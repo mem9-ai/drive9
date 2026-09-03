@@ -5815,16 +5815,20 @@ func (fs *Dat9FS) cacheNegativePath(p string) {
 }
 
 func (fs *Dat9FS) cacheRemoteNotFoundPath(p string) {
-	if fs == nil || p == "/" || isLockFilePath(p) {
+	if fs == nil || p == "/" {
 		return
 	}
 	// A remote-confirmed ENOENT starts a fresh path incarnation. Any
-	// committed-revision watermark from a prior incarnation must not fence a
-	// later PendingNew recreate before the request reaches the server. Older
-	// dirty payloads are still fenced by their own generation/base-revision
-	// checks; this only clears the path epoch after the mount has observed that
-	// the remote object no longer exists.
-	fs.forgetCommittedRevision(p)
+	// committed-revision watermark from a prior incarnation (including child
+	// paths if the missing entry used to be a directory) must not fence a later
+	// PendingNew recreate before the request reaches the server. Older dirty
+	// payloads are still fenced by their own generation/base-revision checks;
+	// this only clears the path epoch after the mount has observed that the
+	// remote object no longer exists.
+	fs.forgetCommittedRevisionPrefix(p)
+	// Lock files intentionally bypass namespace negative caching so high-churn
+	// lock create/delete/recreate probes always revalidate remotely. Keep that
+	// cache policy separate from the incarnation/watermark reset above.
 	fs.cacheNegativePath(p)
 }
 
@@ -6383,10 +6387,11 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 			}
 		}
 		// Returning ENOENT from namespace cache means this mount currently
-		// observes the path as absent. Do not let a committed-revision watermark
-		// from a previous incarnation make a later same-name PendingNew look
-		// stale before it reaches the server.
-		fs.forgetCommittedRevision(childP)
+		// observes the path as absent. Do not let committed-revision watermarks
+		// from a previous incarnation (including children if this used to be a
+		// directory) make later same-name PendingNew payloads look stale before
+		// they reach the server.
+		fs.forgetCommittedRevisionPrefix(childP)
 		out.NodeId = 0
 		out.SetEntryTimeout(fs.negativeEntryTTL(childP))
 		return true, gofuse.ENOENT

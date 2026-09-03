@@ -6055,9 +6055,25 @@ func TestLookupStatNotFoundSeedsShortNegativeNamespaceCache(t *testing.T) {
 }
 
 func TestLookupRemoteNotFoundClearsCommittedRevisionForPendingNewRecreate(t *testing.T) {
-	const filePath = "/recreate.txt"
+	for _, tc := range []struct {
+		name              string
+		filePath          string
+		wantNegativeCache bool
+	}{
+		{name: "regular-file", filePath: "/recreate.txt", wantNegativeCache: true},
+		{name: "lock-file", filePath: "/config.lock", wantNegativeCache: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testRemoteNotFoundClearsCommittedRevisionForPendingNewRecreate(t, tc.filePath, tc.wantNegativeCache)
+		})
+	}
+}
+
+func testRemoteNotFoundClearsCommittedRevisionForPendingNewRecreate(t *testing.T, filePath string, wantNegativeCache bool) {
+	t.Helper()
 	newData := []byte("new incarnation")
 	staleData := []byte("old payload")
+	lookupName := path.Base(filePath)
 
 	var (
 		mu          sync.Mutex
@@ -6075,7 +6091,8 @@ func TestLookupRemoteNotFoundClearsCommittedRevisionForPendingNewRecreate(t *tes
 			}
 			// Simulate another client deleting a file this mount previously knew
 			// at rev 7. Lookup has now authoritatively observed a new empty
-			// incarnation slot for this path.
+			// incarnation slot for this path. Lock files must clear the watermark
+			// too even though they intentionally skip negative dir-cache entries.
 			http.Error(w, "not found", http.StatusNotFound)
 		case http.MethodPut:
 			if r.URL.Path != "/v1/fs"+filePath {
@@ -6133,15 +6150,15 @@ func TestLookupRemoteNotFoundClearsCommittedRevisionForPendingNewRecreate(t *tes
 
 	fs.recordCommittedRevision(filePath, 7)
 	var lookupOut gofuse.EntryOut
-	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "recreate.txt", &lookupOut)
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, lookupName, &lookupOut)
 	if st != gofuse.ENOENT {
 		t.Fatalf("Lookup status = %v, want ENOENT", st)
 	}
 	if got := fs.latestCommittedRevision(filePath); got != 0 {
 		t.Fatalf("committed revision after remote ENOENT = %d, want 0", got)
 	}
-	if !fs.hasNegativePathCache(filePath) {
-		t.Fatal("remote ENOENT did not seed negative lookup cache")
+	if got := fs.hasNegativePathCache(filePath); got != wantNegativeCache {
+		t.Fatalf("negative cache after remote ENOENT = %v, want %v", got, wantNegativeCache)
 	}
 
 	if err := shadow.WriteFull(filePath, newData, 0); err != nil {
@@ -6215,6 +6232,44 @@ func TestLookupRemoteNotFoundClearsCommittedRevisionForPendingNewRecreate(t *tes
 	}
 }
 
+func TestLookupRemoteDirectoryNotFoundClearsCommittedRevisionPrefix(t *testing.T) {
+	const dirPath = "/gone-dir"
+	var rec testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			rec.Recordf("method = %s, want HEAD", r.Method)
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.URL.Path != "/v1/fs"+dirPath {
+			rec.Recordf("HEAD path = %s, want /v1/fs%s", r.URL.Path, dirPath)
+			http.Error(w, "bad path", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer ts.Close()
+	defer rec.Check(t)
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.recordCommittedRevision(dirPath, 7)
+	fs.recordCommittedRevision(dirPath+"/file.txt", 8)
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, path.Base(dirPath), &out)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
+	}
+	if got := fs.latestCommittedRevision(dirPath); got != 0 {
+		t.Fatalf("directory committed revision after remote ENOENT = %d, want 0", got)
+	}
+	if got := fs.latestCommittedRevision(dirPath + "/file.txt"); got != 0 {
+		t.Fatalf("child committed revision after remote directory ENOENT = %d, want 0", got)
+	}
+}
+
 func TestLookupLockFileStatNotFoundDoesNotSeedNamespaceNegative(t *testing.T) {
 	var headCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -6229,6 +6284,7 @@ func TestLookupLockFileStatNotFoundDoesNotSeedNamespaceNegative(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.recordCommittedRevision("/config.lock", 7)
 
 	for range 2 {
 		var out gofuse.EntryOut
@@ -6239,6 +6295,9 @@ func TestLookupLockFileStatNotFoundDoesNotSeedNamespaceNegative(t *testing.T) {
 	}
 	if got := headCalls.Load(); got != 2 {
 		t.Fatalf("HEAD calls = %d, want 2", got)
+	}
+	if got := fs.latestCommittedRevision("/config.lock"); got != 0 {
+		t.Fatalf("lock committed revision after remote ENOENT = %d, want 0", got)
 	}
 }
 
