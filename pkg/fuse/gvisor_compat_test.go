@@ -1157,6 +1157,65 @@ func TestGVisorCompatLayerShadowCommitDoesNotRelockPathFence(t *testing.T) {
 	}
 }
 
+func TestLayerShadowCommitDoesNotRelockInheritedFence(t *testing.T) {
+	const filePath = "/layer-shadow-inherited-fence.txt"
+	data := []byte("layer shadow data")
+	var pathLockCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-test/entries" {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"layer_id": "layer-test", "path": filePath, "op": "upsert", "kind": "file"})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{LayerRef: "layer-test"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(filePath, data, 0); err != nil {
+		t.Fatal(err)
+	}
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, nil, nil, 1, 8)
+	cq.SetLayerRef("layer-test")
+	cq.PathLock = func(string) func() {
+		pathLockCalls.Add(1)
+		return func() {}
+	}
+	defer cq.DrainAll()
+	fs.shadowStore = shadow
+	fs.commitQueue = cq
+	ino := fs.inodes.Lookup(filePath, false, int64(len(data)), time.Now())
+	dirty := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	if _, err := dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:                ino,
+		Path:               filePath,
+		Dirty:              dirty,
+		ShadowSpill:        true,
+		ShadowStageGen:     shadow.ActiveGeneration(filePath),
+		IsNew:              true,
+		RemoteCommitUnlock: func() {},
+	}
+	fh.Lock()
+	err = fs.commitLayerShadowLocked(context.Background(), fh, false, false)
+	fh.Unlock()
+	if err != nil {
+		t.Fatalf("commitLayerShadowLocked: %v", err)
+	}
+	if got := pathLockCalls.Load(); got != 0 {
+		t.Fatalf("path fence locks = %d, want 0 while inherited fence is held", got)
+	}
+}
+
 func TestGVisorCompatLayerShadowCommitPreservesConcurrentWrite(t *testing.T) {
 	const filePath = "/layer-shadow-concurrent.txt"
 	original := []byte("original layer shadow data")
