@@ -8331,11 +8331,19 @@ func TestOpenReadOnlySyncDurabilityKeepsCacheWithoutBypassMarker(t *testing.T) {
 	}
 }
 
+func cleanupKernelCacheBypassAfterTest(t *testing.T, fs *Dat9FS) {
+	t.Helper()
+	t.Cleanup(func() {
+		fs.clearKernelCacheBypassMarkers()
+	})
+}
+
 func TestOpenReadOnlySyncDurabilityBypassMarkerUsesDirectIO(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	opts.WritePolicy = WritePolicyCloseSync
 	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	cleanupKernelCacheBypassAfterTest(t, fs)
 
 	markedIno := fs.inodes.Lookup("/sync-visible.txt", false, 17, time.Now())
 	fs.inodes.UpdateRevision(markedIno, 7)
@@ -8374,6 +8382,7 @@ func TestKernelCacheBypassMarkerIsInodeScopedAcrossRecreate(t *testing.T) {
 	opts.setDefaults()
 	opts.WritePolicy = WritePolicyCloseSync
 	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	cleanupKernelCacheBypassAfterTest(t, fs)
 
 	oldIno := fs.inodes.Lookup("/recreate.txt", false, 0, time.Now())
 	fs.armKernelCacheBypass(oldIno, "/recreate.txt", 1, 0, "test")
@@ -8401,6 +8410,7 @@ func TestKernelCacheBypassMarkerFollowsRenamedInode(t *testing.T) {
 	opts.setDefaults()
 	opts.WritePolicy = WritePolicyCloseSync
 	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	cleanupKernelCacheBypassAfterTest(t, fs)
 
 	ino := fs.inodes.Lookup("/old.txt", false, 5, time.Now())
 	fs.armKernelCacheBypass(ino, "/old.txt", 2, 5, "test")
@@ -8424,6 +8434,7 @@ func TestSyncCommitNotifyFailureLeavesPerInodeBypass(t *testing.T) {
 	opts.setDefaults()
 	opts.WritePolicy = WritePolicyCloseSync
 	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	cleanupKernelCacheBypassAfterTest(t, fs)
 
 	ino := fs.inodes.Lookup("/notify-fallback.txt", false, 21, time.Now())
 	fs.inodes.UpdateRevision(ino, 9)
@@ -8450,18 +8461,18 @@ func TestSyncCommitNotifySuccessLeavesPerInodeBypassUntilTTL(t *testing.T) {
 	opts.setDefaults()
 	opts.WritePolicy = WritePolicyCloseSync
 	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	cleanupKernelCacheBypassAfterTest(t, fs)
 
 	ino := fs.inodes.Lookup("/notify-success.txt", false, 21, time.Now())
 	fs.inodes.UpdateRevision(ino, 9)
 
 	var notified atomic.Bool
-	t.Cleanup(func() { testHookNotifyInodeSyncResult = nil })
-	testHookNotifyInodeSyncResult = func(gotIno uint64) bool {
+	t.Cleanup(func() { testHookNotifyInodeSync = nil })
+	testHookNotifyInodeSync = func(gotIno uint64) {
 		if gotIno != ino {
 			t.Fatalf("notify ino = %d, want %d", gotIno, ino)
 		}
 		notified.Store(true)
-		return true
 	}
 
 	fs.finishSyncCommitKernelCacheBoundary(ino, "/notify-success.txt", 9, 21)
@@ -8495,19 +8506,15 @@ func TestSyncCommitNotifySuccessLeavesPerInodeBypassUntilTTL(t *testing.T) {
 	}
 }
 
-func TestKernelCacheBypassMarkerExpiresAndClearsByGeneration(t *testing.T) {
+func TestKernelCacheBypassMarkerExpiresAndClears(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	opts.WritePolicy = WritePolicyCloseSync
 	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	cleanupKernelCacheBypassAfterTest(t, fs)
 
 	ino := fs.inodes.Lookup("/short-window.txt", false, 8, time.Now())
-	oldGen := fs.armKernelCacheBypass(ino, "/short-window.txt", 1, 8, "old")
-	newGen := fs.armKernelCacheBypass(ino, "/short-window.txt", 2, 8, "new")
-	fs.clearKernelCacheBypassGeneration(ino, oldGen)
-	if !fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/short-window.txt"}) {
-		t.Fatal("clearing an older generation removed the active marker")
-	}
+	fs.armKernelCacheBypass(ino, "/short-window.txt", 2, 8, "test")
 
 	fs.kernelCacheBypassMu.Lock()
 	marker := fs.kernelCacheBypass[ino]
@@ -8518,62 +8525,64 @@ func TestKernelCacheBypassMarkerExpiresAndClearsByGeneration(t *testing.T) {
 	if fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/short-window.txt"}) {
 		t.Fatal("expired marker stayed active")
 	}
-	fs.clearKernelCacheBypassGeneration(ino, newGen)
 }
 
-func TestKernelCacheBypassTTLDoesNotClearNewerGeneration(t *testing.T) {
+func TestKernelCacheBypassStaleSweepDoesNotClearRenewedMarker(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	opts.WritePolicy = WritePolicyCloseSync
 	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	cleanupKernelCacheBypassAfterTest(t, fs)
 
-	ino := fs.inodes.Lookup("/generation-safe.txt", false, 8, time.Now())
-	fs.armKernelCacheBypassUntil(ino, "/generation-safe.txt", 1, 8, "old", time.Now().Add(10*time.Millisecond))
-	newGen := fs.armKernelCacheBypassUntil(ino, "/generation-safe.txt", 2, 8, "new", time.Now().Add(5*time.Second))
-	defer fs.clearKernelCacheBypassGeneration(ino, newGen)
-
-	time.Sleep(50 * time.Millisecond)
-	deadline := time.Now().Add(time.Second)
-	for {
-		fs.kernelCacheBypassMu.Lock()
-		marker, ok := fs.kernelCacheBypass[ino]
-		fs.kernelCacheBypassMu.Unlock()
-		if ok && marker.revision == 2 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("newer kernel cache bypass marker did not survive older generation cleanup")
-		}
-		time.Sleep(5 * time.Millisecond)
+	expiredIno := fs.inodes.Lookup("/expired-marker.txt", false, 0, time.Now())
+	liveIno := fs.inodes.Lookup("/renewed-marker.txt", false, 8, time.Now())
+	fs.armKernelCacheBypassUntil(liveIno, "/renewed-marker.txt", 2, 8, "new", time.Now().Add(5*time.Second))
+	fs.kernelCacheBypassMu.Lock()
+	fs.kernelCacheBypass[expiredIno] = kernelCacheBypassMarker{
+		ino:       expiredIno,
+		path:      "/expired-marker.txt",
+		revision:  1,
+		size:      0,
+		reason:    "expired-test",
+		expiresAt: time.Now().Add(-time.Second),
 	}
+	fs.kernelCacheBypassMu.Unlock()
 
-	if !fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/generation-safe.txt"}) {
-		t.Fatal("older marker TTL cleanup deleted the newer generation")
+	fs.sweepKernelCacheBypass()
+
+	if fs.kernelCacheBypassActive(&FileHandle{Ino: expiredIno, Path: "/expired-marker.txt"}) {
+		t.Fatal("sweeper did not delete the expired marker")
+	}
+	if !fs.kernelCacheBypassActive(&FileHandle{Ino: liveIno, Path: "/renewed-marker.txt"}) {
+		t.Fatal("stale sweeper callback deleted a renewed marker before its expiry")
+	}
+	fs.kernelCacheBypassMu.Lock()
+	defer fs.kernelCacheBypassMu.Unlock()
+	if fs.kernelCacheBypassSweepTimer == nil {
+		t.Fatal("sweeper did not reschedule itself for the remaining live marker")
 	}
 }
 
-func TestKernelCacheBypassRearmReusesTimerAndKeepsOneMarker(t *testing.T) {
+func TestKernelCacheBypassRearmKeepsSingleSweepTimerAndOneMarker(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	opts.WritePolicy = WritePolicyWriteSync
 	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	cleanupKernelCacheBypassAfterTest(t, fs)
 
 	ino := fs.inodes.Lookup("/hot-writer.txt", false, 8, time.Now())
-	firstGen := fs.armKernelCacheBypassUntil(ino, "/hot-writer.txt", 1, 8, "first", time.Now().Add(time.Second))
+	fs.armKernelCacheBypassUntil(ino, "/hot-writer.txt", 1, 8, "first", time.Now().Add(time.Second))
 
 	fs.kernelCacheBypassMu.Lock()
-	firstMarker := fs.kernelCacheBypass[ino]
-	firstTimer := firstMarker.timer
+	firstTimer := fs.kernelCacheBypassSweepTimer
 	fs.kernelCacheBypassMu.Unlock()
 	if firstTimer == nil {
-		t.Fatal("first marker did not create a cleanup timer")
+		t.Fatal("first marker did not create a cleanup sweeper")
 	}
 
-	var lastGen uint64
 	for i := 0; i < 64; i++ {
-		lastGen = fs.armKernelCacheBypassUntil(ino, "/hot-writer.txt", int64(i+2), int64(i+9), "write-sync", time.Now().Add(time.Second))
+		fs.armKernelCacheBypassUntil(ino, "/hot-writer.txt", int64(i+2), int64(i+9), "write-sync", time.Now().Add(time.Second))
 	}
-	defer fs.clearKernelCacheBypassGeneration(ino, lastGen)
 
 	fs.kernelCacheBypassMu.Lock()
 	defer fs.kernelCacheBypassMu.Unlock()
@@ -8581,11 +8590,11 @@ func TestKernelCacheBypassRearmReusesTimerAndKeepsOneMarker(t *testing.T) {
 		t.Fatalf("marker count = %d, want 1 for repeated same-inode rearm", got)
 	}
 	marker := fs.kernelCacheBypass[ino]
-	if marker.generation == firstGen {
-		t.Fatal("marker generation did not advance on rearm")
+	if marker.revision != 65 {
+		t.Fatalf("marker revision = %d, want latest rearm revision 65", marker.revision)
 	}
-	if marker.timer != firstTimer {
-		t.Fatal("rearm allocated a new cleanup timer instead of reusing the inode timer")
+	if fs.kernelCacheBypassSweepTimer != firstTimer {
+		t.Fatal("rearm allocated a new cleanup sweeper instead of reusing the mount timer")
 	}
 }
 
@@ -8594,6 +8603,7 @@ func TestKernelCacheBypassMarkersExpireWithoutReopen(t *testing.T) {
 	opts.setDefaults()
 	opts.WritePolicy = WritePolicyCloseSync
 	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	cleanupKernelCacheBypassAfterTest(t, fs)
 
 	const markerCount = 128
 	expiresAt := time.Now().Add(10 * time.Millisecond)
@@ -26355,6 +26365,7 @@ func TestSetAttr_NoKernelNotify(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	cleanupKernelCacheBypassAfterTest(t, fs)
 
 	ino := fs.inodes.Lookup("/trunc.txt", false, 100, time.Now())
 

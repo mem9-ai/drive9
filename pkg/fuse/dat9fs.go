@@ -29,9 +29,9 @@ import (
 // candidate after discovery but before the second TryLock in candidateLoop.
 var testHookAfterSamePathDirtyHandleScan func(path string)
 
-// testHookNotifyInodeSyncResult lets cache-boundary tests cover the production
-// notify-success branch without mounting a real FUSE server.
-var testHookNotifyInodeSyncResult func(ino uint64) bool
+// testHookNotifyInodeSync lets cache-boundary tests observe the production
+// synchronous notify path without mounting a real FUSE server.
+var testHookNotifyInodeSync func(ino uint64)
 
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
 // operations to the dat9 HTTP API via the Go SDK client.
@@ -59,21 +59,25 @@ type Dat9FS struct {
 	// stream is current, revision-bound file stat hits are enabled only when
 	// MountOptions.TrustLocalEvents explicitly allows process-local SSE
 	// freshness for this deployment.
-	statCacheUnverified  atomic.Bool
-	readSlots            chan struct{}
-	dirtyMu              sync.Mutex
-	dirtyInodes          map[uint64]dirtyInodeState
-	dirtySeq             uint64
-	kernelCacheBypassMu  sync.Mutex
-	kernelCacheBypass    map[uint64]kernelCacheBypassMarker
-	kernelCacheBypassSeq uint64
-	modeSeq              atomic.Uint64
-	specialMu            sync.RWMutex
-	specialByPath        map[string]uint64
-	uid                  uint32
-	gid                  uint32
-	opts                 *MountOptions
-	debouncer            *flushDebouncer
+	statCacheUnverified atomic.Bool
+	readSlots           chan struct{}
+	dirtyMu             sync.Mutex
+	dirtyInodes         map[uint64]dirtyInodeState
+	dirtySeq            uint64
+	kernelCacheBypassMu sync.Mutex
+	kernelCacheBypass   map[uint64]kernelCacheBypassMarker
+	// A single coalesced timer sweeps expired kernelCacheBypass markers. Readers
+	// also reclaim expired markers lazily; this timer only bounds map growth when
+	// a sync-written inode is never reopened.
+	kernelCacheBypassSweepTimer *time.Timer
+	kernelCacheBypassSweepAt    time.Time
+	modeSeq                     atomic.Uint64
+	specialMu                   sync.RWMutex
+	specialByPath               map[string]uint64
+	uid                         uint32
+	gid                         uint32
+	opts                        *MountOptions
+	debouncer                   *flushDebouncer
 
 	// Write-back cache: Flush writes small files to local disk, Release
 	// triggers async upload. Nil when CacheDir is not configured.
@@ -320,14 +324,12 @@ type dirtyInodeState struct {
 }
 
 type kernelCacheBypassMarker struct {
-	ino        uint64
-	path       string
-	generation uint64
-	revision   int64
-	size       int64
-	reason     string
-	expiresAt  time.Time
-	timer      *time.Timer
+	ino       uint64
+	path      string
+	revision  int64
+	size      int64
+	reason    string
+	expiresAt time.Time
 }
 
 type layerSymlinkState struct {
@@ -1710,122 +1712,125 @@ func (fs *Dat9FS) openFlagsForHandle(fh *FileHandle) uint32 {
 // armKernelCacheBypass records a short-lived per-inode cache-bypass marker for
 // close-to-open readers that must not trust stale kernel pages immediately
 // after a truncate-first sync commit.
-func (fs *Dat9FS) armKernelCacheBypass(ino uint64, localPath string, revision, size int64, reason string) uint64 {
-	return fs.armKernelCacheBypassUntil(ino, localPath, revision, size, reason, time.Now().Add(kernelCacheBypassFallbackTTL))
+func (fs *Dat9FS) armKernelCacheBypass(ino uint64, localPath string, revision, size int64, reason string) {
+	fs.armKernelCacheBypassUntil(ino, localPath, revision, size, reason, time.Now().Add(kernelCacheBypassFallbackTTL))
 }
 
 // armKernelCacheBypassUntil is the testable form of armKernelCacheBypass with
-// an explicit expiry. Re-arming the same inode reuses its cleanup timer so a
-// hot write-sync path has one bounded timer instead of one timer per commit.
-func (fs *Dat9FS) armKernelCacheBypassUntil(ino uint64, localPath string, revision, size int64, reason string, expiresAt time.Time) uint64 {
+// an explicit expiry. Re-arming markers uses one coalesced mount-level sweeper
+// rather than one timer per commit or inode.
+func (fs *Dat9FS) armKernelCacheBypassUntil(ino uint64, localPath string, revision, size int64, reason string, expiresAt time.Time) {
 	if fs == nil || ino == 0 {
-		return 0
+		return
 	}
 	fs.kernelCacheBypassMu.Lock()
 	defer fs.kernelCacheBypassMu.Unlock()
 	if fs.kernelCacheBypass == nil {
 		fs.kernelCacheBypass = make(map[uint64]kernelCacheBypassMarker)
 	}
-	fs.kernelCacheBypassSeq++
-	gen := fs.kernelCacheBypassSeq
-	var timer *time.Timer
-	if previous, ok := fs.kernelCacheBypass[ino]; ok {
-		timer = previous.timer
-	}
 	fs.kernelCacheBypass[ino] = kernelCacheBypassMarker{
-		ino:        ino,
-		path:       localPath,
-		generation: gen,
-		revision:   revision,
-		size:       size,
-		reason:     reason,
-		expiresAt:  expiresAt,
-		timer:      timer,
+		ino:       ino,
+		path:      localPath,
+		revision:  revision,
+		size:      size,
+		reason:    reason,
+		expiresAt: expiresAt,
 	}
-	fs.debugf("kernel cache bypass armed path=%s ino=%d gen=%d rev=%d size=%d reason=%s", localPath, ino, gen, revision, size, reason)
-	fs.scheduleKernelCacheBypassCleanupLocked(ino, expiresAt)
-	return gen
+	fs.debugf("kernel cache bypass armed path=%s ino=%d rev=%d size=%d reason=%s", localPath, ino, revision, size, reason)
+	fs.scheduleKernelCacheBypassSweepLocked(expiresAt)
 }
 
-// scheduleKernelCacheBypassCleanupLocked schedules or resets the per-inode
-// cleanup timer for the marker currently stored in kernelCacheBypass. Caller
+// scheduleKernelCacheBypassSweepLocked schedules or advances the single cleanup
+// timer used to reclaim expired markers that are never reopened. Caller
 // must hold kernelCacheBypassMu.
-func (fs *Dat9FS) scheduleKernelCacheBypassCleanupLocked(ino uint64, expiresAt time.Time) {
-	if fs == nil || ino == 0 || expiresAt.IsZero() {
+func (fs *Dat9FS) scheduleKernelCacheBypassSweepLocked(expiresAt time.Time) {
+	if fs == nil || expiresAt.IsZero() {
 		return
 	}
-	marker, ok := fs.kernelCacheBypass[ino]
-	if !ok {
+	if fs.kernelCacheBypassSweepTimer != nil && !fs.kernelCacheBypassSweepAt.IsZero() && !expiresAt.Before(fs.kernelCacheBypassSweepAt) {
 		return
 	}
 	delay := time.Until(expiresAt)
 	if delay < 0 {
 		delay = 0
 	}
-	if marker.timer == nil {
-		marker.timer = time.AfterFunc(delay, func() {
-			fs.expireKernelCacheBypass(ino)
+	fs.kernelCacheBypassSweepAt = expiresAt
+	if fs.kernelCacheBypassSweepTimer == nil {
+		fs.kernelCacheBypassSweepTimer = time.AfterFunc(delay, func() {
+			fs.sweepKernelCacheBypass()
 		})
-		fs.kernelCacheBypass[ino] = marker
 		return
 	}
-	marker.timer.Reset(delay)
-	fs.kernelCacheBypass[ino] = marker
+	// Ignore Reset's boolean result deliberately: if a previous callback is
+	// already running, sweepKernelCacheBypass re-checks all current markers under
+	// the same mutex and only deletes markers whose own expiresAt has passed.
+	fs.kernelCacheBypassSweepTimer.Reset(delay)
 }
 
-// expireKernelCacheBypass removes an expired marker from the timer callback.
-// If a race re-armed the inode to a later expiry before this callback acquired
-// the lock, the same coalesced timer is reset to the newer deadline.
-func (fs *Dat9FS) expireKernelCacheBypass(ino uint64) {
-	if fs == nil || ino == 0 {
+// rescheduleKernelCacheBypassSweepLocked resets the single sweeper to the
+// earliest live marker, or stops it when no markers remain. Caller must hold
+// kernelCacheBypassMu.
+func (fs *Dat9FS) rescheduleKernelCacheBypassSweepLocked() {
+	var next time.Time
+	for _, marker := range fs.kernelCacheBypass {
+		if marker.expiresAt.IsZero() {
+			continue
+		}
+		if next.IsZero() || marker.expiresAt.Before(next) {
+			next = marker.expiresAt
+		}
+	}
+	if next.IsZero() {
+		if fs.kernelCacheBypassSweepTimer != nil {
+			fs.kernelCacheBypassSweepTimer.Stop()
+			fs.kernelCacheBypassSweepTimer = nil
+		}
+		fs.kernelCacheBypassSweepAt = time.Time{}
+		return
+	}
+	fs.kernelCacheBypassSweepAt = time.Time{}
+	fs.scheduleKernelCacheBypassSweepLocked(next)
+}
+
+// sweepKernelCacheBypass removes expired markers from the timer callback. A
+// stale callback is benign: every marker's current expiresAt is checked under
+// kernelCacheBypassMu before deletion, so a re-armed marker survives and the
+// sweeper reschedules itself to the next live deadline.
+func (fs *Dat9FS) sweepKernelCacheBypass() {
+	if fs == nil {
 		return
 	}
 	now := time.Now()
 	fs.kernelCacheBypassMu.Lock()
 	defer fs.kernelCacheBypassMu.Unlock()
-	marker, ok := fs.kernelCacheBypass[ino]
-	if !ok {
-		return
+	fs.kernelCacheBypassSweepAt = time.Time{}
+	for ino, marker := range fs.kernelCacheBypass {
+		if marker.expiresAt.IsZero() {
+			continue
+		}
+		if now.Before(marker.expiresAt) {
+			continue
+		}
+		delete(fs.kernelCacheBypass, ino)
+		fs.debugf("kernel cache bypass expired path=%s ino=%d rev=%d size=%d reason=%s", marker.path, marker.ino, marker.revision, marker.size, marker.reason)
 	}
-	if !marker.expiresAt.IsZero() && now.Before(marker.expiresAt) {
-		fs.scheduleKernelCacheBypassCleanupLocked(ino, marker.expiresAt)
-		return
-	}
-	delete(fs.kernelCacheBypass, ino)
-	fs.debugf("kernel cache bypass expired path=%s ino=%d gen=%d rev=%d size=%d reason=%s", marker.path, marker.ino, marker.generation, marker.revision, marker.size, marker.reason)
+	fs.rescheduleKernelCacheBypassSweepLocked()
 }
 
-// clearKernelCacheBypassGeneration removes only the named marker generation.
-// This protects a newer same-inode marker from an older timer or cleanup path.
-func (fs *Dat9FS) clearKernelCacheBypassGeneration(ino, generation uint64) {
-	if fs == nil || ino == 0 || generation == 0 {
-		return
-	}
-	fs.kernelCacheBypassMu.Lock()
-	defer fs.kernelCacheBypassMu.Unlock()
-	marker, ok := fs.kernelCacheBypass[ino]
-	if !ok || marker.generation != generation {
-		return
-	}
-	if marker.timer != nil {
-		marker.timer.Stop()
-	}
-	delete(fs.kernelCacheBypass, ino)
-	fs.debugf("kernel cache bypass cleared path=%s ino=%d gen=%d rev=%d size=%d reason=%s", marker.path, marker.ino, marker.generation, marker.revision, marker.size, marker.reason)
-}
-
-// clearKernelCacheBypassMarkers stops all marker timers and drops their state
-// during graceful shutdown.
+// clearKernelCacheBypassMarkers stops the cleanup sweeper and drops all marker
+// state during graceful shutdown.
 func (fs *Dat9FS) clearKernelCacheBypassMarkers() {
 	if fs == nil {
 		return
 	}
 	fs.kernelCacheBypassMu.Lock()
 	defer fs.kernelCacheBypassMu.Unlock()
-	for ino, marker := range fs.kernelCacheBypass {
-		if marker.timer != nil {
-			marker.timer.Stop()
-		}
+	if fs.kernelCacheBypassSweepTimer != nil {
+		fs.kernelCacheBypassSweepTimer.Stop()
+		fs.kernelCacheBypassSweepTimer = nil
+	}
+	fs.kernelCacheBypassSweepAt = time.Time{}
+	for ino := range fs.kernelCacheBypass {
 		delete(fs.kernelCacheBypass, ino)
 	}
 }
@@ -1845,11 +1850,9 @@ func (fs *Dat9FS) kernelCacheBypassActive(fh *FileHandle) bool {
 		return false
 	}
 	if !marker.expiresAt.IsZero() && now.After(marker.expiresAt) {
-		if marker.timer != nil {
-			marker.timer.Stop()
-		}
 		delete(fs.kernelCacheBypass, fh.Ino)
-		fs.debugf("kernel cache bypass expired path=%s ino=%d gen=%d rev=%d size=%d reason=%s", marker.path, marker.ino, marker.generation, marker.revision, marker.size, marker.reason)
+		fs.debugf("kernel cache bypass expired path=%s ino=%d rev=%d size=%d reason=%s", marker.path, marker.ino, marker.revision, marker.size, marker.reason)
+		fs.rescheduleKernelCacheBypassSweepLocked()
 		return false
 	}
 	return marker.ino == fh.Ino
@@ -1861,11 +1864,11 @@ func (fs *Dat9FS) finishSyncCommitKernelCacheBoundary(ino uint64, localPath stri
 	}
 	// InodeNotify is best-effort: Linux may still serve stale page/attr cache
 	// immediately after a truncate-first close-sync/write-sync commit even when
-	// the notification call reports success. Keep the per-inode/generation
+	// the notification call reports success. Keep the per-inode
 	// short-window bypass armed until its TTL expires; this remains narrower
 	// than making every clean reader on sync-durability mounts DIRECT_IO.
 	fs.armKernelCacheBypass(ino, localPath, revision, size, "sync-commit")
-	_ = fs.notifyInodeSync(ino)
+	fs.notifyInodeSync(ino)
 }
 
 func (fs *Dat9FS) localEntry(localPath string, info os.FileInfo, incrementLookup bool) (*InodeEntry, gofuse.Status) {
@@ -6638,15 +6641,16 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 // remote commits are close-to-open barriers: the next opener may otherwise
 // observe stale size/page-cache state even though the remote commit has
 // completed.
-func (fs *Dat9FS) notifyInodeSync(ino uint64) bool {
+func (fs *Dat9FS) notifyInodeSync(ino uint64) {
 	fs.notifyCount.Add(1)
 	if fs.perf != nil {
 		fs.perf.notifyInode.add(1)
 	}
-	if testHookNotifyInodeSyncResult != nil {
-		return testHookNotifyInodeSyncResult(ino)
+	if testHookNotifyInodeSync != nil {
+		testHookNotifyInodeSync(ino)
+		return
 	}
-	return fs.invalidateInodeKernelCaches(ino)
+	_ = fs.invalidateInodeKernelCaches(ino)
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
