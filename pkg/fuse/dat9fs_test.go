@@ -8445,6 +8445,56 @@ func TestSyncCommitNotifyFailureLeavesPerInodeBypass(t *testing.T) {
 	}
 }
 
+func TestSyncCommitNotifySuccessLeavesPerInodeBypassUntilTTL(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	ino := fs.inodes.Lookup("/notify-success.txt", false, 21, time.Now())
+	fs.inodes.UpdateRevision(ino, 9)
+
+	var notified atomic.Bool
+	t.Cleanup(func() { testHookNotifyInodeSyncResult = nil })
+	testHookNotifyInodeSyncResult = func(gotIno uint64) bool {
+		if gotIno != ino {
+			t.Fatalf("notify ino = %d, want %d", gotIno, ino)
+		}
+		notified.Store(true)
+		return true
+	}
+
+	fs.finishSyncCommitKernelCacheBoundary(ino, "/notify-success.txt", 9, 21)
+
+	if !notified.Load() {
+		t.Fatal("notify success hook was not called")
+	}
+	if !fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/notify-success.txt"}) {
+		t.Fatal("notify success cleared the per-inode bypass marker before TTL")
+	}
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("open flags = %d, want FOPEN_DIRECT_IO while notify-success short window is active", out.OpenFlags)
+	}
+
+	fs.kernelCacheBypassMu.Lock()
+	marker := fs.kernelCacheBypass[ino]
+	marker.expiresAt = time.Now().Add(-time.Second)
+	fs.kernelCacheBypass[ino] = marker
+	fs.kernelCacheBypassMu.Unlock()
+
+	if fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/notify-success.txt"}) {
+		t.Fatal("notify-success marker stayed active after TTL")
+	}
+}
+
 func TestKernelCacheBypassMarkerExpiresAndClearsByGeneration(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
@@ -8469,6 +8519,103 @@ func TestKernelCacheBypassMarkerExpiresAndClearsByGeneration(t *testing.T) {
 		t.Fatal("expired marker stayed active")
 	}
 	fs.clearKernelCacheBypassGeneration(ino, newGen)
+}
+
+func TestKernelCacheBypassTTLDoesNotClearNewerGeneration(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	ino := fs.inodes.Lookup("/generation-safe.txt", false, 8, time.Now())
+	fs.armKernelCacheBypassUntil(ino, "/generation-safe.txt", 1, 8, "old", time.Now().Add(10*time.Millisecond))
+	newGen := fs.armKernelCacheBypassUntil(ino, "/generation-safe.txt", 2, 8, "new", time.Now().Add(5*time.Second))
+	defer fs.clearKernelCacheBypassGeneration(ino, newGen)
+
+	time.Sleep(50 * time.Millisecond)
+	deadline := time.Now().Add(time.Second)
+	for {
+		fs.kernelCacheBypassMu.Lock()
+		marker, ok := fs.kernelCacheBypass[ino]
+		fs.kernelCacheBypassMu.Unlock()
+		if ok && marker.revision == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("newer kernel cache bypass marker did not survive older generation cleanup")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if !fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/generation-safe.txt"}) {
+		t.Fatal("older marker TTL cleanup deleted the newer generation")
+	}
+}
+
+func TestKernelCacheBypassRearmReusesTimerAndKeepsOneMarker(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyWriteSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	ino := fs.inodes.Lookup("/hot-writer.txt", false, 8, time.Now())
+	firstGen := fs.armKernelCacheBypassUntil(ino, "/hot-writer.txt", 1, 8, "first", time.Now().Add(time.Second))
+
+	fs.kernelCacheBypassMu.Lock()
+	firstMarker := fs.kernelCacheBypass[ino]
+	firstTimer := firstMarker.timer
+	fs.kernelCacheBypassMu.Unlock()
+	if firstTimer == nil {
+		t.Fatal("first marker did not create a cleanup timer")
+	}
+
+	var lastGen uint64
+	for i := 0; i < 64; i++ {
+		lastGen = fs.armKernelCacheBypassUntil(ino, "/hot-writer.txt", int64(i+2), int64(i+9), "write-sync", time.Now().Add(time.Second))
+	}
+	defer fs.clearKernelCacheBypassGeneration(ino, lastGen)
+
+	fs.kernelCacheBypassMu.Lock()
+	defer fs.kernelCacheBypassMu.Unlock()
+	if got := len(fs.kernelCacheBypass); got != 1 {
+		t.Fatalf("marker count = %d, want 1 for repeated same-inode rearm", got)
+	}
+	marker := fs.kernelCacheBypass[ino]
+	if marker.generation == firstGen {
+		t.Fatal("marker generation did not advance on rearm")
+	}
+	if marker.timer != firstTimer {
+		t.Fatal("rearm allocated a new cleanup timer instead of reusing the inode timer")
+	}
+}
+
+func TestKernelCacheBypassMarkersExpireWithoutReopen(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyCloseSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	const markerCount = 128
+	expiresAt := time.Now().Add(10 * time.Millisecond)
+	for i := 0; i < markerCount; i++ {
+		p := fmt.Sprintf("/bulk-sync-%03d.txt", i)
+		ino := fs.inodes.Lookup(p, false, int64(i+1), time.Now())
+		fs.armKernelCacheBypassUntil(ino, p, int64(i+1), int64(i+1), "bulk-test", expiresAt)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		fs.kernelCacheBypassMu.Lock()
+		remaining := len(fs.kernelCacheBypass)
+		fs.kernelCacheBypassMu.Unlock()
+		if remaining == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expired kernel cache bypass markers not cleaned without reopening; remaining=%d", remaining)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func TestOpenReadOnlyCacheableFileSkipsPrefetcher(t *testing.T) {
