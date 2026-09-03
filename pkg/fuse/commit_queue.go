@@ -1220,6 +1220,16 @@ func (cq *CommitQueue) isEntryCanceled(entry *CommitEntry) bool {
 	return entry.canceled
 }
 
+func (cq *CommitQueue) isCanceledImmediateEntry(entry *CommitEntry) bool {
+	if cq == nil || entry == nil || !cq.serializeMutationInodes {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	_, immediate := cq.immediate[entry]
+	return immediate && entry.canceled
+}
+
 func (cq *CommitQueue) discardSupersededEntry(entry *CommitEntry) bool {
 	if cq == nil || entry == nil || cq.IsSuperseded == nil || !cq.IsSuperseded(entry) {
 		return false
@@ -1985,8 +1995,8 @@ func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEnt
 }
 
 func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *CommitEntry) error {
-	if cq.isEntryCanceled(entry) {
-		cq.discardEntry(entry)
+	if cq.isCanceledImmediateEntry(entry) {
+		cq.removeFromQueue(entry)
 		return nil
 	}
 	if cq.discardSupersededEntry(entry) {
@@ -1999,8 +2009,8 @@ func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *Co
 		}
 		return err
 	}
-	if cq.isEntryCanceled(entry) {
-		cq.discardEntry(entry)
+	if cq.isCanceledImmediateEntry(entry) {
+		cq.removeFromQueue(entry)
 		return nil
 	}
 	if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err != nil {
@@ -2020,7 +2030,7 @@ func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *
 		cq.mu.Lock()
 		newer := false
 		older := false
-		skipQueuedAliases := pathLocked && cq.inFlight[entry.Path] != nil
+		samePathWorker := pathLocked && cq.inFlight[entry.Path] != nil
 		for _, active := range cq.inFlight {
 			if active == nil || active.canceled || active == entry || (pathLocked && active.Path == entry.Path) || active.Inode != entry.Inode || active.MutationSeq == 0 {
 				continue
@@ -2042,7 +2052,10 @@ func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *
 			}
 		}
 		for _, queued := range cq.queue {
-			if queued == nil || queued.canceled || queued == entry || (pathLocked && queued.Path == entry.Path) || skipQueuedAliases || queued.Inode != entry.Inode || queued.MutationSeq == 0 {
+			if queued == nil || queued.canceled || queued == entry || (pathLocked && queued.Path == entry.Path) || queued.Inode != entry.Inode || queued.MutationSeq == 0 {
+				continue
+			}
+			if samePathWorker && queued.MutationSeq < entry.MutationSeq {
 				continue
 			}
 			if queued.MutationSeq > entry.MutationSeq {

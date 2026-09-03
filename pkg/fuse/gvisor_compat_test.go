@@ -984,6 +984,25 @@ func TestGVisorCompatPathLockedImmediateCommitDoesNotWaitForSamePathWorker(t *te
 	}
 }
 
+func TestGVisorCompatPathLockedImmediateCommitDiscardsForNewerQueuedAlias(t *testing.T) {
+	const ino = uint64(42)
+	worker := &CommitEntry{Path: "/same-path", Inode: ino, MutationSeq: 1}
+	entry := &CommitEntry{Path: "/same-path", Inode: ino, MutationSeq: 2}
+	newerAlias := &CommitEntry{Path: "/alias-path", Inode: ino, MutationSeq: 3}
+	cq := &CommitQueue{
+		inFlight:                map[string]*CommitEntry{worker.Path: worker},
+		queue:                   []*CommitEntry{newerAlias},
+		queuedByPath:            map[string]map[*CommitEntry]struct{}{newerAlias.Path: {newerAlias: {}}},
+		immediate:               make(map[*CommitEntry]struct{}),
+		serializeMutationInodes: true,
+	}
+
+	release, discard, err := cq.beginImmediateMutationCommit(context.Background(), entry, true)
+	if err != nil || !discard || release != nil {
+		t.Fatalf("path-locked immediate result = release:%t discard:%t err:%v, want discarded by newer alias", release != nil, discard, err)
+	}
+}
+
 func TestGVisorCompatImmediateCommitOccupiesPathAndCanBeCanceled(t *testing.T) {
 	const filePath = "/immediate.txt"
 	entry := &CommitEntry{Path: filePath, Inode: 42, MutationSeq: 1}
@@ -1016,6 +1035,55 @@ func TestGVisorCompatImmediateCommitOccupiesPathAndCanBeCanceled(t *testing.T) {
 	release()
 	if cq.HasPath(filePath) {
 		t.Fatal("released immediate commit remained visible to HasPath")
+	}
+}
+
+func TestGVisorCompatImmediateCancelPreservesLocalStaging(t *testing.T) {
+	const filePath = "/immediate-preserve.txt"
+	data := []byte("preserve this staged content")
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(filePath, data, 0); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingGen, err := pending.PutWithBaseRev(filePath, int64(len(data)), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cq := NewCommitQueue(newTestClient("http://127.0.0.1"), shadow, pending, nil, 1, 8)
+	cq.serializeMutationInodes = true
+	defer cq.DrainAll()
+	entry := &CommitEntry{
+		Path:            filePath,
+		Inode:           42,
+		MutationSeq:     1,
+		PendingIndexGen: pendingGen,
+		ShadowGen:       shadow.ActiveGeneration(filePath),
+		Size:            int64(len(data)),
+		Kind:            PendingNew,
+	}
+	release, discard, err := cq.beginImmediateMutationCommit(context.Background(), entry, false)
+	if err != nil || discard || release == nil {
+		t.Fatalf("begin immediate = release:%t discard:%t err:%v", release != nil, discard, err)
+	}
+	defer release()
+
+	cq.CancelPathPreserveLocal(filePath)
+	if err := cq.commitNowClaimedPathLocked(context.Background(), entry); err != nil {
+		t.Fatalf("commit canceled immediate entry: %v", err)
+	}
+	if !shadow.Has(filePath) {
+		t.Fatal("CancelPathPreserveLocal removed the immediate entry shadow")
+	}
+	if !pending.HasPending(filePath) {
+		t.Fatal("CancelPathPreserveLocal removed the immediate entry pending state")
 	}
 }
 
@@ -1086,6 +1154,118 @@ func TestGVisorCompatLayerShadowCommitDoesNotRelockPathFence(t *testing.T) {
 	}
 	if got := pathLockCalls.Load(); got != 0 {
 		t.Fatalf("path fence locks = %d, want 0 while already held", got)
+	}
+}
+
+func TestGVisorCompatLayerShadowCommitPreservesConcurrentWrite(t *testing.T) {
+	const filePath = "/layer-shadow-concurrent.txt"
+	original := []byte("original layer shadow data")
+	updated := []byte("updated after layer commit started")
+	uploadStarted := make(chan struct{})
+	allowUpload := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-test/entries" {
+			http.Error(w, "unexpected request "+r.Method+" "+r.URL.Path, http.StatusInternalServerError)
+			return
+		}
+		close(uploadStarted)
+		<-allowUpload
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"layer_id": "layer-test", "path": filePath, "op": "upsert", "kind": "file"})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: true, LayerRef: "layer-test"}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(filePath, original, 0); err != nil {
+		t.Fatal(err)
+	}
+	pendingGen, err := pending.PutWithBaseRev(filePath, int64(len(original)), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.SetLayerRef("layer-test")
+	cq.serializeMutationInodes = true
+	defer cq.DrainAll()
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = cq
+	ino := fs.inodes.Lookup(filePath, false, int64(len(original)), time.Now())
+	dirty := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	if _, err := dirty.Write(0, original); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:                ino,
+		Path:               filePath,
+		Dirty:              dirty,
+		DirtySeq:           fs.markDirtySize(ino, int64(len(original))),
+		ShadowSpill:        true,
+		ShadowStageGen:     shadow.ActiveGeneration(filePath),
+		PendingIndexGen:    pendingGen,
+		IsNew:              true,
+		RemoteCommitUnlock: func() {},
+	}
+	commitDone := make(chan error, 1)
+	go func() {
+		fh.Lock()
+		err := fs.commitLayerShadowLocked(context.Background(), fh, false, false)
+		fh.Unlock()
+		commitDone <- err
+	}()
+	select {
+	case <-uploadStarted:
+	case err := <-commitDone:
+		t.Fatalf("layer commit ended before upload started: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("layer commit did not start")
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		fh.Lock()
+		unlockRemoteCommit := fs.lockHandleRemoteCommitPathLocked(fh)
+		_, err := fh.Dirty.Write(0, updated)
+		if err == nil {
+			fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+		}
+		unlockRemoteCommit()
+		fh.Unlock()
+		writeDone <- err
+	}()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("concurrent Write failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent Write did not complete")
+	}
+	close(allowUpload)
+	select {
+	case err := <-commitDone:
+		if err != nil {
+			t.Fatalf("commitLayerShadowLocked: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("layer commit did not complete")
+	}
+	fh.Lock()
+	dirtySeq := fh.DirtySeq
+	hasDirty := fh.Dirty.HasDirtyParts()
+	fh.Unlock()
+	if dirtySeq == 0 || !hasDirty {
+		t.Fatalf("concurrent layer write was cleared: seq=%d dirty=%t", dirtySeq, hasDirty)
 	}
 }
 
