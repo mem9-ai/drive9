@@ -8563,6 +8563,57 @@ func TestKernelCacheBypassStaleSweepDoesNotClearRenewedMarker(t *testing.T) {
 	}
 }
 
+func TestKernelCacheBypassTimerFireConcurrentRearmKeepsRenewedMarker(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyWriteSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	cleanupKernelCacheBypassAfterTest(t, fs)
+
+	ino := fs.inodes.Lookup("/timer-race.txt", false, 8, time.Now())
+	enteredSweep := make(chan struct{})
+	releaseSweep := make(chan struct{})
+	var hookOnce sync.Once
+	var releaseOnce sync.Once
+	releaseHook := func() {
+		releaseOnce.Do(func() {
+			close(releaseSweep)
+		})
+	}
+	defer releaseHook()
+	t.Cleanup(func() { testHookBeforeKernelCacheBypassSweep = nil })
+	testHookBeforeKernelCacheBypassSweep = func() {
+		hookOnce.Do(func() {
+			close(enteredSweep)
+			<-releaseSweep
+		})
+	}
+
+	fs.armKernelCacheBypassUntil(ino, "/timer-race.txt", 1, 8, "old", time.Now().Add(10*time.Millisecond))
+	select {
+	case <-enteredSweep:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup sweeper did not fire")
+	}
+
+	fs.armKernelCacheBypassUntil(ino, "/timer-race.txt", 2, 9, "new", time.Now().Add(time.Second))
+	releaseHook()
+	time.Sleep(50 * time.Millisecond)
+
+	if !fs.kernelCacheBypassActive(&FileHandle{Ino: ino, Path: "/timer-race.txt"}) {
+		t.Fatal("timer callback racing with re-arm deleted the renewed marker")
+	}
+	fs.kernelCacheBypassMu.Lock()
+	defer fs.kernelCacheBypassMu.Unlock()
+	marker := fs.kernelCacheBypass[ino]
+	if marker.revision != 2 || marker.size != 9 {
+		t.Fatalf("marker = (rev=%d size=%d), want renewed marker (rev=2 size=9)", marker.revision, marker.size)
+	}
+	if fs.kernelCacheBypassSweepTimer == nil {
+		t.Fatal("cleanup sweeper was not rescheduled for the renewed marker")
+	}
+}
+
 func TestKernelCacheBypassRearmKeepsSingleSweepTimerAndOneMarker(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
