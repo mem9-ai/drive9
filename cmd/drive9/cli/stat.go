@@ -107,6 +107,9 @@ func Stat(c *client.Client, args []string) error {
 	}
 	fmt.Printf("content_type: %s\n", m.ContentType)
 	fmt.Printf("semantic_text: %s\n", m.SemanticText)
+	if m.Description != "" {
+		fmt.Printf("description: %s\n", m.Description)
+	}
 	if m.Degraded {
 		fmt.Printf("degraded: true\n")
 	}

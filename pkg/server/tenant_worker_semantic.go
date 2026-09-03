@@ -450,6 +450,7 @@ func (m *tenantWorkerManager) processEmbedTask(ctx context.Context, store *datas
 		}
 	}
 
+	descChanged := false
 	if strings.TrimSpace(file.Description) != "" {
 		vecDesc, err := m.embedder.EmbedText(ctx, file.Description)
 		if err != nil {
@@ -458,12 +459,20 @@ func (m *tenantWorkerManager) processEmbedTask(ctx context.Context, store *datas
 		if len(vecDesc) == 0 {
 			return semanticTaskOutcome{action: semanticTaskActionRetry, result: "embed_desc_empty", message: "embed description returned empty vector"}
 		}
-		descUpdated, err = store.UpdateFileDescriptionEmbedding(ctx, task.ResourceID, task.ResourceVersion, vecDesc)
+		descUpdated, err = store.UpdateFileDescriptionEmbeddingIfText(ctx, task.ResourceID, task.ResourceVersion, file.Description, vecDesc)
 		if err != nil {
 			return semanticTaskOutcome{action: semanticTaskActionRetry, result: "writeback_desc_error", message: fmt.Sprintf("write description embedding: %v", err)}
 		}
+		// setmeta changes the description without bumping the revision, so the
+		// revision check above cannot catch a description that changed while
+		// this task was in flight; the writeback text predicate does. Retry to
+		// converge on the new description.
+		descChanged = !descUpdated
 	}
 
+	if descChanged {
+		return semanticTaskOutcome{action: semanticTaskActionRetry, result: "description_changed", message: "description changed during embedding"}
+	}
 	if !contentUpdated && !descUpdated {
 		return semanticTaskOutcome{action: semanticTaskActionAck, result: "obsolete", message: "conditional_write_miss"}
 	}

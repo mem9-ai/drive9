@@ -141,6 +141,17 @@ func newEmbedTask(taskID, fileID string, revision int64, now time.Time) *semanti
 	}
 }
 
+// forceRequeueEmbedTaskTx guarantees a queued embed task for the current
+// revision, re-queuing terminal rows in place and resetting rows being
+// processed under an active lease (clearing the receipt fails the in-flight
+// owner's lease fence). Metadata-only updates (setmeta) change the
+// description without bumping the revision, so neither the terminal-row
+// dedupe of plain enqueue nor the active-lease exemption of ensure can
+// apply: both would leave the new description without an embedding.
+func (b *Dat9Backend) forceRequeueEmbedTaskTx(tx *sql.Tx, fileID string, revision int64) (bool, error) {
+	return b.store.ForceRequeueSemanticTaskTx(tx, newEmbedTask(b.genID(), fileID, revision, time.Now().UTC()))
+}
+
 func newImgExtractTask(taskID, fileID string, revision int64, path, contentType string, now time.Time) (*semantic.Task, error) {
 	now = now.UTC()
 	payload := semantic.ImgExtractTaskPayload{Path: path, ContentType: contentType}

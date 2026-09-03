@@ -54,6 +54,7 @@ func ExampleClient_constructionStatusAndRawRequests() {
 func ExampleClient_filesystemCRUDAndMetadata() {
 	ctx := context.Background()
 	c := drive9.New("https://drive9.example.com", "api-key")
+	desc := "updated description"
 
 	_ = c.Mkdir("/workspace")
 	_ = c.MkdirCtx(ctx, "/workspace/", 0o755)
@@ -102,6 +103,8 @@ func ExampleClient_filesystemCRUDAndMetadata() {
 	_ = c.HardlinkCtx(ctx, "/workspace/a.txt", "/workspace/a-hardlink-ctx.txt")
 	_ = c.Chmod("/workspace/a.txt", 0o640)
 	_ = c.ChmodCtx(ctx, "/workspace/a.txt", 0o644)
+	_ = c.SetMetadata("/workspace/a.txt", drive9.SetMetadataOptions{Tags: map[string]string{"owner": "alice"}})
+	_ = c.SetMetadataCtx(ctx, "/workspace/a.txt", drive9.SetMetadataOptions{Description: &desc})
 
 	_, _ = c.SQL("select path, size_bytes from files limit 10")
 	_, _ = c.Grep("deployment checklist", "/workspace/", 20)
@@ -776,6 +779,8 @@ var coveredClientMethods = map[string]bool{
 	"SQL":                                  true,
 	"SearchJournal":                        true,
 	"SetActor":                             true,
+	"SetMetadata":                          true,
+	"SetMetadataCtx":                       true,
 	"SetQuota":                             true,
 	"SetSmallFileThresholdForTests":        true,
 	"SmallFileThreshold":                   true,
