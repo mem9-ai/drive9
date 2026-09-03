@@ -705,6 +705,103 @@ func TestReplaceFileTagsTxAndGetFileTags(t *testing.T) {
 	}
 }
 
+func TestUpdateFileDescriptionTxClearsDescriptionEmbedding(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID: "f-desc", StorageType: StorageDB9, StorageRef: "/blobs/f-desc",
+		Revision: 2, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now,
+		Description: "old description",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.UpdateFileDescriptionEmbedding(context.Background(), "f-desc", 2, testEmbeddingVector(0.1, 0.2, 0.3))
+	if err != nil || !updated {
+		t.Fatalf("seed description embedding: updated=%v err=%v", updated, err)
+	}
+
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		if _, err := s.LockConfirmedFileRevisionTx(tx, "f-desc"); err != nil {
+			return err
+		}
+		return s.UpdateFileDescriptionTx(tx, "f-desc", "new description")
+	}); err != nil {
+		t.Fatalf("UpdateFileDescriptionTx: %v", err)
+	}
+
+	sem, err := s.GetSemantic(context.Background(), "f-desc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sem.Description != "new description" {
+		t.Fatalf("description = %q, want %q", sem.Description, "new description")
+	}
+	if sem.DescriptionEmbeddingRevision != nil {
+		t.Fatalf("description_embedding_revision = %v, want cleared", *sem.DescriptionEmbeddingRevision)
+	}
+	if got := mustFile(t, s, "f-desc").Revision; got != 2 {
+		t.Fatalf("revision = %d, want unchanged 2", got)
+	}
+
+	// Clearing the description stores NULL.
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		return s.UpdateFileDescriptionTx(tx, "f-desc", "")
+	}); err != nil {
+		t.Fatalf("UpdateFileDescriptionTx(clear): %v", err)
+	}
+	sem, err = s.GetSemantic(context.Background(), "f-desc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sem.Description != "" {
+		t.Fatalf("description after clear = %q, want empty", sem.Description)
+	}
+
+	// Unknown file is reported by the revision lock.
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		_, err := s.LockConfirmedFileRevisionTx(tx, "f-missing")
+		return err
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LockConfirmedFileRevisionTx(missing) err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestLockDentryFileIDTx(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertFile(context.Background(), &File{
+		FileID: "f-dentry", StorageType: StorageDB9, StorageRef: "inline",
+		Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{
+		NodeID: "n-dentry", Path: "/dentry.txt", ParentPath: "/", Name: "dentry.txt",
+		FileID: "f-dentry", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var id string
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		var err error
+		id, err = s.LockDentryFileIDTx(tx, "/dentry.txt")
+		return err
+	}); err != nil {
+		t.Fatalf("LockDentryFileIDTx: %v", err)
+	}
+	if id != "f-dentry" {
+		t.Fatalf("dentry identity = %q, want f-dentry", id)
+	}
+
+	if err := s.InTx(context.Background(), func(tx *sql.Tx) error {
+		_, err := s.LockDentryFileIDTx(tx, "/missing.txt")
+		return err
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LockDentryFileIDTx(missing) err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestReplaceFileTagsByPrefixTxPreservesOtherTags(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()

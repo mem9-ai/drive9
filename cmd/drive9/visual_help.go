@@ -546,6 +546,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "mv <old> <new>", Desc: "rename or move a path"},
 					{Name: "mkdir <path>", Desc: "create a directory; parents are auto-created"},
 					{Name: "chmod <mode> <path>", Desc: "change permissions with octal mode, e.g. 644"},
+					{Name: "setmeta [flags] <path>", Desc: "update tags/description without re-uploading (--tag k=v, --clear-tags, --description, --clear-description)"},
 					{Name: "symlink <target> <link>", Desc: "create a symbolic link"},
 					{Name: "hardlink <target> <link>", Desc: "create a hard link"},
 					{Name: "rm [-r|--recursive] <path>", Desc: "remove a file or directory tree"},
