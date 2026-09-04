@@ -147,6 +147,7 @@ func TestAppendLogGenerationResetRestartsShadowStreamingState(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 	})
 	defer closeServer()
+	fs.perf = newFusePerfCounters(true)
 
 	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
 	if err != nil {
@@ -186,6 +187,40 @@ func TestAppendLogGenerationResetRestartsShadowStreamingState(t *testing.T) {
 	}
 	if !fh.Dirty.uploadedParts[0] {
 		t.Fatal("new spill callback did not evict the new-generation part")
+	}
+	if got := fs.perf.snapshot().Counters["append_log_outcome_success"]; got != 0 {
+		t.Fatalf("append-log outcome success = %d, want 0 for conditional reset PUT", got)
+	}
+}
+
+func TestAppendLogGenerationResetClearsReadOnlySiblingTarget(t *testing.T) {
+	oldHeader, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
+	if !ok {
+		t.Fatal("old header did not parse")
+	}
+	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	setGenerationResetDirty(t, fh, oldHeader, newHeader, 64)
+	reader := &FileHandle{Path: fh.Path, ReadTarget: &client.ReadTarget{ObjectURL: "https://old-object.example"}}
+	fs.openHandles.Add(reader)
+	defer fs.openHandles.Remove(reader)
+
+	fh.Lock()
+	result := fs.tryAppendLogGenerationResetLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if reader.ReadTarget != nil {
+		t.Fatalf("read-only sibling retained stale target: %+v", reader.ReadTarget)
 	}
 }
 

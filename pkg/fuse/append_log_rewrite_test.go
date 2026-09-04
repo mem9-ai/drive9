@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -39,6 +40,7 @@ func TestAppendLogFullRewriteUsesOneConditionalPUT(t *testing.T) {
 	defer closeServer()
 	setAppendLogRewriteDirty(t, fh, "rewrite")
 	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+	fs.perf = newFusePerfCounters(true)
 
 	fh.Lock()
 	result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
@@ -51,6 +53,9 @@ func TestAppendLogFullRewriteUsesOneConditionalPUT(t *testing.T) {
 	}
 	if got := fh.appendLogLayoutAt(6, int64(len("rewrite"))); got != client.ContentLayoutAppendLog {
 		t.Fatalf("layout = %q, want append_log", got)
+	}
+	if got := fs.perf.snapshot().Counters["append_log_outcome_success"]; got != 0 {
+		t.Fatalf("append-log outcome success = %d, want 0 for conditional PUT", got)
 	}
 }
 
@@ -614,6 +619,7 @@ func TestAppendLogPathTruncateUsesConditionalFullPUT(t *testing.T) {
 	defer closeServer()
 	fs.appendLogSnapshotRoot = ""
 	fs.opts.CacheDir = ""
+	fs.perf = newFusePerfCounters(true)
 	ino := fs.inodes.Lookup("/db-wal", false, 3, time.Now())
 	fs.inodes.UpdateRevision(ino, 5)
 	entry, ok := fs.inodes.GetEntry(ino)
@@ -626,6 +632,9 @@ func TestAppendLogPathTruncateUsesConditionalFullPUT(t *testing.T) {
 	}
 	if headCalls != 1 || putCalls != 1 {
 		t.Fatalf("head/put calls = %d/%d, want 1/1", headCalls, putCalls)
+	}
+	if got := fs.perf.snapshot().Counters["append_log_outcome_success"]; got != 0 {
+		t.Fatalf("append-log outcome success = %d, want 0 for conditional PUT", got)
 	}
 }
 
@@ -963,6 +972,94 @@ func TestAppendLogWriteSyncWriteUsesAppendRoute(t *testing.T) {
 	}
 	if appendCalls != 1 || putCalls != 0 {
 		t.Fatalf("append/put calls = %d/%d, want 1/0", appendCalls, putCalls)
+	}
+}
+
+func TestAppendLogWriteSyncErrorPreservesNewerConcurrentGeneration(t *testing.T) {
+	firstAppendStarted := make(chan struct{})
+	releaseFirstAppend := make(chan struct{})
+	var appendCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		appendCalls++
+		body, _ := io.ReadAll(r.Body)
+		switch appendCalls {
+		case 1:
+			if got := string(body); got != "one" {
+				t.Errorf("first append body = %q, want one", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			close(firstAppendStarted)
+			<-releaseFirstAppend
+			w.WriteHeader(http.StatusInternalServerError)
+		case 2:
+			if got := string(body); got != "onetwo" {
+				t.Errorf("second append body = %q, want onetwo", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 9})
+		default:
+			t.Errorf("append calls = %d, want 2", appendCalls)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, []byte("pre")); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.DirtySeq = 0
+	fh.BaseRev = 5
+	fh.OrigSize = 3
+	fh.WritePolicy = WritePolicyWriteSync
+	fh.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 5, size: 3}
+	handleID := fs.fileHandles.Allocate(fh)
+	defer fs.fileHandles.Delete(handleID)
+
+	firstDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 3}, []byte("one"))
+		firstDone <- status
+	}()
+	<-firstAppendStarted
+
+	secondDone := make(chan struct {
+		written uint32
+		status  gofuse.Status
+	}, 1)
+	go func() {
+		written, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 6}, []byte("two"))
+		secondDone <- struct {
+			written uint32
+			status  gofuse.Status
+		}{written, status}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for fh.TryLock() {
+		fh.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("concurrent write did not acquire the handle")
+		}
+		runtime.Gosched()
+	}
+	close(releaseFirstAppend)
+
+	if status := <-firstDone; status == gofuse.OK {
+		t.Fatal("first failed append write returned OK")
+	}
+	second := <-secondDone
+	if second.status != gofuse.OK || second.written != 3 {
+		t.Fatalf("second write = %d/%d, want 3/OK", second.written, second.status)
+	}
+	if appendCalls != 2 || fh.BaseRev != 6 || fh.OrigSize != 9 || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || string(fh.Dirty.Bytes()) != "preonetwo" {
+		t.Fatalf("newer generation was not preserved: calls=%d handle=%+v body=%q", appendCalls, fh, fh.Dirty.Bytes())
 	}
 }
 
