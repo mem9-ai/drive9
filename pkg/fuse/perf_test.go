@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -94,6 +95,45 @@ func TestFusePerfCountersSummary(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("summary missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestAppendLogPerfCounters(t *testing.T) {
+	perf := newFusePerfCounters(true)
+	perf.recordRemoteOp(perfRemoteAppendLog, nil, time.Millisecond, 4)
+	perf.recordRemoteOp(perfRemoteAppendLog, errors.New("rebase"), 2*time.Millisecond, 4)
+	perf.recordAppendLogOutcome(appendLogPerfOutcomeSuccess)
+	perf.recordAppendLogOutcome(appendLogPerfOutcomeRebased)
+	perf.recordAppendLogOutcome(appendLogPerfOutcomeTooLarge)
+	perf.recordAppendLogFullRewrite(12)
+	perf.recordAppendLogGenerationReset(32)
+	perf.recordAppendLogGenerationResetShadowReady()
+	perf.recordAppendLogGenerationResetShadowDegraded()
+	perf.recordAppendLogRebaseRetry()
+	perf.recordAppendLogFsync(false, 3*time.Millisecond)
+	perf.recordAppendLogFsync(true, 4*time.Millisecond)
+
+	snap := perf.snapshot()
+	if got := snap.RemoteOps["append_log"]; got.count != 2 || got.errors != 1 || got.bytes != 8 {
+		t.Fatalf("append-log remote stats = %+v, want count=2 errors=1 bytes=8", got)
+	}
+	for key, want := range map[string]uint64{
+		"append_log_outcome_success":                  1,
+		"append_log_outcome_rebased":                  1,
+		"append_log_outcome_too_large":                1,
+		"append_log_full_rewrite_count":               1,
+		"append_log_full_rewrite_bytes":               12,
+		"append_log_generation_reset_count":           1,
+		"append_log_generation_reset_bytes":           32,
+		"append_log_generation_reset_shadow_ready":    1,
+		"append_log_generation_reset_shadow_degraded": 1,
+		"append_log_rebase_retry_count":               1,
+		"append_log_fsync_append_count":               1,
+		"append_log_fsync_full_rewrite_count":         1,
+	} {
+		if got := snap.Counters[key]; got != want {
+			t.Fatalf("counter %s = %d, want %d", key, got, want)
 		}
 	}
 }

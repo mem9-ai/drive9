@@ -23,6 +23,7 @@ type FileHandle struct {
 	WriteBackSeq uint64       // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
 	OrigSize     int64        // original file size at open time (for patch detection)
 	BaseRev      int64        // server revision at open time (for conflict detection)
+	appendLog    appendLogHandleState
 	// StorageClass is the cached view of the remote object's storage class
 	// (storageClassDB9 / storageClassS3, empty = unknown). It is seeded from
 	// the server's X-Dat9-Storage-Type stat header when available, updated

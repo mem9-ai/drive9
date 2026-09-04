@@ -29,6 +29,11 @@ func TestContinuousPerfRecorderWritesJSONLSamples(t *testing.T) {
 	fs.dirtyMu.Unlock()
 	fs.perf.recordFuseOp(perfFuseWrite, gofuse.OK, 2*time.Millisecond, 64)
 	fs.perf.recordRemoteOp(perfRemoteWrite, nil, 3*time.Millisecond, 64)
+	fs.perf.recordRemoteOp(perfRemoteAppendLog, nil, 4*time.Millisecond, 8)
+	fs.perf.recordAppendLogOutcome(appendLogPerfOutcomeSuccess)
+	fs.perf.recordAppendLogGenerationReset(32)
+	fs.perf.recordAppendLogGenerationResetShadowReady()
+	fs.perf.recordAppendLogGenerationResetShadowDegraded()
 	fs.perf.readCacheHit.add(2)
 
 	recorder, err := StartContinuousPerf(opts.Profiling, fs)
@@ -74,6 +79,15 @@ func TestContinuousPerfRecorderWritesJSONLSamples(t *testing.T) {
 	}
 	if last.RemoteOps["write"].Count != 1 || last.RemoteOps["write"].Bytes != 64 {
 		t.Fatalf("write remote stats = %+v, want count=1 bytes=64", last.RemoteOps["write"])
+	}
+	if last.RemoteOps["append_log"].Count != 1 || last.RemoteOps["append_log"].Bytes != 8 || last.Counters["append_log_outcome_success"] != 1 {
+		t.Fatalf("append-log sample = remote=%+v counters=%v", last.RemoteOps["append_log"], last.Counters)
+	}
+	if last.Counters["append_log_generation_reset_count"] != 1 || last.Counters["append_log_generation_reset_bytes"] != 32 {
+		t.Fatalf("generation-reset counters = %v", last.Counters)
+	}
+	if last.Counters["append_log_generation_reset_shadow_ready"] != 1 || last.Counters["append_log_generation_reset_shadow_degraded"] != 1 {
+		t.Fatalf("generation-reset shadow counters = %v", last.Counters)
 	}
 	if last.Counters["read_cache_hit"] != 2 {
 		t.Fatalf("read_cache_hit = %d, want 2", last.Counters["read_cache_hit"])

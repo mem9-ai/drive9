@@ -59,6 +59,7 @@ type MountOptions struct {
 	LocalRoot               string        // local-only overlay root for overlay-profile mounts
 	LocalOnlyPatterns       []string      // additional local-only path patterns for overlay-profile mounts
 	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for overlay-profile mounts
+	AppendLogPatterns       []string      // remote-persistent files eligible for append-log synchronization
 	PackPaths               []string      // local overlay paths auto-packed after unmount
 	CommitQueueMaxPending   int           // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
 	WriteBackBatchWindow    time.Duration // writeback-only small-file batch window (default 0 disabled)
@@ -436,6 +437,7 @@ func Mount(opts *MountOptions) (err error) {
 		if opts.LayerRef != "" {
 			mountHash = MountLayerHash(opts.Server, opts.MountPoint, opts.RemoteRoot, opts.LayerRef, opts.CheckpointRef)
 		}
+		dat9fs.appendLogSnapshotRoot = filepath.Join(cacheBase, mountHash, "append-log-snapshots")
 		readCacheHash := MountReadCacheHash(opts.Server, opts.MountPoint, opts.RemoteRoot, mountCredentialKind(opts), mountCredentialSecret(opts))
 		readCacheDir := filepath.Join(cacheBase, readCacheHash, "read")
 		diskReadCache, err := NewDiskReadCache(DiskReadCacheOptions{
@@ -1217,6 +1219,9 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 		return fmt.Errorf("mount: unknown profile %q", opts.Profile)
 	}
 	opts.LocalRoot = strings.TrimSpace(opts.LocalRoot)
+	if err := validateAppendLogPatterns(opts.AppendLogPatterns); err != nil {
+		return fmt.Errorf("mount: %w", err)
+	}
 	if opts.EnableGitWorkspaces && opts.LocalRoot == "" {
 		return fmt.Errorf("mount: EnableGitWorkspaces requires LocalRoot")
 	}

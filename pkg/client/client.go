@@ -55,6 +55,13 @@ type tenantStatusResponse struct {
 	MaxUploadBytes        int64                  `json:"max_upload_bytes"`
 	InlineThreshold       int64                  `json:"inline_threshold,omitempty"`
 	MigrationCapabilities *MigrationCapabilities `json:"migration_capabilities,omitempty"`
+	StorageCapabilities   *StorageCapabilities   `json:"storage_capabilities,omitempty"`
+}
+
+// StorageCapabilities is the server-advertised storage feature contract.
+// A missing object means the server predates the contract.
+type StorageCapabilities struct {
+	AppendLogV1 bool `json:"append_log_v1"`
 }
 
 // MigrationCapabilities is the bounded Server contract. A missing object
@@ -109,6 +116,7 @@ var ErrMigrationUnsupported = errors.New("migration unsupported")
 type StatusError struct {
 	StatusCode int
 	Message    string
+	Code       string
 }
 
 func (e *StatusError) Error() string {
@@ -271,6 +279,14 @@ const (
 	StorageTypeS3  StorageType = "s3"
 )
 
+// ContentLayout identifies the server's physical content layout.
+type ContentLayout string
+
+const (
+	ContentLayoutSingle    ContentLayout = "single"
+	ContentLayoutAppendLog ContentLayout = "append_log"
+)
+
 type StatResult struct {
 	Size       int64
 	IsDir      bool
@@ -288,6 +304,9 @@ type StatResult struct {
 	// server predates the header; callers must treat empty as "unknown" and
 	// fall back to local heuristics.
 	StorageType StorageType
+	// ContentLayout is the server-authoritative physical layout from
+	// X-Dat9-Content-Layout. Empty means the server omitted the header.
+	ContentLayout ContentLayout
 }
 
 // MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
@@ -520,6 +539,16 @@ func (c *Client) CachedSmallFileThreshold() int64 {
 		return c.smallFileThreshold
 	}
 	return c.statusInline.Load()
+}
+
+// CachedAppendLogSupported reports the already-negotiated append-log
+// capability without triggering a status request.
+func (c *Client) CachedAppendLogSupported() bool {
+	if c == nil {
+		return false
+	}
+	body := c.statusBody.Load()
+	return body != nil && body.StorageCapabilities != nil && body.StorageCapabilities.AppendLogV1
 }
 
 // ensureTenantStatus is the compatibility warm path. Legacy getters
@@ -1094,6 +1123,7 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 	}
 	s.ResourceID = resp.Header.Get("X-Dat9-Resource-ID")
 	s.StorageType = StorageType(resp.Header.Get("X-Dat9-Storage-Type"))
+	s.ContentLayout = ContentLayout(resp.Header.Get("X-Dat9-Content-Layout"))
 	s.ChecksumSHA256 = resp.Header.Get("X-Dat9-Checksum-SHA256")
 	if nlink := resp.Header.Get("X-Dat9-Nlink"); nlink != "" {
 		if n, err := strconv.ParseUint(nlink, 10, 32); err == nil {
@@ -1415,9 +1445,10 @@ func readError(resp *http.Response) error {
 	body, _ := io.ReadAll(resp.Body)
 	var errResp struct {
 		Error string `json:"error"`
+		Code  string `json:"code"`
 	}
 	if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-		return &StatusError{StatusCode: resp.StatusCode, Message: errResp.Error}
+		return &StatusError{StatusCode: resp.StatusCode, Message: errResp.Error, Code: errResp.Code}
 	}
 	var nestedErr struct {
 		Error struct {
@@ -1426,7 +1457,7 @@ func readError(resp *http.Response) error {
 		} `json:"error"`
 	}
 	if json.Unmarshal(body, &nestedErr) == nil && nestedErr.Error.Message != "" {
-		return &StatusError{StatusCode: resp.StatusCode, Message: nestedErr.Error.Message}
+		return &StatusError{StatusCode: resp.StatusCode, Message: nestedErr.Error.Message, Code: nestedErr.Error.Code}
 	}
 	return &StatusError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body))}
 }

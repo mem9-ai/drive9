@@ -1,0 +1,16 @@
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023
+
+RUN dnf install -y fuse3 fuse3-libs python3 strace util-linux-core && \
+    dnf clean all && \
+    mkdir -p /scratch/home /scratch/tmp
+
+COPY drive9-microvm-e2e-runner /usr/local/bin/drive9-microvm-e2e-runner
+COPY drive9 /usr/local/bin/drive9-transfer
+
+RUN chmod 0755 /usr/local/bin/drive9-microvm-e2e-runner \
+        /usr/local/bin/drive9-transfer && \
+    ln -s /usr/local/bin/drive9-transfer /usr/local/bin/drive9
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/drive9-microvm-e2e-runner"]

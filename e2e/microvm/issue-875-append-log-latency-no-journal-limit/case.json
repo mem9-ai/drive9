@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "runner_api_version": 1,
+  "name": "issue-875-append-log-checkpoint-read-source-contrast",
+  "profile": "fuse",
+  "entrypoint": "case.py",
+  "default_timeout_seconds": 600,
+  "requires_target": true,
+  "requires_credential": true,
+  "mutates_target": true
+}
