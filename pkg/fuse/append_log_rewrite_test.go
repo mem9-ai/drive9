@@ -157,6 +157,82 @@ func TestAppendLogFullRewriteRemovesUnownedStaleShadow(t *testing.T) {
 	}
 }
 
+func TestAppendLogFullRewriteClearsAndRebindsLiveShadowSibling(t *testing.T) {
+	header := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
+	image := append(append([]byte(nil), header...), []byte("tail")...)
+	fs, owner, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 7})
+	})
+	defer closeServer()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	owner.Dirty = NewWriteBuffer(owner.Path, 1024, 0)
+	if _, err := owner.Dirty.Write(0, header); err != nil {
+		t.Fatal(err)
+	}
+	owner.Dirty.ClearDirty()
+	owner.DirtySeq = 0
+	owner.BaseRev = 6
+	owner.OrigSize = sqliteWALHeaderSize
+	owner.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 6, size: sqliteWALHeaderSize}
+	owner.ShadowReady = true
+	owner.ShadowSpill = true
+	if err := shadow.WriteFull(owner.Path, header, owner.BaseRev); err != nil {
+		t.Fatal(err)
+	}
+	fs.openHandles.Add(owner)
+	defer fs.openHandles.Remove(owner)
+	ownerHandleID := fs.fileHandles.Allocate(owner)
+	defer fs.fileHandles.Delete(ownerHandleID)
+
+	publisher := &FileHandle{
+		Ino:      2,
+		Path:     owner.Path,
+		Dirty:    NewWriteBuffer(owner.Path, 1024, 0),
+		DirtySeq: 1,
+		OrigSize: sqliteWALHeaderSize,
+		BaseRev:  6,
+		appendLog: appendLogHandleState{
+			initialized: true,
+			layout:      client.ContentLayoutAppendLog,
+			revision:    6,
+			size:        sqliteWALHeaderSize,
+		},
+	}
+	if _, err := publisher.Dirty.Write(0, image); err != nil {
+		t.Fatal(err)
+	}
+	publisher.appendLogRecordUserWrite(sqliteWALHeaderSize, 0, int64(len(image)))
+	fs.openHandles.Add(publisher)
+	defer fs.openHandles.Remove(publisher)
+
+	publisher.Lock()
+	result := fs.tryAppendLogFullRewriteLocked(context.Background(), publisher)
+	publisher.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("full rewrite = %+v, want committed", result)
+	}
+	if owner.ShadowReady || owner.ShadowSpill {
+		t.Fatalf("owner retained removed shadow flags: ready=%t spill=%t", owner.ShadowReady, owner.ShadowSpill)
+	}
+	got, status, err := readDat9FSTestRange(fs, owner.Ino, ownerHandleID, 0, len(image))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != gofuse.OK || !bytes.Equal(got, image) {
+		t.Fatalf("sibling read = %x/%d, want %x/OK", got, status, image)
+	}
+}
+
 func TestAppendLogFullRewriteAppliesPendingModeAndCachesDirEntry(t *testing.T) {
 	var putCalls, chmodCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {

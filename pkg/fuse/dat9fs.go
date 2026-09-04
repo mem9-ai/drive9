@@ -2375,6 +2375,10 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision i
 		fs.discardSupersededMutationLocked(fh)
 		if fs.handleCanAdoptCommittedRevisionLocked(fh) {
 			cleanBuffer := fh.Dirty != nil
+			if cleanBuffer && fs.clearRemovedCommittedShadowLocked(fh, revision, fs.committedHandleSizeLocked(fh), true) {
+				fh.Unlock()
+				continue
+			}
 			fh.IsNew = false
 			fh.BaseRev = revision
 			if fh.Streamer != nil {
@@ -2409,6 +2413,10 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandlesWithSize(path string, re
 		fs.discardSupersededMutationLocked(fh)
 		if fs.handleCanAdoptCommittedRevisionLocked(fh) {
 			cleanBuffer := fh.Dirty != nil
+			if cleanBuffer && fs.clearRemovedCommittedShadowLocked(fh, revision, committedSize, true) {
+				fh.Unlock()
+				continue
+			}
 			fh.IsNew = false
 			fh.BaseRev = revision
 			if fh.Streamer != nil {
@@ -2550,6 +2558,9 @@ func (fs *Dat9FS) clearRemovedCommittedShadowForOpenHandles(path string, committ
 
 func (fs *Dat9FS) clearRemovedCommittedShadowLocked(fh *FileHandle, committedRev, committedSize int64, releaseRemoteCommitLock bool) bool {
 	if fs == nil || fh == nil || fs.shadowStore == nil || !fh.ShadowReady || fs.shadowStore.Has(fh.Path) {
+		return false
+	}
+	if fh.Dirty != nil && (fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts()) {
 		return false
 	}
 	if fs.hasPendingLocalState(fh.Path) {
@@ -2862,7 +2873,9 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 		return
 	}
 	advanced := revision > fh.BaseRev
-	committedSize := fs.committedHandleSizeLocked(fh)
+	if !hasCommittedSize {
+		committedSize = fs.committedHandleSizeLocked(fh)
+	}
 	if advanced {
 		if !fs.handleCanAdoptCommittedRevisionLocked(fh) {
 			return

@@ -63,6 +63,10 @@ func TestAppendLogTailCommit(t *testing.T) {
 
 func TestAppendLogAdoptsCommittedRevisionAndSizeTogether(t *testing.T) {
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte("pretail"))
+			return
+		}
 		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
 			t.Errorf("request = %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
@@ -87,6 +91,15 @@ func TestAppendLogAdoptsCommittedRevisionAndSizeTogether(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 7, Size: 11})
 	})
 	defer closeServer()
+	// Only a clean handle can adopt a sibling commit. Its stale inode size
+	// must not override the size atomically published with the new revision.
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, []byte("pre")); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.DirtySeq = 0
+	fh.Ino = fs.inodes.Lookup(fh.Path, false, fh.OrigSize, time.Now())
 	fs.recordCommittedRevisionWithSize(fh.Path, 6, 7)
 
 	fh.Lock()
