@@ -1957,11 +1957,8 @@ func (cq *CommitQueue) entryUploadContext(parent context.Context, entry *CommitE
 // by workers. It is used as a fallback when the async queue rejects an entry
 // after local state has already moved to the final path.
 func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error {
-	cq.mu.Lock()
-	abandoned := cq.abandoned
-	cq.mu.Unlock()
-	if abandoned {
-		return errLayerRolledBack
+	if err := cq.rejectAbandonedLayer(); err != nil {
+		return err
 	}
 	release, discard, err := cq.beginImmediateMutationCommit(ctx, entry, false)
 	if err != nil {
@@ -1979,7 +1976,20 @@ func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error 
 	return cq.commitNowClaimedPathLocked(ctx, entry)
 }
 
+func (cq *CommitQueue) rejectAbandonedLayer() error {
+	cq.mu.Lock()
+	abandoned := cq.abandoned
+	cq.mu.Unlock()
+	if abandoned {
+		return errLayerRolledBack
+	}
+	return nil
+}
+
 func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEntry) error {
+	if err := cq.rejectAbandonedLayer(); err != nil {
+		return err
+	}
 	release, discard, err := cq.beginImmediateMutationCommit(ctx, entry, true)
 	if err != nil {
 		return err

@@ -749,6 +749,22 @@ func TestCommitQueueCommitNowHoldsPathLockThroughSuccessCleanup(t *testing.T) {
 	}
 }
 
+func TestCommitQueueCommitNowRejectsAbandonedLayer(t *testing.T) {
+	cq := &CommitQueue{abandoned: true}
+	entry := &CommitEntry{Path: "/rolled-back.txt"}
+
+	for name, commit := range map[string]func(context.Context, *CommitEntry) error{
+		"CommitNow":           cq.CommitNow,
+		"commitNowPathLocked": cq.commitNowPathLocked,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := commit(context.Background(), entry); err != errLayerRolledBack {
+				t.Fatalf("%s error = %v, want errLayerRolledBack", name, err)
+			}
+		})
+	}
+}
+
 func TestCommitQueueAppliesModeAfterUpload(t *testing.T) {
 	var putCalls atomic.Int32
 	var chmodCalls atomic.Int32
