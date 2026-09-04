@@ -33,28 +33,39 @@ func TestAppendLogGenerationResetPublishesHeaderThenAppendsFirstFrame(t *testing
 		case http.MethodPut:
 			putCalls++
 			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
-				t.Fatalf("reset expected revision = %q, want 5", got)
+				t.Errorf("reset expected revision = %q, want 5", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			body, _ := io.ReadAll(r.Body)
 			if !bytes.Equal(body, newHeaderBytes) {
-				t.Fatalf("reset body = %x, want header %x", body, newHeaderBytes)
+				t.Errorf("reset body = %x, want header %x", body, newHeaderBytes)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 		case http.MethodPost:
 			appendCalls++
 			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "6" {
-				t.Fatalf("append expected revision = %q, want 6", got)
+				t.Errorf("append expected revision = %q, want 6", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			if got := r.Header.Get("X-Dat9-Expected-Size"); got != "32" {
-				t.Fatalf("append expected size = %q, want 32", got)
+				t.Errorf("append expected size = %q, want 32", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			body, _ := io.ReadAll(r.Body)
 			if got := string(body); got != "frame" {
-				t.Fatalf("append body = %q, want frame", got)
+				t.Errorf("append body = %q, want frame", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 7, Size: 37})
 		default:
-			t.Fatalf("unexpected request %s", r.Method)
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
 		}
 	})
 	defer closeServer()
@@ -127,7 +138,8 @@ func TestAppendLogGenerationResetRejectsUnchangedSalt(t *testing.T) {
 		t.Fatal("header did not parse")
 	}
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
-		t.Fatalf("unexpected request %s", r.Method)
+		t.Errorf("unexpected request %s", r.Method)
+		w.WriteHeader(http.StatusInternalServerError)
 	})
 	defer closeServer()
 
@@ -167,7 +179,8 @@ func TestAppendLogGenerationResetRequiresCompleteHeader(t *testing.T) {
 	}
 	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
-		t.Fatalf("incomplete header must not issue %s", r.Method)
+		t.Errorf("incomplete header must not issue %s", r.Method)
+		w.WriteHeader(http.StatusInternalServerError)
 	})
 	defer closeServer()
 	setGenerationResetDirty(t, fh, oldHeader, newHeader, 64)
@@ -200,11 +213,15 @@ func TestAppendLogGenerationResetResolvesUnknownLayout(t *testing.T) {
 			putCalls++
 			body, _ := io.ReadAll(r.Body)
 			if !bytes.Equal(body, newHeader) {
-				t.Fatalf("reset body = %x, want %x", body, newHeader)
+				t.Errorf("reset body = %x, want %x", body, newHeader)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 		default:
-			t.Fatalf("unexpected request %s", r.Method)
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -297,7 +314,8 @@ func TestAppendLogGenerationResetCanceledRequestPreservesOldGeneration(t *testin
 	}
 	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("canceled request must not reach server")
+		t.Error("canceled request must not reach server")
+		w.WriteHeader(http.StatusInternalServerError)
 	})
 	defer closeServer()
 	setGenerationResetDirty(t, fh, oldHeader, newHeader, 64)
@@ -364,7 +382,9 @@ func TestAppendLogGenerationResetConcurrentWriteRetainsDirtyGeneration(t *testin
 		fh.Lock()
 		if _, err := fh.Dirty.Write(sqliteWALHeaderSize, []byte("frame")); err != nil {
 			fh.Unlock()
-			t.Fatal(err)
+			t.Error(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		fh.appendLogRecordUserWrite(sqliteWALHeaderSize, sqliteWALHeaderSize, int64(len("frame")))
 		fh.DirtySeq = 12
@@ -397,11 +417,15 @@ func TestAppendLogGenerationResetFsyncRecordsConditionalPUT(t *testing.T) {
 	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
-			t.Fatalf("method = %s, want PUT", r.Method)
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		body, _ := io.ReadAll(r.Body)
 		if !bytes.Equal(body, newHeader) {
-			t.Fatalf("reset body = %x, want %x", body, newHeader)
+			t.Errorf("reset body = %x, want %x", body, newHeader)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 	})
@@ -542,13 +566,19 @@ func TestAppendLogGenerationResetAppliesPendingModeAndCachesDirEntry(t *testing.
 				Mode uint32 `json:"mode"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-				t.Fatal(err)
+				t.Errorf("decode chmod request: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			if request.Mode != 0o600 {
-				t.Fatalf("chmod mode = %o, want 600", request.Mode)
+				t.Errorf("chmod mode = %o, want 600", request.Mode)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 		default:
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -589,7 +619,9 @@ func TestAppendLogGenerationResetShadowFailureKeepsRemoteReset(t *testing.T) {
 			remoteReadCalls++
 			_, _ = w.Write(append(append([]byte(nil), newHeader...), []byte("frame")...))
 		default:
-			t.Fatalf("unexpected method %s", r.Method)
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -659,24 +691,32 @@ func TestAppendLogGenerationResetShadowServesFirstFrameRead(t *testing.T) {
 			putCalls++
 			body, _ := io.ReadAll(r.Body)
 			if !bytes.Equal(body, newHeader) {
-				t.Fatalf("reset body = %x, want H1 %x", body, newHeader)
+				t.Errorf("reset body = %x, want H1 %x", body, newHeader)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 		case http.MethodPost:
 			appendCalls++
 			if got := r.Header.Get("X-Dat9-Expected-Size"); got != "32" {
-				t.Fatalf("append expected size = %q, want 32", got)
+				t.Errorf("append expected size = %q, want 32", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			body, _ := io.ReadAll(r.Body)
 			if !bytes.Equal(body, frame) {
-				t.Fatalf("append body length = %d, want frame length %d", len(body), len(frame))
+				t.Errorf("append body length = %d, want frame length %d", len(body), len(frame))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 7, Size: sqliteWALHeaderSize + int64(len(frame))})
 		case http.MethodGet:
 			remoteReadCalls++
 			w.WriteHeader(http.StatusInternalServerError)
 		default:
-			t.Fatalf("unexpected request %s", r.Method)
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -827,21 +867,29 @@ func TestAppendLogGenerationResetWriteThenFsyncUsesFirstFrameAppend(t *testing.T
 			putCalls++
 			body, _ := io.ReadAll(r.Body)
 			if !bytes.Equal(body, newHeader) {
-				t.Fatalf("reset body = %x, want %x", body, newHeader)
+				t.Errorf("reset body = %x, want %x", body, newHeader)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 		case http.MethodPost:
 			appendCalls++
 			if got := r.Header.Get("X-Dat9-Expected-Size"); got != "32" {
-				t.Fatalf("append expected size = %q, want 32", got)
+				t.Errorf("append expected size = %q, want 32", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			body, _ := io.ReadAll(r.Body)
 			if got := string(body); got != "frame" {
-				t.Fatalf("append body = %q, want frame", got)
+				t.Errorf("append body = %q, want frame", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 7, Size: 37})
 		default:
-			t.Fatalf("unexpected request %s", r.Method)
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -904,12 +952,16 @@ func TestAppendLogGenerationResetWithFrameBeforeFsyncUsesFullRewrite(t *testing.
 	var putCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
-			t.Fatalf("method = %s, want complete-image PUT", r.Method)
+			t.Errorf("method = %s, want complete-image PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		putCalls++
 		body, _ := io.ReadAll(r.Body)
 		if len(body) != 64 || !bytes.Equal(body[:sqliteWALHeaderSize], newHeader) || string(body[sqliteWALHeaderSize:sqliteWALHeaderSize+len("frame")]) != "frame" {
-			t.Fatalf("full rewrite body = %x, want H1 plus frame in 64-byte image", body)
+			t.Errorf("full rewrite body = %x, want H1 plus frame in 64-byte image", body)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 	})
@@ -974,7 +1026,8 @@ func TestAppendLogCapturesSQLiteWALHeaderBeforeOffsetZeroWrite(t *testing.T) {
 		t.Fatal("old header did not parse")
 	}
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
-		t.Fatalf("unexpected request %s", r.Method)
+		t.Errorf("unexpected request %s", r.Method)
+		w.WriteHeader(http.StatusInternalServerError)
 	})
 	defer closeServer()
 
@@ -1003,7 +1056,9 @@ func TestAppendLogNewSQLiteWALCreateAdoptsCommittedHeader(t *testing.T) {
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		if !bytes.Equal(body, headerBytes) {
-			t.Fatalf("create body = %x, want %x", body, headerBytes)
+			t.Errorf("create body = %x, want %x", body, headerBytes)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 1, Size: sqliteWALHeaderSize})
 	})
@@ -1036,11 +1091,15 @@ func TestAppendLogTailFsyncLazilyConfirmsSQLiteWALHeader(t *testing.T) {
 	}
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			t.Fatalf("method = %s, want POST", r.Method)
+			t.Errorf("method = %s, want POST", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		body, _ := io.ReadAll(r.Body)
 		if got := string(body); got != "tail" {
-			t.Fatalf("tail body = %q, want tail", got)
+			t.Errorf("tail body = %q, want tail", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: sqliteWALHeaderSize + int64(len("tail"))})
 	})

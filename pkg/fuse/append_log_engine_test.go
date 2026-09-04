@@ -20,17 +20,25 @@ func TestAppendLogTailCommit(t *testing.T) {
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		appendCalls++
 		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
-			t.Fatalf("request = %s %s", r.Method, r.URL.String())
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
-			t.Fatalf("expected revision = %q", got)
+			t.Errorf("expected revision = %q", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if got := r.Header.Get("X-Dat9-Expected-Size"); got != "3" {
-			t.Fatalf("expected size = %q", got)
+			t.Errorf("expected size = %q", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		body, _ := io.ReadAll(r.Body)
 		if got := string(body); got != "tail" {
-			t.Fatalf("append body = %q, want tail", got)
+			t.Errorf("append body = %q, want tail", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
 	})
@@ -66,13 +74,19 @@ func TestAppendLogTailCommitAppliesPendingModeAndCachesDirEntry(t *testing.T) {
 				Mode uint32 `json:"mode"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-				t.Fatal(err)
+				t.Errorf("decode chmod request: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			if request.Mode != 0o600 {
-				t.Fatalf("chmod mode = %o, want 600", request.Mode)
+				t.Errorf("chmod mode = %o, want 600", request.Mode)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 		default:
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -132,14 +146,20 @@ func TestAppendLogTailCommitRemovesUnownedStaleShadow(t *testing.T) {
 func TestAppendLogNewZeroByteCreate(t *testing.T) {
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "0" {
-			t.Fatalf("expected revision = %q", got)
+			t.Errorf("expected revision = %q", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if got := r.Header.Get("X-Dat9-Expected-Size"); got != "0" {
-			t.Fatalf("expected size = %q", got)
+			t.Errorf("expected size = %q", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		body, _ := io.ReadAll(r.Body)
 		if len(body) != 0 {
-			t.Fatalf("zero-byte create body = %q", body)
+			t.Errorf("zero-byte create body = %q", body)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 1, Size: 0})
 	})
@@ -164,15 +184,21 @@ func TestAppendLogNewZeroByteCreate(t *testing.T) {
 func TestAppendLogNewRandomAssemblyCreatesCompleteImage(t *testing.T) {
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "0" {
-			t.Fatalf("expected revision = %q", got)
+			t.Errorf("expected revision = %q", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if got := r.Header.Get("X-Dat9-Expected-Size"); got != "0" {
-			t.Fatalf("expected size = %q", got)
+			t.Errorf("expected size = %q", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		body, _ := io.ReadAll(r.Body)
 		want := []byte{'h', 'i', 0, 0, 't', 'a', 'i', 'l'}
 		if !bytes.Equal(body, want) {
-			t.Fatalf("create body = %v, want %v", body, want)
+			t.Errorf("create body = %v, want %v", body, want)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 1, Size: int64(len(want))})
 	})
@@ -206,7 +232,9 @@ func TestAppendLogRebaseRetriesOnceWithFrozenTail(t *testing.T) {
 			appendCalls++
 			body, _ := io.ReadAll(r.Body)
 			if got := string(body); got != "tail" {
-				t.Fatalf("append %d body = %q", appendCalls, got)
+				t.Errorf("append %d body = %q", appendCalls, got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			if appendCalls == 1 {
 				w.WriteHeader(http.StatusConflict)
@@ -214,7 +242,9 @@ func TestAppendLogRebaseRetriesOnceWithFrozenTail(t *testing.T) {
 				return
 			}
 			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "6" {
-				t.Fatalf("retry expected revision = %q", got)
+				t.Errorf("retry expected revision = %q", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 7, Size: 7})
 		case http.MethodHead:
@@ -223,7 +253,9 @@ func TestAppendLogRebaseRetriesOnceWithFrozenTail(t *testing.T) {
 			w.Header().Set("X-Dat9-Revision", "6")
 			w.WriteHeader(http.StatusOK)
 		default:
-			t.Fatalf("unexpected request %s", r.Method)
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -253,7 +285,9 @@ func TestAppendLogRebaseRejectsChangedSizeWithoutRetry(t *testing.T) {
 			w.Header().Set("X-Dat9-Revision", "6")
 			w.WriteHeader(http.StatusOK)
 		default:
-			t.Fatalf("unexpected request %s", r.Method)
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -289,7 +323,9 @@ func TestAppendLogEnginePerfRecordsRebase(t *testing.T) {
 			w.Header().Set("X-Dat9-Revision", "6")
 			w.WriteHeader(http.StatusOK)
 		default:
-			t.Fatalf("unexpected request %s", r.Method)
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -318,7 +354,9 @@ func TestAppendLogConcurrentTailPreservesNewerDirtyGeneration(t *testing.T) {
 		<-release
 		body, _ := io.ReadAll(r.Body)
 		if got := string(body); got != "tail" {
-			t.Fatalf("append body = %q, want tail", got)
+			t.Errorf("append body = %q, want tail", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
 	})
@@ -508,7 +546,8 @@ func TestAppendLogConflictAndTimeoutPreserveDirtyState(t *testing.T) {
 
 func TestAppendLogCapabilityDisabledDoesNotProbeEndpoint(t *testing.T) {
 	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
-		t.Fatalf("append endpoint must not be called when capability is disabled")
+		t.Errorf("append endpoint must not be called when capability is disabled")
+		w.WriteHeader(http.StatusInternalServerError)
 	})
 	defer closeServer()
 

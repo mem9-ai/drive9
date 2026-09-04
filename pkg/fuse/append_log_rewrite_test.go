@@ -19,14 +19,20 @@ func TestAppendLogFullRewriteUsesOneConditionalPUT(t *testing.T) {
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		putCalls++
 		if r.Method != http.MethodPut || r.URL.RawQuery != "" {
-			t.Fatalf("request = %s %s", r.Method, r.URL.String())
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
-			t.Fatalf("expected revision = %q", got)
+			t.Errorf("expected revision = %q", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		body, _ := io.ReadAll(r.Body)
 		if got := string(body); got != "rewrite" {
-			t.Fatalf("full rewrite body = %q", got)
+			t.Errorf("full rewrite body = %q", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 	})
@@ -61,13 +67,19 @@ func TestAppendLogFullRewriteAppliesPendingModeAndCachesDirEntry(t *testing.T) {
 				Mode uint32 `json:"mode"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-				t.Fatal(err)
+				t.Errorf("decode chmod request: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			if request.Mode != 0o600 {
-				t.Fatalf("chmod mode = %o, want 600", request.Mode)
+				t.Errorf("chmod mode = %o, want 600", request.Mode)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 		default:
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -116,7 +128,9 @@ func TestAppendLogFullRewriteResolvesUnknownLayoutOnce(t *testing.T) {
 					putCalls++
 					_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 				default:
-					t.Fatalf("unexpected method %s", r.Method)
+					t.Errorf("unexpected method %s", r.Method)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
 				}
 			})
 			defer closeServer()
@@ -147,7 +161,9 @@ func TestAppendLogFullRewriteRejectsMissingLayoutWithoutWrite(t *testing.T) {
 		case http.MethodPut:
 			putCalls++
 		default:
-			t.Fatalf("unexpected method %s", r.Method)
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -181,15 +197,21 @@ func TestAppendLogFtruncateZeroRetainsCommittedBaselineForFullRewrite(t *testing
 		case http.MethodPut:
 			putCalls++
 			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
-				t.Fatalf("expected revision = %q, want 5", got)
+				t.Errorf("expected revision = %q, want 5", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			body, _ := io.ReadAll(r.Body)
 			if len(body) != 0 {
-				t.Fatalf("full rewrite body = %q, want empty", body)
+				t.Errorf("full rewrite body = %q, want empty", body)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 		default:
-			t.Fatalf("unexpected method %s", r.Method)
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -264,7 +286,9 @@ func TestAppendLogPathTruncateClearsAdoptedHandleGeneration(t *testing.T) {
 		case http.MethodPut:
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 		default:
-			t.Fatalf("unexpected method %s", r.Method)
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -388,15 +412,21 @@ func TestAppendLogPathTruncateUsesConditionalFullPUT(t *testing.T) {
 		case http.MethodPut:
 			putCalls++
 			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
-				t.Fatalf("expected revision = %q, want 5", got)
+				t.Errorf("expected revision = %q, want 5", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			body, _ := io.ReadAll(r.Body)
 			if len(body) != 0 {
-				t.Fatalf("truncate body = %q, want empty", body)
+				t.Errorf("truncate body = %q, want empty", body)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 		default:
-			t.Fatalf("unexpected request %s", r.Method)
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -431,15 +461,21 @@ func TestAppendLogPathTruncateGrowthFreezesPrefixAndZeroFill(t *testing.T) {
 		case http.MethodPut:
 			putCalls++
 			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
-				t.Fatalf("expected revision = %q, want 5", got)
+				t.Errorf("expected revision = %q, want 5", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			body, _ := io.ReadAll(r.Body)
 			if want := []byte{'a', 'b', 'c', 0, 0}; !bytes.Equal(body, want) {
-				t.Fatalf("truncate growth body = %v, want %v", body, want)
+				t.Errorf("truncate growth body = %v, want %v", body, want)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 		default:
-			t.Fatalf("unexpected request %s", r.Method)
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -462,12 +498,16 @@ func TestAppendLogGenericUnsupportedReroutesOnceToFullPUT(t *testing.T) {
 	var putCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
-			t.Fatalf("method = %s, want PUT", r.Method)
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		putCalls++
 		body, _ := io.ReadAll(r.Body)
 		if got := string(body); got != "pretail" {
-			t.Fatalf("full rewrite body = %q, want pretail", got)
+			t.Errorf("full rewrite body = %q, want pretail", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 	})
@@ -494,7 +534,9 @@ func TestAppendLogReleaseShadowSpillRoutesBeforeCommitQueue(t *testing.T) {
 	var appendCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
-			t.Fatalf("request = %s %s", r.Method, r.URL.String())
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		appendCalls++
 		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
@@ -570,7 +612,9 @@ func TestAppendLogEntryPointFlushUsesAppendRoutesBeforeGenericUpload(t *testing.
 			putCalls++
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 		default:
-			t.Fatalf("unexpected method %s", r.Method)
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -593,13 +637,19 @@ func TestAppendLogEntryPointFlushUsesFullPUTForNonTailWrite(t *testing.T) {
 			putCalls++
 			body, _ := io.ReadAll(r.Body)
 			if got := string(body); got != "rewrite" {
-				t.Fatalf("full rewrite body = %q", got)
+				t.Errorf("full rewrite body = %q", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 		case http.MethodHead:
-			t.Fatalf("known append_log layout must not restat")
+			t.Errorf("known append_log layout must not restat")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		default:
-			t.Fatalf("unexpected method %s", r.Method)
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -654,7 +704,9 @@ func TestAppendLogEntryPointFsyncForcesRemoteAppendInInteractiveMode(t *testing.
 	var appendCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
-			t.Fatalf("request = %s %s", r.Method, r.URL.String())
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		appendCalls++
 		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
@@ -678,7 +730,9 @@ func TestAppendLogEntryPointFsyncForcesRemoteAppendInInteractiveMode(t *testing.
 func TestAppendLogEntryPointFsyncRecordsFullRewrite(t *testing.T) {
 	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
-			t.Fatalf("method = %s, want PUT", r.Method)
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 	})
@@ -714,11 +768,15 @@ func TestAppendLogUnsupportedFallbackUsesOneFullPUT(t *testing.T) {
 			putCalls++
 			body, _ := io.ReadAll(r.Body)
 			if got := string(body); got != "pretail" {
-				t.Fatalf("fallback full body = %q", got)
+				t.Errorf("fallback full body = %q", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 		default:
-			t.Fatalf("unexpected method %s", r.Method)
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -952,11 +1010,15 @@ func TestAppendLogUnsupportedSingleFallsBackToGenericRewrite(t *testing.T) {
 			putCalls++
 			body, _ := io.ReadAll(r.Body)
 			if got := string(body); got != "pretail" {
-				t.Fatalf("generic rewrite body = %q", got)
+				t.Errorf("generic rewrite body = %q", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 		default:
-			t.Fatalf("unexpected method %s", r.Method)
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 	})
 	defer closeServer()
@@ -1166,7 +1228,9 @@ func TestAppendLogCapabilityChangeStillFullRewritesKnownAppendLayout(t *testing.
 	var putCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
-			t.Fatalf("method = %s, want PUT", r.Method)
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		putCalls++
 		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
@@ -1226,14 +1290,18 @@ func TestAppendLogFullRewriteConcurrentMutationPreservesNewerDirtyGeneration(t *
 	started := make(chan struct{})
 	release := make(chan struct{})
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
-			t.Fatalf("method = %s, want PUT", r.Method)
-		}
 		close(started)
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		<-release
 		body, _ := io.ReadAll(r.Body)
 		if got := string(body); got != "rewrite" {
-			t.Fatalf("full rewrite body = %q", got)
+			t.Errorf("full rewrite body = %q, want rewrite", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 	})
@@ -1277,6 +1345,76 @@ func TestAppendLogFullRewriteConcurrentMutationPreservesNewerDirtyGeneration(t *
 	}
 	if revision, size := fh.appendLogCommittedBaseline(); revision != 6 || size != int64(len("rewrite")) {
 		t.Fatalf("next rewrite baseline = %d/%d, want 6/%d", revision, size, len("rewrite"))
+	}
+}
+
+func TestAppendLogFullRewriteConcurrentWALKeepsLiveHeaderFence(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	headerBytes := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2)
+	image := append(append([]byte(nil), headerBytes...), bytes.Repeat([]byte("p"), 32)...)
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			close(started)
+			return
+		}
+		close(started)
+		<-release
+		body, _ := io.ReadAll(r.Body)
+		if !bytes.Equal(body, image) {
+			t.Errorf("full rewrite body = %x, want %x", body, image)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, image); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = 1
+	fh.IsNew = false
+	fh.OrigSize = int64(len(image))
+	fh.BaseRev = 5
+	fh.appendLog = appendLogHandleState{
+		initialized: true,
+		appendSafe:  false,
+		layout:      client.ContentLayoutAppendLog,
+		revision:    5,
+		size:        int64(len(image)),
+	}
+
+	resultCh := make(chan appendLogAttemptResult, 1)
+	go func() {
+		fh.Lock()
+		result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+		fh.Unlock()
+		resultCh <- result
+	}()
+	<-started
+
+	fh.Lock()
+	if _, err := fh.Dirty.Write(sqliteWALHeaderSize+24, []byte("frame")); err != nil {
+		fh.Unlock()
+		t.Fatal(err)
+	}
+	fh.appendLogRecordUserWrite(int64(len(image)), sqliteWALHeaderSize+24, int64(len("frame")))
+	fh.DirtySeq = 2
+	fh.Unlock()
+	close(release)
+
+	result := <-resultCh
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if !fh.appendLog.sqliteWALWriteBeyondHeader {
+		t.Fatal("concurrent WAL frame write lost its header-only reset fence")
+	}
+	if fh.DirtySeq != 2 || !fh.Dirty.HasDirtyParts() {
+		t.Fatalf("concurrent dirty generation = seq %d dirty %t, want 2/true", fh.DirtySeq, fh.Dirty.HasDirtyParts())
 	}
 }
 
