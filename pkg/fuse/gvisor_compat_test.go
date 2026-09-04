@@ -1934,6 +1934,110 @@ func TestGVisorCompatRenamePreflightRejectsRetryAfterMountViewReset(t *testing.T
 	}
 }
 
+func TestGVisorCompatUnlinkSnapshotSurvivesInterrupt(t *testing.T) {
+	const filePath = "/dir/snapshot.txt"
+	data := []byte("open handle snapshot")
+	for _, tc := range []struct {
+		name         string
+		gvisorCompat bool
+		wantStatus   gofuse.Status
+		wantDeletes  int32
+	}{
+		{name: "gvisor", gvisorCompat: true, wantStatus: gofuse.OK, wantDeletes: 1},
+		{name: "disabled", wantStatus: gofuse.EAGAIN},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshotStarted := make(chan struct{})
+			snapshotCanceled := make(chan struct{})
+			allowSnapshot := make(chan struct{})
+			var (
+				snapshotCalls atomic.Int32
+				deleteCalls   atomic.Int32
+				allowOnce     sync.Once
+			)
+			t.Cleanup(func() { allowOnce.Do(func() { close(allowSnapshot) }) })
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					if snapshotCalls.Add(1) != 1 {
+						http.Error(w, "unexpected snapshot retry", http.StatusInternalServerError)
+						return
+					}
+					close(snapshotStarted)
+					select {
+					case <-r.Context().Done():
+						close(snapshotCanceled)
+						return
+					case <-allowSnapshot:
+						_, _ = w.Write(data)
+					}
+				case http.MethodDelete:
+					deleteCalls.Add(1)
+					w.WriteHeader(http.StatusOK)
+				default:
+					http.Error(w, "unexpected request", http.StatusMethodNotAllowed)
+				}
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{GVisorCompat: tc.gvisorCompat}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			parentIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+			ino := fs.inodes.Lookup(filePath, false, int64(len(data)), time.Now())
+			fs.inodes.UpdateRevision(ino, 1)
+			fs.allocateFileHandle(&FileHandle{
+				Ino:      ino,
+				Path:     filePath,
+				Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+				OrigSize: int64(len(data)),
+				BaseRev:  1,
+			})
+
+			cancel := make(chan struct{})
+			done := make(chan gofuse.Status, 1)
+			go func() {
+				done <- fs.Unlink(cancel, &gofuse.InHeader{NodeId: parentIno}, "snapshot.txt")
+			}()
+
+			select {
+			case <-snapshotStarted:
+				close(cancel)
+			case <-time.After(time.Second):
+				t.Fatal("snapshot GET did not start")
+			}
+
+			if tc.gvisorCompat {
+				select {
+				case <-snapshotCanceled:
+					t.Fatal("gVisor snapshot GET was canceled by the FUSE request")
+				case <-time.After(100 * time.Millisecond):
+					allowOnce.Do(func() { close(allowSnapshot) })
+				}
+			} else {
+				select {
+				case <-snapshotCanceled:
+				case <-time.After(time.Second):
+					t.Fatal("disabled snapshot GET was not canceled")
+				}
+			}
+
+			select {
+			case st := <-done:
+				if st != tc.wantStatus {
+					t.Fatalf("Unlink status = %v, want %v", st, tc.wantStatus)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("Unlink timed out")
+			}
+			if got := deleteCalls.Load(); got != tc.wantDeletes {
+				t.Fatalf("DELETE calls = %d, want %d", got, tc.wantDeletes)
+			}
+		})
+	}
+}
+
 func TestGVisorCompatUnlinkKeepsRemoteMutationAliveAfterInterrupt(t *testing.T) {
 	const filePath = "/dir/file.txt"
 	deleteStarted := make(chan struct{})
