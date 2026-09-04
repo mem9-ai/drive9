@@ -61,6 +61,39 @@ func TestAppendLogTailCommit(t *testing.T) {
 	}
 }
 
+func TestAppendLogSmallTailCommitDoesNotRequireSnapshotCache(t *testing.T) {
+	var appendCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		appendCalls++
+		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if got := string(body); got != "tail" {
+			t.Errorf("append body = %q, want tail", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+	})
+	defer closeServer()
+	fs.appendLogSnapshotRoot = ""
+	fs.opts.CacheDir = ""
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, fh.BaseRev, fh.OrigSize)
+
+	fh.Lock()
+	result := fs.tryAppendLogLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if appendCalls != 1 {
+		t.Fatalf("append calls = %d, want 1", appendCalls)
+	}
+}
+
 func TestAppendLogAdoptsCommittedRevisionAndSizeTogether(t *testing.T) {
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {

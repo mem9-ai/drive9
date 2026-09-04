@@ -85,7 +85,7 @@ func (fh *FileHandle) appendLogRecordTruncate() {
 	if fh == nil || fh.IsNew {
 		return
 	}
-	if fh.BaseRev > 0 && fh.OrigSize >= 0 {
+	if !fh.appendLog.hasRewriteBase && fh.BaseRev > 0 && fh.OrigSize >= 0 {
 		fh.appendLog.rewriteBaseRevision = fh.BaseRev
 		fh.appendLog.rewriteBaseSize = fh.OrigSize
 		fh.appendLog.hasRewriteBase = true
@@ -441,9 +441,13 @@ func (fs *Dat9FS) newAppendLogSnapshotLocked(fh *FileHandle, offset, size int64)
 	if fh == nil || fh.Dirty == nil || offset < 0 || size < 0 {
 		return nil, fmt.Errorf("invalid append-log snapshot source")
 	}
-	tempDir, err := fs.appendLogSnapshotDir()
-	if err != nil {
-		return nil, err
+	tempDir := ""
+	if size > appendLogSnapshotMemoryLimit {
+		var err error
+		tempDir, err = fs.appendLogSnapshotDir()
+		if err != nil {
+			return nil, err
+		}
 	}
 	if fh.ShadowSpill {
 		if fs.shadowStore == nil || !fh.ShadowReady {
@@ -616,6 +620,12 @@ func (fs *Dat9FS) rotateAppendLogGenerationShadowLocked(fh *FileHandle, path str
 	}
 	fh.ShadowReady = true
 	fh.ShadowSpill = true
+	if fh.Dirty != nil {
+		wb := fh.Dirty
+		wb.OnPartFull = func(partIdx int, _ []byte) {
+			wb.EvictPart(partIdx)
+		}
+	}
 	fs.recordAppendLogGenerationResetShadowReady()
 }
 
@@ -720,6 +730,8 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 		if err := fh.Dirty.Truncate(sqliteWALHeaderSize); err != nil {
 			return appendLogAttemptResult{route: appendLogRouteFailed, status: gofuse.EIO}
 		}
+		fh.Dirty.ResetSequentialState(sqliteWALHeaderSize)
+		fh.Dirty.ResetStreamingState()
 		fh.Dirty.ClearDirty()
 		fs.clearDirtySize(fh.Ino, snapshotDirtySeq)
 		fh.DirtySeq = 0
@@ -968,9 +980,12 @@ func (fs *Dat9FS) tryAppendLogPathTruncate(ctx context.Context, entry *InodeEntr
 		return true, gofuse.EIO
 	}
 
-	tempDir, err := fs.appendLogSnapshotDir()
-	if err != nil {
-		return true, gofuse.EIO
+	tempDir := ""
+	if newSize > appendLogSnapshotMemoryLimit {
+		tempDir, err = fs.appendLogSnapshotDir()
+		if err != nil {
+			return true, gofuse.EIO
+		}
 	}
 	var snapshot *appendLogSnapshot
 	if int64(len(data)) == newSize {

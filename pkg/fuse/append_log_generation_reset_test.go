@@ -132,6 +132,63 @@ func TestAppendLogGenerationResetPublishesHeaderThenAppendsFirstFrame(t *testing
 	}
 }
 
+func TestAppendLogGenerationResetRestartsShadowStreamingState(t *testing.T) {
+	oldHeader, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
+	if !ok {
+		t.Fatal("old header did not parse")
+	}
+	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	setGenerationResetDirty(t, fh, oldHeader, newHeader, 64)
+	if err := shadow.WriteFull(fh.Path, bytes.Repeat([]byte("o"), 64), fh.BaseRev); err != nil {
+		t.Fatal(err)
+	}
+	fh.ShadowReady = true
+	fh.ShadowSpill = true
+	fh.Dirty.sequential = false
+	fh.Dirty.uploadedParts = map[int]bool{0: true}
+	oldCallbacks := 0
+	fh.Dirty.OnPartFull = func(int, []byte) { oldCallbacks++ }
+
+	fh.Lock()
+	result := fs.tryAppendLogGenerationResetLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if !fh.Dirty.IsSequential() {
+		t.Fatal("reset left the next WAL generation non-sequential")
+	}
+	if got := len(fh.Dirty.uploadedParts); got != 0 {
+		t.Fatalf("uploaded parts = %d, want no old-generation entries", got)
+	}
+	if fh.Dirty.OnPartFull == nil {
+		t.Fatal("shadow-ready reset did not reinstall the spill callback")
+	}
+	fh.Dirty.OnPartFull(0, []byte("new-generation-part"))
+	if oldCallbacks != 0 {
+		t.Fatalf("old spill callback invoked %d times", oldCallbacks)
+	}
+	if !fh.Dirty.uploadedParts[0] {
+		t.Fatal("new spill callback did not evict the new-generation part")
+	}
+}
+
 func TestAppendLogGenerationResetRejectsUnchangedSalt(t *testing.T) {
 	header, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
 	if !ok {

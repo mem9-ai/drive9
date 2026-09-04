@@ -399,6 +399,9 @@ func TestAppendLogFtruncateZeroRetainsCommittedBaselineForFullRewrite(t *testing
 	}
 	fh.appendLogRecordTruncate()
 	fh.OrigSize = 0 // mirrors truncateWritableHandleLocked's generic-routing state.
+	// A second local truncate is still based on the same remote revision and
+	// size. It must not replace the first conditional-PUT baseline with zero.
+	fh.appendLogRecordTruncate()
 
 	fh.Lock()
 	result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
@@ -609,6 +612,8 @@ func TestAppendLogPathTruncateUsesConditionalFullPUT(t *testing.T) {
 		}
 	})
 	defer closeServer()
+	fs.appendLogSnapshotRoot = ""
+	fs.opts.CacheDir = ""
 	ino := fs.inodes.Lookup("/db-wal", false, 3, time.Now())
 	fs.inodes.UpdateRevision(ino, 5)
 	entry, ok := fs.inodes.GetEntry(ino)
