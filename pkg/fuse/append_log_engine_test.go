@@ -61,6 +61,54 @@ func TestAppendLogTailCommit(t *testing.T) {
 	}
 }
 
+func TestAppendLogAdoptsCommittedRevisionAndSizeTogether(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "6" {
+			t.Errorf("expected revision = %q, want 6", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if got := r.Header.Get("X-Dat9-Expected-Size"); got != "7" {
+			t.Errorf("expected size = %q, want 7", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if got := string(body); got != "next" {
+			t.Errorf("append body = %q, want next", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 7, Size: 11})
+	})
+	defer closeServer()
+	fs.recordCommittedRevisionWithSize(fh.Path, 6, 7)
+
+	fh.Lock()
+	fs.adoptCommittedRevisionLocked(fh)
+	if fh.BaseRev != 6 || fh.OrigSize != 7 {
+		fh.Unlock()
+		t.Fatalf("adopted baseline = %d/%d, want 6/7", fh.BaseRev, fh.OrigSize)
+	}
+	preWriteSize := fh.Dirty.Size()
+	if _, err := fh.Dirty.Write(preWriteSize, []byte("next")); err != nil {
+		fh.Unlock()
+		t.Fatal(err)
+	}
+	fh.appendLogRecordUserWrite(preWriteSize, preWriteSize, 4)
+	fh.DirtySeq = 2
+	result := fs.tryAppendLogLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("append result = %+v, want committed", result)
+	}
+}
+
 func TestAppendLogTailCommitFinalizesBeforePendingModeFailure(t *testing.T) {
 	var appendCalls, chmodCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
