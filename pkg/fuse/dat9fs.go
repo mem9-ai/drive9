@@ -29,6 +29,11 @@ import (
 // candidate after discovery but before the second TryLock in candidateLoop.
 var testHookAfterSamePathDirtyHandleScan func(path string)
 
+// testHookBeforeGVisorShadowSpillFlushFence lets race-focused unit tests pause
+// a gVisor ShadowSpill Flush after its initial supersession check but before it
+// acquires the same-path remote commit fence.
+var testHookBeforeGVisorShadowSpillFlushFence func(path string)
+
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
 // operations to the dat9 HTTP API via the Go SDK client.
 type Dat9FS struct {
@@ -12843,16 +12848,35 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				return gofuse.OK
 			}
 			phase = "large-shadowspill-sync-upload"
+			gvisorCompat := fs.gvisorCompatibilityEnabled()
 			expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 			mutationSeq := fh.DirtySeq
 			handleIsNew := fh.IsNew
 			handlePath := fh.Path
+			handleIno := fh.Ino
 			stagingGens := fs.captureHandleStagingGensLocked(fh)
 			// B4: serialize with Unlink's remote DELETE — hold the per-path
 			// remoteCommitLock across the network upload while releasing fh.mu,
 			// exactly like flushHandle Path 2. Without it Unlink can DELETE and
 			// return while this large-file PUT is still in flight.
+			if gvisorCompat && testHookBeforeGVisorShadowSpillFlushFence != nil {
+				testHookBeforeGVisorShadowSpillFlushFence(fh.Path)
+			}
 			unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
+			if gvisorCompat && fs.discardSupersededMutationLocked(fh) {
+				fs.removeHandleOwnedStagingLocked(fh)
+				unlockRemoteCommit()
+				phase = "superseded-after-commit-fence"
+				return gofuse.OK
+			}
+			if gvisorCompat {
+				expectedRevision = fs.expectedRevisionForHandleLocked(fh)
+				mutationSeq = fh.DirtySeq
+				handleIsNew = fh.IsNew
+				handlePath = fh.Path
+				handleIno = fh.Ino
+				stagingGens = fs.captureHandleStagingGensLocked(fh)
+			}
 			uploadStart := time.Now()
 			fs.debugf("flush shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 			fh.Unlock()
@@ -12871,6 +12895,14 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					fs.recordCommittedRevision(handlePath, syntheticRev)
 				}
 			}
+			var mutationRevision int64
+			if err == nil && gvisorCompat {
+				mutationRevision = fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
+				fs.recordCommittedMutation(handleIno, mutationSeq, mutationRevision, size)
+				if mutationRevision > 0 {
+					fs.refreshCommittedRevisionForOpenHandlesWithSize(handlePath, mutationRevision, fh, size)
+				}
+			}
 			unlockRemoteCommit()
 			fh.Lock()
 			var uploadBytes uint64
@@ -12883,10 +12915,11 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				safeLogPrintf("flush: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
 				return gofuse.EIO
 			}
-			mutationRevision := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
-			fs.recordCommittedMutation(fh.Ino, mutationSeq, mutationRevision, size)
-			if mutationRevision > 0 {
-				fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, mutationRevision, fh, size)
+			if !gvisorCompat {
+				mutationRevision = fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
+				if mutationRevision > 0 {
+					fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, mutationRevision, fh, size)
+				}
 			}
 			// If Unlink completed while remoteCommitLock was released (it
 			// serializes DELETE after our PUT via the same lock), the path is
@@ -12897,12 +12930,22 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				fs.discardUnlinkedHandleStateLocked(fh)
 				return gofuse.OK
 			}
+			if gvisorCompat && (fh.Path != handlePath || fh.DirtySeq != mutationSeq) {
+				return gofuse.OK
+			}
 			if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 				safeLogPrintf("flush: ShadowSpill pending chmod failed for %s: %v", fh.Path, err)
 				return httpToFuseStatus(err)
 			}
+			if gvisorCompat && (fh.Path != handlePath || fh.DirtySeq != mutationSeq) {
+				return gofuse.OK
+			}
 			fh.Dirty.ClearDirty()
-			fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+			if gvisorCompat {
+				fs.clearDirtySize(handleIno, mutationSeq)
+			} else {
+				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+			}
 			fh.DirtySeq = 0
 			if committedRev > 0 {
 				clearReadTargetForLockedHandle(fh)
@@ -13172,6 +13215,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			return gofuse.OK
 		}
 		phase = "shadowspill-sync-upload"
+		gvisorCompat := fs.gvisorCompatibilityEnabled()
 		handleIsNew := fh.IsNew
 		handlePath := fh.Path
 		stagingGens := fs.captureHandleStagingGensLocked(fh)
@@ -13235,13 +13279,23 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			fs.discardUnlinkedHandleStateLocked(fh)
 			return gofuse.OK
 		}
+		if gvisorCompat && (fh.Path != handlePath || fh.DirtySeq != mutationSeq) {
+			return gofuse.OK
+		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			safeLogPrintf("fsync: ShadowSpill pending chmod failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
+		if gvisorCompat && (fh.Path != handlePath || fh.DirtySeq != mutationSeq) {
+			return gofuse.OK
+		}
 		if fh.Dirty != nil {
 			fh.Dirty.ClearDirty()
-			fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+			if gvisorCompat {
+				fs.clearDirtySize(handleIno, mutationSeq)
+			} else {
+				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+			}
 			fh.DirtySeq = 0
 		}
 		if committedRev > 0 {

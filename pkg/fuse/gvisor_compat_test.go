@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -2301,5 +2302,275 @@ func TestGVisorCompatOpenHandleSnapshotRejectsRevisionBehindCommittedFrontier(t 
 	}
 	if got := getCalls.Load(); got != 1 {
 		t.Fatalf("remote GET calls = %d, want 1 after rejecting stale cache", got)
+	}
+}
+
+func TestGVisorCompatShadowSpillFlushPreservesConcurrentWrite(t *testing.T) {
+	testGVisorCompatShadowSpillSyncCommitPreservesConcurrentWrite(t, func(fs *Dat9FS, ino, fhID uint64) gofuse.Status {
+		return fs.Flush(nil, &gofuse.FlushIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+		})
+	})
+}
+
+func TestGVisorCompatShadowSpillFsyncPreservesConcurrentWrite(t *testing.T) {
+	testGVisorCompatShadowSpillSyncCommitPreservesConcurrentWrite(t, func(fs *Dat9FS, ino, fhID uint64) gofuse.Status {
+		return fs.Fsync(nil, &gofuse.FsyncIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+		})
+	})
+}
+
+func testGVisorCompatShadowSpillSyncCommitPreservesConcurrentWrite(t *testing.T, commit func(*Dat9FS, uint64, uint64) gofuse.Status) {
+	t.Helper()
+	const filePath = "/shadowspill-sync-concurrent-write.bin"
+	original := bytes.Repeat([]byte("a"), writeBackThreshold)
+	updated := []byte("newer write after old shadow upload")
+	uploadStarted := make(chan struct{})
+	allowUpload := make(chan struct{})
+	var (
+		uploadMu sync.Mutex
+		uploaded []byte
+		putCalls atomic.Int32
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write(original)
+			return
+		case http.MethodPut:
+		default:
+			http.Error(w, "unexpected request", http.StatusMethodNotAllowed)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		uploadMu.Lock()
+		uploaded = append(uploaded[:0], body...)
+		putCall := putCalls.Add(1)
+		uploadMu.Unlock()
+		if putCall == 1 {
+			close(uploadStarted)
+			<-allowUpload
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": int64(putCall)})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{
+		GVisorCompat: true,
+		SyncMode:     SyncStrict,
+		WritePolicy:  WritePolicyWriteBack,
+	}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(int64(writeBackThreshold + 1))
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	ino := fs.inodes.Lookup(filePath, false, int64(len(original)), time.Now())
+	dirty := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	if _, err := dirty.Write(0, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(filePath, original, 0); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:            ino,
+		Path:           filePath,
+		Dirty:          dirty,
+		DirtySeq:       fs.markDirtySize(ino, int64(len(original))),
+		ShadowReady:    true,
+		ShadowSpill:    true,
+		ShadowStageGen: shadow.ActiveGeneration(filePath),
+		IsNew:          true,
+		WritePolicy:    WritePolicyWriteBack,
+	}
+	fhID := fs.allocateFileHandle(fh)
+
+	commitDone := make(chan gofuse.Status, 1)
+	go func() {
+		commitDone <- commit(fs, ino, fhID)
+	}()
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old shadow upload did not start")
+	}
+
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+			Size:     uint32(len(updated)),
+		}, updated)
+		writeDone <- st
+	}()
+
+	// Flush/Fsync has released fh.mu for the upload. Wait until Write holds
+	// it while blocked on the still-held path fence, then release the upload.
+	deadline := time.Now().Add(5 * time.Second)
+	for fh.TryLock() {
+		fh.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("concurrent Write did not acquire fh.mu")
+		}
+		runtime.Gosched()
+	}
+	close(allowUpload)
+
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("concurrent Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent Write did not finish")
+	}
+	select {
+	case st := <-commitDone:
+		if st != gofuse.OK {
+			t.Fatalf("sync commit status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sync commit did not finish")
+	}
+
+	uploadMu.Lock()
+	firstUpload := append([]byte(nil), uploaded...)
+	uploadMu.Unlock()
+	if !bytes.Equal(firstUpload, original) {
+		t.Fatal("old sync commit did not upload its captured shadow snapshot")
+	}
+	fh.Lock()
+	dirtySeq := fh.DirtySeq
+	hasDirty := fh.Dirty != nil && fh.Dirty.HasDirtyParts()
+	fh.Unlock()
+	if dirtySeq == 0 || !hasDirty {
+		t.Fatalf("concurrent Write was cleared: dirty_seq=%d dirty=%t", dirtySeq, hasDirty)
+	}
+
+	if st := commit(fs, ino, fhID); st != gofuse.OK {
+		t.Fatalf("next sync commit status = %v, want OK", st)
+	}
+	wantRemote := append([]byte(nil), original...)
+	copy(wantRemote, updated)
+	uploadMu.Lock()
+	gotRemote := append([]byte(nil), uploaded...)
+	uploadMu.Unlock()
+	if !bytes.Equal(gotRemote, wantRemote) {
+		t.Fatalf("next sync commit body = %q, want updated dirty buffer", gotRemote[:len(updated)])
+	}
+}
+
+func TestGVisorCompatShadowSpillFlushRechecksSupersessionAfterFence(t *testing.T) {
+	const filePath = "/shadowspill-stale-after-fence.bin"
+	stale := bytes.Repeat([]byte("s"), writeBackThreshold)
+	newer := []byte("newer committed sibling data")
+	var putCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "unexpected request", http.StatusMethodNotAllowed)
+			return
+		}
+		putCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 2})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{
+		GVisorCompat: true,
+		SyncMode:     SyncStrict,
+		WritePolicy:  WritePolicyWriteBack,
+	}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(int64(writeBackThreshold + 1))
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	ino := fs.inodes.Lookup(filePath, false, int64(len(stale)), time.Now())
+	dirty := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	if _, err := dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(filePath, stale, 0); err != nil {
+		t.Fatal(err)
+	}
+	staleSeq := fs.markDirtySize(ino, int64(len(stale)))
+	fh := &FileHandle{
+		Ino:            ino,
+		Path:           filePath,
+		Dirty:          dirty,
+		DirtySeq:       staleSeq,
+		ShadowReady:    true,
+		ShadowSpill:    true,
+		ShadowStageGen: shadow.ActiveGeneration(filePath),
+		IsNew:          true,
+		WritePolicy:    WritePolicyWriteBack,
+	}
+	fhID := fs.allocateFileHandle(fh)
+
+	reachedFence := make(chan struct{})
+	allowFence := make(chan struct{})
+	previousHook := testHookBeforeGVisorShadowSpillFlushFence
+	testHookBeforeGVisorShadowSpillFlushFence = func(path string) {
+		if path != filePath {
+			return
+		}
+		close(reachedFence)
+		<-allowFence
+	}
+	t.Cleanup(func() {
+		testHookBeforeGVisorShadowSpillFlushFence = previousHook
+	})
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		flushDone <- fs.Flush(nil, &gofuse.FlushIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+		})
+	}()
+	select {
+	case <-reachedFence:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Flush did not reach the post-check, pre-fence boundary")
+	}
+
+	newerSeq := fs.markDirtySize(ino, int64(len(newer)))
+	fs.recordCommittedMutation(ino, newerSeq, 1, int64(len(newer)))
+	close(allowFence)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("stale Flush status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale Flush did not finish")
+	}
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("stale Flush remote PUTs = %d, want 0", got)
 	}
 }
