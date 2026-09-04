@@ -352,9 +352,9 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	}
 	if err == nil {
 		if snapshotIsNew {
-			fs.replaceCommittedRevision(snapshotPath, result.Revision)
+			fs.replaceCommittedRevisionWithSize(snapshotPath, result.Revision, result.Size)
 		} else {
-			fs.recordCommittedRevision(snapshotPath, result.Revision)
+			fs.recordCommittedRevisionWithSize(snapshotPath, result.Revision, result.Size)
 		}
 		if !snapshotOwnsShadow && fs.shadowStore != nil {
 			fs.shadowStore.Remove(snapshotPath)
@@ -410,6 +410,7 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	fs.inodes.UpdateRevision(fh.Ino, result.Revision)
 	fs.inodes.UpdateSize(fh.Ino, publishedSize)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, result.Revision, fh, result.Size)
+	fs.clearReadTargetsForPathExcept(snapshotPath, fh)
 	fs.cacheFileForPath(snapshotPath, publishedSize, time.Now(), result.Revision)
 	if snapshotIsNew && snapshot.Size() <= fs.readCache.MaxFileSize() {
 		if reader, openErr := snapshot.Open(); openErr == nil {
@@ -698,7 +699,7 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	_ = reader.Close()
 	if err == nil {
 		fs.recordAppendLogGenerationReset(uint64(snapshot.Size()))
-		fs.recordCommittedRevision(snapshotPath, revision)
+		fs.recordCommittedRevisionWithSize(snapshotPath, revision, sqliteWALHeaderSize)
 	}
 	if err != nil {
 		fs.debugf("append-log trace event=generation_reset_result path=%q result=error error=%q dirty_seq=%d wall_unix_nano=%d duration_ns=%d", snapshotPath, err, snapshotDirtySeq, time.Now().UnixNano(), time.Since(resetStarted).Nanoseconds())
@@ -810,7 +811,7 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	fs.recordAppendLogOutcome(err)
 	_ = reader.Close()
 	if err == nil {
-		fs.recordCommittedRevision(snapshotPath, revision)
+		fs.recordCommittedRevisionWithSize(snapshotPath, revision, snapshot.Size())
 		if !snapshotOwnsShadow && fs.shadowStore != nil {
 			fs.shadowStore.Remove(snapshotPath)
 			fs.clearRemovedCommittedShadowForOpenHandles(snapshotPath, revision, snapshot.Size())
@@ -853,6 +854,7 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.inodes.UpdateSize(fh.Ino, publishedSize)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, revision, fh, snapshot.Size())
+	fs.clearReadTargetsForPathExcept(snapshotPath, fh)
 	fs.cacheFileForPath(snapshotPath, publishedSize, time.Now(), revision)
 	if snapshot.Size() <= fs.readCache.MaxFileSize() {
 		if reader, openErr := snapshot.Open(); openErr == nil {

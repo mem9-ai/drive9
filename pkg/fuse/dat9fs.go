@@ -49,6 +49,7 @@ type Dat9FS struct {
 	mountViewGeneration atomic.Uint64
 	committedMu         sync.Mutex
 	committedRev        map[string]int64
+	committedSize       map[string]int64
 	remoteCommitMu      sync.Mutex
 	remoteCommitLocks   map[string]*sync.Mutex
 	readCache           *ReadCache
@@ -353,6 +354,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		locks:             newFuseLockTable(),
 		dirHandles:        NewHandleTable[*DirHandle](),
 		committedRev:      make(map[string]int64),
+		committedSize:     make(map[string]int64),
 		remoteCommitLocks: make(map[string]*sync.Mutex),
 		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, opts.ReadCacheTTL, opts.ReadCacheMaxFileBytes),
 		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, dirCacheMaxEntriesOrDefault(opts.DirCacheMaxEntries)),
@@ -2665,6 +2667,28 @@ func (fs *Dat9FS) recordCommittedRevision(path string, revision int64) {
 	}
 	if revision > fs.committedRev[path] {
 		fs.committedRev[path] = revision
+		delete(fs.committedSize, path)
+	}
+	fs.committedMu.Unlock()
+}
+
+// recordCommittedRevisionWithSize publishes the revision and exact remote
+// logical size as one path-level state transition. Waiting same-handle writers
+// must never adopt a new revision with the preceding object's size.
+func (fs *Dat9FS) recordCommittedRevisionWithSize(path string, revision, size int64) {
+	if fs == nil || path == "" || revision <= 0 || size < 0 {
+		return
+	}
+	fs.committedMu.Lock()
+	if fs.committedRev == nil {
+		fs.committedRev = make(map[string]int64)
+	}
+	if fs.committedSize == nil {
+		fs.committedSize = make(map[string]int64)
+	}
+	if revision >= fs.committedRev[path] {
+		fs.committedRev[path] = revision
+		fs.committedSize[path] = size
 	}
 	fs.committedMu.Unlock()
 }
@@ -2676,12 +2700,30 @@ func (fs *Dat9FS) replaceCommittedRevision(path string, revision int64) {
 	fs.committedMu.Lock()
 	if revision <= 0 {
 		delete(fs.committedRev, path)
+		delete(fs.committedSize, path)
 	} else {
 		if fs.committedRev == nil {
 			fs.committedRev = make(map[string]int64)
 		}
 		fs.committedRev[path] = revision
+		delete(fs.committedSize, path)
 	}
+	fs.committedMu.Unlock()
+}
+
+func (fs *Dat9FS) replaceCommittedRevisionWithSize(path string, revision, size int64) {
+	if fs == nil || path == "" || revision <= 0 || size < 0 {
+		return
+	}
+	fs.committedMu.Lock()
+	if fs.committedRev == nil {
+		fs.committedRev = make(map[string]int64)
+	}
+	if fs.committedSize == nil {
+		fs.committedSize = make(map[string]int64)
+	}
+	fs.committedRev[path] = revision
+	fs.committedSize[path] = size
 	fs.committedMu.Unlock()
 }
 
@@ -2691,6 +2733,7 @@ func (fs *Dat9FS) forgetCommittedRevision(path string) {
 	}
 	fs.committedMu.Lock()
 	delete(fs.committedRev, path)
+	delete(fs.committedSize, path)
 	fs.committedMu.Unlock()
 }
 
@@ -2703,19 +2746,26 @@ func (fs *Dat9FS) forgetCommittedRevisionPrefix(path string) {
 	for p := range fs.committedRev {
 		if p == path || strings.HasPrefix(p, prefix) {
 			delete(fs.committedRev, p)
+			delete(fs.committedSize, p)
 		}
 	}
 	fs.committedMu.Unlock()
 }
 
 func (fs *Dat9FS) latestCommittedRevision(path string) int64 {
+	revision, _, _ := fs.latestCommittedRevisionWithSize(path)
+	return revision
+}
+
+func (fs *Dat9FS) latestCommittedRevisionWithSize(path string) (revision, size int64, hasSize bool) {
 	if fs == nil || path == "" {
-		return 0
+		return 0, 0, false
 	}
 	fs.committedMu.Lock()
-	revision := fs.committedRev[path]
+	revision = fs.committedRev[path]
+	size, hasSize = fs.committedSize[path]
 	fs.committedMu.Unlock()
-	return revision
+	return revision, size, hasSize
 }
 
 func (fs *Dat9FS) lockRemoteCommitPath(path string) func() {
@@ -2806,7 +2856,7 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 	if fs == nil || fh == nil {
 		return
 	}
-	revision := fs.latestCommittedRevision(fh.Path)
+	revision, committedSize, hasCommittedSize := fs.latestCommittedRevisionWithSize(fh.Path)
 	if revision <= 0 {
 		fs.clearRemovedCommittedShadowLocked(fh, 0, fs.committedHandleSizeLocked(fh), false)
 		return
@@ -2819,6 +2869,10 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 		}
 		fh.IsNew = false
 		fh.BaseRev = revision
+		if hasCommittedSize && fh.Dirty != nil && fh.Dirty.Size() >= committedSize {
+			fh.OrigSize = committedSize
+			fh.appendLogRebindLayout(revision, committedSize)
+		}
 		if fh.Streamer != nil {
 			fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
 		}

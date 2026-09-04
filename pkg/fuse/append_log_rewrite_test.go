@@ -54,6 +54,33 @@ func TestAppendLogFullRewriteUsesOneConditionalPUT(t *testing.T) {
 	}
 }
 
+func TestAppendLogFullRewriteClearsReadOnlySiblingTarget(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+	reader := &FileHandle{Path: fh.Path, ReadTarget: &client.ReadTarget{ObjectURL: "https://old-object.example"}}
+	fs.openHandles.Add(reader)
+	defer fs.openHandles.Remove(reader)
+
+	fh.Lock()
+	result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if reader.ReadTarget != nil {
+		t.Fatalf("read-only sibling retained stale target: %+v", reader.ReadTarget)
+	}
+}
+
 func TestAppendLogFullRewriteFinalizesBeforePendingModeFailure(t *testing.T) {
 	var putCalls, chmodCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
