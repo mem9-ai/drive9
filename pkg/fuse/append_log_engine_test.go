@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"syscall"
 	"testing"
+	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -49,6 +50,51 @@ func TestAppendLogTailCommit(t *testing.T) {
 	}
 	if got := fh.appendLogLayoutAt(6, 7); got != client.ContentLayoutAppendLog {
 		t.Fatalf("layout = %q, want append_log", got)
+	}
+}
+
+func TestAppendLogTailCommitAppliesPendingModeAndCachesDirEntry(t *testing.T) {
+	var appendCalls, chmodCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("append-log"):
+			appendCalls++
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls++
+			var request struct {
+				Mode uint32 `json:"mode"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			if request.Mode != 0o600 {
+				t.Fatalf("chmod mode = %o, want 600", request.Mode)
+			}
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	})
+	defer closeServer()
+	fh.Ino = fs.inodes.Lookup(fh.Path, false, fh.OrigSize, time.Now())
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "db-wal", Size: 0, Revision: 5}})
+
+	fh.Lock()
+	fs.setPendingModeLocked(fh, 0o600, 1)
+	result := fs.tryAppendLogLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if appendCalls != 1 || chmodCalls != 1 || fh.HasPendingMode {
+		t.Fatalf("append/chmod/pending = %d/%d/%t, want 1/1/false", appendCalls, chmodCalls, fh.HasPendingMode)
+	}
+	if entry, ok := fs.inodes.GetEntry(fh.Ino); !ok || !entry.HasMode || entry.Mode != 0o600 {
+		t.Fatalf("inode mode = %+v/%t, want explicit 600", entry, ok)
+	}
+	cached := fs.dirCache.Lookup("/", "db-wal")
+	if cached.kind != namespaceLookupPositive || cached.item.Size != 7 || cached.item.Revision != 6 {
+		t.Fatalf("dir cache = %+v, want size/revision 7/6", cached)
 	}
 }
 

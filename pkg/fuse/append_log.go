@@ -214,6 +214,10 @@ func (fh *FileHandle) appendLogRebindLayout(revision, size int64) {
 	}
 	fh.appendLog.revision = revision
 	fh.appendLog.size = size
+	if fh.appendLog.hasRewriteBase {
+		fh.appendLog.rewriteBaseRevision = revision
+		fh.appendLog.rewriteBaseSize = size
+	}
 }
 
 func (fs *Dat9FS) appendLogReadSQLiteWALHeaderLocked(fh *FileHandle) (sqliteWALHeader, bool) {
@@ -371,6 +375,10 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	if fh.Unlinked || fh.Path != snapshotPath {
 		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 	}
+	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+		safeLogPrintf("append-log pending chmod failed for %s: %v", snapshotPath, err)
+		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
+	}
 	fh.IsNew = false
 	fh.BaseRev = result.Revision
 	fh.OrigSize = result.Size
@@ -391,6 +399,7 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	fs.inodes.UpdateRevision(fh.Ino, result.Revision)
 	fs.inodes.UpdateSize(fh.Ino, result.Size)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, result.Revision, fh, result.Size)
+	fs.cacheFileForPath(snapshotPath, result.Size, time.Now(), result.Revision)
 	if snapshotIsNew && snapshot.Size() <= fs.readCache.MaxFileSize() {
 		if reader, openErr := snapshot.Open(); openErr == nil {
 			if data, readErr := io.ReadAll(reader); readErr == nil {
@@ -553,7 +562,8 @@ func (fs *Dat9FS) rotateAppendLogGenerationShadowLocked(fh *FileHandle, path str
 	if fh == nil {
 		return
 	}
-	hadShadow := fh.ShadowReady || fh.ShadowSpill || fh.ShadowPinned
+	hadShadow := fh.ShadowReady || fh.ShadowSpill || fh.ShadowPinned ||
+		(fs != nil && fs.shadowStore != nil && fs.shadowStore.Has(path))
 	if !hadShadow {
 		return
 	}
@@ -663,7 +673,12 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	unlockRemoteCommit()
 	fh.Lock()
 	unlockRemoteCommit = fs.lockHandleRemoteCommitPathLocked(fh)
-	defer unlockRemoteCommit()
+	remoteCommitHeld := true
+	defer func() {
+		if remoteCommitHeld {
+			unlockRemoteCommit()
+		}
+	}()
 	if err != nil {
 		fs.debugf("append-log trace event=generation_reset_result path=%q result=error error=%q dirty_seq=%d wall_unix_nano=%d duration_ns=%d", snapshotPath, err, snapshotDirtySeq, time.Now().UnixNano(), time.Since(resetStarted).Nanoseconds())
 		if appendLogErrorCode(err) == client.AppendLogCodeTooLarge {
@@ -691,7 +706,6 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 		fs.rotateAppendLogGenerationShadowLocked(fh, snapshotPath, newHeader, revision)
 		clearReadTargetForLockedHandle(fh)
 		fs.readCache.Put(snapshotPath, newHeader.raw[:], revision)
-		fs.inodes.UpdateSize(fh.Ino, sqliteWALHeaderSize)
 	} else {
 		fh.appendLogRebindLayout(revision, sqliteWALHeaderSize)
 		fh.appendLog.sqliteWALConfirmed = true
@@ -699,7 +713,15 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 		fh.appendLog.appendSafe = false
 	}
 	fs.inodes.UpdateRevision(fh.Ino, revision)
+	fs.inodes.UpdateSize(fh.Ino, sqliteWALHeaderSize)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, revision, fh, sqliteWALHeaderSize)
+	fs.cacheFileForPath(snapshotPath, sqliteWALHeaderSize, time.Now(), revision)
+	unlockRemoteCommit()
+	remoteCommitHeld = false
+	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+		safeLogPrintf("append-log generation-reset pending chmod failed for %s: %v", snapshotPath, err)
+		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
+	}
 	return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 }
 
@@ -784,6 +806,10 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	if fh.Unlinked || fh.Path != snapshotPath {
 		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 	}
+	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+		safeLogPrintf("append-log full-rewrite pending chmod failed for %s: %v", snapshotPath, err)
+		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
+	}
 	fh.BaseRev = revision
 	fh.OrigSize = snapshot.Size()
 	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, revision, snapshot.Size())
@@ -801,6 +827,7 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.inodes.UpdateSize(fh.Ino, snapshot.Size())
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, revision, fh, snapshot.Size())
+	fs.cacheFileForPath(snapshotPath, snapshot.Size(), time.Now(), revision)
 	if snapshot.Size() <= fs.readCache.MaxFileSize() {
 		if reader, openErr := snapshot.Open(); openErr == nil {
 			if data, readErr := io.ReadAll(reader); readErr == nil {

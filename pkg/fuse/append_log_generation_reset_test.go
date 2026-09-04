@@ -480,6 +480,98 @@ func TestAppendLogGenerationResetRotatesPinnedShadow(t *testing.T) {
 	}
 }
 
+func TestAppendLogGenerationResetRotatesUnownedPathShadow(t *testing.T) {
+	oldHeader, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
+	if !ok {
+		t.Fatal("old header did not parse")
+	}
+	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	setGenerationResetDirty(t, fh, oldHeader, newHeader, 64)
+	if err := shadow.WriteFull(fh.Path, bytes.Repeat([]byte{'o'}, 64), fh.BaseRev); err != nil {
+		t.Fatal(err)
+	}
+	// The previous shadow owner may already have closed. A newly opened handle
+	// has no per-handle shadow flags, but the path-level shadow remains active.
+	if fh.ShadowReady || fh.ShadowSpill || fh.ShadowPinned {
+		t.Fatal("fixture unexpectedly has handle-owned shadow state")
+	}
+
+	fh.Lock()
+	result := fs.tryAppendLogGenerationResetLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	data, err := shadow.ReadAll(fh.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, newHeader) {
+		t.Fatalf("rotated shadow = %x, want H1 %x", data, newHeader)
+	}
+	if !fh.ShadowReady || !fh.ShadowSpill {
+		t.Fatalf("new generation shadow state = ready=%t spill=%t, want true/true", fh.ShadowReady, fh.ShadowSpill)
+	}
+}
+
+func TestAppendLogGenerationResetAppliesPendingModeAndCachesDirEntry(t *testing.T) {
+	oldHeader, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
+	if !ok {
+		t.Fatal("old header did not parse")
+	}
+	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
+	var putCalls, chmodCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			putCalls++
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls++
+			var request struct {
+				Mode uint32 `json:"mode"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			if request.Mode != 0o600 {
+				t.Fatalf("chmod mode = %o, want 600", request.Mode)
+			}
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	})
+	defer closeServer()
+	setGenerationResetDirty(t, fh, oldHeader, newHeader, 64)
+	fh.Ino = fs.inodes.Lookup(fh.Path, false, fh.OrigSize, time.Now())
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "db-wal", Size: 0, Revision: 5}})
+
+	fh.Lock()
+	fs.setPendingModeLocked(fh, 0o600, 1)
+	result := fs.tryAppendLogGenerationResetLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if putCalls != 1 || chmodCalls != 1 || fh.HasPendingMode {
+		t.Fatalf("put/chmod/pending = %d/%d/%t, want 1/1/false", putCalls, chmodCalls, fh.HasPendingMode)
+	}
+	cached := fs.dirCache.Lookup("/", "db-wal")
+	if cached.kind != namespaceLookupPositive || cached.item.Size != sqliteWALHeaderSize || cached.item.Revision != 6 {
+		t.Fatalf("dir cache = %+v, want size/revision %d/6", cached, sqliteWALHeaderSize)
+	}
+}
+
 func TestAppendLogGenerationResetShadowFailureKeepsRemoteReset(t *testing.T) {
 	oldHeader, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
 	if !ok {
@@ -645,18 +737,24 @@ func TestAppendLogGenerationResetDoesNotInvertHandleAndRemoteCommitLocks(t *test
 	responseStarted := make(chan struct{})
 	releaseResponse := make(chan struct{})
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
+		switch {
+		case r.Method == http.MethodPut:
+			close(responseStarted)
+			<-releaseResponse
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			return
+		default:
 			t.Errorf("method = %s, want PUT", r.Method)
 			w.WriteHeader(http.StatusInternalServerError)
-			return
 		}
-		close(responseStarted)
-		<-releaseResponse
-		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
 	})
 	defer closeServer()
 
 	setGenerationResetDirty(t, fh, oldHeader, newHeader, 64)
+	fh.Lock()
+	fs.setPendingModeLocked(fh, 0o600, 1)
+	fh.Unlock()
 	resetDone := make(chan appendLogAttemptResult, 1)
 	go func() {
 		fh.Lock()
