@@ -709,6 +709,88 @@ func TestAppendLogGenericUnsupportedReroutesOnceToFullPUT(t *testing.T) {
 	}
 }
 
+func TestAppendLogGenericUnsupportedReroutesUnmatchedPhysicalAppendLayout(t *testing.T) {
+	var putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		putCalls++
+		body, _ := io.ReadAll(r.Body)
+		if got := string(body); got != "pretail" {
+			t.Errorf("full rewrite body = %q, want pretail", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	fs.appendLogMatcher = NewAppendLogMatcher([]string{"/configured/**"})
+	if fs.appendLogPathConfigured(fh.Path) {
+		t.Fatal("fixture path unexpectedly matches append-log policy")
+	}
+
+	fh.Lock()
+	handled, status := fs.routeAppendLogGenericUnsupportedLocked(
+		context.Background(),
+		fh,
+		fh.Path,
+		fh.DirtySeq,
+		&client.StatusError{StatusCode: http.StatusBadRequest, Code: client.AppendLogCodeUnsupported},
+	)
+	fh.Unlock()
+	if !handled || status != gofuse.OK || putCalls != 1 {
+		t.Fatalf("handled/status/puts = %t/%d/%d, want true/OK/1", handled, status, putCalls)
+	}
+	if got := fh.appendLogLayoutAt(6, 7); got != client.ContentLayoutAppendLog {
+		t.Fatalf("observed layout = %q, want append_log", got)
+	}
+}
+
+func TestAppendLogPathTruncateReusesSetAttrCommitLock(t *testing.T) {
+	fs, _, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+		case http.MethodPut:
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	ino := fs.inodes.Lookup("/db-wal", false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	unlock := fs.waitQueuedRemoteCommitBeforeWrite(entry.Path)
+	defer unlock()
+	type truncateResult struct {
+		handled bool
+		status  gofuse.Status
+	}
+	done := make(chan truncateResult, 1)
+	go func() {
+		handled, status := fs.tryAppendLogPathTruncate(context.Background(), entry, ino, 0, 0, nil)
+		done <- truncateResult{handled: handled, status: status}
+	}()
+	select {
+	case result := <-done:
+		if !result.handled || result.status != gofuse.OK {
+			t.Fatalf("truncate result = %+v, want handled/OK", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("append-log truncate attempted to reacquire SetAttr's path lock")
+	}
+}
+
 func TestAppendLogReleaseShadowSpillRoutesBeforeCommitQueue(t *testing.T) {
 	var appendCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {

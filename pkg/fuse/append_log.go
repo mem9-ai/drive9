@@ -748,7 +748,7 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 }
 
 func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHandle) appendLogAttemptResult {
-	if fs == nil || fs.client == nil || fh == nil || fh.Dirty == nil || fh.IsNew || !fs.appendLogConfiguredLocked(fh) {
+	if fs == nil || fs.client == nil || fh == nil || fh.Dirty == nil || fh.IsNew {
 		return appendLogAttemptResult{route: appendLogRouteNotApplicable, status: gofuse.OK}
 	}
 	expectedRevision, expectedSize := fh.appendLogCommittedBaseline()
@@ -917,7 +917,7 @@ func (fs *Dat9FS) routeAppendLogLocked(ctx context.Context, fh *FileHandle) (han
 // That response proves the target layout and permits one full-PUT reroute; it
 // must never retry the rejected generic plan.
 func (fs *Dat9FS) routeAppendLogGenericUnsupportedLocked(ctx context.Context, fh *FileHandle, snapshotPath string, snapshotDirtySeq uint64, err error) (handled bool, status gofuse.Status) {
-	if appendLogErrorCode(err) != client.AppendLogCodeUnsupported || !fs.appendLogConfiguredLocked(fh) ||
+	if appendLogErrorCode(err) != client.AppendLogCodeUnsupported || fh == nil || fh.Layer == PathLayerLocalOnly || fh.Layer == PathLayerGitWorkspace ||
 		fh.Unlinked || fh.Path != snapshotPath || fh.DirtySeq != snapshotDirtySeq {
 		return false, gofuse.OK
 	}
@@ -942,16 +942,15 @@ func (fs *Dat9FS) appendLogNewPathActive(path string) bool {
 	return fs.appendLogPathConfigured(path) && fs.client != nil && fs.client.CachedAppendLogSupported()
 }
 
-// tryAppendLogPathTruncate handles a truncate that has no file handle. An
-// existing append-log object must still use the server-proxied conditional PUT
-// rather than the generic truncate helper, which may select multipart upload.
+// tryAppendLogPathTruncate handles a truncate that has no file handle. Its
+// SetAttr caller already holds the same-path remote commit lock; an existing
+// append-log object must still use the server-proxied conditional PUT rather
+// than the generic truncate helper, which may select multipart upload.
 func (fs *Dat9FS) tryAppendLogPathTruncate(ctx context.Context, entry *InodeEntry, ino uint64, pid uint32, newSize int64, data []byte) (bool, gofuse.Status) {
 	if fs == nil || fs.client == nil || entry == nil || entry.Revision <= 0 || !fs.appendLogPathConfigured(entry.Path) {
 		return false, gofuse.OK
 	}
 
-	unlockRemoteCommit := fs.lockWritableRemoteCommitPath(entry.Path)
-	defer unlockRemoteCommit()
 	apiPath := fs.remotePath(entry.Path)
 	statStart := fs.perfStart()
 	stat, err := fs.client.StatCtx(ctx, apiPath)
