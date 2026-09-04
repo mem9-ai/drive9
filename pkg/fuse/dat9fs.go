@@ -8923,8 +8923,15 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if fs.debouncer != nil {
 		fs.debouncer.Cancel(childP)
 	}
-	if err := fs.snapshotOpenHandlesBeforeUnlink(ctx, childP); err != nil {
-		status = httpToFuseStatus(err)
+	snapshotCtx := ctx
+	snapshotCancel := func() {}
+	if fs.gvisorCompatibilityEnabled() {
+		snapshotCtx, snapshotCancel = fs.namespaceMutationCommitContext(ctx)
+	}
+	snapshotErr := fs.snapshotOpenHandlesBeforeUnlink(snapshotCtx, childP)
+	snapshotCancel()
+	if snapshotErr != nil {
+		status = httpToFuseStatus(snapshotErr)
 		return status
 	}
 
