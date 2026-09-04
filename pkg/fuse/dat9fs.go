@@ -9831,7 +9831,10 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		return st
 	}
 	if oldInfo.special {
-		return fs.renameMetadataOnlySpecial(ctx, input, oldP, newP, newInfo)
+		specialRenameCtx, specialRenameCancel := fs.namespaceMutationCommitContext(ctx)
+		st := fs.renameMetadataOnlySpecial(specialRenameCtx, input, oldP, newP, newInfo)
+		specialRenameCancel()
+		return st
 	}
 
 	pendingRename, err := fs.renamePendingNewCommit(ctx, input, oldP, newP)

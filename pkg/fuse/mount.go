@@ -103,6 +103,14 @@ type MountOptions struct {
 
 const defaultUploadConcurrency = 16
 
+// gvisorWriteBackRequiresCommitQueue rejects the legacy write-back uploader
+// path for gVisor-compatible write-back mounts. That uploader persists only
+// path-owned metadata, so it cannot enforce the inode mutation ordering that
+// GVisorCompat requires.
+func gvisorWriteBackRequiresCommitQueue(opts *MountOptions, writeBack *WriteBackCache, commitQueue *CommitQueue) bool {
+	return opts != nil && opts.GVisorCompat && opts.WritePolicy == WritePolicyWriteBack && writeBack != nil && commitQueue == nil
+}
+
 func (o *MountOptions) setDefaults() {
 	// Apply profile defaults before generic defaults so profile-specific
 	// zero-value options can take effect while explicit non-zero values win.
@@ -547,6 +555,15 @@ func Mount(opts *MountOptions) (err error) {
 					layerEventWatcherStop = StartLayerEventWatcher(dat9fs, c, opts, shadowStore, pendingIdx)
 				}
 				dat9fs.commitQueue = cq
+			}
+			if gvisorWriteBackRequiresCommitQueue(opts, wbCache, dat9fs.commitQueue) {
+				if journal != nil {
+					_ = journal.Close()
+				}
+				if shadowStore != nil {
+					shadowStore.Close()
+				}
+				return errors.New("mount: gvisor compat write-back requires pending index and shadow store")
 			}
 
 			if wbCache != nil {
