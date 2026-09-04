@@ -103,6 +103,21 @@ type MountOptions struct {
 
 const defaultUploadConcurrency = 16
 
+// gvisorWriteBackRequiresCommitQueue rejects the legacy write-back uploader
+// path for gVisor-compatible write-back mounts. That uploader persists only
+// path-owned metadata, so it cannot enforce the inode mutation ordering that
+// GVisorCompat requires.
+func gvisorWriteBackRequiresCommitQueue(opts *MountOptions, writeBack *WriteBackCache, commitQueue *CommitQueue) bool {
+	if opts == nil {
+		return false
+	}
+	policy := opts.WritePolicy
+	if policy == "" {
+		policy = WritePolicyWriteBack
+	}
+	return opts.GVisorCompat && policy == WritePolicyWriteBack && writeBack != nil && commitQueue == nil
+}
+
 func (o *MountOptions) setDefaults() {
 	// Apply profile defaults before generic defaults so profile-specific
 	// zero-value options can take effect while explicit non-zero values win.
@@ -528,7 +543,11 @@ func Mount(opts *MountOptions) (err error) {
 				cq.SetLayerRef(opts.LayerRef)
 				cq.SetPerfCounters(dat9fs.perf)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
+				cq.OnUploaded = dat9fs.onCommitQueueUploaded
 				cq.OnCleanup = dat9fs.onCommitQueueCleanup
+				cq.OnDiscard = dat9fs.onCommitQueueDiscard
+				cq.IsSuperseded = dat9fs.commitEntrySuperseded
+				cq.serializeMutationInodes = opts.GVisorCompat
 				cq.PathLock = dat9fs.lockRemoteCommitPath
 				cq.DurableWatermark = dat9fs.latestCommittedRevision
 				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {
@@ -543,6 +562,15 @@ func Mount(opts *MountOptions) (err error) {
 					layerEventWatcherStop = StartLayerEventWatcher(dat9fs, c, opts, shadowStore, pendingIdx)
 				}
 				dat9fs.commitQueue = cq
+			}
+			if gvisorWriteBackRequiresCommitQueue(opts, wbCache, dat9fs.commitQueue) {
+				if journal != nil {
+					_ = journal.Close()
+				}
+				if shadowStore != nil {
+					shadowStore.Close()
+				}
+				return errors.New("mount: gvisor compat write-back requires pending index and shadow store")
 			}
 
 			if wbCache != nil {

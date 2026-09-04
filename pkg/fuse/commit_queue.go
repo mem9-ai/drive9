@@ -51,6 +51,7 @@ func (cq *CommitQueue) directPutThreshold() int64 {
 type CommitEntry struct {
 	Path                 string
 	Inode                uint64
+	MutationSeq          uint64
 	BaseRev              int64 // revision when we started editing
 	Size                 int64
 	Kind                 PendingKind
@@ -84,6 +85,7 @@ type CommitEntry struct {
 	canceled              bool
 	cancelCommit          context.CancelFunc
 	cancelUpload          context.CancelFunc
+	mutationPublished     bool
 	payload               []byte
 	payloadBound          bool
 }
@@ -118,13 +120,18 @@ type CommitSuccessFunc func(entry *CommitEntry, committedRev int64)
 // state has been removed but before the queue entry is dequeued.
 type CommitCleanupFunc func(entry *CommitEntry)
 
+// CommitSupersededFunc reports whether a queued live-handle snapshot has been
+// overtaken by a newer mutation and must not reach remote storage.
+type CommitSupersededFunc func(entry *CommitEntry) bool
+
 // CommitQueue manages ordered background remote commits with baseRev tracking.
 // It provides backpressure when the queue exceeds maxPending items.
 type CommitQueue struct {
 	mu           sync.Mutex
 	queue        []*CommitEntry
 	queuedByPath map[string]map[*CommitEntry]struct{}
-	inFlight     map[string]*CommitEntry // paths currently being processed by workers
+	inFlight     map[string]*CommitEntry   // paths currently being processed by workers
+	immediate    map[*CommitEntry]struct{} // synchronous gVisor commits participating in inode ordering
 	delayed      map[*CommitEntry]*time.Timer
 	maxPending   int
 	client       *client.Client
@@ -145,8 +152,24 @@ type CommitQueue struct {
 	// revision. Used by dat9fs to seed readCache and update inode revision.
 	OnSuccess CommitSuccessFunc
 
+	// OnUploaded is called at the data-commit boundary before fallible mode,
+	// journal, or cleanup bookkeeping.
+	OnUploaded CommitSuccessFunc
+
 	// OnCleanup is called after local commit state has been removed.
 	OnCleanup CommitCleanupFunc
+
+	// OnDiscard is called after a superseded entry's owned staging and queue
+	// state have been removed without publishing commit success.
+	OnDiscard CommitCleanupFunc
+
+	// IsSuperseded is an optional upload-boundary guard. Sequence-zero path and
+	// recovery entries remain unfiltered by the Dat9FS implementation.
+	IsSuperseded CommitSupersededFunc
+
+	// serializeMutationInodes extends queue dispatch ordering across hardlink
+	// aliases for live-handle mutations. It is enabled only for gVisor mounts.
+	serializeMutationInodes bool
 
 	// PathLock serializes upload and cleanup against Dat9FS same-path shadow
 	// mutations. When unset, the queue still serializes same-path entries.
@@ -194,6 +217,7 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 		index:             index,
 		journal:           journal,
 		inFlight:          make(map[string]*CommitEntry),
+		immediate:         make(map[*CommitEntry]struct{}),
 		queuedByPath:      make(map[string]map[*CommitEntry]struct{}),
 		delayed:           make(map[*CommitEntry]*time.Timer),
 		workCh:            make(chan *CommitEntry, bufSize),
@@ -453,6 +477,14 @@ func (cq *CommitQueue) PendingStats() (count int, bytes int64) {
 		count++
 		bytes += e.Size
 	}
+	for e := range cq.immediate {
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		count++
+		bytes += e.Size
+	}
 	return
 }
 
@@ -506,12 +538,26 @@ func (cq *CommitQueue) snapshotLocked() CommitQueueSnapshot {
 		snap.Pending++
 		snap.Bytes += e.Size
 	}
+	for e := range cq.immediate {
+		if e == nil {
+			continue
+		}
+		if snap.FirstPath == "" {
+			snap.FirstPath = e.Path
+		}
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		snap.Pending++
+		snap.Bytes += e.Size
+	}
 	for e := range cq.delayed {
 		if e != nil && snap.FirstPath == "" {
 			snap.FirstPath = e.Path
 		}
 	}
-	snap.InFlight = len(cq.inFlight)
+	snap.InFlight = len(cq.inFlight) + len(cq.immediate)
 	snap.Delayed = len(cq.delayed)
 	if cq.index != nil {
 		var firstConflictPath string
@@ -685,8 +731,9 @@ func (cq *CommitQueue) WaitPath(path string) {
 		cq.forceDelayedPathLocked(path)
 		_, inflight := cq.inFlight[path]
 		queued := cq.hasQueuedPathLocked(path)
+		immediate := cq.hasImmediatePathLocked(path)
 		cq.mu.Unlock()
-		if !inflight && !queued {
+		if !inflight && !queued && !immediate {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -701,8 +748,9 @@ func (cq *CommitQueue) WaitPathTimeout(path string, pollInterval time.Duration) 
 	cq.forceDelayedPathLocked(path)
 	_, inflight := cq.inFlight[path]
 	queued := cq.hasQueuedPathLocked(path)
+	immediate := cq.hasImmediatePathLocked(path)
 	cq.mu.Unlock()
-	if !inflight && !queued {
+	if !inflight && !queued && !immediate {
 		return true
 	}
 	time.Sleep(pollInterval)
@@ -719,7 +767,86 @@ func (cq *CommitQueue) HasPath(path string) bool {
 	if _, inflight := cq.inFlight[path]; inflight {
 		return true
 	}
-	return cq.hasQueuedPathLocked(path)
+	return cq.hasQueuedPathLocked(path) || cq.hasImmediatePathLocked(path)
+}
+
+func (cq *CommitQueue) hasImmediatePathLocked(path string) bool {
+	for entry := range cq.immediate {
+		if entry != nil && entry.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+func (cq *CommitQueue) hasImmediatePrefixLocked(prefix string) bool {
+	for entry := range cq.immediate {
+		if entry != nil && strings.HasPrefix(entry.Path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (cq *CommitQueue) mutationSeqForPath(path string) uint64 {
+	if cq == nil || path == "" {
+		return 0
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	var seq uint64
+	if entry := cq.inFlight[path]; entry != nil && entry.MutationSeq > seq {
+		seq = entry.MutationSeq
+	}
+	for entry := range cq.immediate {
+		if entry != nil && entry.Path == path && entry.MutationSeq > seq {
+			seq = entry.MutationSeq
+		}
+	}
+	for entry := range cq.queuedByPath[path] {
+		if entry != nil && entry.MutationSeq > seq {
+			seq = entry.MutationSeq
+		}
+	}
+	return seq
+}
+
+func (cq *CommitQueue) hasNewerMutation(path string, ino, seq uint64) bool {
+	if cq == nil || path == "" || ino == 0 || seq == 0 {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	newer := func(entry *CommitEntry) bool {
+		return entry != nil && !entry.canceled && entry.Inode == ino && entry.MutationSeq > seq
+	}
+	if cq.serializeMutationInodes {
+		for _, entry := range cq.inFlight {
+			if newer(entry) {
+				return true
+			}
+		}
+		for entry := range cq.immediate {
+			if newer(entry) {
+				return true
+			}
+		}
+		for _, entry := range cq.queue {
+			if newer(entry) {
+				return true
+			}
+		}
+		return false
+	}
+	if newer(cq.inFlight[path]) {
+		return true
+	}
+	for entry := range cq.queuedByPath[path] {
+		if newer(entry) {
+			return true
+		}
+	}
+	return false
 }
 
 // WaitPrefix blocks until all in-flight or queued commits under the given
@@ -742,6 +869,9 @@ func (cq *CommitQueue) WaitPrefix(prefix string) {
 					break
 				}
 			}
+		}
+		if !found {
+			found = cq.hasImmediatePrefixLocked(prefix)
 		}
 		cq.mu.Unlock()
 		if !found {
@@ -774,6 +904,9 @@ func (cq *CommitQueue) WaitPrefixTimeout(prefix string, timeout time.Duration) b
 					break
 				}
 			}
+		}
+		if !found {
+			found = cq.hasImmediatePrefixLocked(prefix)
 		}
 		cq.mu.Unlock()
 		if !found {
@@ -835,6 +968,11 @@ func (cq *CommitQueue) CancelPathIfInode(path string, ino uint64) {
 	if e, ok := cq.inFlight[path]; ok {
 		markCanceled(e)
 	}
+	for e := range cq.immediate {
+		if e != nil && e.Path == path {
+			markCanceled(e)
+		}
+	}
 	if cq.queuedByPath != nil {
 		for e := range cq.queuedByPath[path] {
 			markCanceled(e)
@@ -884,7 +1022,7 @@ func (cq *CommitQueue) CancelQueuedZeroTruncatePreserveLocal(path string) bool {
 	}
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
-	if cq.inFlight[path] != nil {
+	if cq.inFlight[path] != nil || cq.hasImmediatePathLocked(path) {
 		return false
 	}
 	otherQueued := false
@@ -933,6 +1071,11 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	cq.mu.Lock()
 	if e, ok := cq.inFlight[path]; ok {
 		markCanceled(e)
+	}
+	for e := range cq.immediate {
+		if e != nil && e.Path == path {
+			markCanceled(e)
+		}
 	}
 	if cq.queuedByPath != nil {
 		for e := range cq.queuedByPath[path] {
@@ -1024,6 +1167,12 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 			cancelled = append(cancelled, p)
 		}
 	}
+	for e := range cq.immediate {
+		if e != nil && strings.HasPrefix(e.Path, prefix) {
+			markCanceled(e)
+			cancelled = append(cancelled, e.Path)
+		}
+	}
 	for _, e := range cq.queue {
 		if strings.HasPrefix(e.Path, prefix) {
 			markCanceled(e)
@@ -1071,6 +1220,41 @@ func (cq *CommitQueue) isEntryCanceled(entry *CommitEntry) bool {
 	return entry.canceled
 }
 
+func (cq *CommitQueue) isCanceledImmediateEntry(entry *CommitEntry) bool {
+	if cq == nil || entry == nil || !cq.serializeMutationInodes {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	_, immediate := cq.immediate[entry]
+	return immediate && entry.canceled
+}
+
+func (cq *CommitQueue) discardSupersededEntry(entry *CommitEntry) bool {
+	if cq == nil || entry == nil || cq.IsSuperseded == nil || !cq.IsSuperseded(entry) {
+		return false
+	}
+	cq.discardEntry(entry)
+	return true
+}
+
+func (cq *CommitQueue) discardEntry(entry *CommitEntry) {
+	if cq == nil || entry == nil {
+		return
+	}
+	if cq.index != nil && entry.PendingIndexGen != 0 {
+		cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
+	}
+	if cq.shadows != nil && entry.ShadowGen != 0 {
+		cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
+	}
+	cq.removeFromQueue(entry)
+	if cq.OnDiscard != nil {
+		cq.OnDiscard(entry)
+	}
+	safeLogPrintf("commit queue: discarded superseded entry for %s (inode=%d seq=%d)", entry.Path, entry.Inode, entry.MutationSeq)
+}
+
 func (cq *CommitQueue) worker() {
 	defer cq.wg.Done()
 	for entry := range cq.workCh {
@@ -1116,8 +1300,7 @@ func (cq *CommitQueue) beginInFlight(entry *CommitEntry) bool {
 		if cq.inFlight == nil {
 			cq.inFlight = make(map[string]*CommitEntry)
 		}
-		oldest := cq.oldestQueuedForPathLocked(entry.Path)
-		if cq.inFlight[entry.Path] == nil && (oldest == nil || oldest == entry) {
+		if cq.canBeginInFlightLocked(entry) {
 			cq.inFlight[entry.Path] = entry
 			cq.mu.Unlock()
 			return true
@@ -1139,11 +1322,39 @@ func (cq *CommitQueue) tryBeginInFlight(entry *CommitEntry) bool {
 	if cq.inFlight == nil {
 		cq.inFlight = make(map[string]*CommitEntry)
 	}
-	oldest := cq.oldestQueuedForPathLocked(entry.Path)
-	if cq.inFlight[entry.Path] != nil || (oldest != nil && oldest != entry) {
+	if !cq.canBeginInFlightLocked(entry) {
 		return false
 	}
 	cq.inFlight[entry.Path] = entry
+	return true
+}
+
+func (cq *CommitQueue) canBeginInFlightLocked(entry *CommitEntry) bool {
+	if cq == nil || entry == nil || cq.inFlight[entry.Path] != nil {
+		return false
+	}
+	if oldest := cq.oldestQueuedForPathLocked(entry.Path); oldest != nil && oldest != entry {
+		return false
+	}
+	if !cq.serializeMutationInodes || entry.Inode == 0 || entry.MutationSeq == 0 {
+		return true
+	}
+	for _, active := range cq.inFlight {
+		if active != nil && active != entry && active.Inode == entry.Inode && active.MutationSeq != 0 {
+			return false
+		}
+	}
+	for active := range cq.immediate {
+		if active != nil && !active.canceled && active != entry && active.Inode == entry.Inode && active.MutationSeq != 0 {
+			return false
+		}
+	}
+	for _, queued := range cq.queue {
+		if queued == nil || queued.canceled || queued.Inode != entry.Inode || queued.MutationSeq == 0 {
+			continue
+		}
+		return queued == entry
+	}
 	return true
 }
 
@@ -1237,6 +1448,10 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cq.mu.Unlock()
 
 		unlockPath := cq.lockPath(entry.Path)
+		if cq.discardSupersededEntry(entry) {
+			unlockPath()
+			return
+		}
 		committedRev, err := cq.uploadEntry(ctx, entry)
 		cq.mu.Lock()
 		entry.cancelUpload = nil
@@ -1418,15 +1633,16 @@ func (cq *CommitQueue) batchWriteEligible(entry *CommitEntry) bool {
 }
 
 func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
+	allEntries := append([]*CommitEntry(nil), entries...)
 	entryCtx, entryCancel := context.WithCancel(context.Background())
 	cq.mu.Lock()
-	for _, entry := range entries {
+	for _, entry := range allEntries {
 		entry.cancelCommit = entryCancel
 	}
 	cq.mu.Unlock()
 	defer func() {
 		cq.mu.Lock()
-		for _, entry := range entries {
+		for _, entry := range allEntries {
 			entry.cancelCommit = nil
 			entry.cancelUpload = nil
 		}
@@ -1451,6 +1667,27 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 	}
 	cq.mu.Unlock()
 	unlockPaths := cq.lockBatchPaths(entries)
+	active := entries[:0]
+	for _, entry := range entries {
+		if cq.discardSupersededEntry(entry) {
+			cq.endInFlight(entry)
+			continue
+		}
+		active = append(active, entry)
+	}
+	entries = active
+	if len(entries) == 0 {
+		cancel()
+		unlockPaths()
+		return
+	}
+	if len(entries) == 1 {
+		cancel()
+		unlockPaths()
+		cq.fallbackBatchEntries(entries)
+		return
+	}
+
 	remoteItems, err := cq.prepareBatchWriteItems(entries)
 	if err != nil {
 		unlockPaths()
@@ -1489,9 +1726,9 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 	}
 	cq.mu.Unlock()
 	cancel()
-	unlockPaths()
 
 	if err != nil {
+		unlockPaths()
 		if isBatchWriteUnsupported(err) {
 			cq.ConfigureBatchWrite(0, 0, 0)
 		}
@@ -1500,10 +1737,16 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 		return
 	}
 	if len(results) != len(entries) {
+		unlockPaths()
 		safeLogPrintf("commit queue: batch write returned %d results for %d entries, falling back to single commits", len(results), len(entries))
 		cq.fallbackBatchEntries(entries)
 		return
 	}
+	type failedBatchEntry struct {
+		entry *CommitEntry
+		err   error
+	}
+	failed := make([]failedBatchEntry, 0)
 	for i, result := range results {
 		entry := entries[i]
 		if cq.isEntryCanceled(entry) {
@@ -1521,6 +1764,12 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 			continue
 		}
 		resultErr := batchWriteResultError(result)
+		failed = append(failed, failedBatchEntry{entry: entry, err: resultErr})
+	}
+	unlockPaths()
+	for _, failure := range failed {
+		entry := failure.entry
+		resultErr := failure.err
 		if errors.Is(resultErr, client.ErrConflict) {
 			unlockPath := cq.lockPath(entry.Path)
 			if entry.DisableAutoResolveLWW {
@@ -1708,24 +1957,71 @@ func (cq *CommitQueue) entryUploadContext(parent context.Context, entry *CommitE
 // by workers. It is used as a fallback when the async queue rejects an entry
 // after local state has already moved to the final path.
 func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error {
+	if err := cq.rejectAbandonedLayer(); err != nil {
+		return err
+	}
+	release, discard, err := cq.beginImmediateMutationCommit(ctx, entry, false)
+	if err != nil {
+		return err
+	}
+	if discard {
+		cq.discardEntry(entry)
+		return nil
+	}
+	if release != nil {
+		defer release()
+	}
+	unlockPath := cq.lockPath(entry.Path)
+	defer unlockPath()
+	return cq.commitNowClaimedPathLocked(ctx, entry)
+}
+
+func (cq *CommitQueue) rejectAbandonedLayer() error {
 	cq.mu.Lock()
 	abandoned := cq.abandoned
 	cq.mu.Unlock()
 	if abandoned {
 		return errLayerRolledBack
 	}
-	unlockPath := cq.lockPath(entry.Path)
-	defer unlockPath()
-	return cq.commitNowPathLocked(ctx, entry)
+	return nil
 }
 
 func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEntry) error {
+	if err := cq.rejectAbandonedLayer(); err != nil {
+		return err
+	}
+	release, discard, err := cq.beginImmediateMutationCommit(ctx, entry, true)
+	if err != nil {
+		return err
+	}
+	if discard {
+		cq.discardEntry(entry)
+		return nil
+	}
+	if release != nil {
+		defer release()
+	}
+	return cq.commitNowClaimedPathLocked(ctx, entry)
+}
+
+func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *CommitEntry) error {
+	if cq.isCanceledImmediateEntry(entry) {
+		cq.removeFromQueue(entry)
+		return nil
+	}
+	if cq.discardSupersededEntry(entry) {
+		return nil
+	}
 	committedRev, err := cq.uploadEntry(ctx, entry)
 	if err != nil {
 		if cq.perf != nil {
 			cq.perf.commitFailure.add(1)
 		}
 		return err
+	}
+	if cq.isCanceledImmediateEntry(entry) {
+		cq.removeFromQueue(entry)
+		return nil
 	}
 	if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err != nil {
 		if cq.perf != nil {
@@ -1734,6 +2030,78 @@ func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEnt
 		return err
 	}
 	return nil
+}
+
+func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *CommitEntry, pathLocked bool) (func(), bool, error) {
+	if cq == nil || entry == nil || !cq.serializeMutationInodes || entry.Inode == 0 || entry.MutationSeq == 0 {
+		return nil, false, nil
+	}
+	for {
+		cq.mu.Lock()
+		newer := false
+		older := false
+		samePathWorker := pathLocked && cq.inFlight[entry.Path] != nil
+		for _, active := range cq.inFlight {
+			if active == nil || active.canceled || active == entry || (pathLocked && active.Path == entry.Path) || active.Inode != entry.Inode || active.MutationSeq == 0 {
+				continue
+			}
+			if active.MutationSeq > entry.MutationSeq {
+				newer = true
+			} else if active.MutationSeq < entry.MutationSeq {
+				older = true
+			}
+		}
+		for active := range cq.immediate {
+			if active == nil || active.canceled || active == entry || (pathLocked && active.Path == entry.Path) || active.Inode != entry.Inode || active.MutationSeq == 0 {
+				continue
+			}
+			if active.MutationSeq > entry.MutationSeq {
+				newer = true
+			} else if active.MutationSeq < entry.MutationSeq {
+				older = true
+			}
+		}
+		for _, queued := range cq.queue {
+			if queued == nil || queued.canceled || queued == entry || (pathLocked && queued.Path == entry.Path) || queued.Inode != entry.Inode || queued.MutationSeq == 0 {
+				continue
+			}
+			if samePathWorker && queued.MutationSeq < entry.MutationSeq {
+				continue
+			}
+			if queued.MutationSeq > entry.MutationSeq {
+				newer = true
+			} else if queued.MutationSeq < entry.MutationSeq {
+				older = true
+			}
+		}
+		if newer {
+			cq.mu.Unlock()
+			return nil, true, nil
+		}
+		if !older && (pathLocked || cq.inFlight[entry.Path] == nil) {
+			if cq.immediate == nil {
+				cq.immediate = make(map[*CommitEntry]struct{})
+			}
+			cq.immediate[entry] = struct{}{}
+			cq.mu.Unlock()
+			return func() { cq.endImmediate(entry) }, false, nil
+		}
+		cq.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func (cq *CommitQueue) endImmediate(entry *CommitEntry) {
+	if cq == nil || entry == nil {
+		return
+	}
+	cq.mu.Lock()
+	delete(cq.immediate, entry)
+	cq.mu.Unlock()
 }
 
 func committedRevisionForExpectedRevision(expectedRevision, committedRev int64) int64 {
@@ -1937,6 +2305,9 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	if layerRef == "" {
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	}
+	if cq.OnUploaded != nil {
+		cq.OnUploaded(entry, committedRev)
+	}
 
 	if layerRef == "" && !remoteModeAlreadyApplied && shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -2032,6 +2403,9 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 // This covers ~80% of agent conflict scenarios (whole-file overwrites) without
 // requiring 3-way merge. Max 1 retry to avoid write amplification.
 func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *CommitEntry) {
+	if cq.discardSupersededEntry(entry) {
+		return
+	}
 	// Bail early if the file was deleted locally while queued.
 	if cq.isEntryCanceled(entry) {
 		cq.removeFromQueue(entry)
@@ -2181,6 +2555,9 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	if err := cq.validateEntryPayloadFresh(entry); err != nil {
 		safeLogPrintf("commit queue: auto-resolve rejected stale payload for %s before LWW: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
+		return
+	}
+	if cq.discardSupersededEntry(entry) {
 		return
 	}
 	// Re-check cancelation before the potentially expensive upload.

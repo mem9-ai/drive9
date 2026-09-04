@@ -31,6 +31,8 @@ type multipartUploadRecorder struct {
 	statCalls        atomic.Int32
 	s3PutCalls       atomic.Int32
 	directFilePuts   atomic.Int32
+	completeStarted  chan struct{}
+	allowComplete    chan struct{}
 	mu               sync.Mutex
 	gotUploadedBytes int64
 }
@@ -190,6 +192,10 @@ func newMultipartUploadRecorder(t *testing.T, wantPath string, wantSize int64, w
 				if part.Number != wantNumber || part.ETag != "etag-1" {
 					t.Fatalf("complete part[%d] = %+v, want number=%d etag=etag-1", i, part, wantNumber)
 				}
+			}
+			if rec.completeStarted != nil {
+				close(rec.completeStarted)
+				<-rec.allowComplete
 			}
 			w.WriteHeader(http.StatusOK)
 			return
