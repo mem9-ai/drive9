@@ -490,6 +490,13 @@ server preserves an existing `append_log` layout across a full rewrite; FUSE
 does not choose the object bucket itself. An existing `single` target remains
 `single` after fallback.
 
+An unmatched path never proactively uses AppendLog, WAL proof/reset, or an
+append-log layout stat. The one exception is a generic PATCH/V2/direct-upload
+request that the server definitively rejects with `append_log_unsupported`:
+FUSE reroutes that already-frozen full image once to conditional full-body PUT
+under section 4.2. This is physical-layout write compatibility, not automatic
+append-log discovery or eligibility for later tail append.
+
 For a configured existing file that needs a full rewrite, transport selection
 uses per-handle observed layout without affecting later append eligibility:
 
