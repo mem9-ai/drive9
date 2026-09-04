@@ -61,6 +61,47 @@ func TestAppendLogTailCommit(t *testing.T) {
 	}
 }
 
+func TestAppendLogTailCommitFinalizesBeforePendingModeFailure(t *testing.T) {
+	var appendCalls, chmodCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("append-log"):
+			appendCalls++
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls++
+			if chmodCalls == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+
+	fh.Lock()
+	fs.setPendingModeLocked(fh, 0o600, 1)
+	first := fs.tryAppendLogLocked(context.Background(), fh)
+	if first.route != appendLogRouteFailed || first.status == gofuse.OK {
+		fh.Unlock()
+		t.Fatalf("first result = %+v, want chmod failure", first)
+	}
+	if fh.BaseRev != 6 || fh.OrigSize != 7 || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || !fh.HasPendingMode {
+		fh.Unlock()
+		t.Fatalf("content finalization after chmod failure = %+v", fh)
+	}
+	secondHandled, secondStatus, _ := fs.routeAppendLogLocked(context.Background(), fh)
+	fh.Unlock()
+	if !secondHandled || secondStatus != gofuse.OK {
+		t.Fatalf("mode retry = handled=%t status=%d, want true/OK", secondHandled, secondStatus)
+	}
+	if appendCalls != 1 || chmodCalls != 2 || fh.HasPendingMode {
+		t.Fatalf("append/chmod/pending = %d/%d/%t, want 1/2/false", appendCalls, chmodCalls, fh.HasPendingMode)
+	}
+}
+
 func TestAppendLogTailCommitAppliesPendingModeAndCachesDirEntry(t *testing.T) {
 	var appendCalls, chmodCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {

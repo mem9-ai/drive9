@@ -139,9 +139,19 @@ func (fh *FileHandle) appendLogObserveCommittedSQLiteWALHeader(header sqliteWALH
 	if fh == nil {
 		return
 	}
+	fh.appendLogRecordSQLiteWALHeaderProof(header)
+	fh.appendLog.clearSQLiteWALHeaderWrite()
+}
+
+// appendLogRecordSQLiteWALHeaderProof records a valid committed header without
+// changing the current dirty generation's reset fences. H0 probes run before a
+// mutation and must not erase a preceding frame or truncate mutation.
+func (fh *FileHandle) appendLogRecordSQLiteWALHeaderProof(header sqliteWALHeader) {
+	if fh == nil {
+		return
+	}
 	fh.appendLog.sqliteWALConfirmed = true
 	fh.appendLog.sqliteWALCommittedHeader = header
-	fh.appendLog.clearSQLiteWALHeaderWrite()
 }
 
 func (fh *FileHandle) appendLogCommittedBaseline() (revision, size int64) {
@@ -244,7 +254,7 @@ func (fs *Dat9FS) appendLogCaptureSQLiteWALPreWriteLocked(fh *FileHandle, offset
 		return
 	}
 	if header, ok := fs.appendLogReadSQLiteWALHeaderLocked(fh); ok {
-		fh.appendLogObserveCommittedSQLiteWALHeader(header)
+		fh.appendLogRecordSQLiteWALHeaderProof(header)
 	}
 }
 
@@ -259,7 +269,7 @@ func (fs *Dat9FS) appendLogConfirmSQLiteWALLocked(fh *FileHandle) bool {
 	if !ok {
 		return false
 	}
-	fh.appendLogObserveCommittedSQLiteWALHeader(header)
+	fh.appendLogRecordSQLiteWALHeaderProof(header)
 	return true
 }
 
@@ -375,10 +385,6 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	if fh.Unlinked || fh.Path != snapshotPath {
 		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 	}
-	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-		safeLogPrintf("append-log pending chmod failed for %s: %v", snapshotPath, err)
-		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
-	}
 	fh.IsNew = false
 	fh.BaseRev = result.Revision
 	fh.OrigSize = result.Size
@@ -407,6 +413,10 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 			}
 			_ = reader.Close()
 		}
+	}
+	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+		safeLogPrintf("append-log pending chmod failed for %s: %v", snapshotPath, err)
+		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 	}
 	return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 }
@@ -659,7 +669,16 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	}
 	resetStarted := time.Now()
 	fs.debugf("append-log trace event=generation_reset_attempt path=%q base_rev=%d base_size=%d snapshot_size=%d dirty_seq=%d wall_unix_nano=%d remote_commit_lock_wait_ns=%d", snapshotPath, expectedRevision, expectedSize, snapshot.Size(), snapshotDirtySeq, resetStarted.UnixNano(), remoteCommitLockWait.Nanoseconds())
-	fh.Unlock()
+	// Keep the initiating handle locked across this bounded 32-byte PUT and
+	// local generation finalization. A same-handle write then resumes against
+	// the published 32-byte generation instead of mutating the old WAL buffer
+	// while the reset is in flight.
+	remoteCommitHeld := true
+	defer func() {
+		if remoteCommitHeld {
+			unlockRemoteCommit()
+		}
+	}()
 	writeStart := fs.perfStart()
 	revision, err := fs.client.WriteServerStreamConditional(ctx, fs.remotePath(snapshotPath), reader, snapshot.Size(), expectedRevision)
 	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(snapshot.Size()))
@@ -670,15 +689,6 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 		fs.recordAppendLogGenerationReset(uint64(snapshot.Size()))
 		fs.recordCommittedRevision(snapshotPath, revision)
 	}
-	unlockRemoteCommit()
-	fh.Lock()
-	unlockRemoteCommit = fs.lockHandleRemoteCommitPathLocked(fh)
-	remoteCommitHeld := true
-	defer func() {
-		if remoteCommitHeld {
-			unlockRemoteCommit()
-		}
-	}()
 	if err != nil {
 		fs.debugf("append-log trace event=generation_reset_result path=%q result=error error=%q dirty_seq=%d wall_unix_nano=%d duration_ns=%d", snapshotPath, err, snapshotDirtySeq, time.Now().UnixNano(), time.Since(resetStarted).Nanoseconds())
 		if appendLogErrorCode(err) == client.AppendLogCodeTooLarge {
@@ -740,6 +750,7 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	remoteCommitLockStarted := time.Now()
 	unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
 	remoteCommitLockWait := time.Since(remoteCommitLockStarted)
+	snapshotOwnsShadow := fh.ShadowReady || fh.ShadowSpill
 	layout := fh.appendLogLayoutAt(expectedRevision, expectedSize)
 	if layout == "" {
 		stat, err := fs.client.StatCtx(ctx, fs.remotePath(snapshotPath))
@@ -789,6 +800,9 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	_ = reader.Close()
 	if err == nil {
 		fs.recordCommittedRevision(snapshotPath, revision)
+		if !snapshotOwnsShadow && fs.shadowStore != nil {
+			fs.shadowStore.Remove(snapshotPath)
+		}
 	}
 	unlockRemoteCommit()
 	fh.Lock()
@@ -805,10 +819,6 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	}
 	if fh.Unlinked || fh.Path != snapshotPath {
 		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
-	}
-	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-		safeLogPrintf("append-log full-rewrite pending chmod failed for %s: %v", snapshotPath, err)
-		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 	}
 	fh.BaseRev = revision
 	fh.OrigSize = snapshot.Size()
@@ -836,6 +846,10 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 			_ = reader.Close()
 		}
 	}
+	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+		safeLogPrintf("append-log full-rewrite pending chmod failed for %s: %v", snapshotPath, err)
+		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
+	}
 	return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 }
 
@@ -848,6 +862,13 @@ func (fs *Dat9FS) routeAppendLogLocked(ctx context.Context, fh *FileHandle) (han
 		return false, gofuse.OK, false
 	}
 	if fh.Dirty == nil || (!fh.IsNew && !fh.Dirty.HasDirtyParts()) {
+		if fh.HasPendingMode {
+			if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+				safeLogPrintf("append-log pending chmod retry failed for %s: %v", fh.Path, err)
+				return true, httpToFuseStatus(err), false
+			}
+			return true, gofuse.OK, false
+		}
 		return false, gofuse.OK, false
 	}
 	reset := fs.tryAppendLogGenerationResetLocked(ctx, fh)

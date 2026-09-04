@@ -355,29 +355,22 @@ observability, and safely fall back to remote reads. It must not return a failed
 fsync after the remote reset, reuse old-generation bytes, or weaken the existing
 concurrent dirty/path/unlink fences.
 
-The existing same-path remote commit lock remains held from the conditional PUT
-through matching reset finalization, including old-shadow retirement and either
-fresh-shadow or degraded-state publication. It is released only after the
-current generation's revision, size, and active local read source agree. This
-prevents another same-path writer from updating the old shadow in the gap
-between remote reset success and local generation rotation; it adds no new lock
-or concurrency model.
+The existing same-path remote commit lock and the initiating handle mutex remain
+held from the conditional PUT through matching reset finalization, including
+old-shadow retirement and either fresh-shadow or degraded-state publication.
+They are released only after the current generation's revision, size, and
+active local read source agree. A same-handle Write therefore resumes only
+after the exact 32-byte local generation is published, and its write at offset
+32 is a normal tail extension. This uses no new lock, replay state, or
+concurrency model; multi-writer coordination remains out of scope.
 
-If `DirtySeq`, path, or unlink state changed while the header PUT was in
-flight, FUSE records the new remote revision/size but does not collapse the
-live buffer or clear newer dirty state. It marks that live generation
-non-appendable and requires its next fsync to use a complete conditional
-full-body PUT. This conservative concurrent-writer path may lose the reset
-optimization for one flush, but cannot drop concurrent frames or reuse stale
-tail bytes. SQLite's normal fsync ordering takes the no-concurrent-write path.
-
-PUT conflict, timeout, response loss, `append_log_unsupported`, malformed
-success, or any other failure leaves `H0`, the old logical view, and all dirty
-state unchanged. It returns the error; it neither retries through an upload
-plan nor converts the layout to `single`. A successful `ftruncate(0)` remains
-the ordinary zero-byte full-rewrite case. It may establish a new clean baseline
-for later ordinary append behavior, but does not itself invoke this header
-reset specialization.
+Path retarget, unlink, conflict, timeout, response loss, malformed success, or
+any other failure leaves `H0`, the old logical view, and all dirty state
+unchanged. It returns the error; it neither retries through an upload plan nor
+converts the layout to `single`. A successful `ftruncate(0)` remains the
+ordinary zero-byte full-rewrite case. It may establish a new clean baseline for
+later ordinary append behavior, but does not itself invoke this header reset
+specialization.
 
 ### 3.3 Decision evidence: automatic header-first recycle
 

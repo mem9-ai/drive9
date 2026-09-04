@@ -333,79 +333,136 @@ func TestAppendLogGenerationResetCanceledRequestPreservesOldGeneration(t *testin
 	}
 }
 
-func TestAppendLogGenerationResetRetargetOrUnlinkPreservesDirtyGeneration(t *testing.T) {
+func TestAppendLogGenerationResetSerializesSameHandleWrite(t *testing.T) {
 	oldHeader, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
 	if !ok {
 		t.Fatal("old header did not parse")
 	}
 	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
-	for _, test := range []struct {
-		name   string
-		mutate func(*FileHandle)
-	}{
-		{name: "retarget", mutate: func(fh *FileHandle) { fh.Path = "/renamed.db-wal" }},
-		{name: "unlink", mutate: func(fh *FileHandle) { fh.Unlinked = true }},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			var fh *FileHandle
-			fs, fixtureHandle, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
-				fh.Lock()
-				test.mutate(fh)
-				fh.Unlock()
-				_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
-			})
-			defer closeServer()
-			fh = fixtureHandle
-			setGenerationResetDirty(t, fh, oldHeader, newHeader, 64)
+	putStarted := make(chan struct{})
+	releasePut := make(chan struct{})
+	var putCalls, appendCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			putCalls++
+			close(putStarted)
+			<-releasePut
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		case r.Method == http.MethodPost && r.URL.Query().Has("append-log"):
+			appendCalls++
+			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "6" {
+				t.Errorf("append expected revision = %q, want 6", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if got := r.Header.Get("X-Dat9-Expected-Size"); got != "32" {
+				t.Errorf("append expected size = %q, want 32", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "frame" {
+				t.Errorf("append body = %q, want frame", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 7, Size: sqliteWALHeaderSize + int64(len("frame"))})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	oldImage := make([]byte, 64)
+	copy(oldImage, oldHeader.raw[:])
+	copy(oldImage[sqliteWALHeaderSize:], []byte("old-generation-tail"))
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, oldImage); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.DirtySeq = 0
+	fh.OrigSize = int64(len(oldImage))
+	fh.BaseRev = 5
+	fh.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 5, size: int64(len(oldImage))}
+	handleID := fs.fileHandles.Allocate(fh)
+	defer fs.fileHandles.Delete(handleID)
 
-			fh.Lock()
-			result := fs.tryAppendLogGenerationResetLocked(context.Background(), fh)
-			fh.Unlock()
-			if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
-				t.Fatalf("result = %+v, want committed", result)
-			}
-			if fh.DirtySeq != 11 || fh.Dirty.Size() != 64 || !fh.Dirty.HasDirtyParts() || fh.appendLog.sqliteWALCommittedHeader != oldHeader {
-				t.Fatalf("retarget/unlink reset mutated live generation: %+v size=%d", fh, fh.Dirty.Size())
-			}
-		})
+	if written, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 0}, newHeader); status != gofuse.OK || written != uint32(len(newHeader)) {
+		t.Fatalf("header write = %d/%d, want %d/OK", written, status, len(newHeader))
+	}
+	resetDone := make(chan gofuse.Status, 1)
+	go func() { resetDone <- fs.Fsync(nil, &gofuse.FsyncIn{Fh: handleID}) }()
+	<-putStarted
+
+	writeStarted := make(chan struct{})
+	writeDone := make(chan struct{})
+	var written uint32
+	var writeStatus gofuse.Status
+	go func() {
+		close(writeStarted)
+		written, writeStatus = fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: sqliteWALHeaderSize}, []byte("frame"))
+		close(writeDone)
+	}()
+	<-writeStarted
+	select {
+	case <-writeDone:
+		t.Fatal("same-handle write completed before reset finalization")
+	default:
+	}
+
+	close(releasePut)
+	if status := <-resetDone; status != gofuse.OK {
+		t.Fatalf("reset Fsync = %d, want OK", status)
+	}
+	if <-writeDone; writeStatus != gofuse.OK || written != uint32(len("frame")) {
+		t.Fatalf("frame write = %d/%d, want %d/OK", written, writeStatus, len("frame"))
+	}
+	if fh.OrigSize != sqliteWALHeaderSize || fh.Dirty.Size() != sqliteWALHeaderSize+int64(len("frame")) || !fh.appendLog.appendSafe {
+		t.Fatalf("post-reset write state = %+v size=%d", fh, fh.Dirty.Size())
+	}
+	if status := fs.Fsync(nil, &gofuse.FsyncIn{Fh: handleID}); status != gofuse.OK {
+		t.Fatalf("first-frame Fsync = %d, want OK", status)
+	}
+	if putCalls != 1 || appendCalls != 1 {
+		t.Fatalf("put/append calls = %d/%d, want 1/1", putCalls, appendCalls)
 	}
 }
 
-func TestAppendLogGenerationResetConcurrentWriteRetainsDirtyGeneration(t *testing.T) {
-	oldHeader, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
-	if !ok {
-		t.Fatal("old header did not parse")
-	}
+func TestAppendLogH0ProbePreservesEarlierFrameFence(t *testing.T) {
+	oldHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2)
 	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
-	var fh *FileHandle
-	fs, fixtureHandle, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
-		fh.Lock()
-		if _, err := fh.Dirty.Write(sqliteWALHeaderSize, []byte("frame")); err != nil {
-			fh.Unlock()
-			t.Error(err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		fh.appendLogRecordUserWrite(sqliteWALHeaderSize, sqliteWALHeaderSize, int64(len("frame")))
-		fh.DirtySeq = 12
-		fh.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s", r.Method)
+		w.WriteHeader(http.StatusInternalServerError)
 	})
 	defer closeServer()
-	fh = fixtureHandle
-	setGenerationResetDirty(t, fh, oldHeader, newHeader, 64)
+	image := make([]byte, 64)
+	copy(image, oldHeader)
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, image); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.DirtySeq = 0
+	fh.OrigSize = int64(len(image))
+	fh.BaseRev = 5
+	fh.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 5, size: int64(len(image))}
+	handleID := fs.fileHandles.Allocate(fh)
+	defer fs.fileHandles.Delete(handleID)
 
-	fh.Lock()
-	result := fs.tryAppendLogGenerationResetLocked(context.Background(), fh)
-	fh.Unlock()
-	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
-		t.Fatalf("result = %+v, want committed", result)
+	if written, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: sqliteWALHeaderSize}, []byte("frame")); status != gofuse.OK || written != uint32(len("frame")) {
+		t.Fatalf("frame write = %d/%d, want %d/OK", written, status, len("frame"))
 	}
-	if fh.BaseRev != 6 || fh.OrigSize != sqliteWALHeaderSize || fh.DirtySeq != 12 || fh.Dirty.Size() != 64 || !fh.Dirty.HasDirtyParts() {
-		t.Fatalf("concurrent reset state = %+v size=%d", fh, fh.Dirty.Size())
+	if !fh.appendLog.sqliteWALWriteBeyondHeader {
+		t.Fatal("frame write did not establish the reset fence")
 	}
-	if fh.appendLog.appendSafe {
-		t.Fatal("concurrent reset must force the next flush through full rewrite")
+	if written, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 0}, newHeader); status != gofuse.OK || written != uint32(len(newHeader)) {
+		t.Fatalf("header write = %d/%d, want %d/OK", written, status, len(newHeader))
+	}
+	if !fh.appendLog.sqliteWALWriteBeyondHeader {
+		t.Fatal("H0 probe cleared the earlier frame reset fence")
 	}
 }
 
@@ -804,17 +861,22 @@ func TestAppendLogGenerationResetDoesNotInvertHandleAndRemoteCommitLocks(t *test
 	}()
 	<-responseStarted
 
-	writerHasHandle := make(chan struct{})
+	writerStarted := make(chan struct{})
 	writerDone := make(chan struct{})
 	go func() {
+		close(writerStarted)
 		fh.Lock()
-		close(writerHasHandle)
 		unlockRemoteCommit := fs.lockHandleRemoteCommitPathLocked(fh)
 		unlockRemoteCommit()
 		fh.Unlock()
 		close(writerDone)
 	}()
-	<-writerHasHandle
+	<-writerStarted
+	select {
+	case <-writerDone:
+		t.Fatal("writer completed before reset finalization")
+	default:
+	}
 	close(releaseResponse)
 	select {
 	case result := <-resetDone:
@@ -822,7 +884,7 @@ func TestAppendLogGenerationResetDoesNotInvertHandleAndRemoteCommitLocks(t *test
 			t.Fatalf("reset = %+v, want committed", result)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("generation reset deadlocked behind a writer holding fh.Lock")
+		t.Fatal("generation reset did not complete")
 	}
 	select {
 	case <-writerDone:

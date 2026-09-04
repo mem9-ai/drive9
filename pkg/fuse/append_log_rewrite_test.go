@@ -54,6 +54,82 @@ func TestAppendLogFullRewriteUsesOneConditionalPUT(t *testing.T) {
 	}
 }
 
+func TestAppendLogFullRewriteFinalizesBeforePendingModeFailure(t *testing.T) {
+	var putCalls, chmodCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			putCalls++
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls++
+			if chmodCalls == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+
+	fh.Lock()
+	fs.setPendingModeLocked(fh, 0o600, 1)
+	first := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+	if first.route != appendLogRouteFailed || first.status == gofuse.OK {
+		fh.Unlock()
+		t.Fatalf("first result = %+v, want chmod failure", first)
+	}
+	if fh.BaseRev != 6 || fh.OrigSize != int64(len("rewrite")) || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || !fh.HasPendingMode {
+		fh.Unlock()
+		t.Fatalf("content finalization after chmod failure = %+v", fh)
+	}
+	secondHandled, secondStatus, _ := fs.routeAppendLogLocked(context.Background(), fh)
+	fh.Unlock()
+	if !secondHandled || secondStatus != gofuse.OK {
+		t.Fatalf("mode retry = handled=%t status=%d, want true/OK", secondHandled, secondStatus)
+	}
+	if putCalls != 1 || chmodCalls != 2 || fh.HasPendingMode {
+		t.Fatalf("put/chmod/pending = %d/%d/%t, want 1/2/false", putCalls, chmodCalls, fh.HasPendingMode)
+	}
+}
+
+func TestAppendLogFullRewriteRemovesUnownedStaleShadow(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	if err := shadow.WriteFull(fh.Path, []byte("stale"), fh.BaseRev); err != nil {
+		t.Fatal(err)
+	}
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+
+	fh.Lock()
+	result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if shadow.Has(fh.Path) {
+		t.Fatal("full rewrite retained an unowned stale shadow")
+	}
+}
+
 func TestAppendLogFullRewriteAppliesPendingModeAndCachesDirEntry(t *testing.T) {
 	var putCalls, chmodCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
