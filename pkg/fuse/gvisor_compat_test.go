@@ -2592,6 +2592,12 @@ func TestGVisorCompatWriteBackRequiresCommitQueue(t *testing.T) {
 			want:        true,
 		},
 		{
+			name:      "gvisor default writeback legacy fallback rejected",
+			gvisor:    true,
+			writeBack: true,
+			want:      true,
+		},
+		{
 			name:        "gvisor writeback queue available",
 			gvisor:      true,
 			writePolicy: WritePolicyWriteBack,
@@ -2769,5 +2775,153 @@ func TestGVisorCompatDisabledRenameMetadataOnlySpecialTargetDeleteRemainsInterru
 	}
 	if got := deleteCalls.Load(); got != 1 {
 		t.Fatalf("target DELETE calls = %d, want 1", got)
+	}
+}
+
+func TestGVisorCompatPendingNewGitRenameSyncCommitSurvivesInterrupt(t *testing.T) {
+	testGVisorCompatPendingNewRenameSyncCommitInterrupt(t, true, true, false, gofuse.OK)
+}
+
+func TestGVisorCompatPendingNewRenameQueueFallbackSyncCommitSurvivesInterrupt(t *testing.T) {
+	testGVisorCompatPendingNewRenameSyncCommitInterrupt(t, true, false, true, gofuse.OK)
+}
+
+func TestGVisorCompatDisabledPendingNewGitRenameSyncCommitRemainsInterruptible(t *testing.T) {
+	testGVisorCompatPendingNewRenameSyncCommitInterrupt(t, false, true, false, gofuse.EAGAIN)
+}
+
+func testGVisorCompatPendingNewRenameSyncCommitInterrupt(t *testing.T, gvisorCompat, gitLooseObject, queueStopped bool, wantStatus gofuse.Status) {
+	t.Helper()
+	oldP := "/repo/.git/objects/70/tmp_obj_interrupt"
+	newP := "/repo/.git/objects/70/24234d93f61104585962ac664bc5a7ed1d241d"
+	oldName := "tmp_obj_interrupt"
+	newName := "24234d93f61104585962ac664bc5a7ed1d241d"
+	parentPath := "/repo/.git/objects/70"
+	if !gitLooseObject {
+		oldP = "/repo/tmp_obj_interrupt"
+		newP = "/repo/final-object"
+		oldName = "tmp_obj_interrupt"
+		newName = "final-object"
+		parentPath = "/repo"
+	}
+	data := []byte("loose object final commit")
+	putStarted := make(chan struct{})
+	putCanceled := make(chan struct{})
+	allowPut := make(chan struct{})
+	var (
+		putCalls   atomic.Int32
+		closeAllow sync.Once
+	)
+	t.Cleanup(func() { closeAllow.Do(func() { close(allowPut) }) })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && (r.URL.Path == "/v1/fs"+oldP || r.URL.Path == "/v1/fs"+newP):
+			http.NotFound(w, r)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+newP:
+			if putCalls.Add(1) != 1 {
+				http.Error(w, "unexpected retry", http.StatusInternalServerError)
+				return
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if string(body) != string(data) {
+				http.Error(w, "unexpected final upload body", http.StatusBadRequest)
+				return
+			}
+			close(putStarted)
+			select {
+			case <-r.Context().Done():
+				close(putCanceled)
+				return
+			case <-allowPut:
+				_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+			}
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: gvisorCompat}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), -1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 16)
+	defer cq.DrainAll()
+	if queueStopped {
+		cq.DrainAll()
+	}
+	fs.commitQueue = cq
+
+	if err := shadow.WriteFull(oldP, data, 0); err != nil {
+		t.Fatalf("WriteFull old shadow: %v", err)
+	}
+	if _, err := pending.PutWithBaseRev(oldP, int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatalf("PutWithBaseRev old pending: %v", err)
+	}
+	fs.inodes.Lookup(oldP, false, int64(len(data)), time.Now())
+	dirIno := fs.inodes.Lookup(parentPath, true, 0, time.Now())
+
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Rename(cancel, &gofuse.RenameIn{
+			InHeader: gofuse.InHeader{NodeId: dirIno},
+			Newdir:   dirIno,
+		}, oldName, newName)
+	}()
+	select {
+	case <-putStarted:
+		close(cancel)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for final-path PUT")
+	}
+	if gvisorCompat {
+		select {
+		case <-putCanceled:
+			// The final status assertion exposes an interruptible commit context.
+		case <-time.After(100 * time.Millisecond):
+			closeAllow.Do(func() { close(allowPut) })
+		}
+	} else {
+		select {
+		case <-putCanceled:
+		case <-time.After(5 * time.Second):
+			t.Fatal("non-gVisor final-path PUT was not canceled")
+		}
+	}
+	select {
+	case st := <-done:
+		if st != wantStatus {
+			t.Fatalf("Rename status = %v, want %v", st, wantStatus)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Rename did not finish")
+	}
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("final-path PUTs = %d, want 1", got)
+	}
+	if gvisorCompat {
+		if pending.HasPending(newP) {
+			t.Fatal("final path remained pending after detached commit")
+		}
+		if shadow.Has(newP) {
+			t.Fatal("final shadow remained after detached commit")
+		}
 	}
 }

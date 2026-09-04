@@ -108,7 +108,14 @@ const defaultUploadConcurrency = 16
 // path-owned metadata, so it cannot enforce the inode mutation ordering that
 // GVisorCompat requires.
 func gvisorWriteBackRequiresCommitQueue(opts *MountOptions, writeBack *WriteBackCache, commitQueue *CommitQueue) bool {
-	return opts != nil && opts.GVisorCompat && opts.WritePolicy == WritePolicyWriteBack && writeBack != nil && commitQueue == nil
+	if opts == nil {
+		return false
+	}
+	policy := opts.WritePolicy
+	if policy == "" {
+		policy = WritePolicyWriteBack
+	}
+	return opts.GVisorCompat && policy == WritePolicyWriteBack && writeBack != nil && commitQueue == nil
 }
 
 func (o *MountOptions) setDefaults() {

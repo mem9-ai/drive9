@@ -9634,16 +9634,21 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 			entry.ShadowGen = fs.shadowStore.ActiveGeneration(newP)
 		}
 		fs.bindCommitEntryToPath(entry, newP, meta.BaseRev)
+		commitPendingRenameNow := func() error {
+			commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+			defer commitCancel()
+			return fs.commitQueue.commitNowPathLocked(commitCtx, entry)
+		}
 		if isGitLooseObjectFinalPath(newP) {
 			// Git treats a successful tmp_obj_* -> <sha> rename as making the
 			// object database complete. Do not acknowledge that rename while the
 			// content-addressed object is only queued for best-effort upload.
-			if commitErr := fs.commitQueue.commitNowPathLocked(ctx, entry); commitErr != nil {
+			if commitErr := commitPendingRenameNow(); commitErr != nil {
 				return pendingRenameHandled, fmt.Errorf("sync commit git loose object rename %s: %w", newP, commitErr)
 			}
 		} else if err := fs.commitQueue.Enqueue(entry); err != nil {
 			safeLogPrintf("rename: enqueue pending-new commit for %s failed, falling back to sync commit: %v", newP, err)
-			if commitErr := fs.commitQueue.commitNowPathLocked(ctx, entry); commitErr != nil {
+			if commitErr := commitPendingRenameNow(); commitErr != nil {
 				return pendingRenameHandled, fmt.Errorf("sync commit pending-new rename %s: %w", newP, commitErr)
 			}
 		}
