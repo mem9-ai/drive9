@@ -561,6 +561,50 @@ func TestAppendLogGenerationResetRotatesPinnedShadow(t *testing.T) {
 	}
 }
 
+func TestAppendLogReleaseDoesNotDoubleUnpinRotatedShadow(t *testing.T) {
+	oldHeader, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
+	if !ok {
+		t.Fatal("old header did not parse")
+	}
+	newHeaderBytes := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
+	newHeader, ok := parseSQLiteWALHeader(newHeaderBytes)
+	if !ok {
+		t.Fatal("new header did not parse")
+	}
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s", r.Method)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer closeServer()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	oldImage := append(append([]byte(nil), oldHeader.raw[:]...), []byte("old-tail")...)
+	if err := shadow.WriteFull(fh.Path, oldImage, fh.BaseRev); err != nil {
+		t.Fatal(err)
+	}
+	ownerGen := shadow.Pin(fh.Path)
+	readerGen := shadow.Pin(fh.Path)
+	fh.ShadowReady = true
+	fh.ShadowSpill = true
+	fh.ShadowPinned = true
+	fh.ShadowGen = ownerGen
+
+	fh.Lock()
+	fs.rotateAppendLogGenerationShadowLocked(fh, fh.Path, newHeader, 6)
+	fh.Unlock()
+	fs.releaseHandleShadowPin(fh)
+
+	read := make([]byte, len(oldImage))
+	if n, err := shadow.ReadAtGen(readerGen, 0, read); err != nil || n != len(read) || !bytes.Equal(read, oldImage) {
+		t.Fatalf("reader generation after owner release = %d/%v/%x, want old shadow", n, err, read)
+	}
+	shadow.Unpin(readerGen)
+}
+
 func TestAppendLogGenerationResetRotatesUnownedPathShadow(t *testing.T) {
 	oldHeader, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
 	if !ok {
@@ -602,6 +646,92 @@ func TestAppendLogGenerationResetRotatesUnownedPathShadow(t *testing.T) {
 	}
 	if !fh.ShadowReady || !fh.ShadowSpill {
 		t.Fatalf("new generation shadow state = ready=%t spill=%t, want true/true", fh.ShadowReady, fh.ShadowSpill)
+	}
+}
+
+func TestAppendLogUnownedAppendClearsLiveSiblingShadow(t *testing.T) {
+	oldHeader, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
+	if !ok {
+		t.Fatal("old header did not parse")
+	}
+	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
+	var resetCalls, appendCalls int
+	fs, owner, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			resetCalls++
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		case r.Method == http.MethodPost && r.URL.Query().Has("append-log"):
+			appendCalls++
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 7, Size: sqliteWALHeaderSize + int64(len("tail"))})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	setGenerationResetDirty(t, owner, oldHeader, newHeader, 64)
+	oldImage := make([]byte, 64)
+	copy(oldImage, newHeader)
+	if err := shadow.WriteFull(owner.Path, oldImage, owner.BaseRev); err != nil {
+		t.Fatal(err)
+	}
+	owner.ShadowReady = true
+	owner.ShadowSpill = true
+	fs.openHandles.Add(owner)
+	defer fs.openHandles.Remove(owner)
+
+	owner.Lock()
+	reset := fs.tryAppendLogGenerationResetLocked(context.Background(), owner)
+	owner.Unlock()
+	if reset.route != appendLogRouteCommitted || reset.status != gofuse.OK {
+		t.Fatalf("reset = %+v, want committed", reset)
+	}
+	if !owner.ShadowReady || !owner.ShadowSpill || !shadow.Has(owner.Path) {
+		t.Fatal("reset did not establish the owner shadow fixture")
+	}
+
+	sibling := &FileHandle{
+		Ino:      2,
+		Path:     owner.Path,
+		Dirty:    NewWriteBuffer(owner.Path, 1024, 0),
+		DirtySeq: 1,
+		OrigSize: sqliteWALHeaderSize,
+		BaseRev:  6,
+		appendLog: appendLogHandleState{
+			initialized: true,
+			appendSafe:  true,
+			layout:      client.ContentLayoutAppendLog,
+			revision:    6,
+			size:        sqliteWALHeaderSize,
+		},
+	}
+	if _, err := sibling.Dirty.Write(0, append(append([]byte(nil), newHeader...), []byte("tail")...)); err != nil {
+		t.Fatal(err)
+	}
+	fs.openHandles.Add(sibling)
+	defer fs.openHandles.Remove(sibling)
+
+	sibling.Lock()
+	appendResult := fs.tryAppendLogLocked(context.Background(), sibling)
+	sibling.Unlock()
+	if appendResult.route != appendLogRouteCommitted || appendResult.status != gofuse.OK {
+		t.Fatalf("sibling append = %+v, want committed", appendResult)
+	}
+	if owner.ShadowReady || owner.ShadowSpill {
+		t.Fatalf("owner retained removed shadow flags: ready=%t spill=%t", owner.ShadowReady, owner.ShadowSpill)
+	}
+	if owner.BaseRev != 7 || owner.Dirty.Size() != sqliteWALHeaderSize+int64(len("tail")) {
+		t.Fatalf("owner rebind = base=%d size=%d, want 7/%d", owner.BaseRev, owner.Dirty.Size(), sqliteWALHeaderSize+len("tail"))
+	}
+	if resetCalls != 1 || appendCalls != 1 {
+		t.Fatalf("reset/append calls = %d/%d, want 1/1", resetCalls, appendCalls)
 	}
 }
 
@@ -698,6 +828,7 @@ func TestAppendLogGenerationResetShadowFailureKeepsRemoteReset(t *testing.T) {
 	}
 	fh.ShadowReady = true
 	fh.ShadowSpill = true
+	fh.Dirty.OnPartFull = func(int, []byte) {}
 
 	fh.Lock()
 	result := fs.tryAppendLogGenerationResetLocked(context.Background(), fh)
@@ -710,6 +841,9 @@ func TestAppendLogGenerationResetShadowFailureKeepsRemoteReset(t *testing.T) {
 	}
 	if fh.ShadowReady || fh.ShadowSpill || shadow.Has(fh.Path) {
 		t.Fatalf("shadow failure state = ready=%t spill=%t active=%t", fh.ShadowReady, fh.ShadowSpill, shadow.Has(fh.Path))
+	}
+	if fh.Dirty.OnPartFull != nil {
+		t.Fatal("shadow degradation retained the part-eviction callback")
 	}
 	if got := fs.perf.snapshot().Counters["append_log_generation_reset_shadow_degraded"]; got != 1 {
 		t.Fatalf("shadow degraded count = %d, want 1", got)

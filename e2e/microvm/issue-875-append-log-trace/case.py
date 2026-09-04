@@ -138,15 +138,17 @@ def main():
         )
         trace = trace_summary(work_root)
         detail = json.dumps(trace, separators=(",", ":"))
-        if process.returncode == 0:
+        trace_complete = trace["append_attempts"] > 0 and trace["rewrite_attempts"] > 0
+        if process.returncode == 0 and trace_complete:
             outcome = "pass"
             checks.append({"name": "sqlite_wal_recycle_trace", "status": "pass", "detail": detail})
         else:
             stage = stage_path.read_text(encoding="utf-8").strip() if stage_path.is_file() else "unknown"
+            reason = "missing append/rewrite trace evidence" if process.returncode == 0 else redact_tail(process.stdout, credential)
             checks.append({
                 "name": "sqlite_wal_recycle_trace",
                 "status": "fail",
-                "detail": f"stage={stage}; trace={detail}; {redact_tail(process.stdout, credential)}",
+                "detail": f"stage={stage}; trace={detail}; {reason}",
             })
     except subprocess.TimeoutExpired:
         checks.append({"name": "sqlite_wal_recycle_trace", "status": "fail", "detail": "workload exceeded 600 seconds"})
