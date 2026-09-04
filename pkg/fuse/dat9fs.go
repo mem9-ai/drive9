@@ -153,8 +153,9 @@ type Dat9FS struct {
 	localPolicy *LocalPolicy
 	// appendLogMatcher recognizes explicit append-log declarations. It does not
 	// change path routing; the sync path consults it after routing checks.
-	appendLogMatcher      *AppendLogMatcher
-	appendLogSnapshotRoot string
+	appendLogMatcher           *AppendLogMatcher
+	appendLogSnapshotRoot      string
+	appendLogSnapshotSweepOnce sync.Once
 	// localOverlay stores local-only paths under MountOptions.LocalRoot.
 	localOverlay *LocalOverlay
 	// transientLocalOverlay stores mount-local runtime sidecars that must be

@@ -52,6 +52,37 @@ func TestAppendLogTailCommit(t *testing.T) {
 	}
 }
 
+func TestAppendLogTailCommitRemovesUnownedStaleShadow(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+	})
+	defer closeServer()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	if err := shadow.WriteFull(fh.Path, []byte("stale"), fh.BaseRev); err != nil {
+		t.Fatal(err)
+	}
+
+	fh.Lock()
+	result := fs.tryAppendLogLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if shadow.Has(fh.Path) {
+		t.Fatal("append success retained an unowned stale shadow")
+	}
+}
+
 func TestAppendLogNewZeroByteCreate(t *testing.T) {
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "0" {

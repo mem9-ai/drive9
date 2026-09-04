@@ -636,52 +636,27 @@ func TestAppendLogGenerationResetShadowServesFirstFrameRead(t *testing.T) {
 	}
 }
 
-func TestAppendLogGenerationResetHoldsRemoteCommitLockThroughShadowRotation(t *testing.T) {
+func TestAppendLogGenerationResetDoesNotInvertHandleAndRemoteCommitLocks(t *testing.T) {
 	oldHeader, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
 	if !ok {
 		t.Fatal("old header did not parse")
 	}
 	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
-	responseSent := make(chan struct{})
+	responseStarted := make(chan struct{})
+	releaseResponse := make(chan struct{})
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
-			t.Fatalf("method = %s, want PUT", r.Method)
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
+		close(responseStarted)
+		<-releaseResponse
 		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
-		close(responseSent)
 	})
 	defer closeServer()
 
-	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shadow.Close()
-	fs.shadowStore = shadow
 	setGenerationResetDirty(t, fh, oldHeader, newHeader, 64)
-	shadowImage := make([]byte, 64)
-	copy(shadowImage, newHeader)
-	if err := shadow.WriteFull(fh.Path, shadowImage, fh.BaseRev); err != nil {
-		t.Fatal(err)
-	}
-	fh.ShadowReady = true
-	fh.ShadowSpill = true
-
-	writer := &FileHandle{
-		Ino:      2,
-		Path:     fh.Path,
-		Dirty:    NewWriteBuffer(fh.Path, 1024, 0),
-		BaseRev:  5,
-		OrigSize: sqliteWALHeaderSize,
-	}
-	if _, err := writer.Dirty.Write(0, newHeader); err != nil {
-		t.Fatal(err)
-	}
-	writer.Dirty.ClearDirty()
-	writerID := fs.fileHandles.Allocate(writer)
-	defer fs.fileHandles.Delete(writerID)
-
-	pathLock := shadow.acquirePathLock(fh.Path)
 	resetDone := make(chan appendLogAttemptResult, 1)
 	go func() {
 		fh.Lock()
@@ -689,25 +664,58 @@ func TestAppendLogGenerationResetHoldsRemoteCommitLockThroughShadowRotation(t *t
 		fh.Unlock()
 		resetDone <- result
 	}()
-	<-responseSent
+	<-responseStarted
 
-	writerDone := make(chan gofuse.Status, 1)
+	writerHasHandle := make(chan struct{})
+	writerDone := make(chan struct{})
 	go func() {
-		_, status := fs.Write(nil, &gofuse.WriteIn{Fh: writerID, Offset: sqliteWALHeaderSize}, []byte("next"))
-		writerDone <- status
+		fh.Lock()
+		close(writerHasHandle)
+		unlockRemoteCommit := fs.lockHandleRemoteCommitPathLocked(fh)
+		unlockRemoteCommit()
+		fh.Unlock()
+		close(writerDone)
 	}()
+	<-writerHasHandle
+	close(releaseResponse)
 	select {
-	case status := <-writerDone:
-		shadow.releasePathLock(fh.Path, pathLock)
-		t.Fatalf("same-path writer completed before shadow rotation: status=%d", status)
-	case <-time.After(100 * time.Millisecond):
+	case result := <-resetDone:
+		if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+			t.Fatalf("reset = %+v, want committed", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("generation reset deadlocked behind a writer holding fh.Lock")
 	}
-	shadow.releasePathLock(fh.Path, pathLock)
-	if result := <-resetDone; result.route != appendLogRouteCommitted || result.status != gofuse.OK {
-		t.Fatalf("reset = %+v, want committed", result)
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not complete after generation reset")
 	}
-	if status := <-writerDone; status != gofuse.OK {
-		t.Fatalf("same-path writer status = %d, want OK", status)
+}
+
+func TestAppendLogCaptureSQLiteWALHeaderPreservesTruncateFence(t *testing.T) {
+	oldHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2)
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s", r.Method)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer closeServer()
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, append(oldHeader, bytes.Repeat([]byte("x"), 32)...)); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.appendLog = appendLogHandleState{}
+	fh.appendLogRecordTruncate()
+	if !fh.appendLog.sqliteWALTruncated {
+		t.Fatal("truncate fence was not set")
+	}
+	fs.appendLogCaptureSQLiteWALPreWriteLocked(fh, 0, sqliteWALHeaderSize)
+	if !fh.appendLog.sqliteWALConfirmed {
+		t.Fatal("header was not confirmed")
+	}
+	if !fh.appendLog.sqliteWALTruncated {
+		t.Fatal("header confirmation cleared the truncate fence")
 	}
 }
 
