@@ -48,6 +48,50 @@ func TestAppendLogFullRewriteUsesOneConditionalPUT(t *testing.T) {
 	}
 }
 
+func TestAppendLogFullRewriteAppliesPendingModeAndCachesDirEntry(t *testing.T) {
+	var putCalls, chmodCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			putCalls++
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls++
+			var request struct {
+				Mode uint32 `json:"mode"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			if request.Mode != 0o600 {
+				t.Fatalf("chmod mode = %o, want 600", request.Mode)
+			}
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+	fh.Ino = fs.inodes.Lookup(fh.Path, false, fh.OrigSize, time.Now())
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "db-wal", Size: 0, Revision: 5}})
+
+	fh.Lock()
+	fs.setPendingModeLocked(fh, 0o600, 1)
+	result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if putCalls != 1 || chmodCalls != 1 || fh.HasPendingMode {
+		t.Fatalf("put/chmod/pending = %d/%d/%t, want 1/1/false", putCalls, chmodCalls, fh.HasPendingMode)
+	}
+	cached := fs.dirCache.Lookup("/", "db-wal")
+	if cached.kind != namespaceLookupPositive || cached.item.Size != int64(len("rewrite")) || cached.item.Revision != 6 {
+		t.Fatalf("dir cache = %+v, want size/revision %d/6", cached, len("rewrite"))
+	}
+}
+
 func TestAppendLogFullRewriteResolvesUnknownLayoutOnce(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -1196,6 +1240,10 @@ func TestAppendLogFullRewriteConcurrentMutationPreservesNewerDirtyGeneration(t *
 	defer closeServer()
 	setAppendLogRewriteDirty(t, fh, "rewrite")
 	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+	// A preceding truncate pins the conditional-PUT baseline. The upload below
+	// races a subsequent dirty generation, so its successful revision must
+	// become the next rewrite's pinned baseline rather than the stale revision.
+	fh.appendLogRecordTruncate()
 
 	resultCh := make(chan appendLogAttemptResult, 1)
 	go func() {
@@ -1226,6 +1274,9 @@ func TestAppendLogFullRewriteConcurrentMutationPreservesNewerDirtyGeneration(t *
 	}
 	if got := fh.appendLogLayoutAt(6, int64(len("rewrite"))); got != client.ContentLayoutAppendLog {
 		t.Fatalf("layout = %q, want append_log", got)
+	}
+	if revision, size := fh.appendLogCommittedBaseline(); revision != 6 || size != int64(len("rewrite")) {
+		t.Fatalf("next rewrite baseline = %d/%d, want 6/%d", revision, size, len("rewrite"))
 	}
 }
 
