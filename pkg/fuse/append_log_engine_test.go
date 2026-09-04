@@ -102,6 +102,61 @@ func TestAppendLogTailCommitFinalizesBeforePendingModeFailure(t *testing.T) {
 	}
 }
 
+func TestAppendLogWriteSyncModeFailureDoesNotRestoreCommittedTail(t *testing.T) {
+	var appendCalls, chmodCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("append-log"):
+			appendCalls++
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "tail" {
+				t.Errorf("append body = %q, want tail", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls++
+			if chmodCalls == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, []byte("pre")); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.DirtySeq = 0
+	fh.BaseRev = 5
+	fh.OrigSize = 3
+	fh.WritePolicy = WritePolicyWriteSync
+	fh.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 5, size: 3}
+	handleID := fs.fileHandles.Allocate(fh)
+	defer fs.fileHandles.Delete(handleID)
+	fh.Lock()
+	fs.setPendingModeLocked(fh, 0o600, 1)
+	fh.Unlock()
+
+	written, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 3}, []byte("tail"))
+	if status == gofuse.OK || written != 0 {
+		t.Fatalf("write result = %d/%d, want 0/chmod error", written, status)
+	}
+	if fh.BaseRev != 6 || fh.OrigSize != 7 || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || string(fh.Dirty.Bytes()) != "pretail" || !fh.HasPendingMode {
+		t.Fatalf("committed tail was restored after chmod failure: %+v body=%q", fh, fh.Dirty.Bytes())
+	}
+	if status := fs.Fsync(nil, &gofuse.FsyncIn{Fh: handleID}); status != gofuse.OK {
+		t.Fatalf("mode retry Fsync = %d, want OK", status)
+	}
+	if appendCalls != 1 || chmodCalls != 2 || fh.HasPendingMode {
+		t.Fatalf("append/chmod/pending = %d/%d/%t, want 1/2/false", appendCalls, chmodCalls, fh.HasPendingMode)
+	}
+}
+
 func TestAppendLogTailCommitAppliesPendingModeAndCachesDirEntry(t *testing.T) {
 	var appendCalls, chmodCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
@@ -402,6 +457,8 @@ func TestAppendLogConcurrentTailPreservesNewerDirtyGeneration(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
 	})
 	defer closeServer()
+	fh.Ino = fs.inodes.Lookup(fh.Path, false, fh.OrigSize, time.Now())
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "db-wal", Size: fh.OrigSize, Revision: fh.BaseRev}})
 
 	resultCh := make(chan appendLogAttemptResult, 1)
 	go func() {
@@ -420,6 +477,8 @@ func TestAppendLogConcurrentTailPreservesNewerDirtyGeneration(t *testing.T) {
 	}
 	fh.appendLogRecordUserWrite(preWriteSize, preWriteSize, 4)
 	fh.DirtySeq = 2
+	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
+	fs.cacheFileForPath(fh.Path, fh.Dirty.Size(), time.Now(), fh.BaseRev)
 	fh.Unlock()
 	close(release)
 
@@ -432,6 +491,12 @@ func TestAppendLogConcurrentTailPreservesNewerDirtyGeneration(t *testing.T) {
 	}
 	if !fh.appendLogCanUseTail() {
 		t.Fatal("contiguous newer suffix should remain append-safe from the committed size")
+	}
+	if entry, ok := fs.inodes.GetEntry(fh.Ino); !ok || entry.Size != int64(len("pretailnext")) {
+		t.Fatalf("inode size after concurrent append = %+v/%t, want %d", entry, ok, len("pretailnext"))
+	}
+	if cached := fs.dirCache.Lookup("/", "db-wal"); cached.kind != namespaceLookupPositive || cached.item.Size != int64(len("pretailnext")) {
+		t.Fatalf("dir cache after concurrent append = %+v, want live size %d", cached, len("pretailnext"))
 	}
 }
 

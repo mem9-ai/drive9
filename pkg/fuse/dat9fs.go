@@ -7434,6 +7434,26 @@ func (fs *Dat9FS) releaseHandleRemoteCommitPathLocked(fh *FileHandle) {
 	unlock()
 }
 
+// releaseHandleShadowPin releases the generation pin currently owned by fh.
+// It reads the token when invoked so reset finalization can retire and unpin an
+// older generation without a later Release unpinning that token again.
+func (fs *Dat9FS) releaseHandleShadowPin(fh *FileHandle) {
+	if fs == nil || fs.shadowStore == nil || fh == nil {
+		return
+	}
+	fh.Lock()
+	shadowPinned := fh.ShadowPinned
+	shadowGen := fh.ShadowGen
+	if shadowPinned {
+		fh.ShadowPinned = false
+		fh.ShadowGen = 0
+	}
+	fh.Unlock()
+	if shadowPinned {
+		fs.shadowStore.Unpin(shadowGen)
+	}
+}
+
 func (fs *Dat9FS) syncOpenSourceForHardlink(ctx context.Context, ino uint64) gofuse.Status {
 	type candidate struct {
 		fh       *FileHandle
@@ -12228,9 +12248,11 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		}
 		if st != gofuse.OK {
 			if fh.Layer != PathLayerGitWorkspace {
+				contentCommitted := fs.appendLogConfiguredLocked(fh) && fh.HasPendingMode && fh.Dirty != nil &&
+					fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts()
 				if state, ok := fs.committedMutation(fh.Ino); ok && fh.DirtySeq != 0 && fh.DirtySeq <= state.committedSeq {
 					fs.discardSupersededMutationLocked(fh)
-				} else {
+				} else if !contentCommitted {
 					fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot)
 				}
 			}
@@ -13684,9 +13706,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			}
 		}()
 
-		// Unpin shadow if this handle pinned it, so deferred removals can proceed.
-		if fh.ShadowPinned && fs.shadowStore != nil {
-			defer fs.shadowStore.Unpin(fh.ShadowGen)
+		// Look up the pin at deferred execution time. Generation reset can retire
+		// and unpin it during Release; capturing the old token here would unpin it
+		// a second time and invalidate another reader's retired snapshot.
+		if fs.shadowStore != nil {
+			defer fs.releaseHandleShadowPin(fh)
 		}
 		if fs.shadowStore != nil {
 			fh.Lock()

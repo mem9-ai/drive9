@@ -1384,6 +1384,8 @@ func TestAppendLogFullRewriteConcurrentMutationPreservesNewerDirtyGeneration(t *
 	defer closeServer()
 	setAppendLogRewriteDirty(t, fh, "rewrite")
 	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+	fh.Ino = fs.inodes.Lookup(fh.Path, false, fh.OrigSize, time.Now())
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "db-wal", Size: fh.OrigSize, Revision: fh.BaseRev}})
 	// A preceding truncate pins the conditional-PUT baseline. The upload below
 	// races a subsequent dirty generation, so its successful revision must
 	// become the next rewrite's pinned baseline rather than the stale revision.
@@ -1406,6 +1408,8 @@ func TestAppendLogFullRewriteConcurrentMutationPreservesNewerDirtyGeneration(t *
 	}
 	fh.appendLogRecordUserWrite(preWriteSize, preWriteSize, 4)
 	fh.DirtySeq = 2
+	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
+	fs.cacheFileForPath(fh.Path, fh.Dirty.Size(), time.Now(), fh.BaseRev)
 	fh.Unlock()
 	close(release)
 
@@ -1421,6 +1425,12 @@ func TestAppendLogFullRewriteConcurrentMutationPreservesNewerDirtyGeneration(t *
 	}
 	if revision, size := fh.appendLogCommittedBaseline(); revision != 6 || size != int64(len("rewrite")) {
 		t.Fatalf("next rewrite baseline = %d/%d, want 6/%d", revision, size, len("rewrite"))
+	}
+	if entry, ok := fs.inodes.GetEntry(fh.Ino); !ok || entry.Size != int64(len("rewritenext")) {
+		t.Fatalf("inode size after concurrent rewrite = %+v/%t, want %d", entry, ok, len("rewritenext"))
+	}
+	if cached := fs.dirCache.Lookup("/", "db-wal"); cached.kind != namespaceLookupPositive || cached.item.Size != int64(len("rewritenext")) {
+		t.Fatalf("dir cache after concurrent rewrite = %+v, want live size %d", cached, len("rewritenext"))
 	}
 }
 

@@ -358,6 +358,7 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 		}
 		if !snapshotOwnsShadow && fs.shadowStore != nil {
 			fs.shadowStore.Remove(snapshotPath)
+			fs.clearRemovedCommittedShadowForOpenHandles(snapshotPath, result.Revision, result.Size)
 		}
 	}
 	unlockRemoteCommit()
@@ -402,10 +403,14 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	} else {
 		fh.appendLogRebindLayout(result.Revision, result.Size)
 	}
+	publishedSize := result.Size
+	if fh.DirtySeq != snapshotDirtySeq && fh.Dirty != nil {
+		publishedSize = fh.Dirty.Size()
+	}
 	fs.inodes.UpdateRevision(fh.Ino, result.Revision)
-	fs.inodes.UpdateSize(fh.Ino, result.Size)
+	fs.inodes.UpdateSize(fh.Ino, publishedSize)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, result.Revision, fh, result.Size)
-	fs.cacheFileForPath(snapshotPath, result.Size, time.Now(), result.Revision)
+	fs.cacheFileForPath(snapshotPath, publishedSize, time.Now(), result.Revision)
 	if snapshotIsNew && snapshot.Size() <= fs.readCache.MaxFileSize() {
 		if reader, openErr := snapshot.Open(); openErr == nil {
 			if data, readErr := io.ReadAll(reader); readErr == nil {
@@ -587,6 +592,9 @@ func (fs *Dat9FS) rotateAppendLogGenerationShadowLocked(fh *FileHandle, path str
 	fh.ShadowPinned = false
 	fh.ShadowGen = 0
 	if fs == nil || fs.shadowStore == nil {
+		if fh.Dirty != nil {
+			fh.Dirty.OnPartFull = nil
+		}
 		fs.recordAppendLogGenerationResetShadowDegraded()
 		return
 	}
@@ -599,6 +607,9 @@ func (fs *Dat9FS) rotateAppendLogGenerationShadowLocked(fh *FileHandle, path str
 		// WriteFull can leave a newly opened or partially written active shadow.
 		// The reset already committed remotely, so remove it and degrade reads.
 		fs.shadowStore.Remove(path)
+		if fh.Dirty != nil {
+			fh.Dirty.OnPartFull = nil
+		}
 		fs.recordAppendLogGenerationResetShadowDegraded()
 		return
 	}
@@ -802,6 +813,7 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 		fs.recordCommittedRevision(snapshotPath, revision)
 		if !snapshotOwnsShadow && fs.shadowStore != nil {
 			fs.shadowStore.Remove(snapshotPath)
+			fs.clearRemovedCommittedShadowForOpenHandles(snapshotPath, revision, snapshot.Size())
 		}
 	}
 	unlockRemoteCommit()
@@ -834,10 +846,14 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	} else {
 		fh.appendLogRebindLayout(revision, snapshot.Size())
 	}
+	publishedSize := snapshot.Size()
+	if fh.DirtySeq != snapshotDirtySeq && fh.Dirty != nil {
+		publishedSize = fh.Dirty.Size()
+	}
 	fs.inodes.UpdateRevision(fh.Ino, revision)
-	fs.inodes.UpdateSize(fh.Ino, snapshot.Size())
+	fs.inodes.UpdateSize(fh.Ino, publishedSize)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, revision, fh, snapshot.Size())
-	fs.cacheFileForPath(snapshotPath, snapshot.Size(), time.Now(), revision)
+	fs.cacheFileForPath(snapshotPath, publishedSize, time.Now(), revision)
 	if snapshot.Size() <= fs.readCache.MaxFileSize() {
 		if reader, openErr := snapshot.Open(); openErr == nil {
 			if data, readErr := io.ReadAll(reader); readErr == nil {
