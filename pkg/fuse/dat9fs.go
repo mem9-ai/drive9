@@ -12302,6 +12302,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		fs.armKernelCacheBypass(fh.Ino, fh.Path, fh.BaseRev, fh.Dirty.Size(), "truncate-write")
 	}
 	if fh.WritePolicy == WritePolicyWriteSync {
+		writeDirtySeq := fh.DirtySeq
 		size := fh.Dirty.Size()
 		writeCtx, writeCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 		defer writeCancel()
@@ -12317,9 +12318,10 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			if fh.Layer != PathLayerGitWorkspace {
 				contentCommitted := fs.appendLogConfiguredLocked(fh) && fh.HasPendingMode && fh.Dirty != nil &&
 					fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts()
+				newerDirtyGeneration := fh.DirtySeq != writeDirtySeq
 				if state, ok := fs.committedMutation(fh.Ino); ok && fh.DirtySeq != 0 && fh.DirtySeq <= state.committedSeq {
 					fs.discardSupersededMutationLocked(fh)
-				} else if !contentCommitted {
+				} else if !contentCommitted && !newerDirtyGeneration {
 					fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot)
 				}
 			}

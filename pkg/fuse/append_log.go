@@ -705,7 +705,6 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	revision, err := fs.client.WriteServerStreamConditional(ctx, fs.remotePath(snapshotPath), reader, snapshot.Size(), expectedRevision)
 	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(snapshot.Size()))
 	fs.recordAppendLogFullRewrite(uint64(snapshot.Size()))
-	fs.recordAppendLogOutcome(err)
 	_ = reader.Close()
 	if err == nil {
 		fs.recordAppendLogGenerationReset(uint64(snapshot.Size()))
@@ -749,6 +748,7 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.inodes.UpdateSize(fh.Ino, sqliteWALHeaderSize)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, revision, fh, sqliteWALHeaderSize)
+	fs.clearReadTargetsForPathExcept(snapshotPath, fh)
 	fs.cacheFileForPath(snapshotPath, sqliteWALHeaderSize, time.Now(), revision)
 	unlockRemoteCommit()
 	remoteCommitHeld = false
@@ -820,7 +820,6 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	revision, err := fs.client.WriteServerStreamConditional(ctx, fs.remotePath(snapshotPath), reader, snapshot.Size(), expectedRevision)
 	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(snapshot.Size()))
 	fs.recordAppendLogFullRewrite(uint64(snapshot.Size()))
-	fs.recordAppendLogOutcome(err)
 	_ = reader.Close()
 	if err == nil {
 		fs.recordCommittedRevisionWithSize(snapshotPath, revision, snapshot.Size())
@@ -1017,7 +1016,6 @@ func (fs *Dat9FS) tryAppendLogPathTruncate(ctx context.Context, entry *InodeEntr
 	revision, err := fs.client.WriteServerStreamConditional(ctx, apiPath, reader, snapshot.Size(), entry.Revision)
 	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(snapshot.Size()))
 	fs.recordAppendLogFullRewrite(uint64(snapshot.Size()))
-	fs.recordAppendLogOutcome(err)
 	_ = reader.Close()
 	if err != nil {
 		if appendLogErrorCode(err) == client.AppendLogCodeTooLarge {
