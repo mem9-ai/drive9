@@ -2574,3 +2574,200 @@ func TestGVisorCompatShadowSpillFlushRechecksSupersessionAfterFence(t *testing.T
 		t.Fatalf("stale Flush remote PUTs = %d, want 0", got)
 	}
 }
+
+func TestGVisorCompatWriteBackRequiresCommitQueue(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		gvisor      bool
+		writePolicy WritePolicy
+		writeBack   bool
+		commitQueue bool
+		want        bool
+	}{
+		{
+			name:        "gvisor writeback legacy fallback rejected",
+			gvisor:      true,
+			writePolicy: WritePolicyWriteBack,
+			writeBack:   true,
+			want:        true,
+		},
+		{
+			name:        "gvisor writeback queue available",
+			gvisor:      true,
+			writePolicy: WritePolicyWriteBack,
+			writeBack:   true,
+			commitQueue: true,
+		},
+		{
+			name:        "non gvisor legacy fallback preserved",
+			writePolicy: WritePolicyWriteBack,
+			writeBack:   true,
+		},
+		{
+			name:        "gvisor close sync has no legacy uploader path",
+			gvisor:      true,
+			writePolicy: WritePolicyCloseSync,
+			writeBack:   true,
+		},
+		{
+			name:        "gvisor without writeback cache",
+			gvisor:      true,
+			writePolicy: WritePolicyWriteBack,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := &MountOptions{GVisorCompat: tc.gvisor, WritePolicy: tc.writePolicy}
+			opts.setDefaults()
+			var writeBack *WriteBackCache
+			if tc.writeBack {
+				writeBack = &WriteBackCache{}
+			}
+			var commitQueue *CommitQueue
+			if tc.commitQueue {
+				commitQueue = &CommitQueue{}
+			}
+			if got := gvisorWriteBackRequiresCommitQueue(opts, writeBack, commitQueue); got != tc.want {
+				t.Fatalf("gvisorWriteBackRequiresCommitQueue = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGVisorCompatRenameMetadataOnlySpecialTargetDeleteSurvivesInterrupt(t *testing.T) {
+	deleteStarted := make(chan struct{})
+	deleteCanceled := make(chan struct{})
+	allowDelete := make(chan struct{})
+	var (
+		deleteCalls atomic.Int32
+		closeAllow  sync.Once
+	)
+	t.Cleanup(func() { closeAllow.Do(func() { close(allowDelete) }) })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/pipe":
+			http.NotFound(w, r)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/target":
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/target":
+			if deleteCalls.Add(1) != 1 {
+				http.Error(w, "unexpected retry", http.StatusInternalServerError)
+				return
+			}
+			close(deleteStarted)
+			select {
+			case <-r.Context().Done():
+				close(deleteCanceled)
+				return
+			case <-allowDelete:
+				w.WriteHeader(http.StatusNoContent)
+			}
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{GVisorCompat: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	var out gofuse.EntryOut
+	if st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFIFO) | 0o644,
+	}, "pipe", &out); st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Rename(cancel, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "pipe", "target")
+	}()
+	select {
+	case <-deleteStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for target DELETE")
+	}
+	select {
+	case <-deleteCanceled:
+		// The final status assertion exposes an interruptible mutation context.
+	case <-time.After(100 * time.Millisecond):
+		closeAllow.Do(func() { close(allowDelete) })
+	}
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("Rename status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Rename did not finish")
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("target DELETE calls = %d, want 1", got)
+	}
+	if _, ok := fs.specialNodeEntry("/target"); !ok {
+		t.Fatal("special source was not renamed to target")
+	}
+}
+
+func TestGVisorCompatDisabledRenameMetadataOnlySpecialTargetDeleteRemainsInterruptible(t *testing.T) {
+	deleteStarted := make(chan struct{})
+	var deleteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/pipe":
+			http.NotFound(w, r)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/target":
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/target":
+			deleteCalls.Add(1)
+			close(deleteStarted)
+			<-r.Context().Done()
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	var out gofuse.EntryOut
+	if st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFIFO) | 0o644,
+	}, "pipe", &out); st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+
+	cancel := make(chan struct{})
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		done <- fs.Rename(cancel, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "pipe", "target")
+	}()
+	select {
+	case <-deleteStarted:
+		close(cancel)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for target DELETE")
+	}
+	select {
+	case st := <-done:
+		if st != gofuse.EAGAIN {
+			t.Fatalf("Rename status = %v, want EAGAIN", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Rename did not return after interrupt")
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("target DELETE calls = %d, want 1", got)
+	}
+}
