@@ -1141,6 +1141,7 @@ func TestMountBackgroundEnvSnapshotsCredentials(t *testing.T) {
 		EnvTiDBCloudPrivateKey + "=tidb-private",
 		EnvMountLocalOnlyPatterns + "=**/.cache/**",
 		EnvMountRemoteOnlyPatterns + "=**/tmp/**",
+		EnvMountAppendLogPatterns + "=**/wal/**",
 	}, mountBackgroundRequest{
 		Server: "https://drive9.example",
 		Token:  "jwt-token",
@@ -1185,6 +1186,22 @@ func TestConsumeMountPolicyPatternsEnvReportsVariableAndLine(t *testing.T) {
 	_, err := consumeMountPolicyPatternsEnv(EnvMountRemoteOnlyPatterns)
 	if err == nil || !strings.Contains(err.Error(), EnvMountRemoteOnlyPatterns+" line 2") || !strings.Contains(err.Error(), `".." segment`) {
 		t.Fatalf("error = %v, want variable, line, and invalid segment", err)
+	}
+}
+
+func TestConsumeAppendLogPatternsEnv(t *testing.T) {
+	t.Setenv(EnvMountAppendLogPatterns, " **/wal/** \r\n\n**/journal/**\n**/wal/**\n**/with space/** ")
+
+	got, err := consumeMountPolicyPatternsEnv(EnvMountAppendLogPatterns)
+	if err != nil {
+		t.Fatalf("consumeMountPolicyPatternsEnv: %v", err)
+	}
+	want := []string{"**/wal/**", "**/journal/**", "**/with space/**"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("patterns = %v, want %v", got, want)
+	}
+	if _, ok := os.LookupEnv(EnvMountAppendLogPatterns); ok {
+		t.Fatalf("%s should be consumed", EnvMountAppendLogPatterns)
 	}
 }
 
@@ -2599,6 +2616,110 @@ func TestMountCmdCodingAgentProfileMergesPolicyEnvironment(t *testing.T) {
 	wantRemote := []string{"**/tmp/**", "**/.shared/**", "**/uploads/**"}
 	if !reflect.DeepEqual(got.RemoteOnlyPatterns, wantRemote) {
 		t.Fatalf("RemoteOnlyPatterns = %v, want %v", got.RemoteOnlyPatterns, wantRemote)
+	}
+}
+
+func TestMountCmdPassesAppendLogPatterns(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	t.Setenv(EnvMountAppendLogPatterns, "**/from-env/**\n**/shared/**")
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "none",
+		"--append-log", "**/from-flag/**",
+		"--append-log", "**/shared/**",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	want := []string{"**/from-env/**", "**/shared/**", "**/from-flag/**"}
+	if !reflect.DeepEqual(got.AppendLogPatterns, want) {
+		t.Fatalf("AppendLogPatterns = %v, want %v", got.AppendLogPatterns, want)
+	}
+}
+
+func TestMountCmdMaterializesAppendLogEnvironmentInSupervisedArgs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("supervised mounts are disabled on Windows")
+	}
+	oldStartSupervised := startMountSupervisedBackground
+	oldMountFuse := mountFuse
+	t.Cleanup(func() {
+		startMountSupervisedBackground = oldStartSupervised
+		mountFuse = oldMountFuse
+	})
+
+	t.Setenv(EnvMountAppendLogPatterns, "**/wal/**\n--foreground")
+	var got mountSuperviseStartRequest
+	startMountSupervisedBackground = func(req mountSuperviseStartRequest) error {
+		got = req
+		return nil
+	}
+	mountFuse = func(*mountFuseOptions) error {
+		t.Fatal("mountFuse should not run in-process")
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "none",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	wantPrefix := []string{"--append-log=**/wal/**", "--append-log=--foreground"}
+	if len(got.OriginalArgs) < len(wantPrefix) || !reflect.DeepEqual(got.OriginalArgs[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("OriginalArgs = %v, want append-log prefix %v", got.OriginalArgs, wantPrefix)
+	}
+	if workerArgs := workerArgsForSupervise(got.OriginalArgs); !containsString(workerArgs, "--append-log=--foreground") {
+		t.Fatalf("worker args = %v, want flag-like append-log pattern preserved", workerArgs)
+	}
+}
+
+func TestMountCmdRejectsAppendLogOutsideDrive9FUSE(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "object store",
+			args: []string{
+				"--foreground", "--mode", "fuse", "--append-log", "**/wal/**",
+				"s3://bucket/prefix/", t.TempDir(),
+			},
+		},
+		{
+			name: "webdav",
+			args: []string{
+				"--foreground", "--mode", "webdav", "--append-log", "**/wal/**",
+				"--server", "https://drive9.example", "--api-key", "sk-test", t.TempDir(),
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := MountCmd(test.args)
+			if err == nil || !strings.Contains(err.Error(), "--append-log is only supported with Drive9 FUSE mounts") {
+				t.Fatalf("MountCmd error = %v, want append-log mode rejection", err)
+			}
+		})
 	}
 }
 

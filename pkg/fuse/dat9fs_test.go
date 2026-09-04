@@ -9012,6 +9012,18 @@ func TestMountOptionsCodingAgentPolicyValidation(t *testing.T) {
 	if err := validateMountOptionsProfile(invalidPattern); err == nil {
 		t.Fatal("coding-agent mount with unsafe policy pattern should fail")
 	}
+
+	appendLogOnly := &MountOptions{AppendLogPatterns: []string{"**/wal/**"}}
+	appendLogOnly.setDefaults()
+	if err := validateMountOptionsProfile(appendLogOnly); err != nil {
+		t.Fatalf("ordinary mount with append-log patterns should be valid: %v", err)
+	}
+
+	invalidAppendLog := &MountOptions{AppendLogPatterns: []string{"**/../wal/**"}}
+	invalidAppendLog.setDefaults()
+	if err := validateMountOptionsProfile(invalidAppendLog); err == nil {
+		t.Fatal("mount with unsafe append-log pattern should fail")
+	}
 }
 
 func TestDat9FSClassifiesCodingAgentLocalPolicy(t *testing.T) {

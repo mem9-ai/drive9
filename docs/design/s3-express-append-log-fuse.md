@@ -1,6 +1,6 @@
 ---
 title: Drive9 FUSE S3 Express Append Log Specification
-status: draft
+status: accepted-for-implementation
 date: 2026-09-02
 ---
 
@@ -28,24 +28,33 @@ weakening SQLite `synchronous=FULL` durability.
 5. Use the append API for pure extensions and the layout-aware conditional
    full-body PUT for resets and non-tail rewrites in every strict synchronous
    upload path, including zero-byte creation and the one explicit rebase retry.
-6. Add configuration, client, FUSE, and SQLite regression coverage.
+6. For an explicitly configured and proven SQLite WAL, rotate its append-log
+   generation at a new, durable WAL-header fsync so later frames are tail
+   appends again, while retaining a fresh FUSE-local shadow for checkpoint
+   reads in the new generation.
+7. Add configuration, client, FUSE, and SQLite regression coverage.
 
 ### Out of scope
 
 1. Drive9 server, TiDB metadata, S3 Express credentials, or object lifecycle.
-2. Automatic file-type discovery, including SQLite WAL header inspection.
+2. Automatic selection or classification of files that do not match an
+   operator `--append-log` pattern. The limited SQLite header proof in scope
+   is not automatic discovery.
 3. Files not matched by operator configuration and automatic conversion of an
    existing `single` file to `append_log`.
 4. #876's stale sibling / delayed Release payload-generation fix.
 5. Multi-writer coordination, direct S3 access, durable append-operation
    idempotency, or multipart rebase.
 
-The Drive9 production estimate is **550-800 net LoC** (tests excluded). The
-increase from the original estimate accounts for mount configuration plumbing,
-exact per-handle mutation tracking, structured error handling, all synchronous
-upload entry points, layout-aware full-rewrite routing, fallback-loop
-prevention, and observability. It does not add a persistent schema, background
-worker, or second state machine.
+The baseline Drive9 production estimate is **550-800 net LoC** (tests
+excluded). SQLite WAL generation reset adds **250-350 net LoC** and
+generation-shadow rotation adds **100-180 net LoC**, for a total estimate of
+**900-1,330 net LoC**. The increase accounts for mount
+configuration plumbing, exact per-handle mutation tracking, structured error
+handling, all synchronous upload entry points, layout-aware full-rewrite
+routing, WAL-header proof/reset/shadow finalization, fallback-loop prevention,
+and observability. It does not add a persistent schema, background worker, or
+second commit state machine.
 
 ## 2. Configuration and compatibility contract
 
@@ -80,8 +89,10 @@ remote-persistent writable file can use the append-log API.
 
 An empty pattern list disables the client append-log path. A matching pattern
 is the authoritative operator declaration: FUSE does not require a `-wal`
-suffix, an open sibling database, a WAL header, or a content-layout HEAD before
-attempting append-log.
+suffix, an open sibling database, or a content-layout HEAD before attempting
+append-log. A later, per-handle SQLite header proof may enable only the
+generation-reset optimization; it neither selects an unconfigured file nor
+changes the generic append-log contract.
 
 ### 2.2 Server capability
 
@@ -242,6 +253,178 @@ to the server-returned committed size. If all concurrent mutations preserved
 the append-safe flag, the next flush may append the remaining suffix from that
 new base; otherwise it must perform a full rewrite.
 
+### 3.2 Explicit SQLite WAL proof and generation reset
+
+This is an opt-in specialization of an already configured append-log path, not
+automatic file discovery. It never applies to a path that fails the
+`--append-log` matcher, and it does not alter append behavior for a configured
+non-SQLite log.
+
+`FileHandle` holds a non-persistent `sqliteWalConfirmed` marker and one
+committed 32-byte WAL header `H0`. The marker means only that the file is a
+SQLite WAL; it does not mean that a transaction is committed or recoverable.
+FUSE confirms `H0` from a successfully committed new-file/full-image snapshot,
+from exactly `[0, 32)` in the clean committed view at the first eligible strict
+fsync, or—before the first write overwrites that range—from a 32-byte immutable
+pre-write prefix snapshot. The pre-write probe occurs only for an unconfirmed,
+explicitly configured existing path whose write covers offset zero. It lets a
+handle that first observes a recycle, rather than a tail append, still compare
+the new header to the old generation. It validates:
+
+1. WAL magic `0x377f0682` or `0x377f0683`;
+2. format version `3007000`;
+3. a valid SQLite page size; and
+4. the two-word WAL-header checksum over bytes `[0, 24)`, using the byte order
+   selected by the magic value.
+
+This prefix proof is lazy: `Open` sends neither a layout HEAD nor a WAL read.
+If the prefix cannot be read or validated, append-log keeps its normal generic
+semantics and no reset optimization is attempted. The proof is held only by
+the handle; reopening lazily proves the current header again. No persistent
+schema, inode-wide classifier, or generic file-type detector is introduced.
+
+A generation-reset candidate exists only when all of the following are true:
+
+1. the handle is `sqliteWalConfirmed` with a valid committed header `H0`;
+2. the current dirty view contains a complete, valid header `H1` at `[0, 32)`;
+3. the current generation includes a non-tail write covering offset zero;
+4. the WAL salt pair in `H1` differs from `H0`; and
+5. the handle still has a positive committed revision and an existing physical
+   `append_log` layout.
+
+The reset route uses the revision-bound observed layout when available. If it
+is unknown, it performs the same one flush-time stat already required for a
+non-tail full rewrite; the stat must equal `BaseRev` and `OrigSize` and report
+`append_log`. It does not add an `Open`-time layout lookup. A `single` result
+uses the existing generic full rewrite; a missing or revision-drifted result
+fails closed. None permits a 32-byte PUT by guesswork.
+
+The candidate is resolved at the fsync containing `H1`, even if it contains
+only the 32-byte logical header. SQLite's automatic recycle trace proves that
+this fsync precedes its first frame write. FUSE does not scan WAL frames,
+compute a commit-frame boundary `L`, or wait for a commit marker. An incomplete
+header, an invalid header, unchanged salts, an unproven path, or an ordinary
+non-tail write follows the existing full-rewrite route.
+
+```text
+known committed WAL header H0
+  -> Write(0, H1[0:32]) + fsync
+  -> freeze H1 only, BaseRev, DirtySeq, and path
+  -> conditional full-body PUT(H1, size=32, expected BaseRev)
+  -> server writes a new append_log object and metadata-CASes its ref
+  -> atomically publish revision, logical size=32, and committed header H1
+  -> later Write(32, frame header) / Write(56, page) + fsync
+  -> AppendLog of the strict tail
+```
+
+Generation reset is selected before the ordinary tail predicate and before the
+generic non-tail/full-rewrite route. It uses the existing
+`WriteServerStreamConditional` API, same-path remote commit lock, immutable
+snapshot discipline, and append-log layout-aware routing; it adds no server
+endpoint. The 32-byte request is never sent through PATCH, V2 multipart,
+direct-upload, or a legacy upload plan.
+
+On a successful reset, FUSE must publish the server revision and replace the
+clean local logical view with exactly `H1[0:32)`: old-generation bytes
+`[32, oldSize)` must be discarded from `WriteBuffer`, dirty-size state, and any
+revision-keyed read cache before the next fsync. It then marks the clean handle
+append-safe with `OrigSize=32`, stores `H1` as the committed header, and
+refreshes same-path clean handles at size 32. This local collapse is part of
+the commit finalization, not a best-effort cache cleanup.
+
+If the matching handle had a FUSE `ShadowStore` shadow, reset must retire and
+remove that old-generation shadow, then initialize a fresh active shadow whose
+complete content is exactly `H1[0:32)`. The replacement shadow belongs to the
+new generation; it must never retain an old tail merely because the filesystem
+path is unchanged. Set `ShadowReady` and `ShadowSpill` only after this exact
+32-byte snapshot is available. Existing write-through handling then keeps this
+new shadow current as later WAL frames append, so SQLite checkpoint reads use
+the local snapshot rather than remote ranges.
+
+Retirement may preserve a pinned old shadow file only for an already-open
+pre-reset snapshot under existing `ShadowStore` generation rules. That retired
+file is not the active path shadow and must never become a current-generation
+read source after the reset revision/size is published.
+
+Shadow rotation is a local read-performance optimization, not a second
+durability commit. The conditional header PUT has already committed remotely
+when rotation starts. If new-shadow initialization fails, FUSE must retain the
+remote reset revision and clean 32-byte logical view, remove any old or partial
+replacement shadow, clear the shadow flags, record bounded degraded
+observability, and safely fall back to remote reads. It must not return a failed
+fsync after the remote reset, reuse old-generation bytes, or weaken the existing
+concurrent dirty/path/unlink fences.
+
+The existing same-path remote commit lock remains held from the conditional PUT
+through matching reset finalization, including old-shadow retirement and either
+fresh-shadow or degraded-state publication. It is released only after the
+current generation's revision, size, and active local read source agree. This
+prevents another same-path writer from updating the old shadow in the gap
+between remote reset success and local generation rotation; it adds no new lock
+or concurrency model.
+
+If `DirtySeq`, path, or unlink state changed while the header PUT was in
+flight, FUSE records the new remote revision/size but does not collapse the
+live buffer or clear newer dirty state. It marks that live generation
+non-appendable and requires its next fsync to use a complete conditional
+full-body PUT. This conservative concurrent-writer path may lose the reset
+optimization for one flush, but cannot drop concurrent frames or reuse stale
+tail bytes. SQLite's normal fsync ordering takes the no-concurrent-write path.
+
+PUT conflict, timeout, response loss, `append_log_unsupported`, malformed
+success, or any other failure leaves `H0`, the old logical view, and all dirty
+state unchanged. It returns the error; it neither retries through an upload
+plan nor converts the layout to `single`. A successful `ftruncate(0)` remains
+the ordinary zero-byte full-rewrite case. It may establish a new clean baseline
+for later ordinary append behavior, but does not itself invoke this header
+reset specialization.
+
+### 3.3 Decision evidence: automatic header-first recycle
+
+An independently authorized MicroVM diagnostic case ran against the hosted S3
+Express target with `synchronous=FULL`, `wal_autocheckpoint=5`,
+`journal_size_limit=-1`, and no explicit checkpoint. It observed two automatic
+recycles with the same ordering:
+
+```text
+Write(offset=0, 32B new WAL header)
+  -> fsync
+  -> Write(offset=32, 24B first frame header)
+```
+
+Before this optimization, the fsync between those writes selected a
+layout-aware full rewrite with the prior 20,632-byte WAL capacity. The
+subsequent frame remained non-tail because FUSE kept that old size as its base.
+The diagnostic therefore proves both the usable header-first boundary and the
+specific missing behavior: FUSE must publish the 32-byte generation locally as
+well as remotely. It does not prove a latency target or replace the
+post-implementation E2E in section 7.
+
+### 3.4 Decision evidence: checkpoint reads require generation-shadow rotation
+
+An independently authorized 2,000-commit MicroVM diagnostic against the same
+hosted S3 Express target used `synchronous=FULL`, `wal_autocheckpoint=1000`,
+and `journal_size_limit=-1`. Both capacity boundaries had the same logical WAL
+size, `4,120,032` bytes, and both reset with a 32-byte conditional PUT followed
+by a first-frame tail append. The read sources differed:
+
+```text
+first checkpoint boundary, commit 989
+  -> seven 4KiB WAL pread calls from FUSE shadow-spill
+  -> 22-38 microseconds each
+
+second checkpoint boundary, commit 1981
+  -> eight 4KiB WAL pread calls from sqlite-sidecar-clean-remote
+  -> 44ms to 1.12s each, about 5.72s total
+```
+
+The first generation was created with `ShadowSpill`; the current reset
+finalization removed that shadow and did not establish a replacement for the
+new generation. This proves that 32-byte reset alone removes remote rewrite
+cost but is insufficient for checkpoint-read latency. It does not introduce a
+SQLite-specific range parser, server range rewrite, or multi-object design:
+rotating the existing FUSE shadow at the proven header boundary is sufficient.
+
 ## 4. Flush and durability behavior
 
 Configured append-log paths participate in the strict remote-sync behavior
@@ -257,6 +440,12 @@ synchronous remote-commit entry point, including `flushHandle`,
 fallbacks. A configured existing handle, or a capability-enabled configured new
 handle, must not start or reuse a generic multipart `StreamUploader` before
 this decision.
+
+For an existing configured path, routing order is fixed: first a proven SQLite
+WAL generation reset, then a strict tail append, then the layout-aware full
+rewrite. The reset exception is deliberately narrower than a generic
+non-tail-write exception: only the validated 32-byte header sequence in
+section 3.2 may bypass a full image.
 
 The implementation may use one narrow shared routing/finalization helper, but
 it does not introduce a second commit state machine. It retains the existing
@@ -279,31 +468,34 @@ evicted bytes needed to construct the snapshot.
 ```text
 strict fsync/flush
   -> freeze path, expected revision, committed size, dirty sequence,
-     append-safe state, and tail bytes
-  -> AppendLog
-  -> server S3 append + metadata CAS
+     append-safe state, and immutable bytes
+  -> proven SQLite WAL generation reset? conditional PUT of 32-byte header
+  -> otherwise strict pure extension? AppendLog of tail
+  -> otherwise layout-aware conditional full-body PUT
+  -> server S3 append or new-object rewrite + metadata CAS
   -> validate committed revision and size
   -> update FUSE committed revision and size
   -> clear exactly the flushed dirty generation
   -> return success
 ```
 
-FUSE returns success only when `AppendLog` returns a valid committed revision
-and size. It updates inode size, handle original size, and all same-path
-committed-revision bookkeeping from the server response while preserving
-newer dirty data. An append success establishes that the committed server
-layout is `append_log`, but FUSE does not require a persistent layout cache for
-future routing.
+FUSE returns success only when the selected AppendLog or conditional PUT
+returns a valid committed revision and compatible size. It updates inode size,
+handle original size, and all same-path committed-revision bookkeeping from the
+server response while preserving newer dirty data. An append success
+establishes that the committed server layout is `append_log`, but FUSE does not
+require a persistent layout cache for future routing.
 
 Zero-byte append-log creation must take this branch before any existing
 `CreateFileCtx` shortcut. Non-tail writes, truncates, and per-handle unsupported
-state enter layout-aware full-rewrite selection. Capability absence sends a
-configured new file through the existing generic create path, but a configured
-existing file must first resolve layout: `append_log` uses conditional
-full-body PUT and `single` uses the generic path. Unmatched paths retain current
-behavior. The server preserves an existing `append_log` layout across a full
-rewrite; FUSE does not choose the object bucket itself. An existing `single`
-target remains `single` after fallback.
+state enter layout-aware full-rewrite selection unless the exact proven SQLite
+header reset in section 3.2 applies. Capability absence sends a configured new
+file through the existing generic create path, but a configured existing file
+must first resolve layout: `append_log` uses conditional full-body PUT and
+`single` uses the generic path. Unmatched paths retain current behavior. The
+server preserves an existing `append_log` layout across a full rewrite; FUSE
+does not choose the object bucket itself. An existing `single` target remains
+`single` after fallback.
 
 For a configured existing file that needs a full rewrite, transport selection
 uses per-handle observed layout without affecting later append eligibility:
@@ -330,13 +522,14 @@ same committed baseline.
 
 ### 4.1 Layout-aware full-body PUT
 
-For `ftruncate(0)`, any other truncate, non-tail writes, and SQLite checkpoint
-reuse of an existing `append_log` file, FUSE freezes the complete new file
-image, path, snapshot size, expected revision, dirty sequence, and observed
-`append_log` layout before releasing the handle lock. It acquires the same-path
-remote commit lock before the network call and sends one conditional full-body
-PUT. The selection happens before threshold-based PATCH/V2 routing, so a body
-larger than the inline threshold still takes this PUT.
+For `ftruncate(0)`, any other truncate, ordinary non-tail writes, and SQLite
+checkpoint reuse that does not meet section 3.2's proven-header predicate,
+FUSE freezes the complete new file image, path, snapshot size, expected
+revision, dirty sequence, and observed `append_log` layout before releasing the
+handle lock. It acquires the same-path remote commit lock before the network
+call and sends one conditional full-body PUT. The selection happens before
+threshold-based PATCH/V2 routing, so a body larger than the inline threshold
+still takes this PUT.
 
 ```text
 truncate / non-tail write / checkpoint reuse
@@ -400,11 +593,14 @@ state and lets the next flush use the now-disabled append state.
 | Server/client result | FUSE action |
 | --- | --- |
 | AppendLog success | Validate revision/size and finalize only the appended snapshot. |
+| proven SQLite WAL header reset success | Validate a positive revision, publish the 32-byte generation, and only then collapse the clean local view to that immutable header. |
 | conditional full-body PUT success | Require a positive revision; publish the snapshot size and `append_log` layout, then clear only the matching dirty generation. |
 | `409 append_log_rebased` | Re-stat, require a positive changed revision and the original expected size, then retry the same immutable tail once with the new revision. Content-layout headers do not override the operator match. |
 | `409 append_log_conflict` or full-PUT revision conflict | Preserve dirty state and return the error; never perform an LWW retry. |
 | timeout / response loss / 5xx | Preserve dirty state and return an error; do not assume append succeeded. |
 | `400 append_log_unsupported` from AppendLog | Disable append for this handle and select exactly one layout-correct full rewrite. |
+| `400 append_log_unsupported` from proven header reset | Preserve the old header and dirty view; return the error without generic-plan fallback. |
+| local shadow initialization after a successful proven header reset fails | Retain the committed 32-byte remote generation, discard old shadow bytes, clear shadow flags, record degraded state, and safely serve later reads remotely. |
 | `400 append_log_unsupported` from PATCH/V2/direct-upload/legacy plan | Reroute the same immutable full snapshot once to conditional full-body PUT; never retry the rejected plan. |
 | `413 append_log_too_large` from AppendLog or full-body PUT | Preserve dirty state, retain `append_log`, and return `EFBIG`; never retry through V2/PATCH or migrate to `single`. |
 | malformed success or any other error | Preserve dirty state and return an error. |
@@ -428,21 +624,33 @@ payload to become valid.
 
 Drive9 continues to use the normal file read API. The server is responsible
 for bounded S3 Express range reads. Open does not issue a content-layout HEAD
-for configured paths. An on-demand stat is allowed only for full-rewrite
-transport selection or the explicit rebase retry.
+for configured paths. An on-demand stat is allowed only for full-rewrite or
+generation-reset transport selection, or the explicit rebase retry.
 
 After an append success, FUSE may seed its read cache only when it already has
 the complete immutable file image. It must not fabricate a whole-file cache
-entry from the tail alone. A cached reopen may reuse revision-matched data and
+entry from the tail alone. A successful WAL generation reset may seed exactly
+the immutable 32-byte header under its new revision, and must invalidate the
+previous-generation cache. A cached reopen may reuse revision-matched data and
 still attempt append-log because operator configuration, not cached layout,
 controls eligibility.
+
+For a configured SQLite WAL whose active handle already owns a complete
+`ShadowSpill` snapshot, a successful generation reset additionally rotates that
+snapshot to the exact 32-byte new header. This shadow is an FUSE-local current
+read source, not an independent remote durability copy: it is updated by later
+write-through tail writes and may be discarded only with safe remote-read
+fallback. A clean WAL reader must never use a stale writable buffer or an
+old-generation shadow merely to avoid a remote read.
 
 Add FUSE performance counters and timing fields for:
 
 1. append-log request count, tail bytes, latency, and outcome code;
 2. full-rewrite fallback count and bytes for configured append-log paths;
 3. retry-after-rebase count; and
-4. strict fsync latency split by append versus rewrite.
+4. generation-reset count and bytes; and
+5. generation-reset shadow outcomes: ready and degraded; and
+6. strict fsync latency split by append versus conditional PUT/rewrite.
 
 The #875 workload uses these counters to prove remote-write bytes scale with
 new WAL frames rather than cumulative WAL length.
@@ -462,41 +670,57 @@ new WAL frames rather than cumulative WAL length.
    and small-to-large growth.
 4. Keep all existing #876 bounded checkpoint and stale-generation tests;
    append-log is not a substitute for their fence.
-5. Full-rewrite tests separately cover truncate-to-zero, non-tail writes,
-   checkpoint reuse, and an existing `append_log` body above the inline
-   threshold. Each asserts one complete immutable request body, the expected
-   revision header, no PATCH/V2/direct-upload/legacy plan, and successful
-   revision/size/layout/dirty-generation finalization both with and without a
-   concurrent newer write.
-6. Fallback tests cover AppendLog unsupported on an existing `single`,
+5. Generation-reset tests cover valid/invalid WAL-header parsing, lazy proof
+   without an `Open` request, split header writes, a header-only fsync, changed
+   versus unchanged salts, exact 32-byte conditional PUT, cache/shadow/dirty
+   collapse, error preservation, and concurrent frame writes. A pre-reset
+   shadow must be retired and replaced with exactly the new 32-byte header; a
+   later random WAL read and first-frame append must use the new local shadow,
+   not old bytes or a remote range. Shadow initialization failure must preserve
+   the committed remote reset and safely degrade only the local read source.
+6. Full-rewrite tests separately cover truncate-to-zero, ordinary non-tail
+   writes, checkpoint reuse that is not a proven header reset, and an existing
+   `append_log` body above the inline threshold. Each asserts one complete
+   immutable request body, the expected revision header, no
+   PATCH/V2/direct-upload/legacy plan, and successful revision/size/layout/
+   dirty-generation finalization both with and without a concurrent newer
+   write.
+7. Fallback tests cover AppendLog unsupported on an existing `single`,
    per-handle suppression, reopen reprobe, and PATCH/V2 unsupported on an
    `append_log` target. They assert a one-way transition to the correct
    full-write transport and prove that the rejected upload-plan endpoint is
    never called twice. A concurrent-write case proves AppendLog unsupported
    does not build a full-body fallback from an advanced dirty generation.
-7. Failure tests cover rebase retry validation, timeout/response-loss dirty
+8. Failure tests cover rebase retry validation, timeout/response-loss dirty
    preservation, normal conflict, routing-stat revision/size drift, and
    `append_log_too_large` from both append and full-body PUT. Drift tests assert
    no PUT/plan request; too-large tests assert no V2/PATCH retry and no layout
    downgrade.
-8. Capability-change tests prove a configured existing `append_log` file still
+9. Capability-change tests prove a configured existing `append_log` file still
    uses conditional full-body PUT, never PATCH/V2, when tail append is disabled.
-9. Snapshot tests mutate the live `WriteBuffer` and active ShadowStore after
+10. Snapshot tests mutate the live `WriteBuffer` and active ShadowStore after
    the HTTP request starts and prove the uploaded tail/full body remains the
    frozen generation. They cover temporary-snapshot cleanup on success,
    timeout, and server error, plus failure when a complete image cannot be
    materialized.
-10. End-to-end #875 runs with an explicit `--append-log` pattern: WAL mode,
-   `synchronous=FULL`, default
-   `wal_autocheckpoint=1000`, 1,000 individual commits, close/reopen, and
-   fresh remount verification.
-11. New append-log creation and tail append remain dormant unless both the
+11. End-to-end #875 runs with an explicit `--append-log` pattern: WAL mode,
+   `synchronous=FULL`, `wal_autocheckpoint=1000`, `journal_size_limit=-1`,
+   2,000 individual commits, close/reopen, and fresh remount verification.
+   The diagnostic must observe two generation resets and assert that WAL reads
+   at the second checkpoint boundary do not use `sqlite-sidecar-clean-remote`.
+12. A manual-only auto-reset case runs with `synchronous=FULL`,
+    `wal_autocheckpoint=5`, `journal_size_limit=-1`, and no explicit
+    checkpoint. It asserts `Write(0, 32B header) -> 32B conditional PUT ->`
+    first-frame tail append. The pre-implementation trace is retained as
+    evidence that SQLite exposes this order.
+13. New append-log creation and tail append remain dormant unless both the
     mount configuration matches and the server advertises the capability, so
     client release may precede server configuration safely.
 
 ## 8. Backlog
 
-Add automatic SQLite WAL discovery by validating the WAL header. Dynamic
-discovery is additive with explicit `--append-log` patterns and must preserve
-the same capability, pure-extension, snapshot, and fallback gates. It is not
-implemented in this release.
+Add automatic SQLite WAL discovery for paths that lack an explicit
+`--append-log` pattern. Dynamic discovery is additive with the limited
+per-handle header proof above and must preserve the same capability,
+pure-extension, snapshot, and fallback gates. It is not implemented in this
+release.

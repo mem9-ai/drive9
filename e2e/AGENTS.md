@@ -452,6 +452,37 @@ to add a bounded WAL readers/writer detector.
 7. Copy the remote tree back through the CLI and verify snapshot integrity
 8. Preserve run root, mount log, and expected/actual manifests on failure
 
+### `fuse-s3-express-append-log.sh`
+
+Manual-only hosted validation for the S3 Express append-log FUSE contract. It
+requires `DRIVE9_BASE`, `DRIVE9_API_KEY`, and explicit
+`DRIVE9_E2E_S3_EXPRESS_ENABLED=1`; `/v1/status` must advertise
+`storage_capabilities.append_log_v1=true`. The script defaults to 1,000
+SQLite WAL transactions with `synchronous=FULL`, verifies integrity and a
+logical fingerprint after close/reopen and a fresh remount, and writes mount
+perf artifacts. It rejects logical remote bytes above 10x the final WAL size,
+bytes that scale with cumulative WAL observations, and a late-commit P95 more
+than 4x the initial-commit P95; both ratios are configurable by environment.
+Do not add it to local-e2e or smoke-all: provider=local and this macOS
+workstation cannot exercise a real S3 Express Directory Bucket.
+Set `FUSE_APPEND_LOG_KEEP_ARTIFACTS=1` to retain successful-run artifacts.
+
+`e2e/microvm/issue-875-auto-reset-header-first/` is the trusted dynamic
+MicroVM companion case. It uses `synchronous=FULL`,
+`wal_autocheckpoint=5`, `journal_size_limit=-1`, and no explicit checkpoint.
+After the SQLite WAL generation-reset optimization lands, it must observe a
+valid offset-zero 32-byte header, an exact 32-byte conditional PUT, a fresh
+local shadow, and a
+subsequent first-frame AppendLog with expected size 32. Do not run or publish
+this case from local development without explicit external authorization.
+
+`e2e/microvm/issue-875-append-log-latency-no-journal-limit/` is the trusted
+2,000-commit checkpoint-read-source companion. It requires two automatic WAL
+generation resets and rejects a second-checkpoint WAL read source other than
+`shadow-spill`; it also reports bounded ready/degraded shadow outcomes. Do not
+run or publish this case from local development without explicit external
+authorization.
+
 ### `fuse-concurrency-stress.sh`
 
 Host support: Linux and macOS only. This script needs real FUSE support and is
