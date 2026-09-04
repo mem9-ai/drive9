@@ -141,7 +141,6 @@ func (fh *FileHandle) appendLogObserveCommittedSQLiteWALHeader(header sqliteWALH
 	}
 	fh.appendLog.sqliteWALConfirmed = true
 	fh.appendLog.sqliteWALCommittedHeader = header
-	fh.appendLog.sqliteWALTruncated = false
 	fh.appendLog.clearSQLiteWALHeaderWrite()
 }
 
@@ -299,6 +298,7 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	remoteCommitLockStarted := time.Now()
 	unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
 	remoteCommitLockWait := time.Since(remoteCommitLockStarted)
+	snapshotOwnsShadow := fh.ShadowReady || fh.ShadowSpill
 	snapshot, err := fs.newAppendLogSnapshotLocked(fh, start, snapshotSize-start)
 	if err != nil {
 		unlockRemoteCommit()
@@ -341,6 +341,9 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 			fs.replaceCommittedRevision(snapshotPath, result.Revision)
 		} else {
 			fs.recordCommittedRevision(snapshotPath, result.Revision)
+		}
+		if !snapshotOwnsShadow && fs.shadowStore != nil {
+			fs.shadowStore.Remove(snapshotPath)
 		}
 	}
 	unlockRemoteCommit()
@@ -454,6 +457,17 @@ func (fs *Dat9FS) appendLogSnapshotDir() (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("create append-log snapshot directory: %w", err)
 	}
+	fs.appendLogSnapshotSweepOnce.Do(func() {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			if entry.Type().IsRegular() && strings.HasPrefix(entry.Name(), ".drive9-append-log-") {
+				_ = os.Remove(filepath.Join(dir, entry.Name()))
+			}
+		}
+	})
 	return dir, nil
 }
 
@@ -646,7 +660,9 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 		fs.recordAppendLogGenerationReset(uint64(snapshot.Size()))
 		fs.recordCommittedRevision(snapshotPath, revision)
 	}
+	unlockRemoteCommit()
 	fh.Lock()
+	unlockRemoteCommit = fs.lockHandleRemoteCommitPathLocked(fh)
 	defer unlockRemoteCommit()
 	if err != nil {
 		fs.debugf("append-log trace event=generation_reset_result path=%q result=error error=%q dirty_seq=%d wall_unix_nano=%d duration_ns=%d", snapshotPath, err, snapshotDirtySeq, time.Now().UnixNano(), time.Since(resetStarted).Nanoseconds())

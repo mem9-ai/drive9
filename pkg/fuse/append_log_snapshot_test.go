@@ -10,6 +10,25 @@ import (
 	"testing"
 )
 
+func TestAppendLogSnapshotDirSweepsOrphansOnce(t *testing.T) {
+	cacheDir := t.TempDir()
+	snapshotDir := filepath.Join(cacheDir, "append-log-snapshots")
+	if err := os.MkdirAll(snapshotDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(snapshotDir, ".drive9-append-log-orphan")
+	if err := os.WriteFile(orphan, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), &MountOptions{CacheDir: cacheDir})
+	if _, err := fs.appendLogSnapshotDir(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan stat error = %v, want not exist", err)
+	}
+}
+
 func TestAppendLogSnapshotMemoryReadersAreFrozen(t *testing.T) {
 	source := []byte("immutable tail")
 	snapshot, err := newAppendLogSnapshotFromReader(t.TempDir(), int64(len(source)), bytes.NewReader(source))
