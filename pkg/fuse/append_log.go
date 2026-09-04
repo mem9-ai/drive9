@@ -818,11 +818,11 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 		fs.clearDirtySize(fh.Ino, snapshotDirtySeq)
 		fh.DirtySeq = 0
 		fh.appendLogAdoptCommittedBaseline(revision, snapshot.Size())
+		if header, ok := appendLogSnapshotSQLiteWALHeader(snapshot); ok {
+			fh.appendLogObserveCommittedSQLiteWALHeader(header)
+		}
 	} else {
 		fh.appendLogRebindLayout(revision, snapshot.Size())
-	}
-	if header, ok := appendLogSnapshotSQLiteWALHeader(snapshot); ok {
-		fh.appendLogObserveCommittedSQLiteWALHeader(header)
 	}
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.inodes.UpdateSize(fh.Ino, snapshot.Size())
