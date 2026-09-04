@@ -10,6 +10,39 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
 
+func TestAppendLogDirtyHandleRejectsNewCommittedBaseline(t *testing.T) {
+	for _, refresh := range []string{"revision", "revision-and-size", "lazy-adoption"} {
+		t.Run(refresh, func(t *testing.T) {
+			fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+				t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				w.WriteHeader(http.StatusInternalServerError)
+			})
+			defer closeServer()
+			fh.Ino = fs.inodes.Lookup(fh.Path, false, fh.OrigSize, time.Now())
+			fs.openHandles.Add(fh)
+			defer fs.openHandles.Remove(fh)
+			fs.recordCommittedRevisionWithSize(fh.Path, 6, 7)
+
+			switch refresh {
+			case "revision":
+				fs.refreshCommittedRevisionForOpenHandles(fh.Path, 6, nil)
+			case "revision-and-size":
+				fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, 6, nil, 7)
+			case "lazy-adoption":
+				fh.Lock()
+				fs.adoptCommittedRevisionLocked(fh)
+				fh.Unlock()
+			}
+			if fh.BaseRev != 5 || fh.OrigSize != 3 || fh.DirtySeq != 1 {
+				t.Fatalf("dirty baseline revision/size/sequence = %d/%d/%d, want 5/3/1", fh.BaseRev, fh.OrigSize, fh.DirtySeq)
+			}
+			if !fh.Dirty.HasDirtyParts() || string(fh.Dirty.Bytes()) != "pretail" {
+				t.Fatalf("pending bytes changed: dirty=%t data=%q", fh.Dirty.HasDirtyParts(), fh.Dirty.Bytes())
+			}
+		})
+	}
+}
+
 func TestAppendLogGVisorSupersededEntryPoints(t *testing.T) {
 	for _, entryPoint := range []string{"Flush", "Fsync", "Release", "flushHandle"} {
 		t.Run(entryPoint, func(t *testing.T) {

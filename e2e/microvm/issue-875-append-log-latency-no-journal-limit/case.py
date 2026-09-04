@@ -371,6 +371,7 @@ def main():
     env = os.environ.copy()
     env.update({
         "DRIVE9_BASE": target,
+        "DRIVE9_SERVER": target,
         "DRIVE9_API_KEY": credential,
         "DRIVE9_E2E_S3_EXPRESS_ENABLED": "1",
         "DRIVE9_CLI_BIN": str(drive9),

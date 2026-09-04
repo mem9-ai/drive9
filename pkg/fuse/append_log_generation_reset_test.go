@@ -735,6 +735,43 @@ func TestAppendLogUnownedAppendClearsLiveSiblingShadow(t *testing.T) {
 	}
 }
 
+func TestAppendLogRefreshClearsRemovedCleanSiblingShadow(t *testing.T) {
+	fs, owner, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s", r.Method)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer closeServer()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	owner.Dirty = NewWriteBuffer(owner.Path, 1024, 0)
+	if _, err := owner.Dirty.Write(0, []byte("clean")); err != nil {
+		t.Fatal(err)
+	}
+	owner.Dirty.ClearDirty()
+	owner.DirtySeq = 0
+	owner.BaseRev = 6
+	owner.OrigSize = 5
+	owner.ShadowReady = true
+	owner.ShadowSpill = true
+	fs.openHandles.Add(owner)
+	defer fs.openHandles.Remove(owner)
+
+	// This models an owner skipped by the first TryLock cleanup loop after a
+	// sibling removed the active path shadow. The later revision refresh must
+	// clear the now-invalid local source before publishing the new revision.
+	fs.refreshCommittedRevisionForOpenHandlesWithSize(owner.Path, 7, nil, 9)
+	if owner.ShadowReady || owner.ShadowSpill {
+		t.Fatalf("refresh retained removed shadow flags: ready=%t spill=%t", owner.ShadowReady, owner.ShadowSpill)
+	}
+	if owner.BaseRev != 7 || owner.Dirty.Size() != 9 {
+		t.Fatalf("refresh rebind = base=%d size=%d, want 7/9", owner.BaseRev, owner.Dirty.Size())
+	}
+}
+
 func TestAppendLogGenerationResetAppliesPendingModeAndCachesDirEntry(t *testing.T) {
 	oldHeader, ok := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
 	if !ok {
