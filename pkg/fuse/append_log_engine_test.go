@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -651,6 +652,118 @@ func TestAppendLogRebasedUnsupportedFallsBackWithRebasedRevision(t *testing.T) {
 	}
 	if appendCalls != 2 || headCalls != 1 || putCalls != 1 {
 		t.Fatalf("append/head/put calls = %d/%d/%d, want 2/1/1", appendCalls, headCalls, putCalls)
+	}
+}
+
+func TestAppendLogRebaseDoesNotPublishStateAcrossConcurrentWrite(t *testing.T) {
+	statStarted := make(chan struct{})
+	releaseStat := make(chan struct{})
+	writerHolding := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	retryStarted := make(chan struct{}, 1)
+	var (
+		appendCalls       int
+		releaseStatOnce   sync.Once
+		releaseWriterOnce sync.Once
+	)
+	finishStat := func() { releaseStatOnce.Do(func() { close(releaseStat) }) }
+	finishWriter := func() { releaseWriterOnce.Do(func() { close(releaseWriter) }) }
+	closeAll := func() {
+		finishStat()
+		finishWriter()
+	}
+	t.Cleanup(closeAll)
+
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			appendCalls++
+			if appendCalls == 1 {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "rebase required", "code": client.AppendLogCodeRebased})
+				return
+			}
+			retryStarted <- struct{}{}
+			w.WriteHeader(http.StatusInternalServerError)
+		case http.MethodHead:
+			close(statStarted)
+			<-releaseStat
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "6")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	fs.opts.RemoteCommitWaitTimeout = 20 * time.Millisecond
+	// The fixture seeds fh.Dirty directly. Register that initial generation as
+	// production Open/Write paths do, so the concurrent Write must advance
+	// DirtySeq rather than reusing the fixture's hand-written value.
+	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+	handleID := fs.allocateFileHandle(fh)
+	defer fs.deleteFileHandle(handleID, fh)
+
+	resultCh := make(chan appendLogAttemptResult, 1)
+	go func() {
+		fh.Lock()
+		result := fs.tryAppendLogLocked(context.Background(), fh)
+		fh.Unlock()
+		resultCh <- result
+	}()
+	select {
+	case <-statStarted:
+	case <-time.After(time.Second):
+		t.Fatal("rebase stat did not start")
+	}
+
+	writeCh := make(chan gofuse.Status, 1)
+	go func() {
+		_, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 7}, []byte("next"))
+		fh.Lock()
+		close(writerHolding)
+		<-releaseWriter
+		fh.Unlock()
+		writeCh <- status
+	}()
+	select {
+	case <-writerHolding:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent Write did not finish its timed lock path")
+	}
+
+	finishStat()
+	select {
+	case <-retryStarted:
+		finishWriter()
+		t.Fatal("rebase retry started while concurrent writer held fh.mu")
+	case <-time.After(100 * time.Millisecond):
+	}
+	finishWriter()
+
+	select {
+	case status := <-writeCh:
+		if status != gofuse.OK {
+			t.Fatalf("concurrent Write status = %d, want OK", status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("concurrent Write did not return")
+	}
+	select {
+	case result := <-resultCh:
+		if result.route != appendLogRouteFailed || result.status != gofuse.EAGAIN {
+			t.Fatalf("rebase result = %+v, want failed/EAGAIN", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rebase append did not return")
+	}
+	if appendCalls != 1 {
+		t.Fatalf("append calls = %d, want 1", appendCalls)
+	}
+	if fh.appendLog.hasRewriteBase {
+		t.Fatal("concurrent writer observed a rebase rewrite baseline")
 	}
 }
 
