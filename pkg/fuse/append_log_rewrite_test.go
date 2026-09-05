@@ -1158,6 +1158,39 @@ func TestAppendLogWriteSyncErrorPreservesNewerConcurrentGeneration(t *testing.T)
 	}
 }
 
+func TestAppendLogWriteSyncRollbackRestoresPriorDirtyGeneration(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer closeServer()
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, []byte("preone")); err != nil {
+		t.Fatal(err)
+	}
+	firstDirtySeq := fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+	fh.DirtySeq = firstDirtySeq
+	firstSnapshot := fh.Dirty.snapshot()
+
+	if _, err := fh.Dirty.Write(fh.Dirty.Size(), []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+	fs.restoreFailedWriteSyncLocked(fh, firstSnapshot, firstDirtySeq)
+	if got := string(fh.Dirty.Bytes()); got != "preone" || fh.DirtySeq != firstDirtySeq {
+		t.Fatalf("successor rollback = %q/%d, want preone/%d", got, fh.DirtySeq, firstDirtySeq)
+	}
+
+	preFirst := NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := preFirst.Write(0, []byte("pre")); err != nil {
+		t.Fatal(err)
+	}
+	preFirst.ClearDirty()
+	fs.restoreFailedWriteSyncLocked(fh, preFirst.snapshot(), 0)
+	if got := string(fh.Dirty.Bytes()); got != "pre" || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		t.Fatalf("earlier rollback = %q/%d/%t, want pre/0/false", got, fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+}
+
 func TestAppendLogEntryPointFsyncForcesRemoteAppendInInteractiveMode(t *testing.T) {
 	var appendCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
