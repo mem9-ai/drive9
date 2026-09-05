@@ -369,7 +369,7 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 			fs.recordCommittedRevisionWithSize(snapshotPath, result.Revision, result.Size)
 		}
 		if !snapshotOwnsShadow && fs.shadowStore != nil {
-			fs.shadowStore.Remove(snapshotPath)
+			fs.shadowStore.removeAfterAppendLogCommit(snapshotPath, result.Revision)
 			fs.clearRemovedCommittedShadowForOpenHandles(snapshotPath, result.Revision, result.Size)
 		}
 	}
@@ -398,6 +398,11 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	if fh.Unlinked || fh.Path != snapshotPath {
 		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 	}
+	if fh.BaseRev > result.Revision || fs.latestCommittedRevision(snapshotPath) > result.Revision {
+		// A successor already committed while this finalizer waited for fh.mu.
+		// It owns local publication, including dirty state and read caches.
+		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+	}
 	fh.IsNew = false
 	fh.BaseRev = result.Revision
 	fh.OrigSize = result.Size
@@ -421,9 +426,11 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	}
 	fs.inodes.UpdateRevision(fh.Ino, result.Revision)
 	fs.inodes.UpdateSize(fh.Ino, publishedSize)
+	committedAt := time.Now()
+	fs.inodes.UpdateMtime(fh.Ino, committedAt)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, result.Revision, fh, result.Size)
-	fs.clearReadTargetsForPathExcept(snapshotPath, fh)
-	fs.cacheFileForPath(snapshotPath, publishedSize, time.Now(), result.Revision)
+	fs.invalidateAppendLogReadTargets(snapshotPath, fh, result.Size)
+	fs.cacheFileForPath(snapshotPath, publishedSize, committedAt, result.Revision)
 	if snapshotIsNew && snapshot.Size() <= fs.readCache.MaxFileSize() {
 		if reader, openErr := snapshot.Open(); openErr == nil {
 			if data, readErr := io.ReadAll(reader); readErr == nil {
@@ -760,9 +767,11 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	}
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.inodes.UpdateSize(fh.Ino, sqliteWALHeaderSize)
+	committedAt := time.Now()
+	fs.inodes.UpdateMtime(fh.Ino, committedAt)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, revision, fh, sqliteWALHeaderSize)
 	fs.invalidateAppendLogReadTargets(snapshotPath, fh, sqliteWALHeaderSize)
-	fs.cacheFileForPath(snapshotPath, sqliteWALHeaderSize, time.Now(), revision)
+	fs.cacheFileForPath(snapshotPath, sqliteWALHeaderSize, committedAt, revision)
 	unlockRemoteCommit()
 	remoteCommitHeld = false
 	if localReset {
@@ -843,7 +852,7 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	if err == nil {
 		fs.recordCommittedRevisionWithSize(snapshotPath, revision, snapshot.Size())
 		if !snapshotOwnsShadow && fs.shadowStore != nil {
-			fs.shadowStore.Remove(snapshotPath)
+			fs.shadowStore.removeAfterAppendLogCommit(snapshotPath, revision)
 			fs.clearRemovedCommittedShadowForOpenHandles(snapshotPath, revision, snapshot.Size())
 		}
 	}
@@ -861,6 +870,9 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 	}
 	if fh.Unlinked || fh.Path != snapshotPath {
+		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+	}
+	if fh.BaseRev > revision || fs.latestCommittedRevision(snapshotPath) > revision {
 		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 	}
 	fh.BaseRev = revision
@@ -883,9 +895,11 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	}
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.inodes.UpdateSize(fh.Ino, publishedSize)
+	committedAt := time.Now()
+	fs.inodes.UpdateMtime(fh.Ino, committedAt)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, revision, fh, snapshot.Size())
 	fs.invalidateAppendLogReadTargets(snapshotPath, fh, snapshot.Size())
-	fs.cacheFileForPath(snapshotPath, publishedSize, time.Now(), revision)
+	fs.cacheFileForPath(snapshotPath, publishedSize, committedAt, revision)
 	if snapshot.Size() <= fs.readCache.MaxFileSize() {
 		if reader, openErr := snapshot.Open(); openErr == nil {
 			if data, readErr := io.ReadAll(reader); readErr == nil {
@@ -899,6 +913,32 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 	}
 	return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+}
+
+// refreshAppendLogReaderShadowLocked drops a pin retired by an ordinary
+// append-log commit. Read-time repair also reaches siblings skipped by TryLock
+// during publication. Reset/unlink snapshots keep their original lifetime.
+// The caller holds fh.mu.
+func (fs *Dat9FS) refreshAppendLogReaderShadowLocked(fh *FileHandle) {
+	if fs.shadowStore == nil || fh.Dirty != nil || !fh.ShadowPinned || fh.Unlinked || fh.UnlinkedSnapshot {
+		return
+	}
+	retiredRevision := fs.shadowStore.appendLogRetiredRevision(fh.ShadowGen)
+	if retiredRevision == 0 {
+		return
+	}
+	gen := fh.ShadowGen
+	fh.ShadowPinned = false
+	fh.ShadowGen = 0
+	fs.shadowStore.Unpin(gen)
+	clearReadTargetForLockedHandle(fh)
+	if revision, size, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && revision >= retiredRevision {
+		fh.BaseRev = revision
+		fh.OrigSize = size
+		if fh.Prefetch != nil {
+			fh.Prefetch.invalidateWithSize(size)
+		}
+	}
 }
 
 // invalidateAppendLogReadTargets drops prefetched bytes independently of the

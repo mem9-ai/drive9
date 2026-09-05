@@ -496,6 +496,11 @@ server response while preserving newer dirty data. An append success
 establishes that the committed server layout is `append_log`, but FUSE does not
 require a persistent layout cache for future routing.
 
+A late append/full-rewrite finalizer must not publish a revision older than
+the handle or the latest committed path revision. A superseded result leaves
+the newer handle, inode, dirty generation, and caches intact. Current results
+publish one commit timestamp to both inode mtime and the directory cache.
+
 Release distinguishes failed content from content committed before a deferred
 chmod failure. In the latter case its existing mode finalizer retries only
 chmod, never the content upload. A failed retry leaves the matching pending
@@ -657,6 +662,14 @@ the immutable 32-byte header under its new revision, and must invalidate the
 previous-generation cache. A cached reopen may reuse revision-matched data and
 still attempt append-log because operator configuration, not cached layout,
 controls eligibility.
+
+Tail append also invalidates sibling prefetch state and updates its size, so a
+cached block at the previous EOF cannot hide the new tail. After an ordinary
+append/full-rewrite retires an active shadow, read-only handles pinned to that
+generation must switch to the current read source. This can happen lazily at
+Read under the existing handle lock, using an in-memory invalidation revision
+on that retired generation. It must not detach snapshots retired by an earlier
+WAL reset, or anonymous unlinked-file snapshots. No persistent marker is added.
 
 For a configured SQLite WAL whose active handle already owns a complete
 `ShadowSpill` snapshot, a successful generation reset additionally rotates that

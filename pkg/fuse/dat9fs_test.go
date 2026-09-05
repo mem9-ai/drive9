@@ -27058,7 +27058,7 @@ func TestDebouncedFlushStaleUploadPreservesNewerPending(t *testing.T) {
 // guard: a stale generation does not remove the entry, while the matching
 // generation does.
 func TestShadowStoreRemoveIfGeneration(t *testing.T) {
-	s, err := NewShadowStore(t.TempDir())
+	s, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
