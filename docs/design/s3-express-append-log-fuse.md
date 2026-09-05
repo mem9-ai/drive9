@@ -334,6 +334,13 @@ append-safe with `OrigSize=32`, stores `H1` as the committed header, and
 refreshes same-path clean handles at size 32. This local collapse is part of
 the commit finalization, not a best-effort cache cleanup.
 
+Successful reset also schedules the existing kernel inode invalidation after
+releasing the remote commit lock. It invalidates attributes and cached data;
+the fsync handler must not synchronously wait for kernel notification because
+the kernel may hold locks for that same fsync. A failed reset PUT does not notify.
+Full rewrites and resets invalidate sibling prefetch bytes and read targets,
+cancel prior fetches, and update the prefetch size to the committed size.
+
 If the matching handle had a FUSE `ShadowStore` shadow, reset must retire and
 remove that old-generation shadow, then initialize a fresh active shadow whose
 complete content is exactly `H1[0:32)`. The replacement shadow belongs to the
@@ -488,6 +495,12 @@ handle original size, and all same-path committed-revision bookkeeping from the
 server response while preserving newer dirty data. An append success
 establishes that the committed server layout is `append_log`, but FUSE does not
 require a persistent layout cache for future routing.
+
+Release distinguishes failed content from content committed before a deferred
+chmod failure. In the latter case its existing mode finalizer retries only
+chmod, never the content upload. A failed retry leaves the matching pending
+mode on live same-inode handles for a later sync; a successful retry clears
+only that mode generation. This adds no persistent retry record or worker.
 
 Zero-byte append-log creation must take this branch before any existing
 `CreateFileCtx` shortcut. Non-tail writes, truncates, and per-handle unsupported

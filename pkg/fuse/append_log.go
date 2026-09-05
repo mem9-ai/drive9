@@ -737,7 +737,8 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	fh.BaseRev = revision
 	fh.OrigSize = sqliteWALHeaderSize
 	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, revision, sqliteWALHeaderSize)
-	if fh.DirtySeq == snapshotDirtySeq {
+	localReset := fh.DirtySeq == snapshotDirtySeq
+	if localReset {
 		if err := fh.Dirty.Truncate(sqliteWALHeaderSize); err != nil {
 			return appendLogAttemptResult{route: appendLogRouteFailed, status: gofuse.EIO}
 		}
@@ -760,10 +761,16 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.inodes.UpdateSize(fh.Ino, sqliteWALHeaderSize)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, revision, fh, sqliteWALHeaderSize)
-	fs.clearReadTargetsForPathExcept(snapshotPath, fh)
+	fs.invalidateAppendLogReadTargets(snapshotPath, fh, sqliteWALHeaderSize)
 	fs.cacheFileForPath(snapshotPath, sqliteWALHeaderSize, time.Now(), revision)
 	unlockRemoteCommit()
 	remoteCommitHeld = false
+	if localReset {
+		// Unlike an explicit truncate, a header fsync has no kernel size
+		// update. Schedule invalidation without waiting on kernel locks held
+		// by the FSYNC request itself.
+		fs.notifyInode(fh.Ino)
+	}
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 		safeLogPrintf("append-log generation-reset pending chmod failed for %s: %v", snapshotPath, err)
 		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
@@ -877,7 +884,7 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.inodes.UpdateSize(fh.Ino, publishedSize)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, revision, fh, snapshot.Size())
-	fs.clearReadTargetsForPathExcept(snapshotPath, fh)
+	fs.invalidateAppendLogReadTargets(snapshotPath, fh, snapshot.Size())
 	fs.cacheFileForPath(snapshotPath, publishedSize, time.Now(), revision)
 	if snapshot.Size() <= fs.readCache.MaxFileSize() {
 		if reader, openErr := snapshot.Open(); openErr == nil {
@@ -892,6 +899,18 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 	}
 	return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+}
+
+// invalidateAppendLogReadTargets drops prefetched bytes independently of the
+// sibling handle lock, as resetMountView does. A busy reader must not retain
+// cached bytes just because the best-effort ReadTarget clear skips its lock.
+func (fs *Dat9FS) invalidateAppendLogReadTargets(path string, skip *FileHandle, size int64) {
+	for _, fh := range fs.openHandles.SnapshotPath(path) {
+		if fh != nil && fh != skip && fh.Prefetch != nil {
+			fh.Prefetch.invalidateWithSize(size)
+		}
+	}
+	fs.clearReadTargetsForPathExcept(path, skip)
 }
 
 // routeAppendLogLocked attempts the append-specific transport before any

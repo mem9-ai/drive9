@@ -13696,6 +13696,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		fs.observePathPolicyWithContext(ctx, fh.Path)
 		flushStatus := gofuse.OK
 		preservePendingModeOnReleaseFailure := false
+		retryPendingModeAfterContentCommit := false
 		defer func() {
 			if fh.Prefetch != nil {
 				fh.Prefetch.Close()
@@ -13741,7 +13742,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				return
 			}
 
-			if flushStatus == gofuse.OK {
+			if flushStatus == gofuse.OK || retryPendingModeAfterContentCommit {
 				modeCtx, modeCancel := fuseCtxWithTimeout(cancel, 30*time.Second)
 				err := retryPostUploadMode(modeCtx, func() error {
 					return fs.applyRemoteMode(modeCtx, localPath, pendingMode)
@@ -13766,6 +13767,10 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				if stillCurrent {
 					fs.inodes.UpdateMode(ino, pendingMode)
 					fs.clearPendingModeForInodeGeneration(ino, fh, pendingMode, pendingModeGen)
+				}
+				if retryPendingModeAfterContentCommit {
+					flushStatus = gofuse.OK
+					releaseStatus = gofuse.OK
 				}
 				return
 			}
@@ -13904,6 +13909,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		}
 		if fs.appendLogConfiguredLocked(fh) {
 			phase = "append-log-release-sync"
+			releasePath := fh.Path
 			size := int64(0)
 			if fh.Dirty != nil {
 				size = fh.Dirty.Size()
@@ -13911,6 +13917,12 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 			flushStatus = fs.syncHandleToRemoteLocked(flushCtx, fh)
 			flushCancel()
+			// The content finalizer may have succeeded before chmod failed.
+			// Let the existing Release mode finalizer retry only the mode; on
+			// failure it keeps the pending generation on live sibling handles.
+			retryPendingModeAfterContentCommit = flushStatus != gofuse.OK &&
+				fh.Path == releasePath && !fh.Unlinked && !fh.IsNew && fh.BaseRev > 0 &&
+				fh.HasPendingMode && fh.DirtySeq == 0 && (fh.Dirty == nil || !fh.Dirty.HasDirtyParts())
 			fh.Unlock()
 			return
 		}
