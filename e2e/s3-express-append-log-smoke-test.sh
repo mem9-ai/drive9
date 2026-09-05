@@ -5,7 +5,7 @@
 
 set -u
 
-required_env=(DRIVE9_BASE DRIVE9_API_KEY DRIVE9_E2E_S3_EXPRESS_ENABLED)
+required_env=(DRIVE9_BASE DRIVE9_API_KEY)
 missing_env=()
 for name in "${required_env[@]}"; do
 	if [[ -z "${!name:-}" ]]; then
@@ -14,6 +14,11 @@ for name in "${required_env[@]}"; do
 done
 if ((${#missing_env[@]} > 0)); then
 	printf 'SKIP: S3 Express append-log smoke requires: %s\n' "${missing_env[*]}"
+	exit 0
+fi
+
+if [[ "${DRIVE9_E2E_S3_EXPRESS_ENABLED:-}" != 1 ]]; then
+	printf 'SKIP: S3 Express append-log smoke requires DRIVE9_E2E_S3_EXPRESS_ENABLED=1\n'
 	exit 0
 fi
 
