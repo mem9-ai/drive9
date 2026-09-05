@@ -145,6 +145,8 @@ AppendLog(ctx, path, tail, tailSize, expectedRevision, expectedSize)
 `tailSize` and does not buffer the whole request. It sends
 `POST /v1/fs/{path}?append-log`, `X-Dat9-Expected-Revision`, and
 `X-Dat9-Expected-Size`. All three sizes/revisions must be non-negative.
+For a zero-byte append or conditional PUT, the client sends an explicit
+zero-length, non-chunked body.
 
 `StatusError` gains the server's optional machine-readable `Code`. The client
 preserves at least these codes as typed constants:
@@ -354,6 +356,14 @@ replacement shadow, clear the shadow flags, record bounded degraded
 observability, and safely fall back to remote reads. It must not return a failed
 fsync after the remote reset, reuse old-generation bytes, or weaken the existing
 concurrent dirty/path/unlink fences.
+
+An append-log shadow is a current-process read cache, not crash-recovery data.
+At a later mount, a disk-only append-log shadow without existing pending-write
+metadata must be discarded before a read-only handle can pin it; it may contain
+writes that never reached a strict fsync. A resident shadow created by the
+current process remains eligible for existing local read acceleration. This
+rule adds no persistent marker, remote validation round trip, or recovery
+upload path.
 
 The existing same-path remote commit lock and the initiating handle mutex remain
 held from the conditional PUT through matching reset finalization, including

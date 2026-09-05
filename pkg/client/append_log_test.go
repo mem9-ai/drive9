@@ -138,6 +138,24 @@ func TestAppendLogRequestAndSuccess(t *testing.T) {
 	}
 }
 
+func TestAppendLogZeroBodyUsesExplicitLength(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %q, want POST", r.Method)
+		}
+		if r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+			t.Fatalf("zero append request = length %d transfer=%v, want 0/non-chunked", r.ContentLength, r.TransferEncoding)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1, "size_bytes": 0})
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL, "").AppendLog(context.Background(), "/file", io.NopCloser(bytes.NewReader(nil)), 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAppendLogRejectsInvalidSuccess(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -189,5 +207,23 @@ func TestWriteServerStreamConditionalUsesOnePUT(t *testing.T) {
 	}
 	if revision != 10 || calls != 1 {
 		t.Fatalf("revision=%d calls=%d", revision, calls)
+	}
+}
+
+func TestWriteServerStreamConditionalZeroBodyUsesExplicitLength(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Fatalf("method = %q, want PUT", r.Method)
+		}
+		if r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+			t.Fatalf("zero conditional PUT = length %d transfer=%v, want 0/non-chunked", r.ContentLength, r.TransferEncoding)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL, "").WriteServerStreamConditional(context.Background(), "/file", io.NopCloser(bytes.NewReader(nil)), 0, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
 }

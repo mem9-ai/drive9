@@ -1126,6 +1126,37 @@ func (s *ShadowStore) PinIfExists(remotePath string) (uint64, bool) {
 	return gen, true
 }
 
+// PinResidentOrDiscardDisk pins a shadow created by this process. A disk-only
+// shadow has no current-process durability proof, so it is discarded instead
+// of becoming a read source after restart. The path lock keeps a concurrent
+// writer from creating a replacement between the resident check and discard.
+func (s *ShadowStore) PinResidentOrDiscardDisk(remotePath string) (uint64, bool) {
+	if s == nil {
+		return 0, false
+	}
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	s.mu.Lock()
+	sf, ok := s.files[remotePath]
+	if !ok {
+		s.mu.Unlock()
+		_ = os.Remove(s.shadowPath(remotePath))
+		s.RecoverPendingBytes()
+		return 0, false
+	}
+	gen := s.active[remotePath]
+	if gen == 0 {
+		s.nextGen++
+		gen = s.nextGen
+		s.active[remotePath] = gen
+		s.genFile[gen] = sf
+	}
+	s.refs[gen]++
+	s.mu.Unlock()
+	return gen, true
+}
+
 // Unpin decrements the reference count for the given generation. If the
 // generation was retired (Remove called while pinned) and the count reaches
 // zero, the retired fd is closed and the disk file deleted. Generation 0

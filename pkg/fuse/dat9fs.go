@@ -11304,9 +11304,19 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		}
 		// Atomically pin shadow for read-only opens so commit queue cleanup
 		// doesn't delete the shadow file while this handle is reading from it.
-		// PinIfExists avoids a TOCTOU race between Has() and Pin().
+		// Configured append-log paths without pending metadata only accept a
+		// current-process shadow; a disk-only shadow may contain an uncommitted
+		// tail left by a crashed process.
 		if !fh.ShadowPinned && fs.shadowStore != nil {
-			if gen, ok := fs.shadowStore.PinIfExists(p); ok {
+			pendingShadow := fs.pendingIndex != nil && fs.pendingIndex.HasPending(p)
+			var gen uint64
+			var ok bool
+			if fs.appendLogPathConfigured(p) && !pendingShadow {
+				gen, ok = fs.shadowStore.PinResidentOrDiscardDisk(p)
+			} else {
+				gen, ok = fs.shadowStore.PinIfExists(p)
+			}
+			if ok {
 				fh.ShadowGen = gen
 				fh.ShadowPinned = true
 			}
@@ -12217,8 +12227,10 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		fh.Dirty = fs.newWriteBuffer(fh.Path, 0, 0)
 	}
 	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
+	writeSyncAppendLogState := appendLogHandleState{}
 	if fh.WritePolicy == WritePolicyWriteSync {
 		writeSyncSnapshot = fh.Dirty.snapshot()
+		writeSyncAppendLogState = fh.appendLog
 	}
 
 	writeOffset := int64(input.Offset)
@@ -12323,6 +12335,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 					fs.discardSupersededMutationLocked(fh)
 				} else if !contentCommitted && !newerDirtyGeneration {
 					fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot)
+					fh.appendLogRestoreFailedWriteState(writeSyncAppendLogState)
 				}
 			}
 			return 0, st
