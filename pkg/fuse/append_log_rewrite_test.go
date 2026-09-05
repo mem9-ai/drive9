@@ -975,6 +975,101 @@ func TestAppendLogWriteSyncWriteUsesAppendRoute(t *testing.T) {
 	}
 }
 
+func TestAppendLogWriteSyncFailureRestoresMutationState(t *testing.T) {
+	var putCalls, appendCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putCalls++
+			if putCalls != 1 {
+				t.Errorf("conditional PUT calls = %d, want 1", putCalls)
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+		case http.MethodPost:
+			appendCalls++
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "tail" {
+				t.Errorf("append body = %q, want tail", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, []byte("pre")); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.DirtySeq = 0
+	fh.BaseRev = 5
+	fh.OrigSize = 3
+	fh.WritePolicy = WritePolicyWriteSync
+	fh.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 5, size: 3}
+	before := fh.appendLog
+	handleID := fs.fileHandles.Allocate(fh)
+	defer fs.fileHandles.Delete(handleID)
+
+	if written, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 0}, []byte("X")); written != 0 || status == gofuse.OK {
+		t.Fatalf("non-tail write = %d/%d, want 0/error", written, status)
+	}
+	if fh.appendLog != before {
+		t.Fatalf("append-log state after rollback = %+v, want %+v", fh.appendLog, before)
+	}
+	if got := string(fh.Dirty.Bytes()); got != "pre" || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		t.Fatalf("buffer after rollback = %q seq=%d dirty=%t, want pre/0/false", got, fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+
+	if written, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 3}, []byte("tail")); written != 4 || status != gofuse.OK {
+		t.Fatalf("tail write = %d/%d, want 4/OK", written, status)
+	}
+	if putCalls != 1 || appendCalls != 1 || fh.BaseRev != 6 || fh.OrigSize != 7 {
+		t.Fatalf("requests/handle = put=%d append=%d rev=%d size=%d", putCalls, appendCalls, fh.BaseRev, fh.OrigSize)
+	}
+}
+
+func TestAppendLogWriteSyncRollbackPreservesUnsupported(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": client.AppendLogCodeUnsupported, "code": client.AppendLogCodeUnsupported})
+		case http.MethodPut:
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, []byte("pre")); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.DirtySeq = 0
+	fh.BaseRev = 5
+	fh.OrigSize = 3
+	fh.WritePolicy = WritePolicyWriteSync
+	fh.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 5, size: 3}
+	before := fh.appendLog
+	handleID := fs.fileHandles.Allocate(fh)
+	defer fs.fileHandles.Delete(handleID)
+
+	if written, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 3}, []byte("tail")); written != 0 || status == gofuse.OK {
+		t.Fatalf("write = %d/%d, want 0/error", written, status)
+	}
+	want := before
+	want.unsupported = true
+	if fh.appendLog != want {
+		t.Fatalf("append-log state after unsupported rollback = %+v, want %+v", fh.appendLog, want)
+	}
+}
+
 func TestAppendLogWriteSyncErrorPreservesNewerConcurrentGeneration(t *testing.T) {
 	firstAppendStarted := make(chan struct{})
 	releaseFirstAppend := make(chan struct{})

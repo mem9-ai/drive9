@@ -36,7 +36,9 @@ func (c *Client) AppendLog(ctx context.Context, path string, tail io.Reader, tai
 	if expectedSize > maxAppendLogInt64-tailSize {
 		return AppendLogResult{}, fmt.Errorf("append-log size overflows int64")
 	}
-	if tail == nil {
+	if tailSize == 0 {
+		tail = http.NoBody
+	} else if tail == nil {
 		tail = bytes.NewReader(nil)
 	}
 
@@ -88,7 +90,9 @@ func (c *Client) WriteServerStreamConditional(ctx context.Context, path string, 
 	if size > 0 && body == nil {
 		return 0, fmt.Errorf("server stream body is nil")
 	}
-	if body == nil {
+	if size == 0 {
+		body = http.NoBody
+	} else if body == nil {
 		body = bytes.NewReader(nil)
 	}
 

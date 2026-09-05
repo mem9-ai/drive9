@@ -94,6 +94,148 @@ func TestAppendLogSmallTailCommitDoesNotRequireSnapshotCache(t *testing.T) {
 	}
 }
 
+func TestAppendLogReadOnlyOpenDiscardsDiskOnlyShadow(t *testing.T) {
+	const path = "/configured-log"
+	opts := &MountOptions{AppendLogPatterns: []string{"**/configured-log"}}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	if !fs.appendLogPathConfigured(path) {
+		t.Fatal("fixture path is not append-log configured")
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.pendingIndex = pending
+
+	shadowDir := t.TempDir()
+	beforeRestart, err := NewShadowStoreWithQuota(shadowDir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := beforeRestart.WriteFull(path, []byte("uncommitted-tail"), 5); err != nil {
+		beforeRestart.Close()
+		t.Fatal(err)
+	}
+	beforeRestart.Close()
+	afterRestart, err := NewShadowStoreWithQuota(shadowDir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer afterRestart.Close()
+	afterRestart.RecoverPendingBytes()
+	if got := afterRestart.PendingBytes(); got != int64(len("uncommitted-tail")) {
+		t.Fatalf("recovered pending bytes = %d, want %d", got, len("uncommitted-tail"))
+	}
+	fs.shadowStore = afterRestart
+
+	ino := fs.inodes.Lookup(path, false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+	var out gofuse.OpenOut
+	if status := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out); status != gofuse.OK {
+		t.Fatalf("Open status = %d, want OK", status)
+	}
+	defer fs.fileHandles.Delete(out.Fh)
+	reader, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("read-only handle is missing")
+	}
+	if reader.ShadowPinned {
+		t.Fatal("read-only append-log handle pinned disk-only shadow after restart")
+	}
+	if afterRestart.Has(path) {
+		t.Fatal("disk-only append-log shadow survived read-only reopen")
+	}
+	if got := afterRestart.PendingBytes(); got != 0 {
+		t.Fatalf("pending bytes after disk-only discard = %d, want 0", got)
+	}
+}
+
+func TestAppendLogReadOnlyOpenPinsResidentShadow(t *testing.T) {
+	const path = "/configured-log"
+	opts := &MountOptions{AppendLogPatterns: []string{"**/configured-log"}}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(path, []byte("committed-cache"), 5); err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex, err = NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ino := fs.inodes.Lookup(path, false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+	var out gofuse.OpenOut
+	if status := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out); status != gofuse.OK {
+		t.Fatalf("Open status = %d, want OK", status)
+	}
+	defer fs.fileHandles.Delete(out.Fh)
+	reader, ok := fs.fileHandles.Get(out.Fh)
+	if !ok || !reader.ShadowPinned {
+		t.Fatal("read-only append-log handle did not pin resident shadow")
+	}
+}
+
+func TestAppendLogReadOnlyOpenRetainsPendingDiskOnlyShadow(t *testing.T) {
+	const path = "/configured-log"
+	opts := &MountOptions{AppendLogPatterns: []string{"**/configured-log"}}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.Put(path, int64(len("recoverable-tail")), PendingOverwrite); err != nil {
+		t.Fatal(err)
+	}
+	fs.pendingIndex = pending
+
+	shadowDir := t.TempDir()
+	beforeRestart, err := NewShadowStoreWithQuota(shadowDir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := beforeRestart.WriteFull(path, []byte("recoverable-tail"), 5); err != nil {
+		beforeRestart.Close()
+		t.Fatal(err)
+	}
+	beforeRestart.Close()
+	afterRestart, err := NewShadowStoreWithQuota(shadowDir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer afterRestart.Close()
+	fs.shadowStore = afterRestart
+
+	ino := fs.inodes.Lookup(path, false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+	var out gofuse.OpenOut
+	if status := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out); status != gofuse.OK {
+		t.Fatalf("Open status = %d, want OK", status)
+	}
+	defer fs.fileHandles.Delete(out.Fh)
+	reader, ok := fs.fileHandles.Get(out.Fh)
+	if !ok || !reader.ShadowPinned || !afterRestart.Has(path) {
+		t.Fatal("read-only append-log handle did not retain pending disk-only shadow")
+	}
+}
+
 func TestAppendLogAdoptsCommittedRevisionAndSizeTogether(t *testing.T) {
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {

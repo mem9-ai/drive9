@@ -197,6 +197,18 @@ func (fh *FileHandle) appendLogMarkUnsupported() {
 	}
 }
 
+// appendLogRestoreFailedWriteState restores the pre-write mutation state after
+// the same dirty generation fails to commit. append_log_unsupported is a
+// server observation, so it remains sticky across that local rollback.
+func (fh *FileHandle) appendLogRestoreFailedWriteState(before appendLogHandleState) {
+	if fh == nil {
+		return
+	}
+	unsupported := fh.appendLog.unsupported
+	fh.appendLog = before
+	fh.appendLog.unsupported = unsupported
+}
+
 func (fh *FileHandle) appendLogAdoptCommittedBaseline(revision, size int64) {
 	if fh == nil {
 		return
