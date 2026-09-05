@@ -1753,6 +1753,80 @@ func (s *Store) InsertAPIKey(ctx context.Context, k *APIKey) (err error) {
 	return err
 }
 
+// InsertAPIKeyWithFSScopes persists one scoped API key and all of its
+// filesystem grants atomically. A retry can never observe a partially-scoped
+// credential after a process or response failure.
+func (s *Store) InsertAPIKeyWithFSScopes(ctx context.Context, k *APIKey, scopes []APIKeyFSScope) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "insert_api_key_with_fs_scopes", start, &err)
+	if k == nil {
+		return fmt.Errorf("api key is required")
+	}
+	scopeKind, err := apiKeyScopeKindForInsert(k)
+	if err != nil {
+		return err
+	}
+	if scopeKind != APIKeyScopeKindFS {
+		return fmt.Errorf("api key scope kind must be %q", APIKeyScopeKindFS)
+	}
+	validated := make([]APIKeyFSScope, len(scopes))
+	seen := make(map[string]struct{}, len(scopes))
+	for i, scope := range scopes {
+		prefix, err := canonicalFSScopePrefix(scope.Prefix)
+		if err != nil {
+			return err
+		}
+		if err := validateFSScopeOps(scope.Ops); err != nil {
+			return err
+		}
+		if _, ok := seen[prefix]; ok {
+			return ErrDuplicate
+		}
+		seen[prefix] = struct{}{}
+		scope.TenantID = k.TenantID
+		scope.APIKeyID = k.ID
+		scope.Prefix = prefix
+		scope.PrefixHash = fsScopePrefixHash(prefix)
+		if scope.CreatedAt.IsZero() {
+			scope.CreatedAt = k.CreatedAt
+		}
+		if scope.UpdatedAt.IsZero() {
+			scope.UpdatedAt = scope.CreatedAt
+		}
+		validated[i] = scope
+	}
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO tenant_api_keys
+			(id, tenant_id, key_name, jwt_ciphertext, jwt_hash, token_version, status, scope_kind,
+			 issued_by_provider, issued_by_subject_key, issued_by_metadata_json,
+			 issued_at, revoked_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			k.ID, k.TenantID, k.KeyName, k.JWTCiphertext, k.JWTHash, k.TokenVersion, k.Status, scopeKind,
+			k.IssuedByProvider, k.IssuedBySubjectKey, nullableBytes(k.IssuedByMetadataJSON),
+			k.IssuedAt.UTC(), k.RevokedAt, k.CreatedAt.UTC(), k.UpdatedAt.UTC())
+		if isDuplicateEntry(err) {
+			return ErrDuplicate
+		}
+		if err != nil {
+			return err
+		}
+		for _, scope := range validated {
+			_, err := tx.ExecContext(ctx, `INSERT INTO tenant_api_key_fs_scopes
+				(tenant_id, api_key_id, prefix, prefix_hash, ops, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				scope.TenantID, scope.APIKeyID, scope.Prefix, scope.PrefixHash, scope.Ops,
+				scope.CreatedAt.UTC(), scope.UpdatedAt.UTC())
+			if isDuplicateEntry(err) {
+				return ErrDuplicate
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (s *Store) GetExternalBinding(ctx context.Context, provider, subjectKey string) (out *ExternalBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "get_external_binding", start, &err)
@@ -1778,7 +1852,16 @@ func (s *Store) InsertExternalBinding(ctx context.Context, b *ExternalBinding) (
 	if b == nil {
 		return fmt.Errorf("external binding is required")
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_external_bindings
+	err = insertExternalBinding(ctx, s.db, b)
+	return err
+}
+
+type externalBindingExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertExternalBinding(ctx context.Context, execer externalBindingExecer, b *ExternalBinding) error {
+	_, err := execer.ExecContext(ctx, `INSERT INTO tenant_external_bindings
 		(provider, subject_key, tenant_id, metadata_json, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		b.Provider, b.SubjectKey, b.TenantID, nullableBytes(b.MetadataJSON), b.CreatedAt.UTC(), b.UpdatedAt.UTC())
@@ -1786,6 +1869,13 @@ func (s *Store) InsertExternalBinding(ctx context.Context, b *ExternalBinding) (
 		return ErrDuplicate
 	}
 	return err
+}
+
+func insertExternalBindingTx(ctx context.Context, tx *sql.Tx, b *ExternalBinding) error {
+	if b == nil {
+		return fmt.Errorf("external binding is required")
+	}
+	return insertExternalBinding(ctx, tx, b)
 }
 
 func (s *Store) DeleteExternalBinding(ctx context.Context, provider, subjectKey string) (err error) {
@@ -2256,7 +2346,7 @@ func (s *Store) listFreeTenantPoolBindings(ctx context.Context, organizationID s
 }
 
 func (s *Store) ClaimOldestFreeTenantPoolBinding(ctx context.Context, organizationID string) (out *TenantWithTiDBCloudOrgBinding, err error) {
-	return s.claimFreeTenantPoolBinding(ctx, organizationID, "", QuotaConfigPatch{})
+	return s.claimFreeTenantPoolBinding(ctx, organizationID, "", QuotaConfigPatch{}, nil)
 }
 
 func (s *Store) ClaimFreeTenantPoolBinding(ctx context.Context, organizationID, tenantID string, quota QuotaConfigPatch) (out *TenantWithTiDBCloudOrgBinding, err error) {
@@ -2264,10 +2354,29 @@ func (s *Store) ClaimFreeTenantPoolBinding(ctx context.Context, organizationID, 
 	if tenantID == "" {
 		return nil, fmt.Errorf("tenant_id is required")
 	}
-	return s.claimFreeTenantPoolBinding(ctx, organizationID, tenantID, quota)
+	return s.claimFreeTenantPoolBinding(ctx, organizationID, tenantID, quota, nil)
 }
 
-func (s *Store) claimFreeTenantPoolBinding(ctx context.Context, organizationID, tenantID string, quota QuotaConfigPatch) (out *TenantWithTiDBCloudOrgBinding, err error) {
+func (s *Store) ClaimFreeTenantPoolBindingWithExternalBinding(
+	ctx context.Context,
+	organizationID, tenantID string,
+	quota QuotaConfigPatch,
+	binding ExternalBinding,
+) (out *TenantWithTiDBCloudOrgBinding, err error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant_id is required")
+	}
+	binding.TenantID = tenantID
+	return s.claimFreeTenantPoolBinding(ctx, organizationID, tenantID, quota, &binding)
+}
+
+func (s *Store) claimFreeTenantPoolBinding(
+	ctx context.Context,
+	organizationID, tenantID string,
+	quota QuotaConfigPatch,
+	externalBinding *ExternalBinding,
+) (out *TenantWithTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "claim_free_tidbcloud_pool_binding", start, &err)
 	organizationID = strings.TrimSpace(organizationID)
@@ -2305,8 +2414,8 @@ func (s *Store) claimFreeTenantPoolBinding(ctx context.Context, organizationID, 
 		}
 		now := time.Now().UTC()
 		res, execErr := tx.ExecContext(ctx, `UPDATE tenant_tidbcloud_org_bindings
-			SET pool_status = ?, used_at = ?, updated_at = ?
-			WHERE tenant_id = ? AND pool_status = ?`,
+				SET pool_status = ?, used_at = ?, updated_at = ?
+				WHERE tenant_id = ? AND pool_status = ?`,
 			TenantPoolBindingUsed, now, now, rec.Binding.TenantID, TenantPoolBindingFree)
 		if execErr != nil {
 			return execErr
@@ -2314,6 +2423,11 @@ func (s *Store) claimFreeTenantPoolBinding(ctx context.Context, organizationID, 
 		n, _ := res.RowsAffected()
 		if n == 0 {
 			return ErrNotFound
+		}
+		if externalBinding != nil {
+			if err := insertExternalBindingTx(ctx, tx, externalBinding); err != nil {
+				return err
+			}
 		}
 		rec.Binding.PoolStatus = TenantPoolBindingUsed
 		rec.Binding.UsedAt = &now
@@ -2703,7 +2817,9 @@ func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKe
 	defer func() { _ = conn.Close() }()
 
 	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(CONCAT(?, DATABASE()), ?)", lockName, externalBindingLockTimeoutSeconds).Scan(&got); err != nil {
+	if err := withMetaLockConflictRetry(ctx, "acquire_external_binding_lock", func() error {
+		return conn.QueryRowContext(ctx, "SELECT GET_LOCK(CONCAT(?, DATABASE()), ?)", lockName, externalBindingLockTimeoutSeconds).Scan(&got)
+	}); err != nil {
 		return err
 	}
 	if !got.Valid {
@@ -2726,7 +2842,9 @@ func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKe
 			return
 		}
 		if released.Int64 != 1 {
-			err = errors.Join(err, fmt.Errorf("external binding named lock was not held by current connection"))
+			logger.Warn(releaseCtx, "named_lock_release_not_owner",
+				zap.String("operation", "external_binding_lock"),
+				zap.String("lock_name", lockName))
 		}
 	}()
 
@@ -2756,7 +2874,9 @@ func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(c
 	lockName = tenantPoolDatabaseLockName(lockName, databaseName.String)
 
 	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, tenantPoolLockTimeoutSeconds).Scan(&got); err != nil {
+	if err := withMetaLockConflictRetry(ctx, "acquire_tenant_pool_lock", func() error {
+		return conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, tenantPoolLockTimeoutSeconds).Scan(&got)
+	}); err != nil {
 		return err
 	}
 	if !got.Valid {
@@ -2779,7 +2899,9 @@ func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(c
 			return
 		}
 		if released.Int64 != 1 {
-			err = errors.Join(err, fmt.Errorf("tenant pool named lock was not held by current connection"))
+			logger.Warn(releaseCtx, "named_lock_release_not_owner",
+				zap.String("operation", "tenant_pool_lock"),
+				zap.String("lock_name", lockName))
 		}
 	}()
 
@@ -3669,14 +3791,32 @@ func (s *Store) RevokeAPIKeysByIssuer(ctx context.Context, tenantID, provider, s
 func (s *Store) GetActiveAPIKeyByIssuer(ctx context.Context, tenantID, provider, subjectKey string) (out *APIKey, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "get_active_api_key_by_issuer", start, &err)
-	row := s.db.QueryRowContext(ctx, `SELECT
+	return s.getAPIKeyByIssuer(ctx, tenantID, provider, subjectKey, true)
+}
+
+// GetAPIKeyByIssuer returns the newest matching API key in any status. It is
+// intended for idempotency lookups where a revoked credential must remain a
+// durable tombstone instead of allowing the same logical action to reissue.
+func (s *Store) GetAPIKeyByIssuer(ctx context.Context, tenantID, provider, subjectKey string) (out *APIKey, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "get_api_key_by_issuer", start, &err)
+	return s.getAPIKeyByIssuer(ctx, tenantID, provider, subjectKey, false)
+}
+
+func (s *Store) getAPIKeyByIssuer(ctx context.Context, tenantID, provider, subjectKey string, activeOnly bool) (out *APIKey, err error) {
+	query := `SELECT
 			id, tenant_id, key_name, jwt_ciphertext, jwt_hash, token_version, status, scope_kind,
 			issued_by_provider, issued_by_subject_key, issued_by_metadata_json, issued_at,
 			revoked_at, created_at, updated_at
 		FROM tenant_api_keys
-		WHERE tenant_id = ? AND issued_by_provider = ? AND issued_by_subject_key = ? AND status = ?
-		ORDER BY created_at DESC
-		LIMIT 1`, tenantID, provider, subjectKey, APIKeyActive)
+		WHERE tenant_id = ? AND issued_by_provider = ? AND issued_by_subject_key = ?`
+	args := []any{tenantID, provider, subjectKey}
+	if activeOnly {
+		query += ` AND status = ?`
+		args = append(args, APIKeyActive)
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT 1`
+	row := s.db.QueryRowContext(ctx, query, args...)
 
 	var rec APIKey
 	var revokedAt sql.NullTime

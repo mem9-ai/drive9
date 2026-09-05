@@ -30,8 +30,10 @@ func ExampleClient_constructionStatusAndRawRequests() {
 	c.SetActor("agent-a")
 	_ = c.BaseURL()
 	_ = c.APIKey()
+	c.SetAPIKey("rotated-fs-scoped-api-key")
 
 	c.Warm(ctx)
+	_, _ = c.CredentialScopeKind(ctx)
 	_ = c.MaxUploadBytes(ctx)
 	_ = c.SmallFileThreshold(ctx)
 	_ = c.CachedSmallFileThreshold()
@@ -695,6 +697,7 @@ var coveredClientMethods = map[string]bool{
 	"CommitFSLayer":                        true,
 	"Copy":                                 true,
 	"CopyCtx":                              true,
+	"CredentialScopeKind":                  true,
 	"CreateFile":                           true,
 	"CreateFileCtx":                        true,
 	"CreateFSLayer":                        true,
@@ -793,6 +796,7 @@ var coveredClientMethods = map[string]bool{
 	"SQL":                                  true,
 	"SearchJournal":                        true,
 	"SetActor":                             true,
+	"SetAPIKey":                            true,
 	"SetMetadata":                          true,
 	"SetMetadataCtx":                       true,
 	"SetQuota":                             true,

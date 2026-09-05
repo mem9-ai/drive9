@@ -1031,6 +1031,8 @@ func isMetaLockConflictError(err error) bool {
 		switch mysqlErr.Number {
 		case 1213, 1205:
 			return true
+		case 1105:
+			return strings.Contains(strings.ToLower(mysqlErr.Message), "pessimistic lock retry limit reached")
 		case 9007:
 			return strings.Contains(strings.ToLower(mysqlErr.Message), "write conflict")
 		}

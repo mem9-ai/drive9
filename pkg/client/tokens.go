@@ -18,9 +18,10 @@ type FSScopeGrant struct {
 
 // IssueScopedTokenRequest is the wire payload for POST /v1/tokens.
 type IssueScopedTokenRequest struct {
-	Subject    string         `json:"subject,omitempty"`
-	TTLSeconds int64          `json:"ttl_seconds"`
-	Scopes     []FSScopeGrant `json:"scopes"`
+	Subject        string         `json:"subject,omitempty"`
+	TTLSeconds     int64          `json:"ttl_seconds"`
+	Scopes         []FSScopeGrant `json:"scopes"`
+	IdempotencyKey string         `json:"-"`
 }
 
 // IssueScopedTokenResponse is returned by POST /v1/tokens.
@@ -50,6 +51,9 @@ func (c *Client) IssueScopedToken(ctx context.Context, req IssueScopedTokenReque
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if req.IdempotencyKey != "" {
+		httpReq.Header.Set("Idempotency-Key", req.IdempotencyKey)
+	}
 	resp, err := c.do(httpReq)
 	if err != nil {
 		return nil, err

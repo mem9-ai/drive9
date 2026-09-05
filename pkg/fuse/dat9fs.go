@@ -1058,8 +1058,18 @@ func (fs *Dat9FS) clearLayerOverlay() {
 // caches and notifies the directory inode, so future readdir/attr paths are
 // refreshed without detaching cwd names.
 func (fs *Dat9FS) resetMountView() {
+	_ = fs.resetMountViewWithKernelInvalidation(false)
+}
+
+// resetMountViewForCredentialChange invalidates all userspace and kernel read
+// caches before a narrower credential can be acknowledged to the supervisor.
+func (fs *Dat9FS) resetMountViewForCredentialChange() error {
+	return fs.resetMountViewWithKernelInvalidation(true)
+}
+
+func (fs *Dat9FS) resetMountViewWithKernelInvalidation(synchronous bool) error {
 	if fs == nil {
-		return
+		return nil
 	}
 	fs.mountViewMu.Lock()
 	generation := fs.mountViewGeneration.Load() + 1
@@ -1099,18 +1109,31 @@ func (fs *Dat9FS) resetMountView() {
 	// potentially slow kernel notify calls.
 	// InodeToPath is kept intact (stale but resolvable).
 	if fs.inodes == nil {
-		return
+		return nil
 	}
 	entries := fs.inodes.Snapshot()
 	for _, entry := range entries {
-		fs.notifyInode(entry.Ino)
+		if synchronous {
+			if err := fs.invalidateInodeKernelCachesSync(entry.Ino); err != nil {
+				return err
+			}
+		} else {
+			fs.notifyInode(entry.Ino)
+		}
 		if entry.Path != "/" && !entry.IsDir {
 			parent := parentDir(entry.Path)
 			if parentIno, ok := fs.inodes.GetInode(parent); ok {
-				fs.notifyEntry(parentIno, path.Base(entry.Path))
+				if synchronous {
+					if err := fs.invalidateEntryKernelCacheSync(parentIno, path.Base(entry.Path)); err != nil {
+						return err
+					}
+				} else {
+					fs.notifyEntry(parentIno, path.Base(entry.Path))
+				}
 			}
 		}
 	}
+	return nil
 }
 
 func (fs *Dat9FS) lockMountViewRead(generation uint64) bool {
@@ -6888,6 +6911,41 @@ func (fs *Dat9FS) invalidateInodeKernelCaches(ino uint64) {
 	_ = fs.server.InodeNotify(ino, 0, 0)
 }
 
+func (fs *Dat9FS) invalidateInodeKernelCachesSync(ino uint64) error {
+	fs.notifyCount.Add(1)
+	if fs.perf != nil {
+		fs.perf.notifyInode.add(1)
+	}
+	if testHookNotifyInodeSync != nil {
+		testHookNotifyInodeSync(ino)
+		return nil
+	}
+	if fs.server == nil {
+		return nil
+	}
+	if status := fs.server.InodeNotify(ino, -1, 0); status != gofuse.OK && status != gofuse.ENOENT {
+		return fmt.Errorf("invalidate inode %d attributes: %v", ino, status)
+	}
+	if status := fs.server.InodeNotify(ino, 0, 0); status != gofuse.OK && status != gofuse.ENOENT {
+		return fmt.Errorf("invalidate inode %d data: %v", ino, status)
+	}
+	return nil
+}
+
+func (fs *Dat9FS) invalidateEntryKernelCacheSync(parentIno uint64, name string) error {
+	fs.notifyCount.Add(1)
+	if fs.perf != nil {
+		fs.perf.notifyEntry.add(1)
+	}
+	if fs.server == nil {
+		return nil
+	}
+	if status := fs.server.EntryNotify(parentIno, name); status != gofuse.OK && status != gofuse.ENOENT {
+		return fmt.Errorf("invalidate entry %d/%s: %v", parentIno, name, status)
+	}
+	return nil
+}
+
 // notifyInode tells the kernel to invalidate cached attributes and data
 // for an inode. The notification is asynchronous to avoid re-entry deadlocks
 // from mutation handlers.
@@ -6913,15 +6971,7 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 // observe stale size/page-cache state even though the remote commit has
 // completed.
 func (fs *Dat9FS) notifyInodeSync(ino uint64) {
-	fs.notifyCount.Add(1)
-	if fs.perf != nil {
-		fs.perf.notifyInode.add(1)
-	}
-	if testHookNotifyInodeSync != nil {
-		testHookNotifyInodeSync(ino)
-		return
-	}
-	fs.invalidateInodeKernelCaches(ino)
+	_ = fs.invalidateInodeKernelCachesSync(ino)
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {

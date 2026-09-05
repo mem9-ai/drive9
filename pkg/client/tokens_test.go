@@ -10,6 +10,7 @@ import (
 
 func TestIssueScopedTokenSendsRequest(t *testing.T) {
 	var gotAuth string
+	var gotIdempotencyKey string
 	var gotSubject any
 	var gotTTL float64
 	var gotScopes []any
@@ -21,6 +22,7 @@ func TestIssueScopedTokenSendsRequest(t *testing.T) {
 			t.Fatalf("path = %q, want /v1/tokens", r.URL.Path)
 		}
 		gotAuth = r.Header.Get("Authorization")
+		gotIdempotencyKey = r.Header.Get("Idempotency-Key")
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("decode request: %v", err)
@@ -36,7 +38,8 @@ func TestIssueScopedTokenSendsRequest(t *testing.T) {
 
 	c := New(ts.URL, "owner-key")
 	resp, err := c.IssueScopedToken(context.Background(), IssueScopedTokenRequest{
-		TTLSeconds: 3600,
+		TTLSeconds:     3600,
+		IdempotencyKey: "session-123:7",
 		Scopes: []FSScopeGrant{
 			{Prefix: "/", Ops: []string{"pseudoroot"}},
 			{Prefix: ":/scratch", Ops: []string{"read", "write"}},
@@ -47,6 +50,9 @@ func TestIssueScopedTokenSendsRequest(t *testing.T) {
 	}
 	if gotAuth != "Bearer owner-key" {
 		t.Fatalf("Authorization = %q, want owner bearer", gotAuth)
+	}
+	if gotIdempotencyKey != "session-123:7" {
+		t.Fatalf("Idempotency-Key = %q, want session-123:7", gotIdempotencyKey)
 	}
 	if gotSubject != nil || gotTTL != 3600 || len(gotScopes) != 2 {
 		t.Fatalf("request body subject=%q ttl=%v scopes=%v", gotSubject, gotTTL, gotScopes)

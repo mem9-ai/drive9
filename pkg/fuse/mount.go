@@ -3,7 +3,10 @@ package fuse
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,7 +24,9 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/mem9-ai/drive9/internal/securefile"
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
@@ -30,14 +35,15 @@ import (
 //
 // Credential kind: APIKey and Token are mutually exclusive. APIKey is an
 // owner tenant API key (full management + data plane); Token is a delegated
-// capability JWT (read-path only). Exactly one must be non-empty at
-// Mount() time — the running mount is bound to that single credential for
-// its entire lifetime (Invariant #3). To change credentials, umount and
-// remount; there is no in-process rebind.
+// capability JWT. Exactly one must be non-empty at Mount() time. Delegated
+// mounts may opt into same-tenant token rotation through TokenFile and
+// TokenReloadReceiptFile; owner credentials remain immutable.
 type MountOptions struct {
 	Server                  string        // drive9 server URL
 	APIKey                  string        // owner API key (mutually exclusive with Token)
 	Token                   string        // delegated capability JWT (mutually exclusive with APIKey)
+	TokenFile               string        // root-readable file reloaded on SIGHUP for delegated token rotation
+	TokenReloadReceiptFile  string        // atomic SHA-256 acknowledgement written after successful token validation and swap
 	MountPoint              string        // local mount point
 	RemoteRoot              string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
 	CacheDir                string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
@@ -287,6 +293,144 @@ func remoteRootValidationError(remoteRoot string, err error) *MountExitError {
 	return ExitStartupTransientErr(fmt.Sprintf("remote root %q", remoteRoot), err)
 }
 
+func readMountTokenFile(path string) (string, error) {
+	token, err := securefile.ReadOwnerOnlySingleLine(path, 16<<10)
+	if err != nil {
+		return "", fmt.Errorf("token file: %w", err)
+	}
+	return token, nil
+}
+
+func validatePrivateOwnedDirectory(path string) error {
+	return securefile.ValidatePrivateOwnedDirectory(path)
+}
+
+func unverifiedMountTokenTenantID(raw string) (string, error) {
+	encoded := ""
+	for _, prefix := range []string{"drive9_", "dat9_"} {
+		if strings.HasPrefix(raw, prefix) {
+			encoded = strings.TrimPrefix(raw, prefix)
+			break
+		}
+	}
+	if encoded == "" {
+		return "", fmt.Errorf("invalid delegated token format")
+	}
+	jwt, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("invalid delegated token envelope")
+	}
+	parts := strings.Split(string(jwt), ".")
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid delegated token payload")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", fmt.Errorf("invalid delegated token claims")
+	}
+	var claims struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || strings.TrimSpace(claims.TenantID) == "" {
+		return "", fmt.Errorf("invalid delegated token tenant claim")
+	}
+	return claims.TenantID, nil
+}
+
+func writeTokenReloadReceipt(path, token string) error {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("token reload receipt file must be a clean absolute path")
+	}
+	dir := filepath.Dir(path)
+	if err := validatePrivateOwnedDirectory(dir); err != nil {
+		return fmt.Errorf("token reload receipt parent: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".drive9-token-reload-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	sum := sha256.Sum256([]byte(token))
+	if _, err := fmt.Fprintf(tmp, "%x\n", sum); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	if dirHandle, err := os.Open(dir); err == nil {
+		_ = dirHandle.Sync()
+		_ = dirHandle.Close()
+	}
+	return nil
+}
+
+func reloadMountToken(
+	ctx context.Context,
+	c *client.Client,
+	server, remoteRoot, tokenFile, receiptFile, expectedTenantID string,
+	afterSwap func() error,
+) error {
+	candidateToken, err := readMountTokenFile(tokenFile)
+	if err != nil {
+		return err
+	}
+	tenantID, err := unverifiedMountTokenTenantID(candidateToken)
+	if err != nil {
+		return fmt.Errorf("parse replacement token: %w", err)
+	}
+	if tenantID != expectedTenantID {
+		return fmt.Errorf("replacement token belongs to a different tenant")
+	}
+	candidate := client.NewWithToken(server, candidateToken)
+	if err := validateFilesystemScopedCredential(ctx, candidate); err != nil {
+		return fmt.Errorf("resolve replacement token scope: %w", err)
+	}
+	if err := validateRemoteRoot(ctx, candidate, remoteRoot); err != nil {
+		return fmt.Errorf("authenticate replacement token: %w", err)
+	}
+	previous := c.APIKey()
+	c.SetAPIKey(candidateToken)
+	if afterSwap != nil {
+		if err := afterSwap(); err != nil {
+			c.SetAPIKey(previous)
+			_ = afterSwap()
+			return fmt.Errorf("apply replacement token: %w", err)
+		}
+	}
+	if err := writeTokenReloadReceipt(receiptFile, candidateToken); err != nil {
+		c.SetAPIKey(previous)
+		if afterSwap != nil {
+			_ = afterSwap()
+		}
+		return fmt.Errorf("write token reload receipt: %w", err)
+	}
+	return nil
+}
+
+func validateFilesystemScopedCredential(ctx context.Context, c *client.Client) error {
+	scopeKind, err := c.CredentialScopeKind(ctx)
+	if err != nil {
+		return err
+	}
+	if scopeKind != string(meta.APIKeyScopeKindFS) {
+		return fmt.Errorf("credential is not filesystem-scoped")
+	}
+	return nil
+}
+
 // Mount creates and serves a FUSE mount. It blocks until the filesystem
 // is unmounted or a signal (SIGINT, SIGTERM) is received.
 func Mount(opts *MountOptions) (err error) {
@@ -339,6 +483,26 @@ func Mount(opts *MountOptions) (err error) {
 		return ExitStartupTransientErr("create mount point", err)
 	}
 
+	if (opts.TokenFile == "") != (opts.TokenReloadReceiptFile == "") {
+		return ExitStartupPermanentErr("TokenFile and TokenReloadReceiptFile must be configured together", nil)
+	}
+	if opts.TokenFile != "" {
+		if filepath.Clean(opts.TokenFile) == filepath.Clean(opts.TokenReloadReceiptFile) {
+			return ExitStartupPermanentErr("TokenFile and TokenReloadReceiptFile must be different paths", nil)
+		}
+		if opts.APIKey != "" {
+			return ExitStartupPermanentErr("token reload is supported only for delegated tokens", nil)
+		}
+		fileToken, err := readMountTokenFile(opts.TokenFile)
+		if err != nil {
+			return ExitStartupPermanentErr("read initial token file", err)
+		}
+		if opts.Token != "" && opts.Token != fileToken {
+			return ExitStartupPermanentErr("initial token does not match token file", nil)
+		}
+		opts.Token = fileToken
+	}
+
 	// Validate credential inputs. MountOptions.APIKey and MountOptions.Token
 	// are mutually exclusive (Invariant #3 — one mount, one principal).
 	// Both empty is caller error; both non-empty would let a silent
@@ -362,10 +526,10 @@ func Mount(opts *MountOptions) (err error) {
 	// Generate per-mount actor ID for SSE self-filtering.
 	actorID := generateMountID()
 
-	// Create client and verify connectivity. The constructor choice binds
-	// the mount's principal kind for its entire lifetime (see Invariant #3
-	// and Invariant #6 — running mount credential change requires umount
-	// and remount).
+	// Create client and verify connectivity. The constructor choice binds the
+	// mount's principal kind for its entire lifetime. A delegated-token mount
+	// may replace only that token in place after same-tenant and data-plane
+	// authorization checks; it can never switch to an owner principal.
 	var c *client.Client
 	if opts.Token != "" {
 		c = client.NewWithToken(opts.Server, opts.Token)
@@ -380,6 +544,19 @@ func Mount(opts *MountOptions) (err error) {
 		return ExitStartupPermanentErr("normalize remote root", err)
 	}
 	opts.RemoteRoot = remoteRoot
+	expectedTenantID := ""
+	if opts.TokenFile != "" {
+		expectedTenantID, err = unverifiedMountTokenTenantID(opts.Token)
+		if err != nil {
+			return ExitStartupPermanentErr("parse delegated token tenant", err)
+		}
+		if err := validateFilesystemScopedCredential(context.Background(), c); err != nil {
+			if client.IsUnauthorized(err) || client.IsForbidden(err) {
+				return ExitStartupPermanentErr("validate delegated token scope", err)
+			}
+			return ExitStartupTransientErr("validate delegated token scope", err)
+		}
+	}
 	if err := validateRemoteRoot(context.Background(), c, remoteRoot); err != nil {
 		return err
 	}
@@ -632,17 +809,36 @@ func Mount(opts *MountOptions) (err error) {
 	// The layer event watcher (started earlier) is deliberately left running:
 	// it does no initial blanket cache invalidation and its first poll only
 	// fires after a 1s tick on real remote events, so it cannot race pollHack.
-	var sseWatcher *SSEWatcher
+	var (
+		sseWatcher   *SSEWatcher
+		sseWatcherMu sync.Mutex
+	)
 	dat9fs.markStatCacheUnverified()
 	stopWatchers := func() {
+		sseWatcherMu.Lock()
+		defer sseWatcherMu.Unlock()
 		if sseWatcher != nil {
 			sseWatcher.Stop()
+			sseWatcher = nil
 		}
 		layerEventWatcherStop()
 	}
+	restartSSEWatcher := func() {
+		sseWatcherMu.Lock()
+		defer sseWatcherMu.Unlock()
+		if sseWatcher != nil {
+			sseWatcher.Stop()
+		}
+		sseWatcher = StartSSEWatcher(dat9fs, c, actorID)
+	}
+	applyReloadedCredential := func() error {
+		err := dat9fs.resetMountViewForCredentialChange()
+		restartSSEWatcher()
+		return err
+	}
 
 	err = serveWaitMountThenStartWatchers(server.Serve, server.WaitMount, func() {
-		sseWatcher = StartSSEWatcher(dat9fs, c, actorID)
+		restartSSEWatcher()
 		// After SSE is up, asynchronously probe the remote git-workspace index
 		// (one FS Stat — not ListGitWorkspaces) so sandbox remounts arm when
 		// prior --fast registrations exist.
@@ -761,6 +957,60 @@ func Mount(opts *MountOptions) (err error) {
 	shutdown := newMountShutdown(stopWatchers, dat9fs.FlushAll)
 	var unmountRequested atomic.Bool
 	mountStartedAt := time.Now()
+	stopTokenReloads := func() {}
+	if opts.TokenFile != "" {
+		reloadCh := make(chan os.Signal, 1)
+		signal.Notify(reloadCh, syscall.Signal(1)) // SIGHUP on Unix.
+		reloadCtx, reloadCancel := context.WithCancel(context.Background())
+		var reloadWG sync.WaitGroup
+		reloadWG.Add(1)
+		go func() {
+			defer reloadWG.Done()
+			for {
+				select {
+				case <-reloadCtx.Done():
+					return
+				case <-reloadCh:
+					if unmountRequested.Load() {
+						continue
+					}
+					operationCtx, cancel := context.WithTimeout(reloadCtx, 30*time.Second)
+					err := reloadMountToken(operationCtx, c, opts.Server, opts.RemoteRoot, opts.TokenFile, opts.TokenReloadReceiptFile, expectedTenantID, applyReloadedCredential)
+					cancel()
+					if reloadCtx.Err() != nil {
+						return
+					}
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "drive9: token reload rejected: %v\n", err)
+						continue
+					}
+					fmt.Fprintln(os.Stderr, "drive9: delegated token reloaded")
+				}
+			}
+		}()
+		var stopReloadOnce sync.Once
+		stopTokenReloads = func() {
+			stopReloadOnce.Do(func() {
+				signal.Stop(reloadCh)
+				reloadCancel()
+				reloadWG.Wait()
+			})
+		}
+		if err := writeTokenReloadReceipt(opts.TokenReloadReceiptFile, opts.Token); err != nil {
+			stopTokenReloads()
+			cleanupMountStartFailure(mountStartCleanup{
+				reason:       "token reload readiness failure",
+				mountPoint:   opts.MountPoint,
+				cause:        err,
+				stopWatchers: stopWatchers,
+				flushAll:     dat9fs.FlushAll,
+				unmount:      server.Unmount,
+				forceUnmount: forceUnmount,
+			})
+			return ExitStartupTransientErr("publish initial token reload readiness", err)
+		}
+	}
+	defer stopTokenReloads()
 
 	// Signal handling for graceful shutdown.
 	//
@@ -866,6 +1116,7 @@ func Mount(opts *MountOptions) (err error) {
 			os.Exit(ExitForceQuit)
 		}()
 
+		stopTokenReloads()
 		shutdown()
 		close(progressDone)
 
@@ -895,6 +1146,7 @@ func Mount(opts *MountOptions) (err error) {
 	// make an abnormal exit look like ExitReasonExternalUnmount.
 	unmountWasRequested := unmountRequested.Load()
 	reason, detail := classifyServeEnd(unmountWasRequested, opts.MountPoint)
+	stopTokenReloads()
 	shutdown()
 
 	uptime := time.Since(mountStartedAt).Round(time.Second)

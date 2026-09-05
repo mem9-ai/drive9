@@ -114,8 +114,8 @@ func (c *Client) streamEvents(ctx context.Context, since uint64, actor string, h
 		return fmt.Errorf("create SSE request: %w", err)
 	}
 	req.Header.Set("Accept", "text/event-stream")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if apiKey := c.APIKey(); apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	if actor != "" {
 		req.Header.Set("X-Dat9-Actor", actor)

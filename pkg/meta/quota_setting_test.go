@@ -446,6 +446,11 @@ func TestIsMetaLockConflictErrorIncludesTiDBWriteConflict(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "tidb pessimistic lock retry limit",
+			err:  &mysql.MySQLError{Number: 1105, SQLState: [5]byte{'H', 'Y', '0', '0', '0'}, Message: "pessimistic lock retry limit reached"},
+			want: true,
+		},
+		{
 			name: "tidb write conflict db-shaped fallback",
 			err:  errors.New("ERROR 9007 (HY000): Write conflict, txnStartTS=123, conflictStartTS=456"),
 			want: true,
