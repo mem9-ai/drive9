@@ -26,7 +26,7 @@ import (
 // Client is the drive9 HTTP client.
 type Client struct {
 	baseURL               string
-	apiKey                string
+	apiKey                atomic.Pointer[string]
 	actor                 string // X-Dat9-Actor header value (per-mount ID)
 	httpClient            *http.Client
 	smallFileThreshold    int64 // 0 means use DefaultSmallFileThreshold
@@ -52,6 +52,7 @@ type Client struct {
 type tenantStatusResponse struct {
 	Status                string                 `json:"status"`
 	TenantID              string                 `json:"tenant_id,omitempty"`
+	ScopeKind             string                 `json:"scope_kind,omitempty"`
 	MaxUploadBytes        int64                  `json:"max_upload_bytes"`
 	InlineThreshold       int64                  `json:"inline_threshold,omitempty"`
 	MigrationCapabilities *MigrationCapabilities `json:"migration_capabilities,omitempty"`
@@ -233,9 +234,8 @@ func newClient(baseURL, credential string) *Client {
 		}
 		return baseDialer.DialContext(ctx, network, net.JoinHostPort(ips[0], port))
 	}
-	return &Client{
+	client := &Client{
 		baseURL:               strings.TrimRight(baseURL, "/"),
-		apiKey:                credential,
 		multipartAbortTimeout: defaultMultipartAbortTimeout,
 		httpClient: &http.Client{
 			Transport: transport,
@@ -251,6 +251,8 @@ func newClient(baseURL, credential string) *Client {
 			},
 		},
 	}
+	client.SetAPIKey(credential)
+	return client
 }
 
 // FileInfo represents a file entry from a directory listing.
@@ -476,7 +478,23 @@ func (c *Client) BaseURL() string {
 
 // APIKey returns the API key.
 func (c *Client) APIKey() string {
-	return c.apiKey
+	credential := c.apiKey.Load()
+	if credential == nil {
+		return ""
+	}
+	return *credential
+}
+
+// SetAPIKey atomically replaces the credential used by subsequent requests.
+// In-flight requests retain the Authorization header already assigned to them.
+func (c *Client) SetAPIKey(apiKey string) {
+	c.statusFetchMu.Lock()
+	defer c.statusFetchMu.Unlock()
+	c.statusBody.Store(nil)
+	c.statusMax.Store(0)
+	c.statusInline.Store(0)
+	credential := apiKey
+	c.apiKey.Store(&credential)
 }
 
 // MaxUploadBytes returns the tenant's effective single-upload size cap as
@@ -621,6 +639,16 @@ func (c *Client) fetchTenantStatus(ctx context.Context) (tenantStatusResponse, e
 	return body, nil
 }
 
+// CredentialScopeKind returns the server-resolved scope kind of the active
+// credential. An empty value means the server predates this status field.
+func (c *Client) CredentialScopeKind(ctx context.Context) (string, error) {
+	body, err := c.tenantStatus(ctx)
+	if err != nil {
+		return "", err
+	}
+	return body.ScopeKind, nil
+}
+
 // GetMigrationCapabilities returns the exact Server Migration contract while
 // preserving concrete transport, status, context, and decode errors.
 func (c *Client) GetMigrationCapabilities(ctx context.Context) (MigrationCapabilities, error) {
@@ -670,8 +698,8 @@ func (c *Client) PostMigrationEvent(ctx context.Context, event MigrationEvent) e
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if apiKey := c.APIKey(); apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	if c.actor != "" {
 		req.Header.Set("X-Dat9-Actor", c.actor)

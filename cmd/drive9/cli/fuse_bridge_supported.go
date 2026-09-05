@@ -22,6 +22,8 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		Server:                  opts.Server,
 		APIKey:                  opts.APIKey,
 		Token:                   opts.Token,
+		TokenFile:               opts.TokenFile,
+		TokenReloadReceiptFile:  opts.TokenReloadReceiptFile,
 		MountPoint:              opts.MountPoint,
 		RemoteRoot:              opts.RemoteRoot,
 		CacheDir:                opts.CacheDir,

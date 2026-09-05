@@ -29,6 +29,8 @@ type mountFuseOptions struct {
 	Server                  string
 	APIKey                  string
 	Token                   string
+	TokenFile               string
+	TokenReloadReceiptFile  string
 	MountPoint              string
 	RemoteRoot              string
 	CacheDir                string

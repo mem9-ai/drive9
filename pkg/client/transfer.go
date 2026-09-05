@@ -1393,8 +1393,8 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path string) (*http.Re
 	if err != nil {
 		return nil, err
 	}
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if apiKey := c.APIKey(); apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
 	return noRedirectClient.Do(req)

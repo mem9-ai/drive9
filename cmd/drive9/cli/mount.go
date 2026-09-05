@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mem9-ai/drive9/internal/securefile"
 	"github.com/mem9-ai/drive9/pkg/buildinfo"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
@@ -147,6 +148,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
+	tokenFile := fs.String("token-file", "", "root-readable delegated token file; reload on SIGHUP (foreground FUSE only)")
+	tokenReloadReceipt := fs.String("token-reload-receipt", "", "write the active token SHA-256 after successful SIGHUP reload")
 	mode := fs.String("mode", "auto", "mount mode: auto, fuse, or webdav")
 	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
 	superviseForeground := fs.Bool("supervise-foreground", false, "run as in-process supervisor and block until stop (sandbox/systemd friendly)")
@@ -277,6 +280,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if objectLoc != nil {
 		if len(effectiveAppendLogPatterns) > 0 {
 			return fmt.Errorf("drive9 mount: --append-log is only supported with Drive9 FUSE mounts")
+		}
+		if *tokenFile != "" || *tokenReloadReceipt != "" {
+			return fmt.Errorf("drive9 mount: --token-file is only supported with Drive9 FUSE mounts")
 		}
 		if gvisorCompatGiven && *gvisorCompat {
 			return fmt.Errorf("drive9 mount: --gvisor-compat is only supported with Drive9 FUSE mounts")
@@ -569,9 +575,34 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		*readOnly = true
 	}
 
-	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
-	if err != nil {
-		return err
+	resolvedCredentials := ResolveCredentials()
+	var serverVal, apiKeyVal, tokenVal string
+	if *tokenFile != "" || *tokenReloadReceipt != "" {
+		if *tokenFile == "" || *tokenReloadReceipt == "" {
+			return fmt.Errorf("drive9 mount: --token-file and --token-reload-receipt must be configured together")
+		}
+		if !*foreground || resolved != MountModeFUSE {
+			return fmt.Errorf("drive9 mount: --token-file requires --foreground --mode=fuse")
+		}
+		if apiKeyGiven {
+			return fmt.Errorf("drive9 mount: --token-file cannot be combined with --api-key")
+		}
+		serverVal = *server
+		if serverVal == "" {
+			serverVal = resolvedCredentials.Server
+		}
+		if serverVal == "" {
+			return fmt.Errorf("drive9 server URL required (--server, $%s, or `drive9 ctx`)", EnvServer)
+		}
+		tokenVal, err = readReloadableMountToken(*tokenFile)
+		if err != nil {
+			return fmt.Errorf("drive9 mount: read --token-file: %w", err)
+		}
+	} else {
+		serverVal, apiKeyVal, tokenVal, err = resolveMountCredentials(resolvedCredentials, *server, *apiKey)
+		if err != nil {
+			return err
+		}
 	}
 	*server, *apiKey = serverVal, apiKeyVal
 	token := tokenVal
@@ -749,6 +780,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		Server:                  *server,
 		APIKey:                  *apiKey,
 		Token:                   token,
+		TokenFile:               *tokenFile,
+		TokenReloadReceiptFile:  *tokenReloadReceipt,
 		MountPoint:              mountPoint,
 		RemoteRoot:              remoteRoot,
 		CacheDir:                *cacheDir,
@@ -2334,6 +2367,14 @@ func terminateProcessWithSignal(pid int, waitTimeout time.Duration, killOnly boo
 		return nil
 	}
 	return err
+}
+
+func readReloadableMountToken(path string) (string, error) {
+	token, err := securefile.ReadOwnerOnlySingleLine(path, 16<<10)
+	if err != nil {
+		return "", fmt.Errorf("token file: %w", err)
+	}
+	return token, nil
 }
 
 // resolveMountCredentials selects the (server, apiKey, token) triple that a

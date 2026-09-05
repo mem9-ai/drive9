@@ -44,6 +44,7 @@ type AdminTenantCreateRequest struct {
 	MaxFileSize            *int64 `json:"max_file_size,omitempty"`
 	MaxFileCount           *int64 `json:"max_file_count,omitempty"`
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
+	IdempotencyKey         string `json:"-"`
 }
 
 type AdminTenantCreateResponse struct {
@@ -124,6 +125,9 @@ func (c *Client) AdminCreateTenant(ctx context.Context, req AdminTenantCreateReq
 		return nil, fmt.Errorf("create admin tenant create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if req.IdempotencyKey != "" {
+		httpReq.Header.Set("Idempotency-Key", req.IdempotencyKey)
+	}
 	resp, err := c.do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("admin tenant create request: %w", err)

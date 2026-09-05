@@ -340,9 +340,10 @@ const DefaultTenantPoolRefillFreeRatio = 0.8
 // shape is per-tenant so future tenant-scoped quotas plug in without a
 // protocol change.
 type TenantStatusResponse struct {
-	Status  string `json:"status"`
-	Kind    string `json:"kind,omitempty"`
-	Message string `json:"message,omitempty"`
+	Status    string               `json:"status"`
+	Kind      string               `json:"kind,omitempty"`
+	Message   string               `json:"message,omitempty"`
+	ScopeKind meta.APIKeyScopeKind `json:"scope_kind,omitempty"`
 
 	MaxUploadBytes int64 `json:"max_upload_bytes"`
 	// InlineThreshold is the server's DB-inline vs S3 storage cutoff. Clients
@@ -2007,6 +2008,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		Status:          string(resolved.Tenant.Status),
 		Kind:            string(resolved.Tenant.Kind),
 		Message:         s.tenantStatusMessage(&resolved.Tenant),
+		ScopeKind:       resolved.APIKey.ScopeKind,
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
 	})
@@ -4796,7 +4798,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	if tenant.UsesTiDBCloudNativeCredentials(provider) && credentialReq != nil {
 		poolClaimStarted := time.Now()
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_started", "provider", provider, "quota_requested", quotaReq != nil)...)
-		if res, pool, claimed, err := s.claimAdminTenantFromPoolWithAccess(r.Context(), *credentialReq, quotaReq, tiDBCloudAccess); err != nil {
+		if res, pool, claimed, err := s.claimAdminTenantFromPoolWithAccess(r.Context(), *credentialReq, quotaReq, tiDBCloudAccess, nil); err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_failed", "provider", provider, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", provisionTenantPoolClaimMetricResult(err))
 			status, msg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", err)
@@ -5081,6 +5083,7 @@ type apiKeyIssueSource struct {
 }
 
 type provisionTenantOptions struct {
+	TenantID              string
 	KeyName               string
 	TokenVersion          int
 	APIKeySource          apiKeyIssueSource
@@ -5392,7 +5395,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			opts.Quota = normalizedQuota
 		}
 	}
-	tenantID := token.NewID()
+	tenantID := strings.TrimSpace(opts.TenantID)
+	if tenantID == "" {
+		tenantID = token.NewID()
+	}
 	provisionStarted := time.Now()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
 	setRequestMetricTenant(ctx, tenantID, "", provider, "", tenantRequestClass{surface: "provision", action: "post"})

@@ -1795,10 +1795,16 @@ func tenantPoolCreateDatabaseLockKey(cred tenant.CredentialProvisionRequest) str
 // claimAdminTenantFromPool tries to hand out a pre-warmed tenant from the
 // caller org's tenant pool.
 func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) (*provisionTenantResult, *meta.TenantPool, bool, error) {
-	return s.claimAdminTenantFromPoolWithAccess(ctx, cred, quotaOpt, nil)
+	return s.claimAdminTenantFromPoolWithAccess(ctx, cred, quotaOpt, nil, nil)
 }
 
-func (s *Server) claimAdminTenantFromPoolWithAccess(ctx context.Context, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest, access *tiDBCloudAccessProfile) (*provisionTenantResult, *meta.TenantPool, bool, error) {
+func (s *Server) claimAdminTenantFromPoolWithAccess(
+	ctx context.Context,
+	cred tenant.CredentialProvisionRequest,
+	quotaOpt *quotaRequest,
+	access *tiDBCloudAccessProfile,
+	apiKeySource *apiKeyIssueSource,
+) (*provisionTenantResult, *meta.TenantPool, bool, error) {
 	claimStarted := time.Now()
 	manager, ok := s.provisioner.(tenant.TenantPoolClusterManager)
 	if !ok {
@@ -1872,7 +1878,26 @@ func (s *Server) claimAdminTenantFromPoolWithAccess(ctx context.Context, cred te
 				return tenantPoolClaimSelection{}, headroomErr
 			}
 		}
-		row, claimErr := s.meta.ClaimFreeTenantPoolBinding(claimCtx, orgID, candidate.Tenant.ID, claimQuotaPatch)
+		var row *meta.TenantWithTiDBCloudOrgBinding
+		var claimErr error
+		if apiKeySource != nil {
+			now := time.Now().UTC()
+			row, claimErr = s.meta.ClaimFreeTenantPoolBindingWithExternalBinding(
+				claimCtx,
+				orgID,
+				candidate.Tenant.ID,
+				claimQuotaPatch,
+				meta.ExternalBinding{
+					Provider:     apiKeySource.Provider,
+					SubjectKey:   apiKeySource.SubjectKey,
+					MetadataJSON: apiKeySource.MetadataJSON,
+					CreatedAt:    now,
+					UpdatedAt:    now,
+				},
+			)
+		} else {
+			row, claimErr = s.meta.ClaimFreeTenantPoolBinding(claimCtx, orgID, candidate.Tenant.ID, claimQuotaPatch)
+		}
 		if claimErr != nil {
 			return tenantPoolClaimSelection{}, claimErr
 		}
@@ -1909,13 +1934,15 @@ func (s *Server) claimAdminTenantFromPoolWithAccess(ctx context.Context, cred te
 	stageStarted = time.Now()
 	cloudCfg, err := manager.MarkClusterPoolUsed(ctx, cluster, cred, usedAt, opts)
 	if err != nil {
-		s.releaseClaimedPoolTenant(ctx, manager, cluster, cred, row.Tenant.ID, "mark_used_error")
+		if apiKeySource == nil {
+			s.releaseClaimedPoolTenant(ctx, manager, cluster, cred, row.Tenant.ID, "mark_used_error")
+		}
 		return nil, nil, false, err
 	}
 	logProvisionStage(ctx, "admin_tenant_pool_claim_cluster_marked_used", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID, "cluster_id", cluster.ClusterID, "quota_requested", quotaOpt != nil)
 	success := false
 	defer func() {
-		if !success {
+		if !success && apiKeySource == nil {
 			s.releaseClaimedPoolTenant(ctx, manager, cluster, cred, row.Tenant.ID, "claim_error")
 		}
 	}()
@@ -1956,7 +1983,11 @@ func (s *Server) claimAdminTenantFromPoolWithAccess(ctx context.Context, cred te
 	}
 	logProvisionStage(ctx, "admin_tenant_pool_claim_db_password_decrypted", row.Tenant.ID, row.Tenant.Provider, stageStarted, "pool_id", pool.PoolID, "organization_id", orgID)
 	stageStarted = time.Now()
-	apiToken, apiKeyID, err := s.issueOwnerAPIKey(ctx, row.Tenant.ID, "default", 1, apiKeyIssueSource{})
+	keySource := apiKeyIssueSource{}
+	if apiKeySource != nil {
+		keySource = *apiKeySource
+	}
+	apiToken, apiKeyID, err := s.issueOwnerAPIKey(ctx, row.Tenant.ID, "default", 1, keySource)
 	if err != nil {
 		return nil, nil, false, err
 	}

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,11 +18,19 @@ import (
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
 
 const (
 	defaultAdminTenantPageSize = 10
 	maxAdminTenantPageSize     = 100
+	adminTenantCreateProvider  = "admin-tenant-create"
+)
+
+var (
+	errAdminTenantIdempotencyConflict = errors.New("admin tenant idempotency conflict")
+	errAdminTenantIdempotencyStuck    = errors.New("admin tenant idempotency binding is not replayable")
+	errAdminTenantPoolCapacity        = errors.New("no replay-safe tenant pool capacity is available")
 )
 
 type adminTenantCreateRequest struct {
@@ -177,9 +187,56 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		writeAdminTiDBCloudError(w, r.Context(), err, "create tenant")
 		return
 	}
+	idempotencyKey, err := validateScopedTokenIdempotencyKey(r.Header.Get("Idempotency-Key"))
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if idempotencyKey != "" {
+		res, replayed, err := s.createAdminTenantIdempotently(r.Context(), cred, quotaOpt, access, idempotencyKey)
+		if errors.Is(err, errAdminTenantIdempotencyConflict) {
+			errJSON(w, http.StatusConflict, "idempotency key was already used with a different request")
+			return
+		}
+		if errors.Is(err, errAdminTenantIdempotencyStuck) {
+			errJSON(w, http.StatusConflict, "idempotent tenant creation requires operator reconciliation")
+			return
+		}
+		if errors.Is(err, errAdminTenantPoolCapacity) {
+			errJSON(w, http.StatusServiceUnavailable, "replay-safe tenant capacity is temporarily unavailable")
+			return
+		}
+		if err != nil {
+			var pe *provisionTenantError
+			if errors.As(err, &pe) {
+				writeProvisionTenantError(w, pe)
+				return
+			}
+			errJSON(w, backendErrorStatus(r.Context(), err), "failed to provision tenant")
+			return
+		}
+		setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, res.OrganizationID, classifyTenantRequest(r))
+		if !replayed && res.Status == meta.TenantProvisioning {
+			s.startProvisionedTenantSchemaInit(r.Context(), res)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if replayed {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusAccepted)
+		}
+		_ = json.NewEncoder(w).Encode(adminTenantCreateResponse{
+			TenantID:      res.TenantID,
+			APIKey:        res.APIKey,
+			Status:        string(res.Status),
+			CloudProvider: res.CloudProvider,
+			Region:        res.Region,
+		})
+		return
+	}
 	poolClaimStarted := time.Now()
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_started", "provider", tenant.ProviderTiDBCloudNative, "quota_requested", quotaOpt != nil)...)
-	res, pool, claimed, err := s.claimAdminTenantFromPoolWithAccess(r.Context(), cred, quotaOpt, access)
+	res, pool, claimed, err := s.claimAdminTenantFromPoolWithAccess(r.Context(), cred, quotaOpt, access, nil)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_claim_failed", "provider", tenant.ProviderTiDBCloudNative, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
 		status, msg := clientFacingErrorResponse(http.StatusBadGateway, "claim tenant pool tenant failed", err)
@@ -231,6 +288,117 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		CloudProvider: res.CloudProvider,
 		Region:        res.Region,
 	})
+}
+
+func (s *Server) createAdminTenantIdempotently(
+	ctx context.Context,
+	cred tenant.CredentialProvisionRequest,
+	quotaOpt *quotaRequest,
+	access *tiDBCloudAccessProfile,
+	idempotencyKey string,
+) (*provisionTenantResult, bool, error) {
+	metadata, err := adminTenantCreateMetadata(cred.PublicKey, access.OrganizationID, quotaOpt)
+	if err != nil {
+		return nil, false, err
+	}
+	subjectKey := adminTenantIdempotencySubject(access.OrganizationID, idempotencyKey)
+	source := apiKeyIssueSource{
+		Provider:     adminTenantCreateProvider,
+		SubjectKey:   subjectKey,
+		MetadataJSON: metadata,
+	}
+	var out *provisionTenantResult
+	replayed := false
+	err = s.meta.WithExternalBindingLock(ctx, adminTenantCreateProvider, subjectKey, func(lockCtx context.Context) error {
+		binding, err := s.meta.GetExternalBinding(lockCtx, adminTenantCreateProvider, subjectKey)
+		if err == nil {
+			if !sameRequestFingerprintMetadata(binding.MetadataJSON, metadata) {
+				return errAdminTenantIdempotencyConflict
+			}
+			out, err = s.adminTenantCreateResultForBinding(lockCtx, binding, source, access.OrganizationID)
+			replayed = err == nil
+			return err
+		}
+		if !errors.Is(err, meta.ErrNotFound) {
+			return err
+		}
+		pooled, _, claimed, err := s.claimAdminTenantFromPoolWithAccess(lockCtx, cred, quotaOpt, access, &source)
+		if err != nil {
+			return err
+		}
+		if claimed {
+			out = pooled
+			return nil
+		}
+		return errAdminTenantPoolCapacity
+	})
+	return out, replayed, err
+}
+
+func adminTenantIdempotencySubject(organizationID, idempotencyKey string) string {
+	return strings.TrimSpace(organizationID) + ":" + idempotencyKey
+}
+
+func (s *Server) adminTenantCreateResultForBinding(
+	ctx context.Context,
+	binding *meta.ExternalBinding,
+	source apiKeyIssueSource,
+	organizationID string,
+) (*provisionTenantResult, error) {
+	t, err := s.meta.GetTenant(ctx, binding.TenantID)
+	if err != nil {
+		return nil, errAdminTenantIdempotencyStuck
+	}
+	if t.Status != meta.TenantActive && t.Status != meta.TenantProvisioning {
+		return nil, errAdminTenantIdempotencyStuck
+	}
+	key, err := s.meta.GetActiveAPIKeyByIssuer(ctx, t.ID, source.Provider, source.SubjectKey)
+	if err != nil || !sameRequestFingerprintMetadata(key.IssuedByMetadataJSON, source.MetadataJSON) {
+		return nil, errAdminTenantIdempotencyStuck
+	}
+	plain, err := poolDecryptToken(ctx, s.pool, key.JWTCiphertext)
+	if err != nil {
+		return nil, err
+	}
+	claims, err := token.ParseAndVerifyToken(s.tokenSecret, string(plain))
+	if err != nil || claims.TenantID != t.ID || claims.TokenVersion != key.TokenVersion {
+		return nil, errAdminTenantIdempotencyStuck
+	}
+	cloudProvider, region := provisioningCloudRegion(s.provisioner)
+	return &provisionTenantResult{
+		TenantID:       t.ID,
+		APIKey:         string(plain),
+		APIKeyID:       key.ID,
+		Status:         t.Status,
+		Provider:       t.Provider,
+		CloudProvider:  cloudProvider,
+		Region:         region,
+		OrganizationID: strings.TrimSpace(organizationID),
+	}, nil
+}
+
+func adminTenantCreateMetadata(publicKey, organizationID string, quotaOpt *quotaRequest) ([]byte, error) {
+	var quota quotaFields
+	if quotaOpt != nil {
+		quota = quotaOpt.quotaFields
+	}
+	publicKeyHash := sha256.Sum256([]byte(strings.TrimSpace(publicKey)))
+	raw, err := json.Marshal(struct {
+		OrganizationID  string      `json:"organization_id"`
+		PublicKeySHA256 string      `json:"public_key_sha256"`
+		Quota           quotaFields `json:"quota"`
+	}{
+		OrganizationID:  strings.TrimSpace(organizationID),
+		PublicKeySHA256: hex.EncodeToString(publicKeyHash[:]),
+		Quota:           quota,
+	})
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(raw)
+	return json.Marshal(struct {
+		RequestSHA256 string `json:"request_sha256"`
+	}{RequestSHA256: hex.EncodeToString(sum[:])})
 }
 
 func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"math"
 	"math/big"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -41,7 +44,19 @@ type revokeScopedTokenByAPIKeyRequest struct {
 	APIKey string `json:"api_key"`
 }
 
-const maxScopedTokenTTLSeconds = int64(1<<63-1) / int64(time.Second)
+type requestFingerprintMetadata struct {
+	RequestSHA256 string `json:"request_sha256"`
+}
+
+const (
+	maxScopedTokenTTLSeconds       = int64(1<<63-1) / int64(time.Second)
+	scopedTokenIdempotencyProvider = "scoped-token"
+)
+
+var (
+	errScopedTokenIdempotencyConflict = errors.New("scoped token idempotency conflict")
+	errScopedTokenIdempotencyInactive = errors.New("scoped token idempotency key is inactive")
+)
 
 func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 	if s.meta == nil || s.pool == nil || len(s.tokenSecret) == 0 {
@@ -126,29 +141,146 @@ func (s *Server) handleScopedTokenIssue(w http.ResponseWriter, r *http.Request, 
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	idempotencyKey, err := validateScopedTokenIdempotencyKey(r.Header.Get("Idempotency-Key"))
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	metadata, err := scopedTokenRequestMetadata(subject, req.TTLSeconds, validatedScopes)
+	if err != nil {
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to validate token request")
+		return
+	}
 
+	var resp *scopedTokenResponse
+	replayed := false
+	issue := func(ctx context.Context) error {
+		if idempotencyKey != "" {
+			existing, err := s.meta.GetAPIKeyByIssuer(ctx, scope.TenantID, scopedTokenIdempotencyProvider, idempotencyKey)
+			if err == nil {
+				if !sameRequestFingerprintMetadata(existing.IssuedByMetadataJSON, metadata) {
+					return errScopedTokenIdempotencyConflict
+				}
+				if existing.Status != meta.APIKeyActive {
+					return errScopedTokenIdempotencyInactive
+				}
+				resp, err = s.scopedTokenResponseForAPIKey(ctx, existing)
+				replayed = err == nil
+				return err
+			}
+			if !errors.Is(err, meta.ErrNotFound) {
+				return err
+			}
+		}
+		var err error
+		resp, err = s.issueScopedToken(ctx, scope.TenantID, subject, req.TTLSeconds, validatedScopes, idempotencyKey, metadata)
+		return err
+	}
+	if idempotencyKey != "" {
+		lockSubject := scope.TenantID + "\x00" + idempotencyKey
+		err = s.meta.WithExternalBindingLock(r.Context(), scopedTokenIdempotencyProvider, lockSubject, issue)
+	} else {
+		err = issue(r.Context())
+	}
+	if errors.Is(err, errScopedTokenIdempotencyConflict) {
+		errJSON(w, http.StatusConflict, "idempotency key was already used with a different request")
+		return
+	}
+	if errors.Is(err, errScopedTokenIdempotencyInactive) {
+		errJSON(w, http.StatusConflict, "idempotency key belongs to an inactive or expired token")
+		return
+	}
+	if errors.Is(err, meta.ErrDuplicate) {
+		errJSON(w, http.StatusConflict, "token already exists")
+		return
+	}
+	if err != nil {
+		errJSON(w, backendErrorStatus(r.Context(), err), "failed to issue token")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if replayed {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusCreated)
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func validateScopedTokenIdempotencyKey(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	key := strings.TrimSpace(raw)
+	if key == "" || key != raw || len(key) > 128 {
+		return "", fmt.Errorf("Idempotency-Key must be 1 to 128 non-whitespace characters")
+	}
+	for _, r := range key {
+		allowed := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' || r == ':'
+		if !allowed {
+			return "", fmt.Errorf("Idempotency-Key contains an unsupported character")
+		}
+	}
+	return key, nil
+}
+
+func sameRequestFingerprintMetadata(left, right []byte) bool {
+	var leftMetadata, rightMetadata requestFingerprintMetadata
+	if json.Unmarshal(left, &leftMetadata) != nil || json.Unmarshal(right, &rightMetadata) != nil {
+		return false
+	}
+	return leftMetadata.RequestSHA256 != "" && leftMetadata.RequestSHA256 == rightMetadata.RequestSHA256
+}
+
+func scopedTokenRequestMetadata(subject string, ttlSeconds int64, scopes []meta.APIKeyFSScope) ([]byte, error) {
+	canonicalScopes := append([]meta.APIKeyFSScope(nil), scopes...)
+	sortAPIKeyFSScopes(canonicalScopes)
+	payload := struct {
+		Subject    string               `json:"subject"`
+		TTLSeconds int64                `json:"ttl_seconds"`
+		Scopes     []meta.APIKeyFSScope `json:"scopes"`
+	}{
+		Subject:    subject,
+		TTLSeconds: ttlSeconds,
+		Scopes:     canonicalScopes,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(raw)
+	return json.Marshal(requestFingerprintMetadata{RequestSHA256: hex.EncodeToString(sum[:])})
+}
+
+func (s *Server) issueScopedToken(
+	ctx context.Context,
+	tenantID string,
+	subject string,
+	ttlSeconds int64,
+	scopes []meta.APIKeyFSScope,
+	idempotencyKey string,
+	metadata []byte,
+) (*scopedTokenResponse, error) {
 	tokenVersion, err := newScopedTokenVersion()
 	if err != nil {
-		errJSON(w, backendErrorStatus(r.Context(), err), "failed to issue token")
-		return
+		return nil, err
 	}
-	expiresAt := time.Now().UTC().Add(time.Duration(req.TTLSeconds) * time.Second)
-	rawToken, err := token.IssueTokenWithExpiry(s.tokenSecret, scope.TenantID, tokenVersion, expiresAt)
+	expiresAt := time.Now().UTC().Add(time.Duration(ttlSeconds) * time.Second).Truncate(time.Second)
+	rawToken, err := token.IssueTokenWithExpiry(s.tokenSecret, tenantID, tokenVersion, expiresAt)
 	if err != nil {
-		errJSON(w, backendErrorStatus(r.Context(), err), "failed to issue token")
-		return
+		return nil, err
 	}
-	cipherToken, err := s.pool.Encrypt(r.Context(), []byte(rawToken))
+	cipherToken, err := s.pool.Encrypt(ctx, []byte(rawToken))
 	if err != nil {
-		errJSON(w, backendErrorStatus(r.Context(), err), "failed to encrypt token")
-		return
+		return nil, err
 	}
 
 	now := time.Now().UTC()
 	apiKeyID := token.NewID()
-	if err := s.meta.InsertAPIKey(r.Context(), &meta.APIKey{
+	key := &meta.APIKey{
 		ID:            apiKeyID,
-		TenantID:      scope.TenantID,
+		TenantID:      tenantID,
 		KeyName:       subject,
 		JWTCiphertext: cipherToken,
 		JWTHash:       token.HashToken(rawToken),
@@ -158,50 +290,71 @@ func (s *Server) handleScopedTokenIssue(w http.ResponseWriter, r *http.Request, 
 		IssuedAt:      now,
 		CreatedAt:     now,
 		UpdatedAt:     now,
-	}); err != nil {
-		if errors.Is(err, meta.ErrDuplicate) {
-			errJSON(w, http.StatusConflict, "token already exists")
-			return
-		}
-		errJSON(w, backendErrorStatus(r.Context(), err), "failed to persist token")
-		return
 	}
-
-	for _, scopeReq := range validatedScopes {
-		if err := s.meta.InsertAPIKeyFSScope(r.Context(), &meta.APIKeyFSScope{
-			TenantID:  scope.TenantID,
-			APIKeyID:  apiKeyID,
-			Prefix:    scopeReq.Prefix,
-			Ops:       scopeReq.Ops,
-			CreatedAt: now,
-			UpdatedAt: now,
-		}); err != nil {
-			_ = s.meta.RevokeAPIKey(context.Background(), scope.TenantID, apiKeyID)
-			if errors.Is(err, meta.ErrDuplicate) {
-				errJSON(w, http.StatusConflict, "duplicate fs scope")
-				return
-			}
-			errJSON(w, http.StatusBadRequest, err.Error())
-			return
-		}
+	if idempotencyKey != "" {
+		key.IssuedByProvider = scopedTokenIdempotencyProvider
+		key.IssuedBySubjectKey = idempotencyKey
+		key.IssuedByMetadataJSON = metadata
 	}
-
-	rows, err := s.meta.ListAPIKeyFSScopes(r.Context(), scope.TenantID, apiKeyID)
-	if err != nil {
-		errJSON(w, backendErrorStatus(r.Context(), err), "failed to load token scopes")
-		return
+	rows := make([]meta.APIKeyFSScope, len(scopes))
+	for i, scope := range scopes {
+		scope.TenantID = tenantID
+		scope.APIKeyID = apiKeyID
+		scope.CreatedAt = now
+		scope.UpdatedAt = now
+		rows[i] = scope
 	}
-	resp := scopedTokenResponse{
+	sortAPIKeyFSScopes(rows)
+	if err := s.meta.InsertAPIKeyWithFSScopes(ctx, key, rows); err != nil {
+		return nil, err
+	}
+	return &scopedTokenResponse{
 		Token:     rawToken,
 		TokenID:   apiKeyID,
 		Subject:   subject,
 		ScopeKind: string(meta.APIKeyScopeKindFS),
 		ExpiresAt: &expiresAt,
 		Scopes:    fsScopeResponses(rows),
+	}, nil
+}
+
+func sortAPIKeyFSScopes(scopes []meta.APIKeyFSScope) {
+	sort.Slice(scopes, func(i, j int) bool {
+		if scopes[i].Prefix == scopes[j].Prefix {
+			return scopes[i].Ops < scopes[j].Ops
+		}
+		return scopes[i].Prefix < scopes[j].Prefix
+	})
+}
+
+func (s *Server) scopedTokenResponseForAPIKey(ctx context.Context, key *meta.APIKey) (*scopedTokenResponse, error) {
+	if key == nil || key.ScopeKind != meta.APIKeyScopeKindFS || key.Status != meta.APIKeyActive {
+		return nil, errScopedTokenIdempotencyInactive
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(resp)
+	rawToken, err := s.pool.Decrypt(ctx, key.JWTCiphertext)
+	if err != nil {
+		return nil, err
+	}
+	if token.HashToken(string(rawToken)) != key.JWTHash {
+		return nil, fmt.Errorf("replayed scoped token hash mismatch")
+	}
+	claims, err := token.ParseAndVerifyToken(s.tokenSecret, string(rawToken))
+	if err != nil || claims.TenantID != key.TenantID || claims.TokenVersion != key.TokenVersion || claims.ExpiresAt <= 0 {
+		return nil, errScopedTokenIdempotencyInactive
+	}
+	expiresAt := time.Unix(claims.ExpiresAt, 0).UTC()
+	rows, err := s.meta.ListAPIKeyFSScopes(ctx, key.TenantID, key.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &scopedTokenResponse{
+		Token:     string(rawToken),
+		TokenID:   key.ID,
+		Subject:   key.KeyName,
+		ScopeKind: string(meta.APIKeyScopeKindFS),
+		ExpiresAt: &expiresAt,
+		Scopes:    fsScopeResponses(rows),
+	}, nil
 }
 
 func (s *Server) handleScopedTokenRevoke(w http.ResponseWriter, r *http.Request, scope *TenantScope, tokenID string) {

@@ -547,6 +547,30 @@ func TestResetMountViewPublishesGenerationAfterInvalidation(t *testing.T) {
 	}
 }
 
+func TestCredentialChangeResetUsesSynchronousKernelInvalidation(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken("http://localhost", "scoped"), opts)
+	fs.readCache.Put("/stale.txt", []byte("stale"), 1)
+	fs.inodes.Lookup("/stale.txt", false, 5, time.Now())
+
+	var invalidated atomic.Int32
+	testHookNotifyInodeSync = func(uint64) {
+		invalidated.Add(1)
+	}
+	t.Cleanup(func() { testHookNotifyInodeSync = nil })
+
+	if err := fs.resetMountViewForCredentialChange(); err != nil {
+		t.Fatal(err)
+	}
+	if got := invalidated.Load(); got == 0 {
+		t.Fatal("credential change did not synchronously invalidate kernel inode caches")
+	}
+	if _, ok := fs.readCache.Get("/stale.txt", 1); ok {
+		t.Fatal("credential change retained userspace read cache")
+	}
+}
+
 func TestStatDiscardedWhenMountViewResetsInFlight(t *testing.T) {
 	for _, status := range []int{http.StatusOK, http.StatusNotFound} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
