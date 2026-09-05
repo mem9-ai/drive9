@@ -58,6 +58,7 @@ type mountFuseOptions struct {
 	LocalRoot               string
 	LocalOnlyPatterns       []string
 	RemoteOnlyPatterns      []string
+	AppendLogPatterns       []string
 	PackPaths               []string
 	UploadConcurrency       int
 	DirCacheMaxEntries      int

@@ -37,6 +37,32 @@ type LocalPolicy struct {
 	remoteOnly []pathfilter.Pattern
 }
 
+// AppendLogMatcher recognizes operator-declared append-log paths without
+// altering normal local/remote path routing.
+type AppendLogMatcher struct {
+	patterns []pathfilter.Pattern
+}
+
+func NewAppendLogMatcher(patterns []string) *AppendLogMatcher {
+	return &AppendLogMatcher{patterns: pathfilter.CompileAll(patterns)}
+}
+
+func (matcher *AppendLogMatcher) Matches(localPath string) bool {
+	if matcher == nil {
+		return false
+	}
+	cleaned, err := canonicalRuntimePolicyPath(localPath)
+	if err != nil {
+		return false
+	}
+	for _, pattern := range matcher.patterns {
+		if pattern.MatchCanonical(cleaned) {
+			return true
+		}
+	}
+	return false
+}
+
 func NewLocalPolicy(profile string, localOnlyPatterns []string, remoteOnlyPatterns []string) *LocalPolicy {
 	policy := &LocalPolicy{}
 	if !profileAllowsLocalPolicy(profile) && len(localOnlyPatterns) == 0 && len(remoteOnlyPatterns) == 0 {
@@ -186,4 +212,8 @@ func canonicalPolicyPath(value string) (string, error) {
 
 func validateLocalPolicyPatterns(localOnlyPatterns []string, remoteOnlyPatterns []string) error {
 	return pathfilter.Validate(localOnlyPatterns, remoteOnlyPatterns)
+}
+
+func validateAppendLogPatterns(patterns []string) error {
+	return pathfilter.Validate(patterns)
 }

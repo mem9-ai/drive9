@@ -50,6 +50,12 @@ type retiredShadow struct {
 	fd       *os.File
 	diskPath string
 	size     int64
+	// cleanupDone closes after the active shadow is renamed (or removed). A
+	// final Unpin waits so it cannot orphan the retired disk path.
+	cleanupDone chan struct{}
+	// Nonzero only when an ordinary append-log commit invalidated this
+	// generation. Reset/unlink snapshots remain readable until final Unpin.
+	appendLogRevision int64
 }
 
 // ShadowStore manages per-path shadow files for local staging of writes.
@@ -1126,6 +1132,37 @@ func (s *ShadowStore) PinIfExists(remotePath string) (uint64, bool) {
 	return gen, true
 }
 
+// PinResidentOrDiscardDisk pins a shadow created by this process. A disk-only
+// shadow has no current-process durability proof, so it is discarded instead
+// of becoming a read source after restart. The path lock keeps a concurrent
+// writer from creating a replacement between the resident check and discard.
+func (s *ShadowStore) PinResidentOrDiscardDisk(remotePath string) (uint64, bool) {
+	if s == nil {
+		return 0, false
+	}
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	s.mu.Lock()
+	sf, ok := s.files[remotePath]
+	if !ok {
+		s.mu.Unlock()
+		_ = os.Remove(s.shadowPath(remotePath))
+		s.RecoverPendingBytes()
+		return 0, false
+	}
+	gen := s.active[remotePath]
+	if gen == 0 {
+		s.nextGen++
+		gen = s.nextGen
+		s.active[remotePath] = gen
+		s.genFile[gen] = sf
+	}
+	s.refs[gen]++
+	s.mu.Unlock()
+	return gen, true
+}
+
 // Unpin decrements the reference count for the given generation. If the
 // generation was retired (Remove called while pinned) and the count reaches
 // zero, the retired fd is closed and the disk file deleted. Generation 0
@@ -1148,6 +1185,9 @@ func (s *ShadowStore) Unpin(gen uint64) {
 	s.mu.Unlock()
 
 	if isRetired && r == 0 && rt != nil {
+		if rt.cleanupDone != nil {
+			<-rt.cleanupDone
+		}
 		_ = rt.fd.Close()
 		_ = os.Remove(rt.diskPath)
 	}
@@ -1166,6 +1206,7 @@ type shadowRemoveCleanup struct {
 	retire      bool
 	srcDiskPath string
 	retiredPath string
+	retired     *retiredShadow
 
 	// For the immediate path: unconditionally os.Remove the disk shadow.
 	immediatePath string
@@ -1203,11 +1244,14 @@ func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64) (s
 		cleanup.retiredPath = retiredPath
 		if sf != nil {
 			cleanup.removedSize = sf.size
-			s.retired[gen] = &retiredShadow{
-				fd:       sf.fd,
-				diskPath: retiredPath,
-				size:     sf.size,
+			retired := &retiredShadow{
+				fd:          sf.fd,
+				diskPath:    retiredPath,
+				size:        sf.size,
+				cleanupDone: make(chan struct{}),
 			}
+			s.retired[gen] = retired
+			cleanup.retired = retired
 		}
 		return cleanup, true
 	}
@@ -1238,6 +1282,9 @@ func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 		if err := os.Rename(cleanup.srcDiskPath, cleanup.retiredPath); err != nil {
 			_ = os.Remove(cleanup.srcDiskPath)
 		}
+		if cleanup.retired != nil {
+			close(cleanup.retired.cleanupDone)
+		}
 	} else if cleanup.immediatePath != "" {
 		// Always attempt disk cleanup — the shadow may exist only on disk
 		// (e.g. after crash/restart recovery where it was never loaded into
@@ -1257,9 +1304,16 @@ func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 // concurrent same-path write cannot open/reuse the shared disk path in
 // between.
 func (s *ShadowStore) Remove(remotePath string) {
+	s.removeAfterAppendLogCommit(remotePath, 0)
+}
+
+func (s *ShadowStore) removeAfterAppendLogCommit(remotePath string, revision int64) {
 	pl := s.acquirePathLock(remotePath)
 	s.mu.Lock()
 	cleanup, ok := s.removeCoreLocked(remotePath, 0)
+	if revision > 0 && cleanup.retired != nil {
+		cleanup.retired.appendLogRevision = revision
+	}
 	s.mu.Unlock()
 	if !ok {
 		s.releasePathLock(remotePath, pl)
@@ -1267,6 +1321,15 @@ func (s *ShadowStore) Remove(remotePath string) {
 	}
 	s.runRemoveCleanup(cleanup)
 	s.releasePathLock(remotePath, pl)
+}
+
+func (s *ShadowStore) appendLogRetiredRevision(gen uint64) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if retired := s.retired[gen]; retired != nil {
+		return retired.appendLogRevision
+	}
+	return 0
 }
 
 // RemoveIfGeneration removes the shadow file for remotePath only if its current

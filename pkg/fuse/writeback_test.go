@@ -3870,7 +3870,8 @@ func newShadowSpillFallbackFS(t *testing.T, c *client.Client, filePath string) (
 	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncInteractive}
 	opts.setDefaults()
 	fs := NewDat9FS(c, opts)
-	shadow, err := NewShadowStore(t.TempDir())
+	// These tests exercise post-upload modes, independently of host free space.
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

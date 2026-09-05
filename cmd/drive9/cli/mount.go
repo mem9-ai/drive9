@@ -42,6 +42,8 @@ const (
 	EnvMountLocalOnlyPatterns = "DRIVE9_MOUNT_LOCAL_ONLY_PATTERNS"
 	// EnvMountRemoteOnlyPatterns adds newline-delimited remote-only mount rules.
 	EnvMountRemoteOnlyPatterns = "DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS"
+	// EnvMountAppendLogPatterns adds newline-delimited append-log mount rules.
+	EnvMountAppendLogPatterns = "DRIVE9_MOUNT_APPEND_LOG_PATTERNS"
 )
 
 var (
@@ -191,10 +193,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
 	var localOnlyPatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
+	var appendLogPatterns stringListFlag
 	var unpackArchives stringListFlag
 	noAutoUnpack := fs.Bool("no-auto-unpack", false, "disable automatic profile pack restore before mounting")
 	fs.Var(&localOnlyPatterns, "local-only", "route matching paths to the local-only overlay; adds to profile rules; repeatable; env $DRIVE9_MOUNT_LOCAL_ONLY_PATTERNS uses one pattern per line")
 	fs.Var(&remoteOnlyPatterns, "remote-only", "force matching paths to remote-persistent storage; overrides local-only routing; repeatable; env $DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS uses one pattern per line")
+	fs.Var(&appendLogPatterns, "append-log", "use append-log sync optimization for matching remote-persistent files; repeatable; env $DRIVE9_MOUNT_APPEND_LOG_PATTERNS uses one pattern per line")
 	fs.Var(&unpackArchives, "unpack", "restore a drive9 pack archive into --local-root before mounting (repeatable)")
 	uploadConcurrency := fs.Int("upload-concurrency", 16, "maximum concurrent background uploads issued by FUSE")
 	dirCacheMaxEntries := fs.Int("dir-cache-max-entries", 200000, "maximum entries per directory in namespace cache before complete marking is disabled")
@@ -264,7 +268,16 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		os.Exit(2)
 	}
 
+	envAppendLogPatterns, err := consumeMountPolicyPatternsEnv(EnvMountAppendLogPatterns)
+	if err != nil {
+		return err
+	}
+	effectiveAppendLogPatterns := mergeProfileValues(envAppendLogPatterns, appendLogPatterns)
+
 	if objectLoc != nil {
+		if len(effectiveAppendLogPatterns) > 0 {
+			return fmt.Errorf("drive9 mount: --append-log is only supported with Drive9 FUSE mounts")
+		}
 		if gvisorCompatGiven && *gvisorCompat {
 			return fmt.Errorf("drive9 mount: --gvisor-compat is only supported with Drive9 FUSE mounts")
 		}
@@ -328,7 +341,10 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
-	policyEnvArgs := make([]string, 0, len(envLocalOnlyPatterns)+len(envRemoteOnlyPatterns))
+	policyEnvArgs := make([]string, 0, len(envAppendLogPatterns)+len(envLocalOnlyPatterns)+len(envRemoteOnlyPatterns))
+	for _, pattern := range envAppendLogPatterns {
+		policyEnvArgs = append(policyEnvArgs, "--append-log="+pattern)
+	}
 	for _, pattern := range envLocalOnlyPatterns {
 		policyEnvArgs = append(policyEnvArgs, "--local-only="+pattern)
 	}
@@ -440,6 +456,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	profileGiven := flagProvided(fs, "profile")
 	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
 	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
+	if len(effectiveAppendLogPatterns) > 0 && resolved != MountModeFUSE {
+		return fmt.Errorf("drive9 mount: --append-log is only supported with Drive9 FUSE mounts")
+	}
+	if err := validateMountPolicyPatterns(effectiveAppendLogPatterns); err != nil {
+		return err
+	}
 	if *directMountStrict && resolved == MountModeWebDAV {
 		return fmt.Errorf("drive9 mount: --direct-mount-strict is not supported with WebDAV mode")
 	}
@@ -583,6 +605,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			LocalRoot:          normalizedLocalRoot,
 			LocalOnlyPatterns:  append([]string(nil), effectiveLocalOnlyPatterns...),
 			RemoteOnlyPatterns: append([]string(nil), effectiveRemoteOnlyPatterns...),
+			AppendLogPatterns:  append([]string(nil), effectiveAppendLogPatterns...),
 			PackPaths:          append([]string(nil), effectivePackPaths...),
 			ReadOnly:           *readOnly,
 			Debug:              *debug,
@@ -713,6 +736,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			LocalRoot:          normalizedLocalRoot,
 			LocalOnlyPatterns:  append([]string(nil), effectiveLocalOnlyPatterns...),
 			RemoteOnlyPatterns: append([]string(nil), effectiveRemoteOnlyPatterns...),
+			AppendLogPatterns:  append([]string(nil), effectiveAppendLogPatterns...),
 			PackPaths:          append([]string(nil), effectivePackPaths...),
 			ReadOnly:           *readOnly,
 			Debug:              *debug,
@@ -754,6 +778,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		LocalRoot:               normalizedLocalRoot,
 		LocalOnlyPatterns:       append([]string(nil), effectiveLocalOnlyPatterns...),
 		RemoteOnlyPatterns:      append([]string(nil), effectiveRemoteOnlyPatterns...),
+		AppendLogPatterns:       append([]string(nil), effectiveAppendLogPatterns...),
 		PackPaths:               append([]string(nil), effectivePackPaths...),
 		UploadConcurrency:       *uploadConcurrency,
 		DirCacheMaxEntries:      *dirCacheMaxEntries,
@@ -967,6 +992,7 @@ func applyScrubbedMountEnv(scrubbed []string) {
 		EnvTiDBCloudPrivateKey,
 		EnvMountLocalOnlyPatterns,
 		EnvMountRemoteOnlyPatterns,
+		EnvMountAppendLogPatterns,
 	} {
 		_ = os.Unsetenv(key)
 	}
@@ -1225,7 +1251,8 @@ func mountBackgroundEnv(environ []string, req mountBackgroundRequest) []string {
 			strings.HasPrefix(kv, EnvTiDBCloudPublicKey+"=") ||
 			strings.HasPrefix(kv, EnvTiDBCloudPrivateKey+"=") ||
 			strings.HasPrefix(kv, EnvMountLocalOnlyPatterns+"=") ||
-			strings.HasPrefix(kv, EnvMountRemoteOnlyPatterns+"=") {
+			strings.HasPrefix(kv, EnvMountRemoteOnlyPatterns+"=") ||
+			strings.HasPrefix(kv, EnvMountAppendLogPatterns+"=") {
 			continue
 		}
 		out = append(out, kv)

@@ -168,6 +168,14 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 	}
 	wait := time.Since(waitStart)
 
+	p.mu.Lock()
+	if p.ctx != ctx || p.cache[offset] != block {
+		p.mu.Unlock()
+		return nil, false
+	}
+	fileSize := p.fileSize
+	p.mu.Unlock()
+
 	if block.err != nil {
 		// Remove failed block — verify identity to avoid deleting a replacement
 		p.mu.Lock()
@@ -181,7 +189,7 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 
 	// Trim to requested size
 	data := block.data
-	if len(data) < size && offset+int64(len(data)) < p.fileSize {
+	if len(data) < size && offset+int64(len(data)) < fileSize {
 		// A prefetched chunk smaller than the caller's request is only valid at
 		// EOF. Returning it for an interior range exposes a short read to FUSE.
 		p.mu.Lock()
@@ -189,7 +197,7 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 			delete(p.cache, offset)
 		}
 		p.mu.Unlock()
-		p.debugf("short block path=%s offset=%d req=%d got=%d file_size=%d wait=%s", p.pathString(), offset, size, len(data), p.fileSize, wait)
+		p.debugf("short block path=%s offset=%d req=%d got=%d file_size=%d wait=%s", p.pathString(), offset, size, len(data), fileSize, wait)
 		return nil, false
 	}
 	if len(data) > size {
@@ -211,6 +219,12 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 // prefetcher. Existing fetches are canceled and drain their inflight markers;
 // subsequent reads can start fresh fetches on the replacement context.
 func (p *Prefetcher) Invalidate() {
+	p.invalidateWithSize(-1)
+}
+
+// invalidateWithSize publishes the replacement file size together with cache
+// invalidation. A negative size leaves the existing size unchanged.
+func (p *Prefetcher) invalidateWithSize(fileSize int64) {
 	if p == nil {
 		return
 	}
@@ -218,6 +232,9 @@ func (p *Prefetcher) Invalidate() {
 	defer p.mu.Unlock()
 	if p.closed {
 		return
+	}
+	if fileSize >= 0 {
+		p.fileSize = fileSize
 	}
 	p.cancel()
 	p.ctx, p.cancel = context.WithCancel(context.Background())
@@ -390,6 +407,7 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 	p.debugf("start path=%s offset=%d length=%d chunk_size=%d chunks=%d window=%d", fetchPath, offset, length, chunkSize, nChunks, p.window)
 
 	ctx := p.ctx
+	fileSize := p.fileSize
 	go func() {
 		defer func() {
 			p.mu.Lock()
@@ -436,12 +454,12 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 							p.perf.recordRemoteOp(perfRemoteRead, err, time.Since(start), uint64(len(data)))
 						}
 						if err != nil {
-							p.markPrefetchBlocks(blocks, fetch, chunkSize, nil, err)
+							p.markPrefetchBlocks(blocks, fetch, chunkSize, fileSize, nil, err)
 							p.debugf("fetch error path=%s offset=%d length=%d dur=%s err=%v", fetchPath, fetch.offset, fetch.length, time.Since(start), err)
 							fetchCancel()
 							continue
 						}
-						p.markPrefetchBlocks(blocks, fetch, chunkSize, data, nil)
+						p.markPrefetchBlocks(blocks, fetch, chunkSize, fileSize, data, nil)
 						p.debugf("fetch done path=%s offset=%d length=%d got=%d dur=%s", fetchPath, fetch.offset, fetch.length, len(data), time.Since(start))
 					}
 				}
@@ -509,7 +527,7 @@ func (p *Prefetcher) fetchRange(ctx context.Context, fetchPath string, target *c
 	return io.ReadAll(rc)
 }
 
-func (p *Prefetcher) markPrefetchBlocks(blocks []*prefetchBlock, fetch prefetchFetch, chunkSize int64, data []byte, err error) {
+func (p *Prefetcher) markPrefetchBlocks(blocks []*prefetchBlock, fetch prefetchFetch, chunkSize, fileSize int64, data []byte, err error) {
 	fetchEnd := fetch.offset + fetch.length
 	for _, b := range blocks {
 		if b.offset < fetch.offset || b.offset >= fetchEnd {
@@ -521,8 +539,8 @@ func (p *Prefetcher) markPrefetchBlocks(blocks []*prefetchBlock, fetch prefetchF
 		}
 		start := b.offset - fetch.offset
 		expected := chunkSize
-		if p.fileSize > 0 && b.offset+expected > p.fileSize {
-			expected = p.fileSize - b.offset
+		if fileSize > 0 && b.offset+expected > fileSize {
+			expected = fileSize - b.offset
 		}
 		if expected <= 0 {
 			b.err = io.ErrUnexpectedEOF
