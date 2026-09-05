@@ -50,6 +50,9 @@ type retiredShadow struct {
 	fd       *os.File
 	diskPath string
 	size     int64
+	// cleanupDone closes after the active shadow is renamed (or removed). A
+	// final Unpin waits so it cannot orphan the retired disk path.
+	cleanupDone chan struct{}
 	// Nonzero only when an ordinary append-log commit invalidated this
 	// generation. Reset/unlink snapshots remain readable until final Unpin.
 	appendLogRevision int64
@@ -1182,6 +1185,9 @@ func (s *ShadowStore) Unpin(gen uint64) {
 	s.mu.Unlock()
 
 	if isRetired && r == 0 && rt != nil {
+		if rt.cleanupDone != nil {
+			<-rt.cleanupDone
+		}
 		_ = rt.fd.Close()
 		_ = os.Remove(rt.diskPath)
 	}
@@ -1200,6 +1206,7 @@ type shadowRemoveCleanup struct {
 	retire      bool
 	srcDiskPath string
 	retiredPath string
+	retired     *retiredShadow
 
 	// For the immediate path: unconditionally os.Remove the disk shadow.
 	immediatePath string
@@ -1237,11 +1244,14 @@ func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64) (s
 		cleanup.retiredPath = retiredPath
 		if sf != nil {
 			cleanup.removedSize = sf.size
-			s.retired[gen] = &retiredShadow{
-				fd:       sf.fd,
-				diskPath: retiredPath,
-				size:     sf.size,
+			retired := &retiredShadow{
+				fd:          sf.fd,
+				diskPath:    retiredPath,
+				size:        sf.size,
+				cleanupDone: make(chan struct{}),
 			}
+			s.retired[gen] = retired
+			cleanup.retired = retired
 		}
 		return cleanup, true
 	}
@@ -1272,6 +1282,9 @@ func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 		if err := os.Rename(cleanup.srcDiskPath, cleanup.retiredPath); err != nil {
 			_ = os.Remove(cleanup.srcDiskPath)
 		}
+		if cleanup.retired != nil {
+			close(cleanup.retired.cleanupDone)
+		}
 	} else if cleanup.immediatePath != "" {
 		// Always attempt disk cleanup — the shadow may exist only on disk
 		// (e.g. after crash/restart recovery where it was never loaded into
@@ -1297,23 +1310,16 @@ func (s *ShadowStore) Remove(remotePath string) {
 func (s *ShadowStore) removeAfterAppendLogCommit(remotePath string, revision int64) {
 	pl := s.acquirePathLock(remotePath)
 	s.mu.Lock()
-	gen := s.active[remotePath]
 	cleanup, ok := s.removeCoreLocked(remotePath, 0)
+	if revision > 0 && cleanup.retired != nil {
+		cleanup.retired.appendLogRevision = revision
+	}
 	s.mu.Unlock()
 	if !ok {
 		s.releasePathLock(remotePath, pl)
 		return
 	}
 	s.runRemoveCleanup(cleanup)
-	if revision > 0 {
-		// Publish invalidation after retirement's disk rename, so a reader's
-		// final Unpin cannot race ahead of that rename and leak the old file.
-		s.mu.Lock()
-		if retired := s.retired[gen]; retired != nil {
-			retired.appendLogRevision = revision
-		}
-		s.mu.Unlock()
-	}
 	s.releasePathLock(remotePath, pl)
 }
 

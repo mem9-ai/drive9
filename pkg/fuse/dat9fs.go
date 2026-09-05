@@ -12238,6 +12238,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
 	writeSyncAppendLogState := appendLogHandleState{}
+	writeSyncBeforeDirtySeq := fh.DirtySeq
 	if fh.WritePolicy == WritePolicyWriteSync {
 		writeSyncSnapshot = fh.Dirty.snapshot()
 		writeSyncAppendLogState = fh.appendLog
@@ -12344,7 +12345,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 				if state, ok := fs.committedMutation(fh.Ino); ok && fh.DirtySeq != 0 && fh.DirtySeq <= state.committedSeq {
 					fs.discardSupersededMutationLocked(fh)
 				} else if !contentCommitted && !newerDirtyGeneration {
-					fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot)
+					fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot, writeSyncBeforeDirtySeq)
 					fh.appendLogRestoreFailedWriteState(writeSyncAppendLogState)
 				}
 			}
@@ -12354,7 +12355,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	return n, gofuse.OK
 }
 
-func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBufferSnapshot) {
+func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBufferSnapshot, restoreDirtySeq uint64) {
 	if fh == nil {
 		return
 	}
@@ -12370,7 +12371,12 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 		}
 		fh.Dirty.restore(snapshot)
 		if fh.Dirty.HasDirtyParts() {
-			fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+			if restoreDirtySeq != 0 {
+				fh.DirtySeq = restoreDirtySeq
+				fs.restoreDirtySize(fh.Ino, restoreDirtySeq, fh.Dirty.Size())
+			} else {
+				fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+			}
 		}
 		fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
 	}
@@ -12384,6 +12390,15 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 		fh.ShadowCommitSeq = 0
 		fh.ShadowStageGen = 0
 	}
+}
+
+func (fs *Dat9FS) restoreDirtySize(ino, seq uint64, size int64) {
+	if fs == nil || seq == 0 {
+		return
+	}
+	fs.dirtyMu.Lock()
+	fs.dirtyInodes[ino] = dirtyInodeState{size: size, seq: seq}
+	fs.dirtyMu.Unlock()
 }
 
 // syncWriteHandleToRemoteLocked makes the current handle contents

@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -231,6 +232,48 @@ func TestShadowStorePinUnpinRemove(t *testing.T) {
 	// SizeGen should return -1 after Unpin.
 	if sz := ss.SizeGen(gen); sz != -1 {
 		t.Errorf("SizeGen after Unpin = %d, want -1", sz)
+	}
+}
+
+func TestShadowStoreFinalUnpinWaitsForRetiredRename(t *testing.T) {
+	ss, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	if err := ss.WriteFull("/retire-race", []byte("shadow"), 1); err != nil {
+		t.Fatal(err)
+	}
+	gen := ss.Pin("/retire-race")
+	pl := ss.acquirePathLock("/retire-race")
+	ss.mu.Lock()
+	cleanup, ok := ss.removeCoreLocked("/retire-race", 0)
+	ss.mu.Unlock()
+	if !ok || !cleanup.retire {
+		ss.releasePathLock("/retire-race", pl)
+		t.Fatal("fixture did not retire pinned shadow")
+	}
+
+	unpinDone := make(chan struct{})
+	go func() {
+		ss.Unpin(gen)
+		close(unpinDone)
+	}()
+	select {
+	case <-unpinDone:
+		ss.releasePathLock("/retire-race", pl)
+		t.Fatal("final unpin completed before retired shadow rename")
+	case <-time.After(20 * time.Millisecond):
+	}
+	ss.runRemoveCleanup(cleanup)
+	ss.releasePathLock("/retire-race", pl)
+	select {
+	case <-unpinDone:
+	case <-time.After(time.Second):
+		t.Fatal("final unpin remained blocked after retired shadow rename")
+	}
+	if _, err := os.Stat(cleanup.retiredPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired shadow stat = %v, want not exist", err)
 	}
 }
 
