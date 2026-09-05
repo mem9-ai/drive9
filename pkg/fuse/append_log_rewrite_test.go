@@ -1,0 +1,2069 @@
+package fuse
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"runtime"
+	"syscall"
+	"testing"
+	"time"
+
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/mem9-ai/drive9/pkg/client"
+)
+
+func TestAppendLogFullRewriteUsesOneConditionalPUT(t *testing.T) {
+	var putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		putCalls++
+		if r.Method != http.MethodPut || r.URL.RawQuery != "" {
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
+			t.Errorf("expected revision = %q", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if got := string(body); got != "rewrite" {
+			t.Errorf("full rewrite body = %q", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+	fs.perf = newFusePerfCounters(true)
+
+	fh.Lock()
+	result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != 0 {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if putCalls != 1 || fh.BaseRev != 6 || fh.OrigSize != int64(len("rewrite")) || fh.DirtySeq != 0 {
+		t.Fatalf("calls/handle = %d/%+v", putCalls, fh)
+	}
+	if got := fh.appendLogLayoutAt(6, int64(len("rewrite"))); got != client.ContentLayoutAppendLog {
+		t.Fatalf("layout = %q, want append_log", got)
+	}
+	if got := fs.perf.snapshot().Counters["append_log_outcome_success"]; got != 0 {
+		t.Fatalf("append-log outcome success = %d, want 0 for conditional PUT", got)
+	}
+}
+
+func TestAppendLogFullRewriteClearsReadOnlySiblingTarget(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+	reader := &FileHandle{Path: fh.Path, ReadTarget: &client.ReadTarget{ObjectURL: "https://old-object.example"}}
+	fs.openHandles.Add(reader)
+	defer fs.openHandles.Remove(reader)
+
+	fh.Lock()
+	result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if reader.ReadTarget != nil {
+		t.Fatalf("read-only sibling retained stale target: %+v", reader.ReadTarget)
+	}
+}
+
+func TestAppendLogFullRewriteFinalizesBeforePendingModeFailure(t *testing.T) {
+	var putCalls, chmodCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			putCalls++
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls++
+			if chmodCalls == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+
+	fh.Lock()
+	fs.setPendingModeLocked(fh, 0o600, 1)
+	first := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+	if first.route != appendLogRouteFailed || first.status == gofuse.OK {
+		fh.Unlock()
+		t.Fatalf("first result = %+v, want chmod failure", first)
+	}
+	if fh.BaseRev != 6 || fh.OrigSize != int64(len("rewrite")) || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || !fh.HasPendingMode {
+		fh.Unlock()
+		t.Fatalf("content finalization after chmod failure = %+v", fh)
+	}
+	secondHandled, secondStatus, _ := fs.routeAppendLogLocked(context.Background(), fh)
+	fh.Unlock()
+	if !secondHandled || secondStatus != gofuse.OK {
+		t.Fatalf("mode retry = handled=%t status=%d, want true/OK", secondHandled, secondStatus)
+	}
+	if putCalls != 1 || chmodCalls != 2 || fh.HasPendingMode {
+		t.Fatalf("put/chmod/pending = %d/%d/%t, want 1/2/false", putCalls, chmodCalls, fh.HasPendingMode)
+	}
+}
+
+func TestAppendLogFullRewriteRemovesUnownedStaleShadow(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	if err := shadow.WriteFull(fh.Path, []byte("stale"), fh.BaseRev); err != nil {
+		t.Fatal(err)
+	}
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+
+	fh.Lock()
+	result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if shadow.Has(fh.Path) {
+		t.Fatal("full rewrite retained an unowned stale shadow")
+	}
+}
+
+func TestAppendLogFullRewriteClearsAndRebindsLiveShadowSibling(t *testing.T) {
+	header := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
+	image := append(append([]byte(nil), header...), []byte("tail")...)
+	fs, owner, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 7})
+	})
+	defer closeServer()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	owner.Dirty = NewWriteBuffer(owner.Path, 1024, 0)
+	if _, err := owner.Dirty.Write(0, header); err != nil {
+		t.Fatal(err)
+	}
+	owner.Dirty.ClearDirty()
+	owner.DirtySeq = 0
+	owner.BaseRev = 6
+	owner.OrigSize = sqliteWALHeaderSize
+	owner.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 6, size: sqliteWALHeaderSize}
+	owner.ShadowReady = true
+	owner.ShadowSpill = true
+	if err := shadow.WriteFull(owner.Path, header, owner.BaseRev); err != nil {
+		t.Fatal(err)
+	}
+	fs.openHandles.Add(owner)
+	defer fs.openHandles.Remove(owner)
+	ownerHandleID := fs.fileHandles.Allocate(owner)
+	defer fs.fileHandles.Delete(ownerHandleID)
+
+	publisher := &FileHandle{
+		Ino:      2,
+		Path:     owner.Path,
+		Dirty:    NewWriteBuffer(owner.Path, 1024, 0),
+		DirtySeq: 1,
+		OrigSize: sqliteWALHeaderSize,
+		BaseRev:  6,
+		appendLog: appendLogHandleState{
+			initialized: true,
+			layout:      client.ContentLayoutAppendLog,
+			revision:    6,
+			size:        sqliteWALHeaderSize,
+		},
+	}
+	if _, err := publisher.Dirty.Write(0, image); err != nil {
+		t.Fatal(err)
+	}
+	publisher.appendLogRecordUserWrite(sqliteWALHeaderSize, 0, int64(len(image)))
+	fs.openHandles.Add(publisher)
+	defer fs.openHandles.Remove(publisher)
+
+	publisher.Lock()
+	result := fs.tryAppendLogFullRewriteLocked(context.Background(), publisher)
+	publisher.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("full rewrite = %+v, want committed", result)
+	}
+	if owner.ShadowReady || owner.ShadowSpill {
+		t.Fatalf("owner retained removed shadow flags: ready=%t spill=%t", owner.ShadowReady, owner.ShadowSpill)
+	}
+	got, status, err := readDat9FSTestRange(fs, owner.Ino, ownerHandleID, 0, len(image))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != gofuse.OK || !bytes.Equal(got, image) {
+		t.Fatalf("sibling read = %x/%d, want %x/OK", got, status, image)
+	}
+}
+
+func TestAppendLogFullRewriteAppliesPendingModeAndCachesDirEntry(t *testing.T) {
+	var putCalls, chmodCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			putCalls++
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls++
+			var request struct {
+				Mode uint32 `json:"mode"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("decode chmod request: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if request.Mode != 0o600 {
+				t.Errorf("chmod mode = %o, want 600", request.Mode)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+	fh.Ino = fs.inodes.Lookup(fh.Path, false, fh.OrigSize, time.Now())
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "db-wal", Size: 0, Revision: 5}})
+
+	fh.Lock()
+	fs.setPendingModeLocked(fh, 0o600, 1)
+	result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if putCalls != 1 || chmodCalls != 1 || fh.HasPendingMode {
+		t.Fatalf("put/chmod/pending = %d/%d/%t, want 1/1/false", putCalls, chmodCalls, fh.HasPendingMode)
+	}
+	cached := fs.dirCache.Lookup("/", "db-wal")
+	if cached.kind != namespaceLookupPositive || cached.item.Size != int64(len("rewrite")) || cached.item.Revision != 6 {
+		t.Fatalf("dir cache = %+v, want size/revision %d/6", cached, len("rewrite"))
+	}
+}
+
+func TestAppendLogFullRewriteResolvesUnknownLayoutOnce(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		layout    client.ContentLayout
+		wantRoute appendLogRoute
+		wantPut   int
+	}{
+		{name: "append log", layout: client.ContentLayoutAppendLog, wantRoute: appendLogRouteCommitted, wantPut: 1},
+		{name: "single", layout: client.ContentLayoutSingle, wantRoute: appendLogRouteNotApplicable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var headCalls, putCalls int
+			fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodHead:
+					headCalls++
+					w.Header().Set("Content-Length", "3")
+					w.Header().Set("X-Dat9-Revision", "5")
+					w.Header().Set("X-Dat9-Content-Layout", string(test.layout))
+					w.WriteHeader(http.StatusOK)
+				case http.MethodPut:
+					putCalls++
+					_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+				default:
+					t.Errorf("unexpected method %s", r.Method)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+			})
+			defer closeServer()
+			setAppendLogRewriteDirty(t, fh, "rewrite")
+
+			fh.Lock()
+			result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+			fh.Unlock()
+			if result.route != test.wantRoute || result.status != 0 {
+				t.Fatalf("result = %+v, want route %v", result, test.wantRoute)
+			}
+			if headCalls != 1 || putCalls != test.wantPut {
+				t.Fatalf("head/put calls = %d/%d, want 1/%d", headCalls, putCalls, test.wantPut)
+			}
+		})
+	}
+}
+
+func TestAppendLogFullRewriteRejectsMissingLayoutWithoutWrite(t *testing.T) {
+	var headCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			headCalls++
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			putCalls++
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	beforeSeq := fh.DirtySeq
+
+	fh.Lock()
+	result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteFailed || result.status != gofuse.EIO {
+		t.Fatalf("result = %+v, want EIO failure", result)
+	}
+	if headCalls != 1 || putCalls != 0 {
+		t.Fatalf("head/put calls = %d/%d, want 1/0", headCalls, putCalls)
+	}
+	if fh.DirtySeq != beforeSeq || !fh.Dirty.HasDirtyParts() {
+		t.Fatal("missing layout must preserve dirty state")
+	}
+}
+
+func TestAppendLogFtruncateZeroRetainsCommittedBaselineForFullRewrite(t *testing.T) {
+	var headCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			headCalls++
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			putCalls++
+			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
+				t.Errorf("expected revision = %q, want 5", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			if len(body) != 0 {
+				t.Errorf("full rewrite body = %q, want empty", body)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	})
+	defer closeServer()
+	if err := fh.Dirty.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	fh.appendLogRecordTruncate()
+	fh.OrigSize = 0 // mirrors truncateWritableHandleLocked's generic-routing state.
+	// A second local truncate is still based on the same remote revision and
+	// size. It must not replace the first conditional-PUT baseline with zero.
+	fh.appendLogRecordTruncate()
+
+	fh.Lock()
+	result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if headCalls != 1 || putCalls != 1 {
+		t.Fatalf("head/put calls = %d/%d, want 1/1", headCalls, putCalls)
+	}
+}
+
+func TestAppendLogCheckpointReuseFsyncUsesConditionalFullPUT(t *testing.T) {
+	var appendCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			appendCalls++
+			w.WriteHeader(http.StatusInternalServerError)
+		case http.MethodPut:
+			putCalls++
+			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
+				t.Errorf("expected revision = %q, want 5", got)
+			}
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "checkpoint" {
+				t.Errorf("checkpoint rewrite body = %q, want checkpoint", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, fh.BaseRev, fh.OrigSize)
+	if err := fh.Dirty.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	fh.appendLogRecordTruncate()
+	fh.OrigSize = 0
+	if _, err := fh.Dirty.Write(0, []byte("checkpoint")); err != nil {
+		t.Fatal(err)
+	}
+	fh.appendLogRecordUserWrite(0, 0, int64(len("checkpoint")))
+	handleID := fs.fileHandles.Allocate(fh)
+
+	if status := fs.Fsync(nil, &gofuse.FsyncIn{Fh: handleID}); status != gofuse.OK {
+		t.Fatalf("Fsync status = %d, want OK", status)
+	}
+	if appendCalls != 0 || putCalls != 1 {
+		t.Fatalf("append/put calls = %d/%d, want 0/1", appendCalls, putCalls)
+	}
+}
+
+func TestAppendLogPathTruncateClearsAdoptedHandleGeneration(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	})
+	defer closeServer()
+	ino := fs.inodes.Lookup(fh.Path, false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	fh.Ino = ino
+	fh.OpenPID = 77
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fs.openHandles.Add(fh)
+	defer fs.openHandles.Remove(fh)
+
+	handled, status := fs.tryAppendLogPathTruncate(context.Background(), entry, ino, 77, 0, nil)
+	if !handled || status != gofuse.OK {
+		t.Fatalf("handled/status = %t/%d, want true/OK", handled, status)
+	}
+	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || fh.BaseRev != 6 || fh.OrigSize != 0 || fh.ZeroBase {
+		t.Fatalf("adopted handle = %+v", fh)
+	}
+}
+
+func TestAppendLogFullRewriteTooLargePreservesLayoutAndDirtyState(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": client.AppendLogCodeTooLarge, "code": client.AppendLogCodeTooLarge})
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+
+	fh.Lock()
+	result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteFailed || result.status != gofuseStatus(syscall.EFBIG) {
+		t.Fatalf("result = %+v, want EFBIG failure", result)
+	}
+	if fh.DirtySeq != 1 || !fh.Dirty.HasDirtyParts() {
+		t.Fatal("failed full rewrite must preserve dirty state")
+	}
+	if got := fh.appendLogLayoutAt(5, 3); got != client.ContentLayoutAppendLog {
+		t.Fatalf("layout after failure = %q, want append_log", got)
+	}
+}
+
+func TestAppendLogFullRewriteFailuresPreserveLayoutAndDirtyState(t *testing.T) {
+	tests := []struct {
+		name   string
+		ctx    func() context.Context
+		handle http.HandlerFunc
+	}{
+		{
+			name: "conflict",
+			ctx:  context.Background,
+			handle: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "conflict", "code": client.AppendLogCodeConflict})
+			},
+		},
+		{
+			name: "server error",
+			ctx:  context.Background,
+			handle: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+		},
+		{
+			name: "malformed success",
+			ctx:  context.Background,
+			handle: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]int64{})
+			},
+		},
+		{
+			name: "canceled context",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			handle: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fs, fh, closeServer := newAppendLogEngineFixture(t, false, test.handle)
+			defer closeServer()
+			setAppendLogRewriteDirty(t, fh, "rewrite")
+			fh.appendLogObserveLayout(client.ContentLayoutAppendLog, fh.BaseRev, fh.OrigSize)
+
+			fh.Lock()
+			result := fs.tryAppendLogFullRewriteLocked(test.ctx(), fh)
+			fh.Unlock()
+			if result.route != appendLogRouteFailed || result.status == gofuse.OK {
+				t.Fatalf("result = %+v, want terminal failure", result)
+			}
+			if fh.DirtySeq != 1 || !fh.Dirty.HasDirtyParts() {
+				t.Fatal("failed full rewrite must preserve dirty state")
+			}
+			if got := fh.appendLogLayoutAt(5, 3); got != client.ContentLayoutAppendLog {
+				t.Fatalf("layout after failure = %q, want append_log", got)
+			}
+		})
+	}
+}
+
+func TestAppendLogPathTruncateUsesConditionalFullPUT(t *testing.T) {
+	var headCalls, putCalls int
+	fs, _, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			headCalls++
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			putCalls++
+			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
+				t.Errorf("expected revision = %q, want 5", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			if len(body) != 0 {
+				t.Errorf("truncate body = %q, want empty", body)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	})
+	defer closeServer()
+	fs.appendLogSnapshotRoot = ""
+	fs.opts.CacheDir = ""
+	fs.perf = newFusePerfCounters(true)
+	ino := fs.inodes.Lookup("/db-wal", false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+
+	if status := fs.applyRemoteTruncate(context.Background(), entry, ino, 0, 0); status != gofuse.OK {
+		t.Fatalf("applyRemoteTruncate status = %d, want OK", status)
+	}
+	if headCalls != 1 || putCalls != 1 {
+		t.Fatalf("head/put calls = %d/%d, want 1/1", headCalls, putCalls)
+	}
+	if got := fs.perf.snapshot().Counters["append_log_outcome_success"]; got != 0 {
+		t.Fatalf("append-log outcome success = %d, want 0 for conditional PUT", got)
+	}
+}
+
+func TestAppendLogPathTruncateGrowthFreezesPrefixAndZeroFill(t *testing.T) {
+	var getCalls, headCalls, putCalls int
+	fs, _, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getCalls++
+			_, _ = w.Write([]byte("abc"))
+		case http.MethodHead:
+			headCalls++
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			putCalls++
+			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
+				t.Errorf("expected revision = %q, want 5", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			if want := []byte{'a', 'b', 'c', 0, 0}; !bytes.Equal(body, want) {
+				t.Errorf("truncate growth body = %v, want %v", body, want)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	})
+	defer closeServer()
+	ino := fs.inodes.Lookup("/db-wal", false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+
+	if status := fs.applyRemoteTruncate(context.Background(), entry, ino, 0, 5); status != gofuse.OK {
+		t.Fatalf("applyRemoteTruncate status = %d, want OK", status)
+	}
+	if getCalls != 1 || headCalls != 1 || putCalls != 1 {
+		t.Fatalf("get/head/put calls = %d/%d/%d, want 1/1/1", getCalls, headCalls, putCalls)
+	}
+}
+
+func TestAppendLogPathTruncateGrowthRebasesCleanSibling(t *testing.T) {
+	var putCalls, appendCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write([]byte("abc"))
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			putCalls++
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		case http.MethodPost:
+			appendCalls++
+			w.WriteHeader(http.StatusConflict)
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+
+	ino := fs.inodes.Lookup(fh.Path, false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	fh.Ino = ino
+	fh.OpenPID = 99
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.DirtySeq = 0
+	fh.OrigSize = 3
+	fh.BaseRev = 5
+	fh.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 5, size: 3}
+	handleID := fs.allocateFileHandle(fh)
+	defer fs.deleteFileHandle(handleID, fh)
+
+	handled, status := fs.tryAppendLogPathTruncate(context.Background(), entry, ino, 77, 5, nil)
+	if !handled || status != gofuse.OK || putCalls != 1 {
+		t.Fatalf("handled/status/puts = %t/%d/%d, want true/OK/1", handled, status, putCalls)
+	}
+	fs.syncOpenHandlesAfterPathTruncate(ino, 5)
+	if fh.BaseRev != 6 || fh.OrigSize != 5 || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || fh.Dirty.Size() != 5 {
+		t.Fatalf("clean sibling after path truncate = rev=%d size=%d seq=%d dirty=%t buffer=%d, want 6/5/0/false/5", fh.BaseRev, fh.OrigSize, fh.DirtySeq, fh.Dirty.HasDirtyParts(), fh.Dirty.Size())
+	}
+	if status := fs.Fsync(nil, &gofuse.FsyncIn{Fh: handleID}); status != gofuse.OK {
+		t.Fatalf("Fsync status = %d, want OK", status)
+	}
+	if appendCalls != 0 {
+		t.Fatalf("append calls after committed truncate = %d, want 0", appendCalls)
+	}
+}
+
+func TestAppendLogGenericUnsupportedReroutesOnceToFullPUT(t *testing.T) {
+	var putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		putCalls++
+		body, _ := io.ReadAll(r.Body)
+		if got := string(body); got != "pretail" {
+			t.Errorf("full rewrite body = %q, want pretail", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+
+	fh.Lock()
+	handled, status := fs.routeAppendLogGenericUnsupportedLocked(
+		context.Background(),
+		fh,
+		fh.Path,
+		fh.DirtySeq,
+		&client.StatusError{StatusCode: http.StatusBadRequest, Code: client.AppendLogCodeUnsupported},
+	)
+	fh.Unlock()
+	if !handled || status != gofuse.OK || putCalls != 1 {
+		t.Fatalf("handled/status/puts = %t/%d/%d, want true/OK/1", handled, status, putCalls)
+	}
+	if got := fh.appendLogLayoutAt(6, 7); got != client.ContentLayoutAppendLog {
+		t.Fatalf("layout = %q, want append_log", got)
+	}
+}
+
+func TestAppendLogGenericUnsupportedReroutesUnmatchedPhysicalAppendLayout(t *testing.T) {
+	var putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		putCalls++
+		body, _ := io.ReadAll(r.Body)
+		if got := string(body); got != "pretail" {
+			t.Errorf("full rewrite body = %q, want pretail", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	fs.appendLogMatcher = NewAppendLogMatcher([]string{"/configured/**"})
+	if fs.appendLogPathConfigured(fh.Path) {
+		t.Fatal("fixture path unexpectedly matches append-log policy")
+	}
+
+	fh.Lock()
+	handled, status := fs.routeAppendLogGenericUnsupportedLocked(
+		context.Background(),
+		fh,
+		fh.Path,
+		fh.DirtySeq,
+		&client.StatusError{StatusCode: http.StatusBadRequest, Code: client.AppendLogCodeUnsupported},
+	)
+	fh.Unlock()
+	if !handled || status != gofuse.OK || putCalls != 1 {
+		t.Fatalf("handled/status/puts = %t/%d/%d, want true/OK/1", handled, status, putCalls)
+	}
+	if got := fh.appendLogLayoutAt(6, 7); got != client.ContentLayoutAppendLog {
+		t.Fatalf("observed layout = %q, want append_log", got)
+	}
+}
+
+func TestAppendLogPathTruncateReusesSetAttrCommitLock(t *testing.T) {
+	fs, _, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+		case http.MethodPut:
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	ino := fs.inodes.Lookup("/db-wal", false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	unlock := fs.waitQueuedRemoteCommitBeforeWrite(entry.Path)
+	defer unlock()
+	type truncateResult struct {
+		handled bool
+		status  gofuse.Status
+	}
+	done := make(chan truncateResult, 1)
+	go func() {
+		handled, status := fs.tryAppendLogPathTruncate(context.Background(), entry, ino, 0, 0, nil)
+		done <- truncateResult{handled: handled, status: status}
+	}()
+	select {
+	case result := <-done:
+		if !result.handled || result.status != gofuse.OK {
+			t.Fatalf("truncate result = %+v, want handled/OK", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("append-log truncate attempted to reacquire SetAttr's path lock")
+	}
+}
+
+func TestAppendLogReleaseShadowSpillRoutesBeforeCommitQueue(t *testing.T) {
+	var appendCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		appendCalls++
+		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+	})
+	defer closeServer()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(fh.Path, []byte("pretail"), fh.BaseRev); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := NewCommitQueue(fs.client, shadow, pending, nil, 1, 8)
+	defer queue.DrainAll()
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = queue
+	fh.ShadowSpill = true
+	fh.ShadowReady = true
+	fh.ShadowCommitReady = true
+	fh.ShadowCommitSeq = fh.DirtySeq
+	handleID := fs.fileHandles.Allocate(fh)
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: handleID})
+	if appendCalls != 1 {
+		t.Fatalf("append calls = %d, want 1", appendCalls)
+	}
+}
+
+func TestAppendLogReleaseNonTailUsesConditionalFullPUT(t *testing.T) {
+	var appendCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			appendCalls++
+			w.WriteHeader(http.StatusInternalServerError)
+		case http.MethodPut:
+			putCalls++
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "rewrite" {
+				t.Errorf("release full rewrite body = %q, want rewrite", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, fh.BaseRev, fh.OrigSize)
+	handleID := fs.fileHandles.Allocate(fh)
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: handleID})
+	if appendCalls != 0 || putCalls != 1 {
+		t.Fatalf("append/put calls = %d/%d, want 0/1", appendCalls, putCalls)
+	}
+}
+
+func TestAppendLogEntryPointFlushUsesAppendRoutesBeforeGenericUpload(t *testing.T) {
+	var appendCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			appendCalls++
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+		case http.MethodPut:
+			putCalls++
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	})
+	defer closeServer()
+
+	fh.Lock()
+	status := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if status != 0 || appendCalls != 1 || putCalls != 0 {
+		t.Fatalf("status/append/put = %d/%d/%d, want OK/1/0", status, appendCalls, putCalls)
+	}
+}
+
+func TestAppendLogEntryPointFlushUsesFullPUTForNonTailWrite(t *testing.T) {
+	var appendCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			appendCalls++
+		case http.MethodPut:
+			putCalls++
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "rewrite" {
+				t.Errorf("full rewrite body = %q", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		case http.MethodHead:
+			t.Errorf("known append_log layout must not restat")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+
+	fh.Lock()
+	status := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if status != 0 || appendCalls != 0 || putCalls != 1 {
+		t.Fatalf("status/append/put = %d/%d/%d, want OK/0/1", status, appendCalls, putCalls)
+	}
+}
+
+func TestAppendLogWriteSyncWriteUsesAppendRoute(t *testing.T) {
+	var appendCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			appendCalls++
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "tailmore" {
+				t.Errorf("append body = %q, want tailmore", got)
+			}
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 11})
+		case http.MethodPut:
+			putCalls++
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	fh.WritePolicy = WritePolicyWriteSync
+	handleID := fs.fileHandles.Allocate(fh)
+
+	written, status := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: fh.Ino},
+		Fh:       handleID,
+		Offset:   uint64(fh.Dirty.Size()),
+	}, []byte("more"))
+	if status != gofuse.OK || written != 4 {
+		t.Fatalf("Write status/written = %d/%d, want OK/4", status, written)
+	}
+	if appendCalls != 1 || putCalls != 0 {
+		t.Fatalf("append/put calls = %d/%d, want 1/0", appendCalls, putCalls)
+	}
+}
+
+func TestAppendLogWriteSyncFailureRestoresMutationState(t *testing.T) {
+	var putCalls, appendCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putCalls++
+			if putCalls != 1 {
+				t.Errorf("conditional PUT calls = %d, want 1", putCalls)
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+		case http.MethodPost:
+			appendCalls++
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "tail" {
+				t.Errorf("append body = %q, want tail", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, []byte("pre")); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.DirtySeq = 0
+	fh.BaseRev = 5
+	fh.OrigSize = 3
+	fh.WritePolicy = WritePolicyWriteSync
+	fh.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 5, size: 3}
+	before := fh.appendLog
+	handleID := fs.fileHandles.Allocate(fh)
+	defer fs.fileHandles.Delete(handleID)
+
+	if written, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 0}, []byte("X")); written != 0 || status == gofuse.OK {
+		t.Fatalf("non-tail write = %d/%d, want 0/error", written, status)
+	}
+	if fh.appendLog != before {
+		t.Fatalf("append-log state after rollback = %+v, want %+v", fh.appendLog, before)
+	}
+	if got := string(fh.Dirty.Bytes()); got != "pre" || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		t.Fatalf("buffer after rollback = %q seq=%d dirty=%t, want pre/0/false", got, fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+
+	if written, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 3}, []byte("tail")); written != 4 || status != gofuse.OK {
+		t.Fatalf("tail write = %d/%d, want 4/OK", written, status)
+	}
+	if putCalls != 1 || appendCalls != 1 || fh.BaseRev != 6 || fh.OrigSize != 7 {
+		t.Fatalf("requests/handle = put=%d append=%d rev=%d size=%d", putCalls, appendCalls, fh.BaseRev, fh.OrigSize)
+	}
+}
+
+func TestAppendLogWriteSyncRollbackPreservesUnsupported(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": client.AppendLogCodeUnsupported, "code": client.AppendLogCodeUnsupported})
+		case http.MethodPut:
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, []byte("pre")); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.DirtySeq = 0
+	fh.BaseRev = 5
+	fh.OrigSize = 3
+	fh.WritePolicy = WritePolicyWriteSync
+	fh.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 5, size: 3}
+	before := fh.appendLog
+	handleID := fs.fileHandles.Allocate(fh)
+	defer fs.fileHandles.Delete(handleID)
+
+	if written, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 3}, []byte("tail")); written != 0 || status == gofuse.OK {
+		t.Fatalf("write = %d/%d, want 0/error", written, status)
+	}
+	want := before
+	want.unsupported = true
+	if fh.appendLog != want {
+		t.Fatalf("append-log state after unsupported rollback = %+v, want %+v", fh.appendLog, want)
+	}
+}
+
+func TestAppendLogWriteSyncErrorPreservesNewerConcurrentGeneration(t *testing.T) {
+	firstAppendStarted := make(chan struct{})
+	releaseFirstAppend := make(chan struct{})
+	var appendCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		appendCalls++
+		body, _ := io.ReadAll(r.Body)
+		switch appendCalls {
+		case 1:
+			if got := string(body); got != "one" {
+				t.Errorf("first append body = %q, want one", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			close(firstAppendStarted)
+			<-releaseFirstAppend
+			w.WriteHeader(http.StatusInternalServerError)
+		case 2:
+			if got := string(body); got != "onetwo" {
+				t.Errorf("second append body = %q, want onetwo", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 9})
+		default:
+			t.Errorf("append calls = %d, want 2", appendCalls)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, []byte("pre")); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.DirtySeq = 0
+	fh.BaseRev = 5
+	fh.OrigSize = 3
+	fh.WritePolicy = WritePolicyWriteSync
+	fh.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 5, size: 3}
+	handleID := fs.fileHandles.Allocate(fh)
+	defer fs.fileHandles.Delete(handleID)
+
+	firstDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 3}, []byte("one"))
+		firstDone <- status
+	}()
+	<-firstAppendStarted
+
+	secondDone := make(chan struct {
+		written uint32
+		status  gofuse.Status
+	}, 1)
+	go func() {
+		written, status := fs.Write(nil, &gofuse.WriteIn{Fh: handleID, Offset: 6}, []byte("two"))
+		secondDone <- struct {
+			written uint32
+			status  gofuse.Status
+		}{written, status}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for fh.TryLock() {
+		fh.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("concurrent write did not acquire the handle")
+		}
+		runtime.Gosched()
+	}
+	close(releaseFirstAppend)
+
+	if status := <-firstDone; status == gofuse.OK {
+		t.Fatal("first failed append write returned OK")
+	}
+	second := <-secondDone
+	if second.status != gofuse.OK || second.written != 3 {
+		t.Fatalf("second write = %d/%d, want 3/OK", second.written, second.status)
+	}
+	if appendCalls != 2 || fh.BaseRev != 6 || fh.OrigSize != 9 || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || string(fh.Dirty.Bytes()) != "preonetwo" {
+		t.Fatalf("newer generation was not preserved: calls=%d handle=%+v body=%q", appendCalls, fh, fh.Dirty.Bytes())
+	}
+}
+
+func TestAppendLogWriteSyncRollbackRestoresPriorDirtyGeneration(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer closeServer()
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, []byte("preone")); err != nil {
+		t.Fatal(err)
+	}
+	firstDirtySeq := fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+	fh.DirtySeq = firstDirtySeq
+	firstSnapshot := fh.Dirty.snapshot()
+
+	if _, err := fh.Dirty.Write(fh.Dirty.Size(), []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+	fs.restoreFailedWriteSyncLocked(fh, firstSnapshot, firstDirtySeq)
+	if got := string(fh.Dirty.Bytes()); got != "preone" || fh.DirtySeq != firstDirtySeq {
+		t.Fatalf("successor rollback = %q/%d, want preone/%d", got, fh.DirtySeq, firstDirtySeq)
+	}
+
+	preFirst := NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := preFirst.Write(0, []byte("pre")); err != nil {
+		t.Fatal(err)
+	}
+	preFirst.ClearDirty()
+	fs.restoreFailedWriteSyncLocked(fh, preFirst.snapshot(), 0)
+	if got := string(fh.Dirty.Bytes()); got != "pre" || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		t.Fatalf("earlier rollback = %q/%d/%t, want pre/0/false", got, fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+}
+
+func TestAppendLogEntryPointFsyncForcesRemoteAppendInInteractiveMode(t *testing.T) {
+	var appendCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		appendCalls++
+		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+	})
+	defer closeServer()
+	fs.syncMode = SyncInteractive
+	fs.perf = newFusePerfCounters(true)
+	handleID := fs.fileHandles.Allocate(fh)
+
+	if status := fs.Fsync(nil, &gofuse.FsyncIn{Fh: handleID}); status != 0 {
+		t.Fatalf("Fsync status = %d, want OK", status)
+	}
+	if appendCalls != 1 {
+		t.Fatalf("append calls = %d, want 1", appendCalls)
+	}
+	if got := fs.perf.snapshot().Counters["append_log_fsync_append_count"]; got != 1 {
+		t.Fatalf("append_log_fsync_append_count = %d, want 1", got)
+	}
+}
+
+func TestAppendLogEntryPointFsyncRecordsFullRewrite(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+	fs.perf = newFusePerfCounters(true)
+	handleID := fs.fileHandles.Allocate(fh)
+
+	if status := fs.Fsync(nil, &gofuse.FsyncIn{Fh: handleID}); status != gofuse.OK {
+		t.Fatalf("Fsync status = %d, want OK", status)
+	}
+	if got := fs.perf.snapshot().Counters["append_log_fsync_full_rewrite_count"]; got != 1 {
+		t.Fatalf("append_log_fsync_full_rewrite_count = %d, want 1", got)
+	}
+}
+
+func TestAppendLogUnsupportedFallbackUsesOneFullPUT(t *testing.T) {
+	var appendCalls, statCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			appendCalls++
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": client.AppendLogCodeUnsupported, "code": client.AppendLogCodeUnsupported})
+		case http.MethodHead:
+			statCalls++
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			putCalls++
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "pretail" {
+				t.Errorf("fallback full body = %q", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	})
+	defer closeServer()
+
+	fh.Lock()
+	status := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if status != 0 || appendCalls != 1 || statCalls != 1 || putCalls != 1 {
+		t.Fatalf("status/append/stat/put = %d/%d/%d/%d, want OK/1/1/1", status, appendCalls, statCalls, putCalls)
+	}
+	if !fh.appendLog.unsupported {
+		t.Fatal("unsupported append must suppress later tail attempts for this handle")
+	}
+}
+
+func TestAppendLogUnsupportedConcurrentWriteDoesNotFallbackFromNewerGeneration(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var appendCalls, headCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			appendCalls++
+			close(started)
+			<-release
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": client.AppendLogCodeUnsupported, "code": client.AppendLogCodeUnsupported})
+		case http.MethodHead:
+			headCalls++
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			putCalls++
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+
+	resultCh := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		resultCh <- fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+	}()
+	<-started
+
+	fh.Lock()
+	preWriteSize := fh.Dirty.Size()
+	if _, err := fh.Dirty.Write(preWriteSize, []byte("next")); err != nil {
+		fh.Unlock()
+		t.Fatalf("concurrent Write: %v", err)
+	}
+	fh.appendLogRecordUserWrite(preWriteSize, preWriteSize, 4)
+	fh.DirtySeq = 2
+	fh.Unlock()
+	close(release)
+
+	if status := <-resultCh; status != gofuse.EAGAIN {
+		t.Fatalf("flush status = %d, want EAGAIN", status)
+	}
+	if appendCalls != 1 || headCalls != 0 || putCalls != 0 {
+		t.Fatalf("append/head/put calls = %d/%d/%d, want 1/0/0", appendCalls, headCalls, putCalls)
+	}
+	if !fh.appendLog.unsupported || fh.DirtySeq != 2 || !fh.Dirty.HasDirtyParts() {
+		t.Fatalf("handle must retain newer dirty generation: %+v", fh)
+	}
+}
+
+func TestAppendLogFsyncUnsupportedFallbackRecordsFullRewrite(t *testing.T) {
+	var appendCalls, headCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			appendCalls++
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": client.AppendLogCodeUnsupported, "code": client.AppendLogCodeUnsupported})
+		case http.MethodHead:
+			headCalls++
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			putCalls++
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	fs.perf = newFusePerfCounters(true)
+	handleID := fs.fileHandles.Allocate(fh)
+
+	if status := fs.Fsync(nil, &gofuse.FsyncIn{Fh: handleID}); status != gofuse.OK {
+		t.Fatalf("Fsync status = %d, want OK", status)
+	}
+	if appendCalls != 1 || headCalls != 1 || putCalls != 1 {
+		t.Fatalf("append/head/put calls = %d/%d/%d, want 1/1/1", appendCalls, headCalls, putCalls)
+	}
+	snapshot := fs.perf.snapshot()
+	if got := snapshot.Counters["append_log_fsync_full_rewrite_count"]; got != 1 {
+		t.Fatalf("append_log_fsync_full_rewrite_count = %d, want 1", got)
+	}
+	if got := snapshot.Counters["append_log_fsync_append_count"]; got != 0 {
+		t.Fatalf("append_log_fsync_append_count = %d, want 0", got)
+	}
+}
+
+func TestAppendLogShadowSpillUnsupportedV2ReroutesOnceToFullPUT(t *testing.T) {
+	var initiateCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			initiateCalls++
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": client.AppendLogCodeUnsupported, "code": client.AppendLogCodeUnsupported})
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/db-wal":
+			putCalls++
+			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
+				t.Errorf("expected revision = %q, want 5", got)
+			}
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "pretail" {
+				t.Errorf("full rewrite body = %q, want pretail", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(fh.Path, []byte("pretail"), fh.BaseRev); err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fh.ShadowSpill = true
+	fh.ShadowReady = true
+	fh.appendLogObserveLayout(client.ContentLayoutSingle, fh.BaseRev, fh.OrigSize)
+
+	fh.Lock()
+	status := fs.syncHandleToRemoteLocked(context.Background(), fh)
+	fh.Unlock()
+	if status != gofuse.OK {
+		t.Fatalf("sync status = %d, want OK", status)
+	}
+	if initiateCalls != 1 || putCalls != 1 {
+		t.Fatalf("initiate/put calls = %d/%d, want 1/1", initiateCalls, putCalls)
+	}
+}
+
+func TestAppendLogCreateAndOpenDoNotAttachGenericStreamer(t *testing.T) {
+	t.Run("capability enabled create", func(t *testing.T) {
+		fs, _, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		})
+		defer closeServer()
+
+		var out gofuse.CreateOut
+		if status := fs.Create(nil, &gofuse.CreateIn{
+			InHeader: gofuse.InHeader{NodeId: 1},
+			Flags:    uint32(syscall.O_RDWR),
+		}, "db-wal", &out); status != gofuse.OK {
+			t.Fatalf("Create status = %d, want OK", status)
+		}
+		fh, ok := fs.fileHandles.Get(out.Fh)
+		if !ok {
+			t.Fatal("created handle is missing")
+		}
+		if fh.Streamer != nil {
+			t.Fatal("configured append-log create must not attach a generic streamer")
+		}
+	})
+
+	for _, capability := range []bool{false, true} {
+		t.Run("existing open", func(t *testing.T) {
+			fs, fh, closeServer := newAppendLogEngineFixture(t, capability, func(w http.ResponseWriter, r *http.Request) {
+				t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				w.WriteHeader(http.StatusInternalServerError)
+			})
+			defer closeServer()
+			ino := fs.inodes.Lookup(fh.Path, false, fh.OrigSize, time.Now())
+			fs.inodes.UpdateRevision(ino, fh.BaseRev)
+			fs.readCache.Put(fh.Path, []byte("pre"), fh.BaseRev)
+
+			var out gofuse.OpenOut
+			if status := fs.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Flags:    uint32(syscall.O_RDWR),
+			}, &out); status != gofuse.OK {
+				t.Fatalf("Open status = %d, want OK", status)
+			}
+			opened, ok := fs.fileHandles.Get(out.Fh)
+			if !ok {
+				t.Fatal("opened handle is missing")
+			}
+			if opened.Streamer != nil {
+				t.Fatal("configured append-log open must not attach a generic streamer")
+			}
+		})
+	}
+}
+
+func TestAppendLogUnsupportedSingleFallsBackToGenericRewrite(t *testing.T) {
+	var appendCalls, statCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			appendCalls++
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": client.AppendLogCodeUnsupported, "code": client.AppendLogCodeUnsupported})
+		case http.MethodHead:
+			statCalls++
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutSingle))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			putCalls++
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "pretail" {
+				t.Errorf("generic rewrite body = %q", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	})
+	defer closeServer()
+	fs.client.SetSmallFileThresholdForTests(100)
+	fs.perf = newFusePerfCounters(true)
+
+	fh.Lock()
+	status := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if status != gofuse.OK || appendCalls != 1 || statCalls != 1 || putCalls != 1 {
+		t.Fatalf("status/append/stat/put = %d/%d/%d/%d, want OK/1/1/1", status, appendCalls, statCalls, putCalls)
+	}
+	if !fh.appendLog.unsupported {
+		t.Fatal("single fallback must suppress further append attempts on this handle")
+	}
+	if got := fs.perf.snapshot().Counters["append_log_full_rewrite_count"]; got != 1 {
+		t.Fatalf("append_log_full_rewrite_count = %d, want 1", got)
+	}
+}
+
+func TestAppendLogSingleLayoutSelectionDoesNotPrecountGenericTransport(t *testing.T) {
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutSingle, fh.BaseRev, fh.OrigSize)
+	fs.perf = newFusePerfCounters(true)
+
+	fh.Lock()
+	handled, status, _ := fs.routeAppendLogLocked(context.Background(), fh)
+	fh.Unlock()
+	if handled || status != gofuse.OK {
+		t.Fatalf("handled/status = %t/%d, want false/OK", handled, status)
+	}
+	if got := fs.perf.snapshot().Counters["append_log_full_rewrite_count"]; got != 0 {
+		t.Fatalf("append_log_full_rewrite_count = %d before generic transport, want 0", got)
+	}
+}
+
+func TestAppendLogSingleGenericPatchDoesNotCountFullRewrite(t *testing.T) {
+	var patchCalls, uploadCalls, completeCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs/db-wal":
+			patchCalls++
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(client.PatchPlan{
+				UploadID: "patch-1",
+				PartSize: 1024,
+				UploadParts: []*client.PatchPartURL{{
+					Number: 1,
+					URL:    "http://" + r.Host + "/upload/1",
+					Size:   3,
+				}},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/upload/1":
+			uploadCalls++
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "new" {
+				t.Errorf("patch body = %q, want new", got)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/patch-1/complete":
+			completeCalls++
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "new")
+	fh.appendLogObserveLayout(client.ContentLayoutSingle, fh.BaseRev, fh.OrigSize)
+	fs.client.SetSmallFileThresholdForTests(1)
+	fs.perf = newFusePerfCounters(true)
+
+	fh.Lock()
+	status := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if status != gofuse.OK {
+		t.Fatalf("flush status = %d, want OK", status)
+	}
+	if patchCalls != 1 || uploadCalls != 1 || completeCalls != 1 {
+		t.Fatalf("patch/upload/complete calls = %d/%d/%d, want 1/1/1", patchCalls, uploadCalls, completeCalls)
+	}
+	if got := fs.perf.snapshot().Counters["append_log_full_rewrite_count"]; got != 0 {
+		t.Fatalf("append_log_full_rewrite_count = %d after PATCH, want 0", got)
+	}
+}
+
+func TestAppendLogGenericPatchUnsupportedReroutesOnceToFullPUT(t *testing.T) {
+	var patchCalls, fullPutCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs/db-wal":
+			patchCalls++
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": client.AppendLogCodeUnsupported, "code": client.AppendLogCodeUnsupported})
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/db-wal":
+			fullPutCalls++
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "new" {
+				t.Errorf("full rewrite body = %q, want new", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "new")
+	fh.appendLogObserveLayout(client.ContentLayoutSingle, fh.BaseRev, fh.OrigSize)
+	fs.client.SetSmallFileThresholdForTests(1)
+
+	fh.Lock()
+	status := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if status != gofuse.OK {
+		t.Fatalf("flush status = %d, want OK", status)
+	}
+	if patchCalls != 1 || fullPutCalls != 1 {
+		t.Fatalf("patch/full PUT calls = %d/%d, want 1/1", patchCalls, fullPutCalls)
+	}
+}
+
+func TestAppendLogGenericDirectPUTUnsupportedReroutesOnceToFullPUT(t *testing.T) {
+	var putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/v1/fs/db-wal" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		putCalls++
+		body, _ := io.ReadAll(r.Body)
+		if got := string(body); got != "pretail" {
+			t.Errorf("PUT %d body = %q, want pretail", putCalls, got)
+		}
+		if putCalls == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": client.AppendLogCodeUnsupported, "code": client.AppendLogCodeUnsupported})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	fh.appendLogObserveLayout(client.ContentLayoutSingle, fh.BaseRev, fh.OrigSize)
+	fs.client.SetSmallFileThresholdForTests(100)
+
+	fh.Lock()
+	status := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if status != gofuse.OK {
+		t.Fatalf("flush status = %d, want OK", status)
+	}
+	if putCalls != 2 {
+		t.Fatalf("direct/full PUT calls = %d, want 2", putCalls)
+	}
+}
+
+func TestAppendLogLegacyUploadPlanUnsupportedReroutesOnceToFullPUT(t *testing.T) {
+	var v2Calls, v1Calls, legacyPlanCalls, fullPutCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			v2Calls++
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/initiate":
+			v1Calls++
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/db-wal" && r.ContentLength == 0:
+			legacyPlanCalls++
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": client.AppendLogCodeUnsupported, "code": client.AppendLogCodeUnsupported})
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/db-wal":
+			fullPutCalls++
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "rewrite" {
+				t.Errorf("full rewrite body = %q, want rewrite", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutSingle, fh.BaseRev, fh.OrigSize)
+	fs.client.SetSmallFileThresholdForTests(1)
+
+	fh.Lock()
+	status := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if status != gofuse.OK {
+		t.Fatalf("flush status = %d, want OK", status)
+	}
+	if v2Calls != 1 || v1Calls != 1 || legacyPlanCalls != 1 || fullPutCalls != 1 {
+		t.Fatalf("v2/v1/legacy/full calls = %d/%d/%d/%d, want 1/1/1/1", v2Calls, v1Calls, legacyPlanCalls, fullPutCalls)
+	}
+}
+
+func TestAppendLogCapabilityChangeStillFullRewritesKnownAppendLayout(t *testing.T) {
+	var putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		putCalls++
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+
+	fh.Lock()
+	status := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if status != 0 || putCalls != 1 {
+		t.Fatalf("status/put = %d/%d, want OK/1", status, putCalls)
+	}
+}
+
+func TestAppendLogCapabilityDisabledPureTailFsyncUsesConditionalFullPUT(t *testing.T) {
+	var putCalls, unexpectedCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.RawQuery != "" {
+			unexpectedCalls++
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		putCalls++
+		if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "5" {
+			t.Errorf("expected revision = %q, want 5", got)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if got := string(body); got != "pretail" {
+			t.Errorf("full rewrite body = %q, want pretail", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	fs.client.SetSmallFileThresholdForTests(1)
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, fh.BaseRev, fh.OrigSize)
+	fs.perf = newFusePerfCounters(true)
+	handleID := fs.fileHandles.Allocate(fh)
+
+	if status := fs.Fsync(nil, &gofuse.FsyncIn{Fh: handleID}); status != gofuse.OK {
+		t.Fatalf("Fsync status = %d, want OK", status)
+	}
+	if putCalls != 1 || unexpectedCalls != 0 {
+		t.Fatalf("conditional PUT/unexpected calls = %d/%d, want 1/0", putCalls, unexpectedCalls)
+	}
+	snapshot := fs.perf.snapshot()
+	if got := snapshot.Counters["append_log_fsync_full_rewrite_count"]; got != 1 {
+		t.Fatalf("append_log_fsync_full_rewrite_count = %d, want 1", got)
+	}
+	if got := snapshot.Counters["append_log_fsync_append_count"]; got != 0 {
+		t.Fatalf("append_log_fsync_append_count = %d, want 0", got)
+	}
+}
+
+func TestAppendLogSameHandleConcurrentFullRewriteUsesCommittedGeneration(t *testing.T) {
+	firstRewriteStarted := make(chan struct{})
+	allowFirstRewrite := make(chan struct{})
+	var putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("request = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		putCalls++
+		if putCalls == 1 {
+			close(firstRewriteStarted)
+			<-allowFirstRewrite
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+			return
+		}
+		w.WriteHeader(http.StatusConflict)
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, fh.BaseRev, fh.OrigSize)
+
+	firstDone := make(chan appendLogAttemptResult, 1)
+	go func() {
+		fh.Lock()
+		result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+		fh.Unlock()
+		firstDone <- result
+	}()
+	select {
+	case <-firstRewriteStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first full rewrite did not reach the server")
+	}
+
+	secondDone := make(chan appendLogAttemptResult, 1)
+	go func() {
+		fh.Lock()
+		result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+		fh.Unlock()
+		secondDone <- result
+	}()
+	deadline := time.Now().Add(time.Second)
+	for fh.TryLock() {
+		fh.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("second full rewrite did not reach the path-lock wait")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(allowFirstRewrite)
+
+	select {
+	case result := <-firstDone:
+		if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+			t.Fatalf("first result = %+v, want committed/OK", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first full rewrite did not finish")
+	}
+	select {
+	case result := <-secondDone:
+		if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+			t.Fatalf("second result = %+v, want committed/OK", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second full rewrite did not finish")
+	}
+	if putCalls != 1 {
+		t.Fatalf("conditional PUT calls = %d, want 1", putCalls)
+	}
+}
+
+func TestAppendLogFullRewriteConcurrentMutationPreservesNewerDirtyGeneration(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		<-release
+		body, _ := io.ReadAll(r.Body)
+		if got := string(body); got != "rewrite" {
+			t.Errorf("full rewrite body = %q, want rewrite", got)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 5, 3)
+	fh.Ino = fs.inodes.Lookup(fh.Path, false, fh.OrigSize, time.Now())
+	fs.dirCache.Put("/", []CachedFileInfo{{Name: "db-wal", Size: fh.OrigSize, Revision: fh.BaseRev}})
+	// A preceding truncate pins the conditional-PUT baseline. The upload below
+	// races a subsequent dirty generation, so its successful revision must
+	// become the next rewrite's pinned baseline rather than the stale revision.
+	fh.appendLogRecordTruncate()
+
+	resultCh := make(chan appendLogAttemptResult, 1)
+	go func() {
+		fh.Lock()
+		result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+		fh.Unlock()
+		resultCh <- result
+	}()
+	<-started
+
+	fh.Lock()
+	preWriteSize := fh.Dirty.Size()
+	if _, err := fh.Dirty.Write(preWriteSize, []byte("next")); err != nil {
+		fh.Unlock()
+		t.Fatalf("concurrent Write: %v", err)
+	}
+	fh.appendLogRecordUserWrite(preWriteSize, preWriteSize, 4)
+	fh.DirtySeq = 2
+	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
+	fs.cacheFileForPath(fh.Path, fh.Dirty.Size(), time.Now(), fh.BaseRev)
+	fh.Unlock()
+	close(release)
+
+	result := <-resultCh
+	if result.route != appendLogRouteCommitted || result.status != 0 {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if fh.BaseRev != 6 || fh.OrigSize != int64(len("rewrite")) || fh.DirtySeq != 2 || !fh.Dirty.HasDirtyParts() {
+		t.Fatalf("handle after concurrent full rewrite = %+v", fh)
+	}
+	if got := fh.appendLogLayoutAt(6, int64(len("rewrite"))); got != client.ContentLayoutAppendLog {
+		t.Fatalf("layout = %q, want append_log", got)
+	}
+	if revision, size := fh.appendLogCommittedBaseline(); revision != 6 || size != int64(len("rewrite")) {
+		t.Fatalf("next rewrite baseline = %d/%d, want 6/%d", revision, size, len("rewrite"))
+	}
+	if entry, ok := fs.inodes.GetEntry(fh.Ino); !ok || entry.Size != int64(len("rewritenext")) {
+		t.Fatalf("inode size after concurrent rewrite = %+v/%t, want %d", entry, ok, len("rewritenext"))
+	}
+	if cached := fs.dirCache.Lookup("/", "db-wal"); cached.kind != namespaceLookupPositive || cached.item.Size != int64(len("rewritenext")) {
+		t.Fatalf("dir cache after concurrent rewrite = %+v, want live size %d", cached, len("rewritenext"))
+	}
+}
+
+func TestAppendLogFullRewriteConcurrentWALKeepsLiveHeaderFence(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	headerBytes := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2)
+	image := append(append([]byte(nil), headerBytes...), bytes.Repeat([]byte("p"), 32)...)
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			close(started)
+			return
+		}
+		close(started)
+		<-release
+		body, _ := io.ReadAll(r.Body)
+		if !bytes.Equal(body, image) {
+			t.Errorf("full rewrite body = %x, want %x", body, image)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+	})
+	defer closeServer()
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, image); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = 1
+	fh.IsNew = false
+	fh.OrigSize = int64(len(image))
+	fh.BaseRev = 5
+	fh.appendLog = appendLogHandleState{
+		initialized: true,
+		appendSafe:  false,
+		layout:      client.ContentLayoutAppendLog,
+		revision:    5,
+		size:        int64(len(image)),
+	}
+
+	resultCh := make(chan appendLogAttemptResult, 1)
+	go func() {
+		fh.Lock()
+		result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+		fh.Unlock()
+		resultCh <- result
+	}()
+	<-started
+
+	fh.Lock()
+	if _, err := fh.Dirty.Write(sqliteWALHeaderSize+24, []byte("frame")); err != nil {
+		fh.Unlock()
+		t.Fatal(err)
+	}
+	fh.appendLogRecordUserWrite(int64(len(image)), sqliteWALHeaderSize+24, int64(len("frame")))
+	fh.DirtySeq = 2
+	fh.Unlock()
+	close(release)
+
+	result := <-resultCh
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed", result)
+	}
+	if !fh.appendLog.sqliteWALWriteBeyondHeader {
+		t.Fatal("concurrent WAL frame write lost its header-only reset fence")
+	}
+	if fh.DirtySeq != 2 || !fh.Dirty.HasDirtyParts() {
+		t.Fatalf("concurrent dirty generation = seq %d dirty %t, want 2/true", fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+}
+
+func setAppendLogRewriteDirty(t *testing.T, fh *FileHandle, body string) {
+	t.Helper()
+	dirty := NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := dirty.Write(0, []byte(body)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	fh.Dirty = dirty
+	fh.DirtySeq = 1
+	fh.IsNew = false
+	fh.OrigSize = 3
+	fh.BaseRev = 5
+	fh.appendLog = appendLogHandleState{}
+	fh.appendLogRecordUserWrite(3, 0, 1)
+}

@@ -76,16 +76,29 @@ const (
 	perfRemoteRead
 	perfRemoteWrite
 	perfRemoteMutation
+	perfRemoteAppendLog
 	perfRemoteOpCount
 )
 
 var perfRemoteOpNames = [...]string{
-	perfRemoteStat:     "stat",
-	perfRemoteList:     "list",
-	perfRemoteRead:     "read",
-	perfRemoteWrite:    "write",
-	perfRemoteMutation: "mutation",
+	perfRemoteStat:      "stat",
+	perfRemoteList:      "list",
+	perfRemoteRead:      "read",
+	perfRemoteWrite:     "write",
+	perfRemoteMutation:  "mutation",
+	perfRemoteAppendLog: "append_log",
 }
+
+type appendLogPerfOutcome uint8
+
+const (
+	appendLogPerfOutcomeSuccess appendLogPerfOutcome = iota
+	appendLogPerfOutcomeRebased
+	appendLogPerfOutcomeConflict
+	appendLogPerfOutcomeUnsupported
+	appendLogPerfOutcomeTooLarge
+	appendLogPerfOutcomeError
+)
 
 type perfOpStats struct {
 	count   uint64
@@ -159,6 +172,26 @@ type fusePerfCounters struct {
 	snapshotWBDatWriteMaxNS    atomicUint64
 	snapshotWBMetaWriteTotalNS atomicUint64
 	snapshotWBMetaWriteMaxNS   atomicUint64
+
+	appendLogOutcomeSuccess                atomicUint64
+	appendLogOutcomeRebased                atomicUint64
+	appendLogOutcomeConflict               atomicUint64
+	appendLogOutcomeUnsupported            atomicUint64
+	appendLogOutcomeTooLarge               atomicUint64
+	appendLogOutcomeError                  atomicUint64
+	appendLogFullRewriteCount              atomicUint64
+	appendLogFullRewriteBytes              atomicUint64
+	appendLogGenerationResetCount          atomicUint64
+	appendLogGenerationResetBytes          atomicUint64
+	appendLogGenerationResetShadowReady    atomicUint64
+	appendLogGenerationResetShadowDegraded atomicUint64
+	appendLogRebaseRetryCount              atomicUint64
+	appendLogFsyncAppendCount              atomicUint64
+	appendLogFsyncAppendTotalNS            atomicUint64
+	appendLogFsyncAppendMaxNS              atomicUint64
+	appendLogFsyncRewriteCount             atomicUint64
+	appendLogFsyncRewriteTotalNS           atomicUint64
+	appendLogFsyncRewriteMaxNS             atomicUint64
 
 	sseChange       atomicUint64
 	sseReset        atomicUint64
@@ -308,6 +341,76 @@ func (p *fusePerfCounters) recordFlushSnapshotWB(dur time.Duration) {
 	p.flushSnapshotWBCount.add(1)
 	p.flushSnapshotWBTotalNS.add(ns)
 	p.flushSnapshotWBMaxNS.max(ns)
+}
+
+func (p *fusePerfCounters) recordAppendLogOutcome(outcome appendLogPerfOutcome) {
+	if !p.isEnabled() {
+		return
+	}
+	switch outcome {
+	case appendLogPerfOutcomeSuccess:
+		p.appendLogOutcomeSuccess.add(1)
+	case appendLogPerfOutcomeRebased:
+		p.appendLogOutcomeRebased.add(1)
+	case appendLogPerfOutcomeConflict:
+		p.appendLogOutcomeConflict.add(1)
+	case appendLogPerfOutcomeUnsupported:
+		p.appendLogOutcomeUnsupported.add(1)
+	case appendLogPerfOutcomeTooLarge:
+		p.appendLogOutcomeTooLarge.add(1)
+	default:
+		p.appendLogOutcomeError.add(1)
+	}
+}
+
+func (p *fusePerfCounters) recordAppendLogFullRewrite(bytes uint64) {
+	if !p.isEnabled() {
+		return
+	}
+	p.appendLogFullRewriteCount.add(1)
+	p.appendLogFullRewriteBytes.add(bytes)
+}
+
+func (p *fusePerfCounters) recordAppendLogGenerationReset(bytes uint64) {
+	if !p.isEnabled() {
+		return
+	}
+	p.appendLogGenerationResetCount.add(1)
+	p.appendLogGenerationResetBytes.add(bytes)
+}
+
+func (p *fusePerfCounters) recordAppendLogGenerationResetShadowReady() {
+	if p.isEnabled() {
+		p.appendLogGenerationResetShadowReady.add(1)
+	}
+}
+
+func (p *fusePerfCounters) recordAppendLogGenerationResetShadowDegraded() {
+	if p.isEnabled() {
+		p.appendLogGenerationResetShadowDegraded.add(1)
+	}
+}
+
+func (p *fusePerfCounters) recordAppendLogRebaseRetry() {
+	if p.isEnabled() {
+		p.appendLogRebaseRetryCount.add(1)
+	}
+}
+
+func (p *fusePerfCounters) recordAppendLogFsync(fullRewrite bool, dur time.Duration) {
+	if !p.isEnabled() {
+		return
+	}
+	ns := uint64(dur)
+	if fullRewrite {
+		p.appendLogFsyncRewriteCount.add(1)
+		p.appendLogFsyncRewriteTotalNS.add(ns)
+		p.appendLogFsyncRewriteMaxNS.max(ns)
+		return
+	}
+	p.appendLogFsyncAppendCount.add(1)
+	p.appendLogFsyncAppendTotalNS.add(ns)
+	p.appendLogFsyncAppendMaxNS.max(ns)
 }
 
 func (p *fusePerfCounters) recordSnapshotWBSubPhases(bytesViewDur time.Duration, wbTimings WriteBackPutTimings) {
@@ -475,6 +578,25 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	snap.Counters["snapshot_wb_dat_write_max_ns"] = p.snapshotWBDatWriteMaxNS.load()
 	snap.Counters["snapshot_wb_meta_write_total_ns"] = p.snapshotWBMetaWriteTotalNS.load()
 	snap.Counters["snapshot_wb_meta_write_max_ns"] = p.snapshotWBMetaWriteMaxNS.load()
+	snap.Counters["append_log_outcome_success"] = p.appendLogOutcomeSuccess.load()
+	snap.Counters["append_log_outcome_rebased"] = p.appendLogOutcomeRebased.load()
+	snap.Counters["append_log_outcome_conflict"] = p.appendLogOutcomeConflict.load()
+	snap.Counters["append_log_outcome_unsupported"] = p.appendLogOutcomeUnsupported.load()
+	snap.Counters["append_log_outcome_too_large"] = p.appendLogOutcomeTooLarge.load()
+	snap.Counters["append_log_outcome_error"] = p.appendLogOutcomeError.load()
+	snap.Counters["append_log_full_rewrite_count"] = p.appendLogFullRewriteCount.load()
+	snap.Counters["append_log_full_rewrite_bytes"] = p.appendLogFullRewriteBytes.load()
+	snap.Counters["append_log_generation_reset_count"] = p.appendLogGenerationResetCount.load()
+	snap.Counters["append_log_generation_reset_bytes"] = p.appendLogGenerationResetBytes.load()
+	snap.Counters["append_log_generation_reset_shadow_ready"] = p.appendLogGenerationResetShadowReady.load()
+	snap.Counters["append_log_generation_reset_shadow_degraded"] = p.appendLogGenerationResetShadowDegraded.load()
+	snap.Counters["append_log_rebase_retry_count"] = p.appendLogRebaseRetryCount.load()
+	snap.Counters["append_log_fsync_append_count"] = p.appendLogFsyncAppendCount.load()
+	snap.Counters["append_log_fsync_append_total_ns"] = p.appendLogFsyncAppendTotalNS.load()
+	snap.Counters["append_log_fsync_append_max_ns"] = p.appendLogFsyncAppendMaxNS.load()
+	snap.Counters["append_log_fsync_full_rewrite_count"] = p.appendLogFsyncRewriteCount.load()
+	snap.Counters["append_log_fsync_full_rewrite_total_ns"] = p.appendLogFsyncRewriteTotalNS.load()
+	snap.Counters["append_log_fsync_full_rewrite_max_ns"] = p.appendLogFsyncRewriteMaxNS.load()
 	snap.Counters["sse_change"] = p.sseChange.load()
 	snap.Counters["sse_reset"] = p.sseReset.load()
 	snap.Counters["sse_self_filtered"] = p.sseSelfFiltered.load()
@@ -555,6 +677,14 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 		snap.Counters["uploader_submit"], snap.Counters["uploader_sync_fallback"],
 		snap.Counters["uploader_success"], snap.Counters["uploader_failure"],
 		snap.Counters["uploader_drain_count"], time.Duration(snap.Counters["uploader_drain_total_ns"]).Truncate(time.Millisecond))
+	writePerfLine(w, "drive9: perf append_log success=%d rebased=%d conflict=%d unsupported=%d too_large=%d error=%d full_rewrite_count=%d full_rewrite_bytes=%d generation_reset_count=%d generation_reset_bytes=%d generation_reset_shadow_ready=%d generation_reset_shadow_degraded=%d rebase_retry_count=%d\n",
+		snap.Counters["append_log_outcome_success"], snap.Counters["append_log_outcome_rebased"],
+		snap.Counters["append_log_outcome_conflict"], snap.Counters["append_log_outcome_unsupported"],
+		snap.Counters["append_log_outcome_too_large"], snap.Counters["append_log_outcome_error"],
+		snap.Counters["append_log_full_rewrite_count"], snap.Counters["append_log_full_rewrite_bytes"],
+		snap.Counters["append_log_generation_reset_count"], snap.Counters["append_log_generation_reset_bytes"],
+		snap.Counters["append_log_generation_reset_shadow_ready"], snap.Counters["append_log_generation_reset_shadow_degraded"],
+		snap.Counters["append_log_rebase_retry_count"])
 	writePerfLine(w, "drive9: perf sse change=%d reset=%d self_filtered=%d notify_entry=%d notify_inode=%d\n",
 		snap.Counters["sse_change"], snap.Counters["sse_reset"], snap.Counters["sse_self_filtered"],
 		snap.Counters["notify_entry"], snap.Counters["notify_inode"])

@@ -129,6 +129,18 @@ func ExampleClient_transfersAppendPatchAndStreaming() {
 	body := []byte("payload")
 	reader := bytes.NewReader(body)
 
+	// Warm negotiates server capabilities once. AppendLog is available only
+	// when the cached append_log_v1 capability is true.
+	c.Warm(ctx)
+	if c.CachedAppendLogSupported() {
+		tail := []byte("tail")
+		_, _ = c.AppendLog(ctx, "/uploads/db-wal", bytes.NewReader(tail), int64(len(tail)), 12, int64(len(body)))
+	}
+
+	// This uses one server-proxied conditional PUT and never selects a
+	// client multipart/direct-upload plan.
+	_, _ = c.WriteServerStreamConditional(ctx, "/uploads/append-log-rewrite", bytes.NewReader(body), int64(len(body)), 12)
+
 	_ = c.WriteStream(ctx, "/uploads/payload.bin", bytes.NewReader(body), int64(len(body)), nil)
 	_ = c.WriteStreamWithTags(ctx, "/uploads/tagged.bin", bytes.NewReader(body), int64(len(body)), nil, map[string]string{"kind": "artifact"})
 	_, _ = c.WriteStreamWithSummary(
@@ -668,12 +680,14 @@ var coveredClientMethods = map[string]bool{
 	"AdminUpdateTenantPool":                true,
 	"AppendJournalEntries":                 true,
 	"AppendStream":                         true,
+	"AppendLog":                            true,
 	"APIKey":                               true,
 	"ArchiveDir":                           true,
 	"BaseURL":                              true,
 	"BatchReadSmallCtx":                    true,
 	"BatchStatCtx":                         true,
 	"BatchWriteCtx":                        true,
+	"CachedAppendLogSupported":             true,
 	"CachedSmallFileThreshold":             true,
 	"CheckpointFSLayer":                    true,
 	"Chmod":                                true,
@@ -810,6 +824,7 @@ var coveredClientMethods = map[string]bool{
 	"WriteCtxConditionalWithRevision":      true,
 	"WriteCtxConditionalWithTags":          true,
 	"WriteMultipartStreamConditional":      true,
+	"WriteServerStreamConditional":         true,
 	"WriteStream":                          true,
 	"WriteStreamConditional":               true,
 	"WriteStreamWithSummary":               true,

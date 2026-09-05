@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -91,7 +92,7 @@ func TestShadowStorePartialWrite(t *testing.T) {
 
 func TestShadowStoreRemove(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +179,7 @@ func TestShadowStoreCheckDiskSpace(t *testing.T) {
 
 func TestShadowStorePinUnpinRemove(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,9 +235,51 @@ func TestShadowStorePinUnpinRemove(t *testing.T) {
 	}
 }
 
+func TestShadowStoreFinalUnpinWaitsForRetiredRename(t *testing.T) {
+	ss, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	if err := ss.WriteFull("/retire-race", []byte("shadow"), 1); err != nil {
+		t.Fatal(err)
+	}
+	gen := ss.Pin("/retire-race")
+	pl := ss.acquirePathLock("/retire-race")
+	ss.mu.Lock()
+	cleanup, ok := ss.removeCoreLocked("/retire-race", 0)
+	ss.mu.Unlock()
+	if !ok || !cleanup.retire {
+		ss.releasePathLock("/retire-race", pl)
+		t.Fatal("fixture did not retire pinned shadow")
+	}
+
+	unpinDone := make(chan struct{})
+	go func() {
+		ss.Unpin(gen)
+		close(unpinDone)
+	}()
+	select {
+	case <-unpinDone:
+		ss.releasePathLock("/retire-race", pl)
+		t.Fatal("final unpin completed before retired shadow rename")
+	case <-time.After(20 * time.Millisecond):
+	}
+	ss.runRemoveCleanup(cleanup)
+	ss.releasePathLock("/retire-race", pl)
+	select {
+	case <-unpinDone:
+	case <-time.After(time.Second):
+		t.Fatal("final unpin remained blocked after retired shadow rename")
+	}
+	if _, err := os.Stat(cleanup.retiredPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired shadow stat = %v, want not exist", err)
+	}
+}
+
 func TestShadowStorePinMultipleReaders(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +311,7 @@ func TestShadowStorePinMultipleReaders(t *testing.T) {
 
 func TestShadowStoreRemoveWithoutPin(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +431,7 @@ func TestShadowStoreRenameFailureRollbackPinState(t *testing.T) {
 
 func TestShadowStorePinIfExists(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +465,7 @@ func TestShadowStorePinIfExists(t *testing.T) {
 
 func TestShadowStoreRemovePreventsPin(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +490,7 @@ func TestShadowStoreRemovePreventsPin(t *testing.T) {
 // does not affect the new shadow.
 func TestShadowStoreRetireAllowsNewWriter(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +593,7 @@ func TestShadowStoreUnpinZeroNoop(t *testing.T) {
 // crash/restart recovery where pending shadows exist on disk only).
 func TestShadowStorePinIfExistsDiskOnly(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -596,7 +639,7 @@ func TestShadowStorePinIfExistsDiskOnly(t *testing.T) {
 // scenario where commit queue uploads a disk-only shadow and then calls Remove.
 func TestShadowStoreRemoveDiskOnly(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1379,7 +1422,7 @@ func TestFreeRatioIndependentOfByteQuota(t *testing.T) {
 // so the newer shadow survives.
 func TestShadowStoreRemoveIfGenerationRaceStaleVsNewerWrite(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1468,7 +1511,7 @@ func TestShadowStoreEnsureActiveGenerationKeepsExistingBaseRevision(t *testing.T
 // replacement's fresh shadow after the in-memory generation check passed.
 func TestShadowStoreRemoveIfGenerationWriteFullRaceConsistency(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

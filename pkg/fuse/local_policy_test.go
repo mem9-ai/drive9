@@ -141,6 +141,42 @@ func TestLocalPolicyRuntimePathWhitespaceIsNotTrimmedIntoMatch(t *testing.T) {
 	}
 }
 
+func TestAppendLogPolicyUsesCanonicalPathfilterSemantics(t *testing.T) {
+	matcher := NewAppendLogMatcher([]string{"**/wal/**", "logs/current"})
+
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "/repo/wal", want: true},
+		{path: "/repo/wal/0001", want: true},
+		{path: "/logs/current", want: true},
+		{path: "/logs/current/child", want: false},
+		{path: "/repo/wal ", want: false},
+		{path: `repo\\wal\\0001`, want: false},
+	}
+	for _, test := range tests {
+		if got := matcher.Matches(test.path); got != test.want {
+			t.Errorf("Matches(%q) = %t, want %t", test.path, got, test.want)
+		}
+	}
+
+	if NewAppendLogMatcher(nil).Matches("/repo/wal/0001") {
+		t.Fatal("empty append-log pattern list must be disabled")
+	}
+}
+
+func TestAppendLogPolicyDoesNotChangeLocalPolicyClassification(t *testing.T) {
+	local := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
+	appendLog := NewAppendLogMatcher([]string{"**/tmp/**"})
+	if !appendLog.Matches("/repo/tmp/wal") {
+		t.Fatal("append-log matcher should recognize configured path")
+	}
+	if got := local.Classify("/repo/tmp/wal"); got != PathLayerLocalOnly {
+		t.Fatalf("local policy classification = %s, want local-only", got)
+	}
+}
+
 func TestSQLiteWALIndexPathMatching(t *testing.T) {
 	tests := []struct {
 		path string
