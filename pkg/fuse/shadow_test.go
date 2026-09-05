@@ -91,7 +91,7 @@ func TestShadowStorePartialWrite(t *testing.T) {
 
 func TestShadowStoreRemove(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestShadowStoreCheckDiskSpace(t *testing.T) {
 
 func TestShadowStorePinUnpinRemove(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestShadowStorePinUnpinRemove(t *testing.T) {
 
 func TestShadowStorePinMultipleReaders(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestShadowStorePinMultipleReaders(t *testing.T) {
 
 func TestShadowStoreRemoveWithoutPin(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +388,7 @@ func TestShadowStoreRenameFailureRollbackPinState(t *testing.T) {
 
 func TestShadowStorePinIfExists(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +422,7 @@ func TestShadowStorePinIfExists(t *testing.T) {
 
 func TestShadowStoreRemovePreventsPin(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +447,7 @@ func TestShadowStoreRemovePreventsPin(t *testing.T) {
 // does not affect the new shadow.
 func TestShadowStoreRetireAllowsNewWriter(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +550,7 @@ func TestShadowStoreUnpinZeroNoop(t *testing.T) {
 // crash/restart recovery where pending shadows exist on disk only).
 func TestShadowStorePinIfExistsDiskOnly(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -596,7 +596,7 @@ func TestShadowStorePinIfExistsDiskOnly(t *testing.T) {
 // scenario where commit queue uploads a disk-only shadow and then calls Remove.
 func TestShadowStoreRemoveDiskOnly(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1379,7 +1379,7 @@ func TestFreeRatioIndependentOfByteQuota(t *testing.T) {
 // so the newer shadow survives.
 func TestShadowStoreRemoveIfGenerationRaceStaleVsNewerWrite(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1468,7 +1468,7 @@ func TestShadowStoreEnsureActiveGenerationKeepsExistingBaseRevision(t *testing.T
 // replacement's fresh shadow after the in-memory generation check passed.
 func TestShadowStoreRemoveIfGenerationWriteFullRaceConsistency(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

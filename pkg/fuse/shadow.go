@@ -50,6 +50,9 @@ type retiredShadow struct {
 	fd       *os.File
 	diskPath string
 	size     int64
+	// Nonzero only when an ordinary append-log commit invalidated this
+	// generation. Reset/unlink snapshots remain readable until final Unpin.
+	appendLogRevision int64
 }
 
 // ShadowStore manages per-path shadow files for local staging of writes.
@@ -1288,8 +1291,13 @@ func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 // concurrent same-path write cannot open/reuse the shared disk path in
 // between.
 func (s *ShadowStore) Remove(remotePath string) {
+	s.removeAfterAppendLogCommit(remotePath, 0)
+}
+
+func (s *ShadowStore) removeAfterAppendLogCommit(remotePath string, revision int64) {
 	pl := s.acquirePathLock(remotePath)
 	s.mu.Lock()
+	gen := s.active[remotePath]
 	cleanup, ok := s.removeCoreLocked(remotePath, 0)
 	s.mu.Unlock()
 	if !ok {
@@ -1297,7 +1305,25 @@ func (s *ShadowStore) Remove(remotePath string) {
 		return
 	}
 	s.runRemoveCleanup(cleanup)
+	if revision > 0 {
+		// Publish invalidation after retirement's disk rename, so a reader's
+		// final Unpin cannot race ahead of that rename and leak the old file.
+		s.mu.Lock()
+		if retired := s.retired[gen]; retired != nil {
+			retired.appendLogRevision = revision
+		}
+		s.mu.Unlock()
+	}
 	s.releasePathLock(remotePath, pl)
+}
+
+func (s *ShadowStore) appendLogRetiredRevision(gen uint64) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if retired := s.retired[gen]; retired != nil {
+		return retired.appendLogRevision
+	}
+	return 0
 }
 
 // RemoveIfGeneration removes the shadow file for remotePath only if its current

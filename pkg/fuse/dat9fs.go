@@ -11369,6 +11369,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	lockStart := time.Now()
 	fh.Lock()
 	lockWait := time.Since(lockStart)
+	fs.refreshAppendLogReaderShadowLocked(fh)
 	if fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 		fs.debugf("read lock wait path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, lockWait)
 	}
@@ -11713,7 +11714,10 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	if fh.Dirty == nil && isSQLitePersistentJournalPath(fh.Path) {
-		if data, n, ok, st, src := fs.readSQLitePersistentJournalVisibleRange(fh.Path, fh, fh.BaseRev, int64(input.Offset), input.Size); ok || st != gofuse.OK {
+		fh.Lock()
+		fallbackRevision := fh.BaseRev
+		fh.Unlock()
+		if data, n, ok, st, src := fs.readSQLitePersistentJournalVisibleRange(fh.Path, fh, fallbackRevision, int64(input.Offset), input.Size); ok || st != gofuse.OK {
 			source = src
 			bytesRead = n
 			if st != gofuse.OK {
@@ -11775,6 +11779,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// generation-based read first — this works even after the shadow has
 	// been retired by commit queue cleanup. Otherwise use path-based ReadAt.
 	if fh.Dirty == nil && fs.shadowStore != nil {
+		// Keep a concurrent Read from releasing this handle's obsolete pin
+		// while its generation is being read below.
+		fh.Lock()
 		var sz int64 = -1
 		var useGen bool
 		if fh.ShadowGen != 0 {
@@ -11789,6 +11796,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		if sz >= 0 {
 			offset := int64(input.Offset)
 			if offset >= sz {
+				fh.Unlock()
 				source = "shadow-store-eof"
 				bytesRead = 0
 				return gofuse.ReadResultData(nil), gofuse.OK
@@ -11806,6 +11814,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 				n, err = fs.shadowStore.ReadAt(fh.Path, offset, buf)
 			}
 			if (err == nil || errors.Is(err, io.EOF)) && n >= 0 {
+				fh.Unlock()
 				source = "shadow-store"
 				bytesRead = n
 				return gofuse.ReadResultData(buf[:n]), gofuse.OK
@@ -11814,6 +11823,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 				fs.debugf("read shadow-store miss path=%s off=%d req=%d gen=%d err=%v", fh.Path, input.Offset, input.Size, fh.ShadowGen, err)
 			}
 		}
+		fh.Unlock()
 	}
 	// Close-to-open consistency: if a previous handle wrote data to the
 	// write-back cache (async upload still in progress), serve reads from
