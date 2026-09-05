@@ -687,6 +687,66 @@ func TestAppendLogPathTruncateGrowthFreezesPrefixAndZeroFill(t *testing.T) {
 	}
 }
 
+func TestAppendLogPathTruncateGrowthRebasesCleanSibling(t *testing.T) {
+	var putCalls, appendCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write([]byte("abc"))
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			putCalls++
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+		case http.MethodPost:
+			appendCalls++
+			w.WriteHeader(http.StatusConflict)
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+
+	ino := fs.inodes.Lookup(fh.Path, false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	fh.Ino = ino
+	fh.OpenPID = 99
+	fh.Dirty = NewWriteBuffer(fh.Path, 1024, 0)
+	if _, err := fh.Dirty.Write(0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fh.DirtySeq = 0
+	fh.OrigSize = 3
+	fh.BaseRev = 5
+	fh.appendLog = appendLogHandleState{initialized: true, appendSafe: true, layout: client.ContentLayoutAppendLog, revision: 5, size: 3}
+	handleID := fs.allocateFileHandle(fh)
+	defer fs.deleteFileHandle(handleID, fh)
+
+	handled, status := fs.tryAppendLogPathTruncate(context.Background(), entry, ino, 77, 5, nil)
+	if !handled || status != gofuse.OK || putCalls != 1 {
+		t.Fatalf("handled/status/puts = %t/%d/%d, want true/OK/1", handled, status, putCalls)
+	}
+	fs.syncOpenHandlesAfterPathTruncate(ino, 5)
+	if fh.BaseRev != 6 || fh.OrigSize != 5 || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || fh.Dirty.Size() != 5 {
+		t.Fatalf("clean sibling after path truncate = rev=%d size=%d seq=%d dirty=%t buffer=%d, want 6/5/0/false/5", fh.BaseRev, fh.OrigSize, fh.DirtySeq, fh.Dirty.HasDirtyParts(), fh.Dirty.Size())
+	}
+	if status := fs.Fsync(nil, &gofuse.FsyncIn{Fh: handleID}); status != gofuse.OK {
+		t.Fatalf("Fsync status = %d, want OK", status)
+	}
+	if appendCalls != 0 {
+		t.Fatalf("append calls after committed truncate = %d, want 0", appendCalls)
+	}
+}
+
 func TestAppendLogGenericUnsupportedReroutesOnceToFullPUT(t *testing.T) {
 	var putCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
@@ -1774,6 +1834,80 @@ func TestAppendLogCapabilityDisabledPureTailFsyncUsesConditionalFullPUT(t *testi
 	}
 	if got := snapshot.Counters["append_log_fsync_append_count"]; got != 0 {
 		t.Fatalf("append_log_fsync_append_count = %d, want 0", got)
+	}
+}
+
+func TestAppendLogSameHandleConcurrentFullRewriteUsesCommittedGeneration(t *testing.T) {
+	firstRewriteStarted := make(chan struct{})
+	allowFirstRewrite := make(chan struct{})
+	var putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("request = %s, want PUT", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		putCalls++
+		if putCalls == 1 {
+			close(firstRewriteStarted)
+			<-allowFirstRewrite
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+			return
+		}
+		w.WriteHeader(http.StatusConflict)
+	})
+	defer closeServer()
+	setAppendLogRewriteDirty(t, fh, "rewrite")
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, fh.BaseRev, fh.OrigSize)
+
+	firstDone := make(chan appendLogAttemptResult, 1)
+	go func() {
+		fh.Lock()
+		result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+		fh.Unlock()
+		firstDone <- result
+	}()
+	select {
+	case <-firstRewriteStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first full rewrite did not reach the server")
+	}
+
+	secondDone := make(chan appendLogAttemptResult, 1)
+	go func() {
+		fh.Lock()
+		result := fs.tryAppendLogFullRewriteLocked(context.Background(), fh)
+		fh.Unlock()
+		secondDone <- result
+	}()
+	deadline := time.Now().Add(time.Second)
+	for fh.TryLock() {
+		fh.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("second full rewrite did not reach the path-lock wait")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(allowFirstRewrite)
+
+	select {
+	case result := <-firstDone:
+		if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+			t.Fatalf("first result = %+v, want committed/OK", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first full rewrite did not finish")
+	}
+	select {
+	case result := <-secondDone:
+		if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+			t.Fatalf("second result = %+v, want committed/OK", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second full rewrite did not finish")
+	}
+	if putCalls != 1 {
+		t.Fatalf("conditional PUT calls = %d, want 1", putCalls)
 	}
 }
 

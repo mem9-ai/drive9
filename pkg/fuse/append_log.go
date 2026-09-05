@@ -307,6 +307,7 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	}
 
 	snapshotPath := fh.Path
+	snapshotIno := fh.Ino
 	snapshotSize := fh.Dirty.Size()
 	snapshotDirtySeq := fh.DirtySeq
 	snapshotIsNew := fh.IsNew
@@ -331,6 +332,10 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 		return appendLogAttemptResult{route: appendLogRouteFailed, status: gofuse.EIO}
 	}
 	defer func() { _ = snapshot.Close() }()
+	committedRevision, committedSize, alreadyCommitted := fs.appendLogCommittedGeneration(snapshotIno, snapshotDirtySeq)
+	if alreadyCommitted && committedSize != snapshotSize {
+		alreadyCommitted = false
+	}
 	appendStarted := time.Now()
 	fs.debugf("append-log trace event=append_attempt path=%q base_rev=%d base_size=%d snapshot_size=%d tail_size=%d dirty_seq=%d wall_unix_nano=%d remote_commit_lock_wait_ns=%d", snapshotPath, expectedRevision, expectedSize, snapshotSize, snapshot.Size(), snapshotDirtySeq, appendStarted.UnixNano(), remoteCommitLockWait.Nanoseconds())
 
@@ -347,34 +352,44 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 		return result, appendErr
 	}
 
-	fh.Unlock()
-	result, err := appendOnce(expectedRevision)
-	if appendLogErrorCode(err) == client.AppendLogCodeRebased {
-		stat, statErr := fs.client.StatCtx(ctx, fs.remotePath(snapshotPath))
-		if statErr != nil || stat == nil || stat.Revision <= 0 || stat.Revision == expectedRevision || stat.Size != expectedSize {
-			if statErr != nil {
-				err = statErr
+	result := client.AppendLogResult{Revision: committedRevision, Size: committedSize}
+	if !alreadyCommitted {
+		fh.Unlock()
+		result, err = appendOnce(expectedRevision)
+		if appendLogErrorCode(err) == client.AppendLogCodeRebased {
+			stat, statErr := fs.client.StatCtx(ctx, fs.remotePath(snapshotPath))
+			if statErr != nil || stat == nil || stat.Revision <= 0 || stat.Revision == expectedRevision || stat.Size != expectedSize {
+				if statErr != nil {
+					err = statErr
+				} else {
+					err = fmt.Errorf("append-log rebase did not provide the same size with a new positive revision")
+				}
 			} else {
-				err = fmt.Errorf("append-log rebase did not provide the same size with a new positive revision")
+				fh.appendLogObserveLayout(stat.ContentLayout, stat.Revision, stat.Size)
+				fh.appendLog.rewriteBaseRevision = stat.Revision
+				fh.appendLog.rewriteBaseSize = stat.Size
+				fh.appendLog.hasRewriteBase = true
+				fs.recordAppendLogRebaseRetry()
+				result, err = appendOnce(stat.Revision)
 			}
-		} else {
-			fs.recordAppendLogRebaseRetry()
-			result, err = appendOnce(stat.Revision)
 		}
+		if err == nil {
+			if snapshotIsNew {
+				fs.replaceCommittedRevisionWithSize(snapshotPath, result.Revision, result.Size)
+			} else {
+				fs.recordCommittedRevisionWithSize(snapshotPath, result.Revision, result.Size)
+			}
+			if !snapshotOwnsShadow && fs.shadowStore != nil {
+				fs.shadowStore.removeAfterAppendLogCommit(snapshotPath, result.Revision)
+				fs.clearRemovedCommittedShadowForOpenHandles(snapshotPath, result.Revision, result.Size)
+			}
+			fs.recordAppendLogCommittedGeneration(snapshotIno, snapshotDirtySeq, result.Revision, result.Size)
+		}
+		unlockRemoteCommit()
+		fh.Lock()
+	} else {
+		unlockRemoteCommit()
 	}
-	if err == nil {
-		if snapshotIsNew {
-			fs.replaceCommittedRevisionWithSize(snapshotPath, result.Revision, result.Size)
-		} else {
-			fs.recordCommittedRevisionWithSize(snapshotPath, result.Revision, result.Size)
-		}
-		if !snapshotOwnsShadow && fs.shadowStore != nil {
-			fs.shadowStore.removeAfterAppendLogCommit(snapshotPath, result.Revision)
-			fs.clearRemovedCommittedShadowForOpenHandles(snapshotPath, result.Revision, result.Size)
-		}
-	}
-	unlockRemoteCommit()
-	fh.Lock()
 	if err == nil {
 		fs.debugf("append-log trace event=append_result path=%q result=ok revision=%d size=%d dirty_seq=%d wall_unix_nano=%d duration_ns=%d", snapshotPath, result.Revision, result.Size, snapshotDirtySeq, time.Now().UnixNano(), time.Since(appendStarted).Nanoseconds())
 	} else {
@@ -396,6 +411,9 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	}
 
 	if fh.Unlinked || fh.Path != snapshotPath {
+		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+	}
+	if !alreadyCommitted && !fh.HasPendingMode && fh.BaseRev == result.Revision && fh.OrigSize == result.Size && fh.DirtySeq == 0 {
 		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 	}
 	if fh.BaseRev > result.Revision || fs.latestCommittedRevision(snapshotPath) > result.Revision {
@@ -797,6 +815,7 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	}
 
 	snapshotPath := fh.Path
+	snapshotIno := fh.Ino
 	snapshotDirtySeq := fh.DirtySeq
 	snapshotSize := fh.Dirty.Size()
 	remoteCommitLockStarted := time.Now()
@@ -835,29 +854,39 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 		return appendLogAttemptResult{route: appendLogRouteFailed, status: gofuse.EIO}
 	}
 	defer func() { _ = snapshot.Close() }()
+	committedRevision, committedSize, alreadyCommitted := fs.appendLogCommittedGeneration(snapshotIno, snapshotDirtySeq)
+	if alreadyCommitted && committedSize != snapshotSize {
+		alreadyCommitted = false
+	}
 	rewriteStarted := time.Now()
 	fs.debugf("append-log trace event=rewrite_attempt path=%q base_rev=%d base_size=%d snapshot_size=%d append_safe=%t dirty_seq=%d wall_unix_nano=%d remote_commit_lock_wait_ns=%d", snapshotPath, expectedRevision, expectedSize, snapshotSize, fh.appendLog.appendSafe, snapshotDirtySeq, rewriteStarted.UnixNano(), remoteCommitLockWait.Nanoseconds())
 
-	reader, err := snapshot.Open()
-	if err != nil {
-		unlockRemoteCommit()
-		return appendLogAttemptResult{route: appendLogRouteFailed, status: gofuse.EIO}
-	}
-	fh.Unlock()
-	writeStart := fs.perfStart()
-	revision, err := fs.client.WriteServerStreamConditional(ctx, fs.remotePath(snapshotPath), reader, snapshot.Size(), expectedRevision)
-	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(snapshot.Size()))
-	fs.recordAppendLogFullRewrite(uint64(snapshot.Size()))
-	_ = reader.Close()
-	if err == nil {
-		fs.recordCommittedRevisionWithSize(snapshotPath, revision, snapshot.Size())
-		if !snapshotOwnsShadow && fs.shadowStore != nil {
-			fs.shadowStore.removeAfterAppendLogCommit(snapshotPath, revision)
-			fs.clearRemovedCommittedShadowForOpenHandles(snapshotPath, revision, snapshot.Size())
+	revision := committedRevision
+	if !alreadyCommitted {
+		reader, openErr := snapshot.Open()
+		if openErr != nil {
+			unlockRemoteCommit()
+			return appendLogAttemptResult{route: appendLogRouteFailed, status: gofuse.EIO}
 		}
+		fh.Unlock()
+		writeStart := fs.perfStart()
+		revision, err = fs.client.WriteServerStreamConditional(ctx, fs.remotePath(snapshotPath), reader, snapshot.Size(), expectedRevision)
+		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(snapshot.Size()))
+		fs.recordAppendLogFullRewrite(uint64(snapshot.Size()))
+		_ = reader.Close()
+		if err == nil {
+			fs.recordCommittedRevisionWithSize(snapshotPath, revision, snapshot.Size())
+			if !snapshotOwnsShadow && fs.shadowStore != nil {
+				fs.shadowStore.removeAfterAppendLogCommit(snapshotPath, revision)
+				fs.clearRemovedCommittedShadowForOpenHandles(snapshotPath, revision, snapshot.Size())
+			}
+			fs.recordAppendLogCommittedGeneration(snapshotIno, snapshotDirtySeq, revision, snapshot.Size())
+		}
+		unlockRemoteCommit()
+		fh.Lock()
+	} else {
+		unlockRemoteCommit()
 	}
-	unlockRemoteCommit()
-	fh.Lock()
 	if err == nil {
 		fs.debugf("append-log trace event=rewrite_result path=%q result=ok revision=%d size=%d dirty_seq=%d wall_unix_nano=%d duration_ns=%d", snapshotPath, revision, snapshot.Size(), snapshotDirtySeq, time.Now().UnixNano(), time.Since(rewriteStarted).Nanoseconds())
 	} else {
@@ -870,6 +899,9 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 	}
 	if fh.Unlinked || fh.Path != snapshotPath {
+		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+	}
+	if !alreadyCommitted && !fh.HasPendingMode && fh.BaseRev == revision && fh.OrigSize == snapshot.Size() && fh.DirtySeq == 0 {
 		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 	}
 	if fh.BaseRev > revision || fs.latestCommittedRevision(snapshotPath) > revision {
@@ -1095,7 +1127,7 @@ func (fs *Dat9FS) tryAppendLogPathTruncate(ctx context.Context, entry *InodeEntr
 		return true, httpToFuseStatus(err)
 	}
 
-	fs.recordCommittedRevision(entry.Path, revision)
+	fs.recordCommittedRevisionWithSize(entry.Path, revision, newSize)
 	entry.Revision = revision
 	entry.Size = newSize
 	fs.inodes.UpdateRevision(ino, revision)

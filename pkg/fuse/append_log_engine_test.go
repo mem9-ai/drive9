@@ -603,6 +603,130 @@ func TestAppendLogRebaseRetriesOnceWithFrozenTail(t *testing.T) {
 	}
 }
 
+func TestAppendLogRebasedUnsupportedFallsBackWithRebasedRevision(t *testing.T) {
+	var appendCalls, headCalls, putCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			appendCalls++
+			if appendCalls == 1 {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "rebase required", "code": client.AppendLogCodeRebased})
+				return
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "append unsupported", "code": client.AppendLogCodeUnsupported})
+		case http.MethodHead:
+			headCalls++
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-Revision", "6")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			putCalls++
+			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "6" {
+				t.Errorf("full rewrite expected revision = %q, want 6", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			if got := string(body); got != "pretail" {
+				t.Errorf("full rewrite body = %q, want pretail", got)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 7})
+		default:
+			t.Errorf("unexpected request %s", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	defer closeServer()
+
+	fh.Lock()
+	handled, status, fullRewrite := fs.routeAppendLogLocked(context.Background(), fh)
+	fh.Unlock()
+	if !handled || status != gofuse.OK || !fullRewrite {
+		t.Fatalf("handled/status/full rewrite = %t/%d/%t, want true/OK/true", handled, status, fullRewrite)
+	}
+	if appendCalls != 2 || headCalls != 1 || putCalls != 1 {
+		t.Fatalf("append/head/put calls = %d/%d/%d, want 2/1/1", appendCalls, headCalls, putCalls)
+	}
+}
+
+func TestAppendLogSameHandleConcurrentTailSyncUsesCommittedGeneration(t *testing.T) {
+	firstAppendStarted := make(chan struct{})
+	allowFirstAppend := make(chan struct{})
+	var appendCalls int
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		appendCalls++
+		if appendCalls == 1 {
+			close(firstAppendStarted)
+			<-allowFirstAppend
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+			return
+		}
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "duplicate tail must not upload", "code": client.AppendLogCodeConflict})
+	})
+	defer closeServer()
+
+	firstDone := make(chan appendLogAttemptResult, 1)
+	go func() {
+		fh.Lock()
+		result := fs.tryAppendLogLocked(context.Background(), fh)
+		fh.Unlock()
+		firstDone <- result
+	}()
+	select {
+	case <-firstAppendStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first append did not reach the server")
+	}
+
+	secondDone := make(chan appendLogAttemptResult, 1)
+	go func() {
+		fh.Lock()
+		result := fs.tryAppendLogLocked(context.Background(), fh)
+		fh.Unlock()
+		secondDone <- result
+	}()
+	deadline := time.Now().Add(time.Second)
+	for fh.TryLock() {
+		fh.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("second append did not reach the path-lock wait")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(allowFirstAppend)
+
+	select {
+	case result := <-firstDone:
+		if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+			t.Fatalf("first result = %+v, want committed/OK", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first append did not finish")
+	}
+	select {
+	case result := <-secondDone:
+		if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+			t.Fatalf("second result = %+v, want committed/OK", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second append did not finish")
+	}
+	if appendCalls != 1 {
+		t.Fatalf("append calls = %d, want 1", appendCalls)
+	}
+}
+
 func TestAppendLogRebaseRejectsChangedSizeWithoutRetry(t *testing.T) {
 	var appendCalls, statCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {

@@ -1950,6 +1950,44 @@ func (fs *Dat9FS) recordCommittedMutation(ino uint64, seq uint64, revision int64
 	fs.dirtyMu.Unlock()
 }
 
+// recordAppendLogCommittedGeneration publishes an in-process append-log
+// completion before its initiating Fsync can reacquire fh.mu. A concurrent
+// Fsync of the exact same handle generation can then finalize locally instead
+// of issuing a duplicate conditional append against the preceding baseline.
+func (fs *Dat9FS) recordAppendLogCommittedGeneration(ino, seq uint64, revision, size int64) {
+	if fs == nil || ino == 0 || seq == 0 || revision <= 0 || size < 0 {
+		return
+	}
+	fs.dirtyMu.Lock()
+	if fs.mutationInodes == nil {
+		fs.mutationInodes = make(map[uint64]inodeMutationState)
+	}
+	state := fs.mutationInodes[ino]
+	if seq >= state.committedSeq {
+		state.committedSeq = seq
+		state.committedRevision = revision
+		state.committedSize = size
+	}
+	if seq > state.latestSeq {
+		state.latestSeq = seq
+	}
+	fs.mutationInodes[ino] = state
+	fs.dirtyMu.Unlock()
+}
+
+func (fs *Dat9FS) appendLogCommittedGeneration(ino, seq uint64) (revision, size int64, ok bool) {
+	if fs == nil || ino == 0 || seq == 0 {
+		return 0, 0, false
+	}
+	fs.dirtyMu.Lock()
+	state, found := fs.mutationInodes[ino]
+	fs.dirtyMu.Unlock()
+	if !found || state.committedSeq != seq || state.committedRevision <= 0 || state.committedSize < 0 {
+		return 0, 0, false
+	}
+	return state.committedRevision, state.committedSize, true
+}
+
 func (fs *Dat9FS) resolveCommittedMutationRevision(localPath string, committedRev, expectedRevision int64) int64 {
 	if committedRev > 0 {
 		return committedRev
@@ -3170,6 +3208,26 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 		if fh.Dirty == nil {
 			fh.Unlock()
 			continue
+		}
+		if fs.appendLogPathConfigured(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
+			if revision, committedSize, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && revision > 0 && committedSize == newSize {
+				fs.adoptCommittedStorageClassLocked(fh, newSize)
+				if fh.Dirty.Size() != newSize {
+					if err := fh.Dirty.Truncate(newSize); err != nil {
+						safeLogPrintf("append-log path-truncate sync failed for %s: %v", fh.Path, err)
+						fh.Unlock()
+						continue
+					}
+					fh.Dirty.ResetSequentialState(newSize)
+				}
+				fh.Dirty.ClearDirty()
+				fh.BaseRev = revision
+				fh.OrigSize = newSize
+				fh.ZeroBase = false
+				fh.appendLogAdoptCommittedBaseline(revision, newSize)
+				fh.Unlock()
+				continue
+			}
 		}
 		// The path truncate committed a full re-upload of newSize remotely;
 		// the storage class follows from that size.
