@@ -365,11 +365,22 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 					err = fmt.Errorf("append-log rebase did not provide the same size with a new positive revision")
 				}
 			} else {
+				// The rebase observation belongs to this immutable snapshot. Do
+				// not publish it into fh.appendLog until fh.mu is reacquired:
+				// a concurrent Write may have advanced the dirty generation while
+				// StatCtx ran, including through the bounded path-lock fallback.
+				fh.Lock()
+				if fh.Unlinked || fh.Path != snapshotPath || fh.DirtySeq != snapshotDirtySeq ||
+					fh.IsNew != snapshotIsNew || fh.BaseRev != expectedRevision || fh.OrigSize != expectedSize {
+					unlockRemoteCommit()
+					return appendLogAttemptResult{route: appendLogRouteFailed, status: gofuse.EAGAIN}
+				}
 				fh.appendLogObserveLayout(stat.ContentLayout, stat.Revision, stat.Size)
 				fh.appendLog.rewriteBaseRevision = stat.Revision
 				fh.appendLog.rewriteBaseSize = stat.Size
 				fh.appendLog.hasRewriteBase = true
 				fs.recordAppendLogRebaseRetry()
+				fh.Unlock()
 				result, err = appendOnce(stat.Revision)
 			}
 		}
