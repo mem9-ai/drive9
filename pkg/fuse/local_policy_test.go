@@ -194,6 +194,9 @@ func TestAppendLogPolicyMatchesSQLiteWALGlob(t *testing.T) {
 		{"/repo/repro.db-shm", false},
 		{"/repo/repro.db-wal.bak", false},
 		{"/repo/repro.db-wal ", false},
+		{"/snapshots-wal/data.bin", false},
+		{"/repo/snapshots-wal/sub/data.bin", false},
+		{"/snapshots-wal/repro.db-wal", true},
 	} {
 		if got := matcher.Matches(test.path); got != test.want {
 			t.Errorf("Matches(%q) = %t, want %t", test.path, got, test.want)

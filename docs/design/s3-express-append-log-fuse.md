@@ -97,6 +97,9 @@ changes the generic append-log contract.
 For SQLite WAL filenames at any directory depth, use `--append-log='**/*-wal'`.
 The `*` is a glob within a single path segment; the leading `**/` permits
 that segment to occur at the mount root or below nested directories.
+The match must end at the file's basename: an ancestor such as `snapshots-wal`
+does not select its ordinary descendants. Append `/**` when explicitly selecting
+an entire subtree.
 
 ### 2.2 Server capability
 

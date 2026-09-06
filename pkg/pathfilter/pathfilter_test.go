@@ -18,7 +18,7 @@ func TestCompileThreeForms(t *testing.T) {
 		{"subpath-nested", "**/.git/**", "proj/.git/refs/heads/main", true},
 		{"subpath-bare-dir", "**/dist", "proj/dist", true},
 		{"subpath-bare-dir-no-trailing", "**/dist", "proj/dist/index.js", true},
-		// Glob segments in the **/x form keep its existing subtree semantics.
+		// Recursive file globs must end at the final path segment.
 		{"subpath-wal-root", "**/*-wal", "repro.db-wal", true},
 		{"subpath-wal-nested", "**/*-wal", "/issue-validation/run/case/repro.db-wal", true},
 		{"subpath-wal-literal", "**/repro.db-wal", "/issue-validation/run/case/repro.db-wal", true},
@@ -26,10 +26,15 @@ func TestCompileThreeForms(t *testing.T) {
 		{"subpath-wal-main-db", "**/*-wal", "proj/repro.db", false},
 		{"subpath-wal-shm", "**/*-wal", "proj/repro.db-shm", false},
 		{"subpath-wal-extra-suffix", "**/*-wal", "proj/repro.db-wal.bak", false},
+		{"subpath-wal-ancestor", "**/*-wal", "/snapshots-wal/data.bin", false},
+		{"subpath-wal-nested-ancestor", "**/*-wal", "/proj/snapshots-wal/sub/data.bin", false},
+		{"subpath-wal-under-wal-dir", "**/*-wal", "/snapshots-wal/repro.db-wal", true},
 		{"subpath-glob-subtree", "**/cache-*/**", "proj/cache-build/objects/a", true},
-		{"subpath-glob-bare-subtree", "**/cache-*", "proj/cache-build/objects/a", true},
+		{"subpath-glob-bare-subtree", "**/cache-*", "proj/cache-build/objects/a", false},
+		{"subpath-glob-bare-directory", "**/cache-*", "proj/cache-build", true},
 		{"subpath-glob-multiple-segments", "**/cache-*/*.log", "proj/cache-build/output.log", true},
 		{"subpath-glob-no-cross-separator", "**/cache-*/*.log", "proj/cache-build/nested/output.log", false},
+		{"subpath-glob-matched-ancestor", "**/cache-*/*.log", "proj/cache-build/output.log/data.bin", false},
 		{"subpath-glob-retry-later-segment", "**/cache-*/*.log", "cache-first/miss/cache-second/output.log", true},
 		{"subpath-question", "**/db?.wal", "proj/db1.wal", true},
 		{"subpath-question-too-long", "**/db?.wal", "proj/db12.wal", false},
@@ -39,6 +44,25 @@ func TestCompileThreeForms(t *testing.T) {
 		{"subpath-literal-brackets", "**/[cache]/**", "proj/[cache]/item", true},
 		{"subpath-invalid-glob-literal", "**/[z-a]/**", "proj/[z-a]/item", true},
 		{"subpath-invalid-glob-no-match", "**/[z-a]/**", "proj/other/item", false},
+		{"subpath-unicode-question", "**/db?.wal", "proj/db\U0001f600.wal", true},
+		{"subpath-unicode-question-two", "**/db??.wal", "proj/db\U0001f600.wal", false},
+		{"subpath-unicode-class", "**/db[\U0001f600].wal", "proj/db\U0001f600.wal", true},
+		{"subpath-unicode-class-no-half", "**/db[\U0001f600]?.wal", "proj/db\U0001f600.wal", false},
+		{"subpath-unicode-range", "**/db[\U0001f600-\U0001f64f].wal", "proj/db\U0001f609.wal", true},
+		{"subpath-unicode-negated-class", "**/db[^\U0001f600].wal", "proj/db\U0001f609.wal", true},
+		{"subpath-class-trailing-hyphen", "**/[a-]/**", "proj/a/item", false},
+		{"subpath-class-trailing-hyphen-literal", "**/[a-]/**", "proj/[a-]/item", true},
+		{"subpath-class-trailing-hyphen-no-dash", "**/[a-]/**", "proj/-/item", false},
+		{"subpath-class-leading-hyphen", "**/[-a]/**", "proj/a/item", false},
+		{"subpath-class-empty", "**/[]/**", "proj/a/item", false},
+		{"subpath-class-empty-negated", "**/[^]/**", "proj/a/item", false},
+		{"subpath-class-leading-bracket", "**/[]a]/**", "proj/a/item", false},
+		{"subpath-class-unclosed", "**/[abc/**", "proj/[/item", false},
+		{"subpath-class-extra-hyphen", "**/[a-b-c]/**", "proj/-/item", false},
+		{"subpath-class-reversed-with-literal", "**/[z-aa]/**", "proj/a/item", true},
+		{"subpath-class-negated-reversed", "**/[^z-a]/**", "proj/a/item", true},
+		{"subpath-class-bracket-literal", "**/[[]/**", "proj/[/item", true},
+		{"subpath-literal-closing-bracket", "**/db?].wal", "proj/db1].wal", true},
 		// prefix/** form
 		{"prefix-match", "dist/**", "dist/index.js", true},
 		{"prefix-nested", "dist/**", "dist/a/b/c.js", true},
@@ -217,6 +241,19 @@ func TestMatchExcluded(t *testing.T) {
 	// Leaf that fails include is not "excluded" in the prune sense either.
 	if m.MatchExcluded("src/util.go") {
 		t.Fatal("src/util.go is dropped by include, not by exclude — not MatchExcluded")
+	}
+}
+
+func TestMatchExcludedRecursiveFileGlobDoesNotPruneDirectory(t *testing.T) {
+	m := NewMatcher(nil, []string{"**/*-wal", "**/cache-*/**", "**/vendor"}, nil)
+	if m.Match("snapshots-wal") || m.MatchExcluded("snapshots-wal") {
+		t.Fatal("file glob should exclude the directory entry without pruning its descendants")
+	}
+	if !m.Match("snapshots-wal/data.bin") || m.Match("snapshots-wal/repro.db-wal") {
+		t.Fatal("each descendant must be filtered by its own filename")
+	}
+	if !m.MatchExcluded("cache-build") || !m.MatchExcluded("proj/vendor") {
+		t.Fatal("explicit subtree and literal directory rules must still prune")
 	}
 }
 

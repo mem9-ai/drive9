@@ -35,10 +35,15 @@ describe("pathfilter recursive glob segments", () => {
     ["**/*-wal", "proj/repro.db", false],
     ["**/*-wal", "proj/repro.db-shm", false],
     ["**/*-wal", "proj/repro.db-wal.bak", false],
+    ["**/*-wal", "/snapshots-wal/data.bin", false],
+    ["**/*-wal", "/proj/snapshots-wal/sub/data.bin", false],
+    ["**/*-wal", "/snapshots-wal/repro.db-wal", true],
     ["**/cache-*/**", "proj/cache-build/objects/a", true],
-    ["**/cache-*", "proj/cache-build/objects/a", true],
+    ["**/cache-*", "proj/cache-build/objects/a", false],
+    ["**/cache-*", "proj/cache-build", true],
     ["**/cache-*/*.log", "proj/cache-build/output.log", true],
     ["**/cache-*/*.log", "proj/cache-build/nested/output.log", false],
+    ["**/cache-*/*.log", "proj/cache-build/output.log/data.bin", false],
     ["**/cache-*/*.log", "cache-first/miss/cache-second/output.log", true],
     ["**/db?.wal", "proj/db1.wal", true],
     ["**/db?.wal", "proj/db12.wal", false],
@@ -48,6 +53,25 @@ describe("pathfilter recursive glob segments", () => {
     ["**/[cache]/**", "proj/[cache]/item", true],
     ["**/[z-a]/**", "proj/[z-a]/item", true],
     ["**/[z-a]/**", "proj/other/item", false],
+    ["**/db?.wal", "proj/db\u{1f600}.wal", true],
+    ["**/db??.wal", "proj/db\u{1f600}.wal", false],
+    ["**/db[\u{1f600}].wal", "proj/db\u{1f600}.wal", true],
+    ["**/db[\u{1f600}]?.wal", "proj/db\u{1f600}.wal", false],
+    ["**/db[\u{1f600}-\u{1f64f}].wal", "proj/db\u{1f609}.wal", true],
+    ["**/db[^\u{1f600}].wal", "proj/db\u{1f609}.wal", true],
+    ["**/[a-]/**", "proj/a/item", false],
+    ["**/[a-]/**", "proj/[a-]/item", true],
+    ["**/[a-]/**", "proj/-/item", false],
+    ["**/[-a]/**", "proj/a/item", false],
+    ["**/[]/**", "proj/a/item", false],
+    ["**/[^]/**", "proj/a/item", false],
+    ["**/[]a]/**", "proj/a/item", false],
+    ["**/[abc/**", "proj/[/item", false],
+    ["**/[a-b-c]/**", "proj/-/item", false],
+    ["**/[z-aa]/**", "proj/a/item", true],
+    ["**/[^z-a]/**", "proj/a/item", true],
+    ["**/[[]/**", "proj/[/item", true],
+    ["**/db?].wal", "proj/db1].wal", true],
   ])("%s matching %s returns %s", (pattern, path, want) => {
     expect(matchPattern(compile(pattern), path)).toBe(want);
   });
@@ -104,6 +128,16 @@ describe("pathfilter compileAll", () => {
 });
 
 describe("pathfilter matchExcluded", () => {
+  it("does not prune directories selected only by recursive file globs", () => {
+    const m = newMatcher({ exclude: ["**/*-wal", "**/cache-*/**", "**/vendor"] });
+    expect(match(m, "snapshots-wal")).toBe(false);
+    expect(matchExcluded(m, "snapshots-wal")).toBe(false);
+    expect(match(m, "snapshots-wal/data.bin")).toBe(true);
+    expect(match(m, "snapshots-wal/repro.db-wal")).toBe(false);
+    expect(matchExcluded(m, "cache-build")).toBe(true);
+    expect(matchExcluded(m, "proj/vendor")).toBe(true);
+  });
+
   it("returns true only for exclude-matched paths not restored by override", () => {
     const m = newMatcher({
       include: ["src/app.go"],

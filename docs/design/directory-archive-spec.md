@@ -75,27 +75,37 @@ but this project's node_modules/.package-lock.json must be archived."
 
 ### Pattern forms
 
-Three forms (mirrored from the FUSE `LocalPolicy` matcher, now extracted to
-`pkg/pathfilter`):
+The FUSE `LocalPolicy` matcher and SDK archives share these `pkg/pathfilter`
+pattern forms:
 
 | Form | Example | Meaning |
 |------|---------|---------|
-| `**/x/**` (or `**/x`) | `**/node_modules/**`, `**/*-wal` | Path contains the `x` subpath at any depth; each segment supports glob matching and literal equality |
+| `**/x/**` | `**/node_modules/**`, `**/cache-*/**` | Match a subpath at any depth and all descendants; each segment supports glob matching and literal equality |
+| `**/glob` | `**/*-wal`, `**/cache-*/*.log` | Match at any depth, ending at the final path segment |
+| `**/literal` | `**/node_modules` | Preserve the existing literal-subpath behavior, including descendants |
 | `prefix/**` | `dist/**` | Everything under the prefix |
 | exact / glob | `*.log`, `go.mod` | `path.Match` glob + exact equality |
 
 In the leading `**/` form, `*`, `?`, and character classes match within a
-single segment. A matched subpath includes its descendants, with or without
-the trailing `/**`. For example, `**/*-wal` matches `repro.db-wal` at the root
-or under any directory; `**/cache-*/*.log` requires the log to be directly
-inside a matching cache directory.
+single segment. Patterns containing these metacharacters must end at the final
+segment unless they have a trailing `/**`. Thus `**/*-wal` matches a WAL filename
+at any depth but does not match `/snapshots-wal/data.bin`. Use `**/cache-*/**` to
+include a matching directory's descendants. Rules without glob metacharacters
+retain the existing literal-subpath behavior.
+
+Go and TypeScript match `?` and character classes by Unicode code point.
+Character classes follow Go `path.Match` syntax, including non-empty classes
+and well-formed range endpoints. Invalid globs retain literal-equality fallback.
 
 ### Directory pruning
 
 When a directory's relative path matches an exclude (and no override restores
-it), the entire subtree is skipped at BFS time — no extra `ListCtx` round-trips
+it), subtree rules skip the entire subtree at BFS time — no extra `ListCtx` round-trips
 for children that would be dropped. This is what makes `--profile coding-agent`
 skip `node_modules/` without exploding the request count.
+
+Recursive file globs exclude matching entries without pruning their descendants;
+the walker continues into matching directories and filters each child separately.
 
 ## Archive formats
 
