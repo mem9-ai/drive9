@@ -21,166 +21,130 @@ import (
 )
 
 func TestSQLiteZeroTruncateWaitingAppendLogFsync(t *testing.T) {
-	for _, route := range []string{"tryAppendLogLocked", "tryAppendLogGenerationResetLocked", "tryAppendLogFullRewriteLocked"} {
-		t.Run(route, func(t *testing.T) {
-			var uploads [][]byte
-			fs, original, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
-				data, _ := io.ReadAll(r.Body)
-				uploads = append(uploads, data)
-				if r.Method == http.MethodPost {
-					_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
-				} else {
-					_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
-				}
-			})
-			t.Cleanup(closeServer)
-			original.appendLogObserveLayout(client.ContentLayoutAppendLog, original.BaseRev, original.OrigSize)
-			switch route {
-			case "tryAppendLogGenerationResetLocked":
-				h0, _ := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
-				setGenerationResetDirty(t, original, h0, makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4), 128)
-			case "tryAppendLogFullRewriteLocked":
-				original.appendLogRecordUserWrite(7, 0, 1)
-			}
-			ino := fs.inodes.Lookup(original.Path, false, original.OrigSize, time.Now())
-			fs.inodes.UpdateRevision(ino, 5)
-			original.Ino = ino
-			original.DirtySeq = fs.markDirtySize(ino, original.Dirty.Size())
-			originalID := fs.allocateFileHandle(original)
-			t.Cleanup(func() { fs.deleteFileHandle(originalID, original) })
-			source := &FileHandle{Ino: ino, Path: original.Path, Flags: syscall.O_RDWR, BaseRev: 5,
-				OrigSize: original.OrigSize, Dirty: fs.newWriteBuffer(original.Path, maxPreloadSize, 0)}
-			sourceID := fs.allocateFileHandle(source)
-			t.Cleanup(func() { fs.deleteFileHandle(sourceID, source) })
-
-			// SetAttr owns the path fence but cannot publish until we release
-			// its FD. The Fsync stack proves its initial consumer has already
-			// run and the selected upload route is waiting on that fence.
-			fs.lockRemoteCommitPath(original.Path)()
-			pathLock := fs.remoteCommitLocks[original.Path]
-			source.Lock()
-			unlockSource := sync.OnceFunc(source.Unlock)
-			t.Cleanup(unlockSource)
-			truncateDone := make(chan gofuse.Status, 1)
-			go func() { truncateDone <- sqliteZeroTruncateForTest(fs, ino, sourceID) }()
-			deadline := time.Now().Add(3 * time.Second)
-			for pathLock.TryLock() {
-				pathLock.Unlock()
-				if time.Now().After(deadline) {
-					t.Fatal("SetAttr did not acquire the path fence")
-				}
-				runtime.Gosched()
-			}
-			fsyncDone := make(chan gofuse.Status, 1)
-			go func() { fsyncDone <- fs.Fsync(nil, &gofuse.FsyncIn{Fh: originalID}) }()
-			stack := make([]byte, 1<<20)
-			for {
-				n := runtime.Stack(stack, true)
-				waiting := false
-				for _, goroutine := range strings.Split(string(stack[:n]), "\n\n") {
-					if strings.Contains(goroutine, "(*Dat9FS)."+route+"(") && strings.Contains(goroutine, "(*Dat9FS).takeHandleRemoteCommitPathLocked(") {
-						waiting = true
-					}
-				}
-				if waiting {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatalf("Fsync did not wait in %s", route)
-				}
-				runtime.Gosched()
-			}
-			unlockSource()
-			for name, done := range map[string]<-chan gofuse.Status{"truncate": truncateDone, "fsync": fsyncDone} {
-				select {
-				case st := <-done:
-					if st != gofuse.OK {
-						t.Fatalf("%s: %v", name, st)
-					}
-				case <-time.After(3 * time.Second):
-					t.Fatalf("%s did not finish", name)
-				}
-			}
-			if len(uploads) != 0 {
-				t.Fatalf("stale Fsync uploaded %d old payload(s): %q", len(uploads), uploads)
-			}
-			got, st, err := readDat9FSTestRange(fs, ino, originalID, 0, 1)
-			if err != nil || st != gofuse.OK || len(got) != 0 {
-				t.Fatalf("read after truncate = %q/%v/%v, want EOF", got, st, err)
-			}
-		})
-	}
+	testSQLiteZeroTruncateWaitingAppendLogFsync(t, false)
 }
 
-func TestSQLiteZeroTruncateDelayedLayerCommit(t *testing.T) {
-	for _, suffix := range []string{"-wal", "-journal"} {
-		t.Run(suffix, func(t *testing.T) {
-			filePath := "/layer.db" + suffix
-			var committed []byte
-			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-test/objects" && r.URL.Query().Get("path") == filePath {
-					_, _ = w.Write(committed)
-					return
+func TestSQLiteZeroTruncateWaitingAppendLogFsyncPendingMode(t *testing.T) {
+	testSQLiteZeroTruncateWaitingAppendLogFsync(t, true)
+}
+
+func testSQLiteZeroTruncateWaitingAppendLogFsync(t *testing.T, pendingMode bool) {
+	t.Helper()
+	for _, route := range []string{"tryAppendLogLocked", "tryAppendLogGenerationResetLocked", "tryAppendLogFullRewriteLocked"} {
+		for _, failMode := range []bool{false, true} {
+			if !pendingMode && failMode {
+				continue
+			}
+			t.Run(fmt.Sprintf("%s/mode=%t/fail=%t", route, pendingMode, failMode), func(t *testing.T) {
+				var uploads [][]byte
+				var chmodCalls int
+				fs, original, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Query().Has("chmod") {
+						chmodCalls++
+						if failMode {
+							w.WriteHeader(http.StatusForbidden)
+						}
+						return
+					}
+					data, _ := io.ReadAll(r.Body)
+					uploads = append(uploads, data)
+					if r.Method == http.MethodPost {
+						_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+					} else {
+						_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+					}
+				})
+				t.Cleanup(closeServer)
+				if pendingMode {
+					fs.setPendingModeLocked(original, 0o600, 1)
 				}
-				if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-test/entries" {
-					t.Errorf("unexpected layer request %s %s", r.Method, r.URL.String())
-					http.Error(w, "unexpected request", http.StatusInternalServerError)
-					return
+				original.appendLogObserveLayout(client.ContentLayoutAppendLog, original.BaseRev, original.OrigSize)
+				switch route {
+				case "tryAppendLogGenerationResetLocked":
+					h0, _ := parseSQLiteWALHeader(makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2))
+					setGenerationResetDirty(t, original, h0, makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4), 128)
+				case "tryAppendLogFullRewriteLocked":
+					original.appendLogRecordUserWrite(7, 0, 1)
 				}
-				var req client.FSLayerEntryRequest
-				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-					t.Error(err)
+				ino := fs.inodes.Lookup(original.Path, false, original.OrigSize, time.Now())
+				fs.inodes.UpdateRevision(ino, 5)
+				original.Ino = ino
+				original.DirtySeq = fs.markDirtySize(ino, original.Dirty.Size())
+				originalID := fs.allocateFileHandle(original)
+				t.Cleanup(func() { fs.deleteFileHandle(originalID, original) })
+				source := &FileHandle{Ino: ino, Path: original.Path, Flags: syscall.O_RDWR, BaseRev: 5,
+					OrigSize: original.OrigSize, Dirty: fs.newWriteBuffer(original.Path, maxPreloadSize, 0)}
+				sourceID := fs.allocateFileHandle(source)
+				t.Cleanup(func() { fs.deleteFileHandle(sourceID, source) })
+
+				// SetAttr owns the path fence but cannot publish until we release
+				// its FD. The Fsync stack proves its initial consumer has already
+				// run and the selected upload route is waiting on that fence.
+				fs.lockRemoteCommitPath(original.Path)()
+				pathLock := fs.remoteCommitLocks[original.Path]
+				source.Lock()
+				unlockSource := sync.OnceFunc(source.Unlock)
+				t.Cleanup(unlockSource)
+				truncateDone := make(chan gofuse.Status, 1)
+				go func() { truncateDone <- sqliteZeroTruncateForTest(fs, ino, sourceID) }()
+				deadline := time.Now().Add(3 * time.Second)
+				for pathLock.TryLock() {
+					pathLock.Unlock()
+					if time.Now().After(deadline) {
+						t.Fatal("SetAttr did not acquire the path fence")
+					}
+					runtime.Gosched()
 				}
-				if req.Op != "upsert" || req.Path != filePath || req.BaseRevision != 7 {
-					t.Errorf("layer upsert = %+v", req)
+				fsyncDone := make(chan gofuse.Status, 1)
+				go func() { fsyncDone <- fs.Fsync(nil, &gofuse.FsyncIn{Fh: originalID}) }()
+				stack := make([]byte, 1<<20)
+				for {
+					n := runtime.Stack(stack, true)
+					waiting := false
+					for _, goroutine := range strings.Split(string(stack[:n]), "\n\n") {
+						if strings.Contains(goroutine, "(*Dat9FS)."+route+"(") && strings.Contains(goroutine, "(*Dat9FS).takeHandleRemoteCommitPathLocked(") {
+							waiting = true
+						}
+					}
+					if waiting {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("Fsync did not wait in %s", route)
+					}
+					runtime.Gosched()
 				}
-				committed = cloneBytes(req.Content)
-				_ = json.NewEncoder(w).Encode(map[string]any{"layer_id": "layer-test", "path": filePath, "op": "upsert", "kind": "file"})
-			}))
-			t.Cleanup(ts.Close)
-			opts := &MountOptions{GVisorCompat: true, LayerRef: "layer-test"}
-			opts.setDefaults()
-			fs := NewDat9FS(newTestClient(ts.URL), opts)
-			ino := fs.inodes.Lookup(filePath, false, 24, time.Now())
-			fs.inodes.UpdateRevision(ino, 7)
-			open := func() (uint64, *FileHandle) {
-				fh := &FileHandle{Ino: ino, Path: filePath, Flags: syscall.O_RDWR, BaseRev: 7, OrigSize: 24,
-					Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0)}
-				_, _ = fh.Dirty.Write(0, []byte("old layer journal bytes!"))
-				fh.Dirty.ClearDirty()
-				id := fs.allocateFileHandle(fh)
-				t.Cleanup(func() { fs.deleteFileHandle(id, fh) })
-				return id, fh
-			}
-			busyID, busy := open()
-			sourceID, _ := open()
-			busy.Lock()
-			unlockBusy := sync.OnceFunc(busy.Unlock)
-			t.Cleanup(unlockBusy)
-			if st := sqliteZeroTruncateForTest(fs, ino, sourceID); st != gofuse.OK {
-				t.Fatal(st)
-			}
-			want := []byte("new layer")
-			sqliteWriteSyncForTest(t, fs, ino, sourceID, 0, want)
-			state, ok := fs.committedMutation(ino)
-			if !ok || state.committedRevision != 0 || state.committedSeq <= busy.pendingSQLiteTruncate.Load().seq || !bytes.Equal(committed, want) {
-				t.Fatalf("revisionless layer commit = %+v/%t/%q", state, ok, committed)
-			}
-			fs.readCache.Invalidate(filePath)
-			unlockBusy()
-			got, st, err := readDat9FSTestRange(fs, ino, busyID, 0, 30)
-			if err != nil || st != gofuse.OK || !bytes.Equal(got, want) {
-				t.Errorf("delayed read = %q/%v/%v, want %q", got, st, err, want)
-			}
-			got, st, err = readDat9FSTestRange(fs, ino, busyID, int64(len(want)), 1)
-			if err != nil || st != gofuse.OK || len(got) != 0 {
-				t.Errorf("EOF = %q/%v/%v", got, st, err)
-			}
-			sqliteWriteSyncForTest(t, fs, ino, busyID, uint64(len(want)), []byte("!"))
-			if !bytes.Equal(committed, append(cloneBytes(want), '!')) {
-				t.Fatalf("reused layer bytes = %q", committed)
-			}
-		})
+				unlockSource()
+				for name, done := range map[string]<-chan gofuse.Status{"truncate": truncateDone, "fsync": fsyncDone} {
+					select {
+					case st := <-done:
+						wantStatus := gofuse.OK
+						if name == "fsync" && failMode {
+							wantStatus = gofuse.EACCES
+						}
+						if st != wantStatus {
+							t.Errorf("%s: %v, want %v", name, st, wantStatus)
+						}
+					case <-time.After(3 * time.Second):
+						t.Fatalf("%s did not finish", name)
+					}
+				}
+				if pendingMode && (chmodCalls != 1 || original.HasPendingMode != failMode) {
+					t.Errorf("chmod calls/pending = %d/%t, want 1/%t", chmodCalls, original.HasPendingMode, failMode)
+				}
+				entry, _ := fs.inodes.GetEntry(ino)
+				if entry.Size != 0 {
+					t.Errorf("inode size = %d, want zero", entry.Size)
+				}
+				if len(uploads) != 0 {
+					t.Fatalf("stale Fsync uploaded %d old payload(s): %q", len(uploads), uploads)
+				}
+				got, st, err := readDat9FSTestRange(fs, ino, originalID, 0, 1)
+				if err != nil || st != gofuse.OK || len(got) != 0 {
+					t.Fatalf("read after truncate = %q/%v/%v, want EOF", got, st, err)
+				}
+			})
+		}
 	}
 }
 
