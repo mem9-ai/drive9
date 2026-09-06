@@ -2032,6 +2032,12 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 	if !ok || fh.DirtySeq > state.committedSeq || state.committedRevision <= 0 && !fs.layerEnabled() {
 		return false
 	}
+	return fs.adoptCommittedMutationLocked(fh, state)
+}
+
+// adoptCommittedMutationLocked rebinds this handle to an already selected
+// committed inode generation. Caller must hold fh.mu.
+func (fs *Dat9FS) adoptCommittedMutationLocked(fh *FileHandle, state inodeMutationState) bool {
 	var layerData []byte
 	if fs.layerEnabled() {
 		var ok bool
@@ -2039,6 +2045,7 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 		if !ok {
 			return false
 		}
+		fs.readCache.Put(fh.Path, layerData, 0)
 	}
 
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
@@ -2233,11 +2240,22 @@ func (fs *Dat9FS) publishSQLiteZeroTruncate(ino uint64, source *FileHandle, seq 
 
 // applySQLiteZeroTruncateLocked updates only this handle's buffer. The shared
 // shadow was truncated by the initiating FD and may already contain new writes.
-func (fs *Dat9FS) applySQLiteZeroTruncateLocked(fh *FileHandle) {
+func (fs *Dat9FS) applySQLiteZeroTruncateLocked(fh *FileHandle) bool {
 	event := fh.pendingSQLiteTruncate.Swap(nil)
 	if event == nil || fh.Dirty == nil || fh.Unlinked || fh.UnlinkedSnapshot || fh.UnlinkedData != nil ||
 		fh.DirtySeq >= event.seq || fh.BaseRev > event.revision {
-		return
+		return false
+	}
+	// Layer commits have no positive path revision. Consult their sequence
+	// before clearing DirtySeq, including clean handles delayed by the fence.
+	if fs.layerEnabled() {
+		if state, ok := fs.committedMutation(fh.Ino); ok && state.committedSeq > event.seq {
+			if fs.adoptCommittedMutationLocked(fh, state) {
+				return true
+			}
+			fh.pendingSQLiteTruncate.CompareAndSwap(nil, event)
+			return false
+		}
 	}
 	fh.appendLogRecordTruncate()
 	_ = fh.Dirty.Truncate(0) // Zero is always within the buffer's size limit.
@@ -2267,6 +2285,7 @@ func (fs *Dat9FS) applySQLiteZeroTruncateLocked(fh *FileHandle) {
 		fh.ShadowReady = false
 		fh.ShadowSpill = false
 		fh.BaseRev = revision
+		fh.IsNew = false
 		fs.rebindCleanWriteBufferToRemoteLocked(fh, size)
 		fh.appendLogAdoptCommittedBaseline(revision, size)
 	}
@@ -2274,6 +2293,7 @@ func (fs *Dat9FS) applySQLiteZeroTruncateLocked(fh *FileHandle) {
 		fh.Streamer.ResetForNextWrite(expectedRevisionForHandle(fh))
 	}
 	clearReadTargetForLockedHandle(fh)
+	return true
 }
 
 func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64, callerPID uint32, truncateSize int64) {
@@ -4763,7 +4783,11 @@ func (fs *Dat9FS) readSQLitePersistentJournalCommittedCache(path string, fallbac
 	if revision <= 0 {
 		revision = fallbackRevision
 	}
-	if revision <= 0 {
+	if fs.layerEnabled() {
+		// Layer upserts retain their base revision and cache committed bytes
+		// with revision 0. A normal-file revision cannot validate that cache.
+		revision = 0
+	} else if revision <= 0 {
 		return nil, 0, false
 	}
 	data, ok := fs.readCache.Get(path, revision)
