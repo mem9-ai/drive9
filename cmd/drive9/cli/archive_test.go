@@ -290,7 +290,7 @@ func TestArchiveFileGlobDoesNotPruneMatchingDirectory(t *testing.T) {
 	c := client.New(srv.URL, "")
 	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
 	out := filepath.Join(t.TempDir(), "proj.tar.gz")
-	if err := Archive(c, []string{":/proj", out, "--exclude", "**/*-wal", "--exclude", "**/[a-]/**"}); err != nil {
+	if err := Archive(c, []string{":/proj", out, "--exclude", "**/*-wal", "--exclude", "**/[a-]"}); err != nil {
 		t.Fatalf("Archive: %v", err)
 	}
 	got := tarEntries(t, out)

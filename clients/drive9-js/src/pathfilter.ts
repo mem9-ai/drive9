@@ -74,6 +74,11 @@ function containsSubpath(segments: string[], subpath: string[], endOnly = false)
  */
 function globMatch(pattern: string, value: string): boolean {
   if (pattern === value) return true;
+  return compileGlob(pattern)?.test(value) ?? false;
+}
+
+// Return null for malformed glob syntax so it retains literal fallback.
+function compileGlob(pattern: string): RegExp | null {
   const chars = Array.from(pattern);
   // Node 18 can split surrogate pairs in negated classes after a literal prefix.
   // A guarded Unicode dot consumes one code point on every supported runtime.
@@ -108,19 +113,19 @@ function globMatch(pattern: string, value: string): boolean {
         let count = 0;
         while (i < chars.length && (chars[i] !== "]" || count === 0)) {
           const lo = readChar();
-          if (lo === undefined) return false;
+          if (lo === undefined) return null;
           let hi = lo;
           if (chars[i] === "-") {
             i++;
             const end = readChar();
-            if (end === undefined) return false;
+            if (end === undefined) return null;
             hi = end;
           }
           // Go allows reversed ranges; they contribute no matching runes.
           if (lo <= hi) ranges += `\\u{${lo.toString(16)}}-\\u{${hi.toString(16)}}`;
           count++;
         }
-        if (chars[i] !== "]" || count === 0) return false;
+        if (chars[i] !== "]" || count === 0) return null;
         i++;
         re += negated ? `(?![${ranges}]).` : `[${ranges}]`;
         break;
@@ -132,7 +137,7 @@ function globMatch(pattern: string, value: string): boolean {
     }
   }
   re += "$";
-  return new RegExp(re, "su").test(value);
+  return new RegExp(re, "su");
 }
 
 /** Compile a single pattern string. Throws on invalid input. */
@@ -145,8 +150,10 @@ export function compile(raw: string): Pattern {
     if (rest.endsWith("/**")) rest = rest.slice(0, -3);
     if (rest.endsWith("/")) rest = rest.slice(0, -1);
     if (rest !== "") {
-      const subpathEndOnly = !cleaned.endsWith("/**") && /[*?\[]/.test(rest);
-      return { raw, kind: "subpath", subpath: splitSegments(rest), subpathEndOnly };
+      const subpath = splitSegments(rest);
+      const subpathEndOnly = !cleaned.endsWith("/**") &&
+        subpath.some((segment) => /[*?\[]/.test(segment) && compileGlob(segment) !== null);
+      return { raw, kind: "subpath", subpath, subpathEndOnly };
     }
   }
   if (cleaned.endsWith("/**")) {
