@@ -2022,6 +2022,9 @@ func (fs *Dat9FS) commitEntrySuperseded(entry *CommitEntry) bool {
 // than the committed inode watermark into a clean view of the committed file.
 // Caller must hold fh.mu. Shared path-keyed staging is intentionally untouched.
 func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
+	if fh != nil {
+		fs.applySQLiteZeroTruncateLocked(fh)
+	}
 	if fh == nil || fh.DirtySeq == 0 {
 		return false
 	}
@@ -2210,6 +2213,67 @@ func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) (f
 		fh.OrigSize = newSize
 	}
 	return abortStreamer, nil
+}
+
+// publishSQLiteZeroTruncate synchronizes the same inode's linked writable
+// handles without waiting on a sibling that may be waiting for our path lock.
+func (fs *Dat9FS) publishSQLiteZeroTruncate(ino uint64, source *FileHandle, seq uint64, revision int64) {
+	event := &sqliteHandleTruncate{seq: seq, revision: revision}
+	for _, fh := range fs.fileHandlesForInode(ino) {
+		if fh == source {
+			continue
+		}
+		fh.pendingSQLiteTruncate.Store(event)
+		if fh.TryLock() {
+			fs.applySQLiteZeroTruncateLocked(fh)
+			fh.Unlock()
+		}
+	}
+}
+
+// applySQLiteZeroTruncateLocked updates only this handle's buffer. The shared
+// shadow was truncated by the initiating FD and may already contain new writes.
+func (fs *Dat9FS) applySQLiteZeroTruncateLocked(fh *FileHandle) {
+	event := fh.pendingSQLiteTruncate.Swap(nil)
+	if event == nil || fh.Dirty == nil || fh.Unlinked || fh.UnlinkedSnapshot || fh.UnlinkedData != nil ||
+		fh.DirtySeq >= event.seq || fh.BaseRev > event.revision {
+		return
+	}
+	fh.appendLogRecordTruncate()
+	_ = fh.Dirty.Truncate(0) // Zero is always within the buffer's size limit.
+	fh.Dirty.remoteSize = 0
+	fh.Dirty.LoadPart = nil
+	fh.Dirty.ResetStreamingState()
+	fh.Dirty.ResetSequentialState(0)
+	if fh.ShadowSpill {
+		wb := fh.Dirty
+		wb.OnPartFull = func(partIdx int, _ []byte) { wb.EvictPart(partIdx) }
+	}
+	fh.OrigSize = 0
+	// The initiating FD owns the truncate mutation. A sibling remains a
+	// clean reader, so later writes on that FD are visible through it too.
+	fh.Dirty.ClearDirty()
+	fh.ZeroBase = false
+	fh.DirtySeq = 0
+	fh.WriteBackSeq = 0
+	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
+	// A busy sibling may be reached only after another handle has committed
+	// the next generation. Its pending truncate must not hide that commit.
+	if revision, size, hasSize := fs.latestCommittedRevisionWithSize(fh.Path); revision > event.revision {
+		if !hasSize {
+			size = fs.committedHandleSizeLocked(fh)
+		}
+		fh.ShadowReady = false
+		fh.ShadowSpill = false
+		fh.BaseRev = revision
+		fs.rebindCleanWriteBufferToRemoteLocked(fh, size)
+		fh.appendLogAdoptCommittedBaseline(revision, size)
+	}
+	if fh.Streamer != nil {
+		fh.Streamer.ResetForNextWrite(expectedRevisionForHandle(fh))
+	}
+	clearReadTargetForLockedHandle(fh)
 }
 
 func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64, callerPID uint32, truncateSize int64) {
@@ -4445,6 +4509,10 @@ restartLoop:
 				pending = true
 				continue
 			}
+			if src.Unlinked || src.UnlinkedSnapshot || src.UnlinkedData != nil {
+				src.Unlock()
+				continue
+			}
 			if src.Dirty != nil && src.DirtySeq > 0 {
 				candidates = append(candidates, candidate{fh: src, dirtySeq: src.DirtySeq})
 			}
@@ -4466,7 +4534,7 @@ restartLoop:
 			if !src.TryLock() {
 				return nil, 0, false, gofuse.OK, true
 			}
-			if src.Dirty == nil || src.DirtySeq == 0 {
+			if src.Dirty == nil || src.DirtySeq == 0 || src.Unlinked || src.UnlinkedSnapshot || src.UnlinkedData != nil {
 				src.Unlock()
 				continue
 			}
@@ -8382,9 +8450,16 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
 				}
+				publishTruncate := newSize == 0 && isSQLitePersistentJournalPath(entry.Path) &&
+					!entry.Unlinked && !fh.Unlinked && !fh.UnlinkedSnapshot && fh.UnlinkedData == nil
+				truncateSeq := fh.DirtySeq
+				truncateRevision := max(fh.BaseRev, fs.latestCommittedRevision(entry.Path))
 				fh.Unlock()
 				if abortStreamer != nil {
 					abortStreamer()
+				}
+				if publishTruncate {
+					fs.publishSQLiteZeroTruncate(input.NodeId, fh, truncateSeq, truncateRevision)
 				}
 			}
 		} else {
@@ -11406,6 +11481,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	lockStart := time.Now()
 	fh.Lock()
 	lockWait := time.Since(lockStart)
+	fs.applySQLiteZeroTruncateLocked(fh)
 	fs.refreshAppendLogReaderShadowLocked(fh)
 	if fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 		fs.debugf("read lock wait path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, lockWait)
