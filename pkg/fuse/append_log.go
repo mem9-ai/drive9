@@ -325,6 +325,11 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	remoteCommitLockStarted := time.Now()
 	unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
 	remoteCommitLockWait := time.Since(remoteCommitLockStarted)
+	// SetAttr can publish while this handle waits for the path fence.
+	if fs.applySQLiteZeroTruncateLocked(fh) {
+		unlockRemoteCommit()
+		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+	}
 	snapshotOwnsShadow := fh.ShadowReady || fh.ShadowSpill
 	snapshot, err := fs.newAppendLogSnapshotLocked(fh, start, snapshotSize-start)
 	if err != nil {
@@ -703,6 +708,10 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	remoteCommitLockStarted := time.Now()
 	unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
 	remoteCommitLockWait := time.Since(remoteCommitLockStarted)
+	if fs.applySQLiteZeroTruncateLocked(fh) {
+		unlockRemoteCommit()
+		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+	}
 	layout := fh.appendLogLayoutAt(expectedRevision, expectedSize)
 	if layout == "" {
 		stat, err := fs.client.StatCtx(ctx, fs.remotePath(snapshotPath))
@@ -832,6 +841,10 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	remoteCommitLockStarted := time.Now()
 	unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
 	remoteCommitLockWait := time.Since(remoteCommitLockStarted)
+	if fs.applySQLiteZeroTruncateLocked(fh) {
+		unlockRemoteCommit()
+		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+	}
 	snapshotOwnsShadow := fh.ShadowReady || fh.ShadowSpill
 	layout := fh.appendLogLayoutAt(expectedRevision, expectedSize)
 	if layout == "" {
