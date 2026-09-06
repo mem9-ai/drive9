@@ -300,6 +300,9 @@ func TestArchiveFileGlobDoesNotPruneMatchingDirectory(t *testing.T) {
 	if contains(got, "proj/snapshots-wal/repro.db-wal") || contains(got, "proj/[a-]/data.bin") {
 		t.Fatalf("excluded files leaked into archive: %v", got)
 	}
+	if contains(got, "proj/snapshots-wal/") || contains(got, "proj/[a-]/") {
+		t.Fatalf("excluded directory entries leaked into archive: %v", got)
+	}
 }
 
 func TestArchiveZipFormat(t *testing.T) {
