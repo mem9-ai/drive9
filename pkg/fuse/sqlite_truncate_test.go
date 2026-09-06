@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -29,7 +31,7 @@ func TestSQLiteSidecarTruncateFollowsLinkedFile(t *testing.T) {
 		{"wal-append-log", "-wal", true},
 		{"journal", "-journal", false},
 	} {
-		for _, truncateMode := range []string{"other-handle", "path", "same-handle", "nonzero-fd"} {
+		for _, truncateMode := range []string{"other-handle", "other-handle-shorter", "other-handle-writes-shorter", "path", "same-handle", "nonzero-fd"} {
 			for _, readerKind := range []string{"read-only", "clean-writable", "shadow-spill", "read-only-no-shadow", "clean-writable-no-shadow"} {
 				readOnly := strings.HasPrefix(readerKind, "read-only")
 				nonzeroShrink := truncateMode == "nonzero-fd"
@@ -40,6 +42,9 @@ func TestSQLiteSidecarTruncateFollowsLinkedFile(t *testing.T) {
 					filePath := "/workload.db" + sidecar.suffix
 					a := makeSQLiteTruncateWALForTest(t, 1, 2, 'A')
 					b := makeSQLiteTruncateWALForTest(t, 3, 4, 'B')
+					if strings.HasSuffix(truncateMode, "shorter") {
+						a = append(a, cloneBytes(a[sqliteWALHeaderSize:])...)
+					}
 					if nonzeroShrink {
 						// journal_size_limit=0 preserves the new generation's
 						// committed frame, removing only the old generation's tail.
@@ -204,7 +209,7 @@ func TestSQLiteSidecarTruncateFollowsLinkedFile(t *testing.T) {
 					// The original writable WAL handle also writes the new generation,
 					// as gVisor retains its I/O FD across the separate truncate FD.
 					writerID := readerID
-					if readOnly {
+					if readOnly || truncateMode == "other-handle-writes-shorter" {
 						writerID = truncateID
 					}
 					for _, chunk := range []struct{ offset, end int }{{0, 32}, {32, len(b)}} {
@@ -217,6 +222,10 @@ func TestSQLiteSidecarTruncateFollowsLinkedFile(t *testing.T) {
 						}
 					}
 					read("after generation B fsync", b)
+					got, st, err := readDat9FSTestRange(fs, ino, readerID, int64(len(b)), 1)
+					if err != nil || st != gofuse.OK || len(got) != 0 {
+						t.Errorf("after generation B fsync: status=%v err=%v bytes=%d beyond EOF", st, err, len(got))
+					}
 					_, body, puts := remote.snapshot()
 					if !bytes.Equal(body, b) {
 						t.Errorf("remote bytes differ from B: size=%d", len(body))
@@ -236,6 +245,152 @@ func TestSQLiteSidecarTruncateFollowsLinkedFile(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestSQLiteZeroTruncateBusySibling(t *testing.T) {
+	for _, gvisor := range []bool{false, true} {
+		for _, phase := range []string{"write", "newer-write", "newer-commit"} {
+			t.Run(fmt.Sprintf("gvisor=%t/%s", gvisor, phase), func(t *testing.T) {
+				const filePath = "/busy.db-wal"
+				oldData := []byte("old WAL bytes that must not survive")
+				newData := []byte("new")
+				remote, ts := newCASFileServer(t, filePath, 7, oldData)
+				t.Cleanup(ts.Close)
+				opts := &MountOptions{GVisorCompat: gvisor}
+				opts.setDefaults()
+				fs := NewDat9FS(newTestClient(ts.URL), opts)
+				ino := fs.inodes.Lookup(filePath, false, int64(len(oldData)), time.Now())
+				fs.inodes.UpdateRevision(ino, 7)
+				fs.recordCommittedRevisionWithSize(filePath, 7, int64(len(oldData)))
+				open := func() (uint64, *FileHandle) {
+					fh := &FileHandle{Ino: ino, Path: filePath, Flags: syscall.O_RDWR, BaseRev: 7, OrigSize: int64(len(oldData)),
+						Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0)}
+					if _, err := fh.Dirty.Write(0, oldData); err != nil {
+						t.Fatal(err)
+					}
+					fh.Dirty.ClearDirty()
+					id := fs.allocateFileHandle(fh)
+					t.Cleanup(func() { fs.deleteFileHandle(id, fh) })
+					return id, fh
+				}
+				originalID, original := open()
+				truncateID, _ := open()
+				original.Lock()
+				unlockOriginal := sync.OnceFunc(original.Unlock)
+				t.Cleanup(unlockOriginal)
+				done := make(chan gofuse.Status, 1)
+				go func() {
+					var out gofuse.AttrOut
+					done <- fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+						InHeader: gofuse.InHeader{NodeId: ino}, Valid: gofuse.FATTR_SIZE | gofuse.FATTR_FH, Fh: truncateID,
+					}}, &out)
+				}()
+				select {
+				case st := <-done:
+					if st != gofuse.OK {
+						t.Fatalf("truncate: %v", st)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("truncate blocked on a busy sibling")
+				}
+				write := func(id uint64, offset uint64, data []byte, durable bool) {
+					t.Helper()
+					if n, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: id, Offset: offset}, data); st != gofuse.OK || int(n) != len(data) {
+						t.Fatalf("Write = %d/%v", n, st)
+					}
+					if durable {
+						if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: id}); st != gofuse.OK {
+							t.Fatalf("Fsync = %v", st)
+						}
+					}
+				}
+				if phase != "write" {
+					write(truncateID, 0, newData, phase == "newer-commit")
+				}
+				unlockOriginal()
+				if phase != "write" {
+					got, st, err := readDat9FSTestRange(fs, ino, originalID, 0, len(newData))
+					if err != nil || st != gofuse.OK || !bytes.Equal(got, newData) {
+						t.Errorf("late truncate hid newer bytes: %q/%v/%v", got, st, err)
+					}
+					if phase == "newer-write" {
+						if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: truncateID}); st != gofuse.OK {
+							t.Fatalf("newer write Fsync = %v", st)
+						}
+					}
+					write(originalID, uint64(len(newData)), []byte("!"), true)
+					newData = append(newData, '!')
+				} else {
+					write(originalID, 0, newData, true)
+				}
+				_, body, _ := remote.snapshot()
+				if !bytes.Equal(body, newData) {
+					t.Fatalf("remote bytes = %q, want %q", body, newData)
+				}
+			})
+		}
+	}
+}
+
+func TestSQLiteReplacementOldHandleTruncateDoesNotPublishEOF(t *testing.T) {
+	for _, suffix := range []string{"-wal", "-journal"} {
+		t.Run(suffix, func(t *testing.T) {
+			const oldPath = "/replacement.tmp"
+			newPath := "/workload.db" + suffix
+			oldData := []byte("old detached inode")
+			newData := []byte("new linked inode contents")
+			var renamed atomic.Bool
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+newPath:
+					if renamed.Load() {
+						_, _ = w.Write(newData)
+					} else {
+						_, _ = w.Write(oldData)
+					}
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+newPath && r.URL.Query().Has("rename"):
+					renamed.Store(true)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			t.Cleanup(ts.Close)
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			oldIno := fs.inodes.Lookup(newPath, false, int64(len(oldData)), time.Now())
+			newIno := fs.inodes.Lookup(oldPath, false, int64(len(newData)), time.Now())
+			old := &FileHandle{Ino: oldIno, Path: newPath, BaseRev: 7, OrigSize: int64(len(oldData)), Flags: syscall.O_RDWR,
+				Dirty: fs.newWriteBuffer(newPath, maxPreloadSize, 0)}
+			if _, err := old.Dirty.Write(0, oldData); err != nil {
+				t.Fatal(err)
+			}
+			old.Dirty.ClearDirty()
+			oldID := fs.allocateFileHandle(old)
+			t.Cleanup(func() { fs.deleteFileHandle(oldID, old) })
+			reader := &FileHandle{Ino: newIno, Path: oldPath, BaseRev: 8, OrigSize: int64(len(newData))}
+			readerID := fs.allocateFileHandle(reader)
+			t.Cleanup(func() { fs.deleteFileHandle(readerID, reader) })
+			if st := fs.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1},
+				strings.TrimPrefix(oldPath, "/"), strings.TrimPrefix(newPath, "/")); st != gofuse.OK {
+				t.Fatalf("Rename: %v", st)
+			}
+			if !bytes.Equal(old.UnlinkedData, oldData) {
+				t.Fatal("rename did not preserve the old inode snapshot")
+			}
+			var out gofuse.AttrOut
+			if st := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+				InHeader: gofuse.InHeader{NodeId: oldIno}, Valid: gofuse.FATTR_SIZE | gofuse.FATTR_FH, Fh: oldID,
+			}}, &out); st != gofuse.OK {
+				t.Fatalf("old handle truncate: %v", st)
+			}
+			got, st, err := readDat9FSTestRange(fs, newIno, readerID, 0, len(newData))
+			if err != nil || st != gofuse.OK || !bytes.Equal(got, newData) {
+				t.Fatalf("replacement read after old handle truncate = %q/%v/%v, want %q", got, st, err, newData)
+			}
+		})
 	}
 }
 
