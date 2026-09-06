@@ -1702,14 +1702,6 @@ func (fs *Dat9FS) bypassStableRemoteReadCaches(localPath string) bool {
 	return false
 }
 
-func shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath string) bool {
-	return isSQLitePersistentJournalPath(localPath)
-}
-
-func shouldSnapshotOpenSQLiteSidecarOnTruncate(localPath string, newSize int64) bool {
-	return newSize == 0 && isSQLitePersistentJournalPath(localPath)
-}
-
 func isSQLiteVisibleSamePathDirtyPath(localPath string) bool {
 	canonical, err := pathutil.Canonicalize(localPath)
 	if err != nil {
@@ -2135,11 +2127,16 @@ func (fs *Dat9FS) forgetMutationState(ino uint64) {
 	fs.dirtyMu.Unlock()
 }
 
-func shouldRefreshHandleAfterPathTruncate(fh *FileHandle) bool {
+func shouldRefreshHandleAfterPathTruncate(fh *FileHandle, newSize int64) bool {
 	if fh == nil || fh.Dirty == nil {
 		return false
 	}
 	if fh.ZeroBase {
+		return true
+	}
+	// Zero truncate discards the clean journal's entire old payload, so it
+	// can adopt the new revision without rebasing retained bytes.
+	if newSize == 0 && !fh.Unlinked && fh.UnlinkedData == nil && isSQLitePersistentJournalPath(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
 		return true
 	}
 	return fh.Flags&syscall.O_TRUNC != 0
@@ -2248,7 +2245,7 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 			}
 			adoptedPathTruncate = true
 		}
-		if !shouldRefreshHandleAfterPathTruncate(fh) {
+		if !shouldRefreshHandleAfterPathTruncate(fh, truncateSize) {
 			fh.Unlock()
 			continue
 		}
@@ -4478,6 +4475,10 @@ restartLoop:
 				pending = true
 				continue restartLoop
 			}
+			if src.ZeroBase && src.Dirty.Size() == 0 && !src.Unlinked {
+				src.Unlock()
+				return nil, 0, true, gofuse.OK, false
+			}
 			if end > src.Dirty.Size() {
 				pending = true
 				src.Unlock()
@@ -5231,20 +5232,6 @@ func (fs *Dat9FS) snapshotOpenHandlesBeforeUnlink(ctx context.Context, localPath
 
 func (fs *Dat9FS) snapshotOpenHandlesBeforePathReplacement(ctx context.Context, localPath string) error {
 	return fs.snapshotOpenHandlesForPath(ctx, localPath, nil)
-}
-
-func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeTruncate(ctx context.Context, localPath string, skip *FileHandle, newSize int64) error {
-	if !shouldSnapshotOpenSQLiteSidecarOnTruncate(localPath, newSize) {
-		return nil
-	}
-	return fs.snapshotOpenSQLiteSidecarHandles(ctx, localPath, skip)
-}
-
-func (fs *Dat9FS) snapshotOpenSQLiteSidecarHandles(ctx context.Context, localPath string, skip *FileHandle) error {
-	if fs == nil || fs.openHandles == nil || !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
-		return nil
-	}
-	return fs.snapshotOpenHandlesForPath(ctx, localPath, skip)
 }
 
 func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath string, skip *FileHandle) error {
@@ -8385,11 +8372,6 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		if input.Valid&gofuse.FATTR_FH != 0 {
 			// ftruncate(fd, size): truncate the open write buffer.
 			fh, ok := fs.fileHandles.Get(input.Fh)
-			if ok {
-				if err := fs.snapshotOpenSQLiteSidecarBeforeTruncate(ctx, entry.Path, fh, newSize); err != nil {
-					return httpToFuseStatus(err)
-				}
-			}
 			if ok && fh.Dirty != nil {
 				var abortStreamer func()
 				fh.Lock()
@@ -8406,9 +8388,6 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				}
 			}
 		} else {
-			if err := fs.snapshotOpenSQLiteSidecarBeforeTruncate(ctx, entry.Path, nil, newSize); err != nil {
-				return httpToFuseStatus(err)
-			}
 			if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
 				return st
 			}
