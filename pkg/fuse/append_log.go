@@ -328,6 +328,10 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	// SetAttr can publish while this handle waits for the path fence.
 	if fs.applySQLiteZeroTruncateLocked(fh) {
 		unlockRemoteCommit()
+		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+			safeLogPrintf("append-log pending chmod failed for %s: %v", snapshotPath, err)
+			return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
+		}
 		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 	}
 	snapshotOwnsShadow := fh.ShadowReady || fh.ShadowSpill
@@ -710,6 +714,10 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	remoteCommitLockWait := time.Since(remoteCommitLockStarted)
 	if fs.applySQLiteZeroTruncateLocked(fh) {
 		unlockRemoteCommit()
+		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+			safeLogPrintf("append-log generation-reset pending chmod failed for %s: %v", snapshotPath, err)
+			return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
+		}
 		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 	}
 	layout := fh.appendLogLayoutAt(expectedRevision, expectedSize)
@@ -843,6 +851,10 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	remoteCommitLockWait := time.Since(remoteCommitLockStarted)
 	if fs.applySQLiteZeroTruncateLocked(fh) {
 		unlockRemoteCommit()
+		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+			safeLogPrintf("append-log full-rewrite pending chmod failed for %s: %v", snapshotPath, err)
+			return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
+		}
 		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 	}
 	snapshotOwnsShadow := fh.ShadowReady || fh.ShadowSpill
