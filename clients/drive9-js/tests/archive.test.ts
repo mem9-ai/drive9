@@ -167,6 +167,8 @@ describe("archive", () => {
     expect(names).not.toContain("proj/snapshots-wal/repro.db-wal");
     expect(names).toContain("proj/a/data.bin");
     expect(names).not.toContain("proj/[a-]/data.bin");
+    expect(names).not.toContain("proj/snapshots-wal/");
+    expect(names).not.toContain("proj/[a-]/");
   });
 
   it("normalizes decomposed exclude patterns for NFC API paths", async () => {
