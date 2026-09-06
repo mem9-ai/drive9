@@ -1139,6 +1139,12 @@ func (fs *Dat9FS) tryAppendLogPathTruncate(ctx context.Context, entry *InodeEntr
 	}
 
 	fs.recordCommittedRevisionWithSize(entry.Path, revision, newSize)
+	if newSize == 0 && fs.shadowStore != nil {
+		// Path truncate has no handle to publish the empty shadow. Retire
+		// the old backing so linked readers cannot keep its pre-truncate bytes.
+		fs.shadowStore.removeAfterAppendLogCommit(entry.Path, revision)
+		fs.clearRemovedCommittedShadowForOpenHandles(entry.Path, revision, newSize)
+	}
 	entry.Revision = revision
 	entry.Size = newSize
 	fs.inodes.UpdateRevision(ino, revision)
