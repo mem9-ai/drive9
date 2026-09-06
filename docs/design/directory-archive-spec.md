@@ -97,6 +97,9 @@ Go and TypeScript normalize patterns and runtime paths to NFC before matching,
 and match `?` and character classes by Unicode code point.
 Character classes follow Go `path.Match` syntax, including non-empty classes
 and well-formed range endpoints. Invalid globs retain literal-equality fallback.
+Star backtracking stays on Unicode code-point boundaries: `*??` requires at least
+two characters. Backslashes are rejected in patterns, including character-class
+escapes, following drive9 path validation.
 
 ### Directory pruning
 

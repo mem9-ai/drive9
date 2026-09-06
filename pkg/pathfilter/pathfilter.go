@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
@@ -23,7 +24,7 @@ type Pattern struct {
 }
 
 // Compile parses a single pattern. Empty/whitespace patterns are rejected.
-// Each segment after a leading **/ supports path.Match globs and literal
+// Each segment after a leading **/ supports Go glob syntax and literal
 // equality. Recursive globs without /** must match the end of the path;
 // literal subpaths and patterns ending in /** also match descendants.
 func Compile(raw string) (Pattern, error) {
@@ -124,10 +125,7 @@ func (p Pattern) matchCanonical(cleaned string) bool {
 		return cleaned == p.prefix || strings.HasPrefix(cleaned, p.prefix+"/")
 	}
 	if p.exact != "" {
-		if ok, err := path.Match(p.exact, cleaned); err == nil && ok {
-			return true
-		}
-		return cleaned == p.exact
+		return matchGlob(p.exact, cleaned)
 	}
 	return false
 }
@@ -257,7 +255,7 @@ func containsSubpath(segments, subpath []string, endOnly bool) bool {
 			if segments[start+offset] == subpath[offset] {
 				continue
 			}
-			if ok, err := path.Match(subpath[offset], segments[start+offset]); err != nil || !ok {
+			if !matchGlob(subpath[offset], segments[start+offset]) {
 				matched = false
 				break
 			}
@@ -267,4 +265,62 @@ func containsSubpath(segments, subpath []string, endOnly bool) bool {
 		}
 	}
 	return false
+}
+
+// matchGlob preserves path.Match syntax and literal fallback, but constrains
+// star backtracking to rune boundaries. Go 1.25 path.Match also tries offsets
+// inside UTF-8 characters, which can make *?? match a single supplementary rune.
+func matchGlob(pattern, value string) bool {
+	if pattern == value {
+		return true
+	}
+	ok, err := path.Match(pattern, value)
+	if err != nil || !ok {
+		return false
+	}
+	if !strings.ContainsRune(pattern, '*') || utf8.RuneCountInString(value) == len(value) {
+		return true
+	}
+
+	// The successful path.Match validated the classes; canonical patterns have
+	// no backslash escapes. Each non-star token consumes exactly one rune.
+	var tokens []string
+	runes := []rune(pattern)
+	for start := 0; start < len(runes); {
+		end := start + 1
+		if runes[start] == '[' {
+			for runes[end] != ']' {
+				end++
+			}
+			end++
+		}
+		tokens = append(tokens, string(runes[start:end]))
+		start = end
+	}
+
+	runes = []rune(value)
+	patternPos, valuePos, star, retry := 0, 0, -1, 0
+	for valuePos < len(runes) {
+		if patternPos < len(tokens) && tokens[patternPos] == "*" {
+			star, retry = patternPos, valuePos
+			patternPos++
+			continue
+		}
+		if patternPos < len(tokens) {
+			if ok, _ := path.Match(tokens[patternPos], string(runes[valuePos])); ok {
+				patternPos++
+				valuePos++
+				continue
+			}
+		}
+		if star < 0 || retry == len(runes) || runes[retry] == '/' {
+			return false
+		}
+		retry++
+		patternPos, valuePos = star+1, retry
+	}
+	for patternPos < len(tokens) && tokens[patternPos] == "*" {
+		patternPos++
+	}
+	return patternPos == len(tokens)
 }

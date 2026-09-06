@@ -67,6 +67,20 @@ describe("pathfilter recursive glob segments", () => {
     ["**/caf\u00e9*.txt", "proj/cafe\u03011.txt", true],
     ["**/caf?.txt", "proj/cafe\u0301.txt", true],
     ["**/caf[e\u0301].txt", "proj/caf\u00e9.txt", true],
+    ["**/*?", "proj/\u{1f600}", true],
+    ["**/*??", "proj/\u{1f600}", false],
+    ["**/*??", "proj/\u{1f600}a", true],
+    ["**/*[^a][^a]", "proj/\u{1f600}", false],
+    ["**/*[\ufffd]", "proj/\u{1f600}", false],
+    ["**/*??x", "proj/\u{1f600}x", false],
+    ["**/*a*??", "proj/a\u{1f600}", false],
+    ["**/*a*??", "proj/a\u{1f600}a", true],
+    ["**/[*]*??", "proj/*\u{1f600}", false],
+    ["**/*-wal", "proj/\u{1f600}-wal", true],
+    ["*??", "\u{1f600}", false],
+    ["*??/file", "\u{1f600}/file", false],
+    ["*?/file", "\u{1f600}/file", true],
+    ["*?file", "\u{1f600}/file", false],
     ["**/[a-]/**", "proj/a/item", false],
     ["**/[a-]/**", "proj/[a-]/item", true],
     ["**/[a-]/**", "proj/-/item", false],
@@ -124,6 +138,12 @@ describe("pathfilter matcher", () => {
 });
 
 describe("pathfilter validate", () => {
+  it.each(["**/[\\-]/**", "**/[\\]]/**"])("rejects backslashes in %s", (pattern) => {
+    expect(() => compile(pattern)).toThrow("backslash");
+    expect(validate([pattern])).toBeInstanceOf(Error);
+    expect(compileAll([pattern])).toEqual([]);
+  });
+
   it("returns null for valid patterns", () => {
     expect(validate(["dist/**", "*.log"], ["**/x/**"])).toBeNull();
   });
