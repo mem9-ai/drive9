@@ -5,7 +5,7 @@
 //   - name      exact name or glob (e.g. *.log, go.mod)
 // Each segment after **/ supports globs and literal equality. Recursive globs
 // without /** must end at the final segment; literal rules retain subtrees.
-// Patterns are canonicalized (whitespace-trimmed, leading "/" stripped) before
+// Patterns are NFC-normalized, whitespace-trimmed, and leading "/" stripped before
 // compilation; runtime paths are matched against the same canonical form.
 
 /** A compiled path-filter pattern. */
@@ -40,7 +40,7 @@ function trimSlashes(s: string): string {
 }
 
 function canonical(value: string): string {
-  return trimSlashes(value.trim());
+  return trimSlashes(value.trim()).normalize("NFC");
 }
 
 function splitSegments(value: string): string[] {
