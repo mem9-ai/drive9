@@ -3,6 +3,8 @@
 //   - **/x/**   matches any path containing the x subpath (e.g. **/node_modules/**)
 //   - prefix/** matches everything under a prefix (e.g. dist/**)
 //   - name      exact name or glob (e.g. *.log, go.mod)
+// Each segment after **/ supports globs and literal equality; a matching
+// subpath includes descendants with or without a trailing /**.
 // Patterns are canonicalized (whitespace-trimmed, leading "/" stripped) before
 // compilation; runtime paths are matched against the same canonical form.
 
@@ -51,10 +53,13 @@ function containsSubpath(segments: string[], subpath: string[]): boolean {
   for (let start = 0; start <= segments.length - subpath.length; start++) {
     let matched = true;
     for (let i = 0; i < subpath.length; i++) {
-      if (segments[start + i] !== subpath[i]) {
-        matched = false;
-        break;
+      try {
+        if (globMatch(subpath[i], segments[start + i])) continue;
+      } catch {
+        // Invalid globs only match literally, checked first by globMatch.
       }
+      matched = false;
+      break;
     }
     if (matched) return true;
   }

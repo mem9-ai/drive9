@@ -1252,9 +1252,10 @@ func TestAppendLogWriteSyncRollbackRestoresPriorDirtyGeneration(t *testing.T) {
 }
 
 func TestAppendLogEntryPointFsyncForcesRemoteAppendInInteractiveMode(t *testing.T) {
+	const walPath = "/issue-validation/run/case/repro.db-wal"
 	var appendCalls int
 	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || !r.URL.Query().Has("append-log") {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs"+walPath || !r.URL.Query().Has("append-log") {
 			t.Errorf("request = %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -1263,6 +1264,8 @@ func TestAppendLogEntryPointFsyncForcesRemoteAppendInInteractiveMode(t *testing.
 		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
 	})
 	defer closeServer()
+	fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/*-wal"})
+	fh.Path = walPath
 	fs.syncMode = SyncInteractive
 	fs.perf = newFusePerfCounters(true)
 	handleID := fs.fileHandles.Allocate(fh)

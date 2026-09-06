@@ -1,4 +1,6 @@
-# drive9 directory archive (`drive9 fs archive`)
+---
+title: drive9 directory archive (drive9 fs archive)
+---
 
 Design spec for downloading a remote directory tree as a single compressed
 archive (tar.gz by default, zip optional), with profile-based file filtering.
@@ -78,9 +80,15 @@ Three forms (mirrored from the FUSE `LocalPolicy` matcher, now extracted to
 
 | Form | Example | Meaning |
 |------|---------|---------|
-| `**/x/**` (or `**/x`) | `**/node_modules/**` | Path contains the `x` subpath at any depth |
+| `**/x/**` (or `**/x`) | `**/node_modules/**`, `**/*-wal` | Path contains the `x` subpath at any depth; each segment supports glob matching and literal equality |
 | `prefix/**` | `dist/**` | Everything under the prefix |
 | exact / glob | `*.log`, `go.mod` | `path.Match` glob + exact equality |
+
+In the leading `**/` form, `*`, `?`, and character classes match within a
+single segment. A matched subpath includes its descendants, with or without
+the trailing `/**`. For example, `**/*-wal` matches `repro.db-wal` at the root
+or under any directory; `**/cache-*/*.log` requires the log to be directly
+inside a matching cache directory.
 
 ### Directory pruning
 

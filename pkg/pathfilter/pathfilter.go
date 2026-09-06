@@ -22,6 +22,8 @@ type Pattern struct {
 }
 
 // Compile parses a single pattern. Empty/whitespace patterns are rejected.
+// Each segment after a leading **/ supports path.Match globs and literal
+// equality; matching subpaths also match their descendants, with or without /**.
 func Compile(raw string) (Pattern, error) {
 	cleaned, err := canonical(raw)
 	if err != nil {
@@ -238,7 +240,10 @@ func containsSubpath(segments, subpath []string) bool {
 	for start := 0; start <= len(segments)-len(subpath); start++ {
 		matched := true
 		for offset := range subpath {
-			if segments[start+offset] != subpath[offset] {
+			if segments[start+offset] == subpath[offset] {
+				continue
+			}
+			if ok, err := path.Match(subpath[offset], segments[start+offset]); err != nil || !ok {
 				matched = false
 				break
 			}
