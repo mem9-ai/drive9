@@ -15,15 +15,17 @@ import (
 
 // Pattern is a compiled path-filter pattern. The zero value never matches.
 type Pattern struct {
-	raw     string
-	subpath []string
-	prefix  string
-	exact   string
+	raw            string
+	subpath        []string
+	subpathEndOnly bool
+	prefix         string
+	exact          string
 }
 
 // Compile parses a single pattern. Empty/whitespace patterns are rejected.
 // Each segment after a leading **/ supports path.Match globs and literal
-// equality; matching subpaths also match their descendants, with or without /**.
+// equality. Recursive globs without /** must match the end of the path;
+// literal subpaths and patterns ending in /** also match descendants.
 func Compile(raw string) (Pattern, error) {
 	cleaned, err := canonical(raw)
 	if err != nil {
@@ -35,6 +37,7 @@ func Compile(raw string) (Pattern, error) {
 		rest = strings.TrimSuffix(rest, "/**")
 		rest = strings.TrimSuffix(rest, "/")
 		if rest != "" {
+			p.subpathEndOnly = !strings.HasSuffix(cleaned, "/**") && strings.ContainsAny(rest, "*?[")
 			p.subpath, err = splitPath(rest)
 			if err != nil {
 				return Pattern{}, err
@@ -115,7 +118,7 @@ func (p Pattern) MatchCanonical(cleaned string) bool {
 func (p Pattern) matchCanonical(cleaned string) bool {
 	if len(p.subpath) > 0 {
 		segments := splitCanonicalPath(cleaned)
-		return containsSubpath(segments, p.subpath)
+		return containsSubpath(segments, p.subpath, p.subpathEndOnly)
 	}
 	if p.prefix != "" {
 		return cleaned == p.prefix || strings.HasPrefix(cleaned, p.prefix+"/")
@@ -193,11 +196,18 @@ func (m Matcher) HasExclude() bool { return len(m.Exclude) > 0 }
 // for may still fail the include whitelist at Match() — but its children
 // must be walked because include matches leaf files, not necessarily their
 // parent directories.
+// Recursive file globs do not prune directories: descendants are matched
+// independently even when the directory entry itself is excluded.
 func (m Matcher) MatchExcluded(path string) bool {
 	if len(m.Override) > 0 && matchesAny(m.Override, path) {
 		return false
 	}
-	return matchesAny(m.Exclude, path)
+	for _, p := range m.Exclude {
+		if !p.subpathEndOnly && p.Match(path) {
+			return true
+		}
+	}
+	return false
 }
 
 func matchesAny(patterns []Pattern, path string) bool {
@@ -233,11 +243,15 @@ func splitCanonicalPath(value string) []string {
 	return strings.Split(value, "/")
 }
 
-func containsSubpath(segments, subpath []string) bool {
+func containsSubpath(segments, subpath []string, endOnly bool) bool {
 	if len(subpath) == 0 || len(segments) < len(subpath) {
 		return false
 	}
-	for start := 0; start <= len(segments)-len(subpath); start++ {
+	first := 0
+	if endOnly {
+		first = len(segments) - len(subpath)
+	}
+	for start := first; start <= len(segments)-len(subpath); start++ {
 		matched := true
 		for offset := range subpath {
 			if segments[start+offset] == subpath[offset] {

@@ -3,8 +3,8 @@
 //   - **/x/**   matches any path containing the x subpath (e.g. **/node_modules/**)
 //   - prefix/** matches everything under a prefix (e.g. dist/**)
 //   - name      exact name or glob (e.g. *.log, go.mod)
-// Each segment after **/ supports globs and literal equality; a matching
-// subpath includes descendants with or without a trailing /**.
+// Each segment after **/ supports globs and literal equality. Recursive globs
+// without /** must end at the final segment; literal rules retain subtrees.
 // Patterns are canonicalized (whitespace-trimmed, leading "/" stripped) before
 // compilation; runtime paths are matched against the same canonical form.
 
@@ -14,6 +14,7 @@ export interface Pattern {
   kind: "subpath" | "prefix" | "exact";
   // subpath form: segments to match as a contiguous subsequence.
   subpath?: string[];
+  subpathEndOnly?: boolean;
   // prefix form: the leading directory prefix.
   prefix?: string;
   // exact form: the literal/glob pattern (matched via minimatch-style glob).
@@ -48,16 +49,13 @@ function splitSegments(value: string): string[] {
   return c.split("/").filter((s) => s.length > 0);
 }
 
-function containsSubpath(segments: string[], subpath: string[]): boolean {
+function containsSubpath(segments: string[], subpath: string[], endOnly = false): boolean {
   if (subpath.length === 0 || segments.length < subpath.length) return false;
-  for (let start = 0; start <= segments.length - subpath.length; start++) {
+  const first = endOnly ? segments.length - subpath.length : 0;
+  for (let start = first; start <= segments.length - subpath.length; start++) {
     let matched = true;
     for (let i = 0; i < subpath.length; i++) {
-      try {
-        if (globMatch(subpath[i], segments[start + i])) continue;
-      } catch {
-        // Invalid globs only match literally, checked first by globMatch.
-      }
+      if (globMatch(subpath[i], segments[start + i])) continue;
       matched = false;
       break;
     }
@@ -76,10 +74,11 @@ function containsSubpath(segments: string[], subpath: string[]): boolean {
  */
 function globMatch(pattern: string, value: string): boolean {
   if (pattern === value) return true;
+  const chars = Array.from(pattern);
   let re = "^";
   let i = 0;
-  while (i < pattern.length) {
-    const c = pattern[i];
+  while (i < chars.length) {
+    const c = chars[i];
     switch (c) {
       case "*":
         re += "[^/]*";
@@ -90,48 +89,47 @@ function globMatch(pattern: string, value: string): boolean {
         i++;
         break;
       case "[": {
-        // Character class: copy it through to the regex, translating the
-        // leading negation (^) and the class body verbatim, but ensure '/' is
-        // excluded from the match so it stays a separator.
-        let cls = "[";
+        // Parse Go's non-empty character-range grammar, not JS class syntax.
+        // Hex escapes keep literal brackets and supplementary runes unambiguous.
         i++;
-        if (i < pattern.length && pattern[i] === "^") {
-          cls += "^";
-          i++;
-        }
-        // A leading ] is a literal ] in the class.
-        if (i < pattern.length && pattern[i] === "]") {
-          cls += "]";
-          i++;
-        }
-        let closed = false;
-        while (i < pattern.length) {
-          const ch = pattern[i];
-          if (ch === "]") {
-            cls += "]";
+        const negated = chars[i] === "^";
+        if (negated) i++;
+        const readChar = (): number | undefined => {
+          let ch = chars[i++];
+          if (ch === "\\") ch = chars[i++];
+          else if (ch === "-" || ch === "]") return undefined;
+          if (ch === undefined || i >= chars.length) return undefined;
+          return ch.codePointAt(0);
+        };
+        let ranges = "";
+        let count = 0;
+        while (i < chars.length && (chars[i] !== "]" || count === 0)) {
+          const lo = readChar();
+          if (lo === undefined) return false;
+          let hi = lo;
+          if (chars[i] === "-") {
             i++;
-            closed = true;
-            break;
+            const end = readChar();
+            if (end === undefined) return false;
+            hi = end;
           }
-          cls += ch;
-          i++;
+          // Go allows reversed ranges; they contribute no matching runes.
+          if (lo <= hi) ranges += `\\u{${lo.toString(16)}}-\\u{${hi.toString(16)}}`;
+          count++;
         }
-        if (!closed) {
-          // Unterminated class — treat '[' literally.
-          re += "\\[";
-        } else {
-          re += cls;
-        }
+        if (chars[i] !== "]" || count === 0) return false;
+        i++;
+        re += `[${negated ? "^" : ""}${ranges}]`;
         break;
       }
       default:
-        if ("\\^$.+(){}|".includes(c)) re += "\\" + c;
+        if ("\\^$.+(){}|]".includes(c)) re += "\\" + c;
         else re += c;
         i++;
     }
   }
   re += "$";
-  return new RegExp(re).test(value);
+  return new RegExp(re, "u").test(value);
 }
 
 /** Compile a single pattern string. Throws on invalid input. */
@@ -143,7 +141,8 @@ export function compile(raw: string): Pattern {
     if (rest.endsWith("/**")) rest = rest.slice(0, -3);
     if (rest.endsWith("/")) rest = rest.slice(0, -1);
     if (rest !== "") {
-      return { raw, kind: "subpath", subpath: splitSegments(rest) };
+      const subpathEndOnly = !cleaned.endsWith("/**") && /[*?\[]/.test(rest);
+      return { raw, kind: "subpath", subpath: splitSegments(rest), subpathEndOnly };
     }
   }
   if (cleaned.endsWith("/**")) {
@@ -191,7 +190,7 @@ export function matchPattern(p: Pattern, value: string): boolean {
 
 function matchCanonical(p: Pattern, cleaned: string): boolean {
   if (p.kind === "subpath" && p.subpath) {
-    return containsSubpath(splitSegments(cleaned), p.subpath);
+    return containsSubpath(splitSegments(cleaned), p.subpath, p.subpathEndOnly);
   }
   if (p.kind === "prefix" && p.prefix !== undefined) {
     return cleaned === p.prefix || cleaned.startsWith(p.prefix + "/");
@@ -250,8 +249,9 @@ export function hasExclude(m: Matcher): boolean {
  * for may still fail the include whitelist at match() — but its children
  * must be walked because include matches leaf files, not necessarily their
  * parent directories.
+ * Recursive file globs exclude entries without pruning their descendants.
  */
 export function matchExcluded(m: Matcher, path: string): boolean {
   if (m.override.length > 0 && matchesAny(m.override, path)) return false;
-  return matchesAny(m.exclude, path);
+  return m.exclude.some((p) => !p.subpathEndOnly && matchPattern(p, path));
 }

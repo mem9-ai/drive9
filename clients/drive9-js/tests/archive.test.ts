@@ -153,6 +153,22 @@ describe("archive", () => {
     }
   });
 
+  it("walks descendants of directories matched by recursive file globs", async () => {
+    mountTree("/proj", [
+      { path: "/proj/snapshots-wal/data.bin", body: "data" },
+      { path: "/proj/snapshots-wal/repro.db-wal", body: "wal" },
+      { path: "/proj/a/data.bin", body: "a" },
+      { path: "/proj/[a-]/data.bin", body: "literal" },
+    ]);
+    const client = new Client("http://localhost:9009", "test-key");
+    const stream = await client.archive("/proj", { exclude: ["**/*-wal", "**/[a-]/**"] });
+    const names = readTarGz(await streamToBuffer(stream));
+    expect(names).toContain("proj/snapshots-wal/data.bin");
+    expect(names).not.toContain("proj/snapshots-wal/repro.db-wal");
+    expect(names).toContain("proj/a/data.bin");
+    expect(names).not.toContain("proj/[a-]/data.bin");
+  });
+
   it("include whitelist keeps only matching paths", async () => {
     mountTree("/proj", [
       { path: "/proj/src/app.go", body: "package src\n" },
