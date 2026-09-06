@@ -325,6 +325,19 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	remoteCommitLockStarted := time.Now()
 	unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
 	remoteCommitLockWait := time.Since(remoteCommitLockStarted)
+	// SetAttr can publish while this handle waits for the path fence.
+	if fs.applySQLiteZeroTruncateLocked(fh) {
+		unlockRemoteCommit()
+		if fh.IsNew && fh.BaseRev == 0 {
+			// No committed object exists for a remote chmod yet.
+			return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+		}
+		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+			safeLogPrintf("append-log pending chmod failed for %s: %v", snapshotPath, err)
+			return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
+		}
+		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+	}
 	snapshotOwnsShadow := fh.ShadowReady || fh.ShadowSpill
 	snapshot, err := fs.newAppendLogSnapshotLocked(fh, start, snapshotSize-start)
 	if err != nil {
@@ -703,6 +716,14 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	remoteCommitLockStarted := time.Now()
 	unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
 	remoteCommitLockWait := time.Since(remoteCommitLockStarted)
+	if fs.applySQLiteZeroTruncateLocked(fh) {
+		unlockRemoteCommit()
+		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+			safeLogPrintf("append-log generation-reset pending chmod failed for %s: %v", snapshotPath, err)
+			return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
+		}
+		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+	}
 	layout := fh.appendLogLayoutAt(expectedRevision, expectedSize)
 	if layout == "" {
 		stat, err := fs.client.StatCtx(ctx, fs.remotePath(snapshotPath))
@@ -832,6 +853,14 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	remoteCommitLockStarted := time.Now()
 	unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
 	remoteCommitLockWait := time.Since(remoteCommitLockStarted)
+	if fs.applySQLiteZeroTruncateLocked(fh) {
+		unlockRemoteCommit()
+		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+			safeLogPrintf("append-log full-rewrite pending chmod failed for %s: %v", snapshotPath, err)
+			return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
+		}
+		return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+	}
 	snapshotOwnsShadow := fh.ShadowReady || fh.ShadowSpill
 	layout := fh.appendLogLayoutAt(expectedRevision, expectedSize)
 	if layout == "" {
@@ -1139,6 +1168,12 @@ func (fs *Dat9FS) tryAppendLogPathTruncate(ctx context.Context, entry *InodeEntr
 	}
 
 	fs.recordCommittedRevisionWithSize(entry.Path, revision, newSize)
+	if newSize == 0 && fs.shadowStore != nil {
+		// Path truncate has no handle to publish the empty shadow. Retire
+		// the old backing so linked readers cannot keep its pre-truncate bytes.
+		fs.shadowStore.removeAfterAppendLogCommit(entry.Path, revision)
+		fs.clearRemovedCommittedShadowForOpenHandles(entry.Path, revision, newSize)
+	}
 	entry.Revision = revision
 	entry.Size = newSize
 	fs.inodes.UpdateRevision(ino, revision)

@@ -1702,14 +1702,6 @@ func (fs *Dat9FS) bypassStableRemoteReadCaches(localPath string) bool {
 	return false
 }
 
-func shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath string) bool {
-	return isSQLitePersistentJournalPath(localPath)
-}
-
-func shouldSnapshotOpenSQLiteSidecarOnTruncate(localPath string, newSize int64) bool {
-	return newSize == 0 && isSQLitePersistentJournalPath(localPath)
-}
-
 func isSQLiteVisibleSamePathDirtyPath(localPath string) bool {
 	canonical, err := pathutil.Canonicalize(localPath)
 	if err != nil {
@@ -2030,6 +2022,9 @@ func (fs *Dat9FS) commitEntrySuperseded(entry *CommitEntry) bool {
 // than the committed inode watermark into a clean view of the committed file.
 // Caller must hold fh.mu. Shared path-keyed staging is intentionally untouched.
 func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
+	if fh != nil {
+		fs.applySQLiteZeroTruncateLocked(fh)
+	}
 	if fh == nil || fh.DirtySeq == 0 {
 		return false
 	}
@@ -2135,11 +2130,16 @@ func (fs *Dat9FS) forgetMutationState(ino uint64) {
 	fs.dirtyMu.Unlock()
 }
 
-func shouldRefreshHandleAfterPathTruncate(fh *FileHandle) bool {
+func shouldRefreshHandleAfterPathTruncate(fh *FileHandle, newSize int64) bool {
 	if fh == nil || fh.Dirty == nil {
 		return false
 	}
 	if fh.ZeroBase {
+		return true
+	}
+	// Zero truncate discards the clean journal's entire old payload, so it
+	// can adopt the new revision without rebasing retained bytes.
+	if newSize == 0 && !fh.Unlinked && fh.UnlinkedData == nil && isSQLitePersistentJournalPath(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
 		return true
 	}
 	return fh.Flags&syscall.O_TRUNC != 0
@@ -2215,6 +2215,69 @@ func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) (f
 	return abortStreamer, nil
 }
 
+// publishSQLiteZeroTruncate synchronizes the same inode's linked writable
+// handles without waiting on a sibling that may be waiting for our path lock.
+func (fs *Dat9FS) publishSQLiteZeroTruncate(ino uint64, source *FileHandle, seq uint64, revision int64) {
+	event := &sqliteHandleTruncate{seq: seq, revision: revision}
+	for _, fh := range fs.fileHandlesForInode(ino) {
+		if fh == source {
+			continue
+		}
+		fh.pendingSQLiteTruncate.Store(event)
+		if fh.TryLock() {
+			fs.applySQLiteZeroTruncateLocked(fh)
+			fh.Unlock()
+		}
+	}
+}
+
+// applySQLiteZeroTruncateLocked updates only this handle's buffer. The shared
+// shadow was truncated by the initiating FD and may already contain new writes.
+func (fs *Dat9FS) applySQLiteZeroTruncateLocked(fh *FileHandle) bool {
+	event := fh.pendingSQLiteTruncate.Swap(nil)
+	if event == nil || fh.Dirty == nil || fh.Unlinked || fh.UnlinkedSnapshot || fh.UnlinkedData != nil ||
+		fh.DirtySeq >= event.seq || fh.BaseRev > event.revision {
+		return false
+	}
+	fh.appendLogRecordTruncate()
+	_ = fh.Dirty.Truncate(0) // Zero is always within the buffer's size limit.
+	fh.Dirty.remoteSize = 0
+	fh.Dirty.LoadPart = nil
+	fh.Dirty.ResetStreamingState()
+	fh.Dirty.ResetSequentialState(0)
+	if fh.ShadowSpill {
+		wb := fh.Dirty
+		wb.OnPartFull = func(partIdx int, _ []byte) { wb.EvictPart(partIdx) }
+	}
+	fh.OrigSize = 0
+	// The initiating FD owns the truncate mutation. A sibling remains a
+	// clean reader, so later writes on that FD are visible through it too.
+	fh.Dirty.ClearDirty()
+	fh.ZeroBase = false
+	fh.DirtySeq = 0
+	fh.WriteBackSeq = 0
+	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
+	// A busy sibling may be reached only after another handle has committed
+	// the next generation. Its pending truncate must not hide that commit.
+	if revision, size, hasSize := fs.latestCommittedRevisionWithSize(fh.Path); revision > event.revision {
+		if !hasSize {
+			size = fs.committedHandleSizeLocked(fh)
+		}
+		fh.ShadowReady = false
+		fh.ShadowSpill = false
+		fh.BaseRev = revision
+		fh.IsNew = false
+		fs.rebindCleanWriteBufferToRemoteLocked(fh, size)
+		fh.appendLogAdoptCommittedBaseline(revision, size)
+	}
+	if fh.Streamer != nil {
+		fh.Streamer.ResetForNextWrite(expectedRevisionForHandle(fh))
+	}
+	clearReadTargetForLockedHandle(fh)
+	return true
+}
+
 func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64, callerPID uint32, truncateSize int64) {
 	if revision <= 0 {
 		return
@@ -2248,7 +2311,7 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 			}
 			adoptedPathTruncate = true
 		}
-		if !shouldRefreshHandleAfterPathTruncate(fh) {
+		if !shouldRefreshHandleAfterPathTruncate(fh, truncateSize) {
 			fh.Unlock()
 			continue
 		}
@@ -4448,6 +4511,10 @@ restartLoop:
 				pending = true
 				continue
 			}
+			if src.Unlinked || src.UnlinkedSnapshot || src.UnlinkedData != nil {
+				src.Unlock()
+				continue
+			}
 			if src.Dirty != nil && src.DirtySeq > 0 {
 				candidates = append(candidates, candidate{fh: src, dirtySeq: src.DirtySeq})
 			}
@@ -4469,7 +4536,7 @@ restartLoop:
 			if !src.TryLock() {
 				return nil, 0, false, gofuse.OK, true
 			}
-			if src.Dirty == nil || src.DirtySeq == 0 {
+			if src.Dirty == nil || src.DirtySeq == 0 || src.Unlinked || src.UnlinkedSnapshot || src.UnlinkedData != nil {
 				src.Unlock()
 				continue
 			}
@@ -4477,6 +4544,10 @@ restartLoop:
 				src.Unlock()
 				pending = true
 				continue restartLoop
+			}
+			if src.ZeroBase && src.Dirty.Size() == 0 && !src.Unlinked {
+				src.Unlock()
+				return nil, 0, true, gofuse.OK, false
 			}
 			if end > src.Dirty.Size() {
 				pending = true
@@ -5231,20 +5302,6 @@ func (fs *Dat9FS) snapshotOpenHandlesBeforeUnlink(ctx context.Context, localPath
 
 func (fs *Dat9FS) snapshotOpenHandlesBeforePathReplacement(ctx context.Context, localPath string) error {
 	return fs.snapshotOpenHandlesForPath(ctx, localPath, nil)
-}
-
-func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeTruncate(ctx context.Context, localPath string, skip *FileHandle, newSize int64) error {
-	if !shouldSnapshotOpenSQLiteSidecarOnTruncate(localPath, newSize) {
-		return nil
-	}
-	return fs.snapshotOpenSQLiteSidecarHandles(ctx, localPath, skip)
-}
-
-func (fs *Dat9FS) snapshotOpenSQLiteSidecarHandles(ctx context.Context, localPath string, skip *FileHandle) error {
-	if fs == nil || fs.openHandles == nil || !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
-		return nil
-	}
-	return fs.snapshotOpenHandlesForPath(ctx, localPath, skip)
 }
 
 func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath string, skip *FileHandle) error {
@@ -8385,11 +8442,6 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		if input.Valid&gofuse.FATTR_FH != 0 {
 			// ftruncate(fd, size): truncate the open write buffer.
 			fh, ok := fs.fileHandles.Get(input.Fh)
-			if ok {
-				if err := fs.snapshotOpenSQLiteSidecarBeforeTruncate(ctx, entry.Path, fh, newSize); err != nil {
-					return httpToFuseStatus(err)
-				}
-			}
 			if ok && fh.Dirty != nil {
 				var abortStreamer func()
 				fh.Lock()
@@ -8400,15 +8452,19 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
 				}
+				publishTruncate := newSize == 0 && isSQLitePersistentJournalPath(entry.Path) &&
+					!entry.Unlinked && !fh.Unlinked && !fh.UnlinkedSnapshot && fh.UnlinkedData == nil
+				truncateSeq := fh.DirtySeq
+				truncateRevision := max(fh.BaseRev, fs.latestCommittedRevision(entry.Path))
 				fh.Unlock()
 				if abortStreamer != nil {
 					abortStreamer()
 				}
+				if publishTruncate {
+					fs.publishSQLiteZeroTruncate(input.NodeId, fh, truncateSeq, truncateRevision)
+				}
 			}
 		} else {
-			if err := fs.snapshotOpenSQLiteSidecarBeforeTruncate(ctx, entry.Path, nil, newSize); err != nil {
-				return httpToFuseStatus(err)
-			}
 			if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
 				return st
 			}
@@ -11427,6 +11483,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	lockStart := time.Now()
 	fh.Lock()
 	lockWait := time.Since(lockStart)
+	fs.applySQLiteZeroTruncateLocked(fh)
 	fs.refreshAppendLogReaderShadowLocked(fh)
 	if fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 		fs.debugf("read lock wait path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, lockWait)
