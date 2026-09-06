@@ -87,11 +87,13 @@ pattern forms:
 | exact / glob | `*.log`, `go.mod` | `path.Match` glob + exact equality |
 
 In the leading `**/` form, `*`, `?`, and character classes match within a
-single segment. Patterns containing these metacharacters must end at the final
+single segment. Patterns with a syntactically valid glob segment must end at the final
 segment unless they have a trailing `/**`. Thus `**/*-wal` matches a WAL filename
 at any depth but does not match `/snapshots-wal/data.bin`. Use `**/cache-*/**` to
 include a matching directory's descendants. Rules without glob metacharacters
-retain the existing literal-subpath behavior.
+retain the existing literal-subpath behavior. A malformed glob segment is treated
+literally; if no segment contains a valid glob, the rule keeps subtree matching
+and directory pruning (for example, `**/[abc` includes descendants of `[abc`).
 
 Go and TypeScript normalize patterns and runtime paths to NFC before matching,
 and match `?` and character classes by Unicode code point.

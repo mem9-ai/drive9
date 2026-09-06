@@ -38,10 +38,18 @@ func Compile(raw string) (Pattern, error) {
 		rest = strings.TrimSuffix(rest, "/**")
 		rest = strings.TrimSuffix(rest, "/")
 		if rest != "" {
-			p.subpathEndOnly = !strings.HasSuffix(cleaned, "/**") && strings.ContainsAny(rest, "*?[")
 			p.subpath, err = splitPath(rest)
 			if err != nil {
 				return Pattern{}, err
+			}
+			if !strings.HasSuffix(cleaned, "/**") {
+				for _, segment := range p.subpath {
+					_, globErr := path.Match(segment, "")
+					if strings.ContainsAny(segment, "*?[") && globErr == nil {
+						p.subpathEndOnly = true
+						break
+					}
+				}
 			}
 			return p, nil
 		}

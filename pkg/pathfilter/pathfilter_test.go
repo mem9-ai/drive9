@@ -81,6 +81,13 @@ func TestCompileThreeForms(t *testing.T) {
 		{"subpath-class-negated-reversed", "**/[^z-a]/**", "proj/a/item", true},
 		{"subpath-class-bracket-literal", "**/[[]/**", "proj/[/item", true},
 		{"subpath-literal-closing-bracket", "**/db?].wal", "proj/db1].wal", true},
+		{"subpath-malformed-literal-subtree", "**/[abc", "proj/[abc/secret", true},
+		{"subpath-malformed-range-subtree", "**/[a-]", "proj/[a-]/secret", true},
+		{"subpath-malformed-multisegment", "**/[abc/name", "proj/[abc/name/secret", true},
+		{"subpath-malformed-split-class", "**/[a/b]", "proj/[a/b]/secret", true},
+		{"subpath-valid-glob-with-literal-fallback", "**/prefix*/[abc", "proj/prefix1/[abc", true},
+		{"subpath-valid-glob-with-literal-no-subtree", "**/prefix*/[abc", "proj/prefix1/[abc/secret", false},
+		{"subpath-valid-empty-class-no-subtree", "**/[z-a]", "proj/[z-a]/secret", false},
 		// prefix/** form
 		{"prefix-match", "dist/**", "dist/index.js", true},
 		{"prefix-nested", "dist/**", "dist/a/b/c.js", true},
@@ -275,7 +282,7 @@ func TestMatchExcluded(t *testing.T) {
 }
 
 func TestMatchExcludedRecursiveFileGlobDoesNotPruneDirectory(t *testing.T) {
-	m := NewMatcher(nil, []string{"**/*-wal", "**/cache-*/**", "**/vendor"}, nil)
+	m := NewMatcher(nil, []string{"**/*-wal", "**/cache-*/**", "**/vendor", "**/[abc"}, nil)
 	if m.Match("snapshots-wal") || m.MatchExcluded("snapshots-wal") {
 		t.Fatal("file glob should exclude the directory entry without pruning its descendants")
 	}
@@ -284,6 +291,9 @@ func TestMatchExcludedRecursiveFileGlobDoesNotPruneDirectory(t *testing.T) {
 	}
 	if !m.MatchExcluded("cache-build") || !m.MatchExcluded("proj/vendor") {
 		t.Fatal("explicit subtree and literal directory rules must still prune")
+	}
+	if !m.MatchExcluded("proj/[abc") || m.Match("proj/[abc/secret") {
+		t.Fatal("malformed glob literal fallback must retain subtree exclusion")
 	}
 }
 

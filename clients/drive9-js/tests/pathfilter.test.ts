@@ -94,6 +94,13 @@ describe("pathfilter recursive glob segments", () => {
     ["**/[^z-a]/**", "proj/a/item", true],
     ["**/[[]/**", "proj/[/item", true],
     ["**/db?].wal", "proj/db1].wal", true],
+    ["**/[abc", "proj/[abc/secret", true],
+    ["**/[a-]", "proj/[a-]/secret", true],
+    ["**/[abc/name", "proj/[abc/name/secret", true],
+    ["**/[a/b]", "proj/[a/b]/secret", true],
+    ["**/prefix*/[abc", "proj/prefix1/[abc", true],
+    ["**/prefix*/[abc", "proj/prefix1/[abc/secret", false],
+    ["**/[z-a]", "proj/[z-a]/secret", false],
   ])("%s matching %s returns %s", (pattern, path, want) => {
     expect(matchPattern(compile(pattern), path)).toBe(want);
   });
@@ -157,13 +164,15 @@ describe("pathfilter compileAll", () => {
 
 describe("pathfilter matchExcluded", () => {
   it("does not prune directories selected only by recursive file globs", () => {
-    const m = newMatcher({ exclude: ["**/*-wal", "**/cache-*/**", "**/vendor"] });
+    const m = newMatcher({ exclude: ["**/*-wal", "**/cache-*/**", "**/vendor", "**/[abc"] });
     expect(match(m, "snapshots-wal")).toBe(false);
     expect(matchExcluded(m, "snapshots-wal")).toBe(false);
     expect(match(m, "snapshots-wal/data.bin")).toBe(true);
     expect(match(m, "snapshots-wal/repro.db-wal")).toBe(false);
     expect(matchExcluded(m, "cache-build")).toBe(true);
     expect(matchExcluded(m, "proj/vendor")).toBe(true);
+    expect(matchExcluded(m, "proj/[abc")).toBe(true);
+    expect(match(m, "proj/[abc/secret")).toBe(false);
   });
 
   it("returns true only for exclude-matched paths not restored by override", () => {

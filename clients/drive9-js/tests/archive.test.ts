@@ -161,7 +161,7 @@ describe("archive", () => {
       { path: "/proj/[a-]/data.bin", body: "literal" },
     ]);
     const client = new Client("http://localhost:9009", "test-key");
-    const stream = await client.archive("/proj", { exclude: ["**/*-wal", "**/[a-]/**"] });
+    const stream = await client.archive("/proj", { exclude: ["**/*-wal", "**/[a-]"] });
     const names = readTarGz(await streamToBuffer(stream));
     expect(names).toContain("proj/snapshots-wal/data.bin");
     expect(names).not.toContain("proj/snapshots-wal/repro.db-wal");
