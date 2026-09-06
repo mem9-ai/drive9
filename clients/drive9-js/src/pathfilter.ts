@@ -65,7 +65,7 @@ function containsSubpath(segments: string[], subpath: string[], endOnly = false)
 }
 
 /**
- * globMatch mirrors Go's path.Match glob semantics:
+ * globMatch uses Go glob syntax with Unicode code-point matching:
  *   *        matches any sequence of non-separator chars
  *   ?        matches any single non-separator char
  *   [abc]    matches one char from the class (with ranges and negation via [^...])
@@ -139,6 +139,7 @@ function globMatch(pattern: string, value: string): boolean {
 export function compile(raw: string): Pattern {
   const cleaned = canonical(raw);
   if (cleaned === "") throw new Error(`invalid pattern ${JSON.stringify(raw)}: empty after canonicalization`);
+  if (cleaned.includes("\\")) throw new Error(`invalid pattern ${JSON.stringify(raw)}: path contains backslash`);
   if (cleaned.startsWith("**/")) {
     let rest = cleaned.slice(3);
     if (rest.endsWith("/**")) rest = rest.slice(0, -3);

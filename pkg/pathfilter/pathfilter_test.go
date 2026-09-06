@@ -58,6 +58,16 @@ func TestCompileThreeForms(t *testing.T) {
 		{"subpath-nfc-path", "**/caf\u00e9*.txt", "proj/cafe\u03011.txt", true},
 		{"subpath-nfc-question", "**/caf?.txt", "proj/cafe\u0301.txt", true},
 		{"subpath-nfc-class", "**/caf[e\u0301].txt", "proj/caf\u00e9.txt", true},
+		{"subpath-star-unicode-one", "**/*?", "proj/\U0001f600", true},
+		{"subpath-star-unicode-two", "**/*??", "proj/\U0001f600", false},
+		{"subpath-star-unicode-two-present", "**/*??", "proj/\U0001f600a", true},
+		{"subpath-star-unicode-class", "**/*[^a][^a]", "proj/\U0001f600", false},
+		{"subpath-star-unicode-no-replacement", "**/*[\ufffd]", "proj/\U0001f600", false},
+		{"subpath-star-unicode-suffix", "**/*??x", "proj/\U0001f600x", false},
+		{"subpath-star-unicode-backtrack", "**/*a*??", "proj/a\U0001f600", false},
+		{"subpath-star-unicode-backtrack-match", "**/*a*??", "proj/a\U0001f600a", true},
+		{"subpath-star-class-unicode", "**/[*]*??", "proj/*\U0001f600", false},
+		{"subpath-star-unicode-wal", "**/*-wal", "proj/\U0001f600-wal", true},
 		{"subpath-class-trailing-hyphen", "**/[a-]/**", "proj/a/item", false},
 		{"subpath-class-trailing-hyphen-literal", "**/[a-]/**", "proj/[a-]/item", true},
 		{"subpath-class-trailing-hyphen-no-dash", "**/[a-]/**", "proj/-/item", false},
@@ -82,6 +92,10 @@ func TestCompileThreeForms(t *testing.T) {
 		{"glob-match", "*.log", "app.log", true},
 		{"glob-no-match", "*.log", "app.txt", false},
 		{"glob-dir-level", "*.log", "logs/app.log", false}, // path.Match against full path
+		{"glob-star-unicode-two", "*??", "\U0001f600", false},
+		{"glob-star-unicode-separator", "*??/file", "\U0001f600/file", false},
+		{"glob-star-unicode-separator-match", "*?/file", "\U0001f600/file", true},
+		{"glob-star-unicode-no-cross-separator", "*?file", "\U0001f600/file", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -100,6 +114,14 @@ func TestValidateRejectsInvalid(t *testing.T) {
 	// pathutil.Canonicalize rejects backslashes and .. segments.
 	if err := Validate([]string{"**/../etc/**"}); err == nil {
 		t.Fatal("Validate accepted a pattern containing ..")
+	}
+	for _, pattern := range []string{`**/[\-]/**`, `**/[\]]/**`} {
+		if err := Validate([]string{pattern}); err == nil {
+			t.Errorf("Validate accepted backslash pattern %q", pattern)
+		}
+		if got := CompileAll([]string{pattern}); len(got) != 0 {
+			t.Errorf("CompileAll retained backslash pattern %q", pattern)
+		}
 	}
 }
 
