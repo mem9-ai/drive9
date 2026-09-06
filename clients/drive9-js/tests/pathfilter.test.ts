@@ -26,6 +26,33 @@ describe("pathfilter compile", () => {
   });
 });
 
+describe("pathfilter recursive glob segments", () => {
+  it.each([
+    ["**/*-wal", "repro.db-wal", true],
+    ["**/*-wal", "/issue-validation/run/case/repro.db-wal", true],
+    ["**/repro.db-wal", "/issue-validation/run/case/repro.db-wal", true],
+    ["**/*-wal", "proj/other.sqlite-wal", true],
+    ["**/*-wal", "proj/repro.db", false],
+    ["**/*-wal", "proj/repro.db-shm", false],
+    ["**/*-wal", "proj/repro.db-wal.bak", false],
+    ["**/cache-*/**", "proj/cache-build/objects/a", true],
+    ["**/cache-*", "proj/cache-build/objects/a", true],
+    ["**/cache-*/*.log", "proj/cache-build/output.log", true],
+    ["**/cache-*/*.log", "proj/cache-build/nested/output.log", false],
+    ["**/cache-*/*.log", "cache-first/miss/cache-second/output.log", true],
+    ["**/db?.wal", "proj/db1.wal", true],
+    ["**/db?.wal", "proj/db12.wal", false],
+    ["**/*.[Tt]xt", "proj/a.Txt", true],
+    ["**/*.[^Tt]xt", "proj/a.bxt", true],
+    ["**/*.[^Tt]xt", "proj/a.txt", false],
+    ["**/[cache]/**", "proj/[cache]/item", true],
+    ["**/[z-a]/**", "proj/[z-a]/item", true],
+    ["**/[z-a]/**", "proj/other/item", false],
+  ])("%s matching %s returns %s", (pattern, path, want) => {
+    expect(matchPattern(compile(pattern), path)).toBe(want);
+  });
+});
+
 describe("pathfilter matcher", () => {
   it("include whitelist + exclude", () => {
     const m = newMatcher({ include: ["proj/**", "go.mod"], exclude: ["**/vendor/**"] });

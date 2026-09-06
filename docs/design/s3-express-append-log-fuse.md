@@ -94,6 +94,10 @@ append-log. A later, per-handle SQLite header proof may enable only the
 generation-reset optimization; it neither selects an unconfigured file nor
 changes the generic append-log contract.
 
+For SQLite WAL filenames at any directory depth, use `--append-log='**/*-wal'`.
+The `*` is a glob within a single path segment; the leading `**/` permits
+that segment to occur at the mount root or below nested directories.
+
 ### 2.2 Server capability
 
 At mount initialization, the existing `/v1/status` warm-up caches:

@@ -177,6 +177,30 @@ func TestAppendLogPolicyDoesNotChangeLocalPolicyClassification(t *testing.T) {
 	}
 }
 
+func TestAppendLogPolicyMatchesSQLiteWALGlob(t *testing.T) {
+	patterns := []string{"**/*-wal"}
+	if err := validateAppendLogPatterns(patterns); err != nil {
+		t.Fatalf("validateAppendLogPatterns: %v", err)
+	}
+	matcher := NewAppendLogMatcher(patterns)
+	for _, test := range []struct {
+		path string
+		want bool
+	}{
+		{"/repro.db-wal", true},
+		{"/issue-validation/run/case/repro.db-wal", true},
+		{"/repo/other.sqlite-wal", true},
+		{"/repo/repro.db", false},
+		{"/repo/repro.db-shm", false},
+		{"/repo/repro.db-wal.bak", false},
+		{"/repo/repro.db-wal ", false},
+	} {
+		if got := matcher.Matches(test.path); got != test.want {
+			t.Errorf("Matches(%q) = %t, want %t", test.path, got, test.want)
+		}
+	}
+}
+
 func TestSQLiteWALIndexPathMatching(t *testing.T) {
 	tests := []struct {
 		path string
