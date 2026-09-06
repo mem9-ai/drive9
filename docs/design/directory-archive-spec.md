@@ -93,7 +93,8 @@ at any depth but does not match `/snapshots-wal/data.bin`. Use `**/cache-*/**` t
 include a matching directory's descendants. Rules without glob metacharacters
 retain the existing literal-subpath behavior.
 
-Go and TypeScript match `?` and character classes by Unicode code point.
+Go and TypeScript normalize patterns and runtime paths to NFC before matching,
+and match `?` and character classes by Unicode code point.
 Character classes follow Go `path.Match` syntax, including non-empty classes
 and well-formed range endpoints. Invalid globs retain literal-equality fallback.
 

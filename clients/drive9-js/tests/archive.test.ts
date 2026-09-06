@@ -169,6 +169,18 @@ describe("archive", () => {
     expect(names).not.toContain("proj/[a-]/data.bin");
   });
 
+  it("normalizes decomposed exclude patterns for NFC API paths", async () => {
+    mountTree("/proj", [
+      { path: "/proj/caf\u00e91.txt", body: "excluded" },
+      { path: "/proj/tea1.txt", body: "kept" },
+    ]);
+    const client = new Client("http://localhost:9009", "test-key");
+    const stream = await client.archive("/proj", { exclude: ["**/cafe\u0301*.txt"] });
+    const names = readTarGz(await streamToBuffer(stream));
+    expect(names).not.toContain("proj/caf\u00e91.txt");
+    expect(names).toContain("proj/tea1.txt");
+  });
+
   it("include whitelist keeps only matching paths", async () => {
     mountTree("/proj", [
       { path: "/proj/src/app.go", body: "package src\n" },
