@@ -328,6 +328,10 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	// SetAttr can publish while this handle waits for the path fence.
 	if fs.applySQLiteZeroTruncateLocked(fh) {
 		unlockRemoteCommit()
+		if fh.IsNew && fh.BaseRev == 0 {
+			// The truncate owner will create the object and apply its mode.
+			return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
+		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			safeLogPrintf("append-log pending chmod failed for %s: %v", snapshotPath, err)
 			return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
@@ -1028,6 +1032,11 @@ func (fs *Dat9FS) invalidateAppendLogReadTargets(path string, skip *FileHandle, 
 func (fs *Dat9FS) routeAppendLogLocked(ctx context.Context, fh *FileHandle) (handled bool, status gofuse.Status, fullRewrite bool) {
 	if !fs.appendLogConfiguredLocked(fh) {
 		return false, gofuse.OK, false
+	}
+	if fh.IsNew && fh.BaseRev == 0 && fh.DirtySeq == 0 && fh.Dirty != nil && !fh.Dirty.HasDirtyParts() && isSQLitePersistentJournalPath(fh.Path) {
+		// A clean pending-create sibling owns no content mutation. Retain its
+		// mode until the creating FD commits; retries must not upload emptiness.
+		return true, gofuse.OK, false
 	}
 	if fh.Dirty == nil || (!fh.IsNew && !fh.Dirty.HasDirtyParts()) {
 		if fh.HasPendingMode {

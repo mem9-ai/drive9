@@ -4458,7 +4458,27 @@ func (fs *Dat9FS) prepareSQLitePersistentJournalLocalCreateWritableOpen(fh *File
 	if fh.BaseRev != 0 || fh.OrigSize != 0 {
 		return false
 	}
-	if !fs.hasOpenPendingSQLitePersistentJournalCreate(fh.Path, fh) {
+	if fs.appendLogConfiguredLocked(fh) {
+		// Any pending-create FD can become the next generation's committer.
+		// Capture creation and its mode together; success clears every copy
+		// of the same mode generation. Never wait on a sibling's handle lock.
+		pendingCreate := false
+		for _, src := range fs.openHandles.SnapshotPath(fh.Path) {
+			if src == nil || src == fh || src.Ino != fh.Ino || !src.TryLock() {
+				continue
+			}
+			if src.Dirty != nil && src.IsNew && src.BaseRev == 0 && src.OrigSize == 0 {
+				pendingCreate = true
+				if src.HasPendingMode && src.PendingModeGen > fh.PendingModeGen {
+					fs.setPendingModeLocked(fh, src.PendingMode, src.PendingModeGen)
+				}
+			}
+			src.Unlock()
+		}
+		if !pendingCreate {
+			return false
+		}
+	} else if !fs.hasOpenPendingSQLitePersistentJournalCreate(fh.Path, fh) {
 		return false
 	}
 	if err := fh.Dirty.Truncate(0); err != nil {
