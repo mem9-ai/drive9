@@ -75,17 +75,20 @@ function containsSubpath(segments: string[], subpath: string[], endOnly = false)
 function globMatch(pattern: string, value: string): boolean {
   if (pattern === value) return true;
   const chars = Array.from(pattern);
+  // Node 18 can split surrogate pairs in negated classes after a literal prefix.
+  // A guarded Unicode dot consumes one code point on every supported runtime.
+  const nonSeparator = "(?:(?!/).)";
   let re = "^";
   let i = 0;
   while (i < chars.length) {
     const c = chars[i];
     switch (c) {
       case "*":
-        re += "[^/]*";
+        re += nonSeparator + "*";
         i++;
         break;
       case "?":
-        re += "[^/]";
+        re += nonSeparator;
         i++;
         break;
       case "[": {
@@ -119,7 +122,7 @@ function globMatch(pattern: string, value: string): boolean {
         }
         if (chars[i] !== "]" || count === 0) return false;
         i++;
-        re += `[${negated ? "^" : ""}${ranges}]`;
+        re += negated ? `(?![${ranges}]).` : `[${ranges}]`;
         break;
       }
       default:
@@ -129,7 +132,7 @@ function globMatch(pattern: string, value: string): boolean {
     }
   }
   re += "$";
-  return new RegExp(re, "u").test(value);
+  return new RegExp(re, "su").test(value);
 }
 
 /** Compile a single pattern string. Throws on invalid input. */
