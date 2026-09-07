@@ -1708,6 +1708,88 @@ func TestDat9FSReadSQLitePersistentJournalBypassesSmallReadCache(t *testing.T) {
 	recorder.Check(t)
 }
 
+func TestDat9FSReadSQLiteJournalSendsFirstHopRange(t *testing.T) {
+	const (
+		path       = "/repo/workload.db-wal"
+		walSize    = 40 << 10 // below the 4 MiB Prefetcher threshold
+		readOffset = walSize - 4096
+		readLength = 4096
+	)
+	wal := bytes.Repeat([]byte("w"), walSize)
+	var recorder testErrorRecorder
+	var mu sync.Mutex
+	var rangeHeaders []string
+	var wroteBytes int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs"+path {
+			recorder.Recordf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		rangeHeader := r.Header.Get("Range")
+		mu.Lock()
+		rangeHeaders = append(rangeHeaders, rangeHeader)
+		mu.Unlock()
+		if rangeHeader == "" {
+			// Range omitted: emulate a full-body 200 so the regression is
+			// observable in the response byte count.
+			n, _ := w.Write(wal)
+			mu.Lock()
+			wroteBytes += n
+			mu.Unlock()
+			return
+		}
+		var start, end int
+		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil || start < 0 || end < start || end >= walSize {
+			http.Error(w, "bad range: "+rangeHeader, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, walSize))
+		w.WriteHeader(http.StatusPartialContent)
+		n, _ := w.Write(wal[start : end+1])
+		mu.Lock()
+		wroteBytes += n
+		mu.Unlock()
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(path, false, walSize, time.Now())
+	fs.inodes.UpdateRevision(ino, 3)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, readOffset, readLength)
+	if err != nil || st != gofuse.OK {
+		t.Fatalf("Read = %d/%v, want OK", st, err)
+	}
+	if !bytes.Equal(got, wal[readOffset:]) {
+		t.Fatalf("Read returned %d bytes, want the requested %d-byte slice", len(got), readLength)
+	}
+	mu.Lock()
+	wantPrefix := fmt.Sprintf("bytes=%d-", readOffset)
+	found := false
+	for _, rh := range rangeHeaders {
+		if strings.HasPrefix(rh, wantPrefix) {
+			found = true
+			break
+		}
+	}
+	mu.Unlock()
+	if !found {
+		t.Fatalf("WAL GET Range headers = %v, want one starting with %q", rangeHeaders, wantPrefix)
+	}
+	mu.Lock()
+	gotWrote := wroteBytes
+	mu.Unlock()
+	if gotWrote != readLength {
+		t.Fatalf("server wrote %d bytes, want exactly %d", gotWrote, readLength)
+	}
+	recorder.Check(t)
+}
+
 func TestDat9FSReadSQLiteMainDatabaseBypassesSmallReadCacheWithOpenSidecar(t *testing.T) {
 	const path = "/repo/workload.db"
 	var reads atomic.Int32
