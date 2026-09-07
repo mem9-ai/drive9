@@ -3,6 +3,8 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -500,6 +502,7 @@ type pathCommitLandmark struct {
 	rev        int64
 	size       int64
 	resourceID string
+	checksum   string
 }
 
 type CommitQueueSnapshot struct {
@@ -1417,7 +1420,27 @@ func (cq *CommitQueue) supersedeOlderQueuedLocked(entry *CommitEntry) {
 	cq.rebuildQueuedIndexLocked()
 }
 
-func (cq *CommitQueue) rememberLanded(path string, rev, size int64, resourceID string) {
+func payloadChecksum(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func (cq *CommitQueue) checksumLandedPayload(entry *CommitEntry) string {
+	const maxHashBytes = 1 << 20
+	if cq == nil || entry == nil || cq.shadows == nil || entry.ShadowGen == 0 {
+		return ""
+	}
+	if entry.Size < 0 || entry.Size > maxHashBytes {
+		return ""
+	}
+	data, err := cq.shadows.ReadAllIfGeneration(entry.Path, entry.ShadowGen)
+	if err != nil || int64(len(data)) != entry.Size {
+		return ""
+	}
+	return payloadChecksum(data)
+}
+
+func (cq *CommitQueue) rememberLanded(path string, rev, size int64, resourceID, checksum string) {
 	if cq == nil || path == "" || rev <= 0 {
 		return
 	}
@@ -1428,29 +1451,16 @@ func (cq *CommitQueue) rememberLanded(path string, rev, size int64, resourceID s
 	prev := cq.landed[path]
 	persist := false
 	if rev >= prev.rev {
-		cq.landed[path] = pathCommitLandmark{rev: rev, size: size, resourceID: resourceID}
+		cq.landed[path] = pathCommitLandmark{rev: rev, size: size, resourceID: resourceID, checksum: checksum}
 		persist = true
 	}
 	idx := cq.index
 	cq.mu.Unlock()
 	if persist && idx != nil {
-		if err := idx.PutLanded(path, rev, size, resourceID); err != nil {
+		if err := idx.PutLanded(path, rev, size, resourceID, checksum); err != nil {
 			safeLogPrintf("commit queue: persist landed snapshot for %s: %v", path, err)
 		}
 	}
-}
-
-func (cq *CommitQueue) captureLandedResourceID(path string) string {
-	if cq == nil || cq.client == nil || path == "" {
-		return ""
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	st, err := cq.client.StatCtx(ctx, cq.remotePath(path))
-	if err != nil || st == nil {
-		return ""
-	}
-	return st.ResourceID
 }
 
 func (cq *CommitQueue) landedCommit(path string) pathCommitLandmark {
@@ -1495,15 +1505,26 @@ func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(entry *CommitEntry, 
 // after a restart. The smaller remote image must match the snapshot this
 // client previously landed; a strictly larger local pending create against
 // an unrelated smaller remote file must stay conflicted.
-func (cq *CommitQueue) maybeRebaseGrownPayloadAgainstRemote(entry *CommitEntry, serverRev, serverSize int64, serverResourceID string) bool {
-	proof, ok := cq.durableLanded(entry.Path)
-	if !ok || proof.rev != serverRev || proof.size != serverSize {
+func landedIdentityMatches(proof pathCommitLandmark, serverRev, serverSize int64, serverResourceID string, serverBody []byte) bool {
+	if proof.rev != serverRev || proof.size != serverSize {
 		return false
 	}
-	// {rev,size} is not identity: delete/recreate can reuse revision 1 and
-	// the same byte length. Require the resource id of the exact object
-	// this mount landed. Missing identity fails closed.
-	if proof.resourceID == "" || serverResourceID == "" || proof.resourceID != serverResourceID {
+	if proof.resourceID != "" && serverResourceID != "" {
+		return proof.resourceID == serverResourceID
+	}
+	if proof.checksum == "" || int64(len(serverBody)) != proof.size {
+		return false
+	}
+	return payloadChecksum(serverBody) == proof.checksum
+}
+
+// maybeRebaseGrownPayloadAgainstRemote reconstructs the #896 growth rebase
+// after a restart. The smaller remote image must match the snapshot this
+// client previously landed (resource id when both sides have it, otherwise
+// the SHA-256 of the landed bytes). Missing identity fails closed.
+func (cq *CommitQueue) maybeRebaseGrownPayloadAgainstRemote(entry *CommitEntry, serverRev, serverSize int64, serverResourceID string, serverBody []byte) bool {
+	proof, ok := cq.durableLanded(entry.Path)
+	if !ok || !landedIdentityMatches(proof, serverRev, serverSize, serverResourceID, serverBody) {
 		return false
 	}
 	return cq.rebaseGrownPayload(entry, serverRev, serverSize)
@@ -2482,7 +2503,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	if layerRef == "" {
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	}
-	cq.rememberLanded(entry.Path, committedRev, entry.Size, cq.captureLandedResourceID(entry.Path))
+	cq.rememberLanded(entry.Path, committedRev, entry.Size, "", cq.checksumLandedPayload(entry))
 	if cq.OnUploaded != nil {
 		cq.OnUploaded(entry, committedRev)
 	}
@@ -2696,7 +2717,19 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 		return
 	}
 	serverRev := stat.Revision
-	if cq.maybeRebaseGrownPayloadAgainstRemote(entry, serverRev, stat.Size, stat.ResourceID) {
+	readCtx, readCancel := context.WithTimeout(context.Background(), uploadTimeout)
+	readStart := time.Now()
+	serverData, err := cq.client.ReadCtx(readCtx, apiPath)
+	readCancel()
+	if cq.perf != nil {
+		cq.perf.recordRemoteOp(perfRemoteRead, err, time.Since(readStart), uint64(len(serverData)))
+	}
+	if err != nil {
+		safeLogPrintf("commit queue: auto-resolve failed for %s: read server: %v", entry.Path, err)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+	if cq.maybeRebaseGrownPayloadAgainstRemote(entry, serverRev, stat.Size, stat.ResourceID, serverData) {
 		if cq.discardSupersededEntry(entry) {
 			return
 		}
@@ -2734,19 +2767,6 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 		if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err != nil {
 			cq.onCommitPostUploadFailure(entry, err)
 		}
-		return
-	}
-
-	readCtx, readCancel := context.WithTimeout(context.Background(), uploadTimeout)
-	readStart := time.Now()
-	serverData, err := cq.client.ReadCtx(readCtx, apiPath)
-	readCancel()
-	if cq.perf != nil {
-		cq.perf.recordRemoteOp(perfRemoteRead, err, time.Since(readStart), uint64(len(serverData)))
-	}
-	if err != nil {
-		safeLogPrintf("commit queue: auto-resolve failed for %s: read server: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry)
 		return
 	}
 
@@ -2917,7 +2937,13 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		}
 	}()
 	if stat.Size != localSize {
-		if localSize > stat.Size && cq.maybeRebaseGrownPayloadAgainstRemote(entry, stat.Revision, stat.Size, stat.ResourceID) {
+		var remoteBody []byte
+		if localSize > stat.Size && stat.Size >= 0 && stat.Size <= 1<<20 {
+			readCtx, readCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			remoteBody, _ = cq.client.ReadCtx(readCtx, apiPath)
+			readCancel()
+		}
+		if localSize > stat.Size && cq.maybeRebaseGrownPayloadAgainstRemote(entry, stat.Revision, stat.Size, stat.ResourceID, remoteBody) {
 			safeLogPrintf("commit queue: ShadowSpill growth overwrite for %s (local %d bytes vs server %d bytes at rev %d)", entry.Path, localSize, stat.Size, stat.Revision)
 			if fd != nil {
 				_ = fd.Close()

@@ -613,6 +613,7 @@ type pendingLandedMeta struct {
 	Rev        int64  `json:"rev"`
 	Size       int64  `json:"size"`
 	ResourceID string `json:"resource_id,omitempty"`
+	Checksum   string `json:"checksum,omitempty"`
 }
 
 func (idx *PendingIndex) landedFile(remotePath string) string {
@@ -622,13 +623,13 @@ func (idx *PendingIndex) landedFile(remotePath string) string {
 // PutLanded durably records the last snapshot this mount successfully
 // committed for path. Crash recovery uses it to prove a smaller remote
 // image is the same image this client landed, not an unrelated create.
-func (idx *PendingIndex) PutLanded(remotePath string, rev, size int64, resourceID string) error {
+func (idx *PendingIndex) PutLanded(remotePath string, rev, size int64, resourceID, checksum string) error {
 	if idx == nil || remotePath == "" || rev <= 0 {
 		return nil
 	}
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
-	raw, err := json.Marshal(pendingLandedMeta{Path: remotePath, Rev: rev, Size: size, ResourceID: resourceID})
+	raw, err := json.Marshal(pendingLandedMeta{Path: remotePath, Rev: rev, Size: size, ResourceID: resourceID, Checksum: checksum})
 	if err != nil {
 		return fmt.Errorf("pending index marshal landed: %w", err)
 	}
@@ -654,7 +655,7 @@ func (idx *PendingIndex) GetLanded(remotePath string) (pathCommitLandmark, bool)
 	if meta.Rev <= 0 {
 		return pathCommitLandmark{}, false
 	}
-	return pathCommitLandmark{rev: meta.Rev, size: meta.Size, resourceID: meta.ResourceID}, true
+	return pathCommitLandmark{rev: meta.Rev, size: meta.Size, resourceID: meta.ResourceID, checksum: meta.Checksum}, true
 }
 
 // Count returns the number of pending entries.
