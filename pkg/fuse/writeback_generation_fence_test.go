@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1752,6 +1753,161 @@ func TestCommitQueueSupersedesOlderSamePathQueuedCommit(t *testing.T) {
 	}
 	if string(puts[len(puts)-1].body) != string(large) {
 		t.Fatalf("last PUT body = %q, want large image", puts[len(puts)-1].body)
+	}
+}
+
+func TestCommitQueueRecoversGrownPayloadAfterSmallerCommitAndRestart(t *testing.T) {
+	const path = "/kv-1g.db"
+	header := bytes.Repeat([]byte("H"), 4096)
+	grown := append(bytes.Repeat([]byte("H"), 4096), bytes.Repeat([]byte("G"), 8192)...)
+
+	server, ts := newCASFileServer(t, path, 0, nil)
+	defer ts.Close()
+
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	if err := shadow.WriteFull(path, header, 0); err != nil {
+		t.Fatal(err)
+	}
+	headerGen := shadow.ActiveGeneration(path)
+	headerPending, err := pending.PutWithBaseRev(path, int64(len(header)), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:              path,
+		BaseRev:           0,
+		PayloadBaseRev:    0,
+		PayloadBaseRevSet: true,
+		Size:              int64(len(header)),
+		Kind:              PendingNew,
+		MutationSeq:       1,
+		ShadowGen:         headerGen,
+		PendingIndexGen:   headerPending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitCommitQueueIdle(t, cq)
+
+	if err := shadow.WriteFull(path, grown, 0); err != nil {
+		t.Fatal(err)
+	}
+	grownPending, err := pending.PutWithBaseRev(path, int64(len(grown)), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grownPending == 0 {
+		t.Fatal("grown pending generation missing")
+	}
+	cq.DrainAll()
+
+	recovered := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	recovered.client.SetSmallFileThresholdForTests(1 << 20)
+	recovered.RecoverPending()
+	waitCommitQueueIdle(t, recovered)
+
+	rev, body, _ := server.snapshot()
+	if rev != 2 {
+		t.Fatalf("after recovery rev=%d, want 2", rev)
+	}
+	if string(body) != string(grown) {
+		t.Fatalf("after recovery body len=%d, want grown %d bytes", len(body), len(grown))
+	}
+	meta, ok := pending.GetMeta(path)
+	if ok && meta.Kind == PendingConflict {
+		t.Fatal("grown payload was marked conflicted after restart")
+	}
+}
+
+func TestCommitQueueSupersedeRemovesDelayedZeroTruncate(t *testing.T) {
+	const path = "/grow.bin"
+	large := []byte("this-is-the-full-image")
+
+	server, ts := newCASFileServer(t, path, 7, []byte("old"))
+	defer ts.Close()
+
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+
+	if err := shadow.WriteFull(path, nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	truncGen := shadow.ActiveGeneration(path)
+	truncPending, err := pending.PutWithBaseRev(path, 0, PendingOverwrite, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:                 path,
+		BaseRev:              7,
+		Size:                 0,
+		Kind:                 PendingOverwrite,
+		MutationSeq:          1,
+		ShadowGen:            truncGen,
+		PendingIndexGen:      truncPending,
+		CoalesceZeroTruncate: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := shadow.WriteFull(path, large, 7); err != nil {
+		t.Fatal(err)
+	}
+	largeGen := shadow.ActiveGeneration(path)
+	largePending, err := pending.PutWithBaseRev(path, int64(len(large)), PendingOverwrite, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:            path,
+		BaseRev:         7,
+		Size:            int64(len(large)),
+		Kind:            PendingOverwrite,
+		MutationSeq:     2,
+		ShadowGen:       largeGen,
+		PendingIndexGen: largePending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := cq.WaitIdle(ctx); err != nil {
+		t.Fatalf("WaitIdle: %v", err)
+	}
+	if cq.HasPath(path) {
+		t.Fatal("superseded delayed zero-truncate still occupies the path")
+	}
+	n, _ := cq.PendingStats()
+	if n != 0 {
+		t.Fatalf("PendingStats count=%d, want 0", n)
+	}
+	_, body, _ := server.snapshot()
+	if string(body) != string(large) {
+		t.Fatalf("body = %q, want large image", body)
 	}
 }
 

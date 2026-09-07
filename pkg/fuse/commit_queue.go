@@ -1388,14 +1388,14 @@ func (cq *CommitQueue) supersedeOlderQueuedLocked(entry *CommitEntry) {
 	if cq == nil || entry == nil || entry.Path == "" {
 		return
 	}
+	remaining := cq.queue[:0]
+	changed := false
 	for _, queued := range cq.queue {
-		if queued == nil || queued == entry || queued.Path != entry.Path || queued.canceled {
+		if queued == nil {
 			continue
 		}
-		if cq.inFlight[queued.Path] == queued {
-			continue
-		}
-		if !commitEntryIsOlderSamePath(queued, entry) {
+		if queued == entry || queued.Path != entry.Path || queued.canceled || cq.inFlight[queued.Path] == queued || !commitEntryIsOlderSamePath(queued, entry) {
+			remaining = append(remaining, queued)
 			continue
 		}
 		queued.canceled = true
@@ -1406,8 +1406,14 @@ func (cq *CommitQueue) supersedeOlderQueuedLocked(entry *CommitEntry) {
 		if queued.cancelUpload != nil {
 			queued.cancelUpload()
 		}
+		changed = true
 		safeLogPrintf("commit queue: superseded older queued commit for %s (old seq=%d size=%d -> new seq=%d size=%d)", entry.Path, queued.MutationSeq, queued.Size, entry.MutationSeq, entry.Size)
 	}
+	if !changed {
+		return
+	}
+	cq.queue = remaining
+	cq.rebuildQueuedIndexLocked()
 }
 
 func (cq *CommitQueue) rememberLanded(path string, rev, size int64) {
@@ -1447,16 +1453,39 @@ func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(entry *CommitEntry, 
 		return false
 	}
 	landed := cq.landedCommit(entry.Path)
-	if landed.rev != watermark || entry.Size <= landed.size {
+	if landed.rev != watermark {
 		return false
 	}
-	if entry.BaseRev < watermark {
-		entry.BaseRev = watermark
+	return cq.rebaseGrownPayload(entry, watermark, landed.size)
+}
+
+// maybeRebaseGrownPayloadAgainstRemote reconstructs the #896 growth rebase
+// after a restart, when this process has no in-memory landed snapshot. A
+// strictly larger local payload against a smaller remote image is same-path
+// growth, not an #876 stale checkpoint (those bytes are smaller/older).
+func (cq *CommitQueue) maybeRebaseGrownPayloadAgainstRemote(entry *CommitEntry, serverRev, serverSize int64) bool {
+	if !cq.rebaseGrownPayload(entry, serverRev, serverSize) {
+		return false
+	}
+	cq.rememberLanded(entry.Path, serverRev, serverSize)
+	return true
+}
+
+func (cq *CommitQueue) rebaseGrownPayload(entry *CommitEntry, priorRev, priorSize int64) bool {
+	if cq == nil || entry == nil || priorRev <= 0 || entry.Size <= priorSize {
+		return false
+	}
+	payloadBase := entry.payloadBaseRevision()
+	if payloadBase >= priorRev && entry.Kind != PendingNew {
+		return false
+	}
+	if entry.BaseRev < priorRev {
+		entry.BaseRev = priorRev
 	}
 	if entry.Kind == PendingNew {
 		entry.Kind = PendingOverwrite
 	}
-	safeLogPrintf("commit queue: rebasing grown payload for %s onto rev %d (size %d -> %d)", entry.Path, watermark, landed.size, entry.Size)
+	safeLogPrintf("commit queue: rebasing grown payload for %s onto rev %d (size %d -> %d)", entry.Path, priorRev, priorSize, entry.Size)
 	return true
 }
 
@@ -2629,6 +2658,46 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 		return
 	}
 	serverRev := stat.Revision
+	if cq.maybeRebaseGrownPayloadAgainstRemote(entry, serverRev, stat.Size) {
+		if cq.discardSupersededEntry(entry) {
+			return
+		}
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			return
+		}
+		uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(int64(len(localData))))
+		if !ok {
+			cq.removeFromQueue(entry)
+			return
+		}
+		uploadStart := time.Now()
+		var committedRev int64
+		var uploadErr error
+		threshold := cq.directPutThreshold()
+		if len(localData) == 0 || (threshold > 0 && int64(len(localData)) < threshold) {
+			committedRev, uploadErr = cq.client.WriteCtxConditionalWithRevision(uploadCtx, apiPath, localData, entry.BaseRev)
+		} else {
+			uploadErr = uploadBufferedRemoteFile(uploadCtx, cq.client, apiPath, localData, entry.BaseRev)
+		}
+		uploadCancel()
+		if cq.perf != nil {
+			cq.perf.recordRemoteOp(perfRemoteWrite, uploadErr, time.Since(uploadStart), uint64(len(localData)))
+		}
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			return
+		}
+		if uploadErr != nil {
+			safeLogPrintf("commit queue: grown-payload overwrite failed for %s: %v", entry.Path, uploadErr)
+			cq.onCommitTerminalFailure(entry)
+			return
+		}
+		if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err != nil {
+			cq.onCommitPostUploadFailure(entry, err)
+		}
+		return
+	}
 
 	readCtx, readCancel := context.WithTimeout(context.Background(), uploadTimeout)
 	readStart := time.Now()
@@ -2810,7 +2879,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		}
 	}()
 	if stat.Size != localSize {
-		if localSize > stat.Size && cq.maybeRebaseGrownPayloadOntoWatermark(entry, stat.Revision) {
+		if localSize > stat.Size && cq.maybeRebaseGrownPayloadAgainstRemote(entry, stat.Revision, stat.Size) {
 			safeLogPrintf("commit queue: ShadowSpill growth overwrite for %s (local %d bytes vs server %d bytes at rev %d)", entry.Path, localSize, stat.Size, stat.Revision)
 			if fd != nil {
 				_ = fd.Close()
