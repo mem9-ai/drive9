@@ -2222,6 +2222,151 @@ func TestWriteBuffer_EvictPart(t *testing.T) {
 	}
 }
 
+// TestWriteBuffer_RestorePartReloadsEvictedBytes covers issue #898: SQLite WAL
+// is not pure append at FUSE granularity. A back-write into an evicted part
+// must overlay the original bytes, not zero-fill the rest of the part.
+func TestWriteBuffer_RestorePartReloadsEvictedBytes(t *testing.T) {
+	const partSize int64 = 64
+	wb := NewWriteBuffer("/kv.db-wal", 1<<20, partSize)
+	wb.SetSmallFileMax(32)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+
+	original := make([]byte, 3*partSize)
+	for i := range original {
+		original[i] = byte(i + 1)
+	}
+	saved := map[int][]byte{}
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		saved[partIdx] = cp
+		wb.EvictPart(partIdx)
+	}
+	wb.RestorePart = func(partNum int) ([]byte, error) {
+		data, ok := saved[partNum-1]
+		if !ok {
+			return nil, fmt.Errorf("missing part %d", partNum)
+		}
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		return cp, nil
+	}
+
+	if _, err := wb.Write(0, original); err != nil {
+		t.Fatalf("sequential write: %v", err)
+	}
+	if !wb.uploadedParts[0] || !wb.uploadedParts[1] {
+		t.Fatalf("expected parts 0 and 1 evicted, got %v", wb.uploadedParts)
+	}
+
+	overlay := []byte("WAL!")
+	off := partSize + 8
+	if _, err := wb.Write(off, overlay); err != nil {
+		t.Fatalf("back-write: %v", err)
+	}
+	part, ok := wb.parts[1]
+	if !ok {
+		t.Fatal("part 1 should be restored")
+	}
+	if int64(len(part)) != partSize {
+		t.Fatalf("restored part len=%d, want %d", len(part), partSize)
+	}
+	want := append([]byte(nil), original[partSize:2*partSize]...)
+	copy(want[8:8+len(overlay)], overlay)
+	if !bytes.Equal(part, want) {
+		t.Fatalf("restored part = %v, want original bytes with overlay", part)
+	}
+}
+
+func TestWriteBuffer_RestorePartErrorFailsBackWrite(t *testing.T) {
+	const partSize int64 = 64
+	wb := NewWriteBuffer("/kv.db-wal", 1<<20, partSize)
+	wb.SetSmallFileMax(32)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+	wb.OnPartFull = func(partIdx int, _ []byte) {
+		wb.EvictPart(partIdx)
+	}
+	wb.RestorePart = func(partNum int) ([]byte, error) {
+		return nil, fmt.Errorf("shadow missing part %d", partNum)
+	}
+
+	if _, err := wb.Write(0, bytes.Repeat([]byte{0x11}, int(2*partSize))); err != nil {
+		t.Fatalf("sequential write: %v", err)
+	}
+	if _, err := wb.Write(8, []byte("x")); err == nil {
+		t.Fatal("back-write into unrestorable evicted part should fail")
+	}
+}
+
+func TestShadowSpillBackWriteRestoresFromShadow(t *testing.T) {
+	store, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const path = "/kv.db-wal"
+	const partSize int64 = 64
+	if err := store.Ensure(path, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	wb := NewWriteBuffer(path, 1<<20, partSize)
+	wb.SetSmallFileMax(32)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+	fh := &FileHandle{Path: path, Dirty: wb, ShadowSpill: true, ShadowReady: true}
+	fs := &Dat9FS{shadowStore: store}
+	fs.bindShadowSpillEvictionLocked(fh)
+
+	original := make([]byte, 3*partSize)
+	for i := range original {
+		original[i] = byte(i + 3)
+	}
+	if _, err := store.WriteAt(path, 0, original, 0); err != nil {
+		t.Fatalf("shadow sequential write: %v", err)
+	}
+	if _, err := wb.Write(0, original); err != nil {
+		t.Fatalf("dirty sequential write: %v", err)
+	}
+	if wb.RestorePart == nil {
+		t.Fatal("spill bind should install RestorePart")
+	}
+	if !wb.uploadedParts[0] || !wb.uploadedParts[1] {
+		t.Fatalf("expected parts 0 and 1 evicted, got %v", wb.uploadedParts)
+	}
+
+	overlay := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+	off := partSize + 4
+	if _, err := store.WriteAt(path, off, overlay, 0); err != nil {
+		t.Fatalf("shadow back-write: %v", err)
+	}
+	if _, err := wb.Write(off, overlay); err != nil {
+		t.Fatalf("dirty back-write: %v", err)
+	}
+
+	part, ok := wb.parts[1]
+	if !ok {
+		t.Fatal("part 1 should be restored from shadow")
+	}
+	want := append([]byte(nil), original[partSize:2*partSize]...)
+	copy(want[4:8], overlay)
+	if !bytes.Equal(part, want) {
+		t.Fatalf("dirty part after restore = %v, want shadow overlay %v", part, want)
+	}
+
+	got := make([]byte, len(original))
+	n, err := store.ReadAt(path, 0, got)
+	if err != nil || n != len(got) {
+		t.Fatalf("shadow read: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got[partSize:partSize+4], original[partSize:partSize+4]) || !bytes.Equal(got[off:off+int64(len(overlay))], overlay) {
+		t.Fatalf("shadow lost original prefix or overlay")
+	}
+}
+
 func TestWriteBuffer_ResetSequentialState(t *testing.T) {
 	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
 	wb.sequential = true

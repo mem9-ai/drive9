@@ -213,6 +213,55 @@ func (fs *Dat9FS) newWriteBuffer(path string, maxSize, partSize int64) *WriteBuf
 	return wb
 }
 
+// bindShadowSpillEvictionLocked evicts completed WriteBuffer parts to keep
+// Dirty memory bounded and restores them from the shadow file on back-write.
+// SQLite WAL is not pure append at this granularity; recreating an evicted
+// part as zeros (#898) poisons later Dirty consumers (header reads, rewrite
+// snapshots if spill is dropped, same-path-dirty fallback).
+func (fs *Dat9FS) bindShadowSpillEvictionLocked(fh *FileHandle) {
+	if fh == nil || fh.Dirty == nil || !fh.ShadowSpill {
+		return
+	}
+	wb := fh.Dirty
+	wb.OnPartFull = func(partIdx int, _ []byte) {
+		wb.EvictPart(partIdx)
+	}
+	if fs == nil || fs.shadowStore == nil {
+		wb.RestorePart = nil
+		return
+	}
+	store := fs.shadowStore
+	wb.RestorePart = func(partNum int) ([]byte, error) {
+		return restoreWriteBufferPartFromShadow(store, wb, partNum)
+	}
+}
+
+func restoreWriteBufferPartFromShadow(store *ShadowStore, wb *WriteBuffer, partNum int) ([]byte, error) {
+	if store == nil || wb == nil || partNum < 1 || wb.partSize <= 0 {
+		return nil, fmt.Errorf("invalid shadow part restore")
+	}
+	partStart := int64(partNum-1) * wb.partSize
+	end := partStart + wb.partSize
+	if wb.totalSize > 0 && partStart >= wb.totalSize {
+		return nil, fmt.Errorf("part %d starts at %d beyond size %d", partNum, partStart, wb.totalSize)
+	}
+	if wb.totalSize > 0 && end > wb.totalSize {
+		end = wb.totalSize
+	}
+	if end <= partStart {
+		return nil, fmt.Errorf("empty part %d", partNum)
+	}
+	buf := make([]byte, end-partStart)
+	n, err := store.ReadAt(wb.path, partStart, buf)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if n != len(buf) {
+		return nil, fmt.Errorf("shadow part %d short read n=%d want=%d", partNum, n, len(buf))
+	}
+	return buf, nil
+}
+
 // inlineThreshold returns a small-file cutoff suitable for performance
 // heuristics (read-cache prefetch sizing, debounce flush timing, write-
 // buffer fast-path bounds). It mirrors the server's inline_threshold once
@@ -2188,10 +2237,7 @@ func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) (f
 	if newSize == 0 {
 		fh.Dirty.ResetStreamingState()
 		if fh.ShadowSpill {
-			wb := fh.Dirty
-			wb.OnPartFull = func(partIdx int, data []byte) {
-				wb.EvictPart(partIdx)
-			}
+			fs.bindShadowSpillEvictionLocked(fh)
 		}
 		if fh.Streamer != nil {
 			streamer := fh.Streamer
@@ -2246,8 +2292,7 @@ func (fs *Dat9FS) applySQLiteZeroTruncateLocked(fh *FileHandle) bool {
 	fh.Dirty.ResetStreamingState()
 	fh.Dirty.ResetSequentialState(0)
 	if fh.ShadowSpill {
-		wb := fh.Dirty
-		wb.OnPartFull = func(partIdx int, _ []byte) { wb.EvictPart(partIdx) }
+		fs.bindShadowSpillEvictionLocked(fh)
 	}
 	fh.OrigSize = 0
 	// The initiating FD owns the truncate mutation. A sibling remains a
@@ -11223,11 +11268,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	}
 
 	if fh.ShadowSpill {
-		// ShadowSpill mode: shadow is the authoritative data source.
-		// OnPartFull evicts memory immediately — no StreamUploader needed.
-		wb.OnPartFull = func(partIdx int, data []byte) {
-			wb.EvictPart(partIdx)
-		}
+		fs.bindShadowSpillEvictionLocked(fh)
 	} else if fh.WritePolicy != WritePolicyWriteSync && !fs.layerEnabled() && !fs.appendLogNewPathActive(childP) {
 		// Normal mode: attach streaming uploader for sequential write streaming.
 		fh.Streamer = NewStreamUploader(fs.client, childP, expectedRevisionForHandle(fh), fs.remoteRoot())
@@ -11442,11 +11483,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			}
 
 			if fh.ShadowSpill {
-				// ShadowSpill mode: shadow is the authoritative data source.
-				wb := fh.Dirty
-				wb.OnPartFull = func(partIdx int, data []byte) {
-					wb.EvictPart(partIdx)
-				}
+				fs.bindShadowSpillEvictionLocked(fh)
 			} else if fh.WritePolicy != WritePolicyWriteSync && !fs.layerEnabled() && !fs.appendLogPathConfigured(p) {
 				// Normal mode: attach streaming uploader with OnPartFull wiring.
 				fh.Streamer = NewStreamUploader(fs.client, p, expectedRevisionForHandle(fh), fs.remoteRoot())

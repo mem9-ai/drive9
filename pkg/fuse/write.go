@@ -47,6 +47,10 @@ type WriteBuffer struct {
 
 	// Callback (optional)
 	LoadPart LoadPartFunc // called to lazily load part data
+	// RestorePart reloads an evicted part from local authoritative storage
+	// (ShadowSpill). partNum is 1-based. Unlike LoadPart, it is not gated on
+	// remoteSize: the part may exist only in the local shadow.
+	RestorePart LoadPartFunc
 
 	// remoteSize is the original remote file size, set when lazy loading
 	// is configured. ensurePart() only calls LoadPart for parts whose
@@ -86,6 +90,7 @@ type writeBufferSnapshot struct {
 	dirtyParts    map[int]bool
 	touched       bool
 	LoadPart      LoadPartFunc
+	RestorePart   LoadPartFunc
 	remoteSize    int64
 	curMemory     int64
 	appendCursor  int64
@@ -109,6 +114,7 @@ func (wb *WriteBuffer) snapshot() *writeBufferSnapshot {
 		dirtyParts:    cloneBoolMap(wb.dirtyParts),
 		touched:       wb.touched,
 		LoadPart:      wb.LoadPart,
+		RestorePart:   wb.RestorePart,
 		remoteSize:    wb.remoteSize,
 		curMemory:     wb.curMemory,
 		appendCursor:  wb.appendCursor,
@@ -132,6 +138,7 @@ func (wb *WriteBuffer) restore(snapshot *writeBufferSnapshot) {
 	wb.dirtyParts = cloneBoolMap(snapshot.dirtyParts)
 	wb.touched = snapshot.touched
 	wb.LoadPart = snapshot.LoadPart
+	wb.RestorePart = snapshot.RestorePart
 	wb.remoteSize = snapshot.remoteSize
 	wb.curMemory = snapshot.curMemory
 	wb.appendCursor = snapshot.appendCursor
@@ -426,13 +433,23 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 		return nil
 	}
 
-	// Check if this part was evicted after streaming upload.
-	// Recreate as zero-filled — the original data is gone (already on S3).
-	// Only the newly written bytes will be meaningful; other bytes are zeros.
+	// A previously evicted part is being touched again. Prefer restoring the
+	// original bytes (ShadowSpill shadow or lazy remote load) so a non-tail
+	// overlay cannot zero-fill the rest of the part. Fall back to the
+	// historical zero-fill only when no restorer exists (streamer-only).
 	if wb.uploadedParts != nil && wb.uploadedParts[partIdx] {
+		data, restored, err := wb.restoreEvictedPart(partIdx)
+		if err != nil {
+			return err
+		}
+		if restored {
+			wb.parts[partIdx] = data
+			wb.curMemory += int64(len(data))
+			return nil
+		}
 		safeLogPrintf("WARNING: back-write to evicted part %d of %s — "+
 			"non-written bytes will be zero (original data already uploaded to S3)", partIdx, wb.path)
-		data := make([]byte, wb.partSize)
+		data = make([]byte, wb.partSize)
 		wb.parts[partIdx] = data
 		wb.curMemory += wb.partSize
 		return nil
@@ -455,6 +472,33 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 	// Create empty part
 	wb.parts[partIdx] = nil // will be grown as needed in Write
 	return nil
+}
+
+func (wb *WriteBuffer) restoreEvictedPart(partIdx int) ([]byte, bool, error) {
+	if wb.RestorePart != nil {
+		data, err := wb.RestorePart(partIdx + 1)
+		if err != nil {
+			return nil, false, fmt.Errorf("restore evicted part %d of %s: %w", partIdx+1, wb.path, err)
+		}
+		if len(data) == 0 {
+			return nil, false, fmt.Errorf("restored evicted part %d of %s is empty", partIdx+1, wb.path)
+		}
+		return data, true, nil
+	}
+	if wb.LoadPart != nil {
+		partStart := int64(partIdx) * wb.partSize
+		if partStart < wb.remoteSize {
+			data, err := wb.LoadPart(partIdx + 1)
+			if err != nil {
+				return nil, false, err
+			}
+			if len(data) == 0 {
+				return nil, false, fmt.Errorf("loaded evicted part %d of %s is empty", partIdx+1, wb.path)
+			}
+			return data, true, nil
+		}
+	}
+	return nil, false, nil
 }
 
 // markDirty marks all parts that overlap with [start, end) as dirty.
@@ -871,6 +915,15 @@ func (wb *WriteBuffer) LoadMissingParts() error {
 			continue
 		}
 		if wb.uploadedParts != nil && wb.uploadedParts[idx] {
+			data, restored, err := wb.restoreEvictedPart(idx)
+			if err != nil {
+				return err
+			}
+			if restored {
+				wb.parts[idx] = data
+				wb.curMemory += int64(len(data))
+				continue
+			}
 			return fmt.Errorf("part %d was evicted after streaming upload and cannot be refetched", idx+1)
 		}
 		if wb.LoadPart == nil {
@@ -934,10 +987,11 @@ func (wb *WriteBuffer) ResetStreamingState() {
 }
 
 // EvictPart releases the memory for a 0-based part index after it has been
-// uploaded via streaming. The part is recorded in uploadedParts so that
-// subsequent reads/writes know it was already handled.
-// If a back-write later touches this part, ensurePart will recreate it
-// as a zero-filled slice and log a warning.
+// uploaded via streaming or spilled to shadow. The part is recorded in
+// uploadedParts so that subsequent reads/writes know it was already handled.
+// If a back-write later touches this part, ensurePart restores it via
+// RestorePart/LoadPart when configured; otherwise it recreates a zero-filled
+// slice and logs a warning.
 func (wb *WriteBuffer) EvictPart(partIdx int) {
 	if wb.uploadedParts == nil {
 		wb.uploadedParts = make(map[int]bool)
