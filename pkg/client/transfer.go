@@ -1515,13 +1515,15 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		}
 
 	case resp.StatusCode == http.StatusPartialContent:
-		if err := validatePartialContentRange(resp, offset); err != nil {
+		end, err := validatePartialContentRange(resp, offset, offset+length-1)
+		if err != nil {
 			_ = resp.Body.Close()
 			return nil, fmt.Errorf("read %s: %w", path, err)
 		}
 		// First-hop Range honored. The body already starts at offset, so
-		// bound it to length without skipping the offset a second time.
-		return &limitedReadCloser{r: io.LimitReader(resp.Body, length), c: resp.Body}, nil
+		// bound it to the declared response range without skipping the
+		// offset a second time.
+		return &limitedReadCloser{r: io.LimitReader(resp.Body, end-offset+1), c: resp.Body}, nil
 
 	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
 		_ = resp.Body.Close()
@@ -1601,43 +1603,53 @@ func (c *Client) sliceBody(rc io.ReadCloser, offset, length int64) (io.ReadClose
 }
 
 // validatePartialContentRange checks that a first-hop 206 response carries a
-// well-formed Content-Range starting at the requested offset. The caller
-// bounds the length via io.LimitReader, so a server-clamped end (EOF) is
-// allowed here.
-func validatePartialContentRange(resp *http.Response, offset int64) error {
+// well-formed Content-Range starting at the requested offset and not extending
+// past the requested end. It returns the declared response end so the caller
+// can bound the body to the declared range. A server-clamped end (EOF) is
+// allowed.
+func validatePartialContentRange(resp *http.Response, offset, requestedEnd int64) (int64, error) {
 	contentRange := resp.Header.Get("Content-Range")
 	if contentRange == "" {
-		return fmt.Errorf("206 response missing Content-Range for offset %d", offset)
+		return 0, fmt.Errorf("206 response missing Content-Range for offset %d", offset)
 	}
 	rest, ok := strings.CutPrefix(contentRange, "bytes ")
 	if !ok {
-		return fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
 	}
 	byteRange, complete, ok := strings.Cut(rest, "/")
 	if !ok {
-		return fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
 	}
+	completeSize := int64(-1)
 	if complete != "*" {
-		if _, err := strconv.ParseInt(complete, 10, 64); err != nil {
-			return fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+		var err error
+		completeSize, err = strconv.ParseInt(complete, 10, 64)
+		if err != nil || completeSize < 0 {
+			return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
 		}
 	}
 	startStr, endStr, ok := strings.Cut(byteRange, "-")
 	if !ok || startStr == "" || endStr == "" {
-		return fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
 	}
 	start, err := strconv.ParseInt(startStr, 10, 64)
 	if err != nil {
-		return fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
 	}
 	end, err := strconv.ParseInt(endStr, 10, 64)
 	if err != nil || end < start {
-		return fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
 	}
 	if start != offset {
-		return fmt.Errorf("unexpected Content-Range %q for offset %d", contentRange, offset)
+		return 0, fmt.Errorf("unexpected Content-Range %q for offset %d", contentRange, offset)
 	}
-	return nil
+	if end > requestedEnd {
+		return 0, fmt.Errorf("Content-Range %q extends past requested end %d for offset %d", contentRange, requestedEnd, offset)
+	}
+	if completeSize >= 0 && completeSize <= end {
+		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+	}
+	return end, nil
 }
 
 type limitedReadCloser struct {

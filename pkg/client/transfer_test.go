@@ -1656,6 +1656,9 @@ func TestReadStreamRangeFirstHop206BadContentRange(t *testing.T) {
 		{name: "trailing-junk", contentRange: "bytes 5-8/64junk"},
 		{name: "missing-bytes-prefix", contentRange: "chunks 5-8/64"},
 		{name: "empty-complete", contentRange: "bytes 5-8/"},
+		{name: "complete-before-end", contentRange: "bytes 5-8/4"},
+		{name: "negative-complete", contentRange: "bytes 5-8/-1"},
+		{name: "wider-than-requested", contentRange: "bytes 5-100/200"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
