@@ -277,6 +277,34 @@ func TestArchiveProfileCodingAgentSkipsDefaults(t *testing.T) {
 	}
 }
 
+func TestArchiveFileGlobDoesNotPruneMatchingDirectory(t *testing.T) {
+	mock := newMockTreeServer()
+	seedRemoteTree(mock, "/proj", map[string]string{
+		"/proj/snapshots-wal/data.bin":     "data",
+		"/proj/snapshots-wal/repro.db-wal": "wal",
+		"/proj/a/data.bin":                 "a",
+		"/proj/[a-]/data.bin":              "literal",
+	})
+	srv := mock.httpServer(t)
+	defer srv.Close()
+	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
+	out := filepath.Join(t.TempDir(), "proj.tar.gz")
+	if err := Archive(c, []string{":/proj", out, "--exclude", "**/*-wal", "--exclude", "**/[a-]"}); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	got := tarEntries(t, out)
+	if !contains(got, "proj/snapshots-wal/data.bin") || !contains(got, "proj/a/data.bin") {
+		t.Fatalf("ordinary descendants missing from archive: %v", got)
+	}
+	if contains(got, "proj/snapshots-wal/repro.db-wal") || contains(got, "proj/[a-]/data.bin") {
+		t.Fatalf("excluded files leaked into archive: %v", got)
+	}
+	if contains(got, "proj/snapshots-wal/") || contains(got, "proj/[a-]/") {
+		t.Fatalf("excluded directory entries leaked into archive: %v", got)
+	}
+}
+
 func TestArchiveZipFormat(t *testing.T) {
 	mock := newMockTreeServer()
 	seedRemoteTree(mock, "/proj", map[string]string{
