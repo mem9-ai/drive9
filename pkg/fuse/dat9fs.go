@@ -3124,10 +3124,21 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 // buffer. A successful Fsync/Flush must not leave uploadedParts/RestorePart
 // pointing at a shadow that the commit path is about to delete (#900).
 func (fs *Dat9FS) rebaselineCommittedDirtyBufferLocked(fh *FileHandle) {
-	if fh == nil || fh.Dirty == nil || fh.Dirty.HasDirtyParts() || !fh.Dirty.needsCommitRebaseline() {
+	if fh == nil || fh.Dirty == nil || fh.Dirty.HasDirtyParts() {
 		return
 	}
-	fs.rebindCleanWriteBufferToRemoteLocked(fh, fh.Dirty.Size())
+	if fh.Dirty.needsCommitRebaseline() {
+		// Evicted parts are gone from memory; the next same-FD write must
+		// load the just-committed remote object instead of a deleted shadow.
+		fs.rebindCleanWriteBufferToRemoteLocked(fh, fh.Dirty.Size())
+		return
+	}
+	// Create installs RestorePart/OnPartFull even for tiny files that never
+	// evicted. Clearing those callbacks is enough: keep the in-memory image
+	// so a later write does not GET a path the commit just deleted (unlink)
+	// or that the test server never served.
+	fh.Dirty.RestorePart = nil
+	fh.Dirty.OnPartFull = nil
 }
 
 func (fs *Dat9FS) seedReadCacheFromShadowGenerationLocked(path string, size int64, revision int64, shadowGen uint64) bool {

@@ -496,13 +496,7 @@ func (wb *WriteBuffer) EnsurePartsForWrite(offset, length int64) error {
 }
 
 func (wb *WriteBuffer) needsCommitRebaseline() bool {
-	if wb == nil {
-		return false
-	}
-	if wb.RestorePart != nil || wb.OnPartFull != nil {
-		return true
-	}
-	return len(wb.uploadedParts) > 0
+	return wb != nil && len(wb.uploadedParts) > 0
 }
 
 func (wb *WriteBuffer) restoreEvictedPart(partIdx int) ([]byte, bool, error) {
