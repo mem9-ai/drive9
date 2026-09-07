@@ -2422,7 +2422,7 @@ func TestShadowSpillFsyncRebaselineAllowsSameHandleBackWrite(t *testing.T) {
 				http.NotFound(w, r)
 				return
 			}
-			w.Write(body)
+			_, _ = w.Write(body)
 		case http.MethodPut:
 			body, _ := io.ReadAll(r.Body)
 			got, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
@@ -2508,7 +2508,7 @@ func TestShadowSpillFsyncThenAppendDoesNotZeroPrefix(t *testing.T) {
 				http.NotFound(w, r)
 				return
 			}
-			w.Write(body)
+			_, _ = w.Write(body)
 		case http.MethodPut:
 			body, _ := io.ReadAll(r.Body)
 			mu.Lock()
