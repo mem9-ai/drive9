@@ -438,6 +438,15 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 	// overlay cannot zero-fill the rest of the part. Fall back to the
 	// historical zero-fill only when no restorer exists (streamer-only).
 	if wb.uploadedParts != nil && wb.uploadedParts[partIdx] {
+		partStart := int64(partIdx) * wb.partSize
+		if partStart >= wb.totalSize {
+			// Truncate/shrink dropped this part from the logical file. A later
+			// append at the new EOF must create a fresh part, not restore
+			// truncated-away bytes (and not fail the write).
+			delete(wb.uploadedParts, partIdx)
+			wb.parts[partIdx] = nil
+			return nil
+		}
 		data, restored, err := wb.restoreEvictedPart(partIdx)
 		if err != nil {
 			return err
@@ -500,6 +509,10 @@ func (wb *WriteBuffer) needsCommitRebaseline() bool {
 }
 
 func (wb *WriteBuffer) restoreEvictedPart(partIdx int) ([]byte, bool, error) {
+	partStart := int64(partIdx) * wb.partSize
+	if wb.partSize > 0 && partStart >= wb.totalSize {
+		return nil, false, nil
+	}
 	if wb.RestorePart != nil {
 		data, err := wb.RestorePart(partIdx + 1)
 		if err != nil {
@@ -592,6 +605,11 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 				wb.curMemory -= int64(len(wb.parts[idx]))
 				delete(wb.parts, idx)
 				delete(wb.dirtyParts, idx)
+			}
+		}
+		for idx := range wb.uploadedParts {
+			if int64(idx)*wb.partSize >= size {
+				delete(wb.uploadedParts, idx)
 			}
 		}
 

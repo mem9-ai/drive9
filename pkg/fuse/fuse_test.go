@@ -2635,6 +2635,182 @@ func newStrictSmallPartSpillFS(t *testing.T, baseURL, filePath string, partSize 
 	return fs, createOut.Fh, createOut.NodeId, shadow
 }
 
+func TestWriteBuffer_ShrinkDropsEvictedPartsBeyondSize(t *testing.T) {
+	const partSize int64 = 64
+	wb := NewWriteBuffer("/spill.bin", 1<<20, partSize)
+	wb.SetSmallFileMax(32)
+	wb.sequential = true
+	wb.uploadedParts = make(map[int]bool)
+	saved := map[int][]byte{}
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		saved[partIdx] = cp
+		wb.EvictPart(partIdx)
+	}
+	wb.RestorePart = func(partNum int) ([]byte, error) {
+		data, ok := saved[partNum-1]
+		if !ok {
+			return nil, fmt.Errorf("missing part %d", partNum)
+		}
+		return append([]byte(nil), data...), nil
+	}
+	original := bytes.Repeat([]byte{0x44}, int(3*partSize))
+	if _, err := wb.Write(0, original); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if !wb.uploadedParts[1] {
+		t.Fatal("expected part 1 evicted")
+	}
+	if err := wb.Truncate(partSize); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if wb.uploadedParts[1] {
+		t.Fatal("truncate should drop evicted parts at/after the new size")
+	}
+	tail := []byte("tail")
+	if _, err := wb.Write(partSize, tail); err != nil {
+		t.Fatalf("append after shrink: %v", err)
+	}
+	if err := wb.EnsureLoaded(0); err != nil {
+		t.Fatalf("load retained part 0: %v", err)
+	}
+	got := make([]byte, partSize+int64(len(tail)))
+	if n := wb.ReadAt(0, got); n != len(got) {
+		t.Fatalf("ReadAt n=%d", n)
+	}
+	want := append(bytes.Repeat([]byte{0x44}, int(partSize)), tail...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("after shrink+append = %x, want %x", got, want)
+	}
+}
+
+func TestShadowSpillShrinkThenAppendAtEvictedBoundary(t *testing.T) {
+	const filePath = "/spill-shrink.bin"
+	const partSize int64 = 64
+	original := bytes.Repeat([]byte{0x55}, int(3*partSize))
+	tail := []byte("tail")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.RawQuery == "list=1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	fs, fhID, nodeID, _ := newStrictSmallPartSpillFS(t, ts.URL, filePath, partSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}, original); st != gofuse.OK {
+		t.Fatalf("seed Write: %v", st)
+	}
+	var attrOut gofuse.AttrOut
+	if st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: nodeID},
+			Valid:    gofuse.FATTR_SIZE | gofuse.FATTR_FH,
+			Fh:       fhID,
+			Size:     uint64(partSize),
+		},
+	}, &attrOut); st != gofuse.OK {
+		t.Fatalf("truncate: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Offset: uint64(partSize),
+	}, tail); st != gofuse.OK {
+		t.Fatalf("append after shrink: %v", st)
+	}
+	buf := make([]byte, int(partSize)+len(tail))
+	result, st := fs.Read(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Size: uint32(len(buf))}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read after shrink+append: %v", st)
+	}
+	got, _ := result.Bytes(buf)
+	want := append(bytes.Repeat([]byte{0x55}, int(partSize)), tail...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("after shrink+append = %x, want %x", got, want)
+	}
+}
+
+func TestShadowSpillFsyncUnlinkSameHandleWriteStaysLocal(t *testing.T) {
+	const filePath = "/spill-unlink.bin"
+	const partSize int64 = 64
+	original := bytes.Repeat([]byte{0x66}, int(3*partSize))
+	overlay := []byte{0xAA, 0xBB}
+
+	var mu sync.Mutex
+	var committed []byte
+	var puts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+		case r.Method == http.MethodGet:
+			mu.Lock()
+			body := append([]byte(nil), committed...)
+			mu.Unlock()
+			if len(body) == 0 {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(body)
+		case r.Method == http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			puts.Add(1)
+			mu.Lock()
+			committed = append([]byte(nil), body...)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": 1})
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			committed = nil
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+		_ = p
+	}))
+	defer ts.Close()
+
+	fs, fhID, nodeID, _ := newStrictSmallPartSpillFS(t, ts.URL, filePath, partSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}, original); st != gofuse.OK {
+		t.Fatalf("seed Write: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("Fsync: %v", st)
+	}
+	if got := puts.Load(); got != 1 {
+		t.Fatalf("puts after fsync = %d, want 1", got)
+	}
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Offset: 8}, overlay); st != gofuse.OK {
+		t.Fatalf("write after unlink: %v", st)
+	}
+	if got := puts.Load(); got != 1 {
+		t.Fatalf("write-after-unlink resurrected remote path (puts=%d)", got)
+	}
+	fh, _ := fs.fileHandles.Get(fhID)
+	fh.Lock()
+	got := make([]byte, 8+len(overlay))
+	n := fh.Dirty.ReadAt(0, got)
+	fh.Unlock()
+	want := append(bytes.Repeat([]byte{0x66}, 8), overlay...)
+	if n != len(got) || !bytes.Equal(got, want) {
+		t.Fatalf("anonymous fd bytes = %x (n=%d), want %x", got[:n], n, want)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("Flush after unlink: %v", st)
+	}
+	if got := puts.Load(); got != 1 {
+		t.Fatalf("flush after unlink uploaded (puts=%d)", got)
+	}
+}
+
 func TestWriteBuffer_ResetSequentialState(t *testing.T) {
 	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
 	wb.sequential = true

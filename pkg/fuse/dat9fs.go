@@ -2784,6 +2784,9 @@ func (fs *Dat9FS) rebindCleanWriteBufferToRemoteLocked(fh *FileHandle, committed
 		if length <= 0 {
 			return nil, nil
 		}
+		if data, handled, err := fs.loadUnlinkedHandlePart(fh, offset, length); handled {
+			return data, err
+		}
 
 		lpCtx, lpCf := context.WithTimeout(context.Background(), fuseTimeout)
 		defer lpCf()
@@ -3204,6 +3207,9 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 		}
 		if length <= 0 {
 			return nil, nil
+		}
+		if data, handled, err := fs.loadUnlinkedHandlePart(fh, offset, length); handled {
+			return data, err
 		}
 
 		lpCtx, lpCf := context.WithTimeout(context.Background(), fuseTimeout)
@@ -7377,7 +7383,8 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 				continue
 			}
 			fh.Lock()
-			handleNeedsSnapshot := cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh)
+			handleNeedsSnapshot := cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) ||
+				remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh)
 			if handleNeedsSnapshot {
 				needsSnapshot = true
 				snapshotNeedCount++
@@ -7440,6 +7447,8 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 					fh.UnlinkedShadowGen = gen
 					fh.UnlinkedSnapshot = true
 				}
+			} else if snapshotOK && remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh) {
+				attachUnlinkedSnapshotLocked(fh, snapshot, snapshotShadowGen, size)
 			}
 		} else if snapshotOK {
 			if snapshotShadowGen != 0 && cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) {
@@ -7469,6 +7478,75 @@ func cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
 		fh.UnlinkedData == nil &&
 		fh.UnlinkedShadowGen == 0 &&
 		!fh.UnlinkedSnapshot
+}
+
+// remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked is the post-#900
+// rebaseline case: a clean WriteBuffer whose bytes live only on the
+// committed pathname via LoadPart. Unlink must snapshot that object before
+// DELETE, or a later same-FD write GETs the deleted path and returns EIO.
+func remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
+	return fh != nil &&
+		fh.Dirty != nil &&
+		!fh.Dirty.HasDirtyParts() &&
+		fh.DirtySeq == 0 &&
+		fh.Dirty.LoadPart != nil &&
+		fh.Dirty.remoteSize > 0 &&
+		!fh.ShadowSpill &&
+		fh.LocalFile == nil &&
+		fh.Layer != PathLayerGitWorkspace &&
+		fh.UnlinkedData == nil &&
+		fh.UnlinkedShadowGen == 0 &&
+		!fh.UnlinkedSnapshot
+}
+
+func attachUnlinkedSnapshotLocked(fh *FileHandle, snapshot []byte, snapshotShadowGen uint64, size int64) {
+	if fh == nil {
+		return
+	}
+	if snapshotShadowGen != 0 {
+		fh.UnlinkedData = nil
+		fh.UnlinkedSnapshot = true
+		fh.UnlinkedShadowGen = snapshotShadowGen
+		fh.UnlinkedSize = size
+		return
+	}
+	fh.UnlinkedData = append(fh.UnlinkedData[:0], snapshot...)
+	fh.UnlinkedSnapshot = true
+	fh.UnlinkedSize = int64(len(snapshot))
+}
+
+func (fs *Dat9FS) loadUnlinkedHandlePart(fh *FileHandle, offset, length int64) ([]byte, bool, error) {
+	if fh == nil || !fh.Unlinked || length <= 0 {
+		return nil, false, nil
+	}
+	if fh.UnlinkedShadowGen != 0 && fs != nil && fs.shadowStore != nil {
+		buf := make([]byte, length)
+		n, err := fs.shadowStore.ReadAtGen(fh.UnlinkedShadowGen, offset, buf)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, true, err
+		}
+		if n < 0 {
+			n = 0
+		}
+		if n > len(buf) {
+			n = len(buf)
+		}
+		return buf[:n], true, nil
+	}
+	if fh.UnlinkedData != nil {
+		if offset >= int64(len(fh.UnlinkedData)) {
+			return nil, true, nil
+		}
+		end := offset + length
+		if end > int64(len(fh.UnlinkedData)) {
+			end = int64(len(fh.UnlinkedData))
+		}
+		if end <= offset {
+			return nil, true, nil
+		}
+		return append([]byte(nil), fh.UnlinkedData[offset:end]...), true, nil
+	}
+	return nil, false, nil
 }
 
 // unmarkOpenHandlesAfterFailedUnlink rolls back markOpenHandlesUnlinked when
