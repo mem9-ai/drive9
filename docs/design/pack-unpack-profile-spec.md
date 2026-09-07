@@ -53,11 +53,12 @@ The archive is uploaded to Drive9. It is not stored inside the local root.
 
 ### Profiles
 
-A profile controls three things:
+A profile controls four things:
 
 - `[local]`: paths that should live in the local overlay;
 - `[remote]`: overrides that force paths back to Drive9-managed remote storage;
 - `[pack]`: local overlay paths that should be included when packing.
+- `[append-log]`: remote-persistent file patterns eligible for append-log sync optimization.
 
 The built-in profiles are:
 
@@ -69,6 +70,49 @@ The built-in profiles are:
 
 `coding-agent` is optimized for interactive local performance. `portable` is
 optimized for moving that local overlay state across machines.
+
+### Append-log defaults
+
+The built-in `coding-agent` profile includes:
+
+```ini
+[append-log]
+**/*-wal
+```
+
+This matches SQLite WAL files such as `db-wal`, `state.db-wal`, and
+`state.sqlite-wal` at the mount root or in subdirectories. It does not match
+database main files or `-shm` files. Other built-in profiles have no default
+append-log rules. These patterns enable the existing synchronization optimization;
+they do not change local/remote routing, durability, or flush timing. Local-only
+files, Git workspaces, and layer mounts retain their existing exclusions.
+
+For Drive9 FUSE mounts, the CLI checks the backend's `append_log_v1` capability
+before starting the mount, with a five-second timeout. When the capability is
+false, missing, or cannot be confirmed, it ignores the profile's append-log rules
+and prints one warning to the caller's stderr, including before background
+mounts detach. Ordinary mount startup continues. Supervised workers check again
+on startup without repeating the warning. No probe is made for empty profile rules.
+
+When supported, rules are combined in profile, environment, then flag order and
+deduplicated. Explicit `DRIVE9_MOUNT_APPEND_LOG_PATTERNS` and `--append-log` rules
+retain their existing behavior and FUSE capability guards even if profile rules
+are ignored. Invalid patterns remain configuration errors. Disabling this
+optimization does not change how existing append-log file layouts are handled.
+
+`drive9 profile show` includes `[append-log]` without contacting the server.
+To customize a profile for Verdent, for example:
+
+```bash
+mkdir -p ~/.drive9/profiles
+drive9 profile show coding-agent > ~/.drive9/profiles/verdent
+```
+
+Edit the exported file's `[append-log]` section and mount with `--profile verdent`.
+Each section accepts one pattern per line, blank lines, and whole-line `#`
+comments. A user profile file completely replaces the same-named built-in
+profile; omitting `[append-log]` from a custom `coding-agent` file disables its
+profile defaults. Profiles do not inherit from each other.
 
 ## Default Archive Location
 

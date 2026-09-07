@@ -61,6 +61,8 @@ type mountBackgroundRequest struct {
 
 var startMountBackground = startMountBackgroundImpl
 var startMountSupervisedBackground = startMountSupervisedBackgroundImpl
+var runSuperviseForeground = runSuperviseForegroundImpl
+var mountProfileAppendLogSupported = probeMountProfileAppendLogSupport
 
 // MountCmd handles the "drive9 mount" command.
 //
@@ -272,7 +274,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
-	effectiveAppendLogPatterns := mergeProfileValues(envAppendLogPatterns, appendLogPatterns)
+	explicitAppendLogPatterns := mergeProfileValues(envAppendLogPatterns, appendLogPatterns)
+	effectiveAppendLogPatterns := explicitAppendLogPatterns
 
 	if objectLoc != nil {
 		if len(effectiveAppendLogPatterns) > 0 {
@@ -479,6 +482,10 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		}
 	}
 	*profile = profileCfg.Name
+	if err := validateMountPolicyPatterns(profileCfg.AppendLogPatterns); err != nil {
+		return err
+	}
+	effectiveAppendLogPatterns = mergeProfileValues(profileCfg.AppendLogPatterns, effectiveAppendLogPatterns)
 	effectiveLocalOnlyPatterns := mergeProfileValues(profileCfg.LocalOnlyPatterns, envLocalOnlyPatterns, localOnlyPatterns)
 	effectiveRemoteOnlyPatterns := mergeProfileValues(profileCfg.RemoteOnlyPatterns, envRemoteOnlyPatterns, remoteOnlyPatterns)
 	effectivePackPaths := mergeProfileValues(profileCfg.PackPaths)
@@ -592,6 +599,18 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
 		return err
+	}
+	if resolved == MountModeFUSE && runtime.GOOS != "windows" && len(profileCfg.AppendLogPatterns) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		supported := mountProfileAppendLogSupported(ctx, serverVal, apiKeyVal, tokenVal)
+		cancel()
+		if !supported {
+			// Keep explicit rules; FUSE retains its existing capability and layout guards.
+			effectiveAppendLogPatterns = explicitAppendLogPatterns
+			if !*supervised {
+				fmt.Fprintf(os.Stderr, "drive9: warning: profile %q [append-log] ignored: backend append-log support is unavailable or could not be confirmed; using normal writes for profile-selected files\n", profileCfg.Name)
+			}
+		}
 	}
 
 	autoUnpack := overlayProfile && len(effectivePackPaths) > 0 && !*noAutoUnpack
@@ -948,7 +967,7 @@ func startMountSupervisedBackgroundImpl(req mountSuperviseStartRequest) error {
 	return nil
 }
 
-func runSuperviseForeground(req mountSuperviseStartRequest) error {
+func runSuperviseForegroundImpl(req mountSuperviseStartRequest) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -979,6 +998,17 @@ func runSuperviseForeground(req mountSuperviseStartRequest) error {
 	applyScrubbedMountEnv(scrubbed)
 	_ = exe
 	return runMountSupervise(supArgs[2:])
+}
+
+func probeMountProfileAppendLogSupport(ctx context.Context, server, apiKey, token string) bool {
+	var c *client.Client
+	if token != "" {
+		c = client.NewWithToken(server, token)
+	} else {
+		c = client.New(server, apiKey)
+	}
+	c.Warm(ctx)
+	return c.CachedAppendLogSupported()
 }
 
 // applyScrubbedMountEnv unsets mount credential env vars then applies scrubbed.

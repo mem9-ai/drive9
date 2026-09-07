@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"runtime"
@@ -784,42 +785,46 @@ func TestAppendLogGenericUnsupportedReroutesOnceToFullPUT(t *testing.T) {
 }
 
 func TestAppendLogGenericUnsupportedReroutesUnmatchedPhysicalAppendLayout(t *testing.T) {
-	var putCalls int
-	fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
-			t.Errorf("method = %s, want PUT", r.Method)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		putCalls++
-		body, _ := io.ReadAll(r.Body)
-		if got := string(body); got != "pretail" {
-			t.Errorf("full rewrite body = %q, want pretail", got)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
-	})
-	defer closeServer()
-	fs.appendLogMatcher = NewAppendLogMatcher([]string{"/configured/**"})
-	if fs.appendLogPathConfigured(fh.Path) {
-		t.Fatal("fixture path unexpectedly matches append-log policy")
-	}
+	for _, patterns := range [][]string{{"/configured/**"}, nil} {
+		t.Run(fmt.Sprint(patterns), func(t *testing.T) {
+			var putCalls int
+			fs, fh, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPut {
+					t.Errorf("method = %s, want PUT", r.Method)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				putCalls++
+				body, _ := io.ReadAll(r.Body)
+				if got := string(body); got != "pretail" {
+					t.Errorf("full rewrite body = %q, want pretail", got)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+			})
+			defer closeServer()
+			fs.appendLogMatcher = NewAppendLogMatcher(patterns)
+			if fs.appendLogPathConfigured(fh.Path) {
+				t.Fatal("fixture path unexpectedly matches append-log policy")
+			}
 
-	fh.Lock()
-	handled, status := fs.routeAppendLogGenericUnsupportedLocked(
-		context.Background(),
-		fh,
-		fh.Path,
-		fh.DirtySeq,
-		&client.StatusError{StatusCode: http.StatusBadRequest, Code: client.AppendLogCodeUnsupported},
-	)
-	fh.Unlock()
-	if !handled || status != gofuse.OK || putCalls != 1 {
-		t.Fatalf("handled/status/puts = %t/%d/%d, want true/OK/1", handled, status, putCalls)
-	}
-	if got := fh.appendLogLayoutAt(6, 7); got != client.ContentLayoutAppendLog {
-		t.Fatalf("observed layout = %q, want append_log", got)
+			fh.Lock()
+			handled, status := fs.routeAppendLogGenericUnsupportedLocked(
+				context.Background(),
+				fh,
+				fh.Path,
+				fh.DirtySeq,
+				&client.StatusError{StatusCode: http.StatusBadRequest, Code: client.AppendLogCodeUnsupported},
+			)
+			fh.Unlock()
+			if !handled || status != gofuse.OK || putCalls != 1 {
+				t.Fatalf("handled/status/puts = %t/%d/%d, want true/OK/1", handled, status, putCalls)
+			}
+			if got := fh.appendLogLayoutAt(6, 7); got != client.ContentLayoutAppendLog {
+				t.Fatalf("observed layout = %q, want append_log", got)
+			}
+		})
 	}
 }
 
@@ -862,6 +867,118 @@ func TestAppendLogPathTruncateReusesSetAttrCommitLock(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("append-log truncate attempted to reacquire SetAttr's path lock")
+	}
+}
+
+func TestAppendLogPathTruncateWithoutRulesFallsBackToConditionalPUT(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		size         int64
+		headRevision int64
+		initStatus   int
+		putStatus    int
+		wantHeads    int
+		wantPuts     int
+		wantSuccess  bool
+	}{
+		{"shrink", 5, 5, 400, 200, 1, 1, true},
+		{"grow", 12, 5, 400, 200, 1, 1, true},
+		{"streamed-grow", maxPathTruncateInMemoryBytes + 1, 5, 400, 200, 1, 1, true},
+		{"stale-revision", 5, 6, 400, 200, 1, 0, false},
+		{"put-conflict", 5, 5, 400, 409, 1, 1, false},
+		{"put-unsupported-no-retry", 5, 5, 400, 400, 1, 1, false},
+		{"unrelated-error-no-fallback", 5, 5, 503, 200, 0, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := []byte("abcdefgh")
+			var initCalls, headCalls, putCalls int
+			fs, _, closeServer := newAppendLogEngineFixture(t, false, func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					http.ServeContent(w, r, "db-wal", time.Time{}, bytes.NewReader(original))
+				case http.MethodPost:
+					initCalls++
+					if r.URL.Path != "/v2/uploads/initiate" {
+						t.Errorf("unexpected POST %s", r.URL)
+					}
+					code := client.AppendLogCodeUnsupported
+					if tc.initStatus != http.StatusBadRequest {
+						code = "unavailable"
+					}
+					w.WriteHeader(tc.initStatus)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "code": code})
+				case http.MethodHead:
+					headCalls++
+					w.Header().Set("Content-Length", fmt.Sprint(len(original)))
+					w.Header().Set("X-Dat9-Revision", fmt.Sprint(tc.headRevision))
+					w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutAppendLog))
+				case http.MethodPut:
+					putCalls++
+					if r.Header.Get("X-Dat9-Expected-Revision") != "5" || r.ContentLength != tc.size {
+						t.Errorf("PUT revision/size = %q/%d, want 5/%d", r.Header.Get("X-Dat9-Expected-Revision"), r.ContentLength, tc.size)
+					}
+					prefix := make([]byte, min(tc.size, int64(len(original))))
+					if _, err := io.ReadFull(r.Body, prefix); err != nil || !bytes.Equal(prefix, original[:len(prefix)]) {
+						t.Errorf("PUT prefix = %q, error = %v", prefix, err)
+					}
+					if tc.size <= maxPathTruncateInMemoryBytes {
+						tail, err := io.ReadAll(r.Body)
+						if err != nil || int64(len(tail)) != tc.size-int64(len(prefix)) || bytes.Count(tail, []byte{0}) != len(tail) {
+							t.Errorf("PUT zero fill = %v, error = %v", tail, err)
+						}
+					} else if n, err := io.Copy(io.Discard, r.Body); err != nil || n != tc.size-int64(len(prefix)) {
+						t.Errorf("PUT streamed tail size = %d, error = %v", n, err)
+					}
+					w.WriteHeader(tc.putStatus)
+					if tc.putStatus != http.StatusOK {
+						code := client.AppendLogCodeConflict
+						if tc.putStatus == http.StatusBadRequest {
+							code = client.AppendLogCodeUnsupported
+						}
+						_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "code": code})
+						return
+					}
+					_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 6})
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			})
+			defer closeServer()
+			fs.appendLogMatcher = NewAppendLogMatcher(nil)
+			fs.client.SetSmallFileThresholdForTests(1)
+			ino := fs.inodes.Lookup("/db-wal", false, int64(len(original)), time.Now())
+			fs.inodes.UpdateRevision(ino, 5)
+			if len(fs.fileHandlesForInode(ino)) != 0 {
+				t.Fatal("path truncate must not have an open handle")
+			}
+			input := &gofuse.SetAttrIn{}
+			input.NodeId = ino
+			input.Valid = gofuse.FATTR_SIZE
+			input.Size = uint64(tc.size)
+			var out gofuse.AttrOut
+			status := fs.SetAttr(nil, input, &out)
+			if (status == gofuse.OK) != tc.wantSuccess {
+				t.Fatalf("SetAttr status = %v, want success = %t", status, tc.wantSuccess)
+			}
+			if initCalls != 1 || headCalls != tc.wantHeads || putCalls != tc.wantPuts {
+				t.Fatalf("init/head/put calls = %d/%d/%d, want 1/%d/%d", initCalls, headCalls, putCalls, tc.wantHeads, tc.wantPuts)
+			}
+			entry, ok := fs.inodes.GetEntry(ino)
+			if !ok {
+				t.Fatal("inode disappeared after truncate")
+			}
+			wantRevision, wantSize := int64(5), int64(len(original))
+			if tc.wantSuccess {
+				wantRevision, wantSize = 6, tc.size
+				if out.Size != uint64(tc.size) {
+					t.Fatalf("SetAttr returned size %d, want %d", out.Size, tc.size)
+				}
+			}
+			if entry.Revision != wantRevision || entry.Size != wantSize {
+				t.Fatalf("inode revision/size = %d/%d, want %d/%d", entry.Revision, entry.Size, wantRevision, wantSize)
+			}
+		})
 	}
 }
 
