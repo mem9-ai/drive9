@@ -2880,6 +2880,49 @@ func TestUnlinkedRemoteBackedDirtyReadUsesPinnedShadowGen(t *testing.T) {
 	}
 }
 
+func TestLoadUnlinkedHandlePartShortShadowGenFailsClosed(t *testing.T) {
+	const filePath = "/anon-short.bin"
+	store, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	if err := store.WriteFull(filePath, []byte("abc"), 1); err != nil {
+		t.Fatal(err)
+	}
+	gen := store.Pin(filePath)
+	store.Remove(filePath)
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	fs.shadowStore = store
+
+	wb := NewWriteBuffer(filePath, 1<<20, 8)
+	wb.SetSmallFileMax(4)
+	wb.totalSize = 8
+	wb.remoteSize = 8
+	fh := &FileHandle{
+		Path: filePath, Dirty: wb,
+		Unlinked: true, UnlinkedSnapshot: true,
+		UnlinkedShadowGen: gen, UnlinkedSize: 8,
+	}
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		offset := int64(partNum-1) * wb.PartSize()
+		data, handled, err := fs.loadUnlinkedHandlePart(fh, offset, wb.PartSize())
+		if !handled {
+			return nil, fmt.Errorf("unlinked backing not handled")
+		}
+		return data, err
+	}
+	if err := wb.EnsureLoaded(0); err == nil {
+		t.Fatal("EnsureLoaded accepted a 3-byte UnlinkedShadowGen for an 8-byte part")
+	}
+	if wb.IsPartLoaded(0) {
+		t.Fatal("short private backing must not be stored as a loaded part")
+	}
+}
+
 func TestUnlinkSnapshotConcurrentWriteKeepsOverlayAndBaseline(t *testing.T) {
 	const filePath = "/spill-unlink-race.bin"
 	const partSize int64 = 64

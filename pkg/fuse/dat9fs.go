@@ -7531,32 +7531,36 @@ func (fs *Dat9FS) loadUnlinkedHandlePart(fh *FileHandle, offset, length int64) (
 	if fh == nil || !fh.Unlinked || length <= 0 {
 		return nil, false, nil
 	}
+	anonSize := fh.UnlinkedSize
+	if anonSize < 0 {
+		anonSize = 0
+	}
+	if offset >= anonSize {
+		return nil, true, nil
+	}
+	want := length
+	if remaining := anonSize - offset; remaining < want {
+		want = remaining
+	}
+	if want <= 0 {
+		return nil, true, nil
+	}
 	if fh.UnlinkedShadowGen != 0 && fs != nil && fs.shadowStore != nil {
-		buf := make([]byte, length)
+		buf := make([]byte, want)
 		n, err := fs.shadowStore.ReadAtGen(fh.UnlinkedShadowGen, offset, buf)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, true, err
 		}
-		if n < 0 {
-			n = 0
+		if int64(n) != want {
+			return nil, true, fmt.Errorf("unlinked shadow gen %d short read n=%d want=%d off=%d", fh.UnlinkedShadowGen, n, want, offset)
 		}
-		if n > len(buf) {
-			n = len(buf)
-		}
-		return buf[:n], true, nil
+		return buf, true, nil
 	}
 	if fh.UnlinkedData != nil {
-		if offset >= int64(len(fh.UnlinkedData)) {
-			return nil, true, nil
+		if offset >= int64(len(fh.UnlinkedData)) || offset+want > int64(len(fh.UnlinkedData)) {
+			return nil, true, fmt.Errorf("unlinked snapshot short read want=%d have=%d off=%d", want, len(fh.UnlinkedData), offset)
 		}
-		end := offset + length
-		if end > int64(len(fh.UnlinkedData)) {
-			end = int64(len(fh.UnlinkedData))
-		}
-		if end <= offset {
-			return nil, true, nil
-		}
-		return append([]byte(nil), fh.UnlinkedData[offset:end]...), true, nil
+		return append([]byte(nil), fh.UnlinkedData[offset:offset+want]...), true, nil
 	}
 	return nil, false, nil
 }
