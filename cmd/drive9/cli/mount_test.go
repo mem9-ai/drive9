@@ -1386,8 +1386,10 @@ func TestMountCmdIgnoresGVisorCompatEnvironmentForNonFUSEMounts(t *testing.T) {
 			return nil
 		}
 		t.Setenv("HOME", t.TempDir())
-		t.Setenv(EnvServer, "https://drive9.example")
-		t.Setenv(EnvAPIKey, "sk-test")
+		setResolverEnv(t, map[string]string{
+			EnvServer: "https://drive9.example",
+			EnvAPIKey: "sk-test",
+		})
 
 		if err := MountCmd([]string{
 			"--foreground",
