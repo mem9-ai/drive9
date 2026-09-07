@@ -26,6 +26,86 @@ describe("pathfilter compile", () => {
   });
 });
 
+describe("pathfilter recursive glob segments", () => {
+  it.each([
+    ["**/*-wal", "repro.db-wal", true],
+    ["**/*-wal", "/issue-validation/run/case/repro.db-wal", true],
+    ["**/repro.db-wal", "/issue-validation/run/case/repro.db-wal", true],
+    ["**/*-wal", "proj/other.sqlite-wal", true],
+    ["**/*-wal", "proj/repro.db", false],
+    ["**/*-wal", "proj/repro.db-shm", false],
+    ["**/*-wal", "proj/repro.db-wal.bak", false],
+    ["**/*-wal", "/snapshots-wal/data.bin", false],
+    ["**/*-wal", "/proj/snapshots-wal/sub/data.bin", false],
+    ["**/*-wal", "/snapshots-wal/repro.db-wal", true],
+    ["**/cache-*/**", "proj/cache-build/objects/a", true],
+    ["**/cache-*", "proj/cache-build/objects/a", false],
+    ["**/cache-*", "proj/cache-build", true],
+    ["**/cache-*/*.log", "proj/cache-build/output.log", true],
+    ["**/cache-*/*.log", "proj/cache-build/nested/output.log", false],
+    ["**/cache-*/*.log", "proj/cache-build/output.log/data.bin", false],
+    ["**/cache-*/*.log", "cache-first/miss/cache-second/output.log", true],
+    ["**/db?.wal", "proj/db1.wal", true],
+    ["**/db?.wal", "proj/db12.wal", false],
+    ["**/*.[Tt]xt", "proj/a.Txt", true],
+    ["**/*.[^Tt]xt", "proj/a.bxt", true],
+    ["**/*.[^Tt]xt", "proj/a.txt", false],
+    ["**/[cache]/**", "proj/[cache]/item", true],
+    ["**/[z-a]/**", "proj/[z-a]/item", true],
+    ["**/[z-a]/**", "proj/other/item", false],
+    ["**/db?.wal", "proj/db\u{1f600}.wal", true],
+    ["**/db??.wal", "proj/db\u{1f600}.wal", false],
+    ["**/db[\u{1f600}].wal", "proj/db\u{1f600}.wal", true],
+    ["**/db[\u{1f600}]?.wal", "proj/db\u{1f600}.wal", false],
+    ["**/db[\u{1f600}-\u{1f64f}].wal", "proj/db\u{1f609}.wal", true],
+    ["**/db[^\u{1f600}].wal", "proj/db\u{1f609}.wal", true],
+    ["**/db[^a].wal", "proj/db\u{1f600}.wal", true],
+    ["**/db[^a]?.wal", "proj/db\u{1f600}.wal", false],
+    ["**/db?.wal", "proj/db\n.wal", true],
+    ["**/db*.wal", "proj/db\n\u{1f600}.wal", true],
+    ["**/cafe\u0301*.txt", "proj/caf\u00e91.txt", true],
+    ["**/caf\u00e9*.txt", "proj/cafe\u03011.txt", true],
+    ["**/caf?.txt", "proj/cafe\u0301.txt", true],
+    ["**/caf[e\u0301].txt", "proj/caf\u00e9.txt", true],
+    ["**/*?", "proj/\u{1f600}", true],
+    ["**/*??", "proj/\u{1f600}", false],
+    ["**/*??", "proj/\u{1f600}a", true],
+    ["**/*[^a][^a]", "proj/\u{1f600}", false],
+    ["**/*[\ufffd]", "proj/\u{1f600}", false],
+    ["**/*??x", "proj/\u{1f600}x", false],
+    ["**/*a*??", "proj/a\u{1f600}", false],
+    ["**/*a*??", "proj/a\u{1f600}a", true],
+    ["**/[*]*??", "proj/*\u{1f600}", false],
+    ["**/*-wal", "proj/\u{1f600}-wal", true],
+    ["*??", "\u{1f600}", false],
+    ["*??/file", "\u{1f600}/file", false],
+    ["*?/file", "\u{1f600}/file", true],
+    ["*?file", "\u{1f600}/file", false],
+    ["**/[a-]/**", "proj/a/item", false],
+    ["**/[a-]/**", "proj/[a-]/item", true],
+    ["**/[a-]/**", "proj/-/item", false],
+    ["**/[-a]/**", "proj/a/item", false],
+    ["**/[]/**", "proj/a/item", false],
+    ["**/[^]/**", "proj/a/item", false],
+    ["**/[]a]/**", "proj/a/item", false],
+    ["**/[abc/**", "proj/[/item", false],
+    ["**/[a-b-c]/**", "proj/-/item", false],
+    ["**/[z-aa]/**", "proj/a/item", true],
+    ["**/[^z-a]/**", "proj/a/item", true],
+    ["**/[[]/**", "proj/[/item", true],
+    ["**/db?].wal", "proj/db1].wal", true],
+    ["**/[abc", "proj/[abc/secret", true],
+    ["**/[a-]", "proj/[a-]/secret", true],
+    ["**/[abc/name", "proj/[abc/name/secret", true],
+    ["**/[a/b]", "proj/[a/b]/secret", true],
+    ["**/prefix*/[abc", "proj/prefix1/[abc", true],
+    ["**/prefix*/[abc", "proj/prefix1/[abc/secret", false],
+    ["**/[z-a]", "proj/[z-a]/secret", false],
+  ])("%s matching %s returns %s", (pattern, path, want) => {
+    expect(matchPattern(compile(pattern), path)).toBe(want);
+  });
+});
+
 describe("pathfilter matcher", () => {
   it("include whitelist + exclude", () => {
     const m = newMatcher({ include: ["proj/**", "go.mod"], exclude: ["**/vendor/**"] });
@@ -65,6 +145,12 @@ describe("pathfilter matcher", () => {
 });
 
 describe("pathfilter validate", () => {
+  it.each(["**/[\\-]/**", "**/[\\]]/**"])("rejects backslashes in %s", (pattern) => {
+    expect(() => compile(pattern)).toThrow("backslash");
+    expect(validate([pattern])).toBeInstanceOf(Error);
+    expect(compileAll([pattern])).toEqual([]);
+  });
+
   it("returns null for valid patterns", () => {
     expect(validate(["dist/**", "*.log"], ["**/x/**"])).toBeNull();
   });
@@ -77,6 +163,18 @@ describe("pathfilter compileAll", () => {
 });
 
 describe("pathfilter matchExcluded", () => {
+  it("does not prune directories selected only by recursive file globs", () => {
+    const m = newMatcher({ exclude: ["**/*-wal", "**/cache-*/**", "**/vendor", "**/[abc"] });
+    expect(match(m, "snapshots-wal")).toBe(false);
+    expect(matchExcluded(m, "snapshots-wal")).toBe(false);
+    expect(match(m, "snapshots-wal/data.bin")).toBe(true);
+    expect(match(m, "snapshots-wal/repro.db-wal")).toBe(false);
+    expect(matchExcluded(m, "cache-build")).toBe(true);
+    expect(matchExcluded(m, "proj/vendor")).toBe(true);
+    expect(matchExcluded(m, "proj/[abc")).toBe(true);
+    expect(match(m, "proj/[abc/secret")).toBe(false);
+  });
+
   it("returns true only for exclude-matched paths not restored by override", () => {
     const m = newMatcher({
       include: ["src/app.go"],

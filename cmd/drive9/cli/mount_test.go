@@ -2637,7 +2637,7 @@ func TestMountCmdPassesAppendLogPatterns(t *testing.T) {
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
 		"--profile", "none",
-		"--append-log", "**/from-flag/**",
+		"--append-log", "**/*-wal",
 		"--append-log", "**/shared/**",
 		t.TempDir(),
 	})
@@ -2647,7 +2647,7 @@ func TestMountCmdPassesAppendLogPatterns(t *testing.T) {
 	if got == nil {
 		t.Fatal("mountFuse was not called")
 	}
-	want := []string{"**/from-env/**", "**/shared/**", "**/from-flag/**"}
+	want := []string{"**/from-env/**", "**/shared/**", "**/*-wal"}
 	if !reflect.DeepEqual(got.AppendLogPatterns, want) {
 		t.Fatalf("AppendLogPatterns = %v, want %v", got.AppendLogPatterns, want)
 	}

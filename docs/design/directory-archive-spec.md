@@ -1,4 +1,6 @@
-# drive9 directory archive (`drive9 fs archive`)
+---
+title: drive9 directory archive (drive9 fs archive)
+---
 
 Design spec for downloading a remote directory tree as a single compressed
 archive (tar.gz by default, zip optional), with profile-based file filtering.
@@ -73,21 +75,43 @@ but this project's node_modules/.package-lock.json must be archived."
 
 ### Pattern forms
 
-Three forms (mirrored from the FUSE `LocalPolicy` matcher, now extracted to
-`pkg/pathfilter`):
+The FUSE `LocalPolicy` matcher and SDK archives share these `pkg/pathfilter`
+pattern forms:
 
 | Form | Example | Meaning |
 |------|---------|---------|
-| `**/x/**` (or `**/x`) | `**/node_modules/**` | Path contains the `x` subpath at any depth |
+| `**/x/**` | `**/node_modules/**`, `**/cache-*/**` | Match a subpath at any depth and all descendants; each segment supports glob matching and literal equality |
+| `**/glob` | `**/*-wal`, `**/cache-*/*.log` | Match at any depth, ending at the final path segment |
+| `**/literal` | `**/node_modules` | Preserve the existing literal-subpath behavior, including descendants |
 | `prefix/**` | `dist/**` | Everything under the prefix |
 | exact / glob | `*.log`, `go.mod` | `path.Match` glob + exact equality |
+
+In the leading `**/` form, `*`, `?`, and character classes match within a
+single segment. Patterns with a syntactically valid glob segment must end at the final
+segment unless they have a trailing `/**`. Thus `**/*-wal` matches a WAL filename
+at any depth but does not match `/snapshots-wal/data.bin`. Use `**/cache-*/**` to
+include a matching directory's descendants. Rules without glob metacharacters
+retain the existing literal-subpath behavior. A malformed glob segment is treated
+literally; if no segment contains a valid glob, the rule keeps subtree matching
+and directory pruning (for example, `**/[abc` includes descendants of `[abc`).
+
+Go and TypeScript normalize patterns and runtime paths to NFC before matching,
+and match `?` and character classes by Unicode code point.
+Character classes follow Go `path.Match` syntax, including non-empty classes
+and well-formed range endpoints. Invalid globs retain literal-equality fallback.
+Star backtracking stays on Unicode code-point boundaries: `*??` requires at least
+two characters. Backslashes are rejected in patterns, including character-class
+escapes, following drive9 path validation.
 
 ### Directory pruning
 
 When a directory's relative path matches an exclude (and no override restores
-it), the entire subtree is skipped at BFS time — no extra `ListCtx` round-trips
+it), subtree rules skip the entire subtree at BFS time — no extra `ListCtx` round-trips
 for children that would be dropped. This is what makes `--profile coding-agent`
 skip `node_modules/` without exploding the request count.
+
+Recursive file globs exclude matching entries without pruning their descendants;
+the walker continues into matching directories and filters each child separately.
 
 ## Archive formats
 

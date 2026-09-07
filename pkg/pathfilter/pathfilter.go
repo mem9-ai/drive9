@@ -9,19 +9,24 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 // Pattern is a compiled path-filter pattern. The zero value never matches.
 type Pattern struct {
-	raw     string
-	subpath []string
-	prefix  string
-	exact   string
+	raw            string
+	subpath        []string
+	subpathEndOnly bool
+	prefix         string
+	exact          string
 }
 
 // Compile parses a single pattern. Empty/whitespace patterns are rejected.
+// Each segment after a leading **/ supports Go glob syntax and literal
+// equality. Recursive globs without /** must match the end of the path;
+// literal subpaths and patterns ending in /** also match descendants.
 func Compile(raw string) (Pattern, error) {
 	cleaned, err := canonical(raw)
 	if err != nil {
@@ -36,6 +41,15 @@ func Compile(raw string) (Pattern, error) {
 			p.subpath, err = splitPath(rest)
 			if err != nil {
 				return Pattern{}, err
+			}
+			if !strings.HasSuffix(cleaned, "/**") {
+				for _, segment := range p.subpath {
+					_, globErr := path.Match(segment, "")
+					if strings.ContainsAny(segment, "*?[") && globErr == nil {
+						p.subpathEndOnly = true
+						break
+					}
+				}
 			}
 			return p, nil
 		}
@@ -113,16 +127,13 @@ func (p Pattern) MatchCanonical(cleaned string) bool {
 func (p Pattern) matchCanonical(cleaned string) bool {
 	if len(p.subpath) > 0 {
 		segments := splitCanonicalPath(cleaned)
-		return containsSubpath(segments, p.subpath)
+		return containsSubpath(segments, p.subpath, p.subpathEndOnly)
 	}
 	if p.prefix != "" {
 		return cleaned == p.prefix || strings.HasPrefix(cleaned, p.prefix+"/")
 	}
 	if p.exact != "" {
-		if ok, err := path.Match(p.exact, cleaned); err == nil && ok {
-			return true
-		}
-		return cleaned == p.exact
+		return matchGlob(p.exact, cleaned)
 	}
 	return false
 }
@@ -191,11 +202,18 @@ func (m Matcher) HasExclude() bool { return len(m.Exclude) > 0 }
 // for may still fail the include whitelist at Match() — but its children
 // must be walked because include matches leaf files, not necessarily their
 // parent directories.
+// Recursive file globs do not prune directories: descendants are matched
+// independently even when the directory entry itself is excluded.
 func (m Matcher) MatchExcluded(path string) bool {
 	if len(m.Override) > 0 && matchesAny(m.Override, path) {
 		return false
 	}
-	return matchesAny(m.Exclude, path)
+	for _, p := range m.Exclude {
+		if !p.subpathEndOnly && p.Match(path) {
+			return true
+		}
+	}
+	return false
 }
 
 func matchesAny(patterns []Pattern, path string) bool {
@@ -231,14 +249,21 @@ func splitCanonicalPath(value string) []string {
 	return strings.Split(value, "/")
 }
 
-func containsSubpath(segments, subpath []string) bool {
+func containsSubpath(segments, subpath []string, endOnly bool) bool {
 	if len(subpath) == 0 || len(segments) < len(subpath) {
 		return false
 	}
-	for start := 0; start <= len(segments)-len(subpath); start++ {
+	first := 0
+	if endOnly {
+		first = len(segments) - len(subpath)
+	}
+	for start := first; start <= len(segments)-len(subpath); start++ {
 		matched := true
 		for offset := range subpath {
-			if segments[start+offset] != subpath[offset] {
+			if segments[start+offset] == subpath[offset] {
+				continue
+			}
+			if !matchGlob(subpath[offset], segments[start+offset]) {
 				matched = false
 				break
 			}
@@ -248,4 +273,62 @@ func containsSubpath(segments, subpath []string) bool {
 		}
 	}
 	return false
+}
+
+// matchGlob preserves path.Match syntax and literal fallback, but constrains
+// star backtracking to rune boundaries. Go 1.25 path.Match also tries offsets
+// inside UTF-8 characters, which can make *?? match a single supplementary rune.
+func matchGlob(pattern, value string) bool {
+	if pattern == value {
+		return true
+	}
+	ok, err := path.Match(pattern, value)
+	if err != nil || !ok {
+		return false
+	}
+	if !strings.ContainsRune(pattern, '*') || utf8.RuneCountInString(value) == len(value) {
+		return true
+	}
+
+	// The successful path.Match validated the classes; canonical patterns have
+	// no backslash escapes. Each non-star token consumes exactly one rune.
+	var tokens []string
+	runes := []rune(pattern)
+	for start := 0; start < len(runes); {
+		end := start + 1
+		if runes[start] == '[' {
+			for runes[end] != ']' {
+				end++
+			}
+			end++
+		}
+		tokens = append(tokens, string(runes[start:end]))
+		start = end
+	}
+
+	runes = []rune(value)
+	patternPos, valuePos, star, retry := 0, 0, -1, 0
+	for valuePos < len(runes) {
+		if patternPos < len(tokens) && tokens[patternPos] == "*" {
+			star, retry = patternPos, valuePos
+			patternPos++
+			continue
+		}
+		if patternPos < len(tokens) {
+			if ok, _ := path.Match(tokens[patternPos], string(runes[valuePos])); ok {
+				patternPos++
+				valuePos++
+				continue
+			}
+		}
+		if star < 0 || retry == len(runes) || runes[retry] == '/' {
+			return false
+		}
+		retry++
+		patternPos, valuePos = star+1, retry
+	}
+	for patternPos < len(tokens) && tokens[patternPos] == "*" {
+		patternPos++
+	}
+	return patternPos == len(tokens)
 }
