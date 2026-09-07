@@ -497,8 +497,9 @@ func (cq *CommitQueue) PendingStats() (count int, bytes int64) {
 
 // pathCommitLandmark is the last commit this queue itself landed for a path.
 type pathCommitLandmark struct {
-	rev  int64
-	size int64
+	rev        int64
+	size       int64
+	resourceID string
 }
 
 type CommitQueueSnapshot struct {
@@ -1416,7 +1417,7 @@ func (cq *CommitQueue) supersedeOlderQueuedLocked(entry *CommitEntry) {
 	cq.rebuildQueuedIndexLocked()
 }
 
-func (cq *CommitQueue) rememberLanded(path string, rev, size int64) {
+func (cq *CommitQueue) rememberLanded(path string, rev, size int64, resourceID string) {
 	if cq == nil || path == "" || rev <= 0 {
 		return
 	}
@@ -1427,16 +1428,29 @@ func (cq *CommitQueue) rememberLanded(path string, rev, size int64) {
 	prev := cq.landed[path]
 	persist := false
 	if rev >= prev.rev {
-		cq.landed[path] = pathCommitLandmark{rev: rev, size: size}
+		cq.landed[path] = pathCommitLandmark{rev: rev, size: size, resourceID: resourceID}
 		persist = true
 	}
 	idx := cq.index
 	cq.mu.Unlock()
 	if persist && idx != nil {
-		if err := idx.PutLanded(path, rev, size); err != nil {
+		if err := idx.PutLanded(path, rev, size, resourceID); err != nil {
 			safeLogPrintf("commit queue: persist landed snapshot for %s: %v", path, err)
 		}
 	}
+}
+
+func (cq *CommitQueue) captureLandedResourceID(path string) string {
+	if cq == nil || cq.client == nil || path == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	st, err := cq.client.StatCtx(ctx, cq.remotePath(path))
+	if err != nil || st == nil {
+		return ""
+	}
+	return st.ResourceID
 }
 
 func (cq *CommitQueue) landedCommit(path string) pathCommitLandmark {
@@ -1481,9 +1495,15 @@ func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(entry *CommitEntry, 
 // after a restart. The smaller remote image must match the snapshot this
 // client previously landed; a strictly larger local pending create against
 // an unrelated smaller remote file must stay conflicted.
-func (cq *CommitQueue) maybeRebaseGrownPayloadAgainstRemote(entry *CommitEntry, serverRev, serverSize int64) bool {
+func (cq *CommitQueue) maybeRebaseGrownPayloadAgainstRemote(entry *CommitEntry, serverRev, serverSize int64, serverResourceID string) bool {
 	proof, ok := cq.durableLanded(entry.Path)
 	if !ok || proof.rev != serverRev || proof.size != serverSize {
+		return false
+	}
+	// {rev,size} is not identity: delete/recreate can reuse revision 1 and
+	// the same byte length. Require the resource id of the exact object
+	// this mount landed. Missing identity fails closed.
+	if proof.resourceID == "" || serverResourceID == "" || proof.resourceID != serverResourceID {
 		return false
 	}
 	return cq.rebaseGrownPayload(entry, serverRev, serverSize)
@@ -2462,7 +2482,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	if layerRef == "" {
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	}
-	cq.rememberLanded(entry.Path, committedRev, entry.Size)
+	cq.rememberLanded(entry.Path, committedRev, entry.Size, cq.captureLandedResourceID(entry.Path))
 	if cq.OnUploaded != nil {
 		cq.OnUploaded(entry, committedRev)
 	}
@@ -2676,7 +2696,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 		return
 	}
 	serverRev := stat.Revision
-	if cq.maybeRebaseGrownPayloadAgainstRemote(entry, serverRev, stat.Size) {
+	if cq.maybeRebaseGrownPayloadAgainstRemote(entry, serverRev, stat.Size, stat.ResourceID) {
 		if cq.discardSupersededEntry(entry) {
 			return
 		}
@@ -2897,7 +2917,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		}
 	}()
 	if stat.Size != localSize {
-		if localSize > stat.Size && cq.maybeRebaseGrownPayloadAgainstRemote(entry, stat.Revision, stat.Size) {
+		if localSize > stat.Size && cq.maybeRebaseGrownPayloadAgainstRemote(entry, stat.Revision, stat.Size, stat.ResourceID) {
 			safeLogPrintf("commit queue: ShadowSpill growth overwrite for %s (local %d bytes vs server %d bytes at rev %d)", entry.Path, localSize, stat.Size, stat.Revision)
 			if fd != nil {
 				_ = fd.Close()
