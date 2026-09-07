@@ -681,12 +681,7 @@ func (fs *Dat9FS) rotateAppendLogGenerationShadowLocked(fh *FileHandle, path str
 	}
 	fh.ShadowReady = true
 	fh.ShadowSpill = true
-	if fh.Dirty != nil {
-		wb := fh.Dirty
-		wb.OnPartFull = func(partIdx int, _ []byte) {
-			wb.EvictPart(partIdx)
-		}
-	}
+	fs.bindShadowSpillEvictionLocked(fh)
 	fs.recordAppendLogGenerationResetShadowReady()
 }
 
