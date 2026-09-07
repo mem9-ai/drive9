@@ -7439,13 +7439,9 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		if staleAfterFetch {
 			if snapshotShadowGen != 0 {
 				fs.discardUnlinkedSnapshotPins(snapshotShadowGen, snapshotNeedCount)
-				snapshotShadowGen = 0
 			}
-			snapshot = nil
-			snapshotOK = false
-			snapshotErr = syscall.EIO
 			safeLogPrintf("open-unlink snapshot stale after concurrent commit for %s", p)
-			return nil, false, snapshotErr
+			return nil, false, syscall.EIO
 		}
 		if snapshotNeedCount > 0 && !snapshotOK && fs.gvisorCompatibilityEnabled() {
 			if snapshotErr == nil {
