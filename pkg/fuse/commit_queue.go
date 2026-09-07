@@ -2221,13 +2221,6 @@ func committedRevisionForExpectedRevision(expectedRevision, committedRev int64) 
 	return 0
 }
 
-func (cq *CommitQueue) recordLandedFromSuccess(entry *CommitEntry, committedRev int64) {
-	if cq == nil || entry == nil {
-		return
-	}
-	cq.rememberLanded(entry.Path, committedRev, entry.Size)
-}
-
 // uploadEntry uploads entry data to the server. Returns (committedRev, error).
 // committedRev > 0 only when the server-returned revision is available
 // (direct PUT). Multipart/streaming uploads return 0 because the current
