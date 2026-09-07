@@ -10243,6 +10243,40 @@ func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gof
 	return gofuse.OK
 }
 
+var errDirectoryViewChanged = fmt.Errorf("directory view changed: %w", syscall.EAGAIN)
+
+// A successful call holds mountViewMu for the caller's response serialization.
+// Only a page starting at offset zero can discard an invalidated snapshot:
+// resuming an old offset in a new listing would skip or duplicate entries.
+func (fs *Dat9FS) lockDirectoryPage(ctx context.Context, dh *DirHandle, offset uint64) ([]DirEntry, uint64, error) {
+	dh.mu.Lock()
+	resumeGeneration, hasSnapshot := dh.entriesGeneration, dh.Entries != nil
+	dh.mu.Unlock()
+	if offset != 0 && !hasSnapshot {
+		return nil, 0, errDirectoryViewChanged
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		entries, generation, err := fs.loadDirHandleEntries(ctx, dh, fs.opts.GVisorCompat && offset == 0)
+		if err == nil {
+			if offset != 0 && generation != resumeGeneration {
+				return nil, 0, errDirectoryViewChanged
+			}
+			if fs.lockMountViewRead(generation) {
+				return entries, generation, nil
+			}
+			err = errDirectoryViewChanged
+		}
+		// Backend errors and cancellation are not directory-generation conflicts.
+		if offset != 0 || !errors.Is(err, errDirectoryViewChanged) {
+			return nil, 0, err
+		}
+	}
+	return nil, 0, errDirectoryViewChanged
+}
+
 func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle, refresh bool) ([]DirEntry, uint64, error) {
 	dh.mu.Lock()
 	generation := fs.mountViewGeneration.Load()
@@ -10264,7 +10298,7 @@ func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle, refre
 	dh.mu.Lock()
 	defer dh.mu.Unlock()
 	if fs.mountViewGeneration.Load() != generation {
-		return nil, 0, syscall.EAGAIN
+		return nil, 0, errDirectoryViewChanged
 	}
 	dh.Entries = cloneLoadedDirEntries(entries)
 	dh.entriesGeneration = generation
@@ -10301,13 +10335,10 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	defer dh.unlockRead()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
 
-	entries, generation, err := fs.loadDirHandleEntries(ctx, dh, fs.opts.GVisorCompat && input.Offset == 0)
+	entries, _, err := fs.lockDirectoryPage(ctx, dh, input.Offset)
 	if err != nil {
 		safeLogPrintf("list dir failed for %s: %v", dh.Path, err)
 		return listDirErrToFuseStatus(err)
-	}
-	if !fs.lockMountViewRead(generation) {
-		return gofuse.Status(syscall.EAGAIN)
 	}
 	defer fs.mountViewMu.RUnlock()
 
@@ -10359,13 +10390,10 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	defer dh.unlockRead()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
 
-	entries, generation, err := fs.loadDirHandleEntries(ctx, dh, fs.opts.GVisorCompat && input.Offset == 0)
+	entries, generation, err := fs.lockDirectoryPage(ctx, dh, input.Offset)
 	if err != nil {
 		safeLogPrintf("list dir plus failed for %s: %v", dh.Path, err)
 		return listDirErrToFuseStatus(err)
-	}
-	if !fs.lockMountViewRead(generation) {
-		return gofuse.Status(syscall.EAGAIN)
 	}
 	defer fs.mountViewMu.RUnlock()
 
@@ -10613,7 +10641,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 		return nil, err
 	}
 	if !fs.lockMountViewRead(generation) {
-		return nil, syscall.EAGAIN
+		return nil, errDirectoryViewChanged
 	}
 	fs.dirCache.Put(dirPath, cached)
 	fs.mountViewMu.RUnlock()
