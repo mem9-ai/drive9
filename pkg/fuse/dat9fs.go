@@ -3623,6 +3623,13 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 	}
 	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(newSize))
 	if err != nil {
+		if appendLogErrorCode(err) == client.AppendLogCodeUnsupported && entry.Revision > 0 {
+			// A filtered profile must not disable writes to an existing append-log layout.
+			// Reuse the conditional rewrite once; never retry the rejected generic upload.
+			if handled, status := fs.rewriteAppendLogPathTruncate(ctx, entry, ino, pid, newSize, data); handled {
+				return status
+			}
+		}
 		return httpToFuseStatus(err)
 	}
 

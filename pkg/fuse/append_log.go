@@ -1104,7 +1104,13 @@ func (fs *Dat9FS) tryAppendLogPathTruncate(ctx context.Context, entry *InodeEntr
 	if fs == nil || fs.client == nil || entry == nil || entry.Revision <= 0 || !fs.appendLogPathConfigured(entry.Path) {
 		return false, gofuse.OK
 	}
+	return fs.rewriteAppendLogPathTruncate(ctx, entry, ino, pid, newSize, data)
+}
 
+// rewriteAppendLogPathTruncate verifies the physical layout and revision before
+// rewriting a configured path or one rejected with append_log_unsupported.
+// The caller holds the path commit lock and supplies a committed inode entry.
+func (fs *Dat9FS) rewriteAppendLogPathTruncate(ctx context.Context, entry *InodeEntry, ino uint64, pid uint32, newSize int64, data []byte) (bool, gofuse.Status) {
 	apiPath := fs.remotePath(entry.Path)
 	statStart := fs.perfStart()
 	stat, err := fs.client.StatCtx(ctx, apiPath)

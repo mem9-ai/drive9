@@ -2,9 +2,80 @@ package cli
 
 import (
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
+
+func TestProfileAppendLogRoundTrip(t *testing.T) {
+	writeTestProfile(t, "verdent", "# custom\n[local]\n**/.cache/**\n[append-log]\n# WAL files\n **/*-wal \n\n**/events.log\n[remote]\n**/.cache/keep/**\n[pack]\n.git\n")
+	cfg, err := loadProfileConfig("verdent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := formatProfileConfig(cfg)
+	for _, want := range []string{"[append-log]\n**/*-wal\n**/events.log\n", "[local]\n**/.cache/**", "[remote]\n**/.cache/keep/**", "[pack]\n.git"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("profile output = %q, want %q", out, want)
+		}
+	}
+	roundTrip, err := parseProfileConfig(cfg.Name, cfg.Source, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(roundTrip, cfg) {
+		t.Fatalf("round trip = %#v, want %#v", roundTrip, cfg)
+	}
+}
+
+func TestProfileAppendLogDefaults(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, name := range []string{"", "coding-agent", "portable", "none", "interactive"} {
+		cfg, err := loadProfileConfig(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "[append-log]\n# no append-log optimization paths\n"
+		if name == "" || name == "coding-agent" {
+			want = "[append-log]\n**/*-wal\n"
+		}
+		if out := formatProfileConfig(cfg); !strings.Contains(out, want) {
+			t.Fatalf("profile %q output = %q, want %q", name, out, want)
+		}
+	}
+}
+
+func TestProfileAppendLogCustomReplacesBuiltin(t *testing.T) {
+	for _, body := range []string{"[local]\n**/scratch/**\n", "[append-log]\n**/events.log\n"} {
+		writeTestProfile(t, "coding-agent", body)
+		cfg, err := loadProfileConfig("coding-agent")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out := formatProfileConfig(cfg); strings.Contains(out, "**/*-wal") {
+			t.Fatalf("custom profile inherited builtin append-log rule: %q", out)
+		}
+	}
+}
+
+func TestProfileAppendLogFormattingDoesNotMutateConfig(t *testing.T) {
+	cfg, err := parseProfileConfig("custom", "test", "[append-log]\n**/z.log\n**/a.log\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := formatProfileConfig(cfg)
+	after, err := parseProfileConfig(cfg.Name, cfg.Source, before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reflect.DeepEqual(cfg, after) {
+		t.Fatal("formatter mutated source rules or failed to sort output")
+	}
+	sort.Strings(cfg.AppendLogPatterns)
+	if !reflect.DeepEqual(cfg, after) {
+		t.Fatalf("formatted config = %#v, want %#v", after, cfg)
+	}
+}
 
 func TestLoadProfileConfigDefaultCodingAgentHasNoPackPaths(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
