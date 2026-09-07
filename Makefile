@@ -50,6 +50,11 @@ TEST_P ?=
 TEST_RUN ?=
 TEST_PKGS ?= ./...
 
+# Trim JuiceFS object-store and meta-engine SDKs we do not use. The drive9
+# meta driver always compiles (no build tag). Keep this list aligned with
+# juicefs Makefile juicefs.lite, plus noredis.
+GO_TAGS ?= noredis,nosqlite,nomysql,nopg,notikv,nobadger,noetcd,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nocifs,nostorj,noqiniu,notos,noks3,nowebdav,nogateway
+
 BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitHash=$(GIT_HASH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
@@ -86,7 +91,7 @@ test:
 			echo "make test: Podman testcontainers setup unavailable, falling back to default runtime" >&2; \
 		fi; \
 	fi; \
-	$(GO) test $$test_p_flag $$test_run_flag -v -timeout $(TEST_TIMEOUT) $(TEST_PKGS)
+	$(GO) test $$test_p_flag $$test_run_flag -tags "$(GO_TAGS)" -v -timeout $(TEST_TIMEOUT) $(TEST_PKGS)
 
 # Run only failpoint-tagged tests through repository-wide instrumentation.
 # Do not run this concurrently with the normal test target because failpoint-ctl
@@ -96,11 +101,11 @@ test-failpoint:
 
 fmt:
 	$(MAKE) install-lint
-	$(GOLANGCI_LINT_BIN) run --fix
+	$(GOLANGCI_LINT_BIN) run --build-tags "$(GO_TAGS)" --fix
 
 lint:
 	$(MAKE) install-lint
-	$(GOLANGCI_LINT_BIN) run --timeout $(LINT_TIMEOUT)
+	$(GOLANGCI_LINT_BIN) run --build-tags "$(GO_TAGS)" --timeout $(LINT_TIMEOUT)
 
 install-lint:
 	@echo "Checking for golangci-lint..."
@@ -116,7 +121,7 @@ build: build-server build-cli
 
 build-server:
 	mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(SERVER_BIN) ./cmd/drive9-server
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -tags "$(GO_TAGS)" -ldflags "$(BUILDINFO_LDFLAGS)" -o $(SERVER_BIN) ./cmd/drive9-server
 
 run-server-local: build-server
 	@DRIVE9_TENANT_PROVIDER="$${DRIVE9_TENANT_PROVIDER:-local}" "./$(SERVER_BIN)"
@@ -146,7 +151,7 @@ sdk-integration-tests:
 
 build-cli:
 	mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(CLI_BIN) ./cmd/drive9
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -tags "$(GO_TAGS)" -ldflags "$(BUILDINFO_LDFLAGS)" -o $(CLI_BIN) ./cmd/drive9
 
 build-migration:
 	mkdir -p $(dir $(MIGRATION_BIN))

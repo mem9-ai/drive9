@@ -77,6 +77,17 @@ func TestProfileAppendLogFormattingDoesNotMutateConfig(t *testing.T) {
 	}
 }
 
+func TestLoadProfileConfigCodingAgentExtent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cfg, err := loadProfileConfig("coding-agent-extent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cfg.ExtentPatterns, []string{"*"}) {
+		t.Fatalf("ExtentPatterns = %v, want [*]", cfg.ExtentPatterns)
+	}
+}
+
 func TestLoadProfileConfigDefaultCodingAgentHasNoPackPaths(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 

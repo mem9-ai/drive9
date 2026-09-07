@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
@@ -85,6 +87,9 @@ type FileHandle struct {
 	ShadowStageGen     uint64 // shadowStore content generation staged by this handle (0 = none)
 	ShadowStageSeq     uint64 // DirtySeq represented by ShadowStageGen
 	RemoteCommitUnlock func() // held same-path commit lock while local shadow state is reserved
+	extentIno jfsmeta.Ino
+	extentW   vfs.FileWriter
+	extentR   vfs.FileReader
 	// A zero truncate can reach a sibling while it holds mu waiting for the
 	// path lock. Publish the event without taking that sibling's mu.
 	pendingSQLiteTruncate atomic.Pointer[sqliteHandleTruncate]

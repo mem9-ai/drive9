@@ -194,6 +194,9 @@ type Dat9FS struct {
 	// xattrs provides in-memory extended attribute storage for the mount session.
 	xattrs *XAttrStore
 
+	extentMu sync.Mutex
+	extentRT *extentRuntime
+
 	// deletedPaths tracks recently-unlinked paths as tombstones, so that
 	// remoteDirectoryHasChildren can filter out stale backend listings during
 	// the eventual-consistency window after a successful Unlink. Entries
@@ -9091,6 +9094,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.cacheNegativePath(childP)
 		return gofuse.OK
 	}
+	if fs.shouldUseExtentPath(childP) {
+		return fs.extentUnlink(cancel, header, name, childP)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
@@ -11132,6 +11138,10 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		return gofuse.OK
 	}
+	if fs.shouldUseExtentPath(childP) {
+		return fs.extentCreate(cancel, input, name, childP, out)
+	}
+
 	unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(childP)
 	defer func() {
 		if unlockRemoteCommit != nil {
@@ -11284,6 +11294,13 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		out.Fh = fs.allocateGitWorkspaceFileHandle(ctx, fh, rt, rel)
 		out.OpenFlags = gitWorkspaceOpenFlags(rt, rel, input.Flags)
 		return gofuse.OK
+	}
+
+	if fs.shouldUseExtentPath(p) {
+		stat, err := fs.client.StatCtx(ctx, p)
+		if err == nil && stat.ContentLayout == client.ContentLayoutExtent && stat.ExtentIno != 0 {
+			return fs.extentOpen(cancel, input, p, stat.ExtentIno, out)
+		}
 	}
 
 	if accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR {
@@ -11486,6 +11503,15 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, fh.Path)
+	if fh.isExtent() {
+		source = "extent"
+		n, st := fs.extentRead(fs.jfsCtx(input.Pid, 0, 0), fh, input.Offset, buf)
+		bytesRead = n
+		if st != gofuse.OK {
+			return nil, st
+		}
+		return gofuse.ReadResultData(buf[:n]), gofuse.OK
+	}
 
 	lockStart := time.Now()
 	fh.Lock()
@@ -12280,6 +12306,14 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, fh.Path)
+	if fh.isExtent() {
+		source = "extent"
+		st := fs.extentWrite(fs.jfsCtx(input.Pid, 0, 0), fh, input.Offset, data)
+		if st != gofuse.OK {
+			return 0, st
+		}
+		return uint32(len(data)), gofuse.OK
+	}
 
 	lockStart := time.Now()
 	fh.Lock()
@@ -12980,6 +13014,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	start := time.Now()
 	phase := "start"
 	fs.debugf("flush start path=%s fh=%d ino=%d", fh.Path, input.Fh, fh.Ino)
+	if fh.isExtent() {
+		return fs.extentFlush(fs.jfsCtx(input.Pid, 0, 0), fh)
+	}
 	lockStart := time.Now()
 	if !fh.LockWithTimeout(flushLockTimeout) {
 		fs.debugf("flush lock timeout path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, time.Since(lockStart))
@@ -13408,6 +13445,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	start := time.Now()
 	phase := "start"
 	fs.debugf("fsync start path=%s fh=%d ino=%d", fh.Path, input.Fh, fh.Ino)
+	if fh.isExtent() {
+		return fs.extentFlush(fs.jfsCtx(input.Pid, 0, 0), fh)
+	}
 	lockStart := time.Now()
 	fh.Lock()
 	lockWait := time.Since(lockStart)
@@ -13841,6 +13881,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		ctx, cf := fuseCtx(cancel)
 		defer cf()
 		fs.observePathPolicyWithContext(ctx, fh.Path)
+		if fh.isExtent() {
+			fs.extentRelease(fs.jfsCtx(input.Pid, 0, 0), fh)
+			fs.deleteFileHandle(input.Fh, fh)
+			return
+		}
 		flushStatus := gofuse.OK
 		preservePendingModeOnReleaseFailure := false
 		retryPendingModeAfterContentCommit := false

@@ -506,6 +506,9 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/layers/", business)
 	mux.Handle("/v1/layer-checkpoints/", business)
 	mux.Handle("/v1/object-credentials", business)
+	mux.Handle("/v1/extent/meta", business)
+	mux.Handle("/v1/extent/blocks/", business)
+	mux.Handle("/v1/data-credential", business)
 	// Vault management API goes through tenant auth.
 	mux.Handle("/v1/vault/secrets", business)
 	mux.Handle("/v1/vault/secrets/", business)
@@ -1570,6 +1573,12 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleFSLayers(w, r)
 	case r.URL.Path == "/v1/object-credentials":
 		s.handleObjectCredentials(w, r)
+	case r.URL.Path == "/v1/extent/meta":
+		s.handleExtentMeta(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/extent/blocks/"):
+		s.handleExtentBlocks(w, r)
+	case r.URL.Path == "/v1/data-credential":
+		s.handleDataCredential(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
@@ -3414,6 +3423,12 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 		// size-based heuristic. Older clients simply ignore the header.
 		if nf.File.StorageType != "" {
 			w.Header().Set("X-Dat9-Storage-Type", string(nf.File.StorageType))
+		}
+		if proj, perr := b.Store().GetExtentProjection(r.Context(), path); perr == nil && proj != nil && proj.ContentLayout != "" {
+			w.Header().Set("X-Dat9-Content-Layout", string(proj.ContentLayout))
+			if proj.ExtentIno != 0 {
+				w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(proj.ExtentIno, 10))
+			}
 		}
 		if nf.File.ConfirmedAt != nil {
 			w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.File.ConfirmedAt.Unix(), 10))

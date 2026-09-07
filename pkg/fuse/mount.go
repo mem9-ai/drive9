@@ -61,6 +61,7 @@ type MountOptions struct {
 	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for overlay-profile mounts
 	AppendLogPatterns       []string      // remote-persistent files eligible for append-log synchronization
 	PackPaths               []string      // local overlay paths auto-packed after unmount
+	ExtentPaths             []string      // path globs created as content_layout=extent
 	CommitQueueMaxPending   int           // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
 	WriteBackBatchWindow    time.Duration // writeback-only small-file batch window (default 0 disabled)
 	WriteBackBatchMaxFiles  int           // maximum files in one writeback batch (default 64 when enabled)
