@@ -274,7 +274,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
-	effectiveAppendLogPatterns := mergeProfileValues(envAppendLogPatterns, appendLogPatterns)
+	explicitAppendLogPatterns := mergeProfileValues(envAppendLogPatterns, appendLogPatterns)
+	effectiveAppendLogPatterns := explicitAppendLogPatterns
 
 	if objectLoc != nil {
 		if len(effectiveAppendLogPatterns) > 0 {
@@ -605,7 +606,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		cancel()
 		if !supported {
 			// Keep explicit rules; FUSE retains its existing capability and layout guards.
-			effectiveAppendLogPatterns = mergeProfileValues(envAppendLogPatterns, appendLogPatterns)
+			effectiveAppendLogPatterns = explicitAppendLogPatterns
 			if !*supervised {
 				fmt.Fprintf(os.Stderr, "drive9: warning: profile %q [append-log] ignored: backend append-log support is unavailable or could not be confirmed; using normal writes for profile-selected files\n", profileCfg.Name)
 			}
