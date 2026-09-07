@@ -958,6 +958,7 @@ func TestPackAuthFromMountStateUsesCredentialSnapshot(t *testing.T) {
 }
 
 func TestMountCmdUnpacksBeforeFuseMount(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1009,6 +1010,7 @@ func TestMountCmdUnpacksBeforeFuseMount(t *testing.T) {
 }
 
 func TestMountCmdAutoUnpacksCodingAgentPackBeforeFuseMount(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 	writeTestProfile(t, "with-pack", "[pack]\n.git\n")

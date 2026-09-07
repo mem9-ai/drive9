@@ -20,6 +20,7 @@ type profileConfig struct {
 	Source             string
 	LocalOnlyPatterns  []string
 	RemoteOnlyPatterns []string
+	AppendLogPatterns  []string
 	PackPaths          []string
 }
 
@@ -144,6 +145,7 @@ func builtinCodingAgentProfile() profileConfig {
 		Source:             "builtin:coding-agent",
 		LocalOnlyPatterns:  builtinCodingAgentLocalOnlyPatterns(),
 		RemoteOnlyPatterns: nil,
+		AppendLogPatterns:  []string{"**/*-wal"},
 		PackPaths:          nil,
 	}
 }
@@ -215,7 +217,7 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")))
 			switch section {
-			case "local", "remote", "pack":
+			case "local", "remote", "pack", "append-log":
 			default:
 				return profileConfig{}, fmt.Errorf("profile %q line %d: unknown section [%s]", name, lineNo+1, section)
 			}
@@ -228,6 +230,8 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 			cfg.RemoteOnlyPatterns = append(cfg.RemoteOnlyPatterns, line)
 		case "pack":
 			cfg.PackPaths = append(cfg.PackPaths, line)
+		case "append-log":
+			cfg.AppendLogPatterns = append(cfg.AppendLogPatterns, line)
 		}
 	}
 	return cfg, nil
@@ -242,6 +246,7 @@ func formatProfileConfig(cfg profileConfig) string {
 	writeProfileSection(&b, "local", cfg.LocalOnlyPatterns, "no local-only overlay paths")
 	writeProfileSection(&b, "remote", cfg.RemoteOnlyPatterns, "no remote override paths")
 	writeProfileSection(&b, "pack", cfg.PackPaths, "no automatic pack paths")
+	writeProfileSection(&b, "append-log", cfg.AppendLogPatterns, "no append-log optimization paths")
 	return b.String()
 }
 

@@ -891,6 +891,7 @@ func TestResolveMountCredentials_MissingServer(t *testing.T) {
 }
 
 func TestMountCmdStartsBackgroundByDefault(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldStartMountBackground := startMountBackground
 	oldStartSupervised := startMountSupervisedBackground
 	oldMountFuse := mountFuse
@@ -946,6 +947,7 @@ func TestMountCmdStartsBackgroundByDefault(t *testing.T) {
 }
 
 func TestMountCmdNoSuperviseUsesLegacyBackground(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldStartMountBackground := startMountBackground
 	oldStartSupervised := startMountSupervisedBackground
 	oldMountFuse := mountFuse
@@ -997,6 +999,7 @@ func TestMountCmdNoSuperviseUsesLegacyBackground(t *testing.T) {
 }
 
 func TestMountCmdVaultStartsBackgroundByDefault(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("vault FUSE mounts are unsupported on Windows")
 	}
@@ -1206,6 +1209,7 @@ func TestConsumeAppendLogPatternsEnv(t *testing.T) {
 }
 
 func TestMountCmdPassesLegacyDirStatFallbackOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1240,6 +1244,7 @@ func TestMountCmdPassesLegacyDirStatFallbackOption(t *testing.T) {
 }
 
 func TestMountCmdLeavesLegacyDirStatFallbackDisabledByDefault(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1269,6 +1274,7 @@ func TestMountCmdLeavesLegacyDirStatFallbackDisabledByDefault(t *testing.T) {
 }
 
 func TestMountCmdResolvesGVisorCompat(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	tests := []struct {
 		name     string
 		env      string
@@ -1380,8 +1386,10 @@ func TestMountCmdIgnoresGVisorCompatEnvironmentForNonFUSEMounts(t *testing.T) {
 			return nil
 		}
 		t.Setenv("HOME", t.TempDir())
-		t.Setenv(EnvServer, "https://drive9.example")
-		t.Setenv(EnvAPIKey, "sk-test")
+		setResolverEnv(t, map[string]string{
+			EnvServer: "https://drive9.example",
+			EnvAPIKey: "sk-test",
+		})
 
 		if err := MountCmd([]string{
 			"--foreground",
@@ -1409,6 +1417,7 @@ func TestMountCmdRejectsInvalidGVisorCompatEnvironment(t *testing.T) {
 }
 
 func TestMountCmdPassesLayerRefOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1443,6 +1452,7 @@ func TestMountCmdPassesLayerRefOption(t *testing.T) {
 }
 
 func TestMountCmdCheckpointRequiresLayer(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 	mountFuse = func(opts *mountFuseOptions) error {
@@ -1467,6 +1477,7 @@ func TestMountCmdCheckpointRequiresLayer(t *testing.T) {
 }
 
 func TestMountCmdPassesTrustLocalEventsOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1497,6 +1508,7 @@ func TestMountCmdPassesTrustLocalEventsOption(t *testing.T) {
 }
 
 func TestMountCmdLeavesTrustLocalEventsDisabledByDefault(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1539,6 +1551,7 @@ func TestMountCmdRejectsTrustLocalEventsWithWebDAV(t *testing.T) {
 }
 
 func TestMountCmdPassesReadCacheMaxFileOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1569,6 +1582,7 @@ func TestMountCmdPassesReadCacheMaxFileOption(t *testing.T) {
 }
 
 func TestMountCmdLeavesReadCacheTTLUnsetByDefault(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1598,6 +1612,7 @@ func TestMountCmdLeavesReadCacheTTLUnsetByDefault(t *testing.T) {
 }
 
 func TestMountCmdPassesReadCacheTTLOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1628,6 +1643,7 @@ func TestMountCmdPassesReadCacheTTLOption(t *testing.T) {
 }
 
 func TestMountCmdReadCacheTTLZeroDisablesTimeExpiry(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1699,6 +1715,7 @@ func TestMountCmdRejectsZeroDiskReadCacheFreeRatio(t *testing.T) {
 }
 
 func TestMountCmdPassesReadConcurrencyOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1729,6 +1746,7 @@ func TestMountCmdPassesReadConcurrencyOption(t *testing.T) {
 }
 
 func TestMountCmdPassesParallelReadOptions(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1763,6 +1781,7 @@ func TestMountCmdPassesParallelReadOptions(t *testing.T) {
 }
 
 func TestMountCmdPassesUploadConcurrencyOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1849,6 +1868,7 @@ func TestMountCmdRejectsInvalidUploadConcurrency(t *testing.T) {
 }
 
 func TestMountCmdPassesDirCacheMaxEntriesOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1878,6 +1898,7 @@ func TestMountCmdPassesDirCacheMaxEntriesOption(t *testing.T) {
 }
 
 func TestMountCmdPassesCommitQueueMaxPendingOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1939,6 +1960,7 @@ func TestMountCmdRejectsInvalidCommitQueueMaxPending(t *testing.T) {
 }
 
 func TestMountCmdPassesFuseSyncReadOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1969,6 +1991,7 @@ func TestMountCmdPassesFuseSyncReadOption(t *testing.T) {
 }
 
 func TestMountCmdMapsDirectMountStrictOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2049,6 +2072,7 @@ func TestMountCmdRejectsDirectMountStrictOutsideLinux(t *testing.T) {
 }
 
 func TestMountCmdMapsDurabilityOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2121,6 +2145,7 @@ func TestMountCmdMapsDurabilityOption(t *testing.T) {
 }
 
 func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2167,6 +2192,7 @@ func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
 }
 
 func TestMountCmdPerfDirSetsDefaultProfilingOptions(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2220,6 +2246,7 @@ func TestMountCmdPerfDirSetsDefaultProfilingOptions(t *testing.T) {
 }
 
 func TestMountCmdPerfDirKeepsAdvancedControls(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2378,6 +2405,7 @@ func TestMountCmdRejectsInvalidPerfRetentionFileCounts(t *testing.T) {
 }
 
 func TestMountCmdPerfCPUIntervalUsesDefaultDuration(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2412,6 +2440,7 @@ func TestMountCmdPerfCPUIntervalUsesDefaultDuration(t *testing.T) {
 }
 
 func TestMountCmdPerfCPUDurationUsesDefaultInterval(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2461,6 +2490,7 @@ func TestMountCmdRejectsPerfCPUDurationNotLessThanInterval(t *testing.T) {
 }
 
 func TestMountCmdLeavesDefaultTTLsUnsetForFuseDefaults(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2493,6 +2523,7 @@ func TestMountCmdLeavesDefaultTTLsUnsetForFuseDefaults(t *testing.T) {
 }
 
 func TestMountCmdPreservesExplicitTTLs(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2532,6 +2563,7 @@ func TestMountCmdPreservesExplicitTTLs(t *testing.T) {
 }
 
 func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2577,6 +2609,7 @@ func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
 }
 
 func TestMountCmdCodingAgentProfileMergesPolicyEnvironment(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2620,6 +2653,7 @@ func TestMountCmdCodingAgentProfileMergesPolicyEnvironment(t *testing.T) {
 }
 
 func TestMountCmdPassesAppendLogPatterns(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2654,6 +2688,7 @@ func TestMountCmdPassesAppendLogPatterns(t *testing.T) {
 }
 
 func TestMountCmdMaterializesAppendLogEnvironmentInSupervisedArgs(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("supervised mounts are disabled on Windows")
 	}
@@ -2724,6 +2759,7 @@ func TestMountCmdRejectsAppendLogOutsideDrive9FUSE(t *testing.T) {
 }
 
 func TestMountCmdMaterializesPolicyEnvironmentInSupervisedArgs(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("supervised mounts are disabled on Windows")
 	}
@@ -2765,6 +2801,7 @@ func TestMountCmdMaterializesPolicyEnvironmentInSupervisedArgs(t *testing.T) {
 }
 
 func TestMountCmdPortableProfilePassesCodingAgentPolicyAndAllLocalPackPath(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -2808,6 +2845,7 @@ func TestMountCmdPortableProfilePassesCodingAgentPolicyAndAllLocalPackPath(t *te
 }
 
 func TestMountCmdCodingAgentProfileGeneratesDefaultLocalRoot(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 

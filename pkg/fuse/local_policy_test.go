@@ -187,6 +187,8 @@ func TestAppendLogPolicyMatchesSQLiteWALGlob(t *testing.T) {
 		path string
 		want bool
 	}{
+		{"/db-wal", true},
+		{"/repo/db-wal", true},
 		{"/repro.db-wal", true},
 		{"/issue-validation/run/case/repro.db-wal", true},
 		{"/repo/other.sqlite-wal", true},
