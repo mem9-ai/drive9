@@ -1830,6 +1830,54 @@ func TestCommitQueueRecoversGrownPayloadAfterSmallerCommitAndRestart(t *testing.
 	}
 }
 
+func TestCommitQueueRecoveredPendingNewDoesNotOverwriteUnrelatedRemote(t *testing.T) {
+	const path = "/kv-1g.db"
+	remote := []byte("external")
+	local := bytes.Repeat([]byte("L"), 4096)
+
+	server, ts := newCASFileServer(t, path, 1, remote)
+	defer ts.Close()
+
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(path, local, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(path, int64(len(local)), PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.RecoverPending()
+	waitCommitQueueIdle(t, cq)
+
+	rev, body, puts := server.snapshot()
+	if rev != 1 || string(body) != string(remote) {
+		t.Fatalf("remote rev=%d body=%q, want rev=1 external image", rev, body)
+	}
+	for _, put := range puts {
+		if string(put.body) == string(local) {
+			t.Fatal("recovered PendingNew overwrote an unrelated smaller remote file")
+		}
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending entry missing after unrelated remote conflict")
+	}
+	if meta.Kind != PendingConflict {
+		t.Fatalf("pending kind = %v, want PendingConflict", meta.Kind)
+	}
+}
+
 func TestCommitQueueSupersedeRemovesDelayedZeroTruncate(t *testing.T) {
 	const path = "/grow.bin"
 	large := []byte("this-is-the-full-image")

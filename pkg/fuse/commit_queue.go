@@ -1421,13 +1421,21 @@ func (cq *CommitQueue) rememberLanded(path string, rev, size int64) {
 		return
 	}
 	cq.mu.Lock()
-	defer cq.mu.Unlock()
 	if cq.landed == nil {
 		cq.landed = make(map[string]pathCommitLandmark)
 	}
 	prev := cq.landed[path]
+	persist := false
 	if rev >= prev.rev {
 		cq.landed[path] = pathCommitLandmark{rev: rev, size: size}
+		persist = true
+	}
+	idx := cq.index
+	cq.mu.Unlock()
+	if persist && idx != nil {
+		if err := idx.PutLanded(path, rev, size); err != nil {
+			safeLogPrintf("commit queue: persist landed snapshot for %s: %v", path, err)
+		}
 	}
 }
 
@@ -1438,6 +1446,16 @@ func (cq *CommitQueue) landedCommit(path string) pathCommitLandmark {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
 	return cq.landed[path]
+}
+
+func (cq *CommitQueue) durableLanded(path string) (pathCommitLandmark, bool) {
+	if mem := cq.landedCommit(path); mem.rev > 0 {
+		return mem, true
+	}
+	if cq != nil && cq.index != nil {
+		return cq.index.GetLanded(path)
+	}
+	return pathCommitLandmark{}, false
 }
 
 // maybeRebaseGrownPayloadOntoWatermark detects issue #896: a later same-path
@@ -1460,15 +1478,15 @@ func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(entry *CommitEntry, 
 }
 
 // maybeRebaseGrownPayloadAgainstRemote reconstructs the #896 growth rebase
-// after a restart, when this process has no in-memory landed snapshot. A
-// strictly larger local payload against a smaller remote image is same-path
-// growth, not an #876 stale checkpoint (those bytes are smaller/older).
+// after a restart. The smaller remote image must match the snapshot this
+// client previously landed; a strictly larger local pending create against
+// an unrelated smaller remote file must stay conflicted.
 func (cq *CommitQueue) maybeRebaseGrownPayloadAgainstRemote(entry *CommitEntry, serverRev, serverSize int64) bool {
-	if !cq.rebaseGrownPayload(entry, serverRev, serverSize) {
+	proof, ok := cq.durableLanded(entry.Path)
+	if !ok || proof.rev != serverRev || proof.size != serverSize {
 		return false
 	}
-	cq.rememberLanded(entry.Path, serverRev, serverSize)
-	return true
+	return cq.rebaseGrownPayload(entry, serverRev, serverSize)
 }
 
 func (cq *CommitQueue) rebaseGrownPayload(entry *CommitEntry, priorRev, priorSize int64) bool {
