@@ -213,6 +213,55 @@ func (fs *Dat9FS) newWriteBuffer(path string, maxSize, partSize int64) *WriteBuf
 	return wb
 }
 
+// bindShadowSpillEvictionLocked evicts completed WriteBuffer parts to keep
+// Dirty memory bounded and restores them from the shadow file on back-write.
+// SQLite WAL is not pure append at this granularity; recreating an evicted
+// part as zeros (#898) poisons later Dirty consumers (header reads, rewrite
+// snapshots if spill is dropped, same-path-dirty fallback).
+func (fs *Dat9FS) bindShadowSpillEvictionLocked(fh *FileHandle) {
+	if fh == nil || fh.Dirty == nil || !fh.ShadowSpill {
+		return
+	}
+	wb := fh.Dirty
+	wb.OnPartFull = func(partIdx int, _ []byte) {
+		wb.EvictPart(partIdx)
+	}
+	if fs == nil || fs.shadowStore == nil {
+		wb.RestorePart = nil
+		return
+	}
+	store := fs.shadowStore
+	wb.RestorePart = func(partNum int) ([]byte, error) {
+		return restoreWriteBufferPartFromShadow(store, wb, partNum)
+	}
+}
+
+func restoreWriteBufferPartFromShadow(store *ShadowStore, wb *WriteBuffer, partNum int) ([]byte, error) {
+	if store == nil || wb == nil || partNum < 1 || wb.partSize <= 0 {
+		return nil, fmt.Errorf("invalid shadow part restore")
+	}
+	partStart := int64(partNum-1) * wb.partSize
+	end := partStart + wb.partSize
+	if wb.totalSize > 0 && partStart >= wb.totalSize {
+		return nil, fmt.Errorf("part %d starts at %d beyond size %d", partNum, partStart, wb.totalSize)
+	}
+	if wb.totalSize > 0 && end > wb.totalSize {
+		end = wb.totalSize
+	}
+	if end <= partStart {
+		return nil, fmt.Errorf("empty part %d", partNum)
+	}
+	buf := make([]byte, end-partStart)
+	n, err := store.ReadAt(wb.path, partStart, buf)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if n != len(buf) {
+		return nil, fmt.Errorf("shadow part %d short read n=%d want=%d", partNum, n, len(buf))
+	}
+	return buf, nil
+}
+
 // inlineThreshold returns a small-file cutoff suitable for performance
 // heuristics (read-cache prefetch sizing, debounce flush timing, write-
 // buffer fast-path bounds). It mirrors the server's inline_threshold once
@@ -2188,10 +2237,7 @@ func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) (f
 	if newSize == 0 {
 		fh.Dirty.ResetStreamingState()
 		if fh.ShadowSpill {
-			wb := fh.Dirty
-			wb.OnPartFull = func(partIdx int, data []byte) {
-				wb.EvictPart(partIdx)
-			}
+			fs.bindShadowSpillEvictionLocked(fh)
 		}
 		if fh.Streamer != nil {
 			streamer := fh.Streamer
@@ -2246,8 +2292,7 @@ func (fs *Dat9FS) applySQLiteZeroTruncateLocked(fh *FileHandle) bool {
 	fh.Dirty.ResetStreamingState()
 	fh.Dirty.ResetSequentialState(0)
 	if fh.ShadowSpill {
-		wb := fh.Dirty
-		wb.OnPartFull = func(partIdx int, _ []byte) { wb.EvictPart(partIdx) }
+		fs.bindShadowSpillEvictionLocked(fh)
 	}
 	fh.OrigSize = 0
 	// The initiating FD owns the truncate mutation. A sibling remains a
@@ -2739,6 +2784,9 @@ func (fs *Dat9FS) rebindCleanWriteBufferToRemoteLocked(fh *FileHandle, committed
 		if length <= 0 {
 			return nil, nil
 		}
+		if data, handled, err := fs.loadUnlinkedHandlePart(fh, offset, length); handled {
+			return data, err
+		}
 
 		lpCtx, lpCf := context.WithTimeout(context.Background(), fuseTimeout)
 		defer lpCf()
@@ -3066,11 +3114,34 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	if fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() > 0 {
 		fh.ZeroBase = false
 	}
+	fs.rebaselineCommittedDirtyBufferLocked(fh)
 	fs.removeHandleStagingLocked(fh)
 	fh.ShadowReady = false
 	fh.ShadowSpill = false
 	fh.ShadowCommitReady = false
 	fh.ShadowCommitSeq = 0
+}
+
+// rebaselineCommittedDirtyBufferLocked replaces a clean live WriteBuffer that
+// still carries ShadowSpill eviction/restore bookkeeping with a remote-backed
+// buffer. A successful Fsync/Flush must not leave uploadedParts/RestorePart
+// pointing at a shadow that the commit path is about to delete (#900).
+func (fs *Dat9FS) rebaselineCommittedDirtyBufferLocked(fh *FileHandle) {
+	if fh == nil || fh.Dirty == nil || fh.Dirty.HasDirtyParts() {
+		return
+	}
+	if fh.Dirty.needsCommitRebaseline() {
+		// Evicted parts are gone from memory; the next same-FD write must
+		// load the just-committed remote object instead of a deleted shadow.
+		fs.rebindCleanWriteBufferToRemoteLocked(fh, fh.Dirty.Size())
+		return
+	}
+	// Create installs RestorePart/OnPartFull even for tiny files that never
+	// evicted. Clearing those callbacks is enough: keep the in-memory image
+	// so a later write does not GET a path the commit just deleted (unlink)
+	// or that the test server never served.
+	fh.Dirty.RestorePart = nil
+	fh.Dirty.OnPartFull = nil
 }
 
 func (fs *Dat9FS) seedReadCacheFromShadowGenerationLocked(path string, size int64, revision int64, shadowGen uint64) bool {
@@ -3136,6 +3207,9 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 		}
 		if length <= 0 {
 			return nil, nil
+		}
+		if data, handled, err := fs.loadUnlinkedHandlePart(fh, offset, length); handled {
+			return data, err
 		}
 
 		lpCtx, lpCf := context.WithTimeout(context.Background(), fuseTimeout)
@@ -3828,6 +3902,7 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 			fh.OrigSize = size
 			if fh.DirtySeq == 0 {
 				fh.appendLogAdoptCommittedBaseline(fh.BaseRev, size)
+				fs.rebaselineCommittedDirtyBufferLocked(fh)
 			} else {
 				fh.appendLogRebindLayout(fh.BaseRev, size)
 			}
@@ -7300,15 +7375,16 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 	snapshotOK := false
 	var snapshot []byte
 	snapshotShadowGen := uint64(0)
+	snapshotNeedCount := 0
 	if snapshotRemote {
 		needsSnapshot := false
-		snapshotNeedCount := 0
 		for _, fh := range handles {
 			if fh == nil {
 				continue
 			}
 			fh.Lock()
-			handleNeedsSnapshot := cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh)
+			handleNeedsSnapshot := cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) ||
+				remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh)
 			if handleNeedsSnapshot {
 				needsSnapshot = true
 				snapshotNeedCount++
@@ -7352,6 +7428,7 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		}
 	}
 
+	attachedSnapshotPins := 0
 	for _, fh := range handles {
 		if fh == nil {
 			continue
@@ -7371,6 +7448,11 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 					fh.UnlinkedShadowGen = gen
 					fh.UnlinkedSnapshot = true
 				}
+			} else if snapshotOK && remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh) {
+				attachUnlinkedSnapshotLocked(fh, snapshot, snapshotShadowGen, size)
+				if snapshotShadowGen != 0 && fh.UnlinkedShadowGen == snapshotShadowGen {
+					attachedSnapshotPins++
+				}
 			}
 		} else if snapshotOK {
 			if snapshotShadowGen != 0 && cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) {
@@ -7378,6 +7460,7 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 				fh.UnlinkedSnapshot = true
 				fh.UnlinkedShadowGen = snapshotShadowGen
 				fh.UnlinkedSize = size
+				attachedSnapshotPins++
 			} else {
 				fh.UnlinkedData = append(fh.UnlinkedData[:0], snapshot...)
 				fh.UnlinkedSnapshot = true
@@ -7387,6 +7470,11 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 			fh.UnlinkedSize = size
 		}
 		fh.Unlock()
+	}
+	if snapshotShadowGen != 0 && fs.shadowStore != nil && attachedSnapshotPins < snapshotNeedCount {
+		for i := attachedSnapshotPins; i < snapshotNeedCount; i++ {
+			fs.shadowStore.Unpin(snapshotShadowGen)
+		}
 	}
 	fs.openHandles.UnlinkPath(p)
 	return handles, true, nil
@@ -7400,6 +7488,81 @@ func cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
 		fh.UnlinkedData == nil &&
 		fh.UnlinkedShadowGen == 0 &&
 		!fh.UnlinkedSnapshot
+}
+
+// remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked is the post-#900
+// rebaseline case: a clean WriteBuffer whose bytes live only on the
+// committed pathname via LoadPart. Unlink must snapshot that object before
+// DELETE, or a later same-FD write GETs the deleted path and returns EIO.
+func remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
+	// Attach even if a concurrent write dirtied the buffer during the
+	// snapshot GET: unloaded parts still depend on the committed pathname,
+	// and LoadPart/Read must use the private backing after DELETE. Dirty
+	// overlays stay in fh.Dirty and are preferred by Read when present.
+	return fh != nil &&
+		fh.Dirty != nil &&
+		fh.Dirty.LoadPart != nil &&
+		fh.Dirty.remoteSize > 0 &&
+		!fh.ShadowSpill &&
+		fh.LocalFile == nil &&
+		fh.Layer != PathLayerGitWorkspace &&
+		fh.UnlinkedData == nil &&
+		fh.UnlinkedShadowGen == 0 &&
+		!fh.UnlinkedSnapshot
+}
+
+func attachUnlinkedSnapshotLocked(fh *FileHandle, snapshot []byte, snapshotShadowGen uint64, size int64) {
+	if fh == nil {
+		return
+	}
+	if snapshotShadowGen != 0 {
+		fh.UnlinkedData = nil
+		fh.UnlinkedSnapshot = true
+		fh.UnlinkedShadowGen = snapshotShadowGen
+		fh.UnlinkedSize = size
+		return
+	}
+	fh.UnlinkedData = append(fh.UnlinkedData[:0], snapshot...)
+	fh.UnlinkedSnapshot = true
+	fh.UnlinkedSize = int64(len(snapshot))
+}
+
+func (fs *Dat9FS) loadUnlinkedHandlePart(fh *FileHandle, offset, length int64) ([]byte, bool, error) {
+	if fh == nil || !fh.Unlinked || length <= 0 {
+		return nil, false, nil
+	}
+	anonSize := fh.UnlinkedSize
+	if anonSize < 0 {
+		anonSize = 0
+	}
+	if offset >= anonSize {
+		return nil, true, nil
+	}
+	want := length
+	if remaining := anonSize - offset; remaining < want {
+		want = remaining
+	}
+	if want <= 0 {
+		return nil, true, nil
+	}
+	if fh.UnlinkedShadowGen != 0 && fs != nil && fs.shadowStore != nil {
+		buf := make([]byte, want)
+		n, err := fs.shadowStore.ReadAtGen(fh.UnlinkedShadowGen, offset, buf)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, true, err
+		}
+		if int64(n) != want {
+			return nil, true, fmt.Errorf("unlinked shadow gen %d short read n=%d want=%d off=%d", fh.UnlinkedShadowGen, n, want, offset)
+		}
+		return buf, true, nil
+	}
+	if fh.UnlinkedData != nil {
+		if offset >= int64(len(fh.UnlinkedData)) || offset+want > int64(len(fh.UnlinkedData)) {
+			return nil, true, fmt.Errorf("unlinked snapshot short read want=%d have=%d off=%d", want, len(fh.UnlinkedData), offset)
+		}
+		return append([]byte(nil), fh.UnlinkedData[offset:offset+want]...), true, nil
+	}
+	return nil, false, nil
 }
 
 // unmarkOpenHandlesAfterFailedUnlink rolls back markOpenHandlesUnlinked when
@@ -11223,11 +11386,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	}
 
 	if fh.ShadowSpill {
-		// ShadowSpill mode: shadow is the authoritative data source.
-		// OnPartFull evicts memory immediately — no StreamUploader needed.
-		wb.OnPartFull = func(partIdx int, data []byte) {
-			wb.EvictPart(partIdx)
-		}
+		fs.bindShadowSpillEvictionLocked(fh)
 	} else if fh.WritePolicy != WritePolicyWriteSync && !fs.layerEnabled() && !fs.appendLogNewPathActive(childP) {
 		// Normal mode: attach streaming uploader for sequential write streaming.
 		fh.Streamer = NewStreamUploader(fs.client, childP, expectedRevisionForHandle(fh), fs.remoteRoot())
@@ -11442,11 +11601,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			}
 
 			if fh.ShadowSpill {
-				// ShadowSpill mode: shadow is the authoritative data source.
-				wb := fh.Dirty
-				wb.OnPartFull = func(partIdx int, data []byte) {
-					wb.EvictPart(partIdx)
-				}
+				fs.bindShadowSpillEvictionLocked(fh)
 			} else if fh.WritePolicy != WritePolicyWriteSync && !fs.layerEnabled() && !fs.appendLogPathConfigured(p) {
 				// Normal mode: attach streaming uploader with OnPartFull wiring.
 				fh.Streamer = NewStreamUploader(fs.client, p, expectedRevisionForHandle(fh), fs.remoteRoot())
@@ -11591,11 +11746,52 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		bytesRead = n
 		return gofuse.ReadResultData(data[:n]), gofuse.OK
 	}
-	if data, n, ok := readUnlinkedData(fh, int64(input.Offset), input.Size); ok {
+	preferDirtyOverlay := fh.Dirty != nil && fh.Dirty.HasDirtyParts()
+	if !preferDirtyOverlay {
+		if data, n, ok := readUnlinkedData(fh, int64(input.Offset), input.Size); ok {
+			fh.Unlock()
+			source = "unlinked-snapshot"
+			bytesRead = n
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
+	}
+	// Post-Fsync rebaseline leaves Dirty != nil with LoadPart. Large unlinks
+	// pin UnlinkedShadowGen instead of UnlinkedData; serve that private
+	// backing before falling through to a remote GET of the deleted path.
+	// Skip when Dirty already has an overlay so concurrent unlink-window
+	// writes remain visible.
+	if !preferDirtyOverlay && fh.Unlinked && fh.UnlinkedShadowGen != 0 {
+		offset := int64(input.Offset)
+		unlinkedSize := fh.UnlinkedSize
+		gen := fh.UnlinkedShadowGen
+		if offset >= unlinkedSize {
+			fh.Unlock()
+			source = "unlinked-shadow-eof"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+		end := offset + int64(input.Size)
+		if end > unlinkedSize {
+			end = unlinkedSize
+		}
 		fh.Unlock()
-		source = "unlinked-snapshot"
+		if fs.shadowStore == nil {
+			source = "unlinked-shadow-missing-store"
+			return nil, gofuse.EIO
+		}
+		result := make([]byte, end-offset)
+		n, err := fs.shadowStore.ReadAtGen(gen, offset, result)
+		if err != nil && (!errors.Is(err, io.EOF) || n != len(result)) {
+			source = "unlinked-shadow-error"
+			return nil, gofuse.EIO
+		}
+		if n != len(result) {
+			source = "unlinked-shadow-short"
+			return nil, gofuse.EIO
+		}
+		source = "unlinked-shadow"
 		bytesRead = n
-		return gofuse.ReadResultData(data), gofuse.OK
+		return gofuse.ReadResultData(result), gofuse.OK
 	}
 	fs.refreshCleanCommittedRevisionForHandleLocked(fh)
 
@@ -12417,10 +12613,23 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	if fh.Flags&uint32(syscall.O_APPEND) != 0 {
 		writeOffset = fh.Dirty.Size()
 	}
+	writeLen := int64(len(data))
+	if fh.Dirty != nil && writeOffset+writeLen > fh.Dirty.maxSize {
+		source = "dirty-write-error"
+		return 0, gofuse.Status(syscall.EFBIG)
+	}
 
 	// ShadowSpill: write shadow FIRST, before Dirty. If shadow fails, return
 	// EIO without touching Dirty — OnPartFull may evict the part, so writing
 	// Dirty first could lose data if shadow then fails.
+	// Restore evicted Dirty parts before mutating shadow so a restore failure
+	// cannot leave authoritative staging bytes from a Write the caller saw fail.
+	if fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil && fh.Dirty != nil {
+		if err := fh.Dirty.EnsurePartsForWrite(writeOffset, writeLen); err != nil {
+			source = "dirty-restore-error"
+			return 0, gofuse.EIO
+		}
+	}
 	if fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
 		shadowStart := time.Now()
 		unlockShadowWrite := fs.lockHandleRemoteCommitPathLocked(fh)
@@ -12449,7 +12658,10 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	n, err := fh.Dirty.Write(writeOffset, data)
 	if err != nil {
 		source = "dirty-write-error"
-		return 0, gofuse.Status(syscall.EFBIG)
+		if errors.Is(err, syscall.EFBIG) {
+			return 0, gofuse.Status(syscall.EFBIG)
+		}
+		return 0, gofuse.EIO
 	}
 	fh.appendLogRecordUserWrite(preWriteSize, writeOffset, int64(n))
 	if fs.appendLogPathConfigured(fh.Path) && !fh.IsNew && n > 0 && writeOffset != preWriteSize {
