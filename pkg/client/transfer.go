@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1599,15 +1600,41 @@ func (c *Client) sliceBody(rc io.ReadCloser, offset, length int64) (io.ReadClose
 	return &limitedReadCloser{r: io.LimitReader(rc, length), c: rc}, nil
 }
 
-// validatePartialContentRange checks that a first-hop 206 response starts at
-// the requested offset. The caller bounds the length via io.LimitReader, so a
-// server-clamped end (EOF) is allowed here.
+// validatePartialContentRange checks that a first-hop 206 response carries a
+// well-formed Content-Range starting at the requested offset. The caller
+// bounds the length via io.LimitReader, so a server-clamped end (EOF) is
+// allowed here.
 func validatePartialContentRange(resp *http.Response, offset int64) error {
 	contentRange := resp.Header.Get("Content-Range")
 	if contentRange == "" {
 		return fmt.Errorf("206 response missing Content-Range for offset %d", offset)
 	}
-	if !strings.HasPrefix(contentRange, fmt.Sprintf("bytes %d-", offset)) {
+	rest, ok := strings.CutPrefix(contentRange, "bytes ")
+	if !ok {
+		return fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+	}
+	byteRange, complete, ok := strings.Cut(rest, "/")
+	if !ok {
+		return fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+	}
+	if complete != "*" {
+		if _, err := strconv.ParseInt(complete, 10, 64); err != nil {
+			return fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+		}
+	}
+	startStr, endStr, ok := strings.Cut(byteRange, "-")
+	if !ok || startStr == "" || endStr == "" {
+		return fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+	}
+	start, err := strconv.ParseInt(startStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+	}
+	end, err := strconv.ParseInt(endStr, 10, 64)
+	if err != nil || end < start {
+		return fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+	}
+	if start != offset {
 		return fmt.Errorf("unexpected Content-Range %q for offset %d", contentRange, offset)
 	}
 	return nil

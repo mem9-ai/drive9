@@ -1650,6 +1650,12 @@ func TestReadStreamRangeFirstHop206BadContentRange(t *testing.T) {
 	}{
 		{name: "missing"},
 		{name: "wrong-start", contentRange: "bytes 0-3/64"},
+		{name: "non-numeric-end", contentRange: "bytes 5-x/64"},
+		{name: "end-before-start", contentRange: "bytes 5-4/64"},
+		{name: "open-ended", contentRange: "bytes 5-/64"},
+		{name: "trailing-junk", contentRange: "bytes 5-8/64junk"},
+		{name: "missing-bytes-prefix", contentRange: "chunks 5-8/64"},
+		{name: "empty-complete", contentRange: "bytes 5-8/"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1682,8 +1688,10 @@ func TestReadStreamRangeFirstHop206BadContentRange(t *testing.T) {
 func TestReadStreamRangeFirstHopBoundedTransfer(t *testing.T) {
 	const (
 		walSize = 1 << 20
-		offset  = walSize - 4096
 		length  = 4096
+		// Place the read mid-file so the server can stream twice the
+		// requested length past the advertised end.
+		offset = walSize - 2*length
 	)
 	wal := bytes.Repeat([]byte("w"), walSize)
 	var wrote atomic.Int64
@@ -1699,6 +1707,8 @@ func TestReadStreamRangeFirstHopBoundedTransfer(t *testing.T) {
 		}
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, walSize))
 		w.WriteHeader(http.StatusPartialContent)
+		// Deliberately write past the advertised end: the client must bound
+		// its own read to the requested length.
 		n, _ := w.Write(wal[offset:])
 		wrote.Add(int64(n))
 	}))
@@ -1712,11 +1722,11 @@ func TestReadStreamRangeFirstHopBoundedTransfer(t *testing.T) {
 	defer func() { _ = rc.Close() }()
 
 	data, _ := io.ReadAll(rc)
-	if !bytes.Equal(data, wal[offset:]) {
+	if !bytes.Equal(data, wal[offset:offset+length]) {
 		t.Fatalf("read %d bytes, want exactly the %d-byte requested slice", len(data), length)
 	}
-	if got := wrote.Load(); got != length {
-		t.Fatalf("server wrote %d bytes, want exactly %d", got, length)
+	if got := wrote.Load(); got != 2*length {
+		t.Fatalf("server wrote %d bytes, want exactly %d", got, 2*length)
 	}
 }
 
