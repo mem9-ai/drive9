@@ -1528,6 +1528,198 @@ func TestReadStreamRangeLargeFileTreats416AsEOF(t *testing.T) {
 	}
 }
 
+func TestReadStreamRangeFirstHop206ZeroOffset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs/wal" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Range"); got != "bytes=0-3" {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", "bytes 0-3/64")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("head"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	rc, err := c.ReadStreamRange(context.Background(), "/wal", 0, 4)
+	if err != nil {
+		t.Fatalf("ReadStreamRange: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	data, _ := io.ReadAll(rc)
+	if string(data) != "head" {
+		t.Errorf("got %q, want %q", data, "head")
+	}
+}
+
+func TestReadStreamRangeFirstHop206NonZeroOffset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs/wal" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Range"); got != "bytes=5-8" {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", "bytes 5-8/64")
+		w.WriteHeader(http.StatusPartialContent)
+		// Only the requested slice is sent; slicing it a second time would
+		// skip the offset again and return nothing.
+		_, _ = w.Write([]byte("body"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	rc, err := c.ReadStreamRange(context.Background(), "/wal", 5, 4)
+	if err != nil {
+		t.Fatalf("ReadStreamRange: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	data, _ := io.ReadAll(rc)
+	if string(data) != "body" {
+		t.Errorf("got %q, want %q", data, "body")
+	}
+}
+
+func TestReadStreamRangeFirstHop416EOF(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs/wal" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Range", "bytes */64")
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	rc, err := c.ReadStreamRange(context.Background(), "/wal", 100, 4)
+	if err != nil {
+		t.Fatalf("ReadStreamRange: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("expected empty body, got %q", data)
+	}
+}
+
+func TestReadStreamRangeFirstHop200Fallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs/small.txt" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Range"); got != "bytes=3-6" {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		// 200: server ignored Range (small inline file or old server).
+		_, _ = w.Write([]byte("0123456789"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	rc, err := c.ReadStreamRange(context.Background(), "/small.txt", 3, 4)
+	if err != nil {
+		t.Fatalf("ReadStreamRange: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	data, _ := io.ReadAll(rc)
+	if string(data) != "3456" {
+		t.Errorf("got %q, want %q", data, "3456")
+	}
+}
+
+func TestReadStreamRangeFirstHop206BadContentRange(t *testing.T) {
+	tests := []struct {
+		name         string
+		contentRange string
+	}{
+		{name: "missing"},
+		{name: "wrong-start", contentRange: "bytes 0-3/64"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/fs/wal" {
+					http.NotFound(w, r)
+					return
+				}
+				if tt.contentRange != "" {
+					w.Header().Set("Content-Range", tt.contentRange)
+				}
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write([]byte("x"))
+			}))
+			defer srv.Close()
+
+			c := New(srv.URL, "")
+			rc, err := c.ReadStreamRange(context.Background(), "/wal", 5, 4)
+			if err == nil {
+				_ = rc.Close()
+				t.Fatal("ReadStreamRange error = nil, want Content-Range validation failure")
+			}
+			if !strings.Contains(err.Error(), "read /wal:") {
+				t.Fatalf("error %q should include the path", err)
+			}
+		})
+	}
+}
+
+func TestReadStreamRangeFirstHopBoundedTransfer(t *testing.T) {
+	const (
+		walSize = 1 << 20
+		offset  = walSize - 4096
+		length  = 4096
+	)
+	wal := bytes.Repeat([]byte("w"), walSize)
+	var wrote atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs/main.db-wal" {
+			http.NotFound(w, r)
+			return
+		}
+		want := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+		if got := r.Header.Get("Range"); got != want {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, walSize))
+		w.WriteHeader(http.StatusPartialContent)
+		n, _ := w.Write(wal[offset:])
+		wrote.Add(int64(n))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	rc, err := c.ReadStreamRange(context.Background(), "/main.db-wal", offset, length)
+	if err != nil {
+		t.Fatalf("ReadStreamRange: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	data, _ := io.ReadAll(rc)
+	if !bytes.Equal(data, wal[offset:]) {
+		t.Fatalf("read %d bytes, want exactly the %d-byte requested slice", len(data), length)
+	}
+	if got := wrote.Load(); got != length {
+		t.Fatalf("server wrote %d bytes, want exactly %d", got, length)
+	}
+}
+
 func TestReadAtCtxUsesRangeAndReturnsBytes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

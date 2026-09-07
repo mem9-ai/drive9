@@ -1345,7 +1345,7 @@ func newMultipartAbortContext(parent context.Context, timeout time.Duration) (co
 
 // ReadStream reads a file, following 302 redirects for large files.
 func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, error) {
-	resp, err := c.readWithoutRedirect(ctx, path)
+	resp, err := c.readWithoutRedirect(ctx, path, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1382,7 +1382,7 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 	}
 }
 
-func (c *Client) readWithoutRedirect(ctx context.Context, path string) (*http.Response, error) {
+func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader string) (*http.Response, error) {
 	// Disable redirect following so we can detect 302
 	noRedirectClient := *c.httpClient
 	noRedirectClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
@@ -1396,6 +1396,9 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path string) (*http.Re
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
 
 	return noRedirectClient.Do(req)
 }
@@ -1408,7 +1411,7 @@ func (c *Client) ResolveReadTarget(ctx context.Context, path string) (*ReadTarge
 }
 
 func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
-	resp, err := c.readWithoutRedirect(ctx, path)
+	resp, err := c.readWithoutRedirect(ctx, path, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1451,11 +1454,12 @@ func (c *Client) downloadToFileSequential(ctx context.Context, remotePath string
 }
 
 // ReadStreamRange reads at most length bytes from a remote file starting at
-// offset. For large files the server returns a 302 redirect to a presigned S3
-// URL; this method resolves that redirect and issues an HTTP Range request so
-// only the requested bytes are transferred. For inline small files, the server
-// sends the full body and this method returns a reader limited to the requested
-// slice.
+// offset. The Range header is sent on the first hop so inline-served files
+// such as append-log WALs transfer only the requested bytes. For large files
+// the server returns a 302 redirect to a presigned S3 URL; this method
+// resolves that redirect and repeats the Range request. A first-hop 200 (small
+// inline file or an old server that ignores Range) falls back to slicing the
+// full body.
 func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
 	if offset < 0 {
 		return nil, fmt.Errorf("offset must be >= 0")
@@ -1470,7 +1474,7 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		return nil, fmt.Errorf("offset + length overflows int64")
 	}
 
-	resp, err := c.readWithoutRedirect(ctx, path)
+	resp, err := c.readWithoutRedirect(ctx, path, fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
 	if err != nil {
 		return nil, err
 	}
@@ -1509,12 +1513,26 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 			return c.sliceBody(resp2.Body, offset, length)
 		}
 
+	case resp.StatusCode == http.StatusPartialContent:
+		if err := validatePartialContentRange(resp, offset); err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+		// First-hop Range honored. The body already starts at offset, so
+		// bound it to length without skipping the offset a second time.
+		return &limitedReadCloser{r: io.LimitReader(resp.Body, length), c: resp.Body}, nil
+
+	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+		_ = resp.Body.Close()
+		return io.NopCloser(bytes.NewReader(nil)), nil
+
 	case resp.StatusCode >= 300:
 		defer func() { _ = resp.Body.Close() }()
 		return nil, readError(resp)
 
 	default:
-		// Small file: full body returned. Skip to offset and limit.
+		// 200: server ignored Range (small inline file or old server).
+		// Skip to offset and limit the read.
 		return c.sliceBody(resp.Body, offset, length)
 	}
 }
@@ -1579,6 +1597,20 @@ func (c *Client) sliceBody(rc io.ReadCloser, offset, length int64) (io.ReadClose
 		}
 	}
 	return &limitedReadCloser{r: io.LimitReader(rc, length), c: rc}, nil
+}
+
+// validatePartialContentRange checks that a first-hop 206 response starts at
+// the requested offset. The caller bounds the length via io.LimitReader, so a
+// server-clamped end (EOF) is allowed here.
+func validatePartialContentRange(resp *http.Response, offset int64) error {
+	contentRange := resp.Header.Get("Content-Range")
+	if contentRange == "" {
+		return fmt.Errorf("206 response missing Content-Range for offset %d", offset)
+	}
+	if !strings.HasPrefix(contentRange, fmt.Sprintf("bytes %d-", offset)) {
+		return fmt.Errorf("unexpected Content-Range %q for offset %d", contentRange, offset)
+	}
+	return nil
 }
 
 type limitedReadCloser struct {
