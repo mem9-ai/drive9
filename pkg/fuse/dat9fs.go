@@ -4632,6 +4632,46 @@ func (fs *Dat9FS) readSQLitePersistentJournalVisibleRange(path string, skip *Fil
 	return nil, 0, false, gofuse.OK, ""
 }
 
+// rebindStaleCleanSamePathReadCandidateLocked refreshes a clean same-path read
+// candidate whose loaded WriteBuffer is older than the latest committed
+// revision. It keeps DirtySeq unchanged so the candidate remains eligible for
+// the local same-path fast path, and returns false when the candidate is stale
+// but unsafe to rebind so the caller can skip it and fall back to
+// shadowStore/remote.
+func (fs *Dat9FS) rebindStaleCleanSamePathReadCandidateLocked(fh *FileHandle) bool {
+	if fs == nil || fh == nil || fh.Dirty == nil || fh.Dirty.HasDirtyParts() {
+		return false
+	}
+	revision, committedSize, hasSize := fs.latestCommittedRevisionWithSize(fh.Path)
+	if revision <= 0 || revision <= fh.BaseRev {
+		return true
+	}
+	if fh.WriteBackSeq != 0 || fh.ShadowCommitReady || fh.ShadowCommitSeq != 0 ||
+		fh.IsNew || fh.ZeroBase || fh.Unlinked || fh.UnlinkedSnapshot ||
+		fh.UnlinkedData != nil || fh.ShadowReady || fh.ShadowSpill ||
+		fh.Streamer != nil {
+		return false
+	}
+	if fs.pendingIndex != nil && fh.PendingIndexGen != 0 &&
+		fs.pendingIndex.Generation(fh.Path) == fh.PendingIndexGen {
+		return false
+	}
+	if fs.shadowStore != nil && fh.ShadowStageGen != 0 &&
+		fs.shadowStore.ActiveGeneration(fh.Path) == fh.ShadowStageGen {
+		return false
+	}
+	if !hasSize {
+		committedSize = fs.committedHandleSizeLocked(fh)
+	}
+	fh.BaseRev = revision
+	if hasSize && fh.Dirty.Size() >= committedSize {
+		fh.OrigSize = committedSize
+		fh.appendLogRebindLayout(revision, committedSize)
+	}
+	fs.rebindCleanWriteBufferToRemoteLocked(fh, committedSize)
+	return true
+}
+
 func (fs *Dat9FS) readSamePathDirtyHandleAllowJournalsOnce(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, bool) {
 	if fs == nil || fs.openHandles == nil || path == "" || reqSize == 0 {
 		return nil, 0, false, gofuse.OK, false
@@ -4683,6 +4723,13 @@ restartLoop:
 				src.Unlock()
 				pending = true
 				continue restartLoop
+			}
+			if !src.Dirty.HasDirtyParts() &&
+				(fs.shadowStore == nil || (!src.ShadowReady && !src.ShadowSpill)) {
+				if !fs.rebindStaleCleanSamePathReadCandidateLocked(src) {
+					src.Unlock()
+					continue
+				}
 			}
 			size := src.Dirty.Size()
 			if offset >= size {

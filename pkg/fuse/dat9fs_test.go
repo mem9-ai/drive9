@@ -12837,6 +12837,149 @@ func TestReadSQLiteSamePathDirtyHandleSkipsIncompleteCandidate(t *testing.T) {
 	}
 }
 
+func TestReadSQLiteSamePathDirtyRebindsStaleCleanSibling(t *testing.T) {
+	const (
+		filePath = "/workload.db"
+		partSize = int64(4096)
+		fileSize = 2 * partSize
+	)
+	oldData := bytes.Repeat([]byte{'A'}, int(fileSize))
+	newData := bytes.Repeat([]byte{'B'}, int(fileSize))
+	var remoteGets atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs"+filePath {
+			http.NotFound(w, r)
+			return
+		}
+		remoteGets.Add(1)
+		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(newData)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{TrustLocalEvents: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, fileSize, time.Now())
+	fs.inodes.UpdateRevision(ino, 2)
+
+	stale := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		BaseRev:  2,
+		OrigSize: fileSize,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, partSize),
+	}
+	if _, err := stale.Dirty.Write(0, oldData); err != nil {
+		t.Fatalf("seed stale buffer: %v", err)
+	}
+	stale.Dirty.ClearDirty()
+	stale.DirtySeq = fs.markDirtySize(ino, fileSize)
+	fs.openHandles.Add(stale)
+	defer fs.openHandles.Remove(stale)
+
+	fs.recordCommittedRevisionWithSize(filePath, 3, fileSize)
+	fs.inodes.UpdateRevision(ino, 3)
+	fs.inodes.UpdateSize(ino, fileSize)
+
+	readPart := func(offset int64) []byte {
+		t.Helper()
+		got, n, ok, st := fs.readSamePathDirtyHandle(filePath, nil, offset, uint32(partSize))
+		if !ok || st != gofuse.OK {
+			t.Fatalf("read offset=%d ok=%t status=%v, want true/OK", offset, ok, st)
+		}
+		if n != int(partSize) {
+			t.Fatalf("read offset=%d bytes=%d, want %d", offset, n, partSize)
+		}
+		return append([]byte(nil), got[:n]...)
+	}
+	if got := readPart(0); !bytes.Equal(got, newData[:partSize]) {
+		t.Fatalf("first read of part0 = %q, want newData prefix", got)
+	}
+	if got := readPart(0); !bytes.Equal(got, newData[:partSize]) {
+		t.Fatalf("second read of part0 = %q, want newData prefix", got)
+	}
+	if got := readPart(partSize); !bytes.Equal(got, newData[partSize:]) {
+		t.Fatalf("read of part1 = %q, want newData suffix", got)
+	}
+	if got := remoteGets.Load(); got != 2 {
+		t.Fatalf("remote gets = %d, want 2: one per distinct part, not one per FUSE read", got)
+	}
+	if got := stale.BaseRev; got != 3 {
+		t.Fatalf("stale sibling BaseRev = %d, want 3 after rebind", got)
+	}
+}
+
+func TestReadSQLiteSamePathDirtySkipsUnsafeStaleSibling(t *testing.T) {
+	const (
+		filePath = "/workload.db"
+		partSize = int64(4096)
+		fileSize = 2 * partSize
+	)
+	oldData := bytes.Repeat([]byte{'A'}, int(fileSize))
+	newData := bytes.Repeat([]byte{'B'}, int(fileSize))
+	var remoteGets atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs"+filePath {
+			http.NotFound(w, r)
+			return
+		}
+		remoteGets.Add(1)
+		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(newData)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{TrustLocalEvents: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, fileSize, time.Now())
+	fs.inodes.UpdateRevision(ino, 2)
+
+	stale := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		BaseRev:  0,
+		OrigSize: fileSize,
+		IsNew:    true,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, partSize),
+	}
+	if _, err := stale.Dirty.Write(0, oldData); err != nil {
+		t.Fatalf("seed stale buffer: %v", err)
+	}
+	stale.Dirty.ClearDirty()
+	stale.DirtySeq = fs.markDirtySize(ino, fileSize)
+	fs.openHandles.Add(stale)
+	defer fs.openHandles.Remove(stale)
+
+	fs.recordCommittedRevisionWithSize(filePath, 3, fileSize)
+	fs.inodes.UpdateRevision(ino, 3)
+	fs.inodes.UpdateSize(ino, fileSize)
+
+	if _, _, ok, st := fs.readSamePathDirtyHandle(filePath, nil, 0, uint32(partSize)); ok || st != gofuse.OK {
+		t.Fatalf("unsafe stale sibling claimed=%t status=%v, want false/OK", ok, st)
+	}
+
+	reader := &FileHandle{Ino: ino, Path: filePath, BaseRev: 3, OrigSize: fileSize}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+	got, st, err := readDat9FSTestRange(fs, ino, readerID, 0, int(partSize))
+	if err != nil {
+		t.Fatalf("read fallback: %v", err)
+	}
+	if st != gofuse.OK {
+		t.Fatalf("read fallback status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, newData[:partSize]) {
+		t.Fatalf("read fallback bytes = %q, want newData prefix", got)
+	}
+	if remoteGets.Load() == 0 {
+		t.Fatal("unsafe stale sibling skipped but fallback never consulted remote")
+	}
+}
+
 func TestReadCloseSyncSamePathDirtyWriterUsesDirtyBuffer(t *testing.T) {
 	var remoteReads atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
