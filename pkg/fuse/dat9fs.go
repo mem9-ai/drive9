@@ -3111,11 +3111,23 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	if fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() > 0 {
 		fh.ZeroBase = false
 	}
+	fs.rebaselineCommittedDirtyBufferLocked(fh)
 	fs.removeHandleStagingLocked(fh)
 	fh.ShadowReady = false
 	fh.ShadowSpill = false
 	fh.ShadowCommitReady = false
 	fh.ShadowCommitSeq = 0
+}
+
+// rebaselineCommittedDirtyBufferLocked replaces a clean live WriteBuffer that
+// still carries ShadowSpill eviction/restore bookkeeping with a remote-backed
+// buffer. A successful Fsync/Flush must not leave uploadedParts/RestorePart
+// pointing at a shadow that the commit path is about to delete (#900).
+func (fs *Dat9FS) rebaselineCommittedDirtyBufferLocked(fh *FileHandle) {
+	if fh == nil || fh.Dirty == nil || fh.Dirty.HasDirtyParts() || !fh.Dirty.needsCommitRebaseline() {
+		return
+	}
+	fs.rebindCleanWriteBufferToRemoteLocked(fh, fh.Dirty.Size())
 }
 
 func (fs *Dat9FS) seedReadCacheFromShadowGenerationLocked(path string, size int64, revision int64, shadowGen uint64) bool {
@@ -3873,6 +3885,7 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 			fh.OrigSize = size
 			if fh.DirtySeq == 0 {
 				fh.appendLogAdoptCommittedBaseline(fh.BaseRev, size)
+				fs.rebaselineCommittedDirtyBufferLocked(fh)
 			} else {
 				fh.appendLogRebindLayout(fh.BaseRev, size)
 			}
@@ -12454,10 +12467,23 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	if fh.Flags&uint32(syscall.O_APPEND) != 0 {
 		writeOffset = fh.Dirty.Size()
 	}
+	writeLen := int64(len(data))
+	if fh.Dirty != nil && writeOffset+writeLen > fh.Dirty.maxSize {
+		source = "dirty-write-error"
+		return 0, gofuse.Status(syscall.EFBIG)
+	}
 
 	// ShadowSpill: write shadow FIRST, before Dirty. If shadow fails, return
 	// EIO without touching Dirty — OnPartFull may evict the part, so writing
 	// Dirty first could lose data if shadow then fails.
+	// Restore evicted Dirty parts before mutating shadow so a restore failure
+	// cannot leave authoritative staging bytes from a Write the caller saw fail.
+	if fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil && fh.Dirty != nil {
+		if err := fh.Dirty.EnsurePartsForWrite(writeOffset, writeLen); err != nil {
+			source = "dirty-restore-error"
+			return 0, gofuse.EIO
+		}
+	}
 	if fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
 		shadowStart := time.Now()
 		unlockShadowWrite := fs.lockHandleRemoteCommitPathLocked(fh)
@@ -12486,7 +12512,10 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	n, err := fh.Dirty.Write(writeOffset, data)
 	if err != nil {
 		source = "dirty-write-error"
-		return 0, gofuse.Status(syscall.EFBIG)
+		if errors.Is(err, syscall.EFBIG) {
+			return 0, gofuse.Status(syscall.EFBIG)
+		}
+		return 0, gofuse.EIO
 	}
 	fh.appendLogRecordUserWrite(preWriteSize, writeOffset, int64(n))
 	if fs.appendLogPathConfigured(fh.Path) && !fh.IsNew && n > 0 && writeOffset != preWriteSize {

@@ -3,17 +3,22 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
@@ -2365,6 +2370,269 @@ func TestShadowSpillBackWriteRestoresFromShadow(t *testing.T) {
 	if !bytes.Equal(got[partSize:partSize+4], original[partSize:partSize+4]) || !bytes.Equal(got[off:off+int64(len(overlay))], overlay) {
 		t.Fatalf("shadow lost original prefix or overlay")
 	}
+}
+
+func TestMarkHandleRemoteCommittedRebaselinesEvictedSpillBuffer(t *testing.T) {
+	const partSize int64 = 64
+	wb := NewWriteBuffer("/spill.bin", 1<<20, partSize)
+	wb.SetSmallFileMax(32)
+	wb.totalSize = 3 * partSize
+	wb.uploadedParts = map[int]bool{0: true, 1: true}
+	wb.RestorePart = func(int) ([]byte, error) { return nil, fmt.Errorf("stale shadow") }
+	wb.OnPartFull = func(int, []byte) {}
+	fh := &FileHandle{
+		Ino: 1, Path: "/spill.bin", Dirty: wb,
+		ShadowSpill: true, ShadowReady: true, IsNew: true,
+	}
+	fs := &Dat9FS{inodes: NewInodeToPath(), openHandles: NewOpenHandleIndex()}
+	fs.inodes.Lookup("/spill.bin", false, 0, time.Now())
+	fs.markHandleRemoteCommittedLocked(fh, 1)
+	if fh.ShadowSpill || fh.Dirty.RestorePart != nil || fh.Dirty.OnPartFull != nil || len(fh.Dirty.uploadedParts) != 0 {
+		t.Fatalf("committed handle still has spill eviction state: spill=%t restore=%t onFull=%t uploaded=%v",
+			fh.ShadowSpill, fh.Dirty.RestorePart != nil, fh.Dirty.OnPartFull != nil, fh.Dirty.uploadedParts)
+	}
+	if fh.Dirty.remoteSize != 3*partSize || fh.Dirty.Size() != 3*partSize {
+		t.Fatalf("rebased size/remoteSize = %d/%d, want %d", fh.Dirty.Size(), fh.Dirty.remoteSize, 3*partSize)
+	}
+	if fh.Dirty.LoadPart == nil {
+		t.Fatal("rebased buffer should load committed parts from remote")
+	}
+}
+
+func TestShadowSpillFsyncRebaselineAllowsSameHandleBackWrite(t *testing.T) {
+	const filePath = "/spill.bin"
+	const partSize int64 = 64
+	original := bytes.Repeat([]byte{0x11}, int(3*partSize))
+	overlay := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+
+	var mu sync.Mutex
+	var committed []byte
+	var puts [][]byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			mu.Lock()
+			body := append([]byte(nil), committed...)
+			mu.Unlock()
+			if len(body) == 0 {
+				http.NotFound(w, r)
+				return
+			}
+			w.Write(body)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			got, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			wantRev := int64(len(puts))
+			if got != wantRev {
+				http.Error(w, "revision conflict", http.StatusConflict)
+				return
+			}
+			puts = append(puts, append([]byte(nil), body...))
+			committed = append([]byte(nil), body...)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(len(puts))})
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	fs, fhID, nodeID, shadow := newStrictSmallPartSpillFS(t, ts.URL, filePath, partSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}, original); st != gofuse.OK {
+		t.Fatalf("seed Write: %v", st)
+	}
+	fh, _ := fs.fileHandles.Get(fhID)
+	fh.Lock()
+	evicted := len(fh.Dirty.uploadedParts) > 0
+	fh.Unlock()
+	if !evicted {
+		t.Fatal("expected ShadowSpill eviction before fsync")
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("first Fsync: %v", st)
+	}
+	if shadow.Has(filePath) {
+		t.Fatal("shadow staging should be removed after successful fsync")
+	}
+	fh.Lock()
+	if fh.ShadowSpill || fh.Dirty.RestorePart != nil || len(fh.Dirty.uploadedParts) != 0 {
+		t.Fatalf("after fsync spill=%t restore=%t uploaded=%v", fh.ShadowSpill, fh.Dirty.RestorePart != nil, fh.Dirty.uploadedParts)
+	}
+	fh.Unlock()
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Offset: 8}, overlay); st != gofuse.OK {
+		t.Fatalf("same-handle back-write after fsync: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("second Fsync: %v", st)
+	}
+	mu.Lock()
+	got := append([]byte(nil), committed...)
+	mu.Unlock()
+	want := append([]byte(nil), original...)
+	copy(want[8:8+len(overlay)], overlay)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("committed after back-write = %x, want original+overlay %x", got, want)
+	}
+}
+
+func TestShadowSpillFsyncThenAppendDoesNotZeroPrefix(t *testing.T) {
+	const filePath = "/spill-append.bin"
+	const partSize int64 = 64
+	original := bytes.Repeat([]byte{0x22}, int(3*partSize))
+	tail := []byte("tail")
+
+	var mu sync.Mutex
+	var committed []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			mu.Lock()
+			body := append([]byte(nil), committed...)
+			mu.Unlock()
+			if len(body) == 0 {
+				http.NotFound(w, r)
+				return
+			}
+			w.Write(body)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			committed = append([]byte(nil), body...)
+			rev := int64(1)
+			if len(committed) > len(original) {
+				rev = 2
+			}
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": rev})
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	fs, fhID, nodeID, _ := newStrictSmallPartSpillFS(t, ts.URL, filePath, partSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}, original); st != gofuse.OK {
+		t.Fatalf("seed Write: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("first Fsync: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Offset: uint64(len(original)),
+	}, tail); st != gofuse.OK {
+		t.Fatalf("append after fsync: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("second Fsync: %v", st)
+	}
+	mu.Lock()
+	got := append([]byte(nil), committed...)
+	mu.Unlock()
+	want := append(append([]byte(nil), original...), tail...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("second commit = %x, want original+tail without zero prefix", got)
+	}
+}
+
+func TestShadowSpillRestoreFailureDoesNotMutateShadow(t *testing.T) {
+	const filePath = "/spill-fail.bin"
+	const partSize int64 = 64
+	original := bytes.Repeat([]byte{0x33}, int(3*partSize))
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.RawQuery == "list=1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+			return
+		}
+		if r.Method == http.MethodPut {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": 1})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	fs, fhID, nodeID, shadow := newStrictSmallPartSpillFS(t, ts.URL, filePath, partSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}, original); st != gofuse.OK {
+		t.Fatalf("seed Write: %v", st)
+	}
+	fh, _ := fs.fileHandles.Get(fhID)
+	fh.Lock()
+	fh.Dirty.RestorePart = func(int) ([]byte, error) { return nil, fmt.Errorf("injected restore failure") }
+	fh.Unlock()
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Offset: 8}, []byte("FAIL")); st != gofuse.EIO {
+		t.Fatalf("restore-failure Write status = %v, want EIO", st)
+	}
+	got := make([]byte, len(original))
+	n, err := shadow.ReadAt(filePath, 0, got)
+	if err != nil || n != len(got) {
+		t.Fatalf("shadow read: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("failed Write mutated shadow: got %x", got)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("Fsync after failed write: %v", st)
+	}
+}
+
+func newStrictSmallPartSpillFS(t *testing.T, baseURL, filePath string, partSize int64) (*Dat9FS, uint64, uint64, *ShadowStore) {
+	t.Helper()
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(baseURL), opts)
+	fs.syncMode = SyncStrict
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(shadow.Close)
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}}, strings.TrimPrefix(filePath, "/"), &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created handle missing")
+	}
+	fh.Lock()
+	fh.Dirty = NewWriteBuffer(filePath, streamingWriteMaxSize, partSize)
+	fh.Dirty.SetSmallFileMax(partSize / 2)
+	fh.Dirty.sequential = true
+	fh.Dirty.uploadedParts = make(map[int]bool)
+	if !fh.ShadowSpill {
+		fh.Unlock()
+		t.Fatal("created handle should be ShadowSpill")
+	}
+	fs.bindShadowSpillEvictionLocked(fh)
+	fh.Unlock()
+	return fs, createOut.Fh, createOut.NodeId, shadow
 }
 
 func TestWriteBuffer_ResetSequentialState(t *testing.T) {

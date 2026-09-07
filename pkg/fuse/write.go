@@ -474,6 +474,37 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 	return nil
 }
 
+// EnsurePartsForWrite loads or restores every part overlapping [offset, offset+length)
+// so a later Write cannot fail mid-overlay after the caller has already mutated
+// an authoritative shadow. offset/length that do not touch any part are a no-op.
+func (wb *WriteBuffer) EnsurePartsForWrite(offset, length int64) error {
+	if wb == nil || length <= 0 || wb.partSize <= 0 {
+		return nil
+	}
+	end := offset + length
+	if end <= offset {
+		return nil
+	}
+	first := int(offset / wb.partSize)
+	last := int((end - 1) / wb.partSize)
+	for i := first; i <= last; i++ {
+		if err := wb.ensurePart(i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (wb *WriteBuffer) needsCommitRebaseline() bool {
+	if wb == nil {
+		return false
+	}
+	if wb.RestorePart != nil || wb.OnPartFull != nil {
+		return true
+	}
+	return len(wb.uploadedParts) > 0
+}
+
 func (wb *WriteBuffer) restoreEvictedPart(partIdx int) ([]byte, bool, error) {
 	if wb.RestorePart != nil {
 		data, err := wb.RestorePart(partIdx + 1)
