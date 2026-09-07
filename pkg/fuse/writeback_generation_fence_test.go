@@ -1688,6 +1688,99 @@ func TestCommitQueueRebasesGrownPayloadAfterSmallerSamePathCommit(t *testing.T) 
 	}
 }
 
+func TestCommitQueueSameProcessGrowthDoesNotOverwriteRecreatedSameRevSize(t *testing.T) {
+	const path = "/kv-1g.db"
+	header := bytes.Repeat([]byte("H"), 4096)
+	grown := append(bytes.Repeat([]byte("H"), 4096), bytes.Repeat([]byte("G"), 8192)...)
+	recreated := bytes.Repeat([]byte("X"), 4096)
+
+	server, ts := newCASFileServer(t, path, 0, nil)
+	defer ts.Close()
+
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	var watermark atomic.Int64
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.OnSuccess = func(_ *CommitEntry, rev int64) {
+		watermark.Store(rev)
+	}
+
+	if err := shadow.WriteFull(path, header, 0); err != nil {
+		t.Fatal(err)
+	}
+	headerGen := shadow.ActiveGeneration(path)
+	headerPending, err := pending.PutWithBaseRev(path, int64(len(header)), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:              path,
+		BaseRev:           0,
+		PayloadBaseRev:    0,
+		PayloadBaseRevSet: true,
+		Size:              int64(len(header)),
+		Kind:              PendingNew,
+		MutationSeq:       1,
+		ShadowGen:         headerGen,
+		PendingIndexGen:   headerPending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitCommitQueueIdle(t, cq)
+	server.recreate(recreated)
+
+	if err := shadow.WriteFull(path, grown, 0); err != nil {
+		t.Fatal(err)
+	}
+	grownGen := shadow.ActiveGeneration(path)
+	grownPending, err := pending.PutWithBaseRev(path, int64(len(grown)), PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:              path,
+		BaseRev:           0,
+		PayloadBaseRev:    0,
+		PayloadBaseRevSet: true,
+		Size:              int64(len(grown)),
+		Kind:              PendingNew,
+		MutationSeq:       2,
+		ShadowGen:         grownGen,
+		PendingIndexGen:   grownPending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitCommitQueueIdle(t, cq)
+
+	rev, body, puts := server.snapshot()
+	if rev != 1 || string(body) != string(recreated) {
+		t.Fatalf("remote rev=%d, want recreated 4KiB image at rev=1", rev)
+	}
+	for _, put := range puts {
+		if string(put.body) == string(grown) {
+			t.Fatal("same-process growth overwrote a delete/recreate with the same rev and size")
+		}
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending entry missing after same-process recreate conflict")
+	}
+	if meta.Kind != PendingConflict {
+		t.Fatalf("pending kind = %v, want PendingConflict", meta.Kind)
+	}
+}
+
 func TestCommitQueueSupersedesOlderSamePathQueuedCommit(t *testing.T) {
 	const path = "/grow.bin"
 	small := []byte("tiny")

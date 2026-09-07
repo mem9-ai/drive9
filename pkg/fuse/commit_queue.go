@@ -1498,7 +1498,33 @@ func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(entry *CommitEntry, 
 	if landed.rev != watermark {
 		return false
 	}
-	return cq.rebaseGrownPayload(entry, watermark, landed.size)
+	rev, size, resourceID, body, ok := cq.readRemoteSnapshot(entry.Path)
+	if !ok {
+		return false
+	}
+	return cq.maybeRebaseGrownPayloadAgainstRemote(entry, rev, size, resourceID, body)
+}
+
+func (cq *CommitQueue) readRemoteSnapshot(path string) (rev, size int64, resourceID string, body []byte, ok bool) {
+	if cq == nil || cq.client == nil || path == "" {
+		return 0, 0, "", nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	apiPath := cq.remotePath(path)
+	st, err := cq.client.StatCtx(ctx, apiPath)
+	if err != nil || st == nil {
+		return 0, 0, "", nil, false
+	}
+	rev, size, resourceID = st.Revision, st.Size, st.ResourceID
+	if st.Size < 0 || st.Size > 1<<20 {
+		return rev, size, resourceID, nil, resourceID != ""
+	}
+	body, err = cq.client.ReadCtx(ctx, apiPath)
+	if err != nil {
+		return rev, size, resourceID, nil, resourceID != ""
+	}
+	return rev, size, resourceID, body, true
 }
 
 // maybeRebaseGrownPayloadAgainstRemote reconstructs the #896 growth rebase
