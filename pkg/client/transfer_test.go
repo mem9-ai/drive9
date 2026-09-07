@@ -1659,6 +1659,7 @@ func TestReadStreamRangeFirstHop206BadContentRange(t *testing.T) {
 		{name: "complete-before-end", contentRange: "bytes 5-8/4"},
 		{name: "negative-complete", contentRange: "bytes 5-8/-1"},
 		{name: "wider-than-requested", contentRange: "bytes 5-100/200"},
+		{name: "signed-fields", contentRange: "bytes +5-+8/+64"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1730,6 +1731,37 @@ func TestReadStreamRangeFirstHopBoundedTransfer(t *testing.T) {
 	}
 	if got := wrote.Load(); got != 2*length {
 		t.Fatalf("server wrote %d bytes, want exactly %d", got, 2*length)
+	}
+}
+
+func TestReadStreamRangeFirstHop206ShorterDeclaredRange(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs/wal" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Range"); got != "bytes=5-8" {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		// The response declares only one byte but streams four: the client
+		// must expose only the declared byte.
+		w.Header().Set("Content-Range", "bytes 5-5/64")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("old!"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	rc, err := c.ReadStreamRange(context.Background(), "/wal", 5, 4)
+	if err != nil {
+		t.Fatalf("ReadStreamRange: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	data, _ := io.ReadAll(rc)
+	if string(data) != "o" {
+		t.Fatalf("got %q, want exactly the one declared byte %q", data, "o")
 	}
 }
 
