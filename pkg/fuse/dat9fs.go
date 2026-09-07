@@ -11736,6 +11736,42 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		bytesRead = n
 		return gofuse.ReadResultData(data), gofuse.OK
 	}
+	// Post-Fsync rebaseline leaves Dirty != nil with LoadPart. Large unlinks
+	// pin UnlinkedShadowGen instead of UnlinkedData; serve that private
+	// backing before falling through to a remote GET of the deleted path.
+	if fh.Unlinked && fh.UnlinkedShadowGen != 0 {
+		offset := int64(input.Offset)
+		unlinkedSize := fh.UnlinkedSize
+		gen := fh.UnlinkedShadowGen
+		if offset >= unlinkedSize {
+			fh.Unlock()
+			source = "unlinked-shadow-eof"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+		end := offset + int64(input.Size)
+		if end > unlinkedSize {
+			end = unlinkedSize
+		}
+		fh.Unlock()
+		if fs.shadowStore == nil {
+			source = "unlinked-shadow-missing-store"
+			return nil, gofuse.EIO
+		}
+		result := make([]byte, end-offset)
+		n, err := fs.shadowStore.ReadAtGen(gen, offset, result)
+		if err != nil && (!errors.Is(err, io.EOF) || n != len(result)) {
+			source = "unlinked-shadow-error"
+			return nil, gofuse.EIO
+		}
+		if n != len(result) {
+			source = "unlinked-shadow-short"
+			return nil, gofuse.EIO
+		}
+		source = "unlinked-shadow"
+		bytesRead = n
+		return gofuse.ReadResultData(result), gofuse.OK
+	}
 	fs.refreshCleanCommittedRevisionForHandleLocked(fh)
 
 	if fh.ShadowSpill && fs.shadowStore != nil && fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.Dirty.Size() == 0 && !fh.Dirty.hasDirtyPartMarks() && !fh.ZeroBase && fh.Flags&syscall.O_TRUNC == 0 {

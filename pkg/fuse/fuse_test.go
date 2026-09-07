@@ -2788,6 +2788,17 @@ func TestShadowSpillFsyncUnlinkSameHandleWriteStaysLocal(t *testing.T) {
 	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
 		t.Fatalf("Unlink: %v", st)
 	}
+	readBuf := make([]byte, 16)
+	readResult, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Size: uint32(len(readBuf)),
+	}, readBuf)
+	if st != gofuse.OK {
+		t.Fatalf("Read after unlink before write: %v", st)
+	}
+	gotRead, _ := readResult.Bytes(readBuf)
+	if !bytes.Equal(gotRead, original[:16]) {
+		t.Fatalf("Read after unlink = %x, want committed prefix", gotRead)
+	}
 	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Offset: 8}, overlay); st != gofuse.OK {
 		t.Fatalf("write after unlink: %v", st)
 	}
@@ -2808,6 +2819,64 @@ func TestShadowSpillFsyncUnlinkSameHandleWriteStaysLocal(t *testing.T) {
 	}
 	if got := puts.Load(); got != 1 {
 		t.Fatalf("flush after unlink uploaded (puts=%d)", got)
+	}
+}
+
+func TestUnlinkedRemoteBackedDirtyReadUsesPinnedShadowGen(t *testing.T) {
+	const filePath = "/anon-large.bin"
+	data := bytes.Repeat([]byte{0x77}, 256)
+	store, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	if err := store.WriteFull(filePath, data, 1); err != nil {
+		t.Fatal(err)
+	}
+	gen := store.Pin(filePath)
+	store.Remove(filePath)
+
+	var remoteGets atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			remoteGets.Add(1)
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.shadowStore = store
+
+	wb := NewWriteBuffer(filePath, 1<<20, 64)
+	wb.totalSize = int64(len(data))
+	wb.remoteSize = int64(len(data))
+	wb.LoadPart = func(int) ([]byte, error) {
+		t.Error("LoadPart must not fetch the deleted path")
+		return nil, fmt.Errorf("deleted")
+	}
+	fh := &FileHandle{
+		Path: filePath, Dirty: wb, DirtySeq: 0,
+		Unlinked: true, UnlinkedSnapshot: true,
+		UnlinkedShadowGen: gen, UnlinkedSize: int64(len(data)),
+	}
+	fhID := fs.allocateFileHandle(fh)
+
+	buf := make([]byte, 32)
+	result, st := fs.Read(nil, &gofuse.ReadIn{Fh: fhID, Size: uint32(len(buf))}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read after unlink before write: %v", st)
+	}
+	got, _ := result.Bytes(buf)
+	if !bytes.Equal(got, data[:32]) {
+		t.Fatalf("Read = %x, want pinned shadow prefix", got)
+	}
+	if remoteGets.Load() != 0 {
+		t.Fatalf("Read hit remote GET %d times after unlink", remoteGets.Load())
 	}
 }
 
