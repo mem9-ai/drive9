@@ -1604,9 +1604,10 @@ func (c *Client) sliceBody(rc io.ReadCloser, offset, length int64) (io.ReadClose
 
 // validatePartialContentRange checks that a first-hop 206 response carries a
 // well-formed Content-Range starting at the requested offset and not extending
-// past the requested end. It returns the declared response end so the caller
-// can bound the body to the declared range. A server-clamped end (EOF) is
-// allowed.
+// past the requested end. Byte positions and the complete length must be
+// strict decimal digits, with `*` allowed for the complete length. It returns
+// the declared response end so the caller can bound the body to the declared
+// range. A server-clamped end (EOF) is allowed.
 func validatePartialContentRange(resp *http.Response, offset, requestedEnd int64) (int64, error) {
 	contentRange := resp.Header.Get("Content-Range")
 	if contentRange == "" {
@@ -1622,14 +1623,17 @@ func validatePartialContentRange(resp *http.Response, offset, requestedEnd int64
 	}
 	completeSize := int64(-1)
 	if complete != "*" {
+		if !isDecimalDigits(complete) {
+			return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+		}
 		var err error
 		completeSize, err = strconv.ParseInt(complete, 10, 64)
-		if err != nil || completeSize < 0 {
+		if err != nil {
 			return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
 		}
 	}
 	startStr, endStr, ok := strings.Cut(byteRange, "-")
-	if !ok || startStr == "" || endStr == "" {
+	if !ok || !isDecimalDigits(startStr) || !isDecimalDigits(endStr) {
 		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
 	}
 	start, err := strconv.ParseInt(startStr, 10, 64)
@@ -1650,6 +1654,21 @@ func validatePartialContentRange(resp *http.Response, offset, requestedEnd int64
 		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
 	}
 	return end, nil
+}
+
+// isDecimalDigits reports whether s is a non-empty sequence of ASCII digits.
+// HTTP byte-range positions and complete lengths are digit sequences; signed
+// values are not valid.
+func isDecimalDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 type limitedReadCloser struct {
