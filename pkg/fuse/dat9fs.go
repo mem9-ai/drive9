@@ -7375,9 +7375,9 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 	snapshotOK := false
 	var snapshot []byte
 	snapshotShadowGen := uint64(0)
+	snapshotNeedCount := 0
 	if snapshotRemote {
 		needsSnapshot := false
-		snapshotNeedCount := 0
 		for _, fh := range handles {
 			if fh == nil {
 				continue
@@ -7428,6 +7428,7 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		}
 	}
 
+	attachedSnapshotPins := 0
 	for _, fh := range handles {
 		if fh == nil {
 			continue
@@ -7449,6 +7450,9 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 				}
 			} else if snapshotOK && remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh) {
 				attachUnlinkedSnapshotLocked(fh, snapshot, snapshotShadowGen, size)
+				if snapshotShadowGen != 0 && fh.UnlinkedShadowGen == snapshotShadowGen {
+					attachedSnapshotPins++
+				}
 			}
 		} else if snapshotOK {
 			if snapshotShadowGen != 0 && cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) {
@@ -7456,6 +7460,7 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 				fh.UnlinkedSnapshot = true
 				fh.UnlinkedShadowGen = snapshotShadowGen
 				fh.UnlinkedSize = size
+				attachedSnapshotPins++
 			} else {
 				fh.UnlinkedData = append(fh.UnlinkedData[:0], snapshot...)
 				fh.UnlinkedSnapshot = true
@@ -7465,6 +7470,11 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 			fh.UnlinkedSize = size
 		}
 		fh.Unlock()
+	}
+	if snapshotShadowGen != 0 && fs.shadowStore != nil && attachedSnapshotPins < snapshotNeedCount {
+		for i := attachedSnapshotPins; i < snapshotNeedCount; i++ {
+			fs.shadowStore.Unpin(snapshotShadowGen)
+		}
 	}
 	fs.openHandles.UnlinkPath(p)
 	return handles, true, nil
@@ -7485,10 +7495,12 @@ func cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
 // committed pathname via LoadPart. Unlink must snapshot that object before
 // DELETE, or a later same-FD write GETs the deleted path and returns EIO.
 func remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
+	// Attach even if a concurrent write dirtied the buffer during the
+	// snapshot GET: unloaded parts still depend on the committed pathname,
+	// and LoadPart/Read must use the private backing after DELETE. Dirty
+	// overlays stay in fh.Dirty and are preferred by Read when present.
 	return fh != nil &&
 		fh.Dirty != nil &&
-		!fh.Dirty.HasDirtyParts() &&
-		fh.DirtySeq == 0 &&
 		fh.Dirty.LoadPart != nil &&
 		fh.Dirty.remoteSize > 0 &&
 		!fh.ShadowSpill &&
@@ -11730,16 +11742,21 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		bytesRead = n
 		return gofuse.ReadResultData(data[:n]), gofuse.OK
 	}
-	if data, n, ok := readUnlinkedData(fh, int64(input.Offset), input.Size); ok {
-		fh.Unlock()
-		source = "unlinked-snapshot"
-		bytesRead = n
-		return gofuse.ReadResultData(data), gofuse.OK
+	preferDirtyOverlay := fh.Dirty != nil && fh.Dirty.HasDirtyParts()
+	if !preferDirtyOverlay {
+		if data, n, ok := readUnlinkedData(fh, int64(input.Offset), input.Size); ok {
+			fh.Unlock()
+			source = "unlinked-snapshot"
+			bytesRead = n
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
 	}
 	// Post-Fsync rebaseline leaves Dirty != nil with LoadPart. Large unlinks
 	// pin UnlinkedShadowGen instead of UnlinkedData; serve that private
 	// backing before falling through to a remote GET of the deleted path.
-	if fh.Unlinked && fh.UnlinkedShadowGen != 0 {
+	// Skip when Dirty already has an overlay so concurrent unlink-window
+	// writes remain visible.
+	if !preferDirtyOverlay && fh.Unlinked && fh.UnlinkedShadowGen != 0 {
 		offset := int64(input.Offset)
 		unlinkedSize := fh.UnlinkedSize
 		gen := fh.UnlinkedShadowGen

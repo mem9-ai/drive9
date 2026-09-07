@@ -2880,6 +2880,119 @@ func TestUnlinkedRemoteBackedDirtyReadUsesPinnedShadowGen(t *testing.T) {
 	}
 }
 
+func TestUnlinkSnapshotConcurrentWriteKeepsOverlayAndBaseline(t *testing.T) {
+	const filePath = "/spill-unlink-race.bin"
+	const partSize int64 = 64
+	original := bytes.Repeat([]byte{0x88}, int(3*partSize))
+	overlay := []byte{0xAA, 0xBB}
+
+	var mu sync.Mutex
+	var committed []byte
+	var puts atomic.Int32
+	var fileGets atomic.Int32
+	snapshotStarted := make(chan struct{})
+	snapshotRelease := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+		case r.Method == http.MethodGet:
+			mu.Lock()
+			body := append([]byte(nil), committed...)
+			mu.Unlock()
+			if len(body) == 0 {
+				http.NotFound(w, r)
+				return
+			}
+			if fileGets.Add(1) == 1 {
+				close(snapshotStarted)
+				<-snapshotRelease
+			}
+			_, _ = w.Write(body)
+		case r.Method == http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			puts.Add(1)
+			mu.Lock()
+			committed = append([]byte(nil), body...)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": 1})
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			committed = nil
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	fs, fhID, nodeID, _ := newStrictSmallPartSpillFS(t, ts.URL, filePath, partSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}, original); st != gofuse.OK {
+		t.Fatalf("seed Write: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("Fsync: %v", st)
+	}
+
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/"))
+	}()
+	select {
+	case <-snapshotStarted:
+	case st := <-unlinkDone:
+		t.Fatalf("Unlink finished before snapshot GET: %v", st)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for unlink snapshot GET")
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Offset: 8}, overlay); st != gofuse.OK {
+		close(snapshotRelease)
+		t.Fatalf("concurrent write during unlink snapshot: %v", st)
+	}
+	close(snapshotRelease)
+	st := <-unlinkDone
+	if st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+
+	prefixBuf := make([]byte, 16)
+	prefixResult, rst := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Size: uint32(len(prefixBuf)),
+	}, prefixBuf)
+	if rst != gofuse.OK {
+		t.Fatalf("Read overlay after unlink: %v", rst)
+	}
+	gotPrefix, _ := prefixResult.Bytes(prefixBuf)
+	wantPrefix := append(bytes.Repeat([]byte{0x88}, 8), overlay...)
+	wantPrefix = append(wantPrefix, bytes.Repeat([]byte{0x88}, 6)...)
+	if !bytes.Equal(gotPrefix, wantPrefix) {
+		t.Fatalf("overlay read = %x, want %x", gotPrefix, wantPrefix)
+	}
+
+	tailBuf := make([]byte, 16)
+	tailResult, rst := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Offset: uint64(2 * partSize), Size: uint32(len(tailBuf)),
+	}, tailBuf)
+	if rst != gofuse.OK {
+		t.Fatalf("Read untouched part after unlink: %v", rst)
+	}
+	gotTail, _ := tailResult.Bytes(tailBuf)
+	if !bytes.Equal(gotTail, original[2*partSize:2*partSize+16]) {
+		t.Fatalf("untouched part = %x, want baseline", gotTail)
+	}
+	if puts.Load() != 1 {
+		t.Fatalf("concurrent unlink/write resurrected path (puts=%d)", puts.Load())
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+	if puts.Load() != 1 {
+		t.Fatalf("Release/Flush uploaded after unlink (puts=%d)", puts.Load())
+	}
+}
+
 func TestWriteBuffer_ResetSequentialState(t *testing.T) {
 	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
 	wb.sequential = true
