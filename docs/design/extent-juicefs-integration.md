@@ -1,7 +1,8 @@
 ---
-title: Extent Content Layout via Embedded JuiceFS Data Plane
+title: Extent Content Layout via Embedded JuiceFS Data Plane and Meta
 status: proposal
 date: 2026-09-07
+revision: 2026-09-07 r2 (JuiceFS meta is SoT for extent names/inodes; file_nodes is a same-txn projection)
 ---
 
 ## 1. Background and problem statement
@@ -39,34 +40,55 @@ cutover point where JuiceFS-like integration is the better path."
 ## 2. Proposal
 
 Embed JuiceFS community edition (Apache-2.0) as a library, and give
-`content_layout=extent` files the complete JuiceFS **data plane**:
+`content_layout=extent` files the complete JuiceFS **data plane and meta
+model** (not only slices):
 
 - reuse `pkg/chunk` (block layout, chunk store, disk cache/writeback),
-- reuse `pkg/vfs` `DataReader` / `DataWriter` (the write-buffering, slice-freeze,
-  flush, and read path semantics that are the defect-prone part of the current
-  reimplementation),
+- reuse `pkg/vfs` `DataReader` / `DataWriter` (write-buffering, slice-freeze,
+  flush, read; the defect-prone part of the current reimplementation),
 - implement `pkg/meta`'s `Meta` interface as an HTTP client of a new
-  drive9-server meta API, backed by tenant TiDB transactions,
+  drive9-server meta API, backed by tenant TiDB transactions — including
+  **Create / Unlink / Lookup / Rename / Open / Close / Flock / Setlk**, not
+  only `Read`/`Write` of slices,
 - replace per-object presigned URLs with **tenant-prefix-scoped, auto-refreshing
   data credentials**; the client talks to S3 directly for extent blocks.
 
-The namespace (dentries, rename, permissions, locks, xattrs, search/tags) stays
-entirely in the existing drive9 path-based model. `extent` describes how a
-file's bytes are organized, not where its name lives.
+**Source of truth for an extent file's name, nlink, inode, length, and slices
+is JuiceFS meta** (server-side tables + one RPC per Meta op). drive9
+`file_nodes` is a **projection written in the same TiDB transaction**, so
+`ls`, `rm -r`, search, tags, and the HTTP API still see the file. The FUSE
+client never dual-writes; `Meta.Create` / `Meta.Unlink` are each a single
+RPC whose server handler updates both trees atomically.
+
+Directories are not extent objects. Parent dirs of extent files are
+**lazily mirrored** into JuiceFS as dir inodes so `Meta.Create(parent, name)`
+has a parent (see §4.2). `ls` of a directory still reads drive9 `file_nodes`.
+
+This is **not** Pattern B (the whole drive9 namespace lives only in JuiceFS
+meta). Pattern B would hide extent files from search/tags/layers and fights
+directory rename (drive9 subtree `UPDATE` vs JuiceFS single edge). The
+projection exists so the drive9 tree can *point at* JuiceFS inodes.
 
 ### Non-goals
 
-1. Mapping drive9's whole namespace onto JuiceFS meta ("Pattern B"). It would
-   make extent files invisible to drive9 search/tags/layers, cannot represent
-   cross-layout renames, and fights the dentry model (drive9 directory rename
-   is a subtree `UPDATE`; JuiceFS is a single edge insert).
-2. Importing JuiceFS's own FUSE frontend (`pkg/fuse` in juicefs). drive9 keeps
-   `Dat9FS`.
-3. Client-side-encrypted extent blocks. Server-side compaction/GC requires the
-   server to read block bytes (see §6.4); this is a recorded constraint, not a
+1. Pattern B: replacing drive9 `file_nodes` with JuiceFS `edge` as the only
+   namespace. Extent files must remain visible to `ls` / `rm -r` / search /
+   tags / the HTTP API; that is what the same-txn projection is for.
+2. FUSE doing two HTTP calls (Meta.Create then InsertNode, or DELETE then
+   CreateFileWithLayout). That is the journal `create_conflict` / `--wait all`
+   failure mode of the first attempt.
+3. Importing JuiceFS's own FUSE frontend (`pkg/fuse` in juicefs). drive9 keeps
+   `Dat9FS` as the kernel frontend and routes extent files to DataWriter/Reader
+   after Meta.Create returns an `extent_ino`.
+4. Client-side-encrypted extent blocks. Server-side compaction/GC requires the
+   server to read block bytes (see §6); this is a recorded constraint, not a
    regression versus the current presign+SSE model.
-4. Multi-machine concurrent writers on one extent file beyond JuiceFS's
+5. Multi-machine concurrent writers on one extent file beyond JuiceFS's
    close-to-open semantics.
+6. Layer/fork copy-on-write of extent inodes in v1. Layers keep path whiteouts
+   on the projection; writing extent files inside a layer is out of scope until
+   a follow-up (COW a new `extent_ino` or bind the layer to a meta session).
+   The `coding-agent-extent` sqlite gate does not use layers.
 
 ## 3. Verified constraints that shape the design
 
@@ -83,9 +105,11 @@ These were checked against juicefs main (`pkg/meta/interface.go`,
 2. **No go-fuse conflict.** `pkg/vfs`, `pkg/chunk`, `pkg/meta` do not import
    go-fuse (verified import lists). Only juicefs's `pkg/fuse` does, and we do
    not import it.
-3. **Data-plane-only reuse is supported upstream.** `vfs.NewDataReader(conf, m,
+3. **DataReader/DataWriter are usable without JuiceFS FUSE.** `vfs.NewDataReader(conf, m,
    store)` and `vfs.NewDataWriter(conf, m, store, reader)` are exported
    constructors; juicefs's own `pkg/fs` SDK frontend consumes them directly.
+   Name ops still go through `meta.Meta` (Create/Unlink), not through Dat9FS
+   HTTP.
 4. **Compaction and block deletion are client-callback driven upstream.**
    `Meta.Write`/`Read` trigger `compactChunk` when a chunk's slice count
    crosses thresholds; cleanup goroutines push deleted slices to a local
@@ -93,7 +117,7 @@ These were checked against juicefs main (`pkg/meta/interface.go`,
    (`OnMsg(CompactChunk/DeleteSlice)`) to the *same process's* chunk store.
    Cross-client coordination uses meta-store locks/counters, not messages. With
    the engine behind HTTP, we replace this push model with server-side GC and
-   a pull-based compact task queue (§5.4), so the meta driver's `OnMsg` is a
+   a pull-based compact task queue (§4.6), so the meta driver's `OnMsg` is a
    no-op.
 5. **Dependency cost is trimmable but real.** juicefs is a single Go module
    that by default compiles every object-store SDK and meta engine
@@ -107,26 +131,30 @@ These were checked against juicefs main (`pkg/meta/interface.go`,
 7. **Tenant credential scoping is strictly stronger than upstream.** Stock
    juicefs stores full-bucket credentials in the volume `Format` and hands them
    to every mount. We issue prefix-scoped, short-lived credentials instead
-   (§5.3).
+   (§4.4).
 
 ## 4. Architecture
 
 ```
-kernel FUSE ──> Dat9FS (unchanged frontend)
+kernel FUSE ──> Dat9FS (frontend kept)
                   │  profile [extent] glob at create; ContentLayout from stat
-                  ├─ single / append_log files → existing writeback/shadow path
-                  └─ extent files ──> vfs.DataWriter / vfs.DataReader
-                                          │
-                            ┌─────────────┴───────────────┐
-                      meta.Meta "drive9" driver      chunk.ChunkStore
-                      (in mem9-ai/juicefs fork;            │
-                       thin HTTP client + retry)    object.ObjectStorage
-                            │                        "drive9s3": tenant-scoped
-                            ▼                         creds, auto-refresh
-                    drive9-server meta API                   │
-                    (TiDB txns: slices, slice-id             ▼
-                     counter, sessions, length/       S3  t/<tenant>/chunks/...
-                     mtime, compact tasks, GC queues)
+                  ├─ single / append_log / dir → existing drive9 paths
+                  └─ extent files
+                        │
+                        ├─ Create/Unlink/Lookup/Rename/Flock
+                        │     → meta.Meta "drive9" driver (one RPC)
+                        └─ Read/Write/Flush/Fsync/Truncate
+                              → vfs.DataWriter / vfs.DataReader
+                                        │
+                          ┌─────────────┴───────────────┐
+                    meta.Meta HTTP client         chunk.ChunkStore
+                    (mem9-ai/juicefs fork)               │
+                          │                       object.ObjectStorage
+                          ▼                       "drive9s3" STS, auto-refresh
+                  drive9-server meta API                  │
+                  ONE TiDB txn:                           ▼
+                    JuiceFS node+edge+chunk        S3  t/<tenant>/chunks/...
+                    + file_nodes projection
 ```
 
 ### 4.1 Routing (existing, kept)
@@ -139,22 +167,92 @@ kernel FUSE ──> Dat9FS (unchanged frontend)
 - `pkg/datastore/layout.go` constants already match JuiceFS (64MiB chunk,
   4MiB max block) and stay.
 
-### 4.2 Client data plane (replaces `pkg/fuse/extent_{writer,read,staging,compact}.go`)
+### 4.2 Extent names: JuiceFS meta is SoT, `file_nodes` is a same-txn projection
 
-- On Open of an extent file, Dat9FS binds a `vfs.DataReader`/`DataWriter` pair
-  keyed by the drive9 inode mapped to a `meta.Ino` (server allocates a uint64
-  extent-inode number at create; see §5.2).
-- Write/Flush/Fsync/Truncate delegate to the DataWriter; Read delegates to the
-  DataReader. Kernel-cache policy stays drive9's (existing bypass/SSE
-  invalidation wiring), with `reader.Invalidate` hooked to SSE events.
+Dat9FS does **not** call `CreateFileWithLayout` or HTTP DELETE for extent
+files. Create/Unlink/Lookup of an extent name go through the meta driver,
+matching JuiceFS `VFS.Create = Meta.Create` then `newFileHandle` and
+`VFS.Unlink = Meta.Unlink` (name/nlink only).
+
+The server handler for each of those RPCs updates **both** the JuiceFS tables
+and the drive9 projection in **one tenant TiDB transaction**. Duplicate is
+allowed; dual HTTP from FUSE is not.
+
+| Question | Source of truth | Projection (`file_nodes`) |
+| --- | --- | --- |
+| Is this path an extent file? | JuiceFS `edge` + `node` | row: `path`, `content_layout=extent`, `extent_ino` |
+| nlink, open-unlinked, length, slices | JuiceFS `node` + chunk blob | optional denormalized size/mtime for `ls -l` / search, updated in the same `Write`/`Truncate` txn |
+| Directory listing | — | `ls` / `readdir` read `file_nodes` only (no JuiceFS Readdir on the hot path) |
+| search / tags / HTTP API | — | continue to key on `file_nodes.path` |
+
+**Parent directories.** JuiceFS `Meta.Create(parent, name)` needs a parent dir
+inode. Directories are not extent files.
+
+- **Lazy mirror (mixed profile, e.g. only `*.db`):** on first extent create
+  under `/foo/bar.db`, the server ensures JuiceFS dir inodes for `/` and
+  `/foo/` exist, then `Create(foo_ino, "bar.db")` and inserts the projection.
+- **Full mirror (`coding-agent-extent` with `ExtentPaths: *`):** every regular
+  file on that mount is extent; the JuiceFS dir tree is 1:1 with drive9
+  directories. This is the sqlite product gate. Projection still exists so
+  `ls` / `rm -r` / search do not change entry points.
+
+`ls /foo/` always reads drive9 `file_nodes`. JuiceFS Readdir is not used for
+user-visible listings.
+
+**Create** (one RPC, one txn), JuiceFS order:
+
+1. allocate tenant-unique `extent_ino` (uint64);
+2. insert JuiceFS `node` + `edge(parent, name)`;
+3. insert `file_nodes(path, layout=extent, extent_ino, …)`;
+4. commit.
+
+The client then `DataWriter.Open(extent_ino, 0)`. Failure rolls the whole txn
+back. A sqlite `.db-journal` create is this RPC, not a local-first handle
+that later `CreateFileWithLayout`s.
+
+**Unlink** (one RPC, one txn), JuiceFS order:
+
+1. delete `edge`, `nlink--`;
+2. delete (or tombstone) the `file_nodes` row so `ls` no longer sees the name.
+
+If `nlink > 0` or a session still holds the inode, the JuiceFS node remains
+(open-unlinked / hard link). The projection is already gone so `ls` is clean.
+A subsequent Create of the same name allocates a **new** `extent_ino` — it
+must not Stat the leftover path. That is the journal `unlink` then `create`
+sequence community.sqlite needs.
+
+**`rm -r`:** drive9 walks the projection; each `layout=extent` child is the
+same Unlink RPC; empty directories are still drive9 `DeleteEmptyDir`.
+
+**Rename file:** one txn: JuiceFS `Rename` (edge) + `file_nodes.path` update.
+
+**Rename directory:** drive9 keeps subtree `UPDATE path` on the projection;
+if the directory was lazily/fully mirrored, JuiceFS renames that one dir
+edge. Children in JuiceFS are relative names and do not need per-file updates.
+
+**POSIX locks** on extent files (`Flock` / `Setlk`) go through the meta
+driver — sqlite needs them on the inode. chmod/chown/xattr stay on the
+drive9 inode/projection so the existing HTTP API does not fork.
+
+**Layers.** v1: layer whiteouts apply to the projection only. JuiceFS inodes
+on the main view are unchanged. Writing extent files inside a layer is a
+follow-up (COW a new `extent_ino`). Not required for `coding-agent-extent`
+sqlite.
+
+### 4.3 Client data plane (replaces `pkg/fuse/extent_{writer,read,staging,compact}.go`)
+
+- After Meta.Create (or Lookup of an existing extent projection), Dat9FS
+  binds a `vfs.DataReader`/`DataWriter` pair keyed by `extent_ino`.
+- Write/Flush/Fsync/Truncate delegate to the DataWriter; Read to the
+  DataReader. Kernel-cache policy stays drive9's (bypass/SSE), with
+  `reader.Invalidate` hooked to SSE events.
 - The per-handle bespoke writer, zero-from tracking, hole punching, staging
   replay, and client-side compact loop are deleted. Crash durability comes from
   the chunk store's writeback cache dir (integrated with drive9's existing
   cache-dir and quota management).
-- Locks, xattrs, chmod, rename remain on the existing drive9 paths — the
-  DataWriter never sees them.
+- DataWriter never sees dentries. Name ops are §4.2.
 
-### 4.3 Object storage and credentials
+### 4.4 Object storage and credentials
 
 - Block keys move from the global `blocks/<fileID>/<ulid>` namespace to a
   tenant-isolated JuiceFS layout: `t/<tenantID>/chunks/<id/1e6>/<id/1e3>/<id>_<idx>_<len>`
@@ -175,33 +273,43 @@ kernel FUSE ──> Dat9FS (unchanged frontend)
   the `prepare-blocks`/`pending_blocks` protocol. JuiceFS semantics are "data
   lands in S3 first, then `Meta.Write` records the slice", so no per-block
   server authorization is needed; orphaned blocks from crashed writes are
-  reclaimed by the pending-slice scanner (§5.4).
+  reclaimed by the pending-slice scanner (§4.6).
 
-### 4.4 Meta API on drive9-server
+### 4.5 Meta API on drive9-server
 
 The fork's `drive9` meta driver is a thin, stateless HTTP client. All
 consistency logic lives server-side in TiDB transactions against the tenant
-schema. Minimal operation set (everything else in the `Meta` interface returns
-ENOSYS initially):
+schema. Each name op is **one RPC**; the handler writes JuiceFS tables and the
+`file_nodes` projection together (see §4.2). Everything else in the `Meta`
+interface returns ENOSYS initially.
 
 | Group | Operations | Notes |
 | --- | --- | --- |
 | Session | `NewSession`, `CloseSession`, `FlushSession`/heartbeat | session table; stale-session sweep releases sustained files |
+| Namespace | `Lookup`, `Create`, `Unlink`, `Rename`, `Mkdir` (lazy parent only) | same txn as `file_nodes` projection; Create allocates `extent_ino` |
 | IDs | `NewSlice` (batch, e.g. 4096) | global uint64 counter per tenant |
-| Data | `Read` (slices for chunk), `Write` (append slice **and** update length/mtime/space in one txn), `Truncate` | mirrors `WriteSliceTx` semantics; Write response carries the chunk's slice count as a compact hint |
-| Handles | `Open`, `Close` | sustained-delete: unlinked-but-open files are GC'd only after last close (fixes today's open-unlinked gap) |
-| Attr | `GetAttr`, `SetAttr`, `Access`, `StatFS` | backed by existing inode/contents rows |
+| Data | `Read` (slices for chunk), `Write` (append slice **and** update length/mtime/space **and** projection size/mtime in one txn), `Truncate` | mirrors JuiceFS `Meta.Write`; response carries chunk slice count as a compact hint; keep this RPC thin (no extra blob-count SELECT on the CONCAT path) |
+| Handles | `Open`, `Close` | sustained-delete: unlinked-but-open files are GC'd only after last close |
+| Locks | `Flock`, `Getlk`, `Setlk` | posix/flock on the extent inode (sqlite); not the drive9 path lock table |
+| Attr | `GetAttr`, `SetAttr`, `Access`, `StatFS` | JuiceFS `node` is SoT for length/mtime/nlink; projection denormalized in the same txn |
 | Compaction | `Compact` (CAS with origin slice list) | called by whoever executes a compact task |
 | Driver glue | `Init`, `Load`, `GetFormat`, `Name`, `Shutdown`, `OnMsg` (no-op), `OnReload` | `Format` persisted per tenant by drive9-server |
+
+`Meta.Write` / `NewSlice` stay on the DataWriter freeze path (one HTTP per
+committed slice after a batched `NewSlice`). That is acceptable for 4MiB
+slices; it is **not** a substitute for putting Create/Unlink in this API.
+Journal create/unlink must not go through Dat9FS `CreateFileWithLayout` /
+HTTP DELETE.
 
 Schema work aligns the existing extent tables to JuiceFS semantics rather than
 inventing new ones: `file_chunks` stays a per-chunk append-only slice blob but
 addressed by `(extent_ino, chunk)` with global uint64 slice ids;
 `file_slice_refs` becomes the block reference table feeding GC; new small
-tables: `extent_sessions`, `extent_meta_counters`, and the compact task queue
-(`slice_compact_tasks` reworked).
+tables: `extent_sessions`, `extent_meta_counters`, JuiceFS-style `node`/`edge`
+(or equivalent), and the compact task queue (`slice_compact_tasks` reworked).
+`file_nodes` gains `extent_ino` (nullable) for the projection.
 
-### 4.5 Garbage collection and compaction without OnMsg
+### 4.6 Garbage collection and compaction without OnMsg
 
 - **Block GC is server-side** (`block_gc_tasks` + `extent_worker` pattern kept):
   deleting blocks is `DeleteObject` calls with zero data movement. Slices are
@@ -224,7 +332,7 @@ tables: `extent_sessions`, `extent_meta_counters`, and the compact task queue
   the default and the fallback is throttled. Metrics: compact count, CAS-fail
   rate, bytes moved (extending `drive9_extent_put_bytes_total`).
 
-### 4.6 Multi-client coherence
+### 4.7 Multi-client coherence
 
 JuiceFS gives close-to-open consistency: slice lists are read from meta at
 open/read time; attr/slice caches are bounded by TTL. drive9 keeps its existing
@@ -248,12 +356,18 @@ Survives / is reworked:
 
 - profile `[extent]` routing and `X-Dat9-Content-Layout` plumbing
 - `pkg/datastore/layout.go` constants and `content_layout` columns
+- `file_nodes` as the **projection** (new `extent_ino` column); `ls` / `rm -r`
+  / search still enter here
 - `file_chunks` / `file_slice_refs` tables (reworked to slice-id addressing)
 - `block_gc_tasks` / `slice_compact_tasks` queues and `extent_worker.go`
   (reworked into GC + compact execution)
 - the extent e2e gates (§8), re-pointed at the new path
 - the 96 extent FUSE unit tests are triaged: behaviors now owned by JuiceFS
-  drop to upstream coverage; drive9-specific glue keeps targeted tests
+  drop to upstream coverage; drive9-specific glue (projection txn, routing,
+  STS refresh) keeps targeted tests
+
+Dat9FS Create/Unlink of extent names stop calling `CreateFileWithLayout` /
+HTTP DELETE; they call the meta driver.
 
 ## 6. Risks and mitigations
 
@@ -261,7 +375,8 @@ Survives / is reworked:
    Mitigation: pin upstream tags, rebase quarterly, keep the delta to one
    package; same workflow as the existing go-fuse fork.
 2. **The HTTP meta driver is new consistency-sensitive code.** Mitigation: it
-   is a thin stateless stub (~12 meaningful methods); server handlers are TiDB
+   is a thin stateless stub (~20 meaningful methods including namespace);
+   server handlers are TiDB
    transactions; behavior is tested against juicefs's own SQL-engine semantics
    as the reference.
 3. **Dependency/toolchain cost.** juicefs go.mod requires `go 1.25.10`; the
@@ -274,8 +389,20 @@ Survives / is reworked:
 5. **DataWriter/DataReader used outside a full `vfs.VFS`** — the precise
    attr-length handoff and invalidation contract is the top spike risk.
    Mitigation: Phase 0 acceptance harness (§7); fallback is embedding the whole
-   `vfs.VFS` for extent files (still with the data-plane-only meta driver).
-6. **Record-locked constraint:** extent blocks must remain server-readable
+   `vfs.VFS` for extent files (still with the drive9 meta driver).
+6. **Meta HTTP is still on the Create/Unlink/Write path.** JuiceFS SQL is
+   microseconds; one RPC is milliseconds. Mitigation: one RPC per name op
+   (never two); batched `NewSlice`; thin `Write` (no extra SELECTs); Phase 0
+   must include a delayed-mock-HTTP harness so we learn whether journal
+   `--wait all` needs further batching before Phase 2.
+7. **Same-txn dual tables.** A bug that commits JuiceFS `edge` without
+   `file_nodes` (or the reverse) makes `ls` and sqlite disagree.
+   Mitigation: one stored transaction; integration tests that kill the
+   handler between the two inserts must still roll back; a repair job for
+   orphans is a belt, not the protocol.
+8. **Layers vs JuiceFS nlink.** v1 whiteouts touch only the projection
+   (§4.2). Do not pretend layer-extent writes work until COW inodes exist.
+9. **Record-locked constraint:** extent blocks must remain server-readable
    (SSE or none); client-side encryption of extent blocks is out of scope.
 
 ## 7. Execution plan
@@ -283,35 +410,47 @@ Survives / is reworked:
 ### Phase 0 — spike (~1 week; gates the whole effort)
 
 1. Fork `juicedata/juicefs` → `mem9-ai/juicefs`; add `pkg/meta` `drive9`
-   driver skeleton implementing the §4.4 subset against a mock server.
+   driver skeleton implementing the §4.5 subset against a mock server.
 2. drive9 `go.mod` replace + `no*` build tags; verify build, toolchain bump,
    binary-size delta.
 3. Standalone harness: DataWriter → mock meta → local-disk ObjectStorage →
    DataReader, under random writes, overwrites, ftruncate, and reopen.
-   **Acceptance: DataWriter/DataReader are usable without a full vfs.VFS, with
-   a documented attr/length/invalidation contract.**
+   **Acceptance:**
+   - DataWriter/DataReader are usable without a full vfs.VFS, with a
+     documented attr/length/invalidation contract (Open length, Flush vs
+     next Read, GetAttr trusts writer length).
+   - Small-I/O: 1KiB overwrite × N + fsync + reopen same inode and read
+     back (sqlite-shaped, not only large random writes).
+   - The same harness with **injected 20–50ms Meta RPC delay**. If
+     sqlite-shaped `--wait all` (two writers, ~1s remaining after a 5s
+     sleep) fails here, stop and change the RPC shape before Phase 1.
 
 ### Phase 1 — server (~2 weeks)
 
 4. `POST /v1/data-credential` with tenant-prefix scoping + refresh contract.
-5. Meta HTTP API (§4.4) on tenant TiDB; schema alignment; session sweep;
-   open-unlinked sustained GC.
+5. Meta HTTP API (§4.5) on tenant TiDB: **Create/Unlink/Lookup/Rename in the
+   same txn as the `file_nodes` projection**; schema alignment (`extent_ino`,
+   node/edge); session sweep; open-unlinked sustained GC.
 6. Compact task queue + CAS commit endpoint; server-side block GC rework.
+   Tests: crash between JuiceFS insert and projection insert still rolls
+   back; Unlink then Create of the same name yields a new `extent_ino`.
 
 ### Phase 2 — client (~2 weeks)
 
 7. `drive9s3` ObjectStorage with credential auto-refresh.
-8. Dat9FS rewiring: extent open → DataReader/DataWriter; delete the bespoke
-   writer/staging/read-plan/compact code and the prepare/commit endpoints;
-   SSE → `Invalidate` wiring.
+8. Dat9FS rewiring: extent **Create/Unlink/Lookup → meta driver**; Open →
+   DataReader/DataWriter; delete the bespoke writer/staging/read-plan/compact
+   code and the prepare/commit endpoints; SSE → `Invalidate` wiring.
 9. Compact executor in the mount process (lease-claim loop).
 
 ### Phase 3 — hardening (~2 weeks, overlapping rollout)
 
 10. Re-run the existing e2e gates on the new path: `fuse-sqlite-correctness.sh`
-    (the historical defect hotspot), `fuse-sqlite-commit-sequence.sh`, fio,
-    pjdfstest subset, `fuse-crash-recovery-test.sh`, plus a new dual-mount
-    coherence script.
+    (the historical defect hotspot), `fuse-sqlite-commit-sequence.sh`, Orb
+    `community.sqlite` under `FUSE_PROFILE=coding-agent-extent` (wal **and**
+    delete-journal mptest), fio, pjdfstest subset, `fuse-crash-recovery-test.sh`,
+    plus a new dual-mount coherence script. Confirm `ls`/`rm -r` see extent
+    files via the projection.
 11. Triage/delete the 96 extent unit tests; add reference-behavior tests for
     the meta driver and server txn handlers.
 12. Perf baseline versus the old extent path and versus `single` upload path;
@@ -323,7 +462,15 @@ Phase 0.
 ## 8. Acceptance criteria
 
 - `coding-agent-extent` profile passes the full FUSE e2e suite on the JuiceFS
-  data plane, including the sqlite WAL correctness and crash-recovery gates.
+  data plane **and** JuiceFS meta name ops, including sqlite WAL **and**
+  delete-journal gates (`mptest` wal-multiwrite **and** delete-multiwrite,
+  crash recovery). `ls` and `rm -r` on a tree that contains extent files
+  succeed via the projection.
+- Extent Create/Unlink are a single meta RPC each; the server commits JuiceFS
+  `node`/`edge` and `file_nodes` together. Unlink then Create of the same
+  path allocates a new `extent_ino` (no 409-Stat of the leftover file).
+  `CreateFileWithLayout` / per-path HTTP DELETE are gone from the extent
+  path.
 - No per-object presign on the extent path: extent block I/O uses only
   tenant-scoped credentials; `prepare-blocks`/`commit-slices`/`read-plan` are
   gone from the server router.
@@ -342,3 +489,6 @@ Phase 0.
   `pkg/backend/extent*.go`, `pkg/client/extent*.go`, `pkg/server/extent.go`,
   `pkg/fuse/extent*.go`, `cmd/drive9/cli/profile.go`,
   `pkg/tenant/schema/extent.go`, `TODO.md`.
+- Discussion: same-txn `file_nodes` projection vs Pattern B; journal
+  Create/Unlink must follow JuiceFS `Meta.Create`/`Meta.Unlink`, not
+  Dat9FS HTTP.
