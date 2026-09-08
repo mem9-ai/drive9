@@ -34,6 +34,11 @@ var testHookAfterSamePathDirtyHandleScan func(path string)
 // acquires the same-path remote commit fence.
 var testHookBeforeGVisorShadowSpillFlushFence func(path string)
 
+// testHookBeforeUnlinkedTransition lets tests run a same-FD Write+Fsync after
+// snapshot attach but before fh.Unlinked is set. Production keeps the
+// identity check, attach, and Unlinked transition under one fh.mu hold.
+var testHookBeforeUnlinkedTransition func()
+
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
 // operations to the dat9 HTTP API via the Go SDK client.
 type Dat9FS struct {
@@ -3116,6 +3121,7 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	}
 	fs.rebaselineCommittedDirtyBufferLocked(fh)
 	fs.removeHandleStagingLocked(fh)
+	clearPreinstalledUnlinkSnapshotLocked(fh)
 	fh.ShadowReady = false
 	fh.ShadowSpill = false
 	fh.ShadowCommitReady = false
@@ -3914,6 +3920,7 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 			fs.recordCommittedRevision(fh.Path, revision)
 		}
 		fs.refreshCommittedRevisionForOpenHandles(fh.Path, revision, fh)
+		clearPreinstalledUnlinkSnapshotLocked(fh)
 	} else {
 		// The flush succeeded, but it was unconditional, so the precise
 		// post-commit revision is unknown. Clear the cached revision instead of
@@ -5449,11 +5456,8 @@ func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath stri
 		}
 		inodeSize := fs.inodeSnapshotSize(fh.Ino)
 		inodeRevision := int64(0)
-		if fs.gvisorCompatibilityEnabled() {
-			entry, ok := fs.inodes.GetEntry(fh.Ino)
-			if ok && entry != nil {
-				inodeRevision = entry.Revision
-			}
+		if entry, ok := fs.inodes.GetEntry(fh.Ino); ok && entry != nil {
+			inodeRevision = entry.Revision
 		}
 		fh.Lock()
 		handlePath := fh.Path
@@ -5464,6 +5468,9 @@ func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath stri
 			continue
 		}
 		size, inodeRevision = fs.committedOpenHandleSnapshotState(fh.Ino, localPath, size, inodeRevision)
+		if _, identRev := fs.pathUnlinkedSnapshotIdentity(localPath); identRev > inodeRevision {
+			inodeRevision = identRev
+		}
 		candidates = append(candidates, candidate{fh: fh, size: size, revision: inodeRevision})
 	}
 	if len(candidates) == 0 {
@@ -5490,8 +5497,13 @@ func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath stri
 		inodeSize := fs.inodeSnapshotSize(cand.fh.Ino)
 		cand.fh.Lock()
 		_, eligible := unlinkSnapshotSizeLocked(cand.fh, inodeSize)
-		if cand.fh.Path == localPath && eligible {
+		if cand.fh.Path == localPath && eligible &&
+			!unlinkedSnapshotStaleLocked(cand.fh, cand.revision, cand.size) {
 			cand.fh.UnlinkedData = cloneBytes(data)
+			cand.fh.UnlinkedSnapshot = true
+			cand.fh.UnlinkedSize = int64(len(data))
+			cand.fh.UnlinkedSnapshotRev = cand.revision
+			cand.fh.UnlinkedSnapshotSize = cand.size
 			clearReadTargetForLockedHandle(cand.fh)
 		}
 		cand.fh.Unlock()
@@ -7362,122 +7374,189 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 	if len(handles) == 0 {
 		return nil, false, nil
 	}
-
-	var size int64
-	var revision int64
-	if ino, ok := fs.inodes.GetInode(p); ok {
-		if entry, ok := fs.inodes.GetEntry(ino); ok {
-			size = entry.Size
-			revision = entry.Revision
+	for _, fh := range handles {
+		if fh == nil {
+			continue
 		}
+		fh.Lock()
+		dropStalePreinstalledUnlinkSnapshotLocked(fh)
+		fh.Unlock()
 	}
+
+	size, revision := fs.pathUnlinkedSnapshotIdentity(p)
 
 	snapshotOK := false
 	var snapshot []byte
 	snapshotShadowGen := uint64(0)
 	snapshotNeedCount := 0
 	if snapshotRemote {
-		needsSnapshot := false
-		for _, fh := range handles {
-			if fh == nil {
+		const maxUnlinkedRemoteSnapshotAttempts = 3
+		var staleAfterFetch bool
+		for attempt := 0; attempt < maxUnlinkedRemoteSnapshotAttempts; attempt++ {
+			if snapshotShadowGen != 0 {
+				fs.discardUnlinkedSnapshotPins(snapshotShadowGen, snapshotNeedCount)
+				snapshotShadowGen = 0
+			}
+			snapshot = nil
+			snapshotOK = false
+			snapshotErr = nil
+			staleAfterFetch = false
+			size, revision = fs.pathUnlinkedSnapshotIdentity(p)
+			needsSnapshot := false
+			snapshotNeedCount = 0
+			for _, fh := range handles {
+				if fh == nil {
+					continue
+				}
+				fh.Lock()
+				if cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) ||
+					remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh) {
+					needsSnapshot = true
+					snapshotNeedCount++
+				}
+				fh.Unlock()
+			}
+			if needsSnapshot {
+				if size == 0 {
+					snapshotOK = true
+				} else if size <= maxPathTruncateInMemoryBytes {
+					readStart := fs.perfStart()
+					data, err := fs.client.ReadAtCtx(ctx, fs.remotePath(p), 0, size)
+					if err == nil && int64(len(data)) == size {
+						snapshot = data
+						snapshotOK = true
+					} else if err == nil {
+						err = io.ErrUnexpectedEOF
+						snapshotErr = err
+						safeLogPrintf("open-unlink snapshot short read for %s: got=%d want=%d", p, len(data), size)
+					} else {
+						snapshotErr = err
+						safeLogPrintf("open-unlink snapshot failed for %s: %v", p, err)
+					}
+					fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(data)))
+				} else {
+					gen, err := fs.snapshotUnlinkedRemoteToShadow(ctx, p, size, revision, snapshotNeedCount)
+					if err == nil {
+						snapshotShadowGen = gen
+						snapshotOK = true
+					} else {
+						snapshotErr = err
+						safeLogPrintf("open-unlink large snapshot failed for %s: %v", p, err)
+					}
+				}
+				if !snapshotOK {
+					break
+				}
+				if fs.unlinkedRemoteSnapshotStale(p, handles, revision, size) {
+					staleAfterFetch = true
+					continue
+				}
+			}
+			attachedSnapshotPins := 0
+			var markedThisPass []*FileHandle
+			attachFailed := false
+			for _, fh := range handles {
+				if fh == nil {
+					continue
+				}
+				fh.Lock()
+				pin, fail := fs.attachUnlinkedHandleSnapshotLocked(fh, p, snapshot, snapshotShadowGen, size, revision, snapshotOK)
+				if !fail && testHookBeforeUnlinkedTransition != nil {
+					fh.Unlock()
+					testHookBeforeUnlinkedTransition()
+					fh.Lock()
+					pin, fail = fs.attachUnlinkedHandleSnapshotLocked(fh, p, snapshot, snapshotShadowGen, size, revision, snapshotOK)
+				}
+				if fail {
+					attachFailed = true
+					fh.Unlock()
+					break
+				}
+				if pin {
+					attachedSnapshotPins++
+				}
+				fh.Unlinked = true
+				markedThisPass = append(markedThisPass, fh)
+				fh.Unlock()
+			}
+			if attachFailed {
+				fs.unmarkOpenHandlesAfterFailedUnlink(p, markedThisPass)
+				staleAfterFetch = true
 				continue
 			}
-			fh.Lock()
-			handleNeedsSnapshot := cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) ||
-				remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh)
-			if handleNeedsSnapshot {
-				needsSnapshot = true
-				snapshotNeedCount++
+			if snapshotShadowGen != 0 && fs.shadowStore != nil && attachedSnapshotPins < snapshotNeedCount {
+				for i := attachedSnapshotPins; i < snapshotNeedCount; i++ {
+					fs.shadowStore.Unpin(snapshotShadowGen)
+				}
 			}
-			fh.Unlock()
+			fs.openHandles.UnlinkPath(p)
+			return handles, true, nil
 		}
-		if needsSnapshot {
-			if size == 0 {
-				snapshotOK = true
-			} else if size <= maxPathTruncateInMemoryBytes {
-				readStart := fs.perfStart()
-				data, err := fs.client.ReadAtCtx(ctx, fs.remotePath(p), 0, size)
-				if err == nil && int64(len(data)) == size {
-					snapshot = data
-					snapshotOK = true
-				} else if err == nil {
-					err = io.ErrUnexpectedEOF
-					snapshotErr = err
-					safeLogPrintf("open-unlink snapshot short read for %s: got=%d want=%d", p, len(data), size)
-				} else {
-					snapshotErr = err
-					safeLogPrintf("open-unlink snapshot failed for %s: %v", p, err)
-				}
-				fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(data)))
-			} else {
-				gen, err := fs.snapshotUnlinkedRemoteToShadow(ctx, p, size, revision, snapshotNeedCount)
-				if err == nil {
-					snapshotShadowGen = gen
-					snapshotOK = true
-				} else {
-					snapshotErr = err
-					safeLogPrintf("open-unlink large snapshot failed for %s: %v", p, err)
-				}
+		if staleAfterFetch {
+			if snapshotShadowGen != 0 {
+				fs.discardUnlinkedSnapshotPins(snapshotShadowGen, snapshotNeedCount)
 			}
-			if needsSnapshot && !snapshotOK && fs.gvisorCompatibilityEnabled() {
-				if snapshotErr == nil {
-					snapshotErr = syscall.EIO
-				}
-				return nil, false, snapshotErr
+			safeLogPrintf("open-unlink snapshot stale after concurrent commit for %s", p)
+			return nil, false, syscall.EIO
+		}
+		if snapshotNeedCount > 0 && !snapshotOK && fs.gvisorCompatibilityEnabled() {
+			if snapshotErr == nil {
+				snapshotErr = syscall.EIO
 			}
+			return nil, false, snapshotErr
 		}
 	}
 
-	attachedSnapshotPins := 0
 	for _, fh := range handles {
 		if fh == nil {
 			continue
 		}
 		fh.Lock()
+		_, _ = fs.attachUnlinkedHandleSnapshotLocked(fh, p, snapshot, snapshotShadowGen, size, revision, snapshotOK)
 		fh.Unlinked = true
-		if fh.Dirty != nil {
-			fh.UnlinkedSize = fh.Dirty.Size()
-			// Dirty ShadowSpill handles keep their authoritative data in the
-			// staged shadow, not in the Dirty buffer (parts were evicted).
-			// Pin that shadow as the handle's private read backing until
-			// Release: the unlink-time Remove then retires it (the fd stays
-			// readable via ReadAtGen) instead of deleting it, and a same-path
-			// replacement gets a fresh shadow file.
-			if fh.ShadowSpill && fh.UnlinkedShadowGen == 0 && fs.shadowStore != nil {
-				if gen, ok := fs.shadowStore.PinIfExists(p); ok {
-					fh.UnlinkedShadowGen = gen
-					fh.UnlinkedSnapshot = true
-				}
-			} else if snapshotOK && remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh) {
-				attachUnlinkedSnapshotLocked(fh, snapshot, snapshotShadowGen, size)
-				if snapshotShadowGen != 0 && fh.UnlinkedShadowGen == snapshotShadowGen {
-					attachedSnapshotPins++
-				}
-			}
-		} else if snapshotOK {
-			if snapshotShadowGen != 0 && cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) {
-				fh.UnlinkedData = nil
-				fh.UnlinkedSnapshot = true
-				fh.UnlinkedShadowGen = snapshotShadowGen
-				fh.UnlinkedSize = size
-				attachedSnapshotPins++
-			} else {
-				fh.UnlinkedData = append(fh.UnlinkedData[:0], snapshot...)
-				fh.UnlinkedSnapshot = true
-				fh.UnlinkedSize = int64(len(snapshot))
-			}
-		} else {
-			fh.UnlinkedSize = size
-		}
 		fh.Unlock()
-	}
-	if snapshotShadowGen != 0 && fs.shadowStore != nil && attachedSnapshotPins < snapshotNeedCount {
-		for i := attachedSnapshotPins; i < snapshotNeedCount; i++ {
-			fs.shadowStore.Unpin(snapshotShadowGen)
-		}
 	}
 	fs.openHandles.UnlinkPath(p)
 	return handles, true, nil
+}
+
+func (fs *Dat9FS) attachUnlinkedHandleSnapshotLocked(fh *FileHandle, p string, snapshot []byte, snapshotShadowGen uint64, size, revision int64, snapshotOK bool) (attachedPin bool, fail bool) {
+	if fh == nil {
+		return false, false
+	}
+	dropStalePreinstalledUnlinkSnapshotLocked(fh)
+	needs := cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) ||
+		remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh)
+	if needs && !fh.ShadowSpill && (!snapshotOK || unlinkedSnapshotStaleLocked(fh, revision, size)) {
+		return false, true
+	}
+	if fh.Dirty != nil {
+		fh.UnlinkedSize = fh.Dirty.Size()
+		if fh.ShadowSpill && fh.UnlinkedShadowGen == 0 && fs.shadowStore != nil {
+			if gen, ok := fs.shadowStore.PinIfExists(p); ok {
+				fh.UnlinkedShadowGen = gen
+				fh.UnlinkedSnapshot = true
+				fh.UnlinkedSnapshotRev = revision
+				fh.UnlinkedSnapshotSize = fh.UnlinkedSize
+			}
+		} else if snapshotOK && remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh) &&
+			!unlinkedSnapshotStaleLocked(fh, revision, size) {
+			attachUnlinkedSnapshotLocked(fh, snapshot, snapshotShadowGen, size, revision)
+			if snapshotShadowGen != 0 && fh.UnlinkedShadowGen == snapshotShadowGen {
+				attachedPin = true
+			}
+		}
+	} else if snapshotOK {
+		if snapshotShadowGen != 0 && cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) {
+			attachUnlinkedSnapshotLocked(fh, nil, snapshotShadowGen, size, revision)
+			attachedPin = true
+		} else {
+			attachUnlinkedSnapshotLocked(fh, snapshot, 0, size, revision)
+		}
+	} else if fh.UnlinkedSize == 0 {
+		fh.UnlinkedSize = size
+	}
+	return attachedPin, false
 }
 
 func cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
@@ -7511,7 +7590,7 @@ func remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
 		!fh.UnlinkedSnapshot
 }
 
-func attachUnlinkedSnapshotLocked(fh *FileHandle, snapshot []byte, snapshotShadowGen uint64, size int64) {
+func attachUnlinkedSnapshotLocked(fh *FileHandle, snapshot []byte, snapshotShadowGen uint64, size, rev int64) {
 	if fh == nil {
 		return
 	}
@@ -7520,11 +7599,105 @@ func attachUnlinkedSnapshotLocked(fh *FileHandle, snapshot []byte, snapshotShado
 		fh.UnlinkedSnapshot = true
 		fh.UnlinkedShadowGen = snapshotShadowGen
 		fh.UnlinkedSize = size
+		fh.UnlinkedSnapshotRev = rev
+		fh.UnlinkedSnapshotSize = size
 		return
 	}
 	fh.UnlinkedData = append(fh.UnlinkedData[:0], snapshot...)
 	fh.UnlinkedSnapshot = true
 	fh.UnlinkedSize = int64(len(snapshot))
+	fh.UnlinkedSnapshotRev = rev
+	fh.UnlinkedSnapshotSize = fh.UnlinkedSize
+}
+
+func clearPreinstalledUnlinkSnapshotLocked(fh *FileHandle) {
+	if fh == nil || fh.Unlinked {
+		return
+	}
+	fh.UnlinkedData = nil
+	fh.UnlinkedSnapshot = false
+	fh.UnlinkedSnapshotRev = 0
+	fh.UnlinkedSnapshotSize = 0
+}
+
+func dropStalePreinstalledUnlinkSnapshotLocked(fh *FileHandle) {
+	if fh == nil || fh.Unlinked || (fh.UnlinkedData == nil && !fh.UnlinkedSnapshot) {
+		return
+	}
+	stale := fh.UnlinkedSnapshotRev > 0 && fh.BaseRev > 0 && fh.UnlinkedSnapshotRev != fh.BaseRev
+	if fh.UnlinkedSnapshotSize > 0 && fh.Dirty != nil && !fh.Dirty.HasDirtyParts() &&
+		fh.Dirty.remoteSize > 0 && fh.Dirty.remoteSize != fh.UnlinkedSnapshotSize {
+		stale = true
+	}
+	if !stale {
+		return
+	}
+	clearPreinstalledUnlinkSnapshotLocked(fh)
+}
+
+func (fs *Dat9FS) pathUnlinkedSnapshotIdentity(p string) (size, rev int64) {
+	if fs == nil || p == "" {
+		return 0, 0
+	}
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		if entry, ok := fs.inodes.GetEntry(ino); ok && entry != nil {
+			size = entry.Size
+			rev = entry.Revision
+		}
+	}
+	if cr := fs.latestCommittedRevision(p); cr > rev {
+		rev = cr
+	}
+	return size, rev
+}
+
+func (fs *Dat9FS) discardUnlinkedSnapshotPins(gen uint64, pins int) {
+	if fs == nil || fs.shadowStore == nil || gen == 0 {
+		return
+	}
+	for i := 0; i < pins; i++ {
+		fs.shadowStore.Unpin(gen)
+	}
+}
+
+func (fs *Dat9FS) unlinkedRemoteSnapshotStale(p string, handles []*FileHandle, snapshotRev, snapshotSize int64) bool {
+	size, rev := fs.pathUnlinkedSnapshotIdentity(p)
+	if snapshotRev > 0 && rev > 0 && rev != snapshotRev {
+		return true
+	}
+	if snapshotSize > 0 && size > 0 && size != snapshotSize {
+		return true
+	}
+	for _, fh := range handles {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		stale := unlinkedSnapshotStaleLocked(fh, snapshotRev, snapshotSize)
+		fh.Unlock()
+		if stale {
+			return true
+		}
+	}
+	return false
+}
+
+func unlinkedSnapshotStaleLocked(fh *FileHandle, snapshotRev, snapshotSize int64) bool {
+	if fh == nil {
+		return false
+	}
+	if !cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) &&
+		!remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh) {
+		return false
+	}
+	if snapshotRev > 0 && fh.BaseRev > 0 && fh.BaseRev != snapshotRev {
+		return true
+	}
+	if fh.Dirty != nil && !fh.Dirty.HasDirtyParts() && fh.Dirty.remoteSize > 0 &&
+		snapshotSize > 0 && fh.Dirty.remoteSize != snapshotSize {
+		return true
+	}
+	return false
 }
 
 func (fs *Dat9FS) loadUnlinkedHandlePart(fh *FileHandle, offset, length int64) ([]byte, bool, error) {
@@ -7594,6 +7767,8 @@ func (fs *Dat9FS) unmarkOpenHandlesAfterFailedUnlink(p string, handles []*FileHa
 		fh.UnlinkedData = nil
 		fh.UnlinkedSnapshot = false
 		fh.UnlinkedSize = 0
+		fh.UnlinkedSnapshotRev = 0
+		fh.UnlinkedSnapshotSize = 0
 		if gen := fh.UnlinkedShadowGen; gen != 0 && fs.shadowStore != nil {
 			fh.UnlinkedShadowGen = 0
 			// The mark-time pin is simply dropped: with the deferred commit

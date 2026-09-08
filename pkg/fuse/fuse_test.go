@@ -3036,6 +3036,361 @@ func TestUnlinkSnapshotConcurrentWriteKeepsOverlayAndBaseline(t *testing.T) {
 	}
 }
 
+func TestUnlinkSnapshotConcurrentFsyncKeepsCommittedOverlay(t *testing.T) {
+	const filePath = "/spill-unlink-fsync-race.bin"
+	const partSize int64 = 64
+	original := bytes.Repeat([]byte{0x88}, int(3*partSize))
+	overlay := []byte{0xAA, 0xBB}
+
+	var mu sync.Mutex
+	var committed []byte
+	var revision int64
+	var puts atomic.Int32
+	var fileGets atomic.Int32
+	snapshotStarted := make(chan struct{})
+	snapshotRelease := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+		case r.Method == http.MethodGet:
+			mu.Lock()
+			body := append([]byte(nil), committed...)
+			mu.Unlock()
+			if len(body) == 0 {
+				http.NotFound(w, r)
+				return
+			}
+			if fileGets.Add(1) == 1 {
+				close(snapshotStarted)
+				<-snapshotRelease
+			}
+			_, _ = w.Write(body)
+		case r.Method == http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			got, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			if got != revision {
+				mu.Unlock()
+				http.Error(w, "revision conflict", http.StatusConflict)
+				return
+			}
+			committed = append([]byte(nil), body...)
+			revision++
+			rev := revision
+			mu.Unlock()
+			puts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": rev})
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			committed = nil
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	fs, fhID, nodeID, _ := newStrictSmallPartSpillFS(t, ts.URL, filePath, partSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}, original); st != gofuse.OK {
+		t.Fatalf("seed Write: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("first Fsync: %v", st)
+	}
+
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/"))
+	}()
+	select {
+	case <-snapshotStarted:
+	case st := <-unlinkDone:
+		t.Fatalf("Unlink finished before snapshot GET: %v", st)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for unlink snapshot GET")
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Offset: 8}, overlay); st != gofuse.OK {
+		close(snapshotRelease)
+		t.Fatalf("concurrent write during unlink snapshot: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		close(snapshotRelease)
+		t.Fatalf("concurrent Fsync during unlink snapshot: %v", st)
+	}
+	close(snapshotRelease)
+	st := <-unlinkDone
+	if st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+
+	prefixBuf := make([]byte, 16)
+	prefixResult, rst := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Size: uint32(len(prefixBuf)),
+	}, prefixBuf)
+	if rst != gofuse.OK {
+		t.Fatalf("Read after unlink: %v", rst)
+	}
+	gotPrefix, _ := prefixResult.Bytes(prefixBuf)
+	wantPrefix := append(bytes.Repeat([]byte{0x88}, 8), overlay...)
+	wantPrefix = append(wantPrefix, bytes.Repeat([]byte{0x88}, 6)...)
+	if !bytes.Equal(gotPrefix, wantPrefix) {
+		t.Fatalf("open-fd read = %x, want fsynced overlay %x", gotPrefix, wantPrefix)
+	}
+	if puts.Load() != 2 {
+		t.Fatalf("puts = %d, want 2 (seed fsync + concurrent fsync)", puts.Load())
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+	if puts.Load() != 2 {
+		t.Fatalf("flush after unlink resurrected path (puts=%d)", puts.Load())
+	}
+}
+
+func TestUnlinkAfterPreinstalledSnapshotKeepsLaterFsync(t *testing.T) {
+	const filePath = "/spill-preinstall-fsync.bin"
+	const partSize int64 = 64
+	original := bytes.Repeat([]byte{0x88}, int(3*partSize))
+	overlay := []byte{0xAA, 0xBB}
+
+	var mu sync.Mutex
+	var committed []byte
+	var revision int64
+	var puts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+		case r.Method == http.MethodGet:
+			mu.Lock()
+			body := append([]byte(nil), committed...)
+			mu.Unlock()
+			if len(body) == 0 {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(body)
+		case r.Method == http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			got, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			if got != revision {
+				mu.Unlock()
+				http.Error(w, "revision conflict", http.StatusConflict)
+				return
+			}
+			committed = append([]byte(nil), body...)
+			revision++
+			rev := revision
+			mu.Unlock()
+			puts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": rev})
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			committed = nil
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	fs, fhID, nodeID, _ := newStrictSmallPartSpillFS(t, ts.URL, filePath, partSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}, original); st != gofuse.OK {
+		t.Fatalf("seed Write: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("first Fsync: %v", st)
+	}
+	if err := fs.snapshotOpenHandlesBeforeUnlink(context.Background(), filePath); err != nil {
+		t.Fatalf("preinstall unlink snapshot: %v", err)
+	}
+	fh, ok := fs.fileHandles.Get(fhID)
+	if !ok {
+		t.Fatal("handle missing")
+	}
+	fh.Lock()
+	if len(fh.UnlinkedData) == 0 {
+		fh.Unlock()
+		t.Fatal("expected preinstalled UnlinkedData")
+	}
+	fh.Unlock()
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Offset: 8}, overlay); st != gofuse.OK {
+		t.Fatalf("write after preinstall: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("Fsync after preinstall: %v", st)
+	}
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+	prefixBuf := make([]byte, 16)
+	prefixResult, rst := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Size: uint32(len(prefixBuf)),
+	}, prefixBuf)
+	if rst != gofuse.OK {
+		t.Fatalf("Read after unlink: %v", rst)
+	}
+	gotPrefix, _ := prefixResult.Bytes(prefixBuf)
+	wantPrefix := append(bytes.Repeat([]byte{0x88}, 8), overlay...)
+	wantPrefix = append(wantPrefix, bytes.Repeat([]byte{0x88}, 6)...)
+	if !bytes.Equal(gotPrefix, wantPrefix) {
+		t.Fatalf("open-fd read = %x, want fsynced overlay %x", gotPrefix, wantPrefix)
+	}
+	if puts.Load() != 2 {
+		t.Fatalf("puts = %d, want 2", puts.Load())
+	}
+}
+
+func TestUnlinkMarkWindowConcurrentFsyncKeepsOverlay(t *testing.T) {
+	const filePath = "/spill-mark-window-fsync.bin"
+	const partSize int64 = 64
+	original := bytes.Repeat([]byte{0x88}, int(3*partSize))
+	overlay := []byte{0xAA, 0xBB}
+
+	var mu sync.Mutex
+	var committed []byte
+	var revision int64
+	var puts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("list"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+		case r.Method == http.MethodGet:
+			mu.Lock()
+			body := append([]byte(nil), committed...)
+			mu.Unlock()
+			if len(body) == 0 {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(body)
+		case r.Method == http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			got, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			if got != revision {
+				mu.Unlock()
+				http.Error(w, "revision conflict", http.StatusConflict)
+				return
+			}
+			committed = append([]byte(nil), body...)
+			revision++
+			rev := revision
+			mu.Unlock()
+			puts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": rev})
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			committed = nil
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	fs, fhID, nodeID, _ := newStrictSmallPartSpillFS(t, ts.URL, filePath, partSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}, original); st != gofuse.OK {
+		t.Fatalf("seed Write: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("first Fsync: %v", st)
+	}
+
+	var once sync.Once
+	testHookBeforeUnlinkedTransition = func() {
+		once.Do(func() {
+			if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Offset: 8}, overlay); st != gofuse.OK {
+				t.Errorf("mark-window write: %v", st)
+				return
+			}
+			if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID}); st != gofuse.OK {
+				t.Errorf("mark-window Fsync: %v", st)
+			}
+		})
+	}
+	t.Cleanup(func() { testHookBeforeUnlinkedTransition = nil })
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+	prefixBuf := make([]byte, 16)
+	prefixResult, rst := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: nodeID}, Fh: fhID, Size: uint32(len(prefixBuf)),
+	}, prefixBuf)
+	if rst != gofuse.OK {
+		t.Fatalf("Read after unlink: %v", rst)
+	}
+	gotPrefix, _ := prefixResult.Bytes(prefixBuf)
+	wantPrefix := append(bytes.Repeat([]byte{0x88}, 8), overlay...)
+	wantPrefix = append(wantPrefix, bytes.Repeat([]byte{0x88}, 6)...)
+	if !bytes.Equal(gotPrefix, wantPrefix) {
+		t.Fatalf("open-fd read = %x, want fsynced overlay %x", gotPrefix, wantPrefix)
+	}
+	if puts.Load() != 2 {
+		t.Fatalf("puts = %d, want 2 (seed + mark-window fsync)", puts.Load())
+	}
+}
+
+func TestAttachUnlinkedHandleSnapshotDoesNotMarkWhenStale(t *testing.T) {
+	wb := NewWriteBuffer("/a.bin", 1<<20, 64)
+	wb.remoteSize = 192
+	wb.LoadPart = func(int) ([]byte, error) { return []byte("x"), nil }
+	fh := &FileHandle{Dirty: wb, BaseRev: 2, Path: "/a.bin"}
+	fs := &Dat9FS{}
+	_, fail := fs.attachUnlinkedHandleSnapshotLocked(fh, "/a.bin", bytes.Repeat([]byte{0x88}, 192), 0, 192, 1, true)
+	if !fail {
+		t.Fatal("stale snapshot must fail closed")
+	}
+	if fh.Unlinked {
+		t.Fatal("must not set Unlinked when attach snapshot is stale")
+	}
+	if len(fh.UnlinkedData) != 0 {
+		t.Fatal("must not keep a stale in-memory snapshot")
+	}
+}
+
+func TestUnlinkedSnapshotStaleLockedDetectsRebaseline(t *testing.T) {
+	wb := NewWriteBuffer("/a.bin", 1<<20, 64)
+	wb.remoteSize = 192
+	wb.LoadPart = func(int) ([]byte, error) { return []byte("x"), nil }
+	fh := &FileHandle{Dirty: wb, BaseRev: 2}
+	if !unlinkedSnapshotStaleLocked(fh, 1, 192) {
+		t.Fatal("BaseRev ahead of snapshot revision must be stale")
+	}
+	fh.BaseRev = 1
+	if unlinkedSnapshotStaleLocked(fh, 1, 192) {
+		t.Fatal("matching BaseRev should not be stale")
+	}
+	wb.remoteSize = 200
+	if !unlinkedSnapshotStaleLocked(fh, 1, 192) {
+		t.Fatal("clean remoteSize change after Fsync rebase must be stale")
+	}
+}
+
 func TestWriteBuffer_ResetSequentialState(t *testing.T) {
 	wb := NewWriteBuffer("/test", streamingWriteMaxSize, DefaultPartSize)
 	wb.sequential = true
