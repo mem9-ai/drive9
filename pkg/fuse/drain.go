@@ -332,6 +332,11 @@ func drainPendingWorkError(p mountcontrol.DrainPending) error {
 	)
 }
 
+// drainPendingHasUndrainedWork is true when drain cannot report a clean pause.
+// commit_queue_conflicts is included so writeback mounts still fail drain after
+// an async commit terminal-failure. Close-sync/write-sync pending-new rename
+// failures are returned to the caller as EAGAIN and no longer require drain to
+// become visible.
 func drainPendingHasUndrainedWork(p mountcontrol.DrainPending) bool {
 	return p.DirtyHandles != 0 ||
 		p.CommitQueuePending != 0 ||
