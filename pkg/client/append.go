@@ -109,11 +109,7 @@ func (c *Client) initiateAppend(ctx context.Context, path string, appendSize int
 		return nil, fmt.Errorf("marshal append request: %w", err)
 	}
 
-	reqURL, err := c.url(path)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL+"?append", bytes.NewReader(body))
+	req, err := c.newFSRequest(ctx, http.MethodPost, path, "?append", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}

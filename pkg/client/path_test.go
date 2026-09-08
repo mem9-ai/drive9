@@ -120,6 +120,9 @@ func TestFSMethodsRejectWindowsPathBeforeRequest(t *testing.T) {
 		"ResumeUpload": func() error {
 			return c.ResumeUpload(ctx, bad, bytes.NewReader([]byte("x")), 1<<20, nil)
 		},
+		"WriteMultipartStream": func() error {
+			return c.WriteMultipartStreamConditional(ctx, bad, bytes.NewReader([]byte("x")), 1<<20, nil, 1)
+		},
 		"StreamWriter": func() error { return sw.WritePart(ctx, 1, []byte("x")) },
 		"BatchStat":    func() error { _, err := c.BatchStatCtx(ctx, []string{"/ok", bad}); return err },
 		"BatchReadSmall": func() error {

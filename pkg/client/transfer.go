@@ -429,6 +429,9 @@ func (c *Client) writeStreamConditionalWithChecksumAndPreCompleteCheck(ctx conte
 // therefore cannot use the direct-PUT path, which materializes the full reader
 // into memory before sending.
 func (c *Client) WriteMultipartStreamConditional(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
+	if err := validateFSPath(path); err != nil {
+		return err
+	}
 	if size <= 0 {
 		return fmt.Errorf("multipart upload requires positive size")
 	}
@@ -762,11 +765,7 @@ func (c *Client) initiateUploadByBody(ctx context.Context, path string, size int
 }
 
 func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64, description string) (UploadPlan, error) {
-	reqURL, err := c.url(path)
-	if err != nil {
-		return UploadPlan{}, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, http.NoBody)
+	req, err := c.newFSRequest(ctx, http.MethodPut, path, "", http.NoBody)
 	if err != nil {
 		return UploadPlan{}, err
 	}
@@ -1405,11 +1404,7 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader stri
 		return http.ErrUseLastResponse
 	}
 
-	reqURL, err := c.url(path)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req, err := c.newFSRequest(ctx, http.MethodGet, path, "", nil)
 	if err != nil {
 		return nil, err
 	}

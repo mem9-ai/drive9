@@ -85,11 +85,7 @@ func (c *Client) PatchFile(ctx context.Context, path string, newSize int64, dirt
 		return fmt.Errorf("marshal patch request: %w", err)
 	}
 
-	reqURL, err := c.url(path)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, reqURL, bytes.NewReader(reqBody))
+	req, err := c.newFSRequest(ctx, http.MethodPatch, path, "", bytes.NewReader(reqBody))
 	if err != nil {
 		return err
 	}

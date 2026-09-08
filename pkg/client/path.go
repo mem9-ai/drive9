@@ -30,7 +30,7 @@ func validateFSPath(path string) error {
 func windowsPathHint(path string) string {
 	switch {
 	case windowsDriveSegment.MatchString(path):
-		return "; path looks like a Windows local path — drive9 paths are absolute POSIX paths with no drive letter; strip the drive prefix and convert separators (e.g. filepath.ToSlash) before calling"
+		return "; path looks like a Windows local path — drive9 paths are absolute POSIX paths with no drive letter; remove the Windows drive segment (e.g. `C:\\`) and convert separators with filepath.ToSlash before calling"
 	case strings.ContainsRune(path, '\\'):
 		return "; drive9 paths use forward slashes — convert Windows-style separators (e.g. filepath.ToSlash) before calling"
 	default:
