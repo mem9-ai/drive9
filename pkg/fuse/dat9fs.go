@@ -10101,11 +10101,16 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 		}
 		fs.bindCommitEntryToPath(entry, newP, meta.BaseRev)
 		commitPendingRenameNow := func() error {
-			timeout := uploadTimeout
 			if entry.ShadowSpill {
-				timeout = releaseTimeout(entry.Size)
+				// Spill uploads need a size-aware budget and must not inherit
+				// the 30s FUSE request deadline. Non-spill commits keep the
+				// request context so git/small-file renames stay interruptible
+				// when gVisor compatibility is off.
+				commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout(entry.Size))
+				defer commitCancel()
+				return fs.commitQueue.commitNowPathLocked(commitCtx, entry)
 			}
-			commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+			commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
 			defer commitCancel()
 			return fs.commitQueue.commitNowPathLocked(commitCtx, entry)
 		}
