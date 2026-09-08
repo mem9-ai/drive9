@@ -7601,10 +7601,7 @@ func dropStalePreinstalledUnlinkSnapshotLocked(fh *FileHandle) {
 	if fh == nil || fh.Unlinked || (fh.UnlinkedData == nil && !fh.UnlinkedSnapshot) {
 		return
 	}
-	stale := false
-	if fh.UnlinkedSnapshotRev > 0 && fh.BaseRev > 0 && fh.UnlinkedSnapshotRev != fh.BaseRev {
-		stale = true
-	}
+	stale := fh.UnlinkedSnapshotRev > 0 && fh.BaseRev > 0 && fh.UnlinkedSnapshotRev != fh.BaseRev
 	if fh.UnlinkedSnapshotSize > 0 && fh.Dirty != nil && !fh.Dirty.HasDirtyParts() &&
 		fh.Dirty.remoteSize > 0 && fh.Dirty.remoteSize != fh.UnlinkedSnapshotSize {
 		stale = true
