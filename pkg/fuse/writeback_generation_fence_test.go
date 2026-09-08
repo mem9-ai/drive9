@@ -685,7 +685,7 @@ func TestStageShadowPendingFailureKeepsCurrentGenerationForSyncFallback(t *testi
 		t.Fatalf("open fallback generation: %v", err)
 	}
 	defer release()
-	defer fd.Close()
+	defer func() { _ = fd.Close() }()
 	got, err := io.ReadAll(fd)
 	if err != nil {
 		t.Fatal(err)
