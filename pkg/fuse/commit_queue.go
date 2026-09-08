@@ -1850,6 +1850,11 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 				return
 			}
 			if err := cq.validateEntryPayloadFreshCtx(entryCtx, entry); err != nil {
+				if cq.isEntryCanceled(entry) {
+					cq.removeFromQueue(entry)
+					unlockPath()
+					return
+				}
 				safeLogPrintf("commit queue: conflict auto-resolve rejected stale payload for %s: %v", entry.Path, err)
 				cq.onCommitTerminalFailure(entry, err)
 				unlockPath()
@@ -2033,7 +2038,13 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 				if entry == nil {
 					continue
 				}
-				if verr := cq.validateEntryPayloadFreshCtx(entryCtx, entry); errors.Is(verr, errCommitPayloadStale) {
+				verr := cq.validateEntryPayloadFreshCtx(entryCtx, entry)
+				if cq.isEntryCanceled(entry) {
+					cq.removeFromQueue(entry)
+					cq.endInFlight(entry)
+					continue
+				}
+				if errors.Is(verr, errCommitPayloadStale) {
 					safeLogPrintf("commit queue: stale batched payload rejected for %s: %v", entry.Path, verr)
 					cq.onCommitTerminalFailure(entry, verr)
 					cq.endInFlight(entry)
@@ -2116,6 +2127,12 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 				continue
 			}
 			if err := cq.validateEntryPayloadFreshCtx(entryCtx, entry); err != nil {
+				if cq.isEntryCanceled(entry) {
+					cq.removeFromQueue(entry)
+					unlockPath()
+					cq.endInFlight(entry)
+					continue
+				}
 				safeLogPrintf("commit queue: batch conflict auto-resolve rejected stale payload for %s: %v", entry.Path, err)
 				cq.onCommitTerminalFailure(entry, err)
 				unlockPath()
@@ -2231,6 +2248,11 @@ func (cq *CommitQueue) validateEntryPayloadFreshCtx(ctx context.Context, entry *
 			// Keep going: this is a later growth of the same path, not a
 			// stale sibling snapshot. Authorization is recorded on entry so
 			// nested payload reads do not repeat the remote identity proof.
+		} else if ctx != nil && ctx.Err() != nil {
+			// Cancellation is not evidence that the payload is stale. Preserve
+			// it as a transient caller outcome so unlink/rollback does not turn
+			// an intentionally canceled entry into PendingConflict.
+			return ctx.Err()
 		} else {
 			entry.DisableAutoResolveLWW = true
 			return fmt.Errorf("%w: %s payload base rev %d is older than durable watermark rev %d",
@@ -2950,6 +2972,10 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 		return
 	}
 	if err := cq.validateEntryPayloadFreshCtx(entryCtx, entry); err != nil {
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			return
+		}
 		safeLogPrintf("commit queue: auto-resolve rejected stale payload for %s before LWW: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry, err)
 		return
@@ -3008,6 +3034,10 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		return
 	}
 	if err := cq.validateEntryPayloadFreshCtx(entryCtx, entry); err != nil {
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			return
+		}
 		safeLogPrintf("commit queue: ShadowSpill stale payload rejected for %s: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry, err)
 		return

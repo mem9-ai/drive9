@@ -1887,6 +1887,84 @@ func TestCommitQueueReadRemoteSnapshotStopsOnCallerCancellation(t *testing.T) {
 	}
 }
 
+func TestCommitQueueCancelDuringConflictLineageProofDoesNotMarkConflict(t *testing.T) {
+	const path = "/cancel-conflict.db"
+	const parentSnapshot = "snapshot-parent"
+	parent := []byte("parent")
+	child := []byte("parent-grown-child")
+	var watermark atomic.Int64
+	headStarted := make(chan struct{})
+	var headOnce sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			_, _ = io.Copy(io.Discard, r.Body)
+			watermark.Store(1)
+			w.WriteHeader(http.StatusConflict)
+		case http.MethodHead:
+			headOnce.Do(func() { close(headStarted) })
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(path, child, 0); err != nil {
+		t.Fatal(err)
+	}
+	pendingGen, err := pending.PutWithBaseRevAndModeAndLineage(path, int64(len(child)), PendingNew, 0, 0, false, "snapshot-child", parentSnapshot, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	defer cq.CancelPathPreserveLocal(path)
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.rememberLanded(path, 1, int64(len(parent)), "", payloadChecksum(parent), parentSnapshot)
+	if err := cq.Enqueue(&CommitEntry{
+		Path: path, BaseRev: 0, PayloadBaseRev: 0, PayloadBaseRevSet: true,
+		Size: int64(len(child)), Kind: PendingNew, ShadowGen: shadow.ActiveGeneration(path), PendingIndexGen: pendingGen,
+		SnapshotID: "snapshot-child", ParentSnapshotID: parentSnapshot, liveLineageProof: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-headStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("conflict lineage HEAD did not start")
+	}
+	cq.CancelPathPreserveLocal(path)
+	drained := make(chan struct{})
+	go func() {
+		cq.WaitPath(path)
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled lineage proof did not drain")
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("cancel-preserve removed pending metadata")
+	}
+	if meta.Kind == PendingConflict {
+		t.Fatal("caller cancellation was recorded as a terminal conflict")
+	}
+}
+
 func TestOpenHandlePathWideShadowPreloadDropsLineageTrust(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
