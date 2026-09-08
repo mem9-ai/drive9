@@ -4097,6 +4097,14 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 		}
 		fh.ShadowReady = true
 	}
+	// The shadow mutation above advances its content generation. Capture it
+	// immediately so every later fallback (including one caused by a pending
+	// index write failure) reads the exact bytes this handle just staged.
+	// Waiting until after pending-index publication leaves ShadowSpill's
+	// synchronous fallback pinned to the previous generation and turns a
+	// recoverable metadata error into EIO.
+	fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
+	fh.ShadowStageSeq = fh.DirtySeq
 
 	if durable {
 		if err := fs.shadowStore.Sync(fh.Path); err != nil {
@@ -4119,12 +4127,6 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 		fh.PendingIndexGen = gen
 	}
 	publishStagedSnapshotLineageLocked(fh)
-	// Record the staged shadow content generation so unlink-discard can scope
-	// its cleanup to this handle's staging generation.
-	if fs.shadowStore != nil {
-		fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
-		fh.ShadowStageSeq = fh.DirtySeq
-	}
 	return nil
 }
 
