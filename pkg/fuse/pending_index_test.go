@@ -303,6 +303,44 @@ func TestPendingIndexPrepareCommitRename(t *testing.T) {
 	}
 }
 
+func TestPreparedRenameBindsExactProcessLocalLineageToCommitEntry(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const snapshotID = "rename-snapshot-B"
+	const parentSnapshotID = "rename-snapshot-A"
+	if _, err := idx.PutWithBaseRevAndModeAndLineage(
+		"/old.db", 4096, PendingNew, 0, 0o640, true,
+		snapshotID, parentSnapshotID, true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := idx.PrepareRename("/old.db", "/new.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared == nil {
+		t.Fatal("PrepareRename returned nil metadata")
+	}
+	if prepared.SnapshotID != snapshotID || prepared.ParentSnapshotID != parentSnapshotID || !prepared.lineageTrusted {
+		t.Fatalf("prepared lineage=%q/%q trusted=%t, want exact live lineage", prepared.SnapshotID, prepared.ParentSnapshotID, prepared.lineageTrusted)
+	}
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	entry := &CommitEntry{Path: prepared.Path, BaseRev: prepared.BaseRev}
+	fs.bindCommitEntryToPreparedPendingMeta(entry, prepared)
+	if entry.PendingIndexGen != prepared.Generation || entry.PayloadBaseRev != prepared.BaseRev || !entry.PayloadBaseRevSet {
+		t.Fatalf("entry generation/base=%d/%d set=%t, want %d/%d/true", entry.PendingIndexGen, entry.PayloadBaseRev, entry.PayloadBaseRevSet, prepared.Generation, prepared.BaseRev)
+	}
+	if entry.SnapshotID != snapshotID || entry.ParentSnapshotID != parentSnapshotID || !entry.liveLineageProof {
+		t.Fatalf("entry lineage=%q/%q live=%t, want exact prepared lineage", entry.SnapshotID, entry.ParentSnapshotID, entry.liveLineageProof)
+	}
+}
+
 // TestPendingIndexAbortRename verifies that Abort removes only the prepared
 // on-disk meta, and refuses to delete a meta that is live in memory.
 func TestPendingIndexAbortRename(t *testing.T) {

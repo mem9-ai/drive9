@@ -3,6 +3,8 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -65,6 +67,13 @@ type CommitEntry struct {
 	// later BaseRev just because a sibling handle committed rev3.
 	PayloadBaseRev    int64
 	PayloadBaseRevSet bool
+	// SnapshotID identifies the exact full local image represented by this
+	// entry. ParentSnapshotID identifies the immediately preceding staged
+	// image from which these bytes were derived. Unlike size or staging
+	// generation, the direct-parent relationship is a causal proof: two
+	// handles that fork from the same image produce siblings, not descendants.
+	SnapshotID       string
+	ParentSnapshotID string
 	// ShadowGen and PendingIndexGen bind this entry to the exact path-local
 	// staging generations that existed when the entry was enqueued. Upload and
 	// cleanup use these tokens so a later same-path write cannot swap in newer
@@ -81,13 +90,21 @@ type CommitEntry struct {
 	// terminal. Re-basing old bytes with a new BaseRev is exactly the silent
 	// rollback class this fence prevents.
 	DisableAutoResolveLWW bool
-	dispatched            bool
-	canceled              bool
-	cancelCommit          context.CancelFunc
-	cancelUpload          context.CancelFunc
-	mutationPublished     bool
-	payload               []byte
-	payloadBound          bool
+	// growthRebaseRev records a one-shot authorization to pair a base-zero
+	// PendingNew payload with the revision of its directly landed parent.
+	// PayloadBaseRev intentionally remains unchanged for auditability, so
+	// repeated validation must consult this state instead of re-authorizing.
+	growthRebaseRev              int64
+	growthRebaseParentSnapshotID string
+	recovered                    bool
+	liveLineageProof             bool
+	dispatched                   bool
+	canceled                     bool
+	cancelCommit                 context.CancelFunc
+	cancelUpload                 context.CancelFunc
+	mutationPublished            bool
+	payload                      []byte
+	payloadBound                 bool
 }
 
 func (entry *CommitEntry) payloadBaseRevision() int64 {
@@ -133,15 +150,19 @@ type CommitQueue struct {
 	inFlight     map[string]*CommitEntry   // paths currently being processed by workers
 	immediate    map[*CommitEntry]struct{} // synchronous gVisor commits participating in inode ordering
 	delayed      map[*CommitEntry]*time.Timer
-	maxPending   int
-	client       *client.Client
-	remoteRoot   string
-	layerRef     string
-	shadows      *ShadowStore
-	index        *PendingIndex
-	journal      *Journal
-	wg           sync.WaitGroup
-	stopped      bool
+	// landed is an intentionally process-local map of exact snapshots this
+	// queue has committed. Shadow bytes and JSON metadata are not atomically
+	// replaced across a crash, so persisting this proof would be unsafe.
+	landed     map[string]pathCommitLandmark
+	maxPending int
+	client     *client.Client
+	remoteRoot string
+	layerRef   string
+	shadows    *ShadowStore
+	index      *PendingIndex
+	journal    *Journal
+	wg         sync.WaitGroup
+	stopped    bool
 	// abandoned is set by AbandonLayer when the mounted layer was rolled
 	// back. When true, Enqueue returns errLayerRolledBack and commitOne
 	// skips tryAutoResolveConflict, going straight to terminal failure so
@@ -220,6 +241,7 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 		immediate:         make(map[*CommitEntry]struct{}),
 		queuedByPath:      make(map[string]map[*CommitEntry]struct{}),
 		delayed:           make(map[*CommitEntry]*time.Timer),
+		landed:            make(map[string]pathCommitLandmark),
 		workCh:            make(chan *CommitEntry, bufSize),
 		zeroTruncateDelay: zeroTruncateCommitQueueDelay,
 	}
@@ -320,6 +342,7 @@ func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 	}
 	cq.queue = append(cq.queue, entry)
 	cq.addQueuedLocked(entry)
+	cq.coalesceDirectParentQueuedLocked(entry)
 	if cq.perf != nil {
 		cq.perf.commitEnqueue.add(1)
 	}
@@ -486,6 +509,17 @@ func (cq *CommitQueue) PendingStats() (count int, bytes int64) {
 		bytes += e.Size
 	}
 	return
+}
+
+// pathCommitLandmark is the last exact snapshot this queue itself landed for
+// a path. It is never persisted: after restart there is no safe causal proof
+// between mutable shadow bytes and recovered metadata.
+type pathCommitLandmark struct {
+	rev        int64
+	size       int64
+	resourceID string
+	checksum   string
+	snapshotID string
 }
 
 type CommitQueueSnapshot struct {
@@ -716,6 +750,7 @@ func (cq *CommitQueue) RecoverPending() {
 				continue
 			}
 		}
+		entry.recovered = true
 		if err := cq.Enqueue(entry); err != nil {
 			safeLogPrintf("commit queue: recover enqueue failed for %s: %v", path, err)
 		}
@@ -1358,6 +1393,233 @@ func (cq *CommitQueue) canBeginInFlightLocked(entry *CommitEntry) bool {
 	return true
 }
 
+func payloadChecksum(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func directParentPendingNew(old, newer *CommitEntry) bool {
+	if old == nil || newer == nil || old == newer || old.Path != newer.Path ||
+		old.Kind != PendingNew || newer.Kind != PendingNew ||
+		old.BaseRev != 0 || newer.BaseRev != 0 ||
+		!old.PayloadBaseRevSet || old.PayloadBaseRev != 0 ||
+		!newer.PayloadBaseRevSet || newer.PayloadBaseRev != 0 ||
+		!old.liveLineageProof || !newer.liveLineageProof ||
+		old.SnapshotID == "" || newer.SnapshotID == "" ||
+		newer.ParentSnapshotID != old.SnapshotID || old.payloadBound {
+		return false
+	}
+	if old.HasMode != newer.HasMode {
+		return false
+	}
+	return !old.HasMode || old.Mode == newer.Mode
+}
+
+func (cq *CommitQueue) reparentQueuedSnapshotLocked(entry *CommitEntry, oldParentID, newParentID string) bool {
+	if cq == nil || entry == nil || cq.index == nil || entry.PendingIndexGen == 0 {
+		return false
+	}
+	// Lineage is intentionally process-local: mutable ShadowStore bytes and
+	// their JSON metadata are not atomically replaced across a crash. Recovery
+	// therefore loses this proof and fails closed rather than trusting it.
+	ok, err := cq.index.ReparentSnapshotIfGeneration(entry.Path, entry.PendingIndexGen, entry.SnapshotID, oldParentID, newParentID)
+	if err != nil {
+		safeLogPrintf("commit queue: direct-parent compression failed for %s: %v", entry.Path, err)
+		return false
+	}
+	return ok
+}
+
+// coalesceDirectParentQueuedLocked replaces broad seq/size-based superseding.
+// A full child snapshot can safely skip an unlanded queued parent only when
+// its process-local ParentSnapshotID names that exact entry. The child is
+// reparented in generation-checked in-memory metadata before cancellation;
+// crash recovery intentionally loses the proof.
+func (cq *CommitQueue) coalesceDirectParentQueuedLocked(entry *CommitEntry) {
+	if cq == nil || entry == nil || entry.ParentSnapshotID == "" {
+		return
+	}
+	for _, queued := range cq.queue {
+		if !directParentPendingNew(queued, entry) || queued.canceled || cq.inFlight[queued.Path] == queued {
+			continue
+		}
+		oldParentID := entry.ParentSnapshotID
+		newParentID := queued.ParentSnapshotID
+		if !cq.reparentQueuedSnapshotLocked(entry, oldParentID, newParentID) {
+			return
+		}
+		entry.ParentSnapshotID = newParentID
+		queued.canceled = true
+		cq.stopDelayedLocked(queued)
+		if queued.cancelCommit != nil {
+			queued.cancelCommit()
+		}
+		if queued.cancelUpload != nil {
+			queued.cancelUpload()
+		}
+		remaining := cq.queue[:0]
+		for _, candidate := range cq.queue {
+			if candidate != queued {
+				remaining = append(remaining, candidate)
+			}
+		}
+		cq.queue = remaining
+		cq.rebuildQueuedIndexLocked()
+		safeLogPrintf("commit queue: coalesced exact queued parent for %s (snapshot %s -> child %s)", entry.Path, queued.SnapshotID, entry.SnapshotID)
+		return
+	}
+}
+
+func (cq *CommitQueue) checksumLandedPayload(entry *CommitEntry) string {
+	const maxHashBytes = 1 << 20
+	if entry == nil {
+		return ""
+	}
+	if entry.Size < 0 || entry.Size > maxHashBytes {
+		return ""
+	}
+	// Once upload has bound a payload, that private copy is the exact image
+	// accepted by the server. A newer same-path writer may already have
+	// replaced the active shadow generation before this success tail runs, so
+	// consulting the path-local shadow first would lose valid lineage proof.
+	if entry.payloadBound {
+		if int64(len(entry.payload)) != entry.Size {
+			return ""
+		}
+		return payloadChecksum(entry.payload)
+	}
+	if cq == nil || cq.shadows == nil || entry.ShadowGen == 0 {
+		return ""
+	}
+	data, err := cq.shadows.ReadAllIfGeneration(entry.Path, entry.ShadowGen)
+	if err != nil || int64(len(data)) != entry.Size {
+		return ""
+	}
+	return payloadChecksum(data)
+}
+
+func (cq *CommitQueue) rememberLanded(path string, rev, size int64, resourceID, checksum, snapshotID string) {
+	if cq == nil || path == "" || rev <= 0 {
+		return
+	}
+	cq.mu.Lock()
+	if cq.landed == nil {
+		cq.landed = make(map[string]pathCommitLandmark)
+	}
+	prev := cq.landed[path]
+	if rev >= prev.rev {
+		cq.landed[path] = pathCommitLandmark{rev: rev, size: size, resourceID: resourceID, checksum: checksum, snapshotID: snapshotID}
+	}
+	cq.mu.Unlock()
+}
+
+func (cq *CommitQueue) landedCommit(path string) pathCommitLandmark {
+	if cq == nil {
+		return pathCommitLandmark{}
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	return cq.landed[path]
+}
+
+// maybeRebaseGrownPayloadOntoWatermark detects issue #896: a later same-path
+// mutation grew the file after this queue already landed a smaller snapshot.
+// Those bytes are newer than the watermark, so CAS should overwrite that
+// revision instead of being fenced as a stale #876 checkpoint snapshot.
+func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(entry *CommitEntry, watermark int64) bool {
+	if cq == nil || entry == nil || watermark <= 0 {
+		return false
+	}
+	payloadBase := entry.payloadBaseRevision()
+	if payloadBase >= watermark {
+		return false
+	}
+	landed := cq.landedCommit(entry.Path)
+	if landed.rev != watermark || !entryCanRebaseOntoLandedParent(entry, landed) {
+		return false
+	}
+	rev, size, resourceID, body, ok := cq.readRemoteSnapshot(entry.Path)
+	if !ok {
+		return false
+	}
+	return cq.maybeRebaseGrownPayloadAgainstRemote(entry, rev, size, resourceID, body)
+}
+
+func (cq *CommitQueue) readRemoteSnapshot(path string) (rev, size int64, resourceID string, body []byte, ok bool) {
+	if cq == nil || cq.client == nil || path == "" {
+		return 0, 0, "", nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	apiPath := cq.remotePath(path)
+	st, err := cq.client.StatCtx(ctx, apiPath)
+	if err != nil || st == nil {
+		return 0, 0, "", nil, false
+	}
+	rev, size, resourceID = st.Revision, st.Size, st.ResourceID
+	if st.Size < 0 || st.Size > 1<<20 {
+		return rev, size, resourceID, nil, resourceID != ""
+	}
+	body, err = cq.client.ReadCtx(ctx, apiPath)
+	if err != nil {
+		return rev, size, resourceID, nil, resourceID != ""
+	}
+	return rev, size, resourceID, body, true
+}
+
+func landedIdentityMatches(proof pathCommitLandmark, serverRev, serverSize int64, serverResourceID string, serverBody []byte) bool {
+	if proof.rev != serverRev || proof.size != serverSize {
+		return false
+	}
+	if proof.resourceID != "" && serverResourceID != "" {
+		return proof.resourceID == serverResourceID
+	}
+	if proof.checksum == "" || int64(len(serverBody)) != proof.size {
+		return false
+	}
+	return payloadChecksum(serverBody) == proof.checksum
+}
+
+// maybeRebaseGrownPayloadAgainstRemote authorizes the #896 growth rebase only
+// when the remote image still matches the in-memory landed parent (resource ID
+// when both sides have it, otherwise SHA-256 for a small payload).
+func (cq *CommitQueue) maybeRebaseGrownPayloadAgainstRemote(entry *CommitEntry, serverRev, serverSize int64, serverResourceID string, serverBody []byte) bool {
+	proof := cq.landedCommit(entry.Path)
+	if !entryCanRebaseOntoLandedParent(entry, proof) || !landedIdentityMatches(proof, serverRev, serverSize, serverResourceID, serverBody) {
+		return false
+	}
+	return cq.authorizeGrownPayloadRebase(entry, proof)
+}
+
+func entryCanRebaseOntoLandedParent(entry *CommitEntry, proof pathCommitLandmark) bool {
+	if entry == nil || entry.Kind != PendingNew || entry.BaseRev != 0 ||
+		!entry.PayloadBaseRevSet || entry.PayloadBaseRev != 0 ||
+		!entry.liveLineageProof || entry.SnapshotID == "" ||
+		entry.ParentSnapshotID == "" || proof.snapshotID == "" {
+		return false
+	}
+	if entry.recovered {
+		return false
+	}
+	return entry.ParentSnapshotID == proof.snapshotID
+}
+
+func (cq *CommitQueue) authorizeGrownPayloadRebase(entry *CommitEntry, proof pathCommitLandmark) bool {
+	if cq == nil || !entryCanRebaseOntoLandedParent(entry, proof) || proof.rev <= 0 || entry.Size <= proof.size {
+		return false
+	}
+	entry.BaseRev = proof.rev
+	entry.Kind = PendingOverwrite
+	if entry.DurableWatermarkRev < proof.rev {
+		entry.DurableWatermarkRev = proof.rev
+	}
+	entry.DisableAutoResolveLWW = true
+	entry.growthRebaseRev = proof.rev
+	entry.growthRebaseParentSnapshotID = entry.ParentSnapshotID
+	safeLogPrintf("commit queue: rebasing direct-child grown payload for %s onto rev %d (size %d -> %d)", entry.Path, proof.rev, proof.size, entry.Size)
+	return true
+}
+
 func (cq *CommitQueue) oldestQueuedForPathLocked(path string) *CommitEntry {
 	if cq == nil || path == "" {
 		return nil
@@ -1883,9 +2145,23 @@ func (cq *CommitQueue) validateEntryPayloadFresh(entry *CommitEntry) error {
 	payloadBaseRev := entry.payloadBaseRevision()
 	watermark := cq.effectiveDurableWatermark(entry)
 	if watermark > 0 && payloadBaseRev >= 0 && payloadBaseRev < watermark {
-		entry.DisableAutoResolveLWW = true
-		return fmt.Errorf("%w: %s payload base rev %d is older than durable watermark rev %d",
-			errCommitPayloadStale, entry.Path, payloadBaseRev, watermark)
+		if entry.growthRebaseRev > 0 {
+			if entry.growthRebaseRev != watermark || entry.BaseRev != watermark ||
+				entry.growthRebaseParentSnapshotID == "" ||
+				entry.growthRebaseParentSnapshotID != entry.ParentSnapshotID {
+				entry.DisableAutoResolveLWW = true
+				return fmt.Errorf("%w: %s growth rebase was authorized at rev %d but durable watermark is rev %d",
+					errCommitPayloadStale, entry.Path, entry.growthRebaseRev, watermark)
+			}
+		} else if cq.maybeRebaseGrownPayloadOntoWatermark(entry, watermark) {
+			// Keep going: this is a later growth of the same path, not a
+			// stale sibling snapshot. Authorization is recorded on entry so
+			// nested payload reads do not repeat the remote identity proof.
+		} else {
+			entry.DisableAutoResolveLWW = true
+			return fmt.Errorf("%w: %s payload base rev %d is older than durable watermark rev %d",
+				errCommitPayloadStale, entry.Path, payloadBaseRev, watermark)
+		}
 	}
 	if entry.ShadowGen != 0 && cq != nil && cq.shadows != nil {
 		if activeGen := cq.shadows.ActiveGeneration(entry.Path); activeGen != entry.ShadowGen {
@@ -2123,17 +2399,19 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 		return 0, fmt.Errorf("no shadow store")
 	}
 
-	expectedRevision := entry.BaseRev
 	layerRef := cq.layerRefSnapshot()
-	if entry.Kind == PendingOverwrite && expectedRevision <= 0 && layerRef == "" {
-		return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
-	}
 	apiPath := cq.remotePath(entry.Path)
 	if layerRef != "" {
-		return cq.uploadLayerEntry(ctx, layerRef, entry, apiPath, expectedRevision)
+		return cq.uploadLayerEntry(ctx, layerRef, entry, apiPath, entry.BaseRev)
 	}
 	if err := cq.validateEntryPayloadFresh(entry); err != nil {
 		return 0, err
+	}
+	// Validation may safely authorize a base-zero PendingNew direct child to
+	// overwrite the exact parent revision this live queue just landed.
+	expectedRevision := entry.BaseRev
+	if entry.Kind == PendingOverwrite && expectedRevision <= 0 {
+		return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
 	}
 
 	// ShadowSpill entries: stream directly from shadow file to avoid loading
@@ -2305,6 +2583,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	if layerRef == "" {
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	}
+	cq.rememberLanded(entry.Path, committedRev, entry.Size, "", cq.checksumLandedPayload(entry), entry.SnapshotID)
 	if cq.OnUploaded != nil {
 		cq.OnUploaded(entry, committedRev)
 	}
@@ -2531,6 +2810,46 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 		cq.onCommitTerminalFailure(entry, err)
 		return
 	}
+	if cq.maybeRebaseGrownPayloadAgainstRemote(entry, serverRev, stat.Size, stat.ResourceID, serverData) {
+		if cq.discardSupersededEntry(entry) {
+			return
+		}
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			return
+		}
+		uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(int64(len(localData))))
+		if !ok {
+			cq.removeFromQueue(entry)
+			return
+		}
+		uploadStart := time.Now()
+		var committedRev int64
+		var uploadErr error
+		threshold := cq.directPutThreshold()
+		if len(localData) == 0 || (threshold > 0 && int64(len(localData)) < threshold) {
+			committedRev, uploadErr = cq.client.WriteCtxConditionalWithRevision(uploadCtx, apiPath, localData, entry.BaseRev)
+		} else {
+			uploadErr = uploadBufferedRemoteFile(uploadCtx, cq.client, apiPath, localData, entry.BaseRev)
+		}
+		uploadCancel()
+		if cq.perf != nil {
+			cq.perf.recordRemoteOp(perfRemoteWrite, uploadErr, time.Since(uploadStart), uint64(len(localData)))
+		}
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			return
+		}
+		if uploadErr != nil {
+			safeLogPrintf("commit queue: grown-payload overwrite failed for %s: %v", entry.Path, uploadErr)
+			cq.onCommitTerminalFailure(entry, uploadErr)
+			return
+		}
+		if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err != nil {
+			cq.onCommitPostUploadFailure(entry, err)
+		}
+		return
+	}
 
 	// Branch 1: idempotent — content already matches server.
 	if bytes.Equal(localData, serverData) {
@@ -2699,6 +3018,51 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		}
 	}()
 	if stat.Size != localSize {
+		var remoteBody []byte
+		if localSize > stat.Size && stat.Size >= 0 && stat.Size <= 1<<20 {
+			readCtx, readCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			remoteBody, _ = cq.client.ReadCtx(readCtx, apiPath)
+			readCancel()
+		}
+		if localSize > stat.Size && cq.maybeRebaseGrownPayloadAgainstRemote(entry, stat.Revision, stat.Size, stat.ResourceID, remoteBody) {
+			safeLogPrintf("commit queue: ShadowSpill growth overwrite for %s (local %d bytes vs server %d bytes at rev %d)", entry.Path, localSize, stat.Size, stat.Revision)
+			if fd != nil {
+				_ = fd.Close()
+				fd = nil
+			}
+			if release != nil {
+				release()
+				release = nil
+			}
+			uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(entry.Size))
+			if !ok {
+				cq.removeFromQueue(entry)
+				return
+			}
+			uploadStart := time.Now()
+			committedRev, uploadErr := uploadFromShadowRemoteWithRevisionAndGeneration(uploadCtx, cq.client, cq.shadows, entry.Path, apiPath, entry.BaseRev, entry.ShadowGen)
+			uploadCancel()
+			if cq.perf != nil {
+				var bytes uint64
+				if entry.Size > 0 {
+					bytes = uint64(entry.Size)
+				}
+				cq.perf.recordRemoteOp(perfRemoteWrite, uploadErr, time.Since(uploadStart), bytes)
+			}
+			if cq.isEntryCanceled(entry) {
+				cq.removeFromQueue(entry)
+				return
+			}
+			if uploadErr != nil {
+				safeLogPrintf("commit queue: ShadowSpill growth overwrite failed for %s: %v", entry.Path, uploadErr)
+				cq.onCommitTerminalFailure(entry, uploadErr)
+				return
+			}
+			if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err != nil {
+				cq.onCommitPostUploadFailure(entry, err)
+			}
+			return
+		}
 		safeLogPrintf("commit queue: ShadowSpill conflict for %s is genuine (local %d bytes vs server %d bytes), terminal failure", entry.Path, localSize, stat.Size)
 		cq.onCommitTerminalFailure(entry, nil)
 		return

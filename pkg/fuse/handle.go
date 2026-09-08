@@ -82,11 +82,22 @@ type FileHandle struct {
 	// destroy the replacement file's staged state, so only store generations
 	// this handle actually created may be removed (gens are monotonic per
 	// store, so a stale value simply never matches).
-	WriteBackGen       uint64 // writeBack generation staged by this handle (0 = none)
-	PendingIndexGen    uint64 // pendingIndex generation staged by this handle (0 = none)
-	ShadowStageGen     uint64 // shadowStore content generation staged by this handle (0 = none)
-	ShadowStageSeq     uint64 // DirtySeq represented by ShadowStageGen
-	RemoteCommitUnlock func() // held same-path commit lock while local shadow state is reserved
+	WriteBackGen    uint64 // writeBack generation staged by this handle (0 = none)
+	PendingIndexGen uint64 // pendingIndex generation staged by this handle (0 = none)
+	ShadowStageGen  uint64 // shadowStore content generation staged by this handle (0 = none)
+	ShadowStageSeq  uint64 // DirtySeq represented by ShadowStageGen
+	// ContentSnapshotID is the latest full staged image from which this
+	// handle's current bytes descend. A new staging generation records it as
+	// ParentSnapshotID, then advances ContentSnapshotID to its own random ID.
+	// StagedSnapshotSeq makes repeated Flush/Fsync of one DirtySeq reuse the
+	// same identity rather than fabricating sibling snapshots for equal bytes.
+	ContentSnapshotID      string
+	StagedSnapshotID       string
+	StagedParentSnapshotID string
+	StagedSnapshotSeq      uint64
+	LineageTrusted         bool
+	StagedLineageTrusted   bool
+	RemoteCommitUnlock     func() // held same-path commit lock while local shadow state is reserved
 	// A zero truncate can reach a sibling while it holds mu waiting for the
 	// path lock. Publish the event without taking that sibling's mu.
 	pendingSQLiteTruncate atomic.Pointer[sqliteHandleTruncate]
