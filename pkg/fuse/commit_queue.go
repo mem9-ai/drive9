@@ -1012,6 +1012,10 @@ func (cq *CommitQueue) CancelPathIfInode(path string, ino uint64) {
 	}
 
 	cq.mu.Lock()
+	// The canceled inode may be the old incarnation of a path that has already
+	// been recreated. Never let its successful-commit proof authorize a later
+	// growth rebase for that pathname.
+	delete(cq.landed, path)
 	if e, ok := cq.inFlight[path]; ok {
 		markCanceled(e)
 	}
@@ -1116,6 +1120,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	}
 
 	cq.mu.Lock()
+	delete(cq.landed, path)
 	if e, ok := cq.inFlight[path]; ok {
 		markCanceled(e)
 	}
@@ -1187,6 +1192,11 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 // is entry-scoped, so future entries under the same prefix are unaffected.
 func (cq *CommitQueue) CancelPrefix(prefix string) {
 	cq.mu.Lock()
+	for path := range cq.landed {
+		if strings.HasPrefix(path, prefix) {
+			delete(cq.landed, path)
+		}
+	}
 	var remaining []*CommitEntry
 	var cancelled []string
 	var cancels []context.CancelFunc
@@ -1569,11 +1579,11 @@ func (cq *CommitQueue) rememberLanded(path string, rev, size int64, resourceID, 
 		cq.mu.Unlock()
 		return
 	}
-	prev := cq.landed[path]
-	if rev >= prev.rev {
-		cq.landedClock++
-		cq.landed[path] = pathCommitLandmark{rev: rev, size: size, resourceID: resourceID, checksum: checksum, snapshotID: snapshotID, lastUsed: cq.landedClock}
-	}
+	// Same-path queue commits are serialized. Always replace the prior proof:
+	// delete/recreate can legitimately reset the server revision, so numeric
+	// ordering alone must not retain a landmark from the old incarnation.
+	cq.landedClock++
+	cq.landed[path] = pathCommitLandmark{rev: rev, size: size, resourceID: resourceID, checksum: checksum, snapshotID: snapshotID, lastUsed: cq.landedClock}
 	cq.pruneLandedLocked()
 	cq.mu.Unlock()
 }
@@ -1715,6 +1725,7 @@ func (cq *CommitQueue) endInFlight(entry *CommitEntry) {
 	if cq.inFlight[entry.Path] == entry {
 		delete(cq.inFlight, entry.Path)
 	}
+	cq.pruneLandedLocked()
 	cq.mu.Unlock()
 }
 
@@ -2117,35 +2128,10 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 	for _, failure := range failed {
 		entry := failure.entry
 		resultErr := failure.err
-		if errors.Is(resultErr, client.ErrConflict) {
-			unlockPath := cq.lockPath(entry.Path)
-			if entry.DisableAutoResolveLWW {
-				safeLogPrintf("commit queue: fenced batch conflict for %s at base revision %d, keeping terminal", entry.Path, entry.BaseRev)
-				cq.onCommitTerminalFailure(entry, resultErr)
-				unlockPath()
-				cq.endInFlight(entry)
-				continue
-			}
-			if err := cq.validateEntryPayloadFreshCtx(entryCtx, entry); err != nil {
-				if cq.isEntryCanceled(entry) {
-					cq.removeFromQueue(entry)
-					unlockPath()
-					cq.endInFlight(entry)
-					continue
-				}
-				safeLogPrintf("commit queue: batch conflict auto-resolve rejected stale payload for %s: %v", entry.Path, err)
-				cq.onCommitTerminalFailure(entry, err)
-				unlockPath()
-				cq.endInFlight(entry)
-				continue
-			}
-			safeLogPrintf("commit queue: batch conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
-			cq.tryAutoResolveConflict(entryCtx, entry)
-			unlockPath()
-			cq.endInFlight(entry)
-			continue
-		}
-		safeLogPrintf("commit queue: batch write result failed for %s, falling back to single commit: %v", entry.Path, resultErr)
+		// A batch shares one transport cancellation context. Retry each failed
+		// item through commitOne so cancellation of one path cannot poison a
+		// sibling's conflict validation or auto-resolve with that shared context.
+		safeLogPrintf("commit queue: batch write result failed for %s, retrying with an independent single commit: %v", entry.Path, resultErr)
 		cq.commitOne(entry)
 		cq.endInFlight(entry)
 	}
@@ -2477,6 +2463,7 @@ func (cq *CommitQueue) endImmediate(entry *CommitEntry) {
 	}
 	cq.mu.Lock()
 	delete(cq.immediate, entry)
+	cq.pruneLandedLocked()
 	cq.mu.Unlock()
 }
 
@@ -2621,6 +2608,7 @@ func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {
 		if e == entry {
 			cq.queue = append(cq.queue[:i], cq.queue[i+1:]...)
 			cq.removeQueuedLocked(entry)
+			cq.pruneLandedLocked()
 			return
 		}
 	}
