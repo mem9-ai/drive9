@@ -40,6 +40,11 @@ var testHookBeforeGVisorShadowSpillFlushFence func(path string)
 // Unlinked transition atomic for the whole open-handle set.
 var testHookBeforeUnlinkedTransition func()
 
+// testHookAfterUnlinkHandleSetLockAttempt fires after a failed TryLock of
+// the whole captured handle set, before the retry sleep. Tests use it to
+// handshake that attach has entered lock contention.
+var testHookAfterUnlinkHandleSetLockAttempt func()
+
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
 // operations to the dat9 HTTP API via the Go SDK client.
 type Dat9FS struct {
@@ -469,7 +474,7 @@ const flushLockTimeout = 60 * time.Second
 // whole captured handle set. The set is acquired with TryLock only: a
 // failed attempt drops every lock already taken and retries, so Unlink
 // never blocks holding a partial set against sibling-mode cleanup.
-const unlinkHandleSetLockTimeout = 15 * time.Second
+var unlinkHandleSetLockTimeout = 15 * time.Second
 
 const (
 	// lookupTransientRetryCount is the number of detached retries after the
@@ -7602,8 +7607,17 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		}
 	}
 
+	if testHookBeforeUnlinkedTransition != nil {
+		testHookBeforeUnlinkedTransition()
+	}
 	failClosed := false
-	_, _ = fs.attachAndMarkOpenHandles(handles, p, snapshot, snapshotShadowGen, size, revision, snapshotOK, failClosed)
+	_, attachFailed := fs.attachAndMarkOpenHandles(handles, p, snapshot, snapshotShadowGen, size, revision, snapshotOK, failClosed)
+	if attachFailed {
+		// Lock timeout (failClosed is false, so attach itself does not
+		// fail). Keep the path index and leave handles linked so Unlink
+		// cannot DELETE/whiteout a name the still-open fd can republish.
+		return nil, false, syscall.EIO
+	}
 	fs.openHandles.UnlinkPath(p)
 	return handles, true, nil
 }
@@ -7628,6 +7642,9 @@ func (fs *Dat9FS) attachAndMarkOpenHandles(handles []*FileHandle, p string, snap
 	for {
 		ordered, ok := tryLockFileHandlesInOrder(handles)
 		if !ok {
+			if testHookAfterUnlinkHandleSetLockAttempt != nil {
+				testHookAfterUnlinkHandleSetLockAttempt()
+			}
 			if !time.Now().Before(deadline) {
 				return 0, true
 			}
@@ -9683,7 +9700,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if info.IsDir() {
 			return gofuse.Status(syscall.EISDIR)
 		}
-		_, preserveOpen, _ := fs.markOpenHandlesUnlinked(ctx, childP, false)
+		_, preserveOpen, markErr := fs.markOpenHandlesUnlinked(ctx, childP, false)
+		if markErr != nil {
+			return httpToFuseStatus(markErr)
+		}
 		if err := overlay.Remove(childP); err != nil {
 			return localErrToFuseStatus(err)
 		}
@@ -9718,7 +9738,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// write fails, the directory entry still exists authoritatively, so
 		// the marking is rolled back — otherwise every later write/flush on
 		// those handles would keep being suppressed and silently drop data.
-		markedGitHandles, _, _ := fs.markOpenHandlesUnlinked(ctx, childP, false)
+		markedGitHandles, _, markErr := fs.markOpenHandlesUnlinked(ctx, childP, false)
+		if markErr != nil {
+			return httpToFuseStatus(markErr)
+		}
 		st := fs.putGitWhiteout(ctx, childP)
 		if st != gofuse.OK {
 			fs.unmarkOpenHandlesAfterFailedUnlink(childP, markedGitHandles)
@@ -9728,7 +9751,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// whiteout request was in flight escaped the first mark; mark them
 		// now so their later write/flush/release is suppressed too and the
 		// overlay entry cannot be upserted back over the whiteout.
-		_, _, _ = fs.markOpenHandlesUnlinked(ctx, childP, false)
+		if _, _, markErr := fs.markOpenHandlesUnlinked(ctx, childP, false); markErr != nil {
+			return httpToFuseStatus(markErr)
+		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
 		fs.touchDirectoryChangeTime(parentPath, time.Now())
@@ -9938,7 +9963,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// marking; mark them now (no remote snapshot — the path is already gone)
 	// so their Flush/Fsync/Release guards see fh.Unlinked and cannot
 	// resurrect the path.
-	if _, anyOpen, _ := fs.markOpenHandlesUnlinked(ctx, childP, false); anyOpen {
+	if _, anyOpen, markErr := fs.markOpenHandlesUnlinked(ctx, childP, false); markErr != nil {
+		status = httpToFuseStatus(markErr)
+		return status
+	} else if anyOpen {
 		preserveOpen = true
 	}
 

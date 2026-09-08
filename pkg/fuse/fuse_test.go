@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -3414,28 +3415,27 @@ func TestAttachAndMarkRetriesInsteadOfDeadlockingSiblingModeClear(t *testing.T) 
 	if len(ordered) != 2 {
 		t.Fatalf("lock order len = %d, want 2", len(ordered))
 	}
-	first, second := ordered[0], ordered[1]
+	_, second := ordered[0], ordered[1]
 
 	second.Lock()
+	entered := make(chan struct{})
+	var enterOnce sync.Once
+	testHookAfterUnlinkHandleSetLockAttempt = func() {
+		enterOnce.Do(func() { close(entered) })
+	}
+	t.Cleanup(func() { testHookAfterUnlinkHandleSetLockAttempt = nil })
+
 	attachDone := make(chan struct{})
 	go func() {
 		defer close(attachDone)
 		snapshotOK, failClosed := false, false
 		_, _ = fs.attachAndMarkOpenHandles([]*FileHandle{fhA, fhB}, "/a.bin", nil, 0, 0, 0, snapshotOK, failClosed)
 	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if first.TryLock() {
-			first.Unlock()
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("attachAndMark still holding the first handle while waiting for the second")
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attachAndMark never reported a failed set-lock attempt")
 	}
-
 	siblingDone := make(chan struct{})
 	go func() {
 		defer close(siblingDone)
@@ -3451,6 +3451,43 @@ func TestAttachAndMarkRetriesInsteadOfDeadlockingSiblingModeClear(t *testing.T) 
 	case <-attachDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("attachAndMark deadlocked after sibling unlock")
+	}
+}
+
+func TestMarkOpenHandlesUnlinkedFailClosedKeepsPathIndexOnLockTimeout(t *testing.T) {
+	const path = "/a.bin"
+	fhA := &FileHandle{Ino: 1, Path: path}
+	fhB := &FileHandle{Ino: 1, Path: path}
+	fs := &Dat9FS{openHandles: NewOpenHandleIndex()}
+	fs.openHandles.Add(fhA)
+	fs.openHandles.Add(fhB)
+	ordered := fileHandlesLockOrder([]*FileHandle{fhA, fhB})
+	second := ordered[1]
+
+	oldTimeout := unlinkHandleSetLockTimeout
+	unlinkHandleSetLockTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { unlinkHandleSetLockTimeout = oldTimeout })
+
+	testHookBeforeUnlinkedTransition = func() {
+		second.Lock()
+	}
+	t.Cleanup(func() {
+		testHookBeforeUnlinkedTransition = nil
+		second.Unlock()
+	})
+
+	marked, anyOpen, err := fs.markOpenHandlesUnlinked(context.Background(), path, false)
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("markOpenHandlesUnlinked err = %v, want EIO", err)
+	}
+	if anyOpen || marked != nil {
+		t.Fatalf("marked/anyOpen = %v/%t, want nil/false", marked, anyOpen)
+	}
+	if fhA.Unlinked || fhB.Unlinked {
+		t.Fatal("lock timeout must not set Unlinked")
+	}
+	if got := fs.openHandles.SnapshotPath(path); len(got) != 2 {
+		t.Fatalf("SnapshotPath len = %d, want 2 (index must be kept)", len(got))
 	}
 }
 
