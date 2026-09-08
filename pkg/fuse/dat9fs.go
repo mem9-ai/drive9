@@ -3920,29 +3920,6 @@ func (fs *Dat9FS) growthPatchSafeLocked(fh *FileHandle, size int64) bool {
 	return true
 }
 
-// ensureAppendLogWALWriteThroughShadowLocked seeds a write-through shadow for a
-// configured append-log SQLite WAL below the small-file shadow threshold so a
-// sibling checkpoint fd can read committed frames locally instead of remote
-// range GETs. Callers hold fh.mu. Failure degrades to remote reads.
-func (fs *Dat9FS) ensureAppendLogWALWriteThroughShadowLocked(fh *FileHandle, path string) {
-	if fs == nil || fh == nil || fh.Dirty == nil || fs.shadowStore == nil ||
-		!fs.appendLogPathConfigured(path) || !isSQLitePersistentJournalPath(path) ||
-		fh.OrigSize >= smallFileShadowThreshold || fh.ShadowReady || fh.ShadowSpill {
-		return
-	}
-	if !writeBufferHasLoadedFullRange(fh.Dirty) {
-		return
-	}
-	if err := fs.shadowStore.WriteFull(path, fh.Dirty.bytesView(), fh.BaseRev); err != nil {
-		fs.debugf("append-log write-through shadow init failed path=%s err=%v", path, err)
-		return
-	}
-	fh.ShadowReady = true
-	fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(path)
-	fh.ShadowGen = fs.shadowStore.Pin(path)
-	fh.ShadowPinned = true
-}
-
 // finalizeHandleFlushLocked updates the live handle and inode cache after a
 // successful upload using the exact CAS revision that completed, when known.
 // Callers must hold fh.mu.
@@ -11717,10 +11694,6 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 					fh.ShadowGen = fs.shadowStore.Pin(p)
 					fh.ShadowPinned = true
 				}
-			}
-
-			if input.Flags&syscall.O_TRUNC == 0 {
-				fs.ensureAppendLogWALWriteThroughShadowLocked(fh, p)
 			}
 
 			if fh.ShadowSpill {

@@ -147,7 +147,7 @@ Result: every page is one remote range GET, counted as
 Change:
 
 1. Allow revision-gated clean-sibling reuse for sidecar reads: serve from a clean sibling buffer/shadow only when its revision equals the latest committed revision (`latestCommittedRevisionWithSize`), preserving the `-shm` short-read protection.
-2. Enable a write-through path shadow for configured append-log WAL files below 64 MiB so the checkpoint fd reads the local shadow instead of remote ranges.
+2. Removed after EC2 validation: a sub-64 MiB write-through shadow leg proved to be dead code — `preloadWritableHandle` lazy-loads all files at open, so the `writeBufferHasLoadedFullRange` gate never passes and the shadow is never created. The clean-sibling buffer leg alone carries checkpoint reads; the >= 64 MiB ShadowSpill mechanism is unchanged and independent.
 
 Tests:
 
