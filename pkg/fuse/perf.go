@@ -140,11 +140,12 @@ type fusePerfCounters struct {
 	readRetrySuccess     atomicUint64
 	readRetryExhausted   atomicUint64
 
-	commitEnqueue      atomicUint64
-	commitEnqueueError atomicUint64
-	commitRetry        atomicUint64
-	commitSuccess      atomicUint64
-	commitFailure      atomicUint64
+	commitEnqueue         atomicUint64
+	commitEnqueueError    atomicUint64
+	commitRetry           atomicUint64
+	commitSuccess         atomicUint64
+	commitFailure         atomicUint64
+	commitTerminalFailure atomicUint64
 
 	uploaderSubmit       atomicUint64
 	uploaderSyncFallback atomicUint64
@@ -556,6 +557,7 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	snap.Counters["commit_retry"] = p.commitRetry.load()
 	snap.Counters["commit_success"] = p.commitSuccess.load()
 	snap.Counters["commit_failure"] = p.commitFailure.load()
+	snap.Counters["commit_terminal_failure"] = p.commitTerminalFailure.load()
 	snap.Counters["uploader_submit"] = p.uploaderSubmit.load()
 	snap.Counters["uploader_sync_fallback"] = p.uploaderSyncFallback.load()
 	snap.Counters["uploader_success"] = p.uploaderSuccess.load()
@@ -652,9 +654,9 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 	writePerfLine(w, "drive9: perf retries lookup_total=%d lookup_success=%d lookup_exhausted=%d read_total=%d read_success=%d read_exhausted=%d\n",
 		snap.Counters["lookup_retry_total"], snap.Counters["lookup_retry_success"], snap.Counters["lookup_retry_exhausted"],
 		snap.Counters["read_retry_total"], snap.Counters["read_retry_success"], snap.Counters["read_retry_exhausted"])
-	writePerfLine(w, "drive9: perf commit enqueue=%d enqueue_errors=%d retries=%d success=%d failure=%d drain_count=%d drain_total=%s\n",
+	writePerfLine(w, "drive9: perf commit enqueue=%d enqueue_errors=%d retries=%d success=%d failure=%d terminal_failure=%d drain_count=%d drain_total=%s\n",
 		snap.Counters["commit_enqueue"], snap.Counters["commit_enqueue_error"], snap.Counters["commit_retry"],
-		snap.Counters["commit_success"], snap.Counters["commit_failure"],
+		snap.Counters["commit_success"], snap.Counters["commit_failure"], snap.Counters["commit_terminal_failure"],
 		snap.Counters["commit_drain_count"], time.Duration(snap.Counters["commit_drain_total_ns"]).Truncate(time.Millisecond))
 	writePerfLine(w, "drive9: perf flush_detail stage_shadow_count=%d stage_shadow_avg=%s stage_shadow_max=%s snapshot_wb_count=%d snapshot_wb_avg=%s snapshot_wb_max=%s\n",
 		snap.Counters["flush_stage_shadow_count"],

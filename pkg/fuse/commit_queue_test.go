@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -1840,6 +1841,16 @@ func TestCommitQueueAutoResolveLWWSecond409Fallback(t *testing.T) {
 
 // Test axis 4: Non-conflict errors (500) still follow existing retry + terminal failure.
 func TestCommitQueueNonConflictErrorUnchanged(t *testing.T) {
+	var logBuf bytes.Buffer
+	oldWriter := log.Writer()
+	oldFlags := log.Flags()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+	})
+
 	var calls int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -1847,7 +1858,8 @@ func TestCommitQueueNonConflictErrorUnchanged(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	shadow, err := NewShadowStore(t.TempDir())
+	// Disable free-ratio quota so this test is hermetic on low-disk hosts.
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1865,6 +1877,8 @@ func TestCommitQueueNonConflictErrorUnchanged(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	perf := newFusePerfCounters(true)
+	cq.SetPerfCounters(perf)
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/500.txt",
 		BaseRev: 5,
@@ -1886,6 +1900,101 @@ func TestCommitQueueNonConflictErrorUnchanged(t *testing.T) {
 	meta, ok := pending.GetMeta("/500.txt")
 	if !ok || meta.Kind != PendingConflict {
 		t.Fatalf("pending entry should be PendingConflict, got kind=%v ok=%v", meta.Kind, ok)
+	}
+
+	logged := logBuf.String()
+	for _, want := range []string{
+		"drive9: error",
+		"event=commit_terminal_failure",
+		"path=/500.txt",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("terminal failure log missing %q:\n%s", want, logged)
+		}
+	}
+	if strings.Count(logged, "drive9: error event=commit_terminal_failure path=/500.txt reason=upload_failure") != 1 {
+		t.Fatalf("want exactly one alertable upload_failure line for /500.txt, got:\n%s", logged)
+	}
+	for _, line := range strings.Split(logged, "\n") {
+		if strings.Contains(line, "upload attempt") && strings.Contains(line, "drive9: error") {
+			t.Fatalf("retry attempts must not be logged as drive9: error: %s", line)
+		}
+	}
+	snap := perf.snapshot()
+	if got := snap.Counters["commit_terminal_failure"]; got != 1 {
+		t.Fatalf("commit_terminal_failure = %d, want 1", got)
+	}
+	if got := snap.Counters["commit_failure"]; got != 1 {
+		t.Fatalf("commit_failure = %d, want 1", got)
+	}
+}
+
+func TestClassifyCommitTerminalReason(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{nil, "conflict"},
+		{errLayerRolledBack, "abandoned"},
+		{fmt.Errorf("%w: 409", errLayerRolledBack), "abandoned"},
+		{client.ErrConflict, "conflict"},
+		{errCommitPayloadStale, "conflict"},
+		{fmt.Errorf("HTTP 503"), "upload_failure"},
+	}
+	for _, tc := range cases {
+		if got := classifyCommitTerminalReason(tc.err); got != tc.want {
+			t.Errorf("classifyCommitTerminalReason(%v) = %q, want %q", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestOnCommitTerminalFailureStaleGenerationSkipsAlert(t *testing.T) {
+	var logBuf bytes.Buffer
+	oldWriter := log.Writer()
+	oldFlags := log.Flags()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+	})
+
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldGen, err := pending.PutWithBaseRev("/stale.txt", 4, PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/stale.txt", 5, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(nil, nil, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	perf := newFusePerfCounters(true)
+	cq.SetPerfCounters(perf)
+	cq.onCommitTerminalFailure(&CommitEntry{
+		Path:            "/stale.txt",
+		Kind:            PendingNew,
+		PendingIndexGen: oldGen,
+	}, fmt.Errorf("upload failed"))
+
+	logged := logBuf.String()
+	if strings.Contains(logged, "event=commit_terminal_failure") {
+		t.Fatalf("stale generation must not emit alertable terminal-failure:\n%s", logged)
+	}
+	snap := perf.snapshot()
+	if got := snap.Counters["commit_terminal_failure"]; got != 0 {
+		t.Fatalf("commit_terminal_failure = %d, want 0", got)
+	}
+	if got := snap.Counters["commit_failure"]; got != 0 {
+		t.Fatalf("commit_failure = %d, want 0", got)
+	}
+	meta, ok := pending.GetMeta("/stale.txt")
+	if !ok || meta.Kind == PendingConflict {
+		t.Fatalf("newer pending must not be marked conflict, kind=%v ok=%v", meta.Kind, ok)
 	}
 }
 

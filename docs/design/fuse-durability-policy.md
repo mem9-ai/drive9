@@ -117,6 +117,10 @@ Therefore:
 
 - `close-sync` is primarily enforced in `Flush`;
 - `write-sync` is enforced at the end of `Write`;
+- pending-new `rename(2)` (`write tmp; mv tmp final`) is also remote-durable
+  on `close-sync` and `write-sync` before rename returns. Upload failure
+  surfaces as `EAGAIN` and keeps the local shadow. Writeback/`auto`/
+  `interactive`/`fsync` mounts still enqueue that rename asynchronously;
 - `Release` handles cleanup and fallback synchronization, but it is not the
   primary close-sync error propagation point.
 
