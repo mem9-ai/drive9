@@ -2268,10 +2268,6 @@ func (cq *CommitQueue) effectiveDurableWatermark(entry *CommitEntry) int64 {
 	return watermark
 }
 
-func (cq *CommitQueue) readEntryPayload(entry *CommitEntry) ([]byte, error) {
-	return cq.readEntryPayloadCtx(context.Background(), entry)
-}
-
 func (cq *CommitQueue) readEntryPayloadCtx(ctx context.Context, entry *CommitEntry) ([]byte, error) {
 	if entry == nil {
 		return nil, fmt.Errorf("nil commit entry")
