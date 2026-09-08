@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -123,10 +124,16 @@ type casFileServer struct {
 	t    *testing.T
 	path string
 
-	mu       sync.Mutex
-	revision int64
-	body     []byte
-	puts     []casFilePut
+	mu        sync.Mutex
+	revision  int64
+	body      []byte
+	puts      []casFilePut
+	headCalls int
+	getCalls  int
+
+	firstPutStarted chan struct{}
+	releaseFirstPut chan struct{}
+	firstPutGate    sync.Once
 }
 
 type casFilePut struct {
@@ -160,6 +167,12 @@ func (s *casFileServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		s.firstPutGate.Do(func() {
+			if s.firstPutStarted != nil && s.releaseFirstPut != nil {
+				close(s.firstPutStarted)
+				<-s.releaseFirstPut
+			}
+		})
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		wantExpected := fmt.Sprintf("%d", s.revision)
@@ -178,6 +191,7 @@ func (s *casFileServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": s.revision})
 	case http.MethodHead:
 		s.mu.Lock()
+		s.headCalls++
 		revision := s.revision
 		size := len(s.body)
 		s.mu.Unlock()
@@ -187,6 +201,7 @@ func (s *casFileServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	case http.MethodGet:
 		s.mu.Lock()
+		s.getCalls++
 		body := append([]byte(nil), s.body...)
 		s.mu.Unlock()
 		_, _ = w.Write(body)
@@ -201,6 +216,19 @@ func (s *casFileServer) snapshot() (int64, []byte, []casFilePut) {
 	puts := make([]casFilePut, len(s.puts))
 	copy(puts, s.puts)
 	return s.revision, append([]byte(nil), s.body...), puts
+}
+
+func (s *casFileServer) proofRequestCounts() (heads, gets int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.headCalls, s.getCalls
+}
+
+func (s *casFileServer) recreate(body []byte) {
+	s.mu.Lock()
+	s.revision = 1
+	s.body = append([]byte(nil), body...)
+	s.mu.Unlock()
 }
 
 func TestDirtySiblingKeepsOriginalBaseRevAfterCommittedRevisionAdvances(t *testing.T) {
@@ -1565,4 +1593,673 @@ func TestShadowSpillDirectPUTCleanupKeepsNewerGeneration(t *testing.T) {
 	if got := shadow.ActiveGeneration(path); got != freshShadowGen {
 		t.Fatalf("shadow generation = %d, want fresh generation %d", got, freshShadowGen)
 	}
+}
+
+func TestCommitQueueRebasesGrownPayloadAfterSmallerSamePathCommit(t *testing.T) {
+	const path = "/kv-1g.db"
+	const headerSnapshot = "header-snapshot"
+	const grownSnapshot = "grown-snapshot"
+	header := bytes.Repeat([]byte("H"), 4096)
+	grown := append(append([]byte(nil), header...), bytes.Repeat([]byte("G"), 8192)...)
+
+	server, ts := newCASFileServer(t, path, 0, nil)
+	defer ts.Close()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	var watermark atomic.Int64
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
+
+	if err := shadow.WriteFull(path, header, 0); err != nil {
+		t.Fatal(err)
+	}
+	headerGen := shadow.ActiveGeneration(path)
+	headerPending, err := pending.PutWithBaseRevAndModeAndLineage(path, int64(len(header)), PendingNew, 0, 0, false, headerSnapshot, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path: path, BaseRev: 0, PayloadBaseRev: 0, PayloadBaseRevSet: true,
+		Size: int64(len(header)), Kind: PendingNew, MutationSeq: 1,
+		ShadowGen: headerGen, PendingIndexGen: headerPending,
+		SnapshotID: headerSnapshot, liveLineageProof: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitCommitQueueIdle(t, cq)
+	if rev, body, _ := server.snapshot(); rev != 1 || !bytes.Equal(body, header) {
+		t.Fatalf("after header commit rev=%d body=%q, want rev1 header", rev, body)
+	}
+
+	if err := shadow.WriteFull(path, grown, 0); err != nil {
+		t.Fatal(err)
+	}
+	grownGen := shadow.ActiveGeneration(path)
+	grownPending, err := pending.PutWithBaseRevAndModeAndLineage(path, int64(len(grown)), PendingNew, 0, 0, false, grownSnapshot, headerSnapshot, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path: path, BaseRev: 0, PayloadBaseRev: 0, PayloadBaseRevSet: true,
+		Size: int64(len(grown)), Kind: PendingNew, MutationSeq: 2,
+		ShadowGen: grownGen, PendingIndexGen: grownPending,
+		SnapshotID: grownSnapshot, ParentSnapshotID: headerSnapshot, liveLineageProof: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitCommitQueueIdle(t, cq)
+	if rev, body, puts := server.snapshot(); rev != 2 || !bytes.Equal(body, grown) || len(puts) != 2 {
+		t.Fatalf("after growth rev=%d body-len=%d puts=%d, want rev2 grown-len=%d and 2 PUTs", rev, len(body), len(puts), len(grown))
+	}
+}
+
+func TestCommitQueueLandedProofUsesUploadedPayloadAfterShadowReplacement(t *testing.T) {
+	const path = "/concurrent-growth.db"
+	const parentSnapshot = "snapshot-A"
+	const childSnapshot = "snapshot-B"
+	parent := []byte("parent-image-A")
+	child := append(append([]byte(nil), parent...), []byte("-grown-image-B")...)
+
+	server, ts := newCASFileServer(t, path, 0, nil)
+	defer ts.Close()
+	server.firstPutStarted = make(chan struct{})
+	server.releaseFirstPut = make(chan struct{})
+	defer func() {
+		select {
+		case <-server.releaseFirstPut:
+		default:
+			close(server.releaseFirstPut)
+		}
+	}()
+
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	var watermark atomic.Int64
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
+
+	if err := shadow.WriteFull(path, parent, 0); err != nil {
+		t.Fatal(err)
+	}
+	parentShadowGen := shadow.ActiveGeneration(path)
+	parentPendingGen, err := pending.PutWithBaseRevAndModeAndLineage(path, int64(len(parent)), PendingNew, 0, 0, false, parentSnapshot, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path: path, BaseRev: 0, PayloadBaseRev: 0, PayloadBaseRevSet: true,
+		Size: int64(len(parent)), Kind: PendingNew, MutationSeq: 1,
+		ShadowGen: parentShadowGen, PendingIndexGen: parentPendingGen,
+		SnapshotID: parentSnapshot, liveLineageProof: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-server.firstPutStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("parent upload did not reach server")
+	}
+
+	// The parent upload has already bound its private payload, but its success
+	// tail has not run. Replace the path's active shadow with the exact child,
+	// matching a second handle staging while the first upload is in flight.
+	if err := shadow.WriteFull(path, child, 0); err != nil {
+		t.Fatal(err)
+	}
+	childShadowGen := shadow.ActiveGeneration(path)
+	childPendingGen, err := pending.PutWithBaseRevAndModeAndLineage(path, int64(len(child)), PendingNew, 0, 0, false, childSnapshot, parentSnapshot, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path: path, BaseRev: 0, PayloadBaseRev: 0, PayloadBaseRevSet: true,
+		Size: int64(len(child)), Kind: PendingNew, MutationSeq: 2,
+		ShadowGen: childShadowGen, PendingIndexGen: childPendingGen,
+		SnapshotID: childSnapshot, ParentSnapshotID: parentSnapshot, liveLineageProof: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(server.releaseFirstPut)
+
+	waitCommitQueueIdle(t, cq)
+	rev, body, puts := server.snapshot()
+	if rev != 2 || !bytes.Equal(body, child) || len(puts) != 2 {
+		t.Fatalf("after overlapping commits rev=%d body=%q puts=%d, want rev2 exact child and two PUTs", rev, body, len(puts))
+	}
+	if puts[0].expected != "0" || !bytes.Equal(puts[0].body, parent) {
+		t.Fatalf("parent PUT expected=%q body=%q, want base0 exact parent", puts[0].expected, puts[0].body)
+	}
+	if puts[1].expected != "1" || !bytes.Equal(puts[1].body, child) {
+		t.Fatalf("child PUT expected=%q body=%q, want base1 exact child", puts[1].expected, puts[1].body)
+	}
+}
+
+func TestOpenHandlePathWideShadowPreloadDropsLineageTrust(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	const path = "/generation-race.db"
+	activePayload := []byte("another handle's active generation")
+	if err := shadow.WriteFull(path, activePayload, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	ino := fs.inodes.Lookup(path, false, int64(len(activePayload)), time.Now())
+	source := &FileHandle{
+		Ino:               ino,
+		Path:              path,
+		Dirty:             fs.newWriteBuffer(path, maxPreloadSize, 0),
+		IsNew:             true,
+		ShadowReady:       true,
+		ShadowStageGen:    0,
+		ContentSnapshotID: "source-snapshot",
+		LineageTrusted:    true,
+	}
+	if _, err := source.Dirty.Write(0, []byte("source handle bytes")); err != nil {
+		t.Fatal(err)
+	}
+	source.DirtySeq = fs.markDirtySize(ino, source.Dirty.Size())
+	fs.openHandles.Add(source)
+
+	target := &FileHandle{
+		Ino:   ino,
+		Path:  path,
+		Dirty: fs.newWriteBuffer(path, maxPreloadSize, 0),
+	}
+	if !fs.loadWritableHandleFromOpenHandleLocked(target) {
+		t.Fatal("loadWritableHandleFromOpenHandleLocked returned false")
+	}
+	if got := target.Dirty.Bytes(); !bytes.Equal(got, activePayload) {
+		t.Fatalf("preloaded bytes = %q, want path-wide active shadow %q", got, activePayload)
+	}
+	if target.LineageTrusted {
+		t.Fatal("path-wide shadow preload retained another handle's lineage trust")
+	}
+}
+
+func TestCommitQueueDoesNotRebaseLargerStaleCheckpointOntoLandedMain(t *testing.T) {
+	const path = "/app.db"
+	base := []byte("base-rev1")
+	checkpointB := []byte("checkpoint-B-rev2")
+	staleA := append([]byte("checkpoint-A-from-rev1:"), bytes.Repeat([]byte("x"), len(checkpointB))...)
+
+	server, ts := newCASFileServer(t, path, 1, base)
+	defer ts.Close()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	var watermark atomic.Int64
+	watermark.Store(1)
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
+
+	stage := func(payload []byte, baseRev int64) (uint64, uint64) {
+		t.Helper()
+		if err := shadow.WriteFull(path, payload, baseRev); err != nil {
+			t.Fatal(err)
+		}
+		shadowGen := shadow.ActiveGeneration(path)
+		pendingGen, err := pending.PutWithBaseRev(path, int64(len(payload)), PendingOverwrite, baseRev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return shadowGen, pendingGen
+	}
+
+	shadowGen, pendingGen := stage(checkpointB, 1)
+	if err := cq.CommitNow(context.Background(), &CommitEntry{
+		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
+		Size: int64(len(checkpointB)), Kind: PendingOverwrite,
+		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rev, body, puts := server.snapshot(); rev != 2 || !bytes.Equal(body, checkpointB) || len(puts) != 1 {
+		t.Fatalf("checkpoint B rev=%d body=%q puts=%d, want rev2 exact B and one PUT", rev, body, len(puts))
+	}
+
+	shadowGen, pendingGen = stage(staleA, 1)
+	err = cq.CommitNow(context.Background(), &CommitEntry{
+		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
+		Size: int64(len(staleA)), Kind: PendingOverwrite,
+		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+		DurableWatermarkRev: 2, DisableAutoResolveLWW: true,
+	})
+	if !errors.Is(err, errCommitPayloadStale) {
+		t.Fatalf("stale larger checkpoint err=%v, want errCommitPayloadStale", err)
+	}
+	if rev, body, puts := server.snapshot(); rev != 2 || !bytes.Equal(body, checkpointB) || len(puts) != 1 {
+		t.Fatalf("after stale checkpoint rev=%d body=%q puts=%d, want rev2 exact B and no second PUT", rev, body, len(puts))
+	}
+}
+
+func TestCommitQueueGrowthRebaseCannotResurrectOlderSQLiteWALGeneration(t *testing.T) {
+	const path = "/app.db-wal"
+	oldHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2)
+	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
+	oldGeneration := append(append([]byte(nil), oldHeader...), bytes.Repeat([]byte("o"), 4096)...)
+
+	server, ts := newCASFileServer(t, path, 1, oldGeneration)
+	defer ts.Close()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	var watermark atomic.Int64
+	watermark.Store(1)
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
+
+	commit := func(payload []byte, payloadBase, durable int64) error {
+		t.Helper()
+		if err := shadow.WriteFull(path, payload, payloadBase); err != nil {
+			t.Fatal(err)
+		}
+		shadowGen := shadow.ActiveGeneration(path)
+		pendingGen, err := pending.PutWithBaseRev(path, int64(len(payload)), PendingOverwrite, payloadBase)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cq.CommitNow(context.Background(), &CommitEntry{
+			Path: path, BaseRev: payloadBase, PayloadBaseRev: payloadBase, PayloadBaseRevSet: true,
+			Size: int64(len(payload)), Kind: PendingOverwrite,
+			ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+			DurableWatermarkRev: durable, DisableAutoResolveLWW: true,
+		})
+	}
+
+	if err := commit(newHeader, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := commit(oldGeneration, 1, 2); !errors.Is(err, errCommitPayloadStale) {
+		t.Fatalf("old WAL generation err=%v, want errCommitPayloadStale", err)
+	}
+	if rev, body, puts := server.snapshot(); rev != 2 || !bytes.Equal(body, newHeader) || len(puts) != 1 {
+		t.Fatalf("after stale WAL rev=%d len=%d puts=%d, want rev2 exact new header and no second PUT", rev, len(body), len(puts))
+	}
+}
+
+func TestCommitQueueGrowthRebaseRejectsForkedPendingNew(t *testing.T) {
+	const path = "/fork.db-wal"
+	base := []byte("landed-A")
+	childB := []byte("landed-A-child-B")
+	siblingC := []byte("landed-A-larger-sibling-C")
+
+	server, ts := newCASFileServer(t, path, 1, base)
+	defer ts.Close()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	var watermark atomic.Int64
+	watermark.Store(1)
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
+	cq.rememberLanded(path, 1, int64(len(base)), "", payloadChecksum(base), "snapshot-A")
+
+	commitChild := func(payload []byte, snapshotID string) error {
+		t.Helper()
+		if err := shadow.WriteFull(path, payload, 0); err != nil {
+			t.Fatal(err)
+		}
+		shadowGen := shadow.ActiveGeneration(path)
+		pendingGen, err := pending.PutWithBaseRevAndModeAndLineage(path, int64(len(payload)), PendingNew, 0, 0, false, snapshotID, "snapshot-A", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cq.CommitNow(context.Background(), &CommitEntry{
+			Path: path, BaseRev: 0, PayloadBaseRev: 0, PayloadBaseRevSet: true,
+			Size: int64(len(payload)), Kind: PendingNew,
+			ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+			SnapshotID: snapshotID, ParentSnapshotID: "snapshot-A", liveLineageProof: true,
+		})
+	}
+
+	if err := commitChild(childB, "snapshot-B"); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitChild(siblingC, "snapshot-C"); !errors.Is(err, errCommitPayloadStale) {
+		t.Fatalf("forked sibling err=%v, want errCommitPayloadStale", err)
+	}
+	if rev, body, puts := server.snapshot(); rev != 2 || !bytes.Equal(body, childB) || len(puts) != 1 {
+		t.Fatalf("fork result rev=%d body=%q puts=%d, want only child B at rev2", rev, body, len(puts))
+	}
+}
+
+func TestCommitQueueGrowthRebaseValidationIsOneShot(t *testing.T) {
+	const path = "/one-shot.db"
+	base := []byte("header")
+	grown := []byte("header-and-grown-payload")
+
+	server, ts := newCASFileServer(t, path, 1, base)
+	defer ts.Close()
+	cq := NewCommitQueue(newTestClient(ts.URL), nil, nil, nil, 1, 8)
+	defer cq.DrainAll()
+	var watermark atomic.Int64
+	watermark.Store(1)
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.rememberLanded(path, 1, int64(len(base)), "", payloadChecksum(base), "snapshot-A")
+	entry := &CommitEntry{
+		Path: path, BaseRev: 0, PayloadBaseRev: 0, PayloadBaseRevSet: true,
+		Size: int64(len(grown)), Kind: PendingNew,
+		SnapshotID: "snapshot-B", ParentSnapshotID: "snapshot-A", liveLineageProof: true,
+	}
+
+	if err := cq.validateEntryPayloadFresh(entry); err != nil {
+		t.Fatal(err)
+	}
+	firstHeads, firstGets := server.proofRequestCounts()
+	if firstHeads != 1 || firstGets != 1 {
+		t.Fatalf("first proof HEAD/GET=%d/%d, want 1/1", firstHeads, firstGets)
+	}
+	if err := cq.validateEntryPayloadFresh(entry); err != nil {
+		t.Fatal(err)
+	}
+	if heads, gets := server.proofRequestCounts(); heads != firstHeads || gets != firstGets {
+		t.Fatalf("repeat validation HEAD/GET=%d/%d, want unchanged %d/%d", heads, gets, firstHeads, firstGets)
+	}
+	watermark.Store(2)
+	if err := cq.validateEntryPayloadFresh(entry); !errors.Is(err, errCommitPayloadStale) {
+		t.Fatalf("advanced watermark err=%v, want errCommitPayloadStale", err)
+	}
+}
+
+func TestCommitQueueCoalescesOnlyExactQueuedParent(t *testing.T) {
+	const path = "/fast-grow.db"
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := pending.PutWithBaseRevAndModeAndLineage(path, 3, PendingNew, 0, 0, false, "snapshot-C", "snapshot-B", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &CommitEntry{Path: path, Kind: PendingNew, PayloadBaseRevSet: true, SnapshotID: "snapshot-A", liveLineageProof: true}
+	b := &CommitEntry{Path: path, Kind: PendingNew, PayloadBaseRevSet: true, SnapshotID: "snapshot-B", ParentSnapshotID: "snapshot-A", liveLineageProof: true}
+	c := &CommitEntry{Path: path, Kind: PendingNew, PayloadBaseRevSet: true, SnapshotID: "snapshot-C", ParentSnapshotID: "snapshot-B", PendingIndexGen: gen, liveLineageProof: true}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{a, b, c},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{path: {a: {}, b: {}, c: {}}},
+		inFlight:     map[string]*CommitEntry{path: a},
+		index:        pending,
+		delayed:      make(map[*CommitEntry]*time.Timer),
+	}
+
+	cq.coalesceDirectParentQueuedLocked(c)
+	if !b.canceled {
+		t.Fatal("exact queued parent B was not canceled")
+	}
+	if a.canceled {
+		t.Fatal("in-flight ancestor A was canceled")
+	}
+	if c.ParentSnapshotID != "snapshot-A" {
+		t.Fatalf("child parent=%q, want compressed snapshot-A", c.ParentSnapshotID)
+	}
+	if len(cq.queue) != 2 || cq.queue[0] != a || cq.queue[1] != c {
+		t.Fatalf("queue after compression=%v, want [A C]", cq.queue)
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok || meta.ParentSnapshotID != "snapshot-A" {
+		t.Fatalf("pending meta=%+v ok=%t, want in-memory parent snapshot-A", meta, ok)
+	}
+}
+
+func TestPendingIndexRestartDropsProcessLocalLineage(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.PutWithBaseRevAndModeAndLineage("/legacy.db", 8, PendingNew, 0, 0, false, "snapshot-B", "snapshot-A", true); err != nil {
+		t.Fatal(err)
+	}
+	if meta, ok := idx.GetMeta("/legacy.db"); !ok || meta.SnapshotID == "" || !meta.lineageTrusted {
+		t.Fatalf("live meta=%+v ok=%t, want trusted process-local lineage", meta, ok)
+	}
+	recovered, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := recovered.GetMeta("/legacy.db")
+	if !ok {
+		t.Fatal("recovered metadata missing")
+	}
+	if meta.SnapshotID != "" || meta.ParentSnapshotID != "" || meta.lineageTrusted {
+		t.Fatalf("recovered lineage=%q/%q trusted=%t, want empty/untrusted", meta.SnapshotID, meta.ParentSnapshotID, meta.lineageTrusted)
+	}
+}
+
+func TestCommitQueueSameProcessGrowthDoesNotOverwriteRecreatedSameRevSize(t *testing.T) {
+	const path = "/kv-1g.db"
+	const headerSnapshot = "recreate-header"
+	const grownSnapshot = "recreate-grown"
+	header := bytes.Repeat([]byte("H"), 4096)
+	grown := append(bytes.Repeat([]byte("H"), 4096), bytes.Repeat([]byte("G"), 8192)...)
+	recreated := bytes.Repeat([]byte("X"), 4096)
+
+	server, ts := newCASFileServer(t, path, 0, nil)
+	defer ts.Close()
+
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	var watermark atomic.Int64
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.OnSuccess = func(_ *CommitEntry, rev int64) {
+		watermark.Store(rev)
+	}
+
+	if err := shadow.WriteFull(path, header, 0); err != nil {
+		t.Fatal(err)
+	}
+	headerGen := shadow.ActiveGeneration(path)
+	headerPending, err := pending.PutWithBaseRevAndModeAndLineage(path, int64(len(header)), PendingNew, 0, 0, false, headerSnapshot, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:              path,
+		BaseRev:           0,
+		PayloadBaseRev:    0,
+		PayloadBaseRevSet: true,
+		Size:              int64(len(header)),
+		Kind:              PendingNew,
+		MutationSeq:       1,
+		ShadowGen:         headerGen,
+		PendingIndexGen:   headerPending,
+		SnapshotID:        headerSnapshot,
+		liveLineageProof:  true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitCommitQueueIdle(t, cq)
+	server.recreate(recreated)
+
+	if err := shadow.WriteFull(path, grown, 0); err != nil {
+		t.Fatal(err)
+	}
+	grownGen := shadow.ActiveGeneration(path)
+	grownPending, err := pending.PutWithBaseRevAndModeAndLineage(path, int64(len(grown)), PendingNew, 0, 0, false, grownSnapshot, headerSnapshot, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:              path,
+		BaseRev:           0,
+		PayloadBaseRev:    0,
+		PayloadBaseRevSet: true,
+		Size:              int64(len(grown)),
+		Kind:              PendingNew,
+		MutationSeq:       2,
+		ShadowGen:         grownGen,
+		PendingIndexGen:   grownPending,
+		SnapshotID:        grownSnapshot,
+		ParentSnapshotID:  headerSnapshot,
+		liveLineageProof:  true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitCommitQueueIdle(t, cq)
+
+	rev, body, puts := server.snapshot()
+	if rev != 1 || !bytes.Equal(body, recreated) {
+		t.Fatalf("remote rev=%d body-len=%d, want recreated 4KiB image at rev=1", rev, len(body))
+	}
+	for _, put := range puts {
+		if bytes.Equal(put.body, grown) {
+			t.Fatal("same-process growth overwrote a delete/recreate with the same rev and size")
+		}
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending entry missing after same-process recreate conflict")
+	}
+	if meta.Kind != PendingConflict {
+		t.Fatalf("pending kind = %v, want PendingConflict", meta.Kind)
+	}
+}
+
+func TestCommitQueueRecoveredGrowthFailsClosedWithoutImmutablePayload(t *testing.T) {
+	const path = "/kv-1g.db"
+	const headerSnapshot = "recovery-header"
+	const grownSnapshot = "recovery-grown"
+	header := bytes.Repeat([]byte("H"), 4096)
+	grown := append(bytes.Repeat([]byte("H"), 4096), bytes.Repeat([]byte("G"), 8192)...)
+
+	server, ts := newCASFileServer(t, path, 0, nil)
+	defer ts.Close()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	if err := shadow.WriteFull(path, header, 0); err != nil {
+		t.Fatal(err)
+	}
+	headerGen := shadow.ActiveGeneration(path)
+	headerPending, err := pending.PutWithBaseRevAndModeAndLineage(path, int64(len(header)), PendingNew, 0, 0, false, headerSnapshot, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path: path, BaseRev: 0, PayloadBaseRev: 0, PayloadBaseRevSet: true,
+		Size: int64(len(header)), Kind: PendingNew, MutationSeq: 1,
+		ShadowGen: headerGen, PendingIndexGen: headerPending,
+		SnapshotID: headerSnapshot, liveLineageProof: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitCommitQueueIdle(t, cq)
+	if err := shadow.WriteFull(path, grown, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRevAndModeAndLineage(path, int64(len(grown)), PendingNew, 0, 0, false, grownSnapshot, headerSnapshot, true); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	recovered := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	recovered.client.SetSmallFileThresholdForTests(1 << 20)
+	defer recovered.DrainAll()
+	recovered.RecoverPending()
+	waitCommitQueueIdle(t, recovered)
+	if rev, body, _ := server.snapshot(); rev != 1 || !bytes.Equal(body, header) {
+		t.Fatalf("after recovery rev=%d body-len=%d, want unchanged rev1 header-len=%d", rev, len(body), len(header))
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok || meta.Kind != PendingConflict {
+		t.Fatalf("recovered mutable payload meta=%+v ok=%t, want preserved PendingConflict", meta, ok)
+	}
+}
+
+func waitCommitQueueIdle(t *testing.T, cq *CommitQueue) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		n, _ := cq.PendingStats()
+		if n == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	n, _ := cq.PendingStats()
+	t.Fatalf("commit queue still pending=%d", n)
 }

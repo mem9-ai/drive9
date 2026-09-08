@@ -156,7 +156,14 @@ func (idx *PendingIndex) PutWithBaseRev(remotePath string, size int64, kind Pend
 // PutWithBaseRevAndMode stores metadata for the given path together with the
 // file mode that must be applied after the pending data commits remotely.
 func (idx *PendingIndex) PutWithBaseRevAndMode(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
-	return idx.putInternal(remotePath, size, kind, baseRev, false, mode, hasMode)
+	return idx.PutWithBaseRevAndModeAndLineage(remotePath, size, kind, baseRev, mode, hasMode, "", "", false)
+}
+
+// PutWithBaseRevAndModeAndLineage attaches process-local causal identity to
+// the durable metadata. The IDs are intentionally excluded from JSON; empty
+// lineage is accepted but can never authorize a growth rebase.
+func (idx *PendingIndex) PutWithBaseRevAndModeAndLineage(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool) (uint64, error) {
+	return idx.putInternal(remotePath, size, kind, baseRev, false, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted)
 }
 
 // PutShadowSpill is like PutWithBaseRev but marks the entry as ShadowSpill
@@ -169,10 +176,16 @@ func (idx *PendingIndex) PutShadowSpill(remotePath string, size int64, kind Pend
 // PutShadowSpillWithMode is like PutShadowSpill, but also persists file mode
 // metadata for the eventual remote chmod.
 func (idx *PendingIndex) PutShadowSpillWithMode(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
-	return idx.putInternal(remotePath, size, kind, baseRev, true, mode, hasMode)
+	return idx.PutShadowSpillWithModeAndLineage(remotePath, size, kind, baseRev, mode, hasMode, "", "", false)
 }
 
-func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool, mode uint32, hasMode bool) (uint64, error) {
+// PutShadowSpillWithModeAndLineage is the spill equivalent of
+// PutWithBaseRevAndModeAndLineage.
+func (idx *PendingIndex) PutShadowSpillWithModeAndLineage(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool) (uint64, error) {
+	return idx.putInternal(remotePath, size, kind, baseRev, true, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted)
+}
+
+func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool) (uint64, error) {
 	// Hold the per-path lock across the disk write AND the in-memory publish
 	// so a generation-checked removal of a stale entry cannot delete this
 	// fresh .meta after already passing its in-memory check.
@@ -181,16 +194,19 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 
 	gen := idx.nextGen.Add(1)
 	meta := &WriteBackMeta{
-		Path:        remotePath,
-		Size:        size,
-		Mtime:       time.Now(),
-		CreatedAt:   time.Now(),
-		Generation:  gen,
-		Kind:        kind,
-		BaseRev:     baseRev,
-		ShadowSpill: shadowSpill,
-		Mode:        mode & posixPermissionModeMask,
-		HasMode:     hasMode,
+		Path:             remotePath,
+		Size:             size,
+		Mtime:            time.Now(),
+		CreatedAt:        time.Now(),
+		Generation:       gen,
+		Kind:             kind,
+		BaseRev:          baseRev,
+		ShadowSpill:      shadowSpill,
+		Mode:             mode & posixPermissionModeMask,
+		HasMode:          hasMode,
+		SnapshotID:       snapshotID,
+		ParentSnapshotID: parentSnapshotID,
+		lineageTrusted:   lineageTrusted,
 	}
 
 	// Write to disk first for durability.
@@ -280,6 +296,24 @@ func (idx *PendingIndex) Generation(remotePath string) uint64 {
 	return 0
 }
 
+// ReparentSnapshotIfGeneration path-compresses one exact process-local
+// pending snapshot after its direct queued parent is coalesced. The generation
+// and snapshot checks prevent an older queue entry from rewriting newer
+// in-memory metadata. Lineage is deliberately not persisted across restart.
+func (idx *PendingIndex) ReparentSnapshotIfGeneration(remotePath string, expectedGen uint64, snapshotID, expectedParentID, newParentID string) (bool, error) {
+	if idx == nil || remotePath == "" || expectedGen == 0 || snapshotID == "" || expectedParentID == "" {
+		return false, nil
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	meta, ok := idx.items[remotePath]
+	if !ok || meta.Generation != expectedGen || meta.SnapshotID != snapshotID || meta.ParentSnapshotID != expectedParentID {
+		return false, nil
+	}
+	meta.ParentSnapshotID = newParentID
+	return true, nil
+}
+
 // RenamePending atomically moves a pending entry from oldPath to newPath.
 // Returns true if there was a pending entry to rename.
 func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
@@ -295,16 +329,19 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 	// Copy fields under read lock.
 	gen := idx.nextGen.Add(1)
 	newMeta := &WriteBackMeta{
-		Path:        newPath,
-		Size:        meta.Size,
-		Mtime:       meta.Mtime,
-		CreatedAt:   meta.CreatedAt,
-		Generation:  gen,
-		Kind:        meta.Kind,
-		BaseRev:     meta.BaseRev,
-		ShadowSpill: meta.ShadowSpill,
-		Mode:        meta.Mode,
-		HasMode:     meta.HasMode,
+		Path:             newPath,
+		Size:             meta.Size,
+		Mtime:            meta.Mtime,
+		CreatedAt:        meta.CreatedAt,
+		Generation:       gen,
+		Kind:             meta.Kind,
+		BaseRev:          meta.BaseRev,
+		ShadowSpill:      meta.ShadowSpill,
+		Mode:             meta.Mode,
+		HasMode:          meta.HasMode,
+		SnapshotID:       meta.SnapshotID,
+		ParentSnapshotID: meta.ParentSnapshotID,
+		lineageTrusted:   meta.lineageTrusted,
 	}
 	idx.mu.RUnlock()
 
@@ -346,16 +383,19 @@ func (idx *PendingIndex) PrepareRename(oldPath, newPath string) (*WriteBackMeta,
 	}
 	gen := idx.nextGen.Add(1)
 	newMeta := &WriteBackMeta{
-		Path:        newPath,
-		Size:        meta.Size,
-		Mtime:       meta.Mtime,
-		CreatedAt:   meta.CreatedAt,
-		Generation:  gen,
-		Kind:        meta.Kind,
-		BaseRev:     meta.BaseRev,
-		ShadowSpill: meta.ShadowSpill,
-		Mode:        meta.Mode,
-		HasMode:     meta.HasMode,
+		Path:             newPath,
+		Size:             meta.Size,
+		Mtime:            meta.Mtime,
+		CreatedAt:        meta.CreatedAt,
+		Generation:       gen,
+		Kind:             meta.Kind,
+		BaseRev:          meta.BaseRev,
+		ShadowSpill:      meta.ShadowSpill,
+		Mode:             meta.Mode,
+		HasMode:          meta.HasMode,
+		SnapshotID:       meta.SnapshotID,
+		ParentSnapshotID: meta.ParentSnapshotID,
+		lineageTrusted:   meta.lineageTrusted,
 	}
 	idx.mu.RUnlock()
 
