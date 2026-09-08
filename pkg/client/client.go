@@ -354,8 +354,10 @@ func (r BatchStatResult) OK() bool {
 
 // BatchReadSmallResult is one per-path result from BatchReadSmallCtx.
 //
-// Data is JSON base64-encoded on the wire. Missing, invalid, directory, and
-// too-large paths are reported as per-path errors.
+// Data is JSON base64-encoded on the wire. Missing, directory, and too-large
+// paths are reported as per-path errors. (Paths the server would reject with
+// HTTP 400 never reach the wire: client-side validation fails the whole
+// BatchReadSmallCtx call first.)
 type BatchReadSmallResult struct {
 	Path     string `json:"path"`
 	Status   int    `json:"status"`
@@ -958,7 +960,9 @@ func (c *Client) ListCtx(ctx context.Context, path string) ([]FileInfo, error) {
 //
 // Transport/request errors fail the method. Per-path stat errors are returned
 // inside the corresponding BatchStatResult so one missing path does not fail
-// the whole batch.
+// the whole batch. A path that fails client-side validation (anything the
+// server would reject with HTTP 400, e.g. backslashes or ".." segments)
+// fails the whole call before any request is sent.
 func (c *Client) BatchStatCtx(ctx context.Context, paths []string) ([]BatchStatResult, error) {
 	return c.BatchStatWithOptionsCtx(ctx, paths, BatchStatOptions{})
 }
@@ -1012,7 +1016,9 @@ func (c *Client) BatchStatWithOptionsCtx(ctx context.Context, paths []string, op
 //
 // Transport/request errors fail the method. Per-path read errors are returned
 // inside the corresponding BatchReadSmallResult so one missing or too-large
-// path does not fail the whole batch.
+// path does not fail the whole batch. A path that fails client-side validation
+// (anything the server would reject with HTTP 400, e.g. backslashes or ".."
+// segments) fails the whole call before any request is sent.
 func (c *Client) BatchReadSmallCtx(ctx context.Context, paths []string, maxBytes int64) ([]BatchReadSmallResult, error) {
 	if len(paths) == 0 {
 		return []BatchReadSmallResult{}, nil
@@ -1066,7 +1072,9 @@ func (c *Client) BatchReadSmallCtx(ctx context.Context, paths []string, maxBytes
 //
 // Transport/request errors fail the method. Per-path write errors are returned
 // inside the corresponding BatchWriteResult so one conflict does not fail the
-// whole batch.
+// whole batch. A path that fails client-side validation (anything the server
+// would reject with HTTP 400, e.g. backslashes or ".." segments) fails the
+// whole call before any request is sent.
 func (c *Client) BatchWriteCtx(ctx context.Context, items []BatchWriteItem) ([]BatchWriteResult, error) {
 	if len(items) == 0 {
 		return []BatchWriteResult{}, nil

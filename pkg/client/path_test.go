@@ -3,9 +3,11 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -77,6 +79,7 @@ func TestFSMethodsRejectWindowsPathBeforeRequest(t *testing.T) {
 	// Shape observed in production: a Windows local absolute path joined
 	// onto a drive9 directory as a path segment.
 	bad := `/个股回测工具/C:\股票工具`
+	sw := c.NewStreamWriter(ctx, bad, 1024)
 	checks := map[string]func() error{
 		"Mkdir":       func() error { return c.MkdirCtx(ctx, bad, 0o755) },
 		"Write":       func() error { return c.WriteCtx(ctx, bad, []byte("x")) },
@@ -89,7 +92,25 @@ func TestFSMethodsRejectWindowsPathBeforeRequest(t *testing.T) {
 		"CopySrc":     func() error { return c.CopyCtx(ctx, bad, "/ok") },
 		"CopyDst":     func() error { return c.CopyCtx(ctx, "/ok", bad) },
 		"HardlinkSrc": func() error { return c.HardlinkCtx(ctx, bad, "/ok") },
-		"BatchStat":   func() error { _, err := c.BatchStatCtx(ctx, []string{"/ok", bad}); return err },
+		"Symlink":     func() error { return c.SymlinkCtx(ctx, "/target", bad) },
+		"Chmod":       func() error { return c.ChmodCtx(ctx, bad, 0o600) },
+		"CreateFile":  func() error { _, err := c.CreateFileCtx(ctx, bad); return err },
+		"Grep":        func() error { _, err := c.Grep("q", bad, 0); return err },
+		"Find":        func() error { _, err := c.Find(bad, url.Values{}); return err },
+		"PatchFile":   func() error { return c.PatchFile(ctx, bad, 0, nil, nil, nil) },
+		"AppendStream": func() error {
+			return c.AppendStream(ctx, bad, strings.NewReader("x"), 1, nil)
+		},
+		// Large size forces the multipart upload session path; validation
+		// must fire before the /v1/status threshold fetch and checksum work.
+		"WriteStream": func() error {
+			return c.WriteStream(ctx, bad, bytes.NewReader([]byte("x")), 1<<20, nil)
+		},
+		"ResumeUpload": func() error {
+			return c.ResumeUpload(ctx, bad, bytes.NewReader([]byte("x")), 1<<20, nil)
+		},
+		"StreamWriter": func() error { return sw.WritePart(ctx, 1, []byte("x")) },
+		"BatchStat":    func() error { _, err := c.BatchStatCtx(ctx, []string{"/ok", bad}); return err },
 		"BatchReadSmall": func() error {
 			_, err := c.BatchReadSmallCtx(ctx, []string{bad}, 16)
 			return err

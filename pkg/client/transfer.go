@@ -450,6 +450,11 @@ func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path str
 }
 
 func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, tags map[string]string, description, checksumSHA256 string, preCompleteCheck func() error) (*UploadSummary, error) {
+	// Validate before the threshold fetch and any checksum work so a bad
+	// path fails fast without a round trip or wasted CPU.
+	if err := validateFSPath(path); err != nil {
+		return nil, err
+	}
 	if err := validateWholeChecksumSHA256(checksumSHA256); err != nil {
 		return nil, err
 	}
@@ -722,6 +727,9 @@ func (c *Client) initiateUpload(ctx context.Context, path string, size int64, ch
 }
 
 func (c *Client) initiateUploadByBody(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64, description string) (UploadPlan, *http.Response, error) {
+	if err := validateFSPath(path); err != nil {
+		return UploadPlan{}, nil, err
+	}
 	body, err := json.Marshal(uploadInitiateRequest{
 		Path:             path,
 		TotalSize:        size,
@@ -974,6 +982,9 @@ func (c *Client) completeUploadWithOptions(ctx context.Context, uploadID string,
 // initiateUploadV2 calls POST /v2/uploads/initiate.
 // Returns errV2NotAvailable if the server responds with 404.
 func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, expectedRevision int64, description string) (*uploadPlanV2, error) {
+	if err := validateFSPath(path); err != nil {
+		return nil, err
+	}
 	body, err := json.Marshal(struct {
 		Path             string `json:"path"`
 		TotalSize        int64  `json:"total_size"`
@@ -1891,6 +1902,11 @@ func (c *Client) ResumeUploadWithSummary(ctx context.Context, path string, r io.
 // the resulting revision on completion, and returns coarse-grained phase
 // timings for the completed resume flow.
 func (c *Client) ResumeUploadWithSummaryAndTags(ctx context.Context, path string, r io.ReaderAt, totalSize int64, progress ProgressFunc, tags map[string]string) (*UploadSummary, error) {
+	// Validate before the upload query and checksum computation so a bad
+	// path fails fast without a round trip or wasted CPU.
+	if err := validateFSPath(path); err != nil {
+		return nil, err
+	}
 	// Resume also applies tags only during complete, so validate here before we
 	// query/resume/upload additional parts.
 	if err := validateTags(tags); err != nil {
@@ -1959,6 +1975,9 @@ func (c *Client) ResumeUploadWithSummaryAndTags(ctx context.Context, path string
 
 // queryUpload finds an active upload for the given path.
 func (c *Client) queryUpload(ctx context.Context, path string) (*UploadMeta, error) {
+	if err := validateFSPath(path); err != nil {
+		return nil, err
+	}
 	query := url.Values{}
 	query.Set("path", path)
 	query.Set("status", "UPLOADING")
