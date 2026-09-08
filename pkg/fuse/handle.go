@@ -30,7 +30,13 @@ type FileHandle struct {
 	// the server's X-Dat9-Storage-Type stat header when available, updated
 	// after local commits and after a PATCH rejection. Write routing prefers
 	// it over the OrigSize size-heuristic when known.
-	StorageClass      client.StorageType
+	StorageClass client.StorageType
+	// patchPlanRejected is a transient, per-handle observation that the
+	// server rejected the PATCH plan for this file (for example part count
+	// over the S3 multipart limit). Unlike a storage-class rejection it does
+	// not mean the object is non-S3, so StorageClass stays unchanged; the
+	// flag only reroutes this handle's future writes to the full upload.
+	patchPlanRejected bool
 	ZeroBase          bool            // true when the handle has adopted an explicit empty-file baseline
 	IsNew             bool            // true if created via Create() (no prior remote existence)
 	ShadowReady       bool            // true when the local shadow file is a safe full snapshot

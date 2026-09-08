@@ -18123,11 +18123,12 @@ func TestFlushHandle_Path2_PatchPathNoFullBufferCopy(t *testing.T) {
 
 // TestFlushHandle_Path2_GrowthBypassesPatch verifies that when a large
 // existing file grows beyond OrigSize, Path 2 uses WriteStreamConditional
-// (full upload) instead of PatchFile. Without the B11 guard
-// (size <= handleOrigSize), PatchFile would be selected for a grown file,
-// but new parts beyond the original size have no server-side data, and the
-// patch callback cannot construct correct content for them.
-func TestFlushHandle_Path2_GrowthBypassesPatch(t *testing.T) {
+// TestFlushHandle_Path2_GapGrowthBypassesPatch verifies that sparse growth
+// (a pwrite beyond EOF that leaves gap parts beyond OrigSize) bypasses
+// PatchFile and uses the full upload, whose bytesView zero-fills the gaps.
+// New parts beyond the original size have no server-side data, and the patch
+// callback cannot construct correct content for an undirtied gap part.
+func TestFlushHandle_Path2_GapGrowthBypassesPatch(t *testing.T) {
 	var patchReceived atomic.Bool
 	var writeStreamReceived atomic.Bool
 
@@ -18179,21 +18180,22 @@ func TestFlushHandle_Path2_GrowthBypassesPatch(t *testing.T) {
 	ino := fs.inodes.Lookup(path, false, 5, time.Now())
 	fs.inodes.UpdateRevision(ino, 5)
 
-	// Existing large file (OrigSize=200), but write grows it to 400.
+	// Existing large file (OrigSize=200). A sparse write at offset 300 grows
+	// it to 400 and leaves part 2 (bytes [200,300)) neither dirty nor loaded.
 	fh := &FileHandle{
 		Ino:      ino,
 		Path:     path,
-		Dirty:    NewWriteBuffer(path, maxPreloadSize, 0),
+		Dirty:    NewWriteBuffer(path, maxPreloadSize, 100),
 		BaseRev:  5,
 		OrigSize: 200, // above threshold
 	}
 
-	// Write 400 bytes — grows beyond OrigSize.
-	data := make([]byte, 400)
+	// Write 100 bytes at offset 300 — grows beyond OrigSize with a gap.
+	data := make([]byte, 100)
 	for i := range data {
 		data[i] = byte(i)
 	}
-	if _, err := fh.Dirty.Write(0, data); err != nil {
+	if _, err := fh.Dirty.Write(300, data); err != nil {
 		t.Fatal(err)
 	}
 	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
@@ -18203,11 +18205,13 @@ func TestFlushHandle_Path2_GrowthBypassesPatch(t *testing.T) {
 	_ = fs.flushHandle(context.Background(), fh)
 	fh.Unlock()
 
-	// B11 assertion: growth must NOT use PatchFile. It should use
-	// WriteStreamConditional (full upload) because new parts beyond
-	// OrigSize have no server-side original data.
+	// Gap-growth must NOT use PatchFile: the undirtied gap part has no
+	// server-side original data and the patch callback cannot construct it.
 	if patchReceived.Load() {
-		t.Fatal("received PATCH for grown file — B11: growth beyond OrigSize must bypass patch path and use full upload")
+		t.Fatal("received PATCH for gap-grown file — sparse growth must bypass patch path and use full upload")
+	}
+	if !writeStreamReceived.Load() {
+		t.Fatal("gap-grown file did not use the full upload path")
 	}
 }
 

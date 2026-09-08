@@ -6,11 +6,23 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sync"
 )
+
+// ErrPatchPlanInitiate marks failures from requesting or decoding the patch
+// plan, before any part upload starts. Callers may safely fall back to a full
+// rewrite for these; part-upload and completion failures stay fail-closed.
+var ErrPatchPlanInitiate = errors.New("patch plan initiate failed")
+
+// IsPatchPlanInitiateErr reports whether err came from the patch-plan
+// initiation phase rather than a part upload or multipart completion.
+func IsPatchPlanInitiateErr(err error) bool {
+	return errors.Is(err, ErrPatchPlanInitiate)
+}
 
 // PatchPlan mirrors the server's response for a PATCH request.
 type PatchPlan struct {
@@ -96,12 +108,12 @@ func (c *Client) PatchFile(ctx context.Context, path string, newSize int64, dirt
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusAccepted {
-		return readError(resp)
+		return fmt.Errorf("%w: %w", ErrPatchPlanInitiate, readError(resp))
 	}
 
 	var plan PatchPlan
 	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
-		return fmt.Errorf("decode patch plan: %w", err)
+		return fmt.Errorf("%w: decode patch plan: %w", ErrPatchPlanInitiate, err)
 	}
 
 	// Step 2: Upload dirty parts concurrently

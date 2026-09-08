@@ -2558,6 +2558,11 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandlesWithSize(path string, re
 		}
 		fs.discardSupersededMutationLocked(fh)
 		if fs.handleCanAdoptCommittedRevisionLocked(fh) {
+			if fh.appendLog.sqliteWALTruncated {
+				fs.debugf("append-log trace event=sibling_truncate_rebind path=%q new_rev=%d new_size=%d pre_base_rev=%d pre_has_rewrite_base=%t pre_rewrite_base_rev=%d pre_sqlite_wal_truncated=%t pre_append_safe=%t", fh.Path, revision, committedSize, fh.BaseRev, fh.appendLog.hasRewriteBase, fh.appendLog.rewriteBaseRevision, fh.appendLog.sqliteWALTruncated, fh.appendLog.appendSafe)
+				fh.appendLogAdoptCommittedBaseline(revision, committedSize)
+				fs.debugf("append-log trace event=sibling_truncate_rebound path=%q base_rev=%d has_rewrite_base=%t rewrite_base_rev=%d sqlite_wal_truncated=%t append_safe=%t", fh.Path, fh.BaseRev, fh.appendLog.hasRewriteBase, fh.appendLog.rewriteBaseRevision, fh.appendLog.sqliteWALTruncated, fh.appendLog.appendSafe)
+			}
 			cleanBuffer := fh.Dirty != nil
 			if cleanBuffer && fs.clearRemovedCommittedShadowLocked(fh, revision, committedSize, true) {
 				fh.Unlock()
@@ -3884,6 +3889,60 @@ func writeBufferHasLoadedFullRange(wb *WriteBuffer) bool {
 	return true
 }
 
+// growthPatchSafeLocked reports whether the PATCH route can construct every
+// part overlapping the grown region [OrigSize, size). Each such part must be
+// dirty and loaded: the server presigns beyond-original parts even when they
+// are absent from the client's dirty set (pkg/backend/patch.go), and the
+// fallback callback would upload an empty body for them, while PartData
+// zero-fills an evicted dirty part. The logical size only grows through
+// Write (marks the written part dirty) or Truncate (marks the extended region
+// dirty), so a loaded part in the growth region is necessarily dirty.
+func (fs *Dat9FS) growthPatchSafeLocked(fh *FileHandle, size int64) bool {
+	if fh == nil || fh.Dirty == nil || size <= fh.OrigSize {
+		return true
+	}
+	partSize := fh.Dirty.PartSize()
+	if partSize <= 0 {
+		return false
+	}
+	dirty := fh.Dirty.DirtyPartNumbers()
+	dirtySet := make(map[int]bool, len(dirty))
+	for _, pn := range dirty {
+		dirtySet[pn] = true
+	}
+	first := int(fh.OrigSize / partSize)
+	last := int((size - 1) / partSize)
+	for part := first; part <= last; part++ {
+		if !dirtySet[part+1] || !fh.Dirty.IsPartLoaded(part) {
+			return false
+		}
+	}
+	return true
+}
+
+// ensureAppendLogWALWriteThroughShadowLocked seeds a write-through shadow for a
+// configured append-log SQLite WAL below the small-file shadow threshold so a
+// sibling checkpoint fd can read committed frames locally instead of remote
+// range GETs. Callers hold fh.mu. Failure degrades to remote reads.
+func (fs *Dat9FS) ensureAppendLogWALWriteThroughShadowLocked(fh *FileHandle, path string) {
+	if fs == nil || fh == nil || fh.Dirty == nil || fs.shadowStore == nil ||
+		!fs.appendLogPathConfigured(path) || !isSQLitePersistentJournalPath(path) ||
+		fh.OrigSize >= smallFileShadowThreshold || fh.ShadowReady || fh.ShadowSpill {
+		return
+	}
+	if !writeBufferHasLoadedFullRange(fh.Dirty) {
+		return
+	}
+	if err := fs.shadowStore.WriteFull(path, fh.Dirty.bytesView(), fh.BaseRev); err != nil {
+		fs.debugf("append-log write-through shadow init failed path=%s err=%v", path, err)
+		return
+	}
+	fh.ShadowReady = true
+	fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(path)
+	fh.ShadowGen = fs.shadowStore.Pin(path)
+	fh.ShadowPinned = true
+}
+
 // finalizeHandleFlushLocked updates the live handle and inode cache after a
 // successful upload using the exact CAS revision that completed, when known.
 // Callers must hold fh.mu.
@@ -4700,11 +4759,71 @@ func (fs *Dat9FS) readSQLitePersistentJournalVisibleRange(path string, skip *Fil
 		}
 		time.Sleep(sqliteSidecarDirtyWaitInterval)
 	}
+	if latest := fs.latestCommittedRevision(path); latest > 0 {
+		if data, n, ok := fs.readSQLitePersistentJournalCleanSiblingRange(path, skip, latest, offset, reqSize); ok {
+			return data, n, true, gofuse.OK, "sqlite-sidecar-clean-sibling"
+		}
+	}
 	cachedData, cachedN, cachedOK := fs.readSQLitePersistentJournalCommittedCache(path, fallbackRevision, offset, reqSize)
 	if cachedOK {
 		return cachedData, cachedN, true, gofuse.OK, "sqlite-sidecar-committed-cache"
 	}
 	return nil, 0, false, gofuse.OK, ""
+}
+
+// readSQLitePersistentJournalCleanSiblingRange serves a sidecar read from a
+// clean sibling whose revision equals the latest committed revision. A
+// behind-revision clean buffer is never served: the shared -shm can point
+// readers at a newer fsync-committed extent, and a stale buffer would produce
+// short reads.
+func (fs *Dat9FS) readSQLitePersistentJournalCleanSiblingRange(path string, skip *FileHandle, revision int64, offset int64, reqSize uint32) ([]byte, int, bool) {
+	if fs == nil || fs.openHandles == nil || path == "" || revision <= 0 || reqSize == 0 || offset < 0 {
+		return nil, 0, false
+	}
+	end := offset + int64(reqSize)
+	for _, src := range fs.openHandles.SnapshotPath(path) {
+		if src == nil || src == skip {
+			continue
+		}
+		if !src.TryLock() {
+			continue
+		}
+		eligible := src.Dirty != nil && src.DirtySeq == 0 && !src.Dirty.HasDirtyParts() &&
+			src.BaseRev == revision && !src.IsNew && !src.ZeroBase &&
+			!src.Unlinked && !src.UnlinkedSnapshot && src.UnlinkedData == nil
+		if !eligible || end > src.Dirty.Size() {
+			src.Unlock()
+			continue
+		}
+		buf := make([]byte, int(reqSize))
+		if fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) {
+			src.Unlock()
+			n, err := fs.shadowStore.ReadAt(path, offset, buf)
+			if err != nil && !errors.Is(err, io.EOF) {
+				return nil, 0, false
+			}
+			if n != len(buf) {
+				return nil, 0, false
+			}
+			return buf, n, true
+		}
+		ps := src.Dirty.PartSize()
+		firstPart := int(offset / ps)
+		lastPart := int((end - 1) / ps)
+		for p := firstPart; p <= lastPart; p++ {
+			if !src.Dirty.IsPartLoaded(p) {
+				src.Unlock()
+				return nil, 0, false
+			}
+		}
+		n := src.Dirty.ReadAt(offset, buf)
+		src.Unlock()
+		if n != len(buf) {
+			return nil, 0, false
+		}
+		return buf, n, true
+	}
+	return nil, 0, false
 }
 
 // rebindStaleCleanSamePathReadCandidateLocked refreshes a clean same-path read
@@ -11600,6 +11719,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				}
 			}
 
+			if input.Flags&syscall.O_TRUNC == 0 {
+				fs.ensureAppendLogWALWriteThroughShadowLocked(fh, p)
+			}
+
 			if fh.ShadowSpill {
 				fs.bindShadowSpillEvictionLocked(fh)
 			} else if fh.WritePolicy != WritePolicyWriteSync && !fs.layerEnabled() && !fs.appendLogPathConfigured(p) {
@@ -12823,7 +12946,7 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 
 	threshold := fs.negotiatedInlineThreshold()
 	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
-	canPatchExisting := threshold > 0 && fh.OrigSize >= threshold && size <= fh.OrigSize
+	canPatchExisting := !fh.patchPlanRejected && threshold > 0 && fh.OrigSize >= threshold && fs.growthPatchSafeLocked(fh, size)
 	if fh.StorageClass == storageClassDB9 {
 		// Authoritative: the remote object is stored inline, so PATCH
 		// (S3 UploadPartCopy-based) is not applicable regardless of size.
@@ -12923,6 +13046,31 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 				)
 				fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
 				fs.debugDurationf(writeStart, 0, "write-sync patch fallback done path=%s size=%d err=%v", fh.Path, size, err)
+			} else if err != nil && client.IsPatchPlanInitiateErr(err) {
+				// The server rejected the patch plan for a reason other than
+				// storage class (for example part count over the S3 multipart
+				// limit). The object is still S3-backed, so StorageClass stays
+				// unchanged; reroute this handle's future writes to the full
+				// upload and retry the current commit that way.
+				fh.patchPlanRejected = true
+				if !fs.materializeFullForUploadLocked(fh) {
+					safeLogPrintf("write-sync patch plan-rejected fallback cannot materialize full file for %s", fh.Path)
+					return gofuse.EIO
+				}
+				data = fh.Dirty.bytesView()
+				genericFullWrite = true
+				writeStart := time.Now()
+				fs.debugf("write-sync patch plan rejected, full-upload fallback start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
+				err = fs.client.WriteStreamConditional(
+					ctx,
+					fs.remotePath(fh.Path),
+					bytes.NewReader(data),
+					size,
+					nil,
+					expectedRevision,
+				)
+				fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
+				fs.debugDurationf(writeStart, 0, "write-sync patch plan-rejected fallback done path=%s size=%d err=%v", fh.Path, size, err)
 			}
 		}
 	} else {
@@ -14031,11 +14179,33 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			return gofuse.OK
 		}
 
+		// W3: the writeback uploader has no PATCH transport. Reroute a strict
+		// fsync of a grown S3-backed large file through flushHandle so only
+		// dirty parts are uploaded with server-side copies of the rest. The
+		// writeback snapshot is discarded first so the background uploader
+		// cannot re-upload a stale full image after this commit.
+		if fh.Dirty != nil && fh.Dirty.Size() > fh.OrigSize && fh.StorageClass != storageClassDB9 {
+			threshold := fs.negotiatedInlineThreshold()
+			if !fh.patchPlanRejected && threshold > 0 && fh.OrigSize >= threshold && fs.growthPatchSafeLocked(fh, fh.Dirty.Size()) {
+				if fh.WriteBackGen != 0 {
+					fs.writeBack.RemoveIfGeneration(fh.Path, fh.WriteBackGen)
+				}
+				fh.WriteBackGen = 0
+				fh.WriteBackSeq = 0
+				phase = "writeback-upload-sync-patch"
+				flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+				defer flushCancel()
+				return fs.flushHandle(flushCtx, fh)
+			}
+		}
+
 		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		mutationSeq := fh.DirtySeq
 		uploadStart := time.Now()
 		fs.debugf("fsync writeback upload start path=%s", fh.Path)
-		committedRev, err := fs.uploader.UploadSyncWithRevision(ctx, fh.Path)
+		uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+		committedRev, err := fs.uploader.UploadSyncWithRevision(uploadCtx, fh.Path)
+		uploadCancel()
 		fs.debugDurationf(uploadStart, 0, "fsync writeback upload done path=%s err=%v", fh.Path, err)
 		if err != nil {
 			safeLogPrintf("fsync writeback upload failed for %s: %v", fh.Path, err)
@@ -15249,7 +15419,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// OrigSize, new parts have no server-side original data and the patch
 	// callback cannot construct correct content. Consistent with write-sync
 	// path's canPatchExisting guard (line ~9912).
-	usePatch := !useDirectPUT && threshold > 0 && handleOrigSize >= threshold && size <= handleOrigSize
+	usePatch := !fh.patchPlanRejected && !useDirectPUT && threshold > 0 && handleOrigSize >= threshold && fs.growthPatchSafeLocked(fh, size)
 	if fh.StorageClass == storageClassDB9 {
 		// Authoritative: remote object is stored inline; PATCH requires S3.
 		// A known-S3 class needs no override: when OrigSize < threshold the
@@ -15457,6 +15627,17 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 				return fs.flushHandle(ctx, fh)
 			}
 			safeLogPrintf("flush patch unsupported for %s; will full-upload on next flush (dirty state advanced during upload)", handlePath)
+		} else if usePatch && client.IsPatchPlanInitiateErr(err) {
+			// The server rejected the patch plan for a reason other than
+			// storage class. The object is still S3-backed, so StorageClass
+			// stays unchanged; this per-handle flag only reroutes the retry
+			// and future flushes to the full upload.
+			fh.patchPlanRejected = true
+			if fh.Path == handlePath && fh.DirtySeq == handleDirtySeq {
+				fs.debugf("flushHandle patch plan rejected, retry as full upload path=%s size=%d", handlePath, size)
+				return fs.flushHandle(ctx, fh)
+			}
+			safeLogPrintf("flush patch plan rejected for %s; will full-upload on next flush (dirty state advanced during upload)", handlePath)
 		}
 		safeLogPrintf("flush upload failed for %s: %v", handlePath, err)
 		return httpToFuseStatus(err)
