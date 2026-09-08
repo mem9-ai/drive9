@@ -3116,6 +3116,7 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	}
 	fs.rebaselineCommittedDirtyBufferLocked(fh)
 	fs.removeHandleStagingLocked(fh)
+	clearPreinstalledUnlinkSnapshotLocked(fh)
 	fh.ShadowReady = false
 	fh.ShadowSpill = false
 	fh.ShadowCommitReady = false
@@ -3914,6 +3915,7 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 			fs.recordCommittedRevision(fh.Path, revision)
 		}
 		fs.refreshCommittedRevisionForOpenHandles(fh.Path, revision, fh)
+		clearPreinstalledUnlinkSnapshotLocked(fh)
 	} else {
 		// The flush succeeded, but it was unconditional, so the precise
 		// post-commit revision is unknown. Clear the cached revision instead of
@@ -5493,6 +5495,10 @@ func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath stri
 		if cand.fh.Path == localPath && eligible &&
 			!unlinkedSnapshotStaleLocked(cand.fh, cand.revision, cand.size) {
 			cand.fh.UnlinkedData = cloneBytes(data)
+			cand.fh.UnlinkedSnapshot = true
+			cand.fh.UnlinkedSize = int64(len(data))
+			cand.fh.UnlinkedSnapshotRev = cand.revision
+			cand.fh.UnlinkedSnapshotSize = cand.size
 			clearReadTargetForLockedHandle(cand.fh)
 		}
 		cand.fh.Unlock()
@@ -7363,6 +7369,14 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 	if len(handles) == 0 {
 		return nil, false, nil
 	}
+	for _, fh := range handles {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		dropStalePreinstalledUnlinkSnapshotLocked(fh)
+		fh.Unlock()
+	}
 
 	size, revision := fs.pathUnlinkedSnapshotIdentity(p)
 
@@ -7451,13 +7465,33 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		}
 	}
 
+	attachFailed := false
+	for _, fh := range handles {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		dropStalePreinstalledUnlinkSnapshotLocked(fh)
+		needs := cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) ||
+			remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh)
+		if needs && snapshotOK && unlinkedSnapshotStaleLocked(fh, revision, size) {
+			attachFailed = true
+		}
+		fh.Unlock()
+	}
+	if attachFailed {
+		if snapshotShadowGen != 0 {
+			fs.discardUnlinkedSnapshotPins(snapshotShadowGen, snapshotNeedCount)
+		}
+		return nil, false, syscall.EIO
+	}
+
 	attachedSnapshotPins := 0
 	for _, fh := range handles {
 		if fh == nil {
 			continue
 		}
 		fh.Lock()
-		fh.Unlinked = true
 		if fh.Dirty != nil {
 			fh.UnlinkedSize = fh.Dirty.Size()
 			// Dirty ShadowSpill handles keep their authoritative data in the
@@ -7470,29 +7504,27 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 				if gen, ok := fs.shadowStore.PinIfExists(p); ok {
 					fh.UnlinkedShadowGen = gen
 					fh.UnlinkedSnapshot = true
+					fh.UnlinkedSnapshotRev = revision
+					fh.UnlinkedSnapshotSize = fh.UnlinkedSize
 				}
 			} else if snapshotOK && remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh) &&
 				!unlinkedSnapshotStaleLocked(fh, revision, size) {
-				attachUnlinkedSnapshotLocked(fh, snapshot, snapshotShadowGen, size)
+				attachUnlinkedSnapshotLocked(fh, snapshot, snapshotShadowGen, size, revision)
 				if snapshotShadowGen != 0 && fh.UnlinkedShadowGen == snapshotShadowGen {
 					attachedSnapshotPins++
 				}
 			}
 		} else if snapshotOK {
 			if snapshotShadowGen != 0 && cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) {
-				fh.UnlinkedData = nil
-				fh.UnlinkedSnapshot = true
-				fh.UnlinkedShadowGen = snapshotShadowGen
-				fh.UnlinkedSize = size
+				attachUnlinkedSnapshotLocked(fh, nil, snapshotShadowGen, size, revision)
 				attachedSnapshotPins++
 			} else {
-				fh.UnlinkedData = append(fh.UnlinkedData[:0], snapshot...)
-				fh.UnlinkedSnapshot = true
-				fh.UnlinkedSize = int64(len(snapshot))
+				attachUnlinkedSnapshotLocked(fh, snapshot, 0, size, revision)
 			}
-		} else {
+		} else if fh.UnlinkedSize == 0 {
 			fh.UnlinkedSize = size
 		}
+		fh.Unlinked = true
 		fh.Unlock()
 	}
 	if snapshotShadowGen != 0 && fs.shadowStore != nil && attachedSnapshotPins < snapshotNeedCount {
@@ -7535,7 +7567,7 @@ func remoteBackedDirtyHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
 		!fh.UnlinkedSnapshot
 }
 
-func attachUnlinkedSnapshotLocked(fh *FileHandle, snapshot []byte, snapshotShadowGen uint64, size int64) {
+func attachUnlinkedSnapshotLocked(fh *FileHandle, snapshot []byte, snapshotShadowGen uint64, size, rev int64) {
 	if fh == nil {
 		return
 	}
@@ -7544,11 +7576,43 @@ func attachUnlinkedSnapshotLocked(fh *FileHandle, snapshot []byte, snapshotShado
 		fh.UnlinkedSnapshot = true
 		fh.UnlinkedShadowGen = snapshotShadowGen
 		fh.UnlinkedSize = size
+		fh.UnlinkedSnapshotRev = rev
+		fh.UnlinkedSnapshotSize = size
 		return
 	}
 	fh.UnlinkedData = append(fh.UnlinkedData[:0], snapshot...)
 	fh.UnlinkedSnapshot = true
 	fh.UnlinkedSize = int64(len(snapshot))
+	fh.UnlinkedSnapshotRev = rev
+	fh.UnlinkedSnapshotSize = fh.UnlinkedSize
+}
+
+func clearPreinstalledUnlinkSnapshotLocked(fh *FileHandle) {
+	if fh == nil || fh.Unlinked {
+		return
+	}
+	fh.UnlinkedData = nil
+	fh.UnlinkedSnapshot = false
+	fh.UnlinkedSnapshotRev = 0
+	fh.UnlinkedSnapshotSize = 0
+}
+
+func dropStalePreinstalledUnlinkSnapshotLocked(fh *FileHandle) {
+	if fh == nil || fh.Unlinked || (fh.UnlinkedData == nil && !fh.UnlinkedSnapshot) {
+		return
+	}
+	stale := false
+	if fh.UnlinkedSnapshotRev > 0 && fh.BaseRev > 0 && fh.UnlinkedSnapshotRev != fh.BaseRev {
+		stale = true
+	}
+	if fh.UnlinkedSnapshotSize > 0 && fh.Dirty != nil && !fh.Dirty.HasDirtyParts() &&
+		fh.Dirty.remoteSize > 0 && fh.Dirty.remoteSize != fh.UnlinkedSnapshotSize {
+		stale = true
+	}
+	if !stale {
+		return
+	}
+	clearPreinstalledUnlinkSnapshotLocked(fh)
 }
 
 func (fs *Dat9FS) pathUnlinkedSnapshotIdentity(p string) (size, rev int64) {
@@ -7683,6 +7747,8 @@ func (fs *Dat9FS) unmarkOpenHandlesAfterFailedUnlink(p string, handles []*FileHa
 		fh.UnlinkedData = nil
 		fh.UnlinkedSnapshot = false
 		fh.UnlinkedSize = 0
+		fh.UnlinkedSnapshotRev = 0
+		fh.UnlinkedSnapshotSize = 0
 		if gen := fh.UnlinkedShadowGen; gen != 0 && fs.shadowStore != nil {
 			fh.UnlinkedShadowGen = 0
 			// The mark-time pin is simply dropped: with the deferred commit
