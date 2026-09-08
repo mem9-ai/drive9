@@ -153,16 +153,17 @@ type CommitQueue struct {
 	// landed is an intentionally process-local map of exact snapshots this
 	// queue has committed. Shadow bytes and JSON metadata are not atomically
 	// replaced across a crash, so persisting this proof would be unsafe.
-	landed     map[string]pathCommitLandmark
-	maxPending int
-	client     *client.Client
-	remoteRoot string
-	layerRef   string
-	shadows    *ShadowStore
-	index      *PendingIndex
-	journal    *Journal
-	wg         sync.WaitGroup
-	stopped    bool
+	landed      map[string]pathCommitLandmark
+	landedClock uint64
+	maxPending  int
+	client      *client.Client
+	remoteRoot  string
+	layerRef    string
+	shadows     *ShadowStore
+	index       *PendingIndex
+	journal     *Journal
+	wg          sync.WaitGroup
+	stopped     bool
 	// abandoned is set by AbandonLayer when the mounted layer was rolled
 	// back. When true, Enqueue returns errLayerRolledBack and commitOne
 	// skips tryAutoResolveConflict, going straight to terminal failure so
@@ -520,6 +521,17 @@ type pathCommitLandmark struct {
 	resourceID string
 	checksum   string
 	snapshotID string
+	lastUsed   uint64
+}
+
+const maxLandedCommitLandmarks = 4096
+
+func (cq *CommitQueue) landedLimitLocked() int {
+	limit := maxLandedCommitLandmarks
+	if cq.maxPending > limit/2 && cq.maxPending <= int(^uint(0)>>1)/2 {
+		limit = 2 * cq.maxPending
+	}
+	return limit
 }
 
 type CommitQueueSnapshot struct {
@@ -1498,6 +1510,48 @@ func (cq *CommitQueue) checksumLandedPayload(entry *CommitEntry) string {
 	return payloadChecksum(data)
 }
 
+// pruneLandedLocked bounds process-local lineage metadata. Evicting an
+// unreferenced landmark can only make a future growth attempt fail closed;
+// landmarks needed by already queued or in-flight direct children are kept.
+func (cq *CommitQueue) pruneLandedLocked() {
+	for len(cq.landed) > cq.landedLimitLocked() {
+		type lineageRef struct {
+			path     string
+			parentID string
+		}
+		referenced := make(map[lineageRef]struct{}, len(cq.queue)+len(cq.inFlight)+len(cq.immediate))
+		rememberReference := func(entry *CommitEntry) {
+			if entry != nil && !entry.canceled && entry.Path != "" && entry.ParentSnapshotID != "" {
+				referenced[lineageRef{path: entry.Path, parentID: entry.ParentSnapshotID}] = struct{}{}
+			}
+		}
+		for _, entry := range cq.queue {
+			rememberReference(entry)
+		}
+		for _, entry := range cq.inFlight {
+			rememberReference(entry)
+		}
+		for entry := range cq.immediate {
+			rememberReference(entry)
+		}
+		oldestPath := ""
+		oldestClock := ^uint64(0)
+		for path, landmark := range cq.landed {
+			if _, ok := referenced[lineageRef{path: path, parentID: landmark.snapshotID}]; ok {
+				continue
+			}
+			if landmark.lastUsed < oldestClock {
+				oldestPath = path
+				oldestClock = landmark.lastUsed
+			}
+		}
+		if oldestPath == "" {
+			return
+		}
+		delete(cq.landed, oldestPath)
+	}
+}
+
 func (cq *CommitQueue) rememberLanded(path string, rev, size int64, resourceID, checksum, snapshotID string) {
 	if cq == nil || path == "" || rev <= 0 {
 		return
@@ -1506,10 +1560,21 @@ func (cq *CommitQueue) rememberLanded(path string, rev, size int64, resourceID, 
 	if cq.landed == nil {
 		cq.landed = make(map[string]pathCommitLandmark)
 	}
+	// Without both causal lineage and a verifiable remote identity this commit
+	// cannot authorize a rebase. It still supersedes any older landmark for the
+	// path, so invalidate that proof instead of leaving stale metadata behind.
+	if snapshotID == "" || (resourceID == "" && checksum == "") {
+		delete(cq.landed, path)
+		cq.pruneLandedLocked()
+		cq.mu.Unlock()
+		return
+	}
 	prev := cq.landed[path]
 	if rev >= prev.rev {
-		cq.landed[path] = pathCommitLandmark{rev: rev, size: size, resourceID: resourceID, checksum: checksum, snapshotID: snapshotID}
+		cq.landedClock++
+		cq.landed[path] = pathCommitLandmark{rev: rev, size: size, resourceID: resourceID, checksum: checksum, snapshotID: snapshotID, lastUsed: cq.landedClock}
 	}
+	cq.pruneLandedLocked()
 	cq.mu.Unlock()
 }
 
@@ -1519,14 +1584,20 @@ func (cq *CommitQueue) landedCommit(path string) pathCommitLandmark {
 	}
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
-	return cq.landed[path]
+	landmark := cq.landed[path]
+	if landmark.snapshotID != "" {
+		cq.landedClock++
+		landmark.lastUsed = cq.landedClock
+		cq.landed[path] = landmark
+	}
+	return landmark
 }
 
 // maybeRebaseGrownPayloadOntoWatermark detects issue #896: a later same-path
 // mutation grew the file after this queue already landed a smaller snapshot.
 // Those bytes are newer than the watermark, so CAS should overwrite that
 // revision instead of being fenced as a stale #876 checkpoint snapshot.
-func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(entry *CommitEntry, watermark int64) bool {
+func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(ctx context.Context, entry *CommitEntry, watermark int64) bool {
 	if cq == nil || entry == nil || watermark <= 0 {
 		return false
 	}
@@ -1538,18 +1609,21 @@ func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(entry *CommitEntry, 
 	if landed.rev != watermark || !entryCanRebaseOntoLandedParent(entry, landed) {
 		return false
 	}
-	rev, size, resourceID, body, ok := cq.readRemoteSnapshot(entry.Path)
+	rev, size, resourceID, body, ok := cq.readRemoteSnapshot(ctx, entry.Path)
 	if !ok {
 		return false
 	}
 	return cq.maybeRebaseGrownPayloadAgainstRemote(entry, rev, size, resourceID, body)
 }
 
-func (cq *CommitQueue) readRemoteSnapshot(path string) (rev, size int64, resourceID string, body []byte, ok bool) {
+func (cq *CommitQueue) readRemoteSnapshot(parent context.Context, path string) (rev, size int64, resourceID string, body []byte, ok bool) {
 	if cq == nil || cq.client == nil || path == "" {
 		return 0, 0, "", nil, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	apiPath := cq.remotePath(path)
 	st, err := cq.client.StatCtx(ctx, apiPath)
@@ -1775,7 +1849,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 				unlockPath()
 				return
 			}
-			if err := cq.validateEntryPayloadFresh(entry); err != nil {
+			if err := cq.validateEntryPayloadFreshCtx(entryCtx, entry); err != nil {
 				safeLogPrintf("commit queue: conflict auto-resolve rejected stale payload for %s: %v", entry.Path, err)
 				cq.onCommitTerminalFailure(entry, err)
 				unlockPath()
@@ -1950,7 +2024,7 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 		return
 	}
 
-	remoteItems, err := cq.prepareBatchWriteItems(entries)
+	remoteItems, err := cq.prepareBatchWriteItems(ctx, entries)
 	if err != nil {
 		unlockPaths()
 		cancel()
@@ -1959,7 +2033,7 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 				if entry == nil {
 					continue
 				}
-				if verr := cq.validateEntryPayloadFresh(entry); errors.Is(verr, errCommitPayloadStale) {
+				if verr := cq.validateEntryPayloadFreshCtx(entryCtx, entry); errors.Is(verr, errCommitPayloadStale) {
 					safeLogPrintf("commit queue: stale batched payload rejected for %s: %v", entry.Path, verr)
 					cq.onCommitTerminalFailure(entry, verr)
 					cq.endInFlight(entry)
@@ -2041,7 +2115,7 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 				cq.endInFlight(entry)
 				continue
 			}
-			if err := cq.validateEntryPayloadFresh(entry); err != nil {
+			if err := cq.validateEntryPayloadFreshCtx(entryCtx, entry); err != nil {
 				safeLogPrintf("commit queue: batch conflict auto-resolve rejected stale payload for %s: %v", entry.Path, err)
 				cq.onCommitTerminalFailure(entry, err)
 				unlockPath()
@@ -2060,10 +2134,10 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 	}
 }
 
-func (cq *CommitQueue) prepareBatchWriteItems(entries []*CommitEntry) ([]client.BatchWriteItem, error) {
+func (cq *CommitQueue) prepareBatchWriteItems(ctx context.Context, entries []*CommitEntry) ([]client.BatchWriteItem, error) {
 	items := make([]client.BatchWriteItem, len(entries))
 	for i, entry := range entries {
-		data, err := cq.readEntryPayload(entry)
+		data, err := cq.readEntryPayloadCtx(ctx, entry)
 		if err != nil {
 			return nil, fmt.Errorf("read shadow %s: %w", entry.Path, err)
 		}
@@ -2138,7 +2212,7 @@ func sleepWithCancel(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-func (cq *CommitQueue) validateEntryPayloadFresh(entry *CommitEntry) error {
+func (cq *CommitQueue) validateEntryPayloadFreshCtx(ctx context.Context, entry *CommitEntry) error {
 	if entry == nil {
 		return nil
 	}
@@ -2153,7 +2227,7 @@ func (cq *CommitQueue) validateEntryPayloadFresh(entry *CommitEntry) error {
 				return fmt.Errorf("%w: %s growth rebase was authorized at rev %d but durable watermark is rev %d",
 					errCommitPayloadStale, entry.Path, entry.growthRebaseRev, watermark)
 			}
-		} else if cq.maybeRebaseGrownPayloadOntoWatermark(entry, watermark) {
+		} else if cq.maybeRebaseGrownPayloadOntoWatermark(ctx, entry, watermark) {
 			// Keep going: this is a later growth of the same path, not a
 			// stale sibling snapshot. Authorization is recorded on entry so
 			// nested payload reads do not repeat the remote identity proof.
@@ -2170,6 +2244,10 @@ func (cq *CommitQueue) validateEntryPayloadFresh(entry *CommitEntry) error {
 		}
 	}
 	return nil
+}
+
+func (cq *CommitQueue) validateEntryPayloadFresh(entry *CommitEntry) error {
+	return cq.validateEntryPayloadFreshCtx(context.Background(), entry)
 }
 
 // effectiveDurableWatermark returns the freshest known durable revision for
@@ -2191,10 +2269,14 @@ func (cq *CommitQueue) effectiveDurableWatermark(entry *CommitEntry) int64 {
 }
 
 func (cq *CommitQueue) readEntryPayload(entry *CommitEntry) ([]byte, error) {
+	return cq.readEntryPayloadCtx(context.Background(), entry)
+}
+
+func (cq *CommitQueue) readEntryPayloadCtx(ctx context.Context, entry *CommitEntry) ([]byte, error) {
 	if entry == nil {
 		return nil, fmt.Errorf("nil commit entry")
 	}
-	if err := cq.validateEntryPayloadFresh(entry); err != nil {
+	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return nil, err
 	}
 	if entry.payloadBound {
@@ -2404,7 +2486,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	if layerRef != "" {
 		return cq.uploadLayerEntry(ctx, layerRef, entry, apiPath, entry.BaseRev)
 	}
-	if err := cq.validateEntryPayloadFresh(entry); err != nil {
+	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return 0, err
 	}
 	// Validation may safely authorize a base-zero PendingNew direct child to
@@ -2430,7 +2512,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	}
 
 	// Non-ShadowSpill: read full content into memory.
-	data, err := cq.readEntryPayload(entry)
+	data, err := cq.readEntryPayloadCtx(ctx, entry)
 	if err != nil {
 		return 0, fmt.Errorf("read shadow: %w", err)
 	}
@@ -2463,7 +2545,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 }
 
 func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string, expectedRevision int64) (int64, error) {
-	if err := cq.validateEntryPayloadFresh(entry); err != nil {
+	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return 0, err
 	}
 	if entry.Size > maxInlineLayerEntryBytes || entry.ShadowSpill {
@@ -2483,7 +2565,7 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 		}
 		return 0, err
 	}
-	data, err := cq.readEntryPayload(entry)
+	data, err := cq.readEntryPayloadCtx(ctx, entry)
 	if err != nil {
 		return 0, fmt.Errorf("read shadow: %w", err)
 	}
@@ -2716,7 +2798,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	}
 
 	// Read local shadow content.
-	localData, err := cq.readEntryPayload(entry)
+	localData, err := cq.readEntryPayloadCtx(entryCtx, entry)
 	if err != nil {
 		// Shadow may have been removed by a concurrent CancelPath/CancelPrefix
 		// (Unlink/Rmdir). Treat as canceled rather than a true conflict.
@@ -2871,7 +2953,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 		cq.onCommitTerminalFailure(entry, nil)
 		return
 	}
-	if err := cq.validateEntryPayloadFresh(entry); err != nil {
+	if err := cq.validateEntryPayloadFreshCtx(entryCtx, entry); err != nil {
 		safeLogPrintf("commit queue: auto-resolve rejected stale payload for %s before LWW: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry, err)
 		return
@@ -2929,7 +3011,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		cq.onCommitTerminalFailure(entry, nil)
 		return
 	}
-	if err := cq.validateEntryPayloadFresh(entry); err != nil {
+	if err := cq.validateEntryPayloadFreshCtx(entryCtx, entry); err != nil {
 		safeLogPrintf("commit queue: ShadowSpill stale payload rejected for %s: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry, err)
 		return

@@ -632,6 +632,69 @@ func TestSQLitePersistentJournalStagedDirtyHandleCannotAdoptCommittedRevision(t 
 	}
 }
 
+func TestStageShadowPendingFailureKeepsCurrentGenerationForSyncFallback(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const path = "/pending-fallback.db"
+	payload := []byte("latest shadow-spill payload")
+	if err := shadow.WriteFull(path, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	oldGen := shadow.ActiveGeneration(path)
+	fh := &FileHandle{
+		Path:           path,
+		Dirty:          fs.newWriteBuffer(path, maxPreloadSize, 0),
+		IsNew:          true,
+		ShadowReady:    true,
+		ShadowSpill:    true,
+		ShadowStageGen: oldGen,
+	}
+	if _, err := fh.Dirty.Write(0, payload); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = 1
+
+	// Force metadata publication to fail after Truncate has advanced the
+	// shadow generation. The caller will fall back to a synchronous upload.
+	pending.dir = filepath.Join(t.TempDir(), "missing", "pending")
+	if err := fs.stageShadowLocked(fh, true); err == nil {
+		t.Fatal("stageShadowLocked succeeded with an unavailable pending directory")
+	}
+	currentGen := shadow.ActiveGeneration(path)
+	if currentGen == oldGen {
+		t.Fatalf("shadow generation = %d, want a generation newer than %d", currentGen, oldGen)
+	}
+	if fh.ShadowStageGen != currentGen || fh.ShadowStageSeq != fh.DirtySeq {
+		t.Fatalf("fallback generation/seq = %d/%d, want %d/%d", fh.ShadowStageGen, fh.ShadowStageSeq, currentGen, fh.DirtySeq)
+	}
+	fd, size, release, err := shadow.OpenIfGeneration(path, fh.ShadowStageGen)
+	if err != nil {
+		t.Fatalf("open fallback generation: %v", err)
+	}
+	defer release()
+	defer fd.Close()
+	got, err := io.ReadAll(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != int64(len(payload)) || !bytes.Equal(got, payload) {
+		t.Fatalf("fallback shadow size/body = %d/%q, want %d/%q", size, got, len(payload), payload)
+	}
+}
+
 func TestSQLitePersistentJournalUnstagedDirtyHandleCannotAdoptDuringStaging(t *testing.T) {
 	for _, path := range []string{"/app.db-wal", "/app.db-journal"} {
 		t.Run(path, func(t *testing.T) {
@@ -1675,13 +1738,6 @@ func TestCommitQueueLandedProofUsesUploadedPayloadAfterShadowReplacement(t *test
 	defer ts.Close()
 	server.firstPutStarted = make(chan struct{})
 	server.releaseFirstPut = make(chan struct{})
-	defer func() {
-		select {
-		case <-server.releaseFirstPut:
-		default:
-			close(server.releaseFirstPut)
-		}
-	}()
 
 	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
 	if err != nil {
@@ -1696,6 +1752,13 @@ func TestCommitQueueLandedProofUsesUploadedPayloadAfterShadowReplacement(t *test
 	c.SetSmallFileThresholdForTests(1 << 20)
 	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	defer cq.DrainAll()
+	defer func() {
+		select {
+		case <-server.releaseFirstPut:
+		default:
+			close(server.releaseFirstPut)
+		}
+	}()
 	var watermark atomic.Int64
 	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
 	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
@@ -1754,6 +1817,73 @@ func TestCommitQueueLandedProofUsesUploadedPayloadAfterShadowReplacement(t *test
 	}
 	if puts[1].expected != "1" || !bytes.Equal(puts[1].body, child) {
 		t.Fatalf("child PUT expected=%q body=%q, want base1 exact child", puts[1].expected, puts[1].body)
+	}
+}
+
+func TestCommitQueueLandedLandmarksAreBoundedAndProtectQueuedChild(t *testing.T) {
+	cq := &CommitQueue{
+		queue:     []*CommitEntry{{Path: "/protected.db", ParentSnapshotID: "protected-parent"}},
+		inFlight:  make(map[string]*CommitEntry),
+		immediate: make(map[*CommitEntry]struct{}),
+		landed:    make(map[string]pathCommitLandmark),
+	}
+	cq.rememberLanded("/protected.db", 1, 1, "", "checksum", "protected-parent")
+	for i := 0; i < maxLandedCommitLandmarks; i++ {
+		path := fmt.Sprintf("/landmark-%04d.db", i)
+		cq.rememberLanded(path, 1, 1, "", "checksum", fmt.Sprintf("snapshot-%04d", i))
+	}
+	if got := len(cq.landed); got != maxLandedCommitLandmarks {
+		t.Fatalf("landed landmark count = %d, want %d", got, maxLandedCommitLandmarks)
+	}
+	if got := cq.landedCommit("/protected.db"); got.snapshotID != "protected-parent" {
+		t.Fatalf("queued child's parent landmark was evicted: %+v", got)
+	}
+	if got := cq.landedCommit("/landmark-0000.db"); got.snapshotID != "" {
+		t.Fatalf("oldest unreferenced landmark was retained: %+v", got)
+	}
+}
+
+func TestCommitQueueUnverifiableCommitInvalidatesOlderLandmark(t *testing.T) {
+	cq := &CommitQueue{landed: make(map[string]pathCommitLandmark)}
+	cq.rememberLanded("/replaced.db", 1, 4, "", "checksum", "snapshot-old")
+	if got := cq.landedCommit("/replaced.db"); got.snapshotID != "snapshot-old" {
+		t.Fatalf("initial landmark = %+v, want snapshot-old", got)
+	}
+	cq.rememberLanded("/replaced.db", 2, 2<<20, "", "", "snapshot-large")
+	if got := cq.landedCommit("/replaced.db"); got.snapshotID != "" {
+		t.Fatalf("unverifiable replacement retained stale landmark: %+v", got)
+	}
+}
+
+func TestCommitQueueReadRemoteSnapshotStopsOnCallerCancellation(t *testing.T) {
+	started := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			http.NotFound(w, r)
+			return
+		}
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	cq := &CommitQueue{client: newTestClient(ts.URL)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _, _, _ = cq.readRemoteSnapshot(ctx, "/cancel.db")
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("remote snapshot HEAD did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("remote snapshot ignored caller cancellation")
 	}
 }
 
@@ -1870,6 +2000,42 @@ func TestCommitQueueDoesNotRebaseLargerStaleCheckpointOntoLandedMain(t *testing.
 	}
 	if rev, body, puts := server.snapshot(); rev != 2 || !bytes.Equal(body, checkpointB) || len(puts) != 1 {
 		t.Fatalf("after stale checkpoint rev=%d body=%q puts=%d, want rev2 exact B and no second PUT", rev, body, len(puts))
+	}
+}
+
+func TestCommitQueueGrowthRebaseParentAboveIdentityLimitFailsClosed(t *testing.T) {
+	const path = "/large-parent.db"
+	parent := bytes.Repeat([]byte("p"), (1<<20)+1)
+	child := append(append([]byte(nil), parent...), 'c')
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	cq := NewCommitQueue(newTestClient("http://localhost"), shadow, nil, nil, 1, 8)
+	defer cq.DrainAll()
+
+	parentEntry := &CommitEntry{Size: int64(len(parent)), SnapshotID: "snapshot-parent", payload: parent, payloadBound: true}
+	checksum := cq.checksumLandedPayload(parentEntry)
+	if checksum != "" {
+		t.Fatalf("large parent checksum = %q, want bounded identity proof to be unavailable", checksum)
+	}
+	cq.rememberLanded(path, 1, int64(len(parent)), "", checksum, parentEntry.SnapshotID)
+	if got := cq.landedCommit(path); got.snapshotID != "" {
+		t.Fatalf("unverifiable large parent was retained as a landmark: %+v", got)
+	}
+
+	if err := shadow.WriteFull(path, child, 0); err != nil {
+		t.Fatal(err)
+	}
+	entry := &CommitEntry{
+		Path: path, BaseRev: 0, PayloadBaseRev: 0, PayloadBaseRevSet: true,
+		Size: int64(len(child)), Kind: PendingNew, ShadowGen: shadow.ActiveGeneration(path),
+		SnapshotID: "snapshot-child", ParentSnapshotID: parentEntry.SnapshotID,
+		liveLineageProof: true, DurableWatermarkRev: 1,
+	}
+	if err := cq.validateEntryPayloadFresh(entry); !errors.Is(err, errCommitPayloadStale) {
+		t.Fatalf("large-parent growth err = %v, want fail-closed errCommitPayloadStale", err)
 	}
 }
 
