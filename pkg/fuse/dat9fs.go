@@ -34,9 +34,10 @@ var testHookAfterSamePathDirtyHandleScan func(path string)
 // acquires the same-path remote commit fence.
 var testHookBeforeGVisorShadowSpillFlushFence func(path string)
 
-// testHookBeforeUnlinkedTransition lets tests run a same-FD Write+Fsync after
-// snapshot attach but before fh.Unlinked is set. Production keeps the
-// identity check, attach, and Unlinked transition under one fh.mu hold.
+// testHookBeforeUnlinkedTransition lets tests run Write+Fsync after the
+// unlink snapshot is fetched but before the captured handle set is locked
+// for attach + Unlinked. Production keeps identity check, attach, and the
+// Unlinked transition atomic for the whole open-handle set.
 var testHookBeforeUnlinkedTransition func()
 
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
@@ -1457,18 +1458,15 @@ func (fs *Dat9FS) layerDirHasOpenChild(prefix string) bool {
 	return false
 }
 
-// discardUnlinkedHandleStateLocked drops staged dirty/pending state for a
-// handle whose path was unlinked while open. Caller must hold fh.Lock.
-// Returning early from Flush/Release without this would re-stage write-back
-// and re-upload the file, leaving an orphan that makes parent rmdir ENOTEMPTY
-// (pjdfstest unlink/14.t).
+// cancelUnlinkedRemotePublishLocked drops path-keyed staging that would
+// resurrect an unlinked pathname. Caller must hold fh.Lock.
 //
-// Path-keyed cleanup is strictly ownership-scoped: POSIX allows recreating
-// the pathname while the old unlinked fd is still open, and path-global
-// removes would then destroy the replacement file's staged state (B5). Each
-// store entry is removed only if it is still the exact generation/inode this
-// handle staged; anything newer belongs to a replacement and is left alone.
-func (fs *Dat9FS) discardUnlinkedHandleStateLocked(fh *FileHandle) {
+// It does not clear fh.Dirty: Fsync/Flush after unlink — including during a
+// mark pass that may still retry — must keep write-after-unlink bytes
+// readable on the anonymous fd. Path-keyed cleanup is ownership-scoped:
+// POSIX allows recreating the pathname while the old unlinked fd is still
+// open, and path-global removes would destroy the replacement (B5).
+func (fs *Dat9FS) cancelUnlinkedRemotePublishLocked(fh *FileHandle) {
 	if fh == nil || !fh.Unlinked {
 		return
 	}
@@ -1476,14 +1474,6 @@ func (fs *Dat9FS) discardUnlinkedHandleStateLocked(fh *FileHandle) {
 	// owns one. Otherwise it would stay held until the final Release and
 	// block same-path create/write for RemoteCommitWaitTimeout.
 	fs.releaseHandleRemoteCommitPathLocked(fh)
-	if fh.Dirty != nil {
-		fh.Dirty.ClearDirty()
-	}
-	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
-	fh.DirtySeq = 0
-	fh.WriteBackSeq = 0
-	fh.ShadowCommitReady = false
-	fh.ShadowCommitSeq = 0
 	path := fh.Path
 	if path == "" {
 		return
@@ -1507,6 +1497,27 @@ func (fs *Dat9FS) discardUnlinkedHandleStateLocked(fh *FileHandle) {
 	if fs.commitQueue != nil {
 		fs.commitQueue.CancelPathIfInode(path, fh.Ino)
 	}
+}
+
+// discardUnlinkedHandleStateLocked drops staged dirty/pending state for a
+// handle whose path was unlinked while open. Caller must hold fh.Lock.
+// Use this on Release (the fd is going away). Fsync/Flush must call
+// cancelUnlinkedRemotePublishLocked instead so a successful write-after-
+// unlink remains readable, and so a retry/rollback of a partial unlink
+// mark cannot lose bytes whose Write and Fsync already returned OK.
+func (fs *Dat9FS) discardUnlinkedHandleStateLocked(fh *FileHandle) {
+	if fh == nil || !fh.Unlinked {
+		return
+	}
+	fs.cancelUnlinkedRemotePublishLocked(fh)
+	if fh.Dirty != nil {
+		fh.Dirty.ClearDirty()
+	}
+	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+	fh.DirtySeq = 0
+	fh.WriteBackSeq = 0
+	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
 }
 
 // removeHandleStagingLocked removes path-keyed staging state owned by fh.
@@ -7490,6 +7501,14 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		const maxUnlinkedRemoteSnapshotAttempts = 3
 		var staleAfterFetch bool
 		for attempt := 0; attempt < maxUnlinkedRemoteSnapshotAttempts; attempt++ {
+			for _, fh := range handles {
+				if fh == nil {
+					continue
+				}
+				fh.Lock()
+				dropStalePreinstalledUnlinkSnapshotLocked(fh)
+				fh.Unlock()
+			}
 			if snapshotShadowGen != 0 {
 				fs.discardUnlinkedSnapshotPins(snapshotShadowGen, snapshotNeedCount)
 				snapshotShadowGen = 0
@@ -7549,35 +7568,15 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 					continue
 				}
 			}
-			attachedSnapshotPins := 0
-			var markedThisPass []*FileHandle
-			attachFailed := false
-			for _, fh := range handles {
-				if fh == nil {
+			if testHookBeforeUnlinkedTransition != nil {
+				testHookBeforeUnlinkedTransition()
+				if snapshotOK && fs.unlinkedRemoteSnapshotStale(p, handles, revision, size) {
+					staleAfterFetch = true
 					continue
 				}
-				fh.Lock()
-				pin, fail := fs.attachUnlinkedHandleSnapshotLocked(fh, p, snapshot, snapshotShadowGen, size, revision, snapshotOK)
-				if !fail && testHookBeforeUnlinkedTransition != nil {
-					fh.Unlock()
-					testHookBeforeUnlinkedTransition()
-					fh.Lock()
-					pin, fail = fs.attachUnlinkedHandleSnapshotLocked(fh, p, snapshot, snapshotShadowGen, size, revision, snapshotOK)
-				}
-				if fail {
-					attachFailed = true
-					fh.Unlock()
-					break
-				}
-				if pin {
-					attachedSnapshotPins++
-				}
-				fh.Unlinked = true
-				markedThisPass = append(markedThisPass, fh)
-				fh.Unlock()
 			}
+			attachedSnapshotPins, attachFailed := fs.attachAndMarkOpenHandles(handles, p, snapshot, snapshotShadowGen, size, revision, snapshotOK, true)
 			if attachFailed {
-				fs.unmarkOpenHandlesAfterFailedUnlink(p, markedThisPass)
 				staleAfterFetch = true
 				continue
 			}
@@ -7604,17 +7603,51 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		}
 	}
 
-	for _, fh := range handles {
-		if fh == nil {
-			continue
-		}
-		fh.Lock()
-		_, _ = fs.attachUnlinkedHandleSnapshotLocked(fh, p, snapshot, snapshotShadowGen, size, revision, snapshotOK)
-		fh.Unlinked = true
-		fh.Unlock()
-	}
+	_, _ = fs.attachAndMarkOpenHandles(handles, p, snapshot, snapshotShadowGen, size, revision, snapshotOK, false)
 	fs.openHandles.UnlinkPath(p)
 	return handles, true, nil
+}
+
+// attachAndMarkOpenHandles attaches unlink snapshots and sets Unlinked on the
+// whole captured handle set under one multi-handle lock hold. If failClosed
+// is set and any handle cannot take the snapshot, no handle is left Unlinked
+// and attached snapshot state from this pass is rolled back.
+func (fs *Dat9FS) attachAndMarkOpenHandles(handles []*FileHandle, p string, snapshot []byte, snapshotShadowGen uint64, size, revision int64, snapshotOK bool, failClosed bool) (attachedPins int, failed bool) {
+	ordered := lockFileHandlesInOrder(handles)
+	defer unlockFileHandles(ordered)
+	for _, fh := range ordered {
+		pin, fail := fs.attachUnlinkedHandleSnapshotLocked(fh, p, snapshot, snapshotShadowGen, size, revision, snapshotOK)
+		if fail && failClosed {
+			for _, h := range ordered {
+				fs.rollbackUnlinkedSnapshotAttachLocked(h, snapshotShadowGen)
+			}
+			return 0, true
+		}
+		if pin {
+			attachedPins++
+		}
+	}
+	for _, fh := range ordered {
+		fh.Unlinked = true
+	}
+	return attachedPins, false
+}
+
+func (fs *Dat9FS) rollbackUnlinkedSnapshotAttachLocked(fh *FileHandle, snapshotShadowGen uint64) {
+	if fh == nil || fh.Unlinked {
+		return
+	}
+	fh.UnlinkedData = nil
+	fh.UnlinkedSnapshot = false
+	fh.UnlinkedSize = 0
+	fh.UnlinkedSnapshotRev = 0
+	fh.UnlinkedSnapshotSize = 0
+	if gen := fh.UnlinkedShadowGen; gen != 0 {
+		fh.UnlinkedShadowGen = 0
+		if gen != snapshotShadowGen && fs != nil && fs.shadowStore != nil {
+			fs.shadowStore.Unpin(gen)
+		}
+	}
 }
 
 func (fs *Dat9FS) attachUnlinkedHandleSnapshotLocked(fh *FileHandle, p string, snapshot []byte, snapshotShadowGen uint64, size, revision int64, snapshotOK bool) (attachedPin bool, fail bool) {
@@ -7838,8 +7871,8 @@ func (fs *Dat9FS) loadUnlinkedHandlePart(fh *FileHandle, offset, length int64) (
 // unmarkOpenHandlesAfterFailedUnlink rolls back markOpenHandlesUnlinked when
 // the remote DELETE fails: the directory entry still exists remotely, so the
 // handles must return to normal — otherwise every later Flush/Fsync/Release
-// takes the unlinked-discard branch and silently drops their dirty/staged
-// data. handles must be the exact set snapshotted before the mark pass;
+// skips remote publish. Fsync/Flush keep Dirty, but Release would still
+// discard. handles must be the exact set snapshotted before the mark pass;
 // handles released in between are skipped via the inode-index liveness check
 // in RelinkPath (their Release already ran the normal lifecycle).
 //
@@ -13079,8 +13112,9 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 		// Write-after-unlink on a write-sync handle: POSIX requires the write
 		// to succeed on the anonymous fd (the data is already in the Dirty
 		// buffer and remains readable), but it must NOT recreate the deleted
-		// pathname remotely. Flush/Fsync/Release discard staged state via the
-		// unlinked guards; the write-sync Write path must not upload either.
+		// pathname remotely. Flush/Fsync cancel path-keyed staging via the
+		// unlinked guards without dropping Dirty; Release discards on close.
+		// The write-sync Write path must not upload either.
 		return gofuse.OK
 	}
 	if handled, status, _ := fs.routeAppendLogLocked(ctx, fh); handled {
@@ -13314,8 +13348,9 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 		return gofuse.OK
 	}
 	if fh.Unlinked {
-		// Path was removed while open; never re-upload discarded content.
-		fs.discardUnlinkedHandleStateLocked(fh)
+		// Path was removed while open; never re-upload. Keep Dirty so a
+		// successful write-after-unlink stays readable on this fd.
+		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
 	}
 	if fs.clearStaleSQLitePersistentJournalEmptyCreateLocked(fh) {
@@ -13381,7 +13416,7 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 			fs.recordAppendLogFullRewrite(uint64(size))
 		}
 		if fh.Unlinked {
-			fs.discardUnlinkedHandleStateLocked(fh)
+			fs.cancelUnlinkedRemotePublishLocked(fh)
 			return gofuse.OK
 		}
 		if fh.Path != handlePath || fh.DirtySeq != mutationSeq {
@@ -13583,10 +13618,11 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 
 	// Unlink-while-open: never re-stage write-back or upload. Doing so
 	// resurrects the path after Unlink's remote DELETE and makes parent
-	// rmdir return ENOTEMPTY (pjdfstest unlink/14.t).
+	// rmdir return ENOTEMPTY (pjdfstest unlink/14.t). Keep Dirty so
+	// write-after-unlink remains readable if unlink later retries.
 	if fh.Unlinked {
 		phase = "unlinked-discard"
-		fs.discardUnlinkedHandleStateLocked(fh)
+		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
 	}
 	if fs.discardSupersededMutationLocked(fh) {
@@ -13837,11 +13873,11 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			}
 			// If Unlink completed while remoteCommitLock was released (it
 			// serializes DELETE after our PUT via the same lock), the path is
-			// already deleted. Discard local staging and do not re-publish
-			// handle committed state.
+			// already deleted. Cancel path-keyed staging and do not re-publish
+			// handle committed state. Keep Dirty for anonymous-fd reads.
 			if fh.Unlinked {
 				phase = "unlinked-after-shadowspill-upload"
-				fs.discardUnlinkedHandleStateLocked(fh)
+				fs.cancelUnlinkedRemotePublishLocked(fh)
 				return gofuse.OK
 			}
 			if gvisorCompat && (fh.Path != handlePath || fh.DirtySeq != mutationSeq) {
@@ -14018,9 +14054,10 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	// Unlink-while-open: never stage/enqueue/upload. Fsync can otherwise
 	// re-enter commitQueue after Unlink's ordered drain and resurrect the
 	// deleted path (write → unlink → fsync → close → rmdir ENOTEMPTY).
+	// Keep Dirty so a successful write-after-unlink stays readable.
 	if fh.Unlinked {
 		phase = "unlinked-discard"
-		fs.discardUnlinkedHandleStateLocked(fh)
+		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
 	}
 	if fs.discardSupersededMutationLocked(fh) {
@@ -14216,11 +14253,11 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 		// If Unlink completed while remoteCommitLock was released (it
 		// serializes DELETE after our PUT via the same lock), the path is
-		// already deleted. Discard local staging and do not re-publish
-		// handle committed state.
+		// already deleted. Cancel path-keyed staging and do not re-publish
+		// handle committed state. Keep Dirty for anonymous-fd reads.
 		if fh.Unlinked {
 			phase = "unlinked-after-shadowspill-upload"
-			fs.discardUnlinkedHandleStateLocked(fh)
+			fs.cancelUnlinkedRemotePublishLocked(fh)
 			return gofuse.OK
 		}
 		if gvisorCompat && (fh.Path != handlePath || fh.DirtySeq != mutationSeq) {
@@ -15025,7 +15062,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		// debounced PUT resurrects a just-deleted path and parent rmdir
 		// fails with ENOTEMPTY (pjdfstest unlink/14.t).
 		if handle.Unlinked {
-			fs.discardUnlinkedHandleStateLocked(handle)
+			fs.cancelUnlinkedRemotePublishLocked(handle)
 			handle.Unlock()
 			return
 		}
@@ -15208,7 +15245,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 	if fh.Unlinked {
 		phase = "unlinked-discard"
-		fs.discardUnlinkedHandleStateLocked(fh)
+		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
 	}
 	if fs.discardSupersededMutationLocked(fh) {
@@ -15379,7 +15416,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 		if fh.Unlinked {
 			phase = "unlinked-after-streaming"
-			fs.discardUnlinkedHandleStateLocked(fh)
+			fs.cancelUnlinkedRemotePublishLocked(fh)
 			return gofuse.OK
 		}
 		if fh.Path != mutationPath || fh.DirtySeq != mutationSeq {
@@ -15463,7 +15500,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 		if fh.Unlinked {
 			phase = "unlinked-after-upload-all"
-			fs.discardUnlinkedHandleStateLocked(fh)
+			fs.cancelUnlinkedRemotePublishLocked(fh)
 			return gofuse.OK
 		}
 		if fh.Path != mutationPath || fh.DirtySeq != mutationSeq {
@@ -15751,10 +15788,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 	// If Unlink completed after we released remoteCommitLock (it serializes
 	// DELETE after our PUT via the same lock), the path is already deleted.
-	// Discard local staging and do not re-publish handle committed state.
+	// Cancel path-keyed staging and do not re-publish handle committed state.
+	// Keep Dirty so the anonymous fd can still read the bytes just uploaded.
 	if fh.Unlinked {
 		phase = "unlinked-after-upload"
-		fs.discardUnlinkedHandleStateLocked(fh)
+		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
 	}
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {

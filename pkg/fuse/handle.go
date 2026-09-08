@@ -3,9 +3,11 @@ package fuse
 import (
 	"context"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
@@ -117,6 +119,37 @@ func (fh *FileHandle) TryLock() bool { return fh.mu.TryLock() }
 
 // Unlock releases the file handle mutex.
 func (fh *FileHandle) Unlock() { fh.mu.Unlock() }
+
+// lockFileHandlesInOrder locks each unique handle in a stable pointer order
+// so a multi-handle unlink mark cannot deadlock with itself. The returned
+// slice is what unlockFileHandles must unlock (reverse order).
+func lockFileHandlesInOrder(handles []*FileHandle) []*FileHandle {
+	seen := make(map[*FileHandle]struct{}, len(handles))
+	ordered := make([]*FileHandle, 0, len(handles))
+	for _, fh := range handles {
+		if fh == nil {
+			continue
+		}
+		if _, ok := seen[fh]; ok {
+			continue
+		}
+		seen[fh] = struct{}{}
+		ordered = append(ordered, fh)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		return uintptr(unsafe.Pointer(ordered[i])) < uintptr(unsafe.Pointer(ordered[j]))
+	})
+	for _, fh := range ordered {
+		fh.Lock()
+	}
+	return ordered
+}
+
+func unlockFileHandles(ordered []*FileHandle) {
+	for i := len(ordered) - 1; i >= 0; i-- {
+		ordered[i].Unlock()
+	}
+}
 
 // LockWithTimeout attempts to acquire the file handle mutex within the given
 // deadline. Returns true if the lock was acquired, false if the deadline
