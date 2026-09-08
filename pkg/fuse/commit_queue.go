@@ -1503,7 +1503,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			cq.mu.Unlock()
 			if abandoned {
 				safeLogPrintf("commit queue: layer abandoned, terminal failure for %s", entry.Path)
-				cq.onCommitTerminalFailure(entry, err)
+				cq.onCommitTerminalFailure(entry, fmt.Errorf("%w: %v", errLayerRolledBack, err))
 				unlockPath()
 				return
 			}
@@ -2780,7 +2780,7 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error
 		if entry.PendingIndexGen != 0 {
 			marked, err := cq.index.MarkConflictIfGeneration(entry.Path, entry.PendingIndexGen)
 			if err != nil {
-				safeLogPrintf("commit queue: failed to mark conflict for %s: %v (entry remains queued)", entry.Path, err)
+				safeLogPrintf("commit queue: failed to mark conflict for %s: %v (pending data preserved; in-memory queue entry removed)", entry.Path, err)
 				cq.removeFromQueue(entry)
 				cq.recordCommitTerminalFailure(entry, lastErr)
 				return
@@ -2791,10 +2791,9 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error
 				return
 			}
 		} else if err := cq.index.MarkConflict(entry.Path); err != nil {
-			// Conflict marker not durable — leave the entry queued so
-			// RecoverPending can retry on next startup rather than
-			// silently dropping it.
-			safeLogPrintf("commit queue: failed to mark conflict for %s: %v (entry remains queued)", entry.Path, err)
+			// Conflict marker not durable. The in-memory queue entry is still
+			// removed; RecoverPending can retry from preserved pending/shadow.
+			safeLogPrintf("commit queue: failed to mark conflict for %s: %v (pending data preserved; in-memory queue entry removed)", entry.Path, err)
 			cq.removeFromQueue(entry)
 			cq.recordCommitTerminalFailure(entry, lastErr)
 			return
@@ -2824,5 +2823,20 @@ func (cq *CommitQueue) recordCommitTerminalFailure(entry *CommitEntry, lastErr e
 	// "drive9: error event=commit_terminal_failure" on stderr / mount-log
 	// files (typically ~/.cache/drive9/mount-logs/). The drive9 server never
 	// sees this line; collect it outside the sandbox. lastErr may be nil.
-	safeLogPrintf("drive9: error event=commit_terminal_failure path=%s err=%v detail=local_data_preserved", entry.Path, lastErr)
+	// reason= distinguishes retryable upload loss from concurrency conflict
+	// and layer-abandonment so alert severity can differ.
+	safeLogPrintf("drive9: error event=commit_terminal_failure path=%s reason=%s err=%v detail=local_data_preserved", entry.Path, classifyCommitTerminalReason(lastErr), lastErr)
+}
+
+func classifyCommitTerminalReason(lastErr error) string {
+	switch {
+	case lastErr == nil:
+		return "conflict"
+	case errors.Is(lastErr, errLayerRolledBack):
+		return "abandoned"
+	case errors.Is(lastErr, client.ErrConflict), errors.Is(lastErr, errCommitPayloadStale):
+		return "conflict"
+	default:
+		return "upload_failure"
+	}
 }

@@ -1912,8 +1912,8 @@ func TestCommitQueueNonConflictErrorUnchanged(t *testing.T) {
 			t.Fatalf("terminal failure log missing %q:\n%s", want, logged)
 		}
 	}
-	if strings.Count(logged, "drive9: error event=commit_terminal_failure path=/500.txt") != 1 {
-		t.Fatalf("want exactly one alertable terminal-failure line for /500.txt, got:\n%s", logged)
+	if strings.Count(logged, "drive9: error event=commit_terminal_failure path=/500.txt reason=upload_failure") != 1 {
+		t.Fatalf("want exactly one alertable upload_failure line for /500.txt, got:\n%s", logged)
 	}
 	for _, line := range strings.Split(logged, "\n") {
 		if strings.Contains(line, "upload attempt") && strings.Contains(line, "drive9: error") {
@@ -1926,6 +1926,25 @@ func TestCommitQueueNonConflictErrorUnchanged(t *testing.T) {
 	}
 	if got := snap.Counters["commit_failure"]; got != 1 {
 		t.Fatalf("commit_failure = %d, want 1", got)
+	}
+}
+
+func TestClassifyCommitTerminalReason(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{nil, "conflict"},
+		{errLayerRolledBack, "abandoned"},
+		{fmt.Errorf("%w: 409", errLayerRolledBack), "abandoned"},
+		{client.ErrConflict, "conflict"},
+		{errCommitPayloadStale, "conflict"},
+		{fmt.Errorf("HTTP 503"), "upload_failure"},
+	}
+	for _, tc := range cases {
+		if got := classifyCommitTerminalReason(tc.err); got != tc.want {
+			t.Errorf("classifyCommitTerminalReason(%v) = %q, want %q", tc.err, got, tc.want)
+		}
 	}
 }
 
