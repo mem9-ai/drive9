@@ -411,7 +411,7 @@ func TestCommitQueueBatchWriteFallsBackWhenUnsupported(t *testing.T) {
 	}
 }
 
-func TestCommitQueueBatchWriteFallsBackPerItemFailure(t *testing.T) {
+func TestCommitQueueBatchWriteFallsBackPerItemConflict(t *testing.T) {
 	var batchCalls atomic.Int32
 	var putPaths []string
 	var putMu sync.Mutex
@@ -424,7 +424,7 @@ func TestCommitQueueBatchWriteFallsBackPerItemFailure(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"results": []map[string]any{
 					{"path": "/a.txt", "status": 200, "revision": 1},
-					{"path": "/b.txt", "status": 500, "error": "temporary"},
+					{"path": "/b.txt", "status": 409, "error": "revision conflict"},
 				},
 			})
 		case r.Method == http.MethodPut:

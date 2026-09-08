@@ -1855,6 +1855,41 @@ func TestCommitQueueUnverifiableCommitInvalidatesOlderLandmark(t *testing.T) {
 	}
 }
 
+func TestCommitQueueLowerRevisionReplacesOlderLandmark(t *testing.T) {
+	cq := &CommitQueue{landed: make(map[string]pathCommitLandmark)}
+	cq.rememberLanded("/recreated.db", 9, 4, "", "old-checksum", "snapshot-old")
+	cq.rememberLanded("/recreated.db", 1, 8, "", "new-checksum", "snapshot-new")
+
+	got := cq.landedCommit("/recreated.db")
+	if got.rev != 1 || got.snapshotID != "snapshot-new" || got.checksum != "new-checksum" {
+		t.Fatalf("landmark after revision reset = %+v, want new incarnation at revision 1", got)
+	}
+}
+
+func TestCommitQueueCancellationInvalidatesLandedLandmarks(t *testing.T) {
+	cq := &CommitQueue{
+		inFlight:  make(map[string]*CommitEntry),
+		immediate: make(map[*CommitEntry]struct{}),
+		landed:    make(map[string]pathCommitLandmark),
+	}
+	for _, path := range []string{"/one.db", "/dir/two.db", "/keep.db"} {
+		cq.rememberLanded(path, 1, 1, "", "checksum", "snapshot-"+path)
+	}
+
+	cq.CancelPathPreserveLocal("/one.db")
+	cq.CancelPrefix("/dir/")
+
+	if got := cq.landedCommit("/one.db"); got.snapshotID != "" {
+		t.Fatalf("CancelPathPreserveLocal retained landmark: %+v", got)
+	}
+	if got := cq.landedCommit("/dir/two.db"); got.snapshotID != "" {
+		t.Fatalf("CancelPrefix retained landmark: %+v", got)
+	}
+	if got := cq.landedCommit("/keep.db"); got.snapshotID == "" {
+		t.Fatal("CancelPrefix removed unrelated landmark")
+	}
+}
+
 func TestCommitQueueReadRemoteSnapshotStopsOnCallerCancellation(t *testing.T) {
 	started := make(chan struct{})
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
