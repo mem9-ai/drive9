@@ -1894,8 +1894,9 @@ func (fs *Dat9FS) mountWritePolicy() WritePolicy {
 }
 
 // mountWritePolicyDurableRename reports whether pending-new rename(2) must
-// commit remotely before returning. Rename has no open-file WritePolicy, so
-// this uses the mount policy rather than a handle.
+// commit remotely before returning. Open handles of oldP carry WritePolicy,
+// but rename is not an fd operation; the mount policy is the proxy for the
+// pending-new states that reach this path (writeback stays async by design).
 func (fs *Dat9FS) mountWritePolicyDurableRename() bool {
 	switch fs.mountWritePolicy() {
 	case WritePolicyCloseSync, WritePolicyWriteSync:
@@ -10100,7 +10101,11 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 		}
 		fs.bindCommitEntryToPath(entry, newP, meta.BaseRev)
 		commitPendingRenameNow := func() error {
-			commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+			timeout := uploadTimeout
+			if entry.ShadowSpill {
+				timeout = releaseTimeout(entry.Size)
+			}
+			commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 			defer commitCancel()
 			return fs.commitQueue.commitNowPathLocked(commitCtx, entry)
 		}

@@ -1697,9 +1697,9 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 				if entry == nil {
 					continue
 				}
-				if errors.Is(cq.validateEntryPayloadFresh(entry), errCommitPayloadStale) {
-					safeLogPrintf("commit queue: stale batched payload rejected for %s: %v", entry.Path, err)
-					cq.onCommitTerminalFailure(entry, err)
+				if verr := cq.validateEntryPayloadFresh(entry); errors.Is(verr, errCommitPayloadStale) {
+					safeLogPrintf("commit queue: stale batched payload rejected for %s: %v", entry.Path, verr)
+					cq.onCommitTerminalFailure(entry, verr)
 					cq.endInFlight(entry)
 					continue
 				}
@@ -2768,10 +2768,6 @@ func (cq *CommitQueue) onCommitPostUploadFailure(entry *CommitEntry, err error) 
 }
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error) {
-	if cq.perf != nil {
-		cq.perf.commitFailure.add(1)
-		cq.perf.commitTerminalFailure.add(1)
-	}
 	// Mark the entry as conflicted in the pending index so that crash
 	// recovery (RecoverPending) skips it instead of retrying forever.
 	// Preserve both the shadow file and the pending metadata so the user
@@ -2786,6 +2782,7 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error
 			if err != nil {
 				safeLogPrintf("commit queue: failed to mark conflict for %s: %v (entry remains queued)", entry.Path, err)
 				cq.removeFromQueue(entry)
+				cq.recordCommitTerminalFailure(entry, lastErr)
 				return
 			}
 			if !marked {
@@ -2799,6 +2796,7 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error
 			// silently dropping it.
 			safeLogPrintf("commit queue: failed to mark conflict for %s: %v (entry remains queued)", entry.Path, err)
 			cq.removeFromQueue(entry)
+			cq.recordCommitTerminalFailure(entry, lastErr)
 			return
 		}
 	}
@@ -2814,7 +2812,14 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error
 	// Remove from queue AFTER all cleanup so WaitPath sees the entry
 	// until bookkeeping is complete.
 	cq.removeFromQueue(entry)
+	cq.recordCommitTerminalFailure(entry, lastErr)
+}
 
+func (cq *CommitQueue) recordCommitTerminalFailure(entry *CommitEntry, lastErr error) {
+	if cq.perf != nil {
+		cq.perf.commitFailure.add(1)
+		cq.perf.commitTerminalFailure.add(1)
+	}
 	// Alertable FUSE-local error. Collectors should match
 	// "drive9: error event=commit_terminal_failure" on stderr / mount-log
 	// files (typically ~/.cache/drive9/mount-logs/). The drive9 server never
