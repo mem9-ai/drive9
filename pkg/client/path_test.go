@@ -101,6 +101,17 @@ func TestFSMethodsRejectWindowsPathBeforeRequest(t *testing.T) {
 		"AppendStream": func() error {
 			return c.AppendStream(ctx, bad, strings.NewReader("x"), 1, nil)
 		},
+		"AppendLog": func() error {
+			_, err := c.AppendLog(ctx, bad, strings.NewReader("x"), 1, 0, 0)
+			return err
+		},
+		"WriteServerStream": func() error {
+			_, err := c.WriteServerStreamConditional(ctx, bad, strings.NewReader("x"), 1, 0)
+			return err
+		},
+		"SetMetadata": func() error {
+			return c.SetMetadataCtx(ctx, bad, SetMetadataOptions{Tags: map[string]string{"k": "v"}})
+		},
 		// Large size forces the multipart upload session path; validation
 		// must fire before the /v1/status threshold fetch and checksum work.
 		"WriteStream": func() error {

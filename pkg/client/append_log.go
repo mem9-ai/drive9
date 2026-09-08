@@ -42,7 +42,11 @@ func (c *Client) AppendLog(ctx context.Context, path string, tail io.Reader, tai
 		tail = bytes.NewReader(nil)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?append-log", tail)
+	reqURL, err := c.url(path)
+	if err != nil {
+		return AppendLogResult{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL+"?append-log", tail)
 	if err != nil {
 		return AppendLogResult{}, err
 	}
@@ -96,7 +100,11 @@ func (c *Client) WriteServerStreamConditional(ctx context.Context, path string, 
 		body = bytes.NewReader(nil)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), body)
+	reqURL, err := c.url(path)
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, body)
 	if err != nil {
 		return 0, err
 	}

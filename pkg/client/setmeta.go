@@ -48,7 +48,11 @@ func (c *Client) SetMetadataCtx(ctx context.Context, path string, opts SetMetada
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?setmeta=1", bytes.NewReader(body))
+	reqURL, err := c.url(path)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL+"?setmeta=1", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
