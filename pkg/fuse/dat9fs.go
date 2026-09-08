@@ -465,6 +465,12 @@ const fuseTimeout = 30 * time.Second
 // the lock holder releases fh.mu during the actual HTTP transfer.
 const flushLockTimeout = 60 * time.Second
 
+// unlinkHandleSetLockTimeout bounds how long Unlink waits to TryLock the
+// whole captured handle set. The set is acquired with TryLock only: a
+// failed attempt drops every lock already taken and retries, so Unlink
+// never blocks holding a partial set against sibling-mode cleanup.
+const unlinkHandleSetLockTimeout = 15 * time.Second
+
 const (
 	// lookupTransientRetryCount is the number of detached retries after the
 	// initial Lookup StatCtx attempt fails with a transient error.
@@ -7482,14 +7488,7 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 	if len(handles) == 0 {
 		return nil, false, nil
 	}
-	for _, fh := range handles {
-		if fh == nil {
-			continue
-		}
-		fh.Lock()
-		dropStalePreinstalledUnlinkSnapshotLocked(fh)
-		fh.Unlock()
-	}
+	dropStalePreinstalledUnlinkSnapshots(handles)
 
 	size, revision := fs.pathUnlinkedSnapshotIdentity(p)
 
@@ -7501,14 +7500,10 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		const maxUnlinkedRemoteSnapshotAttempts = 3
 		var staleAfterFetch bool
 		for attempt := 0; attempt < maxUnlinkedRemoteSnapshotAttempts; attempt++ {
-			for _, fh := range handles {
-				if fh == nil {
-					continue
-				}
-				fh.Lock()
-				dropStalePreinstalledUnlinkSnapshotLocked(fh)
-				fh.Unlock()
-			}
+			// Drop before unlinkedRemoteSnapshotStale: that check treats a
+			// handle with any preinstalled snapshot as not-needing, so a
+			// stale UnlinkedData would otherwise hide a concurrent commit.
+			dropStalePreinstalledUnlinkSnapshots(handles)
 			if snapshotShadowGen != 0 {
 				fs.discardUnlinkedSnapshotPins(snapshotShadowGen, snapshotNeedCount)
 				snapshotShadowGen = 0
@@ -7575,8 +7570,12 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 					continue
 				}
 			}
-			attachedSnapshotPins, attachFailed := fs.attachAndMarkOpenHandles(handles, p, snapshot, snapshotShadowGen, size, revision, snapshotOK, true)
+			failClosed := true
+			attachedSnapshotPins, attachFailed := fs.attachAndMarkOpenHandles(handles, p, snapshot, snapshotShadowGen, size, revision, snapshotOK, failClosed)
 			if attachFailed {
+				if attachedSnapshotPins > snapshotNeedCount {
+					snapshotNeedCount = attachedSnapshotPins
+				}
 				staleAfterFetch = true
 				continue
 			}
@@ -7603,25 +7602,67 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		}
 	}
 
-	_, _ = fs.attachAndMarkOpenHandles(handles, p, snapshot, snapshotShadowGen, size, revision, snapshotOK, false)
+	failClosed := false
+	_, _ = fs.attachAndMarkOpenHandles(handles, p, snapshot, snapshotShadowGen, size, revision, snapshotOK, failClosed)
 	fs.openHandles.UnlinkPath(p)
 	return handles, true, nil
 }
 
 // attachAndMarkOpenHandles attaches unlink snapshots and sets Unlinked on the
-// whole captured handle set under one multi-handle lock hold. If failClosed
-// is set and any handle cannot take the snapshot, no handle is left Unlinked
-// and attached snapshot state from this pass is rolled back.
+// whole captured handle set under one multi-handle lock hold. The set is
+// acquired with TryLock only; a failed attempt drops every lock already
+// taken and retries, so this never blocks holding a partial set against
+// sibling-mode cleanup (layer flush/Fsync holds one fh.mu then Lock()s
+// other same-inode handles). If failClosed is set and any handle cannot
+// take the snapshot, no handle is left Unlinked and attached snapshot
+// state from this pass is rolled back.
+//
+// Shadow pin ownership: snapshotShadowGen pins are created for
+// snapshotNeedCount and released by the mark loop via
+// discardUnlinkedSnapshotPins (or leftover unpin after a successful attach).
+// Per-handle pins from PinIfExists belong to the handle and are unpinned by
+// rollbackUnlinkedSnapshotAttachLocked / unmark / Release. Do not unify those
+// two Unpin rules.
 func (fs *Dat9FS) attachAndMarkOpenHandles(handles []*FileHandle, p string, snapshot []byte, snapshotShadowGen uint64, size, revision int64, snapshotOK bool, failClosed bool) (attachedPins int, failed bool) {
-	ordered := lockFileHandlesInOrder(handles)
-	defer unlockFileHandles(ordered)
+	deadline := time.Now().Add(unlinkHandleSetLockTimeout)
+	for {
+		ordered, ok := tryLockFileHandlesInOrder(handles)
+		if !ok {
+			if !time.Now().Before(deadline) {
+				return 0, true
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		attachedPins, failed = fs.attachAndMarkOpenHandlesLocked(ordered, p, snapshot, snapshotShadowGen, size, revision, snapshotOK, failClosed)
+		unlockFileHandles(ordered)
+		return attachedPins, failed
+	}
+}
+
+func (fs *Dat9FS) attachAndMarkOpenHandlesLocked(ordered []*FileHandle, p string, snapshot []byte, snapshotShadowGen uint64, size, revision int64, snapshotOK bool, failClosed bool) (attachedPins int, failed bool) {
+	if failClosed && snapshotOK {
+		// Re-check path identity while every captured fh.mu is held. A
+		// concurrent Fsync may have published a new committed revision
+		// while its handle lock was released around the PUT; the writer's
+		// BaseRev adoption is blocked here, so only the path map sees it.
+		// Do not call unlinkedRemoteSnapshotStale here: it takes fh.Lock
+		// per handle and would self-deadlock under this multi-hold.
+		curSize, curRev := fs.pathUnlinkedSnapshotIdentity(p)
+		if revision > 0 && curRev > 0 && curRev != revision {
+			return 0, true
+		}
+		if size > 0 && curSize > 0 && curSize != size {
+			return 0, true
+		}
+	}
 	for _, fh := range ordered {
 		pin, fail := fs.attachUnlinkedHandleSnapshotLocked(fh, p, snapshot, snapshotShadowGen, size, revision, snapshotOK)
 		if fail && failClosed {
 			for _, h := range ordered {
 				fs.rollbackUnlinkedSnapshotAttachLocked(h, snapshotShadowGen)
 			}
-			return 0, true
+			return attachedPins, true
 		}
 		if pin {
 			attachedPins++
@@ -7633,6 +7674,11 @@ func (fs *Dat9FS) attachAndMarkOpenHandles(handles []*FileHandle, p string, snap
 	return attachedPins, false
 }
 
+// rollbackUnlinkedSnapshotAttachLocked drops snapshot state attached in a
+// fail-closed mark pass that did not set Unlinked. Shared snapshotShadowGen
+// pins stay with the mark loop (discardUnlinkedSnapshotPins on retry);
+// only a per-handle PinIfExists generation is unpinned here. Already
+// Unlinked handles are left alone — those pins are committed to the fd.
 func (fs *Dat9FS) rollbackUnlinkedSnapshotAttachLocked(fh *FileHandle, snapshotShadowGen uint64) {
 	if fh == nil || fh.Unlinked {
 		return
@@ -7644,9 +7690,20 @@ func (fs *Dat9FS) rollbackUnlinkedSnapshotAttachLocked(fh *FileHandle, snapshotS
 	fh.UnlinkedSnapshotSize = 0
 	if gen := fh.UnlinkedShadowGen; gen != 0 {
 		fh.UnlinkedShadowGen = 0
-		if gen != snapshotShadowGen && fs != nil && fs.shadowStore != nil {
+		if gen != snapshotShadowGen && fs.shadowStore != nil {
 			fs.shadowStore.Unpin(gen)
 		}
+	}
+}
+
+func dropStalePreinstalledUnlinkSnapshots(handles []*FileHandle) {
+	for _, fh := range handles {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		dropStalePreinstalledUnlinkSnapshotLocked(fh)
+		fh.Unlock()
 	}
 }
 
@@ -7769,10 +7826,12 @@ func (fs *Dat9FS) pathUnlinkedSnapshotIdentity(p string) (size, rev int64) {
 	if fs == nil || p == "" {
 		return 0, 0
 	}
-	if ino, ok := fs.inodes.GetInode(p); ok {
-		if entry, ok := fs.inodes.GetEntry(ino); ok && entry != nil {
-			size = entry.Size
-			rev = entry.Revision
+	if fs.inodes != nil {
+		if ino, ok := fs.inodes.GetInode(p); ok {
+			if entry, ok := fs.inodes.GetEntry(ino); ok && entry != nil {
+				size = entry.Size
+				rev = entry.Revision
+			}
 		}
 	}
 	if cr := fs.latestCommittedRevision(p); cr > rev {
@@ -7901,9 +7960,10 @@ func (fs *Dat9FS) unmarkOpenHandlesAfterFailedUnlink(p string, handles []*FileHa
 		fh.UnlinkedSnapshotSize = 0
 		if gen := fh.UnlinkedShadowGen; gen != 0 && fs.shadowStore != nil {
 			fh.UnlinkedShadowGen = 0
-			// The mark-time pin is simply dropped: with the deferred commit
-			// point, the staged shadow was never removed or retired, so the
-			// handle keeps reading it by path like any normal handle.
+			// Unmark always unpins: attach already consumed a pin for this
+			// fd (shared snapshotShadowGen or PinIfExists). Unlike
+			// rollbackUnlinkedSnapshotAttachLocked, the mark loop will not
+			// discardUnlinkedSnapshotPins for a completed mark pass.
 			fs.shadowStore.Unpin(gen)
 		}
 		fh.Unlock()
@@ -9703,9 +9763,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	//
 	// Two ordering constraints force this position:
 	//
-	// 1. markOpenHandlesUnlinked takes fh.mu per handle, and every other code
-	//    path acquires fh.mu before remoteCommitLock (Write, Flush, the
-	//    debounced callback — see the B13 note in flushHandleDebounced).
+	// 1. markOpenHandlesUnlinked takes fh.mu for the whole captured handle
+	//    set (pointer order), and every other code path acquires fh.mu before
+	//    remoteCommitLock (Write, Flush, the debounced callback — see the
+	//    B13 note in flushHandleDebounced).
 	//    Running it while holding remoteCommitLock inverts that order: a
 	//    same-path flush holding fh.mu and waiting on remoteCommitLock would
 	//    deadlock with Unlink holding remoteCommitLock and waiting on fh.mu

@@ -3366,7 +3366,8 @@ func TestAttachAndMarkOpenHandlesDoesNotPartiallyUnlink(t *testing.T) {
 	fh2 := &FileHandle{Dirty: wb2, BaseRev: 2, Path: "/a.bin"}
 	fs := &Dat9FS{}
 	snapshot := bytes.Repeat([]byte{0x88}, 192)
-	_, fail := fs.attachAndMarkOpenHandles([]*FileHandle{fh1, fh2}, "/a.bin", snapshot, 0, 192, 1, true, true)
+	snapshotOK, failClosed := true, true
+	_, fail := fs.attachAndMarkOpenHandles([]*FileHandle{fh1, fh2}, "/a.bin", snapshot, 0, 192, 1, snapshotOK, failClosed)
 	if !fail {
 		t.Fatal("stale second handle must fail closed")
 	}
@@ -3375,6 +3376,81 @@ func TestAttachAndMarkOpenHandlesDoesNotPartiallyUnlink(t *testing.T) {
 	}
 	if len(fh1.UnlinkedData) != 0 || len(fh2.UnlinkedData) != 0 {
 		t.Fatal("failed mark pass must not leave a partial snapshot attached")
+	}
+}
+
+func TestAttachAndMarkOpenHandlesFailsClosedOnPathIdentityAdvance(t *testing.T) {
+	wb := NewWriteBuffer("/a.bin", 1<<20, 64)
+	wb.remoteSize = 192
+	wb.LoadPart = func(int) ([]byte, error) { return []byte("x"), nil }
+	fh := &FileHandle{Dirty: wb, BaseRev: 1, Path: "/a.bin"}
+	fs := &Dat9FS{
+		committedRev:  map[string]int64{"/a.bin": 2},
+		committedSize: map[string]int64{"/a.bin": 192},
+	}
+	snapshot := bytes.Repeat([]byte{0x88}, 192)
+	snapshotOK, failClosed := true, true
+	_, fail := fs.attachAndMarkOpenHandles([]*FileHandle{fh}, "/a.bin", snapshot, 0, 192, 1, snapshotOK, failClosed)
+	if !fail {
+		t.Fatal("path identity ahead of the fetched snapshot must fail closed")
+	}
+	if fh.Unlinked {
+		t.Fatal("must not set Unlinked when path identity advanced under the set lock")
+	}
+	if len(fh.UnlinkedData) != 0 {
+		t.Fatal("must not attach a snapshot after a path-identity fail-closed")
+	}
+}
+
+func TestAttachAndMarkRetriesInsteadOfDeadlockingSiblingModeClear(t *testing.T) {
+	const ino uint64 = 42
+	fhA := &FileHandle{Ino: ino, Path: "/a.bin", HasPendingMode: true, PendingMode: 0o644, PendingModeGen: 1}
+	fhB := &FileHandle{Ino: ino, Path: "/a.bin", HasPendingMode: true, PendingMode: 0o644, PendingModeGen: 1}
+	fs := &Dat9FS{fileHandles: NewHandleTable[*FileHandle]()}
+	fs.fileHandles.Allocate(fhA)
+	fs.fileHandles.Allocate(fhB)
+
+	ordered := fileHandlesLockOrder([]*FileHandle{fhA, fhB})
+	if len(ordered) != 2 {
+		t.Fatalf("lock order len = %d, want 2", len(ordered))
+	}
+	first, second := ordered[0], ordered[1]
+
+	second.Lock()
+	attachDone := make(chan struct{})
+	go func() {
+		defer close(attachDone)
+		snapshotOK, failClosed := false, false
+		_, _ = fs.attachAndMarkOpenHandles([]*FileHandle{fhA, fhB}, "/a.bin", nil, 0, 0, 0, snapshotOK, failClosed)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if first.TryLock() {
+			first.Unlock()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("attachAndMark still holding the first handle while waiting for the second")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	siblingDone := make(chan struct{})
+	go func() {
+		defer close(siblingDone)
+		fs.clearPendingModeForInodeGeneration(ino, second, 0o644, 1)
+	}()
+	select {
+	case <-siblingDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("clearPendingModeForInodeGeneration deadlocked with attachAndMark")
+	}
+	second.Unlock()
+	select {
+	case <-attachDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attachAndMark deadlocked after sibling unlock")
 	}
 }
 

@@ -79,11 +79,12 @@ type FileHandle struct {
 	UnlinkedSnapshotRev  int64 // committed revision captured with UnlinkedData / UnlinkedShadowGen
 	UnlinkedSnapshotSize int64 // committed size captured with that snapshot identity
 	// Staging generations recorded when this handle staged path-keyed state.
-	// discardUnlinkedHandleStateLocked uses them for ownership-scoped cleanup:
-	// after a pathname is unlinked and recreated, path-global removes would
-	// destroy the replacement file's staged state, so only store generations
-	// this handle actually created may be removed (gens are monotonic per
-	// store, so a stale value simply never matches).
+	// cancelUnlinkedRemotePublishLocked and discardUnlinkedHandleStateLocked
+	// use them for ownership-scoped cleanup: after a pathname is unlinked
+	// and recreated, path-global removes would destroy the replacement
+	// file's staged state, so only store generations this handle actually
+	// created may be removed (gens are monotonic per store, so a stale
+	// value simply never matches).
 	WriteBackGen    uint64 // writeBack generation staged by this handle (0 = none)
 	PendingIndexGen uint64 // pendingIndex generation staged by this handle (0 = none)
 	ShadowStageGen  uint64 // shadowStore content generation staged by this handle (0 = none)
@@ -120,10 +121,11 @@ func (fh *FileHandle) TryLock() bool { return fh.mu.TryLock() }
 // Unlock releases the file handle mutex.
 func (fh *FileHandle) Unlock() { fh.mu.Unlock() }
 
-// lockFileHandlesInOrder locks each unique handle in a stable pointer order
-// so a multi-handle unlink mark cannot deadlock with itself. The returned
-// slice is what unlockFileHandles must unlock (reverse order).
-func lockFileHandlesInOrder(handles []*FileHandle) []*FileHandle {
+// fileHandlesLockOrder returns unique handles in a stable pointer order.
+// Pointer identity is the total order: Go's GC does not move heap objects,
+// so addresses stay stable for the lifetime of any later held locks. Ino
+// and Path are shared across open fds of the same file and must not be used.
+func fileHandlesLockOrder(handles []*FileHandle) []*FileHandle {
 	seen := make(map[*FileHandle]struct{}, len(handles))
 	ordered := make([]*FileHandle, 0, len(handles))
 	for _, fh := range handles {
@@ -139,10 +141,25 @@ func lockFileHandlesInOrder(handles []*FileHandle) []*FileHandle {
 	sort.Slice(ordered, func(i, j int) bool {
 		return uintptr(unsafe.Pointer(ordered[i])) < uintptr(unsafe.Pointer(ordered[j]))
 	})
-	for _, fh := range ordered {
-		fh.Lock()
-	}
 	return ordered
+}
+
+// tryLockFileHandlesInOrder TryLocks each unique handle in pointer order.
+// If any TryLock fails it releases every lock already taken and returns
+// false, so the caller never blocks while holding a partial set. That
+// avoids deadlock with sibling-mode cleanup, which holds one fh.mu and
+// then Lock()s other same-inode handles (clearPendingModeForInodeGeneration).
+func tryLockFileHandlesInOrder(handles []*FileHandle) ([]*FileHandle, bool) {
+	ordered := fileHandlesLockOrder(handles)
+	for i, fh := range ordered {
+		if !fh.TryLock() {
+			for j := i - 1; j >= 0; j-- {
+				ordered[j].Unlock()
+			}
+			return nil, false
+		}
+	}
+	return ordered, true
 }
 
 func unlockFileHandles(ordered []*FileHandle) {
