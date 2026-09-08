@@ -1898,6 +1898,19 @@ func (fs *Dat9FS) mountWritePolicy() WritePolicy {
 	return fs.opts.WritePolicy
 }
 
+// mountWritePolicyDurableRename reports whether pending-new rename(2) must
+// commit remotely before returning. Open handles of oldP carry WritePolicy,
+// but rename is not an fd operation; the mount policy is the proxy for the
+// pending-new states that reach this path (writeback stays async by design).
+func (fs *Dat9FS) mountWritePolicyDurableRename() bool {
+	switch fs.mountWritePolicy() {
+	case WritePolicyCloseSync, WritePolicyWriteSync:
+		return true
+	default:
+		return false
+	}
+}
+
 func isGitLooseObjectFinalPath(p string) bool {
 	const marker = "/.git/objects/"
 
@@ -4012,7 +4025,7 @@ func (fs *Dat9FS) stagePathTruncateToZeroLocked(ctx context.Context, entry *Inod
 		safeLogPrintf("path truncate async enqueue failed for %s: %v, falling back to sync commit", entry.Path, err)
 		if commitErr := fs.commitQueue.commitNowPathLocked(ctx, commit); commitErr != nil {
 			if errors.Is(commitErr, errCommitPayloadStale) {
-				fs.commitQueue.onCommitTerminalFailure(commit)
+				fs.commitQueue.onCommitTerminalFailure(commit, commitErr)
 			} else {
 				cleanupCommitStaging()
 			}
@@ -10263,16 +10276,27 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 		}
 		fs.bindCommitEntryToPath(entry, newP, meta.BaseRev)
 		commitPendingRenameNow := func() error {
+			if entry.ShadowSpill {
+				// Spill uploads need a size-aware budget and must not inherit
+				// the 30s FUSE request deadline. Non-spill commits keep the
+				// request context so git/small-file renames stay interruptible
+				// when gVisor compatibility is off.
+				commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout(entry.Size))
+				defer commitCancel()
+				return fs.commitQueue.commitNowPathLocked(commitCtx, entry)
+			}
 			commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
 			defer commitCancel()
 			return fs.commitQueue.commitNowPathLocked(commitCtx, entry)
 		}
-		if isGitLooseObjectFinalPath(newP) {
-			// Git treats a successful tmp_obj_* -> <sha> rename as making the
-			// object database complete. Do not acknowledge that rename while the
-			// content-addressed object is only queued for best-effort upload.
+		// Git treats a successful tmp_obj_* -> <sha> rename as making the
+		// object database complete. Close-sync/write-sync mounts have the same
+		// durability contract for ordinary pending-new mv: rename(2) must not
+		// return success while the final path is only queued for upload.
+		syncRename := isGitLooseObjectFinalPath(newP) || fs.mountWritePolicyDurableRename()
+		if syncRename {
 			if commitErr := commitPendingRenameNow(); commitErr != nil {
-				return pendingRenameHandled, fmt.Errorf("sync commit git loose object rename %s: %w", newP, commitErr)
+				return pendingRenameHandled, fmt.Errorf("sync commit pending-new rename %s: %w", newP, commitErr)
 			}
 		} else if err := fs.commitQueue.Enqueue(entry); err != nil {
 			safeLogPrintf("rename: enqueue pending-new commit for %s failed, falling back to sync commit: %v", newP, err)

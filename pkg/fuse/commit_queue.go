@@ -1489,7 +1489,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		}
 		if errors.Is(err, errCommitPayloadStale) {
 			safeLogPrintf("commit queue: stale payload rejected for %s: %v", entry.Path, err)
-			cq.onCommitTerminalFailure(entry)
+			cq.onCommitTerminalFailure(entry, err)
 			unlockPath()
 			return
 		}
@@ -1503,19 +1503,19 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			cq.mu.Unlock()
 			if abandoned {
 				safeLogPrintf("commit queue: layer abandoned, terminal failure for %s", entry.Path)
-				cq.onCommitTerminalFailure(entry)
+				cq.onCommitTerminalFailure(entry, fmt.Errorf("%w: %v", errLayerRolledBack, err))
 				unlockPath()
 				return
 			}
 			if entry.DisableAutoResolveLWW {
 				safeLogPrintf("commit queue: fenced conflict for %s at base revision %d, keeping terminal", entry.Path, entry.BaseRev)
-				cq.onCommitTerminalFailure(entry)
+				cq.onCommitTerminalFailure(entry, err)
 				unlockPath()
 				return
 			}
 			if err := cq.validateEntryPayloadFresh(entry); err != nil {
 				safeLogPrintf("commit queue: conflict auto-resolve rejected stale payload for %s: %v", entry.Path, err)
-				cq.onCommitTerminalFailure(entry)
+				cq.onCommitTerminalFailure(entry, err)
 				unlockPath()
 				return
 			}
@@ -1534,7 +1534,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cq.onCommitPostUploadFailure(entry, lastErr)
 		return
 	}
-	cq.onCommitTerminalFailure(entry)
+	cq.onCommitTerminalFailure(entry, lastErr)
 }
 
 type commitBatchConfig struct {
@@ -1697,9 +1697,9 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 				if entry == nil {
 					continue
 				}
-				if errors.Is(cq.validateEntryPayloadFresh(entry), errCommitPayloadStale) {
-					safeLogPrintf("commit queue: stale batched payload rejected for %s: %v", entry.Path, err)
-					cq.onCommitTerminalFailure(entry)
+				if verr := cq.validateEntryPayloadFresh(entry); errors.Is(verr, errCommitPayloadStale) {
+					safeLogPrintf("commit queue: stale batched payload rejected for %s: %v", entry.Path, verr)
+					cq.onCommitTerminalFailure(entry, verr)
 					cq.endInFlight(entry)
 					continue
 				}
@@ -1774,14 +1774,14 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 			unlockPath := cq.lockPath(entry.Path)
 			if entry.DisableAutoResolveLWW {
 				safeLogPrintf("commit queue: fenced batch conflict for %s at base revision %d, keeping terminal", entry.Path, entry.BaseRev)
-				cq.onCommitTerminalFailure(entry)
+				cq.onCommitTerminalFailure(entry, resultErr)
 				unlockPath()
 				cq.endInFlight(entry)
 				continue
 			}
 			if err := cq.validateEntryPayloadFresh(entry); err != nil {
 				safeLogPrintf("commit queue: batch conflict auto-resolve rejected stale payload for %s: %v", entry.Path, err)
-				cq.onCommitTerminalFailure(entry)
+				cq.onCommitTerminalFailure(entry, err)
 				unlockPath()
 				cq.endInFlight(entry)
 				continue
@@ -2418,7 +2418,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	// check nor LWW can be trusted. Keep layer conflicts terminal.
 	if cq.layerRefSnapshot() != "" {
 		safeLogPrintf("commit queue: auto-resolve unsupported for layer mount, terminal failure for %s", entry.Path)
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, nil)
 		return
 	}
 
@@ -2432,7 +2432,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	}
 
 	if cq.shadows == nil {
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, nil)
 		return
 	}
 
@@ -2448,11 +2448,11 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 		}
 		if errors.Is(err, errCommitPayloadStale) {
 			safeLogPrintf("commit queue: auto-resolve rejected stale payload for %s: %v", entry.Path, err)
-			cq.onCommitTerminalFailure(entry)
+			cq.onCommitTerminalFailure(entry, err)
 			return
 		}
 		safeLogPrintf("commit queue: auto-resolve failed for %s: read shadow: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, err)
 		return
 	}
 	apiPath := cq.remotePath(entry.Path)
@@ -2504,7 +2504,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 			}
 			if uploadErr != nil {
 				safeLogPrintf("commit queue: create retry failed for %s: %v", entry.Path, uploadErr)
-				cq.onCommitTerminalFailure(entry)
+				cq.onCommitTerminalFailure(entry, uploadErr)
 				return
 			}
 			safeLogPrintf("commit queue: auto-resolved conflict for %s via create retry (no remote file)", entry.Path)
@@ -2514,7 +2514,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 			return
 		}
 		safeLogPrintf("commit queue: auto-resolve failed for %s: stat: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, err)
 		return
 	}
 	serverRev := stat.Revision
@@ -2528,7 +2528,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	}
 	if err != nil {
 		safeLogPrintf("commit queue: auto-resolve failed for %s: read server: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, err)
 		return
 	}
 
@@ -2544,17 +2544,17 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	// Branch 2: LWW — re-upload local shadow with new base revision.
 	if entry.DisableAutoResolveLWW {
 		safeLogPrintf("commit queue: fenced conflict for %s will not LWW-rebase payload from base rev %d onto server rev %d", entry.Path, entry.payloadBaseRevision(), serverRev)
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, nil)
 		return
 	}
 	if entry.PayloadBaseRevSet && entry.payloadBaseRevision() < serverRev {
 		safeLogPrintf("commit queue: refusing LWW rebase for %s: payload base rev %d is older than server rev %d", entry.Path, entry.payloadBaseRevision(), serverRev)
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, nil)
 		return
 	}
 	if err := cq.validateEntryPayloadFresh(entry); err != nil {
 		safeLogPrintf("commit queue: auto-resolve rejected stale payload for %s before LWW: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, err)
 		return
 	}
 	if cq.discardSupersededEntry(entry) {
@@ -2581,7 +2581,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	}
 	if err != nil {
 		safeLogPrintf("commit queue: auto-resolve LWW re-upload failed for %s: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, err)
 		return
 	}
 	if cq.isEntryCanceled(entry) {
@@ -2607,12 +2607,12 @@ const shadowSpillCompareChunk = 8 << 20
 // LWW re-upload is intentionally not attempted for large files.
 func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context, entry *CommitEntry) {
 	if cq.shadows == nil || cq.client == nil {
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, nil)
 		return
 	}
 	if err := cq.validateEntryPayloadFresh(entry); err != nil {
 		safeLogPrintf("commit queue: ShadowSpill stale payload rejected for %s: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, err)
 		return
 	}
 	apiPath := cq.remotePath(entry.Path)
@@ -2660,7 +2660,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 			}
 			if uploadErr != nil {
 				safeLogPrintf("commit queue: ShadowSpill create retry failed for %s: %v", entry.Path, uploadErr)
-				cq.onCommitTerminalFailure(entry)
+				cq.onCommitTerminalFailure(entry, uploadErr)
 				return
 			}
 			safeLogPrintf("commit queue: auto-resolved ShadowSpill conflict for %s via create retry (no remote file)", entry.Path)
@@ -2670,7 +2670,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 			return
 		}
 		safeLogPrintf("commit queue: ShadowSpill auto-resolve failed for %s: stat: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, err)
 		return
 	}
 
@@ -2687,7 +2687,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		} else {
 			safeLogPrintf("commit queue: ShadowSpill auto-resolve failed for %s: open shadow: %v", entry.Path, err)
 		}
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, err)
 		return
 	}
 	defer func() {
@@ -2700,7 +2700,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 	}()
 	if stat.Size != localSize {
 		safeLogPrintf("commit queue: ShadowSpill conflict for %s is genuine (local %d bytes vs server %d bytes), terminal failure", entry.Path, localSize, stat.Size)
-		cq.onCommitTerminalFailure(entry)
+		cq.onCommitTerminalFailure(entry, nil)
 		return
 	}
 
@@ -2726,7 +2726,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		}
 		if err != nil {
 			safeLogPrintf("commit queue: ShadowSpill auto-resolve failed for %s: read server @%d: %v", entry.Path, off, err)
-			cq.onCommitTerminalFailure(entry)
+			cq.onCommitTerminalFailure(entry, err)
 			return
 		}
 		ln, err := fd.ReadAt(buf[:n], off)
@@ -2737,12 +2737,12 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 				return
 			}
 			safeLogPrintf("commit queue: ShadowSpill auto-resolve failed for %s: read shadow @%d: n=%d err=%v", entry.Path, off, ln, err)
-			cq.onCommitTerminalFailure(entry)
+			cq.onCommitTerminalFailure(entry, err)
 			return
 		}
 		if int64(len(serverChunk)) != n || !bytes.Equal(serverChunk, buf[:n]) {
 			safeLogPrintf("commit queue: ShadowSpill conflict for %s is genuine (content differs @%d), terminal failure", entry.Path, off)
-			cq.onCommitTerminalFailure(entry)
+			cq.onCommitTerminalFailure(entry, nil)
 			return
 		}
 	}
@@ -2767,10 +2767,7 @@ func (cq *CommitQueue) onCommitPostUploadFailure(entry *CommitEntry, err error) 
 	safeLogPrintf("commit queue: post-upload failure for %s; local pending state preserved for retry: %v", entry.Path, err)
 }
 
-func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
-	if cq.perf != nil {
-		cq.perf.commitFailure.add(1)
-	}
+func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error) {
 	// Mark the entry as conflicted in the pending index so that crash
 	// recovery (RecoverPending) skips it instead of retrying forever.
 	// Preserve both the shadow file and the pending metadata so the user
@@ -2783,8 +2780,9 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
 		if entry.PendingIndexGen != 0 {
 			marked, err := cq.index.MarkConflictIfGeneration(entry.Path, entry.PendingIndexGen)
 			if err != nil {
-				safeLogPrintf("commit queue: failed to mark conflict for %s: %v (entry remains queued)", entry.Path, err)
+				safeLogPrintf("commit queue: failed to mark conflict for %s: %v (pending data preserved; in-memory queue entry removed)", entry.Path, err)
 				cq.removeFromQueue(entry)
+				cq.recordCommitTerminalFailure(entry, lastErr)
 				return
 			}
 			if !marked {
@@ -2793,11 +2791,11 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
 				return
 			}
 		} else if err := cq.index.MarkConflict(entry.Path); err != nil {
-			// Conflict marker not durable — leave the entry queued so
-			// RecoverPending can retry on next startup rather than
-			// silently dropping it.
-			safeLogPrintf("commit queue: failed to mark conflict for %s: %v (entry remains queued)", entry.Path, err)
+			// Conflict marker not durable. The in-memory queue entry is still
+			// removed; RecoverPending can retry from preserved pending/shadow.
+			safeLogPrintf("commit queue: failed to mark conflict for %s: %v (pending data preserved; in-memory queue entry removed)", entry.Path, err)
 			cq.removeFromQueue(entry)
+			cq.recordCommitTerminalFailure(entry, lastErr)
 			return
 		}
 	}
@@ -2813,6 +2811,32 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
 	// Remove from queue AFTER all cleanup so WaitPath sees the entry
 	// until bookkeeping is complete.
 	cq.removeFromQueue(entry)
+	cq.recordCommitTerminalFailure(entry, lastErr)
+}
 
-	safeLogPrintf("commit queue: terminal failure for %s — local data preserved for manual recovery", entry.Path)
+func (cq *CommitQueue) recordCommitTerminalFailure(entry *CommitEntry, lastErr error) {
+	if cq.perf != nil {
+		cq.perf.commitFailure.add(1)
+		cq.perf.commitTerminalFailure.add(1)
+	}
+	// Alertable FUSE-local error. Collectors should match
+	// "drive9: error event=commit_terminal_failure" on stderr / mount-log
+	// files (typically ~/.cache/drive9/mount-logs/). The drive9 server never
+	// sees this line; collect it outside the sandbox. lastErr may be nil.
+	// reason= distinguishes retryable upload loss from concurrency conflict
+	// and layer-abandonment so alert severity can differ.
+	safeLogPrintf("drive9: error event=commit_terminal_failure path=%s reason=%s err=%v detail=local_data_preserved", entry.Path, classifyCommitTerminalReason(lastErr), lastErr)
+}
+
+func classifyCommitTerminalReason(lastErr error) string {
+	switch {
+	case lastErr == nil:
+		return "conflict"
+	case errors.Is(lastErr, errLayerRolledBack):
+		return "abandoned"
+	case errors.Is(lastErr, client.ErrConflict), errors.Is(lastErr, errCommitPayloadStale):
+		return "conflict"
+	default:
+		return "upload_failure"
+	}
 }
