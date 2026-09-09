@@ -64,6 +64,7 @@ type gitWorkspaceFixture struct {
 	failTree              bool
 	failOverlay           bool
 	failOverlayPut        bool
+	failWhiteoutAfterWait bool
 }
 
 type gitStateOnlyFixture struct {
@@ -451,6 +452,19 @@ func (f *gitWorkspaceFixture) handleOverlay(w http.ResponseWriter, r *http.Reque
 				f.overlayPostEnteredOnce.Do(func() { close(entered) })
 			}
 			<-wait
+		}
+		if req.Op == "whiteout" {
+			f.mu.Lock()
+			failWhiteout := f.failWhiteoutAfterWait
+			if failWhiteout {
+				f.failWhiteoutAfterWait = false
+			}
+			f.mu.Unlock()
+			if failWhiteout {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "whiteout unavailable"})
+				return
+			}
 		}
 		entry := client.GitOverlayEntry{
 			WorkspaceID:    "ws1",
@@ -4883,6 +4897,169 @@ func TestGitWorkspaceFlushQueuedDuringWhiteoutDoesNotUpsert(t *testing.T) {
 	}
 	if !ok || entry.Op != "upsert" {
 		t.Fatalf("overlay after recreate = %+v, %v — want upsert", entry, ok)
+	}
+}
+
+func TestGitWorkspaceQueuedFsyncAfterFailedWhiteoutStillPublishes(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyCloseSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	v1 := []byte("git-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1 status = %v, want OK", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync v1 status = %v, want OK", st)
+	}
+
+	postWait := make(chan struct{})
+	postEntered := make(chan struct{})
+	fixture.mu.Lock()
+	fixture.overlayPostWait = postWait
+	fixture.overlayPostEntered = postEntered
+	fixture.failWhiteoutAfterWait = true
+	fixture.mu.Unlock()
+
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt")
+	}()
+	select {
+	case <-postEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("whiteout POST never parked")
+	}
+
+	rt, rel, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/sync.txt")
+	if !ok {
+		t.Fatal("git workspace path missing")
+	}
+	mirror, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel)
+	if !ok {
+		t.Fatal("dirty mirror path missing")
+	}
+	_ = os.Remove(mirror)
+	if err := os.MkdirAll(mirror, 0o755); err != nil {
+		t.Fatalf("mkdir dirty-mirror leaf: %v", err)
+	}
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup during in-flight whiteout = %v, want OK", st)
+	}
+	var open2 gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_TRUNC),
+	}, &open2); st != gofuse.OK {
+		t.Fatalf("Open memory-fallback handle = %v, want OK", st)
+	}
+	v2 := []byte("git-v2")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       open2.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write v2 status = %v, want OK", st)
+	}
+
+	upsertQueued := make(chan struct{})
+	var upsertOnce sync.Once
+	testHookAfterGitOverlaySlotReserved = func(op string) {
+		if op == "upsert" {
+			upsertOnce.Do(func() { close(upsertQueued) })
+		}
+	}
+	fsyncWaited := make(chan struct{})
+	releaseFsync := make(chan struct{})
+	var waitOnce sync.Once
+	testHookAfterGitOverlaySlotWait = func(op string) {
+		if op != "upsert" {
+			return
+		}
+		waitOnce.Do(func() { close(fsyncWaited) })
+		<-releaseFsync
+	}
+	t.Cleanup(func() {
+		testHookAfterGitOverlaySlotReserved = nil
+		testHookAfterGitOverlaySlotWait = nil
+		select {
+		case <-releaseFsync:
+		default:
+			close(releaseFsync)
+		}
+	})
+
+	fsyncDone := make(chan gofuse.Status, 1)
+	go func() {
+		fsyncDone <- fs.Fsync(nil, &gofuse.FsyncIn{
+			InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+			Fh:       open2.Fh,
+		})
+	}()
+	select {
+	case <-upsertQueued:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Fsync never reserved an overlay upsert slot behind the whiteout")
+	}
+
+	close(postWait)
+	unlinkSt := <-unlinkDone
+	if unlinkSt == gofuse.OK {
+		t.Fatal("Unlink status = OK, want error after rejected whiteout")
+	}
+	escaped, ok := fs.fileHandles.Get(open2.Fh)
+	if !ok {
+		t.Fatal("escaped handle missing")
+	}
+	escaped.Lock()
+	unlinked := escaped.Unlinked
+	escaped.Unlock()
+	if unlinked {
+		t.Fatal("handle must stay linked after failed unlink")
+	}
+
+	select {
+	case <-fsyncWaited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Fsync never resumed after the failed whiteout slot")
+	}
+	close(releaseFsync)
+	fsyncSt := <-fsyncDone
+	if fsyncSt != gofuse.OK {
+		t.Fatalf("Fsync status = %v, want OK after failed unlink", fsyncSt)
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	puts := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if puts != 2 {
+		t.Fatalf("overlay puts = %d, want 2 (seed + v2 fsync)", puts)
+	}
+	if !ok || entry.Op != "upsert" || string(entry.Content) != string(v2) {
+		t.Fatalf("overlay entry = %+v, %v — want upsert %q", entry, ok, v2)
 	}
 }
 

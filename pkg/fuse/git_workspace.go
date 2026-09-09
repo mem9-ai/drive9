@@ -4411,6 +4411,10 @@ func (fs *Dat9FS) blockGitOverlayUnlinkPublish(workspaceID, rel string) {
 	if fs.gitOverlayUnlinkBlocked == nil {
 		fs.gitOverlayUnlinkBlocked = make(map[string]int)
 	}
+	if fs.gitOverlayUnlinkAttempt == nil {
+		fs.gitOverlayUnlinkAttempt = make(map[string]uint64)
+	}
+	fs.gitOverlayUnlinkAttempt[key]++
 	fs.gitOverlayUnlinkBlocked[key]++
 	fs.gitOverlayMu.Unlock()
 }
@@ -4440,11 +4444,44 @@ func (fs *Dat9FS) gitOverlayUnlinkBlocksPublish(workspaceID, rel string) bool {
 	return n > 0
 }
 
-func (fs *Dat9FS) gitOverlayShouldDropQueuedPublish(op, workspaceID, rel string, reservedDuringUnlink bool) bool {
-	if op == "whiteout" {
+func (fs *Dat9FS) gitOverlayUnlinkAttemptIfBlocked(workspaceID, rel string) uint64 {
+	if fs == nil || workspaceID == "" || rel == "" {
+		return 0
+	}
+	key := gitOverlayUnlinkBlockKey(workspaceID, rel)
+	fs.gitOverlayMu.Lock()
+	var stamp uint64
+	if fs.gitOverlayUnlinkBlocked[key] > 0 {
+		stamp = fs.gitOverlayUnlinkAttempt[key]
+	}
+	fs.gitOverlayMu.Unlock()
+	return stamp
+}
+
+func (fs *Dat9FS) noteGitOverlayUnlinkCommitted(workspaceID, rel string) {
+	if fs == nil || workspaceID == "" || rel == "" {
+		return
+	}
+	key := gitOverlayUnlinkBlockKey(workspaceID, rel)
+	fs.gitOverlayMu.Lock()
+	if fs.gitOverlayUnlinkCommitted == nil {
+		fs.gitOverlayUnlinkCommitted = make(map[string]uint64)
+	}
+	if attempt := fs.gitOverlayUnlinkAttempt[key]; attempt > fs.gitOverlayUnlinkCommitted[key] {
+		fs.gitOverlayUnlinkCommitted[key] = attempt
+	}
+	fs.gitOverlayMu.Unlock()
+}
+
+func (fs *Dat9FS) gitOverlayShouldDropQueuedPublish(op, workspaceID, rel string, reservedAttempt uint64) bool {
+	if op == "whiteout" || reservedAttempt == 0 {
 		return false
 	}
-	return reservedDuringUnlink || fs.gitOverlayUnlinkBlocksPublish(workspaceID, rel)
+	key := gitOverlayUnlinkBlockKey(workspaceID, rel)
+	fs.gitOverlayMu.Lock()
+	committed := fs.gitOverlayUnlinkCommitted[key]
+	fs.gitOverlayMu.Unlock()
+	return committed >= reservedAttempt
 }
 
 func (fs *Dat9FS) putGitOverlayRemote(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest) (*client.GitOverlayEntry, error) {
@@ -4478,7 +4515,10 @@ func (fs *Dat9FS) putGitOverlay(ctx context.Context, workspaceID string, req cli
 func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest, policy WritePolicy, forceSync bool) (*client.GitOverlayEntry, error) {
 	req = normalizeGitOverlayRequest(req)
 	localEntry := gitOverlayEntryFromRequest(workspaceID, req)
-	reservedDuringUnlink := req.Op != "whiteout" && fs.gitOverlayUnlinkBlocksPublish(workspaceID, req.Path)
+	reservedAttempt := fs.gitOverlayUnlinkAttemptIfBlocked(workspaceID, req.Path)
+	if req.Op == "whiteout" {
+		reservedAttempt = 0
+	}
 	if fs.gitOverlayWriteBackEnabled(policy, forceSync) {
 		pendingSeq := fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
 		fs.applyGitOverlayEntry(workspaceID, *localEntry)
@@ -4499,7 +4539,7 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 				testHookAfterGitOverlaySlotWait(req.Op)
 			}
 			defer close(done)
-			if fs.gitOverlayShouldDropQueuedPublish(req.Op, workspaceID, req.Path, reservedDuringUnlink) {
+			if fs.gitOverlayShouldDropQueuedPublish(req.Op, workspaceID, req.Path, reservedAttempt) {
 				return
 			}
 			timeout := releaseTimeout(req.SizeBytes)
@@ -4508,6 +4548,9 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 			if _, err := fs.putGitOverlayRemote(commitCtx, workspaceID, req); err != nil {
 				safeLogPrintf("git workspace overlay async commit failed workspace=%s path=%s op=%s: %v", workspaceID, req.Path, req.Op, err)
 			} else {
+				if req.Op == "whiteout" {
+					fs.noteGitOverlayUnlinkCommitted(workspaceID, req.Path)
+				}
 				fs.forgetPendingGitOverlayEntry(workspaceID, req.Path, pendingSeq)
 			}
 		}()
@@ -4527,12 +4570,15 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 		testHookAfterGitOverlaySlotWait(req.Op)
 	}
 	defer close(done)
-	if fs.gitOverlayShouldDropQueuedPublish(req.Op, workspaceID, req.Path, reservedDuringUnlink) {
+	if fs.gitOverlayShouldDropQueuedPublish(req.Op, workspaceID, req.Path, reservedAttempt) {
 		return nil, errGitOverlayPublishSuppressed
 	}
 	entry, err := fs.putGitOverlayRemote(ctx, workspaceID, req)
 	if err != nil {
 		return nil, err
+	}
+	if req.Op == "whiteout" {
+		fs.noteGitOverlayUnlinkCommitted(workspaceID, req.Path)
 	}
 	fs.forgetPendingGitOverlayEntry(workspaceID, entry.Path, 0)
 	fs.applyGitOverlayEntry(workspaceID, *entry)

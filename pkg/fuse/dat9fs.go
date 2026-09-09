@@ -186,14 +186,17 @@ type Dat9FS struct {
 	gitOverlaySeq     atomic.Uint64
 	gitOverlayPending map[string]map[string]pendingGitOverlayEntry
 	// gitOverlayUnlinkBlocked counts in-flight git Unlink operations per
-	// overlay path. Upserts that reserved a queue slot during Unlink must
-	// not publish after waiting for the whiteout slot.
-	gitOverlayUnlinkBlocked map[string]int
-	layerMu                 sync.RWMutex
-	layerWhiteouts          map[string]struct{}
-	layerFiles              map[string]uint32
-	layerDirs               map[string]uint32
-	layerSymlinks           map[string]layerSymlinkState
+	// overlay path. Attempt/committed gens stamp queued upserts so they
+	// stay suppressed after a successful whiteout even once Unlink returns,
+	// without swallowing Fsync after a failed delete.
+	gitOverlayUnlinkBlocked   map[string]int
+	gitOverlayUnlinkAttempt   map[string]uint64
+	gitOverlayUnlinkCommitted map[string]uint64
+	layerMu                   sync.RWMutex
+	layerWhiteouts            map[string]struct{}
+	layerFiles                map[string]uint32
+	layerDirs                 map[string]uint32
+	layerSymlinks             map[string]layerSymlinkState
 	// layerAbandoned is set when the layer-event watcher observes a
 	// rollback event, signalling that the mounted layer is now abandoned.
 	// Subsequent write ops short-circuit with errLayerRolledBack (→ ESTALE)
