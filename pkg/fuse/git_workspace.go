@@ -4566,6 +4566,19 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 		return fs.gitOverlayShouldSuppressPublish(req.Op, workspaceID, req.Path, reservedAttempt, fh)
 	}
 	if fs.gitOverlayWriteBackEnabled(policy, forceSync) {
+		// Keep local overlay visibility for the common write-back path.
+		// Defer upsert apply only while an unlink is in flight on this path,
+		// so a later drop cannot resurrect a whiteout. Whiteout itself must
+		// apply before Unlink returns.
+		deferLocal := req.Op != "whiteout" && fs.gitOverlayUnlinkAttemptIfBlocked(workspaceID, req.Path) > 0
+		var pendingSeq uint64
+		if !deferLocal {
+			pendingSeq = fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
+			fs.applyGitOverlayEntry(workspaceID, *localEntry)
+			if req.Op == "whiteout" {
+				fs.noteGitOverlayUnlinkCommitted(workspaceID, req.Path)
+			}
+		}
 		prev, done := fs.reserveGitOverlayCommitSlot()
 		if testHookAfterGitOverlaySlotReserved != nil {
 			testHookAfterGitOverlaySlotReserved(req.Op)
@@ -4584,10 +4597,23 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 			}
 			defer close(done)
 			if dropQueued() {
+				if !deferLocal {
+					fs.forgetPendingGitOverlayEntry(workspaceID, req.Path, pendingSeq)
+					if req.Op != "whiteout" {
+						fs.applyGitOverlayEntry(workspaceID, client.GitOverlayEntry{
+							WorkspaceID: workspaceID,
+							Path:        req.Path,
+							Op:          "whiteout",
+							Kind:        "file",
+						})
+					}
+				}
 				return
 			}
-			pendingSeq := fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
-			fs.applyGitOverlayEntry(workspaceID, *localEntry)
+			if deferLocal {
+				pendingSeq = fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
+				fs.applyGitOverlayEntry(workspaceID, *localEntry)
+			}
 			timeout := releaseTimeout(req.SizeBytes)
 			commitCtx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
