@@ -1885,11 +1885,11 @@ func (s *Store) jfsDeleteSustainedTx(tx *sql.Tx, sid, ino uint64) error {
 }
 
 func jfsIsUnlock(ltype uint32) bool {
-	return ltype == uint32(syscall.F_UNLCK) || ltype == 'U' || ltype == 2
+	return ltype == jfsLockUnlock || ltype == 'U' || ltype == 2
 }
 
 func jfsIsWriteLock(ltype uint32) bool {
-	return ltype == uint32(syscall.F_WRLCK) || ltype == 'W' || ltype == 3
+	return ltype == jfsLockWrite || ltype == 'W' || ltype == 3
 }
 
 func (s *Store) jfsLockInodeTx(tx *sql.Tx, ino uint64) (int, error) {
@@ -2116,7 +2116,7 @@ func (s *Store) jfsGetlkTx(tx *sql.Tx, ino, sid, owner uint64, ltype uint32, sta
 			}
 		}
 	}
-	return uint32(syscall.F_UNLCK), start, end, 0, 0, nil
+	return jfsLockUnlock, start, end, 0, 0, nil
 }
 
 func (s *Store) jfsFindStaleSessionsTx(tx *sql.Tx, limit int) ([]uint64, error) {

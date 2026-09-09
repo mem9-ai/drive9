@@ -45,11 +45,11 @@ func wrapLockMeta(inner jfsmeta.Meta) jfsmeta.Meta {
 }
 
 func memIsUnlock(t uint32) bool {
-	return t == uint32(syscall.F_UNLCK) || t == 'U' || t == 2
+	return t == memLockUnlock || t == 'U' || t == 2
 }
 
 func memIsWrite(t uint32) bool {
-	return t == uint32(syscall.F_WRLCK) || t == 'W' || t == 3
+	return t == memLockWrite || t == 'W' || t == 3
 }
 
 func memOverlap(a0, a1, b0, b1 uint64) bool {
@@ -159,7 +159,7 @@ func (m *memLockMeta) Getlk(ctx jfsmeta.Context, inode jfsmeta.Ino, owner uint64
 		*pid = rec.pid
 		return 0
 	}
-	*ltype = uint32(syscall.F_UNLCK)
+	*ltype = memLockUnlock
 	return 0
 }
 
