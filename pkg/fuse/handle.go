@@ -63,31 +63,44 @@ type FileHandle struct {
 	// adoption uses it to drop only THIS handle's stale pending entry — a
 	// legitimate same-path recreate re-remembers the path with a newer seq
 	// and must survive the cleanup.
-	GitPendingMirrorSeq uint64
-	PendingMode         uint32 // mode change deferred because a dirty handle was open
-	HasPendingMode      bool   // true when PendingMode should be applied on Release
-	PendingModeGen      uint64 // generation for PendingMode, used to avoid clearing newer chmods
-	PreviousMode        uint32 // mode before PendingMode was set (for rollback on flush failure)
-	HasPreviousMode     bool   // true when previous mode state was snapshotted
-	PreviousModeKnown   bool   // true when PreviousMode was authoritative
-	Unlinked            bool   // true after the directory entry was removed while this handle stayed open
-	UnlinkedSnapshot    bool   // true when UnlinkedData is an authoritative read snapshot
-	UnlinkedData        []byte // read-only snapshot for open-but-unlinked remote files
-	UnlinkedShadowGen   uint64 // generation pin for large open-unlink snapshots stored in ShadowStore
-	UnlinkedSize        int64
+	GitPendingMirrorSeq  uint64
+	PendingMode          uint32 // mode change deferred because a dirty handle was open
+	HasPendingMode       bool   // true when PendingMode should be applied on Release
+	PendingModeGen       uint64 // generation for PendingMode, used to avoid clearing newer chmods
+	PreviousMode         uint32 // mode before PendingMode was set (for rollback on flush failure)
+	HasPreviousMode      bool   // true when previous mode state was snapshotted
+	PreviousModeKnown    bool   // true when PreviousMode was authoritative
+	Unlinked             bool   // true after the directory entry was removed while this handle stayed open
+	UnlinkedSnapshot     bool   // true when UnlinkedData is an authoritative read snapshot
+	UnlinkedData         []byte // read-only snapshot for open-but-unlinked remote files
+	UnlinkedShadowGen    uint64 // generation pin for large open-unlink snapshots stored in ShadowStore
+	UnlinkedSize         int64
+	UnlinkedSnapshotRev  int64 // committed revision captured with UnlinkedData / UnlinkedShadowGen
+	UnlinkedSnapshotSize int64 // committed size captured with that snapshot identity
 	// Staging generations recorded when this handle staged path-keyed state.
 	// discardUnlinkedHandleStateLocked uses them for ownership-scoped cleanup:
 	// after a pathname is unlinked and recreated, path-global removes would
 	// destroy the replacement file's staged state, so only store generations
 	// this handle actually created may be removed (gens are monotonic per
 	// store, so a stale value simply never matches).
-	WriteBackGen       uint64 // writeBack generation staged by this handle (0 = none)
-	PendingIndexGen    uint64 // pendingIndex generation staged by this handle (0 = none)
-	ShadowStageGen     uint64 // shadowStore content generation staged by this handle (0 = none)
-	ShadowStageSeq     uint64 // DirtySeq represented by ShadowStageGen
-	RemoteCommitUnlock func() // held same-path commit lock while local shadow state is reserved
-	extentIno          jfsmeta.Ino
-	extentFh           uint64 // JuiceFS vfs.VFS handle; 0 until Open/Create
+	WriteBackGen    uint64 // writeBack generation staged by this handle (0 = none)
+	PendingIndexGen uint64 // pendingIndex generation staged by this handle (0 = none)
+	ShadowStageGen  uint64 // shadowStore content generation staged by this handle (0 = none)
+	ShadowStageSeq  uint64 // DirtySeq represented by ShadowStageGen
+	// ContentSnapshotID is the latest full staged image from which this
+	// handle's current bytes descend. A new staging generation records it as
+	// ParentSnapshotID, then advances ContentSnapshotID to its own random ID.
+	// StagedSnapshotSeq makes repeated Flush/Fsync of one DirtySeq reuse the
+	// same identity rather than fabricating sibling snapshots for equal bytes.
+	ContentSnapshotID      string
+	StagedSnapshotID       string
+	StagedParentSnapshotID string
+	StagedSnapshotSeq      uint64
+	LineageTrusted         bool
+	StagedLineageTrusted   bool
+	RemoteCommitUnlock     func() // held same-path commit lock while local shadow state is reserved
+	extentIno              jfsmeta.Ino
+	extentFh               uint64 // JuiceFS vfs.VFS handle; 0 until Open/Create
 	// A zero truncate can reach a sibling while it holds mu waiting for the
 	// path lock. Publish the event without taking that sibling's mu.
 	pendingSQLiteTruncate atomic.Pointer[sqliteHandleTruncate]

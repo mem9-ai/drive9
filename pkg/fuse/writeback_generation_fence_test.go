@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -123,10 +124,16 @@ type casFileServer struct {
 	t    *testing.T
 	path string
 
-	mu       sync.Mutex
-	revision int64
-	body     []byte
-	puts     []casFilePut
+	mu        sync.Mutex
+	revision  int64
+	body      []byte
+	puts      []casFilePut
+	headCalls int
+	getCalls  int
+
+	firstPutStarted chan struct{}
+	releaseFirstPut chan struct{}
+	firstPutGate    sync.Once
 }
 
 type casFilePut struct {
@@ -160,6 +167,12 @@ func (s *casFileServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		s.firstPutGate.Do(func() {
+			if s.firstPutStarted != nil && s.releaseFirstPut != nil {
+				close(s.firstPutStarted)
+				<-s.releaseFirstPut
+			}
+		})
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		wantExpected := fmt.Sprintf("%d", s.revision)
@@ -178,6 +191,7 @@ func (s *casFileServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": s.revision})
 	case http.MethodHead:
 		s.mu.Lock()
+		s.headCalls++
 		revision := s.revision
 		size := len(s.body)
 		s.mu.Unlock()
@@ -187,6 +201,7 @@ func (s *casFileServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	case http.MethodGet:
 		s.mu.Lock()
+		s.getCalls++
 		body := append([]byte(nil), s.body...)
 		s.mu.Unlock()
 		_, _ = w.Write(body)
@@ -201,6 +216,19 @@ func (s *casFileServer) snapshot() (int64, []byte, []casFilePut) {
 	puts := make([]casFilePut, len(s.puts))
 	copy(puts, s.puts)
 	return s.revision, append([]byte(nil), s.body...), puts
+}
+
+func (s *casFileServer) proofRequestCounts() (heads, gets int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.headCalls, s.getCalls
+}
+
+func (s *casFileServer) recreate(body []byte) {
+	s.mu.Lock()
+	s.revision = 1
+	s.body = append([]byte(nil), body...)
+	s.mu.Unlock()
 }
 
 func TestDirtySiblingKeepsOriginalBaseRevAfterCommittedRevisionAdvances(t *testing.T) {
@@ -601,6 +629,69 @@ func TestSQLitePersistentJournalStagedDirtyHandleCannotAdoptCommittedRevision(t 
 	}
 	if entry.DurableWatermarkRev != 3 || !entry.DisableAutoResolveLWW {
 		t.Fatalf("journal entry watermark = %d disable_lww=%t, want rev3 fence", entry.DurableWatermarkRev, entry.DisableAutoResolveLWW)
+	}
+}
+
+func TestStageShadowPendingFailureKeepsCurrentGenerationForSyncFallback(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const path = "/pending-fallback.db"
+	payload := []byte("latest shadow-spill payload")
+	if err := shadow.WriteFull(path, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	oldGen := shadow.ActiveGeneration(path)
+	fh := &FileHandle{
+		Path:           path,
+		Dirty:          fs.newWriteBuffer(path, maxPreloadSize, 0),
+		IsNew:          true,
+		ShadowReady:    true,
+		ShadowSpill:    true,
+		ShadowStageGen: oldGen,
+	}
+	if _, err := fh.Dirty.Write(0, payload); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = 1
+
+	// Force metadata publication to fail after Truncate has advanced the
+	// shadow generation. The caller will fall back to a synchronous upload.
+	pending.dir = filepath.Join(t.TempDir(), "missing", "pending")
+	if err := fs.stageShadowLocked(fh, true); err == nil {
+		t.Fatal("stageShadowLocked succeeded with an unavailable pending directory")
+	}
+	currentGen := shadow.ActiveGeneration(path)
+	if currentGen == oldGen {
+		t.Fatalf("shadow generation = %d, want a generation newer than %d", currentGen, oldGen)
+	}
+	if fh.ShadowStageGen != currentGen || fh.ShadowStageSeq != fh.DirtySeq {
+		t.Fatalf("fallback generation/seq = %d/%d, want %d/%d", fh.ShadowStageGen, fh.ShadowStageSeq, currentGen, fh.DirtySeq)
+	}
+	fd, size, release, err := shadow.OpenIfGeneration(path, fh.ShadowStageGen)
+	if err != nil {
+		t.Fatalf("open fallback generation: %v", err)
+	}
+	defer release()
+	defer func() { _ = fd.Close() }()
+	got, err := io.ReadAll(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != int64(len(payload)) || !bytes.Equal(got, payload) {
+		t.Fatalf("fallback shadow size/body = %d/%q, want %d/%q", size, got, len(payload), payload)
 	}
 }
 

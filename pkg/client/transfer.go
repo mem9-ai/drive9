@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -428,6 +429,9 @@ func (c *Client) writeStreamConditionalWithChecksumAndPreCompleteCheck(ctx conte
 // therefore cannot use the direct-PUT path, which materializes the full reader
 // into memory before sending.
 func (c *Client) WriteMultipartStreamConditional(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
+	if err := validateFSPath(path); err != nil {
+		return err
+	}
 	if size <= 0 {
 		return fmt.Errorf("multipart upload requires positive size")
 	}
@@ -449,6 +453,11 @@ func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path str
 }
 
 func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, tags map[string]string, description, checksumSHA256 string, preCompleteCheck func() error) (*UploadSummary, error) {
+	// Validate before the threshold fetch and any checksum work so a bad
+	// path fails fast without a round trip or wasted CPU.
+	if err := validateFSPath(path); err != nil {
+		return nil, err
+	}
 	if err := validateWholeChecksumSHA256(checksumSHA256); err != nil {
 		return nil, err
 	}
@@ -721,6 +730,9 @@ func (c *Client) initiateUpload(ctx context.Context, path string, size int64, ch
 }
 
 func (c *Client) initiateUploadByBody(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64, description string) (UploadPlan, *http.Response, error) {
+	if err := validateFSPath(path); err != nil {
+		return UploadPlan{}, nil, err
+	}
 	body, err := json.Marshal(uploadInitiateRequest{
 		Path:             path,
 		TotalSize:        size,
@@ -753,7 +765,7 @@ func (c *Client) initiateUploadByBody(ctx context.Context, path string, size int
 }
 
 func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int64, checksums []string, expectedRevision int64, description string) (UploadPlan, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), http.NoBody)
+	req, err := c.newFSRequest(ctx, http.MethodPut, path, "", http.NoBody)
 	if err != nil {
 		return UploadPlan{}, err
 	}
@@ -969,6 +981,9 @@ func (c *Client) completeUploadWithOptions(ctx context.Context, uploadID string,
 // initiateUploadV2 calls POST /v2/uploads/initiate.
 // Returns errV2NotAvailable if the server responds with 404.
 func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, expectedRevision int64, description string) (*uploadPlanV2, error) {
+	if err := validateFSPath(path); err != nil {
+		return nil, err
+	}
 	body, err := json.Marshal(struct {
 		Path             string `json:"path"`
 		TotalSize        int64  `json:"total_size"`
@@ -1345,7 +1360,7 @@ func newMultipartAbortContext(parent context.Context, timeout time.Duration) (co
 
 // ReadStream reads a file, following 302 redirects for large files.
 func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, error) {
-	resp, err := c.readWithoutRedirect(ctx, path)
+	resp, err := c.readWithoutRedirect(ctx, path, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1391,19 +1406,22 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 	}
 }
 
-func (c *Client) readWithoutRedirect(ctx context.Context, path string) (*http.Response, error) {
+func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader string) (*http.Response, error) {
 	// Disable redirect following so we can detect 302
 	noRedirectClient := *c.httpClient
 	noRedirectClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path), nil)
+	req, err := c.newFSRequest(ctx, http.MethodGet, path, "", nil)
 	if err != nil {
 		return nil, err
 	}
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
 	}
 
 	return noRedirectClient.Do(req)
@@ -1418,7 +1436,7 @@ func (c *Client) ResolveReadTarget(ctx context.Context, path string) (*ReadTarge
 }
 
 func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
-	resp, err := c.readWithoutRedirect(ctx, path)
+	resp, err := c.readWithoutRedirect(ctx, path, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1467,11 +1485,12 @@ func (c *Client) downloadToFileSequential(ctx context.Context, remotePath string
 }
 
 // ReadStreamRange reads at most length bytes from a remote file starting at
-// offset. For large files the server returns a 302 redirect to a presigned S3
-// URL; this method resolves that redirect and issues an HTTP Range request so
-// only the requested bytes are transferred. For inline small files, the server
-// sends the full body and this method returns a reader limited to the requested
-// slice.
+// offset. The Range header is sent on the first hop so inline-served files
+// such as append-log WALs transfer only the requested bytes. For large files
+// the server returns a 302 redirect to a presigned S3 URL; this method
+// resolves that redirect and repeats the Range request. A first-hop 200 (small
+// inline file or an old server that ignores Range) falls back to slicing the
+// full body.
 func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
 	if offset < 0 {
 		return nil, fmt.Errorf("offset must be >= 0")
@@ -1486,7 +1505,7 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		return nil, fmt.Errorf("offset + length overflows int64")
 	}
 
-	resp, err := c.readWithoutRedirect(ctx, path)
+	resp, err := c.readWithoutRedirect(ctx, path, fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
 	if err != nil {
 		return nil, err
 	}
@@ -1534,12 +1553,28 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 			return c.sliceBody(resp2.Body, offset, length)
 		}
 
+	case resp.StatusCode == http.StatusPartialContent:
+		end, err := validatePartialContentRange(resp, offset, offset+length-1)
+		if err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+		// First-hop Range honored. The body already starts at offset, so
+		// bound it to the declared response range without skipping the
+		// offset a second time.
+		return &limitedReadCloser{r: io.LimitReader(resp.Body, end-offset+1), c: resp.Body}, nil
+
+	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+		_ = resp.Body.Close()
+		return io.NopCloser(bytes.NewReader(nil)), nil
+
 	case resp.StatusCode >= 300:
 		defer func() { _ = resp.Body.Close() }()
 		return nil, readError(resp)
 
 	default:
-		// Small file: full body returned. Skip to offset and limit.
+		// 200: server ignored Range (small inline file or old server).
+		// Skip to offset and limit the read.
 		return c.sliceBody(resp.Body, offset, length)
 	}
 }
@@ -1604,6 +1639,75 @@ func (c *Client) sliceBody(rc io.ReadCloser, offset, length int64) (io.ReadClose
 		}
 	}
 	return &limitedReadCloser{r: io.LimitReader(rc, length), c: rc}, nil
+}
+
+// validatePartialContentRange checks that a first-hop 206 response carries a
+// well-formed Content-Range starting at the requested offset and not extending
+// past the requested end. Byte positions and the complete length must be
+// strict decimal digits, with `*` allowed for the complete length. It returns
+// the declared response end so the caller can bound the body to the declared
+// range. A server-clamped end (EOF) is allowed.
+func validatePartialContentRange(resp *http.Response, offset, requestedEnd int64) (int64, error) {
+	contentRange := resp.Header.Get("Content-Range")
+	if contentRange == "" {
+		return 0, fmt.Errorf("206 response missing Content-Range for offset %d", offset)
+	}
+	rest, ok := strings.CutPrefix(contentRange, "bytes ")
+	if !ok {
+		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+	}
+	byteRange, complete, ok := strings.Cut(rest, "/")
+	if !ok {
+		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+	}
+	completeSize := int64(-1)
+	if complete != "*" {
+		if !isDecimalDigits(complete) {
+			return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+		}
+		var err error
+		completeSize, err = strconv.ParseInt(complete, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+		}
+	}
+	startStr, endStr, ok := strings.Cut(byteRange, "-")
+	if !ok || !isDecimalDigits(startStr) || !isDecimalDigits(endStr) {
+		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+	}
+	start, err := strconv.ParseInt(startStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+	}
+	end, err := strconv.ParseInt(endStr, 10, 64)
+	if err != nil || end < start {
+		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+	}
+	if start != offset {
+		return 0, fmt.Errorf("unexpected Content-Range %q for offset %d", contentRange, offset)
+	}
+	if end > requestedEnd {
+		return 0, fmt.Errorf("Content-Range %q extends past requested end %d for offset %d", contentRange, requestedEnd, offset)
+	}
+	if completeSize >= 0 && completeSize <= end {
+		return 0, fmt.Errorf("invalid Content-Range %q for offset %d", contentRange, offset)
+	}
+	return end, nil
+}
+
+// isDecimalDigits reports whether s is a non-empty sequence of ASCII digits.
+// HTTP byte-range positions and complete lengths are digit sequences; signed
+// values are not valid.
+func isDecimalDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 type limitedReadCloser struct {
@@ -1818,6 +1922,11 @@ func (c *Client) ResumeUploadWithSummary(ctx context.Context, path string, r io.
 // the resulting revision on completion, and returns coarse-grained phase
 // timings for the completed resume flow.
 func (c *Client) ResumeUploadWithSummaryAndTags(ctx context.Context, path string, r io.ReaderAt, totalSize int64, progress ProgressFunc, tags map[string]string) (*UploadSummary, error) {
+	// Validate before the upload query and checksum computation so a bad
+	// path fails fast without a round trip or wasted CPU.
+	if err := validateFSPath(path); err != nil {
+		return nil, err
+	}
 	// Resume also applies tags only during complete, so validate here before we
 	// query/resume/upload additional parts.
 	if err := validateTags(tags); err != nil {
@@ -1886,6 +1995,9 @@ func (c *Client) ResumeUploadWithSummaryAndTags(ctx context.Context, path string
 
 // queryUpload finds an active upload for the given path.
 func (c *Client) queryUpload(ctx context.Context, path string) (*UploadMeta, error) {
+	if err := validateFSPath(path); err != nil {
+		return nil, err
+	}
 	query := url.Values{}
 	query.Set("path", path)
 	query.Set("status", "UPLOADING")

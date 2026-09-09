@@ -362,8 +362,10 @@ func (r BatchStatResult) OK() bool {
 
 // BatchReadSmallResult is one per-path result from BatchReadSmallCtx.
 //
-// Data is JSON base64-encoded on the wire. Missing, invalid, directory, and
-// too-large paths are reported as per-path errors.
+// Data is JSON base64-encoded on the wire. Missing, directory, and too-large
+// paths are reported as per-path errors. (Paths the server would reject with
+// HTTP 400 never reach the wire: client-side validation fails the whole
+// BatchReadSmallCtx call first.)
 type BatchReadSmallResult struct {
 	Path     string `json:"path"`
 	Status   int    `json:"status"`
@@ -418,11 +420,27 @@ type StatMetadataResult struct {
 
 var errStatMetadataCompatFallback = errors.New("stat metadata fallback to legacy HEAD")
 
-func (c *Client) url(path string) string {
+// url builds the /v1/fs request URL for path, rejecting paths the server
+// would refuse with HTTP 400 so callers fail fast client-side.
+func (c *Client) url(path string) (string, error) {
+	if err := validateFSPath(path); err != nil {
+		return "", err
+	}
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	return c.baseURL + "/v1/fs" + escapeFSPath(path)
+	return c.baseURL + "/v1/fs" + escapeFSPath(path), nil
+}
+
+// newFSRequest builds an HTTP request for the /v1/fs endpoint, rejecting
+// paths the server would refuse with HTTP 400 so callers fail fast
+// client-side. rawQuery includes the leading "?" or is empty.
+func (c *Client) newFSRequest(ctx context.Context, method, path, rawQuery string, body io.Reader) (*http.Request, error) {
+	reqURL, err := c.url(path)
+	if err != nil {
+		return nil, err
+	}
+	return http.NewRequestWithContext(ctx, method, reqURL+rawQuery, body)
 }
 
 func escapeFSPath(path string) string {
@@ -749,7 +767,7 @@ func (c *Client) CreateFile(path string) (int64, error) {
 // CreateFileCtx creates an empty file with context support and returns the
 // committed file revision when the server reports it.
 func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?create=1", nil)
+	req, err := c.newFSRequest(ctx, http.MethodPost, path, "?create=1", nil)
 	if err != nil {
 		return 0, err
 	}
@@ -784,7 +802,7 @@ func (c *Client) SymlinkCtx(ctx context.Context, target, linkPath string) error 
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(linkPath)+"?symlink=1", bytes.NewReader(body))
+	req, err := c.newFSRequest(ctx, http.MethodPost, linkPath, "?symlink=1", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -807,7 +825,10 @@ func (c *Client) Hardlink(srcPath, dstPath string) error {
 
 // HardlinkCtx creates a hard link with context support.
 func (c *Client) HardlinkCtx(ctx context.Context, srcPath, dstPath string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(dstPath)+"?hardlink=1", nil)
+	if err := validateFSPath(srcPath); err != nil {
+		return err
+	}
+	req, err := c.newFSRequest(ctx, http.MethodPost, dstPath, "?hardlink=1", nil)
 	if err != nil {
 		return err
 	}
@@ -824,7 +845,7 @@ func (c *Client) HardlinkCtx(ctx context.Context, srcPath, dstPath string) error
 }
 
 func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
+	req, err := c.newFSRequest(ctx, http.MethodPut, path, "", bytes.NewReader(data))
 	if err != nil {
 		return 0, err
 	}
@@ -871,6 +892,9 @@ func (c *Client) Read(path string) ([]byte, error) {
 
 // ReadCtx downloads a file's content with context support.
 func (c *Client) ReadCtx(ctx context.Context, path string) ([]byte, error) {
+	// ReadStream validates the path (newFSRequest), follows presigned
+	// redirects, and routes content_layout=extent reads to the JuiceFS data
+	// plane when the server answers 422 with the extent hint.
 	rc, err := c.ReadStream(ctx, path)
 	if err != nil {
 		return nil, err
@@ -902,7 +926,7 @@ func (c *Client) List(path string) ([]FileInfo, error) {
 // ListCtx returns the entries in a directory with context support.
 func (c *Client) ListCtx(ctx context.Context, path string) ([]FileInfo, error) {
 	// Use an explicit value to avoid intermediaries dropping bare "?list".
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path)+"?list=1", nil)
+	req, err := c.newFSRequest(ctx, http.MethodGet, path, "?list=1", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -927,7 +951,9 @@ func (c *Client) ListCtx(ctx context.Context, path string) ([]FileInfo, error) {
 //
 // Transport/request errors fail the method. Per-path stat errors are returned
 // inside the corresponding BatchStatResult so one missing path does not fail
-// the whole batch.
+// the whole batch. A path that fails client-side validation (anything the
+// server would reject with HTTP 400, e.g. backslashes or ".." segments)
+// fails the whole call before any request is sent.
 func (c *Client) BatchStatCtx(ctx context.Context, paths []string) ([]BatchStatResult, error) {
 	return c.BatchStatWithOptionsCtx(ctx, paths, BatchStatOptions{})
 }
@@ -939,6 +965,11 @@ func (c *Client) BatchStatWithOptionsCtx(ctx context.Context, paths []string, op
 	}
 	if len(paths) > MaxBatchStatPaths {
 		return nil, fmt.Errorf("batch stat: %d paths exceeds limit of %d", len(paths), MaxBatchStatPaths)
+	}
+	for _, p := range paths {
+		if err := validateFSPath(p); err != nil {
+			return nil, err
+		}
 	}
 	body, err := json.Marshal(struct {
 		Paths           []string `json:"paths"`
@@ -976,13 +1007,20 @@ func (c *Client) BatchStatWithOptionsCtx(ctx context.Context, paths []string, op
 //
 // Transport/request errors fail the method. Per-path read errors are returned
 // inside the corresponding BatchReadSmallResult so one missing or too-large
-// path does not fail the whole batch.
+// path does not fail the whole batch. A path that fails client-side validation
+// (anything the server would reject with HTTP 400, e.g. backslashes or ".."
+// segments) fails the whole call before any request is sent.
 func (c *Client) BatchReadSmallCtx(ctx context.Context, paths []string, maxBytes int64) ([]BatchReadSmallResult, error) {
 	if len(paths) == 0 {
 		return []BatchReadSmallResult{}, nil
 	}
 	if len(paths) > MaxBatchReadSmallPaths {
 		return nil, fmt.Errorf("batch read-small: %d paths exceeds limit of %d", len(paths), MaxBatchReadSmallPaths)
+	}
+	for _, p := range paths {
+		if err := validateFSPath(p); err != nil {
+			return nil, err
+		}
 	}
 	body, err := json.Marshal(struct {
 		Paths    []string `json:"paths"`
@@ -1025,7 +1063,9 @@ func (c *Client) BatchReadSmallCtx(ctx context.Context, paths []string, maxBytes
 //
 // Transport/request errors fail the method. Per-path write errors are returned
 // inside the corresponding BatchWriteResult so one conflict does not fail the
-// whole batch.
+// whole batch. A path that fails client-side validation (anything the server
+// would reject with HTTP 400, e.g. backslashes or ".." segments) fails the
+// whole call before any request is sent.
 func (c *Client) BatchWriteCtx(ctx context.Context, items []BatchWriteItem) ([]BatchWriteResult, error) {
 	if len(items) == 0 {
 		return []BatchWriteResult{}, nil
@@ -1035,6 +1075,9 @@ func (c *Client) BatchWriteCtx(ctx context.Context, items []BatchWriteItem) ([]B
 	}
 	var total int64
 	for _, item := range items {
+		if err := validateFSPath(item.Path); err != nil {
+			return nil, err
+		}
 		total += int64(len(item.Data))
 		if total > MaxBatchWriteBytes {
 			return nil, fmt.Errorf("batch write: %d bytes exceeds limit of %d", total, MaxBatchWriteBytes)
@@ -1090,7 +1133,7 @@ func (c *Client) Stat(path string) (*StatResult, error) {
 // StatCtx is the context-aware form of the lightweight HEAD-based Stat
 // interface. Use StatMetadataCompatCtx when enriched metadata is required.
 func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.url(path), nil)
+	req, err := c.newFSRequest(ctx, http.MethodHead, path, "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1145,7 +1188,7 @@ func (c *Client) StatMetadata(path string) (*StatMetadataResult, error) {
 
 // StatMetadataCtx returns enriched metadata for a path with context support.
 func (c *Client) StatMetadataCtx(ctx context.Context, path string) (*StatMetadataResult, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path)+"?stat=1", nil)
+	req, err := c.newFSRequest(ctx, http.MethodGet, path, "?stat=1", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1301,17 +1344,17 @@ func removeAllRetryDelay(retryAfter string, backoff time.Duration) time.Duration
 }
 
 func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kind string) error {
-	requestURL := c.url(path)
+	// Use an explicit value to avoid intermediaries dropping bare "?recursive".
+	var rawQuery string
 	if recursive {
-		// Use an explicit value to avoid intermediaries dropping bare "?recursive".
-		requestURL += "?recursive=1"
+		rawQuery = "?recursive=1"
 	} else if kind != "" {
-		requestURL += "?kind=" + url.QueryEscape(kind)
+		rawQuery = "?kind=" + url.QueryEscape(kind)
 	}
 
 	backoff := time.Second
 	for attempt := 0; ; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)
+		req, err := c.newFSRequest(ctx, http.MethodDelete, path, rawQuery, nil)
 		if err != nil {
 			return err
 		}
@@ -1353,7 +1396,10 @@ func (c *Client) Copy(srcPath, dstPath string) error {
 // tree copy). The non-Ctx Copy delegates here so both paths share
 // the same request shape.
 func (c *Client) CopyCtx(ctx context.Context, srcPath, dstPath string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(dstPath)+"?copy", nil)
+	if err := validateFSPath(srcPath); err != nil {
+		return err
+	}
+	req, err := c.newFSRequest(ctx, http.MethodPost, dstPath, "?copy", nil)
 	if err != nil {
 		return err
 	}
@@ -1376,7 +1422,10 @@ func (c *Client) Rename(oldPath, newPath string) error {
 
 // RenameCtx moves/renames a file or directory with context support.
 func (c *Client) RenameCtx(ctx context.Context, oldPath, newPath string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(newPath)+"?rename", nil)
+	if err := validateFSPath(oldPath); err != nil {
+		return err
+	}
+	req, err := c.newFSRequest(ctx, http.MethodPost, newPath, "?rename", nil)
 	if err != nil {
 		return err
 	}
@@ -1399,11 +1448,11 @@ func (c *Client) Mkdir(path string) error {
 
 // MkdirCtx creates a directory with context support.
 func (c *Client) MkdirCtx(ctx context.Context, path string, mode uint32) error {
-	urlStr := c.url(path) + "?mkdir"
+	rawQuery := "?mkdir"
 	if mode != 0o755 {
-		urlStr += "&mode=" + strconv.FormatUint(uint64(mode), 10)
+		rawQuery += "&mode=" + strconv.FormatUint(uint64(mode), 10)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, nil)
+	req, err := c.newFSRequest(ctx, http.MethodPost, path, rawQuery, nil)
 	if err != nil {
 		return err
 	}
@@ -1429,7 +1478,7 @@ func (c *Client) ChmodCtx(ctx context.Context, path string, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(path)+"?chmod", bytes.NewReader(body))
+	req, err := c.newFSRequest(ctx, http.MethodPost, path, "?chmod", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -1503,14 +1552,14 @@ func (c *Client) Grep(query, pathPrefix string, limit int) ([]SearchResult, erro
 }
 
 func (c *Client) GrepWithLayer(query, pathPrefix string, limit int, layerRef string) ([]SearchResult, error) {
-	u := c.url(pathPrefix) + "?grep=" + url.QueryEscape(query)
+	rawQuery := "?grep=" + url.QueryEscape(query)
 	if limit > 0 {
-		u += "&limit=" + strconv.Itoa(limit)
+		rawQuery += "&limit=" + strconv.Itoa(limit)
 	}
 	if strings.TrimSpace(layerRef) != "" {
-		u += "&layer=" + url.QueryEscape(strings.TrimSpace(layerRef))
+		rawQuery += "&layer=" + url.QueryEscape(strings.TrimSpace(layerRef))
 	}
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+	req, err := c.newFSRequest(context.Background(), http.MethodGet, pathPrefix, rawQuery, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1531,8 +1580,7 @@ func (c *Client) GrepWithLayer(query, pathPrefix string, limit int, layerRef str
 
 func (c *Client) Find(pathPrefix string, params url.Values) ([]SearchResult, error) {
 	params.Set("find", "")
-	u := c.url(pathPrefix) + "?" + params.Encode()
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+	req, err := c.newFSRequest(context.Background(), http.MethodGet, pathPrefix, "?"+params.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}

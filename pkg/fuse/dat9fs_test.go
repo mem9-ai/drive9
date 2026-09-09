@@ -1708,6 +1708,88 @@ func TestDat9FSReadSQLitePersistentJournalBypassesSmallReadCache(t *testing.T) {
 	recorder.Check(t)
 }
 
+func TestDat9FSReadSQLiteJournalSendsFirstHopRange(t *testing.T) {
+	const (
+		path       = "/repo/workload.db-wal"
+		walSize    = 40 << 10 // below the 4 MiB Prefetcher threshold
+		readOffset = walSize - 4096
+		readLength = 4096
+	)
+	wal := bytes.Repeat([]byte("w"), walSize)
+	var recorder testErrorRecorder
+	var mu sync.Mutex
+	var rangeHeaders []string
+	var wroteBytes int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs"+path {
+			recorder.Recordf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		rangeHeader := r.Header.Get("Range")
+		mu.Lock()
+		rangeHeaders = append(rangeHeaders, rangeHeader)
+		mu.Unlock()
+		if rangeHeader == "" {
+			// Range omitted: emulate a full-body 200 so the regression is
+			// observable in the response byte count.
+			n, _ := w.Write(wal)
+			mu.Lock()
+			wroteBytes += n
+			mu.Unlock()
+			return
+		}
+		var start, end int
+		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil || start < 0 || end < start || end >= walSize {
+			http.Error(w, "bad range: "+rangeHeader, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, walSize))
+		w.WriteHeader(http.StatusPartialContent)
+		n, _ := w.Write(wal[start : end+1])
+		mu.Lock()
+		wroteBytes += n
+		mu.Unlock()
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(path, false, walSize, time.Now())
+	fs.inodes.UpdateRevision(ino, 3)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, readOffset, readLength)
+	if err != nil || st != gofuse.OK {
+		t.Fatalf("Read = %d/%v, want OK", st, err)
+	}
+	if !bytes.Equal(got, wal[readOffset:]) {
+		t.Fatalf("Read returned %d bytes, want the requested %d-byte slice", len(got), readLength)
+	}
+	mu.Lock()
+	wantPrefix := fmt.Sprintf("bytes=%d-", readOffset)
+	found := false
+	for _, rh := range rangeHeaders {
+		if strings.HasPrefix(rh, wantPrefix) {
+			found = true
+			break
+		}
+	}
+	mu.Unlock()
+	if !found {
+		t.Fatalf("WAL GET Range headers = %v, want one starting with %q", rangeHeaders, wantPrefix)
+	}
+	mu.Lock()
+	gotWrote := wroteBytes
+	mu.Unlock()
+	if gotWrote != readLength {
+		t.Fatalf("server wrote %d bytes, want exactly %d", gotWrote, readLength)
+	}
+	recorder.Check(t)
+}
+
 func TestDat9FSReadSQLiteMainDatabaseBypassesSmallReadCacheWithOpenSidecar(t *testing.T) {
 	const path = "/repo/workload.db"
 	var reads atomic.Int32
@@ -12843,6 +12925,149 @@ func TestReadSQLiteSamePathDirtyHandleSkipsIncompleteCandidate(t *testing.T) {
 	}
 }
 
+func TestReadSQLiteSamePathDirtyRebindsStaleCleanSibling(t *testing.T) {
+	const (
+		filePath = "/workload.db"
+		partSize = int64(4096)
+		fileSize = 2 * partSize
+	)
+	oldData := bytes.Repeat([]byte{'A'}, int(fileSize))
+	newData := bytes.Repeat([]byte{'B'}, int(fileSize))
+	var remoteGets atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs"+filePath {
+			http.NotFound(w, r)
+			return
+		}
+		remoteGets.Add(1)
+		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(newData)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{TrustLocalEvents: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, fileSize, time.Now())
+	fs.inodes.UpdateRevision(ino, 2)
+
+	stale := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		BaseRev:  2,
+		OrigSize: fileSize,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, partSize),
+	}
+	if _, err := stale.Dirty.Write(0, oldData); err != nil {
+		t.Fatalf("seed stale buffer: %v", err)
+	}
+	stale.Dirty.ClearDirty()
+	stale.DirtySeq = fs.markDirtySize(ino, fileSize)
+	fs.openHandles.Add(stale)
+	defer fs.openHandles.Remove(stale)
+
+	fs.recordCommittedRevisionWithSize(filePath, 3, fileSize)
+	fs.inodes.UpdateRevision(ino, 3)
+	fs.inodes.UpdateSize(ino, fileSize)
+
+	readPart := func(offset int64) []byte {
+		t.Helper()
+		got, n, ok, st := fs.readSamePathDirtyHandle(filePath, nil, offset, uint32(partSize))
+		if !ok || st != gofuse.OK {
+			t.Fatalf("read offset=%d ok=%t status=%v, want true/OK", offset, ok, st)
+		}
+		if n != int(partSize) {
+			t.Fatalf("read offset=%d bytes=%d, want %d", offset, n, partSize)
+		}
+		return append([]byte(nil), got[:n]...)
+	}
+	if got := readPart(0); !bytes.Equal(got, newData[:partSize]) {
+		t.Fatalf("first read of part0 = %q, want newData prefix", got)
+	}
+	if got := readPart(0); !bytes.Equal(got, newData[:partSize]) {
+		t.Fatalf("second read of part0 = %q, want newData prefix", got)
+	}
+	if got := readPart(partSize); !bytes.Equal(got, newData[partSize:]) {
+		t.Fatalf("read of part1 = %q, want newData suffix", got)
+	}
+	if got := remoteGets.Load(); got != 2 {
+		t.Fatalf("remote gets = %d, want 2: one per distinct part, not one per FUSE read", got)
+	}
+	if got := stale.BaseRev; got != 3 {
+		t.Fatalf("stale sibling BaseRev = %d, want 3 after rebind", got)
+	}
+}
+
+func TestReadSQLiteSamePathDirtySkipsUnsafeStaleSibling(t *testing.T) {
+	const (
+		filePath = "/workload.db"
+		partSize = int64(4096)
+		fileSize = 2 * partSize
+	)
+	oldData := bytes.Repeat([]byte{'A'}, int(fileSize))
+	newData := bytes.Repeat([]byte{'B'}, int(fileSize))
+	var remoteGets atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs"+filePath {
+			http.NotFound(w, r)
+			return
+		}
+		remoteGets.Add(1)
+		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(newData)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{TrustLocalEvents: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, fileSize, time.Now())
+	fs.inodes.UpdateRevision(ino, 2)
+
+	stale := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		BaseRev:  0,
+		OrigSize: fileSize,
+		IsNew:    true,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, partSize),
+	}
+	if _, err := stale.Dirty.Write(0, oldData); err != nil {
+		t.Fatalf("seed stale buffer: %v", err)
+	}
+	stale.Dirty.ClearDirty()
+	stale.DirtySeq = fs.markDirtySize(ino, fileSize)
+	fs.openHandles.Add(stale)
+	defer fs.openHandles.Remove(stale)
+
+	fs.recordCommittedRevisionWithSize(filePath, 3, fileSize)
+	fs.inodes.UpdateRevision(ino, 3)
+	fs.inodes.UpdateSize(ino, fileSize)
+
+	if _, _, ok, st := fs.readSamePathDirtyHandle(filePath, nil, 0, uint32(partSize)); ok || st != gofuse.OK {
+		t.Fatalf("unsafe stale sibling claimed=%t status=%v, want false/OK", ok, st)
+	}
+
+	reader := &FileHandle{Ino: ino, Path: filePath, BaseRev: 3, OrigSize: fileSize}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+	got, st, err := readDat9FSTestRange(fs, ino, readerID, 0, int(partSize))
+	if err != nil {
+		t.Fatalf("read fallback: %v", err)
+	}
+	if st != gofuse.OK {
+		t.Fatalf("read fallback status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, newData[:partSize]) {
+		t.Fatalf("read fallback bytes = %q, want newData prefix", got)
+	}
+	if remoteGets.Load() == 0 {
+		t.Fatal("unsafe stale sibling skipped but fallback never consulted remote")
+	}
+}
+
 func TestReadCloseSyncSamePathDirtyWriterUsesDirtyBuffer(t *testing.T) {
 	var remoteReads atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -21687,6 +21912,289 @@ func TestRenamePendingNewCommitGitLooseObjectSyncFailureKeepsRecoverableShadow(t
 	if string(got) != string(data) {
 		t.Fatalf("Read recovered object = %q, want %q", string(got), string(data))
 	}
+}
+
+func TestRenamePendingNewCommitCloseSyncUploadsBeforeReturning(t *testing.T) {
+	testRenamePendingNewCommitDurablePolicyUploadsBeforeReturning(t, WritePolicyCloseSync)
+}
+
+func TestRenamePendingNewCommitWriteSyncUploadsBeforeReturning(t *testing.T) {
+	testRenamePendingNewCommitDurablePolicyUploadsBeforeReturning(t, WritePolicyWriteSync)
+}
+
+func TestRenamePendingNewCommitWriteBackAllowsAsyncUploadAfterReturning(t *testing.T) {
+	oldP := "/app/file.txt.tmp.xxx"
+	newP := "/app/file.txt"
+	data := []byte("new-content-should-be-remote")
+	const putDelay = 300 * time.Millisecond
+
+	var finalPuts atomic.Int32
+	var renameCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+newP:
+			time.Sleep(putDelay)
+			finalPuts.Add(1)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if string(body) != string(data) {
+				http.Error(w, "unexpected body", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+		case r.Method == http.MethodPost && r.URL.RawQuery == "rename":
+			renameCalls.Add(1)
+			http.Error(w, "server rename should not be used for pending-new temp files", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	fs, cq, _, _ := newPendingNewRenameTestFS(t, ts.URL, WritePolicyWriteBack, oldP, data)
+	defer cq.DrainAll()
+	dirIno := fs.inodes.Lookup("/app", true, 0, time.Now())
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Newdir:   dirIno,
+	}, "file.txt.tmp.xxx", "file.txt")
+	if st != gofuse.OK {
+		t.Fatalf("Rename: %v", st)
+	}
+	if got := finalPuts.Load(); got != 0 {
+		t.Fatalf("writeback Rename returned with final path PUTs = %d, want 0 (async)", got)
+	}
+	if got := renameCalls.Load(); got != 0 {
+		t.Fatalf("remote rename calls = %d, want 0", got)
+	}
+
+	cq.DrainAll()
+	if got := finalPuts.Load(); got < 1 {
+		t.Fatalf("final path PUTs after drain = %d, want >= 1", got)
+	}
+}
+
+func testRenamePendingNewCommitDurablePolicyUploadsBeforeReturning(t *testing.T, policy WritePolicy) {
+	t.Helper()
+	oldP := "/app/file.txt.tmp.xxx"
+	newP := "/app/file.txt"
+	data := []byte("new-content-should-be-remote")
+	const putDelay = 300 * time.Millisecond
+
+	var finalPuts atomic.Int32
+	var renameCalls atomic.Int32
+	var mu sync.Mutex
+	var finalBody []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+newP:
+			time.Sleep(putDelay)
+			finalPuts.Add(1)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			finalBody = append([]byte(nil), body...)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+		case r.Method == http.MethodPost && r.URL.RawQuery == "rename":
+			renameCalls.Add(1)
+			http.Error(w, "server rename should not be used for pending-new temp files", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	fs, cq, shadow, pending := newPendingNewRenameTestFS(t, ts.URL, policy, oldP, data)
+	defer cq.DrainAll()
+	dirIno := fs.inodes.Lookup("/app", true, 0, time.Now())
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Newdir:   dirIno,
+	}, "file.txt.tmp.xxx", "file.txt")
+	if st != gofuse.OK {
+		t.Fatalf("Rename: %v", st)
+	}
+	if got := finalPuts.Load(); got < 1 {
+		t.Fatalf("%s Rename returned with final path PUTs = %d, want >= 1", policy, got)
+	}
+	if got := renameCalls.Load(); got != 0 {
+		t.Fatalf("remote rename calls = %d, want 0", got)
+	}
+	mu.Lock()
+	gotBody := string(finalBody)
+	mu.Unlock()
+	if gotBody != string(data) {
+		t.Fatalf("final upload body = %q, want %q", gotBody, string(data))
+	}
+	if pending.HasPending(oldP) {
+		t.Fatal("old temp path still pending")
+	}
+	if pending.HasPending(newP) {
+		t.Fatal("final path still pending after sync upload")
+	}
+	if shadow.Has(oldP) {
+		t.Fatal("old temp shadow still exists")
+	}
+	if shadow.Has(newP) {
+		t.Fatal("final shadow still exists after sync upload")
+	}
+}
+
+func TestRenamePendingNewCommitCloseSyncFailureReturnsErrorAndKeepsShadow(t *testing.T) {
+	testRenamePendingNewCommitDurablePolicyFailureReturnsErrorAndKeepsShadow(t, WritePolicyCloseSync)
+}
+
+func TestRenamePendingNewCommitWriteSyncFailureReturnsErrorAndKeepsShadow(t *testing.T) {
+	testRenamePendingNewCommitDurablePolicyFailureReturnsErrorAndKeepsShadow(t, WritePolicyWriteSync)
+}
+
+func testRenamePendingNewCommitDurablePolicyFailureReturnsErrorAndKeepsShadow(t *testing.T, policy WritePolicy) {
+	t.Helper()
+	oldP := "/app/file.txt.tmp.xxx"
+	newP := "/app/file.txt"
+	finalName := "file.txt"
+	data := []byte("new-content-should-be-remote")
+
+	var finalPuts atomic.Int32
+	var renameCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+newP:
+			finalPuts.Add(1)
+			http.Error(w, "storage backend unavailable", http.StatusServiceUnavailable)
+		case r.Method == http.MethodPost && r.URL.RawQuery == "rename":
+			renameCalls.Add(1)
+			http.Error(w, "server rename should not be used for pending-new temp files", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	shadowDir := t.TempDir()
+	pendingDir := t.TempDir()
+	fs, cq, shadow, pending := newPendingNewRenameTestFSAt(t, ts.URL, policy, oldP, data, shadowDir, pendingDir)
+	dirIno := fs.inodes.Lookup("/app", true, 0, time.Now())
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Newdir:   dirIno,
+	}, "file.txt.tmp.xxx", finalName)
+	if st != gofuse.Status(syscall.EAGAIN) {
+		t.Fatalf("%s Rename status = %v, want EAGAIN", policy, st)
+	}
+	cq.DrainAll()
+	shadow.Close()
+
+	if got := finalPuts.Load(); got < 1 {
+		t.Fatalf("final path PUTs = %d, want >= 1", got)
+	}
+	if got := renameCalls.Load(); got != 0 {
+		t.Fatalf("remote rename calls = %d, want 0", got)
+	}
+	if pending.HasPending(oldP) {
+		t.Fatal("old temp path still pending")
+	}
+	if !pending.HasPending(newP) {
+		t.Fatal("final path should stay pending after sync upload failure")
+	}
+
+	pending2, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pending2.RecoverFromDisk(); err != nil {
+		t.Fatalf("RecoverFromDisk: %v", err)
+	}
+	shadow2, err := NewShadowStoreWithQuota(shadowDir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow2.Close()
+	if !shadow2.Has(newP) {
+		t.Fatal("recovered shadow missing final path")
+	}
+
+	opts := &MountOptions{WritePolicy: policy}
+	opts.setDefaults()
+	fs2 := NewDat9FS(newTestClient(ts.URL), opts)
+	fs2.shadowStore = shadow2
+	fs2.pendingIndex = pending2
+	dirIno2 := fs2.inodes.Lookup("/app", true, 0, time.Now())
+	var entryOut gofuse.EntryOut
+	st = fs2.Lookup(nil, &gofuse.InHeader{NodeId: dirIno2}, finalName, &entryOut)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup recovered file: %v, want OK", st)
+	}
+	if entryOut.Size != uint64(len(data)) {
+		t.Fatalf("Lookup size = %d, want %d", entryOut.Size, len(data))
+	}
+
+	var openOut gofuse.OpenOut
+	st = fs2.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: entryOut.NodeId},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &openOut)
+	if st != gofuse.OK {
+		t.Fatalf("Open recovered file: %v", st)
+	}
+	buf := make([]byte, len(data)+8)
+	result, st := fs2.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: entryOut.NodeId},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read recovered file: %v", st)
+	}
+	got, _ := result.Bytes(buf)
+	if string(got) != string(data) {
+		t.Fatalf("Read recovered file = %q, want %q", string(got), string(data))
+	}
+}
+
+func newPendingNewRenameTestFS(t *testing.T, serverURL string, policy WritePolicy, oldP string, data []byte) (*Dat9FS, *CommitQueue, *ShadowStore, *PendingIndex) {
+	t.Helper()
+	return newPendingNewRenameTestFSAt(t, serverURL, policy, oldP, data, t.TempDir(), t.TempDir())
+}
+
+func newPendingNewRenameTestFSAt(t *testing.T, serverURL string, policy WritePolicy, oldP string, data []byte, shadowDir, pendingDir string) (*Dat9FS, *CommitQueue, *ShadowStore, *PendingIndex) {
+	t.Helper()
+	opts := &MountOptions{WritePolicy: policy}
+	opts.setDefaults()
+	c := newTestClient(serverURL)
+	fs := NewDat9FS(c, opts)
+
+	shadow, err := NewShadowStoreWithQuota(shadowDir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { shadow.Close() })
+	pending, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 16)
+	fs.commitQueue = cq
+
+	if err := shadow.WriteFull(oldP, data, 0); err != nil {
+		t.Fatalf("WriteFull old shadow: %v", err)
+	}
+	if _, err := pending.PutWithBaseRev(oldP, int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatalf("PutWithBaseRev old pending: %v", err)
+	}
+	return fs, cq, shadow, pending
 }
 
 func TestRenamePendingNewCommitFallsBackWhenFinalTargetExists(t *testing.T) {
