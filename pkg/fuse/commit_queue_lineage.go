@@ -150,26 +150,30 @@ func (cq *CommitQueue) checksumLandedPayload(entry *CommitEntry) string {
 // unreferenced landmark can only make a future growth attempt fail closed;
 // landmarks needed by already queued or in-flight direct children are kept.
 func (cq *CommitQueue) pruneLandedLocked() {
-	for len(cq.landed) > cq.landedLimitLocked() {
-		type lineageRef struct {
-			path     string
-			parentID string
+	limit := cq.landedLimitLocked()
+	if len(cq.landed) <= limit {
+		return
+	}
+	type lineageRef struct {
+		path     string
+		parentID string
+	}
+	referenced := make(map[lineageRef]struct{}, len(cq.queue)+len(cq.inFlight)+len(cq.immediate))
+	rememberReference := func(entry *CommitEntry) {
+		if entry != nil && !entry.canceled && entry.Path != "" && entry.ParentSnapshotID != "" {
+			referenced[lineageRef{path: entry.Path, parentID: entry.ParentSnapshotID}] = struct{}{}
 		}
-		referenced := make(map[lineageRef]struct{}, len(cq.queue)+len(cq.inFlight)+len(cq.immediate))
-		rememberReference := func(entry *CommitEntry) {
-			if entry != nil && !entry.canceled && entry.Path != "" && entry.ParentSnapshotID != "" {
-				referenced[lineageRef{path: entry.Path, parentID: entry.ParentSnapshotID}] = struct{}{}
-			}
-		}
-		for _, entry := range cq.queue {
-			rememberReference(entry)
-		}
-		for _, entry := range cq.inFlight {
-			rememberReference(entry)
-		}
-		for entry := range cq.immediate {
-			rememberReference(entry)
-		}
+	}
+	for _, entry := range cq.queue {
+		rememberReference(entry)
+	}
+	for _, entry := range cq.inFlight {
+		rememberReference(entry)
+	}
+	for entry := range cq.immediate {
+		rememberReference(entry)
+	}
+	for len(cq.landed) > limit {
 		oldestPath := ""
 		oldestClock := ^uint64(0)
 		for path, landmark := range cq.landed {

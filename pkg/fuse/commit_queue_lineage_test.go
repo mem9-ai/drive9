@@ -768,6 +768,7 @@ func TestCommitQueueSameProcessGrowthDoesNotOverwriteRecreatedSameRevSize(t *tes
 	c := newTestClient(ts.URL)
 	c.SetSmallFileThresholdForTests(1 << 20)
 	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
 	var watermark atomic.Int64
 	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
 	cq.OnSuccess = func(_ *CommitEntry, rev int64) {
@@ -865,6 +866,7 @@ func TestCommitQueueRecoveredGrowthFailsClosedWithoutImmutablePayload(t *testing
 	c := newTestClient(ts.URL)
 	c.SetSmallFileThresholdForTests(1 << 20)
 	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
 	if err := shadow.WriteFull(path, header, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -916,4 +918,38 @@ func waitCommitQueueIdle(t *testing.T, cq *CommitQueue) {
 	}
 	n, _ := cq.PendingStats()
 	t.Fatalf("commit queue still pending=%d", n)
+}
+
+func TestCommitQueuePruneMultipleLandmarksProtectsAllReferenceSources(t *testing.T) {
+	queued := &CommitEntry{Path: "/queued", ParentSnapshotID: "queued-parent"}
+	flight := &CommitEntry{Path: "/flight", ParentSnapshotID: "flight-parent"}
+	immediate := &CommitEntry{Path: "/immediate", ParentSnapshotID: "immediate-parent"}
+	cq := &CommitQueue{
+		queue:     []*CommitEntry{queued},
+		inFlight:  map[string]*CommitEntry{flight.Path: flight},
+		immediate: map[*CommitEntry]struct{}{immediate: {}},
+		landed:    make(map[string]pathCommitLandmark),
+	}
+	for _, entry := range []*CommitEntry{queued, flight, immediate} {
+		cq.landed[entry.Path] = pathCommitLandmark{snapshotID: entry.ParentSnapshotID, lastUsed: 1}
+	}
+	for i := 0; i < maxLandedCommitLandmarks; i++ {
+		cq.landed[fmt.Sprintf("/unreferenced-%04d", i)] = pathCommitLandmark{lastUsed: uint64(i + 2)}
+	}
+	cq.mu.Lock()
+	cq.pruneLandedLocked()
+	cq.mu.Unlock()
+	if len(cq.landed) != maxLandedCommitLandmarks {
+		t.Fatalf("landmark count=%d, want %d", len(cq.landed), maxLandedCommitLandmarks)
+	}
+	for _, entry := range []*CommitEntry{queued, flight, immediate} {
+		if got := cq.landed[entry.Path]; got.snapshotID != entry.ParentSnapshotID {
+			t.Errorf("evicted referenced parent for %s: %+v", entry.Path, got)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if _, ok := cq.landed[fmt.Sprintf("/unreferenced-%04d", i)]; ok {
+			t.Errorf("retained unreferenced landmark %d", i)
+		}
+	}
 }
