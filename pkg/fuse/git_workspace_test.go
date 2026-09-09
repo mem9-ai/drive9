@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -4526,6 +4527,176 @@ func TestGitWorkspaceUnlinkMarksHandlesOpenedDuringWhiteout(t *testing.T) {
 	fixture.mu.Unlock()
 	if putsFinal != putsAfterWhiteout {
 		t.Fatalf("overlay puts after whiteout = %d, after writes = %d — handle opened during whiteout resurrected the entry", putsAfterWhiteout, putsFinal)
+	}
+	if !ok || entry.Op != "whiteout" {
+		t.Fatalf("overlay entry = %+v, %v — want whiteout preserved", entry, ok)
+	}
+}
+
+func TestGitWorkspaceUnlinkPass2LockTimeoutDoesNotUpsertOverWhiteout(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyCloseSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	v1 := []byte("git-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1 status = %v, want OK", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync v1 status = %v, want OK", st)
+	}
+
+	postWait := make(chan struct{})
+	postEntered := make(chan struct{})
+	fixture.mu.Lock()
+	fixture.overlayPostWait = postWait
+	fixture.overlayPostEntered = postEntered
+	fixture.mu.Unlock()
+
+	oldTimeout := unlinkHandleSetLockTimeout
+	unlinkHandleSetLockTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { unlinkHandleSetLockTimeout = oldTimeout })
+
+	var escapedFh atomic.Uint64
+	var markPass atomic.Int32
+	contending := make(chan struct{})
+	testHookBeforeUnlinkedTransition = func() {
+		if markPass.Add(1) != 2 {
+			return
+		}
+		fh, ok := fs.fileHandles.Get(escapedFh.Load())
+		if !ok || fh == nil {
+			return
+		}
+		locked := make(chan struct{})
+		go func() {
+			fh.Lock()
+			close(locked)
+			<-contending
+			fh.Unlock()
+		}()
+		<-locked
+	}
+	t.Cleanup(func() {
+		testHookBeforeUnlinkedTransition = nil
+		select {
+		case <-contending:
+		default:
+			close(contending)
+		}
+	})
+
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt")
+	}()
+	select {
+	case <-postEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("whiteout POST never parked")
+	}
+
+	rt, rel, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/sync.txt")
+	if !ok {
+		t.Fatal("git workspace path missing")
+	}
+	mirror, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel)
+	if !ok {
+		t.Fatal("dirty mirror path missing")
+	}
+	_ = os.Remove(mirror)
+	if err := os.MkdirAll(mirror, 0o755); err != nil {
+		t.Fatalf("mkdir dirty-mirror leaf: %v", err)
+	}
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup during in-flight whiteout = %v, want OK", st)
+	}
+	var open2 gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_TRUNC),
+	}, &open2); st != gofuse.OK {
+		t.Fatalf("Open memory-fallback handle = %v, want OK", st)
+	}
+	escaped, ok := fs.fileHandles.Get(open2.Fh)
+	if !ok || escaped == nil {
+		t.Fatal("escaped handle missing")
+	}
+	escaped.Lock()
+	localFile := escaped.LocalFile
+	hasDirty := escaped.Dirty != nil
+	escaped.Unlock()
+	if localFile != nil || !hasDirty {
+		t.Fatalf("LocalFile/Dirty = %v/%t, want nil/true (memory fallback)", localFile, hasDirty)
+	}
+	escapedFh.Store(open2.Fh)
+	v2 := []byte("git-v2-must-stay-local")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       open2.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write on memory-fallback handle = %v, want OK", st)
+	}
+
+	close(postWait)
+	select {
+	case st := <-unlinkDone:
+		t.Fatalf("Unlink returned %v before pass-2 lock contention was released", st)
+	case <-time.After(80 * time.Millisecond):
+	}
+	close(contending)
+	st := <-unlinkDone
+	if st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK after post-commit force-mark", st)
+	}
+
+	escaped, ok = fs.fileHandles.Get(open2.Fh)
+	if !ok {
+		t.Fatal("escaped handle missing after unlink")
+	}
+	escaped.Lock()
+	unlinked := escaped.Unlinked
+	escaped.Unlock()
+	if !unlinked {
+		t.Fatal("escaped memory-fallback handle not marked unlinked after pass-2 timeout")
+	}
+
+	fixture.mu.Lock()
+	putsAfterUnlink := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: open2.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush after unlink = %v, want OK", st)
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	putsFinal := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if putsFinal != putsAfterUnlink {
+		t.Fatalf("overlay puts = %d -> %d — Flush upserted over committed whiteout", putsAfterUnlink, putsFinal)
 	}
 	if !ok || entry.Op != "whiteout" {
 		t.Fatalf("overlay entry = %+v, %v — want whiteout preserved", entry, ok)

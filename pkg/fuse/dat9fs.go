@@ -7622,6 +7622,30 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 	return handles, true, nil
 }
 
+// forceMarkOpenHandlesUnlinkedAfterCommit marks still-linked open handles
+// for p after DELETE/whiteout has already committed. It locks one handle at
+// a time so it cannot form the whole-set ABBA deadlock; partial Unlinked is
+// required here because the name is gone and a later Flush must not publish.
+func (fs *Dat9FS) forceMarkOpenHandlesUnlinkedAfterCommit(p string) bool {
+	if fs == nil || fs.openHandles == nil || p == "" {
+		return false
+	}
+	handles := fs.openHandles.SnapshotPath(p)
+	any := false
+	for _, fh := range handles {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		_, _ = fs.attachUnlinkedHandleSnapshotLocked(fh, p, nil, 0, 0, 0, false)
+		fh.Unlinked = true
+		fh.Unlock()
+		any = true
+	}
+	fs.openHandles.UnlinkPath(p)
+	return any
+}
+
 // attachAndMarkOpenHandles attaches unlink snapshots and sets Unlinked on the
 // whole captured handle set under one multi-handle lock hold. The set is
 // acquired with TryLock only; a failed attempt drops every lock already
@@ -9752,7 +9776,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// now so their later write/flush/release is suppressed too and the
 		// overlay entry cannot be upserted back over the whiteout.
 		if _, _, markErr := fs.markOpenHandlesUnlinked(ctx, childP, false); markErr != nil {
-			return httpToFuseStatus(markErr)
+			// Whiteout already committed. Do not return EIO with unmarked
+			// fds: an in-memory Dirty git handle can still upsert over the
+			// whiteout. Mark one-at-a-time instead of aborting Unlink.
+			fs.forceMarkOpenHandlesUnlinkedAfterCommit(childP)
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
@@ -9964,8 +9991,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// so their Flush/Fsync/Release guards see fh.Unlinked and cannot
 	// resurrect the path.
 	if _, anyOpen, markErr := fs.markOpenHandlesUnlinked(ctx, childP, false); markErr != nil {
-		status = httpToFuseStatus(markErr)
-		return status
+		if fs.forceMarkOpenHandlesUnlinkedAfterCommit(childP) {
+			preserveOpen = true
+		}
 	} else if anyOpen {
 		preserveOpen = true
 	}
