@@ -31,7 +31,12 @@ type Runtime struct {
 }
 
 type RuntimeConfig struct {
-	CacheDir  string
+	// CacheDir is the drive9-side cache root for this runtime; JuiceFS keeps
+	// its chunk cache and writeback staging in the jfs/ subdirectory. It
+	// defaults under the drive9 user cache dir when Writeback is requested.
+	CacheDir string
+	// Writeback stages writes locally and uploads them in the background
+	// (JuiceFS --writeback). FUSE mounts always enable it.
 	Writeback bool
 	Transport jfsmeta.Drive9Transport
 	Storage   object.ObjectStorage
@@ -63,16 +68,15 @@ func juiceMetaConf() *jfsmeta.Config {
 	return conf
 }
 
-// applyChunkCacheDir is JuiceFS `mount --cache-dir DIR --writeback`.
-// UploadDelay stays 0 (JuiceFS default). Fsync returns after local stage;
-// the same goroutine may PUT afterwards. fuse-crash-recovery remounts the
-// same cache dir so scanStaging uploads leftover blocks.
+// applyChunkCacheDir is JuiceFS `mount --cache-dir DIR`. UploadDelay stays 0
+// (JuiceFS default); fsync returns after local stage and the same goroutine
+// may PUT afterwards. fuse-crash-recovery remounts the same cache dir so
+// scanStaging uploads leftover blocks.
 func applyChunkCacheDir(conf *chunk.Config, cacheDir string) {
 	if cacheDir == "" || conf == nil {
 		return
 	}
 	conf.CacheDir = path.Join(cacheDir, "jfs")
-	conf.Writeback = true
 	conf.UploadDelay = 0
 	if conf.BufferSize < juiceWritebackBufferSize {
 		conf.BufferSize = juiceWritebackBufferSize
@@ -133,6 +137,21 @@ func quietJuiceFSLogs() {
 	utils.SetLogLevel(logrus.ErrorLevel)
 }
 
+// extentCacheRoot resolves the drive9-side cache root for the extent data
+// plane: the caller's mount-scoped directory, else drive9's user cache dir
+// (the same default the other drive9 caches use). JuiceFS writeback needs
+// local staging space, so the root is never left empty.
+func extentCacheRoot(configured string) string {
+	if configured != "" {
+		return configured
+	}
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "drive9")
+}
+
 func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	if cfg.Transport == nil {
 		return nil, fmt.Errorf("extent runtime: missing meta transport")
@@ -174,7 +193,12 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 		CacheFullBlock: true,
 		Writeback:      cfg.Writeback,
 	}
-	applyChunkCacheDir(&chunkConf, cfg.CacheDir)
+	if cfg.CacheDir != "" || cfg.Writeback {
+		// Writeback is never left without a cache root: an empty dir would
+		// make chunk.SelfCheck fall back to memory mode and silently drop
+		// writeback.
+		applyChunkCacheDir(&chunkConf, extentCacheRoot(cfg.CacheDir))
+	}
 	loaded := m.GetFormat()
 	chunkConf.SelfCheck(loaded.UUID)
 	store := chunk.NewCachedStore(cfg.Storage, chunkConf, nil)

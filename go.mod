@@ -346,7 +346,7 @@ replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/
 
 // JuiceFS fork with the drive9 HTTP meta engine (extend-v1.4 from v1.4.1).
 // Pin the GitHub commit; do not replace with a local path.
-replace github.com/juicedata/juicefs => github.com/mornyx/juicefs v1.4.2-0.20260909044158-3c217f26d815
+replace github.com/juicedata/juicefs => github.com/mornyx/juicefs v1.4.2-0.20260909083529-a53df2a9e0ac
 
 // JuiceFS compress/utils pull CGO libraries; keep drive9 CGO_ENABLED=0.
 replace github.com/DataDog/zstd => ./internal/jfsstub/zstd

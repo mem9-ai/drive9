@@ -1,6 +1,8 @@
 package extent
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -26,12 +28,9 @@ func TestJuiceMetaConfOpenCacheForHTTP(t *testing.T) {
 	}
 }
 
-func TestApplyChunkCacheDirWritebackNoUploadDelay(t *testing.T) {
+func TestApplyChunkCacheDirJfsSubdirNoUploadDelay(t *testing.T) {
 	conf := chunk.Config{BufferSize: 32 << 20, UploadDelay: time.Hour}
 	applyChunkCacheDir(&conf, "/mnt/cache")
-	if !conf.Writeback {
-		t.Fatal("cache-dir must enable JuiceFS writeback")
-	}
 	if !strings.HasSuffix(conf.CacheDir, "/jfs") {
 		t.Fatalf("CacheDir=%q, want .../jfs", conf.CacheDir)
 	}
@@ -84,6 +83,19 @@ func TestApplyChunkCacheDirEmptyIsNoop(t *testing.T) {
 	}
 }
 
+func TestExtentCacheRootDefaultsUnderDrive9UserCache(t *testing.T) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		t.Skipf("no user cache dir: %v", err)
+	}
+	if got, want := extentCacheRoot(""), filepath.Join(base, "drive9"); got != want {
+		t.Fatalf("extentCacheRoot(\"\")=%q, want %q", got, want)
+	}
+	if got := extentCacheRoot("/mnt/mount-hash"); got != "/mnt/mount-hash" {
+		t.Fatalf("configured cache root mutated: %q", got)
+	}
+}
+
 func TestApplyChunkCacheDirWritebackSurvivesSelfCheck(t *testing.T) {
 	conf := chunk.Config{
 		BlockSize:      4 << 20,
@@ -93,6 +105,9 @@ func TestApplyChunkCacheDirWritebackSurvivesSelfCheck(t *testing.T) {
 		MaxDownload:    200,
 		BufferSize:     32 << 20,
 		CacheFullBlock: true,
+		// NewRuntime passes RuntimeConfig.Writeback straight through; FUSE
+		// mounts pin it on.
+		Writeback: true,
 	}
 	applyChunkCacheDir(&conf, t.TempDir())
 	conf.SelfCheck("drive9-extent")

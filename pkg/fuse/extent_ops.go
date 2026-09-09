@@ -330,13 +330,6 @@ func (fs *Dat9FS) extentSetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn,
 	}
 	fs.fillAttr(entry, &out.Attr)
 	out.SetTimeout(extentAttrTimeout(entry))
-	if input.Valid&gofuse.FATTR_SIZE != 0 {
-		// JuiceFS fuse Open notifies when !KeepCache. After ftruncate of a
-		// MAP_SHARED WAL shm (crash01 _exit while other processes still
-		// mmap), leftover dirty pages past i_size make close() return EIO
-		// (SQLITE_IOERR_CLOSE) without a FUSE WRITE. Drop the kernel cache.
-		fs.notifyInode(input.NodeId)
-	}
 	return gofuse.OK
 }
 

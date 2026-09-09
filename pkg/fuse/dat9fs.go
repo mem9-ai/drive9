@@ -157,6 +157,11 @@ type Dat9FS struct {
 	appendLogMatcher           *AppendLogMatcher
 	appendLogSnapshotRoot      string
 	appendLogSnapshotSweepOnce sync.Once
+	// extentCacheDir is the mount-scoped cache root for the extent data plane.
+	// It lives under MountOptions.CacheDir (defaulting like the other drive9
+	// caches); JuiceFS keeps its chunk cache and writeback staging in the jfs/
+	// subdirectory, so writeback never depends on an explicit --cache-dir.
+	extentCacheDir string
 	// localOverlay stores local-only paths under MountOptions.LocalRoot.
 	localOverlay *LocalOverlay
 	// transientLocalOverlay stores mount-local runtime sidecars that must be
@@ -8361,7 +8366,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			return httpToFuseStatus(restoreErr)
 		}
 		if mtime, ok := input.GetMTime(); ok {
-			if err := overlay.Chtimes(entry.Path, mtime); err != nil {
+			if err := localOverlayChtimes(overlay, entry.Path, entry.Unlinked, mtime); err != nil {
 				return localErrToFuseStatus(err)
 			}
 			entry.Mtime = mtime

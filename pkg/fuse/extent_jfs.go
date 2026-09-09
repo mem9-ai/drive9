@@ -39,15 +39,19 @@ func (fs *Dat9FS) ensureExtentRuntime() error {
 	if err != nil {
 		return fmt.Errorf("extent storage: %w", err)
 	}
-	cacheDir := ""
-	if fs.opts != nil {
+	// The extent data plane always runs JuiceFS writeback: the cache root is
+	// mount-scoped under the drive9 cache dir (JuiceFS keeps chunks and
+	// staging in its jfs/ subdir), so writeback no longer depends on an
+	// explicit --cache-dir.
+	cacheDir := fs.extentCacheDir
+	if cacheDir == "" && fs.opts != nil {
 		cacheDir = fs.opts.CacheDir
 	}
 	rt, err := extent.NewRuntime(extent.RuntimeConfig{
 		CacheDir:  cacheDir,
 		Transport: extent.NewHTTPTransport(fs.client),
 		Storage:   store,
-		Writeback: cacheDir != "",
+		Writeback: true,
 	})
 	if err != nil {
 		return err
@@ -225,7 +229,16 @@ func (fs *Dat9FS) juiceParentIno(localDir string) (jfsmeta.Ino, bool) {
 		if e, ok := fs.inodes.GetEntry(1); ok && e.ExtentIno != 0 {
 			return jfsmeta.Ino(e.ExtentIno), true
 		}
-		return jfsmeta.RootInode, true
+		if fs.juiceMountRootIsTenantRoot() {
+			return jfsmeta.RootInode, true
+		}
+		// Subtree mount: the drive9 root is a directory inside the tenant
+		// JuiceFS tree, not the JuiceFS root. Answering RootInode here put
+		// every subtree mount's root-level entries at the tenant root, so
+		// identical relative names (e.g. fsx.bin) collided across mounts and
+		// one mount wrote into another mount's inode. Return false so the
+		// caller mirrors the remote path via extentEnsureParent.
+		return 0, false
 	}
 	for _, p := range []string{localDir, strings.TrimSuffix(localDir, "/") + "/", strings.TrimSuffix(localDir, "/")} {
 		if ino, ok := fs.inodes.GetInode(p); ok {
@@ -235,6 +248,16 @@ func (fs *Dat9FS) juiceParentIno(localDir string) (jfsmeta.Ino, bool) {
 		}
 	}
 	return 0, false
+}
+
+// juiceMountRootIsTenantRoot reports whether the drive9 mount root is the
+// tenant root (RemoteRoot "/"), where drive9 paths and JuiceFS paths are the
+// same tree.
+func (fs *Dat9FS) juiceMountRootIsTenantRoot() bool {
+	if fs == nil {
+		return true
+	}
+	return fs.remoteRoot() == "/"
 }
 
 func (fs *Dat9FS) extentEnsureParent(ctx vfs.LogContext, dirPath string) (jfsmeta.Ino, syscall.Errno) {
@@ -250,7 +273,13 @@ func (fs *Dat9FS) extentEnsureParent(ctx vfs.LogContext, dirPath string) (jfsmet
 		return jfsmeta.RootInode, 0
 	}
 	parent := jfsmeta.RootInode
-	fs.bindJuiceDirIno("/", jfsmeta.RootInode)
+	if fs.juiceMountRootIsTenantRoot() {
+		// Only a tenant-root mount maps drive9 "/" onto the JuiceFS root.
+		// A subtree mount must bind "/" to the mirrored remote root instead
+		// (done by the walk below); binding it to the JuiceFS root here made
+		// concurrent juiceParentIno("/") callers create at the tenant root.
+		fs.bindJuiceDirIno("/", jfsmeta.RootInode)
+	}
 	rel := strings.Trim(remoteDir, "/")
 	acc := ""
 	for _, part := range strings.Split(rel, "/") {
@@ -763,6 +792,17 @@ func (fs *Dat9FS) extentWrite(ctx vfs.LogContext, fh *FileHandle, off uint64, da
 	end := int64(off + uint64(len(data)))
 	if e, ok := fs.inodes.GetEntry(fh.Ino); ok && end > e.Size {
 		fs.inodes.UpdateSize(fh.Ino, end)
+	}
+	if writeFlags&gofuse.WRITE_CACHE != 0 {
+		// The kernel marks the page clean as soon as this writeback reply
+		// lands, so the slice must already be visible in meta when it does.
+		// Otherwise the kernel may reclaim the clean page and re-read it
+		// before the async commit arrives, caching zeros for data the app
+		// already wrote (JuiceFS hides this with a synchronous Meta.Write).
+		if st := v.Flush(ctx, fh.extentIno, fh.extentFh, 0); st != 0 {
+			fmt.Fprintf(os.Stderr, "drive9: extent writeback commit %s ino=%d off=%d err=%v\n", fh.Path, fh.extentIno, off, st)
+			return gofuse.Status(st)
+		}
 	}
 	return gofuse.OK
 }

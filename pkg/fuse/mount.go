@@ -439,6 +439,10 @@ func Mount(opts *MountOptions) (err error) {
 			mountHash = MountLayerHash(opts.Server, opts.MountPoint, opts.RemoteRoot, opts.LayerRef, opts.CheckpointRef)
 		}
 		dat9fs.appendLogSnapshotRoot = filepath.Join(cacheBase, mountHash, "append-log-snapshots")
+		// The extent data plane keeps its own JuiceFS chunk cache/writeback
+		// staging under the same mount-scoped root (jfs/ inside it), so extent
+		// mounts get writeback even when --cache-dir is not passed.
+		dat9fs.extentCacheDir = filepath.Join(cacheBase, mountHash)
 		readCacheHash := MountReadCacheHash(opts.Server, opts.MountPoint, opts.RemoteRoot, mountCredentialKind(opts), mountCredentialSecret(opts))
 		readCacheDir := filepath.Join(cacheBase, readCacheHash, "read")
 		diskReadCache, err := NewDiskReadCache(DiskReadCacheOptions{
