@@ -1700,12 +1700,13 @@ func TestReadStreamRangeFirstHopBoundedTransfer(t *testing.T) {
 	wal := bytes.Repeat([]byte("w"), walSize)
 	var wrote atomic.Int64
 	wroteDone := make(chan struct{})
+	var wroteOnce sync.Once
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer close(wroteDone)
 		if r.URL.Path != "/v1/fs/main.db-wal" {
 			http.NotFound(w, r)
 			return
 		}
+		defer wroteOnce.Do(func() { close(wroteDone) })
 		want := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
 		if got := r.Header.Get("Range"); got != want {
 			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
