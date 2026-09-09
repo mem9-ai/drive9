@@ -596,7 +596,7 @@ func TestCommitQueueLayerEntryShadowSpillUploadsObject(t *testing.T) {
 		ShadowSpill: true,
 		Mode:        0o640,
 		HasMode:     true,
-	}, "/remote/spill.bin", 7)
+	}, "/remote/spill.bin")
 	if err != nil {
 		t.Fatalf("uploadLayerEntry: %v", err)
 	}
@@ -1607,7 +1607,7 @@ func TestCommitQueueLayerUploadRejectsSizeMismatch(t *testing.T) {
 		Path: "/mismatch.bin",
 		Size: 99,
 		Kind: PendingNew,
-	}, "/mismatch.bin", 0)
+	}, "/mismatch.bin")
 	if err == nil || !strings.Contains(err.Error(), "size mismatch") {
 		t.Fatalf("uploadLayerEntry err=%v, want size mismatch", err)
 	}

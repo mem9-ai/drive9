@@ -3,8 +3,6 @@ package fuse
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -510,28 +508,6 @@ func (cq *CommitQueue) PendingStats() (count int, bytes int64) {
 		bytes += e.Size
 	}
 	return
-}
-
-// pathCommitLandmark is the last exact snapshot this queue itself landed for
-// a path. It is never persisted: after restart there is no safe causal proof
-// between mutable shadow bytes and recovered metadata.
-type pathCommitLandmark struct {
-	rev        int64
-	size       int64
-	resourceID string
-	checksum   string
-	snapshotID string
-	lastUsed   uint64
-}
-
-const maxLandedCommitLandmarks = 4096
-
-func (cq *CommitQueue) landedLimitLocked() int {
-	limit := maxLandedCommitLandmarks
-	if cq.maxPending > limit/2 && cq.maxPending <= int(^uint(0)>>1)/2 {
-		limit = 2 * cq.maxPending
-	}
-	return limit
 }
 
 type CommitQueueSnapshot struct {
@@ -1415,295 +1391,6 @@ func (cq *CommitQueue) canBeginInFlightLocked(entry *CommitEntry) bool {
 	return true
 }
 
-func payloadChecksum(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-
-func directParentPendingNew(old, newer *CommitEntry) bool {
-	if old == nil || newer == nil || old == newer || old.Path != newer.Path ||
-		old.Kind != PendingNew || newer.Kind != PendingNew ||
-		old.BaseRev != 0 || newer.BaseRev != 0 ||
-		!old.PayloadBaseRevSet || old.PayloadBaseRev != 0 ||
-		!newer.PayloadBaseRevSet || newer.PayloadBaseRev != 0 ||
-		!old.liveLineageProof || !newer.liveLineageProof ||
-		old.SnapshotID == "" || newer.SnapshotID == "" ||
-		newer.ParentSnapshotID != old.SnapshotID || old.payloadBound {
-		return false
-	}
-	if old.HasMode != newer.HasMode {
-		return false
-	}
-	return !old.HasMode || old.Mode == newer.Mode
-}
-
-func (cq *CommitQueue) reparentQueuedSnapshotLocked(entry *CommitEntry, oldParentID, newParentID string) bool {
-	if cq == nil || entry == nil || cq.index == nil || entry.PendingIndexGen == 0 {
-		return false
-	}
-	// Lineage is intentionally process-local: mutable ShadowStore bytes and
-	// their JSON metadata are not atomically replaced across a crash. Recovery
-	// therefore loses this proof and fails closed rather than trusting it.
-	ok, err := cq.index.ReparentSnapshotIfGeneration(entry.Path, entry.PendingIndexGen, entry.SnapshotID, oldParentID, newParentID)
-	if err != nil {
-		safeLogPrintf("commit queue: direct-parent compression failed for %s: %v", entry.Path, err)
-		return false
-	}
-	return ok
-}
-
-// coalesceDirectParentQueuedLocked replaces broad seq/size-based superseding.
-// A full child snapshot can safely skip an unlanded queued parent only when
-// its process-local ParentSnapshotID names that exact entry. The child is
-// reparented in generation-checked in-memory metadata before cancellation;
-// crash recovery intentionally loses the proof.
-func (cq *CommitQueue) coalesceDirectParentQueuedLocked(entry *CommitEntry) {
-	if cq == nil || entry == nil || entry.ParentSnapshotID == "" {
-		return
-	}
-	for _, queued := range cq.queue {
-		if !directParentPendingNew(queued, entry) || queued.canceled || cq.inFlight[queued.Path] == queued {
-			continue
-		}
-		oldParentID := entry.ParentSnapshotID
-		newParentID := queued.ParentSnapshotID
-		if !cq.reparentQueuedSnapshotLocked(entry, oldParentID, newParentID) {
-			return
-		}
-		entry.ParentSnapshotID = newParentID
-		queued.canceled = true
-		cq.stopDelayedLocked(queued)
-		if queued.cancelCommit != nil {
-			queued.cancelCommit()
-		}
-		if queued.cancelUpload != nil {
-			queued.cancelUpload()
-		}
-		remaining := cq.queue[:0]
-		for _, candidate := range cq.queue {
-			if candidate != queued {
-				remaining = append(remaining, candidate)
-			}
-		}
-		cq.queue = remaining
-		cq.rebuildQueuedIndexLocked()
-		safeLogPrintf("commit queue: coalesced exact queued parent for %s (snapshot %s -> child %s)", entry.Path, queued.SnapshotID, entry.SnapshotID)
-		return
-	}
-}
-
-func (cq *CommitQueue) checksumLandedPayload(entry *CommitEntry) string {
-	const maxHashBytes = 1 << 20
-	if entry == nil {
-		return ""
-	}
-	if entry.Size < 0 || entry.Size > maxHashBytes {
-		return ""
-	}
-	// Once upload has bound a payload, that private copy is the exact image
-	// accepted by the server. A newer same-path writer may already have
-	// replaced the active shadow generation before this success tail runs, so
-	// consulting the path-local shadow first would lose valid lineage proof.
-	if entry.payloadBound {
-		if int64(len(entry.payload)) != entry.Size {
-			return ""
-		}
-		return payloadChecksum(entry.payload)
-	}
-	if cq == nil || cq.shadows == nil || entry.ShadowGen == 0 {
-		return ""
-	}
-	data, err := cq.shadows.ReadAllIfGeneration(entry.Path, entry.ShadowGen)
-	if err != nil || int64(len(data)) != entry.Size {
-		return ""
-	}
-	return payloadChecksum(data)
-}
-
-// pruneLandedLocked bounds process-local lineage metadata. Evicting an
-// unreferenced landmark can only make a future growth attempt fail closed;
-// landmarks needed by already queued or in-flight direct children are kept.
-func (cq *CommitQueue) pruneLandedLocked() {
-	for len(cq.landed) > cq.landedLimitLocked() {
-		type lineageRef struct {
-			path     string
-			parentID string
-		}
-		referenced := make(map[lineageRef]struct{}, len(cq.queue)+len(cq.inFlight)+len(cq.immediate))
-		rememberReference := func(entry *CommitEntry) {
-			if entry != nil && !entry.canceled && entry.Path != "" && entry.ParentSnapshotID != "" {
-				referenced[lineageRef{path: entry.Path, parentID: entry.ParentSnapshotID}] = struct{}{}
-			}
-		}
-		for _, entry := range cq.queue {
-			rememberReference(entry)
-		}
-		for _, entry := range cq.inFlight {
-			rememberReference(entry)
-		}
-		for entry := range cq.immediate {
-			rememberReference(entry)
-		}
-		oldestPath := ""
-		oldestClock := ^uint64(0)
-		for path, landmark := range cq.landed {
-			if _, ok := referenced[lineageRef{path: path, parentID: landmark.snapshotID}]; ok {
-				continue
-			}
-			if landmark.lastUsed < oldestClock {
-				oldestPath = path
-				oldestClock = landmark.lastUsed
-			}
-		}
-		if oldestPath == "" {
-			return
-		}
-		delete(cq.landed, oldestPath)
-	}
-}
-
-func (cq *CommitQueue) rememberLanded(path string, rev, size int64, resourceID, checksum, snapshotID string) {
-	if cq == nil || path == "" || rev <= 0 {
-		return
-	}
-	cq.mu.Lock()
-	if cq.landed == nil {
-		cq.landed = make(map[string]pathCommitLandmark)
-	}
-	// Without both causal lineage and a verifiable remote identity this commit
-	// cannot authorize a rebase. It still supersedes any older landmark for the
-	// path, so invalidate that proof instead of leaving stale metadata behind.
-	if snapshotID == "" || (resourceID == "" && checksum == "") {
-		delete(cq.landed, path)
-		cq.pruneLandedLocked()
-		cq.mu.Unlock()
-		return
-	}
-	// Same-path queue commits are serialized. Always replace the prior proof:
-	// delete/recreate can legitimately reset the server revision, so numeric
-	// ordering alone must not retain a landmark from the old incarnation.
-	cq.landedClock++
-	cq.landed[path] = pathCommitLandmark{rev: rev, size: size, resourceID: resourceID, checksum: checksum, snapshotID: snapshotID, lastUsed: cq.landedClock}
-	cq.pruneLandedLocked()
-	cq.mu.Unlock()
-}
-
-func (cq *CommitQueue) landedCommit(path string) pathCommitLandmark {
-	if cq == nil {
-		return pathCommitLandmark{}
-	}
-	cq.mu.Lock()
-	defer cq.mu.Unlock()
-	landmark := cq.landed[path]
-	if landmark.snapshotID != "" {
-		cq.landedClock++
-		landmark.lastUsed = cq.landedClock
-		cq.landed[path] = landmark
-	}
-	return landmark
-}
-
-// maybeRebaseGrownPayloadOntoWatermark detects issue #896: a later same-path
-// mutation grew the file after this queue already landed a smaller snapshot.
-// Those bytes are newer than the watermark, so CAS should overwrite that
-// revision instead of being fenced as a stale #876 checkpoint snapshot.
-func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(ctx context.Context, entry *CommitEntry, watermark int64) bool {
-	if cq == nil || entry == nil || watermark <= 0 {
-		return false
-	}
-	payloadBase := entry.payloadBaseRevision()
-	if payloadBase >= watermark {
-		return false
-	}
-	landed := cq.landedCommit(entry.Path)
-	if landed.rev != watermark || !entryCanRebaseOntoLandedParent(entry, landed) {
-		return false
-	}
-	rev, size, resourceID, body, ok := cq.readRemoteSnapshot(ctx, entry.Path)
-	if !ok {
-		return false
-	}
-	return cq.maybeRebaseGrownPayloadAgainstRemote(entry, rev, size, resourceID, body)
-}
-
-func (cq *CommitQueue) readRemoteSnapshot(parent context.Context, path string) (rev, size int64, resourceID string, body []byte, ok bool) {
-	if cq == nil || cq.client == nil || path == "" {
-		return 0, 0, "", nil, false
-	}
-	if parent == nil {
-		parent = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-	defer cancel()
-	apiPath := cq.remotePath(path)
-	st, err := cq.client.StatCtx(ctx, apiPath)
-	if err != nil || st == nil {
-		return 0, 0, "", nil, false
-	}
-	rev, size, resourceID = st.Revision, st.Size, st.ResourceID
-	if st.Size < 0 || st.Size > 1<<20 {
-		return rev, size, resourceID, nil, resourceID != ""
-	}
-	body, err = cq.client.ReadCtx(ctx, apiPath)
-	if err != nil {
-		return rev, size, resourceID, nil, resourceID != ""
-	}
-	return rev, size, resourceID, body, true
-}
-
-func landedIdentityMatches(proof pathCommitLandmark, serverRev, serverSize int64, serverResourceID string, serverBody []byte) bool {
-	if proof.rev != serverRev || proof.size != serverSize {
-		return false
-	}
-	if proof.resourceID != "" && serverResourceID != "" {
-		return proof.resourceID == serverResourceID
-	}
-	if proof.checksum == "" || int64(len(serverBody)) != proof.size {
-		return false
-	}
-	return payloadChecksum(serverBody) == proof.checksum
-}
-
-// maybeRebaseGrownPayloadAgainstRemote authorizes the #896 growth rebase only
-// when the remote image still matches the in-memory landed parent (resource ID
-// when both sides have it, otherwise SHA-256 for a small payload).
-func (cq *CommitQueue) maybeRebaseGrownPayloadAgainstRemote(entry *CommitEntry, serverRev, serverSize int64, serverResourceID string, serverBody []byte) bool {
-	proof := cq.landedCommit(entry.Path)
-	if !entryCanRebaseOntoLandedParent(entry, proof) || !landedIdentityMatches(proof, serverRev, serverSize, serverResourceID, serverBody) {
-		return false
-	}
-	return cq.authorizeGrownPayloadRebase(entry, proof)
-}
-
-func entryCanRebaseOntoLandedParent(entry *CommitEntry, proof pathCommitLandmark) bool {
-	if entry == nil || entry.Kind != PendingNew || entry.BaseRev != 0 ||
-		!entry.PayloadBaseRevSet || entry.PayloadBaseRev != 0 ||
-		!entry.liveLineageProof || entry.SnapshotID == "" ||
-		entry.ParentSnapshotID == "" || proof.snapshotID == "" {
-		return false
-	}
-	if entry.recovered {
-		return false
-	}
-	return entry.ParentSnapshotID == proof.snapshotID
-}
-
-func (cq *CommitQueue) authorizeGrownPayloadRebase(entry *CommitEntry, proof pathCommitLandmark) bool {
-	if cq == nil || !entryCanRebaseOntoLandedParent(entry, proof) || proof.rev <= 0 || entry.Size <= proof.size {
-		return false
-	}
-	entry.BaseRev = proof.rev
-	entry.Kind = PendingOverwrite
-	if entry.DurableWatermarkRev < proof.rev {
-		entry.DurableWatermarkRev = proof.rev
-	}
-	entry.DisableAutoResolveLWW = true
-	entry.growthRebaseRev = proof.rev
-	entry.growthRebaseParentSnapshotID = entry.ParentSnapshotID
-	safeLogPrintf("commit queue: rebasing direct-child grown payload for %s onto rev %d (size %d -> %d)", entry.Path, proof.rev, proof.size, entry.Size)
-	return true
-}
-
 func (cq *CommitQueue) oldestQueuedForPathLocked(path string) *CommitEntry {
 	if cq == nil || path == "" {
 		return nil
@@ -2489,7 +2176,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	layerRef := cq.layerRefSnapshot()
 	apiPath := cq.remotePath(entry.Path)
 	if layerRef != "" {
-		return cq.uploadLayerEntry(ctx, layerRef, entry, apiPath, entry.BaseRev)
+		return cq.uploadLayerEntry(ctx, layerRef, entry, apiPath)
 	}
 	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return 0, err
@@ -2505,7 +2192,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	// multi-GiB files into memory. Uses io.SectionReader over the shadow fd.
 	if entry.ShadowSpill {
 		start := time.Now()
-		committedRev, err := uploadFromShadowRemoteWithRevisionAndGeneration(ctx, cq.client, cq.shadows, entry.Path, apiPath, expectedRevision, entry.ShadowGen)
+		committedRev, err := cq.uploadShadowSpill(ctx, entry, expectedRevision)
 		if cq.perf != nil {
 			var bytes uint64
 			if entry.Size > 0 {
@@ -2549,10 +2236,13 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	return 0, err
 }
 
-func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string, expectedRevision int64) (int64, error) {
+func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string) (int64, error) {
 	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return 0, err
 	}
+	// Read the main-namespace claim only after validation. Overlay upserts
+	// themselves do not advance main revisions or produce landed proofs.
+	expectedRevision := entry.BaseRev
 	if entry.Size > maxInlineLayerEntryBytes || entry.ShadowSpill {
 		fd, actualSize, release, err := cq.shadows.OpenIfGeneration(entry.Path, entry.ShadowGen)
 		if err != nil {
@@ -2671,7 +2361,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	if layerRef == "" {
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	}
-	cq.rememberLanded(entry.Path, committedRev, entry.Size, "", cq.checksumLandedPayload(entry), entry.SnapshotID)
+	cq.rememberLanded(entry.Path, committedRev, entry.Size, cq.checksumLandedPayload(entry), entry.SnapshotID)
 	if cq.OnUploaded != nil {
 		cq.OnUploaded(entry, committedRev)
 	}
@@ -2774,7 +2464,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 		return
 	}
 	// Bail early if the file was deleted locally while queued.
-	if cq.isEntryCanceled(entry) {
+	if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 		cq.removeFromQueue(entry)
 		safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled)", entry.Path)
 		return
@@ -2785,7 +2475,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	// check nor LWW can be trusted. Keep layer conflicts terminal.
 	if cq.layerRefSnapshot() != "" {
 		safeLogPrintf("commit queue: auto-resolve unsupported for layer mount, terminal failure for %s", entry.Path)
-		cq.onCommitTerminalFailure(entry, nil)
+		cq.finishResolveFailure(entryCtx, entry, nil)
 		return
 	}
 
@@ -2799,7 +2489,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	}
 
 	if cq.shadows == nil {
-		cq.onCommitTerminalFailure(entry, nil)
+		cq.finishResolveFailure(entryCtx, entry, nil)
 		return
 	}
 
@@ -2808,25 +2498,25 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	if err != nil {
 		// Shadow may have been removed by a concurrent CancelPath/CancelPrefix
 		// (Unlink/Rmdir). Treat as canceled rather than a true conflict.
-		if cq.isEntryCanceled(entry) {
+		if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 			cq.removeFromQueue(entry)
 			safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled mid-read)", entry.Path)
 			return
 		}
 		if errors.Is(err, errCommitPayloadStale) {
 			safeLogPrintf("commit queue: auto-resolve rejected stale payload for %s: %v", entry.Path, err)
-			cq.onCommitTerminalFailure(entry, err)
+			cq.finishResolveFailure(entryCtx, entry, err)
 			return
 		}
 		safeLogPrintf("commit queue: auto-resolve failed for %s: read shadow: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry, err)
+		cq.finishResolveFailure(entryCtx, entry, err)
 		return
 	}
 	apiPath := cq.remotePath(entry.Path)
 
 	// Fetch server's current state: revision + content.
 	// Use per-RPC timeouts so that a slow Read doesn't starve the Upload budget.
-	statCtx, statCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	statCtx, statCancel := context.WithTimeout(entryCtx, 10*time.Second)
 	statStart := time.Now()
 	stat, err := cq.client.StatCtx(statCtx, apiPath)
 	statCancel()
@@ -2840,7 +2530,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 			// client), not content — or the file was deleted remotely, in
 			// which case LWW means the local write wins anyway. Retry once
 			// as a create; terminal only if the retry also fails.
-			if cq.isEntryCanceled(entry) {
+			if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 				cq.removeFromQueue(entry)
 				safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled before create retry)", entry.Path)
 				return
@@ -2864,14 +2554,14 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 			if cq.perf != nil {
 				cq.perf.recordRemoteOp(perfRemoteWrite, uploadErr, time.Since(uploadStart), uint64(len(localData)))
 			}
-			if cq.isEntryCanceled(entry) {
+			if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 				cq.removeFromQueue(entry)
 				safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled during create retry upload)", entry.Path)
 				return
 			}
 			if uploadErr != nil {
 				safeLogPrintf("commit queue: create retry failed for %s: %v", entry.Path, uploadErr)
-				cq.onCommitTerminalFailure(entry, uploadErr)
+				cq.finishResolveFailure(entryCtx, entry, uploadErr)
 				return
 			}
 			safeLogPrintf("commit queue: auto-resolved conflict for %s via create retry (no remote file)", entry.Path)
@@ -2881,12 +2571,12 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 			return
 		}
 		safeLogPrintf("commit queue: auto-resolve failed for %s: stat: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry, err)
+		cq.finishResolveFailure(entryCtx, entry, err)
 		return
 	}
 	serverRev := stat.Revision
 
-	readCtx, readCancel := context.WithTimeout(context.Background(), uploadTimeout)
+	readCtx, readCancel := context.WithTimeout(entryCtx, uploadTimeout)
 	readStart := time.Now()
 	serverData, err := cq.client.ReadCtx(readCtx, apiPath)
 	readCancel()
@@ -2895,84 +2585,46 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	}
 	if err != nil {
 		safeLogPrintf("commit queue: auto-resolve failed for %s: read server: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry, err)
+		cq.finishResolveFailure(entryCtx, entry, err)
 		return
 	}
-	if cq.maybeRebaseGrownPayloadAgainstRemote(entry, serverRev, stat.Size, stat.ResourceID, serverData) {
-		if cq.discardSupersededEntry(entry) {
-			return
-		}
-		if cq.isEntryCanceled(entry) {
-			cq.removeFromQueue(entry)
-			return
-		}
-		uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(int64(len(localData))))
-		if !ok {
-			cq.removeFromQueue(entry)
-			return
-		}
-		uploadStart := time.Now()
-		var committedRev int64
-		var uploadErr error
-		threshold := cq.directPutThreshold()
-		if len(localData) == 0 || (threshold > 0 && int64(len(localData)) < threshold) {
-			committedRev, uploadErr = cq.client.WriteCtxConditionalWithRevision(uploadCtx, apiPath, localData, entry.BaseRev)
-		} else {
-			uploadErr = uploadBufferedRemoteFile(uploadCtx, cq.client, apiPath, localData, entry.BaseRev)
-		}
-		uploadCancel()
-		if cq.perf != nil {
-			cq.perf.recordRemoteOp(perfRemoteWrite, uploadErr, time.Since(uploadStart), uint64(len(localData)))
-		}
-		if cq.isEntryCanceled(entry) {
-			cq.removeFromQueue(entry)
-			return
-		}
-		if uploadErr != nil {
-			safeLogPrintf("commit queue: grown-payload overwrite failed for %s: %v", entry.Path, uploadErr)
-			cq.onCommitTerminalFailure(entry, uploadErr)
-			return
-		}
-		if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err != nil {
-			cq.onCommitPostUploadFailure(entry, err)
-		}
+	if cq.maybeRebaseGrownPayloadAgainstRemote(entry, serverRev, stat.Size, serverData) {
+		cq.commitGrownPayload(entryCtx, entry)
 		return
 	}
 
 	// Branch 1: idempotent — content already matches server.
 	if bytes.Equal(localData, serverData) {
 		safeLogPrintf("commit queue: auto-resolved conflict for %s (idempotent, content matches server rev %d)", entry.Path, serverRev)
-		if err := cq.onCommitSuccess(entry, serverRev, serverRev); err != nil {
-			cq.onCommitPostUploadFailure(entry, err)
-		}
+		cq.finishIdempotentCommit(entryCtx, entry, serverRev)
 		return
 	}
 
 	// Branch 2: LWW — re-upload local shadow with new base revision.
 	if entry.DisableAutoResolveLWW {
 		safeLogPrintf("commit queue: fenced conflict for %s will not LWW-rebase payload from base rev %d onto server rev %d", entry.Path, entry.payloadBaseRevision(), serverRev)
-		cq.onCommitTerminalFailure(entry, nil)
+		cq.finishResolveFailure(entryCtx, entry, nil)
 		return
 	}
 	if entry.PayloadBaseRevSet && entry.payloadBaseRevision() < serverRev {
 		safeLogPrintf("commit queue: refusing LWW rebase for %s: payload base rev %d is older than server rev %d", entry.Path, entry.payloadBaseRevision(), serverRev)
-		cq.onCommitTerminalFailure(entry, nil)
+		cq.finishResolveFailure(entryCtx, entry, nil)
 		return
 	}
 	if err := cq.validateEntryPayloadFreshCtx(entryCtx, entry); err != nil {
-		if cq.isEntryCanceled(entry) {
+		if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 			cq.removeFromQueue(entry)
 			return
 		}
 		safeLogPrintf("commit queue: auto-resolve rejected stale payload for %s before LWW: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry, err)
+		cq.finishResolveFailure(entryCtx, entry, err)
 		return
 	}
 	if cq.discardSupersededEntry(entry) {
 		return
 	}
 	// Re-check cancelation before the potentially expensive upload.
-	if cq.isEntryCanceled(entry) {
+	if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 		cq.removeFromQueue(entry)
 		safeLogPrintf("commit queue: auto-resolve aborted for %s before LWW upload (canceled)", entry.Path)
 		return
@@ -2992,10 +2644,10 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	}
 	if err != nil {
 		safeLogPrintf("commit queue: auto-resolve LWW re-upload failed for %s: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry, err)
+		cq.finishResolveFailure(entryCtx, entry, err)
 		return
 	}
-	if cq.isEntryCanceled(entry) {
+	if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 		cq.removeFromQueue(entry)
 		safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled during LWW upload)", entry.Path)
 		return
@@ -3018,21 +2670,21 @@ const shadowSpillCompareChunk = 8 << 20
 // LWW re-upload is intentionally not attempted for large files.
 func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context, entry *CommitEntry) {
 	if cq.shadows == nil || cq.client == nil {
-		cq.onCommitTerminalFailure(entry, nil)
+		cq.finishResolveFailure(entryCtx, entry, nil)
 		return
 	}
 	if err := cq.validateEntryPayloadFreshCtx(entryCtx, entry); err != nil {
-		if cq.isEntryCanceled(entry) {
+		if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 			cq.removeFromQueue(entry)
 			return
 		}
 		safeLogPrintf("commit queue: ShadowSpill stale payload rejected for %s: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry, err)
+		cq.finishResolveFailure(entryCtx, entry, err)
 		return
 	}
 	apiPath := cq.remotePath(entry.Path)
 
-	statCtx, statCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	statCtx, statCancel := context.WithTimeout(entryCtx, 10*time.Second)
 	statStart := time.Now()
 	stat, err := cq.client.StatCtx(statCtx, apiPath)
 	statCancel()
@@ -3046,7 +2698,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 			// client mid-multipart — exactly the crash-recovery window),
 			// not content. Retry once as a create; terminal only if the
 			// retry also fails.
-			if cq.isEntryCanceled(entry) {
+			if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 				cq.removeFromQueue(entry)
 				safeLogPrintf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled before create retry)", entry.Path)
 				return
@@ -3059,7 +2711,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 				return
 			}
 			uploadStart := time.Now()
-			committedRev, uploadErr := uploadFromShadowRemoteWithRevisionAndGeneration(uploadCtx, cq.client, cq.shadows, entry.Path, apiPath, 0, entry.ShadowGen)
+			committedRev, uploadErr := cq.uploadShadowSpill(uploadCtx, entry, 0)
 			uploadCancel()
 			if cq.perf != nil {
 				var bytes uint64
@@ -3068,14 +2720,14 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 				}
 				cq.perf.recordRemoteOp(perfRemoteWrite, uploadErr, time.Since(uploadStart), bytes)
 			}
-			if cq.isEntryCanceled(entry) {
+			if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 				cq.removeFromQueue(entry)
 				safeLogPrintf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled during create retry upload)", entry.Path)
 				return
 			}
 			if uploadErr != nil {
 				safeLogPrintf("commit queue: ShadowSpill create retry failed for %s: %v", entry.Path, uploadErr)
-				cq.onCommitTerminalFailure(entry, uploadErr)
+				cq.finishResolveFailure(entryCtx, entry, uploadErr)
 				return
 			}
 			safeLogPrintf("commit queue: auto-resolved ShadowSpill conflict for %s via create retry (no remote file)", entry.Path)
@@ -3085,14 +2737,14 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 			return
 		}
 		safeLogPrintf("commit queue: ShadowSpill auto-resolve failed for %s: stat: %v", entry.Path, err)
-		cq.onCommitTerminalFailure(entry, err)
+		cq.finishResolveFailure(entryCtx, entry, err)
 		return
 	}
 
 	fd, localSize, release, err := cq.shadows.OpenIfGeneration(entry.Path, entry.ShadowGen)
 	if err != nil {
 		// Shadow gone — likely canceled by a concurrent Unlink/Rmdir.
-		if cq.isEntryCanceled(entry) {
+		if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 			cq.removeFromQueue(entry)
 			safeLogPrintf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled)", entry.Path)
 			return
@@ -3102,7 +2754,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		} else {
 			safeLogPrintf("commit queue: ShadowSpill auto-resolve failed for %s: open shadow: %v", entry.Path, err)
 		}
-		cq.onCommitTerminalFailure(entry, err)
+		cq.finishResolveFailure(entryCtx, entry, err)
 		return
 	}
 	defer func() {
@@ -3114,53 +2766,24 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		}
 	}()
 	if stat.Size != localSize {
-		var remoteBody []byte
-		if localSize > stat.Size && stat.Size >= 0 && stat.Size <= 1<<20 {
-			readCtx, readCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			remoteBody, _ = cq.client.ReadCtx(readCtx, apiPath)
-			readCancel()
-		}
-		if localSize > stat.Size && cq.maybeRebaseGrownPayloadAgainstRemote(entry, stat.Revision, stat.Size, stat.ResourceID, remoteBody) {
-			safeLogPrintf("commit queue: ShadowSpill growth overwrite for %s (local %d bytes vs server %d bytes at rev %d)", entry.Path, localSize, stat.Size, stat.Revision)
-			if fd != nil {
+		if localSize > stat.Size && stat.Size >= 0 && stat.Size <= maxLandedPayloadBytes {
+			// Reuse the bounded, caller-cancelable identity read. A failed read
+			// is not permission to overwrite, nor evidence of a genuine conflict.
+			rev, size, body, readErr := cq.readRemoteSnapshot(entryCtx, entry.Path)
+			if readErr != nil {
+				cq.finishResolveFailure(entryCtx, entry, readErr)
+				return
+			}
+			if cq.maybeRebaseGrownPayloadAgainstRemote(entry, rev, size, body) {
 				_ = fd.Close()
 				fd = nil
-			}
-			if release != nil {
 				release()
 				release = nil
-			}
-			uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(entry.Size))
-			if !ok {
-				cq.removeFromQueue(entry)
+				cq.commitGrownPayload(entryCtx, entry)
 				return
 			}
-			uploadStart := time.Now()
-			committedRev, uploadErr := uploadFromShadowRemoteWithRevisionAndGeneration(uploadCtx, cq.client, cq.shadows, entry.Path, apiPath, entry.BaseRev, entry.ShadowGen)
-			uploadCancel()
-			if cq.perf != nil {
-				var bytes uint64
-				if entry.Size > 0 {
-					bytes = uint64(entry.Size)
-				}
-				cq.perf.recordRemoteOp(perfRemoteWrite, uploadErr, time.Since(uploadStart), bytes)
-			}
-			if cq.isEntryCanceled(entry) {
-				cq.removeFromQueue(entry)
-				return
-			}
-			if uploadErr != nil {
-				safeLogPrintf("commit queue: ShadowSpill growth overwrite failed for %s: %v", entry.Path, uploadErr)
-				cq.onCommitTerminalFailure(entry, uploadErr)
-				return
-			}
-			if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err != nil {
-				cq.onCommitPostUploadFailure(entry, err)
-			}
-			return
 		}
-		safeLogPrintf("commit queue: ShadowSpill conflict for %s is genuine (local %d bytes vs server %d bytes), terminal failure", entry.Path, localSize, stat.Size)
-		cq.onCommitTerminalFailure(entry, nil)
+		cq.finishResolveFailure(entryCtx, entry, nil)
 		return
 	}
 
@@ -3168,7 +2791,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 	for off := int64(0); off < localSize; off += shadowSpillCompareChunk {
 		// Chunk-boundary cancel check bounds wasted work on multi-GiB
 		// compares when the file is unlinked mid-resolve.
-		if cq.isEntryCanceled(entry) {
+		if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 			cq.removeFromQueue(entry)
 			safeLogPrintf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled mid-compare)", entry.Path)
 			return
@@ -3177,7 +2800,7 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		if off+n > localSize {
 			n = localSize - off
 		}
-		readCtx, readCancel := context.WithTimeout(context.Background(), uploadTimeout)
+		readCtx, readCancel := context.WithTimeout(entryCtx, uploadTimeout)
 		readStart := time.Now()
 		serverChunk, err := cq.client.ReadAtCtx(readCtx, apiPath, off, n)
 		readCancel()
@@ -3186,23 +2809,23 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 		}
 		if err != nil {
 			safeLogPrintf("commit queue: ShadowSpill auto-resolve failed for %s: read server @%d: %v", entry.Path, off, err)
-			cq.onCommitTerminalFailure(entry, err)
+			cq.finishResolveFailure(entryCtx, entry, err)
 			return
 		}
 		ln, err := fd.ReadAt(buf[:n], off)
 		if err != nil || int64(ln) != n {
-			if cq.isEntryCanceled(entry) {
+			if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 				cq.removeFromQueue(entry)
 				safeLogPrintf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled mid-read)", entry.Path)
 				return
 			}
 			safeLogPrintf("commit queue: ShadowSpill auto-resolve failed for %s: read shadow @%d: n=%d err=%v", entry.Path, off, ln, err)
-			cq.onCommitTerminalFailure(entry, err)
+			cq.finishResolveFailure(entryCtx, entry, err)
 			return
 		}
 		if int64(len(serverChunk)) != n || !bytes.Equal(serverChunk, buf[:n]) {
 			safeLogPrintf("commit queue: ShadowSpill conflict for %s is genuine (content differs @%d), terminal failure", entry.Path, off)
-			cq.onCommitTerminalFailure(entry, nil)
+			cq.finishResolveFailure(entryCtx, entry, nil)
 			return
 		}
 	}
@@ -3214,7 +2837,17 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context,
 	fd = nil
 	release()
 	release = nil
-	if err := cq.onCommitSuccess(entry, stat.Revision, stat.Revision); err != nil {
+	cq.finishIdempotentCommit(entryCtx, entry, stat.Revision)
+}
+
+// finishIdempotentCommit runs only after a successful equality read. Cancellation
+// may have happened after that read returned, so recheck before removing staging.
+func (cq *CommitQueue) finishIdempotentCommit(ctx context.Context, entry *CommitEntry, rev int64) {
+	if cq.isEntryCanceled(entry) || ctx.Err() != nil {
+		cq.removeFromQueue(entry)
+		return
+	}
+	if err := cq.onCommitSuccess(entry, rev, rev); err != nil {
 		cq.onCommitPostUploadFailure(entry, err)
 	}
 }
