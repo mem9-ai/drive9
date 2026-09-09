@@ -334,7 +334,7 @@ func runFS(args []string) {
 	rest := args[1:]
 
 	// Only commands that may upload pay the /v1/status warm RTT. Read-only
-	// commands (cat/ls/stat/rm/grep/find) and namespace-only writes (mv,
+	// commands (cat/ls/stat/tasks/rm/grep/find) and namespace-only writes (mv,
 	// mkdir) do not consult the upload threshold and can skip the warm —
 	// keeps cold-start latency unchanged for the common case and avoids
 	// hanging an `ls` behind a slow status endpoint.
@@ -356,6 +356,8 @@ func runFS(args []string) {
 		err = cli.Ls(c, rest)
 	case "stat":
 		err = cli.Stat(c, rest)
+	case "tasks":
+		err = cli.Tasks(c, rest)
 	case "mv":
 		err = cli.Mv(c, rest)
 	case "rm":
@@ -498,6 +500,8 @@ commands:
   ls [-l] [path]      list directory
   stat [-o text|json] <path>
                        file metadata
+  tasks [-o text|json] <path>
+                       extract/embed task status for a file
   mv <old> <new>      rename/move
   mkdir <path>        create directory (parents auto-created)
   chmod <mode> <path>  change file permissions (octal, e.g. 644)

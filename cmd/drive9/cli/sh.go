@@ -14,7 +14,7 @@ import (
 //
 //	drive9 fs sh
 //
-// The shell supports: cd, pwd, ls, cat, cp, mv, rm, stat, help, exit.
+// The shell supports: cd, pwd, ls, cat, cp, mv, rm, stat, tasks, help, exit.
 // Paths are resolved relative to the current working directory.
 func Sh(c *client.Client, _ []string) error {
 	cwd := "/"
@@ -129,6 +129,15 @@ func Sh(c *client.Client, _ []string) error {
 				fmt.Fprintf(os.Stderr, "stat: %v\n", err)
 			}
 
+		case "tasks":
+			if len(args) != 1 {
+				fmt.Fprintln(os.Stderr, "usage: tasks <path>")
+				continue
+			}
+			if err := Tasks(c, []string{resolve(cwd, args[0])}); err != nil {
+				fmt.Fprintf(os.Stderr, "tasks: %v\n", err)
+			}
+
 		case "mkdir":
 			if len(args) != 1 {
 				fmt.Fprintln(os.Stderr, "usage: mkdir <path>")
@@ -210,6 +219,7 @@ func shHelp() {
   rm [-r|--recursive] <path>  remove
   mkdir <path>    create directory (parents auto-created)
   stat <path>     file metadata
+  tasks <path>    extract/embed task status
   help            this help
   exit            quit shell`)
 }

@@ -87,6 +87,7 @@ drive9 fs cat :/path/to/file               # print content to stdout
 drive9 fs ls :/                            # list root
 drive9 fs ls :/path/                       # list subdirectory
 drive9 fs stat :/path/to/file              # metadata (size, type, mtime)
+drive9 fs tasks :/path/to/file             # extract/embed task status
 
 # move / remove
 drive9 fs mv :/old.txt :/new.txt
@@ -152,6 +153,15 @@ Output: one path per line. Empty output means no matches.
 
 Use `grep` to find files by what they contain. Use `find` to find files by name, date, tag, or size.
 
+### Extract/embed task status
+
+`drive9 fs tasks <path>` reports the extract/embed pipeline state for a file's current revision: one entry per applicable task type (`embed`, `img_extract_text`, `audio_extract_text`, `video_extract_visual`). Status is one of `queued`, `processing`, `succeeded`, or `failed`; a failed task includes a bounded `last_error` reason.
+
+```bash
+drive9 fs tasks :/docs/report.pdf
+drive9 fs tasks -o json :/docs/report.pdf
+```
+
 ### Output formats
 
 | Command | Output |
@@ -160,6 +170,7 @@ Use `grep` to find files by what they contain. Use `find` to find files by name,
 | `fs ls -l` | tab-separated: `type  size  name` (type: `d` or `-`) |
 | `fs cat` | raw file content to stdout |
 | `fs stat` | key-value metadata; use `-o json` for JSON |
+| `fs tasks` | tab-separated: `task_type  status  last_error`; use `-o json` for JSON |
 | `fs grep` | tab-separated: `path  score` per match |
 | `fs find` | one path per line |
 
