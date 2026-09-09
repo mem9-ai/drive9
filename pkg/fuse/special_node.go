@@ -68,20 +68,6 @@ func (fs *Dat9FS) removeSpecialNode(p string) {
 	delete(fs.specialByPath, p)
 }
 
-func (fs *Dat9FS) renameSpecialNode(oldP, newP string) bool {
-	fs.specialMu.Lock()
-	defer fs.specialMu.Unlock()
-
-	ino, ok := fs.specialByPath[oldP]
-	if !ok {
-		return false
-	}
-	delete(fs.specialByPath, oldP)
-	delete(fs.specialByPath, newP)
-	fs.specialByPath[newP] = ino
-	return true
-}
-
 func (fs *Dat9FS) renameSpecialNodeSubtree(oldP, newP string) {
 	if fs == nil || oldP == newP {
 		return

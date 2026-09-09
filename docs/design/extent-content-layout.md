@@ -273,6 +273,8 @@ Dat9FS (drive9 frontend: namespace, dir cache, write-back, layers, git workspace
 | `Flock` / `Setlk` / `Getlk` | JuiceFS meta locks on the extent inode (SQLite needs them on the inode, not on a path) |
 | `Release` | releases the VFS handle; unlinked-but-open files are released only after the last close |
 
+Routing an existing path never costs an extra RPC on a mount that did not opt into extent. A mount with no `--extent` glob (and no initialised extent runtime) takes the layout from whatever the server already returned — `X-Dat9-Content-Layout` / `X-Dat9-Extent-Ino` on a stat or lookup reply — and otherwise treats the path as non-extent. Only a mount that opted in (`--extent`, the `extent` profile, or an already-initialised runtime) may probe for a JuiceFS inode it has not seen yet. Without that split, every `GetAttr` would pay a data-credential request plus a JuiceFS lookup and every `Open`/`Unlink`/`Rename`/`SetAttr` a stat HEAD on ordinary mounts, which breaks the standard path's remote-call budget that `--durability` and the perf gates are defined against.
+
 ## 4.4 Length and attribute contract
 
 JuiceFS distinguishes the *meta* length (`GetAttr`) from the *writer* length (dirty data not yet flushed). The graft keeps both correct:
