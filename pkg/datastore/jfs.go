@@ -1098,6 +1098,13 @@ func (s *Store) insertExtentProjectionTx(tx *sql.Tx, path string, extentIno uint
 		s.scope.Args(inodeID, StorageExtent, string(ContentLayoutExtent))...); err != nil {
 		return fmt.Errorf("insert extent contents: %w", err)
 	}
+	// Keep the split-table invariant the standard create path has
+	// (insertSplitTablesTx): every file row set has a semantic row. Without it
+	// Store.Stat -> GetFile -> GetSemantic returns ErrNotFound, and a later
+	// description update silently updates zero rows.
+	if err := s.InsertSemanticTx(tx, &Semantic{InodeID: inodeID}); err != nil {
+		return fmt.Errorf("insert extent semantic: %w", err)
+	}
 	_, err := tx.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at, content_layout, extent_ino`)+`)
 		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?`)+`)`,
 		s.scope.Args(nodeID, path, fileNodePathHash(path), parent, fileNodePathHash(parent),
