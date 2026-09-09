@@ -387,3 +387,45 @@ func TestCommitQueueEmptyParentGrowthAcceptsRangeEOF(t *testing.T) {
 		t.Fatalf("rev=%d body=%q", rev, body)
 	}
 }
+
+// An in-flight entry can remain in either queue index while its upload worker
+// binds the immutable payload without cq.mu. Coalescing must reject ownership
+// before reading any worker-owned fields, not merely skip the final mutation.
+func TestCommitQueueCoalescerSkipsInFlightPayloadBinding(t *testing.T) {
+	for _, indexed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("indexed=%t", indexed), func(t *testing.T) {
+			parent := &CommitEntry{
+				Path: "/in-flight.bin", Kind: PendingNew, PayloadBaseRevSet: true,
+				SnapshotID: "parent", liveLineageProof: true,
+			}
+			child := &CommitEntry{
+				Path: parent.Path, Kind: PendingNew, PayloadBaseRevSet: true,
+				SnapshotID: "child", ParentSnapshotID: parent.SnapshotID, liveLineageProof: true,
+			}
+			cq := &CommitQueue{
+				queue:    []*CommitEntry{parent},
+				inFlight: map[string]*CommitEntry{parent.Path: parent},
+			}
+			if indexed {
+				cq.queuedByPath = map[string]map[*CommitEntry]struct{}{parent.Path: {parent: {}, nil: {}}}
+			}
+			start := make(chan struct{})
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				<-start
+				parent.bindPayload([]byte("uploaded snapshot"))
+			}()
+			close(start)
+			for i := 0; i < 10000; i++ {
+				cq.mu.Lock()
+				cq.coalesceDirectParentQueuedLocked(child)
+				cq.mu.Unlock()
+			}
+			<-done
+			if len(cq.queue) != 1 || cq.queue[0] != parent || parent.canceled || child.ParentSnapshotID != parent.SnapshotID {
+				t.Fatal("coalescing changed the in-flight parent or child lineage")
+			}
+		})
+	}
+}
