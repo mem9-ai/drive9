@@ -89,7 +89,9 @@ func (cq *CommitQueue) coalesceDirectParentQueuedLocked(entry *CommitEntry) {
 		}
 	}
 	for queued := range candidates {
-		if !directParentPendingNew(queued, entry) || queued.canceled || cq.inFlight[queued.Path] == queued {
+		// An in-flight worker owns mutable payload/rebase fields outside cq.mu.
+		// Exclude it before the lineage predicate reads any of those fields.
+		if queued == nil || queued.canceled || cq.inFlight[queued.Path] == queued || !directParentPendingNew(queued, entry) {
 			continue
 		}
 		oldParentID := entry.ParentSnapshotID
