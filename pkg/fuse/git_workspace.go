@@ -4433,17 +4433,6 @@ func (fs *Dat9FS) unblockGitOverlayUnlinkPublish(workspaceID, rel string) {
 	fs.gitOverlayMu.Unlock()
 }
 
-func (fs *Dat9FS) gitOverlayUnlinkBlocksPublish(workspaceID, rel string) bool {
-	if fs == nil || workspaceID == "" || rel == "" {
-		return false
-	}
-	key := gitOverlayUnlinkBlockKey(workspaceID, rel)
-	fs.gitOverlayMu.Lock()
-	n := fs.gitOverlayUnlinkBlocked[key]
-	fs.gitOverlayMu.Unlock()
-	return n > 0
-}
-
 func (fs *Dat9FS) gitOverlayUnlinkAttemptIfBlocked(workspaceID, rel string) uint64 {
 	if fs == nil || workspaceID == "" || rel == "" {
 		return 0
