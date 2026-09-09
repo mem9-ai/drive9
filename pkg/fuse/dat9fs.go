@@ -7645,7 +7645,7 @@ func (fs *Dat9FS) forceMarkOpenHandlesUnlinkedAfterCommit(p string) bool {
 		}
 		fh.Lock()
 		_, _ = fs.attachUnlinkedHandleSnapshotLocked(fh, p, nil, 0, 0, 0, false)
-		fh.Unlinked = true
+		fs.markHandleUnlinkedLocked(fh)
 		fh.Unlock()
 		any = true
 	}
@@ -7717,7 +7717,7 @@ func (fs *Dat9FS) attachAndMarkOpenHandlesLocked(ordered []*FileHandle, p string
 		}
 	}
 	for _, fh := range ordered {
-		fh.Unlinked = true
+		fs.markHandleUnlinkedLocked(fh)
 	}
 	return attachedPins, false
 }
@@ -8001,6 +8001,7 @@ func (fs *Dat9FS) unmarkOpenHandlesAfterFailedUnlink(p string, handles []*FileHa
 			continue
 		}
 		fh.Unlinked = false
+		fh.UnlinkedAttempt = 0
 		fh.UnlinkedData = nil
 		fh.UnlinkedSnapshot = false
 		fh.UnlinkedSize = 0

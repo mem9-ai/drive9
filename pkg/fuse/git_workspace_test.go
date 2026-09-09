@@ -5298,6 +5298,378 @@ func TestGitWorkspaceFsyncDuringUnlinkMarkPublishesIfWhiteoutFails(t *testing.T)
 	}
 }
 
+func TestGitWorkspaceFsyncAfterUnlinkMarkPublishesIfWhiteoutFails(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyCloseSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	v1 := []byte("git-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1 status = %v, want OK", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync v1 status = %v, want OK", st)
+	}
+	v2 := []byte("git-v2")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write v2 status = %v, want OK", st)
+	}
+
+	postWait := make(chan struct{})
+	postEntered := make(chan struct{})
+	fixture.mu.Lock()
+	fixture.overlayPostWait = postWait
+	fixture.overlayPostEntered = postEntered
+	fixture.failWhiteoutAfterWait = true
+	fixture.mu.Unlock()
+
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt")
+	}()
+	select {
+	case <-postEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("whiteout POST never parked")
+	}
+
+	upsertQueued := make(chan struct{})
+	var upsertOnce sync.Once
+	testHookAfterGitOverlaySlotReserved = func(op string) {
+		if op == "upsert" {
+			upsertOnce.Do(func() { close(upsertQueued) })
+		}
+	}
+	t.Cleanup(func() { testHookAfterGitOverlaySlotReserved = nil })
+
+	fsyncDone := make(chan gofuse.Status, 1)
+	go func() {
+		fsyncDone <- fs.Fsync(nil, &gofuse.FsyncIn{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+			Fh:       createOut.Fh,
+		})
+	}()
+	select {
+	case <-upsertQueued:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Fsync returned without enqueueing; tentative Unlinked swallowed it")
+	}
+	close(postWait)
+	if st := <-unlinkDone; st == gofuse.OK {
+		t.Fatal("Unlink status = OK, want error after rejected whiteout")
+	}
+	if st := <-fsyncDone; st != gofuse.OK {
+		t.Fatalf("Fsync after unlink mark = %v, want OK", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("handle missing")
+	}
+	fh.Lock()
+	unlinked := fh.Unlinked
+	fh.Unlock()
+	if unlinked {
+		t.Fatal("handle must stay linked after failed unlink")
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	puts := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if puts != 2 {
+		t.Fatalf("overlay puts = %d, want 2 (seed + v2 fsync)", puts)
+	}
+	if !ok || entry.Op != "upsert" || string(entry.Content) != string(v2) {
+		t.Fatalf("overlay entry = %+v, %v — want upsert %q", entry, ok, v2)
+	}
+}
+
+func TestGitWorkspaceRecreateFailedUnlinkDoesNotSwallowFsync(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyCloseSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	createAndSync := func(name, body string) gofuse.CreateOut {
+		t.Helper()
+		var out gofuse.CreateOut
+		if st := fs.Create(nil, &gofuse.CreateIn{
+			InHeader: gofuse.InHeader{NodeId: repoIno},
+			Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT | syscall.O_TRUNC),
+			Mode:     0o644,
+		}, name, &out); st != gofuse.OK {
+			t.Fatalf("Create status = %v, want OK", st)
+		}
+		data := []byte(body)
+		if _, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: out.NodeId},
+			Fh:       out.Fh,
+			Size:     uint32(len(data)),
+		}, data); st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+		if st := fs.Fsync(nil, &gofuse.FsyncIn{
+			InHeader: gofuse.InHeader{NodeId: out.NodeId},
+			Fh:       out.Fh,
+		}); st != gofuse.OK {
+			t.Fatalf("Fsync status = %v, want OK", st)
+		}
+		return out
+	}
+
+	first := createAndSync("sync.txt", "git-v0")
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt"); st != gofuse.OK {
+		t.Fatalf("first Unlink status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: first.Fh})
+
+	second := createAndSync("sync.txt", "git-v1")
+	v2 := []byte("git-v2")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: second.NodeId},
+		Fh:       second.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write v2 status = %v, want OK", st)
+	}
+
+	fsyncSampled := make(chan struct{})
+	whiteoutSampled := make(chan struct{})
+	releaseFsync := make(chan struct{})
+	releaseWhiteout := make(chan struct{})
+	var fsyncOnce, whiteoutOnce sync.Once
+	testHookAfterGitOverlayAttemptSample = func(op string) {
+		switch op {
+		case "upsert":
+			fsyncOnce.Do(func() { close(fsyncSampled) })
+			<-releaseFsync
+		case "whiteout":
+			whiteoutOnce.Do(func() { close(whiteoutSampled) })
+			<-releaseWhiteout
+		}
+	}
+	t.Cleanup(func() {
+		testHookAfterGitOverlayAttemptSample = nil
+		select {
+		case <-releaseFsync:
+		default:
+			close(releaseFsync)
+		}
+		select {
+		case <-releaseWhiteout:
+		default:
+			close(releaseWhiteout)
+		}
+	})
+
+	fsyncDone := make(chan gofuse.Status, 1)
+	go func() {
+		fsyncDone <- fs.Fsync(nil, &gofuse.FsyncIn{
+			InHeader: gofuse.InHeader{NodeId: second.NodeId},
+			Fh:       second.Fh,
+		})
+	}()
+	select {
+	case <-fsyncSampled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Fsync never sampled overlay unlink attempt")
+	}
+
+	fixture.mu.Lock()
+	fixture.failWhiteoutAfterWait = true
+	fixture.mu.Unlock()
+
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt")
+	}()
+	select {
+	case <-whiteoutSampled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second Unlink whiteout never sampled overlay attempt")
+	}
+
+	close(releaseFsync)
+	if st := <-fsyncDone; st != gofuse.OK {
+		t.Fatalf("Fsync status = %v, want OK", st)
+	}
+	close(releaseWhiteout)
+	if st := <-unlinkDone; st == gofuse.OK {
+		t.Fatal("second Unlink status = OK, want error after rejected whiteout")
+	}
+
+	fh, ok := fs.fileHandles.Get(second.Fh)
+	if !ok {
+		t.Fatal("recreate handle missing")
+	}
+	fh.Lock()
+	unlinked := fh.Unlinked
+	fh.Unlock()
+	if unlinked {
+		t.Fatal("recreate handle must stay linked after failed unlink")
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	fixture.mu.Unlock()
+	if !ok || entry.Op != "upsert" || string(entry.Content) != string(v2) {
+		t.Fatalf("overlay entry = %+v, %v — want upsert %q", entry, ok, v2)
+	}
+}
+
+func TestGitWorkspaceWriteBackUnlinkDoesNotLeavePendingUpsert(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{
+		LocalRoot:           t.TempDir(),
+		WritePolicy:         WritePolicyWriteBack,
+		SyncMode:            SyncInteractive,
+		EnableGitWorkspaces: true,
+	}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	fs.syncMode = SyncInteractive
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	v1 := []byte("git-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1 status = %v, want OK", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync v1 status = %v, want OK", st)
+	}
+	fs.drainGitOverlayWrites()
+	v2 := []byte("git-v2-must-stay-local")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write v2 status = %v, want OK", st)
+	}
+
+	sampled := make(chan struct{})
+	releaseFsync := make(chan struct{})
+	var sampleOnce sync.Once
+	testHookAfterGitOverlayAttemptSample = func(op string) {
+		if op != "upsert" {
+			return
+		}
+		sampleOnce.Do(func() { close(sampled) })
+		<-releaseFsync
+	}
+	t.Cleanup(func() {
+		testHookAfterGitOverlayAttemptSample = nil
+		select {
+		case <-releaseFsync:
+		default:
+			close(releaseFsync)
+		}
+	})
+
+	fsyncDone := make(chan gofuse.Status, 1)
+	go func() {
+		fsyncDone <- fs.Fsync(nil, &gofuse.FsyncIn{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+			Fh:       createOut.Fh,
+		})
+	}()
+	select {
+	case <-sampled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Fsync never sampled overlay unlink attempt")
+	}
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	close(releaseFsync)
+	if st := <-fsyncDone; st != gofuse.OK {
+		t.Fatalf("Fsync status = %v, want OK", st)
+	}
+	fs.drainGitOverlayWrites()
+
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("handle missing")
+	}
+	fh.Lock()
+	wsID := fh.GitWorkspaceID
+	rel := fh.GitRelPath
+	fh.Unlock()
+	fs.gitOverlayMu.Lock()
+	pendingOp := ""
+	if byPath := fs.gitOverlayPending[wsID]; byPath != nil {
+		if pending, ok := byPath[rel]; ok {
+			pendingOp = pending.entry.Op
+		}
+	}
+	fs.gitOverlayMu.Unlock()
+	if pendingOp == "upsert" {
+		t.Fatalf("pending overlay still upsert after unlink suppressed writeback fsync")
+	}
+	rt, _, _ := fs.gitWorkspaceForPath(context.Background(), "/repo")
+	if rt == nil {
+		t.Fatal("git workspace runtime missing")
+	}
+	live, ok := rt.overlayEntry(rel)
+	if !ok || live.Op != "whiteout" {
+		t.Fatalf("live overlay = %+v, %v — want whiteout", live, ok)
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	fixture.mu.Unlock()
+	if !ok || entry.Op != "whiteout" {
+		t.Fatalf("remote overlay = %+v, %v — want whiteout", entry, ok)
+	}
+}
+
 // TestGitWorkspaceOpenStraddlingWhiteoutMarkedUnlinked: an Open whose overlay
 // read snapshots the pre-whiteout state, but whose handle registers only after
 // the unlink's whiteout and post-commit pass have both completed, must still

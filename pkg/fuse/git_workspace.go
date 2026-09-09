@@ -4267,12 +4267,7 @@ func (fs *Dat9FS) applyGitOverlayMirrorEntry(fh *FileHandle, size int64) {
 	if fs == nil || fh == nil || fh.Layer != PathLayerGitWorkspace || fh.GitWorkspaceID == "" || fh.GitRelPath == "" {
 		return
 	}
-	if fh.Unlinked {
-		// Open-unlink: the whiteout written by the gitEntry unlink path must
-		// stay authoritative in the live overlay and the pending map. An
-		// upsert mirror here would resurrect the deleted name in lookups,
-		// readdir and reads on the active mount even though the remote PUT
-		// is already suppressed by the git flush guards.
+	if fs.gitOverlayShouldSuppressPublishLocked(fh) {
 		return
 	}
 	entry := client.GitOverlayEntry{
@@ -4304,7 +4299,7 @@ func (fs *Dat9FS) applyGitOverlayMirrorEntryUnlessWhiteout(fh *FileHandle, size 
 	if fs == nil || fh == nil || fh.Layer != PathLayerGitWorkspace || fh.GitWorkspaceID == "" || fh.GitRelPath == "" {
 		return
 	}
-	if fh.Unlinked {
+	if fs.gitOverlayShouldSuppressPublishLocked(fh) {
 		return
 	}
 	entry := client.GitOverlayEntry{
@@ -4319,7 +4314,7 @@ func (fs *Dat9FS) applyGitOverlayMirrorEntryUnlessWhiteout(fh *FileHandle, size 
 		UpdatedAt:      time.Now(),
 	}
 	if _, blocked := fs.applyGitOverlayEntryUnlessWhiteout(fh.GitWorkspaceID, entry); blocked {
-		fh.Unlinked = true
+		fs.markHandleUnlinkedLocked(fh)
 		return
 	}
 	// Capture the pending seq so registration-time whiteout adoption can drop
@@ -4467,36 +4462,66 @@ func (fs *Dat9FS) noteGitOverlayUnlinkCommitted(workspaceID, rel string) {
 	fs.gitOverlayMu.Unlock()
 }
 
-func (fs *Dat9FS) gitOverlayShouldDropQueuedPublish(op, workspaceID, rel string, reservedAttempt uint64) bool {
-	if op == "whiteout" || reservedAttempt == 0 {
-		return false
+func (fs *Dat9FS) markHandleUnlinkedLocked(fh *FileHandle) {
+	if fh == nil {
+		return
 	}
-	key := gitOverlayUnlinkBlockKey(workspaceID, rel)
+	fh.Unlinked = true
+	if fh.Layer != PathLayerGitWorkspace || fh.GitWorkspaceID == "" || fh.GitRelPath == "" {
+		return
+	}
+	key := gitOverlayUnlinkBlockKey(fh.GitWorkspaceID, fh.GitRelPath)
 	fs.gitOverlayMu.Lock()
-	committed := fs.gitOverlayUnlinkCommitted[key]
+	if fs.gitOverlayUnlinkBlocked[key] > 0 {
+		fh.UnlinkedAttempt = fs.gitOverlayUnlinkAttempt[key]
+	} else {
+		fh.UnlinkedAttempt = fs.gitOverlayUnlinkCommitted[key]
+	}
 	fs.gitOverlayMu.Unlock()
-	return committed >= reservedAttempt
 }
 
-func (fs *Dat9FS) gitOverlayUnlinkHasCommitted(workspaceID, rel string) bool {
-	if fs == nil || workspaceID == "" || rel == "" {
+func (fs *Dat9FS) gitOverlayShouldSuppressPublish(op, workspaceID, rel string, reservedAttempt uint64, fh *FileHandle) bool {
+	if op == "whiteout" {
 		return false
 	}
-	key := gitOverlayUnlinkBlockKey(workspaceID, rel)
-	fs.gitOverlayMu.Lock()
-	committed := fs.gitOverlayUnlinkCommitted[key]
-	fs.gitOverlayMu.Unlock()
-	return committed > 0
+	var markAttempt uint64
+	var unlinked bool
+	if fh != nil {
+		fh.Lock()
+		markAttempt = fh.UnlinkedAttempt
+		unlinked = fh.Unlinked
+		if workspaceID == "" {
+			workspaceID = fh.GitWorkspaceID
+		}
+		if rel == "" {
+			rel = fh.GitRelPath
+		}
+		fh.Unlock()
+	}
+	return fs.gitOverlayShouldSuppressPublishState(workspaceID, rel, reservedAttempt, unlinked, markAttempt)
 }
 
-func gitOverlayHandleUnlinked(fh *FileHandle) bool {
+func (fs *Dat9FS) gitOverlayShouldSuppressPublishLocked(fh *FileHandle) bool {
 	if fh == nil {
 		return false
 	}
-	fh.Lock()
-	unlinked := fh.Unlinked
-	fh.Unlock()
-	return unlinked
+	return fs.gitOverlayShouldSuppressPublishState(fh.GitWorkspaceID, fh.GitRelPath, 0, fh.Unlinked, fh.UnlinkedAttempt)
+}
+
+func (fs *Dat9FS) gitOverlayShouldSuppressPublishState(workspaceID, rel string, reservedAttempt uint64, unlinked bool, markAttempt uint64) bool {
+	key := gitOverlayUnlinkBlockKey(workspaceID, rel)
+	fs.gitOverlayMu.Lock()
+	attempt := fs.gitOverlayUnlinkAttempt[key]
+	committed := fs.gitOverlayUnlinkCommitted[key]
+	blocked := fs.gitOverlayUnlinkBlocked[key]
+	fs.gitOverlayMu.Unlock()
+	if reservedAttempt > 0 && committed >= reservedAttempt {
+		return true
+	}
+	if blocked > 0 && attempt > 0 && committed >= attempt {
+		return true
+	}
+	return unlinked && markAttempt > 0 && committed >= markAttempt
 }
 
 func (fs *Dat9FS) putGitOverlayRemote(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest) (*client.GitOverlayEntry, error) {
@@ -4538,19 +4563,9 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 		testHookAfterGitOverlayAttemptSample(req.Op)
 	}
 	dropQueued := func() bool {
-		if req.Op == "whiteout" {
-			return false
-		}
-		if fs.gitOverlayShouldDropQueuedPublish(req.Op, workspaceID, req.Path, reservedAttempt) {
-			return true
-		}
-		// Unlinked is set before whiteout commits and rolled back on failure.
-		// Only treat it as a publish barrier after a whiteout has landed.
-		return gitOverlayHandleUnlinked(fh) && fs.gitOverlayUnlinkHasCommitted(workspaceID, req.Path)
+		return fs.gitOverlayShouldSuppressPublish(req.Op, workspaceID, req.Path, reservedAttempt, fh)
 	}
 	if fs.gitOverlayWriteBackEnabled(policy, forceSync) {
-		pendingSeq := fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
-		fs.applyGitOverlayEntry(workspaceID, *localEntry)
 		prev, done := fs.reserveGitOverlayCommitSlot()
 		if testHookAfterGitOverlaySlotReserved != nil {
 			testHookAfterGitOverlaySlotReserved(req.Op)
@@ -4571,6 +4586,8 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 			if dropQueued() {
 				return
 			}
+			pendingSeq := fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
+			fs.applyGitOverlayEntry(workspaceID, *localEntry)
 			timeout := releaseTimeout(req.SizeBytes)
 			commitCtx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
@@ -4736,14 +4753,7 @@ func (fs *Dat9FS) flushGitLocalFileHandleLockedWithPolicy(ctx context.Context, f
 	if fh == nil || fh.Layer != PathLayerGitWorkspace || fh.LocalFile == nil {
 		return gofuse.OK
 	}
-	if fh.Unlinked {
-		// Open-unlink: the gitEntry unlink path marked this handle when it
-		// wrote the whiteout. Suppress the overlay upsert so the whiteout is
-		// not shadowed by a recreate from the anonymous fd. The fd's data
-		// stays in LocalFile untouched for reads (POSIX write/read
-		// after-unlink) — unlike Flush/Release on remote-DELETE handles,
-		// nothing is discarded here because a write-sync Write also routes
-		// through this function and its bytes must remain readable.
+	if fs.gitOverlayShouldSuppressPublishLocked(fh) {
 		return gofuse.OK
 	}
 	if fh.DirtySeq == 0 && !fh.HasPendingMode {
@@ -4790,13 +4800,7 @@ func (fs *Dat9FS) flushGitHandleLockedWithPolicy(ctx context.Context, fh *FileHa
 	if fh == nil || fh.Layer != PathLayerGitWorkspace {
 		return gofuse.OK
 	}
-	if fh.Unlinked {
-		// Open-unlink: suppress the overlay upsert — the whiteout written by
-		// the gitEntry unlink path must not be shadowed by a recreate from
-		// the anonymous fd. Its data stays in the Dirty buffer / LocalFile
-		// for reads (POSIX write/read-after-unlink); nothing is discarded
-		// here because write-sync Writes also route through this function
-		// and their bytes must remain readable.
+	if fs.gitOverlayShouldSuppressPublishLocked(fh) {
 		return gofuse.OK
 	}
 	if fh.LocalFile != nil {
@@ -5193,7 +5197,7 @@ func (fs *Dat9FS) registerGitWorkspaceHandle(fh *FileHandle, rt *gitWorkspaceRun
 	defer fs.openHandles.mu.Unlock()
 	marked := false
 	if e, ok := rt.overlayEntry(rel); ok && e.Op == "whiteout" {
-		fh.Unlinked = true
+		fs.markHandleUnlinkedLocked(fh)
 		marked = true
 	}
 	fs.openHandles.addLocked(fh)
