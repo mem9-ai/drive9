@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -173,6 +174,13 @@ func buildS3Client(ctx context.Context, cfg AWSConfig, provider aws.CredentialsP
 
 	loadOptions := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
+		// drive9 streams several uploads (layer objects, large files) from a
+		// non-seekable request body. Since aws-sdk-go-v2 v1.90 the default
+		// request-checksum mode computes a header checksum, which requires a
+		// seekable body (or TLS + trailing checksum) and fails with
+		// "unseekable stream is not supported without TLS and trailing
+		// checksum". Keep the pre-1.90 behavior: only checksum when required.
+		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 		awsconfig.WithHTTPClient(&http.Client{Transport: transport}),
 	}
@@ -554,6 +562,23 @@ func (c *AWSS3Client) PutObject(ctx context.Context, key string, body io.Reader,
 	result := "ok"
 	defer func() { recordS3Operation("put_object", result, start) }()
 
+	// SigV4 over a plain-HTTP endpoint cannot use UNSIGNED-PAYLOAD: the SDK
+	// hashes the body to sign it, which requires a seekable reader. drive9
+	// streams request bodies (layer objects, large uploads), so spool those
+	// to a temp file for the duration of the call. HTTPS endpoints sign with
+	// UNSIGNED-PAYLOAD and keep the streaming behavior.
+	if c.needsSeekableUploadBody() {
+		if _, ok := body.(io.Seeker); !ok {
+			spooled, cleanup, err := spoolUploadBody(body)
+			if err != nil {
+				result = "error"
+				return fmt.Errorf("spool upload body: %w", err)
+			}
+			defer cleanup()
+			body = spooled
+		}
+	}
+
 	in := &s3.PutObjectInput{
 		Bucket:        &c.bucket,
 		Key:           aws.String(c.fullKey(key)),
@@ -570,6 +595,34 @@ func (c *AWSS3Client) PutObject(ctx context.Context, key string, body io.Reader,
 		return fmt.Errorf("put object: %w", err)
 	}
 	return nil
+}
+
+// needsSeekableUploadBody reports whether PutObject has to hand the SDK a
+// seekable body: only plain-HTTP endpoints sign the payload itself.
+func (c *AWSS3Client) needsSeekableUploadBody() bool {
+	return !strings.HasPrefix(strings.ToLower(strings.TrimSpace(c.endpoint)), "https://")
+}
+
+// spoolUploadBody copies a non-seekable upload stream into a temp file and
+// returns it rewound to the start, plus a cleanup func.
+func spoolUploadBody(body io.Reader) (*os.File, func(), error) {
+	f, err := os.CreateTemp("", "drive9-upload-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	}
+	if _, err := io.Copy(f, body); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return f, cleanup, nil
 }
 
 func applyEncryptionToCreateMultipartUploadInput(in *s3.CreateMultipartUploadInput, encOpts EncryptionOpts) error {
