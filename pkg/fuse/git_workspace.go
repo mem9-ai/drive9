@@ -54,6 +54,11 @@ var errGitOverlayPublishSuppressed = errors.New("git overlay publish suppressed"
 // has joined the overlay queue behind an in-flight whiteout.
 var testHookAfterGitOverlaySlotReserved func(op string)
 
+// testHookAfterGitOverlaySlotWait fires after a queued overlay request has
+// waited for the previous slot. Tests use it to resume Flush only after
+// Unlink has fully returned and dropped the live block count.
+var testHookAfterGitOverlaySlotWait func(op string)
+
 // testHookAfterEmptyLocalScan runs after an empty-list leader scans local
 // markers and before it relocks to decide whether to disarm. Tests only.
 var testHookAfterEmptyLocalScan func()
@@ -4435,6 +4440,13 @@ func (fs *Dat9FS) gitOverlayUnlinkBlocksPublish(workspaceID, rel string) bool {
 	return n > 0
 }
 
+func (fs *Dat9FS) gitOverlayShouldDropQueuedPublish(op, workspaceID, rel string, reservedDuringUnlink bool) bool {
+	if op == "whiteout" {
+		return false
+	}
+	return reservedDuringUnlink || fs.gitOverlayUnlinkBlocksPublish(workspaceID, rel)
+}
+
 func (fs *Dat9FS) putGitOverlayRemote(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest) (*client.GitOverlayEntry, error) {
 	if fs == nil || fs.client == nil {
 		return nil, syscall.EIO
@@ -4466,6 +4478,7 @@ func (fs *Dat9FS) putGitOverlay(ctx context.Context, workspaceID string, req cli
 func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest, policy WritePolicy, forceSync bool) (*client.GitOverlayEntry, error) {
 	req = normalizeGitOverlayRequest(req)
 	localEntry := gitOverlayEntryFromRequest(workspaceID, req)
+	reservedDuringUnlink := req.Op != "whiteout" && fs.gitOverlayUnlinkBlocksPublish(workspaceID, req.Path)
 	if fs.gitOverlayWriteBackEnabled(policy, forceSync) {
 		pendingSeq := fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
 		fs.applyGitOverlayEntry(workspaceID, *localEntry)
@@ -4482,8 +4495,11 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 			if prev != nil {
 				<-prev
 			}
+			if testHookAfterGitOverlaySlotWait != nil {
+				testHookAfterGitOverlaySlotWait(req.Op)
+			}
 			defer close(done)
-			if req.Op != "whiteout" && fs.gitOverlayUnlinkBlocksPublish(workspaceID, req.Path) {
+			if fs.gitOverlayShouldDropQueuedPublish(req.Op, workspaceID, req.Path, reservedDuringUnlink) {
 				return
 			}
 			timeout := releaseTimeout(req.SizeBytes)
@@ -4507,8 +4523,11 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 	if prev != nil {
 		<-prev
 	}
+	if testHookAfterGitOverlaySlotWait != nil {
+		testHookAfterGitOverlaySlotWait(req.Op)
+	}
 	defer close(done)
-	if req.Op != "whiteout" && fs.gitOverlayUnlinkBlocksPublish(workspaceID, req.Path) {
+	if fs.gitOverlayShouldDropQueuedPublish(req.Op, workspaceID, req.Path, reservedDuringUnlink) {
 		return nil, errGitOverlayPublishSuppressed
 	}
 	entry, err := fs.putGitOverlayRemote(ctx, workspaceID, req)

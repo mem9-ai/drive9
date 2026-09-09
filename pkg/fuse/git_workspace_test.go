@@ -4794,7 +4794,25 @@ func TestGitWorkspaceFlushQueuedDuringWhiteoutDoesNotUpsert(t *testing.T) {
 			upsertOnce.Do(func() { close(upsertQueued) })
 		}
 	}
-	t.Cleanup(func() { testHookAfterGitOverlaySlotReserved = nil })
+	flushWaited := make(chan struct{})
+	releaseFlush := make(chan struct{})
+	var waitOnce sync.Once
+	testHookAfterGitOverlaySlotWait = func(op string) {
+		if op != "upsert" {
+			return
+		}
+		waitOnce.Do(func() { close(flushWaited) })
+		<-releaseFlush
+	}
+	t.Cleanup(func() {
+		testHookAfterGitOverlaySlotReserved = nil
+		testHookAfterGitOverlaySlotWait = nil
+		select {
+		case <-releaseFlush:
+		default:
+			close(releaseFlush)
+		}
+	})
 
 	flushDone := make(chan gofuse.Status, 1)
 	go func() {
@@ -4808,10 +4826,16 @@ func TestGitWorkspaceFlushQueuedDuringWhiteoutDoesNotUpsert(t *testing.T) {
 
 	close(postWait)
 	unlinkSt := <-unlinkDone
-	flushSt := <-flushDone
 	if unlinkSt != gofuse.OK {
 		t.Fatalf("Unlink status = %v, want OK", unlinkSt)
 	}
+	select {
+	case <-flushWaited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Flush never resumed after the whiteout slot")
+	}
+	close(releaseFlush)
+	flushSt := <-flushDone
 	if flushSt != gofuse.OK {
 		t.Fatalf("Flush status = %v, want OK", flushSt)
 	}
@@ -4824,6 +4848,41 @@ func TestGitWorkspaceFlushQueuedDuringWhiteoutDoesNotUpsert(t *testing.T) {
 	}
 	if !ok || entry.Op != "whiteout" {
 		t.Fatalf("overlay entry = %+v, %v — want whiteout preserved", entry, ok)
+	}
+
+	testHookAfterGitOverlaySlotReserved = nil
+	testHookAfterGitOverlaySlotWait = nil
+	var recreate gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT | syscall.O_TRUNC),
+		Mode:     0o644,
+	}, "sync.txt", &recreate); st != gofuse.OK {
+		t.Fatalf("recreate after unlink = %v, want OK", st)
+	}
+	v3 := []byte("git-v3")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: recreate.NodeId},
+		Fh:       recreate.Fh,
+		Size:     uint32(len(v3)),
+	}, v3); st != gofuse.OK {
+		t.Fatalf("recreate Write = %v, want OK", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: recreate.NodeId},
+		Fh:       recreate.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("recreate Fsync = %v, want OK", st)
+	}
+	fixture.mu.Lock()
+	entry, ok = fixture.overlay["sync.txt"]
+	putsAfterCreate := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if putsAfterCreate <= puts {
+		t.Fatalf("recreate overlay puts = %d, want > %d", putsAfterCreate, puts)
+	}
+	if !ok || entry.Op != "upsert" {
+		t.Fatalf("overlay after recreate = %+v, %v — want upsert", entry, ok)
 	}
 }
 
