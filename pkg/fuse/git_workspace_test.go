@@ -4703,6 +4703,130 @@ func TestGitWorkspaceUnlinkPass2LockTimeoutDoesNotUpsertOverWhiteout(t *testing.
 	}
 }
 
+func TestGitWorkspaceFlushQueuedDuringWhiteoutDoesNotUpsert(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyCloseSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	v1 := []byte("git-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1 status = %v, want OK", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync v1 status = %v, want OK", st)
+	}
+
+	postWait := make(chan struct{})
+	postEntered := make(chan struct{})
+	fixture.mu.Lock()
+	fixture.overlayPostWait = postWait
+	fixture.overlayPostEntered = postEntered
+	fixture.mu.Unlock()
+
+	unlinkDone := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkDone <- fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt")
+	}()
+	select {
+	case <-postEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("whiteout POST never parked")
+	}
+
+	rt, rel, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/sync.txt")
+	if !ok {
+		t.Fatal("git workspace path missing")
+	}
+	mirror, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel)
+	if !ok {
+		t.Fatal("dirty mirror path missing")
+	}
+	_ = os.Remove(mirror)
+	if err := os.MkdirAll(mirror, 0o755); err != nil {
+		t.Fatalf("mkdir dirty-mirror leaf: %v", err)
+	}
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup during in-flight whiteout = %v, want OK", st)
+	}
+	var open2 gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_TRUNC),
+	}, &open2); st != gofuse.OK {
+		t.Fatalf("Open memory-fallback handle = %v, want OK", st)
+	}
+	v2 := []byte("git-v2-must-stay-local")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       open2.Fh,
+		Size:     uint32(len(v2)),
+	}, v2); st != gofuse.OK {
+		t.Fatalf("Write on memory-fallback handle = %v, want OK", st)
+	}
+
+	upsertQueued := make(chan struct{})
+	var upsertOnce sync.Once
+	testHookAfterGitOverlaySlotReserved = func(op string) {
+		if op == "upsert" {
+			upsertOnce.Do(func() { close(upsertQueued) })
+		}
+	}
+	t.Cleanup(func() { testHookAfterGitOverlaySlotReserved = nil })
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		flushDone <- fs.Flush(nil, &gofuse.FlushIn{Fh: open2.Fh})
+	}()
+	select {
+	case <-upsertQueued:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Flush never reserved an overlay upsert slot behind the whiteout")
+	}
+
+	close(postWait)
+	unlinkSt := <-unlinkDone
+	flushSt := <-flushDone
+	if unlinkSt != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", unlinkSt)
+	}
+	if flushSt != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", flushSt)
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	puts := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if puts != 2 {
+		t.Fatalf("overlay puts = %d, want 2 (seed + whiteout, no upsert)", puts)
+	}
+	if !ok || entry.Op != "whiteout" {
+		t.Fatalf("overlay entry = %+v, %v — want whiteout preserved", entry, ok)
+	}
+}
+
 // TestGitWorkspaceOpenStraddlingWhiteoutMarkedUnlinked: an Open whose overlay
 // read snapshots the pre-whiteout state, but whose handle registers only after
 // the unlink's whiteout and post-commit pass have both completed, must still

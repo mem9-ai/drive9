@@ -185,11 +185,15 @@ type Dat9FS struct {
 	gitOverlayWG      sync.WaitGroup
 	gitOverlaySeq     atomic.Uint64
 	gitOverlayPending map[string]map[string]pendingGitOverlayEntry
-	layerMu           sync.RWMutex
-	layerWhiteouts    map[string]struct{}
-	layerFiles        map[string]uint32
-	layerDirs         map[string]uint32
-	layerSymlinks     map[string]layerSymlinkState
+	// gitOverlayUnlinkBlocked counts in-flight git Unlink operations per
+	// overlay path. Upserts that reserved a queue slot during Unlink must
+	// not publish after waiting for the whiteout slot.
+	gitOverlayUnlinkBlocked map[string]int
+	layerMu                 sync.RWMutex
+	layerWhiteouts          map[string]struct{}
+	layerFiles              map[string]uint32
+	layerDirs               map[string]uint32
+	layerSymlinks           map[string]layerSymlinkState
 	// layerAbandoned is set when the layer-event watcher observes a
 	// rollback event, signalling that the mounted layer is now abandoned.
 	// Subsequent write ops short-circuit with errLayerRolledBack (→ ESTALE)
@@ -9762,6 +9766,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// write fails, the directory entry still exists authoritatively, so
 		// the marking is rolled back — otherwise every later write/flush on
 		// those handles would keep being suppressed and silently drop data.
+		if rt, rel, ok := fs.gitWorkspaceForPath(ctx, childP); ok && rel != "" {
+			fs.blockGitOverlayUnlinkPublish(rt.workspace.WorkspaceID, rel)
+			defer fs.unblockGitOverlayUnlinkPublish(rt.workspace.WorkspaceID, rel)
+		}
 		markedGitHandles, _, markErr := fs.markOpenHandlesUnlinked(ctx, childP, false)
 		if markErr != nil {
 			return httpToFuseStatus(markErr)

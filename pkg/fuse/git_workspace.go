@@ -44,6 +44,16 @@ const gitLocalObjectMaxPackBytes int64 = 256 << 20
 
 var gitCleanTreeDefaultMtime = time.Unix(1, 0).UTC()
 
+// errGitOverlayPublishSuppressed means an overlay upsert was queued during
+// Unlink and must not publish after the whiteout slot. Flush treats it as
+// success without clearing Dirty.
+var errGitOverlayPublishSuppressed = errors.New("git overlay publish suppressed")
+
+// testHookAfterGitOverlaySlotReserved fires after reserveGitOverlayCommitSlot
+// in putGitOverlayWithPolicy. Tests use it to observe that a Flush upsert
+// has joined the overlay queue behind an in-flight whiteout.
+var testHookAfterGitOverlaySlotReserved func(op string)
+
 // testHookAfterEmptyLocalScan runs after an empty-list leader scans local
 // markers and before it relocks to decide whether to disarm. Tests only.
 var testHookAfterEmptyLocalScan func()
@@ -4383,6 +4393,48 @@ func (fs *Dat9FS) reserveGitOverlayCommitSlot() (<-chan struct{}, chan struct{})
 	return prev, done
 }
 
+func gitOverlayUnlinkBlockKey(workspaceID, rel string) string {
+	return workspaceID + "\x00" + rel
+}
+
+func (fs *Dat9FS) blockGitOverlayUnlinkPublish(workspaceID, rel string) {
+	if fs == nil || workspaceID == "" || rel == "" {
+		return
+	}
+	key := gitOverlayUnlinkBlockKey(workspaceID, rel)
+	fs.gitOverlayMu.Lock()
+	if fs.gitOverlayUnlinkBlocked == nil {
+		fs.gitOverlayUnlinkBlocked = make(map[string]int)
+	}
+	fs.gitOverlayUnlinkBlocked[key]++
+	fs.gitOverlayMu.Unlock()
+}
+
+func (fs *Dat9FS) unblockGitOverlayUnlinkPublish(workspaceID, rel string) {
+	if fs == nil || workspaceID == "" || rel == "" {
+		return
+	}
+	key := gitOverlayUnlinkBlockKey(workspaceID, rel)
+	fs.gitOverlayMu.Lock()
+	if n := fs.gitOverlayUnlinkBlocked[key]; n <= 1 {
+		delete(fs.gitOverlayUnlinkBlocked, key)
+	} else {
+		fs.gitOverlayUnlinkBlocked[key] = n - 1
+	}
+	fs.gitOverlayMu.Unlock()
+}
+
+func (fs *Dat9FS) gitOverlayUnlinkBlocksPublish(workspaceID, rel string) bool {
+	if fs == nil || workspaceID == "" || rel == "" {
+		return false
+	}
+	key := gitOverlayUnlinkBlockKey(workspaceID, rel)
+	fs.gitOverlayMu.Lock()
+	n := fs.gitOverlayUnlinkBlocked[key]
+	fs.gitOverlayMu.Unlock()
+	return n > 0
+}
+
 func (fs *Dat9FS) putGitOverlayRemote(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest) (*client.GitOverlayEntry, error) {
 	if fs == nil || fs.client == nil {
 		return nil, syscall.EIO
@@ -4418,6 +4470,9 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 		pendingSeq := fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
 		fs.applyGitOverlayEntry(workspaceID, *localEntry)
 		prev, done := fs.reserveGitOverlayCommitSlot()
+		if testHookAfterGitOverlaySlotReserved != nil {
+			testHookAfterGitOverlaySlotReserved(req.Op)
+		}
 		if fs.perfEnabled() {
 			fs.perf.gitOverlayEnqueue.add(1)
 		}
@@ -4428,6 +4483,9 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 				<-prev
 			}
 			defer close(done)
+			if req.Op != "whiteout" && fs.gitOverlayUnlinkBlocksPublish(workspaceID, req.Path) {
+				return
+			}
 			timeout := releaseTimeout(req.SizeBytes)
 			commitCtx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
@@ -4443,10 +4501,16 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 		fs.perf.gitOverlaySync.add(1)
 	}
 	prev, done := fs.reserveGitOverlayCommitSlot()
+	if testHookAfterGitOverlaySlotReserved != nil {
+		testHookAfterGitOverlaySlotReserved(req.Op)
+	}
 	if prev != nil {
 		<-prev
 	}
 	defer close(done)
+	if req.Op != "whiteout" && fs.gitOverlayUnlinkBlocksPublish(workspaceID, req.Path) {
+		return nil, errGitOverlayPublishSuppressed
+	}
 	entry, err := fs.putGitOverlayRemote(ctx, workspaceID, req)
 	if err != nil {
 		return nil, err
@@ -4607,6 +4671,9 @@ func (fs *Dat9FS) flushGitLocalFileHandleLockedWithPolicy(ctx context.Context, f
 	fh.Unlock()
 	_, err = fs.putGitOverlayWithPolicy(ctx, fh.GitWorkspaceID, req, fh.WritePolicy, forceSync)
 	fh.Lock()
+	if errors.Is(err, errGitOverlayPublishSuppressed) {
+		return gofuse.OK
+	}
 	if err != nil {
 		return httpToFuseStatus(err)
 	}
@@ -4656,6 +4723,9 @@ func (fs *Dat9FS) flushGitHandleLockedWithPolicy(ctx context.Context, fh *FileHa
 		fh.Unlock()
 		_, err := fs.putGitOverlayWithPolicy(ctx, fh.GitWorkspaceID, req, fh.WritePolicy, forceSync)
 		fh.Lock()
+		if errors.Is(err, errGitOverlayPublishSuppressed) {
+			return gofuse.OK
+		}
 		if err != nil {
 			return httpToFuseStatus(err)
 		}
@@ -4679,6 +4749,9 @@ func (fs *Dat9FS) flushGitHandleLockedWithPolicy(ctx context.Context, fh *FileHa
 	fh.Unlock()
 	_, err := fs.putGitOverlayWithPolicy(ctx, fh.GitWorkspaceID, req, fh.WritePolicy, forceSync)
 	fh.Lock()
+	if errors.Is(err, errGitOverlayPublishSuppressed) {
+		return gofuse.OK
+	}
 	if err != nil {
 		return httpToFuseStatus(err)
 	}
