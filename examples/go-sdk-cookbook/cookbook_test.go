@@ -92,6 +92,8 @@ func ExampleClient_filesystemCRUDAndMetadata() {
 	_, _ = c.StatMetadataCtx(ctx, "/workspace/a.txt")
 	_, _ = c.StatMetadataCompat("/workspace/a.txt")
 	_, _ = c.StatMetadataCompatCtx(ctx, "/workspace/a.txt")
+	_, _ = c.FileTasks("/workspace/a.txt")
+	_, _ = c.FileTasksCtx(ctx, "/workspace/a.txt")
 
 	_ = c.Copy("/workspace/a.txt", "/workspace/a-copy.txt")
 	_ = c.CopyCtx(ctx, "/workspace/a.txt", "/workspace/a-copy-ctx.txt")
@@ -715,6 +717,8 @@ var coveredClientMethods = map[string]bool{
 	"DownloadToFile":                       true,
 	"DownloadToFileWithSummary":            true,
 	"Find":                                 true,
+	"FileTasks":                            true,
+	"FileTasksCtx":                         true,
 	"GetFSLayer":                           true,
 	"GetFSLayerCheckpoint":                 true,
 	"GetFSLayerEntry":                      true,
