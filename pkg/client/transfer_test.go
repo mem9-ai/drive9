@@ -1699,11 +1699,14 @@ func TestReadStreamRangeFirstHopBoundedTransfer(t *testing.T) {
 	)
 	wal := bytes.Repeat([]byte("w"), walSize)
 	var wrote atomic.Int64
+	wroteDone := make(chan struct{})
+	var wroteOnce sync.Once
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/fs/main.db-wal" {
 			http.NotFound(w, r)
 			return
 		}
+		defer wroteOnce.Do(func() { close(wroteDone) })
 		want := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
 		if got := r.Header.Get("Range"); got != want {
 			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
@@ -1726,6 +1729,13 @@ func TestReadStreamRangeFirstHopBoundedTransfer(t *testing.T) {
 	defer func() { _ = rc.Close() }()
 
 	data, _ := io.ReadAll(rc)
+	// Keep the body open until the oversized Write finishes; otherwise the
+	// handler can still be in Write when we sample `wrote`.
+	select {
+	case <-wroteDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first-hop handler to finish")
+	}
 	if !bytes.Equal(data, wal[offset:offset+length]) {
 		t.Fatalf("read %d bytes, want exactly the %d-byte requested slice", len(data), length)
 	}
