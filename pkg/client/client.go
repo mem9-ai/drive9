@@ -1592,6 +1592,57 @@ func (c *Client) Find(pathPrefix string, params url.Values) ([]SearchResult, err
 	return results, nil
 }
 
+// FileTask is one durable extract/embed task for a file's current revision.
+// LastError is empty unless the task failed, and is bounded by the server.
+type FileTask struct {
+	TaskType  string `json:"task_type"`
+	Status    string `json:"status"`
+	LastError string `json:"last_error,omitempty"`
+}
+
+// FileTasksResult is the response of GET /v1/fs/{path}?tasks.
+type FileTasksResult struct {
+	Path  string     `json:"path"`
+	Tasks []FileTask `json:"tasks"`
+}
+
+// FileTasks returns the extract/embed task status for a file's current
+// revision, including the failure reason when a task failed.
+func (c *Client) FileTasks(path string) (*FileTasksResult, error) {
+	return c.FileTasksCtx(context.Background(), path)
+}
+
+// FileTasksCtx returns the extract/embed task status for a file's current
+// revision with context support. Only servers that implement ?tasks return
+// JSON; older servers fall through to a plain read, so a non-JSON response is
+// reported as an unsupported-server error instead of a decode failure.
+func (c *Client) FileTasksCtx(ctx context.Context, path string) (*FileTasksResult, error) {
+	req, err := c.newFSRequest(ctx, http.MethodGet, path, "?tasks=1", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	if !strings.HasPrefix(contentType, "application/json") {
+		return nil, fmt.Errorf("file tasks: unexpected Content-Type %q (server may not support task status)", resp.Header.Get("Content-Type"))
+	}
+	var out FileTasksResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode file tasks: %w", err)
+	}
+	if out.Tasks == nil {
+		out.Tasks = []FileTask{}
+	}
+	return &out, nil
+}
+
 // validateTags applies the same client-side validation across direct PUT,
 // multipart upload, and resume flows. Multipart tags are still sent only in
 // the final complete request, but validating up front avoids uploading parts
