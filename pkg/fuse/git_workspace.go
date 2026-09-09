@@ -110,13 +110,14 @@ type gitWorkspaceRuntime struct {
 	nodes     map[string]client.GitTreeNode
 	children  map[string][]client.GitTreeNode
 	overlay   map[string]client.GitOverlayEntry
-	// overlayGen is the per-path local apply generation of overlay, bumped by
-	// every live-overlay mutation under mu. A request that undoes its own
-	// local write compares its generation against this map so a same-path
-	// recreate that applied later keeps its entry.
-	overlayGen map[string]uint64
-	loadedAt   time.Time
-	restored   bool
+	// overlayWriter records, per path, the gitOverlaySeq token of the local
+	// writer that installed the live entry, under mu. A request that must undo
+	// its own live write compares that token so a same-path recreate that
+	// wrote later keeps its entry; the token is carried across runtime
+	// refresh by mergePendingGitOverlayEntries.
+	overlayWriter map[string]uint64
+	loadedAt      time.Time
+	restored      bool
 
 	localTreeCommit   string
 	localNodes        map[string]client.GitTreeNode
@@ -690,7 +691,7 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 		// Preserve in-memory size fills across force-refresh (blobless trees often
 		// arrive with SizeBytes=-1; losing fills causes phantom git status dirty).
 		fs.carryGitKnownSizesIntoRuntime(rt)
-		fs.mergePendingGitOverlayEntries(ws.WorkspaceID, rt.overlay)
+		fs.mergePendingGitOverlayEntries(ws.WorkspaceID, rt)
 		loaded = append(loaded, rt)
 	}
 	var incomplete error
@@ -4218,23 +4219,30 @@ func gitOverlayEntryFromRequest(workspaceID string, req client.GitOverlayEntryRe
 	}
 }
 
-// setOverlayEntryLocked installs entry as the live overlay entry and returns
-// the path's new local apply generation. Caller must hold rt.mu for writing.
-func (rt *gitWorkspaceRuntime) setOverlayEntryLocked(entry client.GitOverlayEntry) uint64 {
+// setOverlayEntryLocked installs entry as the live overlay entry on behalf of
+// writer (a gitOverlaySeq token) and records that writer for the path. Caller
+// must hold rt.mu for writing.
+func (rt *gitWorkspaceRuntime) setOverlayEntryLocked(entry client.GitOverlayEntry, writer uint64) {
 	rt.overlay[entry.Path] = entry
-	if rt.overlayGen == nil {
-		rt.overlayGen = make(map[string]uint64)
+	if rt.overlayWriter == nil {
+		rt.overlayWriter = make(map[string]uint64)
 	}
-	rt.overlayGen[entry.Path]++
-	return rt.overlayGen[entry.Path]
+	rt.overlayWriter[entry.Path] = writer
 }
 
-// applyGitOverlayEntry mirrors entry into the live overlay and returns the
-// local apply generation this write installed for the path (0 when no runtime
-// matched). Every live-overlay mutation bumps that generation, so a caller
-// that may later need to undo its own write can prove ownership: a same-path
-// recreate that applied after it must survive the cleanup.
+// applyGitOverlayEntry mirrors entry into the live overlay as a fresh local
+// writer and returns the token it recorded (0 when no runtime matched).
+// Callers that may later need to undo their own write — the write-back drop
+// cleanup — apply with their own token via applyGitOverlayEntryAs and hand it
+// back to restoreGitOverlayWhiteoutOwned.
 func (fs *Dat9FS) applyGitOverlayEntry(workspaceID string, entry client.GitOverlayEntry) uint64 {
+	if fs == nil {
+		return 0
+	}
+	return fs.applyGitOverlayEntryAs(workspaceID, entry, fs.gitOverlaySeq.Add(1))
+}
+
+func (fs *Dat9FS) applyGitOverlayEntryAs(workspaceID string, entry client.GitOverlayEntry, writer uint64) uint64 {
 	if fs == nil || fs.git == nil {
 		return 0
 	}
@@ -4246,19 +4254,20 @@ func (fs *Dat9FS) applyGitOverlayEntry(workspaceID string, entry client.GitOverl
 		}
 		rt.mu.Lock()
 		defer rt.mu.Unlock()
-		return rt.setOverlayEntryLocked(entry)
+		rt.setOverlayEntryLocked(entry, writer)
+		return writer
 	}
 	return 0
 }
 
 // restoreGitOverlayWhiteoutOwned replaces the live entry for rel with a
-// whiteout only while gen is still that path's latest local apply generation.
-// It is the ownership-scoped form of the write-back drop cleanup: the request
-// being cleaned up may only undo its own local write, so a later legitimate
-// same-path recreate keeps its live upsert (the remote PUT it already made is
-// authoritative). Returns whether the whiteout was installed.
-func (fs *Dat9FS) restoreGitOverlayWhiteoutOwned(workspaceID, rel string, gen uint64) bool {
-	if fs == nil || fs.git == nil || rel == "" || gen == 0 {
+// whiteout only while writer is still the path's local writer token. It is the
+// ownership-scoped form of the write-back drop cleanup: the dropped request
+// may only undo its own local write, so a same-path recreate that wrote later
+// keeps its live upsert (the remote PUT it already made is authoritative).
+// Returns whether the whiteout was installed.
+func (fs *Dat9FS) restoreGitOverlayWhiteoutOwned(workspaceID, rel string, writer uint64) bool {
+	if fs == nil || fs.git == nil || rel == "" || writer == 0 {
 		return false
 	}
 	fs.git.mu.Lock()
@@ -4269,7 +4278,7 @@ func (fs *Dat9FS) restoreGitOverlayWhiteoutOwned(workspaceID, rel string, gen ui
 		}
 		rt.mu.Lock()
 		defer rt.mu.Unlock()
-		if rt.overlayGen[rel] != gen {
+		if rt.overlayWriter[rel] != writer {
 			return false
 		}
 		rt.setOverlayEntryLocked(client.GitOverlayEntry{
@@ -4277,7 +4286,7 @@ func (fs *Dat9FS) restoreGitOverlayWhiteoutOwned(workspaceID, rel string, gen ui
 			Path:        rel,
 			Op:          "whiteout",
 			Kind:        "file",
-		})
+		}, writer)
 		return true
 	}
 	return false
@@ -4310,7 +4319,7 @@ func (fs *Dat9FS) applyGitOverlayEntryUnlessWhiteout(workspaceID string, entry c
 			rt.mu.Unlock()
 			return false, true
 		}
-		rt.setOverlayEntryLocked(entry)
+		rt.setOverlayEntryLocked(entry, fs.gitOverlaySeq.Add(1))
 		rt.mu.Unlock()
 		return true, false
 	}
@@ -4416,14 +4425,28 @@ func (fs *Dat9FS) forgetPendingGitOverlayEntry(workspaceID, relPath string, seq 
 	}
 }
 
-func (fs *Dat9FS) mergePendingGitOverlayEntries(workspaceID string, overlay map[string]client.GitOverlayEntry) {
-	if fs == nil || len(overlay) == 0 && fs.gitOverlayPending == nil {
+// mergePendingGitOverlayEntries replays the in-flight write-back entries into a
+// freshly loaded runtime so local state survives a refresh. Each replayed entry
+// keeps its own pending seq as the live writer token: the request that queued it
+// can still recognise and clean up its own entry after the refresh, while a
+// newer same-path writer keeps its token and therefore its entry.
+func (fs *Dat9FS) mergePendingGitOverlayEntries(workspaceID string, rt *gitWorkspaceRuntime) {
+	if fs == nil || rt == nil {
 		return
 	}
 	fs.gitOverlayMu.Lock()
-	defer fs.gitOverlayMu.Unlock()
-	for rel, pending := range fs.gitOverlayPending[workspaceID] {
-		overlay[rel] = pending.entry
+	pending := make(map[string]pendingGitOverlayEntry, len(fs.gitOverlayPending[workspaceID]))
+	for rel, entry := range fs.gitOverlayPending[workspaceID] {
+		pending[rel] = entry
+	}
+	fs.gitOverlayMu.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	for _, entry := range pending {
+		rt.setOverlayEntryLocked(entry.entry, entry.seq)
 	}
 }
 
@@ -4623,12 +4646,15 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 		// Keep local overlay visibility for the common write-back path.
 		// Defer upsert apply only while an unlink is in flight on this path,
 		// so a later drop cannot resurrect a whiteout. Whiteout itself must
-		// apply before Unlink returns.
+		// apply before Unlink returns. A request that is already stale here —
+		// its fd was marked for an unlink attempt that has committed — must
+		// not apply at all: applying late would overwrite a legitimate
+		// same-path recreate and hand this request the current writer token.
 		deferLocal := req.Op != "whiteout" && fs.gitOverlayUnlinkAttemptIfBlocked(workspaceID, req.Path) > 0
-		var pendingSeq, localGen uint64
-		if !deferLocal {
+		var pendingSeq, localWriter uint64
+		if !deferLocal && !fs.gitOverlayShouldSuppressPublish(req.Op, workspaceID, req.Path, reservedAttempt, fh) {
 			pendingSeq = fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
-			localGen = fs.applyGitOverlayEntry(workspaceID, *localEntry)
+			localWriter = fs.applyGitOverlayEntryAs(workspaceID, *localEntry, pendingSeq)
 			if req.Op == "whiteout" {
 				fs.noteGitOverlayUnlinkCommitted(workspaceID, req.Path)
 			}
@@ -4651,17 +4677,17 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 			}
 			defer close(done)
 			if dropQueued() {
-				if !deferLocal {
+				if pendingSeq != 0 {
 					fs.forgetPendingGitOverlayEntry(workspaceID, req.Path, pendingSeq)
 					if req.Op != "whiteout" {
-						fs.restoreGitOverlayWhiteoutOwned(workspaceID, req.Path, localGen)
+						fs.restoreGitOverlayWhiteoutOwned(workspaceID, req.Path, localWriter)
 					}
 				}
 				return
 			}
 			if deferLocal {
 				pendingSeq = fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
-				fs.applyGitOverlayEntry(workspaceID, *localEntry)
+				fs.applyGitOverlayEntryAs(workspaceID, *localEntry, pendingSeq)
 			}
 			timeout := releaseTimeout(req.SizeBytes)
 			commitCtx, cancel := context.WithTimeout(context.Background(), timeout)

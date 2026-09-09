@@ -5840,6 +5840,396 @@ func TestGitWorkspaceWriteBackStaleDropKeepsRecreatedLiveUpsert(t *testing.T) {
 	}
 }
 
+// TestGitWorkspaceWriteBackLateStaleDropKeepsRecreatedFile: a stale request
+// that resumes only after the name was fully recreated must not write its own
+// live entry at all. Its apply would overwrite the recreate and hand this
+// request the current writer token, so the drop cleanup could not tell that it
+// no longer owns the path and would hide the recreated file locally.
+func TestGitWorkspaceWriteBackLateStaleDropKeepsRecreatedFile(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{
+		LocalRoot:           t.TempDir(),
+		WritePolicy:         WritePolicyWriteBack,
+		SyncMode:            SyncInteractive,
+		EnableGitWorkspaces: true,
+	}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	fs.syncMode = SyncInteractive
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	v1 := []byte("git-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1 status = %v, want OK", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync v1 status = %v, want OK", st)
+	}
+	fs.drainGitOverlayWrites()
+
+	stale := []byte("git-v2-stale")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(stale)),
+	}, stale); st != gofuse.OK {
+		t.Fatalf("Write stale status = %v, want OK", st)
+	}
+
+	sampled := make(chan struct{})
+	releaseStale := make(chan struct{})
+	var sampleOnce sync.Once
+	testHookAfterGitOverlayAttemptSample = func(op string) {
+		if op != "upsert" {
+			return
+		}
+		park := false
+		sampleOnce.Do(func() {
+			park = true
+			close(sampled)
+		})
+		if park {
+			<-releaseStale
+		}
+	}
+	t.Cleanup(func() {
+		testHookAfterGitOverlayAttemptSample = nil
+		select {
+		case <-releaseStale:
+		default:
+			close(releaseStale)
+		}
+	})
+
+	fsyncDone := make(chan gofuse.Status, 1)
+	go func() {
+		fsyncDone <- fs.Fsync(nil, &gofuse.FsyncIn{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+			Fh:       createOut.Fh,
+		})
+	}()
+	select {
+	case <-sampled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale Fsync never sampled overlay unlink attempt")
+	}
+
+	// Unlink commits while the stale request is still parked before its apply.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	fs.drainGitOverlayWrites()
+
+	// The name is fully recreated, remote PUT included, before the stale
+	// request resumes.
+	var recreate gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT | syscall.O_TRUNC),
+		Mode:     0o644,
+	}, "sync.txt", &recreate); st != gofuse.OK {
+		t.Fatalf("recreate Create = %v, want OK", st)
+	}
+	v3 := []byte("replacement-v3")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: recreate.NodeId},
+		Fh:       recreate.Fh,
+		Size:     uint32(len(v3)),
+	}, v3); st != gofuse.OK {
+		t.Fatalf("recreate Write = %v, want OK", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: recreate.NodeId},
+		Fh:       recreate.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("recreate Fsync = %v, want OK", st)
+	}
+	fs.drainGitOverlayWrites()
+	fixture.mu.Lock()
+	putsBeforeStale := fixture.overlayPuts
+	fixture.mu.Unlock()
+
+	close(releaseStale)
+	if st := <-fsyncDone; st != gofuse.OK {
+		t.Fatalf("stale Fsync status = %v, want OK", st)
+	}
+	fs.drainGitOverlayWrites()
+
+	fixture.mu.Lock()
+	remote, remoteOK := fixture.overlay["sync.txt"]
+	putsAfterStale := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if putsAfterStale != putsBeforeStale {
+		t.Fatalf("overlay puts = %d, want %d — stale upsert must not publish", putsAfterStale, putsBeforeStale)
+	}
+	if !remoteOK || remote.Op != "upsert" || string(remote.Content) != string(v3) {
+		t.Fatalf("remote overlay = %+v, %v — want recreate upsert %q", remote, remoteOK, v3)
+	}
+	rt, _, _ := fs.gitWorkspaceForPath(context.Background(), "/repo")
+	if rt == nil {
+		t.Fatal("git workspace runtime missing")
+	}
+	live, liveOK := rt.overlayEntry("sync.txt")
+	if !liveOK || live.Op != "upsert" || string(live.Content) != string(v3) {
+		t.Fatalf("live overlay = %+v, %v — want recreate upsert %q (late stale request must not apply or undo)", live, liveOK, v3)
+	}
+}
+
+// TestGitWorkspaceWriteBackRefreshDuringStaleDropKeepsWhiteout: a workspace
+// refresh that lands between a stale request's enqueue and its drop must not
+// let the deleted name reappear locally. The refreshed runtime replays
+// in-flight write-back state, and the stale request's cleanup must still be
+// able to remove it (or must never have contributed it in the first place).
+func TestGitWorkspaceWriteBackRefreshDuringStaleDropKeepsWhiteout(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{
+		LocalRoot:           t.TempDir(),
+		WritePolicy:         WritePolicyWriteBack,
+		SyncMode:            SyncInteractive,
+		EnableGitWorkspaces: true,
+	}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	fs.syncMode = SyncInteractive
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	v1 := []byte("git-v1")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(v1)),
+	}, v1); st != gofuse.OK {
+		t.Fatalf("Write v1 status = %v, want OK", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync v1 status = %v, want OK", st)
+	}
+	fs.drainGitOverlayWrites()
+
+	stale := []byte("git-v2-stale")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(stale)),
+	}, stale); st != gofuse.OK {
+		t.Fatalf("Write stale status = %v, want OK", st)
+	}
+
+	sampled := make(chan struct{})
+	releaseStale := make(chan struct{})
+	var sampleOnce sync.Once
+	testHookAfterGitOverlayAttemptSample = func(op string) {
+		if op != "upsert" {
+			return
+		}
+		park := false
+		sampleOnce.Do(func() {
+			park = true
+			close(sampled)
+		})
+		if park {
+			<-releaseStale
+		}
+	}
+	t.Cleanup(func() {
+		testHookAfterGitOverlayAttemptSample = nil
+		select {
+		case <-releaseStale:
+		default:
+			close(releaseStale)
+		}
+	})
+
+	fsyncDone := make(chan gofuse.Status, 1)
+	go func() {
+		fsyncDone <- fs.Fsync(nil, &gofuse.FsyncIn{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+			Fh:       createOut.Fh,
+		})
+	}()
+	select {
+	case <-sampled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale Fsync never sampled overlay unlink attempt")
+	}
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "sync.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	fs.drainGitOverlayWrites()
+
+	// Park the stale request once it has its overlay slot, then refresh the
+	// workspace underneath it.
+	resumed := make(chan struct{})
+	releaseDrop := make(chan struct{})
+	var waitOnce sync.Once
+	testHookAfterGitOverlaySlotWait = func(op string) {
+		if op != "upsert" {
+			return
+		}
+		waitOnce.Do(func() { close(resumed) })
+		<-releaseDrop
+	}
+	t.Cleanup(func() {
+		testHookAfterGitOverlaySlotWait = nil
+		select {
+		case <-releaseDrop:
+		default:
+			close(releaseDrop)
+		}
+	})
+
+	close(releaseStale)
+	select {
+	case <-resumed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale Fsync never resumed after its overlay slot wait")
+	}
+
+	if err := fs.ensureGitWorkspacesWithRefresh(context.Background(), true); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	close(releaseDrop)
+	if st := <-fsyncDone; st != gofuse.OK {
+		t.Fatalf("stale Fsync status = %v, want OK", st)
+	}
+	fs.drainGitOverlayWrites()
+
+	fixture.mu.Lock()
+	remote, remoteOK := fixture.overlay["sync.txt"]
+	fixture.mu.Unlock()
+	if !remoteOK || remote.Op != "whiteout" {
+		t.Fatalf("remote overlay = %+v, %v — want whiteout", remote, remoteOK)
+	}
+	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo")
+	if !ok || rt == nil {
+		t.Fatal("git workspace runtime missing after refresh")
+	}
+	live, liveOK := rt.overlayEntry("sync.txt")
+	if !liveOK || live.Op != "whiteout" {
+		t.Fatalf("live overlay = %+v, %v — want whiteout; stale upsert reappeared locally after refresh", live, liveOK)
+	}
+}
+
+// TestGitWorkspaceRefreshMergeCarriesWriterToken: a refresh rebuilds the
+// runtime and replays in-flight write-back entries into it. The replayed entry
+// must keep the writer token of the request that queued it, otherwise that
+// request can no longer recognise its own live entry and its drop cleanup
+// silently leaves the stale upsert (and the deleted name) visible locally.
+func TestGitWorkspaceRefreshMergeCarriesWriterToken(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/race.txt")
+	if !ok {
+		t.Fatal("workspace ws1 not loaded")
+	}
+
+	// A write-back upsert is queued and applied, then the request parks.
+	upsert := client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "race.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   4,
+		Content:     []byte("git-"),
+	}
+	seq := fs.rememberPendingGitOverlayEntry("ws1", upsert)
+	if got := fs.applyGitOverlayEntryAs("ws1", upsert, seq); got != seq {
+		t.Fatalf("apply writer token = %d, want %d", got, seq)
+	}
+
+	// Refresh: a fresh runtime loaded from the server (whiteout already
+	// committed) replaces the old one, and the pending replay runs into it.
+	fresh := &gitWorkspaceRuntime{
+		workspace: rt.workspace,
+		localRoot: rt.localRoot,
+		overlay: map[string]client.GitOverlayEntry{
+			"race.txt": {WorkspaceID: "ws1", Path: "race.txt", Op: "whiteout", Kind: "file"},
+		},
+	}
+	fs.mergePendingGitOverlayEntries("ws1", fresh)
+	if live, _ := fresh.overlayEntry("race.txt"); live.Op != "upsert" {
+		t.Fatalf("replayed overlay op = %q, want upsert", live.Op)
+	}
+	fs.git.mu.Lock()
+	fs.git.workspaces = []*gitWorkspaceRuntime{fresh}
+	fs.git.mu.Unlock()
+
+	// The queued request must still be able to clean up its own entry.
+	if !fs.restoreGitOverlayWhiteoutOwned("ws1", "race.txt", seq) {
+		t.Fatal("owner lost its live entry across refresh; drop cleanup would leave the stale upsert")
+	}
+	live, _ := fresh.overlayEntry("race.txt")
+	if live.Op != "whiteout" {
+		t.Fatalf("live overlay op = %q, want whiteout after owner cleanup", live.Op)
+	}
+
+	// A newer same-path writer that survived the refresh keeps its entry: the
+	// stale owner must not white it out.
+	recreate := upsert
+	recreate.Content = []byte("git-2")
+	if fs.rememberPendingGitOverlayEntry("ws1", recreate) == 0 {
+		t.Fatal("recreate pending seq missing")
+	}
+	recreated := &gitWorkspaceRuntime{
+		workspace: rt.workspace,
+		localRoot: rt.localRoot,
+		overlay:   map[string]client.GitOverlayEntry{},
+	}
+	fs.mergePendingGitOverlayEntries("ws1", recreated)
+	fs.git.mu.Lock()
+	fs.git.workspaces = []*gitWorkspaceRuntime{recreated}
+	fs.git.mu.Unlock()
+	if fs.restoreGitOverlayWhiteoutOwned("ws1", "race.txt", seq) {
+		t.Fatal("stale owner whited out a newer recreated entry")
+	}
+	live, _ = recreated.overlayEntry("race.txt")
+	if live.Op != "upsert" || string(live.Content) != string(recreate.Content) {
+		t.Fatalf("live overlay = %+v — want the recreated upsert preserved", live)
+	}
+}
+
 // TestGitWorkspaceOpenStraddlingWhiteoutMarkedUnlinked: an Open whose overlay
 // read snapshots the pre-whiteout state, but whose handle registers only after
 // the unlink's whiteout and post-commit pass have both completed, must still
@@ -6325,12 +6715,15 @@ func TestGitWorkspaceRegistrationDropsStalePendingMirrorEntry(t *testing.T) {
 
 	// A workspace refresh merging pending entries over the server state must
 	// keep the authoritative whiteout.
-	serverOverlay := map[string]client.GitOverlayEntry{
+	rt.mu.Lock()
+	rt.overlay = map[string]client.GitOverlayEntry{
 		"race.txt": {WorkspaceID: "ws1", Path: "race.txt", Op: "whiteout", Kind: "file"},
 	}
-	fs.mergePendingGitOverlayEntries("ws1", serverOverlay)
-	if got := serverOverlay["race.txt"].Op; got != "whiteout" {
-		t.Fatalf("merged overlay op = %q, want whiteout; stale mirror pending resurrected path", got)
+	rt.mu.Unlock()
+	fs.mergePendingGitOverlayEntries("ws1", rt)
+	merged, _ := rt.overlayEntry("race.txt")
+	if merged.Op != "whiteout" {
+		t.Fatalf("merged overlay op = %q, want whiteout; stale mirror pending resurrected path", merged.Op)
 	}
 }
 
