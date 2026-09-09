@@ -54,6 +54,7 @@ Two invariants (**no fix may break these**):
 | P1-5 | Medium (perf, open) | Every kernel writeback batch costs one extra meta commit RPC (the fsx fix); `community.fio` 132 s → 227 s | ≈ +30 % on the write-heavy suites until the commit is folded into the write RPC |
 | P1-7 | High (open) | A file written through an open handle is **invisible to remote readers until close**: `mount drain` reports idle queues and the remote read returns an empty body | `e2e/fuse-smoke-test.sh [9.1]` FAIL; the upload barrier alone does not fix it |
 | P1-8 | High (open) | After `umount` + remount an extent file reads back as **size 0** on the new mount while the server/S3 have the full content | `e2e/fuse-supervision-test.sh [8]` FAIL; extent-only (profile `none` passes) |
+| P1-9 | High (open) | With the kernel writeback cache **off**, concurrent small writes stall the extent write path: `community.sqlite` mptest/threadtest3 fail with `database is locked`, slices sit `freezed:true done:true committed:false` until `flush timeout after waited 5m0s` | Reached by `--durability write-sync` (cache off by design), macFUSE/older kernels that ignore the cap, and any workload whose writes stay small |
 | P2-1 | Medium | Projection size is not kept in sync (Write only updates `jfs_node.length`) | `ls -l` shows a stale size when the jfs overlay misses |
 | P2-2 | Medium | STS grants that can be narrowed (DeleteObject / multipart / static branch has no IAM / TTL has no jitter / per-process mint) | Over-broad permissions + STS noise |
 | P2-3 | Low | Server-side fallback compactor builds a new Runtime per task (new session never closed) + `WrapS3` reads the whole blob into memory | Session churn, memory spikes |
@@ -243,6 +244,32 @@ With `PROFILE=none` the identical script passes (38 B before and after remount),
 - `PROFILE=extent` repro reads the 38 bytes after umount + remount (both same path and fresh mount point);
 - `e2e/fuse-supervision-test.sh` 51/51;
 - no extent attr path may answer from the projection when `jfs_node.length` is authoritative.
+
+---
+
+# P1-9 Concurrent small writes stall the extent write path when the kernel writeback cache is off
+
+**Symptom** [verified, 2026-09-09]
+With `FUSE_WRITEBACK_CACHE` disabled every `write(2)` becomes its own FUSE `WRITE`, and a workload that writes many small blocks from several processes (SQLite WAL) stalls: `community.sqlite` `mptest crash01` fails with `database is locked` (SQLite's 10 s busy timeout) and `threadtest3 walthread5` never finishes. The mount log shows `flush <n> timeout after waited 5m0s` and pending slices stuck at `freezed:true done:true committed:false`.
+
+**Evidence** [verified]
+A/B on the same host, same build, extent profile, two runs each:
+
+| kernel writeback cache | `mptest crash01 --journalmode wal` | `--journalmode delete` | `threadtest3 walthread5` |
+|---|---|---|---|
+| off | FAIL rc=1, 14 / 17 `database is locked` (28.6 s / 28.0 s) | FAIL rc=1, 7 / 8 errors (39.7 s / 52.9 s) | hang, rc=124 at 120 s (both runs) |
+| on | PASS rc=0, 0 errors (14.4 s / 12.3 s) | PASS rc=0, 0 errors (57.9 s / 62.5 s) | PASS rc=0 (21.2 s / 26.9 s) |
+
+A goroutine dump taken while the mount was stalled showed no pending FUSE handler (only idle commit-queue workers), so the stall was not captured at the right instant yet.
+
+**Reachability**
+`--durability write-sync` keeps the cache off by design, and macFUSE/older kernels ignore the cap, so both still reach this path. It is not the default anymore: `--durability auto|interactive|fsync|close-sync` enables the cache (design doc §4.2).
+
+**How to reproduce**
+`~/repro/ab-sqlite.sh` on the EC2 test host (starts the local stack, mounts with `--profile extent`, runs both configurations), or the blackbox module with a cache-off binary: `python3 blackbox/run.py --module community.sqlite --server-mode local`.
+
+**Suggested next step**
+Capture `/debug/pprof/goroutine?debug=2` from the mount every 2 s while `mptest` retries, then check whether the slice commit is stuck in the JuiceFS writer, in the forced `flush`+`WaitWrites` barrier of `extentWrite`, or in the server transaction. Fix the starvation rather than relying on the kernel cache.
 
 ---
 

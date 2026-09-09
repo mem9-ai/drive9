@@ -191,6 +191,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
 	trustProcessLocalEvents := fs.Bool("trust-process-local-events", false, "allow revision-bound GetAttr dir-cache hits using process-local SSE freshness; only safe for single-server/sticky routing or cluster-wide event streams")
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
+	writebackCache := fs.String("writeback-cache", string(fuseWritebackCacheAuto), "kernel FUSE writeback cache: auto (on unless --durability write-sync), on, or off")
 	layerRef := fs.String("layer", "", "mount through writable fs layer (layer id, name, or tag ref)")
 	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
 	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
@@ -521,6 +522,10 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
+	writebackCacheVal, err := parseFuseWritebackCache(*writebackCache)
+	if err != nil {
+		return err
+	}
 	if *writeBackBatchWindow > 0 && writePolicyVal != fuseWritePolicyWriteBack {
 		return fmt.Errorf("drive9 mount: --writeback-batch-window requires --durability auto, interactive, or fsync")
 	}
@@ -820,6 +825,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		TrustLocalEvents:        *trustProcessLocalEvents,
 		SyncMode:                syncModeVal,
 		WritePolicy:             writePolicyVal,
+		WritebackCache:          writebackCacheVal,
 		Profile:                 profileCfg.Name,
 		LayerRef:                strings.TrimSpace(*layerRef),
 		CheckpointRef:           strings.TrimSpace(*checkpointRef),

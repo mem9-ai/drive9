@@ -787,6 +787,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "--layer REF", Desc: "mount through writable fs layer by id, name, or tag ref"},
 					{Name: "--checkpoint REF", Desc: "restore fs layer checkpoint before mounting"},
 					{Name: "--durability MODE", Desc: "write durability: auto, interactive, fsync, close-sync, or write-sync"},
+					{Name: "--writeback-cache MODE", Desc: "kernel FUSE writeback cache: auto (on unless --durability write-sync), on, or off"},
 					{Name: "--flush-debounce DURATION", Desc: "debounce window for small-file flush coalescing; 0 disables"},
 					{Name: "--upload-concurrency N", Desc: "maximum concurrent background uploads issued by FUSE"},
 					{Name: "--commit-queue-max-pending N", Desc: "maximum pending entries in the commit queue before backpressure"},

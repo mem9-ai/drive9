@@ -8,6 +8,7 @@ import (
 type fuseSyncMode string
 type fuseWritePolicy string
 type fuseDurability string
+type fuseWritebackCache string
 
 const (
 	fuseSyncModeAuto        fuseSyncMode = "auto"
@@ -23,6 +24,10 @@ const (
 	fuseDurabilityFsync       fuseDurability = "fsync"
 	fuseDurabilityCloseSync   fuseDurability = "close-sync"
 	fuseDurabilityWriteSync   fuseDurability = "write-sync"
+
+	fuseWritebackCacheAuto fuseWritebackCache = "auto"
+	fuseWritebackCacheOn   fuseWritebackCache = "on"
+	fuseWritebackCacheOff  fuseWritebackCache = "off"
 )
 
 type mountFuseOptions struct {
@@ -52,6 +57,7 @@ type mountFuseOptions struct {
 	TrustLocalEvents        bool
 	SyncMode                fuseSyncMode
 	WritePolicy             fuseWritePolicy
+	WritebackCache          fuseWritebackCache
 	Profile                 string
 	LayerRef                string
 	CheckpointRef           string
@@ -121,5 +127,18 @@ func parseFuseDurability(s string) (fuseSyncMode, fuseWritePolicy, error) {
 		return fuseSyncModeStrict, fuseWritePolicyWriteSync, nil
 	default:
 		return "", "", fmt.Errorf("unknown durability %q (valid: auto, interactive, fsync, close-sync, write-sync)", s)
+	}
+}
+
+func parseFuseWritebackCache(s string) (fuseWritebackCache, error) {
+	switch fuseWritebackCache(s) {
+	case fuseWritebackCacheAuto:
+		return fuseWritebackCacheAuto, nil
+	case fuseWritebackCacheOn:
+		return fuseWritebackCacheOn, nil
+	case fuseWritebackCacheOff:
+		return fuseWritebackCacheOff, nil
+	default:
+		return "", fmt.Errorf("unknown writeback cache mode %q (valid: auto, on, off)", s)
 	}
 }

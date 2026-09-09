@@ -254,6 +254,8 @@ Dat9FS (drive9 frontend: namespace, dir cache, write-back, layers, git workspace
 
 `vfs.Config` keeps `AttrTimeout`/`EntryTimeout`/`DirEntryTimeout` at one second and enables writeback, matching the JuiceFS FUSE defaults that the perf tests were tuned against.
 
+The kernel-side `FUSE_WRITEBACK_CACHE` cap is mount-wide and is decided by `--durability`: it is on for `auto`/`interactive`/`fsync`/`close-sync`, whose promises all end in an explicit flush that the kernel performs after writing the dirty range back to the daemon, and off for `write-sync`, where `write()` itself must be remote-durable. `--writeback-cache on|off` overrides the default. Extent files depend on this cap: without it every 4KiB write becomes its own FUSE `WRITE`, and concurrent small writes stall the extent write path (`community.sqlite` mptest/threadtest3).
+
 ## 4.3 Operation dispatch
 
 | Kernel operation | drive9 handling for an extent file |
