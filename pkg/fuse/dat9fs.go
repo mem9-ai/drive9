@@ -13823,14 +13823,15 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFlush, perfStart, status, 0) }()
 	fh, ok := fs.fileHandles.Get(input.Fh)
-	if !ok {
-		return gofuse.OK
-	}
-	if fh.isExtent() {
+	if ok && fh.isExtent() {
+		// Extent handles release POSIX locks inside JuiceFS VFS.Flush.
 		return fs.extentFlush(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh, input.LockOwner)
 	}
 	if lockOwner := fuseLockOwner(input.LockOwner, input.Pid, input.Fh); lockOwner != 0 {
 		fs.locks.release(input.NodeId, lockOwner)
+	}
+	if !ok {
+		return gofuse.OK
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
