@@ -59,6 +59,11 @@ var testHookAfterGitOverlaySlotReserved func(op string)
 // Unlink has fully returned and dropped the live block count.
 var testHookAfterGitOverlaySlotWait func(op string)
 
+// testHookAfterGitOverlayAttemptSample fires after sampling the unlink
+// attempt id and before reserving the overlay slot. Tests use it to run
+// Unlink after a handle has captured bytes but before it joins the queue.
+var testHookAfterGitOverlayAttemptSample func(op string)
+
 // testHookAfterEmptyLocalScan runs after an empty-list leader scans local
 // markers and before it relocks to decide whether to disarm. Tests only.
 var testHookAfterEmptyLocalScan func()
@@ -4473,6 +4478,16 @@ func (fs *Dat9FS) gitOverlayShouldDropQueuedPublish(op, workspaceID, rel string,
 	return committed >= reservedAttempt
 }
 
+func gitOverlayHandleUnlinked(fh *FileHandle) bool {
+	if fh == nil {
+		return false
+	}
+	fh.Lock()
+	unlinked := fh.Unlinked
+	fh.Unlock()
+	return unlinked
+}
+
 func (fs *Dat9FS) putGitOverlayRemote(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest) (*client.GitOverlayEntry, error) {
 	if fs == nil || fs.client == nil {
 		return nil, syscall.EIO
@@ -4498,15 +4513,24 @@ func (fs *Dat9FS) putGitOverlay(ctx context.Context, workspaceID string, req cli
 	if fs != nil && fs.opts != nil && fs.opts.WritePolicy != "" {
 		policy = fs.opts.WritePolicy
 	}
-	return fs.putGitOverlayWithPolicy(ctx, workspaceID, req, policy, false)
+	return fs.putGitOverlayWithPolicy(ctx, workspaceID, req, policy, false, nil)
 }
 
-func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest, policy WritePolicy, forceSync bool) (*client.GitOverlayEntry, error) {
+func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest, policy WritePolicy, forceSync bool, fh *FileHandle) (*client.GitOverlayEntry, error) {
 	req = normalizeGitOverlayRequest(req)
 	localEntry := gitOverlayEntryFromRequest(workspaceID, req)
 	reservedAttempt := fs.gitOverlayUnlinkAttemptIfBlocked(workspaceID, req.Path)
 	if req.Op == "whiteout" {
 		reservedAttempt = 0
+	}
+	if testHookAfterGitOverlayAttemptSample != nil {
+		testHookAfterGitOverlayAttemptSample(req.Op)
+	}
+	dropQueued := func() bool {
+		if req.Op != "whiteout" && gitOverlayHandleUnlinked(fh) {
+			return true
+		}
+		return fs.gitOverlayShouldDropQueuedPublish(req.Op, workspaceID, req.Path, reservedAttempt)
 	}
 	if fs.gitOverlayWriteBackEnabled(policy, forceSync) {
 		pendingSeq := fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
@@ -4528,7 +4552,7 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 				testHookAfterGitOverlaySlotWait(req.Op)
 			}
 			defer close(done)
-			if fs.gitOverlayShouldDropQueuedPublish(req.Op, workspaceID, req.Path, reservedAttempt) {
+			if dropQueued() {
 				return
 			}
 			timeout := releaseTimeout(req.SizeBytes)
@@ -4559,7 +4583,7 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 		testHookAfterGitOverlaySlotWait(req.Op)
 	}
 	defer close(done)
-	if fs.gitOverlayShouldDropQueuedPublish(req.Op, workspaceID, req.Path, reservedAttempt) {
+	if dropQueued() {
 		return nil, errGitOverlayPublishSuppressed
 	}
 	entry, err := fs.putGitOverlayRemote(ctx, workspaceID, req)
@@ -4679,7 +4703,7 @@ func (fs *Dat9FS) syncGitDirtyMirrorRoot(workspaceID string, rt *gitWorkspaceRun
 			BaseObjectSHA: base,
 			Content:       data,
 			SizeBytes:     int64(len(data)),
-		}, WritePolicyWriteSync, true)
+		}, WritePolicyWriteSync, true, nil)
 		cancel()
 		if err != nil {
 			safeLogPrintf("git workspace dirty mirror sync failed workspace=%s root=%s path=%s: %v", workspaceID, dirtyRoot, rel, err)
@@ -4723,7 +4747,7 @@ func (fs *Dat9FS) flushGitLocalFileHandleLockedWithPolicy(ctx context.Context, f
 		SizeBytes:     int64(len(data)),
 	}
 	fh.Unlock()
-	_, err = fs.putGitOverlayWithPolicy(ctx, fh.GitWorkspaceID, req, fh.WritePolicy, forceSync)
+	_, err = fs.putGitOverlayWithPolicy(ctx, fh.GitWorkspaceID, req, fh.WritePolicy, forceSync, fh)
 	fh.Lock()
 	if errors.Is(err, errGitOverlayPublishSuppressed) {
 		return gofuse.OK
@@ -4775,7 +4799,7 @@ func (fs *Dat9FS) flushGitHandleLockedWithPolicy(ctx context.Context, fh *FileHa
 			SizeBytes:     fh.OrigSize,
 		}
 		fh.Unlock()
-		_, err := fs.putGitOverlayWithPolicy(ctx, fh.GitWorkspaceID, req, fh.WritePolicy, forceSync)
+		_, err := fs.putGitOverlayWithPolicy(ctx, fh.GitWorkspaceID, req, fh.WritePolicy, forceSync, fh)
 		fh.Lock()
 		if errors.Is(err, errGitOverlayPublishSuppressed) {
 			return gofuse.OK
@@ -4801,7 +4825,7 @@ func (fs *Dat9FS) flushGitHandleLockedWithPolicy(ctx context.Context, fh *FileHa
 		SizeBytes:     int64(len(data)),
 	}
 	fh.Unlock()
-	_, err := fs.putGitOverlayWithPolicy(ctx, fh.GitWorkspaceID, req, fh.WritePolicy, forceSync)
+	_, err := fs.putGitOverlayWithPolicy(ctx, fh.GitWorkspaceID, req, fh.WritePolicy, forceSync, fh)
 	fh.Lock()
 	if errors.Is(err, errGitOverlayPublishSuppressed) {
 		return gofuse.OK
