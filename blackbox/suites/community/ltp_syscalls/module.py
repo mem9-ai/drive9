@@ -40,7 +40,8 @@ class CommunityLTPSyscalls(BaseModule):
                 scenario = "syscalls"
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_ltp_syscalls", remote, profile="none", extra=["--allow-other"])
+        profile = os.environ.get("FUSE_PROFILE") or "none"
+        handle = ctx.target.mount("community_ltp_syscalls", remote, profile=profile, extra=["--allow-other"])
         try:
             work = handle.mountpoint / "ltp-work"
             work.mkdir()
@@ -70,7 +71,9 @@ class CommunityLTPSyscalls(BaseModule):
 
             failures: list[str] = []
             for sc in scenarios:
-                cmd = build_ltp_runner_cmd(runner, sc, work)
+                kirk_tmp = ctx.artifact_dir(self.id) / f"kirk-{sc}"
+                kirk_tmp.mkdir(parents=True, exist_ok=True)
+                cmd = build_ltp_runner_cmd(runner, sc, work, session_dir=kirk_tmp)
                 result = ctx.target.run_cmd(
                     "community-ltp-syscalls",
                     cmd,

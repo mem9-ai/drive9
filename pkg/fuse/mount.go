@@ -1516,13 +1516,18 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 		Name:               "drive9",
 		MaxReadAhead:       8 * 1024 * 1024, // 8MB — larger readahead reduces FUSE kernel↔userspace switches
 		MaxWrite:           128 * 1024,      // 128KB per write request (default 64KB)
-		MaxBackground:      32,              // concurrent background FUSE requests (default 12)
+		MaxBackground:      200,             // JuiceFS GenFuseOpt MaxBackground
 		SyncRead:           opts.SyncRead,   // disables FUSE_CAP_ASYNC_READ; one read in flight per file handle
 		DirectMountStrict:  opts.DirectMountStrict,
 		EnableLocks:        true,
 		Debug:              opts.Debug,
 		AllowOther:         opts.AllowOther,
 		EnableDirectIoMmap: true, // allow mmap on FOPEN_DIRECT_IO handles (e.g. SQLite *.db with mmap_size>0); no-op on kernels without CAP_DIRECT_IO_ALLOW_MMAP
+		// JuiceFS `-o writeback_cache`: sqlite page writes complete in the
+		// kernel page cache instead of one FUSE WRITE per 4KiB. Without it,
+		// VFS.Read of a dirty WAL (cache_size=10) Flushes and HTTP-commits
+		// slices on every spill. macFUSE/older kernels ignore the cap.
+		EnableWriteback: runtime.GOOS == "linux",
 	}
 	if runtime.GOOS == "linux" {
 		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively

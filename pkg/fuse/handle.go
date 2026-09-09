@@ -8,7 +8,6 @@ import (
 	"time"
 
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
-	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
@@ -87,9 +86,8 @@ type FileHandle struct {
 	ShadowStageGen     uint64 // shadowStore content generation staged by this handle (0 = none)
 	ShadowStageSeq     uint64 // DirtySeq represented by ShadowStageGen
 	RemoteCommitUnlock func() // held same-path commit lock while local shadow state is reserved
-	extentIno jfsmeta.Ino
-	extentW   vfs.FileWriter
-	extentR   vfs.FileReader
+	extentIno          jfsmeta.Ino
+	extentFh           uint64 // JuiceFS vfs.VFS handle; 0 until Open/Create
 	// A zero truncate can reach a sibling while it holds mu waiting for the
 	// path lock. Publish the event without taking that sibling's mu.
 	pendingSQLiteTruncate atomic.Pointer[sqliteHandleTruncate]
@@ -151,6 +149,8 @@ type DirHandle struct {
 	Path              string
 	Entries           []DirEntry // guarded by mu; stable snapshot for one directory enumeration sequence
 	entriesGeneration uint64
+	extentIno         jfsmeta.Ino
+	extentFh          uint64 // JuiceFS vfs.Opendir handle; 0 when not grafted
 }
 
 func (dh *DirHandle) lockRead(ctx context.Context) bool {
@@ -194,6 +194,7 @@ type DirEntry struct {
 	IsDir      bool
 	ResourceID string
 	Nlink      uint32
+	ExtentIno  uint64
 
 	HasMetadata bool
 }
@@ -228,6 +229,25 @@ func (ht *HandleTable[T]) Allocate(val T) uint64 {
 	ht.table[fh] = val
 	ht.nextFh++
 	return fh
+}
+
+// PutIfAbsent stores val at id when that slot is free. JuiceFS fuse uses the
+// VFS fh as the kernel Fh so writeback WRITE(in.Fh) still hits VFS after
+// Dat9FS Release (releaseFileHandle runs asynchronously).
+func (ht *HandleTable[T]) PutIfAbsent(id uint64, val T) bool {
+	if ht == nil || id == 0 {
+		return false
+	}
+	ht.mu.Lock()
+	defer ht.mu.Unlock()
+	if _, ok := ht.table[id]; ok {
+		return false
+	}
+	ht.table[id] = val
+	if id >= ht.nextFh {
+		ht.nextFh = id + 1
+	}
+	return true
 }
 
 // Get looks up a value by handle ID. It returns the value and true if found,

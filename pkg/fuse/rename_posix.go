@@ -79,6 +79,9 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 		if err != nil {
 			return oldInfo, renamePathInfo{}, httpToFuseStatus(err)
 		}
+		if newParentInfo.hasMode && isSymlinkMode(newParentInfo.mode) {
+			return oldInfo, renamePathInfo{}, gofuse.Status(syscall.ELOOP)
+		}
 		if !newParentInfo.exists || !newParentInfo.isDir {
 			return oldInfo, renamePathInfo{}, gofuse.ENOENT
 		}
@@ -95,6 +98,9 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 	}
 	if st := fs.renameCheckSticky(caller, oldParentInfo, oldInfo); st != gofuse.OK {
 		return oldInfo, renamePathInfo{}, st
+	}
+	if oldParentInfo.hasMode && isSymlinkMode(oldParentInfo.mode) {
+		return oldInfo, renamePathInfo{}, gofuse.Status(syscall.ELOOP)
 	}
 
 	newInfo, err := fs.renamePathInfo(ctx, newP)

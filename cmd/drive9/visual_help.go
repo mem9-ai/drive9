@@ -771,7 +771,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "--readdir-prefetch-timeout DURATION", Desc: "timeout for one readdir prefetch batch"},
 				}},
 				{Title: "Overlay profiles", Flags: []visualHelpFlag{
-					{Name: "--profile NAME", Desc: "mount profile: coding-agent, portable, none, interactive, or a custom profile file"},
+					{Name: "--profile NAME", Desc: "mount profile: coding-agent, portable, none, extent, interactive, or a custom profile file"},
 					{Name: "--local-root DIR", Desc: "local-only overlay storage root; auto-generated for overlay profiles"},
 					{Name: "--local-only PATTERN", Desc: "add a local-only rule; repeatable; env DRIVE9_MOUNT_LOCAL_ONLY_PATTERNS is newline-delimited"},
 					{Name: "--remote-only PATTERN", Desc: "force remote-persistent routing over local rules; repeatable; env DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS is newline-delimited"},

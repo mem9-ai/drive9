@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
 from pathlib import Path
@@ -37,13 +38,26 @@ def ensure_fsx(ctx: Context) -> str:
     raise DependencyUnavailable("fsx binary not found after preparing secfs.test")
 
 
+def _libc_has_strlcpy() -> bool:
+    """glibc 2.38+ exports strlcpy; Amazon Linux 2023 (glibc 2.34) does not."""
+    try:
+        ctypes.CDLL(None).strlcpy
+        return True
+    except AttributeError:
+        return False
+
+
 def _patch_fsx_for_glibc_strlcpy(root_dir: Path) -> None:
     """Skip bundled strlcpy/strlcat on Linux when glibc already provides them.
 
     secfs.test defines static strlcpy/strlcat under ``#if defined(__linux__)``,
     which fails to compile on glibc that exports those symbols (Arch, recent
     Fedora/Ubuntu). Prefer the libc implementations on Linux.
+    Older glibc (Amazon Linux 2023 is 2.34) still needs the bundled copies.
     """
+    if not _libc_has_strlcpy():
+        progress("dependency patch: libc has no strlcpy; keep bundled fsx copies")
+        return
     candidates = (
         root_dir / "fstools" / "src" / "fsx" / "fsx.c",
         root_dir / "tools" / "fsx" / "fsx.c",

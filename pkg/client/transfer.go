@@ -144,8 +144,8 @@ const (
 var errReadTargetNoRedirect = errors.New("parallel download unavailable without redirect")
 
 // IsReadTargetNoRedirect reports whether err indicates that a read target could
-// not be resolved because the server returned an inline file body instead of a
-// redirect to object storage.
+// not be resolved because the server returned an inline body or an extent
+// layout hint instead of a redirect to a single object URL.
 func IsReadTargetNoRedirect(err error) bool {
 	return errors.Is(err, errReadTargetNoRedirect)
 }
@@ -1351,6 +1351,15 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 	}
 
 	switch {
+	case resp.StatusCode == http.StatusUnprocessableEntity:
+		ino, length, ok := extentHintFromResponse(resp)
+		if !ok {
+			defer func() { _ = resp.Body.Close() }()
+			return nil, readError(resp)
+		}
+		_ = resp.Body.Close()
+		return c.openExtentStream(ino, length, 0, 0)
+
 	case resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusTemporaryRedirect:
 		// Large file: follow presigned URL
 		_ = resp.Body.Close()
@@ -1401,8 +1410,9 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path string) (*http.Re
 }
 
 // ResolveReadTarget resolves a large S3-backed file path to a reusable object
-// URL. Inline files return an error matched by IsReadTargetNoRedirect because
-// there is no object URL to reuse.
+// URL. Inline files and content_layout=extent files return an error matched by
+// IsReadTargetNoRedirect because there is no single object URL to reuse;
+// callers fall back to ReadStream (extent uses the JuiceFS DataReader).
 func (c *Client) ResolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
 	return c.resolveReadTarget(ctx, path)
 }
@@ -1421,6 +1431,12 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarge
 			return nil, fmt.Errorf("302 without Location header")
 		}
 		return &ReadTarget{ObjectURL: location}, nil
+
+	case resp.StatusCode == http.StatusUnprocessableEntity:
+		if _, _, ok := extentHintFromResponse(resp); ok {
+			return nil, errReadTargetNoRedirect
+		}
+		return nil, readError(resp)
 
 	case resp.StatusCode >= 300:
 		return nil, readError(resp)
@@ -1476,6 +1492,15 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 	}
 
 	switch {
+	case resp.StatusCode == http.StatusUnprocessableEntity:
+		ino, fileLen, ok := extentHintFromResponse(resp)
+		if !ok {
+			defer func() { _ = resp.Body.Close() }()
+			return nil, readError(resp)
+		}
+		_ = resp.Body.Close()
+		return c.openExtentStream(ino, fileLen, offset, length)
+
 	case resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusTemporaryRedirect:
 		_ = resp.Body.Close()
 		location := resp.Header.Get("Location")

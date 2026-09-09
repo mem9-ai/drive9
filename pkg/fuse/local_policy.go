@@ -12,6 +12,7 @@ const (
 	MountProfileInteractive = "interactive"
 	MountProfileCodingAgent = "coding-agent"
 	MountProfileNone        = "none"
+	MountProfileExtent      = "extent"
 )
 
 type PathLayer string
@@ -83,7 +84,7 @@ func validMountProfile(profile string) bool {
 
 func profileAllowsLocalPolicy(profile string) bool {
 	profile = strings.TrimSpace(profile)
-	return profile != "" && profile != MountProfileInteractive && profile != MountProfileNone
+	return profile != "" && profile != MountProfileInteractive && profile != MountProfileNone && profile != MountProfileExtent
 }
 
 func validMountProfileName(profile string) bool {

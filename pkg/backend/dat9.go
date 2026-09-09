@@ -1540,6 +1540,9 @@ type ReadPlan struct {
 	InlineData []byte
 	// PresignURL is non-empty for S3-stored files — the 302 redirect target.
 	PresignURL string
+	// ExtentIno is set for content_layout=extent files. Bytes are not served
+	// by the server; the client reads object storage with data-credential.
+	ExtentIno uint64
 	// Size is the file size in bytes.
 	Size int64
 	// Revision is the file revision observed by the same metadata query.
@@ -1630,6 +1633,21 @@ func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (plan *ReadP
 			Size:       nf.File.SizeBytes,
 			Revision:   nf.File.Revision,
 			Mtime:      fileMtime(nf.File),
+		}, nil
+	case datastore.StorageExtent:
+		proj, err := b.store.GetExtentProjection(ctx, resolvedPath)
+		if err != nil {
+			return nil, err
+		}
+		if proj == nil || proj.ExtentIno == 0 {
+			return nil, fmt.Errorf("extent file missing inode")
+		}
+		phase = "extent_hint"
+		return &ReadPlan{
+			ExtentIno: proj.ExtentIno,
+			Size:      nf.File.SizeBytes,
+			Revision:  nf.File.Revision,
+			Mtime:     fileMtime(nf.File),
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported storage type for read plan: %s", nf.File.StorageType)

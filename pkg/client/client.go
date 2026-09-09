@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mem9-ai/drive9/pkg/extent"
 	"github.com/mem9-ai/drive9/pkg/tagutil"
 )
 
@@ -45,6 +46,9 @@ type Client struct {
 	// raced with concurrent uploads.
 	statusMax    atomic.Int64 // tenant max_upload_bytes from /v1/status; 0 if unavailable
 	statusInline atomic.Int64 // server inline_threshold from /v1/status; 0 if unavailable
+
+	extentMu sync.Mutex
+	extentRT *extent.Runtime
 }
 
 // tenantStatusResponse mirrors the server's TenantStatusResponse JSON shape.
@@ -275,8 +279,9 @@ type FileInfo struct {
 type StorageType string
 
 const (
-	StorageTypeDB9 StorageType = "db9"
-	StorageTypeS3  StorageType = "s3"
+	StorageTypeDB9    StorageType = "db9"
+	StorageTypeS3     StorageType = "s3"
+	StorageTypeExtent StorageType = "extent"
 )
 
 // ContentLayout identifies the server's physical content layout.
@@ -866,19 +871,12 @@ func (c *Client) Read(path string) ([]byte, error) {
 
 // ReadCtx downloads a file's content with context support.
 func (c *Client) ReadCtx(ctx context.Context, path string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url(path), nil)
+	rc, err := c.ReadStream(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode >= 300 {
-		return nil, readError(resp)
-	}
-	return io.ReadAll(resp.Body)
+	defer func() { _ = rc.Close() }()
+	return io.ReadAll(rc)
 }
 
 // ReadAt downloads at most length bytes starting at offset.

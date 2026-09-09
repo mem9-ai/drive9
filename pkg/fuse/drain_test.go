@@ -35,6 +35,35 @@ func TestDrainResponseStatusMapsRetryableKind(t *testing.T) {
 	}
 }
 
+func TestDrainExtentHandleIgnoresDat9DirtySeq(t *testing.T) {
+	fs := newTestDrainFS()
+	fs.fileHandles.Allocate(&FileHandle{
+		Path:      "/e.txt",
+		extentIno: 4,
+		extentFh:  2,
+		DirtySeq:  1,
+	})
+
+	resp := fs.Drain(context.Background())
+	if !resp.OK {
+		t.Fatalf("Drain OK = false, error_kind=%q error=%q pending=%+v", resp.ErrorKind, resp.Error, resp.Pending)
+	}
+	if resp.Pending.OpenHandles != 1 || resp.Pending.DirtyHandles != 0 {
+		t.Fatalf("pending = %+v, want one clean extent handle", resp.Pending)
+	}
+	if !hasDrainPhase(resp, "flush_extent") {
+		t.Fatalf("phases = %+v, want flush_extent phase", resp.Phases)
+	}
+}
+
+func TestDrainHandleLockedRoutesExtentWithoutDat9Dirty(t *testing.T) {
+	fs := newTestDrainFS()
+	fh := &FileHandle{Path: "/e.txt", extentIno: 9, extentFh: 3}
+	if st := fs.drainHandleLocked(context.Background(), fh); st != gofuse.OK {
+		t.Fatalf("drainHandleLocked extent: %v", st)
+	}
+}
+
 func TestDrainAllowsCleanOpenHandles(t *testing.T) {
 	fs := newTestDrainFS()
 	fs.fileHandles.Allocate(&FileHandle{Path: "/clean.txt"})

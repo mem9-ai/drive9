@@ -13,10 +13,15 @@ const (
 	defaultMetaConnMaxIdleTime       = 1 * time.Minute
 	defaultMetaMaxOpenConns          = 100
 	defaultMetaMaxIdleConns          = 20
-	defaultUserConnMaxLifetime       = 5 * time.Minute
-	defaultUserConnMaxIdleTime       = 1 * time.Minute
-	defaultUserMaxOpenConns          = 6
-	defaultUserMaxIdleConns          = 2
+	defaultUserConnMaxLifetime = 5 * time.Minute
+	defaultUserConnMaxIdleTime = 1 * time.Minute
+	// JuiceFS mysql meta uses database/sql default MaxOpenConns=0 (unlimited).
+	// Extent FUSE issues one TiDB txn per JuiceFS op; a 6-conn cap queued
+	// sqlite DELETE exclusive COMMITs past mptest --wait all (10s) and
+	// produced go-sql-driver "busy buffer" / "driver: bad connection" under
+	// concurrent threadtest.
+	defaultUserMaxOpenConns = 64
+	defaultUserMaxIdleConns = 16
 	defaultUserSchemaConnMaxLifetime = 3 * time.Minute
 	defaultUserSchemaConnMaxIdleTime = 20 * time.Second
 	defaultUserSchemaMaxOpenConns    = 8

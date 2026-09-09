@@ -250,9 +250,9 @@ start_mount() {
   # Force FUSE mode for POSIX permission tests; WebDAV does not propagate
   # chmod/mkdir -m mode bits.
   if [ "$mmode" = "ro" ]; then
-    drive9 mount --mode=fuse --read-only "$MOUNT_POINT" >/dev/null 2>&1 &
+    drive9 mount --mode=fuse --read-only ${FUSE_PROFILE:+--profile} ${FUSE_PROFILE:+"$FUSE_PROFILE"} "$MOUNT_POINT" >/dev/null 2>&1 &
   else
-    drive9 mount --mode=fuse "$MOUNT_POINT" >/dev/null 2>&1 &
+    drive9 mount --mode=fuse ${FUSE_PROFILE:+--profile} ${FUSE_PROFILE:+"$FUSE_PROFILE"} "$MOUNT_POINT" >/dev/null 2>&1 &
   fi
   MOUNT_PID="$!"
   wait_mount_state mounted

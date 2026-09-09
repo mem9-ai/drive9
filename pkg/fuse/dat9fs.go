@@ -591,7 +591,8 @@ func (fs *Dat9FS) childPath(parentIno uint64, name string) (string, gofuse.Statu
 	if !ok {
 		return "", gofuse.ENOENT
 	}
-	if parentPath == "/" {
+	parentPath = strings.TrimRight(parentPath, "/")
+	if parentPath == "" || parentPath == "/" {
 		return "/" + name, gofuse.OK
 	}
 	return parentPath + "/" + name, gofuse.OK
@@ -4861,6 +4862,9 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 		out.Mode = fileKind | (mode & posixPermissionModeMask)
 		out.Rdev = entry.Rdev
 		out.Nlink = entry.Nlink
+		if n := uint32(len(entry.Paths)); n > 0 {
+			out.Nlink = n
+		}
 		if out.Nlink == 0 && !entry.Unlinked {
 			out.Nlink = 1
 		}
@@ -4902,13 +4906,29 @@ func symlinkMode() uint32 {
 func (fs *Dat9FS) fillEntryOut(entry *InodeEntry, out *gofuse.EntryOut) {
 	out.NodeId = entry.Ino
 	out.Generation = 1
+	if entry.ExtentIno != 0 && !entry.IsDir && entry.Size <= 0 && fs.extentVFS() != nil {
+		fs.extentRefreshFromVFS(entry.Ino, entry.Path, 0)
+		if e, ok := fs.inodes.GetEntry(entry.Ino); ok {
+			entry = e
+		}
+	}
+	// JuiceFS replyEntry: UpdateLength in-memory (writer vs attr), no extra GetAttr RPC.
+	fs.extentApplyWriterLength(entry)
 	fs.fillAttr(entry, &out.Attr)
 	entryTTL := fs.opts.EntryTTL
+	attrTTL := fs.opts.AttrTTL
 	if isLockFilePath(entry.Path) {
 		entryTTL = 0
 	}
+	// JuiceFS replyEntry: --attr-cache/--entry-cache 1.0s, then UpdateLength.
+	// Timeout 0 forced every getattr through VFS.GetAttr HTTP.
+	if entry.ExtentIno != 0 || (!entry.IsDir && fs.shouldUseExtentPath(entry.Path)) {
+		ttl := extentAttrTimeout(entry)
+		entryTTL = ttl
+		attrTTL = ttl
+	}
 	out.SetEntryTimeout(entryTTL)
-	out.SetAttrTimeout(fs.opts.AttrTTL)
+	out.SetAttrTimeout(attrTTL)
 }
 
 func isLockFilePath(p string) bool {
@@ -6080,6 +6100,7 @@ func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
 		HasGID:     entry.HasGID,
 		ResourceID: entry.ResourceID,
 		Nlink:      entry.Nlink,
+		ExtentIno:  entry.ExtentIno,
 	}
 }
 
@@ -6097,6 +6118,7 @@ func cachedInfoFromStat(name string, stat *client.StatResult) CachedFileInfo {
 		item.Mode = stat.Mode
 		item.ResourceID = stat.ResourceID
 		item.Nlink = stat.Nlink
+		item.ExtentIno = stat.ExtentIno
 	}
 	return item
 }
@@ -6796,6 +6818,10 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 		if mtime.IsZero() {
 			mtime = time.Now()
 		}
+		// Do not FindByExtentIno from dir-cache ExtentIno: after rename-replace
+		// the dest name can still cache the old dest juicefs ino, which would
+		// alias dest's FUSE nodeid onto the source path (pjdfstest expected N
+		// got N+2). Stat-path Lookup still reuses by live juicefs identity.
 		ino := fs.inodes.LookupWithIdentity(childP, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
@@ -7184,13 +7210,29 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if !stat.Mtime.IsZero() {
 		mtime = stat.Mtime
 	}
-	ino := fs.inodes.LookupWithIdentity(childP, stat.ResourceID, stat.Nlink, stat.IsDir, stat.Size, mtime)
+	ino := uint64(0)
+	if !stat.IsDir && stat.ExtentIno != 0 {
+		if existing, ok := fs.inodes.FindByExtentIno(stat.ExtentIno); ok {
+			if fs.inodes.AddAlias(existing, childP, stat.ResourceID, stat.Nlink, false, stat.Size, mtime) {
+				ino = existing
+			}
+		}
+	}
+	if ino == 0 {
+		ino = fs.inodes.LookupWithIdentity(childP, stat.ResourceID, stat.Nlink, stat.IsDir, stat.Size, mtime)
+	}
 	// Store server revision for cache validation.
 	if stat.Revision > 0 {
 		fs.inodes.UpdateRevision(ino, stat.Revision)
 	}
 	if stat.HasMode {
 		fs.inodes.UpdateMode(ino, stat.Mode)
+	}
+	if stat.ContentLayout == client.ContentLayoutExtent && stat.ExtentIno != 0 {
+		fs.inodes.SetExtentIno(ino, stat.ExtentIno)
+	}
+	if !stat.IsDir && (stat.ContentLayout == client.ContentLayoutExtent || fs.shouldUseExtentPath(childP)) {
+		fs.extentRefreshFromVFS(ino, childP, 0)
 	}
 	fs.dirCache.Upsert(parentPath, cachedInfoFromStat(name, stat))
 	entry, ok := fs.inodes.GetEntry(ino)
@@ -7697,7 +7739,7 @@ func (fs *Dat9FS) openHandleEntry(p string) (*InodeEntry, bool) {
 			continue
 		}
 		fh.Lock()
-		if fh.Dirty == nil {
+		if fh.Unlinked || fh.Dirty == nil {
 			fh.Unlock()
 			continue
 		}
@@ -7757,7 +7799,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	if entryIsMetadataOnlySpecial(entry) {
+	if localOnlySpecialEntry(entry) {
 		fs.fillAttr(entry, &out.Attr)
 		out.SetTimeout(fs.opts.AttrTTL)
 		return gofuse.OK
@@ -7821,113 +7863,127 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		return gofuse.OK
 	}
 
-	// Prefer unflushed writable state over the remote object size.
-	if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
-		entry.Size = size
-	} else if gitEntry, handled := fs.gitEntry(ctx, entry.Path, false); handled {
-		if gitEntry == nil {
-			return gofuse.ENOENT
+	// Extent files: size/owner/mode come from JuiceFS VFS GetAttr, not
+	// file_nodes. Directories keep Dat9FS mkdir mode (sticky/owner).
+	// Kernel i_size (and therefore O_APPEND) follows VFS.
+	if !entry.IsDir && fs.extentRefreshFromVFS(input.NodeId, entry.Path, input.Fh()) {
+		if refreshed, ok := fs.inodes.GetEntry(input.NodeId); ok {
+			entry = refreshed
 		}
-		entry = gitEntry
-	} else if fs.writeBack != nil && !entry.IsDir {
-		// Check pending index first (in-memory, O(1)), then fall back
-		// to old GetMeta for backward compatibility.
-		pendingFound := false
-		if fs.pendingIndex != nil {
-			if meta, ok := fs.pendingIndex.GetMeta(entry.Path); ok {
-				entry.Size = meta.Size
-				if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
-					entry.Mtime = meta.Mtime
-				}
-				pendingFound = true
+		fs.applyLayerFileMode(entry.Path, input.NodeId, entry)
+		fs.extentKeepOpenWALIndexSize(entry)
+		fs.fillAttr(entry, &out.Attr)
+		out.SetTimeout(extentAttrTimeout(entry))
+		return gofuse.OK
+	}
+	{
+		if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
+			entry.Size = size
+		} else if gitEntry, handled := fs.gitEntry(ctx, entry.Path, false); handled {
+			if gitEntry == nil {
+				return gofuse.ENOENT
 			}
-		}
-		if !pendingFound {
-			if meta, ok := fs.writeBack.GetMeta(entry.Path); ok {
-				entry.Size = meta.Size
-				if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
-					entry.Mtime = meta.Mtime
+			entry = gitEntry
+		} else if fs.writeBack != nil && !entry.IsDir {
+			// Check pending index first (in-memory, O(1)), then fall back
+			// to old GetMeta for backward compatibility.
+			pendingFound := false
+			if fs.pendingIndex != nil {
+				if meta, ok := fs.pendingIndex.GetMeta(entry.Path); ok {
+					entry.Size = meta.Size
+					if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
+						entry.Mtime = meta.Mtime
+					}
+					pendingFound = true
 				}
-				pendingFound = true
 			}
-		}
-		if !pendingFound {
+			if !pendingFound {
+				if meta, ok := fs.writeBack.GetMeta(entry.Path); ok {
+					entry.Size = meta.Size
+					if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
+						entry.Mtime = meta.Mtime
+					}
+					pendingFound = true
+				}
+			}
+			if !pendingFound {
+				if cachedEntry, ok := fs.cachedAttrEntry(entry); ok {
+					entry = cachedEntry
+					pendingFound = true
+				}
+			}
+			if !pendingFound && input.NodeId != 1 {
+				stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
+				if err != nil {
+					return listDirErrToFuseStatus(err)
+				}
+				if !fs.lockMountViewRead(statGeneration) {
+					return gofuse.Status(syscall.EAGAIN)
+				}
+				defer fs.mountViewMu.RUnlock()
+				entry.Size = stat.Size
+				entry.IsDir = stat.IsDir
+				fs.inodes.UpdateSize(input.NodeId, stat.Size)
+				if stat.ResourceID != "" || stat.Nlink > 0 {
+					fs.inodes.SetIdentity(input.NodeId, stat.ResourceID, stat.Nlink)
+					entry.ResourceID = stat.ResourceID
+					entry.Nlink = stat.Nlink
+				}
+				if stat.Revision > 0 {
+					fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+				}
+				if stat.HasMode {
+					entry.Mode = stat.Mode
+					entry.HasMode = true
+					fs.inodes.UpdateMode(input.NodeId, stat.Mode)
+				}
+				if !stat.Mtime.IsZero() {
+					// Only adopt the remote mtime when the inode does not already
+					// have a newer local mtime. This prevents a stale remote mtime
+					// (e.g. creation time from before a local truncation) from
+					// clobbering a locally-updated mtime after the dirty handle is
+					// flushed and the remote stat path runs.
+					if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
+						entry.Mtime = stat.Mtime
+						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+					}
+				}
+			}
+		} else if input.NodeId != 1 {
+			// Some deployments do not support HEAD/stat on directories.
+			// Keep directory attrs from inode map and only refresh regular files.
 			if cachedEntry, ok := fs.cachedAttrEntry(entry); ok {
 				entry = cachedEntry
-				pendingFound = true
-			}
-		}
-		if !pendingFound && input.NodeId != 1 {
-			stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
-			if err != nil {
-				return listDirErrToFuseStatus(err)
-			}
-			if !fs.lockMountViewRead(statGeneration) {
-				return gofuse.Status(syscall.EAGAIN)
-			}
-			defer fs.mountViewMu.RUnlock()
-			entry.Size = stat.Size
-			entry.IsDir = stat.IsDir
-			fs.inodes.UpdateSize(input.NodeId, stat.Size)
-			if stat.ResourceID != "" || stat.Nlink > 0 {
-				fs.inodes.SetIdentity(input.NodeId, stat.ResourceID, stat.Nlink)
-				entry.ResourceID = stat.ResourceID
-				entry.Nlink = stat.Nlink
-			}
-			if stat.Revision > 0 {
-				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-			}
-			if stat.HasMode {
-				entry.Mode = stat.Mode
-				entry.HasMode = true
-				fs.inodes.UpdateMode(input.NodeId, stat.Mode)
-			}
-			if !stat.Mtime.IsZero() {
-				// Only adopt the remote mtime when the inode does not already
-				// have a newer local mtime. This prevents a stale remote mtime
-				// (e.g. creation time from before a local truncation) from
-				// clobbering a locally-updated mtime after the dirty handle is
-				// flushed and the remote stat path runs.
-				if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
-					entry.Mtime = stat.Mtime
-					fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+			} else if !entry.IsDir {
+				stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
+				if err != nil {
+					return listDirErrToFuseStatus(err)
 				}
-			}
-		}
-	} else if input.NodeId != 1 {
-		// Some deployments do not support HEAD/stat on directories.
-		// Keep directory attrs from inode map and only refresh regular files.
-		if cachedEntry, ok := fs.cachedAttrEntry(entry); ok {
-			entry = cachedEntry
-		} else if !entry.IsDir {
-			stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
-			if err != nil {
-				return listDirErrToFuseStatus(err)
-			}
-			if !fs.lockMountViewRead(statGeneration) {
-				return gofuse.Status(syscall.EAGAIN)
-			}
-			defer fs.mountViewMu.RUnlock()
-			entry.Size = stat.Size
-			entry.IsDir = stat.IsDir
-			fs.inodes.UpdateSize(input.NodeId, stat.Size)
-			if stat.ResourceID != "" || stat.Nlink > 0 {
-				fs.inodes.SetIdentity(input.NodeId, stat.ResourceID, stat.Nlink)
-				entry.ResourceID = stat.ResourceID
-				entry.Nlink = stat.Nlink
-			}
-			if stat.Revision > 0 {
-				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-			}
-			if stat.HasMode {
-				entry.Mode = stat.Mode
-				entry.HasMode = true
-				fs.inodes.UpdateMode(input.NodeId, stat.Mode)
-			}
-			if !stat.Mtime.IsZero() {
-				if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
-					entry.Mtime = stat.Mtime
-					fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+				if !fs.lockMountViewRead(statGeneration) {
+					return gofuse.Status(syscall.EAGAIN)
+				}
+				defer fs.mountViewMu.RUnlock()
+				entry.Size = stat.Size
+				entry.IsDir = stat.IsDir
+				fs.inodes.UpdateSize(input.NodeId, stat.Size)
+				if stat.ResourceID != "" || stat.Nlink > 0 {
+					fs.inodes.SetIdentity(input.NodeId, stat.ResourceID, stat.Nlink)
+					entry.ResourceID = stat.ResourceID
+					entry.Nlink = stat.Nlink
+				}
+				if stat.Revision > 0 {
+					fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+				}
+				if stat.HasMode {
+					entry.Mode = stat.Mode
+					entry.HasMode = true
+					fs.inodes.UpdateMode(input.NodeId, stat.Mode)
+				}
+				if !stat.Mtime.IsZero() {
+					if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
+						entry.Mtime = stat.Mtime
+						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+					}
 				}
 			}
 		}
@@ -7984,7 +8040,10 @@ func hasPOSIXSearchAccess(caller gofuse.Owner, file gofuse.Owner, mode uint32, i
 	return hasPOSIXAccess(caller, file, mode, gofuse.X_OK, inSupplementaryGroup)
 }
 
-const setGIDPermissionBit uint32 = 0o2000
+const (
+	setUIDPermissionBit uint32 = 0o4000
+	setGIDPermissionBit uint32 = 0o2000
+)
 
 func (fs *Dat9FS) entryOwner(entry *InodeEntry) gofuse.Owner {
 	owner := gofuse.Owner{Uid: fs.uid, Gid: fs.gid}
@@ -8104,11 +8163,19 @@ func (fs *Dat9FS) checkOpenAccess(ctx context.Context, input *gofuse.OpenIn, ent
 func (fs *Dat9FS) setAttrModeForCaller(input *gofuse.SetAttrIn, entry *InodeEntry) (uint32, gofuse.Status) {
 	caller := setAttrCallerOwner(input)
 	owner := fs.entryOwner(entry)
+	mode := input.Mode & posixPermissionModeMask
 	if caller.Uid != 0 && caller.Uid != owner.Uid {
+		// Kernel file_remove_privs issues SetAttr as the writer to drop
+		// SUID/SGID after a non-owner write. That is not a chmod by the
+		// caller; only allow clearing those bits.
+		oldMode := entry.Mode & posixPermissionModeMask
+		cleared := mode &^ (setUIDPermissionBit | setGIDPermissionBit)
+		oldCleared := oldMode &^ (setUIDPermissionBit | setGIDPermissionBit)
+		if cleared == oldCleared && mode&(setUIDPermissionBit|setGIDPermissionBit) == 0 {
+			return mode, gofuse.OK
+		}
 		return 0, gofuse.EPERM
 	}
-
-	mode := input.Mode & posixPermissionModeMask
 	if caller.Uid != 0 && entryIsRegularFile(entry) && mode&setGIDPermissionBit != 0 {
 		if caller.Gid != owner.Gid && !processHasSupplementaryGroup(input.Pid, owner.Gid) {
 			mode &^= setGIDPermissionBit
@@ -8158,6 +8225,36 @@ func resolveSetAttrOwner(input *gofuse.SetAttrIn) (uid uint32, hasUID bool, gid 
 		hasGID = false
 	}
 	return uid, hasUID, gid, hasGID
+}
+
+func processSupplementaryGroups(pid uint32) []uint32 {
+	if pid == 0 {
+		return nil
+	}
+	status, err := readProcessStatusFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return nil
+	}
+	return procStatusGroups(status)
+}
+
+func procStatusGroups(status []byte) []uint32 {
+	for _, line := range strings.Split(string(status), "\n") {
+		if !strings.HasPrefix(line, "Groups:") {
+			continue
+		}
+		fields := strings.Fields(strings.TrimPrefix(line, "Groups:"))
+		out := make([]uint32, 0, len(fields))
+		for _, field := range fields {
+			v, err := strconv.ParseUint(field, 10, 32)
+			if err != nil {
+				continue
+			}
+			out = append(out, uint32(v))
+		}
+		return out
+	}
+	return nil
 }
 
 func processHasSupplementaryGroup(pid, gid uint32) bool {
@@ -8246,7 +8343,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	sizeChanged := false
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	if entryIsMetadataOnlySpecial(entry) {
+	if localOnlySpecialEntry(entry) {
 		return fs.setMetadataOnlySpecialAttr(input, entry, out)
 	}
 	if input.Valid&gofuse.FATTR_FH == 0 {
@@ -8344,6 +8441,11 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		ctx, cf := fuseCtx(cancel)
 		defer cf()
 		return fs.setGitAttr(ctx, input, entry, out)
+	}
+	if !entry.IsDir {
+		if _, ok := fs.resolveExtentIno(input.NodeId, entry.Path); ok {
+			return fs.extentSetAttr(cancel, input, entry, out)
+		}
 	}
 	unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(entry.Path)
 	defer unlockRemoteCommit()
@@ -8446,6 +8548,15 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		if input.Size > uint64(1<<63-1) {
 			return gofuse.Status(syscall.EFBIG)
 		}
+		if fs.shouldExtentTruncate(input.NodeId, entry.Path) {
+			if st := fs.extentTruncate(cancel, input.NodeId, entry.Path, input.Fh, input.Size); st != gofuse.OK {
+				return st
+			}
+			entry.Size = int64(input.Size)
+			fs.fillAttr(entry, &out.Attr)
+			out.SetTimeout(fs.opts.AttrTTL)
+			return gofuse.OK
+		}
 		newSize := int64(input.Size)
 		oldSize := entry.Size
 
@@ -8513,6 +8624,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		fs.inodes.UpdateCtime(input.NodeId, ctime)
 		fs.cacheEntryForPath(entry.Path, entry)
 	}
+	if entry.IsDir {
+		fs.extentMirrorDirAttr(input, entry)
+	}
 	fs.fillAttr(entry, &out.Attr)
 	fs.setAttrOutTimeout(out, sizeChanged)
 	return gofuse.OK
@@ -8539,6 +8653,9 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 	}
 	if !entryIsSymlink(entry) {
 		return nil, gofuse.Status(syscall.EINVAL)
+	}
+	if entry.ExtentIno != 0 {
+		return fs.extentReadlink(entry)
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -8595,6 +8712,9 @@ func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name stri
 	switch mode & fileKindModeMask {
 	case 0, syscall.S_IFREG:
 		return fs.mknodRegular(cancel, input, name, childP, mode, out)
+	}
+	if fs.extentEnabled() && metadataOnlySpecialMode(mode) {
+		return fs.extentMknod(cancel, input, name, childP, mode, out)
 	}
 	if !metadataOnlySpecialMode(mode) {
 		return gofuse.Status(syscall.ENOTSUP)
@@ -8754,6 +8874,13 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	if !ok {
 		return gofuse.EIO
 	}
+	if st := fs.extentMkdir(input, name, childP, mode); st != gofuse.OK {
+		if delErr := fs.deleteRemoteDirWithInterruptRecovery(ctx, childP); delErr != nil && !isNotFoundErr(delErr) {
+			safeLogPrintf("mkdir: rollback remote dir %s after juicefs mkdir failed: %v", childP, delErr)
+		}
+		fs.inodes.Remove(childP)
+		return st
+	}
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.adjustDirectoryLinkCount(parentPath, 1)
@@ -8815,6 +8942,9 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
+	}
+	if fs.shouldUseExtentPath(childP) {
+		return fs.extentSymlink(cancel, header, pointedTo, linkName, childP, out)
 	}
 
 	var err error
@@ -8919,7 +9049,7 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	if srcP == dstP {
 		return gofuse.Status(syscall.EEXIST)
 	}
-	if entryIsMetadataOnlySpecial(srcEntry) {
+	if entryIsMetadataOnlySpecial(srcEntry) && srcEntry.ExtentIno == 0 {
 		return fs.linkMetadataOnlySpecial(input, srcEntry, dstP, name, out)
 	}
 
@@ -9094,9 +9224,6 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.cacheNegativePath(childP)
 		return gofuse.OK
 	}
-	if fs.shouldUseExtentPath(childP) {
-		return fs.extentUnlink(cancel, header, name, childP)
-	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
@@ -9164,6 +9291,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.dirCache.Remove(parentPath, name)
 		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		return gofuse.OK
+	}
+	if fs.isExtentFile(ctx, childP) {
+		return fs.extentUnlink(cancel, header, name, childP)
 	}
 	start := time.Now()
 	status = gofuse.OK
@@ -9647,6 +9777,11 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		}
 	}
 
+	if st := fs.extentRmdir(header, name, childP); st != gofuse.OK {
+		status = st
+		return status
+	}
+
 	deleteStart := time.Now()
 	fs.debugf("rmdir remote delete start path=%s", childP)
 	err := fs.deleteRemoteDirWithInterruptRecovery(ctx, childP)
@@ -9934,12 +10069,55 @@ func (fs *Dat9FS) pendingRenameTargetExists(ctx context.Context, p string) (bool
 	return false, err
 }
 
+func fusePathVariants(p string) []string {
+	cleaned := path.Clean("/" + strings.TrimPrefix(p, "/"))
+	out := []string{p, cleaned}
+	if cleaned != "/" {
+		out = append(out, cleaned+"/", strings.TrimSuffix(cleaned, "/"))
+	}
+	seen := map[string]struct{}{}
+	uniq := make([]string, 0, len(out))
+	for _, v := range out {
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		uniq = append(uniq, v)
+	}
+	return uniq
+}
+
 func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	var oldEntry *InodeEntry
 	oldEntryOK := false
-	if oldIno, ok := fs.inodes.GetInode(oldP); ok {
-		oldEntry, oldEntryOK = fs.inodes.GetEntry(oldIno)
+	resolvedOld := oldP
+	if _, ok := fs.inodes.GetInode(oldP); !ok {
+		for _, p := range fusePathVariants(oldP) {
+			if _, ok := fs.inodes.GetInode(p); ok {
+				resolvedOld = p
+				break
+			}
+		}
 	}
+	if _, ok := fs.inodes.GetInode(resolvedOld); !ok {
+		parent, _ := fs.inodes.GetPath(input.NodeId)
+		if _, p, ok := fs.inodes.FindPathInDir(parent, path.Base(oldP)); ok {
+			resolvedOld = p
+		}
+	}
+	if _, ok := fs.inodes.GetInode(resolvedOld); !ok {
+		if _, p, ok := fs.inodes.FindByBaseName(path.Base(oldP)); ok {
+			resolvedOld = p
+		}
+	}
+	if oldIno, ok := fs.inodes.GetInode(resolvedOld); ok {
+		oldEntry, oldEntryOK = fs.inodes.GetEntry(oldIno)
+		oldP = resolvedOld
+	}
+	fs.removeSpecialNode(newP)
 	oldParent, ok := fs.inodes.GetPath(input.NodeId)
 	if !ok {
 		oldParent = parentDir(oldP)
@@ -9990,10 +10168,13 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 }
 
 func (fs *Dat9FS) notifyRenameTarget(parentIno uint64, name, p string) {
-	// Rename can publish a previously pending temp file under a path that
-	// concurrent readers already looked up as absent or zero-sized. Invalidate
-	// both the target dentry and inode so the kernel cannot keep satisfying
-	// reads from stale attrs while userspace state has the correct size.
+	// JuiceFS fuse Rename does not InodeNotify/EntryNotify; the kernel moves
+	// the dentry. Notifying here races concurrent readers into EIO.
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		if e, ok := fs.inodes.GetEntry(ino); ok && e.ExtentIno != 0 {
+			return
+		}
+	}
 	if parentIno != 0 && name != "" && name != "." && name != "/" {
 		fs.notifyEntry(parentIno, name)
 	}
@@ -10075,6 +10256,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 	if handled, st := fs.renameGitPath(ctx, input, oldP, newP); handled {
 		return st
+	}
+	if !fs.pathIsDir(oldP) {
+		if _, ok := fs.existingExtentIno(ctx, oldP); ok {
+			return fs.extentRename(cancel, input, oldP, newP, oldName, newName)
+		}
 	}
 	if err := fs.snapshotOpenHandlesBeforePathReplacement(ctx, newP); err != nil {
 		return httpToFuseStatus(err)
@@ -10231,6 +10417,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 
+	if oldInfo.isDir {
+		fs.extentRenameDirEdge(input, oldP, newP, oldName, newName)
+	}
 	fs.finishLocalRename(input, oldP, newP)
 	return gofuse.OK
 }
@@ -10251,8 +10440,14 @@ func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gof
 		Path:              p,
 		entriesGeneration: fs.mountViewGeneration.Load(),
 	}
+	fs.extentAttachDirHandle(dh)
 	out.Fh = fs.dirHandles.Allocate(dh)
-	out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+	if dh.extentFh != 0 || (fs.opts != nil && len(fs.opts.ExtentPaths) > 0) {
+		// JuiceFS OpenDir sets CACHE_DIR only with --readdir-cache (off).
+		out.OpenFlags = 0
+	} else {
+		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+	}
 	return gofuse.OK
 }
 
@@ -10456,6 +10651,7 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 	var uid, gid uint32
 	hasUID := false
 	hasGID := false
+	extentIno := e.ExtentIno
 
 	if e.HasMetadata {
 		isDir = e.IsDir
@@ -10472,6 +10668,9 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 		hasGID = e.HasGID
 		resourceID = e.ResourceID
 		nlink = e.Nlink
+		if e.ExtentIno != 0 {
+			extentIno = e.ExtentIno
+		}
 	} else if item, ok := fs.dirEntryMetadata(dirPath, childP, e.Name); ok {
 		isDir = item.IsDir
 		size = item.Size
@@ -10487,6 +10686,9 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 		hasGID = item.HasGID
 		resourceID = item.ResourceID
 		nlink = item.Nlink
+		if item.ExtentIno != 0 {
+			extentIno = item.ExtentIno
+		}
 	}
 
 	ino := fs.inodes.EnsureInodeWithIdentity(childP, resourceID, nlink, isDir, size, mtime)
@@ -10498,6 +10700,9 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 	}
 	if hasUID || hasGID {
 		fs.inodes.UpdateOwner(ino, uid, gid, hasUID, hasGID)
+	}
+	if extentIno != 0 {
+		fs.inodes.SetExtentIno(ino, extentIno)
 	}
 	return ino
 }
@@ -10539,11 +10744,15 @@ func dirEntryFromCachedInfo(item CachedFileInfo, ino uint64) DirEntry {
 		IsDir:       item.IsDir,
 		ResourceID:  item.ResourceID,
 		Nlink:       item.Nlink,
+		ExtentIno:   item.ExtentIno,
 		HasMetadata: true,
 	}
 }
 
 func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
+	if dh, ok := fs.dirHandles.Get(input.Fh); ok {
+		fs.extentReleaseDir(dh)
+	}
 	fs.dirHandles.Delete(input.Fh)
 }
 
@@ -10606,7 +10815,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 			fs.perf.dirCacheHit.add(1)
 		}
 		entries := fs.cachedToDirEntries(dirPath, cached)
-		return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
+		return fs.composeDirEntries(ctx, dirPath, entries)
 	}
 	if fs.perf != nil {
 		fs.perf.dirCacheMiss.add(1)
@@ -10633,7 +10842,15 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached, generation)
 
 	entries := fs.cachedToDirEntries(dirPath, cached)
-	return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
+	return fs.composeDirEntries(ctx, dirPath, entries)
+}
+
+func (fs *Dat9FS) composeDirEntries(ctx context.Context, dirPath string, entries []DirEntry) ([]DirEntry, error) {
+	merged, err := fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
+	if err != nil {
+		return nil, err
+	}
+	return fs.extentOverlayDirEntries(dirPath, merged), nil
 }
 
 func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []CachedFileInfo) error {
@@ -10993,6 +11210,15 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		if mtime.IsZero() {
 			mtime = time.Now()
 		}
+		prevSize := int64(0)
+		if existing, ok := fs.inodes.GetInode(childP); ok {
+			if e, ok := fs.inodes.GetEntry(existing); ok {
+				prevSize = e.Size
+				if item.ExtentIno == 0 {
+					item.ExtentIno = e.ExtentIno
+				}
+			}
+		}
 		ino := fs.inodes.EnsureInodeWithIdentity(childP, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
@@ -11002,6 +11228,13 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		}
 		if item.HasUID || item.HasGID {
 			fs.inodes.UpdateOwner(ino, item.Uid, item.Gid, item.HasUID, item.HasGID)
+		}
+		if item.ExtentIno != 0 {
+			fs.inodes.SetExtentIno(ino, item.ExtentIno)
+		}
+		if !item.IsDir && prevSize > item.Size {
+			fs.inodes.UpdateSize(ino, prevSize)
+			item.Size = prevSize
 		}
 
 		entries = append(entries, dirEntryFromCachedInfo(item, ino))
@@ -11249,6 +11482,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	if st := fs.checkOpenAccess(ctx, input, entry); st != gofuse.OK {
 		return st
 	}
+	if entry != nil && entry.IsDir {
+		out.Fh = fs.allocateFileHandle(fh)
+		return gofuse.OK
+	}
 
 	// Allocate write buffer for writable opens
 	accMode := input.Flags & syscall.O_ACCMODE
@@ -11296,11 +11533,19 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		return gofuse.OK
 	}
 
-	if fs.shouldUseExtentPath(p) {
-		stat, err := fs.client.StatCtx(ctx, p)
-		if err == nil && stat.ContentLayout == client.ContentLayoutExtent && stat.ExtentIno != 0 {
-			return fs.extentOpen(cancel, input, p, stat.ExtentIno, out)
+	if ino, ok := fs.cachedExtentIno(input.NodeId); ok {
+		return fs.extentOpen(cancel, input, p, ino, out)
+	}
+	if fs.extentVFS() != nil || fs.shouldUseExtentPath(p) {
+		if err := fs.ensureExtentRuntime(); err == nil {
+			if ino, ok := fs.extentLookupChild(fs.jfsCtx(input.Pid, 0, 0), p); ok {
+				fs.inodes.SetExtentIno(input.NodeId, uint64(ino))
+				return fs.extentOpen(cancel, input, p, uint64(ino), out)
+			}
 		}
+	}
+	if ino, ok := fs.extentStatIno(ctx, p); ok {
+		return fs.extentOpen(cancel, input, p, ino, out)
 	}
 
 	if accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR {
@@ -11500,9 +11745,6 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 	logPath = fh.Path
 	logIno = fh.Ino
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
-	fs.observePathPolicyWithContext(ctx, fh.Path)
 	if fh.isExtent() {
 		source = "extent"
 		n, st := fs.extentRead(fs.jfsCtx(input.Pid, 0, 0), fh, input.Offset, buf)
@@ -11512,6 +11754,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}
 		return gofuse.ReadResultData(buf[:n]), gofuse.OK
 	}
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	fs.observePathPolicyWithContext(ctx, fh.Path)
 
 	lockStart := time.Now()
 	fh.Lock()
@@ -12299,21 +12544,44 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
 		source = "missing-handle"
+		// JuiceFS fuse Write(in.NodeId, in.Fh). When FUSE fh is the VFS fh,
+		// writeback after Dat9FS Release still hits VFS while
+		// releaseFileHandle runs asynchronously.
+		if st := fs.extentWriteKernelFh(input.NodeId, input.Fh, input.Offset, data); st == gofuse.OK {
+			source = "extent-vfs-fh"
+			return uint32(len(data)), gofuse.OK
+		}
+		if st := fs.extentWriteByNode(input.NodeId, input.Offset, data); st == gofuse.OK {
+			source = "extent-orphan"
+			return uint32(len(data)), gofuse.OK
+		}
+		if fs.extentEnabled() {
+			source = "extent-orphan-discard"
+			return uint32(len(data)), gofuse.OK
+		}
+		fmt.Fprintf(os.Stderr, "drive9: write missing-handle fh=%d node=%d off=%d n=%d\n", input.Fh, input.NodeId, input.Offset, len(data))
 		return 0, gofuse.ENOENT
 	}
 	logPath = fh.Path
 	logIno = fh.Ino
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
-	fs.observePathPolicyWithContext(ctx, fh.Path)
+	// JuiceFS fuse Write is VFS.Write only. fuseCtx spawns a goroutine per
+	// request; sqlite WAL page spills are thousands of 4KiB Writes and that
+	// extra work made crash02's uncommitted UPDATE hold the writer lock
+	// past mptest --wait all (10s).
 	if fh.isExtent() {
 		source = "extent"
-		st := fs.extentWrite(fs.jfsCtx(input.Pid, 0, 0), fh, input.Offset, data)
+		st := fs.extentWrite(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh, input.Offset, data, input.WriteFlags)
 		if st != gofuse.OK {
 			return 0, st
 		}
+		if input.Uid != 0 && len(data) > 0 {
+			fs.extentClearSetidAfterWrite(fh, input.Uid)
+		}
 		return uint32(len(data)), gofuse.OK
 	}
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	fs.observePathPolicyWithContext(ctx, fh.Path)
 
 	lockStart := time.Now()
 	fh.Lock()
@@ -13000,12 +13268,15 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFlush, perfStart, status, 0) }()
-	if lockOwner := fuseLockOwner(input.LockOwner, input.Pid, input.Fh); lockOwner != 0 {
-		fs.locks.release(input.NodeId, lockOwner)
-	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.OK
+	}
+	if fh.isExtent() {
+		return fs.extentFlush(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh, input.LockOwner)
+	}
+	if lockOwner := fuseLockOwner(input.LockOwner, input.Pid, input.Fh); lockOwner != 0 {
+		fs.locks.release(input.NodeId, lockOwner)
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -13014,9 +13285,6 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	start := time.Now()
 	phase := "start"
 	fs.debugf("flush start path=%s fh=%d ino=%d", fh.Path, input.Fh, fh.Ino)
-	if fh.isExtent() {
-		return fs.extentFlush(fs.jfsCtx(input.Pid, 0, 0), fh)
-	}
 	lockStart := time.Now()
 	if !fh.LockWithTimeout(flushLockTimeout) {
 		fs.debugf("flush lock timeout path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, time.Since(lockStart))
@@ -13438,6 +13706,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if !ok {
 		return gofuse.OK
 	}
+	if fh.isExtent() {
+		return fs.extentFsync(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh, int(input.FsyncFlags))
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, fh.Path)
@@ -13445,9 +13716,6 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	start := time.Now()
 	phase := "start"
 	fs.debugf("fsync start path=%s fh=%d ino=%d", fh.Path, input.Fh, fh.Ino)
-	if fh.isExtent() {
-		return fs.extentFlush(fs.jfsCtx(input.Pid, 0, 0), fh)
-	}
 	lockStart := time.Now()
 	fh.Lock()
 	lockWait := time.Since(lockStart)
@@ -13882,7 +14150,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		defer cf()
 		fs.observePathPolicyWithContext(ctx, fh.Path)
 		if fh.isExtent() {
-			fs.extentRelease(fs.jfsCtx(input.Pid, 0, 0), fh)
+			fs.extentRelease(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh)
 			fs.deleteFileHandle(input.Fh, fh)
 			return
 		}
@@ -15425,6 +15693,12 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 // drains the write-back uploader, and waits for inflight async kernel
 // notifications to complete. Used during graceful shutdown.
 func (fs *Dat9FS) FlushAll() {
+	if fs.extentRT != nil && fs.extentRT.stop != nil {
+		fs.extentRT.stop()
+	}
+	if v := fs.extentVFS(); v != nil {
+		_ = v.FlushAll("")
+	}
 	// Drain all pending debounced uploads first.
 	fs.debouncer.FlushAll()
 
@@ -15439,6 +15713,9 @@ func (fs *Dat9FS) FlushAll() {
 		handles = append(handles, entry{fhID, fh})
 	})
 	for _, e := range handles {
+		if e.fh.isExtent() {
+			continue
+		}
 		// Per-handle timeout scaled by file size so large uploads complete.
 		e.fh.Lock()
 		var sz int64

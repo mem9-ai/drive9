@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -152,6 +153,7 @@ type Store struct {
 	db             *sql.DB
 	useLegacyFiles bool // true when the legacy `files` table exists and needs dual-write
 	scope          Scope
+	jfsInited      atomic.Bool
 }
 
 func Open(dsn string) (*Store, error) {
@@ -798,8 +800,10 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath,
 
 	var fileID, inodeID sql.NullString
 	var isDir bool
-	err := db.QueryRowContext(ctx, `SELECT file_id, inode_id, is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
-		s.scope.Args(fileNodePathHash(srcPath), srcPath)...).Scan(&fileID, &inodeID, &isDir)
+	var layout sql.NullString
+	var extentIno sql.NullInt64
+	err := db.QueryRowContext(ctx, `SELECT file_id, inode_id, is_directory, content_layout, extent_ino FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+		s.scope.Args(fileNodePathHash(srcPath), srcPath)...).Scan(&fileID, &inodeID, &isDir, &layout, &extentIno)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
@@ -819,14 +823,31 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath,
 	if inodeID.Valid && inodeID.String != "" {
 		linkInodeID = inodeID.String
 	}
-	_, err = db.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at`)+`)
-		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 0, ?, ?, ?`)+`)`,
-		s.scope.Args(nodeID, dstPath, fileNodePathHash(dstPath), dstParentPath, fileNodePathHash(dstParentPath), dstName, fileID.String, linkInodeID, createdAt.UTC())...)
+	layoutArg := string(ContentLayoutSingle)
+	if layout.Valid && layout.String != "" {
+		layoutArg = layout.String
+	}
+	var extentArg any
+	if extentIno.Valid && extentIno.Int64 > 0 {
+		extentArg = uint64(extentIno.Int64)
+	}
+	_, err = db.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at, content_layout, extent_ino`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?`)+`)`,
+		s.scope.Args(nodeID, dstPath, fileNodePathHash(dstPath), dstParentPath, fileNodePathHash(dstParentPath), dstName, fileID.String, linkInodeID, createdAt.UTC(), layoutArg, extentArg)...)
 	if isUniqueViolation(err) {
 		return ErrPathConflict
 	}
 	if err != nil {
 		return err
+	}
+	if extentIno.Valid && extentIno.Int64 > 0 {
+		tx, ok := db.(*sql.Tx)
+		if !ok {
+			return fmt.Errorf("extent hardlink requires a transaction")
+		}
+		if err := s.jfsLinkEdgeTx(tx, dstPath, uint64(extentIno.Int64)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1429,14 +1450,15 @@ func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
 func (s *Store) lockConfirmedFileForAttachTx(db execer, fileID string) error {
 	var status string
 	if s.useLegacyFiles {
-		if err := db.QueryRow(`SELECT status FROM files WHERE file_id = ? FOR UPDATE`, fileID).Scan(&status); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
+		err := db.QueryRow(`SELECT status FROM files WHERE file_id = ? FOR UPDATE`, fileID).Scan(&status)
+		if err == nil {
+			if FileStatus(status) != StatusConfirmed {
 				return ErrNotFound
 			}
-			return err
+			return nil
 		}
-		if FileStatus(status) != StatusConfirmed {
-			return ErrNotFound
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
 		}
 	}
 	if err := db.QueryRow(`SELECT status FROM inodes WHERE `+s.scope.And(`inode_id = ?`)+` FOR UPDATE`, s.scope.Args(fileID)...).Scan(&status); err != nil {
@@ -1720,8 +1742,8 @@ func (s *Store) Stat(ctx context.Context, path string) (out *NodeWithFile, err e
 		}
 		nf.File = f
 	}
-	out = nf
-	return out, nil
+	out, err = s.withExtentStat(ctx, s.db, nf, nil)
+	return out, err
 }
 
 // StatTx is like Stat but reads through an existing transaction.
@@ -1737,7 +1759,8 @@ func (s *Store) StatTx(ctx context.Context, db execer, path string) (out *NodeWi
 		LEFT JOIN semantic s ON `+s.scope.AndOn(`i.inode_id = s.inode_id`, "s")+`
 		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
 		LIMIT 1`, scopeWhereArgs(s.scope, 3, s.scope.Args(fileNodePathHash(path), path)...)...)
-	return scanNodeWithFileWithBlob(row)
+	out, err = scanNodeWithFileWithBlob(row)
+	return s.withExtentStat(ctx, db, out, err)
 }
 
 // LockDentryFileIDTx locks the file_nodes row for path inside an existing
@@ -1779,6 +1802,7 @@ func (s *Store) StatPathFallback(ctx context.Context, primaryPath, fallbackPath 
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
 		LIMIT 1`, scopeWhereArgs(s.scope, 3, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)...)
 	out, err = scanNodeWithFileWithBlob(row)
+	out, err = s.withExtentStat(ctx, s.db, out, err)
 	return out, err
 }
 
@@ -1798,6 +1822,7 @@ func (s *Store) StatPathFallbackLite(ctx context.Context, primaryPath, fallbackP
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
 		LIMIT 1`, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)...)
 	out, err = scanNodeWithFileLite(row)
+	out, err = s.withExtentStat(ctx, s.db, out, err)
 	return out, err
 }
 
@@ -1814,6 +1839,7 @@ func (s *Store) StatLite(ctx context.Context, path string) (out *NodeWithFile, e
 		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
 		LIMIT 1`, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(path), path)...)...)
 	out, err = scanNodeWithFileLite(row)
+	out, err = s.withExtentStat(ctx, s.db, out, err)
 	return out, err
 }
 
@@ -1833,6 +1859,7 @@ func (s *Store) StatForRead(ctx context.Context, path string) (out *NodeWithFile
 		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
 		LIMIT 1`, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(path), path)...)...)
 	out, err = scanNodeWithFileForRead(row)
+	out, err = s.withExtentStat(ctx, s.db, out, err)
 	return out, err
 }
 
@@ -1850,6 +1877,7 @@ func (s *Store) StatPathFallbackForRead(ctx context.Context, primaryPath, fallba
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
 		LIMIT 1`, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)...)
 	out, err = scanNodeWithFileForRead(row)
+	out, err = s.withExtentStat(ctx, s.db, out, err)
 	return out, err
 }
 
@@ -1933,6 +1961,10 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_file_with_ref_check", start, &err)
 
+	if proj, perr := s.GetExtentProjection(ctx, path); perr == nil && proj != nil && proj.ContentLayout == ContentLayoutExtent && proj.ExtentIno != 0 {
+		return nil, s.UnlinkExtentPath(ctx, path, false)
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -2000,6 +2032,10 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*File, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_dir_recursive", start, &err)
+
+	if err := s.unlinkExtentTree(ctx, dirPath); err != nil {
+		return nil, err
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

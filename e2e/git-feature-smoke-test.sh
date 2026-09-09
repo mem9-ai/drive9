@@ -849,7 +849,7 @@ PY
   local local_root_b="$RUN_ROOT/git-local-b"
   local log_file_b="$RUN_ROOT/git-mount-b.log"
   mkdir -p "$mount_point_b" "$local_root_b"
-  if start_mount "$mount_point_b" "$log_file_b" --mode=fuse --profile=coding-agent --local-root "$local_root_b" --durability=interactive ":/$git_root_rel" "$mount_point_b"; then
+  if start_mount "$mount_point_b" "$log_file_b" --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$local_root_b" --durability=interactive ":/$git_root_rel" "$mount_point_b"; then
     record "PASS" "Drive9 Git Workspace Behavior" "fresh local-root remount starts" "mounted"
   else
     record "FAIL" "Drive9 Git Workspace Behavior" "fresh local-root remount starts" "see $log_file_b"
@@ -902,7 +902,7 @@ PY
   printf 'local ignored\n' > "$restore_repo/ignored-build/cache.tmp"
   stop_mount "$mount_point_b" >/dev/null 2>&1 || true
   mkdir -p "$mount_point_b" "$RUN_ROOT/git-local-c"
-  if start_mount "$mount_point_b" "$RUN_ROOT/git-mount-c.log" --mode=fuse --profile=coding-agent --local-root "$RUN_ROOT/git-local-c" --durability=interactive ":/$git_root_rel" "$mount_point_b"; then
+  if start_mount "$mount_point_b" "$RUN_ROOT/git-mount-c.log" --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$RUN_ROOT/git-local-c" --durability=interactive ":/$git_root_rel" "$mount_point_b"; then
     if [ ! -e "$mount_point_b/restore-workspace/ignored-build/cache.tmp" ]; then
       record "PASS" "Sandbox Restore" "ignored generated files are non-durable by design" "ignored-build/cache.tmp absent after fresh local root"
     else
@@ -986,7 +986,7 @@ main() {
   local git_mount="$RUN_ROOT/git-mount-a"
   local git_local="$RUN_ROOT/git-local-a"
   mkdir -p "$git_mount" "$git_local"
-  if start_mount "$git_mount" "$RUN_ROOT/git-mount-a.log" --mode=fuse --profile=coding-agent --local-root "$git_local" --durability=interactive ":/$git_root_rel" "$git_mount"; then
+  if start_mount "$git_mount" "$RUN_ROOT/git-mount-a.log" --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$git_local" --durability=interactive ":/$git_root_rel" "$git_mount"; then
     record "PASS" "Drive9 Git Workspace Behavior" "coding-agent mount starts" "mounted"
   else
     record "FAIL" "Drive9 Git Workspace Behavior" "coding-agent mount starts" "mount failed"

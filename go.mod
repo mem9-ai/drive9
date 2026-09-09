@@ -160,6 +160,7 @@ require (
 	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/oliverisaac/shellescape v0.0.0-20220131224704-1b6c6b87b668 // indirect
 	github.com/pengsrc/go-shared v0.2.1-0.20190131101655-1999055a4a14 // indirect
+	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/pingcap/kvproto v0.0.0-20230403051650-e166ae588106 // indirect
 	github.com/pingcap/log v1.1.1-0.20221110025148-ca232912c9f3 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
@@ -301,7 +302,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.2 // indirect
-	github.com/sirupsen/logrus v1.9.3 // indirect
+	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.11.1
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.3.87
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/kms v1.3.87
@@ -322,9 +323,10 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-// Dat9FS and object mounts share this go-fuse fork for inode/nlookup
-// behavior. Pin the replace; do not drop it for upstream go-fuse.
-replace github.com/hanwen/go-fuse/v2 => github.com/mornyx/go-fuse/v2 v2.9.1-0.20260707042005-213f4c78d30a
+// Dat9FS and object mounts share this go-fuse fork (feat/enable-writeback,
+// CAP_WRITEBACK_CACHE). Pin the GitHub commit; do not drop it for upstream
+// go-fuse or replace with a local path.
+replace github.com/hanwen/go-fuse/v2 => github.com/mornyx/go-fuse/v2 v2.9.1-0.20260908115844-7ed5121d2bb7
 
 // JuiceFS v1.4.1 pins a fork of mpb; the replace does not propagate through
 // our juicefs replace, so copy it here.
@@ -343,7 +345,13 @@ replace github.com/vmware/go-nfs-client v0.0.0-20190605212624-d43b92724c1b => gi
 replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/juicedata/minio v0.0.0-20260515071949-69a6cfc9da65
 
 // JuiceFS fork with the drive9 HTTP meta engine (extend-v1.4 from v1.4.1).
-replace github.com/juicedata/juicefs => github.com/mornyx/juicefs v1.4.2-0.20260907124057-3b4499fbdf3e
+// Pin the GitHub commit; do not replace with a local path.
+replace github.com/juicedata/juicefs => github.com/mornyx/juicefs v1.4.2-0.20260909044158-3c217f26d815
+
+// JuiceFS compress/utils pull CGO libraries; keep drive9 CGO_ENABLED=0.
+replace github.com/DataDog/zstd => ./internal/jfsstub/zstd
+
+replace github.com/hungys/go-lz4 => ./internal/jfsstub/lz4
 
 // Historical genproto versions still ship googleapis/api and googleapis/rpc.
 // Those paths now live in split modules and collide when docker/otel test

@@ -49,6 +49,10 @@ func ExtentTiDBSchemaStatements() []string {
 			UNIQUE KEY uk_jfs_edge (parent, name),
 			KEY idx_jfs_edge_inode (inode)
 		)`,
+		`CREATE TABLE IF NOT EXISTS jfs_symlink (
+			inode  BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+			target VARBINARY(4096) NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS jfs_chunk (
 			id     BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			inode  BIGINT UNSIGNED NOT NULL,
@@ -192,6 +196,10 @@ func ExtentDB9SchemaStatements() []string {
 			UNIQUE (parent, name)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_jfs_edge_inode ON jfs_edge(inode)`,
+		`CREATE TABLE IF NOT EXISTS jfs_symlink (
+			inode  BIGINT NOT NULL PRIMARY KEY,
+			target BYTEA NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS jfs_chunk (
 			id     BIGSERIAL PRIMARY KEY,
 			inode  BIGINT NOT NULL,

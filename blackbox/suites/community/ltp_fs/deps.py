@@ -382,14 +382,18 @@ def resolve_runner(ltp: Path) -> str:
     return str(kirk)
 
 
-def build_ltp_runner_cmd(runner: str, scenario: str, work_dir: Path) -> list[str]:
+def build_ltp_runner_cmd(runner: str, scenario: str, work_dir: Path, session_dir: Path | None = None) -> list[str]:
     """Build the LTP test runner command for kirk or runltp.
 
-    For kirk: ``kirk --no-colors --run-suite <scenario> --sut default --tmp-dir <work>``
-    For runltp: ``runltp -Q -f <scenario> -d <work>``
+    For kirk: ``kirk --no-colors --run-suite <scenario> --sut default --tmp-dir <session>``
+    kirk's --tmp-dir is its session directory (it creates a ``latest`` symlink
+    there). That bookkeeping must not live on the FUSE mount: extent FUSE
+    reports EEXIST when kirk replaces ``latest``. LTP binaries still use
+    TMPDIR=work_dir on the mount. runltp ``-d`` stays on work_dir.
     """
     if runner.endswith("kirk") or runner.endswith("/kirk"):
-        return [runner, "--no-colors", "--run-suite", scenario, "--sut", "default", "--tmp-dir", str(work_dir)]
+        tmp = session_dir if session_dir is not None else work_dir
+        return [runner, "--no-colors", "--run-suite", scenario, "--sut", "default", "--tmp-dir", str(tmp)]
     # runltp fallback
     return [runner, "-Q", "-f", scenario, "-d", str(work_dir)]
 

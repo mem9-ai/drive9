@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1720,6 +1721,58 @@ func TestResolveReadTargetInlineFileErrorIsDetectable(t *testing.T) {
 	_, err := c.ResolveReadTarget(context.Background(), "/small.txt")
 	if !IsReadTargetNoRedirect(err) {
 		t.Fatalf("ResolveReadTarget error = %v, want no-redirect sentinel", err)
+	}
+}
+
+func TestResolveReadTargetExtentHintIsNoRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Dat9-Content-Layout", "extent")
+		w.Header().Set("X-Dat9-Extent-Ino", "7")
+		w.Header().Set("X-Dat9-Extent-Length", "8388608")
+		http.Error(w, `{"error":"extent content is not served inline"}`, http.StatusUnprocessableEntity)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	_, err := c.ResolveReadTarget(context.Background(), "/large.bin")
+	if !IsReadTargetNoRedirect(err) {
+		t.Fatalf("ResolveReadTarget error = %v, want no-redirect sentinel", err)
+	}
+}
+
+func TestDownloadToFileWithSummaryExtentFallsBackToSequential(t *testing.T) {
+	payload := bytes.Repeat([]byte("e"), downloadParallelThreshold)
+	var reads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := reads.Add(1)
+		if n == 1 {
+			// resolveReadTarget: extent files have no single object URL.
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.Header().Set("X-Dat9-Extent-Ino", "7")
+			w.Header().Set("X-Dat9-Extent-Length", strconv.Itoa(len(payload)))
+			http.Error(w, `{"error":"extent content is not served inline"}`, http.StatusUnprocessableEntity)
+			return
+		}
+		// Sequential ReadStream fallback: serve the body inline so the test
+		// does not need a JuiceFS DataReader.
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	dst := filepath.Join(t.TempDir(), "out.bin")
+	if _, err := c.DownloadToFileWithSummary(context.Background(), "/large.bin", dst, int64(len(payload))); err != nil {
+		t.Fatalf("DownloadToFileWithSummary: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dest: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("downloaded %d bytes, want %d", len(got), len(payload))
+	}
+	if reads.Load() < 2 {
+		t.Fatalf("reads = %d, want resolve + sequential GET", reads.Load())
 	}
 }
 

@@ -268,7 +268,7 @@ start_mount() {
 
   local perf_dir="${mount_log%.log}.perf"
   local args=(
-    mount --foreground --mode=fuse --profile=coding-agent --local-root "$local_root"
+    mount --foreground --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$local_root"
     --durability=interactive
     --perf-dir "$perf_dir"
     --perf-interval 1h

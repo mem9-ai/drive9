@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -16,11 +17,30 @@ import (
 )
 
 const (
-	jfsRootIno   = uint64(1)
-	jfsTypeFile  = uint8(1)
-	jfsTypeDir   = uint8(2)
-	jfsCompactN  = 350
+	jfsRootIno     = uint64(1)
+	jfsTypeFile    = uint8(1)
+	jfsTypeDir     = uint8(2)
+	jfsTypeSymlink = uint8(3)
+	jfsTypeFIFO    = uint8(4)
+	jfsTypeBlock   = uint8(5)
+	jfsTypeChar    = uint8(6)
+	jfsTypeSocket  = uint8(7)
 )
+
+// jfsCompactThreshold is the slice-count that enqueues a compact task.
+// Tests may lower it via SetCompactThresholdForTest.
+var jfsCompactThreshold = extentCompactSlices
+
+// jfsTestFailBeforeProjection is invoked after the JuiceFS node/edge insert
+// and before the file_nodes projection. Tests use it to prove the txn rolls back.
+var jfsTestFailBeforeProjection func() error
+
+// SetCompactThresholdForTest overrides the compact enqueue threshold.
+func SetCompactThresholdForTest(n int) func() {
+	old := jfsCompactThreshold
+	jfsCompactThreshold = n
+	return func() { jfsCompactThreshold = old }
+}
 
 // ExtentAttr is the JSON shape of juicefs meta.Attr (exported field names).
 type ExtentAttr struct {
@@ -51,9 +71,9 @@ type ExtentSlice struct {
 }
 
 type ExtentProjection struct {
-	Path         string
+	Path          string
 	ContentLayout ContentLayout
-	ExtentIno    uint64
+	ExtentIno     uint64
 }
 
 func (s *Store) GetExtentProjection(ctx context.Context, path string) (*ExtentProjection, error) {
@@ -75,35 +95,180 @@ func (s *Store) GetExtentProjection(ctx context.Context, path string) (*ExtentPr
 	return p, nil
 }
 
+// overlayExtentStat copies jfs_node.length onto File.SizeBytes.
+// JuiceFS writes update jfs_node only; inodes.size_bytes stays 0 until
+// truncate. Remote drive9 fs stat reads inodes.size_bytes unless overlaid.
+func (s *Store) overlayExtentStat(ctx context.Context, db execer, nf *NodeWithFile) {
+	if nf == nil || nf.Node.IsDirectory || nf.File == nil {
+		return
+	}
+	if nf.File.StorageType != StorageExtent {
+		return
+	}
+	path := nf.Node.Path
+	if path == "" {
+		return
+	}
+	var length sql.NullInt64
+	err := db.QueryRowContext(ctx, `SELECT j.length FROM file_nodes fn
+		INNER JOIN jfs_node j ON j.inode = fn.extent_ino
+		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
+		AND fn.extent_ino IS NOT NULL AND fn.extent_ino <> 0`,
+		s.scope.Args(fileNodePathHash(path), path)...).Scan(&length)
+	if err != nil || !length.Valid {
+		return
+	}
+	nf.File.SizeBytes = length.Int64
+}
+
+func (s *Store) withExtentStat(ctx context.Context, db execer, nf *NodeWithFile, err error) (*NodeWithFile, error) {
+	if err != nil || nf == nil {
+		return nf, err
+	}
+	s.overlayExtentStat(ctx, db, nf)
+	return nf, nil
+}
+
+func jfsLockBlockFromRaw(op string, raw json.RawMessage) (block bool, writeLock bool) {
+	if op != "setlk" && op != "flock" {
+		return false, false
+	}
+	var peek struct {
+		Block bool   `json:"block"`
+		Ltype uint32 `json:"ltype"`
+	}
+	if json.Unmarshal(raw, &peek) != nil {
+		return false, false
+	}
+	return peek.Block, jfsIsWriteLock(peek.Ltype)
+}
+
 // RunExtentMetaOp executes one JuiceFS-engine RPC inside a tenant transaction
 // and dual-writes the file_nodes projection for namespace ops.
 func (s *Store) RunExtentMetaOp(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
 	var (
-		out    any
-		errno  int
-		opErr  error
+		out   any
+		errno int
+		opErr error
 	)
-	err := s.InTx(ctx, func(tx *sql.Tx) error {
-		if err := s.jfsEnsureInitTx(tx); err != nil {
-			return err
-		}
-		out, errno, opErr = s.dispatchExtentOp(ctx, tx, op, raw)
-		if opErr != nil {
-			return opErr
-		}
-		if errno != 0 {
+	block, writeLock := jfsLockBlockFromRaw(op, raw)
+	const maxAttempts = 8
+	var err error
+	attempts := 0
+	if op == "compact" {
+		return s.runCompactOp(ctx, raw)
+	}
+	for {
+		out, errno, opErr = nil, 0, nil
+		err = s.InTx(ctx, func(tx *sql.Tx) error {
+			if err := s.jfsEnsureInitTx(tx); err != nil {
+				return err
+			}
+			out, errno, opErr = s.dispatchExtentOp(ctx, tx, op, raw)
+			if opErr != nil {
+				return opErr
+			}
+			if errno != 0 {
+				return nil
+			}
 			return nil
+		})
+		if err == nil && block && errno == int(syscall.EAGAIN) {
+			sleep := 10 * time.Millisecond
+			if writeLock {
+				sleep = time.Millisecond
+			}
+			select {
+			case <-ctx.Done():
+				out = map[string]any{"errno": int(syscall.EINTR)}
+				errno = int(syscall.EINTR)
+				err = nil
+			case <-time.After(sleep):
+				continue
+			}
 		}
-		return nil
-	})
-	if err != nil && errno == 0 {
-		return nil, int(syscall.EIO), err
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			out = map[string]any{"errno": int(syscall.EINTR)}
+			errno = int(syscall.EINTR)
+			err = nil
+			break
+		}
+		attempts++
+		if attempts < maxAttempts && (isUniqueViolation(err) || isDeadlock(err)) {
+			continue
+		}
+		if errno == 0 {
+			return nil, int(syscall.EIO), err
+		}
+		break
 	}
 	body, mErr := json.Marshal(out)
 	if mErr != nil {
 		return nil, int(syscall.EIO), mErr
 	}
 	return body, errno, nil
+}
+
+// runCompactOp is JuiceFS dbMeta.doCompactChunk: CAS in one txn, then
+// deleteSlice after that txn. GC INSERT under the chunk FOR UPDATE held
+// sqlite Write/Flush on the same inode for seconds (crash01 --wait all).
+func (s *Store) runCompactOp(ctx context.Context, raw json.RawMessage) (json.RawMessage, int, error) {
+	var in struct {
+		Inode   uint64 `json:"inode"`
+		Indx    uint32 `json:"indx"`
+		Origin  []byte `json:"origin"`
+		Skipped int    `json:"skipped"`
+		Pos     uint32 `json:"pos"`
+		Id      uint64 `json:"id"`
+		Size    uint32 `json:"size"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil, int(syscall.EINVAL), err
+	}
+	var (
+		eno  int
+		olds []extentSliceRef
+	)
+	const maxAttempts = 8
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		olds = nil
+		eno = 0
+		err = s.InTx(ctx, func(tx *sql.Tx) error {
+			if err := s.jfsEnsureInitTx(tx); err != nil {
+				return err
+			}
+			var err error
+			eno, olds, err = s.jfsCompactTx(tx, in.Inode, in.Indx, in.Origin, in.Skipped, in.Pos, in.Id, in.Size)
+			return err
+		})
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return nil, int(syscall.EINTR), ctx.Err()
+		}
+		if isUniqueViolation(err) || isDeadlock(err) {
+			continue
+		}
+		return nil, int(syscall.EIO), err
+	}
+	if err != nil {
+		return nil, int(syscall.EIO), err
+	}
+	if eno == 0 && len(olds) > 0 {
+		_ = s.InTx(ctx, func(tx *sql.Tx) error {
+			return s.jfsEnqueueDeadSliceGCTx(tx, in.Inode, olds)
+		})
+	}
+	body, mErr := json.Marshal(map[string]any{"errno": eno})
+	if mErr != nil {
+		return nil, int(syscall.EIO), mErr
+	}
+	return body, eno, nil
 }
 
 func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw json.RawMessage) (any, int, error) {
@@ -243,15 +408,49 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 			ProjPath string     `json:"proj_path"`
 			Uid      uint32     `json:"uid"`
 			Gid      uint32     `json:"gid"`
+			Indx     uint32     `json:"indx"`
+			Parts    []struct {
+				Off   uint32      `json:"off"`
+				Slice ExtentSlice `json:"slice"`
+			} `json:"parts"`
+			Mtime time.Time `json:"mtime"`
 		}
 		if err := json.Unmarshal(raw, &in); err != nil {
 			return nil, int(syscall.EINVAL), err
 		}
-		ino, attr, eno, err := s.jfsMknodTx(ctx, tx, in.Parent, in.Name, in.Type, in.Mode, in.Cumask, in.Inode, in.Attr, in.ProjPath, in.Uid, in.Gid)
+		ino, attr, eno, err := s.jfsMknodTx(ctx, tx, in.Parent, in.Name, in.Type, in.Mode, in.Cumask, in.Inode, in.Attr, in.ProjPath, in.Uid, in.Gid, in.Path)
 		if err != nil {
 			return nil, int(syscall.EIO), err
 		}
+		if eno == 0 && len(in.Parts) > 0 {
+			parts := make([]extentWritePart, 0, len(in.Parts))
+			for _, p := range in.Parts {
+				parts = append(parts, extentWritePart{Off: p.Off, Slice: p.Slice})
+			}
+			_, wattr, _, _, weno, werr := s.jfsWritePartsTx(tx, ino, in.Indx, parts, in.Mtime)
+			if werr != nil {
+				return nil, int(syscall.EIO), werr
+			}
+			if weno != 0 {
+				eno = weno
+			}
+			if wattr != nil {
+				attr = wattr
+			}
+		}
 		return map[string]any{"errno": eno, "inode": ino, "attr": attr}, eno, nil
+	case "readlink":
+		var in struct {
+			Inode uint64 `json:"inode"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return nil, int(syscall.EINVAL), err
+		}
+		target, eno, err := s.jfsReadlinkTx(tx, in.Inode)
+		if err != nil {
+			return nil, int(syscall.EIO), err
+		}
+		return map[string]any{"errno": eno, "target": target}, eno, nil
 	case "unlink":
 		var in struct {
 			Parent    uint64 `json:"parent"`
@@ -296,7 +495,7 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 		if err := json.Unmarshal(raw, &in); err != nil {
 			return nil, int(syscall.EINVAL), err
 		}
-		ino, tinode, attr, tattr, eno, err := s.jfsRenameTx(tx, in.SrcParent, in.SrcName, in.DstParent, in.DstName, in.SrcPath, in.DstPath)
+		ino, tinode, attr, tattr, eno, err := s.jfsRenameTx(tx, in.SrcParent, in.SrcName, in.DstParent, in.DstName, in.SrcPath, in.DstPath, in.Flags)
 		if err != nil {
 			return nil, int(syscall.EIO), err
 		}
@@ -334,12 +533,23 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 			Indx  uint32      `json:"indx"`
 			Off   uint32      `json:"off"`
 			Slice ExtentSlice `json:"slice"`
-			Mtime time.Time   `json:"mtime"`
+			Parts []struct {
+				Off   uint32      `json:"off"`
+				Slice ExtentSlice `json:"slice"`
+			} `json:"parts"`
+			Mtime time.Time `json:"mtime"`
 		}
 		if err := json.Unmarshal(raw, &in); err != nil {
 			return nil, int(syscall.EINVAL), err
 		}
-		nslice, attr, dlen, dspace, eno, err := s.jfsWriteTx(tx, in.Inode, in.Indx, in.Off, in.Slice, in.Mtime)
+		parts := make([]extentWritePart, 0, len(in.Parts)+1)
+		for _, p := range in.Parts {
+			parts = append(parts, extentWritePart{Off: p.Off, Slice: p.Slice})
+		}
+		if len(parts) == 0 {
+			parts = append(parts, extentWritePart{Off: in.Off, Slice: in.Slice})
+		}
+		nslice, attr, dlen, dspace, eno, err := s.jfsWritePartsTx(tx, in.Inode, in.Indx, parts, in.Mtime)
 		if err != nil {
 			return nil, int(syscall.EIO), err
 		}
@@ -377,7 +587,7 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 		if err := json.Unmarshal(raw, &in); err != nil {
 			return nil, int(syscall.EINVAL), err
 		}
-		eno, err := s.jfsCompactTx(tx, in.Inode, in.Indx, in.Origin, in.Skipped, in.Pos, in.Id, in.Size)
+		eno, _, err := s.jfsCompactTx(tx, in.Inode, in.Indx, in.Origin, in.Skipped, in.Pos, in.Id, in.Size)
 		if err != nil {
 			return nil, int(syscall.EIO), err
 		}
@@ -422,7 +632,23 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 		}
 		return map[string]any{"errno": eno}, eno, nil
 	case "getlk":
-		return map[string]any{"errno": 0, "ltype": uint32(syscall.F_UNLCK), "start": 0, "end": 0, "pid": 0}, 0, nil
+		var in struct {
+			Inode uint64 `json:"inode"`
+			Sid   uint64 `json:"sid"`
+			Owner uint64 `json:"owner"`
+			Ltype uint32 `json:"ltype"`
+			Start uint64 `json:"start"`
+			End   uint64 `json:"end"`
+			Pid   uint32 `json:"pid"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return nil, int(syscall.EINVAL), err
+		}
+		ltype, start, end, pid, eno, err := s.jfsGetlkTx(tx, in.Inode, in.Sid, in.Owner, in.Ltype, in.Start, in.End)
+		if err != nil {
+			return nil, int(syscall.EIO), err
+		}
+		return map[string]any{"errno": eno, "ltype": ltype, "start": start, "end": end, "pid": pid}, eno, nil
 	case "setlk":
 		var in struct {
 			Inode uint64 `json:"inode"`
@@ -442,10 +668,49 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 		}
 		return map[string]any{"errno": eno}, eno, nil
 	case "find_stale_sessions":
-		return map[string]any{"errno": 0, "sids": []uint64{}}, 0, nil
+		var in struct {
+			Limit int `json:"limit"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return nil, int(syscall.EINVAL), err
+		}
+		sids, err := s.jfsFindStaleSessionsTx(tx, in.Limit)
+		if err != nil {
+			return nil, int(syscall.EIO), err
+		}
+		return map[string]any{"errno": 0, "sids": sids}, 0, nil
 	case "clean_stale_session":
+		var in struct {
+			Sid uint64 `json:"sid"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return nil, int(syscall.EINVAL), err
+		}
+		if err := s.jfsCleanStaleSessionTx(tx, in.Sid); err != nil {
+			return nil, int(syscall.EIO), err
+		}
 		return map[string]any{"errno": 0}, 0, nil
 	case "get_session":
+		return map[string]any{"errno": 0}, 0, nil
+	case "claim_compact":
+		ino, indx, taskID, err := s.jfsClaimCompactTx(tx)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return map[string]any{"errno": 0, "inode": 0, "indx": 0, "task_id": ""}, 0, nil
+			}
+			return nil, int(syscall.EIO), err
+		}
+		return map[string]any{"errno": 0, "inode": ino, "indx": indx, "task_id": taskID}, 0, nil
+	case "requeue_compact":
+		var in struct {
+			TaskID string `json:"task_id"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return nil, int(syscall.EINVAL), err
+		}
+		if err := s.jfsRequeueCompactTx(tx, in.TaskID); err != nil {
+			return nil, int(syscall.EIO), err
+		}
 		return map[string]any{"errno": 0}, 0, nil
 	default:
 		return map[string]any{"errno": int(syscall.ENOSYS)}, int(syscall.ENOSYS), nil
@@ -453,11 +718,17 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 }
 
 func (s *Store) jfsEnsureInitTx(tx *sql.Tx) error {
+	if s != nil && s.jfsInited.Load() {
+		return nil
+	}
 	var n int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM jfs_node WHERE inode = ?`, jfsRootIno).Scan(&n); err != nil {
 		return err
 	}
 	if n > 0 {
+		if s != nil {
+			s.jfsInited.Store(true)
+		}
 		return nil
 	}
 	now := time.Now().UnixNano()
@@ -483,6 +754,9 @@ func (s *Store) jfsEnsureInitTx(tx *sql.Tx) error {
 			return err
 		}
 	}
+	if s != nil {
+		s.jfsInited.Store(true)
+	}
 	return nil
 }
 
@@ -490,12 +764,13 @@ func jfsSplitTime(ns int64) (int64, int16) {
 	return ns / 1e3, int16(ns % 1e3)
 }
 
-func jfsAttrFromNode(typ uint8, mode uint16, uid, gid uint32, atime, mtime, ctime int64, asec, msec, csec int16, nlink uint32, length uint64, parent uint64) ExtentAttr {
+func jfsAttrFromNode(typ uint8, mode uint16, uid, gid uint32, atime, mtime, ctime int64, asec, msec, csec int16, nlink uint32, length uint64, parent uint64, rdev uint32) ExtentAttr {
 	return ExtentAttr{
 		Typ:       typ,
 		Mode:      mode,
 		Uid:       uid,
 		Gid:       gid,
+		Rdev:      rdev,
 		Atime:     atime / 1e6,
 		Atimensec: uint32(atime%1e6*1000) + uint32(asec),
 		Mtime:     mtime / 1e6,
@@ -600,16 +875,17 @@ func (s *Store) jfsGetAttrTx(tx *sql.Tx, ino uint64) (*ExtentAttr, int, error) {
 	var asec, msec, csec int16
 	var nlink uint32
 	var length, parent uint64
-	err := tx.QueryRow(`SELECT type, mode, uid, gid, atime, mtime, ctime, atimensec, mtimensec, ctimensec, nlink, length, parent
+	var rdev uint32
+	err := tx.QueryRow(`SELECT type, mode, uid, gid, atime, mtime, ctime, atimensec, mtimensec, ctimensec, nlink, length, parent, rdev
 		FROM jfs_node WHERE inode = ?`, ino).Scan(
-		&typ, &mode, &uid, &gid, &atime, &mtime, &ctime, &asec, &msec, &csec, &nlink, &length, &parent)
+		&typ, &mode, &uid, &gid, &atime, &mtime, &ctime, &asec, &msec, &csec, &nlink, &length, &parent, &rdev)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, int(syscall.ENOENT), nil
 	}
 	if err != nil {
 		return nil, 0, err
 	}
-	attr := jfsAttrFromNode(typ, mode, uid, gid, atime, mtime, ctime, asec, msec, csec, nlink, length, parent)
+	attr := jfsAttrFromNode(typ, mode, uid, gid, atime, mtime, ctime, asec, msec, csec, nlink, length, parent, rdev)
 	return &attr, 0, nil
 }
 
@@ -619,12 +895,14 @@ func (s *Store) jfsSetAttrTx(tx *sql.Tx, ino uint64, set uint16, patch ExtentAtt
 		return attr, eno, err
 	}
 	const (
-		setMode = 1 << 0
-		setUID  = 1 << 1
-		setGID  = 1 << 2
-		setSize = 1 << 3
-		setAtime = 1 << 4
-		setMtime = 1 << 5
+		setMode     = 1 << 0
+		setUID      = 1 << 1
+		setGID      = 1 << 2
+		setSize     = 1 << 3
+		setAtime    = 1 << 4
+		setMtime    = 1 << 5
+		setAtimeNow = 1 << 7
+		setMtimeNow = 1 << 8
 	)
 	if set&setMode != 0 {
 		attr.Mode = patch.Mode
@@ -638,7 +916,22 @@ func (s *Store) jfsSetAttrTx(tx *sql.Tx, ino uint64, set uint16, patch ExtentAtt
 	if set&setSize != 0 {
 		attr.Length = patch.Length
 	}
-	now := time.Now().UnixNano()
+	nowt := time.Now()
+	if set&setAtimeNow != 0 {
+		attr.Atime = nowt.Unix()
+		attr.Atimensec = uint32(nowt.Nanosecond())
+	} else if set&setAtime != 0 {
+		attr.Atime = patch.Atime
+		attr.Atimensec = patch.Atimensec
+	}
+	if set&setMtimeNow != 0 {
+		attr.Mtime = nowt.Unix()
+		attr.Mtimensec = uint32(nowt.Nanosecond())
+	} else if set&setMtime != 0 {
+		attr.Mtime = patch.Mtime
+		attr.Mtimensec = patch.Mtimensec
+	}
+	now := nowt.UnixNano()
 	atime, asec := jfsSplitTime(attr.Atime*1e9 + int64(attr.Atimensec))
 	mtime, msec := jfsSplitTime(attr.Mtime*1e9 + int64(attr.Mtimensec))
 	ctime, csec := jfsSplitTime(now)
@@ -649,7 +942,7 @@ func (s *Store) jfsSetAttrTx(tx *sql.Tx, ino uint64, set uint16, patch ExtentAtt
 	return s.jfsGetAttrTx(tx, ino)
 }
 
-func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name string, typ uint8, mode, cumask uint16, inode uint64, attr ExtentAttr, projPath string, uid, gid uint32) (uint64, *ExtentAttr, int, error) {
+func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name string, typ uint8, mode, cumask uint16, inode uint64, attr ExtentAttr, projPath string, uid, gid uint32, symlinkTarget string) (uint64, *ExtentAttr, int, error) {
 	if parent == 0 {
 		parent = jfsRootIno
 	}
@@ -686,6 +979,11 @@ func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name 
 	if typ == jfsTypeDir {
 		nlink = 2
 		length = 4096
+	} else if typ == jfsTypeSymlink {
+		length = uint64(len(symlinkTarget))
+		if attr.Length > 0 {
+			length = attr.Length
+		}
 	}
 	now := time.Now().UnixNano()
 	atime, asec := jfsSplitTime(now)
@@ -697,15 +995,25 @@ func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name 
 	}
 	if _, err := tx.Exec(`INSERT INTO jfs_node
 		(inode, type, flags, mode, uid, gid, atime, mtime, ctime, atimensec, mtimensec, ctimensec, nlink, length, rdev, parent)
-		VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-		inode, typ, mode, attr.Uid, attr.Gid, atime, atime, atime, asec, asec, asec, nlink, length, parent); err != nil {
+		VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		inode, typ, mode, attr.Uid, attr.Gid, atime, atime, atime, asec, asec, asec, nlink, length, attr.Rdev, parent); err != nil {
 		return 0, nil, 0, err
 	}
 	if _, err := tx.Exec(`INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?, ?, ?, ?)`,
 		parent, []byte(name), inode, typ); err != nil {
 		return 0, nil, 0, err
 	}
-	if typ == jfsTypeFile && projPath != "" {
+	if typ == jfsTypeSymlink {
+		if _, err := tx.Exec(`INSERT INTO jfs_symlink (inode, target) VALUES (?, ?)`, inode, []byte(symlinkTarget)); err != nil {
+			return 0, nil, 0, err
+		}
+	}
+	if typ != jfsTypeDir && projPath != "" {
+		if jfsTestFailBeforeProjection != nil {
+			if err := jfsTestFailBeforeProjection(); err != nil {
+				return 0, nil, 0, err
+			}
+		}
 		if err := s.insertExtentProjectionTx(tx, projPath, inode, mode); err != nil {
 			return 0, nil, 0, err
 		}
@@ -718,7 +1026,7 @@ func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name 
 		_, _ = tx.Exec(`UPDATE file_nodes SET extent_ino = ? WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
 			append([]any{inode}, s.scope.Args(fileNodePathHash(dirPath), dirPath)...)...)
 	}
-	out := jfsAttrFromNode(typ, mode, attr.Uid, attr.Gid, atime, atime, atime, asec, asec, asec, nlink, length, parent)
+	out := jfsAttrFromNode(typ, mode, attr.Uid, attr.Gid, atime, atime, atime, asec, asec, asec, nlink, length, parent, attr.Rdev)
 	return inode, &out, 0, nil
 }
 
@@ -793,11 +1101,64 @@ func (s *Store) insertExtentProjectionTx(tx *sql.Tx, path string, extentIno uint
 	return err
 }
 
+func (s *Store) jfsParentInoForPathTx(tx *sql.Tx, filePath string) (uint64, error) {
+	parentPath := pathutil.ParentPath(filePath)
+	if parentPath == "/" {
+		return jfsRootIno, nil
+	}
+	dirPath := parentPath
+	if !strings.HasSuffix(dirPath, "/") {
+		dirPath += "/"
+	}
+	var ino sql.NullInt64
+	err := tx.QueryRow(`SELECT extent_ino FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
+		s.scope.Args(fileNodePathHash(dirPath), dirPath)...).Scan(&ino)
+	if err == nil && ino.Valid && ino.Int64 > 0 {
+		return uint64(ino.Int64), nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	return s.jfsEnsureParentsTx(tx, filePath, 0, 0)
+}
+
+func (s *Store) jfsLinkEdgeTx(tx *sql.Tx, dstPath string, ino uint64) error {
+	parent, err := s.jfsParentInoForPathTx(tx, dstPath)
+	if err != nil {
+		return err
+	}
+	name := pathutil.BaseName(dstPath)
+	var exist uint64
+	err = tx.QueryRow(`SELECT inode FROM jfs_edge WHERE parent = ? AND name = ?`, parent, []byte(name)).Scan(&exist)
+	if err == nil {
+		return ErrPathConflict
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var typ uint8
+	if err := tx.QueryRow(`SELECT type FROM jfs_node WHERE inode = ?`, ino).Scan(&typ); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?, ?, ?, ?)`,
+		parent, []byte(name), ino, typ); err != nil {
+		return err
+	}
+	now := time.Now().UnixNano()
+	ctime, csec := jfsSplitTime(now)
+	_, err = tx.Exec(`UPDATE jfs_node SET nlink = nlink + 1, ctime = ?, ctimensec = ? WHERE inode = ?`, ctime, csec, ino)
+	return err
+}
+
 func (s *Store) jfsUnlinkTx(ctx context.Context, tx *sql.Tx, parent uint64, name, projPath string, sid uint64, opened bool) (*ExtentAttr, int, error) {
 	var ino uint64
 	var typ uint8
 	err := tx.QueryRow(`SELECT inode, type FROM jfs_edge WHERE parent = ? AND name = ?`, parent, []byte(name)).Scan(&ino, &typ)
 	if errors.Is(err, sql.ErrNoRows) {
+		if projPath != "" {
+			_, _ = tx.Exec(`DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
+				s.scope.Args(fileNodePathHash(projPath), projPath)...)
+		}
 		return nil, int(syscall.ENOENT), nil
 	}
 	if err != nil {
@@ -840,10 +1201,27 @@ func (s *Store) jfsUnlinkTx(ctx context.Context, tx *sql.Tx, parent uint64, name
 	if err := s.jfsEnqueueFileGCTx(tx, ino, attr.Length); err != nil {
 		return nil, 0, err
 	}
+	if attr.Typ == jfsTypeSymlink {
+		if _, err := tx.Exec(`DELETE FROM jfs_symlink WHERE inode = ?`, ino); err != nil {
+			return nil, 0, err
+		}
+	}
 	if _, err := tx.Exec(`DELETE FROM jfs_node WHERE inode = ?`, ino); err != nil {
 		return nil, 0, err
 	}
 	return attr, 0, nil
+}
+
+func (s *Store) jfsReadlinkTx(tx *sql.Tx, ino uint64) ([]byte, int, error) {
+	var target []byte
+	err := tx.QueryRow(`SELECT target FROM jfs_symlink WHERE inode = ?`, ino).Scan(&target)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, int(syscall.ENOENT), nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	return target, 0, nil
 }
 
 func (s *Store) jfsProjectionPathTx(tx *sql.Tx, parent uint64, name string) (string, error) {
@@ -891,20 +1269,63 @@ func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (ui
 	return ino, attr, 0, nil
 }
 
-func (s *Store) jfsRenameTx(tx *sql.Tx, srcParent uint64, srcName string, dstParent uint64, dstName, srcPath, dstPath string) (uint64, uint64, *ExtentAttr, *ExtentAttr, int, error) {
+const (
+	jfsRenameNoReplace = uint32(1 << 0)
+	jfsRenameExchange  = uint32(1 << 1)
+)
+
+func (s *Store) jfsRenameTx(tx *sql.Tx, srcParent uint64, srcName string, dstParent uint64, dstName, srcPath, dstPath string, flags uint32) (uint64, uint64, *ExtentAttr, *ExtentAttr, int, error) {
 	ino, attr, eno, err := s.jfsLookupTx(tx, srcParent, srcName)
 	if err != nil || eno != 0 {
 		return 0, 0, nil, nil, eno, err
 	}
+	if flags&jfsRenameExchange != 0 {
+		return 0, 0, attr, nil, int(syscall.ENOTSUP), nil
+	}
 	var exist uint64
 	err = tx.QueryRow(`SELECT inode FROM jfs_edge WHERE parent = ? AND name = ?`, dstParent, []byte(dstName)).Scan(&exist)
 	if err == nil {
-		return 0, exist, attr, nil, int(syscall.EEXIST), nil
-	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if exist == ino {
+			return ino, exist, attr, attr, 0, nil
+		}
+		if flags&jfsRenameNoReplace != 0 {
+			return 0, exist, attr, nil, int(syscall.EEXIST), nil
+		}
+		dstAttr, denos, derr := s.jfsGetAttrTx(tx, exist)
+		if derr != nil || denos != 0 {
+			return 0, exist, attr, dstAttr, denos, derr
+		}
+		if attr.Typ == jfsTypeDir && dstAttr.Typ != jfsTypeDir {
+			return 0, exist, attr, dstAttr, int(syscall.ENOTDIR), nil
+		}
+		if attr.Typ != jfsTypeDir && dstAttr.Typ == jfsTypeDir {
+			return 0, exist, attr, dstAttr, int(syscall.EISDIR), nil
+		}
+		if dstAttr.Typ == jfsTypeDir {
+			var children int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM jfs_edge WHERE parent = ?`, exist).Scan(&children); err != nil {
+				return 0, 0, nil, nil, 0, err
+			}
+			if children > 0 {
+				return 0, exist, attr, dstAttr, int(syscall.ENOTEMPTY), nil
+			}
+		}
+		if _, ueno, uerr := s.jfsUnlinkTx(context.Background(), tx, dstParent, dstName, dstPath, 0, false); uerr != nil || ueno != 0 {
+			if dstAttr.Typ == jfsTypeDir && ueno == int(syscall.EPERM) {
+				if _, _, reno, rerr := s.jfsRmdirTx(tx, dstParent, dstName, dstPath); rerr != nil || reno != 0 {
+					return 0, exist, attr, dstAttr, reno, rerr
+				}
+			} else {
+				return 0, exist, attr, dstAttr, ueno, uerr
+			}
+		}
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, 0, nil, nil, 0, err
 	}
 	if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? AND name = ?`, srcParent, []byte(srcName)); err != nil {
+		return 0, 0, nil, nil, 0, err
+	}
+	if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? AND name = ? AND inode <> ?`, dstParent, []byte(dstName), ino); err != nil {
 		return 0, 0, nil, nil, 0, err
 	}
 	if _, err := tx.Exec(`INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?, ?, ?, ?)`,
@@ -914,17 +1335,47 @@ func (s *Store) jfsRenameTx(tx *sql.Tx, srcParent uint64, srcName string, dstPar
 	if _, err := tx.Exec(`UPDATE jfs_node SET parent = ? WHERE inode = ?`, dstParent, ino); err != nil {
 		return 0, 0, nil, nil, 0, err
 	}
-	if srcPath != "" && dstPath != "" {
-		parent := pathutil.ParentPath(dstPath)
-		name := pathutil.BaseName(dstPath)
-		if _, err := tx.Exec(`UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?
-			WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
-			append([]any{dstPath, fileNodePathHash(dstPath), parent, fileNodePathHash(parent), name},
-				s.scope.Args(fileNodePathHash(srcPath), srcPath)...)...); err != nil {
+	if dstPath != "" {
+		if err := s.jfsMoveProjectionTx(tx, ino, srcPath, srcName, dstPath); err != nil {
 			return 0, 0, nil, nil, 0, err
 		}
 	}
 	return ino, 0, attr, nil, 0, nil
+}
+
+func (s *Store) jfsMoveProjectionTx(tx *sql.Tx, extentIno uint64, srcPath, srcName, dstPath string) error {
+	dstParent := pathutil.ParentPath(dstPath)
+	dstName := pathutil.BaseName(dstPath)
+	setArgs := []any{dstPath, fileNodePathHash(dstPath), dstParent, fileNodePathHash(dstParent), dstName}
+	try := func(where string, whereArgs []any) (int64, error) {
+		q := `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE ` + s.scope.And(where)
+		args := append(append([]any{}, setArgs...), s.scope.Args(whereArgs...)...)
+		res, err := tx.Exec(q, args...)
+		if isUniqueViolation(err) {
+			_, _ = tx.Exec(`DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
+				s.scope.Args(fileNodePathHash(dstPath), dstPath)...)
+			res, err = tx.Exec(q, args...)
+		}
+		if err != nil {
+			return 0, err
+		}
+		n, _ := res.RowsAffected()
+		return n, nil
+	}
+	if srcPath != "" {
+		n, err := try(`path_hash = ? AND path = ?`, []any{fileNodePathHash(srcPath), srcPath})
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			return nil
+		}
+	}
+	if extentIno == 0 || srcName == "" {
+		return nil
+	}
+	_, err := try(`extent_ino = ? AND name = ?`, []any{extentIno, srcName})
+	return err
 }
 
 func (s *Store) jfsReaddirTx(tx *sql.Tx, ino uint64, limit int) ([]map[string]any, error) {
@@ -975,51 +1426,80 @@ func marshalExtentSlice(pos uint32, id uint64, size, off, length uint32) []byte 
 	return buf
 }
 
+type extentWritePart struct {
+	Off   uint32
+	Slice ExtentSlice
+}
+
 func (s *Store) jfsWriteTx(tx *sql.Tx, ino uint64, indx, off uint32, sl ExtentSlice, mtime time.Time) (int, *ExtentAttr, int64, int64, int, error) {
-	attr, eno, err := s.jfsGetAttrTx(tx, ino)
-	if err != nil || eno != 0 {
-		return 0, attr, 0, 0, eno, err
+	return s.jfsWritePartsTx(tx, ino, indx, []extentWritePart{{Off: off, Slice: sl}}, mtime)
+}
+
+func (s *Store) jfsWritePartsTx(tx *sql.Tx, ino uint64, indx uint32, parts []extentWritePart, mtime time.Time) (int, *ExtentAttr, int64, int64, int, error) {
+	// JuiceFS doWrite: ForUpdate Get node, upsert slice, insert sliceRef,
+	// update node. Slice-count SELECT only when the chunk already existed
+	// (compact decision). We skip that SELECT and compact INSERT: compact
+	// is claim_compact scanning jfs_chunk, not the sqlite exclusive write.
+	var typ uint8
+	var length, parent uint64
+	var uid, gid uint32
+	err := tx.QueryRow(`SELECT type, length, parent, uid, gid FROM jfs_node WHERE inode = ?`, ino).
+		Scan(&typ, &length, &parent, &uid, &gid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil, 0, 0, int(syscall.ENOENT), nil
 	}
-	if attr.Typ != jfsTypeFile {
-		return 0, attr, 0, 0, int(syscall.EPERM), nil
-	}
-	newlen := uint64(indx)*ExtentChunkSize + uint64(off) + uint64(sl.Len)
-	var dlen, dspace int64
-	if newlen > attr.Length {
-		dlen = int64(newlen - attr.Length)
-		dspace = dlen
-		attr.Length = newlen
-	}
-	buf := marshalExtentSlice(off, sl.Id, sl.Size, sl.Off, sl.Len)
-	if _, err := tx.Exec(`INSERT INTO jfs_chunk (inode, indx, slices) VALUES (?, ?, ?)
-		ON DUPLICATE KEY UPDATE slices = CONCAT(slices, VALUES(slices))`, ino, indx, buf); err != nil {
+	if err != nil {
 		return 0, nil, 0, 0, 0, err
 	}
-	if _, err := tx.Exec(`INSERT INTO jfs_chunk_ref (chunkid, size, refs) VALUES (?, ?, 1)`, sl.Id, sl.Size); err != nil {
+	if typ != jfsTypeFile {
+		attr := ExtentAttr{Typ: typ, Length: length, Parent: parent, Uid: uid, Gid: gid, Full: true}
+		return 0, &attr, 0, 0, int(syscall.EPERM), nil
+	}
+	if len(parts) == 0 {
+		attr := ExtentAttr{Typ: typ, Length: length, Parent: parent, Uid: uid, Gid: gid, Full: true}
+		return 0, &attr, 0, 0, 0, nil
+	}
+	var buf []byte
+	var dlen, dspace int64
+	refSQL := make([]string, 0, len(parts))
+	refArgs := make([]any, 0, len(parts)*2)
+	for _, p := range parts {
+		newlen := uint64(indx)*ExtentChunkSize + uint64(p.Off) + uint64(p.Slice.Len)
+		if newlen > length {
+			dlen += int64(newlen - length)
+			dspace = dlen
+			length = newlen
+		}
+		buf = append(buf, marshalExtentSlice(p.Off, p.Slice.Id, p.Slice.Size, p.Slice.Off, p.Slice.Len)...)
+		refSQL = append(refSQL, "(?, ?, 1)")
+		refArgs = append(refArgs, p.Slice.Id, p.Slice.Size)
+	}
+	if len(refSQL) > 0 {
+		q := `INSERT INTO jfs_chunk_ref (chunkid, size, refs) VALUES ` + strings.Join(refSQL, ",") +
+			` ON DUPLICATE KEY UPDATE refs = refs + 1`
+		if _, err := tx.Exec(q, refArgs...); err != nil {
+			return 0, nil, 0, 0, 0, err
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO jfs_chunk (inode, indx, slices) VALUES (?, ?, ?)
+		ON DUPLICATE KEY UPDATE slices = CONCAT(slices, VALUES(slices))`, ino, indx, buf); err != nil {
 		return 0, nil, 0, 0, 0, err
 	}
 	now := time.Now().UnixNano()
 	mt, msec := jfsSplitTime(mtime.UnixNano())
 	ct, csec := jfsSplitTime(now)
 	if _, err := tx.Exec(`UPDATE jfs_node SET length=?, mtime=?, ctime=?, mtimensec=?, ctimensec=? WHERE inode=?`,
-		attr.Length, mt, ct, msec, csec, ino); err != nil {
+		length, mt, ct, msec, csec, ino); err != nil {
 		return 0, nil, 0, 0, 0, err
 	}
-	if _, err := tx.Exec(`UPDATE inodes SET size_bytes = ?, mtime = ? WHERE inode_id IN (
-		SELECT inode_id FROM file_nodes WHERE extent_ino = ?)`, attr.Length, mtime.UTC(), ino); err != nil {
-		// projection size is best-effort if the subquery is empty
-		_ = err
+	// JuiceFS doWrite returns len(slices)/sliceBytes from the in-memory blob.
+	// LENGTH() is the SQL equivalent without pulling the blob (CONCAT write).
+	var nbytes int
+	if err := tx.QueryRow(`SELECT LENGTH(slices) FROM jfs_chunk WHERE inode = ? AND indx = ?`, ino, indx).Scan(&nbytes); err != nil {
+		return 0, nil, 0, 0, 0, err
 	}
-	var slices []byte
-	_ = tx.QueryRow(`SELECT slices FROM jfs_chunk WHERE inode = ? AND indx = ?`, ino, indx).Scan(&slices)
-	nslice := len(slices) / extentSliceBytes
-	if nslice >= jfsCompactN {
-		taskID := strings.ToLower(ulid.Make().String())
-		_, _ = tx.Exec(`INSERT IGNORE INTO slice_compact_tasks (task_id, extent_ino, chunk, status, max_attempts)
-			VALUES (?, ?, ?, 'PENDING', 8)`, taskID, ino, indx)
-	}
-	out, _, _ := s.jfsGetAttrTx(tx, ino)
-	return nslice, out, dlen, dspace, 0, nil
+	attr := ExtentAttr{Typ: typ, Length: length, Parent: parent, Uid: uid, Gid: gid, Full: true}
+	return nbytes / extentSliceBytes, &attr, dlen, dspace, 0, nil
 }
 
 func (s *Store) jfsTruncateTx(tx *sql.Tx, ino, length uint64) (*ExtentAttr, int64, int64, int, error) {
@@ -1056,17 +1536,22 @@ func (s *Store) jfsTruncateTx(tx *sql.Tx, ino, length uint64) (*ExtentAttr, int6
 	return out, dlen, dlen, 0, nil
 }
 
-func (s *Store) jfsCompactTx(tx *sql.Tx, ino uint64, indx uint32, origin []byte, skipped int, pos uint32, id uint64, size uint32) (int, error) {
+type extentSliceRef struct {
+	id   uint64
+	size uint32
+}
+
+func (s *Store) jfsCompactTx(tx *sql.Tx, ino uint64, indx uint32, origin []byte, skipped int, pos uint32, id uint64, size uint32) (int, []extentSliceRef, error) {
 	var cur []byte
 	err := tx.QueryRow(`SELECT slices FROM jfs_chunk WHERE inode = ? AND indx = ? FOR UPDATE`, ino, indx).Scan(&cur)
 	if errors.Is(err, sql.ErrNoRows) {
-		return int(syscall.EINVAL), nil
+		return int(syscall.EINVAL), nil, nil
 	}
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if len(cur) < len(origin) || string(cur[:len(origin)]) != string(origin) {
-		return int(syscall.EINVAL), nil
+		return int(syscall.EINVAL), nil, nil
 	}
 	skipBytes := skipped * extentSliceBytes
 	if skipBytes > len(origin) {
@@ -1077,28 +1562,36 @@ func (s *Store) jfsCompactTx(tx *sql.Tx, ino uint64, indx uint32, origin []byte,
 	next = append(next, repl...)
 	next = append(next, cur[len(origin):]...)
 	if _, err := tx.Exec(`UPDATE jfs_chunk SET slices = ? WHERE inode = ? AND indx = ?`, next, ino, indx); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if _, err := tx.Exec(`INSERT INTO jfs_chunk_ref (chunkid, size, refs) VALUES (?, ?, 1)`, id, size); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
+	// JuiceFS doCompactChunk: refs-1 in the compact txn, deleteSlice after.
+	// Batched IN is the remote-SQL shape of those local Execs. Do not
+	// INSERT block_gc_tasks here — that held FOR UPDATE across sqlite fsync.
+	tuples := make([]string, 0)
+	args := make([]any, 0)
+	var olds []extentSliceRef
 	for i := skipBytes; i+extentSliceBytes <= len(origin); i += extentSliceBytes {
 		oldID := binary.BigEndian.Uint64(origin[i+4 : i+12])
 		oldSize := binary.BigEndian.Uint32(origin[i+12 : i+16])
 		if oldID == 0 {
 			continue
 		}
-		if _, err := tx.Exec(`UPDATE jfs_chunk_ref SET refs = refs - 1 WHERE chunkid = ? AND size = ?`, oldID, oldSize); err != nil {
-			return 0, err
-		}
-		var refs int
-		if err := tx.QueryRow(`SELECT refs FROM jfs_chunk_ref WHERE chunkid = ?`, oldID).Scan(&refs); err == nil && refs <= 0 {
-			_ = s.jfsEnqueueSliceGCTx(tx, oldID, oldSize, ino)
+		tuples = append(tuples, "(?, ?)")
+		args = append(args, oldID, oldSize)
+		olds = append(olds, extentSliceRef{id: oldID, size: oldSize})
+	}
+	if len(tuples) > 0 {
+		q := `UPDATE jfs_chunk_ref SET refs = refs - 1 WHERE (chunkid, size) IN (` + strings.Join(tuples, ",") + `)`
+		if _, err := tx.Exec(q, args...); err != nil {
+			return 0, nil, err
 		}
 	}
 	_, _ = tx.Exec(`UPDATE slice_compact_tasks SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP(3)
 		WHERE extent_ino = ? AND chunk = ? AND status IN ('PENDING','LEASED')`, ino, indx)
-	return 0, nil
+	return 0, olds, nil
 }
 
 func (s *Store) jfsEnqueueSliceGCTx(tx *sql.Tx, id uint64, size uint32, ino uint64) error {
@@ -1115,6 +1608,73 @@ func (s *Store) jfsEnqueueSliceGCTx(tx *sql.Tx, id uint64, size uint32, ino uint
 		}
 	}
 	return nil
+}
+
+func (s *Store) jfsEnqueueDeadSliceGCTx(tx *sql.Tx, ino uint64, refs []extentSliceRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	tuples := make([]string, 0, len(refs))
+	args := make([]any, 0, len(refs)*2)
+	for _, r := range refs {
+		if r.id == 0 {
+			continue
+		}
+		tuples = append(tuples, "(?, ?)")
+		args = append(args, r.id, r.size)
+	}
+	if len(tuples) == 0 {
+		return nil
+	}
+	q := `SELECT chunkid, size FROM jfs_chunk_ref WHERE refs <= 0 AND (chunkid, size) IN (` + strings.Join(tuples, ",") + `)`
+	rows, err := tx.Query(q, args...)
+	if err != nil {
+		return err
+	}
+	var dead []extentSliceRef
+	for rows.Next() {
+		var o extentSliceRef
+		if rows.Scan(&o.id, &o.size) == nil {
+			dead = append(dead, o)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	const batch = 64
+	ins := make([]string, 0, batch)
+	insArgs := make([]any, 0, batch*4)
+	flush := func() error {
+		if len(ins) == 0 {
+			return nil
+		}
+		_, err := tx.Exec(`INSERT IGNORE INTO block_gc_tasks (task_id, block_key, extent_ino, size_bytes, status, max_attempts) VALUES `+
+			strings.Join(ins, ","), insArgs...)
+		ins = ins[:0]
+		insArgs = insArgs[:0]
+		return err
+	}
+	for _, o := range dead {
+		nblocks := int((o.size + ExtentBlockSize - 1) / ExtentBlockSize)
+		if nblocks < 1 {
+			nblocks = 1
+		}
+		for i := 0; i < nblocks; i++ {
+			key := fmt.Sprintf("chunks/%d/%d/%d_%d_%d", o.id/1000/1000, o.id/1000, o.id, i, blockLen(o.size, i))
+			taskID := strings.ToLower(ulid.Make().String())
+			ins = append(ins, "(?, ?, ?, ?, 'PENDING', 8)")
+			insArgs = append(insArgs, taskID, key, nullUint64(ino), blockLen(o.size, i))
+			if len(ins) >= batch {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return flush()
 }
 
 func blockLen(size uint32, indx int) uint32 {
@@ -1136,37 +1696,14 @@ func nullUint64(v uint64) any {
 }
 
 func (s *Store) jfsEnqueueFileGCTx(tx *sql.Tx, ino, length uint64) error {
-	rows, err := tx.Query(`SELECT slices FROM jfs_chunk WHERE inode = ?`, ino)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var buf []byte
-		if err := rows.Scan(&buf); err != nil {
-			return err
-		}
-		for i := 0; i+extentSliceBytes <= len(buf); i += extentSliceBytes {
-			id := binary.BigEndian.Uint64(buf[i+4 : i+12])
-			sz := binary.BigEndian.Uint32(buf[i+12 : i+16])
-			if id == 0 {
-				continue
-			}
-			if _, err := tx.Exec(`UPDATE jfs_chunk_ref SET refs = refs - 1 WHERE chunkid = ?`, id); err != nil {
-				return err
-			}
-			var refs int
-			if err := tx.QueryRow(`SELECT refs FROM jfs_chunk_ref WHERE chunkid = ?`, id).Scan(&refs); err == nil && refs <= 0 {
-				if err := s.jfsEnqueueSliceGCTx(tx, id, sz, ino); err != nil {
-					return err
-				}
-			}
-		}
-	}
+	// JuiceFS sql_unlink with MaxDeletes=0 records delfile and returns;
+	// slice ref-count + object delete run in the background. Walking every
+	// 24-byte slice here made delete-journal COMMIT unlink take seconds
+	// (sqlite --wait all is 10s).
 	if _, err := tx.Exec(`DELETE FROM jfs_chunk WHERE inode = ?`, ino); err != nil {
 		return err
 	}
-	_, err = tx.Exec(`INSERT IGNORE INTO jfs_delfile (inode, length, expire) VALUES (?, ?, ?)`, ino, length, time.Now().Unix())
+	_, err := tx.Exec(`INSERT IGNORE INTO jfs_delfile (inode, length, expire) VALUES (?, ?, ?)`, ino, length, time.Now().Unix())
 	return err
 }
 
@@ -1191,22 +1728,43 @@ func (s *Store) jfsDeleteSustainedTx(tx *sql.Tx, sid, ino uint64) error {
 	return nil
 }
 
+func jfsIsUnlock(ltype uint32) bool {
+	return ltype == uint32(syscall.F_UNLCK) || ltype == 'U' || ltype == 2
+}
+
+func jfsIsWriteLock(ltype uint32) bool {
+	return ltype == uint32(syscall.F_WRLCK) || ltype == 'W' || ltype == 3
+}
+
+func (s *Store) jfsLockInodeTx(tx *sql.Tx, ino uint64) (int, error) {
+	var got uint64
+	err := tx.QueryRow(`SELECT inode FROM jfs_node WHERE inode = ? FOR UPDATE`, ino).Scan(&got)
+	if errors.Is(err, sql.ErrNoRows) {
+		return int(syscall.ENOENT), nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
+
 func (s *Store) jfsFlockTx(tx *sql.Tx, ino, sid, owner uint64, ltype uint32) (int, error) {
-	const (
-		fUnlck = 1
-		fWrlck = 3
-	)
-	if ltype == uint32(syscall.F_UNLCK) || ltype == fUnlck {
+	if eno, err := s.jfsLockInodeTx(tx, ino); err != nil || eno != 0 {
+		return eno, err
+	}
+	if jfsIsUnlock(ltype) {
 		_, err := tx.Exec(`DELETE FROM jfs_flock WHERE inode = ? AND sid = ? AND owner = ?`, ino, sid, int64(owner))
 		return 0, err
 	}
+	wantWrite := jfsIsWriteLock(ltype)
 	var n int
-	wantWrite := ltype == uint32(syscall.F_WRLCK) || ltype == fWrlck
-	q := `SELECT COUNT(*) FROM jfs_flock WHERE inode = ? AND NOT (sid = ? AND owner = ?)`
+	q := `SELECT COUNT(*) FROM jfs_flock WHERE inode = ? AND NOT (sid = ? AND owner = ?) FOR UPDATE`
 	if !wantWrite {
-		q = `SELECT COUNT(*) FROM jfs_flock WHERE inode = ? AND NOT (sid = ? AND owner = ?) AND ltype = 87`
-	}
-	if err := tx.QueryRow(q, ino, sid, int64(owner)).Scan(&n); err != nil {
+		q = `SELECT COUNT(*) FROM jfs_flock WHERE inode = ? AND NOT (sid = ? AND owner = ?) AND ltype = ? FOR UPDATE`
+		if err := tx.QueryRow(q, ino, sid, int64(owner), int('W')).Scan(&n); err != nil {
+			return 0, err
+		}
+	} else if err := tx.QueryRow(q, ino, sid, int64(owner)).Scan(&n); err != nil {
 		return 0, err
 	}
 	if n > 0 {
@@ -1221,16 +1779,388 @@ func (s *Store) jfsFlockTx(tx *sql.Tx, ino, sid, owner uint64, ltype uint32) (in
 	return 0, err
 }
 
-func (s *Store) jfsSetlkTx(tx *sql.Tx, ino, sid, owner uint64, ltype uint32, start, end uint64, pid uint32) (int, error) {
-	// POSIX record locks: store as a single blob per (inode,sid,owner).
-	if ltype == uint32(syscall.F_UNLCK) {
+type jfsPLock struct {
+	Type  uint32 `json:"t"`
+	Start uint64 `json:"s"`
+	End   uint64 `json:"e"`
+	Pid   uint32 `json:"p"`
+}
+
+func (s *Store) jfsLoadPlocksTx(tx *sql.Tx, ino uint64) ([]struct {
+	sid, owner uint64
+	recs       []jfsPLock
+}, error) {
+	return s.jfsLoadPlocksQueryTx(tx, ino, false)
+}
+
+func (s *Store) jfsLoadPlocksForUpdateTx(tx *sql.Tx, ino uint64) ([]struct {
+	sid, owner uint64
+	recs       []jfsPLock
+}, error) {
+	return s.jfsLoadPlocksQueryTx(tx, ino, true)
+}
+
+func (s *Store) jfsLoadPlocksQueryTx(tx *sql.Tx, ino uint64, forUpdate bool) ([]struct {
+	sid, owner uint64
+	recs       []jfsPLock
+}, error) {
+	q := `SELECT sid, owner, records FROM jfs_plock WHERE inode = ?`
+	if forUpdate {
+		q += ` FOR UPDATE`
+	}
+	rows, err := tx.Query(q, ino)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []struct {
+		sid, owner uint64
+		recs       []jfsPLock
+	}
+	for rows.Next() {
+		var sid uint64
+		var owner int64
+		var raw []byte
+		if err := rows.Scan(&sid, &owner, &raw); err != nil {
+			return nil, err
+		}
+		var recs []jfsPLock
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, &recs)
+		}
+		out = append(out, struct {
+			sid, owner uint64
+			recs       []jfsPLock
+		}{sid, uint64(owner), recs})
+	}
+	return out, rows.Err()
+}
+
+// jfsUpdateLocks is JuiceFS meta.updateLocks: split/merge inclusive ranges
+// and drop F_UNLCK records. SQLite WAL uses single-byte POSIX locks.
+func jfsUpdateLocks(ls []jfsPLock, nl jfsPLock) []jfsPLock {
+	size := len(ls)
+	for i := 0; i < size && nl.Start <= nl.End; i++ {
+		l := ls[i]
+		if nl.Start < l.Start && nl.End >= l.Start {
+			ls = append(ls, nl)
+			ls[len(ls)-1].End = l.Start - 1
+			nl.Start = l.Start
+		}
+		if nl.Start > l.Start && nl.Start <= l.End {
+			l.End = nl.Start - 1
+			ls = append(ls, l)
+			ls[i].Start = nl.Start
+			l = ls[i]
+		}
+		if nl.Start == l.Start {
+			ls[i].Type = nl.Type
+			ls[i].Pid = nl.Pid
+			if l.End > nl.End {
+				ls[i].End = nl.End
+				l.Start = nl.End + 1
+				ls = append(ls, l)
+			}
+			nl.Start = ls[i].End + 1
+		}
+	}
+	if nl.Start <= nl.End {
+		ls = append(ls, nl)
+	}
+	sort.Slice(ls, func(i, j int) bool { return ls[i].Start < ls[j].Start })
+	for i := 0; i < len(ls); {
+		if jfsIsUnlock(ls[i].Type) || ls[i].Start > ls[i].End {
+			copy(ls[i:], ls[i+1:])
+			ls = ls[:len(ls)-1]
+			continue
+		}
+		if i+1 < len(ls) && ls[i].Type == ls[i+1].Type && ls[i].Pid == ls[i+1].Pid && ls[i].End+1 == ls[i+1].Start {
+			ls[i].End = ls[i+1].End
+			ls[i+1].Start = ls[i+1].End + 1
+		}
+		i++
+	}
+	return ls
+}
+
+func (s *Store) jfsSavePlockTx(tx *sql.Tx, ino, sid, owner uint64, recs []jfsPLock) error {
+	if len(recs) == 0 {
 		_, err := tx.Exec(`DELETE FROM jfs_plock WHERE inode = ? AND sid = ? AND owner = ?`, ino, sid, int64(owner))
+		return err
+	}
+	raw, err := json.Marshal(recs)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO jfs_plock (inode, sid, owner, records) VALUES (?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE records = VALUES(records)`, ino, sid, int64(owner), raw)
+	return err
+}
+
+func (s *Store) jfsSetlkTx(tx *sql.Tx, ino, sid, owner uint64, ltype uint32, start, end uint64, pid uint32) (int, error) {
+	if eno, err := s.jfsLockInodeTx(tx, ino); err != nil || eno != 0 {
+		return eno, err
+	}
+	held, err := s.jfsLoadPlocksForUpdateTx(tx, ino)
+	if err != nil {
 		return 0, err
 	}
-	rec := fmt.Sprintf("%d:%d:%d:%d", ltype, start, end, pid)
-	_, err := tx.Exec(`INSERT INTO jfs_plock (inode, sid, owner, records) VALUES (?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE records = VALUES(records)`, ino, sid, int64(owner), []byte(rec))
-	return 0, err
+	nl := jfsPLock{Type: ltype, Start: start, End: end, Pid: pid}
+	if jfsIsUnlock(ltype) {
+		for _, h := range held {
+			if h.sid != sid || h.owner != owner {
+				continue
+			}
+			return 0, s.jfsSavePlockTx(tx, ino, sid, owner, jfsUpdateLocks(h.recs, nl))
+		}
+		return 0, nil
+	}
+	wantWrite := jfsIsWriteLock(ltype)
+	for _, h := range held {
+		if h.sid == sid && h.owner == owner {
+			continue
+		}
+		for _, rec := range h.recs {
+			if end < rec.Start || start > rec.End {
+				continue
+			}
+			otherWrite := jfsIsWriteLock(rec.Type)
+			if wantWrite || otherWrite {
+				return int(syscall.EAGAIN), nil
+			}
+		}
+	}
+	var mine []jfsPLock
+	for _, h := range held {
+		if h.sid == sid && h.owner == owner {
+			mine = h.recs
+			break
+		}
+	}
+	return 0, s.jfsSavePlockTx(tx, ino, sid, owner, jfsUpdateLocks(mine, nl))
+}
+
+func (s *Store) jfsGetlkTx(tx *sql.Tx, ino, sid, owner uint64, ltype uint32, start, end uint64) (uint32, uint64, uint64, uint32, int, error) {
+	held, err := s.jfsLoadPlocksTx(tx, ino)
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	wantWrite := jfsIsWriteLock(ltype)
+	for _, h := range held {
+		if h.sid == sid && h.owner == owner {
+			continue
+		}
+		for _, rec := range h.recs {
+			if end < rec.Start || start > rec.End {
+				continue
+			}
+			otherWrite := jfsIsWriteLock(rec.Type)
+			if wantWrite || otherWrite {
+				return rec.Type, rec.Start, rec.End, rec.Pid, 0, nil
+			}
+		}
+	}
+	return uint32(syscall.F_UNLCK), start, end, 0, 0, nil
+}
+
+func (s *Store) jfsFindStaleSessionsTx(tx *sql.Tx, limit int) ([]uint64, error) {
+	if limit <= 0 {
+		limit = 16
+	}
+	now := time.Now().Unix()
+	rows, err := tx.Query(`SELECT sid FROM jfs_session2 WHERE expire > 0 AND expire < ? ORDER BY expire LIMIT ?`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var sids []uint64
+	for rows.Next() {
+		var sid uint64
+		if err := rows.Scan(&sid); err != nil {
+			return nil, err
+		}
+		sids = append(sids, sid)
+	}
+	if sids == nil {
+		sids = []uint64{}
+	}
+	return sids, rows.Err()
+}
+
+func (s *Store) jfsCleanStaleSessionTx(tx *sql.Tx, sid uint64) error {
+	if _, err := tx.Exec(`DELETE FROM jfs_flock WHERE sid = ?`, sid); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM jfs_plock WHERE sid = ?`, sid); err != nil {
+		return err
+	}
+	rows, err := tx.Query(`SELECT inode FROM jfs_sustained WHERE sid = ?`, sid)
+	if err != nil {
+		return err
+	}
+	var inos []uint64
+	for rows.Next() {
+		var ino uint64
+		if err := rows.Scan(&ino); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		inos = append(inos, ino)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, ino := range inos {
+		if err := s.jfsDeleteSustainedTx(tx, sid, ino); err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(`DELETE FROM jfs_session2 WHERE sid = ?`, sid)
+	return err
+}
+
+// UnlinkExtentPath removes an extent file via the JuiceFS Unlink txn (edge + projection).
+func (s *Store) UnlinkExtentPath(ctx context.Context, path string, opened bool) error {
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		if err := s.jfsEnsureInitTx(tx); err != nil {
+			return err
+		}
+		return s.unlinkExtentPathTx(tx, path, opened)
+	})
+}
+
+func (s *Store) unlinkExtentTree(ctx context.Context, dirPath string) error {
+	prefix := dirPath
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT path FROM file_nodes WHERE `+
+		s.scope.And(`is_directory = 0 AND content_layout = ? AND (path = ? OR path LIKE ?)`),
+		s.scope.Args(string(ContentLayoutExtent), dirPath, prefix+"%")...)
+	if err != nil {
+		return err
+	}
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		paths = append(paths, p)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, p := range paths {
+		if err := s.UnlinkExtentPath(ctx, p, false); err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) unlinkExtentPathTx(tx *sql.Tx, path string, opened bool) error {
+	var ino sql.NullInt64
+	var layout sql.NullString
+	err := tx.QueryRow(`SELECT content_layout, extent_ino FROM file_nodes WHERE `+
+		s.scope.And(`path_hash = ? AND path = ?`),
+		s.scope.Args(fileNodePathHash(path), path)...).Scan(&layout, &ino)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if layout.String != string(ContentLayoutExtent) || !ino.Valid || ino.Int64 == 0 {
+		return ErrNotFound
+	}
+	attr, eno, err := s.jfsGetAttrTx(tx, uint64(ino.Int64))
+	if err != nil {
+		return err
+	}
+	if eno != 0 || attr == nil {
+		_, err = tx.Exec(`DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
+			s.scope.Args(fileNodePathHash(path), path)...)
+		return err
+	}
+	name := pathutil.BaseName(path)
+	_, eno, err = s.jfsUnlinkTx(context.Background(), tx, attr.Parent, name, path, 0, opened)
+	if err != nil {
+		return err
+	}
+	if eno == int(syscall.ENOENT) {
+		return ErrNotFound
+	}
+	if eno != 0 {
+		return fmt.Errorf("extent unlink: %w", syscall.Errno(eno))
+	}
+	return nil
+}
+
+// SweepStaleExtentSessions reclaims locks and open-unlinked files for expired sessions.
+func (s *Store) SweepStaleExtentSessions(ctx context.Context, limit int) (int, error) {
+	n := 0
+	err := s.InTx(ctx, func(tx *sql.Tx) error {
+		sids, err := s.jfsFindStaleSessionsTx(tx, limit)
+		if err != nil {
+			return err
+		}
+		for _, sid := range sids {
+			if err := s.jfsCleanStaleSessionTx(tx, sid); err != nil {
+				return err
+			}
+			n++
+		}
+		return nil
+	})
+	return n, err
+}
+
+func (s *Store) jfsClaimCompactTx(tx *sql.Tx) (ino uint64, chunk uint32, taskID string, err error) {
+	err = tx.QueryRow(`SELECT task_id, extent_ino, chunk FROM slice_compact_tasks
+		WHERE status = 'PENDING' OR (status = 'LEASED' AND lease_until < CURRENT_TIMESTAMP(3))
+		ORDER BY created_at LIMIT 1 FOR UPDATE`).Scan(&taskID, &ino, &chunk)
+	if err == nil {
+		_, err = tx.Exec(`UPDATE slice_compact_tasks SET status = 'LEASED', leased_at = CURRENT_TIMESTAMP(3),
+			lease_until = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 5 MINUTE) WHERE task_id = ?`, taskID)
+		return ino, chunk, taskID, err
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, "", err
+	}
+	// JuiceFS compact is not an INSERT on the write txn; doWrite returns
+	// numSlices and baseMeta.Write launches compactChunk. Discover fat
+	// chunks here as a backup. Skip runaway blobs (LENGTH ≫ maxSlices):
+	// a 500MB leftover row made compact SELECT+UPDATE saturate TiDB and
+	// stall sqlite --finish on other inodes. Write-path compact keeps
+	// live chunks ≤ maxSlices (60KiB).
+	minBytes := jfsCompactThreshold * extentSliceBytes
+	// 4× JuiceFS maxSlices (240KiB). Live Write compact keeps chunks near
+	// 60KiB; 500MiB leftovers from before that trigger are skipped so
+	// compact SELECT+UPDATE cannot saturate TiDB.
+	maxBytes := extentCompactSlices * extentSliceBytes * 4
+	err = tx.QueryRow(`SELECT inode, indx FROM jfs_chunk WHERE LENGTH(slices) >= ? AND LENGTH(slices) <= ? LIMIT 1`, minBytes, maxBytes).
+		Scan(&ino, &chunk)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	taskID = strings.ToLower(ulid.Make().String())
+	_, err = tx.Exec(`INSERT INTO slice_compact_tasks (task_id, extent_ino, chunk, status, max_attempts, leased_at, lease_until)
+		VALUES (?, ?, ?, 'LEASED', 8, CURRENT_TIMESTAMP(3), DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 5 MINUTE))
+		ON DUPLICATE KEY UPDATE status = 'LEASED', task_id = VALUES(task_id),
+			leased_at = CURRENT_TIMESTAMP(3),
+			lease_until = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 5 MINUTE)`,
+		taskID, ino, chunk)
+	return ino, chunk, taskID, err
+}
+
+func (s *Store) jfsRequeueCompactTx(tx *sql.Tx, taskID string) error {
+	_, err := tx.Exec(`UPDATE slice_compact_tasks SET status = 'PENDING', leased_at = NULL, lease_until = NULL
+		WHERE task_id = ? AND status = 'LEASED'`, taskID)
+	return err
 }
 
 // ListPendingBlockGC returns block keys ready for deletion.
@@ -1258,19 +2188,20 @@ func (s *Store) MarkBlockGCDone(ctx context.Context, key string) error {
 	return err
 }
 
+func (s *Store) BlockGCTaskStatus(ctx context.Context, key string) (string, error) {
+	var status string
+	err := s.db.QueryRowContext(ctx, `SELECT status FROM block_gc_tasks WHERE block_key = ?`, key).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return status, err
+}
+
 func (s *Store) ClaimCompactTask(ctx context.Context) (ino uint64, chunk uint32, taskID string, err error) {
 	err = s.InTx(ctx, func(tx *sql.Tx) error {
-		err := tx.QueryRow(`SELECT task_id, extent_ino, chunk FROM slice_compact_tasks
-			WHERE status = 'PENDING' ORDER BY created_at LIMIT 1 FOR UPDATE`).Scan(&taskID, &ino, &chunk)
-		if errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if err != nil {
-			return err
-		}
-		_, err = tx.Exec(`UPDATE slice_compact_tasks SET status = 'LEASED', leased_at = CURRENT_TIMESTAMP(3),
-			lease_until = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 5 MINUTE) WHERE task_id = ?`, taskID)
-		return err
+		var e error
+		ino, chunk, taskID, e = s.jfsClaimCompactTx(tx)
+		return e
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, 0, "", nil

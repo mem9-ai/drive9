@@ -93,6 +93,14 @@ on:
         options:
           - "0"
           - "1"
+      run_fuse_sqlite_commit_sequence:
+        description: "Run opt-in FUSE SQLite 1000-commit WAL FULL sequence"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
       run_fuse_performance_baseline:
         description: "Run opt-in FUSE performance baseline and upload metrics artifacts"
         required: false
@@ -167,6 +175,7 @@ env:
   RUN_FUSE_SQLITE_WAL: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_wal) || '0') }}
   RUN_FUSE_SQLITE_CHURN: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_churn) || '0') }}
   RUN_FUSE_SQLITE_CONCURRENCY: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_concurrency) || '0') }}
+  RUN_FUSE_SQLITE_COMMIT_SEQUENCE: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_commit_sequence) || '0') }}
   RUN_FUSE_PERFORMANCE_BASELINE: ${{ github.event_name == 'schedule' && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_performance_baseline) || '0') }}
   ARCHIVE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.archive_fuse_performance_metrics || '0') }}
   COMPARE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.compare_fuse_performance_metrics || '0') }}
@@ -250,9 +259,13 @@ jobs:
           cat /tmp/tidb-sql-ready.log >&2 || true
           exit 1
 
+      - name: Pull MinIO image
+        run: docker pull "${DRIVE9_MINIO_IMAGE:-minio/minio:RELEASE.2024-12-18T13-15-44Z}" || echo "MinIO image pull failed; scripts/local-minio.sh will retry or fall back to the filesystem mock"
+
       - name: Start drive9-server
         run: |
           set -euo pipefail
+          eval "$(bash scripts/local-minio.sh apply)"
           if [ -n "${DRIVE9_SERVER_BIN:-}" ]; then
             if [ ! -x "$DRIVE9_SERVER_BIN" ]; then
               echo "DRIVE9_SERVER_BIN is not executable: $DRIVE9_SERVER_BIN" >&2
@@ -448,6 +461,14 @@ jobs:
         continue-on-error: true
         run: bash e2e/fuse-posix-fsx-gate.sh
 
+      - name: Run FUSE SQLite commit sequence
+        id: fuse-sqlite-commit-sequence
+        if: always() && env.RUN_FUSE_SQLITE_COMMIT_SEQUENCE == '1'
+        timeout-minutes: 30
+        env:
+          FUSE_STRICT_PREREQS: "1"
+        run: bash e2e/fuse-sqlite-commit-sequence.sh
+
       - name: Run full smoke-all suite
         id: smoke-all
         if: always() && env.RUN_E2E_SMOKE_ALL == '1'
@@ -491,6 +512,7 @@ jobs:
             echo "| FUSE performance compare | ${{ steps.fuse_performance_compare.outcome || 'skipped' }} |"
             echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.outcome || 'skipped' }} |"
             echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.outcome || 'skipped' }} |"
+            echo "| FUSE SQLite commit sequence | ${{ steps.fuse-sqlite-commit-sequence.outcome || 'skipped' }} |"
             echo "| Full smoke-all suite | ${{ steps.smoke-all.outcome || 'skipped' }} |"
             echo "| Git feature smoke | ${{ steps.git-feature-smoke.outcome || 'skipped' }} |"
             echo
@@ -500,6 +522,7 @@ jobs:
             echo "FUSE SQLite WAL: \`RUN_FUSE_SQLITE_WAL=${RUN_FUSE_SQLITE_WAL}\`"
             echo "FUSE SQLite churn: \`RUN_FUSE_SQLITE_CHURN=${RUN_FUSE_SQLITE_CHURN}\`"
             echo "FUSE SQLite concurrency: \`RUN_FUSE_SQLITE_CONCURRENCY=${RUN_FUSE_SQLITE_CONCURRENCY}\`"
+            echo "FUSE SQLite commit sequence: \`RUN_FUSE_SQLITE_COMMIT_SEQUENCE=${RUN_FUSE_SQLITE_COMMIT_SEQUENCE}\`"
             echo "FUSE performance baseline: \`RUN_FUSE_PERFORMANCE_BASELINE=${RUN_FUSE_PERFORMANCE_BASELINE}\`"
             echo "Archive FUSE performance metrics: \`ARCHIVE_FUSE_PERFORMANCE_METRICS=${ARCHIVE_FUSE_PERFORMANCE_METRICS}\`"
             echo "Compare FUSE performance metrics: \`COMPARE_FUSE_PERFORMANCE_METRICS=${COMPARE_FUSE_PERFORMANCE_METRICS}\`"
@@ -537,6 +560,7 @@ jobs:
             "fuse_performance_compare": "${{ steps.fuse_performance_compare.outcome }}",
             "fuse-concurrency-stress": "${{ steps.fuse-concurrency-stress.outcome }}",
             "fuse-posix-fsx": "${{ steps.fuse-posix-fsx.outcome }}",
+            "fuse-sqlite-commit-sequence": "${{ steps.fuse-sqlite-commit-sequence.outcome }}",
             "smoke-all": "${{ steps.smoke-all.outcome }}",
             "git-feature-smoke": "${{ steps.git-feature-smoke.outcome }}"
           }
@@ -642,6 +666,9 @@ jobs:
           fi
           if [ "${RUN_FUSE_POSIX_FSX}" = "1" ]; then
             check_required "FUSE POSIX/fsx gate" "${{ steps.fuse-posix-fsx.outcome }}"
+          fi
+          if [ "${RUN_FUSE_SQLITE_COMMIT_SEQUENCE}" = "1" ]; then
+            check_required "FUSE SQLite commit sequence" "${{ steps.fuse-sqlite-commit-sequence.outcome }}"
           fi
           if [ "${RUN_E2E_SMOKE_ALL}" = "1" ]; then
             check_required "Full smoke-all suite" "${{ steps.smoke-all.outcome }}"

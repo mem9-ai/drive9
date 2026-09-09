@@ -51,6 +51,12 @@ func (c *LocalS3Client) objectPath(key string) string {
 	return filepath.Join(c.rootDir, "objects", key)
 }
 
+// RootDir is the local mock S3 root.
+func (c *LocalS3Client) RootDir() string { return c.rootDir }
+
+// ObjectsDir is where PutObject stores keys (root/objects).
+func (c *LocalS3Client) ObjectsDir() string { return filepath.Join(c.rootDir, "objects") }
+
 func (c *LocalS3Client) partPath(key, uploadID string, partNumber int) string {
 	return filepath.Join(c.rootDir, "parts", uploadID, fmt.Sprintf("%05d", partNumber))
 }

@@ -106,6 +106,13 @@
       "owner_hint": "fs",
       "failure_class": "correctness"
     },
+    "fuse-sqlite-commit-sequence": {
+      "title": "FUSE SQLite commit sequence",
+      "product_area": "fuse",
+      "product_promise": "SQLite WAL survives many sequential FULL commits across remount",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
+    },
     "smoke-all": {
       "title": "Full smoke-all suite",
       "product_area": "platform",

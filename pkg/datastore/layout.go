@@ -15,7 +15,10 @@ const (
 	// ExtentBlockSize matches JuiceFS default block size (4 MiB).
 	ExtentBlockSize = 4 << 20
 	extentSliceBytes = 24
-	extentCompactSlices = 350
+	// JuiceFS maxSlices (pkg/meta/base.go) is 2500; below that compact is
+	// async and must not block Write. Enqueue at 350 made HTTP compact CAS
+	// contend with sqlite exclusive COMMITs (JuiceFS SQL compact is µs).
+	extentCompactSlices = 2500
 )
 
 func NormalizeContentLayout(layout ContentLayout) ContentLayout {

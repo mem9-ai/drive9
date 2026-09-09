@@ -30,6 +30,12 @@ func entryIsMetadataOnlySpecial(entry *InodeEntry) bool {
 	return entry != nil && !entry.IsDir && entry.HasMode && metadataOnlySpecialMode(entry.Mode)
 }
 
+// localOnlySpecialEntry is an in-memory fifo/device/socket with no JuiceFS
+// inode. Extent-backed specials use VFS SetAttr/GetAttr/Link like files.
+func localOnlySpecialEntry(entry *InodeEntry) bool {
+	return entryIsMetadataOnlySpecial(entry) && entry.ExtentIno == 0
+}
+
 func (fs *Dat9FS) specialNodeEntry(p string) (*InodeEntry, bool) {
 	if fs == nil {
 		return nil, false

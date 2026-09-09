@@ -9618,8 +9618,14 @@ func TestGoFuseMountOptionsMapsSyncRead(t *testing.T) {
 	if !explicit.SyncRead {
 		t.Fatal("explicit go-fuse SyncRead = false, want true")
 	}
-	if explicit.MaxBackground != 32 {
-		t.Fatalf("MaxBackground = %d, want 32", explicit.MaxBackground)
+	if explicit.MaxBackground != 200 {
+		t.Fatalf("MaxBackground = %d, want JuiceFS GenFuseOpt 200", explicit.MaxBackground)
+	}
+	if runtime.GOOS == "linux" && !explicit.EnableWriteback {
+		t.Fatal("linux EnableWriteback = false, want JuiceFS -o writeback_cache")
+	}
+	if runtime.GOOS != "linux" && explicit.EnableWriteback {
+		t.Fatal("non-linux EnableWriteback = true, want kernel cap only on linux")
 	}
 }
 

@@ -21,6 +21,7 @@
 #   bash scripts/sdk-integration-tests.sh --port 19009         # override listen port
 #   bash scripts/sdk-integration-tests.sh --no-build           # reuse bin/drive9-server
 #   DRIVE9_SERVER_BIN=/path/to/drive9-server bash scripts/sdk-integration-tests.sh --no-build
+#   DRIVE9_S3_BACKEND=minio|mock|auto bash scripts/sdk-integration-tests.sh
 #
 # Exit code is non-zero if any enabled SDK suite fails.
 #
@@ -272,8 +273,6 @@ build_server() {
 
 start_server() {
   log "starting drive9-server on $LISTEN_ADDR"
-  S3_DIR="$WORK_DIR/s3"
-  mkdir -p "$S3_DIR"
 
   # Compose the env explicitly so the run is hermetic.
   export DRIVE9_LISTEN_ADDR="$LISTEN_ADDR"
@@ -283,7 +282,18 @@ start_server() {
   export DRIVE9_META_DSN="${DRIVE9_META_DSN:-$DRIVE9_LOCAL_DSN}"
   export DRIVE9_LOCAL_MYSQL_DSN="${DRIVE9_LOCAL_MYSQL_DSN:-$DRIVE9_LOCAL_DSN}"
   export DRIVE9_LOCAL_EMBEDDING_MODE="${DRIVE9_LOCAL_EMBEDDING_MODE:-app}"
-  export DRIVE9_S3_DIR="$S3_DIR"
+  if [ -z "${DRIVE9_S3_BUCKET:-}" ]; then
+    : "${DRIVE9_S3_DIR:=$WORK_DIR/s3}"
+    export DRIVE9_S3_DIR
+  fi
+  local s3_env
+  s3_env="$(bash "$ROOT/scripts/local-minio.sh" apply)"
+  eval "$s3_env"
+  if [ -n "${DRIVE9_S3_DIR:-}" ]; then
+    S3_DIR="$DRIVE9_S3_DIR"
+  else
+    S3_DIR=""
+  fi
 
   # Redirect server logs to a file for debugging.
   "$SERVER_BIN" >"$WORK_DIR/server.log" 2>&1 &

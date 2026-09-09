@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,9 @@ type InodeEntry struct {
 	Rdev       uint32
 	Revision   int64 // server-side revision for cache validation
 	Unlinked   bool  // path was removed while open handles still reference this inode
+	// ExtentIno is the JuiceFS inode for content_layout=extent files.
+	// Shared across hardlink aliases of the same FUSE inode.
+	ExtentIno uint64
 }
 
 // InodeToPath provides a bidirectional mapping between inode numbers and
@@ -277,6 +281,12 @@ func shouldKeepForgetMapping(entry *InodeEntry) bool {
 	if entry.HasUID || entry.HasGID {
 		return true
 	}
+	// JuiceFS uses the juicefs inode as the FUSE nodeid, so Forget cannot
+	// drop the identity. Dat9FS allocates its own nodeids and must keep the
+	// juicefs Ino mapping (and last known length) across kernel Forget.
+	if entry.ExtentIno != 0 {
+		return true
+	}
 	return entryIsMetadataOnlySpecial(entry)
 }
 
@@ -352,6 +362,91 @@ func (m *InodeToPath) AddAliasIfAbsent(ino uint64, path, resourceID string, nlin
 	entry.Nlookup++
 	m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
 	return true
+}
+
+// SetExtentIno records the JuiceFS inode for a FUSE inode. Hardlink aliases
+// share the FUSE inode, so one update covers every path.
+func (m *InodeToPath) SetExtentIno(ino uint64, extentIno uint64) {
+	if m == nil || extentIno == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if entry, ok := m.byInode[ino]; ok {
+		entry.ExtentIno = extentIno
+	}
+}
+
+// FindByExtentIno returns the FUSE inode that already owns this JuiceFS
+// inode, so Lookup after rename/hardlink reuses the same nodeid.
+func (m *InodeToPath) FindByExtentIno(extentIno uint64) (uint64, bool) {
+	if m == nil || extentIno == 0 {
+		return 0, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for ino, entry := range m.byInode {
+		if entry != nil && !entry.IsDir && entry.ExtentIno == extentIno {
+			return ino, true
+		}
+	}
+	return 0, false
+}
+
+// FindPathInDir locates a child by basename under dir, ignoring extra slashes
+// so finishLocalRename still finds the source after childPath normalization.
+func (m *InodeToPath) FindPathInDir(dir, name string) (uint64, string, bool) {
+	if m == nil || name == "" {
+		return 0, "", false
+	}
+	dir = path.Clean("/" + strings.TrimPrefix(strings.TrimSuffix(dir, "/"), "/"))
+	if dir == "." {
+		dir = "/"
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for p, ino := range m.byPath {
+		trimmed := strings.TrimSuffix(p, "/")
+		if path.Base(trimmed) != name {
+			continue
+		}
+		parent := path.Dir(trimmed)
+		if parent == "." {
+			parent = "/"
+		}
+		if parent == dir {
+			return ino, p, true
+		}
+	}
+	return 0, "", false
+}
+
+// FindByBaseName returns the unique path with this basename. pjdfstest
+// names are unique hashes; rename can then find the source even when the
+// parent path string does not match GetPath.
+func (m *InodeToPath) FindByBaseName(name string) (uint64, string, bool) {
+	if m == nil || name == "" || name == "/" || name == "." {
+		return 0, "", false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	found := 0
+	var ino uint64
+	var pth string
+	for p, i := range m.byPath {
+		if path.Base(strings.TrimSuffix(p, "/")) != name {
+			continue
+		}
+		found++
+		ino, pth = i, p
+		if found > 1 {
+			return 0, "", false
+		}
+	}
+	if found != 1 {
+		return 0, "", false
+	}
+	return ino, pth, true
 }
 
 // SetIdentity records a stable resource identity for an existing inode.
@@ -622,7 +717,12 @@ func (m *InodeToPath) addPathLocked(entry *InodeEntry, path string) {
 func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID string, nlink uint32, isDir bool, size int64, mtime time.Time) {
 	m.addPathLocked(entry, path)
 	entry.IsDir = isDir
-	entry.Size = size
+	// Listing/create-cache often still has size=0 after JuiceFS writes.
+	// Shrinking an extent inode here makes ReadDirPlus publish i_size=0 so
+	// the kernel returns EOF without FUSE READ. Truncate uses UpdateSize.
+	if !(entry.ExtentIno != 0 && !isDir && size < entry.Size) {
+		entry.Size = size
+	}
 	entry.Mtime = mtime
 	m.setIdentityLocked(entry, resourceID)
 	if nlink > 0 {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import socket
@@ -99,6 +100,59 @@ def log_tail(path: Path, *, max_chars: int = 1600) -> str:
         return path.read_text(encoding="utf-8", errors="replace").strip()[-max_chars:]
     except OSError:
         return ""
+
+
+_EXPORT_RE = re.compile(r"^export ([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_UNSET_RE = re.compile(r"^unset ([A-Za-z_][A-Za-z0-9_]*)$")
+
+
+def _unquote_shell(raw: str) -> str:
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
+        return raw[1:-1].replace("'\\''", "'")
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        return raw[1:-1]
+    return raw
+
+
+def apply_s3_backend(env: dict[str, str], *, mock_dir: Path) -> dict[str, str]:
+    """Resolve local S3 via scripts/local-minio.sh (MinIO by default, mock fallback)."""
+    out = dict(env)
+    if out.get("DRIVE9_S3_BUCKET", "").strip():
+        progress(f"setup: using existing DRIVE9_S3_BUCKET={out['DRIVE9_S3_BUCKET']}")
+        return out
+    if not out.get("DRIVE9_S3_DIR", "").strip():
+        out["DRIVE9_S3_DIR"] = str(mock_dir)
+    script = REPO_ROOT / "scripts" / "local-minio.sh"
+    result = subprocess.run(
+        ["bash", str(script), "apply"],
+        cwd=str(REPO_ROOT),
+        env=out,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    note = (result.stderr or "").strip()
+    if note:
+        for line in note.splitlines():
+            progress(f"setup: {line}")
+    if result.returncode != 0:
+        detail = f"scripts/local-minio.sh apply failed (exit {result.returncode})"
+        if note:
+            detail += f"\n{note}"
+        raise BlackboxError(detail)
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        unset = _UNSET_RE.match(line)
+        if unset:
+            out.pop(unset.group(1), None)
+            continue
+        export = _EXPORT_RE.match(line)
+        if export:
+            out[export.group(1)] = _unquote_shell(export.group(2))
+    return out
 
 
 class Drive9FuseTargetProvider:
@@ -385,10 +439,10 @@ class Drive9FuseTargetProvider:
                 "DRIVE9_META_DSN": os.environ.get("DRIVE9_META_DSN", dsn),
                 "DRIVE9_LOCAL_MYSQL_DSN": os.environ.get("DRIVE9_LOCAL_MYSQL_DSN", dsn),
                 "DRIVE9_LOCAL_EMBEDDING_MODE": os.environ.get("DRIVE9_LOCAL_EMBEDDING_MODE", "app"),
-                "DRIVE9_S3_DIR": os.environ.get("DRIVE9_S3_DIR", str(self.tmp_dir / "s3")),
                 "DRIVE9_LOG_LEVEL": os.environ.get("DRIVE9_LOG_LEVEL", "warn"),
             }
         )
+        env = apply_s3_backend(env, mock_dir=self.tmp_dir / "s3")
         with log.open("ab") as handle:
             handle.write(f"# {utc_ts()} starting drive9-server at {self.server_url}\n".encode())
             self.server_proc = subprocess.Popen([str(self.server_bin)], cwd=str(REPO_ROOT), env=env, stdout=handle, stderr=handle, start_new_session=True)
@@ -493,8 +547,15 @@ class Drive9FuseTargetProvider:
         log_dir = self.mount_logs_dir / case / cache_key
         log_dir.mkdir(parents=True, exist_ok=True)
         # When profile/durability are None, let drive9 use its own defaults
-        # (profile=coding-agent, durability=auto/writeback).
-        effective_profile = profile or ""
+        # (profile=coding-agent, durability=auto/writeback). FUSE_PROFILE
+        # replaces the default/coding-agent mount, matching e2e FUSE suites,
+        # but does not override an explicit per-module profile such as none
+        # or a custom pack profile.
+        env_profile = os.environ.get("FUSE_PROFILE", "").strip()
+        if env_profile and (profile is None or profile == "" or profile == "coding-agent"):
+            effective_profile = env_profile
+        else:
+            effective_profile = profile or ""
         command = [
             str(self.cli),
             "mount",
@@ -507,7 +568,7 @@ class Drive9FuseTargetProvider:
             command.extend(["--profile", effective_profile])
         if durability:
             command.extend(["--durability", durability])
-        if effective_profile and effective_profile not in ("none", "interactive"):
+        if effective_profile and effective_profile not in ("none", "extent", "interactive"):
             command.extend(["--local-root", str(local_root)])
         if read_only:
             command.append("--read-only")

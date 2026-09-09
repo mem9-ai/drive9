@@ -260,11 +260,13 @@ sqlite.
   credentials safe.
 - New endpoint `POST /v1/data-credential` → `{endpoint, bucket, prefix,
   accessKey, secretKey, sessionToken, expiresAt}`:
-  - AWS / MinIO: STS `AssumeRole` with a session policy pinned to the tenant
-    prefix;
-  - mock/local backend: pass-through;
-  - backends without STS: documented fallback is a narrow server-presign
-    ObjectStorage (slower path, kept behind a capability flag).
+  - AWS (and MinIO with a role): STS `AssumeRole` with a session policy
+    pinned to the tenant prefix;
+  - local MinIO without STS: mint the server's static keys as a
+    non-expiring `scheme=s3` session; the FUSE client still talks S3/MinIO
+    directly (same JuiceFS object path as production);
+  - filesystem mock (`LocalS3Client`, unit tests): `scheme=file` pass-through.
+  Extent block I/O never goes through drive9-server HTTP.
 - The client's `object.ObjectStorage` implementation refreshes credentials
   before expiry (juicefs's s3 backend only supports static credentials, hence
   a small custom backend modeled on `pkg/object/webdav.go`/`restful.go`).
@@ -471,9 +473,10 @@ Phase 0.
   path allocates a new `extent_ino` (no 409-Stat of the leftover file).
   `CreateFileWithLayout` / per-path HTTP DELETE are gone from the extent
   path.
-- No per-object presign on the extent path: extent block I/O uses only
-  tenant-scoped credentials; `prepare-blocks`/`commit-slices`/`read-plan` are
-  gone from the server router.
+- No per-object presign and no drive9-server block proxy on the extent path:
+  extent block I/O uses only S3 (STS or local static keys) or the filesystem
+  mock; `prepare-blocks`/`commit-slices`/`read-plan` are gone from the server
+  router.
 - Orphan blocks and stale sessions are reclaimed without any client online.
 - pjdfstest results on extent files are no worse than on `single` files.
 

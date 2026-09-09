@@ -13,6 +13,7 @@ const (
 	defaultMountProfile           = "coding-agent"
 	codingAgentExtentMountProfile = "coding-agent-extent"
 	noneMountProfile              = "none"
+	extentMountProfile            = "extent"
 	portableMountProfile          = "portable"
 )
 
@@ -78,6 +79,9 @@ func loadProfileConfig(name string) (profileConfig, error) {
 	if name == noneMountProfile {
 		return builtinNoneProfile(), nil
 	}
+	if name == extentMountProfile {
+		return builtinExtentProfile(), nil
+	}
 	if name == "interactive" {
 		return profileConfig{Name: "interactive", Source: "builtin:interactive"}, nil
 	}
@@ -142,6 +146,14 @@ func validateProfileName(name string) error {
 
 func builtinNoneProfile() profileConfig {
 	return profileConfig{Name: noneMountProfile, Source: "builtin:none"}
+}
+
+func builtinExtentProfile() profileConfig {
+	return profileConfig{
+		Name:           extentMountProfile,
+		Source:         "builtin:extent",
+		ExtentPatterns: []string{"*"},
+	}
 }
 
 func builtinCodingAgentProfile() profileConfig {
