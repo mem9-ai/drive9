@@ -18,3 +18,7 @@ var ErrInvalidSymlinkTarget = errors.New("invalid symlink target")
 // ErrInvalidHardlinkTarget reports that a hardlink source cannot be linked,
 // for example because it names a directory.
 var ErrInvalidHardlinkTarget = errors.New("invalid hardlink target")
+
+// ErrExtentExtraMetadata reports that tags/description cannot be set on an
+// extent ingest/PUT (same contract as large-file PUT initiate).
+var ErrExtentExtraMetadata = errors.New("X-Dat9-Tag is not supported on extent writes")

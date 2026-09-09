@@ -14,6 +14,11 @@
 #   RUN_API_ONLY=1 bash scripts/e2e-local.sh
 #   RUN_FUSE_SMOKE=0 bash scripts/e2e-local.sh
 #   DRIVE9_SERVER_BIN=/path/to/drive9-server bash scripts/e2e-local.sh --no-build
+#   FUSE_PROFILE=coding-agent-extent make e2e-local
+#   FUSE_PROFILE=coding-agent-extent \
+#     DRIVE9_LOCAL_E2E_SMOKE_SCRIPT=e2e/fuse-sqlite-correctness.sh make e2e-local
+#   DRIVE9_S3_BACKEND=mock make e2e-local
+#   DRIVE9_S3_BACKEND=minio make e2e-local
 #
 # Defaults:
 #   RUN_API_ONLY=0              full local-e2e.yml PR set (api/cli + pack + FUSE)
@@ -24,6 +29,10 @@
 #   RUN_CLI_FORK_CHECKS=0       cli tenant fork (set 1 to enable)
 #   RUN_TOKENS_SMOKE=0          /v1/tokens management smoke (set 1 to enable)
 #   RUN_SSE_SMOKE=0             /v1/events retention smoke (set 1 to enable)
+#   FUSE_PROFILE=               optional --profile for FUSE suites (e.g. coding-agent-extent)
+#   DRIVE9_S3_BACKEND=auto      try real MinIO, else local filesystem mock
+#                               minio = require MinIO; mock = filesystem mock
+#                               skip bootstrap when DRIVE9_S3_BUCKET is already set
 #
 # Compatible with macOS bash 3.2.
 
@@ -263,16 +272,13 @@ start_server() {
   fi
 
   log "starting drive9-server on $LISTEN_ADDR"
-  S3_DIR="$WORK_DIR/s3"
-  mkdir -p "$S3_DIR"
-
   export DRIVE9_LISTEN_ADDR="$LISTEN_ADDR"
   export DRIVE9_PUBLIC_URL="${DRIVE9_PUBLIC_URL:-http://$LISTEN_ADDR}"
   export DRIVE9_TENANT_PROVIDER="${DRIVE9_TENANT_PROVIDER:-local}"
   export DRIVE9_LOCAL_DSN="${DRIVE9_LOCAL_DSN:-$DEFAULT_DSN}"
   export DRIVE9_META_DSN="${DRIVE9_META_DSN:-$DRIVE9_LOCAL_DSN}"
   export DRIVE9_LOCAL_MYSQL_DSN="${DRIVE9_LOCAL_MYSQL_DSN:-$DRIVE9_LOCAL_DSN}"
-  export DRIVE9_S3_DIR="${DRIVE9_S3_DIR:-$S3_DIR}"
+  apply_s3_backend
 
   "$SERVER_BIN" >"$WORK_DIR/server.log" 2>&1 &
   SERVER_PID=$!
@@ -284,6 +290,21 @@ start_server() {
     exit 1
   fi
   echo "server healthy at http://$LISTEN_ADDR/healthz"
+}
+
+apply_s3_backend() {
+  if [ -z "${DRIVE9_S3_BUCKET:-}" ]; then
+    : "${DRIVE9_S3_DIR:=$WORK_DIR/s3}"
+    export DRIVE9_S3_DIR
+  fi
+  local s3_env
+  s3_env="$(bash "$ROOT/scripts/local-minio.sh" apply)" || return 1
+  eval "$s3_env"
+  if [ -n "${DRIVE9_S3_DIR:-}" ]; then
+    S3_DIR="$DRIVE9_S3_DIR"
+  else
+    S3_DIR=""
+  fi
 }
 
 apply_smoke_defaults() {

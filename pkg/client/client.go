@@ -285,6 +285,7 @@ type ContentLayout string
 const (
 	ContentLayoutSingle    ContentLayout = "single"
 	ContentLayoutAppendLog ContentLayout = "append_log"
+	ContentLayoutExtent    ContentLayout = "extent"
 )
 
 type StatResult struct {
@@ -307,6 +308,10 @@ type StatResult struct {
 	// ContentLayout is the server-authoritative physical layout from
 	// X-Dat9-Content-Layout. Empty means the server omitted the header.
 	ContentLayout ContentLayout
+	// SliceGeneration is X-Dat9-Slice-Generation for extent files.
+	SliceGeneration int64
+	// StorageClass is X-Dat9-Storage-Class (standard|extent).
+	StorageClass string
 }
 
 // MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
@@ -395,17 +400,21 @@ func (r BatchWriteResult) OK() bool {
 
 // StatMetadataResult represents enriched metadata from GET /v1/fs/{path}?stat=1.
 type StatMetadataResult struct {
-	Size         int64             `json:"size"`
-	IsDir        bool              `json:"isdir"`
-	ResourceID   string            `json:"resource_id,omitempty"`
-	Nlink        uint32            `json:"nlink,omitempty"`
-	Revision     int64             `json:"revision"`
-	Mtime        *int64            `json:"mtime,omitempty"` // Unix seconds when known
-	ContentType  string            `json:"content_type"`
-	SemanticText string            `json:"semantic_text"`
-	Description  string            `json:"description"`
-	Tags         map[string]string `json:"tags"`
-	Degraded     bool              `json:"degraded,omitempty"`
+	Size            int64             `json:"size"`
+	IsDir           bool              `json:"isdir"`
+	ResourceID      string            `json:"resource_id,omitempty"`
+	Nlink           uint32            `json:"nlink,omitempty"`
+	Revision        int64             `json:"revision"`
+	Mtime           *int64            `json:"mtime,omitempty"` // Unix seconds when known
+	ContentType     string            `json:"content_type"`
+	SemanticText    string            `json:"semantic_text"`
+	Description     string            `json:"description"`
+	Tags            map[string]string `json:"tags"`
+	Degraded        bool              `json:"degraded,omitempty"`
+	StorageType     string            `json:"storage_type,omitempty"`
+	ContentLayout   string            `json:"content_layout,omitempty"`
+	StorageClass    string            `json:"storage_class,omitempty"`
+	SliceGeneration int64             `json:"slice_generation,omitempty"`
 }
 
 var errStatMetadataCompatFallback = errors.New("stat metadata fallback to legacy HEAD")
@@ -1124,6 +1133,10 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 	s.ResourceID = resp.Header.Get("X-Dat9-Resource-ID")
 	s.StorageType = StorageType(resp.Header.Get("X-Dat9-Storage-Type"))
 	s.ContentLayout = ContentLayout(resp.Header.Get("X-Dat9-Content-Layout"))
+	s.StorageClass = resp.Header.Get("X-Dat9-Storage-Class")
+	if gen := resp.Header.Get("X-Dat9-Slice-Generation"); gen != "" {
+		s.SliceGeneration, _ = strconv.ParseInt(gen, 10, 64)
+	}
 	s.ChecksumSHA256 = resp.Header.Get("X-Dat9-Checksum-SHA256")
 	if nlink := resp.Header.Get("X-Dat9-Nlink"); nlink != "" {
 		if n, err := strconv.ParseUint(nlink, 10, 32); err == nil {

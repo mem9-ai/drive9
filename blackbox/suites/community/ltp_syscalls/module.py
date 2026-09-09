@@ -40,7 +40,8 @@ class CommunityLTPSyscalls(BaseModule):
                 scenario = "syscalls"
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_ltp_syscalls", remote, profile="none", extra=["--allow-other"])
+        profile = os.environ.get("FUSE_PROFILE") or "none"
+        handle = ctx.target.mount("community_ltp_syscalls", remote, profile=profile, extra=["--allow-other"])
         try:
             work = handle.mountpoint / "ltp-work"
             work.mkdir()

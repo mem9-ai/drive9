@@ -586,6 +586,19 @@ func (wb *WriteBuffer) Size() int64 {
 	return wb.totalSize
 }
 
+// SetSizeOnly grows the logical size without marking the gap dirty or
+// allocating zeros. Extent files store sparse growth as holes.
+func (wb *WriteBuffer) SetSizeOnly(size int64) error {
+	if size > wb.maxSize {
+		return syscall.EFBIG
+	}
+	if size > wb.totalSize {
+		wb.totalSize = size
+		wb.touched = true
+	}
+	return nil
+}
+
 // PartSize returns the part size used for dirty-part boundary calculations.
 func (wb *WriteBuffer) PartSize() int64 {
 	return wb.partSize
@@ -766,9 +779,15 @@ func (wb *WriteBuffer) ReadAt(offset int64, buf []byte) int {
 
 	if data, ok := wb.smallFileBytes(); ok {
 		start := int(offset)
-		limit := start + total
-		n := copy(buf[:total], data[start:limit])
-		return n
+		if start >= len(data) {
+			clear(buf[:total])
+			return total
+		}
+		n := copy(buf[:total], data[start:])
+		if n < total {
+			clear(buf[n:total])
+		}
+		return total
 	}
 
 	pos := offset

@@ -21,6 +21,7 @@ including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=loca
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/hardlink/rename/stat semantics, cross-channel consistency, `mount drain`/native `sync -f` drain checks, mounted 10KiB→8MiB→10KiB tier-transition parity, read-only and error-path checks |
 | `fuse-correctness-workload.sh` | Real read-only FUSE workload over a manifest fixture: `find`, `grep`, `stat`, `cat`, `sha256`, symlink, hardlink, unicode/space paths, empty files, binary files, and 8MiB+ files |
 | `fuse-sqlite-correctness.sh` | Real writable FUSE SQLite correctness workload with rollback-journal mode, `PRAGMA integrity_check`, unmount/remount parity, and remote snapshot verification; set `RUN_FUSE_SQLITE_WAL=1` for WAL, `RUN_FUSE_SQLITE_CHURN=1` for repeated large-DB rewrite churn, and `RUN_FUSE_SQLITE_CONCURRENCY=1` for the bounded readers/writer detector |
+| `fuse-sqlite-commit-sequence.sh` | Generic FUSE SQLite WAL sequence: 1000 independent `COMMIT`s with `synchronous=FULL`, same-mount reopen, remount, and remote snapshot fingerprints. Honors `FUSE_PROFILE` (default FS or `coding-agent-extent`). Does not require S3 Express / append-log |
 | `fuse-concurrency-stress.sh` | Real writable FUSE concurrency workload with parallel writers/readers, atomic rename, unlink churn, open-handle rename reads, and deterministic final manifest checks |
 | `fuse-posix-fsx-gate.sh` | Opt-in JuiceFS-style POSIX/fsx subset over real writable FUSE: deterministic random write/read/truncate, atomic rename replacement, unlink-open reads, directory fsync, final model hash, unmount, and remote snapshot parity |
 | `fuse-performance-baseline.sh` | Opt-in real writable FUSE baseline that records small-file, large-file, repeated large-read, and SQLite transaction/read metrics as JSON artifacts without hardcoded throughput thresholds; SQLite reads verify stored row payload bytes against row checksums |
@@ -57,7 +58,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Tier | Trigger | What runs |
 |------|---------|-----------|
 | PR gate | `pull_request` to `main` (local-e2e) | api, cli, object-store, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback), fuse-patch-storage-class, git-ops, git-workspace-ondemand, portable pack/unpack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget |
-| Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
+| Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, sqlite 1000-commit WAL FULL sequence, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | Local E2E `workflow_dispatch` with `run_all_e2e=1` | Everything above |
 | Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `image-extract-config-smoke-test.sh` / `video-extract-config-smoke-test.sh` (hosted control-plane + billable vision provider), `embedding-config-smoke-test.sh` (hosted control-plane + billable embedding provider), `object-auth-smoke-test.sh` (tidbcloud-native + real object-store STS mint; `--auth=server` cannot run in local-e2e), `object-auth-s3-hosted-test.sh` / `object-auth-cos-hosted-test.sh` / `object-auth-tos-hosted-test.sh` (hosted S3/COS/TOS isolation/mount/refresh; same reason), `s3-express-append-log-smoke-test.sh` (hosted Directory Bucket HTTP smoke), and `fuse-s3-express-append-log.sh` (hosted Directory Bucket + real FUSE; macOS/local provider cannot exercise S3 Express) |
@@ -150,6 +151,11 @@ bash e2e/fuse-correctness-workload.sh
 
 # SQLite rollback-journal correctness on a real writable FUSE mount.
 bash e2e/fuse-sqlite-correctness.sh
+
+# 1000 sequential WAL FULL commits, reopen, remount, remote snapshot.
+# Works on the default FS and with FUSE_PROFILE=coding-agent-extent.
+bash e2e/fuse-sqlite-commit-sequence.sh
+FUSE_PROFILE=coding-agent-extent bash e2e/fuse-sqlite-commit-sequence.sh
 
 # Bounded concurrency stress on a real writable FUSE mount.
 bash e2e/fuse-concurrency-stress.sh
@@ -309,6 +315,16 @@ Useful knobs for existing-tenant runs:
 `--server-mode local` uses `--local-server`, which defaults to
 `DRIVE9_SERVER_BIN`.
 
+To run FUSE suites with `coding-agent-extent` (all files `content_layout=extent`):
+
+```bash
+FUSE_PROFILE=coding-agent-extent make e2e-local
+FUSE_PROFILE=coding-agent-extent \
+  DRIVE9_LOCAL_E2E_SMOKE_SCRIPT=e2e/fuse-sqlite-correctness.sh make e2e-local
+```
+
+`fuse-patch-storage-class.sh` ignores `FUSE_PROFILE`. CLI smoke does not mount.
+
 ## Notes
 
 - `api-smoke-test.sh` expects `POST /v1/provision` to return `tenant_id`, `api_key`, and `status`.
@@ -373,16 +389,17 @@ Useful knobs for existing-tenant runs:
 - FUSE mount readiness knobs are `MOUNT_READY_TIMEOUT_S`, `MOUNT_READY_INTERVAL_S`, and `FUSE_MOUNT_ROOT`.
 - FUSE correctness workload knobs are `FUSE_CORRECTNESS_LARGE_MB` and `FUSE_CORRECTNESS_KEEP_ARTIFACTS`.
 - FUSE SQLite correctness workload knobs are `FUSE_SQLITE_ROWS`, `FUSE_SQLITE_CHURN_ROUNDS`, `FUSE_SQLITE_CONCURRENCY_READERS`, `FUSE_SQLITE_CONCURRENCY_WRITES`, `FUSE_SQLITE_WORKLOAD_TIMEOUT_S`, `FUSE_SQLITE_KEEP_ARTIFACTS`, `RUN_FUSE_SQLITE_WAL`, `RUN_FUSE_SQLITE_CHURN`, and `RUN_FUSE_SQLITE_CONCURRENCY`.
+- FUSE SQLite commit-sequence knobs are `FUSE_SQLITE_COMMITS` (default 1000), `FUSE_SQLITE_WAL_AUTOCHECKPOINT` (default 100), `FUSE_SQLITE_COMMIT_TIMEOUT_S`, `FUSE_SQLITE_COMMIT_DURABILITY` (default `fsync`), `FUSE_SQLITE_COMMIT_KEEP_ARTIFACTS`, and `FUSE_PROFILE`. This is the generic (non-S3-Express) 1000-commit WAL FULL detector.
 - FUSE concurrency workload knobs are `FUSE_CONCURRENCY_WORKERS`, `FUSE_CONCURRENCY_FILES_PER_WORKER`, `FUSE_CONCURRENCY_READER_WORKERS`, `FUSE_CONCURRENCY_PAYLOAD_KB`, `FUSE_CONCURRENCY_TIMEOUT_S`, and `FUSE_CONCURRENCY_KEEP_ARTIFACTS`.
 - FUSE POSIX/fsx workload knobs are `FUSE_POSIX_FSX_OPS`, `FUSE_POSIX_FSX_MAX_BYTES`, `FUSE_POSIX_FSX_SEED`, `FUSE_POSIX_FSX_TIMEOUT_S`, and `FUSE_POSIX_FSX_KEEP_ARTIFACTS`. When enabled in CI, failures are hard failures.
 - FUSE performance baseline knobs are `FUSE_PERF_SMALL_FILES`, `FUSE_PERF_SMALL_BYTES`, `FUSE_PERF_LARGE_MB`, `FUSE_PERF_READ_PASSES`, `FUSE_PERF_SQLITE_ROWS`, `FUSE_PERF_KEEP_ARTIFACTS`, `FUSE_PERF_ARTIFACT_DIR`, `FUSE_PERF_COMPARE_WARN_RATIO`, and `FUSE_PERF_COMPARE_FAIL_ON_REGRESSION`. The baseline records small-file, large-file, rollback-journal SQLite, WAL SQLite, and WAL checkpoint metrics; SQLite rows are read back as payload bytes and SHA-256 verified before metrics are accepted.
 - Layer filesystem knobs are `RUN_LAYER_FUSE_SMOKE`, `LAYER_FUSE_STRICT_PREREQS`, `LAYER_DIFF_TIMEOUT_S`, and `LAYER_DIFF_INTERVAL_S`. Ordinary PR `local-e2e.yml` runs `layer-fs-smoke-test.sh` with `RUN_LAYER_FUSE_SMOKE=1` against local `drive9-server`, so layer schema/API/FUSE restore coverage does not depend on a dedicated dev backend. Point at any deployment with `DRIVE9_BASE`. `smoke-all.sh` defaults `RUN_LAYER_FUSE_SMOKE` from `RUN_FUSE_SMOKE`. FUSE mounts in these suites pass `--mode=fuse` (required on macOS, where `auto` is WebDAV).
 - Full daily local-e2e knobs are `RUN_E2E_SMOKE_ALL` and `RUN_GIT_FEATURE_SMOKE`; the scheduled run sets both to `1`, and manual `workflow_dispatch` runs can enable them with `run_e2e_smoke_all=1` and `run_git_feature_smoke=1`.
-- `local-e2e.yml` runs the lightweight pack smoke on ordinary PR triggers. It does not run the performance baseline or heavy FUSE/Git detectors on ordinary PR triggers. Use manual `workflow_dispatch` inputs `run_fuse_concurrency_stress=1`, `run_fuse_posix_fsx=1`, `run_fuse_sqlite_wal=1`, `run_fuse_sqlite_churn=1`, `run_fuse_sqlite_concurrency=1`, `run_fuse_performance_baseline=1`, `compare_fuse_performance_metrics=1`, `run_e2e_smoke_all=1`, and `run_git_feature_smoke=1` to enable them on demand. The scheduled daily run enables all of these flags; concurrency stress, POSIX/fsx, full smoke-all, and Git feature smoke run as separate hard-fail steps after the release gate and metrics archive, and all are attempted so one failure does not hide another workload's result. `run_e2e_smoke_all=1` also enables journal, posix-permission, and Git workspace smoke coverage.
+- `local-e2e.yml` runs the lightweight pack smoke on ordinary PR triggers. It does not run the performance baseline or heavy FUSE/Git detectors on ordinary PR triggers. Use manual `workflow_dispatch` inputs `run_fuse_concurrency_stress=1`, `run_fuse_posix_fsx=1`, `run_fuse_sqlite_wal=1`, `run_fuse_sqlite_churn=1`, `run_fuse_sqlite_concurrency=1`, `run_fuse_sqlite_commit_sequence=1`, `run_fuse_performance_baseline=1`, `compare_fuse_performance_metrics=1`, `run_e2e_smoke_all=1`, and `run_git_feature_smoke=1` to enable them on demand. The scheduled daily run enables all of these flags; concurrency stress, POSIX/fsx, full smoke-all, and Git feature smoke run as separate hard-fail steps after the release gate and metrics archive, and all are attempted so one failure does not hide another workload's result. `run_e2e_smoke_all=1` also enables journal, posix-permission, and Git workspace smoke coverage.
 - Set `archive_fuse_performance_metrics=1` on manual `local-e2e` runs, or use the daily scheduled run, to copy `performance-metrics-*.json`, `performance-compare-*.json`, `performance-compare-*.md`, mount logs, and an archive manifest to the Drive9 CI workspace under `/benchmarks/fuse-performance/<YYYY>/<MM>/<DD>/<branch>/<sha>/<run_id>-<attempt>/`. The same files are still uploaded as the GitHub artifact `fuse-performance-baseline`.
 - Set `compare_fuse_performance_metrics=1` on manual `local-e2e` runs, or use the daily scheduled run, to compare current metrics against the latest Drive9 archive before archiving the current run. By default, `FUSE_PERF_COMPARE_FAIL_ON_REGRESSION=1` makes any metric below `1 - FUSE_PERF_COMPARE_WARN_RATIO` fail the compare step after writing JSON/Markdown reports. Missing historical baselines, parameter mismatches, and legacy baselines missing newly added workloads still produce non-failing warnings; invalid current metrics, broken Drive9 compare configuration, malformed archived manifests, and structurally invalid baseline metrics fail closed.
 - The daily local-e2e gate intentionally covers the local CI-safe SQLite/Git/FUSE scripts. `description-smoke-test.sh` remains a manual environment-specific run (Docker + Ollama or stub embedder). Full pjdfstest lives under `blackbox` (`community.pjdfstest`).
-- FUSE release-gate knobs are `FUSE_STRICT_PREREQS`, `RUN_FUSE_GIT_CLONE`, `FUSE_GIT_CLONE_URL`, `FUSE_GIT_CLONE_TIMEOUT_S`, `RUN_FUSE_UMOUNT_DURABLE`, `FUSE_UMOUNT_TIMEOUT`, `RUN_FUSE_LOG_AUDIT`, `RUN_FUSE_ALL_WORKLOADS`, `RUN_FUSE_SQLITE_CORRECTNESS`, `RUN_FUSE_CONCURRENCY_STRESS`, `RUN_FUSE_POSIX_FSX`, `RUN_FUSE_PERFORMANCE_BASELINE`, and the FUSE correctness/SQLite/concurrency/POSIX/fsx/performance workload knobs. Set `RUN_FUSE_ALL_WORKLOADS=1` to default concurrency stress, POSIX/fsx, and performance baseline to enabled in one release-gate command; explicit per-workload env vars still take precedence. `local-e2e.yml` intentionally overrides `RUN_FUSE_CONCURRENCY_STRESS=0` and `RUN_FUSE_POSIX_FSX=0` for its release-gate step, then runs `fuse-concurrency-stress.sh` and `fuse-posix-fsx-gate.sh` separately after metrics artifact/archive steps.
+- FUSE release-gate knobs are `FUSE_STRICT_PREREQS`, `RUN_FUSE_GIT_CLONE`, `FUSE_GIT_CLONE_URL`, `FUSE_GIT_CLONE_TIMEOUT_S`, `RUN_FUSE_UMOUNT_DURABLE`, `FUSE_UMOUNT_TIMEOUT`, `RUN_FUSE_LOG_AUDIT`, `RUN_FUSE_ALL_WORKLOADS`, `RUN_FUSE_SQLITE_CORRECTNESS`, `RUN_FUSE_SQLITE_COMMIT_SEQUENCE`, `RUN_FUSE_CONCURRENCY_STRESS`, `RUN_FUSE_POSIX_FSX`, `RUN_FUSE_PERFORMANCE_BASELINE`, and the FUSE correctness/SQLite/concurrency/POSIX/fsx/performance workload knobs. Set `RUN_FUSE_ALL_WORKLOADS=1` to default concurrency stress, POSIX/fsx, and performance baseline to enabled in one release-gate command; explicit per-workload env vars still take precedence. `local-e2e.yml` intentionally overrides `RUN_FUSE_CONCURRENCY_STRESS=0` and `RUN_FUSE_POSIX_FSX=0` for its release-gate step, then runs `fuse-concurrency-stress.sh`, `fuse-posix-fsx-gate.sh`, and `fuse-sqlite-commit-sequence.sh` separately after metrics artifact/archive steps.
 - Git workspace smoke defaults to `drive9`, `kimi-cli`, and `kimi-code`. Override with `GIT_WORKSPACE_REPOS='slug=https://example/repo.git,...'`.
 - Git workspace scenarios default to `agent_edit_add_commit,agent_patch_apply,sandbox_restore`; tune with `GIT_WORKSPACE_SCENARIOS`.
 - Git workspace file-count knobs are `GIT_WORKSPACE_EXISTING_FILES`, `GIT_WORKSPACE_NEW_FILES`, and `GIT_WORKSPACE_PATCH_FILES`.

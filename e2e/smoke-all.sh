@@ -101,7 +101,7 @@ fi
 echo "=== drive9 smoke-all ==="
 echo "BASE=$BASE"
 echo "Tenant=$TENANT_MODE"
-echo "RUN_API_ONLY=$RUN_API_ONLY RUN_FUSE_SMOKE=$RUN_FUSE_SMOKE"
+echo "RUN_API_ONLY=$RUN_API_ONLY RUN_FUSE_SMOKE=$RUN_FUSE_SMOKE FUSE_PROFILE=${FUSE_PROFILE:-}"
 
 run_case "api" "e2e/api-smoke-test.sh"
 run_case "cli" "e2e/cli-smoke-test.sh"

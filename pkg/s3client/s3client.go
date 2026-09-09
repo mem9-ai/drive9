@@ -5,6 +5,7 @@ package s3client
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 
@@ -125,11 +126,35 @@ type S3Client interface {
 	// an object. startByte and endByte are inclusive.
 	PresignGetObjectRange(ctx context.Context, key string, startByte, endByte int64, ttl time.Duration) (string, error)
 
+	// PresignPutObject returns a presigned PUT URL for a whole object. size is
+	// signed as Content-Length. checksumSHA256 is the base64 SHA-256 payload
+	// checksum signed as x-amz-checksum-sha256 when non-empty. ifNoneMatch, when
+	// true, signs If-None-Match: *.
+	PresignPutObject(ctx context.Context, key string, size int64, checksumSHA256 string, ifNoneMatch bool, encOpts EncryptionOpts, ttl time.Duration) (*UploadPartURL, error)
+
+	// GetObjectRange reads an inclusive byte range of an object.
+	GetObjectRange(ctx context.Context, key string, startByte, endByte int64) (io.ReadCloser, error)
+
+	// HeadObject returns object metadata. Exists is false when the key is missing.
+	HeadObject(ctx context.Context, key string) (*ObjectHead, error)
+
 	// DeletePrefix removes all objects under prefix and aborts multipart uploads
 	// under the same prefix. Prefix is relative to the client's configured base
 	// prefix.
 	DeletePrefix(ctx context.Context, prefix string) (PrefixDeleteResult, error)
 }
+
+// ObjectHead is the result of HeadObject.
+type ObjectHead struct {
+	Exists         bool
+	Size           int64
+	ChecksumSHA256 string // hex-encoded SHA-256 of object bytes when known
+}
+
+// ErrPreconditionFailed is returned when If-None-Match: * rejects a PUT
+// because the object already exists (HTTP 412). Callers treat this as success
+// for immutable extent blocks.
+var ErrPreconditionFailed = errors.New("s3 precondition failed")
 
 // Default presigned URL TTLs per design doc §11.2.
 const (

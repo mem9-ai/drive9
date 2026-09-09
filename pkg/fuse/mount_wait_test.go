@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"syscall"
 	"testing"
 )
@@ -113,6 +114,16 @@ func TestServeWaitMountThenStartWatchersDoesNotStartWatchersAfterRejectedWaitMou
 }
 
 func TestShouldContinueAfterWaitMountPermissionErrorWhenProbePasses(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		ok, probeErr := shouldContinueAfterWaitMountPermissionError(syscall.EACCES, "/mnt/drive9", func(string) error {
+			t.Fatal("probe must not run off linux")
+			return nil
+		})
+		if ok || probeErr != nil {
+			t.Fatalf("non-linux: ok=%v probeErr=%v", ok, probeErr)
+		}
+		return
+	}
 	called := false
 	ok, probeErr := shouldContinueAfterWaitMountPermissionError(syscall.EACCES, "/mnt/drive9", func(mountPoint string) error {
 		called = true
@@ -134,6 +145,9 @@ func TestShouldContinueAfterWaitMountPermissionErrorWhenProbePasses(t *testing.T
 }
 
 func TestShouldContinueAfterWaitMountPermissionErrorWhenProbeFails(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("permission-wait continue is linux-only")
+	}
 	wantErr := errors.New("not ready")
 
 	ok, probeErr := shouldContinueAfterWaitMountPermissionError(syscall.EPERM, "/mnt/drive9", func(string) error {

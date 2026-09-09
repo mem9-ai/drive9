@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -783,6 +785,113 @@ func (c *AWSS3Client) PresignGetObjectRange(ctx context.Context, key string, sta
 		return "", fmt.Errorf("presign get object range: %w", err)
 	}
 	return out.URL, nil
+}
+
+func (c *AWSS3Client) PresignPutObject(ctx context.Context, key string, size int64, checksumSHA256 string, ifNoneMatch bool, encOpts EncryptionOpts, ttl time.Duration) (*UploadPartURL, error) {
+	start := time.Now()
+	metricResult := "ok"
+	defer func() { recordS3Operation("presign_put_object", metricResult, start) }()
+
+	if ttl > UploadTTL {
+		ttl = UploadTTL
+	}
+	in := &s3.PutObjectInput{
+		Bucket:        &c.bucket,
+		Key:           aws.String(c.fullKey(key)),
+		ContentLength: aws.Int64(size),
+	}
+	if ifNoneMatch {
+		in.IfNoneMatch = aws.String("*")
+	}
+	if checksumSHA256 != "" {
+		in.ChecksumSHA256 = aws.String(checksumSHA256)
+		in.ChecksumAlgorithm = types.ChecksumAlgorithmSha256
+	}
+	if err := applyEncryptionToPutObjectInput(in, encOpts); err != nil {
+		metricResult = "error"
+		return nil, err
+	}
+	putPresigner := v4.NewSigner(func(o *v4.SignerOptions) {
+		o.DisableURIPathEscaping = true
+		o.DisableHeaderHoisting = true
+	})
+	out, err := c.presign.PresignPutObject(ctx, in,
+		s3.WithPresignExpires(ttl),
+		func(o *s3.PresignOptions) { o.Presigner = putPresigner },
+	)
+	if err != nil {
+		metricResult = "error"
+		return nil, fmt.Errorf("presign put object: %w", err)
+	}
+	headers := flattenSignedHeaders(out.SignedHeader)
+	if checksumSHA256 != "" {
+		headers["x-amz-checksum-sha256"] = checksumSHA256
+	}
+	if ifNoneMatch {
+		headers["if-none-match"] = "*"
+	}
+	return &UploadPartURL{
+		Number:         1,
+		URL:            out.URL,
+		Size:           size,
+		ChecksumSHA256: checksumSHA256,
+		Headers:        headers,
+		ExpiresAt:      time.Now().Add(ttl),
+	}, nil
+}
+
+func (c *AWSS3Client) GetObjectRange(ctx context.Context, key string, startByte, endByte int64) (io.ReadCloser, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("get_object_range", result, start) }()
+
+	out, err := c.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &c.bucket,
+		Key:    aws.String(c.fullKey(key)),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", startByte, endByte)),
+	})
+	if err != nil {
+		result = "error"
+		return nil, fmt.Errorf("get object range: %w", err)
+	}
+	return out.Body, nil
+}
+
+func (c *AWSS3Client) HeadObject(ctx context.Context, key string) (*ObjectHead, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("head_object", result, start) }()
+
+	out, err := c.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: &c.bucket,
+		Key:    aws.String(c.fullKey(key)),
+	})
+	if err != nil {
+		var nsk *types.NotFound
+		var nfe *types.NoSuchKey
+		if errors.As(err, &nsk) || errors.As(err, &nfe) {
+			result = "not_found"
+			return &ObjectHead{Exists: false}, nil
+		}
+		// Some S3 implementations return 404 as api error with Code NotFound.
+		if strings.Contains(strings.ToLower(err.Error()), "not found") || strings.Contains(err.Error(), "404") {
+			result = "not_found"
+			return &ObjectHead{Exists: false}, nil
+		}
+		result = "error"
+		return nil, fmt.Errorf("head object: %w", err)
+	}
+	head := &ObjectHead{Exists: true}
+	if out.ContentLength != nil {
+		head.Size = *out.ContentLength
+	}
+	if out.ChecksumSHA256 != nil && *out.ChecksumSHA256 != "" {
+		decoded, decErr := base64.StdEncoding.DecodeString(*out.ChecksumSHA256)
+		if decErr == nil {
+			head.ChecksumSHA256 = hex.EncodeToString(decoded)
+		}
+	}
+	return head, nil
 }
 
 var _ S3Client = (*AWSS3Client)(nil)

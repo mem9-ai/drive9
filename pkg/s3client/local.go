@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -451,6 +452,121 @@ func (c *LocalS3Client) PresignGetObjectRange(ctx context.Context, key string, s
 
 	url := fmt.Sprintf("%s/objects/%s?range=%d-%d", c.baseURL, key, startByte, endByte)
 	return url, nil
+}
+
+func (c *LocalS3Client) PresignPutObject(ctx context.Context, key string, size int64, checksumSHA256 string, ifNoneMatch bool, encOpts EncryptionOpts, ttl time.Duration) (*UploadPartURL, error) {
+	start := time.Now()
+	defer func() { recordS3Operation("presign_put_object", "ok", start) }()
+	if ttl <= 0 {
+		ttl = UploadTTL
+	}
+	headers := map[string]string{
+		"content-length": strconv.FormatInt(size, 10),
+	}
+	if ifNoneMatch {
+		headers["if-none-match"] = "*"
+	}
+	if checksumSHA256 != "" {
+		headers["x-amz-checksum-sha256"] = checksumSHA256
+	}
+	return &UploadPartURL{
+		Number:         1,
+		URL:            fmt.Sprintf("%s/objects/%s", c.baseURL, key),
+		Size:           size,
+		ChecksumSHA256: checksumSHA256,
+		Headers:        headers,
+		ExpiresAt:      time.Now().Add(ttl),
+	}, nil
+}
+
+func (c *LocalS3Client) GetObjectRange(ctx context.Context, key string, startByte, endByte int64) (io.ReadCloser, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("get_object_range", result, start) }()
+
+	f, err := os.Open(c.objectPath(key))
+	if err != nil {
+		if os.IsNotExist(err) {
+			result = "not_found"
+		} else {
+			result = "error"
+		}
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		result = "error"
+		return nil, err
+	}
+	if startByte < 0 {
+		startByte = 0
+	}
+	if endByte >= info.Size() {
+		endByte = info.Size() - 1
+	}
+	if startByte > endByte || startByte >= info.Size() {
+		_ = f.Close()
+		return io.NopCloser(strings.NewReader("")), nil
+	}
+	if _, err := f.Seek(startByte, io.SeekStart); err != nil {
+		_ = f.Close()
+		result = "error"
+		return nil, err
+	}
+	return &limitedReadCloser{ReadCloser: f, remain: endByte - startByte + 1}, nil
+}
+
+func (c *LocalS3Client) HeadObject(ctx context.Context, key string) (*ObjectHead, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("head_object", result, start) }()
+
+	info, err := os.Stat(c.objectPath(key))
+	if err != nil {
+		if os.IsNotExist(err) {
+			result = "not_found"
+			return &ObjectHead{Exists: false}, nil
+		}
+		result = "error"
+		return nil, err
+	}
+	sum, err := fileSHA256Hex(c.objectPath(key))
+	if err != nil {
+		result = "error"
+		return nil, err
+	}
+	return &ObjectHead{Exists: true, Size: info.Size(), ChecksumSHA256: sum}, nil
+}
+
+type limitedReadCloser struct {
+	io.ReadCloser
+	remain int64
+}
+
+func (l *limitedReadCloser) Read(p []byte) (int, error) {
+	if l.remain <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > l.remain {
+		p = p[:l.remain]
+	}
+	n, err := l.ReadCloser.Read(p)
+	l.remain -= int64(n)
+	return n, err
+}
+
+func fileSHA256Hex(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // Verify interface compliance.

@@ -1006,6 +1006,11 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		b.recordTenantOperation("central_quota", "upload_mark_completing", "ok", 0)
 	}
 
+	if existing, statErr := b.store.Stat(ctx, upload.TargetPath); statErr == nil && existing != nil && existing.File != nil && existing.File.IsExtent() {
+		b.recordTenantOperation("backend", "finalize_upload", "error", time.Since(start))
+		return datastore.ErrExtentUseCommit
+	}
+
 	completeMultipartStart := time.Now()
 	if err := b.s3.CompleteMultipartUpload(ctx, upload.S3Key, upload.S3UploadID, parts); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_complete_multipart_failed", zap.String("upload_id", uploadID), zap.Error(err))

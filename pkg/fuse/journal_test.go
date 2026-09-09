@@ -19,6 +19,38 @@ func mustFsync(t *testing.T, j *Journal) {
 	}
 }
 
+func TestReplayJournalIntoPendingSkipsExtent(t *testing.T) {
+	dir := t.TempDir()
+	j, err := NewJournal(filepath.Join(dir, "extent.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = j.Close() }()
+	mustAppend(t, j, JournalEntry{
+		Op:         JournalFsync,
+		Path:       "/app.db-wal",
+		Length:     32,
+		BaseRev:    1,
+		Extent:     true,
+		ExtentOpID: "op-1",
+	})
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/plain.txt", Length: 4, BaseRev: 2})
+	mustFsync(t, j)
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replayJournalIntoPending(j, idx); err != nil {
+		t.Fatal(err)
+	}
+	if idx.HasPending("/app.db-wal") {
+		t.Fatal("extent fsync must not resurrect as a whole-file pending PUT")
+	}
+	if !idx.HasPending("/plain.txt") {
+		t.Fatal("non-extent fsync should still resurrect")
+	}
+}
+
 func TestJournalAppendReplay(t *testing.T) {
 	dir := t.TempDir()
 	jPath := filepath.Join(dir, "test.wal")

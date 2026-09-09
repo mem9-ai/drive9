@@ -1,9 +1,14 @@
 package s3client
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -52,12 +57,26 @@ func (c *LocalS3Client) handleUploadPart(w http.ResponseWriter, r *http.Request)
 // Supports ?range=START-END query parameter for byte-range reads
 // (used by PresignGetObjectRange in the local mock).
 func (c *LocalS3Client) handleGetObject(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	key := strings.TrimPrefix(r.URL.Path, "/objects/")
+	switch r.Method {
+	case http.MethodPut:
+		c.handlePutObject(w, r, key)
+		return
+	case http.MethodHead:
+		head, err := c.HeadObject(r.Context(), key)
+		if err != nil || head == nil || !head.Exists {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.FormatInt(head.Size, 10))
+		w.WriteHeader(http.StatusOK)
+		return
+	case http.MethodGet:
+	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	key := strings.TrimPrefix(r.URL.Path, "/objects/")
 	rc, err := c.GetObject(r.Context(), key)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
@@ -120,4 +139,32 @@ func (c *LocalS3Client) handleGetObject(w http.ResponseWriter, r *http.Request) 
 	}
 
 	_, _ = io.Copy(w, rc)
+}
+
+func (c *LocalS3Client) handlePutObject(w http.ResponseWriter, r *http.Request, key string) {
+	if r.Header.Get("If-None-Match") == "*" {
+		if _, err := os.Stat(c.objectPath(key)); err == nil {
+			http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+			return
+		}
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if want := r.Header.Get("x-amz-checksum-sha256"); want != "" {
+		sum := sha256.Sum256(body)
+		gotB64 := base64.StdEncoding.EncodeToString(sum[:])
+		gotHex := hex.EncodeToString(sum[:])
+		if want != gotB64 && !strings.EqualFold(want, gotHex) {
+			http.Error(w, "checksum mismatch", http.StatusBadRequest)
+			return
+		}
+	}
+	if err := c.PutObject(r.Context(), key, bytes.NewReader(body), int64(len(body)), EncryptionOpts{}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }

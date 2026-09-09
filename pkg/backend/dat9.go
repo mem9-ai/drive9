@@ -281,6 +281,15 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		return err
 	}
 
+	layout, err := b.resolveLayout(ctx, path)
+	if err != nil {
+		return err
+	}
+	if layout == datastore.ContentLayoutExtent {
+		_, err = b.createExtentFile(ctx, path)
+		return err
+	}
+
 	fileID := b.genID()
 	now := time.Now()
 	storageType := datastore.StorageDB9
@@ -741,6 +750,19 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 	if timingEnabled {
 		statDuration = time.Since(statStart)
 	}
+	if err == nil && existing != nil && existing.File != nil && existing.File.IsExtent() {
+		if len(tags) > 0 || strings.TrimSpace(description) != "" {
+			return 0, 0, ErrExtentExtraMetadata
+		}
+		if expectedRevision == 0 {
+			return 0, 0, datastore.ErrRevisionConflict
+		}
+		if expectedRevision > 0 && existing.File.Revision != expectedRevision {
+			return 0, 0, datastore.ErrRevisionConflict
+		}
+		n, rev, _, ingestErr := b.IngestExtentReader(ctx, path, bytes.NewReader(data), int64(len(data)), expectedRevision)
+		return n, rev, ingestErr
+	}
 	if err == datastore.ErrNotFound {
 		operation = "create"
 		if expectedRevision > 0 {
@@ -899,6 +921,18 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	}
 	if err := b.ensureFileSizeQuota(ctx, int64(len(data))); err != nil {
 		return 0, err
+	}
+	if layout, layoutErr := b.resolveLayout(ctx, path); layoutErr != nil {
+		return 0, layoutErr
+	} else if layout == datastore.ContentLayoutExtent {
+		if len(tags) > 0 || strings.TrimSpace(description) != "" {
+			return 0, ErrExtentExtraMetadata
+		}
+		_, _, err := b.IngestExtentBytes(ctx, path, data)
+		if err != nil {
+			return 0, err
+		}
+		return int64(len(data)), nil
 	}
 	fileID := b.genID()
 	now := time.Now()
@@ -1540,6 +1574,11 @@ type ReadPlan struct {
 	InlineData []byte
 	// PresignURL is non-empty for S3-stored files — the 302 redirect target.
 	PresignURL string
+	// Assemble is true for content_layout=extent files. The server must stream
+	// the body from file_slices rather than 302 to a single object.
+	Assemble bool
+	// InodeID is set when Assemble is true.
+	InodeID string
 	// Size is the file size in bytes.
 	Size int64
 	// Revision is the file revision observed by the same metadata query.
@@ -1602,6 +1641,17 @@ func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (plan *ReadP
 	}
 	storageType = string(nf.File.StorageType)
 	size = nf.File.SizeBytes
+
+	if nf.File.IsExtent() {
+		phase = "assemble"
+		return &ReadPlan{
+			Assemble: true,
+			InodeID:  nf.File.FileID,
+			Size:     nf.File.SizeBytes,
+			Revision: nf.File.Revision,
+			Mtime:    fileMtime(nf.File),
+		}, nil
+	}
 
 	switch nf.File.StorageType {
 	case datastore.StorageDB9:
@@ -1955,6 +2005,13 @@ func (b *Dat9Backend) enqueueObjectGCCandidateCtx(ctx context.Context, storageRe
 func (b *Dat9Backend) readFileDataCtx(ctx context.Context, f *datastore.File) ([]byte, error) {
 	if f == nil {
 		return nil, fmt.Errorf("nil file")
+	}
+	if f.IsExtent() {
+		var buf bytes.Buffer
+		if err := b.AssembleExtent(ctx, f.FileID, 0, f.SizeBytes, &buf); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
 	}
 	if f.StorageType == datastore.StorageS3 {
 		if b.s3 == nil {

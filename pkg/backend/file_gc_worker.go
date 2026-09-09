@@ -80,7 +80,7 @@ func (b *Dat9Backend) processFileGCTask(ctx context.Context, task *datastore.Fil
 	if err := b.deleteCentralFileMetaForGCTask(ctx, task); err != nil {
 		return err
 	}
-	if task.StorageType == datastore.StorageS3 && task.StorageRef != "" {
+	if task.StorageType == datastore.StorageS3 && task.StorageRef != "" && !datastore.IsExtentStorageRef(task.StorageRef) {
 		handled, err := b.enqueueObjectGCCandidateCtx(ctx, task.StorageRef, meta.ObjectGCReasonFileDelete, task.FileID)
 		if handled && err == nil {
 			return nil

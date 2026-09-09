@@ -156,6 +156,9 @@ func TestIsScopedBusinessRequestAllowed(t *testing.T) {
 			{http.MethodGet, "/v1/fs/main.txt", ""},
 			{http.MethodGet, "/v1/fs/dir/", "list=1"},
 			{http.MethodGet, "/v1/fs/dir/file.txt", "stat=1"},
+			{http.MethodGet, "/v1/fs/dir/file.txt", "slices=1"},
+			{http.MethodGet, "/v1/fs/dir/file.txt", "read-plan=1"},
+			{http.MethodGet, "/v1/fs/dir/file.txt", "read-plan=1&off=0&len=4096"},
 			{http.MethodGet, "/v1/fs/dir/", "grep=hello"},
 			// Regression for @adversary-1 msg 00efe734: grep + limit must
 			// pass dispatcher (handleGrep reads ?limit).
@@ -653,6 +656,12 @@ func TestC2aDispatcherWriteSideAllowed(t *testing.T) {
 			{http.MethodPost, "setmeta=1"},
 			{http.MethodPost, "create=1"},
 			{http.MethodPost, "symlink=1"},
+			{http.MethodPost, "prepare-blocks=1"},
+			{http.MethodPost, "commit-slices=1"},
+			{http.MethodPost, "compact-slices=1"},
+			{http.MethodPost, "setattr=1"},
+			{http.MethodPost, "clone-range=1"},
+			{http.MethodPost, "presign-put=1"},
 		}
 		for _, tc := range cases {
 			r := newScopedRequest(t, tc.method, "/v1/fs/main.txt", tc.query)

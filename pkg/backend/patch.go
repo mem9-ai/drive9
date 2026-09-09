@@ -90,6 +90,9 @@ func (b *Dat9Backend) InitiateAppendUploadIfRevision(ctx context.Context, path s
 	if nf.File == nil || nf.File.StorageType != datastore.StorageS3 {
 		return nil, fmt.Errorf("%w: %s", ErrNotS3Stored, path)
 	}
+	if nf.File.IsExtent() {
+		return nil, datastore.ErrExtentUseCommit
+	}
 	if expectedRevision == 0 {
 		return nil, datastore.ErrRevisionConflict
 	}
@@ -182,6 +185,10 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	if nf.File == nil || nf.File.StorageType != datastore.StorageS3 {
 		b.recordTenantOperation("backend", "patch_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("%w: %s", ErrNotS3Stored, path)
+	}
+	if nf.File.IsExtent() {
+		b.recordTenantOperation("backend", "patch_upload", "error", time.Since(start))
+		return nil, datastore.ErrExtentUseCommit
 	}
 	if expectedRevision == 0 {
 		b.recordTenantOperation("backend", "patch_upload", "conflict", time.Since(start))

@@ -19,6 +19,8 @@ type Content struct {
 	ContentType            string
 	ChecksumSHA256         string
 	SourceID               string
+	ContentLayout          ContentLayout
+	SliceGeneration        int64
 }
 
 // InsertContent inserts a content row.
@@ -26,12 +28,13 @@ func (s *Store) InsertContent(ctx context.Context, content *Content) error {
 	mode := fileStorageEncryptionModeForWrite(content.StorageEncryptionMode)
 	_, err := s.db.ExecContext(ctx, `INSERT INTO contents
 		(`+s.scope.InsCols(`inode_id, storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
-		 content_blob, content_type, checksum_sha256, source_id`)+`)
-		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
+		 content_blob, content_type, checksum_sha256, source_id, content_layout, slice_generation`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
 		s.scope.Args(content.InodeID, content.StorageType, content.StorageRef, StorageRefHash(content.StorageRef), mode,
 			storageEncryptionKeyIDForWrite(mode, content.StorageEncryptionKeyID),
 			nilBytes(content.ContentBlob), nullStr(content.ContentType),
-			nullStr(content.ChecksumSHA256), nullStr(content.SourceID))...)
+			nullStr(content.ChecksumSHA256), nullStr(content.SourceID),
+			layoutForWrite(content.ContentLayout), content.SliceGeneration)...)
 	return err
 }
 
@@ -40,12 +43,13 @@ func (s *Store) InsertContentTx(db execer, content *Content) error {
 	mode := fileStorageEncryptionModeForWrite(content.StorageEncryptionMode)
 	_, err := db.Exec(`INSERT INTO contents
 		(`+s.scope.InsCols(`inode_id, storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
-		 content_blob, content_type, checksum_sha256, source_id`)+`)
-		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
+		 content_blob, content_type, checksum_sha256, source_id, content_layout, slice_generation`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
 		s.scope.Args(content.InodeID, content.StorageType, content.StorageRef, StorageRefHash(content.StorageRef), mode,
 			storageEncryptionKeyIDForWrite(mode, content.StorageEncryptionKeyID),
 			nilBytes(content.ContentBlob), nullStr(content.ContentType),
-			nullStr(content.ChecksumSHA256), nullStr(content.SourceID))...)
+			nullStr(content.ChecksumSHA256), nullStr(content.SourceID),
+			layoutForWrite(content.ContentLayout), content.SliceGeneration)...)
 	return err
 }
 
@@ -53,7 +57,8 @@ func (s *Store) InsertContentTx(db execer, content *Content) error {
 func (s *Store) GetContent(ctx context.Context, inodeID string) (*Content, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT inode_id, storage_type, storage_ref,
 		storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
-		content_blob, content_type, checksum_sha256, source_id
+		content_blob, content_type, checksum_sha256, source_id,
+		COALESCE(content_layout, 'single'), COALESCE(slice_generation, 0)
 		FROM contents WHERE `+s.scope.And(`inode_id = ?`), s.scope.Args(inodeID)...)
 	return scanContent(row)
 }
@@ -74,9 +79,10 @@ func scanContent(row *sql.Row) (*Content, error) {
 	var c Content
 	var contentType, checksum, sourceID sql.NullString
 	var encryptionMode string
+	var layout string
 	err := row.Scan(&c.InodeID, &c.StorageType, &c.StorageRef,
 		&c.StorageRefHash, &encryptionMode, &c.StorageEncryptionKeyID,
-		&c.ContentBlob, &contentType, &checksum, &sourceID)
+		&c.ContentBlob, &contentType, &checksum, &sourceID, &layout, &c.SliceGeneration)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -90,5 +96,10 @@ func scanContent(row *sql.Row) (*Content, error) {
 	c.ContentType = contentType.String
 	c.ChecksumSHA256 = checksum.String
 	c.SourceID = sourceID.String
+	c.ContentLayout = NormalizeContentLayout(ContentLayout(layout))
 	return &c, nil
+}
+
+func layoutForWrite(layout ContentLayout) string {
+	return string(NormalizeContentLayout(layout))
 }

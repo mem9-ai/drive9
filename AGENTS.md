@@ -104,9 +104,12 @@ make run-server-local
 
 `make run-server-local` sets `DRIVE9_TENANT_PROVIDER=local`. Control-plane tables
 are migrated on startup, and each `POST /v1/provision` creates `drive9_<tenantid>`
-and inits tenant schema. Defaults assume TiDB at `127.0.0.1:4000` and local mock
-S3. Override any `DRIVE9_*` var before running. E2E scripts provision their own
-tenant when `DRIVE9_API_KEY` is unset.
+and inits tenant schema. Defaults assume TiDB at `127.0.0.1:4000` and a real
+MinIO on `127.0.0.1:19000` (`scripts/local-minio.sh`; docker/podman, else a
+MinIO binary). If MinIO cannot start, the server falls back to the local
+filesystem S3 mock. Override with `DRIVE9_S3_BACKEND=minio|mock`, or set
+`DRIVE9_S3_BUCKET` (and the other `DRIVE9_S3_*` keys) to use an existing
+bucket. E2E scripts provision their own tenant when `DRIVE9_API_KEY` is unset.
 
 ---
 

@@ -189,7 +189,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
 	layerRef := fs.String("layer", "", "mount through writable fs layer (layer id, name, or tag ref)")
 	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
-	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, interactive, or a ~/.drive9/profiles/<name> file")
+	profile := fs.String("profile", "", "mount profile: coding-agent (default), coding-agent-extent, portable, none, interactive, or a ~/.drive9/profiles/<name> file")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
 	var localOnlyPatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
@@ -607,6 +607,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			RemoteOnlyPatterns: append([]string(nil), effectiveRemoteOnlyPatterns...),
 			AppendLogPatterns:  append([]string(nil), effectiveAppendLogPatterns...),
 			PackPaths:          append([]string(nil), effectivePackPaths...),
+			ExtentPaths:        append([]string(nil), profileCfg.ExtentPatterns...),
 			ReadOnly:           *readOnly,
 			Debug:              *debug,
 			GVisorCompat:       *gvisorCompat,
@@ -738,6 +739,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			RemoteOnlyPatterns: append([]string(nil), effectiveRemoteOnlyPatterns...),
 			AppendLogPatterns:  append([]string(nil), effectiveAppendLogPatterns...),
 			PackPaths:          append([]string(nil), effectivePackPaths...),
+			ExtentPaths:        append([]string(nil), profileCfg.ExtentPatterns...),
 			ReadOnly:           *readOnly,
 			Debug:              *debug,
 			GVisorCompat:       *gvisorCompat,
@@ -780,6 +782,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		RemoteOnlyPatterns:      append([]string(nil), effectiveRemoteOnlyPatterns...),
 		AppendLogPatterns:       append([]string(nil), effectiveAppendLogPatterns...),
 		PackPaths:               append([]string(nil), effectivePackPaths...),
+		ExtentPaths:             append([]string(nil), profileCfg.ExtentPatterns...),
 		UploadConcurrency:       *uploadConcurrency,
 		DirCacheMaxEntries:      *dirCacheMaxEntries,
 		CommitQueueMaxPending:   *commitQueueMaxPending,

@@ -8,6 +8,8 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // JournalOp identifies the type of operation recorded in a journal entry.
@@ -39,6 +41,13 @@ type JournalEntry struct {
 	// file, so crash recovery must rebuild the pending entry in spill mode
 	// (streamed upload) instead of full-memory ReadAll.
 	ShadowSpill bool `json:"shadow_spill,omitempty"`
+	// Extent marks a commit-slices durability frame. These must not be
+	// resurrected as a whole-file pending PUT.
+	Extent           bool             `json:"extent,omitempty"`
+	ExtentOpID       string           `json:"extent_op_id,omitempty"`
+	ExtentOps        []client.SliceOp `json:"extent_ops,omitempty"`
+	ExtentTruncateTo *int64           `json:"extent_truncate_to,omitempty"`
+	ExtentGeneration int64            `json:"extent_generation,omitempty"`
 }
 
 // Journal is an append-only WAL for crash recovery. Each entry is
@@ -251,6 +260,11 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex) error {
 				latestDone[e.Path] = e.Seq
 			}
 		case JournalFsync:
+			if e.Extent {
+				// Extent commits are replayed via commit-slices, not as a
+				// whole-file pending PUT.
+				break
+			}
 			// Only fsync frames assert "shadow data is durable"; other ops
 			// (write/rename/mkdir/...) must not resurrect pending uploads.
 			if prev, ok := latestData[e.Path]; !ok || e.Seq > prev.Seq {

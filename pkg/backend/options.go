@@ -8,6 +8,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/embedding"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"go.uber.org/zap"
 )
 
@@ -270,6 +271,7 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	} else {
 		b.textExtractMaxBytes = DefaultTextExtractMaxBytes
 	}
+	metrics.SetFeatureEnabled("extent", true)
 
 	cb := opts.LLMCostBudget
 	switch {

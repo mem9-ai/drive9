@@ -102,6 +102,18 @@ func Stat(c *client.Client, args []string) error {
 		fmt.Printf("nlink: %d\n", m.Nlink)
 	}
 	fmt.Printf("revision: %d\n", m.Revision)
+	if m.StorageType != "" {
+		fmt.Printf("storage_type: %s\n", m.StorageType)
+	}
+	if m.ContentLayout != "" {
+		fmt.Printf("content_layout: %s\n", m.ContentLayout)
+	}
+	if m.StorageClass != "" {
+		fmt.Printf("storage_class: %s\n", m.StorageClass)
+	}
+	if m.SliceGeneration != 0 {
+		fmt.Printf("slice_generation: %d\n", m.SliceGeneration)
+	}
 	if m.Mtime != nil {
 		fmt.Printf("mtime: %s\n", time.Unix(*m.Mtime, 0).UTC().Format(time.RFC3339))
 	}

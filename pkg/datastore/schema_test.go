@@ -31,6 +31,15 @@ func TestInitSchemaRequiredColumns(t *testing.T) {
 	if !s1.columnExists("file_gc_tasks", "task_id") {
 		t.Fatal("missing file_gc_tasks table")
 	}
+	if !s1.columnExists("file_slices", "block_key") {
+		t.Fatal("missing file_slices table")
+	}
+	if !s1.columnExists("file_chunks", "slices") {
+		t.Fatal("missing file_chunks table")
+	}
+	if !s1.columnExists("contents", "content_layout") {
+		t.Fatal("missing contents.content_layout")
+	}
 	if !s1.columnExists("journals", "journal_id") {
 		t.Fatal("missing journals table")
 	}
@@ -42,6 +51,13 @@ func TestInitSchemaRequiredColumns(t *testing.T) {
 func dropDataPlaneTables(t *testing.T, s *Store) {
 	t.Helper()
 	stmts := []string{
+		"DROP TABLE IF EXISTS slice_compact_tasks",
+		"DROP TABLE IF EXISTS block_gc_tasks",
+		"DROP TABLE IF EXISTS slice_commit_ops",
+		"DROP TABLE IF EXISTS pending_blocks",
+		"DROP TABLE IF EXISTS file_slice_refs",
+		"DROP TABLE IF EXISTS file_slices",
+		"DROP TABLE IF EXISTS file_chunks",
 		"DROP TABLE IF EXISTS file_gc_tasks",
 		"DROP TABLE IF EXISTS git_workspace_object_packs",
 		"DROP TABLE IF EXISTS git_workspace_overlay",

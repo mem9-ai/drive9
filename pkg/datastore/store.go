@@ -115,6 +115,11 @@ type File struct {
 	CreatedAt                    time.Time
 	ConfirmedAt                  *time.Time
 	ExpiresAt                    *time.Time
+	// ContentLayout is how bytes are organized (single object vs extent rows).
+	// Empty means single. Extent files keep StorageType=s3.
+	ContentLayout ContentLayout
+	// SliceGeneration is the CAS generation for content_layout=extent files.
+	SliceGeneration int64
 }
 
 // NodeWithFile joins file_nodes and files for stat/read operations.
@@ -936,6 +941,8 @@ func (s *Store) insertSplitTablesTx(tx execer, f *File) error {
 		ContentType:            f.ContentType,
 		ChecksumSHA256:         f.ChecksumSHA256,
 		SourceID:               f.SourceID,
+		ContentLayout:          f.ContentLayout,
+		SliceGeneration:        f.SliceGeneration,
 	}
 	if err := s.InsertContentTx(tx, content); err != nil {
 		return fmt.Errorf("insert content: %w", err)
@@ -1730,7 +1737,8 @@ func (s *Store) StatTx(ctx context.Context, db execer, path string) (out *NodeWi
 		i.inode_id, c.storage_type, c.storage_ref, c.storage_encryption_mode, c.storage_encryption_key_id,
 		c.content_blob, c.content_type, i.size_bytes,
 		c.checksum_sha256, i.revision, i.mode, s.embedding_revision, i.status, c.source_id, s.content_text,
-		s.description, s.description_embedding_revision, i.created_at, i.confirmed_at, i.expires_at
+		s.description, s.description_embedding_revision, i.created_at, i.confirmed_at, i.expires_at,
+		COALESCE(c.content_layout, 'single'), COALESCE(c.slice_generation, 0)
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
 		LEFT JOIN contents c ON `+s.scope.AndOn(`i.inode_id = c.inode_id`, "c")+`
@@ -1770,7 +1778,8 @@ func (s *Store) StatPathFallback(ctx context.Context, primaryPath, fallbackPath 
 		i.inode_id, c.storage_type, c.storage_ref, c.storage_encryption_mode, c.storage_encryption_key_id,
 		c.content_blob, c.content_type, i.size_bytes,
 		c.checksum_sha256, i.revision, i.mode, s.embedding_revision, i.status, c.source_id, s.content_text,
-		s.description, s.description_embedding_revision, i.created_at, i.confirmed_at, i.expires_at
+		s.description, s.description_embedding_revision, i.created_at, i.confirmed_at, i.expires_at,
+		COALESCE(c.content_layout, 'single'), COALESCE(c.slice_generation, 0)
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
 		LEFT JOIN contents c ON `+s.scope.AndOn(`i.inode_id = c.inode_id`, "c")+`
@@ -1790,7 +1799,8 @@ func (s *Store) StatPathFallbackLite(ctx context.Context, primaryPath, fallbackP
 	defer observeStoreOp(ctx, "stat_path_fallback_lite", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at, c.storage_type
+		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at, c.storage_type,
+		COALESCE(c.content_layout, 'single'), COALESCE(c.slice_generation, 0)
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
 		LEFT JOIN contents c ON `+s.scope.AndOn(`i.inode_id = c.inode_id`, "c")+`
@@ -1807,7 +1817,8 @@ func (s *Store) StatLite(ctx context.Context, path string) (out *NodeWithFile, e
 	defer observeStoreOp(ctx, "stat_lite", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at, c.storage_type
+		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at, c.storage_type,
+		COALESCE(c.content_layout, 'single'), COALESCE(c.slice_generation, 0)
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
 		LEFT JOIN contents c ON `+s.scope.AndOn(`i.inode_id = c.inode_id`, "c")+`
@@ -1826,7 +1837,8 @@ func (s *Store) StatForRead(ctx context.Context, path string) (out *NodeWithFile
 	defer observeStoreOp(ctx, "stat_for_read", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		i.inode_id, c.storage_type, c.storage_ref, c.content_blob, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
+		i.inode_id, c.storage_type, c.storage_ref, c.content_blob, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at,
+		COALESCE(c.content_layout, 'single'), COALESCE(c.slice_generation, 0)
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
 		LEFT JOIN contents c ON `+s.scope.AndOn(`i.inode_id = c.inode_id`, "c")+`
@@ -1842,7 +1854,8 @@ func (s *Store) StatPathFallbackForRead(ctx context.Context, primaryPath, fallba
 	defer observeStoreOp(ctx, "stat_path_fallback_for_read", start, &err)
 
 	row := s.db.QueryRowContext(ctx, `SELECT fn.node_id, fn.path, fn.parent_path, fn.name, fn.is_directory, fn.file_id, fn.created_at,
-		i.inode_id, c.storage_type, c.storage_ref, c.content_blob, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
+		i.inode_id, c.storage_type, c.storage_ref, c.content_blob, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at,
+		COALESCE(c.content_layout, 'single'), COALESCE(c.slice_generation, 0)
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON `+s.scope.AndOn(`COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'`, "i")+`
 		LEFT JOIN contents c ON `+s.scope.AndOn(`i.inode_id = c.inode_id`, "c")+`
@@ -1989,6 +2002,11 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	if _, err := s.EnqueueFileGCTaskTx(tx, task); err != nil {
 		return nil, err
 	}
+	if candidate.file.IsExtent() {
+		if err := s.ReleaseExtentInodeTx(ctx, tx, candidate.fileID, time.Now().UTC()); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -2054,6 +2072,11 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		}
 		if _, err := s.EnqueueFileGCTaskTx(tx, task); err != nil {
 			return nil, err
+		}
+		if f.IsExtent() {
+			if err := s.ReleaseExtentInodeTx(ctx, tx, f.FileID, time.Now().UTC()); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -2681,6 +2704,8 @@ func assembleFile(inode *Inode, content *Content, semantic *Semantic) *File {
 		f.ContentType = content.ContentType
 		f.ChecksumSHA256 = content.ChecksumSHA256
 		f.SourceID = content.SourceID
+		f.ContentLayout = content.ContentLayout
+		f.SliceGeneration = content.SliceGeneration
 	}
 	if semantic != nil {
 		f.ContentText = semantic.ContentText
@@ -2773,12 +2798,15 @@ func scanNodeWithFileWithBlob(s scanner) (*NodeWithFile, error) {
 	var fSizeBytes, fRevision, fMode, fEmbeddingRevision, fDescriptionEmbeddingRevision sql.NullInt64
 	var fStatus sql.NullString
 	var fCreatedAt, fConfirmedAt, fExpiresAt sql.NullTime
+	var fLayout sql.NullString
+	var fSliceGeneration sql.NullInt64
 
 	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
 		&fFileID, &fStorageType, &fStorageRef, &fStorageEncryptionMode, &fStorageEncryptionKeyID,
 		&fContentBlob, &fContentType, &fSizeBytes,
 		&fChecksum, &fRevision, &fMode, &fEmbeddingRevision, &fStatus, &fSourceID, &fContentText,
-		&fDescription, &fDescriptionEmbeddingRevision, &fCreatedAt, &fConfirmedAt, &fExpiresAt)
+		&fDescription, &fDescriptionEmbeddingRevision, &fCreatedAt, &fConfirmedAt, &fExpiresAt,
+		&fLayout, &fSliceGeneration)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -2808,6 +2836,8 @@ func scanNodeWithFileWithBlob(s scanner) (*NodeWithFile, error) {
 			SourceID:               fSourceID.String,
 			ContentText:            fContentText.String,
 			Description:            fDescription.String,
+			ContentLayout:          NormalizeContentLayout(ContentLayout(fLayout.String)),
+			SliceGeneration:        fSliceGeneration.Int64,
 		}
 		if fEmbeddingRevision.Valid {
 			rev := fEmbeddingRevision.Int64
@@ -2852,9 +2882,12 @@ func scanNodeWithFileForRead(s scanner) (*NodeWithFile, error) {
 	var fMode sql.NullInt64
 	var fStatus sql.NullString
 	var fCreatedAt, fConfirmedAt sql.NullTime
+	var fLayout sql.NullString
+	var fSliceGeneration sql.NullInt64
 
 	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
-		&fFileID, &fStorageType, &fStorageRef, &fContentBlob, &fSizeBytes, &fRevision, &fMode, &fStatus, &fCreatedAt, &fConfirmedAt)
+		&fFileID, &fStorageType, &fStorageRef, &fContentBlob, &fSizeBytes, &fRevision, &fMode, &fStatus, &fCreatedAt, &fConfirmedAt,
+		&fLayout, &fSliceGeneration)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -2869,13 +2902,15 @@ func scanNodeWithFileForRead(s scanner) (*NodeWithFile, error) {
 	nf := &NodeWithFile{Node: n}
 	if fFileID.Valid {
 		nf.File = &File{
-			FileID:      fFileID.String,
-			StorageType: StorageType(fStorageType.String),
-			StorageRef:  fStorageRef.String,
-			ContentBlob: append([]byte(nil), fContentBlob...),
-			SizeBytes:   fSizeBytes.Int64,
-			Revision:    fRevision.Int64,
-			Status:      FileStatus(fStatus.String),
+			FileID:          fFileID.String,
+			StorageType:     StorageType(fStorageType.String),
+			StorageRef:      fStorageRef.String,
+			ContentBlob:     append([]byte(nil), fContentBlob...),
+			SizeBytes:       fSizeBytes.Int64,
+			Revision:        fRevision.Int64,
+			Status:          FileStatus(fStatus.String),
+			ContentLayout:   NormalizeContentLayout(ContentLayout(fLayout.String)),
+			SliceGeneration: fSliceGeneration.Int64,
 		}
 		if fCreatedAt.Valid {
 			nf.File.CreatedAt = fCreatedAt.Time.UTC()
@@ -2907,9 +2942,12 @@ func scanNodeWithFileLite(s scanner) (*NodeWithFile, error) {
 	var fStatus sql.NullString
 	var fCreatedAt, fConfirmedAt sql.NullTime
 	var fStorageType sql.NullString
+	var fLayout sql.NullString
+	var fSliceGeneration sql.NullInt64
 
 	err := s.Scan(&n.NodeID, &n.Path, &n.ParentPath, &n.Name, &isDir, &nodeFileID, &nodeCreatedAt,
-		&fFileID, &fSizeBytes, &fRevision, &fMode, &fStatus, &fCreatedAt, &fConfirmedAt, &fStorageType)
+		&fFileID, &fSizeBytes, &fRevision, &fMode, &fStatus, &fCreatedAt, &fConfirmedAt, &fStorageType,
+		&fLayout, &fSliceGeneration)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -2924,12 +2962,14 @@ func scanNodeWithFileLite(s scanner) (*NodeWithFile, error) {
 	nf := &NodeWithFile{Node: n}
 	if fFileID.Valid {
 		nf.File = &File{
-			FileID:      fFileID.String,
-			SizeBytes:   fSizeBytes.Int64,
-			Revision:    fRevision.Int64,
-			Mode:        uint32(fMode.Int64),
-			Status:      FileStatus(fStatus.String),
-			StorageType: StorageType(fStorageType.String),
+			FileID:          fFileID.String,
+			SizeBytes:       fSizeBytes.Int64,
+			Revision:        fRevision.Int64,
+			Mode:            uint32(fMode.Int64),
+			Status:          FileStatus(fStatus.String),
+			StorageType:     StorageType(fStorageType.String),
+			ContentLayout:   NormalizeContentLayout(ContentLayout(fLayout.String)),
+			SliceGeneration: fSliceGeneration.Int64,
 		}
 		if fCreatedAt.Valid {
 			nf.File.CreatedAt = fCreatedAt.Time.UTC()

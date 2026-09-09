@@ -59,6 +59,7 @@ func TestStatCtxParsesContentLayout(t *testing.T) {
 	}{
 		{name: "append-log", header: "append_log", want: ContentLayoutAppendLog},
 		{name: "single", header: "single", want: ContentLayoutSingle},
+		{name: "extent", header: "extent", want: ContentLayoutExtent},
 		{name: "missing", want: ""},
 		{name: "unknown", header: "future", want: ContentLayout("future")},
 	} {

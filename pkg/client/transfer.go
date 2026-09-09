@@ -488,6 +488,9 @@ func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx contex
 			return nil, err
 		}
 		if err := c.writeCtxConditionalWithTagsAndDescription(ctx, path, data, expectedRevision, tags, description); err != nil {
+			if isExtentUseCommitError(err) {
+				return c.writeExtentStream(ctx, path, bytes.NewReader(data), int64(len(data)), expectedRevision, summary)
+			}
 			return nil, err
 		}
 		summary.DirectWriteSeconds = time.Since(directWriteStart).Seconds()
@@ -504,11 +507,17 @@ func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx contex
 	if err == errV2NotAvailable {
 		// Server doesn't support v2 — fall back to v1.
 		if err := c.writeStreamV1WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, preCompleteCheck); err != nil {
+			if isExtentUseCommitError(err) {
+				return c.writeExtentStream(ctx, path, io.NewSectionReader(ra, 0, size), size, expectedRevision, summary)
+			}
 			return nil, err
 		}
 		return finishUploadSummary(summary), nil
 	}
 	if err != nil {
+		if isExtentUseCommitError(err) {
+			return c.writeExtentStream(ctx, path, io.NewSectionReader(ra, 0, size), size, expectedRevision, summary)
+		}
 		return nil, err
 	}
 	return finishUploadSummary(summary), nil

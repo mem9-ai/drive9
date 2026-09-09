@@ -222,6 +222,7 @@ func removeHandleFromSet[K comparable](m map[K]map[*FileHandle]struct{}, key K, 
 }
 
 func (fs *Dat9FS) allocateFileHandle(fh *FileHandle) uint64 {
+	fs.attachExtentWriter(fh)
 	fhID := fs.fileHandles.Allocate(fh)
 	fs.openHandles.Add(fh)
 	return fhID
@@ -235,6 +236,7 @@ func (fs *Dat9FS) deleteFileHandle(fhID uint64, fh *FileHandle) {
 			return
 		}
 	}
+	fs.detachExtentWriter(fh)
 	fs.fileHandles.Delete(fhID)
 	fs.openHandles.Remove(fh)
 }

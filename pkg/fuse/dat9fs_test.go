@@ -3815,6 +3815,227 @@ func TestSetAttrModePreservesSpecialPermissionBits(t *testing.T) {
 	}
 }
 
+func TestWriteClearsSetIDBitsForNonRootCaller(t *testing.T) {
+	ts, _ := newTestServer(t)
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const nobody uint32 = 65534
+	cases := []struct {
+		name      string
+		mode      uint32
+		createUid uint32
+		writerUid uint32
+		wantMode  uint32
+	}{
+		{name: "suid-nonowner", mode: 0o4777, createUid: 0, writerUid: nobody, wantMode: 0o777},
+		{name: "sgid-nonowner", mode: 0o2777, createUid: 0, writerUid: nobody, wantMode: 0o777},
+		{name: "suid-sgid-nonowner", mode: 0o6777, createUid: 0, writerUid: nobody, wantMode: 0o777},
+		{name: "suid-root-keeps", mode: 0o4777, createUid: 0, writerUid: 0, wantMode: 0o4777},
+		{name: "suid-owner-nonroot", mode: 0o4777, createUid: 1000, writerUid: 1000, wantMode: 0o777},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			name := tc.name + ".txt"
+			var createOut gofuse.CreateOut
+			st := fs.Create(nil, &gofuse.CreateIn{
+				InHeader: gofuse.InHeader{
+					NodeId: 1,
+					Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: tc.createUid, Gid: tc.createUid}},
+				},
+				Mode:  tc.mode,
+				Flags: uint32(syscall.O_WRONLY),
+			}, name, &createOut)
+			if st != gofuse.OK {
+				t.Fatalf("Create: %v", st)
+			}
+			st = fs.Flush(nil, &gofuse.FlushIn{
+				InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+				Fh:       createOut.Fh,
+			})
+			if st != gofuse.OK {
+				t.Fatalf("Flush create: %v", st)
+			}
+			fs.Release(nil, &gofuse.ReleaseIn{
+				InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+				Fh:       createOut.Fh,
+			})
+
+			var openOut gofuse.OpenOut
+			st = fs.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{
+					NodeId: createOut.NodeId,
+					Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: tc.writerUid, Gid: tc.writerUid}},
+				},
+				Flags: uint32(syscall.O_WRONLY),
+			}, &openOut)
+			if st != gofuse.OK {
+				t.Fatalf("Open: %v", st)
+			}
+			_, st = fs.Write(nil, &gofuse.WriteIn{
+				InHeader: gofuse.InHeader{
+					NodeId: createOut.NodeId,
+					Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: tc.writerUid, Gid: tc.writerUid}},
+				},
+				Fh: openOut.Fh,
+			}, []byte("x"))
+			if st != gofuse.OK {
+				t.Fatalf("Write: %v", st)
+			}
+
+			var attr gofuse.AttrOut
+			st = fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: createOut.NodeId}}, &attr)
+			if st != gofuse.OK {
+				t.Fatalf("GetAttr after write: %v", st)
+			}
+			if got := attr.Mode & posixPermissionModeMask; got != tc.wantMode {
+				t.Fatalf("fstat mode = %o, want %o", got, tc.wantMode)
+			}
+
+			st = fs.Flush(nil, &gofuse.FlushIn{
+				InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+				Fh:       openOut.Fh,
+			})
+			if st != gofuse.OK {
+				t.Fatalf("Flush write: %v", st)
+			}
+			fs.Release(nil, &gofuse.ReleaseIn{
+				InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+				Fh:       openOut.Fh,
+			})
+
+			st = fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: createOut.NodeId}}, &attr)
+			if st != gofuse.OK {
+				t.Fatalf("GetAttr after release: %v", st)
+			}
+			if got := attr.Mode & posixPermissionModeMask; got != tc.wantMode {
+				t.Fatalf("stat mode = %o, want %o", got, tc.wantMode)
+			}
+		})
+	}
+}
+
+func TestWriteSameHandleClearsPendingSetIDBits(t *testing.T) {
+	ts, _ := newTestServer(t)
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{
+			NodeId: 1,
+			Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 0, Gid: 0}},
+		},
+		Mode:  0o4777,
+		Flags: uint32(syscall.O_RDWR),
+	}, "pending-suid.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+
+	_, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{
+			NodeId: createOut.NodeId,
+			Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 65534, Gid: 65534}},
+		},
+		Fh: createOut.Fh,
+	}, []byte("x"))
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("create handle missing")
+	}
+	fh.Lock()
+	pending := fh.PendingMode
+	hasPending := fh.HasPendingMode
+	fh.Unlock()
+	if !hasPending {
+		t.Fatal("expected pending mode from create 04777")
+	}
+	if got := pending & posixPermissionModeMask; got != 0o777 {
+		t.Fatalf("pending mode = %o, want 0777", got)
+	}
+
+	var attr gofuse.AttrOut
+	st = fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: createOut.NodeId}}, &attr)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr: %v", st)
+	}
+	if got := attr.Mode & posixPermissionModeMask; got != 0o777 {
+		t.Fatalf("mode = %o, want 0777", got)
+	}
+
+	st = fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+	if st != gofuse.OK {
+		t.Fatalf("Flush: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	st = fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: createOut.NodeId}}, &attr)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr after release: %v", st)
+	}
+	if got := attr.Mode & posixPermissionModeMask; got != 0o777 {
+		t.Fatalf("stat mode after release = %o, want 0777", got)
+	}
+}
+
+func TestZeroByteWriteDoesNotClearSetIDBits(t *testing.T) {
+	ts, _ := newTestServer(t)
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     0o4777,
+		Flags:    uint32(syscall.O_WRONLY),
+	}, "empty-write-suid.txt", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	_, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{
+			NodeId: createOut.NodeId,
+			Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 65534, Gid: 65534}},
+		},
+		Fh: createOut.Fh,
+	}, nil)
+	if st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	var attr gofuse.AttrOut
+	st = fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: createOut.NodeId}}, &attr)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr: %v", st)
+	}
+	if got := attr.Mode & posixPermissionModeMask; got != 0o4777 {
+		t.Fatalf("mode = %o, want 04777 after 0-byte write", got)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+}
+
 func TestSetAttrModeUsesDirectoryRemotePath(t *testing.T) {
 	var chmodCalls atomic.Int32
 	var gotPath string
@@ -9618,8 +9839,14 @@ func TestGoFuseMountOptionsMapsSyncRead(t *testing.T) {
 	if !explicit.SyncRead {
 		t.Fatal("explicit go-fuse SyncRead = false, want true")
 	}
-	if explicit.MaxBackground != 32 {
-		t.Fatalf("MaxBackground = %d, want 32", explicit.MaxBackground)
+	if explicit.MaxBackground != 50 {
+		t.Fatalf("MaxBackground = %d, want 50 (JuiceFS Serve)", explicit.MaxBackground)
+	}
+	if defaults.MaxReadAhead != 1<<20 {
+		t.Fatalf("MaxReadAhead = %d, want 1MiB (JuiceFS fuse.MountOptions)", defaults.MaxReadAhead)
+	}
+	if defaults.MaxWrite != 128*1024 {
+		t.Fatalf("MaxWrite = %d, want 128KiB (JuiceFS --max-fuse-io default)", defaults.MaxWrite)
 	}
 }
 

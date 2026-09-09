@@ -12,12 +12,19 @@ import (
 // FileHandle represents an open file in the FUSE filesystem.
 // WriteBuffer is defined in write.go and supports offset-based writes.
 type FileHandle struct {
-	Ino          uint64
-	Path         string
-	Layer        PathLayer
-	LocalFile    *os.File
-	Flags        uint32       // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
-	OpenPID      uint32       // PID that opened the handle, when supplied by the kernel
+	Ino       uint64
+	Path      string
+	Layer     PathLayer
+	LocalFile *os.File
+	Flags     uint32 // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
+	OpenPID   uint32 // PID that opened the handle, when supplied by the kernel
+	// posixLocks/ofdOwner match JuiceFS vfs.handle.locks bit 2 and ofdOwner:
+	// FUSE SETLK is recorded on the handle that issued it, and Flush/Release
+	// only UNLCK that handle. Kernel 3.1- (and some Release requests) omit
+	// lock_owner, so ofdOwner is the owner stored at SETLK time.
+	posixLocks   uint8
+	ofdOwner     uint64
+	flockOwner   uint64
 	Dirty        *WriteBuffer // write buffer, nil for read-only opens
 	DirtySeq     uint64       // monotonic sequence for authoritative dirty-size tracking
 	WriteBackSeq uint64       // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
@@ -29,25 +36,34 @@ type FileHandle struct {
 	// the server's X-Dat9-Storage-Type stat header when available, updated
 	// after local commits and after a PATCH rejection. Write routing prefers
 	// it over the OrigSize size-heuristic when known.
-	StorageClass      client.StorageType
-	ZeroBase          bool            // true when the handle has adopted an explicit empty-file baseline
-	IsNew             bool            // true if created via Create() (no prior remote existence)
-	ShadowReady       bool            // true when the local shadow file is a safe full snapshot
-	ShadowSpill       bool            // true when shadow is the authoritative data source (large IsNew/ZeroBase files)
-	ShadowCommitReady bool            // true when ShadowSpill Flush has staged shadow for async commit
-	ShadowCommitSeq   uint64          // DirtySeq captured when ShadowCommitReady was staged
-	ShadowPinned      bool            // true when this handle has pinned the shadow (must Unpin on Release)
-	ShadowGen         uint64          // generation token from Pin/PinIfExists (passed to Unpin)
-	Streamer          *StreamUploader // nil for small files / read-only; manages background part uploads
-	Prefetch          *Prefetcher     // nil for writable handles; sequential read prefetcher
-	ReadTarget        *client.ReadTarget
-	readTargetGen     uint64
-	WritePolicy       WritePolicy // per-handle remote durability policy chosen at open/create
-	GitWorkspaceID    string      // set for handles served by the git workspace layer
-	GitRelPath        string
-	GitKind           string
-	GitMode           string
-	GitBaseObjectSHA  string
+	StorageClass       client.StorageType
+	ContentLayout      client.ContentLayout
+	SliceGeneration    int64
+	extentDirty        *extentDirtySet
+	extentWriter       *extentFileWriter
+	extentOpen         *extentOpenFile
+	extentLastMod      time.Time
+	extentStarted      time.Time
+	extentRA           [2]extentReadAhead
+	extentNeedTruncate bool            // ftruncate/setattr size changed; flush must send truncate_to
+	ZeroBase           bool            // true when the handle has adopted an explicit empty-file baseline
+	IsNew              bool            // true if created via Create() (no prior remote existence)
+	ShadowReady        bool            // true when the local shadow file is a safe full snapshot
+	ShadowSpill        bool            // true when shadow is the authoritative data source (large IsNew/ZeroBase files)
+	ShadowCommitReady  bool            // true when ShadowSpill Flush has staged shadow for async commit
+	ShadowCommitSeq    uint64          // DirtySeq captured when ShadowCommitReady was staged
+	ShadowPinned       bool            // true when this handle has pinned the shadow (must Unpin on Release)
+	ShadowGen          uint64          // generation token from Pin/PinIfExists (passed to Unpin)
+	Streamer           *StreamUploader // nil for small files / read-only; manages background part uploads
+	Prefetch           *Prefetcher     // nil for writable handles; sequential read prefetcher
+	ReadTarget         *client.ReadTarget
+	readTargetGen      uint64
+	WritePolicy        WritePolicy // per-handle remote durability policy chosen at open/create
+	GitWorkspaceID     string      // set for handles served by the git workspace layer
+	GitRelPath         string
+	GitKind            string
+	GitMode            string
+	GitBaseObjectSHA   string
 	// GitOpenSnapshot is the overlay entry content observed (or fetched, for
 	// metadata-only entries) by a read-only prepareGitOpenHandle. It exists
 	// so a whiteout racing the rest of the open can still give the registered

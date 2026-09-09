@@ -10,9 +10,10 @@ import (
 )
 
 const (
-	defaultMountProfile  = "coding-agent"
-	noneMountProfile     = "none"
-	portableMountProfile = "portable"
+	defaultMountProfile           = "coding-agent"
+	codingAgentExtentMountProfile = "coding-agent-extent"
+	noneMountProfile              = "none"
+	portableMountProfile          = "portable"
 )
 
 type profileConfig struct {
@@ -21,6 +22,7 @@ type profileConfig struct {
 	LocalOnlyPatterns  []string
 	RemoteOnlyPatterns []string
 	PackPaths          []string
+	ExtentPatterns     []string
 }
 
 func Profile(args []string) error {
@@ -92,6 +94,9 @@ func loadProfileConfig(name string) (profileConfig, error) {
 	if name == defaultMountProfile {
 		return builtinCodingAgentProfile(), nil
 	}
+	if name == codingAgentExtentMountProfile {
+		return builtinCodingAgentExtentProfile(), nil
+	}
 	if name == portableMountProfile {
 		return builtinPortableProfile(), nil
 	}
@@ -145,6 +150,7 @@ func builtinCodingAgentProfile() profileConfig {
 		LocalOnlyPatterns:  builtinCodingAgentLocalOnlyPatterns(),
 		RemoteOnlyPatterns: nil,
 		PackPaths:          nil,
+		ExtentPatterns:     nil,
 	}
 }
 
@@ -155,7 +161,16 @@ func builtinPortableProfile() profileConfig {
 		LocalOnlyPatterns:  builtinCodingAgentLocalOnlyPatterns(),
 		RemoteOnlyPatterns: nil,
 		PackPaths:          []string{"/"},
+		ExtentPatterns:     nil,
 	}
+}
+
+func builtinCodingAgentExtentProfile() profileConfig {
+	cfg := builtinCodingAgentProfile()
+	cfg.Name = codingAgentExtentMountProfile
+	cfg.Source = "builtin:coding-agent-extent"
+	cfg.ExtentPatterns = []string{"*"}
+	return cfg
 }
 
 func mergeProfileValues(groups ...[]string) []string {
@@ -215,7 +230,7 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")))
 			switch section {
-			case "local", "remote", "pack":
+			case "local", "remote", "pack", "extent":
 			default:
 				return profileConfig{}, fmt.Errorf("profile %q line %d: unknown section [%s]", name, lineNo+1, section)
 			}
@@ -228,6 +243,8 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 			cfg.RemoteOnlyPatterns = append(cfg.RemoteOnlyPatterns, line)
 		case "pack":
 			cfg.PackPaths = append(cfg.PackPaths, line)
+		case "extent":
+			cfg.ExtentPatterns = append(cfg.ExtentPatterns, line)
 		}
 	}
 	return cfg, nil
@@ -242,6 +259,7 @@ func formatProfileConfig(cfg profileConfig) string {
 	writeProfileSection(&b, "local", cfg.LocalOnlyPatterns, "no local-only overlay paths")
 	writeProfileSection(&b, "remote", cfg.RemoteOnlyPatterns, "no remote override paths")
 	writeProfileSection(&b, "pack", cfg.PackPaths, "no automatic pack paths")
+	writeProfileSection(&b, "extent", cfg.ExtentPatterns, "no extent path patterns")
 	return b.String()
 }
 

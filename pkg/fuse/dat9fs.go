@@ -53,6 +53,14 @@ type Dat9FS struct {
 	remoteCommitMu      sync.Mutex
 	remoteCommitLocks   map[string]*sync.Mutex
 	readCache           *ReadCache
+	extentCache         *extentReadCache
+	extentCompact       *extentCompactScheduler
+	extentBGOnce        sync.Once
+	extentBGStop        chan struct{}
+	extentBGDone        chan struct{}
+	extentDisk          *extentBlockDiskCache
+	extentOpenMu        sync.Mutex
+	extentOpens         map[uint64]*extentOpenFile
 	diskReadCache       *DiskReadCache
 	dirCache            *DirCache
 	// statCacheUnverified is true while the SSE stream is not known-current.
@@ -357,6 +365,9 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		committedSize:     make(map[string]int64),
 		remoteCommitLocks: make(map[string]*sync.Mutex),
 		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, opts.ReadCacheTTL, opts.ReadCacheMaxFileBytes),
+		extentCache:       newExtentReadCache(opts.CacheSize),
+		extentCompact:     newExtentCompactScheduler(),
+		extentOpens:       make(map[uint64]*extentOpenFile),
 		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, dirCacheMaxEntriesOrDefault(opts.DirCacheMaxEntries)),
 		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
 		dirtyInodes:       make(map[uint64]dirtyInodeState),
@@ -1663,6 +1674,18 @@ func isSQLitePersistentJournalPath(localPath string) bool {
 	return strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-journal")
 }
 
+func isSQLiteRollbackJournalPath(localPath string) bool {
+	canonical, err := pathutil.Canonicalize(localPath)
+	if err != nil {
+		return false
+	}
+	name := path.Base(canonical)
+	if name == "-journal" || !strings.HasSuffix(name, "-journal") {
+		return false
+	}
+	return strings.TrimSuffix(name, "-journal") != ""
+}
+
 func isSQLiteMainDatabasePath(localPath string) bool {
 	canonical, err := pathutil.Canonicalize(localPath)
 	if err != nil {
@@ -1688,6 +1711,9 @@ func sqliteMainDatabaseSidecarPaths(localPath string) []string {
 }
 
 func (fs *Dat9FS) bypassStableRemoteReadCaches(localPath string) bool {
+	if fs != nil && fs.shouldUseExtentPath(localPath) {
+		return true
+	}
 	if bypassStableRemoteReadCachesForSQLiteSidecar(localPath) {
 		return true
 	}
@@ -1722,8 +1748,23 @@ func isSQLiteDirectIOPath(localPath string) bool {
 	return isSQLiteVisibleSamePathDirtyPath(localPath) || isSQLitePersistentJournalPath(localPath)
 }
 
+func unlinkFuseTimeout(path string) time.Duration {
+	if isSQLitePersistentJournalPath(path) {
+		return releaseTimeout(0)
+	}
+	return fuseTimeout
+}
+
 func remoteOpenFlagsForHandle(fh *FileHandle) uint32 {
 	if fh == nil {
+		return gofuse.FOPEN_KEEP_CACHE
+	}
+	if isSQLiteWALIndexPath(fh.Path) {
+		return gofuse.FOPEN_KEEP_CACHE
+	}
+	if fh.isExtent() {
+		// JuiceFS: kernel page cache + Invalidate after write. DIRECT_IO
+		// makes MAP_SHARED mappings private per process.
 		return gofuse.FOPEN_KEEP_CACHE
 	}
 	if isSQLiteDirectIOPath(fh.Path) {
@@ -1742,6 +1783,17 @@ func remoteOpenFlagsForHandle(fh *FileHandle) uint32 {
 }
 
 func (fs *Dat9FS) openFlagsForHandle(fh *FileHandle) uint32 {
+	if fh != nil && fh.isExtent() {
+		// JuiceFS OpenCache: first Open of a live open-file InodeNotify;
+		// later Opens of the same inode KEEP_CACHE (mmap coherence).
+		if fh.extentOpen != nil && fh.extentOpen.takeKeepCache() && !fs.kernelCacheBypassActive(fh) {
+			return gofuse.FOPEN_KEEP_CACHE
+		}
+		// Async: Open runs on a go-fuse worker; sync InodeNotify re-enters
+		// GetAttr and can exhaust the pool (sqlite "database is locked").
+		fs.notifyInode(fh.Ino)
+		return 0
+	}
 	flags := remoteOpenFlagsForHandle(fh)
 	if flags != gofuse.FOPEN_KEEP_CACHE || fh == nil || fh.Dirty != nil {
 		return flags
@@ -1876,6 +1928,22 @@ func isGitLooseObjectFinalPath(p string) bool {
 
 func (fs *Dat9FS) localPath(remotePath string) (string, bool) {
 	return mountpath.ToLocal(fs.remoteRoot(), remotePath)
+}
+
+func (fs *Dat9FS) extentAttrUnstable(ino uint64) bool {
+	if fs == nil || ino == 0 {
+		return false
+	}
+	if _, ok := fs.dirtyHandleSize(ino); ok {
+		return true
+	}
+	if fs.extentOpens == nil {
+		return false
+	}
+	fs.extentOpenMu.Lock()
+	of := fs.extentOpens[ino]
+	fs.extentOpenMu.Unlock()
+	return of != nil && of.writer != nil && !of.writer.empty()
 }
 
 func (fs *Dat9FS) dirtyHandleSize(ino uint64) (int64, bool) {
@@ -2160,14 +2228,22 @@ func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) (f
 		return nil, nil
 	}
 	preTruncateSize := fh.Dirty.Size()
-	if err := fh.Dirty.Truncate(newSize); err != nil {
+	oldSize := preTruncateSize
+	if fh.isExtent() && newSize > oldSize {
+		// Sparse grow: do not materialize zeros into the write buffer.
+		if err := fh.Dirty.SetSizeOnly(newSize); err != nil {
+			return nil, err
+		}
+	} else if err := fh.Dirty.Truncate(newSize); err != nil {
 		return nil, err
 	}
-	fh.appendLogRecordTruncate()
-	if fs.appendLogPathConfigured(fh.Path) && !fh.IsNew {
-		fs.debugf("append-log trace event=truncate path=%q base_rev=%d base_size=%d pre_size=%d new_size=%d dirty_seq=%d", fh.Path, fh.BaseRev, fh.OrigSize, preTruncateSize, newSize, fh.DirtySeq)
+	if !fh.isExtent() {
+		fh.appendLogRecordTruncate()
+		if fs.appendLogPathConfigured(fh.Path) && !fh.IsNew {
+			fs.debugf("append-log trace event=truncate path=%q base_rev=%d base_size=%d pre_size=%d new_size=%d dirty_seq=%d", fh.Path, fh.BaseRev, fh.OrigSize, preTruncateSize, newSize, fh.DirtySeq)
+		}
 	}
-	if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
+	if fh.WritePolicy != WritePolicyWriteSync && !fh.isExtent() && fs.shadowStore != nil && fs.pendingIndex != nil {
 		if fh.ShadowReady || fh.IsNew || newSize == 0 {
 			if err := fs.shadowStore.Truncate(fh.Path, newSize, fh.BaseRev); err != nil {
 				safeLogPrintf("shadow truncate failed for %s: %v", fh.Path, err)
@@ -2209,8 +2285,41 @@ func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) (f
 	// safe only if the file was already S3-backed; if it was db9-backed,
 	// OrigSize should stay at the pre-truncate value to avoid PatchFile
 	// (qiffang B5). Use the minimum to be safe.
-	if newSize == 0 || newSize < fh.OrigSize {
+	// Extent files keep OrigSize as the last committed remote size so
+	// fsync can send truncate_to. Single-blob files still shrink OrigSize
+	// so PatchFile is not selected on a db9 rewrite.
+	if !fh.isExtent() && (newSize == 0 || newSize < fh.OrigSize) {
 		fh.OrigSize = newSize
+	}
+	if fh.isExtent() {
+		if fh.extentOpen == nil || fh.extentWriter == nil {
+			fs.attachExtentWriter(fh)
+		}
+		if fh.extentDirty == nil {
+			fh.extentDirty = &extentDirtySet{}
+		}
+		if fh.extentWriter == nil {
+			fs.attachExtentWriter(fh)
+		}
+		if newSize > oldSize {
+			// JuiceFS-style grow: logical size only (reads as zeros / holes).
+			if fh.extentOpen != nil {
+				fh.extentOpen.setSize(newSize)
+			}
+		} else {
+			fh.extentDirty.clip(newSize)
+			fh.extentWriter.clip(newSize)
+			if fh.extentOpen != nil {
+				fh.extentOpen.markZeroFrom(newSize)
+				fh.extentOpen.clipSize(newSize)
+			}
+			if fs.extentCache != nil {
+				fs.extentCache.invalidatePath(fs.remotePath(fh.Path))
+			}
+		}
+		if newSize != oldSize {
+			fh.extentNeedTruncate = true
+		}
 	}
 	return abortStreamer, nil
 }
@@ -3030,12 +3139,31 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 	stat, err := fs.client.StatCtx(ctx, fs.remotePath(fh.Path))
 	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
 	if err != nil {
+		if isNotFoundErr(err) && fh.isExtent() && fs.openHandles != nil && fs.openHandles.Has(fh.Ino, fh.Path) {
+			fh.IsNew = true
+			return gofuse.OK
+		}
 		return httpToFuseStatus(err)
 	}
 	fh.OrigSize = stat.Size
 	fh.BaseRev = stat.Revision
 	fh.StorageClass = stat.StorageType
+	fh.ContentLayout = stat.ContentLayout
+	fh.SliceGeneration = stat.SliceGeneration
+	if fh.isExtent() && fh.extentDirty == nil {
+		fh.extentDirty = &extentDirtySet{}
+	}
 	if stat.Size == 0 {
+		return gofuse.OK
+	}
+	if fh.isExtent() {
+		// Extent bytes live in slice objects, not the Dirty part map.
+		if err := fh.Dirty.SetSizeOnly(stat.Size); err != nil {
+			fh.Dirty.totalSize = stat.Size
+			fh.Dirty.remoteSize = stat.Size
+		} else {
+			fh.Dirty.remoteSize = stat.Size
+		}
 		return gofuse.OK
 	}
 
@@ -3085,6 +3213,16 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 
 		loadStart := time.Now()
 		fs.debugf("dirty load part start path=%s part=%d off=%d len=%d", filePath, partNum, offset, length)
+		if fh.isExtent() {
+			data, err := fs.readExtentRangeLocked(lpCtx, fh, offset, length)
+			fs.perfRecordRemote(perfRemoteRead, loadStart, err, uint64(len(data)))
+			if err != nil {
+				fs.debugDurationf(loadStart, 0, "dirty load part extent failed path=%s part=%d off=%d len=%d err=%v", filePath, partNum, offset, length, err)
+				return nil, err
+			}
+			fs.debugDurationf(loadStart, 0, "dirty load part extent done path=%s part=%d off=%d len=%d got=%d err=<nil>", filePath, partNum, offset, length, len(data))
+			return data, nil
+		}
 		rc, err := c.ReadStreamRange(lpCtx, remoteFilePath, offset, length)
 		if err != nil {
 			fs.perfRecordRemote(perfRemoteRead, loadStart, err, 0)
@@ -3107,6 +3245,9 @@ func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gof
 }
 
 func (fs *Dat9FS) preloadWritableHandleFromReadCacheLocked(fh *FileHandle) bool {
+	if fh != nil && fh.isExtent() {
+		return false
+	}
 	if fs.readCache == nil || fh == nil || fh.Dirty == nil {
 		return false
 	}
@@ -3234,17 +3375,39 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 		fs.adoptCommittedStorageClassLocked(fh, newSize)
 		curSize := fh.Dirty.Size()
 		if curSize != newSize {
-			if err := fh.Dirty.Truncate(newSize); err != nil {
+			if fh.isExtent() {
+				if err := fh.Dirty.SetSizeOnly(newSize); err != nil && newSize > curSize {
+					safeLogPrintf("path-truncate sync: extent size failed for %s: %v", fh.Path, err)
+					fh.Unlock()
+					continue
+				}
+				if newSize < curSize {
+					if err := fh.Dirty.Truncate(newSize); err != nil {
+						safeLogPrintf("path-truncate sync: dirty buffer truncate failed for %s: %v", fh.Path, err)
+						fh.Unlock()
+						continue
+					}
+					if fh.extentWriter != nil {
+						fh.extentWriter.clip(newSize)
+					}
+					if fh.extentDirty != nil {
+						fh.extentDirty.clip(newSize)
+					}
+				}
+				if fh.extentOpen != nil {
+					fh.extentOpen.clipSize(newSize)
+				}
+				fh.OrigSize = newSize
+			} else if err := fh.Dirty.Truncate(newSize); err != nil {
 				safeLogPrintf("path-truncate sync: dirty buffer truncate failed for %s: %v", fh.Path, err)
 				fh.Unlock()
 				continue
-			}
-			fh.Dirty.ResetSequentialState(newSize)
-			fh.ZeroBase = newSize == 0
-			// Reset OrigSize only when truncating to 0 or shrinking to
-			// prevent PatchFile on db9-backed files (see B5 rationale).
-			if newSize == 0 || newSize < fh.OrigSize {
-				fh.OrigSize = newSize
+			} else {
+				fh.Dirty.ResetSequentialState(newSize)
+				fh.ZeroBase = newSize == 0
+				if newSize == 0 || newSize < fh.OrigSize {
+					fh.OrigSize = newSize
+				}
 			}
 		}
 		fh.DirtySeq = fs.markDirtySize(ino, newSize)
@@ -3474,6 +3637,30 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 	}
 
 	apiPath := fs.remotePath(entry.Path)
+	probeExtent := fs.shouldUseExtentPath(entry.Path)
+	if !probeExtent {
+		if _, ok := fs.extentOpenSize(ino); ok {
+			probeExtent = true
+		}
+	}
+	if probeExtent {
+		if stat, err := fs.client.StatCtx(ctx, apiPath); err == nil && stat != nil && stat.ContentLayout == client.ContentLayoutExtent {
+			if st := fs.syncOpenExtentHandlesToSize(entry.Path, newSize); st != gofuse.OK {
+				return st
+			}
+			to := newSize
+			_, err := fs.client.CommitSlicesRetry(ctx, apiPath, stat.Revision, stat.SliceGeneration, nil, &to, false, true)
+			if err != nil {
+				return httpToFuseStatus(err)
+			}
+			fs.inodes.UpdateSize(ino, newSize)
+			if fs.extentCache != nil {
+				fs.extentCache.invalidatePath(apiPath)
+			}
+			fs.cacheFileForPath(entry.Path, newSize, time.Now(), stat.Revision+1)
+			return gofuse.OK
+		}
+	}
 	var data []byte
 	if newSize > 0 && newSize <= maxPathTruncateInMemoryBytes {
 		if entry.Size > 0 {
@@ -4247,7 +4434,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		}
 
 		src.Lock()
-		if src.Dirty == nil {
+		if src.Dirty == nil || src.isExtent() {
 			src.Unlock()
 			continue
 		}
@@ -4821,6 +5008,7 @@ func symlinkMode() uint32 {
 func (fs *Dat9FS) fillEntryOut(entry *InodeEntry, out *gofuse.EntryOut) {
 	out.NodeId = entry.Ino
 	out.Generation = 1
+	fs.applyLiveFileSize(entry)
 	fs.fillAttr(entry, &out.Attr)
 	entryTTL := fs.opts.EntryTTL
 	if isLockFilePath(entry.Path) {
@@ -4847,6 +5035,11 @@ func httpToFuseStatus(err error) gofuse.Status {
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return gofuse.Status(syscall.EAGAIN)
+	}
+
+	var ce *client.ExtentCommitError
+	if errors.As(err, &ce) {
+		return gofuse.EIO
 	}
 
 	// Prefer typed StatusError so we map by status code even when the
@@ -6846,6 +7039,7 @@ func (fs *Dat9FS) Init(server *gofuse.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), inlineThresholdWarmTimeout)
 	defer cancel()
 	fs.warmInlineThreshold(ctx)
+	fs.startExtentBackground()
 }
 
 // inlineThresholdWarmTimeout caps the synchronous status fetch on Init.
@@ -7247,6 +7441,9 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		}
 		fh.Lock()
 		fh.Unlinked = true
+		if fh.extentWriter != nil {
+			fh.extentWriter.markUnlinked()
+		}
 		if fh.Dirty != nil {
 			fh.UnlinkedSize = fh.Dirty.Size()
 			// Dirty ShadowSpill handles keep their authoritative data in the
@@ -7635,6 +7832,11 @@ func (fs *Dat9FS) openHandleEntry(p string) (*InodeEntry, bool) {
 			continue
 		}
 		size := fh.Dirty.Size()
+		if fh.extentOpen != nil {
+			if n := fh.extentOpen.logicalSize(); n > size {
+				size = n
+			}
+		}
 		fh.Unlock()
 		// This path reconstructs a dentry for an already-open writable file
 		// after the kernel dropped its lookup ref. Reuse the handle's inode
@@ -7867,8 +8069,15 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	}
 
 	fs.applyLayerFileMode(entry.Path, input.NodeId, entry)
+	fs.applyLiveFileSize(entry)
 	fs.fillAttr(entry, &out.Attr)
-	out.SetTimeout(fs.opts.AttrTTL)
+	// JuiceFS replyAttr: ModifiedSince → attr timeout 0 so the kernel
+	// does not cache a stale i_size across concurrent writers.
+	if fs.extentAttrUnstable(input.NodeId) {
+		out.SetTimeout(0)
+	} else {
+		out.SetTimeout(fs.opts.AttrTTL)
+	}
 	return gofuse.OK
 }
 
@@ -7917,7 +8126,39 @@ func hasPOSIXSearchAccess(caller gofuse.Owner, file gofuse.Owner, mode uint32, i
 	return hasPOSIXAccess(caller, file, mode, gofuse.X_OK, inSupplementaryGroup)
 }
 
-const setGIDPermissionBit uint32 = 0o2000
+const (
+	setGIDPermissionBit uint32 = 0o2000
+	setUIDPermissionBit uint32 = 0o4000
+	setIDPermissionBits        = setUIDPermissionBit | setGIDPermissionBit
+)
+
+// clearSetIDBitsAfterWriteLocked implements POSIX write(2) privilege stripping:
+// a successful write by a non-root process clears S_ISUID and S_ISGID on a
+// regular file. Caller must hold fh.mu. Root (uid 0) keeps the bits.
+func (fs *Dat9FS) clearSetIDBitsAfterWriteLocked(fh *FileHandle, callerUid uint32) {
+	if fs == nil || fh == nil || callerUid == 0 {
+		return
+	}
+	entry, ok := fs.inodes.GetEntry(fh.Ino)
+	if !ok || !entryIsRegularFile(entry) {
+		return
+	}
+	changed := false
+	newMode := uint32(0)
+	if entry.HasMode && entry.Mode&setIDPermissionBits != 0 {
+		newMode = entry.Mode &^ setIDPermissionBits
+		fs.inodes.UpdateMode(fh.Ino, newMode)
+		changed = true
+	}
+	if fh.HasPendingMode && fh.PendingMode&setIDPermissionBits != 0 {
+		newMode = fh.PendingMode &^ setIDPermissionBits
+		fs.setPendingModeLocked(fh, newMode, 0)
+		changed = true
+	}
+	if changed {
+		fs.setPendingMetadataMode(fh.Path, newMode)
+	}
+}
 
 func (fs *Dat9FS) entryOwner(entry *InodeEntry) gofuse.Owner {
 	owner := gofuse.Owner{Uid: fs.uid, Gid: fs.gid}
@@ -8394,15 +8635,44 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				var abortStreamer func()
 				fh.Lock()
 				fs.discardSupersededMutationLocked(fh)
+				extent := fh.isExtent()
+				path := fh.Path
+				// JuiceFS VFS.Truncate: Flush then Meta.Truncate while the
+				// handle is still locked. Clip-before-flush drops the current
+				// slice; deferred holes on a later fsync overlay later writes.
+				if extent && !fh.IsNew && fh.BaseRev > 0 {
+					if fh.extentOpen == nil || fh.extentWriter == nil {
+						fs.attachExtentWriter(fh)
+					}
+					if fh.extentWriter != nil && fh.extentWriter.bound() {
+						if _, st := fs.flushExtentHandle(ctx, fh); st != gofuse.OK {
+							fh.Unlock()
+							return st
+						}
+					}
+				}
 				var err error
 				abortStreamer, err = fs.truncateWritableHandleLocked(fh, newSize)
 				if err != nil {
 					fh.Unlock()
+					if errno, ok := err.(syscall.Errno); ok {
+						return gofuse.Status(errno)
+					}
 					return gofuse.Status(syscall.EFBIG)
+				}
+				if extent && !fh.IsNew && fh.BaseRev > 0 {
+					to := newSize
+					if st := fs.commitExtentHoleOpsLocked(ctx, fh, nil, &to); st != gofuse.OK {
+						fh.Unlock()
+						return st
+					}
 				}
 				fh.Unlock()
 				if abortStreamer != nil {
 					abortStreamer()
+				}
+				if extent {
+					_ = fs.clipOpenExtentHandlesToSize(path, newSize, false)
 				}
 			}
 		} else {
@@ -8571,7 +8841,12 @@ func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, na
 	defer cf()
 
 	writeStart := fs.perfStart()
-	err := fs.client.WriteCtxConditional(ctx, fs.remotePath(childP), nil, 0)
+	var err error
+	if layout := fs.extentLayoutForCreate(childP); layout == client.ContentLayoutExtent {
+		_, err = fs.client.CreateFileWithLayout(ctx, fs.remotePath(childP), string(layout))
+	} else {
+		err = fs.client.WriteCtxConditional(ctx, fs.remotePath(childP), nil, 0)
+	}
 	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
 	if err != nil {
 		return httpToFuseStatus(err)
@@ -9028,7 +9303,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.cacheNegativePath(childP)
 		return gofuse.OK
 	}
-	ctx, cf := fuseCtx(cancel)
+	ctx, cf := fuseCtxWithTimeout(cancel, unlinkFuseTimeout(childP))
 	defer cf()
 	if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
 		if st != gofuse.OK {
@@ -9149,7 +9424,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// The mark pass returns the exact handle set it marked, so a failed
 	// remote DELETE can roll precisely those handles back (the entry still
 	// exists remotely in that case).
-	markCtx, markCf := fuseCtx(cancel)
+	markCtx, markCf := fuseCtxWithTimeout(cancel, unlinkFuseTimeout(childP))
 	if fs.gvisorCompatibilityEnabled() {
 		markCf()
 		markCtx, markCf = fs.namespaceMutationCommitContext(ctx)
@@ -9162,7 +9437,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}
 	preserveOpen = markedAny
 
-	if fs.writeBack != nil && fs.uploader != nil {
+	if fs.shouldUseExtentPath(childP) {
+		// JuiceFS Unlink is name/nlink only; do not wait for slice PUT.
+	} else if fs.writeBack != nil && fs.uploader != nil {
 		// Wait for any in-flight upload to finish so it doesn't "revive"
 		// the file on the server after we delete it.
 		waitStart := time.Now()
@@ -9180,7 +9457,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// Wait for any in-flight commitQueue upload so the background commit
 	// cannot resurrect the deleted file. The destructive CancelPath is
 	// deferred to the commit point (see writeBack note above).
-	if fs.commitQueue != nil {
+	if fs.shouldUseExtentPath(childP) {
+		// Extent slice commits are inode-scoped; name unlink does not wait.
+	} else if fs.commitQueue != nil {
 		waitStart := time.Now()
 		fs.debugf("unlink wait commit start path=%s", childP)
 		fs.commitQueue.WaitPath(childP)
@@ -9240,7 +9519,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if !pendingNew {
 		// File existed on server (or unknown) — issue remote DELETE.
 		// Tolerate 404 in case it was already deleted.
-		deleteCtx, deleteCancel := fuseCtx(cancel)
+		deleteCtx, deleteCancel := fuseCtxWithTimeout(cancel, unlinkFuseTimeout(childP))
 		if fs.gvisorCompatibilityEnabled() {
 			deleteCancel()
 			deleteCtx, deleteCancel = fs.namespaceMutationCommitContext(ctx)
@@ -9917,6 +10196,10 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 		fs.touchDirectoryChangeTime(newParent, touchTime)
 	}
 	fs.retargetOpenHandlesForRename(oldP, newP)
+	if fs.extentCache != nil {
+		fs.extentCache.invalidatePath(fs.remotePath(oldP))
+		fs.extentCache.invalidatePath(fs.remotePath(newP))
+	}
 	fs.notifyRenameTarget(input.Newdir, path.Base(newP), newP)
 }
 
@@ -11089,20 +11372,22 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	wb.sequential = true
 	wb.uploadedParts = make(map[int]bool)
 	fh := &FileHandle{
-		Ino:         ino,
-		Path:        childP,
-		Flags:       input.Flags,
-		OpenPID:     input.Pid,
-		Dirty:       wb,
-		IsNew:       true,
-		ShadowReady: false,
-		WritePolicy: fs.writePolicyForOpen(input.Flags),
+		Ino:           ino,
+		Path:          childP,
+		Flags:         input.Flags,
+		OpenPID:       input.Pid,
+		Dirty:         wb,
+		IsNew:         true,
+		ShadowReady:   false,
+		WritePolicy:   fs.writePolicyForOpen(input.Flags),
+		ContentLayout: fs.extentLayoutForCreate(childP),
+		extentDirty:   &extentDirtySet{},
 	}
 	if hasRemoteMode {
 		fs.setPendingModeLocked(fh, mode, 0)
 	}
 
-	if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
+	if fh.WritePolicy != WritePolicyWriteSync && !fh.isExtent() && fs.shadowStore != nil && fs.pendingIndex != nil {
 		if err := fs.shadowStore.Ensure(childP, 0, 0); err != nil {
 			safeLogPrintf("shadow ensure failed for create %s: %v", childP, err)
 		} else {
@@ -11118,7 +11403,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		wb.OnPartFull = func(partIdx int, data []byte) {
 			wb.EvictPart(partIdx)
 		}
-	} else if fh.WritePolicy != WritePolicyWriteSync && !fs.layerEnabled() && !fs.appendLogNewPathActive(childP) {
+	} else if fh.WritePolicy != WritePolicyWriteSync && !fs.layerEnabled() && !fh.isExtent() && !fs.appendLogNewPathActive(childP) {
 		// Normal mode: attach streaming uploader for sequential write streaming.
 		fh.Streamer = NewStreamUploader(fs.client, childP, expectedRevisionForHandle(fh), fs.remoteRoot())
 		streamer := fh.Streamer
@@ -11161,6 +11446,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		Flags:       input.Flags,
 		OpenPID:     input.Pid,
 		WritePolicy: fs.writePolicyForOpen(input.Flags),
+		extentDirty: &extentDirtySet{},
 	}
 	entry, _ := fs.inodes.GetEntry(input.NodeId)
 	if entry != nil {
@@ -11223,11 +11509,12 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		return gofuse.OK
 	}
 
+	var unlockRemoteCommit func()
 	if accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR {
 		if fs.opts.ReadOnly {
 			return gofuse.EROFS
 		}
-		unlockRemoteCommit := fs.lockWritableRemoteCommitPathForWritableOpen(p)
+		unlockRemoteCommit = fs.lockWritableRemoteCommitPathForWritableOpen(p)
 		defer func() {
 			if unlockRemoteCommit != nil {
 				unlockRemoteCommit()
@@ -11238,6 +11525,8 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.BaseRev = refreshedEntry.Revision
 			entry = refreshedEntry
 		}
+		fs.seedHandleLayoutFromStat(ctx, fh)
+		fs.adoptOpenExtentState(fh)
 
 		fh.Dirty = fs.newWriteBuffer(p, maxPreloadSize, 0)
 
@@ -11276,6 +11565,11 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				if err == nil && stat != nil {
 					fh.BaseRev = stat.Revision
 					fh.StorageClass = stat.StorageType
+					fh.ContentLayout = stat.ContentLayout
+					fh.SliceGeneration = stat.SliceGeneration
+					if fh.isExtent() && fh.extentDirty == nil {
+						fh.extentDirty = &extentDirtySet{}
+					}
 					fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
 				}
 			}
@@ -11318,7 +11612,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			// invalidated before Open returns to the kernel.
 			fs.invalidateInodeKernelCaches(input.NodeId)
 			fs.armKernelCacheBypass(input.NodeId, p, fh.BaseRev, 0, "open-truncate")
-			if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
+			if fh.WritePolicy != WritePolicyWriteSync && !fh.isExtent() && fs.shadowStore != nil && fs.pendingIndex != nil {
 				if err := fs.shadowStore.WriteFull(p, nil, fh.BaseRev); err != nil {
 					safeLogPrintf("shadow reset failed for truncate-open %s: %v", p, err)
 				} else {
@@ -11337,7 +11631,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				wb.OnPartFull = func(partIdx int, data []byte) {
 					wb.EvictPart(partIdx)
 				}
-			} else if fh.WritePolicy != WritePolicyWriteSync && !fs.layerEnabled() && !fs.appendLogPathConfigured(p) {
+			} else if fh.WritePolicy != WritePolicyWriteSync && !fs.layerEnabled() && !fh.isExtent() && !fs.appendLogPathConfigured(p) {
 				// Normal mode: attach streaming uploader with OnPartFull wiring.
 				fh.Streamer = NewStreamUploader(fs.client, p, expectedRevisionForHandle(fh), fs.remoteRoot())
 				streamer := fh.Streamer
@@ -11355,7 +11649,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	// Set up read prefetcher for read-only opens on large files.
 	if fh.Dirty == nil {
 		entry, _ := fs.inodes.GetEntry(input.NodeId)
-		if entry != nil && entry.Size > fs.readCache.MaxFileSize() {
+		if entry != nil && entry.Size > fs.readCache.MaxFileSize() && !fh.isExtent() && !fs.shouldUseExtentPath(p) {
 			fh.Prefetch = NewPrefetcher(fs.client, fs.remotePath(p), entry.Size, fs.debugEnabled())
 			fh.Prefetch.SetParallelRead(fs.parallelReadConcurrency(), fs.parallelReadBlockSize())
 			fh.Prefetch.SetPerfCounters(fs.perf)
@@ -11381,7 +11675,21 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		}
 	}
 
+	fs.seedHandleLayoutFromStat(ctx, fh)
+	fs.adoptOpenExtentState(fh)
 	out.Fh = fs.allocateFileHandle(fh)
+	if input.Flags&syscall.O_TRUNC != 0 && fh.isExtent() {
+		if unlockRemoteCommit != nil {
+			unlockRemoteCommit()
+			unlockRemoteCommit = nil
+		}
+		if st := fs.clipOpenExtentHandlesToSize(p, 0, false); st != gofuse.OK {
+			return st
+		}
+		if fs.extentCache != nil {
+			fs.extentCache.invalidatePath(fs.remotePath(p))
+		}
+	}
 	out.OpenFlags = fs.openFlagsForHandle(fh)
 	fs.debugf("open path=%s fh=%d ino=%d flags=0x%x open_flags=%d dirty=%t prefetch=%t orig_size=%d base_rev=%d shadow_ready=%t shadow_spill=%t write_policy=%s", p, out.Fh, fh.Ino, input.Flags, out.OpenFlags, fh.Dirty != nil, fh.Prefetch != nil, fh.OrigSize, fh.BaseRev, fh.ShadowReady, fh.ShadowSpill, fh.WritePolicy)
 	return gofuse.OK
@@ -11553,7 +11861,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// However, if the handle has evicted (streaming-uploaded) parts, we cannot
 	// serve reads from those ranges — the data is on S3 but not in memory.
 	// For such ranges we fall through to the server read path.
-	if fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
+	if fh.isExtent() {
+		fh.Unlock()
+	} else if fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
 		handlePath := fh.Path
 		baseRev := fh.BaseRev
 		cleanEmptyEOF := fh.Dirty.Size() == 0 && (fh.IsNew || fh.BaseRev == 0 || fh.OrigSize == 0)
@@ -11576,7 +11886,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// serve their preloaded WAL/journal bytes from the writable buffer:
 		// the shared -shm can point readers at a newer fsync-committed sidecar
 		// extent, and a stale clean buffer would produce short reads.
-	} else if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
+	} else if !fh.isExtent() && fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
 		offset := int64(input.Offset)
 		size := fh.Dirty.Size()
 		if offset >= size {
@@ -11906,7 +12216,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 
 	p := fh.Path
 	mountViewGeneration := fs.mountViewGeneration.Load()
-	bypassStableCaches := fs.bypassStableRemoteReadCaches(p)
+	bypassStableCaches := fs.bypassStableRemoteReadCaches(p) || fh.isExtent()
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
 	revalidatedForRead := false
 	if entry != nil && !fs.statCacheVerified() {
@@ -12070,78 +12380,95 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 
 	rangeOffset := int64(input.Offset)
 	requestedRangeSize := int64(input.Size)
-	rangeSize, eof := diskReadCacheReadSize(entry, rangeOffset, requestedRangeSize)
-	if eof {
-		source = "disk-read-cache-eof"
-		bytesRead = 0
-		return fs.mountViewReadResult(mountViewGeneration, nil)
-	}
-	if key, ok := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize); ok {
-		if data, ok := fs.diskReadCache.Get(key); ok {
-			if !fs.statCacheTrustedAndVerified() && !revalidatedForRead {
-				refreshed, err := fs.revalidateReadCacheEntryIfUntrusted(cancel, p, entry)
-				if err != nil {
-					source = "read-cache-revalidate-error"
-					return nil, listDirErrToFuseStatus(err)
+	if !bypassStableCaches {
+		rangeSize, eof := diskReadCacheReadSize(entry, rangeOffset, requestedRangeSize)
+		if eof {
+			source = "disk-read-cache-eof"
+			bytesRead = 0
+			return fs.mountViewReadResult(mountViewGeneration, nil)
+		}
+		if key, ok := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize); ok {
+			if data, ok := fs.diskReadCache.Get(key); ok {
+				if !fs.statCacheTrustedAndVerified() && !revalidatedForRead {
+					refreshed, err := fs.revalidateReadCacheEntryIfUntrusted(cancel, p, entry)
+					if err != nil {
+						source = "read-cache-revalidate-error"
+						return nil, listDirErrToFuseStatus(err)
+					}
+					entry = refreshed
+					refreshedRangeSize, refreshedEOF := diskReadCacheReadSize(entry, rangeOffset, requestedRangeSize)
+					if refreshedEOF {
+						source = "disk-read-cache-eof"
+						bytesRead = 0
+						return fs.mountViewReadResult(mountViewGeneration, nil)
+					}
+					rangeSize = refreshedRangeSize
+					refreshedKey, refreshedOK := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize)
+					if !refreshedOK {
+						ok = false
+					} else if refreshedKey != key {
+						key = refreshedKey
+						data, ok = fs.diskReadCache.Get(key)
+					}
+					if !ok {
+						goto diskReadCacheMiss
+					}
 				}
-				entry = refreshed
-				refreshedRangeSize, refreshedEOF := diskReadCacheReadSize(entry, rangeOffset, requestedRangeSize)
-				if refreshedEOF {
-					source = "disk-read-cache-eof"
-					bytesRead = 0
-					return fs.mountViewReadResult(mountViewGeneration, nil)
+				if fs.perf != nil {
+					fs.perf.readCacheHit.add(1)
 				}
-				rangeSize = refreshedRangeSize
-				refreshedKey, refreshedOK := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize)
-				if !refreshedOK {
-					ok = false
-				} else if refreshedKey != key {
-					key = refreshedKey
-					data, ok = fs.diskReadCache.Get(key)
+				source = "disk-read-cache-hit"
+				bytesRead = len(data)
+				if fh.Prefetch != nil && !bypassStableCaches {
+					fh.Prefetch.OnRead(rangeOffset, len(data))
 				}
-				if !ok {
-					goto diskReadCacheMiss
-				}
+				return fs.mountViewReadResult(mountViewGeneration, data)
 			}
+		diskReadCacheMiss:
 			if fs.perf != nil {
-				fs.perf.readCacheHit.add(1)
+				fs.perf.readCacheMiss.add(1)
 			}
-			source = "disk-read-cache-hit"
-			bytesRead = len(data)
+			rangeStart := time.Now()
+			var data []byte
+			var n int
+			var err error
+			if rangeSize > fs.parallelReadBlockSize() && fs.parallelReadConcurrency() > 1 {
+				source = "disk-read-cache-parallel-miss"
+				data, n, err = fs.readDiskCachedBlocks(ctx, p, fh, entry, rangeOffset, rangeSize, mountViewGeneration)
+			} else {
+				source = "disk-read-cache-miss"
+				data, n, err = fs.readDiskCachedRangeForGeneration(ctx, p, fh, key, mountViewGeneration)
+			}
+			if err != nil {
+				fs.debugf("read disk-cache range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
+				if errors.Is(err, errReadRetriesExhausted) {
+					return nil, gofuse.EIO
+				}
+				return nil, listDirErrToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
+			}
+			if fs.debugEnabled() && time.Since(rangeStart) >= fuseDebugSlowReadThreshold {
+				fs.debugf("read disk-cache range done path=%s off=%d req=%d got=%d source=%s dur=%s", p, input.Offset, input.Size, n, source, time.Since(rangeStart))
+			}
+			bytesRead = n
 			if fh.Prefetch != nil && !bypassStableCaches {
-				fh.Prefetch.OnRead(rangeOffset, len(data))
+				fh.Prefetch.OnRead(rangeOffset, n)
 			}
 			return fs.mountViewReadResult(mountViewGeneration, data)
 		}
-	diskReadCacheMiss:
-		if fs.perf != nil {
-			fs.perf.readCacheMiss.add(1)
-		}
+	}
+
+	if fh.isExtent() {
+		source = "extent-s3"
 		rangeStart := time.Now()
-		var data []byte
-		var n int
-		var err error
-		if rangeSize > fs.parallelReadBlockSize() && fs.parallelReadConcurrency() > 1 {
-			source = "disk-read-cache-parallel-miss"
-			data, n, err = fs.readDiskCachedBlocks(ctx, p, fh, entry, rangeOffset, rangeSize, mountViewGeneration)
-		} else {
-			source = "disk-read-cache-miss"
-			data, n, err = fs.readDiskCachedRangeForGeneration(ctx, p, fh, key, mountViewGeneration)
+		data, err := fs.readExtentRange(ctx, fh, int64(input.Offset), int64(input.Size))
+		for i := 0; i < 8 && err != nil && (errors.Is(err, syscall.EAGAIN) || errors.Is(err, context.DeadlineExceeded)); i++ {
+			data, err = fs.readExtentRange(ctx, fh, int64(input.Offset), int64(input.Size))
 		}
 		if err != nil {
-			fs.debugf("read disk-cache range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
-			if errors.Is(err, errReadRetriesExhausted) {
-				return nil, gofuse.EIO
-			}
-			return nil, listDirErrToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
+			fs.debugf("read extent error path=%s off=%d req=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, source, time.Since(rangeStart), err)
+			return nil, httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
 		}
-		if fs.debugEnabled() && time.Since(rangeStart) >= fuseDebugSlowReadThreshold {
-			fs.debugf("read disk-cache range done path=%s off=%d req=%d got=%d source=%s dur=%s", p, input.Offset, input.Size, n, source, time.Since(rangeStart))
-		}
-		bytesRead = n
-		if fh.Prefetch != nil && !bypassStableCaches {
-			fh.Prefetch.OnRead(rangeOffset, n)
-		}
+		bytesRead = len(data)
 		return fs.mountViewReadResult(mountViewGeneration, data)
 	}
 
@@ -12250,6 +12577,9 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			fs.inodes.UpdateSize(fh.Ino, info.Size())
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
+		if written > 0 {
+			fs.clearSetIDBitsAfterWriteLocked(fh, input.Uid)
+		}
 		source = "local-file"
 		return written, gofuse.OK
 	}
@@ -12281,12 +12611,21 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 				return 0, st
 			}
 		}
+		if written > 0 {
+			fs.clearSetIDBitsAfterWriteLocked(fh, input.Uid)
+		}
 		source = "git-local-file"
 		return written, gofuse.OK
 	}
 
-	unlockRemoteCommit := fs.lockHandleRemoteCommitPathLocked(fh)
-	defer unlockRemoteCommit()
+	// JuiceFS VFS.Write has no per-path commit lock. Extent commits are
+	// append+commitMu; holding the path lock while writeAt waits
+	// flushwaiting deadlocks Fsync/Read flush on the same file
+	// (wal-multiwrite concurrent UPDATE after VACUUM).
+	if !fh.isExtent() {
+		unlockRemoteCommit := fs.lockHandleRemoteCommitPathLocked(fh)
+		defer unlockRemoteCommit()
+	}
 	fs.discardSupersededMutationLocked(fh)
 	fs.adoptCommittedRevisionLocked(fh)
 
@@ -12305,6 +12644,16 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	writeOffset := int64(input.Offset)
 	if fh.Flags&uint32(syscall.O_APPEND) != 0 {
 		writeOffset = fh.Dirty.Size()
+		if fh.OrigSize > writeOffset {
+			writeOffset = fh.OrigSize
+		}
+		if fh.extentOpen != nil {
+			fh.extentOpen.mu.Lock()
+			if fh.extentOpen.size > writeOffset {
+				writeOffset = fh.extentOpen.size
+			}
+			fh.extentOpen.mu.Unlock()
+		}
 	}
 
 	// ShadowSpill: write shadow FIRST, before Dirty. If shadow fails, return
@@ -12334,15 +12683,84 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 
 	preWriteSize := fh.Dirty.Size()
-	fs.appendLogCaptureSQLiteWALPreWriteLocked(fh, writeOffset, int64(len(data)))
-	n, err := fh.Dirty.Write(writeOffset, data)
-	if err != nil {
-		source = "dirty-write-error"
-		return 0, gofuse.Status(syscall.EFBIG)
+	if !fh.isExtent() {
+		fs.appendLogCaptureSQLiteWALPreWriteLocked(fh, writeOffset, int64(len(data)))
 	}
-	fh.appendLogRecordUserWrite(preWriteSize, writeOffset, int64(n))
-	if fs.appendLogPathConfigured(fh.Path) && !fh.IsNew && n > 0 && writeOffset != preWriteSize {
-		fs.debugf("append-log trace event=non_tail_write path=%q base_rev=%d base_size=%d pre_size=%d offset=%d written=%d dirty_seq=%d", fh.Path, fh.BaseRev, fh.OrigSize, preWriteSize, writeOffset, n, fh.DirtySeq)
+	var n uint32
+	if fh.isExtent() {
+		if fh.extentOpen == nil || fh.extentWriter == nil {
+			fs.attachExtentWriter(fh)
+		}
+		if fh.extentDirty == nil {
+			fh.extentDirty = &extentDirtySet{}
+		}
+		if fh.extentWriter == nil {
+			fs.attachExtentWriter(fh)
+		}
+		now := time.Now()
+		if fh.extentStarted.IsZero() {
+			fh.extentStarted = now
+		}
+		fh.extentLastMod = now
+		capn := fs.extentWriteBufferCap()
+		if st := fs.waitExtentWriteBudget(ctx, fh, capn); st != gofuse.OK {
+			source = "extent-write-budget"
+			return 0, st
+		}
+		frozeFull := fh.extentWriter.writeAt(writeOffset, data)
+		if st := fh.extentWriter.status(); st != gofuse.OK {
+			source = "extent-writer-err"
+			return 0, st
+		}
+		newSize := writeOffset + int64(len(data))
+		if err := fh.Dirty.SetSizeOnly(newSize); err != nil {
+			source = "dirty-write-error"
+			return 0, gofuse.Status(syscall.EFBIG)
+		}
+		if fh.extentOpen != nil {
+			fh.extentOpen.setSize(newSize)
+		}
+		n = uint32(len(data))
+		fh.extentDirty.add(writeOffset, writeOffset+int64(n))
+		if fs.extentCache != nil {
+			// JuiceFS VFS.Write: reader.Invalidate after a successful write.
+			fs.extentCache.invalidatePath(fs.remotePath(fh.Path))
+		}
+		if frozeFull || fh.extentWriter.sliceCount() > extentFlushMaxRuns || fs.extentTotalDirtyBytes() > capn {
+			if !frozeFull {
+				fh.extentWriter.freezeAll()
+			}
+			// JuiceFS: full-slice freeze starts go flushData(); Write does
+			// not PUT+commit on the FUSE thread. Unbound tests still sync.
+			if !fh.extentWriter.bound() {
+				var st gofuse.Status
+				for attempt := 0; attempt < 4; attempt++ {
+					flushCtx, flushCF := fs.extentFlushContext(fh)
+					st = fs.flushExtentFrozenLocked(flushCtx, fh)
+					flushCF()
+					if st == gofuse.OK || (st != gofuse.Status(syscall.EAGAIN) && st != gofuse.EINTR) {
+						break
+					}
+				}
+				if st != gofuse.OK {
+					source = "extent-buffer-flush"
+					return 0, st
+				}
+			}
+		}
+	} else {
+		var err error
+		n, err = fh.Dirty.Write(writeOffset, data)
+		if err != nil {
+			source = "dirty-write-error"
+			return 0, gofuse.Status(syscall.EFBIG)
+		}
+	}
+	if !fh.isExtent() {
+		fh.appendLogRecordUserWrite(preWriteSize, writeOffset, int64(n))
+		if fs.appendLogPathConfigured(fh.Path) && !fh.IsNew && n > 0 && writeOffset != preWriteSize {
+			fs.debugf("append-log trace event=non_tail_write path=%q base_rev=%d base_size=%d pre_size=%d offset=%d written=%d dirty_seq=%d", fh.Path, fh.BaseRev, fh.OrigSize, preWriteSize, writeOffset, n, fh.DirtySeq)
+		}
 	}
 	written = n
 
@@ -12379,10 +12797,19 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
+	if fh.isExtent() {
+		// JuiceFS VFS.Write: reader.Invalidate / InvalidateChunk.
+		if fh.extentOpen != nil {
+			fh.extentOpen.invalidateSlices()
+		}
+		if fs.extentCache != nil {
+			fs.extentCache.invalidatePath(fs.remotePath(fh.Path))
+		}
+	}
 	if fh.Flags&syscall.O_TRUNC != 0 {
 		fs.armKernelCacheBypass(fh.Ino, fh.Path, fh.BaseRev, fh.Dirty.Size(), "truncate-write")
 	}
-	if fh.WritePolicy == WritePolicyWriteSync {
+	if fh.WritePolicy == WritePolicyWriteSync && !fh.isExtent() {
 		writeDirtySeq := fh.DirtySeq
 		size := fh.Dirty.Size()
 		writeCtx, writeCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
@@ -12409,6 +12836,9 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			}
 			return 0, st
 		}
+	}
+	if n > 0 {
+		fs.clearSetIDBitsAfterWriteLocked(fh, input.Uid)
 	}
 	return n, gofuse.OK
 }
@@ -12466,6 +12896,9 @@ func (fs *Dat9FS) restoreDirtySize(ino, seq uint64, size int64) {
 func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
 	if fh == nil || fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
 		return gofuse.OK
+	}
+	if fh.isExtent() {
+		return fs.flushHandle(ctx, fh)
 	}
 	if fh.Unlinked {
 		// Write-after-unlink on a write-sync handle: POSIX requires the write
@@ -12705,6 +13138,9 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 	if fh == nil || fh.Dirty == nil {
 		return gofuse.OK
 	}
+	if fh.isExtent() {
+		return fs.flushHandle(ctx, fh)
+	}
 	if fh.Unlinked {
 		// Path was removed while open; never re-upload discarded content.
 		fs.discardUnlinkedHandleStateLocked(fh)
@@ -12902,13 +13338,13 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFlush, perfStart, status, 0) }()
-	if lockOwner := fuseLockOwner(input.LockOwner, input.Pid, input.Fh); lockOwner != 0 {
-		fs.locks.release(input.NodeId, lockOwner)
-	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.OK
 	}
+	// JuiceFS VFS.Flush: writer.Flush then Setlk(UNLCK) iff h.locks&2.
+	// Defer so posix locks stay until in-flight uploads finish.
+	defer fs.releasePosixLocksOnFlush(input.NodeId, fh, input.LockOwner)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, fh.Path)
@@ -12994,6 +13430,13 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		syncCtx, syncCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 		defer syncCancel()
 		return fs.syncHandleToRemoteLocked(syncCtx, fh)
+	}
+
+	if fh.isExtent() {
+		phase = "extent"
+		flushCtx, flushCancel := fs.extentFlushWaitContext(fh)
+		defer flushCancel()
+		return fs.flushHandle(flushCtx, fh)
 	}
 
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() &&
@@ -13436,6 +13879,13 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		return status
 	}
 
+	if fh.isExtent() {
+		phase = "extent"
+		flushCtx, flushCancel := fs.extentFlushWaitContext(fh)
+		defer flushCancel()
+		return fs.flushHandle(flushCtx, fh)
+	}
+
 	// Interactive mode: Fsync = local durable only. Shadow file + journal
 	// ensure crash safety. Remote commit happens asynchronously.
 	requiresRemoteSync := isSQLitePersistentJournalPath(fh.Path)
@@ -13769,11 +14219,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	perfStart := fs.perfStart()
 	releaseStatus := gofuse.OK
 	defer func() { fs.perfRecordFuse(perfFuseRelease, perfStart, releaseStatus, 0) }()
-	if lockOwner := fuseLockOwner(input.LockOwner, input.Pid, input.Fh); lockOwner != 0 {
-		fs.locks.release(input.NodeId, lockOwner)
-	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
+		// JuiceFS VFS.Release: writer.Flush then Flock/Setlk UNLCK.
+		defer fs.releasePosixLocksOnRelease(input.NodeId, fh)
+		defer fs.releaseFlockOnRelease(input.NodeId, fh, input.Fh)
 		ctx, cf := fuseCtx(cancel)
 		defer cf()
 		fs.observePathPolicyWithContext(ctx, fh.Path)
@@ -14018,19 +14468,24 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		// close-sync is primarily enforced in Flush so close(2) can receive
 		// remote upload errors. Keep Release as a best-effort fallback for
 		// unusual flows where dirty staged state reaches Release directly.
-		if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync {
+		if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync || fh.isExtent() {
 			phase = "release-write-policy-sync"
 			lockStart := time.Now()
 			fh.Lock()
 			if lockWait := time.Since(lockStart); fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 				fs.debugf("release lock wait path=%s fh=%d ino=%d phase=%s wait=%s", fh.Path, input.Fh, fh.Ino, phase, lockWait)
 			}
-			if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
+			extentDirty := fh.isExtent() && fh.extentWriter != nil && !fh.extentWriter.empty()
+			if fh.Dirty != nil && (fh.Dirty.HasDirtyParts() || extentDirty) {
 				size := fh.Dirty.Size()
 				flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 				flushStart := time.Now()
 				fs.debugf("release write policy sync start path=%s size=%d policy=%s timeout=%s", fh.Path, size, fh.WritePolicy, releaseTimeout(size))
-				flushStatus = fs.syncHandleToRemoteLocked(flushCtx, fh)
+				if fh.isExtent() {
+					flushStatus = fs.flushHandle(flushCtx, fh)
+				} else {
+					flushStatus = fs.syncHandleToRemoteLocked(flushCtx, fh)
+				}
 				fs.debugDurationf(flushStart, 0, "release write policy sync done path=%s size=%d status=%d", fh.Path, size, flushStatus)
 				flushCancel()
 			}
@@ -14345,7 +14800,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 // When force is false and the file is small, the upload may be deferred.
 // Caller must hold fh.mu.
 func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, force bool) gofuse.Status {
-	if fs.layerEnabled() {
+	if fs.layerEnabled() || fh.isExtent() {
 		return fs.flushHandle(ctx, fh)
 	}
 	if force || fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
@@ -14614,6 +15069,12 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	if fs.clearStaleSQLitePersistentJournalEmptyCreateLocked(fh) {
 		phase = "stale-sqlite-sidecar-empty-create"
 		return gofuse.OK
+	}
+	if fh.isExtent() {
+		if handled, st := fs.flushExtentHandle(ctx, fh); handled {
+			phase = "extent"
+			return st
+		}
 	}
 	if !fh.Dirty.HasDirtyParts() {
 		phase = "no-dirty-parts"
@@ -15373,6 +15834,8 @@ func (fs *Dat9FS) FlushAll() {
 	if fs.commitQueue != nil {
 		fs.commitQueue.DrainAll()
 	}
+
+	fs.stopExtentBackground()
 
 	if fs.diskReadCache != nil {
 		fs.diskReadCache.Close()

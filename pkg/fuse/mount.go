@@ -54,6 +54,7 @@ type MountOptions struct {
 	SyncMode                SyncMode      // interactive, strict, or auto (default auto)
 	WritePolicy             WritePolicy   // writeback, close-sync, or write-sync (default writeback)
 	Profile                 string        // mount profile: "interactive", "coding-agent", "none", or a custom profile name
+	ExtentPaths             []string      // extra path patterns created as content_layout=extent
 	LayerRef                string        // optional writable fs layer ref (layer_id, name, or tag ref)
 	CheckpointRef           string        // optional checkpoint ref to restore as the layer view baseline
 	LocalRoot               string        // local-only overlay root for overlay-profile mounts
@@ -506,6 +507,12 @@ func Mount(opts *MountOptions) (err error) {
 				// and base revision so CommitQueue.RecoverPending can re-enqueue.
 				if err := replayJournalIntoPending(journal, pendingIdx); err != nil {
 					fmt.Fprintf(os.Stderr, "drive9: journal replay: %v\n", err)
+				}
+				if err := dat9fs.replayExtentStaging(context.Background()); err != nil {
+					fmt.Fprintf(os.Stderr, "drive9: extent staging replay: %v\n", err)
+				}
+				if err := dat9fs.replayExtentJournal(context.Background()); err != nil {
+					fmt.Fprintf(os.Stderr, "drive9: extent journal replay: %v\n", err)
 				}
 				// Drop frames already covered by commit markers so the WAL does
 				// not grow unboundedly across mounts. Safe here: mount init is
@@ -1513,10 +1520,10 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 	fuseOpts := &gofuse.MountOptions{
 		FsName:             "drive9",
 		Name:               "drive9",
-		MaxReadAhead:       8 * 1024 * 1024, // 8MB — larger readahead reduces FUSE kernel↔userspace switches
-		MaxWrite:           128 * 1024,      // 128KB per write request (default 64KB)
-		MaxBackground:      32,              // concurrent background FUSE requests (default 12)
-		SyncRead:           opts.SyncRead,   // disables FUSE_CAP_ASYNC_READ; one read in flight per file handle
+		MaxReadAhead:       1 << 20,       // JuiceFS pkg/fuse/fuse.go MaxReadAhead
+		MaxWrite:           128 * 1024,    // JuiceFS --max-fuse-io default
+		MaxBackground:      50,            // JuiceFS pkg/fuse/fuse.go Serve MaxBackground
+		SyncRead:           opts.SyncRead, // disables FUSE_CAP_ASYNC_READ; one read in flight per file handle
 		DirectMountStrict:  opts.DirectMountStrict,
 		EnableLocks:        true,
 		Debug:              opts.Debug,
@@ -1524,7 +1531,6 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 		EnableDirectIoMmap: true, // allow mmap on FOPEN_DIRECT_IO handles (e.g. SQLite *.db with mmap_size>0); no-op on kernels without CAP_DIRECT_IO_ALLOW_MMAP
 	}
 	if runtime.GOOS == "linux" {
-		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
 		if opts.AllowOther {
 			fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
 		}

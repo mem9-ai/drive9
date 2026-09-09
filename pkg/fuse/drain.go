@@ -347,6 +347,18 @@ func drainHandleHasDirtyStateLocked(fh *FileHandle) bool {
 	if fh == nil {
 		return false
 	}
+	if fh.isExtent() {
+		if fh.extentWriter != nil && !fh.extentWriter.empty() {
+			return true
+		}
+		if fh.extentDirty != nil && !fh.extentDirty.empty() {
+			return true
+		}
+		if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
+			return true
+		}
+		return fh.ShadowCommitReady || fh.HasPendingMode
+	}
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
 		return true
 	}

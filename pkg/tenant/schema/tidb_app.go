@@ -106,9 +106,13 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			content_blob               LONGBLOB,
 			content_type               VARCHAR(255),
 			checksum_sha256            VARCHAR(128),
-			source_id                  VARCHAR(255)
+			source_id                  VARCHAR(255),
+			content_layout             VARCHAR(32) NOT NULL DEFAULT 'single',
+			slice_generation           BIGINT NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX idx_contents_storage_ref_hash ON contents(storage_ref_hash)`,
+		`ALTER TABLE contents ADD COLUMN content_layout VARCHAR(32) NOT NULL DEFAULT 'single'`,
+		`ALTER TABLE contents ADD COLUMN slice_generation BIGINT NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS semantic (
 			inode_id                           VARCHAR(64) PRIMARY KEY,
 			content_text                       LONGTEXT,
@@ -221,6 +225,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 	stmts = append(stmts, FSLayerTiDBSchemaStatements()...)
 	stmts = append(stmts, JournalTiDBSchemaStatements()...)
 	stmts = append(stmts, VaultTiDBSchemaStatements()...)
+	stmts = append(stmts, ExtentTiDBSchemaStatements()...)
 	return stmts
 }
 

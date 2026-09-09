@@ -177,6 +177,26 @@ func TestAppendLogPolicyDoesNotChangeLocalPolicyClassification(t *testing.T) {
 	}
 }
 
+func TestSQLiteRollbackJournalPathMatching(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "/repo/workload.db-journal", want: true},
+		{path: "/repo/workload.sqlite-journal", want: true},
+		{path: "/repo/workload-journal", want: true},
+		{path: "/repo/workload.db-wal", want: false},
+		{path: "/repo/workload.db-shm", want: false},
+		{path: "/repo/-journal", want: false},
+		{path: `repo\\workload.db-journal`, want: false},
+	}
+	for _, test := range tests {
+		if got := isSQLiteRollbackJournalPath(test.path); got != test.want {
+			t.Errorf("isSQLiteRollbackJournalPath(%q) = %t, want %t", test.path, got, test.want)
+		}
+	}
+}
+
 func TestSQLiteWALIndexPathMatching(t *testing.T) {
 	tests := []struct {
 		path string

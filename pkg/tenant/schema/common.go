@@ -303,7 +303,10 @@ func isIgnorableSchemaError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "duplicate key") ||
 		strings.Contains(msg, "already exist") ||
-		strings.Contains(msg, "duplicate column")
+		strings.Contains(msg, "duplicate column") ||
+		strings.Contains(msg, "multiple primary key") ||
+		strings.Contains(msg, "can't drop") ||
+		strings.Contains(msg, "check that column/key exists")
 }
 
 func isIgnorableOptionalSchemaError(err error) bool {

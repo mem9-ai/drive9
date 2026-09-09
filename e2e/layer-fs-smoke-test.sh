@@ -391,7 +391,7 @@ start_layer_mount() {
     echo "local_root=$local_root"
   } >>"$MOUNT_LOG"
 
-  local args=(mount --foreground --mode=fuse --profile=coding-agent --local-root "$local_root" --durability=write-sync --flush-debounce=0 --layer "$layer_ref")
+  local args=(mount --foreground --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$local_root" --durability=write-sync --flush-debounce=0 --layer "$layer_ref")
   if [ -n "$checkpoint_ref" ]; then
     args+=(--checkpoint "$checkpoint_ref")
   fi
@@ -419,7 +419,7 @@ expect_layer_mount_fail() {
     echo "local_root=$local_root"
   } >>"$mount_log"
 
-  local args=(mount --foreground --mode=fuse --profile=coding-agent --local-root "$local_root" --durability=write-sync --flush-debounce=0 --layer "$layer_ref" --checkpoint "$checkpoint_ref" ":$remote_root" "$mount_point")
+  local args=(mount --foreground --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$local_root" --durability=write-sync --flush-debounce=0 --layer "$layer_ref" --checkpoint "$checkpoint_ref" ":$remote_root" "$mount_point")
   set +e
   drive9 "${args[@]}" >>"$mount_log" 2>&1 &
   local pid="$!"

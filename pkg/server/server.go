@@ -1810,7 +1810,7 @@ func isScopedFSPostQueryAllowed(q url.Values) bool {
 	// no selector = deny (no handler matches the dispatcher's else branch
 	// for scoped tokens — that's "unknown POST action" which is a 400 for
 	// owner today, and we don't want to silently widen for scoped).
-	selectors := []string{"append", "copy", "rename", "mkdir", "chmod", "setmeta", "create", "symlink", "hardlink"}
+	selectors := []string{"append", "copy", "rename", "mkdir", "chmod", "setmeta", "create", "symlink", "hardlink", "prepare-blocks", "commit-slices", "compact-slices", "setattr", "clone-range", "presign-put"}
 	selectorCount := 0
 	var selectorKey string
 	for _, k := range selectors {
@@ -1858,6 +1858,18 @@ func isScopedFSPostQueryAllowed(q url.Values) bool {
 		// handleHardlink reads only ?hardlink; source path is in
 		// X-Dat9-Hardlink-Source.
 		return queryKeysSubsetOf(q, []string{"hardlink"})
+	case "prepare-blocks":
+		return queryKeysSubsetOf(q, []string{"prepare-blocks"})
+	case "commit-slices":
+		return queryKeysSubsetOf(q, []string{"commit-slices"})
+	case "compact-slices":
+		return queryKeysSubsetOf(q, []string{"compact-slices"})
+	case "setattr":
+		return queryKeysSubsetOf(q, []string{"setattr"})
+	case "clone-range":
+		return queryKeysSubsetOf(q, []string{"clone-range"})
+	case "presign-put":
+		return queryKeysSubsetOf(q, []string{"presign-put"})
 	default:
 		return false
 	}
@@ -1878,6 +1890,10 @@ func isScopedFSGetQueryAllowed(q url.Values) bool {
 	case q.Has("stat"):
 		// handleStatMetadata reads only ?stat.
 		return queryKeysSubsetOf(q, []string{"stat"})
+	case q.Has("slices"):
+		return queryKeysSubsetOf(q, []string{"slices", "limit", "after_chunk", "after_off"})
+	case q.Has("read-plan"):
+		return queryKeysSubsetOf(q, []string{"read-plan", "off", "len"})
 	case q.Has("grep"):
 		// handleGrep reads ?grep, ?limit, and optional ?layer.
 		return queryKeysSubsetOf(q, []string{"grep", "limit", "layer"})
@@ -2091,6 +2107,10 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 			// - GET ?stat=1 (s.handleStatMetadata): enriched JSON metadata
 			//   (content_type/semantic_text/tags in addition to core attrs).
 			s.handleStatMetadata(w, r, path)
+		} else if r.URL.Query().Has("slices") {
+			s.handleGetSlices(w, r, path)
+		} else if r.URL.Query().Has("read-plan") {
+			s.handleReadPlan(w, r, path)
 		} else if r.URL.Query().Has("grep") {
 			s.handleGrep(w, r, path)
 		} else if r.URL.Query().Has("find") {
@@ -2129,6 +2149,18 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 			s.handleSymlink(w, r, path)
 		} else if r.URL.Query().Has("hardlink") {
 			s.handleHardlink(w, r, path)
+		} else if r.URL.Query().Has("prepare-blocks") {
+			s.handlePrepareBlocks(w, r, path)
+		} else if r.URL.Query().Has("commit-slices") {
+			s.handleCommitSlices(w, r, path)
+		} else if r.URL.Query().Has("compact-slices") {
+			s.handleCompactSlices(w, r, path)
+		} else if r.URL.Query().Has("setattr") {
+			s.handleSetattr(w, r, path)
+		} else if r.URL.Query().Has("clone-range") {
+			s.handleCloneRange(w, r, path)
+		} else if r.URL.Query().Has("presign-put") {
+			s.handlePresignPut(w, r, path)
 		} else {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_unknown_post_action", "path", path)...)
 			errJSON(w, http.StatusBadRequest, "unknown POST action")
@@ -2173,6 +2205,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "read_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_read", "result", "error")
 		writeBackendError(w, r, err)
+		return
+	}
+
+	if plan.Assemble {
+		s.assembleExtentRead(w, r, b, plan)
+		metricEvent(r.Context(), "fs_read", "result", "ok")
+		recordTenantFileBytes(r.Context(), "fs", "read", "read", plan.Size)
 		return
 	}
 
@@ -2380,28 +2419,46 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(*mtime, 10))
+	contentLayout := datastore.ContentLayoutSingle
+	var sliceGeneration int64
+	storageClass := "standard"
+	storageType := ""
+	if nf.File != nil {
+		contentLayout = nf.File.Layout()
+		sliceGeneration = nf.File.SliceGeneration
+		storageClass = storageClassFor(nf.File)
+		storageType = string(nf.File.StorageType)
+	}
 	_ = json.NewEncoder(w).Encode(struct {
-		Size         int64             `json:"size"`
-		IsDir        bool              `json:"isdir"`
-		ResourceID   string            `json:"resource_id"`
-		Nlink        uint32            `json:"nlink,omitempty"`
-		Revision     int64             `json:"revision"`
-		Mtime        *int64            `json:"mtime,omitempty"`
-		ContentType  string            `json:"content_type"`
-		SemanticText string            `json:"semantic_text"`
-		Description  string            `json:"description"`
-		Tags         map[string]string `json:"tags"`
+		Size            int64             `json:"size"`
+		IsDir           bool              `json:"isdir"`
+		ResourceID      string            `json:"resource_id"`
+		Nlink           uint32            `json:"nlink,omitempty"`
+		Revision        int64             `json:"revision"`
+		Mtime           *int64            `json:"mtime,omitempty"`
+		ContentType     string            `json:"content_type"`
+		SemanticText    string            `json:"semantic_text"`
+		Description     string            `json:"description"`
+		Tags            map[string]string `json:"tags"`
+		StorageType     string            `json:"storage_type,omitempty"`
+		ContentLayout   string            `json:"content_layout,omitempty"`
+		StorageClass    string            `json:"storage_class,omitempty"`
+		SliceGeneration int64             `json:"slice_generation,omitempty"`
 	}{
-		Size:         size,
-		IsDir:        nf.Node.IsDirectory,
-		ResourceID:   resourceID,
-		Nlink:        nlink,
-		Revision:     revision,
-		Mtime:        mtime,
-		ContentType:  contentType,
-		SemanticText: semanticText,
-		Description:  description,
-		Tags:         tags,
+		Size:            size,
+		IsDir:           nf.Node.IsDirectory,
+		ResourceID:      resourceID,
+		Nlink:           nlink,
+		Revision:        revision,
+		Mtime:           mtime,
+		ContentType:     contentType,
+		SemanticText:    semanticText,
+		Description:     description,
+		Tags:            tags,
+		StorageType:     storageType,
+		ContentLayout:   string(contentLayout),
+		StorageClass:    storageClass,
+		SliceGeneration: sliceGeneration,
 	})
 }
 
@@ -2460,7 +2517,20 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
 		return
 	}
+	writeCtx := r.Context()
+	if layout := parseContentLayoutHeader(r.Header); layout != "" {
+		parsed, perr := datastore.ParseContentLayout(string(layout))
+		if perr != nil {
+			s.writeExtentError(w, r, path, "write", perr)
+			return
+		}
+		writeCtx = backend.WithContentLayout(writeCtx, parsed)
+	}
 	if cl > 0 && b.IsLargeFile(cl) {
+		if b.ShouldIngestExtent(writeCtx, path) {
+			s.handleExtentIngestWrite(w, r, b, path, writeCtx, cl, expectedRevision, writeTags)
+			return
+		}
 		if len(writeTags) > 0 {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_large_put_tag_unsupported", "path", path)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
@@ -2568,7 +2638,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	if timingEnabled {
 		backendWriteStart = time.Now()
 	}
-	_, committedRevision, err := b.WriteCtxIfRevisionWithTagsResult(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision, writeTags, description)
+	_, committedRevision, err := b.WriteCtxIfRevisionWithTagsResult(writeCtx, path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision, writeTags, description)
 	if timingEnabled {
 		backendWriteDuration = time.Since(backendWriteStart)
 	}
@@ -2596,6 +2666,13 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		}
 		if errJSONInvalidRootDentry(w, err) {
 			metricEvent(r.Context(), "fs_write", "result", "error")
+			return
+		}
+		if errors.Is(err, datastore.ErrExtentUseCommit) ||
+			errors.Is(err, backend.ErrExtentExtraMetadata) ||
+			errors.Is(err, datastore.ErrInvalidContentLayout) || errors.Is(err, datastore.ErrAppendLogUnsupported) {
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			s.writeExtentError(w, r, path, "write", err)
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_failed", "path", path, "error", err)...)
@@ -3415,6 +3492,11 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 		if nf.File.StorageType != "" {
 			w.Header().Set("X-Dat9-Storage-Type", string(nf.File.StorageType))
 		}
+		w.Header().Set(headerContentLayout, string(nf.File.Layout()))
+		w.Header().Set(headerStorageClass, storageClassFor(nf.File))
+		if nf.File.IsExtent() {
+			w.Header().Set(headerSliceGeneration, strconv.FormatInt(nf.File.SliceGeneration, 10))
+		}
 		if nf.File.ConfirmedAt != nil {
 			w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(nf.File.ConfirmedAt.Unix(), 10))
 		} else {
@@ -3723,7 +3805,20 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	if err := b.CreateCtx(r.Context(), path); err != nil {
+	ctx := r.Context()
+	if layout := parseContentLayoutHeader(r.Header); layout != "" {
+		parsed, err := datastore.ParseContentLayout(string(layout))
+		if err != nil {
+			s.writeExtentError(w, r, path, "create", err)
+			return
+		}
+		ctx = backend.WithContentLayout(ctx, parsed)
+	}
+	if err := b.CreateCtx(ctx, path); err != nil {
+		if errors.Is(err, datastore.ErrInvalidContentLayout) || errors.Is(err, datastore.ErrAppendLogUnsupported) {
+			s.writeExtentError(w, r, path, "create", err)
+			return
+		}
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_conflict", "path", path, "detail", err.Error())...)
 			errJSON(w, http.StatusConflict, err.Error())

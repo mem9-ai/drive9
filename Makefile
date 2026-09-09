@@ -118,8 +118,17 @@ build-server:
 	mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -ldflags "$(BUILDINFO_LDFLAGS)" -o $(SERVER_BIN) ./cmd/drive9-server
 
+# Local server (provider=local). Object store:
+#   DRIVE9_S3_BACKEND=auto (default) — real MinIO via scripts/local-minio.sh, else filesystem mock
+#   DRIVE9_S3_BACKEND=minio|mock     — require MinIO, or force the mock
+#   DRIVE9_S3_BUCKET already set     — skip bootstrap (use that bucket)
+#   bash scripts/local-minio.sh stop — tear down the named local MinIO
 run-server-local: build-server
-	@DRIVE9_TENANT_PROVIDER="$${DRIVE9_TENANT_PROVIDER:-local}" "./$(SERVER_BIN)"
+	@set -euo pipefail; \
+	export DRIVE9_TENANT_PROVIDER="$${DRIVE9_TENANT_PROVIDER:-local}"; \
+	s3_env="$$(bash scripts/local-minio.sh apply)"; \
+	eval "$$s3_env"; \
+	exec "./$(SERVER_BIN)"
 
 # One-shot local e2e: start TiDB if needed, start drive9-server (provider=local),
 # run e2e/smoke-all.sh (local-e2e.yml PR set, including FUSE). Extra flags:
@@ -127,12 +136,16 @@ run-server-local: build-server
 #   make e2e-local E2E_LOCAL_ARGS="--keep-server"
 #   RUN_API_ONLY=1 make e2e-local
 #   RUN_FUSE_SMOKE=0 make e2e-local
+#   FUSE_PROFILE=coding-agent-extent make e2e-local
+#   DRIVE9_S3_BACKEND=minio make e2e-local
+#   DRIVE9_S3_BACKEND=mock make e2e-local
 e2e-local:
 	bash scripts/e2e-local.sh $(E2E_LOCAL_ARGS)
 
 # Run the cross-SDK live-server integration suites for all drive9 SDKs
 # (Go, TypeScript, Rust, Python, Kotlin, Swift). Expects TiDB on
-# DRIVE9_LOCAL_DSN (default 127.0.0.1:4000), starts drive9-server (provider=local),
+# DRIVE9_LOCAL_DSN (default 127.0.0.1:4000), starts drive9-server (provider=local,
+# MinIO via DRIVE9_S3_BACKEND=auto unless DRIVE9_S3_BUCKET is already set),
 # points each SDK at it via
 # DRIVE9_SERVER/DRIVE9_API_KEY, runs every suite, and tears it all down.
 # Pass extra args through to the runner via SDK_INTEGRATION_ARGS, e.g.:

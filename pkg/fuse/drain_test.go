@@ -7,6 +7,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 )
 
@@ -45,6 +46,20 @@ func TestDrainAllowsCleanOpenHandles(t *testing.T) {
 	}
 	if resp.Pending.OpenHandles != 1 || resp.Pending.DirtyHandles != 0 {
 		t.Fatalf("pending = %+v, want one clean open handle", resp.Pending)
+	}
+}
+
+func TestDrainIgnoresExtentDirtySeqWithoutPayload(t *testing.T) {
+	fh := &FileHandle{
+		Path:          "/extent.bin",
+		ContentLayout: client.ContentLayoutExtent,
+		DirtySeq:      9,
+		Dirty:         NewWriteBuffer("/extent.bin", 1<<20, 0),
+		extentWriter:  newExtentFileWriter(),
+		extentDirty:   &extentDirtySet{},
+	}
+	if drainHandleHasDirtyStateLocked(fh) {
+		t.Fatal("extent DirtySeq without payload must not count as pending drain work")
 	}
 }
 

@@ -433,6 +433,15 @@ func (m *tenantWorkerManager) pollFallbackOnce(ctx context.Context) bool {
 	if did, err := m.fallback.ProcessOneFileGCTask(ctx); err == nil && did {
 		processed = true
 	}
+	if did, err := m.fallback.ProcessOneBlockGCTask(ctx); err == nil && did {
+		processed = true
+	}
+	if did, err := m.fallback.ProcessOnePendingBlockGC(ctx); err == nil && did {
+		processed = true
+	}
+	if did, err := m.fallback.ProcessOneSliceCompact(ctx); err == nil && did {
+		processed = true
+	}
 	return processed
 }
 
@@ -497,6 +506,9 @@ func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID, tidbC
 
 	// Drain file_gc tasks (if selected).
 	if workMask&WorkFileGC != 0 {
+		if m.drainExtent(ctx, target) {
+			reKickMask |= WorkFileGC
+		}
 		if m.drainFileGC(ctx, target) {
 			reKickMask |= WorkFileGC
 		}
@@ -520,6 +532,27 @@ func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID, tidbC
 
 // drainFileGC recovers expired file_gc leases and drains available tasks.
 // Returns true if the drain hit its batch cap (more work likely remains).
+func (m *tenantWorkerManager) drainExtent(ctx context.Context, target *tenantTarget) (hitCap bool) {
+	if ctx.Err() != nil {
+		return false
+	}
+	b := target.backend
+	if b == nil {
+		return false
+	}
+	didWork := false
+	if did, err := b.ProcessOnePendingBlockGC(ctx); err == nil && did {
+		didWork = true
+	}
+	if did, err := b.ProcessOneBlockGCTask(ctx); err == nil && did {
+		didWork = true
+	}
+	if did, err := b.ProcessOneSliceCompact(ctx); err == nil && did {
+		didWork = true
+	}
+	return didWork
+}
+
 func (m *tenantWorkerManager) drainFileGC(ctx context.Context, target *tenantTarget) (hitCap bool) {
 	if ctx.Err() != nil {
 		return false
