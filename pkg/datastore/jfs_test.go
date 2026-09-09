@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -637,6 +638,37 @@ func TestLinkFileNodeCopiesExtentProjection(t *testing.T) {
 	}
 	if proj.ContentLayout != ContentLayoutExtent || proj.ExtentIno != 9 {
 		t.Fatalf("hardlink projection = %+v", proj)
+	}
+
+	// The hardlink must also extend the JuiceFS inode: a projection row alone
+	// leaves nlink=1 and a stale ctime on the extent inode (pjdfstest link/00
+	// "successful link updates ctime").
+	var before int64
+	if err := s.DB().QueryRow(`SELECT ctime FROM jfs_node WHERE inode = 9`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InTx(ctx, func(tx *sql.Tx) error {
+		return s.LinkFileNodeTx(ctx, tx, "/src.db", "/alias2.db", "/", "alias2.db", "link-2", time.Now())
+	}); err != nil {
+		t.Fatalf("LinkFileNodeTx alias2: %v", err)
+	}
+	var nlink int
+	var ctime int64
+	if err := s.DB().QueryRow(`SELECT nlink, ctime FROM jfs_node WHERE inode = 9`).Scan(&nlink, &ctime); err != nil {
+		t.Fatal(err)
+	}
+	if nlink != 3 {
+		t.Fatalf("extent inode nlink = %d, want 3", nlink)
+	}
+	if ctime <= before {
+		t.Fatalf("extent inode ctime = %d, want > %d after hardlink", ctime, before)
+	}
+	var edgeIno uint64
+	if err := s.DB().QueryRow(`SELECT inode FROM jfs_edge WHERE parent = 1 AND name = ?`, []byte("alias2.db")).Scan(&edgeIno); err != nil {
+		t.Fatalf("jfs edge for alias2: %v", err)
+	}
+	if edgeIno != 9 {
+		t.Fatalf("jfs edge inode = %d, want 9", edgeIno)
 	}
 }
 

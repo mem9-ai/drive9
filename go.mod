@@ -348,6 +348,12 @@ replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/
 // Pin the GitHub commit; do not replace with a local path.
 replace github.com/juicedata/juicefs => github.com/mornyx/juicefs v1.4.2-0.20260909083529-a53df2a9e0ac
 
+// Upstream juicefs replaces hashicorp/golang-lru with the juicedata fork that
+// adds LRU.AddIf; a dependency replace is ignored, so consumers must carry it.
+// Without it, builds that compile juicefs pkg/meta (no `noredis` tag, e.g. the
+// failpoint test build) fail with "AddIf undefined".
+replace github.com/hashicorp/golang-lru/v2 => github.com/juicedata/golang-lru/v2 v2.0.8-0.20251126062551-1b321869f904
+
 // JuiceFS compress/utils pull CGO libraries; keep drive9 CGO_ENABLED=0.
 replace github.com/DataDog/zstd => ./internal/jfsstub/zstd
 
@@ -360,3 +366,4 @@ exclude (
 	google.golang.org/genproto v0.0.0-20180817151627-c66870c02cf8
 	google.golang.org/genproto v0.0.0-20190819201941-24fa4b261c55
 )
+
