@@ -211,19 +211,6 @@ func (fs *Dat9FS) extentRefreshFromVFS(nodeID uint64, p string, fuseFh uint64) b
 	return true
 }
 
-// extentAttrLength is JuiceFS fuse GetAttr: VFS.GetAttr then UpdateLength.
-// Uses the FUSE inode's juicefs Ino mapping only — no extra HEAD.
-func (fs *Dat9FS) extentAttrLength(nodeID uint64, p string, fuseFh uint64) (int64, bool) {
-	if !fs.extentRefreshFromVFS(nodeID, p, fuseFh) {
-		return 0, false
-	}
-	entry, ok := fs.inodes.GetEntry(nodeID)
-	if !ok {
-		return 0, false
-	}
-	return entry.Size, true
-}
-
 func (fs *Dat9FS) extentSetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, entry *InodeEntry, out *gofuse.AttrOut) gofuse.Status {
 	if err := fs.ensureExtentRuntime(); err != nil {
 		return gofuse.EIO

@@ -720,7 +720,7 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 	// Listing/create-cache often still has size=0 after JuiceFS writes.
 	// Shrinking an extent inode here makes ReadDirPlus publish i_size=0 so
 	// the kernel returns EOF without FUSE READ. Truncate uses UpdateSize.
-	if !(entry.ExtentIno != 0 && !isDir && size < entry.Size) {
+	if entry.ExtentIno == 0 || isDir || size >= entry.Size {
 		entry.Size = size
 	}
 	entry.Mtime = mtime

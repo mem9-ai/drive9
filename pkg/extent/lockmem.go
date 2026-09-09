@@ -140,7 +140,7 @@ func (m *memLockMeta) WriteParts(ctx jfsmeta.Context, inode jfsmeta.Ino, indx ui
 	}
 	var st syscall.Errno
 	for _, p := range parts {
-		st = m.Meta.Write(ctx, inode, indx, p.Off, p.Slice, mtime)
+		st = m.Write(ctx, inode, indx, p.Off, p.Slice, mtime)
 		if st != 0 {
 			return st
 		}

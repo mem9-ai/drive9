@@ -193,7 +193,6 @@ func (s *Store) RunExtentMetaOp(ctx context.Context, op string, raw json.RawMess
 		if ctx.Err() != nil {
 			out = map[string]any{"errno": int(syscall.EINTR)}
 			errno = int(syscall.EINTR)
-			err = nil
 			break
 		}
 		attempts++
@@ -983,10 +982,11 @@ func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name 
 	mode = mode &^ cumask
 	nlink := uint32(1)
 	length := uint64(0)
-	if typ == jfsTypeDir {
+	switch typ {
+	case jfsTypeDir:
 		nlink = 2
 		length = 4096
-	} else if typ == jfsTypeSymlink {
+	case jfsTypeSymlink:
 		length = uint64(len(symlinkTarget))
 		if attr.Length > 0 {
 			length = attr.Length
@@ -1436,10 +1436,6 @@ func marshalExtentSlice(pos uint32, id uint64, size, off, length uint32) []byte 
 type extentWritePart struct {
 	Off   uint32
 	Slice ExtentSlice
-}
-
-func (s *Store) jfsWriteTx(tx *sql.Tx, ino uint64, indx, off uint32, sl ExtentSlice, mtime time.Time) (int, *ExtentAttr, int64, int64, int, error) {
-	return s.jfsWritePartsTx(tx, ino, indx, []extentWritePart{{Off: off, Slice: sl}}, mtime)
 }
 
 func (s *Store) jfsWritePartsTx(tx *sql.Tx, ino uint64, indx uint32, parts []extentWritePart, mtime time.Time) (int, *ExtentAttr, int64, int64, int, error) {

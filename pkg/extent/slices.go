@@ -38,16 +38,6 @@ func parseRawSlices(buf []byte) []*rawSlice {
 	return out
 }
 
-func marshalRawSlice(pos uint32, id uint64, size, off, length uint32) []byte {
-	buf := make([]byte, sliceBytes)
-	binary.BigEndian.PutUint32(buf[0:4], pos)
-	binary.BigEndian.PutUint64(buf[4:12], id)
-	binary.BigEndian.PutUint32(buf[12:16], size)
-	binary.BigEndian.PutUint32(buf[16:20], off)
-	binary.BigEndian.PutUint32(buf[20:24], length)
-	return buf
-}
-
 func newRawSlice(pos uint32, id uint64, cleng, off, length uint32) *rawSlice {
 	if length == 0 {
 		return nil
@@ -149,7 +139,7 @@ OUT:
 		if first.len < (1<<20) || first.len*5 < size || size == 0 {
 			break
 		}
-		if !(pos == first.pos && c[0].Id == first.id && c[0].Off == first.off && c[0].Len == first.len) {
+		if pos != first.pos || c[0].Id != first.id || c[0].Off != first.off || c[0].Len != first.len {
 			break
 		}
 		for _, s := range ss[1:] {

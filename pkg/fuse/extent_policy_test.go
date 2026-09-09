@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"syscall"
 	"testing"
 	"time"
@@ -305,7 +306,7 @@ func TestRenamePreflightSymlinkParentIsELOOP(t *testing.T) {
 	input := &gofuse.RenameIn{}
 	input.NodeId = dir
 	input.Newdir = link
-	_, _, st := fs.renamePreflight(nil, input, "/file", "/loop/test")
+	_, _, st := fs.renamePreflight(context.TODO(), input, "/file", "/loop/test")
 	if st != gofuse.Status(syscall.ELOOP) {
 		t.Fatalf("rename through symlink parent st=%v, want ELOOP", st)
 	}
@@ -410,8 +411,6 @@ func TestExtentKeepOpenWALIndexSize(t *testing.T) {
 		t.Fatalf("open empty shm size=%d, want %d", e.Size, sqliteWALIndexMinSize)
 	}
 }
-
-
 
 func TestExtentWriteByNodeWithoutHandleIsOK(t *testing.T) {
 	fs := &Dat9FS{opts: &MountOptions{}, inodes: NewInodeToPath()}
@@ -717,10 +716,10 @@ func TestNotifyRenameTargetSkipsExtentInode(t *testing.T) {
 
 func TestIsExtentFileUsesContentLayoutNotGlob(t *testing.T) {
 	fs := &Dat9FS{opts: &MountOptions{ExtentPaths: []string{"*"}}}
-	if fs.isExtentFile(nil, "/x.db") {
+	if fs.isExtentFile(context.TODO(), "/x.db") {
 		t.Fatal("existing files dispatch on ContentLayout, not the create glob")
 	}
-	if fs.isExtentFile(nil, "/dir/") {
+	if fs.isExtentFile(context.TODO(), "/dir/") {
 		t.Fatal("directories are not extent files")
 	}
 	fs.inodes = NewInodeToPath()
@@ -728,7 +727,7 @@ func TestIsExtentFileUsesContentLayoutNotGlob(t *testing.T) {
 	if fs.pathIsDir("/moved") != true {
 		t.Fatalf("expected dir inode %d", ino)
 	}
-	if _, ok := fs.existingExtentIno(nil, "/moved"); ok {
+	if _, ok := fs.existingExtentIno(context.TODO(), "/moved"); ok {
 		t.Fatal("directory inode must not be treated as an extent file")
 	}
 }
