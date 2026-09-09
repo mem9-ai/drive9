@@ -209,6 +209,13 @@ func (s *Store) RunExtentMetaOp(ctx context.Context, op string, raw json.RawMess
 	if mErr != nil {
 		return nil, int(syscall.EIO), mErr
 	}
+	// Deleting a file only records jfs_delfile inside the transaction (a full
+	// slice walk there made delete-journal COMMIT take seconds). Reclaim its
+	// blocks right after the commit; anything this misses is retried by the
+	// tenant worker, and the delfile row survives until the walk finishes.
+	if errno == 0 && (op == "unlink" || op == "delete_sustained") {
+		_, _ = s.DrainPendingDeletedFiles(ctx, 4)
+	}
 	return body, errno, nil
 }
 
@@ -1696,15 +1703,161 @@ func nullUint64(v uint64) any {
 }
 
 func (s *Store) jfsEnqueueFileGCTx(tx *sql.Tx, ino, length uint64) error {
-	// JuiceFS sql_unlink with MaxDeletes=0 records delfile and returns;
-	// slice ref-count + object delete run in the background. Walking every
-	// 24-byte slice here made delete-journal COMMIT unlink take seconds
-	// (sqlite --wait all is 10s).
-	if _, err := tx.Exec(`DELETE FROM jfs_chunk WHERE inode = ?`, ino); err != nil {
-		return err
-	}
+	// Record the inode only. JuiceFS sql_unlink with MaxDeletes=0 does the
+	// same; walking every 24-byte slice here made delete-journal COMMIT unlink
+	// take seconds (sqlite --wait all is 10s). DrainDeletedFile walks
+	// jfs_chunk in batches after the transaction commits, so the slices must
+	// survive until then, and the delfile row is the crash-recovery record.
 	_, err := tx.Exec(`INSERT IGNORE INTO jfs_delfile (inode, length, expire) VALUES (?, ?, ?)`, ino, length, time.Now().Unix())
 	return err
+}
+
+// jfsDeleteChunkBatch bounds how many jfs_chunk rows one drain transaction
+// walks; the rows are deleted as they are processed, so a big file drains over
+// several rounds without holding a long lock.
+const jfsDeleteChunkBatch = 64
+
+// DrainDeletedFile reclaims the blocks of one deleted extent file: it walks
+// that inode's slices in batches, drops each slice's refcount, queues the
+// blocks whose refs hit zero for object deletion, and finally removes the
+// jfs_chunk/jfs_delfile rows. Safe to call repeatedly; it is a no-op once the
+// delfile row is gone.
+func (s *Store) DrainDeletedFile(ctx context.Context, ino uint64) error {
+	if ino == 0 {
+		return nil
+	}
+	for {
+		done, err := s.drainDeletedFileOnce(ctx, ino)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+}
+
+func (s *Store) drainDeletedFileOnce(ctx context.Context, ino uint64) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	done, err := s.drainDeletedFileTx(tx, ino)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return done, nil
+}
+
+func (s *Store) drainDeletedFileTx(tx *sql.Tx, ino uint64) (bool, error) {
+	var pending int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM jfs_delfile WHERE inode = ?`, ino).Scan(&pending); err != nil {
+		return false, err
+	}
+	if pending == 0 {
+		return true, nil
+	}
+	rows, err := tx.Query(`SELECT indx, slices FROM jfs_chunk WHERE inode = ? ORDER BY indx LIMIT ?`, ino, jfsDeleteChunkBatch)
+	if err != nil {
+		return false, fmt.Errorf("drain select chunks: %w", err)
+	}
+	type chunkRow struct {
+		indx   uint32
+		slices []byte
+	}
+	var batch []chunkRow
+	for rows.Next() {
+		var cr chunkRow
+		if err := rows.Scan(&cr.indx, &cr.slices); err != nil {
+			_ = rows.Close()
+			return false, err
+		}
+		batch = append(batch, cr)
+	}
+	if err := rows.Close(); err != nil {
+		return false, err
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if len(batch) == 0 {
+		if _, err := tx.Exec(`DELETE FROM jfs_delfile WHERE inode = ?`, ino); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	// A slice can appear more than once in one file (rewrites append a new
+	// record), so the refcount drop is per occurrence.
+	counts := make(map[extentSliceRef]int)
+	order := make([]extentSliceRef, 0, len(batch))
+	indxArgs := make([]any, 0, len(batch))
+	indxPlace := make([]string, 0, len(batch))
+	for _, cr := range batch {
+		indxArgs = append(indxArgs, cr.indx)
+		indxPlace = append(indxPlace, "?")
+		for i := 0; i+extentSliceBytes <= len(cr.slices); i += extentSliceBytes {
+			id := binary.BigEndian.Uint64(cr.slices[i+4 : i+12])
+			size := binary.BigEndian.Uint32(cr.slices[i+12 : i+16])
+			if id == 0 {
+				continue
+			}
+			ref := extentSliceRef{id: id, size: size}
+			if _, seen := counts[ref]; !seen {
+				order = append(order, ref)
+			}
+			counts[ref]++
+		}
+	}
+	for _, ref := range order {
+		if _, err := tx.Exec(`UPDATE jfs_chunk_ref SET refs = refs - ? WHERE chunkid = ? AND size = ?`,
+			counts[ref], ref.id, ref.size); err != nil {
+			return false, fmt.Errorf("drain decrement ref: %w", err)
+		}
+	}
+	if err := s.jfsEnqueueDeadSliceGCTx(tx, ino, order); err != nil {
+		return false, fmt.Errorf("drain enqueue gc: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM jfs_chunk WHERE inode = ? AND indx IN (`+strings.Join(indxPlace, ",")+`)`,
+		append([]any{ino}, indxArgs...)...); err != nil {
+		return false, fmt.Errorf("drain delete chunks: %w", err)
+	}
+	return false, nil
+}
+
+// DrainPendingDeletedFiles drains up to limit deleted-file records that are
+// ready (expire <= now). Used inline after unlink and by the tenant worker as
+// the safety net for drains that were interrupted.
+func (s *Store) DrainPendingDeletedFiles(ctx context.Context, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	drained := 0
+	for i := 0; i < limit; i++ {
+		if err := ctx.Err(); err != nil {
+			return drained, err
+		}
+		var ino uint64
+		err := s.db.QueryRowContext(ctx, `SELECT inode FROM jfs_delfile WHERE expire <= ? ORDER BY expire LIMIT 1`,
+			time.Now().Unix()).Scan(&ino)
+		if errors.Is(err, sql.ErrNoRows) {
+			return drained, nil
+		}
+		if err != nil {
+			return drained, err
+		}
+		if err := s.DrainDeletedFile(ctx, ino); err != nil {
+			return drained, err
+		}
+		drained++
+	}
+	return drained, nil
 }
 
 func (s *Store) jfsDeleteSustainedTx(tx *sql.Tx, sid, ino uint64) error {
@@ -2022,12 +2175,23 @@ func (s *Store) jfsCleanStaleSessionTx(tx *sql.Tx, sid uint64) error {
 
 // UnlinkExtentPath removes an extent file via the JuiceFS Unlink txn (edge + projection).
 func (s *Store) UnlinkExtentPath(ctx context.Context, path string, opened bool) error {
-	return s.InTx(ctx, func(tx *sql.Tx) error {
+	// Capture the extent inode before the projection row disappears: the
+	// unlink transaction only records jfs_delfile, so the blocks are reclaimed
+	// here right after it commits.
+	var ino uint64
+	_ = s.db.QueryRowContext(ctx, `SELECT extent_ino FROM file_nodes WHERE `+
+		s.scope.And(`path_hash = ? AND path = ?`),
+		s.scope.Args(fileNodePathHash(path), path)...).Scan(&ino)
+	err := s.InTx(ctx, func(tx *sql.Tx) error {
 		if err := s.jfsEnsureInitTx(tx); err != nil {
 			return err
 		}
 		return s.unlinkExtentPathTx(tx, path, opened)
 	})
+	if err == nil && ino != 0 {
+		_ = s.DrainDeletedFile(ctx, ino)
+	}
+	return err
 }
 
 func (s *Store) unlinkExtentTree(ctx context.Context, dirPath string) error {
@@ -2060,6 +2224,110 @@ func (s *Store) unlinkExtentTree(ctx context.Context, dirPath string) error {
 		}
 	}
 	return nil
+}
+
+// jfsEdgeOfTx returns the (parent, name) of the edge pointing at ino.
+func (s *Store) jfsEdgeOfTx(tx *sql.Tx, ino uint64) (uint64, []byte, bool, error) {
+	var parent uint64
+	var name []byte
+	err := tx.QueryRow(`SELECT parent, name FROM jfs_edge WHERE inode = ? LIMIT 1`, ino).Scan(&parent, &name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil, false, nil
+	}
+	if err != nil {
+		return 0, nil, false, err
+	}
+	return parent, name, true, nil
+}
+
+// jfsDeleteSubtreeTx removes the JuiceFS subtree rooted at ino: every edge and
+// node below it, plus the node itself. Extent files are recorded in
+// jfs_delfile so DrainDeletedFile reclaims their blocks. Server-side directory
+// deletes only touch file_nodes, so without this the jfs tree keeps orphan
+// edges (P0-3): rmdir then fails with ENOTEMPTY and recreating the name binds
+// the orphan inode.
+func (s *Store) jfsDeleteSubtreeTx(tx *sql.Tx, ino uint64) error {
+	if ino == 0 || ino == jfsRootIno {
+		return nil
+	}
+	queue := []uint64{ino}
+	seen := map[uint64]struct{}{}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[cur]; ok {
+			continue
+		}
+		seen[cur] = struct{}{}
+		rows, err := tx.Query(`SELECT inode FROM jfs_edge WHERE parent = ?`, cur)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var child uint64
+			if err := rows.Scan(&child); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if child != jfsRootIno {
+				queue = append(queue, child)
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+	now := time.Now().Unix()
+	for node := range seen {
+		var typ uint8
+		var length uint64
+		var nlink uint32
+		err := tx.QueryRow(`SELECT type, length, nlink FROM jfs_node WHERE inode = ?`, node).Scan(&typ, &length, &nlink)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			// Edge without a node (already half-deleted): drop the edge below.
+		case err != nil:
+			return err
+		case typ == jfsTypeFile && nlink > 0:
+			if _, err := tx.Exec(`INSERT IGNORE INTO jfs_delfile (inode, length, expire) VALUES (?, ?, ?)`,
+				node, length, now); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? OR inode = ?`, node, node); err != nil {
+			return err
+		}
+		for _, q := range []string{
+			`DELETE FROM jfs_node WHERE inode = ?`,
+			`DELETE FROM jfs_symlink WHERE inode = ?`,
+			`DELETE FROM jfs_sustained WHERE inode = ?`,
+		} {
+			if _, err := tx.Exec(q, node); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// jfsRenameDirEdgeTx moves a directory's edge to newParent/newName. Children
+// are keyed by parent inode, so one edge update moves the whole subtree.
+func (s *Store) jfsRenameDirEdgeTx(tx *sql.Tx, ino, newParent uint64, newName string) error {
+	if ino == 0 || ino == jfsRootIno || newName == "" {
+		return nil
+	}
+	_, _, ok, err := s.jfsEdgeOfTx(tx, ino)
+	if err != nil || !ok {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? AND name = ?`, newParent, []byte(newName)); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE jfs_edge SET parent = ?, name = ? WHERE inode = ?`, newParent, []byte(newName), ino)
+	return err
 }
 
 func (s *Store) unlinkExtentPathTx(tx *sql.Tx, path string, opened bool) error {

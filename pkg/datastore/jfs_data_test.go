@@ -756,6 +756,229 @@ func TestExtentUnlinkEnqueuesBlockGC(t *testing.T) {
 	}
 }
 
+func TestDrainDeletedFileReclaimsSharedSlices(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	// Two extent files share one slice (77, 4 bytes). The unlink transaction
+	// only records jfs_delfile; DrainDeletedFile drops the refcount and queues
+	// the block for object deletion once the last reference is gone.
+	for i, spec := range []struct {
+		inode uint64
+		path  string
+	}{
+		{2, "/drain-a.db"},
+		{3, "/drain-b.db"},
+	} {
+		create, _ := json.Marshal(map[string]any{
+			"parent": 1, "name": strings.TrimPrefix(spec.path, "/"), "type": 1, "mode": 0644,
+			"inode": spec.inode, "proj_path": spec.path,
+			"attr": ExtentAttr{Typ: 1, Mode: 0644, Nlink: 1, Parent: 1, Full: true},
+		})
+		if _, errno, err := s.RunExtentMetaOp(ctx, "mknod", create); err != nil || errno != 0 {
+			t.Fatalf("mknod %d errno=%d err=%v", i, errno, err)
+		}
+		write, _ := json.Marshal(map[string]any{
+			"inode": spec.inode, "indx": 0, "off": 0,
+			"slice": ExtentSlice{Id: 77, Size: 4, Off: 0, Len: 4},
+		})
+		if _, errno, err := s.RunExtentMetaOp(ctx, "write", write); err != nil || errno != 0 {
+			t.Fatalf("write %d errno=%d err=%v", i, errno, err)
+		}
+	}
+	if err := s.UnlinkExtentPath(ctx, "/drain-a.db", false); err != nil {
+		t.Fatal(err)
+	}
+	// The slice is still referenced by the second file: no object deletion yet.
+	var refs int
+	if err := s.db.QueryRow(`SELECT refs FROM jfs_chunk_ref WHERE chunkid = 77 AND size = 4`).Scan(&refs); err != nil {
+		t.Fatal(err)
+	}
+	if refs != 1 {
+		t.Fatalf("refs=%d after unlinking one of two owners, want 1", refs)
+	}
+	if keys, err := s.ListPendingBlockGC(ctx, 32); err != nil || len(keys) != 0 {
+		t.Fatalf("shared slice queued for GC early: keys=%v err=%v", keys, err)
+	}
+	if err := s.UnlinkExtentPath(ctx, "/drain-b.db", false); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := s.ListPendingBlockGC(ctx, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, k := range keys {
+		if strings.Contains(k, "77_0_4") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("last owner unlink did not queue the block: %v", keys)
+	}
+	for _, q := range []string{
+		`SELECT COUNT(*) FROM jfs_delfile WHERE inode IN (2,3)`,
+		`SELECT COUNT(*) FROM jfs_chunk WHERE inode IN (2,3)`,
+	} {
+		var n int
+		if err := s.db.QueryRow(q).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("drained rows left over for %s: %d", q, n)
+		}
+	}
+	// Draining an already-drained inode must stay a no-op.
+	if err := s.DrainDeletedFile(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServerDirOpsTouchJfsTree(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	insertDir := func(path, parent, name string) {
+		t.Helper()
+		if err := s.InsertNode(ctx, &FileNode{
+			NodeID: "dir-" + name, Path: path, ParentPath: parent, Name: name,
+			IsDirectory: true, CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkdirJfs := func(parent uint64, name, projPath string) uint64 {
+		t.Helper()
+		req, _ := json.Marshal(map[string]any{
+			"parent": parent, "name": name, "type": 2, "mode": 0755, "proj_path": projPath,
+		})
+		body, errno, err := s.RunExtentMetaOp(ctx, "mknod", req)
+		if err != nil || errno != 0 {
+			t.Fatalf("mkdir %s errno=%d err=%v", name, errno, err)
+		}
+		var resp struct {
+			Inode uint64 `json:"inode"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp.Inode
+	}
+	mknodFile := func(parent uint64, name, projPath string, slice uint64) {
+		t.Helper()
+		req, _ := json.Marshal(map[string]any{
+			"parent": parent, "name": name, "type": 1, "mode": 0644, "proj_path": projPath,
+			"attr": ExtentAttr{Typ: 1, Mode: 0644, Nlink: 1, Parent: parent, Full: true},
+		})
+		body, errno, err := s.RunExtentMetaOp(ctx, "mknod", req)
+		if err != nil || errno != 0 {
+			t.Fatalf("mknod %s errno=%d err=%v", name, errno, err)
+		}
+		var resp struct {
+			Inode uint64 `json:"inode"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			t.Fatal(err)
+		}
+		write, _ := json.Marshal(map[string]any{
+			"inode": resp.Inode, "indx": 0, "off": 0,
+			"slice": ExtentSlice{Id: slice, Size: 4, Off: 0, Len: 4},
+		})
+		if _, errno, err := s.RunExtentMetaOp(ctx, "write", write); err != nil || errno != 0 {
+			t.Fatalf("write %s errno=%d err=%v", name, errno, err)
+		}
+	}
+	jfsEdgeNames := func() map[string]bool {
+		t.Helper()
+		rows, err := s.db.Query(`SELECT name FROM jfs_edge`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = rows.Close() }()
+		out := map[string]bool{}
+		for rows.Next() {
+			var name []byte
+			if err := rows.Scan(&name); err != nil {
+				t.Fatal(err)
+			}
+			out[string(name)] = true
+		}
+		return out
+	}
+
+	insertDir("/cli-rm/", "/", "cli-rm")
+	insertDir("/cli-rm/sub/", "/cli-rm/", "sub")
+	cliIno := mkdirJfs(jfsRootIno, "cli-rm", "/cli-rm/")
+	subIno := mkdirJfs(cliIno, "sub", "/cli-rm/sub/")
+	mknodFile(cliIno, "a.db", "/cli-rm/a.db", 55)
+	mknodFile(subIno, "c.db", "/cli-rm/sub/c.db", 56)
+	for _, name := range []string{"cli-rm", "sub", "a.db", "c.db"} {
+		if !jfsEdgeNames()[name] {
+			t.Fatalf("fixture missing jfs edge %q", name)
+		}
+	}
+
+	// fs rm -r: the server-side delete must take the jfs subtree with it.
+	if _, err := s.DeleteDirRecursive(ctx, "/cli-rm/"); err != nil {
+		t.Fatal(err)
+	}
+	edges := jfsEdgeNames()
+	for _, name := range []string{"cli-rm", "sub", "a.db", "c.db"} {
+		if edges[name] {
+			t.Fatalf("jfs edge %q survived fs rm -r", name)
+		}
+	}
+	var nodes int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM jfs_node`).Scan(&nodes); err != nil {
+		t.Fatal(err)
+	}
+	if nodes != 1 {
+		t.Fatalf("jfs_node count=%d after fs rm -r, want only the root", nodes)
+	}
+	keys, err := s.ListPendingBlockGC(ctx, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"55_0_4", "56_0_4"} {
+		found := false
+		for _, k := range keys {
+			if strings.Contains(k, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("fs rm -r did not queue block %s: %v", want, keys)
+		}
+	}
+
+	// fs mv: one edge update moves the subtree, and the old name disappears.
+	insertDir("/ren-a/", "/", "ren-a")
+	renIno := mkdirJfs(jfsRootIno, "ren-a", "/ren-a/")
+	mknodFile(renIno, "keep.db", "/ren-a/keep.db", 57)
+	if _, err := s.RenameDir(ctx, "/ren-a/", "/ren-b/"); err != nil {
+		t.Fatal(err)
+	}
+	edges = jfsEdgeNames()
+	if edges["ren-a"] {
+		t.Fatal("jfs edge ren-a survived the rename")
+	}
+	if !edges["ren-b"] || !edges["keep.db"] {
+		t.Fatalf("rename lost jfs edges: %v", edges)
+	}
+
+	// rmdir of an empty directory must drop its own jfs edge, so recreating
+	// the same name and removing it again works (case G).
+	insertDir("/gone/", "/", "gone")
+	goneIno := mkdirJfs(jfsRootIno, "gone", "/gone/")
+	if goneIno == 0 {
+		t.Fatal("mkdir returned inode 0")
+	}
+	if err := s.DeleteEmptyDir(ctx, "/gone/"); err != nil {
+		t.Fatal(err)
+	}
+	if jfsEdgeNames()["gone"] {
+		t.Fatal("jfs edge gone survived rmdir")
+	}
+}
+
 func TestExtentDirRenameSubtreeProjection(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -784,10 +1007,15 @@ func TestExtentDirRenameSubtreeProjection(t *testing.T) {
 	if _, err := s.RenameDir(ctx, "/d/", "/e/"); err != nil {
 		t.Fatal(err)
 	}
-	if _, errno, err := s.RunExtentMetaOp(ctx, "rename", mustJSON(map[string]any{
-		"src_parent": 1, "src_name": "d", "dst_parent": 1, "dst_name": "e",
-	})); err != nil || errno != 0 {
-		t.Fatalf("jfs dir edge rename errno=%d err=%v", errno, err)
+	// P0-3: the server-side directory rename moves the jfs edge in the same
+	// transaction, so the old name must be gone before any FUSE-side step.
+	var edgeParent uint64
+	var edgeName []byte
+	if err := s.db.QueryRow(`SELECT parent, name FROM jfs_edge WHERE inode = 10`).Scan(&edgeParent, &edgeName); err != nil {
+		t.Fatal(err)
+	}
+	if edgeParent != jfsRootIno || string(edgeName) != "e" {
+		t.Fatalf("jfs edge parent=%d name=%q after rename, want (1,e)", edgeParent, edgeName)
 	}
 	if _, err := s.GetExtentProjection(ctx, "/d/a.db"); err == nil {
 		t.Fatal("child projection still at old path after dir rename")

@@ -39,6 +39,20 @@ class UnmountResult:
     seconds: float
 
 
+def resolve_mount_profile(requested: str | None) -> str:
+    """Return the profile a mount will actually use.
+
+    When a module passes no profile (or the implicit default ``coding-agent``),
+    ``FUSE_PROFILE`` replaces it, matching the e2e FUSE suites. An explicit
+    per-module profile such as ``none``, ``portable``, or a custom pack profile
+    is never overridden.
+    """
+    env_profile = os.environ.get("FUSE_PROFILE", "").strip()
+    if env_profile and (requested is None or requested == "" or requested == "coding-agent"):
+        return env_profile
+    return requested or ""
+
+
 def pick_port() -> int:
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
@@ -546,16 +560,7 @@ class Drive9FuseTargetProvider:
             path.mkdir(parents=True, exist_ok=True)
         log_dir = self.mount_logs_dir / case / cache_key
         log_dir.mkdir(parents=True, exist_ok=True)
-        # When profile/durability are None, let drive9 use its own defaults
-        # (profile=coding-agent, durability=auto/writeback). FUSE_PROFILE
-        # replaces the default/coding-agent mount, matching e2e FUSE suites,
-        # but does not override an explicit per-module profile such as none
-        # or a custom pack profile.
-        env_profile = os.environ.get("FUSE_PROFILE", "").strip()
-        if env_profile and (profile is None or profile == "" or profile == "coding-agent"):
-            effective_profile = env_profile
-        else:
-            effective_profile = profile or ""
+        effective_profile = resolve_mount_profile(profile)
         command = [
             str(self.cli),
             "mount",
@@ -580,7 +585,7 @@ class Drive9FuseTargetProvider:
         err = (log_dir / "mount.err").open("ab")
         out.write(f"\n# {utc_ts()} $ {' '.join(command)}\n".encode())
         out.flush()
-        progress(f"mount start: {case}/{cache_key} remote={remote_root} mountpoint={mountpoint} profile={profile or 'default'} durability={durability or 'default'}")
+        progress(f"mount start: {case}/{cache_key} remote={remote_root} mountpoint={mountpoint} profile={effective_profile or 'default'} durability={durability or 'default'}")
         proc = subprocess.Popen(command, cwd=str(REPO_ROOT), env=env, stdout=out, stderr=err, start_new_session=True)
         deadline = time.monotonic() + int(os.environ.get("MOUNT_READY_TIMEOUT_S", "30"))
         next_wait_log = time.monotonic() + 10
@@ -592,7 +597,7 @@ class Drive9FuseTargetProvider:
                     detail += f"\nlast mount stderr:\n{tail}"
                 raise BlackboxError(detail)
             if self.is_mounted(mountpoint):
-                handle = MountHandle(mountpoint=mountpoint, remote_root=remote_root, proc=proc, log_dir=log_dir, cache_dir=cache_dir, local_root=local_root, profile=profile)
+                handle = MountHandle(mountpoint=mountpoint, remote_root=remote_root, proc=proc, log_dir=log_dir, cache_dir=cache_dir, local_root=local_root, profile=effective_profile)
                 self.mounts.append(handle)
                 progress(f"mount ready: {case}/{cache_key} -> {mountpoint}")
                 return handle

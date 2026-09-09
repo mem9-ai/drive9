@@ -162,6 +162,17 @@ func extentBlockKey(tenantID, key string) string {
 	return prefix + key
 }
 
+// runExtentFileGC drains deleted-file records whose blocks were not reclaimed
+// inline (the unlink transaction only records jfs_delfile). It is the safety
+// net for a drain that was interrupted; block_gc_tasks produced here are
+// deleted by runExtentBlockGC in the same pass.
+func runExtentFileGC(ctx context.Context, store *datastore.Store) {
+	if store == nil {
+		return
+	}
+	_, _ = store.DrainPendingDeletedFiles(ctx, 8)
+}
+
 func runExtentBlockGC(ctx context.Context, store *datastore.Store, s3 s3client.S3Client, tenantID string) {
 	if store == nil || s3 == nil {
 		return

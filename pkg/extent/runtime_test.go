@@ -96,6 +96,41 @@ func TestExtentCacheRootDefaultsUnderDrive9UserCache(t *testing.T) {
 	}
 }
 
+func TestExtentChunkCacheRootNamespacesByCacheKey(t *testing.T) {
+	if got := extentChunkCacheRoot("/mnt/hash", ""); got != "/mnt/hash" {
+		t.Fatalf("empty key changed the root: %q", got)
+	}
+	a := extentChunkCacheRoot("/mnt/hash", "aaaa")
+	b := extentChunkCacheRoot("/mnt/hash", "bbbb")
+	if a == b {
+		t.Fatalf("two cache keys resolved to the same root %q", a)
+	}
+	if want := filepath.Join("/mnt/hash", "aaaa"); a != want {
+		t.Fatalf("root=%q, want %q", a, want)
+	}
+}
+
+func TestCacheKeyForPrefixIsTenantStable(t *testing.T) {
+	if got := CacheKeyForPrefix(""); got != "" {
+		t.Fatalf("empty prefix produced key %q", got)
+	}
+	if got := CacheKeyForPrefix("  "); got != "" {
+		t.Fatalf("blank prefix produced key %q", got)
+	}
+	a1 := CacheKeyForPrefix("t/tenant-a/")
+	a2 := CacheKeyForPrefix("t/tenant-a/")
+	b := CacheKeyForPrefix("t/tenant-b/")
+	if a1 == "" || a1 != a2 {
+		t.Fatalf("same prefix must map to the same key: %q vs %q", a1, a2)
+	}
+	if a1 == b {
+		t.Fatalf("different tenants share cache key %q", a1)
+	}
+	if len(a1) != 16 {
+		t.Fatalf("cache key length=%d, want 16", len(a1))
+	}
+}
+
 func TestApplyChunkCacheDirWritebackSurvivesSelfCheck(t *testing.T) {
 	conf := chunk.Config{
 		BlockSize:      4 << 20,

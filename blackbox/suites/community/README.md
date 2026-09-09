@@ -21,7 +21,6 @@ Each subdirectory is one auto-discovered module (`module.py`), optionally with a
 | `community.pjdfstest` | compatibility | pjdfstest POSIX pass rate. |
 | `community.pyxattr` | compatibility | pyxattr-backed extended attribute checks. |
 | `community.sqlite` | compatibility | Official SQLite `speedtest1`, `mptester`, `threadtest3`, and `kvtest` on a FUSE mount, plus a MAP_SHARED mmap probe. |
-| `community.vdbench` | performance | vdbench file workload (manual dependency). |
 
 The two LTP modules each have their own `module.py` but share the LTP
 dependency logic (`ltp_fs/deps.py`, re-exported by `ltp_syscalls/deps.py`).
@@ -37,7 +36,7 @@ python3 blackbox/run.py --group community
 
 Label filters narrow within a selection. Community-relevant labels include
 `posix` (`community.pjdfstest`), `performance` (`community.fio`,
-community.mdtest, community.vdbench`), and `compatibility`
+`community.mdtest`), and `compatibility`
 (`community.pjdfstest`, `community.sqlite`, LTP, lock, pyxattr):
 
 ```bash
@@ -46,10 +45,6 @@ python3 blackbox/run.py --group community --label posix
 python3 blackbox/run.py --module community.pjdfstest
 python3 blackbox/run.py --module community.sqlite
 ```
-
-`community.vdbench` is a manual-dependency module and is excluded from broad
-selectors unless `INCLUDE_MANUAL=1` is set or it is selected explicitly with
-`--module`.
 
 ## Dependencies
 
@@ -79,7 +74,6 @@ LTP_INSTALL_ROOT=/path/to/ltp-install
 FIO_BIN=/path/to/fio
 MDTEST_BIN=/path/to/mdtest
 MPICC=/path/to/mpicc
-VDBENCH_BIN=/path/to/vdbench       # vdbench is never auto-fetched (Oracle download)
 FSX_BIN=/path/to/fsx
 SPEEDTEST1_BIN=/path/to/speedtest1
 MPTEST_BIN=/path/to/mptester          # upstream binary name is mptester
@@ -236,9 +230,8 @@ retain their own licenses and notices.
 - **secfs.test / fsx**: https://github.com/billziss-gh/secfs.test — Apache-2.0
 - **fio**: https://github.com/axboe/fio — GPL-2.0-only
 - **IOR / mdtest**: https://github.com/hpc/ior — GPL-2.0-only
-- **vdbench**: Oracle distribution (manual download, not auto-fetched).
 - **SQLite** (`speedtest1`, `mptester`): https://github.com/sqlite/sqlite — public domain ([blessing](https://sqlite.org/copyright.html))
 
-fio, mdtest/IOR, vdbench, Python xattr bindings, and platform tools may be
+fio, mdtest/IOR, Python xattr bindings, and platform tools may be
 provided by the host environment or installed by CI. Their own distribution
 licenses apply.

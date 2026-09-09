@@ -257,6 +257,9 @@ FUSE_PROFILE=coding-agent-extent make e2e-local
 # sqlite-only:
 FUSE_PROFILE=coding-agent-extent \
   DRIVE9_LOCAL_E2E_SMOKE_SCRIPT=e2e/fuse-sqlite-correctness.sh make e2e-local
+# full extent sweep (every optional workload + POSIX + the extent e2e):
+FUSE_PROFILE=coding-agent-extent RUN_FUSE_ALL_WORKLOADS=1 \
+  RUN_FUSE_SQLITE_COMMIT_SEQUENCE=1 RUN_POSIX_SMOKE=1 RUN_EXTENT_E2E=1 make e2e-local
 ```
 
 `fuse-patch-storage-class.sh` ignores `FUSE_PROFILE` (it needs single-blob PATCH).
@@ -510,6 +513,39 @@ Honor `FUSE_PROFILE` so the same script covers the default FS and
 Not part of the PR fuse-release-gate. `local-e2e.yml` runs it on post-merge,
 nightly, `run_all_e2e=1`, or `run_fuse_sqlite_commit_sequence=1`. Set
 `RUN_FUSE_SQLITE_COMMIT_SEQUENCE=1` to add it to `fuse-release-gate.sh`.
+
+### `extent-rename-mixed-dir.sh`
+
+Host support: Linux and macOS only. Manual-only: it needs a server whose
+`content_layout=extent` data plane is live (`POST /v1/data-credential` must
+return usable credentials), which the PR-gate local stack does not guarantee.
+Run it with `RUN_EXTENT_E2E=1` in `smoke-all.sh`, or directly with
+`DRIVE9_BASE=... bash e2e/extent-rename-mixed-dir.sh`.
+
+It mounts with a MIXED profile written to a throwaway `$HOME/.drive9/profiles/`
+(`EXTENT_E2E_PATTERNS`, default `*.db`, `*.db-wal`, `*.db-journal`, `*.db-shm`),
+so only matching names become extent and everything else stays single.
+
+1. Provision tenant unless `DRIVE9_API_KEY` is already set
+2. Prepare `drive9` CLI binary (build local or download official release)
+3. Assert `profile show` round-trips the `[extent]` section
+4. A: create a single file, rename it onto a `*.db` name, require the layout to
+   stay `single`, bytes and later appends to stay intact
+5. B: create an extent file, rename it off the pattern, require the layout to
+   stay `extent` with the SAME `X-Dat9-Extent-Ino` and intact bytes
+6. C: build a directory with extent + single children and a subdirectory, then
+   `ls`, rename the directory, and re-verify every child's layout, `extent_ino`,
+   bytes, and writability; finally `rm -rf` it and re-create the path
+7. D: unlink + re-create one extent path and require a NEW `extent_ino`
+8. E: rename extent -> extent inside one directory and require the same inode
+9. Unmount, rename a mixed directory through the CLI (`fs mv`) and delete
+   another tree through the CLI (`fs rm -r`)
+10. Remount: children of the CLI-renamed directory must still read, write, and
+    unlink with stable layout/`extent_ino`; `mkdir` + `rmdir` of the CLI-deleted
+    path must succeed (orphan JuiceFS dir-edge guard)
+11. Optional `EXTENT_E2E_SQL_ORPHAN_CHECK=1` asserts via `POST /v1/sql` that
+    `jfs_edge` holds no leftover edge for the deleted name
+12. Preserve run root and mount log on failure or `EXTENT_E2E_KEEP_ARTIFACTS=1`
 
 ### `fuse-s3-express-append-log.sh`
 
@@ -864,6 +900,13 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `FUSE_SQLITE_COMMIT_TIMEOUT_S` | `600` | `fuse-sqlite-commit-sequence.sh` |
 | `FUSE_SQLITE_COMMIT_DURABILITY` | `fsync` | `fuse-sqlite-commit-sequence.sh` |
 | `FUSE_SQLITE_COMMIT_KEEP_ARTIFACTS` | `0` | `fuse-sqlite-commit-sequence.sh` |
+| `RUN_EXTENT_E2E` | `0` | `smoke-all.sh` opt-in extra (`e2e/extent-rename-mixed-dir.sh`) |
+| `EXTENT_E2E_PROFILE` | `extent-mixed` | `extent-rename-mixed-dir.sh` |
+| `EXTENT_E2E_PATTERNS` | `*.db`, `*.db-wal`, `*.db-journal`, `*.db-shm` | `extent-rename-mixed-dir.sh` |
+| `EXTENT_E2E_PAYLOAD_KB` | `256` | `extent-rename-mixed-dir.sh` |
+| `EXTENT_E2E_DURABILITY` | *(CLI default)* | `extent-rename-mixed-dir.sh` |
+| `EXTENT_E2E_SQL_ORPHAN_CHECK` | `0` | `extent-rename-mixed-dir.sh` |
+| `EXTENT_E2E_KEEP_ARTIFACTS` | `0` | `extent-rename-mixed-dir.sh` |
 | `FUSE_CONCURRENCY_WORKERS` | `4` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_FILES_PER_WORKER` | `8` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_READER_WORKERS` | `2` | `fuse-concurrency-stress.sh` |

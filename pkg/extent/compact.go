@@ -6,6 +6,7 @@ import (
 
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/vfs"
+	"github.com/sirupsen/logrus"
 )
 
 // ExecuteCompact merges one chunk's slices, uploads the new blob, and CAS-commits.
@@ -42,10 +43,32 @@ func ExecuteCompact(rt *Runtime, ino uint64, indx uint32) error {
 		return fmt.Errorf("compact data: %w", err)
 	}
 	st := jfsmeta.Drive9CommitCompact(unwrapDrive9Meta(rt.Meta), jfsmeta.Ino(ino), indx, origin, skipped, pos, id, size)
+	if st == syscall.EINVAL {
+		// CAS lost: another executor compacted the same chunk first, so the
+		// blob we just uploaded is referenced by nothing. JuiceFS hands it to
+		// deleteSlice; do the same or it leaks forever (P0-2).
+		enqueueSliceGC(rt, id, size)
+	}
 	if st != 0 {
 		return st
 	}
 	return nil
+}
+
+// enqueueSliceGC asks the server to schedule block GC for a slice that will
+// never be referenced. Best effort: a failure leaves the blob for a later
+// orphan scan.
+func enqueueSliceGC(rt *Runtime, id uint64, size uint32) {
+	if rt == nil || rt.Transport == nil || id == 0 || size == 0 {
+		return
+	}
+	var resp struct {
+		Errno int `json:"errno"`
+	}
+	if st := rt.Transport.Call(jfsmeta.Background(), jfsmeta.Drive9OpDeleteSlice,
+		map[string]any{"id": id, "size": size}, &resp); st != 0 || resp.Errno != 0 {
+		logrus.Warnf("extent compact: enqueue GC for slice %d (%d bytes) failed: status=%d errno=%d", id, size, st, resp.Errno)
+	}
 }
 
 // juiceMaxCompactSlices is JuiceFS maxCompactSlices (pkg/meta/base.go).

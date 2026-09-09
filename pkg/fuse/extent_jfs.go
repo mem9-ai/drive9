@@ -42,13 +42,15 @@ func (fs *Dat9FS) ensureExtentRuntime() error {
 	// The extent data plane always runs JuiceFS writeback: the cache root is
 	// mount-scoped under the drive9 cache dir (JuiceFS keeps chunks and
 	// staging in its jfs/ subdir), so writeback no longer depends on an
-	// explicit --cache-dir.
+	// explicit --cache-dir. The per-tenant key keeps two tenants that share
+	// --cache-dir from serving each other's blocks.
 	cacheDir := fs.extentCacheDir
 	if cacheDir == "" && fs.opts != nil {
 		cacheDir = fs.opts.CacheDir
 	}
 	rt, err := extent.NewRuntime(extent.RuntimeConfig{
 		CacheDir:  cacheDir,
+		CacheKey:  extent.CacheKeyForPrefix(cred.Prefix),
 		Transport: extent.NewHTTPTransport(fs.client),
 		Storage:   store,
 		Writeback: true,

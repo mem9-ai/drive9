@@ -1,10 +1,13 @@
 package extent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +38,11 @@ type RuntimeConfig struct {
 	// its chunk cache and writeback staging in the jfs/ subdirectory. It
 	// defaults under the drive9 user cache dir when Writeback is requested.
 	CacheDir string
+	// CacheKey namespaces the cache root per filesystem (tenant). Slice ids
+	// restart at 1 in every tenant and the cache key carries no filesystem
+	// identity, so two tenants sharing CacheDir would otherwise overwrite and
+	// serve each other's blocks. Use CacheKeyForPrefix.
+	CacheKey string
 	// Writeback stages writes locally and uploads them in the background
 	// (JuiceFS --writeback). FUSE mounts always enable it.
 	Writeback bool
@@ -60,7 +68,12 @@ const juiceWritebackBufferSize = 300 << 20
 func juiceMetaConf() *jfsmeta.Config {
 	conf := jfsmeta.DefaultConf()
 	conf.NoBGJob = true
-	conf.MaxDeletes = 0
+	// MaxDeletes must stay > 0: baseMeta.deleteSlice is the only path that
+	// hands a dead slice to the server's delete_slice op (block GC). With 0,
+	// the CAS loser of a compaction leaks the blob it uploaded, and slice GC
+	// from truncate/overwrite leaks too. NoBGJob still keeps cleanupDeleted-
+	// Files/Slices/Trash off (drive9 drains those server-side).
+	conf.MaxDeletes = 10
 	conf.Heartbeat = 12 * time.Second
 	conf.OpenCache = time.Second
 	conf.OpenCacheLimit = 10000
@@ -152,6 +165,32 @@ func extentCacheRoot(configured string) string {
 	return filepath.Join(base, "drive9")
 }
 
+// extentChunkCacheRoot is the JuiceFS cache root for one filesystem: the
+// mount-scoped root plus the per-filesystem cache key. JuiceFS appends its own
+// format UUID below it, so the final path is
+// <configured>/jfs/<cacheKey>/<uuid>/{raw,rawstaging}.
+func extentChunkCacheRoot(configured, cacheKey string) string {
+	root := extentCacheRoot(configured)
+	if cacheKey == "" {
+		return root
+	}
+	return filepath.Join(root, cacheKey)
+}
+
+// CacheKeyForPrefix derives the per-filesystem cache key from the data
+// credential prefix (server-side `t/<tenant>/`). Slice ids and the JuiceFS
+// format UUID are identical across tenants, so the local cache/staging tree
+// must be namespaced by something tenant-stable; the credential prefix is
+// stable across API key rotation.
+func CacheKeyForPrefix(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(prefix))
+	return hex.EncodeToString(sum[:8])
+}
+
 func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	if cfg.Transport == nil {
 		return nil, fmt.Errorf("extent runtime: missing meta transport")
@@ -196,8 +235,8 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	if cfg.CacheDir != "" || cfg.Writeback {
 		// Writeback is never left without a cache root: an empty dir would
 		// make chunk.SelfCheck fall back to memory mode and silently drop
-		// writeback.
-		applyChunkCacheDir(&chunkConf, extentCacheRoot(cfg.CacheDir))
+		// writeback. The per-filesystem key keeps tenants apart.
+		applyChunkCacheDir(&chunkConf, extentChunkCacheRoot(cfg.CacheDir, cfg.CacheKey))
 	}
 	loaded := m.GetFormat()
 	chunkConf.SelfCheck(loaded.UUID)

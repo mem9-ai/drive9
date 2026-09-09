@@ -372,6 +372,13 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 	if hasChildren {
 		return fmt.Errorf("%w: %s", ErrDirectoryNotEmpty, path)
 	}
+	// The projection is empty, but the jfs tree may still hold this
+	// directory's edge (a previous rm -r/mv only touched file_nodes). Remove
+	// it in the same transaction or the next mkdir+rmdir fails ENOTEMPTY.
+	extentIno, err := s.dirExtentInoTx(ctx, tx, path)
+	if err != nil {
+		return err
+	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ? AND is_directory = 1`),
 		s.scope.Args(fileNodePathHash(path), path)...)
 	if err != nil {
@@ -380,6 +387,9 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return ErrNotFound
+	}
+	if err := s.jfsDeleteSubtreeTx(tx, extentIno); err != nil {
+		return err
 	}
 	err = tx.Commit()
 	return err
@@ -674,7 +684,36 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 		if hasChild {
 			return 0, ErrPathConflict
 		}
+		// The overwritten destination may still own a jfs subtree; drop it
+		// together with its projection row.
+		var dstExtentIno uint64
+		_ = tx.QueryRowContext(ctx, `SELECT COALESCE(extent_ino, 0) FROM file_nodes WHERE `+
+			s.scope.And(`node_id = ?`), s.scope.Args(dst.nodeID)...).Scan(&dstExtentIno)
 		if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(`node_id = ?`), s.scope.Args(dst.nodeID)...); err != nil {
+			return 0, err
+		}
+		if err := s.jfsDeleteSubtreeTx(tx, dstExtentIno); err != nil {
+			return 0, err
+		}
+	}
+
+	// Move the directory's jfs edge in the same transaction: children are
+	// keyed by parent inode, so a FUSE-side second step is unnecessary and
+	// non-FUSE renames (CLI/HTTP) no longer fork the jfs tree (P0-3, P1-1).
+	var srcExtentIno uint64
+	_ = tx.QueryRowContext(ctx, `SELECT COALESCE(extent_ino, 0) FROM file_nodes WHERE `+
+		s.scope.And(`path_hash = ? AND path = ?`),
+		s.scope.Args(fileNodePathHash(oldPrefix), oldPrefix)...).Scan(&srcExtentIno)
+	newParentPath := parentPath(newPrefix)
+	newParentIno := jfsRootIno
+	if newParentPath != "/" && newParentPath != "" {
+		newParentIno = 0
+		_ = tx.QueryRowContext(ctx, `SELECT COALESCE(extent_ino, 0) FROM file_nodes WHERE `+
+			s.scope.And(`path_hash = ? AND path = ?`),
+			s.scope.Args(fileNodePathHash(newParentPath), newParentPath)...).Scan(&newParentIno)
+	}
+	if srcExtentIno != 0 && newParentIno != 0 {
+		if err := s.jfsRenameDirEdgeTx(tx, srcExtentIno, newParentIno, baseName(newPrefix)); err != nil {
 			return 0, err
 		}
 	}
@@ -2043,6 +2082,15 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Capture the directory's jfs inode before its projection row is deleted:
+	// the jfs subtree (edges/nodes of the directory and any orphan children)
+	// has to go in the same transaction (P0-3). Callers pass the path with or
+	// without the trailing slash, so accept both.
+	extentIno, err := s.dirExtentInoTx(ctx, tx, dirPath)
+	if err != nil {
+		return nil, err
+	}
+
 	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT file_id FROM file_nodes
 		WHERE `+s.scope.And(`(path = ? OR path LIKE ?) AND file_id IS NOT NULL`), s.scope.Args(dirPath, dirPath+"%")...)
 	if err != nil {
@@ -2093,8 +2141,18 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		}
 	}
 
+	if err := s.jfsDeleteSubtreeTx(tx, extentIno); err != nil {
+		return nil, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	// Files that had no projection row (orphan jfs children) were recorded in
+	// jfs_delfile above; reclaim their blocks now instead of waiting for the
+	// tenant worker.
+	if extentIno != 0 {
+		_, _ = s.DrainPendingDeletedFiles(ctx, 16)
 	}
 	out = orphaned
 	return out, nil
@@ -3069,6 +3127,23 @@ func coalesceTime(t *time.Time, fallback time.Time) time.Time {
 		return *t
 	}
 	return fallback
+}
+
+// dirExtentInoTx returns the JuiceFS inode recorded on a directory projection
+// row. Callers pass the path with or without the trailing slash.
+func (s *Store) dirExtentInoTx(ctx context.Context, tx *sql.Tx, path string) (uint64, error) {
+	withSlash := path
+	if !strings.HasSuffix(withSlash, "/") {
+		withSlash += "/"
+	}
+	var ino uint64
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(extent_ino, 0) FROM file_nodes WHERE `+
+		s.scope.And(`is_directory = 1 AND ((path_hash = ? AND path = ?) OR (path_hash = ? AND path = ?))`),
+		s.scope.Args(fileNodePathHash(path), path, fileNodePathHash(withSlash), withSlash)...).Scan(&ino)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return ino, err
 }
 
 func parentPath(p string) string {

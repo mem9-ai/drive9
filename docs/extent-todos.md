@@ -47,10 +47,6 @@ Two invariants (**no fix may break these**):
 
 | ID | Severity | One-liner | Impact |
 |---|---|---|---|
-| P0-1 | Critical | Deleting an extent file **reclaims no S3 blocks**: `jfs_delfile` has no consumer, and the slice list is deleted in the same transaction | Permanent space leak (main path) |
-| P0-2 | Critical | The CAS loser of a compaction **never cleans up the blob it uploaded** | One leaked object per concurrent compact |
-| P0-3 | Critical | Server-side directory operations (`fs rm -r` / `fs mv`) **never touch the jfs tree** | Orphan dir edges → empty dir cannot be removed, same-name create fails EEXIST, deletes leak |
-| P0-4 | Critical | The local JuiceFS cache directory is **shared by every tenant** (hardcoded format UUID + slice ids restart per tenant) | Cross-tenant data leak/corruption through the read cache and the writeback staging dir |
 | P1-1 | High | FUSE directory rename is two non-atomic steps and the second step's error is swallowed; the directory `extent_ino` is not exposed to clients | jfs directory tree diverges; behavior degrades across mount/remount |
 | P1-2 | High | compact claim is an **overwrite-style lease**, and the self-feeding scan is **unindexed** | Duplicate merges, duplicate uploads, full table scans |
 | P1-3 | High | block GC has **no grace period** (ignores `available_at`) | Readers on another mount can hit a block that was just deleted |
@@ -61,155 +57,6 @@ Two invariants (**no fix may break these**):
 | P2-1 | Medium | Projection size is not kept in sync (Write only updates `jfs_node.length`) | `ls -l` shows a stale size when the jfs overlay misses |
 | P2-2 | Medium | STS grants that can be narrowed (DeleteObject / multipart / static branch has no IAM / TTL has no jitter / per-process mint) | Over-broad permissions + STS noise |
 | P2-3 | Low | Server-side fallback compactor builds a new Runtime per task (new session never closed) + `WrapS3` reads the whole blob into memory | Session churn, memory spikes |
-| Q-1 | To confirm | `TestExtentUnlinkEnqueuesBlockGC` disagrees with the implementation and may be red | Run it before touching P0-1 |
-
----
-
-# P0-1 Deleting an extent file reclaims no S3 blocks
-
-**Symptom** [verified]
-After `rm` / `rm -r` / the last open-unlinked handle closing, **not a single object under `t/<tenant>/chunks/...` is deleted**. Only **compaction** reclaims space.
-
-**Root cause**
-`jfsEnqueueFileGCTx` does two things, and **nothing consumes either of them**:
-
-```go
-// pkg/datastore/jfs.go:1698
-DELETE FROM jfs_chunk WHERE inode = ?                                  // (1) throws away the slice list
-INSERT IGNORE INTO jfs_delfile (inode, length, expire) VALUES (?,?,?)  // (2) keeps only inode/length
-```
-
-1. **`jfs_delfile` has no consumer**: repo-wide the table appears only in the schema, this one INSERT, and `internal/testtidb`'s truncation list.
-2. The fork side is stubbed anyway: `drive9_engine.go:653-657` has `doFindDeletedFiles` returning nothing and `doDeleteFileData` as a no-op; on top of that `conf.NoBGJob = true` (`pkg/extent/runtime.go:57`) means the `cleanupDeletedFiles` goroutine never starts (fork `pkg/meta/base.go:808-815`).
-3. **Worse, point (1)**: upstream's `doDeleteFileData` (fork `pkg/meta/sql.go:3781`) **keeps the chunk rows** and walks them in the background → `deleteChunk` → slice refs-- → GC. Here `jfs_chunk` is deleted, so the delfile row only holds `(inode, length, expire)` — **not even the slice ids survive**, which means that even if a drain were added, it could not locate the object keys.
-
-Call sites:
-- `jfsUnlinkTx` (`jfs.go:1201`, nlink→0 and not open)
-- `jfsDeleteSustainedTx` (`jfs.go:1726`, last open-unlinked handle released)
-
-**Why it was written this way**: the comment at `jfs.go:1699-1702` says "Walking every 24-byte slice here made delete-journal COMMIT unlink take seconds (sqlite `--wait all` is 10s)" — i.e. walking slices inside the unlink transaction was too slow. The intent was to mirror JuiceFS's `MaxDeletes=0` model, but the "keep the chunk rows + drain them in the background" half was left out.
-
-**How to verify**
-- Unit test: `pkg/datastore/jfs_data_test.go:719 TestExtentUnlinkEnqueuesBlockGC` asserts that after unlink `ListPendingBlockGC` contains a `99_` key — which contradicts the current implementation (see Q-1; run it first).
-- e2e: run `e2e/extent-rename-mixed-dir.sh` with `EXTENT_E2E_SQL_ORPHAN_CHECK=1`, or query `SELECT COUNT(*) FROM block_gc_tasks` / `SELECT COUNT(*) FROM jfs_delfile` through `POST /v1/sql`.
-
-**Suggested fix (pick one)**
-- **Option A (align with upstream)**: stop doing `DELETE FROM jfs_chunk` in `jfsEnqueueFileGCTx`; only write `jfs_delfile`. Then implement the drain in the server tenant worker: pick delfile rows with `expire <= now - grace` → walk that inode's `jfs_chunk` (100 chunks per round, like upstream) → `jfs_chunk_ref.refs-1` → write slices with refs≤0 into `block_gc_tasks` → delete the delfile row.
-- **Option B (no schema change)**: keep the chunk rows inside the unlink/sustained transaction; **after it commits**, use a separate transaction (mirroring `runCompactOp`'s two-phase shape, `jfs.go:264-269`) to turn that file's slices directly into `block_gc_tasks` rows. Do not stretch the `FOR UPDATE` across an S3 call.
-
-**Acceptance criteria**
-- After unlinking an extent file that wrote a large slice, `block_gc_tasks` contains the matching `chunks/<id/1e6>/<id/1e3>/<id>_i_len` rows;
-- After one server worker pass the S3 objects are gone and the rows are `COMPLETED`;
-- If a crash lands between "projection deleted" and "GC rows inserted", the next scan pass still recovers it (eventual consistency is fine; permanent leakage is not).
-
----
-
-# P0-2 The CAS loser of a compaction never cleans up the blob it uploaded
-
-**Symptom** [verified]
-When two executors merge the same chunk concurrently, only one wins the CAS; **the loser's freshly uploaded merged blob becomes a permanent orphan** (no `jfs_chunk_ref` row, no `block_gc_tasks` row, nothing can reclaim it).
-
-**Root cause**
-- Upstream calls `m.deleteSlice(id, size)` on CAS failure (`EINVAL`) (fork `pkg/meta/base.go:2896-2898`) to hand the just-uploaded slice back to GC.
-- Two places cut that wire for us:
-  1. `conf.MaxDeletes = 0` (`pkg/extent/runtime.go:58`) → `baseMeta.deleteSlice` returns immediately (fork `base.go:2996-2998`) → nothing enters `m.dslices`, the `delete_slice` op is never called.
-  2. Our own `ExecuteCompact` does not call deleteSlice either: `pkg/extent/compact.go:44-47` returns the error as soon as `Drive9CommitCompact` is non-zero.
-- Concurrency sources (**multiple mounts only amplify this; a single mount already hits it**):
-  - read path: any chunk with ≥5 slices triggers `go compactChunk` (fork `base.go:2125`; `once=false` skips the 2500 threshold check);
-  - write path: `numSlices%100==99 || numSlices>350` triggers it; at `≥maxSlices(2500)` it runs **synchronously inside Write** (fork `base.go:2177-2180`);
-  - claim loop: `extentCompactLoop` (`pkg/fuse/extent_ops.go:610`, every 2s) calls `ExecuteCompact` directly, **bypassing `baseMeta.compacting`'s in-process dedup**, so it can race the same process's write/read triggers;
-  - N mounts + the server fallback → N× the probability.
-
-**How to verify**
-- Single process: for an extent file with many small slices, trigger the claim loop and a large write at the same time, then look for `chunks/<newid>/...` in S3 with no matching `jfs_chunk_ref` row.
-- Multiple mounts: have two mounts read the same file at the same time (≥5 slices triggers compaction) and assert the loser's blob key lands in `block_gc_tasks` (today it does not).
-- Metrics: `vfs.Compact` Put count vs. new `jfs_chunk_ref` rows.
-
-**Suggested fix**
-- Preferred: **do not set `MaxDeletes = 0`** (or at least route `deleteSlice` through the `delete_slice` op) so upstream's loser cleanup works; note `delete_slice` → `jfsEnqueueSliceGCTx` (`jfs.go:1597`) → `block_gc_tasks` already exists.
-- Alternative: explicitly call `delete_slice` in the failure branches of both `ExecuteCompact` and the fork's `doCompactChunk` (this needs a call site exposed on the transport).
-- Also: make the claim loop participate in `m.compacting` dedup (or at least avoid compacting a chunk the write path is already compacting).
-
-**Acceptance criteria**
-- The blob uploaded by the CAS loser always appears in `block_gc_tasks` (or is deleted outright);
-- After N rounds of concurrent compaction, no `chunks/*` object exists that is "referenced by no `jfs_chunk_ref` row and absent from the GC queue".
-
----
-
-# P0-3 Server-side directory operations never touch the JuiceFS tree
-
-**Symptom** [verified]
-After a CLI/HTTP `fs rm -r <dir>` / `fs mv <dir> <dir2>`:
-
-- Re-creating an empty directory with the same name and then **`rmdir` returns ENOTEMPTY** (the jfs side still holds an orphan child edge);
-- Deleting an extent child of that directory from a new mount **silently leaks** the jfs node + S3 blocks (parent resolution lands on the new empty inode → jfs Unlink returns ENOENT, which is tolerated).
-
-**Root cause**
-1. The server-side directory implementations only touch the projection:
-   - `RenameDir` (`pkg/datastore/store.go:600`): only `UPDATE file_nodes SET path/...`;
-   - `DeleteDirRecursive` (`store.go:2032`) → `unlinkExtentTree` (`pkg/datastore/jfs.go:2033`): the query is `is_directory = 0 AND content_layout = 'extent'`, so it **only removes extent files**; the directory's own `jfs_node`/`jfs_edge` rows stay;
-   - `DeleteEmptyDir` (`store.go:358`) and `DeleteNodesByPrefix` (`store.go:388`) likewise never touch jfs.
-2. Repo-wide, `DELETE FROM jfs_edge` / `DELETE FROM jfs_node` appear only in `jfs.go`'s unlink / rmdir / rename, and are only reachable through JuiceFS meta RPCs.
-3. Why `rmdir` hits ENOTEMPTY: `jfsRmdirTx` (`jfs.go:1239`) first runs `SELECT COUNT(*) FROM jfs_edge WHERE parent = ?` and returns ENOTEMPTY when >0 (`jfs.go:1252-1258`). The projection is empty, but jfs still holds the orphan `sub` edge.
-
-**Reproduction**
-- Already pinned down as case **G** in `e2e/extent-rename-mixed-dir.sh`:
-  1. inside the mount create `cli-rm/a.db` (extent) and `cli-rm/sub/c.db`;
-  2. unmount, run `drive9 fs rm -r :/cli-rm`;
-  3. remount, `mkdir cli-rm` (hits EEXIST→Lookup and reuses the orphan inode) → `rmdir cli-rm` → **fails today (ENOTEMPTY)**.
-- Case **F** covers the other half: after a CLI `fs mv` of a directory, the extent children are still readable/writable/deletable (projection side is fine), but the jfs directory name is stale → a new mount creates a second, empty dir inode for the same path.
-
-**Suggested fix**
-- Make server-side directory operations inline the jfs changes **in the same transaction** (this is the real fix; the FUSE two-step only ever covers FUSE clients):
-  - `RenameDir`: use `file_nodes.extent_ino` (both source and target directory rows have it — see P1-1) to move one `jfs_edge`; children are keyed by parent inode, so no per-file work is needed;
-  - `DeleteDirRecursive`: recursively delete the subtree's `jfs_edge`/`jfs_node` rows (and reuse P0-1's block GC);
-  - `DeleteEmptyDir`: delete the directory's `jfs_edge` + `jfs_node`.
-- Belt and braces: add an orphan-repair task (scan `jfs_edge` for edges whose parent no longer exists in `file_nodes` or whose path disagrees, plus `jfs_node` rows with nlink>0 and no reachable edge) that reclaims blocks through the P0-1 replacement.
-
-**Acceptance criteria**
-- `rmdir` in case G of `e2e/extent-rename-mixed-dir.sh` passes;
-- After `fs rm -r`, `SELECT COUNT(*) FROM jfs_edge WHERE name = _binary'<dir>'` is 0;
-- After `fs mv`, the jfs tree contains only the edge under the new name.
-
----
-
-# P0-4 All tenants share one local JuiceFS cache directory: cross-tenant block collision
-
-**Symptom** [verified]
-When a mount passes `--cache-dir DIR` (the only way to turn on the chunk-layer write-back cache, see the note below), the local cache root is `<DIR>/jfs/drive9-extent/` — **identical for every tenant**. Because the cache key carries no filesystem identity and every tenant's slice ids start at 1, two tenants mounted on the same host with the same `--cache-dir` overwrite and serve each other's blocks:
-
-- a **read** of tenant B's slice can be served from tenant A's cached file (same id/index/length) → B receives A's bytes;
-- a **write** stages into the same `rawstaging/` path, so a leftover staged block can be uploaded as B's object (and vice versa);
-- eviction (`cache.used` accounting) also evicts the other tenant's blocks.
-
-This is a **data-correctness / isolation bug**, not a perf bug: the bytes are self-consistent (the cache file carries its own checksum), so nothing downstream detects the mixup.
-
-**Root cause** (three independent facts, all required for the collision)
-1. **The format UUID is a hardcoded constant**: `pkg/extent/runtime.go:148` sets `Format{UUID: "drive9-extent"}` for every tenant. The server stores that JSON per tenant (`jfsStoreFormatTx`, `pkg/datastore/jfs.go:830`), and `NewRuntime` re-runs `m.Init(format, …)` on every mount, so every tenant keeps the same UUID. `chunk.Config.SelfCheck` then appends the UUID to the cache dir (fork `pkg/chunk/cached_store.go:594-597`, `filepath.Join(ds[i], uuid)`), and `applyChunkCacheDir` only adds a `jfs/` component (`runtime.go:74`) — so the final path has no per-tenant component.
-2. **The cache key has no fs/tenant component**: `rSlice.key` produces `chunks/<id/1e6>/<id/1e3>/<id>_<indx>_<blen>` (fork `pkg/chunk/cached_store.go:77-82`; `HashPrefix` is off), `getCacheKey` parses only id/index/size (`disk_cache.go:603-640`), and `cachePath`/`stagePath` join that onto `raw/` and `rawstaging/` (`disk_cache.go:728-734`). Nothing in the local path derives from the tenant prefix `t/<tenant>/` that the server adds to the S3 key.
-3. **The slice id space restarts per tenant**: `jfsInitTx` seeds `nextChunk = 1` (`pkg/datastore/jfs.go:747`), the fork allocates in batches of `sliceIdBatch = 4 << 10` (`pkg/meta/base.go:51`) and `NewSlice` sets `freeSlices.next = v - sliceIdBatch` (`base.go:2131-2141`), so the **first slice id is 1 in every tenant** and the low ids are dense and identical across tenants. Two files of comparable shape therefore collide almost immediately.
-
-**Scope / trigger**
-- Only when `--cache-dir` is set: `pkg/fuse/extent_jfs.go:50` sets `Writeback: cacheDir != ""`, and `cmd/drive9/cli/mount.go:168` defaults `--cache-dir` to `""` (the `~/.cache/drive9` default is only used for drive9's own read cache / append-log journal, `pkg/fuse/mount.go:428`). Without `--cache-dir` the chunk store runs `CacheDir="memory"` and write-back is disabled, so there is no shared on-disk cache.
-- The blackbox harness **always** passes `--cache-dir` (`blackbox/harness/target.py:566-569`), as do `e2e/fuse-crash-recovery-test.sh:128` and `e2e/fuse-write-perf-budget-test.sh:152`, so any two suites/tenants sharing one host cache root hit this.
-- drive9's own read cache is unaffected: it is namespaced by `MountReadCacheHash(server, mountpoint, remoteRoot, credential)`.
-
-**How to verify**
-- Two tenants on one host, both mounted with the same `--cache-dir`:
-  1. tenant A writes a 4 MiB-aligned file as its first extent file (slice id 1, block 0, len 4194304);
-  2. `ls -l <cache-dir>/jfs/drive9-extent/raw/chunks/0/0/` shows `1_0_4194304` — then tenant B reads its own first file and must not see A's bytes;
-  3. simplest static check: assert that the resolved cache root (`chunk.Config.CacheDir` after `SelfCheck`) differs between two tenant runtimes — today it does not.
-- `pkg/extent/runtime_test.go:98` already pins the hardcoded `"drive9-extent"` UUID; extend it to assert a per-tenant/per-fs component.
-
-**Suggested fix** (pick one, but keep the crash-replay property in mind)
-- **Preferred: make the cache root per-filesystem.** Give each tenant a stable UUID (derive it from the tenant id / server prefix instead of the literal `"drive9-extent"`) so `SelfCheck` produces `<cache-dir>/jfs/<tenant-uuid>/`. `RuntimeConfig` (`pkg/extent/runtime.go:33`) needs a new field plumbed from `pkg/fuse/extent_jfs.go`; the server-side fallback runtime (`pkg/server/extent_meta.go:212`) can pass the same value or leave the cache off.
-- **Alternative: namespace the cache dir before `SelfCheck`** — `applyChunkCacheDir` could append a per-tenant/mount component (e.g. `path.Join(cacheDir, "jfs", tenantKey)`), which is enough because `SelfCheck` only appends the UUID onto whatever directory it is given.
-- Do **not** fix this by clearing the cache dir on exit: the whole point of `scanStaging` (`disk_cache.go:1016-1062`, `cached_store.go:1100-1116`) is that staged blocks survive a crash and are re-uploaded on remount of the same directory.
-
-**Acceptance criteria**
-- Two tenants mounted with the same `--cache-dir` on one host resolve to different cache roots, and tenant B reading its own file after tenant A wrote returns B's bytes (test at the `extent.NewRuntime` level plus one e2e case);
-- The crash-recovery replay still works: a staged block left by a crashed mount is re-uploaded on remount of that tenant's cache dir;
-- No regression to the existing "same tenant, two mount points, one cache dir" reuse.
 
 ---
 
@@ -230,7 +77,7 @@ A FUSE `mv <dir> <dir2>` is **two independent transactions**, and the second one
 - Case F (`e2e/extent-rename-mixed-dir.sh`) already covers "CLI directory rename + remount + read/write/delete"; turn on `EXTENT_E2E_SQL_ORPHAN_CHECK=1` to see whether an extra edge under the old name remains.
 
 **Suggested fix**
-- Short term: when `extentRenameDirEdge` fails, at least **log and return an error** (so the FUSE rename fails as a whole) instead of silently succeeding; or fold the directory's jfs rename into the server's `RenameDir` (same transaction — see P0-3) and delete the FUSE step entirely.
+- Short term: when `extentRenameDirEdge` fails, at least **log and return an error** (so the FUSE rename fails as a whole) instead of silently succeeding; or fold the directory's jfs rename into the server's `RenameDir` (same transaction) and delete the FUSE step entirely. **Done for the server side**: `RenameDir` now moves the directory's `jfs_edge` in its own transaction (see the P0-3 fix), so a CLI/HTTP rename no longer forks the tree and the FUSE second step is redundant (it currently returns ENOENT, which the caller ignores). Still open here: the swallowed error, `RENAME_EXCHANGE`, and exposing the directory `extent_ino`.
 - Medium term: **expose the directory's `extent_ino` to clients via stat/lookup** (for example also set `content_layout='extent'` on directory rows, or add a dedicated header) so parent resolution no longer depends on rebuilding by name.
 
 **Acceptance criteria**
@@ -447,14 +294,10 @@ Current flow (`pkg/server/extent_meta.go:61-120`, `pkg/s3client/aws.go:264-304`)
 
 ---
 
-# Q-1 Questions to confirm first
+# Q-1 Remaining questions
 
-1. **Is `TestExtentUnlinkEnqueuesBlockGC` (`pkg/datastore/jfs_data_test.go:719`) red right now?**
-   It asserts that after unlink `block_gc_tasks` contains a `99_` key, but `jfsEnqueueFileGCTx` never writes that table (P0-1). `newTestStore` calls `testtidb.ResetDB` (`pkg/datastore/store_test.go:20-29`), so in theory no leftover row can make it pass by accident.
-   Run: `DRIVE9_TEST_TIDB_DSN=... make test TEST_RUN=TestExtentUnlinkEnqueuesBlockGC TEST_PKGS=./pkg/datastore/...`
-   (`ResetDB` wipes the test database, so do not run this concurrently with other test runs that share the same DSN.)
-2. **Are there other sources of the P0-3 orphan edges?** `DeleteNodesByPrefix`, layer discard, and the fork cleanup paths all delete projection rows; use `grep -rn "DELETE FROM file_nodes"` to check each one for the jfs cleanup it may need.
-3. **Semantics of a directory's extent_ino**: `jfsMknodTx`/`jfsEnsureParentsTx` already write `extent_ino` on directory rows, but no `content_layout`. Before exposing it to clients, confirm every read path (stat/list/lookup) can carry it safely.
+1. **Are there other sources of P0-3 orphan edges?** The server-side directory paths are fixed (`DeleteEmptyDir`, `DeleteDirRecursive`, `RenameDir` all touch the jfs tree now). `DeleteNodesByPrefix` has no callers today; if a new path deletes `file_nodes` rows directly, check whether it needs the same jfs cleanup (`grep -rn "DELETE FROM file_nodes"`).
+2. **Semantics of a directory's extent_ino**: `jfsMknodTx`/`jfsEnsureParentsTx` already write `extent_ino` on directory rows, but no `content_layout`. Before exposing it to clients (P1-1), confirm every read path (stat/list/lookup) can carry it safely.
 
 ---
 
