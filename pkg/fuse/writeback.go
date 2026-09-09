@@ -58,16 +58,22 @@ const (
 // WriteBackMeta stores metadata alongside cached file data so that the
 // background uploader (and crash-recovery) knows the remote path and size.
 type WriteBackMeta struct {
-	Path        string      `json:"path"`
-	Size        int64       `json:"size"`
-	Mtime       time.Time   `json:"mtime"`
-	CreatedAt   time.Time   `json:"created_at"`
-	Generation  uint64      `json:"generation,omitempty"`
-	Kind        PendingKind `json:"kind"`
-	BaseRev     int64       `json:"base_rev,omitempty"`
-	ShadowSpill bool        `json:"shadow_spill,omitempty"`
-	Mode        uint32      `json:"mode,omitempty"`
-	HasMode     bool        `json:"has_mode,omitempty"`
+	Path             string      `json:"path"`
+	Size             int64       `json:"size"`
+	Mtime            time.Time   `json:"mtime"`
+	CreatedAt        time.Time   `json:"created_at"`
+	Generation       uint64      `json:"generation,omitempty"`
+	Kind             PendingKind `json:"kind"`
+	BaseRev          int64       `json:"base_rev,omitempty"`
+	ShadowSpill      bool        `json:"shadow_spill,omitempty"`
+	Mode             uint32      `json:"mode,omitempty"`
+	HasMode          bool        `json:"has_mode,omitempty"`
+	SnapshotID       string      `json:"-"`
+	ParentSnapshotID string      `json:"-"`
+	// lineageTrusted is deliberately process-local and never serialized.
+	// Recovering a mutable path-keyed payload cannot prove that the bytes and
+	// JSON metadata were replaced atomically across a crash.
+	lineageTrusted bool
 }
 
 // WriteBackCache manages a local disk cache of pending (not-yet-uploaded)
@@ -253,6 +259,13 @@ func (c *WriteBackCache) PutWithBaseRevAndMode(remotePath string, data []byte, s
 // serialized per-path by a per-path lock. The global lock is only held briefly
 // to allocate the generation, compute file paths, and publish in-memory state.
 func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, WriteBackPutTimings, error) {
+	return c.PutWithBaseRevAndModeAndLineageTimings(remotePath, data, size, kind, baseRev, mode, hasMode, "", "", false)
+}
+
+// PutWithBaseRevAndModeAndLineageTimings is the process-local lineage variant
+// used by FileHandle staging. Legacy callers deliberately store empty lineage,
+// which is safe because such metadata cannot authorize a growth rebase.
+func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool) (uint64, WriteBackPutTimings, error) {
 	var t WriteBackPutTimings
 
 	// Phase 1: acquire per-path lock (serializes same-path Put/Remove/etc.)
@@ -276,15 +289,18 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 
 	now := time.Now()
 	meta := WriteBackMeta{
-		Path:       remotePath,
-		Size:       size,
-		Mtime:      now,
-		CreatedAt:  now,
-		Generation: gen,
-		Kind:       kind,
-		BaseRev:    baseRev,
-		Mode:       mode & posixPermissionModeMask,
-		HasMode:    hasMode,
+		Path:             remotePath,
+		Size:             size,
+		Mtime:            now,
+		CreatedAt:        now,
+		Generation:       gen,
+		Kind:             kind,
+		BaseRev:          baseRev,
+		Mode:             mode & posixPermissionModeMask,
+		HasMode:          hasMode,
+		SnapshotID:       snapshotID,
+		ParentSnapshotID: parentSnapshotID,
+		lineageTrusted:   lineageTrusted,
 	}
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
