@@ -9703,11 +9703,12 @@ func TestGoFuseMountOptionsMapsSyncRead(t *testing.T) {
 	if explicit.MaxBackground != 200 {
 		t.Fatalf("MaxBackground = %d, want JuiceFS GenFuseOpt 200", explicit.MaxBackground)
 	}
-	if runtime.GOOS == "linux" && !explicit.EnableWriteback {
-		t.Fatal("linux EnableWriteback = false, want JuiceFS -o writeback_cache")
-	}
-	if runtime.GOOS != "linux" && explicit.EnableWriteback {
-		t.Fatal("non-linux EnableWriteback = true, want kernel cap only on linux")
+	// The kernel writeback cache stays off for every mount: it is a
+	// mount-wide option that would override the standard path's --durability
+	// contract. The extent data plane uses the JuiceFS chunk-layer writeback
+	// instead (pkg/extent/runtime.go).
+	if explicit.EnableWriteback {
+		t.Fatal("EnableWriteback = true, want the kernel writeback cache off (durability decides)")
 	}
 }
 

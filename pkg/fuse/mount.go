@@ -1527,11 +1527,11 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 		Debug:              opts.Debug,
 		AllowOther:         opts.AllowOther,
 		EnableDirectIoMmap: true, // allow mmap on FOPEN_DIRECT_IO handles (e.g. SQLite *.db with mmap_size>0); no-op on kernels without CAP_DIRECT_IO_ALLOW_MMAP
-		// JuiceFS `-o writeback_cache`: sqlite page writes complete in the
-		// kernel page cache instead of one FUSE WRITE per 4KiB. Without it,
-		// VFS.Read of a dirty WAL (cache_size=10) Flushes and HTTP-commits
-		// slices on every spill. macFUSE/older kernels ignore the cap.
-		EnableWriteback: runtime.GOOS == "linux",
+		// Do NOT set EnableWriteback here: the kernel writeback cache is a
+		// mount-wide option that would replace the standard path's
+		// --durability contract (writeback/close-sync/write-sync) for every
+		// file. The extent data plane's writeback is the JuiceFS chunk layer
+		// (pkg/extent/runtime.go pins RuntimeConfig.Writeback), not this.
 	}
 	if runtime.GOOS == "linux" {
 		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively

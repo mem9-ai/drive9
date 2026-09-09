@@ -13135,7 +13135,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			n   int
 			err error
 		)
-		if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+		if fh.Flags&uint32(syscall.O_APPEND) != 0 && input.WriteFlags&gofuse.WRITE_CACHE == 0 {
 			n, err = fh.LocalFile.Write(data)
 		} else {
 			n, err = fh.LocalFile.WriteAt(data, int64(input.Offset))
@@ -13157,7 +13157,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			n   int
 			err error
 		)
-		if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+		if fh.Flags&uint32(syscall.O_APPEND) != 0 && input.WriteFlags&gofuse.WRITE_CACHE == 0 {
 			n, err = fh.LocalFile.Write(data)
 		} else {
 			n, err = fh.LocalFile.WriteAt(data, int64(input.Offset))
@@ -13202,7 +13202,12 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 
 	writeOffset := int64(input.Offset)
-	if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+	// With the kernel writeback cache a WRITE_CACHE request already carries
+	// the append offset merged into the dirty range (the kernel writes back
+	// [0, old+new) for an O_APPEND file whose previous bytes were still
+	// dirty). Re-applying O_APPEND here would write the payload at the old
+	// size and duplicate the prefix, so trust the kernel offset then.
+	if fh.Flags&uint32(syscall.O_APPEND) != 0 && input.WriteFlags&gofuse.WRITE_CACHE == 0 {
 		writeOffset = fh.Dirty.Size()
 	}
 	writeLen := int64(len(data))
