@@ -358,3 +358,32 @@ func TestCommitQueueCanceledIdempotentSuccessPreservesStaging(t *testing.T) {
 		}
 	}
 }
+
+func TestCommitQueueEmptyParentGrowthAcceptsRangeEOF(t *testing.T) {
+	const path = "/empty-parent"
+	main := &casFileServer{t: t, path: path}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.Header.Get("Range") != "" {
+			rev, body, _ := main.snapshot()
+			if rev == 1 && len(body) == 0 {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+		}
+		main.serveHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	cq := newLineageQueue(t, ts.URL)
+	parent := stageLineageEntry(t, cq, path, nil, "A", "", true)
+	if err := cq.CommitNow(context.Background(), parent); err != nil {
+		t.Fatal(err)
+	}
+	child := stageLineageEntry(t, cq, path, []byte("grown"), "B", "A", true)
+	child.DurableWatermarkRev = 1
+	if err := cq.CommitNow(context.Background(), child); err != nil {
+		t.Fatal(err)
+	}
+	if rev, body, _ := main.snapshot(); rev != 2 || string(body) != "grown" {
+		t.Fatalf("rev=%d body=%q", rev, body)
+	}
+}
