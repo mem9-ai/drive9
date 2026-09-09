@@ -4478,6 +4478,17 @@ func (fs *Dat9FS) gitOverlayShouldDropQueuedPublish(op, workspaceID, rel string,
 	return committed >= reservedAttempt
 }
 
+func (fs *Dat9FS) gitOverlayUnlinkHasCommitted(workspaceID, rel string) bool {
+	if fs == nil || workspaceID == "" || rel == "" {
+		return false
+	}
+	key := gitOverlayUnlinkBlockKey(workspaceID, rel)
+	fs.gitOverlayMu.Lock()
+	committed := fs.gitOverlayUnlinkCommitted[key]
+	fs.gitOverlayMu.Unlock()
+	return committed > 0
+}
+
 func gitOverlayHandleUnlinked(fh *FileHandle) bool {
 	if fh == nil {
 		return false
@@ -4527,10 +4538,15 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 		testHookAfterGitOverlayAttemptSample(req.Op)
 	}
 	dropQueued := func() bool {
-		if req.Op != "whiteout" && gitOverlayHandleUnlinked(fh) {
+		if req.Op == "whiteout" {
+			return false
+		}
+		if fs.gitOverlayShouldDropQueuedPublish(req.Op, workspaceID, req.Path, reservedAttempt) {
 			return true
 		}
-		return fs.gitOverlayShouldDropQueuedPublish(req.Op, workspaceID, req.Path, reservedAttempt)
+		// Unlinked is set before whiteout commits and rolled back on failure.
+		// Only treat it as a publish barrier after a whiteout has landed.
+		return gitOverlayHandleUnlinked(fh) && fs.gitOverlayUnlinkHasCommitted(workspaceID, req.Path)
 	}
 	if fs.gitOverlayWriteBackEnabled(policy, forceSync) {
 		pendingSeq := fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
