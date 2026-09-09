@@ -84,33 +84,24 @@ func TestW2BehindRevisionCleanSiblingIsNotServed(t *testing.T) {
 	}
 }
 
-// TestW2CleanSiblingShadowServesSidecarRead covers the shadow leg of the
-// clean-sibling reuse.
-func TestW2CleanSiblingShadowServesSidecarRead(t *testing.T) {
+// TestW2CleanSiblingRevisionAdvanceDiscardsCandidate pins the post-copy
+// revalidation: if a same-path commit advances the latest committed revision
+// after the sibling bytes are copied, the stale candidate must be discarded
+// and the read falls back instead of returning behind-revision bytes.
+func TestW2CleanSiblingRevisionAdvanceDiscardsCandidate(t *testing.T) {
 	fs, _, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected request %s", r.Method)
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 	defer closeServer()
 
-	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shadow.Close()
-	fs.shadowStore = shadow
-
-	content := []byte("shadowed-wal-frames")
-	if err := shadow.WriteFull("/db-wal", content, 6); err != nil {
-		t.Fatal(err)
-	}
+	content := []byte("committed-wal-frames")
 	writer := &FileHandle{
-		Ino:         1,
-		Path:        "/db-wal",
-		Dirty:       NewWriteBuffer("/db-wal", 1024, 0),
-		BaseRev:     6,
-		OrigSize:    int64(len(content)),
-		ShadowReady: true,
+		Ino:      1,
+		Path:     "/db-wal",
+		Dirty:    NewWriteBuffer("/db-wal", 1024, 0),
+		BaseRev:  6,
+		OrigSize: int64(len(content)),
 	}
 	if _, err := writer.Dirty.Write(0, content); err != nil {
 		t.Fatal(err)
@@ -120,12 +111,18 @@ func TestW2CleanSiblingShadowServesSidecarRead(t *testing.T) {
 	defer fs.openHandles.Remove(writer)
 	fs.recordCommittedRevision("/db-wal", 6)
 
-	reader := &FileHandle{Ino: 2, Path: "/db-wal", Dirty: NewWriteBuffer("/db-wal", 1024, 0), BaseRev: 5}
-	data, n, ok, st, src := fs.readSQLitePersistentJournalVisibleRange("/db-wal", reader, 5, 0, uint32(len(content)))
-	if st != gofuse.OK || !ok {
-		t.Fatalf("visible range = ok=%t st=%d, want ok/OK", ok, st)
+	// Advance the committed revision between the copy and the revalidation.
+	testHookAfterCleanSiblingCopy = func(path string) {
+		fs.recordCommittedRevision(path, 7)
 	}
-	if src != "sqlite-sidecar-clean-sibling" || n != len(content) || !bytes.Equal(data, content) {
-		t.Fatalf("shadow serve = src=%q n=%d data=%q, want clean-sibling/%d/%q", src, n, data, len(content), content)
+	t.Cleanup(func() { testHookAfterCleanSiblingCopy = nil })
+
+	reader := &FileHandle{Ino: 2, Path: "/db-wal", Dirty: NewWriteBuffer("/db-wal", 1024, 0), BaseRev: 6}
+	data, _, ok, st, src := fs.readSQLitePersistentJournalVisibleRange("/db-wal", reader, 6, 0, uint32(len(content)))
+	if st != gofuse.OK {
+		t.Fatalf("status = %d, want OK", st)
+	}
+	if ok || data != nil || src != "" {
+		t.Fatalf("stale candidate served after revision advance: ok=%t src=%q", ok, src)
 	}
 }

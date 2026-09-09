@@ -135,10 +135,11 @@ func TestW3FlushGrowthUsesPatchWhenCoverageComplete(t *testing.T) {
 	}
 }
 
-// TestW3FsyncGrowthReroutesToPatch covers decision A: a strict fsync of a grown
-// S3-backed file commits through the patch-capable flush path and discards the
-// writeback snapshot instead of full-uploading via the writeback uploader.
-func TestW3FsyncGrowthReroutesToPatch(t *testing.T) {
+// TestW3FsyncGrowthFallsThroughToPatch covers the real EC2-verified path: a
+// strict fsync of a grown S3-backed large file has no writeback snapshot
+// (above the write-back threshold), so it falls through to flushHandle and
+// commits through PATCH without a whole-file upload.
+func TestW3FsyncGrowthFallsThroughToPatch(t *testing.T) {
 	var patchReceived atomic.Bool
 	var fullUpload atomic.Bool
 
@@ -175,12 +176,6 @@ func TestW3FsyncGrowthReroutesToPatch(t *testing.T) {
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	fs.smallFileMax.Store(100)
 
-	cache, err := NewWriteBackCache(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs.SetWriteBack(cache, NewWriteBackUploader(fs.client, cache, 1))
-
 	path := "/w3-fsync-growth.dat"
 	ino := fs.inodes.Lookup(path, false, 5, time.Now())
 	fs.inodes.UpdateRevision(ino, 5)
@@ -201,13 +196,6 @@ func TestW3FsyncGrowthReroutesToPatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
-	fh.WriteBackSeq = fh.DirtySeq
-
-	gen, _, err := cache.PutWithBaseRevAndModeTimings(path, data, fh.Dirty.Size(), PendingOverwrite, 5, 0, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fh.WriteBackGen = gen
 	fhID := fs.fileHandles.Allocate(fh)
 
 	st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fhID})
@@ -218,52 +206,35 @@ func TestW3FsyncGrowthReroutesToPatch(t *testing.T) {
 		t.Fatal("strict fsync of a grown S3-backed file must commit via PATCH")
 	}
 	if fullUpload.Load() {
-		t.Fatal("strict fsync of a grown S3-backed file must not full-upload via the writeback uploader")
-	}
-	if _, ok := cache.GetMeta(path); ok {
-		t.Fatal("writeback snapshot was not discarded after the patch reroute")
+		t.Fatal("strict fsync of a grown S3-backed file must not full-upload")
 	}
 	fh.Lock()
 	defer fh.Unlock()
-	if fh.DirtySeq != 0 || fh.WriteBackSeq != 0 || fh.Dirty.HasDirtyParts() {
-		t.Fatalf("handle not cleaned after patch commit: seq=%d wbSeq=%d dirty=%t", fh.DirtySeq, fh.WriteBackSeq, fh.Dirty.HasDirtyParts())
+	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		t.Fatalf("handle not cleaned after patch commit: seq=%d dirty=%t", fh.DirtySeq, fh.Dirty.HasDirtyParts())
 	}
 }
 
-// TestW3PatchPlanRejectedFallsBackToFullUpload covers T3.4: a patch-plan
-// initiation failure (not a storage-class rejection) retries the commit as a
-// full upload, records the per-handle rejection, and never recurses into
-// PATCH again for this handle.
-func TestW3PatchPlanRejectedFallsBackToFullUpload(t *testing.T) {
+// TestW3PatchConflictFailsClosed pins the fail-closed semantics: a PATCH plan
+// rejected with a revision conflict must not trigger a full-upload fallback;
+// the error is surfaced and the dirty state is preserved.
+func TestW3PatchConflictFailsClosed(t *testing.T) {
 	var patchCount atomic.Int32
 	var fullUpload atomic.Bool
 
-	var ts *httptest.Server
-	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/v1/status":
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": 50, "storage_capabilities": map[string]bool{}})
-			return
 		case r.Method == http.MethodPatch:
 			patchCount.Add(1)
 			_, _ = io.ReadAll(r.Body)
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "part_size 8388608 produces 10001 parts for size 8388688896, exceeds S3 limit"})
-			return
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "revision conflict"})
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
 			fullUpload.Store(true)
 			_, _ = io.ReadAll(r.Body)
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
-			return
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/complete"):
-			fullUpload.Store(true)
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
-			return
 		default:
-			t.Logf("unexpected request %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	}))
@@ -274,7 +245,7 @@ func TestW3PatchPlanRejectedFallsBackToFullUpload(t *testing.T) {
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	fs.smallFileMax.Store(100)
 
-	path := "/w3-plan-rejected.dat"
+	path := "/w3-conflict.dat"
 	ino := fs.inodes.Lookup(path, false, 5, time.Now())
 	fs.inodes.UpdateRevision(ino, 5)
 
@@ -299,19 +270,18 @@ func TestW3PatchPlanRejectedFallsBackToFullUpload(t *testing.T) {
 	fh.Lock()
 	st := fs.flushHandle(context.Background(), fh)
 	fh.Unlock()
-	if st != gofuse.OK {
-		t.Fatalf("flushHandle status = %v, want OK", st)
+	if st == gofuse.OK {
+		t.Fatal("flushHandle succeeded on a revision conflict, want failure")
 	}
 	if patchCount.Load() != 1 {
-		t.Fatalf("patch attempts = %d, want exactly 1 before fallback", patchCount.Load())
+		t.Fatalf("patch attempts = %d, want 1", patchCount.Load())
 	}
-	if !fullUpload.Load() {
-		t.Fatal("patch plan rejection must fall back to a full upload")
+	if fullUpload.Load() {
+		t.Fatal("revision conflict must not fall back to a full upload")
 	}
-	if !fh.patchPlanRejected {
-		t.Fatal("handle did not record the patch plan rejection")
-	}
-	if fh.StorageClass != storageClassS3 {
-		t.Fatalf("storage class changed to %q on plan rejection", fh.StorageClass)
+	fh.Lock()
+	defer fh.Unlock()
+	if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+		t.Fatal("dirty state was not preserved after the failed commit")
 	}
 }

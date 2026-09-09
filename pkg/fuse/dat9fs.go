@@ -29,6 +29,11 @@ import (
 // candidate after discovery but before the second TryLock in candidateLoop.
 var testHookAfterSamePathDirtyHandleScan func(path string)
 
+// testHookAfterCleanSiblingCopy lets race-focused unit tests advance the
+// committed revision after a clean sibling's bytes are copied but before the
+// latest-revision revalidation, proving the stale candidate is discarded.
+var testHookAfterCleanSiblingCopy func(path string)
+
 // testHookBeforeGVisorShadowSpillFlushFence lets race-focused unit tests pause
 // a gVisor ShadowSpill Flush after its initial supersession check but before it
 // acquires the same-path remote commit fence.
@@ -4773,17 +4778,6 @@ func (fs *Dat9FS) readSQLitePersistentJournalCleanSiblingRange(path string, skip
 			continue
 		}
 		buf := make([]byte, int(reqSize))
-		if fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) {
-			src.Unlock()
-			n, err := fs.shadowStore.ReadAt(path, offset, buf)
-			if err != nil && !errors.Is(err, io.EOF) {
-				return nil, 0, false
-			}
-			if n != len(buf) {
-				return nil, 0, false
-			}
-			return buf, n, true
-		}
 		ps := src.Dirty.PartSize()
 		firstPart := int(offset / ps)
 		lastPart := int((end - 1) / ps)
@@ -4796,6 +4790,16 @@ func (fs *Dat9FS) readSQLitePersistentJournalCleanSiblingRange(path string, skip
 		n := src.Dirty.ReadAt(offset, buf)
 		src.Unlock()
 		if n != len(buf) {
+			return nil, 0, false
+		}
+		if testHookAfterCleanSiblingCopy != nil {
+			testHookAfterCleanSiblingCopy(path)
+		}
+		// Revalidate: a same-path commit can advance the global revision while
+		// this sibling was locked (its refresh uses TryLock and skips a locked
+		// handle), so the copied bytes may be behind what the shared -shm
+		// points at. Discard the candidate and fall back to the remote read.
+		if fs.latestCommittedRevision(path) != revision {
 			return nil, 0, false
 		}
 		return buf, n, true
@@ -12919,7 +12923,9 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 
 	threshold := fs.negotiatedInlineThreshold()
 	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
-	canPatchExisting := !fh.patchPlanRejected && threshold > 0 && fh.OrigSize >= threshold && fs.growthPatchSafeLocked(fh, size)
+	canPatchExisting := threshold > 0 && fh.OrigSize >= threshold &&
+		(size <= fh.OrigSize || !isSQLitePersistentJournalPath(fh.Path)) &&
+		fs.growthPatchSafeLocked(fh, size)
 	if fh.StorageClass == storageClassDB9 {
 		// Authoritative: the remote object is stored inline, so PATCH
 		// (S3 UploadPartCopy-based) is not applicable regardless of size.
@@ -13019,31 +13025,6 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 				)
 				fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
 				fs.debugDurationf(writeStart, 0, "write-sync patch fallback done path=%s size=%d err=%v", fh.Path, size, err)
-			} else if err != nil && client.IsPatchPlanInitiateErr(err) {
-				// The server rejected the patch plan for a reason other than
-				// storage class (for example part count over the S3 multipart
-				// limit). The object is still S3-backed, so StorageClass stays
-				// unchanged; reroute this handle's future writes to the full
-				// upload and retry the current commit that way.
-				fh.patchPlanRejected = true
-				if !fs.materializeFullForUploadLocked(fh) {
-					safeLogPrintf("write-sync patch plan-rejected fallback cannot materialize full file for %s", fh.Path)
-					return gofuse.EIO
-				}
-				data = fh.Dirty.bytesView()
-				genericFullWrite = true
-				writeStart := time.Now()
-				fs.debugf("write-sync patch plan rejected, full-upload fallback start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
-				err = fs.client.WriteStreamConditional(
-					ctx,
-					fs.remotePath(fh.Path),
-					bytes.NewReader(data),
-					size,
-					nil,
-					expectedRevision,
-				)
-				fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
-				fs.debugDurationf(writeStart, 0, "write-sync patch plan-rejected fallback done path=%s size=%d err=%v", fh.Path, size, err)
 			}
 		}
 	} else {
@@ -14150,26 +14131,6 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			// use the updated BaseRev.
 			fh.WriteBackSeq = 0
 			return gofuse.OK
-		}
-
-		// W3: the writeback uploader has no PATCH transport. Reroute a strict
-		// fsync of a grown S3-backed large file through flushHandle so only
-		// dirty parts are uploaded with server-side copies of the rest. The
-		// writeback snapshot is discarded first so the background uploader
-		// cannot re-upload a stale full image after this commit.
-		if fh.Dirty != nil && fh.Dirty.Size() > fh.OrigSize && fh.StorageClass != storageClassDB9 {
-			threshold := fs.negotiatedInlineThreshold()
-			if !fh.patchPlanRejected && threshold > 0 && fh.OrigSize >= threshold && fs.growthPatchSafeLocked(fh, fh.Dirty.Size()) {
-				if fh.WriteBackGen != 0 {
-					fs.writeBack.RemoveIfGeneration(fh.Path, fh.WriteBackGen)
-				}
-				fh.WriteBackGen = 0
-				fh.WriteBackSeq = 0
-				phase = "writeback-upload-sync-patch"
-				flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
-				defer flushCancel()
-				return fs.flushHandle(flushCtx, fh)
-			}
 		}
 
 		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
@@ -15392,7 +15353,9 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// OrigSize, new parts have no server-side original data and the patch
 	// callback cannot construct correct content. Consistent with write-sync
 	// path's canPatchExisting guard (line ~9912).
-	usePatch := !fh.patchPlanRejected && !useDirectPUT && threshold > 0 && handleOrigSize >= threshold && fs.growthPatchSafeLocked(fh, size)
+	usePatch := !useDirectPUT && threshold > 0 && handleOrigSize >= threshold &&
+		(size <= handleOrigSize || !isSQLitePersistentJournalPath(fh.Path)) &&
+		fs.growthPatchSafeLocked(fh, size)
 	if fh.StorageClass == storageClassDB9 {
 		// Authoritative: remote object is stored inline; PATCH requires S3.
 		// A known-S3 class needs no override: when OrigSize < threshold the
@@ -15600,17 +15563,6 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 				return fs.flushHandle(ctx, fh)
 			}
 			safeLogPrintf("flush patch unsupported for %s; will full-upload on next flush (dirty state advanced during upload)", handlePath)
-		} else if usePatch && client.IsPatchPlanInitiateErr(err) {
-			// The server rejected the patch plan for a reason other than
-			// storage class. The object is still S3-backed, so StorageClass
-			// stays unchanged; this per-handle flag only reroutes the retry
-			// and future flushes to the full upload.
-			fh.patchPlanRejected = true
-			if fh.Path == handlePath && fh.DirtySeq == handleDirtySeq {
-				fs.debugf("flushHandle patch plan rejected, retry as full upload path=%s size=%d", handlePath, size)
-				return fs.flushHandle(ctx, fh)
-			}
-			safeLogPrintf("flush patch plan rejected for %s; will full-upload on next flush (dirty state advanced during upload)", handlePath)
 		}
 		safeLogPrintf("flush upload failed for %s: %v", handlePath, err)
 		return httpToFuseStatus(err)

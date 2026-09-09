@@ -74,14 +74,12 @@ appends with constant latency). PATCH rebuilds the object and copies all
 untouched parts per commit, which would reintroduce the #875 upload
 amplification. PATCH applies only to `main.db` growth.
 
-Under writeback policy a strict fsync does not reach the write-sync or flush
-PATCH path: it goes through `WriteBackUploader.UploadSyncWithRevision`
-(pkg/fuse/writeback_uploader.go:486) ->
-`uploadBufferedRemoteFileWithRevision` (pkg/fuse/remote_upload.go:20) ->
-`WriteStreamConditional`, which is always a full-file multipart upload with no
-PATCH. W3 therefore also reroutes the strict-fsync growth case through the
-patch-capable flush path; this remains client-only and the writeback uploader
-itself is unchanged for background commits.
+Under writeback policy, write-back snapshots exist only below the
+write-back threshold (~10 MiB), so a grown large file has no snapshot and a
+strict fsync falls through to `flushHandleDebounced` -> `flushHandle`, which
+already selects PATCH under the relaxed gate. No special-case fsync reroute is
+needed (one was added and then removed after review: it raced an in-flight
+writeback upload into a nondeterministic CAS conflict).
 
 ## 4. Workstreams
 
@@ -146,7 +144,7 @@ Result: every page is one remote range GET, counted as
 
 Change:
 
-1. Allow revision-gated clean-sibling reuse for sidecar reads: serve from a clean sibling buffer/shadow only when its revision equals the latest committed revision (`latestCommittedRevisionWithSize`), preserving the `-shm` short-read protection.
+1. Allow revision-gated clean-sibling reuse for sidecar reads: serve from a clean sibling buffer only when its revision equals the latest committed revision (`latestCommittedRevisionWithSize`), revalidate the latest revision after copying the bytes, and preserve the `-shm` short-read protection. The shadow leg was removed after review: a path-keyed shadow read is not atomic with the handle's clean state and the leg is dormant in practice.
 2. Removed after EC2 validation: a sub-64 MiB write-through shadow leg proved to be dead code — `preloadWritableHandle` lazy-loads all files at open, so the `writeBufferHasLoadedFullRange` gate never passes and the shadow is never created. The clean-sibling buffer leg alone carries checkpoint reads; the >= 64 MiB ShadowSpill mechanism is unchanged and independent.
 
 Tests:
@@ -165,12 +163,12 @@ Current behavior:
 
 Change:
 
-1. Relax both gates to `OrigSize >= threshold && StorageClass != DB9`, dropping `size <= OrigSize`. Keep `OrigSize >= threshold` so inline (< 50 KB) files still take the cheap whole-file PUT; keep the DB9 override.
+1. Relax both gates to `OrigSize >= threshold && StorageClass != DB9 && (size <= OrigSize || !isSQLitePersistentJournalPath)`, dropping the unconditional `size <= OrigSize`. Keep `OrigSize >= threshold` so inline (< 50 KB) files still take the cheap whole-file PUT; keep the DB9 override; growth beyond `OrigSize` stays off PATCH for SQLite sidecars so append-log (and its legacy full-PUT fallback chain) remains the WAL transport, while non-growth sidecar PATCH is unchanged.
 2. Add a residency guard: if a dirty part beyond the original file is not loaded (evicted by streaming), fall back to the full rewrite instead of uploading a zero-filled part. The guard must consult `IsPartLoaded` (as pkg/fuse/append_log.go:249 does): `PartData` (pkg/fuse/write.go:786) returns a zero-filled slice for an evicted in-range part, and the snapshot loop's `src != nil` check (pkg/fuse/dat9fs.go:12868) would otherwise capture and upload zeros.
 3. Optional: skip the `read_url` download in `uploadPatchPart` (pkg/client/patch.go:163) when the callback already holds the complete merged part (FUSE returns `partSnapshots[partNumber]` and ignores `origData`).
-4. Reroute the strict-fsync growth case: in the `Fsync` writeback branch (pkg/fuse/dat9fs.go:13991), when `fh.Dirty` qualifies under the relaxed gate (S3-backed, `OrigSize >= threshold`, dirty parts present), commit via `flushHandle` instead of `UploadSyncWithRevision`; first discard the path's writeback snapshot (pkg/fuse/dat9fs.go:14079 pattern) so the background uploader cannot re-upload a stale full image. The writeback uploader itself is unchanged for background commits.
+4. Removed after review: a special-case strict-fsync reroute through `flushHandle` raced an in-flight writeback upload into a nondeterministic CAS conflict. Write-back snapshots only exist below ~10 MiB, so grown large files have no snapshot and already fall through to `flushHandleDebounced` -> `flushHandle` PATCH; sub-threshold growth keeps the race-free `UploadSyncWithRevision` (`WaitPath`).
 5. Add a growth-region coverage guard. The server reconstructs every part outside the original object from the client upload and presigns such parts even when they are absent from the client's dirty set (pkg/backend/patch.go:247); a sparse `pwrite` beyond EOF leaves the gap parts neither loaded nor dirty in the WriteBuffer (pkg/fuse/write.go:259), and the fallback callback would then upload an empty body and corrupt the assembly. Therefore, before taking the PATCH route, require that every part overlapping the region `[OrigSize, newSize)` is present in `DirtyPartNumbers()` and loaded (`IsPartLoaded`); otherwise fall back to the full rewrite, whose `bytesView` zero-fills the gaps with the correct logical zeros. SQLite's contiguous truncate-extend and page writes satisfy the guard; only sparse growth is rerouted.
-6. Widen the patch-failure fallback. The write-sync path today retries the full upload only on `IsUnsupportedStorageTargetErr` (pkg/fuse/dat9fs.go:12899); a plan rejection such as part-count-over-`MaxMultipartParts` would surface as a hard error instead. Treat patch-plan initiation failures (unsupported storage target, part count over the S3 limit, invalid plan) as triggers for the existing full-rewrite fallback in both the write-sync and flushHandle paths; part-upload failures after a valid plan keep failing closed.
+6. Removed after review: the plan-initiation fallback classified every non-202 response (including CAS conflicts, auth, throttling, and 5xx) as recoverable. The full-upload fallback remains only for `IsUnsupportedStorageTargetErr`; everything else fails closed. A part-count-over-`MaxMultipartParts` rejection also fails closed (a full upload would exceed the same limit).
 
 The server contract is already in place: parts beyond the original object carry
 no `read_url` (pkg/backend/patch.go:44) and are never presigned
@@ -182,7 +180,7 @@ Tests:
 2. Scattered dirty parts.
 3. Inline growth stays a full PUT.
 4. Inline -> S3 cross-threshold adoption.
-5. Strict fsync of a grown S3-backed file commits via PATCH with no whole-file upload and no stale writeback re-upload.
+5. Strict fsync of a grown S3-backed large file (no writeback snapshot) falls through to `flushHandle` and commits via PATCH with no whole-file upload.
 6. Sparse growth (`pwrite` beyond EOF leaving gap parts) falls back to the full rewrite and produces zero-filled gaps, never a corrupt PATCH.
 
 ### 4.4 W4: deadline / memory coherence (optional)

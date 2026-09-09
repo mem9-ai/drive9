@@ -18901,24 +18901,75 @@ func TestFlushGrowthLazyBufferFetchesMissingParts(t *testing.T) {
 	for _, tc := range flushBothWays(t) {
 		t.Run(tc.name, func(t *testing.T) {
 			var loadCalls atomic.Int32
-			var gotBody []byte
-			var gotExpectedRev string
+			var patchNewSize atomic.Int64
+			var patchRev atomic.Int64
+			var partBodies sync.Map
+			var orig [2][]byte
 
 			path := "/growth-lazy-fetch.dat"
-			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method == http.MethodPut {
-					gotExpectedRev = r.Header.Get("X-Dat9-Expected-Revision")
+			var ts *httptest.Server
+			ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPatch:
+					var req struct {
+						NewSize          int64  `json:"new_size"`
+						DirtyParts       []int  `json:"dirty_parts"`
+						PartSize         int64  `json:"part_size"`
+						ExpectedRevision *int64 `json:"expected_revision"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						t.Errorf("decode patch request: %v", err)
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					patchNewSize.Store(req.NewSize)
+					if req.ExpectedRevision != nil {
+						patchRev.Store(*req.ExpectedRevision)
+					}
+					parts := make([]map[string]any, 0, len(req.DirtyParts))
+					for _, pn := range req.DirtyParts {
+						size := req.PartSize
+						if int64(pn)*req.PartSize > req.NewSize {
+							size = req.NewSize - int64(pn-1)*req.PartSize
+						}
+						part := map[string]any{
+							"number": pn,
+							"url":    ts.URL + "/s3/" + strconv.Itoa(pn),
+							"size":   size,
+						}
+						if int64(pn)*req.PartSize <= 512 {
+							part["read_url"] = ts.URL + "/orig/" + strconv.Itoa(pn)
+							part["read_headers"] = map[string]string{
+								"Range": fmt.Sprintf("bytes=%d-%d", (pn-1)*256, pn*256-1),
+							}
+						}
+						parts = append(parts, part)
+					}
+					w.WriteHeader(http.StatusAccepted)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"upload_id":    "u1",
+						"upload_parts": parts,
+						"copied_parts": []any{2},
+					})
+				case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/orig/"):
+					pn, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/orig/"))
+					_, _ = w.Write(orig[pn-1])
+				case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/"):
+					pn, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/s3/"))
 					body, err := io.ReadAll(r.Body)
 					if err != nil {
-						t.Errorf("read PUT body: %v", err)
+						t.Errorf("read s3 body: %v", err)
 					}
-					gotBody = body
-					w.Header().Set("Content-Type", "application/json")
-					_ = json.NewEncoder(w).Encode(map[string]any{"revision": 42})
-					return
+					partBodies.Store(pn, body)
+					w.Header().Set("ETag", "etag")
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/complete"):
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+					w.WriteHeader(http.StatusMethodNotAllowed)
 				}
-				t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
-				w.WriteHeader(http.StatusMethodNotAllowed)
 			}))
 			defer ts.Close()
 
@@ -18927,7 +18978,8 @@ func TestFlushGrowthLazyBufferFetchesMissingParts(t *testing.T) {
 			fs := NewDat9FS(newTestClient(ts.URL), opts)
 			fs.smallFileMax.Store(100)
 
-			fh, orig := newLazyTwoPartHandle(t, fs, path, true, &loadCalls)
+			var fh *FileHandle
+			fh, orig = newLazyTwoPartHandle(t, fs, path, true, &loadCalls)
 			// Grow beyond OrigSize: append 88 bytes at the end (size 512->600).
 			appendData := make([]byte, 88)
 			for i := range appendData {
@@ -18941,19 +18993,31 @@ func TestFlushGrowthLazyBufferFetchesMissingParts(t *testing.T) {
 			if st := tc.run(fs, fh); st != gofuse.OK {
 				t.Fatalf("flush status = %v, want OK (growth with loader must fetch, not EIO)", st)
 			}
-			if loadCalls.Load() == 0 {
-				t.Fatal("expected lazy loader to fetch the untouched part before growth upload")
+			if loadCalls.Load() != 1 {
+				t.Fatalf("lazy load calls = %d, want 1 (only the modified part is fetched; the untouched part is server-copied)", loadCalls.Load())
 			}
-			if gotExpectedRev != "5" {
-				t.Fatalf("upload X-Dat9-Expected-Revision = %q, want 5 (BaseRev CAS)", gotExpectedRev)
+			if got := patchNewSize.Load(); got != 600 {
+				t.Fatalf("patch new_size = %d, want 600", got)
 			}
-			want := make([]byte, 600)
-			copy(want, orig[0])
-			copy(want[256:], orig[1])
-			copy(want[:4], "WXYZ")
-			copy(want[512:], appendData)
-			if !bytes.Equal(gotBody, want) {
-				t.Fatal("growth upload body mismatch: untouched remote-backed range not preserved")
+			if got := patchRev.Load(); got != 5 {
+				t.Fatalf("patch expected_revision = %d, want 5", got)
+			}
+			part1, ok := partBodies.Load(1)
+			if !ok {
+				t.Fatal("modified part 1 was not uploaded")
+			}
+			wantPart1 := make([]byte, 256)
+			copy(wantPart1, orig[0])
+			copy(wantPart1[:4], "WXYZ")
+			if !bytes.Equal(part1.([]byte), wantPart1) {
+				t.Fatal("modified part 1 upload mismatch")
+			}
+			part3, ok := partBodies.Load(3)
+			if !ok || !bytes.Equal(part3.([]byte), appendData) {
+				t.Fatal("growth part 3 upload mismatch")
+			}
+			if _, ok := partBodies.Load(2); ok {
+				t.Fatal("untouched part 2 was uploaded; it must be server-copied")
 			}
 			if fh.DirtySeq != 0 {
 				t.Fatalf("DirtySeq = %d, want 0 after successful upload", fh.DirtySeq)
