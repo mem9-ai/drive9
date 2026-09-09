@@ -33,9 +33,13 @@ func (fs *Dat9FS) isExtentFile(ctx context.Context, p string) bool {
 }
 
 // existingExtentIno reports a live extent file from stat ContentLayout, not
-// the create-time glob. Directories are never extent objects.
+// the create-time glob. Directories are never extent objects. The stat probe
+// only runs on mounts that opted into the extent data plane.
 func (fs *Dat9FS) existingExtentIno(ctx context.Context, p string) (uint64, bool) {
 	if p == "" || strings.HasSuffix(p, "/") || fs.pathIsDir(p) {
+		return 0, false
+	}
+	if !fs.extentDiscoveryEnabled() {
 		return 0, false
 	}
 	return fs.extentStatIno(ctx, p)
@@ -172,6 +176,9 @@ func (fs *Dat9FS) extentRefreshFromVFS(nodeID uint64, p string, fuseFh uint64) b
 	}
 	inoNum, ok := fs.cachedExtentIno(nodeID)
 	if !ok {
+		if !fs.extentDiscoveryEnabled() {
+			return false
+		}
 		if err := fs.ensureExtentRuntime(); err != nil {
 			return false
 		}
@@ -404,6 +411,9 @@ func (fs *Dat9FS) resolveJuiceIno(nodeID uint64, p string) (uint64, bool) {
 func (fs *Dat9FS) resolveExtentIno(nodeID uint64, p string) (uint64, bool) {
 	if ino, ok := fs.cachedExtentIno(nodeID); ok {
 		return ino, true
+	}
+	if !fs.extentDiscoveryEnabled() {
+		return 0, false
 	}
 	std, cf := context.WithTimeout(context.Background(), fuseTimeout)
 	defer cf()

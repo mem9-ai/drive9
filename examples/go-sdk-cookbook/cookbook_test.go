@@ -656,6 +656,25 @@ func Example_localFileTransferShape() {
 	_, _ = io.Copy(io.Discard, rc)
 }
 
+func ExampleClient_extentDataPlane() {
+	ctx := context.Background()
+	c := drive9.New("https://drive9.example.com", "api-key")
+
+	// POST /v1/data-credential returns the tenant-prefix object-store session
+	// the extent data plane uses for its JuiceFS chunks.
+	cred, err := c.GetDataCredential(ctx)
+	if err == nil {
+		_ = cred.Prefix
+	}
+
+	// POST /v1/extent/meta runs one JuiceFS metadata operation; op travels in
+	// X-Drive9-Extent-Op and the body is operation specific.
+	raw, err := c.ExtentMeta(ctx, "lookup", map[string]any{"path": "/workspace/a.db"})
+	if err == nil {
+		_ = json.Valid(raw)
+	}
+}
+
 var coveredClientMethods = map[string]bool{
 	"AdminCreateTenant":                    true,
 	"AdminCreateTenantPool":                true,
@@ -708,6 +727,8 @@ var coveredClientMethods = map[string]bool{
 	"DeleteGitWorkspace":                   true,
 	"DeleteVaultSecret":                    true,
 	"DiffFSLayer":                          true,
+	"ExtentMeta":                           true,
+	"GetDataCredential":                    true,
 	"ForkFSLayer":                          true,
 	"DiffFSLayerAtSeq":                     true,
 	"DownloadDir":                          true,

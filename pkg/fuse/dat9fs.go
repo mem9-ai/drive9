@@ -9779,7 +9779,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		return gofuse.OK
 	}
-	if fs.isExtentFile(ctx, childP) {
+	if fs.extentDiscoveryEnabled() && fs.isExtentFile(ctx, childP) {
 		return fs.extentUnlink(cancel, header, name, childP)
 	}
 	start := time.Now()
@@ -10615,7 +10615,13 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 		oldEntry, oldEntryOK = fs.inodes.GetEntry(oldIno)
 		oldP = resolvedOld
 	}
-	fs.removeSpecialNode(newP)
+	// Drop a stale special-node entry at the target only when the source
+	// brings none: renameSpecialNodeSubtree below publishes oldP's entries at
+	// newP, so removing newP first would make a special-source rename lose the
+	// entry it just moved.
+	if _, ok := fs.specialNodeEntry(oldP); !ok {
+		fs.removeSpecialNode(newP)
+	}
 	oldParent, ok := fs.inodes.GetPath(input.NodeId)
 	if !ok {
 		oldParent = parentDir(oldP)
@@ -10755,7 +10761,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	if handled, st := fs.renameGitPath(ctx, input, oldP, newP); handled {
 		return st
 	}
-	if !fs.pathIsDir(oldP) {
+	if !fs.pathIsDir(oldP) && fs.extentDiscoveryEnabled() {
 		if _, ok := fs.existingExtentIno(ctx, oldP); ok {
 			return fs.extentRename(cancel, input, oldP, newP, oldName, newName)
 		}
@@ -12032,7 +12038,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	if ino, ok := fs.cachedExtentIno(input.NodeId); ok {
 		return fs.extentOpen(cancel, input, p, ino, out)
 	}
-	if fs.extentVFS() != nil || fs.shouldUseExtentPath(p) {
+	if fs.extentVFS() != nil || fs.extentEnabled() {
 		if err := fs.ensureExtentRuntime(); err == nil {
 			if ino, ok := fs.extentLookupChild(fs.jfsCtx(input.Pid, 0, 0), p); ok {
 				fs.inodes.SetExtentIno(input.NodeId, uint64(ino))
@@ -12040,8 +12046,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			}
 		}
 	}
-	if ino, ok := fs.extentStatIno(ctx, p); ok {
-		return fs.extentOpen(cancel, input, p, ino, out)
+	if fs.extentDiscoveryEnabled() {
+		if ino, ok := fs.extentStatIno(ctx, p); ok {
+			return fs.extentOpen(cancel, input, p, ino, out)
+		}
 	}
 
 	if accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR {

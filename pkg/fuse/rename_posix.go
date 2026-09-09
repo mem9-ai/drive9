@@ -335,10 +335,17 @@ func (fs *Dat9FS) renameMetadataOnlySpecial(ctx context.Context, input *gofuse.R
 	if st := fs.removeRenameSpecialTarget(ctx, newInfo); st != gofuse.OK {
 		return st
 	}
-	if !fs.renameSpecialNode(oldP, newP) {
+	if _, ok := fs.specialNodeEntry(oldP); !ok {
 		return gofuse.ENOENT
 	}
+	// finishLocalRename migrates the source's special-node registry entry to
+	// newP (renameSpecialNodeSubtree), so move it there rather than here: a
+	// renameSpecialNode call before this point would leave oldP empty and the
+	// migration would have nothing to publish.
 	fs.finishLocalRename(input, oldP, newP)
+	if _, ok := fs.specialNodeEntry(newP); !ok {
+		return gofuse.ENOENT
+	}
 	return gofuse.OK
 }
 

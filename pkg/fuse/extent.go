@@ -48,6 +48,21 @@ func (fs *Dat9FS) extentEnabled() bool {
 	return fs != nil && fs.opts != nil && len(fs.opts.ExtentPaths) > 0
 }
 
+// extentDiscoveryEnabled reports whether this mount may spend an extra RPC to
+// discover that a path is an extent object it did not create itself.
+//
+// Only mounts that opted into the extent data plane (--extent patterns or the
+// extent profile) pay for discovery. A mount without them still serves an
+// extent file whenever the server already reported ContentLayout/ExtentIno in
+// a stat or lookup reply, because that costs nothing; it just never probes.
+// Without this gate every standard mount would issue an extent credential
+// request, a JuiceFS lookup, or a HEAD per getattr/open/unlink/rename, which
+// breaks the standard path's remote-call budget (and its --durability
+// contract).
+func (fs *Dat9FS) extentDiscoveryEnabled() bool {
+	return fs.extentEnabled() || fs.extentVFS() != nil
+}
+
 func (fs *Dat9FS) shouldUseExtentPath(localPath string) bool {
 	if fs == nil || fs.opts == nil {
 		return false
