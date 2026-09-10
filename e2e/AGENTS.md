@@ -594,7 +594,7 @@ the PR or post-merge default.
 
 Opt-in (`RUN_TASKS_SMOKE=1`). Wire contract for `GET /v1/fs/{path}?tasks`
 (the surface behind `drive9 fs tasks`): the `X-Dat9-Tasks: 1` marker, the
-`{path, tasks[]}` field names, `[]` (never `null`) for an empty result, a
+`{path, tasks[]}` field names, `tasks` always an array (never `null`), a
 directory `400`, and unknown-query-key rejection. The handler lives in the
 external server repository, so this is the cross-repo drift check; it needs a
 server build that implements `?tasks`. Not part of the PR or post-merge default.

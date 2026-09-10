@@ -111,6 +111,30 @@ func TestFileTasksCtxRejectsRedirectWithoutDownloading(t *testing.T) {
 	}
 }
 
+// A same-host redirect (for example an ingress http->https upgrade) is not
+// evidence that the server predates ?tasks, so it must not be reported as
+// unsupported.
+func TestFileTasksCtxSameHostRedirectIsNotUnsupported(t *testing.T) {
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	mux.HandleFunc("/v1/fs/config.json", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, srv.URL+"/v2/fs/config.json?tasks=1", http.StatusMovedPermanently)
+	})
+
+	c := New(srv.URL, "")
+	_, err := c.FileTasksCtx(context.Background(), "/config.json")
+	if err == nil {
+		t.Fatal("expected an error for a same-host redirect")
+	}
+	if errors.Is(err, ErrFileTasksUnsupported) {
+		t.Fatalf("same-host redirect must not be reported as unsupported: %v", err)
+	}
+	if !strings.Contains(err.Error(), "unexpected redirect") {
+		t.Fatalf("err = %v, want unexpected-redirect classification", err)
+	}
+}
+
 func TestFileTasksCtxSurfacesStatusError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

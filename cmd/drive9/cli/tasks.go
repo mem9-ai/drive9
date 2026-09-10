@@ -58,12 +58,12 @@ func Tasks(c *client.Client, args []string) error {
 	return w.Flush()
 }
 
-// taskCell replaces tab and newline characters so a server-supplied value
-// cannot break the column layout of the text table.
+// taskCell replaces control characters so a server-supplied value cannot break
+// the column layout of the text table. tabwriter treats \t, \v, and \f as cell
+// or line boundaries, so map every C0 control and DEL to a space.
 func taskCell(s string) string {
 	return strings.Map(func(r rune) rune {
-		switch r {
-		case '\t', '\n', '\r':
+		if r < 0x20 || r == 0x7f {
 			return ' '
 		}
 		return r

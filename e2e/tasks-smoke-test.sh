@@ -4,7 +4,7 @@
 # Covers the data-plane wire contract behind `drive9 fs tasks`:
 #   - a successful response carries the X-Dat9-Tasks: 1 marker
 #   - the body is {path, tasks[]} with task_type/status and optional last_error
-#   - an empty result encodes tasks as [] (never null)
+#   - tasks is always an array, never null (including an empty result)
 #   - a directory is rejected with 400
 #   - unknown query keys are not silently accepted on the tasks arm
 #
@@ -39,23 +39,40 @@ REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-2}"
 
 # The owner key is a credential: never send it in cleartext. http:// is allowed
 # only for loopback (single-machine dev); every other target must be https://.
-# Mirrors embedding-config-smoke-test.sh's HTTPS requirement.
-if [[ "$BASE" == http://* ]]; then
-  base_authority="${BASE#http://}"
-  base_authority="${base_authority%%/*}"
-  base_authority="${base_authority##*@}"
+# Default-deny: classify the scheme case-insensitively, allow only https, and
+# route http through the loopback host check. Anything else (a missing scheme
+# such as "host:9009", an unknown scheme, or an unparseable authority) is
+# refused rather than assumed safe. Mirrors embedding-config-smoke-test.sh's
+# HTTPS requirement while keeping http for local dev.
+base_lower="$(printf '%s' "$BASE" | tr 'A-Z' 'a-z')"
+base_scheme="${base_lower%%:*}"
+if [ "$base_scheme" = "$base_lower" ]; then
+  base_scheme="" # No colon: curl would default this to cleartext http.
+fi
+if [ "$base_scheme" != "https" ]; then
+  base_authority=""
+  if [ "$base_scheme" = "http" ]; then
+    base_authority="${BASE#*:}"                # drop the scheme
+    base_authority="${base_authority#//}"      # drop two slashes (http://host)
+    base_authority="${base_authority#/}"       # drop one slash (http:/host)
+    base_authority="${base_authority%%[/?#]*}" # drop path/query/fragment
+    base_authority="${base_authority##*@}"     # drop userinfo
+  fi
   case "$base_authority" in
-    '['*']'*) base_host="${base_authority%%]*}]" ;;
-    *) base_host="${base_authority%%:*}" ;;
-  esac
-  case "$base_host" in
-    127.0.0.1|localhost|'[::1]') ;;
+    127.0.0.1|127.0.0.1:*|localhost|localhost:*|'[::1]'|'[::1]':*) ;;
     *)
       echo "FATAL: DRIVE9_BASE must use https:// (http:// is allowed only for loopback) so the owner key is not sent in cleartext: $BASE" >&2
       exit 2
       ;;
   esac
 fi
+
+for command in curl jq; do
+  command -v "$command" >/dev/null || {
+    echo "FATAL: $command is required" >&2
+    exit 2
+  }
+done
 
 PASS=0
 FAIL=0
@@ -75,7 +92,6 @@ info() { echo "  -> $*"; }
 
 check_eq() {
   local desc="$1" got="$2" want="$3"
-  TOTAL=$((TOTAL+1))
   if [ "$got" = "$want" ]; then
     ok "$desc (got=$got)"
   else
@@ -86,7 +102,6 @@ check_eq() {
 check_cmd() {
   local desc="$1"
   shift
-  TOTAL=$((TOTAL+1))
   if "$@"; then
     ok "$desc"
   else
@@ -96,7 +111,20 @@ check_cmd() {
 
 HDR_FILE="$(mktemp)"
 BODY_FILE="$(mktemp)"
-trap 'rm -f "$HDR_FILE" "$BODY_FILE"' EXIT
+TREE_CREATED=0
+# Remove the created tree on a hard abort so a failed run does not leak a
+# tasks-smoke-<ts>/ directory (step 7 still deletes it on the happy path).
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [ "$TREE_CREATED" -eq 1 ] && [ -n "$API_KEY" ] && [ -n "${DIR:-}" ]; then
+    curl -sS -o /dev/null -X DELETE \
+      -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/$DIR?recursive" || true
+  fi
+  rm -f "$HDR_FILE" "$BODY_FILE"
+  exit "$status"
+}
+trap cleanup EXIT
 
 # http returns "<body>__HTTP__<code>" and leaves response headers in $HDR_FILE.
 http() {
@@ -106,10 +134,10 @@ http() {
     local code
     if [ -n "$data" ]; then
       code=$(curl -sS -D "$HDR_FILE" -o "$BODY_FILE" -w "%{http_code}" -X "$method" \
-        -H "Authorization: Bearer $API_KEY" --data-binary "$data" "$url")
+        -H "Authorization: Bearer $API_KEY" --data-binary "$data" "$url") || code="000"
     else
       code=$(curl -sS -D "$HDR_FILE" -o "$BODY_FILE" -w "%{http_code}" -X "$method" \
-        -H "Authorization: Bearer $API_KEY" "$url")
+        -H "Authorization: Bearer $API_KEY" "$url") || code="000"
     fi
     if [ "$code" != "429" ] || [ "$attempt" -ge "$REQUEST_MAX_RETRIES" ]; then
       printf '%s\n__HTTP__%s' "$(cat "$BODY_FILE")" "$code"
@@ -162,7 +190,7 @@ while :; do
   if [ "$(date +%s)" -ge "$deadline" ]; then
     fail "tenant not active within ${POLL_TIMEOUT_S}s (last=$status)"
     echo
-    echo "RESULT: $PASS passed, $FAIL failed"
+    echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
     exit 1
   fi
   sleep "$POLL_INTERVAL_S"
@@ -178,6 +206,7 @@ resp=$(http PUT "$BASE/v1/fs/$FILE" "task status smoke")
 check_eq "PUT file returns 200" "$(http_code "$resp")" "200"
 resp=$(http POST "$BASE/v1/fs/$DIR?mkdir")
 check_eq "POST mkdir returns 200" "$(http_code "$resp")" "200"
+TREE_CREATED=1
 
 step "4" "GET ?tasks on the file"
 resp=$(http GET "$BASE/v1/fs/$FILE?tasks=1")
@@ -205,9 +234,10 @@ resp=$(http DELETE "$BASE/v1/fs/$FILE")
 info "delete file: $(http_code "$resp")"
 resp=$(http DELETE "$BASE/v1/fs/$DIR?recursive")
 info "delete directory: $(http_code "$resp")"
+TREE_CREATED=0
 
 echo
-echo "RESULT: $PASS passed, $FAIL failed"
+echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
 if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
