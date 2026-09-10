@@ -155,9 +155,11 @@ Use `grep` to find files by what they contain. Use `find` to find files by name,
 
 ### Extract/embed task status
 
-`drive9 fs tasks <path>` reports the extract/embed pipeline state for a file's current revision: one entry per applicable task type (`embed`, `img_extract_text`, `audio_extract_text`, `video_extract_visual`). Status is one of `queued`, `processing`, `succeeded`, or `failed`; a failed task includes a bounded `last_error` reason.
+`drive9 fs tasks <path>` reports the extract/embed pipeline state for a file's current revision: one entry per applicable task type (`embed`, `img_extract_text`, `audio_extract_text`, `video_extract_visual`). Status is one of `queued`, `processing`, `succeeded`, or `failed` (the server maps its internal terminal `dead_lettered` state to `failed`). A `last_error` appears when a task failed; a retryable failure stays `queued` and can carry a `last_error` while it is retried.
 
 Text output always prints the `TASK_TYPE  STATUS  LAST_ERROR` header and one row per task, so an empty result prints the header alone. `-o json` emits `{"path": ..., "tasks": []}`. Task status is drive9-only; object-store URIs are rejected.
+
+On a server older than this command, `fs tasks` returns an error matching `ErrFileTasksUnsupported` (`file tasks: server does not support fs tasks (?tasks)`) instead of an empty list; upgrade the server to use the command.
 
 ```bash
 drive9 fs tasks :/docs/report.pdf

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 )
 
 // fileTasksMarkerHeader is set by servers that implement
@@ -16,8 +17,9 @@ import (
 const fileTasksMarkerHeader = "X-Dat9-Tasks"
 
 // ErrFileTasksUnsupported reports that the server does not implement
-// GET /v1/fs/{path}?tasks. Callers can detect it with errors.Is.
-var ErrFileTasksUnsupported = errors.New("file tasks: server does not support task status")
+// GET /v1/fs/{path}?tasks (the `fs tasks` command). Callers can detect it with
+// errors.Is.
+var ErrFileTasksUnsupported = errors.New("file tasks: server does not support fs tasks (?tasks)")
 
 // FileTask is one durable extract/embed task for a file's current revision.
 // LastError is empty unless the task failed, and is bounded by the server.
@@ -59,6 +61,12 @@ func (c *Client) FileTasksCtx(ctx context.Context, path string) (*FileTasksResul
 	defer func() { _ = resp.Body.Close() }()
 	switch {
 	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		// A cross-host Location (an object-store redirect) is the strongest
+		// signal that the server predates ?tasks; name the host without ever
+		// dereferencing it.
+		if host := redirectHost(resp); host != "" {
+			return nil, fmt.Errorf("%w (HTTP %d redirect to %s)", ErrFileTasksUnsupported, resp.StatusCode, host)
+		}
 		return nil, fmt.Errorf("%w (HTTP %d redirect)", ErrFileTasksUnsupported, resp.StatusCode)
 	case resp.StatusCode >= 400:
 		return nil, readError(resp)
@@ -74,4 +82,14 @@ func (c *Client) FileTasksCtx(ctx context.Context, path string) (*FileTasksResul
 		out.Tasks = []FileTask{}
 	}
 	return &out, nil
+}
+
+// redirectHost returns the host of a response's Location header, or "" when the
+// header is missing, relative, or malformed. It never follows the redirect.
+func redirectHost(resp *http.Response) string {
+	u, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }

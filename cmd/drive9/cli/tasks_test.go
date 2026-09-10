@@ -76,7 +76,8 @@ func TestTasksJSONOutput(t *testing.T) {
 // An empty result still prints the header so callers can tell "no applicable
 // tasks" apart from a no-op.
 func TestTasksEmptyTextPrintsHeader(t *testing.T) {
-	srv := newTasksTestServer(t, `{"path":"/doc.txt","tasks":[]}`)
+	// The server omits tasks; the client must normalize to an empty slice.
+	srv := newTasksTestServer(t, `{"path":"/doc.txt"}`)
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
@@ -90,7 +91,8 @@ func TestTasksEmptyTextPrintsHeader(t *testing.T) {
 }
 
 func TestTasksJSONEmptyTasksIsArray(t *testing.T) {
-	srv := newTasksTestServer(t, `{"path":"/doc.txt","tasks":[]}`)
+	// The server omits tasks entirely; JSON output must still be [] (not null).
+	srv := newTasksTestServer(t, `{"path":"/doc.txt"}`)
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
@@ -110,6 +112,26 @@ func TestTasksRejectsObjectURIWithoutNetwork(t *testing.T) {
 	err := Tasks(c, []string{"s3://bucket/key"})
 	if err == nil || !strings.Contains(err.Error(), "only available on drive9 paths") {
 		t.Fatalf("err = %v, want drive9-only error", err)
+	}
+}
+
+// Control characters in a server-supplied last_error must not break the table.
+func TestTasksTextOutputSanitizesControlCharacters(t *testing.T) {
+	srv := newTasksTestServer(t, `{"path":"/doc.txt","tasks":[`+
+		`{"task_type":"embed","status":"failed","last_error":"embed_text_failed\ninjected\trow"}]}`)
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	out, err := captureStdoutE(t, func() error { return Tasks(c, []string{":/doc.txt"}) })
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected header + 1 row, got %d lines: %q", len(lines), out)
+	}
+	if !strings.Contains(out, "embed_text_failed injected row") {
+		t.Fatalf("control characters not replaced with spaces: %q", out)
 	}
 }
 

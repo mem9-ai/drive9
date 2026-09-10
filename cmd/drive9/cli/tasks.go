@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -22,14 +23,15 @@ func Tasks(c *client.Client, args []string) error {
 	if err != nil {
 		return err
 	}
-	// Task status is a drive9 concept, so reject object-store URIs (and stdin)
-	// before fsHandleForArg opens an object backend and mints credentials for a
-	// command that can never use them.
+	// Task status is a drive9 concept, so reject object-store URIs before
+	// fsHandleForArg opens an object backend and mints credentials for a
+	// command that can never use them. Stdin ("-") is already rejected as a
+	// flag by parseOutputFormatAndPath.
 	loc, err := Parse(path)
 	if err != nil {
 		return err
 	}
-	if loc = promoteBareFSArg(loc); loc.Kind == KindObject || loc.Kind == KindStdin {
+	if loc = promoteBareFSArg(loc); loc.Kind == KindObject {
 		return fmt.Errorf("drive9 fs tasks: only available on drive9 paths")
 	}
 	h, err := fsHandleForArg(c, path)
@@ -51,7 +53,19 @@ func Tasks(c *client.Client, args []string) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	_, _ = fmt.Fprintln(w, "TASK_TYPE\tSTATUS\tLAST_ERROR")
 	for _, task := range resp.Tasks {
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\n", task.TaskType, task.Status, task.LastError)
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\n", taskCell(task.TaskType), taskCell(task.Status), taskCell(task.LastError))
 	}
 	return w.Flush()
+}
+
+// taskCell replaces tab and newline characters so a server-supplied value
+// cannot break the column layout of the text table.
+func taskCell(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\t', '\n', '\r':
+			return ' '
+		}
+		return r
+	}, s)
 }
