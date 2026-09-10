@@ -210,7 +210,9 @@ done
 ok "tenant is active"
 
 TS="$(date +%s)"
-DIR="tasks-smoke-${TS}"
+# Append the pid so two runs started in the same second do not share a tree
+# (the trap deletes recursively and would otherwise let one delete the other's).
+DIR="tasks-smoke-${TS}-$$"
 FILE="${DIR}/doc-${TS}.txt"
 
 step "3" "Write a file and a directory"
