@@ -63,6 +63,18 @@ var umountHandler = cli.UmountCmd
 var updateHandler = cli.Update
 
 func main() {
+	// Command handlers exit through the cli package; give them the same
+	// telemetry-aware exit path this package uses.
+	restoreExitHook := cli.SetExitHook(exitWithCode)
+	defer restoreExitHook()
+
+	withCLITelemetry(os.Args[1:], runCLI)
+}
+
+// runCLI performs one CLI invocation inside the telemetry-aware wrapper, so
+// startup failures report the same way a command failure does. It must not call
+// os.Exit directly: every exit goes through exitWithCode.
+func runCLI() {
 	if logger.CLIEnabled() {
 		if l, err := logger.NewCLILogger(); err == nil {
 			cliLogger = l
@@ -76,13 +88,15 @@ func main() {
 	stopCPUProfile, err := startCPUProfileFromEnv()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "drive9: %v\n", err)
-		os.Exit(1)
+		exitWithCode(1)
+		return
 	}
 	cpuProfileStop = stopCPUProfile
 	defer cpuProfileStop()
 
 	if len(os.Args) < 2 {
 		usage(2)
+		return
 	}
 
 	dispatch(os.Args[1], os.Args[2:])
@@ -401,7 +415,11 @@ func fatal(cmd string, err error) {
 			msg = m
 		}
 	}
-	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, msg)
+	// Errors that already printed their own message (and usage) are reported
+	// only through the exit code.
+	if reported, ok := err.(interface{ Reported() bool }); !ok || !reported.Reported() {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, msg)
+	}
 	type exitCoder interface{ ExitCode() int }
 	if ec, ok := err.(exitCoder); ok && ec.ExitCode() > 0 {
 		exitWithCode(ec.ExitCode())

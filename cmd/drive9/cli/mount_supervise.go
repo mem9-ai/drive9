@@ -15,6 +15,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 	"github.com/mem9-ai/drive9/pkg/mountsupervisor"
+	"github.com/mem9-ai/drive9/pkg/telemetry"
 )
 
 // runMountSupervise is the hidden supervisor entrypoint:
@@ -133,7 +134,7 @@ func runMountSupervise(args []string) error {
 		MountPoint:          *mountPoint,
 		Executable:          exe,
 		WorkerArgs:          workerArgs,
-		Env:                 os.Environ(),
+		Env:                 telemetryDisabledEnv(os.Environ()),
 		LogPath:             *logPath,
 		Stdout:              stdout,
 		Stderr:              stderr,
@@ -529,6 +530,8 @@ func runMountSystemdUnit(args []string) error {
 	execStart := systemdEscapePercents(shellJoin(startArgs))
 	execStop := systemdEscapePercents(shellJoin([]string{exe, "umount", "--timeout", "60s", mountPoint}))
 	desc := systemdEscapePercents(fmt.Sprintf("drive9 FUSE mount for %s", mountPoint))
+	// The unit re-runs this binary for ExecStart/ExecStop without a user typing
+	// anything, so the whole unit opts out of telemetry.
 	unit := fmt.Sprintf(`[Unit]
 Description=%s
 After=network-online.target
@@ -536,6 +539,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=%s=off
 ExecStart=%s
 ExecStop=%s
 Restart=on-failure
@@ -545,7 +549,7 @@ TimeoutStopSec=70
 
 [Install]
 WantedBy=default.target
-`, desc, execStart, execStop)
+`, desc, telemetry.EnvironmentVariable, execStart, execStop)
 
 	if !install {
 		fmt.Print(unit)

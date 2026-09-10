@@ -28,7 +28,7 @@ func VaultMountCmd(args []string) error {
 }
 
 func vaultMountCmd(args []string, background bool) error {
-	fs := flag.NewFlagSet("mount vault", flag.ExitOnError)
+	fs := flag.NewFlagSet("mount vault", flag.ContinueOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
 	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
@@ -42,11 +42,12 @@ func vaultMountCmd(args []string, background bool) error {
 	}
 
 	if err := fs.Parse(args); err != nil {
-		return err
+		// The flag package already printed the error and the command usage.
+		return UsageError{Err: err}
 	}
 	if fs.NArg() < 1 {
 		fs.Usage()
-		os.Exit(2)
+		exitProcess(2)
 	}
 	if fs.NArg() != 1 {
 		return fmt.Errorf("drive9 mount vault: exactly one mountpoint required")
