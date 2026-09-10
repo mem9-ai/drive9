@@ -2401,7 +2401,39 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 	if revision <= 0 {
 		return
 	}
+	// A truncate through one hardlink alias bumps the shared object's
+	// revision for every alias. Handles opened through the sibling paths
+	// must adopt the fresh base revision too: otherwise their next commit
+	// carries the stale base, conflicts on the server, and the commit queue
+	// terminally refuses the rebase — the content never lands remotely
+	// (hardlink alias + O_TRUNC regression).
+	paths := []string{remotePath}
+	if ino, ok := fs.inodes.GetInode(remotePath); ok {
+		if entry, ok := fs.inodes.GetEntry(ino); ok && len(entry.Paths) > 1 {
+			paths = paths[:0]
+			for p := range entry.Paths {
+				paths = append(paths, p)
+			}
+		}
+	}
+	for _, p := range paths {
+		fs.updateOpenHandleBaseRevisionForPath(p, revision, callerPID, truncateSize)
+	}
+	// Zombies are not in openHandles. A dirty zombie whose absorbed data
+	// survives the truncate must commit with the post-truncate revision, or
+	// its pending commit conflicts terminally (the same alias race).
+	if ino, ok := fs.inodes.GetInode(remotePath); ok {
+		for _, zfh := range fs.zombieHandlesForInode(ino) {
+			zfh.Lock()
+			if zfh.Zombie && (zfh.DirtySeq != 0 || (zfh.Dirty != nil && zfh.Dirty.HasDirtyParts())) {
+				zfh.BaseRev = revision
+			}
+			zfh.Unlock()
+		}
+	}
+}
 
+func (fs *Dat9FS) updateOpenHandleBaseRevisionForPath(remotePath string, revision int64, callerPID uint32, truncateSize int64) {
 	var matching []*FileHandle
 	for _, fh := range fs.openHandles.SnapshotPath(remotePath) {
 		if fh == nil {
@@ -2420,7 +2452,15 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 		adoptedPathTruncate := false
 		fh.Lock()
 		fs.adoptCommittedStorageClassLocked(fh, truncateSize)
-		if shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
+		// The truncating caller's own handle always adopts the truncate and
+		// the fresh base revision, regardless of the O_TRUNC flag or the
+		// sibling-handle count: the caller's own history includes the
+		// truncation, and the kernel does not propagate O_TRUNC into the FUSE
+		// open flags (it issues the truncate as a separate SetAttr), so the
+		// conservative O_TRUNC heuristic below never fires for real O_TRUNC
+		// writers and their next commit would CAS-conflict forever.
+		callerOwned := callerPID != 0 && fh.OpenPID != 0 && fh.OpenPID == callerPID
+		if callerOwned || shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
 			var err error
 			abortStreamer, err = fs.truncateWritableHandleLocked(fh, truncateSize)
 			if err != nil {
@@ -2430,7 +2470,7 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 			}
 			adoptedPathTruncate = true
 		}
-		if !shouldRefreshHandleAfterPathTruncate(fh, truncateSize) {
+		if !callerOwned && !shouldRefreshHandleAfterPathTruncate(fh, truncateSize) {
 			fh.Unlock()
 			continue
 		}
@@ -3444,6 +3484,13 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 		// The path truncate committed a full re-upload of newSize remotely;
 		// the storage class follows from that size.
 		fs.adoptCommittedStorageClassLocked(fh, newSize)
+		// A zombie with no dirty sequence and no dirty parts was clean before
+		// this sync: any dirty state the truncation below creates is phantom
+		// bookkeeping, not absorbed writeback data. Committing it would
+		// publish the truncated (usually zero) image with the zombie's stale
+		// BaseRev and terminally conflict the live writer's pending content
+		// commit on the same shared object (the alias truncate race).
+		wasDirty := fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts()
 		curSize := fh.Dirty.Size()
 		if curSize != newSize {
 			if err := fh.Dirty.Truncate(newSize); err != nil {
@@ -3459,7 +3506,12 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 				fh.OrigSize = newSize
 			}
 		}
-		fh.DirtySeq = fs.markDirtySize(ino, newSize)
+		if fh.Zombie && !wasDirty {
+			fh.Dirty.ClearDirty()
+			fh.ZeroBase = false
+		} else {
+			fh.DirtySeq = fs.markDirtySize(ino, newSize)
+		}
 		fh.Unlock()
 	}
 }
@@ -4018,6 +4070,16 @@ func (fs *Dat9FS) canStagePathTruncateToZero(entry *InodeEntry) bool {
 	}
 	if fs.mountWritePolicy() != WritePolicyWriteBack {
 		return false
+	}
+	// With a live writer on the inode (any alias path), an async zero-truncate
+	// races the writer's pending commit: whichever revision lands first wins
+	// and the other is terminally refused, losing data either way (the
+	// O_TRUNC-on-hardlink-alias regression). Take the synchronous path, which
+	// refreshes the writer's base revision (across aliases) before it commits.
+	for _, fh := range fs.fileHandlesForInode(entry.Ino) {
+		if fh != nil && !fh.Zombie && !fh.Unlinked && fh.Dirty != nil {
+			return false
+		}
 	}
 	return fs.shadowStore != nil && fs.pendingIndex != nil && fs.commitQueue != nil
 }

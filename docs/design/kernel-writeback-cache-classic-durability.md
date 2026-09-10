@@ -103,6 +103,43 @@ plain append would produce. The remote dirty-buffer path is unaffected (its
 `WriteBuffer` has no such restriction, and it already trusts the kernel
 offset for `WRITE_CACHE`).
 
+## 1.5 The hardlink-alias truncate race (third hole)
+
+`printf "x" > hardlink.txt` (a truncate-then-write through a hardlink alias)
+surfaced in Local E2E as `writing hardlink updates remote source` failing
+with the remote stuck at 0 bytes while the local read was correct. The
+mechanism is a commit-ordering race on the shared object:
+
+- the O_TRUNC arrives as a path-based SetAttr (no fh) and, on the
+  write-back staged path, is committed as its own async zero-byte write to
+  the canonical path — racing the writer's content commit on the alias
+  path, both carrying the open-time base revision;
+- whichever lands first wins and the commit queue terminally refuses the
+  other ("refusing LWW rebase"), so the remote ends at 0 either way;
+- a second, independent zero could come from a **clean zombie**: the
+  path-truncate buffer sync dirtied its buffer, and it then committed the
+  truncated image with its own stale base revision.
+
+Three repairs, all in the revision-tracking layer:
+
+1. **Caller-owned adoption.** `updateOpenHandleBaseRevision` now always
+   adopts the truncate and the fresh base revision for the truncating
+   caller's own handle (OpenPID == callerPID), regardless of the O_TRUNC
+   flag or sibling-handle count. The pre-existing `O_TRUNC`-flag heuristic
+   never fires in production — the kernel issues the truncate as a separate
+   SetAttr and does not propagate O_TRUNC into the FUSE open flags — so
+   real O_TRUNC writers were never refreshed and their next commit
+   CAS-conflicted forever.
+2. **Alias coverage.** The base-revision refresh iterates every alias path
+   of the inode (and dirty zombies of the inode), so a writer on any
+   hardlink alias commits with the post-truncate revision.
+3. **Race removal.** `canStagePathTruncateToZero` declines the async staged
+   path while any live (non-zombie) writer holds the inode, forcing the
+   synchronous truncate that lands before the writer's commit and refreshes
+   it first; and the truncate buffer syncs no longer create phantom dirty
+   state on clean zombies (they truncate the buffer but keep the zombie
+   clean, so it never publishes the zero image with a stale base).
+
 ---
 
 # 2. The durability contract that must not change

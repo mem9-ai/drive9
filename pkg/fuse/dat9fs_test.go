@@ -14623,9 +14623,37 @@ func TestSetAttr_WriteBackInteractivePathTruncateStagesAndReturnsBeforeRemoteCom
 
 func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
 	const callerPID = 5151
+	// With a live writer on the inode the truncate must take the synchronous
+	// path (the async staged zero would race the writer's pending commit), so
+	// the test needs a live server that accepts the truncate PUT.
+	var mu sync.Mutex
+	rev := int64(7)
+	content := bytes.Repeat([]byte{0x41}, 8*1024*1024)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			content = append([]byte(nil), body...)
+			rev++
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
 	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
 	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

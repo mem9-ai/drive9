@@ -625,3 +625,161 @@ func TestWriteAppendLocalHandleWriteCacheStatus(t *testing.T) {
 		t.Fatalf("content = %q, want reflog-entry", data)
 	}
 }
+
+// A path truncate through one hardlink alias must refresh the base revision
+// of handles opened through the sibling aliases. Before the fix, only the
+// canonical path's handles were updated: a writer on the alias kept the
+// stale base, its commit conflicted forever, and the content never landed
+// remotely (remote stayed at the truncated 0 bytes).
+func TestPathTruncateRefreshesBaseRevisionAcrossHardlinkAliases(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	const pid = 4321
+
+	now := time.Now()
+	ino := fs.inodes.LookupWithIdentity("/alpha/text.txt", "rid-1", 2, false, 29, now)
+	fs.inodes.AddAlias(ino, "/alpha/text-hardlink.txt", "rid-1", 2, false, 29, now)
+
+	writer := &FileHandle{
+		Ino:     ino,
+		Path:    "/alpha/text-hardlink.txt",
+		Flags:   uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+		OpenPID: pid,
+		Dirty:   fs.newWriteBuffer("/alpha/text-hardlink.txt", 0, 0),
+		BaseRev: 2,
+	}
+	_, _ = writer.Dirty.Write(0, []byte("hardlink-x"))
+	fs.allocateFileHandle(writer)
+
+	// The truncate commits through the canonical path (server revision 3).
+	fs.updateOpenHandleBaseRevision("/alpha/text.txt", 3, pid, 0)
+
+	writer.Lock()
+	baseRev := writer.BaseRev
+	bufferSize := writer.Dirty.Size()
+	writer.Unlock()
+	if baseRev != 3 {
+		t.Fatalf("alias writer BaseRev = %d, want 3 (post-truncate revision)", baseRev)
+	}
+	// The O_TRUNC adoption truncates the alias writer's buffer in step with
+	// the remote truncate, so no stale tail can leak into the next commit.
+	if bufferSize != 0 {
+		t.Fatalf("alias writer buffer size = %d, want 0 after truncate adoption", bufferSize)
+	}
+}
+
+// The full O_TRUNC-on-hardlink-alias regression: printf-style truncate+write
+// through a hardlink alias must end with the caller's content on the shared
+// remote object — never stuck at 0 bytes because the remote zero-truncate
+// raced the content commit and won.
+func TestPathTruncateOnHardlinkAliasCommitsCallerContent(t *testing.T) {
+	const pid = 7777
+
+	// Revision-checking server seeded at rev 2 for the shared object.
+	var mu sync.Mutex
+	rev := int64(2)
+	content := []byte("overwrite-x-append-0123456789")
+	puts := make(map[string][][]byte)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			if p != "/alpha/text.txt" && p != "/alpha/text-hardlink.txt" {
+				w.Header().Set("X-Dat9-IsDir", "true")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			if exp := r.Header.Get("X-Dat9-Expected-Revision"); exp != "" && exp != strconv.FormatInt(rev, 10) {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			content = append([]byte(nil), body...)
+			rev++
+			puts[p] = append(puts[p], body)
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.kernelWritebackCache = true
+	t.Cleanup(fs.stopZombieJanitor)
+
+	// text.txt committed at revision 2 with 29 bytes, aliased as
+	// text-hardlink.txt (same inode).
+	ino := fs.inodes.LookupWithIdentity("/alpha/text.txt", "rid-1", 2, false, 29, time.Now())
+	fs.inodes.AddAlias(ino, "/alpha/text-hardlink.txt", "rid-1", 2, false, 29, time.Now())
+	fs.inodes.UpdateRevision(ino, 2)
+	fs.replaceCommittedRevision("/alpha/text.txt", 2)
+
+	// The caller opens the alias with O_TRUNC (printf ">"): writable handle,
+	// BaseRev from the open-time stat.
+	writer := &FileHandle{
+		Ino:      ino,
+		Path:     "/alpha/text-hardlink.txt",
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+		OpenPID:  pid,
+		Dirty:    fs.newWriteBuffer("/alpha/text-hardlink.txt", 0, 0),
+		OrigSize: 29,
+		BaseRev:  2,
+	}
+	fhID := fs.allocateFileHandle(writer)
+
+	// The O_TRUNC SetAttr arrives without FATTR_FH (path-based, at open).
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr(size=0): %v", st)
+	}
+	writer.Lock()
+	bufSize := writer.Dirty.Size()
+	baseRev := writer.BaseRev
+	writer.Unlock()
+	if bufSize != 0 {
+		t.Fatalf("caller buffer size = %d, want 0 after truncate adoption", bufSize)
+	}
+	// The synchronous truncate committed the zero and refreshed the writer's
+	// base revision across the alias.
+	if baseRev != 3 {
+		t.Fatalf("caller BaseRev = %d, want 3 after the committed truncate", baseRev)
+	}
+
+	// printf's write + close commits the content — with the refreshed base,
+	// no revision conflict is possible.
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       fhID,
+	}, []byte("hardlink-x")); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fhID})
+
+	mu.Lock()
+	final := string(content)
+	mu.Unlock()
+	if final != "hardlink-x" {
+		t.Fatalf("final remote content = %q, want hardlink-x", final)
+	}
+}

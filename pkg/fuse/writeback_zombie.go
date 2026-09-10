@@ -310,8 +310,17 @@ func (fs *Dat9FS) truncateZombieBuffersForInode(ino uint64, newSize int64) {
 	for _, zfh := range fs.zombieHandlesForInode(ino) {
 		zfh.Lock()
 		if zfh.Zombie && zfh.Dirty != nil && zfh.Dirty.Size() > newSize {
+			// A zombie with no dirty sequence and no dirty parts was clean
+			// before this sync: the dirty state the truncation creates is
+			// phantom bookkeeping, not absorbed writeback data. Keep it
+			// clean — committing it would publish the truncated (usually
+			// zero) image with the zombie's stale BaseRev.
+			wasDirty := zfh.DirtySeq != 0 || zfh.Dirty.HasDirtyParts()
 			if err := zfh.Dirty.Truncate(newSize); err != nil {
 				safeLogPrintf("zombie truncate sync failed for %s: %v", zfh.Path, err)
+			} else if !wasDirty {
+				zfh.Dirty.ClearDirty()
+				zfh.ZeroBase = false
 			} else {
 				zfh.DirtySeq = fs.markDirtySize(ino, newSize)
 				if newSize == 0 {
