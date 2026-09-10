@@ -541,6 +541,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "cat <path>", Desc: "read a remote file to stdout"},
 					{Name: "ls [-l] [path]", Desc: "list a remote directory"},
 					{Name: "stat [-o text|json] <path>", Desc: "show file metadata"},
+					{Name: "tasks [-o text|json] <path>", Desc: "show extract/embed task status for a file"},
 				}},
 				{Title: "Namespace", Flags: []visualHelpFlag{
 					{Name: "mv <old> <new>", Desc: "rename or move a path"},
@@ -581,6 +582,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			Examples: []visualHelpExample{
 				{Command: "drive9 fs ls -l :/", Desc: "list root"},
 				{Command: "drive9 fs cp ./notes.md :/team/notes.md", Desc: "upload a file"},
+				{Command: "drive9 fs tasks :/team/report.pdf", Desc: "check extract/embed status"},
 				{Command: "drive9 fs find :/team -tag owner=agent", Desc: "find by exact tag"},
 				{Command: "drive9 fs archive :/proj ./proj.tar.gz --profile coding-agent", Desc: "download tree, skip node_modules/.git"},
 				{Command: "drive9 fs archive :/proj --stdout | tar -tzf -", Desc: "list archive contents via pipe"},

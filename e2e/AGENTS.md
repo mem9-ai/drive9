@@ -685,6 +685,15 @@ Optional `SSE_SWEEP_TEST=1` (needs a short `DRIVE9_FS_EVENTS_RETENTION`)
 checks retention pruning via dedicated-shape `POST /v1/sql`. Not part of
 the PR or post-merge default.
 
+### `tasks-smoke-test.sh`
+
+Opt-in (`RUN_TASKS_SMOKE=1`). Wire contract for `GET /v1/fs/{path}?tasks`
+(the surface behind `drive9 fs tasks`): the `X-Dat9-Tasks: 1` marker, the
+`{path, tasks[]}` field names, `tasks` always an array (never `null`), a
+directory `400`, and unknown-query-key rejection. The handler lives in the
+external server repository, so this is the cross-repo drift check; it needs a
+server build that implements `?tasks`. Not part of the PR or post-merge default.
+
 ### `git-feature-smoke-test.sh`
 
 Broader Git feature smoke on a coding-agent FUSE mount (clone modes, readiness,
@@ -773,7 +782,7 @@ Set `RUN_FUSE_SMOKE=0` to skip FUSE-related suites (and layer-fs FUSE restore);
 macOS WebDAV fallback cannot satisfy those asserts. Post-merge extras:
 `RUN_JOURNAL_SMOKE=1`, `RUN_POSIX_SMOKE=1`, `RUN_GIT_WORKSPACE_SMOKE=1`.
 Opt-in HTTP extras (off even on post-merge): `RUN_TOKENS_SMOKE=1`,
-`RUN_SSE_SMOKE=1`.
+`RUN_SSE_SMOKE=1`, `RUN_TASKS_SMOKE=1`.
 
 ### `image-extract-config-smoke-test.sh`
 
@@ -940,6 +949,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `RUN_POSIX_SMOKE` | `0` | `smoke-all.sh` post-merge extra |
 | `RUN_TOKENS_SMOKE` | `0` | `smoke-all.sh` opt-in extra (`e2e/tokens-smoke-test.sh`) |
 | `RUN_SSE_SMOKE` | `0` | `smoke-all.sh` opt-in extra (`e2e/sse-retention-smoke-test.sh`) |
+| `RUN_TASKS_SMOKE` | `0` | `smoke-all.sh` opt-in extra (`e2e/tasks-smoke-test.sh`) |
 | `RUN_FUSE_SMOKE` | `1` | `smoke-all.sh` |
 | `RUN_API_ONLY` | `0` | `smoke-all.sh` (run only api + cli, skip the rest) |
 | `GIT_WORKSPACE_REPOS` | `drive9=...,kimi-cli=...,kimi-code=...` | `git-workspace-smoke-test.sh` |

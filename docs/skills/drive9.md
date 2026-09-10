@@ -87,6 +87,7 @@ drive9 fs cat :/path/to/file               # print content to stdout
 drive9 fs ls :/                            # list root
 drive9 fs ls :/path/                       # list subdirectory
 drive9 fs stat :/path/to/file              # metadata (size, type, mtime)
+drive9 fs tasks :/path/to/file             # extract/embed task status
 
 # move / remove
 drive9 fs mv :/old.txt :/new.txt
@@ -152,6 +153,19 @@ Output: one path per line. Empty output means no matches.
 
 Use `grep` to find files by what they contain. Use `find` to find files by name, date, tag, or size.
 
+### Extract/embed task status
+
+`drive9 fs tasks <path>` reports the extract/embed pipeline state for a file's current revision: one entry per applicable task type (`embed`, `img_extract_text`, `audio_extract_text`, `video_extract_visual`). Status is one of `queued`, `processing`, `succeeded`, or `failed` (the server maps its internal terminal `dead_lettered` state to `failed`). A `last_error` appears when a task failed; a retryable failure stays `queued` and can carry a `last_error` while it is retried.
+
+Text output always prints the `TASK_TYPE  STATUS  LAST_ERROR` header and one row per task, so an empty result prints the header alone. `-o json` emits `{"path": ..., "tasks": []}`. Task status is drive9-only; object-store URIs are rejected.
+
+On a server older than this command, `fs tasks` returns an error matching `ErrFileTasksUnsupported` (`file tasks: server does not support fs tasks (?tasks)`) instead of an empty list; upgrade the server to use the command.
+
+```bash
+drive9 fs tasks :/docs/report.pdf
+drive9 fs tasks -o json :/docs/report.pdf
+```
+
 ### Output formats
 
 | Command | Output |
@@ -160,6 +174,7 @@ Use `grep` to find files by what they contain. Use `find` to find files by name,
 | `fs ls -l` | tab-separated: `type  size  name` (type: `d` or `-`) |
 | `fs cat` | raw file content to stdout |
 | `fs stat` | key-value metadata; use `-o json` for JSON |
+| `fs tasks` | aligned columns: `TASK_TYPE  STATUS  LAST_ERROR` (header always printed); use `-o json` for JSON |
 | `fs grep` | tab-separated: `path  score` per match |
 | `fs find` | one path per line |
 

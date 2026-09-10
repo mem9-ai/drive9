@@ -696,13 +696,30 @@ func (c *Client) PostMigrationEvent(ctx context.Context, event MigrationEvent) e
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
+	return c.doWith(req, c.httpClient)
+}
+
+// doNoRedirect sends req like do but does not follow redirects, so callers that
+// care about a 3xx (for example object-store redirects that must not be
+// mistaken for an API response) can inspect it.
+func (c *Client) doNoRedirect(req *http.Request) (*http.Response, error) {
+	noRedirectClient := *c.httpClient
+	noRedirectClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return c.doWith(req, &noRedirectClient)
+}
+
+// doWith applies the client's credential headers to req and executes it with
+// hc. Credential plumbing lives here so do and doNoRedirect cannot drift apart.
+func (c *Client) doWith(req *http.Request, hc *http.Client) (*http.Response, error) {
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 	if c.actor != "" {
 		req.Header.Set("X-Dat9-Actor", c.actor)
 	}
-	return c.httpClient.Do(req)
+	return hc.Do(req)
 }
 
 // Write uploads data to a remote path.
