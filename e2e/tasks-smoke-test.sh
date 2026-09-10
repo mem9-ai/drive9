@@ -52,7 +52,7 @@ fi
 if [ "$base_scheme" != "https" ]; then
   base_authority=""
   if [ "$base_scheme" = "http" ]; then
-    base_authority="${BASE#*:}"                # drop the scheme
+    base_authority="${base_lower#*:}"          # drop the scheme
     base_authority="${base_authority#//}"      # drop two slashes (http://host)
     base_authority="${base_authority#/}"       # drop one slash (http:/host)
     base_authority="${base_authority%%[/?#]*}" # drop path/query/fragment
@@ -111,13 +111,13 @@ check_cmd() {
 
 HDR_FILE="$(mktemp)"
 BODY_FILE="$(mktemp)"
-TREE_CREATED=0
-# Remove the created tree on a hard abort so a failed run does not leak a
-# tasks-smoke-<ts>/ directory (step 7 still deletes it on the happy path).
+# Delete the tree on any exit, including a hard abort, so a failed run does not
+# leak a tasks-smoke-<ts>/ directory. The delete is idempotent and guarded by a
+# provisioned key and directory; step 7 repeats it on the happy path.
 cleanup() {
   local status=$?
   trap - EXIT
-  if [ "$TREE_CREATED" -eq 1 ] && [ -n "$API_KEY" ] && [ -n "${DIR:-}" ]; then
+  if [ -n "$API_KEY" ] && [ -n "${DIR:-}" ]; then
     curl -sS -o /dev/null -X DELETE \
       -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/$DIR?recursive" || true
   fi
@@ -181,6 +181,14 @@ deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
 while :; do
   resp=$(http GET "$BASE/v1/status")
   code=$(http_code "$resp")
+  if [ "$code" = "000" ]; then
+    # A refused/unreachable transport is not a slow tenant; fail fast instead
+    # of waiting out POLL_TIMEOUT_S.
+    fail "GET /v1/status transport error (code 000)"
+    echo
+    echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
+    exit 1
+  fi
   body=$(json_body "$resp")
   status=$(printf '%s' "$body" | jq -r '.status // empty')
   info "status=$status"
@@ -190,7 +198,7 @@ while :; do
   if [ "$(date +%s)" -ge "$deadline" ]; then
     fail "tenant not active within ${POLL_TIMEOUT_S}s (last=$status)"
     echo
-    echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
+    echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
     exit 1
   fi
   sleep "$POLL_INTERVAL_S"
@@ -206,7 +214,6 @@ resp=$(http PUT "$BASE/v1/fs/$FILE" "task status smoke")
 check_eq "PUT file returns 200" "$(http_code "$resp")" "200"
 resp=$(http POST "$BASE/v1/fs/$DIR?mkdir")
 check_eq "POST mkdir returns 200" "$(http_code "$resp")" "200"
-TREE_CREATED=1
 
 step "4" "GET ?tasks on the file"
 resp=$(http GET "$BASE/v1/fs/$FILE?tasks=1")
@@ -234,10 +241,9 @@ resp=$(http DELETE "$BASE/v1/fs/$FILE")
 info "delete file: $(http_code "$resp")"
 resp=$(http DELETE "$BASE/v1/fs/$DIR?recursive")
 info "delete directory: $(http_code "$resp")"
-TREE_CREATED=0
 
 echo
-echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
+echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
 if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
