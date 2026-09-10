@@ -89,6 +89,10 @@ ok() { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo -e "${GREEN}  PASS${RESET} $*"
 fail() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo -e "${RED}  FAIL${RESET} $*"; }
 skip_check() { local desc="$1"; TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1)); echo -e "${YELLOW}  SKIP${RESET} $desc"; }
 info() { echo "  -> $*"; }
+report() {
+  echo
+  echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
+}
 
 check_eq() {
   local desc="$1" got="$2" want="$3"
@@ -111,9 +115,11 @@ check_cmd() {
 
 HDR_FILE="$(mktemp)"
 BODY_FILE="$(mktemp)"
-# Delete the tree on any exit, including a hard abort, so a failed run does not
-# leak a tasks-smoke-<ts>/ directory. The delete is idempotent and guarded by a
-# provisioned key and directory; step 7 repeats it on the happy path.
+# DIR must start empty so an environment-inherited value cannot name a tenant
+# directory the run never created; only the timestamped assignment below makes
+# the trap's guarded delete live. The delete is idempotent and also runs on the
+# happy path from step 7.
+DIR=""
 cleanup() {
   local status=$?
   trap - EXIT
@@ -185,8 +191,7 @@ while :; do
     # A refused/unreachable transport is not a slow tenant; fail fast instead
     # of waiting out POLL_TIMEOUT_S.
     fail "GET /v1/status transport error (code 000)"
-    echo
-    echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
+    report
     exit 1
   fi
   body=$(json_body "$resp")
@@ -197,8 +202,7 @@ while :; do
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
     fail "tenant not active within ${POLL_TIMEOUT_S}s (last=$status)"
-    echo
-    echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
+    report
     exit 1
   fi
   sleep "$POLL_INTERVAL_S"
@@ -242,8 +246,7 @@ info "delete file: $(http_code "$resp")"
 resp=$(http DELETE "$BASE/v1/fs/$DIR?recursive")
 info "delete directory: $(http_code "$resp")"
 
-echo
-echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
+report
 if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
