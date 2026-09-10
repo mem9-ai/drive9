@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -23,32 +22,9 @@ func Stat(c *client.Client, args []string) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
-	outputFormat := "text"
-	path := ""
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch arg {
-		case "-o", "--output":
-			if i+1 >= len(args) {
-				return fmt.Errorf("usage: drive9 fs stat [-o text|json] [--auth=local|server] <path>")
-			}
-			i++
-			outputFormat = args[i]
-			if outputFormat != "text" && outputFormat != "json" {
-				return fmt.Errorf("unsupported output format %q (want text or json)", outputFormat)
-			}
-		default:
-			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("usage: drive9 fs stat [-o text|json] [--auth=local|server] <path>")
-			}
-			if path != "" {
-				return fmt.Errorf("usage: drive9 fs stat [-o text|json] [--auth=local|server] <path>")
-			}
-			path = arg
-		}
-	}
-	if path == "" {
-		return fmt.Errorf("usage: drive9 fs stat [-o text|json] [--auth=local|server] <path>")
+	outputFormat, path, err := parseOutputFormatAndPath(args, "drive9 fs stat [-o text|json] [--auth=local|server] <path>")
+	if err != nil {
+		return err
 	}
 	h, err := fsHandleForArg(c, path)
 	if err != nil {
