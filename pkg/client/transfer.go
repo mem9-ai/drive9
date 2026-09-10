@@ -1398,24 +1398,18 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 }
 
 func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader string) (*http.Response, error) {
-	// Disable redirect following so we can detect 302
-	noRedirectClient := *c.httpClient
-	noRedirectClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-
+	// Disable redirect following so we can detect 302. The request carries the
+	// same credentials as any other read (doWith), including X-Dat9-Actor: the
+	// actor header is read by the drive9 origin on this hop and is not forwarded
+	// to the object store; only the redirect response itself is inspected here.
 	req, err := c.newFSRequest(ctx, http.MethodGet, path, "", nil)
 	if err != nil {
 		return nil, err
 	}
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
 	if rangeHeader != "" {
 		req.Header.Set("Range", rangeHeader)
 	}
-
-	return noRedirectClient.Do(req)
+	return c.doNoRedirect(req)
 }
 
 // ResolveReadTarget resolves a large S3-backed file path to a reusable object
