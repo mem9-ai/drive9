@@ -88,6 +88,13 @@ func (fs *Dat9FS) zombifyReleasedHandle(fh *FileHandle) bool {
 	fh.Zombie = true
 	fh.ZombifiedAt = time.Now()
 	fh.Unlock()
+	// The zombie is a closed handle for every namespace purpose: it must not
+	// count as an open handle, or openHandleEntry/SnapshotPath lookups would
+	// report a deleted path as still present (the truncate-then-unlink local
+	// resurrection). It stays in fileHandles (fh-addressed writebacks) and
+	// zombiesByInode (node-addressed writebacks); unlink/rename cover it
+	// through the explicit zombie helpers.
+	fs.openHandles.Remove(fh)
 	fs.registerZombie(fh)
 	fs.startZombieJanitor()
 	if fs.debugEnabled() {

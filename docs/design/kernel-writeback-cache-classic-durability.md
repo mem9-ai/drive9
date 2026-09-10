@@ -196,10 +196,13 @@ zombie handle:   Open ────────────── Release ── 
 The zombie keeps the handle in `fileHandles` (keyed by fh, so a writeback
 carrying the released fh hits it directly) plus a dedicated per-inode index
 `zombiesByInode` (so a node-addressed writeback finds it), with a `Zombie`
-flag. It is deliberately **not** in `openHandles`: a zombie is closed for
-every namespace purpose, and keeping it out leaves the ~20 open-handle call
-sites (unlink-while-open, rename retarget, SQLite sidecar probes,
-`shouldPreserveForgottenInode`) byte-identical. The zombie reuses the entire
+flag. It is **removed from `openHandles` at the transition**: a zombie is
+closed for every namespace purpose, and leaving it in `openHandles` made
+`openHandleEntry`/`SnapshotPath` report a deleted path as still present —
+the truncate-then-unlink local resurrection where `test -e` succeeded on a
+file that was deleted remotely. Unlink, rename, fsync, and truncate cover
+it through the explicit zombie helpers (`markZombiesUnlinkedForPath`,
+`retargetZombiePathsForRename`, `syncZombieHandlesForInode`). The zombie reuses the entire
 existing Write machinery: dirty buffer, shadow write-through, DirtySeq
 generation fences, `remoteCommitLock` serialization, unlinked discards.
 **No second staging or commit path is introduced.** The two namespace flows
