@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // fileTasksMarkerHeader is set by servers that implement
@@ -63,11 +64,17 @@ func (c *Client) FileTasksCtx(ctx context.Context, path string) (*FileTasksResul
 	case resp.StatusCode >= 300 && resp.StatusCode < 400:
 		// A cross-host Location (an object-store redirect) is the strongest
 		// signal that the server predates ?tasks; name the host without ever
-		// dereferencing it.
-		if host := redirectHost(resp); host != "" {
+		// dereferencing it. A same-host redirect (for example an http->https
+		// upgrade) is not that signal, so it must not claim the capability is
+		// missing.
+		host := redirectHost(resp)
+		if host != "" && !sameHost(c.baseURL, host) {
 			return nil, fmt.Errorf("%w (HTTP %d redirect to %s)", ErrFileTasksUnsupported, resp.StatusCode, host)
 		}
-		return nil, fmt.Errorf("%w (HTTP %d redirect)", ErrFileTasksUnsupported, resp.StatusCode)
+		if host == "" {
+			host = "relative Location"
+		}
+		return nil, fmt.Errorf("file tasks: unexpected redirect (HTTP %d to %s)", resp.StatusCode, host)
 	case resp.StatusCode >= 400:
 		return nil, readError(resp)
 	}
@@ -92,4 +99,15 @@ func redirectHost(resp *http.Response) string {
 		return ""
 	}
 	return u.Host
+}
+
+// sameHost reports whether host matches the host of baseURL, including any
+// port. It is used to tell an object-store redirect (a different host, which
+// means the server predates ?tasks) from an ingress redirect on the same host.
+func sameHost(baseURL, host string) bool {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, host)
 }

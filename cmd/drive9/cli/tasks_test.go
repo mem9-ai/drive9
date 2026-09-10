@@ -76,7 +76,9 @@ func TestTasksJSONOutput(t *testing.T) {
 // An empty result still prints the header so callers can tell "no applicable
 // tasks" apart from a no-op.
 func TestTasksEmptyTextPrintsHeader(t *testing.T) {
-	// The server omits tasks; the client must normalize to an empty slice.
+	// The server omits tasks. The text path renders a nil and an empty slice
+	// identically, so this asserts only the header; the JSON and client tests
+	// pin the nil -> [] normalization.
 	srv := newTasksTestServer(t, `{"path":"/doc.txt"}`)
 	defer srv.Close()
 
@@ -116,9 +118,10 @@ func TestTasksRejectsObjectURIWithoutNetwork(t *testing.T) {
 }
 
 // Control characters in a server-supplied last_error must not break the table.
+// tabwriter treats \t, \v, and \f specially, so all of them must be mapped.
 func TestTasksTextOutputSanitizesControlCharacters(t *testing.T) {
 	srv := newTasksTestServer(t, `{"path":"/doc.txt","tasks":[`+
-		`{"task_type":"embed","status":"failed","last_error":"embed_text_failed\ninjected\trow"}]}`)
+		`{"task_type":"embed","status":"failed","last_error":"embed_text_failed\ninjected\trow\u000bcol\u000cform\u007fdel"}]}`)
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
@@ -130,7 +133,7 @@ func TestTasksTextOutputSanitizesControlCharacters(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("expected header + 1 row, got %d lines: %q", len(lines), out)
 	}
-	if !strings.Contains(out, "embed_text_failed injected row") {
+	if !strings.Contains(out, "embed_text_failed injected row col form del") {
 		t.Fatalf("control characters not replaced with spaces: %q", out)
 	}
 }
