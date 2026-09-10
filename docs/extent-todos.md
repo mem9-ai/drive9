@@ -289,6 +289,24 @@ Split of the 81 s (instrumented fork): **41.9 s in the per-read `vfs.VFS.Read` w
 
 A bounded read-your-writes window in `Dat9FS` (serve a read from bytes this daemon just wrote) was implemented and measured: it did **not** help (spill 132 s vs 81 s), because SQLite's read-back only partly overlaps the written ranges, so most reads still fall through to the store and pay the barrier. The remaining fix has to be in the read path itself: drop or narrow the unconditional `writer.Flush` in the fork's `VFS.Read` (it is only needed for read-your-writes on *other* clients) and/or let the daemon answer a clean read from the git-style local staging area without a store round trip. Until then the cap-off extent path cannot meet SQLite's 10 s busy timeout for this workload.
 
+**The remaining fix is a fork change, and it is now specified** [verified]
+The three delays behind the 41.9 s read barrier are hard-coded in the JuiceFS fork, not exposed through `vfs.Config`, so drive9 cannot tune them:
+
+| Where | Constant | Effect per read-after-write |
+|---|---|---|
+| `pkg/vfs/vfs.go:790` (`VFS.Read`) | `v.writer.Flush(ctx, ino)` unconditional | every read drains the inode's writer, even when the read range has nothing staged |
+| `pkg/meta/drive9_engine.go:407,447` (`inodeWriteWorker`) | `8 * time.Millisecond` batch window | a staged slice waits up to 8 ms before its meta write is sent |
+| `pkg/vfs/writer.go:386` (`pickCommitCount`) | `5 ms` deadline before committing leading done slices | each read-back waits for that window; `writePartsBatch = 64` (`writer.go:326`) is the ceiling |
+
+For the isolated spill that is 4.4 ms per read on average (p50 0.02 ms, 3997 of 9483 reads > 1 ms), i.e. almost exactly the two windows, repeated 9.5 k times.
+
+Proposed fork change, in order of value:
+1. Serve a read whose range is fully covered by the writer's **staged** slices from the local staging area (`chunkWriter`/`sliceWriter` hold the bytes) instead of draining: this removes both the barrier and the store round trip for read-your-writes, and unlike a daemon-side cache it knows the staged ranges exactly (a daemon-side window was tried and failed precisely because SQLite's read-back only partly overlaps what was written).
+2. When a drain *is* required (read outside the staged ranges, Fsync, Flush, Release), flush the pending meta batch immediately instead of waiting out the 8 ms window; `WaitWrites` already queues behind the parts, so this only removes timer latency.
+3. Make the two windows configurable (`vfs.Config`) so a mount can trade meta batching for read-after-write latency without a fork release.
+
+Acceptance for this item: with `--writeback-cache off`, the isolated spill task returns to single-digit seconds (ext4: 0.2 s; cap-on: 16 s; cap-off today: 81 s) and `mptester crash01.test --journalmode wal` reports `0 errors out of 94 tests`, then the whole `community.sqlite` module passes on the extent profile.
+
 ---
 
 # P1-10 Classic-path SQLite mounted integrity_check fails with disk I/O error under the kernel writeback cache
