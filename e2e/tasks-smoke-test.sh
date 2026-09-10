@@ -24,6 +24,9 @@
 #   RUN_TASKS_SMOKE=1 bash e2e/smoke-all.sh
 #   export DRIVE9_BASE=http://127.0.0.1:9009
 #   bash e2e/tasks-smoke-test.sh
+#
+# DRIVE9_BASE may use http:// only for loopback; every other target must be
+# https:// so the owner key is never sent in cleartext.
 
 set -euo pipefail
 
@@ -33,6 +36,26 @@ POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-300}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
 REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-8}"
 REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-2}"
+
+# The owner key is a credential: never send it in cleartext. http:// is allowed
+# only for loopback (single-machine dev); every other target must be https://.
+# Mirrors embedding-config-smoke-test.sh's HTTPS requirement.
+if [[ "$BASE" == http://* ]]; then
+  base_authority="${BASE#http://}"
+  base_authority="${base_authority%%/*}"
+  base_authority="${base_authority##*@}"
+  case "$base_authority" in
+    '['*']'*) base_host="${base_authority%%]*}]" ;;
+    *) base_host="${base_authority%%:*}" ;;
+  esac
+  case "$base_host" in
+    127.0.0.1|localhost|'[::1]') ;;
+    *)
+      echo "FATAL: DRIVE9_BASE must use https:// (http:// is allowed only for loopback) so the owner key is not sent in cleartext: $BASE" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 PASS=0
 FAIL=0
