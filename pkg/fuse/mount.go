@@ -1536,21 +1536,24 @@ func transientOverlayMountID() string {
 // auto leaves it off there.
 //
 // It matters a lot for databases: without the cache every 4KiB write is its own
-// FUSE WRITE, and the extent data plane turns that storm of small concurrent
-// writes into per-write slice commits (community.sqlite mptest/threadtest3
-// stall). The extent VFS already assumes the cache is on
-// (pkg/extent/runtime.go juiceFuseOpts). macFUSE/older kernels ignore the cap.
+// FUSE WRITE, and a sustained storm of small concurrent writes (SQLite WAL) has
+// to be absorbed by the data plane instead of by the kernel's dirty-range
+// merging. That is the main reason to opt in with --writeback-cache on for a
+// single-writer mount. macFUSE/older kernels ignore the cap.
 //
-// auto also leaves it off for git workspaces (a local root), because a blobless
-// workspace serves its clean tree as empty placeholders whose blobs arrive
-// later: a regular file that was never written locally keeps size 0 in the
-// kernel while the cap is on, so no READ reaches the daemon even after a
-// GETATTR reported the real size and INVAL_INODE dropped the inode's caches.
-// The read-through hydration that materializes blobs on demand therefore never
-// runs (`git status` reports every path as modified). Without the cap the
-// daemon path serves placeholders and hydrates on read, so auto prefers that,
-// and --writeback-cache on still forces the kernel cache for a local-root mount
-// that does not use blobless clones.
+// auto also leaves it off, which is the safe default for the multi-writer
+// deployments drive9 is used in: while the cap is on the kernel treats a
+// regular file's i_size, mtime and ctime as its own — fuse_get_cache_mask()
+// returns STATX_MTIME|STATX_CTIME|STATX_SIZE unconditionally for such an inode,
+// so fuse_change_attributes() discards the server's values and skips
+// truncate_pagecache()/auto_inval_data — which means a change another mount, the
+// CLI or a server-side task makes to a file this mount already cached is never
+// observed here (a reader keeps seeing the old size/content, build tools keep
+// seeing the old mtime). Dirty pages also reach the daemon at unpredictable
+// times (after RELEASE for mmap), so write order between mounts is not
+// reconstructable. `--writeback-cache on` is therefore an explicit declaration
+// that the mount is the only writer of the files it touches; it keeps the
+// database write path fast on such a mount.
 func kernelWritebackCacheEnabled(opts *MountOptions) bool {
 	if runtime.GOOS != "linux" || opts == nil {
 		return false
@@ -1561,11 +1564,7 @@ func kernelWritebackCacheEnabled(opts *MountOptions) bool {
 	case WritebackCacheOff:
 		return false
 	default:
-		// auto: empty WritePolicy means the writeback default (mountWritePolicy).
-		if opts.WritePolicy == WritePolicyWriteSync || opts.EnableGitWorkspaces {
-			return false
-		}
-		return true
+		return false
 	}
 }
 

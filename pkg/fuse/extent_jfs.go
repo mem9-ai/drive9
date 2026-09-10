@@ -746,7 +746,6 @@ func (fs *Dat9FS) extentRead(ctx vfs.LogContext, fh *FileHandle, off uint64, buf
 	}
 	return n, gofuse.OK
 }
-
 func juiceAppendOff(off, length uint64) uint64 {
 	if length > off {
 		return length
@@ -822,6 +821,15 @@ func (fs *Dat9FS) extentClearSetidAfterWrite(fh *FileHandle, callerUID uint32) {
 	if v == nil {
 		return
 	}
+	// A write can only drop set-user-ID/set-group-ID while the file still has
+	// them, and the inode already knows its mode on any path that reached a
+	// handle. JuiceFS invalidates its open-file attr cache after each committed
+	// meta write, so the GetAttr below costs one HTTP meta op per 4 KiB write —
+	// the dominant per-write cost of the cap-off extent path.
+	entry, hasEntry := fs.inodes.GetEntry(fh.Ino)
+	if hasEntry && entry.HasMode && entry.Mode&(setUIDPermissionBit|setGIDPermissionBit) == 0 {
+		return
+	}
 	ctx := fs.jfsCtx(0, 0, 0)
 	jentry, errn := v.GetAttr(ctx, fh.extentIno, 1)
 	if errn != 0 || jentry == nil || jentry.Attr == nil {
@@ -829,6 +837,10 @@ func (fs *Dat9FS) extentClearSetidAfterWrite(fh *FileHandle, callerUID uint32) {
 	}
 	mode := uint32(jentry.Attr.Mode)
 	if mode&(setUIDPermissionBit|setGIDPermissionBit) == 0 {
+		// Remember the clean mode so later writes skip the GetAttr entirely.
+		if hasEntry {
+			fs.inodes.SetModeState(fh.Ino, juiceTypeToStatMode(jentry.Attr.Typ, uint16(mode)), true)
+		}
 		return
 	}
 	mode &^= setUIDPermissionBit | setGIDPermissionBit

@@ -9792,27 +9792,27 @@ func TestGoFuseMountOptionsMapsSyncRead(t *testing.T) {
 	if explicit.MaxBackground != 200 {
 		t.Fatalf("MaxBackground = %d, want JuiceFS GenFuseOpt 200", explicit.MaxBackground)
 	}
-	// The kernel writeback cache is mount-wide and buffers writes, so it is
-	// enabled for the durability policies that end in an explicit flush
-	// (interactive/fsync/close-sync) and left off for write-sync, whose
-	// contract is "remote-durable when write() returns". auto also leaves it
-	// off for git workspaces (a local root): a blobless clean tree is served as
-	// placeholders whose later materialization cannot invalidate the kernel's
-	// cached empty page.
+	// The kernel writeback cache is mount-wide and buffers writes in the
+	// kernel, and while it is on the kernel treats a regular file's size, mtime
+	// and ctime as its own (fuse_get_cache_mask), so a change another writer
+	// makes to a cached file is never observed by this mount. auto therefore
+	// leaves it off for every policy, and --writeback-cache on is the explicit
+	// "this mount is the only writer" opt-in; off wins over any policy.
 	linux := runtime.GOOS == "linux"
 	cases := []struct {
 		name string
 		opts *MountOptions
 		want bool
 	}{
-		{"default auto", &MountOptions{}, linux},
-		{"interactive", &MountOptions{WritePolicy: WritePolicyWriteBack}, linux},
-		{"close-sync", &MountOptions{WritePolicy: WritePolicyCloseSync}, linux},
+		{"default auto", &MountOptions{}, false},
+		{"interactive", &MountOptions{WritePolicy: WritePolicyWriteBack}, false},
+		{"close-sync", &MountOptions{WritePolicy: WritePolicyCloseSync}, false},
 		{"write-sync auto", &MountOptions{WritePolicy: WritePolicyWriteSync}, false},
+		{"forced on", &MountOptions{WritebackCache: WritebackCacheOn}, linux},
 		{"write-sync forced on", &MountOptions{WritePolicy: WritePolicyWriteSync, WritebackCache: WritebackCacheOn}, linux},
-		{"writeback forced off", &MountOptions{WritebackCache: WritebackCacheOff}, false},
-		{"git workspace auto", &MountOptions{EnableGitWorkspaces: true, LocalRoot: "/tmp/drive9-wb"}, false},
 		{"git workspace forced on", &MountOptions{EnableGitWorkspaces: true, LocalRoot: "/tmp/drive9-wb", WritebackCache: WritebackCacheOn}, linux},
+		{"writeback forced off", &MountOptions{WritebackCache: WritebackCacheOff}, false},
+		{"forced off beats forced on state", &MountOptions{WritebackCache: WritebackCacheOff, WritePolicy: WritePolicyWriteBack}, false},
 	}
 	for _, tc := range cases {
 		if got := newGoFuseMountOptions(tc.opts); got.EnableWriteback != tc.want {

@@ -7702,3 +7702,24 @@ func TestGitWorkspaceStraddleAdoptionPreservesSamePathRecreate(t *testing.T) {
 		t.Fatalf("recreate dirty mirror content = %q, want %q", mirrorData, replacement)
 	}
 }
+
+// The NOTIFY_STORE correction must cover exactly the file's last page: a STORE
+// that starts mid-page would be copied into a page the kernel then marks up to
+// date, and only a page-aligned range that ends at EOF is correct content.
+func TestFileTailPageRange(t *testing.T) {
+	cases := []struct {
+		size int64
+		want int64
+	}{
+		{1, 0}, {32, 0}, {4096, 0}, {4097, 4096}, {8192, 4096}, {8193, 8192},
+	}
+	for _, tc := range cases {
+		start, length := fileTailPageRange(tc.size, 4096)
+		if start != tc.want || start+length != tc.size || length <= 0 || length > 4096 {
+			t.Fatalf("fileTailPageRange(%d) = [%d,+%d), want start %d ending at %d", tc.size, start, length, tc.want, tc.size)
+		}
+	}
+	if start, length := fileTailPageRange(0, 4096); start != 0 || length != 0 {
+		t.Fatalf("fileTailPageRange(0) = [%d,+%d), want empty", start, length)
+	}
+}
