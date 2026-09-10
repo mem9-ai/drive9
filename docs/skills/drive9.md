@@ -157,6 +157,8 @@ Use `grep` to find files by what they contain. Use `find` to find files by name,
 
 `drive9 fs tasks <path>` reports the extract/embed pipeline state for a file's current revision: one entry per applicable task type (`embed`, `img_extract_text`, `audio_extract_text`, `video_extract_visual`). Status is one of `queued`, `processing`, `succeeded`, or `failed`; a failed task includes a bounded `last_error` reason.
 
+Text output always prints the `TASK_TYPE  STATUS  LAST_ERROR` header and one row per task, so an empty result prints the header alone. `-o json` emits `{"path": ..., "tasks": []}`. Task status is drive9-only; object-store URIs are rejected.
+
 ```bash
 drive9 fs tasks :/docs/report.pdf
 drive9 fs tasks -o json :/docs/report.pdf
@@ -170,7 +172,7 @@ drive9 fs tasks -o json :/docs/report.pdf
 | `fs ls -l` | tab-separated: `type  size  name` (type: `d` or `-`) |
 | `fs cat` | raw file content to stdout |
 | `fs stat` | key-value metadata; use `-o json` for JSON |
-| `fs tasks` | tab-separated: `task_type  status  last_error`; use `-o json` for JSON |
+| `fs tasks` | aligned columns: `TASK_TYPE  STATUS  LAST_ERROR` (header always printed); use `-o json` for JSON |
 | `fs grep` | tab-separated: `path  score` per match |
 | `fs find` | one path per line |
 

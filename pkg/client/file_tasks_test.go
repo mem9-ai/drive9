@@ -4,6 +4,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,7 +17,9 @@ func TestFileTasksCtxDecodesResponse(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(fileTasksMarkerHeader, "1")
+		// Charset-suffixed Content-Type must not affect decoding.
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_, _ = w.Write([]byte(`{"path":"/doc.txt","tasks":[{"task_type":"embed","status":"failed","last_error":"embedding_provider_auth_rejected: provider rejected the credentials (HTTP 401)"}]}`))
 	}))
 	defer srv.Close()
@@ -39,6 +42,7 @@ func TestFileTasksCtxDecodesResponse(t *testing.T) {
 
 func TestFileTasksCtxEmptyTasksIsEmptySlice(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(fileTasksMarkerHeader, "1")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"path":"/doc.txt","tasks":[]}`))
 	}))
@@ -57,17 +61,48 @@ func TestFileTasksCtxEmptyTasksIsEmptySlice(t *testing.T) {
 	}
 }
 
-func TestFileTasksCtxRejectsNonJSON(t *testing.T) {
+// A server without ?tasks falls through to a plain read. Even when the
+// fall-through body is valid JSON (for example an application/json file), the
+// missing marker must be reported as unsupported rather than decoded as an
+// empty task list.
+func TestFileTasksCtxRequiresServerMarker(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte("file contents"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"path":"","tasks":[]}`))
 	}))
 	defer srv.Close()
 
 	c := New(srv.URL, "")
-	_, err := c.FileTasksCtx(context.Background(), "/doc.txt")
-	if err == nil || !strings.Contains(err.Error(), "unexpected Content-Type") {
-		t.Fatalf("err = %v, want Content-Type error", err)
+	_, err := c.FileTasksCtx(context.Background(), "/config.json")
+	if !errors.Is(err, ErrFileTasksUnsupported) {
+		t.Fatalf("err = %v, want ErrFileTasksUnsupported", err)
+	}
+}
+
+// An old server serving an object-backed file answers with a redirect to a
+// presigned URL. The client must not follow it (which would download the whole
+// object) and must report the server as unsupported.
+func TestFileTasksCtxRejectsRedirectWithoutDownloading(t *testing.T) {
+	var objectHits int
+	object := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		objectHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"path":"/config.json","tasks":[]}`))
+	}))
+	defer object.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, object.URL+"/config.json", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	_, err := c.FileTasksCtx(context.Background(), "/config.json")
+	if !errors.Is(err, ErrFileTasksUnsupported) {
+		t.Fatalf("err = %v, want ErrFileTasksUnsupported", err)
+	}
+	if objectHits != 0 {
+		t.Fatalf("object served %d times, want 0 (must not follow redirect)", objectHits)
 	}
 }
 
@@ -83,5 +118,8 @@ func TestFileTasksCtxSurfacesStatusError(t *testing.T) {
 	_, err := c.FileTasksCtx(context.Background(), "/dir/")
 	if err == nil || !strings.Contains(err.Error(), "path is a directory") {
 		t.Fatalf("err = %v, want directory error", err)
+	}
+	if errors.Is(err, ErrFileTasksUnsupported) {
+		t.Fatalf("status error must not be reported as unsupported: %v", err)
 	}
 }

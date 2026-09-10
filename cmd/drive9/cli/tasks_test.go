@@ -12,7 +12,7 @@ import (
 )
 
 // newTasksTestServer returns an httptest.Server that answers the file task
-// status endpoint with responseBody.
+// status endpoint like a current server, including the X-Dat9-Tasks marker.
 func newTasksTestServer(t *testing.T, responseBody string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -21,6 +21,7 @@ func newTasksTestServer(t *testing.T, responseBody string) *httptest.Server {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Dat9-Tasks", "1")
 		_, _ = io.WriteString(w, responseBody)
 	}))
 }
@@ -36,7 +37,7 @@ func TestTasksTextOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tasks: %v", err)
 	}
-	for _, want := range []string{"embed", "succeeded", "img_extract_text", "failed", "image_extract_provider_auth_rejected: authentication rejected (HTTP 401)"} {
+	for _, want := range []string{"TASK_TYPE", "STATUS", "LAST_ERROR", "embed", "succeeded", "img_extract_text", "failed", "image_extract_provider_auth_rejected: authentication rejected (HTTP 401)"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q: %q", want, out)
 		}
@@ -72,7 +73,9 @@ func TestTasksJSONOutput(t *testing.T) {
 	}
 }
 
-func TestTasksEmptyTextOutputsNothing(t *testing.T) {
+// An empty result still prints the header so callers can tell "no applicable
+// tasks" apart from a no-op.
+func TestTasksEmptyTextPrintsHeader(t *testing.T) {
 	srv := newTasksTestServer(t, `{"path":"/doc.txt","tasks":[]}`)
 	defer srv.Close()
 
@@ -81,8 +84,8 @@ func TestTasksEmptyTextOutputsNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tasks: %v", err)
 	}
-	if strings.TrimSpace(out) != "" {
-		t.Fatalf("output = %q, want empty", out)
+	if !strings.Contains(out, "TASK_TYPE") || !strings.Contains(out, "STATUS") || !strings.Contains(out, "LAST_ERROR") {
+		t.Fatalf("empty output should still print the header, got %q", out)
 	}
 }
 
@@ -97,6 +100,39 @@ func TestTasksJSONEmptyTasksIsArray(t *testing.T) {
 	}
 	if !strings.Contains(out, `"tasks": []`) {
 		t.Fatalf("output should encode empty tasks as []: %q", out)
+	}
+}
+
+// Object-store URIs are rejected before an object backend is opened, so no
+// credentials are minted and no network call is made.
+func TestTasksRejectsObjectURIWithoutNetwork(t *testing.T) {
+	c := client.New("http://127.0.0.1:1", "")
+	err := Tasks(c, []string{"s3://bucket/key"})
+	if err == nil || !strings.Contains(err.Error(), "only available on drive9 paths") {
+		t.Fatalf("err = %v, want drive9-only error", err)
+	}
+}
+
+func TestTasksSurfacesStatusError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"path is a directory"}`)
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	err := Tasks(c, []string{":/dir/"})
+	if err == nil || !strings.Contains(err.Error(), "path is a directory") {
+		t.Fatalf("err = %v, want directory error", err)
+	}
+}
+
+func TestTasksRejectsAuthFlag(t *testing.T) {
+	c := client.New("http://127.0.0.1:1", "")
+	err := Tasks(c, []string{"--auth=local", ":/doc.txt"})
+	if err == nil || !strings.Contains(err.Error(), "usage:") {
+		t.Fatalf("err = %v, want usage error for removed --auth flag", err)
 	}
 }
 
