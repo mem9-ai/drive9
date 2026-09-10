@@ -9226,6 +9226,95 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 	}
 }
 
+// A write-only local-only handle must still serve the page-fill READ the kernel
+// issues to merge a partial-page write once the FUSE writeback cache is
+// negotiated: git appends a ref-log line at a non-page-aligned offset and the
+// kernel reads the existing page back through the very handle it wrote with.
+// A write-only backing fd answered that READ with EBADF, which the kernel then
+// reported as the caller's write error ("unable to append to '.git/logs/HEAD':
+// Bad file descriptor") and which broke the local-only profiles after remount.
+func TestCodingAgentLocalOverlayWriteOnlyHandleServesWritebackRead(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be used for local-only overlay paths", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	localRoot := t.TempDir()
+	opts := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: localRoot,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.kernelWritebackCache = true
+
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var gitOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Mode:     0o755,
+	}, ".git", &gitOut); st != gofuse.OK {
+		t.Fatalf("Mkdir .git: %v", st)
+	}
+	var logsOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: gitOut.NodeId},
+		Mode:     0o755,
+	}, "logs", &logsOut); st != gofuse.OK {
+		t.Fatalf("Mkdir logs: %v", st)
+	}
+
+	content := []byte("0000000 1111111 drive9 <drive9@example.com> 1700000000 +0000\tcommit\n")
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: logsOut.NodeId},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_APPEND | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "HEAD", &createOut); st != gofuse.OK {
+		t.Fatalf("Create HEAD: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(content)),
+	}, content); st != gofuse.OK {
+		t.Fatalf("Write HEAD: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: logsOut.NodeId}, "HEAD", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup HEAD: %v", st)
+	}
+	var openOut gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_APPEND),
+	}, &openOut); st != gofuse.OK {
+		t.Fatalf("Open HEAD write-only: %v", st)
+	}
+	buf := make([]byte, len(content)+16)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("page-fill Read on write-only handle = %v, want OK", st)
+	}
+	got, _ := result.Bytes(buf)
+	if string(got) != string(content) {
+		t.Fatalf("page-fill Read = %q, want %q", got, content)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+}
+
 func TestFsyncDirRemotePathReturnsOK(t *testing.T) {
 	var remoteCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -9706,7 +9795,10 @@ func TestGoFuseMountOptionsMapsSyncRead(t *testing.T) {
 	// The kernel writeback cache is mount-wide and buffers writes, so it is
 	// enabled for the durability policies that end in an explicit flush
 	// (interactive/fsync/close-sync) and left off for write-sync, whose
-	// contract is "remote-durable when write() returns".
+	// contract is "remote-durable when write() returns". auto also leaves it
+	// off for git workspaces (a local root): a blobless clean tree is served as
+	// placeholders whose later materialization cannot invalidate the kernel's
+	// cached empty page.
 	linux := runtime.GOOS == "linux"
 	cases := []struct {
 		name string
@@ -9719,6 +9811,8 @@ func TestGoFuseMountOptionsMapsSyncRead(t *testing.T) {
 		{"write-sync auto", &MountOptions{WritePolicy: WritePolicyWriteSync}, false},
 		{"write-sync forced on", &MountOptions{WritePolicy: WritePolicyWriteSync, WritebackCache: WritebackCacheOn}, linux},
 		{"writeback forced off", &MountOptions{WritebackCache: WritebackCacheOff}, false},
+		{"git workspace auto", &MountOptions{EnableGitWorkspaces: true, LocalRoot: "/tmp/drive9-wb"}, false},
+		{"git workspace forced on", &MountOptions{EnableGitWorkspaces: true, LocalRoot: "/tmp/drive9-wb", WritebackCache: WritebackCacheOn}, linux},
 	}
 	for _, tc := range cases {
 		if got := newGoFuseMountOptions(tc.opts); got.EnableWriteback != tc.want {

@@ -295,6 +295,14 @@ The same suite passes **20/20 on macFUSE** (which ignores the writeback-cache ca
 **Next step**
 Reproduce on a real Linux kernel with `FUSE_SQLITE_MOUNT_DEBUG=1` and inspect the mount log for the read that returns EIO — check whether the integrity_check's read-back of `workload.db` (or the replayed `-journal`) hits a missing-handle/orphan writeback, a stale kernel page invalidation, or a torn committed write. The reliable repro is the GitHub runner; EC2+SSM tunnels proved too flaky (mount-readiness races, tunnel drops) to iterate there.
 
+**Status update (classic-path fallout, fixed separately)** [verified]
+Chasing the `local-e2e` failures this entry predicted found two concrete classic-path rules the kernel writeback cache imposes, both now implemented:
+
+- A partial-page write is merged by reading the page back through the caller's *own* handle, so a `READ` arrives on an `O_WRONLY` handle. Local overlay handles answered it with `EBADF` because their backing fd was write-only; the kernel then reported the caller's write as `unable to append to '.git/logs/HEAD': Bad file descriptor` (`git commit` after a remount). Fixed by `openLocalBackingFile` (read-write backing fd, requested mode as fallback).
+- A blobless git workspace serves its clean tree as empty placeholders whose blobs arrive on read. With the cap on, a file that was never written locally keeps size 0 in the kernel — a `GETATTR` that reported the real size and an `INVAL_INODE` that dropped the inode's attrs and pages both left it at 0 — so no `READ` reaches the daemon, the read-through hydration never runs, and `git status` reports every path as modified. `auto` therefore leaves the cap off for git workspaces (`EnableGitWorkspaces`/`--local-root`); `--writeback-cache on` still forces it.
+
+Making blobless workspaces cache-safe (the placeholder must not be served through the kernel's page cache, e.g. a `DIRECT_IO` open until the blob is materialized — `FOPEN_KEEP_CACHE` is deliberate today because macFUSE mmap readers SIGBUS on read-only `DIRECT_IO` handles) would let `auto` turn the cap back on for local-root mounts. The SQLite `integrity_check` symptom above stays open: the suite mounts without a local root, so it still runs with the cap on.
+
 ---
 
 # P2-1 Projection size is not kept in sync

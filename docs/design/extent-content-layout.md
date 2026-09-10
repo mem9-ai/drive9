@@ -256,6 +256,13 @@ Dat9FS (drive9 frontend: namespace, dir cache, write-back, layers, git workspace
 
 The kernel-side `FUSE_WRITEBACK_CACHE` cap is mount-wide and is decided by `--durability`: it is on for `auto`/`interactive`/`fsync`/`close-sync`, whose promises all end in an explicit flush that the kernel performs after writing the dirty range back to the daemon, and off for `write-sync`, where `write()` itself must be remote-durable. `--writeback-cache on|off` overrides the default. Extent files depend on this cap: without it every 4KiB write becomes its own FUSE `WRITE`, and concurrent small writes stall the extent write path (`community.sqlite` mptest/threadtest3).
 
+`auto` also leaves the cap off for git workspaces (`EnableGitWorkspaces`, i.e. a mount with `--local-root`). A blobless workspace serves its clean tree as empty placeholders whose blobs arrive later; with the cap on, a file that was never written locally keeps size 0 in the kernel (neither a `GETATTR` reporting the real size nor an `INVAL_INODE` changed it), so no `READ` ever reaches the daemon and the read-through hydration that materializes blobs on demand never runs — `git status` reports every path as modified. `--writeback-cache on` still forces the cap for a local-root mount that does not use blobless clones.
+
+Two classic-path rules exist because the kernel uses the caller's own file handle for page-cache maintenance under that cap, not a fresh one:
+
+* A partial-page write is merged by reading the page back through the *same* handle the caller wrote with, so a `READ` can arrive on an `O_WRONLY` handle. Local overlay handles therefore open their backing fd read-write (`openLocalBackingFile`), falling back to the requested mode for a write-only file mode; without it the daemon answered `EBADF` and the kernel reported it as the caller's write error (`git`'s reflog append: `unable to append to '.git/logs/HEAD': Bad file descriptor`).
+* A writeback `WRITE` can arrive after the caller released the handle, addressed to a node the daemon has already forgotten. Classic handles are kept as zombies until `FORGET` so the write still lands.
+
 ## 4.3 Operation dispatch
 
 | Kernel operation | drive9 handling for an extent file |

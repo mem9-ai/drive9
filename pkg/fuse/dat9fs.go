@@ -1888,6 +1888,29 @@ func localFileHandleOpenedWritable(fh *FileHandle) bool {
 	return accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR
 }
 
+// openLocalBackingFile opens the daemon-side file backing a local-only FUSE
+// handle. A write-only open is upgraded to read-write while the kernel
+// writeback cache is negotiated: the kernel merges a partial-page write by
+// reading that page back through the very handle the caller wrote with, so a
+// READ arrives on an fh opened O_WRONLY and a write-only backing fd answers it
+// with EBADF — which the kernel then reports as the caller's write error
+// ("unable to append to '.git/logs/HEAD': Bad file descriptor" for git's
+// reflog append). A write-only file mode (0200) legitimately refuses the read
+// side, so the requested open is retried and such files keep working exactly
+// as they did before the upgrade.
+func (fs *Dat9FS) openLocalBackingFile(open func(flags uint32) (*os.File, error), flags uint32) (*os.File, error) {
+	if !fs.kernelWritebackCacheOn() || flags&uint32(syscall.O_ACCMODE) != uint32(syscall.O_WRONLY) {
+		return open(flags)
+	}
+	// Replace the access mode instead of OR-ing it: O_WRONLY|O_RDWR is not a
+	// valid access mode.
+	file, err := open(flags&^uint32(syscall.O_ACCMODE) | uint32(syscall.O_RDWR))
+	if err == nil {
+		return file, nil
+	}
+	return open(flags)
+}
+
 // writeLocalFileForHandle writes data to a local overlay fd, honoring the
 // kernel writeback-cache offset semantics without calling os.File.WriteAt on
 // O_APPEND handles: Go rejects WriteAt on a file opened with O_APPEND
@@ -12196,7 +12219,9 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		if restoreErr != nil {
 			return httpToFuseStatus(restoreErr)
 		}
-		file, err := overlay.OpenFile(childP, input.Flags|uint32(syscall.O_CREAT), mode)
+		file, err := fs.openLocalBackingFile(func(flags uint32) (*os.File, error) {
+			return overlay.OpenFile(childP, flags, mode)
+		}, input.Flags|uint32(syscall.O_CREAT))
 		if err != nil {
 			return localErrToFuseStatus(err)
 		}
@@ -12366,7 +12391,9 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		if (accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR) && fs.opts.ReadOnly {
 			return gofuse.EROFS
 		}
-		file, err := overlay.OpenFile(p, input.Flags, 0)
+		file, err := fs.openLocalBackingFile(func(flags uint32) (*os.File, error) {
+			return overlay.OpenFile(p, flags, 0)
+		}, input.Flags)
 		if err != nil {
 			return localErrToFuseStatus(err)
 		}
@@ -13526,6 +13553,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		n, err := writeLocalFileForHandle(fh, int64(input.Offset), data, input.WriteFlags)
 		if err != nil && n == 0 {
 			source = "local-error"
+			safeLogPrintf("drive9: write local-error path=%s off=%d n=%d handle_flags=0x%x write_flags=0x%x err=%v", fh.Path, input.Offset, len(data), fh.Flags, input.WriteFlags, err)
 			return 0, localErrToFuseStatus(err)
 		}
 		written = uint32(n)
