@@ -345,7 +345,7 @@ func (fs *Dat9FS) truncateZombieBuffersForInode(ino uint64, newSize int64) {
 // markOpenHandlesUnlinked — zombies are deliberately not in openHandles, so
 // the unlink flow needs this explicit pass.
 func (fs *Dat9FS) markZombiesUnlinkedForPath(p string) {
-	if p == "" {
+	if p == "" || fs == nil || fs.inodes == nil {
 		return
 	}
 	ino, ok := fs.inodes.GetInode(p)
