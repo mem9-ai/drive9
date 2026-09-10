@@ -114,7 +114,7 @@ func TestFileTasksCtxRejectsRedirectWithoutDownloading(t *testing.T) {
 // A same-host redirect (for example an ingress http->https upgrade) is not
 // evidence that the server predates ?tasks, so it must not be reported as
 // unsupported.
-func TestFileTasksCtxSameHostRedirectIsNotUnsupported(t *testing.T) {
+func TestFileTasksCtxSameHostAndEffectivePortRedirectIsNotUnsupported(t *testing.T) {
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -135,12 +135,12 @@ func TestFileTasksCtxSameHostRedirectIsNotUnsupported(t *testing.T) {
 	}
 }
 
-// TestSameHostTreatsDefaultPortsAsEqual pins the host+effective-port comparison
+// TestSameHostAndEffectivePortTreatsDefaultPortsAsEqual pins the comparison
 // against the spellings httptest cannot produce: a default port on only one side
 // must still match (an ingress that upgrades the scheme and spells :443/:80),
 // while a different hostname or explicit port stays cross-host. The scheme is
 // ignored by design, so a scheme upgrade is a match.
-func TestSameHostTreatsDefaultPortsAsEqual(t *testing.T) {
+func TestSameHostAndEffectivePortTreatsDefaultPortsAsEqual(t *testing.T) {
 	cases := []struct {
 		base string
 		host string

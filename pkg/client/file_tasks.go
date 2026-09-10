@@ -25,8 +25,8 @@ var ErrFileTasksUnsupported = errors.New("file tasks: server does not support fs
 // errFileTasksUnexpectedRedirect reports a redirect the client refused to
 // follow that is not evidence the server predates ?tasks: a same-host redirect
 // (same hostname and effective port, scheme ignored) such as an ingress scheme
-// upgrade. A cross-origin redirect (a different host and/or explicit port — the
-// object-store fall-through) reports ErrFileTasksUnsupported instead.
+// upgrade. A cross-host redirect (a different hostname and/or explicit port —
+// the object-store fall-through) reports ErrFileTasksUnsupported instead.
 var errFileTasksUnexpectedRedirect = errors.New("file tasks: unexpected redirect")
 
 // IsFileTasksUnexpectedRedirect reports whether err is a same-host redirect
