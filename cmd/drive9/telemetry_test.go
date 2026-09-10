@@ -122,6 +122,18 @@ func TestTelemetryFlagNamesNeverRecordFlagValues(t *testing.T) {
 			args: []string{"-l", "--", "--secret"},
 			want: "l",
 		},
+		{
+			// A dash-prefixed token that is not a flag this CLI defines is user
+			// input — here a pattern the command would reject — never a name.
+			name: "unknown flag-shaped token is dropped",
+			args: []string{"-my-private-pattern"},
+			want: "",
+		},
+		{
+			name: "mistyped flag name is dropped",
+			args: []string{"--api-key-secret123"},
+			want: "",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

@@ -4,8 +4,11 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -108,4 +111,153 @@ func dispatcherCaseLabels(file, function string) ([]string, error) {
 		})
 	}
 	return labels, nil
+}
+
+// TestTelemetryKnownFlagNamesCoverEveryDefinedFlag keeps the closed flag-name
+// allowlist in sync with the CLI. Telemetry records flag names from argv, so an
+// unknown name must be dropped (it is user input); this test makes sure a real
+// flag is never dropped silently — add it to telemetryKnownFlagNames instead.
+//
+// The set is derived from source because flags are declared in two styles: a
+// flag.FlagSet per command, and hand-rolled parsers that compare argv tokens
+// against string literals.
+func TestTelemetryKnownFlagNamesCoverEveryDefinedFlag(t *testing.T) {
+	defined := map[string]string{}
+	for _, file := range telemetryFlagDefinitionFiles(t) {
+		parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, 0)
+		if err != nil {
+			t.Fatalf("%s: %v", file, err)
+		}
+		ast.Inspect(parsed, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.CallExpr:
+				if name, ok := flagSetDefinitionName(node); ok {
+					defined[name] = file
+				}
+			case *ast.CaseClause:
+				for _, expr := range node.List {
+					if name, ok := dashPrefixedLiteral(expr); ok {
+						defined[name] = file
+					}
+				}
+			case *ast.BinaryExpr:
+				if node.Op != token.EQL && node.Op != token.NEQ {
+					return true
+				}
+				for _, expr := range []ast.Expr{node.X, node.Y} {
+					if name, ok := dashPrefixedLiteral(expr); ok {
+						defined[name] = file
+					}
+				}
+			}
+			return true
+		})
+	}
+	if len(defined) < 100 {
+		t.Fatalf("only %d flag names were derived; the scan is broken", len(defined))
+	}
+	var missing, stale []string
+	for name, file := range defined {
+		if _, known := telemetryKnownFlagNames[name]; !known {
+			missing = append(missing, name+" ("+file+")")
+		}
+	}
+	for name := range telemetryKnownFlagNames {
+		if _, ok := defined[name]; !ok {
+			stale = append(stale, name)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(stale)
+	if len(missing) > 0 {
+		t.Errorf("flags are defined but missing from telemetryKnownFlagNames (their names would be dropped): %s", strings.Join(missing, ", "))
+	}
+	if len(stale) > 0 {
+		t.Errorf("telemetryKnownFlagNames lists names no flag defines any more (they could record user input): %s", strings.Join(stale, ", "))
+	}
+	for name := range telemetryKnownFlagNames {
+		if !telemetryFlagNamePattern.MatchString(name) {
+			t.Errorf("telemetryKnownFlagNames entry %q cannot match the runtime pattern", name)
+		}
+	}
+}
+
+// telemetryFlagDefinitionFiles lists the non-test Go sources that can declare a
+// flag or parse one by hand.
+func telemetryFlagDefinitionFiles(t *testing.T) []string {
+	t.Helper()
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cliFiles, err := filepath.Glob("cli/*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := append(files, cliFiles...)
+	kept := make([]string, 0, len(all))
+	for _, file := range all {
+		if !strings.HasSuffix(file, "_test.go") {
+			kept = append(kept, file)
+		}
+	}
+	return kept
+}
+
+// flagSetDefinitionName recognizes a flag.FlagSet definition such as
+// fs.String("json", false, "..."), fs.DurationVar(&d, "timeout", ...), or
+// fs.Var(v, "tag", "..."), by method name, arity, and a variable receiver (a
+// package-qualified call like zap.String("command", ...) is not a flag).
+func flagSetDefinitionName(call *ast.CallExpr) (string, bool) {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return "", false
+	}
+	if _, ok := selector.X.(*ast.Ident); !ok {
+		return "", false
+	}
+	wantArgs, ok := telemetryFlagDefinitionMethods[selector.Sel.Name]
+	if !ok || len(call.Args) != wantArgs {
+		return "", false
+	}
+	nameIndex := 0
+	if selector.Sel.Name == "Var" || strings.HasSuffix(selector.Sel.Name, "Var") {
+		nameIndex = 1
+	}
+	literal, ok := call.Args[nameIndex].(*ast.BasicLit)
+	if !ok || literal.Kind != token.STRING {
+		return "", false
+	}
+	value, err := strconv.Unquote(literal.Value)
+	if err != nil {
+		return "", false
+	}
+	return strings.ToLower(value), true
+}
+
+// telemetryFlagDefinitionMethods maps a flag-defining method to its arity.
+var telemetryFlagDefinitionMethods = map[string]int{
+	"String": 3, "Bool": 3, "Int": 3, "Int64": 3, "Uint": 3, "Uint64": 3,
+	"Duration": 3, "Float64": 3, "Text": 3, "Var": 3, "Func": 2,
+	"StringVar": 4, "BoolVar": 4, "IntVar": 4, "Int64Var": 4, "UintVar": 4,
+	"Uint64Var": 4, "DurationVar": 4, "Float64Var": 4, "TextVar": 4,
+}
+
+// dashPrefixedLiteral normalizes a "-flag" / "--flag" / "--flag=value" string
+// literal the same way telemetry does at runtime.
+func dashPrefixedLiteral(expr ast.Expr) (string, bool) {
+	literal, ok := expr.(*ast.BasicLit)
+	if !ok || literal.Kind != token.STRING {
+		return "", false
+	}
+	value, err := strconv.Unquote(literal.Value)
+	if err != nil || !strings.HasPrefix(value, "-") {
+		return "", false
+	}
+	name, _, _ := strings.Cut(strings.TrimLeft(value, "-"), "=")
+	name = strings.ToLower(name)
+	if !telemetryFlagNamePattern.MatchString(name) {
+		return "", false
+	}
+	return name, true
 }

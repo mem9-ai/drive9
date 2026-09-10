@@ -388,6 +388,12 @@ func telemetryFlagNames(args []string) []string {
 		if !telemetryFlagNamePattern.MatchString(name) {
 			continue
 		}
+		// Closed allowlist: a dash-prefixed token that is not a flag this CLI
+		// defines is user input — an unknown or mistyped flag, or a value the
+		// command rejects — and must never be reported.
+		if _, known := telemetryKnownFlagNames[name]; !known {
+			continue
+		}
 		if _, ok := seen[name]; ok {
 			continue
 		}
