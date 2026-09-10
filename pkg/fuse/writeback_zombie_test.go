@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -530,5 +532,96 @@ func TestZombieRenameRetargetsCommit(t *testing.T) {
 				srv.bodiesFor("/zr2.txt"), srv.bodiesFor("/zr.txt"))
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The kernel writeback cache sends O_APPEND writes as WRITE_CACHE requests
+// carrying absolute offsets, but Go rejects os.File.WriteAt on an O_APPEND
+// fd. This was the `git clone` reflog EIO regression: the first writeback to
+// git's O_APPEND-reflog failed with EIO at "update refs/remotes/origin/HEAD".
+func TestWriteLocalFileForHandleAppendWriteCache(t *testing.T) {
+	openAppend := func(t *testing.T) (*FileHandle, func()) {
+		t.Helper()
+		f, err := os.OpenFile(filepath.Join(t.TempDir(), "reflog"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fh := &FileHandle{Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND), LocalFile: f}
+		return fh, func() { _ = f.Close() }
+	}
+
+	fh, cleanup := openAppend(t)
+	defer cleanup()
+
+	// Plain O_APPEND syscall write: lands at the current end.
+	if n, err := writeLocalFileForHandle(fh, 0, []byte("abc"), 0); err != nil || n != 3 {
+		t.Fatalf("plain append write: n=%d err=%v", n, err)
+	}
+	// WRITE_CACHE [0,6) — the whole dirty range at absolute offsets: must
+	// replace, not duplicate ("abcabc" would be the plain-append bug).
+	if n, err := writeLocalFileForHandle(fh, 0, []byte("abcXYZ"), gofuse.WRITE_CACHE); err != nil || n != 6 {
+		t.Fatalf("writeback whole-range: n=%d err=%v", n, err)
+	}
+	// WRITE_CACHE [6,9) — a tail range: must append after the existing end.
+	if n, err := writeLocalFileForHandle(fh, 6, []byte("123"), gofuse.WRITE_CACHE); err != nil || n != 3 {
+		t.Fatalf("writeback tail range: n=%d err=%v", n, err)
+	}
+	data, err := os.ReadFile(fh.LocalFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "abcXYZ123" {
+		t.Fatalf("content = %q, want abcXYZ123", data)
+	}
+
+	// WRITE_CACHE beyond the current end zero-fills the gap, like WriteAt.
+	if _, err := writeLocalFileForHandle(fh, 12, []byte("zz"), gofuse.WRITE_CACHE); err != nil {
+		t.Fatalf("writeback with gap: %v", err)
+	}
+	data, _ = os.ReadFile(fh.LocalFile.Name())
+	if len(data) != 14 || string(data[12:]) != "zz" || string(data[:9]) != "abcXYZ123" {
+		t.Fatalf("content after gap fill = %q (len %d)", data, len(data))
+	}
+}
+
+func TestWriteAppendLocalHandleWriteCacheStatus(t *testing.T) {
+	srv := &zombieTestServer{bodies: make(map[string][][]byte)}
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.kernelWritebackCache = true
+	t.Cleanup(fs.stopZombieJanitor)
+
+	f, err := os.OpenFile(filepath.Join(t.TempDir(), "reflog"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	ino := fs.inodes.Lookup("/logs/refs/remotes/origin/HEAD", false, 0, time.Now())
+	fh := &FileHandle{
+		Ino:       ino,
+		Path:      "/logs/refs/remotes/origin/HEAD",
+		Layer:     PathLayerLocalOnly,
+		Flags:     uint32(syscall.O_WRONLY | syscall.O_APPEND),
+		LocalFile: f,
+	}
+	fhID := fs.allocateFileHandle(fh)
+
+	// The exact reflog scenario: O_APPEND handle, first WRITE_CACHE at off=0
+	// must not fail with EIO.
+	n, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader:   gofuse.InHeader{NodeId: ino},
+		Fh:         fhID,
+		Offset:     0,
+		WriteFlags: gofuse.WRITE_CACHE,
+	}, []byte("reflog-entry"))
+	if st != gofuse.OK || n != 12 {
+		t.Fatalf("O_APPEND WRITE_CACHE Write = n=%d st=%v, want 12/OK", n, st)
+	}
+	data, _ := os.ReadFile(f.Name())
+	if string(data) != "reflog-entry" {
+		t.Fatalf("content = %q, want reflog-entry", data)
 	}
 }

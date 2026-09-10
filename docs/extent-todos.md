@@ -211,6 +211,16 @@ With `FUSE_PROFILE=extent` and JuiceFS writeback on, an app writes through an op
 - `e2e/fuse-supervision-test.sh` 51/51 (its `[8]` probe);
 - no write may be discarded silently: every `extent-orphan-discard` must log.
 
+**Update (2026-09-11, writeback-zombie work)**: the missing-handle Write
+branch no longer discards on `extentEnabled()` alone. The discard is gated on
+`InodeToPath.WasEverExtent(nodeId)` (the inode provably belonged to an extent
+file) and always logs; a released **classic** handle is kept as a zombie until
+FORGET so its late kernel writebacks land through the normal Write path
+(`pkg/fuse/writeback_zombie.go`,
+`docs/design/kernel-writeback-cache-classic-durability.md`). The classic-file
+silent-loss part of this issue is closed by that change; the open-handle
+visibility symptom above (state-dependent `9.1` failure) remains open.
+
 ---
 
 # P1-8 After a remount an extent file reads back as size 0 (mount-side, extent-only)

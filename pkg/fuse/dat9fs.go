@@ -1855,6 +1855,37 @@ func localFileHandleOpenedWritable(fh *FileHandle) bool {
 	return accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR
 }
 
+// writeLocalFileForHandle writes data to a local overlay fd, honoring the
+// kernel writeback-cache offset semantics without calling os.File.WriteAt on
+// O_APPEND handles: Go rejects WriteAt on a file opened with O_APPEND
+// ("invalid use of WriteAt on file opened with O_APPEND"), which previously
+// surfaced to callers as EIO on the very first WRITE_CACHE writeback to an
+// O_APPEND handle (e.g. git's reflog append, breaking `git clone` once the
+// kernel writeback cache was enabled).
+func writeLocalFileForHandle(fh *FileHandle, off int64, data []byte, writeFlags uint32) (int, error) {
+	f := fh.LocalFile
+	if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+		if writeFlags&gofuse.WRITE_CACHE == 0 {
+			// Plain O_APPEND syscall write: the fd's append semantics place
+			// the bytes at the current end.
+			return f.Write(data)
+		}
+		// A WRITE_CACHE writeback already carries the append offset merged
+		// into the dirty range (the kernel writes back [0, old+new) when the
+		// previous bytes were still dirty), so it must land at the absolute
+		// offset, not at EOF. Truncate to the range start — a no-op when the
+		// file already ends there, zero-fill when the file is short — and
+		// append: exactly WriteAt's effect for a full-range writeback,
+		// without the forbidden call or the prefix duplication that plain
+		// append would produce.
+		if err := f.Truncate(off); err != nil {
+			return 0, err
+		}
+		return f.Write(data)
+	}
+	return f.WriteAt(data, off)
+}
+
 var syncOpenLocalFile = func(file *os.File) error {
 	return file.Sync()
 }
@@ -13201,15 +13232,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 
 	if isLocalFileHandle(fh) {
-		var (
-			n   int
-			err error
-		)
-		if fh.Flags&uint32(syscall.O_APPEND) != 0 && input.WriteFlags&gofuse.WRITE_CACHE == 0 {
-			n, err = fh.LocalFile.Write(data)
-		} else {
-			n, err = fh.LocalFile.WriteAt(data, int64(input.Offset))
-		}
+		n, err := writeLocalFileForHandle(fh, int64(input.Offset), data, input.WriteFlags)
 		if err != nil && n == 0 {
 			source = "local-error"
 			return 0, localErrToFuseStatus(err)
@@ -13223,15 +13246,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		return written, gofuse.OK
 	}
 	if isGitWorkspaceLocalFileHandle(fh) {
-		var (
-			n   int
-			err error
-		)
-		if fh.Flags&uint32(syscall.O_APPEND) != 0 && input.WriteFlags&gofuse.WRITE_CACHE == 0 {
-			n, err = fh.LocalFile.Write(data)
-		} else {
-			n, err = fh.LocalFile.WriteAt(data, int64(input.Offset))
-		}
+		n, err := writeLocalFileForHandle(fh, int64(input.Offset), data, input.WriteFlags)
 		if err != nil && n == 0 {
 			source = "git-local-error"
 			return 0, localErrToFuseStatus(err)

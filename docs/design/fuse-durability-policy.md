@@ -124,6 +124,27 @@ Therefore:
 - `Release` handles cleanup and fallback synchronization, but it is not the
   primary close-sync error propagation point.
 
+## Kernel writeback cache interaction
+
+`FUSE_WRITEBACK_CACHE` (mount-wide, `--writeback-cache auto|on|off`) buffers
+`write(2)` data in the kernel page cache, so a write can return before the
+daemon has seen the bytes. The profiles survive because the kernel writes the
+dirty range back to the daemon before the FSYNC / FLUSH / RELEASE the policy
+waits on:
+
+- `auto` / `interactive` / `fsync` / `close-sync` keep their contracts with
+  the cache on; `auto` leaves the cache **off** for `write-sync`, and forcing
+  `--writeback-cache on` together with `--durability write-sync` is rejected
+  (the combination cannot honor "remote-durable when write() returns").
+- The one window the cache opens is **after RELEASE**: mmap(MAP_SHARED) dirty
+  pages can be written back once the handle is gone. drive9 absorbs them with
+  a **zombie handle** — the released classic handle stays registered until the
+  kernel FORGETs the inode, and the late writeback flows through the normal
+  Write path (dirty buffer + shadow staging + a debounced background commit).
+  See `docs/design/kernel-writeback-cache-classic-durability.md`.
+- A reopened fd's `fsync` commits zombie-absorbed data of the same inode
+  first, so `mmap write -> close -> reopen -> fsync` keeps its usual meaning.
+
 ## Expected Tradeoffs
 
 `interactive` and `auto` on high-RTT mounts keep editor latency low by making

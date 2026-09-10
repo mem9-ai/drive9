@@ -128,6 +128,7 @@ new-process accept and make the inherited state no longer clean.
 | Open file handles | `fileHandles`, `openHandles`, kernel fh ids | 必须传递 | V0 refuses if any file handle exists, even read-only. |
 | Open directory handles | `dirHandles`, kernel fh ids | 必须传递 | V0 refuses if any directory handle exists. |
 | Dirty write buffers | `FileHandle.Dirty`, `DirtySeq`, shadow flags | 必须阻止升级 | Refuse until dirty state is flushed and the handle is closed. |
+| Zombie handles (kernel writeback cache on) | `fileHandles` + `Dat9FS.zombiesByInode`, `zombieTimer` | 必须传递 | A zombie is a released handle kept until FORGET; it sits in `fileHandles`, so the open-handle refusal covers it. Any dirty zombie state is additionally caught by the dirty-state refusal — drain flushes zombies via `drainOpenHandles` before the gate. |
 | Inode/path map with kernel refs | `InodeToPath` and kernel NodeId cache | 必须传递 | V0 refuses if any non-root inode has `Nlookup > 0`; entries with no kernel refs may be dropped. |
 | FUSE lock table | `fuseLockTable` | 必须传递 | V0 refuses if any lock is held; add a mechanical count before implementation. |
 | In-memory xattrs | `XAttrStore` | 必须传递 | V0 refuses if any xattr exists; add a mechanical count before implementation. |
