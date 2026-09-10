@@ -22,6 +22,18 @@ const fileTasksMarkerHeader = "X-Dat9-Tasks"
 // errors.Is.
 var ErrFileTasksUnsupported = errors.New("file tasks: server does not support fs tasks (?tasks)")
 
+// errFileTasksUnexpectedRedirect reports a redirect the client refused to
+// follow that is not evidence the server predates ?tasks: a same-origin
+// redirect such as an ingress scheme upgrade. A cross-origin redirect (the
+// object-store fall-through) reports ErrFileTasksUnsupported instead.
+var errFileTasksUnexpectedRedirect = errors.New("file tasks: unexpected redirect")
+
+// IsFileTasksUnexpectedRedirect reports whether err is a same-origin redirect
+// the client refused to follow. Callers can detect it with errors.Is.
+func IsFileTasksUnexpectedRedirect(err error) bool {
+	return errors.Is(err, errFileTasksUnexpectedRedirect)
+}
+
 // FileTask is one durable extract/embed task for a file's current revision.
 // LastError is empty unless the task failed, and is bounded by the server.
 type FileTask struct {
@@ -48,8 +60,10 @@ func (c *Client) FileTasks(path string) (*FileTasksResult, error) {
 // The request deliberately does not follow redirects: on a server without
 // ?tasks, the GET falls through to a plain read that may redirect to object
 // storage. A response is only decoded as a task list when the server sets the
-// X-Dat9-Tasks marker; a redirect, a file body, or any other unmarked 2xx
-// returns an error matching ErrFileTasksUnsupported.
+// X-Dat9-Tasks marker; an unmarked 2xx returns an error matching
+// ErrFileTasksUnsupported. A redirect to a different origin (the object-store
+// case) also matches ErrFileTasksUnsupported, while a same-origin redirect (for
+// example a scheme upgrade) matches IsFileTasksUnexpectedRedirect.
 func (c *Client) FileTasksCtx(ctx context.Context, path string) (*FileTasksResult, error) {
 	req, err := c.newFSRequest(ctx, http.MethodGet, path, "?tasks=1", nil)
 	if err != nil {
@@ -74,7 +88,7 @@ func (c *Client) FileTasksCtx(ctx context.Context, path string) (*FileTasksResul
 		if host == "" {
 			host = "relative Location"
 		}
-		return nil, fmt.Errorf("file tasks: unexpected redirect (HTTP %d to %s)", resp.StatusCode, host)
+		return nil, fmt.Errorf("%w (HTTP %d to %s)", errFileTasksUnexpectedRedirect, resp.StatusCode, host)
 	case resp.StatusCode >= 400:
 		return nil, readError(resp)
 	}
@@ -101,13 +115,44 @@ func redirectHost(resp *http.Response) string {
 	return u.Host
 }
 
-// sameHost reports whether host matches the host of baseURL, including any
-// port. It is used to tell an object-store redirect (a different host, which
-// means the server predates ?tasks) from an ingress redirect on the same host.
+// sameHost reports whether host resolves to the same origin as baseURL: the
+// hostname compared case-insensitively and the effective port (an explicit
+// port, or the scheme default when one side omits it). A genuinely different
+// explicit port stays cross-origin, so an object-store redirect still maps to
+// ErrFileTasksUnsupported. It is used to tell that redirect apart from an
+// ingress redirect on the same origin.
 func sameHost(baseURL, host string) bool {
-	u, err := url.Parse(baseURL)
-	if err != nil {
+	base, err := url.Parse(baseURL)
+	if err != nil || base.Hostname() == "" {
 		return false
 	}
-	return strings.EqualFold(u.Host, host)
+	other, err := url.Parse("//" + host)
+	if err != nil || other.Hostname() == "" {
+		return false
+	}
+	if !strings.EqualFold(base.Hostname(), other.Hostname()) {
+		return false
+	}
+	return effectivePort(base, base.Scheme) == effectivePort(other, base.Scheme)
+}
+
+// effectivePort returns u's explicit port, or the default port for fallback (the
+// base URL's scheme, used when the redirect Location is protocol-relative and
+// carries no scheme). An unknown scheme with no port yields "".
+func effectivePort(u *url.URL, fallback string) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	scheme := u.Scheme
+	if scheme == "" {
+		scheme = fallback
+	}
+	switch strings.ToLower(scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
