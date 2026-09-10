@@ -307,6 +307,18 @@ Proposed fork change, in order of value:
 
 Acceptance for this item: with `--writeback-cache off`, the isolated spill task returns to single-digit seconds (ext4: 0.2 s; cap-on: 16 s; cap-off today: 81 s) and `mptester crash01.test --journalmode wal` reports `0 errors out of 94 tests`, then the whole `community.sqlite` module passes on the extent profile.
 
+Why no tuning shortcut exists: a synchronous commit per write (what `WRITE_CACHE` writes do under the cap) removes the pending-slice part of the barrier but leaves the store read itself — 9 509 reads at 2.8 ms is already 27 s for this 64 MB spill, so the read-backs must be served locally (kernel page cache, or a staged-range read overlay in the fork). A daemon-side cache cannot substitute, because it cannot know which ranges the writer has staged.
+
+**A/B harness (EC2 host, reusable)** [verified]
+Everything lives in `/home/ec2-user/night` on the ap-southeast-1 test host (`ssh -i ~/.ssh/drive9_extent_e2e ec2-user@13.214.129.143`); the tree it builds is `/home/ec2-user/drive9-src` (rsync a worktree over `pkg/fuse/` plus `docs/`; use `rsync --delete` or a stale file breaks the build).
+
+* `env.sh` — PATH (prepends `/home/ec2-user/night/bin`), private `HOME`, `DRIVE9_*`, `provision()`.
+* `bin/drive9` — PATH shim that injects `--writeback-cache "$FUSE_WB_CAP"` into `drive9 mount <opts> ...`. It only covers mounts launched as bare `drive9` (git-ops, git-workspace-*, supervision, sqlite-correctness and `mount.sh` all do); a script that mounts through its own `$CLI_BIN` bypasses it, so **always confirm the negotiation from the mount's INIT reply**, never from the harness env.
+* `mount.sh <profile> <on|off> <tag> [extra args]`, `umount.sh <tag>` — mount/unmount with the cap forced.
+* `sqlite-probe.sh <mount> [cases]` — mptest wal/delete (crash01), threadtest3 walthread2/5, kvtest.
+* `e2e.sh <profile> <cap> <script> [tag]`, `single.sh` — run one `e2e/*.sh` gate with the profile and cap set; `blackbox.sh <profile> <cap> <tag>` runs `community.sqlite` via `blackbox/run.py --server-mode local`.
+* Isolated spill repro (the fastest signal, ~2 min): `/tmp/bigspill2.test` with `$SQLITE_TOOLS/mptester probe.db --sync --journalmode wal --timeout 30000 /tmp/bigspill2.test` inside the mount; SQLite tools are in `/home/ec2-user/bb-work/cache/tools/sqlite/master`.
+
 ---
 
 # P1-10 Classic-path SQLite mounted integrity_check fails with disk I/O error under the kernel writeback cache
