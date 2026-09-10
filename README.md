@@ -273,7 +273,12 @@ Collected:
 
 - command and flag names, never flag values
 - exit codes and duration
-- Drive9 version, OS, and architecture
+- Drive9 version, OS, architecture, and how the CLI was installed
+- the active context's cloud provider and region, from a fixed allowlist
+  (unrecognised values are dropped, and commands addressing another context
+  report neither)
+- whether the credentials came from the config file, the environment, or an
+  explicit flag
 
 Never collected:
 

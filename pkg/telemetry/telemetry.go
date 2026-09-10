@@ -370,11 +370,20 @@ func loadOrCreateInstallationID(homeDir string) (string, error) {
 		return "", err
 	}
 	// Link publishes without clobbering an identity another process just wrote.
-	// Rename is the fallback for filesystems without hard links (FAT/exFAT, some
-	// SMB/NFS home directories), where link fails with a non-ErrExist error.
 	if err := os.Link(tempPath, path); err != nil && !errors.Is(err, os.ErrExist) {
-		if renameErr := os.Rename(tempPath, path); renameErr != nil {
+		// Fallback for filesystems without hard links (FAT/exFAT, some SMB/NFS
+		// home directories). Claim the path exclusively first: renaming straight
+		// over it would let two concurrent processes replace each other's
+		// identity and then report events under different IDs. Replacing our own
+		// placeholder afterwards keeps the content publish atomic.
+		claimed, claimErr := claimInstallationIDPath(path)
+		if claimErr != nil {
 			return "", err
+		}
+		if claimed {
+			if renameErr := os.Rename(tempPath, path); renameErr != nil {
+				return "", renameErr
+			}
 		}
 	}
 	// Read back instead of trusting the local value: the loser of a race must
@@ -388,6 +397,23 @@ func loadOrCreateInstallationID(homeDir string) (string, error) {
 		return "", fmt.Errorf("telemetry installation ID could not be persisted")
 	}
 	return persisted, nil
+}
+
+// claimInstallationIDPath creates path only when nothing is there yet. It is
+// how an identity is published on filesystems without hard links: the loser of
+// a race leaves the winner's file untouched instead of replacing it.
+func claimInstallationIDPath(path string) (bool, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := file.Close(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func readInstallationID(path string) (string, bool, error) {

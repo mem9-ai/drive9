@@ -169,15 +169,25 @@ to keep issue structure and required context consistent.
 - Help, version, commandless usage, unknown commands, every `drive9 update`
   form, and internal mount processes (`mount supervise`, `--supervised`,
   `--supervise-foreground`) are excluded before telemetry reads
-  `~/.drive9/config` or `.telemetry-installation-id`.
+  `~/.drive9/config` or `.telemetry-installation-id`. The `admin` subtree also
+  opts out of a bare `help` operand (`drive9 admin tenant create help` is a help
+  request there) via `bareHelp`; `fs grep help` is a real operand and still
+  reports.
+- Placement fields describe the command's own context. A command that addresses
+  a named context (`drive9 fs cat prod:/file`) reports no provider/region and
+  `profile_source: unknown`, because the active context does not describe it.
 - One user command must produce at most one event. Every process drive9 spawns
   itself — background mounts, supervisors, detached hydration — must go through
   `telemetryDisabledEnv`, and the generated systemd unit sets
   `Environment=DRIVE9_TELEMETRY=off`.
 - Flag names come from argv, so a flag value must never be recorded as a name:
-  a dash token directly after another dash token is treated as a value.
-  `telemetryFlagNames` documents the tradeoff; do not "fix" the resulting
-  under-reporting by guessing arity.
+  a dash token directly after another dash token is treated as a value, and
+  `telemetryKnownFlagNames` (guarded by
+  `TestTelemetryKnownFlagNamesCoverEveryDefinedFlag`) drops anything that is not
+  a flag the CLI defines. A dash-shaped operand that happens to spell a real flag
+  is still reported; that is an analytics-fidelity limit, not a privacy one,
+  because the recorded string is always a known flag name. Do not "fix" the
+  remaining under-reporting by guessing arity.
 - `cmd/drive9/telemetry.go` holds a hand-maintained copy of the command tree, and
   `cmd/drive9/telemetry_drift_test.go` compares it against the real dispatchers.
   Adding a command or subcommand means updating the tree; the test fails

@@ -546,3 +546,20 @@ func assertFileContent(t *testing.T, path, want string) {
 		t.Fatalf("%s changed: got %q, want %q", path, data, want)
 	}
 }
+
+func TestClaimInstallationIDPathIsExclusive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), installationIDFile)
+	claimed, err := claimInstallationIDPath(path)
+	if err != nil || !claimed {
+		t.Fatalf("first claim = %t, %v; want true, nil", claimed, err)
+	}
+	claimed, err = claimInstallationIDPath(path)
+	if err != nil || claimed {
+		t.Fatalf("second claim = %t, %v; want false, nil", claimed, err)
+	}
+	if info, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0o600 && runtime.GOOS != "windows" {
+		t.Fatalf("claimed file mode = %o, want 0600", info.Mode().Perm())
+	}
+}

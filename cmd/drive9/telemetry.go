@@ -27,7 +27,12 @@ type telemetryNode struct {
 	defaultName string
 	excluded    bool
 	leaf        bool
-	children    map[string]*telemetryNode
+	// bareHelp marks command trees whose leaf parsers treat a bare "help"
+	// operand as a help request (`drive9 admin tenant create help` is a
+	// successful help invocation). It is inherited by descendants. Commands like
+	// `fs grep` do not set it, because there "help" is a legitimate operand.
+	bareHelp bool
+	children map[string]*telemetryNode
 }
 
 var telemetryLeaf = &telemetryNode{}
@@ -43,7 +48,8 @@ var telemetryCommands = &telemetryNode{
 		"version": {excluded: true},
 		"help":    {excluded: true},
 		"admin": {
-			aliases: map[string]string{"tenants": "tenant"},
+			aliases:  map[string]string{"tenants": "tenant"},
+			bareHelp: true,
 			children: map[string]*telemetryNode{
 				"tenant": {
 					children: map[string]*telemetryNode{
@@ -233,7 +239,7 @@ func resolveTelemetryCommand(args []string) telemetryInvocation {
 	if len(args) == 0 || hasTelemetryExclusionFlag(args) || hasInternalProcessFlag(args) {
 		return telemetryInvocation{}
 	}
-	path, rest, ok := telemetryCommands.resolve(args, []string{"drive9"})
+	path, rest, ok := telemetryCommands.resolve(args, []string{"drive9"}, false)
 	if !ok || len(path) == 0 {
 		return telemetryInvocation{}
 	}
@@ -244,17 +250,18 @@ func resolveTelemetryCommand(args []string) telemetryInvocation {
 	}
 }
 
-func (n *telemetryNode) resolve(args []string, path []string) ([]string, []string, bool) {
+func (n *telemetryNode) resolve(args []string, path []string, bareHelp bool) ([]string, []string, bool) {
 	if n == nil || n.excluded {
 		return nil, nil, false
 	}
+	bareHelp = bareHelp || n.bareHelp
 	if len(args) == 0 {
 		if n.defaultName != "" {
 			child := n.lookupChild(n.defaultName)
 			if child == nil {
 				return nil, nil, false
 			}
-			return child.resolve(nil, append(path, n.defaultName))
+			return child.resolve(nil, append(path, n.defaultName), bareHelp)
 		}
 		if len(n.children) > 0 && !n.leaf {
 			return nil, nil, false
@@ -269,11 +276,15 @@ func (n *telemetryNode) resolve(args []string, path []string) ([]string, []strin
 		if child == nil {
 			return nil, nil, false
 		}
-		return child.resolve(args[1:], append(path, childName))
+		return child.resolve(args[1:], append(path, childName), bareHelp)
 	}
-	// Everything left belongs to a leaf command, so it is an argument — even
-	// when it spells "help" or "version" (`drive9 fs grep help`).
+	// Everything left belongs to a leaf command, so it is normally an argument —
+	// even when it spells "version" (`drive9 fs grep help`). Trees that do treat
+	// a bare "help" as a help request opt out through bareHelp.
 	if n.leaf || len(n.children) == 0 {
+		if bareHelp && hasBareHelpOperand(args) {
+			return nil, nil, false
+		}
 		return path, args, true
 	}
 	// Unknown token on a namespace command: help/version or a command we do not
@@ -328,6 +339,46 @@ func hasTelemetryExclusionFlag(args []string) bool {
 			continue
 		}
 		if !hasValue || strings.EqualFold(value, "true") || value == "1" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasBareHelpOperand reports whether a leaf command's arguments contain a bare
+// "help" that its parser would treat as a help request. A "help" consumed as a
+// flag's value (`--server help`) does not count.
+func hasBareHelpOperand(args []string) bool {
+	previousWasFlag := false
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if !strings.HasPrefix(arg, "-") {
+			if arg == "help" && !previousWasFlag {
+				return true
+			}
+			previousWasFlag = false
+			continue
+		}
+		// An inline "--flag=value" token consumes nothing after it.
+		previousWasFlag = !strings.Contains(arg, "=")
+	}
+	return false
+}
+
+// hasContextScopedOperand reports whether argv addresses a named context
+// (name:/path). Such a command is served by that context's client, so the
+// active context's placement must not be reported as if it were its own.
+func hasContextScopedOperand(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			continue
+		}
+		if strings.HasPrefix(arg, "-") || strings.Contains(arg, "://") {
+			continue
+		}
+		if index := strings.Index(arg, ":/"); index > 0 {
 			return true
 		}
 	}
@@ -467,6 +518,11 @@ func finishCLITelemetry(session *telemetry.Session, inv telemetryInvocation, arg
 		return
 	}
 	provider, region, source := cli.TelemetryContextMetadata()
+	if hasContextScopedOperand(args) {
+		// The command ran against another context; the active context's
+		// placement does not describe it, and reporting it would be wrong.
+		provider, region, source = "", "", "unknown"
+	}
 	session.Finish(telemetry.EventInput{
 		CommandPath:   inv.commandPath,
 		FlagNames:     telemetryFlagNames(inv.flagArgs),

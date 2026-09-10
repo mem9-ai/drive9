@@ -52,6 +52,12 @@ func TestResolveTelemetryCommandEligibility(t *testing.T) {
 		{name: "value that looks like the version command", args: []string{"fs", "find", "-name", "version", ":/"}, wantEligible: true, wantPath: "drive9 fs find", wantFlags: "name"},
 		{name: "value that looks like help", args: []string{"fs", "grep", "help", ":/"}, wantEligible: true, wantPath: "drive9 fs grep"},
 		{name: "context named version", args: []string{"ctx", "use", "version"}, wantEligible: true, wantPath: "drive9 ctx use"},
+		// admin leaf parsers treat a bare "help" operand as a help request.
+		{name: "admin leaf help operand", args: []string{"admin", "tenant", "create", "help"}},
+		{name: "admin nested leaf help operand", args: []string{"admin", "tenant", "pool", "create", "help"}},
+		{name: "admin object backend help operand", args: []string{"admin", "object-backend", "add", "help"}},
+		{name: "admin help consumed as a flag value", args: []string{"admin", "tenant", "create", "--server", "help"}, wantEligible: true, wantPath: "drive9 admin tenant create", wantFlags: "server"},
+		{name: "admin normal invocation", args: []string{"admin", "tenant", "create", "--json"}, wantEligible: true, wantPath: "drive9 admin tenant create", wantFlags: "json"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -140,6 +146,87 @@ func TestTelemetryFlagNamesNeverRecordFlagValues(t *testing.T) {
 			got := strings.Join(telemetryFlagNames(test.args), ",")
 			if got != test.want {
 				t.Fatalf("flag names = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestWithCLITelemetryReportsUnknownPlacementForContextScopedCommands(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		args         []string
+		wantProvider string
+		wantRegion   string
+		wantSource   string
+	}{
+		{
+			name:         "active context",
+			args:         []string{"fs", "cat", ":/file"},
+			wantProvider: "aws",
+			wantRegion:   "aws-ap-southeast-1",
+			wantSource:   "default",
+		},
+		{
+			name:       "named context",
+			args:       []string{"fs", "cat", "prod:/file"},
+			wantSource: "unknown",
+		},
+		{
+			name:         "object store location keeps the active context",
+			args:         []string{"fs", "cat", "s3://bucket/key"},
+			wantProvider: "aws",
+			wantRegion:   "aws-ap-southeast-1",
+			wantSource:   "default",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("DRIVE9_TELEMETRY", "on")
+			t.Setenv("DRIVE9_ALLOW_TEST_ENDPOINTS", "1")
+			t.Setenv(cli.EnvAPIKey, "")
+			t.Setenv(cli.EnvVaultToken, "")
+			writeConfigFile(t, home, `{"current_context":"dev","contexts":{"dev":{"type":"owner","api_key":"k","server":"https://s","cloud_provider":"aws","region":"aws-ap-southeast-1"}}}`)
+
+			requests := make(chan []byte, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				body, _ := io.ReadAll(request.Body)
+				requests <- body
+				writer.WriteHeader(http.StatusAccepted)
+			}))
+			defer server.Close()
+			t.Setenv("DRIVE9_TEST_TELEMETRY_ENDPOINT", server.URL+"/v1/telemetry/batch")
+
+			origVersion, origSource := buildinfo.Version, buildinfo.InstallSource
+			t.Cleanup(func() { buildinfo.Version, buildinfo.InstallSource = origVersion, origSource })
+			buildinfo.Version = "0.2.0"
+			buildinfo.InstallSource = "local"
+
+			origExit, origStop := exitFunc, cpuProfileStop
+			t.Cleanup(func() { exitFunc, cpuProfileStop = origExit, origStop })
+			cpuProfileStop = func() {}
+			exitFunc = func(int) {}
+
+			withCLITelemetry(test.args, func() {})
+
+			var payload struct {
+				Events []struct {
+					CloudProvider string `json:"cloud_provider"`
+					RegionCode    string `json:"region_code"`
+					ProfileSource string `json:"profile_source"`
+				} `json:"events"`
+			}
+			select {
+			case body := <-requests:
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				t.Fatal("no telemetry event was sent")
+			}
+			event := payload.Events[0]
+			if event.CloudProvider != test.wantProvider || event.RegionCode != test.wantRegion || event.ProfileSource != test.wantSource {
+				t.Fatalf("placement = %q/%q/%q, want %q/%q/%q", event.CloudProvider, event.RegionCode, event.ProfileSource, test.wantProvider, test.wantRegion, test.wantSource)
 			}
 		})
 	}
