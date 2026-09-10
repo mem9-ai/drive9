@@ -760,10 +760,11 @@ func TestPathTruncateOnHardlinkAliasCommitsCallerContent(t *testing.T) {
 	if bufSize != 0 {
 		t.Fatalf("caller buffer size = %d, want 0 after truncate adoption", bufSize)
 	}
-	// The synchronous truncate committed the zero and refreshed the writer's
-	// base revision across the alias.
-	if baseRev != 3 {
-		t.Fatalf("caller BaseRev = %d, want 3 after the committed truncate", baseRev)
+	// The caller is the inode's only live writer, so the truncate is folded
+	// into its own handle: no remote zero is committed and the base stays at
+	// the open value — the caller's next commit CAS-succeeds at it.
+	if baseRev != 2 {
+		t.Fatalf("caller BaseRev = %d, want 2 (folded truncate)", baseRev)
 	}
 
 	// printf's write + close commits the content — with the refreshed base,

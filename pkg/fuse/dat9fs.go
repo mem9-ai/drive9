@@ -2615,6 +2615,56 @@ func (fs *Dat9FS) adoptOpenHandlePathTruncate(entry *InodeEntry, ino uint64, cal
 	return gofuse.OK
 }
 
+// adoptCallerOwnedInodeTruncate folds a path-based truncate into the
+// truncating process's own open writable handle on the inode — including
+// handles opened through hardlink aliases — so the truncate and the caller's
+// subsequent writes commit as a single write. A remote zero-truncate
+// committed on its own would race that handle's pending commit on any alias
+// path: whichever revision lands first wins and the other is terminally
+// refused, losing data either way (the O_TRUNC-on-hardlink-alias regression,
+// where the remote stayed at 0 bytes while the local read was correct).
+// Returns true when a caller-owned handle adopted the truncate; the caller
+// then syncs sibling buffers and skips the remote truncate entirely.
+func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, newSize int64) bool {
+	if callerPID == 0 {
+		return false
+	}
+	// Fold only when the truncating caller is the inode's ONLY live writer.
+	// With a concurrent writer from another process, the remote truncate's
+	// revision bump is the CAS fence that makes the stale writer's next
+	// commit conflict detectably instead of silently clobbering — keep the
+	// remote path there.
+	var owner *FileHandle
+	for _, fh := range fs.fileHandlesForInode(ino) {
+		if fh == nil || fh.Dirty == nil || fh.Zombie || fh.Unlinked {
+			continue
+		}
+		if !localFileHandleOpenedWritable(fh) {
+			continue
+		}
+		if fh.OpenPID != callerPID {
+			return false
+		}
+		if owner == nil {
+			owner = fh
+		}
+	}
+	if owner == nil {
+		return false
+	}
+	owner.Lock()
+	abortStreamer, err := fs.truncateWritableHandleLocked(owner, newSize)
+	owner.Unlock()
+	if abortStreamer != nil {
+		abortStreamer()
+	}
+	if err != nil {
+		safeLogPrintf("caller-owned inode truncate adoption failed for %s: %v", owner.Path, err)
+		return false
+	}
+	return true
+}
+
 func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision int64, skip *FileHandle) {
 	if fs == nil || fs.openHandles == nil || path == "" || revision <= 0 {
 		return
@@ -9205,15 +9255,28 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			// so a pending zombie commit cannot resurrect the truncated tail.
 			fs.truncateZombieBuffersForInode(input.NodeId, newSize)
 		} else {
-			if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
-				return st
+			// The truncating process itself holds the file open: fold the
+			// truncate into the caller's own handle (including hardlink
+			// aliases) so its history — truncate, then any subsequent writes
+			// — commits as a single write. A remote zero-truncate committed
+			// on its own would race the handle's pending commit on any alias
+			// path: whichever revision lands first wins and the other is
+			// terminally refused, losing data either way (the
+			// O_TRUNC-on-hardlink regression). Without a caller-owned handle,
+			// keep the remote path.
+			if fs.adoptCallerOwnedInodeTruncate(input.NodeId, input.Pid, newSize) {
+				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
+			} else {
+				if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
+					return st
+				}
+				// Path-based truncate(path, size) truncates the remote file but
+				// does not update open dirty handles' WriteBuffers. Without this
+				// sync, a subsequent fstat(fd) on an open dirty handle returns the
+				// stale (pre-truncate) size via dirtyHandleSize(), causing
+				// fstat() mismatch failures (LTP ftest01 m_fstat case).
+				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
 			}
-			// Path-based truncate(path, size) truncates the remote file but
-			// does not update open dirty handles' WriteBuffers. Without this
-			// sync, a subsequent fstat(fd) on an open dirty handle returns the
-			// stale (pre-truncate) size via dirtyHandleSize(), causing
-			// fstat() mismatch failures (LTP ftest01 m_fstat case).
-			fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
 		}
 		entry.Size = newSize
 		fs.inodes.UpdateSize(input.NodeId, newSize)

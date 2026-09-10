@@ -120,25 +120,31 @@ mechanism is a commit-ordering race on the shared object:
   path-truncate buffer sync dirtied its buffer, and it then committed the
   truncated image with its own stale base revision.
 
-Three repairs, all in the revision-tracking layer:
+The fix has two tiers:
 
-1. **Caller-owned adoption.** `updateOpenHandleBaseRevision` now always
-   adopts the truncate and the fresh base revision for the truncating
-   caller's own handle (OpenPID == callerPID), regardless of the O_TRUNC
-   flag or sibling-handle count. The pre-existing `O_TRUNC`-flag heuristic
-   never fires in production — the kernel issues the truncate as a separate
-   SetAttr and does not propagate O_TRUNC into the FUSE open flags — so
-   real O_TRUNC writers were never refreshed and their next commit
-   CAS-conflicted forever.
-2. **Alias coverage.** The base-revision refresh iterates every alias path
-   of the inode (and dirty zombies of the inode), so a writer on any
-   hardlink alias commits with the post-truncate revision.
-3. **Race removal.** `canStagePathTruncateToZero` declines the async staged
-   path while any live (non-zombie) writer holds the inode, forcing the
-   synchronous truncate that lands before the writer's commit and refreshes
-   it first; and the truncate buffer syncs no longer create phantom dirty
-   state on clean zombies (they truncate the buffer but keep the zombie
-   clean, so it never publishes the zero image with a stale base).
+1. **Caller-owned fold (the common case).** When the truncating process is
+   the inode's ONLY live writer, `adoptCallerOwnedInodeTruncate` folds the
+   truncate into the caller's own handle buffer (including hardlink
+   aliases) and **no remote zero-truncate is committed at all**: the
+   truncate and the caller's subsequent writes commit as a single write, so
+   the race does not exist. The caller's base revision stays at its open
+   value and its next commit CAS-succeeds at it. This also removes the
+   production-only O_TRUNC-flag bug — the kernel issues the truncate as a
+   separate SetAttr and does not propagate O_TRUNC into the FUSE open
+   flags, so the refresh that was supposed to save the writer never fired
+   outside unit tests.
+2. **Concurrent-writer fencing (unchanged semantics).** With a live writer
+   from another process on the inode, the remote truncate still commits
+   and its revision bump remains the CAS fence that makes a stale writer's
+   next commit conflict detectably instead of silently clobbering. The
+   base-revision refresh now iterates every alias path of the inode (and
+   dirty zombies of the inode), and `canStagePathTruncateToZero` declines
+   the async staged path while any live (non-zombie) writer holds the
+   inode, forcing the synchronous truncate that lands first and refreshes
+   the writer before its commit. The truncate buffer syncs no longer
+   create phantom dirty state on clean zombies (they truncate the buffer
+   but keep the zombie clean, so it never publishes the zero image with a
+   stale base).
 
 ---
 

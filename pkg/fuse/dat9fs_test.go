@@ -20041,8 +20041,12 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 		t.Fatalf("SetAttr status = %v, want OK", st)
 	}
 
-	if fh.BaseRev != 2 {
-		t.Fatalf("open handle base revision after path truncate = %d, want 2", fh.BaseRev)
+	// With the caller as the inode's only live writer, the truncate is folded
+	// into the caller's own handle (no remote zero-truncate is committed), so
+	// the open base revision stays and the caller's next commit CAS-succeeds
+	// at it.
+	if fh.BaseRev != 1 {
+		t.Fatalf("open handle base revision after path truncate = %d, want 1 (folded truncate)", fh.BaseRev)
 	}
 	if fh.Streamer != nil {
 		t.Fatal("stream uploader should be reset after adopted zero truncate")
@@ -20073,8 +20077,8 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	if got := string(content); got != "overwrite" {
 		t.Fatalf("remote content = %q, want %q", got, "overwrite")
 	}
-	if revision != 3 {
-		t.Fatalf("remote revision = %d, want 3", revision)
+	if revision != 2 {
+		t.Fatalf("remote revision = %d, want 2", revision)
 	}
 }
 
@@ -20529,8 +20533,10 @@ func TestSetAttr_PathTruncateSingleCallerWriterAdoptsZeroBase(t *testing.T) {
 		t.Fatalf("SetAttr status = %v, want OK", st)
 	}
 
-	if fh.BaseRev != 2 {
-		t.Fatalf("open handle base revision after path truncate = %d, want 2", fh.BaseRev)
+	// Folded truncate: the base revision stays at the open value; the
+	// caller's next commit CAS-succeeds at it (no remote zero is committed).
+	if fh.BaseRev != 1 {
+		t.Fatalf("open handle base revision after path truncate = %d, want 1 (folded truncate)", fh.BaseRev)
 	}
 	if !fh.ZeroBase {
 		t.Fatal("expected same-caller writer handle to adopt zero base")
@@ -20563,8 +20569,8 @@ func TestSetAttr_PathTruncateSingleCallerWriterAdoptsZeroBase(t *testing.T) {
 	if got := string(content); got != "overwrite" {
 		t.Fatalf("remote content = %q, want %q", got, "overwrite")
 	}
-	if revision != 3 {
-		t.Fatalf("remote revision = %d, want 3", revision)
+	if revision != 2 {
+		t.Fatalf("remote revision = %d, want 2", revision)
 	}
 }
 
