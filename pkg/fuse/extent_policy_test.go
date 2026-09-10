@@ -414,9 +414,13 @@ func TestExtentKeepOpenWALIndexSize(t *testing.T) {
 
 func TestExtentWriteByNodeWithoutHandleIsOK(t *testing.T) {
 	fs := &Dat9FS{opts: &MountOptions{}, inodes: NewInodeToPath()}
+	// With no extent mapping for the node, extentWriteByNode reports ENOENT
+	// and lets the Write caller classify: classic bytes route to the
+	// zombie/ENOENT path, and only a provably-extent forgotten inode is
+	// discarded (via WasEverExtent).
 	st := fs.extentWriteByNode(99, 0, []byte("x"))
-	if st != gofuse.OK {
-		t.Fatalf("orphan write without extent ino: %v, want OK (discard writeback of gone inode)", st)
+	if st != gofuse.ENOENT {
+		t.Fatalf("orphan write without extent ino: %v, want ENOENT (caller classifies)", st)
 	}
 }
 
@@ -426,9 +430,17 @@ func TestWriteMissingHandleOnExtentDiscards(t *testing.T) {
 		inodes:      NewInodeToPath(),
 		fileHandles: NewHandleTable[*FileHandle](),
 	}
+	// A node that never carried an extent mapping must not be discarded,
+	// even on an extent-glob mount: classic bytes fail loudly (ENOENT).
+	if n, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: 99}, Fh: 7}, []byte("x")); st != gofuse.ENOENT || n != 0 {
+		t.Fatalf("Write missing handle on never-extent node: n=%d st=%v, want ENOENT", n, st)
+	}
+	// A node that was bound to a JuiceFS extent inode and then forgotten is
+	// the legitimate orphan-writeback case: discard with OK.
+	fs.inodes.SetExtentIno(99, 42)
 	n, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: 99}, Fh: 7}, []byte("x"))
 	if st != gofuse.OK || n != 1 {
-		t.Fatalf("Write missing handle n=%d st=%v, want discard OK", n, st)
+		t.Fatalf("Write missing handle on forgotten extent node: n=%d st=%v, want discard OK", n, st)
 	}
 }
 

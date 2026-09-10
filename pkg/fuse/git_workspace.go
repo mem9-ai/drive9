@@ -5012,6 +5012,7 @@ func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flag
 // contract).
 func (fs *Dat9FS) allocateGitWorkspaceFileHandle(ctx context.Context, fh *FileHandle, rt *gitWorkspaceRuntime, rel string) uint64 {
 	fhID := fs.fileHandles.Allocate(fh)
+	fh.handleID = fhID
 	if fs.registerGitWorkspaceHandle(fh, rt, rel) {
 		fs.cleanupGitWhiteoutAdoption(ctx, fh, rt, rel)
 	}

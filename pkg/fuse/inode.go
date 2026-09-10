@@ -42,7 +42,20 @@ type InodeToPath struct {
 	byPath  map[string]uint64
 	byID    map[string]uint64
 	nextIno uint64
+	// extentOnce records every FUSE inode that ever carried a JuiceFS
+	// extent mapping. Inode numbers are allocated monotonically (nextIno
+	// never repeats), so membership reliably means "this nodeid belonged to
+	// an extent file" even after the entry itself is removed. The missing-
+	// handle Write path uses it to authorize discarding orphan writebacks
+	// for deleted extent files without ever swallowing classic-file bytes.
+	extentOnce map[uint64]struct{}
 }
+
+// extentOnceSoftCap bounds the extentOnce set. On overflow the set is
+// dropped and rebuilt from scratch: a false negative after a reset turns an
+// orphan extent writeback into a logged ENOENT instead of a silent discard,
+// which is the safe direction.
+const extentOnceSoftCap = 1 << 20
 
 // NewInodeToPath creates a new InodeToPath initialized with the root inode
 // (inode 1, corresponding to go-fuse FUSE_ROOT_ID).
@@ -56,10 +69,11 @@ func NewInodeToPath() *InodeToPath {
 		Nlookup: 1,
 	}
 	return &InodeToPath{
-		byInode: map[uint64]*InodeEntry{1: root},
-		byPath:  map[string]uint64{"/": 1},
-		byID:    make(map[string]uint64),
-		nextIno: 2,
+		byInode:    map[uint64]*InodeEntry{1: root},
+		byPath:     map[string]uint64{"/": 1},
+		byID:       make(map[string]uint64),
+		extentOnce: make(map[uint64]struct{}),
+		nextIno:    2,
 	}
 }
 
@@ -372,9 +386,31 @@ func (m *InodeToPath) SetExtentIno(ino uint64, extentIno uint64) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if len(m.extentOnce) >= extentOnceSoftCap {
+		// Bound the routing memory of a long-lived mount with heavy extent
+		// inode churn. Resetting only downgrades late orphan writebacks to a
+		// logged ENOENT (see WasEverExtent); it never misclassifies a
+		// classic file, because nodeids are never reused.
+		m.extentOnce = make(map[uint64]struct{}, extentOnceSoftCap/2)
+	}
+	m.extentOnce[ino] = struct{}{}
 	if entry, ok := m.byInode[ino]; ok {
 		entry.ExtentIno = extentIno
 	}
+}
+
+// WasEverExtent reports whether this FUSE inode was ever bound to a JuiceFS
+// extent inode on this mount. Unlike the entry's ExtentIno field, it survives
+// entry removal (unlink + forget), which is exactly when an orphan kernel
+// writeback may still arrive for the deleted extent file.
+func (m *InodeToPath) WasEverExtent(ino uint64) bool {
+	if m == nil || ino == 0 {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.extentOnce[ino]
+	return ok
 }
 
 // FindByExtentIno returns the FUSE inode that already owns this JuiceFS

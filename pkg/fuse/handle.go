@@ -104,7 +104,25 @@ type FileHandle struct {
 	// A zero truncate can reach a sibling while it holds mu waiting for the
 	// path lock. Publish the event without taking that sibling's mu.
 	pendingSQLiteTruncate atomic.Pointer[sqliteHandleTruncate]
-	mu                    sync.Mutex
+	// Zombie marks a handle whose file was fully released but which is kept
+	// registered until the kernel FORGETs the inode. With the kernel
+	// writeback cache enabled, mmap-dirtied pages can be written back after
+	// RELEASE; the zombie absorbs them through the normal Write path instead
+	// of dropping them as missing-handle writes. Classic (non-extent) files
+	// only, only on Linux with the kernel cache negotiated.
+	Zombie      bool
+	ZombifiedAt time.Time
+	// handleID is the FUSE file handle id under which this handle is
+	// registered in Dat9FS.fileHandles (needed when purging zombies from
+	// paths that only know the inode, e.g. Forget).
+	handleID uint64
+	// zombieTimer debounces the background remote commit of dirty data a
+	// zombie absorbed after Release. Guarded by fh.mu.
+	zombieTimer *time.Timer
+	// zombieCommitFails counts consecutive failed zombie commit attempts and
+	// drives the retry backoff. Guarded by fh.mu.
+	zombieCommitFails int
+	mu                sync.Mutex
 }
 
 type sqliteHandleTruncate struct {

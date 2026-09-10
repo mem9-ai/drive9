@@ -526,6 +526,15 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
+	// The kernel writeback cache buffers write() data in the page cache, so a
+	// write can return before the daemon has seen the bytes. That is
+	// mathematically incompatible with write-sync's "remote-durable when
+	// write() returns" contract; refuse the explicit override instead of
+	// silently downgrading the promise. (auto already leaves the cache off
+	// for write-sync, so only an explicit "on" reaches this check.)
+	if writebackCacheVal == fuseWritebackCacheOn && writePolicyVal == fuseWritePolicyWriteSync {
+		return fmt.Errorf("drive9 mount: --writeback-cache on is incompatible with --durability write-sync (write-sync requires every write() to be remote-durable when it returns)")
+	}
 	if *writeBackBatchWindow > 0 && writePolicyVal != fuseWritePolicyWriteBack {
 		return fmt.Errorf("drive9 mount: --writeback-batch-window requires --durability auto, interactive, or fsync")
 	}

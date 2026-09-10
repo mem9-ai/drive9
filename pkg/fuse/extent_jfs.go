@@ -668,9 +668,12 @@ func (fs *Dat9FS) extentWriteByNode(nodeId uint64, off uint64, data []byte) gofu
 	ino, ok := fs.juiceInoFromFuseNode(nodeId)
 	v := fs.extentVFS()
 	if !ok || v == nil {
-		// Kernel writeback of an unlinked/forgotten inode must not fail
-		// syncfs(2) with ENOENT; discard the pages.
-		return gofuse.OK
+		// No live extent mapping: this is either a classic file (the caller
+		// routes it to the zombie/ENOENT path — classic bytes must never be
+		// discarded here) or a deleted extent inode (the caller authorizes
+		// the discard via WasEverExtent). Report ENOENT and let the caller
+		// classify.
+		return gofuse.ENOENT
 	}
 	if errn := v.WriteBack(ctx, jfsmeta.Ino(ino), data, off); errn != 0 {
 		fmt.Fprintf(os.Stderr, "drive9: extent orphan write ino=%d off=%d err=%v\n", ino, off, errn)

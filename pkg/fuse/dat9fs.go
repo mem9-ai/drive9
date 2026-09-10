@@ -87,6 +87,20 @@ type Dat9FS struct {
 	opts                        *MountOptions
 	debouncer                   *flushDebouncer
 
+	// kernelWritebackCache records whether this mount negotiated the kernel
+	// FUSE writeback cache (kernelWritebackCacheEnabled). It gates the zombie
+	// handle lifecycle; tests may override it directly.
+	kernelWritebackCache bool
+	// zombieMu guards zombiesByInode and the zombie janitor lifecycle.
+	// Zombies are released classic handles kept registered until the kernel
+	// FORGETs the inode, so a late kernel writeback (mmap dirty pages) still
+	// lands through the normal Write path. They are deliberately not in
+	// openHandles: a zombie is closed for every namespace purpose (unlink,
+	// rename, sidecar probes). See writeback_zombie.go.
+	zombieMu       sync.Mutex
+	zombiesByInode map[uint64]map[*FileHandle]struct{}
+	zombieJanitor  chan struct{}
+
 	// Write-back cache: Flush writes small files to local disk, Release
 	// triggers async upload. Nil when CacheDir is not configured.
 	writeBack *WriteBackCache
@@ -408,38 +422,40 @@ type layerSymlinkState struct {
 // NewDat9FS creates a new FUSE filesystem backed by the given dat9 client.
 func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 	return &Dat9FS{
-		RawFileSystem:     gofuse.NewDefaultRawFileSystem(),
-		client:            c,
-		inodes:            NewInodeToPath(),
-		fileHandles:       NewHandleTable[*FileHandle](),
-		openHandles:       NewOpenHandleIndex(),
-		locks:             newFuseLockTable(),
-		dirHandles:        NewHandleTable[*DirHandle](),
-		committedRev:      make(map[string]int64),
-		committedSize:     make(map[string]int64),
-		remoteCommitLocks: make(map[string]*sync.Mutex),
-		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, opts.ReadCacheTTL, opts.ReadCacheMaxFileBytes),
-		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, dirCacheMaxEntriesOrDefault(opts.DirCacheMaxEntries)),
-		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
-		dirtyInodes:       make(map[uint64]dirtyInodeState),
-		kernelCacheBypass: make(map[uint64]kernelCacheBypassMarker),
-		specialByPath:     make(map[string]uint64),
-		uid:               uint32(os.Getuid()),
-		gid:               uint32(os.Getgid()),
-		opts:              opts,
-		syncMode:          opts.SyncMode,
-		debouncer:         newFlushDebouncer(opts.FlushDebounce),
-		perf:              newFusePerfCounters(opts.PerfCounters || opts.Profiling.PerfSamplesPath != ""),
-		localPolicy:       NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
-		appendLogMatcher:  NewAppendLogMatcher(opts.AppendLogPatterns),
-		localOverlay:      NewLocalOverlay(opts.LocalRoot),
-		git:               newGitWorkspaceLayer(),
-		gitCheckpoints:    newFlushDebouncer(gitCheckpointDebounce),
-		gitOverlayPending: make(map[string]map[string]pendingGitOverlayEntry),
-		readFlight:        NewSingleFlight(),
-		remoteReadTimeout: fuseTimeout,
-		xattrs:            NewXAttrStore(),
-		deletedPaths:      make(map[string]time.Time),
+		RawFileSystem:        gofuse.NewDefaultRawFileSystem(),
+		client:               c,
+		inodes:               NewInodeToPath(),
+		fileHandles:          NewHandleTable[*FileHandle](),
+		openHandles:          NewOpenHandleIndex(),
+		locks:                newFuseLockTable(),
+		dirHandles:           NewHandleTable[*DirHandle](),
+		committedRev:         make(map[string]int64),
+		committedSize:        make(map[string]int64),
+		remoteCommitLocks:    make(map[string]*sync.Mutex),
+		readCache:            NewReadCacheWithMaxFileSize(opts.CacheSize, opts.ReadCacheTTL, opts.ReadCacheMaxFileBytes),
+		dirCache:             NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, dirCacheMaxEntriesOrDefault(opts.DirCacheMaxEntries)),
+		readSlots:            make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
+		dirtyInodes:          make(map[uint64]dirtyInodeState),
+		kernelCacheBypass:    make(map[uint64]kernelCacheBypassMarker),
+		specialByPath:        make(map[string]uint64),
+		uid:                  uint32(os.Getuid()),
+		gid:                  uint32(os.Getgid()),
+		opts:                 opts,
+		syncMode:             opts.SyncMode,
+		debouncer:            newFlushDebouncer(opts.FlushDebounce),
+		perf:                 newFusePerfCounters(opts.PerfCounters || opts.Profiling.PerfSamplesPath != ""),
+		localPolicy:          NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
+		appendLogMatcher:     NewAppendLogMatcher(opts.AppendLogPatterns),
+		localOverlay:         NewLocalOverlay(opts.LocalRoot),
+		git:                  newGitWorkspaceLayer(),
+		gitCheckpoints:       newFlushDebouncer(gitCheckpointDebounce),
+		gitOverlayPending:    make(map[string]map[string]pendingGitOverlayEntry),
+		readFlight:           NewSingleFlight(),
+		remoteReadTimeout:    fuseTimeout,
+		xattrs:               NewXAttrStore(),
+		deletedPaths:         make(map[string]time.Time),
+		kernelWritebackCache: kernelWritebackCacheEnabled(opts),
+		zombiesByInode:       make(map[uint64]map[*FileHandle]struct{}),
 	}
 }
 
@@ -7483,6 +7499,11 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 }
 
 func (fs *Dat9FS) Forget(nodeId uint64, nlookup uint64) {
+	// The kernel forgets an inode only after its dirty pages were written
+	// back, so no late writeback can arrive afterwards: retire the inode's
+	// zombie handles first (they were kept precisely for that window), then
+	// run the normal forget bookkeeping.
+	fs.purgeZombiesForInode(nodeId)
 	entry, ok := fs.inodes.GetEntry(nodeId)
 	if ok && !entry.IsDir && fs.shouldPreserveForgottenInode(entry) {
 		fs.inodes.ForgetKeepMapping(nodeId, nlookup)
@@ -7514,6 +7535,11 @@ func (fs *Dat9FS) hasOpenHandle(ino uint64, p string) bool {
 // pre-snapshot would race with handles opened in between) and whether that
 // set is non-empty.
 func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapshotRemote bool) (marked []*FileHandle, anyOpen bool, snapshotErr error) {
+	// Zombies are deliberately not in openHandles (a zombie is closed for
+	// every namespace purpose), so mark them explicitly: their absorbed
+	// writebacks keep anonymous-fd semantics and must never resurrect the
+	// removed path.
+	fs.markZombiesUnlinkedForPath(p)
 	if fs.openHandles == nil || p == "" {
 		return nil, false, nil
 	}
@@ -8934,6 +8960,15 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			return fs.extentSetAttr(cancel, input, entry, out)
 		}
 	}
+	// A truncate must be ordered after everything the kernel has already
+	// written back: commit dirty zombie state absorbed after close before
+	// mutating the path remotely. Do this before taking the per-path commit
+	// lock below — the zombie commit takes that same lock.
+	if input.Valid&gofuse.FATTR_SIZE != 0 {
+		if st := fs.syncZombieHandlesForPath(cancel, entry.Path); st != gofuse.OK {
+			return st
+		}
+	}
 	unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(entry.Path)
 	defer unlockRemoteCommit()
 
@@ -9072,6 +9107,10 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					fs.publishSQLiteZeroTruncate(input.NodeId, fh, truncateSeq, truncateRevision)
 				}
 			}
+			// The kernel invalidated this inode's pages beyond newSize;
+			// mirror that in zombie buffers absorbed from earlier writebacks
+			// so a pending zombie commit cannot resurrect the truncated tail.
+			fs.truncateZombieBuffersForInode(input.NodeId, newSize)
 		} else {
 			if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
 				return st
@@ -10708,6 +10747,9 @@ func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
 		}
 		fh.Unlock()
 	}
+	// Zombies are not in openHandles; retarget them so a pending zombie
+	// commit lands on the post-rename path.
+	fs.retargetZombiePathsForRename(oldP, newP)
 }
 
 func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) (status gofuse.Status) {
@@ -13092,16 +13134,36 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			source = "extent-vfs-fh"
 			return uint32(len(data)), gofuse.OK
 		}
-		if st := fs.extentWriteByNode(input.NodeId, input.Offset, data); st == gofuse.OK {
+		extentSt := fs.extentWriteByNode(input.NodeId, input.Offset, data)
+		if extentSt == gofuse.OK {
 			source = "extent-orphan"
 			return uint32(len(data)), gofuse.OK
 		}
-		if fs.extentEnabled() {
+		// With the kernel writeback cache on, a released classic handle is
+		// kept as a zombie until FORGET precisely so this writeback lands
+		// through the normal write path. The kernel may address it by node
+		// without the released fh.
+		if zfh := fs.zombieHandleForNode(input.NodeId); zfh != nil {
+			fh = zfh
+			source = "zombie-writeback"
+		} else if extentSt == gofuse.ENOENT && fs.inodes.WasEverExtent(input.NodeId) {
+			// The inode belonged to an extent file whose mapping is gone
+			// (unlinked + entry removed): the orphan writeback has nowhere
+			// to land and dropping it is correct — but never silently, and
+			// never for a classic file (WasEverExtent survives entry
+			// removal; classic files never enter this branch).
 			source = "extent-orphan-discard"
+			safeLogPrintf("drive9: discarding orphan extent writeback node=%d off=%d n=%d (extent inode forgotten)", input.NodeId, input.Offset, len(data))
 			return uint32(len(data)), gofuse.OK
+		} else if extentSt != gofuse.ENOENT {
+			// A real extent data-plane error must reach the kernel so
+			// syncfs/fsync can report it — never swallow it.
+			safeLogPrintf("drive9: extent orphan writeback failed node=%d off=%d n=%d status=%d", input.NodeId, input.Offset, len(data), extentSt)
+			return 0, extentSt
+		} else {
+			fmt.Fprintf(os.Stderr, "drive9: write missing-handle fh=%d node=%d off=%d n=%d\n", input.Fh, input.NodeId, input.Offset, len(data))
+			return 0, gofuse.ENOENT
 		}
-		fmt.Fprintf(os.Stderr, "drive9: write missing-handle fh=%d node=%d off=%d n=%d\n", input.Fh, input.NodeId, input.Offset, len(data))
-		return 0, gofuse.ENOENT
 	}
 	logPath = fh.Path
 	logIno = fh.Ino
@@ -13337,6 +13399,13 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			}
 			return 0, st
 		}
+	}
+	if fh.Zombie {
+		// A zombie absorbed a late kernel writeback: the data is locally
+		// staged by the normal path above (dirty buffer + shadow
+		// write-through), but no Flush/Fsync/Release will ever drive the
+		// remote commit for this handle again — schedule it.
+		fs.scheduleZombieCommitLocked(fh)
 	}
 	return n, gofuse.OK
 }
@@ -14272,6 +14341,14 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if fh.isExtent() {
 		return fs.extentFsync(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh, int(input.FsyncFlags))
 	}
+	// A reopened fd's fsync must also cover data the kernel wrote back to a
+	// zombie handle of the same inode after the previous close (the mmap
+	// write -> close -> reopen -> fsync sequence under the kernel writeback
+	// cache). Runs before fh.mu is taken: the zombie lock order is
+	// independent (zombie code never takes another handle's mu).
+	if st := fs.syncZombieHandlesForInode(cancel, input.NodeId, fh); st != gofuse.OK {
+		return st
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, fh.Path)
@@ -14724,8 +14801,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			if fh.Prefetch != nil {
 				fh.Prefetch.Close()
 			}
-			fs.deleteFileHandle(input.Fh, fh)
-			fs.cleanupReleasedInode(fh.Ino, fh.Path)
+			// With the kernel writeback cache on, an eligible handle becomes
+			// a zombie instead of being unregistered, so a late kernel
+			// writeback (mmap dirty pages) still lands through the normal
+			// Write path. See writeback_zombie.go.
+			fs.finishReleasedHandle(input.Fh, fh, flushStatus)
 		}()
 		defer func() {
 			fh.Lock()
@@ -14860,7 +14940,14 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			gitState := localPathShouldCheckpointGitState(fh.Path)
 			localPath := fh.Path
 			ino := fh.Ino
-			fh.LocalFile = nil
+			// With the kernel writeback cache on, keep the local fd open: a
+			// late kernel writeback (mmap dirty pages) can still arrive after
+			// RELEASE and must have somewhere to land. finishReleasedHandle
+			// turns the handle into a zombie; purge closes the fd.
+			keepForZombie := fs.kernelWritebackCacheOn() && openedWritable
+			if !keepForZombie {
+				fh.LocalFile = nil
+			}
 			fh.Unlock()
 			if localFile != nil {
 				if gitState && openedWritable {
@@ -14873,8 +14960,10 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					fs.inodes.UpdateSize(ino, info.Size())
 					fs.inodes.UpdateMtime(ino, info.ModTime())
 				}
-				if err := localFile.Close(); err != nil && flushStatus == gofuse.OK {
-					flushStatus = localErrToFuseStatus(err)
+				if !keepForZombie {
+					if err := localFile.Close(); err != nil && flushStatus == gofuse.OK {
+						flushStatus = localErrToFuseStatus(err)
+					}
 				}
 			}
 			if flushStatus == gofuse.OK && gitState && openedWritable {
@@ -14903,10 +14992,16 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(flushSize))
 			flushStatus = fs.flushGitHandleLocked(flushCtx, fh)
 			flushCancel()
+			// Same kernel-writeback rationale as the local-close branch: keep
+			// the fd open so a post-RELEASE writeback can still land; the
+			// zombie purge closes it.
+			keepForZombie := fs.kernelWritebackCacheOn() && localFileHandleOpenedWritable(fh)
 			localFile := fh.LocalFile
-			fh.LocalFile = nil
+			if !keepForZombie {
+				fh.LocalFile = nil
+			}
 			fh.Unlock()
-			if localFile != nil {
+			if localFile != nil && !keepForZombie {
 				if err := localFile.Close(); err != nil && flushStatus == gofuse.OK {
 					flushStatus = localErrToFuseStatus(err)
 				}
@@ -16256,6 +16351,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 // drains the write-back uploader, and waits for inflight async kernel
 // notifications to complete. Used during graceful shutdown.
 func (fs *Dat9FS) FlushAll() {
+	fs.stopZombieJanitor()
 	if fs.extentRT != nil && fs.extentRT.stop != nil {
 		fs.extentRT.stop()
 	}
@@ -16294,6 +16390,11 @@ func (fs *Dat9FS) FlushAll() {
 		e.fh.Unlock()
 		cf()
 	}
+
+	// Retire zombie handles: the flush loop above drained their dirty data;
+	// purge frees the registrations and any kept local fds. No kernel
+	// writeback can arrive during unmount teardown.
+	fs.purgeAllZombies("unmount")
 
 	// Drain git workspace overlay commits queued by interactive writeback.
 	// These include both file payloads and metadata entries such as chmod,

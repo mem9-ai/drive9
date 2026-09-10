@@ -1243,6 +1243,15 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	if opts.WriteBackBatchWindow > 0 && opts.WritePolicy != WritePolicyWriteBack {
 		return fmt.Errorf("mount: WriteBackBatchWindow requires writeback policy")
 	}
+	// The kernel writeback cache buffers write() data in the page cache, so a
+	// write can return before the daemon has seen the bytes. That is
+	// incompatible with write-sync's "remote-durable when write() returns"
+	// contract; refuse the explicit override instead of silently downgrading
+	// the promise. (auto already keeps the cache off for write-sync; see
+	// kernelWritebackCacheEnabled.)
+	if opts.WritebackCache == WritebackCacheOn && opts.WritePolicy == WritePolicyWriteSync {
+		return fmt.Errorf("mount: WritebackCache on is incompatible with write-sync durability")
+	}
 	hasOverlayOptions := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0 || len(opts.PackPaths) > 0
 	if !profileAllowsLocalPolicy(opts.Profile) {
 		if hasOverlayOptions {
