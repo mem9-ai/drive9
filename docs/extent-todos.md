@@ -321,6 +321,7 @@ Everything lives in `/home/ec2-user/night` on the ap-southeast-1 test host (`ssh
 * `mount.sh <profile> <on|off> <tag> [extra args]`, `umount.sh <tag>` — mount/unmount with the cap forced.
 * `sqlite-probe.sh <mount> [cases]` — mptest wal/delete (crash01), threadtest3 walthread2/5, kvtest.
 * `e2e.sh <profile> <cap> <script> [tag]`, `single.sh` — run one `e2e/*.sh` gate with the profile and cap set; `blackbox.sh <profile> <cap> <tag>` runs `community.sqlite` via `blackbox/run.py --server-mode local`.
+* One-shot acceptance for a candidate fork patch: `bash /home/ec2-user/night/accept-fork-patch.sh [tree]` — prints the effective `replace`, builds, then reports the isolated spill seconds, `crash01`'s `Summary: N errors out of M tests`, and the `RESULT:` line of the extent cap-off, extent cap-on and classic cap-off `sqlite-correctness` gates (targets: spill < 10 s, 0/94, 20/20 each).
 * Isolated spill repro (the fastest signal, ~2 min): `/tmp/bigspill2.test` with `$SQLITE_TOOLS/mptester probe.db --sync --journalmode wal --timeout 30000 /tmp/bigspill2.test` inside the mount; SQLite tools are in `/home/ec2-user/bb-work/cache/tools/sqlite/master`.
 
 ---
