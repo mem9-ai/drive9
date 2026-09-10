@@ -44,7 +44,9 @@ func TestFileTasksCtxEmptyTasksIsEmptySlice(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(fileTasksMarkerHeader, "1")
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"path":"/doc.txt","tasks":[]}`))
+		// The server omits tasks entirely (or could send null); the client must
+		// still return a non-nil empty slice so JSON encodes as [].
+		_, _ = w.Write([]byte(`{"path":"/doc.txt"}`))
 	}))
 	defer srv.Close()
 
@@ -100,6 +102,9 @@ func TestFileTasksCtxRejectsRedirectWithoutDownloading(t *testing.T) {
 	_, err := c.FileTasksCtx(context.Background(), "/config.json")
 	if !errors.Is(err, ErrFileTasksUnsupported) {
 		t.Fatalf("err = %v, want ErrFileTasksUnsupported", err)
+	}
+	if !strings.Contains(err.Error(), "redirect to 127.0.0.1") {
+		t.Fatalf("err = %v, want redirect host in message", err)
 	}
 	if objectHits != 0 {
 		t.Fatalf("object served %d times, want 0 (must not follow redirect)", objectHits)
