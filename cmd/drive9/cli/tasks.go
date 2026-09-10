@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"text/tabwriter"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -18,44 +17,24 @@ import (
 //	drive9 fs tasks -o json /path/to/file
 //	drive9 fs tasks :/path/to/file
 func Tasks(c *client.Client, args []string) error {
-	authLocal, args, err := peelObjectAuth(args)
+	const usage = "drive9 fs tasks [-o text|json] <path>"
+	outputFormat, path, err := parseOutputFormatAndPath(args, usage)
 	if err != nil {
 		return err
 	}
-	defer withObjectAuthLocal(authLocal)()
-	outputFormat := "text"
-	path := ""
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch arg {
-		case "-o", "--output":
-			if i+1 >= len(args) {
-				return fmt.Errorf("usage: drive9 fs tasks [-o text|json] [--auth=local|server] <path>")
-			}
-			i++
-			outputFormat = args[i]
-			if outputFormat != "text" && outputFormat != "json" {
-				return fmt.Errorf("unsupported output format %q (want text or json)", outputFormat)
-			}
-		default:
-			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("usage: drive9 fs tasks [-o text|json] [--auth=local|server] <path>")
-			}
-			if path != "" {
-				return fmt.Errorf("usage: drive9 fs tasks [-o text|json] [--auth=local|server] <path>")
-			}
-			path = arg
-		}
+	// Task status is a drive9 concept, so reject object-store URIs (and stdin)
+	// before fsHandleForArg opens an object backend and mints credentials for a
+	// command that can never use them.
+	loc, err := Parse(path)
+	if err != nil {
+		return err
 	}
-	if path == "" {
-		return fmt.Errorf("usage: drive9 fs tasks [-o text|json] [--auth=local|server] <path>")
+	if loc = promoteBareFSArg(loc); loc.Kind == KindObject || loc.Kind == KindStdin {
+		return fmt.Errorf("drive9 fs tasks: only available on drive9 paths")
 	}
 	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
-	}
-	if h.Loc.Kind == KindObject {
-		return fmt.Errorf("drive9 fs tasks: only available on drive9 paths")
 	}
 	c, path = h.Client, h.Path
 	resp, err := c.FileTasksCtx(context.Background(), path)
@@ -67,9 +46,8 @@ func Tasks(c *client.Client, args []string) error {
 		enc.SetIndent("", "  ")
 		return enc.Encode(resp)
 	}
-	if len(resp.Tasks) == 0 {
-		return nil
-	}
+	// Always print the header so an empty result is distinguishable from a
+	// no-op; JSON already encodes an empty result as {"tasks": []}.
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	_, _ = fmt.Fprintln(w, "TASK_TYPE\tSTATUS\tLAST_ERROR")
 	for _, task := range resp.Tasks {
