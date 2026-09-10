@@ -180,11 +180,15 @@ type Dat9FS struct {
 	// gitOverlayTail serializes background git workspace overlay commits so
 	// compound operations such as rename copy+whiteout reach the backend in
 	// the same order they became visible locally.
-	gitOverlayMu      sync.Mutex
-	gitOverlayTail    chan struct{}
-	gitOverlayWG      sync.WaitGroup
-	gitOverlaySeq     atomic.Uint64
-	gitOverlayPending map[string]map[string]pendingGitOverlayEntry
+	gitOverlayMu   sync.Mutex
+	gitOverlayTail chan struct{}
+	gitOverlayWG   sync.WaitGroup
+	gitOverlaySeq  atomic.Uint64
+	// gitOverlayPending records, per workspace and path, the ordered list of
+	// live-relevant local overlay applies that have not been confirmed on the
+	// remote, so a workspace refresh can replay every one of them — not just
+	// the top of the stack. Seq order matches apply order.
+	gitOverlayPending map[string]map[string][]pendingGitOverlayEntry
 	// gitOverlayUnlinkBlocked counts in-flight git Unlink operations per
 	// overlay path. Attempt/committed gens stamp queued upserts so they
 	// stay suppressed after a successful whiteout even once Unlink returns,
@@ -440,7 +444,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		localOverlay:      NewLocalOverlay(opts.LocalRoot),
 		git:               newGitWorkspaceLayer(),
 		gitCheckpoints:    newFlushDebouncer(gitCheckpointDebounce),
-		gitOverlayPending: make(map[string]map[string]pendingGitOverlayEntry),
+		gitOverlayPending: make(map[string]map[string][]pendingGitOverlayEntry),
 		readFlight:        NewSingleFlight(),
 		remoteReadTimeout: fuseTimeout,
 		xattrs:            NewXAttrStore(),

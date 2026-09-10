@@ -4410,6 +4410,13 @@ func (fs *Dat9FS) dropGitOverlayApply(workspaceID, rel string, token uint64) {
 // blockedByWhiteout reports that a whiteout is currently authoritative and the
 // entry was dropped; applied reports the entry was stored.
 func (fs *Dat9FS) applyGitOverlayEntryUnlessWhiteout(workspaceID string, entry client.GitOverlayEntry) (applied, blockedByWhiteout bool) {
+	return fs.applyGitOverlayEntryUnlessWhiteoutWithToken(workspaceID, entry, fs.gitOverlaySeq.Add(1))
+}
+
+// applyGitOverlayEntryUnlessWhiteoutWithToken is applyGitOverlayEntryUnlessWhiteout
+// with a caller-allocated apply token, so the caller can reuse the same token
+// for the matching pending-map record.
+func (fs *Dat9FS) applyGitOverlayEntryUnlessWhiteoutWithToken(workspaceID string, entry client.GitOverlayEntry, token uint64) (applied, blockedByWhiteout bool) {
 	if fs == nil || fs.git == nil {
 		return false, false
 	}
@@ -4424,7 +4431,7 @@ func (fs *Dat9FS) applyGitOverlayEntryUnlessWhiteout(workspaceID string, entry c
 			rt.mu.Unlock()
 			return false, true
 		}
-		rt.pushOverlayApplyLocked(entry, fs.gitOverlaySeq.Add(1), true)
+		rt.pushOverlayApplyLocked(entry, token, true)
 		rt.mu.Unlock()
 		return true, false
 	}
@@ -4449,8 +4456,14 @@ func (fs *Dat9FS) applyGitOverlayMirrorEntry(fh *FileHandle, size int64) {
 		ChecksumSHA256: "",
 		UpdatedAt:      time.Now(),
 	}
-	fs.rememberPendingGitOverlayEntry(fh.GitWorkspaceID, entry)
-	fs.applyGitOverlayEntry(fh.GitWorkspaceID, entry)
+	// One seq stamps both the pending record and the runtime apply token, so
+	// pending order always matches apply order. The mirror's permanent push
+	// prunes every older apply from the runtime stack; the mirror remember
+	// drops their pending records the same way. Remember first: a refresh
+	// landing between the two still replays the entry into the new runtime.
+	seq := fs.gitOverlaySeq.Add(1)
+	fs.rememberPendingGitOverlayMirror(fh.GitWorkspaceID, entry, seq)
+	fs.pushGitOverlayApply(fh.GitWorkspaceID, entry, seq, true)
 }
 
 // applyGitOverlayMirrorEntryUnlessWhiteout is the open-time variant of
@@ -4481,35 +4494,86 @@ func (fs *Dat9FS) applyGitOverlayMirrorEntryUnlessWhiteout(fh *FileHandle, size 
 		ChecksumSHA256: "",
 		UpdatedAt:      time.Now(),
 	}
-	if _, blocked := fs.applyGitOverlayEntryUnlessWhiteout(fh.GitWorkspaceID, entry); blocked {
+	// The seq is allocated at apply time and shared by the runtime apply
+	// token and the pending record, so a pending registration that straggles
+	// behind a same-path recreate keeps its older (apply-time) position
+	// instead of overwriting the recreate's newer record.
+	seq := fs.gitOverlaySeq.Add(1)
+	if _, blocked := fs.applyGitOverlayEntryUnlessWhiteoutWithToken(fh.GitWorkspaceID, entry, seq); blocked {
 		fs.markHandleUnlinkedLocked(fh)
 		return
 	}
 	// Capture the pending seq so registration-time whiteout adoption can drop
 	// only THIS handle's stale pending entry — a legitimate same-path
 	// recreate re-remembers the path with a newer seq and must survive.
-	fh.GitPendingMirrorSeq = fs.rememberPendingGitOverlayEntry(fh.GitWorkspaceID, entry)
+	fh.GitPendingMirrorSeq = seq
+	fs.rememberPendingGitOverlayMirror(fh.GitWorkspaceID, entry, seq)
 }
 
+// rememberPendingGitOverlayEntry records a write-back apply that has not been
+// confirmed on the remote, so mergePendingGitOverlayEntries can replay it into
+// a refreshed runtime. The per-path pending list is kept in seq (apply) order;
+// a write-back apply is non-permanent, so it stacks on top of every earlier
+// record without invalidating them.
 func (fs *Dat9FS) rememberPendingGitOverlayEntry(workspaceID string, entry client.GitOverlayEntry) uint64 {
 	if fs == nil {
 		return 0
 	}
 	seq := fs.gitOverlaySeq.Add(1)
 	fs.gitOverlayMu.Lock()
-	if fs.gitOverlayPending == nil {
-		fs.gitOverlayPending = make(map[string]map[string]pendingGitOverlayEntry)
+	defer fs.gitOverlayMu.Unlock()
+	byPath := fs.pendingGitOverlayByPathLocked(workspaceID)
+	list := byPath[entry.Path]
+	pos := len(list)
+	for pos > 0 && list[pos-1].seq > seq {
+		pos--
 	}
-	byPath := fs.gitOverlayPending[workspaceID]
-	if byPath == nil {
-		byPath = make(map[string]pendingGitOverlayEntry)
-		fs.gitOverlayPending[workspaceID] = byPath
-	}
-	byPath[entry.Path] = pendingGitOverlayEntry{seq: seq, entry: entry}
-	fs.gitOverlayMu.Unlock()
+	list = append(list, pendingGitOverlayEntry{})
+	copy(list[pos+1:], list[pos:])
+	list[pos] = pendingGitOverlayEntry{seq: seq, entry: entry}
+	byPath[entry.Path] = list
 	return seq
 }
 
+// rememberPendingGitOverlayMirror records a dirty-mirror apply with its
+// apply-time seq. A mirror apply is permanent, so its runtime push prunes
+// every older apply for the path from the runtime stack; the pending list
+// mirrors that prune by dropping every older record for the path. Records
+// with a newer seq — a same-path recreate that landed after this apply —
+// survive.
+func (fs *Dat9FS) rememberPendingGitOverlayMirror(workspaceID string, entry client.GitOverlayEntry, seq uint64) {
+	if fs == nil || seq == 0 {
+		return
+	}
+	fs.gitOverlayMu.Lock()
+	defer fs.gitOverlayMu.Unlock()
+	byPath := fs.pendingGitOverlayByPathLocked(workspaceID)
+	list := byPath[entry.Path]
+	pos := 0
+	for pos < len(list) && list[pos].seq < seq {
+		pos++
+	}
+	list = append([]pendingGitOverlayEntry{{seq: seq, entry: entry}}, list[pos:]...)
+	byPath[entry.Path] = list
+}
+
+func (fs *Dat9FS) pendingGitOverlayByPathLocked(workspaceID string) map[string][]pendingGitOverlayEntry {
+	if fs.gitOverlayPending == nil {
+		fs.gitOverlayPending = make(map[string]map[string][]pendingGitOverlayEntry)
+	}
+	byPath := fs.gitOverlayPending[workspaceID]
+	if byPath == nil {
+		byPath = make(map[string][]pendingGitOverlayEntry)
+		fs.gitOverlayPending[workspaceID] = byPath
+	}
+	return byPath
+}
+
+// forgetPendingGitOverlayEntry drops one pending record: exactly the record
+// stamped with seq (a stale request withdrawing its own apply, or whiteout
+// adoption dropping one handle's stale mirror record). seq == 0 drops every
+// record for the path (a sync write landed on the remote and supersedes all
+// older local state).
 func (fs *Dat9FS) forgetPendingGitOverlayEntry(workspaceID, relPath string, seq uint64) {
 	if fs == nil || relPath == "" {
 		return
@@ -4520,29 +4584,74 @@ func (fs *Dat9FS) forgetPendingGitOverlayEntry(workspaceID, relPath string, seq 
 	if byPath == nil {
 		return
 	}
-	pending, ok := byPath[relPath]
-	if !ok || (seq != 0 && pending.seq != seq) {
+	if seq == 0 {
+		delete(byPath, relPath)
+	} else if list := byPath[relPath]; len(list) > 0 {
+		for i := range list {
+			if list[i].seq != seq {
+				continue
+			}
+			list = append(list[:i], list[i+1:]...)
+			break
+		}
+		if len(list) == 0 {
+			delete(byPath, relPath)
+		} else {
+			byPath[relPath] = list
+		}
+	}
+	if len(byPath) == 0 {
+		delete(fs.gitOverlayPending, workspaceID)
+	}
+}
+
+// forgetPendingGitOverlayEntriesThrough drops every pending record for the
+// path up to and including seq. A write-back request whose remote write just
+// landed is made permanent in the runtime, which prunes every apply below it;
+// the pending list mirrors that prune. Newer records still in flight survive.
+func (fs *Dat9FS) forgetPendingGitOverlayEntriesThrough(workspaceID, relPath string, seq uint64) {
+	if fs == nil || relPath == "" || seq == 0 {
 		return
 	}
-	delete(byPath, relPath)
+	fs.gitOverlayMu.Lock()
+	defer fs.gitOverlayMu.Unlock()
+	byPath := fs.gitOverlayPending[workspaceID]
+	if byPath == nil {
+		return
+	}
+	list := byPath[relPath]
+	pos := 0
+	for pos < len(list) && list[pos].seq <= seq {
+		pos++
+	}
+	if pos > 0 {
+		list = append([]pendingGitOverlayEntry(nil), list[pos:]...)
+	}
+	if len(list) == 0 {
+		delete(byPath, relPath)
+	} else {
+		byPath[relPath] = list
+	}
 	if len(byPath) == 0 {
 		delete(fs.gitOverlayPending, workspaceID)
 	}
 }
 
 // mergePendingGitOverlayEntries replays the in-flight write-back entries into a
-// freshly loaded runtime so local state survives a refresh. Each replayed entry
-// keeps its own pending seq as the live writer token: the request that queued it
-// can still recognise and clean up its own entry after the refresh, while a
-// newer same-path writer keeps its token and therefore its entry.
+// freshly loaded runtime so local state survives a refresh. Each path replays
+// its whole pending list in seq (apply) order — a valid recreate sitting under
+// a stale top-of-stack apply must not be lost. Every replayed entry keeps its
+// own pending seq as the live writer token: the request that queued it can
+// still recognise and commit or clean up its own entry after the refresh,
+// while a newer same-path writer keeps its token and therefore its entry.
 func (fs *Dat9FS) mergePendingGitOverlayEntries(workspaceID string, rt *gitWorkspaceRuntime) {
 	if fs == nil || rt == nil {
 		return
 	}
 	fs.gitOverlayMu.Lock()
-	pending := make(map[string]pendingGitOverlayEntry, len(fs.gitOverlayPending[workspaceID]))
-	for rel, entry := range fs.gitOverlayPending[workspaceID] {
-		pending[rel] = entry
+	pending := make(map[string][]pendingGitOverlayEntry, len(fs.gitOverlayPending[workspaceID]))
+	for rel, list := range fs.gitOverlayPending[workspaceID] {
+		pending[rel] = append([]pendingGitOverlayEntry(nil), list...)
 	}
 	fs.gitOverlayMu.Unlock()
 	if len(pending) == 0 {
@@ -4550,8 +4659,10 @@ func (fs *Dat9FS) mergePendingGitOverlayEntries(workspaceID string, rt *gitWorks
 	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	for _, entry := range pending {
-		rt.pushOverlayApplyLocked(entry.entry, entry.seq, false)
+	for _, list := range pending {
+		for _, entry := range list {
+			rt.pushOverlayApplyLocked(entry.entry, entry.seq, false)
+		}
 	}
 }
 
@@ -4804,7 +4915,7 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 				if req.Op == "whiteout" {
 					fs.noteGitOverlayUnlinkCommitted(workspaceID, req.Path)
 				}
-				fs.forgetPendingGitOverlayEntry(workspaceID, req.Path, pendingSeq)
+				fs.forgetPendingGitOverlayEntriesThrough(workspaceID, req.Path, pendingSeq)
 				fs.commitGitOverlayApply(workspaceID, req.Path, pendingSeq)
 			}
 		}()
