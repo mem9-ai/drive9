@@ -55,6 +55,7 @@ Two invariants (**no fix may break these**):
 | P1-7 | High (open) | A file written through an open handle is **invisible to remote readers until close**: `mount drain` reports idle queues and the remote read returns an empty body | `e2e/fuse-smoke-test.sh [9.1]` FAIL; the upload barrier alone does not fix it |
 | P1-8 | High (open) | After `umount` + remount an extent file reads back as **size 0** on the new mount while the server/S3 have the full content | `e2e/fuse-supervision-test.sh [8]` FAIL; extent-only (profile `none` passes) |
 | P1-9 | High (open) | With the kernel writeback cache **off**, concurrent small writes stall the extent write path: `community.sqlite` mptest/threadtest3 fail with `database is locked`, slices sit `freezed:true done:true committed:false` until `flush timeout after waited 5m0s` | Reached by `--durability write-sync` (cache off by design), macFUSE/older kernels that ignore the cap, and any workload whose writes stay small |
+| P1-10 | High (open) | With the kernel writeback cache **on**, the classic-path SQLite correctness suite fails at the mounted `PRAGMA integrity_check` after the rollback workload with `sqlite3.OperationalError: disk I/O error` | `e2e/fuse-sqlite-correctness.sh [6]` FAIL; exposed (not caused) by the classic durability fixes, which let the suite run this far for the first time; passes 20/20 on macFUSE (no real writeback cache), so it is cache-dependent and needs a real-kernel `--debug` diagnosis |
 | P2-1 | Medium | Projection size is not kept in sync (Write only updates `jfs_node.length`) | `ls -l` shows a stale size when the jfs overlay misses |
 | P2-2 | Medium | STS grants that can be narrowed (DeleteObject / multipart / static branch has no IAM / TTL has no jitter / per-process mint) | Over-broad permissions + STS noise |
 | P2-3 | Low | Server-side fallback compactor builds a new Runtime per task (new session never closed) + `WrapS3` reads the whole blob into memory | Session churn, memory spikes |
@@ -280,6 +281,19 @@ A goroutine dump taken while the mount was stalled showed no pending FUSE handle
 
 **Suggested next step**
 Capture `/debug/pprof/goroutine?debug=2` from the mount every 2 s while `mptest` retries, then check whether the slice commit is stuck in the JuiceFS writer, in the forced `flush`+`WaitWrites` barrier of `extentWrite`, or in the server transaction. Fix the starvation rather than relying on the kernel cache.
+
+---
+
+# P1-10 Classic-path SQLite mounted integrity_check fails with disk I/O error under the kernel writeback cache
+
+**Symptom** [verified]
+With the kernel writeback cache **on** (the default auto policy), `e2e/fuse-sqlite-correctness.sh` fails at section `[6]`: the rollback-journal workload completes, then the mounted `PRAGMA integrity_check` raises `sqlite3.OperationalError: disk I/O error`. On a separate EC2 run the same build instead failed one check later — the remounted tree was missing `sqlite/rollback/workload.db` while the remote snapshot held a valid copy — so the failure surface is a read-after-write visibility problem on the SQLite file under the real kernel writeback cache, not a deterministic data-corruption signature.
+
+**Attribution** [verified]
+The same suite passes **20/20 on macFUSE** (which ignores the writeback-cache cap, so there is no real kernel writeback cache), so the failure is writeback-cache-dependent. It is **not a regression from the classic durability fixes** (`4ce69d3a`, `8ccf7a0a`, `2c4ec400`, `bc31ad7a`, `981041d9`): before those fixes the suite never reached section `[6]` on CI — earlier commits failed in the release gate (git clone EIO, hardlink, truncate/unlink) and aborted before the SQLite suite ran. The durability fixes are what let the suite run this far for the first time.
+
+**Next step**
+Reproduce on a real Linux kernel with `FUSE_SQLITE_MOUNT_DEBUG=1` and inspect the mount log for the read that returns EIO — check whether the integrity_check's read-back of `workload.db` (or the replayed `-journal`) hits a missing-handle/orphan writeback, a stale kernel page invalidation, or a torn committed write. The reliable repro is the GitHub runner; EC2+SSM tunnels proved too flaky (mount-readiness races, tunnel drops) to iterate there.
 
 ---
 
