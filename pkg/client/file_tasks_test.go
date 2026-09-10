@@ -135,10 +135,11 @@ func TestFileTasksCtxSameHostRedirectIsNotUnsupported(t *testing.T) {
 	}
 }
 
-// TestSameHostTreatsDefaultPortsAsEqual pins the origin comparison against the
-// spellings httptest cannot produce: a default port on only one side must still
-// be the same origin (an ingress that upgrades the scheme and spells :443/:80),
-// while a genuinely different explicit port stays cross-origin.
+// TestSameHostTreatsDefaultPortsAsEqual pins the host+effective-port comparison
+// against the spellings httptest cannot produce: a default port on only one side
+// must still match (an ingress that upgrades the scheme and spells :443/:80),
+// while a different hostname or explicit port stays cross-host. The scheme is
+// ignored by design, so a scheme upgrade is a match.
 func TestSameHostTreatsDefaultPortsAsEqual(t *testing.T) {
 	cases := []struct {
 		base string
@@ -157,8 +158,8 @@ func TestSameHostTreatsDefaultPortsAsEqual(t *testing.T) {
 		{"https://h.example", "other.example", false},
 	}
 	for _, tc := range cases {
-		if got := sameHost(tc.base, tc.host); got != tc.want {
-			t.Errorf("sameHost(%q, %q) = %t, want %t", tc.base, tc.host, got, tc.want)
+		if got := sameHostAndEffectivePort(tc.base, tc.host); got != tc.want {
+			t.Errorf("sameHostAndEffectivePort(%q, %q) = %t, want %t", tc.base, tc.host, got, tc.want)
 		}
 	}
 }

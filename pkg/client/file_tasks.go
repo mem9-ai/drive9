@@ -23,13 +23,15 @@ const fileTasksMarkerHeader = "X-Dat9-Tasks"
 var ErrFileTasksUnsupported = errors.New("file tasks: server does not support fs tasks (?tasks)")
 
 // errFileTasksUnexpectedRedirect reports a redirect the client refused to
-// follow that is not evidence the server predates ?tasks: a same-origin
-// redirect such as an ingress scheme upgrade. A cross-origin redirect (the
+// follow that is not evidence the server predates ?tasks: a same-host redirect
+// (same hostname and effective port, scheme ignored) such as an ingress scheme
+// upgrade. A cross-origin redirect (a different host and/or explicit port — the
 // object-store fall-through) reports ErrFileTasksUnsupported instead.
 var errFileTasksUnexpectedRedirect = errors.New("file tasks: unexpected redirect")
 
-// IsFileTasksUnexpectedRedirect reports whether err is a same-origin redirect
-// the client refused to follow. Callers can detect it with errors.Is.
+// IsFileTasksUnexpectedRedirect reports whether err is a same-host redirect
+// (same hostname and effective port, scheme ignored) that the client refused to
+// follow.
 func IsFileTasksUnexpectedRedirect(err error) bool {
 	return errors.Is(err, errFileTasksUnexpectedRedirect)
 }
@@ -61,9 +63,10 @@ func (c *Client) FileTasks(path string) (*FileTasksResult, error) {
 // ?tasks, the GET falls through to a plain read that may redirect to object
 // storage. A response is only decoded as a task list when the server sets the
 // X-Dat9-Tasks marker; an unmarked 2xx returns an error matching
-// ErrFileTasksUnsupported. A redirect to a different origin (the object-store
-// case) also matches ErrFileTasksUnsupported, while a same-origin redirect (for
-// example a scheme upgrade) matches IsFileTasksUnexpectedRedirect.
+// ErrFileTasksUnsupported. A redirect to a different host or effective port
+// (the object-store case) also matches ErrFileTasksUnsupported, while a
+// same-host redirect (for example a scheme upgrade) matches
+// IsFileTasksUnexpectedRedirect.
 func (c *Client) FileTasksCtx(ctx context.Context, path string) (*FileTasksResult, error) {
 	req, err := c.newFSRequest(ctx, http.MethodGet, path, "?tasks=1", nil)
 	if err != nil {
@@ -76,13 +79,13 @@ func (c *Client) FileTasksCtx(ctx context.Context, path string) (*FileTasksResul
 	defer func() { _ = resp.Body.Close() }()
 	switch {
 	case resp.StatusCode >= 300 && resp.StatusCode < 400:
-		// A cross-host Location (an object-store redirect) is the strongest
-		// signal that the server predates ?tasks; name the host without ever
-		// dereferencing it. A same-host redirect (for example an http->https
-		// upgrade) is not that signal, so it must not claim the capability is
-		// missing.
+		// A different host or effective port (an object-store redirect) is the
+		// strongest signal that the server predates ?tasks; name the host without
+		// ever dereferencing it. A redirect that is local to this host (for
+		// example an http->https upgrade) is not that signal, so it must not
+		// claim the capability is missing.
 		host := redirectHost(resp)
-		if host != "" && !sameHost(c.baseURL, host) {
+		if host != "" && !sameHostAndEffectivePort(c.baseURL, host) {
 			return nil, fmt.Errorf("%w (HTTP %d redirect to %s)", ErrFileTasksUnsupported, resp.StatusCode, host)
 		}
 		if host == "" {
@@ -115,13 +118,14 @@ func redirectHost(resp *http.Response) string {
 	return u.Host
 }
 
-// sameHost reports whether host resolves to the same origin as baseURL: the
-// hostname compared case-insensitively and the effective port (an explicit
-// port, or the scheme default when one side omits it). A genuinely different
-// explicit port stays cross-origin, so an object-store redirect still maps to
-// ErrFileTasksUnsupported. It is used to tell that redirect apart from an
-// ingress redirect on the same origin.
-func sameHost(baseURL, host string) bool {
+// sameHostAndEffectivePort reports whether host names the same host and
+// effective port as baseURL: the hostname compared case-insensitively and the
+// effective port (an explicit port, or the scheme default when one side omits
+// it). The scheme is deliberately ignored — a same-host http->https upgrade is
+// not evidence the server predates ?tasks. A different hostname or a genuinely
+// different explicit port stays cross-host, so an object-store redirect still
+// maps to ErrFileTasksUnsupported.
+func sameHostAndEffectivePort(baseURL, host string) bool {
 	base, err := url.Parse(baseURL)
 	if err != nil || base.Hostname() == "" {
 		return false
