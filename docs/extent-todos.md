@@ -305,6 +305,8 @@ Proposed fork change, in order of value:
 2. When a drain *is* required (read outside the staged ranges, Fsync, Flush, Release), flush the pending meta batch immediately instead of waiting out the 8 ms window; `WaitWrites` already queues behind the parts, so this only removes timer latency.
 3. Make the two windows configurable (`vfs.Config`) so a mount can trade meta batching for read-after-write latency without a fork release.
 
+Local-replace mechanics (verified the hard way): a fork working copy still declares `module github.com/juicedata/juicefs`, so a scratch tree must point the *original* path at it — `go mod edit -replace github.com/juicedata/juicefs=/path/to/forkcopy` — not at `github.com/mornyx/juicefs`, which fails the module-path check.
+
 Fork working copy: `~/work/juicefs` on the dev machine is a clone of `github.com/mornyx/juicefs` with push access (ADMIN) whose `a53df2a9` is the commit the current `replace` pseudo-version pins. Work there, push a branch, then `go mod edit -replace github.com/hanwen/go-fuse/v2=...`-style bump: `go get github.com/mornyx/juicefs@<sha>` for the meta package replace, rebuild, and verify with the spill repro plus `crash01` before landing.
 
 Acceptance for this item: with `--writeback-cache off`, the isolated spill task returns to single-digit seconds (ext4: 0.2 s; cap-on: 16 s; cap-off today: 81 s) and `mptester crash01.test --journalmode wal` reports `0 errors out of 94 tests`, then the whole `community.sqlite` module passes on the extent profile.
