@@ -326,6 +326,29 @@ With the cap off, `write()` is FUSE direct IO, so every read-back misses the ker
 
 A daemon-side **read-your-writes window** in the fork (`fileWriter`: 4 KiB pages, per-inode budget, filled on write and on store read, served when a read is fully covered, marked committed on flush) fixed the speed: hit rate **98.5 %**, meta calls 22 500 → 500, chunk reads 22 488 → 499, and `mptester crash01.test` reached **`Summary: 0 errors out of 94 tests`** with the cap off. It is **not landable as written**: SQLite then reported `database disk image is malformed` in the isolated spill (the suite still passed, so the corruption is pattern-dependent). A variant that also skipped the writer drain when a read did not touch the window was tried first and reverted (it can serve a reader's stale chunk mapping). The unlanded patch lives only in the scratch clone `~/work/juicefs` (branch `drive9-staged-read-window`) — no fork commit was pushed and drive9's `go.mod` is untouched.
 
+**Why JuiceFS/Cloud pass SQLite with a remote meta, and what our graft is missing** [analysis + measurements]
+JuiceFS Cloud's metadata is remote too, so "meta is local" is not the explanation. Three mechanisms account for it, and our graft satisfies none of them:
+
+| JuiceFS mechanism | Where | Our graft |
+|---|---|---|
+| Cheap per-op meta RPC (pooled Redis/SQL/TiKV or a managed service, sub-ms) | `baseMeta.Read`/`Write` | one HTTP request **plus a server-side TiDB transaction** per op: measured **1.54 ms** per read (`drive9Meta.Read` → `doRead`), 22 500 calls = 34.7 s of a 71 s spill |
+| Data reads served from the client's local cache dir (`--cache-dir`, write-through) | `dataReader`/`cacheStore` | measured **1.39 ms** per read (22 488 calls = 31.2 s): not a local-cache hit profile |
+| Adaptive readahead amortizes lookups over growing windows | `fileReader.checkReadahead` (`reader.go:423-432`), `MaxReadAhead` | exists, but SQLite's page access is not sequential so the window never grows; measured ~10 KiB covered per meta+chunk pair |
+
+Note upstream invalidates the chunk mapping on every write exactly like we do (`baseMeta.Write` → `m.of.InvalidateChunk(inode, indx)`, `pkg/meta/base.go:2168`), so the invalidation is not the defect — the *price of the refetch* is.
+
+Two fork variants were implemented and both are **unlanded because they corrupt data** (SQLite `database disk image is malformed` in the isolated spill, while `crash01` still reported 0/94 in the first one, i.e. pattern-dependent):
+1. daemon-side read/write cache in `fileWriter` + `VFS.Read` (98.5 % hit rate, meta calls 500, chunk reads 499, spill 71 s → 21 s) — corrupted with the meta path untouched, root cause not found;
+2. keep the chunk mapping across our own commit by appending `parts[i].Slice` to `m.of`'s cached list instead of `InvalidateChunk` (`drive9_engine.go:483`) — corrupted immediately (spill fails in 2 s); blind append almost certainly duplicates slices already present in the cached list, so a reconciliation by slice id (or plain invalidate) is required.
+
+Plan, in leverage order, none of which needs a new cache semantics:
+1. Make a read hit the client's local chunk cache (write-through retention of the chunk just written, sane cache quota/eviction); target ≈0.1 ms per read (data leg 31 s → ~2 s).
+2. Batch meta lookups (one HTTP op for several chunks, or prefetch the next K chunks' mappings on a miss); target meta leg 34.7 s → 2-4 s.
+3. Make the server-side read op cheap: a chunk lookup should not need the write-path transaction wrapper (`RunExtentMetaOp`) and the HTTP client should reuse connections; target sub-ms.
+4. Over-fetch one `blockSize` (64 KiB) per block miss and let `sliceReader` serve the following small reads (the mechanism is already there; only the request size is small).
+
+Reference experiment to set the budget before optimising further: mount **stock JuiceFS with a remote meta** on the same host and run the same `mptester crash01` workload with the same instrumentation, to obtain its per-op meta and data-read latencies and readahead hit rate. Our numbers (1.54 ms + 1.39 ms per ~10 KiB read) should be compared against that baseline rather than against zero.
+
 Next attempt should prefer the **read-side cost** over caching, which has no staleness surface: keep the chunk mapping valid across our own commits (append the committed slices to `m.of` instead of `InvalidateChunk` at `drive9_engine.go:483`), and fetch bigger blocks per read so one meta + one chunk read covers more than the measured ~10 KiB. Only then revisit a cache, with the correctness question above answered.
 
 Status of the delegated attempt (2026-09-10): a background implementation session was given this spec (fork clone at `~/work/juicefs`, base `a53df2a9`, push access, the four acceptance cases) and ran for many hours without producing a branch, commit or measurement; it was stopped. The next attempt should be made by a session with a full context budget, following the same spec and finishing with `accept-fork-patch.sh`.
