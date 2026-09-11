@@ -121,6 +121,92 @@ func (s *Store) overlayExtentStat(ctx context.Context, db execer, nf *NodeWithFi
 	nf.File.SizeBytes = length.Int64
 }
 
+// jfsTypeToStatMode maps a JuiceFS node type plus permission bits onto the stat
+// mode a directory entry carries. The projection's inodes.mode is NULL for
+// extent files, so a listing built from it alone would present a symlink as a
+// regular file (git reports that as a typechange).
+func jfsTypeToStatMode(typ uint8, perm uint32) uint32 {
+	kind := uint32(syscall.S_IFREG)
+	switch typ {
+	case jfsTypeDir:
+		kind = uint32(syscall.S_IFDIR)
+	case jfsTypeSymlink:
+		return uint32(syscall.S_IFLNK) | 0o777
+	case jfsTypeFIFO:
+		kind = uint32(syscall.S_IFIFO)
+	case jfsTypeBlock:
+		kind = uint32(syscall.S_IFBLK)
+	case jfsTypeChar:
+		kind = uint32(syscall.S_IFCHR)
+	case jfsTypeSocket:
+		kind = uint32(syscall.S_IFSOCK)
+	}
+	perm &= 0o7777
+	if perm == 0 {
+		if kind == uint32(syscall.S_IFDIR) {
+			perm = 0o755
+		} else {
+			perm = 0o644
+		}
+	}
+	return kind | perm
+}
+
+// overlayExtentStatDir is overlayExtentStat for a directory listing. The
+// per-node query would cost one round trip per entry, and a listing is exactly
+// where the missing size does the most damage: readdirplus hands the kernel
+// size 0 for every extent file, the kernel caches i_size = 0, and every later
+// read of those files returns nothing until the attributes expire.
+func (s *Store) overlayExtentStatDir(ctx context.Context, db execer, parentPath string, entries []*NodeWithFile) error {
+	if parentPath == "" || len(entries) == 0 {
+		return nil
+	}
+	type extentStat struct {
+		length int64
+		mode   uint32
+	}
+	rows, err := db.QueryContext(ctx, `SELECT fn.path, j.length, j.type, j.mode FROM file_nodes fn
+		INNER JOIN jfs_node j ON j.inode = fn.extent_ino
+		WHERE `+s.scope.AndAs("fn", `fn.parent_path_hash = ? AND fn.parent_path = ?`)+`
+		AND fn.extent_ino IS NOT NULL AND fn.extent_ino <> 0`,
+		s.scope.Args(fileNodePathHash(parentPath), parentPath)...)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	stats := make(map[string]extentStat)
+	for rows.Next() {
+		var path string
+		var length sql.NullInt64
+		var typ, perm sql.NullInt64
+		if err := rows.Scan(&path, &length, &typ, &perm); err != nil {
+			return err
+		}
+		if length.Valid {
+			stats[path] = extentStat{length: length.Int64, mode: jfsTypeToStatMode(uint8(typ.Int64), uint32(perm.Int64))}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, nf := range entries {
+		// Directories keep the projection's values: overlayExtentStat skips them
+		// on the single-node path, and readdirplus must not disagree with it.
+		if nf == nil || nf.File == nil || nf.Node.IsDirectory {
+			continue
+		}
+		stat, ok := stats[nf.Node.Path]
+		if !ok {
+			continue
+		}
+		nf.File.SizeBytes = stat.length
+		nf.Mode = stat.mode
+		nf.HasMode = true
+	}
+	return nil
+}
+
 func (s *Store) withExtentStat(ctx context.Context, db execer, nf *NodeWithFile, err error) (*NodeWithFile, error) {
 	if err != nil || nf == nil {
 		return nf, err

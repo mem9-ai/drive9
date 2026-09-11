@@ -1299,6 +1299,7 @@ type execer interface {
 	Query(query string, args ...interface{}) (*sql.Rows, error)
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
 }
 
 // FileStorageMeta holds the lightweight storage metadata needed by upload
@@ -1991,6 +1992,12 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	// inodes.size_bytes stays 0 for extent files until a truncate, so a listing
+	// that does not overlay jfs_node.length reports every extent file as empty
+	// (readdirplus then hands the kernel i_size = 0 and reads return nothing).
+	if err := s.overlayExtentStatDir(ctx, s.db, parentPath, result); err != nil {
+		logger.Warn(ctx, "list_dir_extent_stat_overlay_failed", zap.String("path", parentPath), zap.Error(err))
 	}
 	out = result
 	return out, nil
