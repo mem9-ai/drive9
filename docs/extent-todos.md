@@ -379,6 +379,20 @@ Acceptance on the landed commit (`accept-fork-patch.sh`, tree pinned to `e7a7fe2
 
 Correctness evidence: a verify build recomputed the flush-then-read answer for every fast-path read on a 3-round crash-shaped workload — **30 612 reads compared, 0 byte mismatches** — and a 6-round single-client spill/integrity loop is clean. Two bugs were found and fixed on the way and are worth remembering: serving a *partial* range needs the reader's answer overlaid (not replaced), and the fast path must require `pending == 0` up front; without that precondition a slice whose commit is already queued is neither in the buffer nor in metadata, and reads of its range silently return the previous contents (that one produced `database disk image is malformed` in about one round out of three).
 
+**Root cause of the cap-off "remount visibility" gate failures: readdirplus reported size 0 and no type** [verified, fixed in `datastore: overlay extent size and type on directory listings`]
+`git-ops` (70/74), `fuse-supervision-test` (50/51) and `fuse-sqlite-commit-sequence` failed under the cap-off extent profile — and failed identically with an untouched baseline binary, so they were pre-existing. The mechanism:
+
+* a directory listing (`Store.ListDir`) builds entries from the `file_nodes` projection, whose `inodes.size_bytes` stays **0** for extent files (JuiceFS writes update `jfs_node` only; only the single-node path patches that, via `overlayExtentStat`) and whose `inodes.mode` is **NULL**;
+* readdirplus therefore hands the kernel `size 0` and a regular-file mode for every extent file;
+* the kernel caches that `i_size = 0`, so every later read of those files returns nothing until the attributes expire;
+* a symlink is presented as a regular file, which git reports as a typechange (`T link-to-readme`).
+
+That is why the failures were all "a fresh/remounted mount cannot read what is there": `git status` and the supervision probe both scan a directory before reading.
+
+Reproduced minimally (`dirplus-repro.sh` on the EC2 host): `stat` a file first -> size 109, content correct; `ls -l repo` first -> every entry listed as 0 and the following `cat` returns nothing. Fixed by one batched overlay per listing (`overlayExtentStatDir`): join `jfs_node` on `file_nodes.extent_ino` for the listing's parent, copy `length` onto the entry and map the JuiceFS type onto the entry mode (symlink bits included); directories keep the projection's values so readdirplus cannot disagree with the single-node path.
+
+Verified with the writeback cache off, extent profile: `git-ops-smoke-test` **74/74** (was 70/74), `fuse-supervision-test` **51/51** (was 50/51), `fuse-sqlite-commit-sequence` **19/19** (was failing), and the three `sqlite-correctness` gates stay 20/20.
+
 **Still open on this item**: `crash01` is now corrupt-free but not yet reliably `rc=0` on a loaded host. Its remaining failure is `mptest`'s `--wait all` timeout in `crash02.subtest` line 53, because the client that crashes (`--exit 1`) holds the SQLite write lock while its process exit waits for the daemon to drain that transaction; on the currently loaded EC2 host a 200 MB transaction takes ~35 s while the peers' busy timeout is 10 s. The same test passes on an idle host (0/94, 25–33 s) and its corruption is gone. Two independent facts from this session bound the problem: native JuiceFS 1.4.1 against the same local TiDB + MinIO **also fails** `crash01` with the cap off (300 s timeout, meta ops averaging 5.7 ms, `setlk` in the meta path), and the instance's disk filling to 100 % wedged TiDB and produced spurious corruption — check `df -h /` before trusting any cap-off failure on this host.
 
 The remaining lever is the exit-time drain itself (freeze/commit cost of a large pending buffer), not the read path: meta commits are 992 × 10.4 ms and object PUTs 3 943 × 10 ms of a 37 s spill.

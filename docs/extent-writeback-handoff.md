@@ -21,7 +21,7 @@
 | 第 1 项 cap off 的**读路径** | ✅ 已修复并落地 | fork `e7a7fe2a`：隔离 spill **83–87 s → 37 s**；每读一次的 `writer.Flush` 9 479 次/43.2 s → 891 次/15.7 s；`crash01` 由「`database is locked`」变为 **0 errors / 94 tests**（空闲主机 25–33 s） |
 | 第 1 项 cap off 的**数据损坏** | ✅ 已消除 | 6 轮单客户端 spill + `integrity_check` 全 `ok`；verify 构建逐字节比对 **30 612 次读、0 不一致** |
 | 第 1 项 cap off 的 `crash01` 稳定性 | ⚠️ **未完成** | 主机负载高时 `crash02.subtest` 第 53 行 `--wait all` 超时：崩溃客户端 `--exit 1` 退出时持锁等待 daemon 排空该事务（负载机上 ~35 s），对端 10 s busy timeout 先到期 |
-| 第 1 项 cap off 的其余 gate | ⏳ 部分（失败项已确认是既存问题） | `accept-fork-patch.sh`（pin `e7a7fe2a`）：spill **40 s**、`crash01` rc=1（负载机）、**三个 `sqlite-correctness` 各 20/20**。cap off 的 extent gate：`git-ops` 70/74、`supervision` 50/51、`fuse-sqlite-commit-sequence` 失败 —— **同一主机、同一 profile、用未改动的基线二进制跑出完全相同的失败项**，所以不是本次改动的回归；它们同属「重新挂载后读不到刚写入的内容」这一族（缓存失效）。`blackbox community.sqlite` 仍未测 |
+| 第 1 项 cap off 的其余 gate | ✅ 已修复（readdirplus 属性） | `accept-fork-patch.sh`（pin `e7a7fe2a`）：spill **40 s**、`crash01` rc=1（负载机）、**三个 `sqlite-correctness` 各 20/20**。cap off 的 extent gate：`git-ops` 70/74、`supervision` 50/51、`fuse-sqlite-commit-sequence` 失败 —— **同一主机、同一 profile、用未改动的基线二进制跑出完全相同的失败项**，所以不是本次改动的回归；它们同属「重新挂载后读不到刚写入的内容」这一族（缓存失效）。**已修复**：根因是目录列表只读投影表（extent 文件 `size_bytes`=0、`mode`=NULL），readdirplus 把 i_size=0 交给内核 → 之后所有读都为空、symlink 显示为普通文件（`T`）；列表改为一次性 overlay `jfs_node.length`+类型后：git-ops **74/74**、supervision **51/51**、commit-sequence **19/19**。`blackbox community.sqlite` 正在跑 |
 
 ## 3. 本次落地的改动（fork `e7a7fe2a`；drive9 侧提交 `extent: answer reads from the JuiceFS write buffer`，随历史清洗后 SHA 为 `4c3cb5d5`）
 
