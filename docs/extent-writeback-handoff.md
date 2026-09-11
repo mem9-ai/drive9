@@ -23,7 +23,7 @@
 | 第 1 项 cap off 的 `crash01` 稳定性 | ⚠️ **未完成** | 主机负载高时 `crash02.subtest` 第 53 行 `--wait all` 超时：崩溃客户端 `--exit 1` 退出时持锁等待 daemon 排空该事务（负载机上 ~35 s），对端 10 s busy timeout 先到期 |
 | 第 1 项 cap off 的其余 gate | ⏳ 部分（失败项已确认是既存问题） | `accept-fork-patch.sh`（pin `e7a7fe2a`）：spill **40 s**、`crash01` rc=1（负载机）、**三个 `sqlite-correctness` 各 20/20**。cap off 的 extent gate：`git-ops` 70/74、`supervision` 50/51、`fuse-sqlite-commit-sequence` 失败 —— **同一主机、同一 profile、用未改动的基线二进制跑出完全相同的失败项**，所以不是本次改动的回归；它们同属「重新挂载后读不到刚写入的内容」这一族（缓存失效）。`blackbox community.sqlite` 仍未测 |
 
-## 3. 本次落地的改动（fork `e7a7fe2a`，drive9 侧 `go.mod` + `pkg/extent/lockmem.go`）
+## 3. 本次落地的改动（fork `e7a7fe2a`；drive9 侧提交 `extent: answer reads from the JuiceFS write buffer`，随历史清洗后 SHA 为 `4c3cb5d5`）
 
 `VFS.Read` 过去在读之前无条件 `writer.Flush(inode)`。对 drive9 的 HTTP meta 引擎，这个 flush 是一次元数据提交（HTTP + 一个 TiDB 事务），
 并且会 **finish（封存）该 inode 每个 chunk 的在途 slice**；cap off 下每次 4 KiB 写都到 daemon，于是「写一页→读回」就变成新 slice + 新对象 + 新提交。
@@ -104,4 +104,6 @@
 5. **本地栈的 API key**：`provision()` 每次新建租户；CLI 必须 `HOME=<私有目录>` + `DRIVE9_SERVER`/`DRIVE9_API_KEY`。
 6. **长命令经 ssh 容易被中断**（本机侧连接被断过一次）：长时间用例放成 `setsid nohup bash /path/script.sh > /tmp/x.out 2>&1 &`，再轮询输出。
 7. **server 卡死后的重启**：`/home/ec2-user/night/start-server.sh`（读 `server.env`，过滤掉 `BASH_FUNC_*` 这类多行环境量）；`server.env` 是从旧进程 `/proc/<pid>/environ` 抓的。
-8. **测量前先确认主机不忙**：`uptime` 负载 3.5+ 时同一用例会慢 3–4 倍，`crash01` 的结论会翻转。
+8. **drive9 在 2026-09 做过历史清洗：6 月之后的所有 SHA 都变了**（本次三个提交现在是 `4c3cb5d5` / `4c2a2155` / `b740ac88`）。
+   文档里凡引用 drive9 SHA 的地方都可能过期，按 **commit subject** 检索；fork 仓库（`mornyx/juicefs`）**没有**被重写，`e7a7fe2a` / `a53df2a9` 仍然有效，`go.mod` 的 pin 不用动。
+9. **测量前先确认主机不忙**：`uptime` 负载 3.5+ 时同一用例会慢 3–4 倍，`crash01` 的结论会翻转。
