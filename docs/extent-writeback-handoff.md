@@ -21,7 +21,7 @@
 | 第 1 项 cap off 的**读路径** | ✅ 已修复并落地 | fork `e7a7fe2a`：隔离 spill **83–87 s → 37 s**；每读一次的 `writer.Flush` 9 479 次/43.2 s → 891 次/15.7 s；`crash01` 由「`database is locked`」变为 **0 errors / 94 tests**（空闲主机 25–33 s） |
 | 第 1 项 cap off 的**数据损坏** | ✅ 已消除 | 6 轮单客户端 spill + `integrity_check` 全 `ok`；verify 构建逐字节比对 **30 612 次读、0 不一致** |
 | 第 1 项 cap off 的 `crash01` 稳定性 | ⚠️ **未完成** | 主机负载高时 `crash02.subtest` 第 53 行 `--wait all` 超时：崩溃客户端 `--exit 1` 退出时持锁等待 daemon 排空该事务（负载机上 ~35 s），对端 10 s busy timeout 先到期 |
-| 第 1 项 cap off 的其余 gate | ⏳ 部分 | `accept-fork-patch.sh`（pin 到 `e7a7fe2a` 的树）结果：spill **40 s**（目标 <10 s，原 81 s）、`crash01` rc=1（负载机）、**extent cap-off / extent cap-on / classic cap-off 三个 `sqlite-correctness` 各 20/20**。`git-ops` / `supervision` / on-demand / `blackbox community.sqlite` 尚未在本 fork 上重跑 |
+| 第 1 项 cap off 的其余 gate | ⏳ 部分（失败项已确认是既存问题） | `accept-fork-patch.sh`（pin `e7a7fe2a`）：spill **40 s**、`crash01` rc=1（负载机）、**三个 `sqlite-correctness` 各 20/20**。cap off 的 extent gate：`git-ops` 70/74、`supervision` 50/51、`fuse-sqlite-commit-sequence` 失败 —— **同一主机、同一 profile、用未改动的基线二进制跑出完全相同的失败项**，所以不是本次改动的回归；它们同属「重新挂载后读不到刚写入的内容」这一族（缓存失效）。`blackbox community.sqlite` 仍未测 |
 
 ## 3. 本次落地的改动（fork `e7a7fe2a`，drive9 侧 `go.mod` + `pkg/extent/lockmem.go`）
 
@@ -85,6 +85,7 @@
 ## 7. 未完成 / 未知
 
 - `crash01` 在**空闲主机**上 0 errors/94（cap off，新 fork），在**负载主机**上仍会 `--wait all` 超时；判定标准（用户口径）应写清是「0 errors」还是「rc=0 且无 malformed」。
+- **重新挂载后的可见性**：`git-ops` 的 post-restore 三项、`supervision` 的 `fresh mount reads seeded cache probe bytes`、`commit-sequence` 的 `remounted fingerprint matches` 在基线二进制上同样失败（已 A/B），是 cap-off extent 的另一族既存问题（挂载级缓存失效），与本次读路径改动无关，但 requirement #1 要过全部 gate 就还得处理它。
 - cap off 下 WAL 模式的**多客户端崩溃恢复**仍会打印 `database disk image is malformed`（同一负载下 rollback journal 模式 0 条）：
   在**本 fork 之前**就存在（是否由我的改动引入无法直接 A/B，因为旧二进制在该负载下根本跑不完第一轮就锁超时）。
   它出现在 `crash02.subtest` 的第 2 轮，且该轮末尾的 `integrity_check` 仍报 ok —— 症状像跨进程 WAL/SHM 视图不一致，值得单独查（`-shm` 走 transient local overlay + `FOPEN_KEEP_CACHE`，见 `pkg/fuse`）。
