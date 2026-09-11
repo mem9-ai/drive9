@@ -2144,6 +2144,80 @@ func TestMountCmdMapsDurabilityOption(t *testing.T) {
 	}
 }
 
+func TestMountCmdMapsWritebackCacheOption(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	tests := []struct {
+		name string
+		args []string
+		want fuseWritebackCache
+	}{
+		{name: "default", want: fuseWritebackCacheAuto},
+		{name: "explicit auto", args: []string{"--writeback-cache", "auto"}, want: fuseWritebackCacheAuto},
+		{name: "on", args: []string{"--writeback-cache", "on"}, want: fuseWritebackCacheOn},
+		{name: "off", args: []string{"--writeback-cache", "off"}, want: fuseWritebackCacheOff},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got *mountFuseOptions
+			mountFuse = func(opts *mountFuseOptions) error {
+				copied := *opts
+				got = &copied
+				return nil
+			}
+
+			args := []string{
+				"--foreground",
+				"--mode", "fuse",
+				"--server", "https://drive9.example",
+				"--api-key", "sk-test",
+			}
+			args = append(args, tt.args...)
+			args = append(args, t.TempDir())
+
+			if err := MountCmd(args); err != nil {
+				t.Fatalf("MountCmd: %v", err)
+			}
+			if got == nil {
+				t.Fatal("mountFuse was not called")
+			}
+			if got.WritebackCache != tt.want {
+				t.Fatalf("WritebackCache = %q, want %q", got.WritebackCache, tt.want)
+			}
+		})
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--writeback-cache", "sometimes",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "unknown writeback cache mode") {
+		t.Fatalf("MountCmd error = %v, want writeback cache validation error", err)
+	}
+
+	// --writeback-cache on breaks write-sync's "remote-durable when write()
+	// returns" contract; the combination must be rejected, not honored.
+	err = MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--durability", "write-sync",
+		"--writeback-cache", "on",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--writeback-cache on is incompatible with --durability write-sync") {
+		t.Fatalf("MountCmd error = %v, want write-sync/writeback-cache incompatibility error", err)
+	}
+}
+
 func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
 	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse

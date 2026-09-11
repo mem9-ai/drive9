@@ -44,6 +44,8 @@ const (
 	EnvMountRemoteOnlyPatterns = "DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS"
 	// EnvMountAppendLogPatterns adds newline-delimited append-log mount rules.
 	EnvMountAppendLogPatterns = "DRIVE9_MOUNT_APPEND_LOG_PATTERNS"
+	// EnvMountExtentPatterns adds newline-delimited extent mount rules.
+	EnvMountExtentPatterns = "DRIVE9_MOUNT_EXTENT_PATTERNS"
 )
 
 var (
@@ -189,18 +191,21 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
 	trustProcessLocalEvents := fs.Bool("trust-process-local-events", false, "allow revision-bound GetAttr dir-cache hits using process-local SSE freshness; only safe for single-server/sticky routing or cluster-wide event streams")
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
+	writebackCache := fs.String("writeback-cache", string(fuseWritebackCacheAuto), "kernel FUSE writeback cache: auto (on unless --durability write-sync), on, or off")
 	layerRef := fs.String("layer", "", "mount through writable fs layer (layer id, name, or tag ref)")
 	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
-	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, interactive, or a ~/.drive9/profiles/<name> file")
+	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
 	var localOnlyPatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
 	var appendLogPatterns stringListFlag
+	var extentPatterns stringListFlag
 	var unpackArchives stringListFlag
 	noAutoUnpack := fs.Bool("no-auto-unpack", false, "disable automatic profile pack restore before mounting")
 	fs.Var(&localOnlyPatterns, "local-only", "route matching paths to the local-only overlay; adds to profile rules; repeatable; env $DRIVE9_MOUNT_LOCAL_ONLY_PATTERNS uses one pattern per line")
 	fs.Var(&remoteOnlyPatterns, "remote-only", "force matching paths to remote-persistent storage; overrides local-only routing; repeatable; env $DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS uses one pattern per line")
 	fs.Var(&appendLogPatterns, "append-log", "use append-log sync optimization for matching remote-persistent files; repeatable; env $DRIVE9_MOUNT_APPEND_LOG_PATTERNS uses one pattern per line")
+	fs.Var(&extentPatterns, "extent", "create matching files with content_layout=extent (JuiceFS data plane); repeatable; env $DRIVE9_MOUNT_EXTENT_PATTERNS uses one pattern per line")
 	fs.Var(&unpackArchives, "unpack", "restore a drive9 pack archive into --local-root before mounting (repeatable)")
 	uploadConcurrency := fs.Int("upload-concurrency", 16, "maximum concurrent background uploads issued by FUSE")
 	dirCacheMaxEntries := fs.Int("dir-cache-max-entries", 200000, "maximum entries per directory in namespace cache before complete marking is disabled")
@@ -277,9 +282,19 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	explicitAppendLogPatterns := mergeProfileValues(envAppendLogPatterns, appendLogPatterns)
 	effectiveAppendLogPatterns := explicitAppendLogPatterns
 
+	envExtentPatterns, err := consumeMountPolicyPatternsEnv(EnvMountExtentPatterns)
+	if err != nil {
+		return err
+	}
+	explicitExtentPatterns := mergeProfileValues(envExtentPatterns, extentPatterns)
+	effectiveExtentPatterns := explicitExtentPatterns
+
 	if objectLoc != nil {
 		if len(effectiveAppendLogPatterns) > 0 {
 			return fmt.Errorf("drive9 mount: --append-log is only supported with Drive9 FUSE mounts")
+		}
+		if len(effectiveExtentPatterns) > 0 {
+			return fmt.Errorf("drive9 mount: --extent is only supported with Drive9 FUSE mounts")
 		}
 		if gvisorCompatGiven && *gvisorCompat {
 			return fmt.Errorf("drive9 mount: --gvisor-compat is only supported with Drive9 FUSE mounts")
@@ -344,9 +359,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
-	policyEnvArgs := make([]string, 0, len(envAppendLogPatterns)+len(envLocalOnlyPatterns)+len(envRemoteOnlyPatterns))
+	policyEnvArgs := make([]string, 0, len(envAppendLogPatterns)+len(envExtentPatterns)+len(envLocalOnlyPatterns)+len(envRemoteOnlyPatterns))
 	for _, pattern := range envAppendLogPatterns {
 		policyEnvArgs = append(policyEnvArgs, "--append-log="+pattern)
+	}
+	for _, pattern := range envExtentPatterns {
+		policyEnvArgs = append(policyEnvArgs, "--extent="+pattern)
 	}
 	for _, pattern := range envLocalOnlyPatterns {
 		policyEnvArgs = append(policyEnvArgs, "--local-only="+pattern)
@@ -465,6 +483,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err := validateMountPolicyPatterns(effectiveAppendLogPatterns); err != nil {
 		return err
 	}
+	if len(effectiveExtentPatterns) > 0 && resolved != MountModeFUSE {
+		return fmt.Errorf("drive9 mount: --extent is only supported with Drive9 FUSE mounts")
+	}
+	if err := validateMountPolicyPatterns(effectiveExtentPatterns); err != nil {
+		return err
+	}
 	if *directMountStrict && resolved == MountModeWebDAV {
 		return fmt.Errorf("drive9 mount: --direct-mount-strict is not supported with WebDAV mode")
 	}
@@ -486,6 +510,10 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		return err
 	}
 	effectiveAppendLogPatterns = mergeProfileValues(profileCfg.AppendLogPatterns, effectiveAppendLogPatterns)
+	if err := validateMountPolicyPatterns(profileCfg.ExtentPatterns); err != nil {
+		return err
+	}
+	effectiveExtentPatterns = mergeProfileValues(profileCfg.ExtentPatterns, effectiveExtentPatterns)
 	effectiveLocalOnlyPatterns := mergeProfileValues(profileCfg.LocalOnlyPatterns, envLocalOnlyPatterns, localOnlyPatterns)
 	effectiveRemoteOnlyPatterns := mergeProfileValues(profileCfg.RemoteOnlyPatterns, envRemoteOnlyPatterns, remoteOnlyPatterns)
 	effectivePackPaths := mergeProfileValues(profileCfg.PackPaths)
@@ -493,6 +521,19 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	syncModeVal, writePolicyVal, err := parseFuseDurability(*durability)
 	if err != nil {
 		return err
+	}
+	writebackCacheVal, err := parseFuseWritebackCache(*writebackCache)
+	if err != nil {
+		return err
+	}
+	// The kernel writeback cache buffers write() data in the page cache, so a
+	// write can return before the daemon has seen the bytes. That is
+	// mathematically incompatible with write-sync's "remote-durable when
+	// write() returns" contract; refuse the explicit override instead of
+	// silently downgrading the promise. (auto already leaves the cache off
+	// for write-sync, so only an explicit "on" reaches this check.)
+	if writebackCacheVal == fuseWritebackCacheOn && writePolicyVal == fuseWritePolicyWriteSync {
+		return fmt.Errorf("drive9 mount: --writeback-cache on is incompatible with --durability write-sync (write-sync requires every write() to be remote-durable when it returns)")
 	}
 	if *writeBackBatchWindow > 0 && writePolicyVal != fuseWritePolicyWriteBack {
 		return fmt.Errorf("drive9 mount: --writeback-batch-window requires --durability auto, interactive, or fsync")
@@ -626,6 +667,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			RemoteOnlyPatterns: append([]string(nil), effectiveRemoteOnlyPatterns...),
 			AppendLogPatterns:  append([]string(nil), effectiveAppendLogPatterns...),
 			PackPaths:          append([]string(nil), effectivePackPaths...),
+			ExtentPaths:        append([]string(nil), effectiveExtentPatterns...),
 			ReadOnly:           *readOnly,
 			Debug:              *debug,
 			GVisorCompat:       *gvisorCompat,
@@ -757,6 +799,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			RemoteOnlyPatterns: append([]string(nil), effectiveRemoteOnlyPatterns...),
 			AppendLogPatterns:  append([]string(nil), effectiveAppendLogPatterns...),
 			PackPaths:          append([]string(nil), effectivePackPaths...),
+			ExtentPaths:        append([]string(nil), effectiveExtentPatterns...),
 			ReadOnly:           *readOnly,
 			Debug:              *debug,
 			GVisorCompat:       *gvisorCompat,
@@ -791,6 +834,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		TrustLocalEvents:        *trustProcessLocalEvents,
 		SyncMode:                syncModeVal,
 		WritePolicy:             writePolicyVal,
+		WritebackCache:          writebackCacheVal,
 		Profile:                 profileCfg.Name,
 		LayerRef:                strings.TrimSpace(*layerRef),
 		CheckpointRef:           strings.TrimSpace(*checkpointRef),
@@ -799,6 +843,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		RemoteOnlyPatterns:      append([]string(nil), effectiveRemoteOnlyPatterns...),
 		AppendLogPatterns:       append([]string(nil), effectiveAppendLogPatterns...),
 		PackPaths:               append([]string(nil), effectivePackPaths...),
+		ExtentPaths:             append([]string(nil), effectiveExtentPatterns...),
 		UploadConcurrency:       *uploadConcurrency,
 		DirCacheMaxEntries:      *dirCacheMaxEntries,
 		CommitQueueMaxPending:   *commitQueueMaxPending,
@@ -1023,6 +1068,7 @@ func applyScrubbedMountEnv(scrubbed []string) {
 		EnvMountLocalOnlyPatterns,
 		EnvMountRemoteOnlyPatterns,
 		EnvMountAppendLogPatterns,
+		EnvMountExtentPatterns,
 	} {
 		_ = os.Unsetenv(key)
 	}
@@ -1282,7 +1328,8 @@ func mountBackgroundEnv(environ []string, req mountBackgroundRequest) []string {
 			strings.HasPrefix(kv, EnvTiDBCloudPrivateKey+"=") ||
 			strings.HasPrefix(kv, EnvMountLocalOnlyPatterns+"=") ||
 			strings.HasPrefix(kv, EnvMountRemoteOnlyPatterns+"=") ||
-			strings.HasPrefix(kv, EnvMountAppendLogPatterns+"=") {
+			strings.HasPrefix(kv, EnvMountAppendLogPatterns+"=") ||
+			strings.HasPrefix(kv, EnvMountExtentPatterns+"=") {
 			continue
 		}
 		out = append(out, kv)
@@ -1599,7 +1646,7 @@ func validateMountProfileFlags(profile string, localRoot string, localOnlyPatter
 
 func profileAllowsOverlay(profile string) bool {
 	profile = strings.TrimSpace(profile)
-	return profile != "" && profile != "interactive" && profile != noneMountProfile
+	return profile != "" && profile != "interactive" && profile != noneMountProfile && profile != extentMountProfile
 }
 
 func defaultMountLocalRoot(server string, remoteRoot string, credentialKey string) (string, error) {

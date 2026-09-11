@@ -20,7 +20,7 @@ Each subdirectory is one auto-discovered module (`module.py`), optionally with a
 | `community.mdtest` | performance | mdtest metadata create/stat/remove workload. |
 | `community.pjdfstest` | compatibility | pjdfstest POSIX pass rate. |
 | `community.pyxattr` | compatibility | pyxattr-backed extended attribute checks. |
-| `community.vdbench` | performance | vdbench file workload (manual dependency). |
+| `community.sqlite` | compatibility | Official SQLite `speedtest1`, `mptester`, `threadtest3`, and `kvtest` on a FUSE mount, plus a MAP_SHARED mmap probe. |
 
 The two LTP modules each have their own `module.py` but share the LTP
 dependency logic (`ltp_fs/deps.py`, re-exported by `ltp_syscalls/deps.py`).
@@ -36,17 +36,15 @@ python3 blackbox/run.py --group community
 
 Label filters narrow within a selection. Community-relevant labels include
 `posix` (`community.pjdfstest`), `performance` (`community.fio`,
-community.mdtest, community.vdbench`), and `compatibility`:
+`community.mdtest`), and `compatibility`
+(`community.pjdfstest`, `community.sqlite`, LTP, lock, pyxattr):
 
 ```bash
 python3 blackbox/run.py --group community --label performance
 python3 blackbox/run.py --group community --label posix
 python3 blackbox/run.py --module community.pjdfstest
+python3 blackbox/run.py --module community.sqlite
 ```
-
-`community.vdbench` is a manual-dependency module and is excluded from broad
-selectors unless `INCLUDE_MANUAL=1` is set or it is selected explicitly with
-`--module`.
 
 ## Dependencies
 
@@ -76,8 +74,12 @@ LTP_INSTALL_ROOT=/path/to/ltp-install
 FIO_BIN=/path/to/fio
 MDTEST_BIN=/path/to/mdtest
 MPICC=/path/to/mpicc
-VDBENCH_BIN=/path/to/vdbench       # vdbench is never auto-fetched (Oracle download)
 FSX_BIN=/path/to/fsx
+SPEEDTEST1_BIN=/path/to/speedtest1
+MPTEST_BIN=/path/to/mptester          # upstream binary name is mptester
+KVTEST_BIN=/path/to/kvtest
+THREADTEST3_BIN=/path/to/threadtest3
+SQLITE_SRC=/path/to/sqlite            # source tree with mptest/*.test
 ```
 
 Tunables read via the harness `env_value` helper accept a `BLACKBOX_` prefix
@@ -101,6 +103,29 @@ IOR_REF=4.0.0                       # IOR provides mdtest
 IOR_MAKE_JOBS=2
 IOR_BUILD_TIMEOUT_S=1800
 SECFS_TEST_REF=master               # fsx fallback source
+SQLITE_REF=master                   # sqlite clone ref
+SQLITE_MAKE_JOBS=2
+SQLITE_BUILD_TIMEOUT_S=1800
+SQLITE_SPEEDTEST_SIZE=1             # correctness scale (upstream default is 100)
+SQLITE_SPEEDTEST_JOURNALS=delete,truncate,persist  # WAL is the extra --mmap case
+SQLITE_SPEEDTEST_NOSYNC=1           # speedtest1 skips fsync; mptester --sync keeps durability
+SQLITE_MPTEST_SCRIPTS=multiwrite01.test,crash01.test
+SQLITE_MPTEST_JOURNALS=wal,delete
+SQLITE_MPTEST_REPEAT=1              # upstream `make mptest` uses 20
+SQLITE_MPTEST_BUSY_MS=30000
+SQLITE_TIMEOUT_S=300                # per-case run_cmd timeout
+SQLITE_MMAP_SIZE=4194304            # speedtest1/kvtest --mmap and mmap probe
+SQLITE_THREADTEST_GLOBS=walthread2,walthread5  # short WAL sidecar/copy tests; walthread* is a soak
+SQLITE_KVTEST_COUNT=32
+SQLITE_KVTEST_SIZE=4096             # blob bytes for kvtest init
+SQLITE_KVTEST_JOURNALS=wal,delete
+SQLITE_KVTEST_NOSYNC=1              # kvtest skips fsync; mptester --sync keeps durability
+SQLITE_SKIP_SPEEDTEST=0
+SQLITE_SKIP_MPTEST=0
+SQLITE_SKIP_THREADTEST=0
+SQLITE_SKIP_KVTEST=0
+SQLITE_SKIP_MMAP=0
+SQLITE_FAIL_FAST=0
 ```
 
 `LTP_ROOT` must point to an installed LTP tree containing `kirk` (or `runltp`),
@@ -148,6 +173,30 @@ runners have no IB and MPICH/UCX otherwise fails with `ibv_create_srq`. The IOR 
 compatibility before building mdtest. `community.fsx` fetches and builds
 `secfs.test` to obtain the `fsx` binary, and patches `fsx.c` for glibc builds
 that already provide `strlcpy`/`strlcat` (common on Arch).
+`community.sqlite` fetches [sqlite/sqlite](https://github.com/sqlite/sqlite),
+runs `./configure && make sqlite3.c`, then compiles official `speedtest1`,
+`mptester`, `kvtest`, and `threadtest3`. It is an SQLite-as-filesystem
+**correctness** probe (journal/WAL/locks/mmap/crash), not a throughput
+benchmark. Defaults stay small and skip redundant fsync; `mptester --sync`
+is what still exercises durable commits.
+
+Default cases:
+
+- `speedtest1 --size 1 --nosync --verify` across `delete,truncate,persist`, plus
+  `speedtest1 --journal wal --mmap 4M --nosync`
+- `mptester --sync` running `multiwrite01.test` and `crash01.test` against
+  `wal` and `delete` (the fsync/crash path)
+- `threadtest3 walthread2` + `walthread5` (WAL vs rollback sidecar, WAL copy;
+  ~21s designed. `SQLITE_THREADTEST_GLOBS=walthread*` restores the 81s soak)
+- `kvtest init` + `kvtest run --integrity-check --mmap --update --nosync` for
+  `wal` and `delete` (32×4KiB)
+- a WAL-mode fixture plus a **direct `mmap(MAP_SHARED)` probe** of the main DB
+  (and `.db-shm` if present). SQLite's own `PRAGMA mmap_size` / `--mmap`
+  swallows `ENODEV` and falls back to pread, so the probe is what actually
+  verifies FUSE `CAP_DIRECT_IO_ALLOW_MMAP`.
+
+Binaries stay on the host; only the database files are created on the mount.
+This is separate from the in-house `drive9.sqlite` WAL+mmap remount module.
 
 Dependency metadata (name, source, license, ref) is embedded in each
 module's own `deps.py` and written as `.drive9-blackbox-dependency.json`
@@ -181,8 +230,8 @@ retain their own licenses and notices.
 - **secfs.test / fsx**: https://github.com/billziss-gh/secfs.test — Apache-2.0
 - **fio**: https://github.com/axboe/fio — GPL-2.0-only
 - **IOR / mdtest**: https://github.com/hpc/ior — GPL-2.0-only
-- **vdbench**: Oracle distribution (manual download, not auto-fetched).
+- **SQLite** (`speedtest1`, `mptester`): https://github.com/sqlite/sqlite — public domain ([blessing](https://sqlite.org/copyright.html))
 
-fio, mdtest/IOR, vdbench, Python xattr bindings, and platform tools may be
+fio, mdtest/IOR, Python xattr bindings, and platform tools may be
 provided by the host environment or installed by CI. Their own distribution
 licenses apply.

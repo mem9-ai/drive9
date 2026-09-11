@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mem9-ai/drive9/pkg/extent"
 	"github.com/mem9-ai/drive9/pkg/tagutil"
 )
 
@@ -45,6 +46,9 @@ type Client struct {
 	// raced with concurrent uploads.
 	statusMax    atomic.Int64 // tenant max_upload_bytes from /v1/status; 0 if unavailable
 	statusInline atomic.Int64 // server inline_threshold from /v1/status; 0 if unavailable
+
+	extentMu sync.Mutex
+	extentRT *extent.Runtime
 }
 
 // tenantStatusResponse mirrors the server's TenantStatusResponse JSON shape.
@@ -275,8 +279,9 @@ type FileInfo struct {
 type StorageType string
 
 const (
-	StorageTypeDB9 StorageType = "db9"
-	StorageTypeS3  StorageType = "s3"
+	StorageTypeDB9    StorageType = "db9"
+	StorageTypeS3     StorageType = "s3"
+	StorageTypeExtent StorageType = "extent"
 )
 
 // ContentLayout identifies the server's physical content layout.
@@ -285,6 +290,7 @@ type ContentLayout string
 const (
 	ContentLayoutSingle    ContentLayout = "single"
 	ContentLayoutAppendLog ContentLayout = "append_log"
+	ContentLayoutExtent    ContentLayout = "extent"
 )
 
 type StatResult struct {
@@ -307,6 +313,8 @@ type StatResult struct {
 	// ContentLayout is the server-authoritative physical layout from
 	// X-Dat9-Content-Layout. Empty means the server omitted the header.
 	ContentLayout ContentLayout
+	// ExtentIno is the JuiceFS inode for content_layout=extent files.
+	ExtentIno uint64
 }
 
 // MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
@@ -901,19 +909,15 @@ func (c *Client) Read(path string) ([]byte, error) {
 
 // ReadCtx downloads a file's content with context support.
 func (c *Client) ReadCtx(ctx context.Context, path string) ([]byte, error) {
-	req, err := c.newFSRequest(ctx, http.MethodGet, path, "", nil)
+	// ReadStream validates the path (newFSRequest), follows presigned
+	// redirects, and routes content_layout=extent reads to the JuiceFS data
+	// plane when the server answers 422 with the extent hint.
+	rc, err := c.ReadStream(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode >= 300 {
-		return nil, readError(resp)
-	}
-	return io.ReadAll(resp.Body)
+	defer func() { _ = rc.Close() }()
+	return io.ReadAll(rc)
 }
 
 // ReadAt downloads at most length bytes starting at offset.
@@ -1181,6 +1185,9 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 	s.ResourceID = resp.Header.Get("X-Dat9-Resource-ID")
 	s.StorageType = StorageType(resp.Header.Get("X-Dat9-Storage-Type"))
 	s.ContentLayout = ContentLayout(resp.Header.Get("X-Dat9-Content-Layout"))
+	if ino := resp.Header.Get("X-Dat9-Extent-Ino"); ino != "" {
+		s.ExtentIno, _ = strconv.ParseUint(ino, 10, 64)
+	}
 	s.ChecksumSHA256 = resp.Header.Get("X-Dat9-Checksum-SHA256")
 	if nlink := resp.Header.Get("X-Dat9-Nlink"); nlink != "" {
 		if n, err := strconv.ParseUint(nlink, 10, 32); err == nil {

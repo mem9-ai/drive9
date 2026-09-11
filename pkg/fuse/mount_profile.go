@@ -62,6 +62,48 @@ func ParseWritePolicy(s string) (WritePolicy, error) {
 	}
 }
 
+// WritebackCacheMode selects the kernel FUSE writeback cache
+// (FUSE_WRITEBACK_CACHE) for the mount.
+//
+// The cache is a mount-wide capability: with it the kernel buffers writes and
+// writes back merged ranges, so the daemon sees fewer, larger FUSE WRITE
+// requests. Without it every write() becomes its own WRITE request.
+type WritebackCacheMode string
+
+const (
+	// WritebackCacheAuto enables the cache unless the write policy is
+	// write-sync, whose contract is "durable when write() returns" and cannot
+	// survive the kernel holding the data.
+	WritebackCacheAuto WritebackCacheMode = "auto"
+	// WritebackCacheOn forces the cache on, including on write-sync mounts
+	// (the caller accepts that write() is no longer remote-durable).
+	WritebackCacheOn WritebackCacheMode = "on"
+	// WritebackCacheOff forces the cache off.
+	WritebackCacheOff WritebackCacheMode = "off"
+)
+
+// String returns the writeback cache mode name for CLI/logging.
+func (m WritebackCacheMode) String() string {
+	if m == "" {
+		return string(WritebackCacheAuto)
+	}
+	return string(m)
+}
+
+// ParseWritebackCacheMode converts a CLI string to a WritebackCacheMode.
+func ParseWritebackCacheMode(s string) (WritebackCacheMode, error) {
+	switch s {
+	case "", string(WritebackCacheAuto):
+		return WritebackCacheAuto, nil
+	case string(WritebackCacheOn):
+		return WritebackCacheOn, nil
+	case string(WritebackCacheOff):
+		return WritebackCacheOff, nil
+	default:
+		return WritebackCacheAuto, fmt.Errorf("unknown writeback cache mode %q (valid: auto, on, off)", s)
+	}
+}
+
 // String returns the sync mode name for CLI/logging.
 func (m SyncMode) String() string {
 	switch m {

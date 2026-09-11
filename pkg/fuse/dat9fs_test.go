@@ -9226,6 +9226,95 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 	}
 }
 
+// A write-only local-only handle must still serve the page-fill READ the kernel
+// issues to merge a partial-page write once the FUSE writeback cache is
+// negotiated: git appends a ref-log line at a non-page-aligned offset and the
+// kernel reads the existing page back through the very handle it wrote with.
+// A write-only backing fd answered that READ with EBADF, which the kernel then
+// reported as the caller's write error ("unable to append to '.git/logs/HEAD':
+// Bad file descriptor") and which broke the local-only profiles after remount.
+func TestCodingAgentLocalOverlayWriteOnlyHandleServesWritebackRead(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be used for local-only overlay paths", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	localRoot := t.TempDir()
+	opts := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: localRoot,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.kernelWritebackCache = true
+
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var gitOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Mode:     0o755,
+	}, ".git", &gitOut); st != gofuse.OK {
+		t.Fatalf("Mkdir .git: %v", st)
+	}
+	var logsOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: gitOut.NodeId},
+		Mode:     0o755,
+	}, "logs", &logsOut); st != gofuse.OK {
+		t.Fatalf("Mkdir logs: %v", st)
+	}
+
+	content := []byte("0000000 1111111 drive9 <drive9@example.com> 1700000000 +0000\tcommit\n")
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: logsOut.NodeId},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_APPEND | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "HEAD", &createOut); st != gofuse.OK {
+		t.Fatalf("Create HEAD: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(content)),
+	}, content); st != gofuse.OK {
+		t.Fatalf("Write HEAD: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: logsOut.NodeId}, "HEAD", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup HEAD: %v", st)
+	}
+	var openOut gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_APPEND),
+	}, &openOut); st != gofuse.OK {
+		t.Fatalf("Open HEAD write-only: %v", st)
+	}
+	buf := make([]byte, len(content)+16)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("page-fill Read on write-only handle = %v, want OK", st)
+	}
+	got, _ := result.Bytes(buf)
+	if string(got) != string(content) {
+		t.Fatalf("page-fill Read = %q, want %q", got, content)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+}
+
 func TestFsyncDirRemotePathReturnsOK(t *testing.T) {
 	var remoteCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -9700,8 +9789,35 @@ func TestGoFuseMountOptionsMapsSyncRead(t *testing.T) {
 	if !explicit.SyncRead {
 		t.Fatal("explicit go-fuse SyncRead = false, want true")
 	}
-	if explicit.MaxBackground != 32 {
-		t.Fatalf("MaxBackground = %d, want 32", explicit.MaxBackground)
+	if explicit.MaxBackground != 200 {
+		t.Fatalf("MaxBackground = %d, want JuiceFS GenFuseOpt 200", explicit.MaxBackground)
+	}
+	// The kernel writeback cache is mount-wide and buffers writes in the
+	// kernel, and while it is on the kernel treats a regular file's size, mtime
+	// and ctime as its own (fuse_get_cache_mask), so a change another writer
+	// makes to a cached file is never observed by this mount. auto therefore
+	// leaves it off for every policy, and --writeback-cache on is the explicit
+	// "this mount is the only writer" opt-in; off wins over any policy.
+	linux := runtime.GOOS == "linux"
+	cases := []struct {
+		name string
+		opts *MountOptions
+		want bool
+	}{
+		{"default auto", &MountOptions{}, false},
+		{"interactive", &MountOptions{WritePolicy: WritePolicyWriteBack}, false},
+		{"close-sync", &MountOptions{WritePolicy: WritePolicyCloseSync}, false},
+		{"write-sync auto", &MountOptions{WritePolicy: WritePolicyWriteSync}, false},
+		{"forced on", &MountOptions{WritebackCache: WritebackCacheOn}, linux},
+		{"write-sync forced on", &MountOptions{WritePolicy: WritePolicyWriteSync, WritebackCache: WritebackCacheOn}, linux},
+		{"git workspace forced on", &MountOptions{EnableGitWorkspaces: true, LocalRoot: "/tmp/drive9-wb", WritebackCache: WritebackCacheOn}, linux},
+		{"writeback forced off", &MountOptions{WritebackCache: WritebackCacheOff}, false},
+		{"forced off beats forced on state", &MountOptions{WritebackCache: WritebackCacheOff, WritePolicy: WritePolicyWriteBack}, false},
+	}
+	for _, tc := range cases {
+		if got := newGoFuseMountOptions(tc.opts); got.EnableWriteback != tc.want {
+			t.Fatalf("%s: EnableWriteback = %t, want %t", tc.name, got.EnableWriteback, tc.want)
+		}
 	}
 }
 
@@ -14601,9 +14717,37 @@ func TestSetAttr_WriteBackInteractivePathTruncateStagesAndReturnsBeforeRemoteCom
 
 func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
 	const callerPID = 5151
+	// With a live writer on the inode the truncate must take the synchronous
+	// path (the async staged zero would race the writer's pending commit), so
+	// the test needs a live server that accepts the truncate PUT.
+	var mu sync.Mutex
+	rev := int64(7)
+	content := bytes.Repeat([]byte{0x41}, 8*1024*1024)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			content = append([]byte(nil), body...)
+			rev++
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
 	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
 	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -19991,8 +20135,12 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 		t.Fatalf("SetAttr status = %v, want OK", st)
 	}
 
-	if fh.BaseRev != 2 {
-		t.Fatalf("open handle base revision after path truncate = %d, want 2", fh.BaseRev)
+	// With the caller as the inode's only live writer, the truncate is folded
+	// into the caller's own handle (no remote zero-truncate is committed), so
+	// the open base revision stays and the caller's next commit CAS-succeeds
+	// at it.
+	if fh.BaseRev != 1 {
+		t.Fatalf("open handle base revision after path truncate = %d, want 1 (folded truncate)", fh.BaseRev)
 	}
 	if fh.Streamer != nil {
 		t.Fatal("stream uploader should be reset after adopted zero truncate")
@@ -20023,8 +20171,8 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	if got := string(content); got != "overwrite" {
 		t.Fatalf("remote content = %q, want %q", got, "overwrite")
 	}
-	if revision != 3 {
-		t.Fatalf("remote revision = %d, want 3", revision)
+	if revision != 2 {
+		t.Fatalf("remote revision = %d, want 2", revision)
 	}
 }
 
@@ -20479,8 +20627,10 @@ func TestSetAttr_PathTruncateSingleCallerWriterAdoptsZeroBase(t *testing.T) {
 		t.Fatalf("SetAttr status = %v, want OK", st)
 	}
 
-	if fh.BaseRev != 2 {
-		t.Fatalf("open handle base revision after path truncate = %d, want 2", fh.BaseRev)
+	// Folded truncate: the base revision stays at the open value; the
+	// caller's next commit CAS-succeeds at it (no remote zero is committed).
+	if fh.BaseRev != 1 {
+		t.Fatalf("open handle base revision after path truncate = %d, want 1 (folded truncate)", fh.BaseRev)
 	}
 	if !fh.ZeroBase {
 		t.Fatal("expected same-caller writer handle to adopt zero base")
@@ -20513,8 +20663,8 @@ func TestSetAttr_PathTruncateSingleCallerWriterAdoptsZeroBase(t *testing.T) {
 	if got := string(content); got != "overwrite" {
 		t.Fatalf("remote content = %q, want %q", got, "overwrite")
 	}
-	if revision != 3 {
-		t.Fatalf("remote revision = %d, want 3", revision)
+	if revision != 2 {
+		t.Fatalf("remote revision = %d, want 2", revision)
 	}
 }
 

@@ -65,6 +65,17 @@ func TestDefaultPoolLifetime(t *testing.T) {
 
 }
 
+func TestUserPoolAllowsConcurrentJuiceFSMetaTxns(t *testing.T) {
+	maxOpen, maxIdle := defaultPoolLimits(RoleUser)
+	// Five sqlite clients plus compact/stat/session must not queue on the pool.
+	if maxOpen < 32 {
+		t.Fatalf("user max open = %d, want >=32 (JuiceFS mysql meta is not a 6-conn API pool)", maxOpen)
+	}
+	if maxIdle < 8 {
+		t.Fatalf("user max idle = %d, want >=8 so DELETE exclusive COMMITs reuse conns", maxIdle)
+	}
+}
+
 func TestDefaultPoolLimits(t *testing.T) {
 	maxOpen, maxIdle := defaultPoolLimits(RoleMeta)
 	if maxOpen != defaultMetaMaxOpenConns {

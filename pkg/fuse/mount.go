@@ -35,60 +35,62 @@ import (
 // its entire lifetime (Invariant #3). To change credentials, umount and
 // remount; there is no in-process rebind.
 type MountOptions struct {
-	Server                  string        // drive9 server URL
-	APIKey                  string        // owner API key (mutually exclusive with Token)
-	Token                   string        // delegated capability JWT (mutually exclusive with APIKey)
-	MountPoint              string        // local mount point
-	RemoteRoot              string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
-	CacheDir                string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
-	CacheSize               int64         // ReadCache max size in bytes (default 128MB)
-	ReadCacheMaxFileBytes   int64         // largest single file admitted to ReadCache and fetched whole-file in one request (default 4MiB)
-	ReadCacheTTL            time.Duration // ReadCache TTL (default 30s; negative disables time-based expiry)
-	DiskReadCacheSize       int64         // disk-backed read cache max size in bytes (default 1GiB)
-	DiskReadCacheFreeRatio  float64       // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
-	DirTTL                  time.Duration // DirCache TTL (default 10s)
-	AttrTTL                 time.Duration // kernel attr cache TTL (default 60s)
-	EntryTTL                time.Duration // kernel entry cache TTL (default 60s)
-	NegativeEntryTTL        time.Duration // kernel negative entry cache TTL (default 1s)
-	FlushDebounce           time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
-	SyncMode                SyncMode      // interactive, strict, or auto (default auto)
-	WritePolicy             WritePolicy   // writeback, close-sync, or write-sync (default writeback)
-	Profile                 string        // mount profile: "interactive", "coding-agent", "none", or a custom profile name
-	LayerRef                string        // optional writable fs layer ref (layer_id, name, or tag ref)
-	CheckpointRef           string        // optional checkpoint ref to restore as the layer view baseline
-	LocalRoot               string        // local-only overlay root for overlay-profile mounts
-	LocalOnlyPatterns       []string      // additional local-only path patterns for overlay-profile mounts
-	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for overlay-profile mounts
-	AppendLogPatterns       []string      // remote-persistent files eligible for append-log synchronization
-	PackPaths               []string      // local overlay paths auto-packed after unmount
-	CommitQueueMaxPending   int           // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
-	WriteBackBatchWindow    time.Duration // writeback-only small-file batch window (default 0 disabled)
-	WriteBackBatchMaxFiles  int           // maximum files in one writeback batch (default 64 when enabled)
-	WriteBackBatchMaxBytes  int64         // maximum bytes in one writeback batch (default 4MiB when enabled)
-	WriteCacheFreeRatio     float64       // minimum free-space ratio on cache-dir partition before write-back refuses writes (default 0.10); negative disables
-	WriteCacheSizeMB        int64         // shadow cache byte quota in MB (default 1024 = 1GB); negative disables; shadow writes exceeding this return ENOSPC
-	UploadConcurrency       int           // number of background upload workers (default 4)
-	ReadConcurrency         int           // maximum concurrent backend reads issued by FUSE (default 24)
-	ParallelReadConcurrency int           // maximum concurrent block reads for one large FUSE read (default 4)
-	ParallelReadBlockSize   int64         // block size for parallel large-file reads in bytes (default 1MiB)
-	SyncRead                bool          // disable kernel async read dispatch; at most one read in flight per file handle
-	DirectMountStrict       bool          // Linux only: mount with mount(2) and do not fall back to fusermount
-	GVisorCompat            bool          // enable gVisor-specific FUSE compatibility behavior
-	LookupRetryCount        int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
-	LookupRetryTimeout      time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
-	LegacyDirStatFallback   bool          // on Lookup stat 404, list parent to support legacy servers without directory stat
-	ReadDirPrefetch         bool          // prefetch small files after readdir into ReadCache (default false)
-	PrefetchMaxFiles        int           // maximum files prefetched per directory read (default 32 when enabled)
-	PrefetchMaxFileBytes    int64         // maximum individual file size prefetched (default 50KB)
-	PrefetchMaxBytes        int64         // maximum aggregate bytes prefetched per directory read (default 1MB)
-	PrefetchTimeout         time.Duration // timeout for one readdir prefetch batch (default 1s)
-	DirCacheMaxEntries      int           // maximum entries per directory in DirCache (default 200000); directories exceeding this limit are not cached as complete
-	TrustLocalEvents        bool          // allow revision-bound GetAttr hits from DirCache using process-local SSE freshness; safe only for single-server/sticky or cluster-wide event streams
-	AllowOther              bool          // allow other users to access mount
-	ReadOnly                bool          // mount as read-only
-	Debug                   bool          // enable FUSE debug logging
-	PerfCounters            bool          // print low-overhead FUSE perf counter summary on shutdown
-	EnableGitWorkspaces     bool          // enable fast-clone git workspace overlay discovery
+	Server                  string             // drive9 server URL
+	APIKey                  string             // owner API key (mutually exclusive with Token)
+	Token                   string             // delegated capability JWT (mutually exclusive with APIKey)
+	MountPoint              string             // local mount point
+	RemoteRoot              string             // remote subtree root (default "/"); set via "drive9 mount :/path /local"
+	CacheDir                string             // write-back cache directory (default ~/.cache/drive9); empty string uses default
+	CacheSize               int64              // ReadCache max size in bytes (default 128MB)
+	ReadCacheMaxFileBytes   int64              // largest single file admitted to ReadCache and fetched whole-file in one request (default 4MiB)
+	ReadCacheTTL            time.Duration      // ReadCache TTL (default 30s; negative disables time-based expiry)
+	DiskReadCacheSize       int64              // disk-backed read cache max size in bytes (default 1GiB)
+	DiskReadCacheFreeRatio  float64            // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
+	DirTTL                  time.Duration      // DirCache TTL (default 10s)
+	AttrTTL                 time.Duration      // kernel attr cache TTL (default 60s)
+	EntryTTL                time.Duration      // kernel entry cache TTL (default 60s)
+	NegativeEntryTTL        time.Duration      // kernel negative entry cache TTL (default 1s)
+	FlushDebounce           time.Duration      // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
+	SyncMode                SyncMode           // interactive, strict, or auto (default auto)
+	WritePolicy             WritePolicy        // writeback, close-sync, or write-sync (default writeback)
+	WritebackCache          WritebackCacheMode // kernel FUSE writeback cache: auto (default), on, off
+	Profile                 string             // mount profile: "interactive", "coding-agent", "none", or a custom profile name
+	LayerRef                string             // optional writable fs layer ref (layer_id, name, or tag ref)
+	CheckpointRef           string             // optional checkpoint ref to restore as the layer view baseline
+	LocalRoot               string             // local-only overlay root for overlay-profile mounts
+	LocalOnlyPatterns       []string           // additional local-only path patterns for overlay-profile mounts
+	RemoteOnlyPatterns      []string           // remote-persistent override path patterns for overlay-profile mounts
+	AppendLogPatterns       []string           // remote-persistent files eligible for append-log synchronization
+	PackPaths               []string           // local overlay paths auto-packed after unmount
+	ExtentPaths             []string           // path globs created as content_layout=extent
+	CommitQueueMaxPending   int                // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
+	WriteBackBatchWindow    time.Duration      // writeback-only small-file batch window (default 0 disabled)
+	WriteBackBatchMaxFiles  int                // maximum files in one writeback batch (default 64 when enabled)
+	WriteBackBatchMaxBytes  int64              // maximum bytes in one writeback batch (default 4MiB when enabled)
+	WriteCacheFreeRatio     float64            // minimum free-space ratio on cache-dir partition before write-back refuses writes (default 0.10); negative disables
+	WriteCacheSizeMB        int64              // shadow cache byte quota in MB (default 1024 = 1GB); negative disables; shadow writes exceeding this return ENOSPC
+	UploadConcurrency       int                // number of background upload workers (default 4)
+	ReadConcurrency         int                // maximum concurrent backend reads issued by FUSE (default 24)
+	ParallelReadConcurrency int                // maximum concurrent block reads for one large FUSE read (default 4)
+	ParallelReadBlockSize   int64              // block size for parallel large-file reads in bytes (default 1MiB)
+	SyncRead                bool               // disable kernel async read dispatch; at most one read in flight per file handle
+	DirectMountStrict       bool               // Linux only: mount with mount(2) and do not fall back to fusermount
+	GVisorCompat            bool               // enable gVisor-specific FUSE compatibility behavior
+	LookupRetryCount        int                // detached retries after transient Lookup/GetAttr stat failures (default 2)
+	LookupRetryTimeout      time.Duration      // timeout per detached stat retry after interrupt/transient errors (default 250ms)
+	LegacyDirStatFallback   bool               // on Lookup stat 404, list parent to support legacy servers without directory stat
+	ReadDirPrefetch         bool               // prefetch small files after readdir into ReadCache (default false)
+	PrefetchMaxFiles        int                // maximum files prefetched per directory read (default 32 when enabled)
+	PrefetchMaxFileBytes    int64              // maximum individual file size prefetched (default 50KB)
+	PrefetchMaxBytes        int64              // maximum aggregate bytes prefetched per directory read (default 1MB)
+	PrefetchTimeout         time.Duration      // timeout for one readdir prefetch batch (default 1s)
+	DirCacheMaxEntries      int                // maximum entries per directory in DirCache (default 200000); directories exceeding this limit are not cached as complete
+	TrustLocalEvents        bool               // allow revision-bound GetAttr hits from DirCache using process-local SSE freshness; safe only for single-server/sticky or cluster-wide event streams
+	AllowOther              bool               // allow other users to access mount
+	ReadOnly                bool               // mount as read-only
+	Debug                   bool               // enable FUSE debug logging
+	PerfCounters            bool               // print low-overhead FUSE perf counter summary on shutdown
+	EnableGitWorkspaces     bool               // enable fast-clone git workspace overlay discovery
 	Profiling               ProfilingOptions
 	// RemoteCommitWaitTimeout bounds how long a FUSE write/flush handler waits
 	// for a background commit to finish before proceeding anyway. This prevents
@@ -438,6 +440,10 @@ func Mount(opts *MountOptions) (err error) {
 			mountHash = MountLayerHash(opts.Server, opts.MountPoint, opts.RemoteRoot, opts.LayerRef, opts.CheckpointRef)
 		}
 		dat9fs.appendLogSnapshotRoot = filepath.Join(cacheBase, mountHash, "append-log-snapshots")
+		// The extent data plane keeps its own JuiceFS chunk cache/writeback
+		// staging under the same mount-scoped root (jfs/ inside it), so extent
+		// mounts get writeback even when --cache-dir is not passed.
+		dat9fs.extentCacheDir = filepath.Join(cacheBase, mountHash)
 		readCacheHash := MountReadCacheHash(opts.Server, opts.MountPoint, opts.RemoteRoot, mountCredentialKind(opts), mountCredentialSecret(opts))
 		readCacheDir := filepath.Join(cacheBase, readCacheHash, "read")
 		diskReadCache, err := NewDiskReadCache(DiskReadCacheOptions{
@@ -1237,6 +1243,15 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	if opts.WriteBackBatchWindow > 0 && opts.WritePolicy != WritePolicyWriteBack {
 		return fmt.Errorf("mount: WriteBackBatchWindow requires writeback policy")
 	}
+	// The kernel writeback cache buffers write() data in the page cache, so a
+	// write can return before the daemon has seen the bytes. That is
+	// incompatible with write-sync's "remote-durable when write() returns"
+	// contract; refuse the explicit override instead of silently downgrading
+	// the promise. (auto already keeps the cache off for write-sync; see
+	// kernelWritebackCacheEnabled.)
+	if opts.WritebackCache == WritebackCacheOn && opts.WritePolicy == WritePolicyWriteSync {
+		return fmt.Errorf("mount: WritebackCache on is incompatible with write-sync durability")
+	}
 	hasOverlayOptions := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0 || len(opts.PackPaths) > 0
 	if !profileAllowsLocalPolicy(opts.Profile) {
 		if hasOverlayOptions {
@@ -1509,19 +1524,64 @@ func transientOverlayMountID() string {
 	return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
 }
 
+// kernelWritebackCacheEnabled reports whether the kernel FUSE writeback cache
+// (FUSE_WRITEBACK_CACHE) is enabled for this mount.
+//
+// The cache is mount-wide and buffers writes in the kernel, so a write() can
+// return before the daemon has seen the data. That is compatible with the
+// durability policies that end in an explicit flush — interactive, fsync and
+// close-sync — because the kernel writes the dirty range back to the daemon
+// before the FSYNC/FLUSH/RELEASE that the policy waits on. It is not compatible
+// with write-sync, whose contract is "remote-durable when write() returns", so
+// auto leaves it off there.
+//
+// It matters a lot for databases: without the cache every 4KiB write is its own
+// FUSE WRITE, and a sustained storm of small concurrent writes (SQLite WAL) has
+// to be absorbed by the data plane instead of by the kernel's dirty-range
+// merging. That is the main reason to opt in with --writeback-cache on for a
+// single-writer mount. macFUSE/older kernels ignore the cap.
+//
+// auto also leaves it off, which is the safe default for the multi-writer
+// deployments drive9 is used in: while the cap is on the kernel treats a
+// regular file's i_size, mtime and ctime as its own — fuse_get_cache_mask()
+// returns STATX_MTIME|STATX_CTIME|STATX_SIZE unconditionally for such an inode,
+// so fuse_change_attributes() discards the server's values and skips
+// truncate_pagecache()/auto_inval_data — which means a change another mount, the
+// CLI or a server-side task makes to a file this mount already cached is never
+// observed here (a reader keeps seeing the old size/content, build tools keep
+// seeing the old mtime). Dirty pages also reach the daemon at unpredictable
+// times (after RELEASE for mmap), so write order between mounts is not
+// reconstructable. `--writeback-cache on` is therefore an explicit declaration
+// that the mount is the only writer of the files it touches; it keeps the
+// database write path fast on such a mount.
+func kernelWritebackCacheEnabled(opts *MountOptions) bool {
+	if runtime.GOOS != "linux" || opts == nil {
+		return false
+	}
+	switch opts.WritebackCache {
+	case WritebackCacheOn:
+		return true
+	case WritebackCacheOff:
+		return false
+	default:
+		return false
+	}
+}
+
 func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 	fuseOpts := &gofuse.MountOptions{
 		FsName:             "drive9",
 		Name:               "drive9",
 		MaxReadAhead:       8 * 1024 * 1024, // 8MB — larger readahead reduces FUSE kernel↔userspace switches
 		MaxWrite:           128 * 1024,      // 128KB per write request (default 64KB)
-		MaxBackground:      32,              // concurrent background FUSE requests (default 12)
+		MaxBackground:      200,             // JuiceFS GenFuseOpt MaxBackground
 		SyncRead:           opts.SyncRead,   // disables FUSE_CAP_ASYNC_READ; one read in flight per file handle
 		DirectMountStrict:  opts.DirectMountStrict,
 		EnableLocks:        true,
 		Debug:              opts.Debug,
 		AllowOther:         opts.AllowOther,
 		EnableDirectIoMmap: true, // allow mmap on FOPEN_DIRECT_IO handles (e.g. SQLite *.db with mmap_size>0); no-op on kernels without CAP_DIRECT_IO_ALLOW_MMAP
+		EnableWriteback:    kernelWritebackCacheEnabled(opts),
 	}
 	if runtime.GOOS == "linux" {
 		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively

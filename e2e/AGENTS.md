@@ -231,6 +231,41 @@ needs macFUSE; suites pass `--mode=fuse`. Pass a pre-built server with
 `DRIVE9_SERVER_BIN`. For a long-running server you drive yourself, use
 `make run-server-local` and the scripts below.
 
+Object store for that local server (also used by `make run-server-local`,
+blackbox `--server-mode local`, and `make sdk-integration-tests`):
+
+```bash
+# default: real MinIO on 127.0.0.1:19000, else filesystem mock
+make e2e-local
+DRIVE9_S3_BACKEND=minio make e2e-local   # require MinIO
+DRIVE9_S3_BACKEND=mock make e2e-local    # filesystem mock
+# already have a bucket:
+DRIVE9_S3_BUCKET=... DRIVE9_S3_ENDPOINT=http://127.0.0.1:19000 \
+  DRIVE9_S3_FORCE_PATH_STYLE=true DRIVE9_S3_ACCESS_KEY_ID=... \
+  DRIVE9_S3_SECRET_ACCESS_KEY=... make e2e-local
+bash scripts/local-minio.sh status
+bash scripts/local-minio.sh stop         # named container / recorded pid only
+```
+
+MinIO is reused across runs (like the local TiDB container). Orb/VMs can bind
+`DRIVE9_MINIO_BIND=0.0.0.0` and advertise `DRIVE9_S3_ENDPOINT` for presign.
+
+FUSE suites honor `FUSE_PROFILE` (`drive9 mount --profile`). Example:
+
+```bash
+FUSE_PROFILE=coding-agent-extent make e2e-local
+# sqlite-only:
+FUSE_PROFILE=coding-agent-extent \
+  DRIVE9_LOCAL_E2E_SMOKE_SCRIPT=e2e/fuse-sqlite-correctness.sh make e2e-local
+# full extent sweep (every optional workload + POSIX + the extent e2e):
+FUSE_PROFILE=coding-agent-extent RUN_FUSE_ALL_WORKLOADS=1 \
+  RUN_FUSE_SQLITE_COMMIT_SEQUENCE=1 RUN_POSIX_SMOKE=1 RUN_EXTENT_E2E=1 make e2e-local
+```
+
+`fuse-patch-storage-class.sh` ignores `FUSE_PROFILE` (it needs single-blob PATCH).
+`pack-smoke-test.sh` stays on `portable`. CLI smoke does not mount, so the
+profile does not change `drive9 fs cp`.
+
 ### Prerequisites
 
 - Choose one of the following local validation setups before startup:
@@ -257,9 +292,10 @@ export DRIVE9_LOCAL_DSN='root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true'  
 make run-server-local
 ```
 
-`make run-server-local` sets `DRIVE9_TENANT_PROVIDER=local` and stays attached
-to the foreground. Export any `DRIVE9_*` overrides before invoking it, then run
-the smoke scripts from a second terminal after the server is healthy.
+`make run-server-local` sets `DRIVE9_TENANT_PROVIDER=local`, bootstraps MinIO
+unless `DRIVE9_S3_BUCKET` is already set, and stays attached to the foreground.
+Export any `DRIVE9_*` overrides before invoking it, then run the smoke scripts
+from a second terminal after the server is healthy.
 
 ### Terminal 2: verify health and run E2E
 
@@ -451,6 +487,65 @@ to add a bounded WAL readers/writer detector.
 6. Unmount, remount, and verify the same logical fingerprints
 7. Copy the remote tree back through the CLI and verify snapshot integrity
 8. Preserve run root, mount log, and expected/actual manifests on failure
+
+### `fuse-sqlite-commit-sequence.sh`
+
+Host support: Linux and macOS only. Generic FUSE counterpart to
+`fuse-s3-express-append-log.sh` without Directory Bucket / append-log
+requirements. It is sequential WAL commit correctness, not a throughput gate.
+Honor `FUSE_PROFILE` so the same script covers the default FS and
+`coding-agent-extent`.
+
+1. Provision tenant unless `DRIVE9_API_KEY` is already set
+2. Prepare `drive9` CLI binary (build local or download official release)
+3. Mount a fresh writable namespace with `--mode=fuse --durability fsync`
+   (override with `FUSE_SQLITE_COMMIT_DURABILITY`)
+4. Run N independent SQLite transactions (`FUSE_SQLITE_COMMITS`, default 1000)
+   with `PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL`, one
+   `BEGIN IMMEDIATE` / `INSERT` / `COMMIT` each, and `wal_autocheckpoint=100`
+5. Require WAL to grow, `PRAGMA integrity_check=ok`, and a logical fingerprint
+   of every `id`/`value` row
+6. Reopen on the same mount and verify the fingerprint
+7. Unmount, remount, and verify the fingerprint
+8. Copy the remote tree through the CLI and verify the snapshot fingerprint
+9. Preserve run root, mount log, and expected JSON on failure
+
+Not part of the PR fuse-release-gate. `local-e2e.yml` runs it on post-merge,
+nightly, `run_all_e2e=1`, or `run_fuse_sqlite_commit_sequence=1`. Set
+`RUN_FUSE_SQLITE_COMMIT_SEQUENCE=1` to add it to `fuse-release-gate.sh`.
+
+### `extent-rename-mixed-dir.sh`
+
+Host support: Linux and macOS only. Manual-only: it needs a server whose
+`content_layout=extent` data plane is live (`POST /v1/data-credential` must
+return usable credentials), which the PR-gate local stack does not guarantee.
+Run it with `RUN_EXTENT_E2E=1` in `smoke-all.sh`, or directly with
+`DRIVE9_BASE=... bash e2e/extent-rename-mixed-dir.sh`.
+
+It mounts with a MIXED profile written to a throwaway `$HOME/.drive9/profiles/`
+(`EXTENT_E2E_PATTERNS`, default `*.db`, `*.db-wal`, `*.db-journal`, `*.db-shm`),
+so only matching names become extent and everything else stays single.
+
+1. Provision tenant unless `DRIVE9_API_KEY` is already set
+2. Prepare `drive9` CLI binary (build local or download official release)
+3. Assert `profile show` round-trips the `[extent]` section
+4. A: create a single file, rename it onto a `*.db` name, require the layout to
+   stay `single`, bytes and later appends to stay intact
+5. B: create an extent file, rename it off the pattern, require the layout to
+   stay `extent` with the SAME `X-Dat9-Extent-Ino` and intact bytes
+6. C: build a directory with extent + single children and a subdirectory, then
+   `ls`, rename the directory, and re-verify every child's layout, `extent_ino`,
+   bytes, and writability; finally `rm -rf` it and re-create the path
+7. D: unlink + re-create one extent path and require a NEW `extent_ino`
+8. E: rename extent -> extent inside one directory and require the same inode
+9. Unmount, rename a mixed directory through the CLI (`fs mv`) and delete
+   another tree through the CLI (`fs rm -r`)
+10. Remount: children of the CLI-renamed directory must still read, write, and
+    unlink with stable layout/`extent_ino`; `mkdir` + `rmdir` of the CLI-deleted
+    path must succeed (orphan JuiceFS dir-edge guard)
+11. Optional `EXTENT_E2E_SQL_ORPHAN_CHECK=1` asserts via `POST /v1/sql` that
+    `jfs_edge` holds no leftover edge for the deleted name
+12. Preserve run root and mount log on failure or `EXTENT_E2E_KEEP_ARTIFACTS=1`
 
 ### `fuse-s3-express-append-log.sh`
 
@@ -646,11 +741,13 @@ targeted regression coverage for PATCH-vs-storage-class mismatches
 6. Runs SQLite rollback-journal correctness workload by default; set
    `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip it temporarily while diagnosing
    host-specific FUSE failures
-7. Runs bounded concurrency stress workload only when
+7. Runs sequential WAL FULL commit-sequence only when
+   `RUN_FUSE_SQLITE_COMMIT_SEQUENCE=1`
+8. Runs bounded concurrency stress workload only when
    `RUN_FUSE_CONCURRENCY_STRESS=1`
-8. Runs POSIX/fsx workload only when `RUN_FUSE_POSIX_FSX=1`
-9. Runs threshold-free FUSE performance baseline metrics only when
-   `RUN_FUSE_PERFORMANCE_BASELINE=1`
+9. Runs POSIX/fsx workload only when `RUN_FUSE_POSIX_FSX=1`
+10. Runs threshold-free FUSE performance baseline metrics only when
+    `RUN_FUSE_PERFORMANCE_BASELINE=1`
 
 Set `RUN_FUSE_ALL_WORKLOADS=1` to default the optional concurrency,
 POSIX/fsx, and performance workloads to enabled in one release-gate command.
@@ -765,8 +862,8 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
 | `LARGE_FILE_MB` | `100` | `api-smoke-test.sh` |
 | `BATCH_SMALL_FILE_COUNT` | `10` | `api-smoke-test.sh` |
-| `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
+| `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-sqlite-commit-sequence.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
+| `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-sqlite-commit-sequence.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
 | `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` (defaults to `0` when `DRIVE9_API_KEY` is set) | `api-smoke-test.sh` |
 | `UPLOAD_LIMIT_BYTES` | `10737418240` | `api-smoke-test.sh` |
 | `RUN_SEMANTIC_CHECKS` | `0` | `api-smoke-test.sh` |
@@ -806,6 +903,19 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `RUN_FUSE_SQLITE_WAL` | `0` | `fuse-sqlite-correctness.sh` |
 | `RUN_FUSE_SQLITE_CHURN` | `0` | `fuse-sqlite-correctness.sh` |
 | `RUN_FUSE_SQLITE_CONCURRENCY` | `0` | `fuse-sqlite-correctness.sh` |
+| `RUN_FUSE_SQLITE_COMMIT_SEQUENCE` | `0` | `fuse-release-gate.sh`, `local-e2e.yml` (`1` on post-merge/nightly) |
+| `FUSE_SQLITE_COMMITS` | `1000` | `fuse-sqlite-commit-sequence.sh` |
+| `FUSE_SQLITE_WAL_AUTOCHECKPOINT` | `100` | `fuse-sqlite-commit-sequence.sh` |
+| `FUSE_SQLITE_COMMIT_TIMEOUT_S` | `600` | `fuse-sqlite-commit-sequence.sh` |
+| `FUSE_SQLITE_COMMIT_DURABILITY` | `fsync` | `fuse-sqlite-commit-sequence.sh` |
+| `FUSE_SQLITE_COMMIT_KEEP_ARTIFACTS` | `0` | `fuse-sqlite-commit-sequence.sh` |
+| `RUN_EXTENT_E2E` | `0` | `smoke-all.sh` opt-in extra (`e2e/extent-rename-mixed-dir.sh`) |
+| `EXTENT_E2E_PROFILE` | `extent-mixed` | `extent-rename-mixed-dir.sh` |
+| `EXTENT_E2E_PATTERNS` | `*.db`, `*.db-wal`, `*.db-journal`, `*.db-shm` | `extent-rename-mixed-dir.sh` |
+| `EXTENT_E2E_PAYLOAD_KB` | `256` | `extent-rename-mixed-dir.sh` |
+| `EXTENT_E2E_DURABILITY` | *(CLI default)* | `extent-rename-mixed-dir.sh` |
+| `EXTENT_E2E_SQL_ORPHAN_CHECK` | `0` | `extent-rename-mixed-dir.sh` |
+| `EXTENT_E2E_KEEP_ARTIFACTS` | `0` | `extent-rename-mixed-dir.sh` |
 | `FUSE_CONCURRENCY_WORKERS` | `4` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_FILES_PER_WORKER` | `8` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_READER_WORKERS` | `2` | `fuse-concurrency-stress.sh` |

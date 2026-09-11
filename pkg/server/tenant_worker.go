@@ -547,6 +547,10 @@ func (m *tenantWorkerManager) drainFileGC(ctx context.Context, target *tenantTar
 			}
 		}
 		if !processed {
+			runExtentFileGC(ctx, target.store)
+			runExtentBlockGC(ctx, target.store, b.S3(), target.tenantID)
+			runExtentSessionSweep(ctx, target.store)
+			runExtentCompactFallback(ctx, target.store, b.S3(), target.tenantID)
 			return false
 		}
 	}

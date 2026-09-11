@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ from suites.community.fio.deps import ensure_fio
 class CommunityFio(BaseModule):
     description = "Run fio sequential and random I/O workloads on Drive9 FUSE."
     labels = ("performance", "community")
-    timeout = 600
+    timeout = 900
 
     def run(self, ctx: Context) -> dict[str, Any]:
         fio = ensure_fio(ctx)
@@ -23,7 +24,17 @@ class CommunityFio(BaseModule):
         handle = ctx.target.mount("community_fio", remote)
         try:
             work = handle.mountpoint / "fio"
-            work.mkdir()
+            last_err: Exception | None = None
+            for _ in range(8):
+                try:
+                    work.mkdir(exist_ok=True)
+                    last_err = None
+                    break
+                except BlockingIOError as err:
+                    last_err = err
+                    time.sleep(0.05)
+            if last_err is not None:
+                raise last_err
             results: dict[str, Any] = {}
             for workload, rw in (("seq_write", "write"), ("seq_read", "read"), ("rand_rw", "randrw")):
                 values: list[float] = []

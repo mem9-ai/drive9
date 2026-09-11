@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
 func TestAWSConfigValidate(t *testing.T) {
@@ -140,6 +141,62 @@ func TestS3LogValueHelpers(t *testing.T) {
 	}
 	if got := RoleLogValue("arn:aws:iam::123456789012:role/test"); got != "arn:aws:iam::123456789012:role/test" {
 		t.Fatalf("RoleLogValue(arn) = %q, want %q", got, "arn:aws:iam::123456789012:role/test")
+	}
+}
+
+func TestMintStaticPrefix(t *testing.T) {
+	c := &AWSS3Client{
+		staticAccessKeyID:     "drive9minio",
+		staticSecretAccessKey: "drive9minio",
+		endpoint:              "http://127.0.0.1:19000",
+		bucket:                "drive9-local",
+		region:                "us-east-1",
+		forcePathStyle:        true,
+		prefix:                "tenants/",
+	}
+	if c.CanMintSTS() {
+		t.Fatal("CanMintSTS=true without role")
+	}
+	if !c.CanMintStatic() {
+		t.Fatal("CanMintStatic=false, want true for minio static keys")
+	}
+	out, err := c.MintStaticPrefix("tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.AccessKeyID != "drive9minio" || out.SecretAccessKey != "drive9minio" {
+		t.Fatalf("keys=%q/%q", out.AccessKeyID, out.SecretAccessKey)
+	}
+	if !out.Expiration.IsZero() {
+		t.Fatalf("static creds must not expire, got %v", out.Expiration)
+	}
+	if out.Prefix != "tenants/t/tenant-a/" {
+		t.Fatalf("prefix=%s", out.Prefix)
+	}
+	if out.Endpoint != "http://127.0.0.1:19000" || out.Bucket != "drive9-local" || !out.ForcePathStyle {
+		t.Fatalf("endpoint/bucket/path-style = %s %s %v", out.Endpoint, out.Bucket, out.ForcePathStyle)
+	}
+}
+
+func TestCanMintStaticFalseWithoutEndpointOrKeys(t *testing.T) {
+	if (&AWSS3Client{staticAccessKeyID: "ak", staticSecretAccessKey: "sk"}).CanMintStatic() {
+		t.Fatal("AWS default endpoint must not mint static keys")
+	}
+	if (&AWSS3Client{endpoint: "http://127.0.0.1:19000"}).CanMintStatic() {
+		t.Fatal("missing keys must not mint static")
+	}
+	stsReady := &AWSS3Client{
+		sts:                   &sts.Client{},
+		roleARN:               "arn:aws:iam::1:role/r",
+		staticAccessKeyID:     "ak",
+		staticSecretAccessKey: "sk",
+		endpoint:              "http://127.0.0.1:19000",
+	}
+	if !stsReady.CanMintSTS() {
+		t.Fatal("CanMintSTS=false with role")
+	}
+	if stsReady.CanMintStatic() {
+		t.Fatal("STS-capable client must not fall back to static mint")
 	}
 }
 

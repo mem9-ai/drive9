@@ -150,6 +150,7 @@ start_mount() {
   # summary) lands in MOUNT_LOG; plain `drive9 mount` daemonizes.
   local perf_dir="$RUN_ROOT/perf"
   drive9 mount --mode=fuse --foreground --cache-dir "$CACHE_DIR" --durability interactive \
+    ${FUSE_PROFILE:+--profile} ${FUSE_PROFILE:+"$FUSE_PROFILE"} \
     --perf-dir "$perf_dir" \
     --perf-interval 1h \
     --perf-cpu-duration 1ms \

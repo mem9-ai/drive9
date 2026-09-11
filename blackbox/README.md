@@ -72,7 +72,8 @@ python3 blackbox/run.py --all --label functional
 # Specify a custom drive9 CLI path
 python3 blackbox/run.py --all --bin ./bin/drive9
 
-# Local server mode (user-built server binary, no auto-build)
+# Local server mode (user-built server binary, no auto-build).
+# Default object store is real MinIO (DRIVE9_S3_BACKEND=auto|minio|mock).
 python3 blackbox/run.py --module community.pjdfstest \
   --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server
 
@@ -108,7 +109,8 @@ python3 blackbox/run.py --all --offline
   for running against an existing drive9 deployment.
 - **`local`**: Starts `drive9-server` (`DRIVE9_TENANT_PROVIDER=local`) against
   TiDB (`DRIVE9_LOCAL_DSN`, default `127.0.0.1:4000`, or a `pingcap/tidb`
-  container). Requires `--local-server <path>`
+  container) and a real MinIO (`scripts/local-minio.sh`, default
+  `127.0.0.1:19000`; `DRIVE9_S3_BACKEND=auto|minio|mock`). Requires `--local-server <path>`
   pointing to a pre-built server binary and `--bin <path>` for the CLI. Neither
   binary is built automatically. `--local-server` defaults to `DRIVE9_SERVER_BIN`
   when that env var is set. After healthz the harness `POST /v1/provision`,

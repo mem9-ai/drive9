@@ -60,5 +60,8 @@ jobs:
       - name: Build (server and cli)
         run: make build
 
+      # Use the Makefile target: a bare `go build` skips GO_TAGS, which the
+      # juicefs dependency needs for a CGO-free Windows build (nogspt has no
+      # Windows files upstream, nosqlite's mattn/go-sqlite3 needs CGO).
       - name: Build Windows CLI
-        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o /tmp/drive9-windows-amd64.exe ./cmd/drive9
+        run: make build-cli GOOS=windows GOARCH=amd64 CLI_BIN=/tmp/drive9-windows-amd64.exe

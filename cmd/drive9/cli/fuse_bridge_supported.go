@@ -17,6 +17,10 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 	if err != nil {
 		return err
 	}
+	writebackCache, err := toDrive9FuseWritebackCache(opts.WritebackCache)
+	if err != nil {
+		return err
+	}
 
 	return drive9fuse.Mount(&drive9fuse.MountOptions{
 		Server:                  opts.Server,
@@ -45,6 +49,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		TrustLocalEvents:        opts.TrustLocalEvents,
 		SyncMode:                mode,
 		WritePolicy:             writePolicy,
+		WritebackCache:          writebackCache,
 		Profile:                 opts.Profile,
 		LayerRef:                opts.LayerRef,
 		CheckpointRef:           opts.CheckpointRef,
@@ -53,6 +58,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		RemoteOnlyPatterns:      opts.RemoteOnlyPatterns,
 		AppendLogPatterns:       opts.AppendLogPatterns,
 		PackPaths:               opts.PackPaths,
+		ExtentPaths:             opts.ExtentPaths,
 		UploadConcurrency:       opts.UploadConcurrency,
 		DirCacheMaxEntries:      opts.DirCacheMaxEntries,
 		CommitQueueMaxPending:   opts.CommitQueueMaxPending,
@@ -126,5 +132,18 @@ func toDrive9FuseWritePolicy(policy fuseWritePolicy) (drive9fuse.WritePolicy, er
 		return drive9fuse.WritePolicyWriteSync, nil
 	default:
 		return drive9fuse.WritePolicyWriteBack, fmt.Errorf("unknown write policy %q", policy)
+	}
+}
+
+func toDrive9FuseWritebackCache(mode fuseWritebackCache) (drive9fuse.WritebackCacheMode, error) {
+	switch mode {
+	case "", fuseWritebackCacheAuto:
+		return drive9fuse.WritebackCacheAuto, nil
+	case fuseWritebackCacheOn:
+		return drive9fuse.WritebackCacheOn, nil
+	case fuseWritebackCacheOff:
+		return drive9fuse.WritebackCacheOff, nil
+	default:
+		return drive9fuse.WritebackCacheAuto, fmt.Errorf("unknown writeback cache mode %q", mode)
 	}
 }

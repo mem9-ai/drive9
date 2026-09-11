@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import socket
@@ -36,6 +37,20 @@ class UnmountResult:
     mounted_after: bool
     forced: bool
     seconds: float
+
+
+def resolve_mount_profile(requested: str | None) -> str:
+    """Return the profile a mount will actually use.
+
+    When a module passes no profile (or the implicit default ``coding-agent``),
+    ``FUSE_PROFILE`` replaces it, matching the e2e FUSE suites. An explicit
+    per-module profile such as ``none``, ``portable``, or a custom pack profile
+    is never overridden.
+    """
+    env_profile = os.environ.get("FUSE_PROFILE", "").strip()
+    if env_profile and (requested is None or requested == "" or requested == "coding-agent"):
+        return env_profile
+    return requested or ""
 
 
 def pick_port() -> int:
@@ -99,6 +114,59 @@ def log_tail(path: Path, *, max_chars: int = 1600) -> str:
         return path.read_text(encoding="utf-8", errors="replace").strip()[-max_chars:]
     except OSError:
         return ""
+
+
+_EXPORT_RE = re.compile(r"^export ([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_UNSET_RE = re.compile(r"^unset ([A-Za-z_][A-Za-z0-9_]*)$")
+
+
+def _unquote_shell(raw: str) -> str:
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
+        return raw[1:-1].replace("'\\''", "'")
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        return raw[1:-1]
+    return raw
+
+
+def apply_s3_backend(env: dict[str, str], *, mock_dir: Path) -> dict[str, str]:
+    """Resolve local S3 via scripts/local-minio.sh (MinIO by default, mock fallback)."""
+    out = dict(env)
+    if out.get("DRIVE9_S3_BUCKET", "").strip():
+        progress(f"setup: using existing DRIVE9_S3_BUCKET={out['DRIVE9_S3_BUCKET']}")
+        return out
+    if not out.get("DRIVE9_S3_DIR", "").strip():
+        out["DRIVE9_S3_DIR"] = str(mock_dir)
+    script = REPO_ROOT / "scripts" / "local-minio.sh"
+    result = subprocess.run(
+        ["bash", str(script), "apply"],
+        cwd=str(REPO_ROOT),
+        env=out,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    note = (result.stderr or "").strip()
+    if note:
+        for line in note.splitlines():
+            progress(f"setup: {line}")
+    if result.returncode != 0:
+        detail = f"scripts/local-minio.sh apply failed (exit {result.returncode})"
+        if note:
+            detail += f"\n{note}"
+        raise BlackboxError(detail)
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        unset = _UNSET_RE.match(line)
+        if unset:
+            out.pop(unset.group(1), None)
+            continue
+        export = _EXPORT_RE.match(line)
+        if export:
+            out[export.group(1)] = _unquote_shell(export.group(2))
+    return out
 
 
 class Drive9FuseTargetProvider:
@@ -385,10 +453,10 @@ class Drive9FuseTargetProvider:
                 "DRIVE9_META_DSN": os.environ.get("DRIVE9_META_DSN", dsn),
                 "DRIVE9_LOCAL_MYSQL_DSN": os.environ.get("DRIVE9_LOCAL_MYSQL_DSN", dsn),
                 "DRIVE9_LOCAL_EMBEDDING_MODE": os.environ.get("DRIVE9_LOCAL_EMBEDDING_MODE", "app"),
-                "DRIVE9_S3_DIR": os.environ.get("DRIVE9_S3_DIR", str(self.tmp_dir / "s3")),
                 "DRIVE9_LOG_LEVEL": os.environ.get("DRIVE9_LOG_LEVEL", "warn"),
             }
         )
+        env = apply_s3_backend(env, mock_dir=self.tmp_dir / "s3")
         with log.open("ab") as handle:
             handle.write(f"# {utc_ts()} starting drive9-server at {self.server_url}\n".encode())
             self.server_proc = subprocess.Popen([str(self.server_bin)], cwd=str(REPO_ROOT), env=env, stdout=handle, stderr=handle, start_new_session=True)
@@ -492,9 +560,7 @@ class Drive9FuseTargetProvider:
             path.mkdir(parents=True, exist_ok=True)
         log_dir = self.mount_logs_dir / case / cache_key
         log_dir.mkdir(parents=True, exist_ok=True)
-        # When profile/durability are None, let drive9 use its own defaults
-        # (profile=coding-agent, durability=auto/writeback).
-        effective_profile = profile or ""
+        effective_profile = resolve_mount_profile(profile)
         command = [
             str(self.cli),
             "mount",
@@ -507,7 +573,7 @@ class Drive9FuseTargetProvider:
             command.extend(["--profile", effective_profile])
         if durability:
             command.extend(["--durability", durability])
-        if effective_profile and effective_profile not in ("none", "interactive"):
+        if effective_profile and effective_profile not in ("none", "extent", "interactive"):
             command.extend(["--local-root", str(local_root)])
         if read_only:
             command.append("--read-only")
@@ -519,7 +585,7 @@ class Drive9FuseTargetProvider:
         err = (log_dir / "mount.err").open("ab")
         out.write(f"\n# {utc_ts()} $ {' '.join(command)}\n".encode())
         out.flush()
-        progress(f"mount start: {case}/{cache_key} remote={remote_root} mountpoint={mountpoint} profile={profile or 'default'} durability={durability or 'default'}")
+        progress(f"mount start: {case}/{cache_key} remote={remote_root} mountpoint={mountpoint} profile={effective_profile or 'default'} durability={durability or 'default'}")
         proc = subprocess.Popen(command, cwd=str(REPO_ROOT), env=env, stdout=out, stderr=err, start_new_session=True)
         deadline = time.monotonic() + int(os.environ.get("MOUNT_READY_TIMEOUT_S", "30"))
         next_wait_log = time.monotonic() + 10
@@ -531,7 +597,7 @@ class Drive9FuseTargetProvider:
                     detail += f"\nlast mount stderr:\n{tail}"
                 raise BlackboxError(detail)
             if self.is_mounted(mountpoint):
-                handle = MountHandle(mountpoint=mountpoint, remote_root=remote_root, proc=proc, log_dir=log_dir, cache_dir=cache_dir, local_root=local_root, profile=profile)
+                handle = MountHandle(mountpoint=mountpoint, remote_root=remote_root, proc=proc, log_dir=log_dir, cache_dir=cache_dir, local_root=local_root, profile=effective_profile)
                 self.mounts.append(handle)
                 progress(f"mount ready: {case}/{cache_key} -> {mountpoint}")
                 return handle

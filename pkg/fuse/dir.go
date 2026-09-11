@@ -34,6 +34,7 @@ type CachedFileInfo struct {
 	HasGID     bool
 	ResourceID string
 	Nlink      uint32
+	ExtentIno  uint64 // JuiceFS inode for content_layout=extent files
 }
 
 type namespaceLookupKind uint8
@@ -459,6 +460,9 @@ func mergeCachedOwner(item, existing CachedFileInfo) CachedFileInfo {
 	if !item.HasGID && existing.HasGID {
 		item.Gid = existing.Gid
 		item.HasGID = true
+	}
+	if item.ExtentIno == 0 {
+		item.ExtentIno = existing.ExtentIno
 	}
 	return item
 }

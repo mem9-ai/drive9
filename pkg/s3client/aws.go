@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -23,10 +24,21 @@ import (
 )
 
 type AWSS3Client struct {
-	client  *s3.Client
-	presign *s3.PresignClient
-	bucket  string
-	prefix  string
+	client         *s3.Client
+	presign        *s3.PresignClient
+	sts            *sts.Client
+	bucket         string
+	prefix         string
+	region         string
+	endpoint       string
+	forcePathStyle bool
+	roleARN        string
+	// staticAccessKeyID/staticSecretAccessKey are the keys the server itself
+	// uses. When STS is not configured they are minted to extent clients as a
+	// stand-in session (local MinIO). They are never a tenant-scoped IAM policy.
+	staticAccessKeyID     string
+	staticSecretAccessKey string
+	staticSessionToken    string
 }
 
 type AWSConfig struct {
@@ -162,6 +174,13 @@ func buildS3Client(ctx context.Context, cfg AWSConfig, provider aws.CredentialsP
 
 	loadOptions := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
+		// drive9 streams several uploads (layer objects, large files) from a
+		// non-seekable request body. Since aws-sdk-go-v2 v1.90 the default
+		// request-checksum mode computes a header checksum, which requires a
+		// seekable body (or TLS + trailing checksum) and fails with
+		// "unseekable stream is not supported without TLS and trailing
+		// checksum". Keep the pre-1.90 behavior: only checksum when required.
+		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 		awsconfig.WithHTTPClient(&http.Client{Transport: transport}),
 	}
@@ -189,10 +208,106 @@ func buildS3Client(ctx context.Context, cfg AWSConfig, provider aws.CredentialsP
 	client := s3.NewFromConfig(awsCfg, applyS3Options(cfg))
 	markS3ClientAvailable()
 	return &AWSS3Client{
-		client:  client,
-		presign: s3.NewPresignClient(client),
-		bucket:  cfg.Bucket,
-		prefix:  normalizePrefix(cfg.Prefix),
+		client:                client,
+		presign:               s3.NewPresignClient(client),
+		sts:                   sts.NewFromConfig(awsCfg),
+		bucket:                cfg.Bucket,
+		prefix:                normalizePrefix(cfg.Prefix),
+		region:                cfg.Region,
+		endpoint:              cfg.Endpoint,
+		forcePathStyle:        cfg.ForcePathStyle,
+		roleARN:               cfg.RoleARN,
+		staticAccessKeyID:     cfg.AccessKeyID,
+		staticSecretAccessKey: cfg.SecretAccessKey,
+		staticSessionToken:    cfg.SessionToken,
+	}, nil
+}
+
+// TenantPrefixCreds are short-lived STS keys pinned to t/<tenant>/...
+type TenantPrefixCreds struct {
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string
+	Expiration      time.Time
+	Endpoint        string
+	Bucket          string
+	Region          string
+	ForcePathStyle  bool
+	Prefix          string
+}
+
+func (c *AWSS3Client) CanMintSTS() bool {
+	return c != nil && c.sts != nil && c.roleARN != ""
+}
+
+// CanMintStatic is true for S3-compatible stores that have static keys and no
+// STS role (local MinIO). The client still speaks S3; only the session is
+// the server's static keys plus a tenant prefix, not AssumeRole.
+func (c *AWSS3Client) CanMintStatic() bool {
+	return c != nil && !c.CanMintSTS() && c.staticAccessKeyID != "" && c.staticSecretAccessKey != "" && c.endpoint != ""
+}
+
+func (c *AWSS3Client) tenantPrefix(tenantID string) string {
+	return c.prefix + "t/" + tenantID + "/"
+}
+
+// MintStaticPrefix returns non-expiring S3 credentials for local MinIO. The
+// object store is the same as production; IAM is not scoped.
+func (c *AWSS3Client) MintStaticPrefix(tenantID string) (*TenantPrefixCreds, error) {
+	if !c.CanMintStatic() {
+		return nil, fmt.Errorf("static s3 credentials are not configured")
+	}
+	return &TenantPrefixCreds{
+		AccessKeyID:     c.staticAccessKeyID,
+		SecretAccessKey: c.staticSecretAccessKey,
+		SessionToken:    c.staticSessionToken,
+		Endpoint:        c.endpoint,
+		Bucket:          c.bucket,
+		Region:          c.region,
+		ForcePathStyle:  c.forcePathStyle,
+		Prefix:          c.tenantPrefix(tenantID),
+	}, nil
+}
+
+func (c *AWSS3Client) MintTenantPrefix(ctx context.Context, tenantID string, ttl time.Duration) (*TenantPrefixCreds, error) {
+	if !c.CanMintSTS() {
+		return nil, fmt.Errorf("sts assume-role is not configured")
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	prefix := c.tenantPrefix(tenantID)
+	policy := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::%s/%s*"},{"Effect":"Allow","Action":["s3:ListBucket"],"Resource":"arn:aws:s3:::%s","Condition":{"StringLike":{"s3:prefix":["%s*"]}}}]}`, c.bucket, prefix, c.bucket, prefix)
+	out, err := c.sts.AssumeRole(ctx, &sts.AssumeRoleInput{
+		RoleArn:         aws.String(c.roleARN),
+		RoleSessionName: aws.String("drive9-extent-" + tenantID),
+		DurationSeconds: aws.Int32(int32(ttl.Seconds())),
+		Policy:          aws.String(policy),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("assume role for tenant prefix: %w", err)
+	}
+	if out.Credentials == nil || out.Credentials.AccessKeyId == nil {
+		return nil, fmt.Errorf("assume role returned empty credentials")
+	}
+	exp := time.Now().Add(ttl)
+	if out.Credentials.Expiration != nil {
+		exp = *out.Credentials.Expiration
+	}
+	ep := c.endpoint
+	if ep == "" {
+		ep = "https://s3.amazonaws.com"
+	}
+	return &TenantPrefixCreds{
+		AccessKeyID:     aws.ToString(out.Credentials.AccessKeyId),
+		SecretAccessKey: aws.ToString(out.Credentials.SecretAccessKey),
+		SessionToken:    aws.ToString(out.Credentials.SessionToken),
+		Expiration:      exp,
+		Endpoint:        ep,
+		Bucket:          c.bucket,
+		Region:          c.region,
+		ForcePathStyle:  c.forcePathStyle,
+		Prefix:          prefix,
 	}, nil
 }
 
@@ -447,6 +562,23 @@ func (c *AWSS3Client) PutObject(ctx context.Context, key string, body io.Reader,
 	result := "ok"
 	defer func() { recordS3Operation("put_object", result, start) }()
 
+	// SigV4 over a plain-HTTP endpoint cannot use UNSIGNED-PAYLOAD: the SDK
+	// hashes the body to sign it, which requires a seekable reader. drive9
+	// streams request bodies (layer objects, large uploads), so spool those
+	// to a temp file for the duration of the call. HTTPS endpoints sign with
+	// UNSIGNED-PAYLOAD and keep the streaming behavior.
+	if c.needsSeekableUploadBody() {
+		if _, ok := body.(io.Seeker); !ok {
+			spooled, cleanup, err := spoolUploadBody(body)
+			if err != nil {
+				result = "error"
+				return fmt.Errorf("spool upload body: %w", err)
+			}
+			defer cleanup()
+			body = spooled
+		}
+	}
+
 	in := &s3.PutObjectInput{
 		Bucket:        &c.bucket,
 		Key:           aws.String(c.fullKey(key)),
@@ -463,6 +595,34 @@ func (c *AWSS3Client) PutObject(ctx context.Context, key string, body io.Reader,
 		return fmt.Errorf("put object: %w", err)
 	}
 	return nil
+}
+
+// needsSeekableUploadBody reports whether PutObject has to hand the SDK a
+// seekable body: only plain-HTTP endpoints sign the payload itself.
+func (c *AWSS3Client) needsSeekableUploadBody() bool {
+	return !strings.HasPrefix(strings.ToLower(strings.TrimSpace(c.endpoint)), "https://")
+}
+
+// spoolUploadBody copies a non-seekable upload stream into a temp file and
+// returns it rewound to the start, plus a cleanup func.
+func spoolUploadBody(body io.Reader) (*os.File, func(), error) {
+	f, err := os.CreateTemp("", "drive9-upload-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	}
+	if _, err := io.Copy(f, body); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return f, cleanup, nil
 }
 
 func applyEncryptionToCreateMultipartUploadInput(in *s3.CreateMultipartUploadInput, encOpts EncryptionOpts) error {

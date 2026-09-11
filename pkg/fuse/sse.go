@@ -116,6 +116,7 @@ func (w *SSEWatcher) handleChange(ce *client.ChangeEvent) {
 
 	// Invalidate read cache and resolved read targets for the changed file.
 	w.fs.invalidateReadCacheAndTargets(p)
+	w.fs.invalidateExtentReaders(p)
 
 	// Invalidate directory cache for the parent directory.
 	w.fs.dirCache.Invalidate(parentDir(p))

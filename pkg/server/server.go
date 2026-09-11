@@ -200,6 +200,8 @@ type Server struct {
 	tenantPoolMaxSize         int
 	tenantPoolRefillFreeRatio float64
 	inlineThreshold           int64
+	localS3                   *s3client.LocalS3Client
+	s3Dir                     string
 	metrics                   *serverMetrics
 	logger                    *zap.Logger
 	mux                       *http.ServeMux
@@ -424,6 +426,8 @@ func NewWithConfig(cfg Config) *Server {
 		tenantPoolMaxSize:         tenantPoolMaxSize,
 		tenantPoolRefillFreeRatio: tenantPoolRefillFreeRatio,
 		inlineThreshold:           inlineThreshold,
+		localS3:                   cfg.LocalS3,
+		s3Dir:                     cfg.S3Dir,
 		metrics:                   newServerMetrics(),
 		logger:                    srvLog,
 		events:                    newEventBuses(),
@@ -506,6 +510,8 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/layers/", business)
 	mux.Handle("/v1/layer-checkpoints/", business)
 	mux.Handle("/v1/object-credentials", business)
+	mux.Handle("/v1/extent/meta", business)
+	mux.Handle("/v1/data-credential", business)
 	// Vault management API goes through tenant auth.
 	mux.Handle("/v1/vault/secrets", business)
 	mux.Handle("/v1/vault/secrets/", business)
@@ -1570,6 +1576,10 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleFSLayers(w, r)
 	case r.URL.Path == "/v1/object-credentials":
 		s.handleObjectCredentials(w, r)
+	case r.URL.Path == "/v1/extent/meta":
+		s.handleExtentMeta(w, r)
+	case r.URL.Path == "/v1/data-credential":
+		s.handleDataCredential(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
@@ -2173,6 +2183,17 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "read_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_read", "result", "error")
 		writeBackendError(w, r, err)
+		return
+	}
+
+	if plan.ExtentIno != 0 {
+		w.Header().Set("X-Dat9-Content-Layout", "extent")
+		w.Header().Set("X-Dat9-Storage-Type", "extent")
+		w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(plan.ExtentIno, 10))
+		w.Header().Set("X-Dat9-Extent-Length", strconv.FormatInt(plan.Size, 10))
+		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_extent_hint", "path", path, "extent_ino", plan.ExtentIno, "size", plan.Size)...)
+		metricEvent(r.Context(), "fs_read", "result", "ok")
+		errJSON(w, http.StatusUnprocessableEntity, "extent content is not served inline")
 		return
 	}
 
@@ -3406,6 +3427,12 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	}
 	if nlink > 0 {
 		w.Header().Set("X-Dat9-Nlink", strconv.FormatUint(uint64(nlink), 10))
+	}
+	if proj, perr := b.Store().GetExtentProjection(r.Context(), path); perr == nil && proj != nil && proj.ContentLayout != "" {
+		w.Header().Set("X-Dat9-Content-Layout", string(proj.ContentLayout))
+		if proj.ExtentIno != 0 {
+			w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(proj.ExtentIno, 10))
+		}
 	}
 	if nf.File != nil {
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(nf.File.Revision, 10))

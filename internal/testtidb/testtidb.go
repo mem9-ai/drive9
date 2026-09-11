@@ -190,6 +190,21 @@ var resetDeleteQueries = []string{
 	"DELETE FROM inodes",
 	"DELETE FROM contents",
 	"DELETE FROM semantic",
+	"DELETE FROM jfs_edge",
+	"DELETE FROM jfs_chunk",
+	"DELETE FROM jfs_chunk_ref",
+	"DELETE FROM jfs_delslices",
+	"DELETE FROM jfs_sustained",
+	"DELETE FROM jfs_delfile",
+	"DELETE FROM jfs_flock",
+	"DELETE FROM jfs_plock",
+	"DELETE FROM jfs_dir_stats",
+	"DELETE FROM jfs_session2",
+	"DELETE FROM jfs_setting",
+	"DELETE FROM jfs_counter",
+	"DELETE FROM jfs_node",
+	"DELETE FROM slice_compact_tasks",
+	"DELETE FROM block_gc_tasks",
 }
 
 // ResetDBWithoutFiles is like ResetDB but for tests that intentionally drop

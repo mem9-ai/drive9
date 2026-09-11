@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -152,6 +153,7 @@ type Store struct {
 	db             *sql.DB
 	useLegacyFiles bool // true when the legacy `files` table exists and needs dual-write
 	scope          Scope
+	jfsInited      atomic.Bool
 }
 
 func Open(dsn string) (*Store, error) {
@@ -370,6 +372,13 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 	if hasChildren {
 		return fmt.Errorf("%w: %s", ErrDirectoryNotEmpty, path)
 	}
+	// The projection is empty, but the jfs tree may still hold this
+	// directory's edge (a previous rm -r/mv only touched file_nodes). Remove
+	// it in the same transaction or the next mkdir+rmdir fails ENOTEMPTY.
+	extentIno, err := s.dirExtentInoTx(ctx, tx, path)
+	if err != nil {
+		return err
+	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ? AND is_directory = 1`),
 		s.scope.Args(fileNodePathHash(path), path)...)
 	if err != nil {
@@ -378,6 +387,9 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return ErrNotFound
+	}
+	if err := s.jfsDeleteSubtreeTx(tx, extentIno); err != nil {
+		return err
 	}
 	err = tx.Commit()
 	return err
@@ -672,7 +684,36 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 		if hasChild {
 			return 0, ErrPathConflict
 		}
+		// The overwritten destination may still own a jfs subtree; drop it
+		// together with its projection row.
+		var dstExtentIno uint64
+		_ = tx.QueryRowContext(ctx, `SELECT COALESCE(extent_ino, 0) FROM file_nodes WHERE `+
+			s.scope.And(`node_id = ?`), s.scope.Args(dst.nodeID)...).Scan(&dstExtentIno)
 		if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(`node_id = ?`), s.scope.Args(dst.nodeID)...); err != nil {
+			return 0, err
+		}
+		if err := s.jfsDeleteSubtreeTx(tx, dstExtentIno); err != nil {
+			return 0, err
+		}
+	}
+
+	// Move the directory's jfs edge in the same transaction: children are
+	// keyed by parent inode, so a FUSE-side second step is unnecessary and
+	// non-FUSE renames (CLI/HTTP) no longer fork the jfs tree (P0-3, P1-1).
+	var srcExtentIno uint64
+	_ = tx.QueryRowContext(ctx, `SELECT COALESCE(extent_ino, 0) FROM file_nodes WHERE `+
+		s.scope.And(`path_hash = ? AND path = ?`),
+		s.scope.Args(fileNodePathHash(oldPrefix), oldPrefix)...).Scan(&srcExtentIno)
+	newParentPath := parentPath(newPrefix)
+	newParentIno := jfsRootIno
+	if newParentPath != "/" && newParentPath != "" {
+		newParentIno = 0
+		_ = tx.QueryRowContext(ctx, `SELECT COALESCE(extent_ino, 0) FROM file_nodes WHERE `+
+			s.scope.And(`path_hash = ? AND path = ?`),
+			s.scope.Args(fileNodePathHash(newParentPath), newParentPath)...).Scan(&newParentIno)
+	}
+	if srcExtentIno != 0 && newParentIno != 0 {
+		if err := s.jfsRenameDirEdgeTx(tx, srcExtentIno, newParentIno, baseName(newPrefix)); err != nil {
 			return 0, err
 		}
 	}
@@ -798,8 +839,10 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath,
 
 	var fileID, inodeID sql.NullString
 	var isDir bool
-	err := db.QueryRowContext(ctx, `SELECT file_id, inode_id, is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
-		s.scope.Args(fileNodePathHash(srcPath), srcPath)...).Scan(&fileID, &inodeID, &isDir)
+	var layout sql.NullString
+	var extentIno sql.NullInt64
+	err := db.QueryRowContext(ctx, `SELECT file_id, inode_id, is_directory, content_layout, extent_ino FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+		s.scope.Args(fileNodePathHash(srcPath), srcPath)...).Scan(&fileID, &inodeID, &isDir, &layout, &extentIno)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
@@ -819,14 +862,31 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath,
 	if inodeID.Valid && inodeID.String != "" {
 		linkInodeID = inodeID.String
 	}
-	_, err = db.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at`)+`)
-		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 0, ?, ?, ?`)+`)`,
-		s.scope.Args(nodeID, dstPath, fileNodePathHash(dstPath), dstParentPath, fileNodePathHash(dstParentPath), dstName, fileID.String, linkInodeID, createdAt.UTC())...)
+	layoutArg := string(ContentLayoutSingle)
+	if layout.Valid && layout.String != "" {
+		layoutArg = layout.String
+	}
+	var extentArg any
+	if extentIno.Valid && extentIno.Int64 > 0 {
+		extentArg = uint64(extentIno.Int64)
+	}
+	_, err = db.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at, content_layout, extent_ino`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?`)+`)`,
+		s.scope.Args(nodeID, dstPath, fileNodePathHash(dstPath), dstParentPath, fileNodePathHash(dstParentPath), dstName, fileID.String, linkInodeID, createdAt.UTC(), layoutArg, extentArg)...)
 	if isUniqueViolation(err) {
 		return ErrPathConflict
 	}
 	if err != nil {
 		return err
+	}
+	if extentIno.Valid && extentIno.Int64 > 0 {
+		tx, ok := db.(*sql.Tx)
+		if !ok {
+			return fmt.Errorf("extent hardlink requires a transaction")
+		}
+		if err := s.jfsLinkEdgeTx(tx, dstPath, uint64(extentIno.Int64)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1239,6 +1299,7 @@ type execer interface {
 	Query(query string, args ...interface{}) (*sql.Rows, error)
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
 }
 
 // FileStorageMeta holds the lightweight storage metadata needed by upload
@@ -1429,14 +1490,15 @@ func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
 func (s *Store) lockConfirmedFileForAttachTx(db execer, fileID string) error {
 	var status string
 	if s.useLegacyFiles {
-		if err := db.QueryRow(`SELECT status FROM files WHERE file_id = ? FOR UPDATE`, fileID).Scan(&status); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
+		err := db.QueryRow(`SELECT status FROM files WHERE file_id = ? FOR UPDATE`, fileID).Scan(&status)
+		if err == nil {
+			if FileStatus(status) != StatusConfirmed {
 				return ErrNotFound
 			}
-			return err
+			return nil
 		}
-		if FileStatus(status) != StatusConfirmed {
-			return ErrNotFound
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
 		}
 	}
 	if err := db.QueryRow(`SELECT status FROM inodes WHERE `+s.scope.And(`inode_id = ?`)+` FOR UPDATE`, s.scope.Args(fileID)...).Scan(&status); err != nil {
@@ -1720,8 +1782,8 @@ func (s *Store) Stat(ctx context.Context, path string) (out *NodeWithFile, err e
 		}
 		nf.File = f
 	}
-	out = nf
-	return out, nil
+	out, err = s.withExtentStat(ctx, s.db, nf, nil)
+	return out, err
 }
 
 // StatTx is like Stat but reads through an existing transaction.
@@ -1737,7 +1799,8 @@ func (s *Store) StatTx(ctx context.Context, db execer, path string) (out *NodeWi
 		LEFT JOIN semantic s ON `+s.scope.AndOn(`i.inode_id = s.inode_id`, "s")+`
 		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
 		LIMIT 1`, scopeWhereArgs(s.scope, 3, s.scope.Args(fileNodePathHash(path), path)...)...)
-	return scanNodeWithFileWithBlob(row)
+	out, err = scanNodeWithFileWithBlob(row)
+	return s.withExtentStat(ctx, db, out, err)
 }
 
 // LockDentryFileIDTx locks the file_nodes row for path inside an existing
@@ -1779,6 +1842,7 @@ func (s *Store) StatPathFallback(ctx context.Context, primaryPath, fallbackPath 
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
 		LIMIT 1`, scopeWhereArgs(s.scope, 3, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)...)
 	out, err = scanNodeWithFileWithBlob(row)
+	out, err = s.withExtentStat(ctx, s.db, out, err)
 	return out, err
 }
 
@@ -1798,6 +1862,7 @@ func (s *Store) StatPathFallbackLite(ctx context.Context, primaryPath, fallbackP
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
 		LIMIT 1`, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)...)
 	out, err = scanNodeWithFileLite(row)
+	out, err = s.withExtentStat(ctx, s.db, out, err)
 	return out, err
 }
 
@@ -1814,6 +1879,7 @@ func (s *Store) StatLite(ctx context.Context, path string) (out *NodeWithFile, e
 		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
 		LIMIT 1`, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(path), path)...)...)
 	out, err = scanNodeWithFileLite(row)
+	out, err = s.withExtentStat(ctx, s.db, out, err)
 	return out, err
 }
 
@@ -1833,6 +1899,7 @@ func (s *Store) StatForRead(ctx context.Context, path string) (out *NodeWithFile
 		WHERE `+s.scope.AndAs("fn", `fn.path_hash = ? AND fn.path = ?`)+`
 		LIMIT 1`, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(path), path)...)...)
 	out, err = scanNodeWithFileForRead(row)
+	out, err = s.withExtentStat(ctx, s.db, out, err)
 	return out, err
 }
 
@@ -1850,6 +1917,7 @@ func (s *Store) StatPathFallbackForRead(ctx context.Context, primaryPath, fallba
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
 		LIMIT 1`, scopeWhereArgs(s.scope, 2, s.scope.Args(fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)...)...)
 	out, err = scanNodeWithFileForRead(row)
+	out, err = s.withExtentStat(ctx, s.db, out, err)
 	return out, err
 }
 
@@ -1925,6 +1993,12 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	// inodes.size_bytes stays 0 for extent files until a truncate, so a listing
+	// that does not overlay jfs_node.length reports every extent file as empty
+	// (readdirplus then hands the kernel i_size = 0 and reads return nothing).
+	if err := s.overlayExtentStatDir(ctx, s.db, parentPath, result); err != nil {
+		logger.Warn(ctx, "list_dir_extent_stat_overlay_failed", zap.String("path", parentPath), zap.Error(err))
+	}
 	out = result
 	return out, nil
 }
@@ -1932,6 +2006,10 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *File, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_file_with_ref_check", start, &err)
+
+	if proj, perr := s.GetExtentProjection(ctx, path); perr == nil && proj != nil && proj.ContentLayout == ContentLayoutExtent && proj.ExtentIno != 0 {
+		return nil, s.UnlinkExtentPath(ctx, path, false)
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -2001,11 +2079,24 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_dir_recursive", start, &err)
 
+	if err := s.unlinkExtentTree(ctx, dirPath); err != nil {
+		return nil, err
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Capture the directory's jfs inode before its projection row is deleted:
+	// the jfs subtree (edges/nodes of the directory and any orphan children)
+	// has to go in the same transaction (P0-3). Callers pass the path with or
+	// without the trailing slash, so accept both.
+	extentIno, err := s.dirExtentInoTx(ctx, tx, dirPath)
+	if err != nil {
+		return nil, err
+	}
 
 	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT file_id FROM file_nodes
 		WHERE `+s.scope.And(`(path = ? OR path LIKE ?) AND file_id IS NOT NULL`), s.scope.Args(dirPath, dirPath+"%")...)
@@ -2057,8 +2148,18 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		}
 	}
 
+	if err := s.jfsDeleteSubtreeTx(tx, extentIno); err != nil {
+		return nil, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	// Files that had no projection row (orphan jfs children) were recorded in
+	// jfs_delfile above; reclaim their blocks now instead of waiting for the
+	// tenant worker.
+	if extentIno != 0 {
+		_, _ = s.DrainPendingDeletedFiles(ctx, 16)
 	}
 	out = orphaned
 	return out, nil
@@ -3033,6 +3134,23 @@ func coalesceTime(t *time.Time, fallback time.Time) time.Time {
 		return *t
 	}
 	return fallback
+}
+
+// dirExtentInoTx returns the JuiceFS inode recorded on a directory projection
+// row. Callers pass the path with or without the trailing slash.
+func (s *Store) dirExtentInoTx(ctx context.Context, tx *sql.Tx, path string) (uint64, error) {
+	withSlash := path
+	if !strings.HasSuffix(withSlash, "/") {
+		withSlash += "/"
+	}
+	var ino uint64
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(extent_ino, 0) FROM file_nodes WHERE `+
+		s.scope.And(`is_directory = 1 AND ((path_hash = ? AND path = ?) OR (path_hash = ? AND path = ?))`),
+		s.scope.Args(fileNodePathHash(path), path, fileNodePathHash(withSlash), withSlash)...).Scan(&ino)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return ino, err
 }
 
 func parentPath(p string) string {

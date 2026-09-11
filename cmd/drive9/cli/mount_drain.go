@@ -3,10 +3,12 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
@@ -15,12 +17,14 @@ import (
 
 type mountDrainDeps struct {
 	readProcessState func(string) (mountstate.ProcessState, string, error)
+	syncfs           func(string) error
 	requestDrain     func(context.Context, string, time.Duration) (*mountcontrol.DrainResponse, error)
 }
 
 func defaultMountDrainDeps() mountDrainDeps {
 	return mountDrainDeps{
 		readProcessState: mountstate.ReadProcessState,
+		syncfs:           syncMountFileSystem,
 		requestDrain:     mountcontrol.RequestDrain,
 	}
 }
@@ -53,6 +57,9 @@ func runMountDrain(args []string, deps mountDrainDeps) error {
 	if deps.requestDrain == nil {
 		deps.requestDrain = mountcontrol.RequestDrain
 	}
+	if deps.syncfs == nil {
+		deps.syncfs = syncMountFileSystem
+	}
 
 	mountPoint := fs.Arg(0)
 	stateMountPoint := backgroundMountStatePoint(mountPoint)
@@ -71,6 +78,14 @@ func runMountDrain(args []string, deps mountDrainDeps) error {
 	clientTimeout := *timeout + 5*time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), clientTimeout)
 	defer cancel()
+	// Kernel writeback_cache keeps dirty pages until syncfs/fsync/close.
+	// The drain CLI is a separate process from the FUSE daemon, so
+	// syncfs(2) can push those pages as FUSE_WRITE without deadlocking.
+	// Linux 6.18 FUSE may still return ENOENT from syncfs(2) after
+	// writeback; ignore that so the control-socket drain can finish.
+	if err := deps.syncfs(mountPoint); err != nil && !syncfsENOENT(err) {
+		return fmt.Errorf("drive9 mount drain: syncfs %s: %w", mountPoint, err)
+	}
 	resp, err := deps.requestDrain(ctx, socketPath, *timeout)
 	if err != nil {
 		return fmt.Errorf("drive9 mount drain: %w", err)
@@ -93,6 +108,10 @@ func runMountDrain(args []string, deps mountDrainDeps) error {
 		return fmt.Errorf("drive9 mount drain: failed")
 	}
 	return nil
+}
+
+func syncfsENOENT(err error) bool {
+	return err != nil && (errors.Is(err, syscall.ENOENT) || os.IsNotExist(err))
 }
 
 func printMountDrainResponse(resp *mountcontrol.DrainResponse) (int, error) {

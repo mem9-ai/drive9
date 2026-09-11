@@ -17,7 +17,8 @@ class CommunityMdtest(BaseModule):
         mdtest = ensure_mdtest(ctx)
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_mdtest", remote, profile="none")
+        profile = os.environ.get("FUSE_PROFILE") or "none"
+        handle = ctx.target.mount("community_mdtest", remote, profile=profile)
         try:
             files = str(os.environ.get("MDTEST_FILES", "1000"))
             # IOR/mdtest always MPI_Init. MPICH's UCX netmod probes InfiniBand

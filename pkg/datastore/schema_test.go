@@ -37,6 +37,12 @@ func TestInitSchemaRequiredColumns(t *testing.T) {
 	if !s1.columnExists("journal_entries", "entry_id") {
 		t.Fatal("missing journal_entries table")
 	}
+	if !s1.columnExists("jfs_node", "inode") {
+		t.Fatal("missing jfs_node table")
+	}
+	if !s1.columnExists("file_nodes", "extent_ino") {
+		t.Fatal("missing file_nodes.extent_ino")
+	}
 }
 
 func dropDataPlaneTables(t *testing.T, s *Store) {

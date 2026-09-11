@@ -22,6 +22,7 @@
 #
 # Binaries default to the repo builds (bin/drive9-server, bin/drive9);
 # override with DRIVE9_SERVER_BIN / DRIVE9_CLI_BIN for cross-version runs.
+# This suite ignores FUSE_PROFILE: it needs a single-blob PATCH path.
 
 set -euo pipefail
 
@@ -194,7 +195,6 @@ start_server() { # start_server <threshold>
     DRIVE9_META_DSN="${DRIVE9_META_DSN:-$DRIVE9_LOCAL_DSN}" \
     DRIVE9_LOCAL_MYSQL_DSN="${DRIVE9_LOCAL_MYSQL_DSN:-$DRIVE9_LOCAL_DSN}" \
     DRIVE9_LOCAL_EMBEDDING_MODE="${DRIVE9_LOCAL_EMBEDDING_MODE:-app}" \
-    DRIVE9_S3_DIR="$TMP_DIR/s3" \
     DRIVE9_INLINE_THRESHOLD="$1" \
     DRIVE9_LOG_LEVEL=warn \
     "$SERVER_BIN" >>"$SERVER_LOG" 2>&1 &
@@ -246,6 +246,11 @@ E2E_HOME="$TMP_DIR/home"
 mkdir -p "$E2E_HOME"
 
 ensure_tidb
+if [ -z "${DRIVE9_S3_BUCKET:-}" ]; then
+  : "${DRIVE9_S3_DIR:=$TMP_DIR/s3}"
+  export DRIVE9_S3_DIR
+fi
+eval "$(bash "$ROOT_DIR/scripts/local-minio.sh" apply)"
 
 LISTEN_ADDR="127.0.0.1:$(pick_port)"
 PUBLIC_URL="http://${LISTEN_ADDR}"

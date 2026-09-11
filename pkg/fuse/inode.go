@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,9 @@ type InodeEntry struct {
 	Rdev       uint32
 	Revision   int64 // server-side revision for cache validation
 	Unlinked   bool  // path was removed while open handles still reference this inode
+	// ExtentIno is the JuiceFS inode for content_layout=extent files.
+	// Shared across hardlink aliases of the same FUSE inode.
+	ExtentIno uint64
 }
 
 // InodeToPath provides a bidirectional mapping between inode numbers and
@@ -38,7 +42,20 @@ type InodeToPath struct {
 	byPath  map[string]uint64
 	byID    map[string]uint64
 	nextIno uint64
+	// extentOnce records every FUSE inode that ever carried a JuiceFS
+	// extent mapping. Inode numbers are allocated monotonically (nextIno
+	// never repeats), so membership reliably means "this nodeid belonged to
+	// an extent file" even after the entry itself is removed. The missing-
+	// handle Write path uses it to authorize discarding orphan writebacks
+	// for deleted extent files without ever swallowing classic-file bytes.
+	extentOnce map[uint64]struct{}
 }
+
+// extentOnceSoftCap bounds the extentOnce set. On overflow the set is
+// dropped and rebuilt from scratch: a false negative after a reset turns an
+// orphan extent writeback into a logged ENOENT instead of a silent discard,
+// which is the safe direction.
+const extentOnceSoftCap = 1 << 20
 
 // NewInodeToPath creates a new InodeToPath initialized with the root inode
 // (inode 1, corresponding to go-fuse FUSE_ROOT_ID).
@@ -52,10 +69,11 @@ func NewInodeToPath() *InodeToPath {
 		Nlookup: 1,
 	}
 	return &InodeToPath{
-		byInode: map[uint64]*InodeEntry{1: root},
-		byPath:  map[string]uint64{"/": 1},
-		byID:    make(map[string]uint64),
-		nextIno: 2,
+		byInode:    map[uint64]*InodeEntry{1: root},
+		byPath:     map[string]uint64{"/": 1},
+		byID:       make(map[string]uint64),
+		extentOnce: make(map[uint64]struct{}),
+		nextIno:    2,
 	}
 }
 
@@ -277,6 +295,12 @@ func shouldKeepForgetMapping(entry *InodeEntry) bool {
 	if entry.HasUID || entry.HasGID {
 		return true
 	}
+	// JuiceFS uses the juicefs inode as the FUSE nodeid, so Forget cannot
+	// drop the identity. Dat9FS allocates its own nodeids and must keep the
+	// juicefs Ino mapping (and last known length) across kernel Forget.
+	if entry.ExtentIno != 0 {
+		return true
+	}
 	return entryIsMetadataOnlySpecial(entry)
 }
 
@@ -352,6 +376,113 @@ func (m *InodeToPath) AddAliasIfAbsent(ino uint64, path, resourceID string, nlin
 	entry.Nlookup++
 	m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
 	return true
+}
+
+// SetExtentIno records the JuiceFS inode for a FUSE inode. Hardlink aliases
+// share the FUSE inode, so one update covers every path.
+func (m *InodeToPath) SetExtentIno(ino uint64, extentIno uint64) {
+	if m == nil || extentIno == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.extentOnce) >= extentOnceSoftCap {
+		// Bound the routing memory of a long-lived mount with heavy extent
+		// inode churn. Resetting only downgrades late orphan writebacks to a
+		// logged ENOENT (see WasEverExtent); it never misclassifies a
+		// classic file, because nodeids are never reused.
+		m.extentOnce = make(map[uint64]struct{}, extentOnceSoftCap/2)
+	}
+	m.extentOnce[ino] = struct{}{}
+	if entry, ok := m.byInode[ino]; ok {
+		entry.ExtentIno = extentIno
+	}
+}
+
+// WasEverExtent reports whether this FUSE inode was ever bound to a JuiceFS
+// extent inode on this mount. Unlike the entry's ExtentIno field, it survives
+// entry removal (unlink + forget), which is exactly when an orphan kernel
+// writeback may still arrive for the deleted extent file.
+func (m *InodeToPath) WasEverExtent(ino uint64) bool {
+	if m == nil || ino == 0 {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.extentOnce[ino]
+	return ok
+}
+
+// FindByExtentIno returns the FUSE inode that already owns this JuiceFS
+// inode, so Lookup after rename/hardlink reuses the same nodeid.
+func (m *InodeToPath) FindByExtentIno(extentIno uint64) (uint64, bool) {
+	if m == nil || extentIno == 0 {
+		return 0, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for ino, entry := range m.byInode {
+		if entry != nil && !entry.IsDir && entry.ExtentIno == extentIno {
+			return ino, true
+		}
+	}
+	return 0, false
+}
+
+// FindPathInDir locates a child by basename under dir, ignoring extra slashes
+// so finishLocalRename still finds the source after childPath normalization.
+func (m *InodeToPath) FindPathInDir(dir, name string) (uint64, string, bool) {
+	if m == nil || name == "" {
+		return 0, "", false
+	}
+	dir = path.Clean("/" + strings.TrimPrefix(strings.TrimSuffix(dir, "/"), "/"))
+	if dir == "." {
+		dir = "/"
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for p, ino := range m.byPath {
+		trimmed := strings.TrimSuffix(p, "/")
+		if path.Base(trimmed) != name {
+			continue
+		}
+		parent := path.Dir(trimmed)
+		if parent == "." {
+			parent = "/"
+		}
+		if parent == dir {
+			return ino, p, true
+		}
+	}
+	return 0, "", false
+}
+
+// FindByBaseName returns the unique path with this basename. pjdfstest
+// names are unique hashes; rename can then find the source even when the
+// parent path string does not match GetPath.
+func (m *InodeToPath) FindByBaseName(name string) (uint64, string, bool) {
+	if m == nil || name == "" || name == "/" || name == "." {
+		return 0, "", false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	found := 0
+	var ino uint64
+	var pth string
+	for p, i := range m.byPath {
+		if path.Base(strings.TrimSuffix(p, "/")) != name {
+			continue
+		}
+		found++
+		ino, pth = i, p
+		if found > 1 {
+			return 0, "", false
+		}
+	}
+	if found != 1 {
+		return 0, "", false
+	}
+	return ino, pth, true
 }
 
 // SetIdentity records a stable resource identity for an existing inode.
@@ -622,7 +753,12 @@ func (m *InodeToPath) addPathLocked(entry *InodeEntry, path string) {
 func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID string, nlink uint32, isDir bool, size int64, mtime time.Time) {
 	m.addPathLocked(entry, path)
 	entry.IsDir = isDir
-	entry.Size = size
+	// Listing/create-cache often still has size=0 after JuiceFS writes.
+	// Shrinking an extent inode here makes ReadDirPlus publish i_size=0 so
+	// the kernel returns EOF without FUSE READ. Truncate uses UpdateSize.
+	if entry.ExtentIno == 0 || isDir || size >= entry.Size {
+		entry.Size = size
+	}
 	entry.Mtime = mtime
 	m.setIdentityLocked(entry, resourceID)
 	if nlink > 0 {

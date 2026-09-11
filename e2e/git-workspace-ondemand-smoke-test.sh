@@ -333,7 +333,7 @@ start_mount() {
   local perf_dir="${mount_log%.log}.perf"
   # --perf-dir enables fusePerfCounters (via PerfSamplesPath), which emits
   # git_workspace refresh= / forced_refresh= on shutdown.
-  drive9 mount --foreground --mode=fuse --profile coding-agent \
+  drive9 mount --foreground --mode=fuse --profile "${FUSE_PROFILE:-coding-agent}" \
     --local-root "$local_root" \
     --durability=interactive \
     --no-auto-unpack \

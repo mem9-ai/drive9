@@ -38,6 +38,9 @@ if [ "$RUN_FUSE_SQLITE_CORRECTNESS" = "1" ]; then
   fi
   bash "$SCRIPT_DIR/fuse-sqlite-correctness.sh"
 fi
+if [ "${RUN_FUSE_SQLITE_COMMIT_SEQUENCE:-0}" = "1" ]; then
+  bash "$SCRIPT_DIR/fuse-sqlite-commit-sequence.sh"
+fi
 if [ "$RUN_FUSE_PERFORMANCE_BASELINE" = "1" ]; then
   bash "$SCRIPT_DIR/fuse-performance-baseline.sh"
 fi

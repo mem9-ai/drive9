@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -24,6 +25,12 @@ func TestRunMountDrainJSON(t *testing.T) {
 				MountKind:     mountstate.MountKindFUSE,
 				ControlSocket: "/tmp/drive9.sock",
 			}, "", nil
+		},
+		syncfs: func(mountPoint string) error {
+			if mountPoint != "/mnt/drive9" {
+				t.Fatalf("syncfs mountPoint = %q", mountPoint)
+			}
+			return nil
 		},
 		requestDrain: func(ctx context.Context, socketPath string, timeout time.Duration) (*mountcontrol.DrainResponse, error) {
 			if socketPath != "/tmp/drive9.sock" {
@@ -68,6 +75,7 @@ func TestRunMountDrainJSONReturnsErrorForNonOKResponse(t *testing.T) {
 				ControlSocket: "/tmp/drive9.sock",
 			}, "", nil
 		},
+		syncfs: func(string) error { return nil },
 		requestDrain: func(context.Context, string, time.Duration) (*mountcontrol.DrainResponse, error) {
 			resp := mountcontrol.NewDrainResponse("/mnt/drive9", start)
 			resp.Pending.UploaderCached = 1
@@ -89,6 +97,87 @@ func TestRunMountDrainJSONReturnsErrorForNonOKResponse(t *testing.T) {
 	}
 	if got.OK || got.Pending.UploaderCached != 1 {
 		t.Fatalf("drain response = %#v", got)
+	}
+}
+
+func TestRunMountDrainCallsSyncfsBeforeRequest(t *testing.T) {
+	start := time.Now().UTC()
+	var got []string
+	deps := mountDrainDeps{
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{
+				PID:           123,
+				MountKind:     mountstate.MountKindFUSE,
+				ControlSocket: "/tmp/drive9.sock",
+			}, "", nil
+		},
+		syncfs: func(mountPoint string) error {
+			got = append(got, "syncfs:"+mountPoint)
+			return nil
+		},
+		requestDrain: func(context.Context, string, time.Duration) (*mountcontrol.DrainResponse, error) {
+			got = append(got, "drain")
+			resp := mountcontrol.NewDrainResponse("/mnt/drive9", start)
+			resp.Finish(start.Add(time.Millisecond))
+			return &resp, nil
+		},
+	}
+	if err := runMountDrain([]string{"/mnt/drive9"}, deps); err != nil {
+		t.Fatalf("runMountDrain: %v", err)
+	}
+	want := []string{"syncfs:/mnt/drive9", "drain"}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("call order = %v, want %v", got, want)
+	}
+}
+
+func TestRunMountDrainIgnoresSyncfsENOENT(t *testing.T) {
+	start := time.Now().UTC()
+	drainRan := false
+	deps := mountDrainDeps{
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{
+				PID:           123,
+				MountKind:     mountstate.MountKindFUSE,
+				ControlSocket: "/tmp/drive9.sock",
+			}, "", nil
+		},
+		syncfs: func(string) error { return syscall.ENOENT },
+		requestDrain: func(context.Context, string, time.Duration) (*mountcontrol.DrainResponse, error) {
+			drainRan = true
+			resp := mountcontrol.NewDrainResponse("/mnt/drive9", start)
+			resp.Finish(start.Add(time.Millisecond))
+			return &resp, nil
+		},
+	}
+	if err := runMountDrain([]string{"/mnt/drive9"}, deps); err != nil {
+		t.Fatalf("runMountDrain: %v", err)
+	}
+	if !drainRan {
+		t.Fatal("requestDrain skipped after ignorable syncfs ENOENT")
+	}
+}
+
+func TestRunMountDrainSyncfsError(t *testing.T) {
+	deps := mountDrainDeps{
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{
+				PID:           123,
+				MountKind:     mountstate.MountKindFUSE,
+				ControlSocket: "/tmp/drive9.sock",
+			}, "", nil
+		},
+		syncfs: func(string) error {
+			return syscall.EIO
+		},
+		requestDrain: func(context.Context, string, time.Duration) (*mountcontrol.DrainResponse, error) {
+			t.Fatal("requestDrain must not run after syncfs error")
+			return nil, nil
+		},
+	}
+	err := runMountDrain([]string{"/mnt/drive9"}, deps)
+	if err == nil || !strings.Contains(err.Error(), "syncfs") {
+		t.Fatalf("runMountDrain error = %v, want syncfs error", err)
 	}
 }
 

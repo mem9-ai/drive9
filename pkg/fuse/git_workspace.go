@@ -30,6 +30,11 @@ import (
 const gitCheckpointTimeout = 2 * time.Minute
 const gitCheckpointDebounce = 2 * time.Second
 const gitWorkspaceHydrateTimeout = 30 * time.Minute
+
+// gitWorkspaceSizeNotifyTimeout bounds the tail read behind one
+// NOTIFY_STORE size correction; the hydrate normally serves it from the local
+// git cache.
+const gitWorkspaceSizeNotifyTimeout = 10 * time.Second
 const gitCheckIgnoreTimeout = 2 * time.Second
 const gitWorkspaceRefreshInterval = time.Second // armed list coalescing / liveness revalidation
 const gitWorkspaceStatusDeleted = "deleted"
@@ -2291,7 +2296,11 @@ func (fs *Dat9FS) carryGitKnownSizesIntoRuntime(rt *gitWorkspaceRuntime) {
 	}
 }
 
-func (fs *Dat9FS) resolveGitCleanNodeSize(ctx context.Context, rt *gitWorkspaceRuntime, rel string, n client.GitTreeNode) int64 {
+func (fs *Dat9FS) resolveGitCleanNodeSize(ctx context.Context, rt *gitWorkspaceRuntime, rel string, n client.GitTreeNode) (size int64) {
+	// A size learned here can be the first honest one for an inode the kernel
+	// already created as an empty blobless placeholder, and the kernel cannot
+	// adopt it from an attr reply once the writeback cache is on.
+	defer func() { fs.maybeCorrectKernelCleanNodeSize(ctx, rt, rel, size) }()
 	if n.SizeBytes >= 0 || n.Kind == "dir" || n.Kind == "submodule" {
 		if n.Kind == "dir" {
 			return 0
@@ -2330,6 +2339,78 @@ func (fs *Dat9FS) resolveGitCleanNodeSize(ctx context.Context, rt *gitWorkspaceR
 		}
 	}
 	return n.SizeBytes
+}
+
+// maybeCorrectKernelCleanNodeSize hands a clean node's freshly learned size to
+// the kernel when the kernel cannot pick it up from an attribute reply.
+//
+// With FUSE_WRITEBACK_CACHE negotiated the kernel treats a regular file's
+// i_size as authoritative: fuse_get_cache_mask() returns
+// STATX_MTIME|STATX_CTIME|STATX_SIZE for every regular file, so
+// fuse_change_attributes() overwrites the size of every Lookup/GetAttr reply
+// with the inode's cached i_size and never calls i_size_write(). A file the
+// kernel created as an empty blobless placeholder therefore stays at size 0
+// whatever the daemon reports: reads return EOF without a FUSE READ, the
+// read-through hydration that materializes the blob never runs, and `git
+// status` reports every path as modified. FUSE_NOTIFY_STORE is the one
+// notification that still grows i_size, because fuse_notify_store() calls
+// fuse_write_update_attr() for the range it receives.
+//
+// Only the last page is stored (page aligned, real bytes up to EOF): the kernel
+// marks exactly that page up to date with correct content, while the earlier
+// pages stay uncached and are served by the daemon on demand.
+//
+// Scoped to blobless workspaces: they are the ones whose sizes are unknown when
+// the inode is created, and their hydrate keeps the tail read a cache hit. A
+// materialized workspace already knows every size at inode creation, so the
+// kernel never cached a smaller one.
+func (fs *Dat9FS) maybeCorrectKernelCleanNodeSize(ctx context.Context, rt *gitWorkspaceRuntime, rel string, size int64) {
+	if fs == nil || rt == nil || rel == "" || size <= 0 || fs.server == nil {
+		return
+	}
+	if !fs.kernelWritebackCacheOn() || !gitWorkspaceIsFastBlobless(rt) {
+		return
+	}
+	localPath := path.Join(rt.localRoot, rel)
+	if rt.localRoot == "/" {
+		localPath = "/" + rel
+	}
+	ino, ok := fs.inodes.GetInode(localPath)
+	if !ok {
+		return
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok || entry.Size >= size {
+		// Either the kernel was already told this size or the caller is about
+		// to report it for a fresh inode.
+		return
+	}
+	tailStart, tailLen := fileTailPageRange(size, os.Getpagesize())
+	fs.notifyWg.Add(1)
+	go func() {
+		defer fs.notifyWg.Done()
+		rctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceSizeNotifyTimeout)
+		defer cancel()
+		data, err := fs.readGitFile(rctx, localPath, tailStart, tailLen)
+		if err != nil || int64(len(data)) != tailLen {
+			safeLogPrintf("drive9: git workspace size notify skipped path=%s ino=%d size=%d got=%d err=%v", localPath, ino, size, len(data), err)
+			return
+		}
+		if st := fs.server.InodeNotifyStoreCache(ino, tailStart, data); st != 0 {
+			safeLogPrintf("drive9: git workspace size notify failed path=%s ino=%d size=%d status=%d", localPath, ino, size, st)
+		}
+	}()
+}
+
+// fileTailPageRange returns the page-aligned range that ends at size, i.e. the
+// last page of a file of that length. A NOTIFY_STORE of exactly this range
+// leaves every earlier page uncached.
+func fileTailPageRange(size int64, pageSize int) (int64, int64) {
+	if size <= 0 || pageSize <= 0 {
+		return 0, 0
+	}
+	start := (size - 1) / int64(pageSize) * int64(pageSize)
+	return start, size - start
 }
 
 func gitNodeCommit(rt *gitWorkspaceRuntime, n client.GitTreeNode) string {
@@ -5502,6 +5583,7 @@ func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flag
 // contract).
 func (fs *Dat9FS) allocateGitWorkspaceFileHandle(ctx context.Context, fh *FileHandle, rt *gitWorkspaceRuntime, rel string) uint64 {
 	fhID := fs.fileHandles.Allocate(fh)
+	fh.handleID = fhID
 	if fs.registerGitWorkspaceHandle(fh, rt, rel) {
 		fs.cleanupGitWhiteoutAdoption(ctx, fh, rt, rel)
 	}
