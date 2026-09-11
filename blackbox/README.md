@@ -30,7 +30,7 @@ blackbox/
       ltp_syscalls/
       ...
     drive9/             drive9 workflow modules
-    customer/           customer scenario modules
+    custom/             case scenario modules
     juicefs/            JuiceFS-inspired rewrite modules
     git/                git official test modules
 ```
@@ -205,7 +205,7 @@ work-dir, keeping the repo tree clean. Use `--work-dir` to specify; defaults to
 Three GitHub Actions workflows are provided:
 
 - **`blackbox.yml`** — the blackbox job. Manual `workflow_dispatch` (choose a
-  group: community, juicefs, drive9, git, customer, or all) and reusable via
+  group: community, juicefs, drive9, git, custom, or all) and reusable via
   `workflow_call` for the scheduled wrappers. No push/PR triggers.
 - **`blackbox-daily.yml`** — runs at 06:00 UTC daily; calls `blackbox.yml` with
   `group=community`.

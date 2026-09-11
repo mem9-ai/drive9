@@ -533,7 +533,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     selector = parser.add_mutually_exclusive_group(required=False)
     selector.add_argument("--all", action="store_true", help="Run every discovered module.")
     selector.add_argument("--module", action="append", help="Run one module id or a comma-separated list. Can be repeated.")
-    selector.add_argument("--group", help="Run a directory group, e.g. community, juicefs, drive9, git, or customer.")
+    selector.add_argument("--group", help="Run a directory group, e.g. community, juicefs, drive9, git, or custom.")
     parser.add_argument("--label", action="append", help="Filter selected modules by label. Comma-separated list; can be repeated. Combinable with --all/--group.")
     parser.add_argument("--deps-only", action="store_true", help="Prepare external dependencies for selected modules without running setup.")
     parser.add_argument("--bootstrap", action="store_true", help="Prepare dependencies into a work-dir, then exit. Use --work-dir to reuse later.")
