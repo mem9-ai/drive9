@@ -146,7 +146,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if authLocal {
 		originalArgs = append([]string{"--auth=local"}, args...)
 	}
-	fs := flag.NewFlagSet("mount", flag.ExitOnError)
+	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
 	mode := fs.String("mode", "auto", "mount mode: auto, fuse, or webdav")
@@ -229,7 +229,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 
 	if err := fs.Parse(args); err != nil {
-		return err
+		// The flag package already printed the error and the command usage.
+		return UsageError{Err: err}
 	}
 	gvisorCompatGiven := flagProvided(fs, "gvisor-compat")
 	if !gvisorCompatGiven {
@@ -267,7 +268,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		}
 	default:
 		fs.Usage()
-		os.Exit(2)
+		exitProcess(2)
 	}
 
 	envAppendLogPatterns, err := consumeMountPolicyPatternsEnv(EnvMountAppendLogPatterns)
@@ -1295,7 +1296,9 @@ func mountBackgroundEnv(environ []string, req mountBackgroundRequest) []string {
 	} else if req.APIKey != "" {
 		out = append(out, EnvAPIKey+"="+req.APIKey)
 	}
-	return out
+	// Spawned mount processes are internal: never let them report their own
+	// command-completion events.
+	return telemetryDisabledEnv(out)
 }
 
 func openMountBackgroundLog(mountPoint string) (string, *os.File, error) {

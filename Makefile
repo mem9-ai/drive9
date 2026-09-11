@@ -29,6 +29,12 @@ VERSION ?=
 GIT_HASH ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+INSTALL_SOURCE ?=
+# Empty for development builds on purpose: only release artifacts carry an
+# ingestion endpoint, so a dev binary can never post to production. Override it
+# to package a release build against another endpoint (e.g. staging).
+TELEMETRY_ENDPOINT ?=
+RELEASE_TELEMETRY_ENDPOINT = https://tdc-telemetry.tidbcloud.com/v1/telemetry/batch
 
 CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 MIGRATION_TARGETS ?= linux/amd64 linux/arm64
@@ -53,7 +59,9 @@ TEST_PKGS ?= ./...
 BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitHash=$(GIT_HASH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
-	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
+	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME) \
+	-X github.com/mem9-ai/drive9/pkg/buildinfo.InstallSource=$(INSTALL_SOURCE) \
+	-X github.com/mem9-ai/drive9/pkg/buildinfo.TelemetryEndpoint=$(TELEMETRY_ENDPOINT)
 
 .PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
@@ -196,7 +204,7 @@ build-cli-release:
 		fi; \
 		out="$(DIST_DIR)/$(CLI_NAME)-$${os}-$${arch}$$ext"; \
 		echo "Building $$(basename "$$out")..."; \
-		$(MAKE) --no-print-directory build-cli GOOS="$$os" GOARCH="$$arch" CLI_BIN="$$out" VERSION="$(VERSION)"; \
+		$(MAKE) --no-print-directory build-cli GOOS="$$os" GOARCH="$$arch" CLI_BIN="$$out" VERSION="$(VERSION)" INSTALL_SOURCE=github-release TELEMETRY_ENDPOINT="$(if $(TELEMETRY_ENDPOINT),$(TELEMETRY_ENDPOINT),$(RELEASE_TELEMETRY_ENDPOINT))"; \
 	done; \
 	cd $(DIST_DIR) && sha256sum $(CLI_NAME)-* > checksums.txt && printf '%s\n' "$(VERSION)" > version
 

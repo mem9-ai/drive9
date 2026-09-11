@@ -132,6 +132,7 @@ pkg/
   tenant/               Tenant schema management
   pathutil/             Path canonicalization and validation
   semantic/             Durable background task types
+  telemetry/            Privacy-preserving CLI command telemetry client
   traceid/              Trace ID helpers
 internal/
   testtidb/             TiDB test helpers (shared across packages)
@@ -152,6 +153,60 @@ to keep issue structure and required context consistent.
 - `drive9 fs find ... -tag key=value` is an exact key/value match.
 - `drive9 fs find ... -tag key` means tag-key existence match.
 - `-tag` does not support fuzzy, prefix, contains, or regex matching.
+
+### CLI telemetry
+
+- Telemetry is opt-in and off by default. Nothing is sent, and no telemetry
+  state file is read or written, unless the user sets `DRIVE9_TELEMETRY=on` or
+  `"telemetry": {"enabled": true}` in `~/.drive9/config`. `cli.TelemetryPreference`
+  is the only reader of that preference; the field must stay on `cli.Config` so
+  `saveConfig` round-trips it. Do not add a build, install-source, or CI
+  heuristic that enables it implicitly, and do not add a telemetry management
+  command.
+- Opted-in commands post one best-effort `drive9.command.finished` event to the
+  shared ti-cli telemetry ingestion endpoint (`POST /v1/telemetry/batch`, `202`
+  is the only success status, 1s timeout, no retries, no local queue).
+- Help, version, commandless usage, unknown commands, every `drive9 update`
+  form, and internal mount processes (`mount supervise`, `--supervised`,
+  `--supervise-foreground`) are excluded before telemetry reads
+  `~/.drive9/config` or `.telemetry-installation-id`. The `admin` subtree also
+  opts out of a bare `help` operand (`drive9 admin tenant create help` is a help
+  request there) via `bareHelp`; `fs grep help` is a real operand and still
+  reports.
+- Placement fields describe the command's own context. A command that addresses
+  a named context (`drive9 fs cat prod:/file`) reports no provider/region and
+  `profile_source: unknown`, because the active context does not describe it.
+- One user command must produce at most one event. Every process drive9 spawns
+  itself — background mounts, supervisors, detached hydration — must go through
+  `telemetryDisabledEnv`, and the generated systemd unit sets
+  `Environment=DRIVE9_TELEMETRY=off`.
+- Flag names come from argv, so a flag value must never be recorded as a name:
+  a dash token directly after another dash token is treated as a value, and
+  `telemetryKnownFlagNames` (guarded by
+  `TestTelemetryKnownFlagNamesCoverEveryDefinedFlag`) drops anything that is not
+  a flag the CLI defines. A dash-shaped operand that happens to spell a real flag
+  is still reported; that is an analytics-fidelity limit, not a privacy one,
+  because the recorded string is always a known flag name. Do not "fix" the
+  remaining under-reporting by guessing arity.
+- `cmd/drive9/telemetry.go` holds a hand-maintained copy of the command tree, and
+  `cmd/drive9/telemetry_drift_test.go` compares it against the real dispatchers.
+  Adding a command or subcommand means updating the tree; the test fails
+  otherwise.
+- The shared ingestion service must allow `drive9.command.finished`,
+  `drive9_[A-Za-z0-9_-]{22}` installation IDs, `drive9` command paths of up to
+  four segments, the `drive9/` User-Agent, and must widen its `command_path`
+  pattern from `{0,2}` to `{0,3}` subcommand segments. It validates with
+  `DisallowUnknownFields`, so no product-discriminator field can be added to the
+  payload until the backend accepts one.
+- Events must never include flag values, credentials, paths, file contents,
+  command output, API payloads, context names, or tenant IDs. `pkg/telemetry`
+  sends no caller-supplied free text: `DRIVE9_TELEMETRY_TAG`/`_EXTRA` were
+  removed for that reason and must not come back without a key allowlist.
+- The shared ingestion service rate-limits per client IP (60/min, burst 120) and
+  drops whole batches when its in-memory buffer is full. The CLI sends one event
+  per command and never retries, so bursts (agent loops, many users behind one
+  NAT) lose events by design; that is a backend capacity question, not something
+  to fix with client-side retries or a local queue.
 
 ---
 
