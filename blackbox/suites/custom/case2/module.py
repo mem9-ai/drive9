@@ -26,12 +26,11 @@ DURABILITY_WRITE_SYNC = "write-sync"
 DURABILITY_INTERACTIVE = "interactive"
 
 
-class Drive9ManusPerf(BaseModule):
-    """Customer benchmark covering the Manus Persistent Sandbox / cloud-PC
-    shared-storage scenario.
+class CustomCase2(BaseModule):
+    """Shared-storage benchmark covering a persistent agent workspace
+    scenario.
 
-    Implements the test requirements captured in the 2026-06-23 meeting with
-    Minghua / Manus:
+    Implements the case2 test requirements:
 
     - Multi-session shared workspace: multiple agents mount the same workspace,
       cross-mount read visibility, concurrent read/write of distinct and same
@@ -46,13 +45,13 @@ class Drive9ManusPerf(BaseModule):
     """
 
     description = (
-        "Manus Persistent Sandbox / cloud-PC shared-storage benchmark: "
+        "Case2 shared-storage benchmark: "
         "multi-session shared workspace, read/write consistency, cache "
         "invalidation, write-sync small-file latency, 2MB routing, single-"
         "session TTL baselines, file-lock behavior, and a vite+react+tailwind "
         "clone+build comparison across local disk / drive9 writeback / write-sync."
     )
-    labels = ("drive9", "customer", "manus", "performance", "fuse")
+    labels = ("drive9", "custom", "case2", "performance", "fuse")
     timeout = 7200
     report_profile = "customer"
     # Cached report markdown from the last run(), used by render_report().
@@ -61,8 +60,8 @@ class Drive9ManusPerf(BaseModule):
     # ----- dependency / opt-in gate -------------------------------------
 
     def ensure_dependencies(self, ctx: Context) -> None:
-        if not env_flag("MANUS_PERF_ENABLE", False, ctx.suite):
-            raise ModuleSkip("set BLACKBOX_MANUS_PERF_ENABLE=1 to run Manus performance tests", "explicit opt-in")
+        if not env_flag("CASE2_PERF_ENABLE", False, ctx.suite):
+            raise ModuleSkip("set BLACKBOX_CASE2_PERF_ENABLE=1 to run Case2 performance tests", "explicit opt-in")
         for tool in ("bash", "find", "git"):
             ctx.deps.require_tool(tool)
         # The extra clone+build case needs node tooling for the vite repo.
@@ -80,7 +79,7 @@ class Drive9ManusPerf(BaseModule):
         for path in (raw_dir, summary_dir):
             path.mkdir(parents=True, exist_ok=True)
 
-        remote_base = env_value("MANUS_PERF_REMOTE_ROOT", ctx.target.remote_root(self.id), ctx.suite).rstrip("/")
+        remote_base = env_value("CASE2_PERF_REMOTE_ROOT", ctx.target.remote_root(self.id), ctx.suite).rstrip("/")
         ctx.target.mkdir_remote(remote_base)
         self.capture_environment(ctx, artifact)
         manifest_config = {key: value for key, value in cfg.items() if not key.startswith("_")}
@@ -111,19 +110,19 @@ class Drive9ManusPerf(BaseModule):
                 rows.append(self.control_row(name, "skipped", "section disabled by config", 0.0))
                 checkpoint()
                 continue
-            progress(f"manus perf section start: {name}")
+            progress(f"case2 perf section start: {name}")
             started = time.perf_counter()
             try:
                 produced = fn()
                 rows.extend(produced)
                 rows.append(self.control_row(name, "completed", f"rows={len(produced)}", time.perf_counter() - started))
-                progress(f"manus perf section done: {name} rows={len(produced)}")
+                progress(f"case2 perf section done: {name} rows={len(produced)}")
             except Exception as exc:
                 elapsed = time.perf_counter() - started
                 detail = f"{type(exc).__name__}: {exc}"
                 issues.append({"severity": "error", "section": name, "op": "section", "detail": detail})
                 rows.append(self.control_row(name, "error", detail, elapsed))
-                progress(f"manus perf section error: {name}: {detail}")
+                progress(f"case2 perf section error: {name}: {detail}")
             finally:
                 checkpoint()
 
@@ -143,45 +142,45 @@ class Drive9ManusPerf(BaseModule):
         sections_default = cfg.get("sections", {})
         return {
             "scales": scales,
-            "selected_scales": self.csv_env(ctx, "MANUS_PERF_SCALES", cfg.get("selected_scales", ["S"])),
-            "runs": max(1, int(env_value("MANUS_PERF_RUNS", str(ctx.runs), ctx.suite))),
-            "profile": env_value("MANUS_PERF_PROFILE", str(cfg.get("profile", "coding-agent")), ctx.suite),
-            "durability": env_value("MANUS_PERF_DURABILITY", str(cfg.get("durability", "auto")), ctx.suite),
+            "selected_scales": self.csv_env(ctx, "CASE2_PERF_SCALES", cfg.get("selected_scales", ["S"])),
+            "runs": max(1, int(env_value("CASE2_PERF_RUNS", str(ctx.runs), ctx.suite))),
+            "profile": env_value("CASE2_PERF_PROFILE", str(cfg.get("profile", "coding-agent")), ctx.suite),
+            "durability": env_value("CASE2_PERF_DURABILITY", str(cfg.get("durability", "auto")), ctx.suite),
             # Mount TTL for infinite-TTL read baselines: 0 disables time-based
             # read-cache expiry (the "infinite TTL read" combination).
-            "infinite_ttl_read_cache_s": float(env_value("MANUS_PERF_INFINITE_TTL_S", str(cfg.get("infinite_ttl_read_cache_s", 0)), ctx.suite)),
-            "agent_counts": self.int_csv_env(ctx, "MANUS_PERF_AGENT_COUNTS", cfg.get("agent_counts", [2, 4])),
-            "small_file_sizes": self.int_csv_env(ctx, "MANUS_PERF_SMALL_SIZES", cfg.get("small_file_sizes", [1024, 20 * 1024, 100 * 1024])),
-            "small_file_concurrency": self.int_csv_env(ctx, "MANUS_PERF_SMALL_CONCURRENCY", cfg.get("small_file_concurrency", [1, 4, 16])),
-            "small_file_ops": int(env_value("MANUS_PERF_SMALL_OPS", str(cfg.get("small_file_ops", 50)), ctx.suite)),
-            "write_sync_sizes": self.int_csv_env(ctx, "MANUS_PERF_WRITE_SYNC_SIZES", cfg.get("write_sync_sizes", [1024, 20 * 1024, 100 * 1024, 512 * 1024, 2 * 1024 * 1024])),
-            "write_sync_ops": int(env_value("MANUS_PERF_WRITE_SYNC_OPS", str(cfg.get("write_sync_ops", 50)), ctx.suite)),
-            "write_sync_concurrency": self.int_csv_env(ctx, "MANUS_PERF_WRITE_SYNC_CONCURRENCY", cfg.get("write_sync_concurrency", [1, 4])),
-            "namespace_stat_samples": int(env_value("MANUS_PERF_STAT_SAMPLES", str(cfg.get("namespace_stat_samples", 300)), ctx.suite)),
-            "namespace_op_samples": int(env_value("MANUS_PERF_NAMESPACE_OP_SAMPLES", str(cfg.get("namespace_op_samples", 200)), ctx.suite)),
-            "visibility_timeout_s": float(env_value("MANUS_PERF_VISIBILITY_TIMEOUT_S", str(cfg.get("visibility_timeout_s", 30)), ctx.suite)),
-            "cache_invalidation_samples": int(env_value("MANUS_PERF_CACHE_INVALIDATION_SAMPLES", str(cfg.get("cache_invalidation_samples", 30)), ctx.suite)),
-            "routing_sizes": self.int_csv_env(ctx, "MANUS_PERF_ROUTING_SIZES", cfg.get("routing_sizes", [1024, 100 * 1024, 512 * 1024, 2 * 1024 * 1024 - 1, 2 * 1024 * 1024, 4 * 1024 * 1024])),
-            "large_file_sizes": self.int_csv_env(ctx, "MANUS_PERF_LARGE_SIZES", cfg.get("large_file_sizes", [4 * 1024 * 1024, 16 * 1024 * 1024])),
-            "large_file_ops": int(env_value("MANUS_PERF_LARGE_OPS", str(cfg.get("large_file_ops", 10)), ctx.suite)),
-            "extra_repo_id": env_value("MANUS_PERF_EXTRA_REPO", str(cfg.get("extra_repo_id", "cruip-tailwind-dashboard")), ctx.suite),
-            "extra_storages": self.csv_env(ctx, "MANUS_PERF_EXTRA_STORAGES", cfg.get("extra_storages", ["local", "fuse-writeback", "fuse-write-sync"])),
-            "extra_profiles": self.csv_env(ctx, "MANUS_PERF_EXTRA_PROFILES", cfg.get("extra_profiles", ["coding-agent", "none"])),
-            "extra_runs": int(env_value("MANUS_PERF_EXTRA_RUNS", str(cfg.get("extra_runs", 1)), ctx.suite)),
-            "raw_results": env_flag("MANUS_PERF_RAW", bool(cfg.get("raw_results", True)), ctx.suite),
+            "infinite_ttl_read_cache_s": float(env_value("CASE2_PERF_INFINITE_TTL_S", str(cfg.get("infinite_ttl_read_cache_s", 0)), ctx.suite)),
+            "agent_counts": self.int_csv_env(ctx, "CASE2_PERF_AGENT_COUNTS", cfg.get("agent_counts", [2, 4])),
+            "small_file_sizes": self.int_csv_env(ctx, "CASE2_PERF_SMALL_SIZES", cfg.get("small_file_sizes", [1024, 20 * 1024, 100 * 1024])),
+            "small_file_concurrency": self.int_csv_env(ctx, "CASE2_PERF_SMALL_CONCURRENCY", cfg.get("small_file_concurrency", [1, 4, 16])),
+            "small_file_ops": int(env_value("CASE2_PERF_SMALL_OPS", str(cfg.get("small_file_ops", 50)), ctx.suite)),
+            "write_sync_sizes": self.int_csv_env(ctx, "CASE2_PERF_WRITE_SYNC_SIZES", cfg.get("write_sync_sizes", [1024, 20 * 1024, 100 * 1024, 512 * 1024, 2 * 1024 * 1024])),
+            "write_sync_ops": int(env_value("CASE2_PERF_WRITE_SYNC_OPS", str(cfg.get("write_sync_ops", 50)), ctx.suite)),
+            "write_sync_concurrency": self.int_csv_env(ctx, "CASE2_PERF_WRITE_SYNC_CONCURRENCY", cfg.get("write_sync_concurrency", [1, 4])),
+            "namespace_stat_samples": int(env_value("CASE2_PERF_STAT_SAMPLES", str(cfg.get("namespace_stat_samples", 300)), ctx.suite)),
+            "namespace_op_samples": int(env_value("CASE2_PERF_NAMESPACE_OP_SAMPLES", str(cfg.get("namespace_op_samples", 200)), ctx.suite)),
+            "visibility_timeout_s": float(env_value("CASE2_PERF_VISIBILITY_TIMEOUT_S", str(cfg.get("visibility_timeout_s", 30)), ctx.suite)),
+            "cache_invalidation_samples": int(env_value("CASE2_PERF_CACHE_INVALIDATION_SAMPLES", str(cfg.get("cache_invalidation_samples", 30)), ctx.suite)),
+            "routing_sizes": self.int_csv_env(ctx, "CASE2_PERF_ROUTING_SIZES", cfg.get("routing_sizes", [1024, 100 * 1024, 512 * 1024, 2 * 1024 * 1024 - 1, 2 * 1024 * 1024, 4 * 1024 * 1024])),
+            "large_file_sizes": self.int_csv_env(ctx, "CASE2_PERF_LARGE_SIZES", cfg.get("large_file_sizes", [4 * 1024 * 1024, 16 * 1024 * 1024])),
+            "large_file_ops": int(env_value("CASE2_PERF_LARGE_OPS", str(cfg.get("large_file_ops", 10)), ctx.suite)),
+            "extra_repo_id": env_value("CASE2_PERF_EXTRA_REPO", str(cfg.get("extra_repo_id", "cruip-tailwind-dashboard")), ctx.suite),
+            "extra_storages": self.csv_env(ctx, "CASE2_PERF_EXTRA_STORAGES", cfg.get("extra_storages", ["local", "fuse-writeback", "fuse-write-sync"])),
+            "extra_profiles": self.csv_env(ctx, "CASE2_PERF_EXTRA_PROFILES", cfg.get("extra_profiles", ["coding-agent", "none"])),
+            "extra_runs": int(env_value("CASE2_PERF_EXTRA_RUNS", str(cfg.get("extra_runs", 1)), ctx.suite)),
+            "raw_results": env_flag("CASE2_PERF_RAW", bool(cfg.get("raw_results", True)), ctx.suite),
             "sections": {
-                "multi_session_shared": env_flag("MANUS_PERF_MULTI_SESSION_SHARED", bool(sections_default.get("multi_session_shared", True)), ctx.suite),
-                "cross_visibility": env_flag("MANUS_PERF_CROSS_VISIBILITY", bool(sections_default.get("cross_visibility", True)), ctx.suite),
-                "concurrent_distinct": env_flag("MANUS_PERF_CONCURRENT_DISTINCT", bool(sections_default.get("concurrent_distinct", True)), ctx.suite),
-                "concurrent_same_file": env_flag("MANUS_PERF_CONCURRENT_SAME_FILE", bool(sections_default.get("concurrent_same_file", True)), ctx.suite),
-                "namespace_ops": env_flag("MANUS_PERF_NAMESPACE_OPS", bool(sections_default.get("namespace_ops", True)), ctx.suite),
-                "write_sync_small": env_flag("MANUS_PERF_WRITE_SYNC_SMALL", bool(sections_default.get("write_sync_small", True)), ctx.suite),
-                "cache_invalidation": env_flag("MANUS_PERF_CACHE_INVALIDATION", bool(sections_default.get("cache_invalidation", True)), ctx.suite),
-                "routing_2mb": env_flag("MANUS_PERF_ROUTING_2MB", bool(sections_default.get("routing_2mb", True)), ctx.suite),
-                "large_file_s3": env_flag("MANUS_PERF_LARGE_FILE_S3", bool(sections_default.get("large_file_s3", True)), ctx.suite),
-                "single_session": env_flag("MANUS_PERF_SINGLE_SESSION", bool(sections_default.get("single_session", True)), ctx.suite),
-                "file_lock": env_flag("MANUS_PERF_FILE_LOCK", bool(sections_default.get("file_lock", True)), ctx.suite),
-                "extra_clone_build": env_flag("MANUS_PERF_EXTRA_CLONE_BUILD", bool(sections_default.get("extra_clone_build", True)), ctx.suite),
+                "multi_session_shared": env_flag("CASE2_PERF_MULTI_SESSION_SHARED", bool(sections_default.get("multi_session_shared", True)), ctx.suite),
+                "cross_visibility": env_flag("CASE2_PERF_CROSS_VISIBILITY", bool(sections_default.get("cross_visibility", True)), ctx.suite),
+                "concurrent_distinct": env_flag("CASE2_PERF_CONCURRENT_DISTINCT", bool(sections_default.get("concurrent_distinct", True)), ctx.suite),
+                "concurrent_same_file": env_flag("CASE2_PERF_CONCURRENT_SAME_FILE", bool(sections_default.get("concurrent_same_file", True)), ctx.suite),
+                "namespace_ops": env_flag("CASE2_PERF_NAMESPACE_OPS", bool(sections_default.get("namespace_ops", True)), ctx.suite),
+                "write_sync_small": env_flag("CASE2_PERF_WRITE_SYNC_SMALL", bool(sections_default.get("write_sync_small", True)), ctx.suite),
+                "cache_invalidation": env_flag("CASE2_PERF_CACHE_INVALIDATION", bool(sections_default.get("cache_invalidation", True)), ctx.suite),
+                "routing_2mb": env_flag("CASE2_PERF_ROUTING_2MB", bool(sections_default.get("routing_2mb", True)), ctx.suite),
+                "large_file_s3": env_flag("CASE2_PERF_LARGE_FILE_S3", bool(sections_default.get("large_file_s3", True)), ctx.suite),
+                "single_session": env_flag("CASE2_PERF_SINGLE_SESSION", bool(sections_default.get("single_session", True)), ctx.suite),
+                "file_lock": env_flag("CASE2_PERF_FILE_LOCK", bool(sections_default.get("file_lock", True)), ctx.suite),
+                "extra_clone_build": env_flag("CASE2_PERF_EXTRA_CLONE_BUILD", bool(sections_default.get("extra_clone_build", True)), ctx.suite),
             },
         }
 
@@ -203,7 +202,7 @@ class Drive9ManusPerf(BaseModule):
         if read_cache_ttl_s is not None:
             extra.extend(["--read-cache-ttl", f"{int(read_cache_ttl_s)}s"])
         return ctx.target.mount(
-            f"manus_{agent}",
+            f"case2_{agent}",
             remote,
             read_only=read_only,
             profile=profile if profile is not None else self.config(ctx)["profile"],
@@ -262,7 +261,7 @@ class Drive9ManusPerf(BaseModule):
             self.record_unmount(ctx, seed_handle, issues, section="multi_session_shared", op="seed")
 
         for count in cfg["agent_counts"]:
-            progress(f"manus multi_session_shared: agents={count}")
+            progress(f"case2 multi_session_shared: agents={count}")
             mount_values: list[float] = []
             read_values: list[float] = []
             mount_errors = 0
@@ -335,7 +334,7 @@ class Drive9ManusPerf(BaseModule):
         remote = f"{remote_base}/cross-visibility"
         ctx.target.mkdir_remote(remote)
         for size in cfg["small_file_sizes"]:
-            progress(f"manus cross_visibility: size={size}")
+            progress(f"case2 cross_visibility: size={size}")
             write_values: list[float] = []
             visible_values: list[float] = []
             read_values: list[float] = []
@@ -418,7 +417,7 @@ class Drive9ManusPerf(BaseModule):
         ctx.target.mkdir_remote(remote)
         for count in cfg["agent_counts"]:
             for size in cfg["small_file_sizes"]:
-                progress(f"manus concurrent_distinct: agents={count} size={size}")
+                progress(f"case2 concurrent_distinct: agents={count} size={size}")
                 payload = stable_bytes(size, seed=size + count)
                 write_values: list[float] = []
                 read_values: list[float] = []
@@ -476,16 +475,16 @@ class Drive9ManusPerf(BaseModule):
 
     def run_concurrent_same_file(self, ctx: Context, cfg: dict[str, Any], remote_base: str, raw_dir: Path, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """P0-8: multiple agents concurrently read/write the *same* file. Per
-        Minghua the requirement is to document behavior, not guarantee conflict
-        resolution. We record the observed outcome (last-writer content, read
-        consistency) and latency, and flag any data corruption (non-decodable
-        sizes)."""
+        the case2 requirements the goal is to document behavior, not guarantee
+        conflict resolution. We record the observed outcome (last-writer
+        content, read consistency) and latency, and flag any data corruption
+        (non-decodable sizes)."""
         rows: list[dict[str, Any]] = []
         remote = f"{remote_base}/concurrent-same-file"
         ctx.target.mkdir_remote(remote)
         for count in cfg["agent_counts"]:
             for size in cfg["small_file_sizes"]:
-                progress(f"manus concurrent_same_file: agents={count} size={size}")
+                progress(f"case2 concurrent_same_file: agents={count} size={size}")
                 payload = stable_bytes(size, seed=size)
                 write_values: list[float] = []
                 read_values: list[float] = []
@@ -569,7 +568,7 @@ class Drive9ManusPerf(BaseModule):
         rows: list[dict[str, Any]] = []
         for scale_id in cfg["selected_scales"]:
             if scale_id not in cfg["scales"]:
-                raise ModuleSkip(f"unknown BLACKBOX_MANUS_PERF_SCALES value: {scale_id}", "configuration skip")
+                raise ModuleSkip(f"unknown BLACKBOX_CASE2_PERF_SCALES value: {scale_id}", "configuration skip")
             scale = cfg["scales"][scale_id]
             remote = f"{remote_base}/namespace-{scale_id}"
             ctx.target.mkdir_remote(remote)
@@ -602,7 +601,7 @@ class Drive9ManusPerf(BaseModule):
             "mount_ms": mount_ms,
         }
         try:
-            manifest = handle.mountpoint / ".drive9-manus-dataset.json"
+            manifest = handle.mountpoint / ".drive9-case2-dataset.json"
             expected = {"scale": scale_id, "bytes": int(scale["bytes"]), "files": int(scale["files"])}
             if manifest.exists():
                 try:
@@ -613,7 +612,7 @@ class Drive9ManusPerf(BaseModule):
                     seconds = float(current.get("seconds", 0.0))
                     row.update({"status": "cached", "created_files": int(scale["files"]), "created_bytes": int(scale["bytes"]), "count": int(scale["files"]), **self.latency_summary([seconds])})
                     return row
-            progress(f"manus dataset generate: {scale_id} bytes={scale['bytes']} files={scale['files']}")
+            progress(f"case2 dataset generate: {scale_id} bytes={scale['bytes']} files={scale['files']}")
             data_dir = handle.mountpoint / "data"
             if data_dir.exists():
                 shutil.rmtree(data_dir)
@@ -634,7 +633,7 @@ class Drive9ManusPerf(BaseModule):
                     created_files += 1
                     created_bytes += size
                     if created_files in checkpoints:
-                        progress(f"manus dataset progress: {created_files}/{int(scale['files'])}")
+                        progress(f"case2 dataset progress: {created_files}/{int(scale['files'])}")
                 detail = "completed"
             except OSError as exc:
                 detail = f"I/O error after {created_files}/{int(scale['files'])} files: {exc}"
@@ -665,7 +664,7 @@ class Drive9ManusPerf(BaseModule):
                 values: list[float] = []
                 errors = 0
                 for run_idx in range(int(cfg["runs"])):
-                    result = ctx.target.run_cmd(f"manus-ns-{scale_id}-{name}-run-{run_idx}", command, timeout=600, shell=True)
+                    result = ctx.target.run_cmd(f"case2-ns-{scale_id}-{name}-run-{run_idx}", command, timeout=600, shell=True)
                     if result.ok:
                         values.append(result.seconds)
                     else:
@@ -741,13 +740,13 @@ class Drive9ManusPerf(BaseModule):
 
     def run_write_sync_small(self, ctx: Context, cfg: dict[str, Any], remote_base: str, raw_dir: Path, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """P0-3 / 口径: write-sync mode small-file write latency, focused on
-        files <= 2MB (the Manus Nexus majority workload)."""
+        files <= 2MB (the majority workload)."""
         rows: list[dict[str, Any]] = []
         remote = f"{remote_base}/write-sync-small"
         ctx.target.mkdir_remote(remote)
         for size in cfg["write_sync_sizes"]:
             for concurrency in cfg["write_sync_concurrency"]:
-                progress(f"manus write_sync_small: size={size} concurrency={concurrency}")
+                progress(f"case2 write_sync_small: size={size} concurrency={concurrency}")
                 ops = max(1, int(cfg["write_sync_ops"]))
                 runs = int(cfg["runs"])
                 payload = stable_bytes(size, seed=size + concurrency)
@@ -839,7 +838,7 @@ class Drive9ManusPerf(BaseModule):
         ctx.target.mkdir_remote(remote)
         samples = max(1, int(cfg["cache_invalidation_samples"]))
         for size in cfg["small_file_sizes"]:
-            progress(f"manus cache_invalidation: size={size}")
+            progress(f"case2 cache_invalidation: size={size}")
             payload_a = stable_bytes(size, seed=size)
             payload_b = stable_bytes(size, seed=size + 1)
             digest_a = hashlib.sha256(payload_a).hexdigest()
@@ -933,7 +932,7 @@ class Drive9ManusPerf(BaseModule):
         ctx.target.mkdir_remote(remote)
         threshold = 2 * 1024 * 1024
         for size in cfg["routing_sizes"]:
-            progress(f"manus routing_2mb: size={size}")
+            progress(f"case2 routing_2mb: size={size}")
             tier = "small_tidb" if size < threshold else ("boundary" if size == threshold else "large_s3")
             payload = stable_bytes(size, seed=size)
             create_values: list[float] = []
@@ -987,7 +986,7 @@ class Drive9ManusPerf(BaseModule):
         remote = f"{remote_base}/large-file-s3"
         ctx.target.mkdir_remote(remote)
         for size in cfg["large_file_sizes"]:
-            progress(f"manus large_file_s3: size={size}")
+            progress(f"case2 large_file_s3: size={size}")
             payload = stable_bytes(size, seed=size)
             create_values: list[float] = []
             read_values: list[float] = []
@@ -1065,7 +1064,7 @@ class Drive9ManusPerf(BaseModule):
             "created_bytes": 0,
         }
         try:
-            manifest = handle.mountpoint / ".drive9-manus-single-dataset.json"
+            manifest = handle.mountpoint / ".drive9-case2-single-dataset.json"
             expected = {"scale": scale_id, "combo": combo_name, "bytes": int(scale["bytes"]), "files": int(scale["files"])}
             if manifest.exists():
                 try:
@@ -1166,8 +1165,9 @@ class Drive9ManusPerf(BaseModule):
     def run_file_lock(self, ctx: Context, cfg: dict[str, Any], remote_base: str, raw_dir: Path, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """File lock: confirm current Drive9 behavior. We attempt POSIX flock
         on a file through two concurrent mounts and record whether locks are
-        honored (cross-mount exclusion) or not. Minghua stated file lock is not
-        a hard requirement — the report just needs to state current behavior."""
+        honored (cross-mount exclusion) or not. The case2 requirements state
+        file lock is not a hard requirement — the report just needs to state
+        current behavior."""
         rows: list[dict[str, Any]] = []
         remote = f"{remote_base}/file-lock"
         ctx.target.mkdir_remote(remote)
@@ -1273,7 +1273,7 @@ class Drive9ManusPerf(BaseModule):
         for run_idx in range(1, runs + 1):
             for profile in profiles:
                 for storage in storages:
-                    progress(f"manus extra_clone_build: run={run_idx} profile={profile} storage={storage}")
+                    progress(f"case2 extra_clone_build: run={run_idx} profile={profile} storage={storage}")
                     sample = self.run_extra_sample(ctx, cfg, repo, commit, storage, profile, run_idx, env, failures)
                     samples.append(sample)
                     ctx.recorder.event(sample)
@@ -1294,7 +1294,7 @@ class Drive9ManusPerf(BaseModule):
 
     def base_repo_env(self, ctx: Context) -> dict[str, str]:
         env = ctx.target.base_env()
-        cache_root = ctx.tmp_dir / "manus-extra-build" / "shared-cache"
+        cache_root = ctx.tmp_dir / "case2-extra-build" / "shared-cache"
         values = {
             "COREPACK_HOME": cache_root / "corepack",
             "npm_config_cache": cache_root / "npm",
@@ -1340,15 +1340,15 @@ class Drive9ManusPerf(BaseModule):
         sample_env = self.sample_env(ctx, str(repo["id"]), storage, profile, run_index, env)
         phases: list[dict[str, Any]] = []
         if storage == "local":
-            checkout_parent = ctx.tmp_dir / "manus-extra-build" / "local" / str(repo["id"]) / f"run-{run_index}-{profile}"
+            checkout_parent = ctx.tmp_dir / "case2-extra-build" / "local" / str(repo["id"]) / f"run-{run_index}-{profile}"
             from harness.core import ensure_empty
 
             ensure_empty(checkout_parent)
             checkout = checkout_parent / "repo"
-            phases.append(self.run_phase(ctx, "clone", [["git", "clone", "--no-checkout", str(repo["url"]), str(checkout)]], checkout_parent, 1800, sample_env, shell=False, name=f"manus-extra-local-{repo['id']}-{profile}-run-{run_index}-clone"))
-            phases.append(self.run_phase(ctx, "checkout", [["git", "-C", str(checkout), "checkout", "--detach", commit]], checkout_parent, 1800, sample_env, shell=False, name=f"manus-extra-local-{repo['id']}-{profile}-run-{run_index}-checkout"))
-            phases.append(self.run_phase(ctx, "install", [str(c) for c in repo.get("install", ["corepack prepare pnpm@10.33.0 --activate", "corepack pnpm install --frozen-lockfile"])], checkout, 1800, sample_env, shell=True, name=f"manus-extra-local-{repo['id']}-{profile}-run-{run_index}-install"))
-            phases.append(self.run_phase(ctx, "build", [str(c) for c in repo.get("build", ["corepack pnpm run build"])], checkout, 1800, sample_env, shell=True, name=f"manus-extra-local-{repo['id']}-{profile}-run-{run_index}-build"))
+            phases.append(self.run_phase(ctx, "clone", [["git", "clone", "--no-checkout", str(repo["url"]), str(checkout)]], checkout_parent, 1800, sample_env, shell=False, name=f"case2-extra-local-{repo['id']}-{profile}-run-{run_index}-clone"))
+            phases.append(self.run_phase(ctx, "checkout", [["git", "-C", str(checkout), "checkout", "--detach", commit]], checkout_parent, 1800, sample_env, shell=False, name=f"case2-extra-local-{repo['id']}-{profile}-run-{run_index}-checkout"))
+            phases.append(self.run_phase(ctx, "install", [str(c) for c in repo.get("install", ["corepack prepare pnpm@10.33.0 --activate", "corepack pnpm install --frozen-lockfile"])], checkout, 1800, sample_env, shell=True, name=f"case2-extra-local-{repo['id']}-{profile}-run-{run_index}-install"))
+            phases.append(self.run_phase(ctx, "build", [str(c) for c in repo.get("build", ["corepack pnpm run build"])], checkout, 1800, sample_env, shell=True, name=f"case2-extra-local-{repo['id']}-{profile}-run-{run_index}-build"))
             return self.assemble_sample(repo, commit, storage, profile, run_index, phases, failures)
         # FUSE storages.
         durability = DURABILITY_WRITEBACK if storage == "fuse-writeback" else DURABILITY_WRITE_SYNC
@@ -1357,17 +1357,17 @@ class Drive9ManusPerf(BaseModule):
         handle = self.mount_shared(ctx, remote, agent="extra_build", cache_key=f"extra-{storage}-{profile}-run-{run_index}", profile=profile, durability=durability)
         try:
             checkout = handle.mountpoint / "repo"
-            phases.append(self.run_phase(ctx, "clone", [["git", "clone", "--no-checkout", str(repo["url"]), str(checkout)]], handle.mountpoint, 1800, sample_env, shell=False, name=f"manus-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-clone"))
-            phases.append(self.run_phase(ctx, "checkout", [["git", "-C", str(checkout), "checkout", "--detach", commit]], handle.mountpoint, 1800, sample_env, shell=False, name=f"manus-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-checkout"))
-            phases.append(self.run_phase(ctx, "install", [str(c) for c in repo.get("install", ["corepack prepare pnpm@10.33.0 --activate", "corepack pnpm install --frozen-lockfile"])], checkout, 1800, sample_env, shell=True, name=f"manus-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-install"))
-            phases.append(self.run_phase(ctx, "build", [str(c) for c in repo.get("build", ["corepack pnpm run build"])], checkout, 1800, sample_env, shell=True, name=f"manus-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-build"))
+            phases.append(self.run_phase(ctx, "clone", [["git", "clone", "--no-checkout", str(repo["url"]), str(checkout)]], handle.mountpoint, 1800, sample_env, shell=False, name=f"case2-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-clone"))
+            phases.append(self.run_phase(ctx, "checkout", [["git", "-C", str(checkout), "checkout", "--detach", commit]], handle.mountpoint, 1800, sample_env, shell=False, name=f"case2-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-checkout"))
+            phases.append(self.run_phase(ctx, "install", [str(c) for c in repo.get("install", ["corepack prepare pnpm@10.33.0 --activate", "corepack pnpm install --frozen-lockfile"])], checkout, 1800, sample_env, shell=True, name=f"case2-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-install"))
+            phases.append(self.run_phase(ctx, "build", [str(c) for c in repo.get("build", ["corepack pnpm run build"])], checkout, 1800, sample_env, shell=True, name=f"case2-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-build"))
             return self.assemble_sample(repo, commit, storage, profile, run_index, phases, failures)
         finally:
             ctx.target.unmount(handle)
 
     def sample_env(self, ctx: Context, repo_id: str, storage: str, profile: str, run_index: int, base: dict[str, str]) -> dict[str, str]:
         env = dict(base)
-        sample = ctx.tmp_dir / "manus-extra-build" / "sample-cache" / storage / profile / repo_id / f"run-{run_index}"
+        sample = ctx.tmp_dir / "case2-extra-build" / "sample-cache" / storage / profile / repo_id / f"run-{run_index}"
         sample.mkdir(parents=True, exist_ok=True)
         return env
 
@@ -1401,7 +1401,7 @@ class Drive9ManusPerf(BaseModule):
         if not ok:
             failures.append(f"{repo['id']} {storage} {profile} run {run_index}: {detail}")
         return {
-            "type": "manus_extra_clone_build",
+            "type": "case2_extra_clone_build",
             "module": self.id,
             "repo": str(repo["id"]),
             "commit": commit,
@@ -1483,7 +1483,7 @@ class Drive9ManusPerf(BaseModule):
                     ctx.metric(f"{self.id}.extra.{r['repo']}.{profile}.{r['storage']}.vs_local_ratio", ratio, "x")
         write_json(artifact / "extra_summary.json", {"repo": str(repo["id"]), "commit": commit, "rows": rows, "ratios": ratios, "failures": failures})
         lines = [
-            "# Manus Extra: vite+react+tailwind Clone+Build Comparison",
+            "# Case2 Extra: vite+react+tailwind Clone+Build Comparison",
             "",
             f"- Repo: `{repo['id']}` ({repo.get('url')}) @ `{commit}`",
             f"- Failures: `{len(failures)}`",
@@ -1525,7 +1525,7 @@ class Drive9ManusPerf(BaseModule):
             status_counts[str(row.get("status", ""))] = status_counts.get(str(row.get("status", "")), 0) + 1
         sections_present = {row.get("section") for row in rows}
         lines = [
-            "# Drive9 Manus Persistent-Sandbox Performance Report",
+            "# Drive9 Case2 Shared-Storage Performance Report",
             "",
             f"- Session: `{ctx.session}`",
             f"- Result dir: `{ctx.result_dir}`",
@@ -1677,7 +1677,7 @@ class Drive9ManusPerf(BaseModule):
             "errors": 0 if status in {"completed", "skipped"} else 1,
             "error_rate": 0.0 if status in {"completed", "skipped"} else 1.0,
             "runs": 1,
-            **Drive9ManusPerf.latency_summary([seconds] if seconds else []),
+            **CustomCase2.latency_summary([seconds] if seconds else []),
         }
 
     @staticmethod

@@ -6,7 +6,7 @@ on:
   workflow_call:
     inputs:
       group:
-        description: "Module group to run (community, juicefs, drive9, git, customer, or all)"
+        description: "Module group to run (community, juicefs, drive9, git, custom, or all)"
         required: false
         default: "community"
         type: string
@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       group:
-        description: "Module group to run (community, juicefs, drive9, git, customer, or all)"
+        description: "Module group to run (community, juicefs, drive9, git, custom, or all)"
         required: false
         default: "all"
         type: string
