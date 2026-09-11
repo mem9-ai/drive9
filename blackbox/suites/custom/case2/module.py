@@ -26,12 +26,11 @@ DURABILITY_WRITE_SYNC = "write-sync"
 DURABILITY_INTERACTIVE = "interactive"
 
 
-class Drive9Case2Perf(BaseModule):
-    """Customer benchmark covering the Case2 Persistent Sandbox / cloud-PC
-    shared-storage scenario.
+class CustomCase2(BaseModule):
+    """Shared-storage benchmark covering a persistent agent workspace
+    scenario.
 
-    Implements the test requirements captured in the 2026-06-23 meeting with
-    the case2 requirements / Case2:
+    Implements the case2 test requirements:
 
     - Multi-session shared workspace: multiple agents mount the same workspace,
       cross-mount read visibility, concurrent read/write of distinct and same
@@ -46,7 +45,7 @@ class Drive9Case2Perf(BaseModule):
     """
 
     description = (
-        "Case2 Persistent Sandbox / cloud-PC shared-storage benchmark: "
+        "Case2 shared-storage benchmark: "
         "multi-session shared workspace, read/write consistency, cache "
         "invalidation, write-sync small-file latency, 2MB routing, single-"
         "session TTL baselines, file-lock behavior, and a vite+react+tailwind "
@@ -476,10 +475,10 @@ class Drive9Case2Perf(BaseModule):
 
     def run_concurrent_same_file(self, ctx: Context, cfg: dict[str, Any], remote_base: str, raw_dir: Path, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """P0-8: multiple agents concurrently read/write the *same* file. Per
-        the case2 requirements the requirement is to document behavior, not guarantee conflict
-        resolution. We record the observed outcome (last-writer content, read
-        consistency) and latency, and flag any data corruption (non-decodable
-        sizes)."""
+        the case2 requirements the goal is to document behavior, not guarantee
+        conflict resolution. We record the observed outcome (last-writer
+        content, read consistency) and latency, and flag any data corruption
+        (non-decodable sizes)."""
         rows: list[dict[str, Any]] = []
         remote = f"{remote_base}/concurrent-same-file"
         ctx.target.mkdir_remote(remote)
@@ -741,7 +740,7 @@ class Drive9Case2Perf(BaseModule):
 
     def run_write_sync_small(self, ctx: Context, cfg: dict[str, Any], remote_base: str, raw_dir: Path, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """P0-3 / 口径: write-sync mode small-file write latency, focused on
-        files <= 2MB (the Case2 Nexus majority workload)."""
+        files <= 2MB (the majority workload)."""
         rows: list[dict[str, Any]] = []
         remote = f"{remote_base}/write-sync-small"
         ctx.target.mkdir_remote(remote)
@@ -1166,8 +1165,9 @@ class Drive9Case2Perf(BaseModule):
     def run_file_lock(self, ctx: Context, cfg: dict[str, Any], remote_base: str, raw_dir: Path, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """File lock: confirm current Drive9 behavior. We attempt POSIX flock
         on a file through two concurrent mounts and record whether locks are
-        honored (cross-mount exclusion) or not. the case2 requirements stated file lock is not
-        a hard requirement — the report just needs to state current behavior."""
+        honored (cross-mount exclusion) or not. The case2 requirements state
+        file lock is not a hard requirement — the report just needs to state
+        current behavior."""
         rows: list[dict[str, Any]] = []
         remote = f"{remote_base}/file-lock"
         ctx.target.mkdir_remote(remote)
@@ -1525,7 +1525,7 @@ class Drive9Case2Perf(BaseModule):
             status_counts[str(row.get("status", ""))] = status_counts.get(str(row.get("status", "")), 0) + 1
         sections_present = {row.get("section") for row in rows}
         lines = [
-            "# Drive9 Case2 Persistent-Sandbox Performance Report",
+            "# Drive9 Case2 Shared-Storage Performance Report",
             "",
             f"- Session: `{ctx.session}`",
             f"- Result dir: `{ctx.result_dir}`",
@@ -1677,7 +1677,7 @@ class Drive9Case2Perf(BaseModule):
             "errors": 0 if status in {"completed", "skipped"} else 1,
             "error_rate": 0.0 if status in {"completed", "skipped"} else 1.0,
             "runs": 1,
-            **Drive9Case2Perf.latency_summary([seconds] if seconds else []),
+            **CustomCase2.latency_summary([seconds] if seconds else []),
         }
 
     @staticmethod
