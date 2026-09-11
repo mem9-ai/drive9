@@ -20,7 +20,7 @@
 | 第 2 项 cap on | ✅ 完成 | 早前实测全绿；本次回归验证：cap on 下 `crash01` `Summary: 0 errors out of 94 tests`（新 fork 亦然） |
 | 第 1 项 cap off 的**读路径** | ✅ 已修复并落地 | fork `e7a7fe2a`：隔离 spill **83–87 s → 37 s**；每读一次的 `writer.Flush` 9 479 次/43.2 s → 891 次/15.7 s；`crash01` 由「`database is locked`」变为 **0 errors / 94 tests**（空闲主机 25–33 s） |
 | 第 1 项 cap off 的**数据损坏** | ✅ 已消除 | 6 轮单客户端 spill + `integrity_check` 全 `ok`；verify 构建逐字节比对 **30 612 次读、0 不一致** |
-| 第 1 项 cap off 的 `crash01` 稳定性 | ⚠️ **未完成** | 主机负载高时 `crash02.subtest` 第 53 行 `--wait all` 超时：崩溃客户端 `--exit 1` 退出时持锁等待 daemon 排空该事务（负载机上 ~35 s），对端 10 s busy timeout 先到期 |
+| 第 1 项 cap off 的 `crash01` 稳定性 | ⚠️ **未完成**（原因已更正） | `crash02.subtest` 第 53 行 `--wait all` 超时：崩溃客户端 `--exit 1` 在**整个事务**期间持有 SQLite 写锁，对端的 `UPDATE task` 撞上 10 s busy timeout。**不是** close 排空的问题——mount 的 perf 计数器显示整轮 `flush count=46 avg=2.1 ms max=20.6 ms`。即：~35 s 的 spill 装不进 10 s 的 busy timeout（cap on 时同一事务 ~13 s，所以过）。**唯一剩下的差距就是 spill 速度（38 s → ~10 s）** |
 | 第 1 项 cap off 的其余 gate | ✅ 已修复（readdirplus 属性） | `accept-fork-patch.sh`（pin `e7a7fe2a`）：spill **40 s**、`crash01` rc=1（负载机）、**三个 `sqlite-correctness` 各 20/20**。cap off 的 extent gate：`git-ops` 70/74、`supervision` 50/51、`fuse-sqlite-commit-sequence` 失败 —— **同一主机、同一 profile、用未改动的基线二进制跑出完全相同的失败项**，所以不是本次改动的回归；它们同属「重新挂载后读不到刚写入的内容」这一族（缓存失效）。**已修复**：根因是目录列表只读投影表（extent 文件 `size_bytes`=0、`mode`=NULL），readdirplus 把 i_size=0 交给内核 → 之后所有读都为空、symlink 显示为普通文件（`T`）；列表改为一次性 overlay `jfs_node.length`+类型后：git-ops **74/74**、supervision **51/51**、commit-sequence **19/19**。`blackbox community.sqlite` 正在跑 |
 
 ## 3. 本次落地的改动（fork `e7a7fe2a`；drive9 侧提交 `extent: answer reads from the JuiceFS write buffer`，随历史清洗后 SHA 为 `4c3cb5d5`）
@@ -74,7 +74,12 @@
 
 ## 6. 下一步（按杠杆排序）
 
-1. **让 `crash01` 在负载机上也能 `rc=0`**：失败点是崩溃客户端退出时的排空延迟（持锁 → 对端 10 s busy timeout）。可查/可做的方向：
+1. **让 spill 从 38 s 降到 ~10 s**（`crash01`/`community.sqlite` 的唯一剩余差距）。当前 37 s 的构成与两个具体杠杆：
+   * 891 次「读触发 flush」共 15.7 s：其中多数是 `pending > 0`（有提交在途）就直接 flush——改为先 `WaitWrites` 等队列落地、再从 meta 读，可省下大部分；另一部分是 slice 的「已上传但未提交」前缀，可从对象存储直接读（对象不可变）。
+   * 992 次 meta 提交 × 10.4 ms = 10.3 s：把 flush 路径的提交批量化。
+   * 3 943 次 PUT × ~10 ms（并发）：对象合并/更少更大的 slice。
+
+   旧的（现已否定的）假设与弯路，留档避免重复：
    - `VFS.Release`/`Close` 的 flush 是否必须等对象 PUT 完成（writeback 语义下本地 stage 已是持久化边界）；
    - 客户端 `--exit 1` 时内核 close 是否先释放 POSIX 锁再等 FLUSH（若顺序相反，锁被无谓地多持有一段排空时间）；
    - 把排空本身变便宜：现在 992 次 meta 提交 × 10.4 ms + 3 943 次 PUT × ~10 ms 是 37 s 的大头。
