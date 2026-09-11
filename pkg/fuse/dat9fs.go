@@ -29,6 +29,11 @@ import (
 // candidate after discovery but before the second TryLock in candidateLoop.
 var testHookAfterSamePathDirtyHandleScan func(path string)
 
+// testHookAfterCleanSiblingCopy lets race-focused unit tests advance the
+// committed revision after a clean sibling's bytes are copied but before the
+// latest-revision revalidation, proving the stale candidate is discarded.
+var testHookAfterCleanSiblingCopy func(path string)
+
 // testHookBeforeGVisorShadowSpillFlushFence lets race-focused unit tests pause
 // a gVisor ShadowSpill Flush after its initial supersession check but before it
 // acquires the same-path remote commit fence.
@@ -2609,6 +2614,11 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandlesWithSize(path string, re
 		}
 		fs.discardSupersededMutationLocked(fh)
 		if fs.handleCanAdoptCommittedRevisionLocked(fh) {
+			if fh.appendLog.sqliteWALTruncated {
+				fs.debugf("append-log trace event=sibling_truncate_rebind path=%q new_rev=%d new_size=%d pre_base_rev=%d pre_has_rewrite_base=%t pre_rewrite_base_rev=%d pre_sqlite_wal_truncated=%t pre_append_safe=%t", fh.Path, revision, committedSize, fh.BaseRev, fh.appendLog.hasRewriteBase, fh.appendLog.rewriteBaseRevision, fh.appendLog.sqliteWALTruncated, fh.appendLog.appendSafe)
+				fh.appendLogAdoptCommittedBaseline(revision, committedSize)
+				fs.debugf("append-log trace event=sibling_truncate_rebound path=%q base_rev=%d has_rewrite_base=%t rewrite_base_rev=%d sqlite_wal_truncated=%t append_safe=%t", fh.Path, fh.BaseRev, fh.appendLog.hasRewriteBase, fh.appendLog.rewriteBaseRevision, fh.appendLog.sqliteWALTruncated, fh.appendLog.appendSafe)
+			}
 			cleanBuffer := fh.Dirty != nil
 			if cleanBuffer && fs.clearRemovedCommittedShadowLocked(fh, revision, committedSize, true) {
 				fh.Unlock()
@@ -3936,6 +3946,37 @@ func writeBufferHasLoadedFullRange(wb *WriteBuffer) bool {
 	return true
 }
 
+// growthPatchSafeLocked reports whether the PATCH route can construct every
+// part overlapping the grown region [OrigSize, size). Each such part must be
+// dirty and loaded: the server presigns beyond-original parts even when they
+// are absent from the client's dirty set (pkg/backend/patch.go), and the
+// fallback callback would upload an empty body for them, while PartData
+// zero-fills an evicted dirty part. The logical size only grows through
+// Write (marks the written part dirty) or Truncate (marks the extended region
+// dirty), so a loaded part in the growth region is necessarily dirty.
+func (fs *Dat9FS) growthPatchSafeLocked(fh *FileHandle, size int64) bool {
+	if fh == nil || fh.Dirty == nil || size <= fh.OrigSize {
+		return true
+	}
+	partSize := fh.Dirty.PartSize()
+	if partSize <= 0 {
+		return false
+	}
+	dirty := fh.Dirty.DirtyPartNumbers()
+	dirtySet := make(map[int]bool, len(dirty))
+	for _, pn := range dirty {
+		dirtySet[pn] = true
+	}
+	first := int(fh.OrigSize / partSize)
+	last := int((size - 1) / partSize)
+	for part := first; part <= last; part++ {
+		if !dirtySet[part+1] || !fh.Dirty.IsPartLoaded(part) {
+			return false
+		}
+	}
+	return true
+}
+
 // finalizeHandleFlushLocked updates the live handle and inode cache after a
 // successful upload using the exact CAS revision that completed, when known.
 // Callers must hold fh.mu.
@@ -4837,11 +4878,70 @@ func (fs *Dat9FS) readSQLitePersistentJournalVisibleRange(path string, skip *Fil
 		}
 		time.Sleep(sqliteSidecarDirtyWaitInterval)
 	}
+	if latest := fs.latestCommittedRevision(path); latest > 0 {
+		if data, n, ok := fs.readSQLitePersistentJournalCleanSiblingRange(path, skip, latest, offset, reqSize); ok {
+			return data, n, true, gofuse.OK, "sqlite-sidecar-clean-sibling"
+		}
+	}
 	cachedData, cachedN, cachedOK := fs.readSQLitePersistentJournalCommittedCache(path, fallbackRevision, offset, reqSize)
 	if cachedOK {
 		return cachedData, cachedN, true, gofuse.OK, "sqlite-sidecar-committed-cache"
 	}
 	return nil, 0, false, gofuse.OK, ""
+}
+
+// readSQLitePersistentJournalCleanSiblingRange serves a sidecar read from a
+// clean sibling whose revision equals the latest committed revision. A
+// behind-revision clean buffer is never served: the shared -shm can point
+// readers at a newer fsync-committed extent, and a stale buffer would produce
+// short reads.
+func (fs *Dat9FS) readSQLitePersistentJournalCleanSiblingRange(path string, skip *FileHandle, revision int64, offset int64, reqSize uint32) ([]byte, int, bool) {
+	if fs == nil || fs.openHandles == nil || path == "" || revision <= 0 || reqSize == 0 || offset < 0 {
+		return nil, 0, false
+	}
+	end := offset + int64(reqSize)
+	for _, src := range fs.openHandles.SnapshotPath(path) {
+		if src == nil || src == skip {
+			continue
+		}
+		if !src.TryLock() {
+			continue
+		}
+		eligible := src.Dirty != nil && src.DirtySeq == 0 && !src.Dirty.HasDirtyParts() &&
+			src.BaseRev == revision && !src.IsNew && !src.ZeroBase &&
+			!src.Unlinked && !src.UnlinkedSnapshot && src.UnlinkedData == nil
+		if !eligible || end > src.Dirty.Size() {
+			src.Unlock()
+			continue
+		}
+		buf := make([]byte, int(reqSize))
+		ps := src.Dirty.PartSize()
+		firstPart := int(offset / ps)
+		lastPart := int((end - 1) / ps)
+		for p := firstPart; p <= lastPart; p++ {
+			if !src.Dirty.IsPartLoaded(p) {
+				src.Unlock()
+				return nil, 0, false
+			}
+		}
+		n := src.Dirty.ReadAt(offset, buf)
+		src.Unlock()
+		if n != len(buf) {
+			return nil, 0, false
+		}
+		if testHookAfterCleanSiblingCopy != nil {
+			testHookAfterCleanSiblingCopy(path)
+		}
+		// Revalidate: a same-path commit can advance the global revision while
+		// this sibling was locked (its refresh uses TryLock and skips a locked
+		// handle), so the copied bytes may be behind what the shared -shm
+		// points at. Discard the candidate and fall back to the remote read.
+		if fs.latestCommittedRevision(path) != revision {
+			return nil, 0, false
+		}
+		return buf, n, true
+	}
+	return nil, 0, false
 }
 
 // rebindStaleCleanSamePathReadCandidateLocked refreshes a clean same-path read
@@ -13275,7 +13375,9 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 
 	threshold := fs.negotiatedInlineThreshold()
 	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
-	canPatchExisting := threshold > 0 && fh.OrigSize >= threshold && size <= fh.OrigSize
+	canPatchExisting := threshold > 0 && fh.OrigSize >= threshold &&
+		(size <= fh.OrigSize || !isSQLitePersistentJournalPath(fh.Path)) &&
+		fs.growthPatchSafeLocked(fh, size)
 	if fh.StorageClass == storageClassDB9 {
 		// Authoritative: the remote object is stored inline, so PATCH
 		// (S3 UploadPartCopy-based) is not applicable regardless of size.
@@ -14490,7 +14592,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		mutationSeq := fh.DirtySeq
 		uploadStart := time.Now()
 		fs.debugf("fsync writeback upload start path=%s", fh.Path)
-		committedRev, err := fs.uploader.UploadSyncWithRevision(ctx, fh.Path)
+		uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+		committedRev, err := fs.uploader.UploadSyncWithRevision(uploadCtx, fh.Path)
+		uploadCancel()
 		fs.debugDurationf(uploadStart, 0, "fsync writeback upload done path=%s err=%v", fh.Path, err)
 		if err != nil {
 			safeLogPrintf("fsync writeback upload failed for %s: %v", fh.Path, err)
@@ -15704,7 +15808,9 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// OrigSize, new parts have no server-side original data and the patch
 	// callback cannot construct correct content. Consistent with write-sync
 	// path's canPatchExisting guard (line ~9912).
-	usePatch := !useDirectPUT && threshold > 0 && handleOrigSize >= threshold && size <= handleOrigSize
+	usePatch := !useDirectPUT && threshold > 0 && handleOrigSize >= threshold &&
+		(size <= handleOrigSize || !isSQLitePersistentJournalPath(fh.Path)) &&
+		fs.growthPatchSafeLocked(fh, size)
 	if fh.StorageClass == storageClassDB9 {
 		// Authoritative: remote object is stored inline; PATCH requires S3.
 		// A known-S3 class needs no override: when OrigSize < threshold the
