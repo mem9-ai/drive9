@@ -89,7 +89,8 @@
 - cap off 下 WAL 模式的**多客户端崩溃恢复**仍会打印 `database disk image is malformed`（同一负载下 rollback journal 模式 0 条）：
   在**本 fork 之前**就存在（是否由我的改动引入无法直接 A/B，因为旧二进制在该负载下根本跑不完第一轮就锁超时）。
   它出现在 `crash02.subtest` 的第 2 轮，且该轮末尾的 `integrity_check` 仍报 ok —— 症状像跨进程 WAL/SHM 视图不一致，值得单独查（`-shm` 走 transient local overlay + `FOPEN_KEEP_CACHE`，见 `pkg/fuse`）。
-- `accept-fork-patch.sh` 的落盘验收（pin `e7a7fe2a`）：spill 40 s、`crash01` rc=1 67 s（负载机、无 Summary）、三个 `sqlite-correctness` 20/20。**空闲主机上 crash01 曾两次 0 errors/94**，所以这一项与环境负载强相关，重跑前先看 `uptime`。
+- `accept-fork-patch.sh` 的落盘验收（pin `e7a7fe2a`）：spill 40 s、`crash01` rc=1 67 s、三个 `sqlite-correctness` 20/20。
+- **空闲主机复测（负载 0.2）**：spill 38 s；`crash01` 两次都是 rc=1（56 s / 84 s，`--wait all` 超时 + 对端 `database is locked`），但 **corrupt=0**（无 `malformed`）。所以「崩溃客户端退出前持锁排空事务」是稳定复现的最后一关，不是抖动；而早前两次 `0 errors out of 94 tests` 出现在**无 corruption 修复**的中间版本上，接手人不要把它当作当前基线。
 
 ## 8. 已知坑（都踩过）
 
