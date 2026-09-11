@@ -356,6 +356,33 @@ Status of the delegated attempt (2026-09-10): a background implementation sessio
 One-shot acceptance for a candidate fork patch: `bash /home/ec2-user/night/accept-fork-patch.sh [tree]` — prints the effective `replace`, builds, then reports the isolated spill seconds, `crash01`'s `Summary: N errors out of M tests`, and the `RESULT:` line of the extent cap-off, extent cap-on and classic cap-off `sqlite-correctness` gates (targets: spill < 10 s, 0/94, 20/20 each).
 * Isolated spill repro (the fastest signal, ~2 min): `/tmp/bigspill2.test` with `$SQLITE_TOOLS/mptester probe.db --sync --journalmode wal --timeout 30000 /tmp/bigspill2.test` inside the mount; SQLite tools are in `/home/ec2-user/bb-work/cache/tools/sqlite/master`.
 
+**Landed fix: read from the write buffer instead of draining the inode** [verified, fork `e7a7fe2a`]
+The fork's `VFS.Read` flushed the inode before every read. The landed change answers a read from whatever is *already committed* plus whatever the writer still holds in memory, and keeps the flush only for ranges the buffer has already handed to the object store without their commit having landed:
+
+* `chunk.BufferedWriter` (`wSlice.BufferedStart`/`ReadBuffered`) exposes the bytes a block writer has not uploaded yet — the same page layout `WriteAt` fills, so it never invents bytes.
+* `vfs.dataWriter.ReadBuffered` reports the buffered ranges covering a read plus whether a byte is uploaded-but-uncommitted (only a flush can answer those).
+* `drive9Meta.WriteState` returns the inode's pending-commit count and a commit sequence number. A read takes the fast path only when **no commit is in flight** (a slice leaves the write buffer the moment its commit is queued, while metadata still holds the previous mapping) and **no commit was enqueued while the read ran** (otherwise the reader window cached from the pre-commit mapping is invalidated); either condition failing falls back to the original flush.
+
+Measured on the isolated cap-off spill (64 MB, same host, same harness; counters were temporary instrumentation, removed before landing):
+
+| | before | after |
+|---|---|---|
+| per-read flush (`vfs_read_flush`) | 9 479 calls / 43.2 s | 891 calls / 15.7 s |
+| meta slice query over HTTP | 4 064 calls / 14.4 s | 1 821 calls / 5.9 s |
+| chunk reads (reader windows) | 8 500 | 2 982 |
+| object writes | 202 MB | 132 MB |
+| meta commits | 3 546 | 992 |
+| **spill** | **83–87 s** | **37 s** |
+| `crash01` | rc=1, `database is locked` | `Summary: 0 errors out of 94 tests` (25–49 s) |
+
+Acceptance on the landed commit (`accept-fork-patch.sh`, tree pinned to `e7a7fe2a`, loaded host): spill **40 s** (was 81 s, target < 10 s), `crash01` rc=1 at 67 s, and **20/20 on all three `sqlite-correctness` gates** (extent cap-off, extent cap-on, classic cap-off).
+
+Correctness evidence: a verify build recomputed the flush-then-read answer for every fast-path read on a 3-round crash-shaped workload — **30 612 reads compared, 0 byte mismatches** — and a 6-round single-client spill/integrity loop is clean. Two bugs were found and fixed on the way and are worth remembering: serving a *partial* range needs the reader's answer overlaid (not replaced), and the fast path must require `pending == 0` up front; without that precondition a slice whose commit is already queued is neither in the buffer nor in metadata, and reads of its range silently return the previous contents (that one produced `database disk image is malformed` in about one round out of three).
+
+**Still open on this item**: `crash01` is now corrupt-free but not yet reliably `rc=0` on a loaded host. Its remaining failure is `mptest`'s `--wait all` timeout in `crash02.subtest` line 53, because the client that crashes (`--exit 1`) holds the SQLite write lock while its process exit waits for the daemon to drain that transaction; on the currently loaded EC2 host a 200 MB transaction takes ~35 s while the peers' busy timeout is 10 s. The same test passes on an idle host (0/94, 25–33 s) and its corruption is gone. Two independent facts from this session bound the problem: native JuiceFS 1.4.1 against the same local TiDB + MinIO **also fails** `crash01` with the cap off (300 s timeout, meta ops averaging 5.7 ms, `setlk` in the meta path), and the instance's disk filling to 100 % wedged TiDB and produced spurious corruption — check `df -h /` before trusting any cap-off failure on this host.
+
+The remaining lever is the exit-time drain itself (freeze/commit cost of a large pending buffer), not the read path: meta commits are 992 × 10.4 ms and object PUTs 3 943 × 10 ms of a 37 s spill.
+
 ---
 
 # P1-10 Classic-path SQLite mounted integrity_check fails with disk I/O error under the kernel writeback cache

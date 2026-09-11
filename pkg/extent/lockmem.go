@@ -121,6 +121,21 @@ func (m *memLockMeta) WaitWrites(inode jfsmeta.Ino) syscall.Errno {
 	return 0
 }
 
+// WriteState forwards the drive9 meta write queue state so VFS.Read can tell
+// whether a read is answerable from the write buffer instead of forcing a
+// Flush, and whether a commit landed while that read ran. Like WaitWrites it
+// reports "unsupported" when the engine cannot say, which keeps the
+// flush-before-read behaviour.
+func (m *memLockMeta) WriteState(inode jfsmeta.Ino) (int64, uint64) {
+	type writeStateMeta interface {
+		WriteState(jfsmeta.Ino) (int64, uint64)
+	}
+	if b, ok := m.Meta.(writeStateMeta); ok {
+		return b.WriteState(inode)
+	}
+	return 0, 0
+}
+
 func (m *memLockMeta) QueueWriteParts(ctx jfsmeta.Context, inode jfsmeta.Ino, indx uint32, parts []jfsmeta.WritePart, mtime time.Time) syscall.Errno {
 	type queueWritePartsMeta interface {
 		QueueWriteParts(jfsmeta.Context, jfsmeta.Ino, uint32, []jfsmeta.WritePart, time.Time) syscall.Errno
