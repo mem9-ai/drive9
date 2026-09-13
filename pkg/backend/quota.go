@@ -224,6 +224,25 @@ func (b *Dat9Backend) checkStorageQuotaServerTx(ctx context.Context, tx *sql.Tx,
 	return result, true
 }
 
+// QuotaConfigView exposes the per-tenant quota config through the same cache
+// the classic write path uses, so a caller outside this package (the extent
+// meta RPC) can enforce the same limits without opening a second source.
+func (b *Dat9Backend) QuotaConfigView(ctx context.Context) *QuotaConfigView {
+	if b == nil {
+		return nil
+	}
+	return b.cachedQuotaConfig(ctx)
+}
+
+// QuotaUsageView exposes the cached tenant usage (central counters plus this
+// process's pending central deltas) for the same reason.
+func (b *Dat9Backend) QuotaUsageView(ctx context.Context) *QuotaUsageView {
+	if b == nil {
+		return nil
+	}
+	return b.cachedQuotaUsage(ctx)
+}
+
 // cachedQuotaConfig returns low-churn quota config from the per-tenant cache,
 // falling back to a synchronous DB query when the cache is unavailable.
 func (b *Dat9Backend) cachedQuotaConfig(ctx context.Context) *QuotaConfigView {
@@ -316,6 +335,16 @@ func (b *Dat9Backend) mediaLLMQuotaExceededServerTx(ctx context.Context, tx *sql
 	recordTenantQuotaSnapshot(b.tenantID, b.tidbCloudOrgID, usage, cfg)
 	_, _, pendingMediaDelta := b.pendingCentralMutationDeltas(ctx)
 	return usage.MediaFileCount+pendingMediaDelta+currentMediaDelta > cfg.MaxMediaLLMFiles
+}
+
+// PendingCentralStorageDelta exposes this process's logged-but-not-yet-applied
+// central storage mutations through the cache the classic soft admission uses,
+// so a caller outside this package (the extent meta RPC) can project the same
+// usage the classic path does. Without it the extent admission would read the
+// committed counters only and under-count every delta still in flight.
+func (b *Dat9Backend) PendingCentralStorageDelta(ctx context.Context) int64 {
+	storageDelta, _, _ := b.pendingCentralMutationDeltas(ctx)
+	return storageDelta
 }
 
 func (b *Dat9Backend) pendingCentralMutationDeltas(ctx context.Context) (storageDelta, fileDelta, mediaDelta int64) {

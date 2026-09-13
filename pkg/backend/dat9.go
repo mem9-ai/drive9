@@ -1081,6 +1081,42 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	return int64(len(data)), nil
 }
 
+// ErrExtentLayoutWrite is returned when a whole-object (CLI/HTTP/SDK) write
+// targets a content_layout=extent file. The extent data plane owns those bytes
+// (jfs chunks + blocks) and a classic revision write would leave the projection
+// advertising extent, so every FUSE mount would keep serving the old jfs bytes
+// while the new object was unreachable and the replaced slices never enqueued
+// for GC. Reads already refuse extent files; writes refuse them too.
+var ErrExtentLayoutWrite = errors.New("extent file cannot be written through the whole-object path; write it through a mount")
+
+// refuseExtentWholeObjectWrite reports an error when path is an extent file.
+//
+// The tenant-level gate keeps this free for the common case: a tenant that never
+// used the extent layout has nothing to refuse, so the projection read — one
+// point query per whole-object write, copy and multipart initiate — is skipped.
+// Correctness does not depend on it: the callers whose target another client can
+// convert under them (overwrite, multipart finalize, batch write, fs-layer
+// stored object) re-check content_layout on the row they lock inside their
+// transaction. CopyFile is the exception and needs no re-check: it refuses the
+// source, and its destination is a fresh node that cannot already be an extent
+// file.
+func (b *Dat9Backend) refuseExtentWholeObjectWrite(ctx context.Context, path string) error {
+	if b == nil || b.store == nil || path == "" {
+		return nil
+	}
+	if !b.store.ExtentMetaMaybeExists(ctx) {
+		return nil
+	}
+	proj, err := b.store.GetExtentProjection(ctx, path)
+	if err != nil || proj == nil {
+		return nil
+	}
+	if proj.ContentLayout == datastore.ContentLayoutExtent {
+		return fmt.Errorf("%w: %s", ErrExtentLayoutWrite, path)
+	}
+	return nil
+}
+
 func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (written int64, newRevision int64, err error) {
 	timingEnabled := logger.BenchTimingLogEnabled()
 	start := time.Time{}
@@ -1088,6 +1124,12 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		start = time.Now()
 	}
 	path := ""
+	if nf != nil && nf.Node.Path != "" {
+		path = nf.Node.Path
+	}
+	if err := b.refuseExtentWholeObjectWrite(ctx, path); err != nil {
+		return 0, 0, err
+	}
 	fileID := ""
 	oldSize := int64(0)
 	storageType := datastore.StorageDB9
@@ -1236,6 +1278,14 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		currentMeta, err := b.store.GetFileStorageMetaForUpdateTx(tx, nf.File.FileID)
 		if err != nil {
 			return err
+		}
+		// The pre-transaction probe above fails open on a query error, and the
+		// target can be unlinked and recreated as an extent file inside the
+		// window it leaves. Re-check on the locked row: committing a
+		// whole-object write onto an extent file would leave the projection
+		// advertising extent while the uploaded object went unreferenced.
+		if currentMeta.ContentLayout == datastore.ContentLayoutExtent {
+			return fmt.Errorf("%w: %s", ErrExtentLayoutWrite, nf.Node.Path)
 		}
 		oldSizeBytes = currentMeta.SizeBytes
 		oldContentTypeForQuota = currentMeta.ContentType
@@ -1418,6 +1468,12 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 			info.Mode = e.Mode
 			meta["hasMode"] = "true"
 		}
+		// A listing is the only place the extent data plane can be announced
+		// for free: the inode rides on the row the size overlay already reads.
+		// Clients that miss it fall back to a HEAD probe on first open.
+		if e.ContentLayout == datastore.ContentLayoutExtent && e.ExtentIno != 0 {
+			meta["extent_ino"] = strconv.FormatUint(e.ExtentIno, 10)
+		}
 		if e.File != nil {
 			info.Size = e.File.SizeBytes
 			info.ModTime = fileMtime(e.File)
@@ -1540,6 +1596,9 @@ type ReadPlan struct {
 	InlineData []byte
 	// PresignURL is non-empty for S3-stored files — the 302 redirect target.
 	PresignURL string
+	// ExtentIno is set for content_layout=extent files. Bytes are not served
+	// by the server; the client reads object storage with data-credential.
+	ExtentIno uint64
 	// Size is the file size in bytes.
 	Size int64
 	// Revision is the file revision observed by the same metadata query.
@@ -1630,6 +1689,21 @@ func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (plan *ReadP
 			Size:       nf.File.SizeBytes,
 			Revision:   nf.File.Revision,
 			Mtime:      fileMtime(nf.File),
+		}, nil
+	case datastore.StorageExtent:
+		proj, err := b.store.GetExtentProjection(ctx, resolvedPath)
+		if err != nil {
+			return nil, err
+		}
+		if proj == nil || proj.ExtentIno == 0 {
+			return nil, fmt.Errorf("extent file missing inode")
+		}
+		phase = "extent_hint"
+		return &ReadPlan{
+			ExtentIno: proj.ExtentIno,
+			Size:      nf.File.SizeBytes,
+			Revision:  nf.File.Revision,
+			Mtime:     fileMtime(nf.File),
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported storage type for read plan: %s", nf.File.StorageType)
@@ -1837,6 +1911,15 @@ func (b *Dat9Backend) CopyFileCtx(ctx context.Context, srcPath, dstPath string) 
 	}
 	if srcNode.IsDirectory {
 		return fmt.Errorf("cannot copy directory with CopyFile: %s", srcPath)
+	}
+	// A copy is a projection-only node sharing the source's drive9 entity, so
+	// an extent source would produce an alias with no layout and no JuiceFS
+	// edge: unreadable through either data plane, reporting size 0, and sharing
+	// the extent inode's file_id so tags and delete bookkeeping on the copy
+	// would mutate the original's entity. Extent files have no whole-object
+	// bytes to copy; the supported alias path is a hardlink.
+	if err := b.refuseExtentWholeObjectWrite(ctx, srcPath); err != nil {
+		return err
 	}
 	if err := b.store.EnsureParentDirs(ctx, dstPath, b.genID); err != nil {
 		return err

@@ -53,6 +53,16 @@ func TestLocalPolicyRemoteOnlyOverridesBuiltinTmpRule(t *testing.T) {
 	}
 }
 
+func TestLocalPolicyDisabledForExtentProfile(t *testing.T) {
+	policy := NewLocalPolicy(MountProfileExtent, nil, nil)
+	if policy.Enabled() {
+		t.Fatal("extent profile must not enable coding-agent local overlay")
+	}
+	if got := policy.Classify("/repo/.git/config"); got != PathLayerRemotePersistent {
+		t.Fatalf("extent .git = %s, want remote persistent", got)
+	}
+}
+
 func TestLocalPolicyDisabledForOrdinaryMount(t *testing.T) {
 	policy := NewLocalPolicy("", nil, nil)
 	if policy.Enabled() {

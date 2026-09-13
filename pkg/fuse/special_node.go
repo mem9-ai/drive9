@@ -30,6 +30,12 @@ func entryIsMetadataOnlySpecial(entry *InodeEntry) bool {
 	return entry != nil && !entry.IsDir && entry.HasMode && metadataOnlySpecialMode(entry.Mode)
 }
 
+// localOnlySpecialEntry is an in-memory fifo/device/socket with no JuiceFS
+// inode. Extent-backed specials use VFS SetAttr/GetAttr/Link like files.
+func localOnlySpecialEntry(entry *InodeEntry) bool {
+	return entryIsMetadataOnlySpecial(entry) && entry.ExtentIno == 0
+}
+
 func (fs *Dat9FS) specialNodeEntry(p string) (*InodeEntry, bool) {
 	if fs == nil {
 		return nil, false
@@ -60,20 +66,6 @@ func (fs *Dat9FS) removeSpecialNode(p string) {
 	defer fs.specialMu.Unlock()
 
 	delete(fs.specialByPath, p)
-}
-
-func (fs *Dat9FS) renameSpecialNode(oldP, newP string) bool {
-	fs.specialMu.Lock()
-	defer fs.specialMu.Unlock()
-
-	ino, ok := fs.specialByPath[oldP]
-	if !ok {
-		return false
-	}
-	delete(fs.specialByPath, oldP)
-	delete(fs.specialByPath, newP)
-	fs.specialByPath[newP] = ino
-	return true
 }
 
 func (fs *Dat9FS) renameSpecialNodeSubtree(oldP, newP string) {

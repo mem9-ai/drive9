@@ -9226,6 +9226,14 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 	}
 }
 
+// A write-only local-only handle must still serve the page-fill READ the kernel
+// issues to merge a partial-page write once the FUSE writeback cache is
+// negotiated: git appends a ref-log line at a non-page-aligned offset and the
+// kernel reads the existing page back through the very handle it wrote with.
+// A write-only backing fd answered that READ with EBADF, which the kernel then
+// reported as the caller's write error ("unable to append to '.git/logs/HEAD':
+// Bad file descriptor") and which broke the local-only profiles after remount.
+
 func TestFsyncDirRemotePathReturnsOK(t *testing.T) {
 	var remoteCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -9701,7 +9709,7 @@ func TestGoFuseMountOptionsMapsSyncRead(t *testing.T) {
 		t.Fatal("explicit go-fuse SyncRead = false, want true")
 	}
 	if explicit.MaxBackground != 32 {
-		t.Fatalf("MaxBackground = %d, want 32", explicit.MaxBackground)
+		t.Fatalf("MaxBackground = %d, want the established mount-wide default 32", explicit.MaxBackground)
 	}
 }
 
@@ -14601,9 +14609,37 @@ func TestSetAttr_WriteBackInteractivePathTruncateStagesAndReturnsBeforeRemoteCom
 
 func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
 	const callerPID = 5151
+	// With a live writer on the inode the truncate must take the synchronous
+	// path (the async staged zero would race the writer's pending commit), so
+	// the test needs a live server that accepts the truncate PUT.
+	var mu sync.Mutex
+	rev := int64(7)
+	content := bytes.Repeat([]byte{0x41}, 8*1024*1024)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			content = append([]byte(nil), body...)
+			rev++
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
 	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
 	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -19991,8 +20027,12 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 		t.Fatalf("SetAttr status = %v, want OK", st)
 	}
 
-	if fh.BaseRev != 2 {
-		t.Fatalf("open handle base revision after path truncate = %d, want 2", fh.BaseRev)
+	// With the caller as the inode's only live writer, the truncate is folded
+	// into the caller's own handle (no remote zero-truncate is committed), so
+	// the open base revision stays and the caller's next commit CAS-succeeds
+	// at it.
+	if fh.BaseRev != 1 {
+		t.Fatalf("open handle base revision after path truncate = %d, want 1 (folded truncate)", fh.BaseRev)
 	}
 	if fh.Streamer != nil {
 		t.Fatal("stream uploader should be reset after adopted zero truncate")
@@ -20023,8 +20063,8 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	if got := string(content); got != "overwrite" {
 		t.Fatalf("remote content = %q, want %q", got, "overwrite")
 	}
-	if revision != 3 {
-		t.Fatalf("remote revision = %d, want 3", revision)
+	if revision != 2 {
+		t.Fatalf("remote revision = %d, want 2", revision)
 	}
 }
 
@@ -20479,8 +20519,10 @@ func TestSetAttr_PathTruncateSingleCallerWriterAdoptsZeroBase(t *testing.T) {
 		t.Fatalf("SetAttr status = %v, want OK", st)
 	}
 
-	if fh.BaseRev != 2 {
-		t.Fatalf("open handle base revision after path truncate = %d, want 2", fh.BaseRev)
+	// Folded truncate: the base revision stays at the open value; the
+	// caller's next commit CAS-succeeds at it (no remote zero is committed).
+	if fh.BaseRev != 1 {
+		t.Fatalf("open handle base revision after path truncate = %d, want 1 (folded truncate)", fh.BaseRev)
 	}
 	if !fh.ZeroBase {
 		t.Fatal("expected same-caller writer handle to adopt zero base")
@@ -20513,8 +20555,8 @@ func TestSetAttr_PathTruncateSingleCallerWriterAdoptsZeroBase(t *testing.T) {
 	if got := string(content); got != "overwrite" {
 		t.Fatalf("remote content = %q, want %q", got, "overwrite")
 	}
-	if revision != 3 {
-		t.Fatalf("remote revision = %d, want 3", revision)
+	if revision != 2 {
+		t.Fatalf("remote revision = %d, want 2", revision)
 	}
 }
 

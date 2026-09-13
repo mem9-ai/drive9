@@ -165,6 +165,27 @@ func (o *LocalOverlay) Chtimes(localPath string, mtime time.Time) error {
 	return os.Chtimes(abs, mtime, mtime)
 }
 
+// localOverlayChtimes updates a local-overlay file's timestamps. The kernel
+// flushes inode times from writeback (fuse_write_inode -> fuse_flush_times)
+// with FATTR_FH, and that flush can arrive after the name is gone: SQLite
+// unlinks the WAL index (-shm) while its fd is still open (unixShmPurge).
+// POSIX keeps the inode alive while a handle is open, so an open-unlinked
+// file must not fail the update. A path-based Chtimes returns ENOENT, the
+// kernel records that as a mapping error (mapping_set_error turns any error
+// into AS_EIO), and the next close(2) fails with EIO — sqlite reports
+// SQLITE_IOERR_CLOSE (errcode=4106) from unixShmPurge. unlinked reports that
+// the pathname was already removed while the file stayed open
+// (InodeEntry.Unlinked).
+func localOverlayChtimes(overlay *LocalOverlay, localPath string, unlinked bool, mtime time.Time) error {
+	err := overlay.Chtimes(localPath, mtime)
+	if err == nil || !unlinked || !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	// The anonymous inode has no pathname left; the in-memory entry is what
+	// fstat reports, so the timestamp update is already complete.
+	return nil
+}
+
 func (o *LocalOverlay) ReadDir(localPath string) ([]localOverlayEntry, error) {
 	abs, err := o.abs(localPath)
 	if err != nil {

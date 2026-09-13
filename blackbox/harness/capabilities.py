@@ -18,7 +18,6 @@ FUSE_TOOLS = (
     "prove",
     "runltp",
     "umount",
-    "vdbench",
 )
 
 DARWIN_FUSE_HELPERS = (

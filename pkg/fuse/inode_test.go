@@ -8,6 +8,62 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
 
+func TestEnsureInodeDoesNotShrinkExtentSize(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/final/w0/file-000.txt", false, 32820, time.Now())
+	m.SetExtentIno(ino, 9)
+	got := m.EnsureInodeWithIdentity("/final/w0/file-000.txt", "", 0, false, 0, time.Now())
+	if got != ino {
+		t.Fatalf("ino=%d, want %d", got, ino)
+	}
+	entry, ok := m.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing entry")
+	}
+	if entry.Size != 32820 {
+		t.Fatalf("listing size=0 shrank extent inode to %d", entry.Size)
+	}
+}
+
+func TestForgetKeepsExtentInodeMapping(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/final/w0/file-000.txt", false, 32768, time.Now())
+	m.SetExtentIno(ino, 42)
+	m.Forget(ino, 1)
+	entry, ok := m.GetEntry(ino)
+	if !ok {
+		t.Fatal("Forget dropped juicefs inode mapping")
+	}
+	if entry.ExtentIno != 42 {
+		t.Fatalf("ExtentIno=%d, want 42", entry.ExtentIno)
+	}
+	if entry.Size != 32768 {
+		t.Fatalf("size=%d, want 32768 after Forget", entry.Size)
+	}
+	got, ok := m.GetInode("/final/w0/file-000.txt")
+	if !ok || got != ino {
+		t.Fatalf("path mapping = %d/%v, want %d/true", got, ok, ino)
+	}
+}
+
+func TestSetExtentIno(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/test.txt", false, 100, time.Now())
+	m.SetExtentIno(ino, 99)
+	entry, ok := m.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.ExtentIno != 99 {
+		t.Fatalf("ExtentIno=%d, want 99", entry.ExtentIno)
+	}
+	m.SetExtentIno(ino, 0) // ignored
+	entry, _ = m.GetEntry(ino)
+	if entry.ExtentIno != 99 {
+		t.Fatalf("zero ExtentIno overwrote cache: %d", entry.ExtentIno)
+	}
+}
+
 func TestUpdateMode(t *testing.T) {
 	m := NewInodeToPath()
 	ino := m.Lookup("/test.txt", false, 100, time.Now())

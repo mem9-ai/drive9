@@ -1860,6 +1860,13 @@ func TestProvisionTiDBCloudNativeCreateTimeQuotaLocalPersistenceErrorIsInternal(
 	defer func() { _ = metaStore.Close() }()
 	testtidb.ResetMetaDB(t, metaStore.DB())
 
+	// A previous run that died between the rename and its cleanup leaves the
+	// placeholder behind, and then every later run fails on "table already
+	// exists" instead of exercising the behavior under test. Reclaim it first
+	// so the test is self-healing.
+	if _, err := metaStore.DB().Exec("DROP TABLE IF EXISTS tenant_quota_config_unavailable"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := metaStore.DB().Exec("RENAME TABLE tenant_quota_config TO tenant_quota_config_unavailable"); err != nil {
 		t.Fatal(err)
 	}

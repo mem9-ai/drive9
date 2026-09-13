@@ -28,7 +28,8 @@ class CommunityPjdfstest(BaseModule):
         tests_dir, bin_path = ensure_pjdfstest(ctx)
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_pjdfstest", remote, profile="none", extra=["--allow-other"])
+        profile = os.environ.get("FUSE_PROFILE") or "none"
+        handle = ctx.target.mount("community_pjdfstest", remote, profile=profile, extra=["--allow-other"])
         try:
             work_dir = handle.mountpoint / "work"
             work_dir.mkdir(exist_ok=True)

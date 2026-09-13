@@ -23,6 +23,51 @@ const (
 	defaultUserSchemaMaxIdleConns    = 2
 )
 
+// ExtentRoleUserEnvPrefix is the env prefix for the extent data plane's own
+// tenant-pool budget. A tenant that actually uses content_layout=extent issues
+// one TiDB transaction per JuiceFS metadata op, so the established 6-connection
+// default queues sqlite's exclusive COMMITs past its own wait window; the
+// budget is raised only for that tenant and only once its extent meta is
+// initialized (datastore.applyExtentPoolBudget), never for the classic path.
+const (
+	ExtentRoleUserEnvPrefix   = "DRIVE9_EXTENT_DB_"
+	DefaultExtentMaxOpenConns = 64
+	DefaultExtentMaxIdleConns = 16
+)
+
+// ExtentPoolLimits returns the connection budget an extent-using tenant may
+// raise its RoleUser pool to. Both values are configurable through
+// DRIVE9_EXTENT_DB_MAX_OPEN_CONNS / DRIVE9_EXTENT_DB_MAX_IDLE_CONNS; a
+// non-positive open limit keeps the global default.
+func ExtentPoolLimits() (maxOpen, maxIdle int) {
+	// An operator who set the tenant pool explicitly keeps that decision: the
+	// extent budget only fills in a default for tenants that never had one.
+	if os.Getenv(rolePoolEnvKey(RoleUser, "MAX_OPEN_CONNS")) != "" {
+		return 0, 0
+	}
+	maxOpen = envIntWithDefault(ExtentRoleUserEnvPrefix+"MAX_OPEN_CONNS", DefaultExtentMaxOpenConns)
+	maxIdle = envIntWithDefault(ExtentRoleUserEnvPrefix+"MAX_IDLE_CONNS", DefaultExtentMaxIdleConns)
+	if maxIdle < 0 {
+		maxIdle = 0
+	}
+	if maxOpen > 0 && maxIdle > maxOpen {
+		maxIdle = maxOpen
+	}
+	return maxOpen, maxIdle
+}
+
+func envIntWithDefault(key string, def int) int {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
 // ApplyPoolDefaults rotates and prunes idle connections before common LB/NAT
 // idle timeout windows. It also applies configurable open/idle connection
 // limits via role-specific env vars.

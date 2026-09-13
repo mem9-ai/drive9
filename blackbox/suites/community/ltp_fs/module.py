@@ -32,7 +32,8 @@ class CommunityLTPFS(BaseModule):
             scenario = "fs"
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_ltp_fs", remote, profile="none", extra=["--allow-other"])
+        profile = os.environ.get("FUSE_PROFILE") or "none"
+        handle = ctx.target.mount("community_ltp_fs", remote, profile=profile, extra=["--allow-other"])
         try:
             work = handle.mountpoint / "ltp-work"
             work.mkdir()
@@ -46,7 +47,9 @@ class CommunityLTPFS(BaseModule):
             # 30s test timeout is too short — multiply by 10x so tests that
             # normally take <1s have up to 300s to complete on FUSE.
             env.setdefault("LTP_TIMEOUT_MUL", "10")
-            cmd = build_ltp_runner_cmd(runner, scenario, work)
+            kirk_tmp = ctx.artifact_dir(self.id) / "kirk-session"
+            kirk_tmp.mkdir(parents=True, exist_ok=True)
+            cmd = build_ltp_runner_cmd(runner, scenario, work, session_dir=kirk_tmp)
             result = ctx.target.run_cmd(
                 "community-ltp-fs",
                 cmd,

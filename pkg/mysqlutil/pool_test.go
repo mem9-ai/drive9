@@ -65,6 +65,35 @@ func TestDefaultPoolLifetime(t *testing.T) {
 
 }
 
+func TestUserPoolKeepsEstablishedDefault(t *testing.T) {
+	maxOpen, maxIdle := defaultPoolLimits(RoleUser)
+	// The 6/2 default is what every existing tenant pool runs with; the extent
+	// data plane gets its own, explicitly scoped budget instead of changing
+	// the global one (see ExtentPoolLimits).
+	if maxOpen != 6 || maxIdle != 2 {
+		t.Fatalf("user pool = %d/%d, want the established 6/2 default", maxOpen, maxIdle)
+	}
+}
+
+func TestExtentPoolLimitsAreScopedAndConfigurable(t *testing.T) {
+	t.Setenv(ExtentRoleUserEnvPrefix+"MAX_OPEN_CONNS", "")
+	t.Setenv(ExtentRoleUserEnvPrefix+"MAX_IDLE_CONNS", "")
+	maxOpen, maxIdle := ExtentPoolLimits()
+	if maxOpen != DefaultExtentMaxOpenConns || maxIdle != DefaultExtentMaxIdleConns {
+		t.Fatalf("extent limits = %d/%d, want %d/%d", maxOpen, maxIdle, DefaultExtentMaxOpenConns, DefaultExtentMaxIdleConns)
+	}
+	t.Setenv(ExtentRoleUserEnvPrefix+"MAX_OPEN_CONNS", "24")
+	t.Setenv(ExtentRoleUserEnvPrefix+"MAX_IDLE_CONNS", "8")
+	maxOpen, maxIdle = ExtentPoolLimits()
+	if maxOpen != 24 || maxIdle != 8 {
+		t.Fatalf("configured extent limits = %d/%d, want 24/8", maxOpen, maxIdle)
+	}
+	t.Setenv(ExtentRoleUserEnvPrefix+"MAX_OPEN_CONNS", "-1")
+	if maxOpen, _ := ExtentPoolLimits(); maxOpen != -1 {
+		t.Fatalf("disabled extent budget = %d, want -1 (keep the global default)", maxOpen)
+	}
+}
+
 func TestDefaultPoolLimits(t *testing.T) {
 	maxOpen, maxIdle := defaultPoolLimits(RoleMeta)
 	if maxOpen != defaultMetaMaxOpenConns {

@@ -29,6 +29,9 @@ func newFuseLockTable() *fuseLockTable {
 }
 
 func (fs *Dat9FS) GetLk(cancel <-chan struct{}, input *gofuse.LkIn, out *gofuse.LkOut) (code gofuse.Status) {
+	if fh, ok := fs.fileHandles.Get(input.Fh); ok && fh.isExtent() {
+		return fs.extentGetLk(cancel, input, out)
+	}
 	owner := fuseLockOwner(input.Owner, input.Pid, input.Fh)
 	if lock, ok := fs.locks.conflict(input.NodeId, owner, input.Lk); ok {
 		out.Lk = gofuse.FileLock{
@@ -45,11 +48,17 @@ func (fs *Dat9FS) GetLk(cancel <-chan struct{}, input *gofuse.LkIn, out *gofuse.
 }
 
 func (fs *Dat9FS) SetLk(cancel <-chan struct{}, input *gofuse.LkIn) (code gofuse.Status) {
+	if fh, ok := fs.fileHandles.Get(input.Fh); ok && fh.isExtent() {
+		return fs.extentSetLk(cancel, input, false)
+	}
 	owner := fuseLockOwner(input.Owner, input.Pid, input.Fh)
 	return fs.locks.set(cancel, input.NodeId, owner, input.Pid, input.Lk, false)
 }
 
 func (fs *Dat9FS) SetLkw(cancel <-chan struct{}, input *gofuse.LkIn) (code gofuse.Status) {
+	if fh, ok := fs.fileHandles.Get(input.Fh); ok && fh.isExtent() {
+		return fs.extentSetLk(cancel, input, true)
+	}
 	owner := fuseLockOwner(input.Owner, input.Pid, input.Fh)
 	return fs.locks.set(cancel, input.NodeId, owner, input.Pid, input.Lk, true)
 }

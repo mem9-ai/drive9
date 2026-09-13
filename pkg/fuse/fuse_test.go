@@ -262,6 +262,24 @@ func TestHandleTable_Delete(t *testing.T) {
 	}
 }
 
+func TestHandleTable_PutIfAbsentUsesVFSFh(t *testing.T) {
+	ht := NewHandleTable[string]()
+	if !ht.PutIfAbsent(9, "vfs") {
+		t.Fatal("empty table must accept VFS fh 9")
+	}
+	if ht.PutIfAbsent(9, "dup") {
+		t.Fatal("occupied VFS fh must not be reused")
+	}
+	got, ok := ht.Get(9)
+	if !ok || got != "vfs" {
+		t.Fatalf("Get(9)=%q %v, want vfs", got, ok)
+	}
+	next := ht.Allocate("auto")
+	if next <= 9 {
+		t.Fatalf("Allocate after PutIfAbsent(9) = %d, want >9", next)
+	}
+}
+
 func TestHandleTable_ForEach(t *testing.T) {
 	ht := NewHandleTable[int]()
 	ht.Allocate(1)

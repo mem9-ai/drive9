@@ -17,7 +17,6 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 	if err != nil {
 		return err
 	}
-
 	return drive9fuse.Mount(&drive9fuse.MountOptions{
 		Server:                  opts.Server,
 		APIKey:                  opts.APIKey,
@@ -53,6 +52,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		RemoteOnlyPatterns:      opts.RemoteOnlyPatterns,
 		AppendLogPatterns:       opts.AppendLogPatterns,
 		PackPaths:               opts.PackPaths,
+		ExtentPaths:             opts.ExtentPaths,
 		UploadConcurrency:       opts.UploadConcurrency,
 		DirCacheMaxEntries:      opts.DirCacheMaxEntries,
 		CommitQueueMaxPending:   opts.CommitQueueMaxPending,

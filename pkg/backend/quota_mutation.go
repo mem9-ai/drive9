@@ -276,6 +276,36 @@ func applyCentralFileOverwriteTx(store MetaQuotaStore, tx *sql.Tx, tenantID stri
 	return applyCentralFileStateTx(store, tx, tenantID, data.FileID, data.NewSizeBytes, data.NewIsMedia)
 }
 
+// extentUsageMutationData carries the extent data plane's byte delta since the
+// last report. Extent bytes live in the tenant's jfs_node (the projection's
+// size_bytes stays 0 by design), so the central counters cannot be derived from
+// the classic file mutations; the tenant worker reports the delta instead.
+type extentUsageMutationData struct {
+	DeltaBytes int64 `json:"delta_bytes"`
+}
+
+// ReportExtentUsageDelta adds the extent data plane's growth to the central
+// tenant_quota_usage counters through the same durable mutation log the classic
+// write path uses, so a crash before the apply is replayed instead of lost.
+func (b *Dat9Backend) ReportExtentUsageDelta(ctx context.Context, delta int64) error {
+	if b == nil || b.metaStore == nil || b.tenantID == "" || delta == 0 {
+		return nil
+	}
+	data := extentUsageMutationData{DeltaBytes: delta}
+	return b.logAndEnqueueMutation(ctx, "extent_usage", data, quotaPendingDeltas{
+		storageDelta: delta,
+	}, func(applyCtx context.Context, tx *sql.Tx) (quotaCounterDeltas, error) {
+		return applyCentralExtentUsageTx(b.metaStore, tx, b.tenantID, data)
+	})
+}
+
+func applyCentralExtentUsageTx(store MetaQuotaStore, tx *sql.Tx, tenantID string, data extentUsageMutationData) (quotaCounterDeltas, error) {
+	if data.DeltaBytes == 0 {
+		return quotaCounterDeltas{}, nil
+	}
+	return quotaCounterDeltas{storageBytes: data.DeltaBytes}, nil
+}
+
 func (b *Dat9Backend) recordCentralFileCreateMutation(ctx context.Context, fileID string, sizeBytes int64, contentType string) error {
 	isMedia := isQuotaMediaContentType(contentType)
 	data := fileCreateMutationData{
