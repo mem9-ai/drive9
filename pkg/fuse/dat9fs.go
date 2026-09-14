@@ -6328,19 +6328,20 @@ func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
 		mtime = time.Now()
 	}
 	return CachedFileInfo{
-		Name:       name,
-		Size:       entry.Size,
-		IsDir:      entry.IsDir,
-		Mtime:      mtime,
-		Revision:   entry.Revision,
-		Mode:       entry.Mode,
-		HasMode:    entry.HasMode,
-		Uid:        entry.Uid,
-		Gid:        entry.Gid,
-		HasUID:     entry.HasUID,
-		HasGID:     entry.HasGID,
-		ResourceID: entry.ResourceID,
-		Nlink:      entry.Nlink,
+		observedVersion: entry.attrVersion,
+		Name:            name,
+		Size:            entry.Size,
+		IsDir:           entry.IsDir,
+		Mtime:           mtime,
+		Revision:        entry.Revision,
+		Mode:            entry.Mode,
+		HasMode:         entry.HasMode,
+		Uid:             entry.Uid,
+		Gid:             entry.Gid,
+		HasUID:          entry.HasUID,
+		HasGID:          entry.HasGID,
+		ResourceID:      entry.ResourceID,
+		Nlink:           entry.Nlink,
 	}
 }
 
@@ -6390,11 +6391,12 @@ func (fs *Dat9FS) cacheFileForPath(p string, size int64, mtime time.Time, revisi
 	}
 	parentPath, name := cacheParentName(p)
 	fs.dirCache.Upsert(parentPath, CachedFileInfo{
-		Name:     name,
-		Size:     size,
-		IsDir:    false,
-		Mtime:    mtime,
-		Revision: revision,
+		observedVersion: fs.inodes.AttrVersion(),
+		Name:            name,
+		Size:            size,
+		IsDir:           false,
+		Mtime:           mtime,
+		Revision:        revision,
 	})
 }
 
@@ -11042,6 +11044,7 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	// FUSE_UNKNOWN_INO (Ino=0) and do not fill attributes or increment the
 	// lookup count, so the kernel does not create dentries for them and the
 	// directory / parent inode lifetime accounting stays correct.
+	local := fs.snapshotDirLocal(dh.Path)
 	dots := fs.dotDotEntries(dh)
 	for d := int(input.Offset); d < len(dots); d++ {
 		e := dots[d]
@@ -11088,7 +11091,7 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 		if found {
 			// A directory handle may outlive the pending generation it listed.
 			// Resolve local attributes again when publishing them to the kernel.
-			item, _ := fs.localDirEntryInfo(inoEntry.Path, cachedInfoFromEntry(e.Name, inoEntry))
+			item, _ := fs.localDirEntryInfo(dirEntryChildPath(dh.Path, e.Name), cachedInfoFromEntry(e.Name, inoEntry), inoEntry, local)
 			inoEntry.Size = item.Size
 			inoEntry.Mtime = item.Mtime
 			inoEntry.Mode = item.Mode
@@ -11149,17 +11152,12 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 		nlink = item.Nlink
 	}
 
-	ino := fs.inodes.EnsureInodeWithIdentity(childP, resourceID, nlink, isDir, size, mtime)
-	if revision > 0 {
-		fs.inodes.UpdateRevision(ino, revision)
-	}
-	if hasMode {
-		fs.inodes.UpdateMode(ino, mode)
-	}
-	if hasUID || hasGID {
-		fs.inodes.UpdateOwner(ino, uid, gid, hasUID, hasGID)
-	}
-	return ino
+	entry := fs.inodes.EnsureDirEntry(childP, CachedFileInfo{
+		ResourceID: resourceID, Nlink: nlink, IsDir: isDir, Size: size, Mtime: mtime,
+		Revision: revision, Mode: mode, HasMode: hasMode,
+		Uid: uid, Gid: gid, HasUID: hasUID, HasGID: hasGID,
+	}, false)
+	return entry.Ino
 }
 
 func (fs *Dat9FS) dirEntryMetadata(dirPath, childP, name string) (CachedFileInfo, bool) {
@@ -11265,8 +11263,9 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 		if fs.perf != nil {
 			fs.perf.dirCacheHit.add(1)
 		}
-		entries := fs.cachedToDirEntries(dirPath, cached)
-		return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
+		local := fs.snapshotDirLocal(dirPath)
+		entries := fs.cachedToDirEntriesWithLocal(dirPath, cached, local)
+		return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntriesWithLocal(dirPath, entries, local)))
 	}
 	if fs.perf != nil {
 		fs.perf.dirCacheMiss.add(1)
@@ -11274,6 +11273,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 
 	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
+	observedVersion := fs.inodes.AttrVersion()
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
@@ -11285,15 +11285,19 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	if err := fs.applyBatchStats(ctx, dirPath, cached); err != nil {
 		return nil, err
 	}
+	for i := range cached {
+		cached[i].observedVersion = observedVersion
+	}
 	if !fs.lockMountViewRead(generation) {
 		return nil, syscall.EAGAIN
 	}
+	local := fs.snapshotDirLocal(dirPath)
+	entries := fs.cachedToDirEntriesWithLocal(dirPath, cached, local)
 	fs.dirCache.Put(dirPath, cached)
 	fs.mountViewMu.RUnlock()
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached, generation)
 
-	entries := fs.cachedToDirEntries(dirPath, cached)
-	return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
+	return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntriesWithLocal(dirPath, entries, local)))
 }
 
 func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []CachedFileInfo) error {
@@ -11368,53 +11372,23 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 // that ls, tab-completion, and editors can see them. Same-name local attributes
 // are resolved by cachedToDirEntries before any inode metadata is updated.
 func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []DirEntry {
-	// Build set of already-listed names for dedup.
+	return fs.mergePendingDirEntriesWithLocal(dirPath, entries, fs.snapshotDirLocal(dirPath))
+}
+
+func (fs *Dat9FS) mergePendingDirEntriesWithLocal(dirPath string, entries []DirEntry, local dirLocalMetadata) []DirEntry {
 	existing := make(map[string]struct{}, len(entries))
 	for _, e := range entries {
 		existing[e.Name] = struct{}{}
 	}
-
-	// Overlay write-back cache entries.
-	if fs.writeBack != nil {
-		prefix := dirPath
-		if prefix != "/" {
-			prefix += "/"
+	for p, meta := range local.pending {
+		name := path.Base(p)
+		if _, ok := existing[name]; ok {
+			continue
 		}
-		for _, meta := range fs.writeBack.ListByPrefix(prefix) {
-			if parentDir(meta.Path) != dirPath {
-				continue
-			}
-			name := path.Base(meta.Path)
-			if _, ok := existing[name]; ok {
-				continue
-			}
-			entries = append(entries, fs.cachedToDirEntries(dirPath, []CachedFileInfo{cachedInfoFromWriteBackMeta(name, meta)})...)
-			existing[name] = struct{}{}
-		}
+		items := []CachedFileInfo{cachedInfoFromWriteBackMeta(name, meta)}
+		entries = append(entries, fs.cachedToDirEntriesWithLocal(dirPath, items, local)...)
+		existing[name] = struct{}{}
 	}
-
-	// Overlay commit-queue-backed entries from pendingIndex. These are files
-	// handed to commitQueue after Release but not yet uploaded to the server.
-	if fs.pendingIndex != nil {
-		prefix := dirPath
-		if prefix != "/" {
-			prefix += "/"
-		} else {
-			prefix = "/"
-		}
-		for _, meta := range fs.pendingIndex.ListByPrefix(prefix) {
-			if parentDir(meta.Path) != dirPath {
-				continue
-			}
-			name := path.Base(meta.Path)
-			if _, ok := existing[name]; ok {
-				continue // already listed from writeBack or remote
-			}
-			entries = append(entries, fs.cachedToDirEntries(dirPath, []CachedFileInfo{cachedInfoFromWriteBackMeta(name, meta)})...)
-			existing[name] = struct{}{}
-		}
-	}
-
 	entries = append(entries, fs.specialNodeDirEntries(dirPath, existing)...)
 	return entries
 }
@@ -11606,78 +11580,28 @@ func listDirErrToFuseStatus(err error) gofuse.Status {
 }
 
 func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []DirEntry {
+	return fs.cachedToDirEntriesWithLocal(dirPath, items, fs.snapshotDirLocal(dirPath))
+}
+
+func (fs *Dat9FS) cachedToDirEntriesWithLocal(dirPath string, items []CachedFileInfo, local dirLocalMetadata) []DirEntry {
 	entries := make([]DirEntry, 0, len(items))
-	for _, item := range items {
+	for i, item := range items {
 		if !validDirEntryName(item.Name) {
 			continue
 		}
 		childP := dirEntryChildPath(dirPath, item.Name)
 		fs.applyLayerFileModeToCachedInfo(childP, &item)
-		if local, ok := fs.localDirEntryInfo(childP, item); ok {
-			// Do not write a directory snapshot back over live local state.
-			// Commit completion or another write may already have advanced it.
-			ino := fs.inodes.EnsureInodeNoUpdate(childP, local.IsDir, local.Size, local.Mtime)
-			entries = append(entries, dirEntryFromCachedInfo(local, ino))
-			continue
+		var live *InodeEntry
+		if ino, ok := fs.inodes.GetInode(childP); ok {
+			live, _ = fs.inodes.GetEntry(ino)
 		}
-
-		mtime := item.Mtime
-		if mtime.IsZero() {
-			mtime = time.Now()
-		}
-		ino := fs.inodes.EnsureInodeWithIdentity(childP, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
-		if item.Revision > 0 {
-			fs.inodes.UpdateRevision(ino, item.Revision)
-		}
-		if item.HasMode {
-			fs.inodes.UpdateMode(ino, item.Mode)
-		}
-		if item.HasUID || item.HasGID {
-			fs.inodes.UpdateOwner(ino, item.Uid, item.Gid, item.HasUID, item.HasGID)
-		}
-
-		entries = append(entries, dirEntryFromCachedInfo(item, ino))
+		item, preserve := fs.localDirEntryInfo(childP, item, live, local)
+		entry := fs.inodes.EnsureDirEntry(childP, item, preserve)
+		item, _ = fs.localDirEntryInfo(childP, cachedInfoFromEntry(item.Name, entry), entry, local)
+		items[i] = item
+		entries = append(entries, dirEntryFromCachedInfo(item, entry.Ino))
 	}
 	return entries
-}
-
-// localDirEntryInfo applies the same local size precedence as GetAttr without
-// changing inode state or consuming pending generations.
-func (fs *Dat9FS) localDirEntryInfo(childP string, item CachedFileInfo) (CachedFileInfo, bool) {
-	var live *InodeEntry
-	if ino, ok := fs.inodes.GetInode(childP); ok {
-		live, _ = fs.inodes.GetEntry(ino)
-		if live != nil && !live.IsDir {
-			if size, dirty := fs.dirtyHandleSize(ino); dirty {
-				item = cachedInfoFromEntry(item.Name, live)
-				item.Size = size
-				return item, true
-			}
-		}
-	}
-	var meta *WriteBackMeta
-	if fs.pendingIndex != nil {
-		meta, _ = fs.pendingIndex.GetMeta(childP)
-	}
-	if meta == nil && fs.writeBack != nil {
-		meta, _ = fs.writeBack.GetMeta(childP)
-	}
-	if meta != nil {
-		item.Size = meta.Size
-		item.IsDir = false
-		if !meta.Mtime.IsZero() {
-			item.Mtime = meta.Mtime
-		}
-		if meta.HasMode {
-			item.Mode, item.HasMode = meta.Mode, true
-		}
-		return item, true
-	}
-	// A listing captured before commit completion can outlive pending cleanup.
-	if live != nil && !live.IsDir && live.Revision > item.Revision {
-		return cachedInfoFromEntry(item.Name, live), true
-	}
-	return item, false
 }
 
 func validDirEntryName(name string) bool {
@@ -16323,8 +16247,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 				fs.readCache.PutOwned(entry.Path, data, committedRev)
 			}
 		}
-		fs.inodes.UpdateRevision(entry.Inode, committedRev)
-		fs.inodes.UpdateSize(entry.Inode, entry.Size)
+		fs.inodes.UpdateCommittedSize(entry.Inode, entry.Size, committedRev)
 		fs.refreshCommittedRevisionForOpenHandles(entry.Path, committedRev, nil)
 		if entry.HasMode {
 			fs.inodes.UpdateMode(entry.Inode, entry.Mode&posixPermissionModeMask)

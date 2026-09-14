@@ -770,6 +770,21 @@ func (c *WriteBackCache) ListByPrefix(prefix string) []*WriteBackMeta {
 	return result
 }
 
+// snapshotPublishedMeta returns only metadata already published in memory.
+// Directory enumeration need not wait for disk writes under per-path locks.
+func (c *WriteBackCache) snapshotPublishedMeta(prefix string) []*WriteBackMeta {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var result []*WriteBackMeta
+	for p, meta := range c.metas {
+		if strings.HasPrefix(p, prefix) {
+			cp := *meta
+			result = append(result, &cp)
+		}
+	}
+	return result
+}
+
 // PendingEntry represents one file waiting to be uploaded.
 type PendingEntry struct {
 	Meta WriteBackMeta
