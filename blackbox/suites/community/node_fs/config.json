@@ -1,0 +1,22 @@
+{
+  "node_version": "24.21.0",
+  "node_source_url": "https://github.com/nodejs/node.git",
+  "node_source_ref": "v24.21.0",
+  "test_filter": "parallel/test-fs-*",
+  "timeout": 3600,
+  "exclusions": {
+    "test-fs-access.js": "tracked: access(W_OK) on mode-0222 file succeeds while open-for-write path denies it - access/open permission views disagree; observed darwin/macFUSE",
+    "test-fs-chmod-mask.js": "tracked: lchmod on a self-referential symlink returns ELOOP (lchmod follows the link instead of operating on the link); lchmod path is darwin-only",
+    "test-fs-chmod.js": "tracked: lchmod on a self-referential symlink returns ELOOP (lchmod follows the link instead of operating on the link); lchmod path is darwin-only",
+    "test-fs-mkdir-recursive-eaccess.js": "tracked: mkdir inside a chmod-0000 parent succeeds; parent-dir search/execute permission bits are not enforced",
+    "test-fs-mkdir.js": "tracked: relative mkdirSync from an unlinked cwd returns ENXIO instead of ENOENT (errno mapping)",
+    "test-fs-mkdtempDisposableSync.js": "tracked: mkdtemp inside a chmod-0000 prefix dir succeeds; parent-dir search/execute permission bits are not enforced",
+    "test-fs-promises-file-handle-readFile.js": "tracked: ftruncate grow to 2GiB+1 returns EFBIG; growing truncate must succeed (sparse)",
+    "test-fs-promises-mkdtempDisposable.js": "tracked: mkdtemp inside a chmod-0000 prefix dir succeeds; parent-dir search/execute permission bits are not enforced",
+    "test-fs-promises.js": "tracked: promises lchmod on a self-referential symlink returns ELOOP; same lchmod root cause as test-fs-chmod",
+    "test-fs-read-stream.js": "tracked: mkfifo on the mount then open yields EPERM; FIFO special files are not supported by the object-backed fs (design limitation, errno should still be validated)",
+    "test-fs-readfile.js": "tracked: ftruncate grow to 2GiB+1 returns EFBIG; growing truncate must succeed (sparse)",
+    "test-fs-rm.js": "tracked: git init under the plain (profile=none) mount dies with SIGBUS; observed darwin/macFUSE, needs root-cause investigation",
+    "test-fs-truncate.js": "tracked: truncate grow does not zero-fill - truncate('Hi', 4) must read back as Hi\\0\\0"
+  }
+}

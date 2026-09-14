@@ -488,6 +488,34 @@ to add a bounded WAL readers/writer detector.
 7. Copy the remote tree back through the CLI and verify snapshot integrity
 8. Preserve run root, mount log, and expected/actual manifests on failure
 
+### `fuse-nodefs-smoke-test.sh`
+
+Host support: Linux and macOS only. This script needs real FUSE support and a
+host `node` >= `FUSE_NODEFS_MIN_NODE_VERSION` (default 18.17.0; the CI runner
+already has node because pack-smoke requires it). It is the basic-operations
+Node.js `fs` gate — broader official Node core fs test coverage lives in
+blackbox (`community.node_fs`), not here. The workload itself is
+`e2e/tools/nodefs_smoke.js` (zero-dependency, stdlib only).
+
+1. Provision tenant unless `DRIVE9_API_KEY` is already set
+2. Prepare `drive9` CLI binary (build local or download official release)
+3. Mount a fresh writable namespace through real FUSE
+4. Run the Node fs workload on the mount: sync/promises roundtrips,
+   `createWriteStream`/`createReadStream` with 4KiB and 64KiB highWaterMarks,
+   `FileHandle` positional reads/writes including a sparse hole and truncate,
+   append via `'a'`, `mkdir`/`readdir` with `withFileTypes` + `recursive`,
+   `mkdtemp`, rename incl. atomic replace and directory rename, symlink
+   `readlink`/`lstat`, hardlink `nlink` + unlink-origin survival, stat/bigint
+   stat/`statfs` sanity, `realpath(.native)`, `copyFile` incl.
+   `COPYFILE_FICLONE`, `chmod`/`utimes`, and the `ENOENT`/`EEXIST`/
+   `ENOTEMPTY`/`EISDIR` error-code matrix
+5. Verify cross-channel consistency both ways: CLI `fs cat` reads a
+   Node-written file; mounted Node reads a CLI-uploaded fixture with matching
+   SHA-256
+6. Unmount, remount, and re-verify the tree against the checksum manifest
+   (entries, checksums, symlink target, directory listings, dirent types)
+7. Preserve run root, mount log, and manifest on failure
+
 ### `fuse-sqlite-commit-sequence.sh`
 
 Host support: Linux and macOS only. Generic FUSE counterpart to
@@ -741,12 +769,14 @@ targeted regression coverage for PATCH-vs-storage-class mismatches
 6. Runs SQLite rollback-journal correctness workload by default; set
    `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip it temporarily while diagnosing
    host-specific FUSE failures
-7. Runs sequential WAL FULL commit-sequence only when
+7. Runs the Node.js fs basic-operations smoke by default; set
+   `RUN_FUSE_NODEFS_SMOKE=0` to skip it
+8. Runs sequential WAL FULL commit-sequence only when
    `RUN_FUSE_SQLITE_COMMIT_SEQUENCE=1`
-8. Runs bounded concurrency stress workload only when
+9. Runs bounded concurrency stress workload only when
    `RUN_FUSE_CONCURRENCY_STRESS=1`
-9. Runs POSIX/fsx workload only when `RUN_FUSE_POSIX_FSX=1`
-10. Runs threshold-free FUSE performance baseline metrics only when
+10. Runs POSIX/fsx workload only when `RUN_FUSE_POSIX_FSX=1`
+11. Runs threshold-free FUSE performance baseline metrics only when
     `RUN_FUSE_PERFORMANCE_BASELINE=1`
 
 Set `RUN_FUSE_ALL_WORKLOADS=1` to default the optional concurrency,
@@ -905,6 +935,11 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `RUN_FUSE_SQLITE_CONCURRENCY` | `0` | `fuse-sqlite-correctness.sh` |
 | `RUN_FUSE_SQLITE_COMMIT_SEQUENCE` | `0` | `fuse-release-gate.sh`, `local-e2e.yml` (`1` on post-merge/nightly) |
 | `FUSE_SQLITE_COMMITS` | `1000` | `fuse-sqlite-commit-sequence.sh` |
+| `RUN_FUSE_NODEFS_SMOKE` | `1` | `fuse-release-gate.sh` |
+| `FUSE_NODEFS_WORKLOAD_TIMEOUT_S` | `240` | `fuse-nodefs-smoke-test.sh` |
+| `FUSE_NODEFS_LARGE_MB` | `9` | `fuse-nodefs-smoke-test.sh` |
+| `FUSE_NODEFS_MIN_NODE_VERSION` | `18.17.0` | `fuse-nodefs-smoke-test.sh` |
+| `FUSE_NODEFS_KEEP_ARTIFACTS` | `0` | `fuse-nodefs-smoke-test.sh` |
 | `FUSE_SQLITE_WAL_AUTOCHECKPOINT` | `100` | `fuse-sqlite-commit-sequence.sh` |
 | `FUSE_SQLITE_COMMIT_TIMEOUT_S` | `600` | `fuse-sqlite-commit-sequence.sh` |
 | `FUSE_SQLITE_COMMIT_DURABILITY` | `fsync` | `fuse-sqlite-commit-sequence.sh` |
