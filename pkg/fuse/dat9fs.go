@@ -647,11 +647,26 @@ func detachedSharedReadCtx(parent context.Context, timeout time.Duration) (conte
 	return context.WithTimeout(context.WithoutCancel(parent), timeout)
 }
 
+// namespaceMutationCommitContext returns the context for the remote commit
+// call of an idempotent namespace mutation (hardlink, rename, unlink/rmdir,
+// mkdir, chmod). Under gVisor compatibility or interrupt-safe mutations the
+// context is detached from the FUSE cancel channel: once the kernel has
+// handed a request to the daemon it waits uninterruptibly for the reply, so
+// finishing a mutation the server may already be applying and answering OK
+// is always kernel-sanctioned, whereas canceling it mid-flight can surface
+// EAGAIN for a change that was already committed.
+//
+// gVisor compatibility keeps its historical fuseTimeout budget. Interrupt-safe
+// mutations use the tighter namespaceMutationRetryTimeout, matching the
+// detached retries that already exist for these operations.
 func (fs *Dat9FS) namespaceMutationCommitContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if !fs.gvisorCompatibilityEnabled() {
+	if !fs.gvisorCompatibilityEnabled() && !fs.interruptSafeMutationsEnabled() {
 		return parent, func() {}
 	}
 	timeout := fuseTimeout
+	if !fs.gvisorCompatibilityEnabled() {
+		timeout = namespaceMutationRetryTimeout
+	}
 	if deadline, ok := parent.Deadline(); ok {
 		remaining := time.Until(deadline)
 		if remaining < timeout {
@@ -662,6 +677,18 @@ func (fs *Dat9FS) namespaceMutationCommitContext(parent context.Context) (contex
 		timeout = time.Nanosecond
 	}
 	return context.WithTimeout(context.WithoutCancel(parent), timeout)
+}
+
+// postCommitConfirmContext returns the context for a read that only confirms
+// an already-committed mutation (e.g. Link's post-commit stat). Under
+// interrupt-safe mutations it is detached from the FUSE cancel channel so an
+// interrupt cannot blur the confirmation; the caller still treats a transient
+// failure of such a read as non-fatal.
+func (fs *Dat9FS) postCommitConfirmContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if !fs.interruptSafeMutationsEnabled() {
+		return parent, func() {}
+	}
+	return detachedSharedReadCtx(parent, namespaceMutationRetryTimeout)
 }
 
 // --- helpers -----------------------------------------------------------------
@@ -2033,6 +2060,15 @@ func (fs *Dat9FS) clearDirtySize(ino uint64, seq uint64) {
 
 func (fs *Dat9FS) gvisorCompatibilityEnabled() bool {
 	return fs != nil && fs.opts != nil && fs.opts.GVisorCompat
+}
+
+// interruptSafeMutationsEnabled reports whether the remote commit of an
+// idempotent namespace mutation should run detached from the FUSE cancel
+// channel (see namespaceMutationCommitContext). Enabled by default;
+// MountOptions.LegacyInterruptibleMutations opts back into the legacy
+// behavior where a FUSE interrupt cancels the in-flight commit.
+func (fs *Dat9FS) interruptSafeMutationsEnabled() bool {
+	return fs == nil || fs.opts == nil || !fs.opts.LegacyInterruptibleMutations
 }
 
 func (fs *Dat9FS) recordCommittedMutation(ino uint64, seq uint64, revision int64, size int64) {
@@ -3590,7 +3626,9 @@ func (fs *Dat9FS) applyRemoteMode(ctx context.Context, localPath string, mode ui
 	}
 	remotePath := fs.remotePath(localPath)
 	start := fs.perfStart()
-	err := fs.client.ChmodCtx(ctx, remotePath, remoteMode)
+	commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+	err := fs.client.ChmodCtx(commitCtx, remotePath, remoteMode)
+	commitCancel()
 	fs.perfRecordRemote(perfRemoteMutation, start, err, 0)
 	fs.debugf("chmod remote done local=%s remote=%s local_mode=%o remote_mode=%o err=%v", localPath, remotePath, localMode, remoteMode, err)
 	if err != nil {
@@ -3653,7 +3691,9 @@ func (fs *Dat9FS) applyRemoteModeForEntry(ctx context.Context, entry *InodeEntry
 		}
 		remotePath := remoteDirectoryPath(fs.remotePath(entry.Path))
 		start := fs.perfStart()
-		err := fs.client.ChmodCtx(ctx, remotePath, remoteMode)
+		commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+		err := fs.client.ChmodCtx(commitCtx, remotePath, remoteMode)
+		commitCancel()
 		fs.perfRecordRemote(perfRemoteMutation, start, err, 0)
 		fs.debugf("chmod remote done local=%s remote=%s local_mode=%o remote_mode=%o err=%v", entry.Path, remotePath, localMode, remoteMode, err)
 		if err != nil {
@@ -6933,7 +6973,9 @@ func (fs *Dat9FS) hardlinkRemoteWithTransientRecovery(ctx context.Context, srcP,
 	srcRemote := fs.remotePath(srcP)
 	dstRemote := fs.remotePath(dstP)
 	mutationStart := fs.perfStart()
-	err := fs.client.HardlinkCtx(ctx, srcRemote, dstRemote)
+	commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+	err := fs.client.HardlinkCtx(commitCtx, srcRemote, dstRemote)
+	commitCancel()
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
 		return err
@@ -7020,7 +7062,9 @@ func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPat
 		return err
 	}
 	mutationStart := fs.perfStart()
-	err := fs.client.MkdirCtx(ctx, apiPath, mode)
+	commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+	err := fs.client.MkdirCtx(commitCtx, apiPath, mode)
+	commitCancel()
 	cf()
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
@@ -7084,15 +7128,17 @@ func (fs *Dat9FS) deleteRemotePathWithInterruptRecovery(ctx context.Context, loc
 	}
 	mutationStart := fs.perfStart()
 	remotePath := fs.remotePath(localPath)
+	commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
 	var err error
 	switch kind {
 	case deleteKindFile:
-		err = fs.client.DeleteFileCtx(ctx, remotePath)
+		err = fs.client.DeleteFileCtx(commitCtx, remotePath)
 	case deleteKindDir:
-		err = fs.client.DeleteDirCtx(ctx, remotePath)
+		err = fs.client.DeleteDirCtx(commitCtx, remotePath)
 	default:
 		err = fmt.Errorf("unsupported delete kind %q", kind)
 	}
+	commitCancel()
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
 		return err
@@ -7115,7 +7161,9 @@ func (fs *Dat9FS) renameRemoteWithTransientRetry(ctx context.Context, oldP, newP
 	oldRemote := fs.remotePath(oldP)
 	newRemote := fs.remotePath(newP)
 	mutationStart := fs.perfStart()
-	err := fs.client.RenameCtx(ctx, oldRemote, newRemote)
+	commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+	err := fs.client.RenameCtx(commitCtx, oldRemote, newRemote)
+	commitCancel()
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err == nil || !isTransientLookupErr(err) {
 		return err
@@ -9897,7 +9945,9 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 		return httpToFuseStatus(err)
 	}
 
-	stat, err := fs.client.StatCtx(ctx, fs.remotePath(dstP))
+	confirmCtx, confirmCancel := fs.postCommitConfirmContext(ctx)
+	stat, err := fs.client.StatCtx(confirmCtx, fs.remotePath(dstP))
+	confirmCancel()
 	if err != nil && !isForbiddenErr(err) && !isTransientLookupErr(err) {
 		return httpToFuseStatus(err)
 	}
@@ -10806,7 +10856,15 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 				defer commitCancel()
 				return fs.commitQueue.commitNowPathLocked(commitCtx, entry)
 			}
-			commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+			// Non-spill commits keep the request context so git/small-file renames
+			// stay interruptible when gVisor compatibility is off. This is a
+			// pending-upload commit (data transfer), not a namespace mutation,
+			// so interrupt-safe mutation detachment deliberately does not
+			// apply here; only gVisor compatibility detaches it.
+			commitCtx, commitCancel := ctx, func() {}
+			if fs.gvisorCompatibilityEnabled() {
+				commitCtx, commitCancel = fs.namespaceMutationCommitContext(ctx)
+			}
 			defer commitCancel()
 			return fs.commitQueue.commitNowPathLocked(commitCtx, entry)
 		}

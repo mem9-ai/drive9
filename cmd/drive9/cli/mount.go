@@ -27,17 +27,18 @@ import (
 )
 
 const (
-	defaultFuseLookupRetryCount        = 3
-	defaultFuseLookupRetryTimeout      = 2 * time.Second
-	defaultFuseReadConcurrency         = 24
-	defaultFuseParallelReadConcurrency = 4
-	defaultFuseParallelReadBlockSizeMB = 1
-	defaultMountBackgroundReadyTimeout = 30 * time.Second
-	defaultMountPerfPprofAddr          = "127.0.0.1:0"
-	defaultMountPerfCPUDuration        = 30 * time.Second
-	defaultMountPerfCPUInterval        = 10 * time.Minute
-	defaultMountPerfHeapInterval       = 10 * time.Minute
-	envMountGVisorCompat               = "DRIVE9_MOUNT_GVISOR_COMPAT"
+	defaultFuseLookupRetryCount          = 3
+	defaultFuseLookupRetryTimeout        = 2 * time.Second
+	defaultFuseReadConcurrency           = 24
+	defaultFuseParallelReadConcurrency   = 4
+	defaultFuseParallelReadBlockSizeMB   = 1
+	defaultMountBackgroundReadyTimeout   = 30 * time.Second
+	defaultMountPerfPprofAddr            = "127.0.0.1:0"
+	defaultMountPerfCPUDuration          = 30 * time.Second
+	defaultMountPerfCPUInterval          = 10 * time.Minute
+	defaultMountPerfHeapInterval         = 10 * time.Minute
+	envMountGVisorCompat                 = "DRIVE9_MOUNT_GVISOR_COMPAT"
+	envMountLegacyInterruptibleMutations = "DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS"
 	// EnvMountLocalOnlyPatterns adds newline-delimited local-only mount rules.
 	EnvMountLocalOnlyPatterns = "DRIVE9_MOUNT_LOCAL_ONLY_PATTERNS"
 	// EnvMountRemoteOnlyPatterns adds newline-delimited remote-only mount rules.
@@ -183,6 +184,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	syncRead := fs.Bool("fuse-sync-read", false, "disable kernel async read dispatch; at most one read in flight per file handle")
 	directMountStrict := fs.Bool("direct-mount-strict", false, "Linux only: mount directly with mount(2) and do not fall back to fusermount")
 	gvisorCompat := fs.Bool("gvisor-compat", false, "enable gVisor-specific FUSE compatibility behavior (default from $DRIVE9_MOUNT_GVISOR_COMPAT)")
+	legacyInterruptibleMutations := fs.Bool("legacy-interruptible-mutations", false, "restore legacy behavior where a FUSE interrupt cancels in-flight remote commits of idempotent namespace mutations, which can surface EAGAIN for an already-committed change (default from $DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS)")
 	legacyDirStatFallback := fs.Bool("legacy-dir-stat-fallback", false, "on Lookup stat 404, list parent to support legacy servers without directory stat")
 	readDirPrefetch := fs.Bool("readdir-prefetch", false, "prefetch small files after directory reads into the read cache")
 	prefetchMaxFiles := fs.Int("readdir-prefetch-max-files", 32, "maximum small files prefetched per directory read")
@@ -238,6 +240,13 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	gvisorCompatGiven := flagProvided(fs, "gvisor-compat")
 	if !gvisorCompatGiven {
 		*gvisorCompat, err = mountGVisorCompatFromEnv()
+		if err != nil {
+			return err
+		}
+	}
+	legacyInterruptibleMutationsGiven := flagProvided(fs, "legacy-interruptible-mutations")
+	if !legacyInterruptibleMutationsGiven {
+		*legacyInterruptibleMutations, err = mountLegacyInterruptibleMutationsFromEnv()
 		if err != nil {
 			return err
 		}
@@ -643,20 +652,21 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	autoUnpack := overlayProfile && len(effectivePackPaths) > 0 && !*noAutoUnpack
 	if runtime.GOOS == "windows" && resolved == MountModeFUSE && len(unpackArchives) == 0 && !autoUnpack {
 		return mountFuse(&mountFuseOptions{
-			MountPoint:         mountPoint,
-			RemoteRoot:         remoteRoot,
-			Profile:            profileCfg.Name,
-			LayerRef:           strings.TrimSpace(*layerRef),
-			CheckpointRef:      strings.TrimSpace(*checkpointRef),
-			LocalRoot:          normalizedLocalRoot,
-			LocalOnlyPatterns:  append([]string(nil), effectiveLocalOnlyPatterns...),
-			RemoteOnlyPatterns: append([]string(nil), effectiveRemoteOnlyPatterns...),
-			AppendLogPatterns:  append([]string(nil), effectiveAppendLogPatterns...),
-			PackPaths:          append([]string(nil), effectivePackPaths...),
-			ExtentPaths:        append([]string(nil), effectiveExtentPatterns...),
-			ReadOnly:           *readOnly,
-			Debug:              *debug,
-			GVisorCompat:       *gvisorCompat,
+			MountPoint:                   mountPoint,
+			RemoteRoot:                   remoteRoot,
+			Profile:                      profileCfg.Name,
+			LayerRef:                     strings.TrimSpace(*layerRef),
+			CheckpointRef:                strings.TrimSpace(*checkpointRef),
+			LocalRoot:                    normalizedLocalRoot,
+			LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
+			RemoteOnlyPatterns:           append([]string(nil), effectiveRemoteOnlyPatterns...),
+			AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),
+			PackPaths:                    append([]string(nil), effectivePackPaths...),
+			ExtentPaths:                  append([]string(nil), effectiveExtentPatterns...),
+			ReadOnly:                     *readOnly,
+			Debug:                        *debug,
+			GVisorCompat:                 *gvisorCompat,
+			LegacyInterruptibleMutations: *legacyInterruptibleMutations,
 		})
 	}
 
@@ -775,89 +785,91 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 
 	if runtime.GOOS == "windows" && resolved == MountModeFUSE {
 		return mountFuse(&mountFuseOptions{
-			MountPoint:         mountPoint,
-			RemoteRoot:         remoteRoot,
-			Profile:            profileCfg.Name,
-			LayerRef:           strings.TrimSpace(*layerRef),
-			CheckpointRef:      strings.TrimSpace(*checkpointRef),
-			LocalRoot:          normalizedLocalRoot,
-			LocalOnlyPatterns:  append([]string(nil), effectiveLocalOnlyPatterns...),
-			RemoteOnlyPatterns: append([]string(nil), effectiveRemoteOnlyPatterns...),
-			AppendLogPatterns:  append([]string(nil), effectiveAppendLogPatterns...),
-			PackPaths:          append([]string(nil), effectivePackPaths...),
-			ExtentPaths:        append([]string(nil), effectiveExtentPatterns...),
-			ReadOnly:           *readOnly,
-			Debug:              *debug,
-			GVisorCompat:       *gvisorCompat,
+			MountPoint:                   mountPoint,
+			RemoteRoot:                   remoteRoot,
+			Profile:                      profileCfg.Name,
+			LayerRef:                     strings.TrimSpace(*layerRef),
+			CheckpointRef:                strings.TrimSpace(*checkpointRef),
+			LocalRoot:                    normalizedLocalRoot,
+			LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
+			RemoteOnlyPatterns:           append([]string(nil), effectiveRemoteOnlyPatterns...),
+			AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),
+			PackPaths:                    append([]string(nil), effectivePackPaths...),
+			ExtentPaths:                  append([]string(nil), effectiveExtentPatterns...),
+			ReadOnly:                     *readOnly,
+			Debug:                        *debug,
+			GVisorCompat:                 *gvisorCompat,
+			LegacyInterruptibleMutations: *legacyInterruptibleMutations,
 		})
 	}
 
 	// FUSE path (existing behavior).
 	opts := &mountFuseOptions{
-		Server:                  *server,
-		APIKey:                  *apiKey,
-		Token:                   token,
-		MountPoint:              mountPoint,
-		RemoteRoot:              remoteRoot,
-		CacheDir:                *cacheDir,
-		CacheSize:               int64(*cacheSize) << 20,
-		ReadCacheMaxFileBytes:   *readCacheMaxFile << 20,
-		ReadCacheTTL:            normalizedReadCacheTTL,
-		DiskReadCacheSize:       *diskReadCacheSize << 20,
-		DiskReadCacheFreeRatio:  *diskReadCacheFreeRatio,
-		DirTTL:                  normalizedDirTTL,
-		AttrTTL:                 normalizedAttrTTL,
-		EntryTTL:                normalizedEntryTTL,
-		FlushDebounce:           *flushDebounce,
-		LookupRetryCount:        normalizedLookupRetryCount,
-		LookupRetryTimeout:      normalizedLookupRetryTimeout,
-		LegacyDirStatFallback:   *legacyDirStatFallback,
-		ReadDirPrefetch:         *readDirPrefetch,
-		PrefetchMaxFiles:        *prefetchMaxFiles,
-		PrefetchMaxFileBytes:    *prefetchMaxFileBytes,
-		PrefetchMaxBytes:        *prefetchMaxBytes,
-		PrefetchTimeout:         *prefetchTimeout,
-		TrustLocalEvents:        *trustProcessLocalEvents,
-		SyncMode:                syncModeVal,
-		WritePolicy:             writePolicyVal,
-		Profile:                 profileCfg.Name,
-		LayerRef:                strings.TrimSpace(*layerRef),
-		CheckpointRef:           strings.TrimSpace(*checkpointRef),
-		LocalRoot:               normalizedLocalRoot,
-		LocalOnlyPatterns:       append([]string(nil), effectiveLocalOnlyPatterns...),
-		RemoteOnlyPatterns:      append([]string(nil), effectiveRemoteOnlyPatterns...),
-		AppendLogPatterns:       append([]string(nil), effectiveAppendLogPatterns...),
-		PackPaths:               append([]string(nil), effectivePackPaths...),
-		ExtentPaths:             append([]string(nil), effectiveExtentPatterns...),
-		UploadConcurrency:       *uploadConcurrency,
-		DirCacheMaxEntries:      *dirCacheMaxEntries,
-		CommitQueueMaxPending:   *commitQueueMaxPending,
-		WriteBackBatchWindow:    *writeBackBatchWindow,
-		WriteBackBatchMaxFiles:  *writeBackBatchMaxFiles,
-		WriteBackBatchMaxBytes:  *writeBackBatchMaxBytes,
-		WriteCacheFreeRatio:     normalizedWriteCacheFreeRatio,
-		WriteCacheSizeMB:        normalizedWriteCacheSizeMB,
-		ReadConcurrency:         *readConcurrency,
-		ParallelReadConcurrency: *parallelReadConcurrency,
-		ParallelReadBlockSize:   *parallelReadBlockSize << 20,
-		SyncRead:                *syncRead,
-		DirectMountStrict:       *directMountStrict,
-		GVisorCompat:            *gvisorCompat,
-		AllowOther:              *allowOther,
-		ReadOnly:                *readOnly,
-		Debug:                   *debug,
-		ProfileCPUDuration:      effectivePerfCPUDuration,
-		ProfileCPUInterval:      effectivePerfCPUInterval,
-		ProfileHeap:             profileHeap,
-		ProfileDir:              profileDir,
-		ProfileHeapInterval:     effectivePerfHeapInterval,
-		PprofAddr:               pprofAddr,
-		PerfSamplesPath:         perfJSONL,
-		PerfSampleInterval:      *perfInterval,
-		PerfMaxSamples:          *perfMaxSamples,
-		PerfMaxSampleFiles:      *perfMaxSampleFiles,
-		PerfMaxProfileFiles:     *perfMaxProfileFiles,
-		Supervised:              *supervised,
+		Server:                       *server,
+		APIKey:                       *apiKey,
+		Token:                        token,
+		MountPoint:                   mountPoint,
+		RemoteRoot:                   remoteRoot,
+		CacheDir:                     *cacheDir,
+		CacheSize:                    int64(*cacheSize) << 20,
+		ReadCacheMaxFileBytes:        *readCacheMaxFile << 20,
+		ReadCacheTTL:                 normalizedReadCacheTTL,
+		DiskReadCacheSize:            *diskReadCacheSize << 20,
+		DiskReadCacheFreeRatio:       *diskReadCacheFreeRatio,
+		DirTTL:                       normalizedDirTTL,
+		AttrTTL:                      normalizedAttrTTL,
+		EntryTTL:                     normalizedEntryTTL,
+		FlushDebounce:                *flushDebounce,
+		LookupRetryCount:             normalizedLookupRetryCount,
+		LookupRetryTimeout:           normalizedLookupRetryTimeout,
+		LegacyDirStatFallback:        *legacyDirStatFallback,
+		ReadDirPrefetch:              *readDirPrefetch,
+		PrefetchMaxFiles:             *prefetchMaxFiles,
+		PrefetchMaxFileBytes:         *prefetchMaxFileBytes,
+		PrefetchMaxBytes:             *prefetchMaxBytes,
+		PrefetchTimeout:              *prefetchTimeout,
+		TrustLocalEvents:             *trustProcessLocalEvents,
+		SyncMode:                     syncModeVal,
+		WritePolicy:                  writePolicyVal,
+		Profile:                      profileCfg.Name,
+		LayerRef:                     strings.TrimSpace(*layerRef),
+		CheckpointRef:                strings.TrimSpace(*checkpointRef),
+		LocalRoot:                    normalizedLocalRoot,
+		LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
+		RemoteOnlyPatterns:           append([]string(nil), effectiveRemoteOnlyPatterns...),
+		AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),
+		PackPaths:                    append([]string(nil), effectivePackPaths...),
+		ExtentPaths:                  append([]string(nil), effectiveExtentPatterns...),
+		UploadConcurrency:            *uploadConcurrency,
+		DirCacheMaxEntries:           *dirCacheMaxEntries,
+		CommitQueueMaxPending:        *commitQueueMaxPending,
+		WriteBackBatchWindow:         *writeBackBatchWindow,
+		WriteBackBatchMaxFiles:       *writeBackBatchMaxFiles,
+		WriteBackBatchMaxBytes:       *writeBackBatchMaxBytes,
+		WriteCacheFreeRatio:          normalizedWriteCacheFreeRatio,
+		WriteCacheSizeMB:             normalizedWriteCacheSizeMB,
+		ReadConcurrency:              *readConcurrency,
+		ParallelReadConcurrency:      *parallelReadConcurrency,
+		ParallelReadBlockSize:        *parallelReadBlockSize << 20,
+		SyncRead:                     *syncRead,
+		DirectMountStrict:            *directMountStrict,
+		GVisorCompat:                 *gvisorCompat,
+		LegacyInterruptibleMutations: *legacyInterruptibleMutations,
+		AllowOther:                   *allowOther,
+		ReadOnly:                     *readOnly,
+		Debug:                        *debug,
+		ProfileCPUDuration:           effectivePerfCPUDuration,
+		ProfileCPUInterval:           effectivePerfCPUInterval,
+		ProfileHeap:                  profileHeap,
+		ProfileDir:                   profileDir,
+		ProfileHeapInterval:          effectivePerfHeapInterval,
+		PprofAddr:                    pprofAddr,
+		PerfSamplesPath:              perfJSONL,
+		PerfSampleInterval:           *perfInterval,
+		PerfMaxSamples:               *perfMaxSamples,
+		PerfMaxSampleFiles:           *perfMaxSampleFiles,
+		PerfMaxProfileFiles:          *perfMaxProfileFiles,
+		Supervised:                   *supervised,
 	}
 
 	return mountFuse(opts)
@@ -1776,6 +1788,21 @@ func mountGVisorCompatFromEnv() (bool, error) {
 		return false, nil
 	default:
 		return false, fmt.Errorf("drive9 mount: %s must be true or false, got %q", envMountGVisorCompat, raw)
+	}
+}
+
+func mountLegacyInterruptibleMutationsFromEnv() (bool, error) {
+	raw, ok := os.LookupEnv(envMountLegacyInterruptibleMutations)
+	if !ok {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("drive9 mount: %s must be true or false, got %q", envMountLegacyInterruptibleMutations, raw)
 	}
 }
 
