@@ -12404,9 +12404,13 @@ func (fs *Dat9FS) cachedToDirEntriesWithLocal(dirPath string, items []CachedFile
 		if ino, ok := fs.inodes.GetInode(childP); ok {
 			live, _ = fs.inodes.GetEntry(ino)
 		}
+		observedVersion := item.observedVersion
 		item, preserve := fs.localDirEntryInfo(childP, item, live, local)
 		entry := fs.inodes.EnsureDirEntry(childP, item, preserve)
 		item, _ = fs.localDirEntryInfo(childP, cachedInfoFromEntry(item.Name, entry), entry, local)
+		// Cache provenance belongs to the observation, while attrVersion on
+		// the inode records mutations. Do not lose the original read fence.
+		item.observedVersion = max(item.observedVersion, observedVersion)
 		items[i] = item
 		entries = append(entries, dirEntryFromCachedInfo(item, entry.Ino))
 	}
