@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -292,5 +293,88 @@ func TestLegacyInterruptibleLinkFallsBackOnInterruptedStat(t *testing.T) {
 	}
 	if entry.Nlink != 2 {
 		t.Fatalf("entry nlink = %d, want fallback 2 (source nlink + 1)", entry.Nlink)
+	}
+}
+
+// TestInterruptSafeSymlinkCommitDetachedFromFuseInterrupt runs the Symlink
+// entry point with the FUSE cancel channel already closed (the interrupt
+// arrived before the commit). The symlink commit runs detached, so Symlink
+// must succeed with exactly one mutation request.
+func TestInterruptSafeSymlinkCommitDetachedFromFuseInterrupt(t *testing.T) {
+	cancel := make(chan struct{})
+	close(cancel)
+	var posts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			posts.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			// The post-create attribute refresh runs on the request context
+			// and is already non-fatal; a transient failure is fine here.
+			w.WriteHeader(statusClientClosedRequest)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Symlink(cancel, &gofuse.InHeader{NodeId: 1}, "/target", "link.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Symlink status = %v, want OK", st)
+	}
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("symlink POST calls = %d, want 1", got)
+	}
+}
+
+// TestInterruptSafeMknodCommitDetachedFromFuseInterrupt runs Mknod for a
+// regular file (which also exercises the conditional chmod because the mode
+// differs from the default 0644) with the FUSE cancel channel already
+// closed. Both commit calls run detached, so Mknod must succeed with exactly
+// one create and one chmod.
+func TestInterruptSafeMknodCommitDetachedFromFuseInterrupt(t *testing.T) {
+	cancel := make(chan struct{})
+	close(cancel)
+	var puts, chmods atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			puts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"revision":1}`))
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmods.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			w.WriteHeader(statusClientClosedRequest)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Mknod(cancel, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFREG) | 0o600,
+	}, "node.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+	if got := puts.Load(); got != 1 {
+		t.Fatalf("create PUT calls = %d, want 1", got)
+	}
+	if got := chmods.Load(); got != 1 {
+		t.Fatalf("chmod calls = %d, want 1", got)
 	}
 }

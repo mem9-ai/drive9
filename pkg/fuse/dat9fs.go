@@ -649,12 +649,13 @@ func detachedSharedReadCtx(parent context.Context, timeout time.Duration) (conte
 
 // namespaceMutationCommitContext returns the context for the remote commit
 // call of an idempotent namespace mutation (hardlink, rename, unlink/rmdir,
-// mkdir, chmod). Under gVisor compatibility or interrupt-safe mutations the
-// context is detached from the FUSE cancel channel: once the kernel has
-// handed a request to the daemon it waits uninterruptibly for the reply, so
-// finishing a mutation the server may already be applying and answering OK
-// is always kernel-sanctioned, whereas canceling it mid-flight can surface
-// EAGAIN for a change that was already committed.
+// mkdir, chmod, symlink, and mknod's empty-file create). Under gVisor
+// compatibility or interrupt-safe mutations the context is detached from the
+// FUSE cancel channel: once the kernel has handed a request to the daemon it
+// waits uninterruptibly for the reply, so finishing a mutation the server
+// may already be applying and answering OK is always kernel-sanctioned,
+// whereas canceling it mid-flight can surface EAGAIN for a change that was
+// already committed.
 //
 // gVisor compatibility keeps its historical fuseTimeout budget. Interrupt-safe
 // mutations use the tighter namespaceMutationRetryTimeout, matching the
@@ -9547,8 +9548,14 @@ func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, na
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
+	// The empty-file create (and its conditional chmod) is the mknod commit:
+	// no data payload is transferred, so under interrupt-safe mutations it runs
+	// detached like every other namespace-mutation commit.
+	commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+	defer commitCancel()
+
 	writeStart := fs.perfStart()
-	err := fs.client.WriteCtxConditional(ctx, fs.remotePath(childP), nil, 0)
+	err := fs.client.WriteCtxConditional(commitCtx, fs.remotePath(childP), nil, 0)
 	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
 	if err != nil {
 		return httpToFuseStatus(err)
@@ -9558,7 +9565,7 @@ func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, na
 	remotePerm := remoteChmodMode(perm)
 	if remotePerm != defaultRegularFileMode {
 		chmodStart := fs.perfStart()
-		err = fs.client.ChmodCtx(ctx, fs.remotePath(childP), remotePerm)
+		err = fs.client.ChmodCtx(commitCtx, fs.remotePath(childP), remotePerm)
 		fs.perfRecordRemote(perfRemoteMutation, chmodStart, err, 0)
 		if err != nil {
 			if rollbackErr := fs.deleteRemoteFileWithInterruptRecovery(ctx, childP); rollbackErr != nil && !isNotFoundErr(rollbackErr) {
@@ -9743,7 +9750,9 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 		err = fs.upsertLayerSymlink(ctx, childP, pointedTo)
 	} else {
 		mutationStart := fs.perfStart()
-		err = fs.client.SymlinkCtx(ctx, pointedTo, fs.remotePath(childP))
+		commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+		err = fs.client.SymlinkCtx(commitCtx, pointedTo, fs.remotePath(childP))
+		commitCancel()
 		fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	}
 	if err != nil {
@@ -9810,7 +9819,9 @@ func (fs *Dat9FS) retrySymlinkAfterNegativeCacheConflict(ctx context.Context, po
 	}
 
 	mutationStart := fs.perfStart()
-	err := fs.client.SymlinkCtx(ctx, pointedTo, fs.remotePath(childP))
+	commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+	err := fs.client.SymlinkCtx(commitCtx, pointedTo, fs.remotePath(childP))
+	commitCancel()
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	return err
 }
