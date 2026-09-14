@@ -281,10 +281,7 @@ func (fs *Dat9FS) loadRemoteDirectory(ctx context.Context, dirPath string, mount
 		return nil, responseBytes, fs.resetMountViewOnAuthorizationError(err)
 	}
 
-	cached := cachedFileInfos(items)
-	for i := range cached {
-		cached[i].observedVersion = observedVersion
-	}
+	cached := cachedFileInfos(items, observedVersion)
 	if err := fs.applyBatchStats(ctx, dirPath, cached); err != nil {
 		return nil, responseBytes, err
 	}

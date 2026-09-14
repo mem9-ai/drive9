@@ -394,10 +394,7 @@ func (fs *Dat9FS) refreshSiblingMetadataList(ctx context.Context, request metada
 	if err != nil {
 		return fs.resetMountViewOnAuthorizationError(err)
 	}
-	cached := cachedFileInfos(items)
-	for i := range cached {
-		cached[i].observedVersion = observedVersion
-	}
+	cached := cachedFileInfos(items, observedVersion)
 	if err := fs.applyBatchStats(ctx, request.parentPath, cached); err != nil {
 		return err
 	}

@@ -206,7 +206,20 @@ func (m *InodeToPath) changedAttrsLocked(entry *InodeEntry) {
 func (m *InodeToPath) EnsureDirEntry(path string, item CachedFileInfo, preserve bool) *InodeEntry {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	keep := func(entry *InodeEntry) bool {
+		return preserve || entry.attrVersion > item.observedVersion ||
+			(sameKnownDirEntryResource(entry, item) && entry.Revision > item.Revision)
+	}
 	ino, found := m.byPath[path]
+	if found && !keep(m.byInode[ino]) {
+		entry := m.byInode[ino]
+		if entry.IsDir != item.IsDir || (entry.ResourceID != "" && item.ResourceID != "" && entry.ResourceID != item.ResourceID) {
+			// The pathname now names a different object. Detach only this path;
+			// old hardlinks and kernel references must retain the old inode.
+			m.removePathLocked(path, true, true)
+			found = false
+		}
+	}
 	if !found {
 		if key := inodeResourceKey(item.ResourceID, item.IsDir); key != "" {
 			ino, found = m.byID[key]
@@ -214,7 +227,7 @@ func (m *InodeToPath) EnsureDirEntry(path string, item CachedFileInfo, preserve 
 	}
 	if found {
 		entry := m.byInode[ino]
-		if preserve || entry.attrVersion > item.observedVersion || entry.Revision > item.Revision {
+		if keep(entry) {
 			m.addPathLocked(entry, path)
 			return copyInodeEntryLocked(entry)
 		}
