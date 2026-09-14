@@ -180,7 +180,7 @@ func TestRecoveredPendingInodeSurvivesCommitCleanup(t *testing.T) {
 	// A recovery entry may have been queued before its inode was discovered.
 	// An already captured directory snapshot must remain fenced after cleanup.
 	stale, _ := fs.dirCache.Get("/")
-	fs.onCommitQueueSuccess(&CommitEntry{Path: "/file.dat", Size: 4096}, 0)
+	fs.onCommitQueueSuccess(&CommitEntry{Path: "/file.dat", Size: 4096, recovered: true, PendingIndexGen: gen}, 0)
 	fs.pendingIndex.RemoveIfGeneration("/file.dat", gen)
 	entries := fs.cachedToDirEntries("/", stale)
 	if entries[0].Size != 4096 {
