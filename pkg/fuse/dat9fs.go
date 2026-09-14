@@ -20,6 +20,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 	"github.com/mem9-ai/drive9/pkg/s3client"
@@ -631,6 +632,7 @@ func fuseCtxWithTimeout(cancel <-chan struct{}, timeout time.Duration) (context.
 	go func() {
 		select {
 		case <-cancel:
+			metrics.RecordFuseInterrupt()
 			cf()
 		case <-ctx.Done():
 		}
@@ -9896,8 +9898,15 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	}
 
 	stat, err := fs.client.StatCtx(ctx, fs.remotePath(dstP))
-	if err != nil && !isForbiddenErr(err) {
+	if err != nil && !isForbiddenErr(err) && !isTransientLookupErr(err) {
 		return httpToFuseStatus(err)
+	}
+	if err != nil {
+		// The hardlink is already committed at this point; the stat only refines
+		// cached attributes, and every field below has a fallback. A FUSE
+		// interrupt (or any transient stat error) must not turn a committed
+		// link into EAGAIN — callers that retry would then hit EEXIST loops.
+		fs.debugf("link post-commit stat failed; keeping fallback attributes local=%s err=%v", dstP, err)
 	}
 	mtime := time.Now()
 	if stat != nil && !stat.Mtime.IsZero() {
