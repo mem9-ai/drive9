@@ -201,7 +201,7 @@ func (m *InodeToPath) EnsureDirEntry(path string, item CachedFileInfo, preserve 
 		if entry.IsDir != item.IsDir || (entry.ResourceID != "" && item.ResourceID != "" && entry.ResourceID != item.ResourceID) {
 			// The pathname now names a different object. Detach only this path;
 			// old hardlinks and kernel references must retain the old inode.
-			m.removePathLocked(path, true, true)
+			m.removePathWithMutationLocked(path, true, true, false)
 			found = false
 		}
 	}
@@ -221,8 +221,25 @@ func (m *InodeToPath) EnsureDirEntry(path string, item CachedFileInfo, preserve 
 	if mtime.IsZero() {
 		mtime = time.Now()
 	}
-	ino = m.ensureInodeWithIdentityLocked(path, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
+	if !found {
+		ino = m.nextIno
+		m.nextIno++
+		m.byInode[ino] = &InodeEntry{Ino: ino}
+		if preserve {
+			// A cold authoritative entry represents a recovered pending write.
+			// Seed its mutation fence once; recovery commits can have Inode=0.
+			m.changedAttrsLocked(m.byInode[ino])
+		}
+	}
 	entry := m.byInode[ino]
+	m.addPathLocked(entry, path)
+	entry.IsDir, entry.Size, entry.Mtime = item.IsDir, item.Size, mtime
+	m.setIdentityLocked(entry, item.ResourceID)
+	if item.Nlink > 0 {
+		entry.Nlink = item.Nlink
+	} else if entry.Nlink == 0 && !entry.IsDir {
+		entry.Nlink = 1
+	}
 	entry.Revision = item.Revision
 	if item.HasMode {
 		entry.Mode, entry.HasMode = item.Mode, true
@@ -233,7 +250,8 @@ func (m *InodeToPath) EnsureDirEntry(path string, item CachedFileInfo, preserve 
 	if item.HasGID {
 		entry.Gid, entry.HasGID = item.Gid, true
 	}
-	m.changedAttrsLocked(entry)
+	// Keep the inode's last mutation version. Ordinary remote/cache
+	// observations must not manufacture newer local state.
 	return copyInodeEntryLocked(entry)
 }
 
@@ -754,6 +772,12 @@ func (m *InodeToPath) removeEntryLocked(ino uint64, entry *InodeEntry) {
 }
 
 func (m *InodeToPath) removePathLocked(path string, consumeLink bool, preserveIfLast bool) {
+	m.removePathWithMutationLocked(path, consumeLink, preserveIfLast, true)
+}
+
+// Remote replacement observations detach the old path without advancing its
+// mutation version; locally initiated namespace changes still advance it.
+func (m *InodeToPath) removePathWithMutationLocked(path string, consumeLink bool, preserveIfLast bool, localMutation bool) {
 	ino, ok := m.byPath[path]
 	if !ok {
 		return
@@ -765,7 +789,9 @@ func (m *InodeToPath) removePathLocked(path string, consumeLink bool, preserveIf
 	}
 	delete(m.byPath, path)
 	delete(entry.Paths, path)
-	m.changedAttrsLocked(entry)
+	if localMutation {
+		m.changedAttrsLocked(entry)
+	}
 	if consumeLink && !entry.IsDir {
 		if entry.Nlink > 1 {
 			entry.Nlink--
