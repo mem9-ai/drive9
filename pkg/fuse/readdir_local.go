@@ -57,8 +57,15 @@ func (fs *Dat9FS) localDirEntryInfo(childP string, item CachedFileInfo, live *In
 		}
 		return item, true
 	}
-	if live != nil && !live.IsDir && live.Revision > item.Revision {
+	if sameKnownDirEntryResource(live, item) && live.Revision > item.Revision {
 		return cachedInfoFromEntry(item.Name, live), true
 	}
 	return item, false
+}
+
+// Revision ordering is meaningful only for the same known resource and type.
+// Without identity information, the local observation version still fences
+// concurrent mutations, but a fresh remote observation must remain visible.
+func sameKnownDirEntryResource(live *InodeEntry, item CachedFileInfo) bool {
+	return live != nil && live.IsDir == item.IsDir && live.ResourceID != "" && live.ResourceID == item.ResourceID
 }

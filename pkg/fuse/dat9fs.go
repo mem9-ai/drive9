@@ -6241,7 +6241,7 @@ func (fs *Dat9FS) getAttrStatWithRetry(cancel <-chan struct{}, remotePath string
 	return stat, generation, fs.resetMountViewOnUnauthorizedError(err)
 }
 
-func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
+func cachedFileInfos(items []client.FileInfo, observedVersion uint64) []CachedFileInfo {
 	cached := make([]CachedFileInfo, 0, len(items))
 	for _, item := range items {
 		if !validDirEntryName(item.Name) {
@@ -6252,15 +6252,16 @@ func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
 			mtime = time.Unix(item.Mtime, 0)
 		}
 		cached = append(cached, CachedFileInfo{
-			Name:       item.Name,
-			Size:       item.Size,
-			IsDir:      item.IsDir,
-			Mtime:      mtime,
-			Revision:   item.Revision,
-			Mode:       item.Mode,
-			HasMode:    item.HasMode,
-			ResourceID: item.ResourceID,
-			Nlink:      item.Nlink,
+			observedVersion: observedVersion,
+			Name:            item.Name,
+			Size:            item.Size,
+			IsDir:           item.IsDir,
+			Mtime:           mtime,
+			Revision:        item.Revision,
+			Mode:            item.Mode,
+			HasMode:         item.HasMode,
+			ResourceID:      item.ResourceID,
+			Nlink:           item.Nlink,
 		})
 	}
 	return cached
@@ -6273,6 +6274,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	apiPath := fs.remotePath(parentPath)
 	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
+	observedVersion := fs.inodes.AttrVersion()
 	items, err := fs.client.ListCtx(ctx, apiPath)
 	cf()
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
@@ -6280,7 +6282,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		if !fs.lockMountViewRead(generation) {
 			return nil, 0, syscall.EAGAIN
 		}
-		fs.dirCache.Put(parentPath, cachedFileInfos(items))
+		fs.dirCache.Put(parentPath, cachedFileInfos(items, observedVersion))
 		fs.mountViewMu.RUnlock()
 		return items, generation, nil
 	}
@@ -6300,6 +6302,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		// original transient failure immediately.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
 		listStart = fs.perfStart()
+		observedVersion = fs.inodes.AttrVersion()
 		items, err = fs.client.ListCtx(retryCtx, apiPath)
 		retryCancel()
 		fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
@@ -6307,7 +6310,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 			if !fs.lockMountViewRead(generation) {
 				return nil, 0, syscall.EAGAIN
 			}
-			fs.dirCache.Put(parentPath, cachedFileInfos(items))
+			fs.dirCache.Put(parentPath, cachedFileInfos(items, observedVersion))
 			fs.mountViewMu.RUnlock()
 			return items, generation, nil
 		}
@@ -6755,6 +6758,7 @@ func (fs *Dat9FS) snapshotDeletedPaths() map[string]struct{} {
 func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string) (bool, uint64, error) {
 	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
+	observedVersion := fs.inodes.AttrVersion()
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
@@ -6789,7 +6793,7 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 		return false, 0, syscall.EAGAIN
 	}
 	if fs.dirCache != nil {
-		fs.dirCache.Put(dirPath, cachedFileInfos(liveItems))
+		fs.dirCache.Put(dirPath, cachedFileInfos(liveItems, observedVersion))
 	}
 	fs.mountViewMu.RUnlock()
 	return len(liveItems) > 0, generation, nil
@@ -11281,12 +11285,9 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	}
 
 	// Store in dir cache
-	cached := cachedFileInfos(items)
+	cached := cachedFileInfos(items, observedVersion)
 	if err := fs.applyBatchStats(ctx, dirPath, cached); err != nil {
 		return nil, err
-	}
-	for i := range cached {
-		cached[i].observedVersion = observedVersion
 	}
 	if !fs.lockMountViewRead(generation) {
 		return nil, syscall.EAGAIN
