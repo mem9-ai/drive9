@@ -346,7 +346,7 @@ replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/
 
 // JuiceFS fork with the drive9 HTTP meta engine (extend-v1.4 from v1.4.1).
 // Pin the GitHub commit; do not replace with a local path.
-replace github.com/juicedata/juicefs => github.com/mornyx/juicefs v1.4.2-0.20260914082257-b0e52daedecf
+replace github.com/juicedata/juicefs => github.com/mornyx/juicefs v1.4.2-0.20260914103651-ec5ea9b23d11
 
 // Upstream juicefs replaces hashicorp/golang-lru with the juicedata fork that
 // adds LRU.AddIf; a dependency replace is ignored, so consumers must carry it.

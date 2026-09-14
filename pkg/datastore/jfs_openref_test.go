@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"syscall"
@@ -55,11 +56,7 @@ func TestCrossRuntimeUnlinkKeepsOpenHandleAlive(t *testing.T) {
 	if st := rtA.Meta.Open(ctx, ino, syscall.O_RDWR, &attr); st != 0 {
 		t.Fatalf("open on A: %v", st)
 	}
-	var holders int
-	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM jfs_sustained WHERE inode = ?`, uint64(ino)).Scan(&holders); err != nil {
-		t.Fatal(err)
-	}
-	if holders != 1 {
+	if holders := holderRows(t, s, uint64(ino)); holders != 1 {
 		t.Fatalf("holder rows after open = %d, want 1", holders)
 	}
 
@@ -321,13 +318,11 @@ func TestConcurrentLastClosesReclaimExactlyOnce(t *testing.T) {
 			t.Fatalf("concurrent close: %v", err)
 		}
 	}
-	var nodes, sustained, delfile int
+	var nodes, delfile int
 	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM jfs_node WHERE inode = 909`).Scan(&nodes); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM jfs_sustained WHERE inode = 909`).Scan(&sustained); err != nil {
-		t.Fatal(err)
-	}
+	sustained := holderRows(t, s, 909)
 	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM jfs_delfile WHERE inode = 909`).Scan(&delfile); err != nil {
 		t.Fatal(err)
 	}
@@ -336,5 +331,263 @@ func TestConcurrentLastClosesReclaimExactlyOnce(t *testing.T) {
 	}
 	if delfile != 1 {
 		t.Fatalf("delfile rows after concurrent last closes = %d, want 1 (reclaimed exactly once)", delfile)
+	}
+}
+
+// deleteSustainedFault models the two indistinguishable failures of a holder
+// release: the RPC can fail before the server transaction commits, or the
+// transaction can commit and the response get lost. The client cannot tell
+// them apart, which is exactly what the release path must survive.
+type deleteSustainedFault struct {
+	mu              sync.Mutex
+	mode            int    // 0 none, 1 fail-before-commit, 2 commit-then-drop-response
+	deliveredByKind [2]int // faults actually delivered, per kind, so the churn test can prove it exercised both
+}
+
+const (
+	faultNone             = 0
+	faultFailBeforeCommit = 1
+	faultDropAfterCommit  = 2
+)
+
+func (f *deleteSustainedFault) take() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	mode := f.mode
+	f.mode = faultNone // one-shot, like a real transient fault
+	if mode != faultNone {
+		f.deliveredByKind[mode-1]++
+	}
+	return mode
+}
+
+func (f *deleteSustainedFault) deliveredOfKind(mode int) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.deliveredByKind[mode-1]
+}
+
+func (f *deleteSustainedFault) arm(mode int) {
+	f.mu.Lock()
+	f.mode = mode
+	f.mu.Unlock()
+}
+
+// newFaultExtentRuntime is newExtentRuntime with delete_sustained responses
+// subject to the armed fault.
+func newFaultExtentRuntime(t *testing.T, s *Store, fault *deleteSustainedFault) *extent.Runtime {
+	t.Helper()
+	dir := t.TempDir()
+	tr := extent.NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
+		if op == "delete_sustained" {
+			switch fault.take() {
+			case faultFailBeforeCommit:
+				return nil, int(syscall.EIO), errors.New("simulated failure before commit")
+			case faultDropAfterCommit:
+				// The server transaction runs and commits; only the response
+				// is lost — the client's error does not mean the row survived.
+				// If the server op itself failed, that failure propagates as
+				// itself (nothing committed, nothing to drop).
+				if _, eno, rerr := s.RunExtentMetaOp(ctx, op, raw, nil); rerr != nil || eno != 0 {
+					t.Logf("dropAfterCommit: server op failed before committing (eno=%d err=%v); propagating the real failure", eno, rerr)
+					return nil, eno, rerr
+				}
+				return nil, int(syscall.EIO), errors.New("simulated response loss after commit")
+			}
+		}
+		return s.RunExtentMetaOp(ctx, op, raw, nil)
+	})
+	st, err := extent.OpenStorage(&extent.Credential{
+		Scheme:   extent.SchemeFile,
+		Endpoint: dir,
+		Prefix:   "t/test/",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, err := extent.NewRuntime(extent.RuntimeConfig{Transport: tr, Storage: st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rt
+}
+
+func holderRows(t *testing.T, s *Store, ino uint64) int {
+	t.Helper()
+	var n int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM jfs_sustained WHERE inode = ?`, ino).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// The three close outcomes a release must survive. The response-lost case is
+// the P1: the client used to cache "registered" across a failed release, the
+// re-open skipped its registration, and the inode was reclaimed under the
+// live fd (Fsync → EBADF). After the fix, a failed release invalidates the
+// cached state and the next Open re-registers, so the server-side holder is
+// valid again in all three outcomes.
+func TestReleaseUncertaintyKeepsHolderValidOnReopen(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode int
+		// rowsAfterClose: what the server really holds once the faulted
+		// close finishes (1 when the delete never committed, 0 when it did).
+		rowsAfterClose int
+	}{
+		{"normal release", faultNone, 0},
+		{"failure before commit", faultFailBeforeCommit, 1},
+		{"response lost after commit", faultDropAfterCommit, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			fault := &deleteSustainedFault{}
+			rtA := newFaultExtentRuntime(t, s, fault)
+			rtB := newExtentRuntime(t, s, 0)
+			t.Cleanup(func() { _ = extent.CloseRuntime(rtA) })
+			t.Cleanup(func() { _ = extent.CloseRuntime(rtB) })
+
+			ctx := jfsmeta.NewContext(1, 0, []uint32{0}).WithValue(jfsmeta.Drive9PathKey, "/uncertain.db")
+			var ino jfsmeta.Ino
+			var attr jfsmeta.Attr
+			if st := rtA.Meta.Create(ctx, jfsmeta.RootInode, "uncertain.db", 0644, 0, 0, &ino, &attr); st != 0 {
+				t.Fatalf("create: %v", st)
+			}
+			// RELEASE of the create-time handle, faulted per the scenario.
+			if tc.mode != faultNone {
+				fault.arm(tc.mode)
+			}
+			if st := rtA.Meta.Close(ctx, ino); st != 0 {
+				t.Fatalf("close of the create handle: %v", st)
+			}
+			if got := holderRows(t, s, uint64(ino)); got != tc.rowsAfterClose {
+				t.Fatalf("holder rows after the faulted close = %d, want %d", got, tc.rowsAfterClose)
+			}
+
+			// The re-open must end with a valid server-side holder whatever
+			// the release really did — this is the step the stale cache broke.
+			if st := rtA.Meta.Open(ctx, ino, syscall.O_RDWR, &attr); st != 0 {
+				t.Fatalf("re-open: %v", st)
+			}
+			if got := holderRows(t, s, uint64(ino)); got != 1 {
+				t.Fatalf("holder rows after the re-open = %d, want 1 (registration must not be skipped)", got)
+			}
+
+			// And the holder must actually protect: a foreign unlink defers,
+			// the open fd keeps committing, the last close reclaims.
+			bctx := jfsmeta.NewContext(2, 0, []uint32{0}).WithValue(jfsmeta.Drive9PathKey, "/uncertain.db")
+			if st := rtB.Meta.Unlink(bctx, jfsmeta.RootInode, "uncertain.db"); st != 0 {
+				t.Fatalf("foreign unlink: %v", st)
+			}
+			var nodes int
+			if err := s.DB().QueryRow(`SELECT COUNT(*) FROM jfs_node WHERE inode = ?`, uint64(ino)).Scan(&nodes); err != nil {
+				t.Fatal(err)
+			}
+			if nodes != 1 {
+				t.Fatalf("jfs_node rows after foreign unlink = %d, want 1 (the holder protects)", nodes)
+			}
+			w := rtA.Writer.Open(ino, 0, 0)
+			if st := w.Write(ctx, 0, bytes.Repeat([]byte("z"), 64)); st != 0 {
+				t.Fatalf("write through the held handle: %v", st)
+			}
+			if st := w.Flush(ctx); st != 0 {
+				t.Fatalf("flush (fsync) through the held handle: %v", st)
+			}
+			_ = w.Close(ctx)
+			if st := rtA.Meta.Close(ctx, ino); st != 0 {
+				t.Fatalf("last close: %v", st)
+			}
+			if err := s.DB().QueryRow(`SELECT COUNT(*) FROM jfs_node WHERE inode = ?`, uint64(ino)).Scan(&nodes); err != nil {
+				t.Fatal(err)
+			}
+			if nodes != 0 {
+				t.Fatalf("jfs_node rows after the last close = %d, want 0", nodes)
+			}
+		})
+	}
+}
+
+// Close/Open churn with intermittent release faults must never end with a
+// live fd and no server-side holder.
+func TestConcurrentCloseOpenWithReleaseFaults(t *testing.T) {
+	s := newTestStore(t)
+	fault := &deleteSustainedFault{}
+	rt := newFaultExtentRuntime(t, s, fault)
+	t.Cleanup(func() { _ = extent.CloseRuntime(rt) })
+
+	ctx := jfsmeta.NewContext(1, 0, []uint32{0}).WithValue(jfsmeta.Drive9PathKey, "/churn.db")
+	var ino jfsmeta.Ino
+	var attr jfsmeta.Attr
+	if st := rt.Meta.Create(ctx, jfsmeta.RootInode, "churn.db", 0644, 0, 0, &ino, &attr); st != 0 {
+		t.Fatalf("create: %v", st)
+	}
+	// RELEASE of the create-time handle: without it the refcount never
+	// reaches zero and no churn close is ever a last close.
+	if st := rt.Meta.Close(ctx, ino); st != 0 {
+		t.Fatalf("close of the create handle: %v", st)
+	}
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	armorDone := make(chan struct{})
+	// A fault armorer: alternate the two fault kinds while the churn runs. It
+	// waits on its own channel — joining the workers' WaitGroup would only be
+	// stoppable after Wait returned, and Wait would wait on it forever.
+	go func() {
+		defer close(armorDone)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if i%2 == 0 {
+				fault.arm(faultFailBeforeCommit)
+			} else {
+				fault.arm(faultDropAfterCommit)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var a jfsmeta.Attr
+			for i := 0; i < 25; i++ {
+				if st := rt.Meta.Open(ctx, ino, syscall.O_RDWR, &a); st != 0 {
+					t.Errorf("open during churn: %v", st)
+					return
+				}
+				if st := rt.Meta.Close(ctx, ino); st != 0 {
+					t.Errorf("close during churn: %v", st)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	<-armorDone
+	for _, mode := range []int{faultFailBeforeCommit, faultDropAfterCommit} {
+		if got := fault.deliveredOfKind(mode); got < 1 {
+			t.Fatalf("faults of kind %d delivered during churn = %d, want >= 1 (the churn must exercise both failure shapes)", mode, got)
+		}
+	}
+	// Disarm the fault injector first: an armed fault consumed by the final
+	// close would legitimately leave the row (unknown outcome), which is the
+	// safe direction, not a bug.
+	fault.arm(faultNone)
+	// The final open must carry a valid holder.
+	if st := rt.Meta.Open(ctx, ino, syscall.O_RDWR, &attr); st != 0 {
+		t.Fatalf("final open: %v", st)
+	}
+	if got := holderRows(t, s, uint64(ino)); got != 1 {
+		t.Fatalf("holder rows after churn = %d, want 1 (final open registered)", got)
+	}
+	if st := rt.Meta.Close(ctx, ino); st != 0 {
+		t.Fatalf("final close: %v", st)
+	}
+	if got := holderRows(t, s, uint64(ino)); got != 0 {
+		t.Fatalf("holder rows after the final clean close = %d, want 0", got)
 	}
 }
