@@ -498,6 +498,15 @@ func (m *tenantWorkerManager) shouldPollFallback() bool {
 func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID, tidbCloudOrgID string, workMask int) {
 	// Do NOT clear kickPending here — a kick coalesced while this message was
 	// in the channel must be consumed after acquiring the tenant slot.
+	// Snapshot the extent runtime's retirement generation BEFORE proving the
+	// tenant alive: a deletion that lands anywhere after this read must not let
+	// this kick rebuild a Runtime for a tenant nothing will drain (see
+	// drainExtentMaintenance). Reading it after kickRef could adopt a generation
+	// bumped by a forget in between, and reading it later still — after the
+	// semantic drain below, which can take seconds — would miss even more. A
+	// stale value can only cause a refusal, never a build, so the earliest read
+	// strictly dominates.
+	retireGen := m.extentRuntimes.retirementGeneration(tenantID)
 	ref, ok := m.kickRef(ctx, tenantID)
 	if !ok {
 		m.clearKickPending(tenantID)
@@ -546,7 +555,10 @@ func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID, tidbC
 	// "file_gc queue is empty" branch starved it whenever file_gc had a
 	// backlog. The bit is a re-kick token: it never re-enters the semantic or
 	// file_gc drains.
-	if m.drainExtentMaintenance(ctx, target) {
+	//
+	// retireGen was snapshotted before this kick proved the tenant alive; the
+	// extent pool refuses to build a Runtime for a tenant retired since.
+	if m.drainExtentMaintenance(ctx, target, retireGen) {
 		reKickMask |= WorkExtent
 	}
 
@@ -618,7 +630,7 @@ func (m *tenantWorkerManager) drainFileGC(ctx context.Context, target *tenantTar
 // waiting. Jobs that make no progress (a failing object store, a no-op
 // compaction, a compact task that is still leased) report false, so a stuck
 // task can never make the worker spin on its own re-kick.
-func (m *tenantWorkerManager) drainExtentMaintenance(ctx context.Context, target *tenantTarget) (more bool) {
+func (m *tenantWorkerManager) drainExtentMaintenance(ctx context.Context, target *tenantTarget, retirementGen uint64) (more bool) {
 	if ctx.Err() != nil || m == nil || m.extentRuntimes == nil || target == nil || target.store == nil || target.backend == nil {
 		return false
 	}
@@ -650,7 +662,7 @@ func (m *tenantWorkerManager) drainExtentMaintenance(ctx context.Context, target
 	}
 	// The compactor reuses one runtime per tenant; building a runtime is not
 	// itself completed work, so it does not feed the re-kick decision.
-	if err := m.extentRuntimes.withRuntime(target.tenantID, target.store, s3, func(rt *extent.Runtime) error {
+	if err := m.extentRuntimes.withRuntime(target.tenantID, retirementGen, target.store, s3, func(rt *extent.Runtime) error {
 		runExtentCompactFallback(ctx, target.store, target.tenantID, rt)
 		return nil
 	}); err != nil {
@@ -662,21 +674,62 @@ func (m *tenantWorkerManager) drainExtentMaintenance(ctx context.Context, target
 		deleted >= extentBlockGCBatchSize
 }
 
+// extentQuotaLeaseReleaseTimeout bounds the post-report lease release, which runs
+// on a context detached from the pass so a cancelled kick still releases it.
+const extentQuotaLeaseReleaseTimeout = 5 * time.Second
+
 // reportExtentQuotaUsage pushes the extent data plane's byte delta into the
 // tenant's central quota counters. The tenant-side marker advances only after
 // the report has landed, so a failed report is retried with the same delta on
 // the next pass instead of being lost.
 //
-// The reverse window — a report that lands and a marker write that fails, or two
-// pods reporting the same delta because the per-tenant slot is process-local —
+// The reverse window — a report that lands and a marker write that fails —
 // re-reports one delta, and since the counters are relative increments nothing
 // recomputes, that over-count persists. It is still the safer half of the trade
-// (the alternative silently under-counts for ever), and docs/extent-todos.md
-// tracks the report-lease sketch that would close it.
+// (the alternative silently under-counts for ever). Concurrent reporters are
+// excluded by the tenant-DB lease around this function, which expires so a dead
+// reporter only delays the next pass.
 func reportExtentQuotaUsage(ctx context.Context, target *tenantTarget) {
 	if target == nil || target.store == nil || target.backend == nil {
 		return
 	}
+	// Cheap filter first: most kicks have no growth to report, and a claim plus a
+	// release is two write transactions on a row this pass would not touch. Only
+	// a non-zero delta is worth serializing.
+	if _, delta, perr := target.store.PeekExtentUsageDelta(ctx); perr != nil {
+		logger.Warn(ctx, "tenant_worker_extent_quota_delta_failed",
+			zap.String("tenant_id", target.tenantID), zap.Error(perr))
+		return
+	} else if delta == 0 {
+		return
+	}
+	// One reporter per tenant, cluster-wide. The shard gate above already means
+	// only the owner reports, but a ring transition can hand the tenant over
+	// while a report is in flight and both pods would then push the same delta;
+	// the lease closes that window and expires, so a crashed reporter cannot
+	// block reporting for ever.
+	token, ok, err := target.store.ClaimExtentUsageReport(ctx)
+	if err != nil {
+		logger.Warn(ctx, "tenant_worker_extent_quota_lease_failed",
+			zap.String("tenant_id", target.tenantID), zap.Error(err))
+		return
+	}
+	if !ok {
+		return
+	}
+	defer func() {
+		// Detached: a cancelled pass must still hand the lease back, or the next
+		// report waits for the TTL. A failure here is only a delay, so it is
+		// logged rather than propagated.
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), extentQuotaLeaseReleaseTimeout)
+		defer cancel()
+		if rerr := target.store.ReleaseExtentUsageReport(releaseCtx, token); rerr != nil {
+			logger.Warn(releaseCtx, "tenant_worker_extent_quota_lease_release_failed",
+				zap.String("tenant_id", target.tenantID), zap.Error(rerr))
+		}
+	}()
+	// The delta the report uses is the one read under the lease: another reporter
+	// may have covered the growth this pass saw before the lease was granted.
 	total, delta, err := target.store.PeekExtentUsageDelta(ctx)
 	if err != nil {
 		logger.Warn(ctx, "tenant_worker_extent_quota_delta_failed",

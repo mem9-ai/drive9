@@ -44,7 +44,7 @@ func TestExtentRuntimePoolReusesRuntimePerTenantAndStore(t *testing.T) {
 	var seen []*extent.Runtime
 	run := func() {
 		t.Helper()
-		if err := pool.withRuntime("tenant-a", store, s3, func(rt *extent.Runtime) error {
+		if err := pool.withRuntime("tenant-a", pool.retirementGeneration("tenant-a"), store, s3, func(rt *extent.Runtime) error {
 			seen = append(seen, rt)
 			return nil
 		}); err != nil {
@@ -64,7 +64,7 @@ func TestExtentRuntimePoolReusesRuntimePerTenantAndStore(t *testing.T) {
 	}
 
 	// A different tenant gets its own runtime.
-	if err := pool.withRuntime("tenant-b", store, s3, func(*extent.Runtime) error { return nil }); err != nil {
+	if err := pool.withRuntime("tenant-b", pool.retirementGeneration("tenant-b"), store, s3, func(*extent.Runtime) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if *built != 2 {
@@ -80,11 +80,11 @@ func TestExtentRuntimePoolRebuildsWhenBackendIsReplaced(t *testing.T) {
 	oldStore := &datastore.Store{}
 	newStore := &datastore.Store{}
 	s3 := newPoolTestS3(t)
-	if err := pool.withRuntime("tenant-a", oldStore, s3, func(*extent.Runtime) error { return nil }); err != nil {
+	if err := pool.withRuntime("tenant-a", pool.retirementGeneration("tenant-a"), oldStore, s3, func(*extent.Runtime) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	var reused *extent.Runtime
-	if err := pool.withRuntime("tenant-a", newStore, s3, func(rt *extent.Runtime) error {
+	if err := pool.withRuntime("tenant-a", pool.retirementGeneration("tenant-a"), newStore, s3, func(rt *extent.Runtime) error {
 		reused = rt
 		return nil
 	}); err != nil {
@@ -118,7 +118,7 @@ func TestExtentRuntimePoolCloseAllClosesEveryRuntimeOnce(t *testing.T) {
 	store := &datastore.Store{}
 	s3 := newPoolTestS3(t)
 	for _, tenantID := range []string{"tenant-a", "tenant-b"} {
-		if err := pool.withRuntime(tenantID, store, s3, func(*extent.Runtime) error { return nil }); err != nil {
+		if err := pool.withRuntime(tenantID, pool.retirementGeneration(tenantID), store, s3, func(*extent.Runtime) error { return nil }); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -147,11 +147,11 @@ func TestExtentRuntimePoolForgetClosesOnlyThatTenant(t *testing.T) {
 	pool, _, closed := newRecordingPool(t)
 	store := &datastore.Store{}
 	s3 := newPoolTestS3(t)
-	if err := pool.withRuntime("tenant-a", store, s3, func(*extent.Runtime) error { return nil }); err != nil {
+	if err := pool.withRuntime("tenant-a", pool.retirementGeneration("tenant-a"), store, s3, func(*extent.Runtime) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	var kept *extent.Runtime
-	if err := pool.withRuntime("tenant-b", store, s3, func(rt *extent.Runtime) error {
+	if err := pool.withRuntime("tenant-b", pool.retirementGeneration("tenant-b"), store, s3, func(rt *extent.Runtime) error {
 		kept = rt
 		return nil
 	}); err != nil {
@@ -164,7 +164,7 @@ func TestExtentRuntimePoolForgetClosesOnlyThatTenant(t *testing.T) {
 	if _, ok := pool.entries["tenant-a"]; ok {
 		t.Fatal("forget left the deleted tenant's entry behind")
 	}
-	if err := pool.withRuntime("tenant-b", store, s3, func(rt *extent.Runtime) error {
+	if err := pool.withRuntime("tenant-b", pool.retirementGeneration("tenant-b"), store, s3, func(rt *extent.Runtime) error {
 		if rt != kept {
 			t.Fatal("forget evicted an unrelated tenant's runtime")
 		}
@@ -183,13 +183,13 @@ func TestExtentRuntimePoolRejectsMissingInputs(t *testing.T) {
 		called = true
 		return nil
 	}
-	if err := pool.withRuntime("", &datastore.Store{}, newPoolTestS3(t), fn); err == nil {
+	if err := pool.withRuntime("", pool.retirementGeneration(""), &datastore.Store{}, newPoolTestS3(t), fn); err == nil {
 		t.Fatal("empty tenant must fail")
 	}
-	if err := pool.withRuntime("tenant-a", nil, newPoolTestS3(t), fn); err == nil {
+	if err := pool.withRuntime("tenant-a", pool.retirementGeneration("tenant-a"), nil, newPoolTestS3(t), fn); err == nil {
 		t.Fatal("nil store must fail")
 	}
-	if err := pool.withRuntime("tenant-a", &datastore.Store{}, nil, fn); err == nil {
+	if err := pool.withRuntime("tenant-a", pool.retirementGeneration("tenant-a"), &datastore.Store{}, nil, fn); err == nil {
 		t.Fatal("nil s3 client must fail")
 	}
 	if called {
@@ -199,7 +199,7 @@ func TestExtentRuntimePoolRejectsMissingInputs(t *testing.T) {
 		t.Fatalf("runtime constructions = %d, want 0", *built)
 	}
 	var nilPool *extentRuntimePool
-	if err := nilPool.withRuntime("tenant-a", &datastore.Store{}, newPoolTestS3(t), fn); err == nil {
+	if err := nilPool.withRuntime("tenant-a", nilPool.retirementGeneration("tenant-a"), &datastore.Store{}, newPoolTestS3(t), fn); err == nil {
 		t.Fatal("nil pool must fail")
 	}
 	nilPool.closeAll()
@@ -212,7 +212,7 @@ func TestExtentRuntimePoolReportsConstructorFailure(t *testing.T) {
 	wantErr := errors.New("meta unavailable")
 	pool.newRuntime = func(extent.RuntimeConfig) (*extent.Runtime, error) { return nil, wantErr }
 	called := false
-	err := pool.withRuntime("tenant-a", &datastore.Store{}, s3, func(*extent.Runtime) error {
+	err := pool.withRuntime("tenant-a", pool.retirementGeneration("tenant-a"), &datastore.Store{}, s3, func(*extent.Runtime) error {
 		called = true
 		return nil
 	})
@@ -227,7 +227,7 @@ func TestExtentRuntimePoolReportsConstructorFailure(t *testing.T) {
 	}
 	// A later attempt must retry construction (no poisoned entry).
 	pool.newRuntime = func(extent.RuntimeConfig) (*extent.Runtime, error) { return &extent.Runtime{}, nil }
-	if err := pool.withRuntime("tenant-a", &datastore.Store{}, s3, func(*extent.Runtime) error { return nil }); err != nil {
+	if err := pool.withRuntime("tenant-a", pool.retirementGeneration("tenant-a"), &datastore.Store{}, s3, func(*extent.Runtime) error { return nil }); err != nil {
 		t.Fatalf("retry after a failed construction: %v", err)
 	}
 }
@@ -235,7 +235,7 @@ func TestExtentRuntimePoolReportsConstructorFailure(t *testing.T) {
 func TestExtentRuntimePoolPassesThroughCallbackError(t *testing.T) {
 	pool, _, _ := newRecordingPool(t)
 	wantErr := errors.New("compact failed")
-	err := pool.withRuntime("tenant-a", &datastore.Store{}, newPoolTestS3(t), func(*extent.Runtime) error {
+	err := pool.withRuntime("tenant-a", pool.retirementGeneration("tenant-a"), &datastore.Store{}, newPoolTestS3(t), func(*extent.Runtime) error {
 		return wantErr
 	})
 	if !errors.Is(err, wantErr) {
@@ -251,7 +251,7 @@ func TestExtentRuntimePoolSerializesOneTenant(t *testing.T) {
 	entered := make(chan struct{})
 	firstErr := make(chan error, 1)
 	go func() {
-		firstErr <- pool.withRuntime("tenant-a", store, s3, func(*extent.Runtime) error {
+		firstErr <- pool.withRuntime("tenant-a", pool.retirementGeneration("tenant-a"), store, s3, func(*extent.Runtime) error {
 			close(entered)
 			<-release
 			return nil
@@ -260,7 +260,7 @@ func TestExtentRuntimePoolSerializesOneTenant(t *testing.T) {
 	<-entered
 	second := make(chan struct{})
 	go func() {
-		_ = pool.withRuntime("tenant-a", store, s3, func(*extent.Runtime) error {
+		_ = pool.withRuntime("tenant-a", pool.retirementGeneration("tenant-a"), store, s3, func(*extent.Runtime) error {
 			close(second)
 			return nil
 		})
@@ -284,19 +284,19 @@ func TestDrainExtentMaintenanceSkipsWithoutInputs(t *testing.T) {
 	ctx := context.Background()
 	// A manager built outside newTenantWorkerManager has no runtime pool.
 	bare := &tenantWorkerManager{}
-	if bare.drainExtentMaintenance(ctx, &tenantTarget{tenantID: "tenant-a", store: &datastore.Store{}}) {
+	if bare.drainExtentMaintenance(ctx, &tenantTarget{tenantID: "tenant-a", store: &datastore.Store{}}, 0) {
 		t.Fatal("manager without a runtime pool must not report extent work")
 	}
-	if bare.drainExtentMaintenance(ctx, nil) {
+	if bare.drainExtentMaintenance(ctx, nil, 0) {
 		t.Fatal("nil target must not report extent work")
 	}
 	pooled := &tenantWorkerManager{extentRuntimes: newExtentRuntimePool()}
-	if pooled.drainExtentMaintenance(ctx, &tenantTarget{tenantID: "tenant-a"}) {
+	if pooled.drainExtentMaintenance(ctx, &tenantTarget{tenantID: "tenant-a"}, 0) {
 		t.Fatal("target without store/backend must not report extent work")
 	}
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	if pooled.drainExtentMaintenance(cancelled, &tenantTarget{tenantID: "tenant-a", store: &datastore.Store{}}) {
+	if pooled.drainExtentMaintenance(cancelled, &tenantTarget{tenantID: "tenant-a", store: &datastore.Store{}}, 0) {
 		t.Fatal("cancelled context must not report extent work")
 	}
 }

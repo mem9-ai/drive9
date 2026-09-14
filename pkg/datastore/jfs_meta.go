@@ -649,11 +649,18 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 			Flags     uint32 `json:"flags"`
 			SrcPath   string `json:"src_path"`
 			DstPath   string `json:"dst_path"`
+			// DstOpened/Sid describe the REPLACED destination, not the source:
+			// the FUSE frontend sets them when this mount still holds the
+			// destination open, and the server then keeps its node and blocks
+			// until the last close (jfs_sustained) instead of reclaiming them
+			// with the rename. Same contract as the unlink op's Opened/Sid.
+			DstOpened bool   `json:"dst_opened"`
+			Sid       uint64 `json:"sid"`
 		}
 		if err := json.Unmarshal(raw, &in); err != nil {
 			return nil, int(syscall.EINVAL), err
 		}
-		ino, tinode, attr, tattr, eno, err := s.jfsRenameTx(ctx, tx, in.SrcParent, in.SrcName, in.DstParent, in.DstName, in.SrcPath, in.DstPath, in.Flags)
+		ino, tinode, attr, tattr, eno, err := s.jfsRenameTx(ctx, tx, in.SrcParent, in.SrcName, in.DstParent, in.DstName, in.SrcPath, in.DstPath, in.Flags, in.DstOpened, in.Sid)
 		if err != nil {
 			return nil, int(syscall.EIO), err
 		}

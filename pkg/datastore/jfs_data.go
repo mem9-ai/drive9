@@ -112,13 +112,12 @@ const extentUsageReportedKey = "extentQuotaReportedBytes"
 // to advance in this transaction, before the report ran, which meant a failed
 // mutation-log write silently under-counted quota forever.
 //
-// The reverse window is possible instead — a report that lands and a commit
-// that fails re-reports the same delta, and two pods draining one tenant can
-// both report the same delta (the per-tenant slot is process-local) — and the
-// counter update is a relative increment that nothing recomputes, so that
-// over-count persists rather than decaying. Over-counting a soft quota input is
-// still the safer half of the trade, and docs/extent-todos.md tracks the
-// report-lease sketch that would close it.
+// The reverse window is possible instead — a report that lands and a commit that
+// fails re-reports the same delta — and the counter update is a relative
+// increment that nothing recomputes, so that over-count persists rather than
+// decaying. Over-counting a soft quota input is still the safer half of the
+// trade. Concurrent reporters, which would add the same delta twice, are
+// excluded by ClaimExtentUsageReport's lease.
 func (s *Store) PeekExtentUsageDelta(ctx context.Context) (total int64, delta int64, err error) {
 	total, reported, err := s.extentUsageTotals(ctx)
 	if err != nil {
@@ -127,17 +126,83 @@ func (s *Store) PeekExtentUsageDelta(ctx context.Context) (total int64, delta in
 	return total, total - reported, nil
 }
 
+// extentQuotaReportLeaseKey is the jfs_counter row that holds the deadline (unix
+// milliseconds) of the extent-usage report lease.
+const extentQuotaReportLeaseKey = "extentQuotaReportLease"
+
+// extentQuotaReportLeaseTTL is how long one reporter may hold the lease. It only
+// has to cover one peek, one central mutation insert and one marker commit, so a
+// minute is generous; a crashed reporter blocks the report for at most this long,
+// which is the same order as the worker's own maintenance cadence.
+const extentQuotaReportLeaseTTL = time.Minute
+
+// ClaimExtentUsageReport claims the tenant's extent-usage report lease: the right
+// to read the unreported delta and push it into the central counters. It returns
+// ok=false while another pod holds an unexpired lease, and a token to hand back
+// to ReleaseExtentUsageReport otherwise.
+//
+// The shard-ownership gate already keeps one *owner* per tenant, but ownership is
+// a hash ring: a transition can hand the tenant to another pod while a report is
+// in flight, and both would then push the same delta (central counters are
+// relative increments nothing recomputes, so the extra amount would persist). The
+// lease is the cross-pod serializer for that window; it expires so a crashed
+// reporter cannot block reporting for ever.
+func (s *Store) ClaimExtentUsageReport(ctx context.Context) (token int64, ok bool, err error) {
+	now := time.Now().UnixMilli()
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		// INSERT IGNORE first: a row that does not exist yet cannot be locked, so
+		// two concurrent claimers would otherwise both see "no lease" and both
+		// believe they won. The insert makes the row exist, and the locking read
+		// below then serializes them on it.
+		if _, ierr := tx.Exec(`INSERT IGNORE INTO jfs_counter (name, value) VALUES (?, 0)`, extentQuotaReportLeaseKey); ierr != nil {
+			return ierr
+		}
+		var deadline int64
+		if qerr := tx.QueryRow(`SELECT value FROM jfs_counter WHERE name = ? FOR UPDATE`, extentQuotaReportLeaseKey).Scan(&deadline); qerr != nil {
+			return qerr
+		}
+		if deadline > now {
+			ok = false
+			return nil
+		}
+		token = now + extentQuotaReportLeaseTTL.Milliseconds()
+		if _, uerr := tx.Exec(`UPDATE jfs_counter SET value = ? WHERE name = ?`, token, extentQuotaReportLeaseKey); uerr != nil {
+			return uerr
+		}
+		ok = true
+		return nil
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	return token, ok, nil
+}
+
+// ReleaseExtentUsageReport drops the lease a claim took, but only while the
+// caller's token is still the one in the row: a lease another reporter took over
+// after ours expired must be left alone.
+func (s *Store) ReleaseExtentUsageReport(ctx context.Context, token int64) error {
+	if token == 0 {
+		return nil
+	}
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE jfs_counter SET value = 0 WHERE name = ? AND value = ?`,
+			extentQuotaReportLeaseKey, token)
+		return err
+	})
+}
+
 // CommitExtentUsageDelta records the total a report covered as the reported
 // extent byte count, but only if the marker still holds the value that report
 // was computed against — derived here from the same PeekExtentUsageDelta pair
 // the caller reported, so a caller cannot pass the wrong number.
 //
-// The compare-and-set matters because the reporter is not always alone: shard
-// ownership is a hash ring, so a ring transition can hand the tenant to another
-// pod while this report is in flight, and that pod then peeks the same marker.
-// Whoever commits second would otherwise write a stale total over the newer one
-// and make the difference look unreported for ever; instead the loser leaves the
-// marker alone and says so.
+// The compare-and-set matters because the reporter is not always alone: a lease
+// that expires mid-report (a stalled or restarted pod) lets a second reporter in
+// with the same peeked marker, and whoever commits second would otherwise write a
+// stale total over the newer one and make the difference look unreported for
+// ever. Instead the loser leaves the marker alone and says so. Concurrency inside
+// the lease's lifetime is excluded by ClaimExtentUsageReport.
 func (s *Store) CommitExtentUsageDelta(ctx context.Context, peekedTotal, peekedDelta int64) error {
 	expected := peekedTotal - peekedDelta
 	err := s.InTx(ctx, func(tx *sql.Tx) error {

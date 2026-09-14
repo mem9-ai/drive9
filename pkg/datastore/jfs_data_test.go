@@ -1426,6 +1426,60 @@ func TestCommitExtentUsageDeltaKeepsNewerMarker(t *testing.T) {
 	}
 }
 
+// The shard-ownership gate keeps one owner per tenant, but ownership is a hash
+// ring: a transition can hand the tenant over while a report is in flight, and
+// two pods would then push the same delta into relative central counters that
+// nothing recomputes. The lease is the cross-pod serializer for that window.
+func TestExtentUsageReportLeaseSerializesReporters(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	token, ok, err := s.ClaimExtentUsageReport(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || token == 0 {
+		t.Fatalf("first claim = (%d, %v), want a token", token, ok)
+	}
+	// A second reporter — another pod against the same tenant — must be refused
+	// while the lease is live.
+	if _, ok, err := s.ClaimExtentUsageReport(ctx); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("a second reporter claimed the lease while it was held")
+	}
+	if err := s.ReleaseExtentUsageReport(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	next, ok, err := s.ClaimExtentUsageReport(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("the lease was not claimable after its release")
+	}
+	// A stale release must not clear a lease that has since been taken over.
+	if err := s.ReleaseExtentUsageReport(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	var held int64
+	if err := s.DB().QueryRow(`SELECT value FROM jfs_counter WHERE name = ?`, extentQuotaReportLeaseKey).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	if held != next {
+		t.Fatalf("a stale release cleared the live lease: value=%d, want %d", held, next)
+	}
+	// An expired lease is takeable again: a reporter that died mid-report must
+	// not block the tenant's quota reporting for ever.
+	if _, err := s.DB().Exec(`UPDATE jfs_counter SET value = 1 WHERE name = ?`, extentQuotaReportLeaseKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.ClaimExtentUsageReport(ctx); err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("an expired lease must be claimable")
+	}
+}
+
 func TestExtentLocksAreAuthoritativeAcrossRuntimes(t *testing.T) {
 	s := newTestStore(t)
 	ctx := jfsmeta.NewContext(1, 0, []uint32{0})

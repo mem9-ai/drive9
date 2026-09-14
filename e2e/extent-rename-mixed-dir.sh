@@ -20,6 +20,10 @@
 #      and writable, and can be unlinked.
 #   G. a tree removed by another channel (CLI `fs rm -r`) leaves no JuiceFS
 #      directory edge behind: mkdir + rmdir of the same path must succeed.
+#   H. renaming over an OPEN destination keeps the replaced file readable through
+#      the open handle: an extent destination is sustained server-side
+#      (dst_opened/sid -> jfs_sustained), a classic destination takes the classic
+#      pre-snapshot of its bytes.
 #
 # G is the regression guard for an orphan JuiceFS dir edge: a server-side
 # recursive delete removes extent file edges but not directory edges, so the
@@ -640,7 +644,43 @@ mv "$M/churn.db" "$M/churn2.db"
 expect_layout "E: churn2.db is extent" "$R/churn2.db" "extent"
 expect_extent_ino "E: churn2.db keeps the inode across the rename" "$R/churn2.db" "$churn_ino_second"
 
-echo "[11] F: directory renamed by the CLI, then used from a fresh mount"
+echo "[11] H: rename over an OPEN extent destination keeps the open handle's bytes"
+# POSIX: the holder of an open file description keeps reading what it opened, even
+# after the name is renamed over. The mount must mark the replaced file's handles
+# unlinked and tell the meta op (dst_opened/sid) to sustain the inode until the
+# last close — without that the rename reclaimed the node and blocks at rename
+# time and this read came back empty.
+open_dst="$M/open-dst.db"
+open_src="$M/open-src.db"
+printf 'REPLACED-DESTINATION-PAYLOAD' >"$open_dst"
+open_dst_sha="$(mount_sha "$open_dst")"
+exec 3<"$open_dst"
+write_payload "$open_src" "$EXTENT_E2E_PAYLOAD_KB"
+open_src_sha="$(mount_sha "$open_src")"
+mv "$open_src" "$open_dst"
+expect_layout "H: open-dst.db is extent after the rename" "$R/open-dst.db" "extent"
+expect_sha "H: the open handle still reads the replaced file" "$(sha256_stream <&3)" "$open_dst_sha"
+exec 3<&-
+expect_sha "H: the name reads the source file after the close" "$(mount_sha "$M/open-dst.db")" "$open_src_sha"
+
+# H2: the mirror case, an EXTENT source renamed over an open CLASSIC destination.
+# There is no jfs node to sustain on the destination side, so the mount must take
+# the classic pre-snapshot of the replaced bytes instead of marking the handle
+# unlinked without data (which reads EOF).
+classic_dst="$M/open-classic.txt"
+classic_src="$M/extent-src.db"
+printf 'REPLACED-CLASSIC-PAYLOAD' >"$classic_dst"
+classic_dst_sha="$(mount_sha "$classic_dst")"
+exec 4<"$classic_dst"
+write_payload "$classic_src" "$EXTENT_E2E_PAYLOAD_KB"
+classic_src_sha="$(mount_sha "$classic_src")"
+mv "$classic_src" "$classic_dst"
+expect_layout "H2: open-classic.txt is extent after the rename" "$R/open-classic.txt" "extent"
+expect_sha "H2: the open handle still reads the replaced classic file" "$(sha256_stream <&4)" "$classic_dst_sha"
+exec 4<&-
+expect_sha "H2: the name reads the extent source after the close" "$(mount_sha "$M/open-classic.txt")" "$classic_src_sha"
+
+echo "[12] F: directory renamed by the CLI, then used from a fresh mount"
 mkdir -p "$M/cli-mix/sub"
 write_payload "$M/cli-mix/a.db" "$EXTENT_E2E_PAYLOAD_KB"
 write_payload "$M/cli-mix/sub/c.db" "$EXTENT_E2E_PAYLOAD_KB"
@@ -649,12 +689,12 @@ cli_a_ino="$(extent_ino_of "$R/cli-mix/a.db")"
 cli_a_sha="$(mount_sha "$M/cli-mix/a.db")"
 check_cmd "F: cli-mix/a.db is an extent file" test -n "$cli_a_ino"
 
-echo "[12] G: tree removed by the CLI, then mkdir + rmdir from a fresh mount"
+echo "[13] G: tree removed by the CLI, then mkdir + rmdir from a fresh mount"
 mkdir -p "$M/cli-rm/sub"
 write_payload "$M/cli-rm/a.db" "$EXTENT_E2E_PAYLOAD_KB"
 write_payload "$M/cli-rm/sub/c.db" "$EXTENT_E2E_PAYLOAD_KB"
 
-echo "[13] unmount, then mutate the tree through the CLI"
+echo "[14] unmount, then mutate the tree through the CLI"
 if unmount_mount; then
   check_eq "unmount for CLI-side mutations" "true" "true"
 else
@@ -665,7 +705,7 @@ check_cmd "F: CLI sees the renamed directory" drive9 fs stat "$R/cli-mix2"
 drive9_retry fs rm -r "$R/cli-rm" >/dev/null
 check_cmd_fail "G: CLI removed the tree" drive9 fs stat "$R/cli-rm"
 
-echo "[14] remount and re-verify every artifact"
+echo "[15] remount and re-verify every artifact"
 if start_mount; then
   check_eq "remount is ready" "true" "true"
 else
@@ -711,7 +751,7 @@ if [ "$EXTENT_E2E_SQL_ORPHAN_CHECK" = "1" ]; then
     "$(printf '%s' "$orphan_resp" | jq -r '.[0].n // "error"')" "0"
 fi
 
-echo "[15] in-mount rm -r of the mixed tree, then reuse the path"
+echo "[16] in-mount rm -r of the mixed tree, then reuse the path"
 rm -rf "$M/mix2"
 check_cmd_fail "C: in-mount rm -r removed the mixed tree" test -e "$M/mix2"
 check_cmd_fail "C: extent child is gone after in-mount rm -r" drive9 fs stat "$R/mix2/a.db"

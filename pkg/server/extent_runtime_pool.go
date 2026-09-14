@@ -35,12 +35,15 @@ type extentRuntimePool struct {
 
 	mu      sync.Mutex
 	entries map[string]*extentRuntimeEntry
-	// retired records tenants whose entry was dropped by forget. A worker that
-	// resolved an entry just before the deletion would otherwise re-create one
-	// through entryFor and park a fresh Runtime (JuiceFS session plus cache
-	// goroutine) for a tenant nothing will drain again; the tombstone makes
-	// withRuntime refuse instead of rebuild.
-	retired map[string]struct{}
+	// retired counts, per tenant, how many times forget dropped its entry. A
+	// worker that resolved the tenant before that deletion passes the count it
+	// saw to withRuntime, which refuses to rebuild for a tenant that has been
+	// retired since; a kick that arrives after a re-provision (a new tenant with
+	// the same id, hence a new store) reads the new count and may build again.
+	// A bare "id was retired" flag would forbid that for the life of the
+	// process, which broke re-provisioned tenants under an id-reusing control
+	// plane; a generation keeps both properties.
+	retired map[string]uint64
 }
 
 type extentRuntimeEntry struct {
@@ -70,12 +73,30 @@ func newExtentRuntimePool() *extentRuntimePool {
 		newRuntime:   extent.NewRuntime,
 		closeRuntime: extent.CloseRuntime,
 		entries:      make(map[string]*extentRuntimeEntry),
-		retired:      make(map[string]struct{}),
+		retired:      make(map[string]uint64),
 	}
+}
+
+// retirementGeneration returns the tenant's current retirement generation: the
+// number of times forget has dropped its entry. A caller takes this value before
+// resolving work for the tenant and hands it back to withRuntime, which then
+// refuses only when the tenant was retired after that snapshot.
+func (p *extentRuntimePool) retirementGeneration(tenantID string) uint64 {
+	if p == nil || tenantID == "" {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.retired[tenantID]
 }
 
 // withRuntime runs fn with the tenant's cached Runtime, creating it on first
 // use and rebuilding it after the tenant backend was replaced.
+//
+// generation is the value retirementGeneration returned when the caller resolved
+// the tenant: a tenant deleted in between must not get a new Runtime (a JuiceFS
+// session plus cache goroutine nothing would ever drain), while a re-provisioned
+// tenant legitimately gets one on its next kick.
 //
 // The entry lock covers the callback as well as acquisition. Holding it is safe
 // because the tenant worker runs at most one extent task per tenant
@@ -83,7 +104,7 @@ func newExtentRuntimePool() *extentRuntimePool {
 // not be closed underneath work in flight: forget (tenant deletion) and closeAll
 // (shutdown) take the same lock, so a slow object PUT delays only this tenant's
 // next task and its own teardown.
-func (p *extentRuntimePool) withRuntime(tenantID string, store *datastore.Store, s3 s3client.S3Client, fn func(*extent.Runtime) error) error {
+func (p *extentRuntimePool) withRuntime(tenantID string, generation uint64, store *datastore.Store, s3 s3client.S3Client, fn func(*extent.Runtime) error) error {
 	if p == nil || tenantID == "" || store == nil || s3 == nil {
 		return fmt.Errorf("extent runtime: missing tenant, store, or s3 client")
 	}
@@ -91,9 +112,12 @@ func (p *extentRuntimePool) withRuntime(tenantID string, store *datastore.Store,
 		return fmt.Errorf("extent runtime for %s: pool has no runtime constructor", tenantID)
 	}
 	for attempt := 0; ; attempt++ {
-		e, fresh := p.entryFor(tenantID)
-		if !fresh {
-			return fmt.Errorf("extent runtime for %s: tenant has no worker", tenantID)
+		// The generation check and the entry lookup share one p.mu hold, so a
+		// forget cannot slip between them and hand back a brand-new, not-gone
+		// entry for a tenant that was just deleted.
+		e, live := p.entryFor(tenantID, generation)
+		if !live {
+			return fmt.Errorf("extent runtime for %s: tenant was retired after this work was resolved", tenantID)
 		}
 		e.mu.Lock()
 		// forget/closeAll may have retired this entry between entryFor and the
@@ -158,9 +182,9 @@ func (p *extentRuntimePool) forget(tenantID string) {
 	e := p.entries[tenantID]
 	delete(p.entries, tenantID)
 	if p.retired == nil {
-		p.retired = make(map[string]struct{})
+		p.retired = make(map[string]uint64)
 	}
-	p.retired[tenantID] = struct{}{}
+	p.retired[tenantID]++
 	p.mu.Unlock()
 	if e == nil {
 		return
@@ -188,11 +212,14 @@ func (p *extentRuntimePool) closeAll() {
 	}
 }
 
-// entryFor returns the tenant's entry, or false when the tenant was forgotten.
-func (p *extentRuntimePool) entryFor(tenantID string) (*extentRuntimeEntry, bool) {
+// entryFor returns the tenant's entry, creating it on first use, but only while
+// the tenant still sits on the caller's retirement generation: false means the
+// tenant was retired (deleted) after the caller resolved it. A re-provisioned
+// tenant reads the new generation and gets a fresh entry.
+func (p *extentRuntimePool) entryFor(tenantID string, generation uint64) (*extentRuntimeEntry, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, gone := p.retired[tenantID]; gone {
+	if p.retired[tenantID] != generation {
 		return nil, false
 	}
 	e := p.entries[tenantID]

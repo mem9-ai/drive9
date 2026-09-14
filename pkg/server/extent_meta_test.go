@@ -333,8 +333,11 @@ func TestExtentRuntimePoolRefusesForgottenTenant(t *testing.T) {
 	store := &datastore.Store{}
 	s3 := &fakeS3ForPool{}
 
+	// A worker that resolved the tenant while it was alive takes the generation
+	// then; the deletion must make its later withRuntime refuse.
+	resolved := p.retirementGeneration("tenant-a")
 	p.forget("tenant-a")
-	err := p.withRuntime("tenant-a", store, s3, func(*extent.Runtime) error {
+	err := p.withRuntime("tenant-a", resolved, store, s3, func(*extent.Runtime) error {
 		t.Fatal("the callback must not run for a forgotten tenant")
 		return nil
 	})
@@ -343,6 +346,23 @@ func TestExtentRuntimePoolRefusesForgottenTenant(t *testing.T) {
 	}
 	if built != 0 {
 		t.Fatalf("built %d runtimes for a forgotten tenant, want 0", built)
+	}
+
+	// The mirror image, and the reason the tombstone is a generation instead of
+	// a flag: a control plane that re-provisions the same tenant id must get its
+	// server-side compaction back (a fresh caller reads the new generation),
+	// while the stale worker above stays refused.
+	reprovisioned := p.retirementGeneration("tenant-a")
+	if reprovisioned == resolved {
+		t.Fatal("a retired tenant must have a new generation for its next resolution")
+	}
+	if err := p.withRuntime("tenant-a", reprovisioned, store, s3, func(*extent.Runtime) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("a re-provisioned tenant must get a Runtime again: %v", err)
+	}
+	if built != 1 {
+		t.Fatalf("built %d runtimes for the re-provisioned tenant, want 1", built)
 	}
 }
 

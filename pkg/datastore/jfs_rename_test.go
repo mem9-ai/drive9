@@ -512,6 +512,100 @@ func TestRenameAndParentMirrorRejectFileParent(t *testing.T) {
 	}
 }
 
+// A rename that replaces an OPEN extent file must keep the replaced file's node
+// and blocks until the last handle closes, exactly as an unlink of an open file
+// does: POSIX lets the holder keep reading what it opened. Without the
+// dst_opened/sid plumbing the rename reclaimed the file at rename time and the
+// open handle's next read or write failed.
+func TestExtentRenameOverOpenDestinationDefersReclaim(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	mknod := func(name, path string, inode uint64, sliceID uint64) {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{
+			"parent": 1, "name": name, "type": 1, "mode": 0644,
+			"inode": inode, "proj_path": path, "indx": 0,
+			"parts": []map[string]any{
+				{"off": 0, "slice": map[string]any{"Id": sliceID, "Size": 10, "Off": 0, "Len": 10}},
+			},
+			"attr": ExtentAttr{Typ: 1, Mode: 0644, Nlink: 1, Parent: 1, Full: true},
+		})
+		if _, errno, err := s.RunExtentMetaOp(ctx, "mknod", body, nil); err != nil || errno != 0 {
+			t.Fatalf("mknod %s errno=%d err=%v", name, errno, err)
+		}
+	}
+	mknod("src.db", "/src.db", 2, 90)
+	mknod("dst.db", "/dst.db", 3, 91)
+	const sid = 7
+	rename, _ := json.Marshal(map[string]any{
+		"src_parent": 1, "src_name": "src.db",
+		"dst_parent": 1, "dst_name": "dst.db",
+		"src_path": "/src.db", "dst_path": "/dst.db",
+		"dst_opened": true, "sid": sid,
+	})
+	if _, errno, err := s.RunExtentMetaOp(ctx, "rename", rename, nil); err != nil || errno != 0 {
+		t.Fatalf("rename over an open destination errno=%d err=%v", errno, err)
+	}
+	// The name now resolves to the source, and the replaced inode is sustained
+	// for the session that still holds it open.
+	var ino uint64
+	if err := s.DB().QueryRow(`SELECT inode FROM jfs_edge WHERE parent = 1 AND name = ?`, []byte("dst.db")).Scan(&ino); err != nil {
+		t.Fatal(err)
+	}
+	if ino != 2 {
+		t.Fatalf("dst.db -> inode %d, want the source inode 2", ino)
+	}
+	var nlink uint32
+	var length uint64
+	if err := s.DB().QueryRow(`SELECT nlink, length FROM jfs_node WHERE inode = 3`).Scan(&nlink, &length); err != nil {
+		t.Fatalf("the replaced inode was reclaimed at rename time: %v", err)
+	}
+	if nlink != 0 || length != 10 {
+		t.Fatalf("replaced inode nlink=%d length=%d, want nlink=0 length=10", nlink, length)
+	}
+	var sustained int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM jfs_sustained WHERE sid = ? AND inode = 3`, sid).Scan(&sustained); err != nil {
+		t.Fatal(err)
+	}
+	if sustained != 1 {
+		t.Fatalf("jfs_sustained rows for the open replaced inode = %d, want 1", sustained)
+	}
+	var queued int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM jfs_delfile WHERE inode = 3`).Scan(&queued); err != nil {
+		t.Fatal(err)
+	}
+	if queued != 0 {
+		t.Fatalf("the replaced file's blocks were queued for GC at rename time (%d delfile rows)", queued)
+	}
+	// The close op reclaims it when a client sends one; production drains the
+	// row at session end (see jfsUnlinkTx's opened branch), so this asserts the
+	// server contract the FUSE session relies on.
+	closeReq, _ := json.Marshal(map[string]any{"sid": sid, "inode": 3})
+	if _, errno, err := s.RunExtentMetaOp(ctx, "delete_sustained", closeReq, nil); err != nil || errno != 0 {
+		t.Fatalf("delete_sustained errno=%d err=%v", errno, err)
+	}
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM jfs_node WHERE inode = 3`).Scan(&queued); err != nil {
+		t.Fatal(err)
+	}
+	if queued != 0 {
+		t.Fatalf("jfs_node rows for the closed inode = %d, want 0", queued)
+	}
+	var chunks int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM jfs_chunk WHERE inode = 3`).Scan(&chunks); err != nil {
+		t.Fatal(err)
+	}
+	if chunks != 0 {
+		t.Fatalf("jfs_chunk rows for the closed inode = %d, want 0 (the close must reclaim the slices)", chunks)
+	}
+	var blocks int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM block_gc_tasks WHERE block_key LIKE ?`, "%91%").Scan(&blocks); err != nil {
+		t.Fatal(err)
+	}
+	if blocks == 0 {
+		t.Fatal("closing the last handle did not queue the replaced file's block for GC")
+	}
+}
+
 // A rename of a dentry that a concurrent unlink already removed must not
 // "succeed" into a dangling edge. The source edge read is locked, so the rename
 // waits for the unlink and then finds no row; without the lock it deleted 0
@@ -552,7 +646,7 @@ func TestRenameRacingUnlinkOfSameDentryLeavesNoDanglingEdge(t *testing.T) {
 			return
 		}
 		defer func() { _ = tx2.Rollback() }()
-		_, _, _, _, eno, err := s.jfsRenameTx(ctx, tx2, 1, "src.db", 1, "moved.db", "/src.db", "/moved.db", 0)
+		_, _, _, _, eno, err := s.jfsRenameTx(ctx, tx2, 1, "src.db", 1, "moved.db", "/src.db", "/moved.db", 0, false, 0)
 		if err == nil && eno == 0 {
 			err = tx2.Commit()
 		}

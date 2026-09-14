@@ -31,6 +31,13 @@ type Runtime struct {
 	Store     chunk.ChunkStore
 	ChunkConf chunk.Config
 	Storage   object.ObjectStorage
+	// SessionID is the JuiceFS session this runtime created (the meta client
+	// writes it back into the config drive9 owns). Unlink and rename report it as
+	// the owner of a sustained inode, so a file that is removed or replaced while
+	// a handle is still open is NOT reclaimed at mutation time: the node and its
+	// blocks stay until the session that held it ends. See jfsUnlinkTx's opened
+	// branch for why session end, not fd close, is when the row goes.
+	SessionID uint64
 }
 
 type RuntimeConfig struct {
@@ -263,6 +270,7 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	return &Runtime{
 		Meta:      m,
 		Transport: cfg.Transport,
+		SessionID: conf.Sid,
 		VFS:       v,
 		Reader:    reader,
 		Writer:    writer,

@@ -613,10 +613,14 @@ func (s *Store) jfsUnlinkTx(ctx context.Context, tx *sql.Tx, parent uint64, name
 		}
 	}
 	if opened {
-		// The jfs node and its blocks stay until the last handle closes:
-		// jfs_sustained is the record jfsDeleteSustainedTx acts on, and that op
-		// only needs jfs_node/jfs_chunk, so the drive9 cleanup above is
-		// independent of it.
+		// The jfs node and its blocks stay past this transaction: jfs_sustained
+		// is the record jfsDeleteSustainedTx acts on, and that op only needs
+		// jfs_node/jfs_chunk, so the drive9 cleanup above is independent of it.
+		// The row goes when the owning session ends (clean unmount, or the
+		// stale-session sweep after a crash): the fork's client only sends
+		// delete_sustained on fd close for inodes it recorded in removedFiles,
+		// which drive9's engine never does. That still satisfies POSIX — the data
+		// outlives every handle.
 		if _, err := tx.Exec(`INSERT IGNORE INTO jfs_sustained (sid, inode) VALUES (?, ?)`, sid, ino); err != nil {
 			return nil, 0, err
 		}
@@ -702,7 +706,18 @@ func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (ui
 	}
 	return ino, attr, 0, nil
 }
-func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, srcName string, dstParent uint64, dstName, srcPath, dstPath string, flags uint32) (uint64, uint64, *ExtentAttr, *ExtentAttr, int, error) {
+
+// jfsRenameTx renames one dentry, replacing whatever sits on the destination.
+//
+// dstOpened and sid come from the caller that knows the destination's handles: a
+// replaced file that a mount still has open keeps its node and blocks — POSIX
+// requires the data to survive the replacement — exactly as an unlink of an open
+// file does, instead of being reclaimed together with the rename. A replace
+// issued without handle knowledge reclaims immediately, which is the classic (and
+// cross-mount) behaviour: the HTTP/CLI rename paths never reach this function at
+// all — Store.RenameFileReplacingTarget removes a replaced extent destination with
+// its own jfsUnlinkTx(..., opened = false).
+func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, srcName string, dstParent uint64, dstName, srcPath, dstPath string, flags uint32, dstOpened bool, sid uint64) (uint64, uint64, *ExtentAttr, *ExtentAttr, int, error) {
 	ino, attr, eno, err := s.jfsLookupForUpdateTx(tx, srcParent, srcName)
 	if err != nil || eno != 0 {
 		return 0, 0, nil, nil, eno, err
@@ -745,17 +760,17 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 		// nothing a locked read does not decide better, and a create landing
 		// between the two would look like an empty directory until the locked
 		// count saved it. One authority for "may this directory go".
-		if _, ueno, uerr := s.jfsUnlinkTx(ctx, tx, dstParent, dstName, dstPath, 0, false); uerr != nil || ueno != 0 {
-			if ueno == int(syscall.ENOENT) {
-				// The destination disappeared between the lookup above and
-				// here (another client's unlink). There is nothing to replace,
-				// so the rename proceeds.
-				ueno, uerr = 0, nil
-			} else if dstAttr.Typ == jfsTypeDir && ueno == int(syscall.EPERM) {
+		if _, ueno, uerr := s.jfsUnlinkTx(ctx, tx, dstParent, dstName, dstPath, sid, dstOpened); uerr != nil || ueno != 0 {
+			switch {
+			case ueno == int(syscall.ENOENT):
+				// The destination disappeared between the lookup above and here
+				// (another client's unlink): there is nothing to replace, so the
+				// rename proceeds.
+			case dstAttr.Typ == jfsTypeDir && ueno == int(syscall.EPERM):
 				if _, _, reno, rerr := s.jfsRmdirTx(tx, dstParent, dstName, dstPath); rerr != nil || reno != 0 {
 					return 0, exist, attr, dstAttr, reno, rerr
 				}
-			} else {
+			default:
 				return 0, exist, attr, dstAttr, ueno, uerr
 			}
 		}

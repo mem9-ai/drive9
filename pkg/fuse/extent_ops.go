@@ -571,6 +571,43 @@ func (fs *Dat9FS) extentRename(cancel <-chan struct{}, input *gofuse.RenameIn, o
 	if errn != 0 {
 		return gofuse.Status(errn)
 	}
+	// A destination this mount still has open must keep working across the
+	// rename, and which mechanism that takes depends on what the destination is:
+	//
+	//   - an EXTENT destination: mark its handles unlinked (exactly as
+	//     extentUnlink does) and tell the meta op, which records a sustained
+	//     inode and keeps the replaced file's node and blocks instead of
+	//     reclaiming them with the rename (the server drains them when the
+	//     session ends; see jfsUnlinkTx's opened branch).
+	//   - a CLASSIC destination: there is no jfs node to sustain — the server
+	//     replaces it through the classic file-GC reclaim — so the handle needs
+	//     the replaced bytes installed locally, exactly as the classic rename
+	//     path does. Marking it unlinked without that snapshot would leave the
+	//     handle reading EOF.
+	opened := false
+	if fs.openHandles != nil {
+		opened = len(fs.openHandles.SnapshotPath(newP)) > 0
+	}
+	// The preflight already resolved the destination, so its inode entry (and the
+	// layout hint on it) decides which mechanism applies — no extra probe.
+	extentDst := newInfo.entry != nil && newInfo.entry.ExtentIno != 0
+	var marked []*FileHandle
+	if opened {
+		if extentDst {
+			marked, _, _ = fs.markOpenHandlesUnlinked(std, newP, false)
+		} else {
+			if err := fs.snapshotOpenHandlesBeforePathReplacement(std, newP); err != nil {
+				return httpToFuseStatus(err)
+			}
+			// A classic destination has no jfs node to sustain: the server
+			// replaces it through the classic reclaim.
+			opened = false
+		}
+	}
+	var sid uint64
+	if rt := fs.extentRT.rt; rt != nil {
+		sid = rt.SessionID
+	}
 	var resp struct {
 		Errno int `json:"errno"`
 	}
@@ -582,11 +619,15 @@ func (fs *Dat9FS) extentRename(cancel <-chan struct{}, input *gofuse.RenameIn, o
 		"flags":      input.Flags,
 		"src_path":   fs.remotePath(oldP),
 		"dst_path":   fs.remotePath(newP),
+		"dst_opened": opened,
+		"sid":        sid,
 	}, &resp)
 	if call != 0 {
+		fs.unmarkOpenHandlesAfterFailedUnlink(newP, marked)
 		return gofuse.Status(call)
 	}
 	if resp.Errno != 0 {
+		fs.unmarkOpenHandlesAfterFailedUnlink(newP, marked)
 		eno := syscall.Errno(resp.Errno)
 		if eno == syscall.ENOTDIR {
 			if e, ok := fs.inodes.GetEntry(input.Newdir); ok && entryIsSymlink(e) {
