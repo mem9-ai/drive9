@@ -968,30 +968,44 @@ func TestPresignedUploadsStripDrive9Credentials(t *testing.T) {
 }
 
 func TestUploadOnePartSkipsCRC32CWhenPresignedHeaderPresent(t *testing.T) {
+	// The presigned header value is intentionally different from the local
+	// ChecksumCRC32C value: asserting the exact received value catches an
+	// accidental unconditional Header.Set that would overwrite the server's
+	// presigned value with the locally computed one.
+	const (
+		presignedValue = "signed-by-server"
+		localValue     = "computed-locally"
+	)
+
 	cases := []struct {
-		name     string
-		headers  map[string]string
-		wantAMZ  bool
-		wantGoog bool
+		name       string
+		headers    map[string]string
+		wantCRC32C string // expected x-amz-checksum-crc32c value ("" = absent)
+		wantGoog   string // expected x-goog-hash value ("" = absent)
 	}{
 		{
-			name:    "s3 presigned crc32c header",
-			headers: map[string]string{"x-amz-checksum-crc32c": "c3Jj"},
-			wantAMZ: true,
+			name:       "s3 presigned crc32c header is preserved",
+			headers:    map[string]string{"x-amz-checksum-crc32c": presignedValue},
+			wantCRC32C: presignedValue,
 		},
 		{
-			name:     "gcs presigned x-goog-hash header",
-			headers:  map[string]string{"x-goog-hash": "crc32c=c3Jj"},
-			wantGoog: true,
+			name:       "s3 presigned crc32c header key is case-insensitive",
+			headers:    map[string]string{"X-Amz-Checksum-Crc32c": presignedValue},
+			wantCRC32C: presignedValue,
 		},
 		{
-			name:     "gcs x-goog-hash header is case-insensitive",
-			headers:  map[string]string{"X-Goog-Hash": "crc32c=c3Jj"},
-			wantGoog: true,
+			name:     "gcs presigned x-goog-hash header is preserved",
+			headers:  map[string]string{"x-goog-hash": "crc32c=" + presignedValue},
+			wantGoog: "crc32c=" + presignedValue,
 		},
 		{
-			name:    "no presigned checksum header injects crc32c",
-			wantAMZ: true,
+			name:     "gcs x-goog-hash header key is case-insensitive",
+			headers:  map[string]string{"X-Goog-Hash": "crc32c=" + presignedValue},
+			wantGoog: "crc32c=" + presignedValue,
+		},
+		{
+			name:       "no presigned checksum header injects local crc32c",
+			wantCRC32C: localValue,
 		},
 	}
 
@@ -1008,15 +1022,15 @@ func TestUploadOnePartSkipsCRC32CWhenPresignedHeaderPresent(t *testing.T) {
 
 			c := New("http://drive9.test", "")
 			_, err := c.uploadOnePart(context.Background(),
-				PartURL{URL: s3.URL, Headers: tc.headers, ChecksumCRC32C: "c3Jj"}, []byte("data"))
+				PartURL{URL: s3.URL, Headers: tc.headers, ChecksumCRC32C: localValue}, []byte("data"))
 			if err != nil {
 				t.Fatalf("uploadOnePart: %v", err)
 			}
-			if got := gotCRC32C != ""; got != tc.wantAMZ {
-				t.Fatalf("x-amz-checksum-crc32c present = %v, want %v (value=%q)", got, tc.wantAMZ, gotCRC32C)
+			if gotCRC32C != tc.wantCRC32C {
+				t.Fatalf("x-amz-checksum-crc32c = %q, want %q", gotCRC32C, tc.wantCRC32C)
 			}
-			if got := gotGoog != ""; got != tc.wantGoog {
-				t.Fatalf("x-goog-hash present = %v, want %v (value=%q)", got, tc.wantGoog, gotGoog)
+			if gotGoog != tc.wantGoog {
+				t.Fatalf("x-goog-hash = %q, want %q", gotGoog, tc.wantGoog)
 			}
 		})
 	}

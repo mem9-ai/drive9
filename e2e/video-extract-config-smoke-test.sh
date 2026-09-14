@@ -171,7 +171,7 @@ with open(file_path, "rb") as data_file:
         lower_headers = {k.lower() for k in headers}
         if part.get("checksum_crc32c") and "x-amz-checksum-crc32c" not in lower_headers and "x-goog-hash" not in lower_headers:
             req.add_header("x-amz-checksum-crc32c", part["checksum_crc32c"])
-        elif part.get("checksum_sha256") and "x-amz-checksum-sha256" not in lower_headers:
+        elif part.get("checksum_sha256") and "x-amz-checksum-sha256" not in lower_headers and "x-goog-meta-drive9-sha256" not in lower_headers:
             req.add_header("x-amz-checksum-sha256", part["checksum_sha256"])
         with urllib.request.urlopen(req, timeout=300) as resp:
             if getattr(resp, "status", 200) >= 300:

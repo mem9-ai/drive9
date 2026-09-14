@@ -484,7 +484,7 @@ with open(file_path, "rb") as data_file:
         lower_headers = {k.lower() for k in headers}
         if p.get("checksum_crc32c") and "x-amz-checksum-crc32c" not in lower_headers and "x-goog-hash" not in lower_headers:
             req.add_header("x-amz-checksum-crc32c", p["checksum_crc32c"])
-        elif p.get("checksum_sha256") and "x-amz-checksum-sha256" not in lower_headers:
+        elif p.get("checksum_sha256") and "x-amz-checksum-sha256" not in lower_headers and "x-goog-meta-drive9-sha256" not in lower_headers:
             req.add_header("x-amz-checksum-sha256", p["checksum_sha256"])
 
         with urllib.request.urlopen(req, timeout=300) as resp:
@@ -782,7 +782,7 @@ with open(file_path, "rb") as data_file:
         lower_headers = {k.lower() for k in headers}
         if p.get("checksum_crc32c") and "x-amz-checksum-crc32c" not in lower_headers and "x-goog-hash" not in lower_headers:
             req.add_header("x-amz-checksum-crc32c", p["checksum_crc32c"])
-        elif p.get("checksum_sha256") and "x-amz-checksum-sha256" not in lower_headers:
+        elif p.get("checksum_sha256") and "x-amz-checksum-sha256" not in lower_headers and "x-goog-meta-drive9-sha256" not in lower_headers:
             req.add_header("x-amz-checksum-sha256", p["checksum_sha256"])
 
         with urllib.request.urlopen(req, timeout=300) as resp:
