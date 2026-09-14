@@ -687,7 +687,9 @@ func startGitHydrateBackground(ctx context.Context, target string, resolved moun
 	cmd := exec.CommandContext(ctx, os.Args[0], "git", "hydrate", "--timeout="+gitHydrateTimeout.String(), target)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	cmd.Env = os.Environ()
+	// Detached hydration is internal work started by `git clone`/`worktree add`;
+	// those commands report themselves, so the child must stay silent.
+	cmd.Env = telemetryDisabledEnv(os.Environ())
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()
 		return err

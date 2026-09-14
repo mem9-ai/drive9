@@ -30,7 +30,7 @@ func MountDrainCmd(args []string) error {
 }
 
 func runMountDrain(args []string, deps mountDrainDeps) error {
-	fs := flag.NewFlagSet("mount drain", flag.ExitOnError)
+	fs := flag.NewFlagSet("mount drain", flag.ContinueOnError)
 	timeout := fs.Duration("timeout", mountcontrol.DefaultDrainTimeout, "maximum time to wait for pending writes to drain")
 	jsonOutput := fs.Bool("json", false, "output drain result as JSON")
 	fs.Usage = func() {
@@ -38,7 +38,8 @@ func runMountDrain(args []string, deps mountDrainDeps) error {
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
-		return err
+		// The flag package already printed the error and the command usage.
+		return UsageError{Err: err}
 	}
 	if fs.NArg() != 1 {
 		fs.Usage()
