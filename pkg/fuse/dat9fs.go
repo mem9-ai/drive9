@@ -15361,6 +15361,10 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		return
 	}
 	fs.clearCommittedAppendSnapshot(entry)
+	if entry.recovered && entry.Inode == 0 && !fs.layerEnabled() {
+		fs.publishRecoveredCommit(entry, committedRev)
+		return
+	}
 	fs.onCommitQueueUploaded(entry, committedRev)
 	if fs.layerEnabled() {
 		fs.clearReadTargetsForPath(entry.Path)
