@@ -584,25 +584,18 @@ func (fs *Dat9FS) extentRename(cancel <-chan struct{}, input *gofuse.RenameIn, o
 	//     the replaced bytes installed locally, exactly as the classic rename
 	//     path does. Marking it unlinked without that snapshot would leave the
 	//     handle reading EOF.
-	opened := false
-	if fs.openHandles != nil {
-		opened = len(fs.openHandles.SnapshotPath(newP)) > 0
-	}
 	// The preflight already resolved the destination, so its inode entry (and the
-	// layout hint on it) decides which mechanism applies — no extra probe.
+	// layout hint on it) decides which mechanism applies — no extra probe, and no
+	// separate "is anything open" pre-check: the mark helper returns that
+	// authoritatively (and is a documented no-op when nothing is open), which is
+	// also how extentUnlink closes the open-racing-the-mutation window.
 	extentDst := newInfo.entry != nil && newInfo.entry.ExtentIno != 0
 	var marked []*FileHandle
-	if opened {
-		if extentDst {
-			marked, _, _ = fs.markOpenHandlesUnlinked(std, newP, false)
-		} else {
-			if err := fs.snapshotOpenHandlesBeforePathReplacement(std, newP); err != nil {
-				return httpToFuseStatus(err)
-			}
-			// A classic destination has no jfs node to sustain: the server
-			// replaces it through the classic reclaim.
-			opened = false
-		}
+	opened := false
+	if extentDst {
+		marked, opened, _ = fs.markOpenHandlesUnlinked(std, newP, false)
+	} else if err := fs.snapshotOpenHandlesBeforePathReplacement(std, newP); err != nil {
+		return httpToFuseStatus(err)
 	}
 	var sid uint64
 	if rt := fs.extentRT.rt; rt != nil {
