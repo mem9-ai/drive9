@@ -967,6 +967,61 @@ func TestPresignedUploadsStripDrive9Credentials(t *testing.T) {
 	}
 }
 
+func TestUploadOnePartSkipsCRC32CWhenPresignedHeaderPresent(t *testing.T) {
+	cases := []struct {
+		name     string
+		headers  map[string]string
+		wantAMZ  bool
+		wantGoog bool
+	}{
+		{
+			name:    "s3 presigned crc32c header",
+			headers: map[string]string{"x-amz-checksum-crc32c": "c3Jj"},
+			wantAMZ: true,
+		},
+		{
+			name:     "gcs presigned x-goog-hash header",
+			headers:  map[string]string{"x-goog-hash": "crc32c=c3Jj"},
+			wantGoog: true,
+		},
+		{
+			name:     "gcs x-goog-hash header is case-insensitive",
+			headers:  map[string]string{"X-Goog-Hash": "crc32c=c3Jj"},
+			wantGoog: true,
+		},
+		{
+			name:    "no presigned checksum header injects crc32c",
+			wantAMZ: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotCRC32C, gotGoog string
+			s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotCRC32C = r.Header.Get("x-amz-checksum-crc32c")
+				gotGoog = r.Header.Get("x-goog-hash")
+				w.Header().Set("ETag", `"etag-1"`)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer s3.Close()
+
+			c := New("http://drive9.test", "")
+			_, err := c.uploadOnePart(context.Background(),
+				PartURL{URL: s3.URL, Headers: tc.headers, ChecksumCRC32C: "c3Jj"}, []byte("data"))
+			if err != nil {
+				t.Fatalf("uploadOnePart: %v", err)
+			}
+			if got := gotCRC32C != ""; got != tc.wantAMZ {
+				t.Fatalf("x-amz-checksum-crc32c present = %v, want %v (value=%q)", got, tc.wantAMZ, gotCRC32C)
+			}
+			if got := gotGoog != ""; got != tc.wantGoog {
+				t.Fatalf("x-goog-hash present = %v, want %v (value=%q)", got, tc.wantGoog, gotGoog)
+			}
+		})
+	}
+}
+
 func TestPresignedPartErrorsLimitBody(t *testing.T) {
 	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
