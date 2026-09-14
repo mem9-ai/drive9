@@ -70,6 +70,7 @@ var businessEventsTotal = eventMeter.Int64Counter("drive9_business_events_total"
 var fuseOperationsTotal = fuseMeter.Int64Counter("drive9_fuse_operations_total", "FUSE operations by operation/result")
 var fuseOperationDuration = fuseMeter.Float64Histogram("drive9_fuse_operation_duration_seconds", "FUSE operation duration histogram", operationDurationBounds)
 var fuseOperationBytes = fuseMeter.Int64Counter("drive9_fuse_operation_bytes_total", "Bytes processed by FUSE operation/result")
+var fuseInterruptsTotal = fuseMeter.Int64Counter("drive9_fuse_interrupts_total", "FUSE request interrupts observed by the mount (kernel interrupted a waiter before the daemon replied)")
 var fuseRemoteOperationsTotal = fuseMeter.Int64Counter("drive9_fuse_remote_operations_total", "Remote FUSE operations by operation/result")
 var fuseRemoteOperationDuration = fuseMeter.Float64Histogram("drive9_fuse_remote_operation_duration_seconds", "Remote FUSE operation duration histogram", operationDurationBounds)
 var fuseRemoteOperationBytes = fuseMeter.Int64Counter("drive9_fuse_remote_operation_bytes_total", "Bytes processed by remote FUSE operation/result")
@@ -713,6 +714,16 @@ func RecordFuseOperation(operation, result string, d time.Duration, bytes uint64
 	if bytes > 0 {
 		fuseOperationBytes.Add(int64(bytes), attrs...)
 	}
+}
+
+// RecordFuseInterrupt counts a FUSE interrupt delivered to this mount: the
+// kernel signaled that a waiter of an in-flight FUSE request gave up (any
+// signal can trigger this, e.g. SIGCHLD) and go-fuse closed the request's
+// cancel channel. Interrupts themselves are normal; the counter makes the
+// rate observable so interrupt-induced EAGAIN regressions are diagnosable.
+func RecordFuseInterrupt() {
+	RegisterModule("fuse")
+	fuseInterruptsTotal.Add(1)
 }
 
 func RecordFuseRemoteOperation(operation, result string, d time.Duration, bytes uint64) {
