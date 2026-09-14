@@ -39,3 +39,20 @@ func TestFuseCtxCancelChannel(t *testing.T) {
 		t.Fatal("cancel channel did not cancel fuseCtx")
 	}
 }
+
+func TestCountFuseInterruptOncePerChannel(t *testing.T) {
+	ch := make(chan struct{})
+	if !countFuseInterruptOnce(ch) {
+		t.Fatal("first observer of a channel should count")
+	}
+	if countFuseInterruptOnce(ch) {
+		t.Fatal("second observer of the same channel must not count again")
+	}
+	other := make(chan struct{})
+	if !countFuseInterruptOnce(other) {
+		t.Fatal("a different request channel should count")
+	}
+	if countFuseInterruptOnce(other) {
+		t.Fatal("second observer of the other channel must not count again")
+	}
+}

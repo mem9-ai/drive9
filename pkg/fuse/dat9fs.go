@@ -624,6 +624,23 @@ func fuseCtx(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
 	return fuseCtxWithTimeout(cancel, fuseTimeout)
 }
 
+// fuseInterruptCounted records which FUSE cancel channels have already been
+// counted as interrupted. One request may derive several contexts from the
+// same cancel channel (e.g. SetAttr's outer request context plus an inner
+// chmod context) and every derived goroutine observes the same channel
+// close; the flag ensures each interrupted request counts once. Entries live
+// for the process lifetime, so the map is bounded by the interrupt count,
+// not by request volume.
+var fuseInterruptCounted sync.Map // <-chan struct{} -> *atomic.Bool
+
+// countFuseInterruptOnce reports whether this cancel-channel close is the
+// first observation for that channel, i.e. whether it should be recorded as
+// an interrupt.
+func countFuseInterruptOnce(cancel <-chan struct{}) bool {
+	counted, _ := fuseInterruptCounted.LoadOrStore(cancel, &atomic.Bool{})
+	return counted.(*atomic.Bool).CompareAndSwap(false, true)
+}
+
 func fuseCtxWithTimeout(cancel <-chan struct{}, timeout time.Duration) (context.Context, context.CancelFunc) {
 	ctx, cf := context.WithTimeout(context.Background(), timeout)
 	if cancel == nil {
@@ -632,7 +649,9 @@ func fuseCtxWithTimeout(cancel <-chan struct{}, timeout time.Duration) (context.
 	go func() {
 		select {
 		case <-cancel:
-			metrics.RecordFuseInterrupt()
+			if countFuseInterruptOnce(cancel) {
+				metrics.RecordFuseInterrupt()
+			}
 			cf()
 		case <-ctx.Done():
 		}
@@ -9906,7 +9925,13 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	if err != nil {
 		safeLogPrintf("link: post-commit stat failed; keeping fallback attributes local=%s err=%v", dstP, err)
 	}
-	mtime := time.Now()
+	// Creating a hard link must only update ctime: when the confirmation
+	// stat is unavailable, keep the source's cached mtime instead of
+	// stamping link-creation time onto the shared inode.
+	mtime := srcEntry.Mtime
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
 	if stat != nil && !stat.Mtime.IsZero() {
 		mtime = stat.Mtime
 	}
