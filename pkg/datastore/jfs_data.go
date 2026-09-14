@@ -12,10 +12,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"go.uber.org/zap"
-
-	"github.com/mem9-ai/drive9/pkg/logger"
 )
 
 // ExtentUnreportedUsageBytes returns the extent file bytes that no central report
@@ -106,18 +102,13 @@ func (s *Store) storeCachedExtentUsage(v int64) {
 const extentUsageReportedKey = "extentQuotaReportedBytes"
 
 // PeekExtentUsageDelta returns the extent bytes written since the last report
-// without recording them. The caller reports the delta to the central counters
-// and only then calls CommitExtentUsageDelta, so a failed report is retried
-// with the same delta on the next pass instead of being lost: the marker used
-// to advance in this transaction, before the report ran, which meant a failed
-// mutation-log write silently under-counted quota forever.
-//
-// The reverse window is possible instead — a report that lands and a commit that
-// fails re-reports the same delta — and the counter update is a relative
-// increment that nothing recomputes, so that over-count persists rather than
-// decaying. Over-counting a soft quota input is still the safer half of the
-// trade. Concurrent reporters, which would add the same delta twice, are
-// excluded by ClaimExtentUsageReport's lease.
+// without recording them. It is the admission-side view: the marker is a
+// tenant-DB cache of what central already carries, and correctness of the
+// report itself lives in the central extent watermark (see
+// backend.ReportExtentUsageRange) — a report whose marker write fails is
+// re-derived from that watermark on the next pass, not from this marker, so
+// the retry cannot double-apply. Concurrent reporters, which would otherwise
+// race the marker, are excluded by ClaimExtentUsageReport's lease.
 func (s *Store) PeekExtentUsageDelta(ctx context.Context) (total int64, delta int64, err error) {
 	total, reported, err := s.extentUsageTotals(ctx)
 	if err != nil {
@@ -192,43 +183,22 @@ func (s *Store) ReleaseExtentUsageReport(ctx context.Context, token int64) error
 	})
 }
 
-// CommitExtentUsageDelta records the total a report covered as the reported
-// extent byte count, but only if the marker still holds the value that report
-// was computed against — derived here from the same PeekExtentUsageDelta pair
-// the caller reported, so a caller cannot pass the wrong number.
-//
-// The compare-and-set matters because the reporter is not always alone: a lease
-// that expires mid-report (a stalled or restarted pod) lets a second reporter in
-// with the same peeked marker, and whoever commits second would otherwise write a
-// stale total over the newer one and make the difference look unreported for
-// ever. Instead the loser leaves the marker alone and says so. Concurrency inside
-// the lease's lifetime is excluded by ClaimExtentUsageReport.
-func (s *Store) CommitExtentUsageDelta(ctx context.Context, peekedTotal, peekedDelta int64) error {
-	expected := peekedTotal - peekedDelta
+// SetExtentUsageReported force-syncs the marker to total, with no expected
+// value to match. It is the marker write the report path uses (the marker
+// records what the lease just pushed), and the repair path for a marker whose
+// commit failed after the central apply landed — such a marker over-states
+// the unreported bytes admission adds for as long as the difference never
+// changes sign. A marker that lands stale behind central is the safe
+// direction; the caller must hold the report lease.
+func (s *Store) SetExtentUsageReported(ctx context.Context, total int64) error {
 	err := s.InTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`INSERT INTO jfs_counter (name, value) VALUES (?, ?)
-			ON DUPLICATE KEY UPDATE value = IF(value = ?, VALUES(value), value)`,
-			extentUsageReportedKey, peekedTotal, expected); err != nil {
-			return err
-		}
-		var after int64
-		if err := tx.QueryRow(`SELECT value FROM jfs_counter WHERE name = ?`, extentUsageReportedKey).Scan(&after); err != nil {
-			return err
-		}
-		if after != peekedTotal {
-			logger.Warn(ctx, "extent_quota_report_raced",
-				zap.Int64("expected", expected), zap.Int64("wanted", peekedTotal), zap.Int64("marker", after))
-		}
-		return nil
+		_, err := tx.Exec(`INSERT INTO jfs_counter (name, value) VALUES (?, ?)
+			ON DUPLICATE KEY UPDATE value = VALUES(value)`, extentUsageReportedKey, total)
+		return err
 	})
 	if err != nil {
 		return err
 	}
-	// Drop the cached remainder rather than pinning it to zero: the marker
-	// covers the total as of the caller's Peek, and a write that commits between
-	// that Peek and this commit is covered by neither, so caching the zero for
-	// the TTL would hide it from admission. Re-reading costs one aggregate per
-	// report, not one per write.
 	s.invalidateCachedExtentUsage()
 	return nil
 }

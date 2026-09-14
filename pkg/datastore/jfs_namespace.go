@@ -449,6 +449,36 @@ func (s *Store) jfsLinkEdgeTx(tx *sql.Tx, dstPath string, ino uint64) error {
 	return err
 }
 
+// jfsOpenRefTx records that session sid holds inode open, as a jfs_sustained
+// row — the same record unlink-while-open defers reclamation through, so the
+// two lifetimes share one table and one sweep.
+//
+// The node row is locked FOR UPDATE to order this against a concurrent
+// jfsUnlinkTx of the same inode (which locks the node the same way): either
+// the holder row is committed and visible when unlink decides between
+// sustaining and reclaiming, or unlink committed first and the node is gone —
+// ENOENT fails the open instead of handing out a handle whose data is already
+// being reclaimed. A node that reached nlink = 0 through unlink-while-open
+// still has its row and accepts the registration; the recovering runtime is
+// exactly the holder the sustained record describes.
+func (s *Store) jfsOpenRefTx(tx *sql.Tx, sid, ino uint64) (int, error) {
+	if ino == 0 || ino == jfsRootIno {
+		return int(syscall.EINVAL), nil
+	}
+	var nlink uint32
+	err := tx.QueryRow(`SELECT nlink FROM jfs_node WHERE inode = ? FOR UPDATE`, ino).Scan(&nlink)
+	if errors.Is(err, sql.ErrNoRows) {
+		return int(syscall.ENOENT), nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(`INSERT IGNORE INTO jfs_sustained (sid, inode) VALUES (?, ?)`, sid, ino); err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
+
 // jfsUnlinkTx removes one edge, its projection row, and — when this was the
 // last reference — the jfs node and its blocks.
 //
@@ -612,17 +642,38 @@ func (s *Store) jfsUnlinkTx(ctx context.Context, tx *sql.Tx, parent uint64, name
 			return nil, 0, err
 		}
 	}
+	// "Still open" is a property of the filesystem, not of the unlinking
+	// runtime: the caller's flag only sees its own handles, so a file held by
+	// another mount would be reclaimed under that mount's fd (its Fsync then
+	// returns EBADF). The sustained table is where every runtime's opens are
+	// registered (open_ref on first open, delete_sustained on last close),
+	// so the last-reference decision consults it. FOR UPDATE pairs with the
+	// node lock an open_ref takes: the two cannot interleave into "no holder
+	// seen, node reclaimed, holder registered on the dead node".
+	foreignHeld := false
+	if !opened {
+		var holders int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM jfs_sustained WHERE inode = ? FOR UPDATE`, ino).Scan(&holders); err != nil {
+			return nil, 0, err
+		}
+		foreignHeld = holders > 0
+		opened = foreignHeld
+	}
 	if opened {
 		// The jfs node and its blocks stay past this transaction: jfs_sustained
 		// is the record jfsDeleteSustainedTx acts on, and that op only needs
 		// jfs_node/jfs_chunk, so the drive9 cleanup above is independent of it.
-		// The row goes when the owning session ends (clean unmount, or the
-		// stale-session sweep after a crash): the fork's client only sends
-		// delete_sustained on fd close for inodes it recorded in removedFiles,
-		// which drive9's engine never does. That still satisfies POSIX — the data
-		// outlives every handle.
-		if _, err := tx.Exec(`INSERT IGNORE INTO jfs_sustained (sid, inode) VALUES (?, ?)`, sid, ino); err != nil {
-			return nil, 0, err
+		// Rows go on the holders' last close (the engine sends delete_sustained
+		// there) or, if a runtime dies first, when the stale-session sweep ends
+		// its session — POSIX holds either way, because the data outlives every
+		// handle. A row is only inserted for the caller's own flag: a foreign
+		// holder's rows already exist, and duplicating them under the unlinker's
+		// sid would pin the inode past the real holders' closes until the
+		// unlinker's own session ends.
+		if !foreignHeld {
+			if _, err := tx.Exec(`INSERT IGNORE INTO jfs_sustained (sid, inode) VALUES (?, ?)`, sid, ino); err != nil {
+				return nil, 0, err
+			}
 		}
 		_, err = tx.Exec(`UPDATE jfs_node SET nlink = 0, ctime = ?, ctimensec = ? WHERE inode = ?`, ctime, csec, ino)
 		return attr, 0, err

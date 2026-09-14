@@ -283,7 +283,7 @@ func applyCentralQuotaMutationTx(ctx context.Context, store MetaQuotaStore, tx *
 		if err := json.Unmarshal(mutationData, &data); err != nil {
 			return quotaCounterDeltas{}, err
 		}
-		return applyCentralExtentUsageTx(store, tx, tenantID, data)
+		return applyCentralExtentUsageTx(ctx, store, tx, tenantID, data)
 
 	case "file_overwrite":
 		var data fileOverwriteMutationData

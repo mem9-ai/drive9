@@ -748,6 +748,7 @@ func metaInitSchemaStatements() []string {
 			file_count         BIGINT NOT NULL DEFAULT 0,
 			media_file_count   BIGINT NOT NULL DEFAULT 0,
 			video_file_count   BIGINT NOT NULL DEFAULT 0,
+			extent_reported_bytes BIGINT NOT NULL DEFAULT 0,
 			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_file_meta (

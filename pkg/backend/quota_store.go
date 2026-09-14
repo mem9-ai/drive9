@@ -43,6 +43,11 @@ type MetaQuotaStore interface {
 	// it once per tenant at the end of the transaction ("hot row last")
 	// instead of touching the single per-tenant hot row from every apply.
 	IncrQuotaUsageCountersTx(tx *sql.Tx, tenantID string, storageDelta, fileDelta, mediaDelta, reservedDelta int64) error
+	// Extent usage reporting: GetExtentReportedBytes reads the idempotency
+	// watermark, ApplyExtentUsageRangeTx moves it under a compare-and-set so
+	// a replayed report applies its bytes exactly once (either sign).
+	GetExtentReportedBytes(ctx context.Context, tenantID string) (int64, error)
+	ApplyExtentUsageRangeTx(tx *sql.Tx, tenantID string, fromTotal, toTotal int64) (bool, error)
 
 	// File meta (server-authored shadow state)
 	UpsertFileMeta(ctx context.Context, fm *FileMetaView) error

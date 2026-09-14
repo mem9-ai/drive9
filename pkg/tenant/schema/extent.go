@@ -89,6 +89,12 @@ func ExtentTiDBSchemaStatements() []string {
 			inode BIGINT UNSIGNED NOT NULL,
 			UNIQUE KEY uk_jfs_sustained (sid, inode)
 		)`,
+		// The unique key answers "what does this session hold"; the reclaim
+		// paths (unlink, subtree delete, delete_sustained, orphan reclaim)
+		// ask the inverse — "does any session hold this inode" — once per
+		// candidate, and every runtime's opens register here now, not just
+		// unlink-while-open survivors.
+		`CREATE INDEX idx_jfs_sustained_inode ON jfs_sustained(inode)`,
 		`CREATE TABLE IF NOT EXISTS jfs_delfile (
 			inode  BIGINT UNSIGNED NOT NULL PRIMARY KEY,
 			length BIGINT UNSIGNED NOT NULL,
@@ -230,6 +236,7 @@ func ExtentDB9SchemaStatements() []string {
 			inode BIGINT NOT NULL,
 			UNIQUE (sid, inode)
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_jfs_sustained_inode ON jfs_sustained(inode)`,
 		`CREATE TABLE IF NOT EXISTS jfs_delfile (
 			inode  BIGINT NOT NULL PRIMARY KEY,
 			length BIGINT NOT NULL,

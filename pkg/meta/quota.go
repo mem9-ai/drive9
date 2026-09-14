@@ -782,6 +782,63 @@ func (s *Store) IncrVideoFileCount(ctx context.Context, tenantID string, delta i
 	return ensureRowsAffected(res, tenantID)
 }
 
+// GetExtentReportedBytes returns the extent byte total already reflected in
+// this tenant's central storage_bytes: the idempotency watermark for extent
+// usage reports. Zero for a tenant that never reported — the column ships
+// with the extent report path itself, so no earlier contributions exist to
+// backfill.
+func (s *Store) GetExtentReportedBytes(ctx context.Context, tenantID string) (int64, error) {
+	start := time.Now()
+	var err error
+	defer observeMeta(ctx, "get_extent_reported_bytes", start, &err)
+
+	var reported int64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT extent_reported_bytes FROM tenant_quota_usage WHERE tenant_id = ?`, tenantID,
+	).Scan(&reported)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil // zero counters
+	}
+	if err != nil {
+		return 0, err
+	}
+	return reported, nil
+}
+
+// ApplyExtentUsageRangeTx moves the extent watermark from fromTotal to
+// toTotal and reports whether this call was the one that moved it. It does
+// NOT touch storage_bytes: the (to-from) counter delta is the apply owner's
+// to flush (quotaCounterDeltas → IncrQuotaUsageCountersTx, "hot row last") in
+// the same transaction. Doing both here — moving the counter inside the CAS
+// and returning the delta for a second flush — double-counted every applied
+// report on the real store; only the watermark belongs to this method.
+//
+// The compare-and-set is what makes an extent_usage mutation idempotent. The
+// report path is split across two stores — the mutation log insert here, the
+// tenant-side reported marker there — so a crash or a failed marker commit
+// re-reports the same range under a fresh log id. Relative counter
+// increments have no rollback, so the only safe second application is none:
+// whichever application lands first moves the watermark, and every replay of
+// the same (or an already superseded) range sees the mismatch, returns zero
+// deltas, and is still marked applied. That holds for negative ranges too: a
+// retried shrink must not subtract twice and leave the counters permanently
+// below the real usage.
+func (s *Store) ApplyExtentUsageRangeTx(tx *sql.Tx, tenantID string, fromTotal, toTotal int64) (bool, error) {
+	res, err := tx.Exec(
+		`UPDATE tenant_quota_usage
+		 SET extent_reported_bytes = ?
+		 WHERE tenant_id = ? AND extent_reported_bytes = ?`,
+		toTotal, tenantID, fromTotal)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // IncrVideoFileCountTx atomically adjusts the video_file_count counter inside a transaction.
 func (s *Store) IncrVideoFileCountTx(tx *sql.Tx, tenantID string, delta int64) error {
 	res, err := tx.Exec(

@@ -678,30 +678,54 @@ func (m *tenantWorkerManager) drainExtentMaintenance(ctx context.Context, target
 // on a context detached from the pass so a cancelled kick still releases it.
 const extentQuotaLeaseReleaseTimeout = 5 * time.Second
 
-// reportExtentQuotaUsage pushes the extent data plane's byte delta into the
-// tenant's central quota counters. The tenant-side marker advances only after
-// the report has landed, so a failed report is retried with the same delta on
-// the next pass instead of being lost.
+// reportExtentQuotaUsage pushes the extent data plane's byte change into the
+// tenant's central quota counters as an absolute range — from the central
+// extent watermark to the current tenant total — not as a relative delta.
 //
-// The reverse window — a report that lands and a marker write that fails —
-// re-reports one delta, and since the counters are relative increments nothing
-// recomputes, that over-count persists. It is still the safer half of the trade
-// (the alternative silently under-counts for ever). Concurrent reporters are
-// excluded by the tenant-DB lease around this function, which expires so a dead
-// reporter only delays the next pass.
+// The report path still spans two stores: the mutation log insert and its
+// apply (central) and the tenant-side marker commit (tenant DB). A crash or
+// failed marker commit between them re-reports the same range, so the apply
+// itself must be idempotent: it compare-and-sets the central watermark and
+// no-ops unless it still equals the range's start. A relative delta would
+// apply twice into counters nothing recomputes — over-counting growth, and
+// permanently under-counting after a retried shrink. Duplicate log rows are
+// the expected residue of that retry window; each is marked applied when its
+// (already superseded) range no-ops.
+//
+// The tenant marker remains the admission-side cache (ExtentUnreportedUsage
+// Bytes) and is only repaired here, never trusted for correctness. Concurrent
+// reporters are excluded by the tenant-DB lease around this function, which
+// expires so a dead reporter only delays the next pass.
 func reportExtentQuotaUsage(ctx context.Context, target *tenantTarget) {
 	if target == nil || target.store == nil || target.backend == nil {
 		return
 	}
 	// Cheap filter first: most kicks have no growth to report, and a claim plus a
-	// release is two write transactions on a row this pass would not touch. Only
-	// a non-zero delta is worth serializing.
-	if _, delta, perr := target.store.PeekExtentUsageDelta(ctx); perr != nil {
+	// release is two write transactions on a row this pass would not touch. The
+	// marker is the cheap input, but it is not the whole story: the marker
+	// advances when a report is enqueued, while the central watermark moves
+	// only when the apply lands. A pending or superseded apply can leave the
+	// watermark off the tenant total with the marker exactly right, and an
+	// idle tenant would carry that difference in the central counters forever
+	// — so a settled marker also has to confirm the watermark before opting
+	// out. One central read per maintenance pass; only a real disagreement
+	// is worth the lease.
+	total, markerDelta, perr := target.store.PeekExtentUsageDelta(ctx)
+	if perr != nil {
 		logger.Warn(ctx, "tenant_worker_extent_quota_delta_failed",
 			zap.String("tenant_id", target.tenantID), zap.Error(perr))
 		return
-	} else if delta == 0 {
-		return
+	} else if markerDelta == 0 {
+		reported, rerr := target.backend.ExtentUsageReported(ctx)
+		if rerr != nil {
+			logger.Warn(ctx, "tenant_worker_extent_quota_reported_read_failed",
+				zap.String("tenant_id", target.tenantID), zap.Error(rerr))
+			return
+		}
+		if reported == total {
+			return
+		}
+		// marker settled, watermark is not: fall through and reconcile below.
 	}
 	// One reporter per tenant, cluster-wide. The shard gate above already means
 	// only the owner reports, but a ring transition can hand the tenant over
@@ -728,23 +752,49 @@ func reportExtentQuotaUsage(ctx context.Context, target *tenantTarget) {
 				zap.String("tenant_id", target.tenantID), zap.Error(rerr))
 		}
 	}()
-	// The delta the report uses is the one read under the lease: another reporter
-	// may have covered the growth this pass saw before the lease was granted.
-	total, delta, err := target.store.PeekExtentUsageDelta(ctx)
+	// The totals the report uses are the ones read under the lease: another
+	// reporter may have covered the growth this pass saw before the lease was
+	// granted. The range starts at the central watermark — not at the tenant
+	// marker — because that watermark is what the apply compare-and-sets; the
+	// two can differ exactly in the retry window this design exists for.
+	total, markerDelta, err = target.store.PeekExtentUsageDelta(ctx)
 	if err != nil {
 		logger.Warn(ctx, "tenant_worker_extent_quota_delta_failed",
 			zap.String("tenant_id", target.tenantID), zap.Error(err))
 		return
 	}
-	if delta == 0 {
+	reported, err := target.backend.ExtentUsageReported(ctx)
+	if err != nil {
+		logger.Warn(ctx, "tenant_worker_extent_quota_reported_read_failed",
+			zap.String("tenant_id", target.tenantID), zap.Error(err))
 		return
 	}
-	if err := target.backend.ReportExtentUsageDelta(ctx, delta); err != nil {
+	if reported == total {
+		// Nothing to push. If the tenant marker still disagrees, the last
+		// report's marker commit failed after the central apply landed —
+		// re-sync it so the admission cache stops over-counting the bytes
+		// central already carries.
+		if markerDelta != 0 {
+			if serr := target.store.SetExtentUsageReported(ctx, total); serr != nil {
+				logger.Warn(ctx, "tenant_worker_extent_quota_marker_resync_failed",
+					zap.String("tenant_id", target.tenantID), zap.Error(serr))
+			}
+		}
+		return
+	}
+	if err := target.backend.ReportExtentUsageRange(ctx, reported, total); err != nil {
 		logger.Warn(ctx, "tenant_worker_extent_quota_report_failed",
-			zap.String("tenant_id", target.tenantID), zap.Int64("delta", delta), zap.Error(err))
+			zap.String("tenant_id", target.tenantID),
+			zap.Int64("from_total", reported), zap.Int64("to_total", total), zap.Error(err))
 		return
 	}
-	if err := target.store.CommitExtentUsageDelta(ctx, total, delta); err != nil {
+	// Set, not CAS: the marker records what this lease pushed — the range up
+	// to total — and the expected value a CAS would need (the watermark) can
+	// legitimately differ from the marker's current value when an earlier
+	// report's marker commit outlived its apply. A marker that lands stale is
+	// the safe direction (admission over-counts until the next pass); one that
+	// fails to land here is healed by the resync branch above.
+	if err := target.store.SetExtentUsageReported(ctx, total); err != nil {
 		logger.Warn(ctx, "tenant_worker_extent_quota_commit_failed",
 			zap.String("tenant_id", target.tenantID), zap.Int64("total", total), zap.Error(err))
 	}

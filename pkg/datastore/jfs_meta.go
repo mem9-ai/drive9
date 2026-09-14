@@ -765,6 +765,19 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 			"errno": eno, "attr": attr, "delta_length": dlen, "delta_space": dspace,
 			"compact_chunks": compactChunks,
 		}, eno, nil
+	case "open_ref":
+		var in struct {
+			Sid   uint64 `json:"sid"`
+			Inode uint64 `json:"inode"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return nil, int(syscall.EINVAL), err
+		}
+		eno, err := s.jfsOpenRefTx(tx, in.Sid, in.Inode)
+		if err != nil {
+			return nil, int(syscall.EIO), err
+		}
+		return map[string]any{"errno": eno}, eno, nil
 	case "delete_sustained":
 		var in struct {
 			Sid   uint64 `json:"sid"`

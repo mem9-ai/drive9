@@ -133,11 +133,13 @@ func (s *Store) overlayExtentStat(ctx context.Context, db execer, nf *NodeWithFi
 		return
 	}
 	nf.File.SizeBytes = length.Int64
-	if typ.Valid {
+	if typ.Valid && perm.Valid {
 		// Permission bits only, matching what the classic projection stores in
 		// inodes.mode: X-Dat9-Mode carries st_mode & 07777 (the file type a
 		// client needs comes from the listing overlay and the FUSE attr
-		// refresh, both of which do carry it).
+		// refresh, both of which do carry it). perm.Valid guards the same
+		// NULL-vs-0 distinction jfsTypeToStatMode makes for listings — both
+		// columns are NOT NULL today, so this is symmetry, not reachability.
 		nf.Mode = uint32(perm.Int64) & 0o7777
 		nf.HasMode = true
 	}
@@ -147,7 +149,13 @@ func (s *Store) overlayExtentStat(ctx context.Context, db execer, nf *NodeWithFi
 // mode a directory entry carries. The projection's inodes.mode is NULL for
 // extent files, so a listing built from it alone would present a symlink as a
 // regular file (git reports that as a typechange).
-func jfsTypeToStatMode(typ uint8, perm uint32) uint32 {
+//
+// permStored distinguishes a stored permission from a missing one: chmod 000
+// stores a real 0, which must be published as 0000 exactly like the per-file
+// stat does — substituting a default made ListDir disagree with Stat for the
+// same file. Only a NULL mode (no permission stored on the jfs_node row)
+// falls back to the type default.
+func jfsTypeToStatMode(typ uint8, perm uint32, permStored bool) uint32 {
 	kind := uint32(syscall.S_IFREG)
 	switch typ {
 	case jfsTypeDir:
@@ -163,15 +171,14 @@ func jfsTypeToStatMode(typ uint8, perm uint32) uint32 {
 	case jfsTypeSocket:
 		kind = uint32(syscall.S_IFSOCK)
 	}
-	perm &= 0o7777
-	if perm == 0 {
+	if !permStored {
 		if kind == uint32(syscall.S_IFDIR) {
 			perm = 0o755
 		} else {
 			perm = 0o644
 		}
 	}
-	return kind | perm
+	return kind | (perm & 0o7777)
 }
 
 // overlayExtentStatDir is overlayExtentStat for a directory listing. The
@@ -215,7 +222,7 @@ func (s *Store) overlayExtentStatDir(ctx context.Context, db execer, parentPath 
 			stats[path] = extentStat{
 				ino:    uint64(ino.Int64),
 				length: length.Int64,
-				mode:   jfsTypeToStatMode(uint8(typ.Int64), uint32(perm.Int64)),
+				mode:   jfsTypeToStatMode(uint8(typ.Int64), uint32(perm.Int64), perm.Valid),
 			}
 		}
 	}

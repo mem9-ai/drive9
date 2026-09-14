@@ -62,6 +62,18 @@ Native JuiceFS 1.4.1 against the same local TiDB + MinIO fails the same test wit
 
 **Acceptance criteria if it is picked up**: `blackbox/run.py --module community.sqlite` green on the extent profile, with the `--wait all` window met by real work reduction (not by a bigger busy timeout).
 
+## P2-4 Server-side sustained reclamation can deadlock against a same-inode unlink
+
+**Status: open** [noted 2026-09-14]
+
+`jfsDeleteSustainedTx` locks sustained→node; `jfsUnlinkTx`/`jfsDeleteSubtreeTx` lock node→sustained. A last close racing a same-inode delete on a **non-RPC server path** (the plain `InTx` callers around `store.go` rename/rmdir/delete-tree) can pick the deadlock victim and surface a transient error to that one op. The engine RPC paths retry (`RunExtentMetaOp` retries `isDeadlock`), nothing strands, and the concurrent-close regression (`TestConcurrentLastClosesReclaimExactlyOnce`) pins the reclaim invariant — this item is only about removing the lock-order inversion (e.g. taking the node lock first everywhere) so the server-side paths stop needing the retry.
+
+## P2-5 Subtree deletion does not honor hardlink aliases
+
+**Status: open, pre-existing** [noted 2026-09-14]
+
+`jfsDeleteSubtreeTx` reads `nlink` but ignores it: a file hardlinked to a name outside the deleted subtree still loses its node and every edge, breaking the surviving alias. Unrelated to the open-holder work (that path was strictly unconditional before); fix by decrementing per removed edge and keeping the node while `nlink > 0`.
+
 ## Q-1 Remaining questions
 
 1. **Should a directory expose its `extent_ino`?** `jfsMknodTx`/`jfsEnsureParentsTx` already write `extent_ino` on directory rows, but no `content_layout`. Nothing needs it today (`RenameDir` moves the edge, and `jfsEnsureParentsTx` mirrors parents on demand), but a client that had to resolve a directory's jfs inode without a name would need a stat/header field plus a FUSE adoption rule.
@@ -117,7 +129,7 @@ Deployment notes: STS deployments can run extent anywhere; a static-key MinIO de
 | Namespace | `jfsMknodTx`, `jfsUnlinkTx`, `jfsRmdirTx`, `jfsRenameTx`, `jfsReaddirTx`, `jfsRenameDirEdgeTx`, `jfsEnsureParentsTx` (also used by `Store.RenameDir`) |
 | Data | `jfsReadTx`, `jfsWritePartsTx` (quota-admitted, `FOR UPDATE` length), `jfsTruncateTx`, `jfsCompactTx` |
 | Locks | `jfsFlockTx`, `jfsGetlkTx`, `jfsSetlkTx` (`jfsLockInodeTx`, `jfsPLock` records) over `jfs_flock`/`jfs_plock` |
-| Quota | `ExtentQuotaLimit` (`admit`), `Store.ExtentUnreportedUsageBytes` (2 s cache of total − reported), `Store.PeekExtentUsageDelta` / `Store.CommitExtentUsageDelta` (the `extentQuotaReportedBytes` marker, a compare-and-set), `Store.ClaimExtentUsageReport` / `Store.ReleaseExtentUsageReport` (the cross-pod report lease), `pkg/backend.ReportExtentUsageDelta` + the `extent_usage` mutation, `pkg/backend.PendingCentralStorageDelta`, `pkg/server.extentQuotaLimit`. The total is `SUM(jfs_node.length)` over **distinct** `file_nodes.extent_ino` with `jfs_node.type = file`, so a hardlink alias and a mirrored directory are each charged once (or not at all) — do not go back to a per-row sum |
+| Quota | `ExtentQuotaLimit` (`admit`), `Store.ExtentUnreportedUsageBytes` (2 s cache of total − reported), `Store.PeekExtentUsageDelta` (the `extentQuotaReportedBytes` admission marker) and `Store.SetExtentUsageReported` (its write), `Store.ClaimExtentUsageReport` / `Store.ReleaseExtentUsageReport` (the cross-pod report lease), `pkg/backend.ReportExtentUsageRange` + the `extent_usage` mutation (absolute `{from_total,to_total}`, idempotent via the central `tenant_quota_usage.extent_reported_bytes` watermark CAS — `meta.ApplyExtentUsageRangeTx` moves only the watermark; the apply owner flushes the counter delta once), `pkg/backend.PendingCentralStorageDelta`, `pkg/server.extentQuotaLimit`. The total is `SUM(jfs_node.length)` over **distinct** `file_nodes.extent_ino` with `jfs_node.type = file`, so a hardlink alias and a mirrored directory are each charged once (or not at all) — do not go back to a per-row sum |
 | Replaced-target reclaim | `Store.reclaimReplacedTargetTx` (classic rename and `jfsMoveProjectionTx`) |
 | Compact queue | `enqueueCompactAfterWrite` (post-commit), `jfsClaimCompactTx` (lease), `jfsRequeueCompactTx`, `runCompactOp` |
 | Block GC | `jfsEnqueueSliceGCTx`, `jfsEnqueueDeadSliceGCTx` (dead `jfs_chunk_ref` rows are deleted once their GC tasks are durable), `ListPendingBlockGC` (grace filter), `MarkBlockGCDone`, `RequeueBlockGC` |

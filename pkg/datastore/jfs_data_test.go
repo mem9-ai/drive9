@@ -250,6 +250,13 @@ func TestJfsUnlinkDoesNotWalkChunkRefs(t *testing.T) {
 	if st := wp.WriteParts(ctx, ino, 0, parts, time.Now()); st != 0 {
 		t.Fatalf("WriteParts: %v", st)
 	}
+	// The kernel releases the create-time handle before the unlink (sqlite
+	// closes its journal fd, then unlinks the name). The close also drops the
+	// server-side open-holder row the create registered, so the opened=false
+	// claim below matches the filesystem state instead of contradicting it.
+	if st := rt.Meta.Close(ctx, ino); st != 0 {
+		t.Fatalf("close: %v", st)
+	}
 	unlinkCtx := ctx.WithValue(jfsmeta.Drive9OpenedKey, false)
 	if st := rt.Meta.Unlink(unlinkCtx, jfsmeta.RootInode, "journal.db-journal"); st != 0 {
 		t.Fatalf("unlink: %v", st)
@@ -1354,7 +1361,7 @@ func TestExtentUsageBytesAndDelta(t *testing.T) {
 	} else if again != delta {
 		t.Fatalf("uncommitted delta=%d, want %d (still pending)", again, delta)
 	}
-	if err := s.CommitExtentUsageDelta(ctx, total, delta); err != nil {
+	if err := s.SetExtentUsageReported(ctx, total); err != nil {
 		t.Fatal(err)
 	}
 	if _, again, err := s.PeekExtentUsageDelta(ctx); err != nil {
@@ -1384,45 +1391,6 @@ func TestExtentUsageBytesAndDelta(t *testing.T) {
 		t.Fatal(err)
 	} else if got != -10 {
 		t.Fatalf("unreported usage after the file went away=%d, want -10", got)
-	}
-}
-
-// The marker advance must not be an unconditional upsert: a reporter that peeked
-// an older marker (a shard-ring transition handing the tenant to another pod
-// mid-report) would then write its stale total over the newer one and make the
-// difference look unreported for ever.
-func TestCommitExtentUsageDeltaKeepsNewerMarker(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	marker := func() int64 {
-		t.Helper()
-		var got int64
-		if err := s.DB().QueryRow(`SELECT value FROM jfs_counter WHERE name = ?`, extentUsageReportedKey).Scan(&got); err != nil {
-			t.Fatal(err)
-		}
-		return got
-	}
-	// A reporter that peeked nothing at all (fresh tenant) creates the marker.
-	if err := s.CommitExtentUsageDelta(ctx, 100, 100); err != nil {
-		t.Fatal(err)
-	}
-	if got := marker(); got != 100 {
-		t.Fatalf("marker after the first report = %d, want 100", got)
-	}
-	// A second reporter that read (total 0, delta 0) before the first one landed
-	// must leave the newer marker alone.
-	if err := s.CommitExtentUsageDelta(ctx, 0, 0); err != nil {
-		t.Fatal(err)
-	}
-	if got := marker(); got != 100 {
-		t.Fatalf("marker after a stale report = %d, want 100 (the newer total must survive)", got)
-	}
-	// A reporter whose own peek is still current advances it.
-	if err := s.CommitExtentUsageDelta(ctx, 300, 200); err != nil {
-		t.Fatal(err)
-	}
-	if got := marker(); got != 300 {
-		t.Fatalf("marker after a current report = %d, want 300", got)
 	}
 }
 

@@ -344,14 +344,25 @@ func (s *Store) jfsDeleteSustainedTx(tx *sql.Tx, sid, ino uint64) error {
 	if _, err := tx.Exec(`DELETE FROM jfs_sustained WHERE sid = ? AND inode = ?`, sid, ino); err != nil {
 		return err
 	}
+	// FOR UPDATE, like jfsUnlinkTx's holder count: two sessions holding the
+	// same inode (the normal case since open_ref registers every runtime's
+	// opens) can close concurrently, and a snapshot count would let each see
+	// the other's row survive, skip reclaim in both, and strand a nlink=0
+	// node with no edge, no sustained row and no delfile record — a leak
+	// nothing walks again. The current-read count serializes the two closers
+	// (the loser blocks on the winner's deleted row and then sees zero); the
+	// inverse lock order against open_ref's node-then-sustained sequence can
+	// deadlock, which RunExtentMetaOp's retry loop resolves.
 	var n int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM jfs_sustained WHERE inode = ?`, ino).Scan(&n); err != nil {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM jfs_sustained WHERE inode = ? FOR UPDATE`, ino).Scan(&n); err != nil {
 		return err
 	}
 	if n > 0 {
 		return nil
 	}
-	attr, eno, err := s.jfsGetAttrTx(tx, ino)
+	// The attr read is locked too, so the nlink check is ordered against a
+	// concurrent open_ref on this inode rather than read from a snapshot.
+	attr, eno, err := s.jfsGetAttrForUpdateTx(tx, ino)
 	if err != nil || eno != 0 {
 		return err
 	}
@@ -530,22 +541,47 @@ func (s *Store) jfsDeleteSubtreeTx(tx *sql.Tx, ino uint64) error {
 		var typ uint8
 		var length uint64
 		var nlink uint32
-		err := tx.QueryRow(`SELECT type, length, nlink FROM jfs_node WHERE inode = ?`, node).Scan(&typ, &length, &nlink)
+		// FOR UPDATE, like jfsUnlinkTx and jfsReclaimOrphanedInoTx: a plain
+		// read left a window for a concurrent open_ref to commit its holder
+		// row between the sustained count below and this transaction's node
+		// DELETE, reclaiming the inode under the handle that was registering.
+		err := tx.QueryRow(`SELECT type, length, nlink FROM jfs_node WHERE inode = ? FOR UPDATE`, node).Scan(&typ, &length, &nlink)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			// Edge without a node (already half-deleted): drop the edge below.
 		case err != nil:
 			return err
-		case typ == jfsTypeFile:
-			// Every file in the subtree, including one already unlinked while
-			// open (nlink = 0, its blocks still referenced only by this node):
-			// the node and its jfs_sustained row go below, so without this
-			// record nothing could ever find those chunks again. The drain is
-			// idempotent and drops refcounts rather than deleting shared
-			// blocks, so recording a node that was already enqueued is safe.
-			if _, err := tx.Exec(`INSERT IGNORE INTO jfs_delfile (inode, length, expire) VALUES (?, ?, ?)`,
-				node, length, now); err != nil {
+		default:
+			// A node another runtime still holds open is not reclaimable here,
+			// whatever this subtree delete says: its blocks must outlive that
+			// handle (same rule as jfsUnlinkTx). The name still goes — only the
+			// node, its chunks and the holder rows stay, with nlink = 0 so the
+			// holders' last close (jfsDeleteSustainedTx) or the stale-session
+			// sweep reclaims them.
+			var holders int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM jfs_sustained WHERE inode = ? FOR UPDATE`, node).Scan(&holders); err != nil {
 				return err
+			}
+			if holders > 0 {
+				if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? OR inode = ?`, node, node); err != nil {
+					return err
+				}
+				if _, err := tx.Exec(`UPDATE jfs_node SET nlink = 0 WHERE inode = ?`, node); err != nil {
+					return err
+				}
+				continue
+			}
+			if typ == jfsTypeFile {
+				// Every file in the subtree, including one already unlinked while
+				// open (nlink = 0, its blocks still referenced only by this node):
+				// the node and its jfs_sustained row go below, so without this
+				// record nothing could ever find those chunks again. The drain is
+				// idempotent and drops refcounts rather than deleting shared
+				// blocks, so recording a node that was already enqueued is safe.
+				if _, err := tx.Exec(`INSERT IGNORE INTO jfs_delfile (inode, length, expire) VALUES (?, ?, ?)`,
+					node, length, now); err != nil {
+					return err
+				}
 			}
 		}
 		if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? OR inode = ?`, node, node); err != nil {

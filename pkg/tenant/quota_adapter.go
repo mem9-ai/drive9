@@ -125,6 +125,14 @@ func (a *metaQuotaAdapter) IncrQuotaUsageCountersTx(tx *sql.Tx, tenantID string,
 	return a.s.IncrQuotaUsageCountersTx(tx, tenantID, storageDelta, fileDelta, mediaDelta, reservedDelta)
 }
 
+func (a *metaQuotaAdapter) GetExtentReportedBytes(ctx context.Context, tenantID string) (int64, error) {
+	return a.s.GetExtentReportedBytes(ctx, tenantID)
+}
+
+func (a *metaQuotaAdapter) ApplyExtentUsageRangeTx(tx *sql.Tx, tenantID string, fromTotal, toTotal int64) (bool, error) {
+	return a.s.ApplyExtentUsageRangeTx(tx, tenantID, fromTotal, toTotal)
+}
+
 // AtomicReserveAndInsertUpload is the preferred single-transaction API for the
 // upload-initiate path. See meta.Store.AtomicReserveAndInsertUpload for
 // invariants. Translates meta sentinels to backend sentinels for the caller.
