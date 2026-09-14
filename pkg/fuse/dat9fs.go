@@ -9956,18 +9956,16 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 		return httpToFuseStatus(err)
 	}
 
+	// The hardlink is committed at this point; the stat only refines cached
+	// attributes, and every field below has a fallback. Any failure of this
+	// advisory read — a FUSE interrupt, a timeout, or a server error — must
+	// not turn a committed link into an error: callers that retry would then
+	// hit EEXIST loops.
 	confirmCtx, confirmCancel := fs.postCommitConfirmContext(ctx)
 	stat, err := fs.client.StatCtx(confirmCtx, fs.remotePath(dstP))
 	confirmCancel()
-	if err != nil && !isForbiddenErr(err) && !isTransientLookupErr(err) {
-		return httpToFuseStatus(err)
-	}
 	if err != nil {
-		// The hardlink is already committed at this point; the stat only refines
-		// cached attributes, and every field below has a fallback. A FUSE
-		// interrupt (or any transient stat error) must not turn a committed
-		// link into EAGAIN — callers that retry would then hit EEXIST loops.
-		fs.debugf("link post-commit stat failed; keeping fallback attributes local=%s err=%v", dstP, err)
+		safeLogPrintf("link: post-commit stat failed; keeping fallback attributes local=%s err=%v", dstP, err)
 	}
 	mtime := time.Now()
 	if stat != nil && !stat.Mtime.IsZero() {
