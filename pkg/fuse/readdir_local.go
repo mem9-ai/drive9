@@ -47,6 +47,13 @@ func (fs *Dat9FS) localDirEntryInfo(childP string, item CachedFileInfo, live *In
 		}
 	}
 	if meta := local.pending[childP]; meta != nil {
+		if live == nil && meta.Kind == PendingNew {
+			// A recovered create is not the older resource a directory cache
+			// may still name. Do not attach it to that resource's hardlinks.
+			observedVersion := item.observedVersion
+			item = cachedInfoFromWriteBackMeta(item.Name, meta)
+			item.observedVersion = observedVersion
+		}
 		item.Size = meta.Size
 		item.IsDir = false
 		if !meta.Mtime.IsZero() {
