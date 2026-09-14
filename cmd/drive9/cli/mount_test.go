@@ -1330,6 +1330,63 @@ func TestMountCmdResolvesGVisorCompat(t *testing.T) {
 	}
 }
 
+func TestMountCmdResolvesLegacyInterruptibleMutations(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
+	tests := []struct {
+		name     string
+		env      string
+		unsetEnv bool
+		args     []string
+		want     bool
+	}{
+		{name: "disabled by default", unsetEnv: true, want: false},
+		{name: "enabled by environment", env: "true", want: true},
+		{name: "flag enables over environment", env: "false", args: []string{"--legacy-interruptible-mutations"}, want: true},
+		{name: "explicit flag disables over environment", env: "true", args: []string{"--legacy-interruptible-mutations=false"}, want: false},
+		{name: "explicit flag overrides invalid environment", env: "invalid", args: []string{"--legacy-interruptible-mutations=false"}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.unsetEnv {
+				t.Setenv(envMountLegacyInterruptibleMutations, "temporary")
+				if err := os.Unsetenv(envMountLegacyInterruptibleMutations); err != nil {
+					t.Fatalf("unset %s: %v", envMountLegacyInterruptibleMutations, err)
+				}
+			} else {
+				t.Setenv(envMountLegacyInterruptibleMutations, tt.env)
+			}
+			oldMountFuse := mountFuse
+			t.Cleanup(func() { mountFuse = oldMountFuse })
+
+			var got *mountFuseOptions
+			mountFuse = func(opts *mountFuseOptions) error {
+				copied := *opts
+				got = &copied
+				return nil
+			}
+
+			args := []string{
+				"--foreground",
+				"--mode", "fuse",
+				"--server", "https://drive9.example",
+				"--api-key", "sk-test",
+			}
+			args = append(args, tt.args...)
+			args = append(args, t.TempDir())
+			if err := MountCmd(args); err != nil {
+				t.Fatalf("MountCmd: %v", err)
+			}
+			if got == nil {
+				t.Fatal("mountFuse was not called")
+			}
+			if got.LegacyInterruptibleMutations != tt.want {
+				t.Fatalf("LegacyInterruptibleMutations = %t, want %t", got.LegacyInterruptibleMutations, tt.want)
+			}
+		})
+	}
+}
+
 func TestMountCmdRejectsGVisorCompatForNonFUSEMounts(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1348,6 +1405,29 @@ func TestMountCmdRejectsGVisorCompatForNonFUSEMounts(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "--gvisor-compat") || !strings.Contains(err.Error(), "only supported") {
 				t.Fatalf("MountCmd error = %q, want gVisor compatibility scope error", err)
+			}
+		})
+	}
+}
+
+func TestMountCmdRejectsLegacyInterruptibleMutationsForNonFUSEMounts(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "WebDAV", args: []string{"--foreground", "--mode", "webdav", "--legacy-interruptible-mutations"}},
+		{name: "object", args: []string{"--foreground", "--legacy-interruptible-mutations", "s3://bucket/prefix/"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append(append([]string(nil), tt.args...), t.TempDir())
+			err := MountCmd(args)
+			if err == nil {
+				t.Fatal("MountCmd error = nil, want unsupported legacy-mutations error")
+			}
+			if !strings.Contains(err.Error(), "--legacy-interruptible-mutations") || !strings.Contains(err.Error(), "only supported") {
+				t.Fatalf("MountCmd error = %q, want legacy-interruptible-mutations scope error", err)
 			}
 		})
 	}

@@ -184,7 +184,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	syncRead := fs.Bool("fuse-sync-read", false, "disable kernel async read dispatch; at most one read in flight per file handle")
 	directMountStrict := fs.Bool("direct-mount-strict", false, "Linux only: mount directly with mount(2) and do not fall back to fusermount")
 	gvisorCompat := fs.Bool("gvisor-compat", false, "enable gVisor-specific FUSE compatibility behavior (default from $DRIVE9_MOUNT_GVISOR_COMPAT)")
-	legacyInterruptibleMutations := fs.Bool("legacy-interruptible-mutations", false, "restore legacy behavior where a FUSE interrupt cancels in-flight remote commits of idempotent namespace mutations, which can surface EAGAIN for an already-committed change (default from $DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS)")
+	legacyInterruptibleMutations := fs.Bool("legacy-interruptible-mutations", false, "restore legacy behavior where a FUSE interrupt cancels in-flight remote commits of idempotent namespace mutations, which can surface EAGAIN for an already-committed change; no effect with --gvisor-compat (default from $DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS)")
 	legacyDirStatFallback := fs.Bool("legacy-dir-stat-fallback", false, "on Lookup stat 404, list parent to support legacy servers without directory stat")
 	readDirPrefetch := fs.Bool("readdir-prefetch", false, "prefetch small files after directory reads into the read cache")
 	prefetchMaxFiles := fs.Int("readdir-prefetch-max-files", 32, "maximum small files prefetched per directory read")
@@ -306,6 +306,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		}
 		if gvisorCompatGiven && *gvisorCompat {
 			return fmt.Errorf("drive9 mount: --gvisor-compat is only supported with Drive9 FUSE mounts")
+		}
+		if legacyInterruptibleMutationsGiven && *legacyInterruptibleMutations {
+			return fmt.Errorf("drive9 mount: --legacy-interruptible-mutations is only supported with Drive9 FUSE mounts")
 		}
 		if err := validateObjectMount(runtime.GOOS, *mode, *layerRef, *checkpointRef, *profile); err != nil {
 			return err
@@ -585,6 +588,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	if resolved == MountModeWebDAV && gvisorCompatGiven && *gvisorCompat {
 		return fmt.Errorf("drive9 mount: --gvisor-compat is only supported with --mode=fuse")
+	}
+	if resolved == MountModeWebDAV && legacyInterruptibleMutationsGiven && *legacyInterruptibleMutations {
+		return fmt.Errorf("drive9 mount: --legacy-interruptible-mutations is only supported with --mode=fuse")
 	}
 	if resolved == MountModeWebDAV && trustProcessLocalEventsGiven {
 		return fmt.Errorf("drive9 mount: --trust-process-local-events is only supported with --mode=fuse")
@@ -1776,8 +1782,8 @@ func durationFlagValue(fs *flag.FlagSet, name string, value time.Duration) time.
 	return 0
 }
 
-func mountGVisorCompatFromEnv() (bool, error) {
-	raw, ok := os.LookupEnv(envMountGVisorCompat)
+func mountBoolFromEnv(name string) (bool, error) {
+	raw, ok := os.LookupEnv(name)
 	if !ok {
 		return false, nil
 	}
@@ -1787,23 +1793,16 @@ func mountGVisorCompatFromEnv() (bool, error) {
 	case "false":
 		return false, nil
 	default:
-		return false, fmt.Errorf("drive9 mount: %s must be true or false, got %q", envMountGVisorCompat, raw)
+		return false, fmt.Errorf("drive9 mount: %s must be true or false, got %q", name, raw)
 	}
 }
 
+func mountGVisorCompatFromEnv() (bool, error) {
+	return mountBoolFromEnv(envMountGVisorCompat)
+}
+
 func mountLegacyInterruptibleMutationsFromEnv() (bool, error) {
-	raw, ok := os.LookupEnv(envMountLegacyInterruptibleMutations)
-	if !ok {
-		return false, nil
-	}
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "true":
-		return true, nil
-	case "false":
-		return false, nil
-	default:
-		return false, fmt.Errorf("drive9 mount: %s must be true or false, got %q", envMountLegacyInterruptibleMutations, raw)
-	}
+	return mountBoolFromEnv(envMountLegacyInterruptibleMutations)
 }
 
 func readCacheTTLFlagValue(given bool, value time.Duration) (time.Duration, error) {

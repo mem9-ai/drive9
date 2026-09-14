@@ -674,19 +674,15 @@ func detachedSharedReadCtx(parent context.Context, timeout time.Duration) (conte
 // waits uninterruptibly for the reply, so finishing a mutation the server
 // may already be applying and answering OK is always kernel-sanctioned,
 // whereas canceling it mid-flight can surface EAGAIN for a change that was
-// already committed.
-//
-// gVisor compatibility keeps its historical fuseTimeout budget. Interrupt-safe
-// mutations use the tighter namespaceMutationRetryTimeout, matching the
-// detached retries that already exist for these operations.
+// already committed. The budget stays at fuseTimeout (clamped to the
+// parent's remaining deadline): detachment must not shorten the first
+// attempt's deadline, which would regress slow-but-successful commits for
+// operations without retry recovery (chmod, delete, mknod, symlink).
 func (fs *Dat9FS) namespaceMutationCommitContext(parent context.Context) (context.Context, context.CancelFunc) {
 	if !fs.gvisorCompatibilityEnabled() && !fs.interruptSafeMutationsEnabled() {
 		return parent, func() {}
 	}
 	timeout := fuseTimeout
-	if !fs.gvisorCompatibilityEnabled() {
-		timeout = namespaceMutationRetryTimeout
-	}
 	if deadline, ok := parent.Deadline(); ok {
 		remaining := time.Until(deadline)
 		if remaining < timeout {
@@ -699,16 +695,19 @@ func (fs *Dat9FS) namespaceMutationCommitContext(parent context.Context) (contex
 	return context.WithTimeout(context.WithoutCancel(parent), timeout)
 }
 
-// postCommitConfirmContext returns the context for a read that only confirms
-// an already-committed mutation (e.g. Link's post-commit stat). Under
-// interrupt-safe mutations it is detached from the FUSE cancel channel so an
-// interrupt cannot blur the confirmation; the caller still treats a transient
-// failure of such a read as non-fatal.
-func (fs *Dat9FS) postCommitConfirmContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if !fs.interruptSafeMutationsEnabled() {
+// gvisorCompatCommitContext detaches a commit context only under gVisor
+// compatibility: data-transfer commits (the pending-upload commit inside
+// durable pending-new renames) and request-bound orchestration steps (the
+// unlink snapshot) stay interruptible for regular mounts and do not follow
+// the interrupt-safe namespace-mutation policy. Do not unify the remaining
+// inline gVisor gates in Unlink (open-handle mark, remote delete) with this
+// helper: their non-gVisor default is a fresh fuseCtx(cancel) deadline, and
+// this helper's parent passthrough would silently change that.
+func (fs *Dat9FS) gvisorCompatCommitContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if !fs.gvisorCompatibilityEnabled() {
 		return parent, func() {}
 	}
-	return detachedSharedReadCtx(parent, namespaceMutationRetryTimeout)
+	return fs.namespaceMutationCommitContext(parent)
 }
 
 // --- helpers -----------------------------------------------------------------
@@ -7091,9 +7090,11 @@ func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPat
 		return err
 	}
 
-	// The first request honored the FUSE interrupt. If it was canceled after the
-	// server committed the directory, a detached stat lets us return success
-	// instead of surfacing EAGAIN to checkout-like callers that will not retry.
+	// The first attempt failed transiently (a server blip, or — under the
+	// legacy interruptible mode — a FUSE interrupt that canceled it after the
+	// server committed). If the directory exists remotely, a detached stat
+	// lets us return success instead of surfacing EAGAIN to checkout-like
+	// callers that will not retry.
 	if fs.remoteDirExistsDetached(localPath) {
 		return nil
 	}
@@ -7164,10 +7165,11 @@ func (fs *Dat9FS) deleteRemotePathWithInterruptRecovery(ctx context.Context, loc
 		return err
 	}
 
-	// If the FUSE request was interrupted after the server committed the delete,
-	// the path is already gone. Confirm that detached from the canceled request.
-	// If the path still exists, do not retry a path-only DELETE: another actor
-	// may have recreated the same name after the ambiguous first delete.
+	// If the first delete was canceled (legacy interruptible mode) or blipped
+	// after the server committed it, the path is already gone. Confirm that
+	// detached from the failed request. If the path still exists, do not
+	// retry a path-only DELETE: another actor may have recreated the same
+	// name after the ambiguous first delete.
 	if fs.remotePathGoneDetached(localPath) {
 		return nil
 	}
@@ -7189,10 +7191,11 @@ func (fs *Dat9FS) renameRemoteWithTransientRetry(ctx context.Context, oldP, newP
 		return err
 	}
 
-	// If the caller interrupted after the server committed the rename but before
-	// the response reached us, the target is visible and the source is gone.
-	// Target visibility alone is not enough because server-side rename supports
-	// replacing an existing target such as .git/config.
+	// If the first attempt failed transiently after the server committed the
+	// rename (a canceled request under the legacy interruptible mode, or a
+	// response lost to a blip), the target is visible and the source is gone.
+	// Target visibility alone is not enough because server-side rename
+	// supports replacing an existing target such as .git/config.
 	if fs.remoteRenameCommittedDetached(oldP, newP) {
 		return nil
 	}
@@ -9979,8 +9982,10 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	// attributes, and every field below has a fallback. Any failure of this
 	// advisory read — a FUSE interrupt, a timeout, or a server error — must
 	// not turn a committed link into an error: callers that retry would then
-	// hit EEXIST loops.
-	confirmCtx, confirmCancel := fs.postCommitConfirmContext(ctx)
+	// hit EEXIST loops. Like the commit itself, the confirm read runs
+	// detached under interrupt-safe mutations (and gVisor compatibility), so
+	// --legacy-interruptible-mutations has no effect under --gvisor-compat.
+	confirmCtx, confirmCancel := fs.namespaceMutationCommitContext(ctx)
 	stat, err := fs.client.StatCtx(confirmCtx, fs.remotePath(dstP))
 	confirmCancel()
 	if err != nil {
@@ -10164,11 +10169,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if fs.debouncer != nil {
 		fs.debouncer.Cancel(childP)
 	}
-	snapshotCtx := ctx
-	snapshotCancel := func() {}
-	if fs.gvisorCompatibilityEnabled() {
-		snapshotCtx, snapshotCancel = fs.namespaceMutationCommitContext(ctx)
-	}
+	snapshotCtx, snapshotCancel := fs.gvisorCompatCommitContext(ctx)
 	snapshotErr := fs.snapshotOpenHandlesBeforeUnlink(snapshotCtx, childP)
 	snapshotCancel()
 	if snapshotErr != nil {
@@ -10790,9 +10791,7 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 			return pendingRenameHandled, oldExistsErr
 		}
 		if oldExistsRemote {
-			renameCtx, renameCancel := fs.namespaceMutationCommitContext(ctx)
-			err := fs.renameRemoteWithTransientRetry(renameCtx, oldP, newP)
-			renameCancel()
+			err := fs.renameRemoteWithTransientRetry(ctx, oldP, newP)
 			if err != nil {
 				return pendingRenameHandled, err
 			}
@@ -10895,10 +10894,7 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 			// pending-upload commit (data transfer), not a namespace mutation,
 			// so interrupt-safe mutation detachment deliberately does not
 			// apply here; only gVisor compatibility detaches it.
-			commitCtx, commitCancel := ctx, func() {}
-			if fs.gvisorCompatibilityEnabled() {
-				commitCtx, commitCancel = fs.namespaceMutationCommitContext(ctx)
-			}
+			commitCtx, commitCancel := fs.gvisorCompatCommitContext(ctx)
 			defer commitCancel()
 			return fs.commitQueue.commitNowPathLocked(commitCtx, entry)
 		}

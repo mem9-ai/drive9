@@ -47,8 +47,27 @@ func TestInterruptSafeCommitContextPolicy(t *testing.T) {
 	if !ok {
 		t.Fatal("interrupt-safe commit ctx has no deadline")
 	}
-	if budget := time.Until(deadline); budget > namespaceMutationRetryTimeout {
-		t.Fatalf("interrupt-safe commit budget = %v, want <= %v", budget, namespaceMutationRetryTimeout)
+	// Detachment must not shorten the first attempt's deadline: the budget
+	// stays at fuseTimeout so slow-but-successful commits do not regress for
+	// operations without retry recovery (chmod, delete, mknod, symlink).
+	// The lower bound catches a regression back to the detached-retry budget.
+	budget := time.Until(deadline)
+	if budget > fuseTimeout {
+		t.Fatalf("interrupt-safe commit budget = %v, want <= fuseTimeout (%v)", budget, fuseTimeout)
+	}
+	if budget <= namespaceMutationRetryTimeout {
+		t.Fatalf("interrupt-safe commit budget = %v, want > the detached-retry budget %v (first attempt must keep the full request deadline)", budget, namespaceMutationRetryTimeout)
+	}
+
+	// A parent with less remaining deadline than fuseTimeout clamps the
+	// budget: the detached commit never outlives its request.
+	parent, parentCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer parentCancel()
+	clampedCtx, clampedCancel := fs.namespaceMutationCommitContext(parent)
+	defer clampedCancel()
+	clampedDeadline, ok := clampedCtx.Deadline()
+	if !ok || time.Until(clampedDeadline) > 500*time.Millisecond {
+		t.Fatalf("clamped commit deadline = %v/%v, want <= the parent's 500ms remaining", clampedDeadline, ok)
 	}
 
 	legacyFS := newInterruptMutationTestFS(t, true)
@@ -65,8 +84,16 @@ func TestInterruptSafeCommitContextPolicy(t *testing.T) {
 	if err := gvisorCtx.Err(); err != nil {
 		t.Fatalf("gVisor commit ctx err = %v, want detached from parent cancel", err)
 	}
-	if deadline, ok := gvisorCtx.Deadline(); !ok || time.Until(deadline) > fuseTimeout {
-		t.Fatalf("gVisor commit ctx budget = %v/%v, want the historical fuseTimeout budget", deadline, ok)
+	gvisorDeadline, ok := gvisorCtx.Deadline()
+	if !ok {
+		t.Fatal("gVisor commit ctx has no deadline")
+	}
+	gvisorBudget := time.Until(gvisorDeadline)
+	if gvisorBudget > fuseTimeout {
+		t.Fatalf("gVisor commit budget = %v, want <= fuseTimeout (%v)", gvisorBudget, fuseTimeout)
+	}
+	if gvisorBudget <= namespaceMutationRetryTimeout {
+		t.Fatalf("gVisor commit budget = %v, want > the detached-retry budget %v (gVisor keeps its historical fuseTimeout budget)", gvisorBudget, namespaceMutationRetryTimeout)
 	}
 }
 
@@ -376,5 +403,35 @@ func TestInterruptSafeMknodCommitDetachedFromFuseInterrupt(t *testing.T) {
 	}
 	if got := chmods.Load(); got != 1 {
 		t.Fatalf("chmod calls = %d, want 1", got)
+	}
+}
+
+// TestInterruptSafeMkdirCommitDetachedFromFuseInterrupt runs the Mkdir wrapper
+// with the FUSE cancel channel already closed. The directory create runs
+// detached, so it must commit exactly once.
+func TestInterruptSafeMkdirCommitDetachedFromFuseInterrupt(t *testing.T) {
+	cancel := make(chan struct{})
+	close(cancel)
+	var posts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			posts.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	if err := fs.mkdirRemoteWithTransientRetry(cancel, "/d", 0o755); err != nil {
+		t.Fatalf("mkdir commit err = %v, want nil", err)
+	}
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("mkdir POST calls = %d, want 1", got)
 	}
 }
