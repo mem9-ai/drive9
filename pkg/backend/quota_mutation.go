@@ -276,6 +276,80 @@ func applyCentralFileOverwriteTx(store MetaQuotaStore, tx *sql.Tx, tenantID stri
 	return applyCentralFileStateTx(store, tx, tenantID, data.FileID, data.NewSizeBytes, data.NewIsMedia)
 }
 
+// extentUsageMutationData carries one extent usage report as the absolute
+// tenant extent totals on both sides of the range, not their difference.
+// Extent bytes live in the tenant's jfs_node (the projection's size_bytes
+// stays 0 by design), so the central counters cannot be derived from the
+// classic file mutations; the tenant worker reports the range instead.
+//
+// Absolute endpoints are what make the mutation idempotent: the report path
+// spans two stores (the mutation log insert here, the tenant-side reported
+// marker in the tenant DB), and a crash or failed marker commit between them
+// re-reports the same range under a fresh log id. A relative delta payload
+// would then apply twice into counters nothing recomputes — over-counting for
+// growth and, worse, permanently under-counting after a retried shrink. The
+// apply compares the central watermark against FromTotal and no-ops unless
+// it still matches.
+type extentUsageMutationData struct {
+	FromTotal int64 `json:"from_total"`
+	ToTotal   int64 `json:"to_total"`
+}
+
+// ExtentUsageReported reads the central extent watermark for this tenant:
+// the extent byte total already inside tenant_quota_usage.storage_bytes, and
+// the FromTotal the next report must carry.
+func (b *Dat9Backend) ExtentUsageReported(ctx context.Context) (int64, error) {
+	if b == nil || b.metaStore == nil || b.tenantID == "" {
+		return 0, nil
+	}
+	return b.metaStore.GetExtentReportedBytes(ctx, b.tenantID)
+}
+
+// ReportExtentUsageRange moves the central extent contribution from fromTotal
+// to toTotal through the same durable mutation log the classic write path
+// uses, so a crash before the apply is replayed instead of lost — and, unlike
+// a relative delta, replayed without double-counting.
+func (b *Dat9Backend) ReportExtentUsageRange(ctx context.Context, fromTotal, toTotal int64) error {
+	if b == nil || b.metaStore == nil || b.tenantID == "" || fromTotal == toTotal {
+		return nil
+	}
+	// The tenant row must exist before the watermark CAS can match anything;
+	// every other counter path makes the same assumption explicit.
+	if err := b.metaStore.EnsureQuotaUsageRow(ctx, b.tenantID); err != nil {
+		return err
+	}
+	data := extentUsageMutationData{FromTotal: fromTotal, ToTotal: toTotal}
+	return b.logAndEnqueueMutation(ctx, "extent_usage", data, quotaPendingDeltas{
+		storageDelta: toTotal - fromTotal,
+	}, func(applyCtx context.Context, tx *sql.Tx) (quotaCounterDeltas, error) {
+		return applyCentralExtentUsageTx(applyCtx, b.metaStore, tx, b.tenantID, data)
+	})
+}
+
+func applyCentralExtentUsageTx(ctx context.Context, store MetaQuotaStore, tx *sql.Tx, tenantID string, data extentUsageMutationData) (quotaCounterDeltas, error) {
+	if data.ToTotal == data.FromTotal {
+		return quotaCounterDeltas{}, nil
+	}
+	moved, err := store.ApplyExtentUsageRangeTx(tx, tenantID, data.FromTotal, data.ToTotal)
+	if err != nil {
+		return quotaCounterDeltas{}, err
+	}
+	if !moved {
+		// The watermark already passed this range: another application of the
+		// same report (a retry after the marker commit failed, the replay of a
+		// logged-but-unapplied row, or a report whose lease expired mid-flight)
+		// got there first. Relative increments have no rollback, so the only
+		// safe second application is none. The next periodic pass re-derives
+		// its range from the watermark, so nothing is lost by skipping here.
+		logger.Info(ctx, "extent_usage_mutation_already_applied",
+			zap.String("tenant_id", tenantID),
+			zap.Int64("from_total", data.FromTotal),
+			zap.Int64("to_total", data.ToTotal))
+		return quotaCounterDeltas{}, nil
+	}
+	return quotaCounterDeltas{storageBytes: data.ToTotal - data.FromTotal}, nil
+}
+
 func (b *Dat9Backend) recordCentralFileCreateMutation(ctx context.Context, fileID string, sizeBytes int64, contentType string) error {
 	isMedia := isQuotaMediaContentType(contentType)
 	data := fileCreateMutationData{

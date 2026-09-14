@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
 func TestAWSConfigValidate(t *testing.T) {
@@ -140,6 +142,62 @@ func TestS3LogValueHelpers(t *testing.T) {
 	}
 	if got := RoleLogValue("arn:aws:iam::123456789012:role/test"); got != "arn:aws:iam::123456789012:role/test" {
 		t.Fatalf("RoleLogValue(arn) = %q, want %q", got, "arn:aws:iam::123456789012:role/test")
+	}
+}
+
+func TestMintStaticPrefix(t *testing.T) {
+	c := &AWSS3Client{
+		staticAccessKeyID:     "drive9minio",
+		staticSecretAccessKey: "drive9minio",
+		endpoint:              "http://127.0.0.1:19000",
+		bucket:                "drive9-local",
+		region:                "us-east-1",
+		forcePathStyle:        true,
+		prefix:                "tenants/",
+	}
+	if c.CanMintSTS() {
+		t.Fatal("CanMintSTS=true without role")
+	}
+	if !c.CanMintStatic() {
+		t.Fatal("CanMintStatic=false, want true for minio static keys")
+	}
+	out, err := c.MintStaticPrefix("tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.AccessKeyID != "drive9minio" || out.SecretAccessKey != "drive9minio" {
+		t.Fatalf("keys=%q/%q", out.AccessKeyID, out.SecretAccessKey)
+	}
+	if !out.Expiration.IsZero() {
+		t.Fatalf("static creds must not expire, got %v", out.Expiration)
+	}
+	if out.Prefix != "tenants/t/tenant-a/" {
+		t.Fatalf("prefix=%s", out.Prefix)
+	}
+	if out.Endpoint != "http://127.0.0.1:19000" || out.Bucket != "drive9-local" || !out.ForcePathStyle {
+		t.Fatalf("endpoint/bucket/path-style = %s %s %v", out.Endpoint, out.Bucket, out.ForcePathStyle)
+	}
+}
+
+func TestCanMintStaticFalseWithoutEndpointOrKeys(t *testing.T) {
+	if (&AWSS3Client{staticAccessKeyID: "ak", staticSecretAccessKey: "sk"}).CanMintStatic() {
+		t.Fatal("AWS default endpoint must not mint static keys")
+	}
+	if (&AWSS3Client{endpoint: "http://127.0.0.1:19000"}).CanMintStatic() {
+		t.Fatal("missing keys must not mint static")
+	}
+	stsReady := &AWSS3Client{
+		sts:                   &sts.Client{},
+		roleARN:               "arn:aws:iam::1:role/r",
+		staticAccessKeyID:     "ak",
+		staticSecretAccessKey: "sk",
+		endpoint:              "http://127.0.0.1:19000",
+	}
+	if !stsReady.CanMintSTS() {
+		t.Fatal("CanMintSTS=false with role")
+	}
+	if stsReady.CanMintStatic() {
+		t.Fatal("STS-capable client must not fall back to static mint")
 	}
 }
 
@@ -388,5 +446,100 @@ func assertSSEKMSHeaders(t *testing.T, mode types.ServerSideEncryption, keyID *s
 		if got[k] != want {
 			t.Fatalf("context[%q] = %q, want %q", k, got[k], want)
 		}
+	}
+}
+
+type sessionPolicyDoc struct {
+	Version    string `json:"Version"`
+	Statements []struct {
+		Effect    string   `json:"Effect"`
+		Action    []string `json:"Action"`
+		Resource  string   `json:"Resource"`
+		Condition struct {
+			StringLike map[string][]string `json:"StringLike"`
+		} `json:"Condition"`
+	} `json:"Statement"`
+}
+
+func parseSessionPolicy(t *testing.T, policy string) sessionPolicyDoc {
+	t.Helper()
+	var doc sessionPolicyDoc
+	if err := json.Unmarshal([]byte(policy), &doc); err != nil {
+		t.Fatalf("session policy is not valid JSON: %v (%s)", err, policy)
+	}
+	return doc
+}
+
+func TestTenantPrefixSessionPolicyScopesToTenantPrefix(t *testing.T) {
+	const (
+		bucket = "drive9-bucket"
+		prefix = "tenants/t/tenant-a/"
+	)
+	raw := tenantPrefixSessionPolicy(bucket, prefix)
+	doc := parseSessionPolicy(t, raw)
+	if doc.Version != "2012-10-17" {
+		t.Fatalf("version = %q, want 2012-10-17", doc.Version)
+	}
+	if len(doc.Statements) != 2 {
+		t.Fatalf("statements = %d, want 2 (objects + bucket listing)", len(doc.Statements))
+	}
+	objectStmt, bucketStmt := doc.Statements[0], doc.Statements[1]
+	if objectStmt.Effect != "Allow" || bucketStmt.Effect != "Allow" {
+		t.Fatalf("effects = %q/%q, want Allow/Allow", objectStmt.Effect, bucketStmt.Effect)
+	}
+	if want := "arn:aws:s3:::" + bucket + "/" + prefix + "*"; objectStmt.Resource != want {
+		t.Fatalf("object resource = %q, want %q", objectStmt.Resource, want)
+	}
+	if want := "arn:aws:s3:::" + bucket; bucketStmt.Resource != want {
+		t.Fatalf("bucket resource = %q, want %q", bucketStmt.Resource, want)
+	}
+	wantObjectActions := map[string]bool{
+		"s3:GetObject":                true,
+		"s3:PutObject":                true,
+		"s3:AbortMultipartUpload":     true,
+		"s3:ListMultipartUploadParts": true,
+	}
+	if len(objectStmt.Action) != len(wantObjectActions) {
+		t.Fatalf("object actions = %v, want exactly %d actions", objectStmt.Action, len(wantObjectActions))
+	}
+	for _, action := range objectStmt.Action {
+		if !wantObjectActions[action] {
+			t.Fatalf("unexpected object action %q (policy=%s)", action, raw)
+		}
+	}
+	if strings.Contains(raw, "s3:DeleteObject") {
+		t.Fatalf("policy must not grant s3:DeleteObject (block GC runs server-side): %s", raw)
+	}
+	wantBucketActions := map[string]bool{"s3:ListBucket": true, "s3:ListBucketMultipartUploads": true}
+	if len(bucketStmt.Action) != len(wantBucketActions) {
+		t.Fatalf("bucket actions = %v, want exactly %d actions", bucketStmt.Action, len(wantBucketActions))
+	}
+	for _, action := range bucketStmt.Action {
+		if !wantBucketActions[action] {
+			t.Fatalf("unexpected bucket action %q (policy=%s)", action, raw)
+		}
+	}
+	gotPrefixes := bucketStmt.Condition.StringLike["s3:prefix"]
+	if len(gotPrefixes) != 1 || gotPrefixes[0] != prefix+"*" {
+		t.Fatalf("s3:prefix condition = %v, want [%q]", gotPrefixes, prefix+"*")
+	}
+}
+
+func TestTenantPrefixSessionPolicyReflectsBucketAndPrefix(t *testing.T) {
+	tests := []struct {
+		name   string
+		bucket string
+		prefix string
+	}{
+		{name: "root prefix", bucket: "b1", prefix: "t/x/"},
+		{name: "nested prefix", bucket: "b2", prefix: "tenants/t/y/"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := parseSessionPolicy(t, tenantPrefixSessionPolicy(tc.bucket, tc.prefix))
+			if got, want := doc.Statements[0].Resource, "arn:aws:s3:::"+tc.bucket+"/"+tc.prefix+"*"; got != want {
+				t.Fatalf("resource = %q, want %q", got, want)
+			}
+		})
 	}
 }

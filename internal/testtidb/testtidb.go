@@ -184,12 +184,31 @@ var resetDeleteQueries = []string{
 	"DELETE FROM quota_admission_locks",
 	"DELETE FROM file_gc_tasks",
 	"DELETE FROM semantic_tasks",
+	// The per-tenant LLM cost ledger outlives a test that fails before its own
+	// cleanup, and the quota tests assert on its total, so a leftover row turns
+	// one earlier failure into a permanently red package.
+	"DELETE FROM llm_usage",
 	"DELETE FROM file_nodes",
 	"DELETE FROM file_tags",
 	"DELETE FROM uploads",
 	"DELETE FROM inodes",
 	"DELETE FROM contents",
 	"DELETE FROM semantic",
+	"DELETE FROM jfs_edge",
+	"DELETE FROM jfs_chunk",
+	"DELETE FROM jfs_chunk_ref",
+	"DELETE FROM jfs_delslices",
+	"DELETE FROM jfs_sustained",
+	"DELETE FROM jfs_delfile",
+	"DELETE FROM jfs_flock",
+	"DELETE FROM jfs_plock",
+	"DELETE FROM jfs_session2",
+	"DELETE FROM jfs_setting",
+	"DELETE FROM jfs_symlink",
+	"DELETE FROM jfs_counter",
+	"DELETE FROM jfs_node",
+	"DELETE FROM slice_compact_tasks",
+	"DELETE FROM block_gc_tasks",
 }
 
 // ResetDBWithoutFiles is like ResetDB but for tests that intentionally drop

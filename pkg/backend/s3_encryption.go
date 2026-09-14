@@ -20,6 +20,18 @@ func (b *Dat9Backend) s3WriteEncryption(objectKey string) (s3client.EncryptionOp
 	return policy.EncryptionOpts(context), storageEncryptionModeFromS3(policy.Mode), policy.KMSKeyID
 }
 
+// ExtentObjectEncryption reports the resolved per-object SSE policy this
+// tenant's uploads use. The extent data plane cannot honour it: its blocks are
+// written by JuiceFS's S3 backend, which has no option to set SSE headers, so
+// the data-credential mint refuses instead of silently writing unencrypted
+// blocks on a deployment that requires them.
+func (b *Dat9Backend) ExtentObjectEncryption() (s3client.EncryptionMode, string) {
+	if b == nil {
+		return s3client.EncryptionModeNone, ""
+	}
+	return b.s3EncryptionPolicy.Mode, b.s3EncryptionPolicy.KMSKeyID
+}
+
 func storageEncryptionModeFromS3(mode s3client.EncryptionMode) datastore.StorageEncryptionMode {
 	switch mode {
 	case s3client.EncryptionModeLegacy:

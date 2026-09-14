@@ -117,12 +117,16 @@ jobs:
           cat /tmp/tidb-sql-ready.log >&2 || true
           exit 1
 
+      # Use the Makefile targets: a bare `CGO_ENABLED=0 go build` skips
+      # GO_TAGS, and the juicefs dependency needs `nogspt` for a CGO-free
+      # build (github.com/erikdubbelboer/gspt has no files without CGO), so
+      # the untagged form fails before the benchmarks start.
       - name: Build drive9 CLI
-        run: CGO_ENABLED=0 go build -o bin/drive9 ./cmd/drive9
+        run: make build-cli
 
       - name: Build drive9-server
         if: ${{ env.DRIVE9_SERVER_BIN == '' }}
-        run: CGO_ENABLED=0 go build -o bin/drive9-server ./cmd/drive9-server
+        run: make build-server
 
       - name: Cache blackbox dependencies
         uses: actions/cache@v4

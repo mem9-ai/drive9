@@ -34,6 +34,13 @@ const (
 	// resolutions after a key revocation. It is broadcast to every pod but does
 	// not touch tenant metrics for live tenants.
 	WorkAPIKeyCacheCleanup = meta.TenantNotifyWorkAPIKeyCacheCleanup
+	// WorkExtent (bit 5) selects the extent data-plane maintenance jobs (block
+	// GC, stale-session sweep, compact fallback). It is server-local: no tenant
+	// DB write path persists it and the outbox poller never dispatches it. The
+	// unified worker runs those jobs on every tenant kick and re-kicks itself
+	// with this bit while a job keeps completing a full batch; a distinct bit
+	// means such a re-kick cannot re-enter the semantic or file_gc drains.
+	WorkExtent = 1 << 5
 )
 
 // Compile-time assertions that the server-side work mask constants match the
@@ -45,4 +52,9 @@ var (
 	_ = [1]byte{}[backend.BackendWorkFileGC^WorkFileGC]
 	_ = [1]byte{}[backend.BackendWorkMetricsCleanup^WorkMetricsCleanup]
 	_ = [1]byte{}[backend.BackendWorkAPIKeyCacheCleanup^WorkAPIKeyCacheCleanup]
+	// WorkExtent must stay clear of every persisted bit: the outbox poller
+	// would silently drop a tenant work_mask bit it does not know, and the
+	// worker would then read extent work as semantic/file_gc work (or the
+	// reverse). The build fails here if the two ever overlap.
+	_ = [1]byte{}[WorkExtent&(WorkSSE|WorkSemantic|WorkFileGC|WorkMetricsCleanup|WorkAPIKeyCacheCleanup)]
 )

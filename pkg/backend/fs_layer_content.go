@@ -197,6 +197,12 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 		if err != nil {
 			return err
 		}
+		// An extent file's bytes belong to the JuiceFS data plane; committing a
+		// stored layer object onto it would leave the projection advertising
+		// extent while the object held the new bytes.
+		if currentMeta.ContentLayout == datastore.ContentLayoutExtent {
+			return fmt.Errorf("%w: %s", ErrExtentLayoutWrite, canonical)
+		}
 		oldStorageType = currentMeta.StorageType
 		oldStorageRef = currentMeta.StorageRef
 		oldSize = currentMeta.SizeBytes

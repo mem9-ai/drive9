@@ -244,6 +244,13 @@ func (b *Dat9Backend) batchWriteOverwriteTx(ctx context.Context, tx *sql.Tx, res
 	if err != nil {
 		return err
 	}
+	// An extent file's bytes belong to the JuiceFS data plane. Writing db9
+	// content here would leave file_nodes.content_layout=extent while the blob
+	// held the new bytes: mounts would keep serving the stale jfs data and the
+	// classic readers would see the new one.
+	if meta.ContentLayout == datastore.ContentLayoutExtent {
+		return fmt.Errorf("%w: %s", ErrExtentLayoutWrite, item.path)
+	}
 	if item.expectedRevision > 0 && meta.Revision != item.expectedRevision {
 		return datastore.ErrRevisionConflict
 	}
@@ -321,5 +328,7 @@ func isBatchWritePerItemError(err error) bool {
 		errors.Is(err, ErrStorageQuotaExceeded) ||
 		errors.Is(err, ErrMediaLLMQuotaExceeded) ||
 		errors.Is(err, datastore.ErrInvalidRootDentry) ||
-		errors.Is(err, ErrBatchWriteDirectory)
+		errors.Is(err, ErrBatchWriteDirectory) ||
+		// Per item, not per batch: one extent target must not fail the others.
+		errors.Is(err, ErrExtentLayoutWrite)
 }

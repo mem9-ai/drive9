@@ -10,9 +10,11 @@ import (
 )
 
 const (
-	defaultMountProfile  = "coding-agent"
-	noneMountProfile     = "none"
-	portableMountProfile = "portable"
+	defaultMountProfile           = "coding-agent"
+	codingAgentExtentMountProfile = "coding-agent-extent"
+	noneMountProfile              = "none"
+	extentMountProfile            = "extent"
+	portableMountProfile          = "portable"
 )
 
 type profileConfig struct {
@@ -22,6 +24,7 @@ type profileConfig struct {
 	RemoteOnlyPatterns []string
 	AppendLogPatterns  []string
 	PackPaths          []string
+	ExtentPatterns     []string
 }
 
 func Profile(args []string) error {
@@ -76,6 +79,9 @@ func loadProfileConfig(name string) (profileConfig, error) {
 	if name == noneMountProfile {
 		return builtinNoneProfile(), nil
 	}
+	if name == extentMountProfile {
+		return builtinExtentProfile(), nil
+	}
 	if name == "interactive" {
 		return profileConfig{Name: "interactive", Source: "builtin:interactive"}, nil
 	}
@@ -92,6 +98,9 @@ func loadProfileConfig(name string) (profileConfig, error) {
 	}
 	if name == defaultMountProfile {
 		return builtinCodingAgentProfile(), nil
+	}
+	if name == codingAgentExtentMountProfile {
+		return builtinCodingAgentExtentProfile(), nil
 	}
 	if name == portableMountProfile {
 		return builtinPortableProfile(), nil
@@ -139,6 +148,14 @@ func builtinNoneProfile() profileConfig {
 	return profileConfig{Name: noneMountProfile, Source: "builtin:none"}
 }
 
+func builtinExtentProfile() profileConfig {
+	return profileConfig{
+		Name:           extentMountProfile,
+		Source:         "builtin:extent",
+		ExtentPatterns: []string{"*"},
+	}
+}
+
 func builtinCodingAgentProfile() profileConfig {
 	return profileConfig{
 		Name:               defaultMountProfile,
@@ -158,6 +175,14 @@ func builtinPortableProfile() profileConfig {
 		RemoteOnlyPatterns: nil,
 		PackPaths:          []string{"/"},
 	}
+}
+
+func builtinCodingAgentExtentProfile() profileConfig {
+	cfg := builtinCodingAgentProfile()
+	cfg.Name = codingAgentExtentMountProfile
+	cfg.Source = "builtin:coding-agent-extent"
+	cfg.ExtentPatterns = []string{"*"}
+	return cfg
 }
 
 func mergeProfileValues(groups ...[]string) []string {
@@ -217,7 +242,7 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")))
 			switch section {
-			case "local", "remote", "pack", "append-log":
+			case "local", "remote", "pack", "append-log", "extent":
 			default:
 				return profileConfig{}, fmt.Errorf("profile %q line %d: unknown section [%s]", name, lineNo+1, section)
 			}
@@ -232,6 +257,8 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 			cfg.PackPaths = append(cfg.PackPaths, line)
 		case "append-log":
 			cfg.AppendLogPatterns = append(cfg.AppendLogPatterns, line)
+		case "extent":
+			cfg.ExtentPatterns = append(cfg.ExtentPatterns, line)
 		}
 	}
 	return cfg, nil
@@ -247,6 +274,7 @@ func formatProfileConfig(cfg profileConfig) string {
 	writeProfileSection(&b, "remote", cfg.RemoteOnlyPatterns, "no remote override paths")
 	writeProfileSection(&b, "pack", cfg.PackPaths, "no automatic pack paths")
 	writeProfileSection(&b, "append-log", cfg.AppendLogPatterns, "no append-log optimization paths")
+	writeProfileSection(&b, "extent", cfg.ExtentPatterns, "no extent path patterns")
 	return b.String()
 }
 

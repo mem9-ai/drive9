@@ -160,8 +160,19 @@ func (s *Server) safetyNetScan(ctx context.Context) {
 				if n, err := store.CountQueuedFileGCTasks(ctx); err == nil && n > 0 {
 					needKick = true
 				}
+				// Extent maintenance is enqueued by the extent meta RPCs
+				// without a tenant kick and WorkExtent is deliberately not a
+				// persisted notification bit, so an extent-only tenant that
+				// only ever wrote through a mount that then went away would
+				// keep its deleted blocks and stale sessions forever. Probe
+				// for queued extent work here and kick that tenant.
+				mask := WorkSemantic | WorkFileGC
+				if pending, err := store.HasPendingExtentWork(ctx); err == nil && pending {
+					mask |= WorkExtent
+					needKick = true
+				}
 				if needKick && s.tenantWorker != nil {
-					s.tenantWorker.Kick(t.ID, WorkSemantic|WorkFileGC)
+					s.tenantWorker.Kick(t.ID, mask)
 				}
 			}()
 		}

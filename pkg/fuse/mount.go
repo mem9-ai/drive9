@@ -61,6 +61,7 @@ type MountOptions struct {
 	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for overlay-profile mounts
 	AppendLogPatterns       []string      // remote-persistent files eligible for append-log synchronization
 	PackPaths               []string      // local overlay paths auto-packed after unmount
+	ExtentPaths             []string      // path globs created as content_layout=extent
 	CommitQueueMaxPending   int           // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
 	WriteBackBatchWindow    time.Duration // writeback-only small-file batch window (default 0 disabled)
 	WriteBackBatchMaxFiles  int           // maximum files in one writeback batch (default 64 when enabled)
@@ -438,6 +439,12 @@ func Mount(opts *MountOptions) (err error) {
 			mountHash = MountLayerHash(opts.Server, opts.MountPoint, opts.RemoteRoot, opts.LayerRef, opts.CheckpointRef)
 		}
 		dat9fs.appendLogSnapshotRoot = filepath.Join(cacheBase, mountHash, "append-log-snapshots")
+		// The extent data plane keeps its own JuiceFS read block cache under
+		// the same mount-scoped root (jfs/ inside it), so an extent mount gets
+		// a persistent block cache even when --cache-dir is not passed. This
+		// is a read cache: chunk-store staging is off, so nothing dirty lives
+		// here.
+		dat9fs.extentCacheDir = filepath.Join(cacheBase, mountHash)
 		readCacheHash := MountReadCacheHash(opts.Server, opts.MountPoint, opts.RemoteRoot, mountCredentialKind(opts), mountCredentialSecret(opts))
 		readCacheDir := filepath.Join(cacheBase, readCacheHash, "read")
 		diskReadCache, err := NewDiskReadCache(DiskReadCacheOptions{

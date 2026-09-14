@@ -63,6 +63,7 @@ type fakeMetaQuotaStore struct {
 	getReservationErr           error // injected into GetUploadReservation to simulate transient DB error
 	inTxHook                    func(context.Context) error
 	alreadyAppliedOnMarkErr     map[int64]bool
+	extentReported              map[string]int64
 }
 
 func (f *fakeMetaQuotaStore) EnqueueObjectGCCandidate(_ context.Context, c *meta.ObjectGCCandidateInput) error {
@@ -81,12 +82,13 @@ func (f *fakeMetaQuotaStore) EnqueueObjectGCCandidate(_ context.Context, c *meta
 
 func newFakeMetaQuotaStore() *fakeMetaQuotaStore {
 	return &fakeMetaQuotaStore{
-		usage:        make(map[string]*QuotaUsageView),
-		config:       make(map[string]*QuotaConfigView),
-		fileMeta:     make(map[string]*FileMetaView),
-		reservations: make(map[string]*UploadReservationView),
-		monthly:      make(map[string]int64),
-		nextID:       1,
+		usage:          make(map[string]*QuotaUsageView),
+		config:         make(map[string]*QuotaConfigView),
+		fileMeta:       make(map[string]*FileMetaView),
+		reservations:   make(map[string]*UploadReservationView),
+		monthly:        make(map[string]int64),
+		extentReported: make(map[string]int64),
+		nextID:         1,
 	}
 }
 
@@ -205,6 +207,27 @@ func (f *fakeMetaQuotaStore) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID 
 
 // IncrQuotaUsageCountersTx mirrors the real Store contract: one combined
 // counter update, skipping entirely (no recorded call) on all-zero deltas.
+func (f *fakeMetaQuotaStore) GetExtentReportedBytes(ctx context.Context, tenantID string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.extentReported[tenantID], nil
+}
+
+func (f *fakeMetaQuotaStore) ApplyExtentUsageRangeTx(tx *sql.Tx, tenantID string, fromTotal, toTotal int64) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Mirrors the real UPDATE ... WHERE extent_reported_bytes = ? exactly:
+	// only the watermark moves here — the storage_bytes delta is returned to
+	// the caller as quotaCounterDeltas and flushed through
+	// IncrQuotaUsageCountersTx ("hot row last"). A missing entry is the
+	// column's zero default, matching a tenant row that never reported.
+	if cur := f.extentReported[tenantID]; cur != fromTotal {
+		return false, nil
+	}
+	f.extentReported[tenantID] = toTotal
+	return true, nil
+}
+
 func (f *fakeMetaQuotaStore) IncrQuotaUsageCountersTx(tx *sql.Tx, tenantID string, storageDelta, fileDelta, mediaDelta, reservedDelta int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

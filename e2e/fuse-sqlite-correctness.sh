@@ -204,6 +204,9 @@ start_mount() {
   if [ "$FUSE_SQLITE_MOUNT_DEBUG" = "1" ]; then
     mount_args+=(--debug)
   fi
+  if [ -n "${FUSE_PROFILE:-}" ]; then
+    mount_args+=(--profile "$FUSE_PROFILE")
+  fi
   mount_args+=("$MOUNT_POINT")
   {
     echo "=== drive9 sqlite mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="

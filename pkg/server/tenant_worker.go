@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/failpoint"
@@ -15,6 +16,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/embedding"
+	"github.com/mem9-ai/drive9/pkg/extent"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
@@ -174,6 +176,16 @@ type tenantWorkerManager struct {
 	lastMaintenance   map[string]time.Time
 	semanticMetricOrg map[string]string // tenantID -> org used by the last semantic gauge observation
 
+	// extentRuntimes caches one JuiceFS data-plane Runtime per tenant for the
+	// extent jobs (block GC / session sweep / compact fallback); see
+	// extentRuntimePool.
+	extentRuntimes *extentRuntimePool
+
+	// ownsTenant gates work that must not be duplicated across pods. It is set
+	// from the shard resolver once the pod ring exists (SetOwnsTenant) and reads
+	// as "owns everything" until then, which is the single-pod answer.
+	ownsTenant atomic.Pointer[func(string) bool]
+
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -223,6 +235,7 @@ func newTenantWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Store
 	m.kickPending = make(map[string]pendingKick)
 	m.lastMaintenance = make(map[string]time.Time)
 	m.semanticMetricOrg = make(map[string]string)
+	m.extentRuntimes = newExtentRuntimePool()
 	m.kicks = make(chan kickMsg, tenantKickQueueCapacity)
 	return m
 }
@@ -267,6 +280,33 @@ func (m *tenantWorkerManager) KickWithOrg(tenantID, tidbCloudOrgID string, workM
 	}
 }
 
+// SetOwnsTenant installs the shard-ownership predicate used to gate work that
+// must not run on two pods at once (the extent quota report). It is the single
+// install path — the options struct deliberately has no field for it, because
+// the resolver that owns the ring is built after the manager — and it is safe to
+// call once the workers are running. A nil predicate means this pod owns
+// everything, which is the single-pod answer.
+func (m *tenantWorkerManager) SetOwnsTenant(fn func(string) bool) {
+	if m == nil {
+		return
+	}
+	if fn == nil {
+		fn = func(string) bool { return true }
+	}
+	m.ownsTenant.Store(&fn)
+}
+
+// ownsTenantWork reports whether this pod owns tenantID's sharded work.
+func (m *tenantWorkerManager) ownsTenantWork(tenantID string) bool {
+	if m == nil {
+		return false
+	}
+	if fn := m.ownsTenant.Load(); fn != nil {
+		return (*fn)(tenantID)
+	}
+	return true
+}
+
 // ForgetTenant drops process-local scheduler bookkeeping after the tenant
 // lifecycle has durably entered deletion. A queued kick may still be present
 // in the channel, but processKicked will reject it against the persisted
@@ -280,6 +320,9 @@ func (m *tenantWorkerManager) ForgetTenant(tenantID string) {
 	delete(m.lastMaintenance, tenantID)
 	delete(m.semanticMetricOrg, tenantID)
 	m.mu.Unlock()
+	// A deleted tenant needs no background work: drop its cached extent
+	// runtime so its JuiceFS session does not outlive the tenant.
+	m.extentRuntimes.forget(tenantID)
 }
 
 func mergeKickOrgID(current, next string) string {
@@ -369,6 +412,9 @@ func (m *tenantWorkerManager) Stop() {
 	m.cancel()
 	m.wg.Wait()
 	m.cancel = nil
+	// No worker can be using a cached extent runtime now; close them so their
+	// JuiceFS sessions end with the worker.
+	m.extentRuntimes.closeAll()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.processing = 0
@@ -452,6 +498,15 @@ func (m *tenantWorkerManager) shouldPollFallback() bool {
 func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID, tidbCloudOrgID string, workMask int) {
 	// Do NOT clear kickPending here — a kick coalesced while this message was
 	// in the channel must be consumed after acquiring the tenant slot.
+	// Snapshot the extent runtime's retirement generation BEFORE proving the
+	// tenant alive: a deletion that lands anywhere after this read must not let
+	// this kick rebuild a Runtime for a tenant nothing will drain (see
+	// drainExtentMaintenance). Reading it after kickRef could adopt a generation
+	// bumped by a forget in between, and reading it later still — after the
+	// semantic drain below, which can take seconds — would miss even more. A
+	// stale value can only cause a refusal, never a build, so the earliest read
+	// strictly dominates.
+	retireGen := m.extentRuntimes.retirementGeneration(tenantID)
 	ref, ok := m.kickRef(ctx, tenantID)
 	if !ok {
 		m.clearKickPending(tenantID)
@@ -493,6 +548,18 @@ func (m *tenantWorkerManager) processKicked(ctx context.Context, tenantID, tidbC
 		if semanticDrained >= tenantKickDrainLimit {
 			reKickMask |= WorkSemantic
 		}
+	}
+
+	// Extent data-plane maintenance runs on its own work bit, on every tenant
+	// kick, BEFORE the file_gc drain: folding it into drainFileGC's
+	// "file_gc queue is empty" branch starved it whenever file_gc had a
+	// backlog. The bit is a re-kick token: it never re-enters the semantic or
+	// file_gc drains.
+	//
+	// retireGen was snapshotted before this kick proved the tenant alive; the
+	// extent pool refuses to build a Runtime for a tenant retired since.
+	if m.drainExtentMaintenance(ctx, target, retireGen) {
+		reKickMask |= WorkExtent
 	}
 
 	// Drain file_gc tasks (if selected).
@@ -551,6 +618,186 @@ func (m *tenantWorkerManager) drainFileGC(ctx context.Context, target *tenantTar
 		}
 	}
 	return true // drained the full batch — likely more remains
+}
+
+// drainExtentMaintenance runs the extent data-plane jobs for one tenant: the
+// jfs_delfile safety net, block GC (object deletes for superseded slices), the
+// stale-session sweep, and one compact-fallback task. It is the extent work
+// type's drain, with the same shape as drainFileGC, and it runs on every
+// tenant kick so a busy file_gc queue cannot starve it.
+//
+// Returns true when a job completed a full batch, i.e. more work is likely
+// waiting. Jobs that make no progress (a failing object store, a no-op
+// compaction, a compact task that is still leased) report false, so a stuck
+// task can never make the worker spin on its own re-kick.
+func (m *tenantWorkerManager) drainExtentMaintenance(ctx context.Context, target *tenantTarget, retirementGen uint64) (more bool) {
+	if ctx.Err() != nil || m == nil || m.extentRuntimes == nil || target == nil || target.store == nil || target.backend == nil {
+		return false
+	}
+	s3 := target.backend.S3()
+	if s3 == nil {
+		return false
+	}
+	drained := runExtentFileGC(ctx, target.store)
+	swept := runExtentSessionSweep(ctx, target.store)
+	deleted := runExtentBlockGC(ctx, target.store, s3, target.tenantID)
+	// Report the extent data plane's bytes to the central quota counters. The
+	// extent write path cannot do it per write (that is one more control-plane
+	// INSERT on the hot path), and the classic file mutations never see these
+	// files because their size lives in jfs_node; this pass is the one place
+	// that already has the tenant store and the backend together.
+	//
+	// Only the shard owner reports: the report is a read-modify-write of the
+	// tenant's marker plus an additive central mutation, and every pod runs this
+	// maintenance pass for tenants it serves (the worker is not leader-gated),
+	// so two reporters would each add the same delta. The other jobs in this pass
+	// need no owner either: the compact fallback below is claimed through a lease
+	// in the database, and the drains above are idempotent by delete/mark, so a
+	// second pod repeats work but cannot corrupt it.
+	if m.ownsTenantWork(target.tenantID) {
+		reportExtentQuotaUsage(ctx, target)
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	// The compactor reuses one runtime per tenant; building a runtime is not
+	// itself completed work, so it does not feed the re-kick decision.
+	if err := m.extentRuntimes.withRuntime(target.tenantID, retirementGen, target.store, s3, func(rt *extent.Runtime) error {
+		runExtentCompactFallback(ctx, target.store, target.tenantID, rt)
+		return nil
+	}); err != nil {
+		logger.Warn(ctx, "tenant_worker_extent_runtime_failed",
+			zap.String("tenant_id", target.tenantID), zap.Error(err))
+	}
+	return drained >= extentFileGCBatchSize ||
+		swept >= extentSessionSweepBatch ||
+		deleted >= extentBlockGCBatchSize
+}
+
+// extentQuotaLeaseReleaseTimeout bounds the post-report lease release, which runs
+// on a context detached from the pass so a cancelled kick still releases it.
+const extentQuotaLeaseReleaseTimeout = 5 * time.Second
+
+// reportExtentQuotaUsage pushes the extent data plane's byte change into the
+// tenant's central quota counters as an absolute range — from the central
+// extent watermark to the current tenant total — not as a relative delta.
+//
+// The report path still spans two stores: the mutation log insert and its
+// apply (central) and the tenant-side marker commit (tenant DB). A crash or
+// failed marker commit between them re-reports the same range, so the apply
+// itself must be idempotent: it compare-and-sets the central watermark and
+// no-ops unless it still equals the range's start. A relative delta would
+// apply twice into counters nothing recomputes — over-counting growth, and
+// permanently under-counting after a retried shrink. Duplicate log rows are
+// the expected residue of that retry window; each is marked applied when its
+// (already superseded) range no-ops.
+//
+// The tenant marker remains the admission-side cache (ExtentUnreportedUsage
+// Bytes) and is only repaired here, never trusted for correctness. Concurrent
+// reporters are excluded by the tenant-DB lease around this function, which
+// expires so a dead reporter only delays the next pass.
+func reportExtentQuotaUsage(ctx context.Context, target *tenantTarget) {
+	if target == nil || target.store == nil || target.backend == nil {
+		return
+	}
+	// Cheap filter first: most kicks have no growth to report, and a claim plus a
+	// release is two write transactions on a row this pass would not touch. The
+	// marker is the cheap input, but it is not the whole story: the marker
+	// advances when a report is enqueued, while the central watermark moves
+	// only when the apply lands. A pending or superseded apply can leave the
+	// watermark off the tenant total with the marker exactly right, and an
+	// idle tenant would carry that difference in the central counters forever
+	// — so a settled marker also has to confirm the watermark before opting
+	// out. One central read per maintenance pass; only a real disagreement
+	// is worth the lease.
+	total, markerDelta, perr := target.store.PeekExtentUsageDelta(ctx)
+	if perr != nil {
+		logger.Warn(ctx, "tenant_worker_extent_quota_delta_failed",
+			zap.String("tenant_id", target.tenantID), zap.Error(perr))
+		return
+	} else if markerDelta == 0 {
+		reported, rerr := target.backend.ExtentUsageReported(ctx)
+		if rerr != nil {
+			logger.Warn(ctx, "tenant_worker_extent_quota_reported_read_failed",
+				zap.String("tenant_id", target.tenantID), zap.Error(rerr))
+			return
+		}
+		if reported == total {
+			return
+		}
+		// marker settled, watermark is not: fall through and reconcile below.
+	}
+	// One reporter per tenant, cluster-wide. The shard gate above already means
+	// only the owner reports, but a ring transition can hand the tenant over
+	// while a report is in flight and both pods would then push the same delta;
+	// the lease closes that window and expires, so a crashed reporter cannot
+	// block reporting for ever.
+	token, ok, err := target.store.ClaimExtentUsageReport(ctx)
+	if err != nil {
+		logger.Warn(ctx, "tenant_worker_extent_quota_lease_failed",
+			zap.String("tenant_id", target.tenantID), zap.Error(err))
+		return
+	}
+	if !ok {
+		return
+	}
+	defer func() {
+		// Detached: a cancelled pass must still hand the lease back, or the next
+		// report waits for the TTL. A failure here is only a delay, so it is
+		// logged rather than propagated.
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), extentQuotaLeaseReleaseTimeout)
+		defer cancel()
+		if rerr := target.store.ReleaseExtentUsageReport(releaseCtx, token); rerr != nil {
+			logger.Warn(releaseCtx, "tenant_worker_extent_quota_lease_release_failed",
+				zap.String("tenant_id", target.tenantID), zap.Error(rerr))
+		}
+	}()
+	// The totals the report uses are the ones read under the lease: another
+	// reporter may have covered the growth this pass saw before the lease was
+	// granted. The range starts at the central watermark — not at the tenant
+	// marker — because that watermark is what the apply compare-and-sets; the
+	// two can differ exactly in the retry window this design exists for.
+	total, markerDelta, err = target.store.PeekExtentUsageDelta(ctx)
+	if err != nil {
+		logger.Warn(ctx, "tenant_worker_extent_quota_delta_failed",
+			zap.String("tenant_id", target.tenantID), zap.Error(err))
+		return
+	}
+	reported, err := target.backend.ExtentUsageReported(ctx)
+	if err != nil {
+		logger.Warn(ctx, "tenant_worker_extent_quota_reported_read_failed",
+			zap.String("tenant_id", target.tenantID), zap.Error(err))
+		return
+	}
+	if reported == total {
+		// Nothing to push. If the tenant marker still disagrees, the last
+		// report's marker commit failed after the central apply landed —
+		// re-sync it so the admission cache stops over-counting the bytes
+		// central already carries.
+		if markerDelta != 0 {
+			if serr := target.store.SetExtentUsageReported(ctx, total); serr != nil {
+				logger.Warn(ctx, "tenant_worker_extent_quota_marker_resync_failed",
+					zap.String("tenant_id", target.tenantID), zap.Error(serr))
+			}
+		}
+		return
+	}
+	if err := target.backend.ReportExtentUsageRange(ctx, reported, total); err != nil {
+		logger.Warn(ctx, "tenant_worker_extent_quota_report_failed",
+			zap.String("tenant_id", target.tenantID),
+			zap.Int64("from_total", reported), zap.Int64("to_total", total), zap.Error(err))
+		return
+	}
+	// Set, not CAS: the marker records what this lease pushed — the range up
+	// to total — and the expected value a CAS would need (the watermark) can
+	// legitimately differ from the marker's current value when an earlier
+	// report's marker commit outlived its apply. A marker that lands stale is
+	// the safe direction (admission over-counts until the next pass); one that
+	// fails to land here is healed by the resync branch above.
+	if err := target.store.SetExtentUsageReported(ctx, total); err != nil {
+		logger.Warn(ctx, "tenant_worker_extent_quota_commit_failed",
+			zap.String("tenant_id", target.tenantID), zap.Int64("total", total), zap.Error(err))
+	}
 }
 
 // recoverExpired recovers expired semantic task leases for the tenant.

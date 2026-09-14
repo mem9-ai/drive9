@@ -456,10 +456,17 @@ func TestStoreRejectsRootPathWrites(t *testing.T) {
 	if _, err := s.RenameFileReplacingTarget(context.Background(), "/", "/dst.txt", "/", "dst.txt"); !errors.Is(err, ErrInvalidRootDentry) {
 		t.Fatalf("RenameFileReplacingTarget root source error = %v, want %v", err, ErrInvalidRootDentry)
 	}
-	if err := s.LinkFileNodeTx(context.Background(), s.DB(), "/src.txt", "/", "/", "root-alias", "link-root", now); !errors.Is(err, ErrInvalidRootDentry) {
+	// Root-path rejection happens before any statement, so these use a real
+	// transaction the way every production caller does.
+	linkTx, err := s.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = linkTx.Rollback() }()
+	if err := s.LinkFileNodeTx(context.Background(), linkTx, "/src.txt", "/", "/", "root-alias", "link-root", now); !errors.Is(err, ErrInvalidRootDentry) {
 		t.Fatalf("LinkFileNodeTx root destination error = %v, want %v", err, ErrInvalidRootDentry)
 	}
-	if err := s.LinkFileNodeTx(context.Background(), s.DB(), "/", "/dst.txt", "/", "dst.txt", "link-dst", now); !errors.Is(err, ErrInvalidRootDentry) {
+	if err := s.LinkFileNodeTx(context.Background(), linkTx, "/", "/dst.txt", "/", "dst.txt", "link-dst", now); !errors.Is(err, ErrInvalidRootDentry) {
 		t.Fatalf("LinkFileNodeTx root source error = %v, want %v", err, ErrInvalidRootDentry)
 	}
 }

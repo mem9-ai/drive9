@@ -107,6 +107,23 @@ func (fs *Dat9FS) Drain(ctx context.Context) mountcontrol.DrainResponse {
 		resp.Finish(time.Now().UTC())
 		return resp
 	}
+	if !runPhase("flush_extent", func() error {
+		if err := ctx.Err(); err != nil {
+			return newDrainContextError(err)
+		}
+		v := fs.extentVFS()
+		if v == nil {
+			return nil
+		}
+		if err := v.FlushAll(""); err != nil {
+			return err
+		}
+		return nil
+	}) {
+		resp.Pending = fs.snapshotDrainPending()
+		resp.Finish(time.Now().UTC())
+		return resp
+	}
 	if !runPhase("git_overlay", func() error {
 		if err := fs.waitGitOverlayWrites(ctx); err != nil {
 			return err
@@ -249,6 +266,13 @@ func (fs *Dat9FS) drainHandleLocked(ctx context.Context, fh *FileHandle) gofuse.
 	if fh != nil && fh.Layer == PathLayerGitWorkspace {
 		return fs.flushGitHandleLockedWithPolicy(ctx, fh, true)
 	}
+	if fh.isExtent() {
+		jctx := fs.jfsCtx(0, 0, 0)
+		if st := fs.extentFlush(jctx, fh, 0); st != gofuse.OK {
+			return st
+		}
+		return fs.extentFsync(jctx, fh, 0)
+	}
 	return fs.flushHandle(ctx, fh)
 }
 
@@ -350,6 +374,9 @@ func drainPendingHasUndrainedWork(p mountcontrol.DrainPending) bool {
 
 func drainHandleHasDirtyStateLocked(fh *FileHandle) bool {
 	if fh == nil {
+		return false
+	}
+	if fh.isExtent() {
 		return false
 	}
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {

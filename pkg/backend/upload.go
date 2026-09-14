@@ -183,6 +183,13 @@ func (b *Dat9Backend) supersedeActiveUpload(ctx context.Context, op string, exis
 }
 
 func (b *Dat9Backend) validateUploadTargetRevision(ctx context.Context, path string, expectedRevision int64) (*datastore.NodeWithFile, bool, error) {
+	// Refuse a multipart upload onto an extent file before spending an object
+	// PUT on it. The extent data plane owns those bytes. finalizeUpload checks
+	// again inside its transaction, because the target can become an extent
+	// file between initiate and confirm.
+	if err := b.refuseExtentWholeObjectWrite(ctx, path); err != nil {
+		return nil, false, err
+	}
 	nf, err := b.store.Stat(ctx, path)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
@@ -1113,6 +1120,13 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			stepStart = time.Now()
 			meta, err := b.store.GetFileStorageMetaForUpdateTx(tx, existingFileID.String)
 			if err == nil {
+				// The target became an extent file after initiate (or the
+				// initial check raced a mount). Committing here would leave the
+				// projection advertising extent while the uploaded object was
+				// unreferenced and the old jfs bytes kept being served.
+				if meta.ContentLayout == datastore.ContentLayoutExtent {
+					return fmt.Errorf("%w: %s", ErrExtentLayoutWrite, upload.TargetPath)
+				}
 				oldStorageType = meta.StorageType
 				oldStorageRef = meta.StorageRef
 				oldSizeBytes = meta.SizeBytes

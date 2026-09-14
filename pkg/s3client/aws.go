@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -23,10 +25,21 @@ import (
 )
 
 type AWSS3Client struct {
-	client  *s3.Client
-	presign *s3.PresignClient
-	bucket  string
-	prefix  string
+	client         *s3.Client
+	presign        *s3.PresignClient
+	sts            *sts.Client
+	bucket         string
+	prefix         string
+	region         string
+	endpoint       string
+	forcePathStyle bool
+	roleARN        string
+	// staticAccessKeyID/staticSecretAccessKey are the keys the server itself
+	// uses. When STS is not configured they are minted to extent clients as a
+	// stand-in session (local MinIO). They are never a tenant-scoped IAM policy.
+	staticAccessKeyID     string
+	staticSecretAccessKey string
+	staticSessionToken    string
 }
 
 type AWSConfig struct {
@@ -84,14 +97,25 @@ func applyS3Options(cfg AWSConfig) func(*s3.Options) {
 			o.BaseEndpoint = aws.String(cfg.Endpoint)
 		}
 		o.UsePathStyle = cfg.ForcePathStyle
-		if isTencentEndpoint(cfg.Endpoint) {
-			o.HTTPClient = &http.Client{
-				Transport: &contentMD5Transport{base: http.DefaultTransport},
-			}
-		}
 	}
 }
 
+// contentMD5Transport adds the Content-MD5 header that S3 requires for
+// Multi-Object Delete (POST ?delete).
+//
+// The API reference is explicit — "The Content-MD5 request header is required
+// for all Multi-Object Delete requests" (directory buckets accept an
+// `x-amz-checksum-*` header instead) — but aws-sdk-go-v2 stopped adding it when
+// it moved to flexible checksums (it builds the request without a body
+// checksum under RequestChecksumCalculationWhenRequired). S3-compatible stores
+// enforce the documented requirement: MinIO answers
+// `400 MissingContentMD5: Missing required header for this request: Content-Md5`
+// and tenant deletion then never purges the tenant's objects. AWS itself
+// currently tolerates the omission, which is not a contract we want to rely on.
+//
+// The header is set at the transport layer, after signing, exactly as the
+// previous Tencent-only path did: Content-MD5 is a standard header, not an
+// `x-amz-*` one, so S3 does not require it to be part of the signature.
 type contentMD5Transport struct {
 	base http.RoundTripper
 }
@@ -162,8 +186,17 @@ func buildS3Client(ctx context.Context, cfg AWSConfig, provider aws.CredentialsP
 
 	loadOptions := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
+		// drive9 streams several uploads (layer objects, large files) from a
+		// non-seekable request body. Since aws-sdk-go-v2 v1.90 the default
+		// request-checksum mode computes a header checksum, which requires a
+		// seekable body (or TLS + trailing checksum) and fails with
+		// "unseekable stream is not supported without TLS and trailing
+		// checksum". Keep the pre-1.90 behavior: only checksum when required.
+		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
-		awsconfig.WithHTTPClient(&http.Client{Transport: transport}),
+		// Every S3-compatible endpoint needs the Multi-Object Delete checksum
+		// header that the SDK no longer sends; see contentMD5Transport.
+		awsconfig.WithHTTPClient(&http.Client{Transport: &contentMD5Transport{base: transport}}),
 	}
 
 	if provider != nil {
@@ -175,10 +208,14 @@ func buildS3Client(ctx context.Context, cfg AWSConfig, provider aws.CredentialsP
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 
+	// mintSTS must be built from the ORIGINAL credentials. AssumeRole with a
+	// client built after the swap below would sign the call with a session of
+	// the very role it is assuming — a self-assume that only works when the
+	// role explicitly trusts itself.
+	mintSTS := sts.NewFromConfig(awsCfg)
 	if cfg.RoleARN != "" {
-		stsClient := sts.NewFromConfig(awsCfg)
 		awsCfg.Credentials = aws.NewCredentialsCache(
-			stscreds.NewAssumeRoleProvider(stsClient, cfg.RoleARN,
+			stscreds.NewAssumeRoleProvider(mintSTS, cfg.RoleARN,
 				func(o *stscreds.AssumeRoleOptions) {
 					o.RoleSessionName = "drive9-server"
 				},
@@ -189,10 +226,129 @@ func buildS3Client(ctx context.Context, cfg AWSConfig, provider aws.CredentialsP
 	client := s3.NewFromConfig(awsCfg, applyS3Options(cfg))
 	markS3ClientAvailable()
 	return &AWSS3Client{
-		client:  client,
-		presign: s3.NewPresignClient(client),
-		bucket:  cfg.Bucket,
-		prefix:  normalizePrefix(cfg.Prefix),
+		client:                client,
+		presign:               s3.NewPresignClient(client),
+		sts:                   mintSTS,
+		bucket:                cfg.Bucket,
+		prefix:                normalizePrefix(cfg.Prefix),
+		region:                cfg.Region,
+		endpoint:              cfg.Endpoint,
+		forcePathStyle:        cfg.ForcePathStyle,
+		roleARN:               cfg.RoleARN,
+		staticAccessKeyID:     cfg.AccessKeyID,
+		staticSecretAccessKey: cfg.SecretAccessKey,
+		staticSessionToken:    cfg.SessionToken,
+	}, nil
+}
+
+// TenantPrefixCreds are short-lived STS keys pinned to t/<tenant>/...
+type TenantPrefixCreds struct {
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string
+	Expiration      time.Time
+	Endpoint        string
+	Bucket          string
+	Region          string
+	ForcePathStyle  bool
+	Prefix          string
+}
+
+func (c *AWSS3Client) CanMintSTS() bool {
+	return c != nil && c.sts != nil && c.roleARN != ""
+}
+
+// CanMintStatic is true for S3-compatible stores that have static keys and no
+// STS role (local MinIO). The client still speaks S3; only the session is
+// the server's static keys plus a tenant prefix, not AssumeRole.
+func (c *AWSS3Client) CanMintStatic() bool {
+	return c != nil && !c.CanMintSTS() && c.staticAccessKeyID != "" && c.staticSecretAccessKey != "" && c.endpoint != ""
+}
+
+func (c *AWSS3Client) tenantPrefix(tenantID string) string {
+	return c.prefix + "t/" + tenantID + "/"
+}
+
+// MintStaticPrefix returns non-expiring S3 credentials for local MinIO. The
+// object store is the same as production, but IAM is NOT scoped: these are the
+// server's own static keys and the tenant prefix is only a client-side
+// convention, so a credential handed to one tenant can read and write every
+// other tenant's prefix. Only use it where all tenants are trusted (local
+// MinIO / dev); production mints per-tenant STS sessions with an inline
+// session policy instead (MintTenantPrefix).
+func (c *AWSS3Client) MintStaticPrefix(tenantID string) (*TenantPrefixCreds, error) {
+	if !c.CanMintStatic() {
+		return nil, fmt.Errorf("static s3 credentials are not configured")
+	}
+	return &TenantPrefixCreds{
+		AccessKeyID:     c.staticAccessKeyID,
+		SecretAccessKey: c.staticSecretAccessKey,
+		SessionToken:    c.staticSessionToken,
+		Endpoint:        c.endpoint,
+		Bucket:          c.bucket,
+		Region:          c.region,
+		ForcePathStyle:  c.forcePathStyle,
+		Prefix:          c.tenantPrefix(tenantID),
+	}, nil
+}
+
+// tenantPrefixSessionPolicy is the inline session policy attached to a
+// tenant-prefix AssumeRole. It is the only IAM scoping the extent data plane
+// gets, and its granularity is the tenant (= one JuiceFS volume): a fork is a
+// new tenant with a new prefix.
+//
+// Two deliberate choices:
+//   - no s3:DeleteObject. Block GC runs server-side on the tenant's behalf
+//     (pkg/server/extent_meta.go runExtentBlockGC), so a mount credential that
+//     leaks cannot delete objects.
+//   - the multipart actions are granted even though JuiceFS's Put is a single
+//     PutObject today, so enabling multipart upload does not start failing
+//     with AccessDenied.
+func tenantPrefixSessionPolicy(bucket, prefix string) string {
+	return fmt.Sprintf(`{"Version":"2012-10-17","Statement":[`+
+		`{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":"arn:aws:s3:::%s/%s*"},`+
+		`{"Effect":"Allow","Action":["s3:ListBucket","s3:ListBucketMultipartUploads"],"Resource":"arn:aws:s3:::%s","Condition":{"StringLike":{"s3:prefix":["%s*"]}}}]}`,
+		bucket, prefix, bucket, prefix)
+}
+
+func (c *AWSS3Client) MintTenantPrefix(ctx context.Context, tenantID string, ttl time.Duration) (*TenantPrefixCreds, error) {
+	if !c.CanMintSTS() {
+		return nil, fmt.Errorf("sts assume-role is not configured")
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	prefix := c.tenantPrefix(tenantID)
+	out, err := c.sts.AssumeRole(ctx, &sts.AssumeRoleInput{
+		RoleArn:         aws.String(c.roleARN),
+		RoleSessionName: aws.String("drive9-extent-" + tenantID),
+		DurationSeconds: aws.Int32(int32(ttl.Seconds())),
+		Policy:          aws.String(tenantPrefixSessionPolicy(c.bucket, prefix)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("assume role for tenant prefix: %w", err)
+	}
+	if out.Credentials == nil || out.Credentials.AccessKeyId == nil {
+		return nil, fmt.Errorf("assume role returned empty credentials")
+	}
+	exp := time.Now().Add(ttl)
+	if out.Credentials.Expiration != nil {
+		exp = *out.Credentials.Expiration
+	}
+	ep := c.endpoint
+	if ep == "" {
+		ep = "https://s3.amazonaws.com"
+	}
+	return &TenantPrefixCreds{
+		AccessKeyID:     aws.ToString(out.Credentials.AccessKeyId),
+		SecretAccessKey: aws.ToString(out.Credentials.SecretAccessKey),
+		SessionToken:    aws.ToString(out.Credentials.SessionToken),
+		Expiration:      exp,
+		Endpoint:        ep,
+		Bucket:          c.bucket,
+		Region:          c.region,
+		ForcePathStyle:  c.forcePathStyle,
+		Prefix:          prefix,
 	}, nil
 }
 
@@ -447,6 +603,23 @@ func (c *AWSS3Client) PutObject(ctx context.Context, key string, body io.Reader,
 	result := "ok"
 	defer func() { recordS3Operation("put_object", result, start) }()
 
+	// SigV4 over a plain-HTTP endpoint cannot use UNSIGNED-PAYLOAD: the SDK
+	// hashes the body to sign it, which requires a seekable reader. drive9
+	// streams request bodies (layer objects, large uploads), so spool those
+	// to a temp file for the duration of the call. HTTPS endpoints sign with
+	// UNSIGNED-PAYLOAD and keep the streaming behavior.
+	if c.needsSeekableUploadBody() {
+		if _, ok := body.(io.Seeker); !ok {
+			spooled, cleanup, err := spoolUploadBody(body)
+			if err != nil {
+				result = "error"
+				return fmt.Errorf("spool upload body: %w", err)
+			}
+			defer cleanup()
+			body = spooled
+		}
+	}
+
 	in := &s3.PutObjectInput{
 		Bucket:        &c.bucket,
 		Key:           aws.String(c.fullKey(key)),
@@ -463,6 +636,46 @@ func (c *AWSS3Client) PutObject(ctx context.Context, key string, body io.Reader,
 		return fmt.Errorf("put object: %w", err)
 	}
 	return nil
+}
+
+// needsSeekableUploadBody reports whether PutObject has to hand the SDK a
+// seekable body. Only SigV4 over plain HTTP hashes the payload instead of
+// using UNSIGNED-PAYLOAD, so only an endpoint that explicitly says http://
+// needs the body spooled. An empty endpoint is the AWS SDK's default HTTPS
+// endpoint, and every other scheme (https, or a bare host the SDK upgrades)
+// keeps streaming.
+func (c *AWSS3Client) needsSeekableUploadBody() bool {
+	ep := strings.TrimSpace(c.endpoint)
+	if ep == "" {
+		return false
+	}
+	u, err := url.Parse(ep)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Scheme, "http")
+}
+
+// spoolUploadBody copies a non-seekable upload stream into a temp file and
+// returns it rewound to the start, plus a cleanup func.
+func spoolUploadBody(body io.Reader) (*os.File, func(), error) {
+	f, err := os.CreateTemp("", "drive9-upload-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	}
+	if _, err := io.Copy(f, body); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return f, cleanup, nil
 }
 
 func applyEncryptionToCreateMultipartUploadInput(in *s3.CreateMultipartUploadInput, encOpts EncryptionOpts) error {
@@ -688,22 +901,22 @@ func (c *AWSS3Client) deleteObjectsByPrefix(ctx context.Context, fullPrefix stri
 						Quiet:   aws.Bool(true),
 					},
 				})
-				if err != nil {
-					if !isDeleteObjectsCompatibilityError(err) {
-						return fmt.Errorf("delete objects by prefix: %w", err)
+				switch {
+				case err == nil:
+					if len(del.Errors) > 0 {
+						first := del.Errors[0]
+						return fmt.Errorf("delete object %q: %s %s", aws.ToString(first.Key), aws.ToString(first.Code), aws.ToString(first.Message))
 					}
+					out.DeletedObjects += int64(len(objects))
+				case isDeleteObjectsCompatibilityError(err):
 					deleted, fallbackErr := c.deleteObjectsOneByOne(ctx, objects)
 					out.DeletedObjects += deleted
 					if fallbackErr != nil {
 						return fmt.Errorf("delete objects by prefix fallback: %w", fallbackErr)
 					}
-					continue
+				default:
+					return fmt.Errorf("delete objects by prefix: %w", err)
 				}
-				if len(del.Errors) > 0 {
-					first := del.Errors[0]
-					return fmt.Errorf("delete object %q: %s %s", aws.ToString(first.Key), aws.ToString(first.Code), aws.ToString(first.Message))
-				}
-				out.DeletedObjects += int64(len(objects))
 			}
 		}
 		if !aws.ToBool(res.IsTruncated) {
@@ -713,14 +926,30 @@ func (c *AWSS3Client) deleteObjectsByPrefix(ctx context.Context, fullPrefix stri
 	}
 }
 
+// isDeleteObjectsCompatibilityError reports whether a failed Multi-Object Delete
+// is worth retrying one object at a time. Anything the batch call rejects before
+// it looks at the keys — a body or header the store does not accept — is fixed
+// by single-object deletes, which carry no request body. It must stay narrow:
+// AccessDenied, NoSuchBucket or a network error mean the fallback would fail
+// the same way and only multiply the requests.
 func isDeleteObjectsCompatibilityError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "MissingArgument") ||
+	if strings.Contains(msg, "MissingArgument") ||
 		strings.Contains(msg, "MalformedXML") ||
-		strings.Contains(msg, "NotImplemented")
+		strings.Contains(msg, "NotImplemented") {
+		return true
+	}
+	// A Content-MD5 failure is fixed by single-object deletes, which carry no
+	// body: MinIO answers `MissingContentMD5: Missing required header for this
+	// request: Content-Md5` when the header is absent, and any store may answer
+	// BadDigest when it disagrees with the checksum we sent. Stores capitalize
+	// the header differently ("Content-MD5" vs "Content-Md5"), so compare the
+	// lower-cased message.
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "content-md5") || strings.Contains(lower, "missingcontentmd5")
 }
 
 func (c *AWSS3Client) deleteObjectsOneByOne(ctx context.Context, objects []types.ObjectIdentifier) (int64, error) {

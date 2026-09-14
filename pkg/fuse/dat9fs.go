@@ -168,6 +168,11 @@ type Dat9FS struct {
 	appendLogMatcher           *AppendLogMatcher
 	appendLogSnapshotRoot      string
 	appendLogSnapshotSweepOnce sync.Once
+	// extentCacheDir is the mount-scoped cache root for the extent data plane.
+	// It lives under MountOptions.CacheDir (defaulting like the other drive9
+	// caches); JuiceFS keeps its chunk cache in the jfs/ subdirectory, so the
+	// extent data plane never depends on an explicit --cache-dir.
+	extentCacheDir string
 	// localOverlay stores local-only paths under MountOptions.LocalRoot.
 	localOverlay *LocalOverlay
 	// transientLocalOverlay stores mount-local runtime sidecars that must be
@@ -215,6 +220,16 @@ type Dat9FS struct {
 
 	// xattrs provides in-memory extended attribute storage for the mount session.
 	xattrs *XAttrStore
+
+	extentMu sync.Mutex
+	extentRT *extentRuntime
+	// extentMisses caches "this path is not an extent file" so an
+	// extent-enabled mount does not pay a stat probe on every syscall against
+	// the classic files that share its glob (the mixed profile is the shape the
+	// design recommends). Entries expire after extentMissTTL and are cleared
+	// whenever this mount creates or unlinks an extent path.
+	extentMissesMu sync.Mutex
+	extentMisses   map[string]time.Time
 
 	// deletedPaths tracks recently-unlinked paths as tombstones, so that
 	// remoteDirectoryHasChildren can filter out stale backend listings during
@@ -665,7 +680,8 @@ func (fs *Dat9FS) childPath(parentIno uint64, name string) (string, gofuse.Statu
 	if !ok {
 		return "", gofuse.ENOENT
 	}
-	if parentPath == "/" {
+	parentPath = strings.TrimRight(parentPath, "/")
+	if parentPath == "" || parentPath == "/" {
 		return "/" + name, gofuse.OK
 	}
 	return parentPath + "/" + name, gofuse.OK
@@ -2378,7 +2394,27 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 	if revision <= 0 {
 		return
 	}
+	// A truncate through one hardlink alias bumps the shared object's
+	// revision for every alias. Handles opened through the sibling paths
+	// must adopt the fresh base revision too: otherwise their next commit
+	// carries the stale base, conflicts on the server, and the commit queue
+	// terminally refuses the rebase — the content never lands remotely
+	// (hardlink alias + O_TRUNC regression).
+	paths := []string{remotePath}
+	if ino, ok := fs.inodes.GetInode(remotePath); ok {
+		if entry, ok := fs.inodes.GetEntry(ino); ok && len(entry.Paths) > 1 {
+			paths = paths[:0]
+			for p := range entry.Paths {
+				paths = append(paths, p)
+			}
+		}
+	}
+	for _, p := range paths {
+		fs.updateOpenHandleBaseRevisionForPath(p, revision, callerPID, truncateSize)
+	}
+}
 
+func (fs *Dat9FS) updateOpenHandleBaseRevisionForPath(remotePath string, revision int64, callerPID uint32, truncateSize int64) {
 	var matching []*FileHandle
 	for _, fh := range fs.openHandles.SnapshotPath(remotePath) {
 		if fh == nil {
@@ -2397,7 +2433,15 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 		adoptedPathTruncate := false
 		fh.Lock()
 		fs.adoptCommittedStorageClassLocked(fh, truncateSize)
-		if shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
+		// The truncating caller's own handle always adopts the truncate and
+		// the fresh base revision, regardless of the O_TRUNC flag or the
+		// sibling-handle count: the caller's own history includes the
+		// truncation, and the kernel does not propagate O_TRUNC into the FUSE
+		// open flags (it issues the truncate as a separate SetAttr), so the
+		// conservative O_TRUNC heuristic below never fires for real O_TRUNC
+		// writers and their next commit would CAS-conflict forever.
+		callerOwned := callerPID != 0 && fh.OpenPID != 0 && fh.OpenPID == callerPID
+		if callerOwned || shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
 			var err error
 			abortStreamer, err = fs.truncateWritableHandleLocked(fh, truncateSize)
 			if err != nil {
@@ -2407,7 +2451,7 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 			}
 			adoptedPathTruncate = true
 		}
-		if !shouldRefreshHandleAfterPathTruncate(fh, truncateSize) {
+		if !callerOwned && !shouldRefreshHandleAfterPathTruncate(fh, truncateSize) {
 			fh.Unlock()
 			continue
 		}
@@ -2550,6 +2594,56 @@ func (fs *Dat9FS) adoptOpenHandlePathTruncate(entry *InodeEntry, ino uint64, cal
 		fs.markDirtySize(ino, 0)
 	}
 	return gofuse.OK
+}
+
+// adoptCallerOwnedInodeTruncate folds a path-based truncate into the
+// truncating process's own open writable handle on the inode — including
+// handles opened through hardlink aliases — so the truncate and the caller's
+// subsequent writes commit as a single write. A remote zero-truncate
+// committed on its own would race that handle's pending commit on any alias
+// path: whichever revision lands first wins and the other is terminally
+// refused, losing data either way (the O_TRUNC-on-hardlink-alias regression,
+// where the remote stayed at 0 bytes while the local read was correct).
+// Returns true when a caller-owned handle adopted the truncate; the caller
+// then syncs sibling buffers and skips the remote truncate entirely.
+func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, newSize int64) bool {
+	if callerPID == 0 {
+		return false
+	}
+	// Fold only when the truncating caller is the inode's ONLY live writer.
+	// With a concurrent writer from another process, the remote truncate's
+	// revision bump is the CAS fence that makes the stale writer's next
+	// commit conflict detectably instead of silently clobbering — keep the
+	// remote path there.
+	var owner *FileHandle
+	for _, fh := range fs.fileHandlesForInode(ino) {
+		if fh == nil || fh.Dirty == nil || fh.Unlinked {
+			continue
+		}
+		if !localFileHandleOpenedWritable(fh) {
+			continue
+		}
+		if fh.OpenPID != callerPID {
+			return false
+		}
+		if owner == nil {
+			owner = fh
+		}
+	}
+	if owner == nil {
+		return false
+	}
+	owner.Lock()
+	abortStreamer, err := fs.truncateWritableHandleLocked(owner, newSize)
+	owner.Unlock()
+	if abortStreamer != nil {
+		abortStreamer()
+	}
+	if err != nil {
+		safeLogPrintf("caller-owned inode truncate adoption failed for %s: %v", owner.Path, err)
+		return false
+	}
+	return true
 }
 
 func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision int64, skip *FileHandle) {
@@ -5117,6 +5211,9 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 		out.Mode = fileKind | (mode & posixPermissionModeMask)
 		out.Rdev = entry.Rdev
 		out.Nlink = entry.Nlink
+		if n := uint32(len(entry.Paths)); n > 0 {
+			out.Nlink = n
+		}
 		if out.Nlink == 0 && !entry.Unlinked {
 			out.Nlink = 1
 		}
@@ -5158,13 +5255,32 @@ func symlinkMode() uint32 {
 func (fs *Dat9FS) fillEntryOut(entry *InodeEntry, out *gofuse.EntryOut) {
 	out.NodeId = entry.Ino
 	out.Generation = 1
+	if entry.ExtentIno != 0 && !entry.IsDir && entry.Size <= 0 && fs.extentVFS() != nil {
+		fs.extentRefreshFromVFS(entry.Ino, entry.Path, 0)
+		if e, ok := fs.inodes.GetEntry(entry.Ino); ok {
+			entry = e
+		}
+	}
+	// JuiceFS replyEntry: UpdateLength in-memory (writer vs attr), no extra GetAttr RPC.
+	fs.extentApplyWriterLength(entry)
 	fs.fillAttr(entry, &out.Attr)
 	entryTTL := fs.opts.EntryTTL
+	attrTTL := fs.opts.AttrTTL
 	if isLockFilePath(entry.Path) {
 		entryTTL = 0
 	}
+	// JuiceFS replyEntry: --attr-cache/--entry-cache 1.0s, then UpdateLength.
+	// Timeout 0 forced every getattr through VFS.GetAttr HTTP. The mount's own
+	// TTLs stay an upper bound (see clampExtentTTL): the create glob also
+	// matches classic files, and the extent timeout must not silently lengthen
+	// what the user configured for them.
+	if entry.ExtentIno != 0 || (!entry.IsDir && fs.shouldUseExtentPath(entry.Path)) {
+		ttl := extentAttrTimeout(entry)
+		entryTTL = clampExtentTTL(ttl, entryTTL)
+		attrTTL = clampExtentTTL(ttl, attrTTL)
+	}
 	out.SetEntryTimeout(entryTTL)
-	out.SetAttrTimeout(fs.opts.AttrTTL)
+	out.SetAttrTimeout(attrTTL)
 }
 
 func isLockFilePath(p string) bool {
@@ -6261,6 +6377,7 @@ func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
 			HasMode:    item.HasMode,
 			ResourceID: item.ResourceID,
 			Nlink:      item.Nlink,
+			ExtentIno:  item.ExtentIno,
 		})
 	}
 	return cached
@@ -6341,6 +6458,7 @@ func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
 		HasGID:     entry.HasGID,
 		ResourceID: entry.ResourceID,
 		Nlink:      entry.Nlink,
+		ExtentIno:  entry.ExtentIno,
 	}
 }
 
@@ -6358,6 +6476,7 @@ func cachedInfoFromStat(name string, stat *client.StatResult) CachedFileInfo {
 		item.Mode = stat.Mode
 		item.ResourceID = stat.ResourceID
 		item.Nlink = stat.Nlink
+		item.ExtentIno = stat.ExtentIno
 	}
 	return item
 }
@@ -7057,6 +7176,10 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 		if mtime.IsZero() {
 			mtime = time.Now()
 		}
+		// Do not FindByExtentIno from dir-cache ExtentIno: after rename-replace
+		// the dest name can still cache the old dest juicefs ino, which would
+		// alias dest's FUSE nodeid onto the source path (pjdfstest expected N
+		// got N+2). Stat-path Lookup still reuses by live juicefs identity.
 		ino := fs.inodes.LookupWithIdentity(childP, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
@@ -7445,13 +7568,33 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if !stat.Mtime.IsZero() {
 		mtime = stat.Mtime
 	}
-	ino := fs.inodes.LookupWithIdentity(childP, stat.ResourceID, stat.Nlink, stat.IsDir, stat.Size, mtime)
+	ino := uint64(0)
+	if !stat.IsDir && stat.ExtentIno != 0 {
+		if existing, ok := fs.inodes.FindByExtentIno(stat.ExtentIno); ok {
+			if fs.inodes.AddAlias(existing, childP, stat.ResourceID, stat.Nlink, false, stat.Size, mtime) {
+				ino = existing
+			}
+		}
+	}
+	if ino == 0 {
+		ino = fs.inodes.LookupWithIdentity(childP, stat.ResourceID, stat.Nlink, stat.IsDir, stat.Size, mtime)
+	}
 	// Store server revision for cache validation.
 	if stat.Revision > 0 {
 		fs.inodes.UpdateRevision(ino, stat.Revision)
 	}
 	if stat.HasMode {
 		fs.inodes.UpdateMode(ino, stat.Mode)
+	}
+	if stat.ContentLayout == client.ContentLayoutExtent && stat.ExtentIno != 0 {
+		fs.inodes.SetExtentIno(ino, stat.ExtentIno)
+	}
+	// Refresh from the JuiceFS side only when the projection says this file
+	// lives on the extent data plane. Matching the profile glob is not enough:
+	// extentRefreshFromVFS resolves the inode by name, so an orphan jfs edge
+	// would capture a single-layout file that happens to match the glob (P1-4).
+	if !stat.IsDir && stat.ContentLayout == client.ContentLayoutExtent {
+		fs.extentRefreshFromVFS(ino, childP, 0)
 	}
 	fs.dirCache.Upsert(parentPath, cachedInfoFromStat(name, stat))
 	entry, ok := fs.inodes.GetEntry(ino)
@@ -8322,7 +8465,7 @@ func (fs *Dat9FS) openHandleEntry(p string) (*InodeEntry, bool) {
 			continue
 		}
 		fh.Lock()
-		if fh.Dirty == nil {
+		if fh.Unlinked || fh.Dirty == nil {
 			fh.Unlock()
 			continue
 		}
@@ -8382,7 +8525,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	if entryIsMetadataOnlySpecial(entry) {
+	if localOnlySpecialEntry(entry) {
 		fs.fillAttr(entry, &out.Attr)
 		out.SetTimeout(fs.opts.AttrTTL)
 		return gofuse.OK
@@ -8446,113 +8589,129 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		return gofuse.OK
 	}
 
-	// Prefer unflushed writable state over the remote object size.
-	if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
-		entry.Size = size
-	} else if gitEntry, handled := fs.gitEntry(ctx, entry.Path, false); handled {
-		if gitEntry == nil {
-			return gofuse.ENOENT
+	// Extent files: size/owner/mode come from JuiceFS VFS GetAttr, not
+	// file_nodes. Directories keep Dat9FS mkdir mode (sticky/owner).
+	// Kernel i_size (and therefore O_APPEND) follows VFS.
+	if !entry.IsDir && fs.extentRefreshFromVFS(input.NodeId, entry.Path, input.Fh()) {
+		if refreshed, ok := fs.inodes.GetEntry(input.NodeId); ok {
+			entry = refreshed
 		}
-		entry = gitEntry
-	} else if fs.writeBack != nil && !entry.IsDir {
-		// Check pending index first (in-memory, O(1)), then fall back
-		// to old GetMeta for backward compatibility.
-		pendingFound := false
-		if fs.pendingIndex != nil {
-			if meta, ok := fs.pendingIndex.GetMeta(entry.Path); ok {
-				entry.Size = meta.Size
-				if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
-					entry.Mtime = meta.Mtime
-				}
-				pendingFound = true
+		fs.applyLayerFileMode(entry.Path, input.NodeId, entry)
+		// The only sanctioned size fabrication in this layer, for an open
+		// sqlite WAL index; see sqliteWALIndexMinSize.
+		fs.extentKeepOpenWALIndexSize(entry)
+		fs.fillAttr(entry, &out.Attr)
+		out.SetTimeout(fs.extentAttrTimeoutFor(entry))
+		return gofuse.OK
+	}
+	{
+		if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
+			entry.Size = size
+		} else if gitEntry, handled := fs.gitEntry(ctx, entry.Path, false); handled {
+			if gitEntry == nil {
+				return gofuse.ENOENT
 			}
-		}
-		if !pendingFound {
-			if meta, ok := fs.writeBack.GetMeta(entry.Path); ok {
-				entry.Size = meta.Size
-				if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
-					entry.Mtime = meta.Mtime
+			entry = gitEntry
+		} else if fs.writeBack != nil && !entry.IsDir {
+			// Check pending index first (in-memory, O(1)), then fall back
+			// to old GetMeta for backward compatibility.
+			pendingFound := false
+			if fs.pendingIndex != nil {
+				if meta, ok := fs.pendingIndex.GetMeta(entry.Path); ok {
+					entry.Size = meta.Size
+					if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
+						entry.Mtime = meta.Mtime
+					}
+					pendingFound = true
 				}
-				pendingFound = true
 			}
-		}
-		if !pendingFound {
+			if !pendingFound {
+				if meta, ok := fs.writeBack.GetMeta(entry.Path); ok {
+					entry.Size = meta.Size
+					if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
+						entry.Mtime = meta.Mtime
+					}
+					pendingFound = true
+				}
+			}
+			if !pendingFound {
+				if cachedEntry, ok := fs.cachedAttrEntry(entry); ok {
+					entry = cachedEntry
+					pendingFound = true
+				}
+			}
+			if !pendingFound && input.NodeId != 1 {
+				stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
+				if err != nil {
+					return listDirErrToFuseStatus(err)
+				}
+				if !fs.lockMountViewRead(statGeneration) {
+					return gofuse.Status(syscall.EAGAIN)
+				}
+				defer fs.mountViewMu.RUnlock()
+				entry.Size = stat.Size
+				entry.IsDir = stat.IsDir
+				fs.inodes.UpdateSize(input.NodeId, stat.Size)
+				if stat.ResourceID != "" || stat.Nlink > 0 {
+					fs.inodes.SetIdentity(input.NodeId, stat.ResourceID, stat.Nlink)
+					entry.ResourceID = stat.ResourceID
+					entry.Nlink = stat.Nlink
+				}
+				if stat.Revision > 0 {
+					fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+				}
+				if stat.HasMode {
+					entry.Mode = stat.Mode
+					entry.HasMode = true
+					fs.inodes.UpdateMode(input.NodeId, stat.Mode)
+				}
+				if !stat.Mtime.IsZero() {
+					// Only adopt the remote mtime when the inode does not already
+					// have a newer local mtime. This prevents a stale remote mtime
+					// (e.g. creation time from before a local truncation) from
+					// clobbering a locally-updated mtime after the dirty handle is
+					// flushed and the remote stat path runs.
+					if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
+						entry.Mtime = stat.Mtime
+						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+					}
+				}
+			}
+		} else if input.NodeId != 1 {
+			// Some deployments do not support HEAD/stat on directories.
+			// Keep directory attrs from inode map and only refresh regular files.
 			if cachedEntry, ok := fs.cachedAttrEntry(entry); ok {
 				entry = cachedEntry
-				pendingFound = true
-			}
-		}
-		if !pendingFound && input.NodeId != 1 {
-			stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
-			if err != nil {
-				return listDirErrToFuseStatus(err)
-			}
-			if !fs.lockMountViewRead(statGeneration) {
-				return gofuse.Status(syscall.EAGAIN)
-			}
-			defer fs.mountViewMu.RUnlock()
-			entry.Size = stat.Size
-			entry.IsDir = stat.IsDir
-			fs.inodes.UpdateSize(input.NodeId, stat.Size)
-			if stat.ResourceID != "" || stat.Nlink > 0 {
-				fs.inodes.SetIdentity(input.NodeId, stat.ResourceID, stat.Nlink)
-				entry.ResourceID = stat.ResourceID
-				entry.Nlink = stat.Nlink
-			}
-			if stat.Revision > 0 {
-				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-			}
-			if stat.HasMode {
-				entry.Mode = stat.Mode
-				entry.HasMode = true
-				fs.inodes.UpdateMode(input.NodeId, stat.Mode)
-			}
-			if !stat.Mtime.IsZero() {
-				// Only adopt the remote mtime when the inode does not already
-				// have a newer local mtime. This prevents a stale remote mtime
-				// (e.g. creation time from before a local truncation) from
-				// clobbering a locally-updated mtime after the dirty handle is
-				// flushed and the remote stat path runs.
-				if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
-					entry.Mtime = stat.Mtime
-					fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+			} else if !entry.IsDir {
+				stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
+				if err != nil {
+					return listDirErrToFuseStatus(err)
 				}
-			}
-		}
-	} else if input.NodeId != 1 {
-		// Some deployments do not support HEAD/stat on directories.
-		// Keep directory attrs from inode map and only refresh regular files.
-		if cachedEntry, ok := fs.cachedAttrEntry(entry); ok {
-			entry = cachedEntry
-		} else if !entry.IsDir {
-			stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
-			if err != nil {
-				return listDirErrToFuseStatus(err)
-			}
-			if !fs.lockMountViewRead(statGeneration) {
-				return gofuse.Status(syscall.EAGAIN)
-			}
-			defer fs.mountViewMu.RUnlock()
-			entry.Size = stat.Size
-			entry.IsDir = stat.IsDir
-			fs.inodes.UpdateSize(input.NodeId, stat.Size)
-			if stat.ResourceID != "" || stat.Nlink > 0 {
-				fs.inodes.SetIdentity(input.NodeId, stat.ResourceID, stat.Nlink)
-				entry.ResourceID = stat.ResourceID
-				entry.Nlink = stat.Nlink
-			}
-			if stat.Revision > 0 {
-				fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-			}
-			if stat.HasMode {
-				entry.Mode = stat.Mode
-				entry.HasMode = true
-				fs.inodes.UpdateMode(input.NodeId, stat.Mode)
-			}
-			if !stat.Mtime.IsZero() {
-				if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
-					entry.Mtime = stat.Mtime
-					fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+				if !fs.lockMountViewRead(statGeneration) {
+					return gofuse.Status(syscall.EAGAIN)
+				}
+				defer fs.mountViewMu.RUnlock()
+				entry.Size = stat.Size
+				entry.IsDir = stat.IsDir
+				fs.inodes.UpdateSize(input.NodeId, stat.Size)
+				if stat.ResourceID != "" || stat.Nlink > 0 {
+					fs.inodes.SetIdentity(input.NodeId, stat.ResourceID, stat.Nlink)
+					entry.ResourceID = stat.ResourceID
+					entry.Nlink = stat.Nlink
+				}
+				if stat.Revision > 0 {
+					fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+				}
+				if stat.HasMode {
+					entry.Mode = stat.Mode
+					entry.HasMode = true
+					fs.inodes.UpdateMode(input.NodeId, stat.Mode)
+				}
+				if !stat.Mtime.IsZero() {
+					if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
+						entry.Mtime = stat.Mtime
+						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+					}
 				}
 			}
 		}
@@ -8609,7 +8768,10 @@ func hasPOSIXSearchAccess(caller gofuse.Owner, file gofuse.Owner, mode uint32, i
 	return hasPOSIXAccess(caller, file, mode, gofuse.X_OK, inSupplementaryGroup)
 }
 
-const setGIDPermissionBit uint32 = 0o2000
+const (
+	setUIDPermissionBit uint32 = 0o4000
+	setGIDPermissionBit uint32 = 0o2000
+)
 
 func (fs *Dat9FS) entryOwner(entry *InodeEntry) gofuse.Owner {
 	owner := gofuse.Owner{Uid: fs.uid, Gid: fs.gid}
@@ -8729,11 +8891,19 @@ func (fs *Dat9FS) checkOpenAccess(ctx context.Context, input *gofuse.OpenIn, ent
 func (fs *Dat9FS) setAttrModeForCaller(input *gofuse.SetAttrIn, entry *InodeEntry) (uint32, gofuse.Status) {
 	caller := setAttrCallerOwner(input)
 	owner := fs.entryOwner(entry)
+	mode := input.Mode & posixPermissionModeMask
 	if caller.Uid != 0 && caller.Uid != owner.Uid {
+		// Kernel file_remove_privs issues SetAttr as the writer to drop
+		// SUID/SGID after a non-owner write. That is not a chmod by the
+		// caller; only allow clearing those bits.
+		oldMode := entry.Mode & posixPermissionModeMask
+		cleared := mode &^ (setUIDPermissionBit | setGIDPermissionBit)
+		oldCleared := oldMode &^ (setUIDPermissionBit | setGIDPermissionBit)
+		if cleared == oldCleared && mode&(setUIDPermissionBit|setGIDPermissionBit) == 0 {
+			return mode, gofuse.OK
+		}
 		return 0, gofuse.EPERM
 	}
-
-	mode := input.Mode & posixPermissionModeMask
 	if caller.Uid != 0 && entryIsRegularFile(entry) && mode&setGIDPermissionBit != 0 {
 		if caller.Gid != owner.Gid && !processHasSupplementaryGroup(input.Pid, owner.Gid) {
 			mode &^= setGIDPermissionBit
@@ -8783,6 +8953,36 @@ func resolveSetAttrOwner(input *gofuse.SetAttrIn) (uid uint32, hasUID bool, gid 
 		hasGID = false
 	}
 	return uid, hasUID, gid, hasGID
+}
+
+func processSupplementaryGroups(pid uint32) []uint32 {
+	if pid == 0 {
+		return nil
+	}
+	status, err := readProcessStatusFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return nil
+	}
+	return procStatusGroups(status)
+}
+
+func procStatusGroups(status []byte) []uint32 {
+	for _, line := range strings.Split(string(status), "\n") {
+		if !strings.HasPrefix(line, "Groups:") {
+			continue
+		}
+		fields := strings.Fields(strings.TrimPrefix(line, "Groups:"))
+		out := make([]uint32, 0, len(fields))
+		for _, field := range fields {
+			v, err := strconv.ParseUint(field, 10, 32)
+			if err != nil {
+				continue
+			}
+			out = append(out, uint32(v))
+		}
+		return out
+	}
+	return nil
 }
 
 func processHasSupplementaryGroup(pid, gid uint32) bool {
@@ -8871,7 +9071,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	sizeChanged := false
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	if entryIsMetadataOnlySpecial(entry) {
+	if localOnlySpecialEntry(entry) {
 		return fs.setMetadataOnlySpecialAttr(input, entry, out)
 	}
 	if input.Valid&gofuse.FATTR_FH == 0 {
@@ -8889,7 +9089,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			return httpToFuseStatus(restoreErr)
 		}
 		if mtime, ok := input.GetMTime(); ok {
-			if err := overlay.Chtimes(entry.Path, mtime); err != nil {
+			if err := localOverlayChtimes(overlay, entry.Path, entry.Unlinked, mtime); err != nil {
 				return localErrToFuseStatus(err)
 			}
 			entry.Mtime = mtime
@@ -8969,6 +9169,11 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		ctx, cf := fuseCtx(cancel)
 		defer cf()
 		return fs.setGitAttr(ctx, input, entry, out)
+	}
+	if !entry.IsDir {
+		if _, ok := fs.resolveExtentIno(input.NodeId, entry.Path); ok {
+			return fs.extentSetAttr(cancel, input, entry, out)
+		}
 	}
 	unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(entry.Path)
 	defer unlockRemoteCommit()
@@ -9071,6 +9276,15 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		if input.Size > uint64(1<<63-1) {
 			return gofuse.Status(syscall.EFBIG)
 		}
+		if fs.shouldExtentTruncate(input.NodeId, entry.Path) {
+			if st := fs.extentTruncate(cancel, input.NodeId, entry.Path, input.Fh, input.Size); st != gofuse.OK {
+				return st
+			}
+			entry.Size = int64(input.Size)
+			fs.fillAttr(entry, &out.Attr)
+			out.SetTimeout(fs.opts.AttrTTL)
+			return gofuse.OK
+		}
 		newSize := int64(input.Size)
 		oldSize := entry.Size
 
@@ -9100,15 +9314,28 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				}
 			}
 		} else {
-			if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
-				return st
+			// The truncating process itself holds the file open: fold the
+			// truncate into the caller's own handle (including hardlink
+			// aliases) so its history — truncate, then any subsequent writes
+			// — commits as a single write. A remote zero-truncate committed
+			// on its own would race the handle's pending commit on any alias
+			// path: whichever revision lands first wins and the other is
+			// terminally refused, losing data either way (the
+			// O_TRUNC-on-hardlink regression). Without a caller-owned handle,
+			// keep the remote path.
+			if fs.adoptCallerOwnedInodeTruncate(input.NodeId, input.Pid, newSize) {
+				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
+			} else {
+				if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
+					return st
+				}
+				// Path-based truncate(path, size) truncates the remote file but
+				// does not update open dirty handles' WriteBuffers. Without this
+				// sync, a subsequent fstat(fd) on an open dirty handle returns the
+				// stale (pre-truncate) size via dirtyHandleSize(), causing
+				// fstat() mismatch failures (LTP ftest01 m_fstat case).
+				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
 			}
-			// Path-based truncate(path, size) truncates the remote file but
-			// does not update open dirty handles' WriteBuffers. Without this
-			// sync, a subsequent fstat(fd) on an open dirty handle returns the
-			// stale (pre-truncate) size via dirtyHandleSize(), causing
-			// fstat() mismatch failures (LTP ftest01 m_fstat case).
-			fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
 		}
 		entry.Size = newSize
 		fs.inodes.UpdateSize(input.NodeId, newSize)
@@ -9138,6 +9365,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		fs.inodes.UpdateCtime(input.NodeId, ctime)
 		fs.cacheEntryForPath(entry.Path, entry)
 	}
+	if entry.IsDir {
+		fs.extentMirrorDirAttr(input, entry)
+	}
 	fs.fillAttr(entry, &out.Attr)
 	fs.setAttrOutTimeout(out, sizeChanged)
 	return gofuse.OK
@@ -9164,6 +9394,9 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 	}
 	if !entryIsSymlink(entry) {
 		return nil, gofuse.Status(syscall.EINVAL)
+	}
+	if entry.ExtentIno != 0 {
+		return fs.extentReadlink(entry)
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -9220,6 +9453,9 @@ func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name stri
 	switch mode & fileKindModeMask {
 	case 0, syscall.S_IFREG:
 		return fs.mknodRegular(cancel, input, name, childP, mode, out)
+	}
+	if fs.extentEnabled() && metadataOnlySpecialMode(mode) {
+		return fs.extentMknod(cancel, input, name, childP, mode, out)
 	}
 	if !metadataOnlySpecialMode(mode) {
 		return gofuse.Status(syscall.ENOTSUP)
@@ -9379,6 +9615,13 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	if !ok {
 		return gofuse.EIO
 	}
+	if st := fs.extentMkdir(input, name, childP, mode); st != gofuse.OK {
+		if delErr := fs.deleteRemoteDirWithInterruptRecovery(ctx, childP); delErr != nil && !isNotFoundErr(delErr) {
+			safeLogPrintf("mkdir: rollback remote dir %s after juicefs mkdir failed: %v", childP, delErr)
+		}
+		fs.inodes.Remove(childP)
+		return st
+	}
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.adjustDirectoryLinkCount(parentPath, 1)
@@ -9440,6 +9683,9 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
+	}
+	if fs.shouldUseExtentPath(childP) {
+		return fs.extentSymlink(cancel, header, pointedTo, linkName, childP, out)
 	}
 
 	var err error
@@ -9544,7 +9790,7 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	if srcP == dstP {
 		return gofuse.Status(syscall.EEXIST)
 	}
-	if entryIsMetadataOnlySpecial(srcEntry) {
+	if entryIsMetadataOnlySpecial(srcEntry) && srcEntry.ExtentIno == 0 {
 		return fs.linkMetadataOnlySpecial(input, srcEntry, dstP, name, out)
 	}
 
@@ -9672,6 +9918,14 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 		isDir = stat.IsDir
 	}
 	fs.inodes.SetIdentity(input.Oldnodeid, resourceID, nlink)
+	// The stat above already knows whether this inode is an extent object, so
+	// re-stamp it: SetIdentity can drop a routing the inode only had from a
+	// create, and an extent file whose routing is lost falls back to the classic
+	// data plane (a cached negative probe would even make the server refuse it).
+	if stat != nil && stat.ExtentIno != 0 {
+		fs.inodes.SetExtentIno(input.Oldnodeid, stat.ExtentIno)
+	}
+	fs.extentMissForget(dstP)
 	if !fs.inodes.AddAlias(input.Oldnodeid, dstP, resourceID, nlink, isDir, size, mtime) {
 		return gofuse.EIO
 	}
@@ -9801,6 +10055,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.dirCache.Remove(parentPath, name)
 		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		return gofuse.OK
+	}
+	if fs.extentDiscoveryEnabled() && fs.isExtentFile(ctx, childP) {
+		return fs.extentUnlink(cancel, header, name, childP)
 	}
 	start := time.Now()
 	status = gofuse.OK
@@ -10289,6 +10546,11 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		}
 	}
 
+	if st := fs.extentRmdir(header, name, childP); st != gofuse.OK {
+		status = st
+		return status
+	}
+
 	deleteStart := time.Now()
 	fs.debugf("rmdir remote delete start path=%s", childP)
 	err := fs.deleteRemoteDirWithInterruptRecovery(ctx, childP)
@@ -10587,11 +10849,60 @@ func (fs *Dat9FS) pendingRenameTargetExists(ctx context.Context, p string) (bool
 	return false, err
 }
 
+func fusePathVariants(p string) []string {
+	cleaned := path.Clean("/" + strings.TrimPrefix(p, "/"))
+	out := []string{p, cleaned}
+	if cleaned != "/" {
+		out = append(out, cleaned+"/", strings.TrimSuffix(cleaned, "/"))
+	}
+	seen := map[string]struct{}{}
+	uniq := make([]string, 0, len(out))
+	for _, v := range out {
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		uniq = append(uniq, v)
+	}
+	return uniq
+}
+
 func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	var oldEntry *InodeEntry
 	oldEntryOK := false
-	if oldIno, ok := fs.inodes.GetInode(oldP); ok {
+	resolvedOld := oldP
+	if _, ok := fs.inodes.GetInode(oldP); !ok {
+		for _, p := range fusePathVariants(oldP) {
+			if _, ok := fs.inodes.GetInode(p); ok {
+				resolvedOld = p
+				break
+			}
+		}
+	}
+	if _, ok := fs.inodes.GetInode(resolvedOld); !ok {
+		parent, _ := fs.inodes.GetPath(input.NodeId)
+		if _, p, ok := fs.inodes.FindPathInDir(parent, path.Base(oldP)); ok {
+			resolvedOld = p
+		}
+	}
+	if _, ok := fs.inodes.GetInode(resolvedOld); !ok {
+		if _, p, ok := fs.inodes.FindByBaseName(path.Base(oldP)); ok {
+			resolvedOld = p
+		}
+	}
+	if oldIno, ok := fs.inodes.GetInode(resolvedOld); ok {
 		oldEntry, oldEntryOK = fs.inodes.GetEntry(oldIno)
+		oldP = resolvedOld
+	}
+	// Drop a stale special-node entry at the target only when the source
+	// brings none: renameSpecialNodeSubtree below publishes oldP's entries at
+	// newP, so removing newP first would make a special-source rename lose the
+	// entry it just moved.
+	if _, ok := fs.specialNodeEntry(oldP); !ok {
+		fs.removeSpecialNode(newP)
 	}
 	oldParent, ok := fs.inodes.GetPath(input.NodeId)
 	if !ok {
@@ -10643,10 +10954,13 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 }
 
 func (fs *Dat9FS) notifyRenameTarget(parentIno uint64, name, p string) {
-	// Rename can publish a previously pending temp file under a path that
-	// concurrent readers already looked up as absent or zero-sized. Invalidate
-	// both the target dentry and inode so the kernel cannot keep satisfying
-	// reads from stale attrs while userspace state has the correct size.
+	// JuiceFS fuse Rename does not InodeNotify/EntryNotify; the kernel moves
+	// the dentry. Notifying here races concurrent readers into EIO.
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		if e, ok := fs.inodes.GetEntry(ino); ok && e.ExtentIno != 0 {
+			return
+		}
+	}
 	if parentIno != 0 && name != "" && name != "." && name != "/" {
 		fs.notifyEntry(parentIno, name)
 	}
@@ -10683,6 +10997,16 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	defer func() { fs.perfRecordFuse(perfFuseRename, perfStart, status, 0) }()
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
+	}
+	// renameat2 flags are not implemented: drive9 rename always replaces the
+	// target, so doing a plain rename for RENAME_NOREPLACE would silently
+	// clobber the destination and RENAME_EXCHANGE would destroy one side
+	// instead of swapping the two. The kernel forwards them on any mount that
+	// negotiated RENAME2, so refuse them here; callers that probe with
+	// RENAME_NOREPLACE (GNU mv, some rename fallbacks) expect EINVAL and retry
+	// without flags.
+	if input.Flags != 0 {
+		return gofuse.EINVAL
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -10728,6 +11052,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 	if handled, st := fs.renameGitPath(ctx, input, oldP, newP); handled {
 		return st
+	}
+	if !fs.pathIsDir(oldP) && fs.extentDiscoveryEnabled() {
+		if _, ok := fs.existingExtentIno(ctx, oldP); ok {
+			return fs.extentRename(cancel, input, oldP, newP, oldName, newName)
+		}
 	}
 	if err := fs.snapshotOpenHandlesBeforePathReplacement(ctx, newP); err != nil {
 		return httpToFuseStatus(err)
@@ -10884,6 +11213,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 
+	// A directory rename needs no second step: the server's RenameDir moves the
+	// directory's jfs edge in the same transaction as the projection subtree
+	// UPDATE (see datastore.RenameDir), so the FUSE side must not dual-write.
 	fs.finishLocalRename(input, oldP, newP)
 	return gofuse.OK
 }
@@ -10904,8 +11236,21 @@ func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gof
 		Path:              p,
 		entriesGeneration: fs.mountViewGeneration.Load(),
 	}
+	fs.extentAttachDirHandle(dh)
 	out.Fh = fs.dirHandles.Allocate(dh)
-	out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+	if dh.extentFh != 0 {
+		// JuiceFS OpenDir sets CACHE_DIR only with --readdir-cache (off), and
+		// a directory that has a JuiceFS handle can gain extent children that
+		// the kernel's cached listing does not know about.
+		//
+		// The test is the handle, not "this mount has an extent profile": a
+		// directory with no mirrored jfs tree lists nothing from the extent
+		// data plane, so dropping KEEP_CACHE for it only made every directory
+		// on an extent mount re-read on each opendir.
+		out.OpenFlags = 0
+	} else {
+		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+	}
 	return gofuse.OK
 }
 
@@ -11109,6 +11454,7 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 	var uid, gid uint32
 	hasUID := false
 	hasGID := false
+	extentIno := e.ExtentIno
 
 	if e.HasMetadata {
 		isDir = e.IsDir
@@ -11125,6 +11471,9 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 		hasGID = e.HasGID
 		resourceID = e.ResourceID
 		nlink = e.Nlink
+		if e.ExtentIno != 0 {
+			extentIno = e.ExtentIno
+		}
 	} else if item, ok := fs.dirEntryMetadata(dirPath, childP, e.Name); ok {
 		isDir = item.IsDir
 		size = item.Size
@@ -11140,6 +11489,9 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 		hasGID = item.HasGID
 		resourceID = item.ResourceID
 		nlink = item.Nlink
+		if item.ExtentIno != 0 {
+			extentIno = item.ExtentIno
+		}
 	}
 
 	ino := fs.inodes.EnsureInodeWithIdentity(childP, resourceID, nlink, isDir, size, mtime)
@@ -11151,6 +11503,9 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 	}
 	if hasUID || hasGID {
 		fs.inodes.UpdateOwner(ino, uid, gid, hasUID, hasGID)
+	}
+	if extentIno != 0 {
+		fs.inodes.SetExtentIno(ino, extentIno)
 	}
 	return ino
 }
@@ -11192,11 +11547,15 @@ func dirEntryFromCachedInfo(item CachedFileInfo, ino uint64) DirEntry {
 		IsDir:       item.IsDir,
 		ResourceID:  item.ResourceID,
 		Nlink:       item.Nlink,
+		ExtentIno:   item.ExtentIno,
 		HasMetadata: true,
 	}
 }
 
 func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
+	if dh, ok := fs.dirHandles.Get(input.Fh); ok {
+		fs.extentReleaseDir(dh)
+	}
 	fs.dirHandles.Delete(input.Fh)
 }
 
@@ -11259,7 +11618,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 			fs.perf.dirCacheHit.add(1)
 		}
 		entries := fs.cachedToDirEntries(dirPath, cached)
-		return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
+		return fs.composeDirEntries(ctx, dirPath, entries)
 	}
 	if fs.perf != nil {
 		fs.perf.dirCacheMiss.add(1)
@@ -11286,6 +11645,15 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached, generation)
 
 	entries := fs.cachedToDirEntries(dirPath, cached)
+	return fs.composeDirEntries(ctx, dirPath, entries)
+}
+
+func (fs *Dat9FS) composeDirEntries(ctx context.Context, dirPath string, entries []DirEntry) ([]DirEntry, error) {
+	// Extent children need no overlay here: their layout rides on the listing
+	// row as CachedFileInfo.ExtentIno, which cachedToDirEntries has already
+	// stamped onto the FUSE inode. Matching jfs entries by bare name (what this
+	// used to do) could hand a single-layout file the JuiceFS inode of an
+	// unrelated jfs subtree.
 	return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
 }
 
@@ -11646,6 +12014,47 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		if mtime.IsZero() {
 			mtime = time.Now()
 		}
+		prevSize := int64(0)
+		if existing, ok := fs.inodes.GetInode(childP); ok {
+			if e, ok := fs.inodes.GetEntry(existing); ok {
+				// Two carry-overs with different evidence requirements.
+				//
+				// Size: keep the cached value unless the listing proves a
+				// different object (both resource ids known and unequal, or a
+				// kind change). A listing that says 0 right after a JuiceFS
+				// write is the case this exists for, and it is self-correcting
+				// because the next authoritative stat overwrites it.
+				provesDifferent := item.IsDir != e.IsDir ||
+					(item.ResourceID != "" && e.ResourceID != "" && item.ResourceID != e.ResourceID)
+				if !provesDifferent {
+					prevSize = e.Size
+				}
+				// Routing: lend the cached JuiceFS inode only when the cache
+				// provably describes this same object. An entry with no
+				// resource id (a directory, or one built from a layer/pending
+				// merge) proves nothing, and inheriting a stale ExtentIno is
+				// unrecoverable: every later Open routes to the replaced
+				// file's drained JuiceFS inode and returns ENOENT with no
+				// classic fallback.
+				//
+				// Clearing is the safe direction even when it was not needed.
+				// For a directory child it always clears, because directory
+				// entries never store a resource id while the listing always
+				// carries one: the next mutation inside that directory resolves
+				// its parent through the extentEnsureParent walk instead of the
+				// kernel-parent fast path, and the walk re-binds the routing.
+				// Skipping the clear for directories would re-open the stale
+				// case, where a directory replaced by another (or by a file)
+				// keeps a routing that no longer belongs to it.
+				provesSame := item.ResourceID != "" && item.ResourceID == e.ResourceID && item.IsDir == e.IsDir
+				if item.ExtentIno == 0 && provesSame {
+					item.ExtentIno = e.ExtentIno
+				}
+				if !provesSame && e.ExtentIno != 0 {
+					fs.inodes.ClearExtentIno(existing)
+				}
+			}
+		}
 		ino := fs.inodes.EnsureInodeWithIdentity(childP, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
@@ -11655,6 +12064,13 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		}
 		if item.HasUID || item.HasGID {
 			fs.inodes.UpdateOwner(ino, item.Uid, item.Gid, item.HasUID, item.HasGID)
+		}
+		if item.ExtentIno != 0 {
+			fs.inodes.SetExtentIno(ino, item.ExtentIno)
+		}
+		if !item.IsDir && prevSize > item.Size {
+			fs.inodes.UpdateSize(ino, prevSize)
+			item.Size = prevSize
 		}
 
 		entries = append(entries, dirEntryFromCachedInfo(item, ino))
@@ -11791,6 +12207,10 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		return gofuse.OK
 	}
+	if fs.shouldUseExtentPath(childP) {
+		return fs.extentCreate(cancel, input, name, childP, out)
+	}
+
 	unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(childP)
 	defer func() {
 		if unlockRemoteCommit != nil {
@@ -11896,6 +12316,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	if st := fs.checkOpenAccess(ctx, input, entry); st != gofuse.OK {
 		return st
 	}
+	if entry != nil && entry.IsDir {
+		out.Fh = fs.allocateFileHandle(fh)
+		return gofuse.OK
+	}
 
 	// Allocate write buffer for writable opens
 	accMode := input.Flags & syscall.O_ACCMODE
@@ -11941,6 +12365,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		out.Fh = fs.allocateGitWorkspaceFileHandle(ctx, fh, rt, rel)
 		out.OpenFlags = gitWorkspaceOpenFlags(rt, rel, input.Flags)
 		return gofuse.OK
+	}
+
+	if ino, ok := fs.extentOpenIno(ctx, input.NodeId, p); ok {
+		return fs.extentOpen(cancel, input, p, ino, out)
 	}
 
 	if accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR {
@@ -12136,6 +12564,15 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 	logPath = fh.Path
 	logIno = fh.Ino
+	if fh.isExtent() {
+		source = "extent"
+		n, st := fs.extentRead(fs.jfsCtx(input.Pid, 0, 0), fh, input.Offset, buf)
+		bytesRead = n
+		if st != gofuse.OK {
+			return nil, st
+		}
+		return gofuse.ReadResultData(buf[:n]), gofuse.OK
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, fh.Path)
@@ -12971,6 +13408,21 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 	logPath = fh.Path
 	logIno = fh.Ino
+	// JuiceFS fuse Write is VFS.Write only. fuseCtx spawns a goroutine per
+	// request; sqlite WAL page spills are thousands of 4KiB Writes and that
+	// extra work made crash02's uncommitted UPDATE hold the writer lock
+	// past mptest --wait all (10s).
+	if fh.isExtent() {
+		source = "extent"
+		st := fs.extentWrite(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh, input.Offset, data)
+		if st != gofuse.OK {
+			return 0, st
+		}
+		if input.Uid != 0 && len(data) > 0 {
+			fs.extentClearSetidAfterWrite(fh, input.Uid)
+		}
+		return uint32(len(data)), gofuse.OK
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, fh.Path)
@@ -13001,6 +13453,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		}
 		if err != nil && n == 0 {
 			source = "local-error"
+			safeLogPrintf("drive9: write local-error path=%s off=%d n=%d handle_flags=0x%x write_flags=0x%x err=%v", fh.Path, input.Offset, len(data), fh.Flags, input.WriteFlags, err)
 			return 0, localErrToFuseStatus(err)
 		}
 		written = uint32(n)
@@ -13678,10 +14131,14 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFlush, perfStart, status, 0) }()
+	fh, ok := fs.fileHandles.Get(input.Fh)
+	if ok && fh.isExtent() {
+		// Extent handles release POSIX locks inside JuiceFS VFS.Flush.
+		return fs.extentFlush(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh, input.LockOwner)
+	}
 	if lockOwner := fuseLockOwner(input.LockOwner, input.Pid, input.Fh); lockOwner != 0 {
 		fs.locks.release(input.NodeId, lockOwner)
 	}
-	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.OK
 	}
@@ -14113,6 +14570,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.OK
+	}
+	if fh.isExtent() {
+		return fs.extentFsync(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh, int(input.FsyncFlags))
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -14555,6 +15015,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		ctx, cf := fuseCtx(cancel)
 		defer cf()
 		fs.observePathPolicyWithContext(ctx, fh.Path)
+		if fh.isExtent() {
+			fs.extentRelease(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh)
+			fs.deleteFileHandle(input.Fh, fh)
+			return
+		}
 		flushStatus := gofuse.OK
 		preservePendingModeOnReleaseFailure := false
 		retryPendingModeAfterContentCommit := false
@@ -16095,6 +16560,18 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 // drains the write-back uploader, and waits for inflight async kernel
 // notifications to complete. Used during graceful shutdown.
 func (fs *Dat9FS) FlushAll() {
+	if fs.extentRT != nil {
+		if fs.extentRT.stop != nil {
+			fs.extentRT.stop()
+		}
+		// Join the compaction loop before touching the VFS: a compaction in
+		// flight is uploading a merged blob and about to CAS it into meta, and
+		// returning from unmount in between would leak that blob.
+		fs.extentRT.wg.Wait()
+	}
+	if v := fs.extentVFS(); v != nil {
+		_ = v.FlushAll("")
+	}
 	// Drain all pending debounced uploads first.
 	fs.debouncer.FlushAll()
 
@@ -16109,6 +16586,9 @@ func (fs *Dat9FS) FlushAll() {
 		handles = append(handles, entry{fhID, fh})
 	})
 	for _, e := range handles {
+		if e.fh.isExtent() {
+			continue
+		}
 		// Per-handle timeout scaled by file size so large uploads complete.
 		e.fh.Lock()
 		var sz int64

@@ -1,0 +1,10 @@
+drive9
+Copyright 2026 mem9-ai
+
+This product includes software developed by Juicedata, Inc. (JuiceFS),
+licensed under the Apache License, Version 2.0.
+See https://github.com/juicedata/juicefs and the Apache License 2.0
+text distributed with that project.
+
+The drive9 JuiceFS meta engine (pkg/meta in the mornyx/juicefs fork)
+is a modification of JuiceFS, used under the terms of Apache-2.0.
