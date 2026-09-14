@@ -5775,7 +5775,8 @@ func TestLinkToleratesTransientPostCommitStatError(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
-	srcIno := fs.inodes.LookupWithIdentity("/src.txt", "file-1", 1, false, 6, time.Now())
+	srcMtime := time.Now().Add(-time.Hour).UTC()
+	srcIno := fs.inodes.LookupWithIdentity("/src.txt", "file-1", 1, false, 6, srcMtime)
 
 	var out gofuse.EntryOut
 	st := fs.Link(nil, &gofuse.LinkIn{
@@ -5789,6 +5790,15 @@ func TestLinkToleratesTransientPostCommitStatError(t *testing.T) {
 	// (nlink = source nlink + 1) instead of failing the committed link.
 	if out.NodeId != srcIno || out.Nlink != 2 {
 		t.Fatalf("entry out = node %d nlink %d, want node %d nlink 2", out.NodeId, out.Nlink, srcIno)
+	}
+	// A hard link only updates ctime: the shared inode must keep the
+	// source's cached mtime, not stamp link-creation time over it.
+	entry, ok := fs.inodes.GetEntry(srcIno)
+	if !ok {
+		t.Fatal("source entry missing after link")
+	}
+	if !entry.Mtime.Equal(srcMtime) {
+		t.Fatalf("entry mtime = %v, want the source mtime %v preserved", entry.Mtime, srcMtime)
 	}
 	if _, ok := fs.inodes.GetInode("/dst.txt"); !ok {
 		t.Fatal("dst inode missing after committed hardlink")
