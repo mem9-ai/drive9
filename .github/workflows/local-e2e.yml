@@ -306,6 +306,11 @@ jobs:
           LAYER_FUSE_STRICT_PREREQS: "1"
         run: bash e2e/layer-fs-smoke-test.sh
 
+      - name: Test pending READDIRPLUS attributes through Linux FUSE
+        env:
+          DRIVE9_REQUIRE_KERNEL_FUSE: "1"
+        run: go test ./pkg/fuse -run '^TestReadDirPlusPendingKernel$' -count=1 -timeout=2m
+
       - name: Run FUSE release gate
         id: fuse-smoke
         env:
