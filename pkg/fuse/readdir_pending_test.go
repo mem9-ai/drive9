@@ -15,11 +15,16 @@ import (
 func readDirPlusAttrs(t *testing.T, fs *Dat9FS, dirIno uint64, dirPath string) map[string]gofuse.EntryOut {
 	t.Helper()
 	dh := &DirHandle{Ino: dirIno, Path: dirPath}
+	return readDirPlusHandleAttrs(t, fs, dh)
+}
+
+func readDirPlusHandleAttrs(t *testing.T, fs *Dat9FS, dh *DirHandle) map[string]gofuse.EntryOut {
+	t.Helper()
 	fh := fs.dirHandles.Allocate(dh)
 	defer fs.dirHandles.Delete(fh)
 	out := gofuse.NewDirEntryList(make([]byte, 8192), 0)
 	if st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
-		InHeader: gofuse.InHeader{NodeId: dirIno}, Fh: fh, Size: 8192,
+		InHeader: gofuse.InHeader{NodeId: dh.Ino}, Fh: fh, Size: 8192,
 	}, out); st != gofuse.OK {
 		t.Fatalf("ReadDirPlus: %v", st)
 	}
