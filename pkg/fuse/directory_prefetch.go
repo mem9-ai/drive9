@@ -259,6 +259,7 @@ func (fs *Dat9FS) loadRemoteDirectory(ctx context.Context, dirPath string, mount
 	defer fs.dirCache.EndRequest(request)
 
 	listStart := fs.perfStart()
+	observedVersion := fs.inodes.AttrVersion()
 	var (
 		items         []client.FileInfo
 		responseBytes int64
@@ -281,6 +282,9 @@ func (fs *Dat9FS) loadRemoteDirectory(ctx context.Context, dirPath string, mount
 	}
 
 	cached := cachedFileInfos(items)
+	for i := range cached {
+		cached[i].observedVersion = observedVersion
+	}
 	if err := fs.applyBatchStats(ctx, dirPath, cached); err != nil {
 		return nil, responseBytes, err
 	}

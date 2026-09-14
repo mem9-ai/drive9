@@ -37,7 +37,6 @@ type CachedFileInfo struct {
 	ResourceID string
 	Nlink      uint32
 	ExtentIno  uint64 // JuiceFS inode for content_layout=extent files
-
 	// freshUntil is the deadline of the evidence holding this value up, and is
 	// what makes the cache's validity per name instead of per directory:
 	//
@@ -53,6 +52,10 @@ type CachedFileInfo struct {
 	// Only DirCache sets this field; a caller-built value leaves it zero and
 	// takes on the deadline of whatever read carries it into the cache.
 	freshUntil time.Time
+
+	// observedVersion is captured before fetching remote directory metadata.
+	// It is mount-local and is never persisted or sent to the server.
+	observedVersion uint64
 }
 
 type namespaceLookupKind uint8

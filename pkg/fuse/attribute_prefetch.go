@@ -388,12 +388,16 @@ func (fs *Dat9FS) refreshSiblingMetadataList(ctx context.Context, request metada
 	observation := fs.dirCache.BeginRequest(request.parentPath)
 	defer fs.dirCache.EndRequest(observation)
 	listStart := fs.perfStart()
+	observedVersion := fs.inodes.AttrVersion()
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(request.parentPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
 		return fs.resetMountViewOnAuthorizationError(err)
 	}
 	cached := cachedFileInfos(items)
+	for i := range cached {
+		cached[i].observedVersion = observedVersion
+	}
 	if err := fs.applyBatchStats(ctx, request.parentPath, cached); err != nil {
 		return err
 	}
