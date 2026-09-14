@@ -5795,6 +5795,56 @@ func TestLinkToleratesTransientPostCommitStatError(t *testing.T) {
 	}
 }
 
+// TestLinkToleratesFuseInterruptAfterCommit exercises the production failure
+// shape directly: the FUSE cancel channel closes (kernel FUSE_INTERRUPT)
+// exactly when the server commits the hardlink, so the post-commit stat runs
+// on a canceled context and fails with context.Canceled.
+func TestLinkToleratesFuseInterruptAfterCommit(t *testing.T) {
+	cancel := make(chan struct{})
+	var closeCancel sync.Once
+	var postCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			postCalls.Add(1)
+			closeCancel.Do(func() { close(cancel) })
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case http.MethodHead:
+			// Serves both the detached committed-probe (if the POST response
+			// raced with the cancel) and the post-commit confirmation stat.
+			w.Header().Set("Content-Length", "6")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.Header().Set("X-Dat9-Resource-ID", "file-1")
+			w.Header().Set("X-Dat9-Nlink", "2")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcIno := fs.inodes.LookupWithIdentity("/src.txt", "file-1", 1, false, 6, time.Now())
+
+	var out gofuse.EntryOut
+	st := fs.Link(cancel, &gofuse.LinkIn{
+		InHeader:  gofuse.InHeader{NodeId: 1},
+		Oldnodeid: srcIno,
+	}, "dst.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Link status = %v, want OK despite interrupted post-commit stat", st)
+	}
+	if got := postCalls.Load(); got < 1 {
+		t.Fatalf("POST calls = %d, want >= 1", got)
+	}
+	if _, ok := fs.inodes.GetInode("/dst.txt"); !ok {
+		t.Fatal("dst inode missing after committed hardlink")
+	}
+}
+
 func TestLinkKeepsDestinationPathWhenDestinationStatForbidden(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -8306,6 +8356,9 @@ func TestHTTPToFuseStatus_MapsClientClosedRequestToEAGAIN(t *testing.T) {
 func TestIsTransientLookupErr_Treats499AsTransient(t *testing.T) {
 	if !isTransientLookupErr(&client.StatusError{StatusCode: 499, Message: ""}) {
 		t.Fatal("499 should be classified as transient")
+	}
+	if !isTransientLookupErr(context.Canceled) {
+		t.Fatal("context.Canceled should be classified as transient")
 	}
 }
 
