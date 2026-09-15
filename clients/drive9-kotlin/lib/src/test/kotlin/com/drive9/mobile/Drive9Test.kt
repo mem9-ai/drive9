@@ -432,6 +432,47 @@ class Drive9Test {
     }
 
     @Test
+    fun uploadFileV1SkipsCrc32cWhenGcsHashPresigned() = runBlocking {
+        val received = mutableListOf<ByteArray>()
+        route("POST", "/v2/uploads/initiate") { ex ->
+            ex.requestBody.readBytes()
+            ex.sendResponseHeaders(404, -1)
+            ex.close()
+        }
+        route("POST", "/v1/uploads/initiate") { ex ->
+            ex.requestBody.readBytes()
+            val response = """{"upload_id":"v1","part_size":4,"parts":[{"number":1,"url":"$baseUrl/v1-part","size":4,"headers":{"x-goog-hash":"crc32c=abc"}}]}"""
+                .toByteArray()
+            ex.responseHeaders.add("Content-Type", "application/json")
+            ex.sendResponseHeaders(202, response.size.toLong())
+            ex.responseBody.write(response)
+            ex.close()
+        }
+        route("PUT", "/v1-part") { ex ->
+            assertEquals(null, ex.requestHeaders.getFirst("x-amz-checksum-crc32c"))
+            assertEquals("crc32c=abc", ex.requestHeaders.getFirst("x-goog-hash"))
+            received += ex.requestBody.readBytes()
+            ex.responseHeaders.add("etag", "e1")
+            ex.sendResponseHeaders(200, -1)
+            ex.close()
+        }
+        route("POST", "/v1/uploads/v1/complete") { ex ->
+            ex.sendResponseHeaders(200, -1)
+            ex.close()
+        }
+
+        val local = Files.createTempFile("drive9-kotlin-v1-gcs", ".bin")
+        Files.write(local, "abcd".toByteArray())
+        val client = Drive9Client(baseUrl, "k").withSmallFileThreshold(1)
+        try {
+            client.uploadFile(local.toString(), "/gcs-fallback.bin")
+            assertContentEquals("abcd".toByteArray(), received.single())
+        } finally {
+            local.deleteIfExists()
+        }
+    }
+
+    @Test
     fun uploadFileCancelBeforeReturnsCancelled() = runBlocking {
         var putHits = 0
         route("PUT", "/v1/fs/up-cancel.bin") { ex ->

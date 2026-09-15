@@ -366,12 +366,17 @@ class TransferMixin:
         checksum = part.checksum_crc32c
         if not checksum:
             checksum = _compute_crc32c(data)
-        headers = {"x-amz-checksum-crc32c": checksum}
+        headers = {}
+        should_send_checksum = True
         if part.headers:
             for k, v in part.headers.items():
                 if k.lower() == "host":
                     continue
                 headers[k] = v
+                if k.lower() in ("x-amz-checksum-crc32c", "x-goog-hash"):
+                    should_send_checksum = False
+        if should_send_checksum:
+            headers["x-amz-checksum-crc32c"] = checksum
         resp = self.session.put(part.url, data=data, headers=headers)
         if resp.status_code >= 300:
             raise StatusError(

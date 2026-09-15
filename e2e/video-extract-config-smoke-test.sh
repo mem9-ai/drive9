@@ -161,11 +161,17 @@ with open(file_path, "rb") as data_file:
             raise SystemExit(f"short read for part {idx}: got {len(data)} expected {size}")
         req = urllib.request.Request(part["url"], data=data, method="PUT")
         req.add_header("Content-Length", str(size))
-        for key, value in (part.get("headers") or {}).items():
+        headers = part.get("headers") or {}
+        for key, value in headers.items():
             req.add_header(key, value)
-        if part.get("checksum_crc32c"):
+        # Only inject the S3-style checksum header when the server did not
+        # already presign a checksum header. Non-S3 backends (e.g. GCS) sign
+        # CRC32C into x-goog-hash; adding x-amz-checksum-crc32c on top of that
+        # fails with 400 "Header must be signed".
+        lower_headers = {k.lower() for k in headers}
+        if part.get("checksum_crc32c") and "x-amz-checksum-crc32c" not in lower_headers and "x-goog-hash" not in lower_headers:
             req.add_header("x-amz-checksum-crc32c", part["checksum_crc32c"])
-        elif part.get("checksum_sha256"):
+        elif part.get("checksum_sha256") and "x-amz-checksum-sha256" not in lower_headers and "x-goog-meta-drive9-sha256" not in lower_headers:
             req.add_header("x-amz-checksum-sha256", part["checksum_sha256"])
         with urllib.request.urlopen(req, timeout=300) as resp:
             if getattr(resp, "status", 200) >= 300:
