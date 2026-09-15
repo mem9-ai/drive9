@@ -384,12 +384,22 @@ async function uploadOnePart(
 ): Promise<void> {
   const checksum = checksumCrc32c || computeCrc32c(data);
   const headers: Record<string, string> = {};
+  let shouldSendChecksum = true;
   if (signedHeaders) {
     for (const [k, v] of Object.entries(signedHeaders)) {
-      if (typeof v === "string" && k.toLowerCase() !== "host") headers[k] = v;
+      if (typeof v === "string" && k.toLowerCase() !== "host") {
+        headers[k] = v;
+        if (k.toLowerCase() === "x-amz-checksum-crc32c" || k.toLowerCase() === "x-goog-hash") {
+          shouldSendChecksum = false;
+        }
+      }
     }
   }
-  headers["x-amz-checksum-crc32c"] = checksum;
+  // Only inject the S3-style CRC32C header when the server did not already
+  // presign a checksum header (GCS signs CRC32C into x-goog-hash).
+  if (shouldSendChecksum) {
+    headers["x-amz-checksum-crc32c"] = checksum;
+  }
   const resp = await fetch(url, {
     method: "PUT",
     headers,

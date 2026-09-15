@@ -423,15 +423,17 @@ impl Client {
             .clone()
             .unwrap_or_else(|| compute_crc32c(data));
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-amz-checksum-crc32c",
-            HeaderValue::from_str(&checksum).unwrap(),
-        );
+        let mut should_send_checksum = true;
         if let Some(ref ph) = part.headers {
             for (k, v) in ph {
                 if let Ok(hv) = HeaderValue::from_str(v.as_str().unwrap_or("")) {
                     if k.eq_ignore_ascii_case("host") {
                         continue;
+                    }
+                    if k.eq_ignore_ascii_case("x-amz-checksum-crc32c")
+                        || k.eq_ignore_ascii_case("x-goog-hash")
+                    {
+                        should_send_checksum = false;
                     }
                     headers.insert(
                         HeaderName::from_bytes(k.as_bytes()).unwrap_or(CONTENT_TYPE),
@@ -439,6 +441,12 @@ impl Client {
                     );
                 }
             }
+        }
+        if should_send_checksum {
+            headers.insert(
+                "x-amz-checksum-crc32c",
+                HeaderValue::from_str(&checksum).unwrap(),
+            );
         }
         let resp = self
             .http

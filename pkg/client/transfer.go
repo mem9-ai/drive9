@@ -243,6 +243,20 @@ func isForbiddenPresignedHeader(key string) bool {
 		strings.EqualFold(key, "x-dat9-actor")
 }
 
+// presignedChecksumHeader reports whether headers already carry a checksum
+// header that the server signed into the presigned URL (S3 uses
+// x-amz-checksum-crc32c; GCS uses x-goog-hash). Callers must not inject an
+// additional x-amz-checksum-crc32c header when one of these is present, or the
+// object store rejects the request for carrying an unsigned header.
+func presignedChecksumHeader(headers map[string]string) bool {
+	for k := range headers {
+		if strings.EqualFold(k, "x-amz-checksum-crc32c") || strings.EqualFold(k, "x-goog-hash") {
+			return true
+		}
+	}
+	return false
+}
+
 func boundedUploadParallelism(partSize int64, partCount int) int {
 	parallelism := uploadParallelism(partSize)
 	if partCount > 0 && parallelism > partCount {
@@ -910,7 +924,13 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 		req.Header.Set(k, v)
 	}
 	req.ContentLength = int64(len(data))
-	req.Header.Set("x-amz-checksum-crc32c", checksum)
+	// Only inject the S3-style CRC32C header when the server did not already
+	// presign a checksum header. Non-S3 backends (e.g. GCS) sign CRC32C into
+	// x-goog-hash instead; adding x-amz-checksum-crc32c on top of that makes the
+	// request fail with 400 "Header must be signed".
+	if !presignedChecksumHeader(part.Headers) {
+		req.Header.Set("x-amz-checksum-crc32c", checksum)
+	}
 
 	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
 	if err != nil {

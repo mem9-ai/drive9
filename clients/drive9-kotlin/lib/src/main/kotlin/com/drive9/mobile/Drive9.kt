@@ -716,7 +716,13 @@ public class Drive9Client(
 
     private fun uploadOnePart(part: Drive9PartUrl, data: ByteArray): String {
         val headers = part.headers.toMutableMap()
-        headers["x-amz-checksum-crc32c"] = part.checksumCrc32c ?: crc32cBase64(data)
+        val hasChecksumHeader = headers.keys.any {
+            it.equals("x-amz-checksum-crc32c", ignoreCase = true) ||
+                it.equals("x-goog-hash", ignoreCase = true)
+        }
+        if (!hasChecksumHeader) {
+            headers["x-amz-checksum-crc32c"] = part.checksumCrc32c ?: crc32cBase64(data)
+        }
         val result = rawPut(part.url, headers, data, retryOnForbidden = false)
         if (result.status !in 200..299) throw errorFrom(result.status, result.body)
         return result.headers["etag"].orEmpty()

@@ -640,7 +640,13 @@ public final class Drive9Client: @unchecked Sendable {
 
     private func uploadOnePart(_ part: Drive9PartURL, data: Data) async throws -> String {
         var headers = part.headers
-        headers["x-amz-checksum-crc32c"] = part.checksumCrc32c ?? crc32cBase64(data)
+        let hasChecksumHeader = headers.keys.contains(where: {
+            $0.caseInsensitiveCompare("x-amz-checksum-crc32c") == .orderedSame
+                || $0.caseInsensitiveCompare("x-goog-hash") == .orderedSame
+        })
+        if !hasChecksumHeader {
+            headers["x-amz-checksum-crc32c"] = part.checksumCrc32c ?? crc32cBase64(data)
+        }
         let response = try await rawPut(url: part.url, headers: headers, data: data)
         guard (200...299).contains(response.status) else { throw errorFrom(data: response.body, status: response.status) }
         return response.headers["etag"] ?? ""
