@@ -267,6 +267,27 @@ unmount_mount() {
   return 0
 }
 
+force_unmount() {
+  # Last-resort teardown mirroring the blackbox harness force path: a lazy
+  # unmount clears kernel entries that survived a clean `drive9 umount`
+  # (observed on Linux: the mount process exits with code 0 while a
+  # mountinfo entry — possibly a stacked one from an earlier mount — lingers).
+  set +e
+  for cmd in "fusermount3 -uz" "fusermount -uz" "umount -l"; do
+    # shellcheck disable=SC2086
+    if command -v ${cmd%% *} >/dev/null 2>&1; then
+      # shellcheck disable=SC2086
+      ${cmd} "$MOUNT_POINT" >/dev/null 2>&1
+      if ! is_mounted "$MOUNT_POINT"; then
+        set -e
+        return 0
+      fi
+    fi
+  done
+  set -e
+  return 1
+}
+
 wait_mount_settled() {
   # After `drive9 umount` on Linux the /etc/mtab entry clears immediately
   # while the kernel mountinfo entry can persist for tens of seconds while
@@ -280,6 +301,18 @@ wait_mount_settled() {
     fi
     sleep 2
   done
+  # Settle budget exhausted: try the force fallbacks, then a short final
+  # wait. Removal still only happens once the mountpoint is verifiably gone.
+  if is_mounted "$MOUNT_POINT"; then
+    force_unmount || true
+    local final=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+    while [ "$(date +%s)" -lt "$final" ]; do
+      if ! is_mounted "$MOUNT_POINT"; then
+        return 0
+      fi
+      sleep 1
+    done
+  fi
   ! is_mounted "$MOUNT_POINT"
 }
 
@@ -581,6 +614,8 @@ cleanup() {
     mountpoint "$MOUNT_POINT" >&2 2>&1 || true
     echo "mount table entries:" >&2
     mount | grep -F "$MOUNT_POINT" >&2 || true
+    echo "mountinfo entries:" >&2
+    grep -F "$MOUNT_POINT" /proc/self/mountinfo >&2 2>/dev/null || echo "(none)" >&2
     echo "live drive9 mount processes:" >&2
     ps -eo pid,ppid,etime,args | grep '[d]rive9 mount' >&2 || echo "(none)" >&2
     echo "all live drive9 processes:" >&2
