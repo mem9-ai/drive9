@@ -47,6 +47,10 @@ class Drive9NodeWatch(BaseModule):
         result_path = artifact / "watch-result.json"
         ready_path = artifact / "watch-ready"
         probe_log = artifact / "watch-probe.log"
+        stamp = artifact / "trigger.stamp"
+        payload = artifact / "target-v2.txt"
+        stamp.write_text(f"{int(time.time() * 1000)}\n", encoding="utf-8")
+        payload.write_text(f"v2-remote-{int(time.time() * 1000)}\n", encoding="utf-8")
 
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
@@ -56,11 +60,19 @@ class Drive9NodeWatch(BaseModule):
             env = ctx.deps.node_env(node_bin)
             for key, value in ctx.target.base_env().items():
                 env.setdefault(key, value)
+            expected_payload = payload.read_text(encoding="utf-8")
             ready_path.unlink(missing_ok=True)
             result_path.unlink(missing_ok=True)
             with probe_log.open("wb") as log:
                 proc = subprocess.Popen(
-                    [node_bin, str(probe_js), str(handle.mountpoint), str(result_path), str(ready_path)],
+                    [
+                        node_bin,
+                        str(probe_js),
+                        str(handle.mountpoint),
+                        str(result_path),
+                        str(ready_path),
+                        expected_payload,
+                    ],
                     cwd=str(artifact),
                     env=env,
                     stdout=log,
@@ -69,7 +81,7 @@ class Drive9NodeWatch(BaseModule):
                 )
             try:
                 self._wait_ready(ready_path, proc, probe_log)
-                mutation = self._remote_mutation(ctx, handle, artifact)
+                mutation = self._remote_mutation(ctx, handle, stamp, payload)
                 outcome = self._wait_probe(proc, result_path, probe_log)
             finally:
                 if proc.poll() is None:
@@ -78,7 +90,8 @@ class Drive9NodeWatch(BaseModule):
             report = self._build_report(outcome, mutation)
             write_json(ctx.result_dir / "node_watch.json", report)
             for name, value in report["metrics"].items():
-                ctx.metric(f"drive9.node_watch.{name}", float(value), "ms")
+                if value is not None:
+                    ctx.metric(f"drive9.node_watch.{name}", float(value), "ms")
             self._apply_policy(report)
             return report
         finally:
@@ -94,28 +107,30 @@ class Drive9NodeWatch(BaseModule):
             time.sleep(0.2)
         raise BlackboxError(f"watch probe did not signal readiness within {READY_TIMEOUT_S}s; see {probe_log}")
 
-    def _remote_mutation(self, ctx: Context, handle: Any, artifact: Path) -> dict[str, Any]:
+    def _remote_mutation(self, ctx: Context, handle: Any, stamp: Path, payload: Path) -> dict[str, Any]:
         """Mutate trigger.stamp + target.txt through the CLI (server-side)."""
-        stamp = artifact / "trigger.stamp"
-        stamp.write_text(f"{int(time.time() * 1000)}\n", encoding="utf-8")
-        payload = artifact / "target-v2.txt"
-        payload.write_text(f"v2-remote-{int(time.time() * 1000)}\n", encoding="utf-8")
         remote_root = handle.remote_root
         trigger_result = ctx.target.drive9("node-watch-trigger-cp", ["fs", "cp", str(stamp), f":{remote_root}/trigger.stamp"])
         if not trigger_result.ok:
             raise BlackboxError(f"failed to write trigger.stamp via CLI; see {trigger_result.stderr}")
-        # Overwriting in place keeps the inode stable for the file watchers; if
-        # the CLI refuses to overwrite, fall back to remove+create and record
-        # the weaker mutation style.
+        # --force keeps this an in-place overwrite so the file watchers observe
+        # an update to a stable file rather than an inode replacement; fall
+        # back to remove+create only for genuine overwrite failures.
         overwrite = ctx.target.drive9(
             "node-watch-target-cp",
-            ["fs", "cp", str(payload), f":{remote_root}/target.txt"],
-            ok_codes=(0,),
+            ["fs", "cp", "--force", str(payload), f":{remote_root}/target.txt"],
         )
         mutation_style = "overwrite"
         if not overwrite.ok:
-            ctx.target.drive9("node-watch-target-rm", ["fs", "rm", f":{remote_root}/target.txt"])
-            ctx.target.drive9("node-watch-target-cp-2", ["fs", "cp", str(payload), f":{remote_root}/target.txt"])
+            remove_result = ctx.target.drive9("node-watch-target-rm", ["fs", "rm", f":{remote_root}/target.txt"])
+            if not remove_result.ok:
+                raise BlackboxError(f"fallback fs rm failed; see {remove_result.stderr}")
+            retry_result = ctx.target.drive9(
+                "node-watch-target-cp-2",
+                ["fs", "cp", str(payload), f":{remote_root}/target.txt"],
+            )
+            if not retry_result.ok:
+                raise BlackboxError(f"fallback fs cp failed; see {retry_result.stderr}")
             mutation_style = "remove+create"
         return {"mutation_style": mutation_style, "trigger_epoch_ms": stamp.read_text(encoding="utf-8").strip()}
 
@@ -123,8 +138,11 @@ class Drive9NodeWatch(BaseModule):
         try:
             code = proc.wait(timeout=PROBE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            ctx_err = f"; see {probe_log}"
-            raise BlackboxError(f"watch probe exceeded {PROBE_TIMEOUT_S}s{ctx_err}") from None
+            raise BlackboxError(f"watch probe exceeded {PROBE_TIMEOUT_S}s; see {probe_log}") from None
+        if code not in (0, 3):
+            # 1 = probe crash (and anything unexpected): the result file, if
+            # any, describes an aborted observation and must not be scored.
+            raise BlackboxError(f"watch probe exited with code {code}; see {probe_log}")
         if not result_path.exists():
             raise BlackboxError(f"watch probe (code {code}) wrote no result; see {probe_log}")
         with result_path.open(encoding="utf-8") as handle:
@@ -134,10 +152,20 @@ class Drive9NodeWatch(BaseModule):
         phase_a = outcome.get("phase_a", {})
         phase_b = outcome.get("phase_b", {})
 
+        # Latencies are measured from the mutation timestamp the harness
+        # embedded in trigger.stamp (written immediately before the target
+        # overwrite), falling back to when the probe first saw the trigger.
+        reference: float | None = None
+        trigger_value = str(phase_b.get("trigger_value") or "").strip()
+        if trigger_value.isdigit():
+            reference = float(trigger_value)
+        elif phase_b.get("trigger_seen_epoch_ms") is not None:
+            reference = float(phase_b["trigger_seen_epoch_ms"])
+
         def latency_ms(channel_epoch_ms: Any) -> float | None:
-            if channel_epoch_ms is None or phase_b.get("trigger_seen_epoch_ms") is None:
+            if channel_epoch_ms is None or reference is None:
                 return None
-            delta = float(channel_epoch_ms) - float(phase_b["trigger_seen_epoch_ms"])
+            delta = float(channel_epoch_ms) - reference
             return delta if delta >= 0 else None
 
         metrics = {
@@ -154,20 +182,28 @@ class Drive9NodeWatch(BaseModule):
             "watcher_errors": outcome.get("watcher_errors", {}),
             "phase_a_local_events": phase_a,
             "phase_b_remote": phase_b,
-            "metrics": {k: (v if v is not None else -1.0) for k, v in metrics.items()},
+            "metrics": metrics,
             "remote_event_observed": remote_event_ms is not None,
             "remote_event_ms": remote_event_ms,
             "poll_fallback_ms": poll_ms,
             "content_verified": bool(phase_b.get("content_verified")),
-            "probe_exit_observed_change": bool(phase_b.get("content_verified")),
+            "content_match": phase_b.get("content_match"),
         }
         return report
 
     def _apply_policy(self, report: dict[str, Any]) -> None:
         if not report["content_verified"]:
+            match = report.get("content_match")
+            detail = (
+                "the mount only ever served a truncated/partial payload"
+                if match == "truncated"
+                else "the mount served payload bytes from a different round"
+                if match == "mismatch"
+                else "the full expected payload never became observable through the mount "
+                "(neither watch events nor stat polling saw any change within the probe window)"
+            )
             raise BlackboxError(
-                "remote CLI mutation never became visible through the mount "
-                "(neither watch events nor stat polling observed it within the probe window)"
+                "remote CLI mutation did not become fully visible through the mount: " + detail
             )
         if report["remote_event_observed"]:
             return

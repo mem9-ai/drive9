@@ -10,6 +10,19 @@ from harness.core import BlackboxError, Context, write_json
 from harness.module_base import BaseModule, read_text
 from suites.community.node_fs.deps import ensure_node_fs_deps, module_cfg
 
+# An exclusion entry may be a plain reason string (applies on every platform)
+# or {"reason": ..., "platforms": ["darwin", ...]} for failures that only
+# reproduce on specific platforms (e.g. the darwin lchmod path).
+def scoped_exclusions(exclusions: dict[str, Any]) -> dict[str, tuple[str, tuple[str, ...] | None]]:
+    scoped: dict[str, tuple[str, tuple[str, ...] | None]] = {}
+    for name, item in exclusions.items():
+        if isinstance(item, dict):
+            platforms = item.get("platforms")
+            scoped[str(name)] = (str(item.get("reason", "")), tuple(str(p) for p in platforms) if platforms else None)
+        else:
+            scoped[str(name)] = (str(item), None)
+    return scoped
+
 # tools/test.py exits 0 when everything passed and 1 when tests failed; both are
 # parseable outcomes. Anything else (or 124 from the run_cmd timeout) is a
 # harness-level anomaly and must fail closed.
@@ -48,7 +61,7 @@ class CommunityNodeFS(BaseModule):
         node_src, node_bin = ensure_node_fs_deps(ctx)
         node_version = str(cfg["node_version"])
         filter_pattern = str(cfg.get("test_filter", "parallel/test-fs-*"))
-        exclusions: dict[str, str] = {str(k): str(v) for k, v in cfg.get("exclusions", {}).items()}
+        exclusions = scoped_exclusions(cfg.get("exclusions", {}))
 
         selected = self.select_tests(node_src, filter_pattern, exclusions)
         if not selected:
@@ -75,6 +88,11 @@ class CommunityNodeFS(BaseModule):
             jobs = str(int(os.environ.get("NODE_FS_JOBS", "1")))
             per_test_timeout = str(int(os.environ.get("NODE_FS_TEST_TIMEOUT_S", "300")))
             timeout_s = int(os.environ.get("NODE_FS_TIMEOUT_S", str(self.timeout)))
+            # Reserve wall-clock headroom for the retry pass and the unmount;
+            # the runner kills the whole module at timeout_s, so a first pass
+            # allowed to run the full budget could never be retried.
+            first_pass_timeout = max(600, timeout_s - 600)
+            retry_budget = max(300, timeout_s - first_pass_timeout)
             cmd = [
                 sys.executable,
                 str(node_src / "tools" / "test.py"),
@@ -89,7 +107,7 @@ class CommunityNodeFS(BaseModule):
                 "community-node-fs",
                 [*cmd, *[f"parallel/{name}" for name in selected]],
                 cwd=node_src,
-                timeout=timeout_s,
+                timeout=first_pass_timeout,
                 env=env,
                 ok_codes=_TEST_RUNNER_OK_CODES,
             )
@@ -102,9 +120,12 @@ class CommunityNodeFS(BaseModule):
             failed_names = first["failed_tests"]
             retry_report: dict[str, Any] = {}
             if failed_names:
-                retry_report = self._retry_failed(ctx, node_src, cmd, failed_names, env, per_test_timeout)
+                retry_report = self._retry_failed(ctx, node_src, cmd, failed_names, env, per_test_timeout, retry_budget)
             log = ctx.artifact_dir(self.id) / "node-fs.log"
-            log.write_text(stdout_text + "\n" + stderr_text, encoding="utf-8")
+            artifact_text = stdout_text + "\n" + stderr_text
+            if retry_report.get("stdout_tail"):
+                artifact_text += "\n=== retry pass (failed subset re-run) ===\n" + retry_report["stdout_tail"]
+            log.write_text(artifact_text, encoding="utf-8")
             report = self.combine(first, retry_report, node_version, filter_pattern, selected, exclusions)
             write_json(ctx.result_dir / "node_fs.json", report)
             ctx.metric("community.node_fs.pass_rate", float(report["pass_rate"]), "ratio")
@@ -120,7 +141,7 @@ class CommunityNodeFS(BaseModule):
         finally:
             ctx.target.unmount(handle)
 
-    def select_tests(self, node_src: Path, filter_pattern: str, exclusions: dict[str, str]) -> list[str]:
+    def select_tests(self, node_src: Path, filter_pattern: str, exclusions: dict[str, tuple[str, tuple[str, ...] | None]]) -> list[str]:
         """Return sorted test filenames under test/parallel matching the filter.
 
         Only ``test-fs-*.js`` files are in scope. Exclusions do not remove a
@@ -145,18 +166,21 @@ class CommunityNodeFS(BaseModule):
         failed_names: list[str],
         env: dict[str, str],
         per_test_timeout: str,
+        retry_budget: int,
     ) -> dict[str, Any]:
         """Re-run only the failed subset once and return its parse result."""
         result = ctx.target.run_cmd(
             "community-node-fs",
             [*cmd, *[f"parallel/{name}" for name in failed_names]],
             cwd=node_src,
-            timeout=max(60, int(per_test_timeout) * max(1, len(failed_names))),
+            timeout=max(60, min(int(per_test_timeout) * max(1, len(failed_names)), retry_budget)),
             env=env,
             ok_codes=_TEST_RUNNER_OK_CODES,
         )
         stdout_text = read_text(result.stdout)
-        return self.parse(stdout_text, str(result.stdout), result.code)
+        report = self.parse(stdout_text, str(result.stdout), result.code)
+        report["stdout_tail"] = self._latest_section(stdout_text)
+        return report
 
     @staticmethod
     def _latest_section(text: str) -> str:
@@ -188,10 +212,12 @@ class CommunityNodeFS(BaseModule):
             anomaly = f"runner_exit_{rc}"
         elif rc == 0 and failed > 0:
             anomaly = "exit_zero_with_failures"
-        elif len(failed_names) > failed:
-            # More failed files than the runner's failed counter: parsing lost
-            # or duplicated information — fail closed instead of guessing.
-            anomaly = "failed_names_exceed_counter"
+        elif len(failed_names) != failed:
+            # The parsed failed-file list disagrees with the runner's failed
+            # counter in either direction: a truncated/absent "Failed tests:"
+            # footer would silently turn real failures into a clean report.
+            # Fail closed instead of guessing which side lost information.
+            anomaly = f"failed_names_counter_mismatch(parsed={len(failed_names)},counter={failed})"
         report: dict[str, Any] = {
             "rc": rc,
             "log": log_path,
@@ -210,7 +236,7 @@ class CommunityNodeFS(BaseModule):
         node_version: str,
         filter_pattern: str,
         selected: list[str],
-        exclusions: dict[str, str],
+        exclusions: dict[str, tuple[str, tuple[str, ...] | None]],
     ) -> dict[str, Any]:
         if anomaly := first.get("anomaly"):
             raise BlackboxError(f"node fs first-pass anomaly ({anomaly}); see {first['log']}")
@@ -219,10 +245,33 @@ class CommunityNodeFS(BaseModule):
         first_failures = set(first["failed_tests"])
         consistent = sorted(first_failures & set(retry.get("failed_tests", []))) if retry else sorted(first_failures)
         flaky_recovered = sorted(first_failures - set(consistent))
-        unexpected = [name for name in consistent if name not in exclusions]
-        excluded_failures = [name for name in consistent if name in exclusions]
-        stale = sorted(set(exclusions) - set(consistent))
+        platform = sys.platform
+
+        def exclusion_applies(name: str) -> bool:
+            entry = exclusions.get(name)
+            if entry is None:
+                return False
+            _, platforms = entry
+            return platforms is None or platform in platforms
+
+        unexpected = [name for name in consistent if not exclusion_applies(name)]
+        excluded_failures = [name for name in consistent if exclusion_applies(name)]
+        # Stale only on platforms where the exclusion is scoped; a darwin-only
+        # exclusion that passes on linux is not stale, it is out of scope.
+        stale = sorted(
+            name
+            for name, (_, platforms) in exclusions.items()
+            if (platforms is None or platform in platforms) and name not in consistent
+        )
+        out_of_scope = sorted(
+            name
+            for name, (_, platforms) in exclusions.items()
+            if platforms is not None and platform not in platforms
+        )
         passed = first["passed"]
+        # Tests that only failed the first pass pass the retry: count them as
+        # passed so the pass rate reflects the retry-aware verdict.
+        passed_total = passed + len(flaky_recovered)
         ran = passed + len(first_failures)
         report: dict[str, Any] = {
             "schema": "drive9-blackbox-node-fs/v1",
@@ -232,7 +281,7 @@ class CommunityNodeFS(BaseModule):
             "log": first["log"],
             "selected_tests": len(selected),
             "excluded_tests": len(exclusions),
-            "passed": passed,
+            "passed": passed_total,
             "failed": len(consistent),
             "failed_tests": consistent,
             "flaky_recovered": flaky_recovered,
@@ -242,6 +291,7 @@ class CommunityNodeFS(BaseModule):
             "excluded_failures": excluded_failures,
             "excluded_failure_count": len(excluded_failures),
             "stale_exclusions": stale,
-            "pass_rate": (passed / ran) if ran else 0.0,
+            "out_of_scope_exclusions": out_of_scope,
+            "pass_rate": (passed_total / ran) if ran else 0.0,
         }
         return report

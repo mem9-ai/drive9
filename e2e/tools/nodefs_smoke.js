@@ -91,10 +91,10 @@ async function runCreate(workDir, manifestPath) {
   const large = payload('drive9-nodefs-large', largeBytes);
   const small = payload('drive9-nodefs-small', 64 * 1024);
 
-  // --- basic sync/promises roundtrip -------------------------------------
-  await fsp.writeFile(path.join(workDir, 'roundtrip.txt'), 'drive9 node fs smoke\n', 'utf8');
+  // --- basic sync roundtrip (the sync binding is the thing under test) ----
+  fs.writeFileSync(path.join(workDir, 'roundtrip.txt'), 'drive9 node fs smoke\n', 'utf8');
   eq('writeFileSync/readFileSync utf8 roundtrip',
-     await fsp.readFile(path.join(workDir, 'roundtrip.txt'), 'utf8'), 'drive9 node fs smoke\n');
+     fs.readFileSync(path.join(workDir, 'roundtrip.txt'), 'utf8'), 'drive9 node fs smoke\n');
   await fsp.appendFile(path.join(workDir, 'roundtrip.txt'), 'appended\n', 'utf8');
   eq('appendFile appends', (await fsp.readFile(path.join(workDir, 'roundtrip.txt'), 'utf8')).endsWith('appended\n'), true);
 
@@ -192,7 +192,10 @@ async function runCreate(workDir, manifestPath) {
   await fsp.writeFile(statPath, 'stat me longer\n');
   const after = await fsp.stat(statPath);
   ok('stat size tracks write', after.size === 'stat me longer\n'.length, `size=${after.size}`);
-  ok('mtime advances on write', after.mtimeMs >= before.mtimeMs, `before=${before.mtimeMs} after=${after.mtimeMs}`);
+  // The deliberate 1.1s gap above makes a strictly greater mtime safe even on
+  // filesystems with 1-second timestamp granularity; `>=` would let a mount
+  // that never advances mtime pass.
+  ok('mtime strictly advances on write', after.mtimeMs > before.mtimeMs, `before=${before.mtimeMs} after=${after.mtimeMs}`);
   const bigStat = await fsp.stat(statPath, { bigint: true });
   eq('bigint stat size', bigStat.size, BigInt('stat me longer\n'.length));
   if (typeof fsp.statfs === 'function') {
@@ -242,29 +245,38 @@ async function runCreate(workDir, manifestPath) {
   await fsp.rm(tmpDir, { recursive: true, force: true });
   eq('rm recursive removes mkdtemp dir', await errorCode(() => fsp.access(tmpDir)), 'ENOENT');
 
+  // --- manifest: exact bytes for every persisted file ----------------------
+  // Existence alone hides content loss (same-size zeroed files pass); record
+  // sha256+size per entry and re-hash every entry after remount.
+  const entryPaths = [
+    'roundtrip.txt',
+    'large-stream.bin',
+    'small-stream.bin',
+    'handle.bin',
+    'append.bin',
+    'published.txt',
+    'replace-old.txt',
+    'stat-target.txt',
+    'hard-link.bin',
+    'large-copy.bin',
+    'large-copy-ficlone.bin',
+    'mode.txt',
+    'utimes.txt',
+    'cross-channel/node-written.txt',
+    'tree/a/b/leaf.txt',
+  ];
+  const entries = [];
+  for (const rel of entryPaths) {
+    const buf = await fsp.readFile(path.join(workDir, rel));
+    entries.push({ path: rel, sha256: sha256(buf), size: buf.length });
+  }
   const manifest = {
     large_sha256: sha256(large),
     large_size: large.length,
     small_sha256: sha256(small),
     hard_sha256: sha256(payload('drive9-nodefs-hard', 8192)),
     cross_content: crossContent,
-    entries: [
-      'large-stream.bin',
-      'small-stream.bin',
-      'handle.bin',
-      'append.bin',
-      'published.txt',
-      'replace-old.txt',
-      'roundtrip.txt',
-      'stat-target.txt',
-      'hard-link.bin',
-      'large-copy.bin',
-      'large-copy-ficlone.bin',
-      'mode.txt',
-      'utimes.txt',
-      'cross-channel/node-written.txt',
-      'tree/a/b/leaf.txt',
-    ],
+    entries,
     symlink: 'tree/a/b/leaf-link',
     dir_entries: {
       top: ['append.bin', 'cross-channel', 'handle.bin', 'hard-link.bin', 'large-copy-ficlone.bin', 'large-copy.bin', 'large-stream.bin', 'mode.txt', 'published.txt', 'replace-old.txt', 'roundtrip.txt', 'small-stream.bin', 'stat-target.txt', 'tree', 'utimes.txt'],
@@ -278,15 +290,21 @@ async function runCreate(workDir, manifestPath) {
 async function runVerify(workDir, manifestPath) {
   const manifest = JSON.parse(await fsp.readFile(manifestPath, 'utf8'));
   for (const entry of manifest.entries) {
-    const target = path.join(workDir, entry);
-    let detail = 'missing';
+    const target = path.join(workDir, entry.path);
+    let detail = '';
     try {
-      detail = `isFile=${(await fsp.stat(target)).isFile()}`;
+      const buf = await fsp.readFile(target);
+      if (!(await fsp.stat(target)).isFile()) {
+        detail = 'not a regular file';
+      } else if (buf.length !== entry.size) {
+        detail = `size want=${entry.size} got=${buf.length}`;
+      } else if (sha256(buf) !== entry.sha256) {
+        detail = 'sha256 mismatch';
+      }
     } catch (err) {
-      ok(`remounted entry exists: ${entry}`, false, err.code || err.message);
-      continue;
+      detail = err.code || err.message;
     }
-    ok(`remounted entry exists: ${entry}`, detail === 'isFile=true', detail);
+    ok(`remounted entry content matches: ${entry.path}`, !detail, detail);
   }
   eq('remounted large stream checksum', sha256(await fsp.readFile(path.join(workDir, 'large-stream.bin'))), manifest.large_sha256);
   eq('remounted large stream size', (await fsp.stat(path.join(workDir, 'large-stream.bin'))).size, manifest.large_size);

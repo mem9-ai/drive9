@@ -509,11 +509,13 @@ blackbox (`community.node_fs`), not here. The workload itself is
    stat/`statfs` sanity, `realpath(.native)`, `copyFile` incl.
    `COPYFILE_FICLONE`, `chmod`/`utimes`, and the `ENOENT`/`EEXIST`/
    `ENOTEMPTY`/`EISDIR` error-code matrix
-5. Verify cross-channel consistency both ways: CLI `fs cat` reads a
-   Node-written file; mounted Node reads a CLI-uploaded fixture with matching
+5. Verify cross-channel consistency both ways with bounded polling (auto
+   durability defers remote commits; FUSE dir caches delay CLI uploads
+   appearing on the mount): CLI `fs cat` reads a Node-written file byte-exact
+   via SHA-256; mounted Node reads a CLI-uploaded fixture with matching
    SHA-256
 6. Unmount, remount, and re-verify the tree against the checksum manifest
-   (entries, checksums, symlink target, directory listings, dirent types)
+   (per-entry sha256+size, symlink target, directory listings, dirent types)
 7. Preserve run root, mount log, and manifest on failure
 
 ### `fuse-sqlite-commit-sequence.sh`
@@ -939,6 +941,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `FUSE_NODEFS_WORKLOAD_TIMEOUT_S` | `240` | `fuse-nodefs-smoke-test.sh` |
 | `FUSE_NODEFS_LARGE_MB` | `9` | `fuse-nodefs-smoke-test.sh` |
 | `FUSE_NODEFS_MIN_NODE_VERSION` | `18.17.0` | `fuse-nodefs-smoke-test.sh` |
+| `FUSE_NODEFS_CROSS_TIMEOUT_S` | `60` | `fuse-nodefs-smoke-test.sh` |
 | `FUSE_NODEFS_KEEP_ARTIFACTS` | `0` | `fuse-nodefs-smoke-test.sh` |
 | `FUSE_SQLITE_WAL_AUTOCHECKPOINT` | `100` | `fuse-sqlite-commit-sequence.sh` |
 | `FUSE_SQLITE_COMMIT_TIMEOUT_S` | `600` | `fuse-sqlite-commit-sequence.sh` |

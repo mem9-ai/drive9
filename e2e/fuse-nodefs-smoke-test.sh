@@ -24,6 +24,7 @@ FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 FUSE_NODEFS_KEEP_ARTIFACTS="${FUSE_NODEFS_KEEP_ARTIFACTS:-0}"
 FUSE_NODEFS_WORKLOAD_TIMEOUT_S="${FUSE_NODEFS_WORKLOAD_TIMEOUT_S:-240}"
+FUSE_NODEFS_CROSS_TIMEOUT_S="${FUSE_NODEFS_CROSS_TIMEOUT_S:-60}"
 FUSE_NODEFS_LARGE_MB="${FUSE_NODEFS_LARGE_MB:-9}"
 FUSE_NODEFS_MIN_NODE_VERSION="${FUSE_NODEFS_MIN_NODE_VERSION:-18.17.0}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
@@ -321,13 +322,80 @@ drive9_retry() {
 }
 
 run_nodefs() {
-  local timeout_cmd=()
-  if [ "$FUSE_NODEFS_WORKLOAD_TIMEOUT_S" != "0" ] && command -v timeout >/dev/null 2>&1; then
-    timeout_cmd=(timeout --kill-after=10s "${FUSE_NODEFS_WORKLOAD_TIMEOUT_S}s")
+  # Enforce the workload timeout on hosts without GNU timeout (stock macOS)
+  # via a background watchdog; relay the workload's exit status and map
+  # watchdog kills to the conventional 124.
+  if [ "$FUSE_NODEFS_WORKLOAD_TIMEOUT_S" = "0" ] || command -v timeout >/dev/null 2>&1; then
+    local timeout_cmd=()
+    if [ "$FUSE_NODEFS_WORKLOAD_TIMEOUT_S" != "0" ]; then
+      timeout_cmd=(timeout --kill-after=10s "${FUSE_NODEFS_WORKLOAD_TIMEOUT_S}s")
+    fi
+    # ${arr[@]+...} keeps empty-array expansion legal under `set -u` on bash 3.2
+    # (macOS) where "${arr[@]}" on an empty array is an unbound-variable error.
+    ${timeout_cmd[@]+"${timeout_cmd[@]}"} node "$NODEFS_JS" "$@"
+    return $?
   fi
-  # ${arr[@]+...} keeps empty-array expansion legal under `set -u` on bash 3.2
-  # (macOS) where "${arr[@]}" on an empty array is an unbound-variable error.
-  ${timeout_cmd[@]+"${timeout_cmd[@]}"} node "$NODEFS_JS" "$@"
+  node "$NODEFS_JS" "$@" &
+  local workload_pid=$!
+  (
+    sleep "${FUSE_NODEFS_WORKLOAD_TIMEOUT_S}"
+    kill -TERM "$workload_pid" 2>/dev/null || true
+    sleep 10
+    kill -KILL "$workload_pid" 2>/dev/null || true
+  ) &
+  local watchdog_pid=$!
+  set +e
+  wait "$workload_pid"
+  local rc=$?
+  set -e
+  kill -TERM "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then
+    echo "nodefs workload exceeded ${FUSE_NODEFS_WORKLOAD_TIMEOUT_S}s (watchdog)" >&2
+    return 124
+  fi
+  return "$rc"
+}
+
+# Auto durability defers the remote commit of a mounted write, and FUSE
+# directory caches can delay a CLI upload from appearing on the mount. Both
+# cross-channel directions therefore poll bounded instead of asserting
+# one-shot.
+wait_remote_content_sha() {
+  local remote="$1" want_sha="$2"
+  local deadline=$(( $(date +%s) + FUSE_NODEFS_CROSS_TIMEOUT_S ))
+  local body_file
+  body_file="$(mktemp)"
+  while :; do
+    set +e
+    drive9 fs cat ":$remote" > "$body_file" 2>/dev/null
+    local rc=$?
+    set -e
+    if [ "$rc" -eq 0 ] && [ "$(sha256_file "$body_file")" = "$want_sha" ]; then
+      rm -f "$body_file"
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      break
+    fi
+    sleep "$MOUNT_READY_INTERVAL_S"
+  done
+  rm -f "$body_file"
+  return 1
+}
+
+wait_mount_probe_sha() {
+  local target="$1" want_sha="$2"
+  local deadline=$(( $(date +%s) + FUSE_NODEFS_CROSS_TIMEOUT_S ))
+  while :; do
+    if run_nodefs probe "$target" 2>/dev/null | head -n1 | grep -qF "$want_sha"; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep "$MOUNT_READY_INTERVAL_S"
+  done
 }
 
 echo "=== drive9 FUSE Node.js fs smoke ==="
@@ -336,6 +404,31 @@ echo "CLI_SOURCE=$CLI_SOURCE"
 echo "FUSE_STRICT_PREREQS=$FUSE_STRICT_PREREQS"
 echo "FUSE_NODEFS_LARGE_MB=$FUSE_NODEFS_LARGE_MB"
 echo "FUSE_NODEFS_MIN_NODE_VERSION=$FUSE_NODEFS_MIN_NODE_VERSION"
+
+# The owner key is a credential: never send it in cleartext. http:// is allowed
+# only for loopback (single-machine dev); every other target must be https://.
+base_lower="$(printf '%s' "$BASE" | tr 'A-Z' 'a-z')"
+base_scheme="${base_lower%%:*}"
+if [ "$base_scheme" = "$base_lower" ]; then
+  base_scheme="" # No colon: curl would default this to cleartext http.
+fi
+if [ "$base_scheme" != "https" ]; then
+  base_authority=""
+  if [ "$base_scheme" = "http" ]; then
+    base_authority="${base_lower#*:}"          # drop the scheme
+    base_authority="${base_authority#//}"      # drop two slashes (http://host)
+    base_authority="${base_authority#/}"       # drop one slash (http:/host)
+    base_authority="${base_authority%%[/?#]*}" # drop path/query/fragment
+    base_authority="${base_authority##*@}"     # drop userinfo
+  fi
+  case "$base_authority" in
+    127.0.0.1|127.0.0.1:*|localhost|localhost:*|'[::1]'|'[::1]':*) ;;
+    *)
+      echo "FATAL: DRIVE9_BASE must use https:// (http:// is allowed only for loopback) so the owner key is not sent in cleartext: $BASE" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 if ! [[ "$FUSE_NODEFS_LARGE_MB" =~ ^[0-9]+$ ]] || [ "$FUSE_NODEFS_LARGE_MB" -lt 9 ]; then
   echo "invalid FUSE_NODEFS_LARGE_MB: must be >= 9 (crosses the 8MiB storage tier boundary)" >&2
@@ -347,6 +440,14 @@ sha256_file() {
     shasum -a 256 "$1" | awk '{print $1}'
   else
     sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
+sha256_stdin() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    sha256sum | awk '{print $1}'
   fi
 }
 
@@ -445,6 +546,18 @@ cleanup() {
   if [ -n "${CLI_BIN:-}" ]; then
     rm -f "$CLI_BIN"
   fi
+  # The mount is the tenant root, so a recursive delete while it is still
+  # mounted would traverse into the remote workspace beyond this fixture.
+  # Never remove the run root unless the mountpoint is verified gone; a
+  # failed unmount preserves artifacts and fails the run even if every
+  # assertion passed.
+  if [ -n "${MOUNT_POINT:-}" ] && is_mounted "$MOUNT_POINT"; then
+    echo "ERROR: $MOUNT_POINT is still mounted after cleanup; refusing to remove $RUN_ROOT" >&2
+    echo "Artifacts preserved at $RUN_ROOT"
+    echo "Mount log: $MOUNT_LOG"
+    echo "Node fs manifest: $MANIFEST_JSON"
+    exit 1
+  fi
   if [ "$rc" -eq 0 ] && [ "$FAIL" -eq 0 ] && [ "$FUSE_NODEFS_KEEP_ARTIFACTS" != "1" ]; then
     rm -rf "$RUN_ROOT"
   else
@@ -485,15 +598,21 @@ if is_mounted "$MOUNT_POINT"; then
   if [ "$nodefs_ok" = "1" ]; then
     echo "[7] cross-channel consistency (CLI <-> mounted Node)"
     cross_remote="$WORK_REMOTE/cross-channel/node-written.txt"
-    cli_cat=$(drive9_retry fs cat ":$cross_remote")
-    expected_cross=$(jq -r '.cross_content' "$MANIFEST_JSON")
-    check_eq "CLI reads Node-written file from mount" "$cli_cat" "$expected_cross"
+    expected_cross_sha=$(jq -j '.cross_content' "$MANIFEST_JSON" | sha256_stdin)
+    if wait_remote_content_sha "$cross_remote" "$expected_cross_sha"; then
+      check_eq "CLI reads Node-written file from mount (bounded poll)" "true" "true"
+    else
+      check_eq "CLI reads Node-written file from mount (bounded poll)" "false" "true"
+    fi
 
     head -c $((1024 * 1024)) /dev/urandom > "$CLI_FIXTURE"
     fixture_sha=$(sha256_file "$CLI_FIXTURE")
     drive9_retry fs cp "$CLI_FIXTURE" ":$WORK_REMOTE/cli-written.bin" >/dev/null
-    probe_out=$(run_nodefs probe "$WORK_MOUNT/cli-written.bin" | head -n1)
-    check_eq "mounted Node sees CLI-written file with matching checksum" "$probe_out" "$fixture_sha 1048576"
+    if wait_mount_probe_sha "$WORK_MOUNT/cli-written.bin" "$fixture_sha"; then
+      check_eq "mounted Node sees CLI-written file with matching checksum (bounded poll)" "true" "true"
+    else
+      check_eq "mounted Node sees CLI-written file with matching checksum (bounded poll)" "false" "true"
+    fi
     rm -f "$WORK_MOUNT/cli-written.bin"
 
     echo "[8] unmount and remount Node fs workload"
@@ -517,7 +636,9 @@ if is_mounted "$MOUNT_POINT"; then
 fi
 
 echo "[9] cleanup remote fixture"
-drive9_retry fs rm -r "$ROOT_REMOTE" >/dev/null || true
+if ! drive9_retry fs rm -r "$ROOT_REMOTE" >/dev/null 2>&1; then
+  echo "WARN: remote cleanup failed for $ROOT_REMOTE; a leftover test tree may remain in the tenant" >&2
+fi
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"
 exit "$FAIL"

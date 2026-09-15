@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Cross-channel fs.watch visibility probe for a Drive9 mount.
 //
-// usage: node watch_probe.js <mountDir> <resultJson(local)> <readyFile(local)>
+// usage: node watch_probe.js <mountDir> <resultJson(local)> <readyFile(local)> <expectedPayload>
 //
 // Phase A (own write): the probe writes target.txt through the mount itself
 // and requires its own watchers to see it. Phase B (remote write): after the
@@ -10,8 +10,13 @@
 // observes the change and how fast: fs.watch(file), fs.watch(dir),
 // fs.watchFile stat polling, and a raw stat poll.
 //
-// Exit codes: 0 result written (change observed through >=1 channel),
-//            3 change never observed (result still written), 1 crash.
+// Content visibility requires an EXACT match against <expectedPayload> (the
+// full bytes the harness wrote server-side). A truncated write or a stale
+// payload from another round is classified (truncated / mismatch) and the
+// probe keeps observing; only the full payload sets content_verified.
+//
+// Exit codes: 0 result written (full payload observed),
+//            3 full payload never observed (result still written), 1 crash.
 
 'use strict';
 
@@ -19,7 +24,7 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 
-const [mountDir, resultPath, readyPath] = process.argv.slice(2);
+const [mountDir, resultPath, readyPath, expectedPayload] = process.argv.slice(2);
 const target = path.join(mountDir, 'target.txt');
 const trigger = path.join(mountDir, 'trigger.stamp');
 
@@ -31,16 +36,20 @@ const PHASE_B_WAIT_MS = 180000;
 const result = {
   started_epoch_ms: Date.now(),
   mount_dir: mountDir,
+  expected_payload_bytes: expectedPayload ? expectedPayload.length : null,
   watcher_errors: {},
   phase_a: { file_event: false, dir_event: false, ms: null },
   phase_b: {
     trigger_seen_epoch_ms: null,
     content_verified: false,
+    content_match: null, // 'exact' | 'truncated' | 'mismatch' once any change is seen
     content_epoch_ms: null,
     file_watch_epoch_ms: null,
     dir_watch_epoch_ms: null,
     watchfile_epoch_ms: null,
     statpoll_epoch_ms: null,
+    partial_content: null,
+    other_content: null,
     last_content: null,
   },
 };
@@ -64,11 +73,20 @@ async function noteContent(channel, epochMs) {
   const content = await readContent();
   if (content !== null && content !== lastContent) {
     lastContent = content;
-    if (content.startsWith(V2_PREFIX)) {
+    if (content === expectedPayload) {
       result.phase_b.content_verified = true;
+      result.phase_b.content_match = 'exact';
       result.phase_b.content_epoch_ms ??= epochMs;
       result.phase_b.last_content = content.slice(0, 80);
       result.phase_b[`${channel}_epoch_ms`] ??= epochMs;
+    } else if (content.startsWith(V2_PREFIX)) {
+      // A truncated or otherwise partial v2 payload: keep observing — only
+      // the full expected payload satisfies the correctness floor.
+      result.phase_b.content_match ??= 'truncated';
+      result.phase_b.partial_content ??= `${content.length}/${expectedPayload.length} bytes: ${content.slice(0, 80)}`;
+    } else {
+      result.phase_b.content_match ??= 'mismatch';
+      result.phase_b.other_content ??= content.slice(0, 80);
     }
   }
   return content;
@@ -101,12 +119,17 @@ async function main() {
       const name = path.basename(String(filename || ''));
       if (name !== 'target.txt' && name !== 'trigger.stamp') return;
       const now = Date.now();
+      if (name !== 'target.txt') {
+        // trigger.stamp events say nothing about the target mutation; crediting
+        // the dir-watch channel from them would fake remote event support.
+        return;
+      }
       if (phase === 'A') {
-        if (name === 'target.txt' && !result.phase_a.dir_event) {
+        if (!result.phase_a.dir_event) {
           result.phase_a.dir_event = true;
           result.phase_a.ms ??= now - phaseAStart;
         }
-      } else if (name === 'target.txt' && result.phase_b.trigger_seen_epoch_ms !== null && result.phase_b.dir_watch_epoch_ms === null) {
+      } else if (result.phase_b.trigger_seen_epoch_ms !== null && result.phase_b.dir_watch_epoch_ms === null) {
         result.phase_b.dir_watch_epoch_ms = now;
         result.phase_b.dir_event_type = eventType;
       }
