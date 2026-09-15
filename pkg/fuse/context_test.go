@@ -42,17 +42,26 @@ func TestFuseCtxCancelChannel(t *testing.T) {
 
 func TestCountFuseInterruptOncePerChannel(t *testing.T) {
 	ch := make(chan struct{})
-	if !countFuseInterruptOnce(ch) {
+	first := observeFuseInterruptFlag(ch)
+	second := observeFuseInterruptFlag(ch)
+	if !first.countOnce() {
 		t.Fatal("first observer of a channel should count")
 	}
-	if countFuseInterruptOnce(ch) {
+	if second.countOnce() {
 		t.Fatal("second observer of the same channel must not count again")
 	}
 	other := make(chan struct{})
-	if !countFuseInterruptOnce(other) {
+	if !observeFuseInterruptFlag(other).countOnce() {
 		t.Fatal("a different request channel should count")
 	}
-	if countFuseInterruptOnce(other) {
-		t.Fatal("second observer of the other channel must not count again")
+	// Once every derived context has completed, the entry is reclaimed; a
+	// later re-registration counts again as a new observation window.
+	second.release(ch)
+	first.release(ch)
+	if _, ok := fuseInterruptFlags.Load(ch); ok {
+		t.Fatal("entry must be reclaimed after all derived contexts completed")
+	}
+	if !observeFuseInterruptFlag(ch).countOnce() {
+		t.Fatal("a re-registered channel should count again")
 	}
 }

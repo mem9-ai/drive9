@@ -720,9 +720,9 @@ func RecordFuseOperation(operation, result string, d time.Duration, bytes uint64
 // the kernel signaled that a waiter of an in-flight request gave up (any
 // signal can trigger this, e.g. SIGCHLD); connection teardown (unmount
 // closing in-flight cancel channels) is counted too. Callers count each
-// request once (see countFuseInterruptOnce). Interrupts are normal; the
-// counter makes the rate observable so interrupt-induced EAGAIN regressions
-// are diagnosable.
+// request once (see fuseInterruptFlag in pkg/fuse). Interrupts are normal;
+// the counter makes the rate observable so interrupt-induced EAGAIN
+// regressions are diagnosable.
 func RecordFuseInterrupt() {
 	RegisterModule("fuse")
 	fuseInterruptsTotal.Add(1)
