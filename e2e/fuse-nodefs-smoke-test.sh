@@ -454,12 +454,12 @@ run_bounded() {
   fi
   local kill_grace=$(( budget - 1 > 5 ? 5 : budget - 1 ))
   local soft=$(( budget - kill_grace ))
-  if command -v timeout >/dev/null 2>&1; then
-    if [ "$kill_grace" -ge 1 ]; then
-      timeout --kill-after="${kill_grace}s" "${soft}s" "$@"
-    else
-      timeout "${soft}s" "$@"
-    fi
+  if command -v timeout >/dev/null 2>&1 && [ "$kill_grace" -ge 1 ]; then
+    # GNU timeout only when a nonzero kill-after fits inside the budget:
+    # without --kill-after it sends TERM and waits forever, so a TERM-ignoring
+    # child would blow the deadline (and --kill-after=0 disables the KILL).
+    # budget=1 therefore takes the watchdog path, which always hard-kills.
+    timeout --kill-after="${kill_grace}s" "${soft}s" "$@"
     return $?
   fi
   "$@" &

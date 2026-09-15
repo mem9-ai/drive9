@@ -60,6 +60,12 @@ function recordWatcherError(kind, err) {
 
 let phase = 'A';
 let lastContent = V1;
+// Monotone lower bound on the mutation time: updated whenever any read still
+// observes pre-mutation content. An fs.watch event can only be attributed to
+// the remote mutation if the event fired at/after this bound — an older event
+// whose (possibly blocked) read happens to return the new payload after the
+// mutation must not be credited as the remote event.
+let lastPreMutationObsEpoch = 0;
 
 async function readContent() {
   try {
@@ -78,23 +84,40 @@ async function noteContent(channel, epochMs) {
       result.phase_b.content_match = 'exact';
       result.phase_b.content_epoch_ms ??= epochMs;
       result.phase_b.last_content = content.slice(0, 80);
-      // Causal attribution: an fs.watch/fs.watchFile epoch is only recorded
-      // when the read triggered by THAT event confirmed the full remote
-      // payload. Late phase-A events read pre-mutation content and can never
-      // occupy the slot, so a stale local event cannot fake remote support.
-      result.phase_b[`${channel}_epoch_ms`] ??= epochMs;
-    } else if (content.startsWith(V2_PREFIX)) {
-      // A truncated or wrong-round v2 payload: keep observing — only the
-      // full expected payload satisfies the correctness floor.
-      result.phase_b.content_match = content.length < expectedPayload.length ? 'truncated' : 'mismatch';
-      if (content.length < expectedPayload.length) {
-        result.phase_b.partial_content ??= `${content.length}/${expectedPayload.length} bytes: ${content.slice(0, 80)}`;
+      // Causal attribution, two fences: an event epoch is recorded only when
+      // (1) the read triggered by that event returned the full remote payload,
+      // AND (2) the event fired at/after the latest observation of
+      // pre-mutation content. Fence (2) rejects stale events whose blocked
+      // read spans the mutation: such an event predates the probe's last
+      // pre-mutation observation, so late content cannot launder its epoch.
+      if (epochMs >= lastPreMutationObsEpoch) {
+        result.phase_b[`${channel}_epoch_ms`] ??= epochMs;
       } else {
-        result.phase_b.other_content ??= content.slice(0, 80);
+        result.phase_b.fenced_event_epochs ??= result.phase_b.fenced_event_epochs || [];
+        if (result.phase_b.fenced_event_epochs.length < 8) {
+          result.phase_b.fenced_event_epochs.push(`${channel}@${epochMs} (pre-bound ${lastPreMutationObsEpoch})`);
+        }
+      }
+    } else {
+      if (phase === 'B') {
+        lastPreMutationObsEpoch = Date.now();
+      }
+      if (content.startsWith(V2_PREFIX)) {
+        // A truncated or wrong-round v2 payload: keep observing — only the
+        // full expected payload satisfies the correctness floor.
+        result.phase_b.content_match = content.length < expectedPayload.length ? 'truncated' : 'mismatch';
+        if (content.length < expectedPayload.length) {
+          result.phase_b.partial_content ??= `${content.length}/${expectedPayload.length} bytes: ${content.slice(0, 80)}`;
+        } else {
+          result.phase_b.other_content ??= content.slice(0, 80);
+        }
       }
     }
     // Anything else (e.g. the phase-A own-write content) is simply pre-mutation
     // state, not a remote-round payload — no classification, no attribution.
+  } else if (content !== null && phase === 'B' && content !== expectedPayload) {
+    // Unchanged pre-mutation content still tightens the mutation lower bound.
+    lastPreMutationObsEpoch = Date.now();
   }
   return content;
 }
