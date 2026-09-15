@@ -208,7 +208,12 @@ wait_mount_state() {
 }
 
 start_mount() {
-  local mount_args=(mount --mode=fuse)
+  # --foreground keeps the mount in-process so MOUNT_PID is the real mount
+  # process and this script owns the full lifecycle. Without it the CLI
+  # detaches a supervised background mount whose heal logic can re-mount
+  # after our umount — the cleanup guard then (correctly) refuses to remove
+  # the run root and fails the run.
+  local mount_args=(mount --mode=fuse --foreground)
   if [ -n "${FUSE_PROFILE:-}" ]; then
     mount_args+=(--profile "$FUSE_PROFILE")
   fi
