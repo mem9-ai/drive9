@@ -2374,14 +2374,9 @@ func packAuthFromMountState(state mountstate.ProcessState) (mountPackAuth, error
 // transient EBUSY without spamming helper stderr.
 const fusermountClearRetries = 3
 
-// unsupportedRungHelperEvery slows the binary-helper retry cadence on
-// platforms without the umount2 rung, so the loop keeps making progress
-// without hammering the helper for the whole timeout.
-const unsupportedRungHelperEvery = 4
-
-// mountEntryClearPollInterval is how often waitForKernelMountEntryClear
+// kernelEntryClearPollInterval is how often waitForKernelMountEntryClear
 // re-checks the kernel mount table while a lingering entry is reaped.
-const mountEntryClearPollInterval = 500 * time.Millisecond
+const kernelEntryClearPollInterval = 500 * time.Millisecond
 
 // waitForKernelMountEntryClear blocks until the kernel mount-table entry for
 // mountPoint is gone, bounded by timeout. The check is authoritative
@@ -2392,13 +2387,15 @@ const mountEntryClearPollInterval = 500 * time.Millisecond
 //
 // Escalation ladder, in order: non-lazy helper retries (EBUSY is
 // transient), one direct umount2 (fusermount refuses leftovers whose mtab
-// entry is gone; skipped where unsupported, keeping slower helper retries),
-// then a single lazy detach — after which path-based unmounts can no longer
-// target the detached superblock and the loop only polls until the kernel
-// reaps the entry. timeout <= 0 verifies once without attempting any
-// unmount. The only outcomes are a cleared table or a bounded, reported
-// failure; the budget is enforced by deadline checks before each attempt,
-// capped sleeps, and a command timeout on every helper run.
+// entry is gone; where unsupported, one final helper attempt instead so the
+// real helper error stays the reported one), then a single lazy detach —
+// after which path-based unmounts can no longer target the detached
+// superblock and the loop only polls until the kernel reaps the entry.
+// timeout <= 0 verifies once without attempting any unmount. The only
+// outcomes are a cleared table or a bounded, reported failure; the budget
+// is enforced by deadline checks before each attempt, capped sleeps, and a
+// command timeout on every helper run (a helper started just before the
+// deadline can overshoot it by at most one command timeout).
 func waitForKernelMountEntryClear(mountPoint string, timeout time.Duration, deps umountDeps) error {
 	if !mountStillActiveAfterUmount(mountPoint) {
 		return nil
@@ -2435,10 +2432,10 @@ func waitForKernelMountEntryClear(mountPoint string, timeout time.Duration, deps
 				err = runHelper()
 			case deps.unmountSyscall != nil:
 				err = deps.unmountSyscall(mountPoint)
-			case attempt%unsupportedRungHelperEvery == 0:
-				// No umount2 rung on this platform: keep retrying the
-				// binary helper at a slower cadence; its real error stays
-				// the reported one.
+			default:
+				// No umount2 rung on this platform: one final helper attempt
+				// before the lazy detach; its real error stays the reported
+				// one instead of an "unsupported" placeholder.
 				err = runHelper()
 			}
 			if err != nil {
@@ -2459,8 +2456,8 @@ func waitForKernelMountEntryClear(mountPoint string, timeout time.Duration, deps
 			}
 		}
 		sleepFor := deadline.Sub(deps.now())
-		if sleepFor > mountEntryClearPollInterval {
-			sleepFor = mountEntryClearPollInterval
+		if sleepFor > kernelEntryClearPollInterval {
+			sleepFor = kernelEntryClearPollInterval
 		}
 		if sleepFor > 0 {
 			deps.sleep(sleepFor)
