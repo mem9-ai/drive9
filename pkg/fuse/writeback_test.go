@@ -1875,11 +1875,17 @@ func TestWriteSyncDisablesStreamingUploaderForLargeSequentialWrites(t *testing.T
 		t.Fatalf("second written = %d, want %d", written, len(chunk))
 	}
 
-	if got := rec.initiateSizes(); len(got) != 2 || got[0] != int64(s3client.PartSize) || got[1] != 2*int64(s3client.PartSize) {
-		t.Fatalf("initiate sizes = %v, want [%d %d]", got, s3client.PartSize, 2*s3client.PartSize)
+	if got := rec.initiateSizes(); len(got) != 1 || got[0] != int64(s3client.PartSize) {
+		t.Fatalf("initiate sizes = %v, want [%d]", got, s3client.PartSize)
 	}
-	if got := rec.completePartCounts(); len(got) != 2 || got[0] != 1 || got[1] != 2 {
-		t.Fatalf("complete part counts = %v, want [1 2]", got)
+	if got := rec.completePartCounts(); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("complete part counts = %v, want [1]", got)
+	}
+	if got := rec.patchNewSizes(); len(got) != 1 || got[0] != 2*int64(s3client.PartSize) {
+		t.Fatalf("patch new sizes = %v, want [%d]", got, 2*s3client.PartSize)
+	}
+	if got := rec.patchDirtyParts(); len(got) != 1 || len(got[0]) != 1 || got[0][0] != 2 {
+		t.Fatalf("patch dirty parts = %v, want [[2]]", got)
 	}
 }
 
@@ -1953,6 +1959,8 @@ type writeSyncMultipartRecorder struct {
 	initiateByID map[string]int64
 	sizes        []int64
 	completes    []int
+	patchSizes   []int64
+	patchDirty   [][]int
 	captureParts bool
 	partBodies   [][]byte
 }
@@ -2060,6 +2068,43 @@ func newWriteSyncMultipartRecorder(t *testing.T, wantPath string) *writeSyncMult
 			rec.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 			return
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs"+rec.wantPath:
+			var req struct {
+				NewSize          int64  `json:"new_size"`
+				DirtyParts       []int  `json:"dirty_parts"`
+				PartSize         int64  `json:"part_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode patch request: %v", err)
+			}
+			rec.mu.Lock()
+			rec.patchSizes = append(rec.patchSizes, req.NewSize)
+			rec.patchDirty = append(rec.patchDirty, append([]int(nil), req.DirtyParts...))
+			rec.mu.Unlock()
+			parts := make([]map[string]any, 0, len(req.DirtyParts))
+			for _, pn := range req.DirtyParts {
+				size := req.PartSize
+				if int64(pn)*req.PartSize > req.NewSize {
+					size = req.NewSize - int64(pn-1)*req.PartSize
+				}
+				parts = append(parts, map[string]any{
+					"number": pn,
+					"url":    rec.server.URL + "/s3/patch-" + strconv.Itoa(pn),
+					"size":   size,
+				})
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":    "patch-1",
+				"upload_parts": parts,
+				"copied_parts": []any{},
+			})
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/uploads/") && strings.HasSuffix(r.URL.Path, "/complete"):
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+			return
 		}
 		t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 	}))
@@ -2081,6 +2126,22 @@ func (rec *writeSyncMultipartRecorder) completePartCounts() []int {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	return append([]int(nil), rec.completes...)
+}
+
+func (rec *writeSyncMultipartRecorder) patchNewSizes() []int64 {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return append([]int64(nil), rec.patchSizes...)
+}
+
+func (rec *writeSyncMultipartRecorder) patchDirtyParts() [][]int {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	out := make([][]int, len(rec.patchDirty))
+	for i, parts := range rec.patchDirty {
+		out[i] = append([]int(nil), parts...)
+	}
+	return out
 }
 
 func (rec *writeSyncMultipartRecorder) capturedPartBodies() [][]byte {
