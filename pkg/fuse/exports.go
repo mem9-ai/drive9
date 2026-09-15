@@ -119,6 +119,59 @@ func activeMountPointBounded(path string) (bool, error) {
 	}
 }
 
+// KernelMountTableHas reports whether mountPoint is still listed in the
+// authoritative kernel mount table (/proc/self/mountinfo on Linux; bounded
+// stat-based probe elsewhere). Use this to decide whether an unmount has
+// actually completed: stat-based probes report a lazily (MNT_DETACH)
+// detached mount as inactive while its kernel entry lingers until the last
+// reference is reaped, and /etc/mtab is already clean by then.
+func KernelMountTableHas(mountPoint string) bool {
+	listed, err := kernelMountTableHas(mountPoint)
+	if err == nil {
+		return listed
+	}
+	if os.IsNotExist(err) {
+		return false
+	}
+	// Indeterminate (unreadable table / wedged stat): mirror the bounded
+	// probe and stay conservative on unknowns so callers never forgive a
+	// failed unmount as success.
+	active, aerr := activeMountPointBounded(mountPoint)
+	if aerr != nil {
+		return !os.IsNotExist(aerr)
+	}
+	return active
+}
+
+// mountTableClearPollInterval is how often WaitMountTableClear re-checks the
+// kernel mount table while waiting for a lingering entry to be reaped.
+const mountTableClearPollInterval = 200 * time.Millisecond
+
+// WaitMountTableClear polls the kernel mount table until the entry for
+// mountPoint disappears or timeout elapses (timeout <= 0 checks once).
+// Returns false if the entry is still listed when the timeout expires.
+func WaitMountTableClear(mountPoint string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !KernelMountTableHas(mountPoint) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(mountTableClearPollInterval)
+	}
+}
+
+// UnmountSyscall detaches mountPoint directly via umount2(2), without
+// fusermount's /etc/mtab bookkeeping. After a lazy detach removed the mtab
+// entry, fusermount refuses to clear the leftover kernel entry; umount2
+// still works for the mount owner. lazy selects MNT_DETACH semantics.
+// Unsupported outside Linux; the binary-based unmount ladder applies there.
+func UnmountSyscall(mountPoint string, lazy bool) error {
+	return unmountSyscall(mountPoint, lazy)
+}
+
 // ForceUnmount force-unmounts a FUSE mountpoint (graceful-death path).
 func ForceUnmount(mountPoint string) {
 	forceUnmount(mountPoint)
