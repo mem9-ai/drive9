@@ -231,7 +231,8 @@ start_mount() {
 stop_mount() {
   set +e
   if [ -n "${MOUNT_POINT:-}" ] && is_mounted "$MOUNT_POINT"; then
-    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT" >/dev/null 2>&1 || true
+    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT" \
+      >"${RUN_ROOT:-/tmp}/umount-trap.log" 2>&1 || true
     wait_mount_state unmounted >/dev/null 2>&1 || true
   fi
   if [ -n "${MOUNT_PID:-}" ] && kill -0 "$MOUNT_PID" >/dev/null 2>&1; then
@@ -553,6 +554,20 @@ cleanup() {
   # assertion passed.
   if [ -n "${MOUNT_POINT:-}" ] && is_mounted "$MOUNT_POINT"; then
     echo "ERROR: $MOUNT_POINT is still mounted after cleanup; refusing to remove $RUN_ROOT" >&2
+    echo "--- diagnostics ---" >&2
+    echo "mountpoint probe:" >&2
+    mountpoint "$MOUNT_POINT" >&2 2>&1 || true
+    echo "mount table entries:" >&2
+    mount | grep -F "$MOUNT_POINT" >&2 || true
+    echo "live drive9 mount processes:" >&2
+    ps -eo pid,ppid,etime,args | grep '[d]rive9 mount' >&2 || echo "(none)" >&2
+    echo "all live drive9 processes:" >&2
+    ps -eo pid,ppid,etime,args | grep '[d]rive9' >&2 || echo "(none)" >&2
+    echo "trap umount output:" >&2
+    cat "${RUN_ROOT:-/dev/null}/umount-trap.log" >&2 2>/dev/null || echo "(none)" >&2
+    echo "mount log tail:" >&2
+    tail -n 40 "$MOUNT_LOG" >&2 2>/dev/null || true
+    echo "--- end diagnostics ---" >&2
     echo "Artifacts preserved at $RUN_ROOT"
     echo "Mount log: $MOUNT_LOG"
     echo "Node fs manifest: $MANIFEST_JSON"
