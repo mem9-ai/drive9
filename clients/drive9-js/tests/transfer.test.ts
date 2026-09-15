@@ -199,6 +199,51 @@ describe("Transfer", () => {
     expect(completeCalled).toBe(true);
   });
 
+  it("v1 upload skips x-amz-checksum-crc32c when GCS x-goog-hash is presigned", async () => {
+    let partCrc32c: string | null = null;
+    let partGoogHash: string | null = null;
+    let completeCalled = false;
+    const data = new Uint8Array(8 * 1024 * 1024);
+    server.use(
+      http.post("http://localhost:9009/v2/uploads/initiate", () =>
+        HttpResponse.text("not available", { status: 404 })
+      ),
+      http.post("http://localhost:9009/v1/uploads/initiate", () =>
+        HttpResponse.json(
+          {
+            upload_id: "v1-js",
+            part_size: 8 * 1024 * 1024,
+            parts: [
+              {
+                number: 1,
+                url: "http://localhost:9009/v1-part",
+                size: 8 * 1024 * 1024,
+                headers: { "x-goog-hash": "crc32c=abc" },
+              },
+            ],
+          },
+          { status: 202 }
+        )
+      ),
+      http.put("http://localhost:9009/v1-part", ({ request }) => {
+        partCrc32c = request.headers.get("x-amz-checksum-crc32c");
+        partGoogHash = request.headers.get("x-goog-hash");
+        return HttpResponse.text("ok");
+      }),
+      http.post("http://localhost:9009/v1/uploads/v1-js/complete", () => {
+        completeCalled = true;
+        return HttpResponse.text("ok");
+      })
+    );
+
+    const client = new Client("http://localhost:9009", "test-key");
+    await client.writeStream("/large.bin", data, data.length);
+
+    expect(partCrc32c).toBeNull();
+    expect(partGoogHash).toBe("crc32c=abc");
+    expect(completeCalled).toBe(true);
+  });
+
   it("resumeUpload slices missing parts with the server part size", async () => {
     let uploaded = "";
     let completeCalled = false;

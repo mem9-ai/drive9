@@ -348,6 +348,52 @@ def test_write_stream_large_v1(client):
 
 
 @responses.activate
+def test_write_stream_v1_skips_crc32c_when_presigned(client):
+    # GCS signs CRC32C into x-goog-hash instead of x-amz-checksum-crc32c; the
+    # client must not inject an extra unsigned S3 checksum header on top of it.
+    size = 8 * 1024 * 1024
+    responses.add(
+        responses.POST,
+        f"{BASE_URL}/v2/uploads/initiate",
+        status=404,
+    )
+    responses.add(
+        responses.POST,
+        f"{BASE_URL}/v1/uploads/initiate",
+        json={
+            "upload_id": "uid",
+            "part_size": size,
+            "parts": [
+                {
+                    "number": 1,
+                    "size": size,
+                    "url": "http://s3/up1",
+                    "headers": {"x-goog-hash": "crc32c=abc"},
+                }
+            ],
+        },
+        status=202,
+    )
+    responses.add(
+        responses.PUT,
+        "http://s3/up1",
+        status=200,
+        headers={"ETag": '"etag1"'},
+    )
+    responses.add(
+        responses.POST,
+        f"{BASE_URL}/v1/uploads/uid/complete",
+        status=200,
+    )
+    stream = BytesIO(b"y" * size)
+    client.write_stream("/large.txt", stream, size=size)
+
+    put_call = next(c for c in responses.calls if c.request.url == "http://s3/up1")
+    assert "x-amz-checksum-crc32c" not in put_call.request.headers
+    assert put_call.request.headers["x-goog-hash"] == "crc32c=abc"
+
+
+@responses.activate
 def test_read_stream_redirect(client):
     responses.add(
         responses.GET,
