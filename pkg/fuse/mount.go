@@ -649,7 +649,16 @@ func Mount(opts *MountOptions) (err error) {
 		layerEventWatcherStop()
 	}
 
-	err = serveWaitMountThenStartWatchers(server.Serve, server.WaitMount, func() {
+	// serveDone closes when the Serve goroutine has fully finished: go-fuse
+	// closes the /dev/fuse fd (aborting the connection) only after the read
+	// loops exit, and an open connection keeps a detached mount listed in the
+	// kernel mount table. Mount must not return while our own fd is still the
+	// last live reference (#928).
+	serveDone := make(chan struct{})
+	err = serveWaitMountThenStartWatchers(func() {
+		defer close(serveDone)
+		server.Serve()
+	}, server.WaitMount, func() {
 		sseWatcher = StartSSEWatcher(dat9fs, c, actorID)
 		// After SSE is up, asynchronously probe the remote git-workspace index
 		// (one FS Stat — not ListGitWorkspaces) so sandbox remounts arm when
@@ -904,6 +913,7 @@ func Mount(opts *MountOptions) (err error) {
 	unmountWasRequested := unmountRequested.Load()
 	reason, detail := classifyServeEnd(unmountWasRequested, opts.MountPoint)
 	shutdown()
+	waitServeClosed(serveDone, opts.MountPoint)
 
 	uptime := time.Since(mountStartedAt).Round(time.Second)
 	pendingFiles, pendingBytes := 0, int64(0)
@@ -922,6 +932,15 @@ func Mount(opts *MountOptions) (err error) {
 
 	switch reason {
 	case ExitReasonSignal, ExitReasonExternalUnmount:
+		// Do not exit while the kernel mount-table entry is still listed:
+		// a lazy (MNT_DETACH) detach leaves the entry in place until the
+		// mount's last reference is reaped, and callers treat mount-process
+		// exit as "mountpoint clean" (#928). Bounded wait; a foreign holder
+		// (open files, cwd) can keep the entry alive past our control.
+		if !WaitMountTableClear(opts.MountPoint, mountExitEntryClearTimeout) {
+			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=mount_entry_linger mountpoint=%s timeout=%s\n",
+				opts.MountPoint, mountExitEntryClearTimeout)
+		}
 		exitRec.Code = ExitOK
 		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
 		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=serve_end reason=%s mountpoint=%s pid=%d uptime=%s\n",
@@ -1003,6 +1022,25 @@ func classifyServeEnd(unmountRequested bool, mountPoint string) (MountExitReason
 // supervisor's bounded restart cleanup owns destructive recovery.
 func shouldForceUnmountAfterAbnormalServe(active bool, err error) bool {
 	return active || isTransportBroken(err)
+}
+
+// serveCloseWaitTimeout bounds how long Mount waits for the Serve goroutine's
+// post-loop cleanup (fd close + OnUnmount) after the read loops exited.
+const serveCloseWaitTimeout = 10 * time.Second
+
+// mountExitEntryClearTimeout bounds how long the clean exit path waits for the
+// kernel mount-table entry to disappear before exiting (#928).
+const mountExitEntryClearTimeout = 5 * time.Second
+
+// waitServeClosed waits for the Serve goroutine to finish so the /dev/fuse fd
+// is closed before Mount returns; a timeout is logged, never fatal.
+func waitServeClosed(serveDone <-chan struct{}, mountPoint string) {
+	select {
+	case <-serveDone:
+	case <-time.After(serveCloseWaitTimeout):
+		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=serve_close_timeout mountpoint=%s timeout=%s\n",
+			mountPoint, serveCloseWaitTimeout)
+	}
 }
 
 type mountStartCleanup struct {
