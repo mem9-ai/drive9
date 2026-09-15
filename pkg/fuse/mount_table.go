@@ -4,15 +4,23 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // procMountInfoPath is the authoritative kernel mount table on Linux. Tests
 // redirect it to a fixture file; other platforms never read it.
 var procMountInfoPath = "/proc/self/mountinfo"
 
+// candidateResolveTimeout bounds the symlink resolution in
+// mountTableCandidates: EvalSymlinks stats the mountpoint itself, which can
+// hang indefinitely on a wedged FUSE endpoint.
+const candidateResolveTimeout = 2 * time.Second
+
 // mountTableCandidates returns the paths a kernel mount-table entry may spell
 // for mountPoint: the cleaned absolute path and its symlink resolution (the
 // kernel reports the mountpoint dentry path, without symlink shortcuts).
+// Resolution is bounded — a wedged endpoint must not stall mount-table
+// probes, which run on unmount critical paths.
 func mountTableCandidates(mountPoint string) map[string]bool {
 	abs, err := filepath.Abs(mountPoint)
 	if err != nil {
@@ -20,12 +28,37 @@ func mountTableCandidates(mountPoint string) map[string]bool {
 	}
 	abs = filepath.Clean(abs)
 	candidates := map[string]bool{abs: true}
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+	if resolved := boundedEvalSymlinks(abs, candidateResolveTimeout); resolved != "" {
 		if resolved = filepath.Clean(resolved); resolved != abs {
 			candidates[resolved] = true
 		}
 	}
 	return candidates
+}
+
+// boundedEvalSymlinks is filepath.EvalSymlinks with a hard timeout. A timeout
+// abandons the goroutine ("" result); if the underlying stat is wedged it
+// leaks until the endpoint recovers — the same tradeoff as the bounded
+// active-mount probes.
+func boundedEvalSymlinks(path string, timeout time.Duration) string {
+	type result struct {
+		path string
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		p, err := filepath.EvalSymlinks(path)
+		ch <- result{p, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return ""
+		}
+		return r.path
+	case <-time.After(timeout):
+		return ""
+	}
 }
 
 // parseMountInfoMountPoints returns the decoded mount-point field (field 5)

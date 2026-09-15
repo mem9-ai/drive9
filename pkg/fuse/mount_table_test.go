@@ -112,7 +112,9 @@ func TestKernelMountTableHasFixture(t *testing.T) {
 	}
 
 	procMountInfoPath = filepath.Join(fixture, "missing")
-	if KernelMountTableHas(mp) {
-		t.Fatal("unreadable table with no stat-active fallback should not report listed")
+	// An unreadable kernel table is indeterminate on Linux and must fail
+	// closed: report still-listed so umount never forgives it as "cleared".
+	if !KernelMountTableHas(mp) {
+		t.Fatal("unreadable mount table should conservatively report still listed")
 	}
 }

@@ -125,22 +125,15 @@ func activeMountPointBounded(path string) (bool, error) {
 // actually completed: stat-based probes report a lazily (MNT_DETACH)
 // detached mount as inactive while its kernel entry lingers until the last
 // reference is reaped, and /etc/mtab is already clean by then.
+// Probe failures are resolved by mountTableProbeFailed per platform; on
+// Linux an unreadable table is indeterminate and fails closed (still
+// listed) so callers never forgive an unmount as complete.
 func KernelMountTableHas(mountPoint string) bool {
 	listed, err := kernelMountTableHas(mountPoint)
 	if err == nil {
 		return listed
 	}
-	if os.IsNotExist(err) {
-		return false
-	}
-	// Indeterminate (unreadable table / wedged stat): mirror the bounded
-	// probe and stay conservative on unknowns so callers never forgive a
-	// failed unmount as success.
-	active, aerr := activeMountPointBounded(mountPoint)
-	if aerr != nil {
-		return !os.IsNotExist(aerr)
-	}
-	return active
+	return mountTableProbeFailed(mountPoint, err)
 }
 
 // mountTableClearPollInterval is how often WaitMountTableClear re-checks the

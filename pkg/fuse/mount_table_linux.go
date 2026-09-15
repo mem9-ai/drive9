@@ -30,6 +30,15 @@ func kernelMountTableHas(mountPoint string) (bool, error) {
 	return false, nil
 }
 
+// mountTableProbeFailed resolves kernelMountTableHas errors on Linux. The
+// kernel mount table is the only authoritative source here, and it never
+// stats the mountpoint itself — so any read failure (missing /proc, chroot,
+// permission) is indeterminate and must fail closed: report the mount as
+// still listed so callers never forgive an unreadable table as "cleared".
+func mountTableProbeFailed(string, error) bool {
+	return true
+}
+
 // unmountSyscall detaches mountPoint with umount2(2), bypassing fusermount's
 // /etc/mtab bookkeeping. Once a lazy detach removed the mtab entry,
 // fusermount refuses to touch the leftover kernel entry ("entry for ...

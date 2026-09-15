@@ -1840,9 +1840,13 @@ func UmountCmd(args []string) error {
 }
 
 type umountDeps struct {
-	goos             string
-	lookPath         func(string) (string, error)
-	run              func([]string) error
+	goos     string
+	lookPath func(string) (string, error)
+	run      func([]string) error
+	// unmountSyscall is the direct umount2 escalation rung for the kernel
+	// mount-table gate; nil where the platform has no supported syscall
+	// unmount (the binary helper ladder keeps applying there).
+	unmountSyscall   func(string) error
 	readPID          func(string) (int, string, error)
 	readProcessState func(string) (mountstate.ProcessState, string, error)
 	terminate        func(int, time.Duration) error
@@ -1855,12 +1859,20 @@ type umountDeps struct {
 	printErrf        func(string, ...any)
 }
 
+// umountCommandTimeout bounds each external unmount helper invocation. A
+// stuck helper must not hold the kernel-table gate — and the supervisor
+// flock around it — past --timeout (same bound pkg/fuse uses for its
+// unmount commands).
+const umountCommandTimeout = 5 * time.Second
+
 func defaultUmountDeps() umountDeps {
-	return umountDeps{
+	deps := umountDeps{
 		goos:     runtime.GOOS,
 		lookPath: exec.LookPath,
 		run: func(argv []string) error {
-			cmd := exec.Command(argv[0], argv[1:]...)
+			ctx, cancel := context.WithTimeout(context.Background(), umountCommandTimeout)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			return cmd.Run()
@@ -1876,11 +1888,15 @@ func defaultUmountDeps() umountDeps {
 		sleep:            time.Sleep,
 		printErrf:        func(format string, args ...any) { fmt.Fprintf(os.Stderr, format, args...) },
 	}
+	if runtime.GOOS == "linux" {
+		deps.unmountSyscall = unmountSyscallCLI
+	}
+	return deps
 }
 
 func runUmount(args []string, deps umountDeps) error {
 	fs := flag.NewFlagSet("umount", flag.ContinueOnError)
-	waitTimeout := fs.Duration("timeout", 60*time.Second, "time to wait for the drive9 mount process to exit and the kernel mount-table entry to clear after unmount; 0 disables waiting")
+	waitTimeout := fs.Duration("timeout", 60*time.Second, "time budget per wait phase (mount process stop, exit wait, kernel mount-table entry clear); 0 disables waiting")
 	noAutoPack := fs.Bool("no-auto-pack", false, "disable automatic profile pack upload after unmount")
 	var packArchives stringListFlag
 	var packPaths stringListFlag
@@ -2037,15 +2053,13 @@ func runUmount(args []string, deps umountDeps) error {
 				return
 			}
 			runErr = deps.run(argv)
-			if runErr != nil && stoppedSupervisor && mountStillActiveAfterUmount(mountPoint) {
-				forceUnmountAfterUmount(mountPoint)
-			}
 			// Gate success on the authoritative kernel mount table: a lazy
 			// (MNT_DETACH) detach clears /etc/mtab immediately while the
 			// kernel entry lingers until the last reference (draining mount
-			// daemon, open files) is reaped, and the stat probe above cannot
-			// tell the difference. Wait for the entry to clear, bounded by
-			// --timeout, escalating through non-lazy and lazy unmounts (#928).
+			// daemon, open files) is reaped, and the stat probe cannot tell
+			// the difference. waitForKernelMountEntryClear owns the whole
+			// escalation ladder (helper retries, umount2, one lazy detach)
+			// so it runs in one place under one budget (#928).
 			if runErr == nil || stoppedSupervisor {
 				runErr = waitForKernelMountEntryClear(mountPoint, *waitTimeout, deps)
 			}
@@ -2356,67 +2370,104 @@ func packAuthFromMountState(state mountstate.ProcessState) (mountPackAuth, error
 }
 
 // fusermountClearRetries is how many times waitForKernelMountEntryClear
-// re-issues the binary unmount helper before switching to direct umount2 —
-// enough to ride out transient EBUSY without spamming helper stderr.
+// re-issues the binary unmount helper before escalating — enough to ride out
+// transient EBUSY without spamming helper stderr.
 const fusermountClearRetries = 3
+
+// unsupportedRungHelperEvery slows the binary-helper retry cadence on
+// platforms without the umount2 rung, so the loop keeps making progress
+// without hammering the helper for the whole timeout.
+const unsupportedRungHelperEvery = 4
 
 // mountEntryClearPollInterval is how often waitForKernelMountEntryClear
 // re-checks the kernel mount table while a lingering entry is reaped.
 const mountEntryClearPollInterval = 500 * time.Millisecond
 
 // waitForKernelMountEntryClear blocks until the kernel mount-table entry for
-// mountPoint is gone, bounded by timeout (0 verifies once without waiting).
-// The check is authoritative (/proc/self/mountinfo on Linux): a lazy
-// (MNT_DETACH) detach removes the /etc/mtab entry immediately while the
-// kernel entry lingers until the mount's last reference is reaped, and
-// stat-based probes cannot see the difference (#928). While the entry
-// lingers the helper re-issues unmounts — non-lazy fusermount first (EBUSY
-// is transient), then direct umount2 (fusermount refuses leftovers whose
-// mtab entry is gone) plus one lazy detach — so the only outcomes are a
-// cleared table or a bounded, reported failure.
+// mountPoint is gone, bounded by timeout. The check is authoritative
+// (/proc/self/mountinfo on Linux): a lazy (MNT_DETACH) detach removes the
+// /etc/mtab entry immediately while the kernel entry lingers until the
+// mount's last reference is reaped, and stat-based probes cannot see the
+// difference (#928).
+//
+// Escalation ladder, in order: non-lazy helper retries (EBUSY is
+// transient), one direct umount2 (fusermount refuses leftovers whose mtab
+// entry is gone; skipped where unsupported, keeping slower helper retries),
+// then a single lazy detach — after which path-based unmounts can no longer
+// target the detached superblock and the loop only polls until the kernel
+// reaps the entry. timeout <= 0 verifies once without attempting any
+// unmount. The only outcomes are a cleared table or a bounded, reported
+// failure; the budget is enforced by deadline checks before each attempt,
+// capped sleeps, and a command timeout on every helper run.
 func waitForKernelMountEntryClear(mountPoint string, timeout time.Duration, deps umountDeps) error {
 	if !mountStillActiveAfterUmount(mountPoint) {
 		return nil
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("drive9 umount: kernel mount-table entry for %s still present after unmount (--timeout 0 verifies once without waiting)", mountPoint)
 	}
 	if deps.printErrf != nil {
 		deps.printErrf("drive9 umount: waiting for kernel mount-table entry for %s to clear\n", mountPoint)
 	}
 	deadline := deps.now().Add(timeout)
-	lazyTried := false
-	var lastErr error
 	attempt := 0
-	for {
-		attempt++
-		var err error
-		if attempt <= fusermountClearRetries {
-			argv, argvErr := umountArgv(deps.goos, deps.lookPath, mountPoint)
-			if argvErr != nil {
-				err = argvErr
-			} else {
-				err = deps.run(argv)
-			}
-		} else {
-			err = unmountSyscallCLI(mountPoint)
-		}
+	lazyDone := false
+	var lastErr error
+	runHelper := func() error {
+		argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
 		if err != nil {
-			lastErr = err
+			return err
 		}
-		if !mountStillActiveAfterUmount(mountPoint) {
-			return nil
-		}
-		if !lazyTried {
-			// One lazy detach detaches the namespace right away; the kernel
-			// entry is reaped once the last reference drops.
-			lazyTried = true
-			forceUnmountAfterUmount(mountPoint)
+		return deps.run(argv)
+	}
+	for deps.now().Before(deadline) {
+		if lazyDone {
+			// After the lazy detach, path-based unmounts cannot target the
+			// detached superblock; poll until the kernel reaps the entry.
 			if !mountStillActiveAfterUmount(mountPoint) {
 				return nil
 			}
+		} else {
+			attempt++
+			var err error
+			switch {
+			case attempt <= fusermountClearRetries:
+				err = runHelper()
+			case deps.unmountSyscall != nil:
+				err = deps.unmountSyscall(mountPoint)
+			case attempt%unsupportedRungHelperEvery == 0:
+				// No umount2 rung on this platform: keep retrying the
+				// binary helper at a slower cadence; its real error stays
+				// the reported one.
+				err = runHelper()
+			}
+			if err != nil {
+				lastErr = err
+			}
+			if !mountStillActiveAfterUmount(mountPoint) {
+				return nil
+			}
+			if attempt > fusermountClearRetries {
+				// Helper retries and (where present) the direct umount2 both
+				// failed to clear the entry: the last rung is a single lazy
+				// detach, then poll-only.
+				lazyDone = true
+				forceUnmountAfterUmount(mountPoint)
+				if !mountStillActiveAfterUmount(mountPoint) {
+					return nil
+				}
+			}
 		}
-		if timeout == 0 || !deps.now().Before(deadline) {
-			break
+		sleepFor := deadline.Sub(deps.now())
+		if sleepFor > mountEntryClearPollInterval {
+			sleepFor = mountEntryClearPollInterval
 		}
-		deps.sleep(mountEntryClearPollInterval)
+		if sleepFor > 0 {
+			deps.sleep(sleepFor)
+		}
+	}
+	if !mountStillActiveAfterUmount(mountPoint) {
+		return nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("entry still listed")
