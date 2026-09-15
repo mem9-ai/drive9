@@ -898,8 +898,8 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
 | `LARGE_FILE_MB` | `100` | `api-smoke-test.sh` |
 | `BATCH_SMALL_FILE_COUNT` | `10` | `api-smoke-test.sh` |
-| `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-sqlite-commit-sequence.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-sqlite-commit-sequence.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
+| `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-sqlite-commit-sequence.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
+| `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-sqlite-commit-sequence.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
 | `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` (defaults to `0` when `DRIVE9_API_KEY` is set) | `api-smoke-test.sh` |
 | `UPLOAD_LIMIT_BYTES` | `10737418240` | `api-smoke-test.sh` |
 | `RUN_SEMANTIC_CHECKS` | `0` | `api-smoke-test.sh` |
