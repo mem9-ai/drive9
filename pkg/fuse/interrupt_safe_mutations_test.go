@@ -70,6 +70,18 @@ func TestInterruptSafeCommitContextPolicy(t *testing.T) {
 		t.Fatalf("clamped commit deadline = %v/%v, want <= the parent's 500ms remaining", clampedDeadline, ok)
 	}
 
+	// An already-expired parent clamps to the 1ns floor: no commit attempt is
+	// made (matching legacy, where an expired request context fails every
+	// call). The context is expired immediately, not resurrected.
+	expiredParent, expiredCancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer expiredCancel()
+	time.Sleep(2 * time.Millisecond)
+	expiredCtx, expiredCtxCancel := fs.namespaceMutationCommitContext(expiredParent)
+	defer expiredCtxCancel()
+	if err := expiredCtx.Err(); err != context.DeadlineExceeded {
+		t.Fatalf("expired-parent commit ctx err = %v, want DeadlineExceeded with no commit attempt", err)
+	}
+
 	legacyFS := newInterruptMutationTestFS(t, true)
 	legacyCtx, legacyCancel := legacyFS.namespaceMutationCommitContext(canceledCtx)
 	defer legacyCancel()

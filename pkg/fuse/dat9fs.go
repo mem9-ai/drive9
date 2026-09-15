@@ -713,6 +713,16 @@ func detachedSharedReadCtx(parent context.Context, timeout time.Duration) (conte
 // parent's remaining deadline): detachment must not shorten the first
 // attempt's deadline, which would regress slow-but-successful commits for
 // operations without retry recovery (chmod, delete, mknod, symlink).
+//
+// Edge case: a parent whose deadline has already expired clamps to the
+// 1ns floor, so the detached commit fails immediately with
+// DeadlineExceeded — no commit attempt is made. This matches legacy
+// behavior exactly (an expired request context fails every call too) and
+// never resurrects a request that has run out of time.
+//
+// Teardown trade-off: because the commit ignores the cancel channel,
+// unmount/supervisor stop waits for in-flight detached commits to finish
+// or hit their (request-bounded) deadline instead of aborting them.
 func (fs *Dat9FS) namespaceMutationCommitContext(parent context.Context) (context.Context, context.CancelFunc) {
 	if !fs.gvisorCompatibilityEnabled() && !fs.interruptSafeMutationsEnabled() {
 		return parent, func() {}
@@ -730,15 +740,17 @@ func (fs *Dat9FS) namespaceMutationCommitContext(parent context.Context) (contex
 	return context.WithTimeout(context.WithoutCancel(parent), timeout)
 }
 
-// gvisorCompatCommitContext detaches a commit context only under gVisor
+// gvisorOnlyCommitContext detaches a commit context only under gVisor
 // compatibility: data-transfer commits (the pending-upload commit inside
 // durable pending-new renames) and request-bound orchestration steps (the
 // unlink snapshot) stay interruptible for regular mounts and do not follow
 // the interrupt-safe namespace-mutation policy. Do not unify the remaining
 // inline gVisor gates in Unlink (open-handle mark, remote delete) with this
 // helper: their non-gVisor default is a fresh fuseCtx(cancel) deadline, and
-// this helper's parent passthrough would silently change that.
-func (fs *Dat9FS) gvisorCompatCommitContext(parent context.Context) (context.Context, context.CancelFunc) {
+// this helper's parent passthrough would silently change that. The remote
+// DELETE itself always re-detaches inside
+// deleteRemotePathWithInterruptRecovery, regardless of these gates.
+func (fs *Dat9FS) gvisorOnlyCommitContext(parent context.Context) (context.Context, context.CancelFunc) {
 	if !fs.gvisorCompatibilityEnabled() {
 		return parent, func() {}
 	}
@@ -2118,9 +2130,11 @@ func (fs *Dat9FS) gvisorCompatibilityEnabled() bool {
 
 // interruptSafeMutationsEnabled reports whether the remote commit of an
 // idempotent namespace mutation should run detached from the FUSE cancel
-// channel (see namespaceMutationCommitContext). Enabled by default;
-// MountOptions.LegacyInterruptibleMutations opts back into the legacy
-// behavior where a FUSE interrupt cancels the in-flight commit.
+// channel (see namespaceMutationCommitContext). Enabled by default (a nil
+// receiver or nil options mean default-on, unlike
+// gvisorCompatibilityEnabled); MountOptions.LegacyInterruptibleMutations
+// opts back into the legacy behavior where a FUSE interrupt cancels the
+// in-flight commit.
 func (fs *Dat9FS) interruptSafeMutationsEnabled() bool {
 	return fs == nil || fs.opts == nil || !fs.opts.LegacyInterruptibleMutations
 }
@@ -10213,7 +10227,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if fs.debouncer != nil {
 		fs.debouncer.Cancel(childP)
 	}
-	snapshotCtx, snapshotCancel := fs.gvisorCompatCommitContext(ctx)
+	snapshotCtx, snapshotCancel := fs.gvisorOnlyCommitContext(ctx)
 	snapshotErr := fs.snapshotOpenHandlesBeforeUnlink(snapshotCtx, childP)
 	snapshotCancel()
 	if snapshotErr != nil {
@@ -10341,7 +10355,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 
 	if !pendingNew {
 		// File existed on server (or unknown) — issue remote DELETE.
-		// Tolerate 404 in case it was already deleted.
+		// Tolerate 404 in case it was already deleted. The gVisor gate here
+		// governs only this orchestration context; the remote DELETE itself
+		// re-detaches inside deleteRemoteFileWithInterruptRecovery for every
+		// mount mode.
 		deleteCtx, deleteCancel := fuseCtx(cancel)
 		if fs.gvisorCompatibilityEnabled() {
 			deleteCancel()
@@ -10938,7 +10955,7 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 			// pending-upload commit (data transfer), not a namespace mutation,
 			// so interrupt-safe mutation detachment deliberately does not
 			// apply here; only gVisor compatibility detaches it.
-			commitCtx, commitCancel := fs.gvisorCompatCommitContext(ctx)
+			commitCtx, commitCancel := fs.gvisorOnlyCommitContext(ctx)
 			defer commitCancel()
 			return fs.commitQueue.commitNowPathLocked(commitCtx, entry)
 		}

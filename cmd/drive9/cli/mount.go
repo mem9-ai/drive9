@@ -184,7 +184,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	syncRead := fs.Bool("fuse-sync-read", false, "disable kernel async read dispatch; at most one read in flight per file handle")
 	directMountStrict := fs.Bool("direct-mount-strict", false, "Linux only: mount directly with mount(2) and do not fall back to fusermount")
 	gvisorCompat := fs.Bool("gvisor-compat", false, "enable gVisor-specific FUSE compatibility behavior (default from $DRIVE9_MOUNT_GVISOR_COMPAT)")
-	legacyInterruptibleMutations := fs.Bool("legacy-interruptible-mutations", false, "restore legacy behavior where a FUSE interrupt cancels in-flight remote commits of idempotent namespace mutations, which can surface EAGAIN for an already-committed change; no effect with --gvisor-compat (default from $DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS)")
+	legacyInterruptibleMutations := fs.Bool("legacy-interruptible-mutations", false, "restore legacy behavior where a FUSE interrupt cancels in-flight remote commits of idempotent namespace mutations, which can surface EAGAIN for an already-committed change; no effect with --gvisor-compat; note: with interrupt-safe commits (default), unmount waits for in-flight detached commits up to their request deadline instead of aborting them (default from $DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS)")
 	legacyDirStatFallback := fs.Bool("legacy-dir-stat-fallback", false, "on Lookup stat 404, list parent to support legacy servers without directory stat")
 	readDirPrefetch := fs.Bool("readdir-prefetch", false, "prefetch small files after directory reads into the read cache")
 	prefetchMaxFiles := fs.Int("readdir-prefetch-max-files", 32, "maximum small files prefetched per directory read")
