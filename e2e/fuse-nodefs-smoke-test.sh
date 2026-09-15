@@ -25,6 +25,7 @@ FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 FUSE_NODEFS_KEEP_ARTIFACTS="${FUSE_NODEFS_KEEP_ARTIFACTS:-0}"
 FUSE_NODEFS_WORKLOAD_TIMEOUT_S="${FUSE_NODEFS_WORKLOAD_TIMEOUT_S:-240}"
 FUSE_NODEFS_CROSS_TIMEOUT_S="${FUSE_NODEFS_CROSS_TIMEOUT_S:-60}"
+FUSE_NODEFS_UNMOUNT_SETTLE_S="${FUSE_NODEFS_UNMOUNT_SETTLE_S:-60}"
 FUSE_NODEFS_LARGE_MB="${FUSE_NODEFS_LARGE_MB:-9}"
 FUSE_NODEFS_MIN_NODE_VERSION="${FUSE_NODEFS_MIN_NODE_VERSION:-18.17.0}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
@@ -264,6 +265,22 @@ unmount_mount() {
     set -e
   fi
   return 0
+}
+
+wait_mount_settled() {
+  # After `drive9 umount` on Linux the /etc/mtab entry clears immediately
+  # while the kernel mountinfo entry can persist for tens of seconds while
+  # the FUSE connection drains (commit queue uploads). Poll until the
+  # mountpoint is verifiably gone; only a mount that outlives the settle
+  # budget counts as "still mounted".
+  local deadline=$(( $(date +%s) + FUSE_NODEFS_UNMOUNT_SETTLE_S ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ! is_mounted "$MOUNT_POINT"; then
+      return 0
+    fi
+    sleep 2
+  done
+  ! is_mounted "$MOUNT_POINT"
 }
 
 curl_body_code() {
@@ -554,10 +571,10 @@ cleanup() {
   fi
   # The mount is the tenant root, so a recursive delete while it is still
   # mounted would traverse into the remote workspace beyond this fixture.
-  # Never remove the run root unless the mountpoint is verified gone; a
-  # failed unmount preserves artifacts and fails the run even if every
-  # assertion passed.
-  if [ -n "${MOUNT_POINT:-}" ] && is_mounted "$MOUNT_POINT"; then
+  # Never remove the run root unless the mountpoint is verified gone (after
+  # the bounded settle window above); a failed unmount preserves artifacts
+  # and fails the run even if every assertion passed.
+  if [ -n "${MOUNT_POINT:-}" ] && ! wait_mount_settled; then
     echo "ERROR: $MOUNT_POINT is still mounted after cleanup; refusing to remove $RUN_ROOT" >&2
     echo "--- diagnostics ---" >&2
     echo "mountpoint probe:" >&2
