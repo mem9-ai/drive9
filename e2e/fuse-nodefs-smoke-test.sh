@@ -653,12 +653,26 @@ if [ "$(uname -s)" = "Linux" ]; then
 fi
 
 echo "[0] run_bounded hard-deadline regression gate"
-# Budget=1 must hard-kill a TERM-ignoring child within the budget. The outer
-# 20s bound turns a regression (TERM-only timeout with no kill-after) into a
-# bounded failure instead of a hung gate; healthy behavior returns 124 in ~1s.
+# Budget=1 must hard-kill a TERM-ignoring child within the budget. The
+# function under test runs in the background with a manual outer cap (nesting
+# it under another run_bounded would hand a shell function to GNU timeout,
+# which cannot exec functions — exit 127, the exact failure class this gate
+# guards). Healthy behavior returns 124 in ~1s; the old TERM-only GNU branch
+# hangs and is caught by the 20s cap.
 gate_start=$SECONDS
 gate_rc=0
-run_bounded 20 run_bounded 1 bash -c 'trap "" TERM; while :; do sleep 0.1; done' >/dev/null 2>&1 || gate_rc=$?
+run_bounded 1 bash -c 'trap "" TERM; while :; do sleep 0.1; done' >/dev/null 2>&1 &
+gate_job=$!
+(
+  sleep 20
+  kill -TERM "$gate_job" 2>/dev/null || true
+  sleep 2
+  kill -KILL "$gate_job" 2>/dev/null || true
+) &
+gate_watchdog=$!
+wait "$gate_job" || gate_rc=$?
+kill -TERM "$gate_watchdog" 2>/dev/null || true
+wait "$gate_watchdog" 2>/dev/null || true
 gate_elapsed=$(( SECONDS - gate_start ))
 if [ "$gate_rc" -eq 124 ] && [ "$gate_elapsed" -le 3 ]; then
   check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child" "true" "true"
