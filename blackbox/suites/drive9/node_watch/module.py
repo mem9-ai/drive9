@@ -57,6 +57,24 @@ class Drive9NodeWatch(BaseModule):
 
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
+        # Attribution-fence regression, runs before any mount is involved:
+        # a delayed read started from a pre-barrier phase-A event must never
+        # be credited as a remote event.
+        env = ctx.deps.node_env(node_bin, base=ctx.target.base_env())
+        selftest = subprocess.run(
+            [node_bin, str(probe_js), "selftest"],
+            cwd=str(artifact),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if selftest.returncode != 0:
+            raise BlackboxError(
+                f"watch probe selftest failed (rc={selftest.returncode}): "
+                f"{(selftest.stdout or '')[-400:]} {(selftest.stderr or '')[-400:]}"
+            )
         profile = os.environ.get("FUSE_PROFILE") or "none"
         handle = ctx.target.mount("drive9_node_watch", remote, profile=profile, extra=["--allow-other"])
         try:

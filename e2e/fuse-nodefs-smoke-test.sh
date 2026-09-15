@@ -652,6 +652,20 @@ if [ "$(uname -s)" = "Linux" ]; then
   fi
 fi
 
+echo "[0] run_bounded hard-deadline regression gate"
+# Budget=1 must hard-kill a TERM-ignoring child within the budget. The outer
+# 20s bound turns a regression (TERM-only timeout with no kill-after) into a
+# bounded failure instead of a hung gate; healthy behavior returns 124 in ~1s.
+gate_start=$SECONDS
+gate_rc=0
+run_bounded 20 run_bounded 1 bash -c 'trap "" TERM; while :; do sleep 0.1; done' >/dev/null 2>&1 || gate_rc=$?
+gate_elapsed=$(( SECONDS - gate_start ))
+if [ "$gate_rc" -eq 124 ] && [ "$gate_elapsed" -le 3 ]; then
+  check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child" "true" "true"
+else
+  check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child" "rc=$gate_rc elapsed=${gate_elapsed}s" "rc=124 elapsed<=3s"
+fi
+
 echo "[1] provision tenant"
 if [ -n "$DRIVE9_API_KEY" ]; then
   API_KEY="$DRIVE9_API_KEY"
