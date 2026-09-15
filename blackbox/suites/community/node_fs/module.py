@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from harness.core import BlackboxError, Context, write_json
+from harness.core import BlackboxError, Context, resolve_module_timeout, write_json
 from harness.module_base import BaseModule, read_text
 from suites.community.node_fs.deps import ensure_node_fs_deps, module_cfg
 
@@ -78,19 +78,28 @@ class CommunityNodeFS(BaseModule):
         try:
             test_root = handle.mountpoint / "nodejs-test"
             test_root.mkdir()
-            env = ctx.target.base_env()
+            env = ctx.deps.node_env(node_bin)
+            # base_env's HOME/GIT overrides must survive the node PATH prepend.
+            for key, value in ctx.target.base_env().items():
+                env.setdefault(key, value)
             # Redirect both the runner-managed tmpdir (NODE_TEST_DIR) and
             # os.tmpdir() (TMPDIR) onto the mount; the node checkout and
             # binary stay on local disk so only the fs-under-test is slow.
             env["NODE_TEST_DIR"] = str(test_root)
             env["TMPDIR"] = str(test_root)
-            env["PATH"] = f"{Path(node_bin).resolve().parent}:{env.get('PATH', '')}"
-            jobs = str(int(os.environ.get("NODE_FS_JOBS", "1")))
-            per_test_timeout = str(int(os.environ.get("NODE_FS_TEST_TIMEOUT_S", "300")))
             try:
+                jobs = int(os.environ.get("NODE_FS_JOBS", "1"))
+                per_test_timeout = str(int(os.environ.get("NODE_FS_TEST_TIMEOUT_S", "300")))
                 timeout_s = int(os.environ.get("NODE_FS_TIMEOUT_S", str(self.timeout)))
             except ValueError as exc:
-                raise BlackboxError(f"NODE_FS_TIMEOUT_S must be an integer number of seconds: {exc}") from exc
+                raise BlackboxError(
+                    f"NODE_FS_JOBS / NODE_FS_TEST_TIMEOUT_S / NODE_FS_TIMEOUT_S must be "
+                    f"integer numbers of seconds: {exc}"
+                ) from exc
+            # Single source of truth for the wall clock: the module budget can
+            # never exceed the runner-resolved module timeout, or the runner
+            # would kill the module mid-flight (e.g. mid-unmount).
+            timeout_s = min(timeout_s, resolve_module_timeout(self.id, self.timeout, ctx.suite))
             # Reserve wall-clock headroom for the retry pass and the unmount;
             # the runner kills the whole module at timeout_s, so first pass +
             # retry must stay below it with margin for mount teardown. Reject
@@ -99,7 +108,7 @@ class CommunityNodeFS(BaseModule):
             timeout_floor = 600 + 120 + 300
             if timeout_s < timeout_floor:
                 raise BlackboxError(
-                    f"NODE_FS_TIMEOUT_S must be >= {timeout_floor} "
+                    f"effective NODE_FS_TIMEOUT_S budget must be >= {timeout_floor} "
                     f"(first-pass floor 600 + retry floor 120 + unmount reserve 300)"
                 )
             first_pass_timeout = max(600, timeout_s - 900)

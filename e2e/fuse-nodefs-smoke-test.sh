@@ -218,7 +218,7 @@ is_mounted() {
     local rc=$?
     if [ -n "${RUN_ROOT:-}" ]; then
       {
-        echo "$(date -u '+%H:%M:%S.%3N') arg=$mount_point awk_rc=$rc"
+        echo "$(date -u '+%H:%M:%S') arg=$mount_point awk_rc=$rc"
       } >>"$IS_MOUNTED_TRACE" 2>/dev/null || true
     fi
     return "$rc"
@@ -297,7 +297,11 @@ unmount_mount() {
     fi
   fi
   if ! wait_mount_state unmounted; then
-    return 1
+    # The kernel mountinfo entry can outlive a clean umount while the FUSE
+    # connection drains; give it the same bounded settle + force fallback as
+    # the exit trap before declaring failure (a 20-180s drain would otherwise
+    # fail the gate at the in-flow unmount steps).
+    wait_mount_settled || return 1
   fi
   if [ -n "${MOUNT_PID:-}" ]; then
     set +e
@@ -418,49 +422,10 @@ drive9_retry() {
   done
 }
 
-run_nodefs() {
-  # Enforce the workload timeout on hosts without GNU timeout (stock macOS)
-  # via a background watchdog; relay the workload's exit status and map
-  # watchdog kills to the conventional 124.
-  if [ "$FUSE_NODEFS_WORKLOAD_TIMEOUT_S" = "0" ] || command -v timeout >/dev/null 2>&1; then
-    local timeout_cmd=()
-    if [ "$FUSE_NODEFS_WORKLOAD_TIMEOUT_S" != "0" ]; then
-      timeout_cmd=(timeout --kill-after=10s "${FUSE_NODEFS_WORKLOAD_TIMEOUT_S}s")
-    fi
-    # ${arr[@]+...} keeps empty-array expansion legal under `set -u` on bash 3.2
-    # (macOS) where "${arr[@]}" on an empty array is an unbound-variable error.
-    ${timeout_cmd[@]+"${timeout_cmd[@]}"} node "$NODEFS_JS" "$@"
-    return $?
-  fi
-  node "$NODEFS_JS" "$@" &
-  local workload_pid=$!
-  (
-    sleep "${FUSE_NODEFS_WORKLOAD_TIMEOUT_S}"
-    kill -TERM "$workload_pid" 2>/dev/null || true
-    sleep 10
-    kill -KILL "$workload_pid" 2>/dev/null || true
-  ) &
-  local watchdog_pid=$!
-  set +e
-  wait "$workload_pid"
-  local rc=$?
-  set -e
-  kill -TERM "$watchdog_pid" 2>/dev/null || true
-  wait "$watchdog_pid" 2>/dev/null || true
-  if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then
-    echo "nodefs workload exceeded ${FUSE_NODEFS_WORKLOAD_TIMEOUT_S}s (watchdog)" >&2
-    return 124
-  fi
-  return "$rc"
-}
-
-# Auto durability defers the remote commit of a mounted write, and FUSE
-# directory caches can delay a CLI upload from appearing on the mount. Both
-# cross-channel directions therefore poll bounded instead of asserting
-# one-shot.
-run_nodefs_bounded() {
-  # Hard per-invocation cap so a single hung FUSE read cannot outlive the
-  # outer polling budget. The kill-after grace stays inside the budget.
+run_bounded() {
+  # Generic hard per-invocation cap: GNU timeout when available, otherwise a
+  # background watchdog (stock macOS). The kill-after grace stays inside the
+  # budget; watchdog kills map to the conventional 124.
   local budget="$1"
   shift
   local kill_grace=5
@@ -469,10 +434,10 @@ run_nodefs_bounded() {
     soft=1
   fi
   if command -v timeout >/dev/null 2>&1; then
-    timeout --kill-after="${kill_grace}s" "${soft}s" node "$NODEFS_JS" "$@"
+    timeout --kill-after="${kill_grace}s" "${soft}s" "$@"
     return $?
   fi
-  node "$NODEFS_JS" "$@" &
+  "$@" &
   local workload_pid=$!
   (
     sleep "$soft"
@@ -493,6 +458,26 @@ run_nodefs_bounded() {
   return "$rc"
 }
 
+run_nodefs() {
+  if [ "$FUSE_NODEFS_WORKLOAD_TIMEOUT_S" = "0" ]; then
+    node "$NODEFS_JS" "$@"
+    return $?
+  fi
+  run_bounded "$FUSE_NODEFS_WORKLOAD_TIMEOUT_S" node "$NODEFS_JS" "$@"
+}
+
+# Auto durability defers the remote commit of a mounted write, and FUSE
+# directory caches can delay a CLI upload from appearing on the mount. Both
+# cross-channel directions therefore poll bounded instead of asserting
+# one-shot.
+run_nodefs_bounded() {
+  # Hard per-invocation cap so a single hung FUSE read cannot outlive the
+  # outer polling budget. The kill-after grace stays inside the budget.
+  local budget="$1"
+  shift
+  run_bounded "$budget" node "$NODEFS_JS" "$@"
+}
+
 wait_remote_content_sha() {
   local remote="$1" want_sha="$2"
   local deadline=$(( $(date +%s) + FUSE_NODEFS_CROSS_TIMEOUT_S ))
@@ -504,11 +489,7 @@ wait_remote_content_sha() {
       break
     fi
     set +e
-    if command -v timeout >/dev/null 2>&1; then
-      timeout --kill-after=5s "${remaining}s" drive9 fs cat ":$remote" > "$body_file" 2>/dev/null
-    else
-      drive9 fs cat ":$remote" > "$body_file" 2>/dev/null
-    fi
+    run_bounded "$remaining" drive9 fs cat ":$remote" > "$body_file" 2>/dev/null
     local rc=$?
     set -e
     if [ "$rc" -eq 0 ] && [ "$(sha256_file "$body_file")" = "$want_sha" ]; then

@@ -117,7 +117,11 @@ async function main() {
           result.phase_a.file_event = true;
           result.phase_a.ms ??= now - phaseAStart;
         }
-      } else if (result.phase_b.trigger_seen_epoch_ms !== null && result.phase_b.file_watch_epoch_ms === null) {
+      } else if (result.phase_b.file_watch_epoch_ms === null) {
+        // Record the first phase-B event even if trigger.stamp is not
+        // readable through the mount yet: the harness writes the trigger
+        // immediately BEFORE overwriting the target, so an early event is a
+        // genuine remote-mutation signal and must not be dropped.
         result.phase_b.file_watch_epoch_ms = now;
         result.phase_b.file_event_type = eventType;
       }
@@ -142,7 +146,7 @@ async function main() {
           result.phase_a.dir_event = true;
           result.phase_a.ms ??= now - phaseAStart;
         }
-      } else if (result.phase_b.trigger_seen_epoch_ms !== null && result.phase_b.dir_watch_epoch_ms === null) {
+      } else if (result.phase_b.dir_watch_epoch_ms === null) {
         result.phase_b.dir_watch_epoch_ms = now;
         result.phase_b.dir_event_type = eventType;
       }
