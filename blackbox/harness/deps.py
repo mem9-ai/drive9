@@ -268,23 +268,29 @@ class Drive9DependencyManager(DependencyManager):
             raise DependencyUnavailable(f"node {required} is required and auto-fetch is disabled")
         self._ensure_tools_root()
         arch = _node_arch()
-        tarball = f"node-v{target_version}-linux-{arch}.tar.xz"
+        system = _node_os()
+        tarball = f"node-v{target_version}-{system}-{arch}.tar.xz"
         url = f"https://nodejs.org/dist/v{target_version}/{tarball}"
         download_dir = self.tools_root / "node" / "_downloads"
         download_dir.mkdir(parents=True, exist_ok=True)
         archive = download_dir / tarball
         self.run(f"node-download-{target_version}", ["curl", "-fsSL", "-o", str(archive), url], timeout=600)
         self.run(f"node-extract-{target_version}", ["tar", "-xJf", str(archive), "-C", str(node_dir.parent)], timeout=300)
-        extracted = node_dir.parent / f"node-v{target_version}-linux-{arch}"
+        extracted = node_dir.parent / f"node-v{target_version}-{system}-{arch}"
         extracted.rename(node_dir)
         if not node_bin.exists():
             raise DependencyUnavailable(f"node {target_version} download did not produce {node_bin}")
         progress(f"dependency tool: node ({target_version}) fetched -> {node_bin}")
         return str(node_bin)
 
-    def node_env(self, node_bin: str) -> dict[str, str]:
-        """Build an env with the given node's bin dir prepended to PATH."""
-        env = dict(os.environ)
+    def node_env(self, node_bin: str, base: dict[str, str] | None = None) -> dict[str, str]:
+        """Build an env with the given node's bin dir prepended to PATH.
+
+        ``base`` overrides the inherited process environment (pass the
+        target's ``base_env()`` so HOME isolation and credential overrides
+        survive the PATH prepend).
+        """
+        env = dict(base) if base is not None else dict(os.environ)
         node_bin_dir = str(Path(node_bin).resolve().parent)
         env["PATH"] = f"{node_bin_dir}:{env.get('PATH', '')}"
         return env
@@ -363,7 +369,7 @@ def _resolve_node_version(constraint: str) -> str:
         base = constraint[2:].strip()
         major = _node_version_tuple(base)[0]
         latest = {
-            24: "24.15.0",
+            24: "24.21.0",
             22: "22.22.1",
             20: "20.19.0",
         }
@@ -372,6 +378,13 @@ def _resolve_node_version(constraint: str) -> str:
         if constraint.startswith(prefix):
             return constraint[len(prefix):].strip()
     return constraint
+
+
+def _node_os() -> str:
+    import platform
+
+    system = platform.system().lower()
+    return {"darwin": "darwin", "macos": "darwin"}.get(system, system or "linux")
 
 
 def _node_arch() -> str:

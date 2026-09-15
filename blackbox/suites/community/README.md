@@ -18,6 +18,7 @@ Each subdirectory is one auto-discovered module (`module.py`), optionally with a
 | `community.ltp.fs` | compatibility | LTP filesystem scenario (`drive9-fs-smoke`). |
 | `community.ltp.syscalls` | compatibility | LTP filesystem-sensitive syscall subset (`drive9-syscalls-fs`). |
 | `community.mdtest` | performance | mdtest metadata create/stat/remove workload. |
+| `community.node_fs` | compatibility | Official Node.js core `parallel/test-fs-*` suite (pinned LTS) with test tmpdirs on the mount. |
 | `community.pjdfstest` | compatibility | pjdfstest POSIX pass rate. |
 | `community.pyxattr` | compatibility | pyxattr-backed extended attribute checks. |
 | `community.sqlite` | compatibility | Official SQLite `speedtest1`, `mptester`, `threadtest3`, and `kvtest` on a FUSE mount, plus a MAP_SHARED mmap probe. |
@@ -75,6 +76,8 @@ FIO_BIN=/path/to/fio
 MDTEST_BIN=/path/to/mdtest
 MPICC=/path/to/mpicc
 FSX_BIN=/path/to/fsx
+NODE_BIN=/path/to/node                 # community.node_fs exact-version binary
+NODE_FS_SOURCE=/path/to/node-source    # checkout with tools/test.py + test/
 SPEEDTEST1_BIN=/path/to/speedtest1
 MPTEST_BIN=/path/to/mptester          # upstream binary name is mptester
 KVTEST_BIN=/path/to/kvtest
@@ -126,6 +129,9 @@ SQLITE_SKIP_THREADTEST=0
 SQLITE_SKIP_KVTEST=0
 SQLITE_SKIP_MMAP=0
 SQLITE_FAIL_FAST=0
+NODE_FS_JOBS=1                         # test.py -j parallelism (serial by default)
+NODE_FS_TEST_TIMEOUT_S=300             # per-test timeout on FUSE
+NODE_FS_TIMEOUT_S=3600                 # whole-module run_cmd timeout
 ```
 
 `LTP_ROOT` must point to an installed LTP tree containing `kirk` (or `runltp`),
@@ -198,6 +204,18 @@ Default cases:
 Binaries stay on the host; only the database files are created on the mount.
 This is separate from the in-house `drive9.sqlite` WAL+mmap remount module.
 
+`community.node_fs` clones the Node.js source at the tag pinned in its
+`config.json` (currently `v24.21.0`, the current LTS line) and runs the
+official test runner (`tools/test.py --shell <official-release-binary>`)
+against the `parallel/test-fs-*` files — no local test code is written. Test
+tmpdirs are redirected onto the mount via `NODE_TEST_DIR`/`TMPDIR`; the source
+checkout and node binary stay on local disk. Bumping the pinned version is a
+deliberate change that requires re-triaging the `exclusions` map in
+`config.json`: excluded entries carry a reason and are reported as stale when
+they stop failing, so the compat matrix stays honest. Run serially by default
+(`NODE_FS_JOBS=1`) to avoid network-FS flake. Node.js is MIT-licensed
+(https://github.com/nodejs/node).
+
 Dependency metadata (name, source, license, ref) is embedded in each
 module's own `deps.py` and written as `.drive9-blackbox-dependency.json`
 next to the cached dependency when a module prepares it.
@@ -231,6 +249,7 @@ retain their own licenses and notices.
 - **fio**: https://github.com/axboe/fio — GPL-2.0-only
 - **IOR / mdtest**: https://github.com/hpc/ior — GPL-2.0-only
 - **SQLite** (`speedtest1`, `mptester`): https://github.com/sqlite/sqlite — public domain ([blessing](https://sqlite.org/copyright.html))
+- **Node.js** (core test suite, `community.node_fs`): https://github.com/nodejs/node — MIT
 
 fio, mdtest/IOR, Python xattr bindings, and platform tools may be
 provided by the host environment or installed by CI. Their own distribution
