@@ -5805,6 +5805,48 @@ func TestLinkToleratesTransientPostCommitStatError(t *testing.T) {
 	}
 }
 
+// TestLinkToleratesNotFoundPostCommitStat pins the 404 boundary of the
+// unconditional tolerance: even a not-found response on the optional
+// post-commit stat must not fail a hardlink the server has confirmed.
+func TestLinkToleratesNotFoundPostCommitStat(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case http.MethodHead:
+			http.Error(w, "not found", http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcMtime := time.Now().Add(-time.Hour).UTC()
+	srcIno := fs.inodes.LookupWithIdentity("/src.txt", "file-1", 1, false, 6, srcMtime)
+
+	var out gofuse.EntryOut
+	st := fs.Link(nil, &gofuse.LinkIn{
+		InHeader:  gofuse.InHeader{NodeId: 1},
+		Oldnodeid: srcIno,
+	}, "dst.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Link status = %v, want OK despite 404 on the post-commit stat", st)
+	}
+	if out.NodeId != srcIno || out.Nlink != 2 {
+		t.Fatalf("entry out = node %d nlink %d, want node %d nlink 2", out.NodeId, out.Nlink, srcIno)
+	}
+	entry, ok := fs.inodes.GetEntry(srcIno)
+	if !ok {
+		t.Fatal("source entry missing after link")
+	}
+	if !entry.Mtime.Equal(srcMtime) {
+		t.Fatalf("entry mtime = %v, want the source mtime %v preserved", entry.Mtime, srcMtime)
+	}
+}
+
 // TestLinkToleratesFuseInterruptAfterCommit exercises the production failure
 // shape directly: the FUSE cancel channel closes (kernel FUSE_INTERRUPT)
 // exactly when the server commits the hardlink, so the post-commit stat runs
