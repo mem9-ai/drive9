@@ -89,10 +89,10 @@ class CommunityNodeFS(BaseModule):
             per_test_timeout = str(int(os.environ.get("NODE_FS_TEST_TIMEOUT_S", "300")))
             timeout_s = int(os.environ.get("NODE_FS_TIMEOUT_S", str(self.timeout)))
             # Reserve wall-clock headroom for the retry pass and the unmount;
-            # the runner kills the whole module at timeout_s, so a first pass
-            # allowed to run the full budget could never be retried.
-            first_pass_timeout = max(600, timeout_s - 600)
-            retry_budget = max(300, timeout_s - first_pass_timeout)
+            # the runner kills the whole module at timeout_s, so first pass +
+            # retry must stay below it with margin for mount teardown.
+            first_pass_timeout = max(600, timeout_s - 900)
+            retry_budget = max(120, timeout_s - first_pass_timeout - 300)
             cmd = [
                 sys.executable,
                 str(node_src / "tools" / "test.py"),
@@ -117,6 +117,12 @@ class CommunityNodeFS(BaseModule):
             stdout_text = read_text(result.stdout)
             stderr_text = read_text(result.stderr)
             first = self.parse(stdout_text, str(result.stdout), result.code)
+            # Surface first-pass anomalies before spending the retry budget:
+            # an anomalous parse must fail, not be retried.
+            if first_anomaly := first.get("anomaly"):
+                log = ctx.artifact_dir(self.id) / "node-fs.log"
+                log.write_text(stdout_text + "\n" + stderr_text, encoding="utf-8")
+                raise BlackboxError(f"node fs first-pass anomaly ({first_anomaly}); see {first['log']}")
             failed_names = first["failed_tests"]
             retry_report: dict[str, Any] = {}
             if failed_names:
@@ -212,6 +218,10 @@ class CommunityNodeFS(BaseModule):
             anomaly = f"runner_exit_{rc}"
         elif rc == 0 and failed > 0:
             anomaly = "exit_zero_with_failures"
+        elif rc == 1 and failed == 0:
+            # Exit 1 without a failed counter means the runner aborted for a
+            # reason the parse cannot see (e.g. "Test aborted.") — fail closed.
+            anomaly = "exit_one_without_failures"
         elif len(failed_names) != failed:
             # The parsed failed-file list disagrees with the runner's failed
             # counter in either direction: a truncated/absent "Failed tests:"

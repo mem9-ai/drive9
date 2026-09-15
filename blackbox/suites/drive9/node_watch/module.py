@@ -49,7 +49,10 @@ class Drive9NodeWatch(BaseModule):
         probe_log = artifact / "watch-probe.log"
         stamp = artifact / "trigger.stamp"
         payload = artifact / "target-v2.txt"
-        stamp.write_text(f"{int(time.time() * 1000)}\n", encoding="utf-8")
+        # The payload is fixed before the probe starts (it must match what the
+        # probe expects). The stamp's embedded timestamp is written inside
+        # _remote_mutation, immediately before the target overwrite, so the
+        # latencies measured against it are not inflated by mount/probe startup.
         payload.write_text(f"v2-remote-{int(time.time() * 1000)}\n", encoding="utf-8")
 
         remote = ctx.target.remote_root(self.id)
@@ -110,6 +113,9 @@ class Drive9NodeWatch(BaseModule):
     def _remote_mutation(self, ctx: Context, handle: Any, stamp: Path, payload: Path) -> dict[str, Any]:
         """Mutate trigger.stamp + target.txt through the CLI (server-side)."""
         remote_root = handle.remote_root
+        # Written here — milliseconds before the target overwrite — so the
+        # embedded timestamp is a true mutation reference, not module start.
+        stamp.write_text(f"{int(time.time() * 1000)}\n", encoding="utf-8")
         trigger_result = ctx.target.drive9("node-watch-trigger-cp", ["fs", "cp", str(stamp), f":{remote_root}/trigger.stamp"])
         if not trigger_result.ok:
             raise BlackboxError(f"failed to write trigger.stamp via CLI; see {trigger_result.stderr}")
@@ -153,8 +159,9 @@ class Drive9NodeWatch(BaseModule):
         phase_b = outcome.get("phase_b", {})
 
         # Latencies are measured from the mutation timestamp the harness
-        # embedded in trigger.stamp (written immediately before the target
-        # overwrite), falling back to when the probe first saw the trigger.
+        # embedded in trigger.stamp (rewritten inside _remote_mutation right
+        # before the target overwrite), falling back to when the probe first
+        # saw the trigger.
         reference: float | None = None
         trigger_value = str(phase_b.get("trigger_value") or "").strip()
         if trigger_value.isdigit():

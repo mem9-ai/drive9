@@ -80,14 +80,17 @@ async function noteContent(channel, epochMs) {
       result.phase_b.last_content = content.slice(0, 80);
       result.phase_b[`${channel}_epoch_ms`] ??= epochMs;
     } else if (content.startsWith(V2_PREFIX)) {
-      // A truncated or otherwise partial v2 payload: keep observing — only
-      // the full expected payload satisfies the correctness floor.
-      result.phase_b.content_match ??= 'truncated';
-      result.phase_b.partial_content ??= `${content.length}/${expectedPayload.length} bytes: ${content.slice(0, 80)}`;
-    } else {
-      result.phase_b.content_match ??= 'mismatch';
-      result.phase_b.other_content ??= content.slice(0, 80);
+      // A truncated or wrong-round v2 payload: keep observing — only the
+      // full expected payload satisfies the correctness floor.
+      result.phase_b.content_match = content.length < expectedPayload.length ? 'truncated' : 'mismatch';
+      if (content.length < expectedPayload.length) {
+        result.phase_b.partial_content ??= `${content.length}/${expectedPayload.length} bytes: ${content.slice(0, 80)}`;
+      } else {
+        result.phase_b.other_content ??= content.slice(0, 80);
+      }
     }
+    // Anything else (e.g. the phase-A own-write content) is simply pre-mutation
+    // state, not a remote-round payload — no classification.
   }
   return content;
 }
@@ -117,13 +120,10 @@ async function main() {
   try {
     dirWatcher = fs.watch(mountDir, (eventType, filename) => {
       const name = path.basename(String(filename || ''));
-      if (name !== 'target.txt' && name !== 'trigger.stamp') return;
+      // trigger.stamp events say nothing about the target mutation; crediting
+      // the dir-watch channel from them would fake remote event support.
+      if (name !== 'target.txt') return;
       const now = Date.now();
-      if (name !== 'target.txt') {
-        // trigger.stamp events say nothing about the target mutation; crediting
-        // the dir-watch channel from them would fake remote event support.
-        return;
-      }
       if (phase === 'A') {
         if (!result.phase_a.dir_event) {
           result.phase_a.dir_event = true;

@@ -278,6 +278,7 @@ async function runCreate(workDir, manifestPath) {
     cross_content: crossContent,
     entries,
     symlink: 'tree/a/b/leaf-link',
+    renamed_dir: 'tree/renamed-dir',
     dir_entries: {
       top: ['append.bin', 'cross-channel', 'handle.bin', 'hard-link.bin', 'large-copy-ficlone.bin', 'large-copy.bin', 'large-stream.bin', 'mode.txt', 'published.txt', 'replace-old.txt', 'roundtrip.txt', 'small-stream.bin', 'stat-target.txt', 'tree', 'utimes.txt'],
       nested: ['leaf-link', 'leaf.txt'],
@@ -312,6 +313,7 @@ async function runVerify(workDir, manifestPath) {
   eq('remounted hardlink checksum', sha256(await fsp.readFile(path.join(workDir, 'hard-link.bin'))), manifest.hard_sha256);
   eq('remounted cross-channel content', (await fsp.readFile(path.join(workDir, 'cross-channel', 'node-written.txt'), 'utf8')), manifest.cross_content);
   eq('remounted symlink still resolves', (await fsp.readFile(path.join(workDir, manifest.symlink), 'utf8')), 'leaf\n');
+  eq('remounted renamed directory survives', (await fsp.stat(path.join(workDir, manifest.renamed_dir))).isDirectory(), true);
   eq('remounted top-level readdir matches', (await fsp.readdir(workDir)).sort().join(','), manifest.dir_entries.top.join(','));
   eq('remounted nested readdir matches', (await fsp.readdir(path.join(workDir, 'tree', 'a', 'b'))).sort().join(','), manifest.dir_entries.nested.join(','));
   const dirents = await fsp.readdir(path.join(workDir, 'tree', 'a', 'b'), { withFileTypes: true });
