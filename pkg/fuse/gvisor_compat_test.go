@@ -2743,7 +2743,11 @@ func TestGVisorCompatDisabledRenameMetadataOnlySpecialTargetDeleteRemainsInterru
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	// Interrupt-safe mutations detach the first commit attempt from the
+	// FUSE cancel channel, so an interrupt can no longer cancel it. This
+	// test simulates exactly that cancellation; pin the legacy mode whose
+	// recovery contract it verifies.
+	opts := &MountOptions{LegacyInterruptibleMutations: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	var out gofuse.EntryOut

@@ -23243,7 +23243,11 @@ func TestUnlinkRemoteDeleteDoesNotRetryRecreatedPathAfterInterrupt(t *testing.T)
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	// Interrupt-safe mutations detach the first commit attempt from the
+	// FUSE cancel channel, so an interrupt can no longer cancel it. These
+	// tests simulate exactly that cancellation; pin the legacy mode whose
+	// recovery contract they verify.
+	opts := &MountOptions{LegacyInterruptibleMutations: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
@@ -23317,7 +23321,11 @@ func TestUnlinkRemoteDeleteAcceptsGoneAfterInterrupt(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	// Interrupt-safe mutations detach the first commit attempt from the
+	// FUSE cancel channel, so an interrupt can no longer cancel it. These
+	// tests simulate exactly that cancellation; pin the legacy mode whose
+	// recovery contract they verify.
+	opts := &MountOptions{LegacyInterruptibleMutations: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
@@ -25692,7 +25700,11 @@ func TestRmdirRemoteDeleteDoesNotRetryRecreatedPathAfterInterrupt(t *testing.T) 
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	// Interrupt-safe mutations detach the first commit attempt from the
+	// FUSE cancel channel, so an interrupt can no longer cancel it. These
+	// tests simulate exactly that cancellation; pin the legacy mode whose
+	// recovery contract they verify.
+	opts := &MountOptions{LegacyInterruptibleMutations: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
@@ -25758,7 +25770,11 @@ func TestRenameRemoteWithTransientRetryRetriesAfterInterrupt(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	// Interrupt-safe mutations detach the first commit attempt from the
+	// FUSE cancel channel, so an interrupt can no longer cancel it. These
+	// tests simulate exactly that cancellation; pin the legacy mode whose
+	// recovery contract they verify.
+	opts := &MountOptions{LegacyInterruptibleMutations: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
@@ -25833,7 +25849,11 @@ func TestRenameRemoteWithTransientRetryAcceptsTargetVisibleAfterInterrupt(t *tes
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	// Interrupt-safe mutations detach the first commit attempt from the
+	// FUSE cancel channel, so an interrupt can no longer cancel it. These
+	// tests simulate exactly that cancellation; pin the legacy mode whose
+	// recovery contract they verify.
+	opts := &MountOptions{LegacyInterruptibleMutations: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
@@ -25916,7 +25936,11 @@ func TestRenameRemoteWithTransientRetryDoesNotAcceptPreexistingTarget(t *testing
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	// Interrupt-safe mutations detach the first commit attempt from the
+	// FUSE cancel channel, so an interrupt can no longer cancel it. This
+	// test simulates exactly that cancellation; pin the legacy mode whose
+	// recovery contract it verifies.
+	opts := &MountOptions{LegacyInterruptibleMutations: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
