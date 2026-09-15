@@ -180,6 +180,8 @@ prepare_cli_binary() {
   esac
 }
 
+IS_MOUNTED_TRACE="${TMPDIR:-/tmp}/drive9-nodefs-is-mounted-trace.log"
+
 is_mounted() {
   local mount_point="$1"
   # On Linux, prefer the authoritative kernel mount table: mountpoint(1)
@@ -188,7 +190,13 @@ is_mounted() {
   # gone, and it exits 32 — not 1 — for plain non-mountpoint directories).
   if [ -r /proc/self/mountinfo ]; then
     awk -v mp="$mount_point" 'BEGIN{ret=1} $5==mp{ret=0} END{exit ret}' /proc/self/mountinfo
-    return
+    local rc=$?
+    if [ -n "${RUN_ROOT:-}" ]; then
+      {
+        echo "$(date -u '+%H:%M:%S.%3N') arg=$mount_point awk_rc=$rc match=$(awk -v mp="$mount_point" '$5==mp{print $5}' /proc/self/mountinfo | head -1)"
+      } >>"$IS_MOUNTED_TRACE" 2>/dev/null || true
+    fi
+    return "$rc"
   fi
   local physical_mount_point
   physical_mount_point="$(cd "$(dirname "$mount_point")" 2>/dev/null && pwd -P)/$(basename "$mount_point")"
@@ -630,6 +638,8 @@ cleanup() {
     ps -eo pid,ppid,etime,args | grep '[d]rive9' >&2 || echo "(none)" >&2
     echo "trap umount output:" >&2
     cat "${RUN_ROOT:-/dev/null}/umount-trap.log" >&2 2>/dev/null || echo "(none)" >&2
+    echo "is_mounted decision trace (tail):" >&2
+    tail -n 15 "$IS_MOUNTED_TRACE" >&2 2>/dev/null || echo "(none)" >&2
     echo "mount log tail:" >&2
     tail -n 40 "$MOUNT_LOG" >&2 2>/dev/null || true
     echo "--- end diagnostics ---" >&2
