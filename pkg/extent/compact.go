@@ -146,26 +146,36 @@ type ClaimCompact struct {
 	Inode  uint64 `json:"inode"`
 	Indx   uint32 `json:"indx"`
 	TaskID string `json:"task_id"`
+	// Receipt is the lease identity the server minted for this claim. Every
+	// later ack for the claimed task must echo it: the server rotates the
+	// column on every reclaim, so a task_id-only ack from a worker whose
+	// lease expired cannot touch the new owner's lease.
+	Receipt string `json:"receipt,omitempty"`
 }
 
-func ClaimNextCompact(tr jfsmeta.Drive9Transport) (ino uint64, indx uint32, taskID string, err error) {
+func ClaimNextCompact(tr jfsmeta.Drive9Transport) (ino uint64, indx uint32, taskID, receipt string, err error) {
 	if tr == nil {
-		return 0, 0, "", fmt.Errorf("compact: missing transport")
+		return 0, 0, "", "", fmt.Errorf("compact: missing transport")
 	}
 	var resp struct {
-		Errno  int    `json:"errno"`
-		Inode  uint64 `json:"inode"`
-		Indx   uint32 `json:"indx"`
-		TaskID string `json:"task_id"`
+		Errno   int    `json:"errno"`
+		Inode   uint64 `json:"inode"`
+		Indx    uint32 `json:"indx"`
+		TaskID  string `json:"task_id"`
+		Receipt string `json:"receipt"`
 	}
-	st := tr.Call(jfsmeta.Background(), "claim_compact", map[string]any{}, &resp)
+	// receipt_capable marks this client as receipt-echoing: the claim's lease
+	// carries a minted receipt, and the acks below quote it. Receipt-less
+	// clients (pre-upgrade builds) get an empty-receipt lease whose
+	// task_id-only acks can only ever match another empty-receipt lease.
+	st := tr.Call(jfsmeta.Background(), "claim_compact", map[string]any{"receipt_capable": true}, &resp)
 	if st != 0 {
-		return 0, 0, "", st
+		return 0, 0, "", "", st
 	}
 	if resp.Errno != 0 {
-		return 0, 0, "", syscall.Errno(resp.Errno)
+		return 0, 0, "", "", syscall.Errno(resp.Errno)
 	}
-	return resp.Inode, resp.Indx, resp.TaskID, nil
+	return resp.Inode, resp.Indx, resp.TaskID, resp.Receipt, nil
 }
 
 // CompleteCompact acknowledges a claimed task the executor is done with. It is
@@ -173,14 +183,21 @@ func ClaimNextCompact(tr jfsmeta.Drive9Transport) (ino uint64, indx uint32, task
 // work (drained, or already thin): leaving the row LEASED there meant the lease
 // expired, the task was reclaimed, it no-opped again, and one row per
 // (inode, chunk) stayed in the table for the life of the tenant.
-func CompleteCompact(tr jfsmeta.Drive9Transport, taskID string) error {
+func CompleteCompact(tr jfsmeta.Drive9Transport, taskID, receipt string) error {
 	if tr == nil || taskID == "" {
 		return nil
 	}
 	var resp struct {
 		Errno int `json:"errno"`
 	}
-	st := tr.Call(jfsmeta.Background(), "complete_compact", map[string]any{"task_id": taskID}, &resp)
+	body := map[string]any{"task_id": taskID}
+	if receipt != "" {
+		// The receipt proves this ack targets the lease the claim minted;
+		// after an expiry and reclaim the server rotated the column and the
+		// ack answers EINVAL instead of touching the new owner.
+		body["receipt"] = receipt
+	}
+	st := tr.Call(jfsmeta.Background(), "complete_compact", body, &resp)
 	if st != 0 {
 		return st
 	}
@@ -193,7 +210,7 @@ func CompleteCompact(tr jfsmeta.Drive9Transport, taskID string) error {
 // RequeueCompact returns a task to the queue after a failed attempt. It counts
 // the attempt, so a chunk that keeps failing reaches max_attempts and parks as
 // FAILED instead of being retried forever by every mount.
-func RequeueCompact(tr jfsmeta.Drive9Transport, taskID string, cause error) error {
+func RequeueCompact(tr jfsmeta.Drive9Transport, taskID, receipt string, cause error) error {
 	if tr == nil || taskID == "" {
 		return nil
 	}
@@ -207,7 +224,11 @@ func RequeueCompact(tr jfsmeta.Drive9Transport, taskID string, cause error) erro
 	var resp struct {
 		Errno int `json:"errno"`
 	}
-	st := tr.Call(jfsmeta.Background(), "requeue_compact", map[string]any{"task_id": taskID, "error": msg}, &resp)
+	body := map[string]any{"task_id": taskID, "error": msg}
+	if receipt != "" {
+		body["receipt"] = receipt
+	}
+	st := tr.Call(jfsmeta.Background(), "requeue_compact", body, &resp)
 	if st != 0 {
 		return st
 	}
