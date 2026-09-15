@@ -715,7 +715,7 @@ func (fs *Dat9FS) extentCompactLoop(ctx context.Context) {
 			}
 			continue
 		}
-		ino, indx, taskID, err := extent.ClaimNextCompact(fs.extentRT.rt.Transport)
+		ino, indx, taskID, receipt, err := extent.ClaimNextCompact(fs.extentRT.rt.Transport)
 		if err != nil || taskID == "" || ino == 0 {
 			select {
 			case <-ctx.Done():
@@ -733,10 +733,10 @@ func (fs *Dat9FS) extentCompactLoop(ctx context.Context) {
 			// task's max_attempts per event until the row parks FAILED. Leave
 			// it leased so the lease expiry reclaims it.
 			if ctx.Err() == nil {
-				_ = extent.RequeueCompact(fs.extentRT.rt.Transport, taskID, err)
+				_ = extent.RequeueCompact(fs.extentRT.rt.Transport, taskID, receipt, err)
 			}
 		} else {
-			_ = extent.CompleteCompact(fs.extentRT.rt.Transport, taskID)
+			_ = extent.CompleteCompact(fs.extentRT.rt.Transport, taskID, receipt)
 		}
 		select {
 		case <-ctx.Done():
