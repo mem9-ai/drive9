@@ -5755,6 +5755,148 @@ func TestLinkRecoversCommittedHardlinkAfterTransientError(t *testing.T) {
 	}
 }
 
+func TestLinkToleratesTransientPostCommitStatError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case http.MethodHead:
+			// The hardlink is already committed (POST above succeeded). The
+			// post-commit stat is an optional refinement read, so a transient
+			// failure — e.g. a FUSE interrupt canceling the request mid-flight
+			// — must not report the committed link as EAGAIN.
+			w.WriteHeader(statusClientClosedRequest)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcMtime := time.Now().Add(-time.Hour).UTC()
+	srcIno := fs.inodes.LookupWithIdentity("/src.txt", "file-1", 1, false, 6, srcMtime)
+
+	var out gofuse.EntryOut
+	st := fs.Link(nil, &gofuse.LinkIn{
+		InHeader:  gofuse.InHeader{NodeId: 1},
+		Oldnodeid: srcIno,
+	}, "dst.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Link status = %v, want OK despite transient post-commit stat error", st)
+	}
+	// The transient stat failed, so Link must use fallback attributes
+	// (nlink = source nlink + 1) instead of failing the committed link.
+	if out.NodeId != srcIno || out.Nlink != 2 {
+		t.Fatalf("entry out = node %d nlink %d, want node %d nlink 2", out.NodeId, out.Nlink, srcIno)
+	}
+	// A hard link only updates ctime: the shared inode must keep the
+	// source's cached mtime, not stamp link-creation time over it.
+	entry, ok := fs.inodes.GetEntry(srcIno)
+	if !ok {
+		t.Fatal("source entry missing after link")
+	}
+	if !entry.Mtime.Equal(srcMtime) {
+		t.Fatalf("entry mtime = %v, want the source mtime %v preserved", entry.Mtime, srcMtime)
+	}
+	if _, ok := fs.inodes.GetInode("/dst.txt"); !ok {
+		t.Fatal("dst inode missing after committed hardlink")
+	}
+}
+
+// TestLinkToleratesNotFoundPostCommitStat pins the 404 boundary of the
+// unconditional tolerance: even a not-found response on the optional
+// post-commit stat must not fail a hardlink the server has confirmed.
+func TestLinkToleratesNotFoundPostCommitStat(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case http.MethodHead:
+			http.Error(w, "not found", http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcMtime := time.Now().Add(-time.Hour).UTC()
+	srcIno := fs.inodes.LookupWithIdentity("/src.txt", "file-1", 1, false, 6, srcMtime)
+
+	var out gofuse.EntryOut
+	st := fs.Link(nil, &gofuse.LinkIn{
+		InHeader:  gofuse.InHeader{NodeId: 1},
+		Oldnodeid: srcIno,
+	}, "dst.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Link status = %v, want OK despite 404 on the post-commit stat", st)
+	}
+	if out.NodeId != srcIno || out.Nlink != 2 {
+		t.Fatalf("entry out = node %d nlink %d, want node %d nlink 2", out.NodeId, out.Nlink, srcIno)
+	}
+	entry, ok := fs.inodes.GetEntry(srcIno)
+	if !ok {
+		t.Fatal("source entry missing after link")
+	}
+	if !entry.Mtime.Equal(srcMtime) {
+		t.Fatalf("entry mtime = %v, want the source mtime %v preserved", entry.Mtime, srcMtime)
+	}
+}
+
+// TestLinkToleratesFuseInterruptAfterCommit exercises the production failure
+// shape directly: the FUSE cancel channel closes (kernel FUSE_INTERRUPT)
+// exactly when the server commits the hardlink, so the post-commit stat runs
+// on a canceled context and fails with context.Canceled.
+func TestLinkToleratesFuseInterruptAfterCommit(t *testing.T) {
+	cancel := make(chan struct{})
+	var closeCancel sync.Once
+	var postCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			postCalls.Add(1)
+			closeCancel.Do(func() { close(cancel) })
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case http.MethodHead:
+			// Serves both the detached committed-probe (if the POST response
+			// raced with the cancel) and the post-commit confirmation stat.
+			w.Header().Set("Content-Length", "6")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.Header().Set("X-Dat9-Resource-ID", "file-1")
+			w.Header().Set("X-Dat9-Nlink", "2")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcIno := fs.inodes.LookupWithIdentity("/src.txt", "file-1", 1, false, 6, time.Now())
+
+	var out gofuse.EntryOut
+	st := fs.Link(cancel, &gofuse.LinkIn{
+		InHeader:  gofuse.InHeader{NodeId: 1},
+		Oldnodeid: srcIno,
+	}, "dst.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Link status = %v, want OK despite interrupted post-commit stat", st)
+	}
+	if got := postCalls.Load(); got < 1 {
+		t.Fatalf("POST calls = %d, want >= 1", got)
+	}
+	if _, ok := fs.inodes.GetInode("/dst.txt"); !ok {
+		t.Fatal("dst inode missing after committed hardlink")
+	}
+}
+
 func TestLinkKeepsDestinationPathWhenDestinationStatForbidden(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -8266,6 +8408,9 @@ func TestHTTPToFuseStatus_MapsClientClosedRequestToEAGAIN(t *testing.T) {
 func TestIsTransientLookupErr_Treats499AsTransient(t *testing.T) {
 	if !isTransientLookupErr(&client.StatusError{StatusCode: 499, Message: ""}) {
 		t.Fatal("499 should be classified as transient")
+	}
+	if !isTransientLookupErr(context.Canceled) {
+		t.Fatal("context.Canceled should be classified as transient")
 	}
 }
 

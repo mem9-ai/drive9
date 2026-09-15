@@ -19,7 +19,11 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 	"github.com/mem9-ai/drive9/pkg/s3client"
@@ -623,14 +627,66 @@ func fuseCtx(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
 	return fuseCtxWithTimeout(cancel, fuseTimeout)
 }
 
+// fuseInterruptFlag deduplicates interrupt counting for one FUSE request:
+// a request may derive several contexts from the same cancel channel (e.g.
+// SetAttr's outer request context plus an inner chmod context) and every
+// derived goroutine observes the same channel close; the flag ensures each
+// interrupted request is recorded once, no matter how many derived contexts
+// observe the close.
+type fuseInterruptFlag struct {
+	counted   atomic.Bool
+	observers atomic.Int32
+}
+
+// fuseInterruptFlags maps a FUSE request's cancel channel to its counting
+// flag. An entry is created when the first context is derived from the
+// channel, shared by every sibling context, and removed once all of them
+// have completed — the map tracks in-flight requests instead of
+// accumulating one entry per interrupt. A context derived after all
+// siblings completed re-registers a fresh flag; if the channel was already
+// closed by then, that close counts again, so the counter remains an
+// approximate rate signal rather than an exact request count.
+var fuseInterruptFlags sync.Map // <-chan struct{} -> *fuseInterruptFlag
+
+// observeFuseInterruptFlag registers a derived context for a cancel channel
+// and returns the channel's shared counting flag.
+func observeFuseInterruptFlag(cancel <-chan struct{}) *fuseInterruptFlag {
+	flag := &fuseInterruptFlag{}
+	if actual, loaded := fuseInterruptFlags.LoadOrStore(cancel, flag); loaded {
+		flag = actual.(*fuseInterruptFlag)
+	}
+	flag.observers.Add(1)
+	return flag
+}
+
+// release removes the channel's entry once every derived context has
+// completed, reclaiming the map entry.
+func (f *fuseInterruptFlag) release(cancel <-chan struct{}) {
+	if f.observers.Add(-1) == 0 {
+		fuseInterruptFlags.Delete(cancel)
+	}
+}
+
+// countOnce reports whether this cancel-channel close is the first
+// observation for the request, i.e. whether it should be recorded as an
+// interrupt.
+func (f *fuseInterruptFlag) countOnce() bool {
+	return f.counted.CompareAndSwap(false, true)
+}
+
 func fuseCtxWithTimeout(cancel <-chan struct{}, timeout time.Duration) (context.Context, context.CancelFunc) {
 	ctx, cf := context.WithTimeout(context.Background(), timeout)
 	if cancel == nil {
 		return ctx, cf
 	}
+	flag := observeFuseInterruptFlag(cancel)
 	go func() {
+		defer flag.release(cancel)
 		select {
 		case <-cancel:
+			if flag.countOnce() {
+				metrics.RecordFuseInterrupt()
+			}
 			cf()
 		case <-ctx.Done():
 		}
@@ -9895,11 +9951,31 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 		return httpToFuseStatus(err)
 	}
 
+	// The hardlink is committed at this point; the stat only refines cached
+	// attributes, and every field below has a fallback. Any failure of this
+	// advisory read — a FUSE interrupt, a timeout, or a server error — must
+	// not turn a committed link into an error: callers that retry would then
+	// hit EEXIST loops.
 	stat, err := fs.client.StatCtx(ctx, fs.remotePath(dstP))
-	if err != nil && !isForbiddenErr(err) {
-		return httpToFuseStatus(err)
+	if err != nil {
+		logger.Warn(context.Background(), "fuse_link_post_commit_stat_failed",
+			zap.String("path", dstP),
+			zap.Error(err))
 	}
-	mtime := time.Now()
+	// The fallback attributes must reflect the inode's current state:
+	// syncOpenSourceForHardlink may have flushed a newer size, and
+	// overlapping links bump nlink. srcEntry was captured on entry, before
+	// any of that; re-read the inode before falling back to it.
+	if entry, ok := fs.inodes.GetEntry(input.Oldnodeid); ok {
+		srcEntry = entry
+	}
+	// Creating a hard link must only update ctime: when the confirmation
+	// stat is unavailable, keep the source's cached mtime instead of
+	// stamping link-creation time onto the shared inode.
+	mtime := srcEntry.Mtime
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
 	if stat != nil && !stat.Mtime.IsZero() {
 		mtime = stat.Mtime
 	}
