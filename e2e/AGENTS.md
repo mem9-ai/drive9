@@ -917,15 +917,15 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `CLI_SEMANTIC_TIMEOUT_S` | `90` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_INTERVAL_S` | `3` | `cli-smoke-test.sh` |
 | `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
-| `CLI_RELEASE_BASE_URL` | `https://drive9.ai/releases` | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
+| `CLI_RELEASE_BASE_URL` | `https://drive9.ai/releases` | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
+| `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
+| `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
+| `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
+| `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
 | `CLI_MAX_RETRIES` | `8` | `fuse-smoke-test.sh` |
 | `CLI_RETRY_SLEEP_S` | `2` | `fuse-smoke-test.sh` |
-| `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
-| `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
+| `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
+| `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
 | `FUSE_CORRECTNESS_LARGE_MB` | `9` | `fuse-correctness-workload.sh` |
 | `FUSE_CORRECTNESS_KEEP_ARTIFACTS` | `0` | `fuse-correctness-workload.sh` |
 | `RUN_FUSE_ALL_WORKLOADS` | `0` | `fuse-release-gate.sh` |

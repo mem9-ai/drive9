@@ -276,17 +276,21 @@ start_mount() {
 }
 
 reap_mount_pid() {
-  # Bounded daemon reap: the first SIGTERM triggers the graceful drain, which
-  # pkg/fuse/mount.go documents can block indefinitely on a stuck
-  # commit-queue worker and needs a second signal to force-quit. TERM, wait
-  # the readiness budget, then KILL. The `|| rc=$?` idiom shields nonzero
-  # statuses without touching the caller's errexit state.
+  # Bounded daemon reap. pkg/fuse/mount.go documents that the first SIGTERM
+  # starts a graceful drain which can block indefinitely on a stuck
+  # commit-queue worker, and that a SECOND signal is the documented
+  # force-quit (the daemon force-unmounts before exiting) — so the sequence
+  # is TERM, wait the readiness budget, TERM again, short grace, then KILL.
+  # `wait ... || rc=$?` shields nonzero statuses without touching the
+  # caller's errexit state.
   local pid="$1"
   [ -n "$pid" ] || return 0
   kill -0 "$pid" >/dev/null 2>&1 || return 0
   kill -TERM "$pid" >/dev/null 2>&1 || true
   (
     sleep "$MOUNT_READY_TIMEOUT_S"
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 5
     kill -KILL "$pid" 2>/dev/null || true
   ) &
   local watchdog_pid=$!
@@ -303,7 +307,10 @@ stop_mount() {
       >"${RUN_ROOT:-/tmp}/umount-trap.log" 2>&1 || true
     wait_mount_state unmounted >/dev/null 2>&1 || true
   fi
-  reap_mount_pid "${MOUNT_PID:-}"
+  # The EXIT trap must complete: an unguarded nonzero return here (daemon
+  # SIGKILLed at 137, or a pre-handler TERM death) would abort the trap and
+  # skip the diagnostics dump, artifact preservation, and the final exit rc.
+  reap_mount_pid "${MOUNT_PID:-}" || true
   MOUNT_PID=""
 }
 
