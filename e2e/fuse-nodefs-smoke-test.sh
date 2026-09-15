@@ -182,6 +182,14 @@ prepare_cli_binary() {
 
 is_mounted() {
   local mount_point="$1"
+  # On Linux, prefer the authoritative kernel mount table: mountpoint(1)
+  # verdicts proved unreliable on ubuntu 24.04 runners (its -q probe reported
+  # a path as mounted that /proc/self/mountinfo and /etc/mtab both listed as
+  # gone, and it exits 32 — not 1 — for plain non-mountpoint directories).
+  if [ -r /proc/self/mountinfo ]; then
+    awk -v mp="$mount_point" 'BEGIN{ret=1} $5==mp{ret=0} END{exit ret}' /proc/self/mountinfo
+    return
+  fi
   local physical_mount_point
   physical_mount_point="$(cd "$(dirname "$mount_point")" 2>/dev/null && pwd -P)/$(basename "$mount_point")"
   if command -v mountpoint >/dev/null 2>&1; then
