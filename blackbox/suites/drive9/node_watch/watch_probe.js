@@ -27,67 +27,112 @@ const path = require('path');
 const [mountDir, resultPath, readyPath, expectedPayload] = process.argv.slice(2);
 
 async function selftest() {
-  // Negative control (no mount required), matching the reviewer's scenario:
-  // generation-1 events keep arriving late (replayed after ready) with
-  // delayed reads that straddle the remote write, and the remote write
-  // itself produces ZERO watch notifications (gen-2 muted). The generation
-  // boundary must keep those late gen-1 events inert: no candidate may be
-  // credited, while content still verifies through polling. Removing the
-  // generation guard makes the replayed gen-1 events dispatch reads that
-  // return the payload after the write, credit an epoch, and FAIL this test
-  // (verified during development by disabling the guard).
   const os = require('os');
   const { spawn } = require('child_process');
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-probe-selftest-'));
-  const payload = `v2-remote-selftest-${Date.now()}\n`;
-  const resultPathSelf = path.join(dir, 'result.json');
-  const readyPathSelf = path.join(dir, 'ready');
-  const child = spawn(process.execPath, [__filename, dir, resultPathSelf, readyPathSelf, payload], {
-    env: {
-      ...process.env,
+
+  async function runChildScenario(childEnv, drive) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-probe-selftest-'));
+    const payload = `v2-remote-selftest-${Date.now()}-${Math.random().toString(36).slice(2)}\n`;
+    const resultPathSelf = path.join(dir, 'result.json');
+    const readyPathSelf = path.join(dir, 'ready');
+    const child = spawn(process.execPath, [__filename, dir, resultPathSelf, readyPathSelf, payload], {
+      env: { ...process.env, WATCH_PROBE_TEST_ENABLE: 'internal-selftest', ...childEnv },
+      stdio: 'ignore',
+    });
+    // Attach the exit listener at spawn time: the child can exit before the
+    // drive step finishes, and a listener attached after emission never
+    // fires (the parent would then exit with the promise still pending).
+    const exitCode = new Promise((resolve) => child.on('exit', resolve));
+    const deadline = Date.now() + 30000;
+    while (!fs.existsSync(readyPathSelf) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    if (!fs.existsSync(readyPathSelf)) {
+      child.kill('SIGKILL');
+      throw new Error('selftest: probe never armed');
+    }
+    await drive(dir, payload);
+    const code = await exitCode;
+    const report = JSON.parse(await fsp.readFile(resultPathSelf, 'utf8'));
+    return { code, report };
+  }
+
+  // Scenario 1 — attribution fence: late generation-1 replays (through
+  // closed handles) with delayed reads straddling the remote write, and the
+  // remote write producing ZERO generation-2 notifications. The generation
+  // guard must keep them inert: nothing credited, content verified via
+  // polling. Guard removed → the replayed event's read is the first payload
+  // observer, an epoch is credited, this scenario fails.
+  const s1 = await runChildScenario(
+    {
       WATCH_PROBE_DELAY_READ_MS: '700',
       WATCH_PROBE_TEST_WATCH_BACKEND: 'fake',
       WATCH_PROBE_TEST_REPLAY_GEN1_AFTER_READY_MS: '30',
       WATCH_PROBE_TEST_MUTE_GEN2: '1',
     },
-    stdio: 'ignore',
-  });
-  const deadline = Date.now() + 30000;
-  while (!fs.existsSync(readyPathSelf) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  if (!fs.existsSync(readyPathSelf)) {
-    child.kill('SIGKILL');
-    throw new Error('selftest: probe never armed');
-  }
-  // Timing contract: the replayed gen-1 event fires at ready+30ms and its
-  // 700ms-delayed read must be the FIRST observer of the payload (the loop's
-  // statpoll read cannot start before the trigger exists, so the trigger is
-  // written at +100ms and the payload at +300ms). With the generation guard
-  // removed, that first-observer read credits the stale event and this test
-  // fails; with the guard, gen-1 handlers are inert and only the poll loop
-  // ever observes the payload.
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  await fsp.writeFile(path.join(dir, 'trigger.stamp'), `${Date.now()}\n`);
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  await fsp.writeFile(path.join(dir, 'target.txt'), payload);
-  const code = await new Promise((resolve) => child.on('exit', resolve));
-  const report = JSON.parse(await fsp.readFile(resultPathSelf, 'utf8'));
-  const pb = report.phase_b;
+    async (dir, payload) => {
+      // Timing contract: the replayed event fires at ready+30ms; the loop's
+      // statpoll read cannot start before the trigger exists, so trigger at
+      // +100ms and payload at +300ms make the replayed event's 700ms-delayed
+      // read the FIRST payload observer.
+      await new Promise((r) => setTimeout(r, 100));
+      await fsp.writeFile(path.join(dir, 'trigger.stamp'), `${Date.now()}\n`);
+      await new Promise((r) => setTimeout(r, 200));
+      await fsp.writeFile(path.join(dir, 'target.txt'), payload);
+    },
+  );
+
+  // Scenario 2 — teardown fence: generation-2 arrivals keep firing through
+  // teardown (fake backend replays gen-2 records continuously). Once
+  // teardown begins, dispatchNote must refuse them (counted as blocked,
+  // never dispatched) and no epoch at/after the teardown boundary may be
+  // credited. tearingDown fence removed → a late gen-2 dispatch slips past
+  // the drain loop and credits an epoch after the boundary.
+  const s2 = await runChildScenario(
+    {
+      WATCH_PROBE_DELAY_READ_MS: '300',
+      WATCH_PROBE_TEST_WATCH_BACKEND: 'fake',
+      WATCH_PROBE_TEST_REPLAY_GEN2_AFTER_READY_MS: '30',
+    },
+    async (dir, payload) => {
+      await fsp.writeFile(path.join(dir, 'trigger.stamp'), `${Date.now()}\n`);
+      await new Promise((r) => setTimeout(r, 150));
+      await fsp.writeFile(path.join(dir, 'target.txt'), payload);
+      // Give the probe time to verify content and enter teardown while the
+      // gen-2 replay is still firing (it replays for the whole phase window).
+      await new Promise((r) => setTimeout(r, 2500));
+    },
+  );
+
   const failures = [];
-  if (code !== 0) failures.push(`probe exit=${code}`);
-  if (!pb.content_verified) failures.push('content not verified');
-  if (report.armed !== true) failures.push('probe not armed');
+  if (s1.code !== 0) failures.push(`scenario1 exit=${s1.code}`);
+  if (!s1.report.phase_b.content_verified) failures.push('scenario1: content not verified');
+  if (s1.report.armed !== true) failures.push('scenario1: probe not armed');
   for (const channel of ['file_watch_epoch_ms', 'dir_watch_epoch_ms']) {
-    if (pb[channel] !== null) {
-      failures.push(`${channel}=${pb[channel]} credited from late gen-1 events despite zero gen-2 notifications`);
+    if (s1.report.phase_b[channel] !== null) {
+      failures.push(`scenario1: ${channel} credited from late gen-1 events despite zero gen-2 notifications`);
     }
   }
-  fs.rmSync(dir, { recursive: true, force: true });
+  if (s2.code !== 0) failures.push(`scenario2 exit=${s2.code}`);
+  if (!s2.report.phase_b.content_verified) failures.push('scenario2: content not verified');
+  const teardownEpoch = s2.report.teardown_epoch_ms;
+  if (typeof teardownEpoch !== 'number') failures.push('scenario2: no teardown boundary recorded');
+  const arrivals = s2.report.teardown_arrivals || 0;
+  if (arrivals < 1) {
+    failures.push('scenario2: no fenced arrivals recorded — the teardown fence did not engage (replays fire through teardown)');
+  }
+  for (const channel of ['file_watch_epoch_ms', 'dir_watch_epoch_ms']) {
+    const credited = s2.report.phase_b[channel];
+    if (credited !== null && credited >= teardownEpoch) {
+      failures.push(`scenario2: ${channel}=${credited} credited at/after the teardown boundary (${teardownEpoch})`);
+    }
+  }
   if (failures.length > 0) {
     throw new Error(`selftest failed: ${failures.join('; ')}`);
   }
-  console.log('watch probe selftest: late gen-1 events + zero gen-2 notifications credit nothing; content verified');
+  console.error(
+    `watch probe selftest: late gen-1 events credit nothing (scenario1); teardown fence engaged with ${arrivals} fenced arrivals, drain passes=${s2.report.teardown_drain_passes} (scenario2)`,
+  );
 }
 
 const target = path.join(mountDir, 'target.txt');
@@ -136,6 +181,12 @@ let lastPreMutationObsEpoch = 0;
 let generation = 1;
 let barrierEpoch = null; // gen-2 watcher creation epoch (the causal boundary)
 let armed = false;
+// Teardown state machine: fence new dispatches FIRST, then stop the
+// producers, then drain to a stable empty, then finalize. Set before any
+// watcher is closed, because callbacks already queued by the event loop can
+// still run after close().
+let tearingDown = false;
+let teardownEpoch = 0;
 const pendingEventEpochs = { file_watch: [], dir_watch: [] };
 
 // Test-only hooks (used by `selftest`; never set in production runs):
@@ -147,10 +198,17 @@ const pendingEventEpochs = { file_watch: [], dir_watch: [] };
 //   generation-1 events after ready (late backlog simulation).
 // - WATCH_PROBE_TEST_MUTE_GEN2: gen-2 watchers never deliver events
 //   (simulates a mount whose remote overwrite produces zero notifications).
-const READ_DELAY_MS = parseInt(process.env.WATCH_PROBE_DELAY_READ_MS || '0', 10) || 0;
-const WATCH_BACKEND = process.env.WATCH_PROBE_TEST_WATCH_BACKEND || 'real';
-const REPLAY_GEN1_AFTER_READY_MS = parseInt(process.env.WATCH_PROBE_TEST_REPLAY_GEN1_AFTER_READY_MS || '0', 10) || 0;
-const MUTE_GEN2 = process.env.WATCH_PROBE_TEST_MUTE_GEN2 === '1';
+// Test hooks are honored ONLY when the internal selftest enable token is
+// present (set exclusively by the `selftest` mode's own child spawn). The
+// module's production spawn additionally scrubs every WATCH_PROBE_* variable,
+// so leftover runner/CI environment can never swap the real watcher backend
+// or timings of a production probe.
+const TEST_HOOKS_ENABLED = process.env.WATCH_PROBE_TEST_ENABLE === 'internal-selftest';
+const READ_DELAY_MS = TEST_HOOKS_ENABLED ? parseInt(process.env.WATCH_PROBE_DELAY_READ_MS || '0', 10) || 0 : 0;
+const WATCH_BACKEND = TEST_HOOKS_ENABLED ? process.env.WATCH_PROBE_TEST_WATCH_BACKEND || 'real' : 'real';
+const REPLAY_GEN1_AFTER_READY_MS = TEST_HOOKS_ENABLED ? parseInt(process.env.WATCH_PROBE_TEST_REPLAY_GEN1_AFTER_READY_MS || '0', 10) || 0 : 0;
+const REPLAY_GEN2_AFTER_READY_MS = TEST_HOOKS_ENABLED ? parseInt(process.env.WATCH_PROBE_TEST_REPLAY_GEN2_AFTER_READY_MS || '0', 10) || 0 : 0;
+const MUTE_GEN2 = TEST_HOOKS_ENABLED && process.env.WATCH_PROBE_TEST_MUTE_GEN2 === '1';
 
 // Fake watcher registry for the test backend: the selftest replays events
 // into stashed generation-1 callbacks to simulate arbitrarily late backlog.
@@ -239,6 +297,14 @@ async function main() {
   const pendingReads = new Set();
 
   function dispatchNote(channel, epochMs) {
+    // Single choke point for every async observation dispatch. Once teardown
+    // has begun, arrivals are counted and refused — no new read may start
+    // after the drain loop has begun emptying pendingReads, otherwise the
+    // "final" monotone bound and candidate set are not final at all.
+    if (tearingDown) {
+      result.teardown_blocked_dispatches = (result.teardown_blocked_dispatches || 0) + 1;
+      return;
+    }
     const p = noteContent(channel, epochMs).catch(() => {});
     pendingReads.add(p);
     p.finally(() => pendingReads.delete(p)).catch(() => {});
@@ -247,6 +313,10 @@ async function main() {
   function makeFileHandler(gen) {
     return (eventType) => {
       const now = Date.now();
+      if (tearingDown) {
+        result.teardown_arrivals = (result.teardown_arrivals || 0) + 1;
+        return;
+      }
       if (gen !== generation) return;
       if (phase === 'A') {
         if (!result.phase_a.file_event) {
@@ -262,6 +332,10 @@ async function main() {
 
   function makeDirHandler(gen) {
     return (eventType, filename) => {
+      if (tearingDown) {
+        result.teardown_arrivals = (result.teardown_arrivals || 0) + 1;
+        return;
+      }
       const name = path.basename(String(filename || ''));
       if (name !== 'target.txt') return;
       const now = Date.now();
@@ -342,6 +416,10 @@ async function main() {
   }
   try {
     fs.watchFile(target, { interval: 200, persistent: false }, (curr, prev) => {
+      if (tearingDown) {
+        result.teardown_arrivals = (result.teardown_arrivals || 0) + 1;
+        return;
+      }
       if (phase !== 'B') return;
       if (curr.mtimeMs === prev.mtimeMs && curr.size === prev.size) return;
       const now = Date.now();
@@ -382,24 +460,30 @@ async function main() {
   armed = true;
   result.barrier_epoch_ms = barrierEpoch;
   result.armed = armed;
-  if (REPLAY_GEN1_AFTER_READY_MS > 0) {
-    // Test hook: replay synthetic generation-1 events after ready — late
-    // phase-A backlog whose delayed reads may straddle the mutation. With the
-    // generation guard these are inert; without it they would be credited.
+  const scheduleReplay = (delayMs, genFilter) => {
     setTimeout(() => {
       const timer = setInterval(() => {
-        // Deliver through gen-1 records even though their handles are
-        // closed: real watchers can still fire callbacks for events that
-        // were queued before close — exactly the late-backlog hazard this
-        // regression simulates.
+        // Deliver through the recorded handles even though gen-1 handles are
+        // closed: real watchers can still fire callbacks for events queued
+        // before close — exactly the late-backlog hazard this simulates.
         for (const rec of fakeWatchRegistry) {
-          if (rec.gen === 1) {
+          if (genFilter(rec.gen)) {
             rec.handler('change', 'target.txt');
           }
         }
-      }, 100);
-      setTimeout(() => clearInterval(timer), PHASE_B_WAIT_MS - REPLAY_GEN1_AFTER_READY_MS);
-    }, REPLAY_GEN1_AFTER_READY_MS);
+      }, 50);
+      setTimeout(() => clearInterval(timer), PHASE_B_WAIT_MS - delayMs);
+    }, delayMs);
+  };
+  if (REPLAY_GEN1_AFTER_READY_MS > 0) {
+    // Late phase-A backlog whose delayed reads may straddle the mutation;
+    // inert under the generation guard.
+    scheduleReplay(REPLAY_GEN1_AFTER_READY_MS, (gen) => gen === 1);
+  }
+  if (REPLAY_GEN2_AFTER_READY_MS > 0) {
+    // Generation-2 arrivals continuing through teardown: fenced by the
+    // tearingDown state, they must never dispatch after teardown begins.
+    scheduleReplay(REPLAY_GEN2_AFTER_READY_MS, (gen) => gen === 2);
   }
 
   // --- Hand off to the harness, then watch for the remote mutation. --------
@@ -445,12 +529,22 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
-  // --- Teardown, then drain in-flight reads BEFORE finalizing attribution ---
-  // New events stop here; every fire-and-forget noteContent read settles so
-  // the monotone pre-mutation bound is final when candidates are re-checked.
-  // Without the drain, a read completing after the loop break could advance
-  // the bound past an already-recorded candidate and the retroactive fence
-  // would silently not apply.
+  // --- Teardown state machine: fence → stop producers → drain → finalize ---
+  // (1) Fence: no new dispatch may start, from any channel, including
+  //     callbacks already queued when the watchers close (the event loop can
+  //     run them after close). generation=3 makes gen-2 handlers inert,
+  //     phase='teardown' makes the watchFile callback inert, and dispatchNote
+  //     itself refuses while tearingDown.
+  // (2) Stop producers: close every watcher.
+  // (3) Drain to a STABLE empty: loop until no registered read remains, so
+  //     reads registered during an in-flight await are also awaited and the
+  //     monotone bound is genuinely final at finalize time.
+  // (4) Finalize attribution against that final bound.
+  tearingDown = true;
+  teardownEpoch = Date.now();
+  result.teardown_epoch_ms = teardownEpoch;
+  generation = 3;
+  phase = 'teardown';
   if (fileWatcher) fileWatcher.close();
   if (dirWatcher) dirWatcher.close();
   closeWatchers(gen2Handlers);
@@ -459,7 +553,12 @@ async function main() {
   } catch {
     /* already closed */
   }
-  await Promise.allSettled([...pendingReads]);
+  let drainPasses = 0;
+  while (pendingReads.size > 0) {
+    await Promise.allSettled([...pendingReads]);
+    drainPasses += 1;
+  }
+  result.teardown_drain_passes = drainPasses;
   result.finished_epoch_ms = Date.now();
   // --- Finalize attribution -------------------------------------------------
   // Candidates were collected when their event's read confirmed the exact

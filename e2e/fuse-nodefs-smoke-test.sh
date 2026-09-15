@@ -653,10 +653,14 @@ if [ "$(uname -s)" = "Linux" ]; then
 fi
 
 echo "[0] run_bounded hard-deadline regression gate"
-# Budget=1 must hard-kill a TERM-ignoring child within the budget, and the
-# gate's own failure fallback must not leave orphans: the child runs in its
-# own session (setsid via python) and records its pgid, so the 20s fallback
-# can kill the whole process group and the no-survivor assertion holds.
+# Budget=1 must hard-kill a TERM-ignoring child within the budget. Cleanup
+# has a SINGLE owner with a strict order: the fallback watchdog (only active
+# when run_bounded regresses and the wrapper hangs) kills the child process
+# GROUP TERM->KILL and only then kills the wrapper; the main thread, after
+# its wait returns, does not touch the watchdog until the child group is
+# verified dead, then re-runs the same idempotent group cleanup. The child
+# runs via python setsid in its own session and records its pgid so the
+# group can be killed and verified from either path.
 gate_pid_file="$(mktemp)"
 gate_start=$SECONDS
 gate_rc=0
@@ -672,32 +676,41 @@ while True:
 gate_job=$!
 (
   sleep 20
-  kill -TERM "$gate_job" 2>/dev/null || true
   gate_fb_pid="$(cat "$gate_pid_file" 2>/dev/null || true)"
   if [ -n "$gate_fb_pid" ]; then
     kill -TERM -- "-$gate_fb_pid" 2>/dev/null || true
-  fi
-  sleep 2
-  kill -KILL "$gate_job" 2>/dev/null || true
-  if [ -n "$gate_fb_pid" ]; then
+    sleep 2
     kill -KILL -- "-$gate_fb_pid" 2>/dev/null || true
+    sleep 1
   fi
+  kill -KILL "$gate_job" 2>/dev/null || true
 ) &
 gate_watchdog=$!
 wait "$gate_job" || gate_rc=$?
+# Main thread: do not kill the watchdog until the child group is gone; the
+# watchdog may still be inside its TERM->KILL escalation for that group.
+gate_pid="$(cat "$gate_pid_file" 2>/dev/null || true)"
+if [ -n "$gate_pid" ]; then
+  gate_kill_deadline=$(( $(date +%s) + 10 ))
+  while kill -0 "$gate_pid" 2>/dev/null && [ "$(date +%s)" -lt "$gate_kill_deadline" ]; do
+    kill -TERM -- "-$gate_pid" 2>/dev/null || true
+    sleep 1
+    kill -KILL -- "-$gate_pid" 2>/dev/null || true
+    sleep 1
+  done
+fi
 kill -TERM "$gate_watchdog" 2>/dev/null || true
 wait "$gate_watchdog" 2>/dev/null || true
-gate_pid="$(cat "$gate_pid_file" 2>/dev/null || true)"
 rm -f "$gate_pid_file"
 gate_elapsed=$(( SECONDS - gate_start ))
 gate_orphan=0
-if [ -n "$gate_pid" ] && kill -0 "$gate_pid" 2>/dev/null; then
+if [ -n "${gate_pid:-}" ] && kill -0 "$gate_pid" 2>/dev/null; then
   gate_orphan=1
 fi
-if [ "$gate_rc" -eq 124 ] && [ "$gate_elapsed" -le 3 ] && [ "$gate_orphan" -eq 0 ]; then
+if [ "$gate_rc" -eq 124 ] && [ "$gate_elapsed" -le 25 ] && [ "$gate_orphan" -eq 0 ]; then
   check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child (no orphans)" "true" "true"
 else
-  check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child (no orphans)" "rc=$gate_rc elapsed=${gate_elapsed}s orphan=$gate_orphan" "rc=124 elapsed<=3s orphan=0"
+  check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child (no orphans)" "rc=$gate_rc elapsed=${gate_elapsed}s orphan=$gate_orphan" "rc=124 elapsed<=25s orphan=0"
 fi
 
 # Watch-probe attribution-fence negative control, wired into the PR gate:

@@ -82,6 +82,11 @@ class Drive9NodeWatch(BaseModule):
             expected_payload = payload.read_text(encoding="utf-8")
             ready_path.unlink(missing_ok=True)
             result_path.unlink(missing_ok=True)
+            # The probe's test hooks (fake watcher backend, read delays) must
+            # never be production inputs: strip every WATCH_PROBE_* variable
+            # inherited from the operator's environment before the real run.
+            # (The selftest above sets its own child env internally.)
+            prod_env = {k: v for k, v in env.items() if not k.startswith("WATCH_PROBE_")}
             with probe_log.open("wb") as log:
                 proc = subprocess.Popen(
                     [
@@ -93,7 +98,7 @@ class Drive9NodeWatch(BaseModule):
                         expected_payload,
                     ],
                     cwd=str(artifact),
-                    env=env,
+                    env=prod_env,
                     stdout=log,
                     stderr=log,
                     start_new_session=True,
