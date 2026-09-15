@@ -916,7 +916,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `RUN_CLI_FORK_CHECKS` | `0` (also auto-skip when `/v1/fork` is unavailable) | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_TIMEOUT_S` | `90` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_INTERVAL_S` | `3` | `cli-smoke-test.sh` |
-| `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
+| `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
 | `CLI_RELEASE_BASE_URL` | `https://drive9.ai/releases` | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
 | `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
 | `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
@@ -946,6 +946,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `FUSE_NODEFS_LARGE_MB` | `9` | `fuse-nodefs-smoke-test.sh` |
 | `FUSE_NODEFS_MIN_NODE_VERSION` | `18.17.0` | `fuse-nodefs-smoke-test.sh` |
 | `FUSE_NODEFS_CROSS_TIMEOUT_S` | `60` | `fuse-nodefs-smoke-test.sh` |
+| `FUSE_NODEFS_UNMOUNT_SETTLE_S` | `180` | `fuse-nodefs-smoke-test.sh` |
 | `FUSE_NODEFS_KEEP_ARTIFACTS` | `0` | `fuse-nodefs-smoke-test.sh` |
 | `FUSE_SQLITE_WAL_AUTOCHECKPOINT` | `100` | `fuse-sqlite-commit-sequence.sh` |
 | `FUSE_SQLITE_COMMIT_TIMEOUT_S` | `600` | `fuse-sqlite-commit-sequence.sh` |

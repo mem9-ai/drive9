@@ -275,19 +275,36 @@ start_mount() {
   return 1
 }
 
+reap_mount_pid() {
+  # Bounded daemon reap: the first SIGTERM triggers the graceful drain, which
+  # pkg/fuse/mount.go documents can block indefinitely on a stuck
+  # commit-queue worker and needs a second signal to force-quit. TERM, wait
+  # the readiness budget, then KILL. The `|| rc=$?` idiom shields nonzero
+  # statuses without touching the caller's errexit state.
+  local pid="$1"
+  [ -n "$pid" ] || return 0
+  kill -0 "$pid" >/dev/null 2>&1 || return 0
+  kill -TERM "$pid" >/dev/null 2>&1 || true
+  (
+    sleep "$MOUNT_READY_TIMEOUT_S"
+    kill -KILL "$pid" 2>/dev/null || true
+  ) &
+  local watchdog_pid=$!
+  local rc=0
+  wait "$pid" >/dev/null 2>&1 || rc=$?
+  kill -TERM "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  return "$rc"
+}
+
 stop_mount() {
-  set +e
   if [ -n "${MOUNT_POINT:-}" ] && is_mounted "$MOUNT_POINT"; then
     drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT" \
       >"${RUN_ROOT:-/tmp}/umount-trap.log" 2>&1 || true
     wait_mount_state unmounted >/dev/null 2>&1 || true
   fi
-  if [ -n "${MOUNT_PID:-}" ] && kill -0 "$MOUNT_PID" >/dev/null 2>&1; then
-    kill "$MOUNT_PID" >/dev/null 2>&1 || true
-    wait "$MOUNT_PID" >/dev/null 2>&1 || true
-  fi
+  reap_mount_pid "${MOUNT_PID:-}"
   MOUNT_PID=""
-  set -e
 }
 
 unmount_mount() {
@@ -303,23 +320,8 @@ unmount_mount() {
     # fail the gate at the in-flow unmount steps).
     wait_mount_settled || return 1
   fi
-  if [ -n "${MOUNT_PID:-}" ]; then
-    set +e
-    # Bound the reap: a wedged daemon must not hang the gate until the
-    # workflow timeout (the exit-trap path kills rather than waits).
-    (
-      sleep "$MOUNT_READY_TIMEOUT_S"
-      kill -TERM "$MOUNT_PID" 2>/dev/null || true
-      sleep 5
-      kill -KILL "$MOUNT_PID" 2>/dev/null || true
-    ) &
-    local reap_watchdog=$!
-    wait "$MOUNT_PID" >/dev/null 2>&1
-    kill -TERM "$reap_watchdog" 2>/dev/null || true
-    wait "$reap_watchdog" 2>/dev/null || true
-    MOUNT_PID=""
-    set -e
-  fi
+  reap_mount_pid "${MOUNT_PID:-}"
+  MOUNT_PID=""
   return 0
 }
 
@@ -457,13 +459,14 @@ run_bounded() {
     kill -KILL "$workload_pid" 2>/dev/null || true
   ) &
   local watchdog_pid=$!
-  set +e
-  wait "$workload_pid"
-  local rc=$?
-  set -e
+  # `|| rc=$?` shields the nonzero wait status without flipping the caller's
+  # errexit state (set +e/set -e here would leak into the calling shell).
+  local rc=0
+  wait "$workload_pid" || rc=$?
   kill -TERM "$watchdog_pid" 2>/dev/null || true
   wait "$watchdog_pid" 2>/dev/null || true
   if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then
+    echo "command exceeded its ${budget}s budget (watchdog kill): $*" >&2
     return 124
   fi
   return "$rc"
@@ -501,7 +504,7 @@ wait_remote_content_sha() {
     fi
     set +e
     # Invoke the CLI binary directly (GNU timeout cannot exec a shell
-    # function); the drive9() wrapper's env prefix is reproduced here.
+    # function); keep this env prefix in sync with the drive9() wrapper.
     DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" \
       run_bounded "$remaining" "$CLI_BIN" fs cat ":$remote" > "$body_file" 2>/dev/null
     local rc=$?
@@ -672,6 +675,8 @@ prepare_cli_binary
 check_cmd "drive9 binary ready" test -x "$CLI_BIN"
 
 drive9() {
+  # The bounded fs-cat path in wait_remote_content_sha inlines this env
+  # prefix (GNU timeout cannot exec shell functions) — keep them in sync.
   DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
 }
 
