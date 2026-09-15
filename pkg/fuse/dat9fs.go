@@ -19,7 +19,10 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
@@ -624,21 +627,51 @@ func fuseCtx(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
 	return fuseCtxWithTimeout(cancel, fuseTimeout)
 }
 
-// fuseInterruptCounted records which FUSE cancel channels have already been
-// counted as interrupted. One request may derive several contexts from the
-// same cancel channel (e.g. SetAttr's outer request context plus an inner
-// chmod context) and every derived goroutine observes the same channel
-// close; the flag ensures each interrupted request counts once. Entries live
-// for the process lifetime, so the map is bounded by the interrupt count,
-// not by request volume.
-var fuseInterruptCounted sync.Map // <-chan struct{} -> *atomic.Bool
+// fuseInterruptFlag deduplicates interrupt counting for one FUSE request:
+// a request may derive several contexts from the same cancel channel (e.g.
+// SetAttr's outer request context plus an inner chmod context) and every
+// derived goroutine observes the same channel close; the flag ensures each
+// interrupted request is recorded once, no matter how many derived contexts
+// observe the close.
+type fuseInterruptFlag struct {
+	counted   atomic.Bool
+	observers atomic.Int32
+}
 
-// countFuseInterruptOnce reports whether this cancel-channel close is the
-// first observation for that channel, i.e. whether it should be recorded as
-// an interrupt.
-func countFuseInterruptOnce(cancel <-chan struct{}) bool {
-	counted, _ := fuseInterruptCounted.LoadOrStore(cancel, &atomic.Bool{})
-	return counted.(*atomic.Bool).CompareAndSwap(false, true)
+// fuseInterruptFlags maps a FUSE request's cancel channel to its counting
+// flag. An entry is created when the first context is derived from the
+// channel, shared by every sibling context, and removed once all of them
+// have completed — the map tracks in-flight requests instead of
+// accumulating one entry per interrupt. A context derived after all
+// siblings completed re-registers a fresh flag; if the channel was already
+// closed by then, that close counts again, so the counter remains an
+// approximate rate signal rather than an exact request count.
+var fuseInterruptFlags sync.Map // <-chan struct{} -> *fuseInterruptFlag
+
+// observeFuseInterruptFlag registers a derived context for a cancel channel
+// and returns the channel's shared counting flag.
+func observeFuseInterruptFlag(cancel <-chan struct{}) *fuseInterruptFlag {
+	flag := &fuseInterruptFlag{}
+	if actual, loaded := fuseInterruptFlags.LoadOrStore(cancel, flag); loaded {
+		flag = actual.(*fuseInterruptFlag)
+	}
+	flag.observers.Add(1)
+	return flag
+}
+
+// release removes the channel's entry once every derived context has
+// completed, reclaiming the map entry.
+func (f *fuseInterruptFlag) release(cancel <-chan struct{}) {
+	if f.observers.Add(-1) == 0 {
+		fuseInterruptFlags.Delete(cancel)
+	}
+}
+
+// countOnce reports whether this cancel-channel close is the first
+// observation for the request, i.e. whether it should be recorded as an
+// interrupt.
+func (f *fuseInterruptFlag) countOnce() bool {
+	return f.counted.CompareAndSwap(false, true)
 }
 
 func fuseCtxWithTimeout(cancel <-chan struct{}, timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -646,10 +679,12 @@ func fuseCtxWithTimeout(cancel <-chan struct{}, timeout time.Duration) (context.
 	if cancel == nil {
 		return ctx, cf
 	}
+	flag := observeFuseInterruptFlag(cancel)
 	go func() {
+		defer flag.release(cancel)
 		select {
 		case <-cancel:
-			if countFuseInterruptOnce(cancel) {
+			if flag.countOnce() {
 				metrics.RecordFuseInterrupt()
 			}
 			cf()
@@ -9923,7 +9958,16 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	// hit EEXIST loops.
 	stat, err := fs.client.StatCtx(ctx, fs.remotePath(dstP))
 	if err != nil {
-		safeLogPrintf("link: post-commit stat failed; keeping fallback attributes local=%s err=%v", dstP, err)
+		logger.Warn(context.Background(), "fuse_link_post_commit_stat_failed",
+			zap.String("path", dstP),
+			zap.Error(err))
+	}
+	// The fallback attributes must reflect the inode's current state:
+	// syncOpenSourceForHardlink may have flushed a newer size, and
+	// overlapping links bump nlink. srcEntry was captured on entry, before
+	// any of that; re-read the inode before falling back to it.
+	if entry, ok := fs.inodes.GetEntry(input.Oldnodeid); ok {
+		srcEntry = entry
 	}
 	// Creating a hard link must only update ctime: when the confirmation
 	// stat is unavailable, keep the source's cached mtime instead of
