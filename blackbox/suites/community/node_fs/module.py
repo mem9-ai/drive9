@@ -78,10 +78,7 @@ class CommunityNodeFS(BaseModule):
         try:
             test_root = handle.mountpoint / "nodejs-test"
             test_root.mkdir()
-            env = ctx.deps.node_env(node_bin)
-            # base_env's HOME/GIT overrides must survive the node PATH prepend.
-            for key, value in ctx.target.base_env().items():
-                env.setdefault(key, value)
+            env = ctx.deps.node_env(node_bin, base=ctx.target.base_env())
             # Redirect both the runner-managed tmpdir (NODE_TEST_DIR) and
             # os.tmpdir() (TMPDIR) onto the mount; the node checkout and
             # binary stay on local disk so only the fs-under-test is slow.

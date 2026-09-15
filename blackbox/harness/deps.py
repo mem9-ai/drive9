@@ -283,9 +283,14 @@ class Drive9DependencyManager(DependencyManager):
         progress(f"dependency tool: node ({target_version}) fetched -> {node_bin}")
         return str(node_bin)
 
-    def node_env(self, node_bin: str) -> dict[str, str]:
-        """Build an env with the given node's bin dir prepended to PATH."""
-        env = dict(os.environ)
+    def node_env(self, node_bin: str, base: dict[str, str] | None = None) -> dict[str, str]:
+        """Build an env with the given node's bin dir prepended to PATH.
+
+        ``base`` overrides the inherited process environment (pass the
+        target's ``base_env()`` so HOME isolation and credential overrides
+        survive the PATH prepend).
+        """
+        env = dict(base) if base is not None else dict(os.environ)
         node_bin_dir = str(Path(node_bin).resolve().parent)
         env["PATH"] = f"{node_bin_dir}:{env.get('PATH', '')}"
         return env

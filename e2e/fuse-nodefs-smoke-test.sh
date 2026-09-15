@@ -305,7 +305,18 @@ unmount_mount() {
   fi
   if [ -n "${MOUNT_PID:-}" ]; then
     set +e
+    # Bound the reap: a wedged daemon must not hang the gate until the
+    # workflow timeout (the exit-trap path kills rather than waits).
+    (
+      sleep "$MOUNT_READY_TIMEOUT_S"
+      kill -TERM "$MOUNT_PID" 2>/dev/null || true
+      sleep 5
+      kill -KILL "$MOUNT_PID" 2>/dev/null || true
+    ) &
+    local reap_watchdog=$!
     wait "$MOUNT_PID" >/dev/null 2>&1
+    kill -TERM "$reap_watchdog" 2>/dev/null || true
+    wait "$reap_watchdog" 2>/dev/null || true
     MOUNT_PID=""
     set -e
   fi
@@ -489,7 +500,10 @@ wait_remote_content_sha() {
       break
     fi
     set +e
-    run_bounded "$remaining" drive9 fs cat ":$remote" > "$body_file" 2>/dev/null
+    # Invoke the CLI binary directly (GNU timeout cannot exec a shell
+    # function); the drive9() wrapper's env prefix is reproduced here.
+    DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" \
+      run_bounded "$remaining" "$CLI_BIN" fs cat ":$remote" > "$body_file" 2>/dev/null
     local rc=$?
     set -e
     if [ "$rc" -eq 0 ] && [ "$(sha256_file "$body_file")" = "$want_sha" ]; then

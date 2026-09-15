@@ -60,9 +60,7 @@ class Drive9NodeWatch(BaseModule):
         profile = os.environ.get("FUSE_PROFILE") or "none"
         handle = ctx.target.mount("drive9_node_watch", remote, profile=profile, extra=["--allow-other"])
         try:
-            env = ctx.deps.node_env(node_bin)
-            for key, value in ctx.target.base_env().items():
-                env.setdefault(key, value)
+            env = ctx.deps.node_env(node_bin, base=ctx.target.base_env())
             expected_payload = payload.read_text(encoding="utf-8")
             ready_path.unlink(missing_ok=True)
             result_path.unlink(missing_ok=True)
