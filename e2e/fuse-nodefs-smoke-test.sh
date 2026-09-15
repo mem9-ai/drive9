@@ -635,7 +635,19 @@ if is_mounted "$MOUNT_POINT"; then
   fi
 fi
 
-echo "[9] cleanup remote fixture"
+echo "[9] unmount before remote cleanup"
+# The remote fixture must only be deleted after the mount is gone: rm -r on
+# the backing tree under a live mount makes the subsequent umount fail (and
+# the cleanup trap then correctly refuses to remove the run root).
+if is_mounted "$MOUNT_POINT"; then
+  if unmount_mount; then
+    check_eq "final unmount before remote cleanup" "true" "true"
+  else
+    check_eq "final unmount before remote cleanup" "false" "true"
+  fi
+fi
+
+echo "[10] cleanup remote fixture"
 if ! drive9_retry fs rm -r "$ROOT_REMOTE" >/dev/null 2>&1; then
   echo "WARN: remote cleanup failed for $ROOT_REMOTE; a leftover test tree may remain in the tenant" >&2
 fi

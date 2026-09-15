@@ -516,7 +516,11 @@ blackbox (`community.node_fs`), not here. The workload itself is
    SHA-256
 6. Unmount, remount, and re-verify the tree against the checksum manifest
    (per-entry sha256+size, symlink target, directory listings, dirent types)
-7. Preserve run root, mount log, and manifest on failure
+7. Perform a checked final unmount before deleting the remote fixture (the
+   backing tree must not be removed under a live mount)
+8. Preserve run root, mount log, and manifest on failure; the exit-trap
+   cleanup never removes the run root while the mountpoint is still mounted
+   and fails the run in that case
 
 ### `fuse-sqlite-commit-sequence.sh`
 
