@@ -27,27 +27,31 @@ const path = require('path');
 const [mountDir, resultPath, readyPath, expectedPayload] = process.argv.slice(2);
 
 async function selftest() {
-  // Negative-control regression (no mount required): a delayed read started
-  // from a pre-barrier phase-A event must never be credited as a remote
-  // event, even when the remote payload lands while that read is blocked.
-  // Drives the probe as a child with WATCH_PROBE_DELAY_READ_MS so reads
-  // straddle the remote write; asserts the credited epoch (if any) is
-  // post-barrier. The pre-barrier fence makes the stale-event misattribution
-  // structurally impossible; the old confirm-on-read implementation credits
-  // it, so this test distinguishes the fix.
+  // Negative control (no mount required), matching the reviewer's scenario:
+  // generation-1 events keep arriving late (replayed after ready) with
+  // delayed reads that straddle the remote write, and the remote write
+  // itself produces ZERO watch notifications (gen-2 muted). The generation
+  // boundary must keep those late gen-1 events inert: no candidate may be
+  // credited, while content still verifies through polling. Removing the
+  // generation guard makes the replayed gen-1 events dispatch reads that
+  // return the payload after the write, credit an epoch, and FAIL this test
+  // (verified during development by disabling the guard).
   const os = require('os');
   const { spawn } = require('child_process');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-probe-selftest-'));
   const payload = `v2-remote-selftest-${Date.now()}\n`;
   const resultPathSelf = path.join(dir, 'result.json');
   const readyPathSelf = path.join(dir, 'ready');
-  const child = spawn(process.execPath, [
-    __filename,
-    dir,
-    resultPathSelf,
-    readyPathSelf,
-    payload,
-  ], { env: { ...process.env, WATCH_PROBE_DELAY_READ_MS: '700' }, stdio: 'ignore' });
+  const child = spawn(process.execPath, [__filename, dir, resultPathSelf, readyPathSelf, payload], {
+    env: {
+      ...process.env,
+      WATCH_PROBE_DELAY_READ_MS: '700',
+      WATCH_PROBE_TEST_WATCH_BACKEND: 'fake',
+      WATCH_PROBE_TEST_REPLAY_GEN1_AFTER_READY_MS: '30',
+      WATCH_PROBE_TEST_MUTE_GEN2: '1',
+    },
+    stdio: 'ignore',
+  });
   const deadline = Date.now() + 30000;
   while (!fs.existsSync(readyPathSelf) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -56,10 +60,16 @@ async function selftest() {
     child.kill('SIGKILL');
     throw new Error('selftest: probe never armed');
   }
-  // Harness side: trigger, then the remote full payload while the delayed
-  // phase-A reads may still be in flight.
+  // Timing contract: the replayed gen-1 event fires at ready+30ms and its
+  // 700ms-delayed read must be the FIRST observer of the payload (the loop's
+  // statpoll read cannot start before the trigger exists, so the trigger is
+  // written at +100ms and the payload at +300ms). With the generation guard
+  // removed, that first-observer read credits the stale event and this test
+  // fails; with the guard, gen-1 handlers are inert and only the poll loop
+  // ever observes the payload.
+  await new Promise((resolve) => setTimeout(resolve, 100));
   await fsp.writeFile(path.join(dir, 'trigger.stamp'), `${Date.now()}\n`);
-  await new Promise((resolve) => setTimeout(resolve, 120));
+  await new Promise((resolve) => setTimeout(resolve, 200));
   await fsp.writeFile(path.join(dir, 'target.txt'), payload);
   const code = await new Promise((resolve) => child.on('exit', resolve));
   const report = JSON.parse(await fsp.readFile(resultPathSelf, 'utf8'));
@@ -67,19 +77,17 @@ async function selftest() {
   const failures = [];
   if (code !== 0) failures.push(`probe exit=${code}`);
   if (!pb.content_verified) failures.push('content not verified');
-  const barrier = report.barrier_epoch_ms;
-  if (typeof barrier !== 'number') failures.push('no barrier epoch');
+  if (report.armed !== true) failures.push('probe not armed');
   for (const channel of ['file_watch_epoch_ms', 'dir_watch_epoch_ms']) {
-    const credited = pb[channel];
-    if (credited !== null && typeof barrier === 'number' && credited < barrier) {
-      failures.push(`${channel}=${credited} credited pre-barrier (barrier=${barrier})`);
+    if (pb[channel] !== null) {
+      failures.push(`${channel}=${pb[channel]} credited from late gen-1 events despite zero gen-2 notifications`);
     }
   }
   fs.rmSync(dir, { recursive: true, force: true });
   if (failures.length > 0) {
     throw new Error(`selftest failed: ${failures.join('; ')}`);
   }
-  console.log('watch probe selftest: pre-barrier stale events cannot be credited; content verified');
+  console.log('watch probe selftest: late gen-1 events + zero gen-2 notifications credit nothing; content verified');
 }
 
 const target = path.join(mountDir, 'target.txt');
@@ -121,20 +129,42 @@ let lastContent = V1;
 // observes pre-mutation content. Evaluated retroactively at finalize time so
 // a bound that advances AFTER a candidate was recorded still fences it.
 let lastPreMutationObsEpoch = 0;
-// Sentinel barrier: after phase A the probe performs one more own write and
-// waits for its event; everything at/before that event is phase-A backlog.
-// Only after the barrier does the probe signal ready, so the harness's remote
-// mutation provably happens post-barrier and pre-barrier events (however
-// delayed their reads) can never be credited as remote events.
-let barrierEpoch = null;
+// Generation boundary: attribution candidates may only come from
+// generation-2 watchers, created after phase A closes its watchers and
+// before the ready marker is written. Events delivered through generation-1
+// watchers (however late, whichever channel) are generation-checked inert.
+let generation = 1;
+let barrierEpoch = null; // gen-2 watcher creation epoch (the causal boundary)
 let armed = false;
 const pendingEventEpochs = { file_watch: [], dir_watch: [] };
-let barrierResolve = null;
 
-// Test-only hook: delays every content read so a blocked read spanning the
-// mutation can be constructed deterministically on a healthy local fs
-// (used by `selftest`). Never set in production runs.
+// Test-only hooks (used by `selftest`; never set in production runs):
+// - WATCH_PROBE_DELAY_READ_MS: delay every content read, so a read started
+//   before the mutation can straddle it.
+// - WATCH_PROBE_TEST_WATCH_BACKEND=fake: scripted fake watchers driven by
+//   the selftest instead of real fs.watch.
+// - WATCH_PROBE_TEST_REPLAY_GEN1_AFTER_READY_MS: keep replaying synthetic
+//   generation-1 events after ready (late backlog simulation).
+// - WATCH_PROBE_TEST_MUTE_GEN2: gen-2 watchers never deliver events
+//   (simulates a mount whose remote overwrite produces zero notifications).
 const READ_DELAY_MS = parseInt(process.env.WATCH_PROBE_DELAY_READ_MS || '0', 10) || 0;
+const WATCH_BACKEND = process.env.WATCH_PROBE_TEST_WATCH_BACKEND || 'real';
+const REPLAY_GEN1_AFTER_READY_MS = parseInt(process.env.WATCH_PROBE_TEST_REPLAY_GEN1_AFTER_READY_MS || '0', 10) || 0;
+const MUTE_GEN2 = process.env.WATCH_PROBE_TEST_MUTE_GEN2 === '1';
+
+// Fake watcher registry for the test backend: the selftest replays events
+// into stashed generation-1 callbacks to simulate arbitrarily late backlog.
+const fakeWatchRegistry = [];
+
+function fakeWatchRegister(channel, gen, handler) {
+  const rec = { channel, gen, handler, closed: false };
+  fakeWatchRegistry.push(rec);
+  return {
+    close() {
+      rec.closed = true;
+    },
+  };
+}
 
 async function readContent() {
   if (READ_DELAY_MS > 0) {
@@ -198,68 +228,117 @@ async function main() {
   }
   await fsp.writeFile(target, V1);
 
+  // Watchers are created per generation. Generation 1 serves phase A only;
+  // before signaling ready the probe closes them and creates generation-2
+  // watchers that alone may collect attribution candidates. Events delivered
+  // late through a closed generation-1 watcher hit a generation-checked
+  // handler and are inert — no read, no candidate — so phase-A backlog can
+  // never be laundered into a remote event, whichever channel it lands on.
   let fileWatcher = null;
   let dirWatcher = null;
-  const onWatcherError = (kind) => (err) => {
-    recordWatcherError(kind, err);
-    const watcher = kind === 'fs_watch_file' ? fileWatcher : dirWatcher;
-    try {
-      if (watcher) watcher.close();
-    } catch {
-      /* already closed */
-    }
-  };
-  try {
-    fileWatcher = fs.watch(target, (eventType) => {
+  const pendingReads = new Set();
+
+  function dispatchNote(channel, epochMs) {
+    const p = noteContent(channel, epochMs).catch(() => {});
+    pendingReads.add(p);
+    p.finally(() => pendingReads.delete(p)).catch(() => {});
+  }
+
+  function makeFileHandler(gen) {
+    return (eventType) => {
       const now = Date.now();
+      if (gen !== generation) return;
       if (phase === 'A') {
         if (!result.phase_a.file_event) {
           result.phase_a.file_event = true;
           result.phase_a.ms ??= now - phaseAStart;
         }
-        if (barrierResolve) {
-          const resolve = barrierResolve;
-          barrierResolve = null;
-          resolve(now);
-        }
       } else if (armed) {
-        // Candidates only while armed; the finalize pass re-checks them.
         result.phase_b.file_event_type ??= eventType;
-        noteContent('file_watch', now).catch(() => {});
+        dispatchNote('file_watch', now);
       }
-    });
-    // A late watcher error must be recorded and that channel closed, not
-    // crash the probe (an unhandled 'error' event would turn an otherwise
-    // classifiable outcome into a hard probe failure).
-    fileWatcher.on('error', onWatcherError('fs_watch_file'));
-  } catch (err) {
-    recordWatcherError('fs_watch_file', err);
+    };
   }
-  try {
-    dirWatcher = fs.watch(mountDir, (eventType, filename) => {
+
+  function makeDirHandler(gen) {
+    return (eventType, filename) => {
       const name = path.basename(String(filename || ''));
-      // trigger.stamp events say nothing about the target mutation; crediting
-      // the dir-watch channel from them would fake remote event support.
       if (name !== 'target.txt') return;
       const now = Date.now();
+      if (gen !== generation) return;
       if (phase === 'A') {
         if (!result.phase_a.dir_event) {
           result.phase_a.dir_event = true;
           result.phase_a.ms ??= now - phaseAStart;
         }
-        if (barrierResolve) {
-          const resolve = barrierResolve;
-          barrierResolve = null;
-          resolve(now);
-        }
       } else if (armed) {
         result.phase_b.dir_event_type ??= eventType;
-        noteContent('dir_watch', now).catch(() => {});
+        dispatchNote('dir_watch', now);
       }
-    });
-    dirWatcher.on('error', onWatcherError('fs_watch_dir'));
-  } catch (err) {
-    recordWatcherError('fs_watch_dir', err);
+    };
+  }
+
+  function openWatchers(gen) {
+    const handlers = {};
+    try {
+      if (WATCH_BACKEND === 'fake') {
+        handlers.file = fakeWatchRegister('file', gen, makeFileHandler(gen));
+        handlers.dir = fakeWatchRegister('dir', gen, makeDirHandler(gen));
+        if (gen >= 2 && MUTE_GEN2) {
+          // Test hook: gen-2 watchers never deliver events (simulates a mount
+          // whose remote overwrite produces zero notifications).
+          handlers.file = { close() {} };
+          handlers.dir = { close() {} };
+          result.watcher_backend = 'fake+mute-gen2';
+        } else {
+          result.watcher_backend = 'fake';
+        }
+      } else {
+        const fw = fs.watch(target, makeFileHandler(gen));
+        fw.on('error', (err) => {
+          recordWatcherError('fs_watch_file', err);
+          try {
+            fw.close();
+          } catch {
+            /* already closed */
+          }
+        });
+        const dw = fs.watch(mountDir, makeDirHandler(gen));
+        dw.on('error', (err) => {
+          recordWatcherError('fs_watch_dir', err);
+          try {
+            dw.close();
+          } catch {
+            /* already closed */
+          }
+        });
+        handlers.file = fw;
+        handlers.dir = dw;
+      }
+    } catch (err) {
+      recordWatcherError(`fs_watch_gen${gen}`, err);
+    }
+    return handlers;
+  }
+
+  function closeWatchers(handlers) {
+    for (const w of Object.values(handlers || {})) {
+      try {
+        if (w && typeof w.close === 'function') w.close();
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+
+  let gen1Handlers = openWatchers(1);
+  fileWatcher = gen1Handlers.file;
+  dirWatcher = gen1Handlers.dir;
+  if (WATCH_BACKEND === 'fake') {
+    // Fake watchers deliver nothing spontaneously; treat phase A as observed
+    // so the selftest skips the real-event wait.
+    result.phase_a.file_event = true;
+    result.phase_a.dir_event = true;
   }
   try {
     fs.watchFile(target, { interval: 200, persistent: false }, (curr, prev) => {
@@ -269,7 +348,7 @@ async function main() {
       if (result.phase_b.trigger_seen_epoch_ms !== null && result.phase_b.watchfile_epoch_ms === null) {
         result.phase_b.watchfile_epoch_ms = now;
       }
-      noteContent('watchfile', now).catch(() => {});
+      dispatchNote('watchfile', now);
     });
   } catch (err) {
     recordWatcherError('fs_watchfile', err);
@@ -284,28 +363,44 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
-  // --- Sentinel barrier: flush the phase-A event backlog. -------------------
-  // One more probe-owned write; the NEXT target event is the barrier. inotify
-  // delivers per-watch in order, so every event at/before the barrier is
-  // phase-A backlog however delayed its delivery (or its read) is. Only after
-  // the barrier does the probe signal ready — the harness's remote mutation
-  // therefore happens provably post-barrier, and pre-barrier events can never
-  // be credited as remote. If the barrier cannot be observed (broken
-  // watchers), stay conservative: armed stays false and no event is credited.
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  barrierEpoch = await new Promise((resolve) => {
-    barrierResolve = resolve;
-    fsp.writeFile(target, 'v1b-own-write\n').catch(() => {});
-    setTimeout(() => {
-      if (barrierResolve === resolve) {
-        barrierResolve = null;
-        resolve(null);
-      }
-    }, 2000);
-  });
-  armed = barrierEpoch !== null && (result.phase_a.file_event || result.phase_a.dir_event);
+  // --- Generation boundary: retire phase-A watchers, arm fresh ones. --------
+  // Close the generation-1 watchers (late deliveries stay inert via the
+  // generation check), let any in-flight event-loop callbacks settle, then
+  // create generation-2 watchers. inotify/kqueue only report events occurring
+  // after watch establishment, so gen-2 watchers cannot observe phase-A
+  // writes; the harness mutates only after seeing ready, i.e. strictly after
+  // gen-2 exists. Any event they deliver is therefore attributable to the
+  // remote window by construction — no "identify the sentinel event" guess.
+  generation = 2; // gen-1 handlers become inert from here on
+  closeWatchers(gen1Handlers);
+  gen1Handlers = null;
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const gen2Handlers = openWatchers(2);
+  fileWatcher = gen2Handlers.file;
+  dirWatcher = gen2Handlers.dir;
+  barrierEpoch = Date.now();
+  armed = true;
   result.barrier_epoch_ms = barrierEpoch;
   result.armed = armed;
+  if (REPLAY_GEN1_AFTER_READY_MS > 0) {
+    // Test hook: replay synthetic generation-1 events after ready — late
+    // phase-A backlog whose delayed reads may straddle the mutation. With the
+    // generation guard these are inert; without it they would be credited.
+    setTimeout(() => {
+      const timer = setInterval(() => {
+        // Deliver through gen-1 records even though their handles are
+        // closed: real watchers can still fire callbacks for events that
+        // were queued before close — exactly the late-backlog hazard this
+        // regression simulates.
+        for (const rec of fakeWatchRegistry) {
+          if (rec.gen === 1) {
+            rec.handler('change', 'target.txt');
+          }
+        }
+      }, 100);
+      setTimeout(() => clearInterval(timer), PHASE_B_WAIT_MS - REPLAY_GEN1_AFTER_READY_MS);
+    }, REPLAY_GEN1_AFTER_READY_MS);
+  }
 
   // --- Hand off to the harness, then watch for the remote mutation. --------
   await fsp.writeFile(readyPath, `ready ${Date.now()} armed=${armed}\n`);
@@ -350,6 +445,21 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
+  // --- Teardown, then drain in-flight reads BEFORE finalizing attribution ---
+  // New events stop here; every fire-and-forget noteContent read settles so
+  // the monotone pre-mutation bound is final when candidates are re-checked.
+  // Without the drain, a read completing after the loop break could advance
+  // the bound past an already-recorded candidate and the retroactive fence
+  // would silently not apply.
+  if (fileWatcher) fileWatcher.close();
+  if (dirWatcher) dirWatcher.close();
+  closeWatchers(gen2Handlers);
+  try {
+    fs.unwatchFile(target);
+  } catch {
+    /* already closed */
+  }
+  await Promise.allSettled([...pendingReads]);
   result.finished_epoch_ms = Date.now();
   // --- Finalize attribution -------------------------------------------------
   // Candidates were collected when their event's read confirmed the exact
@@ -379,13 +489,6 @@ async function main() {
   // data, truncated data, or read errors alongside the updated stat.
   if (!result.phase_b.content_verified) {
     result.phase_b.final_content = (await readContent()) ?? null;
-  }
-  if (fileWatcher) fileWatcher.close();
-  if (dirWatcher) dirWatcher.close();
-  try {
-    fs.unwatchFile(target);
-  } catch {
-    /* already closed */
   }
   await fsp.writeFile(resultPath, JSON.stringify(result, null, 2) + '\n');
   process.exit(result.phase_b.content_verified ? 0 : 3);

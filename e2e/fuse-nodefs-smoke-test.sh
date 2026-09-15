@@ -653,31 +653,62 @@ if [ "$(uname -s)" = "Linux" ]; then
 fi
 
 echo "[0] run_bounded hard-deadline regression gate"
-# Budget=1 must hard-kill a TERM-ignoring child within the budget. The
-# function under test runs in the background with a manual outer cap (nesting
-# it under another run_bounded would hand a shell function to GNU timeout,
-# which cannot exec functions — exit 127, the exact failure class this gate
-# guards). Healthy behavior returns 124 in ~1s; the old TERM-only GNU branch
-# hangs and is caught by the 20s cap.
+# Budget=1 must hard-kill a TERM-ignoring child within the budget, and the
+# gate's own failure fallback must not leave orphans: the child runs in its
+# own session (setsid via python) and records its pgid, so the 20s fallback
+# can kill the whole process group and the no-survivor assertion holds.
+gate_pid_file="$(mktemp)"
 gate_start=$SECONDS
 gate_rc=0
-run_bounded 1 bash -c 'trap "" TERM; while :; do sleep 0.1; done' >/dev/null 2>&1 &
+run_bounded 1 python3 -c '
+import os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+os.setsid()
+with open(sys.argv[1], "w") as fh:
+    fh.write(str(os.getpgid(0)))
+while True:
+    time.sleep(0.1)
+' "$gate_pid_file" >/dev/null 2>&1 &
 gate_job=$!
 (
   sleep 20
   kill -TERM "$gate_job" 2>/dev/null || true
+  gate_fb_pid="$(cat "$gate_pid_file" 2>/dev/null || true)"
+  if [ -n "$gate_fb_pid" ]; then
+    kill -TERM -- "-$gate_fb_pid" 2>/dev/null || true
+  fi
   sleep 2
   kill -KILL "$gate_job" 2>/dev/null || true
+  if [ -n "$gate_fb_pid" ]; then
+    kill -KILL -- "-$gate_fb_pid" 2>/dev/null || true
+  fi
 ) &
 gate_watchdog=$!
 wait "$gate_job" || gate_rc=$?
 kill -TERM "$gate_watchdog" 2>/dev/null || true
 wait "$gate_watchdog" 2>/dev/null || true
+gate_pid="$(cat "$gate_pid_file" 2>/dev/null || true)"
+rm -f "$gate_pid_file"
 gate_elapsed=$(( SECONDS - gate_start ))
-if [ "$gate_rc" -eq 124 ] && [ "$gate_elapsed" -le 3 ]; then
-  check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child" "true" "true"
+gate_orphan=0
+if [ -n "$gate_pid" ] && kill -0 "$gate_pid" 2>/dev/null; then
+  gate_orphan=1
+fi
+if [ "$gate_rc" -eq 124 ] && [ "$gate_elapsed" -le 3 ] && [ "$gate_orphan" -eq 0 ]; then
+  check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child (no orphans)" "true" "true"
 else
-  check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child" "rc=$gate_rc elapsed=${gate_elapsed}s" "rc=124 elapsed<=3s"
+  check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child (no orphans)" "rc=$gate_rc elapsed=${gate_elapsed}s orphan=$gate_orphan" "rc=124 elapsed<=3s orphan=0"
+fi
+
+# Watch-probe attribution-fence negative control, wired into the PR gate:
+# late generation-1 events with reads straddling the remote write, and the
+# remote write producing zero generation-2 notifications, must credit
+# nothing. Removing the generation guard makes this fail.
+gate_probe="$SCRIPT_DIR/../blackbox/suites/drive9/node_watch/watch_probe.js"
+if run_bounded 90 node "$gate_probe" selftest >/dev/null 2>&1; then
+  check_eq "watch probe selftest: late gen-1 events credit nothing" "true" "true"
+else
+  check_eq "watch probe selftest: late gen-1 events credit nothing" "false" "true"
 fi
 
 echo "[1] provision tenant"
