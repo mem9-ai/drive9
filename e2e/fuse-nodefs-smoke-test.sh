@@ -182,18 +182,43 @@ prepare_cli_binary() {
 
 IS_MOUNTED_TRACE="${TMPDIR:-/tmp}/drive9-nodefs-is-mounted-trace.log"
 
+mountinfo_encode() {
+  # Encode a path the way the kernel encodes mountinfo field 5:
+  # space/tab/newline/backslash -> \040/\011/\012/\134. Pure bash so the
+  # result is identical on every awk implementation (gsub replacement
+  # backslash semantics differ between BSD awk, gawk, and mawk).
+  local s="$1" out="" i c
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      '\') out+='\134' ;;
+      ' ') out+='\040' ;;
+      $'\t') out+='\011' ;;
+      $'\n') out+='\012' ;;
+      *) out+="$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 is_mounted() {
   local mount_point="$1"
   # On Linux, prefer the authoritative kernel mount table: mountpoint(1)
   # verdicts proved unreliable on ubuntu 24.04 runners (its -q probe reported
   # a path as mounted that /proc/self/mountinfo and /etc/mtab both listed as
   # gone, and it exits 32 — not 1 — for plain non-mountpoint directories).
+  # The needle is pre-encoded in bash and passed via the environment because
+  # awk -v values undergo a second round of escape processing (gawk octal
+  # escapes would corrupt \040-style sequences).
   if [ -r /proc/self/mountinfo ]; then
-    awk -v mp="$mount_point" 'BEGIN{ret=1} $5==mp{ret=0} END{exit ret}' /proc/self/mountinfo
+    MOUNTINFO_NEEDLE="$(mountinfo_encode "$mount_point")" awk '
+      BEGIN { ret = 1 }
+      $5 == ENVIRON["MOUNTINFO_NEEDLE"] { ret = 0 }
+      END { exit ret }' /proc/self/mountinfo
     local rc=$?
     if [ -n "${RUN_ROOT:-}" ]; then
       {
-        echo "$(date -u '+%H:%M:%S.%3N') arg=$mount_point awk_rc=$rc match=$(awk -v mp="$mount_point" '$5==mp{print $5}' /proc/self/mountinfo | head -1)"
+        echo "$(date -u '+%H:%M:%S.%3N') arg=$mount_point awk_rc=$rc"
       } >>"$IS_MOUNTED_TRACE" 2>/dev/null || true
     fi
     return "$rc"
@@ -433,14 +458,57 @@ run_nodefs() {
 # directory caches can delay a CLI upload from appearing on the mount. Both
 # cross-channel directions therefore poll bounded instead of asserting
 # one-shot.
+run_nodefs_bounded() {
+  # Hard per-invocation cap so a single hung FUSE read cannot outlive the
+  # outer polling budget. The kill-after grace stays inside the budget.
+  local budget="$1"
+  shift
+  local kill_grace=5
+  local soft=$(( budget - kill_grace ))
+  if [ "$soft" -lt 1 ]; then
+    soft=1
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --kill-after="${kill_grace}s" "${soft}s" node "$NODEFS_JS" "$@"
+    return $?
+  fi
+  node "$NODEFS_JS" "$@" &
+  local workload_pid=$!
+  (
+    sleep "$soft"
+    kill -TERM "$workload_pid" 2>/dev/null || true
+    sleep "$kill_grace"
+    kill -KILL "$workload_pid" 2>/dev/null || true
+  ) &
+  local watchdog_pid=$!
+  set +e
+  wait "$workload_pid"
+  local rc=$?
+  set -e
+  kill -TERM "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then
+    return 124
+  fi
+  return "$rc"
+}
+
 wait_remote_content_sha() {
   local remote="$1" want_sha="$2"
   local deadline=$(( $(date +%s) + FUSE_NODEFS_CROSS_TIMEOUT_S ))
   local body_file
   body_file="$(mktemp)"
   while :; do
+    local remaining=$(( deadline - $(date +%s) ))
+    if [ "$remaining" -le 0 ]; then
+      break
+    fi
     set +e
-    drive9 fs cat ":$remote" > "$body_file" 2>/dev/null
+    if command -v timeout >/dev/null 2>&1; then
+      timeout --kill-after=5s "${remaining}s" drive9 fs cat ":$remote" > "$body_file" 2>/dev/null
+    else
+      drive9 fs cat ":$remote" > "$body_file" 2>/dev/null
+    fi
     local rc=$?
     set -e
     if [ "$rc" -eq 0 ] && [ "$(sha256_file "$body_file")" = "$want_sha" ]; then
@@ -460,7 +528,11 @@ wait_mount_probe_sha() {
   local target="$1" want_sha="$2"
   local deadline=$(( $(date +%s) + FUSE_NODEFS_CROSS_TIMEOUT_S ))
   while :; do
-    if run_nodefs probe "$target" 2>/dev/null | head -n1 | grep -qF "$want_sha"; then
+    local remaining=$(( deadline - $(date +%s) ))
+    if [ "$remaining" -le 0 ]; then
+      return 1
+    fi
+    if run_nodefs_bounded "$remaining" probe "$target" 2>/dev/null | head -n1 | grep -qF "$want_sha"; then
       return 0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
@@ -504,6 +576,18 @@ fi
 
 if ! [[ "$FUSE_NODEFS_LARGE_MB" =~ ^[0-9]+$ ]] || [ "$FUSE_NODEFS_LARGE_MB" -lt 9 ]; then
   echo "invalid FUSE_NODEFS_LARGE_MB: must be >= 9 (crosses the 8MiB storage tier boundary)" >&2
+  exit 1
+fi
+if ! [[ "$FUSE_NODEFS_CROSS_TIMEOUT_S" =~ ^[1-9][0-9]*$ ]]; then
+  echo "invalid FUSE_NODEFS_CROSS_TIMEOUT_S: must be a positive integer (seconds)" >&2
+  exit 1
+fi
+if ! [[ "$FUSE_NODEFS_UNMOUNT_SETTLE_S" =~ ^[0-9]+$ ]]; then
+  echo "invalid FUSE_NODEFS_UNMOUNT_SETTLE_S: must be a non-negative integer (seconds)" >&2
+  exit 1
+fi
+if ! [[ "$FUSE_NODEFS_WORKLOAD_TIMEOUT_S" =~ ^[0-9]+$ ]]; then
+  echo "invalid FUSE_NODEFS_WORKLOAD_TIMEOUT_S: must be a non-negative integer (seconds; 0 disables)" >&2
   exit 1
 fi
 
@@ -631,7 +715,7 @@ cleanup() {
     echo "mount table entries:" >&2
     mount | grep -F "$MOUNT_POINT" >&2 || true
     echo "mountinfo entries:" >&2
-    grep -F "$MOUNT_POINT" /proc/self/mountinfo >&2 2>/dev/null || echo "(none)" >&2
+    MOUNTINFO_NEEDLE="$(mountinfo_encode "$MOUNT_POINT")" awk '$5 == ENVIRON["MOUNTINFO_NEEDLE"]' /proc/self/mountinfo >&2 || echo "(none)" >&2
     echo "live drive9 mount processes:" >&2
     ps -eo pid,ppid,etime,args | grep '[d]rive9 mount' >&2 || echo "(none)" >&2
     echo "all live drive9 processes:" >&2
@@ -727,19 +811,28 @@ fi
 
 echo "[9] unmount before remote cleanup"
 # The remote fixture must only be deleted after the mount is gone: rm -r on
-# the backing tree under a live mount makes the subsequent umount fail (and
-# the cleanup trap then correctly refuses to remove the run root).
+# the backing tree under a live mount destroys the fixture the mount is
+# serving. When the final unmount fails, remote cleanup is unreachable —
+# the run already counts as failed and the exit trap preserves artifacts.
+remote_cleanup_allowed=0
 if is_mounted "$MOUNT_POINT"; then
   if unmount_mount; then
     check_eq "final unmount before remote cleanup" "true" "true"
+    remote_cleanup_allowed=1
   else
     check_eq "final unmount before remote cleanup" "false" "true"
   fi
+else
+  remote_cleanup_allowed=1
 fi
 
-echo "[10] cleanup remote fixture"
-if ! drive9_retry fs rm -r "$ROOT_REMOTE" >/dev/null 2>&1; then
-  echo "WARN: remote cleanup failed for $ROOT_REMOTE; a leftover test tree may remain in the tenant" >&2
+if [ "$remote_cleanup_allowed" = "1" ]; then
+  echo "[10] cleanup remote fixture"
+  if ! drive9_retry fs rm -r "$ROOT_REMOTE" >/dev/null 2>&1; then
+    echo "WARN: remote cleanup failed for $ROOT_REMOTE; a leftover test tree may remain in the tenant" >&2
+  fi
+else
+  echo "SKIP remote cleanup: final unmount failed; refusing to delete the backing fixture under a live mount" >&2
 fi
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"

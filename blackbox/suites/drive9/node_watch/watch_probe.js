@@ -191,8 +191,13 @@ async function main() {
     if (stamp) {
       result.phase_b.trigger_seen_epoch_ms ??= Date.now();
       result.phase_b.trigger_value = stamp.trim().slice(0, 40);
-      const baseline = await fsp.stat(target).catch(() => null);
-      statBaseline = baseline ? { size: baseline.size, mtimeMs: baseline.mtimeMs } : null;
+      // Capture the pre-mutation stat baseline only once: re-capturing it on
+      // every poll would fold an already-applied mutation into the baseline
+      // and the raw-stat-poll channel could never detect the change.
+      if (statBaseline === null) {
+        const baseline = await fsp.stat(target).catch(() => null);
+        statBaseline = baseline ? { size: baseline.size, mtimeMs: baseline.mtimeMs } : null;
+      }
     }
     const now = Date.now();
     if (result.phase_b.trigger_seen_epoch_ms !== null) {

@@ -87,10 +87,21 @@ class CommunityNodeFS(BaseModule):
             env["PATH"] = f"{Path(node_bin).resolve().parent}:{env.get('PATH', '')}"
             jobs = str(int(os.environ.get("NODE_FS_JOBS", "1")))
             per_test_timeout = str(int(os.environ.get("NODE_FS_TEST_TIMEOUT_S", "300")))
-            timeout_s = int(os.environ.get("NODE_FS_TIMEOUT_S", str(self.timeout)))
+            try:
+                timeout_s = int(os.environ.get("NODE_FS_TIMEOUT_S", str(self.timeout)))
+            except ValueError as exc:
+                raise BlackboxError(f"NODE_FS_TIMEOUT_S must be an integer number of seconds: {exc}") from exc
             # Reserve wall-clock headroom for the retry pass and the unmount;
             # the runner kills the whole module at timeout_s, so first pass +
-            # retry must stay below it with margin for mount teardown.
+            # retry must stay below it with margin for mount teardown. Reject
+            # budgets below the phase minimums — they cannot be honored and
+            # would silently overspend the module wall clock.
+            timeout_floor = 600 + 120 + 300
+            if timeout_s < timeout_floor:
+                raise BlackboxError(
+                    f"NODE_FS_TIMEOUT_S must be >= {timeout_floor} "
+                    f"(first-pass floor 600 + retry floor 120 + unmount reserve 300)"
+                )
             first_pass_timeout = max(600, timeout_s - 900)
             retry_budget = max(120, timeout_s - first_pass_timeout - 300)
             cmd = [
