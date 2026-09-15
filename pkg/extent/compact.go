@@ -164,10 +164,11 @@ func ClaimNextCompact(tr jfsmeta.Drive9Transport) (ino uint64, indx uint32, task
 		TaskID  string `json:"task_id"`
 		Receipt string `json:"receipt"`
 	}
-	// receipt_capable marks this client as receipt-echoing: the claim's lease
-	// carries a minted receipt, and the acks below quote it. Receipt-less
-	// clients (pre-upgrade builds) get an empty-receipt lease whose
-	// task_id-only acks can only ever match another empty-receipt lease.
+	// receipt_capable is REQUIRED: the server refuses receipt-less claims
+	// outright (EINVAL), because a task_id-only client cannot be fenced
+	// across a lease expiry — two such workers are indistinguishable. A
+	// refused client simply finds no claimable task and idles; compaction
+	// degrades until upgrade, it never corrupts.
 	st := tr.Call(jfsmeta.Background(), "claim_compact", map[string]any{"receipt_capable": true}, &resp)
 	if st != 0 {
 		return 0, 0, "", "", st
