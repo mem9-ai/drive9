@@ -78,6 +78,10 @@ async function noteContent(channel, epochMs) {
       result.phase_b.content_match = 'exact';
       result.phase_b.content_epoch_ms ??= epochMs;
       result.phase_b.last_content = content.slice(0, 80);
+      // Causal attribution: an fs.watch/fs.watchFile epoch is only recorded
+      // when the read triggered by THAT event confirmed the full remote
+      // payload. Late phase-A events read pre-mutation content and can never
+      // occupy the slot, so a stale local event cannot fake remote support.
       result.phase_b[`${channel}_epoch_ms`] ??= epochMs;
     } else if (content.startsWith(V2_PREFIX)) {
       // A truncated or wrong-round v2 payload: keep observing — only the
@@ -90,7 +94,7 @@ async function noteContent(channel, epochMs) {
       }
     }
     // Anything else (e.g. the phase-A own-write content) is simply pre-mutation
-    // state, not a remote-round payload — no classification.
+    // state, not a remote-round payload — no classification, no attribution.
   }
   return content;
 }
@@ -117,15 +121,12 @@ async function main() {
           result.phase_a.file_event = true;
           result.phase_a.ms ??= now - phaseAStart;
         }
-      } else if (result.phase_b.file_watch_epoch_ms === null) {
-        // Record the first phase-B event even if trigger.stamp is not
-        // readable through the mount yet: the harness writes the trigger
-        // immediately BEFORE overwriting the target, so an early event is a
-        // genuine remote-mutation signal and must not be dropped.
-        result.phase_b.file_watch_epoch_ms = now;
-        result.phase_b.file_event_type = eventType;
+      } else {
+        // Diagnostic only; the channel epoch is set by noteContent when the
+        // read triggered by this event confirms the full remote payload.
+        result.phase_b.file_event_type ??= eventType;
+        noteContent('file_watch', now).catch(() => {});
       }
-      if (phase === 'B') noteContent('file_watch', now).catch(() => {});
     });
     // A late watcher error must be recorded and that channel closed, not
     // crash the probe (an unhandled 'error' event would turn an otherwise
@@ -146,11 +147,10 @@ async function main() {
           result.phase_a.dir_event = true;
           result.phase_a.ms ??= now - phaseAStart;
         }
-      } else if (result.phase_b.dir_watch_epoch_ms === null) {
-        result.phase_b.dir_watch_epoch_ms = now;
-        result.phase_b.dir_event_type = eventType;
+      } else {
+        result.phase_b.dir_event_type ??= eventType;
+        noteContent('dir_watch', now).catch(() => {});
       }
-      if (phase === 'B') noteContent('dir_watch', now).catch(() => {});
     });
     dirWatcher.on('error', onWatcherError('fs_watch_dir'));
   } catch (err) {

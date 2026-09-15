@@ -27,6 +27,22 @@ def scoped_exclusions(exclusions: dict[str, Any]) -> dict[str, tuple[str, tuple[
 # parseable outcomes. Anything else (or 124 from the run_cmd timeout) is a
 # harness-level anomaly and must fail closed.
 _TEST_RUNNER_OK_CODES = (0, 1)
+
+
+def runner_cmd(node_src: Path, node_bin: str, jobs: int, per_test_timeout: str) -> list[str]:
+    """Assemble the tools/test.py argv. Every element must be a str: run_cmd
+    joins the argv with " ".join(cmd) before logging, so a single int element
+    crashes the module before the runner even spawns."""
+    return [
+        sys.executable,
+        str(node_src / "tools" / "test.py"),
+        "--shell",
+        node_bin,
+        "-j",
+        str(jobs),
+        "-t",
+        per_test_timeout,
+    ]
 _PROGRESS_RE = re.compile(r"\[\d+:\d+\|% *\d+\|\+ +(?P<passed>\d+)\|- +(?P<failed>\d+)\]")
 _FAILED_NAME_RE = re.compile(r"test/parallel/(?P<name>test-fs-[\w.-]+\.js)")
 
@@ -110,16 +126,7 @@ class CommunityNodeFS(BaseModule):
                 )
             first_pass_timeout = max(600, timeout_s - 900)
             retry_budget = max(120, timeout_s - first_pass_timeout - 300)
-            cmd = [
-                sys.executable,
-                str(node_src / "tools" / "test.py"),
-                "--shell",
-                node_bin,
-                "-j",
-                jobs,
-                "-t",
-                per_test_timeout,
-            ]
+            cmd = runner_cmd(node_src, node_bin, jobs, per_test_timeout)
             result = ctx.target.run_cmd(
                 "community-node-fs",
                 [*cmd, *[f"parallel/{name}" for name in selected]],

@@ -444,17 +444,22 @@ drive9_retry() {
 
 run_bounded() {
   # Generic hard per-invocation cap: GNU timeout when available, otherwise a
-  # background watchdog (stock macOS). The kill-after grace stays inside the
-  # budget; watchdog kills map to the conventional 124.
+  # background watchdog (stock macOS). The kill-after grace stays INSIDE the
+  # budget for any positive budget (soft + grace <= budget), so a TERM-ignoring
+  # child cannot outlive the caller's deadline; watchdog kills map to 124.
   local budget="$1"
   shift
-  local kill_grace=5
-  local soft=$(( budget - kill_grace ))
-  if [ "$soft" -lt 1 ]; then
-    soft=1
+  if [ "$budget" -lt 1 ]; then
+    budget=1
   fi
+  local kill_grace=$(( budget - 1 > 5 ? 5 : budget - 1 ))
+  local soft=$(( budget - kill_grace ))
   if command -v timeout >/dev/null 2>&1; then
-    timeout --kill-after="${kill_grace}s" "${soft}s" "$@"
+    if [ "$kill_grace" -ge 1 ]; then
+      timeout --kill-after="${kill_grace}s" "${soft}s" "$@"
+    else
+      timeout "${soft}s" "$@"
+    fi
     return $?
   fi
   "$@" &
@@ -462,7 +467,9 @@ run_bounded() {
   (
     sleep "$soft"
     kill -TERM "$workload_pid" 2>/dev/null || true
-    sleep "$kill_grace"
+    if [ "$kill_grace" -ge 1 ]; then
+      sleep "$kill_grace"
+    fi
     kill -KILL "$workload_pid" 2>/dev/null || true
   ) &
   local watchdog_pid=$!
