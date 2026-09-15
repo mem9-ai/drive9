@@ -122,7 +122,7 @@ class CommunityNodeFS(BaseModule):
             if first_anomaly := first.get("anomaly"):
                 log = ctx.artifact_dir(self.id) / "node-fs.log"
                 log.write_text(stdout_text + "\n" + stderr_text, encoding="utf-8")
-                raise BlackboxError(f"node fs first-pass anomaly ({first_anomaly}); see {first['log']}")
+                raise BlackboxError(f"node fs first-pass anomaly ({first_anomaly}); see {log}")
             failed_names = first["failed_tests"]
             retry_report: dict[str, Any] = {}
             if failed_names:
@@ -248,8 +248,8 @@ class CommunityNodeFS(BaseModule):
         selected: list[str],
         exclusions: dict[str, tuple[str, tuple[str, ...] | None]],
     ) -> dict[str, Any]:
-        if anomaly := first.get("anomaly"):
-            raise BlackboxError(f"node fs first-pass anomaly ({anomaly}); see {first['log']}")
+        # First-pass anomalies are raised in run() before the retry pass, so
+        # only the retry-pass anomaly remains possible here.
         if retry and (retry_anomaly := retry.get("anomaly")):
             raise BlackboxError(f"node fs retry-pass anomaly ({retry_anomaly}); see {retry['log']}")
         first_failures = set(first["failed_tests"])

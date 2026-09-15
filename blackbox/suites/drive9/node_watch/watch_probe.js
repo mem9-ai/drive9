@@ -100,6 +100,15 @@ async function main() {
 
   let fileWatcher = null;
   let dirWatcher = null;
+  const onWatcherError = (kind) => (err) => {
+    recordWatcherError(kind, err);
+    const watcher = kind === 'fs_watch_file' ? fileWatcher : dirWatcher;
+    try {
+      if (watcher) watcher.close();
+    } catch {
+      /* already closed */
+    }
+  };
   try {
     fileWatcher = fs.watch(target, (eventType) => {
       const now = Date.now();
@@ -114,6 +123,10 @@ async function main() {
       }
       if (phase === 'B') noteContent('file_watch', now).catch(() => {});
     });
+    // A late watcher error must be recorded and that channel closed, not
+    // crash the probe (an unhandled 'error' event would turn an otherwise
+    // classifiable outcome into a hard probe failure).
+    fileWatcher.on('error', onWatcherError('fs_watch_file'));
   } catch (err) {
     recordWatcherError('fs_watch_file', err);
   }
@@ -135,6 +148,7 @@ async function main() {
       }
       if (phase === 'B') noteContent('dir_watch', now).catch(() => {});
     });
+    dirWatcher.on('error', onWatcherError('fs_watch_dir'));
   } catch (err) {
     recordWatcherError('fs_watch_dir', err);
   }
@@ -166,6 +180,7 @@ async function main() {
   phase = 'B';
 
   const phaseBDeadline = Date.now() + PHASE_B_WAIT_MS;
+  let statBaseline = null;
   while (Date.now() < phaseBDeadline) {
     let stamp = null;
     try {
@@ -176,6 +191,8 @@ async function main() {
     if (stamp) {
       result.phase_b.trigger_seen_epoch_ms ??= Date.now();
       result.phase_b.trigger_value = stamp.trim().slice(0, 40);
+      const baseline = await fsp.stat(target).catch(() => null);
+      statBaseline = baseline ? { size: baseline.size, mtimeMs: baseline.mtimeMs } : null;
     }
     const now = Date.now();
     if (result.phase_b.trigger_seen_epoch_ms !== null) {
@@ -183,6 +200,12 @@ async function main() {
       if (stat) {
         result.phase_b.stat_size = stat.size;
         result.phase_b.stat_mtime_ms = stat.mtimeMs;
+        // Stamp the raw-stat-poll channel from its own observation so the
+        // metric survives even when a watch event's content read wins the
+        // race to first see the new bytes.
+        if (statBaseline && (stat.size !== statBaseline.size || stat.mtimeMs !== statBaseline.mtimeMs)) {
+          result.phase_b.statpoll_epoch_ms ??= now;
+        }
       }
       await noteContent('statpoll', now);
     }
