@@ -25,6 +25,7 @@ fi
 export RUN_FUSE_CONCURRENCY_STRESS
 export RUN_FUSE_POSIX_FSX
 export RUN_FUSE_SQLITE_CORRECTNESS="${RUN_FUSE_SQLITE_CORRECTNESS:-1}"
+export RUN_FUSE_NODEFS_SMOKE="${RUN_FUSE_NODEFS_SMOKE:-1}"
 export RUN_FUSE_PERFORMANCE_BASELINE
 export FUSE_GIT_CLONE_URL="${FUSE_GIT_CLONE_URL:-https://github.com/octocat/Hello-World.git}"
 export FUSE_GIT_CLONE_TIMEOUT_S="${FUSE_GIT_CLONE_TIMEOUT_S:-180}"
@@ -37,6 +38,9 @@ if [ "$RUN_FUSE_SQLITE_CORRECTNESS" = "1" ]; then
     export FUSE_SQLITE_MOUNT_DEBUG="${FUSE_SQLITE_MOUNT_DEBUG:-1}"
   fi
   bash "$SCRIPT_DIR/fuse-sqlite-correctness.sh"
+fi
+if [ "$RUN_FUSE_NODEFS_SMOKE" = "1" ]; then
+  bash "$SCRIPT_DIR/fuse-nodefs-smoke-test.sh"
 fi
 if [ "${RUN_FUSE_SQLITE_COMMIT_SEQUENCE:-0}" = "1" ]; then
   bash "$SCRIPT_DIR/fuse-sqlite-commit-sequence.sh"
