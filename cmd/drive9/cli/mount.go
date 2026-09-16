@@ -2060,6 +2060,12 @@ func runUmount(args []string, deps umountDeps) error {
 			// the difference. waitForKernelMountEntryClear owns the whole
 			// escalation ladder (helper retries, umount2, one lazy detach)
 			// so it runs in one place under one budget (#928).
+			//
+			// The gate can poll for the whole --timeout while holding the
+			// supervisor flock: deliberate, so a successor cannot mount over
+			// a lingering entry mid-cleanup. A concurrent `drive9 mount` on
+			// this mountpoint fails fast with lock contention instead of
+			// waiting out the budget.
 			if runErr == nil || stoppedSupervisor {
 				runErr = waitForKernelMountEntryClear(mountPoint, *waitTimeout, deps)
 			}
@@ -2394,8 +2400,10 @@ const kernelEntryClearPollInterval = 500 * time.Millisecond
 // timeout <= 0 verifies once without attempting any unmount. The only
 // outcomes are a cleared table or a bounded, reported failure; the budget
 // is enforced by deadline checks before each attempt, capped sleeps, and a
-// command timeout on every helper run (a helper started just before the
-// deadline can overshoot it by at most one command timeout).
+// command timeout on every helper run. Worst-case overshoot past the
+// deadline is one in-flight helper command (5s) plus one bounded symlink
+// resolution per probe (2s on a wedged endpoint) — ~7s for the last
+// iteration started just before the deadline.
 func waitForKernelMountEntryClear(mountPoint string, timeout time.Duration, deps umountDeps) error {
 	if !mountStillActiveAfterUmount(mountPoint) {
 		return nil

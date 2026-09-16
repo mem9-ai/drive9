@@ -133,6 +133,11 @@ func activeMountPointBounded(path string) (bool, error) {
 // Probe failures are resolved by mountTableProbeFailed per platform; on
 // Linux an unreadable table is indeterminate and fails closed (still
 // listed) so callers never forgive an unmount as complete.
+//
+// Matching is path-based, not mount-identity-based: any entry at a
+// candidate path counts as listed, so an unrelated filesystem mounted over
+// a path (manual mount, or a successor past a generation gate) reads as
+// still-listed — the safe, fail-closed direction for unmount gating.
 func KernelMountTableHas(mountPoint string) bool {
 	listed, err := kernelMountTableHas(mountPoint)
 	if err == nil {
@@ -148,6 +153,9 @@ const mountTableClearPollInterval = 200 * time.Millisecond
 // WaitMountTableClear polls the kernel mount table until the entry for
 // mountPoint disappears or timeout elapses (timeout <= 0 checks once).
 // Returns false if the entry is still listed when the timeout expires.
+// Each check can cost one bounded symlink resolution (2s on a wedged
+// endpoint) plus the mountinfo read, and one final poll interval can start
+// before the deadline, so the total can overshoot timeout by that much.
 func WaitMountTableClear(mountPoint string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
