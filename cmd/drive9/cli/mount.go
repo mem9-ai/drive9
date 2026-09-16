@@ -2400,10 +2400,12 @@ const kernelEntryClearPollInterval = 500 * time.Millisecond
 // timeout <= 0 verifies once without attempting any unmount. The only
 // outcomes are a cleared table or a bounded, reported failure; the budget
 // is enforced by deadline checks before each attempt, capped sleeps, and a
-// command timeout on every helper run. Worst-case overshoot past the
-// deadline is one in-flight helper command (5s) plus one bounded symlink
-// resolution per probe (2s on a wedged endpoint) — ~7s for the last
-// iteration started just before the deadline.
+// command timeout on every helper run. Overshoot past the deadline is
+// bounded by the in-flight costs of the last iteration started before it:
+// each helper command up to umountCommandTimeout (5s), and each
+// mountStillActiveAfterUmount probe up to one bounded symlink resolution
+// (2s on a wedged endpoint) — an iteration can run a helper plus two
+// probes, and the post-loop verification adds one more probe.
 func waitForKernelMountEntryClear(mountPoint string, timeout time.Duration, deps umountDeps) error {
 	if !mountStillActiveAfterUmount(mountPoint) {
 		return nil
