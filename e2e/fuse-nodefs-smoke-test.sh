@@ -707,10 +707,13 @@ gate_orphan=0
 if [ -n "${gate_pid:-}" ] && kill -0 "$gate_pid" 2>/dev/null; then
   gate_orphan=1
 fi
-if [ "$gate_rc" -eq 124 ] && [ "$gate_elapsed" -le 25 ] && [ "$gate_orphan" -eq 0 ]; then
+# Tight bound on purpose: the healthy budget=1 path returns in ~1s. If the
+# 20s fallback had to fire at all, the internal deadline has regressed — the
+# fallback's job is safe cleanup, never re-packaging a hang as a pass.
+if [ "$gate_rc" -eq 124 ] && [ "$gate_elapsed" -le 5 ] && [ "$gate_orphan" -eq 0 ]; then
   check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child (no orphans)" "true" "true"
 else
-  check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child (no orphans)" "rc=$gate_rc elapsed=${gate_elapsed}s orphan=$gate_orphan" "rc=124 elapsed<=25s orphan=0"
+  check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child (no orphans)" "rc=$gate_rc elapsed=${gate_elapsed}s orphan=$gate_orphan" "rc=124 elapsed<=5s orphan=0"
 fi
 
 # Watch-probe attribution-fence negative control, wired into the PR gate:

@@ -36,7 +36,14 @@ async function selftest() {
     const resultPathSelf = path.join(dir, 'result.json');
     const readyPathSelf = path.join(dir, 'ready');
     const child = spawn(process.execPath, [__filename, dir, resultPathSelf, readyPathSelf, payload], {
-      env: { ...process.env, WATCH_PROBE_TEST_ENABLE: 'internal-selftest', ...childEnv },
+      env: {
+        // Strip every ambient WATCH_PROBE_* from the parent environment so
+        // runner residue cannot pollute scenarios; only the scenario's own
+        // hooks (plus the internal token) reach the child.
+        ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('WATCH_PROBE_'))),
+        WATCH_PROBE_TEST_ENABLE: 'internal-selftest',
+        ...childEnv,
+      },
       stdio: 'ignore',
     });
     // Attach the exit listener at spawn time: the child can exit before the
