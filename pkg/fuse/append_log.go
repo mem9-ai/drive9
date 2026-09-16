@@ -703,7 +703,7 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	}
 
 	expectedRevision, expectedSize := fh.appendLogCommittedBaseline()
-	if expectedRevision <= 0 || expectedSize < sqliteWALHeaderSize {
+	if expectedRevision <= 0 || (expectedSize != 0 && expectedSize < sqliteWALHeaderSize) {
 		return appendLogAttemptResult{route: appendLogRouteNotApplicable, status: gofuse.OK}
 	}
 	snapshotPath := fh.Path
@@ -754,7 +754,7 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 		return appendLogAttemptResult{route: appendLogRouteFailed, status: gofuse.EIO}
 	}
 	resetStarted := time.Now()
-	fs.debugf("append-log trace event=generation_reset_attempt path=%q base_rev=%d base_size=%d snapshot_size=%d dirty_seq=%d wall_unix_nano=%d remote_commit_lock_wait_ns=%d", snapshotPath, expectedRevision, expectedSize, snapshot.Size(), snapshotDirtySeq, resetStarted.UnixNano(), remoteCommitLockWait.Nanoseconds())
+	fs.debugf("append-log trace event=generation_reset_attempt path=%q base_rev=%d base_size=%d append_safe=%t has_rewrite_base=%t rewrite_base_rev=%d sqlite_wal_truncated=%t snapshot_size=%d dirty_seq=%d wall_unix_nano=%d remote_commit_lock_wait_ns=%d", snapshotPath, expectedRevision, expectedSize, fh.appendLog.appendSafe, fh.appendLog.hasRewriteBase, fh.appendLog.rewriteBaseRevision, fh.appendLog.sqliteWALTruncated, snapshot.Size(), snapshotDirtySeq, resetStarted.UnixNano(), remoteCommitLockWait.Nanoseconds())
 	// Keep the initiating handle locked across this bounded 32-byte PUT and
 	// local generation finalization. A same-handle write then resumes against
 	// the published 32-byte generation instead of mutating the old WAL buffer
