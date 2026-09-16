@@ -661,8 +661,10 @@ func (s *Store) jfsClaimCompactTx(tx *sql.Tx) (ino uint64, chunk uint32, taskID,
 // jfsRequeueCompactTx returns a leased task to the queue after a failed
 // attempt, counting the attempt the way RequeueBlockGC does: without the count
 // max_attempts is dead, and a chunk whose CAS keeps losing is retried by every
-// mount plus the server fallback for the life of the tenant.
-func (s *Store) jfsRequeueCompactTx(tx *sql.Tx, taskID, receipt string, cause error) (int, error) {
+// mount plus the server fallback for the life of the tenant. The errno return
+// is a syscall.Errno (0 = ok) so callers compare it with errors.Is against the
+// real errno value instead of an int that happens to match.
+func (s *Store) jfsRequeueCompactTx(tx *sql.Tx, taskID, receipt string, cause error) (syscall.Errno, error) {
 	msg := ""
 	if cause != nil {
 		msg = cause.Error()
@@ -691,7 +693,7 @@ func (s *Store) jfsRequeueCompactTx(tx *sql.Tx, taskID, receipt string, cause er
 		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return int(syscall.EINVAL), nil
+		return syscall.EINVAL, nil
 	}
 	return 0, nil
 }
@@ -700,8 +702,9 @@ func (s *Store) jfsRequeueCompactTx(tx *sql.Tx, taskID, receipt string, cause er
 // ExecuteCompact reports success for a chunk that was drained or is already
 // thin, and those outcomes have to ack the row: leaving it LEASED meant the
 // lease expired and it was reclaimed only to no-op again, so one row per
-// (inode, chunk) stayed in the table for the life of the tenant.
-func (s *Store) jfsCompleteCompactTx(tx *sql.Tx, taskID, receipt string) (int, error) {
+// (inode, chunk) stayed in the table for the life of the tenant. The errno
+// return is a syscall.Errno (0 = ok), like jfsRequeueCompactTx.
+func (s *Store) jfsCompleteCompactTx(tx *sql.Tx, taskID, receipt string) (syscall.Errno, error) {
 	if taskID == "" {
 		return 0, nil
 	}
@@ -713,6 +716,13 @@ func (s *Store) jfsCompleteCompactTx(tx *sql.Tx, taskID, receipt string) (int, e
 	// duplicate complete after a requeue or a revive would mark the requeued
 	// work done and drop it. A missing/stale receipt or any zero-row update
 	// is an explicit EINVAL.
+	//
+	// Unlike AckFileGCTask, the predicate deliberately omits a
+	// lease_until > now check: the receipt is single-use, so a late ack from
+	// a holder nobody rotated is still the legitimate owner of the identity —
+	// its work landed, and retiring the row is correct. It is the rotation on
+	// reclaim (a new receipt overwrites the column) that fences the successor,
+	// not the expiry timestamp.
 	res, err := tx.Exec(`UPDATE slice_compact_tasks
 		SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP(3),
 			leased_at = NULL, lease_until = NULL
@@ -721,7 +731,7 @@ func (s *Store) jfsCompleteCompactTx(tx *sql.Tx, taskID, receipt string) (int, e
 		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return int(syscall.EINVAL), nil
+		return syscall.EINVAL, nil
 	}
 	return 0, nil
 }
@@ -730,17 +740,14 @@ func (s *Store) jfsCompleteCompactTx(tx *sql.Tx, taskID, receipt string) (int, e
 // zero-row update answers EINVAL: the lease expired and a reclaim rotated the
 // identity, so the ack does not belong to this run.
 func (s *Store) CompleteCompactTask(ctx context.Context, taskID, receipt string) error {
-	var eno int
-	err := s.InTx(ctx, func(tx *sql.Tx) error {
-		var e error
-		eno, e = s.jfsCompleteCompactTx(tx, taskID, receipt)
-		return e
+	eno, err := s.inTxErrno(ctx, func(tx *sql.Tx) (syscall.Errno, error) {
+		return s.jfsCompleteCompactTx(tx, taskID, receipt)
 	})
 	if err != nil {
 		return err
 	}
 	if eno != 0 {
-		return syscall.Errno(eno)
+		return eno
 	}
 	return nil
 }
@@ -748,19 +755,29 @@ func (s *Store) CompleteCompactTask(ctx context.Context, taskID, receipt string)
 // RequeueCompactTask is jfsRequeueCompactTx for the in-process fallback, so its
 // failures count attempts the same way a mount's do.
 func (s *Store) RequeueCompactTask(ctx context.Context, taskID, receipt string, cause error) error {
-	var eno int
-	err := s.InTx(ctx, func(tx *sql.Tx) error {
-		var e error
-		eno, e = s.jfsRequeueCompactTx(tx, taskID, receipt, cause)
-		return e
+	eno, err := s.inTxErrno(ctx, func(tx *sql.Tx) (syscall.Errno, error) {
+		return s.jfsRequeueCompactTx(tx, taskID, receipt, cause)
 	})
 	if err != nil {
 		return err
 	}
 	if eno != 0 {
-		return syscall.Errno(eno)
+		return eno
 	}
 	return nil
+}
+
+// inTxErrno runs fn in a transaction and keeps its errno out of the error
+// channel, so an Errno verdict is returned as a typed syscall.Errno value
+// rather than smuggled through error wrapping.
+func (s *Store) inTxErrno(ctx context.Context, fn func(tx *sql.Tx) (syscall.Errno, error)) (syscall.Errno, error) {
+	var eno syscall.Errno
+	err := s.InTx(ctx, func(tx *sql.Tx) error {
+		var e error
+		eno, e = fn(tx)
+		return e
+	})
+	return eno, err
 }
 
 // ListPendingBlockGC returns block keys ready for deletion. A task only

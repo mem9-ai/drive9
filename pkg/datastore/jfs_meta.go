@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 func jfsLockBlockFromRaw(op string, raw json.RawMessage) (block bool, writeLock bool) {
@@ -885,7 +886,15 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 			// until they upgrade, it never corrupts.
 			ReceiptCapable bool `json:"receipt_capable"`
 		}
-		if err := json.Unmarshal(raw, &in); err != nil || !in.ReceiptCapable {
+		if err := json.Unmarshal(raw, &in); err != nil {
+			// The refusal is the rollout signal, not noise: without a counter
+			// an idle queue ("nothing to compact") and a fully refused fleet
+			// ("every client is pre-receipt") look identical to operators.
+			metrics.RecordOperation("extent_compact", "claim", "refused_malformed_body", 0)
+			return nil, int(syscall.EINVAL), err
+		}
+		if !in.ReceiptCapable {
+			metrics.RecordOperation("extent_compact", "claim", "refused_receipt_capable", 0)
 			return map[string]any{"errno": int(syscall.EINVAL)}, int(syscall.EINVAL), nil
 		}
 		ino, indx, taskID, receipt, err := s.jfsClaimCompactTx(tx)
@@ -913,7 +922,7 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 		if err != nil {
 			return nil, int(syscall.EIO), err
 		}
-		return map[string]any{"errno": eno}, eno, nil
+		return map[string]any{"errno": int(eno)}, int(eno), nil
 	case "complete_compact":
 		var in struct {
 			TaskID  string `json:"task_id"`
@@ -926,7 +935,7 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 		if err != nil {
 			return nil, int(syscall.EIO), err
 		}
-		return map[string]any{"errno": eno}, eno, nil
+		return map[string]any{"errno": int(eno)}, int(eno), nil
 	default:
 		return map[string]any{"errno": int(syscall.ENOSYS)}, int(syscall.ENOSYS), nil
 	}

@@ -675,8 +675,8 @@ func TestStaleCompactAckCannotTouchReclaimedLease(t *testing.T) {
 	if err := json.Unmarshal(body, &reclaim); err != nil {
 		t.Fatal(err)
 	}
-	if reclaim.TaskID != "lease-1" || reclaim.Receipt == claim.Receipt {
-		t.Fatalf("reclaim = (%q, %q), want the same task with a rotated receipt", reclaim.TaskID, reclaim.Receipt)
+	if reclaim.TaskID != "lease-1" || reclaim.Receipt == "" || reclaim.Receipt == claim.Receipt {
+		t.Fatalf("reclaim = (%q, %q), want the same task with a fresh, non-empty receipt", reclaim.TaskID, reclaim.Receipt)
 	}
 	if errno := op("requeue_compact", `{"task_id":"lease-1","receipt":"`+claim.Receipt+`","error":"expired"}`); errno != int(syscall.EINVAL) {
 		t.Fatalf("stale-receipt requeue after reclaim errno=%d, want EINVAL", errno)
