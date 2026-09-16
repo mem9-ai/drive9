@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -387,7 +388,7 @@ func runExtentCompactFallback(ctx context.Context, store *datastore.Store, tenan
 	if store == nil || rt == nil {
 		return
 	}
-	ino, indx, taskID, err := store.ClaimCompactTask(ctx)
+	ino, indx, taskID, receipt, err := store.ClaimCompactTask(ctx)
 	if err != nil || taskID == "" || ino == 0 {
 		return
 	}
@@ -403,7 +404,7 @@ func runExtentCompactFallback(ctx context.Context, store *datastore.Store, tenan
 			zap.Uint64("inode", ino),
 			zap.Uint32("chunk", indx),
 			zap.Error(err))
-		if rerr := store.RequeueCompactTask(ctx, taskID, err); rerr != nil {
+		if rerr := store.RequeueCompactTask(ctx, taskID, receipt, err); rerr != nil {
 			logger.Warn(ctx, "tenant_worker_extent_compact_requeue_failed",
 				zap.String("tenant_id", tenantID),
 				zap.String("task_id", taskID),
@@ -411,7 +412,13 @@ func runExtentCompactFallback(ctx context.Context, store *datastore.Store, tenan
 		}
 		return
 	}
-	if cerr := store.CompleteCompactTask(ctx, taskID); cerr != nil {
+	// EINVAL from the ack is the common success shape, not a failure: the
+	// compact op's slice CAS retires the row in the same transaction that
+	// rewrote the chunk, so by the time this receipt ack runs the row is
+	// already COMPLETED and matches nothing. Only a real store error is worth
+	// a Warn — logging EINVAL here would report a failure on every chunk the
+	// fallback successfully compacted.
+	if cerr := store.CompleteCompactTask(ctx, taskID, receipt); cerr != nil && !errors.Is(cerr, syscall.EINVAL) {
 		logger.Warn(ctx, "tenant_worker_extent_compact_complete_failed",
 			zap.String("tenant_id", tenantID),
 			zap.String("task_id", taskID),

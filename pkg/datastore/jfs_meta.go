@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 func jfsLockBlockFromRaw(op string, raw json.RawMessage) (block bool, writeLock bool) {
@@ -237,6 +238,12 @@ func (s *Store) RunExtentMetaOp(ctx context.Context, op string, raw json.RawMess
 			return nil, int(syscall.EIO), err
 		}
 		break
+	}
+	// An errno-only answer (a malformed body the dispatcher rejected with
+	// EINVAL, say) must still be a JSON object the client can read the errno
+	// from; marshaling a nil out would answer a bare `null` instead.
+	if out == nil {
+		out = map[string]any{"errno": errno}
 	}
 	body, mErr := json.Marshal(out)
 	if mErr != nil {
@@ -867,18 +874,42 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 	case "get_session":
 		return map[string]any{"errno": 0}, 0, nil
 	case "claim_compact":
-		ino, indx, taskID, err := s.jfsClaimCompactTx(tx)
+		var in struct {
+			// ReceiptCapable is REQUIRED: the claim mints a per-lease receipt
+			// the client must echo on every later ack for the task. A claim
+			// without it (a pre-receipt client sending `{}`) is refused with
+			// EINVAL rather than leased: a task_id-only client cannot be
+			// fenced across a lease expiry — two such workers both write and
+			// match on the same "no identity" state, so a stale worker's ack
+			// lands on the reclaiming worker's lease. Refused clients simply
+			// find no claimable task and idle; compaction degrades for them
+			// until they upgrade, it never corrupts.
+			ReceiptCapable bool `json:"receipt_capable"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			// The refusal is the rollout signal, not noise: without a counter
+			// an idle queue ("nothing to compact") and a fully refused fleet
+			// ("every client is pre-receipt") look identical to operators.
+			metrics.RecordOperation("extent_compact", "claim", "refused_malformed_body", 0)
+			return nil, int(syscall.EINVAL), err
+		}
+		if !in.ReceiptCapable {
+			metrics.RecordOperation("extent_compact", "claim", "refused_receipt_capable", 0)
+			return map[string]any{"errno": int(syscall.EINVAL)}, int(syscall.EINVAL), nil
+		}
+		ino, indx, taskID, receipt, err := s.jfsClaimCompactTx(tx)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return map[string]any{"errno": 0, "inode": 0, "indx": 0, "task_id": ""}, 0, nil
+				return map[string]any{"errno": 0, "inode": 0, "indx": 0, "task_id": "", "receipt": ""}, 0, nil
 			}
 			return nil, int(syscall.EIO), err
 		}
-		return map[string]any{"errno": 0, "inode": ino, "indx": indx, "task_id": taskID}, 0, nil
+		return map[string]any{"errno": 0, "inode": ino, "indx": indx, "task_id": taskID, "receipt": receipt}, 0, nil
 	case "requeue_compact":
 		var in struct {
-			TaskID string `json:"task_id"`
-			Error  string `json:"error"`
+			TaskID  string `json:"task_id"`
+			Receipt string `json:"receipt"`
+			Error   string `json:"error"`
 		}
 		if err := json.Unmarshal(raw, &in); err != nil {
 			return nil, int(syscall.EINVAL), err
@@ -887,21 +918,24 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 		if in.Error != "" {
 			cause = errors.New(in.Error)
 		}
-		if err := s.jfsRequeueCompactTx(tx, in.TaskID, cause); err != nil {
+		eno, err := s.jfsRequeueCompactTx(tx, in.TaskID, in.Receipt, cause)
+		if err != nil {
 			return nil, int(syscall.EIO), err
 		}
-		return map[string]any{"errno": 0}, 0, nil
+		return map[string]any{"errno": int(eno)}, int(eno), nil
 	case "complete_compact":
 		var in struct {
-			TaskID string `json:"task_id"`
+			TaskID  string `json:"task_id"`
+			Receipt string `json:"receipt"`
 		}
 		if err := json.Unmarshal(raw, &in); err != nil {
 			return nil, int(syscall.EINVAL), err
 		}
-		if err := s.jfsCompleteCompactTx(tx, in.TaskID); err != nil {
+		eno, err := s.jfsCompleteCompactTx(tx, in.TaskID, in.Receipt)
+		if err != nil {
 			return nil, int(syscall.EIO), err
 		}
-		return map[string]any{"errno": 0}, 0, nil
+		return map[string]any{"errno": int(eno)}, int(eno), nil
 	default:
 		return map[string]any{"errno": int(syscall.ENOSYS)}, int(syscall.ENOSYS), nil
 	}
