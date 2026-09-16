@@ -50,18 +50,28 @@ async function selftest() {
     // drive step finishes, and a listener attached after emission never
     // fires (the parent would then exit with the promise still pending).
     const exitCode = new Promise((resolve) => child.on('exit', resolve));
-    const deadline = Date.now() + 30000;
-    while (!fs.existsSync(readyPathSelf) && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 50));
+    try {
+      const deadline = Date.now() + 30000;
+      while (!fs.existsSync(readyPathSelf) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      if (!fs.existsSync(readyPathSelf)) {
+        throw new Error('selftest: probe never armed');
+      }
+      await drive(dir, payload);
+      const code = await exitCode;
+      const report = JSON.parse(await fsp.readFile(resultPathSelf, 'utf8'));
+      return { code, report };
+    } finally {
+      // Single cleanup for success, timeout, drive/read/assert exceptions:
+      // reap the child (escalating to SIGKILL if it ignores TERM) and remove
+      // the scenario temp dir so repeated runs do not accumulate.
+      if (child.exitCode === null) {
+        child.kill('SIGKILL');
+        await exitCode;
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
     }
-    if (!fs.existsSync(readyPathSelf)) {
-      child.kill('SIGKILL');
-      throw new Error('selftest: probe never armed');
-    }
-    await drive(dir, payload);
-    const code = await exitCode;
-    const report = JSON.parse(await fsp.readFile(resultPathSelf, 'utf8'));
-    return { code, report };
   }
 
   // Scenario 1 — attribution fence: late generation-1 replays (through

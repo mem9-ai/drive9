@@ -13,6 +13,17 @@ from harness.module_base import BaseModule
 # Phase A (own write) + startup must finish before the probe signals ready;
 # phase B (remote mutation observation) must finish within the probe timeout.
 READY_TIMEOUT_S = 90
+
+
+def production_probe_env(env: dict[str, str]) -> dict[str, str]:
+    """Strip every WATCH_PROBE_* variable from the production probe env.
+
+    This is the enforced boundary against ambient activation: the probe's
+    internal token gate is itself env-driven, so a runner carrying
+    WATCH_PROBE_TEST_ENABLE + a fake backend would satisfy the JS gate —
+    only this scrub keeps the production probe on real watchers.
+    """
+    return {k: v for k, v in env.items() if not k.startswith("WATCH_PROBE_")}
 PROBE_TIMEOUT_S = 300
 
 
@@ -86,7 +97,7 @@ class Drive9NodeWatch(BaseModule):
             # never be production inputs: strip every WATCH_PROBE_* variable
             # inherited from the operator's environment before the real run.
             # (The selftest above sets its own child env internally.)
-            prod_env = {k: v for k, v in env.items() if not k.startswith("WATCH_PROBE_")}
+            prod_env = production_probe_env(env)
             with probe_log.open("wb") as log:
                 proc = subprocess.Popen(
                     [
