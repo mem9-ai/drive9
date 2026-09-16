@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -95,6 +96,10 @@ func ActiveMountPointBounded(path string) (bool, error) {
 	return activeMountPointBounded(path)
 }
 
+// errActiveMountProbeTimeout marks a bounded active-mount probe that gave up
+// waiting on a wedged stat. Callers must not retry the same probe on it.
+var errActiveMountProbeTimeout = errors.New("active mount check timed out")
+
 func activeMountPointBounded(path string) (bool, error) {
 	type result struct {
 		active bool
@@ -115,7 +120,7 @@ func activeMountPointBounded(path string) (bool, error) {
 	case r := <-ch:
 		return r.active, r.err
 	case <-time.After(timeout):
-		return false, fmt.Errorf("active mount check timed out after %s", timeout)
+		return false, fmt.Errorf("%w after %s", errActiveMountProbeTimeout, timeout)
 	}
 }
 

@@ -18,11 +18,16 @@ func kernelMountTableHas(mountPoint string) (bool, error) {
 
 // mountTableProbeFailed resolves kernelMountTableHas errors on platforms
 // without a kernel-table file, where the probe stats the mountpoint itself:
-// a missing path is genuinely not mounted; other failures fall back to the
-// bounded stat probe again and stay conservative on unknowns.
+// a missing path is genuinely not mounted; a probe timeout would time out
+// again on retry (wedged stat), so it fails closed without re-probing;
+// other failures retry the bounded stat probe once and stay conservative on
+// unknowns.
 func mountTableProbeFailed(mountPoint string, err error) bool {
 	if os.IsNotExist(err) {
 		return false
+	}
+	if errors.Is(err, errActiveMountProbeTimeout) {
+		return true
 	}
 	active, aerr := activeMountPointBounded(mountPoint)
 	if aerr != nil {

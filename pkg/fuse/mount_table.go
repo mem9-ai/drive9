@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,48 +17,56 @@ var procMountInfoPath = "/proc/self/mountinfo"
 // hang indefinitely on a wedged FUSE endpoint.
 const candidateResolveTimeout = 2 * time.Second
 
+// evalSymlinks is stubbed in tests to force resolution failures.
+var evalSymlinks = filepath.EvalSymlinks
+
 // mountTableCandidates returns the paths a kernel mount-table entry may spell
-// for mountPoint: the cleaned absolute path and its symlink resolution (the
-// kernel reports the mountpoint dentry path, without symlink shortcuts).
-// Resolution is bounded — a wedged endpoint must not stall mount-table
-// probes, which run on unmount critical paths.
-func mountTableCandidates(mountPoint string) map[string]bool {
+// for mountPoint — the cleaned absolute path plus its symlink resolution (the
+// kernel reports the post-symlink dentry path) — and whether resolution was
+// conclusive. When conclusive is false the candidate set may be missing the
+// spelling the kernel actually lists, so a non-match is not proof of absence;
+// callers must fail closed (#928). Resolution is bounded — a wedged endpoint
+// must not stall mount-table probes, which run on unmount critical paths.
+func mountTableCandidates(mountPoint string) (map[string]bool, bool) {
 	abs, err := filepath.Abs(mountPoint)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	abs = filepath.Clean(abs)
 	candidates := map[string]bool{abs: true}
-	if resolved := boundedEvalSymlinks(abs, candidateResolveTimeout); resolved != "" {
+	resolved, conclusive := boundedEvalSymlinks(abs, candidateResolveTimeout)
+	if conclusive && resolved != "" {
 		if resolved = filepath.Clean(resolved); resolved != abs {
 			candidates[resolved] = true
 		}
 	}
-	return candidates
+	return candidates, conclusive
 }
 
 // boundedEvalSymlinks is filepath.EvalSymlinks with a hard timeout. A timeout
-// abandons the goroutine ("" result); if the underlying stat is wedged it
-// leaks until the endpoint recovers — the same tradeoff as the bounded
-// active-mount probes.
-func boundedEvalSymlinks(path string, timeout time.Duration) string {
+// abandons the goroutine (inconclusive result); if the underlying stat is
+// wedged it leaks until the endpoint recovers — the same tradeoff as the
+// bounded active-mount probes. A missing path is conclusive: it cannot hide
+// a different kernel spelling behind a symlink. Any other error is
+// inconclusive.
+func boundedEvalSymlinks(path string, timeout time.Duration) (string, bool) {
 	type result struct {
 		path string
 		err  error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		p, err := filepath.EvalSymlinks(path)
+		p, err := evalSymlinks(path)
 		ch <- result{p, err}
 	}()
 	select {
 	case r := <-ch:
 		if r.err != nil {
-			return ""
+			return "", os.IsNotExist(r.err)
 		}
-		return r.path
+		return r.path, true
 	case <-time.After(timeout):
-		return ""
+		return "", false
 	}
 }
 

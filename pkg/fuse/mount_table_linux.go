@@ -14,7 +14,7 @@ import (
 // through to the underlying directory, but the kernel keeps the entry listed
 // until the mount's last reference is reaped.
 func kernelMountTableHas(mountPoint string) (bool, error) {
-	candidates := mountTableCandidates(mountPoint)
+	candidates, resolved := mountTableCandidates(mountPoint)
 	if len(candidates) == 0 {
 		return false, syscall.EINVAL
 	}
@@ -26,6 +26,12 @@ func kernelMountTableHas(mountPoint string) (bool, error) {
 		if candidates[mp] {
 			return true, nil
 		}
+	}
+	if !resolved {
+		// Symlink resolution was inconclusive, so the miss above may just be
+		// a spelling mismatch with the kernel's post-symlink dentry path —
+		// fail closed as still listed (#928).
+		return true, nil
 	}
 	return false, nil
 }

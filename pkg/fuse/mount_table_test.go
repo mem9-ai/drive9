@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -48,7 +49,10 @@ func TestParseMountInfoMountPoints(t *testing.T) {
 
 func TestMountTableCandidates(t *testing.T) {
 	dir := t.TempDir()
-	candidates := mountTableCandidates(dir)
+	candidates, conclusive := mountTableCandidates(dir)
+	if !conclusive {
+		t.Fatal("resolution of an existing plain path must be conclusive")
+	}
 	if !candidates[filepath.Clean(dir)] {
 		t.Fatalf("candidates %v missing %q", candidates, dir)
 	}
@@ -67,10 +71,53 @@ func TestMountTableCandidates(t *testing.T) {
 	if err := os.Symlink(real, link); err != nil {
 		t.Skipf("symlink: %v", err)
 	}
-	candidates = mountTableCandidates(link)
+	candidates, conclusive = mountTableCandidates(link)
+	if !conclusive {
+		t.Fatal("resolution of an existing symlink must be conclusive")
+	}
 	if !candidates[realResolved] {
 		t.Fatalf("candidates %v missing resolved %q", candidates, realResolved)
 	}
+}
+
+// TestMountTableCandidatesResolutionFailureIsInconclusive guards #928: when
+// symlink resolution fails or times out, the candidate set may be missing
+// the spelling the kernel actually lists, so the result must be marked
+// inconclusive (callers fail closed on a non-match). A missing path is the
+// exception — it cannot hide a symlink spelling — and stays conclusive.
+func TestMountTableCandidatesResolutionFailureIsInconclusive(t *testing.T) {
+	link := filepath.Join(t.TempDir(), "mp")
+	if err := os.Symlink(filepath.Join(t.TempDir(), "target"), link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	stubEvalSymlinks(t, func(p string) (string, error) {
+		return "", errors.New("stat: endpoint wedged")
+	})
+	candidates, conclusive := mountTableCandidates(link)
+	if conclusive {
+		t.Fatal("wedged resolution must be inconclusive")
+	}
+	if len(candidates) != 1 || !candidates[filepath.Clean(link)] {
+		t.Fatalf("candidates = %v, want only the unresolved abs spelling", candidates)
+	}
+
+	stubEvalSymlinks(t, func(string) (string, error) {
+		return "", os.ErrNotExist
+	})
+	candidates, conclusive = mountTableCandidates(link)
+	if !conclusive {
+		t.Fatal("ENOENT resolution is conclusive: no symlink spelling can exist")
+	}
+	if len(candidates) != 1 || !candidates[filepath.Clean(link)] {
+		t.Fatalf("candidates = %v, want only the unresolved abs spelling", candidates)
+	}
+}
+
+func stubEvalSymlinks(t *testing.T, fn func(string) (string, error)) {
+	t.Helper()
+	old := evalSymlinks
+	evalSymlinks = fn
+	t.Cleanup(func() { evalSymlinks = old })
 }
 
 func TestKernelMountTableHasUnlistedPath(t *testing.T) {
@@ -116,5 +163,83 @@ func TestKernelMountTableHasFixture(t *testing.T) {
 	// closed: report still-listed so umount never forgives it as "cleared".
 	if !KernelMountTableHas(mp) {
 		t.Fatal("unreadable mount table should conservatively report still listed")
+	}
+}
+
+// TestKernelMountTableHasUnresolvedSpellingFailsClosed guards the #928
+// symlink-spelling hole: when the kernel lists the post-symlink dentry path
+// but resolution could not compute it, a non-match must still report the
+// mount as listed instead of a false clearance.
+func TestKernelMountTableHasUnresolvedSpellingFailsClosed(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("mountinfo-backed check is Linux-only")
+	}
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	fixture := t.TempDir()
+	// The kernel table lists the post-symlink dentry path only.
+	line := "36 35 98:0 /mnt1 " + target + " rw,relatime - fuse.drive9 fuse.drive9 rw,user_id=1000,group_id=1000\n"
+	if err := os.WriteFile(filepath.Join(fixture, "mountinfo"), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := procMountInfoPath
+	procMountInfoPath = filepath.Join(fixture, "mountinfo")
+	t.Cleanup(func() { procMountInfoPath = old })
+
+	// Wedged resolution: only the unresolved link spelling is available, it
+	// does not match the listed target path — must fail closed.
+	stubEvalSymlinks(t, func(string) (string, error) {
+		return "", errors.New("stat: endpoint wedged")
+	})
+	listed, err := kernelMountTableHas(link)
+	if err != nil {
+		t.Fatalf("kernelMountTableHas: %v", err)
+	}
+	if !listed {
+		t.Fatal("inconclusive resolution with no candidate match must report still listed")
+	}
+	if !KernelMountTableHas(link) {
+		t.Fatal("KernelMountTableHas must fail closed on inconclusive resolution")
+	}
+
+	// ENOENT is conclusive (no symlink spelling can exist): a no-match is a
+	// real clearance.
+	stubEvalSymlinks(t, func(string) (string, error) {
+		return "", os.ErrNotExist
+	})
+	listed, err = kernelMountTableHas(link)
+	if err != nil {
+		t.Fatalf("kernelMountTableHas: %v", err)
+	}
+	if listed {
+		t.Fatal("conclusive ENOENT resolution with no candidate match should report not listed")
+	}
+}
+
+// TestMountTableProbeFailedTimeoutFailsClosedWithoutReprobe: a bounded-probe
+// timeout must not be retried — a wedged stat times out again and a
+// recovered endpoint could flip the conservative answer.
+func TestMountTableProbeFailedTimeoutFailsClosedWithoutReprobe(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("mountTableProbeFailed is only wired on the stat-probe platforms")
+	}
+	old := activeMountProbe
+	calls := 0
+	activeMountProbe = func(string) (bool, error) {
+		calls++
+		return false, errActiveMountProbeTimeout
+	}
+	t.Cleanup(func() { activeMountProbe = old })
+
+	// Pre-seed the counter: kernelMountTableHas on these platforms runs the
+	// probe once; the timeout must not trigger a second run.
+	if !mountTableProbeFailed("/mnt/drive9", errActiveMountProbeTimeout) {
+		t.Fatal("probe timeout must conservatively report still listed")
+	}
+	if calls != 0 {
+		t.Fatalf("bounded probe re-run %d times after a timeout, want 0", calls)
 	}
 }
