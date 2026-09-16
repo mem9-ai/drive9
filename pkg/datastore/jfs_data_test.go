@@ -491,7 +491,7 @@ func TestJfsWriteEnqueuesCompactWhenFat(t *testing.T) {
 	if queued != 1 {
 		t.Fatalf("write at the threshold queued %d compact tasks, want 1", queued)
 	}
-	cino, cindx, taskID, err := s.ClaimCompactTask(context.Background())
+	cino, cindx, taskID, _, err := s.ClaimCompactTask(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +521,7 @@ func TestClaimCompactTaskLeasesOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			ino, _, taskID, err := s.ClaimCompactTask(ctx)
+			ino, _, taskID, _, err := s.ClaimCompactTask(ctx)
 			if err != nil {
 				t.Errorf("claim: %v", err)
 				return
@@ -544,7 +544,7 @@ func TestClaimCompactTaskLeasesOnce(t *testing.T) {
 	if won != 1 {
 		t.Fatalf("%d concurrent claims won, want exactly 1", won)
 	}
-	if _, _, taskID, err := s.ClaimCompactTask(ctx); err != nil || taskID != "" {
+	if _, _, taskID, _, err := s.ClaimCompactTask(ctx); err != nil || taskID != "" {
 		t.Fatalf("claim while leased = (%q, %v), want no task", taskID, err)
 	}
 	// An expired lease is claimable again.
@@ -552,7 +552,7 @@ func TestClaimCompactTaskLeasesOnce(t *testing.T) {
 		WHERE task_id = 'queued-1'`); err != nil {
 		t.Fatal(err)
 	}
-	ino, _, taskID, err := s.ClaimCompactTask(ctx)
+	ino, _, taskID, _, err := s.ClaimCompactTask(ctx)
 	if err != nil || taskID != "queued-1" || ino != 77 {
 		t.Fatalf("claim after expiry = (%d, %q, %v), want (77, queued-1, nil)", ino, taskID, err)
 	}
@@ -572,7 +572,7 @@ func TestCompactEnqueueKeepsLiveLease(t *testing.T) {
 		}
 	}
 	write()
-	ino, _, taskID, err := s.ClaimCompactTask(ctx)
+	ino, _, taskID, _, err := s.ClaimCompactTask(ctx)
 	if err != nil || taskID != "w1" || ino != 88 {
 		t.Fatalf("claim = (%d, %q, %v), want (88, w1, nil)", ino, taskID, err)
 	}
@@ -594,6 +594,198 @@ func TestCompactEnqueueKeepsLiveLease(t *testing.T) {
 	}
 	if status != "PENDING" {
 		t.Fatalf("a completed task was not revived: status=%s, want PENDING", status)
+	}
+}
+
+// A receipt-less or stale-receipt ack must never touch a lease it does not
+// own. A pre-receipt client (claim body `{}`) is refused outright — it can
+// never lease — and after an expiry plus a receipt-capable reclaim, the old
+// receipt matches zero rows: the reclaim rotated the identity column.
+func TestStaleCompactAckCannotTouchReclaimedLease(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.db.Exec(`INSERT INTO slice_compact_tasks (task_id, extent_ino, chunk, status, max_attempts)
+		VALUES ('lease-1', 901, 0, 'PENDING', 8)`); err != nil {
+		t.Fatal(err)
+	}
+	op := func(op string, body string) int {
+		t.Helper()
+		_, errno, err := s.RunExtentMetaOp(ctx, op, json.RawMessage(body), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return errno
+	}
+	// A receipt-less claim is refused outright: a task_id-only client cannot
+	// be fenced across an expiry, so it must not be able to lease at all.
+	if errno := op("claim_compact", `{}`); errno != int(syscall.EINVAL) {
+		t.Fatalf("receipt-less claim errno=%d, want EINVAL (unfenceable clients must not lease)", errno)
+	}
+	for _, bad := range []string{`x`, `[`, `0`, `""`} {
+		if errno := op("claim_compact", bad); errno != int(syscall.EINVAL) {
+			t.Fatalf("malformed claim body %q errno=%d, want EINVAL", bad, errno)
+		}
+	}
+	// The capable claim leases and mints the identity.
+	body, errno, err := s.RunExtentMetaOp(ctx, "claim_compact", json.RawMessage(`{"receipt_capable":true}`), nil)
+	if err != nil || errno != 0 {
+		t.Fatalf("claim errno=%d err=%v", errno, err)
+	}
+	var claim struct {
+		TaskID  string `json:"task_id"`
+		Receipt string `json:"receipt"`
+	}
+	if err := json.Unmarshal(body, &claim); err != nil {
+		t.Fatal(err)
+	}
+	if claim.TaskID != "lease-1" || claim.Receipt == "" {
+		t.Fatalf("claim = (%q, %q), want the task with a minted receipt", claim.TaskID, claim.Receipt)
+	}
+	// Task-ID-only acks (the stale worker) match zero rows: EINVAL, lease
+	// untouched, attempts uncounted.
+	if errno := op("requeue_compact", `{"task_id":"lease-1","error":"stale"}`); errno != int(syscall.EINVAL) {
+		t.Fatalf("receipt-less requeue errno=%d, want EINVAL", errno)
+	}
+	if errno := op("complete_compact", `{"task_id":"lease-1"}`); errno != int(syscall.EINVAL) {
+		t.Fatalf("receipt-less complete errno=%d, want EINVAL", errno)
+	}
+	var status string
+	var attempts int
+	if err := s.db.QueryRow(`SELECT status, attempt_count FROM slice_compact_tasks WHERE task_id = 'lease-1'`).
+		Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "LEASED" || attempts != 0 {
+		t.Fatalf("after receipt-less acks: status=%s attempts=%d, want LEASED/0", status, attempts)
+	}
+	// Force the expiry and let a second worker reclaim: the receipt rotates,
+	// so the first worker's ack now matches zero rows.
+	if _, err := s.db.Exec(`UPDATE slice_compact_tasks SET lease_until = CURRENT_TIMESTAMP(3) - INTERVAL 1 SECOND
+		WHERE task_id = 'lease-1'`); err != nil {
+		t.Fatal(err)
+	}
+	body, errno, err = s.RunExtentMetaOp(ctx, "claim_compact", json.RawMessage(`{"receipt_capable":true}`), nil)
+	if err != nil || errno != 0 {
+		t.Fatalf("reclaim errno=%d err=%v", errno, err)
+	}
+	var reclaim struct {
+		TaskID  string `json:"task_id"`
+		Receipt string `json:"receipt"`
+	}
+	if err := json.Unmarshal(body, &reclaim); err != nil {
+		t.Fatal(err)
+	}
+	if reclaim.TaskID != "lease-1" || reclaim.Receipt == claim.Receipt {
+		t.Fatalf("reclaim = (%q, %q), want the same task with a rotated receipt", reclaim.TaskID, reclaim.Receipt)
+	}
+	if errno := op("requeue_compact", `{"task_id":"lease-1","receipt":"`+claim.Receipt+`","error":"expired"}`); errno != int(syscall.EINVAL) {
+		t.Fatalf("stale-receipt requeue after reclaim errno=%d, want EINVAL", errno)
+	}
+	// The reclaiming worker's own ack works with its rotated receipt.
+	if errno := op("complete_compact", `{"task_id":"lease-1","receipt":"`+reclaim.Receipt+`"}`); errno != 0 {
+		t.Fatalf("fresh receipt-complete errno=%d, want 0", errno)
+	}
+}
+
+// Requeue ends the lease, so the receipt that named it must die with it: a
+// late or duplicate complete carrying the spent receipt used to match the
+// requeued PENDING row (complete accepted PENDING and requeue kept the
+// receipt) and mark it COMPLETED — silently dropping the work the requeue had
+// just put back in the queue. The revive edge is pinned too: a terminal row
+// keeps its dead receipt and the enqueue upsert flips COMPLETED back to
+// PENDING without touching it, which a duplicate of the successful ack must
+// not be able to drop either.
+func TestRequeuedCompactTaskCannotBeCompletedByItsSpentReceipt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.db.Exec(`INSERT INTO slice_compact_tasks (task_id, extent_ino, chunk, status, max_attempts)
+		VALUES ('requeue-1', 902, 0, 'PENDING', 8)`); err != nil {
+		t.Fatal(err)
+	}
+	op := func(op string, body string) int {
+		t.Helper()
+		_, errno, err := s.RunExtentMetaOp(ctx, op, json.RawMessage(body), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return errno
+	}
+	claim := func() (string, string) {
+		t.Helper()
+		body, errno, err := s.RunExtentMetaOp(ctx, "claim_compact", json.RawMessage(`{"receipt_capable":true}`), nil)
+		if err != nil || errno != 0 {
+			t.Fatalf("claim errno=%d err=%v", errno, err)
+		}
+		var out struct {
+			TaskID  string `json:"task_id"`
+			Receipt string `json:"receipt"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out.TaskID, out.Receipt
+	}
+	rowState := func(taskID string) (string, bool) {
+		t.Helper()
+		var status string
+		var receipt sql.NullString
+		if err := s.db.QueryRow(`SELECT status, receipt FROM slice_compact_tasks WHERE task_id = ?`, taskID).
+			Scan(&status, &receipt); err != nil {
+			t.Fatal(err)
+		}
+		return status, receipt.Valid && receipt.String != ""
+	}
+	taskID, receipt := claim()
+	if taskID != "requeue-1" || receipt == "" {
+		t.Fatalf("claim = (%q, %q), want the task with a minted receipt", taskID, receipt)
+	}
+	if errno := op("requeue_compact", `{"task_id":"requeue-1","receipt":"`+receipt+`","error":"transient"}`); errno != 0 {
+		t.Fatalf("requeue errno=%d, want 0", errno)
+	}
+	// The requeued row carries no identity at all.
+	if status, hasReceipt := rowState(taskID); status != "PENDING" || hasReceipt {
+		t.Fatalf("after requeue: status=%s receipt_present=%v, want PENDING with the receipt cleared", status, hasReceipt)
+	}
+	// The spent receipt can no longer complete anything: the requeued work
+	// must survive the late ack.
+	if errno := op("complete_compact", `{"task_id":"requeue-1","receipt":"`+receipt+`"}`); errno != int(syscall.EINVAL) {
+		t.Fatalf("complete with the spent receipt errno=%d, want EINVAL (a dead lease must not ack)", errno)
+	}
+	if status, _ := rowState(taskID); status != "PENDING" {
+		t.Fatalf("after a spent-receipt complete: status=%s, want PENDING (the requeued work was dropped)", status)
+	}
+	// The next claim re-leases the same task under a fresh identity, and only
+	// that identity's ack retires it.
+	taskID2, receipt2 := claim()
+	if taskID2 != taskID {
+		t.Fatalf("re-claim = %q, want the same requeued task %q", taskID2, taskID)
+	}
+	if receipt2 == "" || receipt2 == receipt {
+		t.Fatalf("re-claim receipt = %q, want a fresh identity distinct from %q", receipt2, receipt)
+	}
+	if errno := op("complete_compact", `{"task_id":"requeue-1","receipt":"`+receipt2+`"}`); errno != 0 {
+		t.Fatalf("complete with the fresh receipt errno=%d, want 0", errno)
+	}
+	if status, _ := rowState(taskID2); status != "COMPLETED" {
+		t.Fatalf("after a fresh-receipt complete: status=%s, want COMPLETED", status)
+	}
+	// A terminal row keeps its (now dead) receipt, and the enqueue upsert
+	// revives COMPLETED rows to PENDING without touching it — so a duplicate
+	// of the successful ack (an HTTP retry) must still find nothing to match:
+	// only a live LEASED row is completable.
+	if _, err := s.db.Exec(`INSERT INTO slice_compact_tasks (task_id, extent_ino, chunk, status, max_attempts)
+		VALUES ('requeue-2', 902, 0, 'PENDING', 8)
+		ON DUPLICATE KEY UPDATE status = IF(status IN ('COMPLETED','FAILED'), 'PENDING', status)`); err != nil {
+		t.Fatal(err)
+	}
+	if status, hasReceipt := rowState(taskID2); status != "PENDING" || !hasReceipt {
+		t.Fatalf("after revive: status=%s receipt_present=%v, want PENDING still carrying the dead receipt", status, hasReceipt)
+	}
+	if errno := op("complete_compact", `{"task_id":"requeue-1","receipt":"`+receipt2+`"}`); errno != int(syscall.EINVAL) {
+		t.Fatalf("duplicate complete after revive errno=%d, want EINVAL (only a live lease acks)", errno)
+	}
+	if status, _ := rowState(taskID2); status != "PENDING" {
+		t.Fatalf("after the duplicate complete: status=%s, want PENDING (the revived work was dropped)", status)
 	}
 }
 
@@ -664,7 +856,7 @@ func TestExtentCompactClaimCAS(t *testing.T) {
 	}
 	_ = w.Close(ctx)
 
-	cino, indx, taskID, err := s.ClaimCompactTask(context.Background())
+	cino, indx, taskID, _, err := s.ClaimCompactTask(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1626,7 +1818,7 @@ func TestExtentCompactCASLostIsSuccess(t *testing.T) {
 	}
 	_ = w.Close(ctx)
 
-	cino, indx, taskID, err := s.ClaimCompactTask(context.Background())
+	cino, indx, taskID, _, err := s.ClaimCompactTask(context.Background())
 	if err != nil || taskID == "" {
 		t.Fatalf("claim compact task: ino=%d task=%q err=%v", cino, taskID, err)
 	}

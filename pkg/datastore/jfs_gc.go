@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -626,35 +627,42 @@ func (s *Store) SweepStaleExtentSessions(ctx context.Context, limit int) (int, e
 // enqueueCompactAfterWrite); there is no self-feeding discovery scan anymore,
 // because `LENGTH(slices)` has no index and the upsert it needed used to
 // overwrite the lease of whoever claimed the chunk first.
-func (s *Store) jfsClaimCompactTx(tx *sql.Tx) (ino uint64, chunk uint32, taskID string, err error) {
+func (s *Store) jfsClaimCompactTx(tx *sql.Tx) (ino uint64, chunk uint32, taskID, receipt string, err error) {
 	const claimable = `status = 'PENDING' OR (status = 'LEASED' AND lease_until < CURRENT_TIMESTAMP(3))`
 	err = tx.QueryRow(`SELECT task_id, extent_ino, chunk FROM slice_compact_tasks
 		WHERE `+claimable+`
 		ORDER BY created_at LIMIT 1 FOR UPDATE`).Scan(&taskID, &ino, &chunk)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, 0, "", nil
+		return 0, 0, "", "", nil
 	}
 	if err != nil {
-		return 0, 0, "", err
+		return 0, 0, "", "", err
 	}
-	res, err := tx.Exec(`UPDATE slice_compact_tasks SET status = 'LEASED', leased_at = CURRENT_TIMESTAMP(3),
+	// The receipt fences every later update of the row: if worker A's lease
+	// expires and worker B reclaims it, A's late complete/requeue must not
+	// touch B's lease (marking an un-executed chunk complete would strand the
+	// fat chunk: enqueueing only happens on the threshold crossing). Every
+	// claim mints a fresh one — the column rotates on every reclaim, so lease
+	// identity holds for every deployment, not just receipt-capable ones.
+	receipt = strings.ToLower(ulid.Make().String())
+	res, err := tx.Exec(`UPDATE slice_compact_tasks SET status = 'LEASED', receipt = ?, leased_at = CURRENT_TIMESTAMP(3),
 		lease_until = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 5 MINUTE)
-		WHERE task_id = ? AND (`+claimable+`)`, taskID)
+		WHERE task_id = ? AND (`+claimable+`)`, receipt, taskID)
 	if err != nil {
-		return 0, 0, "", err
+		return 0, 0, "", "", err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		// Another executor claimed it between the SELECT and the UPDATE.
-		return 0, 0, "", nil
+		return 0, 0, "", "", nil
 	}
-	return ino, chunk, taskID, nil
+	return ino, chunk, taskID, receipt, nil
 }
 
 // jfsRequeueCompactTx returns a leased task to the queue after a failed
 // attempt, counting the attempt the way RequeueBlockGC does: without the count
 // max_attempts is dead, and a chunk whose CAS keeps losing is retried by every
 // mount plus the server fallback for the life of the tenant.
-func (s *Store) jfsRequeueCompactTx(tx *sql.Tx, taskID string, cause error) error {
+func (s *Store) jfsRequeueCompactTx(tx *sql.Tx, taskID, receipt string, cause error) (int, error) {
 	msg := ""
 	if cause != nil {
 		msg = cause.Error()
@@ -662,14 +670,30 @@ func (s *Store) jfsRequeueCompactTx(tx *sql.Tx, taskID string, cause error) erro
 	if len(msg) > 1000 {
 		msg = msg[:1000]
 	}
-	_, err := tx.Exec(`UPDATE slice_compact_tasks
+	// The receipt column is the lease identity and rotates on every reclaim,
+	// so a task_id-only WHERE is never safe across an expiry: a stale worker
+	// would requeue (and count an attempt against) the reclaiming worker's
+	// lease. The receipt is required (claims only mint leases for
+	// receipt-echoing clients); a missing or stale one matches zero rows,
+	// which is EINVAL — never a silent success. Requeue also NULLs the
+	// receipt: the identity dies with the lease it named, so the worker that
+	// gave the task back can never ack it again once the row is PENDING —
+	// complete used to accept that state and silently drop the requeued work.
+	res, err := tx.Exec(`UPDATE slice_compact_tasks
 		SET attempt_count = attempt_count + 1,
 			last_error = ?,
 			status = CASE WHEN max_attempts > 0 AND attempt_count + 1 >= max_attempts THEN 'FAILED' ELSE 'PENDING' END,
+			receipt = NULL,
 			leased_at = NULL,
 			lease_until = NULL
-		WHERE task_id = ? AND status = 'LEASED'`, msg, taskID)
-	return err
+		WHERE task_id = ? AND receipt = ? AND status = 'LEASED'`, msg, taskID, receipt)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return int(syscall.EINVAL), nil
+	}
+	return 0, nil
 }
 
 // jfsCompleteCompactTx acknowledges a claimed task whose chunk needs no work.
@@ -677,30 +701,66 @@ func (s *Store) jfsRequeueCompactTx(tx *sql.Tx, taskID string, cause error) erro
 // thin, and those outcomes have to ack the row: leaving it LEASED meant the
 // lease expired and it was reclaimed only to no-op again, so one row per
 // (inode, chunk) stayed in the table for the life of the tenant.
-func (s *Store) jfsCompleteCompactTx(tx *sql.Tx, taskID string) error {
+func (s *Store) jfsCompleteCompactTx(tx *sql.Tx, taskID, receipt string) (int, error) {
 	if taskID == "" {
-		return nil
+		return 0, nil
 	}
-	_, err := tx.Exec(`UPDATE slice_compact_tasks
+	// Same lease-identity rule as jfsRequeueCompactTx, one step stricter: an
+	// ack may only retire a lease that is still live (LEASED) and still the
+	// caller's (receipt match). PENDING is deliberately absent — requeue is
+	// the only writer that puts a row back there and it NULLs the receipt, so
+	// a PENDING match would mean a dead identity came back to life: a late or
+	// duplicate complete after a requeue or a revive would mark the requeued
+	// work done and drop it. A missing/stale receipt or any zero-row update
+	// is an explicit EINVAL.
+	res, err := tx.Exec(`UPDATE slice_compact_tasks
 		SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP(3),
 			leased_at = NULL, lease_until = NULL
-		WHERE task_id = ? AND status IN ('PENDING','LEASED')`, taskID)
-	return err
+		WHERE task_id = ? AND receipt = ? AND status = 'LEASED'`, taskID, receipt)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return int(syscall.EINVAL), nil
+	}
+	return 0, nil
 }
 
-// CompleteCompactTask is jfsCompleteCompactTx for the in-process fallback.
-func (s *Store) CompleteCompactTask(ctx context.Context, taskID string) error {
-	return s.InTx(ctx, func(tx *sql.Tx) error {
-		return s.jfsCompleteCompactTx(tx, taskID)
+// CompleteCompactTask is jfsCompleteCompactTx for the in-process fallback. A
+// zero-row update answers EINVAL: the lease expired and a reclaim rotated the
+// identity, so the ack does not belong to this run.
+func (s *Store) CompleteCompactTask(ctx context.Context, taskID, receipt string) error {
+	var eno int
+	err := s.InTx(ctx, func(tx *sql.Tx) error {
+		var e error
+		eno, e = s.jfsCompleteCompactTx(tx, taskID, receipt)
+		return e
 	})
+	if err != nil {
+		return err
+	}
+	if eno != 0 {
+		return syscall.Errno(eno)
+	}
+	return nil
 }
 
 // RequeueCompactTask is jfsRequeueCompactTx for the in-process fallback, so its
 // failures count attempts the same way a mount's do.
-func (s *Store) RequeueCompactTask(ctx context.Context, taskID string, cause error) error {
-	return s.InTx(ctx, func(tx *sql.Tx) error {
-		return s.jfsRequeueCompactTx(tx, taskID, cause)
+func (s *Store) RequeueCompactTask(ctx context.Context, taskID, receipt string, cause error) error {
+	var eno int
+	err := s.InTx(ctx, func(tx *sql.Tx) error {
+		var e error
+		eno, e = s.jfsRequeueCompactTx(tx, taskID, receipt, cause)
+		return e
 	})
+	if err != nil {
+		return err
+	}
+	if eno != 0 {
+		return syscall.Errno(eno)
+	}
+	return nil
 }
 
 // ListPendingBlockGC returns block keys ready for deletion. A task only
@@ -776,14 +836,19 @@ func (s *Store) BlockGCTaskStatus(ctx context.Context, key string) (string, erro
 	}
 	return status, err
 }
-func (s *Store) ClaimCompactTask(ctx context.Context) (ino uint64, chunk uint32, taskID string, err error) {
+
+// ClaimCompactTask leases one compact task for this filesystem. The receipt it
+// returns is the lease identity: every later ack for this claim must echo it,
+// and a reclaim after expiry rotates it so a stale worker's ack matches
+// nothing.
+func (s *Store) ClaimCompactTask(ctx context.Context) (ino uint64, chunk uint32, taskID, receipt string, err error) {
 	err = s.InTx(ctx, func(tx *sql.Tx) error {
 		var e error
-		ino, chunk, taskID, e = s.jfsClaimCompactTx(tx)
+		ino, chunk, taskID, receipt, e = s.jfsClaimCompactTx(tx)
 		return e
 	})
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, 0, "", nil
+		return 0, 0, "", "", nil
 	}
-	return ino, chunk, taskID, err
+	return ino, chunk, taskID, receipt, err
 }
