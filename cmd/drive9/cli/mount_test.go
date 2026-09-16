@@ -3236,3 +3236,284 @@ func TestValidateRemoteRoot_StatNon404ListFails(t *testing.T) {
 		t.Fatalf("error = %q, want List error message", got)
 	}
 }
+
+func stubMountStillActiveAfterUmount(t *testing.T, fn func(string) bool) {
+	t.Helper()
+	old := mountStillActiveAfterUmount
+	mountStillActiveAfterUmount = fn
+	t.Cleanup(func() { mountStillActiveAfterUmount = old })
+}
+
+func stubForceUnmountAfterUmount(t *testing.T, counter *int) {
+	t.Helper()
+	old := forceUnmountAfterUmount
+	forceUnmountAfterUmount = func(string) {
+		*counter++
+	}
+	t.Cleanup(func() { forceUnmountAfterUmount = old })
+}
+
+// TestRunUmountFailsWhenKernelMountEntryLingers guards #928: umount must not
+// report success while the kernel mount-table entry is still listed.
+func TestRunUmountFailsWhenKernelMountEntryLingers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("FUSE unmount gating is not used on Windows")
+	}
+	now := time.Unix(100, 0)
+	runCalls := 0
+	lazyCalls := 0
+	stubMountStillActiveAfterUmount(t, func(string) bool { return true })
+	stubForceUnmountAfterUmount(t, &lazyCalls)
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run:      func([]string) error { runCalls++; return nil },
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{}, "/tmp/drive9.pid", os.ErrNotExist
+		},
+		readPID:   func(string) (int, string, error) { return 0, "", os.ErrNotExist },
+		pidAlive:  func(int) bool { return false },
+		now:       func() time.Time { return now },
+		sleep:     func(d time.Duration) { now = now.Add(d) },
+		printErrf: func(string, ...any) {},
+	}
+
+	err := runUmount([]string{"--timeout", "300ms", "/mnt/drive9"}, deps)
+	if err == nil {
+		t.Fatal("expected error while kernel mount-table entry lingers")
+	}
+	if !strings.Contains(err.Error(), "still present after unmount") {
+		t.Fatalf("error = %v, want kernel-table linger error", err)
+	}
+	if lazyCalls != 0 {
+		t.Fatalf("lazy force-unmount called %d times, want 0 within a short budget", lazyCalls)
+	}
+	if runCalls < 1 {
+		t.Fatalf("fusermount retried %d times, want >= 1", runCalls)
+	}
+}
+
+// TestRunUmountClearsLingeringKernelEntryWithinTimeout guards #928: while the
+// kernel entry lingers, umount retries the helper and succeeds once the entry
+// is reaped within --timeout.
+func TestRunUmountClearsLingeringKernelEntryWithinTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("FUSE unmount gating is not used on Windows")
+	}
+	now := time.Unix(100, 0)
+	probeCalls := 0
+	lazyCalls := 0
+	stubMountStillActiveAfterUmount(t, func(string) bool {
+		probeCalls++
+		return probeCalls <= 2
+	})
+	stubForceUnmountAfterUmount(t, &lazyCalls)
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run:      func([]string) error { return nil },
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{}, "/tmp/drive9.pid", os.ErrNotExist
+		},
+		readPID:   func(string) (int, string, error) { return 0, "", os.ErrNotExist },
+		pidAlive:  func(int) bool { return false },
+		now:       func() time.Time { return now },
+		sleep:     func(d time.Duration) { now = now.Add(d) },
+		printErrf: func(string, ...any) {},
+	}
+
+	if err := runUmount([]string{"--timeout", "10s", "/mnt/drive9"}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+	if lazyCalls != 0 {
+		t.Fatalf("lazy force-unmount called %d times, want 0 (helper retry cleared the entry)", lazyCalls)
+	}
+}
+
+// TestRunUmountLadderOrderHelperThenSyscallThenLazy asserts the escalation
+// order of the kernel-table gate (#928): non-lazy helper retries, then the
+// direct umount2 rung, then exactly one lazy detach, then poll-only.
+func TestRunUmountLadderOrderHelperThenSyscallThenLazy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("FUSE unmount gating is not used on Windows")
+	}
+	now := time.Unix(100, 0)
+	var events []string
+	syscallCalls := 0
+	oldProbe := mountStillActiveAfterUmount
+	mountStillActiveAfterUmount = func(string) bool {
+		for _, e := range events {
+			if e == "lazy" {
+				return false // entry is reaped on the first poll after the lazy detach
+			}
+		}
+		return true
+	}
+	t.Cleanup(func() { mountStillActiveAfterUmount = oldProbe })
+	oldForce := forceUnmountAfterUmount
+	forceUnmountAfterUmount = func(string) { events = append(events, "lazy") }
+	t.Cleanup(func() { forceUnmountAfterUmount = oldForce })
+
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run:      func([]string) error { events = append(events, "helper"); return nil },
+		unmountSyscall: func(string) error {
+			syscallCalls++
+			events = append(events, "syscall")
+			return errors.New("umount2: EBUSY")
+		},
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{}, "/tmp/drive9.pid", os.ErrNotExist
+		},
+		readPID:   func(string) (int, string, error) { return 0, "", os.ErrNotExist },
+		pidAlive:  func(int) bool { return false },
+		now:       func() time.Time { return now },
+		sleep:     func(d time.Duration) { now = now.Add(d) },
+		printErrf: func(string, ...any) {},
+	}
+
+	if err := runUmount([]string{"--timeout", "10s", "/mnt/drive9"}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+	want := []string{"helper", "helper", "helper", "helper", "syscall", "lazy"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("ladder events = %v, want %v (helper retries incl. the pre-gate run, umount2, single lazy, then poll-only)", events, want)
+	}
+	if syscallCalls != 1 {
+		t.Fatalf("umount2 rung called %d times, want 1", syscallCalls)
+	}
+}
+
+// TestRunUmountNoSyscallRungPreservesHelperError: platforms without the
+// umount2 rung keep retrying the binary helper and must not overwrite the
+// real failure with a "not supported" placeholder (#928 review).
+func TestRunUmountNoSyscallRungPreservesHelperError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("FUSE unmount gating is not used on Windows")
+	}
+	// A stopped supervisor of ours is required so the failed primary helper
+	// still enters the kernel-table gate (foreign-mount failures return
+	// immediately, unchanged).
+	mp := t.TempDir()
+	childPID := spawnUmountStateChild(t, mp)
+
+	now := time.Unix(100, 0)
+	helperErr := errors.New("umount: Resource busy")
+	var events []string
+	stubMountStillActiveAfterUmount(t, func(string) bool { return true })
+	oldForce := forceUnmountAfterUmount
+	forceUnmountAfterUmount = func(string) { events = append(events, "lazy") }
+	t.Cleanup(func() { forceUnmountAfterUmount = oldForce })
+
+	deps := umountDeps{
+		goos: "darwin", // no unmountSyscall rung configured
+		run:  func([]string) error { events = append(events, "helper"); return helperErr },
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{PID: childPID}, "/tmp/fake.pid", nil
+		},
+		terminate: func(int, time.Duration) error { return nil },
+		pidAlive:  func(int) bool { return false },
+		now:       func() time.Time { return now },
+		sleep:     func(d time.Duration) { now = now.Add(d) },
+		printErrf: func(string, ...any) {},
+	}
+
+	err := runUmount([]string{"--timeout", "3s", mp}, deps)
+	if err == nil {
+		t.Fatal("expected error while kernel mount-table entry lingers")
+	}
+	if !strings.Contains(err.Error(), "Resource busy") {
+		t.Fatalf("error = %v, want the real helper error preserved", err)
+	}
+	if strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("error = %v, must not surface the unsupported-rung placeholder", err)
+	}
+	lazyCount := 0
+	for _, e := range events {
+		if e == "lazy" {
+			lazyCount++
+		}
+	}
+	if lazyCount != 1 {
+		t.Fatalf("lazy detach ran %d times, want 1 (events: %v)", lazyCount, events)
+	}
+	// After the single lazy detach the loop must be poll-only.
+	for i, e := range events {
+		if e == "lazy" && i != len(events)-1 {
+			t.Fatalf("events after lazy detach = %v, want none (poll-only)", events[i+1:])
+		}
+	}
+}
+
+// spawnUmountStateChild starts a short-lived child recorded as the
+// supervisor/worker owner of mp's state and returns its PID. runUmount sends
+// real signals via terminateProcessGraceful, so the PID must not be this
+// test process; the child is reaped as soon as it exits — an unreaped zombie
+// keeps looking alive to identity checks and stalls the real terminators for
+// their whole budget.
+func spawnUmountStateChild(t *testing.T, mp string) int {
+	t.Helper()
+	child := exec.Command("sleep", "30")
+	if err := child.Start(); err != nil {
+		t.Skipf("spawn child: %v", err)
+	}
+	childDone := make(chan struct{})
+	go func() {
+		_ = child.Wait()
+		close(childDone)
+	}()
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		<-childDone
+	})
+	creation, err := mountstate.ProcessCreationTime(child.Process.Pid)
+	if err != nil || creation == 0 {
+		t.Skipf("process creation time unavailable: %v", err)
+	}
+	if err := mountstate.WriteSupervisorState(mp, mountstate.SupervisorState{
+		PID: child.Process.Pid, CreationTime: creation,
+		WorkerPID: child.Process.Pid, WorkerCreation: creation,
+		MountPoint: mp, State: mountstate.SupervisorStateRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+	return child.Process.Pid
+}
+
+// TestRunUmountSkipsUnmountWhenKernelTableClean: when the authoritative
+// kernel table is already clean, a stopped-supervisor umount must not invoke
+// fusermount at all.
+func TestRunUmountSkipsUnmountWhenKernelTableClean(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("FUSE unmount gating is not used on Windows")
+	}
+	mp := t.TempDir()
+	childPID := spawnUmountStateChild(t, mp)
+
+	stubMountStillActiveAfterUmount(t, func(string) bool { return false })
+	runCalls := 0
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run: func([]string) error {
+			runCalls++
+			return nil
+		},
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{PID: childPID}, "/tmp/fake.pid", nil
+		},
+		terminate: func(int, time.Duration) error { return nil },
+		pidAlive:  func(int) bool { return false },
+		now:       time.Now,
+		sleep:     func(time.Duration) { t.Fatal("sleep should not be called for a clean table") },
+		printErrf: func(string, ...any) {},
+	}
+	if err := runUmount([]string{mp}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+	if runCalls != 0 {
+		t.Fatalf("fusermount called %d times, want 0", runCalls)
+	}
+}

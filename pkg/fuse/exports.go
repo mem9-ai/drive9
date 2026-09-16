@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -95,6 +96,10 @@ func ActiveMountPointBounded(path string) (bool, error) {
 	return activeMountPointBounded(path)
 }
 
+// errActiveMountProbeTimeout marks a bounded active-mount probe that gave up
+// waiting on a wedged stat. Callers must not retry the same probe on it.
+var errActiveMountProbeTimeout = errors.New("active mount check timed out")
+
 func activeMountPointBounded(path string) (bool, error) {
 	type result struct {
 		active bool
@@ -115,8 +120,62 @@ func activeMountPointBounded(path string) (bool, error) {
 	case r := <-ch:
 		return r.active, r.err
 	case <-time.After(timeout):
-		return false, fmt.Errorf("active mount check timed out after %s", timeout)
+		return false, fmt.Errorf("%w after %s", errActiveMountProbeTimeout, timeout)
 	}
+}
+
+// KernelMountTableHas reports whether mountPoint is still listed in the
+// authoritative kernel mount table (/proc/self/mountinfo on Linux; bounded
+// stat-based probe elsewhere). Use this to decide whether an unmount has
+// actually completed: stat-based probes report a lazily (MNT_DETACH)
+// detached mount as inactive while its kernel entry lingers until the last
+// reference is reaped, and /etc/mtab is already clean by then.
+// Probe failures are resolved by mountTableProbeFailed per platform; on
+// Linux an unreadable table is indeterminate and fails closed (still
+// listed) so callers never forgive an unmount as complete.
+//
+// Matching is path-based, not mount-identity-based: any entry at a
+// candidate path counts as listed, so an unrelated filesystem mounted over
+// a path (manual mount, or a successor past a generation gate) reads as
+// still-listed — the safe, fail-closed direction for unmount gating.
+func KernelMountTableHas(mountPoint string) bool {
+	listed, err := kernelMountTableHas(mountPoint)
+	if err == nil {
+		return listed
+	}
+	return mountTableProbeFailed(mountPoint, err)
+}
+
+// mountTableClearPollInterval is how often WaitMountTableClear re-checks the
+// kernel mount table while waiting for a lingering entry to be reaped.
+const mountTableClearPollInterval = 200 * time.Millisecond
+
+// WaitMountTableClear polls the kernel mount table until the entry for
+// mountPoint disappears or timeout elapses (timeout <= 0 checks once).
+// Returns false if the entry is still listed when the timeout expires.
+// Each check can cost one bounded symlink resolution (2s on a wedged
+// endpoint) plus the mountinfo read, and one final poll interval can start
+// before the deadline, so the total can overshoot timeout by that much.
+func WaitMountTableClear(mountPoint string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !KernelMountTableHas(mountPoint) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(mountTableClearPollInterval)
+	}
+}
+
+// UnmountSyscall detaches mountPoint directly via umount2(2), without
+// fusermount's /etc/mtab bookkeeping. After a lazy detach removed the mtab
+// entry, fusermount refuses to clear the leftover kernel entry; umount2
+// still works for the mount owner. lazy selects MNT_DETACH semantics.
+// Unsupported outside Linux; the binary-based unmount ladder applies there.
+func UnmountSyscall(mountPoint string, lazy bool) error {
+	return unmountSyscall(mountPoint, lazy)
 }
 
 // ForceUnmount force-unmounts a FUSE mountpoint (graceful-death path).

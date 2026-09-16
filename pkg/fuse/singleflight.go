@@ -10,7 +10,7 @@ import (
 // singleflightCall represents an in-progress or completed call.
 type singleflightCall struct {
 	done    chan struct{} // closed when the call completes
-	waiters atomic.Int32 // number of piggybackers currently in select
+	waiters atomic.Int32  // number of piggybackers currently in select
 	val     []byte
 	err     error
 }
