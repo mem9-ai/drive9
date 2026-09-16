@@ -716,6 +716,15 @@ else
   check_eq "run_bounded budget=1 hard-kills a TERM-ignoring child (no orphans)" "rc=$gate_rc elapsed=${gate_elapsed}s orphan=$gate_orphan" "rc=124 elapsed<=5s orphan=0"
 fi
 
+# Blackbox python unit tests (env isolation regression gates and any future
+# test_*.py under blackbox/suites), wired into the PR gate so they cannot
+# rot unrun (the repo's own "an unrun test is dead code" rule).
+if (cd "$SCRIPT_DIR/../blackbox" && python3 -m unittest discover -s suites -p 'test_*.py' -t . >/dev/null 2>&1); then
+  check_eq "blackbox test_*.py unit suite (incl. production env isolation)" "true" "true"
+else
+  check_eq "blackbox test_*.py unit suite (incl. production env isolation)" "false" "true"
+fi
+
 # Watch-probe attribution-fence negative control, wired into the PR gate:
 # late generation-1 events with reads straddling the remote write, and the
 # remote write producing zero generation-2 notifications, must credit
