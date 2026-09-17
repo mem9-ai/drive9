@@ -7860,7 +7860,7 @@ func TestListDirIgnoresBatchStatPerPathFailure(t *testing.T) {
 	}
 }
 
-func TestListDirIgnoresBatchStatTransportFailure(t *testing.T) {
+func TestListDirRejectsBatchStatTransportFailureBeforePublishingEntries(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
@@ -7884,18 +7884,14 @@ func TestListDirIgnoresBatchStatTransportFailure(t *testing.T) {
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	entries, err := fs.listDir(context.Background(), "/")
-	if err != nil {
-		t.Fatalf("listDir error = %v, want nil", err)
+	if err == nil {
+		t.Fatalf("listDir entries = %+v, want fail-closed batch-stat error", entries)
 	}
-	if len(entries) != 1 || entries[0].Name != "listed.txt" {
-		t.Fatalf("listDir entries = %+v, want listed.txt despite batch transport failure", entries)
+	if len(entries) != 0 {
+		t.Fatalf("listDir entries = %+v, want none published without path authorization", entries)
 	}
-	entry, ok := fs.inodes.GetEntry(entries[0].Ino)
-	if !ok {
-		t.Fatal("listDir entry inode not found")
-	}
-	if entry.Size != 9 || entry.Revision != 0 {
-		t.Fatalf("entry = %+v, want list metadata preserved with no revision", entry)
+	if _, ok := fs.inodes.GetInode("/listed.txt"); ok {
+		t.Fatal("listDir published inode despite unavailable path authorization")
 	}
 }
 

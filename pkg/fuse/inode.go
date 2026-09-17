@@ -28,13 +28,12 @@ type InodeEntry struct {
 	HasMode    bool   // true when mode is explicitly known (including 0)
 	Rdev       uint32
 	Revision   int64 // server-side revision for cache validation
-	// ContentReadDenied records that the server allowed this delegated mount
-	// to discover the entry through a directory listing, but denied the
-	// corresponding read/stat authority. Linux rewrites an EACCES returned
-	// from a FUSE READ reply to EIO, so Open must reject these entries before
-	// the kernel admits the file descriptor.
-	ContentReadDenied bool
-	Unlinked          bool // path was removed while open handles still reference this inode
+	// IdentityIsolated keeps this path from sharing a FUSE inode with another
+	// hardlink alias. It is required when authorization differs by path: FUSE
+	// Open carries only a node id, so a denied alias needs its own node id in
+	// order to reject the correct path without poisoning readable aliases.
+	IdentityIsolated bool
+	Unlinked         bool // path was removed while open handles still reference this inode
 	// ExtentIno is the JuiceFS inode for content_layout=extent files.
 	// Shared across hardlink aliases of the same FUSE inode.
 	ExtentIno uint64
@@ -47,7 +46,11 @@ type InodeToPath struct {
 	byInode map[uint64]*InodeEntry
 	byPath  map[string]uint64
 	byID    map[string]uint64
-	nextIno uint64
+	// contentReadDenied is deliberately keyed by path, not inode. Drive9
+	// authorization is path-scoped and hardlink aliases may have different
+	// grants even though they share one server resource id.
+	contentReadDenied map[string]bool
+	nextIno           uint64
 }
 
 // NewInodeToPath creates a new InodeToPath initialized with the root inode
@@ -62,10 +65,11 @@ func NewInodeToPath() *InodeToPath {
 		Nlookup: 1,
 	}
 	return &InodeToPath{
-		byInode: map[uint64]*InodeEntry{1: root},
-		byPath:  map[string]uint64{"/": 1},
-		byID:    make(map[string]uint64),
-		nextIno: 2,
+		byInode:           map[uint64]*InodeEntry{1: root},
+		byPath:            map[string]uint64{"/": 1},
+		byID:              make(map[string]uint64),
+		contentReadDenied: make(map[string]bool),
+		nextIno:           2,
 	}
 }
 
@@ -88,7 +92,7 @@ func (m *InodeToPath) LookupWithIdentity(path, resourceID string, nlink uint32, 
 		m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
 		return ino
 	}
-	if key := inodeResourceKey(resourceID, isDir); key != "" {
+	if key := inodeResourceKey(resourceID, isDir); key != "" && !m.contentReadDenied[path] {
 		if ino, ok := m.byID[key]; ok {
 			entry := m.byInode[ino]
 			entry.Nlookup++
@@ -102,22 +106,23 @@ func (m *InodeToPath) LookupWithIdentity(path, resourceID string, nlink uint32, 
 	m.nextIno++
 
 	entry := &InodeEntry{
-		Ino:        ino,
-		Path:       path,
-		Paths:      map[string]struct{}{path: {}},
-		ResourceID: inodeResourceKey(resourceID, isDir),
-		Nlink:      nlink,
-		IsDir:      isDir,
-		Nlookup:    1,
-		Size:       size,
-		Mtime:      mtime,
+		Ino:              ino,
+		Path:             path,
+		Paths:            map[string]struct{}{path: {}},
+		ResourceID:       inodeResourceKey(resourceID, isDir),
+		Nlink:            nlink,
+		IsDir:            isDir,
+		Nlookup:          1,
+		Size:             size,
+		Mtime:            mtime,
+		IdentityIsolated: m.contentReadDenied[path],
 	}
 	if entry.Nlink == 0 && !entry.IsDir {
 		entry.Nlink = 1
 	}
 	m.byInode[ino] = entry
 	m.byPath[path] = ino
-	if entry.ResourceID != "" {
+	if entry.ResourceID != "" && !entry.IdentityIsolated {
 		m.byID[entry.ResourceID] = ino
 	}
 	return ino
@@ -141,7 +146,7 @@ func (m *InodeToPath) EnsureInodeWithIdentity(path, resourceID string, nlink uin
 		m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
 		return ino
 	}
-	if key := inodeResourceKey(resourceID, isDir); key != "" {
+	if key := inodeResourceKey(resourceID, isDir); key != "" && !m.contentReadDenied[path] {
 		if ino, ok := m.byID[key]; ok {
 			entry := m.byInode[ino]
 			m.addPathLocked(entry, path)
@@ -154,22 +159,23 @@ func (m *InodeToPath) EnsureInodeWithIdentity(path, resourceID string, nlink uin
 	m.nextIno++
 
 	entry := &InodeEntry{
-		Ino:        ino,
-		Path:       path,
-		Paths:      map[string]struct{}{path: {}},
-		ResourceID: inodeResourceKey(resourceID, isDir),
-		Nlink:      nlink,
-		IsDir:      isDir,
-		Nlookup:    0, // no kernel lookup reference yet
-		Size:       size,
-		Mtime:      mtime,
+		Ino:              ino,
+		Path:             path,
+		Paths:            map[string]struct{}{path: {}},
+		ResourceID:       inodeResourceKey(resourceID, isDir),
+		Nlink:            nlink,
+		IsDir:            isDir,
+		Nlookup:          0, // no kernel lookup reference yet
+		Size:             size,
+		Mtime:            mtime,
+		IdentityIsolated: m.contentReadDenied[path],
 	}
 	if entry.Nlink == 0 && !entry.IsDir {
 		entry.Nlink = 1
 	}
 	m.byInode[ino] = entry
 	m.byPath[path] = ino
-	if entry.ResourceID != "" {
+	if entry.ResourceID != "" && !entry.IdentityIsolated {
 		m.byID[entry.ResourceID] = ino
 	}
 	return ino
@@ -585,14 +591,72 @@ func (m *InodeToPath) UpdateRevision(ino uint64, revision int64) {
 }
 
 // SetContentReadDenied records whether the current mount credential may read
-// an entry that remains visible through list permission.
-func (m *InodeToPath) SetContentReadDenied(ino uint64, denied bool) {
+// a path that remains visible through list permission. Authorization is
+// path-scoped: hardlink aliases of one server resource may have different
+// grants.
+//
+// A denied alias is isolated from the shared resource-id inode before the
+// state becomes visible. FUSE Open contains only a node id, so this invariant
+// lets Open recover the exact denied path without applying that denial to a
+// readable alias.
+func (m *InodeToPath) SetContentReadDenied(path string, denied bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if entry, ok := m.byInode[ino]; ok {
-		entry.ContentReadDenied = denied
+	if !denied {
+		delete(m.contentReadDenied, path)
+		return
 	}
+	m.contentReadDenied[path] = true
+	m.isolatePathLocked(path)
+}
+
+// ContentReadDenied reports the path-scoped read authorization state.
+func (m *InodeToPath) ContentReadDenied(path string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.contentReadDenied[path]
+}
+
+// isolatePathLocked detaches path from a resource-id-shared inode. Existing
+// kernel lookup references stay with the old inode; the isolated inode starts
+// with no lookup reference and is handed to the kernel by the current
+// Lookup/ReadDirPlus response.
+func (m *InodeToPath) isolatePathLocked(path string) {
+	ino, ok := m.byPath[path]
+	if !ok {
+		return
+	}
+	entry, ok := m.byInode[ino]
+	if !ok || entry.IdentityIsolated {
+		return
+	}
+	if len(entry.Paths) <= 1 {
+		entry.IdentityIsolated = true
+		if entry.ResourceID != "" && m.byID[entry.ResourceID] == ino {
+			delete(m.byID, entry.ResourceID)
+		}
+		return
+	}
+
+	isolated := copyInodeEntryLocked(entry)
+	isolated.Ino = m.nextIno
+	m.nextIno++
+	isolated.Path = path
+	isolated.Paths = map[string]struct{}{path: {}}
+	isolated.Nlookup = 0
+	isolated.IdentityIsolated = true
+
+	delete(entry.Paths, path)
+	if entry.Path == path {
+		entry.Path = ""
+		for alias := range entry.Paths {
+			entry.Path = alias
+			break
+		}
+	}
+	m.byInode[isolated.Ino] = isolated
+	m.byPath[path] = isolated.Ino
 }
 
 // UpdateMode updates the permission bits of the entry identified by ino.
@@ -641,6 +705,10 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 		m.removePathLocked(newPath, true, true)
 	}
 	m.byPath[newPath] = ino
+	if m.contentReadDenied[oldPath] {
+		m.contentReadDenied[newPath] = true
+	}
+	delete(m.contentReadDenied, oldPath)
 	if entry.Paths == nil {
 		entry.Paths = make(map[string]struct{})
 	}
@@ -666,6 +734,10 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 			newChildPath := newPath + "/" + strings.TrimPrefix(c.oldChildPath, oldPrefix)
 			delete(m.byPath, c.oldChildPath)
 			m.byPath[newChildPath] = c.childIno
+			if m.contentReadDenied[c.oldChildPath] {
+				m.contentReadDenied[newChildPath] = true
+			}
+			delete(m.contentReadDenied, c.oldChildPath)
 			childEntry := m.byInode[c.childIno]
 			if childEntry.Paths == nil {
 				childEntry.Paths = make(map[string]struct{})
@@ -786,15 +858,19 @@ func (m *InodeToPath) setIdentityLocked(entry *InodeEntry, resourceID string) {
 		entry.ExtentIno = 0
 	}
 	entry.ResourceID = key
-	m.byID[key] = entry.Ino
+	if !entry.IdentityIsolated {
+		m.byID[key] = entry.Ino
+	}
 }
 
 func (m *InodeToPath) removeEntryLocked(ino uint64, entry *InodeEntry) {
 	for p := range entry.Paths {
 		delete(m.byPath, p)
+		delete(m.contentReadDenied, p)
 	}
 	if entry.Path != "" {
 		delete(m.byPath, entry.Path)
+		delete(m.contentReadDenied, entry.Path)
 	}
 	if entry.ResourceID != "" && m.byID[entry.ResourceID] == ino {
 		delete(m.byID, entry.ResourceID)
@@ -803,6 +879,7 @@ func (m *InodeToPath) removeEntryLocked(ino uint64, entry *InodeEntry) {
 }
 
 func (m *InodeToPath) removePathLocked(path string, consumeLink bool, preserveIfLast bool) {
+	delete(m.contentReadDenied, path)
 	ino, ok := m.byPath[path]
 	if !ok {
 		return

@@ -35,6 +35,10 @@ type CachedFileInfo struct {
 	ResourceID string
 	Nlink      uint32
 	ExtentIno  uint64 // JuiceFS inode for content_layout=extent files
+	// ContentReadAuthKnown distinguishes a successful path-scoped stat (or an
+	// explicit 403) from metadata that has never been authorization-checked.
+	// Unknown cache rows must not clear a previously established denial.
+	ContentReadAuthKnown bool
 	// ContentReadDenied is true when list permission exposed the entry but a
 	// per-path read/stat authorization check returned HTTP 403.
 	ContentReadDenied bool

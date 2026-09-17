@@ -3,7 +3,9 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -260,12 +262,14 @@ func TestBatchStatPerPathUnauthorizedResetsMountView(t *testing.T) {
 
 func TestBatchStatPerPathForbiddenKeepsListOnlyEntry(t *testing.T) {
 	var contentReads atomic.Int32
+	var batchStats atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Query().Get("list") == "1" {
-			_, _ = w.Write([]byte(`{"entries":[{"name":"visible.txt","isdir":false}]}`))
+			_, _ = w.Write([]byte(`{"entries":[{"name":"visible.txt","isDir":false,"size":5,"revision":7,"resource_id":"file-1","nlink":1}]}`))
 			return
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat" {
+			batchStats.Add(1)
 			_, _ = w.Write([]byte(`{"results":[{"path":"/project/visible.txt","status":403,"error":"fs access denied"}]}`))
 			return
 		}
@@ -280,23 +284,29 @@ func TestBatchStatPerPathForbiddenKeepsListOnlyEntry(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
-	fs.inodes.EnsureInode("/project", true, 0, time.Now())
+	dirIno := fs.inodes.EnsureInode("/project", true, 0, time.Now())
 	seedMountViewCaches(fs)
 
-	entries, err := fs.listDir(context.Background(), "/project")
-	if err != nil {
-		t.Fatalf("listDir: %v", err)
+	// Exercise the production sequence: a revision-bearing List row is
+	// authorized by BatchStat before READDIRPLUS publishes its inode. The
+	// later Open must fail before the kernel can issue a FUSE READ.
+	dh := &DirHandle{Ino: dirIno, Path: "/project"}
+	fh := fs.dirHandles.Allocate(dh)
+	out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if got := fs.ReadDirPlus(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Size:     4096,
+	}, out); got != gofuse.OK {
+		t.Fatalf("ReadDirPlus status = %v, want OK", got)
 	}
-	if len(entries) != 1 || entries[0].Name != "visible.txt" {
-		t.Fatalf("entries = %#v, want list-only visible.txt", entries)
-	}
-	entry, ok := fs.inodes.GetEntry(entries[0].Ino)
-	if !ok || !entry.ContentReadDenied {
-		t.Fatalf("inode = %#v, want content-read denial preserved", entry)
+	ino, ok := fs.inodes.GetInode("/project/visible.txt")
+	if !ok || !fs.inodes.ContentReadDenied("/project/visible.txt") {
+		t.Fatalf("path authorization missing for list-only inode %d", ino)
 	}
 	var openOut gofuse.OpenOut
 	if got := fs.Open(nil, &gofuse.OpenIn{
-		InHeader: gofuse.InHeader{NodeId: entries[0].Ino},
+		InHeader: gofuse.InHeader{NodeId: ino},
 		Flags:    syscall.O_RDONLY,
 	}, &openOut); got != gofuse.EACCES {
 		t.Fatalf("Open status = %v, want EACCES before FUSE READ", got)
@@ -307,11 +317,123 @@ func TestBatchStatPerPathForbiddenKeepsListOnlyEntry(t *testing.T) {
 	if got := contentReads.Load(); got != 0 {
 		t.Fatalf("content reads = %d, want 0 after fail-closed Open", got)
 	}
+	if got := batchStats.Load(); got != 1 {
+		t.Fatalf("batch stat calls = %d, want 1 for revision-bearing List row", got)
+	}
 	if _, ok := fs.dirCache.Get("/stale"); !ok {
 		t.Fatal("directory cache was cleared by a per-path 403")
 	}
 	if _, ok := fs.readCache.Get("/stale.txt", 1); !ok {
 		t.Fatal("read cache was cleared by a per-path 403")
+	}
+}
+
+func TestBatchStatAuthorizationIsPathScopedForHardlinkAliases(t *testing.T) {
+	for _, deniedFirst := range []bool{false, true} {
+		name := "readable-first"
+		if deniedFirst {
+			name = "denied-first"
+		}
+		t.Run(name, func(t *testing.T) {
+			ordered := []string{"readable.txt", "denied.txt"}
+			if deniedFirst {
+				ordered[0], ordered[1] = ordered[1], ordered[0]
+			}
+			var denyAlias atomic.Bool
+			denyAlias.Store(true)
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+					_, _ = fmt.Fprintf(w, `{"entries":[{"name":%q,"isDir":false,"size":5,"revision":7,"resource_id":"shared-file","nlink":2},{"name":%q,"isDir":false,"size":5,"revision":7,"resource_id":"shared-file","nlink":2}]}`, ordered[0], ordered[1])
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+					results := make([]map[string]any, 0, 2)
+					for _, entryName := range ordered {
+						result := map[string]any{
+							"path":        "/project/" + entryName,
+							"status":      200,
+							"size":        5,
+							"revision":    7,
+							"resource_id": "shared-file",
+							"nlink":       2,
+						}
+						if entryName == "denied.txt" && denyAlias.Load() {
+							result = map[string]any{
+								"path":   "/project/denied.txt",
+								"status": 403,
+								"error":  "fs access denied",
+							}
+						}
+						results = append(results, result)
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
+				default:
+					http.Error(w, "unexpected request", http.StatusMethodNotAllowed)
+				}
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+			fs.inodes.EnsureInode("/project", true, 0, time.Now())
+			entries, err := fs.listDir(context.Background(), "/project")
+			if err != nil {
+				t.Fatalf("listDir: %v", err)
+			}
+			if len(entries) != 2 {
+				t.Fatalf("entries = %#v, want two hardlink aliases", entries)
+			}
+			readableIno, readableOK := fs.inodes.GetInode("/project/readable.txt")
+			deniedIno, deniedOK := fs.inodes.GetInode("/project/denied.txt")
+			if !readableOK || !deniedOK || readableIno == deniedIno {
+				t.Fatalf("hardlink inode isolation = readable %d/%v denied %d/%v, want distinct", readableIno, readableOK, deniedIno, deniedOK)
+			}
+			if fs.inodes.ContentReadDenied("/project/readable.txt") {
+				t.Fatal("readable alias inherited denied path authorization")
+			}
+			if !fs.inodes.ContentReadDenied("/project/denied.txt") {
+				t.Fatal("denied alias lost path-scoped authorization")
+			}
+
+			var readableOut gofuse.OpenOut
+			if got := fs.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{NodeId: readableIno},
+				Flags:    syscall.O_RDONLY,
+			}, &readableOut); got != gofuse.OK {
+				t.Fatalf("readable Open status = %v, want OK", got)
+			}
+			fs.fileHandles.Delete(readableOut.Fh)
+			if got := fs.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{NodeId: deniedIno},
+				Flags:    syscall.O_RDONLY,
+			}, &gofuse.OpenOut{}); got != gofuse.EACCES {
+				t.Fatalf("denied Open status = %v, want EACCES", got)
+			}
+
+			// A later successful path stat clears only this alias's denial. Its
+			// already-published node id remains isolated, while both aliases are
+			// independently readable under the new authorization snapshot.
+			denyAlias.Store(false)
+			fs.dirCache.Invalidate("/project")
+			if _, err := fs.listDir(context.Background(), "/project"); err != nil {
+				t.Fatalf("listDir after permission grant: %v", err)
+			}
+			if fs.inodes.ContentReadDenied("/project/denied.txt") {
+				t.Fatal("successful retry did not clear denied alias authorization")
+			}
+			grantedIno, ok := fs.inodes.GetInode("/project/denied.txt")
+			if !ok || grantedIno != deniedIno {
+				t.Fatalf("granted alias inode = %d/%v, want stable isolated inode %d", grantedIno, ok, deniedIno)
+			}
+			var grantedOut gofuse.OpenOut
+			if got := fs.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{NodeId: grantedIno},
+				Flags:    syscall.O_RDONLY,
+			}, &grantedOut); got != gofuse.OK {
+				t.Fatalf("granted alias Open status = %v, want OK", got)
+			}
+			fs.fileHandles.Delete(grantedOut.Fh)
+		})
 	}
 }
 
@@ -384,6 +506,8 @@ func TestDirectoryPrefetchDiscardedWhenMountViewResetsInFlight(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet:
 			_, _ = w.Write([]byte(`{"entries":[{"name":"prefetch.txt","isdir":false,"size":5,"revision":7}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			_, _ = w.Write([]byte(`{"results":[{"path":"/prefetch.txt","status":200,"size":5,"revision":7}]}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-read-small":
 			close(prefetchStarted)
 			<-releasePrefetch
@@ -535,6 +659,8 @@ func TestRmdirRejectsDirectoryListWhenMountViewResetsInFlight(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet:
 			_, _ = w.Write([]byte(`{"entries":[{"name":"child.txt","isdir":false,"size":5,"revision":7}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			_, _ = w.Write([]byte(`{"results":[{"path":"/dir/child.txt","status":200,"size":5,"revision":7}]}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-read-small":
 			close(prefetchStarted)
 			<-releasePrefetch
@@ -746,8 +872,8 @@ func TestLookupForbiddenStatFallsBackToAuthorizedList(t *testing.T) {
 	if out.NodeId == 0 || out.Size != 5 {
 		t.Fatalf("Lookup output = node:%d size:%d, want visible file", out.NodeId, out.Size)
 	}
-	if entry, ok := fs.inodes.GetEntry(out.NodeId); !ok || !entry.ContentReadDenied {
-		t.Fatalf("inode = %#v, want list-only content denial", entry)
+	if _, ok := fs.inodes.GetEntry(out.NodeId); !ok || !fs.inodes.ContentReadDenied("/visible.txt") {
+		t.Fatalf("path authorization missing for list-only inode %d", out.NodeId)
 	}
 	if got := fs.Open(nil, &gofuse.OpenIn{
 		InHeader: gofuse.InHeader{NodeId: out.NodeId},

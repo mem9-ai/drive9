@@ -6555,21 +6555,20 @@ func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
 		mtime = time.Now()
 	}
 	return CachedFileInfo{
-		Name:              name,
-		Size:              entry.Size,
-		IsDir:             entry.IsDir,
-		Mtime:             mtime,
-		Revision:          entry.Revision,
-		Mode:              entry.Mode,
-		HasMode:           entry.HasMode,
-		Uid:               entry.Uid,
-		Gid:               entry.Gid,
-		HasUID:            entry.HasUID,
-		HasGID:            entry.HasGID,
-		ResourceID:        entry.ResourceID,
-		Nlink:             entry.Nlink,
-		ExtentIno:         entry.ExtentIno,
-		ContentReadDenied: entry.ContentReadDenied,
+		Name:       name,
+		Size:       entry.Size,
+		IsDir:      entry.IsDir,
+		Mtime:      mtime,
+		Revision:   entry.Revision,
+		Mode:       entry.Mode,
+		HasMode:    entry.HasMode,
+		Uid:        entry.Uid,
+		Gid:        entry.Gid,
+		HasUID:     entry.HasUID,
+		HasGID:     entry.HasGID,
+		ResourceID: entry.ResourceID,
+		Nlink:      entry.Nlink,
+		ExtentIno:  entry.ExtentIno,
 	}
 }
 
@@ -6588,6 +6587,7 @@ func cachedInfoFromStat(name string, stat *client.StatResult) CachedFileInfo {
 		item.ResourceID = stat.ResourceID
 		item.Nlink = stat.Nlink
 		item.ExtentIno = stat.ExtentIno
+		item.ContentReadAuthKnown = true
 	}
 	return item
 }
@@ -6690,15 +6690,14 @@ func (fs *Dat9FS) statCacheTrustedAndVerified() bool {
 	return fs.statCacheVerified()
 }
 
-func (fs *Dat9FS) updateEntryFromStat(entry *InodeEntry, stat *client.StatResult) *InodeEntry {
+func (fs *Dat9FS) updateEntryFromStat(p string, entry *InodeEntry, stat *client.StatResult) *InodeEntry {
 	if fs == nil || entry == nil || stat == nil {
 		return entry
 	}
 	entry.Size = stat.Size
 	entry.IsDir = stat.IsDir
 	fs.inodes.UpdateSize(entry.Ino, stat.Size)
-	fs.inodes.SetContentReadDenied(entry.Ino, false)
-	entry.ContentReadDenied = false
+	fs.inodes.SetContentReadDenied(p, false)
 	if stat.ResourceID != "" || stat.Nlink > 0 {
 		fs.inodes.SetIdentity(entry.Ino, stat.ResourceID, stat.Nlink)
 		entry.ResourceID = stat.ResourceID
@@ -6733,7 +6732,7 @@ func (fs *Dat9FS) revalidateReadCacheEntryIfUntrusted(cancel <-chan struct{}, p 
 		return nil, syscall.EAGAIN
 	}
 	defer fs.mountViewMu.RUnlock()
-	entry = fs.updateEntryFromStat(entry, stat)
+	entry = fs.updateEntryFromStat(p, entry, stat)
 	if stat == nil || stat.IsDir || stat.Revision <= 0 || stat.Revision != cachedRevision {
 		fs.invalidateReadCacheAndTargets(p)
 	}
@@ -7305,8 +7304,10 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 		// the dest name can still cache the old dest juicefs ino, which would
 		// alias dest's FUSE nodeid onto the source path (pjdfstest expected N
 		// got N+2). Stat-path Lookup still reuses by live juicefs identity.
+		if item.ContentReadAuthKnown {
+			fs.inodes.SetContentReadDenied(childP, item.ContentReadDenied)
+		}
 		ino := fs.inodes.LookupWithIdentity(childP, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
-		fs.inodes.SetContentReadDenied(ino, item.ContentReadDenied)
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
 		}
@@ -7657,14 +7658,15 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 			if matched.Mtime > 0 {
 				mtime = time.Unix(matched.Mtime, 0)
 			}
-			ino := fs.inodes.LookupWithIdentity(childP, matched.ResourceID, matched.Nlink, matched.IsDir, matched.Size, mtime)
 			// Stat returned 403 but parent List exposed this entry: it is a
 			// list-only projection. Preserve the denial until Open so Linux
 			// reports EACCES instead of rewriting a READ denial to EIO.
-			fs.inodes.SetContentReadDenied(ino, isForbiddenErr(err))
+			fs.inodes.SetContentReadDenied(childP, isForbiddenErr(err))
+			ino := fs.inodes.LookupWithIdentity(childP, matched.ResourceID, matched.Nlink, matched.IsDir, matched.Size, mtime)
 			if isForbiddenErr(err) {
 				cachedMatched := cachedFileInfos([]client.FileInfo{matched})
 				if len(cachedMatched) == 1 {
+					cachedMatched[0].ContentReadAuthKnown = true
 					cachedMatched[0].ContentReadDenied = true
 					fs.dirCache.Upsert(parentPath, cachedMatched[0])
 				}
@@ -7714,9 +7716,10 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 	}
 	if ino == 0 {
+		fs.inodes.SetContentReadDenied(childP, false)
 		ino = fs.inodes.LookupWithIdentity(childP, stat.ResourceID, stat.Nlink, stat.IsDir, stat.Size, mtime)
 	}
-	fs.inodes.SetContentReadDenied(ino, false)
+	fs.inodes.SetContentReadDenied(childP, false)
 	// Store server revision for cache validation.
 	if stat.Revision > 0 {
 		fs.inodes.UpdateRevision(ino, stat.Revision)
@@ -11836,24 +11839,20 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 		return nil
 	}
 
-	// Collect indices of items that need a BatchStat (revision unknown).
-	// When the server list response includes revision (revision > 0), the
-	// item already has full metadata and no per-file stat is needed.
-	// This is backward-compatible: old servers that omit revision leave it
-	// at 0, so those entries still go through BatchStat.
+	// Every listed regular file needs a path-scoped authorization conclusion
+	// before READDIRPLUS may hand its inode to the kernel. A positive revision
+	// proves metadata freshness, but it does not prove that this credential may
+	// read content: delegated list-only scopes return normal revision-bearing
+	// List rows and reject the per-path stat with 403.
 	//
-	// Directories are always skipped: they have no file revision, and the
-	// list API already returns their full metadata (name, isDir, mtime,
-	// mode, resourceID, nlink). BatchStat added no new information for
-	// directories.
+	// Directories are skipped because OpenDir does not admit a content handle
+	// and List already returned their namespace metadata.
 	var needStat []int
 	for i := range items {
 		if items[i].IsDir {
 			continue
 		}
-		if items[i].Revision <= 0 {
-			needStat = append(needStat, i)
-		}
+		needStat = append(needStat, i)
 	}
 	if len(needStat) == 0 {
 		return nil
@@ -11875,7 +11874,10 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 			if isAuthorizationErr(err) {
 				return fs.resetMountViewOnAuthorizationError(err)
 			}
-			return nil
+			// Do not publish revision-bearing List rows without a path-scoped
+			// authorization conclusion. Otherwise READDIRPLUS can admit a file
+			// descriptor whose eventual 403 arrives at READ and becomes EIO.
+			return err
 		}
 		for j, result := range results {
 			if !result.OK() {
@@ -11889,11 +11891,13 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 					})
 				}
 				if result.Status == http.StatusForbidden {
+					items[batch[j]].ContentReadAuthKnown = true
 					items[batch[j]].ContentReadDenied = true
 				}
 				continue
 			}
 			item := &items[batch[j]]
+			item.ContentReadAuthKnown = true
 			item.ContentReadDenied = false
 			item.Size = result.Size
 			item.IsDir = result.IsDir
@@ -12242,8 +12246,10 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 				}
 			}
 		}
+		if item.ContentReadAuthKnown {
+			fs.inodes.SetContentReadDenied(childP, item.ContentReadDenied)
+		}
 		ino := fs.inodes.EnsureInodeWithIdentity(childP, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
-		fs.inodes.SetContentReadDenied(ino, item.ContentReadDenied)
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
 		}
@@ -12505,7 +12511,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		return st
 	}
 	accMode := input.Flags & syscall.O_ACCMODE
-	if entry != nil && entry.ContentReadDenied && (accMode == syscall.O_RDONLY || accMode == syscall.O_RDWR) {
+	if fs.inodes.ContentReadDenied(p) && (accMode == syscall.O_RDONLY || accMode == syscall.O_RDWR) {
 		return gofuse.EACCES
 	}
 	if entry != nil && entry.IsDir {
