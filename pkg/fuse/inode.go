@@ -28,7 +28,13 @@ type InodeEntry struct {
 	HasMode    bool   // true when mode is explicitly known (including 0)
 	Rdev       uint32
 	Revision   int64 // server-side revision for cache validation
-	Unlinked   bool  // path was removed while open handles still reference this inode
+	// ContentReadDenied records that the server allowed this delegated mount
+	// to discover the entry through a directory listing, but denied the
+	// corresponding read/stat authority. Linux rewrites an EACCES returned
+	// from a FUSE READ reply to EIO, so Open must reject these entries before
+	// the kernel admits the file descriptor.
+	ContentReadDenied bool
+	Unlinked          bool // path was removed while open handles still reference this inode
 	// ExtentIno is the JuiceFS inode for content_layout=extent files.
 	// Shared across hardlink aliases of the same FUSE inode.
 	ExtentIno uint64
@@ -575,6 +581,17 @@ func (m *InodeToPath) UpdateRevision(ino uint64, revision int64) {
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Revision = revision
+	}
+}
+
+// SetContentReadDenied records whether the current mount credential may read
+// an entry that remains visible through list permission.
+func (m *InodeToPath) SetContentReadDenied(ino uint64, denied bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.ContentReadDenied = denied
 	}
 }
 

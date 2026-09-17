@@ -35,6 +35,9 @@ type CachedFileInfo struct {
 	ResourceID string
 	Nlink      uint32
 	ExtentIno  uint64 // JuiceFS inode for content_layout=extent files
+	// ContentReadDenied is true when list permission exposed the entry but a
+	// per-path read/stat authorization check returned HTTP 403.
+	ContentReadDenied bool
 }
 
 type namespaceLookupKind uint8

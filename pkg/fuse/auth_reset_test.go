@@ -231,18 +231,56 @@ func TestBatchStatAuthorizationErrorResetsMountView(t *testing.T) {
 	assertMountViewCachesCleared(t, fs)
 }
 
-func TestBatchStatPerPathForbiddenKeepsListOnlyEntry(t *testing.T) {
+func TestBatchStatPerPathUnauthorizedResetsMountView(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
 			_, _ = w.Write([]byte(`{"entries":[{"name":"visible.txt","isdir":false}]}`))
-			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			_, _ = w.Write([]byte(`{"results":[{"path":"/project/visible.txt","status":401,"error":"invalid API key"}]}`))
+		default:
+			http.Error(w, "unexpected request", http.StatusMethodNotAllowed)
 		}
-		_, _ = w.Write([]byte(`{"results":[{"path":"/project/visible.txt","status":403,"error":"fs access denied"}]}`))
 	}))
 	defer ts.Close()
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+	seedMountViewCaches(fs)
+
+	_, err := fs.listDir(context.Background(), "/project")
+	if err == nil {
+		t.Fatal("listDir error = nil, want per-path authorization error")
+	}
+	if got := httpToFuseStatus(err); got != gofuse.EACCES {
+		t.Fatalf("FUSE status = %v, want EACCES", got)
+	}
+	assertMountViewCachesCleared(t, fs)
+}
+
+func TestBatchStatPerPathForbiddenKeepsListOnlyEntry(t *testing.T) {
+	var contentReads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Query().Get("list") == "1" {
+			_, _ = w.Write([]byte(`{"entries":[{"name":"visible.txt","isdir":false}]}`))
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat" {
+			_, _ = w.Write([]byte(`{"results":[{"path":"/project/visible.txt","status":403,"error":"fs access denied"}]}`))
+			return
+		}
+		if r.Method == http.MethodGet {
+			contentReads.Add(1)
+			http.Error(w, "fs access denied", http.StatusForbidden)
+			return
+		}
+		http.Error(w, "unexpected request", http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.NewWithToken(ts.URL, "scoped"), opts)
+	fs.inodes.EnsureInode("/project", true, 0, time.Now())
 	seedMountViewCaches(fs)
 
 	entries, err := fs.listDir(context.Background(), "/project")
@@ -251,6 +289,23 @@ func TestBatchStatPerPathForbiddenKeepsListOnlyEntry(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name != "visible.txt" {
 		t.Fatalf("entries = %#v, want list-only visible.txt", entries)
+	}
+	entry, ok := fs.inodes.GetEntry(entries[0].Ino)
+	if !ok || !entry.ContentReadDenied {
+		t.Fatalf("inode = %#v, want content-read denial preserved", entry)
+	}
+	var openOut gofuse.OpenOut
+	if got := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: entries[0].Ino},
+		Flags:    syscall.O_RDONLY,
+	}, &openOut); got != gofuse.EACCES {
+		t.Fatalf("Open status = %v, want EACCES before FUSE READ", got)
+	}
+	if openOut.Fh != 0 {
+		t.Fatalf("Open fh = %d, want no handle on denied open", openOut.Fh)
+	}
+	if got := contentReads.Load(); got != 0 {
+		t.Fatalf("content reads = %d, want 0 after fail-closed Open", got)
 	}
 	if _, ok := fs.dirCache.Get("/stale"); !ok {
 		t.Fatal("directory cache was cleared by a per-path 403")
@@ -690,6 +745,15 @@ func TestLookupForbiddenStatFallsBackToAuthorizedList(t *testing.T) {
 	}
 	if out.NodeId == 0 || out.Size != 5 {
 		t.Fatalf("Lookup output = node:%d size:%d, want visible file", out.NodeId, out.Size)
+	}
+	if entry, ok := fs.inodes.GetEntry(out.NodeId); !ok || !entry.ContentReadDenied {
+		t.Fatalf("inode = %#v, want list-only content denial", entry)
+	}
+	if got := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: out.NodeId},
+		Flags:    syscall.O_RDONLY,
+	}, &gofuse.OpenOut{}); got != gofuse.EACCES {
+		t.Fatalf("Open status = %v, want EACCES for list-only entry", got)
 	}
 	if got := statCalls.Load(); got != 1 {
 		t.Fatalf("Stat calls = %d, want 1", got)

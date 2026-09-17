@@ -6555,20 +6555,21 @@ func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
 		mtime = time.Now()
 	}
 	return CachedFileInfo{
-		Name:       name,
-		Size:       entry.Size,
-		IsDir:      entry.IsDir,
-		Mtime:      mtime,
-		Revision:   entry.Revision,
-		Mode:       entry.Mode,
-		HasMode:    entry.HasMode,
-		Uid:        entry.Uid,
-		Gid:        entry.Gid,
-		HasUID:     entry.HasUID,
-		HasGID:     entry.HasGID,
-		ResourceID: entry.ResourceID,
-		Nlink:      entry.Nlink,
-		ExtentIno:  entry.ExtentIno,
+		Name:              name,
+		Size:              entry.Size,
+		IsDir:             entry.IsDir,
+		Mtime:             mtime,
+		Revision:          entry.Revision,
+		Mode:              entry.Mode,
+		HasMode:           entry.HasMode,
+		Uid:               entry.Uid,
+		Gid:               entry.Gid,
+		HasUID:            entry.HasUID,
+		HasGID:            entry.HasGID,
+		ResourceID:        entry.ResourceID,
+		Nlink:             entry.Nlink,
+		ExtentIno:         entry.ExtentIno,
+		ContentReadDenied: entry.ContentReadDenied,
 	}
 }
 
@@ -6696,6 +6697,8 @@ func (fs *Dat9FS) updateEntryFromStat(entry *InodeEntry, stat *client.StatResult
 	entry.Size = stat.Size
 	entry.IsDir = stat.IsDir
 	fs.inodes.UpdateSize(entry.Ino, stat.Size)
+	fs.inodes.SetContentReadDenied(entry.Ino, false)
+	entry.ContentReadDenied = false
 	if stat.ResourceID != "" || stat.Nlink > 0 {
 		fs.inodes.SetIdentity(entry.Ino, stat.ResourceID, stat.Nlink)
 		entry.ResourceID = stat.ResourceID
@@ -7303,6 +7306,7 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 		// alias dest's FUSE nodeid onto the source path (pjdfstest expected N
 		// got N+2). Stat-path Lookup still reuses by live juicefs identity.
 		ino := fs.inodes.LookupWithIdentity(childP, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
+		fs.inodes.SetContentReadDenied(ino, item.ContentReadDenied)
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
 		}
@@ -7654,6 +7658,17 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 				mtime = time.Unix(matched.Mtime, 0)
 			}
 			ino := fs.inodes.LookupWithIdentity(childP, matched.ResourceID, matched.Nlink, matched.IsDir, matched.Size, mtime)
+			// Stat returned 403 but parent List exposed this entry: it is a
+			// list-only projection. Preserve the denial until Open so Linux
+			// reports EACCES instead of rewriting a READ denial to EIO.
+			fs.inodes.SetContentReadDenied(ino, isForbiddenErr(err))
+			if isForbiddenErr(err) {
+				cachedMatched := cachedFileInfos([]client.FileInfo{matched})
+				if len(cachedMatched) == 1 {
+					cachedMatched[0].ContentReadDenied = true
+					fs.dirCache.Upsert(parentPath, cachedMatched[0])
+				}
+			}
 			if matched.HasMode {
 				fs.inodes.UpdateMode(ino, matched.Mode)
 			}
@@ -7701,6 +7716,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if ino == 0 {
 		ino = fs.inodes.LookupWithIdentity(childP, stat.ResourceID, stat.Nlink, stat.IsDir, stat.Size, mtime)
 	}
+	fs.inodes.SetContentReadDenied(ino, false)
 	// Store server revision for cache validation.
 	if stat.Revision > 0 {
 		fs.inodes.UpdateRevision(ino, stat.Revision)
@@ -11863,9 +11879,22 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 		}
 		for j, result := range results {
 			if !result.OK() {
+				// A delegated list-only scope may enumerate a file while its
+				// per-path read/stat check is denied. Preserve that fact so Open
+				// can return EACCES; Linux rewrites EACCES from FUSE READ to EIO.
+				if result.Status == http.StatusUnauthorized {
+					return fs.resetMountViewOnAuthorizationError(&client.StatusError{
+						StatusCode: result.Status,
+						Message:    result.Error,
+					})
+				}
+				if result.Status == http.StatusForbidden {
+					items[batch[j]].ContentReadDenied = true
+				}
 				continue
 			}
 			item := &items[batch[j]]
+			item.ContentReadDenied = false
 			item.Size = result.Size
 			item.IsDir = result.IsDir
 			if result.Mtime > 0 {
@@ -12214,6 +12243,7 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 			}
 		}
 		ino := fs.inodes.EnsureInodeWithIdentity(childP, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
+		fs.inodes.SetContentReadDenied(ino, item.ContentReadDenied)
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
 		}
@@ -12474,13 +12504,16 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	if st := fs.checkOpenAccess(ctx, input, entry); st != gofuse.OK {
 		return st
 	}
+	accMode := input.Flags & syscall.O_ACCMODE
+	if entry != nil && entry.ContentReadDenied && (accMode == syscall.O_RDONLY || accMode == syscall.O_RDWR) {
+		return gofuse.EACCES
+	}
 	if entry != nil && entry.IsDir {
 		out.Fh = fs.allocateFileHandle(fh)
 		return gofuse.OK
 	}
 
 	// Allocate write buffer for writable opens
-	accMode := input.Flags & syscall.O_ACCMODE
 	if overlay, local, st := fs.localOverlayForPath(ctx, p); local {
 		if st != gofuse.OK {
 			return st
