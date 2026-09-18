@@ -4694,11 +4694,28 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 }
 
 func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
+	return fs.loadWritableHandleFromOpenHandles(fh, false)
+}
+
+// loadWritableHandleFromOpenHandles reloads fh's buffer from another open
+// handle with pending local state for the same path. tryLock selects candidate
+// handles with TryLock instead of blocking: used by the write-path append
+// refresh, where the caller already holds the per-path commit lock and fh.mu,
+// so waiting on a busy sibling's handle lock could stall for the remote
+// commit wait timeout.
+func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool) bool {
 	if fs.openHandles == nil || fh == nil || fh.Dirty == nil {
 		return false
 	}
 	if isSQLitePersistentJournalPath(fh.Path) {
 		return false
+	}
+	lockSrc := func(src *FileHandle) bool {
+		if tryLock {
+			return src.TryLock()
+		}
+		src.Lock()
+		return true
 	}
 
 	type candidate struct {
@@ -4725,7 +4742,9 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 			continue
 		}
 
-		src.Lock()
+		if !lockSrc(src) {
+			continue
+		}
 		if src.Dirty == nil {
 			src.Unlock()
 			continue
@@ -4793,7 +4812,9 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		}
 
 		if !haveData && c.canMemory {
-			c.src.Lock()
+			if !lockSrc(c.src) {
+				continue
+			}
 			if c.src.Dirty != nil {
 				size = c.src.Dirty.Size()
 				c.origSize = c.src.OrigSize
@@ -4852,6 +4873,42 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		return true
 	}
 	return false
+}
+
+// refreshCleanAppendBufferLocked reloads a clean writable handle's buffer from
+// the newest same-path content so an O_APPEND lands at the current end of file
+// instead of a stale snapshot end. Without this, concurrent appendFile-style
+// writers (npm cacache, issue #935) produce divergent whole-file payloads that
+// the commit fence must reject. Sources, in order: another open handle's
+// pending writes, the staged shadow/pending image, the write-back cache; the
+// committed-revision rebind already ran in adoptCommittedRevisionLocked.
+// Callers hold fh.mu; the per-path commit lock is normally held but may be
+// absent on the lock-timeout fallback path. The refresh only uses TryLock on
+// sibling handles and the internally synchronized shadow/pending/write-back
+// stores, so it is safe either way.
+func (fs *Dat9FS) refreshCleanAppendBufferLocked(fh *FileHandle) bool {
+	if fs == nil || fh == nil || fh.Dirty == nil || fh.ShadowSpill {
+		return false
+	}
+	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		return false
+	}
+	if isSQLitePersistentJournalPath(fh.Path) {
+		return false
+	}
+	if fs.loadWritableHandleFromOpenHandles(fh, true) {
+		return true
+	}
+	if fs.pendingIndex != nil && fs.shadowStore != nil {
+		if meta, ok := fs.pendingIndex.GetMeta(fh.Path); ok && fs.shadowStore.Has(fh.Path) {
+			if err := fs.loadWritableHandleFromShadowLocked(fh, meta); err != nil {
+				safeLogPrintf("append shadow refresh failed for %s: %v", fh.Path, err)
+			} else {
+				return true
+			}
+		}
+	}
+	return fs.loadWritableHandleFromWriteBackLocked(fh)
 }
 
 func (fs *Dat9FS) hasOpenPendingSQLitePersistentJournalCreate(path string, skip *FileHandle) bool {
@@ -13662,6 +13719,12 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	if fh.Dirty == nil {
 		source = "new-dirty-buffer"
 		fh.Dirty = fs.newWriteBuffer(fh.Path, 0, 0)
+	}
+	// POSIX append must land at the current end of file. A still-clean buffer
+	// may predate same-path writes staged by other handles, so refresh it from
+	// the newest source before resolving the append offset (issue #935).
+	if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+		fs.refreshCleanAppendBufferLocked(fh)
 	}
 	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
 	writeSyncAppendLogState := appendLogHandleState{}

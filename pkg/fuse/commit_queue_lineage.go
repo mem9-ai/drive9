@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -235,10 +236,13 @@ func (cq *CommitQueue) landedCommit(path string) pathCommitLandmark {
 	return landmark
 }
 
-// maybeRebaseGrownPayloadOntoWatermark detects issue #896: a later same-path
-// mutation grew the file after this queue already landed a smaller snapshot.
-// Those bytes are newer than the watermark, so CAS should overwrite that
-// revision instead of being fenced as a stale #876 checkpoint snapshot.
+// maybeRebaseGrownPayloadOntoWatermark detects a causal same-path descendant
+// of an image this queue already landed. Issue #896: a later mutation grew the
+// file after the queue landed a smaller snapshot. Issue #935: rapid rewrites
+// staged a later snapshot while the dirty handle kept its original base rev,
+// so the payload base now predates the landed revision. In both cases the
+// bytes are newer than the watermark, so CAS should overwrite that revision
+// instead of being fenced as a stale #876 checkpoint snapshot.
 func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(ctx context.Context, entry *CommitEntry, watermark int64) bool {
 	if cq == nil || entry == nil || watermark <= 0 {
 		return false
@@ -248,14 +252,64 @@ func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(ctx context.Context,
 		return false
 	}
 	landed := cq.landedCommit(entry.Path)
-	if landed.rev != watermark || !entryCanRebaseOntoLandedParent(entry, landed) {
+	if landed.rev != watermark {
 		return false
 	}
-	rev, size, body, err := cq.readRemoteSnapshot(ctx, entry.Path)
-	if err != nil {
+	if entryCanRebaseOntoLandedParent(entry, landed) {
+		rev, size, body, err := cq.readRemoteSnapshot(ctx, entry.Path)
+		if err != nil {
+			return false
+		}
+		return cq.maybeRebaseGrownPayloadAgainstRemote(entry, rev, size, body)
+	}
+	// Issue #935: rapid same-path appends (npm cacache appendFile) leave the
+	// entry with a stale payload base but a payload that strictly extends the
+	// current remote content. Uploading such a payload preserves every remote
+	// byte and appends, so it is safe without a lineage proof. The watermark
+	// must have come from a queue commit of this path (landed.rev == watermark)
+	// so the remote read below is meaningful and fenced entries whose watermark
+	// came from other paths perform no remote I/O.
+	return cq.maybeRebaseAppendExtension(ctx, entry, watermark)
+}
+
+// maybeRebaseAppendExtension authorizes a rebase when the entry's staged
+// payload contains the current remote content as a strict prefix. The upload
+// then cannot roll back any remote byte; it only appends. Divergent rewrites —
+// including stale SQLite checkpoint images — fail the prefix check and keep
+// the terminal fence. The comparison is bounded like the landed identity proof
+// so remote reads and shadow loads cannot grow past maxLandedPayloadBytes.
+func (cq *CommitQueue) maybeRebaseAppendExtension(ctx context.Context, entry *CommitEntry, watermark int64) bool {
+	if cq == nil || entry == nil || entry.recovered || cq.shadows == nil || cq.client == nil {
 		return false
 	}
-	return cq.maybeRebaseGrownPayloadAgainstRemote(entry, rev, size, body)
+	// ShadowSpill payloads stream from disk; refuse to load them into memory
+	// for the byte-level prefix proof.
+	if entry.Kind != PendingOverwrite || entry.ShadowSpill {
+		return false
+	}
+	if entry.ShadowGen == 0 || entry.Size <= 0 || entry.Size > maxLandedPayloadBytes {
+		return false
+	}
+	localData, err := cq.shadows.ReadAllIfGeneration(entry.Path, entry.ShadowGen)
+	if err != nil || int64(len(localData)) != entry.Size {
+		return false
+	}
+	rev, _, remoteData, err := cq.readRemoteSnapshot(ctx, entry.Path)
+	if err != nil || rev != watermark {
+		return false
+	}
+	if len(localData) <= len(remoteData) || !bytes.HasPrefix(localData, remoteData) {
+		return false
+	}
+	entry.BaseRev = rev
+	if entry.DurableWatermarkRev < rev {
+		entry.DurableWatermarkRev = rev
+	}
+	entry.DisableAutoResolveLWW = true
+	entry.growthRebaseRev = rev
+	entry.growthRebaseParentSnapshotID = entry.ParentSnapshotID
+	safeLogPrintf("commit queue: rebasing append extension for %s onto rev %d (%d -> %d bytes)", entry.Path, rev, len(remoteData), len(localData))
+	return true
 }
 
 func (cq *CommitQueue) readRemoteSnapshot(parent context.Context, path string) (rev, size int64, body []byte, err error) {
@@ -295,9 +349,11 @@ func landedIdentityMatches(proof pathCommitLandmark, serverRev, serverSize int64
 	return payloadChecksum(serverBody) == proof.checksum
 }
 
-// maybeRebaseGrownPayloadAgainstRemote authorizes the #896 growth rebase only
-// when the remote image still matches the in-memory landed parent (SHA-256
-// of a payload no larger than maxLandedPayloadBytes).
+// maybeRebaseGrownPayloadAgainstRemote authorizes the #896/#935 descendant
+// rebase only when the remote image still matches the in-memory landed parent
+// (SHA-256 of a payload no larger than maxLandedPayloadBytes). If any other
+// writer changed the revision since, the proof is invalid and the entry stays
+// fenced.
 func (cq *CommitQueue) maybeRebaseGrownPayloadAgainstRemote(entry *CommitEntry, serverRev, serverSize int64, serverBody []byte) bool {
 	proof := cq.landedCommit(entry.Path)
 	if !entryCanRebaseOntoLandedParent(entry, proof) || !landedIdentityMatches(proof, serverRev, serverSize, serverBody) {
@@ -306,21 +362,50 @@ func (cq *CommitQueue) maybeRebaseGrownPayloadAgainstRemote(entry *CommitEntry, 
 	return cq.authorizeGrownPayloadRebase(entry, proof)
 }
 
+// entryCanRebaseOntoLandedParent reports whether entry is an exact causal
+// descendant of the image this queue landed, so overwriting that revision is
+// not a silent rollback. Two shapes qualify:
+//
+//   - #896 growth: a base-zero PendingNew create whose direct parent snapshot
+//     is the landed image and whose payload grew.
+//   - #935 superseded rewrite: a later PendingOverwrite whose payload base
+//     predates the landed revision because the dirty handle kept its original
+//     base rev while the queue landed its direct parent snapshot. npm/npx
+//     rewrites small _cacache index files this way.
+//
+// Both rely on a process-local direct-parent proof; recovery loses it and
+// fails closed.
 func entryCanRebaseOntoLandedParent(entry *CommitEntry, proof pathCommitLandmark) bool {
-	if entry == nil || entry.Kind != PendingNew || entry.BaseRev != 0 ||
-		!entry.PayloadBaseRevSet || entry.PayloadBaseRev != 0 ||
-		!entry.liveLineageProof || entry.SnapshotID == "" ||
+	if entry == nil || !entry.liveLineageProof || entry.SnapshotID == "" ||
 		entry.ParentSnapshotID == "" || proof.snapshotID == "" {
 		return false
 	}
 	if entry.recovered {
 		return false
 	}
-	return entry.ParentSnapshotID == proof.snapshotID
+	if entry.ParentSnapshotID != proof.snapshotID {
+		return false
+	}
+	if entry.Kind == PendingNew && entry.BaseRev == 0 &&
+		entry.PayloadBaseRevSet && entry.PayloadBaseRev == 0 {
+		return true
+	}
+	if entry.Kind == PendingOverwrite && entry.BaseRev > 0 &&
+		entry.PayloadBaseRevSet && entry.PayloadBaseRev > 0 {
+		return true
+	}
+	return false
 }
 
 func (cq *CommitQueue) authorizeGrownPayloadRebase(entry *CommitEntry, proof pathCommitLandmark) bool {
-	if cq == nil || !entryCanRebaseOntoLandedParent(entry, proof) || proof.rev <= 0 || entry.Size <= proof.size {
+	if cq == nil || !entryCanRebaseOntoLandedParent(entry, proof) || proof.rev <= 0 {
+		return false
+	}
+	// A #896 growth must be strictly larger than the landed image. A #935
+	// superseded rewrite may be any size (npm rewrites can shrink or grow):
+	// the direct-parent lineage proof, not the size delta, is what makes
+	// overwriting the landed revision safe.
+	if entry.Kind == PendingNew && entry.Size <= proof.size {
 		return false
 	}
 	entry.BaseRev = proof.rev
@@ -331,7 +416,7 @@ func (cq *CommitQueue) authorizeGrownPayloadRebase(entry *CommitEntry, proof pat
 	entry.DisableAutoResolveLWW = true
 	entry.growthRebaseRev = proof.rev
 	entry.growthRebaseParentSnapshotID = entry.ParentSnapshotID
-	safeLogPrintf("commit queue: rebasing direct-child grown payload for %s onto rev %d (size %d -> %d)", entry.Path, proof.rev, proof.size, entry.Size)
+	safeLogPrintf("commit queue: rebasing direct-child payload for %s onto rev %d (size %d -> %d)", entry.Path, proof.rev, proof.size, entry.Size)
 	return true
 }
 

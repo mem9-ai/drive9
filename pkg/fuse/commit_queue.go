@@ -88,10 +88,11 @@ type CommitEntry struct {
 	// terminal. Re-basing old bytes with a new BaseRev is exactly the silent
 	// rollback class this fence prevents.
 	DisableAutoResolveLWW bool
-	// growthRebaseRev records a one-shot authorization to pair a base-zero
-	// PendingNew payload with the revision of its directly landed parent.
-	// PayloadBaseRev intentionally remains unchanged for auditability, so
-	// repeated validation must consult this state instead of re-authorizing.
+	// growthRebaseRev records a one-shot authorization to pair a direct-child
+	// payload (#896 base-zero growth, #935 lineage or append-extension
+	// rewrite) with the revision it is safe to overwrite. PayloadBaseRev
+	// intentionally remains unchanged for auditability, so repeated
+	// validation must consult this state instead of re-authorizing.
 	growthRebaseRev              int64
 	growthRebaseParentSnapshotID string
 	recovered                    bool
@@ -1911,10 +1912,9 @@ func (cq *CommitQueue) validateEntryPayloadFreshCtx(ctx context.Context, entry *
 	if watermark > 0 && payloadBaseRev >= 0 && payloadBaseRev < watermark {
 		if entry.growthRebaseRev > 0 {
 			if entry.growthRebaseRev != watermark || entry.BaseRev != watermark ||
-				entry.growthRebaseParentSnapshotID == "" ||
 				entry.growthRebaseParentSnapshotID != entry.ParentSnapshotID {
 				entry.DisableAutoResolveLWW = true
-				return fmt.Errorf("%w: %s growth rebase was authorized at rev %d but durable watermark is rev %d",
+				return fmt.Errorf("%w: %s direct-child rebase was authorized at rev %d but durable watermark is rev %d",
 					errCommitPayloadStale, entry.Path, entry.growthRebaseRev, watermark)
 			}
 		} else if cq.maybeRebaseGrownPayloadOntoWatermark(ctx, entry, watermark) {
@@ -2597,6 +2597,42 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	if bytes.Equal(localData, serverData) {
 		safeLogPrintf("commit queue: auto-resolved conflict for %s (idempotent, content matches server rev %d)", entry.Path, serverRev)
 		cq.finishIdempotentCommit(entryCtx, entry, serverRev)
+		return
+	}
+
+	// Branch 1b: monotonic append extension — the local payload preserves every
+	// server byte and appends (npm cacache appendFile pattern, issue #935).
+	// Unlike a blind LWW rebase this cannot roll back any remote byte, so it
+	// applies even to fenced entries. Recovered entries stay fail-closed: after
+	// restart the shadow bytes are not provably the ones the metadata described.
+	if !entry.recovered && len(localData) > len(serverData) && bytes.HasPrefix(localData, serverData) {
+		safeLogPrintf("commit queue: auto-resolving conflict for %s via append extension (server rev %d, %d -> %d bytes)", entry.Path, serverRev, len(serverData), len(localData))
+		uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(int64(len(localData))))
+		if !ok {
+			cq.removeFromQueue(entry)
+			safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled before append extension upload)", entry.Path)
+			return
+		}
+		uploadStart := time.Now()
+		err = uploadBufferedRemoteFile(uploadCtx, cq.client, apiPath, localData, serverRev)
+		uploadCancel()
+		if cq.perf != nil {
+			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(uploadStart), uint64(len(localData)))
+		}
+		if err != nil {
+			safeLogPrintf("commit queue: append extension re-upload failed for %s: %v", entry.Path, err)
+			cq.finishResolveFailure(entryCtx, entry, err)
+			return
+		}
+		if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
+			cq.removeFromQueue(entry)
+			safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled during append extension upload)", entry.Path)
+			return
+		}
+		safeLogPrintf("commit queue: auto-resolved conflict for %s via append extension (overwrote rev %d)", entry.Path, serverRev)
+		if err := cq.onCommitSuccess(entry, serverRev, 0); err != nil {
+			cq.onCommitPostUploadFailure(entry, err)
+		}
 		return
 	}
 
