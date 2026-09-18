@@ -5467,6 +5467,108 @@ func TestRename_Directory_MigratesPendingDescendants(t *testing.T) {
 	}
 }
 
+// TestRename_Directory_WaitsForInflightDescendantUpload verifies that a
+// directory rename waits for an in-flight background upload of a descendant
+// before issuing the server-side rename. Regression test for issue #934:
+// without the uploader prefix-scoped wait, the server-side directory rename
+// runs while a child PUT is still in flight, and the child lands on the stale
+// (pre-rename) path — silently losing the file from the renamed tree.
+func TestRename_Directory_WaitsForInflightDescendantUpload(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		events       []string
+		record       = func(e string) { mu.Lock(); events = append(events, e); mu.Unlock() }
+		putEntered   = make(chan struct{})
+		allowPutResp = make(chan struct{})
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPost:
+			// Server-side rename.
+			record("post")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			_, _ = io.ReadAll(r.Body)
+			close(putEntered)
+			<-allowPutResp
+			record("put")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := newTestClient(ts.URL)
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	fs.SetWriteBack(cache, uploader)
+
+	fs.inodes.Lookup("/olddir", true, 0, time.Time{})
+	fs.inodes.Lookup("/newdir", true, 0, time.Time{})
+
+	// Stage a descendant and start its background upload.
+	_ = cache.Put("/olddir/file1.txt", []byte("d1"), 2, PendingNew)
+	uploader.Submit("/olddir/file1.txt")
+
+	// Wait until the PUT request is received (upload is in flight).
+	select {
+	case <-putEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for descendant upload to start")
+	}
+
+	renameDone := make(chan gofuse.Status, 1)
+	go func() {
+		renameDone <- fs.Rename(nil, &gofuse.RenameIn{
+			InHeader: gofuse.InHeader{NodeId: 1},
+			Newdir:   1,
+		}, "olddir", "newdir")
+	}()
+
+	// The rename must block while the descendant upload is in flight: the
+	// server-side rename (POST) must not be issued before the PUT completes.
+	select {
+	case st := <-renameDone:
+		t.Fatalf("Rename returned %v before the in-flight descendant upload completed", st)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Release the upload so it completes against the old (pre-rename) path.
+	close(allowPutResp)
+
+	select {
+	case st := <-renameDone:
+		if st != gofuse.OK {
+			t.Fatalf("Rename: %v", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Rename did not complete after upload released")
+	}
+
+	uploader.DrainAll()
+
+	mu.Lock()
+	got := append([]string(nil), events...)
+	mu.Unlock()
+	// The descendant PUT must complete before the server-side directory
+	// rename, so the file is uploaded to the old path and then moved by the
+	// server. The reverse order means the PUT targeted a stale path.
+	want := []string{"put", "post"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("upload/rename event order = %v, want %v", got, want)
+	}
+}
+
 // TestFlush_SkipsRedundantCacheWrite verifies that Flush does not re-write
 // the write-back cache when no new writes have occurred since the last Flush.
 func TestFlush_SkipsRedundantCacheWrite(t *testing.T) {

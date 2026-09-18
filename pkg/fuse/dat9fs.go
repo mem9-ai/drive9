@@ -11253,6 +11253,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		// background worker from PUT-ing to oldP after we rename away from it.
 		fs.uploader.WaitPath(oldP)
 		fs.uploader.WaitPath(newP)
+		// Also wait for in-flight uploads of descendants under oldP. Without
+		// this a background PUT for a child could complete against the stale
+		// (pre-rename) path after the server-side directory rename below has
+		// already moved the subtree, silently losing the child's data.
+		fs.uploader.WaitPrefix(oldP + "/")
 
 		// Fast path (vim :w): if oldP is a pending-new file (created locally,
 		// never existed on the server), rename it locally. The background
@@ -11326,6 +11331,13 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	// After server-side rename, migrate pending descendants.
 	// If oldP is a directory, pending children under oldP+"/", must be
 	// re-keyed to newP+"/". Without this the uploader would PUT to stale paths.
+	//
+	// Retarget open handles BEFORE the migration: a concurrent Flush that has
+	// not yet captured fh.Path will then stage under the NEW path (needing no
+	// migration), while a Flush that already staged under the OLD path is
+	// caught by the migration below. finishLocalRename retargets again, but
+	// that call is a no-op once the handles are already under newP.
+	fs.retargetOpenHandlesForRename(oldP, newP)
 	prefix := oldP + "/"
 	if fs.writeBack != nil {
 		for _, meta := range fs.writeBack.ListByPrefix(prefix) {
@@ -11333,7 +11345,14 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 			if fs.uploader != nil {
 				fs.uploader.WaitPath(meta.Path)
 			}
-			fs.writeBack.RenamePending(meta.Path, newChild)
+			if !fs.writeBack.RenamePending(meta.Path, newChild) {
+				// The entry vanished (committed by a racing upload) or the
+				// rename failed. Either way the data is not lost: it is still
+				// reachable under the old path and will surface as a stale
+				// upload rather than being silently dropped. Log loudly.
+				safeLogPrintf("rename: migrate pending writeback child %s -> %s failed", meta.Path, newChild)
+				continue
+			}
 			if fs.uploader != nil {
 				fs.uploader.Submit(newChild)
 			}

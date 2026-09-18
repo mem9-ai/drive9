@@ -196,6 +196,69 @@ func TestPendingIndexListByPrefix(t *testing.T) {
 	}
 }
 
+// TestPendingIndexListByPrefixWaitsInflightPut verifies that ListByPrefix waits
+// for in-flight per-path operations under the prefix before scanning, so the
+// rename mutation path does not miss a descendant whose pending metadata is
+// being published concurrently (issue #934: silent data loss on directory
+// rename of a tree still in the write pipeline).
+func TestPendingIndexListByPrefixWaitsInflightPut(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const prefix = "/dir/"
+	const childPath = "/dir/child.txt"
+
+	_, _ = idx.Put(childPath, 4, PendingNew)
+
+	// Simulate an in-flight Put on a second child by holding its pathLock.
+	const inflightPath = "/dir/inflight.txt"
+	pl := idx.acquirePathLock(inflightPath)
+
+	done := make(chan []*WriteBackMeta)
+	go func() {
+		done <- idx.ListByPrefix(prefix)
+	}()
+
+	// Give the goroutine time to start and block.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("ListByPrefix should block while pathLock under prefix is held")
+	default:
+		// Expected: ListByPrefix is blocked.
+	}
+
+	// Publish the in-flight entry, then release the pathLock.
+	idx.mu.Lock()
+	idx.items[inflightPath] = &WriteBackMeta{
+		Path:       inflightPath,
+		Size:       5,
+		Kind:       PendingNew,
+		Generation: idx.nextGen.Add(1),
+	}
+	idx.mu.Unlock()
+	idx.releasePathLock(inflightPath, pl)
+
+	select {
+	case result := <-done:
+		if len(result) != 2 {
+			t.Fatalf("ListByPrefix returned %d entries, want 2", len(result))
+		}
+		paths := map[string]bool{}
+		for _, m := range result {
+			paths[m.Path] = true
+		}
+		if !paths[childPath] || !paths[inflightPath] {
+			t.Fatalf("ListByPrefix missing expected paths: got %v", paths)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ListByPrefix did not unblock after pathLock release")
+	}
+}
+
 func TestPendingIndexCount(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := NewPendingIndex(dir)
