@@ -374,6 +374,78 @@ func TestCommitQueueAutoResolveAppendExtension(t *testing.T) {
 	}
 }
 
+// TestCommitQueueAppendExtensionFailsClosedAbovePayloadBound pins the memory
+// bound of the byte-level prefix proof: a prefix-extension payload above
+// maxLandedPayloadBytes must keep the terminal fence (no shadow load, no
+// remote read, no upload), so the proof cannot grow unbounded.
+func TestCommitQueueAppendExtensionFailsClosedAbovePayloadBound(t *testing.T) {
+	const path = "/_cacache/index-v5/ab/cd/large-extend"
+	first := bytes.Repeat([]byte("a"), 4096)
+	big := append(append([]byte(nil), first...), bytes.Repeat([]byte("b"), maxLandedPayloadBytes)...)
+
+	server, ts := newCASFileServer(t, path, 1, first)
+	defer ts.Close()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	var watermark atomic.Int64
+	watermark.Store(1)
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
+
+	if err := shadow.WriteFull(path, first, 1); err != nil {
+		t.Fatal(err)
+	}
+	shadowGen := shadow.ActiveGeneration(path)
+	pendingGen, err := pending.PutWithBaseRev(path, int64(len(first)), PendingOverwrite, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.CommitNow(context.Background(), &CommitEntry{
+		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
+		Size: int64(len(first)), Kind: PendingOverwrite,
+		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+		SnapshotID: "snap-first", liveLineageProof: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := shadow.WriteFull(path, big, 1); err != nil {
+		t.Fatal(err)
+	}
+	shadowGen = shadow.ActiveGeneration(path)
+	pendingGen, err = pending.PutWithBaseRev(path, int64(len(big)), PendingOverwrite, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
+		Size: int64(len(big)), Kind: PendingOverwrite,
+		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if rev, body, puts := server.snapshot(); rev != 2 || !bytes.Equal(body, first) || len(puts) != 1 {
+		t.Fatalf("after oversized append rev=%d body-len=%d puts=%d, want untouched rev2", rev, len(body), len(puts))
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok || meta.Kind != PendingConflict {
+		t.Fatalf("pending meta = %+v ok=%t, want preserved PendingConflict above the proof bound", meta, ok)
+	}
+}
+
 // TestConsecutiveStagedShadowSnapshotsFormDirectParentChain pins the
 // process-local staging lineage that lets CommitQueue rebase a rapid same-path
 // rewrite (#935): after a dirty handle stages twice, the second snapshot must

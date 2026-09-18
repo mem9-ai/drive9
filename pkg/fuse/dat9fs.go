@@ -4882,7 +4882,10 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 // the commit fence must reject. Sources, in order: another open handle's
 // pending writes, the staged shadow/pending image, the write-back cache; the
 // committed-revision rebind already ran in adoptCommittedRevisionLocked.
-// Callers hold fh.mu and the per-path commit lock.
+// Callers hold fh.mu; the per-path commit lock is normally held but may be
+// absent on the lock-timeout fallback path. The refresh only uses TryLock on
+// sibling handles and the internally synchronized shadow/pending/write-back
+// stores, so it is safe either way.
 func (fs *Dat9FS) refreshCleanAppendBufferLocked(fh *FileHandle) bool {
 	if fs == nil || fh == nil || fh.Dirty == nil || fh.ShadowSpill {
 		return false
