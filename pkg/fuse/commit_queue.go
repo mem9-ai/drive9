@@ -88,10 +88,11 @@ type CommitEntry struct {
 	// terminal. Re-basing old bytes with a new BaseRev is exactly the silent
 	// rollback class this fence prevents.
 	DisableAutoResolveLWW bool
-	// growthRebaseRev records a one-shot authorization to pair a base-zero
-	// PendingNew payload with the revision of its directly landed parent.
-	// PayloadBaseRev intentionally remains unchanged for auditability, so
-	// repeated validation must consult this state instead of re-authorizing.
+	// growthRebaseRev records a one-shot authorization to pair a direct-child
+	// payload (#896 base-zero growth or #935 superseded rewrite) with the
+	// revision of its directly landed parent. PayloadBaseRev intentionally
+	// remains unchanged for auditability, so repeated validation must consult
+	// this state instead of re-authorizing.
 	growthRebaseRev              int64
 	growthRebaseParentSnapshotID string
 	recovered                    bool
@@ -1914,7 +1915,7 @@ func (cq *CommitQueue) validateEntryPayloadFreshCtx(ctx context.Context, entry *
 				entry.growthRebaseParentSnapshotID == "" ||
 				entry.growthRebaseParentSnapshotID != entry.ParentSnapshotID {
 				entry.DisableAutoResolveLWW = true
-				return fmt.Errorf("%w: %s growth rebase was authorized at rev %d but durable watermark is rev %d",
+				return fmt.Errorf("%w: %s direct-child rebase was authorized at rev %d but durable watermark is rev %d",
 					errCommitPayloadStale, entry.Path, entry.growthRebaseRev, watermark)
 			}
 		} else if cq.maybeRebaseGrownPayloadOntoWatermark(ctx, entry, watermark) {
