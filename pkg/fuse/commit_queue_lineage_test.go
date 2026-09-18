@@ -83,6 +83,153 @@ func TestCommitQueueRebasesGrownPayloadAfterSmallerSamePathCommit(t *testing.T) 
 	}
 }
 
+// TestCommitQueueRebasesSupersededRewriteOntoLandedParent reproduces issue
+// #935: rapid same-path rewrites (npm/npx _cacache index files) leave the
+// second entry with a payload base revision that predates the revision the
+// queue just landed for its direct parent snapshot. The bytes are a causal
+// descendant of that landed image, so the entry must rebase onto it instead of
+// failing as a terminal conflict that blocks mount drain forever.
+func TestCommitQueueRebasesSupersededRewriteOntoLandedParent(t *testing.T) {
+	const path = "/_cacache/index-v5/ab/cd/rewrite"
+	const firstSnapshot = "rewrite-snapshot-1"
+	const secondSnapshot = "rewrite-snapshot-2"
+	first := []byte("index entry v1")
+	second := []byte("index entry v2 rewritten in place, possibly smaller")
+
+	server, ts := newCASFileServer(t, path, 1, first)
+	defer ts.Close()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	var watermark atomic.Int64
+	watermark.Store(1)
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
+
+	stage := func(payload []byte, baseRev int64, snapshotID, parentSnapshotID string) (uint64, uint64) {
+		t.Helper()
+		if err := shadow.WriteFull(path, payload, baseRev); err != nil {
+			t.Fatal(err)
+		}
+		shadowGen := shadow.ActiveGeneration(path)
+		pendingGen, err := pending.PutWithBaseRevAndModeAndLineage(path, int64(len(payload)), PendingOverwrite, baseRev, 0, false, snapshotID, parentSnapshotID, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return shadowGen, pendingGen
+	}
+
+	// First rewrite commits against the existing rev 1.
+	shadowGen, pendingGen := stage(first, 1, firstSnapshot, "")
+	if err := cq.CommitNow(context.Background(), &CommitEntry{
+		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
+		Size: int64(len(first)), Kind: PendingOverwrite,
+		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+		SnapshotID: firstSnapshot, liveLineageProof: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rev, body, _ := server.snapshot(); rev != 2 || !bytes.Equal(body, first) {
+		t.Fatalf("after first rewrite rev=%d body=%q, want rev2 first bytes", rev, body)
+	}
+
+	// Rapid second rewrite is staged from a dirty handle that still carries
+	// base rev 1, so its payload base predates the landed rev 2. Its snapshot
+	// is the exact direct child of the image the queue just landed.
+	shadowGen, pendingGen = stage(second, 1, secondSnapshot, firstSnapshot)
+	if err := cq.CommitNow(context.Background(), &CommitEntry{
+		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
+		Size: int64(len(second)), Kind: PendingOverwrite,
+		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+		SnapshotID: secondSnapshot, ParentSnapshotID: firstSnapshot,
+		liveLineageProof: true,
+	}); err != nil {
+		t.Fatalf("superseded rewrite err = %v, want rebase onto landed parent", err)
+	}
+	rev, body, puts := server.snapshot()
+	if rev != 3 || !bytes.Equal(body, second) {
+		t.Fatalf("after superseded rewrite rev=%d body=%q, want rev3 second bytes", rev, body)
+	}
+	if len(puts) != 2 || !bytes.Equal(puts[1].body, second) || puts[1].expected != "2" {
+		t.Fatalf("PUT history = %+v, want second PUT expected rev2 with second bytes", puts)
+	}
+	if conflicts, _, _ := pending.ConflictSummary(); conflicts != 0 {
+		t.Fatalf("pending conflicts = %d, want 0 after rebase", conflicts)
+	}
+}
+
+// TestConsecutiveStagedShadowSnapshotsFormDirectParentChain pins the
+// process-local staging lineage that lets CommitQueue rebase a rapid same-path
+// rewrite (#935): after a dirty handle stages twice, the second snapshot must
+// name the first as its exact direct parent and carry trusted lineage.
+func TestConsecutiveStagedShadowSnapshotsFormDirectParentChain(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const path = "/_cacache/index-v5/ab/cd/chain"
+	ino := fs.inodes.Lookup(path, false, 0, time.Now())
+	fh := &FileHandle{
+		Ino:            ino,
+		Path:           path,
+		Dirty:          fs.newWriteBuffer(path, maxPreloadSize, 0),
+		IsNew:          true,
+		WritePolicy:    WritePolicyWriteBack,
+		LineageTrusted: true,
+	}
+	fs.openHandles.Add(fh)
+
+	stage := func(payload []byte) (snapshot, parent string, trust bool) {
+		t.Helper()
+		fh.Lock()
+		defer fh.Unlock()
+		if _, err := fh.Dirty.Write(0, payload); err != nil {
+			t.Fatal(err)
+		}
+		fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+		if err := fs.stageShadowLocked(fh, true); err != nil {
+			t.Fatal(err)
+		}
+		return fh.StagedSnapshotID, fh.StagedParentSnapshotID, fh.StagedLineageTrusted
+	}
+
+	snap1, parent1, trust1 := stage([]byte("first rewrite"))
+	if snap1 == "" || !trust1 {
+		t.Fatalf("first stage snapshot/trusted = %q/%t, want a trusted snapshot", snap1, trust1)
+	}
+	if parent1 != "" {
+		t.Fatalf("first stage parent = %q, want empty root", parent1)
+	}
+	snap2, parent2, trust2 := stage([]byte("second rapid rewrite that grows"))
+	if snap2 == "" || snap2 == snap1 || !trust2 {
+		t.Fatalf("second stage snapshot/trusted = %q/%t, want a new trusted snapshot", snap2, trust2)
+	}
+	if parent2 != snap1 {
+		t.Fatalf("second stage parent = %q, want direct parent %q", parent2, snap1)
+	}
+}
+
 func TestCommitQueueLandedProofUsesUploadedPayloadAfterShadowReplacement(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
