@@ -11150,6 +11150,68 @@ func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
 	}
 }
 
+// renameLocalOverlaySubtree moves a local-overlay subtree from oldP to newP.
+//
+// A directory can be remote-classified while still containing local-only
+// descendants: the coding-agent profile routes "**/dist/**",
+// "**/node_modules/**" and similar paths to the local overlay, so a remotely
+// created staging directory can hold a local-only build tree. The layer
+// classification of the directory itself does not describe its children, so a
+// remote rename must move the overlay subtree independently instead of
+// leaving those files orphaned at the stale path.
+//
+// Missing or empty overlay directories are a no-op: the overlay root contains
+// implicit parent directories created for local files, and moving an empty
+// directory is pointless.
+func (fs *Dat9FS) renameLocalOverlaySubtree(oldP, newP string) error {
+	if fs == nil || fs.localOverlay == nil {
+		return nil
+	}
+	// POSIX forbids renaming a directory into its own subtree, and the target
+	// replacement below would otherwise delete part of the source tree. The
+	// kernel and renamePreflight reject these shapes before this point, but
+	// guard anyway so a layered edge case can never destroy source data.
+	if strings.HasPrefix(newP, oldP+"/") || strings.HasPrefix(oldP, newP+"/") {
+		return nil
+	}
+	info, err := fs.localOverlay.Lstat(oldP)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	entries, err := fs.localOverlay.ReadDir(oldP)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	// Replace semantics, matching the server-side rename: drop any local-only
+	// content already present at the target. Without this os.Rename fails with
+	// ENOTEMPTY after the remote rename already succeeded, leaving the source
+	// subtree orphaned and the caller with an unretryable partial rename.
+	if _, err := fs.localOverlay.Lstat(newP); err == nil {
+		if err := fs.localOverlay.RemoveAll(newP); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := fs.localOverlay.Rename(oldP, newP); err != nil {
+		return err
+	}
+	fs.scheduleGitStateCheckpoint(newP)
+	return nil
+}
+
 func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseRename, perfStart, status, 0) }()
@@ -11253,6 +11315,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		// background worker from PUT-ing to oldP after we rename away from it.
 		fs.uploader.WaitPath(oldP)
 		fs.uploader.WaitPath(newP)
+		// Also wait for in-flight uploads of descendants under oldP. Without
+		// this a background PUT for a child could complete against the stale
+		// (pre-rename) path after the server-side directory rename below has
+		// already moved the subtree, silently losing the child's data.
+		fs.uploader.WaitPrefix(oldP + "/")
 
 		// Fast path (vim :w): if oldP is a pending-new file (created locally,
 		// never existed on the server), rename it locally. The background
@@ -11323,9 +11390,24 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 
+	// A remote-classified directory can still contain local-only children
+	// (coding-agent local patterns). Move the overlay subtree with the
+	// server-side rename so those files do not stay orphaned at the stale path.
+	if err := fs.renameLocalOverlaySubtree(oldP, newP); err != nil {
+		safeLogPrintf("rename: migrate local overlay subtree %s -> %s failed: %v", oldP, newP, err)
+		return localErrToFuseStatus(err)
+	}
+
 	// After server-side rename, migrate pending descendants.
 	// If oldP is a directory, pending children under oldP+"/", must be
 	// re-keyed to newP+"/". Without this the uploader would PUT to stale paths.
+	//
+	// Retarget open handles BEFORE the migration: a concurrent Flush that has
+	// not yet captured fh.Path will then stage under the NEW path (needing no
+	// migration), while a Flush that already staged under the OLD path is
+	// caught by the migration below. finishLocalRename retargets again, but
+	// that call is a no-op once the handles are already under newP.
+	fs.retargetOpenHandlesForRename(oldP, newP)
 	prefix := oldP + "/"
 	if fs.writeBack != nil {
 		for _, meta := range fs.writeBack.ListByPrefix(prefix) {
@@ -11333,7 +11415,14 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 			if fs.uploader != nil {
 				fs.uploader.WaitPath(meta.Path)
 			}
-			fs.writeBack.RenamePending(meta.Path, newChild)
+			if !fs.writeBack.RenamePending(meta.Path, newChild) {
+				// The entry vanished (committed by a racing upload) or the
+				// rename failed. Either way the data is not lost: it is still
+				// reachable under the old path and will surface as a stale
+				// upload rather than being silently dropped. Log loudly.
+				safeLogPrintf("rename: migrate pending writeback child %s -> %s failed", meta.Path, newChild)
+				continue
+			}
 			if fs.uploader != nil {
 				fs.uploader.Submit(newChild)
 			}

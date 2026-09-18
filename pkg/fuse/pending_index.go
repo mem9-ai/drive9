@@ -477,7 +477,31 @@ func (idx *PendingIndex) ConflictSummary() (count int, bytes int64, firstPath st
 }
 
 // ListByPrefix returns metadata for all paths with the given prefix.
+// It first waits for any in-flight per-path operations (Put, Remove, etc.)
+// under the prefix to complete, mirroring WriteBackCache.ListByPrefix, so
+// callers in mutation paths (rmdir, rename) see a consistent snapshot that
+// includes entries currently being staged. Without this a concurrent Flush
+// that publishes a descendant's pending metadata just after the scan leaves
+// the entry at the stale pre-rename path.
 func (idx *PendingIndex) ListByPrefix(prefix string) []*WriteBackMeta {
+	// Collect paths with in-flight operations under prefix.
+	idx.mu.Lock()
+	var inflightPaths []string
+	for p := range idx.pathLocks {
+		if strings.HasPrefix(p, prefix) {
+			inflightPaths = append(inflightPaths, p)
+		}
+	}
+	idx.mu.Unlock()
+
+	// Wait for each in-flight operation to finish by acquiring and immediately
+	// releasing its per-path lock. This guarantees the operation has completed
+	// and published its results to idx.items before we scan.
+	for _, p := range inflightPaths {
+		pl := idx.acquirePathLock(p)
+		idx.releasePathLock(p, pl)
+	}
+
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -257,6 +258,31 @@ func (u *WriteBackUploader) WaitPath(localPath string) {
 	u.inflightMu.Unlock()
 	if ok {
 		<-ps.done
+	}
+}
+
+// WaitPrefix blocks until all in-flight uploads for paths under the given
+// prefix complete. Rename uses this before a server-side directory rename so
+// a background PUT for a descendant cannot land on a stale (pre-rename) path
+// after the directory has already moved. Queued-but-not-yet-dispatched
+// uploads are not tracked here: the rename's descendant migration re-keys the
+// writeBack cache entries before those workers read them, so a queued upload
+// for an old path becomes a no-op instead of PUT-ing to a stale path.
+func (u *WriteBackUploader) WaitPrefix(prefix string) {
+	for {
+		u.inflightMu.Lock()
+		found := false
+		for p := range u.inflight {
+			if strings.HasPrefix(p, prefix) {
+				found = true
+				break
+			}
+		}
+		u.inflightMu.Unlock()
+		if !found {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

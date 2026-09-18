@@ -126,6 +126,18 @@ func (o *LocalOverlay) Remove(localPath string) error {
 	return os.Remove(abs)
 }
 
+// RemoveAll removes a local-overlay path and everything under it. Used to
+// implement rename(2) replace semantics: before moving a source subtree onto
+// an existing target, the target's local-only content must go the same way
+// the remote rename discards the target's remote content.
+func (o *LocalOverlay) RemoveAll(localPath string) error {
+	abs, err := o.abs(localPath)
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(abs)
+}
+
 func (o *LocalOverlay) Rename(oldPath, newPath string) error {
 	oldAbs, err := o.abs(oldPath)
 	if err != nil {
