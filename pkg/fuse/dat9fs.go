@@ -11150,6 +11150,50 @@ func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
 	}
 }
 
+// renameLocalOverlaySubtree moves a local-overlay subtree from oldP to newP.
+//
+// A directory can be remote-classified while still containing local-only
+// descendants: the coding-agent profile routes "**/dist/**",
+// "**/node_modules/**" and similar paths to the local overlay, so a remotely
+// created staging directory can hold a local-only build tree. The layer
+// classification of the directory itself does not describe its children, so a
+// remote rename must move the overlay subtree independently instead of
+// leaving those files orphaned at the stale path.
+//
+// Missing or empty overlay directories are a no-op: the overlay root contains
+// implicit parent directories created for local files, and moving an empty
+// directory is pointless.
+func (fs *Dat9FS) renameLocalOverlaySubtree(oldP, newP string) error {
+	if fs == nil || fs.localOverlay == nil {
+		return nil
+	}
+	info, err := fs.localOverlay.Lstat(oldP)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	entries, err := fs.localOverlay.ReadDir(oldP)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	if err := fs.localOverlay.Rename(oldP, newP); err != nil {
+		return err
+	}
+	fs.scheduleGitStateCheckpoint(newP)
+	return nil
+}
+
 func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseRename, perfStart, status, 0) }()
@@ -11326,6 +11370,14 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		if st := fs.removeRenameSpecialTarget(ctx, newInfo); st != gofuse.OK {
 			return st
 		}
+	}
+
+	// A remote-classified directory can still contain local-only children
+	// (coding-agent local patterns). Move the overlay subtree with the
+	// server-side rename so those files do not stay orphaned at the stale path.
+	if err := fs.renameLocalOverlaySubtree(oldP, newP); err != nil {
+		safeLogPrintf("rename: migrate local overlay subtree %s -> %s failed: %v", oldP, newP, err)
+		return localErrToFuseStatus(err)
 	}
 
 	// After server-side rename, migrate pending descendants.
