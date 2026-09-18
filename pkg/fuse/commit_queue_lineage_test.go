@@ -168,6 +168,212 @@ func TestCommitQueueRebasesSupersededRewriteOntoLandedParent(t *testing.T) {
 	}
 }
 
+// TestCommitQueueRebasesAppendExtensionOntoWatermark reproduces the commit
+// layer of issue #935: a later appendFile-style write is staged from a handle
+// that predates the earlier commit (payload base rev 1) and has no snapshot
+// lineage, but its payload strictly extends the current remote content. The
+// entry must rebase onto the watermark instead of becoming a terminal
+// conflict that blocks mount drain.
+func TestCommitQueueRebasesAppendExtensionOntoWatermark(t *testing.T) {
+	const path = "/_cacache/index-v5/ab/cd/extend"
+	base := []byte("line-1\n")
+	first := append(append([]byte(nil), base...), []byte("line-A\n")...)
+	second := append(append([]byte(nil), first...), []byte("line-B\n")...)
+
+	server, ts := newCASFileServer(t, path, 1, base)
+	defer ts.Close()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	var watermark atomic.Int64
+	watermark.Store(1)
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
+
+	stage := func(payload []byte, baseRev int64) (uint64, uint64) {
+		t.Helper()
+		if err := shadow.WriteFull(path, payload, baseRev); err != nil {
+			t.Fatal(err)
+		}
+		shadowGen := shadow.ActiveGeneration(path)
+		pendingGen, err := pending.PutWithBaseRev(path, int64(len(payload)), PendingOverwrite, baseRev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return shadowGen, pendingGen
+	}
+
+	shadowGen, pendingGen := stage(first, 1)
+	if err := cq.CommitNow(context.Background(), &CommitEntry{
+		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
+		Size: int64(len(first)), Kind: PendingOverwrite,
+		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+		SnapshotID: "snap-first", liveLineageProof: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rev, body, _ := server.snapshot(); rev != 2 || !bytes.Equal(body, first) {
+		t.Fatalf("after first append rev=%d body=%q, want rev2 first bytes", rev, body)
+	}
+
+	shadowGen, pendingGen = stage(second, 1)
+	if err := cq.CommitNow(context.Background(), &CommitEntry{
+		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
+		Size: int64(len(second)), Kind: PendingOverwrite,
+		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+	}); err != nil {
+		t.Fatalf("append extension err = %v, want rebase onto rev 2", err)
+	}
+	rev, body, puts := server.snapshot()
+	if rev != 3 || !bytes.Equal(body, second) {
+		t.Fatalf("after append extension rev=%d body=%q, want rev3 composed bytes", rev, body)
+	}
+	if len(puts) != 2 || !bytes.Equal(puts[1].body, second) || puts[1].expected != "2" {
+		t.Fatalf("PUT history = %+v, want second PUT expected rev2 with composed bytes", puts)
+	}
+	if conflicts, _, _ := pending.ConflictSummary(); conflicts != 0 {
+		t.Fatalf("pending conflicts = %d, want 0 after append extension rebase", conflicts)
+	}
+}
+
+// TestCommitQueueDivergentRewriteKeepsTerminalFence is the negative half of
+// issue #935: when the later payload does NOT contain the current remote
+// content as a prefix (a genuinely divergent concurrent write, or a stale
+// SQLite checkpoint), the #876 fence must stay terminal so no remote byte is
+// silently rolled back.
+func TestCommitQueueDivergentRewriteKeepsTerminalFence(t *testing.T) {
+	const path = "/_cacache/index-v5/ab/cd/diverge"
+	base := []byte("line-1\n")
+	first := append(append([]byte(nil), base...), []byte("line-A\n")...)
+	divergent := append(append([]byte(nil), base...), []byte("line-X\n")...)
+
+	server, ts := newCASFileServer(t, path, 1, base)
+	defer ts.Close()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	var watermark atomic.Int64
+	watermark.Store(1)
+	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
+	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
+
+	stage := func(payload []byte, baseRev int64) (uint64, uint64) {
+		t.Helper()
+		if err := shadow.WriteFull(path, payload, baseRev); err != nil {
+			t.Fatal(err)
+		}
+		shadowGen := shadow.ActiveGeneration(path)
+		pendingGen, err := pending.PutWithBaseRev(path, int64(len(payload)), PendingOverwrite, baseRev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return shadowGen, pendingGen
+	}
+
+	shadowGen, pendingGen := stage(first, 1)
+	if err := cq.CommitNow(context.Background(), &CommitEntry{
+		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
+		Size: int64(len(first)), Kind: PendingOverwrite,
+		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	shadowGen, pendingGen = stage(divergent, 1)
+	if err := cq.Enqueue(&CommitEntry{
+		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
+		Size: int64(len(divergent)), Kind: PendingOverwrite,
+		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if rev, body, puts := server.snapshot(); rev != 2 || !bytes.Equal(body, first) || len(puts) != 1 {
+		t.Fatalf("after divergent rewrite rev=%d body=%q puts=%d, want untouched rev2 first bytes", rev, body, len(puts))
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok || meta.Kind != PendingConflict {
+		t.Fatalf("pending meta = %+v ok=%t, want preserved PendingConflict", meta, ok)
+	}
+}
+
+// TestCommitQueueAutoResolveAppendExtension covers the 409 fallback: when the
+// server moved past the entry's base without a local watermark observation,
+// the conflict auto-resolve must recognize a payload that strictly extends the
+// server content and rebase onto the server revision instead of fencing.
+func TestCommitQueueAutoResolveAppendExtension(t *testing.T) {
+	const path = "/_cacache/index-v5/ab/cd/extend409"
+	serverData := []byte("line-1\nline-A\n")
+	local := append(append([]byte(nil), serverData...), []byte("line-B\n")...)
+
+	server, ts := newCASFileServer(t, path, 2, serverData)
+	defer ts.Close()
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+
+	if err := shadow.WriteFull(path, local, 1); err != nil {
+		t.Fatal(err)
+	}
+	shadowGen := shadow.ActiveGeneration(path)
+	pendingGen, err := pending.PutWithBaseRev(path, int64(len(local)), PendingOverwrite, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No DurableWatermark callback: the local fence does not fire, the CAS PUT
+	// against base 1 gets a 409, and auto-resolve must take the extension path.
+	if err := cq.Enqueue(&CommitEntry{
+		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
+		Size: int64(len(local)), Kind: PendingOverwrite,
+		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	rev, body, puts := server.snapshot()
+	if rev != 3 || !bytes.Equal(body, local) {
+		t.Fatalf("after auto-resolve rev=%d body=%q, want rev3 composed bytes", rev, body)
+	}
+	if len(puts) != 1 || !bytes.Equal(puts[0].body, local) || puts[0].expected != "2" {
+		t.Fatalf("PUT history = %+v, want one PUT expected rev2 with composed bytes", puts)
+	}
+	if conflicts, _, _ := pending.ConflictSummary(); conflicts != 0 {
+		t.Fatalf("pending conflicts = %d, want 0 after append extension auto-resolve", conflicts)
+	}
+}
+
 // TestConsecutiveStagedShadowSnapshotsFormDirectParentChain pins the
 // process-local staging lineage that lets CommitQueue rebase a rapid same-path
 // rewrite (#935): after a dirty handle stages twice, the second snapshot must

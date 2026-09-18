@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -251,14 +252,64 @@ func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(ctx context.Context,
 		return false
 	}
 	landed := cq.landedCommit(entry.Path)
-	if landed.rev != watermark || !entryCanRebaseOntoLandedParent(entry, landed) {
+	if landed.rev != watermark {
 		return false
 	}
-	rev, size, body, err := cq.readRemoteSnapshot(ctx, entry.Path)
-	if err != nil {
+	if entryCanRebaseOntoLandedParent(entry, landed) {
+		rev, size, body, err := cq.readRemoteSnapshot(ctx, entry.Path)
+		if err != nil {
+			return false
+		}
+		return cq.maybeRebaseGrownPayloadAgainstRemote(entry, rev, size, body)
+	}
+	// Issue #935: rapid same-path appends (npm cacache appendFile) leave the
+	// entry with a stale payload base but a payload that strictly extends the
+	// current remote content. Uploading such a payload preserves every remote
+	// byte and appends, so it is safe without a lineage proof. The watermark
+	// must have come from a queue commit of this path (landed.rev == watermark)
+	// so the remote read below is meaningful and fenced entries whose watermark
+	// came from other paths perform no remote I/O.
+	return cq.maybeRebaseAppendExtension(ctx, entry, watermark)
+}
+
+// maybeRebaseAppendExtension authorizes a rebase when the entry's staged
+// payload contains the current remote content as a strict prefix. The upload
+// then cannot roll back any remote byte; it only appends. Divergent rewrites —
+// including stale SQLite checkpoint images — fail the prefix check and keep
+// the terminal fence. The comparison is bounded like the landed identity proof
+// so remote reads and shadow loads cannot grow past maxLandedPayloadBytes.
+func (cq *CommitQueue) maybeRebaseAppendExtension(ctx context.Context, entry *CommitEntry, watermark int64) bool {
+	if cq == nil || entry == nil || entry.recovered || cq.shadows == nil || cq.client == nil {
 		return false
 	}
-	return cq.maybeRebaseGrownPayloadAgainstRemote(entry, rev, size, body)
+	// ShadowSpill payloads stream from disk; refuse to load them into memory
+	// for the byte-level prefix proof.
+	if entry.Kind != PendingOverwrite || entry.ShadowSpill {
+		return false
+	}
+	if entry.ShadowGen == 0 || entry.Size <= 0 || entry.Size > maxLandedPayloadBytes {
+		return false
+	}
+	localData, err := cq.shadows.ReadAllIfGeneration(entry.Path, entry.ShadowGen)
+	if err != nil || int64(len(localData)) != entry.Size {
+		return false
+	}
+	rev, _, remoteData, err := cq.readRemoteSnapshot(ctx, entry.Path)
+	if err != nil || rev != watermark {
+		return false
+	}
+	if len(localData) <= len(remoteData) || !bytes.HasPrefix(localData, remoteData) {
+		return false
+	}
+	entry.BaseRev = rev
+	if entry.DurableWatermarkRev < rev {
+		entry.DurableWatermarkRev = rev
+	}
+	entry.DisableAutoResolveLWW = true
+	entry.growthRebaseRev = rev
+	entry.growthRebaseParentSnapshotID = entry.ParentSnapshotID
+	safeLogPrintf("commit queue: rebasing append extension for %s onto rev %d (%d -> %d bytes)", entry.Path, rev, len(remoteData), len(localData))
+	return true
 }
 
 func (cq *CommitQueue) readRemoteSnapshot(parent context.Context, path string) (rev, size int64, body []byte, err error) {
