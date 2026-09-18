@@ -11167,6 +11167,13 @@ func (fs *Dat9FS) renameLocalOverlaySubtree(oldP, newP string) error {
 	if fs == nil || fs.localOverlay == nil {
 		return nil
 	}
+	// POSIX forbids renaming a directory into its own subtree, and the target
+	// replacement below would otherwise delete part of the source tree. The
+	// kernel and renamePreflight reject these shapes before this point, but
+	// guard anyway so a layered edge case can never destroy source data.
+	if strings.HasPrefix(newP, oldP+"/") || strings.HasPrefix(oldP, newP+"/") {
+		return nil
+	}
 	info, err := fs.localOverlay.Lstat(oldP)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -11186,6 +11193,17 @@ func (fs *Dat9FS) renameLocalOverlaySubtree(oldP, newP string) error {
 	}
 	if len(entries) == 0 {
 		return nil
+	}
+	// Replace semantics, matching the server-side rename: drop any local-only
+	// content already present at the target. Without this os.Rename fails with
+	// ENOTEMPTY after the remote rename already succeeded, leaving the source
+	// subtree orphaned and the caller with an unretryable partial rename.
+	if _, err := fs.localOverlay.Lstat(newP); err == nil {
+		if err := fs.localOverlay.RemoveAll(newP); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	if err := fs.localOverlay.Rename(oldP, newP); err != nil {
 		return err
