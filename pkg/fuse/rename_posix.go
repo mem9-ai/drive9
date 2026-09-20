@@ -2,11 +2,15 @@ package fuse
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"golang.org/x/sys/unix"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
@@ -108,6 +112,21 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 		return oldInfo, newInfo, httpToFuseStatus(err)
 	}
 
+	// A remote-classified directory can still have local-only children.
+	// Check the backing overlay even without cached child inodes or a remote
+	// destination. Empty invisible parents left by rmdir are only scaffolding;
+	// real local-only entries must still reject replacement before commit.
+	if oldInfo.isDir && (!newInfo.exists || newInfo.isDir) && fs.localOverlay != nil {
+		if err := fs.pruneRenameOverlayParents(ctx, newP); err != nil {
+			// The generic local mapper treats ENOTEMPTY as os.ErrExist.
+			// Preserve the directory replacement error at this boundary.
+			if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
+				return oldInfo, newInfo, gofuse.Status(syscall.ENOTEMPTY)
+			}
+			return oldInfo, newInfo, localErrToFuseStatus(err)
+		}
+	}
+
 	if newInfo.exists {
 		switch {
 		case oldInfo.isDir && !newInfo.isDir:
@@ -129,6 +148,78 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 	}
 
 	return oldInfo, newInfo, gofuse.OK
+}
+
+// pruneRenameOverlayParents removes only invisible, empty backing directories
+// from a rename destination. Files, symlinks and visible directories are never
+// removed. Directory-relative operations do not follow replacement symlinks;
+// AT_REMOVEDIR refuses a directory that acquired a concurrent child.
+func (fs *Dat9FS) pruneRenameOverlayParents(ctx context.Context, p string) error {
+	abs, err := fs.localOverlay.abs(p)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(fs.localOverlay.root, abs)
+	if err != nil {
+		return err
+	}
+	const flags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+	fd, err := unix.Open(fs.localOverlay.root, flags, 0)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	dir := os.NewFile(uintptr(fd), fs.localOverlay.root)
+	defer func() { _ = dir.Close() }()
+	// Walk from the overlay root so even intermediate target components cannot
+	// redirect cleanup through a symlink outside the backing tree.
+	for _, name := range strings.Split(rel, string(os.PathSeparator)) {
+		childFD, err := unix.Openat(int(dir.Fd()), name, flags, 0)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		_ = dir.Close()
+		dir = os.NewFile(uintptr(childFD), filepath.Join(dir.Name(), name))
+	}
+	var prune func(*os.File, string) error
+	prune = func(parent *os.File, parentPath string) error {
+		names, err := parent.Readdirnames(-1)
+		if err != nil {
+			return err
+		}
+		for _, name := range names {
+			childPath := dirEntryChildPath(parentPath, name)
+			if fs.observeDirPathPolicyWithContext(ctx, childPath) != PathLayerRemotePersistent || fs.usesTransientLocalOverlay(childPath, true) {
+				return syscall.ENOTEMPTY
+			}
+			childFD, err := unix.Openat(int(parent.Fd()), name, flags, 0)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) {
+				return syscall.ENOTEMPTY
+			}
+			if err != nil {
+				return err
+			}
+			child := os.NewFile(uintptr(childFD), filepath.Join(parent.Name(), name))
+			err = prune(child, childPath)
+			_ = child.Close()
+			if err != nil {
+				return err
+			}
+			if err := unix.Unlinkat(int(parent.Fd()), name, unix.AT_REMOVEDIR); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		return nil
+	}
+	return prune(dir, p)
 }
 
 func (fs *Dat9FS) renameCheckParentAccess(caller gofuse.Owner, parent renamePathInfo) gofuse.Status {
@@ -380,4 +471,54 @@ func (fs *Dat9FS) renameRemoteFileToMissingTargetFallback(ctx context.Context, i
 	}
 	fs.finishLocalRename(input, oldInfo.path, newInfo.path)
 	return true, gofuse.OK
+}
+
+// renameLocalOverlaySubtree moves a local-overlay subtree from oldP to newP.
+//
+// A directory can be remote-classified while still containing local-only
+// descendants: the coding-agent profile routes "**/dist/**",
+// "**/node_modules/**" and similar paths to the local overlay, so a remotely
+// created staging directory can hold a local-only build tree. The layer
+// classification of the directory itself does not describe its children, so a
+// remote rename must move the overlay subtree independently instead of
+// leaving those files orphaned at the stale path.
+//
+// Missing or empty overlay directories are a no-op: the overlay root contains
+// implicit parent directories created for local files, and moving an empty
+// directory is pointless.
+func (fs *Dat9FS) renameLocalOverlaySubtree(oldP, newP string) error {
+	if fs == nil || fs.localOverlay == nil {
+		return nil
+	}
+	// Preflight rejects overlapping source and destination directories.
+	if strings.HasPrefix(newP, oldP+"/") || strings.HasPrefix(oldP, newP+"/") {
+		return nil
+	}
+	info, err := fs.localOverlay.Lstat(oldP)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	entries, err := fs.localOverlay.ReadDir(oldP)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	// Preflight rejects non-empty destinations. The kernel replaces an empty
+	// directory atomically and preserves both trees if a new child raced in.
+	if err := fs.localOverlay.Rename(oldP, newP); err != nil {
+		return err
+	}
+	fs.scheduleGitStateCheckpoint(newP)
+	return nil
 }

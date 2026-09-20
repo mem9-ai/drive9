@@ -9797,6 +9797,83 @@ func TestCodingAgentLocalOverlayCrossLayerRenameReturnsEXDEV(t *testing.T) {
 	}
 }
 
+// TestRenameDirectoryMovesLocalOverlaySubtree verifies that renaming a
+// remote-classified directory also moves local-only descendants held in the
+// local overlay. Regression test for issue #934: the coding-agent profile
+// routes "**/dist/**" (and similar) to the local overlay, so a remote staging
+// directory can contain a local-only tree; a remote-only rename orphaned those
+// files at the stale path and the extracted package silently lost ~99% of its
+// files while rename(2) returned success.
+func TestRenameDirectoryMovesLocalOverlaySubtree(t *testing.T) {
+	var renameCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPost:
+			if r.URL.RawQuery == "rename" {
+				renameCalls.Add(1)
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	localRoot := t.TempDir()
+	opts := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: localRoot,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	if fs.localOverlay == nil {
+		t.Fatal("coding-agent mount should have a local overlay")
+	}
+
+	// Remote staging directory holding local-only dist/ descendants.
+	fs.inodes.Lookup("/staging", true, 0, time.Now())
+	distDir := localRoot + "/overlay/staging/dist"
+	if err := os.MkdirAll(distDir+"/nested", 0o755); err != nil {
+		t.Fatalf("MkdirAll overlay dist: %v", err)
+	}
+	if err := os.WriteFile(distDir+"/pnpm.cjs", []byte("local-only pnpm"), 0o644); err != nil {
+		t.Fatalf("WriteFile overlay pnpm.cjs: %v", err)
+	}
+	if err := os.WriteFile(distDir+"/nested/chunk.js", []byte("local-only chunk"), 0o644); err != nil {
+		t.Fatalf("WriteFile overlay chunk.js: %v", err)
+	}
+	fs.inodes.Lookup("/final", true, 0, time.Now())
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Newdir:   1,
+	}, "staging", "final")
+	if st != gofuse.OK {
+		t.Fatalf("Rename: %v", st)
+	}
+	if renameCalls.Load() == 0 {
+		t.Fatal("remote rename was not issued")
+	}
+
+	data, err := os.ReadFile(localRoot + "/overlay/final/dist/pnpm.cjs")
+	if err != nil {
+		t.Fatalf("local-only file did not follow the directory rename: %v", err)
+	}
+	if string(data) != "local-only pnpm" {
+		t.Fatalf("moved file content = %q, want %q", data, "local-only pnpm")
+	}
+	if _, err := os.Stat(localRoot + "/overlay/final/dist/nested/chunk.js"); err != nil {
+		t.Fatalf("nested local-only file missing after rename: %v", err)
+	}
+	if _, err := os.Stat(localRoot + "/overlay/staging"); !os.IsNotExist(err) {
+		t.Fatalf("old overlay staging dir still present (err=%v)", err)
+	}
+}
+
 func TestCodingAgentLocalOverlayReadDirMergesRemoteAndLocalEntries(t *testing.T) {
 	localRoot := t.TempDir()
 	opts := &MountOptions{

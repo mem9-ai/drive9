@@ -138,7 +138,12 @@ func (o *LocalOverlay) Rename(oldPath, newPath string) error {
 	if err := os.MkdirAll(filepath.Dir(newAbs), 0o755); err != nil {
 		return err
 	}
-	return os.Rename(oldAbs, newAbs)
+	// os.Rename rejects an existing directory even when it is empty. Let the
+	// kernel atomically replace empty directories and reject non-empty ones.
+	if err := syscall.Rename(oldAbs, newAbs); err != nil {
+		return &os.LinkError{Op: "rename", Old: oldAbs, New: newAbs, Err: err}
+	}
+	return nil
 }
 
 func (o *LocalOverlay) Chmod(localPath string, mode uint32) error {

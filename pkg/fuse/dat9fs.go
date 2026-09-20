@@ -11323,6 +11323,13 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 
+	// A remote-classified directory can still contain local-only children
+	// (coding-agent local patterns). Move the overlay subtree with the
+	// server-side rename so those files do not stay orphaned at the stale path.
+	overlayErr := fs.renameLocalOverlaySubtree(oldP, newP)
+	// The remote namespace has committed. An overlay error must not skip
+	// reconciliation of handles, pending data, or the inode/directory caches.
+
 	// After server-side rename, migrate pending descendants.
 	// If oldP is a directory, pending children under oldP+"/", must be
 	// re-keyed to newP+"/". Without this the uploader would PUT to stale paths.
@@ -11371,10 +11378,19 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 
-	// A directory rename needs no second step: the server's RenameDir moves the
-	// directory's jfs edge in the same transaction as the projection subtree
-	// UPDATE (see datastore.RenameDir), so the FUSE side must not dual-write.
+	// The server's RenameDir already moved its jfs edge and projection subtree
+	// in one transaction; only local namespace reconciliation remains here.
 	fs.finishLocalRename(input, oldP, newP)
+	// Retry after local namespace reconciliation. A persistent failure preserves
+	// its source bytes and is reported with handles/inodes aligned to the
+	// already committed remote rename.
+	if overlayErr != nil {
+		overlayErr = fs.renameLocalOverlaySubtree(oldP, newP)
+	}
+	if overlayErr != nil {
+		safeLogPrintf("rename: migrate local overlay subtree %s -> %s failed after remote commit: %v", oldP, newP, overlayErr)
+		return localErrToFuseStatus(overlayErr)
+	}
 	return gofuse.OK
 }
 
