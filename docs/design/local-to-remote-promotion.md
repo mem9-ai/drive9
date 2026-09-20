@@ -1,6 +1,6 @@
 # Local-to-Remote Persistence Promotion
 
-Status: Accepted for staged delivery
+Status: Proposed for staged delivery; P0/P1 contract under review
 
 Date: 2026-09-18
 
@@ -233,10 +233,13 @@ The coordinator persists a record before remote side effects:
 migration_id
 source_path
 target_path
-source_identity (local root UUID, st_dev, st_ino, generation)
+source_identity (local root UUID, reserved source-incarnation UUID)
 manifest_hash
-target_precondition (parent inode incarnation, child name, expected absence)
+target_expectation (canonical target, expected absence,
+                    server precondition digest after CreateImport)
 staging_ref
+owner_epoch (0 until returned or recovered from GetImport)
+owner_token
 phase
 created_at
 updated_at
@@ -245,8 +248,15 @@ updated_at
 The manifest is written to a temporary file, fsynced, renamed to its final
 name, and followed by a parent-directory fsync. The checksummed migration record
 is then written with the same temp-file, fsync, rename, and directory-fsync
-sequence. Recovery accepts only a complete record whose manifest hash matches;
-it never assumes the pair was atomically written.
+sequence. The record and its owner token are private mode `0600` state. Recovery
+accepts only a complete record whose manifest hash matches; it never assumes
+the pair was atomically written.
+
+The initial record contains the canonical target and expected absence. After a
+successful or recovered `CreateImport`, the coordinator rewrites and fsyncs the
+record with the server precondition digest and owner epoch. The digest is for
+reconciliation only; the server always uses its own stored namespace facts at
+commit.
 
 Phases are monotonic:
 
@@ -262,6 +272,34 @@ PREPARED
 ```
 
 No phase transition relies only on an in-memory flag.
+
+#### Durable local source identity
+
+`st_dev` and `st_ino` are diagnostics, not identity: both may be reused after
+unlink. Before writing `PREPARED`, while holding the subtree fence, the
+coordinator opens the source root with no-follow semantics and reads a reserved
+Drive9 source-incarnation xattr. If absent, it creates a cryptographically
+random 128-bit UUID with create-only xattr semantics, fsyncs the source inode
+and its containing directory, and then persists that UUID in the migration
+record. The reserved xattr is not readable, writable, copied, or removable
+through the mounted user namespace. A local filesystem that cannot durably
+store this xattr is unsupported by P1 and returns
+`promotion_not_supported` before remote staging.
+
+The local-root UUID is stored in the private promotion state directory and is
+created and fsynced when that root is initialized. The security identity is
+therefore `(local_root_uuid, source_incarnation_uuid)`. Device, inode, type,
+ctime, and mtime remain snapshot validation inputs, but never substitute for
+the UUID. A UUID is never reassigned to a different local object. A duplicate
+reserved UUID observed at two live objects, including one introduced by direct
+mutation of the private overlay, fails closed as corrupt local state.
+
+Recovery and cleanup open the recorded source or quarantine object first and
+compare its reserved UUID before rename or removal. A same-path object with a
+different UUID is a new source generation and is never hidden, quarantined, or
+deleted by the old migration. The quarantine rename preserves the xattr. A
+crash after xattr creation but before `PREPARED` leaves only an inert marker;
+a later promotion may safely reuse that object's UUID with a new migration ID.
 
 `COMMIT_REQUESTED` is an outcome-unknown state. It is fsynced before sending
 `CommitImport`. Until `GetImport` proves committed or not committed, both source
@@ -285,21 +323,27 @@ released without being hidden or deleted by the old migration.
 The exact wire shape may change, but the runtime requirements are fixed:
 
 ```text
-CreateImport(migration_id, target, target_parent_incarnation,
-             expected_target_absent,
-             manifest_hash, entry_total, byte_total)
-CreateImportContent(migration_id, relative_path, entry_hash, size)
-PutImportEntry(migration_id, relative_path, entry_hash,
+CreateImport(migration_id, target, expected_target_absent,
+             manifest_hash, entry_total, byte_total, owner_token)
+CreateImportContent(migration_id, owner_epoch, owner_token,
+                    relative_path, entry_hash, size)
+PutImportEntry(migration_id, owner_epoch, owner_token,
+               relative_path, entry_hash,
                import_content_token, metadata)
-VerifyImport(migration_id, manifest_hash)
-CommitImport(migration_id, target_precondition)
+VerifyImport(migration_id, owner_epoch, owner_token, manifest_hash)
+CommitImport(migration_id, owner_epoch, owner_token)
 GetImport(migration_id)
-AbortImport(migration_id)
-RenewImportLease(migration_id, owner_epoch)
+AbortImport(migration_id, owner_epoch, owner_token)
+RenewImportLease(migration_id, owner_epoch, owner_token)
+TakeOverImport(migration_id, expected_owner_epoch, new_owner_token)
 ```
 
 Every method is idempotent for the same migration identity and payload. Reuse
 with different target, manifest, or content returns conflict.
+Repeating `CreateImport` with the same owner token returns the current state and
+does not duplicate the reservation. Repeating it with a different token never
+acts as takeover or resets an epoch; the caller must follow the explicit
+expired-lease takeover contract.
 
 `migration_id` is scoped by tenant. Content references are server-issued for
 that import and tenant; the client cannot attach an arbitrary storage key or a
@@ -308,30 +352,102 @@ bounded upload plan/capability used by the existing direct or multipart upload
 machinery. The completed object is checked against the declared size and hash
 before an entry can reference it.
 
-The target precondition is an immutable destination-parent incarnation plus
-the child name and expected absence. A pathname, mtime, or reusable numeric
-revision is not a sufficient fence: deleting and recreating the parent or
-target must make the commit conflict even if a revision value is reused.
+During `CreateImport`, the server resolves and records an immutable target
+precondition; clients cannot supply or replace its namespace facts. It is a
+snapshot of all of:
+
+- the canonical destination-parent path;
+- the incarnation of that exact parent **path edge**, not merely the directory
+  inode identity;
+- the parent's monotonic child-set generation;
+- the canonical child name and expected absence.
+
+Every direct child create, unlink, or rename into or out of a directory
+increments its child-set generation in the same namespace transaction. Every
+directory-entry create or rename assigns a fresh, non-reusable path-edge
+incarnation, even when the underlying inode identity is retained. The
+filesystem root has a durable root-edge incarnation and child-set generation.
+These counters are server-maintained and cannot be supplied by clients.
+
+The concrete P0 namespace representation adds an opaque edge-incarnation UUID
+to each `file_nodes` row and an unsigned child-set generation to each directory
+inode (with equivalent root metadata for `/`). Structural writers lock the
+canonical parent edge and directory inode in a single order, mutate the child,
+and increment the generation in one transaction. Generation overflow fails the
+mutation closed; it never wraps or resets within an incarnation.
+
+`CommitImport` resolves the canonical parent path under lock and requires the
+same edge incarnation, child-set generation, and absent child immediately
+before publication. Publication increments the child-set generation in that
+same transaction. Consequently target `create -> delete`, parent
+`rename -> rename back`, parent delete/recreate, and a parent moved away from
+the requested path all conflict. This conservative P0 fence may also reject an
+unrelated sibling mutation; the caller restarts with a fresh precondition. A
+pathname, mtime, inode ID alone, or reusable numeric revision is not sufficient.
 
 The server import state machine is:
 
 ```text
-CREATED -> STAGING -> VERIFIED -> COMMITTING -> COMMITTED
-                    \-> ABORTING -> ABORTED
+CREATED -----> STAGING -----> VERIFIED -----> COMMITTING -----> COMMITTED
+   |              |              |
+   +--------------+--------------+----------> ABORTING -------> ABORTED
 ```
 
-- `VERIFIED` freezes the entry set and manifest version. A late or different
-  `PutImportEntry` cannot mutate or revive it.
-- `COMMITTING` and `ABORTING` are acquired by CAS; only one can win.
-- `COMMITTED` and `ABORTED` are terminal. Abort and lease GC cannot remove a
-  committed result, and a late upload cannot revive an aborted import.
-- Only the current nonterminal owner epoch may renew the lease. GC first CASes
-  an expired import to `ABORTING` before deleting stage data and releasing
-  quota.
-- The staging uploader uses an import-scoped internal capability. It never
-  writes through the ordinary user namespace or FUSE writeback path.
+The transitions and their durable effects are normative:
 
-`CommitImport` is the namespace linearization point. In one transaction it:
+| From | Trigger | To | Durable result |
+| --- | --- | --- | --- |
+| none | `CreateImport` | `CREATED` | Identity, target precondition, manifest totals, reservation, owner epoch `1`, owner-token hash, and lease are stored atomically. |
+| `CREATED` | first accepted entry/content mutation | `STAGING` | Partial hidden stage and the same reservation remain owned by the import. |
+| `STAGING` | successful `VerifyImport` | `VERIFIED` | Entry set, content set, and manifest version become immutable. |
+| `VERIFIED` | accepted `CommitImport` CAS | `COMMITTING` | Commit attempt ID and accepted outcome are durable; request cancellation can no longer abort it. |
+| `COMMITTING` | server commit worker | `COMMITTED` | Target CAS, namespace publication, ownership transfer, reservation settlement, result row, and structural outbox event commit atomically. |
+| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort or expired-lease GC CAS | `ABORTING` | No new upload, verify, renew, takeover, or commit is accepted; cleanup ownership is durable. |
+| `COMMITTING` | permanent target/auth/manifest failure before publication | `ABORTING` | A durable terminal reason is recorded; no namespace or committed quota changed. Transient failure stays `COMMITTING` and is retried by the server. |
+| `ABORTING` | server cleanup worker | `ABORTED` | Hidden entries and unowned objects are detached, the reservation is released exactly once, and the terminal reason/result is retained. |
+
+There are no other transitions. `COMMITTED` and `ABORTED` are terminal.
+`COMMITTING` and `ABORTING` are server-owned recovery states: client lease
+expiry does not abandon them, and their workers are durably discoverable after
+a server crash. `COMMITTING` never transitions directly back to `VERIFIED`, and
+`ABORTING` cannot be revived.
+
+Every transition compares and increments `state_version`. Commit and cleanup
+workers additionally claim a durable attempt ID; duplicate workers either
+resume that attempt or observe its terminal state. Reservation settlement and
+release use the reservation ID plus terminal ownership state as their
+idempotency key, so a crash after the accounting write but before the worker
+ack cannot double-charge or double-release.
+
+`CreateImport` receives an opaque, random owner token that the coordinator
+generated and fsynced in `PREPARED` before the request. The server stores only
+its hash, creates `owner_epoch = 1`, and returns the epoch and lease expiry.
+Every staging, verify, commit, abort, and renew mutation must present both the
+current epoch and token. Thus a lost create response is recoverable with the
+already-durable token; `GetImport` may disclose the epoch and state but never
+the token.
+
+For `CREATED`, `STAGING`, or `VERIFIED`, the current owner may renew before
+expiry. After expiry, `TakeOverImport` atomically compares the old epoch and
+state, increments the epoch, installs the hash of a newly generated and
+fsynced token, and grants a new lease. Takeover is rejected while the old lease
+is live and in every server-owned or terminal state. Any request carrying the
+old epoch or token is then fenced, including an old renew, upload, verify,
+commit, or abort. The single-writer local-root lock prevents routine concurrent
+takeover; the server epoch is the authoritative fence for a paused or zombie
+coordinator.
+
+`VERIFIED` freezes the entry set and manifest version. A late or different
+`PutImportEntry` cannot mutate it. Commit acceptance and abort/GC acquisition
+race through the state CAS, so only one wins. The staging uploader uses an
+import-scoped internal capability and never writes through the ordinary user
+namespace or FUSE writeback path.
+
+`CommitImport` first durably accepts work by CASing `VERIFIED -> COMMITTING`
+and recording a commit attempt. The handler may drive the worker synchronously,
+but request lifetime is not ownership of the accepted work. The worker's final
+database transaction is the namespace linearization point. In that transaction
+it:
 
 1. revalidates destination authorization and quota;
 2. revalidates the target precondition and rename type rules;
@@ -355,8 +471,10 @@ durable facts are required:
 ```text
 imports(
   tenant_id, migration_id, target_path, target_parent_inode,
-  target_parent_incarnation, manifest_hash, entry_total, byte_total,
-  quota_reservation_id, state, owner_epoch, lease_expires_at,
+  target_parent_path, target_parent_edge_incarnation,
+  target_parent_children_generation, manifest_hash, entry_total, byte_total,
+  quota_reservation_id, state, state_version, owner_epoch, owner_token_hash,
+  lease_expires_at, commit_attempt_id, terminal_reason,
   committed_root_inode, committed_generation, created_at, updated_at,
   primary key (tenant_id, migration_id)
 )
@@ -381,6 +499,12 @@ and unowned objects are garbage collected. Commit changes content ownership and
 namespace visibility in the same transaction; storage deletion is always an
 outbox/GC consequence and never precedes the durable ownership decision.
 
+The ordinary namespace schema also supplies the non-reusable parent
+path-edge incarnation and monotonic child-set generation described above.
+Every namespace mutation, including legacy create/unlink/rename code paths,
+must use the same helper that updates those facts. P0 cannot claim the target
+CAS until delete-the-fix tests prove that bypassing either update is detected.
+
 The outbox is part of the transaction. It invalidates positive and negative
 directory caches on other mounts. Staging emits no user-visible namespace or
 search events. Namespace, content, and metadata are complete at commit;
@@ -396,7 +520,13 @@ The coordinator fences both source and destination subtrees on the initiating
 mount before taking a manifest. Lookup, open, create, write, truncate, unlink,
 rename, and writeback enqueue paths must participate in this fence. Other
 mounts cannot share this in-memory fence; their target races are serialized by
-the server-side parent-incarnation and absent-child precondition at commit.
+the server-side parent path-edge incarnation, parent child-set generation, and
+absent-child precondition at commit.
+
+Prefix membership is component-aware: a fence for `/a` covers `/a` and
+`/a/...`, but not `/ab`. Source and target fences use canonical paths and reject
+`.`/`..`, separator, or case-normalization aliases according to the mounted
+filesystem's namespace rules.
 
 `WaitPrefix` or scanning current handles is not a fence: a new operation can
 start immediately after either check. The fence must prevent new work while
@@ -411,6 +541,12 @@ complete. Recovery rebuilds all fences from migration records before accepting
 FUSE requests. Normal commit queues and uploaders cannot enqueue work under the
 fenced prefixes; the import uploader is exempt only through its migration ID
 and internal capability.
+
+FUSE request cancellation is phase-sensitive. Before the server durably
+accepts `VERIFIED -> COMMITTING`, cancellation stops new work and drives the
+same owner-epoch abort path. After acceptance it cannot cancel the server
+commit; the request returns outcome-unknown if necessary, retains both fences,
+and resolves `GetImport` until `COMMITTED` or `ABORTED`.
 
 The local root has a single-writer mount lock. Direct mutation of the private
 local root is unsupported, but P1 still detects it. The coordinator traverses
@@ -463,15 +599,32 @@ generation CAS. The generic import path must not bypass Git routing.
 On a restart with the same local root, recovery restores all migration fences
 and queries the server by `migration_id` before serving affected paths.
 
-| Last durable state | Recovery result |
+The server state is authoritative for publish and accounting outcome:
+
+| `GetImport` result | Client authority and fence | Server resources and next action | Local-record disposition |
+| --- | --- | --- | --- |
+| not found from an authorized, strongly consistent lookup | Source is authoritative; keep both paths fenced while reconciling the lost-create outcome. | No reservation or stage exists. | Fsync a local aborted result, then release fences and remove the active record. |
+| `CREATED` | Source is authoritative; keep both fenced during recovery. | Reservation exists; no or partial stage. Resume with the current durable owner token, take over after expiry, or abort. | Retain until `ABORTED` or a later commit result. |
+| `STAGING` | Source is authoritative; keep both fenced during recovery. | Reservation and partial hidden stage remain. Resume/take over or abort; late upload is epoch-fenced. | Retain. |
+| `VERIFIED` | Source is authoritative; keep both fenced. | Immutable hidden stage and reservation remain. Commit with the same migration ID or abort; no entry mutation is allowed. | Retain. |
+| `COMMITTING` | Outcome is unknown; neither source nor target is released. | Server owns completion; lease expiry and client abort do nothing. Poll `GetImport`; a recovered server worker reaches `COMMITTED` or `ABORTING`. | Retain; never create a second migration ID. |
+| `ABORTING` | Source remains authoritative, but both paths stay fenced until cleanup completes. | Server resumes hidden-stage deletion and exactly-once reservation release; no client mutation or takeover is accepted. | Retain and poll. |
+| `ABORTED` | Source is authoritative; target was not published. | Reservation is released, staged ownership is detached, and the terminal reason is durable. | Fsync the local aborted result, release fences, then remove the active record; the server tombstone remains for retry identity. |
+| `COMMITTED` | Target is authoritative; keep both fenced until source reconciliation finishes. | Quota is settled, committed content ownership and namespace/outbox result are durable; stage GC cannot remove them. | Verify the source-incarnation UUID, quarantine only the matching source, publish inode/cache state, fsync `DONE`, release fences, then retire the active record. |
+| unreachable or invalid response | Authority is unresolved; keep both paths fenced or fail the mount closed. | No cleanup, quota release, abort, or new migration is guessed. | Retain and return `promotion_recovery_required`. |
+
+The durable local phase refines, but never overrides, that server result:
+
+| Last durable local phase | Recovery action |
 | --- | --- |
-| Local record missing | No operation existed. |
-| `PREPARED` or `STAGING`; server not committed | Source remains visible. Resume or abort hidden staging. |
-| `STAGED_VERIFIED`; no commit request sent | Source remains visible. Commit or abort with the same ID. |
-| `COMMIT_REQUESTED` | Query `GetImport`; never retry with a new ID. If the server is unreachable, keep both paths fenced and return `EIO`. |
-| Server `REMOTE_COMMITTED`, local quarantine missing | Keep both paths fenced, atomically quarantine the source, publish inode/cache state, then release the fence. Never roll back the target. |
-| `SOURCE_QUARANTINED`, physical local files remain | Target is authoritative. A janitor removes the migration-owned quarantine identity. |
-| Manifest missing, corrupt, or mismatched | Fail closed and require repair; do not guess. |
+| Local record missing | No client operation existed. A server import with no matching record is reclaimed only by its lease/GC state machine. |
+| `PREPARED` | Install fences and call `GetImport`; not-found is the only proof that create never became durable. |
+| `STAGING` | Reconcile owner epoch and server state before uploading or aborting. |
+| `STAGED_VERIFIED` | Reconcile before commit; do not mutate the frozen manifest. |
+| `COMMIT_REQUESTED` | Query `GetImport`; never retry with a new migration ID or infer failure from disconnect. |
+| `REMOTE_COMMITTED` | Verify the durable source-incarnation UUID before quarantine. Never roll back the target. |
+| `SOURCE_QUARANTINED` | Target is authoritative. A janitor removes only the matching migration-owned quarantine identity. |
+| Manifest/record/token missing, corrupt, or mismatched | Fail closed and require repair; do not guess, take over, or delete either tree. |
 
 Once the server reports committed, old uploaders and recovery attempts cannot
 write a different manifest under the same migration ID.
@@ -485,11 +638,17 @@ owner.
 
 - Two promotions of the same source or destination have one winner through the
   subtree fence and server target CAS.
-- A different client creating the target during staging causes final commit to
-  conflict. The source remains visible.
+- A different client creating, deleting, or renaming the target during staging
+  advances the parent child-set generation and causes final commit to conflict,
+  even when the child is absent again at commit. Moving, moving-away-and-back,
+  deleting, or recreating the target parent changes the parent edge
+  incarnation and also conflicts. The source remains visible.
 - A client timeout does not cancel an accepted server commit. The caller
   resolves the outcome by migration ID. Commit, abort, and lease GC race through
   the import-state CAS and have one winner.
+- A coordinator restart reuses its durable current token while the lease is
+  live, or takes over an expired client-owned state with a new token and
+  incremented epoch. The previous epoch is rejected by every mutation.
 - Source mutations during the restricted preview are blocked or rejected. A
   future concurrent implementation requires a snapshot generation plus a final
   delta barrier; a directory walk alone is never sufficient.
@@ -504,6 +663,9 @@ owner.
 - abandoned hidden staging is garbage collected by lease and retention policy;
 - committed imports transfer object ownership and cannot be removed by staging
   GC; aborted imports idempotently release quota and cannot be revived;
+- lease GC can acquire only `CREATED`, `STAGING`, or `VERIFIED`; it never
+  cancels `COMMITTING`, and a crashed `ABORTING` cleanup is resumed until the
+  exactly-once release is durable;
 - entry, byte, depth, and time limits are checked before or during hidden
   staging and never produce a partial final target.
 
@@ -512,9 +674,12 @@ owner.
 ### P0: primitive and specification
 
 - freeze this contract and public capability naming;
+- add namespace path-edge incarnations and child-set generations to every
+  structural mutation path before enabling target CAS;
 - implement hidden staging, idempotent upload, manifest verification,
-  versioned quota reservation, the import state CAS, `CommitImport`, committed
-  outbox/status lookup, and garbage collection;
+  versioned quota reservation, owner epoch/token takeover, the complete import
+  state CAS, `CommitImport`, committed outbox/status lookup, and garbage
+  collection;
 - add server-side failure injection and crash recovery tests.
 
 ### P1: restricted preview
@@ -579,8 +744,13 @@ tree. Repeated recovery is idempotent.
 
 - source create, write, truncate, unlink, rename, and open during promotion;
 - target creation by another mount during staging;
+- target `create -> delete` ABA between precondition issue and commit;
+- target parent rename away, rename away-and-back, and delete/recreate;
+- unrelated target-parent sibling mutation conservatively conflicts in P0;
 - two promotions competing for source or target;
 - commit versus abort and commit versus lease GC;
+- coordinator crash followed by expired-lease takeover; every old-epoch renew,
+  upload, verify, commit, and abort is rejected;
 - verify versus a late upload and upload versus an aborted terminal import;
 - writeback enqueue immediately after a drain attempt;
 - direct local-root file replacement and symlink swap while a snapshot is read;
@@ -598,7 +768,13 @@ tree. Repeated recovery is idempotent.
 - abort and GC release it exactly once and cannot race a committed import;
 - committed content references survive staging GC;
 - a structural-reset outbox entry exists exactly once for each commit, while
-  no staging entry is indexed or emitted.
+  no staging entry is indexed or emitted;
+- response loss and server restart are injected in every state:
+  `CREATED`, `STAGING`, `VERIFIED`, `COMMITTING`, `ABORTING`, `ABORTED`, and
+  `COMMITTED`; each case asserts source/target authority, fence retention,
+  staging ownership, reservation/committed quota, and local-record retention;
+- deleting the owner-epoch comparison or allowing takeover of a live,
+  server-owned, or terminal state makes a focused test fail.
 
 ### Local recovery and reuse
 
@@ -606,11 +782,20 @@ tree. Repeated recovery is idempotent.
 - `COMMIT_REQUESTED` with an unreachable server blocks only the affected paths
   or fails the mount closed;
 - successful publish followed immediately by recreating the old path creates a
-  new generation that quarantine cleanup cannot hide or delete;
+  new source-incarnation UUID that quarantine cleanup cannot hide or delete;
+- a fake local filesystem reuses the same `(st_dev, st_ino)` after
+  delete/recreate but returns a new reserved UUID; recovery and quarantine must
+  refuse to touch it, and deleting the UUID comparison makes the test fail;
+- crash points after create-only xattr, after inode fsync, and after local-record
+  fsync either leave an inert marker or a fully recoverable identity;
 - the import-scoped uploader cannot deadlock on the user-namespace subtree
   fence;
 - direct source mutation or identity change rejects the migration rather than
-  uploading a torn snapshot.
+  uploading a torn snapshot;
+- a fence for `/a` blocks `/a` and `/a/...` but not `/ab`;
+- FUSE cancellation before commit acceptance reaches `ABORTED`, while
+  cancellation after acceptance retains fences and resolves the server-owned
+  `COMMITTING` outcome.
 
 ### Handle behavior
 
@@ -625,10 +810,13 @@ Tests must fail when independently deleting:
 
 - the subtree fence;
 - migration idempotency;
-- target CAS;
+- the parent path-edge incarnation, child-set generation, or absent-child term
+  of the target CAS;
 - the server-state CAS between commit, abort, and GC;
+- owner epoch/token fencing and expired-lease takeover;
 - quota reservation conversion and content-ref ownership transfer;
-- the post-commit source quarantine identity;
+- the reserved source-incarnation UUID comparison used by recovery and
+  post-commit quarantine;
 - the committed outbox/cache reset;
 - handle state migration;
 - Git workspace routing.
