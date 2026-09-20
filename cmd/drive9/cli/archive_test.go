@@ -266,14 +266,17 @@ func TestArchiveProfileCodingAgentSkipsDefaults(t *testing.T) {
 	}
 	got := tarEntries(t, out)
 	for _, name := range got {
-		for _, bad := range []string{"node_modules", "/dist/", ".git/", ".cache/"} {
+		for _, bad := range []string{"node_modules", ".git/", ".cache/"} {
 			if strings.Contains(name, bad) {
 				t.Fatalf("coding-agent profile should skip %q but found %q", bad, name)
 			}
 		}
 	}
 	if !contains(got, "proj/main.go") {
-		t.Fatalf("main.go missing: %v", got)
+		t.Fatalf("main.go missing from archive: %v", got)
+	}
+	if !contains(got, "proj/dist/bundle.js") {
+		t.Fatalf("dist build output missing from archive: %v", got)
 	}
 }
 

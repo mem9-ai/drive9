@@ -89,7 +89,6 @@ func TestLocalPolicyDefaultsCodingAgentCacheSegmentsToLocalOnly(t *testing.T) {
 	for _, path := range []string{
 		"/repo/node_modules/pkg/index.js",
 		"/repo/.pnpm-store/v3/files/pkg",
-		"/repo/dist/app.js",
 		"/repo/build/output.bin",
 		"/repo/coverage/lcov.info",
 		"/repo/tmp/generated.js",
@@ -110,6 +109,13 @@ func TestLocalPolicyDefaultsCodingAgentCacheSegmentsToLocalOnly(t *testing.T) {
 		if got := policy.Classify(path); got != PathLayerLocalOnly {
 			t.Errorf("Classify(%q) = %s, want local-only default", path, got)
 		}
+	}
+}
+
+func TestLocalPolicyKeepsDistBuildOutputRemotePersistent(t *testing.T) {
+	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
+	if got := policy.Classify("/repo/dist/app.js"); got != PathLayerRemotePersistent {
+		t.Fatalf("dist build output = %s, want remote persistent", got)
 	}
 }
 

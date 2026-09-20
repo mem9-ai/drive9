@@ -64,7 +64,7 @@ git clone https://github.com/mem9-ai/drive9.git ~/drive9/drive9
 ```
 
 The CLI also supports bulk tree download as a single archive, with the same
-profile-based filtering that mount uses to skip `node_modules`/`.git`/`dist`:
+profile-based filtering that mount uses to skip `node_modules`/`.git`:
 
 ```bash
 drive9 fs archive :/proj ./proj.tar.gz --profile coding-agent

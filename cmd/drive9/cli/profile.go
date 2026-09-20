@@ -212,7 +212,6 @@ func builtinCodingAgentLocalOnlyPatterns() []string {
 		"**/node_modules/**",
 		"**/.pnpm-store/**",
 		"**/target/**",
-		"**/dist/**",
 		"**/build/**",
 		"**/coverage/**",
 		"**/tmp/**",

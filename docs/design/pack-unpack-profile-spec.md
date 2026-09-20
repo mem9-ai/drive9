@@ -64,7 +64,7 @@ The built-in profiles are:
 
 | Profile | Local overlay policy | Automatic pack policy |
 | --- | --- | --- |
-| `coding-agent` | Routes common agent/developer local state to local disk, including `.git`, `node_modules`, `.venv`, caches, and build output. This is the default FUSE profile. | No automatic pack paths. Nothing is packed unless the user explicitly asks. |
+| `coding-agent` | Routes common agent/developer local state to local disk, including `.git`, `node_modules`, `.venv`, caches, and build output (`build/`, `target/`). Node `dist/` build products are remote-synced like source files. This is the default FUSE profile. | No automatic pack paths. Nothing is packed unless the user explicitly asks. |
 | `portable` | Uses the same local overlay policy as `coding-agent`. | Packs all files and directories that currently exist under `local-root/overlay`. |
 | `none` | No local overlay policy. | No pack policy. |
 

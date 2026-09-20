@@ -97,7 +97,7 @@ Hidden local clean cache
 Coding-agent local overlay policy
 
 - The coding-agent mount profile routes heavyweight local state and generated output to `<local-root>/overlay` instead of Drive9 backend storage.
-- Default local-only paths include VCS state (`.git`, `.hg`, `.svn`), dependency directories (`node_modules`, `.venv`, `.pnpm-store`), build outputs (`dist`, `build`, `target`, `coverage`), temporary/cache directories (`tmp`, `.tmp`, `.cache`, `.turbo`, `.next/cache`, `.vitepress/cache`), and tool-specific generated output such as `.tmp-api-extractor`.
+- Default local-only paths include VCS state (`.git`, `.hg`, `.svn`), dependency directories (`node_modules`, `.venv`, `.pnpm-store`), build outputs (`build`, `target`, `coverage`; Node `dist/` build products are remote-synced instead), temporary/cache directories (`tmp`, `.tmp`, `.cache`, `.turbo`, `.next/cache`, `.vitepress/cache`), and tool-specific generated output such as `.tmp-api-extractor`.
 - These local-only paths are still merged into FUSE directory listings with tracked Git workspace entries, so generated directories under a tracked source directory remain visible to local build tools without being uploaded to Drive9.
 - Local-only dependency and generated-output files are a rebuildable performance layer. Their ordinary FUSE `Flush` path does not force `fsync`; it refreshes local inode metadata only. Explicit `Fsync` still syncs the local file.
 - Lightweight `.git` state is checkpointed asynchronously and coalesced per workspace. Foreground `Flush`, `Fsync`, `Release`, `Rename`, and `Unlink` on local `.git` files only perform the necessary local filesystem operation and schedule a checkpoint; `FlushAll`/unmount drains pending checkpoints.
