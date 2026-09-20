@@ -11253,9 +11253,6 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		// background worker from PUT-ing to oldP after we rename away from it.
 		fs.uploader.WaitPath(oldP)
 		fs.uploader.WaitPath(newP)
-		// Wait for currently in-flight descendant uploads. This does not fence
-		// queued/new uploads from starting afterwards (tracked in issue #944).
-		fs.uploader.WaitPrefix(oldP + "/")
 
 		// Fast path (vim :w): if oldP is a pending-new file (created locally,
 		// never existed on the server), rename it locally. The background
@@ -11336,12 +11333,6 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	// After server-side rename, migrate pending descendants.
 	// If oldP is a directory, pending children under oldP+"/", must be
 	// re-keyed to newP+"/". Without this the uploader would PUT to stale paths.
-	//
-	// Retarget before migration under each handle's lock. Existing Flush calls
-	// finish staging at the old path before retarget can acquire that lock;
-	// subsequent Flush calls use the new path. finishLocalRename also retargets
-	// for its other callers and handles registered after this snapshot.
-	fs.retargetOpenHandlesForRename(oldP, newP)
 	prefix := oldP + "/"
 	if fs.writeBack != nil {
 		for _, meta := range fs.writeBack.ListByPrefix(prefix) {
@@ -11349,12 +11340,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 			if fs.uploader != nil {
 				fs.uploader.WaitPath(meta.Path)
 			}
-			if !fs.writeBack.RenamePending(meta.Path, newChild) {
-				// False can mean an absent entry or an I/O failure. Distinguishing
-				// and recovering those cases is tracked separately in issue #945.
-				safeLogPrintf("rename: migrate pending writeback child %s -> %s failed", meta.Path, newChild)
-				continue
-			}
+			fs.writeBack.RenamePending(meta.Path, newChild)
 			if fs.uploader != nil {
 				fs.uploader.Submit(newChild)
 			}
@@ -11392,16 +11378,15 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 
-	// Retry the overlay move once after pending reconciliation. A persistent
-	// failure preserves its source bytes and is reported after local namespace
-	// state catches up with the already committed remote rename.
-	if overlayErr != nil {
-		overlayErr = fs.renameLocalOverlaySubtree(oldP, newP)
-	}
-
 	// The server's RenameDir already moved its jfs edge and projection subtree
 	// in one transaction; only local namespace reconciliation remains here.
 	fs.finishLocalRename(input, oldP, newP)
+	// Retry after local namespace reconciliation. A persistent failure preserves
+	// its source bytes and is reported with handles/inodes aligned to the
+	// already committed remote rename.
+	if overlayErr != nil {
+		overlayErr = fs.renameLocalOverlaySubtree(oldP, newP)
+	}
 	if overlayErr != nil {
 		safeLogPrintf("rename: migrate local overlay subtree %s -> %s failed after remote commit: %v", oldP, newP, overlayErr)
 		return localErrToFuseStatus(overlayErr)

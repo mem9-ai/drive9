@@ -317,8 +317,9 @@ func TestRenameDirectoryOverlayFailureReconcilesCommittedState(t *testing.T) {
 				fh.Lock()
 				done := make(chan gofuse.Status, 1)
 				go func() { done <- fs.Rename(nil, input, "staging", "final") }()
-				// The index moves immediately before retarget waits for fh.mu.
-				// At this point the first overlay attempt has already failed.
+				// finishLocalRename moves the index before retarget waits for
+				// fh.mu. The first overlay attempt and pending migration have
+				// completed when this becomes observable.
 				deadline := time.Now().Add(5 * time.Second)
 				for {
 					fs.openHandles.mu.RLock()

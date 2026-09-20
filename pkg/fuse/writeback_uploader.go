@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -258,27 +257,6 @@ func (u *WriteBackUploader) WaitPath(localPath string) {
 	u.inflightMu.Unlock()
 	if ok {
 		<-ps.done
-	}
-}
-
-// WaitPrefix blocks until no in-flight upload under prefix is observed.
-// Queued or newly submitted uploads can still start after it returns; this is
-// not a prefix mutation barrier. That rename race is tracked in issue #944.
-func (u *WriteBackUploader) WaitPrefix(prefix string) {
-	for {
-		u.inflightMu.Lock()
-		found := false
-		for p := range u.inflight {
-			if strings.HasPrefix(p, prefix) {
-				found = true
-				break
-			}
-		}
-		u.inflightMu.Unlock()
-		if !found {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 

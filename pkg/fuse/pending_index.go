@@ -476,28 +476,8 @@ func (idx *PendingIndex) ConflictSummary() (count int, bytes int64, firstPath st
 	return count, bytes, firstPath
 }
 
-// ListByPrefix waits for per-path operations observed at entry, then copies
-// the current metadata under prefix. It does not prevent new operations from
-// starting; namespace mutation callers must synchronize those writers.
+// ListByPrefix returns metadata for all paths with the given prefix.
 func (idx *PendingIndex) ListByPrefix(prefix string) []*WriteBackMeta {
-	// Collect paths with in-flight operations under prefix.
-	idx.mu.Lock()
-	var inflightPaths []string
-	for p := range idx.pathLocks {
-		if strings.HasPrefix(p, prefix) {
-			inflightPaths = append(inflightPaths, p)
-		}
-	}
-	idx.mu.Unlock()
-
-	// Wait for each in-flight operation to finish by acquiring and immediately
-	// releasing its per-path lock. This guarantees the operation has completed
-	// and published its results to idx.items before we scan.
-	for _, p := range inflightPaths {
-		pl := idx.acquirePathLock(p)
-		idx.releasePathLock(p, pl)
-	}
-
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
