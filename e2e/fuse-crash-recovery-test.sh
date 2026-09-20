@@ -14,6 +14,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/durability-contract.sh"
+drive9_e2e_init_durability "interactive"
+
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
@@ -125,8 +129,14 @@ start_mount() {
   # --foreground keeps the daemon as our child: plain `drive9 mount`
   # daemonizes (re-execs a --foreground child and the parent exits), which
   # would make $! useless for kill -9.
-  drive9 mount --mode=fuse --foreground --cache-dir "$CACHE_DIR" --durability interactive \
-    ${FUSE_PROFILE:+--profile} ${FUSE_PROFILE:+"$FUSE_PROFILE"} "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+  local mount_args=(mount --mode=fuse --foreground --cache-dir "$CACHE_DIR"
+    --durability "$DRIVE9_E2E_EFFECTIVE_DURABILITY")
+  if [ -n "${FUSE_PROFILE:-}" ]; then
+    mount_args+=(--profile "$FUSE_PROFILE")
+  fi
+  mount_args+=("$MOUNT_POINT")
+  drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"
+  drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
   if wait_mount_state mounted; then
     DAEMON_PID="$(pgrep -f "$CLI_BIN mount" 2>/dev/null | head -1)"

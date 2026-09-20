@@ -18,6 +18,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/durability-contract.sh"
+drive9_e2e_init_durability "interactive"
+
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
@@ -149,16 +153,23 @@ start_mount() {
   # --foreground keeps the daemon as our child so its stderr (the perf
   # summary) lands in MOUNT_LOG; plain `drive9 mount` daemonizes.
   local perf_dir="$RUN_ROOT/perf"
-  drive9 mount --mode=fuse --foreground --cache-dir "$CACHE_DIR" --durability interactive \
-    ${FUSE_PROFILE:+--profile} ${FUSE_PROFILE:+"$FUSE_PROFILE"} \
-    --perf-dir "$perf_dir" \
-    --perf-interval 1h \
-    --perf-cpu-duration 1ms \
-    --perf-cpu-interval 1h \
-    --perf-heap-interval 1h \
-    --perf-max-sample-files 1 \
-    --perf-max-profile-files 1 \
-    ":$ROOT_REMOTE" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+  local mount_args=(mount --mode=fuse --foreground --cache-dir "$CACHE_DIR"
+    --durability "$DRIVE9_E2E_EFFECTIVE_DURABILITY")
+  if [ -n "${FUSE_PROFILE:-}" ]; then
+    mount_args+=(--profile "$FUSE_PROFILE")
+  fi
+  mount_args+=(
+    --perf-dir "$perf_dir"
+    --perf-interval 1h
+    --perf-cpu-duration 1ms
+    --perf-cpu-interval 1h
+    --perf-heap-interval 1h
+    --perf-max-sample-files 1
+    --perf-max-profile-files 1
+    ":$ROOT_REMOTE" "$MOUNT_POINT"
+  )
+  drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"
+  drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
   if wait_mount_state mounted; then
     return 0
