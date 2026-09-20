@@ -163,6 +163,9 @@ download_official_cli() {
 }
 
 prepare_cli_binary() {
+  local override_rc
+  if drive9_e2e_use_cli_override; then return 0; else override_rc=$?; fi
+  [ "$override_rc" -eq 1 ] || return "$override_rc"
   CLI_BIN="$(mktemp)"
   case "$CLI_SOURCE" in
     build)
@@ -207,6 +210,7 @@ wait_mount_state() {
 }
 
 start_mount() {
+  local mount_role="$1"
   {
     echo "=== drive9 performance mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
     echo "root_remote=$ROOT_REMOTE"
@@ -219,7 +223,10 @@ start_mount() {
     mount_args+=(--profile "$FUSE_PROFILE")
   fi
   mount_args+=("$MOUNT_POINT")
-  drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"
+  if ! drive9_e2e_print_mount_evidence "$mount_role" "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"; then
+    echo "failed to record mount evidence for role=$mount_role" >&2
+    return 70
+  fi
   drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
 
@@ -763,7 +770,7 @@ cleanup() {
   stop_mount
   publish_artifacts || true
   if [ -n "${CLI_BIN:-}" ]; then
-    rm -f "$CLI_BIN"
+    drive9_e2e_cleanup_cli_bin
   fi
   if [ "$rc" -eq 0 ] && [ "$FAIL" -eq 0 ] && [ "$FUSE_PERF_KEEP_ARTIFACTS" != "1" ]; then
     rm -rf "$RUN_ROOT"
@@ -781,7 +788,7 @@ drive9_retry fs mkdir "$ROOT_REMOTE" >/dev/null
 check_eq "remote performance root" "$ROOT_REMOTE" "$ROOT_REMOTE"
 
 echo "[5] mount writable namespace"
-if start_mount; then
+if start_mount primary; then
   check_eq "performance mount is mounted" "true" "true"
   if ls "$MOUNT_POINT" >/dev/null 2>&1; then
     check_eq "mount root ls precheck" "true" "true"
