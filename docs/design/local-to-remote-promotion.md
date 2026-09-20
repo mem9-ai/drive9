@@ -253,10 +253,12 @@ The coordinator persists a record before remote side effects:
 
 ```text
 migration_id
+allocation_token
 source_path
 target_path
 source_identity (local root UUID, reserved source-incarnation UUID)
 manifest_hash
+create_request_digest
 target_expectation (canonical target, expected absence fixed to true in P0,
                     server precondition digest after CreateImport)
 storage_plan (mode, digest, backend capability generation, limits)
@@ -273,9 +275,9 @@ updated_at
 The manifest is written to a temporary file, fsynced, renamed to its final
 name, and followed by a parent-directory fsync. The checksummed migration record
 is then written with the same temp-file, fsync, rename, and directory-fsync
-sequence. The record, owner token, and recovery token are private mode `0600`
-state. Recovery accepts only a complete record whose manifest hash matches; it
-never assumes the pair was atomically written.
+sequence. The record and its allocation, owner, and recovery tokens are private
+mode `0600` state. Recovery accepts only a complete record whose manifest hash
+matches; it never assumes the pair was atomically written.
 
 Per-content staging progress is a checksummed, fsynced journal in the same
 private state directory. P0 records the relative content identity, hash, size,
@@ -286,16 +288,18 @@ the same rule applies separately to its content attempt and every write-grant
 key, so response loss is never interpreted as permission to allocate a
 replacement side effect.
 
-The initial record contains the canonical target and expected absence. After a
-successful or recovered `CreateImport`, the coordinator rewrites and fsyncs the
-record with the server precondition digest and owner epoch. The digest is for
-reconciliation only; the server always uses its own stored namespace facts at
-commit.
+The initial record contains the allocation token, canonical target, expected
+absence, and exact create-request digest. After a successful or recovered
+`CreateImport`, the coordinator rewrites and fsyncs the record with the server
+precondition digest and owner epoch and advances the local phase to `STAGING`
+before sending content. The target-precondition digest is for reconciliation
+only; the server always uses its own stored namespace facts at commit.
 
 Phases are monotonic:
 
 ```text
 PREPARED
+  -> CREATE_REQUESTED
   -> STAGING
   -> STAGED_VERIFIED
   -> COMMIT_REQUESTED
@@ -306,6 +310,13 @@ PREPARED
 ```
 
 No phase transition relies only on an in-memory flag.
+
+`PREPARED` means the complete request identity is durable and the coordinator
+has **not** dispatched `CreateImport`. Immediately before the first network
+write that can dispatch that request, it rewrites and fsyncs
+`CREATE_REQUESTED`; therefore this phase means the create outcome may be
+unknown. A transport send is forbidden directly from `PREPARED`. This ordering
+is the local proof that distinguishes “never sent” from “possibly accepted.”
 
 #### Durable local source identity
 
@@ -362,7 +373,9 @@ PlanImport(target, expected_target_absent=true, canonical_manifest)
      storage_mode, storage_plan_digest, backend_capability_generation,
      limits, plan_expires_at
 AllocateImportID()
-CreateImport(migration_id, target, expected_target_absent=true,
+  -> migration_id, allocation_token, create_before
+CreateImport(migration_id, allocation_token,
+             target, expected_target_absent=true,
              canonical_manifest,
              manifest_hash, entry_total, byte_total, max_content_size,
              storage_plan_digest, backend_capability_generation,
@@ -390,6 +403,7 @@ AttachImportContent(migration_id, owner_epoch, owner_token,
 VerifyImport(migration_id, owner_epoch, owner_token, manifest_hash)
 CommitImport(migration_id, owner_epoch, owner_token)
 GetImport(migration_id)
+RetireImportAllocation(migration_id, allocation_token)
 AbortImport(migration_id, owner_epoch, owner_token)
 RenewImportLease(migration_id, owner_epoch, owner_token)
 TakeOverImport(migration_id, expected_owner_epoch,
@@ -439,12 +453,15 @@ and cannot create an import.
    the same comparison and returns its terminal result. After retirement it
    returns `import_id_retired`. These are recovery of an accepted transaction,
    not new admission. Any mismatch returns conflict and cannot reset the epoch.
-3. Only when no row exists does the server validate allocation-token signature
-   and `create_before`, plan MAC/expiry, current capability generation,
+3. Only when no accepted row exists does the server lock the durable allocation
+   claim. It rechecks for an accepted winner, then validates claim state/token,
+   `create_before`, plan MAC/expiry, current capability generation,
    authorization, limits, and quota before attempting the atomic insert.
-4. If the insert loses a unique-key race, the transaction rolls back and the
-   server re-reads the winning row, applying step 2. It never allocates a
-   second reservation or entry set.
+4. The transaction changes the claim from `ALLOCATED` to `ACCEPTED` together
+   with the import, reservation, and entry insert. Concurrent identical creates
+   serialize on the claim and the loser applies step 2; a mismatched loser
+   conflicts. A concurrent retirement winner makes create return
+   `import_id_retired`. No path allocates a second reservation or entry set.
 
 The create-request digest covers every immutable request field including the
 canonical manifest hash, canonical target, `expected_target_absent=true`, and
@@ -453,14 +470,30 @@ as takeover; the caller must follow the explicit expired-lease takeover
 contract. Changing the expected-absence field on a recovery request therefore
 conflicts rather than recovering or creating a replacement import.
 
-Migration IDs are tenant-bound, authenticated IDs returned by
-`AllocateImportID`, with a signed `create_before` time and random, non-reusable
-identity. The coordinator obtains and fsyncs the ID and both tokens before
-`CreateImport`, so allocation creates no stage or quota side effect.
-When no row exists, `CreateImport` accepts an ID only before `create_before`;
-an expired or previously consumed ID can never start a new import. Recovery of
-an already-accepted row follows the digest/token comparison above and is not a
-new use of the allocation token. An active import has no
+Migration IDs are tenant-bound random, non-reusable identities returned by
+`AllocateImportID`. Allocation persists one quota-neutral claim keyed by
+`(tenant_id, migration_id)`, a hash of the opaque allocation token, and
+`create_before`; it creates no import, manifest stage, reservation, or content
+side effect. A lost allocation response may leave only this bounded inert
+claim; the client may allocate a different ID, while the server retires the
+unclaimed row at `create_before`. The coordinator obtains and fsyncs the ID,
+allocation token, owner token, and recovery token before `CreateImport`.
+
+The first-create transaction locks that allocation claim. It accepts only an
+`ALLOCATED` claim with the matching token and database time before
+`create_before`, then creates the import/reservation/entries and changes the
+claim to `ACCEPTED` atomically. An `ACCEPTED` claim resolves through the
+existing-row recovery contract; a `RETIRED` or missing claim can never create
+an import. `RetireImportAllocation` locks the same claim and CASes
+`ALLOCATED -> RETIRED`. If it races a delayed `CreateImport`, exactly one wins:
+retirement makes that and every later create fail irreversibly, while an
+accepted create makes retirement return the existing import for recovery.
+Thus `GetImport=not found` is only an observation, never proof that a request
+cannot still commit. Only the durable local `PREPARED` phase (request provably
+never dispatched) or a successful claim retirement supplies that proof.
+
+Recovery of an already-accepted row follows the digest/token comparison above
+and is not a new use of the allocation token. An active import has no
 allocation-time retirement deadline: its durable row remains queryable until
 the server reaches a terminal state, and terminal retention begins only then.
 
@@ -877,14 +910,27 @@ but request lifetime is not ownership of the accepted work. The worker's final
 database transaction is the namespace linearization point. In that transaction
 it:
 
-1. revalidates destination authorization and quota;
-2. revalidates the target precondition and rename type rules;
-3. verifies the complete staged manifest;
-4. transfers every staged content reference to its committed inode owner;
-5. converts the quota reservation to committed usage without double charge;
-6. materializes the complete remote tree;
-7. writes the committed result and one structural-reset outbox event containing
+1. locks the tenant namespace-capability row and requires
+   `namespace_cas_ready=true` and `namespace_cas_epoch` equal to the epoch
+   captured by `CreateImport`;
+2. revalidates destination authorization and quota;
+3. revalidates the target precondition and rename type rules;
+4. verifies the complete staged manifest;
+5. transfers every staged content reference to its committed inode owner;
+6. converts the quota reservation to committed usage without double charge;
+7. materializes the complete remote tree;
+8. writes the committed result and one structural-reset outbox event containing
    target parent, migration ID, and tree generation.
+
+The readiness/epoch check is not satisfied merely because `CommitImport`
+entered `COMMITTING`. If it fails at the final linearization point, that same
+transaction publishes nothing, transfers no content/quota, emits no outbox
+event, and moves the import to `ABORTING` with the durable
+`target_precondition_changed` reason. The source remains authoritative. A
+rollback/epoch-change transaction and final publish therefore serialize on the
+same tenant row: publish may linearize first under the old valid epoch, or the
+epoch change may win and force the import to abort, but an old worker cannot
+publish afterward.
 
 P0 caps manifest entries and total metadata bytes below the database
 transaction and statement limits. A larger tree fails before staging; it is not
@@ -901,6 +947,18 @@ promotion_storage_capabilities(
   tenant_id, generation, inline_enabled, inline_threshold,
   allowed_mode, updated_at,
   primary key (tenant_id)
+)
+
+promotion_namespace_capabilities(
+  tenant_id, namespace_cas_ready, namespace_cas_epoch,
+  minimum_writer_protocol, updated_at,
+  primary key (tenant_id)
+)
+
+import_id_claims(
+  tenant_id, migration_id, allocation_token_hash, create_before, claim_state,
+  accepted_create_request_digest, retired_at, created_at, updated_at,
+  primary key (tenant_id, migration_id)
 )
 
 imports(
@@ -1001,6 +1059,15 @@ and unowned objects are garbage collected. Commit changes content ownership and
 namespace visibility in the same transaction; storage deletion is always an
 outbox/GC consequence and never precedes the durable ownership decision.
 
+`import_id_claims` is also the serialization row for first create versus
+allocation retirement. Its state is `ALLOCATED`, `ACCEPTED`, or `RETIRED` and
+never moves backward. An accepted claim remains linked to the import/tombstone;
+the expiry scanner retires an unused `ALLOCATED` claim under the same row lock
+used by first Create, so an in-flight create or retirement is the sole winner.
+An unused retired claim may be compacted after `create_before` plus the maximum
+request/recovery window, but a missing claim is treated as retired/invalid and
+can never be reconstructed from an old token.
+
 The ordinary namespace schema also supplies the non-reusable parent
 path-edge incarnation and monotonic child-set generation described above.
 Every namespace mutation, including legacy create/unlink/rename code paths,
@@ -1073,8 +1140,10 @@ availability. Rollout is therefore ordered and fail-closed:
    canonical namespace. Backfill is retried idempotently but never overlaps an
    unfenced legacy writer.
 4. Atomically mark that tenant `namespace_cas_ready` with a new CAS epoch only
-   after the audit and all-writer gate pass. `CreateImport` records this epoch;
-   `CommitImport` requires the tenant to remain ready at the same epoch.
+   after the audit and all-writer gate pass. `CreateImport` records this epoch.
+   Both commit acceptance and, normatively, the final namespace-publish
+   transaction lock the tenant capability row and require it to remain ready at
+   exactly that epoch; an earlier check cannot authorize later publication.
 
 Promotion API routes and the FUSE preview return `promotion_not_enabled` until
 that per-tenant gate is ready. A rollback below the minimum writer version must
@@ -1182,7 +1251,8 @@ The server state is authoritative for publish and accounting outcome:
 
 | `GetImport` result | Client authority and fence | Server resources and next action | Local-record disposition |
 | --- | --- | --- | --- |
-| not found from an authorized, strongly consistent lookup | Source is authoritative; keep both paths fenced while reconciling the lost-create outcome. | No reservation or stage exists. | Fsync a local aborted result, then release fences and remove the active record. |
+| not found, or an `ALLOCATED` claim with no import | Source is currently authoritative, but `CREATE_REQUESTED` remains outcome-unknown; keep both paths fenced. | A delayed create may still win. Retry the exact `CreateImport` or serialize with it through `RetireImportAllocation`; lookup absence alone causes no cleanup. | Retain; never release a fence or delete the record from this observation. |
+| `RETIRED` allocation claim with no accepted import | Source is authoritative. | Claim retirement serialized after every in-flight create loser, so no reservation or stage can appear later. | Fsync a local aborted result, release fences, then remove the active record. |
 | `CREATED` | Source is authoritative; keep both fenced during recovery. | Reservation exists; no or partial stage. Resume with the current durable owner token, take over after expiry, or abort. | Retain until `ABORTED` or a later commit result. |
 | `STAGING` | Source is authoritative; keep both fenced during recovery. | Reservation and partial hidden inline stage remain. Resume/take over or abort. In a future external mode, old control-plane mutations are epoch-fenced and already-issued grants remain isolated/tracked through landing closure plus GC. | Retain. |
 | `VERIFIED` | Source is authoritative; keep both fenced. | Immutable hidden stage and reservation remain. Commit with the same migration ID or abort; no entry mutation is allowed. | Retain. |
@@ -1197,7 +1267,8 @@ The durable local phase refines, but never overrides, that server result:
 | Last durable local phase | Recovery action |
 | --- | --- |
 | Local record missing | No client operation existed. A server import with no matching record is reclaimed only by its lease/GC state machine. |
-| `PREPARED` | Install fences and call `GetImport`; not-found is the only proof that create never became durable. |
+| `PREPARED` | Install fences. The fsynced phase proves no create dispatch occurred; retire the allocation claim before recording local abort/releasing fences. If retirement instead reports an accepted import, fail closed and reconcile it. |
+| `CREATE_REQUESTED` | Install fences and treat the result as unknown. Retry the exact idempotent `CreateImport`, or call `RetireImportAllocation`; a not-found lookup never releases the fence. Retirement and first create lock the same claim, so the returned accepted-or-retired result is definitive. |
 | `STAGING` | Reconcile owner epoch and server state before uploading or aborting. |
 | `STAGED_VERIFIED` | Reconcile before commit; do not mutate the frozen manifest. |
 | `COMMIT_REQUESTED` | Query `GetImport`; never retry with a new migration ID or infer failure from disconnect. |
@@ -1344,6 +1415,8 @@ owner.
 Kill and restart before and after:
 
 - local record and manifest fsync;
+- `PREPARED -> CREATE_REQUESTED` record fsync, first Create request dispatch,
+  allocation-claim lock, atomic Create commit, and response delivery;
 - atomic `CreateImport` manifest-entry/reservation commit and lost response;
 - inline-content idempotency-key journal fsync, bounded body/transaction send,
   DB commit, response loss, and returned content-ID journal fsync;
@@ -1377,6 +1450,11 @@ tree. Repeated recovery is idempotent.
 - target creation by another mount during staging;
 - target `create -> delete` ABA between precondition issue and commit;
 - target parent rename away, rename away-and-back, and delete/recreate;
+- final publish versus namespace-CAS disable/epoch advance: a barrier test lets
+  publish lock the tenant capability row first and permits the old-epoch commit
+  to finish, while the complementary test lets rollback advance the epoch first
+  and requires the `COMMITTING` worker to publish nothing and reach `ABORTED`
+  with `target_precondition_changed`;
 - unrelated target-parent sibling mutation conservatively returns
   `target_precondition_changed`/`EAGAIN` in P0 while the requested child remains
   absent; it never masquerades as `EEXIST`;
@@ -1388,6 +1466,11 @@ tree. Repeated recovery is idempotent.
   deadline remains queryable and reaches a terminal state;
 - coordinator crash followed by expired-lease takeover; every old-epoch renew,
   inline-content, entry, verify, commit, and abort mutation is rejected;
+- a delayed first `CreateImport` versus recovery: one strongly consistent
+  not-found observation must leave fences intact. A barrier then lets either
+  Create accept the allocation claim or `RetireImportAllocation` retire it;
+  recovery must respectively resume the one import or prove no import can ever
+  appear before releasing fences;
 
 The following cases are not claims about the initial inline-only P0. They are
 mandatory gates before enabling any future external-object adapter:
@@ -1448,8 +1531,10 @@ The remaining P0/FUSE concurrency cases are:
   `plan_expires_at` and advance the backend capability generation after the
   first create transaction commits: the identical retry still recovers that
   row, while an absent-row request is rejected by new-admission checks;
-- a unique-key race between identical creates returns the winner; a mismatched
-  request conflicts, and neither path creates a second reservation/entry set;
+- concurrent identical creates serialize on the durable allocation claim and
+  return the winner; a mismatched request conflicts, retirement versus create
+  has exactly one durable winner, and no path creates a second
+  reservation/entry set;
 - the import row, quota reservation, and all manifest entries are all present
   or all absent after transaction failure injection; no content endpoint can
   observe an import without its complete expected entry set;
@@ -1540,7 +1625,9 @@ external-object adapter:
   whose canonical path changes; deleting that refresh makes an ancestor
   rename-away-and-back test fail;
 - changing or disabling the tenant namespace CAS epoch after `CreateImport`
-  makes `CommitImport` fail closed;
+  but before the final publish transaction makes the accepted `COMMITTING`
+  worker fail closed; deleting only the final-transaction recheck (while
+  retaining the earlier check) makes the rollback-winner barrier test fail;
 - rollback below the minimum writer version is rejected while imports are
   active or promotion remains enabled, and re-enable requires a fresh audit;
 - deleting the writer-version/admission check makes the old-writer fixture
@@ -1549,6 +1636,10 @@ external-object adapter:
 ### Local recovery and reuse
 
 - recovery reinstalls fences before the first lookup;
+- a crash in `PREPARED` proves the request was never dispatched and retires the
+  allocation claim before releasing fences; a crash in `CREATE_REQUESTED`
+  treats Create as outcome-unknown, and deleting that phase fsync or treating a
+  single not-found lookup as terminal makes the delayed-create barrier fail;
 - `COMMIT_REQUESTED` with an unreachable server blocks only the affected paths
   or fails the mount closed;
 - successful publish followed immediately by recreating the old path creates a
@@ -1614,7 +1705,10 @@ Tests must fail when independently deleting:
 - the activity-deadline state CAS, including both deterministic winners:
   deadline-before-commit yields the stable deadline result, while
   commit-before-deadline preserves the actual server-owned commit outcome;
-- the namespace all-writer rollout/admission gate;
+- the namespace all-writer rollout/admission gate and the final publish
+  transaction's locked ready/epoch revalidation;
+- the fsynced `CREATE_REQUESTED` outcome-unknown phase and durable allocation
+  claim serialization between delayed first create and retirement;
 - quota reservation conversion and content-ref ownership transfer;
 - the reserved source-incarnation UUID comparison used by recovery and
   post-commit quarantine;
