@@ -166,6 +166,14 @@ The first version preserves:
 Unsupported ownership, ACL, xattr, hard-link, sparse-file, or special-file
 semantics cause the operation to fail before remote side effects.
 
+The sole xattr exception is Drive9's exact reserved source-incarnation key on
+the source root. It is private coordinator metadata: traversal filters it from
+the manifest, checksum, destination metadata, and unsupported-xattr result.
+The same key on a descendant is corrupt state, and every other xattr remains
+unsupported. A symlink source root, a filesystem without durable no-follow
+xattr operations, or failure to fsync the reserved marker is rejected before
+`CreateImport` or quota reservation.
+
 ### Error contract
 
 The explicit promotion API returns stable typed errors. The restricted FUSE
@@ -240,6 +248,7 @@ target_expectation (canonical target, expected absence,
 staging_ref
 owner_epoch (0 until returned or recovered from GetImport)
 owner_token
+recovery_token
 phase
 created_at
 updated_at
@@ -248,9 +257,9 @@ updated_at
 The manifest is written to a temporary file, fsynced, renamed to its final
 name, and followed by a parent-directory fsync. The checksummed migration record
 is then written with the same temp-file, fsync, rename, and directory-fsync
-sequence. The record and its owner token are private mode `0600` state. Recovery
-accepts only a complete record whose manifest hash matches; it never assumes
-the pair was atomically written.
+sequence. The record, owner token, and recovery token are private mode `0600`
+state. Recovery accepts only a complete record whose manifest hash matches; it
+never assumes the pair was atomically written.
 
 The initial record contains the canonical target and expected absence. After a
 successful or recovered `CreateImport`, the coordinator rewrites and fsyncs the
@@ -323,10 +332,17 @@ released without being hidden or deleted by the old migration.
 The exact wire shape may change, but the runtime requirements are fixed:
 
 ```text
+AllocateImportID()
 CreateImport(migration_id, target, expected_target_absent,
-             manifest_hash, entry_total, byte_total, owner_token)
+             manifest_hash, entry_total, byte_total,
+             owner_token, recovery_token)
 CreateImportContent(migration_id, owner_epoch, owner_token,
                     relative_path, entry_hash, size)
+CompleteImportContentUpload(migration_id, owner_epoch, owner_token,
+                            content_id, upload_attempt_id,
+                            multipart_completion)
+SealImportContent(migration_id, owner_epoch, owner_token,
+                  content_id, upload_attempt_id)
 PutImportEntry(migration_id, owner_epoch, owner_token,
                relative_path, entry_hash,
                import_content_token, metadata)
@@ -335,22 +351,81 @@ CommitImport(migration_id, owner_epoch, owner_token)
 GetImport(migration_id)
 AbortImport(migration_id, owner_epoch, owner_token)
 RenewImportLease(migration_id, owner_epoch, owner_token)
-TakeOverImport(migration_id, expected_owner_epoch, new_owner_token)
+TakeOverImport(migration_id, expected_owner_epoch,
+               recovery_token, new_owner_token)
+AcknowledgeImportResult(migration_id, recovery_token,
+                        terminal_state, result_digest)
 ```
 
 Every method is idempotent for the same migration identity and payload. Reuse
 with different target, manifest, or content returns conflict.
-Repeating `CreateImport` with the same owner token returns the current state and
-does not duplicate the reservation. Repeating it with a different token never
-acts as takeover or resets an epoch; the caller must follow the explicit
-expired-lease takeover contract.
+Repeating `CreateImport` with the same owner and recovery tokens returns the
+current state and does not duplicate the reservation. Repeating it with either
+token changed never acts as takeover or resets an epoch; the caller must follow
+the explicit expired-lease takeover contract.
+
+Migration IDs are tenant-bound, authenticated IDs returned by
+`AllocateImportID`, with signed `create_before` and `retire_after` times. The
+coordinator obtains and fsyncs the ID and both tokens before `CreateImport`, so
+allocation creates no stage or quota side effect. `CreateImport` accepts an ID
+only before `create_before`; an expired or previously consumed ID can never
+start a new import. `retire_after` is later than every capability lifetime,
+in-flight safety margin, cleanup deadline, and supported offline-recovery
+window for the import.
 
 `migration_id` is scoped by tenant. Content references are server-issued for
 that import and tenant; the client cannot attach an arbitrary storage key or a
-content reference owned by another tenant. `CreateImportContent` returns the
-bounded upload plan/capability used by the existing direct or multipart upload
-machinery. The completed object is checked against the declared size and hash
-before an entry can reference it.
+content reference owned by another tenant.
+
+#### Immutable staged content and capability closure
+
+An object-store upload capability can outlive a server epoch check. Therefore
+no direct or multipart capability ever writes a key or version that a verified
+manifest references. `CreateImportContent` creates a durable upload-attempt row
+and returns a short-lived capability scoped to the exact tenant, migration,
+content, attempt UUID, temporary object key, maximum size, and checksum header
+where the provider supports it. It cannot write any committed or sealed key.
+The maximum size must be enforced by the provider's signed request contract or
+by a Drive9 upload proxy; a backend that can only detect an oversized direct
+upload after accepting unbounded bytes is not eligible for direct capability
+upload.
+
+Each attempt records its capability `not_after`, provider upload ID, temporary
+key, state, and GC status before the capability is returned. Multipart
+capabilities permit part upload only; completion is an epoch-fenced Drive9
+operation. A takeover always allocates a new attempt UUID, temporary key, and
+multipart upload ID; no attempt from an earlier owner epoch is reused. Direct
+PUT may be replayable until expiry, so its temporary key is always treated as
+mutable and untrusted.
+
+Before `VerifyImport`, an epoch-fenced seal operation snapshots an uploaded
+attempt into a new immutable sealed object version. It then reads that sealed
+version, validates the exact byte count and checksum, and records its provider
+version ID or an equivalent create-only storage identity. A backend that cannot
+produce and later address an immutable version is unsupported for promotion.
+The manifest references only this sealed identity. `VerifyImport` freezes the
+ordered set of sealed identities, sizes, and hashes; `CommitImport` rechecks
+those exact identities and never resolves a mutable temporary key. A late PUT
+or part from an old owner can therefore affect only its old temporary attempt,
+not verified or committed bytes.
+
+On owner-epoch takeover, verify, commit acceptance, or abort, the server stops
+issuing capabilities for the old epoch and aborts outstanding multipart upload
+IDs where supported. Revocation is not assumed. Every temporary attempt stays
+in the durable attempt ledger until its capability expiry plus a provider clock
+and in-flight-request safety margin has passed and a sweeper has confirmed the
+temporary key/parts are absent. Cleanup repeats delete/abort after that bound,
+so a PUT that lands after an earlier delete is still collected. `ABORTED` may
+release customer quota once sealed ownership is detached, but its attempt
+ledger and internal cleanup obligation remain until `gc_done`; deleting the
+ledger early is forbidden. Object-store lifecycle policy is a backstop, not the
+correctness mechanism.
+
+Each capability is bounded by the import reservation and a separate internal
+temporary-attempt budget. Customer quota may be released at `ABORTED`, but the
+maximum bytes of every still-live capability remain charged to that internal
+cleanup budget until `gc_done`. This prevents repeated aborts or takeovers from
+turning the capability-expiry window into unbounded provider storage debt.
 
 During `CreateImport`, the server resolves and records an immutable target
 precondition; clients cannot supply or replace its namespace facts. It is a
@@ -367,7 +442,10 @@ increments its child-set generation in the same namespace transaction. Every
 directory-entry create or rename assigns a fresh, non-reusable path-edge
 incarnation, even when the underlying inode identity is retained. The
 filesystem root has a durable root-edge incarnation and child-set generation.
-These counters are server-maintained and cannot be supplied by clients.
+Because `file_nodes` stores canonical paths, a subtree rename assigns a fresh
+edge incarnation to every row whose canonical path changes; otherwise an
+ancestor rename-away-and-back could preserve the recorded direct-parent edge.
+These facts are server-maintained and cannot be supplied by clients.
 
 The concrete P0 namespace representation adds an opaque edge-incarnation UUID
 to each `file_nodes` row and an unsigned child-set generation to each directory
@@ -397,14 +475,14 @@ The transitions and their durable effects are normative:
 
 | From | Trigger | To | Durable result |
 | --- | --- | --- | --- |
-| none | `CreateImport` | `CREATED` | Identity, target precondition, manifest totals, reservation, owner epoch `1`, owner-token hash, and lease are stored atomically. |
+| none | `CreateImport` | `CREATED` | Identity, target precondition, manifest totals, reservation, namespace-CAS epoch, owner epoch `1`, owner/recovery-token hashes, and lease are stored atomically. |
 | `CREATED` | first accepted entry/content mutation | `STAGING` | Partial hidden stage and the same reservation remain owned by the import. |
 | `STAGING` | successful `VerifyImport` | `VERIFIED` | Entry set, content set, and manifest version become immutable. |
 | `VERIFIED` | accepted `CommitImport` CAS | `COMMITTING` | Commit attempt ID and accepted outcome are durable; request cancellation can no longer abort it. |
 | `COMMITTING` | server commit worker | `COMMITTED` | Target CAS, namespace publication, ownership transfer, reservation settlement, result row, and structural outbox event commit atomically. |
-| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort or expired-lease GC CAS | `ABORTING` | No new upload, verify, renew, takeover, or commit is accepted; cleanup ownership is durable. |
+| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort or expired-lease GC CAS | `ABORTING` | No new capability, completion, seal, entry, verify, renew, takeover, or commit is accepted; cleanup ownership, including all issued attempt expiries, is durable. |
 | `COMMITTING` | permanent target/auth/manifest failure before publication | `ABORTING` | A durable terminal reason is recorded; no namespace or committed quota changed. Transient failure stays `COMMITTING` and is retried by the server. |
-| `ABORTING` | server cleanup worker | `ABORTED` | Hidden entries and unowned objects are detached, the reservation is released exactly once, and the terminal reason/result is retained. |
+| `ABORTING` | server cleanup worker | `ABORTED` | Hidden entries and sealed unowned objects are detached, the reservation is released exactly once, and the terminal reason/result is retained. Issued-attempt cleanup remains tracked through the post-expiry sweep until `gc_done`. |
 
 There are no other transitions. `COMMITTED` and `ABORTED` are terminal.
 `COMMITTING` and `ABORTING` are server-owned recovery states: client lease
@@ -419,23 +497,27 @@ release use the reservation ID plus terminal ownership state as their
 idempotency key, so a crash after the accounting write but before the worker
 ack cannot double-charge or double-release.
 
-`CreateImport` receives an opaque, random owner token that the coordinator
-generated and fsynced in `PREPARED` before the request. The server stores only
-its hash, creates `owner_epoch = 1`, and returns the epoch and lease expiry.
-Every staging, verify, commit, abort, and renew mutation must present both the
-current epoch and token. Thus a lost create response is recoverable with the
-already-durable token; `GetImport` may disclose the epoch and state but never
-the token.
+`CreateImport` receives opaque, random owner and recovery tokens that the
+coordinator generated and fsynced in `PREPARED` before the request. The server
+stores only their hashes, creates `owner_epoch = 1`, and returns the epoch and
+lease expiry. Every staging, verify, commit, abort, and renew mutation must
+present both the current epoch and owner token. Thus a lost create response is
+recoverable with the already-durable token; `GetImport` may disclose the epoch
+and state but never either token.
 
 For `CREATED`, `STAGING`, or `VERIFIED`, the current owner may renew before
-expiry. After expiry, `TakeOverImport` atomically compares the old epoch and
-state, increments the epoch, installs the hash of a newly generated and
-fsynced token, and grants a new lease. Takeover is rejected while the old lease
-is live and in every server-owned or terminal state. Any request carrying the
-old epoch or token is then fenced, including an old renew, upload, verify,
-commit, or abort. The single-writer local-root lock prevents routine concurrent
-takeover; the server epoch is the authoritative fence for a paused or zombie
-coordinator.
+expiry. After expiry, `TakeOverImport` requires the stable recovery token and
+atomically compares the old epoch and state, increments the epoch, installs the
+hash of a newly generated and fsynced owner token, and grants a new lease.
+Tenant authentication or knowledge of a migration ID alone cannot take over an
+import. Takeover is rejected while the old lease is live and in every
+server-owned or terminal state. Any request carrying the old epoch or owner
+token is then fenced, including an old renew, content-create,
+multipart-complete, seal, entry, verify, commit, or abort control-plane
+mutation. Already-issued provider capabilities are not treated as revoked;
+their isolation and cleanup follow the temporary-attempt contract above. The
+single-writer local-root lock prevents routine concurrent takeover; the server
+epoch is the authoritative fence for a paused or zombie coordinator.
 
 `VERIFIED` freezes the entry set and manifest version. A late or different
 `PutImportEntry` cannot mutate it. Commit acceptance and abort/GC acquisition
@@ -473,9 +555,12 @@ imports(
   tenant_id, migration_id, target_path, target_parent_inode,
   target_parent_path, target_parent_edge_incarnation,
   target_parent_children_generation, manifest_hash, entry_total, byte_total,
-  quota_reservation_id, state, state_version, owner_epoch, owner_token_hash,
+  namespace_cas_epoch, quota_reservation_id, state, state_version,
+  owner_epoch, owner_token_hash, recovery_token_hash,
   lease_expires_at, commit_attempt_id, terminal_reason,
-  committed_root_inode, committed_generation, created_at, updated_at,
+  committed_root_inode, committed_generation, terminal_result_blob,
+  terminal_result_digest, terminal_at, result_acknowledged_at,
+  full_row_compact_not_before, retire_after, created_at, updated_at,
   primary key (tenant_id, migration_id)
 )
 
@@ -486,13 +571,28 @@ import_entries(
 )
 
 import_contents(
-  tenant_id, migration_id, import_content_id, storage_ref,
-  size_bytes, checksum_sha256, upload_state, ownership_state,
+  tenant_id, migration_id, import_content_id, sealed_storage_ref,
+  sealed_storage_version, size_bytes, checksum_sha256,
+  seal_state, ownership_state,
   primary key (tenant_id, migration_id, import_content_id)
+)
+
+import_upload_attempts(
+  tenant_id, migration_id, import_content_id, upload_attempt_id,
+  owner_epoch, temporary_storage_ref, provider_upload_id,
+  maximum_size_bytes, capability_not_after, state,
+  gc_not_before, gc_state,
+  primary key (tenant_id, migration_id, import_content_id, upload_attempt_id)
+)
+
+import_tombstones(
+  tenant_id, migration_id, request_digest, recovery_token_hash, terminal_state,
+  terminal_result_blob, terminal_result_digest, retire_after,
+  primary key (tenant_id, migration_id)
 )
 ```
 
-All three tables are tenant-scoped. A unique relative-path constraint rejects
+All tables are tenant-scoped. A unique relative-path constraint rejects
 duplicate manifest entries after canonical path normalization. Terminal import
 rows retain enough target/result identity to answer retries after staging rows
 and unowned objects are garbage collected. Commit changes content ownership and
@@ -505,6 +605,32 @@ Every namespace mutation, including legacy create/unlink/rename code paths,
 must use the same helper that updates those facts. P0 cannot claim the target
 CAS until delete-the-fix tests prove that bypassing either update is detected.
 
+Full terminal rows are never compacted before
+`full_row_compact_not_before`. A valid `AcknowledgeImportResult`, sent only
+after the client has fsynced its terminal local phase, permits compaction after
+that minimum. A missing acknowledgement may retain the full row longer, but no
+later than a configured maximum full-row retention time; at that bound it is
+also compacted. The compact tombstone therefore stores the complete immutable
+terminal result needed by `GetImport`, not merely a digest.
+
+The tenant-bound migration ID, request digest, recovery-token hash, terminal
+state, result, and result digest remain in `import_tombstones` until the signed
+ID's `retire_after`. During that interval, `CreateImport` conflicts and
+`GetImport` returns the same terminal result. After `retire_after`, the signed
+ID itself is invalid and every API returns `import_id_retired`; it is never
+interpreted as a new or not-found operation. Recovery beyond this documented
+maximum offline window fails closed with `promotion_recovery_required`. The
+configured minimum and maximum full-row windows are both shorter than the ID
+lifetime, making storage retention bounded and migration-ID reuse behavior
+testable with a fake clock.
+
+Physical tombstone deletion additionally requires every upload attempt to be
+`gc_done`. If a provider outage delays cleanup past `retire_after`, external
+APIs still return `import_id_retired`; the terminal result blob and recovery
+token hash may be pruned, while a minimal internal migration/tenant cleanup
+anchor and the attempt ledger remain. Result-payload retention stays bounded;
+cleanup debt is never orphaned merely to satisfy that bound.
+
 The outbox is part of the transaction. It invalidates positive and negative
 directory caches on other mounts. Staging emits no user-visible namespace or
 search events. Namespace, content, and metadata are complete at commit;
@@ -513,6 +639,41 @@ same committed outbox.
 
 The initial implementation requires the destination to be absent. Support for
 replacement of files or empty directories is a later compatibility step.
+
+### Mixed-version namespace rollout gate
+
+Target CAS is unsafe while any structural writer can bypass edge incarnation
+or child-set generation updates. Schema availability alone is not capability
+availability. Rollout is therefore ordered and fail-closed:
+
+1. Add the namespace-version schema and import schema while promotion remains
+   disabled. Deploy binaries that dual-write the new namespace facts on every
+   create, link, unlink, rename, replacement, recursive delete, maintenance,
+   and migration path.
+2. Each namespace-writing process publishes a renewable writer-capability
+   lease containing its build protocol version. The deployment controller
+   drains all older processes and DB sessions, revokes their tenant-write
+   credentials, and enforces a minimum writer version at admission. Writer
+   credentials are deployment-generation scoped, so an old binary that never
+   publishes a lease cannot continue writing through an unversioned shared
+   credential. An absent, stale, or old-version inventory entry blocks
+   enablement.
+3. Under a per-tenant namespace maintenance barrier, backfill a fresh edge
+   incarnation for every existing path, initialize every directory/root
+   child-set generation, and audit that the new facts cover the complete
+   canonical namespace. Backfill is retried idempotently but never overlaps an
+   unfenced legacy writer.
+4. Atomically mark that tenant `namespace_cas_ready` with a new CAS epoch only
+   after the audit and all-writer gate pass. `CreateImport` records this epoch;
+   `CommitImport` requires the tenant to remain ready at the same epoch.
+
+Promotion API routes and the FUSE preview return `promotion_not_enabled` until
+that per-tenant gate is ready. A rollback below the minimum writer version must
+first disable new imports, advance the CAS epoch so every in-flight import
+fails closed, wait for all imports to reach a terminal state, revoke promotion,
+and only then admit old writers. Re-enabling after such a rollback repeats the
+barrier, backfill, audit, and epoch change. There is no mixed-version window in
+which an old writer and an enabled import may coexist.
 
 ### Subtree fence
 
@@ -548,13 +709,22 @@ same owner-epoch abort path. After acceptance it cannot cancel the server
 commit; the request returns outcome-unknown if necessary, retains both fences,
 and resolves `GetImport` until `COMMITTED` or `ABORTED`.
 
-The local root has a single-writer mount lock. Direct mutation of the private
-local root is unsupported, but P1 still detects it. The coordinator traverses
-with `openat`/`fstat` and no-follow semantics, records each entry's device,
-inode, type, size, ctime, mtime and content hash, and revalidates identity and
-metadata after each read and again before `VerifyImport`. Any mismatch or
-symlink swap aborts the import. Coordinator-owned traversal handles are marked
-internal and do not fail the open-handle validation.
+The local root has a single-writer mount lock. The coordinator traverses with
+`openat`/`fstat` and no-follow semantics, records each entry's device, inode,
+reserved root incarnation, type, size, ctime, mtime and content hash, and
+revalidates identity and metadata after each read, before `VerifyImport`, and
+again immediately before `CommitImport`. Any mismatch or symlink swap observed
+at those barriers aborts the import. Coordinator-owned traversal handles are
+marked internal and do not fail the open-handle validation.
+
+Supported mutations enter through Drive9/FUSE and are blocked by the subtree
+fence through commit. Raw mutation of the private local root is unsupported and
+cannot be made atomic with a remote transaction; a raw write after the final
+revalidation has begun may be quarantined after a successful commit. P1 is
+enabled only where the overlay root is private to Drive9. This is an explicit
+support boundary, not a claimed fail-closed guarantee. Closing it would require
+a filesystem snapshot or kernel-enforced external-writer exclusion and is a
+separate capability.
 
 ### Policy homogeneity
 
@@ -605,12 +775,12 @@ The server state is authoritative for publish and accounting outcome:
 | --- | --- | --- | --- |
 | not found from an authorized, strongly consistent lookup | Source is authoritative; keep both paths fenced while reconciling the lost-create outcome. | No reservation or stage exists. | Fsync a local aborted result, then release fences and remove the active record. |
 | `CREATED` | Source is authoritative; keep both fenced during recovery. | Reservation exists; no or partial stage. Resume with the current durable owner token, take over after expiry, or abort. | Retain until `ABORTED` or a later commit result. |
-| `STAGING` | Source is authoritative; keep both fenced during recovery. | Reservation and partial hidden stage remain. Resume/take over or abort; late upload is epoch-fenced. | Retain. |
+| `STAGING` | Source is authoritative; keep both fenced during recovery. | Reservation and partial hidden stage remain. Resume/take over or abort. Old control-plane mutations are epoch-fenced; already-issued data-plane capabilities remain isolated to their old temporary attempts until expiry and GC. | Retain. |
 | `VERIFIED` | Source is authoritative; keep both fenced. | Immutable hidden stage and reservation remain. Commit with the same migration ID or abort; no entry mutation is allowed. | Retain. |
 | `COMMITTING` | Outcome is unknown; neither source nor target is released. | Server owns completion; lease expiry and client abort do nothing. Poll `GetImport`; a recovered server worker reaches `COMMITTED` or `ABORTING`. | Retain; never create a second migration ID. |
 | `ABORTING` | Source remains authoritative, but both paths stay fenced until cleanup completes. | Server resumes hidden-stage deletion and exactly-once reservation release; no client mutation or takeover is accepted. | Retain and poll. |
-| `ABORTED` | Source is authoritative; target was not published. | Reservation is released, staged ownership is detached, and the terminal reason is durable. | Fsync the local aborted result, release fences, then remove the active record; the server tombstone remains for retry identity. |
-| `COMMITTED` | Target is authoritative; keep both fenced until source reconciliation finishes. | Quota is settled, committed content ownership and namespace/outbox result are durable; stage GC cannot remove them. | Verify the source-incarnation UUID, quarantine only the matching source, publish inode/cache state, fsync `DONE`, release fences, then retire the active record. |
+| `ABORTED` | Source is authoritative; target was not published. | Reservation is released, sealed ownership is detached, and the terminal reason is durable. Temporary-attempt GC may continue from its retained ledger until `gc_done`. | Fsync the local aborted result, release fences, then acknowledge/retire the active record; the server tombstone remains for retry identity. |
+| `COMMITTED` | Target is authoritative; keep both fenced until source reconciliation finishes. | Quota is settled, sealed content ownership and namespace/outbox result are durable; temporary-attempt GC cannot remove them and continues independently until `gc_done`. | Verify the source-incarnation UUID, quarantine only the matching source, publish inode/cache state, fsync `DONE`, release fences, then acknowledge/retire the active record. |
 | unreachable or invalid response | Authority is unresolved; keep both paths fenced or fail the mount closed. | No cleanup, quota release, abort, or new migration is guessed. | Retain and return `promotion_recovery_required`. |
 
 The durable local phase refines, but never overrides, that server result:
@@ -666,6 +836,11 @@ owner.
 - lease GC can acquire only `CREATED`, `STAGING`, or `VERIFIED`; it never
   cancels `COMMITTING`, and a crashed `ABORTING` cleanup is resumed until the
   exactly-once release is durable;
+- expired data-plane capabilities can write only migration-owned temporary
+  attempt keys; their durable ledger outlives abort/commit until a post-expiry
+  sweep proves cleanup, while sealed and committed versions are immutable;
+- terminal full rows and compact tombstones follow the acknowledgement and
+  signed-ID retirement contract; a forgotten ID is never accepted as new;
 - entry, byte, depth, and time limits are checked before or during hidden
   staging and never produce a partial final target.
 
@@ -717,6 +892,9 @@ owner.
 - empty and deep directories;
 - zero-byte and large files;
 - symlink without following the target;
+- source-root symlink and no-durable-xattr filesystem rejected before staging;
+- the exact reserved root-incarnation xattr excluded from the manifest while
+  any user xattr and a reserved-key descendant are rejected;
 - mode and mtime round trip;
 - Unicode, spaces, long paths, and tree-size limits;
 - target absent, present, wrong type, nonempty, or inside source;
@@ -750,8 +928,15 @@ tree. Repeated recovery is idempotent.
 - two promotions competing for source or target;
 - commit versus abort and commit versus lease GC;
 - coordinator crash followed by expired-lease takeover; every old-epoch renew,
-  upload, verify, commit, and abort is rejected;
-- verify versus a late upload and upload versus an aborted terminal import;
+  content-create, multipart-complete, seal, entry, verify, commit, and abort
+  control-plane mutation is rejected;
+- an old direct PUT capability writes its temporary key after verify, takeover,
+  commit, and abort cleanup; sealed/committed bytes never change and the late
+  object is deleted after capability expiry plus grace;
+- old multipart parts arrive after takeover/abort and cannot be completed or
+  referenced; provider abort plus post-expiry sweep converges to no parts;
+- verify versus a late upload, and content completion/seal versus an aborted
+  terminal import;
 - writeback enqueue immediately after a drain attempt;
 - direct local-root file replacement and symlink swap while a snapshot is read;
 - a second mount reading while publish occurs;
@@ -764,9 +949,16 @@ tree. Repeated recovery is idempotent.
 - missing, extra, duplicate, absolute, escaping, or symlink-following manifest
   entries are rejected;
 - an upload cannot exceed the reserved entry or byte total;
+- repeated attempt issuance and owner takeover cannot exceed the internal
+  temporary-attempt budget; customer quota release does not release that debt
+  before `gc_done`;
 - commit converts the reservation exactly once after response loss and retry;
 - abort and GC release it exactly once and cannot race a committed import;
 - committed content references survive staging GC;
+- verify records an immutable storage version, and mutating the upload-attempt
+  key afterward cannot change the bytes observed by commit/read;
+- removing the seal/version binding or deleting the retained upload-attempt
+  ledger makes the late-PUT/late-part tests fail;
 - a structural-reset outbox entry exists exactly once for each commit, while
   no staging entry is indexed or emitted;
 - response loss and server restart are injected in every state:
@@ -775,6 +967,24 @@ tree. Repeated recovery is idempotent.
   staging ownership, reservation/committed quota, and local-record retention;
 - deleting the owner-epoch comparison or allowing takeover of a live,
   server-owned, or terminal state makes a focused test fail.
+
+### Upgrade and rollback
+
+- fresh schema with promotion disabled accepts old and new namespace traffic;
+- a live or stale old-writer fixture blocks `namespace_cas_ready` enablement;
+- backfill racing an unfenced old writer is rejected, never marked ready;
+- after all-writer cutover and barriered backfill, create/unlink and
+  rename/rename-back through every structural writer advance the recorded
+  namespace facts;
+- a subtree rename refreshes the edge incarnation of every descendant row
+  whose canonical path changes; deleting that refresh makes an ancestor
+  rename-away-and-back test fail;
+- changing or disabling the tenant namespace CAS epoch after `CreateImport`
+  makes `CommitImport` fail closed;
+- rollback below the minimum writer version is rejected while imports are
+  active or promotion remains enabled, and re-enable requires a fresh audit;
+- deleting the writer-version/admission check makes the old-writer fixture
+  reproduce target ABA and fail the test.
 
 ### Local recovery and reuse
 
@@ -795,7 +1005,17 @@ tree. Repeated recovery is idempotent.
 - a fence for `/a` blocks `/a` and `/a/...` but not `/ab`;
 - FUSE cancellation before commit acceptance reaches `ABORTED`, while
   cancellation after acceptance retains fences and resolves the server-owned
-  `COMMITTING` outcome.
+  `COMMITTING` outcome;
+- a supported FUSE write after verify remains blocked; a raw private-root write
+  in the documented final-revalidation gap is explicitly tested as
+  out-of-contract and is never advertised as fail-closed;
+- terminal result acknowledgement, minimum and unacknowledged-maximum full-row
+  compaction, complete-result tombstone lookup, and signed-ID retirement are
+  tested with a fake clock; a replay is terminal or `import_id_retired`, never
+  a fresh import.
+- a provider cleanup outage past `retire_after` prunes the externally
+  recoverable result but retains the internal attempt/cleanup anchor until
+  `gc_done`, then removes it.
 
 ### Handle behavior
 
@@ -813,7 +1033,11 @@ Tests must fail when independently deleting:
 - the parent path-edge incarnation, child-set generation, or absent-child term
   of the target CAS;
 - the server-state CAS between commit, abort, and GC;
-- owner epoch/token fencing and expired-lease takeover;
+- owner epoch/owner-token fencing, recovery-token authorization, and
+  expired-lease takeover;
+- immutable sealed-version binding and upload-attempt retention through
+  capability expiry/grace;
+- the namespace all-writer rollout/admission gate;
 - quota reservation conversion and content-ref ownership transfer;
 - the reserved source-incarnation UUID comparison used by recovery and
   post-commit quarantine;
