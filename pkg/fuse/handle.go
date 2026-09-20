@@ -96,10 +96,14 @@ type FileHandle struct {
 	// ParentSnapshotID, then advances ContentSnapshotID to its own random ID.
 	// StagedSnapshotSeq makes repeated Flush/Fsync of one DirtySeq reuse the
 	// same identity rather than fabricating sibling snapshots for equal bytes.
-	ContentSnapshotID      string
-	contentAncestors       []string // bounded immutable ancestry, never persisted
-	stagedAncestors        []string
-	appendSnapshot         bool // this snapshot participated in a live append refresh
+	ContentSnapshotID string
+	contentAncestors  []string // bounded immutable ancestry, never persisted
+	stagedAncestors   []string
+	// appendSnapshot routes a copied source through the same causal commit
+	// path. Synchronous success clears it. An async success callback may miss
+	// the handle's TryLock while Fsync still owns mu; leaving it set is safe
+	// because it only reselects the same ancestry/identity-validated path.
+	appendSnapshot         bool
 	StagedSnapshotID       string
 	StagedParentSnapshotID string
 	StagedSnapshotSeq      uint64

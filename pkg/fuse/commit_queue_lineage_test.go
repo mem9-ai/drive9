@@ -168,13 +168,12 @@ func TestCommitQueueRebasesSupersededRewriteOntoLandedParent(t *testing.T) {
 	}
 }
 
-// TestCommitQueueRebasesAppendExtensionOntoWatermark reproduces the commit
-// layer of issue #935: a later appendFile-style write is staged from a handle
-// that predates the earlier commit (payload base rev 1) and has no snapshot
-// lineage, but its payload strictly extends the current remote content. The
-// entry must rebase onto the watermark instead of becoming a terminal
-// conflict that blocks mount drain.
-func TestCommitQueueRebasesAppendExtensionOntoWatermark(t *testing.T) {
+// TestCommitQueueRebasesLiveDescendantOntoWatermark reproduces the commit
+// layer of issue #935: a later appendFile-style snapshot retains live causal
+// ancestry to the exact snapshot this queue landed. After the remote revision,
+// size, and checksum verify that landed identity, the descendant may rebase
+// onto the watermark instead of becoming a terminal drain-blocking conflict.
+func TestCommitQueueRebasesLiveDescendantOntoWatermark(t *testing.T) {
 	const path = "/_cacache/index-v5/ab/cd/extend"
 	base := []byte("line-1\n")
 	first := append(append([]byte(nil), base...), []byte("line-A\n")...)
@@ -233,25 +232,23 @@ func TestCommitQueueRebasesAppendExtensionOntoWatermark(t *testing.T) {
 		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
 		SnapshotID: "snap-second", ParentSnapshotID: "snap-first", liveLineageProof: true,
 	}); err != nil {
-		t.Fatalf("append extension err = %v, want rebase onto rev 2", err)
+		t.Fatalf("live descendant err = %v, want rebase onto rev 2", err)
 	}
 	rev, body, puts := server.snapshot()
 	if rev != 3 || !bytes.Equal(body, second) {
-		t.Fatalf("after append extension rev=%d body=%q, want rev3 composed bytes", rev, body)
+		t.Fatalf("after live descendant rev=%d body=%q, want rev3 composed bytes", rev, body)
 	}
 	if len(puts) != 2 || !bytes.Equal(puts[1].body, second) || puts[1].expected != "2" {
 		t.Fatalf("PUT history = %+v, want second PUT expected rev2 with composed bytes", puts)
 	}
 	if conflicts, _, _ := pending.ConflictSummary(); conflicts != 0 {
-		t.Fatalf("pending conflicts = %d, want 0 after append extension rebase", conflicts)
+		t.Fatalf("pending conflicts = %d, want 0 after live descendant rebase", conflicts)
 	}
 }
 
 // TestCommitQueueDivergentRewriteKeepsTerminalFence is the negative half of
-// issue #935: when the later payload does NOT contain the current remote
-// content as a prefix (a genuinely divergent concurrent write, or a stale
-// SQLite checkpoint), the #876 fence must stay terminal so no remote byte is
-// silently rolled back.
+// issue #935: a sibling snapshot without live causal ancestry to the landed
+// image must stay terminal, including divergent writes and stale checkpoints.
 func TestCommitQueueDivergentRewriteKeepsTerminalFence(t *testing.T) {
 	const path = "/_cacache/index-v5/ab/cd/diverge"
 	base := []byte("line-1\n")
@@ -325,11 +322,10 @@ func TestCommitQueueRejectsUnprovenAppendExtension(t *testing.T) {
 	pr939Assert409PreservesRemote(t, PendingOverwrite, 1, []byte("line-1\nline-A\nline-B\n"), []byte("line-1\nline-A\n"))
 }
 
-// TestCommitQueueAppendExtensionFailsClosedAbovePayloadBound pins the memory
-// bound of the byte-level prefix proof: a prefix-extension payload above
-// maxLandedPayloadBytes must keep the terminal fence (no shadow load, no
-// remote read, no upload), so the proof cannot grow unbounded.
-func TestCommitQueueAppendExtensionFailsClosedAbovePayloadBound(t *testing.T) {
+// TestCommitQueueUnprovenOversizedPayloadFailsClosedWithoutRemoteRead pins the
+// proof bound: an unproven payload above maxLandedPayloadBytes must keep the
+// terminal fence without loading shadow bytes or reading/uploading remote data.
+func TestCommitQueueUnprovenOversizedPayloadFailsClosedWithoutRemoteRead(t *testing.T) {
 	const path = "/_cacache/index-v5/ab/cd/large-extend"
 	first := bytes.Repeat([]byte("a"), 4096)
 	big := append(append([]byte(nil), first...), bytes.Repeat([]byte("b"), maxLandedPayloadBytes)...)
@@ -1113,10 +1109,10 @@ func TestPendingIndexRestartDropsProcessLocalLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := idx.PutWithBaseRevAndModeAndLineage("/legacy.db", 8, PendingNew, 0, 0, false, "snapshot-B", "snapshot-A", true); err != nil {
+	if _, err := idx.PutWithBaseRevAndModeAndLineage("/legacy.db", 8, PendingNew, 0, 0, false, "snapshot-B", "snapshot-A", true, "snapshot-A", "snapshot-root"); err != nil {
 		t.Fatal(err)
 	}
-	if meta, ok := idx.GetMeta("/legacy.db"); !ok || meta.SnapshotID == "" || !meta.lineageTrusted {
+	if meta, ok := idx.GetMeta("/legacy.db"); !ok || meta.SnapshotID == "" || !meta.lineageTrusted || len(meta.liveAncestors) != 2 {
 		t.Fatalf("live meta=%+v ok=%t, want trusted process-local lineage", meta, ok)
 	}
 	recovered, err := NewPendingIndex(dir)
@@ -1130,8 +1126,8 @@ func TestPendingIndexRestartDropsProcessLocalLineage(t *testing.T) {
 	if !ok {
 		t.Fatal("recovered metadata missing")
 	}
-	if meta.SnapshotID != "" || meta.ParentSnapshotID != "" || meta.lineageTrusted {
-		t.Fatalf("recovered lineage=%q/%q trusted=%t, want empty/untrusted", meta.SnapshotID, meta.ParentSnapshotID, meta.lineageTrusted)
+	if meta.SnapshotID != "" || meta.ParentSnapshotID != "" || meta.lineageTrusted || len(meta.liveAncestors) != 0 {
+		t.Fatalf("recovered lineage=%q/%q ancestors=%v trusted=%t, want empty/untrusted", meta.SnapshotID, meta.ParentSnapshotID, meta.liveAncestors, meta.lineageTrusted)
 	}
 }
 

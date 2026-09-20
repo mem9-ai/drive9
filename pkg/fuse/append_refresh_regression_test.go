@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -73,6 +74,96 @@ func TestAppendSnapshotsFsyncInAnyOrder(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestWritableRehomePreservesProcessLocalAncestors(t *testing.T) {
+	const path = "/rehome-ancestors"
+	fs, ino := pr939HandleFS(t, path, "base")
+	writeBack, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.writeBack = writeBack
+	source, _ := pr939Handle(t, fs, ino, path, "baseA", true)
+	source.ContentSnapshotID = "snapshot-parent"
+	source.contentAncestors = []string{"snapshot-grandparent", "snapshot-root"}
+	source.LineageTrusted = true
+
+	source.Lock()
+	if err := fs.stageShadowLocked(source, false); err != nil {
+		source.Unlock()
+		t.Fatal(err)
+	}
+	if err := fs.snapshotWriteBackLocked(source); err != nil {
+		source.Unlock()
+		t.Fatal(err)
+	}
+	want := append([]string(nil), source.stagedAncestors...)
+	source.Unlock()
+
+	pendingMeta, ok := fs.pendingIndex.GetMeta(path)
+	if !ok || !slices.Equal(pendingMeta.liveAncestors, want) {
+		t.Fatalf("pending ancestors=%v ok=%t, want %v", pendingMeta.liveAncestors, ok, want)
+	}
+	writeBackMeta, ok := fs.writeBack.GetMeta(path)
+	if !ok || !slices.Equal(writeBackMeta.liveAncestors, want) {
+		t.Fatalf("write-back ancestors=%v ok=%t, want %v", writeBackMeta.liveAncestors, ok, want)
+	}
+
+	shadowTarget, _ := pr939Handle(t, fs, ino, path, "base", false)
+	shadowTarget.Lock()
+	if err := fs.loadWritableHandleFromShadowLocked(shadowTarget, pendingMeta); err != nil {
+		shadowTarget.Unlock()
+		t.Fatal(err)
+	}
+	shadowAncestors := append([]string(nil), shadowTarget.contentAncestors...)
+	shadowTarget.Unlock()
+	if !slices.Equal(shadowAncestors, want) {
+		t.Fatalf("shadow re-home ancestors=%v, want %v", shadowAncestors, want)
+	}
+
+	writeBackTarget, _ := pr939Handle(t, fs, ino, path, "base", false)
+	writeBackTarget.Lock()
+	loaded := fs.loadWritableHandleFromWriteBackLocked(writeBackTarget)
+	writeBackAncestors := append([]string(nil), writeBackTarget.contentAncestors...)
+	writeBackTarget.Unlock()
+	if !loaded || !slices.Equal(writeBackAncestors, want) {
+		t.Fatalf("write-back re-home loaded=%t ancestors=%v, want %v", loaded, writeBackAncestors, want)
+	}
+}
+
+func TestAppendSnapshotLatchClearsAfterSynchronousCommit(t *testing.T) {
+	const path = "/append-latch.txt"
+	_, ts := newCASFileServer(t, path, 1, []byte("base"))
+	defer ts.Close()
+	fs, ino := pr939HandleFS(t, path, "base")
+	fs.client = newTestClient(ts.URL)
+	fs.client.SetSmallFileThresholdForTests(1 << 20)
+	cq := NewCommitQueue(fs.client, fs.shadowStore, fs.pendingIndex, nil, 1, 8)
+	defer cq.DrainAll()
+	fs.commitQueue = cq
+	cq.PathLock = fs.lockRemoteCommitPath
+	cq.DurableWatermark = fs.latestCommittedRevision
+	cq.OnUploaded, cq.OnSuccess = fs.onCommitQueueUploaded, fs.onCommitQueueSuccess
+	cq.OnCleanup = fs.onCommitQueueCleanup
+
+	source, sourceID := pr939Handle(t, fs, ino, path, "base", false)
+	_, targetID := pr939Handle(t, fs, ino, path, "base", false)
+	if _, st := pr939Append(fs, ino, sourceID, "A"); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	if _, st := pr939Append(fs, ino, targetID, "B"); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	if !source.appendSnapshot {
+		t.Fatal("source append snapshot latch was not armed")
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: sourceID}); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	if source.appendSnapshot {
+		t.Fatal("synchronous source snapshot commit retained append latch")
 	}
 }
 

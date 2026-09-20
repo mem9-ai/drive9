@@ -60,6 +60,7 @@ func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle
 	fh.DirtySeq, fh.WriteBackSeq = 0, 0
 	fh.ShadowCommitReady, fh.ShadowCommitSeq = false, 0
 	fh.ShadowReady, fh.ShadowSpill = false, false
+	fh.appendSnapshot = false
 	publishStagedSnapshotLineageLocked(fh)
 	fs.adoptCommittedRevisionLocked(fh)
 	proof := fs.commitQueue.landedCommit(fh.Path)

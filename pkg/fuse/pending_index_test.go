@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -311,12 +312,14 @@ func TestPreparedRenameBindsExactProcessLocalLineageToCommitEntry(t *testing.T) 
 	}
 	const snapshotID = "rename-snapshot-B"
 	const parentSnapshotID = "rename-snapshot-A"
+	ancestors := []string{parentSnapshotID, "rename-snapshot-root"}
 	if _, err := idx.PutWithBaseRevAndModeAndLineage(
 		"/old.db", 4096, PendingNew, 0, 0o640, true,
-		snapshotID, parentSnapshotID, true,
+		snapshotID, parentSnapshotID, true, ancestors...,
 	); err != nil {
 		t.Fatal(err)
 	}
+	ancestors[0] = "mutated-caller-slice"
 	prepared, err := idx.PrepareRename("/old.db", "/new.db")
 	if err != nil {
 		t.Fatal(err)
@@ -326,6 +329,10 @@ func TestPreparedRenameBindsExactProcessLocalLineageToCommitEntry(t *testing.T) 
 	}
 	if prepared.SnapshotID != snapshotID || prepared.ParentSnapshotID != parentSnapshotID || !prepared.lineageTrusted {
 		t.Fatalf("prepared lineage=%q/%q trusted=%t, want exact live lineage", prepared.SnapshotID, prepared.ParentSnapshotID, prepared.lineageTrusted)
+	}
+	wantAncestors := []string{parentSnapshotID, "rename-snapshot-root"}
+	if !slices.Equal(prepared.liveAncestors, wantAncestors) {
+		t.Fatalf("prepared ancestors=%v, want %v", prepared.liveAncestors, wantAncestors)
 	}
 
 	opts := &MountOptions{}
@@ -338,6 +345,9 @@ func TestPreparedRenameBindsExactProcessLocalLineageToCommitEntry(t *testing.T) 
 	}
 	if entry.SnapshotID != snapshotID || entry.ParentSnapshotID != parentSnapshotID || !entry.liveLineageProof {
 		t.Fatalf("entry lineage=%q/%q live=%t, want exact prepared lineage", entry.SnapshotID, entry.ParentSnapshotID, entry.liveLineageProof)
+	}
+	if !slices.Equal(entry.liveAncestors, wantAncestors) {
+		t.Fatalf("entry ancestors=%v, want %v", entry.liveAncestors, wantAncestors)
 	}
 }
 
