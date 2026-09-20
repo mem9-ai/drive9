@@ -183,7 +183,8 @@ preview maps them as follows:
 | --- | --- | --- |
 | Cross-layer preview disabled | `promotion_not_enabled` | `EXDEV` |
 | Open handle, mixed tree, Git ownership, unsupported metadata/type, unsupported target replacement | `promotion_not_supported` | `EXDEV` |
-| Target created or changed before final CAS | `target_conflict` | `EEXIST` or `ENOTEMPTY`, matching the observed target |
+| Target child exists or has the wrong type at final CAS | `target_conflict` | `EEXIST` or `ENOTEMPTY`, matching the observed target |
+| Target remains absent but its parent edge, child-set generation, or namespace-CAS epoch changed | `target_precondition_changed` | `EAGAIN` |
 | Source changed during snapshot | `source_changed` | `EAGAIN` |
 | Permission failure | `permission_denied` | `EACCES` or `EPERM` |
 | Quota reservation failure | `quota_exceeded` | `EDQUOT` or `ENOSPC` |
@@ -249,6 +250,7 @@ staging_ref
 owner_epoch (0 until returned or recovered from GetImport)
 owner_token
 recovery_token
+activity_deadline (unset until returned or recovered from GetImport)
 phase
 created_at
 updated_at
@@ -260,6 +262,13 @@ is then written with the same temp-file, fsync, rename, and directory-fsync
 sequence. The record, owner token, and recovery token are private mode `0600`
 state. Recovery accepts only a complete record whose manifest hash matches; it
 never assumes the pair was atomically written.
+
+Per-content upload progress is a checksummed, fsynced journal in the same
+private state directory. Before each `CreateImportContent`, it durably records
+the relative content identity and random attempt idempotency key; after a
+response it records the returned logical attempt ID. Recovery truncates only an
+incomplete tail and retries the last complete key, so response loss cannot be
+misread as permission to allocate a replacement attempt.
 
 The initial record contains the canonical target and expected absence. After a
 successful or recovered `CreateImport`, the coordinator rewrites and fsyncs the
@@ -337,7 +346,8 @@ CreateImport(migration_id, target, expected_target_absent,
              manifest_hash, entry_total, byte_total,
              owner_token, recovery_token)
 CreateImportContent(migration_id, owner_epoch, owner_token,
-                    relative_path, entry_hash, size)
+                    relative_path, entry_hash, size,
+                    attempt_idempotency_key)
 CompleteImportContentUpload(migration_id, owner_epoch, owner_token,
                             content_id, upload_attempt_id,
                             multipart_completion)
@@ -365,13 +375,13 @@ token changed never acts as takeover or resets an epoch; the caller must follow
 the explicit expired-lease takeover contract.
 
 Migration IDs are tenant-bound, authenticated IDs returned by
-`AllocateImportID`, with signed `create_before` and `retire_after` times. The
-coordinator obtains and fsyncs the ID and both tokens before `CreateImport`, so
-allocation creates no stage or quota side effect. `CreateImport` accepts an ID
-only before `create_before`; an expired or previously consumed ID can never
-start a new import. `retire_after` is later than every capability lifetime,
-in-flight safety margin, cleanup deadline, and supported offline-recovery
-window for the import.
+`AllocateImportID`, with a signed `create_before` time and random, non-reusable
+identity. The coordinator obtains and fsyncs the ID and both tokens before
+`CreateImport`, so allocation creates no stage or quota side effect.
+`CreateImport` accepts an ID only before `create_before`; an expired or
+previously consumed ID can never start a new import. An active import has no
+allocation-time retirement deadline: its durable row remains queryable until
+the server reaches a terminal state, and terminal retention begins only then.
 
 `migration_id` is scoped by tenant. Content references are server-issued for
 that import and tenant; the client cannot attach an arbitrary storage key or a
@@ -390,6 +400,18 @@ by a Drive9 upload proxy; a backend that can only detect an oversized direct
 upload after accepting unbounded bytes is not eligible for direct capability
 upload.
 
+The client supplies a random `attempt_idempotency_key` that it durably records
+before the request. A retry with the same key and identical payload returns the
+same logical attempt UUID, temporary key, multipart upload ID, and budget
+charge only while the stored owner epoch is still current; a different payload
+conflicts. After takeover, that key resolves as a stale-owner attempt and the
+new owner must generate and fsync a new key. The server may reissue a capability
+for the same current-epoch mutable attempt after response loss, but durably
+advances the attempt's issuance count and maximum `not_after` before returning
+it, and never extends it past the import activity deadline. Replacing or
+restarting an upload likewise requires a new idempotency key and therefore a
+new attempt UUID/key; it is not inferred from a timeout.
+
 Each attempt records its capability `not_after`, provider upload ID, temporary
 key, state, and GC status before the capability is returned. Multipart
 capabilities permit part upload only; completion is an epoch-fenced Drive9
@@ -398,16 +420,41 @@ multipart upload ID; no attempt from an earlier owner epoch is reused. Direct
 PUT may be replayable until expiry, so its temporary key is always treated as
 mutable and untrusted.
 
-Before `VerifyImport`, an epoch-fenced seal operation snapshots an uploaded
-attempt into a new immutable sealed object version. It then reads that sealed
-version, validates the exact byte count and checksum, and records its provider
-version ID or an equivalent create-only storage identity. A backend that cannot
-produce and later address an immutable version is unsupported for promotion.
-The manifest references only this sealed identity. `VerifyImport` freezes the
-ordered set of sealed identities, sizes, and hashes; `CommitImport` rechecks
-those exact identities and never resolves a mutable temporary key. A late PUT
-or part from an old owner can therefore affect only its old temporary attempt,
-not verified or committed bytes.
+Before touching object storage, `SealImportContent` first creates a durable
+seal-intent row containing a server-generated seal-attempt UUID, expected
+content identity/hash/size, owner epoch, and a deterministic, server-only
+create-once destination key. Only then does it snapshot the uploaded attempt
+into that destination. The backend must support an atomic create-if-absent
+object or an equivalently discoverable immutable version; an API that can
+create a version but cannot unambiguously rediscover it after response loss is
+unsupported.
+
+There is at most one seal intent for a given content/upload-attempt pair.
+Repeating `SealImportContent` after request or response loss resumes that exact
+intent; it cannot allocate another destination. A checksum-invalid candidate
+terminally fails both the seal and its mutable upload attempt, so replacement
+starts with a new content-attempt idempotency key rather than re-sealing bytes
+that a late writer might still change.
+
+After the create/copy, the server reads the exact deterministic destination,
+validates byte count and checksum, and records its provider version ID or
+equivalent create-once identity. One database transaction then locks the seal
+intent and import, records that immutable candidate in the intent ledger, and
+attaches it to `import_contents` only if the current import state and owner
+epoch still match. If takeover or abort won the race, the same transaction
+marks the candidate for GC and never attaches it. A crash after object creation
+but before this DB transaction resumes the same intent and exact destination;
+response loss after the transaction returns the already-recorded attach or GC
+outcome. Neither path re-reads a possibly late-overwritten temporary key or
+creates an untracked second version. A failed candidate is terminal for that
+seal intent and upload attempt. A replacement upload attempt receives a new
+seal-attempt UUID/destination while the old row remains retained for cleanup.
+
+The manifest references only the successfully attached sealed identity.
+`VerifyImport` freezes the ordered set of sealed identities, sizes, and hashes;
+`CommitImport` rechecks those exact identities and never resolves a mutable
+temporary key. A late PUT or part from an old owner can therefore affect only
+its old temporary attempt, not verified or committed bytes.
 
 On owner-epoch takeover, verify, commit acceptance, or abort, the server stops
 issuing capabilities for the old epoch and aborts outstanding multipart upload
@@ -475,12 +522,12 @@ The transitions and their durable effects are normative:
 
 | From | Trigger | To | Durable result |
 | --- | --- | --- | --- |
-| none | `CreateImport` | `CREATED` | Identity, target precondition, manifest totals, reservation, namespace-CAS epoch, owner epoch `1`, owner/recovery-token hashes, and lease are stored atomically. |
+| none | `CreateImport` | `CREATED` | Identity, target precondition, manifest totals, reservation, namespace-CAS epoch, immutable activity deadline, owner epoch `1`, owner/recovery-token hashes, and lease are stored atomically. |
 | `CREATED` | first accepted entry/content mutation | `STAGING` | Partial hidden stage and the same reservation remain owned by the import. |
 | `STAGING` | successful `VerifyImport` | `VERIFIED` | Entry set, content set, and manifest version become immutable. |
 | `VERIFIED` | accepted `CommitImport` CAS | `COMMITTING` | Commit attempt ID and accepted outcome are durable; request cancellation can no longer abort it. |
 | `COMMITTING` | server commit worker | `COMMITTED` | Target CAS, namespace publication, ownership transfer, reservation settlement, result row, and structural outbox event commit atomically. |
-| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort or expired-lease GC CAS | `ABORTING` | No new capability, completion, seal, entry, verify, renew, takeover, or commit is accepted; cleanup ownership, including all issued attempt expiries, is durable. |
+| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort, expired-lease GC, or activity-deadline CAS | `ABORTING` | No new capability, completion, seal, entry, verify, renew, takeover, or commit is accepted; cleanup ownership, including all issued attempt expiries, is durable. |
 | `COMMITTING` | permanent target/auth/manifest failure before publication | `ABORTING` | A durable terminal reason is recorded; no namespace or committed quota changed. Transient failure stays `COMMITTING` and is retried by the server. |
 | `ABORTING` | server cleanup worker | `ABORTED` | Hidden entries and sealed unowned objects are detached, the reservation is released exactly once, and the terminal reason/result is retained. Issued-attempt cleanup remains tracked through the post-expiry sweep until `gc_done`. |
 
@@ -489,6 +536,20 @@ There are no other transitions. `COMMITTED` and `ABORTED` are terminal.
 expiry does not abandon them, and their workers are durably discoverable after
 a server crash. `COMMITTING` never transitions directly back to `VERIFIED`, and
 `ABORTING` cannot be revived.
+
+`CreateImport` assigns an immutable `activity_deadline` no later than the
+server's maximum import lifetime. Owner leases and every data-plane capability
+must expire at or before that deadline; renew and takeover may shorten their
+normal duration but never extend the deadline. `CommitImport` can be accepted
+only before it. Every owner mutation performs that comparison with database
+time inside the same state/version transaction; application clocks do not
+decide the winner. At the deadline, a server scanner (and every racing API
+call) CASes `CREATED`, `STAGING`, or `VERIFIED` to `ABORTING` with reason
+`activity_deadline_exceeded`; no new owner action is accepted. A commit whose
+`VERIFIED -> COMMITTING` CAS won before the deadline remains server-owned and
+runs to `COMMITTED` or `ABORTING`. Thus active work has a finite
+client-controlled horizon, but `GetImport` remains available and its ID/status
+never retire before server-owned terminalization.
 
 Every transition compares and increments `state_version`. Commit and cleanup
 workers additionally claim a durable attempt ID; duplicate workers either
@@ -557,7 +618,7 @@ imports(
   target_parent_children_generation, manifest_hash, entry_total, byte_total,
   namespace_cas_epoch, quota_reservation_id, state, state_version,
   owner_epoch, owner_token_hash, recovery_token_hash,
-  lease_expires_at, commit_attempt_id, terminal_reason,
+  activity_deadline, lease_expires_at, commit_attempt_id, terminal_reason,
   committed_root_inode, committed_generation, terminal_result_blob,
   terminal_result_digest, terminal_at, result_acknowledged_at,
   full_row_compact_not_before, retire_after, created_at, updated_at,
@@ -573,16 +634,28 @@ import_entries(
 import_contents(
   tenant_id, migration_id, import_content_id, sealed_storage_ref,
   sealed_storage_version, size_bytes, checksum_sha256,
-  seal_state, ownership_state,
+  accepted_seal_attempt_id, seal_state, ownership_state,
   primary key (tenant_id, migration_id, import_content_id)
 )
 
 import_upload_attempts(
   tenant_id, migration_id, import_content_id, upload_attempt_id,
-  owner_epoch, temporary_storage_ref, provider_upload_id,
-  maximum_size_bytes, capability_not_after, state,
+  attempt_idempotency_key, request_digest, owner_epoch,
+  temporary_storage_ref, provider_upload_id,
+  maximum_size_bytes, capability_issuance_count,
+  capability_not_after, state,
   gc_not_before, gc_state,
-  primary key (tenant_id, migration_id, import_content_id, upload_attempt_id)
+  primary key (tenant_id, migration_id, import_content_id, upload_attempt_id),
+  unique (tenant_id, migration_id, import_content_id, attempt_idempotency_key)
+)
+
+import_seal_attempts(
+  tenant_id, migration_id, import_content_id, seal_attempt_id,
+  source_upload_attempt_id, owner_epoch, deterministic_storage_ref,
+  sealed_storage_version, expected_size_bytes, expected_checksum_sha256,
+  state, gc_state, created_at, updated_at,
+  primary key (tenant_id, migration_id, import_content_id, seal_attempt_id),
+  unique (tenant_id, migration_id, import_content_id, source_upload_attempt_id)
 )
 
 import_tombstones(
@@ -613,23 +686,27 @@ later than a configured maximum full-row retention time; at that bound it is
 also compacted. The compact tombstone therefore stores the complete immutable
 terminal result needed by `GetImport`, not merely a digest.
 
-The tenant-bound migration ID, request digest, recovery-token hash, terminal
-state, result, and result digest remain in `import_tombstones` until the signed
-ID's `retire_after`. During that interval, `CreateImport` conflicts and
-`GetImport` returns the same terminal result. After `retire_after`, the signed
-ID itself is invalid and every API returns `import_id_retired`; it is never
-interpreted as a new or not-found operation. Recovery beyond this documented
+Only terminalization assigns `retire_after = terminal_at +` the configured
+maximum offline-recovery window. The tenant-bound migration ID, request digest,
+recovery-token hash, terminal state, result, and result digest remain in
+`import_tombstones` until that time. During the interval, `CreateImport`
+conflicts and `GetImport` returns the same terminal result. At and after
+`retire_after`, every external API returns `import_id_retired`; the ID is never
+interpreted as a new or not-found operation. If all durable rows have since
+been removed, a valid allocation token whose `create_before` has passed also
+resolves as retired rather than reusable. Recovery beyond this documented
 maximum offline window fails closed with `promotion_recovery_required`. The
-configured minimum and maximum full-row windows are both shorter than the ID
-lifetime, making storage retention bounded and migration-ID reuse behavior
-testable with a fake clock.
+configured minimum and maximum full-row windows are both shorter than the
+terminal retention window, making storage retention bounded and migration-ID
+reuse behavior testable with a fake clock.
 
-Physical tombstone deletion additionally requires every upload attempt to be
-`gc_done`. If a provider outage delays cleanup past `retire_after`, external
-APIs still return `import_id_retired`; the terminal result blob and recovery
-token hash may be pruned, while a minimal internal migration/tenant cleanup
-anchor and the attempt ledger remain. Result-payload retention stays bounded;
-cleanup debt is never orphaned merely to satisfy that bound.
+Physical tombstone deletion additionally requires every upload attempt and
+every unowned seal candidate to be `gc_done`. If a provider outage delays
+cleanup past `retire_after`, external APIs still return `import_id_retired`;
+the terminal result blob and recovery token hash may be pruned, while a minimal
+internal migration/tenant cleanup anchor and both attempt ledgers remain.
+Result-payload retention stays bounded; cleanup debt is never orphaned merely
+to satisfy that bound.
 
 The outbox is part of the transaction. It invalidates positive and negative
 directory caches on other mounts. Staging emits no user-visible namespace or
@@ -840,7 +917,8 @@ owner.
   attempt keys; their durable ledger outlives abort/commit until a post-expiry
   sweep proves cleanup, while sealed and committed versions are immutable;
 - terminal full rows and compact tombstones follow the acknowledgement and
-  signed-ID retirement contract; a forgotten ID is never accepted as new;
+  post-terminal retirement contract; an expired allocation or forgotten ID is
+  never accepted as new;
 - entry, byte, depth, and time limits are checked before or during hidden
   staging and never produce a partial final target.
 
@@ -905,7 +983,11 @@ owner.
 Kill and restart before and after:
 
 - local record and manifest fsync;
+- content-attempt idempotency-key journal fsync, request send, and returned
+  attempt-ID journal fsync;
 - each object upload;
+- durable seal intent, create-once sealed-object creation, sealed-version
+  verification, and DB attach;
 - stage verification;
 - durable `COMMIT_REQUESTED` before request send;
 - server commit;
@@ -924,9 +1006,14 @@ tree. Repeated recovery is idempotent.
 - target creation by another mount during staging;
 - target `create -> delete` ABA between precondition issue and commit;
 - target parent rename away, rename away-and-back, and delete/recreate;
-- unrelated target-parent sibling mutation conservatively conflicts in P0;
+- unrelated target-parent sibling mutation conservatively returns
+  `target_precondition_changed`/`EAGAIN` in P0 while the requested child remains
+  absent; it never masquerades as `EEXIST`;
 - two promotions competing for source or target;
 - commit versus abort and commit versus lease GC;
+- activity deadline versus renew, takeover, capability issuance, verify, and
+  commit acceptance; client-owned states go `ABORTING`, while a commit accepted
+  before the deadline remains queryable and reaches a terminal state;
 - coordinator crash followed by expired-lease takeover; every old-epoch renew,
   content-create, multipart-complete, seal, entry, verify, commit, and abort
   control-plane mutation is rejected;
@@ -937,6 +1024,14 @@ tree. Repeated recovery is idempotent.
   referenced; provider abort plus post-expiry sweep converges to no parts;
 - verify versus a late upload, and content completion/seal versus an aborted
   terminal import;
+- `CreateImportContent` response loss followed by same-key retry returns one
+  logical attempt/budget charge; a new key creates a separately tracked
+  replacement attempt;
+- after owner takeover, retrying an earlier epoch's content-attempt key is
+  rejected as stale and cannot reissue a capability for the old temp key;
+- crash after create-once seal succeeds but before its DB attach resumes the
+  same seal intent/version without consulting the mutable temp key; deleting
+  the intent makes the failure-injection test leak or attach wrong bytes;
 - writeback enqueue immediately after a drain attempt;
 - direct local-root file replacement and symlink swap while a snapshot is read;
 - a second mount reading while publish occurs;
@@ -946,6 +1041,7 @@ tree. Repeated recovery is idempotent.
 
 - the same migration ID with a different target, manifest, entry payload, or
   content hash conflicts;
+- the same content-attempt idempotency key with a different request conflicts;
 - missing, extra, duplicate, absolute, escaping, or symlink-following manifest
   entries are rejected;
 - an upload cannot exceed the reserved entry or byte total;
@@ -966,7 +1062,10 @@ tree. Repeated recovery is idempotent.
   `COMMITTED`; each case asserts source/target authority, fence retention,
   staging ownership, reservation/committed quota, and local-record retention;
 - deleting the owner-epoch comparison or allowing takeover of a live,
-  server-owned, or terminal state makes a focused test fail.
+  server-owned, or terminal state makes a focused test fail;
+- lease renewal and capability issuance at the activity boundary never extend
+  their expiry beyond it; every active import is forced into `COMMITTING` or
+  `ABORTING` before terminal retention/retirement begins.
 
 ### Upgrade and rollback
 
@@ -1010,9 +1109,10 @@ tree. Repeated recovery is idempotent.
   in the documented final-revalidation gap is explicitly tested as
   out-of-contract and is never advertised as fail-closed;
 - terminal result acknowledgement, minimum and unacknowledged-maximum full-row
-  compaction, complete-result tombstone lookup, and signed-ID retirement are
-  tested with a fake clock; a replay is terminal or `import_id_retired`, never
-  a fresh import.
+  compaction, complete-result tombstone lookup, and post-terminal ID retirement
+  are tested with a fake clock; an active import never becomes retired, and a
+  replay after terminal retirement is `import_id_retired`, never a fresh
+  import;
 - a provider cleanup outage past `retire_after` prunes the externally
   recoverable result but retains the internal attempt/cleanup anchor until
   `gc_done`, then removes it.
@@ -1035,8 +1135,9 @@ Tests must fail when independently deleting:
 - the server-state CAS between commit, abort, and GC;
 - owner epoch/owner-token fencing, recovery-token authorization, and
   expired-lease takeover;
-- immutable sealed-version binding and upload-attempt retention through
-  capability expiry/grace;
+- immutable sealed-version binding, durable seal intent, upload/seal attempt
+  retention through capability expiry/grace, and content-attempt idempotency;
+- the activity deadline and forced terminalization before terminal retention;
 - the namespace all-writer rollout/admission gate;
 - quota reservation conversion and content-ref ownership transfer;
 - the reserved source-incarnation UUID comparison used by recovery and
