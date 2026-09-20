@@ -257,7 +257,7 @@ source_path
 target_path
 source_identity (local root UUID, reserved source-incarnation UUID)
 manifest_hash
-target_expectation (canonical target, expected absence,
+target_expectation (canonical target, expected absence fixed to true in P0,
                     server precondition digest after CreateImport)
 storage_plan (mode, digest, backend capability generation, limits)
 staging_ref
@@ -357,12 +357,12 @@ released without being hidden or deleted by the old migration.
 The exact wire shape may change, but the runtime requirements are fixed:
 
 ```text
-PlanImport(target, expected_target_absent, canonical_manifest)
+PlanImport(target, expected_target_absent=true, canonical_manifest)
   -> manifest_hash, entry_total, byte_total, max_content_size,
      storage_mode, storage_plan_digest, backend_capability_generation,
      limits, plan_expires_at
 AllocateImportID()
-CreateImport(migration_id, target, expected_target_absent,
+CreateImport(migration_id, target, expected_target_absent=true,
              canonical_manifest,
              manifest_hash, entry_total, byte_total, max_content_size,
              storage_plan_digest, backend_capability_generation,
@@ -401,7 +401,11 @@ AcknowledgeImportResult(migration_id, recovery_token,
 Every method is idempotent for the same migration identity and payload. Reuse
 with different target, manifest, or content returns conflict.
 `PlanImport` is side-effect free: it validates the complete bounded canonical
-manifest but creates no import row, reservation, object, or cleanup debt.
+manifest but creates no import row, reservation, object, or cleanup debt. P0 is
+an absent-target-only protocol: both `PlanImport` and `CreateImport` require
+`expected_target_absent=true`. `PlanImport` rejects `false` instead of issuing a
+plan, and a first `CreateImport` rejects `false` before admission or side
+effects. Target replacement remains outside this API contract.
 `CreateImport` repeats the authorization and provider check,
 requires the same server-authenticated plan digest and backend capability
 generation, and returns
@@ -411,10 +415,12 @@ trusted: each staged content request enforces its own size and checksum, and
 `VerifyImport` recomputes the complete entry/byte/hash summary.
 
 The plan digest is an expiring server MAC over tenant, canonical target,
-manifest summary, selected storage mode, exact limits, capability generation,
-and `plan_expires_at`; `PlanImport` keeps no server-side reservation. Replaying
-or altering any claim fails verification. `CreateImport` accepts it only before
-expiry and only while the recorded generation still equals current runtime
+`expected_target_absent=true`, manifest summary, selected storage mode, exact
+limits, capability generation, and `plan_expires_at`; `PlanImport` keeps no
+server-side reservation. Replaying or altering any claim fails verification.
+`CreateImport` recomputes and compares the expected-absence claim rather than
+trusting the duplicate request field. It accepts the plan only before expiry
+and only while the recorded generation still equals current runtime
 configuration **when creating a row for the first time**. It must also receive
 the identical canonical manifest bytes, recompute every summary and the MAC
 input, and atomically persist the import row, quota reservation, and complete
@@ -441,9 +447,11 @@ and cannot create an import.
    second reservation or entry set.
 
 The create-request digest covers every immutable request field including the
-canonical manifest hash and plan claims. Repeating `CreateImport` with either
-token changed never acts as takeover; the caller must follow the explicit
-expired-lease takeover contract.
+canonical manifest hash, canonical target, `expected_target_absent=true`, and
+all plan claims. Repeating `CreateImport` with either token changed never acts
+as takeover; the caller must follow the explicit expired-lease takeover
+contract. Changing the expected-absence field on a recovery request therefore
+conflicts rather than recovering or creating a replacement import.
 
 Migration IDs are tenant-bound, authenticated IDs returned by
 `AllocateImportID`, with a signed `create_before` time and random, non-reusable
@@ -806,10 +814,16 @@ mutation performs that comparison with database time inside the same
 state/version transaction; application clocks do not decide the winner. At the
 deadline, a server scanner (and every racing API call) CASes `CREATED`,
 `STAGING`, or `VERIFIED` to `ABORTING` with reason
-`activity_deadline_exceeded`; no new owner action is accepted. A commit whose
-`VERIFIED -> COMMITTING` CAS won before the deadline remains server-owned and
-runs to `COMMITTED` or `ABORTING`. Thus active work has a finite
-client-controlled horizon, but `GetImport` remains available and its ID/status
+`activity_deadline_exceeded`; no new owner action is accepted. The winner is
+the first state CAS serialized by the database, not whichever caller returns
+first: if the deadline CAS wins, a racing commit cannot be accepted; if the
+`VERIFIED -> COMMITTING` CAS wins while database time is still before the
+deadline, the deadline scanner cannot rewrite its outcome. That commit remains
+server-owned and runs to `COMMITTED` or to `ABORTING` with the actual permanent
+commit failure reason. It is never relabeled `activity_deadline_exceeded`
+merely because wall-clock time passes while it is `COMMITTING`. Thus active
+work has a finite client-controlled horizon, but `GetImport` remains available
+and its ID/status
 never retire before server-owned terminalization. A FUSE rename whose import
 reaches this terminal reason returns the stable
 `promotion_deadline_exceeded`/`ETIMEDOUT` mapping above; retries query the same
@@ -1423,6 +1437,10 @@ The remaining P0/FUSE concurrency cases are:
 
 - the same migration ID with a different target, manifest, entry payload, or
   content hash conflicts;
+- `PlanImport(expected_target_absent=false)` returns no plan, and changing a
+  valid plan/Create request from `true` to `false` fails MAC/request-digest
+  verification before row, reservation, or entry creation; the same mutation
+  against an existing import conflicts instead of entering recovery;
 - a lost `CreateImport` response followed by the same token, plan, and full
   manifest returns the one import, one reservation, and identical persisted
   entry set; a different manifest cannot reuse either token or reservation;
@@ -1459,9 +1477,18 @@ The remaining P0/FUSE concurrency cases are:
 - deleting the owner-epoch comparison or allowing takeover of a live,
   server-owned, or terminal state makes a focused test fail;
 - lease renewal and inline-content mutation at the activity boundary never
-  extend beyond it; every active import is forced into `COMMITTING` or
-  `ABORTING` before terminal retention/retirement begins, and its public result
-  remains `promotion_deadline_exceeded`/`ETIMEDOUT` across restart and retry.
+  extend beyond it; a deterministic barrier test lets the deadline CAS win
+  from each of `CREATED`, `STAGING`, and `VERIFIED`, then requires
+  `ABORTING -> ABORTED` with the stable
+  `promotion_deadline_exceeded`/`ETIMEDOUT` result across restart and retry;
+- a complementary barrier test lets `CommitImport` win the
+  `VERIFIED -> COMMITTING` CAS before the deadline, then advances database time
+  past the deadline. The deadline scanner must leave `COMMITTING` untouched,
+  and recovery must expose the actual `COMMITTED` result or the actual durable
+  commit-failure reason, never synthesize `promotion_deadline_exceeded`;
+- moving either deadline comparison outside the state-CAS transaction, or
+  allowing both race participants to claim the import, makes one of those two
+  winner tests fail.
 
 The following accounting cases are mandatory before enabling a future
 external-object adapter:
@@ -1495,10 +1522,11 @@ external-object adapter:
 - removing the seal/version binding or deleting the retained upload-attempt
   ledger makes the late-PUT/late-part tests fail;
 - lease renewal, write-grant bounds, and provider-mutation bounds at the
-  activity boundary never extend beyond it; every active import is forced into
-  `COMMITTING` or `ABORTING` before terminal retention/retirement begins, and
-  its public result remains `promotion_deadline_exceeded`/`ETIMEDOUT` across
-  restart and retry.
+  activity boundary never extend beyond it. The same two winner tests apply:
+  a deadline CAS that wins from a client-owned state yields the stable deadline
+  result, while a commit CAS accepted before the deadline remains
+  server-owned and reports its actual commit outcome after all tracked landing
+  bounds close.
 
 ### Upgrade and rollback
 
@@ -1571,6 +1599,10 @@ Tests must fail when independently deleting:
 - side-effect-free plan revalidation and the production adapter classifier that
   permits DB-inline content but rejects `AWSS3Client`, `LocalS3Client` in
   production, and unknown backends before import/quota creation;
+- the P0 absent-target claim being fixed to `true` in both APIs, authenticated
+  by the plan MAC, included in the create-request digest, and revalidated before
+  first admission; changing it to `false` must reject before side effects, and
+  deleting it from either digest must fail a mutation test;
 - `CreateImport` re-sending and atomically persisting the full authenticated
   manifest entry set before any content API can run;
 - existing-row recovery taking precedence over plan/allocation expiry and
@@ -1579,7 +1611,9 @@ Tests must fail when independently deleting:
   tuple validation, entry binding, verification, and hidden-content ownership
   transfer;
 - direct `CREATED -> VERIFIED` validation for metadata-only manifests;
-- the activity deadline and forced terminalization before terminal retention;
+- the activity-deadline state CAS, including both deterministic winners:
+  deadline-before-commit yields the stable deadline result, while
+  commit-before-deadline preserves the actual server-owned commit outcome;
 - the namespace all-writer rollout/admission gate;
 - quota reservation conversion and content-ref ownership transfer;
 - the reserved source-incarnation UUID comparison used by recovery and
