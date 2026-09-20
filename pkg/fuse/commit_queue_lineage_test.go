@@ -231,6 +231,7 @@ func TestCommitQueueRebasesAppendExtensionOntoWatermark(t *testing.T) {
 		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
 		Size: int64(len(second)), Kind: PendingOverwrite,
 		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+		SnapshotID: "snap-second", ParentSnapshotID: "snap-first", liveLineageProof: true,
 	}); err != nil {
 		t.Fatalf("append extension err = %v, want rebase onto rev 2", err)
 	}
@@ -318,60 +319,10 @@ func TestCommitQueueDivergentRewriteKeepsTerminalFence(t *testing.T) {
 	}
 }
 
-// TestCommitQueueAutoResolveAppendExtension covers the 409 fallback: when the
-// server moved past the entry's base without a local watermark observation,
-// the conflict auto-resolve must recognize a payload that strictly extends the
-// server content and rebase onto the server revision instead of fencing.
-func TestCommitQueueAutoResolveAppendExtension(t *testing.T) {
-	const path = "/_cacache/index-v5/ab/cd/extend409"
-	serverData := []byte("line-1\nline-A\n")
-	local := append(append([]byte(nil), serverData...), []byte("line-B\n")...)
-
-	server, ts := newCASFileServer(t, path, 2, serverData)
-	defer ts.Close()
-	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shadow.Close()
-	pending, err := NewPendingIndex(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := newTestClient(ts.URL)
-	c.SetSmallFileThresholdForTests(1 << 20)
-	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
-	defer cq.DrainAll()
-
-	if err := shadow.WriteFull(path, local, 1); err != nil {
-		t.Fatal(err)
-	}
-	shadowGen := shadow.ActiveGeneration(path)
-	pendingGen, err := pending.PutWithBaseRev(path, int64(len(local)), PendingOverwrite, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// No DurableWatermark callback: the local fence does not fire, the CAS PUT
-	// against base 1 gets a 409, and auto-resolve must take the extension path.
-	if err := cq.Enqueue(&CommitEntry{
-		Path: path, BaseRev: 1, PayloadBaseRev: 1, PayloadBaseRevSet: true,
-		Size: int64(len(local)), Kind: PendingOverwrite,
-		ShadowGen: shadowGen, PendingIndexGen: pendingGen,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	cq.DrainAll()
-
-	rev, body, puts := server.snapshot()
-	if rev != 3 || !bytes.Equal(body, local) {
-		t.Fatalf("after auto-resolve rev=%d body=%q, want rev3 composed bytes", rev, body)
-	}
-	if len(puts) != 1 || !bytes.Equal(puts[0].body, local) || puts[0].expected != "2" {
-		t.Fatalf("PUT history = %+v, want one PUT expected rev2 with composed bytes", puts)
-	}
-	if conflicts, _, _ := pending.ConflictSummary(); conflicts != 0 {
-		t.Fatalf("pending conflicts = %d, want 0 after append extension auto-resolve", conflicts)
-	}
+// TestCommitQueueRejectsUnprovenAppendExtension checks that a prefix is not
+// permission to overwrite an unseen remote revision (which may be a truncate).
+func TestCommitQueueRejectsUnprovenAppendExtension(t *testing.T) {
+	pr939Assert409PreservesRemote(t, PendingOverwrite, 1, []byte("line-1\nline-A\nline-B\n"), []byte("line-1\nline-A\n"))
 }
 
 // TestCommitQueueAppendExtensionFailsClosedAbovePayloadBound pins the memory
@@ -420,6 +371,7 @@ func TestCommitQueueAppendExtensionFailsClosedAbovePayloadBound(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	beforeHeads, beforeGets := server.proofRequestCounts()
 	if err := shadow.WriteFull(path, big, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -436,6 +388,9 @@ func TestCommitQueueAppendExtensionFailsClosedAbovePayloadBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
+	if heads, gets := server.proofRequestCounts(); heads != beforeHeads || gets != beforeGets {
+		t.Fatalf("unproven oversized payload performed reads: HEAD=%d GET=%d", heads-beforeHeads, gets-beforeGets)
+	}
 
 	if rev, body, puts := server.snapshot(); rev != 2 || !bytes.Equal(body, first) || len(puts) != 1 {
 		t.Fatalf("after oversized append rev=%d body-len=%d puts=%d, want untouched rev2", rev, len(body), len(puts))

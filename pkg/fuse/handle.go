@@ -97,6 +97,9 @@ type FileHandle struct {
 	// StagedSnapshotSeq makes repeated Flush/Fsync of one DirtySeq reuse the
 	// same identity rather than fabricating sibling snapshots for equal bytes.
 	ContentSnapshotID      string
+	contentAncestors       []string // bounded immutable ancestry, never persisted
+	stagedAncestors        []string
+	appendSnapshot         bool // this snapshot participated in a live append refresh
 	StagedSnapshotID       string
 	StagedParentSnapshotID string
 	StagedSnapshotSeq      uint64

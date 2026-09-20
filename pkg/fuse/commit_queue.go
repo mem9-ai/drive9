@@ -88,15 +88,15 @@ type CommitEntry struct {
 	// terminal. Re-basing old bytes with a new BaseRev is exactly the silent
 	// rollback class this fence prevents.
 	DisableAutoResolveLWW bool
-	// growthRebaseRev records a one-shot authorization to pair a direct-child
-	// payload (#896 base-zero growth, #935 lineage or append-extension
-	// rewrite) with the revision it is safe to overwrite. PayloadBaseRev
+	// growthRebaseRev records a one-shot authorization to pair a descendant
+	// payload (#896 base-zero growth, #935 live same-path rewrite) with the revision it is safe to overwrite. PayloadBaseRev
 	// intentionally remains unchanged for auditability, so repeated
 	// validation must consult this state instead of re-authorizing.
 	growthRebaseRev              int64
 	growthRebaseParentSnapshotID string
 	recovered                    bool
 	liveLineageProof             bool
+	liveAncestors                []string // immutable, process-local snapshot ancestry
 	dispatched                   bool
 	canceled                     bool
 	cancelCommit                 context.CancelFunc
@@ -1483,7 +1483,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cq.mu.Unlock()
 
 		unlockPath := cq.lockPath(entry.Path)
-		if cq.discardSupersededEntry(entry) {
+		if cq.discardSupersededEntry(entry) || cq.discardLandedAncestor(entryCtx, entry) {
 			unlockPath()
 			return
 		}
@@ -1709,7 +1709,7 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 	unlockPaths := cq.lockBatchPaths(entries)
 	active := entries[:0]
 	for _, entry := range entries {
-		if cq.discardSupersededEntry(entry) {
+		if cq.discardSupersededEntry(entry) || cq.discardLandedAncestor(ctx, entry) {
 			cq.endInFlight(entry)
 			continue
 		}
@@ -2058,7 +2058,7 @@ func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *Co
 		cq.removeFromQueue(entry)
 		return nil
 	}
-	if cq.discardSupersededEntry(entry) {
+	if cq.discardSupersededEntry(entry) || cq.discardLandedAncestor(ctx, entry) {
 		return nil
 	}
 	committedRev, err := cq.uploadEntry(ctx, entry)
@@ -2361,7 +2361,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	if layerRef == "" {
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	}
-	cq.rememberLanded(entry.Path, committedRev, entry.Size, cq.checksumLandedPayload(entry), entry.SnapshotID)
+	cq.rememberLanded(entry.Path, committedRev, entry.Size, cq.checksumLandedPayload(entry), entry.SnapshotID, entry.liveAncestors...)
 	if cq.OnUploaded != nil {
 		cq.OnUploaded(entry, committedRev)
 	}
@@ -2597,42 +2597,6 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	if bytes.Equal(localData, serverData) {
 		safeLogPrintf("commit queue: auto-resolved conflict for %s (idempotent, content matches server rev %d)", entry.Path, serverRev)
 		cq.finishIdempotentCommit(entryCtx, entry, serverRev)
-		return
-	}
-
-	// Branch 1b: monotonic append extension — the local payload preserves every
-	// server byte and appends (npm cacache appendFile pattern, issue #935).
-	// Unlike a blind LWW rebase this cannot roll back any remote byte, so it
-	// applies even to fenced entries. Recovered entries stay fail-closed: after
-	// restart the shadow bytes are not provably the ones the metadata described.
-	if !entry.recovered && len(localData) > len(serverData) && bytes.HasPrefix(localData, serverData) {
-		safeLogPrintf("commit queue: auto-resolving conflict for %s via append extension (server rev %d, %d -> %d bytes)", entry.Path, serverRev, len(serverData), len(localData))
-		uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(int64(len(localData))))
-		if !ok {
-			cq.removeFromQueue(entry)
-			safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled before append extension upload)", entry.Path)
-			return
-		}
-		uploadStart := time.Now()
-		err = uploadBufferedRemoteFile(uploadCtx, cq.client, apiPath, localData, serverRev)
-		uploadCancel()
-		if cq.perf != nil {
-			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(uploadStart), uint64(len(localData)))
-		}
-		if err != nil {
-			safeLogPrintf("commit queue: append extension re-upload failed for %s: %v", entry.Path, err)
-			cq.finishResolveFailure(entryCtx, entry, err)
-			return
-		}
-		if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
-			cq.removeFromQueue(entry)
-			safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled during append extension upload)", entry.Path)
-			return
-		}
-		safeLogPrintf("commit queue: auto-resolved conflict for %s via append extension (overwrote rev %d)", entry.Path, serverRev)
-		if err := cq.onCommitSuccess(entry, serverRev, 0); err != nil {
-			cq.onCommitPostUploadFailure(entry, err)
-		}
 		return
 	}
 
