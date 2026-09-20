@@ -8,6 +8,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/durability-contract.sh"
+drive9_e2e_init_durability "interactive"
+
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
@@ -27,7 +31,6 @@ CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
 GIT_FEATURE_TIMEOUT_S="${GIT_FEATURE_TIMEOUT_S:-240}"
 GIT_FEATURE_RUN_OVERSIZED="${GIT_FEATURE_RUN_OVERSIZED:-1}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PASS=0
@@ -327,6 +330,7 @@ start_mount() {
     printf ' %q' "$@"
     printf '\n'
   } >>"$log_file"
+  drive9_e2e_print_mount_argv "$CLI_BIN" mount "$@" | tee -a "$log_file"
   env "DRIVE9_SERVER=$BASE" "DRIVE9_API_KEY=$API_KEY" "$CLI_BIN" mount "$@" >>"$log_file" 2>&1 &
   local mount_pid=$!
   if wait_mount_state "$mount_point" mounted; then
@@ -338,6 +342,16 @@ start_mount() {
     tail -n 80 "$log_file" >&2 || true
   fi
   return 1
+}
+
+start_git_feature_mount() {
+  local mount_point="$1" log_file="$2" local_root="$3" remote_root="$4"
+  start_mount "$mount_point" "$log_file" \
+    --mode=fuse \
+    --profile="${FUSE_PROFILE:-coding-agent}" \
+    --local-root "$local_root" \
+    --durability="$DRIVE9_E2E_EFFECTIVE_DURABILITY" \
+    ":/$remote_root" "$mount_point"
 }
 
 stop_mount() {
@@ -849,7 +863,7 @@ PY
   local local_root_b="$RUN_ROOT/git-local-b"
   local log_file_b="$RUN_ROOT/git-mount-b.log"
   mkdir -p "$mount_point_b" "$local_root_b"
-  if start_mount "$mount_point_b" "$log_file_b" --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$local_root_b" --durability=interactive ":/$git_root_rel" "$mount_point_b"; then
+  if start_git_feature_mount "$mount_point_b" "$log_file_b" "$local_root_b" "$git_root_rel"; then
     record "PASS" "Drive9 Git Workspace Behavior" "fresh local-root remount starts" "mounted"
   else
     record "FAIL" "Drive9 Git Workspace Behavior" "fresh local-root remount starts" "see $log_file_b"
@@ -902,7 +916,7 @@ PY
   printf 'local ignored\n' > "$restore_repo/ignored-build/cache.tmp"
   stop_mount "$mount_point_b" >/dev/null 2>&1 || true
   mkdir -p "$mount_point_b" "$RUN_ROOT/git-local-c"
-  if start_mount "$mount_point_b" "$RUN_ROOT/git-mount-c.log" --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$RUN_ROOT/git-local-c" --durability=interactive ":/$git_root_rel" "$mount_point_b"; then
+  if start_git_feature_mount "$mount_point_b" "$RUN_ROOT/git-mount-c.log" "$RUN_ROOT/git-local-c" "$git_root_rel"; then
     if [ ! -e "$mount_point_b/restore-workspace/ignored-build/cache.tmp" ]; then
       record "PASS" "Sandbox Restore" "ignored generated files are non-durable by design" "ignored-build/cache.tmp absent after fresh local root"
     else
@@ -986,7 +1000,7 @@ main() {
   local git_mount="$RUN_ROOT/git-mount-a"
   local git_local="$RUN_ROOT/git-local-a"
   mkdir -p "$git_mount" "$git_local"
-  if start_mount "$git_mount" "$RUN_ROOT/git-mount-a.log" --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$git_local" --durability=interactive ":/$git_root_rel" "$git_mount"; then
+  if start_git_feature_mount "$git_mount" "$RUN_ROOT/git-mount-a.log" "$git_local" "$git_root_rel"; then
     record "PASS" "Drive9 Git Workspace Behavior" "coding-agent mount starts" "mounted"
   else
     record "FAIL" "Drive9 Git Workspace Behavior" "coding-agent mount starts" "mount failed"
@@ -1023,4 +1037,3 @@ main() {
 }
 
 main "$@"
-

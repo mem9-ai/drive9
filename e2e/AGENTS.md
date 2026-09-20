@@ -926,6 +926,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `CLI_RETRY_SLEEP_S` | `2` | `fuse-smoke-test.sh` |
 | `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
 | `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
+| `DRIVE9_E2E_DURABILITY` | *(unset; preserves each suite's historical fixed/default behavior)* | Autopilot catalog suites: optional explicit `interactive`, `fsync`, `close-sync`, or `write-sync`; invalid non-empty values fail before setup and every mount emits `mount_argv=...` evidence |
 | `FUSE_CORRECTNESS_LARGE_MB` | `9` | `fuse-correctness-workload.sh` |
 | `FUSE_CORRECTNESS_KEEP_ARTIFACTS` | `0` | `fuse-correctness-workload.sh` |
 | `RUN_FUSE_ALL_WORKLOADS` | `0` | `fuse-release-gate.sh` |

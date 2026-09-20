@@ -21,6 +21,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/durability-contract.sh"
+drive9_e2e_init_durability "close-sync"
+
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
@@ -341,9 +345,13 @@ start_supervised_mount() {
   {
     echo "=== supervised-background start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
   } >>"$MOUNT_LOG"
-  if ! drive9 mount --mode=fuse --durability=close-sync \
-    ${FUSE_PROFILE:+--profile} ${FUSE_PROFILE:+"$FUSE_PROFILE"} \
-    ":$ROOT_REMOTE" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1; then
+  local mount_args=(mount --mode=fuse "--durability=$DRIVE9_E2E_EFFECTIVE_DURABILITY")
+  if [ -n "${FUSE_PROFILE:-}" ]; then
+    mount_args+=(--profile "$FUSE_PROFILE")
+  fi
+  mount_args+=(":$ROOT_REMOTE" "$MOUNT_POINT")
+  drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"
+  if ! drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1; then
     cat "$MOUNT_LOG" >&2 || true
     return 1
   fi
@@ -356,6 +364,18 @@ start_supervised_mount() {
     cat "$MOUNT_LOG" >&2 || true
     return 1
   }
+}
+
+start_foreground_supervised_mount() {
+  local mount_args=(mount --supervise-foreground --mode=fuse
+    "--durability=$DRIVE9_E2E_EFFECTIVE_DURABILITY")
+  if [ -n "${FUSE_PROFILE:-}" ]; then
+    mount_args+=(--profile "$FUSE_PROFILE")
+  fi
+  mount_args+=(":$ROOT_REMOTE" "$MOUNT_POINT")
+  drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"
+  drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1 &
+  FG_PID=$!
 }
 
 wait_healed_after_worker_kill() {
@@ -555,6 +575,16 @@ with_timeout_scoped_drive9() {
 		DRIVE9_SERVER="$BASE" "$CLI_BIN" "$@"
 }
 
+run_denied_scoped_mount() {
+	local mount_args=(mount --mode=fuse "--durability=$DRIVE9_E2E_EFFECTIVE_DURABILITY")
+	if [ -n "${FUSE_PROFILE:-}" ]; then
+		mount_args+=(--profile "$FUSE_PROFILE")
+	fi
+	mount_args+=(":/" "$MOUNT_POINT")
+	drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"
+	with_timeout_scoped_drive9 10 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1
+}
+
 issue_scoped_context() {
 	local name="$1"
 	shift
@@ -574,9 +604,13 @@ start_scoped_mount() {
 	local context_name="$1"
 	local remote_root="$2"
 	select_scoped_context "$context_name" || return 1
-	if ! scoped_drive9 mount --mode=fuse --durability=close-sync \
-		${FUSE_PROFILE:+--profile} ${FUSE_PROFILE:+"$FUSE_PROFILE"} \
-		":$remote_root" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1; then
+	local mount_args=(mount --mode=fuse "--durability=$DRIVE9_E2E_EFFECTIVE_DURABILITY")
+	if [ -n "${FUSE_PROFILE:-}" ]; then
+		mount_args+=(--profile "$FUSE_PROFILE")
+	fi
+	mount_args+=(":$remote_root" "$MOUNT_POINT")
+	drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"
+	if ! scoped_drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1; then
 		cat "$MOUNT_LOG" >&2 || true
 		return 1
 	fi
@@ -831,10 +865,7 @@ if [ "$RUN_FOREGROUND_SMOKE" = "1" ]; then
     echo "=== supervise-foreground start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
   } >>"$MOUNT_LOG"
 
-  drive9 mount --supervise-foreground --mode=fuse --durability=close-sync \
-    ${FUSE_PROFILE:+--profile} ${FUSE_PROFILE:+"$FUSE_PROFILE"} \
-    ":$ROOT_REMOTE" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
-  FG_PID=$!
+  start_foreground_supervised_mount
 
   if wait_mount_state mounted && wait_healthy_io "fg-ready"; then
     check_eq "supervise-foreground mount ready" "true" "true"
@@ -1011,9 +1042,7 @@ if ! select_scoped_context "$denied_context"; then
 fi
 failure_start="$(date +%s)"
 set +e
-with_timeout_scoped_drive9 10 mount --mode=fuse --durability=close-sync \
-	${FUSE_PROFILE:+--profile} ${FUSE_PROFILE:+"$FUSE_PROFILE"} \
-	":/" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1
+run_denied_scoped_mount
 denied_mount_rc=$?
 set -e
 failure_elapsed=$(( $(date +%s) - failure_start ))

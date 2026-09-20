@@ -11,6 +11,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/durability-contract.sh"
+drive9_e2e_init_durability ""
+
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 DRIVE9_API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
@@ -207,12 +211,16 @@ start_mount() {
   if [ -n "${FUSE_PROFILE:-}" ]; then
     mount_args+=(--profile "$FUSE_PROFILE")
   fi
+  if [ "$DRIVE9_E2E_DURABILITY_OVERRIDDEN" = "1" ]; then
+    mount_args+=("--durability=$DRIVE9_E2E_EFFECTIVE_DURABILITY")
+  fi
   mount_args+=("$MOUNT_POINT")
   {
     echo "=== drive9 sqlite mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
     echo "root_remote=$ROOT_REMOTE"
-    echo "mount_args=${mount_args[*]}"
+    drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}"
   } >>"$MOUNT_LOG"
+  drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}"
   drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
 

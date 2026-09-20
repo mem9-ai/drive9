@@ -184,6 +184,13 @@ bash e2e/git-ops-smoke-test.sh
 # Broader Git feature smoke (clone modes / ops / remount restore)
 bash e2e/git-feature-smoke-test.sh
 
+# Autopilot may override the mount durability for catalog-backed suites.
+# Leaving this unset preserves each script's historical behavior exactly:
+# fixed-mode scripts keep that mode, while default-mode scripts still omit the
+# flag and inherit the CLI default. Every actual mount prints mount_argv=...
+# for requested/actual evidence matching.
+DRIVE9_E2E_DURABILITY=write-sync bash e2e/fuse-concurrency-stress.sh
+
 # Strict FUSE release gate used by CI
 bash e2e/fuse-release-gate.sh
 

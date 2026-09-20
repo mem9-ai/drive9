@@ -17,6 +17,9 @@ jobs:
       - name: Test hosted config smoke guards
         run: bash scripts/test-hosted-config-smoke-guards.sh
 
+      - name: Test E2E durability override contract
+        run: bash e2e/durability-contract-test.sh
+
       - name: Checkout agfs dependency
         run: |
           git clone --depth 1 https://github.com/c4pt0r/agfs ../agfs
