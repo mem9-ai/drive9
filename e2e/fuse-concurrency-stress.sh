@@ -178,19 +178,11 @@ wait_mount_state() {
 }
 
 start_mount() {
-  local mount_args=(mount --mode=fuse --durability=write-sync)
-  local mount_argv_text
-  if [ -n "${FUSE_PROFILE:-}" ]; then
-    mount_args+=(--profile "$FUSE_PROFILE")
-  fi
-  mount_args+=("$MOUNT_POINT")
   {
     echo "=== drive9 concurrency mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
     echo "root_remote=$ROOT_REMOTE"
   } >>"$MOUNT_LOG"
-  printf -v mount_argv_text ' %q' "$CLI_BIN" "${mount_args[@]}"
-  echo "mount_argv=$mount_argv_text" | tee -a "$MOUNT_LOG"
-  drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1 &
+  drive9 mount --mode=fuse ${FUSE_PROFILE:+--profile} ${FUSE_PROFILE:+"$FUSE_PROFILE"} "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
 
   if wait_mount_state mounted; then
