@@ -211,11 +211,59 @@ mount closed, but it must not guess or expose both paths.
 ### Authorization and quota
 
 Promotion requires both source mutation and destination creation authority.
-The mount coordinator proves source authority by owning the single-writer local
-root and accepting the originating FUSE operation; the server cannot infer that
-authority from a source path that has no remote namespace entry. The server
-independently reauthorizes destination creation on both `CreateImport` and
-`CommitImport`.
+Owning the single-writer local root is not source authorization. The real
+`Dat9FS.Rename` handler may classify the two paths only to recognize a possible
+cross-layer operation; it must not return from an early cross-layer branch or
+create promotion state until it performs the same daemon-side POSIX preflight
+as an ordinary rename using `RenameIn.Owner`:
+source existence, both parents' write plus search permission, sticky-directory
+ownership rules for source and destination, parent/type/symlink validity,
+self-subtree rejection, target type compatibility, and target-directory
+emptiness. Drive9 cannot rely on kernel `default_permissions`: it is not enabled
+for every mount/profile, and macOS explicitly defers these checks to the
+daemon. The validation portion of `renamePreflight` must therefore be extracted
+or reused as one side-effect-free check; overlay-parent pruning or other cleanup
+is not part of that check and cannot run until validation succeeds. This shared
+preflight runs while the in-memory subtree fence is held but before any durable
+promotion record, `PlanImport`, `AllocateImportID`, `CreateImport`, quota
+reservation, or hidden staging. Only after it succeeds may P1 enter the
+promotion branch and apply its stricter absent-target/no-open-handle eligibility
+checks. Failure returns the ordinary rename errno and produces zero promotion
+side effects.
+
+The server cannot infer authority over a local-only source path. It does,
+however, independently authorize the canonical destination against the
+**current request's** tenant identity and filesystem scope on every
+client-facing import call. Migration IDs and allocation/owner/recovery tokens
+are idempotency, operation-identity, and epoch-fencing secrets; none is a bearer
+credential and none preserves a revoked or narrowed filesystem scope.
+
+The normative request authorization matrix is:
+
+| API | Required current-request authorization before any visible effect or mutation |
+| --- | --- |
+| `PlanImport`, `AllocateImportID` | Tenant authentication plus `write` on the canonical target. Allocation stores that target in its claim. |
+| First/retried `CreateImport` | Tenant authentication plus `write` on the request target; it must equal the plan and allocation-claim target. Recovery-before-admission does not bypass this check. |
+| `PutInlineImportContent`, future content/grant/complete/seal/attach calls, `VerifyImport`, `RenewImportLease` | Resolve the import under the authenticated tenant, then require current `write` scope on its stored target before reading a body, returning a capability, renewing, or mutating state. |
+| `CommitImport` | Require current `write` scope on the stored target before the `VERIFIED -> COMMITTING` acceptance CAS. |
+| `AbortImport`, `TakeOverImport`, `RetireImportAllocation`, `AcknowledgeImportResult` | Require current `write` scope on the stored import/allocation target in addition to the applicable owner, recovery, or allocation token. |
+| `GetImport` | Require current `read` scope on the stored import/allocation target before returning existence, state, target, or result. |
+
+The HTTP dispatcher admits scoped tokens only to import routes whose handler
+implements this table, and each handler authorizes from the server-stored
+target rather than trusting a continuation request path. Revocation, token
+expiry, or scope narrowing therefore rejects every later client mutation and
+read, even when the caller still has a migration secret. Existing client-owned
+state remains fenced and is eventually aborted by lease/deadline GC.
+
+Server-owned work is deliberately different. Once `CommitImport` wins
+`VERIFIED -> COMMITTING`, or abort/deadline/GC wins a transition to
+`ABORTING`, the durable worker runs under Drive9's service authority and reaches
+a real terminal state even if the initiating user token is later revoked. It
+does not re-evaluate mutable caller scope after acceptance; otherwise revocation
+could strand an accepted commit or cleanup. The final transaction still checks
+tenant ownership, immutable target identity, quota, namespace-CAS readiness,
+and every structural precondition described below.
 
 `CreateImport` reserves the canonical manifest byte and entry totals and
 returns a versioned quota reservation. Inline content writes, and any future
@@ -372,7 +420,7 @@ PlanImport(target, expected_target_absent=true, canonical_manifest)
   -> manifest_hash, entry_total, byte_total, max_content_size,
      storage_mode, storage_plan_digest, backend_capability_generation,
      limits, plan_expires_at
-AllocateImportID()
+AllocateImportID(canonical_target, expected_target_absent=true)
   -> migration_id, allocation_token, create_before
 CreateImport(migration_id, allocation_token,
              target, expected_target_absent=true,
@@ -472,12 +520,13 @@ conflicts rather than recovering or creating a replacement import.
 
 Migration IDs are tenant-bound random, non-reusable identities returned by
 `AllocateImportID`. Allocation persists one quota-neutral claim keyed by
-`(tenant_id, migration_id)`, a hash of the opaque allocation token, and
-`create_before`; it creates no import, manifest stage, reservation, or content
-side effect. A lost allocation response may leave only this bounded inert
-claim; the client may allocate a different ID, while the server retires the
-unclaimed row at `create_before`. The coordinator obtains and fsyncs the ID,
-allocation token, owner token, and recovery token before `CreateImport`.
+`(tenant_id, migration_id)`, the canonical target and fixed expected-absence
+claim, a hash of the opaque allocation token, and `create_before`; it creates no
+import, manifest stage, reservation, or content side effect. A lost allocation
+response may leave only this bounded inert claim; the client may allocate a
+different ID, while the server retires the unclaimed row at `create_before`.
+The coordinator obtains and fsyncs the ID, allocation token, owner token, and
+recovery token before `CreateImport`.
 
 The first-create transaction locks that allocation claim. It accepts only an
 `ALLOCATED` claim with the matching token and database time before
@@ -913,7 +962,9 @@ it:
 1. locks the tenant namespace-capability row and requires
    `namespace_cas_ready=true` and `namespace_cas_epoch` equal to the epoch
    captured by `CreateImport`;
-2. revalidates destination authorization and quota;
+2. revalidates tenant ownership, immutable target binding, server policy, and
+   quota, but does not reinterpret the initiating caller's mutable scope after
+   commit acceptance;
 3. revalidates the target precondition and rename type rules;
 4. verifies the complete staged manifest;
 5. transfers every staged content reference to its committed inode owner;
@@ -956,7 +1007,8 @@ promotion_namespace_capabilities(
 )
 
 import_id_claims(
-  tenant_id, migration_id, allocation_token_hash, create_before, claim_state,
+  tenant_id, migration_id, target_path, expected_target_absent,
+  allocation_token_hash, create_before, claim_state,
   accepted_create_request_digest, retired_at, created_at, updated_at,
   primary key (tenant_id, migration_id)
 )
@@ -1033,7 +1085,7 @@ import_seal_attempts(
 )
 
 import_tombstones(
-  tenant_id, migration_id, request_digest, owner_token_hash,
+  tenant_id, migration_id, target_path, request_digest, owner_token_hash,
   recovery_token_hash, terminal_state,
   terminal_result_blob, terminal_result_digest, retire_after,
   primary key (tenant_id, migration_id)
@@ -1079,8 +1131,9 @@ Full terminal rows are never compacted before
 after the client has fsynced its terminal local phase, permits compaction after
 that minimum. A missing acknowledgement may retain the full row longer, but no
 later than a configured maximum full-row retention time; at that bound it is
-also compacted. The compact tombstone therefore stores the complete immutable
-terminal result needed by `GetImport`, not merely a digest.
+also compacted. The compact tombstone therefore stores the canonical target
+and complete immutable terminal result needed to reauthorize and answer
+`GetImport` or an idempotent acknowledgement retry, not merely a digest.
 
 Only terminalization assigns `retire_after = terminal_at +` the configured
 maximum offline-recovery window. The tenant-bound migration ID, request digest,
@@ -1147,11 +1200,15 @@ availability. Rollout is therefore ordered and fail-closed:
 
 Promotion API routes and the FUSE preview return `promotion_not_enabled` until
 that per-tenant gate is ready. A rollback below the minimum writer version must
-first disable new imports, advance the CAS epoch so every in-flight import
-fails closed, wait for all imports to reach a terminal state, revoke promotion,
-and only then admit old writers. Re-enabling after such a rollback repeats the
+first disable new imports and advance the CAS epoch under the same tenant-row
+lock used by final publish. Every import that has **not** already linearized its
+publish then fails closed at its final ready/epoch check. A publish transaction
+that acquired the row lock first may legally finish under the old epoch; the
+rollback waits for that transaction and observes the already-terminal commit.
+After all imports reach a terminal state, the controller revokes promotion and
+only then admits old writers. Re-enabling after such a rollback repeats the
 barrier, backfill, audit, and epoch change. There is no mixed-version window in
-which an old writer and an enabled import may coexist.
+which an old writer and an enabled, nonterminal import may coexist.
 
 ### Subtree fence
 
@@ -1374,6 +1431,19 @@ owner.
 
 ### Functional
 
+- the production `Dat9FS.Rename` entry point, with `AllowOther=false` so kernel
+  `default_permissions` is absent, rejects a cross-layer candidate when either
+  parent lacks write or search permission, when either applicable sticky-dir
+  ownership check fails, when the source is missing, when the destination is
+  inside the source, when source/target types conflict, or when a target
+  directory is nonempty. Each case asserts the ordinary `EACCES`, `EPERM`,
+  `ENOENT`, `EINVAL`, `ENOTDIR`/`EISDIR`, or `ENOTEMPTY` result as applicable,
+  with the source unchanged and no local migration record, plan, allocation,
+  import, reservation, or staging side effect;
+- those entry-point tests must traverse the same shared daemon preflight as an
+  ordinary rename rather than call a validation helper directly. Moving the
+  cross-layer branch ahead of preflight, relying on `default_permissions`, or
+  deleting any parent/sticky/type/emptiness check makes a focused test fail;
 - empty and deep directories;
 - zero-byte files, files at `inlineThreshold-1`, and complete all-inline trees;
 - files at `inlineThreshold` or larger and disabled inline storage require an
@@ -1518,6 +1588,23 @@ The remaining P0/FUSE concurrency cases are:
 
 ### Import and accounting
 
+- after a successful create, revoke the caller or replace it with a scoped
+  credential that cannot access the import's stored target. Even with the
+  correct migration/allocation/owner/recovery token, every client continuation
+  is reauthorized: inline/external content and grant calls, verify, renew,
+  commit acceptance, abort, takeover, retirement, acknowledgement, and status
+  read all return the canonical authorization error and make no state, lease,
+  capability, body-read, quota, or storage mutation. `GetImport` does not leak
+  the import's existence, target, or result to the denied caller;
+- the complementary allowed-scope cases succeed, and every continuation
+  authorizes the server-stored target rather than a caller-supplied path. An
+  exact method/path dispatcher matrix admits scoped credentials only to import
+  handlers with that check; unknown actions and method mismatches remain
+  denied;
+- a deterministic revocation barrier after `CommitImport` has already won
+  `VERIFIED -> COMMITTING`, and after abort/deadline GC has already won
+  `... -> ABORTING`, does not strand server work: the service-owned worker
+  reaches its real terminal result while later client requests remain denied;
 - the same migration ID with a different target, manifest, entry payload, or
   content hash conflicts;
 - `PlanImport(expected_target_absent=false)` returns no plan, and changing a
@@ -1680,6 +1767,9 @@ external-object adapter:
 
 Tests must fail when independently deleting:
 
+- the production `Dat9FS.Rename` cross-layer call to the shared daemon-side
+  POSIX preflight, or any required parent write/search, sticky-directory,
+  source/target type, self-subtree, or target-emptiness check;
 - the subtree fence;
 - migration idempotency;
 - the parent path-edge incarnation, child-set generation, or absent-child term
@@ -1687,6 +1777,10 @@ Tests must fail when independently deleting:
 - the server-state CAS between commit, abort, and GC;
 - owner epoch/owner-token fencing, recovery-token authorization, and
   expired-lease takeover;
+- current-request authorization against the server-stored target on every
+  client-facing import continuation, scoped-route dispatcher allowlisting, or
+  the separation that lets already-accepted `COMMITTING`/`ABORTING` workers
+  finish under service authority;
 - side-effect-free plan revalidation and the production adapter classifier that
   permits DB-inline content but rejects `AWSS3Client`, `LocalS3Client` in
   production, and unknown backends before import/quota creation;
