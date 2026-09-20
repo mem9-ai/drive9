@@ -363,6 +363,7 @@ PlanImport(target, expected_target_absent, canonical_manifest)
      limits, plan_expires_at
 AllocateImportID()
 CreateImport(migration_id, target, expected_target_absent,
+             canonical_manifest,
              manifest_hash, entry_total, byte_total, max_content_size,
              storage_plan_digest, backend_capability_generation,
              plan_expires_at,
@@ -384,9 +385,8 @@ CompleteImportContentUpload(migration_id, owner_epoch, owner_token,
                             ordered_write_grants, multipart_completion)
 SealImportContent(migration_id, owner_epoch, owner_token,
                   content_id, upload_attempt_id)
-PutImportEntry(migration_id, owner_epoch, owner_token,
-               relative_path, entry_hash,
-               import_content_token, metadata)
+AttachImportContent(migration_id, owner_epoch, owner_token,
+                    relative_path, entry_hash, import_content_token)
 VerifyImport(migration_id, owner_epoch, owner_token, manifest_hash)
 CommitImport(migration_id, owner_epoch, owner_token)
 GetImport(migration_id)
@@ -415,7 +415,10 @@ manifest summary, selected storage mode, exact limits, capability generation,
 and `plan_expires_at`; `PlanImport` keeps no server-side reservation. Replaying
 or altering any claim fails verification. `CreateImport` accepts it only before
 expiry and only while the recorded generation still equals current runtime
-configuration.
+configuration. It must also receive the identical canonical manifest bytes,
+recompute every summary and the MAC input, and atomically persist the import
+row, quota reservation, and complete hidden `import_entries` set. A hash or
+summary alone is not an entry transport and cannot create an import.
 
 Repeating `CreateImport` with the same owner and recovery tokens returns the
 current state and does not duplicate the reservation. Repeating it with either
@@ -475,20 +478,40 @@ generation produced by the real backend constructor. It never promotes an
 unknown wrapper because it happens to implement `S3Client`, nor infers support
 from provider or endpoint strings.
 
-`PutInlineImportContent` accepts a bounded body only for a `db9_inline` import.
-It checks the recorded per-file size, SHA-256, manifest identity, owner epoch,
-state, and remaining reservation, then stores an immutable hidden content row
-in TiDB. The random idempotency key and request digest are unique within the
-import: response-loss retry with identical input returns the same content ID;
-reuse with different input conflicts. Verify freezes those content IDs, and
-commit changes their ownership and publishes namespace entries in one database
-transaction without copying the blobs. Abort deletes hidden rows and releases
-the reservation idempotently. The content write's state/owner check and row
-insert are one transaction: if its commit result is unknown, retry/query by the
-same key discovers the single row; if abort wins first, the state CAS rejects
-the write, and if the content write wins first, abort owns and deletes it. No
-provider operation can materialize after that database ordering. P0 never
-calls `CreateImportWriteGrant`.
+The canonical manifest contains one normalized, ordered tuple per entry. Every
+tuple includes path, type, mode, mtime, and entry hash. A regular-file tuple
+also includes expected size and SHA-256; a symlink tuple includes the link text;
+a directory has no content field. `CreateImport` persists all tuples before
+returning. Its one transaction also creates the import row and reservation, so
+there is no state in which content is accepted but the expected entry metadata
+is absent. This is the only P0 entry-creation path: empty directories, symlinks,
+mode, and mtime do not depend on a later content call.
+
+`PutInlineImportContent` accepts a bounded body only for a `db9_inline` import
+and an already-recorded regular-file entry. Before reading/storing the body it
+checks the path, entry hash, declared size/SHA-256, owner epoch, state, and
+remaining reservation against that tuple. It reads at most expected-size plus
+one byte, computes SHA-256 itself, and inserts nothing unless actual size/hash
+match. It then stores an immutable hidden content row and atomically fills the
+entry's previously-null content ID. The
+random idempotency key and request digest are unique within the import:
+response-loss retry with identical input returns the same content ID; reuse
+with different input conflicts. A second different content ID cannot bind the
+same entry.
+
+`VerifyImport` requires every regular-file entry to have exactly one bound
+content ID whose stored size/hash matches the tuple, and every directory or
+symlink to have none; it rejects any missing, extra, or mismatched entry before
+freezing the manifest. Commit changes content ownership and publishes those
+already-complete namespace entries in one database transaction without copying
+the blobs. Abort deletes hidden rows and releases the reservation idempotently.
+The content write's state/owner check, content insert, and entry bind are one
+transaction: if its commit result is unknown, retry/query by the same key
+discovers the single result; if abort wins first, the state CAS rejects the
+write, and if the content write wins first, abort owns and deletes it. No
+provider operation can materialize after that database ordering. P0 never calls
+`CreateImportContent`, `CreateImportWriteGrant`, `AttachImportContent`, or
+`SealImportContent`.
 
 The initial P1 preview consequently supports only all-inline trees. A tree with
 one object-backed file returns `promotion_storage_backend_unsupported`/`EXDEV`
@@ -502,6 +525,11 @@ object adapter. It does **not** make the current `AWSS3Client` eligible. Such an
 adapter must add concrete operation identity, finite landing bounds, exact
 enumeration, accounting, cleanup, and adapter-classification tests before its
 mode can appear in `PlanImport`.
+
+Even in that future mode, `CreateImport` remains the sole entry/metadata
+transport. `AttachImportContent` may only bind an immutable sealed content
+token to the matching already-persisted regular-file tuple; it cannot create an
+entry or modify type, path, mode, mtime, size, hash, or symlink text.
 
 An object-store upload capability can outlive a server epoch check. Therefore
 no direct or multipart capability ever writes a key or version that a verified
@@ -716,8 +744,8 @@ The transitions and their durable effects are normative:
 
 | From | Trigger | To | Durable result |
 | --- | --- | --- | --- |
-| none | `CreateImport` | `CREATED` | Identity, target precondition, manifest totals, reservation, namespace-CAS epoch, immutable activity deadline, owner epoch `1`, owner/recovery-token hashes, and lease are stored atomically. |
-| `CREATED` | first accepted entry/content mutation | `STAGING` | Partial hidden stage and the same reservation remain owned by the import. |
+| none | `CreateImport` | `CREATED` | Identity, target precondition, complete hidden manifest-entry set, reservation, namespace-CAS epoch, immutable activity deadline, owner epoch `1`, owner/recovery-token hashes, and lease are stored atomically. |
+| `CREATED` | first accepted content mutation | `STAGING` | Partial hidden content stage and the same manifest/reservation remain owned by the import. |
 | `STAGING` | successful `VerifyImport` | `VERIFIED` | Entry set, content set, and manifest version become immutable. |
 | `VERIFIED` | accepted `CommitImport` CAS | `COMMITTING` | Commit attempt ID and accepted outcome are durable; request cancellation can no longer abort it. |
 | `COMMITTING` | server commit worker | `COMMITTED` | Target CAS, namespace publication, ownership transfer, reservation settlement, result row, and structural outbox event commit atomically. |
@@ -786,9 +814,10 @@ write-grant/landing-bound contract above. The
 single-writer local-root lock prevents routine concurrent takeover; the server
 epoch is the authoritative fence for a paused or zombie coordinator.
 
-`VERIFIED` freezes the entry set and manifest version. A late or different
-`PutImportEntry` cannot mutate it. Commit acceptance and abort/GC acquisition
-race through the state CAS, so only one wins. The staging uploader uses an
+`VERIFIED` freezes the entry set, every entry-to-content binding, and the
+manifest version. No late inline write or future `AttachImportContent` can
+mutate it. Commit acceptance and abort/GC acquisition race through the state
+CAS, so only one wins. The staging uploader uses an
 import-scoped internal capability and never writes through the ordinary user
 namespace or FUSE writeback path.
 
@@ -835,7 +864,9 @@ imports(
 
 import_entries(
   tenant_id, migration_id, relative_path_hash, relative_path,
-  entry_type, metadata_blob, entry_hash, import_content_id,
+  entry_type, mode, mtime_ns, symlink_target,
+  expected_size_bytes, expected_checksum_sha256,
+  metadata_blob, entry_hash, import_content_id,
   primary key (tenant_id, migration_id, relative_path_hash)
 )
 
@@ -898,6 +929,12 @@ path. The upload/write-grant/seal tables describe the disabled future
 external-object extension and need not ship until a concrete production
 adapter satisfies the matrix above. Keeping that future schema in the design
 does not authorize an implementation to classify `AWSS3Client` as eligible.
+
+All `import_entries` rows are inserted from the canonical manifest in the same
+transaction as `imports` and the reservation. `import_content_id` starts null
+for regular files and is filled only by the matching idempotent inline-content
+transaction; it remains null for directories and symlinks. The expected size,
+checksum, type, and metadata columns are immutable after `CreateImport`.
 
 All tables are tenant-scoped. A unique relative-path constraint rejects
 duplicate manifest entries after canonical path normalization. Terminal import
@@ -1217,6 +1254,15 @@ owner.
   the same tenant remains eligible;
 - `PlanImport` is side-effect free, and a backend capability generation or
   inline-threshold change before `CreateImport` invalidates the plan;
+- changing, omitting, reordering, or adding any canonical manifest tuple
+  between `PlanImport` and `CreateImport` fails before the import transaction;
+- the real API sequence `PlanImport` -> `CreateImport(full manifest)` ->
+  `PutInlineImportContent*` -> `VerifyImport` -> `CommitImport` round-trips an
+  empty directory, symlink text, mode, mtime, zero-byte file, and nonempty file;
+- removing `CreateImport`'s manifest persistence loses those metadata-only
+  entries and makes the production-path round-trip fail;
+- an inline content call for an absent/non-file path or a mismatched entry
+  hash, size, or checksum is rejected before reading/storing its body;
 - Aliyun and Tencent endpoints are classified through their actual
   `AWSS3Client` construction path and remain unsupported, not inferred from an
   endpoint-name allowlist;
@@ -1234,6 +1280,7 @@ owner.
 Kill and restart before and after:
 
 - local record and manifest fsync;
+- atomic `CreateImport` manifest-entry/reservation commit and lost response;
 - inline-content idempotency-key journal fsync, bounded body/transaction send,
   DB commit, response loss, and returned content-ID journal fsync;
 - stage verification;
@@ -1326,11 +1373,19 @@ The remaining P0/FUSE concurrency cases are:
 
 - the same migration ID with a different target, manifest, entry payload, or
   content hash conflicts;
+- a lost `CreateImport` response followed by the same token, plan, and full
+  manifest returns the one import, one reservation, and identical persisted
+  entry set; a different manifest cannot reuse either token or reservation;
+- the import row, quota reservation, and all manifest entries are all present
+  or all absent after transaction failure injection; no content endpoint can
+  observe an import without its complete expected entry set;
 - the same inline-content idempotency key with an identical request returns the
   same content ID after response loss; a different body, hash, size, or path
   conflicts;
 - missing, extra, duplicate, absolute, escaping, or symlink-following manifest
   entries are rejected;
+- verify rejects a regular file with no content or multiple/mismatched content,
+  and rejects any directory/symlink with a content binding;
 - an inline content write cannot exceed its planned size, the captured inline
   threshold, or the reserved entry/byte total;
 - deleting or weakening the real-adapter classifier makes tests admit
@@ -1460,8 +1515,11 @@ Tests must fail when independently deleting:
 - side-effect-free plan revalidation and the production adapter classifier that
   permits DB-inline content but rejects `AWSS3Client`, `LocalS3Client` in
   production, and unknown backends before import/quota creation;
+- `CreateImport` re-sending and atomically persisting the full authenticated
+  manifest entry set before any content API can run;
 - inline-content idempotency, per-file threshold enforcement, manifest/hash
-  verification, and hidden-content ownership transfer;
+  tuple validation, entry binding, verification, and hidden-content ownership
+  transfer;
 - the activity deadline and forced terminalization before terminal retention;
 - the namespace all-writer rollout/admission gate;
 - quota reservation conversion and content-ref ownership transfer;
