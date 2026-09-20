@@ -619,7 +619,8 @@ deterministic writable concurrency coverage, not a Git or cross-mount workload.
 
 1. Provision tenant unless `DRIVE9_API_KEY` is already set
 2. Prepare `drive9` CLI binary (build local or download official release)
-3. Mount a fresh writable namespace through real FUSE
+3. Mount a fresh writable namespace through real FUSE with explicit
+   `--durability=write-sync` (the #936 concurrent-write regression boundary)
 4. Run parallel writer threads that create files via temp-write/fsync/atomic
    rename, append per-worker logs, churn create/unlink temp files, rename
    directories into final locations, and verify open-handle reads across rename
