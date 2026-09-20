@@ -250,11 +250,29 @@ The normative request authorization matrix is:
 | `GetImport` | Require current `read` scope on the stored import/allocation target before returning existence, state, target, or result. |
 
 The HTTP dispatcher admits scoped tokens only to import routes whose handler
-implements this table, and each handler authorizes from the server-stored
-target rather than trusting a continuation request path. Revocation, token
-expiry, or scope narrowing therefore rejects every later client mutation and
-read, even when the caller still has a migration secret. Existing client-owned
-state remains fenced and is eventually aborted by lease/deadline GC.
+implements this table. Entry handlers authorize their canonical request
+target; continuation and recovery handlers additionally authorize the
+server-stored target rather than trusting a caller-supplied path. Revocation,
+token expiry, or scope narrowing therefore rejects every later client mutation
+and read, even when the caller still has a migration secret. Existing
+client-owned state remains fenced and is eventually aborted by lease/deadline
+GC.
+
+Authorization cannot itself become an existence oracle. Target-bearing
+requests (`PlanImport`, `AllocateImportID`, and first or retried `CreateImport`)
+authorize the request target before plan, claim, or import lookup, so an
+out-of-scope request always returns the same canonical `403 fs access denied`
+regardless of whether the supplied ID exists. After a retried Create finds an
+accepted claim/import, it also authorizes the stored target before returning
+recovery; denial is non-disclosing rather than a target-mismatch oracle.
+ID-only continuation handlers look up tenant-owned state internally only to
+obtain its stored target; when that target is outside the current scope, they
+return the exact canonical `404 import not found` response used for an unknown
+or no-longer-retained ID, including status, body shape, and cache policy. They
+do not reveal whether an active row, terminal row, tombstone, allocation claim,
+target, or result was found. A valid current scope plus the applicable
+operation token is required before normal active, terminal, or
+`import_id_retired` semantics are exposed.
 
 Server-owned work is deliberately different. Once `CommitImport` wins
 `VERIFIED -> COMMITTING`, or abort/deadline/GC wins a transition to
@@ -1238,6 +1256,17 @@ FUSE requests. Normal commit queues and uploaders cannot enqueue work under the
 fenced prefixes; the import uploader is exempt only through its migration ID
 and internal capability.
 
+Fence ownership is structured. Immediately after atomically acquiring both
+prefixes, the request installs one idempotent cleanup guard before invoking
+preflight. The initiating rename is owner-exempt while it performs validation.
+Every preflight or eligibility error, request cancellation, recovered panic,
+and return before the durable local migration record is fsynced releases both
+prefixes and wakes waiters. After that fsync, ownership is atomically handed to
+the migration coordinator/recovery record and the request guard is disarmed;
+exactly one owner then releases the fences at the terminal point described
+above. There is no interval with neither cleanup owner and no error path may
+leave an unrecorded in-memory fence behind.
+
 FUSE request cancellation is phase-sensitive. Before the server durably
 accepts `VERIFIED -> COMMITTING`, cancellation stops new work and drives the
 same owner-epoch abort path. After acceptance it cannot cancel the server
@@ -1444,6 +1473,13 @@ owner.
   ordinary rename rather than call a validation helper directly. Moving the
   cross-layer branch ahead of preflight, relying on `default_permissions`, or
   deleting any parent/sticky/type/emptiness check makes a focused test fail;
+- after each preflight/eligibility negative case, cancellation, and an injected
+  panic immediately after fence acquisition, a second goroutine performs
+  lookup, write, and rename under both source and target prefixes with a bounded
+  deadline. It must observe ordinary namespace semantics rather than block,
+  and the fence registry/waiter count must be empty. Deleting the request's
+  cleanup guard, releasing only one prefix, or disarming before durable-record
+  handoff makes a production-entry test hang or fail;
 - empty and deep directories;
 - zero-byte files, files at `inlineThreshold-1`, and complete all-inline trees;
 - files at `inlineThreshold` or larger and disabled inline storage require an
@@ -1588,6 +1624,13 @@ The remaining P0/FUSE concurrency cases are:
 
 ### Import and accounting
 
+- authorization is exercised before import creation, not only on
+  continuations: out-of-scope `PlanImport` returns no plan, out-of-scope
+  `AllocateImportID` creates no claim, and scope revocation between allocation
+  and first `CreateImport` creates no import, manifest entries, reservation, or
+  staging. Retrying an already-accepted `CreateImport` after revocation is also
+  denied before recovery can return the existing row; recovery-before-admission
+  never becomes recovery-before-authorization;
 - after a successful create, revoke the caller or replace it with a scoped
   credential that cannot access the import's stored target. Even with the
   correct migration/allocation/owner/recovery token, every client continuation
@@ -1601,6 +1644,13 @@ The remaining P0/FUSE concurrency cases are:
   exact method/path dispatcher matrix admits scoped credentials only to import
   handlers with that check; unknown actions and method mismatches remain
   denied;
+- `GetImport` response-equivalence tests query an existing out-of-scope import,
+  a random unknown ID, and an ID whose externally retained result has expired.
+  The same scoped caller receives byte-for-byte equivalent canonical not-found
+  responses and no state-dependent headers; an authorized caller with the
+  required operation token still receives the defined active, terminal, or
+  retired result. The equivalent non-disclosure check covers allocation and
+  tombstone-backed lookups;
 - a deterministic revocation barrier after `CommitImport` has already won
   `VERIFIED -> COMMITTING`, and after abort/deadline GC has already won
   `... -> ABORTING`, does not strand server work: the service-owned worker
@@ -1770,6 +1820,9 @@ Tests must fail when independently deleting:
 - the production `Dat9FS.Rename` cross-layer call to the shared daemon-side
   POSIX preflight, or any required parent write/search, sticky-directory,
   source/target type, self-subtree, or target-emptiness check;
+- the idempotent two-prefix fence cleanup guard on any pre-record error,
+  cancellation, or panic path, or the atomic handoff from request ownership to
+  the fsynced migration record;
 - the subtree fence;
 - migration idempotency;
 - the parent path-edge incarnation, child-set generation, or absent-child term
@@ -1778,9 +1831,10 @@ Tests must fail when independently deleting:
 - owner epoch/owner-token fencing, recovery-token authorization, and
   expired-lease takeover;
 - current-request authorization against the server-stored target on every
-  client-facing import continuation, scoped-route dispatcher allowlisting, or
-  the separation that lets already-accepted `COMMITTING`/`ABORTING` workers
-  finish under service authority;
+  client-facing import entry and continuation (including accepted-row Create
+  recovery), scoped-route dispatcher allowlisting, the non-disclosing lookup
+  response rule, or the separation that lets already-accepted
+  `COMMITTING`/`ABORTING` workers finish under service authority;
 - side-effect-free plan revalidation and the production adapter classifier that
   permits DB-inline content but rejects `AWSS3Client`, `LocalS3Client` in
   production, and unknown backends before import/quota creation;
