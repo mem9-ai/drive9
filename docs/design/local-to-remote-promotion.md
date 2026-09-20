@@ -201,6 +201,7 @@ preview maps them as follows:
 | Quota reservation failure | `quota_exceeded` | `EDQUOT` or `ENOSPC` |
 | Tenant allocation rate/live/window budget exhausted | `promotion_identity_budget_exceeded` | `EDQUOT` |
 | Global promotion-identity capacity unavailable | `promotion_identity_capacity_unavailable` | `EAGAIN` |
+| Promotion identity authority unavailable, fencing a restore, or inconsistent with the installed tenant epoch | `promotion_identity_epoch_unavailable` | `EAGAIN` |
 | Configured tree limit exceeded | `promotion_limit_exceeded` | `EFBIG` |
 | Corrupt local record/manifest, identity-codec/counter invariant, or unresolved committed outcome | `promotion_recovery_required` | `EIO` |
 
@@ -322,6 +323,7 @@ The coordinator persists a record before remote side effects:
 
 ```text
 migration_id
+allocation_epoch
 allocation_sequence
 allocation_idempotency_key
 allocation_proof
@@ -455,7 +457,8 @@ PlanImport(target, expected_target_absent=true, canonical_manifest)
      limits, plan_expires_at
 AllocateImportID(canonical_target, expected_target_absent=true,
                  allocation_idempotency_key)
-  -> migration_id, allocation_sequence, allocation_proof, create_before
+  -> migration_id, allocation_epoch, allocation_sequence,
+     allocation_proof, create_before
 CreateImport(migration_id, allocation_proof,
              target, expected_target_absent=true,
              canonical_manifest,
@@ -525,23 +528,26 @@ and cannot create an import.
 
 `CreateImport` resolves lost responses before it performs new-admission checks:
 
-1. Strictly decode the canonical migration ID to its protocol version and
-   allocation sequence. Validate the server-authenticated allocation proof,
-   its tenant/target/ID/sequence binding, and current target scope. Then look up
-   `(tenant_id, allocation_sequence)` in active/full-terminal rows, retained
-   tombstones, the allocation claim, and sparse retired-sequence set before
-   treating it as new.
+1. Strictly decode the canonical migration ID to its protocol version,
+   allocation epoch, and allocation sequence. Validate the server-authenticated
+   allocation proof, its tenant/target/ID/epoch/sequence binding, and current
+   target scope. Then look up `(tenant_id, allocation_epoch,
+   allocation_sequence)` in active/full-terminal rows, retained tombstones, the
+   allocation claim, and sparse retired-sequence set before treating it as new.
 2. If an active/full row exists, compare the stored immutable create-request
    digest, owner-token hash, and recovery-token hash. An exact match returns the
    current state, reservation, and manifest-entry result even if
    `create_before` or `plan_expires_at` has since passed or the current backend
    capability generation has changed. A retained terminal tombstone performs
    the same comparison and returns its terminal result. A valid proof whose
-   sequence is at or below the tenant's retired watermark, or is present in the
-   sparse retired set, returns `import_id_retired`; without a valid proof and
-   current scope it is non-disclosing not-found. These are recovery of an
-   accepted transaction, not new admission. Any visible mismatch returns
-   conflict and cannot reset the epoch.
+   sequence is at or below its allocation epoch's retired watermark, or is
+   present in that epoch's sparse retired set, returns `import_id_retired`;
+   without a valid proof and current scope it is non-disclosing not-found.
+   A valid proof for a missing/compacted non-current epoch, or for an impossible
+   gap above the matching watermark, returns `promotion_recovery_required` and
+   never proceeds to new admission. These are recovery of an accepted
+   transaction, not new admission. Any visible mismatch returns conflict and
+   cannot reset the epoch.
 3. Only when no accepted row exists does the server lock the durable allocation
    claim. It rechecks for an accepted winner, then validates claim state/proof,
    `create_before`, plan MAC/expiry, current capability generation,
@@ -560,86 +566,148 @@ expired-lease takeover contract. Changing the expected-absence field on a
 recovery request therefore conflicts rather than recovering or creating a
 replacement import.
 
-Migration IDs are the canonical, versioned, tenant-scoped wire encoding of a
-monotonically increasing `allocation_sequence`, not an independently random
+Migration IDs are the canonical, versioned, tenant-scoped wire encoding of an
+`(allocation_epoch, allocation_sequence)` pair, not an independently random
 identifier. P0 uses a fixed-width, single-representation encoding such as
-`p1_<base32(big-endian sequence)>`; clients treat it as opaque, while the
-server strictly decodes it before lookup. For a given tenant and protocol
-version the encoding is reversible and injective: no two sequences have the
-same ID, aliases such as non-canonical padding/case are rejected, and the same
-sequence always has the same ID. The authenticated tenant context supplies the
-tenant component; the normative wire identity is therefore
-`(authenticated tenant, migration_id)`, never the bare string. Every non-reuse
-claim in this contract refers to that composite identity. Predictability of the
-string grants no authority.
-After normal route authorization, malformed, non-canonical, overflowed, or
-unknown-version IDs return the same non-disclosing not-found response as an
-unknown well-formed ID and perform no state lookup or mutation.
+`p1_<base32(big-endian epoch)>_<base32(big-endian sequence)>`; clients treat it
+as opaque, while the server strictly decodes it before lookup. For a given
+tenant and protocol version the encoding is reversible and injective: no two
+epoch/sequence pairs have the same ID, aliases such as non-canonical padding or
+case are rejected, and the same pair always has the same ID. The authenticated
+tenant context supplies the tenant component; the normative wire identity is
+therefore `(authenticated tenant, migration_id)`, never the bare string. Every
+non-reuse claim in this contract refers to that composite identity.
+Predictability of the string grants no authority. After normal route
+authorization, malformed, non-canonical, overflowed, or unknown-version IDs
+return the same non-disclosing not-found response as an unknown well-formed ID
+and perform no state lookup or mutation.
 
-P0 freezes `id_codec_version=p1` in the tenant identity-counter row before the
-first allocation. It cannot be changed while that sequence namespace exists.
-The version tag permits strict parsing, not re-encoding an old sequence under a
-new alias; any future incompatible codec requires a separately reviewed
-namespace migration/cutover contract and is outside P0. The counter row belongs
-to an already-provisioned, non-reusable tenant identity; allocation cannot
-create arbitrary tenant counter rows.
+P0 freezes `id_codec_version=p1` in each allocation-epoch row. The version tag
+permits strict parsing, not re-encoding an old pair under a new alias; any
+future incompatible codec requires a separately reviewed namespace migration
+contract. The tenant identity is pre-provisioned and non-reusable; allocation
+cannot create arbitrary tenant identities.
 
-The allocation transaction locks `last_issued_sequence`, computes exactly the
-next value, derives the canonical ID, and round-trips the ID through the strict
-decoder before committing the counter and claim. Any decoded version/sequence
-mismatch returns `promotion_recovery_required` and rolls back with no proof,
-claim, or counter advance. A sequence is never decremented or reassigned. The
-database constraints require `last_issued_sequence >= retired_through`, require
-the candidate to be greater than both, and forbid wrap; exhausting the
-representable range fails with `promotion_identity_budget_exceeded` before
-issuing an ID rather than resetting or reusing a sequence. Therefore compaction
-needs retain only the retirement watermark, not an old
-`migration_id -> sequence` map, to prove that a later allocation cannot reuse
-an old public ID. Tenant identity itself is non-reusable; tenant clone/restore
-may not reset or copy this sequence namespace under the same tenant identity.
+The current `allocation_epoch` comes from a promotion-identity authority in a
+control-plane durability domain that is **not** included in tenant-database
+backup, PITR, clone, or rollback. Its per-tenant epoch is monotonic, never
+reused, and cannot wrap. The tenant database stores the externally installed
+current epoch plus one sequence-counter row per epoch that still has live or
+recoverable state. Within an epoch, the allocation transaction locks
+`last_issued_sequence`, computes exactly the next value, derives the canonical
+ID, and round-trips the ID through the strict decoder before committing the
+counter and claim. Any decoded version/epoch/sequence mismatch returns
+`promotion_recovery_required` and rolls back with no proof, claim, or counter
+advance. The database constraints require
+`last_issued_sequence >= retired_through`, require the candidate to be greater
+than both, and forbid wrap. Exhausting either epoch or sequence space fails
+with `promotion_identity_budget_exceeded` before issuing an ID rather than
+resetting or reusing a pair.
 
-The server also returns an opaque, authenticated
-`allocation_proof` binding proof-format/key version, tenant, sequence,
-migration ID, canonical target, fixed expected-absence claim, `create_before`,
-and allocation-request digest (including the idempotency-key digest).
+The server also returns an opaque, authenticated `allocation_proof` binding
+proof-format/key version, tenant, allocation epoch, sequence, migration ID,
+canonical target, fixed expected-absence claim, `create_before`, and
+allocation-request digest (including the idempotency-key digest).
 Verification-only key material for issued proof versions remains available;
 proof validation does not require a per-ID row. The proof is an operation-
 identity credential, not tenant authorization.
 
+#### PITR and allocation-epoch fence
+
+Promotion is unsupported unless the deployment supplies that non-rollback
+authority and integrates every tenant restore/clone path with it. A raw restore
+that can bypass the platform restore generation must leave promotion disabled;
+the server must not infer safety from a self-consistent restored database.
+
+The authority record contains tenant ID, current allocation epoch, restore
+generation, admission state (`ACTIVE` or `FENCING`), lease generation, and the
+latest outstanding allocation-lease expiry. It issues short-lived signed
+allocation leases binding all of those values plus `not_after` and the tenant-
+database incarnation. `AllocateImportID` must validate an `ACTIVE` lease using
+database time and require its epoch/restore/lease generations and database
+incarnation to equal the installed tenant-database values in the same
+transaction that charges identity capacity and inserts the claim. Authority
+unavailability, `FENCING`, an expired/stale lease, or any generation mismatch
+returns
+`promotion_identity_epoch_unavailable` (`503`, FUSE `EAGAIN`) before sequence,
+proof, claim, quota, or staging side effects.
+
+The supported PITR/clone workflow is a barrier, not advisory documentation:
+
+1. CAS the external authority from `ACTIVE` to `FENCING`, stop routing new
+   promotion API calls and workers for the tenant, and stop issuing allocation
+   leases.
+2. Wait past the authority-recorded maximum lease expiry, drain requests and
+   service workers, and detach the old tenant-database incarnation before
+   replacing it. No old lease, handler, or worker can then mutate either the
+   restored database or the detached incarnation.
+3. CAS-increment the non-rollback allocation epoch and restore generation and
+   mint the expected new database incarnation in the authority. Restore or
+   clone the tenant database only after that durable decision.
+4. With a signed one-use install grant for that exact restore generation, run a
+   tenant-database transaction that installs the new current epoch, creates its
+   sequence counter at zero, seals older epoch counters against allocation, and
+   records the new database incarnation. It does not rewrite or delete restored
+   old-epoch imports.
+5. The authority returns to `ACTIVE` only after it has verified the installed
+   epoch/incarnation. Normal allocation leases are then issued for the new
+   epoch.
+
+The install operation is idempotent for exactly
+`(tenant, allocation_epoch, restore_generation, database_incarnation)`: a lost
+response followed by the same signed grant returns the installed result, while
+any different tuple conflicts and leaves the authority `FENCING`. A crash or
+restore failure at any earlier step likewise leaves the tenant fenced; an
+operator may retry the same restore generation or explicitly begin a newer one,
+but cannot reactivate the old epoch. The authority does not mark the grant
+complete until it receives and verifies the tenant transaction's durable
+installation acknowledgement.
+
+Old proofs and local records still decode to their old epoch. A restored old-
+epoch row is queried and reconciled normally, but an otherwise valid old-epoch
+proof whose row is absent is `promotion_recovery_required`: the operation may
+have been accepted after the PITR snapshot and cannot be guessed retired. A new
+allocation can reuse the same numeric sequence only under the new epoch, so its
+public ID and database key remain distinct. Client-facing continuations never
+translate an old ID to the current epoch.
+
 The coordinator generates and fsyncs an allocation idempotency key before the
-request. The allocation transaction locks the tenant identity-budget row and a
-global materialized-identity counter, applies the limits below, increments the
-tenant sequence, and inserts one quota-neutral claim keyed by tenant/sequence
-plus the request-key digest. Retrying the same key and request
-while that bounded mapping is retained returns the same ID, sequence, proof,
-and deadline; reusing it with different claims conflicts. The claim retains the
-exact bounded proof blob until sequence retirement, so signing-key rotation
-cannot change a lost-response retry. Only after this response is fsynced does
-the coordinator generate and fsync owner and recovery tokens and call
-`CreateImport`.
+request. The allocation transaction locks the tenant identity-budget row, the
+installed current-epoch row, and a global materialized-identity counter,
+applies the limits below, increments that epoch's sequence, and inserts one
+quota-neutral claim keyed by tenant/epoch/sequence plus the request-key digest.
+Retrying the same key and request while that bounded mapping is retained
+returns the same ID, epoch, sequence, proof, and deadline; reusing it with
+different claims conflicts. The claim retains the exact bounded proof blob
+until sequence retirement, so signing-key rotation cannot change a lost-
+response retry. Only after this response is fsynced does the coordinator
+generate and fsync owner and recovery tokens and call `CreateImport`.
 
 `AllocateImportID` resolves an existing idempotency-key row before applying
 new-admission limits. An exact retry therefore recovers its original result
 even while the tenant or deployment is at capacity; a mismatch conflicts. This
 idempotency guarantee lasts through the documented allocation/terminal
 recovery window, while the claim/import/tombstone still exists. After its
-sequence has been retired and folded into the watermark, the per-request key
-mapping is intentionally gone; an allocation request at that point is a new
-operation and receives a new non-reused sequence. No safety or deduplication
-decision may use the caller's idempotency key after that bounded window.
+sequence has been retired and folded into its allocation epoch's watermark, the
+per-request key mapping is intentionally gone; an allocation request at that
+point is a new operation and receives a new non-reused epoch/sequence identity.
+No safety or deduplication decision may use the caller's idempotency key after
+that bounded window.
 
 Identity admission is bounded independently from byte quota. Each tenant has a
 durable allocation token-bucket/rate limit, a maximum number of live allocation
-claims, and a maximum sequence window
+claims, and a maximum per-epoch sequence window
 `last_issued_sequence - retired_through`. The deployment also caps the total
-number of materialized allocation identities across all tenants. One sequence
-consumes exactly one identity slot whether it is represented by an allocation
-claim, an accepted claim plus import, a terminal tombstone, or a sparse retired
-marker. State transitions transfer that slot without charging it again; an
-out-of-order retirement preserves the charge until watermark compaction
-consumes the marker. The schema permits only a fixed, documented maximum
-number of control-plane rows per charged identity, so the identity caps also
-place a hard bound on these tables and indexes.
+number of materialized allocation identities across all tenants and epochs.
+One epoch/sequence identity consumes exactly one slot whether it is represented
+by an allocation claim, an accepted claim plus import, a terminal tombstone, or
+a sparse retired marker. State transitions transfer that slot without charging
+it again; an out-of-order retirement preserves the charge until watermark
+compaction consumes the marker. A sealed old epoch cannot allocate, but its
+remaining rows continue to consume the same tenant/global counters. The schema
+permits only a fixed, documented maximum number of control-plane rows per
+charged identity, so the identity caps also place a hard bound on these tables
+and indexes.
 
 Allocation checks and charges all applicable counters in the same transaction
 that increments the sequence and inserts the claim. Tenant rate, live-claim,
@@ -1132,20 +1200,27 @@ promotion_namespace_capabilities(
 )
 
 import_id_claims(
-  tenant_id, allocation_sequence, target_path,
+  tenant_id, allocation_epoch, allocation_sequence, target_path,
   expected_target_absent, allocation_idempotency_key_hash,
   allocation_request_digest, allocation_proof_blob, allocation_proof_digest,
   create_before, claim_state,
   accepted_create_request_digest, retired_at, created_at, updated_at,
-  primary key (tenant_id, allocation_sequence),
+  primary key (tenant_id, allocation_epoch, allocation_sequence),
   unique (tenant_id, allocation_idempotency_key_hash)
 )
 
-promotion_import_identity_counters(
-  tenant_id, last_issued_sequence, retired_through,
+promotion_import_identity_tenants(
+  tenant_id, installed_allocation_epoch, installed_restore_generation,
+  installed_database_incarnation,
   live_claim_count, materialized_identity_count,
-  rate_bucket_state, id_codec_version, config_generation, updated_at,
+  rate_bucket_state, config_generation, updated_at,
   primary key (tenant_id)
+)
+
+promotion_import_identity_epochs(
+  tenant_id, allocation_epoch, last_issued_sequence, retired_through,
+  id_codec_version, epoch_state, created_at, sealed_at, updated_at,
+  primary key (tenant_id, allocation_epoch)
 )
 
 promotion_import_identity_global(
@@ -1153,8 +1228,16 @@ promotion_import_identity_global(
   primary key (capacity_key)
 )
 
+# Stored in a control-plane durability domain outside tenant backup/PITR/clone.
+promotion_identity_epoch_authority(
+  tenant_id, current_allocation_epoch, restore_generation, admission_state,
+  lease_generation, max_allocation_lease_not_after,
+  database_incarnation, updated_at,
+  primary key (tenant_id)
+)
+
 imports(
-  tenant_id, allocation_sequence, allocation_proof_digest,
+  tenant_id, allocation_epoch, allocation_sequence, allocation_proof_digest,
   target_path, target_parent_inode,
   target_parent_path, target_parent_edge_incarnation,
   target_parent_children_generation, manifest_hash, entry_total, byte_total,
@@ -1167,95 +1250,118 @@ imports(
   committed_root_inode, committed_generation, terminal_result_blob,
   terminal_result_digest, terminal_at, result_acknowledged_at,
   full_row_compact_not_before, retire_after, created_at, updated_at,
-  primary key (tenant_id, allocation_sequence)
+  primary key (tenant_id, allocation_epoch, allocation_sequence)
 )
 
 import_entries(
-  tenant_id, allocation_sequence, relative_path_hash, relative_path,
+  tenant_id, allocation_epoch, allocation_sequence,
+  relative_path_hash, relative_path,
   entry_type, mode, mtime_ns, symlink_target,
   expected_size_bytes, expected_checksum_sha256,
   metadata_blob, entry_hash, import_content_id,
-  primary key (tenant_id, allocation_sequence, relative_path_hash)
+  primary key (tenant_id, allocation_epoch, allocation_sequence,
+               relative_path_hash)
 )
 
 import_contents(
-  tenant_id, allocation_sequence, import_content_id,
+  tenant_id, allocation_epoch, allocation_sequence, import_content_id,
   inline_content_blob, inline_content_idempotency_key, inline_request_digest,
   sealed_storage_ref,
   sealed_storage_version, size_bytes, checksum_sha256,
   accepted_seal_attempt_id, seal_state, ownership_state,
-  primary key (tenant_id, allocation_sequence, import_content_id),
-  unique (tenant_id, allocation_sequence, inline_content_idempotency_key)
+  primary key (tenant_id, allocation_epoch, allocation_sequence,
+               import_content_id),
+  unique (tenant_id, allocation_epoch, allocation_sequence,
+          inline_content_idempotency_key)
 )
 
 import_upload_attempts(
-  tenant_id, allocation_sequence, import_content_id, upload_attempt_id,
+  tenant_id, allocation_epoch, allocation_sequence,
+  import_content_id, upload_attempt_id,
   attempt_idempotency_key, request_digest, owner_epoch,
   upload_mode, provider_upload_id, maximum_size_bytes,
   selected_direct_write_grant_id,
   provider_mutation_id, provider_mutation_kind,
   provider_mutation_state, provider_mutation_not_after,
   state, gc_not_before, gc_state,
-  primary key (tenant_id, allocation_sequence, import_content_id,
+  primary key (tenant_id, allocation_epoch, allocation_sequence,
+               import_content_id,
                upload_attempt_id),
-  unique (tenant_id, allocation_sequence, import_content_id,
+  unique (tenant_id, allocation_epoch, allocation_sequence,
+          import_content_id,
           attempt_idempotency_key)
 )
 
 import_upload_write_grants(
-  tenant_id, allocation_sequence, import_content_id, upload_attempt_id,
+  tenant_id, allocation_epoch, allocation_sequence,
+  import_content_id, upload_attempt_id,
   write_grant_id, write_grant_idempotency_key, request_digest, owner_epoch,
   write_kind, part_number, part_generation, temporary_storage_ref,
   maximum_bytes, accept_before, body_complete_before, landing_not_after,
   provider_mutation_id, provider_mutation_state,
   provider_mutation_not_after, provider_write_identity,
   temporary_debt_charge_id, state, gc_not_before, gc_state,
-  primary key (tenant_id, allocation_sequence, import_content_id,
+  primary key (tenant_id, allocation_epoch, allocation_sequence,
+               import_content_id,
                upload_attempt_id, write_grant_id),
-  unique (tenant_id, allocation_sequence, import_content_id,
+  unique (tenant_id, allocation_epoch, allocation_sequence,
+          import_content_id,
           upload_attempt_id, write_grant_idempotency_key)
 )
 
 import_seal_attempts(
-  tenant_id, allocation_sequence, import_content_id, seal_attempt_id,
+  tenant_id, allocation_epoch, allocation_sequence,
+  import_content_id, seal_attempt_id,
   source_upload_attempt_id, owner_epoch, deterministic_storage_ref,
   sealed_storage_version, expected_size_bytes, expected_checksum_sha256,
   provider_mutation_id, provider_mutation_state,
   provider_mutation_not_after, candidate_debt_charge_id,
   state, gc_state, created_at, updated_at,
-  primary key (tenant_id, allocation_sequence, import_content_id,
+  primary key (tenant_id, allocation_epoch, allocation_sequence,
+               import_content_id,
                seal_attempt_id),
-  unique (tenant_id, allocation_sequence, import_content_id,
+  unique (tenant_id, allocation_epoch, allocation_sequence,
+          import_content_id,
           source_upload_attempt_id)
 )
 
 import_tombstones(
-  tenant_id, allocation_sequence, allocation_proof_digest,
+  tenant_id, allocation_epoch, allocation_sequence,
+  allocation_proof_digest,
   target_path, request_digest, owner_token_hash,
   recovery_token_hash, terminal_state,
   terminal_result_blob, terminal_result_digest, retire_after,
-  primary key (tenant_id, allocation_sequence)
+  primary key (tenant_id, allocation_epoch, allocation_sequence)
 )
 
 retired_import_sequences(
-  tenant_id, allocation_sequence, retired_at,
-  primary key (tenant_id, allocation_sequence)
+  tenant_id, allocation_epoch, allocation_sequence, retired_at,
+  primary key (tenant_id, allocation_epoch, allocation_sequence)
 )
 ```
 
+`promotion_identity_epoch_authority` is shown for relational clarity but is
+physically stored and backed up in the non-rollback control-plane durability
+domain, never in the tenant database being restored. Every foreign key among
+claims, imports, entries, content, attempts, grants, seals, tombstones, and
+sparse retirement rows includes the full
+`(tenant_id, allocation_epoch, allocation_sequence)` prefix. Omitting the epoch
+from a child key or unique constraint is a schema error, not an implementation
+shortcut.
+
 The public `migration_id` is not an independently stored database identity.
-Every handler strictly decodes it, combines the sequence with the authenticated
-tenant, and keys all durable state and foreign keys by
-`(tenant_id, allocation_sequence)`. Responses derive the canonical ID from that
-same sequence. An implementation may expose a generated diagnostic column, but
-it must be computed by the one canonical codec and cannot accept an arbitrary
-stored ID. This makes row lookup order irrelevant: an old ID always selects its
-old sequence and can only resolve to an active old row, a sparse retirement, or
-the retired watermark; it cannot select a newer operation. Proof-bearing
-handlers require the proof's version, tenant, ID, and sequence to match that
-decoded composite identity before examining state. Owner/recovery-token
-handlers decode the same sequence, look up only that row, and then compare the
-stored token hash.
+Every handler strictly decodes it, combines the epoch/sequence pair with the
+authenticated tenant, and keys all durable state and foreign keys by
+`(tenant_id, allocation_epoch, allocation_sequence)`. Responses derive the
+canonical ID from that same pair. An implementation may expose a generated
+diagnostic column, but it must be computed by the one canonical codec and
+cannot accept an arbitrary stored ID. This makes row lookup order irrelevant:
+an old ID always selects its old epoch and sequence and can only resolve to an
+active old row, that epoch's sparse retirement, or that epoch's retired
+watermark; it cannot select a newer operation. Proof-bearing handlers require
+the proof's version, tenant, ID, epoch, and sequence to match that decoded
+composite identity before examining state. Owner/recovery-token handlers decode
+the same pair, look up only that row, and then compare the stored token hash.
 
 `inline_content_blob` and its idempotency fields are the only P0 content-write
 path. The upload/write-grant/seal tables describe the disabled future
@@ -1283,19 +1389,33 @@ the expiry scanner retires an unused `ALLOCATED` claim under the same row lock
 used by first Create, so an in-flight create or retirement is the sole winner.
 After `create_before` plus the maximum request/recovery window, an unused
 retired claim enters the same sequence-retirement transaction as a terminal
-import. A missing claim with a valid proof but no retired-sequence evidence is
+import in its allocation epoch. A missing claim with a valid proof but no
+matching epoch/sequence retirement evidence is
 corrupt/outcome-unknown, not permission to reconstruct or admit the operation.
 
 `live_claim_count` counts only unused `ALLOCATED` claims. The per-tenant and
-global `materialized_identity_count` values count allocation sequences, not
-physical rows: a sequence is charged once at allocation and remains charged as
-its representation moves through claim, import, tombstone, and sparse-retired
-states. An accepted claim may coexist with its import/tombstone as a fixed
-serialization row without a second identity charge. The schema and retention
-rules bound the physical rows per charged sequence by a fixed constant; manifest
-entries and content use their separate entry/byte quota. Claim acceptance,
-terminal compaction, sparse retirement, watermark advancement, and counter
-transfer/decrement each occur in the same transaction as the row transition.
+global `materialized_identity_count` values count epoch/sequence identities,
+not physical rows: an identity is charged once at allocation and remains
+charged as its representation moves through claim, import, tombstone, and
+sparse-retired states. An accepted claim may coexist with its import/tombstone
+as a fixed serialization row without a second identity charge. The schema and
+retention rules bound the physical rows per charged identity by a fixed
+constant; manifest entries and content use their separate entry/byte quota.
+Claim acceptance, terminal compaction, sparse retirement, watermark
+advancement, and counter transfer/decrement each occur in the same transaction
+as the row transition.
+
+Only the epoch named by `promotion_import_identity_tenants` may be `ACTIVE` and
+allocate. Older epoch rows are `SEALED`; they support lookup, continuation, and
+retirement only. Their sequence window, sparse set, and retirement watermark
+are independent from the current epoch. A sealed epoch row may be compacted
+after it has no materialized identities, claims, imports, tombstones, or sparse
+markers. Because the external authority proves that epoch will never allocate
+again, an authenticated proof for a compacted old epoch with no durable
+operation row returns `promotion_recovery_required`, never a fresh allocation
+or `import_id_retired`. This conservative answer avoids both per-restore
+permanent database rows and an unsafe inference that a post-snapshot operation
+was retired.
 
 The ordinary namespace schema also supplies the non-reusable parent
 path-edge incarnation and monotonic child-set generation described above.
@@ -1318,34 +1438,38 @@ target, request digest, recovery-token hash, terminal state, result, and result
 digest remain in `import_tombstones` until that time. During the interval,
 `CreateImport` conflicts and an authorized `GetImport` returns the same terminal
 result. At `retire_after`, the server atomically marks the allocation sequence
-retired before deleting the result tombstone and its linked accepted claim. An
-out-of-order retirement inserts one sparse `retired_import_sequences` row in
-that same transaction. Counter rows initialize with
-`last_issued_sequence=retired_through=0`, and sequence zero is never issued.
-Every retirement locks the tenant counter: a sequence at or below the watermark
-is already retired; `retired_through+1` advances the watermark and consumes all
-immediately following sparse markers; any larger sequence inserts exactly one
-unique sparse marker. Tenant/global materialized counters decrement only for
-the directly folded sequence and each marker consumed by that same transaction;
-retries cannot decrement twice. This serialization makes concurrent and
-out-of-order retirement deterministic. The configured sequence-window and row
-budgets bound the sparse set even if an older operation temporarily prevents
-watermark advancement. A live allocation or accepted import is never inferred
-retired and therefore blocks the watermark at its sequence; exhausting the
-window blocks only new allocations and does not alter the live operation.
+retired inside its allocation epoch before deleting the result tombstone and
+its linked accepted claim. An out-of-order retirement inserts one sparse
+`retired_import_sequences` row for that epoch in the same transaction. Epoch
+counter rows initialize with `last_issued_sequence=retired_through=0`, and
+sequence zero is never issued. Every retirement locks the exact tenant/epoch
+counter: a sequence at or below that epoch's watermark is already retired;
+`retired_through+1` advances the watermark and consumes all immediately
+following sparse markers in that epoch; any larger sequence inserts exactly one
+unique epoch/sequence marker. Tenant/global materialized counters decrement
+only for the directly folded identity and each marker consumed by that same
+transaction; retries cannot decrement twice. This serialization makes
+concurrent and out-of-order retirement deterministic. The configured per-epoch
+sequence-window and row budgets bound each sparse set even if an older
+operation temporarily prevents watermark advancement. A live allocation or
+accepted import is never inferred retired and therefore blocks its epoch's
+watermark at that sequence; exhausting the current epoch's window blocks only
+new allocations and does not alter the live operation.
 
 The authenticated allocation proof supplies the retired operation's tenant,
-target, migration ID, and sequence after per-ID rows are gone. With current
-scope on that target and a valid proof, the proof-bearing `CreateImport`,
-`GetImport`, and `RetireImportAllocation` endpoints return the stable
-`import_id_retired` result when the sequence is at or below `retired_through` or
-has a sparse retired marker. Without both proofs they return the same canonical
-not-found response as an unknown ID. Other mutation endpoints do not carry an
-allocation proof and return canonical not-found once their active/tombstone row
-has retired; an old owner or recovery token alone cannot reveal or resurrect
-the identity. A valid proof above the watermark with no active/tombstone/claim/
-sparse row is a storage-invariant violation and returns fail-closed
-`promotion_recovery_required`; it is never treated as new. Recovery beyond the
+target, migration ID, epoch, and sequence after per-ID rows are gone. With
+current scope on that target and a valid proof, the proof-bearing
+`CreateImport`, `GetImport`, and `RetireImportAllocation` endpoints return the
+stable `import_id_retired` result when the sequence is at or below the matching
+epoch's `retired_through` or has a sparse marker in that epoch. Without both
+proofs they return the same canonical not-found response as an unknown ID.
+Other mutation endpoints do not carry an allocation proof and return canonical
+not-found once their active/tombstone row has retired; an old owner or recovery
+token alone cannot reveal or resurrect the identity. A valid proof above the
+matching epoch's watermark with no active/tombstone/claim/sparse row is a
+storage-invariant violation and returns fail-closed
+`promotion_recovery_required`; a proof for a compacted old epoch takes that same
+fail-closed result. Neither is ever treated as new. Recovery beyond the
 documented maximum offline window therefore remains deterministic through
 `GetImport` without retaining one permanent database row per allocation.
 
@@ -1355,9 +1479,10 @@ That cleanup anchor cannot be deleted until every write grant, upload attempt,
 and unowned seal candidate is `gc_done`, every landing/provider-mutation closure
 bound has passed, and every corresponding debt charge is released. A provider
 outage may therefore retain the cleanup anchor and write/attempt ledgers beyond
-`retire_after`, while the sequence proof/watermark independently returns
-`import_id_retired` to authorized callers and the terminal result blob is
-already pruned. Result-payload retention stays bounded; cleanup debt is never
+`retire_after`, while the matching epoch/sequence proof and watermark
+independently return `import_id_retired` to authorized callers and the terminal
+result blob is already pruned. Result-payload retention stays bounded; cleanup
+debt is never
 orphaned merely to satisfy that bound.
 
 The outbox is part of the transaction. It invalidates positive and negative
@@ -1538,7 +1663,7 @@ The server state is authoritative for publish and accounting outcome:
 | `GetImport` result | Client authority and fence | Server resources and next action | Local-record disposition |
 | --- | --- | --- | --- |
 | not found, or an `ALLOCATED` claim with no import | Source is currently authoritative, but `CREATE_REQUESTED` remains outcome-unknown; keep both paths fenced. | A delayed create may still win. Retry the exact `CreateImport` or serialize with it through `RetireImportAllocation`; lookup absence alone causes no cleanup. | Retain; never release a fence or delete the record from this observation. |
-| `RETIRED` allocation claim or proof-backed `import_id_retired` | Source is authoritative. | Claim/sequence retirement serialized after every in-flight create loser, so no reservation or stage can appear later. | Fsync a local aborted result, release fences, then remove the active record. |
+| `RETIRED` allocation claim or proof-backed `import_id_retired` | Source is authoritative. | Claim/epoch-sequence retirement serialized after every in-flight create loser, so no reservation or stage can appear later. | Fsync a local aborted result, release fences, then remove the active record. |
 | `CREATED` | Source is authoritative; keep both fenced during recovery. | Reservation exists; no or partial stage. Resume with the current durable owner token, take over after expiry, or abort. | Retain until `ABORTED` or a later commit result. |
 | `STAGING` | Source is authoritative; keep both fenced during recovery. | Reservation and partial hidden inline stage remain. Resume/take over or abort. In a future external mode, old control-plane mutations are epoch-fenced and already-issued grants remain isolated/tracked through landing closure plus GC. | Retain. |
 | `VERIFIED` | Source is authoritative; keep both fenced. | Immutable hidden stage and reservation remain. Commit with the same migration ID or abort; no entry mutation is allowed. | Retain. |
@@ -1840,36 +1965,59 @@ The remaining P0/FUSE concurrency cases are:
 ### Import and accounting
 
 - allocation flood tests use distinct idempotency keys until the tenant rate,
-  live-claim, and sequence-window limits and the global materialized-identity
-  limit are reached. The boundary request gets the specified stable error and
+  live-claim, current-epoch sequence-window, and global materialized-identity
+  limits are reached. The boundary request gets the specified stable error and
   creates no sequence/proof/claim; retrying a prior key still returns its one
   original allocation even after capacity is full. Two tenants contend for a
   deliberately small global limit to prove that the shared counter, not only
   each tenant's limit, rejects the boundary request. A fake clock retires
-  claims out of order, proves the sparse set cannot exceed the configured
-  window, and leaves the oldest sequence live until the window rejects new
-  allocations. Retiring that sequence closes the gap, advances the watermark,
-  releases the exact tenant/global counters, and permits allocation again.
+  claims out of order within one epoch, proves the sparse set cannot exceed the
+  configured window, and leaves the oldest sequence live until the window
+  rejects new allocations. Retiring that sequence closes the gap, advances
+  that epoch's watermark, releases the exact tenant/global counters, and
+  permits allocation again.
   Independently deleting the rate, live-claim, window, global-cap, or atomic
   counter-transfer check makes the production `AllocateImportID` flood test
   exceed its configured rows, double charge/release, or issue one extra proof;
 - allocation response loss before the client records the result retries the
-  same fsynced idempotency key and obtains the identical sequence, migration
-  ID, proof bytes, and deadline without a second counter charge. After the
-  documented retention window and watermark compaction, a reused key is
-  explicitly a new allocation with a new sequence; neither path can resurrect
-  or reuse the retired migration ID;
-- after an old sequence has been folded into `retired_through`, a forced-codec
-  fixture makes the next allocation encoder return that old public ID. The
-  encode/decode-versus-new-sequence check must roll back the transaction with no
-  counter, claim, or proof side effect; deleting that check makes the test
-  fail. The normal codec then returns the canonical next ID: old ID plus old
-  proof resolves retired, while new ID plus new proof resolves only the new
-  row, independent of whether a handler would otherwise inspect proof or rows
-  first. Boundary tests cover canonical fixed-width encoding, alias rejection,
-  sequence exhaustion without wrap, counter rewind below the watermark failing
-  closed, and per-tenant reuse of the same sequence string without cross-tenant
-  authority;
+  same fsynced idempotency key and obtains the identical epoch, sequence,
+  migration ID, proof bytes, and deadline without a second counter charge.
+  After the documented retention window and watermark compaction, a reused key
+  is explicitly a new allocation with a new epoch/sequence identity; neither
+  path can resurrect or reuse the retired migration ID;
+- inside one epoch, after an old sequence has been folded into
+  `retired_through`, a forced-codec fixture makes the next allocation encoder
+  return that old public ID. The encode/decode-versus-new-pair check must roll
+  back the transaction with no counter, claim, or proof side effect; deleting
+  that check makes the test fail. Boundary tests cover canonical fixed-width
+  epoch/sequence encoding, alias rejection, epoch and sequence exhaustion
+  without wrap, current-epoch pointer mismatch, counter rewind below the
+  matching epoch's watermark failing closed, and per-tenant reuse of the same
+  numeric pair without cross-tenant authority;
+- a deterministic PITR test snapshots a tenant database at external epoch `E`
+  and sequence `N`, allocates and fsyncs proof `E/N+1`, then puts the external
+  authority into `FENCING`, stops leases, waits the recorded lease bound,
+  advances it to `E+1`, restores the tenant database to the snapshot, installs
+  `E+1`, and reactivates admission. The old `E/N+1` proof must return
+  `promotion_recovery_required` when its post-snapshot row is absent; a new
+  allocation may receive numeric sequence `N+1` only under `E+1`, producing a
+  distinct migration ID and key. An older restored `E/N` row still reconciles
+  normally. This test restores all tenant rows and counters consistently; the
+  existing counter-below-watermark fixture is not a substitute for it;
+- barrier variants prove that an old allocation lease cannot commit a claim
+  after `FENCING` or after the restore-generation/epoch changes, that the
+  authority being unavailable or inconsistent returns the stable
+  `promotion_identity_epoch_unavailable` response before counter, claim, quota,
+  or staging side effects, and that a raw tenant restore/clone without a valid
+  one-use install grant leaves promotion disabled. Response loss after the DB
+  install replays the same tuple without a second epoch row, while changing any
+  tuple component conflicts and leaves the tenant fenced. Fake time covers the
+  exact maximum-lease-expiry boundary;
+- independently deleting the allocation epoch from the canonical ID, proof,
+  any durable primary/foreign key, or handler lookup; skipping the
+  `FENCING`/lease-drain barrier; or accepting a restored database before exact
+  epoch/generation/incarnation installation makes the PITR test fail. These are
+  delete-the-fix mutations, not merely assertions that an epoch field exists;
 - authorization is exercised before import creation, not only on
   continuations: out-of-scope `PlanImport` returns no plan, out-of-scope
   `AllocateImportID` creates no claim, and scope revocation between allocation
@@ -1893,14 +2041,16 @@ The remaining P0/FUSE concurrency cases are:
   denied;
 - an ID-only continuation table crosses authorized and out-of-scope callers
   with active rows, full-terminal rows, result tombstones, unused retired
-  allocations, sparse retired sequences, watermark-compacted sequences, and
-  random unknown IDs. Every stored/proof-target denial or missing-proof case is
-  a byte-for-byte equivalent canonical not-found response with no state-
-  dependent headers. Current scope plus the applicable authenticated
-  allocation proof or recovery token exposes the defined active/terminal
-  result; only a proof-bearing endpoint exposes stable `import_id_retired`.
-  An unknown ID remains not-found, while a valid proof for an impossible above-
-  watermark gap fails closed as recovery required;
+  allocations, current- and sealed-epoch sparse retired sequences,
+  watermark-compacted sequences, a compacted old epoch, and random unknown IDs.
+  Every stored/proof-target denial or missing-proof case is a byte-for-byte
+  equivalent canonical not-found response with no state-dependent headers.
+  Current scope plus the applicable authenticated allocation proof or recovery
+  token exposes the defined active/terminal result; only a proof-bearing
+  endpoint exposes stable `import_id_retired` while its epoch retirement
+  summary exists. An unknown ID remains not-found, while a valid proof for an
+  impossible above-watermark gap or a compacted old epoch fails closed as
+  recovery required;
 - the target-bearing Create-recovery table separately proves its two gates: an
   out-of-scope request target returns the same 403 before lookup for existing
   and unknown IDs, while an in-scope request target that resolves to a stored
@@ -2024,7 +2174,18 @@ external-object adapter:
 - rollback below the minimum writer version is rejected while imports are
   active or promotion remains enabled, and re-enable requires a fresh audit;
 - deleting the writer-version/admission check makes the old-writer fixture
-  reproduce target ABA and fail the test.
+  reproduce target ABA and fail the test;
+- tenant PITR/clone is refused until the external promotion-identity authority
+  is `FENCING`, old allocation leases have drained, and a new monotonic epoch
+  and restore generation have been committed outside the restored durability
+  domain. Promotion stays disabled until the restored database installs that
+  exact epoch, restore generation, and database incarnation with a one-use
+  grant and the authority acknowledges the installation;
+- restoring a tenant snapshot without advancing the external epoch, replaying
+  an install grant, presenting a stale allocation lease, or making the
+  authority unavailable leaves allocation fail-closed with
+  `promotion_identity_epoch_unavailable` and no identity/quota/staging side
+  effect.
 
 ### Local recovery and reuse
 
@@ -2054,14 +2215,15 @@ external-object adapter:
   in the documented final-revalidation gap is explicitly tested as
   out-of-contract and is never advertised as fail-closed;
 - terminal result acknowledgement, minimum and unacknowledged-maximum full-row
-  compaction, complete-result tombstone lookup, and post-terminal sequence
-  retirement are tested with a fake clock. Out-of-order retirement creates a
-  sparse marker; closing the oldest gap advances the contiguous watermark and
-  deletes consumed markers/counter debt atomically. An active sequence never
-  becomes retired, and a valid authorized proof after terminal retirement is
-  `import_id_retired`, never a fresh import. Missing/invalid proof,
-  out-of-scope proof, and an unknown ID are indistinguishable not-found; a
-  valid proof for an impossible above-watermark gap is recovery-required;
+  compaction, complete-result tombstone lookup, and post-terminal epoch/
+  sequence retirement are tested with a fake clock. Out-of-order retirement
+  creates a marker in the matching epoch; closing the oldest gap advances only
+  that epoch's contiguous watermark and deletes consumed markers/counter debt
+  atomically. An active identity never becomes retired, and a valid authorized
+  proof after terminal retirement is `import_id_retired`, never a fresh import.
+  Missing/invalid proof, out-of-scope proof, and an unknown ID are
+  indistinguishable not-found; a valid proof for an impossible above-watermark
+  gap or compacted old epoch is recovery-required;
 - a provider cleanup outage past `retire_after` prunes the externally
   recoverable result but retains the internal attempt/cleanup anchor until
   `gc_done`, then removes it.
@@ -2095,11 +2257,18 @@ Tests must fail when independently deleting:
   recovery), scoped-route dispatcher allowlisting, the non-disclosing lookup
   response rule, or the separation that lets already-accepted
   `COMMITTING`/`ABORTING` workers finish under service authority;
-- authenticated allocation proof binding, monotonic sequence allocation,
-  canonical injective migration-ID encoding, allocation-time encode/decode
-  equality, and decode-before-lookup,
-  transactional sparse retirement/watermark advancement before payload or
-  claim removal, and every per-tenant/global identity admission counter;
+- authenticated allocation proof binding, monotonic current-epoch sequence
+  allocation, canonical injective epoch/sequence migration-ID encoding,
+  allocation-time encode/decode equality, and decode-before-lookup;
+- the non-rollback promotion-identity authority, exact epoch/restore/
+  incarnation installation, `FENCING` plus allocation-lease drain, and epoch
+  binding in the public ID, proof, every durable key, and every handler lookup;
+- full tenant-database PITR after a post-snapshot allocation must not alias the
+  old proof with a new operation, even when the restored database is internally
+  self-consistent and reuses the same numeric sequence;
+- matching-epoch transactional sparse retirement/watermark advancement before
+  payload or claim removal, sealed-epoch non-allocation, and every
+  per-tenant/global identity admission counter;
 - side-effect-free plan revalidation and the production adapter classifier that
   permits DB-inline content but rejects `AWSS3Client`, `LocalS3Client` in
   production, and unknown backends before import/quota creation;
@@ -2148,9 +2317,11 @@ independently deleting:
   enabled.
 - Provide path-policy overrides as the immediate workaround.
 - Ship the preview behind a capability flag only for tenants whose namespace
-  CAS gate is ready and whose complete manifest receives a `db9_inline` plan;
-  record promotion outcomes, duration, bytes, entries, storage mode,
-  unsupported-provider rejections, conflicts, and recovery actions.
+  CAS gate is ready, whose non-rollback promotion-identity authority and
+  restore/clone fence are operational, and whose complete manifest receives a
+  `db9_inline` plan; record promotion outcomes, duration, bytes, entries,
+  storage mode, identity-epoch admission failures, unsupported-provider
+  rejections, conflicts, and recovery actions.
 - Do not enable object-backed promotion merely because traffic is proxied.
   Each production adapter needs a separately reviewed capability-matrix row
   backed by its real API contract and classification regression.
