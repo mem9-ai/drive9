@@ -181,7 +181,7 @@ func (cq *CommitQueue) checksumLandedPayload(entry *CommitEntry) string {
 
 // pruneLandedLocked bounds process-local lineage metadata. Evicting an
 // unreferenced landmark can only make a future growth attempt fail closed;
-// landmarks needed by already queued or in-flight direct children are kept.
+// landmarks needed by already queued or in-flight descendants are kept.
 func (cq *CommitQueue) pruneLandedLocked() {
 	limit := cq.landedLimitLocked()
 	if len(cq.landed) <= limit {
@@ -193,8 +193,16 @@ func (cq *CommitQueue) pruneLandedLocked() {
 	}
 	referenced := make(map[lineageRef]struct{}, len(cq.queue)+len(cq.inFlight)+len(cq.immediate))
 	rememberReference := func(entry *CommitEntry) {
-		if entry != nil && !entry.canceled && entry.Path != "" && entry.ParentSnapshotID != "" {
+		if entry == nil || entry.canceled || entry.Path == "" {
+			return
+		}
+		if entry.ParentSnapshotID != "" {
 			referenced[lineageRef{path: entry.Path, parentID: entry.ParentSnapshotID}] = struct{}{}
+		}
+		for _, ancestorID := range entry.liveAncestors {
+			if ancestorID != "" {
+				referenced[lineageRef{path: entry.Path, parentID: ancestorID}] = struct{}{}
+			}
 		}
 	}
 	for _, entry := range cq.queue {

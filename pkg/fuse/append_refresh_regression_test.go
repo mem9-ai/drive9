@@ -211,6 +211,49 @@ func TestPR939ReviewBusySiblingMustNotAppendAtStaleEOF(t *testing.T) {
 	}
 }
 
+func TestAppendRefreshBusyTimeoutReturnsEAGAIN(t *testing.T) {
+	const path = "/_cacache/index-v5/review-busy-timeout"
+	fs, ino := pr939HandleFS(t, path, "base")
+	fs.opts.RemoteCommitWaitTimeout = 10 * time.Millisecond
+	src, srcID := pr939Handle(t, fs, ino, path, "base", false)
+	_, targetID := pr939Handle(t, fs, ino, path, "base", false)
+	if _, st := pr939Append(fs, ino, srcID, "A"); st != gofuse.OK {
+		t.Fatal(st)
+	}
+
+	src.Lock()
+	start := time.Now()
+	n, st := pr939Append(fs, ino, targetID, "B")
+	src.Unlock()
+	if st != gofuse.Status(syscall.EAGAIN) || n != 0 {
+		t.Fatalf("busy timeout: n=%d status=%v, want zero-byte EAGAIN", n, st)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("busy timeout took %s, want bounded retry", elapsed)
+	}
+}
+
+func TestAppendRefreshLineageMismatchFailsFast(t *testing.T) {
+	const path = "/_cacache/index-v5/review-lineage-mismatch"
+	fs, ino := pr939HandleFS(t, path, "base")
+	fs.opts.RemoteCommitWaitTimeout = 2 * time.Second
+	target, targetID := pr939Handle(t, fs, ino, path, "baseA", true)
+	pr939Handle(t, fs, ino, path, "baseB", true)
+
+	before := pr939HandleBytes(target)
+	start := time.Now()
+	n, st := pr939Append(fs, ino, targetID, "X")
+	if st != gofuse.Status(syscall.EAGAIN) || n != 0 {
+		t.Fatalf("lineage mismatch: n=%d status=%v, want zero-byte EAGAIN", n, st)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("lineage mismatch retried for %s instead of failing fast", elapsed)
+	}
+	if after := pr939HandleBytes(target); after != before {
+		t.Fatalf("lineage mismatch changed target from %q to %q", before, after)
+	}
+}
+
 func TestPR939ReviewUnlinkedAppendKeepsAnonymousInode(t *testing.T) {
 	const path = "/_cacache/index-v5/review-unlinked"
 	fs, oldIno := pr939HandleFS(t, path, "OLD")

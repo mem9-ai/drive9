@@ -50,6 +50,11 @@ var testHookBeforeUnlinkedTransition func()
 // handshake that attach has entered lock contention.
 var testHookAfterUnlinkHandleSetLockAttempt func()
 
+// errAppendRefreshBusy marks transient sibling-handle lock contention. Write
+// may retry it after yielding fh.mu and the path fence; lineage rejection uses
+// syscall.EAGAIN directly and returns to the caller without an internal spin.
+var errAppendRefreshBusy = errors.New("append refresh source busy")
+
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
 // operations to the dat9 HTTP API via the Go SDK client.
 type Dat9FS struct {
@@ -4755,7 +4760,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 		}
 
 		if !lockSrc(src) {
-			return false, syscall.EAGAIN
+			return false, errAppendRefreshBusy
 		}
 		if src.Unlinked || src.Ino != fh.Ino || src.Dirty == nil {
 			src.Unlock()
@@ -4830,7 +4835,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 
 		if !haveData && c.canMemory {
 			if !lockSrc(c.src) {
-				return false, syscall.EAGAIN
+				return false, errAppendRefreshBusy
 			}
 			if c.src.Dirty != nil && !c.src.Unlinked && c.src.Ino == fh.Ino {
 				size = c.src.Dirty.Size()
@@ -13773,12 +13778,18 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		if fh.Flags&uint32(syscall.O_APPEND) == 0 {
 			break
 		}
-		err := fs.refreshAppendBufferLocked(fh)
-		if err == nil {
+		refreshErr := fs.refreshAppendBufferLocked(fh)
+		if refreshErr == nil {
 			break
 		}
-		if !errors.Is(err, syscall.EAGAIN) || time.Now().After(deadline) {
-			return 0, httpToFuseStatus(err)
+		if !errors.Is(refreshErr, errAppendRefreshBusy) {
+			if errors.Is(refreshErr, syscall.EAGAIN) {
+				return 0, gofuse.Status(syscall.EAGAIN)
+			}
+			return 0, httpToFuseStatus(refreshErr)
+		}
+		if time.Now().After(deadline) {
+			return 0, gofuse.Status(syscall.EAGAIN)
 		}
 		fs.releaseHandleRemoteCommitPathLocked(fh)
 		fh.Unlock()

@@ -577,12 +577,20 @@ func TestCommitQueueLandedProofUsesUploadedPayloadAfterShadowReplacement(t *test
 
 func TestCommitQueueLandedLandmarksAreBoundedAndProtectQueuedChild(t *testing.T) {
 	cq := &CommitQueue{
-		queue:     []*CommitEntry{{Path: "/protected.db", ParentSnapshotID: "protected-parent"}},
+		queue: []*CommitEntry{
+			{Path: "/protected.db", ParentSnapshotID: "protected-parent"},
+			{
+				Path:             "/ancestor-protected.db",
+				ParentSnapshotID: "unlanded-direct-parent",
+				liveAncestors:    []string{"protected-ancestor"},
+			},
+		},
 		inFlight:  make(map[string]*CommitEntry),
 		immediate: make(map[*CommitEntry]struct{}),
 		landed:    make(map[string]pathCommitLandmark),
 	}
 	cq.rememberLanded("/protected.db", 1, 1, "checksum", "protected-parent")
+	cq.rememberLanded("/ancestor-protected.db", 1, 1, "checksum", "protected-ancestor")
 	for i := 0; i < maxLandedCommitLandmarks; i++ {
 		path := fmt.Sprintf("/landmark-%04d.db", i)
 		cq.rememberLanded(path, 1, 1, "checksum", fmt.Sprintf("snapshot-%04d", i))
@@ -592,6 +600,9 @@ func TestCommitQueueLandedLandmarksAreBoundedAndProtectQueuedChild(t *testing.T)
 	}
 	if got := cq.landedCommit("/protected.db"); got.snapshotID != "protected-parent" {
 		t.Fatalf("queued child's parent landmark was evicted: %+v", got)
+	}
+	if got := cq.landedCommit("/ancestor-protected.db"); got.snapshotID != "protected-ancestor" {
+		t.Fatalf("queued child's ancestor landmark was evicted: %+v", got)
 	}
 	if got := cq.landedCommit("/landmark-0000.db"); got.snapshotID != "" {
 		t.Fatalf("oldest unreferenced landmark was retained: %+v", got)
