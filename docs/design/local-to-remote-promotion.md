@@ -186,6 +186,7 @@ preview maps them as follows:
 | Target child exists or has the wrong type at final CAS | `target_conflict` | `EEXIST` or `ENOTEMPTY`, matching the observed target |
 | Target remains absent but its parent edge, child-set generation, or namespace-CAS epoch changed | `target_precondition_changed` | `EAGAIN` |
 | Source changed during snapshot | `source_changed` | `EAGAIN` |
+| Import activity deadline won before commit acceptance | `promotion_deadline_exceeded` | `ETIMEDOUT` |
 | Permission failure | `permission_denied` | `EACCES` or `EPERM` |
 | Quota reservation failure | `quota_exceeded` | `EDQUOT` or `ENOSPC` |
 | Configured tree limit exceeded | `promotion_limit_exceeded` | `EFBIG` |
@@ -420,6 +421,21 @@ multipart upload ID; no attempt from an earlier owner epoch is reused. Direct
 PUT may be replayable until expiry, so its temporary key is always treated as
 mutable and untrusted.
 
+Every server-side provider mutation, including multipart completion and the
+copy/create used by `SealImportContent`, also has a durable operation claim
+created before the request is sent. The claim records a random operation UUID,
+kind, exact source and destination/upload identities, owner epoch, state, and a
+provider-guaranteed `mutation_not_after`: after that instant the provider
+cannot newly materialize the side effect. A worker checks database time and
+the import/claim state immediately before sending and never starts the request
+after that bound. A synchronous timeout is not such a guarantee; an
+asynchronous provider operation remains claimed and is polled by its provider
+operation ID until terminal. A backend without idempotent or exactly
+rediscoverable operations and a finite, enforceable side-effect bound is not
+eligible for promotion. Retrying the same control-plane request resumes its
+existing mutation claim and provider operation; it cannot allocate a second
+side effect or move the closure bound.
+
 Before touching object storage, `SealImportContent` first creates a durable
 seal-intent row containing a server-generated seal-attempt UUID, expected
 content identity/hash/size, owner epoch, and a deterministic, server-only
@@ -450,6 +466,18 @@ creates an untracked second version. A failed candidate is terminal for that
 seal intent and upload attempt. A replacement upload attempt receives a new
 seal-attempt UUID/destination while the old row remains retained for cleanup.
 
+Abort, takeover, and GC do not assume cancellation of a claimed provider
+mutation. They preserve its claim and destination/upload identity through
+`mutation_not_after` plus the provider clock, propagation, and in-flight safety
+margin. Only after that closure bound may cleanup issue another exact-key
+delete or multipart abort and prove with an exact-key/version lookup (not an
+eventually consistent prefix listing) that no object, version, upload, or part
+remains. An absence observed before the bound is provisional and cannot set
+`gc_done`: a delayed operation may still land and must be removed by the
+post-bound sweep. If the worker crashes after the provider side effect but
+before DB attach, the durable claim keeps the ledger and tombstone alive until
+the same deterministic destination is either attached or collected.
+
 The manifest references only the successfully attached sealed identity.
 `VerifyImport` freezes the ordered set of sealed identities, sizes, and hashes;
 `CommitImport` rechecks those exact identities and never resolves a mutable
@@ -469,10 +497,21 @@ ledger early is forbidden. Object-store lifecycle policy is a backstop, not the
 correctness mechanism.
 
 Each capability is bounded by the import reservation and a separate internal
-temporary-attempt budget. Customer quota may be released at `ABORTED`, but the
-maximum bytes of every still-live capability remain charged to that internal
-cleanup budget until `gc_done`. This prevents repeated aborts or takeovers from
-turning the capability-expiry window into unbounded provider storage debt.
+cleanup-debt budget. Before returning a capability, the server charges that
+attempt's maximum bytes as temporary-attempt debt. Before claiming a seal
+copy/create, it separately charges the candidate's expected bytes; both copies
+may exist simultaneously and therefore both charges count toward the peak
+bound. The attach transaction atomically converts an accepted sealed
+candidate from internal candidate debt to reservation-backed staged ownership.
+If abort/takeover wins, it instead leaves the candidate as internal cleanup
+debt. A later abort atomically transfers every detached staged candidate back
+to internal cleanup debt before releasing the reservation. Customer quota may
+be released at `ABORTED`, but temporary-attempt and unowned-candidate charges
+remain until their respective operation/capability closure and `gc_done`.
+Retrying a durable attempt or seal intent reuses its charge; it never
+double-charges or silently drops debt after response loss. This prevents
+repeated uploads, seals, aborts, or takeovers from turning the closure window
+into unbounded provider storage debt.
 
 During `CreateImport`, the server resolves and records an immutable target
 precondition; clients cannot supply or replace its namespace facts. It is a
@@ -527,9 +566,9 @@ The transitions and their durable effects are normative:
 | `STAGING` | successful `VerifyImport` | `VERIFIED` | Entry set, content set, and manifest version become immutable. |
 | `VERIFIED` | accepted `CommitImport` CAS | `COMMITTING` | Commit attempt ID and accepted outcome are durable; request cancellation can no longer abort it. |
 | `COMMITTING` | server commit worker | `COMMITTED` | Target CAS, namespace publication, ownership transfer, reservation settlement, result row, and structural outbox event commit atomically. |
-| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort, expired-lease GC, or activity-deadline CAS | `ABORTING` | No new capability, completion, seal, entry, verify, renew, takeover, or commit is accepted; cleanup ownership, including all issued attempt expiries, is durable. |
+| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort, expired-lease GC, or activity-deadline CAS | `ABORTING` | No new capability, completion, seal, entry, verify, renew, takeover, or commit is accepted; cleanup ownership, including every capability expiry, provider-mutation closure bound, object identity, and debt charge, is durable. |
 | `COMMITTING` | permanent target/auth/manifest failure before publication | `ABORTING` | A durable terminal reason is recorded; no namespace or committed quota changed. Transient failure stays `COMMITTING` and is retried by the server. |
-| `ABORTING` | server cleanup worker | `ABORTED` | Hidden entries and sealed unowned objects are detached, the reservation is released exactly once, and the terminal reason/result is retained. Issued-attempt cleanup remains tracked through the post-expiry sweep until `gc_done`. |
+| `ABORTING` | server cleanup worker | `ABORTED` | Hidden entries and sealed unowned objects are detached, the reservation is released exactly once, and the terminal reason/result is retained. Upload/seal attempts, provider-mutation claims, and cleanup debt remain tracked through the post-closure sweep until `gc_done`. |
 
 There are no other transitions. `COMMITTED` and `ABORTED` are terminal.
 `COMMITTING` and `ABORTING` are server-owned recovery states: client lease
@@ -549,7 +588,10 @@ call) CASes `CREATED`, `STAGING`, or `VERIFIED` to `ABORTING` with reason
 `VERIFIED -> COMMITTING` CAS won before the deadline remains server-owned and
 runs to `COMMITTED` or `ABORTING`. Thus active work has a finite
 client-controlled horizon, but `GetImport` remains available and its ID/status
-never retire before server-owned terminalization.
+never retire before server-owned terminalization. A FUSE rename whose import
+reaches this terminal reason returns the stable
+`promotion_deadline_exceeded`/`ETIMEDOUT` mapping above; retries query the same
+terminal result rather than translating it from a transport timeout.
 
 Every transition compares and increments `state_version`. Commit and cleanup
 workers additionally claim a durable attempt ID; duplicate workers either
@@ -643,8 +685,9 @@ import_upload_attempts(
   attempt_idempotency_key, request_digest, owner_epoch,
   temporary_storage_ref, provider_upload_id,
   maximum_size_bytes, capability_issuance_count,
-  capability_not_after, state,
-  gc_not_before, gc_state,
+  capability_not_after, provider_mutation_id, provider_mutation_kind,
+  provider_mutation_state, provider_mutation_not_after,
+  temporary_debt_charge_id, state, gc_not_before, gc_state,
   primary key (tenant_id, migration_id, import_content_id, upload_attempt_id),
   unique (tenant_id, migration_id, import_content_id, attempt_idempotency_key)
 )
@@ -653,6 +696,8 @@ import_seal_attempts(
   tenant_id, migration_id, import_content_id, seal_attempt_id,
   source_upload_attempt_id, owner_epoch, deterministic_storage_ref,
   sealed_storage_version, expected_size_bytes, expected_checksum_sha256,
+  provider_mutation_id, provider_mutation_state,
+  provider_mutation_not_after, candidate_debt_charge_id,
   state, gc_state, created_at, updated_at,
   primary key (tenant_id, migration_id, import_content_id, seal_attempt_id),
   unique (tenant_id, migration_id, import_content_id, source_upload_attempt_id)
@@ -701,10 +746,12 @@ terminal retention window, making storage retention bounded and migration-ID
 reuse behavior testable with a fake clock.
 
 Physical tombstone deletion additionally requires every upload attempt and
-every unowned seal candidate to be `gc_done`. If a provider outage delays
-cleanup past `retire_after`, external APIs still return `import_id_retired`;
-the terminal result blob and recovery token hash may be pruned, while a minimal
-internal migration/tenant cleanup anchor and both attempt ledgers remain.
+every unowned seal candidate to be `gc_done`, every provider-mutation closure
+bound to have passed, and every corresponding debt charge to be released. If a
+provider outage delays cleanup past `retire_after`, external APIs still return
+`import_id_retired`; the terminal result blob and recovery token hash may be
+pruned, while a minimal internal migration/tenant cleanup anchor and both
+attempt ledgers remain.
 Result-payload retention stays bounded; cleanup debt is never orphaned merely
 to satisfy that bound.
 
@@ -856,8 +903,8 @@ The server state is authoritative for publish and accounting outcome:
 | `VERIFIED` | Source is authoritative; keep both fenced. | Immutable hidden stage and reservation remain. Commit with the same migration ID or abort; no entry mutation is allowed. | Retain. |
 | `COMMITTING` | Outcome is unknown; neither source nor target is released. | Server owns completion; lease expiry and client abort do nothing. Poll `GetImport`; a recovered server worker reaches `COMMITTED` or `ABORTING`. | Retain; never create a second migration ID. |
 | `ABORTING` | Source remains authoritative, but both paths stay fenced until cleanup completes. | Server resumes hidden-stage deletion and exactly-once reservation release; no client mutation or takeover is accepted. | Retain and poll. |
-| `ABORTED` | Source is authoritative; target was not published. | Reservation is released, sealed ownership is detached, and the terminal reason is durable. Temporary-attempt GC may continue from its retained ledger until `gc_done`. | Fsync the local aborted result, release fences, then acknowledge/retire the active record; the server tombstone remains for retry identity. |
-| `COMMITTED` | Target is authoritative; keep both fenced until source reconciliation finishes. | Quota is settled, sealed content ownership and namespace/outbox result are durable; temporary-attempt GC cannot remove them and continues independently until `gc_done`. | Verify the source-incarnation UUID, quarantine only the matching source, publish inode/cache state, fsync `DONE`, release fences, then acknowledge/retire the active record. |
+| `ABORTED` | Source is authoritative; target was not published. | Reservation is released, sealed ownership is detached, and the terminal reason is durable. Upload/seal-attempt cleanup, provider-mutation claims, and debt may continue from retained ledgers until `gc_done`. | Fsync the local aborted result, release fences, then acknowledge/retire the active record; the server tombstone remains for retry identity. |
+| `COMMITTED` | Target is authoritative; keep both fenced until source reconciliation finishes. | Quota is settled, sealed content ownership and namespace/outbox result are durable; cleanup of temporary and unowned candidates cannot remove committed versions and continues independently until `gc_done`. | Verify the source-incarnation UUID, quarantine only the matching source, publish inode/cache state, fsync `DONE`, release fences, then acknowledge/retire the active record. |
 | unreachable or invalid response | Authority is unresolved; keep both paths fenced or fail the mount closed. | No cleanup, quota release, abort, or new migration is guessed. | Retain and return `promotion_recovery_required`. |
 
 The durable local phase refines, but never overrides, that server result:
@@ -986,6 +1033,8 @@ Kill and restart before and after:
 - content-attempt idempotency-key journal fsync, request send, and returned
   attempt-ID journal fsync;
 - each object upload;
+- durable provider-mutation claim, multipart-complete/copy request send,
+  provider-side completion, and returned outcome persistence;
 - durable seal intent, create-once sealed-object creation, sealed-version
   verification, and DB attach;
 - stage verification;
@@ -1022,6 +1071,10 @@ tree. Repeated recovery is idempotent.
   object is deleted after capability expiry plus grace;
 - old multipart parts arrive after takeover/abort and cannot be completed or
   referenced; provider abort plus post-expiry sweep converges to no parts;
+- abort cleanup first observes an absent destination or incomplete multipart,
+  then a previously claimed server-side complete/copy lands and its worker
+  crashes before recording the outcome; the pre-bound absence cannot set
+  `gc_done`, and the post-bound sweep removes the late side effect;
 - verify versus a late upload, and content completion/seal versus an aborted
   terminal import;
 - `CreateImportContent` response loss followed by same-key retry returns one
@@ -1032,6 +1085,9 @@ tree. Repeated recovery is idempotent.
 - crash after create-once seal succeeds but before its DB attach resumes the
   same seal intent/version without consulting the mutable temp key; deleting
   the intent makes the failure-injection test leak or attach wrong bytes;
+- deleting the provider-mutation claim or allowing cleanup before its closure
+  bound makes deterministic delayed multipart-complete and delayed seal-copy
+  tests leave an object/version/part after the ledger would have been removed;
 - writeback enqueue immediately after a drain attempt;
 - direct local-root file replacement and symlink swap while a snapshot is read;
 - a second mount reading while publish occurs;
@@ -1045,9 +1101,16 @@ tree. Repeated recovery is idempotent.
 - missing, extra, duplicate, absolute, escaping, or symlink-following manifest
   entries are rejected;
 - an upload cannot exceed the reserved entry or byte total;
-- repeated attempt issuance and owner takeover cannot exceed the internal
-  temporary-attempt budget; customer quota release does not release that debt
-  before `gc_done`;
+- repeated attempt issuance, seal creation, and owner takeover cannot exceed
+  the internal cleanup-debt budget; customer quota release does not release
+  temporary or unowned-candidate debt before `gc_done`;
+- a mutable upload and its unowned sealed candidate are charged separately at
+  their simultaneous peak; attach atomically converts candidate debt to
+  reservation-backed staging, while abort retains both cleanup charges until
+  their individual `gc_done` transitions;
+- request/response loss around upload-attempt creation, provider-mutation
+  claim, seal attach, abort, and debt transfer neither double-charges nor
+  releases debt before the corresponding bytes can no longer exist;
 - commit converts the reservation exactly once after response loss and retry;
 - abort and GC release it exactly once and cannot race a committed import;
 - committed content references survive staging GC;
@@ -1065,7 +1128,8 @@ tree. Repeated recovery is idempotent.
   server-owned, or terminal state makes a focused test fail;
 - lease renewal and capability issuance at the activity boundary never extend
   their expiry beyond it; every active import is forced into `COMMITTING` or
-  `ABORTING` before terminal retention/retirement begins.
+  `ABORTING` before terminal retention/retirement begins, and its public result
+  remains `promotion_deadline_exceeded`/`ETIMEDOUT` across restart and retry.
 
 ### Upgrade and rollback
 
@@ -1137,6 +1201,10 @@ Tests must fail when independently deleting:
   expired-lease takeover;
 - immutable sealed-version binding, durable seal intent, upload/seal attempt
   retention through capability expiry/grace, and content-attempt idempotency;
+- provider-mutation claims, their side-effect closure bounds, and the required
+  post-bound exact-key/multipart rescan before `gc_done`;
+- separate temporary-attempt and unowned-sealed-candidate debt charges plus
+  their atomic attach/abort transfer;
 - the activity deadline and forced terminalization before terminal retention;
 - the namespace all-writer rollout/admission gate;
 - quota reservation conversion and content-ref ownership transfer;
