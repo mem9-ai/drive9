@@ -246,8 +246,8 @@ The normative request authorization matrix is:
 | First/retried `CreateImport` | Tenant authentication plus `write` on the request target; it must equal the plan and allocation-claim target. Recovery-before-admission does not bypass this check. |
 | `PutInlineImportContent`, future content/grant/complete/seal/attach calls, `VerifyImport`, `RenewImportLease` | Resolve the import under the authenticated tenant, then require current `write` scope on its stored target before reading a body, returning a capability, renewing, or mutating state. |
 | `CommitImport` | Require current `write` scope on the stored target before the `VERIFIED -> COMMITTING` acceptance CAS. |
-| `AbortImport`, `TakeOverImport`, `RetireImportAllocation`, `AcknowledgeImportResult` | Require current `write` scope on the stored import/allocation target in addition to the applicable owner, recovery, or allocation token. |
-| `GetImport` | Require current `read` scope on the stored import/allocation target plus the applicable allocation or recovery token before returning existence, state, target, or result. |
+| `AbortImport`, `TakeOverImport`, `RetireImportAllocation`, `AcknowledgeImportResult` | Require current `write` scope on the stored or authenticated-proof target in addition to the applicable owner, recovery, or allocation proof. |
+| `GetImport` | Require current `read` scope on the stored or authenticated-proof target plus the applicable allocation proof or recovery token before returning existence, state, target, or result. |
 
 The HTTP dispatcher admits scoped tokens only to import routes whose handler
 implements this table. Entry handlers authorize their canonical request
@@ -268,11 +268,11 @@ recovery; denial is non-disclosing rather than a target-mismatch oracle.
 ID-only continuation handlers look up tenant-owned state internally only to
 obtain its stored target; when that target is outside the current scope, they
 return the exact canonical `404 import not found` response used for an unknown
-or unauthorized graveyard ID, including status, body shape, and cache policy.
-They do not reveal whether an active row, terminal row, tombstone, allocation
-claim, graveyard identity, target, or result was found. A valid current scope
-plus the applicable operation token is required before normal active, terminal,
-or `import_id_retired` semantics are exposed.
+or unauthorized retired-sequence proof, including status, body shape, and cache
+policy. They do not reveal whether an active row, terminal row, tombstone,
+allocation claim, retired sequence, target, or result was found. A valid
+current scope plus the applicable operation credential is required before
+normal active, terminal, or `import_id_retired` semantics are exposed.
 
 Server-owned work is deliberately different. Once `CommitImport` wins
 `VERIFIED -> COMMITTING`, or abort/deadline/GC wins a transition to
@@ -319,7 +319,9 @@ The coordinator persists a record before remote side effects:
 
 ```text
 migration_id
-allocation_token
+allocation_sequence
+allocation_idempotency_key
+allocation_proof
 source_path
 target_path
 source_identity (local root UUID, reserved source-incarnation UUID)
@@ -355,12 +357,13 @@ the same rule applies separately to its content attempt and every write-grant
 key, so response loss is never interpreted as permission to allocate a
 replacement side effect.
 
-The initial record contains the allocation token, canonical target, expected
-absence, and exact create-request digest. After a successful or recovered
-`CreateImport`, the coordinator rewrites and fsyncs the record with the server
-precondition digest and owner epoch and advances the local phase to `STAGING`
-before sending content. The target-precondition digest is for reconciliation
-only; the server always uses its own stored namespace facts at commit.
+The initial record contains the allocation sequence/proof, canonical target,
+expected absence, and exact create-request digest. After a successful or
+recovered `CreateImport`, the coordinator rewrites and fsyncs the record with
+the server precondition digest and owner epoch and advances the local phase to
+`STAGING` before sending content. The target-precondition digest is for
+reconciliation only; the server always uses its own stored namespace facts at
+commit.
 
 Phases are monotonic:
 
@@ -447,9 +450,10 @@ PlanImport(target, expected_target_absent=true, canonical_manifest)
   -> manifest_hash, entry_total, byte_total, max_content_size,
      storage_mode, storage_plan_digest, backend_capability_generation,
      limits, plan_expires_at
-AllocateImportID(canonical_target, expected_target_absent=true)
-  -> migration_id, allocation_token, create_before
-CreateImport(migration_id, allocation_token,
+AllocateImportID(canonical_target, expected_target_absent=true,
+                 allocation_idempotency_key)
+  -> migration_id, allocation_sequence, allocation_proof, create_before
+CreateImport(migration_id, allocation_proof,
              target, expected_target_absent=true,
              canonical_manifest,
              manifest_hash, entry_total, byte_total, max_content_size,
@@ -477,8 +481,8 @@ AttachImportContent(migration_id, owner_epoch, owner_token,
                     relative_path, entry_hash, import_content_token)
 VerifyImport(migration_id, owner_epoch, owner_token, manifest_hash)
 CommitImport(migration_id, owner_epoch, owner_token)
-GetImport(migration_id, allocation_or_recovery_token)
-RetireImportAllocation(migration_id, allocation_token)
+GetImport(migration_id, allocation_proof_or_recovery_token)
+RetireImportAllocation(migration_id, allocation_proof)
 AbortImport(migration_id, owner_epoch, owner_token)
 RenewImportLease(migration_id, owner_epoch, owner_token)
 TakeOverImport(migration_id, expected_owner_epoch,
@@ -518,21 +522,24 @@ and cannot create an import.
 
 `CreateImport` resolves lost responses before it performs new-admission checks:
 
-1. Under normal tenant authentication, look up `(tenant_id, migration_id)` in
-   active/full-terminal rows, retained tombstones, and the ID graveyard before
+1. Validate the server-authenticated allocation proof, its tenant/target/ID/
+   sequence binding, and current target scope. Then look up
+   `(tenant_id, migration_id)` in active/full-terminal rows, retained
+   tombstones, the allocation claim, and sparse retired-sequence set before
    treating it as new.
 2. If an active/full row exists, compare the stored immutable create-request
    digest, owner-token hash, and recovery-token hash. An exact match returns the
    current state, reservation, and manifest-entry result even if
    `create_before` or `plan_expires_at` has since passed or the current backend
    capability generation has changed. A retained terminal tombstone performs
-   the same comparison and returns its terminal result. A graveyard row with
-   matching current scope and operation token returns `import_id_retired`;
-   without those proofs it is non-disclosing not-found. These are recovery of
-   an accepted transaction, not new admission. Any visible mismatch returns
+   the same comparison and returns its terminal result. A valid proof whose
+   sequence is at or below the tenant's retired watermark, or is present in the
+   sparse retired set, returns `import_id_retired`; without a valid proof and
+   current scope it is non-disclosing not-found. These are recovery of an
+   accepted transaction, not new admission. Any visible mismatch returns
    conflict and cannot reset the epoch.
 3. Only when no accepted row exists does the server lock the durable allocation
-   claim. It rechecks for an accepted winner, then validates claim state/token,
+   claim. It rechecks for an accepted winner, then validates claim state/proof,
    `create_before`, plan MAC/expiry, current capability generation,
    authorization, limits, and quota before attempting the atomic insert.
 4. The transaction changes the claim from `ALLOCATED` to `ACCEPTED` together
@@ -543,23 +550,74 @@ and cannot create an import.
 
 The create-request digest covers every immutable request field including the
 canonical manifest hash, canonical target, `expected_target_absent=true`, and
-all plan claims. Repeating `CreateImport` with either token changed never acts
-as takeover; the caller must follow the explicit expired-lease takeover
-contract. Changing the expected-absence field on a recovery request therefore
-conflicts rather than recovering or creating a replacement import.
+all plan claims. Repeating `CreateImport` with either the owner or recovery
+token changed never acts as takeover; the caller must follow the explicit
+expired-lease takeover contract. Changing the expected-absence field on a
+recovery request therefore conflicts rather than recovering or creating a
+replacement import.
 
-Migration IDs are tenant-bound random, non-reusable identities returned by
-`AllocateImportID`. Allocation persists one quota-neutral claim keyed by
-`(tenant_id, migration_id)`, the canonical target and fixed expected-absence
-claim, a hash of the opaque allocation token, and `create_before`; it creates no
-import, manifest stage, reservation, or content side effect. A lost allocation
-response may leave only this bounded inert claim; the client may allocate a
-different ID, while the server retires the unclaimed row at `create_before`.
-The coordinator obtains and fsyncs the ID, allocation token, owner token, and
-recovery token before `CreateImport`.
+Migration IDs are server-generated opaque identifiers assigned alongside a
+tenant-bound, monotonically increasing `allocation_sequence`; the transaction
+rejects an ID collision, and a sequence is never decremented or reassigned.
+The database type and check constraint forbid sequence wrap; exhausting the
+representable range fails with `promotion_identity_budget_exceeded` before
+issuing an ID rather than resetting or reusing a sequence.
+The server also returns an opaque, authenticated
+`allocation_proof` binding proof-format/key version, tenant, sequence,
+migration ID, canonical target, fixed expected-absence claim, `create_before`,
+and allocation-request digest (including the idempotency-key digest).
+Verification-only key material for issued proof versions remains available;
+proof validation does not require a per-ID row. The proof is an operation-
+identity credential, not tenant authorization.
+
+The coordinator generates and fsyncs an allocation idempotency key before the
+request. The allocation transaction locks the tenant identity-budget row and a
+global materialized-identity counter, applies the limits below, increments the
+tenant sequence, and inserts one quota-neutral claim keyed by tenant/sequence/
+migration ID plus the request-key digest. Retrying the same key and request
+while that bounded mapping is retained returns the same ID, sequence, proof,
+and deadline; reusing it with different claims conflicts. The claim retains the
+exact bounded proof blob until sequence retirement, so signing-key rotation
+cannot change a lost-response retry. Only after this response is fsynced does
+the coordinator
+generate/fsync owner and recovery tokens and call `CreateImport`.
+
+`AllocateImportID` resolves an existing idempotency-key row before applying
+new-admission limits. An exact retry therefore recovers its original result
+even while the tenant or deployment is at capacity; a mismatch conflicts. This
+idempotency guarantee lasts through the documented allocation/terminal
+recovery window, while the claim/import/tombstone still exists. After its
+sequence has been retired and folded into the watermark, the per-request key
+mapping is intentionally gone; an allocation request at that point is a new
+operation and receives a new non-reused sequence. No safety or deduplication
+decision may use the caller's idempotency key after that bounded window.
+
+Identity admission is bounded independently from byte quota. Each tenant has a
+durable allocation token-bucket/rate limit, a maximum number of live allocation
+claims, and a maximum sequence window
+`last_issued_sequence - retired_through`. The deployment also caps the total
+number of materialized allocation identities across all tenants. One sequence
+consumes exactly one identity slot whether it is represented by an allocation
+claim, an accepted claim plus import, a terminal tombstone, or a sparse retired
+marker. State transitions transfer that slot without charging it again; an
+out-of-order retirement preserves the charge until watermark compaction
+consumes the marker. The schema permits only a fixed, documented maximum
+number of control-plane rows per charged identity, so the identity caps also
+place a hard bound on these tables and indexes.
+
+Allocation checks and charges all applicable counters in the same transaction
+that increments the sequence and inserts the claim. Tenant rate, live-claim,
+or sequence-window exhaustion returns the stable
+`promotion_identity_budget_exceeded` (`429`, FUSE `EDQUOT`); global backpressure
+returns `promotion_identity_capacity_unavailable` (`503`, FUSE `EAGAIN`). Both
+produce no claim, sequence, proof, quota reservation, or staging side effect.
+Limits are configuration-versioned and observable; callers cannot bypass them
+with new idempotency keys. Counter/row disagreement fails allocation closed and
+raises a repair alert; a reconciliation job may repair counters from the
+bounded materialized state but never guesses that an identity was retired.
 
 The first-create transaction locks that allocation claim. It accepts only an
-`ALLOCATED` claim with the matching token and database time before
+`ALLOCATED` claim with the matching authenticated proof and database time before
 `create_before`, then creates the import/reservation/entries and changes the
 claim to `ACCEPTED` atomically. An `ACCEPTED` claim resolves through the
 existing-row recovery contract; a `RETIRED` or missing claim can never create
@@ -572,7 +630,7 @@ cannot still commit. Only the durable local `PREPARED` phase (request provably
 never dispatched) or a successful claim retirement supplies that proof.
 
 Recovery of an already-accepted row follows the digest/token comparison above
-and is not a new use of the allocation token. An active import has no
+and is not a new allocation. An active import has no
 allocation-time retirement deadline: its durable row remains queryable until
 the server reaches a terminal state, and terminal retention begins only then.
 
@@ -1038,14 +1096,31 @@ promotion_namespace_capabilities(
 )
 
 import_id_claims(
-  tenant_id, migration_id, target_path, expected_target_absent,
-  allocation_token_hash, create_before, claim_state,
+  tenant_id, allocation_sequence, migration_id, target_path,
+  expected_target_absent, allocation_idempotency_key_hash,
+  allocation_request_digest, allocation_proof_blob, allocation_proof_digest,
+  create_before, claim_state,
   accepted_create_request_digest, retired_at, created_at, updated_at,
-  primary key (tenant_id, migration_id)
+  primary key (tenant_id, allocation_sequence),
+  unique (tenant_id, migration_id),
+  unique (tenant_id, allocation_idempotency_key_hash)
+)
+
+promotion_import_identity_counters(
+  tenant_id, last_issued_sequence, retired_through,
+  live_claim_count, materialized_identity_count,
+  rate_bucket_state, config_generation, updated_at,
+  primary key (tenant_id)
+)
+
+promotion_import_identity_global(
+  capacity_key, materialized_identity_count, config_generation, updated_at,
+  primary key (capacity_key)
 )
 
 imports(
-  tenant_id, migration_id, target_path, target_parent_inode,
+  tenant_id, migration_id, allocation_sequence, allocation_proof_digest,
+  target_path, target_parent_inode,
   target_parent_path, target_parent_edge_incarnation,
   target_parent_children_generation, manifest_hash, entry_total, byte_total,
   max_content_size, storage_mode, storage_plan_digest,
@@ -1116,18 +1191,16 @@ import_seal_attempts(
 )
 
 import_tombstones(
-  tenant_id, migration_id, target_path, request_digest, owner_token_hash,
+  tenant_id, migration_id, allocation_sequence, allocation_proof_digest,
+  target_path, request_digest, owner_token_hash,
   recovery_token_hash, terminal_state,
   terminal_result_blob, terminal_result_digest, retire_after,
   primary key (tenant_id, migration_id)
 )
 
-import_id_graveyard(
-  tenant_id, migration_id, target_path, retired_kind,
-  allocation_token_hash, request_digest, owner_token_hash,
-  recovery_token_hash,
-  retired_at,
-  primary key (tenant_id, migration_id)
+retired_import_sequences(
+  tenant_id, allocation_sequence, retired_at,
+  primary key (tenant_id, allocation_sequence)
 )
 ```
 
@@ -1156,9 +1229,20 @@ never moves backward. An accepted claim remains linked to the import/tombstone;
 the expiry scanner retires an unused `ALLOCATED` claim under the same row lock
 used by first Create, so an in-flight create or retirement is the sole winner.
 After `create_before` plus the maximum request/recovery window, an unused
-retired claim is atomically compacted into `import_id_graveyard` before its
-claim row is removed. A missing claim without a matching graveyard is unknown
-and cannot be reconstructed or admitted from an old token.
+retired claim enters the same sequence-retirement transaction as a terminal
+import. A missing claim with a valid proof but no retired-sequence evidence is
+corrupt/outcome-unknown, not permission to reconstruct or admit the operation.
+
+`live_claim_count` counts only unused `ALLOCATED` claims. The per-tenant and
+global `materialized_identity_count` values count allocation sequences, not
+physical rows: a sequence is charged once at allocation and remains charged as
+its representation moves through claim, import, tombstone, and sparse-retired
+states. An accepted claim may coexist with its import/tombstone as a fixed
+serialization row without a second identity charge. The schema and retention
+rules bound the physical rows per charged sequence by a fixed constant; manifest
+entries and content use their separate entry/byte quota. Claim acceptance,
+terminal compaction, sparse retirement, watermark advancement, and counter
+transfer/decrement each occur in the same transaction as the row transition.
 
 The ordinary namespace schema also supplies the non-reusable parent
 path-edge incarnation and monotonic child-set generation described above.
@@ -1180,26 +1264,32 @@ maximum offline-recovery window. The tenant-bound migration ID, canonical
 target, request digest, recovery-token hash, terminal state, result, and result
 digest remain in `import_tombstones` until that time. During the interval,
 `CreateImport` conflicts and an authorized `GetImport` returns the same terminal
-result. At `retire_after`, one transaction creates the minimal
-`import_id_graveyard` row before deleting the result tombstone. The graveyard
-retains no manifest, content, quota, result blob, or cleanup ownership; it keeps
-only the bounded identity, target, token/digest hashes, retired kind, and time
-needed to prevent reuse, authorize a retirement proof, and distinguish a valid
-old operation from a random ID. It is logically permanent and included in
-capacity planning as bounded-size control-plane identity debt. Result-payload
-retention remains bounded; any future external-storage cleanup debt follows its
-separate accounted-until-converged contract below.
+result. At `retire_after`, the server atomically marks the allocation sequence
+retired before deleting the result tombstone and its linked accepted claim. An
+out-of-order retirement inserts one sparse `retired_import_sequences` row in
+that same transaction. Under the tenant identity-counter lock, a compactor
+advances `retired_through` only across a contiguous prefix of retired sequences
+and deletes the consumed sparse markers. The materialized identity counters are
+decremented in the same transactions. The configured sequence-window and row
+budgets bound the sparse set even if an older operation temporarily prevents
+watermark advancement. A live allocation or accepted import is never inferred
+retired and therefore blocks the watermark at its sequence; exhausting the
+window blocks only new allocations and does not alter the live operation.
 
-With current scope on the retained target and the operation token applicable to
-that endpoint (allocation, current owner, or recovery), every ID-addressed API
-against a graveyard returns the stable `import_id_retired` result and never
-creates a new claim/import. Without both proofs it returns the same canonical
-not-found response as an unknown ID. A random or deleted/nonexistent ID has no
-graveyard and is never admitted except through a fresh successful
-`AllocateImportID`; allocation retries on an ID in the graveyard choose a new
-random ID. Recovery of a valid operation beyond the documented maximum offline
-window therefore receives `import_id_retired` and maps it to fail-closed
-`promotion_recovery_required`.
+The authenticated allocation proof supplies the retired operation's tenant,
+target, migration ID, and sequence after per-ID rows are gone. With current
+scope on that target and a valid proof, the proof-bearing `CreateImport`,
+`GetImport`, and `RetireImportAllocation` endpoints return the stable
+`import_id_retired` result when the sequence is at or below `retired_through` or
+has a sparse retired marker. Without both proofs they return the same canonical
+not-found response as an unknown ID. Other mutation endpoints do not carry an
+allocation proof and return canonical not-found once their active/tombstone row
+has retired; an old owner or recovery token alone cannot reveal or resurrect
+the identity. A valid proof above the watermark with no active/tombstone/claim/
+sparse row is a storage-invariant violation and returns fail-closed
+`promotion_recovery_required`; it is never treated as new. Recovery beyond the
+documented maximum offline window therefore remains deterministic through
+`GetImport` without retaining one permanent database row per allocation.
 
 For a future external mode, result-tombstone compaction at `retire_after` also
 creates or retains a separate minimal internal migration/tenant cleanup anchor.
@@ -1207,7 +1297,7 @@ That cleanup anchor cannot be deleted until every write grant, upload attempt,
 and unowned seal candidate is `gc_done`, every landing/provider-mutation closure
 bound has passed, and every corresponding debt charge is released. A provider
 outage may therefore retain the cleanup anchor and write/attempt ledgers beyond
-`retire_after`, while the public identity graveyard independently returns
+`retire_after`, while the sequence proof/watermark independently returns
 `import_id_retired` to authorized callers and the terminal result blob is
 already pruned. Result-payload retention stays bounded; cleanup debt is never
 orphaned merely to satisfy that bound.
@@ -1390,7 +1480,7 @@ The server state is authoritative for publish and accounting outcome:
 | `GetImport` result | Client authority and fence | Server resources and next action | Local-record disposition |
 | --- | --- | --- | --- |
 | not found, or an `ALLOCATED` claim with no import | Source is currently authoritative, but `CREATE_REQUESTED` remains outcome-unknown; keep both paths fenced. | A delayed create may still win. Retry the exact `CreateImport` or serialize with it through `RetireImportAllocation`; lookup absence alone causes no cleanup. | Retain; never release a fence or delete the record from this observation. |
-| `RETIRED` allocation claim with no accepted import | Source is authoritative. | Claim retirement serialized after every in-flight create loser, so no reservation or stage can appear later. | Fsync a local aborted result, release fences, then remove the active record. |
+| `RETIRED` allocation claim or proof-backed `import_id_retired` | Source is authoritative. | Claim/sequence retirement serialized after every in-flight create loser, so no reservation or stage can appear later. | Fsync a local aborted result, release fences, then remove the active record. |
 | `CREATED` | Source is authoritative; keep both fenced during recovery. | Reservation exists; no or partial stage. Resume with the current durable owner token, take over after expiry, or abort. | Retain until `ABORTED` or a later commit result. |
 | `STAGING` | Source is authoritative; keep both fenced during recovery. | Reservation and partial hidden inline stage remain. Resume/take over or abort. In a future external mode, old control-plane mutations are epoch-fenced and already-issued grants remain isolated/tracked through landing closure plus GC. | Retain. |
 | `VERIFIED` | Source is authoritative; keep both fenced. | Immutable hidden stage and reservation remain. Commit with the same migration ID or abort; no entry mutation is allowed. | Retain. |
@@ -1418,7 +1508,7 @@ record fails the mount closed.
 | `COMMIT_REQUESTED` | Query `GetImport`; never retry with a new migration ID or infer failure from disconnect. |
 | `REMOTE_COMMITTED` | Verify the durable source-incarnation UUID before quarantine. Never roll back the target. |
 | `SOURCE_QUARANTINED` | Target is authoritative. A janitor removes only the matching migration-owned quarantine identity. |
-| Manifest/record/token missing, corrupt, or mismatched | Fail closed and require repair; do not guess, take over, or delete either tree. |
+| Manifest/record/proof/token missing, corrupt, or mismatched | Fail closed and require repair; do not guess, take over, or delete either tree. |
 
 Once the server reports committed, old uploaders and recovery attempts cannot
 write a different manifest under the same migration ID.
@@ -1691,6 +1781,26 @@ The remaining P0/FUSE concurrency cases are:
 
 ### Import and accounting
 
+- allocation flood tests use distinct idempotency keys until the tenant rate,
+  live-claim, and sequence-window limits and the global materialized-identity
+  limit are reached. The boundary request gets the specified stable error and
+  creates no sequence/proof/claim; retrying a prior key still returns its one
+  original allocation even after capacity is full. Two tenants contend for a
+  deliberately small global limit to prove that the shared counter, not only
+  each tenant's limit, rejects the boundary request. A fake clock retires
+  claims out of order, proves the sparse set cannot exceed the configured
+  window, and leaves the oldest sequence live until the window rejects new
+  allocations. Retiring that sequence closes the gap, advances the watermark,
+  releases the exact tenant/global counters, and permits allocation again.
+  Independently deleting the rate, live-claim, window, global-cap, or atomic
+  counter-transfer check makes the production `AllocateImportID` flood test
+  exceed its configured rows, double charge/release, or issue one extra proof;
+- allocation response loss before the client records the result retries the
+  same fsynced idempotency key and obtains the identical sequence, migration
+  ID, proof bytes, and deadline without a second counter charge. After the
+  documented retention window and watermark compaction, a reused key is
+  explicitly a new allocation with a new sequence; neither path can resurrect
+  or reuse the retired migration ID;
 - authorization is exercised before import creation, not only on
   continuations: out-of-scope `PlanImport` returns no plan, out-of-scope
   `AllocateImportID` creates no claim, and scope revocation between allocation
@@ -1713,11 +1823,14 @@ The remaining P0/FUSE concurrency cases are:
   denied;
 - an ID-only continuation table crosses authorized and out-of-scope callers
   with active rows, full-terminal rows, result tombstones, unused retired
-  allocations, permanent graveyard rows, and random unknown IDs. Every stored-
-  target denial or missing-proof case is a byte-for-byte equivalent canonical
-  not-found response with no state-dependent headers. Current scope plus the
-  required operation token exposes the defined active/terminal result or stable
-  `import_id_retired` for a graveyard row; an unknown ID remains not-found;
+  allocations, sparse retired sequences, watermark-compacted sequences, and
+  random unknown IDs. Every stored/proof-target denial or missing-proof case is
+  a byte-for-byte equivalent canonical not-found response with no state-
+  dependent headers. Current scope plus the applicable authenticated
+  allocation proof or recovery token exposes the defined active/terminal
+  result; only a proof-bearing endpoint exposes stable `import_id_retired`.
+  An unknown ID remains not-found, while a valid proof for an impossible above-
+  watermark gap fails closed as recovery required;
 - the target-bearing Create-recovery table separately proves its two gates: an
   out-of-scope request target returns the same 403 before lookup for existing
   and unknown IDs, while an in-scope request target that resolves to a stored
@@ -1871,12 +1984,14 @@ external-object adapter:
   in the documented final-revalidation gap is explicitly tested as
   out-of-contract and is never advertised as fail-closed;
 - terminal result acknowledgement, minimum and unacknowledged-maximum full-row
-  compaction, complete-result tombstone lookup, and post-terminal ID retirement
-  are tested with a fake clock. Tombstone or unused-claim pruning first creates
-  the minimal graveyard row transactionally; deleting that row or permitting
-  `AllocateImportID` to reuse it makes the test fail. An active import never
-  becomes retired, and a valid authorized replay after terminal retirement is
-  `import_id_retired`, never a fresh import;
+  compaction, complete-result tombstone lookup, and post-terminal sequence
+  retirement are tested with a fake clock. Out-of-order retirement creates a
+  sparse marker; closing the oldest gap advances the contiguous watermark and
+  deletes consumed markers/counter debt atomically. An active sequence never
+  becomes retired, and a valid authorized proof after terminal retirement is
+  `import_id_retired`, never a fresh import. Missing/invalid proof,
+  out-of-scope proof, and an unknown ID are indistinguishable not-found; a
+  valid proof for an impossible above-watermark gap is recovery-required;
 - a provider cleanup outage past `retire_after` prunes the externally
   recoverable result but retains the internal attempt/cleanup anchor until
   `gc_done`, then removes it.
@@ -1910,8 +2025,9 @@ Tests must fail when independently deleting:
   recovery), scoped-route dispatcher allowlisting, the non-disclosing lookup
   response rule, or the separation that lets already-accepted
   `COMMITTING`/`ABORTING` workers finish under service authority;
-- transactional compaction of terminal tombstones and unused retired claims
-  into the permanent, target-bearing ID graveyard before payload/claim removal;
+- authenticated allocation proof binding, monotonic sequence allocation,
+  transactional sparse retirement/watermark advancement before payload or
+  claim removal, and every per-tenant/global identity admission counter;
 - side-effect-free plan revalidation and the production adapter classifier that
   permits DB-inline content but rejects `AWSS3Client`, `LocalS3Client` in
   production, and unknown backends before import/quota creation;
