@@ -415,22 +415,44 @@ manifest summary, selected storage mode, exact limits, capability generation,
 and `plan_expires_at`; `PlanImport` keeps no server-side reservation. Replaying
 or altering any claim fails verification. `CreateImport` accepts it only before
 expiry and only while the recorded generation still equals current runtime
-configuration. It must also receive the identical canonical manifest bytes,
-recompute every summary and the MAC input, and atomically persist the import
-row, quota reservation, and complete hidden `import_entries` set. A hash or
-summary alone is not an entry transport and cannot create an import.
+configuration **when creating a row for the first time**. It must also receive
+the identical canonical manifest bytes, recompute every summary and the MAC
+input, and atomically persist the import row, quota reservation, and complete
+hidden `import_entries` set. A hash or summary alone is not an entry transport
+and cannot create an import.
 
-Repeating `CreateImport` with the same owner and recovery tokens returns the
-current state and does not duplicate the reservation. Repeating it with either
-token changed never acts as takeover or resets an epoch; the caller must follow
-the explicit expired-lease takeover contract.
+`CreateImport` resolves lost responses before it performs new-admission checks:
+
+1. Under normal tenant authentication, look up `(tenant_id, migration_id)` in
+   active/full-terminal rows and retained tombstones before treating it as new.
+2. If an active/full row exists, compare the stored immutable create-request
+   digest, owner-token hash, and recovery-token hash. An exact match returns the
+   current state, reservation, and manifest-entry result even if
+   `create_before` or `plan_expires_at` has since passed or the current backend
+   capability generation has changed. A retained terminal tombstone performs
+   the same comparison and returns its terminal result. After retirement it
+   returns `import_id_retired`. These are recovery of an accepted transaction,
+   not new admission. Any mismatch returns conflict and cannot reset the epoch.
+3. Only when no row exists does the server validate allocation-token signature
+   and `create_before`, plan MAC/expiry, current capability generation,
+   authorization, limits, and quota before attempting the atomic insert.
+4. If the insert loses a unique-key race, the transaction rolls back and the
+   server re-reads the winning row, applying step 2. It never allocates a
+   second reservation or entry set.
+
+The create-request digest covers every immutable request field including the
+canonical manifest hash and plan claims. Repeating `CreateImport` with either
+token changed never acts as takeover; the caller must follow the explicit
+expired-lease takeover contract.
 
 Migration IDs are tenant-bound, authenticated IDs returned by
 `AllocateImportID`, with a signed `create_before` time and random, non-reusable
 identity. The coordinator obtains and fsyncs the ID and both tokens before
 `CreateImport`, so allocation creates no stage or quota side effect.
-`CreateImport` accepts an ID only before `create_before`; an expired or
-previously consumed ID can never start a new import. An active import has no
+When no row exists, `CreateImport` accepts an ID only before `create_before`;
+an expired or previously consumed ID can never start a new import. Recovery of
+an already-accepted row follows the digest/token comparison above and is not a
+new use of the allocation token. An active import has no
 allocation-time retirement deadline: its durable row remains queryable until
 the server reaches a terminal state, and terminal retention begins only then.
 
@@ -477,6 +499,15 @@ The planner uses an explicit, closed capability enum and configuration
 generation produced by the real backend constructor. It never promotes an
 unknown wrapper because it happens to implement `S3Client`, nor infers support
 from provider or endpoint strings.
+
+`backend_capability_generation` is a cluster-visible, tenant-scoped database
+fact, not an unsynchronized process-local counter. A storage/config rollout
+advances it before minting new plans. The first-create transaction locks and
+rechecks that row, and the serving process must also report the exact closed
+adapter capability; disagreement fails closed. Thus a plan minted on one server
+cannot be admitted by a differently configured server. Existing accepted rows
+continue under their captured inline mode/limits and are recovered by request
+digest rather than reclassified.
 
 The canonical manifest contains one normalized, ordered tuple per entry. Every
 tuple includes path, type, mode, mtime, and entry hash. A regular-file tuple
@@ -735,10 +766,15 @@ pathname, mtime, inode ID alone, or reusable numeric revision is not sufficient.
 The server import state machine is:
 
 ```text
-CREATED -----> STAGING -----> VERIFIED -----> COMMITTING -----> COMMITTED
-   |              |              |
-   +--------------+--------------+----------> ABORTING -------> ABORTED
+CREATED --content--> STAGING --verify--> VERIFIED --> COMMITTING --> COMMITTED
+   \------ metadata-only verify -------->/
+
+CREATED | STAGING | VERIFIED --abort/deadline--> ABORTING --> ABORTED
 ```
+
+The direct `CREATED -> VERIFIED` edge is used only when verification proves the
+persisted manifest requires no regular-file content, such as an empty,
+empty-directory-only, or symlink-only tree.
 
 The transitions and their durable effects are normative:
 
@@ -746,7 +782,7 @@ The transitions and their durable effects are normative:
 | --- | --- | --- | --- |
 | none | `CreateImport` | `CREATED` | Identity, target precondition, complete hidden manifest-entry set, reservation, namespace-CAS epoch, immutable activity deadline, owner epoch `1`, owner/recovery-token hashes, and lease are stored atomically. |
 | `CREATED` | first accepted content mutation | `STAGING` | Partial hidden content stage and the same manifest/reservation remain owned by the import. |
-| `STAGING` | successful `VerifyImport` | `VERIFIED` | Entry set, content set, and manifest version become immutable. |
+| `CREATED` or `STAGING` | successful `VerifyImport` | `VERIFIED` | The complete persisted entry set is validated; every required file content is bound; entry set, content set, and manifest version become immutable. A manifest with no regular-file content may take this edge directly from `CREATED`. |
 | `VERIFIED` | accepted `CommitImport` CAS | `COMMITTING` | Commit attempt ID and accepted outcome are durable; request cancellation can no longer abort it. |
 | `COMMITTING` | server commit worker | `COMMITTED` | Target CAS, namespace publication, ownership transfer, reservation settlement, result row, and structural outbox event commit atomically. |
 | `CREATED`, `STAGING`, or `VERIFIED` | explicit abort, expired-lease GC, or activity-deadline CAS | `ABORTING` | No new inline content, entry, verify, renew, takeover, or commit is accepted. For a future external mode, this also rejects new grants/completion/seal and durably owns every closure bound, object identity, and debt charge. |
@@ -847,12 +883,19 @@ The exact SQL names may follow the existing schema conventions, but these
 durable facts are required:
 
 ```text
+promotion_storage_capabilities(
+  tenant_id, generation, inline_enabled, inline_threshold,
+  allowed_mode, updated_at,
+  primary key (tenant_id)
+)
+
 imports(
   tenant_id, migration_id, target_path, target_parent_inode,
   target_parent_path, target_parent_edge_incarnation,
   target_parent_children_generation, manifest_hash, entry_total, byte_total,
   max_content_size, storage_mode, storage_plan_digest,
   backend_capability_generation, inline_threshold, plan_expires_at,
+  create_request_digest,
   namespace_cas_epoch, quota_reservation_id, state, state_version,
   owner_epoch, owner_token_hash, recovery_token_hash,
   activity_deadline, lease_expires_at, commit_attempt_id, terminal_reason,
@@ -918,7 +961,8 @@ import_seal_attempts(
 )
 
 import_tombstones(
-  tenant_id, migration_id, request_digest, recovery_token_hash, terminal_state,
+  tenant_id, migration_id, request_digest, owner_token_hash,
+  recovery_token_hash, terminal_state,
   terminal_result_blob, terminal_result_digest, retire_after,
   primary key (tenant_id, migration_id)
 )
@@ -1254,11 +1298,17 @@ owner.
   the same tenant remains eligible;
 - `PlanImport` is side-effect free, and a backend capability generation or
   inline-threshold change before `CreateImport` invalidates the plan;
+- a plan minted on server A is rejected on differently configured server B;
+  first-create generation validation and import insertion share one database
+  transaction/lock, while retry of an existing matching row is recoverable;
 - changing, omitting, reordering, or adding any canonical manifest tuple
   between `PlanImport` and `CreateImport` fails before the import transaction;
 - the real API sequence `PlanImport` -> `CreateImport(full manifest)` ->
   `PutInlineImportContent*` -> `VerifyImport` -> `CommitImport` round-trips an
   empty directory, symlink text, mode, mtime, zero-byte file, and nonempty file;
+- empty, empty-directory-only, and symlink-only manifests verify directly from
+  `CREATED`; a manifest with any unbound regular file fails verification and
+  remains in its original state;
 - removing `CreateImport`'s manifest persistence loses those metadata-only
   entries and makes the production-path round-trip fail;
 - an inline content call for an absent/non-file path or a mismatched entry
@@ -1376,6 +1426,12 @@ The remaining P0/FUSE concurrency cases are:
 - a lost `CreateImport` response followed by the same token, plan, and full
   manifest returns the one import, one reservation, and identical persisted
   entry set; a different manifest cannot reuse either token or reservation;
+- fake-clock and configuration-rollout tests move past `create_before` and
+  `plan_expires_at` and advance the backend capability generation after the
+  first create transaction commits: the identical retry still recovers that
+  row, while an absent-row request is rejected by new-admission checks;
+- a unique-key race between identical creates returns the winner; a mismatched
+  request conflicts, and neither path creates a second reservation/entry set;
 - the import row, quota reservation, and all manifest entries are all present
   or all absent after transaction failure injection; no content endpoint can
   observe an import without its complete expected entry set;
@@ -1517,9 +1573,12 @@ Tests must fail when independently deleting:
   production, and unknown backends before import/quota creation;
 - `CreateImport` re-sending and atomically persisting the full authenticated
   manifest entry set before any content API can run;
+- existing-row recovery taking precedence over plan/allocation expiry and
+  capability-generation admission, while mismatched retries still conflict;
 - inline-content idempotency, per-file threshold enforcement, manifest/hash
   tuple validation, entry binding, verification, and hidden-content ownership
   transfer;
+- direct `CREATED -> VERIFIED` validation for metadata-only manifests;
 - the activity deadline and forced terminalization before terminal retention;
 - the namespace all-writer rollout/admission gate;
 - quota reservation conversion and content-ref ownership transfer;
