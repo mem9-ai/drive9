@@ -131,6 +131,42 @@ func TestWritableRehomePreservesProcessLocalAncestors(t *testing.T) {
 	if !loaded || !slices.Equal(writeBackAncestors, want) {
 		t.Fatalf("write-back re-home loaded=%t ancestors=%v, want %v", loaded, writeBackAncestors, want)
 	}
+	assertBoundAncestors := func(name string, fh *FileHandle, want []string, transitiveAncestor string) {
+		t.Helper()
+		fh.Lock()
+		ensureStagedSnapshotLineageLocked(fh)
+		entry := &CommitEntry{Path: fh.Path, BaseRev: fh.BaseRev, Kind: PendingOverwrite}
+		fs.bindCommitEntryToHandleLocked(entry, fh, fh.BaseRev)
+		fh.Unlock()
+		if !slices.Equal(entry.liveAncestors, want) {
+			t.Fatalf("%s bound ancestors=%v, want %v", name, entry.liveAncestors, want)
+		}
+		if !entryCanRebaseOntoLandedParent(entry, pathCommitLandmark{snapshotID: transitiveAncestor}) {
+			t.Fatalf("%s rejected transitive landed ancestor %q", name, transitiveAncestor)
+		}
+	}
+	assertBoundAncestors("write-back re-home", writeBackTarget, want, "snapshot-root")
+
+	const zeroPath = "/rehome-zero-shadow"
+	if err := fs.shadowStore.WriteFull(zeroPath, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	zeroAncestors := []string{"zero-parent", "zero-root"}
+	zeroMeta := &WriteBackMeta{
+		Path: zeroPath, Kind: PendingOverwrite, BaseRev: 1, Generation: 1,
+		SnapshotID: "zero-snapshot", ParentSnapshotID: "zero-parent",
+		lineageTrusted: true, liveAncestors: append([]string(nil), zeroAncestors...),
+	}
+	zeroIno := fs.inodes.Lookup(zeroPath, false, 0, time.Now())
+	fs.inodes.UpdateRevision(zeroIno, 1)
+	zeroTarget, _ := pr939Handle(t, fs, zeroIno, zeroPath, "", false)
+	zeroTarget.Lock()
+	if err := fs.loadWritableHandleFromShadowLocked(zeroTarget, zeroMeta); err != nil {
+		zeroTarget.Unlock()
+		t.Fatal(err)
+	}
+	zeroTarget.Unlock()
+	assertBoundAncestors("zero-shadow re-home", zeroTarget, zeroAncestors, "zero-root")
 }
 
 func TestAppendSnapshotLatchClearsAfterSynchronousCommit(t *testing.T) {

@@ -329,27 +329,14 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 	}
 	// Copy fields under read lock.
 	gen := idx.nextGen.Add(1)
-	newMeta := &WriteBackMeta{
-		Path:             newPath,
-		Size:             meta.Size,
-		Mtime:            meta.Mtime,
-		CreatedAt:        meta.CreatedAt,
-		Generation:       gen,
-		Kind:             meta.Kind,
-		BaseRev:          meta.BaseRev,
-		ShadowSpill:      meta.ShadowSpill,
-		Mode:             meta.Mode,
-		HasMode:          meta.HasMode,
-		SnapshotID:       meta.SnapshotID,
-		ParentSnapshotID: meta.ParentSnapshotID,
-		lineageTrusted:   meta.lineageTrusted,
-		liveAncestors:    append([]string(nil), meta.liveAncestors...),
-	}
+	newMeta := cloneWriteBackMeta(meta)
+	newMeta.Path = newPath
+	newMeta.Generation = gen
 	idx.mu.RUnlock()
 
 	// Persist new meta to disk BEFORE updating memory so that crash
 	// recovery always has a consistent view.
-	metaBytes, _ := json.Marshal(newMeta)
+	metaBytes, _ := json.Marshal(&newMeta)
 	newMetaPath := filepath.Join(idx.dir, hashPath(newPath)+".meta")
 	if err := atomicWrite(newMetaPath, metaBytes); err != nil {
 		return false
@@ -357,7 +344,7 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 
 	idx.mu.Lock()
 	delete(idx.items, oldPath)
-	idx.items[newPath] = newMeta
+	idx.items[newPath] = &newMeta
 	idx.mu.Unlock()
 
 	oldMetaPath := filepath.Join(idx.dir, hashPath(oldPath)+".meta")
@@ -384,32 +371,19 @@ func (idx *PendingIndex) PrepareRename(oldPath, newPath string) (*WriteBackMeta,
 		return nil, nil
 	}
 	gen := idx.nextGen.Add(1)
-	newMeta := &WriteBackMeta{
-		Path:             newPath,
-		Size:             meta.Size,
-		Mtime:            meta.Mtime,
-		CreatedAt:        meta.CreatedAt,
-		Generation:       gen,
-		Kind:             meta.Kind,
-		BaseRev:          meta.BaseRev,
-		ShadowSpill:      meta.ShadowSpill,
-		Mode:             meta.Mode,
-		HasMode:          meta.HasMode,
-		SnapshotID:       meta.SnapshotID,
-		ParentSnapshotID: meta.ParentSnapshotID,
-		lineageTrusted:   meta.lineageTrusted,
-		liveAncestors:    append([]string(nil), meta.liveAncestors...),
-	}
+	newMeta := cloneWriteBackMeta(meta)
+	newMeta.Path = newPath
+	newMeta.Generation = gen
 	idx.mu.RUnlock()
 
-	metaBytes, err := json.Marshal(newMeta)
+	metaBytes, err := json.Marshal(&newMeta)
 	if err != nil {
 		return nil, fmt.Errorf("marshal prepared meta for %s: %w", newPath, err)
 	}
 	if err := atomicWrite(filepath.Join(idx.dir, hashPath(newPath)+".meta"), metaBytes); err != nil {
 		return nil, fmt.Errorf("persist prepared meta for %s: %w", newPath, err)
 	}
-	return newMeta, nil
+	return &newMeta, nil
 }
 
 // CommitRename completes a rename prepared by PrepareRename after the shadow

@@ -4669,6 +4669,7 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 		fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 		fh.StagedSnapshotID = meta.SnapshotID
 		fh.StagedParentSnapshotID = meta.ParentSnapshotID
+		fh.stagedAncestors = processLocalMetaAncestors(meta)
 		fh.StagedSnapshotSeq = fh.DirtySeq
 		fh.StagedLineageTrusted = meta.lineageTrusted
 	}
@@ -4719,6 +4720,7 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 	fh.WriteBackSeq = fh.DirtySeq
 	fh.StagedSnapshotID = meta.SnapshotID
 	fh.StagedParentSnapshotID = meta.ParentSnapshotID
+	fh.stagedAncestors = processLocalMetaAncestors(meta)
 	fh.StagedSnapshotSeq = fh.DirtySeq
 	fh.StagedLineageTrusted = meta.lineageTrusted
 	return true
