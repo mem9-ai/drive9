@@ -26,6 +26,13 @@ P1 exposes a bounded opt-in preview, P2 closes stable-inode and open-handle
 semantics, and P3 treats Git workspaces separately. Until P2 passes its handle
 matrix, the default cross-layer rename behavior remains `EXDEV`.
 
+The first P0 storage implementation is intentionally narrower than the full
+protocol: it accepts only trees whose regular-file payloads fit the existing
+DB9 inline-content policy. The current production S3-compatible adapter cannot
+prove a finite latest side-effect time, even when Drive9 proxies the request,
+so object-backed promotion fails closed until a provider-specific contract is
+implemented and enabled.
+
 ## User Problem
 
 Coding-agent profiles keep build and cache paths such as `dist`, `build`, and
@@ -65,6 +72,8 @@ The first implementation does not support:
 - mixed-policy subtrees;
 - hard links or special files;
 - target replacement or renameat2 extensions;
+- object-backed regular-file payloads until a production provider supplies the
+  operation-identity and finite latest-landing contract below;
 - transparent cross-layer rename while a source file or directory handle is
   open;
 - unbounded trees without entry, byte, depth, and time limits.
@@ -186,6 +195,7 @@ preview maps them as follows:
 | Target child exists or has the wrong type at final CAS | `target_conflict` | `EEXIST` or `ENOTEMPTY`, matching the observed target |
 | Target remains absent but its parent edge, child-set generation, or namespace-CAS epoch changed | `target_precondition_changed` | `EAGAIN` |
 | Source changed during snapshot | `source_changed` | `EAGAIN` |
+| Selected storage backend or object size lacks the required promotion guarantees | `promotion_storage_backend_unsupported` | `EXDEV` |
 | Import activity deadline won before commit acceptance | `promotion_deadline_exceeded` | `ETIMEDOUT` |
 | Permission failure | `permission_denied` | `EACCES` or `EPERM` |
 | Quota reservation failure | `quota_exceeded` | `EDQUOT` or `ENOSPC` |
@@ -208,7 +218,8 @@ independently reauthorizes destination creation on both `CreateImport` and
 `CommitImport`.
 
 `CreateImport` reserves the canonical manifest byte and entry totals and
-returns a versioned quota reservation. Uploads cannot exceed those totals.
+returns a versioned quota reservation. Inline content writes, and any future
+external upload mode, cannot exceed those totals.
 
 `CommitImport` atomically converts staged reservation into committed usage and
 must not charge the same content twice. Abort or expired-stage GC idempotently
@@ -224,7 +235,8 @@ FUSE promotion coordinator
   | durable local MigrationRecord and subtree fence
   v
 private remote staging namespace
-  | import-scoped capability + idempotent upload + manifest verification
+  | P0: idempotent DB-inline content; future: proven provider adapter
+  | manifest verification
   v
 CommitImport transaction
   | target CAS + quota settlement + outbox + complete tree publication
@@ -247,6 +259,7 @@ source_identity (local root UUID, reserved source-incarnation UUID)
 manifest_hash
 target_expectation (canonical target, expected absence,
                     server precondition digest after CreateImport)
+storage_plan (mode, digest, backend capability generation, limits)
 staging_ref
 owner_epoch (0 until returned or recovered from GetImport)
 owner_token
@@ -264,15 +277,14 @@ sequence. The record, owner token, and recovery token are private mode `0600`
 state. Recovery accepts only a complete record whose manifest hash matches; it
 never assumes the pair was atomically written.
 
-Per-content upload progress is a checksummed, fsynced journal in the same
-private state directory. Before each `CreateImportContent`, it durably records
-the relative content identity and random attempt idempotency key; after a
-response it records the returned logical attempt ID. Before each write-grant
-request it likewise records the attempt, part/direct-write identity, maximum
-bytes, and random grant idempotency key, then records the returned grant ID.
-Recovery truncates only an incomplete tail and retries the last complete key,
-so response loss cannot be misread as permission to allocate either a
-replacement attempt or an unaccounted write grant.
+Per-content staging progress is a checksummed, fsynced journal in the same
+private state directory. P0 records the relative content identity, hash, size,
+and random inline-content idempotency key before `PutInlineImportContent`, then
+records the returned content ID. Recovery truncates only an incomplete tail and
+retries the last complete key. If a future external-object adapter is enabled,
+the same rule applies separately to its content attempt and every write-grant
+key, so response loss is never interpreted as permission to allocate a
+replacement side effect.
 
 The initial record contains the canonical target and expected absence. After a
 successful or recovered `CreateImport`, the coordinator rewrites and fsyncs the
@@ -345,10 +357,21 @@ released without being hidden or deleted by the old migration.
 The exact wire shape may change, but the runtime requirements are fixed:
 
 ```text
+PlanImport(target, expected_target_absent, canonical_manifest)
+  -> manifest_hash, entry_total, byte_total, max_content_size,
+     storage_mode, storage_plan_digest, backend_capability_generation,
+     limits, plan_expires_at
 AllocateImportID()
 CreateImport(migration_id, target, expected_target_absent,
-             manifest_hash, entry_total, byte_total,
+             manifest_hash, entry_total, byte_total, max_content_size,
+             storage_plan_digest, backend_capability_generation,
+             plan_expires_at,
              owner_token, recovery_token)
+PutInlineImportContent(migration_id, owner_epoch, owner_token,
+                       relative_path, entry_hash, size, checksum_sha256,
+                       content_idempotency_key, bounded_body)
+
+# Future external-object extension; disabled for current production adapters.
 CreateImportContent(migration_id, owner_epoch, owner_token,
                     relative_path, entry_hash, size,
                     attempt_idempotency_key)
@@ -377,6 +400,23 @@ AcknowledgeImportResult(migration_id, recovery_token,
 
 Every method is idempotent for the same migration identity and payload. Reuse
 with different target, manifest, or content returns conflict.
+`PlanImport` is side-effect free: it validates the complete bounded canonical
+manifest but creates no import row, reservation, object, or cleanup debt.
+`CreateImport` repeats the authorization and provider check,
+requires the same server-authenticated plan digest and backend capability
+generation, and returns
+`promotion_storage_backend_unsupported` before creating the import row or
+reserving quota if the plan is no longer eligible. The manifest summary is not
+trusted: each staged content request enforces its own size and checksum, and
+`VerifyImport` recomputes the complete entry/byte/hash summary.
+
+The plan digest is an expiring server MAC over tenant, canonical target,
+manifest summary, selected storage mode, exact limits, capability generation,
+and `plan_expires_at`; `PlanImport` keeps no server-side reservation. Replaying
+or altering any claim fails verification. `CreateImport` accepts it only before
+expiry and only while the recorded generation still equals current runtime
+configuration.
+
 Repeating `CreateImport` with the same owner and recovery tokens returns the
 current state and does not duplicate the reservation. Repeating it with either
 token changed never acts as takeover or resets an epoch; the caller must follow
@@ -395,7 +435,73 @@ the server reaches a terminal state, and terminal retention begins only then.
 that import and tenant; the client cannot attach an arbitrary storage key or a
 content reference owned by another tenant.
 
-#### Immutable staged content and capability closure
+#### P0 storage eligibility and inline staging
+
+P0 freezes a concrete, code-backed provider matrix rather than assuming that a
+proxy turns every synchronous object API into a bounded operation:
+
+| Storage path | Production code/API evidence | Durable operation identity and finite latest landing | P0 status |
+| --- | --- | --- | --- |
+| DB9 inline (`content_blob`) | `Dat9Backend.shouldStoreInDB`: enabled only when `smallInDB && size < inlineThreshold`; the default cutoff is `DefaultInlineThreshold` | The content row and its idempotency result are committed by TiDB; there is no external provider side effect | **Supported** for every regular file strictly below the recorded threshold |
+| `LocalS3Client` | `pkg/s3client` identifies it as the testing implementation | The in-process fake can model a bound, but this is not production evidence | **Test/E2E only**; never enables production promotion |
+| Native AWS/Aliyun/Tencent S3-compatible upload | `AWSS3Client.PresignUploadPart`; Aliyun and Tencent construct the same `AWSS3Client` | S3 checks presigned expiry when the HTTP request starts, not when its effect finishes; replay and in-flight parts lack a finite latest-landing proof | **Unsupported** |
+| Proxied AWS/Aliyun/Tencent S3-compatible upload or copy | Synchronous `AWSS3Client.PutObject`, `CompleteMultipartUpload`, and `UploadPartCopy`; the production interface has no proxied `UploadPart` operation | The interface returns no durable provider operation ID or provider-enforced latest-landing time. Context cancellation/timeout is not evidence that S3 cannot finish later | **Unsupported** |
+| Unknown/future provider | No reviewed adapter contract | Missing proof is denial, not an inferred capability | **Unsupported by default** |
+
+The S3 conclusions follow the provider contract, not a fake timing model. AWS
+documents that a transfer begun before a presigned URL expires can continue
+after expiry, because expiration is checked when the HTTP request starts
+([presigned URL expiration](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)). It also documents that in-progress part uploads may still succeed after abort and must be listed/aborted until gone
+([AbortMultipartUpload](https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortMultipartUpload.html)), while `CompleteMultipartUpload` may continue processing after its initial response and can report a later embedded error
+([CompleteMultipartUpload](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html)). A Drive9 proxy can bound request acceptance and body receipt, but it cannot add a provider guarantee absent from those APIs.
+
+`PlanImport` selects `db9_inline` only when inline storage is enabled for the
+tenant, every regular file is strictly smaller than the captured inline
+threshold, and the per-request, total-inline-byte, entry, and transaction limits
+admit the complete tree. It binds those limits plus the server
+configuration/capability generation into the plan digest. An empty tree is
+eligible. If any file requires object storage, or the inline configuration
+changes before `CreateImport`, the operation fails before an import row, quota
+reservation, hidden entry, or object-store request exists. There is no partial
+inline staging followed by a late object-store rejection. Once `CreateImport`
+accepts a plan, its captured mode and limits remain immutable for that import;
+a later configuration rollout affects only new plans.
+
+Eligibility is for the resolved content path, not for the tenant's unused S3
+client. A production tenant configured with `AWSS3Client` may still promote an
+all-inline tree; it cannot promote a tree containing an object-backed file.
+The planner uses an explicit, closed capability enum and configuration
+generation produced by the real backend constructor. It never promotes an
+unknown wrapper because it happens to implement `S3Client`, nor infers support
+from provider or endpoint strings.
+
+`PutInlineImportContent` accepts a bounded body only for a `db9_inline` import.
+It checks the recorded per-file size, SHA-256, manifest identity, owner epoch,
+state, and remaining reservation, then stores an immutable hidden content row
+in TiDB. The random idempotency key and request digest are unique within the
+import: response-loss retry with identical input returns the same content ID;
+reuse with different input conflicts. Verify freezes those content IDs, and
+commit changes their ownership and publishes namespace entries in one database
+transaction without copying the blobs. Abort deletes hidden rows and releases
+the reservation idempotently. The content write's state/owner check and row
+insert are one transaction: if its commit result is unknown, retry/query by the
+same key discovers the single row; if abort wins first, the state CAS rejects
+the write, and if the content write wins first, abort owns and deletes it. No
+provider operation can materialize after that database ordering. P0 never
+calls `CreateImportWriteGrant`.
+
+The initial P1 preview consequently supports only all-inline trees. A tree with
+one object-backed file returns `promotion_storage_backend_unsupported`/`EXDEV`
+before remote side effects. This limitation is advertised as capability scope,
+not silently routed through the ordinary S3 upload path.
+
+#### Future external-object capability contract (not enabled in P0)
+
+The remainder of this section is a necessary contract for a future production
+object adapter. It does **not** make the current `AWSS3Client` eligible. Such an
+adapter must add concrete operation identity, finite landing bounds, exact
+enumeration, accounting, cleanup, and adapter-classification tests before its
+mode can appear in `PlanImport`.
 
 An object-store upload capability can outlive a server epoch check. Therefore
 no direct or multipart capability ever writes a key or version that a verified
@@ -406,8 +512,8 @@ scoped to the exact tenant, migration, content, attempt UUID, unique temporary
 object/upload identity, maximum bytes, and checksum header where supported. It
 cannot write any committed or sealed key.
 
-P0 uses a Drive9 upload proxy unless a provider can prove equivalent native
-semantics. A proxy grant has separate `accept_before`, `body_complete_before`,
+An eligible future adapter may use a Drive9 upload proxy, but the proxy alone
+is insufficient. A proxy grant has separate `accept_before`, `body_complete_before`,
 and `landing_not_after` bounds. The proxy admits the request only before the
 first bound, stops reading and fails it closed unless the complete bounded body
 arrives before the second, and creates a durable provider-mutation claim before
@@ -420,7 +526,8 @@ landing bound **and** the grant is single-use or every possible replay creates
 an exactly enumerable write/version identity with separately reserved debt.
 Checking expiry only when a PUT or `UploadPart` begins is insufficient. In
 particular, replayable presigned S3 PUT/UploadPart URLs do not satisfy P0: they
-fail closed during staging and the proxy path must be used. A backend that can
+fail closed during planning, and the current synchronous proxy path does not
+repair the missing provider-side landing bound. A backend that can
 only detect an oversized upload afterward, cannot enumerate every version or
 part generation, or cannot bound an accepted request's eventual side effect is
 unsupported for promotion.
@@ -614,9 +721,9 @@ The transitions and their durable effects are normative:
 | `STAGING` | successful `VerifyImport` | `VERIFIED` | Entry set, content set, and manifest version become immutable. |
 | `VERIFIED` | accepted `CommitImport` CAS | `COMMITTING` | Commit attempt ID and accepted outcome are durable; request cancellation can no longer abort it. |
 | `COMMITTING` | server commit worker | `COMMITTED` | Target CAS, namespace publication, ownership transfer, reservation settlement, result row, and structural outbox event commit atomically. |
-| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort, expired-lease GC, or activity-deadline CAS | `ABORTING` | No new grant, completion, seal, entry, verify, renew, takeover, or commit is accepted; cleanup ownership, including every grant landing bound, provider-mutation closure bound, object identity, and debt charge, is durable. |
+| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort, expired-lease GC, or activity-deadline CAS | `ABORTING` | No new inline content, entry, verify, renew, takeover, or commit is accepted. For a future external mode, this also rejects new grants/completion/seal and durably owns every closure bound, object identity, and debt charge. |
 | `COMMITTING` | permanent target/auth/manifest failure before publication | `ABORTING` | A durable terminal reason is recorded; no namespace or committed quota changed. Transient failure stays `COMMITTING` and is retried by the server. |
-| `ABORTING` | server cleanup worker | `ABORTED` | Hidden entries and sealed unowned objects are detached, the reservation is released exactly once, and the terminal reason/result is retained. Upload/seal attempts, provider-mutation claims, and cleanup debt remain tracked through the post-closure sweep until `gc_done`. |
+| `ABORTING` | server cleanup worker | `ABORTED` | Hidden entries and inline contents are deleted, the reservation is released exactly once, and the terminal reason/result is retained. A future external mode additionally detaches sealed unowned objects and retains upload/seal attempts, provider-mutation claims, and cleanup debt through `gc_done`. |
 
 There are no other transitions. `COMMITTED` and `ABORTED` are terminal.
 `COMMITTING` and `ABORTING` are server-owned recovery states: client lease
@@ -625,7 +732,8 @@ a server crash. `COMMITTING` never transitions directly back to `VERIFIED`, and
 `ABORTING` cannot be revived.
 
 `CreateImport` assigns an immutable `activity_deadline` no later than the
-server's maximum import lifetime. Owner leases, every write grant's
+server's maximum import lifetime. Owner leases and every inline-content write
+must finish before it. For a future external mode, every write grant's
 `accept_before`, `body_complete_before`, and `landing_not_after`, and every
 provider mutation's `mutation_not_after` must be at or before that deadline;
 renew, takeover, or grant retry may shorten their normal duration but never
@@ -672,8 +780,9 @@ import. Takeover is rejected while the old lease is live and in every
 server-owned or terminal state. Any request carrying the old epoch or owner
 token is then fenced, including an old renew, content-create,
 multipart-complete, seal, entry, verify, commit, or abort control-plane
-mutation. Already-issued write grants are not treated as revoked; their
-isolation and cleanup follow the write-grant/landing-bound contract above. The
+mutation. In a future external mode, already-issued write grants are not
+treated as revoked; their isolation and cleanup follow the
+write-grant/landing-bound contract above. The
 single-writer local-root lock prevents routine concurrent takeover; the server
 epoch is the authoritative fence for a paused or zombie coordinator.
 
@@ -713,6 +822,8 @@ imports(
   tenant_id, migration_id, target_path, target_parent_inode,
   target_parent_path, target_parent_edge_incarnation,
   target_parent_children_generation, manifest_hash, entry_total, byte_total,
+  max_content_size, storage_mode, storage_plan_digest,
+  backend_capability_generation, inline_threshold, plan_expires_at,
   namespace_cas_epoch, quota_reservation_id, state, state_version,
   owner_epoch, owner_token_hash, recovery_token_hash,
   activity_deadline, lease_expires_at, commit_attempt_id, terminal_reason,
@@ -729,10 +840,13 @@ import_entries(
 )
 
 import_contents(
-  tenant_id, migration_id, import_content_id, sealed_storage_ref,
+  tenant_id, migration_id, import_content_id,
+  inline_content_blob, inline_content_idempotency_key, inline_request_digest,
+  sealed_storage_ref,
   sealed_storage_version, size_bytes, checksum_sha256,
   accepted_seal_attempt_id, seal_state, ownership_state,
-  primary key (tenant_id, migration_id, import_content_id)
+  primary key (tenant_id, migration_id, import_content_id),
+  unique (tenant_id, migration_id, inline_content_idempotency_key)
 )
 
 import_upload_attempts(
@@ -779,6 +893,12 @@ import_tombstones(
 )
 ```
 
+`inline_content_blob` and its idempotency fields are the only P0 content-write
+path. The upload/write-grant/seal tables describe the disabled future
+external-object extension and need not ship until a concrete production
+adapter satisfies the matrix above. Keeping that future schema in the design
+does not authorize an implementation to classify `AWSS3Client` as eligible.
+
 All tables are tenant-scoped. A unique relative-path constraint rejects
 duplicate manifest entries after canonical path normalization. Terminal import
 rows retain enough target/result identity to answer retries after staging rows
@@ -814,10 +934,11 @@ configured minimum and maximum full-row windows are both shorter than the
 terminal retention window, making storage retention bounded and migration-ID
 reuse behavior testable with a fake clock.
 
-Physical tombstone deletion additionally requires every write grant, upload
-attempt, and unowned seal candidate to be `gc_done`, every landing/provider-
-mutation closure bound to have passed, and every corresponding debt charge to
-be released. If a provider outage delays cleanup past `retire_after`, external
+For a future external mode, physical tombstone deletion additionally requires
+every write grant, upload attempt, and unowned seal candidate to be `gc_done`,
+every landing/provider-mutation closure bound to have passed, and every
+corresponding debt charge to be released. If a provider outage delays cleanup
+past `retire_after`, external
 APIs still return `import_id_retired`; the terminal result blob and recovery
 token hash may be pruned, while a minimal internal migration/tenant cleanup
 anchor and all write/attempt ledgers remain.
@@ -968,11 +1089,11 @@ The server state is authoritative for publish and accounting outcome:
 | --- | --- | --- | --- |
 | not found from an authorized, strongly consistent lookup | Source is authoritative; keep both paths fenced while reconciling the lost-create outcome. | No reservation or stage exists. | Fsync a local aborted result, then release fences and remove the active record. |
 | `CREATED` | Source is authoritative; keep both fenced during recovery. | Reservation exists; no or partial stage. Resume with the current durable owner token, take over after expiry, or abort. | Retain until `ABORTED` or a later commit result. |
-| `STAGING` | Source is authoritative; keep both fenced during recovery. | Reservation and partial hidden stage remain. Resume/take over or abort. Old control-plane mutations are epoch-fenced; already-issued write grants remain isolated to their old attempts and tracked through landing closure plus GC. | Retain. |
+| `STAGING` | Source is authoritative; keep both fenced during recovery. | Reservation and partial hidden inline stage remain. Resume/take over or abort. In a future external mode, old control-plane mutations are epoch-fenced and already-issued grants remain isolated/tracked through landing closure plus GC. | Retain. |
 | `VERIFIED` | Source is authoritative; keep both fenced. | Immutable hidden stage and reservation remain. Commit with the same migration ID or abort; no entry mutation is allowed. | Retain. |
 | `COMMITTING` | Outcome is unknown; neither source nor target is released. | Server owns completion; lease expiry and client abort do nothing. Poll `GetImport`; a recovered server worker reaches `COMMITTED` or `ABORTING`. | Retain; never create a second migration ID. |
 | `ABORTING` | Source remains authoritative, but both paths stay fenced until cleanup completes. | Server resumes hidden-stage deletion and exactly-once reservation release; no client mutation or takeover is accepted. | Retain and poll. |
-| `ABORTED` | Source is authoritative; target was not published. | Reservation is released, sealed ownership is detached, and the terminal reason is durable. Upload/seal-attempt cleanup, provider-mutation claims, and debt may continue from retained ledgers until `gc_done`. | Fsync the local aborted result, release fences, then acknowledge/retire the active record; the server tombstone remains for retry identity. |
+| `ABORTED` | Source is authoritative; target was not published. | Reservation is released, hidden inline content is gone, and the terminal reason is durable. A future external mode may continue upload/seal cleanup, provider claims, and debt from retained ledgers until `gc_done`. | Fsync the local aborted result, release fences, then acknowledge/retire the active record; the server tombstone remains for retry identity. |
 | `COMMITTED` | Target is authoritative; keep both fenced until source reconciliation finishes. | Quota is settled, sealed content ownership and namespace/outbox result are durable; cleanup of temporary and unowned candidates cannot remove committed versions and continues independently until `gc_done`. | Verify the source-incarnation UUID, quarantine only the matching source, publish inode/cache state, fsync `DONE`, release fences, then acknowledge/retire the active record. |
 | unreachable or invalid response | Authority is unresolved; keep both paths fenced or fail the mount closed. | No cleanup, quota release, abort, or new migration is guessed. | Retain and return `promotion_recovery_required`. |
 
@@ -1044,9 +1165,11 @@ owner.
 ### P0: primitive and specification
 
 - freeze this contract and public capability naming;
+- implement side-effect-free `PlanImport` and a fail-closed production adapter
+  classifier; initially only `db9_inline` plans are eligible;
 - add namespace path-edge incarnations and child-set generations to every
   structural mutation path before enabling target CAS;
-- implement hidden staging, idempotent upload, manifest verification,
+- implement hidden DB-inline staging, idempotent content writes, manifest verification,
   versioned quota reservation, owner epoch/token takeover, the complete import
   state CAS, `CommitImport`, committed outbox/status lookup, and garbage
   collection;
@@ -1055,7 +1178,8 @@ owner.
 ### P1: restricted preview
 
 - explicit `promote/persist` and/or opt-in FUSE cross-layer rename;
-- homogeneous ordinary trees only;
+- homogeneous ordinary all-inline trees only; any object-backed file fails
+  before `CreateImport` and quota reservation;
 - absent target, no open handles, no Git workspace, bounded tree;
 - durable local migration record, subtree fence, synchronous completion.
 
@@ -1085,7 +1209,17 @@ owner.
 ### Functional
 
 - empty and deep directories;
-- zero-byte and large files;
+- zero-byte files, files at `inlineThreshold-1`, and complete all-inline trees;
+- files at `inlineThreshold` or larger and disabled inline storage require an
+  external-object plan; `LocalS3Client` in production, `AWSS3Client`, and an
+  unknown adapter all return `promotion_storage_backend_unsupported` before
+  import/quota/object side effects for that plan, while an all-inline tree on
+  the same tenant remains eligible;
+- `PlanImport` is side-effect free, and a backend capability generation or
+  inline-threshold change before `CreateImport` invalidates the plan;
+- Aliyun and Tencent endpoints are classified through their actual
+  `AWSS3Client` construction path and remain unsupported, not inferred from an
+  endpoint-name allowlist;
 - symlink without following the target;
 - source-root symlink and no-durable-xattr filesystem rejected before staging;
 - the exact reserved root-incarnation xattr excluded from the manifest while
@@ -1100,14 +1234,8 @@ owner.
 Kill and restart before and after:
 
 - local record and manifest fsync;
-- content-attempt idempotency-key journal fsync, request send, and returned
-  attempt-ID journal fsync;
-- write-grant idempotency-key journal fsync, grant response, proxy acceptance,
-  bounded body completion, provider-write claim, and provider-write outcome;
-- durable provider-mutation claim, multipart-complete/copy request send,
-  provider-side completion, and returned outcome persistence;
-- durable seal intent, create-once sealed-object creation, sealed-version
-  verification, and DB attach;
+- inline-content idempotency-key journal fsync, bounded body/transaction send,
+  DB commit, response loss, and returned content-ID journal fsync;
 - stage verification;
 - durable `COMMIT_REQUESTED` before request send;
 - server commit;
@@ -1116,6 +1244,18 @@ Kill and restart before and after:
 - local source quarantine;
 - physical local deletion;
 - inode/cache publication.
+
+Before any future external-object adapter is enabled, additionally kill and
+restart before and after:
+
+- content-attempt idempotency-key journal fsync, request send, and returned
+  attempt-ID journal fsync;
+- write-grant idempotency-key journal fsync, grant response, proxy acceptance,
+  bounded body completion, provider-write claim, and provider-write outcome;
+- durable provider-mutation claim, multipart-complete/copy request send,
+  provider-side completion, and returned outcome persistence;
+- durable seal intent, create-once sealed-object creation, sealed-version
+  verification, and DB attach;
 
 Every case converges to only the complete old tree or only the complete new
 tree. Repeated recovery is idempotent.
@@ -1131,13 +1271,19 @@ tree. Repeated recovery is idempotent.
   absent; it never masquerades as `EEXIST`;
 - two promotions competing for source or target;
 - commit versus abort and commit versus lease GC;
-- activity deadline versus renew, takeover, write-grant issuance/acceptance,
-  body completion, provider mutation, verify, and commit acceptance;
+- activity deadline versus renew, takeover, inline-content mutation, verify,
+  and commit acceptance;
   client-owned states go `ABORTING`, while a commit accepted before the
   deadline remains queryable and reaches a terminal state;
 - coordinator crash followed by expired-lease takeover; every old-epoch renew,
-  content-create, multipart-complete, seal, entry, verify, commit, and abort
-  control-plane mutation is rejected;
+  inline-content, entry, verify, commit, and abort mutation is rejected;
+
+The following cases are not claims about the initial inline-only P0. They are
+mandatory gates before enabling any future external-object adapter:
+
+- activity deadline and takeover versus content-attempt creation, write-grant
+  issuance/acceptance, body completion, multipart completion, seal, and every
+  provider mutation;
 - a proxy grant is accepted before `accept_before`, cleanup observes absence,
   and its tracked PUT lands just before `landing_not_after`; sealed/committed
   bytes never change, pre-bound absence cannot set `gc_done`, and the
@@ -1168,6 +1314,9 @@ tree. Repeated recovery is idempotent.
 - deleting the provider-mutation claim or allowing cleanup before its closure
   bound makes deterministic delayed multipart-complete and delayed seal-copy
   tests leave an object/version/part after the ledger would have been removed;
+
+The remaining P0/FUSE concurrency cases are:
+
 - writeback enqueue immediately after a drain attempt;
 - direct local-root file replacement and symlink swap while a snapshot is read;
 - a second mount reading while publish occurs;
@@ -1177,9 +1326,36 @@ tree. Repeated recovery is idempotent.
 
 - the same migration ID with a different target, manifest, entry payload, or
   content hash conflicts;
-- the same content-attempt idempotency key with a different request conflicts;
+- the same inline-content idempotency key with an identical request returns the
+  same content ID after response loss; a different body, hash, size, or path
+  conflicts;
 - missing, extra, duplicate, absolute, escaping, or symlink-following manifest
   entries are rejected;
+- an inline content write cannot exceed its planned size, the captured inline
+  threshold, or the reserved entry/byte total;
+- deleting or weakening the real-adapter classifier makes tests admit
+  `AWSS3Client` before `CreateImport`, and therefore fails; a fake provider is
+  insufficient evidence for production eligibility;
+- commit converts the reservation exactly once after response loss and retry;
+- abort and GC release it exactly once and cannot race a committed import;
+- committed inline content survives staging GC;
+- a structural-reset outbox entry exists exactly once for each commit, while
+  no staging entry is indexed or emitted;
+- response loss and server restart are injected in every state:
+  `CREATED`, `STAGING`, `VERIFIED`, `COMMITTING`, `ABORTING`, `ABORTED`, and
+  `COMMITTED`; each case asserts source/target authority, fence retention,
+  staging ownership, reservation/committed quota, and local-record retention;
+- deleting the owner-epoch comparison or allowing takeover of a live,
+  server-owned, or terminal state makes a focused test fail;
+- lease renewal and inline-content mutation at the activity boundary never
+  extend beyond it; every active import is forced into `COMMITTING` or
+  `ABORTING` before terminal retention/retirement begins, and its public result
+  remains `promotion_deadline_exceeded`/`ETIMEDOUT` across restart and retry.
+
+The following accounting cases are mandatory before enabling a future
+external-object adapter:
+
+- the same content-attempt idempotency key with a different request conflicts;
 - an upload cannot exceed the reserved entry or byte total;
 - repeated attempt issuance, seal creation, and owner takeover cannot exceed
   the internal cleanup-debt budget; customer quota release does not release
@@ -1202,21 +1378,11 @@ tree. Repeated recovery is idempotent.
 - request/response loss around upload-attempt creation, provider-mutation
   claim, seal attach, abort, and debt transfer neither double-charges nor
   releases debt before the corresponding bytes can no longer exist;
-- commit converts the reservation exactly once after response loss and retry;
-- abort and GC release it exactly once and cannot race a committed import;
 - committed content references survive staging GC;
 - verify records an immutable storage version, and mutating the upload-attempt
   key afterward cannot change the bytes observed by commit/read;
 - removing the seal/version binding or deleting the retained upload-attempt
   ledger makes the late-PUT/late-part tests fail;
-- a structural-reset outbox entry exists exactly once for each commit, while
-  no staging entry is indexed or emitted;
-- response loss and server restart are injected in every state:
-  `CREATED`, `STAGING`, `VERIFIED`, `COMMITTING`, `ABORTING`, `ABORTED`, and
-  `COMMITTED`; each case asserts source/target authority, fence retention,
-  staging ownership, reservation/committed quota, and local-record retention;
-- deleting the owner-epoch comparison or allowing takeover of a live,
-  server-owned, or terminal state makes a focused test fail;
 - lease renewal, write-grant bounds, and provider-mutation bounds at the
   activity boundary never extend beyond it; every active import is forced into
   `COMMITTING` or `ABORTING` before terminal retention/retirement begins, and
@@ -1291,15 +1457,11 @@ Tests must fail when independently deleting:
 - the server-state CAS between commit, abort, and GC;
 - owner epoch/owner-token fencing, recovery-token authorization, and
   expired-lease takeover;
-- immutable sealed-version binding, durable seal intent, write-grant and
-  upload/seal-attempt retention through landing closure/grace, and
-  content-attempt/grant idempotency;
-- native-capability admission requiring a finite landing bound plus single-use
-  or completely enumerable replay identities;
-- provider-mutation claims, their side-effect closure bounds, and the required
-  post-bound exact-key/multipart rescan before `gc_done`;
-- per-write-grant/part-generation and unowned-sealed-candidate debt charges
-  plus their atomic attach/abort transfer;
+- side-effect-free plan revalidation and the production adapter classifier that
+  permits DB-inline content but rejects `AWSS3Client`, `LocalS3Client` in
+  production, and unknown backends before import/quota creation;
+- inline-content idempotency, per-file threshold enforcement, manifest/hash
+  verification, and hidden-content ownership transfer;
 - the activity deadline and forced terminalization before terminal retention;
 - the namespace all-writer rollout/admission gate;
 - quota reservation conversion and content-ref ownership transfer;
@@ -1309,12 +1471,30 @@ Tests must fail when independently deleting:
 - handle state migration;
 - Git workspace routing.
 
+Before an external-object mode can be enabled, its tests must also fail when
+independently deleting:
+
+- immutable sealed-version binding, durable seal intent, write-grant and
+  upload/seal-attempt retention through landing closure/grace, and
+  content-attempt/grant idempotency;
+- native-capability admission requiring a finite landing bound plus single-use
+  or completely enumerable replay identities;
+- provider-mutation claims, their side-effect closure bounds, and the required
+  post-bound exact-key/multipart rescan before `gc_done`;
+- per-write-grant/part-generation and unowned-sealed-candidate debt charges
+  plus their atomic attach/abort transfer;
+
 ## Rollout
 
 - Keep current `EXDEV` by default until the restricted preview is explicitly
   enabled.
 - Provide path-policy overrides as the immediate workaround.
-- Ship the preview behind a capability flag and record promotion outcomes,
-  duration, bytes, entries, conflicts, and recovery actions.
+- Ship the preview behind a capability flag only for tenants whose namespace
+  CAS gate is ready and whose complete manifest receives a `db9_inline` plan;
+  record promotion outcomes, duration, bytes, entries, storage mode,
+  unsupported-provider rejections, conflicts, and recovery actions.
+- Do not enable object-backed promotion merely because traffic is proxied.
+  Each production adapter needs a separately reviewed capability-matrix row
+  backed by its real API contract and classification regression.
 - Enable transparent rename by default only after the P2 handle and concurrency
   matrix passes on Linux FUSE and the live local E2E environment.
