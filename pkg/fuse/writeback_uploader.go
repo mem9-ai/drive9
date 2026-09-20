@@ -261,13 +261,9 @@ func (u *WriteBackUploader) WaitPath(localPath string) {
 	}
 }
 
-// WaitPrefix blocks until all in-flight uploads for paths under the given
-// prefix complete. Rename uses this before a server-side directory rename so
-// a background PUT for a descendant cannot land on a stale (pre-rename) path
-// after the directory has already moved. Queued-but-not-yet-dispatched
-// uploads are not tracked here: the rename's descendant migration re-keys the
-// writeBack cache entries before those workers read them, so a queued upload
-// for an old path becomes a no-op instead of PUT-ing to a stale path.
+// WaitPrefix blocks until no in-flight upload under prefix is observed.
+// Queued or newly submitted uploads can still start after it returns; this is
+// not a prefix mutation barrier. That rename race is tracked in issue #944.
 func (u *WriteBackUploader) WaitPrefix(prefix string) {
 	for {
 		u.inflightMu.Lock()
