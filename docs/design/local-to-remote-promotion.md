@@ -247,7 +247,7 @@ The normative request authorization matrix is:
 | `PutInlineImportContent`, future content/grant/complete/seal/attach calls, `VerifyImport`, `RenewImportLease` | Resolve the import under the authenticated tenant, then require current `write` scope on its stored target before reading a body, returning a capability, renewing, or mutating state. |
 | `CommitImport` | Require current `write` scope on the stored target before the `VERIFIED -> COMMITTING` acceptance CAS. |
 | `AbortImport`, `TakeOverImport`, `RetireImportAllocation`, `AcknowledgeImportResult` | Require current `write` scope on the stored import/allocation target in addition to the applicable owner, recovery, or allocation token. |
-| `GetImport` | Require current `read` scope on the stored import/allocation target before returning existence, state, target, or result. |
+| `GetImport` | Require current `read` scope on the stored import/allocation target plus the applicable allocation or recovery token before returning existence, state, target, or result. |
 
 The HTTP dispatcher admits scoped tokens only to import routes whose handler
 implements this table. Entry handlers authorize their canonical request
@@ -268,11 +268,11 @@ recovery; denial is non-disclosing rather than a target-mismatch oracle.
 ID-only continuation handlers look up tenant-owned state internally only to
 obtain its stored target; when that target is outside the current scope, they
 return the exact canonical `404 import not found` response used for an unknown
-or no-longer-retained ID, including status, body shape, and cache policy. They
-do not reveal whether an active row, terminal row, tombstone, allocation claim,
-target, or result was found. A valid current scope plus the applicable
-operation token is required before normal active, terminal, or
-`import_id_retired` semantics are exposed.
+or unauthorized graveyard ID, including status, body shape, and cache policy.
+They do not reveal whether an active row, terminal row, tombstone, allocation
+claim, graveyard identity, target, or result was found. A valid current scope
+plus the applicable operation token is required before normal active, terminal,
+or `import_id_retired` semantics are exposed.
 
 Server-owned work is deliberately different. Once `CommitImport` wins
 `VERIFIED -> COMMITTING`, or abort/deadline/GC wins a transition to
@@ -333,6 +333,7 @@ owner_epoch (0 until returned or recovered from GetImport)
 owner_token
 recovery_token
 activity_deadline (unset until returned or recovered from GetImport)
+fence_state (`INSTALLING` or `INSTALLED`)
 phase
 created_at
 updated_at
@@ -376,6 +377,14 @@ PREPARED
 ```
 
 No phase transition relies only on an in-memory flag.
+
+`fence_state` is an orthogonal local durability field, not a server phase. A
+complete record first becomes durable with `fence_state=INSTALLING`; recovery
+must treat that value as requiring both prefixes to remain fenced. The local
+fence manager then confirms that the already-installed registry entry is bound
+to this record, rewrites and fsyncs `fence_state=INSTALLED`, and only then lets
+the normal `PREPARED` workflow continue. Both values are checksummed recovery
+inputs and neither authorizes a remote request.
 
 `PREPARED` means the complete request identity is durable and the coordinator
 has **not** dispatched `CreateImport`. Immediately before the first network
@@ -468,7 +477,7 @@ AttachImportContent(migration_id, owner_epoch, owner_token,
                     relative_path, entry_hash, import_content_token)
 VerifyImport(migration_id, owner_epoch, owner_token, manifest_hash)
 CommitImport(migration_id, owner_epoch, owner_token)
-GetImport(migration_id)
+GetImport(migration_id, allocation_or_recovery_token)
 RetireImportAllocation(migration_id, allocation_token)
 AbortImport(migration_id, owner_epoch, owner_token)
 RenewImportLease(migration_id, owner_epoch, owner_token)
@@ -510,15 +519,18 @@ and cannot create an import.
 `CreateImport` resolves lost responses before it performs new-admission checks:
 
 1. Under normal tenant authentication, look up `(tenant_id, migration_id)` in
-   active/full-terminal rows and retained tombstones before treating it as new.
+   active/full-terminal rows, retained tombstones, and the ID graveyard before
+   treating it as new.
 2. If an active/full row exists, compare the stored immutable create-request
    digest, owner-token hash, and recovery-token hash. An exact match returns the
    current state, reservation, and manifest-entry result even if
    `create_before` or `plan_expires_at` has since passed or the current backend
    capability generation has changed. A retained terminal tombstone performs
-   the same comparison and returns its terminal result. After retirement it
-   returns `import_id_retired`. These are recovery of an accepted transaction,
-   not new admission. Any mismatch returns conflict and cannot reset the epoch.
+   the same comparison and returns its terminal result. A graveyard row with
+   matching current scope and operation token returns `import_id_retired`;
+   without those proofs it is non-disclosing not-found. These are recovery of
+   an accepted transaction, not new admission. Any visible mismatch returns
+   conflict and cannot reset the epoch.
 3. Only when no accepted row exists does the server lock the durable allocation
    claim. It rechecks for an accepted winner, then validates claim state/token,
    `create_before`, plan MAC/expiry, current capability generation,
@@ -946,8 +958,9 @@ coordinator generated and fsynced in `PREPARED` before the request. The server
 stores only their hashes, creates `owner_epoch = 1`, and returns the epoch and
 lease expiry. Every staging, verify, commit, abort, and renew mutation must
 present both the current epoch and owner token. Thus a lost create response is
-recoverable with the already-durable token; `GetImport` may disclose the epoch
-and state but never either token.
+recoverable with the already-durable token; `GetImport` requires the applicable
+allocation or recovery token and may disclose the epoch and state, but never
+either token.
 
 For `CREATED`, `STAGING`, or `VERIFIED`, the current owner may renew before
 expiry. After expiry, `TakeOverImport` requires the stable recovery token and
@@ -1108,6 +1121,14 @@ import_tombstones(
   terminal_result_blob, terminal_result_digest, retire_after,
   primary key (tenant_id, migration_id)
 )
+
+import_id_graveyard(
+  tenant_id, migration_id, target_path, retired_kind,
+  allocation_token_hash, request_digest, owner_token_hash,
+  recovery_token_hash,
+  retired_at,
+  primary key (tenant_id, migration_id)
+)
 ```
 
 `inline_content_blob` and its idempotency fields are the only P0 content-write
@@ -1134,9 +1155,10 @@ allocation retirement. Its state is `ALLOCATED`, `ACCEPTED`, or `RETIRED` and
 never moves backward. An accepted claim remains linked to the import/tombstone;
 the expiry scanner retires an unused `ALLOCATED` claim under the same row lock
 used by first Create, so an in-flight create or retirement is the sole winner.
-An unused retired claim may be compacted after `create_before` plus the maximum
-request/recovery window, but a missing claim is treated as retired/invalid and
-can never be reconstructed from an old token.
+After `create_before` plus the maximum request/recovery window, an unused
+retired claim is atomically compacted into `import_id_graveyard` before its
+claim row is removed. A missing claim without a matching graveyard is unknown
+and cannot be reconstructed or admitted from an old token.
 
 The ordinary namespace schema also supplies the non-reusable parent
 path-edge incarnation and monotonic child-set generation described above.
@@ -1154,29 +1176,41 @@ and complete immutable terminal result needed to reauthorize and answer
 `GetImport` or an idempotent acknowledgement retry, not merely a digest.
 
 Only terminalization assigns `retire_after = terminal_at +` the configured
-maximum offline-recovery window. The tenant-bound migration ID, request digest,
-recovery-token hash, terminal state, result, and result digest remain in
-`import_tombstones` until that time. During the interval, `CreateImport`
-conflicts and `GetImport` returns the same terminal result. At and after
-`retire_after`, every external API returns `import_id_retired`; the ID is never
-interpreted as a new or not-found operation. If all durable rows have since
-been removed, a valid allocation token whose `create_before` has passed also
-resolves as retired rather than reusable. Recovery beyond this documented
-maximum offline window fails closed with `promotion_recovery_required`. The
-configured minimum and maximum full-row windows are both shorter than the
-terminal retention window, making storage retention bounded and migration-ID
-reuse behavior testable with a fake clock.
+maximum offline-recovery window. The tenant-bound migration ID, canonical
+target, request digest, recovery-token hash, terminal state, result, and result
+digest remain in `import_tombstones` until that time. During the interval,
+`CreateImport` conflicts and an authorized `GetImport` returns the same terminal
+result. At `retire_after`, one transaction creates the minimal
+`import_id_graveyard` row before deleting the result tombstone. The graveyard
+retains no manifest, content, quota, result blob, or cleanup ownership; it keeps
+only the bounded identity, target, token/digest hashes, retired kind, and time
+needed to prevent reuse, authorize a retirement proof, and distinguish a valid
+old operation from a random ID. It is logically permanent and included in
+capacity planning as bounded-size control-plane identity debt. Result-payload
+retention remains bounded; any future external-storage cleanup debt follows its
+separate accounted-until-converged contract below.
 
-For a future external mode, physical tombstone deletion additionally requires
-every write grant, upload attempt, and unowned seal candidate to be `gc_done`,
-every landing/provider-mutation closure bound to have passed, and every
-corresponding debt charge to be released. If a provider outage delays cleanup
-past `retire_after`, external
-APIs still return `import_id_retired`; the terminal result blob and recovery
-token hash may be pruned, while a minimal internal migration/tenant cleanup
-anchor and all write/attempt ledgers remain.
-Result-payload retention stays bounded; cleanup debt is never orphaned merely
-to satisfy that bound.
+With current scope on the retained target and the operation token applicable to
+that endpoint (allocation, current owner, or recovery), every ID-addressed API
+against a graveyard returns the stable `import_id_retired` result and never
+creates a new claim/import. Without both proofs it returns the same canonical
+not-found response as an unknown ID. A random or deleted/nonexistent ID has no
+graveyard and is never admitted except through a fresh successful
+`AllocateImportID`; allocation retries on an ID in the graveyard choose a new
+random ID. Recovery of a valid operation beyond the documented maximum offline
+window therefore receives `import_id_retired` and maps it to fail-closed
+`promotion_recovery_required`.
+
+For a future external mode, result-tombstone compaction at `retire_after` also
+creates or retains a separate minimal internal migration/tenant cleanup anchor.
+That cleanup anchor cannot be deleted until every write grant, upload attempt,
+and unowned seal candidate is `gc_done`, every landing/provider-mutation closure
+bound has passed, and every corresponding debt charge is released. A provider
+outage may therefore retain the cleanup anchor and write/attempt ledgers beyond
+`retire_after`, while the public identity graveyard independently returns
+`import_id_retired` to authorized callers and the terminal result blob is
+already pruned. Result-payload retention stays bounded; cleanup debt is never
+orphaned merely to satisfy that bound.
 
 The outbox is part of the transaction. It invalidates positive and negative
 directory caches on other mounts. Staging emits no user-visible namespace or
@@ -1256,16 +1290,34 @@ FUSE requests. Normal commit queues and uploaders cannot enqueue work under the
 fenced prefixes; the import uploader is exempt only through its migration ID
 and internal capability.
 
-Fence ownership is structured. Immediately after atomically acquiring both
-prefixes, the request installs one idempotent cleanup guard before invoking
-preflight. The initiating rename is owner-exempt while it performs validation.
-Every preflight or eligibility error, request cancellation, recovered panic,
-and return before the durable local migration record is fsynced releases both
-prefixes and wakes waiters. After that fsync, ownership is atomically handed to
-the migration coordinator/recovery record and the request guard is disarmed;
-exactly one owner then releases the fences at the terminal point described
-above. There is no interval with neither cleanup owner and no error path may
-leave an unrecorded in-memory fence behind.
+Fence ownership is structured but does **not** assume disk and memory can be
+updated atomically. One mount-local fence manager owns the same registry entry
+from initial acquisition through terminal release; a request and coordinator
+hold references to that entry rather than transferring ownership by toggling a
+boolean. Immediately after atomically acquiring both prefixes, the manager
+installs one idempotent resolution guard before invoking preflight. The
+initiating rename is owner-exempt while it performs validation.
+
+After preflight and snapshot validation, `PersistAndBind` first marks the
+manager entry `PERSISTING`, writes the complete checksummed migration record
+with `fence_state=INSTALLING`, and fsyncs the file and directory while the same
+in-memory fence remains installed. It then binds the coordinator to that same
+registry entry, rewrites/fsyncs `fence_state=INSTALLED`, and signals recovery.
+There is no request-guard-to-coordinator fence handoff and therefore no point
+at which successful record fsync requires releasing and reacquiring a prefix.
+
+Every exit invokes the manager's idempotent resolver, never a raw fence
+release. Before persistence starts, preflight/eligibility error, cancellation,
+or recovered panic removes both prefixes and wakes waiters. Once persistence
+starts, an error or panic makes the resolver inspect the durable record: a
+valid `INSTALLING`/`INSTALLED` record keeps the existing fence and schedules the
+supervisor to finish binding; a provably absent record permits release; an
+ambiguous fsync/read outcome keeps the fence and marks the mount fail-closed
+until the supervisor resolves it. If binding or supervisor startup fails, the
+mount stays fail-closed rather than exposing an unfenced durable migration.
+Process restart scans and installs fences for both fence states before serving
+FUSE. Exactly one registry entry exists per migration, and only terminal
+reconciliation releases it.
 
 FUSE request cancellation is phase-sensitive. Before the server durably
 accepts `VERIFIED -> COMMITTING`, cancellation stops new work and drives the
@@ -1349,6 +1401,12 @@ The server state is authoritative for publish and accounting outcome:
 | unreachable or invalid response | Authority is unresolved; keep both paths fenced or fail the mount closed. | No cleanup, quota release, abort, or new migration is guessed. | Retain and return `promotion_recovery_required`. |
 
 The durable local phase refines, but never overrides, that server result:
+
+Before interpreting `phase`, recovery processes `fence_state`. `INSTALLING`
+and `INSTALLED` both require both prefixes to be installed before FUSE accepts
+requests. `INSTALLING` is completed to `INSTALLED` with the existing fence
+entry; it is never treated as permission to release. A corrupt or ambiguous
+record fails the mount closed.
 
 | Last durable local phase | Recovery action |
 | --- | --- |
@@ -1473,13 +1531,22 @@ owner.
   ordinary rename rather than call a validation helper directly. Moving the
   cross-layer branch ahead of preflight, relying on `default_permissions`, or
   deleting any parent/sticky/type/emptiness check makes a focused test fail;
-- after each preflight/eligibility negative case, cancellation, and an injected
-  panic immediately after fence acquisition, a second goroutine performs
-  lookup, write, and rename under both source and target prefixes with a bounded
-  deadline. It must observe ordinary namespace semantics rather than block,
-  and the fence registry/waiter count must be empty. Deleting the request's
-  cleanup guard, releasing only one prefix, or disarming before durable-record
-  handoff makes a production-entry test hang or fail;
+- after each preflight/eligibility negative case and cancellation, a second
+  goroutine performs lookup, write, and rename under both source and target
+  prefixes with a bounded deadline. It must observe ordinary namespace
+  semantics rather than block, and the fence registry/waiter count must be
+  empty;
+- deterministic fault injection covers panic/error immediately after fence
+  acquisition, after entering `PERSISTING`, before and after the temporary-file
+  fsync, after record rename, before and after the parent-directory fsync, after
+  a successful directory fsync but before manager binding, after binding but
+  before `INSTALLED` fsync, and after that fsync.
+  Cases without a valid durable record release both prefixes; cases with a
+  valid or outcome-unknown record retain exactly one registry fence and are
+  adopted by the supervisor, or the mount rejects all operations fail-closed.
+  Deleting manager resolution, releasing one prefix, or treating the fsync-to-
+  binding interval as an ordinary request error makes a production-entry test
+  expose an unfenced durable record or hang;
 - empty and deep directories;
 - zero-byte files, files at `inlineThreshold-1`, and complete all-inline trees;
 - files at `inlineThreshold` or larger and disabled inline storage require an
@@ -1644,13 +1711,19 @@ The remaining P0/FUSE concurrency cases are:
   exact method/path dispatcher matrix admits scoped credentials only to import
   handlers with that check; unknown actions and method mismatches remain
   denied;
-- `GetImport` response-equivalence tests query an existing out-of-scope import,
-  a random unknown ID, and an ID whose externally retained result has expired.
-  The same scoped caller receives byte-for-byte equivalent canonical not-found
-  responses and no state-dependent headers; an authorized caller with the
-  required operation token still receives the defined active, terminal, or
-  retired result. The equivalent non-disclosure check covers allocation and
-  tombstone-backed lookups;
+- an ID-only continuation table crosses authorized and out-of-scope callers
+  with active rows, full-terminal rows, result tombstones, unused retired
+  allocations, permanent graveyard rows, and random unknown IDs. Every stored-
+  target denial or missing-proof case is a byte-for-byte equivalent canonical
+  not-found response with no state-dependent headers. Current scope plus the
+  required operation token exposes the defined active/terminal result or stable
+  `import_id_retired` for a graveyard row; an unknown ID remains not-found;
+- the target-bearing Create-recovery table separately proves its two gates: an
+  out-of-scope request target returns the same 403 before lookup for existing
+  and unknown IDs, while an in-scope request target that resolves to a stored
+  out-of-scope target receives the same 404 as an unknown ID rather than a
+  mismatch conflict. Only a caller authorized for the matching stored target
+  receives active, terminal, or retired recovery;
 - a deterministic revocation barrier after `CommitImport` has already won
   `VERIFIED -> COMMITTING`, and after abort/deadline GC has already won
   `... -> ABORTING`, does not strand server work: the service-owned worker
@@ -1799,9 +1872,11 @@ external-object adapter:
   out-of-contract and is never advertised as fail-closed;
 - terminal result acknowledgement, minimum and unacknowledged-maximum full-row
   compaction, complete-result tombstone lookup, and post-terminal ID retirement
-  are tested with a fake clock; an active import never becomes retired, and a
-  replay after terminal retirement is `import_id_retired`, never a fresh
-  import;
+  are tested with a fake clock. Tombstone or unused-claim pruning first creates
+  the minimal graveyard row transactionally; deleting that row or permitting
+  `AllocateImportID` to reuse it makes the test fail. An active import never
+  becomes retired, and a valid authorized replay after terminal retirement is
+  `import_id_retired`, never a fresh import;
 - a provider cleanup outage past `retire_after` prunes the externally
   recoverable result but retains the internal attempt/cleanup anchor until
   `gc_done`, then removes it.
@@ -1820,9 +1895,9 @@ Tests must fail when independently deleting:
 - the production `Dat9FS.Rename` cross-layer call to the shared daemon-side
   POSIX preflight, or any required parent write/search, sticky-directory,
   source/target type, self-subtree, or target-emptiness check;
-- the idempotent two-prefix fence cleanup guard on any pre-record error,
-  cancellation, or panic path, or the atomic handoff from request ownership to
-  the fsynced migration record;
+- the fence manager's idempotent two-prefix resolution on any pre-record error,
+  cancellation, or panic path, continuous registry ownership across every
+  persist/bind boundary, or restart adoption of `INSTALLING`/`INSTALLED`;
 - the subtree fence;
 - migration idempotency;
 - the parent path-edge incarnation, child-set generation, or absent-child term
@@ -1835,6 +1910,8 @@ Tests must fail when independently deleting:
   recovery), scoped-route dispatcher allowlisting, the non-disclosing lookup
   response rule, or the separation that lets already-accepted
   `COMMITTING`/`ABORTING` workers finish under service authority;
+- transactional compaction of terminal tombstones and unused retired claims
+  into the permanent, target-bearing ID graveyard before payload/claim removal;
 - side-effect-free plan revalidation and the production adapter classifier that
   permits DB-inline content but rejects `AWSS3Client`, `LocalS3Client` in
   production, and unknown backends before import/quota creation;
