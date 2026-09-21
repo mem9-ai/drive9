@@ -80,6 +80,10 @@ type Config struct {
 	SemanticEmbedder embedding.Client
 	TenantWorkers    TenantWorkerOptions
 	SlockOAuth       SlockOAuthClient
+	// PromotionRuntime is the fail-closed bridge to the external promotion
+	// identity/writer authority and a tenant PromotionStore. Nil keeps every
+	// promotion route disabled. The server never mints process-local leases.
+	PromotionRuntime PromotionRuntime
 
 	TiDBAutoEmbeddingConfig  tenantschema.TiDBAutoEmbeddingConfig
 	TiDBAutoEmbeddingAPIKey  string
@@ -211,6 +215,7 @@ type Server struct {
 	journalCursorSecret       []byte
 	objectGCWorker            *objectGCWorker
 	slockOAuth                SlockOAuthClient
+	promotionRuntime          PromotionRuntime
 	tidbAutoEmbedding         tenantAutoEmbeddingDefault
 	disableDBAutoEmbed        bool
 	forkWorkerCtx             context.Context
@@ -432,6 +437,7 @@ func NewWithConfig(cfg Config) *Server {
 		logger:                    srvLog,
 		events:                    newEventBuses(),
 		slockOAuth:                cfg.SlockOAuth,
+		promotionRuntime:          cfg.PromotionRuntime,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
 			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
@@ -512,6 +518,10 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/object-credentials", business)
 	mux.Handle("/v1/extent/meta", business)
 	mux.Handle("/v1/data-credential", business)
+	mux.Handle("/v1/promotions/imports", business)
+	mux.Handle("/v1/promotions/imports/", business)
+	mux.Handle("/v1/promotions/imports:plan", business)
+	mux.Handle("/v1/promotions/imports:allocate", business)
 	// Vault management API goes through tenant auth.
 	mux.Handle("/v1/vault/secrets", business)
 	mux.Handle("/v1/vault/secrets/", business)
@@ -1584,6 +1594,9 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleExtentMeta(w, r)
 	case r.URL.Path == "/v1/data-credential":
 		s.handleDataCredential(w, r)
+	case r.URL.Path == "/v1/promotions/imports" || strings.HasPrefix(r.URL.Path, "/v1/promotions/imports/") ||
+		r.URL.Path == "/v1/promotions/imports:plan" || r.URL.Path == "/v1/promotions/imports:allocate":
+		s.handlePromotion(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
@@ -1682,6 +1695,10 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 
 	if path == "/v1/layers" || strings.HasPrefix(path, "/v1/layers/") || strings.HasPrefix(path, "/v1/layer-checkpoints/") {
 		return isScopedFSLayerRouteAllowed(r.Method, path, r.URL.Query())
+	}
+	if path == "/v1/promotions/imports" || strings.HasPrefix(path, "/v1/promotions/imports/") ||
+		path == "/v1/promotions/imports:plan" || path == "/v1/promotions/imports:allocate" {
+		return isScopedPromotionRouteAllowed(r.Method, path, r.URL.Query())
 	}
 
 	// SQL, fork, events, journals, vault, status, etc.: still default-deny.

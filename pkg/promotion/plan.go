@@ -29,10 +29,10 @@ type StorageCapability struct {
 
 // PlanImportRequest is the side-effect-free planning input.
 type PlanImportRequest struct {
-	TenantID             string
-	Target               string
-	ExpectedTargetAbsent bool
-	Manifest             []ManifestEntry
+	TenantID             string          `json:"-"`
+	Target               string          `json:"target"`
+	ExpectedTargetAbsent bool            `json:"expected_target_absent"`
+	Manifest             []ManifestEntry `json:"manifest"`
 }
 
 // ImportPlan is the authenticated immutable result of PlanImport.
