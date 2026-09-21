@@ -46,6 +46,9 @@ func (o *LocalOverlay) abs(localPath string) (string, error) {
 		return "", err
 	}
 	rel := strings.TrimPrefix(canonical, "/")
+	if rel == promotionStateDirName || strings.HasPrefix(rel, promotionStateDirName+"/") {
+		return "", syscall.ENOENT
+	}
 	if rel == "" {
 		return o.root, nil
 	}
@@ -202,6 +205,9 @@ func (o *LocalOverlay) ReadDir(localPath string) ([]localOverlayEntry, error) {
 	}
 	entries := make([]localOverlayEntry, 0, len(items))
 	for _, item := range items {
+		if localPath == "/" && item.Name() == promotionStateDirName {
+			continue
+		}
 		info, err := item.Info()
 		if err != nil {
 			return nil, err

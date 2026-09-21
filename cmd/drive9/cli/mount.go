@@ -197,6 +197,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
 	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
+	enableSynchronousPromotion := fs.Bool("sync-promotion-preview", false, "opt in to restricted synchronous local-only to remote rename promotion")
 	var localOnlyPatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
 	var appendLogPatterns stringListFlag
@@ -673,6 +674,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			Debug:                        *debug,
 			GVisorCompat:                 *gvisorCompat,
 			LegacyInterruptibleMutations: *legacyInterruptibleMutations,
+			EnableSynchronousPromotion:   *enableSynchronousPromotion,
 		})
 	}
 
@@ -806,6 +808,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			Debug:                        *debug,
 			GVisorCompat:                 *gvisorCompat,
 			LegacyInterruptibleMutations: *legacyInterruptibleMutations,
+			EnableSynchronousPromotion:   *enableSynchronousPromotion,
 		})
 	}
 
@@ -861,6 +864,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		DirectMountStrict:            *directMountStrict,
 		GVisorCompat:                 *gvisorCompat,
 		LegacyInterruptibleMutations: *legacyInterruptibleMutations,
+		EnableSynchronousPromotion:   *enableSynchronousPromotion,
 		AllowOther:                   *allowOther,
 		ReadOnly:                     *readOnly,
 		Debug:                        *debug,

@@ -45,6 +45,18 @@ func (i renamePathInfo) modeOrDefault() uint32 {
 }
 
 func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, oldP, newP string) (renamePathInfo, renamePathInfo, gofuse.Status) {
+	return fs.renamePreflightWithOverlayPrune(ctx, input, oldP, newP, true)
+}
+
+// renamePreflightForPromotion shares the daemon-side POSIX checks with an
+// ordinary rename but is strictly side-effect free. In particular, it must not
+// prune overlay scaffolding before the promotion coordinator has installed and
+// durably recorded its fence.
+func (fs *Dat9FS) renamePreflightForPromotion(ctx context.Context, input *gofuse.RenameIn, oldP, newP string) (renamePathInfo, renamePathInfo, gofuse.Status) {
+	return fs.renamePreflightWithOverlayPrune(ctx, input, oldP, newP, false)
+}
+
+func (fs *Dat9FS) renamePreflightWithOverlayPrune(ctx context.Context, input *gofuse.RenameIn, oldP, newP string, pruneOverlay bool) (renamePathInfo, renamePathInfo, gofuse.Status) {
 	oldInfo, err := fs.renamePathInfo(ctx, oldP)
 	if err != nil {
 		return oldInfo, renamePathInfo{}, httpToFuseStatus(err)
@@ -116,7 +128,7 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 	// Check the backing overlay even without cached child inodes or a remote
 	// destination. Empty invisible parents left by rmdir are only scaffolding;
 	// real local-only entries must still reject replacement before commit.
-	if oldInfo.isDir && (!newInfo.exists || newInfo.isDir) && fs.localOverlay != nil {
+	if pruneOverlay && oldInfo.isDir && (!newInfo.exists || newInfo.isDir) && fs.localOverlay != nil {
 		if err := fs.pruneRenameOverlayParents(ctx, newP); err != nil {
 			// The generic local mapper treats ENOTEMPTY as os.ErrExist.
 			// Preserve the directory replacement error at this boundary.

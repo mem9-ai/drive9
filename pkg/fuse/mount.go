@@ -91,6 +91,7 @@ type MountOptions struct {
 	Debug                        bool          // enable FUSE debug logging
 	PerfCounters                 bool          // print low-overhead FUSE perf counter summary on shutdown
 	EnableGitWorkspaces          bool          // enable fast-clone git workspace overlay discovery
+	EnableSynchronousPromotion   bool          // opt in to the restricted local-only -> remote synchronous rename preview
 	Profiling                    ProfilingOptions
 	// RemoteCommitWaitTimeout bounds how long a FUSE write/flush handler waits
 	// for a background commit to finish before proceeding anyway. This prevents
@@ -407,6 +408,13 @@ func Mount(opts *MountOptions) (err error) {
 
 	// Build FUSE filesystem
 	dat9fs := NewDat9FS(c, opts)
+	// The preview owns a durable local operation journal. Recover it before
+	// NewServer makes the namespace reachable: an unresolved COMMIT_REQUESTED
+	// operation must never race a fresh lookup or a second promotion after a
+	// process restart.
+	if err := dat9fs.recoverSynchronousPromotions(context.Background()); err != nil {
+		return ExitStartupPermanentErr("recover synchronous promotion", err)
+	}
 	layerEventWatcherStop := func() {}
 
 	profiler, err := StartProfiler(opts.Profiling)
@@ -1270,6 +1278,9 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	}
 	if opts.EnableGitWorkspaces && opts.LocalRoot == "" {
 		return fmt.Errorf("mount: EnableGitWorkspaces requires LocalRoot")
+	}
+	if opts.EnableSynchronousPromotion && opts.LocalRoot == "" {
+		return fmt.Errorf("mount: EnableSynchronousPromotion requires LocalRoot")
 	}
 	if opts.WriteBackBatchWindow < 0 {
 		return fmt.Errorf("mount: WriteBackBatchWindow must be >= 0")

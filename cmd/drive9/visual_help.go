@@ -785,6 +785,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "--extent PATTERN", Desc: "create matching files with content_layout=extent (JuiceFS data plane); repeatable; env DRIVE9_MOUNT_EXTENT_PATTERNS is newline-delimited"},
 					{Name: "--unpack :/archive.tar.gz", Desc: "restore a drive9 pack archive into local-root before mounting; repeatable"},
 					{Name: "--no-auto-unpack", Desc: "disable automatic profile pack restore before mounting"},
+					{Name: "--sync-promotion-preview", Desc: "opt in to restricted synchronous local-only to remote rename promotion"},
 				}},
 				{Title: "Layers and writes", Flags: []visualHelpFlag{
 					{Name: "--layer REF", Desc: "mount through writable fs layer by id, name, or tag ref"},

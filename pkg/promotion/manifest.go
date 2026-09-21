@@ -154,6 +154,9 @@ func validateManifest(entries []ManifestEntry, limits ManifestLimits, alreadyNor
 		if entry.Mode&^uint32(0o7777) != 0 {
 			return nil, fmt.Errorf("%w: path %q mode %#o contains file-type bits", ErrInvalidManifest, path, entry.Mode)
 		}
+		if path == "." && entry.Type != EntryTypeDirectory {
+			return nil, fmt.Errorf("%w: root metadata entry must be a directory", ErrInvalidManifest)
+		}
 		if err := validateEntryTypeFields(entry, limits); err != nil {
 			return nil, err
 		}
@@ -255,6 +258,13 @@ func validateEntryTypeFields(entry ManifestEntry, limits ManifestLimits) error {
 func CanonicalRelativePath(raw string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("relative path is empty")
+	}
+	// The optional dot entry represents metadata for the promoted tree root.
+	// It is never a content path; materialization consumes it when creating the
+	// target-root inode. Keeping it in the canonical manifest binds root mode
+	// and mtime to Plan/Create/Commit without a second unsigned metadata lane.
+	if raw == "." {
+		return ".", nil
 	}
 	if strings.HasPrefix(raw, "/") {
 		return "", fmt.Errorf("relative path is absolute")

@@ -135,6 +135,24 @@ func (idx *OpenHandleIndex) SnapshotPath(p string) []*FileHandle {
 	return out
 }
 
+// HasPathPrefix reports whether a live file handle names p or a descendant.
+// Promotion uses this while its mutation barrier is held, so a successful
+// check cannot race a new Open registration.
+func (idx *OpenHandleIndex) HasPathPrefix(p string) bool {
+	if idx == nil || p == "" {
+		return false
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	prefix := strings.TrimSuffix(p, "/") + "/"
+	for current := range idx.byPath {
+		if current == p || strings.HasPrefix(current, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // SnapshotInode returns a point-in-time copy of handles currently indexed by inode.
 func (idx *OpenHandleIndex) SnapshotInode(ino uint64) []*FileHandle {
 	if idx == nil || ino == 0 {

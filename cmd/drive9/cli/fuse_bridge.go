@@ -76,6 +76,7 @@ type mountFuseOptions struct {
 	DirectMountStrict            bool
 	GVisorCompat                 bool
 	LegacyInterruptibleMutations bool
+	EnableSynchronousPromotion   bool
 	AllowOther                   bool
 	ReadOnly                     bool
 	Debug                        bool

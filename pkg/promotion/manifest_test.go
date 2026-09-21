@@ -140,6 +140,41 @@ func TestValidateCanonicalManifestEmptyTree(t *testing.T) {
 	}
 }
 
+func TestCanonicalManifestBindsOptionalRootMetadata(t *testing.T) {
+	manifest, err := CanonicalizeManifest([]ManifestEntry{
+		{RelativePath: ".", Type: EntryTypeDirectory, Mode: 0o710, MtimeNS: 1234},
+		{RelativePath: "child", Type: EntryTypeFile, Mode: 0o640, MtimeNS: 5678, ExpectedChecksumSHA256: checksum("payload")},
+	}, testManifestLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Entries) != 2 || manifest.Entries[0].RelativePath != "." ||
+		manifest.Entries[0].Mode != 0o710 || manifest.Entries[0].MtimeNS != 1234 {
+		t.Fatalf("canonical root metadata = %+v", manifest.Entries)
+	}
+	mutated := append([]ManifestEntry(nil), manifest.Entries...)
+	mutated[0].Mode = 0o755
+	if _, err := ValidateCanonicalManifest(mutated, testManifestLimits()); !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("root metadata mutation error = %v, want ErrInvalidManifest", err)
+	}
+}
+
+func TestCanonicalManifestRejectsRootContentEntry(t *testing.T) {
+	for _, entryType := range []EntryType{EntryTypeFile, EntryTypeSymlink} {
+		t.Run(string(entryType), func(t *testing.T) {
+			entry := ManifestEntry{RelativePath: ".", Type: entryType, Mode: 0o600}
+			if entryType == EntryTypeFile {
+				entry.ExpectedChecksumSHA256 = checksum("")
+			} else {
+				entry.SymlinkTarget = "target"
+			}
+			if _, err := CanonicalizeManifest([]ManifestEntry{entry}, testManifestLimits()); !errors.Is(err, ErrInvalidManifest) {
+				t.Fatalf("CanonicalizeManifest root %s error = %v, want ErrInvalidManifest", entryType, err)
+			}
+		})
+	}
+}
+
 func TestValidateCanonicalManifestEntryHashGatesMetadata(t *testing.T) {
 	manifest, err := CanonicalizeManifest([]ManifestEntry{{RelativePath: "dir", Type: EntryTypeDirectory, Mode: 0o755, MtimeNS: 7}}, testManifestLimits())
 	if err != nil {

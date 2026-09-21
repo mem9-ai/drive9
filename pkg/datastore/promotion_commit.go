@@ -475,6 +475,16 @@ func (s *PromotionStore) settlePromotionQuotaTx(ctx context.Context, tx *sql.Tx,
 
 func (s *PromotionStore) materializePromotionTreeTx(ctx context.Context, tx *sql.Tx, req PromotionCommitRequest, row *promotionOwnerImport, entries []promotionEntryRow, contents []promotionContentRow, now time.Time) (string, uint64, error) {
 	rootPath := strings.TrimSuffix(row.target, "/") + "/"
+	rootMode := uint32(0o755)
+	rootMtime := now
+	if len(entries) != 0 && entries[0].relativePath == "." {
+		if entries[0].entryType != promotion.EntryTypeDirectory {
+			return "", 0, ErrPromotionRecoveryRequired
+		}
+		rootMode = entries[0].mode
+		rootMtime = time.Unix(0, entries[0].mtimeNS).UTC()
+		entries = entries[1:]
+	}
 	rootInode, err := newPromotionID("pin")
 	if err != nil {
 		return "", 0, err
@@ -489,7 +499,7 @@ func (s *PromotionStore) materializePromotionTreeTx(ctx context.Context, tx *sql
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO inodes
 		(inode_id, size_bytes, revision, mode, status, created_at, mtime, confirmed_at)
-		VALUES (?, 0, 1, ?, 'CONFIRMED', ?, ?, ?)`, rootInode, uint32(0o755), now, now, now); err != nil {
+		VALUES (?, 0, 1, ?, 'CONFIRMED', ?, ?, ?)`, rootInode, rootMode, now, rootMtime, now); err != nil {
 		return "", 0, fmt.Errorf("insert promotion root inode: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO file_nodes

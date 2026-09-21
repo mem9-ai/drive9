@@ -68,6 +68,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		DirectMountStrict:            opts.DirectMountStrict,
 		GVisorCompat:                 opts.GVisorCompat,
 		LegacyInterruptibleMutations: opts.LegacyInterruptibleMutations,
+		EnableSynchronousPromotion:   opts.EnableSynchronousPromotion,
 		AllowOther:                   opts.AllowOther,
 		ReadOnly:                     opts.ReadOnly,
 		Debug:                        opts.Debug,

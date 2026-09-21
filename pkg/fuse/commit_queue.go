@@ -793,6 +793,28 @@ func (cq *CommitQueue) HasPath(path string) bool {
 	return cq.hasQueuedPathLocked(path) || cq.hasImmediatePathLocked(path)
 }
 
+// HasPrefix reports whether any queued, in-flight, or synchronous commit is
+// below prefix. Callers must include the trailing slash when they need a path
+// component boundary rather than a raw string prefix.
+func (cq *CommitQueue) HasPrefix(prefix string) bool {
+	if cq == nil || prefix == "" {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	for path := range cq.inFlight {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	for path, entries := range cq.queuedByPath {
+		if len(entries) != 0 && strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return cq.hasImmediatePrefixLocked(prefix)
+}
+
 func (cq *CommitQueue) hasImmediatePathLocked(path string) bool {
 	for entry := range cq.immediate {
 		if entry != nil && entry.Path == path {

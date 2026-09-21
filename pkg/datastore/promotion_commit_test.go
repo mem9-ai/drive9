@@ -96,6 +96,7 @@ func insertPromotionTestNode(t *testing.T, store *Store, path string, directory 
 
 func TestPromotionCommitPublishesWholeTreeAndRecoversExactResult(t *testing.T) {
 	store, promotionStore, verified, _ := createVerifiedPromotionImport(t, []promotion.ManifestEntry{
+		{RelativePath: ".", Type: promotion.EntryTypeDirectory, Mode: 0o710, MtimeNS: 500_007_000},
 		{RelativePath: "dir", Type: promotion.EntryTypeDirectory, Mode: 0o750, MtimeNS: 1_001_000_000},
 		{RelativePath: "dir/empty", Type: promotion.EntryTypeFile, Mode: 0o640, MtimeNS: 2_002_000_000, ExpectedChecksumSHA256: promotionTestHash("")},
 		{RelativePath: "dir/file", Type: promotion.EntryTypeFile, Mode: 0o600, MtimeNS: 3_003_000_000, ExpectedSizeBytes: 5, ExpectedChecksumSHA256: promotionTestHash("hello")},
@@ -130,6 +131,12 @@ func TestPromotionCommitPublishesWholeTreeAndRecoversExactResult(t *testing.T) {
 	root, err := store.Stat(context.Background(), "/published/")
 	require.NoError(t, err)
 	require.True(t, root.Node.IsDirectory)
+	var rootMode uint32
+	var rootMtime time.Time
+	require.NoError(t, store.DB().QueryRow(`SELECT i.mode, i.mtime FROM file_nodes n
+		JOIN inodes i ON n.inode_id = i.inode_id WHERE n.path = '/published/'`).Scan(&rootMode, &rootMtime))
+	require.Equal(t, uint32(0o710), rootMode)
+	require.Equal(t, time.Unix(0, 500_007_000).UTC(), rootMtime.UTC())
 	children, err := store.ListDir(context.Background(), "/published/")
 	require.NoError(t, err)
 	require.Len(t, children, 2)

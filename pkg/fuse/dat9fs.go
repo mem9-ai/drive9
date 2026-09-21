@@ -54,22 +54,28 @@ var testHookAfterUnlinkHandleSetLockAttempt func()
 type Dat9FS struct {
 	gofuse.RawFileSystem
 
-	client              *client.Client
-	inodes              *InodeToPath
-	fileHandles         *HandleTable[*FileHandle]
-	openHandles         *OpenHandleIndex
-	locks               *fuseLockTable
-	dirHandles          *HandleTable[*DirHandle]
-	mountViewMu         sync.RWMutex
-	mountViewGeneration atomic.Uint64
-	committedMu         sync.Mutex
-	committedRev        map[string]int64
-	committedSize       map[string]int64
-	remoteCommitMu      sync.Mutex
-	remoteCommitLocks   map[string]*sync.Mutex
-	readCache           *ReadCache
-	diskReadCache       *DiskReadCache
-	dirCache            *DirCache
+	client *client.Client
+	// promotionBarrier deliberately serializes the preview against every
+	// user-visible mutator. The first preview is rare and opt-in; using one
+	// mount-wide barrier keeps the existing writeback paths unchanged while
+	// still making the snapshot/commit boundary explicit and reviewable.
+	promotionBarrier        sync.RWMutex
+	promotionRecoveryNeeded atomic.Bool
+	inodes                  *InodeToPath
+	fileHandles             *HandleTable[*FileHandle]
+	openHandles             *OpenHandleIndex
+	locks                   *fuseLockTable
+	dirHandles              *HandleTable[*DirHandle]
+	mountViewMu             sync.RWMutex
+	mountViewGeneration     atomic.Uint64
+	committedMu             sync.Mutex
+	committedRev            map[string]int64
+	committedSize           map[string]int64
+	remoteCommitMu          sync.Mutex
+	remoteCommitLocks       map[string]*sync.Mutex
+	readCache               *ReadCache
+	diskReadCache           *DiskReadCache
+	dirCache                *DirCache
 	// statCacheUnverified is true while the SSE stream is not known-current.
 	// In that state, file stat cache hits embedded in DirCache must fall back
 	// to HEAD revalidation instead of serving TTL-only attrs. Even when the
@@ -469,6 +475,17 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		xattrs:            NewXAttrStore(),
 		deletedPaths:      make(map[string]time.Time),
 	}
+}
+
+// promotionGuard rejects new filesystem work after a synchronous promotion
+// crosses a point whose outcome cannot be proved from local durable state.
+// P1 deliberately fails the whole opt-in mount closed instead of attempting a
+// path-scoped fence that existing lookup/writeback code could bypass.
+func (fs *Dat9FS) promotionGuard() gofuse.Status {
+	if fs != nil && fs.opts != nil && fs.opts.EnableSynchronousPromotion && fs.promotionRecoveryNeeded.Load() {
+		return gofuse.EIO
+	}
+	return gofuse.OK
 }
 
 // SetWriteBack configures the write-back cache and uploader on the filesystem.
@@ -7498,8 +7515,13 @@ func (fs *Dat9FS) notifyInodeSync(ino uint64) {
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseLookup, perfStart, status, 0) }()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -8639,8 +8661,13 @@ func (fs *Dat9FS) cleanupCommittedInode(ino uint64, p string) {
 }
 
 func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseGetAttr, perfStart, status, 0) }()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -8848,6 +8875,9 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 func (fs *Dat9FS) Access(cancel <-chan struct{}, input *gofuse.AccessIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseAccess, perfStart, status, 0) }()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 
 	var out gofuse.AttrOut
 	if st := fs.GetAttr(cancel, &gofuse.GetAttrIn{InHeader: input.InHeader}, &out); st != gofuse.OK {
@@ -9170,6 +9200,11 @@ func setAttrCallerOwner(input *gofuse.SetAttrIn) gofuse.Owner {
 }
 
 func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseSetAttr, perfStart, status, 0) }()
 	defer func() {
@@ -9507,8 +9542,13 @@ func (fs *Dat9FS) setAttrOutTimeout(out *gofuse.AttrOut, sizeChanged bool) {
 }
 
 func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out []byte, status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseReadlink, perfStart, status, uint64(len(out))) }()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return nil, status
+	}
 
 	entry, ok := fs.inodes.GetEntry(header.NodeId)
 	if !ok {
@@ -9560,6 +9600,11 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 // --- Directory operations ----------------------------------------------------
 
 func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseMknod, perfStart, status, 0) }()
 	if fs.opts.ReadOnly {
@@ -9680,6 +9725,11 @@ func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, na
 }
 
 func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseMkdir, perfStart, status, 0) }()
 	if fs.opts.ReadOnly {
@@ -9764,6 +9814,11 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 }
 
 func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, pointedTo string, linkName string, out *gofuse.EntryOut) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseSymlink, perfStart, status, 0) }()
 	if fs.opts.ReadOnly {
@@ -9898,6 +9953,11 @@ func (fs *Dat9FS) retrySymlinkAfterNegativeCacheConflict(ctx context.Context, po
 }
 
 func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseLink, perfStart, status, 0) }()
 	if fs.opts.ReadOnly {
@@ -10111,6 +10171,11 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 }
 
 func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseUnlink, perfStart, status, 0) }()
 	if fs.opts.ReadOnly {
@@ -10453,6 +10518,11 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 }
 
 func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseRmdir, perfStart, status, 0) }()
 	if fs.opts.ReadOnly {
@@ -11153,6 +11223,9 @@ func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
 func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseRename, perfStart, status, 0) }()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
@@ -11190,10 +11263,19 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 	if oldLayer == PathLayerLocalOnly || newLayer == PathLayerLocalOnly {
 		if oldLayer != newLayer {
-			return gofuse.Status(syscall.EXDEV)
+			if oldLayer != PathLayerLocalOnly || newLayer == PathLayerLocalOnly ||
+				fs.opts == nil || !fs.opts.EnableSynchronousPromotion {
+				return gofuse.Status(syscall.EXDEV)
+			}
+			return fs.renameLocalToRemoteSynchronously(ctx, input, oldP, newP)
 		}
 		if fs.localOverlay == nil {
 			return gofuse.EIO
+		}
+		fs.promotionBarrier.RLock()
+		defer fs.promotionBarrier.RUnlock()
+		if status = fs.promotionGuard(); status != gofuse.OK {
+			return status
 		}
 		if err := fs.ensureGitStateForLocalPath(ctx, oldP); err != nil {
 			return httpToFuseStatus(err)
@@ -11207,6 +11289,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		fs.finishLocalRename(input, oldP, newP)
 		fs.scheduleGitStateCheckpoint(newP)
 		return gofuse.OK
+	}
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
 	}
 	if handled, st := fs.renameGitPath(ctx, input, oldP, newP); handled {
 		return st
@@ -11395,6 +11482,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 }
 
 func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseOpenDir, perfStart, status, 0) }()
 	ctx, cf := fuseCtx(cancel)
@@ -11472,8 +11564,13 @@ func (dh *DirHandle) updateEntryIno(generation uint64, index int, ino uint64) {
 }
 
 func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseReadDir, perfStart, status, 0) }()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	dh, ok := fs.dirHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.ENOENT
@@ -11530,8 +11627,13 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 }
 
 func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseReadDirPlus, perfStart, status, 0) }()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	dh, ok := fs.dirHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.ENOENT
@@ -11734,8 +11836,13 @@ func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
 }
 
 func (fs *Dat9FS) FsyncDir(cancel <-chan struct{}, input *gofuse.FsyncIn) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFsyncDir, perfStart, status, 0) }()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 
 	dh, ok := fs.dirHandles.Get(input.Fh)
 	if !ok {
@@ -12316,6 +12423,11 @@ func dirEntryChildPath(dirPath, name string) string {
 // --- File operations ---------------------------------------------------------
 
 func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string, out *gofuse.CreateOut) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseCreate, perfStart, status, 0) }()
 	if fs.opts.ReadOnly {
@@ -12457,6 +12569,11 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 }
 
 func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseOpen, perfStart, status, 0) }()
 	ctx, cf := fuseCtx(cancel)
@@ -12706,6 +12823,11 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 }
 
 func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (result gofuse.ReadResult, status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return nil, status
+	}
 	start := time.Now()
 	logPath := ""
 	var logIno uint64
@@ -13555,6 +13677,11 @@ func (fs *Dat9FS) mountViewReadResult(generation uint64, data []byte) (gofuse.Re
 }
 
 func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []byte) (written uint32, status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return 0, status
+	}
 	start := time.Now()
 	logPath := ""
 	var logIno uint64
@@ -14303,8 +14430,13 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 }
 
 func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFlush, perfStart, status, 0) }()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok && fh.isExtent() {
 		// Extent handles release POSIX locks inside JuiceFS VFS.Flush.
@@ -14739,8 +14871,13 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 }
 
 func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFsync, perfStart, status, 0) }()
+	if status = fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.OK
@@ -15178,11 +15315,21 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 }
 
 func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
+	// Release can synchronously flush dirty content (including the close-sync
+	// fallback), so it participates in the same mount-wide promotion barrier as
+	// Flush/Fsync. A commit with an unknown outcome makes the mount restart-only;
+	// in that state retaining the handle until process restart is safer than
+	// emitting an unobservable post-fence remote mutation from this void method.
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
 	perfStart := fs.perfStart()
 	releaseStatus := gofuse.OK
 	defer func() { fs.perfRecordFuse(perfFuseRelease, perfStart, releaseStatus, 0) }()
 	if lockOwner := fuseLockOwner(input.LockOwner, input.Pid, input.Fh); lockOwner != 0 {
 		fs.locks.release(input.NodeId, lockOwner)
+	}
+	if fs.promotionGuard() != gofuse.OK {
+		return
 	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
@@ -16837,6 +16984,11 @@ func (fs *Dat9FS) FlushAll() {
 // StatFs reports a generous virtual capacity so that apps (Obsidian, Finder)
 // see free space and allow writes. The actual limit is server-side.
 func (fs *Dat9FS) StatFs(cancel <-chan struct{}, header *gofuse.InHeader, out *gofuse.StatfsOut) gofuse.Status {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status := fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	const blockSize = 4096
 	const totalBlocks = (1 << 40) / blockSize // 1 TiB
 	out.Blocks = totalBlocks
@@ -16851,6 +17003,11 @@ func (fs *Dat9FS) StatFs(cancel <-chan struct{}, header *gofuse.InHeader, out *g
 // --- Xattr handlers (in-memory, session-scoped) ----------------------------
 
 func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string, dest []byte) (uint32, gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status := fs.promotionGuard(); status != gofuse.OK {
+		return 0, status
+	}
 	path, ok := fs.inodes.GetPath(header.NodeId)
 	if !ok {
 		return 0, gofuse.ENOENT
@@ -16870,6 +17027,11 @@ func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr
 }
 
 func (fs *Dat9FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, dest []byte) (uint32, gofuse.Status) {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status := fs.promotionGuard(); status != gofuse.OK {
+		return 0, status
+	}
 	path, ok := fs.inodes.GetPath(header.NodeId)
 	if !ok {
 		return 0, gofuse.ENOENT
@@ -16895,6 +17057,11 @@ func (fs *Dat9FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, des
 }
 
 func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, attr string, data []byte) gofuse.Status {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status := fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	path, ok := fs.inodes.GetPath(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -16906,6 +17073,11 @@ func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, att
 }
 
 func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string) gofuse.Status {
+	fs.promotionBarrier.RLock()
+	defer fs.promotionBarrier.RUnlock()
+	if status := fs.promotionGuard(); status != gofuse.OK {
+		return status
+	}
 	path, ok := fs.inodes.GetPath(header.NodeId)
 	if !ok {
 		return gofuse.ENOENT
