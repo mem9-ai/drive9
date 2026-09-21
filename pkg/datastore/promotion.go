@@ -265,6 +265,7 @@ func (s *PromotionStore) AllocateImportID(ctx context.Context, req PromotionAllo
 		return nil, err
 	}
 	var out *PromotionAllocation
+	var admissionErr error
 	err = s.store.InTx(ctx, func(tx *sql.Tx) error {
 		tenant, err := s.lockPromotionIdentityTenant(ctx, tx, req.TenantID)
 		if err != nil {
@@ -308,7 +309,24 @@ func (s *PromotionStore) AllocateImportID(ctx context.Context, req PromotionAllo
 		}
 		bucket, err := consumePromotionRate(tenant.RateBucketRaw, now, tenant.AllocationRatePerMinute, tenant.AllocationRateBurst)
 		if err != nil {
-			return err
+			if !errors.Is(err, ErrPromotionIdentityBudgetExceeded) {
+				return err
+			}
+			// A rate denial is an expected admission result, not a reason to
+			// discard recovery progress. In particular, a database clock
+			// rollback can leave a durable timestamp in the future. Persist the
+			// clamped/refilled bucket in this otherwise side-effect-free
+			// transaction, commit it, and report the denial afterwards.
+			bucketRaw, marshalErr := json.Marshal(bucket)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			if _, updateErr := tx.ExecContext(ctx, `UPDATE promotion_import_identity_tenants
+				SET rate_bucket_state = ? WHERE tenant_id = ?`, string(bucketRaw), req.TenantID); updateErr != nil {
+				return fmt.Errorf("persist denied promotion rate state: %w", updateErr)
+			}
+			admissionErr = err
+			return nil
 		}
 		var globalCount, globalMax, globalConfigGeneration uint64
 		if err := tx.QueryRowContext(ctx, `SELECT materialized_identity_count,
@@ -412,6 +430,9 @@ func (s *PromotionStore) AllocateImportID(ctx context.Context, req PromotionAllo
 	})
 	if err != nil {
 		return nil, err
+	}
+	if admissionErr != nil {
+		return nil, admissionErr
 	}
 	return out, nil
 }
@@ -1073,7 +1094,7 @@ func consumePromotionRate(raw sql.NullString, now time.Time, ratePerMinute, burs
 		bucket.UpdatedUnixMilli = now.UnixMilli()
 	}
 	if bucket.TokensMilli < 1000 {
-		return promotionRateBucket{}, ErrPromotionIdentityBudgetExceeded
+		return bucket, ErrPromotionIdentityBudgetExceeded
 	}
 	bucket.TokensMilli -= 1000
 	return bucket, nil

@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -259,6 +260,50 @@ func TestPromotionAllocationRateClampsDurableClockAndBurstChanges(t *testing.T) 
 	}
 	if bucket.TokensMilli != 1000 || bucket.UpdatedUnixMilli != now.UnixMilli() {
 		t.Fatalf("clamped bucket = %+v, want 1000 tokens at current DB time", bucket)
+	}
+}
+
+func TestPromotionAllocationRateDenialPersistsFutureClockRecovery(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+	var before time.Time
+	if err := store.DB().QueryRow(`SELECT CURRENT_TIMESTAMP(3)`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	before = before.UTC().Truncate(time.Millisecond)
+	future := before.Add(time.Hour).UnixMilli()
+	if _, err := store.DB().Exec(`UPDATE promotion_import_identity_tenants
+		SET allocation_rate_burst = 1,
+		    rate_bucket_state = ?
+		WHERE tenant_id = 'tenant-a'`, fmt.Sprintf(`{"tokens_milli":0,"updated_unix_milli":%d}`, future)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
+		TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true,
+		IdempotencyKey: "future-clock-denial", AllocationLease: "allocation-lease",
+	})
+	if !errors.Is(err, ErrPromotionIdentityBudgetExceeded) {
+		t.Fatalf("AllocateImportID error = %v, want ErrPromotionIdentityBudgetExceeded", err)
+	}
+
+	var raw string
+	if err := store.DB().QueryRow(`SELECT rate_bucket_state
+		FROM promotion_import_identity_tenants WHERE tenant_id = 'tenant-a'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var after time.Time
+	if err := store.DB().QueryRow(`SELECT CURRENT_TIMESTAMP(3)`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	after = after.UTC().Truncate(time.Millisecond)
+	var bucket promotionRateBucket
+	if err := json.Unmarshal([]byte(raw), &bucket); err != nil {
+		t.Fatalf("decode durable rate bucket %q: %v", raw, err)
+	}
+	if bucket.TokensMilli != 0 || bucket.UpdatedUnixMilli < before.UnixMilli() || bucket.UpdatedUnixMilli > after.UnixMilli() {
+		t.Fatalf("durable denied bucket = %+v, want zero tokens and timestamp in DB interval [%d,%d]",
+			bucket, before.UnixMilli(), after.UnixMilli())
 	}
 }
 
