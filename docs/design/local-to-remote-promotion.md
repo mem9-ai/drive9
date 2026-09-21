@@ -366,7 +366,7 @@ commit_containment_fence (unset until a provider-authenticated
                           lineage ID, ordered position, and proof digest)
 restore_disposition (`NONE`, `RESTORE_SOURCE`, or `RECOVERY_REQUIRED`)
 source_release (unset, or signed certificate plus restore-floor checkpoint)
-fence_state (`INSTALLING` or `INSTALLED`)
+fence_state (`INSTALLING`, `INSTALLED`, `RELEASED`, or `RECONCILING`)
 phase
 created_at
 updated_at
@@ -381,7 +381,7 @@ matches; it never assumes the pair was atomically written.
 
 The record checksum covers the accepted tuple, complete server observation,
 commit-containment fence when present, restore disposition, source-release
-fields, and phase. `STAGING` and later
+fields, `fence_state`, and phase. `STAGING` and later
 require the accepted tuple returned by the successful or recovered
 `CreateImport`. A terminal observation requires its immutable terminal-result
 digest. `REMOTE_COMMITTED` and later require a complete `COMMITTED` observation
@@ -424,9 +424,15 @@ PREPARED
   -> PUBLISHED_QUARANTINED
   -> LOCAL_CLEANED
   -> DONE
+
+PREPARED | CREATE_REQUESTED | STAGING | STAGED_VERIFIED | COMMIT_REQUESTED
+  -> LOCAL_ABORTED
 ```
 
-No phase transition relies only on an in-memory flag.
+`LOCAL_ABORTED` requires a definitive proof that no target was published: a
+retired allocation decision or the immutable server `ABORTED` result. It is a
+terminal local failure branch, not a server state transition. No phase
+transition relies only on an in-memory flag.
 
 Every accepted-state or terminal response is an input to a durable local
 transition, not permission to mutate local data directly. Before that response
@@ -436,13 +442,19 @@ together with the new phase/disposition, fsyncs the record file, atomically
 renames it, and fsyncs the state directory. A crash before the directory fsync
 leaves the earlier phase authoritative; recovery queries `GetImport` again.
 
-`fence_state` is an orthogonal local durability field, not a server phase. A
-complete record first becomes durable with `fence_state=INSTALLING`; recovery
-must treat that value as requiring both prefixes to remain fenced. The local
-fence manager then confirms that the already-installed registry entry is bound
-to this record, rewrites and fsyncs `fence_state=INSTALLED`, and only then lets
-the normal `PREPARED` workflow continue. Both values are checksummed recovery
-inputs and neither authorizes a remote request.
+`fence_state` is a separate durability dimension, but recovery interprets it
+only as a validated pair with `phase`. A complete record first becomes durable
+with `fence_state=INSTALLING`; the local fence manager confirms that the already-
+installed registry entry is bound to this record, rewrites and fsyncs
+`fence_state=INSTALLED`, and only then lets the normal `PREPARED` workflow
+continue. `INSTALLING`/`INSTALLED` require both prefixes fenced and are valid
+only before user-visible publication. `RELEASED` means this migration owns no
+ordinary registry fence and is valid only at `PUBLISHED_QUARANTINED` or later,
+or at `LOCAL_ABORTED` with a checksum-bound definitive non-publish result.
+`RECONCILING` means a newer restore generation re-acquired both prefixes for
+rollback reconciliation after publication. Every value is checksum-bound to
+phase; an impossible pair fails the affected mount paths closed rather than
+choosing either field as more authoritative.
 
 `PREPARED` means the complete request identity is durable and the coordinator
 has **not** dispatched `CreateImport`. Immediately before the first network
@@ -504,20 +516,42 @@ identity and never deletes by the old user path.
 
 `SOURCE_QUARANTINED` is still inside the synchronous rename boundary. The
 coordinator now publishes the committed target to local inode/cache state,
-rewrites and fsyncs `phase=PUBLISHED_QUARANTINED`, and only then releases the
-source/target user-path fences and returns rename success. This phase is the
-durable proof that the user-visible rename completed while the matching local
-bytes remain safely retained in private quarantine. Certificate acquisition
-and physical quarantine deletion are post-success background GC; backup delay
-or authority unavailability cannot extend the rename syscall after this phase.
+then rewrites and fsyncs the single checksummed record with
+`phase=PUBLISHED_QUARANTINED` **and** `fence_state=RELEASED` while the existing
+in-memory source/target fence is still held. Only after the file and directory
+fsyncs succeed does the fence manager release the registry entry and return
+rename success. A crash before that durable pair leaves `INSTALLED` and recovery
+reinstalls/completes publication; a crash after it sees `RELEASED` and never
+reinstalls the ordinary fence, even if the process died before its in-memory
+release call. This pair is the durable proof that the user-visible rename
+completed while the matching local bytes remain safely retained in private
+quarantine. Certificate acquisition and physical quarantine deletion are post-
+success background GC; backup delay or authority unavailability cannot extend
+the rename syscall after this phase.
+
+The non-publish terminal path uses the same ordering. After a definitive
+retired-allocation or `ABORTED` result, the coordinator fsyncs that exact result
+with `phase=LOCAL_ABORTED` and `fence_state=RELEASED` while the manager entry is
+still held. Only then may it release the registry entry and return the failed
+rename. A crash after that fsync but before the in-memory release does not
+reinstall the fence. Server acknowledgement/identity retirement and local-
+record compaction may follow, but neither is the release linearization point.
 
 Mount startup obtains the tenant's installed restore generation/database
 incarnation before serving paths. For `PUBLISHED_QUARANTINED` with the same
 tuple it reconstructs the published target and starts the janitor without
 reinstalling ordinary user-path fences. If startup or a live generation
 invalidation observes a newer rollback generation, it first installs fences on
-the affected source/target prefixes and persists `RESTORE_SOURCE` or
-`RECOVERY_REQUIRED` before reconciling the retained quarantine. Thus restart
+the affected source/target prefixes, then persists `fence_state=RECONCILING`
+together with `RESTORE_SOURCE` or `RECOVERY_REQUIRED` before reconciling the
+retained quarantine. On restart, `RECONCILING` reinstalls those conditional
+fences. If the matching source is safely restored and the rolled-back target is
+invalidated, one record+directory fsync preserves the newer restore observation/
+disposition and changes `fence_state=RELEASED` before the manager releases the
+conditional fence. If either side is ambiguous, it stays `RECONCILING` and the
+affected paths remain recovery-required. The historical phase need not regress;
+the checksum-bound restore disposition explains why a published operation was
+later rolled back. Thus restart
 does not turn backup retention into a rename stall, while a real restore still
 cannot race source recovery.
 
@@ -556,7 +590,7 @@ the certificate and its bindings. Only then may it call
 because a certificate was issued. A successful or recovered acknowledgement
 permits `phase=DONE` and normal local-record retention/compaction. Neither phase
 publishes the rename or releases user-path fences—the durable
-`PUBLISHED_QUARANTINED` transition already did both. A lost acknowledgement
+`PUBLISHED_QUARANTINED+RELEASED` transition already did both. A lost acknowledgement
 response is retried with the same certificate and never makes the already-
 certified deletion ambiguous.
 
@@ -2126,9 +2160,16 @@ supervisor to finish binding; a provably absent record permits release; an
 ambiguous fsync/read outcome keeps the fence and marks the mount fail-closed
 until the supervisor resolves it. If binding or supervisor startup fails, the
 mount stays fail-closed rather than exposing an unfenced durable migration.
-Process restart scans and installs fences for both fence states before serving
-FUSE. Exactly one registry entry exists per migration, and only terminal
-reconciliation releases it.
+The successful publish path uses the same manager: while its entry is still
+held, it fsyncs the legal pair
+`(phase=PUBLISHED_QUARANTINED,fence_state=RELEASED)` and only then invokes the
+idempotent resolver. The definitive non-publish path likewise fsyncs
+`(phase=LOCAL_ABORTED,fence_state=RELEASED)` while held before resolving the
+entry. Process restart installs ordinary fences only for
+`INSTALLING`/`INSTALLED`; `RELEASED` installs none. A newer restore generation
+may acquire a fresh registry entry and persist `RECONCILING`; restart reinstalls
+that conditional entry until rollback reconciliation durably returns to
+`RELEASED`. Exactly one registry entry exists per migration at a time.
 
 FUSE request cancellation is phase-sensitive. Before the server durably
 accepts `VERIFIED -> COMMITTING`, cancellation stops new work and drives the
@@ -2224,23 +2265,25 @@ The server state is authoritative for publish and accounting outcome:
 | `GetImport` result | Client authority and fence | Server resources and next action | Local-record disposition |
 | --- | --- | --- | --- |
 | not found, or an `ALLOCATED` claim with no import | Source is currently authoritative, but `CREATE_REQUESTED` remains outcome-unknown; keep both paths fenced. | A delayed create may still win. Retry the exact `CreateImport` or serialize with it through `RetireImportAllocation`; lookup absence alone causes no cleanup. | Retain; never release a fence or delete the record from this observation. |
-| `RETIRED` allocation claim or proof-backed `import_id_retired` | Source is authoritative. | Claim/epoch-sequence retirement serialized after every in-flight create loser, so no reservation or stage can appear later. | Fsync a local aborted result, release fences, then remove the active record. |
+| `RETIRED` allocation claim or proof-backed `import_id_retired` | Source is authoritative. | Claim/epoch-sequence retirement serialized after every in-flight create loser, so no reservation or stage can appear later. | Atomically fsync `LOCAL_ABORTED+RELEASED` while fenced, release the manager entry, then remove the local record. |
 | `CREATED` | Source is authoritative; keep both fenced during recovery. | Reservation exists; no or partial stage. Resume with the current durable owner token, take over after expiry, or abort. | Retain until `ABORTED` or a later commit result. |
 | `STAGING` | Source is authoritative; keep both fenced during recovery. | Reservation and partial hidden inline stage remain. Resume/take over or abort. In a future external mode, old control-plane mutations are epoch-fenced and already-issued grants remain isolated/tracked through landing closure plus GC. | Retain. |
 | `VERIFIED` | Source is authoritative; keep both fenced. | Immutable hidden stage and reservation remain. Commit with the same migration ID or abort; no entry mutation is allowed. | Retain. |
 | `COMMITTING` | Outcome is unknown; neither source nor target is released. | Server owns completion; lease expiry and client abort do nothing. Poll `GetImport`; a recovered server worker reaches `COMMITTED` or `ABORTING`. | Retain; never create a second migration ID. |
 | `ABORTING` | Source remains authoritative, but both paths stay fenced until cleanup completes. | Server resumes the row's one durable cleanup attempt: hidden-stage deletion and exactly-once reservation release; no new cleanup attempt, client mutation, or takeover is accepted. A missing attempt tuple is corruption/recovery-required, not permission to guess ownership. | Retain and poll. |
-| `ABORTED` | Source is authoritative; target was not published. | Reservation is released, hidden inline content is gone, and the terminal reason is durable. A future external mode may continue upload/seal cleanup, provider claims, and debt from retained ledgers until `gc_done`. | Fsync the local aborted result, release fences, then acknowledge/retire the active record; the server tombstone remains for retry identity. |
-| `COMMITTED` | Target is authoritative; keep both fenced only through durable source quarantine and local publication. | Quota is settled, sealed content ownership and namespace/outbox result are durable; cleanup of temporary and unowned candidates cannot remove committed versions and continues independently until `gc_done`. The asynchronous containment-fence/source-release workflow may remain pending. | Verify the source-incarnation UUID, quarantine only the matching source, publish inode/cache state, fsync `PUBLISHED_QUARANTINED`, release user-path fences, and return rename success. Physical quarantine deletion is deferred to certificate-authorized background GC. |
+| `ABORTED` | Source is authoritative; target was not published. | Reservation is released, hidden inline content is gone, and the terminal reason is durable. A future external mode may continue upload/seal cleanup, provider claims, and debt from retained ledgers until `gc_done`. | Atomically fsync the immutable result as `LOCAL_ABORTED+RELEASED` while fenced, release the manager entry, then acknowledge/retire the active record; the server tombstone remains for retry identity. |
+| `COMMITTED` | Target is authoritative; keep both fenced only through durable source quarantine and local publication. | Quota is settled, sealed content ownership and namespace/outbox result are durable; cleanup of temporary and unowned candidates cannot remove committed versions and continues independently until `gc_done`. The asynchronous containment-fence/source-release workflow may remain pending. | Verify the source-incarnation UUID, quarantine only the matching source, publish inode/cache state, atomically fsync `PUBLISHED_QUARANTINED+RELEASED`, release user-path fences, and return rename success. Physical quarantine deletion is deferred to certificate-authorized background GC. |
 | unreachable or invalid response | Authority is unresolved; keep both paths fenced or fail the mount closed. | No cleanup, quota release, abort, or new migration is guessed. | Retain and return `promotion_recovery_required`. |
 
-The durable local phase refines, but never overrides, that server result:
-
-Before interpreting `phase`, recovery processes `fence_state`. `INSTALLING`
-and `INSTALLED` both require both prefixes to be installed before FUSE accepts
-requests. `INSTALLING` is completed to `INSTALLED` with the existing fence
-entry; it is never treated as permission to release. A corrupt or ambiguous
-record fails the mount closed.
+The durable local phase refines, but never overrides, that server result.
+Recovery first checksum-validates the record and the **pair**
+`(phase,fence_state)`, then applies one decision: pre-publication
+`INSTALLING`/`INSTALLED` install both ordinary fences;
+`PUBLISHED_QUARANTINED` or later, or `LOCAL_ABORTED`, with `RELEASED` installs none; and
+`RECONCILING` installs the conditional rollback fences. `INSTALLING` is
+completed to `INSTALLED` with the existing manager entry. There is no rule that
+processes `fence_state` independently ahead of phase. A missing, corrupt, or
+illegal pair fails the affected mount paths closed.
 
 | Last durable local phase | Recovery action |
 | --- | --- |
@@ -2250,11 +2293,12 @@ record fails the mount closed.
 | `STAGING` | Reconcile owner epoch and server state before uploading or aborting. |
 | `STAGED_VERIFIED` | Reconcile before commit; do not mutate the frozen manifest. |
 | `COMMIT_REQUESTED` | Query `GetImport`; never retry with a new migration ID or infer failure from disconnect. |
+| `LOCAL_ABORTED` | Requires `RELEASED` plus the checksum-bound retired-allocation or immutable `ABORTED` result. The source remains authoritative, no ordinary fence is installed, and acknowledgement/retirement or local-record compaction may be retried without blocking the paths. |
 | `REMOTE_COMMITTED` | Require the complete durable phase-result binding, fetch `GetImport`, and proceed only if its `COMMITTED` digest and restore tuple still match. Then verify the source-incarnation UUID before quarantine. If a newer emergency-restore generation returns `promotion_restore_rolled_back`, first fsync that observation/disposition and retain or restore only the matching source; never perform destructive cleanup from the old result. |
-| `SOURCE_QUARANTINED` | This is still a synchronous rename phase: reconstruct/publish the committed target, fsync `PUBLISHED_QUARANTINED`, then release fences. A newer rolled-back generation observed first is durably recorded and restores only the matching quarantine or keeps those paths recovery-required. No certificate or physical deletion is needed to finish this transition. |
-| `PUBLISHED_QUARANTINED` | The rename already succeeded and ordinary path fences stay released. With the same installed restore tuple, run only the background containment/source-release janitor and retain quarantine while proof is pending. If mount startup or live invalidation observes a newer rollback generation, install affected-path fences before persisting/reconciling that observation; never unlink from the old result. A valid persisted certificate permits resumable physical deletion even if the terminal row compacted. |
-| `LOCAL_CLEANED` | The matching quarantine is absent and parent fsync is durable; user paths were already released. Retry `AcknowledgeSourceRelease`, then fsync `DONE`. |
-| `DONE` | The committed target is locally published, fences are released, and the source was irreversibly released under the certificate. Retry any lost terminal/source-release acknowledgements and compact the local record only under the configured local recovery-retention policy. |
+| `SOURCE_QUARANTINED` | This is still a synchronous rename phase with `fence_state=INSTALLED`: reconstruct/publish the committed target, atomically fsync `PUBLISHED_QUARANTINED+RELEASED`, then release the manager entry. A newer rolled-back generation observed first is durably recorded and restores only the matching quarantine or keeps those paths recovery-required. No certificate or physical deletion is needed to finish this transition. |
+| `PUBLISHED_QUARANTINED` | With `RELEASED`, the rename already succeeded and ordinary path fences stay released; run only the background containment/source-release janitor and retain quarantine while proof is pending. If mount startup or live invalidation observes a newer rollback generation, acquire both affected prefixes and persist `RECONCILING` before applying rollback; never unlink from the old result. A valid persisted certificate permits resumable physical deletion even if the terminal row compacted. |
+| `LOCAL_CLEANED` | Requires `RELEASED`. The matching quarantine is absent and parent fsync is durable; user paths were already released. Retry `AcknowledgeSourceRelease`, then fsync `DONE+RELEASED`. |
+| `DONE` | Requires `RELEASED`. The committed target is locally published, fences are released, and the source was irreversibly released under the certificate. Retry any lost terminal/source-release acknowledgements and compact the local record only under the configured local recovery-retention policy. |
 | Manifest/record/proof/token missing, corrupt, or mismatched | Fail closed and require repair; do not guess, take over, or delete either tree. |
 
 Once the server reports committed, old uploaders and recovery attempts cannot
@@ -2456,8 +2500,14 @@ Kill and restart before and after:
 - remote commit followed by local quarantine fsync failure;
 - before/after local source quarantine rename, both parent fsyncs, and the
   `SOURCE_QUARANTINED` record+directory fsync;
-- local inode/cache publication, `PUBLISHED_QUARANTINED` record+directory
-  fsync, user-path fence release, rename response, and mount restart;
+- local inode/cache publication, the atomic
+  `PUBLISHED_QUARANTINED+RELEASED` record+directory fsync, the exact boundary
+  after that fsync but before the manager release call, user-path fence release,
+  rename response, and mount restart;
+- the symmetric non-publish transition: definitive retired/`ABORTED` result,
+  atomic `LOCAL_ABORTED+RELEASED` record+directory fsync, the exact boundary
+  after that fsync but before the manager release call, failed-rename response,
+  acknowledgement/retirement, local-record compaction, and mount restart;
 - source-release request, authority floor CAS, certificate response, local
   certificate record+directory fsync, first unlink, each bounded deletion batch,
   final physical local deletion, `LOCAL_CLEANED` record+directory fsync,
@@ -2594,18 +2644,29 @@ tree. Repeated recovery is idempotent.
   that local fsync must strand the recovery anchor under response loss and make
   the mutation test fail;
 - rename lifecycle has one durability boundary: after source quarantine and
-  local publication, `PUBLISHED_QUARANTINED` is directory-fsynced before fence
-  release/response. Restart at that phase serves the completed rename and runs
-  background GC without waiting for a backup or reinstalling ordinary path
-  fences. A backup catalog that stays unavailable forever retains quarantine
-  but does not block the user path. Deleting the phase fsync, treating
-  `SOURCE_QUARANTINED` as success, or reinstalling the original fences at same-
-  generation restart makes the production rename/restart test fail;
+  local publication, the single pair `PUBLISHED_QUARANTINED+RELEASED` is file-
+  and directory-fsynced while the manager entry remains held, before registry
+  release/response. A barrier crashes immediately after that fsync but before
+  the in-memory release call; restart must serve the completed rename with no
+  ordinary fence and run background GC. A backup catalog that stays unavailable
+  forever retains quarantine but does not block the user path. Deleting the
+  phase/state fsync, leaving `fence_state=INSTALLED`, treating
+  `SOURCE_QUARANTINED` as success, or processing stale `INSTALLED` independently
+  of the published phase makes the production rename/restart test fail;
 - the complementary newer-generation restart/live-invalidation fixture fences
-  the affected paths before recording and applying rollback reconciliation;
-  deleting that conditional fence lets a concurrent source/target mutation race
-  quarantine restoration and fails. `LOCAL_CLEANED`/`DONE` mutations never
-  control whether rename was already published;
+  the affected paths, fsyncs `RECONCILING`, and only then applies rollback
+  reconciliation. Crash before its fsync re-derives the need from the newer
+  startup tuple; crash after it reinstalls the conditional fence. Removing that
+  state or changing `RECONCILING -> RELEASED` before the restored source/target
+  outcome is durable lets a concurrent mutation race quarantine restoration and
+  fails. `LOCAL_CLEANED`/`DONE` mutations never control whether rename was
+  already published;
+- the non-publish terminal fixture fsyncs `LOCAL_ABORTED+RELEASED` while its
+  manager entry is held. A barrier crash immediately after that fsync but before
+  the release call must restart with the source authoritative and no ordinary
+  fence. Removing the pair transition, accepting lookup absence as definitive,
+  or reinstalling from the earlier phase makes the failure-path test hang or
+  expose an outcome-unknown create and fail;
 - unrelated target-parent sibling mutation conservatively returns
   `target_precondition_changed`/`EAGAIN` in P0 while the requested child remains
   absent; it never masquerades as `EEXIST`;
@@ -2937,7 +2998,7 @@ external-object adapter:
   tuple is durably recorded before restoring/quarantining/deleting anything;
 - `SOURCE_QUARANTINED` without a valid, checksum-bound source-release
   certificate never unlinks. It first advances to durable
-  `PUBLISHED_QUARANTINED`, releases ordinary path fences, and returns success;
+  `PUBLISHED_QUARANTINED+RELEASED`, releases ordinary path fences, and returns success;
   backup/certificate delay remains background retention. With a certificate,
   restart verifies its tenant/migration/result/containment/source/floor
   bindings and resumes partial cleanup without depending on a compacted
@@ -2994,7 +3055,9 @@ Tests must fail when independently deleting:
   source/target type, self-subtree, or target-emptiness check;
 - the fence manager's idempotent two-prefix resolution on any pre-record error,
   cancellation, or panic path, continuous registry ownership across every
-  persist/bind boundary, or restart adoption of `INSTALLING`/`INSTALLED`;
+  persist/bind boundary, restart adoption of `INSTALLING`/`INSTALLED`, durable
+  release through `PUBLISHED_QUARANTINED+RELEASED` or
+  `LOCAL_ABORTED+RELEASED`, or conditional ownership through `RECONCILING`;
 - the subtree fence;
 - migration idempotency;
 - the parent path-edge incarnation, child-set generation, or absent-child term
@@ -3037,7 +3100,8 @@ Tests must fail when independently deleting:
   release floor/certificate CAS against restore fencing, durable certificate
   fsync before first unlink, certificate binding across every resumed deletion
   batch, durable `LOCAL_CLEANED` before source-release acknowledgement, and
-  durable `PUBLISHED_QUARANTINED` before user-path fence release/rename success;
+  the legal `PUBLISHED_QUARANTINED+RELEASED` pair before user-path fence release/
+  rename success plus `RECONCILING` ownership for newer-generation rollback;
 - full tenant-database PITR after a post-snapshot allocation must not alias the
   old proof with a new operation, even when the restored database is internally
   self-consistent and reuses the same numeric sequence;
