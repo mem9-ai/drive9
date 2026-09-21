@@ -581,7 +581,7 @@ func (s *PromotionStore) scanPromotionTerminalCompactionCandidates(ctx context.C
 	if err != nil {
 		return nil, fmt.Errorf("scan promotion terminal compaction: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var identities []promotion.MigrationIdentity
 	for rows.Next() {
 		var identity promotion.MigrationIdentity
@@ -690,7 +690,7 @@ func (s *PromotionStore) scanPromotionRetirementCandidates(ctx context.Context, 
 	if err != nil {
 		return nil, fmt.Errorf("scan promotion retirement candidates: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []promotionRetirementCandidate
 	for rows.Next() {
 		var candidate promotionRetirementCandidate
@@ -728,7 +728,7 @@ func (s *PromotionStore) retirePromotionCandidate(ctx context.Context, req Promo
 			if err != nil {
 				return err
 			}
-			if now.Before(retireAfter) || (state != "ABORTED" && !(state == "COMMITTED" && sourceRelease == "ACKNOWLEDGED")) {
+			if now.Before(retireAfter) || (state != "ABORTED" && (state != "COMMITTED" || sourceRelease != "ACKNOWLEDGED")) {
 				return nil
 			}
 			deletedTombstone, err := tx.ExecContext(ctx, `DELETE FROM promotion_import_tombstones

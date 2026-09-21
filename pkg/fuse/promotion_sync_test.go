@@ -952,9 +952,10 @@ func newPromotionRecoveryFixture(t *testing.T, phase localPromotionPhase, fence 
 		BackendCapabilityGeneration: 1, ConfigGeneration: 1, PlanExpiresAt: time.Now().Add(time.Hour),
 	}
 	serverState := "COMMITTED"
-	if phase == promotionPhaseStaging {
+	switch phase {
+	case promotionPhaseStaging:
 		serverState = "STAGING"
-	} else if phase == promotionPhaseCommitRequested {
+	case promotionPhaseCommitRequested:
 		serverState = "VERIFIED"
 	}
 	record = &localPromotionRecord{

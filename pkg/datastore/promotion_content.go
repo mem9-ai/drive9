@@ -732,7 +732,7 @@ func selectPromotionEntriesTx(ctx context.Context, tx *sql.Tx, tenantID string, 
 	if err != nil {
 		return nil, fmt.Errorf("lock promotion manifest entries: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var entries []promotionEntryRow
 	for rows.Next() {
 		var entry promotionEntryRow
@@ -760,7 +760,7 @@ func selectPromotionContentsTx(ctx context.Context, tx *sql.Tx, tenantID string,
 	if err != nil {
 		return nil, fmt.Errorf("lock promotion inline contents: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var contents []promotionContentRow
 	for rows.Next() {
 		var content promotionContentRow
@@ -790,7 +790,7 @@ func validatePromotionStagedContentsStreamTx(ctx context.Context, tx *sql.Tx, te
 	if err != nil {
 		return fmt.Errorf("lock promotion inline contents: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	seen := make(map[string]struct{}, len(stored.entriesByContentID))
 	for rows.Next() {
 		var content promotionContentRow
