@@ -253,7 +253,7 @@ The normative request authorization matrix is:
 | First/retried `CreateImport` | Tenant authentication plus `write` on the request target; it must equal the plan and allocation-claim target. Recovery-before-admission does not bypass this check. |
 | `PutInlineImportContent`, future content/grant/complete/seal/attach calls, `VerifyImport`, `RenewImportLease` | Resolve the import under the authenticated tenant, then require current `write` scope on its stored target before reading a body, returning a capability, renewing, or mutating state. |
 | `CommitImport` | Require current `write` scope on the stored target before the `VERIFIED -> COMMITTING` acceptance CAS. |
-| `AbortImport`, `TakeOverImport`, `RetireImportAllocation`, `AcknowledgeImportResult` | Require current `write` scope on the stored or authenticated-proof target in addition to the applicable owner, recovery, or allocation proof. |
+| `AbortImport`, `TakeOverImport`, `RetireImportAllocation`, `AcknowledgeImportResult`, `AuthorizeSourceRelease`, `AcknowledgeSourceRelease` | Require current `write` scope on the stored or authenticated-proof target in addition to the applicable owner, recovery, allocation proof, or source-release certificate. |
 | `GetImport` | Require current `read` scope on the stored or authenticated-proof target plus the applicable allocation proof or recovery token before returning existence, state, target, or result. |
 
 The HTTP dispatcher admits scoped tokens only to import routes whose handler
@@ -265,14 +265,16 @@ and read, even when the caller still has a migration secret. Existing
 client-owned state remains fenced and is eventually aborted by lease/deadline
 GC.
 
-For every mutating API in the table, user authorization is necessary but not
-sufficient: after that check the server obtains a short-lived internal
+For every tenant-DB mutating API in the table, user authorization is necessary
+but not sufficient: after that check the server obtains a short-lived internal
 promotion-writer lease and the datastore transaction applies the locked restore
 guard. This includes first and retried Create recovery, retirement,
 acknowledgement, takeover, and abort paths that might otherwise appear
-idempotent. A stale process cannot use a valid user token or migration secret
-to bypass restore fencing. `GetImport` is read-only and does not require a
-writer lease; any recovery action it suggests still does.
+idempotent. `AuthorizeSourceRelease` instead uses the external authority-record
+CAS that is the restore-fence linearization point; it cannot use a tenant-DB
+writer lease as a substitute. A stale process cannot use a valid user token or
+migration secret to bypass either fence. `GetImport` is read-only and does not
+require a writer lease; any recovery action it suggests still does.
 
 Authorization cannot itself become an existence oracle. Target-bearing
 requests (`PlanImport`, `AllocateImportID`, and first or retried `CreateImport`)
@@ -360,6 +362,7 @@ accepted_server_tuple (restore generation, database incarnation)
 server_observation (import state, terminal-result digest when terminal,
                     restore generation, database incarnation)
 restore_disposition (`NONE`, `RESTORE_SOURCE`, or `RECOVERY_REQUIRED`)
+source_release (unset, or signed certificate plus restore-floor checkpoint)
 fence_state (`INSTALLING` or `INSTALLED`)
 phase
 created_at
@@ -374,13 +377,14 @@ mode `0600` state. Recovery accepts only a complete record whose manifest hash
 matches; it never assumes the pair was atomically written.
 
 The record checksum covers the accepted tuple, complete server observation,
-restore disposition, and phase. `STAGING` and later require the accepted tuple
-returned by the successful or recovered `CreateImport`. A terminal observation
-requires its immutable terminal-result digest. `REMOTE_COMMITTED` and later
-require a complete `COMMITTED` observation whose tuple and digest were written
-in the same record rewrite that advanced the phase. If a later emergency
-restore supersedes that observation, the coordinator does not regress the
-physical phase: it atomically records the newer observation plus
+restore disposition, source-release fields, and phase. `STAGING` and later
+require the accepted tuple returned by the successful or recovered
+`CreateImport`. A terminal observation requires its immutable terminal-result
+digest. `REMOTE_COMMITTED` and later require a complete `COMMITTED` observation
+whose tuple and digest were written in the same record rewrite that advanced
+the phase. If a later emergency restore supersedes that observation before
+source release, the coordinator does not regress the physical phase: it
+atomically records the newer observation plus
 `RESTORE_SOURCE` or `RECOVERY_REQUIRED` and fsyncs it before touching the source
 or quarantine. A phase that requires one of these facts but has a missing,
 zero, corrupt, or mismatched field is fail-closed recovery state, not an old
@@ -477,9 +481,9 @@ and target paths remain fenced and fail closed. A retry of the same
 
 A `COMMITTED` response does not authorize quarantine directly. The coordinator
 first persists `phase=REMOTE_COMMITTED`, `restore_disposition=NONE`, the exact
-`COMMITTED` result digest, and its restore generation/database incarnation in
-one checksummed record rewrite and completes the file and directory fsyncs.
-Only that durable phase-result binding may authorize the quarantine rename.
+`COMMITTED` result digest, and restore generation/database incarnation in one
+checksummed record rewrite and completes the file and directory fsyncs. Only
+that durable phase-result binding may authorize the quarantine rename.
 
 After remote commit, the coordinator atomically renames the physical local
 source into a migration-owned quarantine on the same filesystem:
@@ -489,18 +493,44 @@ overlay/.drive9-promotions/<migration_id>/source
 ```
 
 It then fsyncs the old parent and quarantine parent, rewrites
-`phase=SOURCE_QUARANTINED` while preserving the exact phase-result tuple and
+`phase=SOURCE_QUARANTINED` while preserving the exact phase-result tuple,
 digest, and fsyncs the record and state directory. Cleanup uses the quarantine
-identity and never deletes by the old user path. Before each irreversible
-quarantine deletion pass, it obtains a fresh authorized `GetImport`, requires
-the same `COMMITTED` digest and restore tuple, persists that revalidation, and
-fsyncs it. A newer restore tuple or changed result is persisted first as
-`RESTORE_SOURCE`/`RECOVERY_REQUIRED` and forbids deletion. The old path may
-therefore be recreated as a new generation after the fence is released without
-being hidden or deleted by the old migration. A disaster restore that occurs
-after a completed same-tuple cleanup remains subject to the explicitly declared
-restore-point RPO; the client never hides that loss by applying an unbound old
-result after restart.
+identity and never deletes by the old user path.
+
+No fresh status read can authorize irreversible deletion: it is not atomic
+with emergency restore. Instead the janitor requests a signed source-release
+certificate for the exact migration/result digest and source identity from the
+non-rollback restore authority described below. The authority issues it only
+after the backup catalog attests an ordered restore point containing that exact
+committed result and namespace transaction, then atomically raises the tenant's
+future-restore floor to at least that point while the tenant is `ACTIVE`; the
+certificate and the
+`ACTIVE -> FENCING` transition serialize on the same authority record. The
+janitor verifies and persists the certificate and floor in the checksummed
+record, then completes the file and state-directory fsyncs **before the first
+unlink**. Without that durable certificate it may retain or restore quarantine,
+but may not remove any byte from it.
+
+Once certified, cleanup may delete the matching quarantine incrementally and
+resume after a crash: every later supported same-tenant restore is constrained
+to a restore point at or after the certificate's floor, so that commit cannot
+be rolled back even if the terminal import row has since compacted to a
+tombstone/retired sequence. A newer restore tuple or changed result observed
+before certification is persisted first as `RESTORE_SOURCE`/
+`RECOVERY_REQUIRED` and forbids release. The old path may therefore be
+recreated as a new generation after the fence is released without being hidden
+or deleted by the old migration. Restoring below a previously certified floor
+is an unsupported raw restore that keeps promotion disabled; the platform never
+reports it as a successful emergency restore.
+
+After the matching quarantine is absent and its parent-directory fsync is
+complete, the coordinator rewrites and fsyncs `phase=LOCAL_CLEANED` while
+preserving the certificate and its bindings. Only then may it call
+`AcknowledgeSourceRelease`; the server never retires the release anchor merely
+because a certificate was issued. The coordinator can then publish local inode/
+cache state, fsync `phase=DONE`, and release both path fences. A lost
+acknowledgement response is retried with the same certificate and never makes
+the already-certified deletion ambiguous.
 
 ### Server API sketch
 
@@ -551,6 +581,12 @@ TakeOverImport(migration_id, expected_owner_epoch,
                recovery_token, new_owner_token)
 AcknowledgeImportResult(migration_id, recovery_token,
                         terminal_state, result_digest)
+AuthorizeSourceRelease(migration_id, recovery_token,
+                       committed_result_digest,
+                       source_identity_digest)
+  -> signed_source_release_certificate, future_restore_floor
+AcknowledgeSourceRelease(migration_id, recovery_token,
+                         signed_source_release_certificate)
 ```
 
 Every method is idempotent for the same migration identity and payload. Reuse
@@ -560,6 +596,24 @@ installed restore generation and database incarnation; every terminal response
 also carries the immutable terminal-result digest. They are response metadata
 common to the authenticated tenant, not an existence distinction, so unknown/
 denied responses preserve the non-disclosure contract below.
+`AuthorizeSourceRelease` is idempotent for the exact committed result and uses
+the recovery token plus current target-scope authorization. Drive9 first proves
+the terminal row/result digest, then asks the independent restore authority to
+serialize source release against restore fencing. The backup catalog attests a
+specific ordered restore point that contains that terminal result and namespace
+transaction. A pending catalog proof/retention floor is not permission to clean
+up: the method returns retryable `source_release_pending` with no certificate.
+A conflicting result is recovery-required. The signed certificate remains
+verifiable after terminal-row compaction and cannot be translated to another
+tenant, migration, result, restore floor, or local source identity.
+The server keeps a compact complete-result/source-release retention anchor and
+does not reduce the identity to an ID-only retired sequence until a valid
+certificate digest is acknowledged. `AcknowledgeImportResult` may compact bulk
+row/staging data but cannot remove that anchor while release is pending.
+`AcknowledgeSourceRelease` verifies the certificate and idempotently permits
+normal terminal retirement; response loss retries the same certificate. This
+is storage/recovery retention only—local deletion authority comes from the
+certificate itself, not from acknowledgement success.
 `PlanImport` is side-effect free: it validates the complete bounded canonical
 manifest but creates no import row, reservation, object, or cleanup debt. P0 is
 an absent-target-only protocol: both `PlanImport` and `CreateImport` require
@@ -690,7 +744,13 @@ sacrificed rather than falling back to tenant-DB counters or local clocks.
 The authority record contains tenant ID, current allocation epoch, restore
 generation, database incarnation, admission state (`ACTIVE` or `FENCING`),
 allocation-lease generation, writer generation, and the latest outstanding
-expiry for both lease families. It issues:
+expiry for both lease families. It also contains a monotonic
+`future_restore_floor` in the tenant database/backup lineage. Every committed
+result can be proven present by an attested catalog restore point that contains
+both its terminal result and atomic namespace/quota/outbox transaction. A same-
+tenant planned or emergency restore may select only a catalog restore point at
+or after the durable floor; retaining older raw backup media does not make it a
+supported platform restore. It issues:
 
 - short-lived allocation leases used only by `AllocateImportID`; and
 - short-lived promotion-writer leases, classified as `NORMAL`,
@@ -715,6 +775,25 @@ values different; an attempt created by the restore controller while already
 validate the two fields against their own rows and never infer one from the
 other. A drain lease cannot create an import, accept content, verify, renew/take
 over ownership, or acquire unrelated work.
+
+Source release and restore fencing serialize on the same authority-record CAS.
+While `ACTIVE`, Drive9 may request a certificate for an exact committed result
+and local source-identity digest. The backup catalog must first attest an
+ordered usable restore point whose snapshot contains that exact terminal result
+and committed namespace/quota/outbox effects. The winning CAS raises
+`future_restore_floor` to the maximum of its old value and that restore point
+and signs a certificate over the tenant, migration identity, result digest,
+source identity, attested restore point, and new floor. The certificate is
+irrevocable, carries its signing-key version, and is statelessly verifiable
+under a versioned, non-rollback authority trust root for the protocol-
+compatibility lifetime. Key rotation may stop signing with an old key but
+cannot make already-issued certificates unverifiable; if that guarantee cannot
+be maintained, the authority must idempotently reissue the exact durable
+release decision under a current key before any cleanup resumes. If
+`ACTIVE -> FENCING` wins first, no certificate is issued; if source release wins
+first, every later same-tenant restore is constrained by the raised floor. The
+authority never issues certificates from `FENCING`, and it never lowers the
+floor during restore, PITR, clone, rollback, or key rotation.
 
 `RESTORE_RECONCILE` is separate from drain. It is issued only after an
 emergency snapshot has been installed into a **new** database incarnation in
@@ -768,7 +847,10 @@ not advisory documentation.
 
 1. CAS the external authority from `ACTIVE` to `FENCING`, advance to a distinct
    fence-writer generation, stop routing new promotion API calls/workers for
-   the tenant, and stop issuing allocation and `NORMAL` writer leases.
+   the tenant, and stop issuing allocation, `NORMAL` writer, and source-release
+   grants. The same CAS records a selected restore point whose checkpoint is at
+   or after the current `future_restore_floor`; a stale point is rejected before
+   DB fencing begins.
 2. Using a signed fence grant, transactionally lock the old tenant DB restore-
    capability row and change it from the prior `ACTIVE` writer generation to
    `DRAINING` at the new fence generation. A transaction that locked the row
@@ -803,8 +885,11 @@ unreachable. It does not require a successful SQL write or inventory scan on
 that DB, but it requires a stronger DB-control-plane fence:
 
 1. The external authority enters `FENCING`, stops all promotion lease issuance,
-   and records the selected backup/restore point and its RPO boundary. The DB
-   control plane permanently removes the old database incarnation from tenant
+   stops source-release issuance, and records the selected backup/restore point
+   and its RPO boundary. Selection and `ACTIVE -> FENCING` are one CAS and the
+   point's checkpoint must be at or after the current `future_restore_floor`;
+   otherwise emergency restore cannot start. The DB control plane permanently
+   removes the old database incarnation from tenant
    routing, revokes its generation-scoped credentials at the service boundary,
    and records that it can never again be authoritative for this tenant. The
    restored DB is created under a new endpoint/credential/incarnation; an old
@@ -1554,6 +1639,7 @@ promotion_identity_epoch_authority(
   allocation_lease_generation, max_allocation_lease_not_after,
   writer_generation, max_writer_lease_not_after,
   database_incarnation, restore_mode, selected_restore_point,
+  future_restore_floor,
   retired_database_incarnation, old_incarnation_fence_proof_digest,
   install_grant_digest, reconciliation_digest, updated_at,
   primary key (tenant_id)
@@ -1576,7 +1662,9 @@ imports(
   commit_attempt_id, commit_writer_generation,
   cleanup_attempt_id, cleanup_writer_generation, terminal_reason,
   committed_root_inode, committed_generation, terminal_result_blob,
-  terminal_result_digest, terminal_at, result_acknowledged_at,
+  terminal_result_digest, source_release_state,
+  source_release_certificate_digest, source_release_floor,
+  terminal_at, result_acknowledged_at,
   full_row_compact_not_before, retire_after, created_at, updated_at,
   primary key (tenant_id, allocation_epoch, allocation_sequence),
   check (
@@ -1664,7 +1752,9 @@ import_tombstones(
   allocation_proof_digest,
   target_path, request_digest, owner_token_hash,
   recovery_token_hash, terminal_state,
-  terminal_result_blob, terminal_result_digest, retire_after,
+  terminal_result_blob, terminal_result_digest,
+  source_release_state, source_release_certificate_digest,
+  source_release_floor, retire_after,
   primary key (tenant_id, allocation_epoch, allocation_sequence)
 )
 
@@ -1779,14 +1869,25 @@ also compacted. The compact tombstone therefore stores the canonical target
 and complete immutable terminal result needed to reauthorize and answer
 `GetImport` or an idempotent acknowledgement retry, not merely a digest.
 
+For `COMMITTED`, compaction also preserves the source-release state. Until a
+valid source-release certificate digest is acknowledged, the compact tombstone
+retains the complete result and remains a charged materialized identity; it
+cannot collapse to ID-only retirement at `retire_after`. This is bounded by the
+same tenant/global materialized-identity admission caps rather than an
+unmetered permanent row. A lost certificate response can be retried, and a lost
+acknowledgement can resubmit the persisted certificate. Once acknowledged, the
+ordinary retirement window applies.
+
 Only terminalization assigns `retire_after = terminal_at +` the configured
 maximum offline-recovery window. The tenant-bound migration ID, canonical
 target, request digest, recovery-token hash, terminal state, result, and result
 digest remain in `import_tombstones` until that time. During the interval,
 `CreateImport` conflicts and an authorized `GetImport` returns the same terminal
-result. At `retire_after`, the server atomically marks the allocation sequence
-retired inside its allocation epoch before deleting the result tombstone and
-its linked accepted claim. An out-of-order retirement inserts one sparse
+result. At `retire_after`, an `ABORTED` result or a `COMMITTED` result whose
+source-release certificate was acknowledged atomically marks the allocation
+sequence retired inside its allocation epoch before deleting the result
+tombstone and its linked accepted claim. A release-pending `COMMITTED` result
+remains charged and retained. An out-of-order retirement inserts one sparse
 `retired_import_sequences` row for that epoch in the same transaction. Epoch
 counter rows initialize with `last_issued_sequence=retired_through=0`, and
 sequence zero is never issued. Every retirement locks the exact tenant/epoch
@@ -1820,8 +1921,10 @@ fail-closed result. Neither is ever treated as new. Recovery beyond the
 documented maximum offline window therefore remains deterministic through
 `GetImport` without retaining one permanent database row per allocation.
 
-For a future external mode, result-tombstone compaction at `retire_after` also
-creates or retains a separate minimal internal migration/tenant cleanup anchor.
+For a future external mode, once the terminal result is eligible for retirement
+(including source-release acknowledgement for `COMMITTED`), result-tombstone
+compaction at `retire_after` also creates or retains a separate minimal internal
+migration/tenant cleanup anchor.
 That cleanup anchor cannot be deleted until every write grant, upload attempt,
 and unowned seal candidate is `gc_done`, every landing/provider-mutation closure
 bound has passed, and every corresponding debt charge is released. A provider
@@ -2019,11 +2122,13 @@ must carry the complete durable `COMMITTED` observation—state, terminal-result
 digest, restore generation, and database incarnation—that justified the phase.
 Missing or corrupt accepted/result tuples keep both prefixes fenced. Recovery
 then performs an authorized `GetImport`: an exact tuple+digest match may resume
-the recorded local action, while a newer tuple or different result is first
-written and directory-fsynced with `RESTORE_SOURCE` or `RECOVERY_REQUIRED`.
-Only after that durable rewrite may recovery restore a matching quarantine;
-it never deletes or hides source state based on an observation that exists only
-in process memory.
+the reversible recorded local action, while a newer tuple or different result
+is first written and directory-fsynced with `RESTORE_SOURCE` or
+`RECOVERY_REQUIRED`. Only after that durable rewrite may recovery restore a
+matching quarantine. Irreversible deletion additionally requires the persisted
+source-release certificate; a matching status read alone is never sufficient.
+Recovery never deletes or hides source state based on an observation that
+exists only in process memory.
 
 The server state is authoritative for publish and accounting outcome:
 
@@ -2037,7 +2142,7 @@ The server state is authoritative for publish and accounting outcome:
 | `COMMITTING` | Outcome is unknown; neither source nor target is released. | Server owns completion; lease expiry and client abort do nothing. Poll `GetImport`; a recovered server worker reaches `COMMITTED` or `ABORTING`. | Retain; never create a second migration ID. |
 | `ABORTING` | Source remains authoritative, but both paths stay fenced until cleanup completes. | Server resumes the row's one durable cleanup attempt: hidden-stage deletion and exactly-once reservation release; no new cleanup attempt, client mutation, or takeover is accepted. A missing attempt tuple is corruption/recovery-required, not permission to guess ownership. | Retain and poll. |
 | `ABORTED` | Source is authoritative; target was not published. | Reservation is released, hidden inline content is gone, and the terminal reason is durable. A future external mode may continue upload/seal cleanup, provider claims, and debt from retained ledgers until `gc_done`. | Fsync the local aborted result, release fences, then acknowledge/retire the active record; the server tombstone remains for retry identity. |
-| `COMMITTED` | Target is authoritative; keep both fenced until source reconciliation finishes. | Quota is settled, sealed content ownership and namespace/outbox result are durable; cleanup of temporary and unowned candidates cannot remove committed versions and continues independently until `gc_done`. | Verify the source-incarnation UUID, quarantine only the matching source, publish inode/cache state, fsync `DONE`, release fences, then acknowledge/retire the active record. |
+| `COMMITTED` | Target is authoritative; keep both fenced until source reconciliation finishes. | Quota is settled, sealed content ownership and namespace/outbox result are durable; cleanup of temporary and unowned candidates cannot remove committed versions and continues independently until `gc_done`. | Verify the source-incarnation UUID and quarantine only the matching source. Physical quarantine deletion is deferred until a source-release certificate is durably recorded; it is not required to publish inode/cache state, fsync the reversible local phase, or release user-path fences. |
 | unreachable or invalid response | Authority is unresolved; keep both paths fenced or fail the mount closed. | No cleanup, quota release, abort, or new migration is guessed. | Retain and return `promotion_recovery_required`. |
 
 The durable local phase refines, but never overrides, that server result:
@@ -2057,7 +2162,9 @@ record fails the mount closed.
 | `STAGED_VERIFIED` | Reconcile before commit; do not mutate the frozen manifest. |
 | `COMMIT_REQUESTED` | Query `GetImport`; never retry with a new migration ID or infer failure from disconnect. |
 | `REMOTE_COMMITTED` | Require the complete durable phase-result binding, fetch `GetImport`, and proceed only if its `COMMITTED` digest and restore tuple still match. Then verify the source-incarnation UUID before quarantine. If a newer emergency-restore generation returns `promotion_restore_rolled_back`, first fsync that observation/disposition and retain or restore only the matching source; never perform destructive cleanup from the old result. |
-| `SOURCE_QUARANTINED` | Require the same complete binding and fresh matching server result before cleanup. A janitor removes only the matching migration-owned quarantine identity after persisting that revalidation. With a newer rolled-back generation, first fsync the superseding observation, then atomically restore only that matching quarantine if the destination remains safe; otherwise keep the affected paths fenced/recovery-required. |
+| `SOURCE_QUARANTINED` | Require the same complete binding. Without a valid persisted source-release certificate, retain the matching quarantine and request/recover the certificate; no same-tuple status read permits unlink. With a certificate, verify its tenant/migration/result/source/floor bindings and resume idempotent deletion even if the terminal row compacted. With a newer rolled-back generation before certification, first fsync the superseding observation, then atomically restore only that matching quarantine if the destination remains safe; otherwise keep the affected paths fenced/recovery-required. |
+| `LOCAL_CLEANED` | Require the complete binding and valid persisted source-release certificate, verify the matching quarantine is absent, and retry `AcknowledgeSourceRelease`. Republish local inode/cache state idempotently, fsync `DONE`, and only then release both path fences. |
+| `DONE` | The committed target is locally published and the source is irreversibly released under the certificate. Retry any lost terminal/source-release acknowledgements, remove stale fence-registry ownership, and compact the local record only under the configured local recovery-retention policy. |
 | Manifest/record/proof/token missing, corrupt, or mismatched | Fail closed and require repair; do not guess, take over, or delete either tree. |
 
 Once the server reports committed, old uploaders and recovery attempts cannot
@@ -2205,6 +2312,12 @@ owner.
 - the real API sequence `PlanImport` -> `CreateImport(full manifest)` ->
   `PutInlineImportContent*` -> `VerifyImport` -> `CommitImport` round-trips an
   empty directory, symlink text, mode, mtime, zero-byte file, and nonempty file;
+- before an attested backup point contains a committed result and namespace
+  transaction, `AuthorizeSourceRelease` returns pending, leaves the restore
+  floor unchanged, and no local unlink occurs. After attestation it returns a
+  certificate bound to tenant/migration/result/source/floor; cross-tenant,
+  result, source, floor, and signature mutations fail before cleanup or
+  acknowledgement;
 - empty, empty-directory-only, and symlink-only manifests verify directly from
   `CREATED`; a manifest with any unbound regular file fails verification and
   remains in its original state;
@@ -2244,8 +2357,10 @@ Kill and restart before and after:
 - remote commit followed by local quarantine fsync failure;
 - before/after local source quarantine rename, both parent fsyncs, and the
   `SOURCE_QUARANTINED` record+directory fsync;
-- fresh pre-delete `GetImport`, durable same-result revalidation, and physical
-  local deletion;
+- source-release request, authority floor CAS, certificate response, local
+  certificate record+directory fsync, first unlink, each bounded deletion batch,
+  final physical local deletion, `LOCAL_CLEANED` record+directory fsync,
+  source-release acknowledgement, `DONE` fsync, and fence release;
 - inode/cache publication.
 
 Before any future external-object adapter is enabled, additionally kill and
@@ -2352,6 +2467,26 @@ tree. Repeated recovery is idempotent.
   before the corresponding record+directory fsync. Each mutation must either
   expose an unbound old success or destroy rolled-back source state and make the
   test fail;
+- source release versus emergency restore has two deterministic authority-CAS
+  winners. If `ACTIVE -> FENCING` wins, certificate issuance fails, a paused
+  janitor performs zero unlink even after its earlier G1 status/record fsync,
+  and G2 rollback retains or restores the matching quarantine. If source
+  release wins, the certificate and raised restore floor are durable before
+  the first unlink; emergency restore refuses every older snapshot and may use
+  only an attested point at/after the floor, so G2 cannot roll that import back;
+- the release-first case pauses after each entry in a multi-entry quarantine,
+  crashes, restarts, and resumes using the same certificate. Removing the
+  authority CAS/floor check, accepting a raw older restore point, deleting the
+  local certificate fsync, or allowing any unlink without a certificate makes
+  the restore-first fixture delete the only authoritative source and fail;
+- lost response before/after the source-release floor CAS and before/after
+  `AcknowledgeSourceRelease` returns the same valid decision without lowering
+  the floor or double-retiring identity state. A release-pending committed
+  tombstone survives `retire_after`, remains charged to materialized-identity
+  capacity, and becomes retireable only after `LOCAL_CLEANED` was durably
+  recorded and the certificate was acknowledged. Moving acknowledgement before
+  that local fsync must strand the recovery anchor under response loss and make
+  the mutation test fail;
 - unrelated target-parent sibling mutation conservatively returns
   `target_precondition_changed`/`EAGAIN` in P0 while the requested child remains
   absent; it never masquerades as `EEXIST`;
@@ -2488,10 +2623,11 @@ The remaining P0/FUSE concurrency cases are:
   correct migration ID, allocation proof, or owner/recovery token, every client
   continuation is reauthorized: inline/external content and grant calls,
   verify, renew, commit acceptance, abort, takeover, retirement,
-  acknowledgement, and status read all return the canonical authorization
-  error and make no state, lease, capability, body-read, quota, or storage
-  mutation. `GetImport` does not leak the import's existence, target, or result
-  to the denied caller;
+  result/source-release acknowledgement, source-release authorization, and
+  status read all return the canonical authorization error and make no state,
+  lease, capability, restore-floor, body-read, quota, or storage mutation.
+  `GetImport` does not leak the import's existence, target, or result to the
+  denied caller;
 - the complementary allowed-scope cases succeed, and every continuation
   authorizes the server-stored target rather than a caller-supplied path. An
   exact method/path dispatcher matrix admits scoped credentials only to import
@@ -2641,6 +2777,10 @@ external-object adapter:
   requires a control-plane proof that the unavailable old database endpoint,
   credentials, and incarnation are permanently isolated before it installs a
   new monotonic epoch/restore/database/writer tuple as `RECOVERING`;
+- restore selection is also refused below the authority's monotonic future-
+  restore floor. Source-release issuance and `ACTIVE -> FENCING` share one CAS;
+  removing that serialization makes the restore-versus-local-cleanup winner
+  test delete authoritative source state;
 - promotion stays disabled through restore reconciliation. Planned restore
   activates only a terminal snapshot; emergency restore activates only after
   every restored import is terminal and the quota/staging/namespace audits
@@ -2674,6 +2814,10 @@ external-object adapter:
   server-observation tuple, or terminal-result digest fail closed before
   quarantine or cleanup. A same-tuple restart resumes, while a newer restore
   tuple is durably recorded before restoring/quarantining/deleting anything;
+- `SOURCE_QUARANTINED` without a valid, checksum-bound source-release
+  certificate never unlinks. With one, restart verifies the certificate's
+  tenant/migration/result/source/floor bindings and resumes partial cleanup
+  without depending on a compacted terminal row;
 - successful publish followed immediately by recreating the old path creates a
   new source-incarnation UUID that quarantine cleanup cannot hide or delete;
 - a fake local filesystem reuses the same `(st_dev, st_ino)` after
@@ -2760,8 +2904,10 @@ Tests must fail when independently deleting:
   zero-nonterminal audit, and local restore-generation mismatch handling;
 - the local record's accepted/result restore tuple and terminal-result digest,
   their checksum binding to phase/disposition, record+directory fsync before
-  quarantine or deletion, and fresh same-tuple revalidation before irreversible
-  quarantine cleanup;
+  quarantine, the non-rollback source-release floor/certificate CAS against
+  restore fencing, durable certificate fsync before first unlink, certificate
+  binding across every resumed deletion batch, and durable `LOCAL_CLEANED`
+  before source-release acknowledgement;
 - full tenant-database PITR after a post-snapshot allocation must not alias the
   old proof with a new operation, even when the restored database is internally
   self-consistent and reuses the same numeric sequence;
@@ -2819,8 +2965,11 @@ independently deleting:
   CAS gate is ready, whose non-rollback promotion-identity authority and
   planned restore fence is operational, and—when production DR is advertised—
   whose emergency old-incarnation isolation plus inline reconciliation gate is
-  operational. The complete manifest must receive a `db9_inline` plan; record
-  promotion outcomes, duration, bytes, entries,
+  operational. The real backup-catalog adapter must also attest ordered restore
+  points and enforce the monotonic future-restore floor before local quarantine
+  deletion is enabled; without it, quarantine retention is mandatory. The
+  complete manifest must receive a `db9_inline` plan; record promotion outcomes,
+  duration, bytes, entries,
   storage mode, identity-epoch admission failures, unsupported-provider
   rejections, conflicts, and recovery actions.
 - Do not enable object-backed promotion merely because traffic is proxied.
