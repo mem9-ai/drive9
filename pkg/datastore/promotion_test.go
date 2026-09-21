@@ -45,6 +45,16 @@ func (a *promotionTestAuthorizer) AuthorizePromotionWrite(_ context.Context, _, 
 	return nil
 }
 
+func (a *promotionTestAuthorizer) AuthorizePromotionRead(_ context.Context, _, target string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.targets = append(a.targets, target)
+	if a.denied {
+		return errors.New("scope denied")
+	}
+	return nil
+}
+
 func testPromotionLimits() promotion.ManifestLimits {
 	return promotion.ManifestLimits{
 		MaxEntries: 64, MaxMetadataBytes: 64 << 10, MaxTotalInlineBytes: 64 << 10,

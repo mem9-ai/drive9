@@ -38,6 +38,7 @@ const promotionGlobalCapacityKey = "promotion-imports"
 // Implementations must enforce the current request's tenant and target write
 // scope; possession of a plan, proof, or token is not authorization.
 type PromotionAuthorizer interface {
+	AuthorizePromotionRead(ctx context.Context, tenantID, canonicalTarget string) error
 	AuthorizePromotionWrite(ctx context.Context, tenantID, canonicalTarget string) error
 }
 

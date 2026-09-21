@@ -57,6 +57,7 @@ type PromotionVerifyRequest struct {
 
 type promotionOwnerImport struct {
 	identity                       promotion.MigrationIdentity
+	allocationProofDigest          string
 	target                         string
 	manifestHash                   string
 	entryTotal                     uint64
@@ -77,6 +78,7 @@ type promotionOwnerImport struct {
 	stateVersion                   uint64
 	ownerEpoch                     uint64
 	ownerTokenHash                 string
+	recoveryTokenHash              string
 	activityDeadline               time.Time
 	leaseExpiresAt                 time.Time
 	terminalReason                 sql.NullString
@@ -84,6 +86,8 @@ type promotionOwnerImport struct {
 	commitWriterGeneration         sql.NullInt64
 	cleanupAttemptID               sql.NullString
 	cleanupWriterGeneration        sql.NullInt64
+	terminalResultBlob             sql.NullString
+	terminalResultDigest           sql.NullString
 }
 
 type promotionEntryRow struct {
@@ -555,27 +559,29 @@ func (s *PromotionStore) lockPromotionMutationGuard(ctx context.Context, tx *sql
 
 func (s *PromotionStore) lockPromotionOwnerImport(ctx context.Context, tx *sql.Tx, tenantID string, identity promotion.MigrationIdentity) (*promotionOwnerImport, error) {
 	row := &promotionOwnerImport{identity: identity}
-	err := tx.QueryRowContext(ctx, `SELECT target_path, manifest_hash, entry_total, byte_total,
+	err := tx.QueryRowContext(ctx, `SELECT allocation_proof_digest, target_path, manifest_hash, entry_total, byte_total,
 		max_content_size, storage_mode, inline_threshold, namespace_cas_epoch,
 		accepted_restore_generation, accepted_database_incarnation, accepted_writer_generation,
 		quota_reservation_id, target_parent_inode, target_parent_path,
 		target_parent_edge_incarnation, target_parent_children_generation,
-		state, state_version, owner_epoch, owner_token_hash,
+		state, state_version, owner_epoch, owner_token_hash, recovery_token_hash,
 		activity_deadline, lease_expires_at, terminal_reason,
 		commit_attempt_id, commit_writer_generation,
-		cleanup_attempt_id, cleanup_writer_generation
+		cleanup_attempt_id, cleanup_writer_generation,
+		terminal_result_blob, terminal_result_digest
 		FROM promotion_imports
 		WHERE tenant_id = ? AND allocation_epoch = ? AND allocation_sequence = ? FOR UPDATE`,
 		tenantID, identity.AllocationEpoch, identity.AllocationSequence).
-		Scan(&row.target, &row.manifestHash, &row.entryTotal, &row.byteTotal,
+		Scan(&row.allocationProofDigest, &row.target, &row.manifestHash, &row.entryTotal, &row.byteTotal,
 			&row.maxContentSize, &row.storageMode, &row.inlineThreshold, &row.namespaceCASEpoch,
 			&row.acceptedRestoreGeneration, &row.acceptedDatabaseIncarnation, &row.acceptedWriterGeneration,
 			&row.quotaReservationID, &row.targetParentInode, &row.targetParentPath,
 			&row.targetParentEdgeIncarnation, &row.targetParentChildrenGeneration,
-			&row.state, &row.stateVersion, &row.ownerEpoch, &row.ownerTokenHash,
+			&row.state, &row.stateVersion, &row.ownerEpoch, &row.ownerTokenHash, &row.recoveryTokenHash,
 			&row.activityDeadline, &row.leaseExpiresAt, &row.terminalReason,
 			&row.commitAttemptID, &row.commitWriterGeneration,
-			&row.cleanupAttemptID, &row.cleanupWriterGeneration)
+			&row.cleanupAttemptID, &row.cleanupWriterGeneration,
+			&row.terminalResultBlob, &row.terminalResultDigest)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
