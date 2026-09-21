@@ -2128,12 +2128,14 @@ the coordinator drains existing work and validates the tree.
 For the restricted preview, any open source file or directory handle, pending
 writeback, mmap, or concurrent mutation fails before remote staging begins.
 
-The fence is acquired before preflight and remains held until remote commit is
-known, the local source has been quarantined, and inode/cache publication is
-complete. Recovery rebuilds all fences from migration records before accepting
-FUSE requests. Normal commit queues and uploaders cannot enqueue work under the
-fenced prefixes; the import uploader is exempt only through its migration ID
-and internal capability.
+The fence is acquired before preflight and remains held until the coordinator
+durably records one of the legal `...+RELEASED` terminal-local pairs. Before
+accepting FUSE requests, recovery scans and checksum-validates every migration
+record, but installs a registry fence only when its validated
+`(phase,fence_state)` requires `INSTALLING`, `INSTALLED`, or `RECONCILING`.
+Scanning a `RELEASED` record is not permission to install a fence. Normal commit
+queues and uploaders cannot enqueue work under fenced prefixes; the import
+uploader is exempt only through its migration ID and internal capability.
 
 Fence ownership is structured but does **not** assume disk and memory can be
 updated atomically. One mount-local fence manager owns the same registry entry
@@ -2234,8 +2236,14 @@ generation CAS. The generic import path must not bypass Git routing.
 
 ## Recovery Rules
 
-On a restart with the same local root, recovery restores all migration fences
-and queries the server by `migration_id` before serving affected paths.
+On a restart with the same local root, recovery scans and validates every local
+migration record before serving paths. It restores ordinary or conditional
+fences only for legal `(phase,fence_state)` pairs that own one; it does not
+fence `PUBLISHED_QUARANTINED+RELEASED`, `LOCAL_ABORTED+RELEASED`, or later
+released records. Records that still own a fence query the server by
+`migration_id` before serving their affected paths. Released records may resume
+non-blocking acknowledgement, retention, or background-GC work without
+reinstalling a path fence.
 
 Every status/terminal response includes the installed restore generation and
 database incarnation. If either is newer than the tuple in the local record,
@@ -2653,6 +2661,13 @@ tree. Repeated recovery is idempotent.
   phase/state fsync, leaving `fence_state=INSTALLED`, treating
   `SOURCE_QUARANTINED` as success, or processing stale `INSTALLED` independently
   of the published phase makes the production rename/restart test fail;
+- startup recovery contains both an unfinished `SOURCE_QUARANTINED+INSTALLED`
+  record and completed `PUBLISHED_QUARANTINED+RELEASED` and
+  `LOCAL_ABORTED+RELEASED` records. Instrumentation must prove that the scanner
+  reads and validates all three, schedules the released records' non-blocking
+  janitor/acknowledgement work, and calls the registry fence installer only for
+  the unfinished record. A mutant that skips released records or installs a
+  fence merely because a migration record exists must fail;
 - the complementary newer-generation restart/live-invalidation fixture fences
   the affected paths, fsyncs `RECONCILING`, and only then applies rollback
   reconciliation. Crash before its fsync re-derives the need from the newer
@@ -2985,7 +3000,10 @@ external-object adapter:
 
 ### Local recovery and reuse
 
-- recovery reinstalls fences before the first lookup;
+- recovery scans and validates every record before the first lookup, but
+  reinstalls fences only for legal `INSTALLING`/`INSTALLED`/`RECONCILING`
+  ownership. `RELEASED` records remain visible to recovery without acquiring a
+  registry fence;
 - a crash in `PREPARED` proves the request was never dispatched and retires the
   allocation claim before releasing fences; a crash in `CREATE_REQUESTED`
   treats Create as outcome-unknown, and deleting that phase fsync or treating a
