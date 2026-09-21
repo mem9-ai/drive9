@@ -84,10 +84,15 @@ type PromotionStoreConfig struct {
 	Authorizer        PromotionAuthorizer
 	LeaseVerifier     PromotionLeaseVerifier
 	RuntimeCapability func(tenantID string) promotion.StorageCapability
-	Limits            promotion.ManifestLimits
-	AllocationTTL     time.Duration
-	ActivityTTL       time.Duration
-	LeaseTTL          time.Duration
+	// WriterProtocol is the namespace mutation protocol implemented by this
+	// process. Deployment raises the durable minimum only after schema
+	// migration and drains older processes/connections; every promotion entry
+	// point then fails closed before mutation when this value is too old.
+	WriterProtocol uint64
+	Limits         promotion.ManifestLimits
+	AllocationTTL  time.Duration
+	ActivityTTL    time.Duration
+	LeaseTTL       time.Duration
 }
 
 // PromotionStore owns the Plan/Allocate/Create transaction boundary.
@@ -173,6 +178,9 @@ func NewPromotionStore(store *Store, cfg PromotionStoreConfig) (*PromotionStore,
 	if store == nil || cfg.Planner == nil || cfg.ProofSigner == nil || cfg.Authorizer == nil || cfg.LeaseVerifier == nil || cfg.RuntimeCapability == nil {
 		return nil, fmt.Errorf("%w: promotion store dependencies are required", ErrPromotionDisabled)
 	}
+	if cfg.WriterProtocol == 0 {
+		return nil, fmt.Errorf("%w: promotion writer protocol is required", ErrPromotionDisabled)
+	}
 	if cfg.AllocationTTL <= 0 || cfg.ActivityTTL <= 0 || cfg.LeaseTTL <= 0 || cfg.LeaseTTL > cfg.ActivityTTL {
 		return nil, fmt.Errorf("%w: invalid promotion deadlines", ErrPromotionDisabled)
 	}
@@ -187,6 +195,13 @@ func (s *PromotionStore) PlanImport(ctx context.Context, req promotion.PlanImpor
 		return nil, err
 	}
 	if err := s.cfg.Authorizer.AuthorizePromotionWrite(ctx, req.TenantID, target); err != nil {
+		return nil, err
+	}
+	namespace, err := s.readPromotionNamespaceCapability(ctx, req.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requirePromotionWriterProtocol(namespace); err != nil {
 		return nil, err
 	}
 	capability, err := s.readPromotionStorageCapability(ctx, req.TenantID)
@@ -230,6 +245,13 @@ func (s *PromotionStore) AllocateImportID(ctx context.Context, req PromotionAllo
 	err = s.store.InTx(ctx, func(tx *sql.Tx) error {
 		tenant, err := s.lockPromotionIdentityTenant(ctx, tx, req.TenantID)
 		if err != nil {
+			return err
+		}
+		namespace, err := s.lockPromotionNamespaceCapability(ctx, tx, req.TenantID)
+		if err != nil {
+			return err
+		}
+		if err := s.requirePromotionWriterProtocol(namespace); err != nil {
 			return err
 		}
 		now, err := promotionDatabaseTime(ctx, tx)
@@ -407,6 +429,9 @@ func (s *PromotionStore) CreateImport(ctx context.Context, req PromotionCreateRe
 		}
 		namespace, err := s.lockPromotionNamespaceCapability(ctx, tx, req.TenantID)
 		if err != nil {
+			return err
+		}
+		if err := s.requirePromotionWriterProtocol(namespace); err != nil {
 			return err
 		}
 		now, err := promotionDatabaseTime(ctx, tx)
@@ -724,6 +749,7 @@ func (s *PromotionStore) requirePromotionNormalWriterLease(ctx context.Context, 
 type promotionNamespaceCapability struct {
 	ready                  bool
 	epoch                  uint64
+	minimumWriterProtocol  uint64
 	restoreGeneration      uint64
 	databaseIncarnation    string
 	writerGeneration       uint64
@@ -733,13 +759,38 @@ type promotionNamespaceCapability struct {
 	rootChildrenGeneration uint64
 }
 
+func (s *PromotionStore) readPromotionNamespaceCapability(ctx context.Context, tenantID string) (promotionNamespaceCapability, error) {
+	var out promotionNamespaceCapability
+	err := s.store.db.QueryRowContext(ctx, `SELECT namespace_cas_ready, namespace_cas_epoch,
+		minimum_writer_protocol, restore_generation, database_incarnation, writer_generation,
+		admission_state, root_inode, root_edge_incarnation, root_children_generation
+		FROM promotion_namespace_capabilities WHERE tenant_id = ?`, tenantID).
+		Scan(&out.ready, &out.epoch, &out.minimumWriterProtocol, &out.restoreGeneration,
+			&out.databaseIncarnation, &out.writerGeneration, &out.admissionState, &out.rootInode,
+			&out.rootEdgeIncarnation, &out.rootChildrenGeneration)
+	if errors.Is(err, sql.ErrNoRows) {
+		return promotionNamespaceCapability{}, ErrPromotionDisabled
+	}
+	if err != nil {
+		return promotionNamespaceCapability{}, fmt.Errorf("read promotion namespace capability: %w", err)
+	}
+	return out, nil
+}
+
+func (s *PromotionStore) requirePromotionWriterProtocol(namespace promotionNamespaceCapability) error {
+	if namespace.minimumWriterProtocol == 0 || s.cfg.WriterProtocol < namespace.minimumWriterProtocol {
+		return ErrPromotionRestoreFenced
+	}
+	return nil
+}
+
 func (s *PromotionStore) lockPromotionNamespaceCapability(ctx context.Context, tx *sql.Tx, tenantID string) (promotionNamespaceCapability, error) {
 	var out promotionNamespaceCapability
-	err := tx.QueryRowContext(ctx, `SELECT namespace_cas_ready, namespace_cas_epoch, restore_generation,
+	err := tx.QueryRowContext(ctx, `SELECT namespace_cas_ready, namespace_cas_epoch, minimum_writer_protocol, restore_generation,
 		database_incarnation, writer_generation, admission_state, root_inode,
 		root_edge_incarnation, root_children_generation
 		FROM promotion_namespace_capabilities WHERE tenant_id = ? FOR UPDATE`, tenantID).
-		Scan(&out.ready, &out.epoch, &out.restoreGeneration, &out.databaseIncarnation, &out.writerGeneration,
+		Scan(&out.ready, &out.epoch, &out.minimumWriterProtocol, &out.restoreGeneration, &out.databaseIncarnation, &out.writerGeneration,
 			&out.admissionState, &out.rootInode, &out.rootEdgeIncarnation, &out.rootChildrenGeneration)
 	if errors.Is(err, sql.ErrNoRows) {
 		return promotionNamespaceCapability{}, ErrPromotionDisabled

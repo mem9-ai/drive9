@@ -98,6 +98,7 @@ func newTestPromotionStore(t *testing.T, now *time.Time) (*Store, *PromotionStor
 	promotionStore, err := NewPromotionStore(store, PromotionStoreConfig{
 		Planner: planner, ProofSigner: proofSigner, Authorizer: authorizer, LeaseVerifier: leaseVerifier,
 		RuntimeCapability: func(string) promotion.StorageCapability { return *capability },
+		WriterProtocol:    1,
 		Limits:            testPromotionLimits(), AllocationTTL: 5 * time.Minute,
 		ActivityTTL: time.Hour, LeaseTTL: time.Minute,
 	})
@@ -525,6 +526,54 @@ func TestPromotionWriterLeaseGuardPrecedesCreateRecovery(t *testing.T) {
 	}
 	if _, err := promotionStore.CreateImport(context.Background(), create); !errors.Is(err, ErrPromotionRestoreFenced) {
 		t.Fatalf("stale writer lease recovery error = %v, want ErrPromotionRestoreFenced", err)
+	}
+}
+
+func TestPromotionWriterProtocolGateRejectsOldProcessBeforeMutation(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+	manifest := testPromotionManifest(t)
+	plan, err := promotionStore.PlanImport(context.Background(), promotion.PlanImportRequest{
+		TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true, Manifest: manifest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocation, err := promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
+		TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true,
+		IdempotencyKey: "create-old-writer-protocol", AllocationLease: "allocation-lease",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE promotion_namespace_capabilities
+		SET minimum_writer_protocol = 2 WHERE tenant_id = 'tenant-a'`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := promotionStore.CreateImport(context.Background(), PromotionCreateRequest{
+		TenantID: "tenant-a", MigrationID: allocation.MigrationID, AllocationProof: allocation.AllocationProof,
+		Target: "/published", ExpectedTargetAbsent: true, Manifest: manifest, Plan: *plan,
+		OwnerToken: "owner-token", RecoveryToken: "recovery-token", WriterLease: "writer-lease",
+	}); !errors.Is(err, ErrPromotionRestoreFenced) {
+		t.Fatalf("old writer protocol CreateImport error = %v, want ErrPromotionRestoreFenced", err)
+	}
+	assertPromotionCreateRows(t, store, 0, 0, 0)
+	assertPromotionReservedQuota(t, store, 0, 0)
+
+	if _, err := promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
+		TenantID: "tenant-a", Target: "/another", ExpectedTargetAbsent: true,
+		IdempotencyKey: "allocate-old-writer-protocol", AllocationLease: "allocation-lease",
+	}); !errors.Is(err, ErrPromotionRestoreFenced) {
+		t.Fatalf("old writer protocol AllocateImportID error = %v, want ErrPromotionRestoreFenced", err)
+	}
+	var lastIssued uint64
+	if err := store.DB().QueryRow(`SELECT last_issued_sequence FROM promotion_import_identity_epochs
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = 2`).Scan(&lastIssued); err != nil {
+		t.Fatal(err)
+	}
+	if lastIssued != allocation.AllocationSequence {
+		t.Fatalf("last issued sequence after rejected old writer = %d, want %d", lastIssued, allocation.AllocationSequence)
 	}
 }
 

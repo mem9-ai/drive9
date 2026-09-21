@@ -187,6 +187,11 @@ func InitSchemaStatements() []string {
 }
 
 func initDB9Schema(dsn string) error {
+	// Schema migration intentionally owns a short-lived connection pool. The
+	// server keeps the tenant out of ACTIVE until this function returns, then
+	// runtime writers open a fresh pool. In particular, a prepared statement
+	// whose parameter types were inferred from a legacy JSONB column must never
+	// survive the terminal_result_blob JSONB -> TEXT migration.
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return err

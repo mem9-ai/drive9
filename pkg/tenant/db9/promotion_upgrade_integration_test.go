@@ -34,7 +34,8 @@ const (
 // conversion. The runtime validator must fail such an unreleased/corrupt row
 // closed; a schema migration cannot reconstruct bytes JSONB already discarded.
 func TestPromotionTerminalResultUpgradeRoundTrip(t *testing.T) {
-	db := openPromotionPostgres(t)
+	dsn := promotionPostgresDSN(t)
+	db := openPromotionPostgresDSN(t, dsn)
 	ctx := context.Background()
 
 	for _, table := range []string{"promotion_import_tombstones", "promotion_imports"} {
@@ -52,9 +53,15 @@ func TestPromotionTerminalResultUpgradeRoundTrip(t *testing.T) {
 
 	terminalResult := `{ "z": 2, "a": {"value": 1} }`
 	wantDigest := promotionTerminalResultDigest(terminalResult)
+	legacyInserts := make([]*sql.Stmt, 0, 2)
 	for _, table := range []string{"promotion_imports", "promotion_import_tombstones"} {
-		if _, err := db.ExecContext(ctx, `INSERT INTO `+table+`
-			(terminal_result_blob, terminal_result_digest) VALUES ($1, $2)`, terminalResult, wantDigest); err != nil {
+		insert, err := db.PrepareContext(ctx, `INSERT INTO `+table+`
+			(terminal_result_blob, terminal_result_digest) VALUES ($1, $2)`)
+		if err != nil {
+			t.Fatalf("prepare legacy %s result insert: %v", table, err)
+		}
+		legacyInserts = append(legacyInserts, insert)
+		if _, err := insert.ExecContext(ctx, terminalResult, wantDigest); err != nil {
 			t.Fatalf("insert legacy %s result: %v", table, err)
 		}
 		var got string
@@ -96,13 +103,31 @@ func TestPromotionTerminalResultUpgradeRoundTrip(t *testing.T) {
 		if _, err := db.ExecContext(ctx, `DELETE FROM `+table); err != nil {
 			t.Fatalf("delete legacy %s result: %v", table, err)
 		}
-		if _, err := db.ExecContext(ctx, `INSERT INTO `+table+`
+	}
+
+	// The production boundary is schema migration before promotion writer
+	// activation. initDB9Schema uses a dedicated pool and closes it before a
+	// tenant becomes active. Closing this pool is therefore part of the test:
+	// a JSONB-typed prepared statement from the old process must not survive
+	// into the TEXT writer generation.
+	if err := db.Close(); err != nil {
+		t.Fatalf("close DB9 migration connection: %v", err)
+	}
+	for _, insert := range legacyInserts {
+		if _, err := insert.ExecContext(ctx, terminalResult, wantDigest); err == nil {
+			t.Fatal("legacy JSONB prepared insert remained usable after migration pool closed")
+		}
+	}
+
+	runtimeDB := openPromotionPostgresDSN(t, dsn)
+	for _, table := range []string{"promotion_imports", "promotion_import_tombstones"} {
+		if _, err := runtimeDB.ExecContext(ctx, `INSERT INTO `+table+`
 			(terminal_result_blob, terminal_result_digest) VALUES ($1, $2)`, terminalResult, wantDigest); err != nil {
 			t.Fatalf("insert upgraded %s result: %v", table, err)
 		}
 
 		var gotBlob, gotDigest string
-		if err := db.QueryRowContext(ctx, `SELECT terminal_result_blob, terminal_result_digest FROM `+table+` WHERE id = 2`).
+		if err := runtimeDB.QueryRowContext(ctx, `SELECT terminal_result_blob, terminal_result_digest FROM `+table+` WHERE id = 2`).
 			Scan(&gotBlob, &gotDigest); err != nil {
 			t.Fatalf("round-trip upgraded %s result: %v", table, err)
 		}
@@ -143,10 +168,10 @@ func promotionTerminalResultDigest(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func openPromotionPostgres(t *testing.T) *sql.DB {
+func promotionPostgresDSN(t *testing.T) string {
 	t.Helper()
 	if dsn := strings.TrimSpace(os.Getenv(db9TestDSNEnv)); dsn != "" {
-		return openPromotionPostgresDSN(t, dsn)
+		return dsn
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), db9TestStartTimeout)
@@ -180,7 +205,7 @@ func openPromotionPostgres(t *testing.T) *sql.DB {
 		t.Fatalf("PostgreSQL test container port: %v", err)
 	}
 	dsn := fmt.Sprintf("postgres://postgres:%s@%s:%s/drive9_test?sslmode=disable", db9TestPassword, host, port.Port())
-	return openPromotionPostgresDSN(t, dsn)
+	return dsn
 }
 
 func openPromotionPostgresDSN(t *testing.T, dsn string) *sql.DB {
