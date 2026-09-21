@@ -181,6 +181,11 @@ func (s *Store) jfsRequireDirTx(tx *sql.Tx, ino uint64) (int, error) {
 }
 
 func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name string, typ uint8, mode, cumask uint16, inode uint64, attr ExtentAttr, projPath string, uid, gid uint32, symlinkTarget string) (uint64, *ExtentAttr, int, error) {
+	if typ != jfsTypeDir && projPath != "" {
+		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, pathutil.ParentPath(projPath)); err != nil {
+			return 0, nil, 0, err
+		}
+	}
 	if parent == 0 {
 		parent = jfsRootIno
 	}
@@ -355,6 +360,10 @@ func (s *Store) insertExtentProjectionTx(tx *sql.Tx, path string, extentIno uint
 	nodeID := strings.ToLower(ulid.Make().String())
 	parent := pathutil.ParentPath(path)
 	name := pathutil.BaseName(path)
+	edge, err := newNamespaceEdgeIncarnation()
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`INSERT INTO inodes (`+s.scope.InsCols(`inode_id, size_bytes, revision, mode, status, created_at, mtime, confirmed_at`)+`)
 		VALUES (`+s.scope.InsVals(`?, 0, 1, ?, ?, ?, ?, ?`)+`)`,
 		s.scope.Args(inodeID, uint32(mode), StatusConfirmed, now, now, now)...); err != nil {
@@ -379,10 +388,10 @@ func (s *Store) insertExtentProjectionTx(tx *sql.Tx, path string, extentIno uint
 	if err := s.InsertSemanticTx(tx, &Semantic{InodeID: inodeID}); err != nil {
 		return fmt.Errorf("insert extent semantic: %w", err)
 	}
-	_, err := tx.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at, content_layout, extent_ino`)+`)
-		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?`)+`)`,
+	_, err = tx.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, path_edge_incarnation, created_at, content_layout, extent_ino`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?`)+`)`,
 		s.scope.Args(nodeID, path, fileNodePathHash(path), parent, fileNodePathHash(parent),
-			name, inodeID, inodeID, now, string(ContentLayoutExtent), extentIno)...)
+			name, inodeID, inodeID, edge, now, string(ContentLayoutExtent), extentIno)...)
 	if isUniqueViolation(err) {
 		return fmt.Errorf("%w", ErrPathConflict)
 	}
@@ -489,6 +498,11 @@ func (s *Store) jfsOpenRefTx(tx *sql.Tx, sid, ino uint64) (int, error) {
 // both quota planes read — never drops: truncate-then-delete cycles would wedge
 // a tenant at EDQUOT with no live data.
 func (s *Store) jfsUnlinkTx(ctx context.Context, tx *sql.Tx, parent uint64, name, projPath string, sid uint64, opened bool) (*ExtentAttr, int, error) {
+	if projPath != "" {
+		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, pathutil.ParentPath(projPath)); err != nil {
+			return nil, 0, err
+		}
+	}
 	var ino uint64
 	var typ uint8
 	// FOR UPDATE, like upstream doUnlink's ForUpdate().Get(&e). The nlink
@@ -769,6 +783,15 @@ func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (ui
 // all — Store.RenameFileReplacingTarget removes a replaced extent destination with
 // its own jfsUnlinkTx(..., opened = false).
 func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, srcName string, dstParent uint64, dstName, srcPath, dstPath string, flags uint32, dstOpened bool, sid uint64) (uint64, uint64, *ExtentAttr, *ExtentAttr, int, error) {
+	if dstPath != "" {
+		parents := []string{pathutil.ParentPath(dstPath)}
+		if srcPath != "" {
+			parents = append(parents, pathutil.ParentPath(srcPath))
+		}
+		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parents...); err != nil {
+			return 0, 0, nil, nil, 0, err
+		}
+	}
 	ino, attr, eno, err := s.jfsLookupForUpdateTx(tx, srcParent, srcName)
 	if err != nil || eno != 0 {
 		return 0, 0, nil, nil, eno, err
@@ -870,9 +893,13 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 func (s *Store) jfsMoveProjectionTx(tx *sql.Tx, extentIno uint64, srcPath, srcName, dstPath string) error {
 	dstParent := pathutil.ParentPath(dstPath)
 	dstName := pathutil.BaseName(dstPath)
-	setArgs := []any{dstPath, fileNodePathHash(dstPath), dstParent, fileNodePathHash(dstParent), dstName}
+	edge, err := newNamespaceEdgeIncarnation()
+	if err != nil {
+		return err
+	}
+	setArgs := []any{dstPath, fileNodePathHash(dstPath), dstParent, fileNodePathHash(dstParent), dstName, edge}
 	try := func(where string, whereArgs []any) (int64, error) {
-		q := `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE ` + s.scope.And(where)
+		q := `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?, path_edge_incarnation = ? WHERE ` + s.scope.And(where)
 		args := append(append([]any{}, setArgs...), s.scope.Args(whereArgs...)...)
 		res, err := tx.Exec(q, args...)
 		if isUniqueViolation(err) {
@@ -924,7 +951,7 @@ func (s *Store) jfsMoveProjectionTx(tx *sql.Tx, extentIno uint64, srcPath, srcNa
 	if extentIno == 0 || srcName == "" {
 		return nil
 	}
-	_, err := try(`extent_ino = ? AND name = ?`, []any{extentIno, srcName})
+	_, err = try(`extent_ino = ? AND name = ?`, []any{extentIno, srcName})
 	return err
 }
 
@@ -1054,6 +1081,9 @@ func (s *Store) jfsRenameDirEdgeTx(tx *sql.Tx, ino, newParent uint64, newName st
 	return s.jfsMoveEdgeTx(tx, parent, string(name), ino, newParent, newName)
 }
 func (s *Store) unlinkExtentPathTx(ctx context.Context, tx *sql.Tx, path string, opened bool) error {
+	if err := s.bumpPromotionParentGenerationsTx(ctx, tx, pathutil.ParentPath(path)); err != nil {
+		return err
+	}
 	var ino sql.NullInt64
 	var layout sql.NullString
 	// FOR UPDATE: the node-gone branch below deletes this row, and a rename that

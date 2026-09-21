@@ -98,7 +98,7 @@ func newTestPromotionStore(t *testing.T, now *time.Time) (*Store, *PromotionStor
 	promotionStore, err := NewPromotionStore(store, PromotionStoreConfig{
 		Planner: planner, ProofSigner: proofSigner, Authorizer: authorizer, LeaseVerifier: leaseVerifier,
 		RuntimeCapability: func(string) promotion.StorageCapability { return *capability },
-		WriterProtocol:    1,
+		WriterProtocol:    promotionNamespaceMutationWriterProtocol,
 		Limits:            testPromotionLimits(), AllocationTTL: 5 * time.Minute,
 		ActivityTTL: time.Hour, LeaseTTL: time.Minute,
 	})
@@ -134,7 +134,7 @@ func seedPromotionCapability(t *testing.T, store *Store, tenantID string, capabi
 			(tenant_id, namespace_cas_ready, namespace_cas_epoch, minimum_writer_protocol,
 			 restore_generation, database_incarnation, writer_generation, admission_state,
 			 root_inode, root_edge_incarnation, root_children_generation)
-			VALUES (?, TRUE, 3, 1, 5, 'db-inc-1', 7, 'ACTIVE', 'root-inode', 'root-edge-1', 11)`, []any{tenantID}},
+			VALUES (?, TRUE, 3, ?, 5, 'db-inc-1', 7, 'ACTIVE', 'root-inode', 'root-edge-1', 11)`, []any{tenantID, promotionNamespaceMutationWriterProtocol}},
 		{`INSERT INTO promotion_import_identity_tenants
 			(tenant_id, installed_allocation_epoch, installed_restore_generation,
 			 installed_database_incarnation, installed_backup_lineage_id, installed_writer_generation,
@@ -547,7 +547,7 @@ func TestPromotionWriterProtocolGateRejectsOldProcessBeforeMutation(t *testing.T
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`UPDATE promotion_namespace_capabilities
-		SET minimum_writer_protocol = 2 WHERE tenant_id = 'tenant-a'`); err != nil {
+		SET minimum_writer_protocol = 3 WHERE tenant_id = 'tenant-a'`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := promotionStore.PlanImport(context.Background(), promotion.PlanImportRequest{
@@ -561,13 +561,13 @@ func TestPromotionWriterProtocolGateRejectsOldProcessBeforeMutation(t *testing.T
 	// A process implementing the admitted protocol can still perform the same
 	// side-effect-free planning operation. This distinguishes a working
 	// rollout gate from accidentally disabling promotion for every version.
-	promotionStore.cfg.WriterProtocol = 2
+	promotionStore.cfg.WriterProtocol = 3
 	if _, err := promotionStore.PlanImport(context.Background(), promotion.PlanImportRequest{
 		TenantID: "tenant-a", Target: "/planned", ExpectedTargetAbsent: true, Manifest: manifest,
 	}); err != nil {
 		t.Fatalf("current writer protocol PlanImport: %v", err)
 	}
-	promotionStore.cfg.WriterProtocol = 1
+	promotionStore.cfg.WriterProtocol = promotionNamespaceMutationWriterProtocol
 
 	if _, err := promotionStore.CreateImport(context.Background(), PromotionCreateRequest{
 		TenantID: "tenant-a", MigrationID: allocation.MigrationID, AllocationProof: allocation.AllocationProof,

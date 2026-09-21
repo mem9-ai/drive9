@@ -298,14 +298,34 @@ func (s *Store) InsertNode(ctx context.Context, n *FileNode) error {
 		opErr = ErrInvalidRootDentry
 		return ErrInvalidRootDentry
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at`)+`)
-		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		opErr = err
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.bumpPromotionParentGenerationsTx(ctx, tx, n.ParentPath); err != nil {
+		opErr = err
+		return err
+	}
+	edge, err := newNamespaceEdgeIncarnation()
+	if err != nil {
+		opErr = err
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, path_edge_incarnation, created_at`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
 		s.scope.Args(n.NodeID, n.Path, fileNodePathHash(n.Path), n.ParentPath, fileNodePathHash(n.ParentPath),
-			n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())...)
+			n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), edge, n.CreatedAt.UTC())...)
 	if isUniqueViolation(err) {
 		opErr = ErrPathConflict
 		return ErrPathConflict
 	}
+	if err != nil {
+		opErr = err
+		return err
+	}
+	err = tx.Commit()
 	opErr = err
 	return err
 }
@@ -374,7 +394,15 @@ func (s *Store) DeleteNode(ctx context.Context, path string) (err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_node", start, &err)
 
-	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parentPath(path)); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
 		s.scope.Args(fileNodePathHash(path), path)...)
 	if err != nil {
 		return err
@@ -383,7 +411,7 @@ func (s *Store) DeleteNode(ctx context.Context, path string) (err error) {
 	if n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 // DeleteEmptyDir atomically checks a directory is empty and deletes it.
@@ -396,6 +424,9 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parentPath(path)); err != nil {
+		return err
+	}
 
 	hasChildren, err := s.dirHasChildrenTx(ctx, tx, path)
 	if err != nil {
@@ -431,13 +462,27 @@ func (s *Store) DeleteNodesByPrefix(ctx context.Context, prefix string) (n int64
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_nodes_by_prefix", start, &err)
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parentPath(prefix)); err != nil {
+		return 0, err
+	}
 	where, args := pathPrefixPredicate("path", prefix)
-	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(where), s.scope.Args(args...)...)
+	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.scope.And(where), s.scope.Args(args...)...)
 	if err != nil {
 		return 0, err
 	}
 	n, err = res.RowsAffected()
-	return n, err
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	return n, tx.Commit()
 }
 
 func (s *Store) UpdateNodePath(ctx context.Context, oldPath, newPath, newParentPath, newName string) (err error) {
@@ -447,9 +492,21 @@ func (s *Store) UpdateNodePath(ctx context.Context, oldPath, newPath, newParentP
 	if isRootFileNodePath(oldPath) || isRootFileNodePath(newPath) {
 		return ErrInvalidRootDentry
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parentPath(oldPath), newParentPath); err != nil {
+		return err
+	}
+	edge, err := newNamespaceEdgeIncarnation()
+	if err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?, path_edge_incarnation = ?
 		WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
-		append([]any{newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName},
+		append([]any{newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName, edge},
 			s.scope.Args(fileNodePathHash(oldPath), oldPath)...)...)
 	if err != nil {
 		return err
@@ -458,7 +515,7 @@ func (s *Store) UpdateNodePath(ctx context.Context, oldPath, newPath, newParentP
 	if n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 // RenameFileReplacingTarget atomically renames a file node. If newPath already
@@ -476,6 +533,16 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var newEdge string
+	if oldPath != newPath {
+		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parentPath(oldPath), newParentPath); err != nil {
+			return nil, err
+		}
+		newEdge, err = newNamespaceEdgeIncarnation()
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	type nodeRef struct {
 		nodeID string
@@ -503,7 +570,6 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 	if oldPath == newPath {
 		return nil, tx.Commit()
 	}
-
 	var dst nodeRef
 	hasDst := false
 	err = tx.QueryRow(`SELECT node_id, file_id, is_directory, extent_ino FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
@@ -545,8 +611,8 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 		}
 	}
 
-	res, err := tx.Exec(`UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE `+s.scope.And(`node_id = ?`),
-		append([]any{newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName}, s.scope.Args(old.nodeID)...)...)
+	res, err := tx.Exec(`UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?, path_edge_incarnation = ? WHERE `+s.scope.And(`node_id = ?`),
+		append([]any{newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName, newEdge}, s.scope.Args(old.nodeID)...)...)
 	if isUniqueViolation(err) {
 		return nil, ErrPathConflict
 	}
@@ -664,6 +730,16 @@ func (s *Store) RenameFileNoReplace(ctx context.Context, oldPath, newPath, newPa
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var newEdge string
+	if oldPath != newPath {
+		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parentPath(oldPath), newParentPath); err != nil {
+			return err
+		}
+		newEdge, err = newNamespaceEdgeIncarnation()
+		if err != nil {
+			return err
+		}
+	}
 
 	type nodeRef struct {
 		nodeID string
@@ -688,7 +764,6 @@ func (s *Store) RenameFileNoReplace(ctx context.Context, oldPath, newPath, newPa
 	if oldPath == newPath {
 		return tx.Commit()
 	}
-
 	var dst nodeRef
 	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
 		s.scope.Args(fileNodePathHash(newPath), newPath)...).Scan(&dst.nodeID, &dst.isDir)
@@ -703,9 +778,9 @@ func (s *Store) RenameFileNoReplace(ctx context.Context, oldPath, newPath, newPa
 		return ErrPathConflict
 	}
 
-	res, err := tx.ExecContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?
+	res, err := tx.ExecContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?, path_edge_incarnation = ?
 		WHERE `+s.scope.And(`node_id = ?`),
-		append([]any{newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName}, s.scope.Args(old.nodeID)...)...)
+		append([]any{newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName, newEdge}, s.scope.Args(old.nodeID)...)...)
 	if err != nil {
 		if strings.Contains(err.Error(), "Duplicate entry") {
 			return ErrPathConflict
@@ -755,6 +830,13 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parentPath(oldPrefix), parentPath(newPrefix)); err != nil {
+		return 0, err
+	}
+	rootEdge, err := newNamespaceEdgeIncarnation()
+	if err != nil {
+		return 0, err
+	}
 
 	// The prefix match escapes % and _ so a directory named "a_b" cannot match
 	// sibling "axb" and rename it.
@@ -789,7 +871,6 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 	if len(updates) == 0 {
 		return 0, ErrNotFound
 	}
-
 	type dstRef struct {
 		nodeID string
 		isDir  bool
@@ -865,11 +946,18 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 	defer func() { _ = stmt.Close() }()
 
 	for _, u := range updates {
-		if _, err := stmt.Exec(append([]any{u.newPath, fileNodePathHash(u.newPath), u.newParent, fileNodePathHash(u.newParent), u.newName}, s.scope.Args(u.nodeID)...)...); err != nil {
-			if isUniqueViolation(err) {
+		var execErr error
+		if u.newPath == newPrefix {
+			_, execErr = tx.ExecContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?, path_edge_incarnation = ? WHERE `+s.scope.And(`node_id = ?`),
+				append([]any{u.newPath, fileNodePathHash(u.newPath), u.newParent, fileNodePathHash(u.newParent), u.newName, rootEdge}, s.scope.Args(u.nodeID)...)...)
+		} else {
+			_, execErr = stmt.Exec(append([]any{u.newPath, fileNodePathHash(u.newPath), u.newParent, fileNodePathHash(u.newParent), u.newName}, s.scope.Args(u.nodeID)...)...)
+		}
+		if execErr != nil {
+			if isUniqueViolation(execErr) {
 				return 0, ErrPathConflict
 			}
-			return 0, err
+			return 0, execErr
 		}
 	}
 
@@ -967,6 +1055,9 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, tx *sql.Tx, srcPath, dstPath
 	if isRootFileNodePath(srcPath) || isRootFileNodePath(dstPath) {
 		return ErrInvalidRootDentry
 	}
+	if err := s.bumpPromotionParentGenerationsTx(ctx, tx, dstParentPath); err != nil {
+		return err
+	}
 	if dstParentPath != "/" {
 		var parentIsDir bool
 		err := tx.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
@@ -1015,9 +1106,13 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, tx *sql.Tx, srcPath, dstPath
 	if extentIno.Valid && extentIno.Int64 > 0 {
 		extentArg = uint64(extentIno.Int64)
 	}
-	_, err = tx.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at, content_layout, extent_ino`)+`)
-		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?`)+`)`,
-		s.scope.Args(nodeID, dstPath, fileNodePathHash(dstPath), dstParentPath, fileNodePathHash(dstParentPath), dstName, fileID.String, linkInodeID, createdAt.UTC(), layoutArg, extentArg)...)
+	edge, err := newNamespaceEdgeIncarnation()
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, path_edge_incarnation, created_at, content_layout, extent_ino`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?`)+`)`,
+		s.scope.Args(nodeID, dstPath, fileNodePathHash(dstPath), dstParentPath, fileNodePathHash(dstParentPath), dstName, fileID.String, linkInodeID, edge, createdAt.UTC(), layoutArg, extentArg)...)
 	if isUniqueViolation(err) {
 		return ErrPathConflict
 	}
@@ -1637,11 +1732,18 @@ func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path 
 		}
 
 		// Directory does not exist — insert the dentry.
+		if err := s.bumpPromotionParentGenerationsTx(ctx, db, pp); err != nil {
+			return err
+		}
+		edge, err := newNamespaceEdgeIncarnation()
+		if err != nil {
+			return err
+		}
 		_, err = db.ExecContext(ctx, `INSERT INTO file_nodes
-			(`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, inode_id, created_at`)+`)
-			VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 1, ?, ?`)+`)
+			(`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, inode_id, path_edge_incarnation, created_at`)+`)
+			VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 1, ?, ?, ?`)+`)
 			ON DUPLICATE KEY UPDATE node_id = node_id`,
-			s.scope.Args(nodeID, dirPath, fileNodePathHash(dirPath), pp, fileNodePathHash(pp), name, nodeID, now)...)
+			s.scope.Args(nodeID, dirPath, fileNodePathHash(dirPath), pp, fileNodePathHash(pp), name, nodeID, edge, now)...)
 		if err != nil && !isUniqueViolation(err) {
 			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
 		}
@@ -1658,10 +1760,17 @@ func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
 			return err
 		}
 	}
-	_, err := db.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at`)+`)
-		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
+	if err := s.bumpPromotionParentGenerationsTx(context.Background(), db, n.ParentPath); err != nil {
+		return err
+	}
+	edge, err := newNamespaceEdgeIncarnation()
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO file_nodes (`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, path_edge_incarnation, created_at`)+`)
+		VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`)+`)`,
 		s.scope.Args(n.NodeID, n.Path, fileNodePathHash(n.Path), n.ParentPath, fileNodePathHash(n.ParentPath),
-			n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())...)
+			n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), edge, n.CreatedAt.UTC())...)
 	if isUniqueViolation(err) {
 		return ErrPathConflict
 	}
@@ -2205,6 +2314,9 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parentPath(path)); err != nil {
+		return nil, err
+	}
 
 	candidate, err := s.scanDeleteCandidateTx(ctx, tx, path)
 	if err != nil {
@@ -2309,6 +2421,9 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parentPath(dirPath)); err != nil {
+		return nil, err
+	}
 
 	// Capture the directory's jfs inode before its projection row is deleted:
 	// the jfs subtree (edges/nodes of the directory and any orphan children)
@@ -2341,7 +2456,6 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 	if err := s.lockFileIDsForDeleteTx(ctx, tx, fileIDs); err != nil {
 		return nil, err
 	}
-
 	if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE `+s.andAsGrouped("", `path = ? OR path LIKE ? ESCAPE '\\'`),
 		s.scope.Args(dirPath, prefixPattern)...); err != nil {
 		return nil, err

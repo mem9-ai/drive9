@@ -351,7 +351,7 @@ func TestPromotionContentMutationsAreAuthorizedAndWriterFenced(t *testing.T) {
 	}
 	promotionStore.cfg.Authorizer.(*promotionTestAuthorizer).denied = false
 	if _, err := store.DB().Exec(`UPDATE promotion_namespace_capabilities
-		SET minimum_writer_protocol = 2 WHERE tenant_id = 'tenant-a'`); err != nil {
+		SET minimum_writer_protocol = 3 WHERE tenant_id = 'tenant-a'`); err != nil {
 		t.Fatal(err)
 	}
 	req.Body = bytes.NewBufferString("hello")
