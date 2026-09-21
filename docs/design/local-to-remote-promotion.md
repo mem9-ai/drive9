@@ -197,11 +197,13 @@ preview maps them as follows:
 | Source changed during snapshot | `source_changed` | `EAGAIN` |
 | Selected storage backend or object size lacks the required promotion guarantees | `promotion_storage_backend_unsupported` | `EXDEV` |
 | Import activity deadline won before commit acceptance | `promotion_deadline_exceeded` | `ETIMEDOUT` |
+| Restore drain aborted a client-owned import before commit acceptance | `promotion_restore_interrupted` | `EAGAIN` |
 | Permission failure | `permission_denied` | `EACCES` or `EPERM` |
 | Quota reservation failure | `quota_exceeded` | `EDQUOT` or `ENOSPC` |
 | Tenant allocation rate/live/window budget exhausted | `promotion_identity_budget_exceeded` | `EDQUOT` |
 | Global promotion-identity capacity unavailable | `promotion_identity_capacity_unavailable` | `EAGAIN` |
 | Promotion identity authority unavailable, fencing a restore, or inconsistent with the installed tenant epoch | `promotion_identity_epoch_unavailable` | `EAGAIN` |
+| Tenant restore writer fence is active, stale, or cannot be proved drained | `promotion_restore_fenced` | `EAGAIN` |
 | Configured tree limit exceeded | `promotion_limit_exceeded` | `EFBIG` |
 | Corrupt local record/manifest, identity-codec/counter invariant, or unresolved committed outcome | `promotion_recovery_required` | `EIO` |
 
@@ -262,6 +264,15 @@ and read, even when the caller still has a migration secret. Existing
 client-owned state remains fenced and is eventually aborted by lease/deadline
 GC.
 
+For every mutating API in the table, user authorization is necessary but not
+sufficient: after that check the server obtains a short-lived internal
+promotion-writer lease and the datastore transaction applies the locked restore
+guard. This includes first and retried Create recovery, retirement,
+acknowledgement, takeover, and abort paths that might otherwise appear
+idempotent. A stale process cannot use a valid user token or migration secret
+to bypass restore fencing. `GetImport` is read-only and does not require a
+writer lease; any recovery action it suggests still does.
+
 Authorization cannot itself become an existence oracle. Target-bearing
 requests (`PlanImport`, `AllocateImportID`, and first or retried `CreateImport`)
 authorize the request target before plan, claim, or import lookup, so an
@@ -285,7 +296,10 @@ a real terminal state even if the initiating user token is later revoked. It
 does not re-evaluate mutable caller scope after acceptance; otherwise revocation
 could strand an accepted commit or cleanup. The final transaction still checks
 tenant ownership, immutable target identity, quota, namespace-CAS readiness,
-and every structural precondition described below.
+the locked restore-writer fence, and every structural precondition described
+below. Service authority bypasses mutable **user scope**, not restore fencing:
+an accepted worker from a revoked writer generation has no authority to mutate
+the restored database.
 
 `CreateImport` reserves the canonical manifest byte and entry totals and
 returns a versioned quota reservation. Inline content writes, and any future
@@ -618,58 +632,140 @@ Promotion is unsupported unless the deployment supplies that non-rollback
 authority and integrates every tenant restore/clone path with it. A raw restore
 that can bypass the platform restore generation must leave promotion disabled;
 the server must not infer safety from a self-consistent restored database.
+The authority is a quorum/linearizable control-plane service with CAS per
+pre-provisioned tenant identity, durable monotonic counters, audited restore
+transitions, and a backup/restore domain independent from tenant data. Tenant
+identity comes from authenticated control-plane routing, never a request body.
+Loss of quorum, ambiguous leadership, counter exhaustion, or inability to prove
+that its state survived a restore stops lease/grant issuance; availability is
+sacrificed rather than falling back to tenant-DB counters or local clocks.
 
 The authority record contains tenant ID, current allocation epoch, restore
-generation, admission state (`ACTIVE` or `FENCING`), lease generation, and the
-latest outstanding allocation-lease expiry. It issues short-lived signed
-allocation leases binding all of those values plus `not_after` and the tenant-
-database incarnation. `AllocateImportID` must validate an `ACTIVE` lease using
-database time and require its epoch/restore/lease generations and database
-incarnation to equal the installed tenant-database values in the same
-transaction that charges identity capacity and inserts the claim. Authority
-unavailability, `FENCING`, an expired/stale lease, or any generation mismatch
-returns
-`promotion_identity_epoch_unavailable` (`503`, FUSE `EAGAIN`) before sequence,
-proof, claim, quota, or staging side effects.
+generation, database incarnation, admission state (`ACTIVE` or `FENCING`),
+allocation-lease generation, writer generation, and the latest outstanding
+expiry for both lease classes. It issues:
+
+- short-lived allocation leases used only by `AllocateImportID`; and
+- short-lived promotion-writer leases, classified as `NORMAL` or
+  `RESTORE_DRAIN`, used by **every** other promotion DB mutation, including
+  client handlers, scanners, takeover/retirement,
+  `COMMITTING`/`ABORTING` workers, GC, quota settlement, staging cleanup, and
+  final namespace publish.
+
+Both signed leases bind tenant, allocation epoch, restore generation, database
+incarnation, their respective generation, and `not_after`. Their maximum TTLs
+are fixed and recorded by the authority. While the tenant is `FENCING`, it
+issues no allocation or `NORMAL` writer leases. It may issue a bounded
+`RESTORE_DRAIN` lease only for an exact already-durable commit/cleanup attempt,
+or a one-use controller operation that converts a named client-owned import to
+`ABORTING` with reason `promotion_restore_interrupted`. A drain lease binds
+**both** the capability row's fence-writer generation and, when resuming an
+older durable attempt, that attempt's captured active-writer generation. The
+two generations are intentionally different and are never treated as an
+equality alias. A drain lease cannot create an import, accept content, verify,
+renew/take over ownership, or acquire unrelated work.
+
+The tenant DB has one restore-capability row containing the exact installed
+restore generation, database incarnation, writer generation, and admission
+state (`ACTIVE`, `DRAINING`, or `FENCED`). A shared datastore transaction guard
+locks this row before **every promotion write** and validates the signed lease
+with database time. A `NORMAL` lease requires every bound field plus `ACTIVE`;
+a `RESTORE_DRAIN` lease requires `DRAINING`, the exact fence-writer generation,
+allowed transition kind, and durable attempt/import identity. For a
+pre-existing attempt it separately requires the attempt row's captured active-
+writer generation to equal the value named in the drain lease; it does not
+require that old generation to equal the capability row's fence generation.
+`FENCED` accepts neither.
+The mutation and guard commit in the same transaction; checking in HTTP
+middleware or before opening the transaction is insufficient.
+`AllocateImportID` applies the equivalent allocation-lease guard in the same
+transaction that charges identity capacity and inserts the claim. All import
+tables, staging/quota mutations, worker state transitions, and namespace-
+publish helpers are reachable only through these guarded datastore paths;
+promotion rollout does not grant an unversioned legacy process write access to
+them.
+
+For allocation and `NORMAL` mutations, authority unavailability, external
+`FENCING`, a DB state other than `ACTIVE`, an expired/stale lease, or any
+generation/incarnation mismatch returns
+`promotion_identity_epoch_unavailable` for allocation and
+`promotion_restore_fenced` for every other mutation (`503`, FUSE `EAGAIN`)
+before sequence, state, quota, staging, cleanup, or namespace side effects.
+Only the exact `RESTORE_DRAIN` operations above may mutate during `DRAINING`.
+Read-only status lookup remains available under its ordinary authorization
+contract, but it cannot advance recovery state while fenced.
 
 The supported PITR/clone workflow is a barrier, not advisory documentation:
 
-1. CAS the external authority from `ACTIVE` to `FENCING`, stop routing new
-   promotion API calls and workers for the tenant, and stop issuing allocation
-   leases.
-2. Wait past the authority-recorded maximum lease expiry, drain requests and
-   service workers, and detach the old tenant-database incarnation before
-   replacing it. No old lease, handler, or worker can then mutate either the
-   restored database or the detached incarnation.
-3. CAS-increment the non-rollback allocation epoch and restore generation and
-   mint the expected new database incarnation in the authority. Restore or
-   clone the tenant database only after that durable decision.
-4. With a signed one-use install grant for that exact restore generation, run a
-   tenant-database transaction that installs the new current epoch, creates its
-   sequence counter at zero, seals older epoch counters against allocation, and
-   records the new database incarnation. It does not rewrite or delete restored
-   old-epoch imports.
-5. The authority returns to `ACTIVE` only after it has verified the installed
-   epoch/incarnation. Normal allocation leases are then issued for the new
-   epoch.
+1. CAS the external authority from `ACTIVE` to `FENCING`, advance to a distinct
+   fence-writer generation, stop routing new promotion API calls/workers for
+   the tenant, and stop issuing both lease classes.
+2. Using a signed fence grant, transactionally lock the old tenant DB restore-
+   capability row and change it from the prior `ACTIVE` writer generation to
+   `DRAINING` at the new fence generation. A transaction that locked the row
+   first may finish; the fence transaction waits for it, then makes every later
+   old/normal-lease transaction fail its locked guard.
+3. The restore controller uses narrowly scoped drain leases to move every
+   `CREATED`/`STAGING`/`VERIFIED` import to `ABORTING`, and to resume only the
+   durable `COMMITTING`/`ABORTING` attempts that existed at the fence. These
+   workers reach real terminal states and cannot acquire new user work. When no
+   nonterminal import remains, a signed drain-complete grant changes the DB row
+   from `DRAINING` to `FENCED` and stops drain-lease issuance.
+4. Wait past the authority-recorded maximum expiry for allocation, normal, and
+   drain leases; drain all pre-fence DB transactions/handlers/workers; and
+   revoke their generation-scoped promotion DB credentials. Success requires
+   the DB to report `FENCED`, zero nonterminal imports, and no transaction or
+   worker claim from either old or drain generation. Timeout, cleanup failure,
+   unreachable inventory, or an uncertain DB session leaves the external
+   authority `FENCING` and the DB `DRAINING`/`FENCED`; the controller must not
+   restore, clone, detach, or reactivate the tenant.
+5. CAS-increment the non-rollback allocation epoch and restore generation and
+   mint the expected new database incarnation plus a distinct active-writer
+   generation in the still-`FENCING` authority. Restore or clone the tenant
+   database only after that durable decision, and never reopen the detached old
+   incarnation for promotion writes.
+6. With a signed one-use install grant for that exact tuple, run a tenant-DB
+   transaction that locks the restored capability row, installs `FENCED` plus
+   the new restore/database/writer tuple, creates the new allocation-epoch
+   counter at zero, and seals older epoch counters against allocation. Before
+   acknowledging installation it scans the restored snapshot: unused
+   `ALLOCATED` claims are retired, terminal rows remain queryable, and the
+   presence of any restored `CREATED`, `STAGING`, `VERIFIED`, `COMMITTING`, or
+   `ABORTING` import rejects activation with `promotion_recovery_required`.
+   P0 does not guess the outcome of a service-owned operation that may have
+   completed after the snapshot. The operator must choose a promotion-
+   consistent snapshot or use a separately reviewed manual reconciliation
+   workflow; there is no force-activate flag in P0.
+7. The authority returns to `ACTIVE` and issues new leases only after it has
+   verified the installed tuple, the zero-nonterminal invariant, and DB
+   acknowledgement. It first signs a one-use activation grant that authorizes
+   only the tenant-DB capability-row transition from the exact installed
+   `FENCED` tuple to `ACTIVE`; that transaction cannot mutate an import. After
+   verifying its acknowledgement, the authority becomes `ACTIVE`, begins
+   issuing new leases, and only then resumes mutation routing.
 
-The install operation is idempotent for exactly
-`(tenant, allocation_epoch, restore_generation, database_incarnation)`: a lost
-response followed by the same signed grant returns the installed result, while
-any different tuple conflicts and leaves the authority `FENCING`. A crash or
-restore failure at any earlier step likewise leaves the tenant fenced; an
-operator may retry the same restore generation or explicitly begin a newer one,
-but cannot reactivate the old epoch. The authority does not mark the grant
-complete until it receives and verifies the tenant transaction's durable
-installation acknowledgement.
+The fence and install operations are idempotent for exactly
+`(tenant, allocation_epoch, restore_generation, database_incarnation,
+writer_generation)`: response loss followed by the same signed grant returns
+the installed result, while replay against another DB incarnation or changing
+any tuple component conflicts and leaves the authority `FENCING`. A crash,
+drain timeout, or restore failure at any earlier step likewise leaves the tenant
+fenced. If no restore/epoch advance began, an operator may cancel the attempt
+only by proving the old DB tuple is still installed, draining again, and
+reactivating it under a newly advanced writer generation; once the authority
+advances restore generation, it can only finish that or a newer restore. It
+never reactivates the revoked writer generation.
 
-Old proofs and local records still decode to their old epoch. A restored old-
-epoch row is queried and reconciled normally, but an otherwise valid old-epoch
-proof whose row is absent is `promotion_recovery_required`: the operation may
-have been accepted after the PITR snapshot and cannot be guessed retired. A new
-allocation can reuse the same numeric sequence only under the new epoch, so its
-public ID and database key remain distinct. Client-facing continuations never
-translate an old ID to the current epoch.
+Old proofs and local records still decode to their old epoch. A restored
+terminal old-epoch row is queried normally, and an unused restored allocation
+claim resolves to the retirement performed during installation. A restored
+nonterminal import keeps activation fenced rather than being reconciled under a
+guessed outcome. An otherwise valid old-epoch proof whose row is absent is
+`promotion_recovery_required`: the operation may have been accepted after the
+PITR snapshot and cannot be guessed retired. A new allocation can reuse the
+same numeric sequence only under the new epoch, so its public ID and database
+key remain distinct. Client-facing continuations never translate an old ID to
+the current epoch.
 
 The coordinator generates and fsyncs an allocation idempotency key before the
 request. The allocation transaction locks the tenant identity-budget row, the
@@ -1062,12 +1158,12 @@ The transitions and their durable effects are normative:
 
 | From | Trigger | To | Durable result |
 | --- | --- | --- | --- |
-| none | `CreateImport` | `CREATED` | Identity, target precondition, complete hidden manifest-entry set, reservation, namespace-CAS epoch, immutable activity deadline, owner epoch `1`, owner/recovery-token hashes, and lease are stored atomically. |
+| none | `CreateImport` | `CREATED` | Identity, target precondition, complete hidden manifest-entry set, reservation, namespace-CAS epoch, accepted restore/database/writer tuple, immutable activity deadline, owner epoch `1`, owner/recovery-token hashes, and lease are stored atomically. |
 | `CREATED` | first accepted content mutation | `STAGING` | Partial hidden content stage and the same manifest/reservation remain owned by the import. |
 | `CREATED` or `STAGING` | successful `VerifyImport` | `VERIFIED` | The complete persisted entry set is validated; every required file content is bound; entry set, content set, and manifest version become immutable. A manifest with no regular-file content may take this edge directly from `CREATED`. |
 | `VERIFIED` | accepted `CommitImport` CAS | `COMMITTING` | Commit attempt ID and accepted outcome are durable; request cancellation can no longer abort it. |
 | `COMMITTING` | server commit worker | `COMMITTED` | Target CAS, namespace publication, ownership transfer, reservation settlement, result row, and structural outbox event commit atomically. |
-| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort, expired-lease GC, or activity-deadline CAS | `ABORTING` | No new inline content, entry, verify, renew, takeover, or commit is accepted. For a future external mode, this also rejects new grants/completion/seal and durably owns every closure bound, object identity, and debt charge. |
+| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort, expired-lease GC, activity-deadline CAS, or exact restore-drain claim | `ABORTING` | No new inline content, entry, verify, renew, takeover, or commit is accepted. Restore drain records `promotion_restore_interrupted`; for a future external mode, every path also rejects new grants/completion/seal and durably owns every closure bound, object identity, and debt charge. |
 | `COMMITTING` | permanent target/auth/manifest failure before publication | `ABORTING` | A durable terminal reason is recorded; no namespace or committed quota changed. Transient failure stays `COMMITTING` and is retried by the server. |
 | `ABORTING` | server cleanup worker | `ABORTED` | Hidden entries and inline contents are deleted, the reservation is released exactly once, and the terminal reason/result is retained. A future external mode additionally detaches sealed unowned objects and retains upload/seal attempts, provider-mutation claims, and cleanup debt through `gc_done`. |
 
@@ -1076,6 +1172,22 @@ There are no other transitions. `COMMITTED` and `ABORTED` are terminal.
 expiry does not abandon them, and their workers are durably discoverable after
 a server crash. `COMMITTING` never transitions directly back to `VERIFIED`, and
 `ABORTING` cannot be revived.
+
+Every transition and every same-state mutation in this table is also a
+promotion write governed by the restore-writer transaction guard. The import
+row stores the restore generation and database incarnation accepted by
+`CreateImport`; each commit/cleanup attempt stores the active-writer generation
+that claimed it. A worker may resume after an ordinary process crash only with
+a fresh `NORMAL` lease for that exact installed active tuple. During restore
+drain, the controller may instead issue a `RESTORE_DRAIN` lease that names the
+current fence-writer generation **and** the older attempt generation; the
+transaction validates those values against the locked capability and attempt
+rows respectively. An old process cannot read a newer tuple and silently adopt
+it. Writer-fence failure makes no state, quota, staging, cleanup, or namespace
+mutation. In the supported PITR workflow all service-owned work reaches
+terminal before restore, and activation rejects any nonterminal row restored
+from the historical snapshot, so no cross-incarnation worker adoption is
+implied.
 
 `CreateImport` assigns an immutable `activity_deadline` no later than the
 server's maximum import lifetime. Owner leases and every inline-content write
@@ -1109,11 +1221,13 @@ and safety bounds. It never returns a nominally unexpired grant whose accepted
 request could outlive the import deadline.
 
 Every transition compares and increments `state_version`. Commit and cleanup
-workers additionally claim a durable attempt ID; duplicate workers either
-resume that attempt or observe its terminal state. Reservation settlement and
-release use the reservation ID plus terminal ownership state as their
-idempotency key, so a crash after the accounting write but before the worker
-ack cannot double-charge or double-release.
+workers additionally claim a durable attempt ID plus the current restore,
+database-incarnation, and writer-generation tuple under the locked restore
+guard; duplicate workers either resume that exact attempt or observe its
+terminal state. Reservation settlement and release use the reservation ID plus
+terminal ownership state as their idempotency key, so a crash after the
+accounting write but before the worker ack cannot double-charge or
+double-release.
 
 `CreateImport` receives opaque, random owner and recovery tokens that the
 coordinator generated and fsynced in `PREPARED` before the request. The server
@@ -1152,19 +1266,33 @@ but request lifetime is not ownership of the accepted work. The worker's final
 database transaction is the namespace linearization point. In that transaction
 it:
 
-1. locks the tenant namespace-capability row and requires
+1. first locks the tenant restore-capability row and validates a current signed
+   promotion-writer lease. Normal execution requires `NORMAL` plus `ACTIVE`,
+   with restore generation, database incarnation, writer generation, and the
+   commit attempt's captured tuple matching exactly. Restore drain permits
+   `RESTORE_DRAIN` plus `DRAINING` only for this pre-existing commit attempt:
+   restore generation and database incarnation remain equal, the lease's fence-
+   writer generation must match the capability row, and its separately signed
+   attempt-writer generation must match the durable attempt row;
+2. then locks the tenant namespace-capability row and requires
    `namespace_cas_ready=true` and `namespace_cas_epoch` equal to the epoch
    captured by `CreateImport`;
-2. revalidates tenant ownership, immutable target binding, server policy, and
+3. revalidates tenant ownership, immutable target binding, server policy, and
    quota, but does not reinterpret the initiating caller's mutable scope after
    commit acceptance;
-3. revalidates the target precondition and rename type rules;
-4. verifies the complete staged manifest;
-5. transfers every staged content reference to its committed inode owner;
-6. converts the quota reservation to committed usage without double charge;
-7. materializes the complete remote tree;
-8. writes the committed result and one structural-reset outbox event containing
+4. revalidates the target precondition and rename type rules;
+5. verifies the complete staged manifest;
+6. transfers every staged content reference to its committed inode owner;
+7. converts the quota reservation to committed usage without double charge;
+8. materializes the complete remote tree;
+9. writes the committed result and one structural-reset outbox event containing
    target parent, migration ID, and tree generation.
+
+Every transaction that needs both rows uses this restore-row-then-namespace-row
+lock order. Abort/cleanup workers lock the restore row before the import,
+staging, and quota rows they change. Thus the restore fence transaction has one
+documented serialization point and cannot deadlock behind an inverse lock
+order.
 
 The readiness/epoch check is not satisfied merely because `CommitImport`
 entered `COMMITTING`. If it fails at the final linearization point, that same
@@ -1175,6 +1303,14 @@ rollback/epoch-change transaction and final publish therefore serialize on the
 same tenant row: publish may linearize first under the old valid epoch, or the
 epoch change may win and force the import to abort, but an old worker cannot
 publish afterward.
+
+Restore-writer failure is different from a target/namespace precondition
+failure: a stale worker cannot use the protected database to record its own
+failure. It returns `promotion_restore_fenced` with **zero mutation**. The
+restore controller either observes that the old database is still pre-restore
+and drains/retries the worker under the old generation, or keeps the tenant
+fenced. It never lets a stale worker mark, clean, settle, or publish a restored
+row.
 
 P0 caps manifest entries and total metadata bytes below the database
 transaction and statement limits. A larger tree fails before staging; it is not
@@ -1211,7 +1347,8 @@ import_id_claims(
 
 promotion_import_identity_tenants(
   tenant_id, installed_allocation_epoch, installed_restore_generation,
-  installed_database_incarnation,
+  installed_database_incarnation, installed_writer_generation,
+  restore_admission_state,
   live_claim_count, materialized_identity_count,
   rate_bucket_state, config_generation, updated_at,
   primary key (tenant_id)
@@ -1231,8 +1368,9 @@ promotion_import_identity_global(
 # Stored in a control-plane durability domain outside tenant backup/PITR/clone.
 promotion_identity_epoch_authority(
   tenant_id, current_allocation_epoch, restore_generation, admission_state,
-  lease_generation, max_allocation_lease_not_after,
-  database_incarnation, updated_at,
+  allocation_lease_generation, max_allocation_lease_not_after,
+  writer_generation, max_writer_lease_not_after,
+  database_incarnation, install_grant_digest, updated_at,
   primary key (tenant_id)
 )
 
@@ -1244,9 +1382,14 @@ imports(
   max_content_size, storage_mode, storage_plan_digest,
   backend_capability_generation, inline_threshold, plan_expires_at,
   create_request_digest,
-  namespace_cas_epoch, quota_reservation_id, state, state_version,
-  owner_epoch, owner_token_hash, recovery_token_hash,
-  activity_deadline, lease_expires_at, commit_attempt_id, terminal_reason,
+  namespace_cas_epoch,
+  accepted_restore_generation, accepted_database_incarnation,
+  accepted_writer_generation,
+  quota_reservation_id, state, state_version,
+  owner_epoch, owner_token_hash, recovery_token_hash, activity_deadline,
+  lease_expires_at,
+  commit_attempt_id, commit_writer_generation,
+  cleanup_attempt_id, cleanup_writer_generation, terminal_reason,
   committed_root_inode, committed_generation, terminal_result_blob,
   terminal_result_digest, terminal_at, result_acknowledged_at,
   full_row_compact_not_before, retire_after, created_at, updated_at,
@@ -1348,6 +1491,16 @@ sparse retirement rows includes the full
 `(tenant_id, allocation_epoch, allocation_sequence)` prefix. Omitting the epoch
 from a child key or unique constraint is a schema error, not an implementation
 shortcut.
+
+`promotion_import_identity_tenants` is also the tenant DB restore-capability
+row. Every production function that inserts, updates, or deletes any row above,
+changes promotion quota, or publishes promotion namespace state accepts a
+verified writer-lease tuple and locks this row through one shared guard before
+its first mutation. Direct SQL helpers that omit the guard are not public to
+handlers or workers. Commit and cleanup attempts persist the generation that
+claimed them so a zombie process cannot refresh its authority by merely reading
+the newer capability row. The rollout/test gate enumerates every writer entry
+point; adding a new writer without the guard is a contract and CI failure.
 
 The public `migration_id` is not an independently stored database identity.
 Every handler strictly decodes it, combines the epoch/sequence pair with the
@@ -1901,6 +2054,37 @@ tree. Repeated recovery is idempotent.
   to finish, while the complementary test lets rollback advance the epoch first
   and requires the `COMMITTING` worker to publish nothing and reach `ABORTED`
   with `target_precondition_changed`;
+- every promotion writer versus restore fencing: parameterized production-path
+  barriers pause `CreateImport`, inline content, verify, renew, takeover,
+  commit acceptance, abort, retirement, acknowledgement, deadline/lease
+  scanners, commit publish, abort cleanup, quota settlement, and staging GC
+  after the old process has loaded its work but before its DB mutation. The
+  controller moves the authority to `FENCING`, the old DB through
+  `DRAINING -> FENCED`, drains/expels the old generation, advances restore
+  generation/incarnation, installs a restored DB, and activates the new
+  generation. Releasing each old process must return
+  `promotion_restore_fenced` and leave state version, rows, bytes, quota,
+  namespace and outbox unchanged;
+- complementary drain tests prove that only exact pre-existing commit/cleanup
+  attempts can use `RESTORE_DRAIN` during `DRAINING`; client mutations and new
+  scanner acquisitions remain denied. Client-owned imports are converted once
+  to `ABORTING/promotion_restore_interrupted`, and no drain lease can target a
+  different import or attempt;
+- a transaction that locked the restore-capability row before the fence may
+  finish; the fence transaction waits, and no old-generation transaction can
+  start after it commits. Separate tests hold an unresponsive worker/session or
+  a nonterminal import past the drain deadline: authority remains `FENCING`,
+  the tenant DB remains `DRAINING` or `FENCED`, no PITR/install/ACTIVE step
+  occurs, and normal mutation routing stays disabled;
+- final publish has a dedicated mutation test that retains the namespace CAS
+  checks but removes only the restore-row/attempt-generation guard. The zombie
+  `COMMITTING` worker must then incorrectly publish into the restored
+  incarnation and make the test fail; equivalent guard deletion on `ABORTING`
+  must incorrectly delete/settle restored state and fail;
+- restoring a snapshot containing any nonterminal import rejects activation.
+  Terminal rows remain readable and unused allocation claims are retired under
+  the new install tuple; no restored `COMMITTING`/`ABORTING` row is silently
+  adopted by a new worker generation;
 - unrelated target-parent sibling mutation conservatively returns
   `target_precondition_changed`/`EAGAIN` in P0 while the requested child remains
   absent; it never masquerades as `EEXIST`;
@@ -2013,6 +2197,11 @@ The remaining P0/FUSE concurrency cases are:
   install replays the same tuple without a second epoch row, while changing any
   tuple component conflicts and leaves the tenant fenced. Fake time covers the
   exact maximum-lease-expiry boundary;
+- authority tests lose quorum, fork a stale replica, replay another tenant's
+  install grant, exhaust epoch/writer counters, and restore only the tenant DB.
+  None may issue a lease/grant or change tenant state; CAS history remains
+  monotonic per authenticated tenant and cross-tenant proofs are rejected
+  before lookup;
 - independently deleting the allocation epoch from the canonical ID, proof,
   any durable primary/foreign key, or handler lookup; skipping the
   `FENCING`/lease-drain barrier; or accepting a restored database before exact
@@ -2176,16 +2365,22 @@ external-object adapter:
 - deleting the writer-version/admission check makes the old-writer fixture
   reproduce target ABA and fail the test;
 - tenant PITR/clone is refused until the external promotion-identity authority
-  is `FENCING`, old allocation leases have drained, and a new monotonic epoch
-  and restore generation have been committed outside the restored durability
-  domain. Promotion stays disabled until the restored database installs that
-  exact epoch, restore generation, and database incarnation with a one-use
-  grant and the authority acknowledges the installation;
+  is `FENCING`, old allocation and writer leases/transactions/workers have
+  drained, and a new monotonic epoch and restore generation have been committed
+  outside the restored durability domain. Promotion stays disabled until the
+  restored database installs that exact epoch, restore generation, database
+  incarnation, and writer generation with a one-use grant and the authority
+  acknowledges the installation;
 - restoring a tenant snapshot without advancing the external epoch, replaying
   an install grant, presenting a stale allocation lease, or making the
   authority unavailable leaves allocation fail-closed with
   `promotion_identity_epoch_unavailable` and no identity/quota/staging side
-  effect.
+  effect;
+- old promotion binaries and DB sessions cannot receive new-generation writer
+  credentials. Restoring/activating a tenant requires the capability-row fence,
+  writer-lease expiry, session/worker drain, zero nonterminal restored imports,
+  and exact install acknowledgement; deleting any one gate makes the
+  cross-incarnation zombie-writer fixture mutate restored state and fail.
 
 ### Local recovery and reuse
 
@@ -2261,8 +2456,16 @@ Tests must fail when independently deleting:
   allocation, canonical injective epoch/sequence migration-ID encoding,
   allocation-time encode/decode equality, and decode-before-lookup;
 - the non-rollback promotion-identity authority, exact epoch/restore/
-  incarnation installation, `FENCING` plus allocation-lease drain, and epoch
-  binding in the public ID, proof, every durable key, and every handler lookup;
+  incarnation installation, `FENCING` plus allocation/writer-lease and
+  transaction/worker drain, and epoch binding in the public ID, proof, every
+  durable key, and every handler lookup;
+- the signed promotion-writer lease, locked restore-capability guard on every
+  client and service-owned mutation, durable commit/cleanup attempt generation,
+  generation-scoped DB credentials, zero-nonterminal activation audit, and
+  final publish's restore tuple revalidation;
+- drain timeout or uncertain writer inventory must keep both authority and DB
+  fenced; it must never proceed to PITR or ACTIVE based on routing shutdown
+  alone;
 - full tenant-database PITR after a post-snapshot allocation must not alias the
   old proof with a new operation, even when the restored database is internally
   self-consistent and reuses the same numeric sequence;
