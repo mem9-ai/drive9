@@ -25,6 +25,7 @@ var (
 	ErrPromotionIdentityCapacityUnavailable = errors.New("promotion identity capacity unavailable")
 	ErrPromotionIdentityEpochUnavailable    = errors.New("promotion identity epoch unavailable")
 	ErrPromotionQuotaExceeded               = errors.New("promotion quota exceeded")
+	ErrPromotionDeadlineExceeded            = errors.New("promotion activity deadline exceeded")
 	ErrPromotionRestoreFenced               = errors.New("promotion writes are restore-fenced")
 	ErrPromotionIDRetired                   = errors.New("promotion migration id is retired")
 	ErrPromotionRecoveryRequired            = errors.New("promotion recovery is required")
@@ -95,7 +96,7 @@ type PromotionStoreConfig struct {
 	LeaseTTL       time.Duration
 }
 
-// PromotionStore owns the Plan/Allocate/Create transaction boundary.
+// PromotionStore owns the promotion admission and state-transition boundaries.
 type PromotionStore struct {
 	store *Store
 	cfg   PromotionStoreConfig
