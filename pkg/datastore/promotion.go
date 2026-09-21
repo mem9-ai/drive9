@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"strings"
 	"time"
 
@@ -1088,16 +1089,37 @@ func consumePromotionRate(raw sql.NullString, now time.Time, ratePerMinute, burs
 		}
 		if refill >= capacity-bucket.TokensMilli {
 			bucket.TokensMilli = capacity
+			bucket.UpdatedUnixMilli = now.UnixMilli()
 		} else {
 			bucket.TokensMilli += refill
+			// Preserve sub-millitoken elapsed time across denied retries. Moving
+			// the timestamp all the way to now after a rounded-zero refill lets a
+			// fast retry loop discard time forever and starve the bucket. Advance
+			// only by the elapsed milliseconds actually represented by the
+			// credited integer refill, rounded up so admission never over-refills.
+			if refill != 0 {
+				consumed := ceilPromotionMulDiv(refill, 60, ratePerMinute)
+				if consumed > elapsed {
+					consumed = elapsed
+				}
+				bucket.UpdatedUnixMilli += int64(consumed)
+			}
 		}
-		bucket.UpdatedUnixMilli = now.UnixMilli()
 	}
 	if bucket.TokensMilli < 1000 {
 		return bucket, ErrPromotionIdentityBudgetExceeded
 	}
 	bucket.TokensMilli -= 1000
 	return bucket, nil
+}
+
+func ceilPromotionMulDiv(value, multiplier, divisor uint64) uint64 {
+	hi, lo := bits.Mul64(value, multiplier)
+	quotient, remainder := bits.Div64(hi, lo, divisor)
+	if remainder != 0 {
+		quotient++
+	}
+	return quotient
 }
 
 func promotionCreateRequestDigest(req PromotionCreateRequest, target, proofDigest, ownerHash, recoveryHash string) (string, error) {

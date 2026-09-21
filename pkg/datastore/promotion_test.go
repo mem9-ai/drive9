@@ -307,6 +307,33 @@ func TestPromotionAllocationRateDenialPersistsFutureClockRecovery(t *testing.T) 
 	}
 }
 
+func TestPromotionAllocationRateFastDeniedRetriesDoNotDiscardElapsedTime(t *testing.T) {
+	start := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	bucket := promotionRateBucket{TokensMilli: 0, UpdatedUnixMilli: start.UnixMilli()}
+	for elapsed := time.Millisecond; elapsed <= time.Minute; elapsed += time.Millisecond {
+		raw, err := json.Marshal(bucket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next, err := consumePromotionRate(sql.NullString{Valid: true, String: string(raw)}, start.Add(elapsed), 1, 1)
+		if elapsed < time.Minute {
+			if !errors.Is(err, ErrPromotionIdentityBudgetExceeded) {
+				t.Fatalf("elapsed=%s error=%v, want rate denial", elapsed, err)
+			}
+			bucket = next
+			continue
+		}
+		if err != nil {
+			t.Fatalf("full refill interval remained starved: %v (bucket=%+v)", err, next)
+		}
+		if next.TokensMilli != 0 {
+			t.Fatalf("post-consume bucket=%+v, want exactly one recovered token consumed", next)
+		}
+		return
+	}
+	t.Fatal("rate liveness loop did not reach full interval")
+}
+
 func TestPromotionNamespaceAdmissionGatesPlanAndAllocateBeforeSideEffects(t *testing.T) {
 	for _, test := range []struct {
 		name  string
