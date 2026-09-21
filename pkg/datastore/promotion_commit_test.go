@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"syscall"
 	"testing"
 	"time"
 
@@ -553,6 +554,86 @@ func TestPromotionJFSProjectionWritersMaintainRootGeneration(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, errno)
 	require.Equal(t, rootBefore+3, promotionRootGeneration(t, store))
+}
+
+func TestPromotionJFSFailedNamespaceOpsDoNotAdvanceGeneration(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("mknod_eexist", func(t *testing.T) {
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+		create, err := json.Marshal(map[string]any{
+			"parent": 1, "name": "extent", "type": 1, "mode": 0o644,
+			"inode": 2, "proj_path": "/extent",
+			"attr": ExtentAttr{Typ: 1, Mode: 0o644, Nlink: 1, Parent: 1, Full: true},
+		})
+		require.NoError(t, err)
+		_, errno, err := store.RunExtentMetaOp(ctx, "mknod", create, nil)
+		require.NoError(t, err)
+		require.Zero(t, errno)
+		verified, _ := createVerifiedPromotionImportOnStore(
+			t, promotionStore, nil, "allocate-jfs-errno-mknod", "/published",
+		)
+		before := promotionRootGeneration(t, store)
+
+		_, errno, err = store.RunExtentMetaOp(ctx, "mknod", create, nil)
+		require.NoError(t, err)
+		require.Equal(t, int(syscall.EEXIST), errno)
+		require.Equal(t, before, promotionRootGeneration(t, store))
+		var extentNodes int
+		require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE path = '/extent'`).Scan(&extentNodes))
+		require.Equal(t, 1, extentNodes)
+		_, err = promotionStore.CommitImport(ctx, commitPromotionRequest(verified))
+		require.NoError(t, err)
+	})
+
+	t.Run("unlink_enoent", func(t *testing.T) {
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+		verified, _ := createVerifiedPromotionImportOnStore(
+			t, promotionStore, nil, "allocate-jfs-errno-unlink", "/published",
+		)
+		before := promotionRootGeneration(t, store)
+		unlink, err := json.Marshal(map[string]any{
+			"parent": 1, "name": "missing", "proj_path": "/missing", "opened": false,
+		})
+		require.NoError(t, err)
+
+		_, errno, err := store.RunExtentMetaOp(ctx, "unlink", unlink, nil)
+		require.NoError(t, err)
+		require.Equal(t, int(syscall.ENOENT), errno)
+		require.Equal(t, before, promotionRootGeneration(t, store))
+		var missingNodes int
+		require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE path = '/missing'`).Scan(&missingNodes))
+		require.Zero(t, missingNodes)
+		_, err = promotionStore.CommitImport(ctx, commitPromotionRequest(verified))
+		require.NoError(t, err)
+	})
+
+	t.Run("rename_enoent", func(t *testing.T) {
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+		verified, _ := createVerifiedPromotionImportOnStore(
+			t, promotionStore, nil, "allocate-jfs-errno-rename", "/published",
+		)
+		before := promotionRootGeneration(t, store)
+		rename, err := json.Marshal(map[string]any{
+			"src_parent": 1, "src_name": "missing", "dst_parent": 1, "dst_name": "renamed",
+			"src_path": "/missing", "dst_path": "/renamed",
+		})
+		require.NoError(t, err)
+
+		_, errno, err := store.RunExtentMetaOp(ctx, "rename", rename, nil)
+		require.NoError(t, err)
+		require.Equal(t, int(syscall.ENOENT), errno)
+		require.Equal(t, before, promotionRootGeneration(t, store))
+		var movedNodes int
+		require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM file_nodes
+			WHERE path IN ('/missing', '/renamed')`).Scan(&movedNodes))
+		require.Zero(t, movedNodes)
+		_, err = promotionStore.CommitImport(ctx, commitPromotionRequest(verified))
+		require.NoError(t, err)
+	})
 }
 
 func TestPromotionCommitNamespaceEpochChangeAfterAcceptancePublishesNothing(t *testing.T) {

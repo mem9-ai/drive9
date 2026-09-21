@@ -181,11 +181,6 @@ func (s *Store) jfsRequireDirTx(tx *sql.Tx, ino uint64) (int, error) {
 }
 
 func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name string, typ uint8, mode, cumask uint16, inode uint64, attr ExtentAttr, projPath string, uid, gid uint32, symlinkTarget string) (uint64, *ExtentAttr, int, error) {
-	if typ != jfsTypeDir && projPath != "" {
-		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, pathutil.ParentPath(projPath)); err != nil {
-			return 0, nil, 0, err
-		}
-	}
 	if parent == 0 {
 		parent = jfsRootIno
 	}
@@ -216,6 +211,15 @@ func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name 
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, nil, 0, err
+	}
+	// The extent RPC reports ordinary filesystem failures as errno while its
+	// transaction still commits. Do not claim a namespace generation until all
+	// errno-only preconditions have passed: a duplicate mknod must not make an
+	// unrelated accepted promotion permanently fail its target CAS.
+	if typ != jfsTypeDir && projPath != "" {
+		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, pathutil.ParentPath(projPath)); err != nil {
+			return 0, nil, 0, err
+		}
 	}
 	if inode == 0 {
 		v, err := s.jfsIncrCounterTx(tx, "nextInode", 1)
@@ -498,11 +502,6 @@ func (s *Store) jfsOpenRefTx(tx *sql.Tx, sid, ino uint64) (int, error) {
 // both quota planes read — never drops: truncate-then-delete cycles would wedge
 // a tenant at EDQUOT with no live data.
 func (s *Store) jfsUnlinkTx(ctx context.Context, tx *sql.Tx, parent uint64, name, projPath string, sid uint64, opened bool) (*ExtentAttr, int, error) {
-	if projPath != "" {
-		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, pathutil.ParentPath(projPath)); err != nil {
-			return nil, 0, err
-		}
-	}
 	var ino uint64
 	var typ uint8
 	// FOR UPDATE, like upstream doUnlink's ForUpdate().Get(&e). The nlink
@@ -548,6 +547,15 @@ func (s *Store) jfsUnlinkTx(ctx context.Context, tx *sql.Tx, parent uint64, name
 			}
 			if cerr == nil {
 				return nil, int(syscall.ENOENT), nil
+			}
+			// A stale projection is an actual namespace mutation even though the
+			// missing jfs edge makes the public result ENOENT. Lock and advance its
+			// parent only after proving that there is a row to remove; a plain
+			// missing-name ENOENT must remain generation-neutral.
+			if serr == nil {
+				if berr := s.bumpPromotionParentGenerationsTx(ctx, tx, pathutil.ParentPath(projPath)); berr != nil {
+					return nil, 0, berr
+				}
 			}
 			if _, derr := tx.Exec(`DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
 				s.scope.Args(fileNodePathHash(projPath), projPath)...); derr != nil {
@@ -613,12 +621,17 @@ func (s *Store) jfsUnlinkTx(ctx context.Context, tx *sql.Tx, parent uint64, name
 	if err != nil || eno != 0 {
 		return attr, eno, err
 	}
-	if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? AND name = ?`, parent, []byte(name)); err != nil {
-		return nil, 0, err
-	}
 	path := projPath
 	if path == "" {
 		path, _ = s.jfsProjectionPathTx(tx, parent, name)
+	}
+	if path != "" {
+		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, pathutil.ParentPath(path)); err != nil {
+			return nil, 0, err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? AND name = ?`, parent, []byte(name)); err != nil {
+		return nil, 0, err
 	}
 	// Capture the drive9 inode id before the projection row goes: the
 	// last-reference branch below has to mark it deleted.
@@ -727,7 +740,7 @@ func (s *Store) jfsProjectionPathTx(tx *sql.Tx, parent uint64, name string) (str
 	}
 	return strings.TrimSuffix(p.String, "/") + "/" + name, nil
 }
-func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (uint64, *ExtentAttr, int, error) {
+func (s *Store) jfsRmdirTx(ctx context.Context, tx *sql.Tx, parent uint64, name, projPath string) (uint64, *ExtentAttr, int, error) {
 	var ino uint64
 	var typ uint8
 	// Locking read, matching jfsUnlinkTx: one dentry can be addressed by two
@@ -763,6 +776,11 @@ func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (ui
 	if err != nil {
 		return 0, nil, 0, err
 	}
+	if projPath != "" {
+		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, pathutil.ParentPath(projPath)); err != nil {
+			return 0, nil, 0, err
+		}
+	}
 	if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? AND name = ?`, parent, []byte(name)); err != nil {
 		return 0, nil, 0, err
 	}
@@ -783,15 +801,6 @@ func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (ui
 // all — Store.RenameFileReplacingTarget removes a replaced extent destination with
 // its own jfsUnlinkTx(..., opened = false).
 func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, srcName string, dstParent uint64, dstName, srcPath, dstPath string, flags uint32, dstOpened bool, sid uint64) (uint64, uint64, *ExtentAttr, *ExtentAttr, int, error) {
-	if dstPath != "" {
-		parents := []string{pathutil.ParentPath(dstPath)}
-		if srcPath != "" {
-			parents = append(parents, pathutil.ParentPath(srcPath))
-		}
-		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parents...); err != nil {
-			return 0, 0, nil, nil, 0, err
-		}
-	}
 	ino, attr, eno, err := s.jfsLookupForUpdateTx(tx, srcParent, srcName)
 	if err != nil || eno != 0 {
 		return 0, 0, nil, nil, eno, err
@@ -841,7 +850,7 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 				// (another client's unlink): there is nothing to replace, so the
 				// rename proceeds.
 			case dstAttr.Typ == jfsTypeDir && ueno == int(syscall.EPERM):
-				if _, _, reno, rerr := s.jfsRmdirTx(tx, dstParent, dstName, dstPath); rerr != nil || reno != 0 {
+				if _, _, reno, rerr := s.jfsRmdirTx(ctx, tx, dstParent, dstName, dstPath); rerr != nil || reno != 0 {
 					return 0, exist, attr, dstAttr, reno, rerr
 				}
 			default:
@@ -851,15 +860,29 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, 0, nil, nil, 0, err
 	}
+	// All errno-only exits are now behind us. Acquire the promotion namespace
+	// fence in this transaction immediately before changing the source edge.
+	// Destination replacement above uses unlink/rmdir, which applies the same
+	// rule to its own successful mutation and leaves failure paths neutral.
+	if dstPath != "" {
+		parents := []string{pathutil.ParentPath(dstPath)}
+		if srcPath != "" {
+			parents = append(parents, pathutil.ParentPath(srcPath))
+		}
+		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parents...); err != nil {
+			return 0, 0, nil, nil, 0, err
+		}
+	}
 	res, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? AND name = ?`, srcParent, []byte(srcName))
 	if err != nil {
 		return 0, 0, nil, nil, 0, err
 	}
-	// The source edge is locked above, so this can only be zero if the caller
-	// raced a state change this transaction cannot see; report ENOENT rather
-	// than inserting a destination edge for a name that no longer exists.
+	// The source edge is locked above, so this can only be zero if the database
+	// violated the locked read. Return a Go error so RunExtentMetaOp rolls the
+	// transaction back, including the generation claim, rather than committing
+	// an errno-only pseudo mutation.
 	if n, aerr := res.RowsAffected(); aerr == nil && n == 0 {
-		return 0, 0, nil, nil, int(syscall.ENOENT), nil
+		return 0, 0, nil, nil, 0, fmt.Errorf("jfs rename: locked source edge disappeared")
 	}
 	// No blind DELETE of whatever now sits on the destination name. Every
 	// destination edge this transaction knows about was already removed above
@@ -1081,9 +1104,6 @@ func (s *Store) jfsRenameDirEdgeTx(tx *sql.Tx, ino, newParent uint64, newName st
 	return s.jfsMoveEdgeTx(tx, parent, string(name), ino, newParent, newName)
 }
 func (s *Store) unlinkExtentPathTx(ctx context.Context, tx *sql.Tx, path string, opened bool) error {
-	if err := s.bumpPromotionParentGenerationsTx(ctx, tx, pathutil.ParentPath(path)); err != nil {
-		return err
-	}
 	var ino sql.NullInt64
 	var layout sql.NullString
 	// FOR UPDATE: the node-gone branch below deletes this row, and a rename that
@@ -1113,6 +1133,9 @@ func (s *Store) unlinkExtentPathTx(ctx context.Context, tx *sql.Tx, path string,
 		// waited for the lock would otherwise have that row deleted under it.
 		// Matching extent_ino is exact here — this inode's jfs node is gone, so
 		// no rename can be moving a row for it.
+		if err := s.bumpPromotionParentGenerationsTx(ctx, tx, pathutil.ParentPath(path)); err != nil {
+			return err
+		}
 		_, err = tx.Exec(`DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ? AND extent_ino = ?`),
 			append(s.scope.Args(fileNodePathHash(path), path), uint64(ino.Int64))...)
 		return err

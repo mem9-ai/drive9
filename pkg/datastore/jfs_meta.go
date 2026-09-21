@@ -642,7 +642,7 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 		if err := json.Unmarshal(raw, &in); err != nil {
 			return nil, int(syscall.EINVAL), err
 		}
-		ino, attr, eno, err := s.jfsRmdirTx(tx, in.Parent, in.Name, in.ProjPath)
+		ino, attr, eno, err := s.jfsRmdirTx(ctx, tx, in.Parent, in.Name, in.ProjPath)
 		if err != nil {
 			return nil, int(syscall.EIO), err
 		}
