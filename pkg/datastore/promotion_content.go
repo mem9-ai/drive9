@@ -82,6 +82,8 @@ type promotionOwnerImport struct {
 	terminalReason                 sql.NullString
 	commitAttemptID                sql.NullString
 	commitWriterGeneration         sql.NullInt64
+	cleanupAttemptID               sql.NullString
+	cleanupWriterGeneration        sql.NullInt64
 }
 
 type promotionEntryRow struct {
@@ -106,6 +108,11 @@ type promotionContentRow struct {
 	checksum       string
 	sealState      string
 	ownershipState string
+}
+
+type promotionStoredManifest struct {
+	entriesByContentID map[string]promotionEntryRow
+	fileCount          uint64
 }
 
 // PutInlineImportContent stores and binds one immutable inline content row.
@@ -555,7 +562,8 @@ func (s *PromotionStore) lockPromotionOwnerImport(ctx context.Context, tx *sql.T
 		target_parent_edge_incarnation, target_parent_children_generation,
 		state, state_version, owner_epoch, owner_token_hash,
 		activity_deadline, lease_expires_at, terminal_reason,
-		commit_attempt_id, commit_writer_generation
+		commit_attempt_id, commit_writer_generation,
+		cleanup_attempt_id, cleanup_writer_generation
 		FROM promotion_imports
 		WHERE tenant_id = ? AND allocation_epoch = ? AND allocation_sequence = ? FOR UPDATE`,
 		tenantID, identity.AllocationEpoch, identity.AllocationSequence).
@@ -566,7 +574,8 @@ func (s *PromotionStore) lockPromotionOwnerImport(ctx context.Context, tx *sql.T
 			&row.targetParentEdgeIncarnation, &row.targetParentChildrenGeneration,
 			&row.state, &row.stateVersion, &row.ownerEpoch, &row.ownerTokenHash,
 			&row.activityDeadline, &row.leaseExpiresAt, &row.terminalReason,
-			&row.commitAttemptID, &row.commitWriterGeneration)
+			&row.commitAttemptID, &row.commitWriterGeneration,
+			&row.cleanupAttemptID, &row.cleanupWriterGeneration)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -757,11 +766,22 @@ func selectPromotionContentsTx(ctx context.Context, tx *sql.Tx, tenantID string,
 }
 
 func validatePromotionCompleteManifest(importRow *promotionOwnerImport, entries []promotionEntryRow, contents []promotionContentRow) error {
+	stored, err := validatePromotionStoredManifest(importRow, entries)
+	if err != nil {
+		return err
+	}
+	if uint64(len(stored.entriesByContentID)) != stored.fileCount {
+		return ErrPromotionConflict
+	}
+	return validatePromotionStagedContents(stored, contents)
+}
+
+func validatePromotionStoredManifest(importRow *promotionOwnerImport, entries []promotionEntryRow) (*promotionStoredManifest, error) {
 	manifestEntries := make([]promotion.ManifestEntry, 0, len(entries))
-	referenced := make(map[string]int, len(contents))
+	stored := &promotionStoredManifest{entriesByContentID: make(map[string]promotionEntryRow)}
 	for _, entry := range entries {
 		if entry.metadataBlob.Valid {
-			return ErrPromotionRecoveryRequired
+			return nil, ErrPromotionRecoveryRequired
 		}
 		manifestEntry := promotion.ManifestEntry{
 			RelativePath: entry.relativePath, Type: entry.entryType, Mode: entry.mode,
@@ -774,19 +794,40 @@ func validatePromotionCompleteManifest(importRow *promotionOwnerImport, entries 
 		manifestEntries = append(manifestEntries, manifestEntry)
 		switch entry.entryType {
 		case promotion.EntryTypeFile:
-			if !entry.contentID.Valid || entry.contentID.String == "" {
-				return ErrPromotionConflict
+			stored.fileCount++
+			if !entry.contentID.Valid {
+				continue
 			}
-			referenced[entry.contentID.String]++
+			if entry.contentID.String == "" {
+				return nil, ErrPromotionRecoveryRequired
+			}
+			if _, exists := stored.entriesByContentID[entry.contentID.String]; exists {
+				return nil, ErrPromotionRecoveryRequired
+			}
+			stored.entriesByContentID[entry.contentID.String] = entry
 		case promotion.EntryTypeDirectory, promotion.EntryTypeSymlink:
 			if entry.contentID.Valid {
-				return ErrPromotionRecoveryRequired
+				return nil, ErrPromotionRecoveryRequired
 			}
 		default:
-			return ErrPromotionRecoveryRequired
+			return nil, ErrPromotionRecoveryRequired
 		}
 	}
-	if uint64(len(entries)) != importRow.entryTotal || uint64(len(contents)) != uint64(len(referenced)) {
+	if uint64(len(entries)) != importRow.entryTotal {
+		return nil, ErrPromotionRecoveryRequired
+	}
+	limits := promotionStoredManifestLimits(manifestEntries, importRow.inlineThreshold)
+	manifest, err := promotion.ValidateCanonicalManifest(manifestEntries, limits)
+	if err != nil || manifest.ManifestHash != importRow.manifestHash ||
+		manifest.EntryTotal != importRow.entryTotal || manifest.ByteTotal != importRow.byteTotal ||
+		manifest.MaxContentSize != importRow.maxContentSize {
+		return nil, ErrPromotionRecoveryRequired
+	}
+	return stored, nil
+}
+
+func validatePromotionStagedContents(stored *promotionStoredManifest, contents []promotionContentRow) error {
+	if uint64(len(contents)) != uint64(len(stored.entriesByContentID)) {
 		return ErrPromotionRecoveryRequired
 	}
 	contentByID := make(map[string]promotionContentRow, len(contents))
@@ -800,25 +841,12 @@ func validatePromotionCompleteManifest(importRow *promotionOwnerImport, entries 
 		}
 		contentByID[content.contentID] = content
 	}
-	for _, entry := range entries {
-		if entry.entryType != promotion.EntryTypeFile {
-			continue
-		}
-		if referenced[entry.contentID.String] != 1 {
-			return ErrPromotionRecoveryRequired
-		}
-		content, ok := contentByID[entry.contentID.String]
+	for contentID, entry := range stored.entriesByContentID {
+		content, ok := contentByID[contentID]
 		if !ok || content.size != entry.expectedSize || content.checksum != entry.expectedChecksum ||
 			uint64(len(content.body)) != entry.expectedSize {
 			return ErrPromotionRecoveryRequired
 		}
-	}
-	limits := promotionStoredManifestLimits(manifestEntries, importRow.inlineThreshold)
-	manifest, err := promotion.ValidateCanonicalManifest(manifestEntries, limits)
-	if err != nil || manifest.ManifestHash != importRow.manifestHash ||
-		manifest.EntryTotal != importRow.entryTotal || manifest.ByteTotal != importRow.byteTotal ||
-		manifest.MaxContentSize != importRow.maxContentSize {
-		return ErrPromotionRecoveryRequired
 	}
 	return nil
 }
