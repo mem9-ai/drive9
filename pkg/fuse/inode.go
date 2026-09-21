@@ -32,6 +32,15 @@ type InodeEntry struct {
 	// ExtentIno is the JuiceFS inode for content_layout=extent files.
 	// Shared across hardlink aliases of the same FUSE inode.
 	ExtentIno uint64
+	// MtimeOverride/AtimeOverride hold times explicitly set by a time-only
+	// SetAttr (utimensat/futimens), including while the file's content commit
+	// is still pending. While armed, derived refreshes (async commit
+	// completion, remote stat, directory re-listings) must not clobber them;
+	// any later local mutation (write, truncate, metadata change) clears
+	// them. The pointed-to values are immutable once published; holders only
+	// replace the pointer, never mutate through it.
+	MtimeOverride *time.Time
+	AtimeOverride *time.Time
 }
 
 // InodeToPath provides a bidirectional mapping between inode numbers and
@@ -522,23 +531,103 @@ func (m *InodeToPath) UpdateSize(ino uint64, size int64) {
 }
 
 // UpdateMtime updates the mtime of the entry identified by the given inode.
+// This is the user-mutation variant: the new time is authoritative, so any
+// armed local time override is cleared.
 func (m *InodeToPath) UpdateMtime(ino uint64, mtime time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Mtime = mtime
+		entry.MtimeOverride = nil
 	}
 }
 
 // UpdateAtime updates the atime of the entry identified by the given inode.
+// This is the user-mutation variant: the new time is authoritative, so any
+// armed local time override is cleared.
 func (m *InodeToPath) UpdateAtime(ino uint64, atime time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Atime = atime
+		entry.AtimeOverride = nil
 	}
+}
+
+// SetLocalMtime records an mtime explicitly requested via SetAttr and arms
+// the local override so derived refreshes (commit completion, stat, listings)
+// cannot clobber it until the next local mutation clears it.
+func (m *InodeToPath) SetLocalMtime(ino uint64, mtime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Mtime = mtime
+		t := mtime
+		entry.MtimeOverride = &t
+	}
+}
+
+// SetLocalAtime records an atime explicitly requested via SetAttr and arms
+// the local override so derived refreshes cannot clobber it.
+func (m *InodeToPath) SetLocalAtime(ino uint64, atime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Atime = atime
+		t := atime
+		entry.AtimeOverride = &t
+	}
+}
+
+// MtimeOverride returns the armed local mtime override, if any.
+func (m *InodeToPath) MtimeOverride(ino uint64) (time.Time, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok || entry.MtimeOverride == nil {
+		return time.Time{}, false
+	}
+	return *entry.MtimeOverride, true
+}
+
+// HasMtimeOverride reports whether a local mtime override is armed.
+func (m *InodeToPath) HasMtimeOverride(ino uint64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entry, ok := m.byInode[ino]
+	return ok && entry.MtimeOverride != nil
+}
+
+// UpdateMtimeDerived updates the mtime from a derived source (async commit
+// completion, remote stat refresh). An armed local override wins.
+func (m *InodeToPath) UpdateMtimeDerived(ino uint64, mtime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok || entry.MtimeOverride != nil {
+		return
+	}
+	entry.Mtime = mtime
+}
+
+// UpdateAtimeDerived updates the atime from a derived source. An armed local
+// override wins.
+func (m *InodeToPath) UpdateAtimeDerived(ino uint64, atime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok || entry.AtimeOverride != nil {
+		return
+	}
+	entry.Atime = atime
 }
 
 // UpdateCtime updates the ctime of the entry identified by the given inode.
@@ -743,7 +832,12 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 	if entry.ExtentIno == 0 || isDir || size >= entry.Size {
 		entry.Size = size
 	}
-	entry.Mtime = mtime
+	// A listing reseed is a derived refresh: keep an explicitly SetAttr'd
+	// time (still pending or diverged from the server view) instead of the
+	// listing mtime, which for a just-committed file is the commit time.
+	if entry.MtimeOverride == nil {
+		entry.Mtime = mtime
+	}
 	m.setIdentityLocked(entry, resourceID)
 	if nlink > 0 {
 		entry.Nlink = nlink

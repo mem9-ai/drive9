@@ -6823,9 +6823,12 @@ func (fs *Dat9FS) updateEntryFromStat(entry *InodeEntry, stat *client.StatResult
 		entry.HasMode = true
 		fs.inodes.UpdateMode(entry.Ino, stat.Mode)
 	}
-	if !stat.Mtime.IsZero() {
+	// A remote stat is a derived refresh: keep an armed local time override
+	// (explicit utimensat still diverged from the server view) instead of the
+	// server mtime, which for a just-committed file is the commit time.
+	if !stat.Mtime.IsZero() && !fs.inodes.HasMtimeOverride(entry.Ino) {
 		entry.Mtime = stat.Mtime
-		fs.inodes.UpdateMtime(entry.Ino, stat.Mtime)
+		fs.inodes.UpdateMtimeDerived(entry.Ino, stat.Mtime)
 	}
 	return entry
 }
@@ -7488,8 +7491,12 @@ func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
 	if entry.Revision > 0 && item.Revision > 0 && item.Revision < entry.Revision {
 		return nil, false
 	}
+	// An armed local time override (explicit utimensat) always wins over the
+	// dir-cache mtime, which for a just-committed file is the commit time.
 	mtime := item.Mtime
-	if mtime.IsZero() || (!entry.Mtime.IsZero() && entry.Mtime.After(mtime)) {
+	if override, ok := fs.inodes.MtimeOverride(entry.Ino); ok {
+		mtime = override
+	} else if mtime.IsZero() || (!entry.Mtime.IsZero() && entry.Mtime.After(mtime)) {
 		mtime = entry.Mtime
 	}
 	if mtime.IsZero() {
@@ -7511,7 +7518,7 @@ func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
 		fs.inodes.UpdateRevision(entry.Ino, item.Revision)
 	}
 	fs.inodes.UpdateSize(entry.Ino, item.Size)
-	fs.inodes.UpdateMtime(entry.Ino, mtime)
+	fs.inodes.UpdateMtimeDerived(entry.Ino, mtime)
 	if item.HasMode {
 		cached.Mode = item.Mode
 		cached.HasMode = true
@@ -8905,10 +8912,12 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 					// have a newer local mtime. This prevents a stale remote mtime
 					// (e.g. creation time from before a local truncation) from
 					// clobbering a locally-updated mtime after the dirty handle is
-					// flushed and the remote stat path runs.
-					if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
+					// flushed and the remote stat path runs. An armed local time
+					// override (explicit utimensat) always wins.
+					if !fs.inodes.HasMtimeOverride(input.NodeId) &&
+						(entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime)) {
 						entry.Mtime = stat.Mtime
-						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+						fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
 					}
 				}
 			}
@@ -8943,9 +8952,10 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 					fs.inodes.UpdateMode(input.NodeId, stat.Mode)
 				}
 				if !stat.Mtime.IsZero() {
-					if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
+					if !fs.inodes.HasMtimeOverride(input.NodeId) &&
+						(entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime)) {
 						entry.Mtime = stat.Mtime
-						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+						fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
 					}
 				}
 			}
@@ -9282,6 +9292,25 @@ func setAttrCallerOwner(input *gofuse.SetAttrIn) gofuse.Owner {
 	return gofuse.Owner{Uid: header.Uid, Gid: header.Gid}
 }
 
+// setattrTimeOnlyValid is the SetAttr flag subset that only touches
+// timestamps: mtime/atime (including the "now" variants), an optional file
+// handle, and the ctime the kernel attaches to metadata updates.
+const setattrTimeOnlyValid = gofuse.FATTR_MTIME | gofuse.FATTR_ATIME |
+	gofuse.FATTR_MTIME_NOW | gofuse.FATTR_ATIME_NOW |
+	gofuse.FATTR_FH | gofuse.FATTR_CTIME
+
+// isTimeOnlySetAttr reports whether this SetAttr only updates times. Such a
+// request mutates no remotely-committed state, so it must not wait for (or
+// order against) a pending writeback commit of the same path. Any other flag
+// — size, mode, owner, lock owner, suid/sgid kill — keeps the original
+// commit fence.
+func isTimeOnlySetAttr(input *gofuse.SetAttrIn) bool {
+	if input.Valid&^setattrTimeOnlyValid != 0 {
+		return false
+	}
+	return input.Valid&(gofuse.FATTR_MTIME|gofuse.FATTR_ATIME) != 0
+}
+
 func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseSetAttr, perfStart, status, 0) }()
@@ -9410,22 +9439,58 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			return fs.extentSetAttr(cancel, input, entry, out)
 		}
 	}
+	if isTimeOnlySetAttr(input) {
+		// Pure utimensat/futimens: the time branches below only update
+		// mount-local state (times are not carried by remote commits), so
+		// fencing behind the path's pending writeback commit would serialize
+		// the caller behind the upload for no ordering benefit — e.g. unzip
+		// restoring each file's mtime right after close() collapsed to ~1
+		// commit latency per file (#954). Apply locally instead and arm the
+		// local time override so the in-flight commit's completion, stat
+		// refreshes, and directory reseedings cannot clobber the times.
+		metadataChanged := false
+		if mtime, ok := input.GetMTime(); ok {
+			entry.Mtime = mtime
+			fs.inodes.SetLocalMtime(input.NodeId, mtime)
+			metadataChanged = true
+		}
+		if atime, ok := input.GetATime(); ok {
+			entry.Atime = atime
+			fs.inodes.SetLocalAtime(input.NodeId, atime)
+			metadataChanged = true
+		}
+		if metadataChanged {
+			ctime := time.Now()
+			entry.Ctime = ctime
+			fs.inodes.UpdateCtime(input.NodeId, ctime)
+			fs.cacheEntryForPath(entry.Path, entry)
+		}
+		if entry.IsDir {
+			fs.extentMirrorDirAttr(input, entry)
+		}
+		fs.fillAttr(entry, &out.Attr)
+		fs.setAttrOutTimeout(out, false)
+		return gofuse.OK
+	}
 	unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(entry.Path)
 	defer unlockRemoteCommit()
 
 	metadataChanged := false
 
-	// Handle mtime updates
+	// Handle mtime updates. Times are mount-local (not part of remote
+	// commits), but this path may also carry size/mode/owner flags, so the
+	// fence above has already ordered us behind any pending commit; arm the
+	// override so later derived refreshes keep the requested time.
 	if mtime, ok := input.GetMTime(); ok {
 		entry.Mtime = mtime
-		fs.inodes.UpdateMtime(input.NodeId, mtime)
+		fs.inodes.SetLocalMtime(input.NodeId, mtime)
 		metadataChanged = true
 	}
 
 	// Handle atime updates.
 	if atime, ok := input.GetATime(); ok {
 		entry.Atime = atime
-		fs.inodes.UpdateAtime(input.NodeId, atime)
+		fs.inodes.SetLocalAtime(input.NodeId, atime)
 		metadataChanged = true
 	}
 
@@ -17088,7 +17153,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		if entry.HasMode {
 			fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
 		}
-		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
+		fs.cacheFileForPath(entry.Path, entry.Size, fs.commitSettleMtime(entry.Inode, time.Now()), 0)
 		return
 	}
 	if committedRev > 0 {
@@ -17115,21 +17180,22 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		if entry.HasMode {
 			fs.inodes.UpdateMode(entry.Inode, entry.Mode&posixPermissionModeMask)
 		}
-		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), committedRev)
+		fs.cacheFileForPath(entry.Path, entry.Size, fs.commitSettleMtime(entry.Inode, time.Now()), committedRev)
 		// Local async commit completion — this is not an external change.
 		// Kernel does not need notify; userspace caches and inode state
 		// are updated above. Kernel will see new attrs on next access.
 	} else {
 		fs.invalidateReadCacheAndTargets(entry.Path)
+		settleMtime := fs.commitSettleMtime(entry.Inode, time.Now())
 		if entry.Inode > 0 {
 			fs.inodes.UpdateSize(entry.Inode, entry.Size)
-			fs.inodes.UpdateMtime(entry.Inode, time.Now())
+			fs.inodes.UpdateMtimeDerived(entry.Inode, settleMtime)
 			if entry.HasMode {
 				fs.inodes.UpdateMode(entry.Inode, entry.Mode&posixPermissionModeMask)
 			}
 			fs.notifyInode(entry.Inode)
 		}
-		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
+		fs.cacheFileForPath(entry.Path, entry.Size, settleMtime, 0)
 	}
 }
 
@@ -17146,6 +17212,17 @@ func (fs *Dat9FS) clearCommittedAppendSnapshot(entry *CommitEntry) {
 		}
 		fh.Unlock()
 	}
+}
+
+// commitSettleMtime keeps an armed local time override (explicit utimensat on
+// a file whose commit was still in flight) visible in the dir cache and inode
+// state when the async commit settles.
+func (fs *Dat9FS) commitSettleMtime(ino uint64, now time.Time) time.Time {
+	if t, ok := fs.inodes.MtimeOverride(ino); ok {
+		return t
+	}
+	return now
+}>>>>>>> 57cf537e2 (fix(fuse): stop time-only setattr from waiting on pending writeback commits)
 }
 
 func (fs *Dat9FS) readCommitEntryPayloadForCache(entry *CommitEntry) ([]byte, error) {
@@ -17236,7 +17313,11 @@ func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int6
 	} else {
 		fs.forgetCommittedRevision(meta.Path)
 	}
-	fs.cacheFileForPath(meta.Path, meta.Size, time.Now(), committedRev)
+	settleMtime := time.Now()
+	if ino, ok := fs.inodes.GetInode(meta.Path); ok {
+		settleMtime = fs.commitSettleMtime(ino, settleMtime)
+	}
+	fs.cacheFileForPath(meta.Path, meta.Size, settleMtime, committedRev)
 	// Clean up pendingIndex and shadowStore so that Unlink does not see a
 	// stale PendingNew entry and skip the remote DELETE (thinking the file
 	// was never uploaded). This mirrors commitQueue's onCommitSuccessWithOptions
