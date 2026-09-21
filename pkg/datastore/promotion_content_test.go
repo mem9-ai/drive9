@@ -551,6 +551,80 @@ func TestPromotionVerifyUsesFreshDatabaseTimeAtFinalCAS(t *testing.T) {
 	}
 }
 
+func TestPromotionVerifiedRetryUsesFreshTimeAfterImportLock(t *testing.T) {
+	store, promotionStore, created, manifest := createPromotionImportForContent(t, []promotion.ManifestEntry{
+		{RelativePath: "file", Type: promotion.EntryTypeFile, Mode: 0o644, ExpectedSizeBytes: 5, ExpectedChecksumSHA256: promotionTestHash("hello")},
+	}, "allocate-verified-retry-time")
+	if _, err := promotionStore.PutInlineImportContent(context.Background(), inlineContentRequest(created, manifest[0], "put-file", bytes.NewBufferString("hello"))); err != nil {
+		t.Fatal(err)
+	}
+	verify := PromotionVerifyRequest{
+		TenantID: "tenant-a", MigrationID: created.MigrationID, OwnerEpoch: created.OwnerEpoch,
+		OwnerToken: "owner-token", WriterLease: "writer-lease", ManifestHash: created.ManifestHash,
+	}
+	if _, err := promotionStore.VerifyImport(context.Background(), verify); err != nil {
+		t.Fatal(err)
+	}
+	var databaseNow time.Time
+	if err := store.DB().QueryRow(`SELECT CURRENT_TIMESTAMP(3)`).Scan(&databaseNow); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE promotion_imports
+		SET activity_deadline = ?
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		databaseNow.Add(1500*time.Millisecond), created.AllocationEpoch, created.AllocationSequence); err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := store.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback() }()
+	var state string
+	if err := blocker.QueryRow(`SELECT state FROM promotion_imports
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ? FOR UPDATE`,
+		created.AllocationEpoch, created.AllocationSequence).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "VERIFIED" {
+		t.Fatalf("locked import state = %q, want VERIFIED", state)
+	}
+	retryResult := make(chan error, 1)
+	go func() {
+		_, err := promotionStore.VerifyImport(context.Background(), verify)
+		retryResult <- err
+	}()
+	// The retry takes the tenant/namespace guards and samples its first DB
+	// time, then waits on the import row. It must not use that pre-lock sample
+	// for the VERIFIED recovery return after the immutable deadline passes.
+	select {
+	case err := <-retryResult:
+		t.Fatalf("verified retry returned before import-row lock release: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if err := blocker.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-retryResult:
+		if !errors.Is(err, ErrPromotionDeadlineExceeded) {
+			t.Fatalf("verified retry after deadline error = %v, want ErrPromotionDeadlineExceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("verified retry did not finish after import-row lock release")
+	}
+	var attemptID, reason string
+	if err := store.DB().QueryRow(`SELECT state, cleanup_attempt_id, terminal_reason
+		FROM promotion_imports WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		created.AllocationEpoch, created.AllocationSequence).Scan(&state, &attemptID, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if state != "ABORTING" || attemptID == "" || reason != "activity_deadline_exceeded" {
+		t.Fatalf("verified retry cleanup = %s/%q/%q, want ABORTING/nonempty/activity_deadline_exceeded", state, attemptID, reason)
+	}
+}
+
 func TestPromotionContentDeadlineCreatesRecoverableCleanupOwner(t *testing.T) {
 	store, promotionStore, created, manifest := createPromotionImportForContent(t, []promotion.ManifestEntry{
 		{RelativePath: "file", Type: promotion.EntryTypeFile, Mode: 0o644, ExpectedSizeBytes: 5, ExpectedChecksumSHA256: promotionTestHash("hello")},

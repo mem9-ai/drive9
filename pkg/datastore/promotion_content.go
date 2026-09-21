@@ -320,7 +320,7 @@ func (s *PromotionStore) VerifyImport(ctx context.Context, req PromotionVerifyRe
 	var out *PromotionImport
 	deadlineWon := false
 	err = s.store.InTx(ctx, func(tx *sql.Tx) error {
-		tenant, namespace, now, err := s.lockPromotionMutationGuard(ctx, tx, req.TenantID, req.WriterLease)
+		tenant, namespace, _, err := s.lockPromotionMutationGuard(ctx, tx, req.TenantID, req.WriterLease)
 		if err != nil {
 			return err
 		}
@@ -337,14 +337,24 @@ func (s *PromotionStore) VerifyImport(ctx context.Context, req PromotionVerifyRe
 		if importRow.manifestHash != req.ManifestHash {
 			return ErrPromotionConflict
 		}
-		if !now.Before(importRow.activityDeadline) {
+		// The guard locks precede the import-row lock. Re-sample time only after
+		// the import lock is acquired: an exact VERIFIED retry may otherwise
+		// wait across the deadline and recover using the stale pre-lock sample.
+		lockedAt, err := promotionDatabaseTime(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !lockedAt.Before(importRow.activityDeadline) {
 			if err := s.transitionPromotionDeadlineTx(ctx, tx, req.TenantID, importRow, namespace.writerGeneration); err != nil {
 				return err
 			}
 			deadlineWon = true
 			return nil
 		}
-		if !now.Before(importRow.leaseExpiresAt) {
+		if err := s.requirePromotionNormalWriterLease(ctx, req.TenantID, req.WriterLease, tenant, namespace, lockedAt); err != nil {
+			return err
+		}
+		if !lockedAt.Before(importRow.leaseExpiresAt) {
 			return ErrPromotionConflict
 		}
 		if importRow.state == "VERIFIED" {
