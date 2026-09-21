@@ -267,10 +267,13 @@ func (s *PromotionStore) finishPromotionAbort(ctx context.Context, req Promotion
 		resultDigest := promotionHashString(resultBlob)
 		aborted, err := tx.ExecContext(ctx, `UPDATE promotion_imports
 			SET state = 'ABORTED', state_version = state_version + 1,
-			    terminal_result_blob = ?, terminal_result_digest = ?, terminal_at = ?
+			    terminal_result_blob = ?, terminal_result_digest = ?, terminal_at = ?,
+			    full_row_compact_not_before = ?, retire_after = ?
 			WHERE tenant_id = ? AND allocation_epoch = ? AND allocation_sequence = ?
 			  AND state = 'ABORTING' AND state_version = ? AND cleanup_attempt_id = ?`,
-			resultBlob, resultDigest, finishedAt, req.TenantID, identity.AllocationEpoch,
+			resultBlob, resultDigest, finishedAt,
+			finishedAt.Add(s.cfg.FullRowCompactDelay), finishedAt.Add(s.cfg.TerminalRetention),
+			req.TenantID, identity.AllocationEpoch,
 			identity.AllocationSequence, row.stateVersion, row.cleanupAttemptID.String)
 		if err != nil {
 			return fmt.Errorf("finish promotion abort: %w", err)

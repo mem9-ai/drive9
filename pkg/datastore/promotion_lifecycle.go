@@ -72,9 +72,8 @@ func (s *PromotionStore) GetImport(ctx context.Context, req PromotionGetRequest)
 
 	var proofTarget, proofDigest string
 	if req.AllocationProof != "" {
-		claims, err := s.cfg.ProofSigner.Verify(req.AllocationProof)
-		if err != nil || claims.TenantID != req.TenantID || claims.MigrationID != req.MigrationID ||
-			claims.AllocationEpoch != identity.AllocationEpoch || claims.AllocationSequence != identity.AllocationSequence {
+		claims, proofIdentity, err := s.verifyPromotionAllocationProof(req.TenantID, req.MigrationID, req.AllocationProof)
+		if err != nil || proofIdentity != identity || !claims.ExpectedTargetAbsent {
 			return nil, ErrNotFound
 		}
 		proofTarget = claims.Target
@@ -86,6 +85,9 @@ func (s *PromotionStore) GetImport(ctx context.Context, req PromotionGetRequest)
 
 	row, err := s.readPromotionImportStatus(ctx, req.TenantID, req.MigrationID, identity)
 	if errors.Is(err, sql.ErrNoRows) {
+		if req.AllocationProof != "" {
+			return nil, s.classifyMissingPromotionProof(ctx, req.TenantID, identity)
+		}
 		return nil, ErrNotFound
 	}
 	if err != nil {

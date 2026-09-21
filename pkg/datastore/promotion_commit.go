@@ -341,10 +341,12 @@ func (s *PromotionStore) finishPromotionCommit(ctx context.Context, req Promotio
 		committed, err := tx.ExecContext(ctx, `UPDATE promotion_imports
 			SET state = 'COMMITTED', state_version = state_version + 1,
 			    committed_root_inode = ?, committed_generation = ?,
-			    terminal_result_blob = ?, terminal_result_digest = ?, terminal_at = ?
+			    terminal_result_blob = ?, terminal_result_digest = ?, terminal_at = ?,
+			    full_row_compact_not_before = ?, retire_after = ?
 			WHERE tenant_id = ? AND allocation_epoch = ? AND allocation_sequence = ?
 			  AND state = 'COMMITTING' AND state_version = ? AND commit_attempt_id = ?`,
 			rootInode, treeGeneration, resultBlob, resultDigest, finishedAt,
+			finishedAt.Add(s.cfg.FullRowCompactDelay), finishedAt.Add(s.cfg.TerminalRetention),
 			req.TenantID, identity.AllocationEpoch, identity.AllocationSequence,
 			row.stateVersion, row.commitAttemptID.String)
 		if err != nil {

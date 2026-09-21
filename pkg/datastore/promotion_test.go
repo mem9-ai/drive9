@@ -111,6 +111,8 @@ func newTestPromotionStore(t *testing.T, now *time.Time) (*Store, *PromotionStor
 		WriterProtocol:    promotionNamespaceMutationWriterProtocol,
 		Limits:            testPromotionLimits(), AllocationTTL: 5 * time.Minute,
 		ActivityTTL: time.Hour, LeaseTTL: time.Minute,
+		FullRowCompactDelay: time.Minute, FullRowMaxRetention: time.Hour,
+		TerminalRetention: 24 * time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)

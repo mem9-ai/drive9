@@ -95,6 +95,13 @@ type PromotionStoreConfig struct {
 	AllocationTTL  time.Duration
 	ActivityTTL    time.Duration
 	LeaseTTL       time.Duration
+	// FullRowCompactDelay is the minimum terminal full-row retention after a
+	// valid client acknowledgement. FullRowMaxRetention is the maximum full-row
+	// retention when no acknowledgement arrives. TerminalRetention is the
+	// offline recovery window before a compact tombstone may retire.
+	FullRowCompactDelay time.Duration
+	FullRowMaxRetention time.Duration
+	TerminalRetention   time.Duration
 }
 
 // PromotionStore owns the promotion admission and state-transition boundaries.
@@ -185,6 +192,10 @@ func NewPromotionStore(store *Store, cfg PromotionStoreConfig) (*PromotionStore,
 	}
 	if cfg.AllocationTTL <= 0 || cfg.ActivityTTL <= 0 || cfg.LeaseTTL <= 0 || cfg.LeaseTTL > cfg.ActivityTTL {
 		return nil, fmt.Errorf("%w: invalid promotion deadlines", ErrPromotionDisabled)
+	}
+	if cfg.FullRowCompactDelay <= 0 || cfg.FullRowMaxRetention < cfg.FullRowCompactDelay ||
+		cfg.TerminalRetention < cfg.FullRowMaxRetention {
+		return nil, fmt.Errorf("%w: invalid promotion retention windows", ErrPromotionDisabled)
 	}
 	return &PromotionStore{store: store, cfg: cfg}, nil
 }
