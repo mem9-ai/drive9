@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -4015,6 +4016,84 @@ func TestSamePathConsecutiveSaves(t *testing.T) {
 	}
 }
 
+// TestAppendWritesComposeAcrossHandles covers the write-path half of issue
+// #935: two handles opened against the same base image must compose their
+// appendFile-style writes, with the second append landing at the first
+// append's end instead of a stale snapshot end.
+func TestAppendWritesComposeAcrossHandles(t *testing.T) {
+	const path = "/_cacache/index-v5/ab/cd/compose"
+	base := []byte("line-1\n")
+	first := []byte("line-A\n")
+	second := []byte("line-B\n")
+	wantA := append(append([]byte(nil), base...), first...)
+	wantB := append(append([]byte(nil), wantA...), second...)
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	ino := fs.inodes.Lookup(path, false, int64(len(base)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.inodes.UpdateSize(ino, int64(len(base)))
+	newAppendHandle := func() *FileHandle {
+		fh := &FileHandle{
+			Ino:      ino,
+			Path:     path,
+			Dirty:    fs.newWriteBuffer(path, maxPreloadSize, 0),
+			OrigSize: int64(len(base)),
+			BaseRev:  1,
+			Flags:    uint32(syscall.O_WRONLY | syscall.O_APPEND),
+		}
+		if _, err := fh.Dirty.Write(0, base); err != nil {
+			t.Fatal(err)
+		}
+		fh.Dirty.ClearDirty()
+		fs.openHandles.Add(fh)
+		return fh
+	}
+	fhA := newAppendHandle()
+	fhB := newAppendHandle()
+	fhAID := fs.allocateFileHandle(fhA)
+	fhBID := fs.allocateFileHandle(fhB)
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       fhAID,
+	}, first); st != gofuse.OK {
+		t.Fatalf("first append: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       fhBID,
+	}, second); st != gofuse.OK {
+		t.Fatalf("second append: %v", st)
+	}
+
+	fhA.Lock()
+	gotA := append([]byte(nil), fhA.Dirty.Bytes()...)
+	fhA.Unlock()
+	fhB.Lock()
+	gotB := append([]byte(nil), fhB.Dirty.Bytes()...)
+	fhB.Unlock()
+	if !bytes.Equal(gotA, wantA) {
+		t.Fatalf("first handle buffer = %q, want %q", gotA, wantA)
+	}
+	if !bytes.Equal(gotB, wantB) {
+		t.Fatalf("second handle buffer = %q, want %q (concurrent appends must compose)", gotB, wantB)
+	}
+}
+
 // TestWriteBackCache_ConcurrentPutSamePath verifies that concurrent Puts to
 // the same path under the per-path lock produce a consistent final state.
 func TestWriteBackCache_ConcurrentPutSamePath(t *testing.T) {
@@ -4710,7 +4789,15 @@ func TestWriteBackCache_RenamePending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_ = cache.Put("/old.txt", []byte("data"), 4, PendingNew)
+	const snapshotID = "writeback-rename-snapshot-B"
+	const parentSnapshotID = "writeback-rename-snapshot-A"
+	ancestors := []string{parentSnapshotID, "writeback-rename-snapshot-root"}
+	if _, _, err := cache.PutWithBaseRevAndModeAndLineageTimings(
+		"/old.txt", []byte("data"), 4, PendingNew, 9, 0o640, true,
+		snapshotID, parentSnapshotID, true, ancestors...,
+	); err != nil {
+		t.Fatal(err)
+	}
 
 	if !cache.RenamePending("/old.txt", "/new.txt") {
 		t.Fatal("RenamePending returned false, expected true")
@@ -4737,6 +4824,15 @@ func TestWriteBackCache_RenamePending(t *testing.T) {
 	}
 	if meta.Path != "/new.txt" {
 		t.Fatalf("meta.Path = %q, want /new.txt", meta.Path)
+	}
+	if meta.BaseRev != 9 || !meta.HasMode || meta.Mode != 0o640 {
+		t.Fatalf("meta base=%d mode=%o has=%t, want 9/0640/true", meta.BaseRev, meta.Mode, meta.HasMode)
+	}
+	if meta.SnapshotID != snapshotID || meta.ParentSnapshotID != parentSnapshotID || !meta.lineageTrusted {
+		t.Fatalf("lineage = %q/%q trusted=%t, want %q/%q true", meta.SnapshotID, meta.ParentSnapshotID, meta.lineageTrusted, snapshotID, parentSnapshotID)
+	}
+	if !slices.Equal(meta.liveAncestors, ancestors) {
+		t.Fatalf("liveAncestors = %v, want %v", meta.liveAncestors, ancestors)
 	}
 }
 

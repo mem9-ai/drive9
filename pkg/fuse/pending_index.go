@@ -162,8 +162,8 @@ func (idx *PendingIndex) PutWithBaseRevAndMode(remotePath string, size int64, ki
 // PutWithBaseRevAndModeAndLineage attaches process-local causal identity to
 // the durable metadata. The IDs are intentionally excluded from JSON; empty
 // lineage is accepted but can never authorize a growth rebase.
-func (idx *PendingIndex) PutWithBaseRevAndModeAndLineage(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool) (uint64, error) {
-	return idx.putInternal(remotePath, size, kind, baseRev, false, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted)
+func (idx *PendingIndex) PutWithBaseRevAndModeAndLineage(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, error) {
+	return idx.putInternal(remotePath, size, kind, baseRev, false, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, liveAncestors)
 }
 
 // PutShadowSpill is like PutWithBaseRev but marks the entry as ShadowSpill
@@ -181,11 +181,11 @@ func (idx *PendingIndex) PutShadowSpillWithMode(remotePath string, size int64, k
 
 // PutShadowSpillWithModeAndLineage is the spill equivalent of
 // PutWithBaseRevAndModeAndLineage.
-func (idx *PendingIndex) PutShadowSpillWithModeAndLineage(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool) (uint64, error) {
-	return idx.putInternal(remotePath, size, kind, baseRev, true, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted)
+func (idx *PendingIndex) PutShadowSpillWithModeAndLineage(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, error) {
+	return idx.putInternal(remotePath, size, kind, baseRev, true, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, liveAncestors)
 }
 
-func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool) (uint64, error) {
+func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors []string) (uint64, error) {
 	// Hold the per-path lock across the disk write AND the in-memory publish
 	// so a generation-checked removal of a stale entry cannot delete this
 	// fresh .meta after already passing its in-memory check.
@@ -207,6 +207,7 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 		SnapshotID:       snapshotID,
 		ParentSnapshotID: parentSnapshotID,
 		lineageTrusted:   lineageTrusted,
+		liveAncestors:    append([]string(nil), liveAncestors...),
 	}
 
 	// Write to disk first for durability.
@@ -235,7 +236,7 @@ func (idx *PendingIndex) GetMeta(remotePath string) (*WriteBackMeta, bool) {
 	if !ok {
 		return nil, false
 	}
-	cp := *meta
+	cp := cloneWriteBackMeta(meta)
 	return &cp, true
 }
 
@@ -328,26 +329,14 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 	}
 	// Copy fields under read lock.
 	gen := idx.nextGen.Add(1)
-	newMeta := &WriteBackMeta{
-		Path:             newPath,
-		Size:             meta.Size,
-		Mtime:            meta.Mtime,
-		CreatedAt:        meta.CreatedAt,
-		Generation:       gen,
-		Kind:             meta.Kind,
-		BaseRev:          meta.BaseRev,
-		ShadowSpill:      meta.ShadowSpill,
-		Mode:             meta.Mode,
-		HasMode:          meta.HasMode,
-		SnapshotID:       meta.SnapshotID,
-		ParentSnapshotID: meta.ParentSnapshotID,
-		lineageTrusted:   meta.lineageTrusted,
-	}
+	newMeta := cloneWriteBackMeta(meta)
+	newMeta.Path = newPath
+	newMeta.Generation = gen
 	idx.mu.RUnlock()
 
 	// Persist new meta to disk BEFORE updating memory so that crash
 	// recovery always has a consistent view.
-	metaBytes, _ := json.Marshal(newMeta)
+	metaBytes, _ := json.Marshal(&newMeta)
 	newMetaPath := filepath.Join(idx.dir, hashPath(newPath)+".meta")
 	if err := atomicWrite(newMetaPath, metaBytes); err != nil {
 		return false
@@ -355,7 +344,7 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 
 	idx.mu.Lock()
 	delete(idx.items, oldPath)
-	idx.items[newPath] = newMeta
+	idx.items[newPath] = &newMeta
 	idx.mu.Unlock()
 
 	oldMetaPath := filepath.Join(idx.dir, hashPath(oldPath)+".meta")
@@ -382,31 +371,19 @@ func (idx *PendingIndex) PrepareRename(oldPath, newPath string) (*WriteBackMeta,
 		return nil, nil
 	}
 	gen := idx.nextGen.Add(1)
-	newMeta := &WriteBackMeta{
-		Path:             newPath,
-		Size:             meta.Size,
-		Mtime:            meta.Mtime,
-		CreatedAt:        meta.CreatedAt,
-		Generation:       gen,
-		Kind:             meta.Kind,
-		BaseRev:          meta.BaseRev,
-		ShadowSpill:      meta.ShadowSpill,
-		Mode:             meta.Mode,
-		HasMode:          meta.HasMode,
-		SnapshotID:       meta.SnapshotID,
-		ParentSnapshotID: meta.ParentSnapshotID,
-		lineageTrusted:   meta.lineageTrusted,
-	}
+	newMeta := cloneWriteBackMeta(meta)
+	newMeta.Path = newPath
+	newMeta.Generation = gen
 	idx.mu.RUnlock()
 
-	metaBytes, err := json.Marshal(newMeta)
+	metaBytes, err := json.Marshal(&newMeta)
 	if err != nil {
 		return nil, fmt.Errorf("marshal prepared meta for %s: %w", newPath, err)
 	}
 	if err := atomicWrite(filepath.Join(idx.dir, hashPath(newPath)+".meta"), metaBytes); err != nil {
 		return nil, fmt.Errorf("persist prepared meta for %s: %w", newPath, err)
 	}
-	return newMeta, nil
+	return &newMeta, nil
 }
 
 // CommitRename completes a rename prepared by PrepareRename after the shadow
@@ -484,7 +461,7 @@ func (idx *PendingIndex) ListByPrefix(prefix string) []*WriteBackMeta {
 	var result []*WriteBackMeta
 	for p, meta := range idx.items {
 		if strings.HasPrefix(p, prefix) {
-			cp := *meta
+			cp := cloneWriteBackMeta(meta)
 			result = append(result, &cp)
 		}
 	}
@@ -514,7 +491,7 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 	if !ok {
 		return nil
 	}
-	updated := *meta
+	updated := cloneWriteBackMeta(meta)
 	updated.Mode = mode & posixPermissionModeMask
 	updated.HasMode = true
 	updated.Generation = idx.nextGen.Add(1)
@@ -545,7 +522,7 @@ func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) er
 	if !ok {
 		return nil
 	}
-	updated := *meta
+	updated := cloneWriteBackMeta(meta)
 	updated.Kind = PendingOverwrite
 	if committedRev > 0 {
 		updated.BaseRev = committedRev

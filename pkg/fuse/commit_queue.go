@@ -88,14 +88,15 @@ type CommitEntry struct {
 	// terminal. Re-basing old bytes with a new BaseRev is exactly the silent
 	// rollback class this fence prevents.
 	DisableAutoResolveLWW bool
-	// growthRebaseRev records a one-shot authorization to pair a base-zero
-	// PendingNew payload with the revision of its directly landed parent.
-	// PayloadBaseRev intentionally remains unchanged for auditability, so
-	// repeated validation must consult this state instead of re-authorizing.
+	// growthRebaseRev records a one-shot authorization to pair a descendant
+	// payload (#896 base-zero growth, #935 live same-path rewrite) with the revision it is safe to overwrite. PayloadBaseRev
+	// intentionally remains unchanged for auditability, so repeated
+	// validation must consult this state instead of re-authorizing.
 	growthRebaseRev              int64
 	growthRebaseParentSnapshotID string
 	recovered                    bool
 	liveLineageProof             bool
+	liveAncestors                []string // immutable, process-local snapshot ancestry
 	dispatched                   bool
 	canceled                     bool
 	cancelCommit                 context.CancelFunc
@@ -1482,7 +1483,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cq.mu.Unlock()
 
 		unlockPath := cq.lockPath(entry.Path)
-		if cq.discardSupersededEntry(entry) {
+		if cq.discardSupersededEntry(entry) || cq.discardLandedAncestor(entryCtx, entry) {
 			unlockPath()
 			return
 		}
@@ -1708,7 +1709,7 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 	unlockPaths := cq.lockBatchPaths(entries)
 	active := entries[:0]
 	for _, entry := range entries {
-		if cq.discardSupersededEntry(entry) {
+		if cq.discardSupersededEntry(entry) || cq.discardLandedAncestor(ctx, entry) {
 			cq.endInFlight(entry)
 			continue
 		}
@@ -1911,10 +1912,9 @@ func (cq *CommitQueue) validateEntryPayloadFreshCtx(ctx context.Context, entry *
 	if watermark > 0 && payloadBaseRev >= 0 && payloadBaseRev < watermark {
 		if entry.growthRebaseRev > 0 {
 			if entry.growthRebaseRev != watermark || entry.BaseRev != watermark ||
-				entry.growthRebaseParentSnapshotID == "" ||
 				entry.growthRebaseParentSnapshotID != entry.ParentSnapshotID {
 				entry.DisableAutoResolveLWW = true
-				return fmt.Errorf("%w: %s growth rebase was authorized at rev %d but durable watermark is rev %d",
+				return fmt.Errorf("%w: %s direct-child rebase was authorized at rev %d but durable watermark is rev %d",
 					errCommitPayloadStale, entry.Path, entry.growthRebaseRev, watermark)
 			}
 		} else if cq.maybeRebaseGrownPayloadOntoWatermark(ctx, entry, watermark) {
@@ -2058,7 +2058,7 @@ func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *Co
 		cq.removeFromQueue(entry)
 		return nil
 	}
-	if cq.discardSupersededEntry(entry) {
+	if cq.discardSupersededEntry(entry) || cq.discardLandedAncestor(ctx, entry) {
 		return nil
 	}
 	committedRev, err := cq.uploadEntry(ctx, entry)
@@ -2361,7 +2361,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	if layerRef == "" {
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	}
-	cq.rememberLanded(entry.Path, committedRev, entry.Size, cq.checksumLandedPayload(entry), entry.SnapshotID)
+	cq.rememberLanded(entry.Path, committedRev, entry.Size, cq.checksumLandedPayload(entry), entry.SnapshotID, entry.liveAncestors...)
 	if cq.OnUploaded != nil {
 		cq.OnUploaded(entry, committedRev)
 	}

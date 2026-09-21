@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -69,8 +70,13 @@ func TestPendingIndexRenamePending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = idx.PutShadowSpillWithMode("/old/file.txt", 512, PendingOverwrite, 11, 0o755, true)
-	if err != nil {
+	const snapshotID = "rename-snapshot-B"
+	const parentSnapshotID = "rename-snapshot-A"
+	ancestors := []string{parentSnapshotID, "rename-snapshot-root"}
+	if _, err = idx.PutShadowSpillWithModeAndLineage(
+		"/old/file.txt", 512, PendingOverwrite, 11, 0o755, true,
+		snapshotID, parentSnapshotID, true, ancestors...,
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -103,6 +109,14 @@ func TestPendingIndexRenamePending(t *testing.T) {
 	}
 	if !meta.HasMode || meta.Mode != 0o755 {
 		t.Errorf("mode = %o has=%t, want 0755 true", meta.Mode, meta.HasMode)
+	}
+	// The rename must carry the process-local live lineage to the new path;
+	// dropping it would fail-closed the cached staging identity after re-home.
+	if meta.SnapshotID != snapshotID || meta.ParentSnapshotID != parentSnapshotID || !meta.lineageTrusted {
+		t.Errorf("lineage = %q/%q trusted=%t, want %q/%q true", meta.SnapshotID, meta.ParentSnapshotID, meta.lineageTrusted, snapshotID, parentSnapshotID)
+	}
+	if !slices.Equal(meta.liveAncestors, ancestors) {
+		t.Errorf("liveAncestors = %v, want %v", meta.liveAncestors, ancestors)
 	}
 }
 
@@ -311,12 +325,14 @@ func TestPreparedRenameBindsExactProcessLocalLineageToCommitEntry(t *testing.T) 
 	}
 	const snapshotID = "rename-snapshot-B"
 	const parentSnapshotID = "rename-snapshot-A"
+	ancestors := []string{parentSnapshotID, "rename-snapshot-root"}
 	if _, err := idx.PutWithBaseRevAndModeAndLineage(
 		"/old.db", 4096, PendingNew, 0, 0o640, true,
-		snapshotID, parentSnapshotID, true,
+		snapshotID, parentSnapshotID, true, ancestors...,
 	); err != nil {
 		t.Fatal(err)
 	}
+	ancestors[0] = "mutated-caller-slice"
 	prepared, err := idx.PrepareRename("/old.db", "/new.db")
 	if err != nil {
 		t.Fatal(err)
@@ -326,6 +342,10 @@ func TestPreparedRenameBindsExactProcessLocalLineageToCommitEntry(t *testing.T) 
 	}
 	if prepared.SnapshotID != snapshotID || prepared.ParentSnapshotID != parentSnapshotID || !prepared.lineageTrusted {
 		t.Fatalf("prepared lineage=%q/%q trusted=%t, want exact live lineage", prepared.SnapshotID, prepared.ParentSnapshotID, prepared.lineageTrusted)
+	}
+	wantAncestors := []string{parentSnapshotID, "rename-snapshot-root"}
+	if !slices.Equal(prepared.liveAncestors, wantAncestors) {
+		t.Fatalf("prepared ancestors=%v, want %v", prepared.liveAncestors, wantAncestors)
 	}
 
 	opts := &MountOptions{}
@@ -338,6 +358,9 @@ func TestPreparedRenameBindsExactProcessLocalLineageToCommitEntry(t *testing.T) 
 	}
 	if entry.SnapshotID != snapshotID || entry.ParentSnapshotID != parentSnapshotID || !entry.liveLineageProof {
 		t.Fatalf("entry lineage=%q/%q live=%t, want exact prepared lineage", entry.SnapshotID, entry.ParentSnapshotID, entry.liveLineageProof)
+	}
+	if !slices.Equal(entry.liveAncestors, wantAncestors) {
+		t.Fatalf("entry ancestors=%v, want %v", entry.liveAncestors, wantAncestors)
 	}
 }
 

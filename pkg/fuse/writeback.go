@@ -74,6 +74,16 @@ type WriteBackMeta struct {
 	// Recovering a mutable path-keyed payload cannot prove that the bytes and
 	// JSON metadata were replaced atomically across a crash.
 	lineageTrusted bool
+	// liveAncestors is immutable process-local ancestry for SnapshotID. It is
+	// copied with in-memory re-home/rename metadata but deliberately omitted
+	// from JSON, so recovery remains fail-closed.
+	liveAncestors []string
+}
+
+func cloneWriteBackMeta(meta *WriteBackMeta) WriteBackMeta {
+	cp := *meta
+	cp.liveAncestors = append([]string(nil), meta.liveAncestors...)
+	return cp
 }
 
 // WriteBackCache manages a local disk cache of pending (not-yet-uploaded)
@@ -265,7 +275,7 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 // PutWithBaseRevAndModeAndLineageTimings is the process-local lineage variant
 // used by FileHandle staging. Legacy callers deliberately store empty lineage,
 // which is safe because such metadata cannot authorize a growth rebase.
-func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool) (uint64, WriteBackPutTimings, error) {
+func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
 	var t WriteBackPutTimings
 
 	// Phase 1: acquire per-path lock (serializes same-path Put/Remove/etc.)
@@ -301,6 +311,7 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath strin
 		SnapshotID:       snapshotID,
 		ParentSnapshotID: parentSnapshotID,
 		lineageTrusted:   lineageTrusted,
+		liveAncestors:    append([]string(nil), liveAncestors...),
 	}
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
@@ -449,7 +460,7 @@ func (c *WriteBackCache) GetMeta(remotePath string) (*WriteBackMeta, bool) {
 		c.releasePathLock(remotePath, pl)
 		return nil, false
 	}
-	cp := *meta
+	cp := cloneWriteBackMeta(meta)
 	c.mu.Unlock()
 	c.releasePathLock(remotePath, pl)
 	return &cp, true
@@ -470,7 +481,7 @@ func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []by
 		c.releasePathLock(remotePath, pl)
 		return nil, nil, false
 	}
-	cp := *meta
+	cp := cloneWriteBackMeta(meta)
 
 	data, dataOK := c.getViewLocked(remotePath)
 	c.mu.Unlock()
@@ -501,7 +512,7 @@ func (c *WriteBackCache) GetMetaAndViewWithCallback(remotePath string, onLocked 
 		c.mu.Unlock()
 		return nil, nil, false
 	}
-	cp := *meta
+	cp := cloneWriteBackMeta(meta)
 
 	data, dataOK := c.getViewLocked(remotePath)
 	c.mu.Unlock()
@@ -561,7 +572,7 @@ func (c *WriteBackCache) UpdateMode(remotePath string, mode uint32) error {
 		c.mu.Unlock()
 		return nil
 	}
-	updated := *meta
+	updated := cloneWriteBackMeta(meta)
 	updated.Mode = mode & posixPermissionModeMask
 	updated.HasMode = true
 	updated.Generation = c.nextGen.Add(1)
@@ -597,7 +608,7 @@ func (c *WriteBackCache) MarkChmodPending(remotePath string, generation uint64) 
 		c.mu.Unlock()
 		return false, nil
 	}
-	updated := *meta
+	updated := cloneWriteBackMeta(meta)
 	updated.Kind = PendingChmod
 	updated.BaseRev = 0
 	updated.Generation = c.nextGen.Add(1)
@@ -649,7 +660,7 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 	if !ok {
 		return false
 	}
-	updated := *meta
+	updated := cloneWriteBackMeta(meta)
 
 	// Rename .dat file directly — same directory, no data copy needed.
 	newDat := c.datFile(newPath)
@@ -763,7 +774,7 @@ func (c *WriteBackCache) ListByPrefix(prefix string) []*WriteBackMeta {
 	var result []*WriteBackMeta
 	for p, meta := range c.metas {
 		if strings.HasPrefix(p, prefix) {
-			cp := *meta
+			cp := cloneWriteBackMeta(meta)
 			result = append(result, &cp)
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,6 +49,11 @@ var testHookBeforeUnlinkedTransition func()
 // the whole captured handle set, before the retry sleep. Tests use it to
 // handshake that attach has entered lock contention.
 var testHookAfterUnlinkHandleSetLockAttempt func()
+
+// errAppendRefreshBusy marks transient sibling-handle lock contention. Write
+// may retry it after yielding fh.mu and the path fence; lineage rejection uses
+// syscall.EAGAIN directly and returns to the caller without an internal spin.
+var errAppendRefreshBusy = errors.New("append refresh source busy")
 
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
 // operations to the dat9 HTTP API via the Go SDK client.
@@ -1651,6 +1657,7 @@ func (fs *Dat9FS) discardUnlinkedHandleStateLocked(fh *FileHandle) {
 	fh.WriteBackSeq = 0
 	fh.ShadowCommitReady = false
 	fh.ShadowCommitSeq = 0
+	fh.appendSnapshot = false
 }
 
 // removeHandleStagingLocked removes path-keyed staging state owned by fh.
@@ -2274,6 +2281,7 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 	fh.ShadowSpill = false
 	fh.ShadowCommitReady = false
 	fh.ShadowCommitSeq = 0
+	fh.appendSnapshot = false
 	fh.ZeroBase = false
 	fh.IsNew = false
 	if state.committedRevision > 0 {
@@ -3372,6 +3380,7 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	fh.ShadowSpill = false
 	fh.ShadowCommitReady = false
 	fh.ShadowCommitSeq = 0
+	fh.appendSnapshot = false
 }
 
 // rebaselineCommittedDirtyBufferLocked replaces a clean live WriteBuffer that
@@ -4185,6 +4194,7 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 	if fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() > 0 {
 		fh.ZeroBase = false
 	}
+	fh.appendSnapshot = false
 }
 
 func (fs *Dat9FS) canStagePathTruncateToZero(entry *InodeEntry) bool {
@@ -4294,6 +4304,7 @@ func ensureStagedSnapshotLineageLocked(fh *FileHandle) (snapshotID, parentSnapsh
 	}
 	fh.StagedSnapshotID = generateMountID()
 	fh.StagedParentSnapshotID = fh.ContentSnapshotID
+	fh.stagedAncestors = snapshotAncestors(fh.ContentSnapshotID, fh.contentAncestors)
 	fh.StagedSnapshotSeq = fh.DirtySeq
 	fh.StagedLineageTrusted = fh.LineageTrusted
 	return fh.StagedSnapshotID, fh.StagedParentSnapshotID
@@ -4302,6 +4313,7 @@ func ensureStagedSnapshotLineageLocked(fh *FileHandle) (snapshotID, parentSnapsh
 func publishStagedSnapshotLineageLocked(fh *FileHandle) {
 	if fh != nil && fh.StagedSnapshotID != "" {
 		fh.ContentSnapshotID = fh.StagedSnapshotID
+		fh.contentAncestors = fh.stagedAncestors
 		fh.LineageTrusted = fh.StagedLineageTrusted
 	}
 }
@@ -4310,6 +4322,7 @@ func clearStagedSnapshotLineageLocked(fh *FileHandle) {
 	if fh == nil {
 		return
 	}
+	fh.stagedAncestors = nil
 	fh.StagedSnapshotID = ""
 	fh.StagedParentSnapshotID = ""
 	fh.StagedSnapshotSeq = 0
@@ -4351,13 +4364,13 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 	mode, hasMode := fs.modeForPendingHandle(fh)
 	snapshotID, parentSnapshotID := ensureStagedSnapshotLineageLocked(fh)
 	if fh.ShadowSpill {
-		gen, err := fs.pendingIndex.PutShadowSpillWithModeAndLineage(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode, snapshotID, parentSnapshotID, fh.StagedLineageTrusted)
+		gen, err := fs.pendingIndex.PutShadowSpillWithModeAndLineage(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode, snapshotID, parentSnapshotID, fh.StagedLineageTrusted, fh.stagedAncestors...)
 		if err != nil {
 			return fmt.Errorf("pending index put %s: %w", fh.Path, err)
 		}
 		fh.PendingIndexGen = gen
 	} else {
-		gen, err := fs.pendingIndex.PutWithBaseRevAndModeAndLineage(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode, snapshotID, parentSnapshotID, fh.StagedLineageTrusted)
+		gen, err := fs.pendingIndex.PutWithBaseRevAndModeAndLineage(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode, snapshotID, parentSnapshotID, fh.StagedLineageTrusted, fh.stagedAncestors...)
 		if err != nil {
 			return fmt.Errorf("pending index put %s: %w", fh.Path, err)
 		}
@@ -4395,6 +4408,7 @@ func (fs *Dat9FS) bindCommitEntryToHandleLocked(entry *CommitEntry, fh *FileHand
 	entry.PayloadBaseRev = payloadBaseRev
 	entry.PayloadBaseRevSet = true
 	entry.SnapshotID = fh.StagedSnapshotID
+	entry.liveAncestors = fh.stagedAncestors
 	entry.ParentSnapshotID = fh.StagedParentSnapshotID
 	entry.liveLineageProof = entry.SnapshotID != "" && fh.StagedLineageTrusted
 	gens := fs.captureHandleStagingGensLocked(fh)
@@ -4437,6 +4451,7 @@ func (fs *Dat9FS) bindCommitEntryToPreparedPendingMeta(entry *CommitEntry, meta 
 	entry.PendingIndexGen = meta.Generation
 	entry.SnapshotID = meta.SnapshotID
 	entry.ParentSnapshotID = meta.ParentSnapshotID
+	entry.liveAncestors = processLocalMetaAncestors(meta)
 	entry.liveLineageProof = entry.SnapshotID != "" && meta.lineageTrusted
 	if watermark := fs.latestCommittedRevision(entry.Path); watermark > meta.BaseRev && meta.BaseRev >= 0 {
 		entry.DurableWatermarkRev = watermark
@@ -4577,6 +4592,7 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 		snapshotID,
 		parentSnapshotID,
 		fh.StagedLineageTrusted,
+		fh.stagedAncestors...,
 	)
 	if err == nil {
 		// Record the staged generation so unlink-discard can remove only this
@@ -4588,6 +4604,16 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 		fs.perf.recordSnapshotWBSubPhases(bvDur, timings)
 	}
 	return err
+}
+
+func processLocalMetaAncestors(meta *WriteBackMeta) []string {
+	if meta == nil {
+		return nil
+	}
+	if len(meta.liveAncestors) > 0 {
+		return append([]string(nil), meta.liveAncestors...)
+	}
+	return snapshotAncestors(meta.ParentSnapshotID, nil)
 }
 
 func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *WriteBackMeta) error {
@@ -4629,6 +4655,7 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 	fh.ShadowStageGen = shadowGen
 	fh.PendingIndexGen = meta.Generation
 	fh.ContentSnapshotID = meta.SnapshotID
+	fh.contentAncestors = processLocalMetaAncestors(meta)
 	fh.LineageTrusted = meta.lineageTrusted
 	fh.IsNew = meta.Kind == PendingNew
 	fh.ZeroBase = zeroOverwrite
@@ -4642,6 +4669,7 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 		fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 		fh.StagedSnapshotID = meta.SnapshotID
 		fh.StagedParentSnapshotID = meta.ParentSnapshotID
+		fh.stagedAncestors = processLocalMetaAncestors(meta)
 		fh.StagedSnapshotSeq = fh.DirtySeq
 		fh.StagedLineageTrusted = meta.lineageTrusted
 	}
@@ -4670,9 +4698,13 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 		return false
 	}
 
+	if err := fh.Dirty.Truncate(int64(len(data))); err != nil {
+		return false
+	}
 	fh.IsNew = meta.Kind == PendingNew
 	fh.WriteBackGen = meta.Generation
 	fh.ContentSnapshotID = meta.SnapshotID
+	fh.contentAncestors = processLocalMetaAncestors(meta)
 	fh.LineageTrusted = meta.lineageTrusted
 	fh.OrigSize = int64(len(data))
 	if meta.BaseRev > 0 {
@@ -4688,17 +4720,36 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 	fh.WriteBackSeq = fh.DirtySeq
 	fh.StagedSnapshotID = meta.SnapshotID
 	fh.StagedParentSnapshotID = meta.ParentSnapshotID
+	fh.stagedAncestors = processLocalMetaAncestors(meta)
 	fh.StagedSnapshotSeq = fh.DirtySeq
 	fh.StagedLineageTrusted = meta.lineageTrusted
 	return true
 }
 
 func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
-	if fs.openHandles == nil || fh == nil || fh.Dirty == nil {
-		return false
+	loaded, _ := fs.loadWritableHandleFromOpenHandles(fh, false)
+	return loaded
+}
+
+// loadWritableHandleFromOpenHandles reloads fh's buffer from another open
+// handle with pending local state for the same path. tryLock selects candidate
+// handles with TryLock instead of blocking: used by the write-path append
+// refresh, where the caller already holds the per-path commit lock and fh.mu,
+// so waiting on a busy sibling's handle lock could stall for the remote
+// commit wait timeout.
+func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool) (bool, error) {
+	if fs.openHandles == nil || fh == nil || fh.Dirty == nil || fh.Unlinked {
+		return false, nil
 	}
 	if isSQLitePersistentJournalPath(fh.Path) {
-		return false
+		return false, nil
+	}
+	lockSrc := func(src *FileHandle) bool {
+		if tryLock {
+			return src.TryLock()
+		}
+		src.Lock()
+		return true
 	}
 
 	type candidate struct {
@@ -4717,6 +4768,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		shadowStageGen    uint64
 		contentSnapshotID string
 		lineageTrusted    bool
+		ancestors         []string
 	}
 
 	var candidates []candidate
@@ -4725,8 +4777,14 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 			continue
 		}
 
-		src.Lock()
-		if src.Dirty == nil {
+		if !lockSrc(src) {
+			return false, errAppendRefreshBusy
+		}
+		if src.Unlinked || src.Ino != fh.Ino || src.Dirty == nil {
+			src.Unlock()
+			continue
+		}
+		if tryLock && fh.DirtySeq != 0 && src.DirtySeq <= fh.DirtySeq {
 			src.Unlock()
 			continue
 		}
@@ -4751,6 +4809,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 			shadowStageGen:    src.ShadowStageGen,
 			contentSnapshotID: src.ContentSnapshotID,
 			lineageTrusted:    src.LineageTrusted,
+			ancestors:         src.contentAncestors,
 		}
 		src.Unlock()
 		candidates = append(candidates, c)
@@ -4772,11 +4831,11 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 	for _, c := range candidates {
 		var data []byte
 		size := c.size
-		haveData := size == 0
+		haveData := size == 0 && !tryLock
 
 		// Shadow-backed handles are authoritative in the shadow store. Their
 		// dirty buffer may have evicted parts and would materialize zeros.
-		if !haveData && c.shadowSource {
+		if !haveData && c.shadowSource && (!tryLock || !c.canMemory) {
 			var err error
 			if c.shadowStageGen != 0 {
 				data, err = fs.shadowStore.ReadAllIfGeneration(fh.Path, c.shadowStageGen)
@@ -4793,8 +4852,10 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		}
 
 		if !haveData && c.canMemory {
-			c.src.Lock()
-			if c.src.Dirty != nil {
+			if !lockSrc(c.src) {
+				return false, errAppendRefreshBusy
+			}
+			if c.src.Dirty != nil && !c.src.Unlinked && c.src.Ino == fh.Ino {
 				size = c.src.Dirty.Size()
 				c.origSize = c.src.OrigSize
 				c.baseRev = c.src.BaseRev
@@ -4803,6 +4864,13 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 				c.storageClass = c.src.StorageClass
 				c.contentSnapshotID = c.src.ContentSnapshotID
 				c.lineageTrusted = c.src.LineageTrusted
+				c.ancestors = c.src.contentAncestors
+				if tryLock && c.src.DirtySeq != 0 {
+					c.contentSnapshotID, _ = ensureStagedSnapshotLineageLocked(c.src)
+					c.ancestors = c.src.stagedAncestors
+					c.src.appendSnapshot = true
+					publishStagedSnapshotLineageLocked(c.src)
+				}
 				if size == 0 {
 					haveData = true
 				} else if c.src.Dirty.CanMaterializeFull() {
@@ -4817,12 +4885,19 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 			continue
 		}
 
+		if tryLock && fh.DirtySeq != 0 {
+			id, _ := ensureStagedSnapshotLineageLocked(fh)
+			if !c.lineageTrusted || !slices.Contains(c.ancestors, id) {
+				return false, syscall.EAGAIN
+			}
+		}
 		if len(data) > 0 {
 			if _, err := fh.Dirty.Write(0, data); err != nil {
 				safeLogPrintf("open-handle preload failed for %s: %v", fh.Path, err)
 				continue
 			}
-		} else if err := fh.Dirty.Truncate(size); err != nil {
+		}
+		if err := fh.Dirty.Truncate(size); err != nil {
 			safeLogPrintf("open-handle preload truncate failed for %s: %v", fh.Path, err)
 			continue
 		}
@@ -4837,6 +4912,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		fh.ZeroBase = c.zeroBase || (c.isNew && c.baseRev == 0)
 		fh.BaseRev = c.baseRev
 		fh.ContentSnapshotID = c.contentSnapshotID
+		fh.contentAncestors = c.ancestors
 		fh.LineageTrusted = c.lineageTrusted
 		if c.isNew {
 			fh.OrigSize = 0
@@ -4849,9 +4925,46 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		if c.baseRev > 0 {
 			fs.inodes.UpdateRevision(fh.Ino, c.baseRev)
 		}
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
+}
+
+// refreshAppendBufferLocked reloads a writable handle's buffer from
+// the newest same-path content so an O_APPEND lands at the current end of file
+// instead of a stale snapshot end. Without this, concurrent appendFile-style
+// writers (npm cacache, issue #935) produce divergent whole-file payloads that
+// the commit fence must reject. Sources, in order: another open handle's
+// pending writes, the staged shadow/pending image, the write-back cache; the
+// committed-revision rebind already ran in adoptCommittedRevisionLocked.
+// Callers hold fh.mu; the per-path commit lock is normally held but may be
+// absent on the lock-timeout fallback path. The refresh only uses TryLock on
+// sibling handles. A busy sibling requests a retry after releasing locks;
+// dirty targets adopt only a proven descendant of their own snapshot.
+func (fs *Dat9FS) refreshAppendBufferLocked(fh *FileHandle) error {
+	if fs == nil || fh == nil || fh.Dirty == nil || fh.Unlinked || fh.ShadowSpill {
+		return nil
+	}
+	if isSQLitePersistentJournalPath(fh.Path) {
+		return nil
+	}
+	if loaded, err := fs.loadWritableHandleFromOpenHandles(fh, true); loaded || err != nil {
+		return err
+	}
+	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		return nil
+	}
+	if fs.pendingIndex != nil && fs.shadowStore != nil {
+		if meta, ok := fs.pendingIndex.GetMeta(fh.Path); ok && fs.shadowStore.Has(fh.Path) {
+			if err := fs.loadWritableHandleFromShadowLocked(fh, meta); err != nil {
+				safeLogPrintf("append shadow refresh failed for %s: %v", fh.Path, err)
+			} else {
+				return nil
+			}
+		}
+	}
+	fs.loadWritableHandleFromWriteBackLocked(fh)
+	return nil
 }
 
 func (fs *Dat9FS) hasOpenPendingSQLitePersistentJournalCreate(path string, skip *FileHandle) bool {
@@ -13671,13 +13784,42 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 
 	unlockRemoteCommit := fs.lockHandleRemoteCommitPathLocked(fh)
-	defer unlockRemoteCommit()
-	fs.discardSupersededMutationLocked(fh)
-	fs.adoptCommittedRevisionLocked(fh)
-
-	if fh.Dirty == nil {
-		source = "new-dirty-buffer"
-		fh.Dirty = fs.newWriteBuffer(fh.Path, 0, 0)
+	defer func() { unlockRemoteCommit() }()
+	deadline := time.Now().Add(fs.opts.RemoteCommitWaitTimeout)
+	for {
+		fs.discardSupersededMutationLocked(fh)
+		fs.adoptCommittedRevisionLocked(fh)
+		if fh.Dirty == nil {
+			source = "new-dirty-buffer"
+			fh.Dirty = fs.newWriteBuffer(fh.Path, 0, 0)
+		}
+		if fh.Flags&uint32(syscall.O_APPEND) == 0 {
+			break
+		}
+		refreshErr := fs.refreshAppendBufferLocked(fh)
+		if refreshErr == nil {
+			break
+		}
+		if !errors.Is(refreshErr, errAppendRefreshBusy) {
+			if errors.Is(refreshErr, syscall.EAGAIN) {
+				return 0, gofuse.Status(syscall.EAGAIN)
+			}
+			return 0, httpToFuseStatus(refreshErr)
+		}
+		if time.Now().After(deadline) {
+			return 0, gofuse.Status(syscall.EAGAIN)
+		}
+		fs.releaseHandleRemoteCommitPathLocked(fh)
+		fh.Unlock()
+		select {
+		case <-ctx.Done():
+			fh.Lock()
+			unlockRemoteCommit = func() {}
+			return 0, httpToFuseStatus(ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+		fh.Lock()
+		unlockRemoteCommit = fs.lockHandleRemoteCommitPathLocked(fh)
 	}
 	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
 	writeSyncAppendLogState := appendLogHandleState{}
@@ -14945,6 +15087,10 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 	}
 
+	if handled, st := fs.commitAppendSnapshotLocked(ctx, fh); handled {
+		return st
+	}
+
 	// ShadowSpill strict: synchronous streaming upload from shadow.
 	if fh.ShadowSpill && fs.shadowStore != nil {
 		size := fh.Dirty.Size()
@@ -16036,6 +16182,9 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		phase = "no-dirty-parts"
 		return gofuse.OK
 	}
+	if handled, st := fs.commitAppendSnapshotLocked(ctx, fh); handled {
+		return st
+	}
 	mutationPath := fh.Path
 	mutationIno := fh.Ino
 	mutationSeq := fh.DirtySeq
@@ -16926,6 +17075,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 	if entry == nil {
 		return
 	}
+	fs.clearCommittedAppendSnapshot(entry)
 	fs.onCommitQueueUploaded(entry, committedRev)
 	if fs.layerEnabled() {
 		fs.clearReadTargetsForPath(entry.Path)
@@ -16980,6 +17130,21 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 			fs.notifyInode(entry.Inode)
 		}
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
+	}
+}
+
+func (fs *Dat9FS) clearCommittedAppendSnapshot(entry *CommitEntry) {
+	if fs == nil || fs.openHandles == nil || entry == nil || entry.SnapshotID == "" {
+		return
+	}
+	for _, fh := range fs.openHandles.SnapshotPath(entry.Path) {
+		if fh == nil || !fh.TryLock() {
+			continue
+		}
+		if fh.appendSnapshot && fh.DirtySeq == entry.MutationSeq && fh.ContentSnapshotID == entry.SnapshotID {
+			fh.appendSnapshot = false
+		}
+		fh.Unlock()
 	}
 }
 
