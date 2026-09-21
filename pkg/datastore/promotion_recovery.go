@@ -30,6 +30,7 @@ type promotionAbortResult struct {
 
 var promotionTestAfterAbortAccepted func()
 var promotionTestFailBeforeAbortFinalize func() error
+var promotionTestBeforeAbortFinalLeaseCheck func()
 
 // AbortImport atomically gives cleanup a durable owner before dispatching the
 // server-owned worker. Once accepted, caller cancellation no longer owns the
@@ -212,6 +213,9 @@ func (s *PromotionStore) finishPromotionAbort(ctx context.Context, req Promotion
 		}
 		if err := validatePromotionStagedContents(storedManifest, contents); err != nil {
 			return err
+		}
+		if promotionTestBeforeAbortFinalLeaseCheck != nil {
+			promotionTestBeforeAbortFinalLeaseCheck()
 		}
 		finishedAt, err := promotionDatabaseTime(ctx, tx)
 		if err != nil {

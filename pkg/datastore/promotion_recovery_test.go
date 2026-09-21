@@ -72,6 +72,80 @@ func TestPromotionAbortMetadataOnlyReleasesZeroReservation(t *testing.T) {
 	require.Equal(t, uint64(2), version)
 }
 
+func TestPromotionAbortCleansPartialStagingExactlyOnce(t *testing.T) {
+	tests := []struct {
+		name             string
+		uploadFirstFile  bool
+		wantInitialState string
+		wantContentRows  int
+	}{
+		{name: "created with all files unbound", wantInitialState: "CREATED"},
+		{name: "staging with a proper subset", uploadFirstFile: true, wantInitialState: "STAGING", wantContentRows: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, promotionStore, created, manifest := createPromotionImportForContent(t, []promotion.ManifestEntry{
+				{RelativePath: "one", Type: promotion.EntryTypeFile, Mode: 0o644, ExpectedSizeBytes: 3, ExpectedChecksumSHA256: promotionTestHash("one")},
+				{RelativePath: "two", Type: promotion.EntryTypeFile, Mode: 0o644, ExpectedSizeBytes: 3, ExpectedChecksumSHA256: promotionTestHash("two")},
+			}, "allocate-abort-partial-"+test.name)
+			if test.uploadFirstFile {
+				_, err := promotionStore.PutInlineImportContent(context.Background(), inlineContentRequest(
+					created, manifest[0], "partial-first", bytes.NewBufferString("one"),
+				))
+				require.NoError(t, err)
+			}
+
+			var initialState string
+			var initialEntries, initialContents int
+			require.NoError(t, store.DB().QueryRow(`SELECT state FROM promotion_imports
+				WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+				created.AllocationEpoch, created.AllocationSequence).Scan(&initialState))
+			require.Equal(t, test.wantInitialState, initialState)
+			require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_import_entries
+				WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+				created.AllocationEpoch, created.AllocationSequence).Scan(&initialEntries))
+			require.Equal(t, 2, initialEntries)
+			require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_import_contents
+				WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+				created.AllocationEpoch, created.AllocationSequence).Scan(&initialContents))
+			require.Equal(t, test.wantContentRows, initialContents)
+
+			aborted, err := promotionStore.AbortImport(context.Background(), abortPromotionRequest(created))
+			require.NoError(t, err)
+			require.Equal(t, "ABORTED", aborted.State)
+			assertPromotionAbortFullyReleased(t, store, created)
+
+			retried, err := promotionStore.AbortImport(context.Background(), abortPromotionRequest(created))
+			require.NoError(t, err)
+			require.Equal(t, aborted.TerminalResultBlob, retried.TerminalResultBlob)
+			require.Equal(t, aborted.TerminalResultDigest, retried.TerminalResultDigest)
+			assertPromotionAbortFullyReleased(t, store, created)
+		})
+	}
+}
+
+func assertPromotionAbortFullyReleased(t *testing.T, store *Store, created *PromotionImport) {
+	t.Helper()
+	var entries, contents int
+	require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_import_entries
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		created.AllocationEpoch, created.AllocationSequence).Scan(&entries))
+	require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_import_contents
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		created.AllocationEpoch, created.AllocationSequence).Scan(&contents))
+	require.Zero(t, entries)
+	require.Zero(t, contents)
+	var reservedBytes, reservedFiles uint64
+	require.NoError(t, store.DB().QueryRow(`SELECT reserved_bytes, reserved_files
+		FROM promotion_quota_accounts WHERE tenant_id = 'tenant-a'`).Scan(&reservedBytes, &reservedFiles))
+	require.Zero(t, reservedBytes)
+	require.Zero(t, reservedFiles)
+	var reservationState string
+	require.NoError(t, store.DB().QueryRow(`SELECT state FROM promotion_quota_reservations
+		WHERE tenant_id = 'tenant-a' AND reservation_id = ?`, created.QuotaReservationID).Scan(&reservationState))
+	require.Equal(t, "RELEASED", reservationState)
+}
+
 func TestPromotionAbortDeniedAndUnknownAreIndistinguishable(t *testing.T) {
 	store, promotionStore, created, _ := createPromotionImportForContent(t, nil, "allocate-abort-nondisclosure")
 	authorizer := promotionStore.cfg.Authorizer.(*promotionTestAuthorizer)
@@ -179,6 +253,72 @@ func TestPromotionAbortUsesFreshDatabaseTimeAfterImportLock(t *testing.T) {
 	}
 }
 
+func TestPromotionAbortRechecksWriterLeaseAfterCleanupScan(t *testing.T) {
+	store, promotionStore, created, manifest := createPromotionImportForContent(t, []promotion.ManifestEntry{
+		{RelativePath: "one", Type: promotion.EntryTypeFile, Mode: 0o644, ExpectedSizeBytes: 3, ExpectedChecksumSHA256: promotionTestHash("one")},
+		{RelativePath: "two", Type: promotion.EntryTypeFile, Mode: 0o644, ExpectedSizeBytes: 3, ExpectedChecksumSHA256: promotionTestHash("two")},
+	}, "allocate-abort-final-lease")
+	_, err := promotionStore.PutInlineImportContent(context.Background(), inlineContentRequest(
+		created, manifest[0], "abort-final-lease-content", bytes.NewBufferString("one"),
+	))
+	require.NoError(t, err)
+
+	var databaseNow time.Time
+	require.NoError(t, store.DB().QueryRow(`SELECT CURRENT_TIMESTAMP(3)`).Scan(&databaseNow))
+	verifier := promotionStore.cfg.LeaseVerifier.(*promotionTestLeaseVerifier)
+	verifier.writer.NotAfter = databaseNow.Add(1500 * time.Millisecond)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	promotionTestBeforeAbortFinalLeaseCheck = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() { promotionTestBeforeAbortFinalLeaseCheck = nil })
+	type abortCallResult struct {
+		value *PromotionImport
+		err   error
+	}
+	result := make(chan abortCallResult, 1)
+	go func() {
+		value, err := promotionStore.AbortImport(context.Background(), abortPromotionRequest(created))
+		result <- abortCallResult{value: value, err: err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup did not reach final lease barrier")
+	}
+	time.Sleep(1700 * time.Millisecond)
+	close(release)
+	call := <-result
+	require.Nil(t, call.value)
+	require.ErrorIs(t, call.err, ErrPromotionRestoreFenced)
+
+	var state, reservationState string
+	var entries, contents int
+	var reservedBytes, reservedFiles uint64
+	require.NoError(t, store.DB().QueryRow(`SELECT state FROM promotion_imports
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		created.AllocationEpoch, created.AllocationSequence).Scan(&state))
+	require.Equal(t, "ABORTING", state)
+	require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_import_entries
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		created.AllocationEpoch, created.AllocationSequence).Scan(&entries))
+	require.Equal(t, 2, entries)
+	require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_import_contents
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		created.AllocationEpoch, created.AllocationSequence).Scan(&contents))
+	require.Equal(t, 1, contents)
+	require.NoError(t, store.DB().QueryRow(`SELECT reserved_bytes, reserved_files
+		FROM promotion_quota_accounts WHERE tenant_id = 'tenant-a'`).Scan(&reservedBytes, &reservedFiles))
+	require.Equal(t, uint64(6), reservedBytes)
+	require.Equal(t, uint64(2), reservedFiles)
+	require.NoError(t, store.DB().QueryRow(`SELECT state FROM promotion_quota_reservations
+		WHERE tenant_id = 'tenant-a' AND reservation_id = ?`, created.QuotaReservationID).Scan(&reservationState))
+	require.Equal(t, "RESERVED", reservationState)
+}
+
 func TestPromotionAbortAcceptanceSurvivesRequestCancellation(t *testing.T) {
 	_, promotionStore, created, _ := createPromotionImportForContent(t, nil, "allocate-abort-cancel")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -215,6 +355,53 @@ func TestPromotionAbortFailureLeavesOneRecoverableAttempt(t *testing.T) {
 		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
 		created.AllocationEpoch, created.AllocationSequence).Scan(&secondAttempt))
 	require.Equal(t, firstAttempt, secondAttempt)
+}
+
+func TestPromotionAbortResumesCommitFailureCleanupAttempt(t *testing.T) {
+	store, promotionStore, verified, _ := createVerifiedPromotionImport(t, []promotion.ManifestEntry{
+		{RelativePath: "file", Type: promotion.EntryTypeFile, Mode: 0o644, ExpectedSizeBytes: 5, ExpectedChecksumSHA256: promotionTestHash("hello")},
+	}, "allocate-abort-commit-failure")
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	require.NoError(t, store.InsertInode(context.Background(), &Inode{
+		InodeID: "abort-aba-target-inode", Mode: 0o644, Revision: 1, Status: StatusConfirmed,
+		CreatedAt: now, Mtime: now, ConfirmedAt: &now,
+	}))
+	require.NoError(t, store.InsertNode(context.Background(), &FileNode{
+		NodeID: "abort-aba-target-node", Path: "/published", ParentPath: "/", Name: "published",
+		InodeID: "abort-aba-target-inode", CreatedAt: now,
+	}))
+	require.NoError(t, store.DeleteNode(context.Background(), "/published"))
+
+	_, err := promotionStore.CommitImport(context.Background(), commitPromotionRequest(verified))
+	require.ErrorIs(t, err, ErrPromotionTargetChanged)
+	var firstAttempt, reason, state string
+	require.NoError(t, store.DB().QueryRow(`SELECT state, cleanup_attempt_id, terminal_reason
+		FROM promotion_imports WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		verified.AllocationEpoch, verified.AllocationSequence).Scan(&state, &firstAttempt, &reason))
+	require.Equal(t, "ABORTING", state)
+	require.NotEmpty(t, firstAttempt)
+	require.Equal(t, "target_precondition_changed", reason)
+
+	aborted, err := promotionStore.AbortImport(context.Background(), abortPromotionRequest(verified))
+	require.NoError(t, err)
+	require.Equal(t, "ABORTED", aborted.State)
+	require.Contains(t, aborted.TerminalResultBlob, `"terminal_reason":"target_precondition_changed"`)
+	var finalAttempt string
+	require.NoError(t, store.DB().QueryRow(`SELECT cleanup_attempt_id FROM promotion_imports
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		verified.AllocationEpoch, verified.AllocationSequence).Scan(&finalAttempt))
+	require.Equal(t, firstAttempt, finalAttempt)
+	assertPromotionAbortFullyReleased(t, store, verified)
+	var publishedNodes, events int
+	require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE path LIKE '/published%'`).Scan(&publishedNodes))
+	require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM fs_events WHERE promotion_migration_id = ?`, verified.MigrationID).Scan(&events))
+	require.Zero(t, publishedNodes)
+	require.Zero(t, events)
+
+	retried, err := promotionStore.AbortImport(context.Background(), abortPromotionRequest(verified))
+	require.NoError(t, err)
+	require.Equal(t, aborted.TerminalResultDigest, retried.TerminalResultDigest)
+	assertPromotionAbortFullyReleased(t, store, verified)
 }
 
 func TestPromotionAbortStaleWriterAndCorruptAttemptFailClosed(t *testing.T) {
