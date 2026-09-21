@@ -191,7 +191,7 @@ Key principles:
 - The write hot path prefers local storage and must not turn every `write(2)` into a remote round trip.
 - Checkpoint/close/fsync/unmount are restore-safe durability barriers.
 - The backend durable layer is the authority for cross-sandbox restore.
-- Local-only overlay is a performance layer and rebuildable state; it does not automatically enter the durable layer.
+- Local-only overlay is a performance layer and rebuildable state; it does not automatically enter the durable layer. Explicit/opt-in promotion follows the atomic protocol in [Local-to-Remote Persistence Promotion](./local-to-remote-promotion.md); ordinary recursive copy/delete is not that protocol.
 - Git workspace keeps its specialized implementation and is not forced into the generic layer.
 
 ## Filesystem Model
@@ -556,6 +556,6 @@ V1 does not do:
 - Recursive directory rename.
 - Full whiteout expansion for recursive delete.
 - Migrating Git workspace tables into generic layer tables.
-- Automatically persisting local-only build/cache output.
+- Automatically persisting local-only build/cache output without the explicit/opt-in promotion protocol defined in [Local-to-Remote Persistence Promotion](./local-to-remote-promotion.md).
 
 DeltaFS/DeltaBox multi-segment checkpoint/rollback can be a future V2/V3 optimization direction, not a source of V1 complexity.

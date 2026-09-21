@@ -369,7 +369,11 @@ Design notes:
 `Rename(old, new, layer_id)`:
 
 - MVP supports files and symlinks: old whiteout + new upsert.
-- Directory rename first returns a typed error or FUSE `EXDEV`, letting callers fall back to copy/delete.
+- Directory rename first returns a typed error or FUSE `EXDEV`. An fs-layer
+  application may explicitly perform a non-atomic copy/delete, but that is not
+  local-to-remote persistence promotion; cross-layer promotion must use the
+  atomic protocol in
+  [Local-to-Remote Persistence Promotion](./local-to-remote-promotion.md).
 - Later versions can add atomic recursive rename or `op=rename`.
 
 `Commit(layer_id)`:
@@ -422,7 +426,7 @@ FUSE:
 - Add `LayerID` to `MountOptions`.
 - `Stat`, `ReadDir`, `Read`, `Write`, `Mkdir`, `Rename`, `Unlink`, `Symlink`, `Chmod`, and `Flush` all use the layer-aware client.
 - Keep the coding-agent local-only overlay for `.git`, `node_modules`, build output, and cache.
-- Local-only state must be clearly marked as rebuildable and must not automatically enter the durable layer.
+- Local-only state must be clearly marked as rebuildable and must not automatically enter the durable layer. An explicit/opt-in transition must use the atomic, recoverable protocol in [Local-to-Remote Persistence Promotion](./local-to-remote-promotion.md), never visible recursive copy/delete.
 
 ## Search / Semantic Semantics
 
