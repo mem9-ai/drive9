@@ -33,6 +33,18 @@ prove a finite latest side-effect time, even when Drive9 proxies the request,
 so object-backed promotion fails closed until a provider-specific contract is
 implemented and enabled.
 
+### Normative freeze boundary
+
+The binding P0/P1 contract in this document is the DB9-inline protocol and the
+restore, namespace, local-recovery, and FUSE rules needed to use it safely.
+Text explicitly marked **non-binding future external-object appendix** is design
+input only: its APIs, tables, and tests do not ship in P0/P1 and are not a
+frozen public or implementation contract. A future production object adapter
+must move that material into a separately reviewed design before enabling any
+external-object mode. References from the binding contract to future cleanup
+requirements are conservative eligibility checks, not permission to implement
+the appendix opportunistically.
+
 ## User Problem
 
 Coding-agent profiles keep build and cache paths such as `dist`, `build`, and
@@ -74,6 +86,10 @@ The first implementation does not support:
 - target replacement or renameat2 extensions;
 - object-backed regular-file payloads until a production provider supplies the
   operation-identity and finite latest-landing contract below;
+- a non-directory source root in the P1 FUSE preview. A regular-file or symlink
+  root returns `promotion_not_supported`/`EXDEV` before allocation or remote
+  side effects; single-file promotion requires a later manifest/root-identity
+  contract;
 - transparent cross-layer rename while a source file or directory handle is
   open;
 - unbounded trees without entry, byte, depth, and time limits.
@@ -390,7 +406,13 @@ the phase. If a later emergency restore supersedes that observation before
 source release, the coordinator does not regress the physical phase: it
 atomically records the newer observation plus
 `RESTORE_SOURCE` or `RECOVERY_REQUIRED` and fsyncs it before touching the source
-or quarantine. A phase that requires one of these facts but has a missing,
+or quarantine. A provable rollback at `REMOTE_COMMITTED` or
+`SOURCE_QUARANTINED` first enters `RECONCILING`; after the matching source is
+authoritative and the rolled-back target is absent or invalidated, it retains
+that historical phase and atomically records `fence_state=RELEASED`. The newer
+rollback observation and `RESTORE_SOURCE` disposition explain why the historic
+commit phase no longer names a live target. A phase that requires one of these
+facts but has a missing,
 zero, corrupt, or mismatched field is fail-closed recovery state, not an old
 success that may be reused.
 
@@ -429,6 +451,12 @@ PREPARED | CREATE_REQUESTED | STAGING | STAGED_VERIFIED | COMMIT_REQUESTED
   -> LOCAL_ABORTED
 ```
 
+`STAGED_VERIFIED` is the local durable observation of server state `VERIFIED`:
+the coordinator writes the complete accepted tuple and verified manifest
+digest, then fsyncs the record and state directory before dispatching commit.
+It is not a second server state and cannot be inferred only from a successful
+`VerifyImport` response held in memory.
+
 `LOCAL_ABORTED` requires a definitive proof that no target was published: a
 retired allocation decision or the immutable server `ABORTED` result. It is a
 terminal local failure branch, not a server state transition. No phase
@@ -450,11 +478,16 @@ installed registry entry is bound to this record, rewrites and fsyncs
 continue. `INSTALLING`/`INSTALLED` require both prefixes fenced and are valid
 only before user-visible publication. `RELEASED` means this migration owns no
 ordinary registry fence and is valid only at `PUBLISHED_QUARANTINED` or later,
-or at `LOCAL_ABORTED` with a checksum-bound definitive non-publish result.
-`RECONCILING` means a newer restore generation re-acquired both prefixes for
-rollback reconciliation after publication. Every value is checksum-bound to
-phase; an impossible pair fails the affected mount paths closed rather than
-choosing either field as more authoritative.
+at `LOCAL_ABORTED` with a checksum-bound definitive non-publish result, or at
+`REMOTE_COMMITTED`/`SOURCE_QUARANTINED` with a checksum-bound newer-generation
+`promotion_restore_rolled_back` observation, `RESTORE_SOURCE`, and durable proof
+that the matching source is authoritative and the rolled-back target is not
+locally published. `RECONCILING` means a newer restore generation re-acquired
+both prefixes for rollback reconciliation at any phase from
+`REMOTE_COMMITTED` onward; it is not limited to operations already returned to
+the user. Every value is checksum-bound to phase; an impossible pair fails the
+affected mount paths closed rather than choosing either field as more
+authoritative.
 
 `PREPARED` means the complete request identity is durable and the coordinator
 has **not** dispatched `CreateImport`. Immediately before the first network
@@ -509,6 +542,15 @@ source into a migration-owned quarantine on the same filesystem:
 overlay/.drive9-promotions/<migration_id>/source
 ```
 
+`overlay/.drive9-promotions/` is a mount-private, Drive9-owned namespace. It is
+excluded from user lookup and readdir, never classified by path policy, and is
+opened only through the coordinator's no-follow private-root handles. User-
+originated lookup, create, rename, link, unlink, or xattr operations targeting
+that root are rejected before reaching the overlay filesystem. The root and
+per-migration directories are mode `0700` (records remain `0600`) and owned by
+the mount service identity; startup rejects an unexpected owner, mode, link, or
+mount crossing as corrupt local state.
+
 It then fsyncs the old parent and quarantine parent, rewrites
 `phase=SOURCE_QUARANTINED` while preserving the exact phase-result tuple,
 digest, and fsyncs the record and state directory. Cleanup uses the quarantine
@@ -541,17 +583,20 @@ Mount startup obtains the tenant's installed restore generation/database
 incarnation before serving paths. For `PUBLISHED_QUARANTINED` with the same
 tuple it reconstructs the published target and starts the janitor without
 reinstalling ordinary user-path fences. If startup or a live generation
-invalidation observes a newer rollback generation, it first installs fences on
-the affected source/target prefixes, then persists `fence_state=RECONCILING`
-together with `RESTORE_SOURCE` or `RECOVERY_REQUIRED` before reconciling the
-retained quarantine. On restart, `RECONCILING` reinstalls those conditional
-fences. If the matching source is safely restored and the rolled-back target is
-invalidated, one record+directory fsync preserves the newer restore observation/
-disposition and changes `fence_state=RELEASED` before the manager releases the
-conditional fence. If either side is ambiguous, it stays `RECONCILING` and the
-affected paths remain recovery-required. The historical phase need not regress;
-the checksum-bound restore disposition explains why a published operation was
-later rolled back. Thus restart
+invalidation observes a newer rollback generation at any phase from
+`REMOTE_COMMITTED` onward, it first installs fences on the affected
+source/target prefixes, then persists `fence_state=RECONCILING` together with
+`RESTORE_SOURCE` or `RECOVERY_REQUIRED` before reconciling the source or retained
+quarantine. On restart, `RECONCILING` reinstalls those conditional fences. If
+the matching source is safely authoritative and the rolled-back target is
+absent or invalidated, one record+directory fsync preserves the newer restore
+observation/disposition and changes `fence_state=RELEASED` before the manager
+releases the conditional fence. This terminal rollback-reconciled pair is legal
+at `REMOTE_COMMITTED`, `SOURCE_QUARANTINED`, or any later phase and does not
+claim the rename was published. If either side is ambiguous, it stays
+`RECONCILING` and the affected paths remain recovery-required. The historical
+phase need not regress; the checksum-bound restore disposition explains why an
+accepted or published operation was later rolled back. Thus restart
 does not turn backup retention into a rename stall, while a real restore still
 cannot race source recovery.
 
@@ -618,7 +663,7 @@ PutInlineImportContent(migration_id, owner_epoch, owner_token,
                        relative_path, entry_hash, size, checksum_sha256,
                        content_idempotency_key, bounded_body)
 
-# Future external-object extension; disabled for current production adapters.
+# BEGIN NON-BINDING FUTURE EXTERNAL-OBJECT APPENDIX API; not P0/P1.
 CreateImportContent(migration_id, owner_epoch, owner_token,
                     relative_path, entry_hash, size,
                     attempt_idempotency_key)
@@ -633,6 +678,7 @@ SealImportContent(migration_id, owner_epoch, owner_token,
                   content_id, upload_attempt_id)
 AttachImportContent(migration_id, owner_epoch, owner_token,
                     relative_path, entry_hash, import_content_token)
+# END NON-BINDING FUTURE EXTERNAL-OBJECT APPENDIX API.
 VerifyImport(migration_id, owner_epoch, owner_token, manifest_hash)
 CommitImport(migration_id, owner_epoch, owner_token)
 GetImport(migration_id, allocation_proof_or_recovery_token)
@@ -955,9 +1001,10 @@ not advisory documentation.
 1. CAS the external authority from `ACTIVE` to `FENCING`, advance to a distinct
    fence-writer generation, stop routing new promotion API calls/workers for
    the tenant, and stop issuing allocation, `NORMAL` writer, and source-release
-   grants. The same CAS records a selected restore point plus the catalog-signed
-   proof that it dominates the current `future_restore_floor_checkpoint`; a
-   stale, lagging, or incomparable point is rejected before DB fencing begins.
+   grants. The same CAS records the requested restore operation and the current
+   `future_restore_floor_checkpoint`, but **does not** bless a pre-drain backup
+   as promotion-consistent. A caller-suggested stale, lagging, or incomparable
+   recovery point is rejected before DB fencing begins.
 2. Using a signed fence grant, transactionally lock the old tenant DB restore-
    capability row and change it from the prior `ACTIVE` writer generation to
    `DRAINING` at the new fence generation. A transaction that locked the row
@@ -977,10 +1024,19 @@ not advisory documentation.
    the DB to report `FENCED`, zero nonterminal imports, and no transaction or
    worker claim from either old or drain generation. Timeout, cleanup failure,
    or an uncertain DB session leaves the authority `FENCING`; planned restore
-   does not silently fall through to the emergency path.
+   does not silently fall through to the emergency path. After that audit, the
+   database adapter obtains an after-drain checkpoint causally containing the
+   `FENCED` row and zero-nonterminal audit transaction. The catalog must attest
+   that checkpoint, its immutable backup lineage, and dominance over the
+   captured future-restore floor. This exact proof defines a
+   **promotion-consistent snapshot**. A point selected before the drain, or any
+   point whose snapshot still contains a nonterminal import, is ineligible for
+   this planned path and leaves the tenant `FENCING`. Arbitrary older planned
+   PITR is unsupported in P0/P1; it requires a separately reviewed planned-
+   reconciliation workflow rather than silently borrowing emergency authority.
 5. Advance the non-rollback allocation epoch and restore generation and mint a
-   new database incarnation and writer generation. Restore the selected
-   promotion-consistent snapshot into that incarnation, install the exact tuple
+   new database incarnation and writer generation. Restore that exact attested
+   promotion-consistent snapshot into the new incarnation, install the tuple
    including its catalog-authenticated backup-lineage ID as `FENCED`, retire
    unused claims, and verify that all import rows are
    terminal before activation. If the restored incarnation starts a descendant
@@ -1068,6 +1124,16 @@ the matching source/quarantine exists, only those paths fail closed with
 `FENCING` after its restored rows have reconciled. Loss of data acknowledged
 after the selected restore point remains the declared tenant RPO, not a hidden
 promotion guarantee.
+
+The distinct surviving-commit case is explicit. If the newer-generation
+`GetImport` returns `COMMITTED` with the same immutable result digest and the
+restored terminal row's containment checkpoint is proven included by the
+selected restore lineage/point, the commit survived PITR. The coordinator
+fsyncs the newer tuple and same digest with `restore_disposition=NONE` before
+resuming its recorded phase. It neither restores a duplicate source nor leaves
+the successful rename indefinitely recovery-required. A same digest without
+the containment/lineage proof stays `RECOVERY_REQUIRED`; equality alone is not
+backup inclusion evidence.
 
 A clone into a **different** tenant identity is not continuation of old
 promotion operations. Before enabling the clone, a one-use clone-scrub grant
@@ -1279,13 +1345,17 @@ one object-backed file returns `promotion_storage_backend_unsupported`/`EXDEV`
 before remote side effects. This limitation is advertised as capability scope,
 not silently routed through the ordinary S3 upload path.
 
-#### Future external-object capability contract (not enabled in P0)
+#### Non-binding future external-object appendix (not enabled in P0/P1)
 
-The remainder of this section is a necessary contract for a future production
-object adapter. It does **not** make the current `AWSS3Client` eligible. Such an
-adapter must add concrete operation identity, finite landing bounds, exact
-enumeration, accounting, cleanup, and adapter-classification tests before its
-mode can appear in `PlanImport`.
+> **Non-binding appendix begins.** Nothing through the explicit end marker below
+> is part of the frozen P0/P1 API or schema. It records hazards and candidate
+> requirements only. A future production object adapter must extract and revise
+> this material in a separately reviewed design. It does **not** make the
+> current `AWSS3Client` eligible.
+
+Such an adapter must add concrete operation identity, finite landing bounds,
+exact enumeration, accounting, cleanup, and adapter-classification tests before
+its mode can appear in `PlanImport`.
 
 Even in that future mode, `CreateImport` remains the sole entry/metadata
 transport. `AttachImportContent` may only bind an immutable sealed content
@@ -1456,6 +1526,9 @@ Retrying a durable attempt or seal intent reuses its charge; it never
 double-charges or silently drops debt after response loss. This prevents
 repeated uploads, seals, aborts, or takeovers from turning the closure window
 into unbounded provider storage debt.
+
+> **Non-binding future external-object appendix ends.** The target-precondition
+> and server-state contracts below are binding P0/P1 requirements.
 
 During `CreateImport`, the server resolves and records an immutable target
 precondition; clients cannot supply or replace its namespace facts. It is a
@@ -1785,13 +1858,7 @@ imports(
   source_release_floor_checkpoint,
   terminal_at, result_acknowledged_at,
   full_row_compact_not_before, retire_after, created_at, updated_at,
-  primary key (tenant_id, allocation_epoch, allocation_sequence),
-  check (
-    state <> 'ABORTING' or
-    (cleanup_attempt_id is not null and
-     cleanup_writer_generation is not null and
-     terminal_reason is not null)
-  )
+  primary key (tenant_id, allocation_epoch, allocation_sequence)
 )
 
 import_entries(
@@ -1807,15 +1874,17 @@ import_entries(
 import_contents(
   tenant_id, allocation_epoch, allocation_sequence, import_content_id,
   inline_content_blob, inline_content_idempotency_key, inline_request_digest,
+  size_bytes, checksum_sha256, ownership_state,
+  # Non-binding future external-object fields; not P0/P1:
   sealed_storage_ref,
-  sealed_storage_version, size_bytes, checksum_sha256,
-  accepted_seal_attempt_id, seal_state, ownership_state,
+  sealed_storage_version, accepted_seal_attempt_id, seal_state,
   primary key (tenant_id, allocation_epoch, allocation_sequence,
                import_content_id),
   unique (tenant_id, allocation_epoch, allocation_sequence,
           inline_content_idempotency_key)
 )
 
+# BEGIN NON-BINDING FUTURE EXTERNAL-OBJECT APPENDIX SCHEMA; not P0/P1.
 import_upload_attempts(
   tenant_id, allocation_epoch, allocation_sequence,
   import_content_id, upload_attempt_id,
@@ -1865,6 +1934,7 @@ import_seal_attempts(
           import_content_id,
           source_upload_attempt_id)
 )
+# END NON-BINDING FUTURE EXTERNAL-OBJECT APPENDIX SCHEMA.
 
 import_tombstones(
   tenant_id, allocation_epoch, allocation_sequence,
@@ -1906,6 +1976,18 @@ on the same row and are written by one transaction; worker enqueue is only a
 notification, not ownership. The rollout/test gate enumerates every writer
 entry point; adding a new writer without the guard, or any transition to
 `ABORTING` without the cleanup tuple, is a contract and CI failure.
+
+The `ABORTING` cleanup tuple is **not** made load-bearing by a portable SQL
+`CHECK`: TiDB parses but does not enforce check constraints unless
+`tidb_enable_check_constraint=ON`, and existing deployments cannot be assumed to
+have that setting. The transition transaction writes state, attempt ID, writer
+generation, and terminal reason together; every reader/scanner rejects an
+incomplete tuple; schema migration and rollout audits scan for invalid rows
+before promotion is enabled. An implementation may add the database `CHECK`
+only when startup verifies enforcement, but tests must still delete/bypass the
+transactional/runtime guard and observe fail-closed recovery. If a deployment
+chooses the constraint as an additional gate, rollback may not disable its
+enforcement while promotion remains enabled.
 
 The public `migration_id` is not an independently stored database identity.
 Every handler strictly decodes it, combines the epoch/sequence pair with the
@@ -1999,6 +2081,20 @@ same tenant/global materialized-identity admission caps rather than an
 unmetered permanent row. A lost certificate response can be retried, and a lost
 acknowledgement can resubmit the persisted certificate. Once acknowledged, the
 ordinary retirement window applies.
+
+This means a deployment without a working containment-checkpoint and backup-
+catalog adapter can exhaust its materialized-identity budget even though each
+rename already returned successfully. Such a deployment is preview-only and
+must expose `source_release_pending` count, oldest age, retained bytes, and
+tenant/global materialized slots as admission-pressure metrics. At the
+configured warning threshold it stops admitting new promotions before the hard
+cap. The bounded operator path is to disable new admission, repair/enable the
+real checkpoint/catalog integration, issue and process the retained release
+certificates, and then retire the identities normally. A configuration-
+generation-guarded cap increase is permitted only after an audited storage and
+quarantine-capacity increase; it remains finite and does not waive certificate
+or cleanup requirements. There is no administrative “forget” operation that
+releases the slot while the last local source copy still lacks a certificate.
 
 Only terminalization assigns `retire_after = terminal_at +` the configured
 maximum offline-recovery window. The tenant-bound migration ID, canonical
@@ -2167,7 +2263,10 @@ held, it fsyncs the legal pair
 `(phase=PUBLISHED_QUARANTINED,fence_state=RELEASED)` and only then invokes the
 idempotent resolver. The definitive non-publish path likewise fsyncs
 `(phase=LOCAL_ABORTED,fence_state=RELEASED)` while held before resolving the
-entry. Process restart installs ordinary fences only for
+entry. A newer-generation rollback from `REMOTE_COMMITTED` or
+`SOURCE_QUARANTINED` first persists `RECONCILING` and may resolve only by
+fsyncing that same historical phase with the checksum-bound rollback proof,
+`RESTORE_SOURCE`, and `RELEASED`. Process restart installs ordinary fences only for
 `INSTALLING`/`INSTALLED`; `RELEASED` installs none. A newer restore generation
 may acquire a fresh registry entry and persist `RECONCILING`; restart reinstalls
 that conditional entry until rollback reconciliation durably returns to
@@ -2239,8 +2338,10 @@ generation CAS. The generic import path must not bypass Git routing.
 On a restart with the same local root, recovery scans and validates every local
 migration record before serving paths. It restores ordinary or conditional
 fences only for legal `(phase,fence_state)` pairs that own one; it does not
-fence `PUBLISHED_QUARANTINED+RELEASED`, `LOCAL_ABORTED+RELEASED`, or later
-released records. Records that still own a fence query the server by
+fence `PUBLISHED_QUARANTINED+RELEASED`, `LOCAL_ABORTED+RELEASED`, a proven
+rollback-reconciled `REMOTE_COMMITTED+RELEASED` or
+`SOURCE_QUARANTINED+RELEASED`, or later released records. Records that still
+own a fence query the server by
 `migration_id` before serving their affected paths. Released records may resume
 non-blocking acknowledgement, retention, or background-GC work without
 reinstalling a path fence.
@@ -2252,6 +2353,14 @@ deletion. `promotion_restore_rolled_back` keeps/restores the matching source as
 described above; a generation mismatch plus an unprovable source/target outcome
 is `promotion_recovery_required` for those paths, never permission to reuse the
 old result.
+
+A newer tuple with the **same immutable `COMMITTED` result digest** is not a
+rollback signal. Recovery requires the restored terminal row and its
+commit-containment checkpoint to be on the installed restore lineage and the
+catalog to prove that the selected restore point contains it. It then fsyncs
+the newer accepted/result tuple with `restore_disposition=NONE` and resumes the
+same physical phase. If containment cannot be proved it remains
+`RECOVERY_REQUIRED`; it never restores a duplicate source beside a live target.
 
 Recovery validates the record's phase-result binding before interpreting the
 phase. `REMOTE_COMMITTED`, `SOURCE_QUARANTINED`, `PUBLISHED_QUARANTINED`,
@@ -2287,7 +2396,9 @@ The durable local phase refines, but never overrides, that server result.
 Recovery first checksum-validates the record and the **pair**
 `(phase,fence_state)`, then applies one decision: pre-publication
 `INSTALLING`/`INSTALLED` install both ordinary fences;
-`PUBLISHED_QUARANTINED` or later, or `LOCAL_ABORTED`, with `RELEASED` installs none; and
+`PUBLISHED_QUARANTINED` or later, `LOCAL_ABORTED`, or a checksum-bound
+rollback-reconciled `REMOTE_COMMITTED`/`SOURCE_QUARANTINED`, with `RELEASED`
+installs none; and
 `RECONCILING` installs the conditional rollback fences. `INSTALLING` is
 completed to `INSTALLED` with the existing manager entry. There is no rule that
 processes `fence_state` independently ahead of phase. A missing, corrupt, or
@@ -2302,8 +2413,8 @@ illegal pair fails the affected mount paths closed.
 | `STAGED_VERIFIED` | Reconcile before commit; do not mutate the frozen manifest. |
 | `COMMIT_REQUESTED` | Query `GetImport`; never retry with a new migration ID or infer failure from disconnect. |
 | `LOCAL_ABORTED` | Requires `RELEASED` plus the checksum-bound retired-allocation or immutable `ABORTED` result. The source remains authoritative, no ordinary fence is installed, and acknowledgement/retirement or local-record compaction may be retried without blocking the paths. |
-| `REMOTE_COMMITTED` | Require the complete durable phase-result binding, fetch `GetImport`, and proceed only if its `COMMITTED` digest and restore tuple still match. Then verify the source-incarnation UUID before quarantine. If a newer emergency-restore generation returns `promotion_restore_rolled_back`, first fsync that observation/disposition and retain or restore only the matching source; never perform destructive cleanup from the old result. |
-| `SOURCE_QUARANTINED` | This is still a synchronous rename phase with `fence_state=INSTALLED`: reconstruct/publish the committed target, atomically fsync `PUBLISHED_QUARANTINED+RELEASED`, then release the manager entry. A newer rolled-back generation observed first is durably recorded and restores only the matching quarantine or keeps those paths recovery-required. No certificate or physical deletion is needed to finish this transition. |
+| `REMOTE_COMMITTED` | Require the complete durable phase-result binding, fetch `GetImport`, and proceed only if its `COMMITTED` digest and restore tuple still match. Then verify the source-incarnation UUID before quarantine. If a newer generation returns `promotion_restore_rolled_back`, acquire/preserve both fences, fsync `RECONCILING+RESTORE_SOURCE`, retain the matching source, invalidate the rolled-back target, then atomically fsync the same historical phase with `RELEASED`; this exact pair is terminal and legal. If a newer tuple preserves the same contained commit digest, fsync that tuple with `NONE` and continue instead. |
+| `SOURCE_QUARANTINED` | This is still a synchronous rename phase with `fence_state=INSTALLED`: reconstruct/publish the committed target, atomically fsync `PUBLISHED_QUARANTINED+RELEASED`, then release the manager entry. A newer rolled-back generation instead fsyncs `RECONCILING+RESTORE_SOURCE`, restores only the matching quarantine, invalidates the target, and atomically fsyncs `SOURCE_QUARANTINED+RELEASED`; this exact pair is terminal and legal. Ambiguity stays `RECONCILING`. No certificate or physical deletion is needed to finish either transition. |
 | `PUBLISHED_QUARANTINED` | With `RELEASED`, the rename already succeeded and ordinary path fences stay released; run only the background containment/source-release janitor and retain quarantine while proof is pending. If mount startup or live invalidation observes a newer rollback generation, acquire both affected prefixes and persist `RECONCILING` before applying rollback; never unlink from the old result. A valid persisted certificate permits resumable physical deletion even if the terminal row compacted. |
 | `LOCAL_CLEANED` | Requires `RELEASED`. The matching quarantine is absent and parent fsync is durable; user paths were already released. Retry `AcknowledgeSourceRelease`, then fsync `DONE+RELEASED`. |
 | `DONE` | Requires `RELEASED`. The committed target is locally published, fences are released, and the source was irreversibly released under the certificate. Retry any lost terminal/source-release acknowledgements and compact the local record only under the configured local recovery-retention policy. |
@@ -2378,8 +2489,9 @@ owner.
 ### P1: restricted preview
 
 - explicit `promote/persist` and/or opt-in FUSE cross-layer rename;
-- homogeneous ordinary all-inline trees only; any object-backed file fails
-  before `CreateImport` and quota reservation;
+- directory source roots containing homogeneous ordinary all-inline trees only;
+  a regular-file/symlink source root or any object-backed file fails before
+  `AllocateImportID`, `CreateImport`, and quota reservation;
 - absent target, no open handles, no Git workspace, bounded tree;
 - durable local migration record, subtree fence, synchronous completion.
 
@@ -2438,6 +2550,10 @@ owner.
   binding interval as an ordinary request error makes a production-entry test
   expose an unfenced durable record or hang;
 - empty and deep directories;
+- a regular-file or symlink source root at the production FUSE rename entry
+  returns `promotion_not_supported`/`EXDEV` before allocation, import, quota, or
+  staging; deleting this directory-root eligibility guard makes the focused
+  test observe a remote side effect and fail;
 - zero-byte files, files at `inlineThreshold-1`, and complete all-inline trees;
 - files at `inlineThreshold` or larger and disabled inline storage require an
   external-object plan; `LocalS3Client` in production, `AWSS3Client`, and an
@@ -2470,6 +2586,12 @@ owner.
 - empty, empty-directory-only, and symlink-only manifests verify directly from
   `CREATED`; a manifest with any unbound regular file fails verification and
   remains in its original state;
+- the private `overlay/.drive9-promotions/` root and every migration child are
+  absent from mounted lookup/readdir and rejected by user create/rename/link/
+  unlink/xattr operations. Startup rejects wrong ownership/mode, symlinked
+  components, and mount crossings; deleting the namespace filter or private-
+  root validation makes the real FUSE fixture expose or mutate quarantine and
+  fail;
 - removing `CreateImport`'s manifest persistence loses those metadata-only
   entries and makes the production-path round-trip fail;
 - an inline content call for an absent/non-file path or a mismatched entry
@@ -2574,9 +2696,12 @@ tree. Repeated recovery is idempotent.
   losing trigger returns the same attempt ID;
 - mutation variants split cleanup-attempt insertion into a second transaction,
   omit its writer generation, or allow `ABORTING` with a null attempt. The
-  transition must fail the row invariant; if the invariant/check or atomic
-  insertion is removed too, the crash-after-transition restore test strands
-  the tenant in `DRAINING` and fails;
+  transition must fail the runtime row invariant; if the invariant/audit or
+  atomic insertion is removed too, the crash-after-transition restore test
+  strands the tenant in `DRAINING` and fails. The TiDB fixture explicitly runs
+  with `tidb_enable_check_constraint=OFF`, injects an invalid historical row,
+  and proves startup/worker recovery rejects it; an optional enforced SQL
+  `CHECK` is defense in depth, never the only failing gate;
 - a transaction that locked the restore-capability row before the fence may
   finish; the fence transaction waits, and no old-generation transaction can
   start after it commits. Separate tests hold an unresponsive worker/session or
@@ -2589,7 +2714,12 @@ tree. Repeated recovery is idempotent.
   incarnation and make the test fail; equivalent guard deletion on `ABORTING`
   must incorrectly delete/settle restored state and fail;
 - planned restore proves the healthy old DB reaches `FENCED` with zero
-  nonterminal rows before restore; deleting that audit makes activation reject;
+  nonterminal rows, then obtains a catalog-attested after-drain checkpoint that
+  causally contains that exact fence/audit transaction. A requested snapshot
+  containing a `COMMITTING` row, a pre-drain point, or a point on an
+  incomparable lineage is rejected while the tenant remains `FENCING`; only
+  the attested promotion-consistent snapshot may install. Deleting the ordering,
+  containment, or zero-nonterminal requirement makes activation reject;
 - emergency restore makes the old DB unavailable and injects a snapshot with
   each of `CREATED`, `STAGING`, `VERIFIED`, `COMMITTING`, and `ABORTING` in
   separate and mixed fixtures. The first three atomically create one
@@ -2618,8 +2748,23 @@ tree. Repeated recovery is idempotent.
   rename but before directory fsync, after durable `REMOTE_COMMITTED`, on both
   sides of the quarantine rename/parent fsyncs, after durable
   `SOURCE_QUARANTINED`, and before physical deletion. It keeps or restores only
-  the matching source/quarantine. If neither side is provable, only those paths
-  remain recovery-required while a fully reconciled tenant can activate;
+  the matching source/quarantine. At durable `REMOTE_COMMITTED` it must end at
+  the exact legal pair `REMOTE_COMMITTED+RELEASED`; at durable
+  `SOURCE_QUARANTINED` it must end at
+  `SOURCE_QUARANTINED+RELEASED`. Both pairs require the checksum-bound newer
+  `promotion_restore_rolled_back` observation, `RESTORE_SOURCE`, restored/
+  retained matching source, and invalidated target. Removing the
+  `RECONCILING` acquisition, either legal pair, or its proof must strand the
+  fence or produce an invalid startup record and fail. If neither side is
+  provable, only those paths remain `RECONCILING`/recovery-required while a
+  fully reconciled tenant can activate;
+- a complementary emergency-restore fixture returns a newer tuple with the
+  same `COMMITTED` result digest. When the restored containment checkpoint is
+  proven included by the selected lineage/point, recovery fsyncs the newer
+  tuple with `NONE`, preserves the committed target, and never restores a
+  duplicate source. A forked/uncontained checkpoint remains recovery-required;
+  treating every newer tuple as rollback or trusting digest equality without
+  containment proof makes one branch fail;
 - the same fixture deletes the accepted/result restore tuple, terminal-result
   digest, or their checksum binding, and separately moves quarantine/deletion
   before the corresponding record+directory fsync. Each mutation must either
@@ -2651,6 +2796,15 @@ tree. Repeated recovery is idempotent.
   recorded and the certificate was acknowledged. Moving acknowledgement before
   that local fsync must strand the recovery anchor under response loss and make
   the mutation test fail;
+- a deployment with containment/catalog certification disabled accumulates
+  release-pending committed identities up to a deliberately small warning and
+  hard materialized cap. Metrics report count, oldest age, retained bytes, and
+  slots; admission stops at the warning policy/hard cap without dropping a
+  source or identity. Enabling the real adapter drains certificates and frees
+  the exact slots. A configuration-generation-guarded finite cap raise works
+  only after capacity audit; deleting the charge or adding an uncertified
+  administrative forget path makes the flood test exceed its bound or lose the
+  last source and fail;
 - rename lifecycle has one durability boundary: after source quarantine and
   local publication, the single pair `PUBLISHED_QUARANTINED+RELEASED` is file-
   and directory-fsynced while the manager entry remains held, before registry
@@ -2968,7 +3122,10 @@ external-object adapter:
   reproduce target ABA and fail the test;
 - planned same-tenant PITR is refused until the external authority is
   `FENCING`, the healthy old DB is `FENCED` with zero nonterminal work, and old
-  leases/transactions/workers have drained. Emergency same-tenant PITR instead
+  leases/transactions/workers have drained, and the chosen snapshot is a
+  catalog-attested checkpoint after that exact fence/audit transaction. A
+  pre-drain or nonterminal-containing snapshot cannot activate. Emergency same-
+  tenant PITR instead
   requires a control-plane proof that the unavailable old database endpoint,
   credentials, and incarnation are permanently isolated before it installs a
   new monotonic epoch/restore/database/writer tuple as `RECOVERING`;
@@ -3075,7 +3232,9 @@ Tests must fail when independently deleting:
   cancellation, or panic path, continuous registry ownership across every
   persist/bind boundary, restart adoption of `INSTALLING`/`INSTALLED`, durable
   release through `PUBLISHED_QUARANTINED+RELEASED` or
-  `LOCAL_ABORTED+RELEASED`, or conditional ownership through `RECONCILING`;
+  `LOCAL_ABORTED+RELEASED`, the checksum-bound rollback-reconciled
+  `REMOTE_COMMITTED+RELEASED` and `SOURCE_QUARANTINED+RELEASED` pairs, or
+  conditional ownership through `RECONCILING`;
 - the subtree fence;
 - migration idempotency;
 - the parent path-edge incarnation, child-set generation, or absent-child term
@@ -3099,6 +3258,10 @@ Tests must fail when independently deleting:
   transaction/worker drain, emergency old-incarnation isolation plus
   `RECOVERING`, and epoch binding in the public ID, proof, every durable key,
   and every handler lookup;
+- planned restore selecting only a catalog-attested after-drain checkpoint that
+  contains the `FENCED`/zero-nonterminal transaction, plus the surviving-commit
+  branch that binds a newer restore tuple only after containment proof instead
+  of duplicating the source;
 - the signed promotion-writer lease, locked restore-capability guard on every
   client and service-owned mutation, durable commit/cleanup attempt generation,
   generation-scoped DB credentials, zero-nonterminal activation audit, and
@@ -3183,8 +3346,11 @@ independently deleting:
   lineage-dominance/ancestry proofs and enforce the structured monotonic future-
   restore floor before local quarantine deletion is enabled. Without both,
   rename may still finish at `PUBLISHED_QUARANTINED`, but quarantine retention
-  is mandatory. The complete manifest must receive a `db9_inline` plan; record
-  promotion outcomes, duration, bytes, entries,
+  is mandatory and the deployment is explicitly preview-only; it must stop new
+  admission before its finite retained-source/materialized-identity budget is
+  exhausted. The complete manifest must receive a `db9_inline` plan; record
+  promotion outcomes, duration, bytes, entries, source-release-pending count/
+  oldest age/bytes/materialized slots,
   storage mode, identity-epoch admission failures, unsupported-provider
   rejections, conflicts, and recovery actions.
 - Do not enable object-backed promotion merely because traffic is proxied.

@@ -556,6 +556,8 @@ V1 does not do:
 - Recursive directory rename.
 - Full whiteout expansion for recursive delete.
 - Migrating Git workspace tables into generic layer tables.
-- Automatically persisting local-only build/cache output without the explicit/opt-in promotion protocol defined in [Local-to-Remote Persistence Promotion](./local-to-remote-promotion.md).
+- Automatically persisting local-only build/cache output. Persistence happens
+  only through the explicit opt-in protocol defined in
+  [Local-to-Remote Persistence Promotion](./local-to-remote-promotion.md).
 
 DeltaFS/DeltaBox multi-segment checkpoint/rollback can be a future V2/V3 optimization direction, not a source of V1 complexity.
