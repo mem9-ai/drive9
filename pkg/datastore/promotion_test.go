@@ -550,6 +550,24 @@ func TestPromotionWriterProtocolGateRejectsOldProcessBeforeMutation(t *testing.T
 		SET minimum_writer_protocol = 2 WHERE tenant_id = 'tenant-a'`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := promotionStore.PlanImport(context.Background(), promotion.PlanImportRequest{
+		TenantID: "tenant-a", Target: "/planned", ExpectedTargetAbsent: true, Manifest: manifest,
+	}); !errors.Is(err, ErrPromotionRestoreFenced) {
+		t.Fatalf("old writer protocol PlanImport error = %v, want ErrPromotionRestoreFenced", err)
+	}
+	assertPromotionCreateRows(t, store, 0, 0, 0)
+	assertPromotionReservedQuota(t, store, 0, 0)
+
+	// A process implementing the admitted protocol can still perform the same
+	// side-effect-free planning operation. This distinguishes a working
+	// rollout gate from accidentally disabling promotion for every version.
+	promotionStore.cfg.WriterProtocol = 2
+	if _, err := promotionStore.PlanImport(context.Background(), promotion.PlanImportRequest{
+		TenantID: "tenant-a", Target: "/planned", ExpectedTargetAbsent: true, Manifest: manifest,
+	}); err != nil {
+		t.Fatalf("current writer protocol PlanImport: %v", err)
+	}
+	promotionStore.cfg.WriterProtocol = 1
 
 	if _, err := promotionStore.CreateImport(context.Background(), PromotionCreateRequest{
 		TenantID: "tenant-a", MigrationID: allocation.MigrationID, AllocationProof: allocation.AllocationProof,
