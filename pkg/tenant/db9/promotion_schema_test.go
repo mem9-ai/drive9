@@ -37,4 +37,10 @@ func TestInitSchemaStatementsIncludePromotionTables(t *testing.T) {
 			t.Fatalf("db9 file_nodes missing %s", fact)
 		}
 	}
+	for _, table := range []string{"promotion_imports", "promotion_import_tombstones"} {
+		lower := strings.ToLower(found[table])
+		if !strings.Contains(lower, "terminal_result_blob text") || strings.Contains(lower, "terminal_result_blob jsonb") {
+			t.Fatalf("db9 %s must store digest-bound terminal result as byte-preserving TEXT", table)
+		}
+	}
 }

@@ -682,13 +682,14 @@ func TestPromotionCreateRecoversTerminalTombstoneAndRejectsRetiredIdentity(t *te
 		Scan(&proofDigest, &requestDigest, &ownerHash, &recoveryHash); err != nil {
 		t.Fatal(err)
 	}
+	terminalResult := `{ "z": 2, "a": {"value": 1} }`
 	if _, err := store.DB().Exec(`INSERT INTO promotion_import_tombstones
 		(tenant_id, allocation_epoch, allocation_sequence, allocation_proof_digest,
 		 target_path, target_path_hash, request_digest, owner_token_hash, recovery_token_hash,
 		 terminal_state, terminal_result_blob, terminal_result_digest, retire_after)
-		VALUES ('tenant-a', ?, ?, ?, '/published', ?, ?, ?, ?, 'COMMITTED', '{}', ?, DATE_ADD(NOW(3), INTERVAL 1 DAY))`,
+		VALUES ('tenant-a', ?, ?, ?, '/published', ?, ?, ?, ?, 'COMMITTED', ?, ?, DATE_ADD(NOW(3), INTERVAL 1 DAY))`,
 		created.AllocationEpoch, created.AllocationSequence, proofDigest, fileNodePathHash("/published"),
-		requestDigest, ownerHash, recoveryHash, promotionTestHash("{}")); err != nil {
+		requestDigest, ownerHash, recoveryHash, terminalResult, promotionTestHash(terminalResult)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`DELETE FROM promotion_imports
@@ -702,7 +703,7 @@ func TestPromotionCreateRecoversTerminalTombstoneAndRejectsRetiredIdentity(t *te
 		t.Fatalf("CreateImport tombstone recovery: %v", err)
 	}
 	if recovered.State != "COMMITTED" || recovered.MigrationID != created.MigrationID || recovered.Target != created.Target ||
-		recovered.TerminalResultBlob != "{}" || recovered.TerminalResultDigest != promotionTestHash("{}") {
+		recovered.TerminalResultBlob != terminalResult || recovered.TerminalResultDigest != promotionTestHash(terminalResult) {
 		t.Fatalf("terminal recovery = %+v, want complete durable terminal result", recovered)
 	}
 	if _, err := store.DB().Exec(`UPDATE promotion_import_tombstones SET terminal_result_digest = ?
@@ -849,12 +850,13 @@ func TestPromotionCreateTerminalFullRowFailsClosedOnMissingOrCorruptResult(t *te
 	if _, err := promotionStore.CreateImport(context.Background(), request); !errors.Is(err, ErrPromotionRecoveryRequired) {
 		t.Fatalf("invalid terminal JSON error = %v, want ErrPromotionRecoveryRequired", err)
 	}
-	setTerminalResult("{}", promotionTestHash("{}"))
+	terminalResult := `{ "z": 2, "a": {"value": 1} }`
+	setTerminalResult(terminalResult, promotionTestHash(terminalResult))
 	recovered, err := promotionStore.CreateImport(context.Background(), request)
 	if err != nil {
 		t.Fatalf("valid full terminal recovery: %v", err)
 	}
-	if recovered.State != "COMMITTED" || recovered.TerminalResultBlob != "{}" || recovered.TerminalResultDigest != promotionTestHash("{}") {
+	if recovered.State != "COMMITTED" || recovered.TerminalResultBlob != terminalResult || recovered.TerminalResultDigest != promotionTestHash(terminalResult) {
 		t.Fatalf("valid full terminal recovery = %+v", recovered)
 	}
 }

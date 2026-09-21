@@ -415,7 +415,7 @@ func PromotionDB9SchemaStatements() []string {
 			terminal_reason VARCHAR(128),
 			committed_root_inode VARCHAR(64),
 			committed_generation BIGINT,
-			terminal_result_blob JSONB,
+			terminal_result_blob TEXT,
 			terminal_result_digest VARCHAR(64),
 			commit_containment_lineage_id VARCHAR(128),
 			commit_containment_position VARCHAR(255),
@@ -515,7 +515,7 @@ func PromotionDB9SchemaStatements() []string {
 			owner_token_hash VARCHAR(64) NOT NULL,
 			recovery_token_hash VARCHAR(64) NOT NULL,
 			terminal_state VARCHAR(32) NOT NULL,
-			terminal_result_blob JSONB NOT NULL,
+			terminal_result_blob TEXT NOT NULL,
 			terminal_result_digest VARCHAR(64) NOT NULL,
 			commit_containment_lineage_id VARCHAR(128),
 			commit_containment_position VARCHAR(255),
@@ -535,5 +535,11 @@ func PromotionDB9SchemaStatements() []string {
 			retired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			PRIMARY KEY (tenant_id, allocation_epoch, allocation_sequence)
 		)`,
+
+		// Terminal result digests cover the exact stored JSON bytes. JSONB
+		// rewrites whitespace and object-key order on round trip, so both fresh
+		// and previously bootstrapped DB9 schemas must use byte-preserving TEXT.
+		`ALTER TABLE promotion_imports ALTER COLUMN terminal_result_blob TYPE TEXT USING terminal_result_blob::text`,
+		`ALTER TABLE promotion_import_tombstones ALTER COLUMN terminal_result_blob TYPE TEXT USING terminal_result_blob::text`,
 	}
 }

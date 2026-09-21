@@ -52,6 +52,14 @@ func TestPromotionSchemaContainsP0DurableFacts(t *testing.T) {
 			}
 
 			imports := creates["promotion_imports"]
+			if name == "db9" {
+				for _, table := range []string{"promotion_imports", "promotion_import_tombstones"} {
+					stmt := creates[table]
+					if !strings.Contains(stmt, "terminal_result_blob text") || strings.Contains(stmt, "terminal_result_blob jsonb") {
+						t.Fatalf("%s must preserve terminal result bytes in TEXT: %s", table, stmt)
+					}
+				}
+			}
 			for _, fact := range []string{
 				"target_parent_edge_incarnation",
 				"target_parent_children_generation",
