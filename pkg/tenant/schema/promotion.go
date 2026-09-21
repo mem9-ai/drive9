@@ -6,6 +6,10 @@ package schema
 // a partial tree before CommitImport publishes it.
 func PromotionTiDBSchemaStatements() []string {
 	return []string{
+		`ALTER TABLE fs_events ADD COLUMN promotion_migration_id VARCHAR(64) NULL`,
+		`ALTER TABLE fs_events ADD COLUMN promotion_target_path TEXT NULL`,
+		`ALTER TABLE fs_events ADD COLUMN promotion_tree_generation BIGINT UNSIGNED NULL`,
+		`CREATE UNIQUE INDEX uk_fs_events_promotion_migration ON fs_events(promotion_migration_id)`,
 		`CREATE TABLE IF NOT EXISTS promotion_storage_capabilities (
 			tenant_id                    VARCHAR(64) PRIMARY KEY,
 			generation                   BIGINT UNSIGNED NOT NULL DEFAULT 0,
@@ -280,6 +284,10 @@ func PromotionTiDBSchemaStatements() []string {
 // PromotionTiDBSchemaStatements.
 func PromotionDB9SchemaStatements() []string {
 	return []string{
+		`ALTER TABLE IF EXISTS fs_events ADD COLUMN IF NOT EXISTS promotion_migration_id VARCHAR(64) NULL`,
+		`ALTER TABLE IF EXISTS fs_events ADD COLUMN IF NOT EXISTS promotion_target_path TEXT NULL`,
+		`ALTER TABLE IF EXISTS fs_events ADD COLUMN IF NOT EXISTS promotion_tree_generation BIGINT NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uk_fs_events_promotion_migration ON fs_events(promotion_migration_id)`,
 		`CREATE TABLE IF NOT EXISTS promotion_storage_capabilities (
 			tenant_id VARCHAR(64) PRIMARY KEY,
 			generation BIGINT NOT NULL DEFAULT 0,

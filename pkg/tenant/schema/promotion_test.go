@@ -45,6 +45,17 @@ func TestPromotionSchemaContainsP0DurableFacts(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			creates := promotionCreateStatements(t, statements)
+			allStatements := strings.ToLower(strings.Join(statements, "\n"))
+			for _, fact := range []string{
+				"promotion_migration_id",
+				"promotion_target_path",
+				"promotion_tree_generation",
+				"uk_fs_events_promotion_migration",
+			} {
+				if !strings.Contains(allStatements, fact) {
+					t.Fatalf("fs_events promotion outbox schema missing %s", fact)
+				}
+			}
 			for _, table := range requiredTables {
 				if creates[table] == "" {
 					t.Fatalf("missing %s CREATE TABLE statement", table)

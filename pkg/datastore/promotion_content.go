@@ -56,26 +56,32 @@ type PromotionVerifyRequest struct {
 }
 
 type promotionOwnerImport struct {
-	identity                    promotion.MigrationIdentity
-	target                      string
-	manifestHash                string
-	entryTotal                  uint64
-	byteTotal                   uint64
-	maxContentSize              uint64
-	storageMode                 string
-	inlineThreshold             uint64
-	namespaceCASEpoch           uint64
-	acceptedRestoreGeneration   uint64
-	acceptedDatabaseIncarnation string
-	acceptedWriterGeneration    uint64
-	quotaReservationID          string
-	state                       string
-	stateVersion                uint64
-	ownerEpoch                  uint64
-	ownerTokenHash              string
-	activityDeadline            time.Time
-	leaseExpiresAt              time.Time
-	terminalReason              sql.NullString
+	identity                       promotion.MigrationIdentity
+	target                         string
+	manifestHash                   string
+	entryTotal                     uint64
+	byteTotal                      uint64
+	maxContentSize                 uint64
+	storageMode                    string
+	inlineThreshold                uint64
+	namespaceCASEpoch              uint64
+	acceptedRestoreGeneration      uint64
+	acceptedDatabaseIncarnation    string
+	acceptedWriterGeneration       uint64
+	quotaReservationID             string
+	targetParentInode              string
+	targetParentPath               string
+	targetParentEdgeIncarnation    string
+	targetParentChildrenGeneration uint64
+	state                          string
+	stateVersion                   uint64
+	ownerEpoch                     uint64
+	ownerTokenHash                 string
+	activityDeadline               time.Time
+	leaseExpiresAt                 time.Time
+	terminalReason                 sql.NullString
+	commitAttemptID                sql.NullString
+	commitWriterGeneration         sql.NullInt64
 }
 
 type promotionEntryRow struct {
@@ -545,16 +551,22 @@ func (s *PromotionStore) lockPromotionOwnerImport(ctx context.Context, tx *sql.T
 	err := tx.QueryRowContext(ctx, `SELECT target_path, manifest_hash, entry_total, byte_total,
 		max_content_size, storage_mode, inline_threshold, namespace_cas_epoch,
 		accepted_restore_generation, accepted_database_incarnation, accepted_writer_generation,
-		quota_reservation_id, state, state_version, owner_epoch, owner_token_hash,
-		activity_deadline, lease_expires_at, terminal_reason
+		quota_reservation_id, target_parent_inode, target_parent_path,
+		target_parent_edge_incarnation, target_parent_children_generation,
+		state, state_version, owner_epoch, owner_token_hash,
+		activity_deadline, lease_expires_at, terminal_reason,
+		commit_attempt_id, commit_writer_generation
 		FROM promotion_imports
 		WHERE tenant_id = ? AND allocation_epoch = ? AND allocation_sequence = ? FOR UPDATE`,
 		tenantID, identity.AllocationEpoch, identity.AllocationSequence).
 		Scan(&row.target, &row.manifestHash, &row.entryTotal, &row.byteTotal,
 			&row.maxContentSize, &row.storageMode, &row.inlineThreshold, &row.namespaceCASEpoch,
 			&row.acceptedRestoreGeneration, &row.acceptedDatabaseIncarnation, &row.acceptedWriterGeneration,
-			&row.quotaReservationID, &row.state, &row.stateVersion, &row.ownerEpoch, &row.ownerTokenHash,
-			&row.activityDeadline, &row.leaseExpiresAt, &row.terminalReason)
+			&row.quotaReservationID, &row.targetParentInode, &row.targetParentPath,
+			&row.targetParentEdgeIncarnation, &row.targetParentChildrenGeneration,
+			&row.state, &row.stateVersion, &row.ownerEpoch, &row.ownerTokenHash,
+			&row.activityDeadline, &row.leaseExpiresAt, &row.terminalReason,
+			&row.commitAttemptID, &row.commitWriterGeneration)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

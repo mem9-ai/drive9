@@ -515,13 +515,12 @@ func (s *PromotionStore) CreateImport(ctx context.Context, req PromotionCreateRe
 		if err != nil {
 			return err
 		}
-		var present int
-		err = tx.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`, fileNodePathHash(target), target).Scan(&present)
-		if err == nil {
-			return ErrPathConflict
+		present, err := promotionTargetChildPresentTx(ctx, tx, parent.path, pathutil.BaseName(target))
+		if err != nil {
+			return err
 		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("lock promotion target absence: %w", err)
+		if present {
+			return ErrPathConflict
 		}
 
 		reservationID, err := newPromotionID("prq")
