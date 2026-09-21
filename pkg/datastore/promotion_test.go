@@ -2,7 +2,9 @@ package datastore
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -244,6 +246,66 @@ func TestPromotionAllocationRateLimitStillAllowsExactRetry(t *testing.T) {
 	}
 	if *retry != *first {
 		t.Fatalf("retry = %+v, want %+v", retry, first)
+	}
+}
+
+func TestPromotionAllocationRateClampsDurableClockAndBurstChanges(t *testing.T) {
+	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	raw := sql.NullString{Valid: true, String: `{"tokens_milli":9000,"updated_unix_milli":` +
+		fmt.Sprint(now.Add(time.Hour).UnixMilli()) + `}`}
+	bucket, err := consumePromotionRate(raw, now, 60, 2)
+	if err != nil {
+		t.Fatalf("consume clamped promotion rate: %v", err)
+	}
+	if bucket.TokensMilli != 1000 || bucket.UpdatedUnixMilli != now.UnixMilli() {
+		t.Fatalf("clamped bucket = %+v, want 1000 tokens at current DB time", bucket)
+	}
+}
+
+func TestPromotionNamespaceAdmissionGatesPlanAndAllocateBeforeSideEffects(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		ready bool
+		state string
+		want  error
+	}{
+		{name: "not ready", state: "ACTIVE", want: ErrPromotionDisabled},
+		{name: "draining", ready: true, state: "DRAINING", want: ErrPromotionRestoreFenced},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+			_, err := store.DB().Exec(`UPDATE promotion_namespace_capabilities
+				SET namespace_cas_ready = ?, admission_state = ? WHERE tenant_id = 'tenant-a'`, test.ready, test.state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = promotionStore.PlanImport(context.Background(), promotion.PlanImportRequest{
+				TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true,
+			})
+			if !errors.Is(err, test.want) {
+				t.Fatalf("PlanImport error = %v, want %v", err, test.want)
+			}
+			_, err = promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
+				TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true,
+				IdempotencyKey: "fenced-allocation-" + test.name, AllocationLease: "allocation-lease",
+			})
+			if !errors.Is(err, test.want) {
+				t.Fatalf("AllocateImportID error = %v, want %v", err, test.want)
+			}
+			var claims int
+			var lastIssued uint64
+			if err := store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_import_id_claims`).Scan(&claims); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.DB().QueryRow(`SELECT last_issued_sequence FROM promotion_import_identity_epochs
+				WHERE tenant_id = 'tenant-a' AND allocation_epoch = 2`).Scan(&lastIssued); err != nil {
+				t.Fatal(err)
+			}
+			if claims != 0 || lastIssued != 0 {
+				t.Fatalf("rejected admission side effects = claims %d, last sequence %d", claims, lastIssued)
+			}
+		})
 	}
 }
 
@@ -640,6 +702,63 @@ func TestPromotionCreateRejectsManifestMutationBeforeAnyImportSideEffect(t *test
 		t.Fatalf("CreateImport changed manifest error = %v, want ErrInvalidPlan", err)
 	}
 	assertPromotionCreateRows(t, store, 0, 0, 0)
+}
+
+func TestPromotionCreateRejectsOversizedProofAndQuotaGenerationDrift(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *Store, *PromotionAllocation) string
+		want   error
+	}{
+		{
+			name: "oversized allocation proof",
+			mutate: func(_ *testing.T, _ *Store, _ *PromotionAllocation) string {
+				return string(make([]byte, maxPromotionAllocationProofSize+1))
+			},
+			want: ErrPromotionConflict,
+		},
+		{
+			name: "quota config generation drift",
+			mutate: func(t *testing.T, store *Store, allocation *PromotionAllocation) string {
+				if _, err := store.DB().Exec(`UPDATE promotion_quota_accounts
+					SET config_generation = 2 WHERE tenant_id = 'tenant-a'`); err != nil {
+					t.Fatal(err)
+				}
+				return allocation.AllocationProof
+			},
+			want: ErrPromotionRecoveryRequired,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+			manifest := testPromotionManifest(t)
+			plan, err := promotionStore.PlanImport(context.Background(), promotion.PlanImportRequest{
+				TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true, Manifest: manifest,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			allocation, err := promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
+				TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true,
+				IdempotencyKey: "proof-or-quota-" + test.name, AllocationLease: "allocation-lease",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := test.mutate(t, store, allocation)
+			_, err = promotionStore.CreateImport(context.Background(), PromotionCreateRequest{
+				TenantID: "tenant-a", MigrationID: allocation.MigrationID, AllocationProof: proof,
+				Target: "/published", ExpectedTargetAbsent: true, Manifest: manifest, Plan: *plan,
+				OwnerToken: "owner-token", RecoveryToken: "recovery-token", WriterLease: "writer-lease",
+			})
+			if !errors.Is(err, test.want) {
+				t.Fatalf("CreateImport error = %v, want %v", err, test.want)
+			}
+			assertPromotionCreateRows(t, store, 0, 0, 0)
+			assertPromotionReservedQuota(t, store, 0, 0)
+		})
+	}
 }
 
 func TestPromotionCreateQuotaFailureRollsBackImportAndReservation(t *testing.T) {

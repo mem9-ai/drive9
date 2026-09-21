@@ -89,7 +89,7 @@ func TestValidateCanonicalManifestRejectsMissingOrNonDirectoryParent(t *testing.
 			canonical := make([]ManifestEntry, len(tc.entries))
 			copy(canonical, tc.entries)
 			for i := range canonical {
-				path, err := canonicalRelativePath(canonical[i].RelativePath)
+				path, err := CanonicalRelativePath(canonical[i].RelativePath)
 				if err != nil {
 					t.Fatal(err)
 				}

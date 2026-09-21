@@ -273,37 +273,48 @@ func TestPromotionCommitPublishesUnderNonRootParentAndAdvancesItsGeneration(t *t
 	require.Equal(t, "/parent/", eventPath)
 }
 
-func TestPromotionCreateTreatsCanonicalDirectorySpellingAsOccupiedTarget(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Millisecond)
-	store, promotionStore, _, _ := newTestPromotionStore(t, &now)
-	require.NoError(t, store.InsertInode(context.Background(), &Inode{
-		InodeID: "existing-dir", Mode: 0o755, Revision: 1, Status: StatusConfirmed,
-		CreatedAt: now, Mtime: now, ConfirmedAt: &now,
-	}))
-	require.NoError(t, store.InsertNode(context.Background(), &FileNode{
-		NodeID: "existing-node", Path: "/published/", ParentPath: "/", Name: "published",
-		IsDirectory: true, InodeID: "existing-dir", CreatedAt: now,
-	}))
-	plan, err := promotionStore.PlanImport(context.Background(), promotion.PlanImportRequest{
-		TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true,
-	})
-	require.NoError(t, err)
-	allocation, err := promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
-		TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true,
-		IdempotencyKey: "occupied-directory", AllocationLease: "allocation-lease",
-	})
-	require.NoError(t, err)
-	_, err = promotionStore.CreateImport(context.Background(), PromotionCreateRequest{
-		TenantID: "tenant-a", MigrationID: allocation.MigrationID, AllocationProof: allocation.AllocationProof,
-		Target: "/published", ExpectedTargetAbsent: true, Plan: *plan,
-		OwnerToken: "owner-token", RecoveryToken: "recovery-token", WriterLease: "writer-lease",
-	})
-	require.ErrorIs(t, err, ErrPathConflict)
-	var imports, reservations int
-	require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_imports`).Scan(&imports))
-	require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_quota_reservations`).Scan(&reservations))
-	require.Zero(t, imports)
-	require.Zero(t, reservations)
+func TestPromotionCreateTreatsBothTargetSpellingsAsOccupied(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		path        string
+		isDirectory bool
+	}{
+		{name: "file", path: "/published"},
+		{name: "directory", path: "/published/", isDirectory: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+			require.NoError(t, store.InsertInode(context.Background(), &Inode{
+				InodeID: "existing-" + test.name, Mode: 0o755, Revision: 1, Status: StatusConfirmed,
+				CreatedAt: now, Mtime: now, ConfirmedAt: &now,
+			}))
+			require.NoError(t, store.InsertNode(context.Background(), &FileNode{
+				NodeID: "existing-node-" + test.name, Path: test.path, ParentPath: "/", Name: "published",
+				IsDirectory: test.isDirectory, InodeID: "existing-" + test.name, CreatedAt: now,
+			}))
+			plan, err := promotionStore.PlanImport(context.Background(), promotion.PlanImportRequest{
+				TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true,
+			})
+			require.NoError(t, err)
+			allocation, err := promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
+				TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true,
+				IdempotencyKey: "occupied-" + test.name, AllocationLease: "allocation-lease",
+			})
+			require.NoError(t, err)
+			_, err = promotionStore.CreateImport(context.Background(), PromotionCreateRequest{
+				TenantID: "tenant-a", MigrationID: allocation.MigrationID, AllocationProof: allocation.AllocationProof,
+				Target: "/published", ExpectedTargetAbsent: true, Plan: *plan,
+				OwnerToken: "owner-token", RecoveryToken: "recovery-token", WriterLease: "writer-lease",
+			})
+			require.ErrorIs(t, err, ErrPathConflict)
+			var imports, reservations int
+			require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_imports`).Scan(&imports))
+			require.NoError(t, store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_quota_reservations`).Scan(&reservations))
+			require.Zero(t, imports)
+			require.Zero(t, reservations)
+		})
+	}
 }
 
 func TestPromotionCommitTargetGenerationChangeAtomicallyClaimsCleanup(t *testing.T) {

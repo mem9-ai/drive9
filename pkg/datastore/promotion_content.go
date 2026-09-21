@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mem9-ai/drive9/pkg/pathutil"
 	"github.com/mem9-ai/drive9/pkg/promotion"
 )
 
@@ -132,7 +131,7 @@ func (s *PromotionStore) PutInlineImportContent(ctx context.Context, req Promoti
 	if err != nil {
 		return nil, ErrNotFound
 	}
-	relativePath, err := canonicalPromotionRelativePath(req.RelativePath)
+	relativePath, err := promotion.CanonicalRelativePath(req.RelativePath)
 	if err != nil || relativePath != req.RelativePath {
 		return nil, ErrPromotionConflict
 	}
@@ -382,19 +381,21 @@ func (s *PromotionStore) VerifyImport(ctx context.Context, req PromotionVerifyRe
 			(importRow.state != "CREATED" && importRow.state != "STAGING") {
 			return ErrPromotionConflict
 		}
-		if err := validatePromotionReservationTx(ctx, tx, req.TenantID, importRow); err != nil {
-			return err
-		}
-
 		entries, err := selectPromotionEntriesTx(ctx, tx, req.TenantID, identity)
 		if err != nil {
 			return err
 		}
-		contents, err := selectPromotionContentsTx(ctx, tx, req.TenantID, identity)
+		stored, err := validatePromotionStoredManifest(importRow, entries)
 		if err != nil {
 			return err
 		}
-		if err := validatePromotionCompleteManifest(importRow, entries, contents); err != nil {
+		if uint64(len(stored.entriesByContentID)) != stored.fileCount {
+			return ErrPromotionConflict
+		}
+		if err := validatePromotionReservationFilesTx(ctx, tx, req.TenantID, importRow, stored.fileCount); err != nil {
+			return err
+		}
+		if err := validatePromotionStagedContentsStreamTx(ctx, tx, req.TenantID, identity, stored); err != nil {
 			return err
 		}
 		// Verification may scan and hash a bounded tree. Sample database time
@@ -588,6 +589,9 @@ func (s *PromotionStore) lockPromotionOwnerImport(ctx context.Context, tx *sql.T
 	if err != nil {
 		return nil, fmt.Errorf("lock promotion import mutation: %w", err)
 	}
+	if err := validatePromotionTerminalResult(row.state, row.terminalResultBlob, row.terminalResultDigest); err != nil {
+		return nil, err
+	}
 	return row, nil
 }
 
@@ -688,6 +692,14 @@ func selectPromotionContentByIdempotencyTx(ctx context.Context, tx *sql.Tx, tena
 }
 
 func validatePromotionReservationTx(ctx context.Context, tx *sql.Tx, tenantID string, row *promotionOwnerImport) error {
+	return validatePromotionReservationExpectedFilesTx(ctx, tx, tenantID, row, nil)
+}
+
+func validatePromotionReservationFilesTx(ctx context.Context, tx *sql.Tx, tenantID string, row *promotionOwnerImport, expectedFiles uint64) error {
+	return validatePromotionReservationExpectedFilesTx(ctx, tx, tenantID, row, &expectedFiles)
+}
+
+func validatePromotionReservationExpectedFilesTx(ctx context.Context, tx *sql.Tx, tenantID string, row *promotionOwnerImport, expectedFiles *uint64) error {
 	var bytes, files uint64
 	var state string
 	err := tx.QueryRowContext(ctx, `SELECT reserved_bytes, reserved_files, state
@@ -705,13 +717,7 @@ func validatePromotionReservationTx(ctx context.Context, tx *sql.Tx, tenantID st
 	if state != "RESERVED" || bytes != row.byteTotal {
 		return ErrPromotionRecoveryRequired
 	}
-	var expectedFiles uint64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM promotion_import_entries
-		WHERE tenant_id = ? AND allocation_epoch = ? AND allocation_sequence = ? AND entry_type = 'file'`,
-		tenantID, row.identity.AllocationEpoch, row.identity.AllocationSequence).Scan(&expectedFiles); err != nil {
-		return fmt.Errorf("count promotion reserved files: %w", err)
-	}
-	if files != expectedFiles {
+	if expectedFiles != nil && files != *expectedFiles {
 		return ErrPromotionRecoveryRequired
 	}
 	return nil
@@ -769,6 +775,51 @@ func selectPromotionContentsTx(ctx context.Context, tx *sql.Tx, tenantID string,
 		return nil, fmt.Errorf("iterate promotion inline contents: %w", err)
 	}
 	return contents, nil
+}
+
+// validatePromotionStagedContentsStreamTx hashes one inline blob at a time.
+// Verification still holds the tuple locks, but its Go heap is bounded by the
+// largest admitted inline object rather than the import's total byte count.
+func validatePromotionStagedContentsStreamTx(ctx context.Context, tx *sql.Tx, tenantID string, identity promotion.MigrationIdentity, stored *promotionStoredManifest) error {
+	rows, err := tx.QueryContext(ctx, `SELECT import_content_id, inline_content_blob,
+		inline_content_idempotency_key, inline_request_digest, size_bytes,
+		checksum_sha256, seal_state, ownership_state
+		FROM promotion_import_contents
+		WHERE tenant_id = ? AND allocation_epoch = ? AND allocation_sequence = ?
+		ORDER BY import_content_id FOR UPDATE`, tenantID, identity.AllocationEpoch, identity.AllocationSequence)
+	if err != nil {
+		return fmt.Errorf("lock promotion inline contents: %w", err)
+	}
+	defer rows.Close()
+	seen := make(map[string]struct{}, len(stored.entriesByContentID))
+	for rows.Next() {
+		var content promotionContentRow
+		if err := rows.Scan(&content.contentID, &content.body, &content.idempotencyKey,
+			&content.requestDigest, &content.size, &content.checksum,
+			&content.sealState, &content.ownershipState); err != nil {
+			return fmt.Errorf("scan promotion inline content: %w", err)
+		}
+		entry, ok := stored.entriesByContentID[content.contentID]
+		if !ok {
+			return ErrPromotionRecoveryRequired
+		}
+		if _, duplicate := seen[content.contentID]; duplicate ||
+			!content.idempotencyKey.Valid || content.idempotencyKey.String == "" ||
+			!content.requestDigest.Valid || !validPromotionSHA256(content.requestDigest.String) ||
+			content.sealState != "INLINE" || content.ownershipState != "STAGED" ||
+			content.size != entry.expectedSize || content.checksum != entry.expectedChecksum ||
+			uint64(len(content.body)) != entry.expectedSize || promotionHashBytes(content.body) != content.checksum {
+			return ErrPromotionRecoveryRequired
+		}
+		seen[content.contentID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate promotion inline contents: %w", err)
+	}
+	if len(seen) != len(stored.entriesByContentID) {
+		return ErrPromotionRecoveryRequired
+	}
+	return nil
 }
 
 func validatePromotionCompleteManifest(importRow *promotionOwnerImport, entries []promotionEntryRow, contents []promotionContentRow) error {
@@ -878,15 +929,4 @@ func promotionStoredManifestLimits(entries []promotion.ManifestEntry, inlineThre
 		}
 	}
 	return limits
-}
-
-func canonicalPromotionRelativePath(raw string) (string, error) {
-	if raw == "" || strings.HasPrefix(raw, "/") {
-		return "", ErrPromotionConflict
-	}
-	canonical, err := pathutil.Canonicalize("/" + raw)
-	if err != nil || canonical == "/" {
-		return "", ErrPromotionConflict
-	}
-	return strings.TrimPrefix(canonical, "/"), nil
 }

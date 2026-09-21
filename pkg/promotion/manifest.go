@@ -89,7 +89,7 @@ func CanonicalizeManifest(entries []ManifestEntry, limits ManifestLimits) (*Cano
 	normalized := make([]ManifestEntry, len(entries))
 	for i := range entries {
 		entry := entries[i]
-		path, err := canonicalRelativePath(entry.RelativePath)
+		path, err := CanonicalRelativePath(entry.RelativePath)
 		if err != nil {
 			return nil, fmt.Errorf("%w: entry %d path: %v", ErrInvalidManifest, i, err)
 		}
@@ -131,7 +131,7 @@ func validateManifest(entries []ManifestEntry, limits ManifestLimits, alreadyNor
 	var byteTotal, maxContent uint64
 	for i := range entries {
 		entry := entries[i]
-		path, err := canonicalRelativePath(entry.RelativePath)
+		path, err := CanonicalRelativePath(entry.RelativePath)
 		if err != nil {
 			return nil, fmt.Errorf("%w: entry %d path: %v", ErrInvalidManifest, i, err)
 		}
@@ -250,7 +250,9 @@ func validateEntryTypeFields(entry ManifestEntry, limits ManifestLimits) error {
 	return nil
 }
 
-func canonicalRelativePath(raw string) (string, error) {
+// CanonicalRelativePath applies the relative-path grammar shared by manifest
+// creation and datastore continuation APIs.
+func CanonicalRelativePath(raw string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("relative path is empty")
 	}

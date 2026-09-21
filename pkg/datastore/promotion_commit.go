@@ -278,11 +278,17 @@ func (s *PromotionStore) finishPromotionCommit(ctx context.Context, req Promotio
 			return nil
 		}
 
-		if err := validatePromotionReservationTx(ctx, tx, req.TenantID, row); err != nil {
-			return err
-		}
 		entries, err := selectPromotionEntriesTx(ctx, tx, req.TenantID, identity)
 		if err != nil {
+			return err
+		}
+		var expectedFiles uint64
+		for _, entry := range entries {
+			if entry.entryType == promotion.EntryTypeFile {
+				expectedFiles++
+			}
+		}
+		if err := validatePromotionReservationFilesTx(ctx, tx, req.TenantID, row, expectedFiles); err != nil {
 			return err
 		}
 		contents, err := selectPromotionContentsTx(ctx, tx, req.TenantID, identity)

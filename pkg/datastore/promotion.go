@@ -32,7 +32,10 @@ var (
 	ErrPromotionTargetChanged               = errors.New("promotion target precondition changed")
 )
 
-const promotionGlobalCapacityKey = "promotion-imports"
+const (
+	promotionGlobalCapacityKey      = "promotion-imports"
+	maxPromotionAllocationProofSize = 4096
+)
 
 // PromotionAuthorizer is invoked on every client-facing promotion operation.
 // Implementations must enforce the current request's tenant and target write
@@ -217,6 +220,9 @@ func (s *PromotionStore) PlanImport(ctx context.Context, req promotion.PlanImpor
 	if err := s.requirePromotionWriterProtocol(namespace); err != nil {
 		return nil, err
 	}
+	if err := requirePromotionNamespaceAdmission(namespace); err != nil {
+		return nil, err
+	}
 	capability, err := s.readPromotionStorageCapability(ctx, req.TenantID)
 	if err != nil {
 		return nil, err
@@ -224,8 +230,12 @@ func (s *PromotionStore) PlanImport(ctx context.Context, req promotion.PlanImpor
 	if err := s.requireRuntimeCapability(req.TenantID, capability); err != nil {
 		return nil, err
 	}
+	now, err := promotionDatabaseTime(ctx, s.store.db)
+	if err != nil {
+		return nil, err
+	}
 	req.Target = target
-	return s.cfg.Planner.PlanImport(req, capability, s.cfg.Limits)
+	return s.cfg.Planner.PlanImportAt(req, capability, s.cfg.Limits, now)
 }
 
 // AllocateImportID durably allocates a tenant-scoped epoch/sequence identity.
@@ -265,6 +275,9 @@ func (s *PromotionStore) AllocateImportID(ctx context.Context, req PromotionAllo
 			return err
 		}
 		if err := s.requirePromotionWriterProtocol(namespace); err != nil {
+			return err
+		}
+		if err := requirePromotionNamespaceAdmission(namespace); err != nil {
 			return err
 		}
 		now, err := promotionDatabaseTime(ctx, tx)
@@ -414,7 +427,7 @@ func (s *PromotionStore) CreateImport(ctx context.Context, req PromotionCreateRe
 	if err := s.cfg.Authorizer.AuthorizePromotionWrite(ctx, req.TenantID, target); err != nil {
 		return nil, err
 	}
-	if !req.ExpectedTargetAbsent || req.OwnerToken == "" || req.RecoveryToken == "" || req.WriterLease == "" || len(req.OwnerToken) > 512 || len(req.RecoveryToken) > 512 {
+	if !req.ExpectedTargetAbsent || req.OwnerToken == "" || req.RecoveryToken == "" || req.WriterLease == "" || len(req.OwnerToken) > 512 || len(req.RecoveryToken) > 512 || len(req.AllocationProof) > maxPromotionAllocationProofSize {
 		return nil, ErrPromotionConflict
 	}
 	identity, err := promotion.DecodeMigrationID(req.MigrationID)
@@ -509,15 +522,15 @@ func (s *PromotionStore) CreateImport(ctx context.Context, req PromotionCreateRe
 		if err := s.requireRuntimeCapability(req.TenantID, capability); err != nil {
 			return err
 		}
-		manifest, err := s.cfg.Planner.VerifyCreatePlan(promotion.PlanImportRequest{
+		manifest, err := s.cfg.Planner.VerifyCreatePlanAt(promotion.PlanImportRequest{
 			TenantID: req.TenantID, Target: target, ExpectedTargetAbsent: true, Manifest: req.Manifest,
-		}, req.Plan, capability)
+		}, req.Plan, capability, now)
 		if err != nil {
 			return err
 		}
 
-		if !namespace.ready || namespace.admissionState != "ACTIVE" || namespace.epoch == 0 {
-			return ErrPromotionDisabled
+		if err := requirePromotionNamespaceAdmission(namespace); err != nil {
+			return err
 		}
 		if namespace.restoreGeneration != tenant.RestoreGeneration || namespace.databaseIncarnation != tenant.DatabaseIncarnation ||
 			namespace.writerGeneration != tenant.WriterGeneration {
@@ -542,7 +555,7 @@ func (s *PromotionStore) CreateImport(ctx context.Context, req PromotionCreateRe
 		activityDeadline := now.Add(s.cfg.ActivityTTL)
 		leaseExpiresAt := now.Add(s.cfg.LeaseTTL)
 		reservedFiles := countRegularFiles(manifest.Entries)
-		if err := s.reservePromotionQuotaTx(ctx, tx, req.TenantID, manifest.ByteTotal, reservedFiles); err != nil {
+		if err := s.reservePromotionQuotaTx(ctx, tx, req.TenantID, tenant.ConfigGeneration, manifest.ByteTotal, reservedFiles); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO promotion_imports
@@ -620,17 +633,20 @@ func (s *PromotionStore) CreateImport(ctx context.Context, req PromotionCreateRe
 	return out, nil
 }
 
-func (s *PromotionStore) reservePromotionQuotaTx(ctx context.Context, tx *sql.Tx, tenantID string, bytes, files uint64) error {
-	var maxBytes, maxFiles, reservedBytes, reservedFiles, committedBytes, committedFiles uint64
+func (s *PromotionStore) reservePromotionQuotaTx(ctx context.Context, tx *sql.Tx, tenantID string, configGeneration, bytes, files uint64) error {
+	var maxBytes, maxFiles, reservedBytes, reservedFiles, committedBytes, committedFiles, durableConfigGeneration uint64
 	err := tx.QueryRowContext(ctx, `SELECT max_bytes, max_files, reserved_bytes, reserved_files,
-		committed_bytes, committed_files FROM promotion_quota_accounts
+		committed_bytes, committed_files, config_generation FROM promotion_quota_accounts
 		WHERE tenant_id = ? FOR UPDATE`, tenantID).
-		Scan(&maxBytes, &maxFiles, &reservedBytes, &reservedFiles, &committedBytes, &committedFiles)
+		Scan(&maxBytes, &maxFiles, &reservedBytes, &reservedFiles, &committedBytes, &committedFiles, &durableConfigGeneration)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrPromotionDisabled
 	}
 	if err != nil {
 		return fmt.Errorf("lock promotion quota account: %w", err)
+	}
+	if configGeneration == 0 || durableConfigGeneration != configGeneration {
+		return ErrPromotionRecoveryRequired
 	}
 	if reservedBytes > maxBytes || committedBytes > maxBytes-reservedBytes || bytes > maxBytes-reservedBytes-committedBytes ||
 		reservedFiles > maxFiles || committedFiles > maxFiles-reservedFiles || files > maxFiles-reservedFiles-committedFiles {
@@ -719,9 +735,13 @@ func (s *PromotionStore) lockPromotionIdentityTenant(ctx context.Context, tx *sq
 	return out, nil
 }
 
-func promotionDatabaseTime(ctx context.Context, tx *sql.Tx) (time.Time, error) {
+type promotionTimeQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func promotionDatabaseTime(ctx context.Context, query promotionTimeQuerier) (time.Time, error) {
 	var now time.Time
-	if err := tx.QueryRowContext(ctx, `SELECT CURRENT_TIMESTAMP(3)`).Scan(&now); err != nil {
+	if err := query.QueryRowContext(ctx, `SELECT CURRENT_TIMESTAMP(3)`).Scan(&now); err != nil {
 		return time.Time{}, fmt.Errorf("read promotion database time: %w", err)
 	}
 	return now.UTC().Truncate(time.Millisecond), nil
@@ -791,6 +811,16 @@ func (s *PromotionStore) readPromotionNamespaceCapability(ctx context.Context, t
 
 func (s *PromotionStore) requirePromotionWriterProtocol(namespace promotionNamespaceCapability) error {
 	if namespace.minimumWriterProtocol == 0 || s.cfg.WriterProtocol < namespace.minimumWriterProtocol {
+		return ErrPromotionRestoreFenced
+	}
+	return nil
+}
+
+func requirePromotionNamespaceAdmission(namespace promotionNamespaceCapability) error {
+	if !namespace.ready || namespace.epoch == 0 {
+		return ErrPromotionDisabled
+	}
+	if namespace.admissionState != "ACTIVE" {
 		return ErrPromotionRestoreFenced
 	}
 	return nil
@@ -1016,8 +1046,17 @@ func consumePromotionRate(raw sql.NullString, now time.Time, ratePerMinute, burs
 		if err := json.Unmarshal([]byte(raw.String), &bucket); err != nil {
 			return promotionRateBucket{}, ErrPromotionRecoveryRequired
 		}
-		if bucket.UpdatedUnixMilli > now.UnixMilli() || bucket.TokensMilli > capacity {
+		if bucket.UpdatedUnixMilli < 0 {
 			return promotionRateBucket{}, ErrPromotionRecoveryRequired
+		}
+		// Durable configuration can lower the burst and the database clock can
+		// move backwards. Clamp without granting refill; neither condition is
+		// structural corruption and neither should brick admission indefinitely.
+		if bucket.TokensMilli > capacity {
+			bucket.TokensMilli = capacity
+		}
+		if bucket.UpdatedUnixMilli > now.UnixMilli() {
+			bucket.UpdatedUnixMilli = now.UnixMilli()
 		}
 		elapsed := uint64(now.UnixMilli() - bucket.UpdatedUnixMilli)
 		var refill uint64

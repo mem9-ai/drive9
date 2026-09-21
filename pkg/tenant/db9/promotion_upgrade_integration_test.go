@@ -30,9 +30,10 @@ const (
 // the upgraded TEXT column must round-trip them unchanged in both the retained
 // full import row and the compact tombstone.
 //
-// The pre-upgrade row intentionally remains a digest mismatch after the type
-// conversion. The runtime validator must fail such an unreleased/corrupt row
-// closed; a schema migration cannot reconstruct bytes JSONB already discarded.
+// A pre-upgrade terminal row cannot be repaired because JSONB has already
+// discarded the original response bytes. The migration must stop for explicit
+// operator reconciliation rather than bless the normalized value with a new
+// digest.
 func TestPromotionTerminalResultUpgradeRoundTrip(t *testing.T) {
 	dsn := promotionPostgresDSN(t)
 	db := openPromotionPostgresDSN(t, dsn)
@@ -73,7 +74,18 @@ func TestPromotionTerminalResultUpgradeRoundTrip(t *testing.T) {
 		}
 	}
 
-	upgrades := promotionTerminalResultUpgradeStatements(t)
+	guards, upgrades := promotionTerminalResultUpgradeStatements(t)
+	for _, table := range []string{"promotion_imports", "promotion_import_tombstones"} {
+		if _, err := db.ExecContext(ctx, guards[table]); err == nil || !strings.Contains(err.Error(), "operator reconciliation required") {
+			t.Fatalf("legacy %s upgrade guard error = %v, want operator reconciliation", table, err)
+		}
+		if _, err := db.ExecContext(ctx, `DELETE FROM `+table); err != nil {
+			t.Fatalf("delete legacy %s result: %v", table, err)
+		}
+		if _, err := db.ExecContext(ctx, guards[table]); err != nil {
+			t.Fatalf("empty %s upgrade guard: %v", table, err)
+		}
+	}
 	for _, stmt := range upgrades {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			t.Fatalf("execute DB9 terminal-result upgrade %q: %v", stmt, err)
@@ -91,18 +103,6 @@ func TestPromotionTerminalResultUpgradeRoundTrip(t *testing.T) {
 			t.Fatalf("upgraded %s terminal_result_blob type = %q, want text", table, dataType)
 		}
 
-		var legacyBlob, legacyDigest string
-		if err := db.QueryRowContext(ctx, `SELECT terminal_result_blob, terminal_result_digest FROM `+table+` WHERE id = 1`).
-			Scan(&legacyBlob, &legacyDigest); err != nil {
-			t.Fatalf("read upgraded legacy %s result: %v", table, err)
-		}
-		if promotionTerminalResultDigest(legacyBlob) == legacyDigest {
-			t.Fatalf("legacy %s JSONB bytes became trusted during upgrade", table)
-		}
-
-		if _, err := db.ExecContext(ctx, `DELETE FROM `+table); err != nil {
-			t.Fatalf("delete legacy %s result: %v", table, err)
-		}
 	}
 
 	// The production boundary is schema migration before promotion writer
@@ -138,16 +138,20 @@ func TestPromotionTerminalResultUpgradeRoundTrip(t *testing.T) {
 	}
 }
 
-func promotionTerminalResultUpgradeStatements(t *testing.T) []string {
+func promotionTerminalResultUpgradeStatements(t *testing.T) (map[string]string, []string) {
 	t.Helper()
 	wanted := map[string]bool{
 		"promotion_imports":           false,
 		"promotion_import_tombstones": false,
 	}
+	guards := make(map[string]string, len(wanted))
 	var upgrades []string
 	for _, stmt := range schema.PromotionDB9SchemaStatements() {
 		lower := strings.ToLower(strings.TrimSpace(stmt))
 		for table := range wanted {
+			if strings.Contains(lower, "drive9 refuses jsonb terminal-result upgrade for "+table) {
+				guards[table] = stmt
+			}
 			prefix := "alter table " + table + " alter column terminal_result_blob type text"
 			if strings.HasPrefix(lower, prefix) {
 				wanted[table] = true
@@ -159,8 +163,11 @@ func promotionTerminalResultUpgradeStatements(t *testing.T) []string {
 		if !found {
 			t.Fatalf("DB9 schema omits terminal-result upgrade for %s", table)
 		}
+		if guards[table] == "" {
+			t.Fatalf("DB9 schema omits terminal-result upgrade guard for %s", table)
+		}
 	}
-	return upgrades
+	return guards, upgrades
 }
 
 func promotionTerminalResultDigest(value string) string {

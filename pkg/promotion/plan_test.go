@@ -2,6 +2,7 @@ package promotion
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -74,6 +75,32 @@ func TestPlannerRejectsChangedManifestAndPlanClaims(t *testing.T) {
 	tampered.StorageMode = StorageMode("forged")
 	if _, err := planner.VerifyCreatePlan(req, tampered, testCapability()); !errors.Is(err, ErrInvalidPlan) {
 		t.Fatalf("MAC-bound claim mutation error = %v, want ErrInvalidPlan", err)
+	}
+
+	// A forged plan is rejected by its MAC before the server performs the
+	// O(entries) manifest validation.
+	forgedWithInvalidManifest := *plan
+	forgedWithInvalidManifest.StorageMode = StorageMode("forged")
+	invalidManifest := req
+	invalidManifest.Manifest = []ManifestEntry{{RelativePath: "../escape", Type: EntryTypeFile}}
+	if _, err := planner.VerifyCreatePlan(invalidManifest, forgedWithInvalidManifest, testCapability()); !errors.Is(err, ErrInvalidPlan) {
+		t.Fatalf("forged plan with invalid manifest error = %v, want ErrInvalidPlan", err)
+	}
+}
+
+func TestPlannerTargetBoundAndAuthoritativeVerifyTime(t *testing.T) {
+	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	planner := testPlanner(t, now)
+	if _, err := CanonicalTarget("/" + strings.Repeat("a", MaxTargetPathBytes)); !errors.Is(err, ErrInvalidPlan) {
+		t.Fatalf("overlong target error = %v, want ErrInvalidPlan", err)
+	}
+	req := PlanImportRequest{TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true, Manifest: testCanonicalEntries(t)}
+	plan, err := planner.PlanImport(req, testCapability(), testManifestLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := planner.VerifyCreatePlanAt(req, *plan, testCapability(), plan.PlanExpiresAt); !errors.Is(err, ErrPlanExpired) {
+		t.Fatalf("database-time expiry error = %v, want ErrPlanExpired", err)
 	}
 }
 

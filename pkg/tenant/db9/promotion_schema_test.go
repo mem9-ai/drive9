@@ -46,7 +46,10 @@ func TestInitSchemaStatementsIncludePromotionTables(t *testing.T) {
 }
 
 func TestInitSchemaStatementsUpgradeTerminalResultStorage(t *testing.T) {
-	upgrades := promotionTerminalResultUpgradeStatements(t)
+	guards, upgrades := promotionTerminalResultUpgradeStatements(t)
+	if len(guards) != 2 {
+		t.Fatalf("terminal-result upgrade guards = %d, want 2", len(guards))
+	}
 	if len(upgrades) != 2 {
 		t.Fatalf("terminal-result upgrades = %d, want 2", len(upgrades))
 	}

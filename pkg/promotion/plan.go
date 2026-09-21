@@ -17,6 +17,10 @@ type StorageMode string
 
 const StorageModeDB9Inline StorageMode = "db9_inline"
 
+// MaxTargetPathBytes matches the narrowest durable target_path column used by
+// the supported datastores.
+const MaxTargetPathBytes = 4096
+
 // StorageCapability is the cluster-visible capability row and the exact
 // process adapter classification used to mint or admit a plan.
 type StorageCapability struct {
@@ -98,6 +102,11 @@ func NewPlannerWithClock(secret []byte, ttl time.Duration, now func() time.Time)
 // PlanImport validates a complete canonical manifest without creating any
 // durable row or quota reservation.
 func (p *Planner) PlanImport(req PlanImportRequest, capability StorageCapability, limits ManifestLimits) (*ImportPlan, error) {
+	return p.PlanImportAt(req, capability, limits, p.now())
+}
+
+// PlanImportAt creates a plan using the caller's authoritative time source.
+func (p *Planner) PlanImportAt(req PlanImportRequest, capability StorageCapability, limits ManifestLimits, now time.Time) (*ImportPlan, error) {
 	if req.TenantID == "" {
 		return nil, fmt.Errorf("%w: tenant is required", ErrInvalidPlan)
 	}
@@ -115,7 +124,7 @@ func (p *Planner) PlanImport(req PlanImportRequest, capability StorageCapability
 	if err != nil {
 		return nil, err
 	}
-	expiresAt := p.now().UTC().Add(p.ttl).Truncate(time.Millisecond)
+	expiresAt := now.UTC().Add(p.ttl).Truncate(time.Millisecond)
 	plan := &ImportPlan{
 		Target:                      target,
 		ExpectedTargetAbsent:        true,
@@ -142,6 +151,13 @@ func (p *Planner) PlanImport(req PlanImportRequest, capability StorageCapability
 // calling this method because recovery intentionally ignores later expiry or
 // capability rollout.
 func (p *Planner) VerifyCreatePlan(req PlanImportRequest, plan ImportPlan, capability StorageCapability) (*CanonicalManifest, error) {
+	return p.VerifyCreatePlanAt(req, plan, capability, p.now())
+}
+
+// VerifyCreatePlanAt revalidates a create plan using the caller's authoritative
+// time source. Datastore callers pass database time so clock skew cannot make
+// plan admission differ across writers.
+func (p *Planner) VerifyCreatePlanAt(req PlanImportRequest, plan ImportPlan, capability StorageCapability, now time.Time) (*CanonicalManifest, error) {
 	if req.TenantID == "" || !req.ExpectedTargetAbsent || !plan.ExpectedTargetAbsent {
 		return nil, fmt.Errorf("%w: P0 requires an absent target", ErrInvalidPlan)
 	}
@@ -152,25 +168,7 @@ func (p *Planner) VerifyCreatePlan(req PlanImportRequest, plan ImportPlan, capab
 	if target != plan.Target {
 		return nil, fmt.Errorf("%w: target mismatch", ErrInvalidPlan)
 	}
-	manifest, err := ValidateCanonicalManifest(req.Manifest, plan.Limits)
-	if err != nil {
-		return nil, err
-	}
-	if manifest.ManifestHash != plan.ManifestHash || manifest.EntryTotal != plan.EntryTotal ||
-		manifest.ByteTotal != plan.ByteTotal || manifest.MaxContentSize != plan.MaxContentSize {
-		return nil, fmt.Errorf("%w: manifest summary mismatch", ErrInvalidPlan)
-	}
-	if !p.now().Before(plan.PlanExpiresAt) {
-		return nil, ErrPlanExpired
-	}
-	if capability.Generation != plan.BackendCapabilityGeneration ||
-		capability.ConfigGeneration != plan.ConfigGeneration ||
-		capability.InlineThreshold != plan.Limits.InlineThreshold {
-		return nil, ErrPlanStale
-	}
-	if err := validateCapability(capability, plan.Limits); err != nil {
-		return nil, err
-	}
+	// Authenticate bounded plan claims before O(entries) manifest validation.
 	expected, err := p.signPlan(req.TenantID, &plan)
 	if err != nil {
 		return nil, err
@@ -182,6 +180,25 @@ func (p *Planner) VerifyCreatePlan(req PlanImportRequest, plan ImportPlan, capab
 	want, _ := hex.DecodeString(expected)
 	if subtle.ConstantTimeCompare(got, want) != 1 {
 		return nil, fmt.Errorf("%w: plan MAC mismatch", ErrInvalidPlan)
+	}
+	manifest, err := ValidateCanonicalManifest(req.Manifest, plan.Limits)
+	if err != nil {
+		return nil, err
+	}
+	if manifest.ManifestHash != plan.ManifestHash || manifest.EntryTotal != plan.EntryTotal ||
+		manifest.ByteTotal != plan.ByteTotal || manifest.MaxContentSize != plan.MaxContentSize {
+		return nil, fmt.Errorf("%w: manifest summary mismatch", ErrInvalidPlan)
+	}
+	if !now.Before(plan.PlanExpiresAt) {
+		return nil, ErrPlanExpired
+	}
+	if capability.Generation != plan.BackendCapabilityGeneration ||
+		capability.ConfigGeneration != plan.ConfigGeneration ||
+		capability.InlineThreshold != plan.Limits.InlineThreshold {
+		return nil, ErrPlanStale
+	}
+	if err := validateCapability(capability, plan.Limits); err != nil {
+		return nil, err
 	}
 	return manifest, nil
 }
@@ -231,6 +248,9 @@ func canonicalTarget(raw string) (string, error) {
 	}
 	if target == "/" {
 		return "", fmt.Errorf("%w: root cannot be a promotion target", ErrInvalidPlan)
+	}
+	if len(target) > MaxTargetPathBytes {
+		return "", fmt.Errorf("%w: target exceeds %d bytes", ErrInvalidPlan, MaxTargetPathBytes)
 	}
 	return target, nil
 }

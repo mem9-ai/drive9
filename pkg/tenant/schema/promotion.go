@@ -547,6 +547,42 @@ func PromotionDB9SchemaStatements() []string {
 		// Terminal result digests cover the exact stored JSON bytes. JSONB
 		// rewrites whitespace and object-key order on round trip, so both fresh
 		// and previously bootstrapped DB9 schemas must use byte-preserving TEXT.
+		// A JSONB row that already contains a terminal result cannot be repaired:
+		// the original response bytes are gone. Stop the upgrade and require
+		// explicit operator reconciliation rather than silently re-digesting a
+		// different result and breaking exact lost-response recovery.
+		`DO $drive9$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema()
+				  AND table_name = 'promotion_imports'
+				  AND column_name = 'terminal_result_blob'
+				  AND data_type = 'jsonb'
+			) AND EXISTS (
+				SELECT 1 FROM promotion_imports
+				WHERE terminal_result_blob IS NOT NULL OR terminal_result_digest IS NOT NULL
+			) THEN
+				RAISE EXCEPTION 'drive9 refuses JSONB terminal-result upgrade for promotion_imports: operator reconciliation required';
+			END IF;
+		END
+		$drive9$`,
+		`DO $drive9$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema()
+				  AND table_name = 'promotion_import_tombstones'
+				  AND column_name = 'terminal_result_blob'
+				  AND data_type = 'jsonb'
+			) AND EXISTS (
+				SELECT 1 FROM promotion_import_tombstones
+				WHERE terminal_result_blob IS NOT NULL OR terminal_result_digest IS NOT NULL
+			) THEN
+				RAISE EXCEPTION 'drive9 refuses JSONB terminal-result upgrade for promotion_import_tombstones: operator reconciliation required';
+			END IF;
+		END
+		$drive9$`,
 		`ALTER TABLE promotion_imports ALTER COLUMN terminal_result_blob TYPE TEXT USING terminal_result_blob::text`,
 		`ALTER TABLE promotion_import_tombstones ALTER COLUMN terminal_result_blob TYPE TEXT USING terminal_result_blob::text`,
 	}

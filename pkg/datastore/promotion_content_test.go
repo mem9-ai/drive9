@@ -159,6 +159,24 @@ func TestPromotionMetadataOnlyVerifyDirectlyFromCreated(t *testing.T) {
 	}
 }
 
+func TestPromotionContentMutationFailsClosedOnCorruptTerminalRow(t *testing.T) {
+	store, promotionStore, created, _ := createPromotionImportForContent(t, nil, "terminal-integrity-content")
+	_, err := store.DB().Exec(`UPDATE promotion_imports
+		SET state = 'COMMITTED', terminal_result_blob = '{}', terminal_result_digest = ?
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		promotionTestHash("different"), created.AllocationEpoch, created.AllocationSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = promotionStore.VerifyImport(context.Background(), PromotionVerifyRequest{
+		TenantID: "tenant-a", MigrationID: created.MigrationID, OwnerEpoch: created.OwnerEpoch,
+		OwnerToken: "owner-token", WriterLease: "writer-lease", ManifestHash: created.ManifestHash,
+	})
+	if !errors.Is(err, ErrPromotionRecoveryRequired) {
+		t.Fatalf("corrupt terminal VerifyImport error = %v, want ErrPromotionRecoveryRequired", err)
+	}
+}
+
 type promotionCountingReader struct {
 	reads int
 	body  io.Reader
@@ -213,6 +231,36 @@ func TestPromotionInlineContentRejectsTupleBeforeReadingOrMutation(t *testing.T)
 	}
 	if contents != 0 {
 		t.Fatalf("content rows after rejected body = %d, want 0", contents)
+	}
+
+	wrongDigestBody := inlineContentRequest(created, manifest[0], "put-wrong-digest", bytes.NewBufferString("jello"))
+	if _, err := promotionStore.PutInlineImportContent(context.Background(), wrongDigestBody); !errors.Is(err, ErrPromotionConflict) {
+		t.Fatalf("same-size wrong-digest body error = %v, want ErrPromotionConflict", err)
+	}
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_import_contents`).Scan(&contents); err != nil {
+		t.Fatal(err)
+	}
+	if contents != 0 {
+		t.Fatalf("content rows after wrong-digest body = %d, want 0", contents)
+	}
+}
+
+func TestPromotionInlineThresholdRejectsBeforeReadingBody(t *testing.T) {
+	store, promotionStore, created, manifest := createPromotionImportForContent(t, []promotion.ManifestEntry{
+		{RelativePath: "file", Type: promotion.EntryTypeFile, Mode: 0o644, ExpectedSizeBytes: 5, ExpectedChecksumSHA256: promotionTestHash("hello")},
+	}, "allocate-content-threshold")
+	if _, err := store.DB().Exec(`UPDATE promotion_imports SET inline_threshold = 5
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		created.AllocationEpoch, created.AllocationSequence); err != nil {
+		t.Fatal(err)
+	}
+	reader := &promotionCountingReader{body: bytes.NewBufferString("hello")}
+	_, err := promotionStore.PutInlineImportContent(context.Background(), inlineContentRequest(created, manifest[0], "threshold", reader))
+	if !errors.Is(err, promotion.ErrStorageBackendUnsupported) {
+		t.Fatalf("inline threshold error = %v, want ErrStorageBackendUnsupported", err)
+	}
+	if reader.reads != 0 {
+		t.Fatalf("inline threshold body reads = %d, want 0", reader.reads)
 	}
 }
 
@@ -326,6 +374,47 @@ func TestPromotionVerifyRejectsMissingOrExtraContentWithoutStateChange(t *testin
 	}
 	if state != "STAGING" || version != 2 {
 		t.Fatalf("state after corrupt verify = %s/%d, want STAGING/2", state, version)
+	}
+}
+
+func TestPromotionVerifyRecomputesStoredManifestHash(t *testing.T) {
+	store, promotionStore, created, _ := createPromotionImportForContent(t, []promotion.ManifestEntry{
+		{RelativePath: "dir", Type: promotion.EntryTypeDirectory, Mode: 0o755, MtimeNS: 1},
+	}, "verify-manifest-recompute")
+	_, err := store.DB().Exec(`UPDATE promotion_import_entries SET mode = 448
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		created.AllocationEpoch, created.AllocationSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = promotionStore.VerifyImport(context.Background(), PromotionVerifyRequest{
+		TenantID: "tenant-a", MigrationID: created.MigrationID, OwnerEpoch: created.OwnerEpoch,
+		OwnerToken: "owner-token", WriterLease: "writer-lease", ManifestHash: created.ManifestHash,
+	})
+	if !errors.Is(err, ErrPromotionRecoveryRequired) {
+		t.Fatalf("stored manifest corruption error = %v, want ErrPromotionRecoveryRequired", err)
+	}
+}
+
+func TestPromotionVerifyChecksReservationFileCountOnce(t *testing.T) {
+	store, promotionStore, created, manifest := createPromotionImportForContent(t, []promotion.ManifestEntry{
+		{RelativePath: "file", Type: promotion.EntryTypeFile, Mode: 0o644, ExpectedSizeBytes: 5, ExpectedChecksumSHA256: promotionTestHash("hello")},
+	}, "verify-reservation-file-count")
+	_, err := promotionStore.PutInlineImportContent(context.Background(), inlineContentRequest(created, manifest[0], "put-file", bytes.NewBufferString("hello")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.DB().Exec(`UPDATE promotion_quota_reservations SET reserved_files = reserved_files + 1
+		WHERE tenant_id = 'tenant-a' AND reservation_id = ?`, created.QuotaReservationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = promotionStore.VerifyImport(context.Background(), PromotionVerifyRequest{
+		TenantID: "tenant-a", MigrationID: created.MigrationID, OwnerEpoch: created.OwnerEpoch,
+		OwnerToken: "owner-token", WriterLease: "writer-lease", ManifestHash: created.ManifestHash,
+	})
+	if !errors.Is(err, ErrPromotionRecoveryRequired) {
+		t.Fatalf("reservation file mismatch error = %v, want ErrPromotionRecoveryRequired", err)
 	}
 }
 
