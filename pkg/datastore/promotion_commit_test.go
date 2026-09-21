@@ -422,7 +422,46 @@ func TestPromotionProductionNamespaceWritersMaintainGenerationsAndEdgeIncarnatio
 	require.NoError(t, store.DB().QueryRow(`SELECT path_edge_incarnation FROM file_nodes
 		WHERE path = '/new/child'`).Scan(&newChildEdge))
 	require.NotEqual(t, oldDirEdge, newDirEdge)
-	require.Equal(t, oldChildEdge, newChildEdge)
+	require.NotEqual(t, oldChildEdge, newChildEdge)
+}
+
+func TestPromotionCommitDescendantParentRenameABACannotReuseTargetPrecondition(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+	insertPromotionTestNode(t, store, "/old/", true)
+	insertPromotionTestNode(t, store, "/old/child/", true)
+	verified, _ := createVerifiedPromotionImportOnStore(
+		t, promotionStore, nil, "allocate-commit-descendant-parent-aba", "/old/child/published",
+	)
+
+	var beforeEdge string
+	var beforeGeneration uint64
+	require.NoError(t, store.DB().QueryRow(`SELECT path_edge_incarnation, children_generation
+		FROM file_nodes WHERE path = '/old/child/'`).Scan(&beforeEdge, &beforeGeneration))
+	count, err := store.RenameDir(context.Background(), "/old/", "/new/")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), count)
+	count, err = store.RenameDir(context.Background(), "/new/", "/old/")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), count)
+
+	var afterEdge string
+	var afterGeneration uint64
+	require.NoError(t, store.DB().QueryRow(`SELECT path_edge_incarnation, children_generation
+		FROM file_nodes WHERE path = '/old/child/'`).Scan(&afterEdge, &afterGeneration))
+	require.NotEqual(t, beforeEdge, afterEdge)
+	// Moving the subtree changes every canonical path identity, but does not
+	// fabricate a child-set mutation inside the moved directory.
+	require.Equal(t, beforeGeneration, afterGeneration)
+
+	_, err = promotionStore.CommitImport(context.Background(), commitPromotionRequest(verified))
+	require.ErrorIs(t, err, ErrPromotionTargetChanged)
+	var state, reason string
+	require.NoError(t, store.DB().QueryRow(`SELECT state, terminal_reason FROM promotion_imports
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		verified.AllocationEpoch, verified.AllocationSequence).Scan(&state, &reason))
+	require.Equal(t, "ABORTING", state)
+	require.Equal(t, "target_precondition_changed", reason)
 }
 
 func TestPromotionProductionNamespaceWriterFailsClosedAtRolloutAndRestoreFences(t *testing.T) {

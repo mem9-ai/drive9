@@ -833,11 +833,6 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 	if err := s.bumpPromotionParentGenerationsTx(ctx, tx, parentPath(oldPrefix), parentPath(newPrefix)); err != nil {
 		return 0, err
 	}
-	rootEdge, err := newNamespaceEdgeIncarnation()
-	if err != nil {
-		return 0, err
-	}
-
 	// The prefix match escapes % and _ so a directory named "a_b" cannot match
 	// sibling "axb" and rename it.
 	prefixPattern := likeLiteralPrefixPattern(oldPrefix)
@@ -848,7 +843,7 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 		return 0, err
 	}
 	type update struct {
-		nodeID, newPath, newParent, newName string
+		nodeID, newPath, newParent, newName, newEdge string
 	}
 	var updates []update
 	for rows.Next() {
@@ -865,7 +860,12 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 			newPath = newPrefix
 			newName = baseName(newPrefix)
 		}
-		updates = append(updates, update{nodeID, newPath, newParent, newName})
+		newEdge, err := newNamespaceEdgeIncarnation()
+		if err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		updates = append(updates, update{nodeID, newPath, newParent, newName, newEdge})
 	}
 	_ = rows.Close()
 	if len(updates) == 0 {
@@ -939,20 +939,14 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 		}
 	}
 
-	stmt, err := tx.PrepareContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE `+s.scope.And(`node_id = ?`))
+	stmt, err := tx.PrepareContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?, path_edge_incarnation = ? WHERE `+s.scope.And(`node_id = ?`))
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = stmt.Close() }()
 
 	for _, u := range updates {
-		var execErr error
-		if u.newPath == newPrefix {
-			_, execErr = tx.ExecContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?, path_edge_incarnation = ? WHERE `+s.scope.And(`node_id = ?`),
-				append([]any{u.newPath, fileNodePathHash(u.newPath), u.newParent, fileNodePathHash(u.newParent), u.newName, rootEdge}, s.scope.Args(u.nodeID)...)...)
-		} else {
-			_, execErr = stmt.Exec(append([]any{u.newPath, fileNodePathHash(u.newPath), u.newParent, fileNodePathHash(u.newParent), u.newName}, s.scope.Args(u.nodeID)...)...)
-		}
+		_, execErr := stmt.Exec(append([]any{u.newPath, fileNodePathHash(u.newPath), u.newParent, fileNodePathHash(u.newParent), u.newName, u.newEdge}, s.scope.Args(u.nodeID)...)...)
 		if execErr != nil {
 			if isUniqueViolation(execErr) {
 				return 0, ErrPathConflict
