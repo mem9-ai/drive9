@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -4788,7 +4789,15 @@ func TestWriteBackCache_RenamePending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_ = cache.Put("/old.txt", []byte("data"), 4, PendingNew)
+	const snapshotID = "writeback-rename-snapshot-B"
+	const parentSnapshotID = "writeback-rename-snapshot-A"
+	ancestors := []string{parentSnapshotID, "writeback-rename-snapshot-root"}
+	if _, _, err := cache.PutWithBaseRevAndModeAndLineageTimings(
+		"/old.txt", []byte("data"), 4, PendingNew, 9, 0o640, true,
+		snapshotID, parentSnapshotID, true, ancestors...,
+	); err != nil {
+		t.Fatal(err)
+	}
 
 	if !cache.RenamePending("/old.txt", "/new.txt") {
 		t.Fatal("RenamePending returned false, expected true")
@@ -4815,6 +4824,15 @@ func TestWriteBackCache_RenamePending(t *testing.T) {
 	}
 	if meta.Path != "/new.txt" {
 		t.Fatalf("meta.Path = %q, want /new.txt", meta.Path)
+	}
+	if meta.BaseRev != 9 || !meta.HasMode || meta.Mode != 0o640 {
+		t.Fatalf("meta base=%d mode=%o has=%t, want 9/0640/true", meta.BaseRev, meta.Mode, meta.HasMode)
+	}
+	if meta.SnapshotID != snapshotID || meta.ParentSnapshotID != parentSnapshotID || !meta.lineageTrusted {
+		t.Fatalf("lineage = %q/%q trusted=%t, want %q/%q true", meta.SnapshotID, meta.ParentSnapshotID, meta.lineageTrusted, snapshotID, parentSnapshotID)
+	}
+	if !slices.Equal(meta.liveAncestors, ancestors) {
+		t.Fatalf("liveAncestors = %v, want %v", meta.liveAncestors, ancestors)
 	}
 }
 
