@@ -688,7 +688,7 @@ func TestPromotionCreateRecoversTerminalTombstoneAndRejectsRetiredIdentity(t *te
 		 terminal_state, terminal_result_blob, terminal_result_digest, retire_after)
 		VALUES ('tenant-a', ?, ?, ?, '/published', ?, ?, ?, ?, 'COMMITTED', '{}', ?, DATE_ADD(NOW(3), INTERVAL 1 DAY))`,
 		created.AllocationEpoch, created.AllocationSequence, proofDigest, fileNodePathHash("/published"),
-		requestDigest, ownerHash, recoveryHash, promotionTestHash("terminal-result")); err != nil {
+		requestDigest, ownerHash, recoveryHash, promotionTestHash("{}")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DB().Exec(`DELETE FROM promotion_imports
@@ -702,8 +702,24 @@ func TestPromotionCreateRecoversTerminalTombstoneAndRejectsRetiredIdentity(t *te
 		t.Fatalf("CreateImport tombstone recovery: %v", err)
 	}
 	if recovered.State != "COMMITTED" || recovered.MigrationID != created.MigrationID || recovered.Target != created.Target ||
-		recovered.TerminalResultBlob != "{}" || recovered.TerminalResultDigest != promotionTestHash("terminal-result") {
+		recovered.TerminalResultBlob != "{}" || recovered.TerminalResultDigest != promotionTestHash("{}") {
 		t.Fatalf("terminal recovery = %+v, want complete durable terminal result", recovered)
+	}
+	if _, err := store.DB().Exec(`UPDATE promotion_import_tombstones SET terminal_result_digest = ?
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		promotionTestHash("different-result"), created.AllocationEpoch, created.AllocationSequence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := promotionStore.CreateImport(context.Background(), request); !errors.Is(err, ErrPromotionRecoveryRequired) {
+		t.Fatalf("corrupt tombstone digest error = %v, want ErrPromotionRecoveryRequired", err)
+	}
+	if _, err := store.DB().Exec(`UPDATE promotion_import_tombstones SET terminal_result_blob = '', terminal_result_digest = ''
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		created.AllocationEpoch, created.AllocationSequence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := promotionStore.CreateImport(context.Background(), request); !errors.Is(err, ErrPromotionRecoveryRequired) {
+		t.Fatalf("empty tombstone result error = %v, want ErrPromotionRecoveryRequired", err)
 	}
 	mismatched := request
 	mismatched.RecoveryToken = "different-recovery-token"
@@ -723,6 +739,123 @@ func TestPromotionCreateRecoversTerminalTombstoneAndRejectsRetiredIdentity(t *te
 	}
 	if _, err := promotionStore.CreateImport(context.Background(), request); !errors.Is(err, ErrPromotionIDRetired) {
 		t.Fatalf("retired CreateImport error = %v, want ErrPromotionIDRetired", err)
+	}
+}
+
+func TestPromotionCreateMetadataOnlyManifestsReserveZeroQuota(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []promotion.ManifestEntry
+	}{
+		{name: "empty"},
+		{name: "directory", entries: []promotion.ManifestEntry{{RelativePath: "empty", Type: promotion.EntryTypeDirectory, Mode: 0o755}}},
+		{name: "symlink", entries: []promotion.ManifestEntry{{RelativePath: "link", Type: promotion.EntryTypeSymlink, Mode: 0o777, SymlinkTarget: "target"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+			manifest, err := promotion.CanonicalizeManifest(test.entries, testPromotionLimits())
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := promotionStore.PlanImport(context.Background(), promotion.PlanImportRequest{
+				TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true, Manifest: manifest.Entries,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			allocation, err := promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
+				TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true,
+				IdempotencyKey: "allocate-metadata-" + test.name, AllocationLease: "allocation-lease",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := promotionStore.CreateImport(context.Background(), PromotionCreateRequest{
+				TenantID: "tenant-a", MigrationID: allocation.MigrationID, AllocationProof: allocation.AllocationProof,
+				Target: "/published", ExpectedTargetAbsent: true, Manifest: manifest.Entries, Plan: *plan,
+				OwnerToken: "owner-token", RecoveryToken: "recovery-token", WriterLease: "writer-lease",
+			})
+			if err != nil {
+				t.Fatalf("CreateImport metadata-only manifest: %v", err)
+			}
+			if created.State != "CREATED" {
+				t.Fatalf("created state = %q, want CREATED", created.State)
+			}
+			var reservationBytes, reservationFiles, accountBytes, accountFiles uint64
+			if err := store.DB().QueryRow(`SELECT reserved_bytes, reserved_files FROM promotion_quota_reservations
+				WHERE tenant_id = 'tenant-a' AND reservation_id = ?`, created.QuotaReservationID).
+				Scan(&reservationBytes, &reservationFiles); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.DB().QueryRow(`SELECT reserved_bytes, reserved_files FROM promotion_quota_accounts
+				WHERE tenant_id = 'tenant-a'`).Scan(&accountBytes, &accountFiles); err != nil {
+				t.Fatal(err)
+			}
+			if reservationBytes != 0 || reservationFiles != 0 || accountBytes != 0 || accountFiles != 0 {
+				t.Fatalf("zero-quota reservation/account = (%d,%d)/(%d,%d)",
+					reservationBytes, reservationFiles, accountBytes, accountFiles)
+			}
+		})
+	}
+}
+
+func TestPromotionCreateTerminalFullRowFailsClosedOnMissingOrCorruptResult(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+	manifest := testPromotionManifest(t)
+	plan, err := promotionStore.PlanImport(context.Background(), promotion.PlanImportRequest{
+		TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true, Manifest: manifest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocation, err := promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
+		TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true,
+		IdempotencyKey: "allocate-terminal-full-row", AllocationLease: "allocation-lease",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := PromotionCreateRequest{
+		TenantID: "tenant-a", MigrationID: allocation.MigrationID, AllocationProof: allocation.AllocationProof,
+		Target: "/published", ExpectedTargetAbsent: true, Manifest: manifest, Plan: *plan,
+		OwnerToken: "owner-token", RecoveryToken: "recovery-token", WriterLease: "writer-lease",
+	}
+	created, err := promotionStore.CreateImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setTerminalResult := func(blob, digest any) {
+		t.Helper()
+		if _, err := store.DB().Exec(`UPDATE promotion_imports
+			SET state = 'COMMITTED', terminal_result_blob = ?, terminal_result_digest = ?
+			WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+			blob, digest, created.AllocationEpoch, created.AllocationSequence); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	setTerminalResult(nil, nil)
+	if _, err := promotionStore.CreateImport(context.Background(), request); !errors.Is(err, ErrPromotionRecoveryRequired) {
+		t.Fatalf("missing terminal result error = %v, want ErrPromotionRecoveryRequired", err)
+	}
+	setTerminalResult("{}", promotionTestHash("different-result"))
+	if _, err := promotionStore.CreateImport(context.Background(), request); !errors.Is(err, ErrPromotionRecoveryRequired) {
+		t.Fatalf("corrupt terminal result error = %v, want ErrPromotionRecoveryRequired", err)
+	}
+	setTerminalResult("not-json", promotionTestHash("not-json"))
+	if _, err := promotionStore.CreateImport(context.Background(), request); !errors.Is(err, ErrPromotionRecoveryRequired) {
+		t.Fatalf("invalid terminal JSON error = %v, want ErrPromotionRecoveryRequired", err)
+	}
+	setTerminalResult("{}", promotionTestHash("{}"))
+	recovered, err := promotionStore.CreateImport(context.Background(), request)
+	if err != nil {
+		t.Fatalf("valid full terminal recovery: %v", err)
+	}
+	if recovered.State != "COMMITTED" || recovered.TerminalResultBlob != "{}" || recovered.TerminalResultDigest != promotionTestHash("{}") {
+		t.Fatalf("valid full terminal recovery = %+v", recovered)
 	}
 }
 

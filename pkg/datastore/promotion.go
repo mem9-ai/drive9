@@ -599,6 +599,13 @@ func (s *PromotionStore) reservePromotionQuotaTx(ctx context.Context, tx *sql.Tx
 		reservedFiles > maxFiles || committedFiles > maxFiles-reservedFiles || files > maxFiles-reservedFiles-committedFiles {
 		return ErrPromotionQuotaExceeded
 	}
+	// The locked account row above is the quota admission point. A
+	// metadata-only manifest has nothing to add to its counters, and MySQL may
+	// report zero affected rows for an UPDATE that adds zero. Treat that valid
+	// no-op as an admitted zero-sized reservation rather than a recovery fault.
+	if bytes == 0 && files == 0 {
+		return nil
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE promotion_quota_accounts
 		SET reserved_bytes = reserved_bytes + ?, reserved_files = reserved_files + ?
 		WHERE tenant_id = ?`, bytes, files, tenantID)
@@ -847,6 +854,9 @@ func (s *PromotionStore) selectPromotionImportTx(ctx context.Context, tx *sql.Tx
 	if terminalResultDigest.Valid {
 		out.TerminalResultDigest = terminalResultDigest.String
 	}
+	if err := validatePromotionTerminalResult(out.State, terminalResultBlob, terminalResultDigest); err != nil {
+		return nil, "", "", "", err
+	}
 	return &out, createDigest, ownerHash, recoveryHash, nil
 }
 
@@ -868,6 +878,11 @@ func (s *PromotionStore) selectPromotionCreateTerminalRecoveryTx(
 	if err == nil {
 		if requestDigest != createDigest || !promotionHashEqual(storedOwnerHash, ownerHash) || !promotionHashEqual(storedRecoveryHash, recoveryHash) {
 			return nil, false, ErrPromotionConflict
+		}
+		if err := validatePromotionTerminalResult(terminalState,
+			sql.NullString{String: terminalResultBlob, Valid: true},
+			sql.NullString{String: terminalResultDigest, Valid: true}); err != nil {
+			return nil, false, err
 		}
 		migrationID, encodeErr := promotion.EncodeMigrationID(identity)
 		if encodeErr != nil {
@@ -908,6 +923,24 @@ func (s *PromotionStore) selectPromotionCreateTerminalRecoveryTx(
 		return nil, false, fmt.Errorf("read promotion retired sequence: %w", err)
 	}
 	return nil, false, nil
+}
+
+func validatePromotionTerminalResult(state string, blob, digest sql.NullString) error {
+	switch state {
+	case "COMMITTED", "ABORTED":
+		if !blob.Valid || strings.TrimSpace(blob.String) == "" || !json.Valid([]byte(blob.String)) ||
+			!digest.Valid || !validPromotionSHA256(digest.String) ||
+			!promotionHashEqual(promotionHashString(blob.String), digest.String) {
+			return ErrPromotionRecoveryRequired
+		}
+	case "CREATED", "STAGING", "VERIFIED", "COMMITTING", "ABORTING":
+		if blob.Valid || digest.Valid {
+			return ErrPromotionRecoveryRequired
+		}
+	default:
+		return ErrPromotionRecoveryRequired
+	}
+	return nil
 }
 
 func consumePromotionRate(raw sql.NullString, now time.Time, ratePerMinute, burst uint64) (promotionRateBucket, error) {
@@ -980,6 +1013,14 @@ func promotionHashBytes(value []byte) string {
 
 func promotionHashEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func validPromotionSHA256(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func newPromotionID(prefix string) (string, error) {
