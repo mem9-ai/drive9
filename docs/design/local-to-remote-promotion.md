@@ -290,9 +290,10 @@ current scope plus the applicable operation credential is required before
 normal active, terminal, or `import_id_retired` semantics are exposed.
 
 Server-owned work is deliberately different. Once `CommitImport` wins
-`VERIFIED -> COMMITTING`, or abort/deadline/GC wins a transition to
-`ABORTING`, the durable worker runs under Drive9's service authority and reaches
-a real terminal state even if the initiating user token is later revoked. It
+`VERIFIED -> COMMITTING`, or abort/deadline/GC wins the **atomic transition plus
+cleanup-attempt creation** into `ABORTING`, the durable worker runs under
+Drive9's service authority and reaches a real terminal state even if the
+initiating user token is later revoked. It
 does not re-evaluate mutable caller scope after acceptance; otherwise revocation
 could strand an accepted commit or cleanup. The final transaction still checks
 tenant ownership, immutable target identity, quota, namespace-CAS readiness,
@@ -657,13 +658,16 @@ incarnation, their respective generation, and `not_after`. Their maximum TTLs
 are fixed and recorded by the authority. While the tenant is `FENCING`, it
 issues no allocation or `NORMAL` writer leases. It may issue a bounded
 `RESTORE_DRAIN` lease only for an exact already-durable commit/cleanup attempt,
-or a one-use controller operation that converts a named client-owned import to
-`ABORTING` with reason `promotion_restore_interrupted`. A drain lease binds
-**both** the capability row's fence-writer generation and, when resuming an
-older durable attempt, that attempt's captured active-writer generation. The
-two generations are intentionally different and are never treated as an
-equality alias. A drain lease cannot create an import, accept content, verify,
-renew/take over ownership, or acquire unrelated work.
+or a one-use controller operation that atomically converts a named client-owned
+import to `ABORTING`, records reason `promotion_restore_interrupted`, and
+creates that import's unique cleanup attempt. A drain lease has distinct signed
+fields for the capability row's fence-writer generation and the durable
+attempt's captured writer generation. A pre-fence attempt usually makes these
+values different; an attempt created by the restore controller while already
+`DRAINING` captures the fence generation and makes them equal. Implementations
+validate the two fields against their own rows and never infer one from the
+other. A drain lease cannot create an import, accept content, verify, renew/take
+over ownership, or acquire unrelated work.
 
 The tenant DB has one restore-capability row containing the exact installed
 restore generation, database incarnation, writer generation, and admission
@@ -671,10 +675,10 @@ state (`ACTIVE`, `DRAINING`, or `FENCED`). A shared datastore transaction guard
 locks this row before **every promotion write** and validates the signed lease
 with database time. A `NORMAL` lease requires every bound field plus `ACTIVE`;
 a `RESTORE_DRAIN` lease requires `DRAINING`, the exact fence-writer generation,
-allowed transition kind, and durable attempt/import identity. For a
-pre-existing attempt it separately requires the attempt row's captured active-
-writer generation to equal the value named in the drain lease; it does not
-require that old generation to equal the capability row's fence generation.
+allowed transition kind, and durable attempt/import identity. For an existing
+attempt it separately requires the attempt row's captured writer generation to
+equal the value named in the drain lease; that value may, but need not, equal
+the capability row's fence generation.
 `FENCED` accepts neither.
 The mutation and guard commit in the same transaction; checking in HTTP
 middleware or before opening the transaction is insufficient.
@@ -705,12 +709,15 @@ The supported PITR/clone workflow is a barrier, not advisory documentation:
    `DRAINING` at the new fence generation. A transaction that locked the row
    first may finish; the fence transaction waits for it, then makes every later
    old/normal-lease transaction fail its locked guard.
-3. The restore controller uses narrowly scoped drain leases to move every
-   `CREATED`/`STAGING`/`VERIFIED` import to `ABORTING`, and to resume only the
-   durable `COMMITTING`/`ABORTING` attempts that existed at the fence. These
-   workers reach real terminal states and cannot acquire new user work. When no
-   nonterminal import remains, a signed drain-complete grant changes the DB row
-   from `DRAINING` to `FENCED` and stops drain-lease issuance.
+3. The restore controller uses narrowly scoped drain leases to atomically move
+   every `CREATED`/`STAGING`/`VERIFIED` import to `ABORTING` **and create its
+   unique durable cleanup attempt**, and to resume the exact durable
+   `COMMITTING`/`ABORTING` attempts already present. A `COMMITTING` attempt that
+   discovers a permanent failure during drain atomically creates its cleanup
+   attempt in the same transition to `ABORTING`. These workers reach real
+   terminal states and cannot acquire new user work. When no nonterminal import
+   remains, a signed drain-complete grant changes the DB row from `DRAINING` to
+   `FENCED` and stops drain-lease issuance.
 4. Wait past the authority-recorded maximum expiry for allocation, normal, and
    drain leases; drain all pre-fence DB transactions/handlers/workers; and
    revoke their generation-scoped promotion DB credentials. Success requires
@@ -1163,8 +1170,8 @@ The transitions and their durable effects are normative:
 | `CREATED` or `STAGING` | successful `VerifyImport` | `VERIFIED` | The complete persisted entry set is validated; every required file content is bound; entry set, content set, and manifest version become immutable. A manifest with no regular-file content may take this edge directly from `CREATED`. |
 | `VERIFIED` | accepted `CommitImport` CAS | `COMMITTING` | Commit attempt ID and accepted outcome are durable; request cancellation can no longer abort it. |
 | `COMMITTING` | server commit worker | `COMMITTED` | Target CAS, namespace publication, ownership transfer, reservation settlement, result row, and structural outbox event commit atomically. |
-| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort, expired-lease GC, activity-deadline CAS, or exact restore-drain claim | `ABORTING` | No new inline content, entry, verify, renew, takeover, or commit is accepted. Restore drain records `promotion_restore_interrupted`; for a future external mode, every path also rejects new grants/completion/seal and durably owns every closure bound, object identity, and debt charge. |
-| `COMMITTING` | permanent target/auth/manifest failure before publication | `ABORTING` | A durable terminal reason is recorded; no namespace or committed quota changed. Transient failure stays `COMMITTING` and is retried by the server. |
+| `CREATED`, `STAGING`, or `VERIFIED` | explicit abort, expired-lease GC, activity-deadline CAS, or exact restore-drain claim | `ABORTING` | The state transition, terminal reason, unique cleanup-attempt ID, and cleanup attempt's captured writer generation are committed atomically. No new inline content, entry, verify, renew, takeover, or commit is accepted. Restore drain records `promotion_restore_interrupted`; for a future external mode, every path also rejects new grants/completion/seal and durably owns every closure bound, object identity, and debt charge. |
+| `COMMITTING` | permanent target/auth/manifest failure before publication | `ABORTING` | The permanent reason and unique cleanup-attempt ID/generation are committed in the same transaction as the state transition; no namespace or committed quota changed. Transient failure stays `COMMITTING` and is retried by the server. |
 | `ABORTING` | server cleanup worker | `ABORTED` | Hidden entries and inline contents are deleted, the reservation is released exactly once, and the terminal reason/result is retained. A future external mode additionally detaches sealed unowned objects and retains upload/seal attempts, provider-mutation claims, and cleanup debt through `gc_done`. |
 
 There are no other transitions. `COMMITTED` and `ABORTED` are terminal.
@@ -1173,21 +1180,39 @@ expiry does not abandon them, and their workers are durably discoverable after
 a server crash. `COMMITTING` never transitions directly back to `VERIFIED`, and
 `ABORTING` cannot be revived.
 
+`ABORTING` has a database invariant, not a scheduling convention: every such
+row has exactly one non-null `cleanup_attempt_id`,
+`cleanup_writer_generation`, and durable terminal reason. **No transaction may
+commit `state=ABORTING` without those fields.** The transition transaction owns
+cleanup before a worker is enqueued or a response is sent. A response loss,
+process crash, or restore fence between transition commit and worker dispatch
+therefore leaves one discoverable attempt, never an ownerless `ABORTING` row.
+Concurrent explicit abort, deadline, lease-GC, commit-failure, and restore-drain
+callers race on the state/version CAS; the winner creates the attempt and every
+loser returns/resumes that same attempt rather than allocating another one.
+The schema/migration audit rejects an `ABORTING` row missing this tuple; runtime
+recovery returns `promotion_recovery_required` and keeps the tenant fenced
+rather than inventing cleanup ownership.
+
 Every transition and every same-state mutation in this table is also a
 promotion write governed by the restore-writer transaction guard. The import
 row stores the restore generation and database incarnation accepted by
-`CreateImport`; each commit/cleanup attempt stores the active-writer generation
-that claimed it. A worker may resume after an ordinary process crash only with
+`CreateImport`; each commit attempt stores the active-writer generation that
+claimed it, while each cleanup attempt stores the effective writer generation
+of the transaction that atomically created `ABORTING`. A worker may resume
+after an ordinary process crash only with
 a fresh `NORMAL` lease for that exact installed active tuple. During restore
 drain, the controller may instead issue a `RESTORE_DRAIN` lease that names the
-current fence-writer generation **and** the older attempt generation; the
-transaction validates those values against the locked capability and attempt
-rows respectively. An old process cannot read a newer tuple and silently adopt
-it. Writer-fence failure makes no state, quota, staging, cleanup, or namespace
-mutation. In the supported PITR workflow all service-owned work reaches
-terminal before restore, and activation rejects any nonterminal row restored
-from the historical snapshot, so no cross-incarnation worker adoption is
-implied.
+current fence-writer generation and the cleanup attempt's captured generation;
+the transaction validates those values against the locked capability and
+attempt fields respectively. The attempt generation may be the old active
+generation for work that predated the fence, or the fence generation for an
+attempt atomically created by the restore controller. An old process cannot
+read a newer tuple and silently adopt it. Writer-fence failure makes no state,
+quota, staging, cleanup, or namespace mutation. In the supported PITR workflow
+all service-owned work reaches terminal before restore, and activation rejects
+any nonterminal row restored from the historical snapshot, so no cross-
+incarnation worker adoption is implied.
 
 `CreateImport` assigns an immutable `activity_deadline` no later than the
 server's maximum import lifetime. Owner leases and every inline-content write
@@ -1200,7 +1225,8 @@ mutation performs that comparison with database time inside the same
 state/version transaction; application clocks do not decide the winner. At the
 deadline, a server scanner (and every racing API call) CASes `CREATED`,
 `STAGING`, or `VERIFIED` to `ABORTING` with reason
-`activity_deadline_exceeded`; no new owner action is accepted. The winner is
+`activity_deadline_exceeded` and creates the unique cleanup attempt in that
+same transaction; no new owner action is accepted. The winner is
 the first state CAS serialized by the database, not whichever caller returns
 first: if the deadline CAS wins, a racing commit cannot be accepted; if the
 `VERIFIED -> COMMITTING` CAS wins while database time is still before the
@@ -1298,7 +1324,8 @@ The readiness/epoch check is not satisfied merely because `CommitImport`
 entered `COMMITTING`. If it fails at the final linearization point, that same
 transaction publishes nothing, transfers no content/quota, emits no outbox
 event, and moves the import to `ABORTING` with the durable
-`target_precondition_changed` reason. The source remains authoritative. A
+`target_precondition_changed` reason **and cleanup attempt** in the same
+transaction. The source remains authoritative. A
 rollback/epoch-change transaction and final publish therefore serialize on the
 same tenant row: publish may linearize first under the old valid epoch, or the
 epoch change may win and force the import to abort, but an old worker cannot
@@ -1393,7 +1420,13 @@ imports(
   committed_root_inode, committed_generation, terminal_result_blob,
   terminal_result_digest, terminal_at, result_acknowledged_at,
   full_row_compact_not_before, retire_after, created_at, updated_at,
-  primary key (tenant_id, allocation_epoch, allocation_sequence)
+  primary key (tenant_id, allocation_epoch, allocation_sequence),
+  check (
+    state <> 'ABORTING' or
+    (cleanup_attempt_id is not null and
+     cleanup_writer_generation is not null and
+     terminal_reason is not null)
+  )
 )
 
 import_entries(
@@ -1499,8 +1532,11 @@ verified writer-lease tuple and locks this row through one shared guard before
 its first mutation. Direct SQL helpers that omit the guard are not public to
 handlers or workers. Commit and cleanup attempts persist the generation that
 claimed them so a zombie process cannot refresh its authority by merely reading
-the newer capability row. The rollout/test gate enumerates every writer entry
-point; adding a new writer without the guard is a contract and CI failure.
+the newer capability row. The `ABORTING` state and cleanup-attempt tuple live
+on the same row and are written by one transaction; worker enqueue is only a
+notification, not ownership. The rollout/test gate enumerates every writer
+entry point; adding a new writer without the guard, or any transition to
+`ABORTING` without the cleanup tuple, is a contract and CI failure.
 
 The public `migration_id` is not an independently stored database identity.
 Every handler strictly decodes it, combines the epoch/sequence pair with the
@@ -1821,7 +1857,7 @@ The server state is authoritative for publish and accounting outcome:
 | `STAGING` | Source is authoritative; keep both fenced during recovery. | Reservation and partial hidden inline stage remain. Resume/take over or abort. In a future external mode, old control-plane mutations are epoch-fenced and already-issued grants remain isolated/tracked through landing closure plus GC. | Retain. |
 | `VERIFIED` | Source is authoritative; keep both fenced. | Immutable hidden stage and reservation remain. Commit with the same migration ID or abort; no entry mutation is allowed. | Retain. |
 | `COMMITTING` | Outcome is unknown; neither source nor target is released. | Server owns completion; lease expiry and client abort do nothing. Poll `GetImport`; a recovered server worker reaches `COMMITTED` or `ABORTING`. | Retain; never create a second migration ID. |
-| `ABORTING` | Source remains authoritative, but both paths stay fenced until cleanup completes. | Server resumes hidden-stage deletion and exactly-once reservation release; no client mutation or takeover is accepted. | Retain and poll. |
+| `ABORTING` | Source remains authoritative, but both paths stay fenced until cleanup completes. | Server resumes the row's one durable cleanup attempt: hidden-stage deletion and exactly-once reservation release; no new cleanup attempt, client mutation, or takeover is accepted. A missing attempt tuple is corruption/recovery-required, not permission to guess ownership. | Retain and poll. |
 | `ABORTED` | Source is authoritative; target was not published. | Reservation is released, hidden inline content is gone, and the terminal reason is durable. A future external mode may continue upload/seal cleanup, provider claims, and debt from retained ledgers until `gc_done`. | Fsync the local aborted result, release fences, then acknowledge/retire the active record; the server tombstone remains for retry identity. |
 | `COMMITTED` | Target is authoritative; keep both fenced until source reconciliation finishes. | Quota is settled, sealed content ownership and namespace/outbox result are durable; cleanup of temporary and unowned candidates cannot remove committed versions and continues independently until `gc_done`. | Verify the source-incarnation UUID, quarantine only the matching source, publish inode/cache state, fsync `DONE`, release fences, then acknowledge/retire the active record. |
 | unreachable or invalid response | Authority is unresolved; keep both paths fenced or fail the mount closed. | No cleanup, quota release, abort, or new migration is guessed. | Retain and return `promotion_recovery_required`. |
@@ -1884,7 +1920,8 @@ owner.
 - committed imports transfer object ownership and cannot be removed by staging
   GC; aborted imports idempotently release quota and cannot be revived;
 - lease GC can acquire only `CREATED`, `STAGING`, or `VERIFIED`; it never
-  cancels `COMMITTING`, and a crashed `ABORTING` cleanup is resumed until the
+  cancels `COMMITTING`; its state CAS creates cleanup ownership atomically, and
+  a crashed `ABORTING` cleanup resumes that exact attempt until the
   exactly-once release is durable;
 - accepted data-plane writes can target only migration-owned temporary
   grant identities; their durable ledgers outlive abort/commit until every
@@ -2067,9 +2104,23 @@ tree. Repeated recovery is idempotent.
   namespace and outbox unchanged;
 - complementary drain tests prove that only exact pre-existing commit/cleanup
   attempts can use `RESTORE_DRAIN` during `DRAINING`; client mutations and new
-  scanner acquisitions remain denied. Client-owned imports are converted once
-  to `ABORTING/promotion_restore_interrupted`, and no drain lease can target a
-  different import or attempt;
+  scanner acquisitions remain denied. Client-owned imports are atomically
+  converted once to `ABORTING/promotion_restore_interrupted` plus their cleanup
+  attempt, and no drain lease can target a different import or attempt;
+- every `... -> ABORTING` production entry (explicit abort, deadline scanner,
+  expired-lease GC, permanent `COMMITTING` failure, and restore-controller
+  conversion) has a barrier immediately after the transition transaction
+  commits but before worker enqueue/response. Killing the initiator there must
+  leave exactly one attempt discoverable from the `ABORTING` row. With the
+  tenant then moved to `DRAINING`, a `RESTORE_DRAIN` worker resumes that same
+  attempt, reaches `ABORTED`, releases quota/staging once, and permits
+  `FENCED`; it never needs a prohibited new scanner acquisition. Replaying any
+  losing trigger returns the same attempt ID;
+- mutation variants split cleanup-attempt insertion into a second transaction,
+  omit its writer generation, or allow `ABORTING` with a null attempt. The
+  transition must fail the row invariant; if the invariant/check or atomic
+  insertion is removed too, the crash-after-transition restore test strands
+  the tenant in `DRAINING` and fails;
 - a transaction that locked the restore-capability row before the fence may
   finish; the fence transaction waits, and no old-generation transaction can
   start after it commits. Separate tests hold an unresponsive worker/session or
@@ -2248,8 +2299,9 @@ The remaining P0/FUSE concurrency cases are:
   receives active, terminal, or retired recovery;
 - a deterministic revocation barrier after `CommitImport` has already won
   `VERIFIED -> COMMITTING`, and after abort/deadline GC has already won
-  `... -> ABORTING`, does not strand server work: the service-owned worker
-  reaches its real terminal result while later client requests remain denied;
+  the atomic `... -> ABORTING` plus cleanup-attempt creation, does not strand
+  server work: the service-owned worker resumes that exact attempt and reaches
+  its real terminal result while later client requests remain denied;
 - the same migration ID with a different target, manifest, entry payload, or
   content hash conflicts;
 - `PlanImport(expected_target_absent=false)` returns no plan, and changing a
@@ -2290,13 +2342,14 @@ The remaining P0/FUSE concurrency cases are:
 - response loss and server restart are injected in every state:
   `CREATED`, `STAGING`, `VERIFIED`, `COMMITTING`, `ABORTING`, `ABORTED`, and
   `COMMITTED`; each case asserts source/target authority, fence retention,
-  staging ownership, reservation/committed quota, and local-record retention;
+  staging ownership, reservation/committed quota, cleanup-attempt uniqueness,
+  and local-record retention;
 - deleting the owner-epoch comparison or allowing takeover of a live,
   server-owned, or terminal state makes a focused test fail;
 - lease renewal and inline-content mutation at the activity boundary never
   extend beyond it; a deterministic barrier test lets the deadline CAS win
   from each of `CREATED`, `STAGING`, and `VERIFIED`, then requires
-  `ABORTING -> ABORTED` with the stable
+  one atomic `ABORTING` cleanup attempt followed by `ABORTED` with the stable
   `promotion_deadline_exceeded`/`ETIMEDOUT` result across restart and retry;
 - a complementary barrier test lets `CommitImport` win the
   `VERIFIED -> COMMITTING` CAS before the deadline, then advances database time
@@ -2445,6 +2498,9 @@ Tests must fail when independently deleting:
 - the parent path-edge incarnation, child-set generation, or absent-child term
   of the target CAS;
 - the server-state CAS between commit, abort, and GC;
+- atomic creation of the unique cleanup-attempt ID, captured writer generation,
+  and terminal reason in every transition to `ABORTING`, plus the invariant
+  that forbids an ownerless `ABORTING` row;
 - owner epoch/owner-token fencing, recovery-token authorization, and
   expired-lease takeover;
 - current-request authorization against the server-stored target on every
