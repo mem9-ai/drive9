@@ -39,6 +39,10 @@ on:
         required: false
         default: "0"
         type: string
+      run_fuse_concurrency_stress_write_sync:
+        required: false
+        default: "0"
+        type: string
       feishu_proof:
         required: false
         default: "0"
@@ -55,6 +59,14 @@ on:
           - "1"
       run_fuse_concurrency_stress:
         description: "Run opt-in FUSE concurrency stress workload"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+      run_fuse_concurrency_stress_write_sync:
+        description: "Run opt-in FUSE concurrency stress workload under --durability write-sync (issue #936 acceptance; not part of run_all_e2e)"
         required: false
         default: "0"
         type: choice
@@ -163,6 +175,10 @@ env:
   RUN_SEMANTIC_CHECKS: "0"
   RUN_CLI_SEMANTIC_CHECKS: "0"
   RUN_FUSE_CONCURRENCY_STRESS: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_concurrency_stress) || '0') }}
+  # Deliberately excluded from schedule/push and from run_all_e2e: write-sync
+  # is not a routine path. Opt-in only, for on-demand issue #936 acceptance
+  # runs of the frozen concurrency workload.
+  RUN_FUSE_CONCURRENCY_STRESS_WRITE_SYNC: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.run_fuse_concurrency_stress_write_sync || '0' }}
   RUN_FUSE_POSIX_FSX: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_posix_fsx) || '0') }}
   RUN_FUSE_SQLITE_WAL: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_wal) || '0') }}
   RUN_FUSE_SQLITE_CHURN: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_churn) || '0') }}
@@ -442,6 +458,23 @@ jobs:
           path: e2e-artifacts/fuse-concurrency
           if-no-files-found: warn
 
+      - name: Run FUSE concurrency stress (write-sync, opt-in)
+        id: fuse-concurrency-stress-write-sync
+        if: always() && env.RUN_FUSE_CONCURRENCY_STRESS_WRITE_SYNC == '1'
+        env:
+          FUSE_CONCURRENCY_KEEP_ARTIFACTS: "1"
+          DRIVE9_E2E_DURABILITY: write-sync
+          FUSE_CONCURRENCY_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-concurrency-write-sync
+        run: bash e2e/fuse-concurrency-stress.sh
+
+      - name: Upload FUSE concurrency write-sync artifacts
+        if: always() && env.RUN_FUSE_CONCURRENCY_STRESS_WRITE_SYNC == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuse-concurrency-stress-write-sync
+          path: e2e-artifacts/fuse-concurrency-write-sync
+          if-no-files-found: warn
+
       - name: Run FUSE POSIX/fsx gate
         id: fuse-posix-fsx
         if: always() && env.RUN_FUSE_POSIX_FSX == '1'
@@ -490,6 +523,7 @@ jobs:
             echo "| FUSE write perf budget e2e | ${{ steps.fuse-write-perf-budget.outcome || 'skipped' }} |"
             echo "| FUSE performance compare | ${{ steps.fuse_performance_compare.outcome || 'skipped' }} |"
             echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.outcome || 'skipped' }} |"
+            echo "| FUSE concurrency stress (write-sync, opt-in) | ${{ steps.fuse-concurrency-stress-write-sync.outcome || 'skipped' }} |"
             echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.outcome || 'skipped' }} |"
             echo "| Full smoke-all suite | ${{ steps.smoke-all.outcome || 'skipped' }} |"
             echo "| Git feature smoke | ${{ steps.git-feature-smoke.outcome || 'skipped' }} |"
@@ -536,6 +570,7 @@ jobs:
             "fuse-write-perf-budget": "${{ steps.fuse-write-perf-budget.outcome }}",
             "fuse_performance_compare": "${{ steps.fuse_performance_compare.outcome }}",
             "fuse-concurrency-stress": "${{ steps.fuse-concurrency-stress.outcome }}",
+            "fuse-concurrency-stress-write-sync": "${{ steps.fuse-concurrency-stress-write-sync.outcome }}",
             "fuse-posix-fsx": "${{ steps.fuse-posix-fsx.outcome }}",
             "smoke-all": "${{ steps.smoke-all.outcome }}",
             "git-feature-smoke": "${{ steps.git-feature-smoke.outcome }}"

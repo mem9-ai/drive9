@@ -20,6 +20,9 @@ jobs:
       - name: Test E2E durability override contract
         run: bash e2e/durability-contract-test.sh
 
+      - name: Test E2E remote residue verdict
+        run: bash e2e/remote-residue-test.sh
+
       - name: Checkout agfs dependency
         run: |
           git clone --depth 1 https://github.com/c4pt0r/agfs ../agfs

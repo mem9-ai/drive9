@@ -628,8 +628,19 @@ deterministic writable concurrency coverage, not a Git or cross-mount workload.
 6. Verify the final mounted tree exactly matches a deterministic manifest
 7. Unmount, copy the remote tree back through the CLI, and verify the remote
    snapshot matches the same manifest
-8. Preserve run root, mount log, expected/actual manifests, and reader error log
-   on failure
+8. Cleanup acceptance, counted into the result: remove the remote fixture and
+   assert it is no longer resolvable, the mount left no mounted residue, the
+   supervisor/worker processes exited, the kernel FUSE connection was
+   released (Linux), and the run-scoped operational home (isolated CLI HOME +
+   default mount cache, kept outside the artifact dir) was removed. Any
+   failure fails the suite. Run root, mount log, expected/actual manifests,
+   and reader error log are preserved on failure
+
+The suite runs with the CLI-default durability in CI. The issue #936 frozen
+write-sync reproduction is `DRIVE9_E2E_DURABILITY=write-sync bash e2e/fuse-concurrency-stress.sh`;
+`local-e2e.yml` exposes it as the opt-in dispatch toggle
+`run_fuse_concurrency_stress_write_sync` (default off, excluded from
+schedule/push and `run_all_e2e`, never a required check).
 
 ### `fuse-performance-baseline.sh`
 

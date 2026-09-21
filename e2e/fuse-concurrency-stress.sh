@@ -10,6 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/durability-contract.sh"
+source "$SCRIPT_DIR/remote-residue.sh"
 drive9_e2e_init_durability ""
 
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
@@ -21,6 +22,7 @@ MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
 FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
 FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
+FUSE_MOUNT_PROC_EXIT_TIMEOUT_S="${FUSE_MOUNT_PROC_EXIT_TIMEOUT_S:-30}"
 FUSE_CONCURRENCY_KEEP_ARTIFACTS="${FUSE_CONCURRENCY_KEEP_ARTIFACTS:-0}"
 FUSE_CONCURRENCY_ARTIFACT_DIR="${FUSE_CONCURRENCY_ARTIFACT_DIR:-}"
 FUSE_CONCURRENCY_WORKERS="${FUSE_CONCURRENCY_WORKERS:-4}"
@@ -230,6 +232,61 @@ unmount_mount() {
     MOUNT_PID=""
     set -e
   fi
+}
+
+# fuse_connection_ids lists kernel FUSE connection ids (Linux only; empty
+# elsewhere), used to prove the mount's own connection was released.
+fuse_connection_ids() {
+  if [ -d /sys/fs/fuse/connections ]; then
+    ls /sys/fs/fuse/connections 2>/dev/null || true
+  fi
+}
+
+# leftover_fuse_connections prints connection ids created by this run, i.e.
+# ids that were not present in the pre-mount baseline.
+leftover_fuse_connections() {
+  local id
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    case " ${FUSE_CONN_BASELINE:-} " in
+      *" $id "*) ;;
+      *) echo "$id" ;;
+    esac
+  done < <(fuse_connection_ids)
+}
+
+# mount_process_pids prints any supervisor or worker process still serving
+# this run's mountpoint.
+mount_process_pids() {
+  pgrep -f "mount supervise --mountpoint $MOUNT_POINT" 2>/dev/null || true
+  pgrep -f "mount --foreground --supervised.*$MOUNT_POINT" 2>/dev/null || true
+}
+
+# wait_mount_processes_exit polls until the supervisor and worker for this
+# mountpoint are gone; they terminate asynchronously after umount.
+wait_mount_processes_exit() {
+  local deadline=$(( $(date +%s) + FUSE_MOUNT_PROC_EXIT_TIMEOUT_S ))
+  while :; do
+    if [ -z "$(mount_process_pids)" ]; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+# remove_remote_root_assert deletes the remote fixture and verifies it is no
+# longer resolvable. remote_root_not_found only accepts an explicit not-found
+# / HTTP 404 as evidence of deletion; resolvable paths and non-404 stat
+# errors (5xx, timeout, auth) fail the check after bounded retries.
+remove_remote_root_assert() {
+  if ! drive9_retry fs rm -r "$ROOT_REMOTE" >/dev/null; then
+    echo "remote root removal command failed for $ROOT_REMOTE" >&2
+    return 1
+  fi
+  remote_root_not_found "$ROOT_REMOTE"
 }
 
 curl_body_code() {
@@ -742,7 +799,10 @@ prepare_cli_binary
 check_cmd "drive9 binary ready" test -x "$CLI_BIN"
 
 drive9() {
-  DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
+  # Isolated HOME keeps a developer-side ~/.drive9 active context (whose
+  # server URL would otherwise win over DRIVE9_SERVER) out of the run, the
+  # same way cli-smoke-test.sh isolates its CLI invocations.
+  env HOME="$CLI_ISOLATED_HOME" DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
 }
 
 TS="$(date +%s)"
@@ -766,6 +826,15 @@ WORK_MOUNT="$MOUNT_POINT/$ROOT_REL/work"
 WORK_REMOTE="$ROOT_REMOTE/work"
 MOUNT_PID=""
 
+# OPS_ROOT holds operational state that must not survive the run: the
+# isolated CLI HOME and, through it, the mount's default write-back cache
+# (~/.cache/drive9). It deliberately lives outside RUN_ROOT so uploaded
+# artifacts keep only audit evidence (logs/manifests) while the residue
+# assertions below can require OPS_ROOT to be gone.
+OPS_ROOT="$(mktemp -d "${FUSE_MOUNT_ROOT}/drive9-fuse-concurrency-ops-${TS}.XXXXXX")"
+CLI_ISOLATED_HOME="$OPS_ROOT/cli-home"
+mkdir -p "$CLI_ISOLATED_HOME"
+
 mkdir -p "$MOUNT_POINT"
 : > "$MOUNT_LOG"
 
@@ -775,6 +844,7 @@ cleanup() {
   if [ -n "${CLI_BIN:-}" ]; then
     rm -f "$CLI_BIN"
   fi
+  rm -rf "${OPS_ROOT:-}" >/dev/null 2>&1 || true
   if [ "$rc" -eq 0 ] && [ "$FAIL" -eq 0 ] && [ "$FUSE_CONCURRENCY_KEEP_ARTIFACTS" != "1" ]; then
     rm -rf "$RUN_ROOT"
   else
@@ -794,6 +864,7 @@ drive9_retry fs mkdir "$ROOT_REMOTE" >/dev/null
 check_eq "remote concurrency root" "$ROOT_REMOTE" "$ROOT_REMOTE"
 
 echo "[5] mount writable namespace"
+FUSE_CONN_BASELINE="$(fuse_connection_ids | sort | tr '\n' ' ')"
 if start_mount; then
   check_eq "concurrency mount is mounted" "true" "true"
 else
@@ -817,8 +888,22 @@ if is_mounted "$MOUNT_POINT"; then
   verify_manifest_dir "remote snapshot manifest matches mounted final manifest" "$REMOTE_WORK_SNAPSHOT" "$REMOTE_MANIFEST"
 fi
 
-echo "[8] cleanup remote fixture"
-drive9_retry fs rm -r "$ROOT_REMOTE" >/dev/null || true
+echo "[8] cleanup remote fixture and verify zero residue"
+check_cmd "remote concurrency root removed and not found" remove_remote_root_assert
+if is_mounted "$MOUNT_POINT"; then
+  check_eq "concurrency mount left no mounted residue" "false" "true"
+else
+  check_eq "concurrency mount left no mounted residue" "true" "true"
+fi
+check_eq "mount supervisor and worker processes exited" \
+  "$(wait_mount_processes_exit && echo true || echo false)" "true"
+if [ -d /sys/fs/fuse/connections ]; then
+  check_eq "kernel FUSE connection released" \
+    "$( [ -z "$(leftover_fuse_connections)" ] && echo true || echo false)" "true"
+fi
+rm -rf "$OPS_ROOT"
+check_eq "run-scoped operational home and mount cache removed" \
+  "$( [ ! -e "$OPS_ROOT" ] && echo true || echo false)" "true"
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"
 exit "$FAIL"
