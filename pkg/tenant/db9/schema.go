@@ -28,12 +28,16 @@ func InitSchemaStatements() []string {
 			is_directory BOOLEAN NOT NULL DEFAULT FALSE,
 			file_id      VARCHAR(64),
 			inode_id     VARCHAR(64),
+			path_edge_incarnation VARCHAR(128) NOT NULL DEFAULT '',
+			children_generation BIGINT NOT NULL DEFAULT 0,
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_path ON file_nodes(path_hash)`,
 		`CREATE INDEX IF NOT EXISTS idx_parent ON file_nodes(parent_path_hash, name)`,
 		`CREATE INDEX IF NOT EXISTS idx_file_id ON file_nodes(file_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_inode_id ON file_nodes(inode_id)`,
+		`ALTER TABLE IF EXISTS file_nodes ADD COLUMN IF NOT EXISTS path_edge_incarnation VARCHAR(128) NOT NULL DEFAULT ''`,
+		`ALTER TABLE IF EXISTS file_nodes ADD COLUMN IF NOT EXISTS children_generation BIGINT NOT NULL DEFAULT 0`,
 		// See docs/async-embedding/async-embedding-generation-proposal.md,
 		// section "2) File schema: embedding must become mutable and revision-aware".
 

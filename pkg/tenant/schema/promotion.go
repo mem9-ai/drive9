@@ -25,8 +25,14 @@ func PromotionTiDBSchemaStatements() []string {
 			database_incarnation         VARCHAR(128) NOT NULL DEFAULT '',
 			writer_generation            BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			admission_state              VARCHAR(32) NOT NULL DEFAULT 'DISABLED',
+			root_inode                   VARCHAR(64) NOT NULL DEFAULT '',
+			root_edge_incarnation        VARCHAR(128) NOT NULL DEFAULT '',
+			root_children_generation     BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			updated_at                   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
+		`ALTER TABLE promotion_namespace_capabilities ADD COLUMN root_inode VARCHAR(64) NOT NULL DEFAULT ''`,
+		`ALTER TABLE promotion_namespace_capabilities ADD COLUMN root_edge_incarnation VARCHAR(128) NOT NULL DEFAULT ''`,
+		`ALTER TABLE promotion_namespace_capabilities ADD COLUMN root_children_generation BIGINT UNSIGNED NOT NULL DEFAULT 0`,
 
 		`CREATE TABLE IF NOT EXISTS promotion_import_identity_tenants (
 			tenant_id                    VARCHAR(64) PRIMARY KEY,
@@ -35,6 +41,7 @@ func PromotionTiDBSchemaStatements() []string {
 			installed_database_incarnation VARCHAR(128) NOT NULL DEFAULT '',
 			installed_backup_lineage_id  VARCHAR(128) NOT NULL DEFAULT '',
 			installed_writer_generation  BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			installed_allocation_lease_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			restore_admission_state      VARCHAR(32) NOT NULL DEFAULT 'DISABLED',
 			live_claim_count             BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			materialized_identity_count  BIGINT UNSIGNED NOT NULL DEFAULT 0,
@@ -42,6 +49,7 @@ func PromotionTiDBSchemaStatements() []string {
 			config_generation            BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			updated_at                   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
+		`ALTER TABLE promotion_import_identity_tenants ADD COLUMN installed_allocation_lease_generation BIGINT UNSIGNED NOT NULL DEFAULT 0`,
 
 		`CREATE TABLE IF NOT EXISTS promotion_import_identity_epochs (
 			tenant_id                    VARCHAR(64) NOT NULL,
@@ -54,6 +62,13 @@ func PromotionTiDBSchemaStatements() []string {
 			sealed_at                    DATETIME(3),
 			updated_at                   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			PRIMARY KEY (tenant_id, allocation_epoch)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS promotion_import_identity_global (
+			capacity_key                  VARCHAR(64) PRIMARY KEY,
+			materialized_identity_count  BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			config_generation            BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			updated_at                   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS promotion_import_id_claims (
@@ -137,7 +152,11 @@ func PromotionTiDBSchemaStatements() []string {
 			PRIMARY KEY (tenant_id, allocation_epoch, allocation_sequence),
 			KEY idx_promotion_import_target (tenant_id, target_path_hash, state),
 			KEY idx_promotion_import_worker (tenant_id, state, lease_expires_at),
-			KEY idx_promotion_import_retire (tenant_id, state, retire_after)
+			KEY idx_promotion_import_retire (tenant_id, state, retire_after),
+			CONSTRAINT chk_promotion_import_aborting_owner CHECK (
+				state <> 'ABORTING' OR
+				(cleanup_attempt_id IS NOT NULL AND cleanup_writer_generation IS NOT NULL AND terminal_reason IS NOT NULL)
+			)
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS promotion_import_entries (
@@ -198,6 +217,18 @@ func PromotionTiDBSchemaStatements() []string {
 			KEY idx_promotion_quota_state (tenant_id, state, updated_at)
 		)`,
 
+		`CREATE TABLE IF NOT EXISTS promotion_quota_accounts (
+			tenant_id                    VARCHAR(64) PRIMARY KEY,
+			max_bytes                    BIGINT UNSIGNED NOT NULL,
+			max_files                    BIGINT UNSIGNED NOT NULL,
+			reserved_bytes               BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			reserved_files               BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			committed_bytes              BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			committed_files              BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			config_generation            BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			updated_at                   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+		)`,
+
 		`CREATE TABLE IF NOT EXISTS promotion_import_tombstones (
 			tenant_id                    VARCHAR(64) NOT NULL,
 			allocation_epoch             BIGINT UNSIGNED NOT NULL,
@@ -255,8 +286,14 @@ func PromotionDB9SchemaStatements() []string {
 			database_incarnation VARCHAR(128) NOT NULL DEFAULT '',
 			writer_generation BIGINT NOT NULL DEFAULT 0,
 			admission_state VARCHAR(32) NOT NULL DEFAULT 'DISABLED',
+			root_inode VARCHAR(64) NOT NULL DEFAULT '',
+			root_edge_incarnation VARCHAR(128) NOT NULL DEFAULT '',
+			root_children_generation BIGINT NOT NULL DEFAULT 0,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
+		`ALTER TABLE IF EXISTS promotion_namespace_capabilities ADD COLUMN IF NOT EXISTS root_inode VARCHAR(64) NOT NULL DEFAULT ''`,
+		`ALTER TABLE IF EXISTS promotion_namespace_capabilities ADD COLUMN IF NOT EXISTS root_edge_incarnation VARCHAR(128) NOT NULL DEFAULT ''`,
+		`ALTER TABLE IF EXISTS promotion_namespace_capabilities ADD COLUMN IF NOT EXISTS root_children_generation BIGINT NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS promotion_import_identity_tenants (
 			tenant_id VARCHAR(64) PRIMARY KEY,
 			installed_allocation_epoch BIGINT NOT NULL DEFAULT 0,
@@ -264,6 +301,7 @@ func PromotionDB9SchemaStatements() []string {
 			installed_database_incarnation VARCHAR(128) NOT NULL DEFAULT '',
 			installed_backup_lineage_id VARCHAR(128) NOT NULL DEFAULT '',
 			installed_writer_generation BIGINT NOT NULL DEFAULT 0,
+			installed_allocation_lease_generation BIGINT NOT NULL DEFAULT 0,
 			restore_admission_state VARCHAR(32) NOT NULL DEFAULT 'DISABLED',
 			live_claim_count BIGINT NOT NULL DEFAULT 0,
 			materialized_identity_count BIGINT NOT NULL DEFAULT 0,
@@ -271,6 +309,7 @@ func PromotionDB9SchemaStatements() []string {
 			config_generation BIGINT NOT NULL DEFAULT 0,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
+		`ALTER TABLE IF EXISTS promotion_import_identity_tenants ADD COLUMN IF NOT EXISTS installed_allocation_lease_generation BIGINT NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS promotion_import_identity_epochs (
 			tenant_id VARCHAR(64) NOT NULL,
 			allocation_epoch BIGINT NOT NULL,
@@ -282,6 +321,12 @@ func PromotionDB9SchemaStatements() []string {
 			sealed_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			PRIMARY KEY (tenant_id, allocation_epoch)
+		)`,
+		`CREATE TABLE IF NOT EXISTS promotion_import_identity_global (
+			capacity_key VARCHAR(64) PRIMARY KEY,
+			materialized_identity_count BIGINT NOT NULL DEFAULT 0,
+			config_generation BIGINT NOT NULL DEFAULT 0,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE TABLE IF NOT EXISTS promotion_import_id_claims (
 			tenant_id VARCHAR(64) NOT NULL,
@@ -360,7 +405,11 @@ func PromotionDB9SchemaStatements() []string {
 			retire_after TIMESTAMPTZ,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			PRIMARY KEY (tenant_id, allocation_epoch, allocation_sequence)
+			PRIMARY KEY (tenant_id, allocation_epoch, allocation_sequence),
+			CONSTRAINT chk_promotion_import_aborting_owner CHECK (
+				state <> 'ABORTING' OR
+				(cleanup_attempt_id IS NOT NULL AND cleanup_writer_generation IS NOT NULL AND terminal_reason IS NOT NULL)
+			)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_promotion_import_target ON promotion_imports(tenant_id, target_path_hash, state)`,
 		`CREATE INDEX IF NOT EXISTS idx_promotion_import_worker ON promotion_imports(tenant_id, state, lease_expires_at)`,
@@ -420,6 +469,17 @@ func PromotionDB9SchemaStatements() []string {
 			UNIQUE (tenant_id, allocation_epoch, allocation_sequence)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_promotion_quota_state ON promotion_quota_reservations(tenant_id, state, updated_at)`,
+		`CREATE TABLE IF NOT EXISTS promotion_quota_accounts (
+			tenant_id VARCHAR(64) PRIMARY KEY,
+			max_bytes BIGINT NOT NULL,
+			max_files BIGINT NOT NULL,
+			reserved_bytes BIGINT NOT NULL DEFAULT 0,
+			reserved_files BIGINT NOT NULL DEFAULT 0,
+			committed_bytes BIGINT NOT NULL DEFAULT 0,
+			committed_files BIGINT NOT NULL DEFAULT 0,
+			config_generation BIGINT NOT NULL DEFAULT 0,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
 		`CREATE TABLE IF NOT EXISTS promotion_import_tombstones (
 			tenant_id VARCHAR(64) NOT NULL,
 			allocation_epoch BIGINT NOT NULL,

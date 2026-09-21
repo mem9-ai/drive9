@@ -28,11 +28,13 @@ func TestPromotionSchemaContainsP0DurableFacts(t *testing.T) {
 		"promotion_namespace_capabilities",
 		"promotion_import_identity_tenants",
 		"promotion_import_identity_epochs",
+		"promotion_import_identity_global",
 		"promotion_import_id_claims",
 		"promotion_imports",
 		"promotion_import_entries",
 		"promotion_import_contents",
 		"promotion_quota_reservations",
+		"promotion_quota_accounts",
 		"promotion_import_tombstones",
 		"promotion_retired_import_sequences",
 	}
@@ -68,6 +70,23 @@ func TestPromotionSchemaContainsP0DurableFacts(t *testing.T) {
 					t.Fatalf("promotion_imports missing %s", fact)
 				}
 			}
+			for _, invariant := range []string{"chk_promotion_import_aborting_owner", "state <> 'ABORTING'", "cleanup_attempt_id IS NOT NULL"} {
+				if !strings.Contains(imports, strings.ToLower(invariant)) && !strings.Contains(imports, invariant) {
+					t.Fatalf("promotion_imports missing invariant %s", invariant)
+				}
+			}
+
+			identityTenant := creates["promotion_import_identity_tenants"]
+			if !strings.Contains(identityTenant, "installed_allocation_lease_generation") {
+				t.Fatal("promotion identity tenant missing allocation lease generation")
+			}
+
+			namespace := creates["promotion_namespace_capabilities"]
+			for _, fact := range []string{"root_inode", "root_edge_incarnation", "root_children_generation"} {
+				if !strings.Contains(namespace, fact) {
+					t.Fatalf("promotion_namespace_capabilities missing %s", fact)
+				}
+			}
 
 			for _, table := range []string{
 				"promotion_import_id_claims",
@@ -97,6 +116,12 @@ func TestPromotionSchemaIsIncludedInTiDBInitModes(t *testing.T) {
 			creates := promotionCreateStatements(t, statements)
 			if creates["promotion_imports"] == "" {
 				t.Fatal("tenant init schema omits promotion_imports")
+			}
+			fileNodes := creates["file_nodes"]
+			for _, fact := range []string{"path_edge_incarnation", "children_generation"} {
+				if !strings.Contains(fileNodes, fact) {
+					t.Fatalf("file_nodes missing %s", fact)
+				}
 			}
 		})
 	}

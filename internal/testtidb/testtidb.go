@@ -175,6 +175,19 @@ func ResetMetaDB(t *testing.T, db *sql.DB) {
 }
 
 var resetDeleteQueries = []string{
+	"DELETE FROM promotion_import_contents",
+	"DELETE FROM promotion_import_entries",
+	"DELETE FROM promotion_quota_reservations",
+	"DELETE FROM promotion_quota_accounts",
+	"DELETE FROM promotion_imports",
+	"DELETE FROM promotion_import_tombstones",
+	"DELETE FROM promotion_retired_import_sequences",
+	"DELETE FROM promotion_import_id_claims",
+	"DELETE FROM promotion_import_identity_epochs",
+	"DELETE FROM promotion_import_identity_tenants",
+	"DELETE FROM promotion_import_identity_global",
+	"DELETE FROM promotion_namespace_capabilities",
+	"DELETE FROM promotion_storage_capabilities",
 	"DELETE FROM fs_layer_checkpoints",
 	"DELETE FROM fs_layer_events",
 	"DELETE FROM fs_layer_tags",

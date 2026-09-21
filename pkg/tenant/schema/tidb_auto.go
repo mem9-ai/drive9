@@ -777,12 +777,16 @@ func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfi
 			is_directory BOOLEAN NOT NULL DEFAULT FALSE,
 			file_id      VARCHAR(64),
 			inode_id     VARCHAR(64),
+			path_edge_incarnation VARCHAR(128) NOT NULL DEFAULT '',
+			children_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 		)`,
 		`CREATE UNIQUE INDEX idx_path ON file_nodes(path_hash)`,
 		`CREATE INDEX idx_parent ON file_nodes(parent_path_hash, name)`,
 		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
 		`CREATE INDEX idx_inode_id ON file_nodes(inode_id)`,
+		`ALTER TABLE file_nodes ADD COLUMN path_edge_incarnation VARCHAR(128) NOT NULL DEFAULT ''`,
+		`ALTER TABLE file_nodes ADD COLUMN children_generation BIGINT UNSIGNED NOT NULL DEFAULT 0`,
 
 		`CREATE TABLE IF NOT EXISTS inodes (
 			inode_id     VARCHAR(64) PRIMARY KEY,
