@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -161,6 +162,19 @@ func TestPromotionMetadataOnlyVerifyDirectlyFromCreated(t *testing.T) {
 type promotionCountingReader struct {
 	reads int
 	body  io.Reader
+}
+
+type promotionBlockingReader struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	body    io.Reader
+}
+
+func (r *promotionBlockingReader) Read(p []byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return r.body.Read(p)
 }
 
 func (r *promotionCountingReader) Read(p []byte) (int, error) {
@@ -350,6 +364,190 @@ func TestPromotionContentMutationsAreAuthorizedAndWriterFenced(t *testing.T) {
 	}
 	if _, err := promotionStore.VerifyImport(context.Background(), verify); !errors.Is(err, ErrPromotionRestoreFenced) {
 		t.Fatalf("old writer protocol verify error = %v, want ErrPromotionRestoreFenced", err)
+	}
+}
+
+func TestPromotionContentMutationLookupDoesNotDiscloseImportExistence(t *testing.T) {
+	_, promotionStore, created, manifest := createPromotionImportForContent(t, []promotion.ManifestEntry{
+		{RelativePath: "file", Type: promotion.EntryTypeFile, Mode: 0o644, ExpectedSizeBytes: 5, ExpectedChecksumSHA256: promotionTestHash("hello")},
+	}, "allocate-content-nondisclosure")
+	authorizer := promotionStore.cfg.Authorizer.(*promotionTestAuthorizer)
+	authorizer.mu.Lock()
+	authorizer.denied = true
+	authorizer.mu.Unlock()
+
+	deniedReader := &promotionCountingReader{body: bytes.NewBufferString("hello")}
+	deniedPut := inlineContentRequest(created, manifest[0], "put-denied", deniedReader)
+	if _, err := promotionStore.PutInlineImportContent(context.Background(), deniedPut); err != ErrNotFound {
+		t.Fatalf("existing denied PutInlineImportContent error = %v, want canonical ErrNotFound", err)
+	}
+	if deniedReader.reads != 0 {
+		t.Fatalf("existing denied body reads = %d, want 0", deniedReader.reads)
+	}
+	deniedVerify := PromotionVerifyRequest{
+		TenantID: "tenant-a", MigrationID: created.MigrationID, OwnerEpoch: created.OwnerEpoch,
+		OwnerToken: "owner-token", WriterLease: "writer-lease", ManifestHash: created.ManifestHash,
+	}
+	if _, err := promotionStore.VerifyImport(context.Background(), deniedVerify); err != ErrNotFound {
+		t.Fatalf("existing denied VerifyImport error = %v, want canonical ErrNotFound", err)
+	}
+
+	authorizer.mu.Lock()
+	authorizer.denied = false
+	authorizer.mu.Unlock()
+	unknownID, err := promotion.EncodeMigrationID(promotion.MigrationIdentity{
+		AllocationEpoch: created.AllocationEpoch, AllocationSequence: created.AllocationSequence + 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownReader := &promotionCountingReader{body: bytes.NewBufferString("hello")}
+	unknownPut := inlineContentRequest(created, manifest[0], "put-unknown", unknownReader)
+	unknownPut.MigrationID = unknownID
+	if _, err := promotionStore.PutInlineImportContent(context.Background(), unknownPut); err != ErrNotFound {
+		t.Fatalf("unknown PutInlineImportContent error = %v, want canonical ErrNotFound", err)
+	}
+	if unknownReader.reads != 0 {
+		t.Fatalf("unknown body reads = %d, want 0", unknownReader.reads)
+	}
+	unknownVerify := deniedVerify
+	unknownVerify.MigrationID = unknownID
+	if _, err := promotionStore.VerifyImport(context.Background(), unknownVerify); err != ErrNotFound {
+		t.Fatalf("unknown VerifyImport error = %v, want canonical ErrNotFound", err)
+	}
+
+	// The canonical response does not hide a broken allow path: the same
+	// authorized request must still reach the content transaction.
+	allowed := inlineContentRequest(created, manifest[0], "put-allowed", bytes.NewBufferString("hello"))
+	if _, err := promotionStore.PutInlineImportContent(context.Background(), allowed); err != nil {
+		t.Fatalf("authorized PutInlineImportContent: %v", err)
+	}
+}
+
+func TestPromotionInlineBodyReadDoesNotHoldRestoreOrImportLocks(t *testing.T) {
+	store, promotionStore, created, manifest := createPromotionImportForContent(t, []promotion.ManifestEntry{
+		{RelativePath: "file", Type: promotion.EntryTypeFile, Mode: 0o644, ExpectedSizeBytes: 5, ExpectedChecksumSHA256: promotionTestHash("hello")},
+	}, "allocate-content-blocked-reader")
+	var databaseNow time.Time
+	if err := store.DB().QueryRow(`SELECT CURRENT_TIMESTAMP(3)`).Scan(&databaseNow); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE promotion_imports
+		SET activity_deadline = ?
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		databaseNow.Add(150*time.Millisecond), created.AllocationEpoch, created.AllocationSequence); err != nil {
+		t.Fatal(err)
+	}
+	reader := &promotionBlockingReader{
+		started: make(chan struct{}), release: make(chan struct{}), body: bytes.NewBufferString("hello"),
+	}
+	request := inlineContentRequest(created, manifest[0], "put-blocked-reader", reader)
+	result := make(chan error, 1)
+	go func() {
+		_, err := promotionStore.PutInlineImportContent(context.Background(), request)
+		result <- err
+	}()
+	select {
+	case <-reader.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("PutInlineImportContent did not reach body read")
+	}
+	time.Sleep(250 * time.Millisecond)
+	updateCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := store.DB().ExecContext(updateCtx, `UPDATE promotion_namespace_capabilities
+		SET admission_state = 'DRAINING' WHERE tenant_id = 'tenant-a'`); err != nil {
+		t.Fatalf("restore fence could not advance while body stalled: %v", err)
+	}
+	close(reader.release)
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrPromotionRestoreFenced) {
+			t.Fatalf("stalled PutInlineImportContent error = %v, want ErrPromotionRestoreFenced", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PutInlineImportContent did not finish after body release")
+	}
+	var contents, bindings int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_import_contents
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		created.AllocationEpoch, created.AllocationSequence).Scan(&contents); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM promotion_import_entries
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?
+		  AND import_content_id IS NOT NULL`, created.AllocationEpoch, created.AllocationSequence).Scan(&bindings); err != nil {
+		t.Fatal(err)
+	}
+	if contents != 0 || bindings != 0 {
+		t.Fatalf("stalled/fenced Put mutations = content %d, bindings %d; want 0/0", contents, bindings)
+	}
+}
+
+func TestPromotionVerifyUsesFreshDatabaseTimeAtFinalCAS(t *testing.T) {
+	store, promotionStore, created, manifest := createPromotionImportForContent(t, []promotion.ManifestEntry{
+		{RelativePath: "file", Type: promotion.EntryTypeFile, Mode: 0o644, ExpectedSizeBytes: 5, ExpectedChecksumSHA256: promotionTestHash("hello")},
+	}, "allocate-verify-final-time")
+	if _, err := promotionStore.PutInlineImportContent(context.Background(), inlineContentRequest(created, manifest[0], "put-file", bytes.NewBufferString("hello"))); err != nil {
+		t.Fatal(err)
+	}
+	var databaseNow time.Time
+	if err := store.DB().QueryRow(`SELECT CURRENT_TIMESTAMP(3)`).Scan(&databaseNow); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE promotion_imports
+		SET activity_deadline = ?
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		databaseNow.Add(1500*time.Millisecond), created.AllocationEpoch, created.AllocationSequence); err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := store.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback() }()
+	var contentID string
+	if err := blocker.QueryRow(`SELECT import_content_id FROM promotion_import_contents
+		WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ? FOR UPDATE`,
+		created.AllocationEpoch, created.AllocationSequence).Scan(&contentID); err != nil {
+		t.Fatal(err)
+	}
+	verifyResult := make(chan error, 1)
+	go func() {
+		_, err := promotionStore.VerifyImport(context.Background(), PromotionVerifyRequest{
+			TenantID: "tenant-a", MigrationID: created.MigrationID, OwnerEpoch: created.OwnerEpoch,
+			OwnerToken: "owner-token", WriterLease: "writer-lease", ManifestHash: created.ManifestHash,
+		})
+		verifyResult <- err
+	}()
+	// The held content row makes a pre-deadline Verify wait after its initial
+	// guard. Keeping it held past the deadline distinguishes the final-time
+	// CAS check from a transaction-start-only implementation.
+	select {
+	case err := <-verifyResult:
+		t.Fatalf("VerifyImport returned before content-row lock release: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if err := blocker.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-verifyResult:
+		if !errors.Is(err, ErrPromotionDeadlineExceeded) {
+			t.Fatalf("VerifyImport after deadline error = %v, want ErrPromotionDeadlineExceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("VerifyImport did not finish after content-row lock release")
+	}
+	var state, attemptID, reason string
+	if err := store.DB().QueryRow(`SELECT state, cleanup_attempt_id, terminal_reason
+		FROM promotion_imports WHERE tenant_id = 'tenant-a' AND allocation_epoch = ? AND allocation_sequence = ?`,
+		created.AllocationEpoch, created.AllocationSequence).Scan(&state, &attemptID, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if state != "ABORTING" || attemptID == "" || reason != "activity_deadline_exceeded" {
+		t.Fatalf("Verify deadline cleanup = %s/%q/%q, want ABORTING/nonempty/activity_deadline_exceeded", state, attemptID, reason)
 	}
 }
 

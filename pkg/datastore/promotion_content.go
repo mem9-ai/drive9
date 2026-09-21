@@ -17,7 +17,8 @@ import (
 
 // PromotionInlineContentRequest is the bounded DB-inline content mutation for
 // one already-persisted regular-file manifest entry. Body is not read until
-// the stored target has been authorized and the entry tuple is locked.
+// the stored target and entry tuple have been checked; no database lock is
+// held while the caller-controlled Reader is consumed.
 type PromotionInlineContentRequest struct {
 	TenantID       string
 	MigrationID    string
@@ -118,16 +119,56 @@ func (s *PromotionStore) PutInlineImportContent(ctx context.Context, req Promoti
 	if err != nil || relativePath != req.RelativePath {
 		return nil, ErrPromotionConflict
 	}
-	target, err := s.readPromotionMutationTarget(ctx, req.TenantID, identity)
+	target, err := s.authorizePromotionMutationTarget(ctx, req.TenantID, identity)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.cfg.Authorizer.AuthorizePromotionWrite(ctx, req.TenantID, target); err != nil {
+
+	// Check the complete stored tuple before accepting a body, then release
+	// every database lock. A slow or malicious reader must not prevent the
+	// deadline scanner or restore controller from acquiring their locks. The
+	// final transaction repeats every check after the body is complete.
+	deadlineWon, err := s.preflightPromotionInlineContent(ctx, req, identity, target)
+	if err != nil {
+		return nil, err
+	}
+	if deadlineWon {
+		return nil, ErrPromotionDeadlineExceeded
+	}
+	body, err := io.ReadAll(io.LimitReader(req.Body, int64(req.SizeBytes)+1))
+	if err != nil {
+		return nil, fmt.Errorf("read promotion inline content: %w", err)
+	}
+	if uint64(len(body)) != req.SizeBytes || promotionHashBytes(body) != req.ChecksumSHA256 {
+		return nil, ErrPromotionConflict
+	}
+	confirmedTarget, err := s.authorizePromotionMutationTarget(ctx, req.TenantID, identity)
+	if err != nil {
+		return nil, err
+	}
+	if confirmedTarget != target {
+		return nil, ErrPromotionRecoveryRequired
+	}
+	requestDigest, err := promotionJSONHash(struct {
+		Version        string `json:"version"`
+		TenantID       string `json:"tenant_id"`
+		MigrationID    string `json:"migration_id"`
+		RelativePath   string `json:"relative_path"`
+		EntryHash      string `json:"entry_hash"`
+		SizeBytes      uint64 `json:"size_bytes"`
+		ChecksumSHA256 string `json:"checksum_sha256"`
+		IdempotencyKey string `json:"idempotency_key"`
+	}{
+		Version: "p1", TenantID: req.TenantID, MigrationID: req.MigrationID,
+		RelativePath: relativePath, EntryHash: req.EntryHash,
+		SizeBytes: req.SizeBytes, ChecksumSHA256: req.ChecksumSHA256, IdempotencyKey: req.IdempotencyKey,
+	})
+	if err != nil {
 		return nil, err
 	}
 
 	var out *PromotionInlineContent
-	deadlineWon := false
+	deadlineWon = false
 	err = s.store.InTx(ctx, func(tx *sql.Tx) error {
 		tenant, namespace, now, err := s.lockPromotionMutationGuard(ctx, tx, req.TenantID, req.WriterLease)
 		if err != nil {
@@ -153,33 +194,13 @@ func (s *PromotionStore) PutInlineImportContent(ctx context.Context, req Promoti
 		if !now.Before(importRow.leaseExpiresAt) {
 			return ErrPromotionConflict
 		}
-		if importRow.storageMode != string(promotion.StorageModeDB9Inline) || importRow.inlineThreshold == 0 ||
-			req.SizeBytes >= importRow.inlineThreshold || req.SizeBytes > math.MaxInt64 {
-			return promotion.ErrStorageBackendUnsupported
-		}
-		if importRow.state != "CREATED" && importRow.state != "STAGING" && importRow.state != "VERIFIED" {
-			return ErrPromotionConflict
-		}
-
-		entry, err := lockPromotionEntryTx(ctx, tx, req.TenantID, identity, relativePath)
+		entry, err := validatePromotionInlineTupleTx(ctx, tx, req, identity, importRow)
 		if err != nil {
 			return err
 		}
-		if entry.entryType != promotion.EntryTypeFile || entry.entryHash != req.EntryHash ||
-			entry.expectedSize != req.SizeBytes || entry.expectedChecksum != req.ChecksumSHA256 {
-			return ErrPromotionConflict
-		}
-		if err := validatePromotionReservationTx(ctx, tx, req.TenantID, importRow); err != nil {
-			return err
-		}
-
-		body, err := io.ReadAll(io.LimitReader(req.Body, int64(entry.expectedSize)+1))
-		if err != nil {
-			return fmt.Errorf("read promotion inline content: %w", err)
-		}
-		if uint64(len(body)) != entry.expectedSize || promotionHashBytes(body) != entry.expectedChecksum {
-			return ErrPromotionConflict
-		}
+		// Tuple/reservation reads above are intentionally before this second
+		// database-time sample. The state CAS is the deadline winner, not the
+		// transaction start timestamp.
 		finishedAt, err := promotionDatabaseTime(ctx, tx)
 		if err != nil {
 			return err
@@ -196,24 +217,6 @@ func (s *PromotionStore) PutInlineImportContent(ctx context.Context, req Promoti
 		}
 		if !finishedAt.Before(importRow.leaseExpiresAt) {
 			return ErrPromotionConflict
-		}
-
-		requestDigest, err := promotionJSONHash(struct {
-			Version        string `json:"version"`
-			TenantID       string `json:"tenant_id"`
-			MigrationID    string `json:"migration_id"`
-			RelativePath   string `json:"relative_path"`
-			EntryHash      string `json:"entry_hash"`
-			SizeBytes      uint64 `json:"size_bytes"`
-			ChecksumSHA256 string `json:"checksum_sha256"`
-			IdempotencyKey string `json:"idempotency_key"`
-		}{
-			Version: "p1", TenantID: req.TenantID, MigrationID: req.MigrationID,
-			RelativePath: relativePath, EntryHash: req.EntryHash,
-			SizeBytes: req.SizeBytes, ChecksumSHA256: req.ChecksumSHA256, IdempotencyKey: req.IdempotencyKey,
-		})
-		if err != nil {
-			return err
 		}
 		existing, err := selectPromotionContentByIdempotencyTx(ctx, tx, req.TenantID, identity, req.IdempotencyKey)
 		if err == nil {
@@ -309,11 +312,8 @@ func (s *PromotionStore) VerifyImport(ctx context.Context, req PromotionVerifyRe
 	if err != nil {
 		return nil, ErrNotFound
 	}
-	target, err := s.readPromotionMutationTarget(ctx, req.TenantID, identity)
+	target, err := s.authorizePromotionMutationTarget(ctx, req.TenantID, identity)
 	if err != nil {
-		return nil, err
-	}
-	if err := s.cfg.Authorizer.AuthorizePromotionWrite(ctx, req.TenantID, target); err != nil {
 		return nil, err
 	}
 
@@ -370,6 +370,26 @@ func (s *PromotionStore) VerifyImport(ctx context.Context, req PromotionVerifyRe
 		if err := validatePromotionCompleteManifest(importRow, entries, contents); err != nil {
 			return err
 		}
+		// Verification may scan and hash a bounded tree. Sample database time
+		// again immediately before the state CAS so an already-expired worker
+		// cannot win with the transaction-start timestamp.
+		finishedAt, err := promotionDatabaseTime(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !finishedAt.Before(importRow.activityDeadline) {
+			if err := s.transitionPromotionDeadlineTx(ctx, tx, req.TenantID, importRow, namespace.writerGeneration); err != nil {
+				return err
+			}
+			deadlineWon = true
+			return nil
+		}
+		if err := s.requirePromotionNormalWriterLease(ctx, req.TenantID, req.WriterLease, tenant, namespace, finishedAt); err != nil {
+			return err
+		}
+		if !finishedAt.Before(importRow.leaseExpiresAt) {
+			return ErrPromotionConflict
+		}
 		advanced, err := tx.ExecContext(ctx, `UPDATE promotion_imports
 			SET state = 'VERIFIED', state_version = state_version + 1
 			WHERE tenant_id = ? AND allocation_epoch = ? AND allocation_sequence = ?
@@ -407,6 +427,82 @@ func (s *PromotionStore) readPromotionMutationTarget(ctx context.Context, tenant
 		return "", fmt.Errorf("resolve promotion mutation target: %w", err)
 	}
 	return target, nil
+}
+
+// authorizePromotionMutationTarget deliberately maps an existing but
+// out-of-scope import to the same public result as an unknown import. Content
+// continuation APIs must not be usable as migration-ID existence oracles.
+func (s *PromotionStore) authorizePromotionMutationTarget(ctx context.Context, tenantID string, identity promotion.MigrationIdentity) (string, error) {
+	target, err := s.readPromotionMutationTarget(ctx, tenantID, identity)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	if err := s.cfg.Authorizer.AuthorizePromotionWrite(ctx, tenantID, target); err != nil {
+		return "", ErrNotFound
+	}
+	return target, nil
+}
+
+// preflightPromotionInlineContent rejects an invalid stored tuple before
+// reading the request body. Its transaction is intentionally short-lived:
+// every lock is released before calling Reader.Read, and the mutation
+// transaction repeats all checks after the body is complete.
+func (s *PromotionStore) preflightPromotionInlineContent(ctx context.Context, req PromotionInlineContentRequest, identity promotion.MigrationIdentity, target string) (bool, error) {
+	deadlineWon := false
+	err := s.store.InTx(ctx, func(tx *sql.Tx) error {
+		tenant, namespace, now, err := s.lockPromotionMutationGuard(ctx, tx, req.TenantID, req.WriterLease)
+		if err != nil {
+			return err
+		}
+		importRow, err := s.lockPromotionOwnerImport(ctx, tx, req.TenantID, identity)
+		if err != nil {
+			return err
+		}
+		if err := validatePromotionOwnerMutation(importRow, tenant, namespace, req.OwnerEpoch, req.OwnerToken); err != nil {
+			return err
+		}
+		if importRow.target != target {
+			return ErrPromotionRecoveryRequired
+		}
+		if !now.Before(importRow.activityDeadline) {
+			if err := s.transitionPromotionDeadlineTx(ctx, tx, req.TenantID, importRow, namespace.writerGeneration); err != nil {
+				return err
+			}
+			deadlineWon = true
+			return nil
+		}
+		if !now.Before(importRow.leaseExpiresAt) {
+			return ErrPromotionConflict
+		}
+		_, err = validatePromotionInlineTupleTx(ctx, tx, req, identity, importRow)
+		return err
+	})
+	return deadlineWon, err
+}
+
+func validatePromotionInlineTupleTx(ctx context.Context, tx *sql.Tx, req PromotionInlineContentRequest, identity promotion.MigrationIdentity, importRow *promotionOwnerImport) (*promotionEntryRow, error) {
+	if importRow.storageMode != string(promotion.StorageModeDB9Inline) || importRow.inlineThreshold == 0 ||
+		req.SizeBytes >= importRow.inlineThreshold || req.SizeBytes > math.MaxInt64 {
+		return nil, promotion.ErrStorageBackendUnsupported
+	}
+	if importRow.state != "CREATED" && importRow.state != "STAGING" && importRow.state != "VERIFIED" {
+		return nil, ErrPromotionConflict
+	}
+	entry, err := lockPromotionEntryTx(ctx, tx, req.TenantID, identity, req.RelativePath)
+	if err != nil {
+		return nil, err
+	}
+	if entry.entryType != promotion.EntryTypeFile || entry.entryHash != req.EntryHash ||
+		entry.expectedSize != req.SizeBytes || entry.expectedChecksum != req.ChecksumSHA256 {
+		return nil, ErrPromotionConflict
+	}
+	if err := validatePromotionReservationTx(ctx, tx, req.TenantID, importRow); err != nil {
+		return nil, err
+	}
+	return entry, nil
 }
 
 func (s *PromotionStore) lockPromotionMutationGuard(ctx context.Context, tx *sql.Tx, tenantID, writerLease string) (promotionIdentityTenant, promotionNamespaceCapability, time.Time, error) {
