@@ -356,6 +356,10 @@ owner_epoch (0 until returned or recovered from GetImport)
 owner_token
 recovery_token
 activity_deadline (unset until returned or recovered from GetImport)
+accepted_server_tuple (restore generation, database incarnation)
+server_observation (import state, terminal-result digest when terminal,
+                    restore generation, database incarnation)
+restore_disposition (`NONE`, `RESTORE_SOURCE`, or `RECOVERY_REQUIRED`)
 fence_state (`INSTALLING` or `INSTALLED`)
 phase
 created_at
@@ -369,6 +373,19 @@ sequence. The record and its allocation, owner, and recovery tokens are private
 mode `0600` state. Recovery accepts only a complete record whose manifest hash
 matches; it never assumes the pair was atomically written.
 
+The record checksum covers the accepted tuple, complete server observation,
+restore disposition, and phase. `STAGING` and later require the accepted tuple
+returned by the successful or recovered `CreateImport`. A terminal observation
+requires its immutable terminal-result digest. `REMOTE_COMMITTED` and later
+require a complete `COMMITTED` observation whose tuple and digest were written
+in the same record rewrite that advanced the phase. If a later emergency
+restore supersedes that observation, the coordinator does not regress the
+physical phase: it atomically records the newer observation plus
+`RESTORE_SOURCE` or `RECOVERY_REQUIRED` and fsyncs it before touching the source
+or quarantine. A phase that requires one of these facts but has a missing,
+zero, corrupt, or mismatched field is fail-closed recovery state, not an old
+success that may be reused.
+
 Per-content staging progress is a checksummed, fsynced journal in the same
 private state directory. P0 records the relative content identity, hash, size,
 and random inline-content idempotency key before `PutInlineImportContent`, then
@@ -381,10 +398,10 @@ replacement side effect.
 The initial record contains the allocation sequence/proof, canonical target,
 expected absence, and exact create-request digest. After a successful or
 recovered `CreateImport`, the coordinator rewrites and fsyncs the record with
-the server precondition digest and owner epoch and advances the local phase to
-`STAGING` before sending content. The target-precondition digest is for
-reconciliation only; the server always uses its own stored namespace facts at
-commit.
+the server precondition digest, owner epoch, and accepted server tuple, and
+advances the local phase to `STAGING` before sending content. The target-
+precondition digest is for reconciliation only; the server always uses its own
+stored namespace facts at commit.
 
 Phases are monotonic:
 
@@ -401,6 +418,14 @@ PREPARED
 ```
 
 No phase transition relies only on an in-memory flag.
+
+Every accepted-state or terminal response is an input to a durable local
+transition, not permission to mutate local data directly. Before that response
+can advance a phase or disposition, the coordinator writes the full server
+observation (including restore tuple and terminal-result digest when present)
+together with the new phase/disposition, fsyncs the record file, atomically
+renames it, and fsyncs the state directory. A crash before the directory fsync
+leaves the earlier phase authoritative; recovery queries `GetImport` again.
 
 `fence_state` is an orthogonal local durability field, not a server phase. A
 complete record first becomes durable with `fence_state=INSTALLING`; recovery
@@ -450,6 +475,12 @@ a later promotion may safely reuse that object's UUID with a new migration ID.
 and target paths remain fenced and fail closed. A retry of the same
 `(source identity, source path, target path)` resumes the existing migration ID.
 
+A `COMMITTED` response does not authorize quarantine directly. The coordinator
+first persists `phase=REMOTE_COMMITTED`, `restore_disposition=NONE`, the exact
+`COMMITTED` result digest, and its restore generation/database incarnation in
+one checksummed record rewrite and completes the file and directory fsyncs.
+Only that durable phase-result binding may authorize the quarantine rename.
+
 After remote commit, the coordinator atomically renames the physical local
 source into a migration-owned quarantine on the same filesystem:
 
@@ -457,10 +488,19 @@ source into a migration-owned quarantine on the same filesystem:
 overlay/.drive9-promotions/<migration_id>/source
 ```
 
-It then fsyncs the old parent, quarantine parent, and migration record. Cleanup
-uses the quarantine identity and never deletes by the old user path. The old
-path may therefore be recreated as a new generation after the fence is
-released without being hidden or deleted by the old migration.
+It then fsyncs the old parent and quarantine parent, rewrites
+`phase=SOURCE_QUARANTINED` while preserving the exact phase-result tuple and
+digest, and fsyncs the record and state directory. Cleanup uses the quarantine
+identity and never deletes by the old user path. Before each irreversible
+quarantine deletion pass, it obtains a fresh authorized `GetImport`, requires
+the same `COMMITTED` digest and restore tuple, persists that revalidation, and
+fsyncs it. A newer restore tuple or changed result is persisted first as
+`RESTORE_SOURCE`/`RECOVERY_REQUIRED` and forbids deletion. The old path may
+therefore be recreated as a new generation after the fence is released without
+being hidden or deleted by the old migration. A disaster restore that occurs
+after a completed same-tuple cleanup remains subject to the explicitly declared
+restore-point RPO; the client never hides that loss by applying an unbound old
+result after restart.
 
 ### Server API sketch
 
@@ -516,9 +556,10 @@ AcknowledgeImportResult(migration_id, recovery_token,
 Every method is idempotent for the same migration identity and payload. Reuse
 with different target, manifest, or content returns conflict.
 Every accepted-state and terminal response, including `GetImport`, carries the
-installed restore generation and database incarnation. They are response
-metadata common to the authenticated tenant, not an existence distinction, so
-unknown/denied responses preserve the non-disclosure contract below.
+installed restore generation and database incarnation; every terminal response
+also carries the immutable terminal-result digest. They are response metadata
+common to the authenticated tenant, not an existence distinction, so unknown/
+denied responses preserve the non-disclosure contract below.
 `PlanImport` is side-effect free: it validates the complete bounded canonical
 manifest but creates no import row, reservation, object, or cleanup debt. P0 is
 an absent-target-only protocol: both `PlanImport` and `CreateImport` require
@@ -1972,6 +2013,18 @@ described above; a generation mismatch plus an unprovable source/target outcome
 is `promotion_recovery_required` for those paths, never permission to reuse the
 old result.
 
+Recovery validates the record's phase-result binding before interpreting the
+phase. `REMOTE_COMMITTED`, `SOURCE_QUARANTINED`, `LOCAL_CLEANED`, and `DONE`
+must carry the complete durable `COMMITTED` observation—state, terminal-result
+digest, restore generation, and database incarnation—that justified the phase.
+Missing or corrupt accepted/result tuples keep both prefixes fenced. Recovery
+then performs an authorized `GetImport`: an exact tuple+digest match may resume
+the recorded local action, while a newer tuple or different result is first
+written and directory-fsynced with `RESTORE_SOURCE` or `RECOVERY_REQUIRED`.
+Only after that durable rewrite may recovery restore a matching quarantine;
+it never deletes or hides source state based on an observation that exists only
+in process memory.
+
 The server state is authoritative for publish and accounting outcome:
 
 | `GetImport` result | Client authority and fence | Server resources and next action | Local-record disposition |
@@ -2003,8 +2056,8 @@ record fails the mount closed.
 | `STAGING` | Reconcile owner epoch and server state before uploading or aborting. |
 | `STAGED_VERIFIED` | Reconcile before commit; do not mutate the frozen manifest. |
 | `COMMIT_REQUESTED` | Query `GetImport`; never retry with a new migration ID or infer failure from disconnect. |
-| `REMOTE_COMMITTED` | If the server restore tuple still matches, verify the durable source-incarnation UUID before quarantine and never roll back the target. If a newer emergency-restore generation returns `promotion_restore_rolled_back`, do not perform destructive cleanup; apply the restore-point rule and retain/restore only the matching source. |
-| `SOURCE_QUARANTINED` | With the matching server restore tuple, target is authoritative and a janitor removes only the matching migration-owned quarantine identity. With a newer rolled-back generation, atomically restore only that matching quarantine if the destination remains safe; otherwise keep the affected paths fenced/recovery-required. |
+| `REMOTE_COMMITTED` | Require the complete durable phase-result binding, fetch `GetImport`, and proceed only if its `COMMITTED` digest and restore tuple still match. Then verify the source-incarnation UUID before quarantine. If a newer emergency-restore generation returns `promotion_restore_rolled_back`, first fsync that observation/disposition and retain or restore only the matching source; never perform destructive cleanup from the old result. |
+| `SOURCE_QUARANTINED` | Require the same complete binding and fresh matching server result before cleanup. A janitor removes only the matching migration-owned quarantine identity after persisting that revalidation. With a newer rolled-back generation, first fsync the superseding observation, then atomically restore only that matching quarantine if the destination remains safe; otherwise keep the affected paths fenced/recovery-required. |
 | Manifest/record/proof/token missing, corrupt, or mismatched | Fail closed and require repair; do not guess, take over, or delete either tree. |
 
 Once the server reports committed, old uploaders and recovery attempts cannot
@@ -2185,9 +2238,14 @@ Kill and restart before and after:
 - durable `COMMIT_REQUESTED` before request send;
 - server commit;
 - successful commit with lost response;
+- receipt of a `COMMITTED` response before record rewrite, after temporary-file
+  fsync, after record rename, before/after the state-directory fsync that binds
+  its result digest and restore tuple to `REMOTE_COMMITTED`;
 - remote commit followed by local quarantine fsync failure;
-- local source quarantine;
-- physical local deletion;
+- before/after local source quarantine rename, both parent fsyncs, and the
+  `SOURCE_QUARANTINED` record+directory fsync;
+- fresh pre-delete `GetImport`, durable same-result revalidation, and physical
+  local deletion;
 - inode/cache publication.
 
 Before any future external-object adapter is enabled, additionally kill and
@@ -2282,9 +2340,18 @@ tree. Repeated recovery is idempotent.
   state must fail. The same fixtures demonstrate that future external-object
   mode is rejected before restore-reconciliation admission;
 - local recovery receives a newer restore generation after a post-restore-
-  point client-owned import was rolled back. It keeps or restores only the
-  matching source/quarantine. If neither side is provable, only those paths
+  point client-owned import was rolled back. The fixture injects the newer
+  response before the result-record temp write, after its file fsync, after its
+  rename but before directory fsync, after durable `REMOTE_COMMITTED`, on both
+  sides of the quarantine rename/parent fsyncs, after durable
+  `SOURCE_QUARANTINED`, and before physical deletion. It keeps or restores only
+  the matching source/quarantine. If neither side is provable, only those paths
   remain recovery-required while a fully reconciled tenant can activate;
+- the same fixture deletes the accepted/result restore tuple, terminal-result
+  digest, or their checksum binding, and separately moves quarantine/deletion
+  before the corresponding record+directory fsync. Each mutation must either
+  expose an unbound old success or destroy rolled-back source state and make the
+  test fail;
 - unrelated target-parent sibling mutation conservatively returns
   `target_precondition_changed`/`EAGAIN` in P0 while the requested child remains
   absent; it never masquerades as `EEXIST`;
@@ -2603,6 +2670,10 @@ external-object adapter:
   single not-found lookup as terminal makes the delayed-create barrier fail;
 - `COMMIT_REQUESTED` with an unreachable server blocks only the affected paths
   or fails the mount closed;
+- `REMOTE_COMMITTED` and later phases with a missing/corrupt accepted tuple,
+  server-observation tuple, or terminal-result digest fail closed before
+  quarantine or cleanup. A same-tuple restart resumes, while a newer restore
+  tuple is durably recorded before restoring/quarantining/deleting anything;
 - successful publish followed immediately by recreating the old path creates a
   new source-incarnation UUID that quarantine cleanup cannot hide or delete;
 - a fake local filesystem reuses the same `(st_dev, st_ino)` after
@@ -2687,6 +2758,10 @@ Tests must fail when independently deleting:
 - the `RESTORE_RECONCILE` allowlist, new-incarnation guard, exact restored
   attempt binding, client-owned rollback result, commit replay, cleanup replay,
   zero-nonterminal audit, and local restore-generation mismatch handling;
+- the local record's accepted/result restore tuple and terminal-result digest,
+  their checksum binding to phase/disposition, record+directory fsync before
+  quarantine or deletion, and fresh same-tuple revalidation before irreversible
+  quarantine cleanup;
 - full tenant-database PITR after a post-snapshot allocation must not alias the
   old proof with a new operation, even when the restored database is internally
   self-consistent and reuses the same numeric sequence;
