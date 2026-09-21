@@ -77,8 +77,24 @@ func TestPromotionSchemaContainsP0DurableFacts(t *testing.T) {
 			}
 
 			identityTenant := creates["promotion_import_identity_tenants"]
-			if !strings.Contains(identityTenant, "installed_allocation_lease_generation") {
-				t.Fatal("promotion identity tenant missing allocation lease generation")
+			for _, fact := range []string{
+				"installed_allocation_lease_generation",
+				"max_live_claims",
+				"max_materialized_identities",
+				"max_sequence_window",
+				"allocation_rate_per_minute",
+				"allocation_rate_burst",
+				"config_generation",
+			} {
+				if !strings.Contains(identityTenant, fact) {
+					t.Fatalf("promotion identity tenant missing %s", fact)
+				}
+			}
+			identityGlobal := creates["promotion_import_identity_global"]
+			for _, fact := range []string{"max_materialized_identities", "config_generation"} {
+				if !strings.Contains(identityGlobal, fact) {
+					t.Fatalf("promotion identity global missing %s", fact)
+				}
 			}
 
 			namespace := creates["promotion_namespace_capabilities"]

@@ -1,6 +1,7 @@
 package promotion
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -17,6 +18,7 @@ import (
 const (
 	migrationIDVersion = "p1"
 	encodedUint64Len   = 13
+	defaultProofKeyID  = "k1"
 )
 
 var migrationBase32 = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -74,14 +76,44 @@ type AllocationProofClaims struct {
 	CreateBeforeUnixMilli        int64  `json:"create_before_unix_milli"`
 }
 
-// ProofSigner signs and verifies bounded allocation proofs.
-type ProofSigner struct{ key []byte }
+// ProofSigner signs bounded allocation proofs with one active key and verifies
+// them with a versioned keyring. Verification keys must remain installed for
+// the documented allocation/terminal recovery window so key rotation does not
+// invalidate an accepted proof or change exact retry bytes.
+type ProofSigner struct {
+	signingKeyID string
+	signingKey   []byte
+	verifyKeys   map[string][]byte
+}
 
 func NewProofSigner(secret []byte) (*ProofSigner, error) {
-	if len(secret) < sha256.Size {
-		return nil, fmt.Errorf("%w: proof signing secret must contain at least %d bytes", ErrInvalidAllocationProof, sha256.Size)
+	return NewProofSignerWithKeyring(defaultProofKeyID, secret, nil)
+
+}
+
+// NewProofSignerWithKeyring constructs a signer with an explicit active key
+// version and retained verification-only keys. The active key is always added
+// to the verification keyring; a conflicting duplicate is rejected.
+func NewProofSignerWithKeyring(signingKeyID string, signingKey []byte, verificationKeys map[string][]byte) (*ProofSigner, error) {
+	if !validProofKeyID(signingKeyID) || len(signingKey) < sha256.Size {
+		return nil, fmt.Errorf("%w: proof signing key requires a canonical id and at least %d bytes", ErrInvalidAllocationProof, sha256.Size)
 	}
-	return &ProofSigner{key: append([]byte(nil), secret...)}, nil
+	keys := make(map[string][]byte, len(verificationKeys)+1)
+	for keyID, key := range verificationKeys {
+		if !validProofKeyID(keyID) || len(key) < sha256.Size {
+			return nil, fmt.Errorf("%w: invalid verification key %q", ErrInvalidAllocationProof, keyID)
+		}
+		keys[keyID] = append([]byte(nil), key...)
+	}
+	if existing, ok := keys[signingKeyID]; ok && !bytes.Equal(existing, signingKey) {
+		return nil, fmt.Errorf("%w: signing key %q conflicts with verification key", ErrInvalidAllocationProof, signingKeyID)
+	}
+	keys[signingKeyID] = append([]byte(nil), signingKey...)
+	return &ProofSigner{
+		signingKeyID: signingKeyID,
+		signingKey:   append([]byte(nil), signingKey...),
+		verifyKeys:   keys,
+	}, nil
 }
 
 // Sign authenticates claims after enforcing the canonical ID and target.
@@ -93,29 +125,31 @@ func (s *ProofSigner) Sign(claims AllocationProofClaims) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal allocation proof: %w", err)
 	}
-	mac := hmac.New(sha256.New, s.key)
-	_, _ = mac.Write(raw)
-	return base64.RawURLEncoding.EncodeToString(raw) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+	payload := base64.RawURLEncoding.EncodeToString(raw)
+	signature := proofMAC(s.signingKey, s.signingKeyID, raw)
+	return s.signingKeyID + "." + payload + "." + base64.RawURLEncoding.EncodeToString(signature), nil
 }
 
 // Verify validates the MAC and every self-consistency invariant. It does not
 // apply create_before; accepted-row recovery must be allowed after expiry.
 func (s *ProofSigner) Verify(proof string) (AllocationProofClaims, error) {
 	parts := strings.Split(proof, ".")
-	if len(parts) != 2 {
+	if len(parts) != 3 || !validProofKeyID(parts[0]) {
 		return AllocationProofClaims{}, ErrInvalidAllocationProof
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
+	key, ok := s.verifyKeys[parts[0]]
+	if !ok {
+		return AllocationProofClaims{}, ErrInvalidAllocationProof
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		return AllocationProofClaims{}, ErrInvalidAllocationProof
 	}
-	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
 		return AllocationProofClaims{}, ErrInvalidAllocationProof
 	}
-	mac := hmac.New(sha256.New, s.key)
-	_, _ = mac.Write(raw)
-	if subtle.ConstantTimeCompare(signature, mac.Sum(nil)) != 1 {
+	if subtle.ConstantTimeCompare(signature, proofMAC(key, parts[0], raw)) != 1 {
 		return AllocationProofClaims{}, ErrInvalidAllocationProof
 	}
 	var claims AllocationProofClaims
@@ -130,6 +164,26 @@ func (s *ProofSigner) Verify(proof string) (AllocationProofClaims, error) {
 		return AllocationProofClaims{}, ErrInvalidAllocationProof
 	}
 	return claims, nil
+}
+
+func proofMAC(key []byte, keyID string, raw []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(keyID))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(raw)
+	return mac.Sum(nil)
+}
+
+func validProofKeyID(value string) bool {
+	if value == "" || len(value) > 32 {
+		return false
+	}
+	for _, ch := range value {
+		if (ch < 'a' || ch > 'z') && (ch < '0' || ch > '9') && ch != '-' && ch != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 // CreateBefore returns the proof deadline as a UTC time.

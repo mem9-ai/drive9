@@ -46,10 +46,20 @@ func PromotionTiDBSchemaStatements() []string {
 			live_claim_count             BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			materialized_identity_count  BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			rate_bucket_state            LONGTEXT,
+			max_live_claims              BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			max_materialized_identities  BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			max_sequence_window          BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			allocation_rate_per_minute   BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			allocation_rate_burst        BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			config_generation            BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			updated_at                   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
 		`ALTER TABLE promotion_import_identity_tenants ADD COLUMN installed_allocation_lease_generation BIGINT UNSIGNED NOT NULL DEFAULT 0`,
+		`ALTER TABLE promotion_import_identity_tenants ADD COLUMN max_live_claims BIGINT UNSIGNED NOT NULL DEFAULT 0`,
+		`ALTER TABLE promotion_import_identity_tenants ADD COLUMN max_materialized_identities BIGINT UNSIGNED NOT NULL DEFAULT 0`,
+		`ALTER TABLE promotion_import_identity_tenants ADD COLUMN max_sequence_window BIGINT UNSIGNED NOT NULL DEFAULT 0`,
+		`ALTER TABLE promotion_import_identity_tenants ADD COLUMN allocation_rate_per_minute BIGINT UNSIGNED NOT NULL DEFAULT 0`,
+		`ALTER TABLE promotion_import_identity_tenants ADD COLUMN allocation_rate_burst BIGINT UNSIGNED NOT NULL DEFAULT 0`,
 
 		`CREATE TABLE IF NOT EXISTS promotion_import_identity_epochs (
 			tenant_id                    VARCHAR(64) NOT NULL,
@@ -67,9 +77,11 @@ func PromotionTiDBSchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS promotion_import_identity_global (
 			capacity_key                  VARCHAR(64) PRIMARY KEY,
 			materialized_identity_count  BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			max_materialized_identities  BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			config_generation            BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			updated_at                   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
+		`ALTER TABLE promotion_import_identity_global ADD COLUMN max_materialized_identities BIGINT UNSIGNED NOT NULL DEFAULT 0`,
 
 		`CREATE TABLE IF NOT EXISTS promotion_import_id_claims (
 			tenant_id                    VARCHAR(64) NOT NULL,
@@ -306,10 +318,20 @@ func PromotionDB9SchemaStatements() []string {
 			live_claim_count BIGINT NOT NULL DEFAULT 0,
 			materialized_identity_count BIGINT NOT NULL DEFAULT 0,
 			rate_bucket_state JSONB,
+			max_live_claims BIGINT NOT NULL DEFAULT 0,
+			max_materialized_identities BIGINT NOT NULL DEFAULT 0,
+			max_sequence_window BIGINT NOT NULL DEFAULT 0,
+			allocation_rate_per_minute BIGINT NOT NULL DEFAULT 0,
+			allocation_rate_burst BIGINT NOT NULL DEFAULT 0,
 			config_generation BIGINT NOT NULL DEFAULT 0,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`ALTER TABLE IF EXISTS promotion_import_identity_tenants ADD COLUMN IF NOT EXISTS installed_allocation_lease_generation BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE IF EXISTS promotion_import_identity_tenants ADD COLUMN IF NOT EXISTS max_live_claims BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE IF EXISTS promotion_import_identity_tenants ADD COLUMN IF NOT EXISTS max_materialized_identities BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE IF EXISTS promotion_import_identity_tenants ADD COLUMN IF NOT EXISTS max_sequence_window BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE IF EXISTS promotion_import_identity_tenants ADD COLUMN IF NOT EXISTS allocation_rate_per_minute BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE IF EXISTS promotion_import_identity_tenants ADD COLUMN IF NOT EXISTS allocation_rate_burst BIGINT NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS promotion_import_identity_epochs (
 			tenant_id VARCHAR(64) NOT NULL,
 			allocation_epoch BIGINT NOT NULL,
@@ -325,9 +347,11 @@ func PromotionDB9SchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS promotion_import_identity_global (
 			capacity_key VARCHAR(64) PRIMARY KEY,
 			materialized_identity_count BIGINT NOT NULL DEFAULT 0,
+			max_materialized_identities BIGINT NOT NULL DEFAULT 0,
 			config_generation BIGINT NOT NULL DEFAULT 0,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
+		`ALTER TABLE IF EXISTS promotion_import_identity_global ADD COLUMN IF NOT EXISTS max_materialized_identities BIGINT NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS promotion_import_id_claims (
 			tenant_id VARCHAR(64) NOT NULL,
 			allocation_epoch BIGINT NOT NULL,

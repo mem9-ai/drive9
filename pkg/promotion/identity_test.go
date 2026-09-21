@@ -66,9 +66,58 @@ func TestAllocationProofBindsTenantTargetAndIdentity(t *testing.T) {
 	}
 
 	parts := strings.Split(proof, ".")
-	parts[1] = strings.Repeat("A", len(parts[1]))
+	parts[2] = strings.Repeat("A", len(parts[2]))
 	if _, err := signer.Verify(strings.Join(parts, ".")); !errors.Is(err, ErrInvalidAllocationProof) {
 		t.Fatalf("tampered proof error = %v, want ErrInvalidAllocationProof", err)
+	}
+}
+
+func TestAllocationProofKeyRotationRetainsOldVerification(t *testing.T) {
+	oldKey := []byte("old-proof-key-0123456789abcdef012345")
+	newKey := []byte("new-proof-key-0123456789abcdef012345")
+	oldSigner, err := NewProofSignerWithKeyring("old", oldKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := EncodeMigrationID(MigrationIdentity{AllocationEpoch: 7, AllocationSequence: 11})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := AllocationProofClaims{
+		Version: "p1", TenantID: "tenant-a", MigrationID: id,
+		AllocationEpoch: 7, AllocationSequence: 11, Target: "/published/tree",
+		ExpectedTargetAbsent: true, AllocationIdempotencyKeyHash: checksum("allocate-key"),
+		AllocationRequestDigest: checksum("request"), CreateBeforeUnixMilli: time.Now().Add(time.Hour).UnixMilli(),
+	}
+	proof, err := oldSigner.Sign(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := NewProofSignerWithKeyring("new", newKey, map[string][]byte{"old": oldKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := rotated.Verify(proof)
+	if err != nil {
+		t.Fatalf("Verify old proof after rotation: %v", err)
+	}
+	if got != claims {
+		t.Fatalf("claims = %+v, want %+v", got, claims)
+	}
+	newProof, err := rotated.Sign(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(proof, "old.") || !strings.HasPrefix(newProof, "new.") {
+		t.Fatalf("proof key versions missing: old=%q new=%q", proof, newProof)
+	}
+	if _, err := oldSigner.Verify(newProof); !errors.Is(err, ErrInvalidAllocationProof) {
+		t.Fatalf("old keyring verified new proof: %v", err)
+	}
+	parts := strings.Split(proof, ".")
+	parts[0] = "new"
+	if _, err := rotated.Verify(strings.Join(parts, ".")); !errors.Is(err, ErrInvalidAllocationProof) {
+		t.Fatalf("renamed proof key version error = %v, want ErrInvalidAllocationProof", err)
 	}
 }
 

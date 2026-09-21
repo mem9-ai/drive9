@@ -100,8 +100,6 @@ func newTestPromotionStore(t *testing.T, now *time.Time) (*Store, *PromotionStor
 		RuntimeCapability: func(string) promotion.StorageCapability { return *capability },
 		Limits:            testPromotionLimits(), AllocationTTL: 5 * time.Minute,
 		ActivityTTL: time.Hour, LeaseTTL: time.Minute,
-		MaxLiveClaims: 8, MaxTenantIdentities: 32, MaxGlobalIdentities: 128, MaxSequenceWindow: 16,
-		AllocationRatePerMinute: 60, AllocationRateBurst: 8,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -140,14 +138,17 @@ func seedPromotionCapability(t *testing.T, store *Store, tenantID string, capabi
 			(tenant_id, installed_allocation_epoch, installed_restore_generation,
 			 installed_database_incarnation, installed_backup_lineage_id, installed_writer_generation,
 			 installed_allocation_lease_generation, restore_admission_state,
-			 live_claim_count, materialized_identity_count, config_generation)
-			VALUES (?, 2, 5, 'db-inc-1', 'backup-lineage-1', 7, 13, 'ACTIVE', 0, 0, 1)`, []any{tenantID}},
+			 live_claim_count, materialized_identity_count, max_live_claims,
+			 max_materialized_identities, max_sequence_window,
+			 allocation_rate_per_minute, allocation_rate_burst, config_generation)
+			VALUES (?, 2, 5, 'db-inc-1', 'backup-lineage-1', 7, 13, 'ACTIVE', 0, 0,
+			        8, 32, 16, 60, 8, 1)`, []any{tenantID}},
 		{`INSERT INTO promotion_import_identity_epochs
 			(tenant_id, allocation_epoch, last_issued_sequence, retired_through, id_codec_version, epoch_state)
 			VALUES (?, 2, 0, 0, 'p1', 'ACTIVE')`, []any{tenantID}},
 		{`INSERT INTO promotion_import_identity_global
-			(capacity_key, materialized_identity_count, config_generation)
-			VALUES ('promotion-imports', 0, 1)`, nil},
+			(capacity_key, materialized_identity_count, max_materialized_identities, config_generation)
+			VALUES ('promotion-imports', 0, 128, 1)`, nil},
 		{`INSERT INTO promotion_quota_accounts
 			(tenant_id, max_bytes, max_files, reserved_bytes, reserved_files, committed_bytes, committed_files, config_generation)
 			VALUES (?, 1048576, 1024, 0, 0, 0, 0, 1)`, []any{tenantID}},
@@ -209,8 +210,11 @@ func TestPromotionAllocateRecoversBeforeCapacityAndRejectsMismatch(t *testing.T)
 
 func TestPromotionAllocationRateLimitStillAllowsExactRetry(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	_, promotionStore, _, _ := newTestPromotionStore(t, &now)
-	promotionStore.cfg.AllocationRateBurst = 1
+	store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+	if _, err := store.DB().Exec(`UPDATE promotion_import_identity_tenants
+		SET allocation_rate_burst = 1 WHERE tenant_id = 'tenant-a'`); err != nil {
+		t.Fatal(err)
+	}
 	firstReq := PromotionAllocationRequest{TenantID: "tenant-a", Target: "/one", ExpectedTargetAbsent: true, IdempotencyKey: "rate-one", AllocationLease: "allocation-lease"}
 	first, err := promotionStore.AllocateImportID(context.Background(), firstReq)
 	if err != nil {
@@ -251,8 +255,11 @@ func TestPromotionAllocationLeaseGuardPrecedesIdempotentRecovery(t *testing.T) {
 
 func TestPromotionAllocationSequenceWindowIsBounded(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	_, promotionStore, _, _ := newTestPromotionStore(t, &now)
-	promotionStore.cfg.MaxSequenceWindow = 1
+	store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+	if _, err := store.DB().Exec(`UPDATE promotion_import_identity_tenants
+		SET max_sequence_window = 1 WHERE tenant_id = 'tenant-a'`); err != nil {
+		t.Fatal(err)
+	}
 	first := PromotionAllocationRequest{
 		TenantID: "tenant-a", Target: "/one", ExpectedTargetAbsent: true,
 		IdempotencyKey: "window-one", AllocationLease: "allocation-lease",
@@ -268,6 +275,134 @@ func TestPromotionAllocationSequenceWindowIsBounded(t *testing.T) {
 	}
 	if _, err := promotionStore.AllocateImportID(context.Background(), first); err != nil {
 		t.Fatalf("exact retry at sequence-window limit: %v", err)
+	}
+}
+
+func TestPromotionDurableIdentityConfigControlsAdmission(t *testing.T) {
+	t.Run("tenant materialized limit", func(t *testing.T) {
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+		if _, err := store.DB().Exec(`UPDATE promotion_import_identity_tenants
+			SET max_materialized_identities = 1 WHERE tenant_id = 'tenant-a'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
+			TenantID: "tenant-a", Target: "/one", ExpectedTargetAbsent: true,
+			IdempotencyKey: "tenant-cap-one", AllocationLease: "allocation-lease",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
+			TenantID: "tenant-a", Target: "/two", ExpectedTargetAbsent: true,
+			IdempotencyKey: "tenant-cap-two", AllocationLease: "allocation-lease",
+		}); !errors.Is(err, ErrPromotionIdentityBudgetExceeded) {
+			t.Fatalf("tenant materialized limit error = %v, want ErrPromotionIdentityBudgetExceeded", err)
+		}
+	})
+
+	t.Run("global materialized limit", func(t *testing.T) {
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+		if _, err := store.DB().Exec(`UPDATE promotion_import_identity_global
+			SET max_materialized_identities = 1 WHERE capacity_key = 'promotion-imports'`); err != nil {
+			t.Fatal(err)
+		}
+		first := PromotionAllocationRequest{
+			TenantID: "tenant-a", Target: "/one", ExpectedTargetAbsent: true,
+			IdempotencyKey: "global-cap-one", AllocationLease: "allocation-lease",
+		}
+		if _, err := promotionStore.AllocateImportID(context.Background(), first); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
+			TenantID: "tenant-a", Target: "/two", ExpectedTargetAbsent: true,
+			IdempotencyKey: "global-cap-two", AllocationLease: "allocation-lease",
+		}); !errors.Is(err, ErrPromotionIdentityCapacityUnavailable) {
+			t.Fatalf("global materialized limit error = %v, want ErrPromotionIdentityCapacityUnavailable", err)
+		}
+		if _, err := promotionStore.AllocateImportID(context.Background(), first); err != nil {
+			t.Fatalf("exact retry at durable global limit: %v", err)
+		}
+	})
+
+	t.Run("partial config rollout fails new admission", func(t *testing.T) {
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		store, promotionStore, _, _ := newTestPromotionStore(t, &now)
+		first := PromotionAllocationRequest{
+			TenantID: "tenant-a", Target: "/one", ExpectedTargetAbsent: true,
+			IdempotencyKey: "config-rollout-one", AllocationLease: "allocation-lease",
+		}
+		original, err := promotionStore.AllocateImportID(context.Background(), first)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().Exec(`UPDATE promotion_import_identity_tenants
+			SET config_generation = 2 WHERE tenant_id = 'tenant-a'`); err != nil {
+			t.Fatal(err)
+		}
+		recovered, err := promotionStore.AllocateImportID(context.Background(), first)
+		if err != nil {
+			t.Fatalf("exact retry during config rollout: %v", err)
+		}
+		if *recovered != *original {
+			t.Fatalf("recovered allocation = %+v, want %+v", recovered, original)
+		}
+		if _, err := promotionStore.AllocateImportID(context.Background(), PromotionAllocationRequest{
+			TenantID: "tenant-a", Target: "/two", ExpectedTargetAbsent: true,
+			IdempotencyKey: "config-rollout-two", AllocationLease: "allocation-lease",
+		}); !errors.Is(err, ErrPromotionRecoveryRequired) {
+			t.Fatalf("partial config rollout error = %v, want ErrPromotionRecoveryRequired", err)
+		}
+		var lastIssued uint64
+		if err := store.DB().QueryRow(`SELECT last_issued_sequence FROM promotion_import_identity_epochs
+			WHERE tenant_id = 'tenant-a' AND allocation_epoch = 2`).Scan(&lastIssued); err != nil {
+			t.Fatal(err)
+		}
+		if lastIssued != 1 {
+			t.Fatalf("last issued sequence after rejected rollout = %d, want 1", lastIssued)
+		}
+	})
+}
+
+func TestPromotionProofKeyRotationPreservesRetryAndCreate(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	_, promotionStore, _, _ := newTestPromotionStore(t, &now)
+	manifest := testPromotionManifest(t)
+	plan, err := promotionStore.PlanImport(context.Background(), promotion.PlanImportRequest{
+		TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true, Manifest: manifest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := PromotionAllocationRequest{
+		TenantID: "tenant-a", Target: "/published", ExpectedTargetAbsent: true,
+		IdempotencyKey: "proof-rotation", AllocationLease: "allocation-lease",
+	}
+	allocation, err := promotionStore.AllocateImportID(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldKey := []byte("abcdef0123456789abcdef0123456789")
+	rotated, err := promotion.NewProofSignerWithKeyring(
+		"k2", []byte("new-proof-key-0123456789abcdef012345"), map[string][]byte{"k1": oldKey},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	promotionStore.cfg.ProofSigner = rotated
+	recovered, err := promotionStore.AllocateImportID(context.Background(), request)
+	if err != nil {
+		t.Fatalf("allocation retry after proof-key rotation: %v", err)
+	}
+	if *recovered != *allocation {
+		t.Fatalf("recovered allocation = %+v, want %+v", recovered, allocation)
+	}
+	if _, err := promotionStore.CreateImport(context.Background(), PromotionCreateRequest{
+		TenantID: "tenant-a", MigrationID: allocation.MigrationID, AllocationProof: allocation.AllocationProof,
+		Target: "/published", ExpectedTargetAbsent: true, Manifest: manifest, Plan: *plan,
+		OwnerToken: "owner-token", RecoveryToken: "recovery-token", WriterLease: "writer-lease",
+	}); err != nil {
+		t.Fatalf("CreateImport with retained old proof key: %v", err)
 	}
 }
 
@@ -566,8 +701,9 @@ func TestPromotionCreateRecoversTerminalTombstoneAndRejectsRetiredIdentity(t *te
 	if err != nil {
 		t.Fatalf("CreateImport tombstone recovery: %v", err)
 	}
-	if recovered.State != "COMMITTED" || recovered.MigrationID != created.MigrationID || recovered.Target != created.Target {
-		t.Fatalf("terminal recovery = %+v, want migration %q target %q state COMMITTED", recovered, created.MigrationID, created.Target)
+	if recovered.State != "COMMITTED" || recovered.MigrationID != created.MigrationID || recovered.Target != created.Target ||
+		recovered.TerminalResultBlob != "{}" || recovered.TerminalResultDigest != promotionTestHash("terminal-result") {
+		t.Fatalf("terminal recovery = %+v, want complete durable terminal result", recovered)
 	}
 	mismatched := request
 	mismatched.RecoveryToken = "different-recovery-token"

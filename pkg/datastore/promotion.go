@@ -72,26 +72,22 @@ type PromotionLeaseVerifier interface {
 	VerifyNormalWriterLease(ctx context.Context, token string) (PromotionWriterLease, error)
 }
 
-// PromotionStoreConfig contains finite bounds for the first DB-inline
-// implementation. RuntimeCapability must return the closed adapter
+// PromotionStoreConfig contains process dependencies and operation deadlines
+// for the first DB-inline implementation. Identity-admission bounds are read
+// from versioned durable rows under the allocation transaction; they are not
+// process-local knobs. RuntimeCapability must return the closed adapter
 // classification for the serving process; disagreement with the durable row
 // fails closed.
 type PromotionStoreConfig struct {
-	Planner                 *promotion.Planner
-	ProofSigner             *promotion.ProofSigner
-	Authorizer              PromotionAuthorizer
-	LeaseVerifier           PromotionLeaseVerifier
-	RuntimeCapability       func(tenantID string) promotion.StorageCapability
-	Limits                  promotion.ManifestLimits
-	AllocationTTL           time.Duration
-	ActivityTTL             time.Duration
-	LeaseTTL                time.Duration
-	MaxLiveClaims           uint64
-	MaxTenantIdentities     uint64
-	MaxGlobalIdentities     uint64
-	MaxSequenceWindow       uint64
-	AllocationRatePerMinute uint64
-	AllocationRateBurst     uint64
+	Planner           *promotion.Planner
+	ProofSigner       *promotion.ProofSigner
+	Authorizer        PromotionAuthorizer
+	LeaseVerifier     PromotionLeaseVerifier
+	RuntimeCapability func(tenantID string) promotion.StorageCapability
+	Limits            promotion.ManifestLimits
+	AllocationTTL     time.Duration
+	ActivityTTL       time.Duration
+	LeaseTTL          time.Duration
 }
 
 // PromotionStore owns the Plan/Allocate/Create transaction boundary.
@@ -130,20 +126,22 @@ type PromotionCreateRequest struct {
 }
 
 type PromotionImport struct {
-	MigrationID         string
-	AllocationEpoch     uint64
-	AllocationSequence  uint64
-	Target              string
-	ManifestHash        string
-	QuotaReservationID  string
-	State               string
-	StateVersion        uint64
-	OwnerEpoch          uint64
-	ActivityDeadline    time.Time
-	LeaseExpiresAt      time.Time
-	RestoreGeneration   uint64
-	DatabaseIncarnation string
-	WriterGeneration    uint64
+	MigrationID          string
+	AllocationEpoch      uint64
+	AllocationSequence   uint64
+	Target               string
+	ManifestHash         string
+	QuotaReservationID   string
+	State                string
+	StateVersion         uint64
+	OwnerEpoch           uint64
+	ActivityDeadline     time.Time
+	LeaseExpiresAt       time.Time
+	RestoreGeneration    uint64
+	DatabaseIncarnation  string
+	WriterGeneration     uint64
+	TerminalResultBlob   string
+	TerminalResultDigest string
 }
 
 type promotionRateBucket struct {
@@ -161,6 +159,12 @@ type promotionIdentityTenant struct {
 	LiveClaimCount            uint64
 	MaterializedCount         uint64
 	RateBucketRaw             sql.NullString
+	MaxLiveClaims             uint64
+	MaxMaterializedIdentities uint64
+	MaxSequenceWindow         uint64
+	AllocationRatePerMinute   uint64
+	AllocationRateBurst       uint64
+	ConfigGeneration          uint64
 }
 
 // NewPromotionStore constructs the P0 store. It rejects an incomplete runtime
@@ -171,10 +175,6 @@ func NewPromotionStore(store *Store, cfg PromotionStoreConfig) (*PromotionStore,
 	}
 	if cfg.AllocationTTL <= 0 || cfg.ActivityTTL <= 0 || cfg.LeaseTTL <= 0 || cfg.LeaseTTL > cfg.ActivityTTL {
 		return nil, fmt.Errorf("%w: invalid promotion deadlines", ErrPromotionDisabled)
-	}
-	if cfg.MaxLiveClaims == 0 || cfg.MaxTenantIdentities == 0 || cfg.MaxGlobalIdentities == 0 || cfg.MaxSequenceWindow == 0 ||
-		cfg.AllocationRatePerMinute == 0 || cfg.AllocationRateBurst == 0 {
-		return nil, fmt.Errorf("%w: promotion identity bounds are required", ErrPromotionDisabled)
 	}
 	return &PromotionStore{store: store, cfg: cfg}, nil
 }
@@ -251,22 +251,34 @@ func (s *PromotionStore) AllocateImportID(ctx context.Context, req PromotionAllo
 		if tenant.AllocationEpoch == 0 || tenant.DatabaseIncarnation == "" || tenant.WriterGeneration == 0 {
 			return ErrPromotionDisabled
 		}
-		if tenant.LiveClaimCount >= s.cfg.MaxLiveClaims || tenant.MaterializedCount >= s.cfg.MaxTenantIdentities {
+		if tenant.ConfigGeneration == 0 || tenant.MaxLiveClaims == 0 || tenant.MaxMaterializedIdentities == 0 ||
+			tenant.MaxSequenceWindow == 0 || tenant.AllocationRatePerMinute == 0 || tenant.AllocationRateBurst == 0 {
+			return ErrPromotionDisabled
+		}
+		if tenant.LiveClaimCount >= tenant.MaxLiveClaims || tenant.MaterializedCount >= tenant.MaxMaterializedIdentities {
 			return ErrPromotionIdentityBudgetExceeded
 		}
-		bucket, err := consumePromotionRate(tenant.RateBucketRaw, now, s.cfg.AllocationRatePerMinute, s.cfg.AllocationRateBurst)
+		bucket, err := consumePromotionRate(tenant.RateBucketRaw, now, tenant.AllocationRatePerMinute, tenant.AllocationRateBurst)
 		if err != nil {
 			return err
 		}
-		var globalCount uint64
-		if err := tx.QueryRowContext(ctx, `SELECT materialized_identity_count
-			FROM promotion_import_identity_global WHERE capacity_key = ? FOR UPDATE`, promotionGlobalCapacityKey).Scan(&globalCount); err != nil {
+		var globalCount, globalMax, globalConfigGeneration uint64
+		if err := tx.QueryRowContext(ctx, `SELECT materialized_identity_count,
+			max_materialized_identities, config_generation
+			FROM promotion_import_identity_global WHERE capacity_key = ? FOR UPDATE`, promotionGlobalCapacityKey).
+			Scan(&globalCount, &globalMax, &globalConfigGeneration); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrPromotionDisabled
 			}
 			return fmt.Errorf("lock promotion global capacity: %w", err)
 		}
-		if globalCount >= s.cfg.MaxGlobalIdentities {
+		if globalConfigGeneration == 0 || globalMax == 0 {
+			return ErrPromotionDisabled
+		}
+		if globalConfigGeneration != tenant.ConfigGeneration {
+			return ErrPromotionRecoveryRequired
+		}
+		if globalCount >= globalMax {
 			return ErrPromotionIdentityCapacityUnavailable
 		}
 		var lastIssued, retiredThrough uint64
@@ -283,7 +295,7 @@ func (s *PromotionStore) AllocateImportID(ctx context.Context, req PromotionAllo
 		if codecVersion != "p1" || epochState != "ACTIVE" || lastIssued < retiredThrough || lastIssued == math.MaxUint64 {
 			return ErrPromotionRecoveryRequired
 		}
-		if lastIssued-retiredThrough >= s.cfg.MaxSequenceWindow {
+		if lastIssued-retiredThrough >= tenant.MaxSequenceWindow {
 			return ErrPromotionIdentityBudgetExceeded
 		}
 		sequence := lastIssued + 1
@@ -646,10 +658,14 @@ func (s *PromotionStore) lockPromotionIdentityTenant(ctx context.Context, tx *sq
 	var out promotionIdentityTenant
 	err := tx.QueryRowContext(ctx, `SELECT installed_allocation_epoch, installed_restore_generation,
 		installed_database_incarnation, installed_writer_generation, installed_allocation_lease_generation, restore_admission_state,
-		live_claim_count, materialized_identity_count, rate_bucket_state
+		live_claim_count, materialized_identity_count, rate_bucket_state,
+		max_live_claims, max_materialized_identities, max_sequence_window,
+		allocation_rate_per_minute, allocation_rate_burst, config_generation
 		FROM promotion_import_identity_tenants WHERE tenant_id = ? FOR UPDATE`, tenantID).
 		Scan(&out.AllocationEpoch, &out.RestoreGeneration, &out.DatabaseIncarnation, &out.WriterGeneration,
-			&out.AllocationLeaseGeneration, &out.AdmissionState, &out.LiveClaimCount, &out.MaterializedCount, &out.RateBucketRaw)
+			&out.AllocationLeaseGeneration, &out.AdmissionState, &out.LiveClaimCount, &out.MaterializedCount, &out.RateBucketRaw,
+			&out.MaxLiveClaims, &out.MaxMaterializedIdentities, &out.MaxSequenceWindow,
+			&out.AllocationRatePerMinute, &out.AllocationRateBurst, &out.ConfigGeneration)
 	if errors.Is(err, sql.ErrNoRows) {
 		return promotionIdentityTenant{}, ErrPromotionDisabled
 	}
@@ -803,16 +819,19 @@ func (s *PromotionStore) selectPromotionAllocationByIdempotency(ctx context.Cont
 func (s *PromotionStore) selectPromotionImportTx(ctx context.Context, tx *sql.Tx, tenantID string, identity promotion.MigrationIdentity) (*PromotionImport, string, string, string, error) {
 	var out PromotionImport
 	var createDigest, ownerHash, recoveryHash string
+	var terminalResultBlob, terminalResultDigest sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT target_path, manifest_hash, quota_reservation_id, state,
 		state_version, owner_epoch, activity_deadline, lease_expires_at,
 		accepted_restore_generation, accepted_database_incarnation, accepted_writer_generation,
-		create_request_digest, owner_token_hash, recovery_token_hash
+		create_request_digest, owner_token_hash, recovery_token_hash,
+		terminal_result_blob, terminal_result_digest
 		FROM promotion_imports
 		WHERE tenant_id = ? AND allocation_epoch = ? AND allocation_sequence = ? FOR UPDATE`,
 		tenantID, identity.AllocationEpoch, identity.AllocationSequence).
 		Scan(&out.Target, &out.ManifestHash, &out.QuotaReservationID, &out.State, &out.StateVersion,
 			&out.OwnerEpoch, &out.ActivityDeadline, &out.LeaseExpiresAt, &out.RestoreGeneration,
-			&out.DatabaseIncarnation, &out.WriterGeneration, &createDigest, &ownerHash, &recoveryHash)
+			&out.DatabaseIncarnation, &out.WriterGeneration, &createDigest, &ownerHash, &recoveryHash,
+			&terminalResultBlob, &terminalResultDigest)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", "", "", ErrNotFound
 	}
@@ -822,6 +841,12 @@ func (s *PromotionStore) selectPromotionImportTx(ctx context.Context, tx *sql.Tx
 	out.AllocationEpoch = identity.AllocationEpoch
 	out.AllocationSequence = identity.AllocationSequence
 	out.MigrationID, _ = promotion.EncodeMigrationID(identity)
+	if terminalResultBlob.Valid {
+		out.TerminalResultBlob = terminalResultBlob.String
+	}
+	if terminalResultDigest.Valid {
+		out.TerminalResultDigest = terminalResultDigest.String
+	}
 	return &out, createDigest, ownerHash, recoveryHash, nil
 }
 
@@ -832,13 +857,14 @@ func (s *PromotionStore) selectPromotionCreateTerminalRecoveryTx(
 	identity promotion.MigrationIdentity,
 	createDigest, ownerHash, recoveryHash string,
 ) (*PromotionImport, bool, error) {
-	var target, requestDigest, storedOwnerHash, storedRecoveryHash, terminalState string
+	var target, requestDigest, storedOwnerHash, storedRecoveryHash, terminalState, terminalResultBlob, terminalResultDigest string
 	err := tx.QueryRowContext(ctx, `SELECT target_path, request_digest, owner_token_hash,
-		recovery_token_hash, terminal_state
+		recovery_token_hash, terminal_state, terminal_result_blob, terminal_result_digest
 		FROM promotion_import_tombstones
 		WHERE tenant_id = ? AND allocation_epoch = ? AND allocation_sequence = ? FOR UPDATE`,
 		tenantID, identity.AllocationEpoch, identity.AllocationSequence).
-		Scan(&target, &requestDigest, &storedOwnerHash, &storedRecoveryHash, &terminalState)
+		Scan(&target, &requestDigest, &storedOwnerHash, &storedRecoveryHash, &terminalState,
+			&terminalResultBlob, &terminalResultDigest)
 	if err == nil {
 		if requestDigest != createDigest || !promotionHashEqual(storedOwnerHash, ownerHash) || !promotionHashEqual(storedRecoveryHash, recoveryHash) {
 			return nil, false, ErrPromotionConflict
@@ -850,6 +876,7 @@ func (s *PromotionStore) selectPromotionCreateTerminalRecoveryTx(
 		return &PromotionImport{
 			MigrationID: migrationID, AllocationEpoch: identity.AllocationEpoch,
 			AllocationSequence: identity.AllocationSequence, Target: target, State: terminalState,
+			TerminalResultBlob: terminalResultBlob, TerminalResultDigest: terminalResultDigest,
 		}, true, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
