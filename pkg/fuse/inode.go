@@ -630,6 +630,21 @@ func (m *InodeToPath) UpdateAtimeDerived(ino uint64, atime time.Time) {
 	entry.Atime = atime
 }
 
+// ClearLocalTimes drops any armed local time overrides without changing the
+// current times. It marks the canonical user-mutation point (a local data
+// write/truncate, see markDirtySize): later commit settles and stat
+// refreshes become authoritative again, so utimensat-then-write cannot leave
+// the mtime frozen at the explicitly requested value.
+func (m *InodeToPath) ClearLocalTimes(ino uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.MtimeOverride = nil
+		entry.AtimeOverride = nil
+	}
+}
+
 // UpdateCtime updates the ctime of the entry identified by the given inode.
 func (m *InodeToPath) UpdateCtime(ino uint64, ctime time.Time) {
 	m.mu.Lock()

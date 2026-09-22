@@ -382,6 +382,35 @@ func TestLocalTimeOverrideLifecycle(t *testing.T) {
 	}
 }
 
+// TestLocalMutationClearsTimeOverride guards the utimensat-then-write
+// lifecycle: a local data mutation (Write/O_TRUNC/truncate all funnel through
+// markDirtySize) must drop the armed override so the commit settle and later
+// stat refreshes can advance the mtime again — `touch -d 2020 f; echo x >> f`
+// must not leave the mtime frozen at 2020.
+func TestLocalMutationClearsTimeOverride(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	requested := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	ino := fs.inodes.Lookup("/mut.txt", false, 3, time.Unix(1000, 0))
+	fs.inodes.SetLocalMtime(ino, requested)
+	if !fs.inodes.HasMtimeOverride(ino) {
+		t.Fatal("override not armed")
+	}
+
+	fs.markDirtySize(ino, 9)
+	if fs.inodes.HasMtimeOverride(ino) {
+		t.Fatal("write mutation did not clear the time override")
+	}
+
+	commitTime := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	fs.inodes.UpdateMtimeDerived(ino, commitTime)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok || !entry.Mtime.Equal(commitTime) {
+		t.Fatalf("mtime after write settle = %v, want %v", entry.Mtime, commitTime)
+	}
+}
+
 // TestAppendLogCompletionKeepsLocalTimeOverride guards the append-log async
 // commit completion: it must not replace an explicitly requested mtime with
 // the commit time nor clear the armed override while the time-only SetAttr
