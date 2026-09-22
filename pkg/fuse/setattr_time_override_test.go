@@ -14,6 +14,8 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // newSetattrTimeTestFS builds a Dat9FS with a commit queue wired exactly like
@@ -66,6 +68,14 @@ func newSetattrTimeTestFS(t *testing.T, path string, data []byte) (*Dat9FS, *Com
 	opts := &MountOptions{FlushDebounce: 0}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	// A write-back cache is required for GetAttr to consult pending metadata
+	// (pendingIndex / writeBack.GetMeta) while a commit is in flight.
+	wb, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.SetWriteBack(wb, nil)
 
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
@@ -179,6 +189,14 @@ func TestSetAttrTimeOnlySkipsPendingCommitWait(t *testing.T) {
 	}
 	if !fs.inodes.HasMtimeOverride(ino) {
 		t.Fatal("local mtime override not armed")
+	}
+
+	// Immediate visibility: GetAttr must return the requested times even
+	// while the commit is still in flight — the pending-metadata branch
+	// (pendingIndex.GetMeta, whose staging mtime is newer) must not clobber
+	// the just-acknowledged explicit times.
+	if mtime, atime := getAttrMtime(t, fs, ino); mtime != requestedMtime.Unix() || atime != requestedAtime.Unix() {
+		t.Fatalf("GetAttr while commit in flight = %d/%d, want %d/%d", mtime, atime, requestedMtime.Unix(), requestedAtime.Unix())
 	}
 
 	close(allowPut)
@@ -323,5 +341,78 @@ func TestLocalTimeOverrideLifecycle(t *testing.T) {
 	if _, ok := inodes.MtimeOverride(ino); ok {
 		// The old inode's entry is gone; the lookup must not report it.
 		t.Fatal("stale inode still reports an override")
+	}
+
+	// A remote replacement of the same path (both identities known and
+	// different) must not inherit the previous object's overrides: the
+	// listing metadata of the new object is adopted instead. Binding the
+	// first identity is create-shaped (empty old id) and must keep the
+	// override; replacing it with a different id clears both overrides.
+	inodes.LookupWithIdentity("/a.txt", "res-1", 1, false, 5, time.Unix(2000, 0))
+	inodes.SetLocalMtime(ino2, requested)
+	inodes.SetLocalAtime(ino2, requested.Add(time.Minute))
+	if !inodes.HasMtimeOverride(ino2) {
+		t.Fatal("override not armed before identity replacement")
+	}
+	replacementMtime := time.Unix(8888888888, 0)
+	inodes.LookupWithIdentity("/a.txt", "res-2", 1, false, 5, replacementMtime)
+	if inodes.HasMtimeOverride(ino2) {
+		t.Fatal("identity replacement inherited the mtime override")
+	}
+	entry, _ = inodes.GetEntry(ino2)
+	if !entry.Mtime.Equal(replacementMtime) {
+		t.Fatalf("replacement mtime = %v, want listing mtime %v", entry.Mtime, replacementMtime)
+	}
+	inodes.UpdateAtimeDerived(ino2, time.Unix(1, 0))
+	entry, _ = inodes.GetEntry(ino2)
+	if !entry.Atime.Equal(time.Unix(1, 0)) {
+		t.Fatal("atime override survived identity replacement")
+	}
+
+	// A kind change at the same path (file replaced by a directory) is also a
+	// different object: overrides are dropped and the listing time adopted.
+	inodes.SetLocalMtime(ino2, requested)
+	inodes.Lookup("/a.txt", true, 0, time.Unix(7777777777, 0))
+	if inodes.HasMtimeOverride(ino2) {
+		t.Fatal("kind change inherited the mtime override")
+	}
+	entry, _ = inodes.GetEntry(ino2)
+	if !entry.Mtime.Equal(time.Unix(7777777777, 0)) {
+		t.Fatalf("kind-change mtime = %v, want listing mtime", entry.Mtime)
+	}
+}
+
+// TestAppendLogCompletionKeepsLocalTimeOverride guards the append-log async
+// commit completion: it must not replace an explicitly requested mtime with
+// the commit time nor clear the armed override while the time-only SetAttr
+// that set it no longer fences behind the completion.
+func TestAppendLogCompletionKeepsLocalTimeOverride(t *testing.T) {
+	requested := time.Date(2019, 5, 4, 3, 2, 1, 0, time.UTC)
+	fs, fh, closeServer := newAppendLogEngineFixture(t, true, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: 6, Size: 7})
+	})
+	defer closeServer()
+
+	fs.inodes.SetLocalMtime(fh.Ino, requested)
+	if !fs.inodes.HasMtimeOverride(fh.Ino) {
+		t.Fatal("override not armed")
+	}
+
+	fh.Lock()
+	result := fs.tryAppendLogLocked(context.Background(), fh)
+	fh.Unlock()
+	if result.route != appendLogRouteCommitted || result.status != gofuse.OK {
+		t.Fatalf("result = %+v, want committed OK", result)
+	}
+
+	if !fs.inodes.HasMtimeOverride(fh.Ino) {
+		t.Fatal("append-log completion cleared the local time override")
+	}
+	if mtime, _ := fs.inodes.MtimeOverride(fh.Ino); !mtime.Equal(requested) {
+		t.Fatalf("override mtime = %v, want %v", mtime, requested)
+	}
+	entry, ok := fs.inodes.GetEntry(fh.Ino)
+	if !ok || !entry.Mtime.Equal(requested) {
+		t.Fatalf("inode mtime after append-log completion = %v, want %v", entry.Mtime, requested)
 	}
 }

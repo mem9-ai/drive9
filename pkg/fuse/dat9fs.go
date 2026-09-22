@@ -8856,12 +8856,15 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 			entry = gitEntry
 		} else if fs.writeBack != nil && !entry.IsDir {
 			// Check pending index first (in-memory, O(1)), then fall back
-			// to old GetMeta for backward compatibility.
+			// to old GetMeta for backward compatibility. Pending metadata is
+			// a derived view of staged state: an armed local time override
+			// (explicit utimensat while the commit is still in flight) wins.
 			pendingFound := false
 			if fs.pendingIndex != nil {
 				if meta, ok := fs.pendingIndex.GetMeta(entry.Path); ok {
 					entry.Size = meta.Size
-					if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
+					if !fs.inodes.HasMtimeOverride(input.NodeId) &&
+						!meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
 						entry.Mtime = meta.Mtime
 					}
 					pendingFound = true
@@ -8870,7 +8873,8 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 			if !pendingFound {
 				if meta, ok := fs.writeBack.GetMeta(entry.Path); ok {
 					entry.Size = meta.Size
-					if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
+					if !fs.inodes.HasMtimeOverride(input.NodeId) &&
+						!meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
 						entry.Mtime = meta.Mtime
 					}
 					pendingFound = true

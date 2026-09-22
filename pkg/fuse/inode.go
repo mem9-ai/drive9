@@ -824,6 +824,10 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 	// directory.
 	if entry.IsDir != isDir {
 		entry.ExtentIno = 0
+		// The new object must not inherit the previous object's explicitly
+		// SetAttr'd times either.
+		entry.MtimeOverride = nil
+		entry.AtimeOverride = nil
 	}
 	entry.IsDir = isDir
 	// Listing/create-cache often still has size=0 after JuiceFS writes.
@@ -831,6 +835,13 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 	// the kernel returns EOF without FUSE READ. Truncate uses UpdateSize.
 	if entry.ExtentIno == 0 || isDir || size >= entry.Size {
 		entry.Size = size
+	}
+	// Clear the previous object's time overrides BEFORE the mtime line
+	// below: an identity replacement (different drive9 file at this path)
+	// adopts the incoming listing metadata instead.
+	if identityReplacedLocked(entry, inodeResourceKey(resourceID, isDir)) {
+		entry.MtimeOverride = nil
+		entry.AtimeOverride = nil
 	}
 	// A listing reseed is a derived refresh: keep an explicitly SetAttr'd
 	// time (still pending or diverged from the server view) instead of the
@@ -846,6 +857,13 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 	}
 }
 
+// identityReplacedLocked reports whether both the entry's current identity
+// and the incoming key are known and differ — i.e. a different drive9 object
+// now owns this path.
+func identityReplacedLocked(entry *InodeEntry, key string) bool {
+	return entry.ResourceID != "" && key != "" && entry.ResourceID != key
+}
+
 func (m *InodeToPath) setIdentityLocked(entry *InodeEntry, resourceID string) {
 	key := inodeResourceKey(resourceID, entry.IsDir)
 	if key == "" || entry.ResourceID == key {
@@ -859,8 +877,15 @@ func (m *InodeToPath) setIdentityLocked(entry *InodeEntry, resourceID string) {
 	// (possibly drained) extent inode. Only clear when both identities are
 	// known: create-shaped entries carry no resource id yet and must keep the
 	// routing this mount just stamped.
-	if entry.ResourceID != "" && key != "" {
+	if identityReplacedLocked(entry, key) {
 		entry.ExtentIno = 0
+		// The new object also must not inherit the previous object's
+		// explicitly SetAttr'd times: drop the local time overrides so the
+		// incoming listing/stat metadata is adopted instead. (updateEntryLocked
+		// clears these before applying a listing mtime; this covers identity
+		// updates that arrive through SetIdentity/stat refreshes.)
+		entry.MtimeOverride = nil
+		entry.AtimeOverride = nil
 	}
 	entry.ResourceID = key
 	m.byID[key] = entry.Ino
