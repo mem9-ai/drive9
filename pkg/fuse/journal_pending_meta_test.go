@@ -17,7 +17,7 @@ func TestPendingIndexJournalRouteAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("journal: %v", err)
 	}
-	defer j.Close()
+	defer func() { _ = j.Close() }()
 
 	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
 	if err != nil {
@@ -67,7 +67,7 @@ func TestJournalPendingMetaSupersededByCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("journal: %v", err)
 	}
-	defer j.Close()
+	defer func() { _ = j.Close() }()
 
 	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
 	if err != nil {
@@ -105,7 +105,7 @@ func TestJournalFsyncSharedCoalesces(t *testing.T) {
 	if err != nil {
 		t.Fatalf("journal: %v", err)
 	}
-	defer j.Close()
+	defer func() { _ = j.Close() }()
 
 	const writers = 8
 	errCh := make(chan error, writers)

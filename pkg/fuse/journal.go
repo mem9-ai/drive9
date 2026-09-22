@@ -66,7 +66,6 @@ type Journal struct {
 	// mu) is the highest seq known durable; it only advances on success.
 	syncMu  sync.Mutex
 	doneGen uint64
-	syncing bool
 }
 
 // NewJournal opens or creates a journal WAL file at the given path. The
