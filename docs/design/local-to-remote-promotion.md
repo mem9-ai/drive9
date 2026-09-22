@@ -71,8 +71,10 @@ The three wire operations form one cross-repository contract. `POST` publishes
 the namespace and its receipt in the same transaction, completes any pending
 accounting for an exact retry, and emits the structural reset event before it
 returns success. Side-effect-free `GET` is keyed by `(target, operation ID)`
-and returns either the completed committed receipt or `404`; it performs no
-accounting and emits no event. After the client has durably persisted
+and returns the completed committed receipt, the explicit
+`promotion_accounting_incomplete` state for a durable namespace receipt whose
+handoff still needs an exact `POST`, or `404` when no receipt exists. It
+performs no accounting and emits no event. After the client has durably persisted
 `released`, `DELETE` carries
 the exact `(target, operation ID, manifest digest)` tuple; it is idempotent and
 an already-absent receipt returns `404`. `409`, `413`, and `507` POST responses
@@ -86,11 +88,14 @@ and the cross-mount structural reset on the successful `POST` boundary. Whether
 any request may have reached the server is sticky across those retries: a later
 local/proxy rejection plus `NotFound` cannot disprove an earlier in-flight
 attempt. A committed matching result plus that successful exact retry means it
-may finish the local source transition. Startup recovery never turns
-a prepared local record with no durable server result into a new publish; it
-fails closed instead. A single receipt `NotFound` is not proof that a publish
-request from the crashed process cannot still commit, so recovery also does
-not discard that record automatically. Reusing an operation ID for the same
+may finish the local source transition. On startup, an explicit matching
+`promotion_accounting_incomplete` result proves the namespace receipt already
+committed; recovery revalidates the local manifest and sends the exact `POST`
+to finish the handoff. Startup never turns a prepared local record with an
+absent server result into a new publish; it fails closed instead. A single
+receipt `NotFound` is not proof that a publish request from the crashed process
+cannot still commit, so recovery also does not discard that record
+automatically. Reusing an operation ID for the same
 target with a different manifest is rejected; the same caller ID under another
 authorized target is a separate operation.
 
@@ -134,8 +139,10 @@ before any request or local mutation if that identity no longer matches.
 - Known pre-commit failure: durably mark the record aborted, then delete it and
   leave the source unchanged. A failed delete can only be retried as cleanup;
   it cannot publish on restart.
-- Unknown response: query the same operation ID. Restart only moves forward
-  from a matching committed result and never re-POSTs a prepared record.
+- Unknown response: query the same operation ID. Restart moves forward from a
+  matching completed result, or from an explicit matching accounting-incomplete
+  receipt by revalidating the local manifest and retrying the exact `POST`.
+  A true `404` never causes a startup `POST`.
 - Committed result: move the source into an operation-ID-private quarantine
   directory, fsync both parent directories, persist `released`, and update the
   mount view. `rename` may then return success. Receipt acknowledgement,
@@ -173,9 +180,9 @@ Do not delete `record.json` merely because its first result lookup returned
 2. Record the error's operation ID and phase. Prove from server request and
    transaction logs that no publish for that exact operation remains in
    flight, then query the receipt again and inspect the remote target.
-3. If the matching receipt exists, restore normal connectivity/configuration
-   and restart so Drive9 can forward-complete it. Do not move or delete the
-   source/quarantine manually.
+3. If a matching completed or accounting-incomplete receipt exists, restore
+   normal connectivity/configuration and restart so Drive9 can
+   forward-complete it. Do not move or delete the source/quarantine manually.
 4. Only for a `prepared` record, after proving the request is quiescent, the
    receipt and target are absent, and the source is still present while its
    quarantine is absent, move `record.json` aside and fsync its parent

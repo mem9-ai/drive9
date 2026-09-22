@@ -1597,6 +1597,119 @@ func TestSynchronousPromotionStartupRecoveryFinishesCommittedOperation(t *testin
 	}
 }
 
+func TestSynchronousPromotionStartupRecoveryCompletesAccountingIncompleteReceipt(t *testing.T) {
+	const operationID = "01234567-89ab-cdef-0123-456789abcdef"
+	var getCalls, postCalls, acknowledgeCalls atomic.Int32
+	var result promotion.Result
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs:promotion" {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			getCalls.Add(1)
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "promotion accounting incomplete", "code": promotion.AccountingIncompleteCode,
+			})
+		case http.MethodPost:
+			postCalls.Add(1)
+			var request promotion.PublishRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if request.OperationID != result.OperationID || request.Target != result.Target || request.ManifestSHA256 != result.ManifestSHA256 {
+				http.Error(w, "exact tuple mismatch", http.StatusConflict)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(result)
+		case http.MethodDelete:
+			acknowledgeCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	fs := newPromotionTestFS(t, server.URL)
+	createPromotionTestTree(t, fs)
+	request, err := fs.scanPromotionTree(context.Background(), "/project/dist/.site-next", "/project/site", "/project/site/", operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result = promotion.Result{
+		OperationID: operationID, Target: request.Target,
+		ManifestSHA256: request.ManifestSHA256, Committed: true,
+	}
+	record := localPromotionRecord{
+		OperationID: operationID, Source: "/project/dist/.site-next", TargetLocal: "/project/site",
+		RemoteIdentitySHA256: fs.promotionRemoteIdentitySHA256(), TargetRemote: request.Target,
+		ManifestSHA256: request.ManifestSHA256, Phase: promotionPhasePrepared,
+	}
+	if err := fs.writePromotionRecord(record); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := fs.recoverSynchronousPromotion(context.Background()); err != nil {
+		t.Fatalf("recover incomplete receipt: %v", err)
+	}
+	waitForPromotionCleanup(t, fs)
+	if getCalls.Load() != 1 || postCalls.Load() != 1 || acknowledgeCalls.Load() != 1 {
+		t.Fatalf("calls get=%d post=%d delete=%d, want 1/1/1", getCalls.Load(), postCalls.Load(), acknowledgeCalls.Load())
+	}
+	if _, err := fs.localOverlay.Lstat(record.Source); !os.IsNotExist(err) {
+		t.Fatalf("source after recovery: %v", err)
+	}
+}
+
+func TestSynchronousPromotionStartupRecoveryDoesNotPublishAbsentPreparedRecord(t *testing.T) {
+	var getCalls, postCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getCalls.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		case http.MethodPost:
+			postCalls.Add(1)
+			http.Error(w, "startup must not publish absent operation", http.StatusInternalServerError)
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	fs := newPromotionTestFS(t, server.URL)
+	createPromotionTestTree(t, fs)
+	const operationID = "fedcba98-7654-3210-fedc-ba9876543210"
+	request, err := fs.scanPromotionTree(context.Background(), "/project/dist/.site-next", "/project/site", "/project/site/", operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := localPromotionRecord{
+		OperationID: operationID, Source: "/project/dist/.site-next", TargetLocal: "/project/site",
+		RemoteIdentitySHA256: fs.promotionRemoteIdentitySHA256(), TargetRemote: request.Target,
+		ManifestSHA256: request.ManifestSHA256, Phase: promotionPhasePrepared,
+	}
+	if err := fs.writePromotionRecord(record); err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.recoverSynchronousPromotion(context.Background())
+	var refusal *promotionRecoveryRefusal
+	if !errors.As(err, &refusal) {
+		t.Fatalf("recovery error = %T %v, want permanent refusal", err, err)
+	}
+	if getCalls.Load() != 1 || postCalls.Load() != 0 {
+		t.Fatalf("calls get=%d post=%d, want 1/0", getCalls.Load(), postCalls.Load())
+	}
+	if _, err := fs.localOverlay.Lstat(record.Source); err != nil {
+		t.Fatalf("source changed after absent prepared recovery: %v", err)
+	}
+}
+
 func TestSynchronousPromotionRecoveryRejectsDifferentRemoteIdentityBeforeRequest(t *testing.T) {
 	serverA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unexpected", http.StatusInternalServerError)
@@ -1896,6 +2009,47 @@ func TestPromotionOutcomeUnknownIsStickyAcrossRetries(t *testing.T) {
 	}
 	if postCalls.Load() != 3 || getCalls.Load() < 3 {
 		t.Fatalf("calls post=%d get=%d, want 3/>=3", postCalls.Load(), getCalls.Load())
+	}
+}
+
+func TestPromotionAccountingIncompleteLookupRetriesExactPost(t *testing.T) {
+	var postCalls, getCalls atomic.Int32
+	request := testPromotionRequest()
+	result := promotion.Result{
+		OperationID: request.OperationID, Target: request.Target,
+		ManifestSHA256: request.ManifestSHA256, Committed: true,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fs:promotion" {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodPost:
+			if postCalls.Add(1) == 1 {
+				http.Error(w, "central handoff failed after tenant commit", http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(result)
+		case http.MethodGet:
+			getCalls.Add(1)
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "promotion accounting incomplete", "code": promotion.AccountingIncompleteCode,
+			})
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	fs := newPromotionTestFS(t, server.URL)
+	got, definitive, err := fs.publishPromotionWithRecovery(context.Background(), request)
+	if err != nil || !definitive || !matchingPromotionResult(request, got) {
+		t.Fatalf("publish result=%+v definitive=%v err=%v, want exact retry success", got, definitive, err)
+	}
+	if postCalls.Load() != 2 || getCalls.Load() != 1 {
+		t.Fatalf("calls post=%d get=%d, want 2/1", postCalls.Load(), getCalls.Load())
 	}
 }
 

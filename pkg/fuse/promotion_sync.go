@@ -273,6 +273,14 @@ func (fs *Dat9FS) publishPreparedPromotionWithRecovery(ctx context.Context, requ
 			// reset event. If that never happens, keep the journal fail-closed.
 			continue
 		}
+		if promotionAccountingIncomplete(statusErr) {
+			// The pure lookup proves this exact operation key already has a
+			// durable namespace receipt. Only the exact POST may advance its
+			// accounting handoff, so keep retrying instead of treating this as
+			// either absence or a generic lookup outage.
+			mayHaveReachedServer = true
+			continue
+		}
 		if client.IsNotFound(statusErr) {
 			if definitelyRejected && !mayHaveReachedServer {
 				return nil, true, err
@@ -288,6 +296,12 @@ func (fs *Dat9FS) publishPreparedPromotionWithRecovery(ctx context.Context, requ
 		break
 	}
 	return nil, false, lastErr
+}
+
+func promotionAccountingIncomplete(err error) bool {
+	var statusErr *client.StatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusConflict &&
+		statusErr.Code == promotion.AccountingIncompleteCode
 }
 
 func promotionRequestDefinitelyRejected(err error) bool {
@@ -839,6 +853,25 @@ func (fs *Dat9FS) recoverSynchronousPromotion(ctx context.Context) error {
 		return nil
 	}
 	result, statusErr := fs.getPromotionResult(ctx, record.OperationID, record.TargetRemote)
+	if promotionAccountingIncomplete(statusErr) {
+		request, scanErr := fs.scanPromotionTree(ctx, record.Source, record.TargetLocal, record.TargetRemote, record.OperationID)
+		if scanErr != nil || request.ManifestSHA256 != record.ManifestSHA256 {
+			return fs.refusePromotionRecovery(record, "promotion source does not match accounting-incomplete receipt manifest")
+		}
+		body, prepareErr := fs.preparePromotionRequest(ctx, request)
+		if prepareErr != nil {
+			return fs.refusePromotionRecovery(record, fmt.Sprintf("promotion source no longer passes request validation: %v", prepareErr))
+		}
+		var definitive bool
+		result, definitive, err = fs.publishPreparedPromotionWithRecovery(ctx, request, body)
+		if err != nil {
+			if definitive {
+				return fs.refusePromotionRecovery(record, fmt.Sprintf("exact POST retry rejected for accounting-incomplete receipt: %v", err))
+			}
+			return err
+		}
+		statusErr = nil
+	}
 	if statusErr != nil && !client.IsNotFound(statusErr) {
 		return statusErr
 	}
