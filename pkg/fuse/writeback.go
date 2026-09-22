@@ -289,7 +289,8 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsNoSync(remotePath
 	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, false, liveAncestors)
 }
 
-func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, durable bool, liveAncestors []string) (uint64, WriteBackPutTimings, error) {	var t WriteBackPutTimings
+func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, durable bool, liveAncestors []string) (uint64, WriteBackPutTimings, error) {
+	var t WriteBackPutTimings
 
 	// Phase 1: acquire per-path lock (serializes same-path Put/Remove/etc.)
 	lockStart := time.Now()

@@ -121,7 +121,7 @@ type Dat9FS struct {
 	syncMode SyncMode
 
 	// journal is the append-only WAL for crash recovery (P1).
-	journal *Journal
+	journal             *Journal
 	journalSyncerCancel context.CancelFunc
 
 	// commitQueue is the ordered background remote commit queue (P1).
@@ -17146,10 +17146,10 @@ func (fs *Dat9FS) FlushAll() {
 	// Close journal.
 	if fs.journal != nil {
 		if fs.journalSyncerCancel != nil {
-		fs.journalSyncerCancel()
-	}
-	_ = fs.journal.FsyncShared()
-	_ = fs.journal.Close()
+			fs.journalSyncerCancel()
+		}
+		_ = fs.journal.FsyncShared()
+		_ = fs.journal.Close()
 	}
 
 	// Close shadow store.
