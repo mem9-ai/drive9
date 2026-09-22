@@ -15502,6 +15502,12 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
+		promotionUnlock, mutationAllowed := fs.lockPromotionMutation()
+		if !mutationAllowed {
+			fs.releasePromotionBlockedHandle(input, fh)
+			return
+		}
+		defer promotionUnlock()
 		ctx, cf := fuseCtx(cancel)
 		defer cf()
 		fs.observePathPolicyWithContext(ctx, fh.Path)
@@ -16072,6 +16078,63 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		}
 
 	}
+}
+
+// releasePromotionBlockedHandle closes one kernel handle without publishing any
+// buffered mutation. Release has no status result, so it must not use the
+// normal best-effort flush path after an outcome-unknown promotion has frozen
+// the mount. The application has already received EIO from Flush/Fsync; the
+// only safe work left here is ownership-scoped cleanup and handle teardown.
+func (fs *Dat9FS) releasePromotionBlockedHandle(input *gofuse.ReleaseIn, fh *FileHandle) {
+	if fh == nil {
+		return
+	}
+	if fh.isExtent() {
+		fs.extentRelease(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh)
+		fs.deleteFileHandle(input.Fh, fh)
+		return
+	}
+
+	fh.Lock()
+	if fs.debouncer != nil {
+		fs.debouncer.CancelNoWaitIfOwner(fh.Path, fh)
+	}
+	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+	fs.removeHandleOwnedStagingLocked(fh)
+	if fh.Dirty != nil {
+		fh.Dirty.ClearDirty()
+	}
+	fh.DirtySeq = 0
+	fh.WriteBackSeq = 0
+	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
+	fh.appendSnapshot = false
+	fs.releaseHandleRemoteCommitPathLocked(fh)
+	localFile := fh.LocalFile
+	fh.LocalFile = nil
+	streamer := fh.Streamer
+	fh.Streamer = nil
+	prefetch := fh.Prefetch
+	fh.Prefetch = nil
+	unlinkedShadowGen := fh.UnlinkedShadowGen
+	fh.UnlinkedShadowGen = 0
+	fh.Unlock()
+
+	if localFile != nil {
+		_ = localFile.Close()
+	}
+	if streamer != nil {
+		streamer.Abort()
+	}
+	if prefetch != nil {
+		prefetch.Close()
+	}
+	fs.releaseHandleShadowPin(fh)
+	if unlinkedShadowGen != 0 && fs.shadowStore != nil {
+		fs.shadowStore.Unpin(unlinkedShadowGen)
+	}
+	fs.deleteFileHandle(input.Fh, fh)
+	fs.cleanupReleasedInode(fh.Ino, fh.Path)
 }
 
 // flushHandleDebounced wraps flushHandle with optional debouncing for small files.

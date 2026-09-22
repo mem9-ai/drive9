@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
@@ -23,6 +24,9 @@ const (
 	MaxTotalBytes = 64 << 20
 	MaxPathBytes  = 4096
 	MaxDepth      = 128
+	// MaxPathSegmentRunes matches file_nodes.name VARCHAR(255). Rejecting at
+	// the wire boundary keeps malformed manifests out of the SQL transaction.
+	MaxPathSegmentRunes = 255
 	// MaxRequestBodyBytes allows for base64 expansion plus bounded metadata.
 	MaxRequestBodyBytes = 96 << 20
 )
@@ -137,6 +141,9 @@ func ValidateTarget(target string) error {
 	if len(target) > MaxPathBytes {
 		return fmt.Errorf("%w: target path", ErrLimitExceeded)
 	}
+	if err := validatePathSegments(strings.Trim(target, "/")); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -196,6 +203,11 @@ func validateEntry(entry Entry, maxFileBytes int64) error {
 	if len(rel) > MaxPathBytes || pathDepth(rel) > MaxDepth {
 		return fmt.Errorf("%w: path %q", ErrLimitExceeded, rel)
 	}
+	if rel != "." {
+		if err := validatePathSegments(rel); err != nil {
+			return err
+		}
+	}
 	if entry.Mode&^uint32(0o777) != 0 {
 		return fmt.Errorf("%w: mode", ErrInvalidRequest)
 	}
@@ -217,6 +229,15 @@ func validateEntry(entry Entry, maxFileBytes int64) error {
 		}
 	default:
 		return fmt.Errorf("%w: entry type %q", ErrInvalidRequest, entry.Type)
+	}
+	return nil
+}
+
+func validatePathSegments(p string) error {
+	for _, segment := range strings.Split(p, "/") {
+		if utf8.RuneCountInString(segment) > MaxPathSegmentRunes {
+			return fmt.Errorf("%w: path segment", ErrLimitExceeded)
+		}
 	}
 	return nil
 }

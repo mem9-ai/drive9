@@ -85,6 +85,38 @@ func TestValidateRejectsBounds(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsPathSegmentsLongerThanDatabaseNameColumn(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		target  string
+		entries []Entry
+	}{
+		{
+			name:    "target basename",
+			target:  "/project/" + strings.Repeat("x", MaxPathSegmentRunes+1) + "/",
+			entries: []Entry{{RelativePath: ".", Type: EntryDirectory, Mode: 0o755}},
+		},
+		{
+			name:   "entry basename",
+			target: "/project/site/",
+			entries: []Entry{
+				{RelativePath: ".", Type: EntryDirectory, Mode: 0o755},
+				{RelativePath: strings.Repeat("界", MaxPathSegmentRunes+1), Type: EntryDirectory, Mode: 0o755},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := PublishRequest{
+				OperationID: "0123456789abcdef", Target: tt.target, Entries: tt.entries,
+				ManifestSHA256: ManifestSHA256(tt.entries),
+			}
+			if err := Validate(req, 50_000); !errors.Is(err, ErrLimitExceeded) {
+				t.Fatalf("Validate error = %v, want %v", err, ErrLimitExceeded)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsSpecialPermissionBits(t *testing.T) {
 	entries := []Entry{{RelativePath: ".", Type: EntryDirectory, Mode: 0o1755}}
 	req := PublishRequest{

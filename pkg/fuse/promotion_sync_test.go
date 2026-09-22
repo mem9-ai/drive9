@@ -298,6 +298,50 @@ func TestPromotionOutcomeUnknownBlocksNamespaceReadsAndFlushes(t *testing.T) {
 	}
 }
 
+func TestPromotionOutcomeUnknownReleaseDropsHandleWithoutCommit(t *testing.T) {
+	var remoteCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 2})
+	}))
+	defer server.Close()
+
+	fs := newPromotionTestFS(t, server.URL)
+	ino := fs.inodes.Lookup("/blocked-release.txt", false, 0, time.Now())
+	dirty := NewWriteBuffer("/blocked-release.txt", 1024, 0)
+	if _, err := dirty.Write(0, []byte("must not be published by Release")); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        "/blocked-release.txt",
+		Dirty:       dirty,
+		IsNew:       true,
+		WritePolicy: WritePolicyCloseSync,
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, dirty.Size())
+	fhID := fs.allocateFileHandle(fh)
+	fs.promotionBlocked.Store(true)
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: fhID})
+
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls after blocked Release = %d, want 0", got)
+	}
+	if _, ok := fs.fileHandles.Get(fhID); ok {
+		t.Fatal("blocked Release left the file handle registered")
+	}
+	if fs.openHandles.Has(ino, fh.Path) {
+		t.Fatal("blocked Release left the handle in the open-handle index")
+	}
+	if _, ok := fs.dirtyHandleSize(ino); ok {
+		t.Fatal("blocked Release left authoritative dirty-size state")
+	}
+	if fh.Dirty.HasDirtyParts() {
+		t.Fatal("blocked Release left dirty bytes eligible for a later hidden flush")
+	}
+}
+
 func TestSynchronousPromotionRejectsOpenSourceBeforeRemoteSideEffect(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
