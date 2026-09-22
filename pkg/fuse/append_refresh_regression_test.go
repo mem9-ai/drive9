@@ -95,7 +95,7 @@ func TestWritableRehomePreservesProcessLocalAncestors(t *testing.T) {
 		source.Unlock()
 		t.Fatal(err)
 	}
-	if err := fs.snapshotWriteBackLocked(source); err != nil {
+	if err := fs.snapshotWriteBackLocked(source, true); err != nil {
 		source.Unlock()
 		t.Fatal(err)
 	}

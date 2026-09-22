@@ -4542,7 +4542,13 @@ func (fs *Dat9FS) enqueueStagedShadowCommitLocked(fh *FileHandle) error {
 	return nil
 }
 
-func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
+// snapshotWriteBackLocked stages the handle's current contents into the
+// write-back cache. durable selects whether the snapshot's own .dat/.meta
+// writes fsync: pass false only when a durable shadow stage + pending-index
+// entry for the same contents already exist (the Flush post-stage path), so
+// the snapshot remains a pure cache; pass true when the snapshot is the only
+// persisted copy (fallback paths without shadow/pendingIndex).
+func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle, durable bool) error {
 	if fs.writeBack == nil {
 		return nil
 	}
@@ -4603,7 +4609,15 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 	bvDur := time.Since(bvStart)
 
 	snapshotID, parentSnapshotID := ensureStagedSnapshotLineageLocked(fh)
-	gen, timings, err := fs.writeBack.PutWithBaseRevAndModeAndLineageTimings(
+	putFn := fs.writeBack.PutWithBaseRevAndModeAndLineageTimings
+	if !durable {
+		// The durable authority for this payload is the shadow store +
+		// pending index (staged durably before this snapshot); the write-back
+		// .dat/.meta are a read/upload cache, so skip their fsyncs (issue
+		// #960: ~12ms of redundant per-close fsyncs on cloud volumes).
+		putFn = fs.writeBack.PutWithBaseRevAndModeAndLineageTimingsNoSync
+	}
+	gen, timings, err := putFn(
 		fh.Path,
 		data,
 		fh.Dirty.Size(),
@@ -14719,7 +14733,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 						// the snapshot or falls back to the synchronous flush —
 						// the staged shadow + pendingIndex already carry the
 						// durable commit path.
-						if err := fs.snapshotWriteBackLocked(fh); err != nil {
+						if err := fs.snapshotWriteBackLocked(fh, false); err != nil {
 							safeLogPrintf("writeback snapshot failed for %s: %v", fh.Path, err)
 						} else {
 							fh.WriteBackSeq = fh.DirtySeq
@@ -14731,7 +14745,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 
 				phase = "small-snapshot-writeback"
 				snapWBStart2 := time.Now()
-				if err := fs.snapshotWriteBackLocked(fh); err != nil {
+				if err := fs.snapshotWriteBackLocked(fh, true); err != nil {
 					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
 					safeLogPrintf("writeback cache put failed for %s: %v, falling back to sync upload", fh.Path, err)
 				} else {
@@ -14953,7 +14967,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 						return gofuse.OK
 					}
 					phase = "large-snapshot-writeback"
-					if err := fs.snapshotWriteBackLocked(fh); err != nil {
+					if err := fs.snapshotWriteBackLocked(fh, false); err != nil {
 						safeLogPrintf("flush: writeback snapshot failed for %s: %v", fh.Path, err)
 					} else {
 						// See the small-snapshot-writeback path: only claim a
@@ -15183,7 +15197,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 					}
 				} else {
 					fs.releaseHandleRemoteCommitPathLocked(fh)
-					if err := fs.snapshotWriteBackLocked(fh); err != nil {
+					if err := fs.snapshotWriteBackLocked(fh, true); err != nil {
 						safeLogPrintf("fsync writeback snapshot failed for %s: %v", fh.Path, err)
 					} else {
 						// See the small-snapshot-writeback path: only claim a

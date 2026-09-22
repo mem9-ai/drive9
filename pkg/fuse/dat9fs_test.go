@@ -19594,7 +19594,7 @@ func TestSnapshotWriteBackShadowSpillUsesAuthoritativeShadow(t *testing.T) {
 	}
 	fh.DirtySeq = fs.markDirtySize(42, 512)
 
-	if err := fs.snapshotWriteBackLocked(fh); err != nil {
+	if err := fs.snapshotWriteBackLocked(fh, true); err != nil {
 		t.Fatalf("snapshotWriteBackLocked: %v", err)
 	}
 	got, ok := wbCache.Get(path)
@@ -19667,7 +19667,7 @@ func TestSnapshotWriteBackNewShadowSpillFileUsesShadow(t *testing.T) {
 	}
 	fh.DirtySeq = fs.markDirtySize(42, 512)
 
-	if err := fs.snapshotWriteBackLocked(fh); err != nil {
+	if err := fs.snapshotWriteBackLocked(fh, true); err != nil {
 		t.Fatalf("snapshotWriteBackLocked: %v", err)
 	}
 	got, ok := wbCache.Get(path)
