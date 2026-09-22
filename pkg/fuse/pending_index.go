@@ -32,6 +32,11 @@ type PendingIndex struct {
 	// content durable (shadow fsync / durable snapshot) BEFORE Put, which the
 	// staging paths already guarantee.
 	journal *Journal
+	// journalSyncOnPut controls whether Put fsyncs the WAL frame it appends.
+	// Legacy (true): every close pays a group-committed fsync. Lazy staging
+	// (issue #964, false): the frame lands in the kernel page cache and a
+	// background SyncLoop / fsync(2) / umount make it durable.
+	journalSyncOnPut bool
 }
 
 // SetJournal wires the WAL used for durable pending-meta publication. It is
@@ -44,7 +49,18 @@ func (idx *PendingIndex) SetJournal(j *Journal) {
 	defer idx.mu.Unlock()
 	if idx.journal == nil {
 		idx.journal = j
+		idx.journalSyncOnPut = true
 	}
+}
+
+// SetJournalSyncOnPut toggles per-Put WAL fsyncs (see journalSyncOnPut).
+func (idx *PendingIndex) SetJournalSyncOnPut(on bool) {
+	if idx == nil {
+		return
+	}
+	idx.mu.Lock()
+	idx.journalSyncOnPut = on
+	idx.mu.Unlock()
 }
 
 // pendingPathLock is a refcounted per-path mutex, mirroring WriteBackCache's
@@ -236,6 +252,7 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 	}
 	idx.mu.RLock()
 	journal := idx.journal
+	syncOnPut := idx.journalSyncOnPut
 	idx.mu.RUnlock()
 	if journal != nil {
 		// WAL route: one group-committed fsync covers this record (and any
@@ -250,8 +267,10 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 		}); err != nil {
 			return 0, fmt.Errorf("pending index journal append: %w", err)
 		}
-		if err := journal.FsyncShared(); err != nil {
-			return 0, fmt.Errorf("pending index journal fsync: %w", err)
+		if syncOnPut {
+			if err := journal.FsyncShared(); err != nil {
+				return 0, fmt.Errorf("pending index journal fsync: %w", err)
+			}
 		}
 	} else {
 		metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")

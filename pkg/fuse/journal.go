@@ -1,12 +1,14 @@
 package fuse
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"os"
 	"sync"
+	"time"
 	"sync/atomic"
 )
 
@@ -195,6 +197,34 @@ func (j *Journal) FsyncShared() error {
 	return nil
 }
 
+// SyncLoop periodically calls FsyncShared until the channel closes, bounding
+// the power-loss exposure of un-fsynced appends (issue #964). It stops on
+// channel close or context cancellation and returns.
+func (j *Journal) SyncLoop(ctx context.Context, interval time.Duration) {
+	if j == nil || interval <= 0 {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			_ = j.FsyncShared()
+		}
+	}
+}
+
+// DurableSeq reports the highest journal sequence known to be on stable
+// storage (advanced only by successful fsyncs). Exposed for tests and
+// diagnostics.
+func (j *Journal) DurableSeq() uint64 {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.doneGen
+}
+
 // Replay reads all entries from the journal file and calls fn for each
 // valid entry. Corrupt entries (bad CRC or truncated) are skipped, and
 // replay continues from the next valid entry boundary.
@@ -292,7 +322,7 @@ func (j *Journal) Close() error {
 //
 // Entries whose .meta survived (already present in the pending index) are
 // left untouched: the .meta file carries strictly more metadata than the WAL.
-func replayJournalIntoPending(j *Journal, idx *PendingIndex) error {
+func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStore) error {
 	if j == nil || idx == nil {
 		return nil
 	}
@@ -331,6 +361,22 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex) error {
 			return nil
 		}
 		if fromMeta {
+			var meta WriteBackMeta
+			if err := json.Unmarshal(e.Meta, &meta); err != nil {
+				return fmt.Errorf("journal replay resurrect %s: %w", path, err)
+			}
+			// Issue #964: close staging is un-fsynced, so the WAL meta frame
+			// may reach disk while the shadow content did not. A frame whose
+			// content is short is a lost file (same outcome as ext4 dropping
+			// un-flushed page cache) — drop the entry instead of uploading
+			// torn bytes.
+			if meta.ShadowSpill && shadows != nil {
+				if size, ok := shadows.ContentSize(path); ok && size < meta.Size {
+					// Partial content: the file is not recoverable.
+					shadows.Remove(path)
+					return nil
+				}
+			}
 			if err := idx.publishRecoveredMeta(e.Meta); err != nil {
 				return fmt.Errorf("journal replay resurrect %s: %w", path, err)
 			}

@@ -122,6 +122,7 @@ type Dat9FS struct {
 
 	// journal is the append-only WAL for crash recovery (P1).
 	journal *Journal
+	journalSyncerCancel context.CancelFunc
 
 	// commitQueue is the ordered background remote commit queue (P1).
 	commitQueue *CommitQueue
@@ -8517,6 +8518,13 @@ func (fs *Dat9FS) hasQueuedCommit(p string) bool {
 	return fs.commitQueue != nil && fs.commitQueue.HasPath(p)
 }
 
+// stageDurableAtClose reports whether close-path staging fsyncs its local
+// artifacts. Legacy: true (power-loss safe close). Issue #964 lazy staging:
+// false — plain writes into the kernel page cache, ext4-equivalent ladder.
+func (fs *Dat9FS) stageDurableAtClose() bool {
+	return fs == nil || fs.opts == nil || !fs.opts.WritebackLazyStaging
+}
+
 func (fs *Dat9FS) waitQueuedRemoteCommitBeforeWrite(p string) func() {
 	if fs == nil || p == "" {
 		return func() {}
@@ -14709,7 +14717,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					phase = "small-stage-shadow"
 					stageStart := time.Now()
 					fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
-					err := fs.stageShadowForQueuedCommitLocked(fh, true)
+					err := fs.stageShadowForQueuedCommitLocked(fh, fs.stageDurableAtClose())
 					if errors.Is(err, syscall.EAGAIN) {
 						return gofuse.EAGAIN
 					}
@@ -14789,7 +14797,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			size := fh.Dirty.Size()
 			stageStart := time.Now()
 			fs.debugf("flush shadowspill stage start path=%s size=%d durable=true", fh.Path, size)
-			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			err := fs.stageShadowForQueuedCommitLocked(fh, fs.stageDurableAtClose())
 			if errors.Is(err, syscall.EAGAIN) {
 				return gofuse.EAGAIN
 			}
@@ -14954,7 +14962,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				size := fh.Dirty.Size()
 				stageStart := time.Now()
 				fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
-				err := fs.stageShadowForQueuedCommitLocked(fh, true)
+				err := fs.stageShadowForQueuedCommitLocked(fh, fs.stageDurableAtClose())
 				if errors.Is(err, syscall.EAGAIN) {
 					return gofuse.EAGAIN
 				}
@@ -17089,7 +17097,11 @@ func (fs *Dat9FS) FlushAll() {
 
 	// Close journal.
 	if fs.journal != nil {
-		_ = fs.journal.Close()
+		if fs.journalSyncerCancel != nil {
+		fs.journalSyncerCancel()
+	}
+	_ = fs.journal.FsyncShared()
+	_ = fs.journal.Close()
 	}
 
 	// Close shadow store.
