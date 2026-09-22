@@ -38,7 +38,7 @@ func TestLazyStagingSurvivesDaemonRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer j2.Close()
+	t.Cleanup(func() { _ = j2.Close() })
 	idx2, err := NewPendingIndex(filepath.Join(dir, "pending"))
 	if err != nil {
 		t.Fatalf("pending2: %v", err)
@@ -61,7 +61,7 @@ func TestLazyStagingTornShadowDropped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("journal: %v", err)
 	}
-	defer j.Close()
+	t.Cleanup(func() { _ = j.Close() })
 
 	shadowDir := filepath.Join(dir, "shadow")
 	if err := os.MkdirAll(shadowDir, 0o755); err != nil {
@@ -114,7 +114,7 @@ func TestJournalSyncLoopBounded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go j.SyncLoop(ctx, 20*time.Millisecond)
-	defer j.Close()
+	t.Cleanup(func() { _ = j.Close() })
 
 	if err := j.Append(JournalEntry{Op: JournalWrite, Path: "/w/s1"}); err != nil {
 		t.Fatalf("append: %v", err)

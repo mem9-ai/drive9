@@ -539,7 +539,11 @@ wbSyncWindow := fs.String("writeback-sync-window", "1s", "write-back close stagi
 		return err
 	}
 	if wbLazyStaging && writePolicyVal != fuseWritePolicyWriteBack {
-		return fmt.Errorf("drive9 mount: --writeback-sync-window applies to write-back durability (auto, interactive, fsync)")
+		// close-sync/write-sync pay synchronous durability at every
+		// write/close; lazy staging is meaningless there. Downgrade to the
+		// legacy flag value instead of erroring, so default-argument mounts
+		// of the strict tiers keep working (issue #964).
+		wbLazyStaging, wbSyncWindowDur = false, 0
 	}
 	if *writeBackBatchWindow > 0 && writePolicyVal != fuseWritePolicyWriteBack {
 		return fmt.Errorf("drive9 mount: --writeback-batch-window requires --durability auto, interactive, or fsync")
