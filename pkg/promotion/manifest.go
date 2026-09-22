@@ -24,10 +24,6 @@ const (
 	MaxTotalBytes = 64 << 20
 	MaxPathBytes  = 4096
 	MaxDepth      = 128
-	// AccountingIncompleteCode is returned by the side-effect-free result
-	// lookup when the namespace receipt is durable but the exact POST still
-	// needs to finish its accounting handoff.
-	AccountingIncompleteCode = "promotion_accounting_incomplete"
 	// MaxPathSegmentRunes matches file_nodes.name VARCHAR(255). Rejecting at
 	// the wire boundary keeps malformed manifests out of the SQL transaction.
 	MaxPathSegmentRunes = 255

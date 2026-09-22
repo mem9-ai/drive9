@@ -71,9 +71,9 @@ The three wire operations form one cross-repository contract. `POST` publishes
 the namespace and its receipt in the same transaction, completes any pending
 accounting for an exact retry, and emits the structural reset event before it
 returns success. Side-effect-free `GET` is keyed by `(target, operation ID)`
-and returns the completed committed receipt, the explicit
-`promotion_accounting_incomplete` state for a durable namespace receipt whose
-handoff still needs an exact `POST`, or `404` when no receipt exists. It
+and returns `200` with the completed immutable receipt, `202` with the same
+authoritative receipt tuple when the namespace is committed but accounting
+still needs an exact `POST`, or `404` when no receipt exists. It
 performs no accounting and emits no event. After the client has durably persisted
 `released`, `DELETE` carries
 the exact `(target, operation ID, manifest digest)` tuple; it is idempotent and
@@ -88,9 +88,9 @@ and the cross-mount structural reset on the successful `POST` boundary. Whether
 any request may have reached the server is sticky across those retries: a later
 local/proxy rejection plus `NotFound` cannot disprove an earlier in-flight
 attempt. A committed matching result plus that successful exact retry means it
-may finish the local source transition. On startup, an explicit matching
-`promotion_accounting_incomplete` result proves the namespace receipt already
-committed; recovery revalidates the local manifest and sends the exact `POST`
+may finish the local source transition. On startup, a matching `202` result
+proves the namespace receipt already committed; recovery revalidates both the
+authoritative tuple and local manifest, then sends the exact `POST`
 to finish the handoff. Startup never turns a prepared local record with an
 absent server result into a new publish; it fails closed instead. A single
 receipt `NotFound` is not proof that a publish request from the crashed process
@@ -140,8 +140,8 @@ before any request or local mutation if that identity no longer matches.
   leave the source unchanged. A failed delete can only be retried as cleanup;
   it cannot publish on restart.
 - Unknown response: query the same operation ID. Restart moves forward from a
-  matching completed result, or from an explicit matching accounting-incomplete
-  receipt by revalidating the local manifest and retrying the exact `POST`.
+  matching completed result, or from a matching `202` receipt by revalidating
+  the authoritative tuple and local manifest before retrying the exact `POST`.
   A true `404` never causes a startup `POST`.
 - Committed result: move the source into an operation-ID-private quarantine
   directory, fsync both parent directories, persist `released`, and update the

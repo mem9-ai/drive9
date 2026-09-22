@@ -262,7 +262,7 @@ func (fs *Dat9FS) publishPreparedPromotionWithRecovery(ctx context.Context, requ
 		// authority to abandon outcome resolution. Keep request values, detach
 		// cancellation, and bound the lookup independently; the durable journal
 		// remains the fallback if this bounded lookup cannot decide.
-		stored, statusErr := fs.getPromotionResult(lookupCtx, request.OperationID, request.Target)
+		stored, _, statusErr := fs.getPromotionResult(lookupCtx, request.OperationID, request.Target)
 		if statusErr == nil {
 			if !matchingPromotionResult(request, stored) {
 				return stored, true, nil
@@ -271,14 +271,6 @@ func (fs *Dat9FS) publishPreparedPromotionWithRecovery(ctx context.Context, requ
 			// side-effect-free. Continue with the same operation ID until an exact
 			// POST retry succeeds and completes accounting plus the structural
 			// reset event. If that never happens, keep the journal fail-closed.
-			continue
-		}
-		if promotionAccountingIncomplete(statusErr) {
-			// The pure lookup proves this exact operation key already has a
-			// durable namespace receipt. Only the exact POST may advance its
-			// accounting handoff, so keep retrying instead of treating this as
-			// either absence or a generic lookup outage.
-			mayHaveReachedServer = true
 			continue
 		}
 		if client.IsNotFound(statusErr) {
@@ -296,12 +288,6 @@ func (fs *Dat9FS) publishPreparedPromotionWithRecovery(ctx context.Context, requ
 		break
 	}
 	return nil, false, lastErr
-}
-
-func promotionAccountingIncomplete(err error) bool {
-	var statusErr *client.StatusError
-	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusConflict &&
-		statusErr.Code == promotion.AccountingIncompleteCode
 }
 
 func promotionRequestDefinitelyRejected(err error) bool {
@@ -852,8 +838,12 @@ func (fs *Dat9FS) recoverSynchronousPromotion(ctx context.Context) error {
 		fs.scheduleReleasedPromotionCleanup(*record)
 		return nil
 	}
-	result, statusErr := fs.getPromotionResult(ctx, record.OperationID, record.TargetRemote)
-	if promotionAccountingIncomplete(statusErr) {
+	result, accountingIncomplete, statusErr := fs.getPromotionResult(ctx, record.OperationID, record.TargetRemote)
+	if accountingIncomplete {
+		if result == nil || !result.Committed || result.OperationID != record.OperationID ||
+			result.Target != record.TargetRemote || result.ManifestSHA256 != record.ManifestSHA256 {
+			return fs.refusePromotionRecovery(record, "accounting-incomplete promotion result does not match local record")
+		}
 		request, scanErr := fs.scanPromotionTree(ctx, record.Source, record.TargetLocal, record.TargetRemote, record.OperationID)
 		if scanErr != nil || request.ManifestSHA256 != record.ManifestSHA256 {
 			return fs.refusePromotionRecovery(record, "promotion source does not match accounting-incomplete receipt manifest")
@@ -883,7 +873,8 @@ func (fs *Dat9FS) recoverSynchronousPromotion(ctx context.Context) error {
 		// identity so an operator can follow the documented recovery procedure.
 		return fs.refusePromotionRecovery(record, "promotion receipt is absent; refusing unsafe startup replay or journal deletion")
 	}
-	if result == nil || !result.Committed || result.Target != record.TargetRemote || result.ManifestSHA256 != record.ManifestSHA256 {
+	if result == nil || !result.Committed || result.OperationID != record.OperationID ||
+		result.Target != record.TargetRemote || result.ManifestSHA256 != record.ManifestSHA256 {
 		return fs.refusePromotionRecovery(record, "promotion result does not match local record")
 	}
 	record.Phase = promotionPhaseCommitted

@@ -1034,9 +1034,12 @@ func TestPromotionHTTPUsesClientActorAndRedirectCredentialPolicy(t *testing.T) {
 	opts := &MountOptions{CacheSize: 1 << 20, Profile: MountProfileCodingAgent, LocalRoot: t.TempDir(), EnableSynchronousPromotion: true, actorID: actor}
 	opts.setDefaults()
 	fs := NewDat9FS(c, opts)
-	got, err := fs.getPromotionResult(context.Background(), result.OperationID, result.Target)
+	got, incomplete, err := fs.getPromotionResult(context.Background(), result.OperationID, result.Target)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if incomplete {
+		t.Fatal("completed redirect lookup reported accounting incomplete")
 	}
 	if got.OperationID != result.OperationID {
 		t.Fatalf("operation ID = %q, want %q", got.OperationID, result.OperationID)
@@ -1071,9 +1074,12 @@ func TestPromotionHTTPKeepsRequestContextAliveWhileReadingBody(t *testing.T) {
 	defer server.Close()
 
 	fs := newPromotionTestFS(t, server.URL)
-	got, err := fs.getPromotionResult(context.Background(), result.OperationID, result.Target)
+	got, incomplete, err := fs.getPromotionResult(context.Background(), result.OperationID, result.Target)
 	if err != nil {
 		t.Fatalf("get delayed promotion result: %v", err)
+	}
+	if incomplete {
+		t.Fatal("completed delayed lookup reported accounting incomplete")
 	}
 	if *got != result {
 		t.Fatalf("result = %+v, want %+v", got, result)
@@ -1609,10 +1615,8 @@ func TestSynchronousPromotionStartupRecoveryCompletesAccountingIncompleteReceipt
 		switch r.Method {
 		case http.MethodGet:
 			getCalls.Add(1)
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error": "promotion accounting incomplete", "code": promotion.AccountingIncompleteCode,
-			})
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(result)
 		case http.MethodPost:
 			postCalls.Add(1)
 			var request promotion.PublishRequest
@@ -1662,6 +1666,58 @@ func TestSynchronousPromotionStartupRecoveryCompletesAccountingIncompleteReceipt
 	}
 	if _, err := fs.localOverlay.Lstat(record.Source); !os.IsNotExist(err) {
 		t.Fatalf("source after recovery: %v", err)
+	}
+}
+
+func TestSynchronousPromotionStartupRecoveryRejectsMismatchedAccountingIncompleteReceipt(t *testing.T) {
+	var getCalls, postCalls atomic.Int32
+	result := promotion.Result{
+		OperationID: "01234567-89ab-cdef-0123-456789abcdef", Target: "/project/site/",
+		ManifestSHA256: strings.Repeat("f", 64), Committed: true,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getCalls.Add(1)
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(result)
+		case http.MethodPost:
+			postCalls.Add(1)
+			http.Error(w, "mismatched receipt must not be retried", http.StatusInternalServerError)
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	fs := newPromotionTestFS(t, server.URL)
+	createPromotionTestTree(t, fs)
+	request, err := fs.scanPromotionTree(context.Background(), "/project/dist/.site-next", "/project/site", result.Target, result.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := localPromotionRecord{
+		OperationID: result.OperationID, Source: "/project/dist/.site-next", TargetLocal: "/project/site",
+		RemoteIdentitySHA256: fs.promotionRemoteIdentitySHA256(), TargetRemote: request.Target,
+		ManifestSHA256: request.ManifestSHA256, Phase: promotionPhasePrepared,
+	}
+	if err := fs.writePromotionRecord(record); err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.recoverSynchronousPromotion(context.Background())
+	var refusal *promotionRecoveryRefusal
+	if !errors.As(err, &refusal) {
+		t.Fatalf("recovery error = %T %v, want permanent refusal", err, err)
+	}
+	if exitErr := promotionRecoveryMountExit(err); exitErr.Code != ExitStartupPermanent {
+		t.Fatalf("mount exit = %+v, want permanent startup", exitErr)
+	}
+	if getCalls.Load() != 1 || postCalls.Load() != 0 {
+		t.Fatalf("calls get=%d post=%d, want 1/0", getCalls.Load(), postCalls.Load())
+	}
+	if _, err := fs.localOverlay.Lstat(record.Source); err != nil {
+		t.Fatalf("source changed after mismatched incomplete receipt: %v", err)
 	}
 }
 
@@ -2033,10 +2089,8 @@ func TestPromotionAccountingIncompleteLookupRetriesExactPost(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(result)
 		case http.MethodGet:
 			getCalls.Add(1)
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error": "promotion accounting incomplete", "code": promotion.AccountingIncompleteCode,
-			})
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(result)
 		default:
 			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
 		}

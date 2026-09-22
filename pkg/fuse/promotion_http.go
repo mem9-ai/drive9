@@ -42,9 +42,24 @@ func (fs *Dat9FS) publishPreparedPromotionRequest(ctx context.Context, body []by
 	return fs.doPromotionResult(ctx, http.MethodPost, "/v1/fs:promotion", bytes.NewReader(body))
 }
 
-func (fs *Dat9FS) getPromotionResult(ctx context.Context, operationID, target string) (*promotion.Result, error) {
+func (fs *Dat9FS) getPromotionResult(ctx context.Context, operationID, target string) (*promotion.Result, bool, error) {
 	query := url.Values{"operation_id": []string{operationID}, "target": []string{target}}
-	return fs.doPromotionResult(ctx, http.MethodGet, "/v1/fs:promotion?"+query.Encode(), nil)
+	callCtx, cancel := context.WithTimeout(ctx, promotionRequestTimeout)
+	defer cancel()
+	resp, err := fs.doPromotionHTTP(callCtx, http.MethodGet, "/v1/fs:promotion?"+query.Encode(), nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, false, readPromotionHTTPError(resp)
+	}
+	var result promotion.Result
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, 1<<20))
+	if err := decoder.Decode(&result); err != nil {
+		return nil, false, fmt.Errorf("decode promotion result: %w", err)
+	}
+	return &result, resp.StatusCode == http.StatusAccepted, nil
 }
 
 func (fs *Dat9FS) acknowledgePromotionResult(ctx context.Context, result promotion.Result) error {
