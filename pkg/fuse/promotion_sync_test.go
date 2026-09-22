@@ -1930,8 +1930,15 @@ func waitForPromotionCleanup(t *testing.T, fs *Dat9FS) {
 			// Wait for its lifecycle critical section to finish so tests may
 			// safely restore process-wide durability failpoints.
 			fs.promotionLifecycleMu.Lock()
+			_, lockedErr := os.Lstat(fs.promotionRecordPath())
 			fs.promotionLifecycleMu.Unlock()
-			return
+			if os.IsNotExist(lockedErr) {
+				return
+			}
+			if lockedErr != nil {
+				t.Fatalf("stat promotion journal after cleanup synchronization: %v", lockedErr)
+			}
+			continue
 		}
 		if err != nil {
 			t.Fatalf("stat promotion journal: %v", err)
