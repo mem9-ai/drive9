@@ -197,6 +197,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
 	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
+	synchronousPromotion := fs.Bool("synchronous-promotion", false, "preview: synchronously publish a closed local-only directory to an absent remote target")
 	var localOnlyPatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
 	var appendLogPatterns stringListFlag
@@ -639,6 +640,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			return err
 		}
 	}
+	if *synchronousPromotion && resolved != MountModeFUSE {
+		return fmt.Errorf("drive9 mount: --synchronous-promotion requires --mode=fuse")
+	}
+	if *synchronousPromotion && runtime.GOOS == "windows" {
+		return fmt.Errorf("drive9 mount: --synchronous-promotion is not supported on Windows")
+	}
 	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
 		return err
 	}
@@ -841,6 +848,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		LayerRef:                     strings.TrimSpace(*layerRef),
 		CheckpointRef:                strings.TrimSpace(*checkpointRef),
 		LocalRoot:                    normalizedLocalRoot,
+		EnableSynchronousPromotion:   *synchronousPromotion,
 		LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 		RemoteOnlyPatterns:           append([]string(nil), effectiveRemoteOnlyPatterns...),
 		AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),

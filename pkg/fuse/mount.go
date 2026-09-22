@@ -91,6 +91,7 @@ type MountOptions struct {
 	Debug                        bool          // enable FUSE debug logging
 	PerfCounters                 bool          // print low-overhead FUSE perf counter summary on shutdown
 	EnableGitWorkspaces          bool          // enable fast-clone git workspace overlay discovery
+	EnableSynchronousPromotion   bool          // preview: synchronously publish a closed local-only tree to an absent remote target
 	Profiling                    ProfilingOptions
 	// RemoteCommitWaitTimeout bounds how long a FUSE write/flush handler waits
 	// for a background commit to finish before proceeding anyway. This prevents
@@ -102,6 +103,7 @@ type MountOptions struct {
 	SkipProcessState bool
 	// Supervised marks this worker as managed by an external supervisor (logging only).
 	Supervised bool
+	actorID    string
 }
 
 const defaultUploadConcurrency = 16
@@ -289,6 +291,13 @@ func remoteRootValidationError(remoteRoot string, err error) *MountExitError {
 	return ExitStartupTransientErr(fmt.Sprintf("remote root %q", remoteRoot), err)
 }
 
+func promotionRecoveryMountExit(err error) *MountExitError {
+	if isPermanentPromotionRecoveryError(err) {
+		return ExitStartupPermanentErr("recover synchronous promotion", err)
+	}
+	return ExitStartupTransientErr("recover synchronous promotion", err)
+}
+
 // Mount creates and serves a FUSE mount. It blocks until the filesystem
 // is unmounted or a signal (SIGINT, SIGTERM) is received.
 func Mount(opts *MountOptions) (err error) {
@@ -298,6 +307,20 @@ func Mount(opts *MountOptions) (err error) {
 	opts.setDefaults()
 	if err := validateMountOptionsProfile(opts); err != nil {
 		return ExitStartupPermanentErr("invalid mount profile", err)
+	}
+	if opts.EnableSynchronousPromotion && strings.TrimSpace(opts.LocalRoot) == "" {
+		return ExitStartupPermanentErr("synchronous promotion requires LocalRoot", nil)
+	}
+	var promotionRootLock *os.File
+	// LocalRoot is a single-writer store regardless of whether this process is
+	// allowed to begin a new promotion. Otherwise a gate-off mount could race an
+	// enabled mount, or serve a root that still has a pending promotion journal.
+	if strings.TrimSpace(opts.LocalRoot) != "" && (runtime.GOOS != "windows" || opts.EnableSynchronousPromotion) {
+		promotionRootLock, err = acquirePromotionRootLock(opts.LocalRoot)
+		if err != nil {
+			return ExitStartupPermanentErr("lock LocalRoot", err)
+		}
+		defer releasePromotionRootLock(promotionRootLock)
 	}
 	var (
 		mountBecameActive bool
@@ -363,6 +386,7 @@ func Mount(opts *MountOptions) (err error) {
 
 	// Generate per-mount actor ID for SSE self-filtering.
 	actorID := generateMountID()
+	opts.actorID = actorID
 
 	// Create client and verify connectivity. The constructor choice binds
 	// the mount's principal kind for its entire lifetime (see Invariant #3
@@ -382,6 +406,16 @@ func Mount(opts *MountOptions) (err error) {
 		return ExitStartupPermanentErr("normalize remote root", err)
 	}
 	opts.RemoteRoot = remoteRoot
+	// Validate any durable local journal against this exact server/principal
+	// before the mount makes its first remote request. A LocalRoot accidentally
+	// restarted against another tenant must fail closed without probing it.
+	dat9fs := NewDat9FS(c, opts)
+	dat9fs.promotionRootLock = promotionRootLock
+	if dat9fs.localOverlay != nil {
+		if _, err := dat9fs.readPromotionRecord(); err != nil {
+			return ExitStartupPermanentErr("validate synchronous promotion journal", err)
+		}
+	}
 	if err := validateRemoteRoot(context.Background(), c, remoteRoot); err != nil {
 		return err
 	}
@@ -405,8 +439,18 @@ func Mount(opts *MountOptions) (err error) {
 		fmt.Fprintf(os.Stderr, "drive9: fs layer: %s\n", layer.LayerID)
 	}
 
-	// Build FUSE filesystem
-	dat9fs := NewDat9FS(c, opts)
+	// Recover the local filesystem before FUSE begins serving.
+	if dat9fs.localOverlay != nil {
+		recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), promotionRequestTimeout)
+		err := dat9fs.recoverSynchronousPromotion(recoveryCtx)
+		recoveryCancel()
+		if err != nil {
+			if isPermanentPromotionRecoveryError(err) {
+				fmt.Fprintf(os.Stderr, "drive9: synchronous promotion recovery requires operator action: %v\n", err)
+			}
+			return promotionRecoveryMountExit(err)
+		}
+	}
 	layerEventWatcherStop := func() {}
 
 	profiler, err := StartProfiler(opts.Profiling)

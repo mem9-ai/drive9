@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -20,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mem9-ai/drive9/internal/drivehttp"
 	"github.com/mem9-ai/drive9/pkg/extent"
 	"github.com/mem9-ai/drive9/pkg/tagutil"
 )
@@ -182,78 +182,11 @@ func NewWithToken(baseURL, token string) *Client {
 // fix is a discriminator; meanwhile Invariant #7 keeps all authorization
 // decisions server-side.
 func newClient(baseURL, credential string) *Client {
-	// Clone DefaultTransport to preserve Proxy, HTTP/2, dialer, and TLS defaults,
-	// then tune connection pooling for concurrent multipart uploads, prefetch,
-	// and repeated range reads against both drive9 and presigned S3 URLs.
-	// Default MaxIdleConnsPerHost=2 forces new TLS handshakes for every
-	// request beyond 2 in-flight, adding ~50-100ms per connection in WAN
-	// deployments. Keep headroom above uploadMaxConcurrency so reads and
-	// metadata calls do not evict upload connections.
-	var transport *http.Transport
-	if t, ok := http.DefaultTransport.(*http.Transport); ok {
-		transport = t.Clone()
-	} else {
-		transport = &http.Transport{}
-	}
-	transport.MaxIdleConns = 256
-	transport.MaxIdleConnsPerHost = 64
-
-	// Custom DialContext: fall back to public DNS (8.8.8.8, 1.1.1.1) when the
-	// system resolver fails. Fixes DNS on Termux and minimal containers that
-	// lack /etc/resolv.conf.
-	baseDialer := &net.Dialer{Timeout: 10 * time.Second}
-	fallbackResolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
-			// Try Google DNS first, then Cloudflare.
-			conn, err := d.DialContext(ctx, "udp", "8.8.8.8:53")
-			if err != nil {
-				conn, err = d.DialContext(ctx, "udp", "1.1.1.1:53")
-			}
-			return conn, err
-		},
-	}
-	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		// Try system resolver first.
-		conn, err := baseDialer.DialContext(ctx, network, addr)
-		if err == nil {
-			return conn, nil
-		}
-		// Only fall back to public DNS on actual DNS resolution errors.
-		// Non-DNS errors (connection refused, timeout, etc.) should not
-		// leak internal hostnames to public resolvers.
-		var dnsErr *net.DNSError
-		if !errors.As(err, &dnsErr) {
-			return nil, err
-		}
-		host, port, splitErr := net.SplitHostPort(addr)
-		if splitErr != nil {
-			return nil, err // return original error
-		}
-		ips, resolveErr := fallbackResolver.LookupHost(ctx, host)
-		if resolveErr != nil || len(ips) == 0 {
-			return nil, err // return original dial error
-		}
-		return baseDialer.DialContext(ctx, network, net.JoinHostPort(ips[0], port))
-	}
 	return &Client{
 		baseURL:               strings.TrimRight(baseURL, "/"),
 		apiKey:                credential,
 		multipartAbortTimeout: defaultMultipartAbortTimeout,
-		httpClient: &http.Client{
-			Transport: transport,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) > 0 && req.URL.Host != via[0].URL.Host {
-					req.Header.Del("Authorization")
-					req.Header.Del("X-Dat9-Actor")
-				}
-				if len(via) >= 10 {
-					return fmt.Errorf("too many redirects")
-				}
-				return nil
-			},
-		},
+		httpClient:            drivehttp.NewClient(),
 	}
 }
 
@@ -717,12 +650,7 @@ func (c *Client) doNoRedirect(req *http.Request) (*http.Response, error) {
 // doWith applies the client's credential headers to req and executes it with
 // hc. Credential plumbing lives here so do and doNoRedirect cannot drift apart.
 func (c *Client) doWith(req *http.Request, hc *http.Client) (*http.Response, error) {
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-	if c.actor != "" {
-		req.Header.Set("X-Dat9-Actor", c.actor)
-	}
+	drivehttp.ApplyCredentials(req, c.apiKey, c.actor)
 	return hc.Do(req)
 }
 
@@ -1517,23 +1445,8 @@ func (c *Client) ChmodCtx(ctx context.Context, path string, mode uint32) error {
 
 func readError(resp *http.Response) error {
 	body, _ := io.ReadAll(resp.Body)
-	var errResp struct {
-		Error string `json:"error"`
-		Code  string `json:"code"`
-	}
-	if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-		return &StatusError{StatusCode: resp.StatusCode, Message: errResp.Error, Code: errResp.Code}
-	}
-	var nestedErr struct {
-		Error struct {
-			Message string `json:"message"`
-			Code    string `json:"code"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(body, &nestedErr) == nil && nestedErr.Error.Message != "" {
-		return &StatusError{StatusCode: resp.StatusCode, Message: nestedErr.Error.Message, Code: nestedErr.Error.Code}
-	}
-	return &StatusError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body))}
+	message, code := drivehttp.DecodeErrorBody(resp.StatusCode, body)
+	return &StatusError{StatusCode: resp.StatusCode, Message: message, Code: code}
 }
 
 func (c *Client) SQL(query string) ([]map[string]interface{}, error) {

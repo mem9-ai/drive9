@@ -25,6 +25,7 @@ FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 RUN_FUSE_GIT_CLONE="${RUN_FUSE_GIT_CLONE:-0}"
 RUN_FUSE_UMOUNT_DURABLE="${RUN_FUSE_UMOUNT_DURABLE:-0}"
 RUN_FUSE_LOG_AUDIT="${RUN_FUSE_LOG_AUDIT:-0}"
+RUN_SYNCHRONOUS_PROMOTION_E2E="${RUN_SYNCHRONOUS_PROMOTION_E2E:-0}"
 FUSE_GIT_CLONE_URL="${FUSE_GIT_CLONE_URL:-https://github.com/octocat/Hello-World.git}"
 FUSE_GIT_CLONE_TIMEOUT_S="${FUSE_GIT_CLONE_TIMEOUT_S:-180}"
 FUSE_LOG_AUDIT_PATTERN="${FUSE_LOG_AUDIT_PATTERN:-panic|fatal error|Resource temporarily unavailable}"
@@ -58,6 +59,23 @@ check_cmd() {
   fi
 }
 
+# Promotion scenarios must not continue after a failed setup or recovery step:
+# once a mount has fallen back to an ordinary directory, later rename checks
+# can otherwise report false success without exercising FUSE at all.
+require_cmd() {
+  local desc="$1"
+  shift
+  TOTAL=$((TOTAL + 1))
+  if "$@"; then
+    echo "PASS $desc"
+    PASS=$((PASS + 1))
+    return 0
+  fi
+  echo "FAIL $desc"
+  FAIL=$((FAIL + 1))
+  return 1
+}
+
 check_cmd_fail() {
   local desc="$1"
   shift
@@ -69,6 +87,42 @@ check_cmd_fail() {
     echo "PASS $desc"
     PASS=$((PASS + 1))
   fi
+}
+
+# Use the rename(2) syscall directly for cross-layer promotion tests. GNU mv
+# deliberately falls back to copy+delete after EXDEV, which would hide the
+# exact filesystem result these tests are meant to exercise.
+rename_syscall() {
+  python3 - "$1" "$2" <<'PY'
+import os
+import sys
+
+os.rename(sys.argv[1], sys.argv[2])
+PY
+}
+
+rename_syscall_expect_errno() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import errno
+import os
+import sys
+
+source, target, expected_name = sys.argv[1:]
+expected = getattr(errno, expected_name)
+try:
+    os.rename(source, target)
+except OSError as exc:
+    if exc.errno == expected:
+        raise SystemExit(0)
+    print(
+        f"rename({source!r}, {target!r}) returned errno={exc.errno} "
+        f"({exc.strerror}), expected {expected_name}={expected}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+print(f"rename({source!r}, {target!r}) unexpectedly succeeded", file=sys.stderr)
+raise SystemExit(1)
+PY
 }
 
 detect_release_target() {
@@ -391,12 +445,18 @@ PY
 
 wait_mount_state() {
   local expect="$1"
+  wait_mount_point_state "$MOUNT_POINT" "$expect"
+}
+
+wait_mount_point_state() {
+  local mount_point="$1"
+  local expect="$2"
   local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
   while :; do
-    if [ "$expect" = "mounted" ] && is_mounted "$MOUNT_POINT"; then
+    if [ "$expect" = "mounted" ] && is_mounted "$mount_point"; then
       return 0
     fi
-    if [ "$expect" = "unmounted" ] && ! is_mounted "$MOUNT_POINT"; then
+    if [ "$expect" = "unmounted" ] && ! is_mounted "$mount_point"; then
       return 0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
@@ -404,6 +464,184 @@ wait_mount_state() {
     fi
     sleep "$MOUNT_READY_INTERVAL_S"
   done
+}
+
+promotion_mounts_ready() {
+  is_mounted "$1" && is_mounted "$2"
+}
+
+start_promotion_mount() {
+  local mount_point="$1"
+  local local_root="$2"
+  local log_path="$3"
+  local enable_promotion="$4"
+  local pid_var="$5"
+  local server_override="${6:-}"
+  local args=(mount --foreground --mode=fuse --profile=coding-agent --local-root "$local_root")
+  if [ "$enable_promotion" = "1" ]; then
+    args+=(--synchronous-promotion)
+  fi
+  if [ -n "$server_override" ]; then
+    args+=(--server "$server_override")
+  fi
+  mkdir -p "$mount_point" "$local_root"
+  drive9 "${args[@]}" "$mount_point" >>"$log_path" 2>&1 &
+  printf -v "$pid_var" '%s' "$!"
+  local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ! kill -0 "${!pid_var}" >/dev/null 2>&1; then
+      wait "${!pid_var}" >/dev/null 2>&1 || true
+      printf -v "$pid_var" '%s' ""
+      cat "$log_path" >&2 || true
+      return 1
+    fi
+    if is_mounted "$mount_point"; then
+      return 0
+    fi
+    sleep "$MOUNT_READY_INTERVAL_S"
+  done
+  cat "$log_path" >&2 || true
+  kill "${!pid_var}" >/dev/null 2>&1 || true
+  wait "${!pid_var}" >/dev/null 2>&1 || true
+  printf -v "$pid_var" '%s' ""
+  return 1
+}
+
+stop_promotion_mount() {
+  local mount_point="$1"
+  local pid_var="$2"
+  local pid="${!pid_var:-}"
+  if is_mounted "$mount_point"; then
+    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$mount_point" >/dev/null 2>&1 || true
+    wait_mount_point_state "$mount_point" unmounted >/dev/null 2>&1 || true
+  fi
+  if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+  fi
+  printf -v "$pid_var" '%s' ""
+  if is_mounted "$mount_point"; then
+    # A killed mount can remain in the mount table while an interrupted syscall
+    # is being reaped. Retry the normal helper, then use the platform fallback;
+    # never let the next readiness check accept that stale mount as the new one.
+    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$mount_point" >/dev/null 2>&1 || true
+  fi
+  if is_mounted "$mount_point"; then
+    if command -v fusermount3 >/dev/null 2>&1; then
+      fusermount3 -uz "$mount_point" >/dev/null 2>&1 || true
+    elif command -v fusermount >/dev/null 2>&1; then
+      fusermount -uz "$mount_point" >/dev/null 2>&1 || true
+    else
+      umount -f "$mount_point" >/dev/null 2>&1 || true
+    fi
+  fi
+  if ! wait_mount_point_state "$mount_point" unmounted >/dev/null 2>&1; then
+    echo "promotion mount remains mounted after stop: $mount_point" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Starts a tiny test-only reverse proxy. It forwards every request to the live
+# server, but after the first promotion POST has committed it deliberately
+# withholds that one response. Killing the mount at the marker exercises the
+# real durable-journal startup recovery path without adding a production
+# failpoint to drive9-server.
+start_promotion_response_loss_proxy() {
+  local origin="$1"
+  local committed_marker="$2"
+  local port_file="$3"
+  local pid_var="$4"
+  python3 - "$origin" "$committed_marker" "$port_file" <<'PY' &
+import http.client
+import http.server
+import pathlib
+import sys
+import time
+import urllib.parse
+
+origin = urllib.parse.urlsplit(sys.argv[1])
+committed_marker = pathlib.Path(sys.argv[2])
+port_file = pathlib.Path(sys.argv[3])
+
+class Proxy(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_HEAD(self):
+        self.forward()
+
+    def do_GET(self):
+        self.forward()
+
+    def do_POST(self):
+        self.forward()
+
+    def do_DELETE(self):
+        self.forward()
+
+    def log_message(self, _format, *_args):
+        pass
+
+    def forward(self):
+        size = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(size) if size else None
+        connection_type = http.client.HTTPSConnection if origin.scheme == "https" else http.client.HTTPConnection
+        connection = connection_type(origin.hostname, origin.port, timeout=120)
+        headers = {
+            key: value for key, value in self.headers.items()
+            if key.lower() not in {"host", "connection", "content-length", "transfer-encoding"}
+        }
+        connection.request(self.command, self.path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_content_length = response.getheader("Content-Length")
+        response_body = response.read()
+        connection.close()
+
+        if self.command == "POST" and self.path.split("?", 1)[0] == "/v1/fs:promotion" and not committed_marker.exists():
+            committed_marker.write_text("committed\n")
+            while True:
+                time.sleep(60)
+
+        self.send_response(response.status)
+        for key, value in response.getheaders():
+            if key.lower() not in {"connection", "content-length", "transfer-encoding"}:
+                self.send_header(key, value)
+        if self.command == "HEAD" and response_content_length is not None:
+            self.send_header("Content-Length", response_content_length)
+        else:
+            self.send_header("Content-Length", str(len(response_body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(response_body)
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+server = Server(("127.0.0.1", 0), Proxy)
+tmp_port_file = port_file.with_suffix(".tmp")
+tmp_port_file.write_text(str(server.server_address[1]))
+tmp_port_file.replace(port_file)
+server.serve_forever()
+PY
+  printf -v "$pid_var" '%s' "$!"
+  local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  while :; do
+    if [ -s "$port_file" ]; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep "$MOUNT_READY_INTERVAL_S"
+  done
+}
+
+stop_promotion_response_loss_proxy() {
+  local pid="${1:-}"
+  if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+  fi
 }
 
 wait_path_exists() {
@@ -578,6 +816,22 @@ PY
 
     sleep "$REMOTE_VISIBILITY_INTERVAL_S"
   done
+}
+
+wait_mounted_cat_eq() {
+  local path="$1"
+  local want="$2"
+  local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  local out=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if out=$(cat "$path" 2>/dev/null) && [ "$out" = "$want" ]; then
+      printf '%s' "$out"
+      return 0
+    fi
+    sleep "$MOUNT_READY_INTERVAL_S"
+  done
+  printf 'wait_mounted_cat_eq: path=%s want=%s got=%s\n' "$path" "$want" "$out" >&2
+  return 1
 }
 
 start_open_handle_writer() {
@@ -756,6 +1010,16 @@ dump_mount_log() {
     echo "=== drive9 mount log: $MOUNT_LOG ==="
     cat "$MOUNT_LOG"
   fi
+  local promotion_log
+  for promotion_log in \
+    "${PROMOTION_A_LOG:-}" \
+    "${PROMOTION_B_LOG:-}" \
+    "${PROMOTION_LOCK_LOG:-}"; do
+    if [ -n "$promotion_log" ] && [ -f "$promotion_log" ]; then
+      echo "=== drive9 promotion mount log: $promotion_log ==="
+      cat "$promotion_log"
+    fi
+  done
 }
 
 audit_mount_log() {
@@ -778,6 +1042,7 @@ echo "RUN_FUSE_GIT_CLONE=$RUN_FUSE_GIT_CLONE"
 echo "FUSE_GIT_CLONE_TIMEOUT_S=$FUSE_GIT_CLONE_TIMEOUT_S"
 echo "RUN_FUSE_UMOUNT_DURABLE=$RUN_FUSE_UMOUNT_DURABLE"
 echo "RUN_FUSE_LOG_AUDIT=$RUN_FUSE_LOG_AUDIT"
+echo "RUN_SYNCHRONOUS_PROMOTION_E2E=$RUN_SYNCHRONOUS_PROMOTION_E2E"
 echo "FUSE_LOG_AUDIT_PATTERN=$FUSE_LOG_AUDIT_PATTERN"
 
 check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
@@ -970,21 +1235,43 @@ DRAIN_CLI_READY="$FUSE_MOUNT_ROOT/drive9-fuse-drain-cli-ready-${TS}"
 DRAIN_CLI_DONE="$FUSE_MOUNT_ROOT/drive9-fuse-drain-cli-done-${TS}"
 DRAIN_SYNC_READY="$FUSE_MOUNT_ROOT/drive9-fuse-drain-syncfs-ready-${TS}"
 DRAIN_SYNC_DONE="$FUSE_MOUNT_ROOT/drive9-fuse-drain-syncfs-done-${TS}"
+PROMOTION_A_MOUNT="$FUSE_MOUNT_ROOT/drive9-promotion-a-${TS}"
+PROMOTION_B_MOUNT="$FUSE_MOUNT_ROOT/drive9-promotion-b-${TS}"
+PROMOTION_LOCK_MOUNT="$FUSE_MOUNT_ROOT/drive9-promotion-lock-${TS}"
+PROMOTION_A_ROOT="$FUSE_MOUNT_ROOT/drive9-promotion-local-a-${TS}"
+PROMOTION_B_ROOT="$FUSE_MOUNT_ROOT/drive9-promotion-local-b-${TS}"
+PROMOTION_A_LOG="$FUSE_MOUNT_ROOT/drive9-promotion-a-${TS}.log"
+PROMOTION_B_LOG="$FUSE_MOUNT_ROOT/drive9-promotion-b-${TS}.log"
+PROMOTION_LOCK_LOG="$FUSE_MOUNT_ROOT/drive9-promotion-lock-${TS}.log"
+PROMOTION_PROXY_PORT_FILE="$FUSE_MOUNT_ROOT/drive9-promotion-proxy-port-${TS}"
+PROMOTION_PROXY_COMMITTED="$FUSE_MOUNT_ROOT/drive9-promotion-proxy-committed-${TS}"
+PROMOTION_REL="promotion-e2e-${TS}"
+PROMOTION_REMOTE="/${PROMOTION_REL}"
 
 mkdir -p "$MOUNT_POINT"
 : >"$MOUNT_LOG"
 printf "seed-%s" "$TS" > "$SEED_LOCAL"
 
 MOUNT_PID=""
+PROMOTION_A_PID=""
+PROMOTION_B_PID=""
+PROMOTION_LOCK_PID=""
+PROMOTION_PROXY_PID=""
 DRAIN_WRITER_PIDS=()
 DRAIN_WRITER_DONE_FILES=()
 cleanup() {
   finish_open_handle_writers
+  stop_promotion_response_loss_proxy "$PROMOTION_PROXY_PID"
+  stop_promotion_mount "$PROMOTION_LOCK_MOUNT" PROMOTION_LOCK_PID || true
+  stop_promotion_mount "$PROMOTION_B_MOUNT" PROMOTION_B_PID || true
+  stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID || true
   stop_mount
   rm -f "$SEED_LOCAL" "$LARGE_DOWNLOADED" "$TIER_DOWNLOADED" "$CLI_BIN" \
     "$DRAIN_CLI_JSON" "$DRAIN_CLI_ERR" "$DRAIN_CLI_READY" "$DRAIN_CLI_DONE" \
-    "$DRAIN_SYNC_READY" "$DRAIN_SYNC_DONE"
+    "$DRAIN_SYNC_READY" "$DRAIN_SYNC_DONE" "$PROMOTION_PROXY_PORT_FILE" \
+    "$PROMOTION_PROXY_COMMITTED"
   rm -rf "${MOUNT_POINT:?}" || true
+  rm -rf "$PROMOTION_A_MOUNT" "$PROMOTION_B_MOUNT" "$PROMOTION_LOCK_MOUNT" "$PROMOTION_A_ROOT" "$PROMOTION_B_ROOT" || true
 }
 on_exit() {
   local rc=$?
@@ -1517,6 +1804,155 @@ PY
   echo "[12.1] cleanup writable tree"
   rm -rf "${MOUNT_POINT:?}/${ROOT_REL:?}"
   check_cmd "remote root removed from ls after mounted rm -rf" wait_remote_ls_missing_name "/" "$ROOT_REL"
+
+  if [ "$RUN_SYNCHRONOUS_PROMOTION_E2E" = "1" ]; then
+    echo "[12.2] synchronous local-to-remote promotion"
+    stop_mount
+    check_cmd "general rw mount stopped before isolated promotion cases" wait_mount_state unmounted
+
+    # Gate off must retain the historical cross-layer EXDEV behavior.
+    check_cmd "gate-off coding-agent mount starts" start_promotion_mount \
+      "$PROMOTION_A_MOUNT" "$PROMOTION_A_ROOT" "$PROMOTION_A_LOG" 0 PROMOTION_A_PID
+    if is_mounted "$PROMOTION_A_MOUNT"; then
+      gateoff_project="$PROMOTION_A_MOUNT/$PROMOTION_REL/gate-off-project"
+      mkdir -p "$gateoff_project/dist/.site-next/assets"
+      printf 'gate-off-%s\n' "$TS" >"$gateoff_project/dist/.site-next/assets/app.js"
+      check_cmd "gate-off local dist to remote site returns EXDEV" \
+        rename_syscall_expect_errno "$gateoff_project/dist/.site-next" "$gateoff_project/site" EXDEV
+      check_cmd "gate-off failure preserves local source" test -f "$gateoff_project/dist/.site-next/assets/app.js"
+      check_cmd_fail "gate-off failure does not create remote target" test -e "$gateoff_project/site"
+      rm -rf "$gateoff_project/dist"
+    fi
+    stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
+
+    require_cmd "gate-on coding-agent mount A starts" start_promotion_mount \
+      "$PROMOTION_A_MOUNT" "$PROMOTION_A_ROOT" "$PROMOTION_A_LOG" 1 PROMOTION_A_PID
+    # The feature gate controls new promotion requests, not LocalRoot
+    # ownership. A gate-off process must not bypass the enabled mount's flock.
+    check_cmd_fail "gate-off mount cannot share enabled LocalRoot" start_promotion_mount \
+      "$PROMOTION_LOCK_MOUNT" "$PROMOTION_A_ROOT" "$PROMOTION_LOCK_LOG" 0 PROMOTION_LOCK_PID
+    stop_promotion_mount "$PROMOTION_LOCK_MOUNT" PROMOTION_LOCK_PID
+    require_cmd "second real coding-agent mount B starts" start_promotion_mount \
+      "$PROMOTION_B_MOUNT" "$PROMOTION_B_ROOT" "$PROMOTION_B_LOG" 0 PROMOTION_B_PID
+
+    if is_mounted "$PROMOTION_A_MOUNT" && is_mounted "$PROMOTION_B_MOUNT"; then
+      promotion_project_a="$PROMOTION_A_MOUNT/$PROMOTION_REL/project"
+      promotion_project_b="$PROMOTION_B_MOUNT/$PROMOTION_REL/project"
+      mkdir -p "$promotion_project_a"
+      check_cmd "promotion parent reaches second mount" wait_path_exists "$promotion_project_b"
+
+      # An existing target must fail before consuming the local source.
+      mkdir -p "$promotion_project_a/site-existing"
+      printf 'existing-%s\n' "$TS" >"$promotion_project_a/site-existing/index.html"
+      mkdir -p "$promotion_project_a/dist/.replace-next"
+      printf 'replacement-%s\n' "$TS" >"$promotion_project_a/dist/.replace-next/index.html"
+      check_cmd "promotion refuses existing remote target with EEXIST" \
+        rename_syscall_expect_errno \
+          "$promotion_project_a/dist/.replace-next" "$promotion_project_a/site-existing" EEXIST
+      check_cmd "target-conflict failure preserves local source" test -f "$promotion_project_a/dist/.replace-next/index.html"
+      check_eq "target-conflict failure preserves remote target" \
+        "$(cat "$promotion_project_a/site-existing/index.html")" "existing-${TS}"
+      rm -rf "$promotion_project_a/dist/.replace-next" "$promotion_project_a/site-existing"
+
+      # A live file descriptor anywhere in the source subtree is unsupported in
+      # phase one and must fail before publishing a target.
+      mkdir -p "$promotion_project_a/dist/.open-next"
+      open_ready="$FUSE_MOUNT_ROOT/drive9-promotion-open-ready-${TS}"
+      open_done="$FUSE_MOUNT_ROOT/drive9-promotion-open-done-${TS}"
+      check_cmd "promotion open-handle fixture is ready" start_open_handle_writer \
+        "$promotion_project_a/dist/.open-next/open.txt" "open-${TS}" "$open_ready" "$open_done"
+      check_cmd "promotion refuses source with open handle using EXDEV" \
+        rename_syscall_expect_errno \
+          "$promotion_project_a/dist/.open-next" "$promotion_project_a/open-site" EXDEV
+      check_cmd "open-handle rejection preserves local source" test -f "$promotion_project_a/dist/.open-next/open.txt"
+      check_cmd_fail "open-handle rejection creates no target" test -e "$promotion_project_a/open-site"
+      finish_open_handle_writers
+      rm -rf "$promotion_project_a/dist/.open-next" "$open_ready" "$open_done"
+
+      # Commit-response loss plus a mount crash must converge forward from the
+      # durable local record. The proxy withholds the committed POST response;
+      # the restarted real mount queries the same operation ID before serving.
+      stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
+      rm -f "$PROMOTION_PROXY_PORT_FILE" "$PROMOTION_PROXY_COMMITTED"
+      require_cmd "response-loss proxy starts" start_promotion_response_loss_proxy \
+        "$BASE" "$PROMOTION_PROXY_COMMITTED" "$PROMOTION_PROXY_PORT_FILE" PROMOTION_PROXY_PID
+      promotion_proxy_url="http://127.0.0.1:$(cat "$PROMOTION_PROXY_PORT_FILE")"
+      require_cmd "promotion mount A restarts through response-loss proxy" start_promotion_mount \
+        "$PROMOTION_A_MOUNT" "$PROMOTION_A_ROOT" "$PROMOTION_A_LOG" 1 PROMOTION_A_PID "$promotion_proxy_url"
+
+      mkdir -p "$promotion_project_a/dist/.recovery-next/nested"
+      printf 'recover-%s\n' "$TS" >"$promotion_project_a/dist/.recovery-next/nested/value.txt"
+      check_cmd_fail "mount B caches recovery target absence" test -e "$promotion_project_b/recovered-site"
+      rename_syscall "$promotion_project_a/dist/.recovery-next" "$promotion_project_a/recovered-site" &
+      promotion_rename_pid=$!
+      require_cmd "server commits before promotion response is lost" wait_path_exists "$PROMOTION_PROXY_COMMITTED"
+      require_cmd "rename syscall remains blocked while committed response is withheld" \
+        kill -0 "$promotion_rename_pid"
+
+      kill -9 "$PROMOTION_A_PID" >/dev/null 2>&1 || true
+      wait "$PROMOTION_A_PID" >/dev/null 2>&1 || true
+      PROMOTION_A_PID=""
+      set +e
+      wait "$promotion_rename_pid" >/dev/null 2>&1
+      promotion_rename_rc=$?
+      set -e
+      # Reap the interrupted syscall before unmounting; otherwise its kernel
+      # reference can leave a stale mount that a later readiness probe could
+      # mistake for the restarted process.
+      stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
+      check_cmd "rename syscall fails when the serving mount is killed" \
+        test "$promotion_rename_rc" -ne 0
+      # Gate-off still owns the LocalRoot and must recover an existing journal
+      # before it serves. Keep the same proxy endpoint so the journal's remote
+      # identity remains exact across the restart.
+      require_cmd "gate-off mount A recovers committed response loss before serving" start_promotion_mount \
+        "$PROMOTION_A_MOUNT" "$PROMOTION_A_ROOT" "$PROMOTION_A_LOG" 0 PROMOTION_A_PID "$promotion_proxy_url"
+      check_cmd_fail "recovery removes the original local source" \
+        test -e "$promotion_project_a/dist/.recovery-next"
+      check_eq "remote API retains committed response-loss content" \
+        "$(wait_remote_cat_eq "/${PROMOTION_REL}/project/recovered-site/nested/value.txt" "recover-${TS}")" "recover-${TS}"
+      check_eq "recovered mount reads committed file" \
+        "$(cat "$promotion_project_a/recovered-site/nested/value.txt")" "recover-${TS}"
+      check_eq "mount B reads response-loss recovery target" \
+        "$(wait_mounted_cat_eq "$promotion_project_b/recovered-site/nested/value.txt" "recover-${TS}")" "recover-${TS}"
+      stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
+      stop_promotion_response_loss_proxy "$PROMOTION_PROXY_PID"
+      PROMOTION_PROXY_PID=""
+      require_cmd "promotion mount A restarts enabled for a new operation" start_promotion_mount \
+        "$PROMOTION_A_MOUNT" "$PROMOTION_A_ROOT" "$PROMOTION_A_LOG" 1 PROMOTION_A_PID
+
+      require_cmd "promotion mounts remain real FUSE mounts before main case" \
+        promotion_mounts_ready "$PROMOTION_A_MOUNT" "$PROMOTION_B_MOUNT"
+
+      # Main product case: closed, nested build output moves from local dist to
+      # an absent remote site. Mount B first caches that site is absent.
+      mkdir -p "$promotion_project_a/dist/.site-next/assets/js" \
+        "$promotion_project_a/dist/.site-next/assets/css" \
+        "$promotion_project_a/dist/.site-next/empty"
+      printf '<html>site-%s</html>\n' "$TS" >"$promotion_project_a/dist/.site-next/index.html"
+      printf 'console.log("site-%s")\n' "$TS" >"$promotion_project_a/dist/.site-next/assets/js/app.js"
+      printf 'body{color:#123}\n' >"$promotion_project_a/dist/.site-next/assets/css/app.css"
+      check_cmd_fail "mount B caches target absence before commit" test -e "$promotion_project_b/site"
+
+      require_cmd "dist .site-next promotes synchronously to site" \
+        rename_syscall "$promotion_project_a/dist/.site-next" "$promotion_project_a/site"
+      check_cmd_fail "successful promotion removes local source before return" \
+        test -e "$promotion_project_a/dist/.site-next"
+      check_eq "mount A reads promoted index" "$(cat "$promotion_project_a/site/index.html")" "<html>site-${TS}</html>"
+      check_cmd "mount B observes complete promoted root after invalidation" wait_path_exists "$promotion_project_b/site/index.html"
+      check_eq "mount B reads complete nested JS" \
+        "$(cat "$promotion_project_b/site/assets/js/app.js")" "console.log(\"site-${TS}\")"
+      check_eq "mount B reads complete nested CSS" \
+        "$(cat "$promotion_project_b/site/assets/css/app.css")" "body{color:#123}"
+      check_cmd "mount B sees promoted empty directory" test -d "$promotion_project_b/site/empty"
+      check_eq "remote API sees complete promoted index after synchronous return" \
+        "$(drive9_retry fs cat "$PROMOTION_REMOTE/project/site/index.html")" "<html>site-${TS}</html>"
+    fi
+
+    stop_promotion_mount "$PROMOTION_B_MOUNT" PROMOTION_B_PID
+    stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
+    drive9_retry fs rm -r "$PROMOTION_REMOTE" >/dev/null 2>&1 || true
+  fi
 
   echo "[13] remount read-only semantics"
   stop_mount

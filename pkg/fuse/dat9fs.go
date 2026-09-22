@@ -22,6 +22,7 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"go.uber.org/zap"
 
+	"github.com/mem9-ai/drive9/internal/drivehttp"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
@@ -61,6 +62,11 @@ type Dat9FS struct {
 	gofuse.RawFileSystem
 
 	client              *client.Client
+	promotionRootLock   *os.File
+	promotionHTTPClient *http.Client
+	promotionBaseURL    string
+	promotionCredential string
+	promotionActor      string
 	inodes              *InodeToPath
 	fileHandles         *HandleTable[*FileHandle]
 	openHandles         *OpenHandleIndex
@@ -185,6 +191,11 @@ type Dat9FS struct {
 	extentCacheDir string
 	// localOverlay stores local-only paths under MountOptions.LocalRoot.
 	localOverlay *LocalOverlay
+	// promotionBarrier freezes FUSE opens and namespace/data mutations while a
+	// local-only tree is scanned and atomically published. It is only consulted
+	// when the preview feature is enabled.
+	promotionBarrier sync.RWMutex
+	promotionBlocked atomic.Bool
 	// transientLocalOverlay stores mount-local runtime sidecars that must be
 	// shared by all handles in one mount, but must not become remote state.
 	transientLocalOverlay *LocalOverlay
@@ -441,40 +452,54 @@ type layerSymlinkState struct {
 
 // NewDat9FS creates a new FUSE filesystem backed by the given dat9 client.
 func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
-	return &Dat9FS{
-		RawFileSystem:     gofuse.NewDefaultRawFileSystem(),
-		client:            c,
-		inodes:            NewInodeToPath(),
-		fileHandles:       NewHandleTable[*FileHandle](),
-		openHandles:       NewOpenHandleIndex(),
-		locks:             newFuseLockTable(),
-		dirHandles:        NewHandleTable[*DirHandle](),
-		committedRev:      make(map[string]int64),
-		committedSize:     make(map[string]int64),
-		remoteCommitLocks: make(map[string]*sync.Mutex),
-		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, opts.ReadCacheTTL, opts.ReadCacheMaxFileBytes),
-		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, dirCacheMaxEntriesOrDefault(opts.DirCacheMaxEntries)),
-		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
-		dirtyInodes:       make(map[uint64]dirtyInodeState),
-		kernelCacheBypass: make(map[uint64]kernelCacheBypassMarker),
-		specialByPath:     make(map[string]uint64),
-		uid:               uint32(os.Getuid()),
-		gid:               uint32(os.Getgid()),
-		opts:              opts,
-		syncMode:          opts.SyncMode,
-		debouncer:         newFlushDebouncer(opts.FlushDebounce),
-		perf:              newFusePerfCounters(opts.PerfCounters || opts.Profiling.PerfSamplesPath != ""),
-		localPolicy:       NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
-		appendLogMatcher:  NewAppendLogMatcher(opts.AppendLogPatterns),
-		localOverlay:      NewLocalOverlay(opts.LocalRoot),
-		git:               newGitWorkspaceLayer(),
-		gitCheckpoints:    newFlushDebouncer(gitCheckpointDebounce),
-		gitOverlayPending: make(map[string]map[string][]pendingGitOverlayEntry),
-		readFlight:        NewSingleFlight(),
-		remoteReadTimeout: fuseTimeout,
-		xattrs:            NewXAttrStore(),
-		deletedPaths:      make(map[string]time.Time),
+	credential := opts.APIKey
+	if opts.Token != "" {
+		credential = opts.Token
 	}
+	if credential == "" && c != nil {
+		credential = c.APIKey()
+	}
+	fs := &Dat9FS{
+		RawFileSystem:       gofuse.NewDefaultRawFileSystem(),
+		client:              c,
+		promotionHTTPClient: drivehttp.NewClient(),
+		promotionCredential: credential,
+		promotionActor:      opts.actorID,
+		inodes:              NewInodeToPath(),
+		fileHandles:         NewHandleTable[*FileHandle](),
+		openHandles:         NewOpenHandleIndex(),
+		locks:               newFuseLockTable(),
+		dirHandles:          NewHandleTable[*DirHandle](),
+		committedRev:        make(map[string]int64),
+		committedSize:       make(map[string]int64),
+		remoteCommitLocks:   make(map[string]*sync.Mutex),
+		readCache:           NewReadCacheWithMaxFileSize(opts.CacheSize, opts.ReadCacheTTL, opts.ReadCacheMaxFileBytes),
+		dirCache:            NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, dirCacheMaxEntriesOrDefault(opts.DirCacheMaxEntries)),
+		readSlots:           make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
+		dirtyInodes:         make(map[uint64]dirtyInodeState),
+		kernelCacheBypass:   make(map[uint64]kernelCacheBypassMarker),
+		specialByPath:       make(map[string]uint64),
+		uid:                 uint32(os.Getuid()),
+		gid:                 uint32(os.Getgid()),
+		opts:                opts,
+		syncMode:            opts.SyncMode,
+		debouncer:           newFlushDebouncer(opts.FlushDebounce),
+		perf:                newFusePerfCounters(opts.PerfCounters || opts.Profiling.PerfSamplesPath != ""),
+		localPolicy:         NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
+		appendLogMatcher:    NewAppendLogMatcher(opts.AppendLogPatterns),
+		localOverlay:        NewLocalOverlay(opts.LocalRoot),
+		git:                 newGitWorkspaceLayer(),
+		gitCheckpoints:      newFlushDebouncer(gitCheckpointDebounce),
+		gitOverlayPending:   make(map[string]map[string][]pendingGitOverlayEntry),
+		readFlight:          NewSingleFlight(),
+		remoteReadTimeout:   fuseTimeout,
+		xattrs:              NewXAttrStore(),
+		deletedPaths:        make(map[string]time.Time),
+	}
+	if c != nil {
+		fs.promotionBaseURL = c.BaseURL()
+	}
+	return fs
 }
 
 // SetWriteBack configures the write-back cache and uploader on the filesystem.
@@ -5545,6 +5570,8 @@ func httpToFuseStatus(err error) gofuse.Status {
 			return gofuse.EACCES
 		case http.StatusRequestEntityTooLarge:
 			return gofuse.Status(syscall.EFBIG)
+		case http.StatusInsufficientStorage:
+			return gofuse.Status(syscall.ENOSPC)
 		case http.StatusPreconditionFailed:
 			return gofuse.Status(syscall.ESTALE)
 		case http.StatusBadRequest:
@@ -5576,6 +5603,8 @@ func httpToFuseStatus(err error) gofuse.Status {
 		return gofuse.EACCES
 	case strings.Contains(msg, "HTTP 413"):
 		return gofuse.Status(syscall.EFBIG)
+	case strings.Contains(msg, "HTTP 507"):
+		return gofuse.Status(syscall.ENOSPC)
 	case strings.Contains(msg, "HTTP 412"):
 		return gofuse.Status(syscall.ESTALE)
 	case strings.Contains(msg, "HTTP 400"):
@@ -9332,6 +9361,11 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -9711,6 +9745,11 @@ func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name stri
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 
 	childP, st := fs.childPath(input.NodeId, name)
 	if st != gofuse.OK {
@@ -9831,6 +9870,11 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	childP, st := fs.childPath(input.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -9915,6 +9959,11 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 
 	childP, st := fs.childPath(header.NodeId, linkName)
 	if st != gofuse.OK {
@@ -10049,6 +10098,11 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 
 	srcEntry, ok := fs.inodes.GetEntry(input.Oldnodeid)
 	if !ok {
@@ -10262,6 +10316,11 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -10604,6 +10663,11 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -11336,8 +11400,16 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 	if oldLayer == PathLayerLocalOnly || newLayer == PathLayerLocalOnly {
 		if oldLayer != newLayer {
+			if oldLayer == PathLayerLocalOnly && newLayer == PathLayerRemotePersistent && fs.synchronousPromotionEnabled() {
+				return fs.promoteLocalTree(ctx, input, oldP, newP)
+			}
 			return gofuse.Status(syscall.EXDEV)
 		}
+		promotionUnlock, ok := fs.lockPromotionMutation()
+		if !ok {
+			return gofuse.EIO
+		}
+		defer promotionUnlock()
 		if fs.localOverlay == nil {
 			return gofuse.EIO
 		}
@@ -11354,6 +11426,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		fs.scheduleGitStateCheckpoint(newP)
 		return gofuse.OK
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	if handled, st := fs.renameGitPath(ctx, input, oldP, newP); handled {
 		return st
 	}
@@ -11543,6 +11620,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseOpenDir, perfStart, status, 0) }()
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	p, ok := fs.inodes.GetPath(input.NodeId)
@@ -12467,6 +12549,11 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 
 	childP, st := fs.childPath(input.NodeId, name)
 	if st != gofuse.OK {
@@ -12605,6 +12692,11 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseOpen, perfStart, status, 0) }()
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -13720,6 +13812,12 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		source = "readonly"
 		return 0, gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		source = "promotion-blocked"
+		return 0, gofuse.EIO
+	}
+	defer promotionUnlock()
 
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
@@ -17080,6 +17178,11 @@ func (fs *Dat9FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, des
 }
 
 func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, attr string, data []byte) gofuse.Status {
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	path, ok := fs.inodes.GetPath(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -17091,6 +17194,11 @@ func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, att
 }
 
 func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string) gofuse.Status {
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	path, ok := fs.inodes.GetPath(header.NodeId)
 	if !ok {
 		return gofuse.ENOENT

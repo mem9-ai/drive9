@@ -882,6 +882,11 @@ func atomicWrite(path string, data []byte) error {
 	}
 
 	// Fsync parent directory so the rename is durable across power loss.
+	if testHookBeforeAtomicWriteDirSync != nil {
+		if err := testHookBeforeAtomicWriteDirSync(path); err != nil {
+			return err
+		}
+	}
 	return fsyncDir(dir)
 }
 
