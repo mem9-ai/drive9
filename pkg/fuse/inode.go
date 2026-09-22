@@ -651,6 +651,103 @@ func clearTimeOverridesLocked(entry *InodeEntry) {
 	entry.AtimeOverride = nil
 }
 
+// localTimeOverrides is a snapshot of the armed local time overrides. The
+// pointed-to values are immutable once published, so sharing the pointers
+// is safe.
+type localTimeOverrides struct {
+	mtime *time.Time
+	atime *time.Time
+}
+
+// SnapshotLocalTimes captures the armed local time overrides as a rollback
+// point. A write-sync attempt clears them at its dirty-mutation hook; if
+// the write fails and the content rolls back, the snapshot re-arms them.
+func (m *InodeToPath) SnapshotLocalTimes(ino uint64) *localTimeOverrides {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok || (entry.MtimeOverride == nil && entry.AtimeOverride == nil) {
+		return nil
+	}
+	return &localTimeOverrides{mtime: entry.MtimeOverride, atime: entry.AtimeOverride}
+}
+
+// RestoreLocalTimes re-arms overrides from a snapshot taken before a failed
+// mutation. A slot armed after the snapshot (a newer concurrent utimensat)
+// wins and is kept; a nil snapshot is a no-op.
+func (m *InodeToPath) RestoreLocalTimes(ino uint64, snap *localTimeOverrides) {
+	if snap == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return
+	}
+	if snap.mtime != nil && entry.MtimeOverride == nil {
+		entry.MtimeOverride = snap.mtime
+	}
+	if snap.atime != nil && entry.AtimeOverride == nil {
+		entry.AtimeOverride = snap.atime
+	}
+}
+
+// ReplacesIdentity reports whether binding the observed resourceID/isDir to
+// the inode would replace a known identity — i.e. a different drive9 object
+// (kind change or both resource ids known and different) now owns the path.
+func (m *InodeToPath) ReplacesIdentity(ino uint64, resourceID string, isDir bool) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return false
+	}
+	if entry.IsDir != isDir {
+		return true
+	}
+	return identityReplacedLocked(entry, inodeResourceKey(resourceID, isDir))
+}
+
+// dropIdentityLocked removes the identity index entry for an object that no
+// longer owns this inode, so a stale byID mapping cannot rejoin the inode
+// from the old resource id at another path.
+func (m *InodeToPath) dropIdentityLocked(entry *InodeEntry) {
+	if entry.ResourceID != "" {
+		if m.byID[entry.ResourceID] == entry.Ino {
+			delete(m.byID, entry.ResourceID)
+		}
+		entry.ResourceID = ""
+	}
+}
+
+// SetIdentityWithKind is SetIdentity with the object kind of the incoming
+// observation. A kind change or a known-and-different resource id means a
+// different drive9 object now owns this inode: the old identity index entry
+// and the previous object's explicit time overrides are dropped so the
+// replacement's metadata is adopted.
+func (m *InodeToPath) SetIdentityWithKind(ino uint64, resourceID string, nlink uint32, isDir bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return
+	}
+	if entry.IsDir != isDir || identityReplacedLocked(entry, inodeResourceKey(resourceID, isDir)) {
+		m.dropIdentityLocked(entry)
+		clearTimeOverridesLocked(entry)
+	}
+	entry.IsDir = isDir
+	m.setIdentityLocked(entry, resourceID)
+	if nlink > 0 {
+		entry.Nlink = nlink
+	}
+}
+
 // UpdateCtime updates the ctime of the entry identified by the given inode.
 func (m *InodeToPath) UpdateCtime(ino uint64, ctime time.Time) {
 	m.mu.Lock()
@@ -846,7 +943,11 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 	if entry.IsDir != isDir {
 		entry.ExtentIno = 0
 		// The new object must not inherit the previous object's explicitly
-		// SetAttr'd times either.
+		// SetAttr'd times, and the old identity index entry must go too:
+		// the replacement (a directory here) has an empty identity key, so
+		// setIdentityLocked would early-return and leave the stale byID
+		// mapping able to rejoin this inode from the old resource id.
+		m.dropIdentityLocked(entry)
 		clearTimeOverridesLocked(entry)
 	}
 	entry.IsDir = isDir

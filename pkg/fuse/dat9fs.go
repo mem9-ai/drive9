@@ -6842,7 +6842,7 @@ func (fs *Dat9FS) updateEntryFromStat(entry *InodeEntry, stat *client.StatResult
 	entry.IsDir = stat.IsDir
 	fs.inodes.UpdateSize(entry.Ino, stat.Size)
 	if stat.ResourceID != "" || stat.Nlink > 0 {
-		fs.inodes.SetIdentity(entry.Ino, stat.ResourceID, stat.Nlink)
+		fs.inodes.SetIdentityWithKind(entry.Ino, stat.ResourceID, stat.Nlink, stat.IsDir)
 		entry.ResourceID = stat.ResourceID
 		entry.Nlink = stat.Nlink
 	}
@@ -8933,8 +8933,13 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				entry.Size = stat.Size
 				entry.IsDir = stat.IsDir
 				fs.inodes.UpdateSize(input.NodeId, stat.Size)
+				// A stat whose resource identity replaces the inode's known
+				// one means a different object owns the path now; detect it
+				// before SetIdentityWithKind drops the old identity state.
+				replacedIdentity := stat.ResourceID != "" &&
+					fs.inodes.ReplacesIdentity(input.NodeId, stat.ResourceID, stat.IsDir)
 				if stat.ResourceID != "" || stat.Nlink > 0 {
-					fs.inodes.SetIdentity(input.NodeId, stat.ResourceID, stat.Nlink)
+					fs.inodes.SetIdentityWithKind(input.NodeId, stat.ResourceID, stat.Nlink, stat.IsDir)
 					entry.ResourceID = stat.ResourceID
 					entry.Nlink = stat.Nlink
 				}
@@ -8952,8 +8957,14 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 					// (e.g. creation time from before a local truncation) from
 					// clobbering a locally-updated mtime after the dirty handle is
 					// flushed and the remote stat path runs. An armed local time
-					// override (explicit utimensat) always wins.
-					if !fs.inodes.HasMtimeOverride(input.NodeId) &&
+					// override (explicit utimensat) always wins — except on
+					// identity replacement, where the local time belongs to the
+					// previous object and the replacement's mtime is authoritative
+					// even when older.
+					if replacedIdentity {
+						entry.Mtime = stat.Mtime
+						fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
+					} else if !fs.inodes.HasMtimeOverride(input.NodeId) &&
 						(entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime)) {
 						entry.Mtime = stat.Mtime
 						fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
@@ -8977,8 +8988,10 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				entry.Size = stat.Size
 				entry.IsDir = stat.IsDir
 				fs.inodes.UpdateSize(input.NodeId, stat.Size)
+				replacedIdentity := stat.ResourceID != "" &&
+					fs.inodes.ReplacesIdentity(input.NodeId, stat.ResourceID, stat.IsDir)
 				if stat.ResourceID != "" || stat.Nlink > 0 {
-					fs.inodes.SetIdentity(input.NodeId, stat.ResourceID, stat.Nlink)
+					fs.inodes.SetIdentityWithKind(input.NodeId, stat.ResourceID, stat.Nlink, stat.IsDir)
 					entry.ResourceID = stat.ResourceID
 					entry.Nlink = stat.Nlink
 				}
@@ -8991,7 +9004,13 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 					fs.inodes.UpdateMode(input.NodeId, stat.Mode)
 				}
 				if !stat.Mtime.IsZero() {
-					if !fs.inodes.HasMtimeOverride(input.NodeId) &&
+					// Identity replacement: the previous object's local time
+					// (possibly an explicit future utimensat) must not shadow
+					// the replacement's server mtime, even when older.
+					if replacedIdentity {
+						entry.Mtime = stat.Mtime
+						fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
+					} else if !fs.inodes.HasMtimeOverride(input.NodeId) &&
 						(entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime)) {
 						entry.Mtime = stat.Mtime
 						fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
@@ -13906,9 +13925,13 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
 	writeSyncAppendLogState := appendLogHandleState{}
 	writeSyncBeforeDirtySeq := fh.DirtySeq
+	writeSyncTimeOverrides := (*localTimeOverrides)(nil)
 	if fh.WritePolicy == WritePolicyWriteSync {
 		writeSyncSnapshot = fh.Dirty.snapshot()
 		writeSyncAppendLogState = fh.appendLog
+		// The dirty-mutation hook below clears armed local time overrides;
+		// a failed write that rolls its content back must re-arm them.
+		writeSyncTimeOverrides = fs.inodes.SnapshotLocalTimes(fh.Ino)
 	}
 
 	writeOffset := int64(input.Offset)
@@ -14028,7 +14051,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 				if state, ok := fs.committedMutation(fh.Ino); ok && fh.DirtySeq != 0 && fh.DirtySeq <= state.committedSeq {
 					fs.discardSupersededMutationLocked(fh)
 				} else if !contentCommitted && !newerDirtyGeneration {
-					fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot, writeSyncBeforeDirtySeq)
+					fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot, writeSyncBeforeDirtySeq, writeSyncTimeOverrides)
 					fh.appendLogRestoreFailedWriteState(writeSyncAppendLogState)
 				}
 			}
@@ -14038,10 +14061,14 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	return n, gofuse.OK
 }
 
-func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBufferSnapshot, restoreDirtySeq uint64) {
+func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBufferSnapshot, restoreDirtySeq uint64, timeOverrides *localTimeOverrides) {
 	if fh == nil {
 		return
 	}
+	// The failed write cleared the local time overrides at its dirty-mutation
+	// hook; with the content rolled back, the pre-write state — including an
+	// explicitly SetAttr'd time acknowledged before the write — is restored.
+	fs.inodes.RestoreLocalTimes(fh.Ino, timeOverrides)
 	if fh.DirtySeq != 0 {
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0

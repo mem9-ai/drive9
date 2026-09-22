@@ -20,10 +20,10 @@ import (
 
 // newSetattrTimeTestFS builds a Dat9FS with a commit queue wired exactly like
 // production (PathLock + OnSuccess + OnCleanup) against a test server whose
-// content PUT blocks until allowPut is closed. The returned channel closes
+// content PUT blocks until the returned releasePut func runs
 // once the first PUT starts, so tests can deterministically hold a commit
 // in flight.
-func newSetattrTimeTestFS(t *testing.T, path string, data []byte) (*Dat9FS, *CommitQueue, chan struct{}, chan struct{}, *atomic.Int32) {
+func newSetattrTimeTestFS(t *testing.T, path string, data []byte) (*Dat9FS, *CommitQueue, chan struct{}, func(), *atomic.Int32) {
 	t.Helper()
 
 	putStarted := make(chan struct{})
@@ -95,6 +95,13 @@ func newSetattrTimeTestFS(t *testing.T, path string, data []byte) (*Dat9FS, *Com
 	cq.OnCleanup = fs.onCommitQueueCleanup
 	fs.commitQueue = cq
 	t.Cleanup(cq.DrainAll)
+	// Cleanups run LIFO: release the blocked PUT before DrainAll. Without
+	// this, a t.Fatal before the test body releases the PUT would leave
+	// DrainAll waiting on it and the test would hang to its timeout instead
+	// of failing. The once keeps the close safe when the body already ran.
+	var releaseOnce sync.Once
+	releasePut := func() { releaseOnce.Do(func() { close(allowPut) }) }
+	t.Cleanup(releasePut)
 
 	if err := shadow.WriteFull(path, data, 0); err != nil {
 		t.Fatal(err)
@@ -102,7 +109,7 @@ func newSetattrTimeTestFS(t *testing.T, path string, data []byte) (*Dat9FS, *Com
 	if _, err := pending.PutWithBaseRev(path, int64(len(data)), PendingNew, 0); err != nil {
 		t.Fatal(err)
 	}
-	return fs, cq, putStarted, allowPut, &chmodCalls
+	return fs, cq, putStarted, releasePut, &chmodCalls
 }
 
 func enqueueSetattrTimeCommit(t *testing.T, fs *Dat9FS, cq *CommitQueue, shadow *ShadowStore, pending *PendingIndex, path string, size int64) uint64 {
@@ -151,7 +158,7 @@ func TestSetAttrTimeOnlySkipsPendingCommitWait(t *testing.T) {
 	requestedMtime := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
 	requestedAtime := time.Date(2021, 6, 7, 8, 9, 10, 0, time.UTC)
 
-	fs, cq, putStarted, allowPut, _ := newSetattrTimeTestFS(t, p, data)
+	fs, cq, putStarted, releasePut, _ := newSetattrTimeTestFS(t, p, data)
 	ino := enqueueSetattrTimeCommit(t, fs, cq, fs.shadowStore, fs.pendingIndex, p, int64(len(data)))
 
 	select {
@@ -199,7 +206,7 @@ func TestSetAttrTimeOnlySkipsPendingCommitWait(t *testing.T) {
 		t.Fatalf("GetAttr while commit in flight = %d/%d, want %d/%d", mtime, atime, requestedMtime.Unix(), requestedAtime.Unix())
 	}
 
-	close(allowPut)
+	releasePut()
 	waitCommitPathIdle(t, cq, p)
 
 	// Commit completion rewrote the dir-cache entry; it must carry the
@@ -244,7 +251,7 @@ func TestSetAttrModeStillWaitsForPendingCommit(t *testing.T) {
 	const p = "/chmod.txt"
 	data := []byte("payload")
 
-	fs, cq, putStarted, allowPut, chmodCalls := newSetattrTimeTestFS(t, p, data)
+	fs, cq, putStarted, releasePut, chmodCalls := newSetattrTimeTestFS(t, p, data)
 	ino := enqueueSetattrTimeCommit(t, fs, cq, fs.shadowStore, fs.pendingIndex, p, int64(len(data)))
 
 	select {
@@ -268,7 +275,7 @@ func TestSetAttrModeStillWaitsForPendingCommit(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 
-	close(allowPut)
+	releasePut()
 	select {
 	case st := <-done:
 		if st != gofuse.OK {
@@ -375,6 +382,9 @@ func TestLocalTimeOverrideLifecycle(t *testing.T) {
 
 	// A kind change at the same path (file replaced by a directory) is also a
 	// different object: overrides are dropped and the listing time adopted.
+	// The old identity index entry must go too — a directory has an empty
+	// identity key, so the same resource id appearing elsewhere must not
+	// rejoin this inode through the stale byID mapping.
 	inodes.SetLocalMtime(ino2, requested)
 	inodes.Lookup("/a.txt", true, 0, time.Unix(7777777777, 0))
 	if inodes.HasMtimeOverride(ino2) {
@@ -383,6 +393,9 @@ func TestLocalTimeOverrideLifecycle(t *testing.T) {
 	entry, _ = inodes.GetEntry(ino2)
 	if !entry.Mtime.Equal(time.Unix(7777777777, 0)) {
 		t.Fatalf("kind-change mtime = %v, want listing mtime", entry.Mtime)
+	}
+	if rejoined := inodes.LookupWithIdentity("/elsewhere.txt", "res-2", 1, false, 5, time.Unix(1000, 0)); rejoined == ino2 {
+		t.Fatal("stale byID mapping rejoined the kind-changed inode")
 	}
 }
 
@@ -441,6 +454,93 @@ func TestLocalMutationClearsTimeOverride(t *testing.T) {
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok || !entry.Mtime.Equal(commitTime) {
 		t.Fatalf("mtime after write settle = %v, want %v", entry.Mtime, commitTime)
+	}
+}
+
+// TestFailedWriteSyncRestoresTimeOverride covers the write-sync failure
+// rollback: the write clears the armed override at its dirty-mutation hook,
+// and a failed remote sync that rolls the content back must re-arm the
+// pre-write override — a failed write must not permanently lose an
+// explicitly acknowledged utimensat.
+func TestFailedWriteSyncRestoresTimeOverride(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	requested := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	ino := fs.inodes.Lookup("/ws.txt", false, 3, time.Unix(1000, 0))
+	fs.inodes.SetLocalMtime(ino, requested)
+
+	dirty := fs.newWriteBuffer("/ws.txt", 1024, 0)
+	if _, err := dirty.Write(0, []byte("pre")); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{Ino: ino, Path: "/ws.txt", Dirty: dirty, DirtySeq: 7}
+
+	// The write-sync attempt snapshots the pre-write state, then the
+	// dirty-mutation hook clears the override.
+	bufSnap := dirty.snapshot()
+	timeSnap := fs.inodes.SnapshotLocalTimes(ino)
+	fh.DirtySeq = fs.markDirtySize(ino, dirty.Size())
+	if fs.inodes.HasMtimeOverride(ino) {
+		t.Fatal("write mutation did not clear the override before rollback")
+	}
+	if _, err := dirty.Write(3, []byte("tail")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remote sync fails: content and time-override state roll back.
+	fs.restoreFailedWriteSyncLocked(fh, bufSnap, 7, timeSnap)
+	if !fs.inodes.HasMtimeOverride(ino) {
+		t.Fatal("failed write-sync rollback did not restore the time override")
+	}
+	if mtime, _ := fs.inodes.MtimeOverride(ino); !mtime.Equal(requested) {
+		t.Fatalf("restored override mtime = %v, want %v", mtime, requested)
+	}
+	if got := fh.Dirty.Size(); got != int64(len("pre")) {
+		t.Fatalf("dirty size after rollback = %d, want %d", got, len("pre"))
+	}
+}
+
+// TestStatIdentityReplacementAdoptsReplacementMtime covers the stat-driven
+// identity replacement in GetAttr: when the remote stat describes a
+// different resource, the replacement's mtime is authoritative even when
+// older than the previous object's explicit (possibly future) local time.
+func TestStatIdentityReplacementAdoptsReplacementMtime(t *testing.T) {
+	explicitMtime := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+	replacementMtime := time.Date(2024, 5, 5, 0, 0, 0, 0, time.UTC)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Length", "5")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "9")
+		w.Header().Set("X-Dat9-Resource-ID", "res-new")
+		w.Header().Set("X-Dat9-Nlink", "1")
+		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(replacementMtime.Unix(), 10))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.LookupWithIdentity("/repl.txt", "res-old", 1, false, 5, explicitMtime)
+	fs.inodes.SetLocalMtime(ino, explicitMtime)
+	if !fs.inodes.HasMtimeOverride(ino) {
+		t.Fatal("override not armed")
+	}
+
+	var out gofuse.AttrOut
+	if st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out); st != gofuse.OK {
+		t.Fatalf("GetAttr: %v", st)
+	}
+	if out.Mtime != uint64(replacementMtime.Unix()) {
+		t.Fatalf("GetAttr mtime after identity replacement = %d, want replacement mtime %d", out.Mtime, replacementMtime.Unix())
+	}
+	if fs.inodes.HasMtimeOverride(ino) {
+		t.Fatal("override survived identity replacement")
 	}
 }
 

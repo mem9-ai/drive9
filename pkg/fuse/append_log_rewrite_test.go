@@ -1352,7 +1352,7 @@ func TestAppendLogWriteSyncRollbackRestoresPriorDirtyGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
-	fs.restoreFailedWriteSyncLocked(fh, firstSnapshot, firstDirtySeq)
+	fs.restoreFailedWriteSyncLocked(fh, firstSnapshot, firstDirtySeq, nil)
 	if got := string(fh.Dirty.Bytes()); got != "preone" || fh.DirtySeq != firstDirtySeq {
 		t.Fatalf("successor rollback = %q/%d, want preone/%d", got, fh.DirtySeq, firstDirtySeq)
 	}
@@ -1362,7 +1362,7 @@ func TestAppendLogWriteSyncRollbackRestoresPriorDirtyGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	preFirst.ClearDirty()
-	fs.restoreFailedWriteSyncLocked(fh, preFirst.snapshot(), 0)
+	fs.restoreFailedWriteSyncLocked(fh, preFirst.snapshot(), 0, nil)
 	if got := string(fh.Dirty.Bytes()); got != "pre" || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
 		t.Fatalf("earlier rollback = %q/%d/%t, want pre/0/false", got, fh.DirtySeq, fh.Dirty.HasDirtyParts())
 	}
