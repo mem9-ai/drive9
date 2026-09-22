@@ -14,10 +14,10 @@ import (
 	"github.com/mem9-ai/drive9/pkg/promotion"
 )
 
-// The promotion wire protocol is an implementation detail of the FUSE mount,
-// not part of the public Go SDK. Keep its three calls here so adding the
-// preview does not expand Client's public contract.
-func (fs *Dat9FS) publishPromotionRequest(ctx context.Context, request promotion.PublishRequest) (*promotion.Result, error) {
+// preparePromotionRequest performs every deterministic client-side admission
+// check before the caller persists a prepared journal. Once that journal
+// exists, failures must describe a request that may have reached the server.
+func (fs *Dat9FS) preparePromotionRequest(ctx context.Context, request promotion.PublishRequest) ([]byte, error) {
 	threshold := fs.client.SmallFileThreshold(ctx)
 	if threshold <= 0 {
 		threshold = client.DefaultSmallFileThreshold
@@ -32,6 +32,13 @@ func (fs *Dat9FS) publishPromotionRequest(ctx context.Context, request promotion
 	if int64(len(body)) > promotion.MaxRequestBodyBytes {
 		return nil, promotion.ErrLimitExceeded
 	}
+	return body, nil
+}
+
+// The promotion wire protocol is an implementation detail of the FUSE mount,
+// not part of the public Go SDK. Keep its three calls here so adding the
+// preview does not expand Client's public contract.
+func (fs *Dat9FS) publishPreparedPromotionRequest(ctx context.Context, body []byte) (*promotion.Result, error) {
 	return fs.doPromotionResult(ctx, http.MethodPost, "/v1/fs:promotion", bytes.NewReader(body))
 }
 

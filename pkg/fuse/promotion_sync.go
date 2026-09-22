@@ -83,6 +83,15 @@ func (fs *Dat9FS) refusePromotionRecovery(record *localPromotionRecord, reason s
 	}
 }
 
+func (fs *Dat9FS) refuseUnreadablePromotionRecovery(err error) error {
+	return &promotionRecoveryRefusal{
+		JournalPath: fs.promotionRecordPath(),
+		Phase:       "unknown",
+		OperationID: "unknown",
+		Reason:      fmt.Sprintf("promotion journal is invalid or unreadable: %v", err),
+	}
+}
+
 func isPermanentPromotionRecoveryError(err error) bool {
 	var refusal *promotionRecoveryRefusal
 	return errors.As(err, &refusal)
@@ -122,8 +131,18 @@ func (fs *Dat9FS) promoteLocalTree(ctx context.Context, input *gofuse.RenameIn, 
 	}
 	fs.promotionBarrier.Lock()
 	defer fs.promotionBarrier.Unlock()
+	fs.promotionLifecycleMu.Lock()
+	defer fs.promotionLifecycleMu.Unlock()
 	if fs.promotionBlocked.Load() {
 		return gofuse.EIO
+	}
+	if _, err := os.Lstat(fs.promotionRecordPath()); err == nil {
+		// A released record is harmless to ordinary namespace work, but this
+		// preview has one durable operation slot. Never overwrite it while its
+		// private quarantine/receipt cleanup is still pending.
+		return gofuse.Status(syscall.EBUSY)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return localErrToFuseStatus(err)
 	}
 	if fs.hasPromotionOpenHandle(source, targetLocal) {
 		return gofuse.Status(syscall.EXDEV)
@@ -147,9 +166,14 @@ func (fs *Dat9FS) promoteLocalTree(ctx context.Context, input *gofuse.RenameIn, 
 		return gofuse.Status(syscall.EXDEV)
 	}
 
-	request, err := fs.scanPromotionTree(ctx, source, targetRemote, uuid.NewString())
+	request, err := fs.scanPromotionTree(ctx, source, targetLocal, targetRemote, uuid.NewString())
 	if err != nil {
 		safeLogPrintf("promotion preflight %s -> %s: %v", source, targetLocal, err)
+		return gofuse.Status(syscall.EXDEV)
+	}
+	requestBody, err := fs.preparePromotionRequest(ctx, request)
+	if err != nil {
+		safeLogPrintf("promotion request preflight %s -> %s: %v", source, targetLocal, err)
 		return gofuse.Status(syscall.EXDEV)
 	}
 	if err := fs.validatePromotionQuarantineLayout(source); err != nil {
@@ -164,7 +188,7 @@ func (fs *Dat9FS) promoteLocalTree(ctx context.Context, input *gofuse.RenameIn, 
 	if err := fs.writePromotionRecord(record); err != nil {
 		return localErrToFuseStatus(err)
 	}
-	result, definitive, err := fs.publishPromotionWithRecovery(ctx, request)
+	result, definitive, err := fs.publishPreparedPromotionWithRecovery(ctx, request, requestBody)
 	if err != nil {
 		if definitive {
 			if cleanupErr := fs.abortPromotionRecord(&record); cleanupErr != nil {
@@ -194,19 +218,36 @@ func (fs *Dat9FS) promoteLocalTree(ctx context.Context, input *gofuse.RenameIn, 
 		return gofuse.EIO
 	}
 	fs.finishLocalRename(input, source, targetLocal)
+	fs.scheduleReleasedPromotionCleanup(record)
 	return gofuse.OK
 }
 
 func (fs *Dat9FS) publishPromotionWithRecovery(ctx context.Context, request promotion.PublishRequest) (*promotion.Result, bool, error) {
+	body, err := fs.preparePromotionRequest(ctx, request)
+	if err != nil {
+		return nil, true, err
+	}
+	return fs.publishPreparedPromotionWithRecovery(ctx, request, body)
+}
+
+func (fs *Dat9FS) publishPreparedPromotionWithRecovery(ctx context.Context, request promotion.PublishRequest, body []byte) (*promotion.Result, bool, error) {
 	commitCtx, cancel := context.WithTimeout(ctx, promotionRequestTimeout)
 	defer cancel()
 	lookupCtx, lookupCancel := context.WithTimeout(context.WithoutCancel(ctx), promotionRequestTimeout)
 	defer lookupCancel()
 	var lastErr error
+	mayHaveReachedServer := false
 	for attempt := 0; attempt < 3; attempt++ {
-		result, err := fs.publishPromotionRequest(commitCtx, request)
+		result, err := fs.publishPreparedPromotionRequest(commitCtx, body)
 		if err == nil {
 			return result, true, nil
+		}
+		definitelyRejected := promotionRequestDefinitelyRejected(err)
+		if !definitelyRejected {
+			// This bit is deliberately sticky across retries. A later proxy-side
+			// rejection cannot prove that an earlier forwarded request will not
+			// commit under the same operation ID.
+			mayHaveReachedServer = true
 		}
 		lastErr = err
 		// Once POST may have reached the server, a canceled FUSE request is not
@@ -218,10 +259,15 @@ func (fs *Dat9FS) publishPromotionWithRecovery(ctx context.Context, request prom
 			return stored, true, nil
 		}
 		if client.IsNotFound(statusErr) {
-			if promotionRequestDefinitelyRejected(err) {
+			if definitelyRejected && !mayHaveReachedServer {
 				return nil, true, err
 			}
 			continue
+		}
+		if definitelyRejected && !mayHaveReachedServer {
+			// A result-lookup outage does not erase a trustworthy rejection when
+			// no earlier attempt could have reached the server.
+			return nil, true, err
 		}
 		lastErr = statusErr
 		break
@@ -278,7 +324,7 @@ func pathWithin(root, candidate string) bool {
 	return candidate == root || strings.HasPrefix(candidate, strings.TrimSuffix(root, "/")+"/")
 }
 
-func (fs *Dat9FS) scanPromotionTree(ctx context.Context, source, targetRemote, operationID string) (promotion.PublishRequest, error) {
+func (fs *Dat9FS) scanPromotionTree(ctx context.Context, source, targetLocal, targetRemote, operationID string) (promotion.PublishRequest, error) {
 	sourceAbs, err := fs.localOverlay.abs(source)
 	if err != nil {
 		return promotion.PublishRequest{}, err
@@ -326,6 +372,17 @@ func (fs *Dat9FS) scanPromotionTree(ctx context.Context, source, targetRemote, o
 		if fs.observePathPolicyWithContext(ctx, localPath) != PathLayerLocalOnly {
 			return fmt.Errorf("mixed policy at %s", localPath)
 		}
+		finalLocalPath := targetLocal
+		if rel != "." {
+			finalLocalPath = path.Join(targetLocal, rel)
+		}
+		finalLayer := fs.observePathPolicyWithContext(ctx, finalLocalPath)
+		if info.IsDir() {
+			finalLayer = fs.observeDirPathPolicyWithContext(ctx, finalLocalPath)
+		}
+		if finalLayer != PathLayerRemotePersistent {
+			return fmt.Errorf("non-remote target policy at %s", finalLocalPath)
+		}
 		if len(fs.xattrs.List(localPath)) != 0 {
 			return fmt.Errorf("xattr: %s", localPath)
 		}
@@ -372,7 +429,15 @@ func (fs *Dat9FS) scanPromotionTree(ctx context.Context, source, targetRemote, o
 	if err != nil {
 		return promotion.PublishRequest{}, err
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].RelativePath < entries[j].RelativePath })
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].RelativePath == "." {
+			return entries[j].RelativePath != "."
+		}
+		if entries[j].RelativePath == "." {
+			return false
+		}
+		return entries[i].RelativePath < entries[j].RelativePath
+	})
 	request := promotion.PublishRequest{OperationID: operationID, Target: targetRemote, Entries: entries}
 	request.ManifestSHA256 = promotion.ManifestSHA256(entries)
 	return request, nil
@@ -578,7 +643,7 @@ func (fs *Dat9FS) finishCommittedPromotion(ctx context.Context, record *localPro
 		// crash before source-parent fsync may replay with both directory names.
 		// Forward-complete only when both copies are exactly the committed
 		// snapshot; otherwise keep both and fail closed rather than guessing.
-		request, scanErr := fs.scanPromotionTree(ctx, record.Source, record.TargetRemote, record.OperationID)
+		request, scanErr := fs.scanPromotionTree(ctx, record.Source, record.TargetLocal, record.TargetRemote, record.OperationID)
 		if scanErr != nil || request.ManifestSHA256 != record.ManifestSHA256 {
 			return newPromotionStateConflict("promotion source does not match committed manifest")
 		}
@@ -601,7 +666,7 @@ func (fs *Dat9FS) finishCommittedPromotion(ctx context.Context, record *localPro
 		// actor left the still-local source untouched. Revalidate immediately
 		// before quarantine so restart can never destroy edits made after the
 		// original scan.
-		request, scanErr := fs.scanPromotionTree(ctx, record.Source, record.TargetRemote, record.OperationID)
+		request, scanErr := fs.scanPromotionTree(ctx, record.Source, record.TargetLocal, record.TargetRemote, record.OperationID)
 		if scanErr != nil || request.ManifestSHA256 != record.ManifestSHA256 {
 			return newPromotionStateConflict("promotion source does not match committed manifest")
 		}
@@ -632,10 +697,27 @@ func (fs *Dat9FS) finishCommittedPromotion(ctx context.Context, record *localPro
 	if err := fs.writePromotionRecord(*record); err != nil {
 		return err
 	}
+	return nil
+}
+
+// cleanupReleasedPromotion only touches the operation's immutable receipt,
+// operation-ID quarantine directory, and journal. In particular it must never
+// inspect or remove record.Source: the user may recreate that path immediately
+// after rename has returned success.
+func (fs *Dat9FS) cleanupReleasedPromotion(ctx context.Context, record localPromotionRecord) error {
+	if record.Phase != promotionPhaseReleased {
+		return errors.New("promotion cleanup requires released phase")
+	}
 	result := promotion.Result{OperationID: record.OperationID, Target: record.TargetRemote, ManifestSHA256: record.ManifestSHA256, Committed: true}
 	if err := fs.acknowledgePromotionResult(ctx, result); err != nil && !client.IsNotFound(err) {
 		return err
 	}
+	qPath, err := fs.promotionQuarantinePath(record.OperationID)
+	if err != nil {
+		return err
+	}
+	fs.promotionLifecycleMu.Lock()
+	defer fs.promotionLifecycleMu.Unlock()
 	if err := os.RemoveAll(qPath); err != nil {
 		return err
 	}
@@ -643,6 +725,16 @@ func (fs *Dat9FS) finishCommittedPromotion(ctx context.Context, record *localPro
 		return err
 	}
 	return fs.removePromotionRecord()
+}
+
+func (fs *Dat9FS) scheduleReleasedPromotionCleanup(record localPromotionRecord) {
+	go func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), promotionRequestTimeout)
+		defer cancel()
+		if err := fs.cleanupReleasedPromotion(cleanupCtx, record); err != nil {
+			safeLogPrintf("promotion background cleanup operation_id=%s: %v", record.OperationID, err)
+		}
+	}()
 }
 
 func comparePromotionTrees(sourceRoot, quarantineRoot string) error {
@@ -715,19 +807,21 @@ func comparePromotionTrees(sourceRoot, quarantineRoot string) error {
 // before FUSE begins serving requests.
 func (fs *Dat9FS) recoverSynchronousPromotion(ctx context.Context) error {
 	record, err := fs.readPromotionRecord()
-	if err != nil || record == nil {
-		return err
+	if err != nil {
+		// A journal that exists but cannot be validated is not a retryable
+		// server outage. Refuse startup permanently with an actionable path;
+		// recovery must not guess at untrusted phase or operation identifiers.
+		return fs.refuseUnreadablePromotionRecovery(err)
+	}
+	if record == nil {
+		return nil
 	}
 	if record.Phase == promotionPhaseAborted {
 		return fs.removePromotionRecord()
 	}
 	if record.Phase == promotionPhaseReleased {
-		err := fs.finishCommittedPromotion(ctx, record)
-		var conflict *promotionStateConflict
-		if errors.As(err, &conflict) {
-			return fs.refusePromotionRecovery(record, conflict.Error())
-		}
-		return err
+		fs.scheduleReleasedPromotionCleanup(*record)
+		return nil
 	}
 	result, statusErr := fs.getPromotionResult(ctx, record.OperationID, record.TargetRemote)
 	if statusErr != nil && !client.IsNotFound(statusErr) {
@@ -753,7 +847,11 @@ func (fs *Dat9FS) recoverSynchronousPromotion(ctx context.Context) error {
 	if errors.As(err, &conflict) {
 		return fs.refusePromotionRecovery(record, conflict.Error())
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	fs.scheduleReleasedPromotionCleanup(*record)
+	return nil
 }
 
 // ensurePromotionDirDurable creates each missing directory component and

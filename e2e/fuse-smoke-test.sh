@@ -1823,7 +1823,7 @@ PY
       check_cmd_fail "gate-off failure does not create remote target" test -e "$gateoff_project/site"
       rm -rf "$gateoff_project/dist"
     fi
-    stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
+    require_cmd "gate-off promotion mount stops cleanly" stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
 
     require_cmd "gate-on coding-agent mount A starts" start_promotion_mount \
       "$PROMOTION_A_MOUNT" "$PROMOTION_A_ROOT" "$PROMOTION_A_LOG" 1 PROMOTION_A_PID
@@ -1831,7 +1831,7 @@ PY
     # ownership. A gate-off process must not bypass the enabled mount's flock.
     check_cmd_fail "gate-off mount cannot share enabled LocalRoot" start_promotion_mount \
       "$PROMOTION_LOCK_MOUNT" "$PROMOTION_A_ROOT" "$PROMOTION_LOCK_LOG" 0 PROMOTION_LOCK_PID
-    stop_promotion_mount "$PROMOTION_LOCK_MOUNT" PROMOTION_LOCK_PID
+    require_cmd "rejected shared-LocalRoot mount is fully stopped" stop_promotion_mount "$PROMOTION_LOCK_MOUNT" PROMOTION_LOCK_PID
     require_cmd "second real coding-agent mount B starts" start_promotion_mount \
       "$PROMOTION_B_MOUNT" "$PROMOTION_B_ROOT" "$PROMOTION_B_LOG" 0 PROMOTION_B_PID
 
@@ -1869,10 +1869,24 @@ PY
       finish_open_handle_writers
       rm -rf "$promotion_project_a/dist/.open-next" "$open_ready" "$open_done"
 
+      # Routing is evaluated again at every mapped target path. A tree that is
+      # wholly local at its source can still land under a target-side local-only
+      # rule (node_modules in the coding-agent profile); reject it before POST.
+      mkdir -p "$promotion_project_a/dist/.policy-next/node_modules/pkg"
+      printf 'policy-%s\n' "$TS" >"$promotion_project_a/dist/.policy-next/node_modules/pkg/index.js"
+      check_cmd "promotion refuses a non-remote final entry using EXDEV" \
+        rename_syscall_expect_errno \
+          "$promotion_project_a/dist/.policy-next" "$promotion_project_a/routed-site" EXDEV
+      check_cmd "target-policy rejection preserves local source" \
+        test -f "$promotion_project_a/dist/.policy-next/node_modules/pkg/index.js"
+      check_cmd_fail "target-policy rejection creates no target" \
+        test -e "$promotion_project_a/routed-site"
+      rm -rf "$promotion_project_a/dist/.policy-next"
+
       # Commit-response loss plus a mount crash must converge forward from the
       # durable local record. The proxy withholds the committed POST response;
       # the restarted real mount queries the same operation ID before serving.
-      stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
+      require_cmd "promotion mount A stops before response-loss case" stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
       rm -f "$PROMOTION_PROXY_PORT_FILE" "$PROMOTION_PROXY_COMMITTED"
       require_cmd "response-loss proxy starts" start_promotion_response_loss_proxy \
         "$BASE" "$PROMOTION_PROXY_COMMITTED" "$PROMOTION_PROXY_PORT_FILE" PROMOTION_PROXY_PID
@@ -1899,7 +1913,7 @@ PY
       # Reap the interrupted syscall before unmounting; otherwise its kernel
       # reference can leave a stale mount that a later readiness probe could
       # mistake for the restarted process.
-      stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
+      require_cmd "killed response-loss mount leaves no stale FUSE mount" stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
       check_cmd "rename syscall fails when the serving mount is killed" \
         test "$promotion_rename_rc" -ne 0
       # Gate-off still owns the LocalRoot and must recover an existing journal
@@ -1915,7 +1929,7 @@ PY
         "$(cat "$promotion_project_a/recovered-site/nested/value.txt")" "recover-${TS}"
       check_eq "mount B reads response-loss recovery target" \
         "$(wait_mounted_cat_eq "$promotion_project_b/recovered-site/nested/value.txt" "recover-${TS}")" "recover-${TS}"
-      stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
+      require_cmd "recovered gate-off mount stops cleanly" stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
       stop_promotion_response_loss_proxy "$PROMOTION_PROXY_PID"
       PROMOTION_PROXY_PID=""
       require_cmd "promotion mount A restarts enabled for a new operation" start_promotion_mount \
@@ -1949,8 +1963,8 @@ PY
         "$(drive9_retry fs cat "$PROMOTION_REMOTE/project/site/index.html")" "<html>site-${TS}</html>"
     fi
 
-    stop_promotion_mount "$PROMOTION_B_MOUNT" PROMOTION_B_PID
-    stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
+    require_cmd "promotion mount B stops cleanly" stop_promotion_mount "$PROMOTION_B_MOUNT" PROMOTION_B_PID
+    require_cmd "promotion mount A stops cleanly" stop_promotion_mount "$PROMOTION_A_MOUNT" PROMOTION_A_PID
     drive9_retry fs rm -r "$PROMOTION_REMOTE" >/dev/null 2>&1 || true
   fi
 

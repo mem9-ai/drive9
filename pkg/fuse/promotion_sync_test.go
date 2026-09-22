@@ -119,9 +119,7 @@ func TestSynchronousPromotionPublishesClosedLocalTree(t *testing.T) {
 			if _, err := fs.localOverlay.Lstat("/project/dist/.site-next"); !os.IsNotExist(err) {
 				t.Fatalf("source still exists: %v", err)
 			}
-			if _, err := os.Stat(fs.promotionRecordPath()); !os.IsNotExist(err) {
-				t.Fatalf("journal still exists: %v", err)
-			}
+			waitForPromotionCleanup(t, fs)
 			if publishCalls.Load() != 1 || acknowledgeCalls.Load() != 1 {
 				t.Fatalf("calls publish=%d get=%d ack=%d", publishCalls.Load(), getCalls.Load(), acknowledgeCalls.Load())
 			}
@@ -165,7 +163,7 @@ func TestPromotionResponseLossLookupOutlivesCanceledCaller(t *testing.T) {
 	fs := newPromotionTestFS(t, server.URL)
 	fs.client.SetSmallFileThresholdForTests(50_000)
 	createPromotionTestTree(t, fs)
-	request, err := fs.scanPromotionTree(context.Background(), "/project/dist/.site-next", "/project/site/",
+	request, err := fs.scanPromotionTree(context.Background(), "/project/dist/.site-next", "/project/site", "/project/site/",
 		"12345678-90ab-cdef-1234-567890abcdef")
 	if err != nil {
 		t.Fatal(err)
@@ -194,6 +192,112 @@ func TestPromotionResponseLossLookupOutlivesCanceledCaller(t *testing.T) {
 	}
 }
 
+func TestPromotionOutcomeUnknownBlocksNamespaceReadsAndFlushes(t *testing.T) {
+	var remoteCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	fs := newPromotionTestFS(t, server.URL)
+	fs.promotionBlocked.Store(true)
+	for name, run := range map[string]func() gofuse.Status{
+		"lookup": func() gofuse.Status {
+			return fs.Lookup(nil, &gofuse.InHeader{}, "x", &gofuse.EntryOut{})
+		},
+		"getattr": func() gofuse.Status {
+			return fs.GetAttr(nil, &gofuse.GetAttrIn{}, &gofuse.AttrOut{})
+		},
+		"access": func() gofuse.Status {
+			return fs.Access(nil, &gofuse.AccessIn{})
+		},
+		"readlink": func() gofuse.Status {
+			_, status := fs.Readlink(nil, &gofuse.InHeader{})
+			return status
+		},
+		"opendir": func() gofuse.Status {
+			return fs.OpenDir(nil, &gofuse.OpenIn{}, &gofuse.OpenOut{})
+		},
+		"readdir": func() gofuse.Status {
+			return fs.ReadDir(nil, &gofuse.ReadIn{}, nil)
+		},
+		"readdirplus": func() gofuse.Status {
+			return fs.ReadDirPlus(nil, &gofuse.ReadIn{}, nil)
+		},
+		"fsyncdir": func() gofuse.Status {
+			return fs.FsyncDir(nil, &gofuse.FsyncIn{})
+		},
+		"open": func() gofuse.Status {
+			return fs.Open(nil, &gofuse.OpenIn{}, &gofuse.OpenOut{})
+		},
+		"read": func() gofuse.Status {
+			_, status := fs.Read(nil, &gofuse.ReadIn{}, nil)
+			return status
+		},
+		"flush": func() gofuse.Status {
+			return fs.Flush(nil, &gofuse.FlushIn{})
+		},
+		"fsync": func() gofuse.Status {
+			return fs.Fsync(nil, &gofuse.FsyncIn{})
+		},
+		"getxattr": func() gofuse.Status {
+			_, status := fs.GetXAttr(nil, &gofuse.InHeader{}, "user.test", nil)
+			return status
+		},
+		"listxattr": func() gofuse.Status {
+			_, status := fs.ListXAttr(nil, &gofuse.InHeader{}, nil)
+			return status
+		},
+		"mkdir": func() gofuse.Status {
+			return fs.Mkdir(nil, &gofuse.MkdirIn{}, "x", &gofuse.EntryOut{})
+		},
+		"setattr": func() gofuse.Status {
+			return fs.SetAttr(nil, &gofuse.SetAttrIn{}, &gofuse.AttrOut{})
+		},
+		"mknod": func() gofuse.Status {
+			return fs.Mknod(nil, &gofuse.MknodIn{}, "x", &gofuse.EntryOut{})
+		},
+		"symlink": func() gofuse.Status {
+			return fs.Symlink(nil, &gofuse.InHeader{}, "target", "x", &gofuse.EntryOut{})
+		},
+		"link": func() gofuse.Status {
+			return fs.Link(nil, &gofuse.LinkIn{}, "x", &gofuse.EntryOut{})
+		},
+		"unlink": func() gofuse.Status {
+			return fs.Unlink(nil, &gofuse.InHeader{}, "x")
+		},
+		"rmdir": func() gofuse.Status {
+			return fs.Rmdir(nil, &gofuse.InHeader{}, "x")
+		},
+		"rename": func() gofuse.Status {
+			return fs.Rename(nil, &gofuse.RenameIn{}, "old", "new")
+		},
+		"create": func() gofuse.Status {
+			return fs.Create(nil, &gofuse.CreateIn{}, "x", &gofuse.CreateOut{})
+		},
+		"write": func() gofuse.Status {
+			_, status := fs.Write(nil, &gofuse.WriteIn{}, []byte("x"))
+			return status
+		},
+		"setxattr": func() gofuse.Status {
+			return fs.SetXAttr(nil, &gofuse.SetXAttrIn{}, "user.test", []byte("x"))
+		},
+		"removexattr": func() gofuse.Status {
+			return fs.RemoveXAttr(nil, &gofuse.InHeader{}, "user.test")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if status := run(); status != gofuse.EIO {
+				t.Fatalf("status = %v, want EIO", status)
+			}
+		})
+	}
+	if remoteCalls.Load() != 0 {
+		t.Fatalf("remote calls = %d, want 0", remoteCalls.Load())
+	}
+}
+
 func TestSynchronousPromotionRejectsOpenSourceBeforeRemoteSideEffect(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -212,6 +316,131 @@ func TestSynchronousPromotionRejectsOpenSourceBeforeRemoteSideEffect(t *testing.
 	}
 	if calls.Load() != 0 {
 		t.Fatalf("remote calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestSynchronousPromotionRejectsNonRemoteFinalPathBeforeRemoteSideEffect(t *testing.T) {
+	var promotionCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == "/v1/fs:promotion" {
+			promotionCalls.Add(1)
+		}
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	fs := newPromotionTestFS(t, server.URL)
+	if err := fs.localOverlay.Mkdir("/project/dist/.site-next", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.localOverlay.Mkdir("/project/dist/.site-next/node_modules", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file, err := fs.localOverlay.OpenFile("/project/dist/.site-next/node_modules/x.js", uint32(os.O_CREATE|os.O_WRONLY), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("module.exports = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	status := fs.promoteLocalTree(context.Background(), &gofuse.RenameIn{}, "/project/dist/.site-next", "/project/site")
+	if status != gofuse.Status(syscall.EXDEV) {
+		t.Fatalf("promotion status = %v, want EXDEV", status)
+	}
+	if promotionCalls.Load() != 0 {
+		t.Fatalf("promotion endpoint calls = %d, want 0", promotionCalls.Load())
+	}
+	if _, err := fs.localOverlay.Lstat("/project/dist/.site-next/node_modules/x.js"); err != nil {
+		t.Fatalf("source changed after target-policy rejection: %v", err)
+	}
+	if _, err := os.Stat(fs.promotionRecordPath()); !os.IsNotExist(err) {
+		t.Fatalf("journal after target-policy rejection: %v", err)
+	}
+}
+
+func TestPromotionScanKeepsRootBeforeLexicallyEarlierNames(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	fs := newPromotionTestFS(t, server.URL)
+	for _, dir := range []string{
+		"/project/dist/.site-next",
+		"/project/dist/.site-next/#cache",
+		"/project/dist/.site-next/-backup",
+	} {
+		if err := fs.localOverlay.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request, err := fs.scanPromotionTree(
+		context.Background(), "/project/dist/.site-next", "/project/site", "/project/site/",
+		"01234567-89ab-cdef-0123-456789abcdef",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := request.Entries[0].RelativePath; got != "." {
+		t.Fatalf("first entry = %q, want root", got)
+	}
+	if err := promotion.Validate(request, 50_000); err != nil {
+		t.Fatalf("Validate scanner output: %v", err)
+	}
+}
+
+func TestSynchronousPromotionRejectsOversizedInlineFileBeforeJournalOrReceiptLookup(t *testing.T) {
+	var promotionCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == "/v1/fs:promotion" {
+			promotionCalls.Add(1)
+		}
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	fs := newPromotionTestFS(t, server.URL)
+	fs.client.SetSmallFileThresholdForTests(50_000)
+	if err := fs.localOverlay.Mkdir("/project/dist/.site-next", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file, err := fs.localOverlay.OpenFile("/project/dist/.site-next/big.bin", uint32(os.O_CREATE|os.O_WRONLY), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(make([]byte, 100_000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	status := fs.promoteLocalTree(context.Background(), &gofuse.RenameIn{}, "/project/dist/.site-next", "/project/site")
+	if status != gofuse.Status(syscall.EXDEV) {
+		t.Fatalf("promotion status = %v, want EXDEV", status)
+	}
+	if promotionCalls.Load() != 0 {
+		t.Fatalf("promotion endpoint calls = %d, want 0", promotionCalls.Load())
+	}
+	if _, err := fs.localOverlay.Lstat("/project/dist/.site-next/big.bin"); err != nil {
+		t.Fatalf("source changed after local request rejection: %v", err)
+	}
+	if _, err := os.Stat(fs.promotionRecordPath()); !os.IsNotExist(err) {
+		t.Fatalf("journal after local request rejection: %v", err)
+	}
+	if fs.promotionBlocked.Load() {
+		t.Fatal("local request rejection blocked the mount")
 	}
 }
 
@@ -284,7 +513,9 @@ func TestSynchronousPromotionStopsBeforePublishWhenJournalParentSyncFails(t *tes
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		publishCalls.Add(1)
+		if r.URL.Path == "/v1/fs:promotion" {
+			publishCalls.Add(1)
+		}
 		http.Error(w, "unexpected", http.StatusInternalServerError)
 	}))
 	defer server.Close()
@@ -400,6 +631,7 @@ func TestSynchronousPromotionQuarantineDurabilityFailuresRecoverForward(t *testi
 			if err := restarted.recoverSynchronousPromotion(context.Background()); err != nil {
 				t.Fatalf("recover: %v", err)
 			}
+			waitForPromotionCleanup(t, restarted)
 			if _, err := restarted.localOverlay.Lstat("/project/dist/.site-next"); !os.IsNotExist(err) {
 				t.Fatalf("source after recovery: %v", err)
 			}
@@ -601,8 +833,19 @@ func TestSynchronousPromotionRejectsUnknownJournalPhaseBeforeRemoteSideEffect(t 
 				t.Fatal(err)
 			}
 
-			if err := fs.recoverSynchronousPromotion(context.Background()); err == nil {
+			recoveryErr := fs.recoverSynchronousPromotion(context.Background())
+			if recoveryErr == nil {
 				t.Fatal("recovery accepted invalid journal phase")
+			}
+			var refusal *promotionRecoveryRefusal
+			if !errors.As(recoveryErr, &refusal) {
+				t.Fatalf("recovery error = %T %v, want permanent refusal", recoveryErr, recoveryErr)
+			}
+			if refusal.JournalPath != fs.promotionRecordPath() || refusal.Phase != "unknown" || refusal.OperationID != "unknown" {
+				t.Fatalf("recovery refusal = %+v, want actionable journal path with untrusted identifiers", refusal)
+			}
+			if exitErr := promotionRecoveryMountExit(recoveryErr); exitErr.Code != ExitStartupPermanent {
+				t.Fatalf("mount exit = %+v, want permanent startup", exitErr)
 			}
 			if remoteCalls.Load() != 0 {
 				t.Fatalf("remote calls = %d, want 0", remoteCalls.Load())
@@ -1115,9 +1358,11 @@ func TestSynchronousPromotionQuotaRejectionReturnsENOSPCWithoutBlockingMount(t *
 	unlock()
 }
 
-func TestSynchronousPromotionAckStallTimesOutAndRestartsFromReleasedJournal(t *testing.T) {
+func TestSynchronousPromotionReturnsBeforeAckAndRestartsReleasedCleanup(t *testing.T) {
 	var acknowledgeCalls atomic.Int32
 	acknowledgeStarted := make(chan struct{})
+	releaseFirstAcknowledge := make(chan struct{})
+	firstAcknowledgeFinished := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusNotFound)
@@ -1140,7 +1385,9 @@ func TestSynchronousPromotionAckStallTimesOutAndRestartsFromReleasedJournal(t *t
 		case http.MethodDelete:
 			if acknowledgeCalls.Add(1) == 1 {
 				close(acknowledgeStarted)
-				<-r.Context().Done()
+				<-releaseFirstAcknowledge
+				http.Error(w, "injected cleanup outage", http.StatusServiceUnavailable)
+				close(firstAcknowledgeFinished)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -1148,35 +1395,41 @@ func TestSynchronousPromotionAckStallTimesOutAndRestartsFromReleasedJournal(t *t
 			http.Error(w, "unexpected", http.StatusInternalServerError)
 		}
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
+	t.Cleanup(func() {
+		select {
+		case <-releaseFirstAcknowledge:
+		default:
+			close(releaseFirstAcknowledge)
+		}
+	})
 
 	fs := newPromotionTestFS(t, server.URL)
 	fs.client.SetSmallFileThresholdForTests(50_000)
 	createPromotionTestTree(t, fs)
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
 	statusResult := make(chan gofuse.Status, 1)
 	go func() {
-		statusResult <- fs.promoteLocalTree(ctx, &gofuse.RenameIn{}, "/project/dist/.site-next", "/project/site")
+		statusResult <- fs.promoteLocalTree(context.Background(), &gofuse.RenameIn{}, "/project/dist/.site-next", "/project/site")
 	}()
+	var status gofuse.Status
+	select {
+	case status = <-statusResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rename waited for background acknowledgement")
+	}
+	if status != gofuse.OK {
+		t.Fatalf("promotion status = %v, want OK", status)
+	}
 	select {
 	case <-acknowledgeStarted:
 	case <-time.After(5 * time.Second):
 		t.Fatal("ack request did not start")
 	}
-	started := time.Now()
-	var status gofuse.Status
-	select {
-	case status = <-statusResult:
-	case <-time.After(time.Second):
-		t.Fatal("ack cancellation did not release rename")
+	unlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		t.Fatal("background acknowledgement blocked ordinary mount mutation")
 	}
-	if status != gofuse.EIO {
-		t.Fatalf("promotion status = %v, want EIO", status)
-	}
-	if time.Since(started) > 2*time.Second {
-		t.Fatal("ack stall did not honor caller deadline")
-	}
+	unlock()
 	record, err := fs.readPromotionRecord()
 	if err != nil || record == nil || record.Phase != promotionPhaseReleased {
 		t.Fatalf("record after ack stall = %+v, %v; want released", record, err)
@@ -1191,16 +1444,39 @@ func TestSynchronousPromotionAckStallTimesOutAndRestartsFromReleasedJournal(t *t
 	if _, err := fs.localOverlay.Lstat(record.Source); !os.IsNotExist(err) {
 		t.Fatalf("source after ack stall: %v", err)
 	}
+	// The returned rename lets the user reuse the old source name immediately.
+	// Cleanup must only touch the operation-ID quarantine, never this new tree.
+	if err := fs.localOverlay.Mkdir(record.Source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	newFile, err := fs.localOverlay.OpenFile(record.Source+"/new.txt", uint32(os.O_CREATE|os.O_WRONLY), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newFile.WriteString("new user data"); err != nil {
+		t.Fatal(err)
+	}
+	if err := newFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseFirstAcknowledge)
+	select {
+	case <-firstAcknowledgeFinished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first background acknowledgement did not finish")
+	}
 
 	restarted := newPromotionTestFSWithRoot(t, server.URL, fs.opts.LocalRoot)
 	if err := restarted.recoverSynchronousPromotion(context.Background()); err != nil {
 		t.Fatalf("restart cleanup: %v", err)
 	}
+	waitForPromotionCleanup(t, restarted)
 	if acknowledgeCalls.Load() != 2 {
 		t.Fatalf("ack calls = %d, want 2", acknowledgeCalls.Load())
 	}
-	if _, err := os.Stat(restarted.promotionRecordPath()); !os.IsNotExist(err) {
-		t.Fatalf("journal after restart cleanup: %v", err)
+	data, err := os.ReadFile(filepath.Join(restarted.opts.LocalRoot, "overlay", "project", "dist", ".site-next", "new.txt"))
+	if err != nil || string(data) != "new user data" {
+		t.Fatalf("recreated source changed by cleanup: data=%q err=%v", data, err)
 	}
 }
 
@@ -1236,7 +1512,7 @@ func TestSynchronousPromotionStartupRecoveryFinishesCommittedOperation(t *testin
 	if err := fs.localOverlay.Mkdir("/project/dist/.site-next", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	request, err := fs.scanPromotionTree(context.Background(), "/project/dist/.site-next", result.Target, operationID)
+	request, err := fs.scanPromotionTree(context.Background(), "/project/dist/.site-next", "/project/site", result.Target, operationID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1253,6 +1529,7 @@ func TestSynchronousPromotionStartupRecoveryFinishesCommittedOperation(t *testin
 	if err := fs.recoverSynchronousPromotion(context.Background()); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
+	waitForPromotionCleanup(t, fs)
 	if acknowledgeCalls.Load() != 1 {
 		t.Fatalf("acknowledge calls = %d, want 1", acknowledgeCalls.Load())
 	}
@@ -1334,7 +1611,7 @@ func TestSynchronousPromotionGateOffStillRecoversPendingJournal(t *testing.T) {
 	if err := enabled.localOverlay.Mkdir("/project/dist/.site-next", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	request, err := enabled.scanPromotionTree(context.Background(), "/project/dist/.site-next", result.Target, operationID)
+	request, err := enabled.scanPromotionTree(context.Background(), "/project/dist/.site-next", "/project/site", result.Target, operationID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1354,6 +1631,7 @@ func TestSynchronousPromotionGateOffStillRecoversPendingJournal(t *testing.T) {
 	if err := disabled.recoverSynchronousPromotion(context.Background()); err != nil {
 		t.Fatalf("gate-off recovery: %v", err)
 	}
+	waitForPromotionCleanup(t, disabled)
 	if getCalls.Load() != 1 || acknowledgeCalls.Load() != 1 {
 		t.Fatalf("calls get=%d ack=%d, want 1/1", getCalls.Load(), acknowledgeCalls.Load())
 	}
@@ -1392,7 +1670,7 @@ func TestSynchronousPromotionRecoveryConvergesDurableDualName(t *testing.T) {
 			fs := newPromotionTestFS(t, server.URL)
 			createPromotionTestTree(t, fs)
 			const operationID = "01234567-89ab-cdef-0123-456789abcdef"
-			request, err := fs.scanPromotionTree(context.Background(), "/project/dist/.site-next", "/project/site/", operationID)
+			request, err := fs.scanPromotionTree(context.Background(), "/project/dist/.site-next", "/project/site", "/project/site/", operationID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1445,6 +1723,7 @@ func TestSynchronousPromotionRecoveryConvergesDurableDualName(t *testing.T) {
 			if err != nil {
 				t.Fatalf("recover identical dual-name state: %v", err)
 			}
+			waitForPromotionCleanup(t, fs)
 			if _, statErr := os.Stat(sourceAbs); !os.IsNotExist(statErr) {
 				t.Fatalf("source after recovery: %v", statErr)
 			}
@@ -1477,7 +1756,7 @@ func TestSynchronousPromotionRecoveryRejectsChangedSourceBeforeQuarantine(t *tes
 	fs := newPromotionTestFS(t, server.URL)
 	createPromotionTestTree(t, fs)
 	const operationID = "abcdef12-3456-7890-abcd-ef1234567890"
-	request, err := fs.scanPromotionTree(context.Background(), "/project/dist/.site-next", "/project/site/", operationID)
+	request, err := fs.scanPromotionTree(context.Background(), "/project/dist/.site-next", "/project/site", "/project/site/", operationID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1533,6 +1812,77 @@ func TestPromotionRequestDefinitelyRejectedTreatsProxyTimeoutsAsUnknown(t *testi
 	}
 }
 
+func TestPromotionOutcomeUnknownIsStickyAcrossRetries(t *testing.T) {
+	var postCalls, getCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			call := postCalls.Add(1)
+			if call == 1 {
+				http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
+				return
+			}
+			http.Error(w, "too large", http.StatusRequestEntityTooLarge)
+		case http.MethodGet:
+			getCalls.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	fs := newPromotionTestFS(t, server.URL)
+	request := testPromotionRequest()
+	_, definitive, err := fs.publishPromotionWithRecovery(context.Background(), request)
+	if err == nil || definitive {
+		t.Fatalf("publish result definitive=%v err=%v, want sticky outcome-unknown", definitive, err)
+	}
+	if postCalls.Load() != 3 || getCalls.Load() < 3 {
+		t.Fatalf("calls post=%d get=%d, want 3/>=3", postCalls.Load(), getCalls.Load())
+	}
+}
+
+func TestPromotionDefiniteRejectionSurvivesReceiptLookupFailure(t *testing.T) {
+	var postCalls, getCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			postCalls.Add(1)
+			http.Error(w, "too large", http.StatusRequestEntityTooLarge)
+		case http.MethodGet:
+			getCalls.Add(1)
+			panic(http.ErrAbortHandler)
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	fs := newPromotionTestFS(t, server.URL)
+	_, definitive, err := fs.publishPromotionWithRecovery(context.Background(), testPromotionRequest())
+	if err == nil || !definitive {
+		t.Fatalf("publish result definitive=%v err=%v, want definite POST rejection", definitive, err)
+	}
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("publish error = %T %v, want original 413", err, err)
+	}
+	if postCalls.Load() != 1 || getCalls.Load() < 1 {
+		t.Fatalf("calls post=%d get=%d, want 1/>=1", postCalls.Load(), getCalls.Load())
+	}
+}
+
+func testPromotionRequest() promotion.PublishRequest {
+	entries := []promotion.Entry{{RelativePath: ".", Type: promotion.EntryDirectory, Mode: 0o755}}
+	return promotion.PublishRequest{
+		OperationID:    "01234567-89ab-cdef-0123-456789abcdef",
+		Target:         "/project/site/",
+		ManifestSHA256: promotion.ManifestSHA256(entries),
+		Entries:        entries,
+	}
+}
+
 func newPromotionTestFS(t *testing.T, serverURL string) *Dat9FS {
 	t.Helper()
 	return newPromotionTestFSWithRoot(t, serverURL, t.TempDir())
@@ -1567,6 +1917,29 @@ func createPromotionTestTree(t *testing.T, fs *Dat9FS) {
 	}
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func waitForPromotionCleanup(t *testing.T, fs *Dat9FS) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := os.Lstat(fs.promotionRecordPath())
+		if os.IsNotExist(err) {
+			// The cleanup removes the journal before its final directory fsync.
+			// Wait for its lifecycle critical section to finish so tests may
+			// safely restore process-wide durability failpoints.
+			fs.promotionLifecycleMu.Lock()
+			fs.promotionLifecycleMu.Unlock()
+			return
+		}
+		if err != nil {
+			t.Fatalf("stat promotion journal: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("promotion cleanup did not remove journal %s", fs.promotionRecordPath())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

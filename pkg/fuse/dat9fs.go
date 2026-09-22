@@ -196,6 +196,10 @@ type Dat9FS struct {
 	// when the preview feature is enabled.
 	promotionBarrier sync.RWMutex
 	promotionBlocked atomic.Bool
+	// promotionLifecycleMu serializes the single durable promotion journal
+	// with its released-phase background cleanup. It never gates ordinary FUSE
+	// work, so a slow receipt acknowledgement cannot freeze the mount.
+	promotionLifecycleMu sync.Mutex
 	// transientLocalOverlay stores mount-local runtime sidecars that must be
 	// shared by all handles in one mount, but must not become remote state.
 	transientLocalOverlay *LocalOverlay
@@ -7675,6 +7679,9 @@ func (fs *Dat9FS) notifyInodeAtSyncCommit(ino uint64) {
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseLookup, perfStart, status, 0) }()
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -8816,6 +8823,9 @@ func (fs *Dat9FS) cleanupCommittedInode(ino uint64, p string) {
 func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseGetAttr, perfStart, status, 0) }()
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -9689,6 +9699,9 @@ func (fs *Dat9FS) setAttrOutTimeout(out *gofuse.AttrOut, sizeChanged bool) {
 func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out []byte, status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseReadlink, perfStart, status, uint64(len(out))) }()
+	if fs.promotionBlocked.Load() {
+		return nil, gofuse.EIO
+	}
 
 	entry, ok := fs.inodes.GetEntry(header.NodeId)
 	if !ok {
@@ -11366,6 +11379,12 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	// Check the fail-closed outcome-unknown barrier before doing path-policy
+	// lookups. The local-to-remote promotion branch takes the write side of
+	// promotionBarrier itself, so it cannot take lockPromotionMutation here.
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 	// renameat2 flags are not implemented: drive9 rename always replaces the
 	// target, so doing a plain rename for RENAME_NOREPLACE would silently
 	// clobber the destination and RENAME_EXCHANGE would destroy one side
@@ -11702,6 +11721,9 @@ func (dh *DirHandle) updateEntryIno(generation uint64, index int, ino uint64) {
 func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseReadDir, perfStart, status, 0) }()
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 	dh, ok := fs.dirHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.ENOENT
@@ -11760,6 +11782,9 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseReadDirPlus, perfStart, status, 0) }()
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 	dh, ok := fs.dirHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.ENOENT
@@ -11964,6 +11989,9 @@ func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
 func (fs *Dat9FS) FsyncDir(cancel <-chan struct{}, input *gofuse.FsyncIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFsyncDir, perfStart, status, 0) }()
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 
 	dh, ok := fs.dirHandles.Get(input.Fh)
 	if !ok {
@@ -12968,6 +12996,10 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}
 		fs.debugf("read path=%s fh=%d ino=%d off=%d req=%d got=%d source=%s status=%d dur=%s", logPath, input.Fh, logIno, input.Offset, input.Size, bytesRead, source, status, d)
 	}()
+	if fs.promotionBlocked.Load() {
+		source = "promotion-blocked"
+		return nil, gofuse.EIO
+	}
 
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
@@ -14579,6 +14611,9 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFlush, perfStart, status, 0) }()
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok && fh.isExtent() {
 		// Extent handles release POSIX locks inside JuiceFS VFS.Flush.
@@ -15015,6 +15050,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFsync, perfStart, status, 0) }()
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.OK
@@ -17134,6 +17172,9 @@ func (fs *Dat9FS) StatFs(cancel <-chan struct{}, header *gofuse.InHeader, out *g
 // --- Xattr handlers (in-memory, session-scoped) ----------------------------
 
 func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string, dest []byte) (uint32, gofuse.Status) {
+	if fs.promotionBlocked.Load() {
+		return 0, gofuse.EIO
+	}
 	path, ok := fs.inodes.GetPath(header.NodeId)
 	if !ok {
 		return 0, gofuse.ENOENT
@@ -17153,6 +17194,9 @@ func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr
 }
 
 func (fs *Dat9FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, dest []byte) (uint32, gofuse.Status) {
+	if fs.promotionBlocked.Load() {
+		return 0, gofuse.EIO
+	}
 	path, ok := fs.inodes.GetPath(header.NodeId)
 	if !ok {
 		return 0, gofuse.ENOENT

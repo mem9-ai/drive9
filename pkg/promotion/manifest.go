@@ -86,7 +86,10 @@ func Validate(req PublishRequest, maxFileBytes int64) error {
 		if err := validateFinalPath(req.Target, entry); err != nil {
 			return fmt.Errorf("entry %d: %w", i, err)
 		}
-		if i > 0 && entry.RelativePath <= previous {
+		// The canonical wire order fixes the root entry first, then sorts only
+		// descendants. Valid Unix names such as "#cache" and "-backup" sort
+		// before "." bytewise and must not make an otherwise valid tree fail.
+		if i > 1 && entry.RelativePath <= previous {
 			return fmt.Errorf("%w: entries are not strictly sorted", ErrInvalidRequest)
 		}
 		previous = entry.RelativePath
@@ -229,7 +232,9 @@ func pathDepth(rel string) int {
 // checksums. File bodies are covered by their verified checksum.
 func ManifestSHA256(entries []Entry) string {
 	ordered := append([]Entry(nil), entries...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].RelativePath < ordered[j].RelativePath })
+	sort.Slice(ordered, func(i, j int) bool {
+		return canonicalEntryPathLess(ordered[i].RelativePath, ordered[j].RelativePath)
+	})
 	h := sha256.New()
 	for _, entry := range ordered {
 		writeDigestField(h, entry.RelativePath)
@@ -240,6 +245,16 @@ func ManifestSHA256(entries []Entry) string {
 		writeDigestField(h, entry.ChecksumSHA256)
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func canonicalEntryPathLess(left, right string) bool {
+	if left == "." {
+		return right != "."
+	}
+	if right == "." {
+		return false
+	}
+	return left < right
 }
 
 type digestWriter interface {

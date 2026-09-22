@@ -27,6 +27,23 @@ func TestValidateCanonicalManifest(t *testing.T) {
 	}
 }
 
+func TestValidateCanonicalManifestKeepsRootBeforeLexicallyEarlierNames(t *testing.T) {
+	entries := []Entry{
+		{RelativePath: ".", Type: EntryDirectory, Mode: 0o755},
+		{RelativePath: "#cache", Type: EntryDirectory, Mode: 0o755},
+		{RelativePath: "-backup", Type: EntryDirectory, Mode: 0o755},
+	}
+	req := PublishRequest{
+		OperationID:    "0123456789abcdef",
+		Target:         "/project/site/",
+		ManifestSHA256: ManifestSHA256(entries),
+		Entries:        entries,
+	}
+	if err := Validate(req, 50_000); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
 func TestValidateRejectsMissingParentAndTamperedBody(t *testing.T) {
 	body := []byte("hello")
 	sum := sha256.Sum256(body)

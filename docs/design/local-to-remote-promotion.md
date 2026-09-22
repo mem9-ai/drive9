@@ -67,8 +67,20 @@ before opening the publish transaction. The transaction:
 5. records the committed operation result;
 6. commits the namespace and result together.
 
+The three wire operations form one cross-repository contract. `POST` publishes
+the namespace and its receipt in the same transaction. Side-effect-free `GET`
+is keyed by `(target, operation ID)` and returns either that committed receipt
+or `404`. After the client has durably persisted `released`, `DELETE` carries
+the exact `(target, operation ID, manifest digest)` tuple; it is idempotent and
+an already-absent receipt returns `404`. `409`, `413`, and `507` POST responses
+are authoritative pre-commit rejections only when no earlier attempt with the
+same operation ID may have reached the server.
+
 If the response is lost, the live syscall queries the same operation ID and
-may retry that exact request before returning. A committed matching result
+may retry that exact request before returning. Whether any request may have
+reached the server is sticky across those retries: a later local/proxy
+rejection plus `NotFound` cannot disprove an earlier in-flight attempt. A
+committed matching result
 means it may finish the local source transition. Startup recovery never turns
 a prepared local record with no durable server result into a new publish; it
 fails closed instead. A single receipt `NotFound` is not proof that a publish
@@ -98,7 +110,8 @@ The request is rejected before the remote call if any of these is true:
   ACL, setuid/setgid/sticky permission bit, or an entry owned by another
   uid/gid;
 - any final entry name is not already in Drive9's canonical path grammar;
-- the tree crosses local/remote/Git/layer policy boundaries;
+- the source is not wholly local-only, or any entry's mapped final path is not
+  remote-persistent (for example `site/node_modules/x.js`);
 - an entry, path, depth, file size, total byte size, or request size exceeds
   the configured phase-one bound;
 - a local-root single-writer lock cannot be held.
@@ -118,8 +131,12 @@ before any request or local mutation if that identity no longer matches.
   it cannot publish on restart.
 - Unknown response: query the same operation ID. Restart only moves forward
   from a matching committed result and never re-POSTs a prepared record.
-- Committed result: move the source into a private quarantine directory,
-  fsync both parent directories, update the mount view, then remove the record.
+- Committed result: move the source into an operation-ID-private quarantine
+  directory, fsync both parent directories, persist `released`, and update the
+  mount view. `rename` may then return success. Receipt acknowledgement,
+  quarantine deletion, and journal deletion are retryable background cleanup;
+  they never inspect or remove a user path that later reuses the old source
+  name.
 - Restart: process any remaining record before serving requests for that local
   root.
 
@@ -176,7 +193,8 @@ Phase one does not include:
 - remote-to-local moves;
 - mixed-policy or Git workspace trees;
 - object-store payloads or unbounded trees;
-- asynchronous rename success;
+- returning rename success before remote commit or the durable local source
+  switch (post-success receipt/quarantine cleanup is asynchronous);
 - online restore/clone concurrency;
 - stable-inode migration.
 
