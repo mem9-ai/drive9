@@ -240,39 +240,26 @@ func (u *WriteBackUploader) Submit(localPath string) {
 		return
 	default:
 	}
-	u.submitMu.Unlock()
-
-	// Channel full — block with timeout, then re-try the send under the
-	// lock (DrainAll may have closed the channel while we waited), then
-	// fall back to sync upload.
+	// Channel full — block until a worker frees space or the timeout
+	// expires, then upload synchronously in this goroutine so an
+	// acknowledged path is never dropped. This wait stays under submitMu:
+	// the send must not race DrainAll's close (which also holds submitMu),
+	// workers never take this lock — they keep draining the channel, which
+	// is what unblocks the wait — and submitTimeout bounds how long
+	// DrainAll can be held off.
 	timer := time.NewTimer(submitTimeout)
 	defer timer.Stop()
 	select {
+	case u.uploadCh <- localPath:
+		u.submitMu.Unlock()
 	case <-timer.C:
+		u.submitMu.Unlock()
 		safeLogPrintf("writeback uploader: channel full after %v, uploading synchronously for %s", submitTimeout, localPath)
 		if u.perf != nil {
 			u.perf.uploaderSyncFallback.add(1)
 		}
 		u.uploadOne(localPath)
-		return
-	default:
 	}
-	u.submitMu.Lock()
-	if u.stopped.Load() {
-		u.submitMu.Unlock()
-		safeLogPrintf("writeback uploader: stopped while blocked, uploading synchronously for %s", localPath)
-		if u.perf != nil {
-			u.perf.uploaderSyncFallback.add(1)
-		}
-		u.uploadOne(localPath)
-		return
-	}
-	select {
-	case u.uploadCh <- localPath:
-	default:
-	}
-	u.submitMu.Unlock()
-	safeLogPrintf("writeback uploader: enqueue after block for %s", localPath)
 }
 
 func (u *WriteBackUploader) directPutThreshold() int64 {
