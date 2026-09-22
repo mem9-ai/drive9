@@ -16922,7 +16922,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// re-adding it here with the upload's size/revision would resurrect a
 	// stale entry. The new path (fh.Path) will be cached on its own flush.
 	if !pathRetargeted {
-		commitTime := fs.commitSettleMtime(handleIno, time.Now())
+		commitTime := time.Now()
 		fs.cacheFileForPath(handlePath, publishSize, commitTime, committedRev)
 		// Ensure the inode's mtime advances to at least the commit time.
 		// Without this, GetAttr may report a stale mtime from before the
@@ -16930,7 +16930,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		// dir cache), causing POSIX mtime-advance checks to fail. The
 		// settle is a derived refresh: an explicit utimensat acknowledged
 		// while this upload was in flight wins (the write itself already
-		// cleared the override at markDirtySize).
+		// cleared the override at markDirtySize); UpdateMtimeDerived guards
+		// the inode and cacheFileForPath resolves the dir-cache stamp.
 		if entry, ok := fs.inodes.GetEntry(handleIno); ok {
 			if entry.Mtime.Before(commitTime) {
 				fs.inodes.UpdateMtimeDerived(handleIno, commitTime)
@@ -17173,7 +17174,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		if entry.HasMode {
 			fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
 		}
-		fs.cacheFileForPath(entry.Path, entry.Size, fs.commitSettleMtime(entry.Inode, time.Now()), 0)
+		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
 		return
 	}
 	if committedRev > 0 {
@@ -17200,15 +17201,18 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		if entry.HasMode {
 			fs.inodes.UpdateMode(entry.Inode, entry.Mode&posixPermissionModeMask)
 		}
-		fs.cacheFileForPath(entry.Path, entry.Size, fs.commitSettleMtime(entry.Inode, time.Now()), committedRev)
+		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), committedRev)
 		// Local async commit completion — this is not an external change.
 		// Kernel does not need notify; userspace caches and inode state
 		// are updated above. Kernel will see new attrs on next access.
 	} else {
 		fs.invalidateReadCacheAndTargets(entry.Path)
-		settleMtime := fs.commitSettleMtime(entry.Inode, time.Now())
+		settleMtime := time.Now()
 		if entry.Inode > 0 {
 			fs.inodes.UpdateSize(entry.Inode, entry.Size)
+			// Derived refresh: an armed local time override (explicit
+			// utimensat acknowledged while this commit was in flight) wins;
+			// cacheFileForPath resolves the same for the dir-cache stamp.
 			fs.inodes.UpdateMtimeDerived(entry.Inode, settleMtime)
 			if entry.HasMode {
 				fs.inodes.UpdateMode(entry.Inode, entry.Mode&posixPermissionModeMask)
@@ -17232,17 +17236,6 @@ func (fs *Dat9FS) clearCommittedAppendSnapshot(entry *CommitEntry) {
 		}
 		fh.Unlock()
 	}
-}
-
-// commitSettleMtime keeps an armed local time override (explicit utimensat on
-// a file whose commit was still in flight) visible in the dir cache and inode
-// state when the async commit settles.
-func (fs *Dat9FS) commitSettleMtime(ino uint64, now time.Time) time.Time {
-	if t, ok := fs.inodes.MtimeOverride(ino); ok {
-		return t
-	}
-	return now
-}>>>>>>> 57cf537e2 (fix(fuse): stop time-only setattr from waiting on pending writeback commits)
 }
 
 func (fs *Dat9FS) readCommitEntryPayloadForCache(entry *CommitEntry) ([]byte, error) {

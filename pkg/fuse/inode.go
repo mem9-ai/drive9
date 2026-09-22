@@ -606,6 +606,15 @@ func (m *InodeToPath) HasMtimeOverride(ino uint64) bool {
 	return ok && entry.MtimeOverride != nil
 }
 
+// HasAtimeOverride reports whether a local atime override is armed.
+func (m *InodeToPath) HasAtimeOverride(ino uint64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entry, ok := m.byInode[ino]
+	return ok && entry.AtimeOverride != nil
+}
+
 // UpdateMtimeDerived updates the mtime from a derived source (async commit
 // completion, remote stat refresh). An armed local override wins.
 func (m *InodeToPath) UpdateMtimeDerived(ino uint64, mtime time.Time) {

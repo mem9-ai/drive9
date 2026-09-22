@@ -352,13 +352,16 @@ func TestLocalTimeOverrideLifecycle(t *testing.T) {
 	inodes.LookupWithIdentity("/a.txt", "res-1", 1, false, 5, time.Unix(2000, 0))
 	inodes.SetLocalMtime(ino2, requested)
 	inodes.SetLocalAtime(ino2, requested.Add(time.Minute))
-	if !inodes.HasMtimeOverride(ino2) {
-		t.Fatal("override not armed before identity replacement")
+	if !inodes.HasMtimeOverride(ino2) || !inodes.HasAtimeOverride(ino2) {
+		t.Fatal("overrides not armed before identity replacement")
 	}
 	replacementMtime := time.Unix(8888888888, 0)
 	inodes.LookupWithIdentity("/a.txt", "res-2", 1, false, 5, replacementMtime)
 	if inodes.HasMtimeOverride(ino2) {
 		t.Fatal("identity replacement inherited the mtime override")
+	}
+	if inodes.HasAtimeOverride(ino2) {
+		t.Fatal("identity replacement inherited the atime override")
 	}
 	entry, _ = inodes.GetEntry(ino2)
 	if !entry.Mtime.Equal(replacementMtime) {
