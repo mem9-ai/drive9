@@ -17017,6 +17017,43 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 // FlushAll flushes all open file handles, drains pending debounced uploads,
 // drains the write-back uploader, and waits for inflight async kernel
 // notifications to complete. Used during graceful shutdown.
+// drainLatePendingEntries rescues staged-but-uncommitted entries left after
+// the primary unmount drains (issue #964). Late FUSE Release arrivals and
+// drain timeouts leave recoverable pending state; commit them synchronously
+// here so a graceful unmount leaves nothing behind locally. Loop a few times:
+// each sync commit may surface follow-up work (mode/lineage follow-ups), and
+// the pending index is the loop condition.
+func (fs *Dat9FS) drainLatePendingEntries() {
+	const (
+		settle   = 100 * time.Millisecond
+		deadline = 120 * time.Second
+	)
+	if fs.pendingIndex == nil || len(fs.pendingIndex.ListPendingPaths()) == 0 {
+		return
+	}
+	start := time.Now()
+	for round := 0; ; round++ {
+		paths := fs.pendingIndex.ListPendingPaths()
+		if len(paths) == 0 {
+			safeLogPrintf("late pending drain: clean after %d rounds (%s)", round, time.Since(start).Round(time.Millisecond))
+			return
+		}
+		if time.Since(start) > deadline {
+			safeLogPrintf("late pending drain: %d entries still pending after %s; leaving them for next-mount recovery", len(paths), deadline)
+			return
+		}
+		safeLogPrintf("late pending drain: round %d, %d entries pending", round, len(paths))
+		var n int
+		if fs.commitQueue != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), deadline-time.Since(start))
+			n = fs.commitQueue.RecoverPendingSync(ctx)
+			cancel()
+		}
+		_ = n
+		time.Sleep(settle)
+	}
+}
+
 func (fs *Dat9FS) FlushAll() {
 	if fs.extentRT != nil {
 		if fs.extentRT.stop != nil {
@@ -17089,6 +17126,17 @@ func (fs *Dat9FS) FlushAll() {
 	// Drain CommitQueue (P1).
 	if fs.commitQueue != nil {
 		fs.commitQueue.DrainAll()
+	}
+
+	// Issue #964: lazy close staging decouples staging from the remote
+	// commit, and FUSE Release can arrive after the drains above (the
+	// kernel delivers Release lazily once the last fd closes, which may be
+	// during or after our sweep). Those late entries stay in the pending
+	// index and would only be rescued by the next mount's RecoverPending.
+	// Loop: give late Releases a moment to land, re-enqueue via recovery,
+	// and re-drain until the pending index is empty or the deadline hits.
+	if fs.pendingIndex != nil && fs.pendingIndex.ListPendingPaths() != nil {
+		fs.drainLatePendingEntries()
 	}
 
 	if fs.diskReadCache != nil {
