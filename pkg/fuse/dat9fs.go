@@ -15147,7 +15147,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 						ShadowSpill: true,
 					}
 					_ = fs.journal.Append(entry)
-					_ = fs.journal.Fsync()
+					_ = fs.journal.FsyncShared()
 				}
 				if fs.commitQueue != nil {
 					phase = "interactive-shadowspill-enqueue"
@@ -15186,7 +15186,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 						BaseRev: fh.BaseRev,
 					}
 					_ = fs.journal.Append(entry)
-					_ = fs.journal.Fsync()
+					_ = fs.journal.FsyncShared()
 				}
 				if fs.commitQueue != nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path) {
 					phase = "interactive-enqueue"

@@ -26,6 +26,25 @@ type PendingIndex struct {
 	dir       string                    // directory for .meta persistence
 	nextGen   atomic.Uint64
 	pathLocks map[string]*pendingPathLock
+	// journal, when set, is the durable publication channel for new pending
+	// entries: one group-committed WAL fsync replaces the per-entry
+	// atomicWrite (tmp fsync + dir fsync). Callers must have made the entry's
+	// content durable (shadow fsync / durable snapshot) BEFORE Put, which the
+	// staging paths already guarantee.
+	journal *Journal
+}
+
+// SetJournal wires the WAL used for durable pending-meta publication. It is
+// wired once during mount init, before the first Put.
+func (idx *PendingIndex) SetJournal(j *Journal) {
+	if idx == nil || j == nil {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.journal == nil {
+		idx.journal = j
+	}
 }
 
 // pendingPathLock is a refcounted per-path mutex, mirroring WriteBackCache's
@@ -210,14 +229,35 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 		liveAncestors:    append([]string(nil), liveAncestors...),
 	}
 
-	// Write to disk first for durability.
+	// Durable publication first, then the in-memory publish.
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
 		return 0, fmt.Errorf("pending index marshal: %w", err)
 	}
-	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
-	if err := atomicWrite(metaPath, metaBytes); err != nil {
-		return 0, fmt.Errorf("pending index put meta: %w", err)
+	idx.mu.RLock()
+	journal := idx.journal
+	idx.mu.RUnlock()
+	if journal != nil {
+		// WAL route: one group-committed fsync covers this record (and any
+		// records other closers appended concurrently). Ordering is safe —
+		// callers fsync the content (shadow / durable snapshot) before Put,
+		// and JournalPendingMeta replay rebuilds this entry after a crash.
+		if err := journal.Append(JournalEntry{
+			Op:        JournalPendingMeta,
+			Path:      remotePath,
+			Timestamp: time.Now().Unix(),
+			Meta:      metaBytes,
+		}); err != nil {
+			return 0, fmt.Errorf("pending index journal append: %w", err)
+		}
+		if err := journal.FsyncShared(); err != nil {
+			return 0, fmt.Errorf("pending index journal fsync: %w", err)
+		}
+	} else {
+		metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
+		if err := atomicWrite(metaPath, metaBytes); err != nil {
+			return 0, fmt.Errorf("pending index put meta: %w", err)
+		}
 	}
 
 	idx.mu.Lock()
@@ -225,6 +265,24 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 	idx.mu.Unlock()
 
 	return gen, nil
+}
+
+// publishRecoveredMeta installs a pending entry unmarshaled from a WAL frame
+// during crash recovery. It is in-memory only: the WAL record remains on disk
+// until compaction drops it behind the path's commit marker, so re-publishing
+// the .meta file would be redundant.
+func (idx *PendingIndex) publishRecoveredMeta(metaBytes []byte) error {
+	var meta WriteBackMeta
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		return fmt.Errorf("recovered meta unmarshal: %w", err)
+	}
+	if meta.Path == "" {
+		return fmt.Errorf("recovered meta has empty path")
+	}
+	idx.mu.Lock()
+	idx.items[meta.Path] = &meta
+	idx.mu.Unlock()
+	return nil
 }
 
 // GetMeta reads metadata from memory only. O(1), no disk I/O.

@@ -510,6 +510,9 @@ func Mount(opts *MountOptions) (err error) {
 				fmt.Fprintf(os.Stderr, "drive9: journal init failed: %v (continuing without)\n", err)
 			} else {
 				dat9fs.journal = journal
+				// Route durable pending-meta publication through the WAL
+				// (group-committed fsync) instead of per-entry atomicWrite.
+				pendingIdx.SetJournal(journal)
 				// Replay journal for crash recovery. Preserve the original kind
 				// and base revision so CommitQueue.RecoverPending can re-enqueue.
 				if err := replayJournalIntoPending(journal, pendingIdx); err != nil {
