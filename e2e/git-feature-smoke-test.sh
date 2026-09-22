@@ -87,6 +87,9 @@ record() {
 finish() {
   local rc=$?
   stop_mount "${MOUNT_POINTS[@]:-}" >/dev/null 2>&1 || true
+  if [ -n "${CLI_BIN:-}" ]; then
+    drive9_e2e_cleanup_cli_bin
+  fi
   if [ -n "${RUN_ROOT:-}" ] && [ -d "$RUN_ROOT" ]; then
     if [ "$rc" -eq 0 ] && [ "${FAIL:-0}" -eq 0 ]; then
       rm -rf "$RUN_ROOT" 2>/dev/null || true
@@ -138,6 +141,9 @@ download_official_cli() {
 }
 
 prepare_cli_binary() {
+  local override_rc
+  if drive9_e2e_use_cli_override; then return 0; else override_rc=$?; fi
+  [ "$override_rc" -eq 1 ] || return "$override_rc"
   CLI_BIN="$(mktemp)"
   case "$CLI_SOURCE" in
     build)
@@ -320,8 +326,8 @@ force_unmount() {
 }
 
 start_mount() {
-  local mount_point="$1" log_file="$2"
-  shift 2
+  local mount_role="$1" mount_point="$2" log_file="$3"
+  shift 3
   mkdir -p "$mount_point"
   mount_point="$(cd "$mount_point" && pwd -P)"
   {
@@ -330,7 +336,10 @@ start_mount() {
     printf ' %q' "$@"
     printf '\n'
   } >>"$log_file"
-  drive9_e2e_print_mount_argv "$CLI_BIN" mount "$@" | tee -a "$log_file"
+  if ! drive9_e2e_print_mount_evidence "$mount_role" "$CLI_BIN" mount "$@" | tee -a "$log_file"; then
+    echo "failed to record mount evidence for role=$mount_role" >&2
+    return 70
+  fi
   env "DRIVE9_SERVER=$BASE" "DRIVE9_API_KEY=$API_KEY" "$CLI_BIN" mount "$@" >>"$log_file" 2>&1 &
   local mount_pid=$!
   if wait_mount_state "$mount_point" mounted; then
@@ -345,8 +354,8 @@ start_mount() {
 }
 
 start_git_feature_mount() {
-  local mount_point="$1" log_file="$2" local_root="$3" remote_root="$4"
-  start_mount "$mount_point" "$log_file" \
+  local mount_role="$1" mount_point="$2" log_file="$3" local_root="$4" remote_root="$5"
+  start_mount "$mount_role" "$mount_point" "$log_file" \
     --mode=fuse \
     --profile="${FUSE_PROFILE:-coding-agent}" \
     --local-root "$local_root" \
@@ -863,7 +872,7 @@ PY
   local local_root_b="$RUN_ROOT/git-local-b"
   local log_file_b="$RUN_ROOT/git-mount-b.log"
   mkdir -p "$mount_point_b" "$local_root_b"
-  if start_git_feature_mount "$mount_point_b" "$log_file_b" "$local_root_b" "$git_root_rel"; then
+  if start_git_feature_mount fresh-local-root "$mount_point_b" "$log_file_b" "$local_root_b" "$git_root_rel"; then
     record "PASS" "Drive9 Git Workspace Behavior" "fresh local-root remount starts" "mounted"
   else
     record "FAIL" "Drive9 Git Workspace Behavior" "fresh local-root remount starts" "see $log_file_b"
@@ -916,7 +925,7 @@ PY
   printf 'local ignored\n' > "$restore_repo/ignored-build/cache.tmp"
   stop_mount "$mount_point_b" >/dev/null 2>&1 || true
   mkdir -p "$mount_point_b" "$RUN_ROOT/git-local-c"
-  if start_git_feature_mount "$mount_point_b" "$RUN_ROOT/git-mount-c.log" "$RUN_ROOT/git-local-c" "$git_root_rel"; then
+  if start_git_feature_mount ignored-remount "$mount_point_b" "$RUN_ROOT/git-mount-c.log" "$RUN_ROOT/git-local-c" "$git_root_rel"; then
     if [ ! -e "$mount_point_b/restore-workspace/ignored-build/cache.tmp" ]; then
       record "PASS" "Sandbox Restore" "ignored generated files are non-durable by design" "ignored-build/cache.tmp absent after fresh local root"
     else
@@ -1000,7 +1009,7 @@ main() {
   local git_mount="$RUN_ROOT/git-mount-a"
   local git_local="$RUN_ROOT/git-local-a"
   mkdir -p "$git_mount" "$git_local"
-  if start_git_feature_mount "$git_mount" "$RUN_ROOT/git-mount-a.log" "$git_local" "$git_root_rel"; then
+  if start_git_feature_mount initial "$git_mount" "$RUN_ROOT/git-mount-a.log" "$git_local" "$git_root_rel"; then
     record "PASS" "Drive9 Git Workspace Behavior" "coding-agent mount starts" "mounted"
   else
     record "FAIL" "Drive9 Git Workspace Behavior" "coding-agent mount starts" "mount failed"

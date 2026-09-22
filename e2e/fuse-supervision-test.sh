@@ -55,6 +55,8 @@ PASS=0
 FAIL=0
 TOTAL=0
 FG_PID=""
+MOUNT_ROLES_OBSERVED=()
+ENSURE_RESTORE_MOUNT_ARGS=()
 
 check_eq() {
   local desc="$1" got="$2" want="$3"
@@ -342,6 +344,7 @@ status_reports_healthy() {
 
 # start_supervised_mount uses the default supervised background path.
 start_supervised_mount() {
+  local mount_role="$1"
   {
     echo "=== supervised-background start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
   } >>"$MOUNT_LOG"
@@ -350,7 +353,15 @@ start_supervised_mount() {
     mount_args+=(--profile "$FUSE_PROFILE")
   fi
   mount_args+=(":$ROOT_REMOTE" "$MOUNT_POINT")
-  drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"
+  if ! drive9_e2e_print_mount_evidence "$mount_role" "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"; then
+    echo "failed to record mount evidence for role=$mount_role" >&2
+    return 70
+  fi
+  MOUNT_ROLES_OBSERVED+=("$mount_role")
+  # mount ensure replays the most recently persisted sanitized mount args.
+  # Keep the exact source array so the recovery attempt can emit a distinct
+  # role bound to those stored args immediately before ensure triggers it.
+  ENSURE_RESTORE_MOUNT_ARGS=("${mount_args[@]}")
   if ! drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1; then
     cat "$MOUNT_LOG" >&2 || true
     return 1
@@ -367,15 +378,46 @@ start_supervised_mount() {
 }
 
 start_foreground_supervised_mount() {
+  local mount_role="$1"
   local mount_args=(mount --supervise-foreground --mode=fuse
     "--durability=$DRIVE9_E2E_EFFECTIVE_DURABILITY")
   if [ -n "${FUSE_PROFILE:-}" ]; then
     mount_args+=(--profile "$FUSE_PROFILE")
   fi
   mount_args+=(":$ROOT_REMOTE" "$MOUNT_POINT")
-  drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"
+  if ! drive9_e2e_print_mount_evidence "$mount_role" "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"; then
+    echo "failed to record mount evidence for role=$mount_role" >&2
+    return 70
+  fi
+  MOUNT_ROLES_OBSERVED+=("$mount_role")
   drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1 &
   FG_PID=$!
+}
+
+record_ensure_recovery_mount() {
+  if [ "${#ENSURE_RESTORE_MOUNT_ARGS[@]}" -lt 2 ]; then
+    echo "missing stored mount argv evidence before mount ensure" >&2
+    return 70
+  fi
+  if ! drive9_e2e_print_mount_evidence ensure-recovery "$CLI_BIN" \
+    "${ENSURE_RESTORE_MOUNT_ARGS[@]}" | tee -a "$MOUNT_LOG"; then
+    echo "failed to record mount evidence for role=ensure-recovery" >&2
+    return 70
+  fi
+  MOUNT_ROLES_OBSERVED+=(ensure-recovery)
+}
+
+build_mount_role_plan() {
+  MOUNT_ROLE_PLAN=(background-initial background-remount)
+  if [ "$RUN_ENSURE_SMOKE" = "1" ]; then
+    MOUNT_ROLE_PLAN+=(ensure-recovery)
+  fi
+  if [ "$RUN_FOREGROUND_SMOKE" = "1" ]; then
+    MOUNT_ROLE_PLAN+=(foreground)
+  fi
+  if [ "$token_management_code" = "200" ]; then
+    MOUNT_ROLE_PLAN+=(scoped-root scoped-team denied-root legacy-root)
+  fi
 }
 
 wait_healed_after_worker_kill() {
@@ -496,6 +538,9 @@ http_code() { printf '%s' "$1" | awk -F'__HTTP__' 'NF>1{print $2}' | tr -d '\n';
 json_body() { printf '%s' "$1" | sed '/__HTTP__/d'; }
 
 prepare_cli_binary() {
+  local override_rc
+  if drive9_e2e_use_cli_override; then return 0; else override_rc=$?; fi
+  [ "$override_rc" -eq 1 ] || return "$override_rc"
   CLI_BIN="$(mktemp)"
   make build-cli CLI_BIN="$CLI_BIN"
 }
@@ -576,12 +621,17 @@ with_timeout_scoped_drive9() {
 }
 
 run_denied_scoped_mount() {
+	local mount_role="$1"
 	local mount_args=(mount --mode=fuse "--durability=$DRIVE9_E2E_EFFECTIVE_DURABILITY")
 	if [ -n "${FUSE_PROFILE:-}" ]; then
 		mount_args+=(--profile "$FUSE_PROFILE")
 	fi
 	mount_args+=(":/" "$MOUNT_POINT")
-	drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"
+	if ! drive9_e2e_print_mount_evidence "$mount_role" "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"; then
+		echo "failed to record mount evidence for role=$mount_role" >&2
+		return 70
+	fi
+	MOUNT_ROLES_OBSERVED+=("$mount_role")
 	with_timeout_scoped_drive9 10 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1
 }
 
@@ -601,15 +651,20 @@ select_scoped_context() {
 }
 
 start_scoped_mount() {
-	local context_name="$1"
-	local remote_root="$2"
+	local mount_role="$1"
+	local context_name="$2"
+	local remote_root="$3"
 	select_scoped_context "$context_name" || return 1
 	local mount_args=(mount --mode=fuse "--durability=$DRIVE9_E2E_EFFECTIVE_DURABILITY")
 	if [ -n "${FUSE_PROFILE:-}" ]; then
 		mount_args+=(--profile "$FUSE_PROFILE")
 	fi
 	mount_args+=(":$remote_root" "$MOUNT_POINT")
-	drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"
+	if ! drive9_e2e_print_mount_evidence "$mount_role" "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"; then
+		echo "failed to record mount evidence for role=$mount_role" >&2
+		return 70
+	fi
+	MOUNT_ROLES_OBSERVED+=("$mount_role")
 	if ! scoped_drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1; then
 		cat "$MOUNT_LOG" >&2 || true
 		return 1
@@ -681,7 +736,7 @@ cleanup() {
     capture_supervisor_log
   fi
   if [ -n "${CLI_BIN:-}" ]; then
-    rm -f "$CLI_BIN"
+    drive9_e2e_cleanup_cli_bin
   fi
   if [ "$rc" -eq 0 ] && [ "$FAIL" -eq 0 ] && [ "$SUPERVISION_KEEP_ARTIFACTS" != "1" ]; then
     rm -rf "$RUN_ROOT"
@@ -701,7 +756,7 @@ check_cmd "create remote supervision root" drive9 fs mkdir "$ROOT_REMOTE"
 # A. Default supervised background + worker kill-9 heal + umount contract
 # ---------------------------------------------------------------------------
 echo "[5] supervised background mount (default path)"
-if start_supervised_mount; then
+if start_supervised_mount background-initial; then
   check_eq "initial supervised mount ready" "true" "true"
 else
   check_eq "initial supervised mount ready" "false" "true"
@@ -784,7 +839,7 @@ else
 fi
 
 echo "[8] remount after umount (stop token must not stick)"
-if start_supervised_mount; then
+if start_supervised_mount background-remount; then
   check_eq "remount after umount ready" "true" "true"
   check_cmd "IO works on remount" probe_mount_io "after-remount"
   check_cmd "fresh mount reads seeded cache probe bytes" \
@@ -827,6 +882,8 @@ if [ "$RUN_ENSURE_SMOKE" = "1" ]; then
     echo "INFO mount already unmounted after tree kill; ensure must recreate"
   fi
 
+  record_ensure_recovery_mount || exit $?
+
   if drive9 mount ensure "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1; then
     check_eq "mount ensure command exits 0" "true" "true"
   else
@@ -865,7 +922,7 @@ if [ "$RUN_FOREGROUND_SMOKE" = "1" ]; then
     echo "=== supervise-foreground start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
   } >>"$MOUNT_LOG"
 
-  start_foreground_supervised_mount
+  start_foreground_supervised_mount foreground
 
   if wait_mount_state mounted && wait_healthy_io "fg-ready"; then
     check_eq "supervise-foreground mount ready" "true" "true"
@@ -963,7 +1020,7 @@ else
 	check_eq "issue root pseudoroot context" "failed" "issued"
 	exit 1
 fi
-if start_scoped_mount "$root_context" "/"; then
+if start_scoped_mount scoped-root "$root_context" "/"; then
 	check_eq "projected root is mounted" "mounted" "mounted"
 else
 	check_eq "projected root is mounted" "failed" "mounted"
@@ -1008,7 +1065,7 @@ else
 	check_eq "issue non-root pseudoroot context" "failed" "issued"
 	exit 1
 fi
-if start_scoped_mount "$team_context" "$pseudo_base/team"; then
+if start_scoped_mount scoped-team "$team_context" "$pseudo_base/team"; then
 	check_eq "projected non-root is mounted" "mounted" "mounted"
 else
 	check_eq "projected non-root is mounted" "failed" "mounted"
@@ -1042,7 +1099,7 @@ if ! select_scoped_context "$denied_context"; then
 fi
 failure_start="$(date +%s)"
 set +e
-run_denied_scoped_mount
+run_denied_scoped_mount denied-root
 denied_mount_rc=$?
 set -e
 failure_elapsed=$(( $(date +%s) - failure_start ))
@@ -1073,7 +1130,7 @@ else
 	check_eq "issue legacy root-list context" "failed" "issued"
 	exit 1
 fi
-if start_scoped_mount "$legacy_context" "/"; then
+if start_scoped_mount legacy-root "$legacy_context" "/"; then
 	check_eq "legacy root list is mounted" "mounted" "mounted"
 else
 	check_eq "legacy root list is mounted" "failed" "mounted"
@@ -1107,6 +1164,15 @@ for remote_root in ${pseudoroot_remote_roots[@]+"${pseudoroot_remote_roots[@]}"}
 	drive9 fs rm -r "$remote_root" >/dev/null 2>&1 || true
 done
 pseudoroot_remote_roots=()
+
+build_mount_role_plan
+observed_roles="$(printf '%s\n' "${MOUNT_ROLES_OBSERVED[@]}")"
+planned_roles="$(printf '%s\n' "${MOUNT_ROLE_PLAN[@]}")"
+if ! drive9_e2e_assert_mount_role_plan "$observed_roles" "$planned_roles"; then
+	check_eq "mount role evidence exactly matches branch plan" "$observed_roles" "$planned_roles"
+else
+	drive9_e2e_print_mount_role_plan "${MOUNT_ROLE_PLAN[@]}"
+fi
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"
 exit "$FAIL"

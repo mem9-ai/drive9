@@ -122,6 +122,7 @@ wait_mount_state() {
 }
 
 start_mount() {
+  local mount_role="$1"
   {
     echo "=== drive9 crash-recovery mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
     echo "cache_dir=$CACHE_DIR"
@@ -135,7 +136,10 @@ start_mount() {
     mount_args+=(--profile "$FUSE_PROFILE")
   fi
   mount_args+=("$MOUNT_POINT")
-  drive9_e2e_print_mount_argv "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"
+  if ! drive9_e2e_print_mount_evidence "$mount_role" "$CLI_BIN" "${mount_args[@]}" | tee -a "$MOUNT_LOG"; then
+    echo "failed to record mount evidence for role=$mount_role" >&2
+    return 70
+  fi
   drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
   if wait_mount_state mounted; then
@@ -244,6 +248,9 @@ http_code() { printf '%s' "$1" | awk -F'__HTTP__' 'NF>1{print $2}' | tr -d '\n';
 json_body() { printf '%s' "$1" | sed '/__HTTP__/d'; }
 
 prepare_cli_binary() {
+  local override_rc
+  if drive9_e2e_use_cli_override; then return 0; else override_rc=$?; fi
+  [ "$override_rc" -eq 1 ] || return "$override_rc"
   CLI_BIN="$(mktemp)"
   make build-cli CLI_BIN="$CLI_BIN"
 }
@@ -392,6 +399,7 @@ wal_path() {
   find "$CACHE_DIR" -name journal.wal 2>/dev/null | head -1
 }
 
+crash_recovery_main() {
 echo "=== drive9 FUSE crash-recovery test ==="
 echo "BASE=$BASE"
 echo "CRASH_SMALL_FILES=$CRASH_SMALL_FILES CRASH_SMALL_KB=$CRASH_SMALL_KB CRASH_LARGE_MB=$CRASH_LARGE_MB"
@@ -480,7 +488,7 @@ cleanup() {
   stop_mount
   force_unmount_stale 2>/dev/null || true
   if [ -n "${CLI_BIN:-}" ]; then
-    rm -f "$CLI_BIN"
+    drive9_e2e_cleanup_cli_bin
   fi
   if [ "$rc" -eq 0 ] && [ "$FAIL" -eq 0 ] && [ "$CRASH_KEEP_ARTIFACTS" != "1" ]; then
     rm -rf "$RUN_ROOT"
@@ -498,7 +506,7 @@ drive9 fs mkdir "$WORK_REMOTE" >/dev/null
 check_eq "remote crash-recovery root" "$ROOT_REMOTE" "$ROOT_REMOTE"
 
 echo "[5] mount (interactive durability, dedicated cache dir)"
-if start_mount; then
+if start_mount initial; then
   check_eq "initial mount is mounted" "true" "true"
 else
   check_eq "initial mount is mounted" "false" "true"
@@ -518,7 +526,7 @@ fi
 check_cmd "crash left durable local state (journal.wal exists)" test -n "$WAL_FILE"
 
 echo "[8] remount with the same cache dir (crash recovery)"
-if start_mount; then
+if start_mount recovery; then
   check_eq "recovery mount is mounted" "true" "true"
 else
   check_eq "recovery mount is mounted" "false" "true"
@@ -534,7 +542,7 @@ check_cmd "mount view matches expected manifest" verify_mount_manifest
 
 echo "[11] clean unmount, then remount to verify WAL compaction"
 check_cmd "clean unmount after recovery" unmount_mount
-if start_mount; then
+if start_mount compaction; then
   check_eq "compaction mount is mounted" "true" "true"
   WAL_FILE="$(wal_path)"
   WAL_SIZE=0
@@ -555,3 +563,8 @@ drive9 fs rm -r "$ROOT_REMOTE" >/dev/null 2>&1 || true
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"
 exit "$FAIL"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  crash_recovery_main "$@"
+fi
