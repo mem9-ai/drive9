@@ -242,18 +242,37 @@ func (u *WriteBackUploader) Submit(localPath string) {
 	}
 	u.submitMu.Unlock()
 
-	// Channel full — block with timeout, then fallback to sync upload.
+	// Channel full — block with timeout, then re-try the send under the
+	// lock (DrainAll may have closed the channel while we waited), then
+	// fall back to sync upload.
 	timer := time.NewTimer(submitTimeout)
 	defer timer.Stop()
 	select {
-	case u.uploadCh <- localPath:
 	case <-timer.C:
 		safeLogPrintf("writeback uploader: channel full after %v, uploading synchronously for %s", submitTimeout, localPath)
 		if u.perf != nil {
 			u.perf.uploaderSyncFallback.add(1)
 		}
 		u.uploadOne(localPath)
+		return
+	default:
 	}
+	u.submitMu.Lock()
+	if u.stopped.Load() {
+		u.submitMu.Unlock()
+		safeLogPrintf("writeback uploader: stopped while blocked, uploading synchronously for %s", localPath)
+		if u.perf != nil {
+			u.perf.uploaderSyncFallback.add(1)
+		}
+		u.uploadOne(localPath)
+		return
+	}
+	select {
+	case u.uploadCh <- localPath:
+	default:
+	}
+	u.submitMu.Unlock()
+	safeLogPrintf("writeback uploader: enqueue after block for %s", localPath)
 }
 
 func (u *WriteBackUploader) directPutThreshold() int64 {
