@@ -602,8 +602,6 @@ github.com/morikuni/aec v1.0.0 h1:nP9CBfwrvYnBRgY6qfDQkygYDmYwOilePFkwzv4dU8A=
 github.com/morikuni/aec v1.0.0/go.mod h1:BbKIizmSmc5MMPqRYbxO4ZU0S0+P200+tUnFx7PXmsc=
 github.com/mornyx/go-fuse/v2 v2.9.1-0.20260908115844-7ed5121d2bb7 h1:aJzaZEIDYmeIWkftkfadNaoRbFcBcYgNCcBFJQQs4wI=
 github.com/mornyx/go-fuse/v2 v2.9.1-0.20260908115844-7ed5121d2bb7/go.mod h1:yE6D2PqWwm3CbYRxFXV9xUd8Md5d6NG0WBs5spCswmI=
-github.com/mornyx/juicefs v1.4.2-0.20260914103651-ec5ea9b23d11 h1:iuzwHK9YHEoWJ9yak+Doh7xSxKO2mEqE2ikJUEwdR20=
-github.com/mornyx/juicefs v1.4.2-0.20260914103651-ec5ea9b23d11/go.mod h1:3s7IeXpxx8g7+mFGIxotSP/zt493jIjYIIMa/vZmu8c=
 github.com/mozillazg/go-httpheader v0.2.1 h1:geV7TrjbL8KXSyvghnFm+NyTux/hxwueTSrwhe88TQQ=
 github.com/mozillazg/go-httpheader v0.2.1/go.mod h1:jJ8xECTlalr6ValeXYdOF8fFUISeBAdw6E61aqQma60=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
@@ -684,6 +682,8 @@ github.com/prometheus/procfs v0.15.1 h1:YagwOFzUgYfKKHX6Dr+sHT7km/hxC76UB0leargg
 github.com/prometheus/procfs v0.15.1/go.mod h1:fB45yRUv8NstnjriLhBQLuOUt+WW4BsoGhij/e3PBqk=
 github.com/putdotio/go-putio/putio v0.0.0-20200123120452-16d982cac2b8 h1:Y258uzXU/potCYnQd1r6wlAnoMB68BiCkCcCnKx1SH8=
 github.com/putdotio/go-putio/putio v0.0.0-20200123120452-16d982cac2b8/go.mod h1:bSJjRokAHHOhA+XFxplld8w2R/dXLH7Z3BZ532vhFwU=
+github.com/qiffang/juicefs v1.4.0-dev.0.20260922170904-d30a153405c5 h1:VFKg+sx9/qpYzx2CYb8LRwNteviB3KGkZT7wls75/vg=
+github.com/qiffang/juicefs v1.4.0-dev.0.20260922170904-d30a153405c5/go.mod h1:3s7IeXpxx8g7+mFGIxotSP/zt493jIjYIIMa/vZmu8c=
 github.com/qingstor/qingstor-sdk-go/v4 v4.4.1 h1:DeoKecl+Ls8GhfXVWB0mQ0Qiy1HtmzgFCkeAi9v7ydw=
 github.com/qingstor/qingstor-sdk-go/v4 v4.4.1/go.mod h1:mDVFtA7+bXQ5xoELTWkoFy1Ad13wtp8jtlnl/RU+zzM=
 github.com/qiniu/go-sdk/v7 v7.26.8 h1:cucYJLDAQE8KmoPum27ZtfogZpTcHK1lSXUy0FcRKwA=

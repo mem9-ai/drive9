@@ -16090,7 +16090,9 @@ func (fs *Dat9FS) releasePromotionBlockedHandle(input *gofuse.ReleaseIn, fh *Fil
 		return
 	}
 	if fh.isExtent() {
-		fs.extentRelease(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh)
+		if v := fs.extentVFS(); v != nil {
+			v.Abort(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh.extentIno, fh.extentFh)
+		}
 		fs.deleteFileHandle(input.Fh, fh)
 		return
 	}
