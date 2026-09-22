@@ -297,9 +297,10 @@ func TestLocalTimeOverrideLifecycle(t *testing.T) {
 		t.Fatal("override not armed after SetLocalMtime")
 	}
 
-	// Derived updates lose to the override.
+	// Derived updates lose to the override (mtime has derived writers: commit
+	// settles and stat refreshes; atime has none in the mainline path, so the
+	// armed value simply persists).
 	inodes.UpdateMtimeDerived(ino, time.Unix(9999999999, 0))
-	inodes.UpdateAtimeDerived(ino, time.Unix(9999999999, 0))
 	entry, ok := inodes.GetEntry(ino)
 	if !ok || !entry.Mtime.Equal(requested) || !entry.Atime.Equal(requested.Add(time.Second)) {
 		t.Fatalf("derived update clobbered the override: mtime=%v atime=%v", entry.Mtime, entry.Atime)
@@ -363,7 +364,7 @@ func TestLocalTimeOverrideLifecycle(t *testing.T) {
 	if !entry.Mtime.Equal(replacementMtime) {
 		t.Fatalf("replacement mtime = %v, want listing mtime %v", entry.Mtime, replacementMtime)
 	}
-	inodes.UpdateAtimeDerived(ino2, time.Unix(1, 0))
+	inodes.UpdateAtime(ino2, time.Unix(1, 0))
 	entry, _ = inodes.GetEntry(ino2)
 	if !entry.Atime.Equal(time.Unix(1, 0)) {
 		t.Fatal("atime override survived identity replacement")
@@ -401,6 +402,35 @@ func TestLocalMutationClearsTimeOverride(t *testing.T) {
 	fs.markDirtySize(ino, 9)
 	if fs.inodes.HasMtimeOverride(ino) {
 		t.Fatal("write mutation did not clear the time override")
+	}
+
+	// Restore registrations (writable re-open loading staged writeback/shadow
+	// content, write-sync failure restore) re-register dirty state without a
+	// data mutation and must keep the override armed.
+	fs.inodes.SetLocalMtime(ino, requested)
+	fs.markDirtySizeRestore(ino, 12)
+	if !fs.inodes.HasMtimeOverride(ino) {
+		t.Fatal("restore registration cleared the time override")
+	}
+	if mtime, _ := fs.inodes.MtimeOverride(ino); !mtime.Equal(requested) {
+		t.Fatalf("override mtime after restore registration = %v, want %v", mtime, requested)
+	}
+
+	// The central dir-cache settle stamp keeps an armed override visible.
+	fs.cacheFileForPath("/mut.txt", 12, time.Now(), 4)
+	if res := fs.dirCache.Lookup("/", "mut.txt"); res.kind == namespaceLookupPositive {
+		if !res.item.Mtime.Equal(requested) {
+			t.Fatalf("dir cache settle stamp = %v, want the override time %v", res.item.Mtime, requested)
+		}
+	} else {
+		t.Fatal("dir cache entry missing after settle stamp")
+	}
+
+	// A genuine write after the re-arm clears the override again, and the
+	// settle can advance the mtime.
+	fs.markDirtySize(ino, 12)
+	if fs.inodes.HasMtimeOverride(ino) {
+		t.Fatal("write mutation after restore did not clear the time override")
 	}
 
 	commitTime := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)

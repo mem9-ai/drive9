@@ -36,9 +36,11 @@ type InodeEntry struct {
 	// SetAttr (utimensat/futimens), including while the file's content commit
 	// is still pending. While armed, derived refreshes (async commit
 	// completion, remote stat, directory re-listings) must not clobber them;
-	// any later local mutation (write, truncate, metadata change) clears
-	// them. The pointed-to values are immutable once published; holders only
-	// replace the pointer, never mutate through it.
+	// a later local data mutation (write, truncate — see markDirtySize) or a
+	// remote identity replacement clears them. Mode-only changes (chmod) do
+	// not: POSIX does not advance mtime for them. The pointed-to values are
+	// immutable once published; holders only replace the pointer, never
+	// mutate through it.
 	MtimeOverride *time.Time
 	AtimeOverride *time.Time
 }
@@ -617,19 +619,6 @@ func (m *InodeToPath) UpdateMtimeDerived(ino uint64, mtime time.Time) {
 	entry.Mtime = mtime
 }
 
-// UpdateAtimeDerived updates the atime from a derived source. An armed local
-// override wins.
-func (m *InodeToPath) UpdateAtimeDerived(ino uint64, atime time.Time) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	entry, ok := m.byInode[ino]
-	if !ok || entry.AtimeOverride != nil {
-		return
-	}
-	entry.Atime = atime
-}
-
 // ClearLocalTimes drops any armed local time overrides without changing the
 // current times. It marks the canonical user-mutation point (a local data
 // write/truncate, see markDirtySize): later commit settles and stat
@@ -640,9 +629,17 @@ func (m *InodeToPath) ClearLocalTimes(ino uint64) {
 	defer m.mu.Unlock()
 
 	if entry, ok := m.byInode[ino]; ok {
-		entry.MtimeOverride = nil
-		entry.AtimeOverride = nil
+		clearTimeOverridesLocked(entry)
 	}
+}
+
+// clearTimeOverridesLocked drops both local time overrides on an entry the
+// caller holds locked. Used at every point where the inode's object or
+// mutation history invalidates explicitly SetAttr'd times: local data
+// mutations, kind changes, and remote identity replacements.
+func clearTimeOverridesLocked(entry *InodeEntry) {
+	entry.MtimeOverride = nil
+	entry.AtimeOverride = nil
 }
 
 // UpdateCtime updates the ctime of the entry identified by the given inode.
@@ -841,8 +838,7 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 		entry.ExtentIno = 0
 		// The new object must not inherit the previous object's explicitly
 		// SetAttr'd times either.
-		entry.MtimeOverride = nil
-		entry.AtimeOverride = nil
+		clearTimeOverridesLocked(entry)
 	}
 	entry.IsDir = isDir
 	// Listing/create-cache often still has size=0 after JuiceFS writes.
@@ -855,8 +851,7 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 	// below: an identity replacement (different drive9 file at this path)
 	// adopts the incoming listing metadata instead.
 	if identityReplacedLocked(entry, inodeResourceKey(resourceID, isDir)) {
-		entry.MtimeOverride = nil
-		entry.AtimeOverride = nil
+		clearTimeOverridesLocked(entry)
 	}
 	// A listing reseed is a derived refresh: keep an explicitly SetAttr'd
 	// time (still pending or diverged from the server view) instead of the
@@ -899,8 +894,7 @@ func (m *InodeToPath) setIdentityLocked(entry *InodeEntry, resourceID string) {
 		// incoming listing/stat metadata is adopted instead. (updateEntryLocked
 		// clears these before applying a listing mtime; this covers identity
 		// updates that arrive through SetIdentity/stat refreshes.)
-		entry.MtimeOverride = nil
-		entry.AtimeOverride = nil
+		clearTimeOverridesLocked(entry)
 	}
 	entry.ResourceID = key
 	m.byID[key] = entry.Ino

@@ -2100,6 +2100,20 @@ func (fs *Dat9FS) dirtyHandleSize(ino uint64) (int64, bool) {
 }
 
 func (fs *Dat9FS) markDirtySize(ino uint64, size int64) uint64 {
+	return fs.markDirtySizeOptions(ino, size, true)
+}
+
+// markDirtySizeRestore re-registers dirty state without a user data
+// mutation: writable re-opens loading staged writeback/shadow content, and
+// write-sync failure restores. Unlike markDirtySize it keeps armed local
+// time overrides — reconstructing an open handle is not a write, so a
+// utimensat acknowledged while the previous close is still uploading must
+// survive the re-open.
+func (fs *Dat9FS) markDirtySizeRestore(ino uint64, size int64) uint64 {
+	return fs.markDirtySizeOptions(ino, size, false)
+}
+
+func (fs *Dat9FS) markDirtySizeOptions(ino uint64, size int64, clearLocalTimes bool) uint64 {
 	fs.dirtyMu.Lock()
 	defer fs.dirtyMu.Unlock()
 
@@ -2107,7 +2121,9 @@ func (fs *Dat9FS) markDirtySize(ino uint64, size int64) uint64 {
 	// user-mutation point: drop any armed local time override so the later
 	// commit settle and stat refreshes can advance the mtime again
 	// (utimensat-then-write must not leave the mtime frozen).
-	fs.inodes.ClearLocalTimes(ino)
+	if clearLocalTimes {
+		fs.inodes.ClearLocalTimes(ino)
+	}
 
 	fs.dirtySeq++
 	seq := fs.dirtySeq
@@ -4672,7 +4688,7 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 		fh.BaseRev = rev
 	}
 	if zeroOverwrite {
-		fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
+		fh.DirtySeq = fs.markDirtySizeRestore(fh.Ino, 0)
 		fh.StagedSnapshotID = meta.SnapshotID
 		fh.StagedParentSnapshotID = meta.ParentSnapshotID
 		fh.stagedAncestors = processLocalMetaAncestors(meta)
@@ -4722,7 +4738,7 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 		fs.setPendingModeLocked(fh, mode, 0)
 		fs.inodes.UpdateMode(fh.Ino, mode)
 	}
-	fh.DirtySeq = fs.markDirtySize(fh.Ino, int64(len(data)))
+	fh.DirtySeq = fs.markDirtySizeRestore(fh.Ino, int64(len(data)))
 	fh.WriteBackSeq = fh.DirtySeq
 	fh.StagedSnapshotID = meta.SnapshotID
 	fh.StagedParentSnapshotID = meta.ParentSnapshotID
@@ -6735,6 +6751,16 @@ func (fs *Dat9FS) cacheFileForPath(p string, size int64, mtime time.Time, revisi
 	}
 	if mtime.IsZero() {
 		mtime = time.Now()
+	}
+	// Commit-settle sites stamp the dir cache with the commit time. An
+	// armed local time override (explicit utimensat acknowledged while the
+	// commit was still in flight) wins, so the cache entry cannot resurrect
+	// the commit time on the next cached readdir/stat. Resolving this here
+	// keeps the invariant enforced at the write side for every settle site.
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		if t, armed := fs.inodes.MtimeOverride(ino); armed {
+			mtime = t
+		}
 	}
 	parentPath, name := cacheParentName(p)
 	fs.dirCache.Upsert(parentPath, CachedFileInfo{
@@ -14032,7 +14058,7 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 				fh.DirtySeq = restoreDirtySeq
 				fs.restoreDirtySize(fh.Ino, restoreDirtySeq, fh.Dirty.Size())
 			} else {
-				fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+				fh.DirtySeq = fs.markDirtySizeRestore(fh.Ino, fh.Dirty.Size())
 			}
 		}
 		fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
@@ -17307,11 +17333,8 @@ func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int6
 	} else {
 		fs.forgetCommittedRevision(meta.Path)
 	}
-	settleMtime := time.Now()
-	if ino, ok := fs.inodes.GetInode(meta.Path); ok {
-		settleMtime = fs.commitSettleMtime(ino, settleMtime)
-	}
-	fs.cacheFileForPath(meta.Path, meta.Size, settleMtime, committedRev)
+	// cacheFileForPath resolves an armed local time override centrally.
+	fs.cacheFileForPath(meta.Path, meta.Size, time.Now(), committedRev)
 	// Clean up pendingIndex and shadowStore so that Unlink does not see a
 	// stale PendingNew entry and skip the remote DELETE (thinking the file
 	// was never uploaded). This mirrors commitQueue's onCommitSuccessWithOptions
