@@ -3,8 +3,16 @@ package fuse
 import "time"
 
 // testHookNotifyInodeSync lets cache-boundary tests observe the production
-// synchronous notify path without mounting a real FUSE server.
+// sync-commit notify boundary without mounting a real FUSE server. It is
+// observe-only: the dispatch still runs when a server is present.
 var testHookNotifyInodeSync func(ino uint64)
+
+// testHookNotifyInodeDataKernel lets tests observe the whole-file data
+// invalidation dispatched off the FUSE reply path. It runs inside the
+// notifyWg goroutine; the notify argument performs the real kernel call, so
+// a test can hold the "kernel-side" wait and then still let the genuine
+// InodeNotify run (issue #936).
+var testHookNotifyInodeDataKernel func(ino uint64, notify func())
 
 // testHookBeforeKernelCacheBypassSweep lets race-focused tests pause a real
 // cleanup timer callback before it inspects current markers.
@@ -187,5 +195,5 @@ func (fs *Dat9FS) finishSyncCommitKernelCacheBoundary(ino uint64, localPath stri
 	// short-window bypass armed until its TTL expires; this remains narrower
 	// than making every clean reader on sync-durability mounts DIRECT_IO.
 	fs.armKernelCacheBypass(ino, localPath, revision, size, "sync-commit")
-	fs.notifyInodeSync(ino)
+	fs.notifyInodeAtSyncCommit(ino)
 }

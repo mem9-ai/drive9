@@ -8733,6 +8733,123 @@ func TestSyncCommitNotifySuccessLeavesPerInodeBypassUntilTTL(t *testing.T) {
 	}
 }
 
+// newWriteSyncNotifyBoundaryFS returns a write-sync filesystem whose server
+// is a zero-value go-fuse Server: real InodeNotify code paths run (a mounted
+// kernel would answer the notifications; without one they report ENOSYS),
+// and no I/O ever touches a device. It lets tests exercise the production
+// asynchronous notification boundary without mounting.
+func newWriteSyncNotifyBoundaryFS(t *testing.T) (*Dat9FS, uint64) {
+	t.Helper()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyWriteSync
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	cleanupKernelCacheBypassAfterTest(t, fs)
+	fs.server = &gofuse.Server{}
+	ino := fs.inodes.Lookup("/write-sync-notify-boundary.txt", false, 21, time.Now())
+	return fs, ino
+}
+
+// blockSyncCommitDataInvalidation arms the data-invalidation hook so the
+// whole-file kernel invalidation starts, signals inflight, then holds the
+// "kernel-side" wait (a real kernel blocks the same call on folios held by
+// the in-flight buffered write — issue #936) until the returned release
+// function runs. The genuine InodeNotify still executes after the hold.
+func blockSyncCommitDataInvalidation(t *testing.T, fs *Dat9FS, ino uint64) (inflight, release chan struct{}) {
+	t.Helper()
+	inflight = make(chan struct{})
+	release = make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() {
+		testHookNotifyInodeDataKernel = nil
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	testHookNotifyInodeDataKernel = func(gotIno uint64, notify func()) {
+		if gotIno != ino {
+			t.Errorf("data invalidation ino = %d, want %d", gotIno, ino)
+		}
+		once.Do(func() { close(inflight) })
+		<-release
+		notify()
+	}
+	return inflight, release
+}
+
+// TestSyncCommitNotifyBoundaryReturnsWhileDataInvalidationInFlight pins the
+// #936 fix: the sync-commit cache boundary must return to the FUSE reply
+// path without waiting for the kernel-side data invalidation. The previous
+// inline implementation blocks forever here — its own WRITE reply is what
+// releases the folio the invalidation waits on — so this test fails on the
+// old synchronous code.
+func TestSyncCommitNotifyBoundaryReturnsWhileDataInvalidationInFlight(t *testing.T) {
+	fs, ino := newWriteSyncNotifyBoundaryFS(t)
+	inflight, release := blockSyncCommitDataInvalidation(t, fs, ino)
+
+	returned := make(chan struct{})
+	go func() {
+		fs.finishSyncCommitKernelCacheBoundary(ino, "/write-sync-notify-boundary.txt", 9, 21)
+		close(returned)
+	}()
+
+	select {
+	case <-inflight:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sync commit boundary never dispatched the data invalidation")
+	}
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sync commit boundary blocked on the in-flight data invalidation (reply-path deadlock regression, issue #936)")
+	}
+	close(release)
+	fs.notifyWg.Wait()
+}
+
+// TestSyncCommitNotifyInFlightKeepsCloseToOpenDirectIO verifies close-to-open
+// visibility while the asynchronous data invalidation is still held: the
+// per-inode kernel cache bypass marker is armed synchronously before the
+// notify is dispatched, so an immediate re-open must be FOPEN_DIRECT_IO even
+// though the invalidation has not completed.
+func TestSyncCommitNotifyInFlightKeepsCloseToOpenDirectIO(t *testing.T) {
+	fs, ino := newWriteSyncNotifyBoundaryFS(t)
+	inflight, release := blockSyncCommitDataInvalidation(t, fs, ino)
+
+	returned := make(chan struct{})
+	go func() {
+		fs.finishSyncCommitKernelCacheBoundary(ino, "/write-sync-notify-boundary.txt", 9, 21)
+		close(returned)
+	}()
+	select {
+	case <-inflight:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sync commit boundary never dispatched the data invalidation")
+	}
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sync commit boundary blocked on the in-flight data invalidation (reply-path deadlock regression, issue #936)")
+	}
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("open flags = %d, want FOPEN_DIRECT_IO while the sync-commit data invalidation is still in flight", out.OpenFlags)
+	}
+
+	close(release)
+	fs.notifyWg.Wait()
+}
+
 func TestKernelCacheBypassMarkerExpiresAndClears(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

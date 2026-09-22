@@ -7566,12 +7566,30 @@ func (fs *Dat9FS) notifyEntry(parentIno uint64, name string) {
 // invalidation form, while off=0/len=0 invalidates cached data. A data-only
 // invalidation can leave a just-truncated 0-byte i_size cached across a later
 // close-sync remote commit, making immediate close-to-open reads observe EOF.
+//
+// The two forms differ in how the kernel answers the daemon's write(2): the
+// attribute form only bumps the attr version on Linux and never waits there,
+// so Open(O_TRUNC) sends it inline to keep its pre-reply mtime guarantee;
+// the data form runs invalidate_inode_pages2_range and waits for every folio
+// it drops, and a folio under an in-flight buffered write stays locked until
+// that FUSE WRITE is answered — an answer the daemon only sends after the
+// handler returns. The data form therefore always runs on a notifyWg-tracked
+// goroutine that never blocks a FUSE reply (#936).
 func (fs *Dat9FS) invalidateInodeKernelCaches(ino uint64) {
 	if fs.server == nil {
 		return
 	}
 	_ = fs.server.InodeNotify(ino, -1, 0)
-	_ = fs.server.InodeNotify(ino, 0, 0)
+	fs.notifyWg.Add(1)
+	go func() {
+		defer fs.notifyWg.Done()
+		notify := func() { _ = fs.server.InodeNotify(ino, 0, 0) }
+		if testHookNotifyInodeDataKernel != nil {
+			testHookNotifyInodeDataKernel(ino, notify)
+			return
+		}
+		notify()
+	}()
 }
 
 // notifyInode tells the kernel to invalidate cached attributes and data
@@ -7582,6 +7600,13 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 	if fs.perf != nil {
 		fs.perf.notifyInode.add(1)
 	}
+	fs.notifyInodeAsyncInvalidation(ino)
+}
+
+// notifyInodeAsyncInvalidation dispatches the kernel-cache invalidation off
+// the FUSE reply path on a notifyWg-tracked goroutine. Both notify entry
+// points share it so the off-reply-path property cannot drift (#936).
+func (fs *Dat9FS) notifyInodeAsyncInvalidation(ino uint64) {
 	if fs.server == nil {
 		return
 	}
@@ -7592,22 +7617,30 @@ func (fs *Dat9FS) notifyInode(ino uint64) {
 	}()
 }
 
-// notifyInodeSync invalidates cached inode attrs/data before returning to the
-// kernel. Most local mutations must use notifyInode's asynchronous path to
-// avoid go-fuse worker-pool re-entry deadlocks, but close-sync/write-sync
-// remote commits are close-to-open barriers: the next opener may otherwise
-// observe stale size/page-cache state even though the remote commit has
-// completed.
-func (fs *Dat9FS) notifyInodeSync(ino uint64) {
+// notifyInodeAtSyncCommit invalidates cached inode attrs/data at a
+// synchronous remote commit boundary (close-sync/write-sync). These commits
+// are close-to-open barriers: the next opener may otherwise observe stale
+// size/page-cache state even though the remote commit has completed. The
+// invalidation itself is dispatched off the FUSE reply path: the kernel
+// processes FUSE_NOTIFY_INVAL_INODE inside the daemon's write(2) and waits
+// there for in-flight I/O — Linux's data form waits on folios held by the
+// pending buffered write (#936), and macFUSE can block even the attribute
+// form — so an inline notify from a WRITE/Flush handler can end up waiting
+// for its own reply, which is only sent after the handler returns. Until the
+// notify lands, close-to-open correctness is carried by the per-inode kernel
+// cache bypass marker that callers arm synchronously first.
+func (fs *Dat9FS) notifyInodeAtSyncCommit(ino uint64) {
 	fs.notifyCount.Add(1)
 	if fs.perf != nil {
 		fs.perf.notifyInode.add(1)
 	}
+	// Observe-only: the hook must not bypass the dispatch below, otherwise
+	// tests never exercise the notifyWg goroutine or the real InodeNotify
+	// boundary this function exists to keep off the reply path.
 	if testHookNotifyInodeSync != nil {
 		testHookNotifyInodeSync(ino)
-		return
 	}
-	fs.invalidateInodeKernelCaches(ino)
+	fs.notifyInodeAsyncInvalidation(ino)
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
@@ -12743,14 +12776,14 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			}
 			fs.inodes.UpdateMtime(fh.Ino, truncTime)
 			fs.inodes.UpdateCtime(fh.Ino, truncTime)
-			// Invalidate the kernel's attribute cache synchronously so the
-			// next stat() sees the updated mtime/ctime instead of a stale
-			// cached value. Without this, the kernel may serve the pre-
-			// truncation mtime from its AttrTTL window (default 60s),
-			// causing POSIX mtime-advance checks to fail (pjdfstest
-			// open/00.t test 43). Use a synchronous InodeNotify (not the
-			// async notifyInode goroutine) to guarantee the cache is
-			// invalidated before Open returns to the kernel.
+			// Invalidate the kernel's attribute cache inline so the next
+			// stat() sees the updated mtime/ctime instead of a stale cached
+			// value: the kernel may otherwise serve the pre-truncation mtime
+			// from its AttrTTL window (default 60s), failing POSIX
+			// mtime-advance checks (pjdfstest open/00.t test 43). Only the
+			// attribute form runs inline (Linux never blocks on it); the
+			// data invalidation is dispatched off the reply path (#936) and
+			// the bypass marker armed below covers immediate re-opens.
 			fs.invalidateInodeKernelCaches(input.NodeId)
 			fs.armKernelCacheBypass(input.NodeId, p, fh.BaseRev, 0, "open-truncate")
 			if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
@@ -14217,9 +14250,10 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 	fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
 	if fh.WritePolicy == WritePolicyWriteSync {
 		// write-sync completes the remote commit before Write returns. If this
-		// handle was opened O_TRUNC + FOPEN_DIRECT_IO, invalidate kernel
-		// size/data state immediately so the next read cannot observe the
-		// truncation's stale 0-byte view.
+		// handle was opened O_TRUNC + FOPEN_DIRECT_IO, drop the kernel's stale
+		// size/data view of the truncation: both notify forms are dispatched
+		// off the reply path (#936), and the synchronously armed bypass marker
+		// covers an immediate re-read.
 		fs.finishSyncCommitKernelCacheBoundary(fh.Ino, fh.Path, committedRev, size)
 	}
 	return gofuse.OK
@@ -16867,15 +16901,17 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		// close-sync/write-sync are remote durability barriers. The writer may
 		// have been opened with O_TRUNC + FOPEN_DIRECT_IO, so Linux can retain a
 		// kernel-side size/page-cache view from the truncation (0 bytes) while
-		// the just-committed bytes live only in userspace/remote caches. Invalidate
-		// synchronously before returning Flush so an immediate close-to-open read
-		// cannot serve stale/empty data from the kernel cache.
+		// the just-committed bytes live only in userspace/remote caches. Drop
+		// that view with both notify forms dispatched off the reply path (#936)
+		// — the synchronously armed bypass marker covers an immediate
+		// close-to-open read until the invalidation lands.
 		fs.finishSyncCommitKernelCacheBoundary(handleIno, handlePath, committedBarrierRev, publishSize)
 	}
 	// Local flush — kernel receives the Flush reply with status. Most paths do
 	// not need notifyInode/notifyEntry because userspace caches are updated
 	// above and kernel will refresh attrs on next getattr/lookup. Synchronous
-	// close-sync/write-sync uploads are the exception handled just above.
+	// close-sync/write-sync uploads are the exception handled just above: their
+	// kernel-cache invalidation rides the off-reply-path dispatch (#936).
 	return gofuse.OK
 }
 

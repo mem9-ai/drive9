@@ -133,6 +133,13 @@
       "product_promise": "Feishu notification delivery works",
       "owner_hint": "ci",
       "failure_class": "infrastructure"
+    },
+    "fuse-concurrency-stress-write-sync": {
+      "title": "FUSE concurrency stress (write-sync)",
+      "product_area": "fuse",
+      "product_promise": "write-sync FUSE keeps forward progress under concurrency",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
     }
   }
 }
