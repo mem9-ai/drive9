@@ -238,7 +238,15 @@ func (fs *Dat9FS) publishPreparedPromotionWithRecovery(ctx context.Context, requ
 	var lastErr error
 	mayHaveReachedServer := false
 	for attempt := 0; attempt < 3; attempt++ {
-		result, err := fs.publishPreparedPromotionRequest(commitCtx, body)
+		postCtx := commitCtx
+		if mayHaveReachedServer {
+			// Once a request may have reached the server, resolution must outlive
+			// cancellation of the original FUSE request. An exact POST retry is
+			// also the server's accounting/event boundary; a side-effect-free GET
+			// is evidence only and cannot complete the live syscall by itself.
+			postCtx = lookupCtx
+		}
+		result, err := fs.publishPreparedPromotionRequest(postCtx, body)
 		if err == nil {
 			return result, true, nil
 		}
@@ -256,7 +264,14 @@ func (fs *Dat9FS) publishPreparedPromotionWithRecovery(ctx context.Context, requ
 		// remains the fallback if this bounded lookup cannot decide.
 		stored, statusErr := fs.getPromotionResult(lookupCtx, request.OperationID, request.Target)
 		if statusErr == nil {
-			return stored, true, nil
+			if !matchingPromotionResult(request, stored) {
+				return stored, true, nil
+			}
+			// The receipt proves the namespace commit, but GET is deliberately
+			// side-effect-free. Continue with the same operation ID until an exact
+			// POST retry succeeds and completes accounting plus the structural
+			// reset event. If that never happens, keep the journal fail-closed.
+			continue
 		}
 		if client.IsNotFound(statusErr) {
 			if definitelyRejected && !mayHaveReachedServer {

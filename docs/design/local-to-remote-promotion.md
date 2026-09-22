@@ -68,20 +68,25 @@ before opening the publish transaction. The transaction:
 6. commits the namespace and result together.
 
 The three wire operations form one cross-repository contract. `POST` publishes
-the namespace and its receipt in the same transaction. Side-effect-free `GET`
-is keyed by `(target, operation ID)` and returns either that committed receipt
-or `404`. After the client has durably persisted `released`, `DELETE` carries
+the namespace and its receipt in the same transaction, completes any pending
+accounting for an exact retry, and emits the structural reset event before it
+returns success. Side-effect-free `GET` is keyed by `(target, operation ID)`
+and returns either the completed committed receipt or `404`; it performs no
+accounting and emits no event. After the client has durably persisted
+`released`, `DELETE` carries
 the exact `(target, operation ID, manifest digest)` tuple; it is idempotent and
 an already-absent receipt returns `404`. `409`, `413`, and `507` POST responses
 are authoritative pre-commit rejections only when no earlier attempt with the
 same operation ID may have reached the server.
 
-If the response is lost, the live syscall queries the same operation ID and
-may retry that exact request before returning. Whether any request may have
-reached the server is sticky across those retries: a later local/proxy
-rejection plus `NotFound` cannot disprove an earlier in-flight attempt. A
-committed matching result
-means it may finish the local source transition. Startup recovery never turns
+If the response is lost, the live syscall queries the same operation ID as
+evidence and must obtain a successful exact `POST` retry before completing the
+local transition. This preserves `GET` as a pure query while keeping accounting
+and the cross-mount structural reset on the successful `POST` boundary. Whether
+any request may have reached the server is sticky across those retries: a later
+local/proxy rejection plus `NotFound` cannot disprove an earlier in-flight
+attempt. A committed matching result plus that successful exact retry means it
+may finish the local source transition. Startup recovery never turns
 a prepared local record with no durable server result into a new publish; it
 fails closed instead. A single receipt `NotFound` is not proof that a publish
 request from the crashed process cannot still commit, so recovery also does

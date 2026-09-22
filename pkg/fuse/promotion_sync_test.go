@@ -44,7 +44,7 @@ func TestSynchronousPromotionPublishesClosedLocalTree(t *testing.T) {
 				}
 				switch r.Method {
 				case http.MethodPost:
-					publishCalls.Add(1)
+					call := publishCalls.Add(1)
 					var request promotion.PublishRequest
 					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 						t.Fatalf("decode promotion: %v", err)
@@ -54,7 +54,7 @@ func TestSynchronousPromotionPublishesClosedLocalTree(t *testing.T) {
 					}
 					result := &promotion.Result{OperationID: request.OperationID, Target: request.Target, ManifestSHA256: request.ManifestSHA256, Committed: true}
 					committed.Store(result)
-					if responseLoss {
+					if responseLoss && call == 1 {
 						panic(http.ErrAbortHandler)
 					}
 					_ = json.NewEncoder(w).Encode(result)
@@ -120,7 +120,11 @@ func TestSynchronousPromotionPublishesClosedLocalTree(t *testing.T) {
 				t.Fatalf("source still exists: %v", err)
 			}
 			waitForPromotionCleanup(t, fs)
-			if publishCalls.Load() != 1 || acknowledgeCalls.Load() != 1 {
+			wantPublishCalls := int32(1)
+			if responseLoss {
+				wantPublishCalls = 2
+			}
+			if publishCalls.Load() != wantPublishCalls || acknowledgeCalls.Load() != 1 {
 				t.Fatalf("calls publish=%d get=%d ack=%d", publishCalls.Load(), getCalls.Load(), acknowledgeCalls.Load())
 			}
 			if responseLoss && getCalls.Load() == 0 {
@@ -134,22 +138,27 @@ func TestPromotionResponseLossLookupOutlivesCanceledCaller(t *testing.T) {
 	postStarted := make(chan struct{})
 	committed := make(chan struct{})
 	var result atomic.Pointer[promotion.Result]
-	var getCalls atomic.Int32
+	var postCalls, getCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
+			call := postCalls.Add(1)
 			var request promotion.PublishRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Errorf("decode promotion: %v", err)
 				return
 			}
-			close(postStarted)
-			<-r.Context().Done()
-			result.Store(&promotion.Result{
-				OperationID: request.OperationID, Target: request.Target,
-				ManifestSHA256: request.ManifestSHA256, Committed: true,
-			})
-			close(committed)
+			if call == 1 {
+				close(postStarted)
+				<-r.Context().Done()
+				result.Store(&promotion.Result{
+					OperationID: request.OperationID, Target: request.Target,
+					ManifestSHA256: request.ManifestSHA256, Committed: true,
+				})
+				close(committed)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(result.Load())
 		case http.MethodGet:
 			getCalls.Add(1)
 			<-committed
@@ -189,6 +198,9 @@ func TestPromotionResponseLossLookupOutlivesCanceledCaller(t *testing.T) {
 	}
 	if getCalls.Load() == 0 {
 		t.Fatal("canceled caller skipped durable result lookup")
+	}
+	if postCalls.Load() < 2 {
+		t.Fatal("receipt lookup completed the publish without an exact POST retry")
 	}
 }
 
@@ -1881,6 +1893,37 @@ func TestPromotionOutcomeUnknownIsStickyAcrossRetries(t *testing.T) {
 	_, definitive, err := fs.publishPromotionWithRecovery(context.Background(), request)
 	if err == nil || definitive {
 		t.Fatalf("publish result definitive=%v err=%v, want sticky outcome-unknown", definitive, err)
+	}
+	if postCalls.Load() != 3 || getCalls.Load() < 3 {
+		t.Fatalf("calls post=%d get=%d, want 3/>=3", postCalls.Load(), getCalls.Load())
+	}
+}
+
+func TestPromotionReceiptLookupAloneDoesNotCompleteLivePublish(t *testing.T) {
+	var postCalls, getCalls atomic.Int32
+	request := testPromotionRequest()
+	result := &promotion.Result{
+		OperationID: request.OperationID, Target: request.Target,
+		ManifestSHA256: request.ManifestSHA256, Committed: true,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			postCalls.Add(1)
+			panic(http.ErrAbortHandler)
+		case http.MethodGet:
+			getCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(result)
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	fs := newPromotionTestFS(t, server.URL)
+	got, definitive, err := fs.publishPromotionWithRecovery(context.Background(), request)
+	if err == nil || definitive || got != nil {
+		t.Fatalf("publish result=%+v definitive=%v err=%v, want fail-closed", got, definitive, err)
 	}
 	if postCalls.Load() != 3 || getCalls.Load() < 3 {
 		t.Fatalf("calls post=%d get=%d, want 3/>=3", postCalls.Load(), getCalls.Load())
