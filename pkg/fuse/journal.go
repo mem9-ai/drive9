@@ -8,23 +8,23 @@ import (
 	"hash/crc32"
 	"os"
 	"sync"
-	"time"
 	"sync/atomic"
+	"time"
 )
 
 // JournalOp identifies the type of operation recorded in a journal entry.
 type JournalOp int
 
 const (
-	JournalWrite      JournalOp = iota // Write data to a file
-	JournalTruncate                    // Truncate a file
-	JournalRename                      // Rename a file
-	JournalUnlink                      // Delete a file
-	JournalMkdir                       // Create a directory
-	JournalRmdir                       // Remove a directory
-	JournalFsync                       // Fsync a file (local durability marker)
-	JournalCommit                      // Remote commit completed (can be compacted)
-	JournalPendingMeta                 // Durable pending-index record (Meta carries the serialized WriteBackMeta)
+	JournalWrite       JournalOp = iota // Write data to a file
+	JournalTruncate                     // Truncate a file
+	JournalRename                       // Rename a file
+	JournalUnlink                       // Delete a file
+	JournalMkdir                        // Create a directory
+	JournalRmdir                        // Remove a directory
+	JournalFsync                        // Fsync a file (local durability marker)
+	JournalCommit                       // Remote commit completed (can be compacted)
+	JournalPendingMeta                  // Durable pending-index record (Meta carries the serialized WriteBackMeta)
 )
 
 // JournalEntry represents a single operation in the WAL.
@@ -369,8 +369,11 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 			// may reach disk while the shadow content did not. A frame whose
 			// content is short is a lost file (same outcome as ext4 dropping
 			// un-flushed page cache) — drop the entry instead of uploading
-			// torn bytes.
-			if meta.ShadowSpill && shadows != nil {
+			// torn bytes. The guard must cover non-spill frames too: both
+			// kinds upload from the shadow file, and a lazy overwrite of a
+			// pre-existing file would otherwise CAS-commit truncated content
+			// over a good remote revision.
+			if shadows != nil {
 				if size, ok := shadows.ContentSize(path); ok && size < meta.Size {
 					// Partial content: the file is not recoverable.
 					shadows.Remove(path)
