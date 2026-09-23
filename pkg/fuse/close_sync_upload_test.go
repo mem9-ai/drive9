@@ -3,9 +3,12 @@ package fuse
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -56,11 +59,15 @@ func TestCloseSyncShadowUploadSkipsLocalSyncOnlyForCloseSync(t *testing.T) {
 		name       string
 		policy     WritePolicy
 		generation bool
+		syncMode   SyncMode
+		pending    bool
 	}{
-		{"close-sync", WritePolicyCloseSync, true},
-		{"write-sync", WritePolicyWriteSync, true},
-		{"writeback", WritePolicyWriteBack, true},
-		{"legacy-close-sync", WritePolicyCloseSync, false},
+		{"close-sync", WritePolicyCloseSync, true, SyncStrict, false},
+		{"writeback", WritePolicyWriteBack, true, SyncStrict, false},
+		{"legacy-close-sync", WritePolicyCloseSync, false, SyncStrict, false},
+		{"interactive-close-sync", WritePolicyCloseSync, true, SyncInteractive, false},
+		{"auto-close-sync", WritePolicyCloseSync, true, SyncAuto, false},
+		{"staged-close-sync", WritePolicyCloseSync, true, SyncStrict, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var puts atomic.Int32
@@ -78,14 +85,13 @@ func TestCloseSyncShadowUploadSkipsLocalSyncOnlyForCloseSync(t *testing.T) {
 				_, _ = io.WriteString(w, `{"revision":1}`)
 			})
 			fh, _ := createCloseSyncShadowTestFile(t, fs, "sync.txt", 0o644)
-			// Make Sync fail without damaging the on-disk bytes. Upload opens
-			// its own fd, so this distinguishes local sync from remote commit.
-			fs.shadowStore.mu.Lock()
-			err := fs.shadowStore.files[fh.Path].fd.Close()
-			fs.shadowStore.mu.Unlock()
-			if err != nil {
-				t.Fatal(err)
+			fs.syncMode = tc.syncMode
+			if tc.pending {
+				if _, err := fs.pendingIndex.PutShadowSpill(fh.Path, fh.Dirty.Size(), PendingNew, 0); err != nil {
+					t.Fatal(err)
+				}
 			}
+			makeCloseSyncShadowUnsyncable(t, fs.shadowStore, fh.Path)
 			fh.Lock()
 			fh.WritePolicy = tc.policy
 			if !tc.generation {
@@ -94,7 +100,7 @@ func TestCloseSyncShadowUploadSkipsLocalSyncOnlyForCloseSync(t *testing.T) {
 			st := fs.syncHandleToRemoteWithoutAppendLogLocked(context.Background(), fh)
 			dirty := fh.Dirty.HasDirtyParts()
 			fh.Unlock()
-			if tc.policy == WritePolicyCloseSync && tc.generation {
+			if tc.policy == WritePolicyCloseSync && tc.generation && tc.syncMode == SyncStrict && !tc.pending {
 				if st != gofuse.OK || puts.Load() != 1 || dirty {
 					t.Fatalf("close-sync: status=%v puts=%d dirty=%t", st, puts.Load(), dirty)
 				}
@@ -107,7 +113,7 @@ func TestCloseSyncShadowUploadSkipsLocalSyncOnlyForCloseSync(t *testing.T) {
 
 func TestCloseSyncShadowUploadPinsGenerationUntilRemoteAck(t *testing.T) {
 	started, allow := make(chan struct{}), make(chan struct{})
-	var release sync.Once
+	var release, startedOnce sync.Once
 	var fs *Dat9FS
 	fs = newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -123,7 +129,7 @@ func TestCloseSyncShadowUploadPinsGenerationUntilRemoteAck(t *testing.T) {
 			pl.mu.Unlock()
 			t.Error("shadow path lock released before remote acknowledgement")
 		}
-		close(started)
+		startedOnce.Do(func() { close(started) })
 		<-allow
 		_, _ = io.WriteString(w, `{"revision":1}`)
 	})
@@ -155,7 +161,7 @@ func TestCloseSyncShadowUploadPinsGenerationUntilRemoteAck(t *testing.T) {
 	}
 }
 
-func TestCloseSyncShadowUploadFailureRetainsRetryableData(t *testing.T) {
+func TestCloseSyncShadowUploadFailureRetainsInProcessRetryableData(t *testing.T) {
 	var puts atomic.Int32
 	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 		if puts.Add(1) == 1 {
@@ -189,8 +195,171 @@ func TestShadowUploadWithoutLocalSyncRejectsStaleGeneration(t *testing.T) {
 	if _, err := fs.shadowStore.WriteAt(fh.Path, 0, []byte("new"), 0); err != nil {
 		t.Fatal(err)
 	}
-	_, err := uploadFromShadowRemoteWithoutLocalSync(context.Background(), fs.client, fs.shadowStore, fh.Path, fh.Path, 0, gen)
+	_, err := uploadFromShadowRemote(context.Background(), fs.client, fs.shadowStore, fh.Path, fh.Path, 0, gen, shadowUploadRemoteDurable)
 	if !errors.Is(err, errCommitPayloadStale) || calls.Load() != 0 {
 		t.Fatalf("stale upload: err=%v remote calls=%d", err, calls.Load())
+	}
+}
+
+// A live pipe fd cannot fsync, but can be closed exactly once by the store.
+// Uploads open their own fd on the unchanged shadow path. This injects an I/O
+// error without leaving a closed descriptor in the store's ownership map.
+func makeCloseSyncShadowUnsyncable(t *testing.T, shadows *ShadowStore, path string) {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+	shadows.mu.Lock()
+	defer shadows.mu.Unlock()
+	original := shadows.files[path].fd
+	shadows.files[path].fd = reader
+	if err := original.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestShadowRemoteDurabilityRejectsMissingGeneration(t *testing.T) {
+	var calls atomic.Int32
+	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1) })
+	fh, _ := createCloseSyncShadowTestFile(t, fs, "missing-gen.txt", 0o644)
+	_, err := uploadFromShadowRemote(context.Background(), fs.client, fs.shadowStore, fh.Path, fh.Path, 0, 0, shadowUploadRemoteDurable)
+	if !errors.Is(err, errCommitPayloadStale) || calls.Load() != 0 {
+		t.Fatalf("unfenced upload: err=%v calls=%d", err, calls.Load())
+	}
+}
+
+func TestCloseSyncInteractiveFsyncKeepsLocalBarrier(t *testing.T) {
+	var calls atomic.Int32
+	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1) })
+	fs.syncMode = SyncInteractive
+	journal, err := NewJournal(filepath.Join(t.TempDir(), "journal.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = journal.Close() })
+	fs.journal = journal
+	fs.pendingIndex.SetJournal(journal)
+	fh, input := createCloseSyncShadowTestFile(t, fs, "staged.txt", 0o644)
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: input.InHeader, Fh: input.Fh}); st != gofuse.OK {
+		t.Fatalf("interactive Fsync: %v", st)
+	}
+	if fh.PendingIndexGen == 0 {
+		t.Fatal("interactive fsync did not stage recovery metadata")
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: input.InHeader, Fh: input.Fh}, []byte("newer")); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	makeCloseSyncShadowUnsyncable(t, fs.shadowStore, fh.Path)
+	if st := fs.Flush(nil, input); st == gofuse.OK || calls.Load() != 0 {
+		t.Fatalf("staged close skipped local barrier: status=%v calls=%d", st, calls.Load())
+	}
+}
+
+func TestCloseSyncStrictFsyncKeepsLocalBarrier(t *testing.T) {
+	var calls atomic.Int32
+	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1) })
+	fh, input := createCloseSyncShadowTestFile(t, fs, "fsync.txt", 0o644)
+	makeCloseSyncShadowUnsyncable(t, fs.shadowStore, fh.Path)
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: input.InHeader, Fh: input.Fh}); st == gofuse.OK || calls.Load() != 0 {
+		t.Fatalf("explicit Fsync skipped local barrier: status=%v calls=%d", st, calls.Load())
+	}
+}
+
+func TestCloseSyncShadowCommitHasNoRecoveryUpload(t *testing.T) {
+	for _, truncateShadow := range []bool{false, true} {
+		name := "surviving-shadow"
+		if truncateShadow {
+			name = "torn-shadow"
+		}
+		t.Run(name, func(t *testing.T) {
+			var calls atomic.Int32
+			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Method != http.MethodPut {
+					t.Errorf("unexpected recovery request: %s", r.Method)
+				}
+				_, _ = io.WriteString(w, `{"revision":1}`)
+			})
+			journalPath := filepath.Join(t.TempDir(), "journal.wal")
+			journal, err := NewJournal(journalPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = journal.Close() })
+			fs.journal = journal
+			fs.pendingIndex.SetJournal(journal)
+			fh, input := createCloseSyncShadowTestFile(t, fs, "recover.txt", 0o644)
+			if st := fs.Flush(nil, input); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			if err := journal.FsyncShared(); err != nil {
+				t.Fatal(err)
+			}
+			fs.shadowStore.Close()
+			// Model a lost unlink and, optionally, lost shadow page-cache bytes.
+			// Reopening the stores must not turn either orphan into an upload.
+			data := []byte("close-sync content")
+			if truncateShadow {
+				data = data[:3]
+			}
+			if err := os.WriteFile(fs.shadowStore.shadowPath(fh.Path), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			recoveredShadow, err := NewShadowStore(fs.shadowStore.dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(recoveredShadow.Close)
+			if err := recoveredShadow.RecoverFromDisk(); err != nil {
+				t.Fatal(err)
+			}
+			recoveredPending, err := NewPendingIndex(fs.pendingIndex.dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := recoveredPending.RecoverFromDisk(); err != nil {
+				t.Fatal(err)
+			}
+			replay, err := NewJournal(journalPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = replay.Close() })
+			if err := replayJournalIntoPending(replay, recoveredPending, recoveredShadow); err != nil {
+				t.Fatal(err)
+			}
+			cq := NewCommitQueue(fs.client, recoveredShadow, recoveredPending, replay, 1, 8)
+			cq.RecoverPending()
+			cq.DrainAll()
+			if recoveredPending.HasPending(fh.Path) || calls.Load() != 1 {
+				t.Fatalf("acknowledged path replayed: pending=%t requests=%d", recoveredPending.HasPending(fh.Path), calls.Load())
+			}
+		})
+	}
+}
+
+func TestCloseSyncShadowUploadEmptyAndMultipart(t *testing.T) {
+	for _, size := range []int64{0, 256 * 1024} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			expected := int64(0)
+			recorder := newMultipartUploadRecorder(t, "/payload.bin", size, &expected)
+			fs := newCloseSyncShadowTestFS(t, recorder.server.Config.Handler.ServeHTTP)
+			fs.client.SetSmallFileThresholdForTests(128 * 1024)
+			fh, input := createCloseSyncShadowTestFile(t, fs, "payload.bin", 0o644)
+			if st := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+				InHeader: input.InHeader, Fh: input.Fh, Valid: gofuse.FATTR_SIZE | gofuse.FATTR_FH, Size: uint64(size),
+			}}, &gofuse.AttrOut{}); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			makeCloseSyncShadowUnsyncable(t, fs.shadowStore, fh.Path)
+			if st := fs.Flush(nil, input); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			if size == 0 && recorder.directFilePuts.Load() != 1 || size > 0 && recorder.completeCalls.Load() != 1 {
+				t.Fatalf("upload route: direct=%d multipart=%d", recorder.directFilePuts.Load(), recorder.completeCalls.Load())
+			}
+		})
 	}
 }
