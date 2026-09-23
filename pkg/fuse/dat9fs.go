@@ -14017,24 +14017,31 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			source = "shadow-spill"
 		}
 		unlockShadowWrite := fs.lockHandleRemoteCommitPathLocked(fh)
-		_, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev)
-		if err == nil {
+		shadowWritten, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev)
+		if err == nil || shadowWritten > 0 {
 			fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
 		}
 		unlockShadowWrite()
 		if err != nil {
-			if errors.Is(err, syscall.ENOSPC) {
+			if shadowWritten > 0 {
+				// POSIX writes report partial progress as a successful short
+				// write. Keep Dirty in step with bytes already in the shadow;
+				// the caller can retry the remainder.
+				data = data[:shadowWritten]
+				source += "-partial"
+			} else if errors.Is(err, syscall.ENOSPC) {
 				source += "-nospace"
 				return 0, gofuse.Status(syscall.ENOSPC)
+			} else {
+				safeLogPrintf("shadow write failed for %s: %v", fh.Path, err)
+				source += "-error"
+				if fh.ShadowSpill {
+					return 0, gofuse.EIO
+				}
+				fs.shadowStore.Remove(fh.Path)
+				fh.ShadowReady = false
+				fh.ShadowStageGen = 0
 			}
-			safeLogPrintf("shadow write failed for %s: %v", fh.Path, err)
-			source += "-error"
-			if fh.ShadowSpill {
-				return 0, gofuse.EIO
-			}
-			fs.shadowStore.Remove(fh.Path)
-			fh.ShadowReady = false
-			fh.ShadowStageGen = 0
 		}
 		if fs.debugEnabled() && time.Since(shadowStart) >= fuseDebugSlowOpThreshold {
 			fs.debugf("write %s done path=%s off=%d size=%d dur=%s", source, fh.Path, input.Offset, len(data), time.Since(shadowStart))

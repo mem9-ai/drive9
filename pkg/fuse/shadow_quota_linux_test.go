@@ -9,6 +9,9 @@ import (
 	"os/signal"
 	"syscall"
 	"testing"
+	"time"
+
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
 
 // A file-size limit produces a real partial pwrite followed by EFBIG. Isolate
@@ -76,6 +79,49 @@ func TestShadowRuntimeQuotaPartialWriteAccounting(t *testing.T) {
 			s.Remove("/file")
 			if s.quotaBytes.Load() != 0 || s.PendingBytes() != 0 {
 				t.Fatal("partial write charge not released")
+			}
+		})
+	}
+	for _, spill := range []bool{false, true} {
+		name := "write-through"
+		if spill {
+			name = "shadow-spill"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := newRuntimeQuotaStore(t, 100)
+			const path = "/partial"
+			if err := s.Ensure(path, 0, 1); err != nil {
+				t.Fatal(err)
+			}
+			before := s.ActiveGeneration(path)
+			opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+			fs.shadowStore = s
+			ino := fs.inodes.Lookup(path, false, 0, time.Now())
+			fh := &FileHandle{Ino: ino, Path: path, BaseRev: 1, IsNew: true,
+				ShadowReady: true, ShadowSpill: spill, Dirty: fs.newWriteBuffer(path, streamingWriteMaxSize, 0),
+				WritePolicy: WritePolicyWriteBack}
+			id := fs.allocateFileHandle(fh)
+			n, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: id}, []byte("0123456789"))
+			if n != 7 || st != gofuse.OK {
+				t.Fatalf("partial FUSE write: n=%d status=%v, want 7/OK", n, st)
+			}
+			shadow, err := s.ReadAll(path)
+			if err != nil || string(shadow) != "0123456" || string(fh.Dirty.bytesView()) != "0123456" {
+				t.Fatalf("shadow/Dirty mismatch: shadow=%q dirty=%q err=%v", shadow, fh.Dirty.bytesView(), err)
+			}
+			if fh.DirtySeq == 0 || fh.ShadowStageGen != s.ActiveGeneration(path) || fh.ShadowStageGen == before || s.quotaBytes.Load() != 7 {
+				t.Fatalf("partial FUSE state: seq=%d stage=%d active=%d quota=%d", fh.DirtySeq, fh.ShadowStageGen, s.ActiveGeneration(path), s.quotaBytes.Load())
+			}
+			result, readStatus := fs.Read(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: id, Size: 10}, make([]byte, 10))
+			if readStatus != gofuse.OK {
+				t.Fatal(readStatus)
+			}
+			got, readStatus := result.Bytes(make([]byte, 10))
+			result.Done()
+			if readStatus != gofuse.OK || string(got) != "0123456" {
+				t.Fatalf("partial read=%q status=%v", got, readStatus)
 			}
 		})
 	}
