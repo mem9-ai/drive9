@@ -6677,32 +6677,41 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 
 	lastErr := err
 	for range retryCount {
-		// Keep list fallback retries detached from FUSE cancel for the same reason
-		// as stat retries above: this path is a compatibility probe after HEAD
-		// said "not found", and cancel-coupled retries would collapse to the
-		// original transient failure immediately.
-		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
-		listStart = fs.perfStart()
-		request = fs.dirCache.BeginRequest(parentPath)
-		items, err = fs.client.ListCtx(retryCtx, apiPath)
-		retryCancel()
-		fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
-		if err == nil {
-			if !fs.lockMountViewRead(generation) {
-				return nil, 0, syscall.EAGAIN
+		// Each attempt runs in its own scope with its own release, so no exit —
+		// including the two early returns below — can leave its registration
+		// behind. The function-level defer holds the first attempt's token, so
+		// a missed release here would pin the directory's reconciliation state
+		// for the mount's lifetime.
+		attempt := func() ([]client.FileInfo, uint64, error, bool) {
+			// Keep list fallback retries detached from FUSE cancel for the same
+			// reason as stat retries above: this path is a compatibility probe
+			// after HEAD said "not found", and cancel-coupled retries would
+			// collapse to the original transient failure immediately.
+			retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
+			listStart := fs.perfStart()
+			request := fs.dirCache.BeginRequest(parentPath)
+			defer fs.dirCache.EndRequest(request)
+			listItems, listErr := fs.client.ListCtx(retryCtx, apiPath)
+			retryCancel()
+			fs.perfRecordRemote(perfRemoteList, listStart, listErr, 0)
+			if listErr == nil {
+				if !fs.lockMountViewRead(generation) {
+					return nil, 0, syscall.EAGAIN, true
+				}
+				view := reconciledFileInfos(fs.dirCache.PutListing(parentPath, cachedFileInfos(listItems), request))
+				fs.mountViewMu.RUnlock()
+				return view, generation, nil, true
 			}
-			items = reconciledFileInfos(fs.dirCache.PutListing(parentPath, cachedFileInfos(items), request))
-			fs.mountViewMu.RUnlock()
-			return items, generation, nil
+			if !isTransientLookupErr(listErr) {
+				return listItems, 0, fs.resetMountViewOnAuthorizationError(listErr), true
+			}
+			return listItems, 0, listErr, false
 		}
-		if !isTransientLookupErr(err) {
-			return items, 0, fs.resetMountViewOnAuthorizationError(err)
+		attemptItems, attemptGen, attemptErr, done := attempt()
+		if done {
+			return attemptItems, attemptGen, attemptErr
 		}
-		lastErr = err
-		// This attempt produced nothing, so release it before the next one (or
-		// before returning). The deferred release holds the original token, so
-		// getting this wrong would leave one registration per call.
-		fs.dirCache.EndRequest(request)
+		lastErr = attemptErr
 	}
 	return nil, 0, lastErr
 }

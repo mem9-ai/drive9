@@ -1018,3 +1018,127 @@ func TestRemotePathsReleaseEveryRegistration(t *testing.T) {
 		t.Fatal("fixture: expected the list attempts to reach the server")
 	}
 }
+
+// --- Ninth review round on #966: reclaim triggers and retry release ---------
+
+// A mutation with no request in flight has no stamp trigger, because its only
+// reader is a request that was already outstanding. Stamps must therefore be
+// written only while one exists — otherwise a directory keeps one per name it
+// has ever held, which at the hard cap is every name the cache refused to store.
+func TestDirCacheNoStampsAccumulateWithoutRequests(t *testing.T) {
+	const cap = 4
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, cap)
+
+	for i := range 1000 {
+		dc.Upsert("/d", CachedFileInfo{Name: fmt.Sprintf("f_%04d.dat", i), Revision: 1})
+	}
+
+	entry := dc.entries["/d"]
+	if len(entry.items) > cap {
+		t.Fatalf("cache grew past maxEntries: %d > %d", len(entry.items), cap)
+	}
+	if got := len(entry.localGen); got != 0 {
+		t.Fatalf("stamps accumulated with no request to consult them: %d (items=%d)", got, len(entry.items))
+	}
+}
+
+// The same, for removals: a directory that only ever sees unlinks must not
+// leave a stamp per removed name.
+func TestDirCacheNoRemovalStampsAccumulateWithoutRequests(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "seed.dat"}})
+
+	for i := range 100 {
+		dc.Remove("/d", fmt.Sprintf("gone_%04d.dat", i))
+	}
+
+	if got := len(dc.entries["/d"].localGen); got != 0 {
+		t.Fatalf("removal stamps accumulated with no request in flight: %d", got)
+	}
+}
+
+// A stamp still has to exist while a request can consult it: a response taken
+// before the change must still be fenced.
+func TestDirCacheStampsWrittenWhileRequestOutstanding(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "seed.dat"}})
+
+	request := dc.BeginRequest("/d")
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Revision: 2})
+	if got := len(dc.entries["/d"].localGen); got == 0 {
+		t.Fatal("no stamp written while a request was outstanding")
+	}
+
+	// The older response must not be able to speak for the committed name.
+	dc.PutListing("/d", []CachedFileInfo{{Name: "other.dat"}}, request)
+	if !containsName(cachedNames(t, dc, "/d"), "committed.dat") {
+		t.Fatalf("committed child lost: %v", cachedNames(t, dc, "/d"))
+	}
+}
+
+// Each retry attempt is a request of its own, and every exit from the loop must
+// release it: the non-transient error return and the mount-view generation
+// mismatch return both leave the loop directly.
+func TestLookupListRetryReleasesTokenOnEveryExit(t *testing.T) {
+	cases := []struct {
+		name string
+		// respond answers list attempts after the first (transient) failure.
+		// It runs on the server side before the response is written, so the
+		// mismatch case advances the mount view generation the way a
+		// concurrent reset would and the install hits the EAGAIN exit.
+		respond func(fs *Dat9FS, w http.ResponseWriter)
+	}{
+		{
+			name: "non-transient error",
+			respond: func(_ *Dat9FS, w http.ResponseWriter) {
+				http.Error(w, "denied", http.StatusForbidden)
+			},
+		},
+		{
+			name: "success then generation mismatch",
+			respond: func(fs *Dat9FS, w http.ResponseWriter) {
+				fs.mountViewGeneration.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"entries":[{"name":"a.dat","size":1,"isDir":false}]}`))
+			},
+		},
+		{
+			name: "transient throughout",
+			respond: func(_ *Dat9FS, w http.ResponseWriter) {
+				http.Error(w, "transient", http.StatusInternalServerError)
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			attempt := 0
+			var fs *Dat9FS
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("list") == "" {
+					http.NotFound(w, r)
+					return
+				}
+				attempt++
+				if attempt == 1 {
+					http.Error(w, "transient", http.StatusInternalServerError)
+					return
+				}
+				tc.respond(fs, w)
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs = NewDat9FS(newTestClient(ts.URL), opts)
+
+			_, _, _ = fs.lookupListWithRetry(nil, "/leak")
+
+			if got := len(fs.dirCache.inFlight); got != 0 {
+				t.Fatalf("retry left %d registration(s) behind", got)
+			}
+			if got := len(fs.dirCache.retired); got != 0 {
+				t.Fatalf("retry left %d retirement(s) behind", got)
+			}
+		})
+	}
+}

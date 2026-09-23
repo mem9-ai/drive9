@@ -505,6 +505,30 @@ func (dc *DirCache) releaseRequestLocked(token RequestToken) {
 	}
 }
 
+// noteLocalLocked records that this mount changed name in dirPath, so a response
+// from a request that was already in flight for that directory cannot speak for
+// it, and advances the directory's fencing value either way. Caller holds dc.mu.
+//
+// The stamp is written only while such a request exists. Its only reader is one
+// of those requests: with none outstanding there is nothing to defend the name
+// from, because the next request to start is newer than this change by
+// construction. That conditional is what keeps the map bounded by concurrency
+// rather than by every name the directory has ever held — and it matters most at
+// the hard cap, where names the cache refuses to store would otherwise leave a
+// stamp each (a 1000-name burst at cap 4 left 1000 of them).
+func (dc *DirCache) noteLocalLocked(entry *dirCacheEntry, dirPath, name string) {
+	stamp := dc.nextGenerationLocked()
+	entry.gen = stamp
+	if dc.inFlight[dirPath] > 0 {
+		entry.localGen[name] = stamp
+		return
+	}
+	// Nothing can consult a stamp for this directory, so any earlier ones are
+	// unreadable too: reclaiming here is what gives a mutation with no request
+	// in flight a reclaim trigger at all.
+	entry.reclaimReconciliationLocked()
+}
+
 // reclaimReconciliationLocked drops per-name state that only an outstanding
 // request could have needed. Caller holds dc.mu.
 func (e *dirCacheEntry) reclaimReconciliationLocked() {
@@ -560,12 +584,10 @@ func (dc *DirCache) Observe(parentPath string, item CachedFileInfo, token Reques
 	entry.expires = time.Now().Add(dc.ttl)
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
-	// An observation is still this mount's knowledge of the name, stamped now
-	// so a response taken before it cannot overwrite it. The stamp is released
-	// with the request, so it lives only as long as something can consult it.
-	stamp := dc.nextGenerationLocked()
-	entry.gen = stamp
-	entry.localGen[item.Name] = stamp
+	// An observation is still this mount's knowledge of the name, so a response
+	// taken before it must not overwrite it. Both the stamp and this request are
+	// released together, so neither outlives the readers that could consult it.
+	dc.noteLocalLocked(entry, parentPath, item.Name)
 	dc.releaseRequestLocked(token)
 }
 
@@ -593,13 +615,9 @@ func (dc *DirCache) upsertInternal(parentPath string, item CachedFileInfo) {
 
 	entry := dc.ensureEntryLocked(parentPath)
 	entry.expires = time.Now().Add(dc.ttl)
-	// Stamp the name before storing it: upsert needs to know an incoming name is
-	// authoritative, and localGen is also how later installs recognise it.
-	stamp := dc.nextGenerationLocked()
-	entry.gen = stamp
-	entry.localGen[item.Name] = stamp
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
+	dc.noteLocalLocked(entry, parentPath, item.Name)
 }
 
 // Remove deletes a known child entry from a parent without implying the parent
@@ -614,9 +632,7 @@ func (dc *DirCache) Remove(parentPath, name string) {
 
 	entry := dc.ensureEntryLocked(parentPath)
 	entry.remove(name)
-	stamp := dc.nextGenerationLocked()
-	entry.gen = stamp
-	entry.localGen[name] = stamp
+	dc.noteLocalLocked(entry, parentPath, name)
 	if !entry.hasState() {
 		delete(dc.entries, parentPath)
 	}
@@ -901,11 +917,12 @@ func (dc *DirCache) getEntryLocked(dirPath string, now time.Time) (*dirCacheEntr
 // another name to make room (the caller uses that to avoid claiming the
 // listing is complete).
 //
-// At the cap the eviction scans for a name with no local stamp: a name this
-// mount committed is exactly what the listing race protection exists to keep
-// visible, so it must not be the one dropped to make room for a name the
-// server can simply list again. If every name is locally owned, the incoming
-// item is not cached at all.
+// Eviction is FIFO and maxEntries is a hard bound even when the incoming name
+// is one this mount just committed: a directory larger than the cap cannot be
+// held in full, so a committed name evicted here is protected by the revoked
+// complete/session markers — misses go back to the server instead of being
+// answered from a cache that no longer holds every name — not by growing
+// items past the caller-configured limit.
 func (e *dirCacheEntry) upsert(item CachedFileInfo, maxEntries int) (evicted bool) {
 	if item.Name == "" {
 		return false
