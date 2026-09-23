@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -17,6 +18,47 @@ import (
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
+// errExtentTornDown is returned when an extent operation races unmount: the
+// runtime has been torn down and must not be re-created.
+var errExtentTornDown = errors.New("extent runtime: mount is tearing down")
+
+// stopExtentRuntimeLoop marks the extent runtime torn down and stops and joins
+// its compaction loop. Teardown is marked under extentMu so a concurrent
+// ensureExtentRuntime cannot install a runtime after the pointer is cleared.
+// The runtime stays installed until closeExtentRuntime so FlushAll's VFS flush
+// still sees it.
+func (fs *Dat9FS) stopExtentRuntimeLoop() {
+	fs.extentMu.Lock()
+	defer fs.extentMu.Unlock()
+	fs.extentTornDown = true
+	if fs.extentRT == nil {
+		return
+	}
+	if fs.extentRT.stop != nil {
+		fs.extentRT.stop()
+	}
+	// Join the compaction loop before touching the VFS: a compaction in flight
+	// is uploading a merged blob and about to CAS it into meta, and returning
+	// from unmount in between would leak that blob.
+	fs.extentRT.wg.Wait()
+}
+
+// closeExtentRuntime releases the extent runtime's JuiceFS session and object
+// store and clears the pointer, so a torn-down fs never advertises a dead
+// runtime as healthy.
+func (fs *Dat9FS) closeExtentRuntime() {
+	fs.extentMu.Lock()
+	defer fs.extentMu.Unlock()
+	er := fs.extentRT
+	if er == nil {
+		return
+	}
+	if err := extent.CloseRuntime(er.rt); err != nil {
+		safeLogPrintf("close extent runtime: %v", err)
+	}
+	fs.extentRT = nil
+}
+
 type extentRuntime struct {
 	rt   *extent.Runtime
 	meta jfsmeta.Meta
@@ -31,6 +73,9 @@ type extentRuntime struct {
 func (fs *Dat9FS) ensureExtentRuntime() error {
 	fs.extentMu.Lock()
 	defer fs.extentMu.Unlock()
+	if fs.extentTornDown {
+		return errExtentTornDown
+	}
 	if fs.extentRT != nil {
 		return nil
 	}

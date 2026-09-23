@@ -23,7 +23,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/mem9-ai/drive9/pkg/client"
-	"github.com/mem9-ai/drive9/pkg/extent"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
@@ -235,6 +234,9 @@ type Dat9FS struct {
 
 	extentMu sync.Mutex
 	extentRT *extentRuntime
+	// extentTornDown is set under extentMu when teardown starts; no extent
+	// runtime may be installed after it (see stopExtentRuntimeLoop).
+	extentTornDown bool
 	// extentMisses caches "this path is not an extent file" so an
 	// extent-enabled mount does not pay a stat probe on every syscall against
 	// the classic files that share its glob (the mixed profile is the shape the
@@ -17092,15 +17094,7 @@ func (fs *Dat9FS) drainLatePendingEntries() {
 }
 
 func (fs *Dat9FS) FlushAll() {
-	if fs.extentRT != nil {
-		if fs.extentRT.stop != nil {
-			fs.extentRT.stop()
-		}
-		// Join the compaction loop before touching the VFS: a compaction in
-		// flight is uploading a merged blob and about to CAS it into meta, and
-		// returning from unmount in between would leak that blob.
-		fs.extentRT.wg.Wait()
-	}
+	fs.stopExtentRuntimeLoop()
 	if v := fs.extentVFS(); v != nil {
 		_ = v.FlushAll("")
 	}
@@ -17206,12 +17200,7 @@ func (fs *Dat9FS) FlushAll() {
 		fs.perf.printSummary(os.Stderr)
 	}
 
-	// Release the extent runtime: close the JuiceFS session and then the object
-	// store, which for GCS owns an HTTP client. Without this a mount torn down
-	// and re-established in the same process leaves one client behind per cycle.
-	if fs.extentRT != nil {
-		_ = extent.CloseRuntime(fs.extentRT.rt)
-	}
+	fs.closeExtentRuntime()
 }
 
 // StatFs reports a generous virtual capacity so that apps (Obsidian, Finder)

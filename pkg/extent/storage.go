@@ -75,6 +75,26 @@ type CredentialSource interface {
 	GetDataCredential(ctx context.Context) (*Credential, error)
 }
 
+// errExtentStoreClosed is returned by every I/O entry point after Shutdown.
+var errExtentStoreClosed = fmt.Errorf("extent storage is closed")
+
+// canonicalExtentScheme maps a data-credential scheme to the one this package
+// reports. Cloud Storage is minted as "gcs", while the object-backend/objectfs
+// surfaces canonicalize to "gs"; both are accepted and reported as "gcs" so
+// String() and metric labels stay stable.
+func canonicalExtentScheme(scheme string) string {
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "", SchemeFile:
+		return SchemeFile
+	case SchemeS3:
+		return SchemeS3
+	case "gs", SchemeGCS:
+		return SchemeGCS
+	default:
+		return strings.ToLower(strings.TrimSpace(scheme))
+	}
+}
+
 // OpenStorage builds a JuiceFS ObjectStorage from a data-credential response.
 // file is the in-process mock used by unit tests. s3 is the production and
 // local-MinIO data plane (STS or static keys). gcs is the Google Cloud Storage
@@ -99,7 +119,7 @@ func OpenStorage(cred *Credential, src CredentialSource) (object.ObjectStorage, 
 		src:    src,
 		inner:  inner,
 		cred:   *cred,
-		scheme: cred.Scheme,
+		scheme: canonicalExtentScheme(cred.Scheme),
 		// One jittered lead per mount: mounts of the same tenant then renew
 		// at spread-out instants instead of together.
 		refreshLead: credentialRefreshLead(credentialRefreshWindow, credentialRefreshJitter, rand.Int64N),
@@ -238,10 +258,16 @@ type refreshingStore struct {
 	inner  object.ObjectStorage
 	cred   Credential
 	scheme string
-	// closed is set under mu by Shutdown; innerStore refuses to serve or refresh
-	// after teardown, so a late renewal cannot resurrect a client nothing will
-	// close.
+	// closed is set under mu by Shutdown; acquireInner refuses to serve or
+	// refresh after teardown, so a late renewal cannot resurrect a client
+	// nothing will close.
 	closed bool
+	// inflight counts callers holding an inner store outside mu, and retired
+	// holds stores that must be disposed once inflight drops to zero. A
+	// superseded or closed store is therefore never shut down under an
+	// in-flight caller.
+	inflight int
+	retired  []object.ObjectStorage
 	// refreshLead is how long before expiry this store renews, jittered per
 	// store instance (see credentialRefreshLead).
 	refreshLead time.Duration
@@ -258,8 +284,8 @@ func (s *refreshingStore) Scheme() string { return s.scheme }
 func (s *refreshingStore) Prefix() string { return s.cred.Prefix }
 
 // Shutdown releases the inner store's resources (for example the GCS client).
-// object.Shutdown unwraps the prefix wrapper, so forwarding here reaches it;
-// CloseRuntime calls it once per runtime.
+// It is idempotent, and a store still held by an in-flight operation is
+// disposed when the last holder releases rather than under it.
 func (s *refreshingStore) Shutdown() {
 	if s == nil {
 		return
@@ -270,7 +296,57 @@ func (s *refreshingStore) Shutdown() {
 		return
 	}
 	s.closed = true
-	object.Shutdown(s.inner)
+	s.retireLocked(s.inner)
+}
+
+// release ends one acquireInner hold, disposing retired stores once no caller
+// holds an inner store.
+func (s *refreshingStore) release() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inflight == 0 {
+		return
+	}
+	s.inflight--
+	if s.inflight == 0 {
+		s.flushRetiredLocked()
+	}
+}
+
+// retireLocked releases store now when no caller holds an inner store, else
+// defers it until the last holder releases.
+func (s *refreshingStore) retireLocked(store object.ObjectStorage) {
+	if store == nil {
+		return
+	}
+	if s.inflight > 0 {
+		s.retired = append(s.retired, store)
+		return
+	}
+	object.Shutdown(store)
+}
+
+func (s *refreshingStore) flushRetiredLocked() {
+	for _, store := range s.retired {
+		object.Shutdown(store)
+	}
+	s.retired = nil
+}
+
+// acquireInner returns the inner store for one operation and the release the
+// caller must run when it is done, so the store cannot be disposed mid-use.
+func (s *refreshingStore) acquireInner(ctx context.Context) (object.ObjectStorage, func(), error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, nil, errExtentStoreClosed
+	}
+	inner, err := s.innerStoreLocked(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	s.inflight++
+	return inner, s.release, nil
 }
 
 func (s *refreshingStore) PutCount() int64 { return s.puts.Load() }
@@ -295,12 +371,9 @@ func tenantFromPrefix(prefix string) string {
 	return rest
 }
 
-func (s *refreshingStore) innerStore(ctx context.Context) (object.ObjectStorage, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, fmt.Errorf("extent storage is closed")
-	}
+// innerStoreLocked resolves the store for one operation and refreshes it when
+// the credential is near expiry. The caller holds s.mu.
+func (s *refreshingStore) innerStoreLocked(ctx context.Context) (object.ObjectStorage, error) {
 	if s.src == nil || s.cred.ExpiresAt == "" {
 		return s.inner, nil
 	}
@@ -338,12 +411,13 @@ func (s *refreshingStore) innerStore(ctx context.Context) (object.ObjectStorage,
 	} else {
 		s.inner = inner
 		s.cred = *next
-		s.scheme = next.Scheme
+		s.scheme = canonicalExtentScheme(next.Scheme)
 	}
-	// A GCS store owns a storage client; replacing it without closing the old
+	// A GCS store owns a storage client; replacing it without releasing the old
 	// one would leak a client per renewal. S3/file stores are not Shutdownable,
-	// so this is a no-op for them.
-	object.Shutdown(superseded)
+	// so this is a no-op for them. Retire rather than close in place, so an
+	// in-flight caller keeps a live client.
+	s.retireLocked(superseded)
 	metrics.RecordTenantOperation(s.tenantLabel(), "extent_storage", "refresh_credential", "ok", time.Since(start))
 	return s.inner, nil
 }
@@ -358,36 +432,58 @@ func (s *refreshingStore) recordRefreshFailure(ctx context.Context, step string,
 	metrics.RecordTenantOperation(tenant, "extent_storage", "refresh_credential", metrics.ResultForError(err), time.Since(start))
 }
 
+// releasingReadCloser keeps a store generation alive until the reader is
+// closed, so a concurrent refresh cannot dispose the client mid-stream.
+type releasingReadCloser struct {
+	io.ReadCloser
+	once    sync.Once
+	release func()
+}
+
+func (r *releasingReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.once.Do(r.release)
+	return err
+}
+
 func (s *refreshingStore) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
-	inner, err := s.innerStore(ctx)
+	inner, release, err := s.acquireInner(ctx)
 	if err != nil {
 		return nil, err
 	}
+	rc, err := inner.Get(ctx, key, off, limit, getters...)
+	if err != nil {
+		release()
+		return nil, err
+	}
 	s.gets.Add(1)
-	return inner.Get(ctx, key, off, limit, getters...)
+	return &releasingReadCloser{ReadCloser: rc, release: release}, nil
 }
 
 func (s *refreshingStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
-	inner, err := s.innerStore(ctx)
+	inner, release, err := s.acquireInner(ctx)
 	if err != nil {
 		return err
 	}
+	defer release()
 	s.puts.Add(1)
 	return inner.Put(ctx, key, in, getters...)
 }
 
 func (s *refreshingStore) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
-	inner, err := s.innerStore(ctx)
+	inner, release, err := s.acquireInner(ctx)
 	if err != nil {
 		return err
 	}
+	defer release()
 	return inner.Delete(ctx, key, getters...)
 }
 
 func (s *refreshingStore) Head(ctx context.Context, key string) (object.Object, error) {
-	inner, err := s.innerStore(ctx)
+	inner, release, err := s.acquireInner(ctx)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	return inner.Head(ctx, key)
 }

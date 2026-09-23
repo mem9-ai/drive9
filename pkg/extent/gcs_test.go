@@ -202,6 +202,88 @@ func TestGCSDeleteIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestClosedStoreRefusesIO pins that every I/O entry point fails closed after
+// Shutdown instead of serving a released store.
+func TestClosedStoreRefusesIO(t *testing.T) {
+	rec := newShutdownRecorder(t)
+	st := &refreshingStore{inner: object.WithPrefix(rec, "t/x/"), cred: Credential{Scheme: SchemeGCS}}
+	st.Shutdown()
+	ctx := context.Background()
+	if _, err := st.Get(ctx, "k", 0, 0); !errors.Is(err, errExtentStoreClosed) {
+		t.Fatalf("Get err = %v, want %v", err, errExtentStoreClosed)
+	}
+	if err := st.Put(ctx, "k", strings.NewReader("x")); !errors.Is(err, errExtentStoreClosed) {
+		t.Fatalf("Put err = %v, want %v", err, errExtentStoreClosed)
+	}
+	if err := st.Delete(ctx, "k"); !errors.Is(err, errExtentStoreClosed) {
+		t.Fatalf("Delete err = %v, want %v", err, errExtentStoreClosed)
+	}
+	if _, err := st.Head(ctx, "k"); !errors.Is(err, errExtentStoreClosed) {
+		t.Fatalf("Head err = %v, want %v", err, errExtentStoreClosed)
+	}
+}
+
+// TestSupersededStoreRetiredOnlyWhenIdle pins the refcount: a store held by an
+// in-flight operation is not shut down by a refresh until the last holder
+// releases.
+func TestSupersededStoreRetiredOnlyWhenIdle(t *testing.T) {
+	ctx := context.Background()
+	rec := newShutdownRecorder(t)
+	st := &refreshingStore{
+		src:    staticCredentialSource{cred: &Credential{Scheme: SchemeGCS, Bucket: "bucket", AccessToken: "fresh", ExpiresAt: time.Now().Add(-time.Minute).Format(time.RFC3339)}},
+		inner:  object.WithPrefix(rec, "t/x/"),
+		cred:   Credential{Scheme: SchemeGCS},
+		scheme: SchemeGCS,
+	}
+	// First holder: the seeded credential has no expiry, so no refresh happens.
+	_, release1, err := st.acquireInner(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Make the current credential due so the next acquire refreshes.
+	st.mu.Lock()
+	st.cred.ExpiresAt = time.Now().Add(-time.Minute).Format(time.RFC3339)
+	st.mu.Unlock()
+
+	_, release2, err := st.acquireInner(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { object.Shutdown(st.inner) })
+	if got := rec.shutdowns.Load(); got != 0 {
+		t.Fatalf("superseded store shut down with a holder: %d", got)
+	}
+	release1()
+	if got := rec.shutdowns.Load(); got != 0 {
+		t.Fatalf("superseded store shut down with a holder: %d", got)
+	}
+	release2()
+	if got := rec.shutdowns.Load(); got != 1 {
+		t.Fatalf("superseded store shutdowns = %d, want 1", got)
+	}
+}
+
+// TestOpenStorageCanonicalScheme pins that the Cloud Storage scheme is
+// normalized: "gs" (the object-backend canonicalization) and "gcs" (the extent
+// wire value) both report "gcs", so String() and metric labels stay stable.
+func TestOpenStorageCanonicalScheme(t *testing.T) {
+	for _, scheme := range []string{"gcs", "gs", " GS ", "GCS"} {
+		t.Run(scheme, func(t *testing.T) {
+			st, err := OpenStorage(&Credential{Scheme: scheme, Bucket: "bucket", AccessToken: "tok"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rs := st.(*refreshingStore)
+			if rs.Scheme() != SchemeGCS {
+				t.Fatalf("Scheme() = %q, want %q", rs.Scheme(), SchemeGCS)
+			}
+			if rs.String() != "drive9-gcs" {
+				t.Fatalf("String() = %q", rs.String())
+			}
+		})
+	}
+}
+
 // TestGCSWriterUsesExtentChunkSize pins the upload chunk contract: a dropped
 // ChunkSize would otherwise only show up as buffered uploads in production.
 func TestGCSWriterUsesExtentChunkSize(t *testing.T) {
@@ -273,7 +355,10 @@ func TestRefreshDisposesSupersededStore(t *testing.T) {
 			scheme: SchemeGCS,
 		}
 		t.Cleanup(func() { object.Shutdown(st.inner) })
-		if _, err := st.innerStore(context.Background()); err != nil {
+		st.mu.Lock()
+		_, err := st.innerStoreLocked(context.Background())
+		st.mu.Unlock()
+		if err != nil {
 			t.Fatal(err)
 		}
 		if got := rec.shutdowns.Load(); got != 1 {
@@ -290,7 +375,10 @@ func TestRefreshDisposesSupersededStore(t *testing.T) {
 			cred:   Credential{Scheme: SchemeGCS, Bucket: "bucket", AccessToken: "old", ExpiresAt: expired},
 			scheme: SchemeGCS,
 		}
-		if _, err := st.innerStore(context.Background()); err == nil {
+		st.mu.Lock()
+		_, err := st.innerStoreLocked(context.Background())
+		st.mu.Unlock()
+		if err == nil {
 			t.Fatal("expected the refresh open to fail")
 		}
 		if got := rec.shutdowns.Load(); got != 0 {
