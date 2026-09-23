@@ -525,7 +525,7 @@ func TestCloseSyncCombinedModeLeavesOtherUploadsUnchanged(t *testing.T) {
 			fh, _ := createCloseSyncShadowTestFile(t, fs, "scope.txt", tc.mode)
 			fh.Lock()
 			tc.modify(fh)
-			st := fs.syncHandleToRemoteWithoutAppendLogLocked(t.Context(), fh)
+			st := fs.syncHandleToRemoteWithoutAppendLogLocked(t.Context(), fh, shadowUploadRemoteDurable)
 			fh.Unlock()
 			wantChmod := int32(1)
 			if tc.mode == 0o644 {

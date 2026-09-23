@@ -2,12 +2,14 @@ package fuse
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -22,6 +24,7 @@ type closeSyncTruncateTest struct {
 	mu        sync.Mutex
 	revision  int64
 	content   []byte
+	layout    string
 	beforePut func(http.ResponseWriter, []byte) bool
 }
 
@@ -48,12 +51,14 @@ func newCloseSyncTruncateTest(t *testing.T) *closeSyncTruncateTest {
 				return
 			}
 			test.content = body
+			test.layout = "single"
 			test.revision++
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": test.revision})
 		case http.MethodHead:
 			w.Header().Set("Content-Length", strconv.Itoa(len(test.content)))
 			w.Header().Set("X-Dat9-IsDir", "false")
 			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(test.revision, 10))
+			w.Header().Set("X-Dat9-Content-Layout", test.layout)
 		case http.MethodGet:
 			http.ServeContent(w, r, "race.txt", time.Time{}, bytes.NewReader(test.content))
 		default:
@@ -229,7 +234,8 @@ func TestCloseSyncPathTruncateWaitsForRemoteWithCleanHandle(t *testing.T) {
 			test := newCloseSyncTruncateTest(t)
 			entered := make(chan struct{})
 			proceed := make(chan struct{})
-			var once sync.Once
+			var once, enteredOnce sync.Once
+			var publications atomic.Int32
 			unblock := func() { once.Do(func() { close(proceed) }) }
 			defer unblock()
 			test.mu.Lock()
@@ -237,7 +243,8 @@ func TestCloseSyncPathTruncateWaitsForRemoteWithCleanHandle(t *testing.T) {
 				if len(body) != 0 {
 					t.Errorf("truncate uploaded %q", body)
 				}
-				close(entered)
+				publications.Add(1)
+				enteredOnce.Do(func() { close(entered) })
 				<-proceed
 				if fail {
 					w.WriteHeader(http.StatusForbidden)
@@ -269,11 +276,157 @@ func TestCloseSyncPathTruncateWaitsForRemoteWithCleanHandle(t *testing.T) {
 				t.Fatal("truncate did not finish")
 			}
 			test.release(test.old)
+			if got := publications.Load(); got != 1 {
+				t.Fatalf("truncate publications=%d, want 1", got)
+			}
 			if fail {
 				test.assertRemote(t, "seed", 1)
 			} else {
 				test.assertRemote(t, "", 2)
 			}
 		})
+	}
+}
+
+func TestCloseSyncPathTruncateRetiresRotatedShadow(t *testing.T) {
+	for _, size := range []int64{16, 48} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			test := newCloseSyncTruncateTest(t)
+			fs := test.fs
+			headerBytes := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
+			header, ok := parseSQLiteWALHeader(headerBytes)
+			if !ok {
+				t.Fatal("invalid test WAL header")
+			}
+			test.write(t, test.old, string(headerBytes))
+			test.flush(t, test.old)
+			fh, _ := fs.fileHandles.Get(test.old)
+			if err := fs.shadowStore.WriteFull(fh.Path, headerBytes, 2); err != nil {
+				t.Fatal(err)
+			}
+			fh.Lock()
+			fh.ShadowReady, fh.ShadowSpill = true, true
+			fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
+			// Use the actual generation-reset transition that leaves a clean
+			// handle with a superseded shadow claim and a new live shadow.
+			fs.rotateAppendLogGenerationShadowLocked(fh, fh.Path, header, 2)
+			fh.Unlock()
+			fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/race.txt"})
+			test.mu.Lock()
+			test.layout = "append_log"
+			test.mu.Unlock()
+			entry, _ := fs.inodes.GetEntry(fh.Ino)
+			handled, status := fs.rewriteAppendLogPathTruncate(context.Background(), entry, fh.Ino, test.header.Pid, size, nil)
+			if !handled || status != gofuse.OK {
+				t.Fatalf("path truncate: handled=%t status=%v", handled, status)
+			}
+			want := make([]byte, size)
+			copy(want, headerBytes)
+			test.assertRemote(t, string(want), 3)
+			if rev, gotSize := fh.appendLogCommittedBaseline(); rev != 3 || gotSize != size {
+				t.Errorf("append baseline=%d/%d, want 3/%d", rev, gotSize, size)
+			}
+			test.write(t, test.old, "x")
+			test.flush(t, test.old)
+			want[0] = 'x'
+			test.assertRemote(t, string(want), 4)
+		})
+	}
+}
+
+func TestCloseSyncPathTruncateDoesNotMutateNewerShadow(t *testing.T) {
+	test := newCloseSyncTruncateTest(t)
+	fs := test.fs
+	fh, _ := fs.fileHandles.Get(test.old)
+	if err := fs.shadowStore.WriteFull(fh.Path, []byte("old"), 1); err != nil {
+		t.Fatal(err)
+	}
+	fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
+	fh.ShadowReady, fh.ShadowSpill = true, true
+	if err := fs.shadowStore.WriteFull(fh.Path, []byte("newer writer"), 2); err != nil {
+		t.Fatal(err)
+	}
+	generation := fs.shadowStore.ActiveGeneration(fh.Path)
+	// Model an acknowledged path truncate while the shared store contains
+	// another writer's later generation. Passive adoption must not Ensure,
+	// Truncate, Remove or write through that generation.
+	test.mu.Lock()
+	test.content, test.revision = []byte("se"), 2
+	test.mu.Unlock()
+	fs.updateOpenHandleBaseRevision(fh.Path, 2, test.header.Pid, 2)
+	test.write(t, test.old, "x")
+	data, err := fs.shadowStore.ReadAllIfGeneration(fh.Path, generation)
+	if err != nil || string(data) != "newer writer" {
+		t.Fatalf("passive handle mutated newer shadow: %q, %v", data, err)
+	}
+}
+
+func TestCloseSyncPathTruncateRechecksOwnerAfterConcurrentFlush(t *testing.T) {
+	test := newCloseSyncTruncateTest(t)
+	test.write(t, test.old, "updated")
+	entered, proceed := make(chan struct{}), make(chan struct{})
+	var enteredOnce, proceedOnce sync.Once
+	unblock := func() { proceedOnce.Do(func() { close(proceed) }) }
+
+	testHookAfterCallerOwnedTruncateScan = func(path string) {
+		if path == "/race.txt" {
+			enteredOnce.Do(func() { close(entered) })
+			<-proceed
+		}
+	}
+	done := make(chan bool, 1)
+	t.Cleanup(func() {
+		unblock()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("truncate owner worker did not stop")
+		}
+		testHookAfterCallerOwnedTruncateScan = nil
+	})
+	go func() {
+		defer close(done)
+		done <- test.fs.adoptCallerOwnedInodeTruncate(test.header.NodeId, test.header.Pid, 0)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("truncate did not select an owner")
+	}
+	test.flush(t, test.old)
+	unblock()
+	select {
+	case adopted := <-done:
+		if adopted {
+			t.Fatal("truncate reused an owner whose Flush already completed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ownership recheck did not finish")
+	}
+	test.assertRemote(t, "updated", 2)
+	fh, _ := test.fs.fileHandles.Get(test.old)
+	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || fh.Dirty.Size() != 7 {
+		t.Fatal("ownership recheck dirtied or truncated the acknowledged handle")
+	}
+}
+
+func TestCloseSyncPathTruncateRebasesAppendLogState(t *testing.T) {
+	test := newCloseSyncTruncateTest(t)
+	fh, _ := test.fs.fileHandles.Get(test.old)
+	fh.appendLogRecordTruncate()
+	test.fs.updateOpenHandleBaseRevision(fh.Path, 2, test.header.Pid, 2)
+	if revision, size := fh.appendLogCommittedBaseline(); revision != 2 || size != 2 || fh.appendLog.hasRewriteBase {
+		t.Fatalf("append baseline=%d/%d rewriteBase=%t", revision, size, fh.appendLog.hasRewriteBase)
+	}
+}
+
+func TestCloseSyncPathTruncateClearsCleanSiblingRestoreCallbacks(t *testing.T) {
+	test := newCloseSyncTruncateTest(t)
+	fh, _ := test.fs.fileHandles.Get(test.old)
+	fh.Dirty.RestorePart = func(int) ([]byte, error) { t.Error("restored obsolete shadow"); return nil, nil }
+	fh.Dirty.OnPartFull = func(int, []byte) { t.Error("evicted to obsolete shadow") }
+	test.fs.syncOpenHandlesAfterPathTruncate(fh.Ino, 2)
+	if fh.Dirty.RestorePart != nil || fh.Dirty.OnPartFull != nil || fh.Dirty.HasDirtyParts() || fh.DirtySeq != 0 {
+		t.Fatal("clean sibling retained staging callbacks or became dirty")
 	}
 }
