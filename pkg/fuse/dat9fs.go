@@ -11872,16 +11872,22 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 			return gofuse.EIO
 		}
 
-		// Fill in the entry attributes
-		inoEntry, found := fs.inodes.GetEntry(e.Ino)
-		if found {
-			// A directory handle may outlive the pending generation it listed.
-			// Resolve local attributes again when publishing them to the kernel.
-			item, _ := fs.localDirEntryInfo(dirEntryChildPath(dh.Path, e.Name), cachedInfoFromEntry(e.Name, inoEntry), inoEntry, local)
-			inoEntry.Size = item.Size
-			inoEntry.Mtime = item.Mtime
-			inoEntry.Mode = item.Mode
-			inoEntry.HasMode = item.HasMode
+		// The pending snapshot predates this atomic inode/binding read. An
+		// old directory handle may still name A after the pathname names B;
+		// never publish B's path-keyed metadata on A's NodeId.
+		childP := dirEntryChildPath(dh.Path, e.Name)
+		inoEntry, bound := fs.inodes.dirEntryWithBinding(e.Ino, childP)
+		if inoEntry != nil {
+			if bound {
+				item, _ := fs.localDirEntryInfo(childP, cachedInfoFromEntry(e.Name, inoEntry), inoEntry, local)
+				inoEntry.Size = item.Size
+				inoEntry.Mtime = item.Mtime
+				inoEntry.Mode = item.Mode
+				inoEntry.HasMode = item.HasMode
+			} else if size, dirty := fs.dirtyHandleSize(e.Ino); dirty {
+				// A can still be written through its old FD or another alias.
+				inoEntry.Size = size
+			}
 			fs.fillEntryOut(inoEntry, entryOut)
 		}
 	}

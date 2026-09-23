@@ -327,7 +327,7 @@ jobs:
         continue-on-error: true
         env:
           DRIVE9_REQUIRE_KERNEL_FUSE: "1"
-        run: make test TEST_PKGS=./pkg/fuse TEST_RUN='^TestReadDirPlusPendingKernel$' TEST_TIMEOUT=2m
+        run: make test TEST_PKGS=./pkg/fuse TEST_RUN='^TestReadDirPlus(PendingKernel|ReplacedInodeKernel)$' TEST_TIMEOUT=2m
 
       - name: Run FUSE release gate
         id: fuse-smoke

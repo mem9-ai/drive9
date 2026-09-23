@@ -372,6 +372,20 @@ func (m *InodeToPath) GetEntry(ino uint64) (*InodeEntry, bool) {
 	return copyInodeEntryLocked(entry), true
 }
 
+// dirEntryWithBinding snapshots a directory entry's inode and its current
+// pathname binding atomically. Callers must capture path-keyed metadata before
+// this read and must not project it when bound is false. Namespace changes
+// since that capture are also fenced by the copied inode's attrVersion.
+func (m *InodeToPath) dirEntryWithBinding(ino uint64, path string) (entry *InodeEntry, bound bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	live, found := m.byInode[ino]
+	if !found {
+		return nil, false
+	}
+	return copyInodeEntryLocked(live), m.byPath[path] == ino
+}
+
 // Forget decrements the Nlookup count for the given inode by nlookup. Some
 // visible mappings are retained after lookup refs drop so later lookups can
 // preserve POSIX inode identity and local owner metadata across rename.
