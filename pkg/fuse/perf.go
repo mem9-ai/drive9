@@ -645,6 +645,8 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 	writePerfLine(w, "drive9: FUSE perf summary uptime=%s\n", snap.Uptime.Truncate(time.Millisecond))
 	writePerfOps(w, "fuse", perfFuseOpNames[:], snap.FuseOps)
 	writePerfOps(w, "remote", perfRemoteOpNames[:], snap.RemoteOps)
+	writePerfLine(w, "drive9: perf close_sync_mode_forbidden_fallback=%d\n",
+		snap.Counters["close_sync_mode_forbidden_fallback"])
 	writePerfLine(w, "drive9: perf cache read_hit=%d read_miss=%d dir_hit=%d dir_miss=%d prefetch_hit=%d prefetch_miss=%d\n",
 		snap.Counters["read_cache_hit"], snap.Counters["read_cache_miss"],
 		snap.Counters["dir_cache_hit"], snap.Counters["dir_cache_miss"],

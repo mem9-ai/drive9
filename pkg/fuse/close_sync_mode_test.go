@@ -1,11 +1,13 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -237,6 +239,11 @@ func TestCloseSyncCombinedModeForbiddenFallsBackWithoutBypassingPermissions(t *t
 			}
 			if got := fs.perf.snapshot().Counters["close_sync_mode_forbidden_fallback"]; got != 1 {
 				t.Fatalf("forbidden fallback counter=%d, want 1", got)
+			}
+			var summary bytes.Buffer
+			fs.perf.printSummary(&summary)
+			if !strings.Contains(summary.String(), "close_sync_mode_forbidden_fallback=1") {
+				t.Fatal("forbidden fallback missing from operator-visible perf summary")
 			}
 			if tc.putStatus == http.StatusOK {
 				// Match ordinary PUT-then-chmod: a failed chmod retains dirty
