@@ -941,8 +941,11 @@ func Mount(opts *MountOptions) (err error) {
 	reason, detail := classifyServeEnd(unmountWasRequested, opts.MountPoint)
 	shutdown()
 	waitServeClosed(serveDone, opts.MountPoint)
-	// Only now are no FUSE handlers left, so the extent runtime can be closed
-	// without racing a foreground operation that already holds it.
+	// Closing here is safe even though go-fuse does not join handler goroutines
+	// on every platform: closeExtentRuntime refuses new metadata RPCs and waits
+	// for the in-flight ones to drain, object I/O is protected by the store's
+	// refcount, and FlushAll stopped and joined the compaction loop. Handler
+	// goroutines therefore cannot use a closed session.
 	dat9fs.closeExtentRuntime()
 
 	uptime := time.Since(mountStartedAt).Round(time.Second)

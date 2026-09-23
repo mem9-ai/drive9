@@ -237,6 +237,11 @@ type Dat9FS struct {
 	// extentTornDown is set under extentMu when teardown starts; no extent
 	// runtime may be installed after it (see stopExtentRuntimeLoop).
 	extentTornDown bool
+	// extentBuilding single-flights the unlocked runtime build;
+	// extentBuildCond (initialised lazily under extentMu) wakes late callers
+	// when it finishes.
+	extentBuilding  bool
+	extentBuildCond *sync.Cond
 	// extentMisses caches "this path is not an extent file" so an
 	// extent-enabled mount does not pay a stat probe on every syscall against
 	// the classic files that share its glob (the mixed profile is the shape the

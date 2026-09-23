@@ -23,10 +23,15 @@ import (
 // runtime has been torn down and must not be re-created.
 var errExtentTornDown = errors.New("extent runtime: mount is tearing down")
 
-// extentRuntimeStartTimeout bounds the data-credential mint ensureExtentRuntime
-// performs while holding extentMu, so unmount cannot block indefinitely on a
-// stalled HTTP call.
-const extentRuntimeStartTimeout = 30 * time.Second
+// extentMetaCallTimeout bounds each non-blocking extent metadata RPC — the
+// mount's credential mint, runtime Init/Load/NewSession, and the compaction
+// loop's ClaimNextCompact — so a stalled endpoint cannot hang initialization or
+// unmount. Blocking Flock/Setlk are exempt inside Transport.Call.
+const extentMetaCallTimeout = 30 * time.Second
+
+// extentMetaDrainTimeout bounds closeExtentRuntime's wait for in-flight
+// metadata RPCs before it releases the session anyway (logged).
+const extentMetaDrainTimeout = 5 * time.Second
 
 // stopExtentRuntimeLoop marks the extent runtime torn down and stops and joins
 // its compaction loop. Teardown is marked under extentMu so a concurrent
@@ -65,7 +70,9 @@ func (fs *Dat9FS) closeExtentRuntime() {
 	// FUSE handler cannot use a closed one (the object store is refcounted
 	// separately).
 	if er.hold != nil {
-		er.hold.closeAndWait()
+		if !er.hold.closeAndWait(extentMetaDrainTimeout) {
+			safeLogPrintf("extent metadata drain timed out after %s; closing anyway", extentMetaDrainTimeout)
+		}
 	}
 	if err := extent.CloseRuntime(er.rt); err != nil {
 		safeLogPrintf("close extent runtime: %v", err)
@@ -106,19 +113,31 @@ func (h *extentMetaHold) leave() {
 	}
 }
 
-// closeAndWait refuses new RPCs and returns once the in-flight ones finish.
-func (h *extentMetaHold) closeAndWait() {
+// closeAndWait refuses new RPCs and returns once the in-flight ones finish, or
+// false after timeout. Teardown proceeds either way: the process is exiting.
+func (h *extentMetaHold) closeAndWait(timeout time.Duration) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.closed = true
+	deadline := time.Now().Add(timeout)
 	for h.active > 0 {
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return false
+		}
+		timer := time.AfterFunc(remain, func() {
+			h.mu.Lock()
+			h.cond.Broadcast()
+			h.mu.Unlock()
+		})
 		h.cond.Wait()
+		timer.Stop()
 	}
+	return true
 }
 
 type extentRuntime struct {
 	rt   *extent.Runtime
-	meta jfsmeta.Meta
 	hold *extentMetaHold
 	stop context.CancelFunc
 	// wg tracks the background compaction loop. FlushAll cancels it and then
@@ -130,22 +149,42 @@ type extentRuntime struct {
 
 func (fs *Dat9FS) ensureExtentRuntime() error {
 	fs.extentMu.Lock()
-	if fs.extentTornDown {
-		fs.extentMu.Unlock()
-		return errExtentTornDown
+	if fs.extentBuildCond == nil {
+		fs.extentBuildCond = sync.NewCond(&fs.extentMu)
 	}
-	if fs.extentRT.Load() != nil {
-		fs.extentMu.Unlock()
-		return nil
+	for {
+		if fs.extentTornDown {
+			fs.extentMu.Unlock()
+			return errExtentTornDown
+		}
+		if fs.extentRT.Load() != nil {
+			fs.extentMu.Unlock()
+			return nil
+		}
+		if !fs.extentBuilding {
+			// Single-flight: only the first caller builds; the rest wait for it
+			// rather than each constructing a full runtime with its own session.
+			fs.extentBuilding = true
+			break
+		}
+		fs.extentBuildCond.Wait()
 	}
 	fs.extentMu.Unlock()
 
-	// Build outside extentMu: the mint and the JuiceFS Init/Load/NewSession
-	// metadata calls all go to the network, and teardown must never wait on them.
+	// The build runs outside extentMu (the mint and the JuiceFS
+	// Init/Load/NewSession metadata calls go to the network, and teardown must
+	// never wait on them). Clear the single-flight flag on every path.
+	defer func() {
+		fs.extentMu.Lock()
+		fs.extentBuilding = false
+		fs.extentBuildCond.Broadcast()
+		fs.extentMu.Unlock()
+	}()
+
 	if fs.client == nil {
 		return fmt.Errorf("extent runtime: missing client")
 	}
-	mintCtx, mintCancel := context.WithTimeout(context.Background(), extentRuntimeStartTimeout)
+	mintCtx, mintCancel := context.WithTimeout(context.Background(), extent.CredentialMintTimeout)
 	cred, err := fs.client.GetDataCredential(mintCtx)
 	mintCancel()
 	if err != nil {
@@ -168,9 +207,9 @@ func (fs *Dat9FS) ensureExtentRuntime() error {
 	transport := extent.NewHTTPTransport(fs.client)
 	transport.Enter = hold.enter
 	transport.Leave = hold.leave
-	// Bound only initialization; clear the timeout before the runtime serves
-	// so blocking Flock/Setlk can wait indefinitely as designed.
-	transport.Timeout = extentRuntimeStartTimeout
+	// Bound the non-blocking metadata RPCs (blocking Flock/Setlk are exempt in
+	// Call). Set before NewRuntime publishes the transport to its goroutines.
+	transport.Timeout = extentMetaCallTimeout
 	rt, err := extent.NewRuntime(extent.RuntimeConfig{
 		CacheDir:  cacheDir,
 		CacheKey:  extent.CacheKeyForPrefix(cred.Prefix),
@@ -187,22 +226,20 @@ func (fs *Dat9FS) ensureExtentRuntime() error {
 		_ = extent.CloseRuntime(rt)
 		return fmt.Errorf("extent runtime: missing juicefs VFS")
 	}
-	// Initialization is done: drop the init-only timeout so the runtime's own
-	// metadata ops (blocking Flock/Setlk) can wait as designed.
-	transport.Timeout = 0
 	ctx, cancel := context.WithCancel(context.Background())
-	er := &extentRuntime{rt: rt, meta: rt.Meta, hold: hold, stop: cancel}
+	er := &extentRuntime{rt: rt, hold: hold, stop: cancel}
 
 	fs.extentMu.Lock()
-	defer fs.extentMu.Unlock()
 	if fs.extentTornDown {
 		// Teardown started while we were building: discard what we built.
+		fs.extentMu.Unlock()
 		cancel()
 		_ = extent.CloseRuntime(rt)
 		return errExtentTornDown
 	}
 	if fs.extentRT.Load() != nil {
 		// Another caller installed a runtime first: discard the duplicate.
+		fs.extentMu.Unlock()
 		cancel()
 		_ = extent.CloseRuntime(rt)
 		return nil
@@ -215,6 +252,7 @@ func (fs *Dat9FS) ensureExtentRuntime() error {
 		defer er.wg.Done()
 		fs.extentCompactLoop(ctx)
 	}()
+	fs.extentMu.Unlock()
 	return nil
 }
 

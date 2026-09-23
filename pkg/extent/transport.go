@@ -20,9 +20,9 @@ type MetaOpFunc func(ctx context.Context, op string, raw json.RawMessage) (json.
 type Transport struct {
 	CallFn MetaOpFunc
 	Delay  time.Duration
-	// Timeout bounds each meta RPC when > 0. Initialization sets it so an
-	// unresponsive endpoint cannot hang extent.NewRuntime; the runtime's
-	// ongoing transport leaves it zero so blocking Flock/Setlk can wait.
+	// Timeout bounds each non-blocking meta RPC when > 0. Blocking Flock/Setlk
+	// are exempt: they legitimately wait for the lock. It must be set before the
+	// transport is handed to extent.NewRuntime (never mutated afterwards).
 	Timeout time.Duration
 	// Enter/Leave, when set, bracket each meta RPC. A runtime sets them so its
 	// teardown can wait for in-flight metadata before closing the session.
@@ -97,7 +97,8 @@ func (t *Transport) Call(ctx jfsmeta.Context, op string, req, resp any) syscall.
 		std = ctx
 	}
 	httpCtx := context.WithoutCancel(std)
-	if t.Timeout > 0 {
+	// Bound non-blocking RPCs; blocking Flock/Setlk must be allowed to wait.
+	if !block && t.Timeout > 0 {
 		var cancel context.CancelFunc
 		httpCtx, cancel = context.WithTimeout(httpCtx, t.Timeout)
 		defer cancel()

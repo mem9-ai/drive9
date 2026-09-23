@@ -64,16 +64,19 @@ func TestExtentMetaHoldDrains(t *testing.T) {
 	if !h.enter() {
 		t.Fatal("first enter must be admitted")
 	}
-	done := make(chan struct{})
-	go func() { h.closeAndWait(); close(done) }()
+	drained := make(chan bool, 1)
+	go func() { drained <- h.closeAndWait(2 * time.Second) }()
 	select {
-	case <-done:
+	case <-drained:
 		t.Fatal("closeAndWait returned with an RPC in flight")
 	case <-time.After(50 * time.Millisecond):
 	}
 	h.leave()
 	select {
-	case <-done:
+	case ok := <-drained:
+		if !ok {
+			t.Fatal("closeAndWait must report drained after the RPC finished")
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("closeAndWait did not return after the RPC finished")
 	}

@@ -98,6 +98,14 @@ test:
 	fi; \
 	$(GO) test $$test_p_flag $$test_run_flag -tags "$(GO_TAGS)" -v -timeout $(TEST_TIMEOUT) $(TEST_PKGS)
 
+# Race-detector run for the extent lifecycle: teardown ordering and the
+# in-flight-holder guards are only observable under -race. Scoped to the extent
+# tests because pkg/fuse has pre-existing unrelated races elsewhere
+# (kernel_cache_bypass) that are not this change's concern.
+test-race:
+	$(GO) test -race -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/extent/...
+	$(GO) test -race -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/fuse/ -run 'TestExtent'
+
 # Run only failpoint-tagged tests through repository-wide instrumentation.
 # Do not run this concurrently with the normal test target because failpoint-ctl
 # rewrites the source tree while the tests are running.

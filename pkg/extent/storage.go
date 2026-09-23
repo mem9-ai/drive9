@@ -36,9 +36,9 @@ const (
 	// tenant that started in the same instant (rolling restart, fleet-wide
 	// remount) calls AssumeRole in the same instant.
 	credentialRefreshJitter = time.Minute
-	// credentialRefreshTimeout bounds the refresh mint, which runs under s.mu and
-	// would otherwise stall Shutdown on a stalled HTTP call.
-	credentialRefreshTimeout = 30 * time.Second
+	// CredentialMintTimeout bounds a credential mint. It is exported so the
+	// mount's runtime initialization uses the same policy.
+	CredentialMintTimeout = 30 * time.Second
 	// jfsS3VHostStyleEnv is JuiceFS's only path-style switch
 	// (pkg/object/s3.go defaultPathStyle): unset/"0"/"false" selects path
 	// style, anything else virtual-host style. JuiceFS reads it once per
@@ -398,7 +398,7 @@ func (s *refreshingStore) innerStoreLocked(ctx context.Context) (object.ObjectSt
 	start := time.Now()
 	// Bound the mint: it runs under s.mu, so an unbounded call would also stall
 	// Shutdown.
-	mintCtx, mintCancel := context.WithTimeout(ctx, credentialRefreshTimeout)
+	mintCtx, mintCancel := context.WithTimeout(ctx, CredentialMintTimeout)
 	defer mintCancel()
 	next, err := s.src.GetDataCredential(mintCtx)
 	if err != nil {

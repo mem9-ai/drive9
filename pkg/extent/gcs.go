@@ -51,7 +51,8 @@ func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint strin
 	if bucket == "" {
 		return nil, fmt.Errorf("gcs bucket is required")
 	}
-	if strings.TrimSpace(accessToken) == "" {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
 		return nil, fmt.Errorf("gcs access token is required")
 	}
 	opts := []option.ClientOption{
@@ -68,6 +69,10 @@ func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint strin
 		if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
 			return nil, fmt.Errorf("gcs endpoint %q is plaintext; a bearer credential requires https except on loopback", endpoint)
 		}
+		// googleapi.ResolveRelative merges the request path, which drops the
+		// last base segment when the base has no trailing slash; normalise so a
+		// slash-less base path cannot silently misroute.
+		endpoint = strings.TrimRight(endpoint, "/") + "/"
 		opts = append(opts, option.WithEndpoint(endpoint))
 	}
 	client, err := storage.NewClient(ctx, opts...)

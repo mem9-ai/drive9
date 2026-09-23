@@ -153,8 +153,9 @@ func TestGCSStoreHonoursEndpointAndPresentsToken(t *testing.T) {
 		Scheme:      SchemeGCS,
 		Bucket:      "bucket",
 		AccessToken: "downscoped-token",
-		// The endpoint is the JSON API base path, not a bare host.
-		Endpoint: url + "/storage/v1/",
+		// Slash-less base path: it must be normalised so requests still land
+		// under /storage/v1/b/.
+		Endpoint: url + "/storage/v1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -281,7 +282,8 @@ func TestGCSEndpointValidation(t *testing.T) {
 	}
 	for _, endpoint := range []string{
 		"https://emulator.example/storage/v1/",
-		"http://127.0.0.1:9000/storage/v1/", // loopback emulator
+		"https://emulator.example/storage/v1", // no trailing slash: normalised, not rejected
+		"http://127.0.0.1:9000/storage/v1/",   // loopback emulator
 	} {
 		t.Run("accept "+endpoint, func(t *testing.T) {
 			gs, err := newGCSTokenStorage(ctx, "bucket", "tok", endpoint)

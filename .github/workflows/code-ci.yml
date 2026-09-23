@@ -53,6 +53,9 @@ jobs:
       - name: Test
         run: make test TEST_TIMEOUT=25m
 
+      - name: Test (race)
+        run: make test-race TEST_TIMEOUT=15m
+
       - name: Cleanup test containers
         if: always()
         run: docker rm -f $(docker ps -aq --filter "ancestor=pingcap/tidb") 2>/dev/null || true
