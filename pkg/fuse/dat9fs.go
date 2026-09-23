@@ -17200,7 +17200,6 @@ func (fs *Dat9FS) FlushAll() {
 		fs.perf.printSummary(os.Stderr)
 	}
 
-	fs.closeExtentRuntime()
 }
 
 // StatFs reports a generous virtual capacity so that apps (Obsidian, Finder)

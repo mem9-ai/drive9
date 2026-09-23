@@ -551,6 +551,10 @@ func (fs *Dat9FS) extentRename(cancel <-chan struct{}, input *gofuse.RenameIn, o
 	if err := fs.ensureExtentRuntime(); err != nil {
 		return gofuse.EIO
 	}
+	er := fs.extentRT.Load()
+	if er == nil || er.rt == nil {
+		return gofuse.EIO
+	}
 	std, cf := fuseCtx(cancel)
 	defer cf()
 	_, newInfo, pre := fs.renamePreflight(std, input, oldP, newP)
@@ -596,10 +600,6 @@ func (fs *Dat9FS) extentRename(cancel <-chan struct{}, input *gofuse.RenameIn, o
 		marked, opened, _ = fs.markOpenHandlesUnlinked(std, newP, false)
 	} else if err := fs.snapshotOpenHandlesBeforePathReplacement(std, newP); err != nil {
 		return httpToFuseStatus(err)
-	}
-	er := fs.extentRT.Load()
-	if er == nil || er.rt == nil {
-		return gofuse.EIO
 	}
 	sid := er.rt.SessionID
 	var resp struct {

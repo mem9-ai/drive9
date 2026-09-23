@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -42,8 +43,9 @@ type gcsTokenStorage struct {
 // (e.g. https://storage.googleapis.com/storage/v1/, or an emulator's
 // .../storage/v1/), not a bare host: it replaces the generated client's
 // BasePath verbatim and receives the bearer token, so it is a trusted
-// control-plane value. Anything without an http(s) scheme and a path fails
-// closed.
+// control-plane value. It must be https with a path; plaintext http is accepted
+// only on loopback (a local emulator, where the credential never leaves the
+// box). Reads use the JSON API so this base path is honoured.
 func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint string) (*gcsTokenStorage, error) {
 	bucket = strings.TrimSpace(bucket)
 	if bucket == "" {
@@ -54,11 +56,17 @@ func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint strin
 	}
 	opts := []option.ClientOption{
 		option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: accessToken})),
+		// Read through the JSON API: the XML read path drops the configured
+		// /storage/v1/ base path, so Head could succeed while Get failed.
+		storage.WithJSONReads(),
 	}
 	if endpoint = strings.TrimSpace(endpoint); endpoint != "" {
 		u, err := url.Parse(endpoint)
 		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || strings.Trim(u.Path, "/") == "" {
-			return nil, fmt.Errorf("gcs endpoint %q must be an http(s) JSON API base path, not a bare host", endpoint)
+			return nil, fmt.Errorf("gcs endpoint %q must be an https JSON API base path, not a bare host", endpoint)
+		}
+		if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+			return nil, fmt.Errorf("gcs endpoint %q is plaintext; a bearer credential requires https except on loopback", endpoint)
 		}
 		opts = append(opts, option.WithEndpoint(endpoint))
 	}
@@ -67,6 +75,16 @@ func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint strin
 		return nil, fmt.Errorf("gcs client: %w", err)
 	}
 	return &gcsTokenStorage{client: client, bucket: bucket}, nil
+}
+
+// isLoopbackHost reports whether host is a loopback name or address, the only
+// place a plaintext endpoint is tolerated: the credential never leaves the box.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (g *gcsTokenStorage) String() string { return "gs://" + g.bucket + "/" }

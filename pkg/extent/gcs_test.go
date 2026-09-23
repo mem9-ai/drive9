@@ -263,29 +263,34 @@ func TestSupersededStoreRetiredOnlyWhenIdle(t *testing.T) {
 	}
 }
 
-// TestGCSEndpointValidation pins that a gcs endpoint must be an http(s) JSON
-// API base path: a bare host would receive the bearer token at a URL with no
-// API root.
+// TestGCSEndpointValidation pins the gcs endpoint contract: an https JSON API
+// base path, with plaintext allowed only on loopback.
 func TestGCSEndpointValidation(t *testing.T) {
 	ctx := context.Background()
 	for _, endpoint := range []string{
-		"http://127.0.0.1:9000",
-		"https://storage.googleapis.com",
-		"ftp://host/storage/v1/",
+		"http://127.0.0.1:9000",              // bare host, no API root
+		"https://storage.googleapis.com",     // bare host, no API root
+		"ftp://host/storage/v1/",             // unsupported scheme
+		"http://storage.example/storage/v1/", // plaintext off loopback
 	} {
-		t.Run(endpoint, func(t *testing.T) {
+		t.Run("reject "+endpoint, func(t *testing.T) {
 			if _, err := newGCSTokenStorage(ctx, "bucket", "tok", endpoint); err == nil {
 				t.Fatalf("endpoint %q must be rejected", endpoint)
 			}
 		})
 	}
-	t.Run("valid base path", func(t *testing.T) {
-		gs, err := newGCSTokenStorage(ctx, "bucket", "tok", "https://emulator.example/storage/v1/")
-		if err != nil {
-			t.Fatal(err)
-		}
-		gs.Shutdown()
-	})
+	for _, endpoint := range []string{
+		"https://emulator.example/storage/v1/",
+		"http://127.0.0.1:9000/storage/v1/", // loopback emulator
+	} {
+		t.Run("accept "+endpoint, func(t *testing.T) {
+			gs, err := newGCSTokenStorage(ctx, "bucket", "tok", endpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gs.Shutdown()
+		})
+	}
 }
 
 // TestOpenStorageCanonicalScheme pins that the Cloud Storage scheme is

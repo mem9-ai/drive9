@@ -79,19 +79,24 @@ type extentRuntime struct {
 
 func (fs *Dat9FS) ensureExtentRuntime() error {
 	fs.extentMu.Lock()
-	defer fs.extentMu.Unlock()
 	if fs.extentTornDown {
+		fs.extentMu.Unlock()
 		return errExtentTornDown
 	}
 	if fs.extentRT.Load() != nil {
+		fs.extentMu.Unlock()
 		return nil
 	}
+	fs.extentMu.Unlock()
+
+	// Build outside extentMu: the mint and the JuiceFS Init/Load/NewSession
+	// metadata calls all go to the network, and teardown must never wait on them.
 	if fs.client == nil {
 		return fmt.Errorf("extent runtime: missing client")
 	}
 	mintCtx, mintCancel := context.WithTimeout(context.Background(), extentRuntimeStartTimeout)
-	defer mintCancel()
 	cred, err := fs.client.GetDataCredential(mintCtx)
+	mintCancel()
 	if err != nil {
 		return fmt.Errorf("data credential: %w", err)
 	}
@@ -124,14 +129,25 @@ func (fs *Dat9FS) ensureExtentRuntime() error {
 		_ = extent.CloseRuntime(rt)
 		return fmt.Errorf("extent runtime: missing juicefs VFS")
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	er := &extentRuntime{rt: rt, meta: rt.Meta, stop: cancel}
+
+	fs.extentMu.Lock()
+	defer fs.extentMu.Unlock()
+	if fs.extentTornDown {
+		// Teardown started while we were building: discard what we built.
+		cancel()
+		_ = extent.CloseRuntime(rt)
+		return errExtentTornDown
+	}
+	if fs.extentRT.Load() != nil {
+		// Another caller installed a runtime first: discard the duplicate.
+		cancel()
+		_ = extent.CloseRuntime(rt)
+		return nil
+	}
 	fmt.Fprintf(os.Stderr, "drive9: extent juicefs cache-dir=%s buffer-size=%d\n",
 		rt.ChunkConf.CacheDir, rt.ChunkConf.BufferSize)
-	ctx, cancel := context.WithCancel(context.Background())
-	er := &extentRuntime{
-		rt:   rt,
-		meta: rt.Meta,
-		stop: cancel,
-	}
 	fs.extentRT.Store(er)
 	er.wg.Add(1)
 	go func() {

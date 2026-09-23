@@ -941,6 +941,9 @@ func Mount(opts *MountOptions) (err error) {
 	reason, detail := classifyServeEnd(unmountWasRequested, opts.MountPoint)
 	shutdown()
 	waitServeClosed(serveDone, opts.MountPoint)
+	// Only now are no FUSE handlers left, so the extent runtime can be closed
+	// without racing a foreground operation that already holds it.
+	dat9fs.closeExtentRuntime()
 
 	uptime := time.Since(mountStartedAt).Round(time.Second)
 	pendingFiles, pendingBytes := 0, int64(0)
