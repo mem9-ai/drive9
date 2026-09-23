@@ -68,28 +68,31 @@ func TestExtentMetaHoldDrains(t *testing.T) {
 	if !h.enter(jfsmeta.Drive9OpLookup) {
 		t.Fatal("first enter must be admitted")
 	}
-	closed := make(chan bool, 1)
-	go func() { closed <- h.closeAndWait(2 * time.Second) }()
-	select {
-	case <-closed:
-		t.Fatal("closeAndWait returned with an RPC in flight")
-	case <-time.After(50 * time.Millisecond):
+	// A zero-timeout close closes the gate synchronously but must report that the
+	// in-flight RPC was not drained yet.
+	if h.closeAndWait(0) {
+		t.Fatal("closeAndWait(0) must report a timeout while an RPC is in flight")
 	}
 	if h.enter(jfsmeta.Drive9OpLookup) {
-		t.Fatal("a late non-cleanup RPC must be refused once teardown starts")
+		t.Fatal("a late non-cleanup RPC must be refused once the gate is closed")
 	}
 	if !h.enter(jfsmeta.Drive9OpCleanStaleSession) {
 		t.Fatal("the session-cleanup RPC must be admitted through the closed gate")
 	}
 	h.leave() // the cleanup RPC
+
+	// The original lookup is still in flight: a real closeAndWait returns true
+	// only after it finishes.
+	closed := make(chan bool, 1)
+	go func() { closed <- h.closeAndWait(2 * time.Second) }()
 	h.leave() // the pre-teardown RPC
 	select {
 	case ok := <-closed:
 		if !ok {
-			t.Fatal("closeAndWait must report drained after the RPCs finished")
+			t.Fatal("closeAndWait must report drained after the RPC finished")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("closeAndWait did not return after the RPCs finished")
+		t.Fatal("closeAndWait did not return after the RPC finished")
 	}
 	if h.enter(jfsmeta.Drive9OpLookup) {
 		t.Fatal("a non-cleanup RPC must stay refused")
