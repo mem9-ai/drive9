@@ -74,10 +74,10 @@ type dirCacheEntry struct {
 	// older value is superseded by whatever changed since.
 	gen uint64
 
-	// installGen is the request generation of the newest listing install this
-	// entry accepted. A response taken before it is stale for every name that
-	// install could have carried, so its items are not applied.
-	installGen uint64
+	// installSeq is the request sequence of the newest listing install this
+	// entry accepted. A response whose request predates it is stale for every
+	// name that install could have carried, so its items are not applied.
+	installSeq uint64
 
 	// localGen stamps each name this mount wrote or removed with the clock
 	// value at that moment. A listing response describes the directory as of
@@ -110,25 +110,26 @@ type DirCache struct {
 	// that can invalidate an in-flight read, so a generation a token holds can
 	// never recur.
 	gen uint64
-	// retired is a per-directory watermark recording that a directory was
-	// retired, and at which fencing value. It outlives the entry it retired:
-	// without it, dropping the entry would erase the very fact an in-flight
-	// read needs, that its directory changed while the read was outstanding.
-	//
-	// It is deliberately not time-bounded. There is no client-side deadline on
-	// a list request, so no wall-clock window can promise to cover one, and a
-	// response arriving after the window would be reinstated as though nothing
-	// had happened. The watermark is instead superseded only by strictly newer
-	// activity in the same directory, which is exactly when it stops mattering.
-	//
-	// Reclaiming the map: that limited-time reasoning was the reason for one
-	// entry per invalidated path to look like a leak. It is bounded by the
-	// directories a mount actually invalidates, and it holds one uint64 each;
-	// a mount that invalidates a million distinct paths pays eight megabytes
-	// for a fence that cannot be defeated. Trading that for a bounded-looking
-	// map that fails open under load is the wrong way round for a correctness
-	// guard, so the watermark stays until the directory moves on.
+	// inFlight counts uncompleted remote reads per directory. It is the
+	// lifetime of every piece of reconciliation state below: a per-name stamp or
+	// a retirement watermark only matters to a request that was already issued
+	// when it was written, so once no request is outstanding for a directory
+	// nothing can still observe them and they are released. That bound is the
+	// mount's concurrency, so none of this grows with the number of directories
+	// a mount has ever touched.
+	inFlight map[string]int
+	// retired is the retirement watermark for directories that have a request
+	// in flight, recording that the directory changed out from under it. It
+	// exists only for those directories: an invalidation with nothing
+	// outstanding has no reader to fence, so it records nothing.
 	retired map[string]uint64
+}
+
+// requestRef is shared by a request token and the cache so a token can be
+// released more than once (an install plus a deferred release, say) without
+// double-counting.
+type requestRef struct {
+	released bool
 }
 
 // NewDirCache creates a new DirCache with the given TTL.
@@ -150,6 +151,7 @@ func NewNamespaceCache(ttl, negativeTTL time.Duration, maxEntries int) *DirCache
 	}
 	return &DirCache{
 		entries:     make(map[string]*dirCacheEntry),
+		inFlight:    make(map[string]int),
 		retired:     make(map[string]uint64),
 		ttl:         ttl,
 		negativeTTL: negativeTTL,
@@ -181,7 +183,11 @@ func (dc *DirCache) Get(dirPath string) ([]CachedFileInfo, bool) {
 
 // Put stores directory entries in the cache with an expiration of now + ttl.
 func (dc *DirCache) Put(dirPath string, items []CachedFileInfo) {
-	dc.PutListing(dirPath, items, dc.Generation(dirPath))
+	// A caller with no request of its own still installs under a registered
+	// request, so the token's lifetime rules apply uniformly.
+	request := dc.BeginRequest(dirPath)
+	dc.PutListing(dirPath, items, request)
+	dc.EndRequest(request)
 }
 
 // PutListing merges a directory listing response into the cache, given the
@@ -217,7 +223,7 @@ func (dc *DirCache) Put(dirPath string, items []CachedFileInfo) {
 //   - A name this mount changed after requestGen keeps its local state; the
 //     response item does not overwrite it (nor contribute to the view).
 //   - A name this mount removed after requestGen stays removed.
-func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGen uint64) []CachedFileInfo {
+func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request RequestToken) []CachedFileInfo {
 	if dc == nil || dirPath == "" {
 		return items
 	}
@@ -229,7 +235,10 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 	// retirement removed (an SSE reset discards the whole directory). It may
 	// answer the request that issued it, but republishing it into the cache
 	// would undo the invalidation until the entry lapsed on its own.
-	if retired := dc.retired[dirPath]; requestGen < retired {
+	if retired := dc.retired[dirPath]; request.seq < retired {
+		// The request is settled (its response is served) even though nothing is
+		// installed, so it releases like any other completion.
+		dc.releaseRequestLocked(request)
 		return items
 	}
 	if old, ok := dc.entries[dirPath]; ok && old != nil {
@@ -247,7 +256,13 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 	// after the request was taken are carried over: the ones the response
 	// cannot know about. This is also the escape hatch for a remote deletion
 	// that no invalidation reported (see the trade-off in the doc comment).
-	listingLapsed := !entry.complete || entry.completeExpires.IsZero()
+	//
+	// The test is the lapsed shape specifically: an install set `complete` and
+	// expiry clearing it, so `complete` still holds while the deadline is gone.
+	// An entry that never held a listing is not lapsed — its names are this
+	// mount's own knowledge, which the response cannot speak for either, so
+	// they stay.
+	listingLapsed := entry.complete && entry.completeExpires.IsZero()
 	if listingLapsed {
 		keptItems := make(map[string]CachedFileInfo, len(entry.items))
 		keptOrder := make([]string, 0, len(entry.items))
@@ -256,7 +271,7 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 			if !live {
 				continue
 			}
-			if stamp := entry.localGen[name]; stamp > requestGen {
+			if stamp := entry.localGen[name]; stamp > request.event {
 				keptItems[name] = item
 				keptOrder = append(keptOrder, name)
 			}
@@ -279,13 +294,21 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 	// describe each name at an older revision than the cache already has. Its
 	// cache effect is limited to names it is still the newest word on, and the
 	// caller is served the accepted state either way.
-	staleInstall := entry.installGen > requestGen
+	staleInstall := entry.installSeq > request.seq
 
-	served := make(map[string]CachedFileInfo, len(items)+len(entry.items))
+	// Names the cache held before this install. They are served to this request
+	// even if the merge has to evict one for room: the reply must not omit a
+	// name the cache was holding, and the pending overlay cannot restore a
+	// committed child the way it restores an in-flight one.
+	prior := make(map[string]CachedFileInfo, len(entry.items))
+	for name, item := range entry.items {
+		prior[name] = item
+	}
+	served := make(map[string]CachedFileInfo, len(items)+len(prior))
 	complete := len(items) <= dc.maxEntries
 	for i := 0; i < len(items); i++ {
 		item := items[i]
-		if stamp, changed := entry.localGen[item.Name]; changed && stamp > requestGen {
+		if stamp, changed := entry.localGen[item.Name]; changed && stamp > request.event {
 			// This mount wrote or removed the name after the request was
 			// taken; the response cannot speak for it.
 			if local, live := entry.items[item.Name]; live {
@@ -309,8 +332,13 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 		}
 		served[item.Name] = item
 	}
+	for name, item := range prior {
+		if _, already := served[name]; !already {
+			served[name] = item
+		}
+	}
 	for name, item := range entry.items {
-		if _, fromResponse := served[name]; !fromResponse {
+		if _, already := served[name]; !already {
 			served[name] = item
 		}
 	}
@@ -329,8 +357,11 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 	entry.gen = dc.nextGenerationLocked()
 	if !staleInstall {
 		// This install is now the newest word on the directory's names.
-		entry.installGen = requestGen
+		entry.installSeq = request.seq
 	}
+	// Releasing here is what retires this request's stamps once it was the last
+	// one outstanding.
+	dc.releaseRequestLocked(request)
 
 	// Emit in the cache's order so the reply matches what a later readdir would
 	// serve, then append the rest deterministically.
@@ -396,21 +427,91 @@ func (dc *DirCache) Lookup(parentPath, name string) namespaceLookupResult {
 // same-revision observation that carries newer metadata.
 //
 // The zero value carries no ordering information, so Observe discards it.
-type ObservationToken struct {
-	dir   string
-	gen   uint64
+type RequestToken struct {
+	dir string
+	// seq is unique per request and increasing, so two requests can be ordered
+	// against each other even when nothing else happened between them.
+	seq uint64
+	// event is the directory's fencing value when the request was issued. An
+	// observation applies only while it is unchanged: unlike seq this is
+	// advanced by events (installs, local writes, removals, retirements) and
+	// not by other requests merely starting, so concurrent reads of one
+	// directory do not supersede each other.
+	event uint64
+	ref   *requestRef
 	valid bool
 }
 
-// BeginObservation captures the token for a remote read of one child under
-// dirPath. Call it immediately before issuing the request.
-func (dc *DirCache) BeginObservation(dirPath string) ObservationToken {
+// BeginRequest registers a remote read of dirPath and returns the token that
+// identifies it. Call it immediately before issuing the request and release the
+// token with EndRequest when the request settles (installing a listing releases
+// it implicitly).
+//
+// Registration is what bounds the cache's reconciliation state: the per-name
+// stamps and the directory's retirement watermark are only meaningful to a read
+// that was already outstanding when they were written, so the last completing
+// request for a directory releases them. Nothing accumulates per path a mount
+// has merely invalidated or probed.
+func (dc *DirCache) BeginRequest(dirPath string) RequestToken {
 	if dc == nil || dirPath == "" {
-		return ObservationToken{}
+		return RequestToken{}
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	return ObservationToken{dir: dirPath, gen: dc.generationLocked(dirPath), valid: true}
+	if dc.inFlight == nil {
+		dc.inFlight = make(map[string]int)
+	}
+	dc.inFlight[dirPath]++
+	return RequestToken{
+		dir:   dirPath,
+		seq:   dc.nextGenerationLocked(),
+		event: dc.generationLocked(dirPath),
+		ref:   &requestRef{},
+		valid: true,
+	}
+}
+
+// EndRequest releases a token whose request produced no install. Safe to call
+// more than once and after an install, which releases the same token.
+func (dc *DirCache) EndRequest(token RequestToken) {
+	if dc == nil || !token.valid {
+		return
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	dc.releaseRequestLocked(token)
+}
+
+// releaseRequestLocked retires one outstanding read and, when it was the last
+// for that directory, reclaims the reconciliation state only it could observe.
+// Caller holds dc.mu.
+func (dc *DirCache) releaseRequestLocked(token RequestToken) {
+	if !token.valid || token.ref == nil || token.ref.released {
+		return
+	}
+	token.ref.released = true
+	if dc.inFlight != nil {
+		if n := dc.inFlight[token.dir]; n > 1 {
+			dc.inFlight[token.dir] = n - 1
+			return
+		}
+		delete(dc.inFlight, token.dir)
+	}
+	// Nothing is outstanding for this directory, so no response can still be
+	// waiting to consult its stamps or watermark.
+	delete(dc.retired, token.dir)
+	if entry, ok := dc.entries[token.dir]; ok && entry != nil {
+		entry.reclaimReconciliationLocked()
+	}
+}
+
+// reclaimReconciliationLocked drops per-name state that only an outstanding
+// request could have needed. Caller holds dc.mu.
+func (e *dirCacheEntry) reclaimReconciliationLocked() {
+	if e == nil {
+		return
+	}
+	e.localGen = make(map[string]uint64)
 }
 
 // Observe records a child entry learned from a remote read (a stat/HEAD
@@ -432,7 +533,7 @@ func (dc *DirCache) BeginObservation(dirPath string) ObservationToken {
 //   - entry absent and none was cached      -> apply: no event has touched this
 //     directory, so the read is the freshest information there is. A later
 //     creation always takes a fresh generation, so this cannot race one.
-func (dc *DirCache) Observe(parentPath string, item CachedFileInfo, token ObservationToken) {
+func (dc *DirCache) Observe(parentPath string, item CachedFileInfo, token RequestToken) {
 	if item.Name == "" || dc == nil {
 		return
 	}
@@ -446,12 +547,13 @@ func (dc *DirCache) Observe(parentPath string, item CachedFileInfo, token Observ
 	// retirement advances that value too, so a read outstanding across an
 	// invalidation is discarded rather than allowed to recreate the directory
 	// from stale knowledge.
-	if dc.generationLocked(parentPath) != token.gen {
+	if dc.generationLocked(parentPath) != token.event {
 		// The read still proves the name exists, which is all an ENOENT marker
 		// denies.
 		if entry, ok := dc.entries[parentPath]; ok && entry != nil {
 			delete(entry.negatives, item.Name)
 		}
+		dc.releaseRequestLocked(token)
 		return
 	}
 	entry := dc.ensureEntryLocked(parentPath)
@@ -459,10 +561,12 @@ func (dc *DirCache) Observe(parentPath string, item CachedFileInfo, token Observ
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
 	// An observation is still this mount's knowledge of the name, stamped now
-	// so a response taken before it cannot overwrite it.
+	// so a response taken before it cannot overwrite it. The stamp is released
+	// with the request, so it lives only as long as something can consult it.
 	stamp := dc.nextGenerationLocked()
 	entry.gen = stamp
 	entry.localGen[item.Name] = stamp
+	dc.releaseRequestLocked(token)
 }
 
 // Upsert records or refreshes a known child entry for a parent.
@@ -494,7 +598,7 @@ func (dc *DirCache) upsertInternal(parentPath string, item CachedFileInfo) {
 	stamp := dc.nextGenerationLocked()
 	entry.gen = stamp
 	entry.localGen[item.Name] = stamp
-	entry.upsertWithAuthority(item, dc.maxEntries, true)
+	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
 }
 
@@ -709,10 +813,12 @@ func (dc *DirCache) invalidateEntryLocked(dirPath string) {
 	// it: a read that began against the retired entry has to be able to tell
 	// that the directory changed while it was outstanding.
 	delete(dc.entries, dirPath)
-	if dc.retired == nil {
-		dc.retired = make(map[string]uint64)
+	// A retirement only has to fence reads that were already outstanding. With
+	// none, there is nothing to remember: recording one per invalidated path
+	// would grow with the mount's history rather than its concurrency.
+	if dc.inFlight != nil && dc.inFlight[dirPath] > 0 {
+		dc.retireLocked(dirPath)
 	}
-	dc.retireLocked(dirPath)
 }
 
 func newDirCacheEntry() *dirCacheEntry {
@@ -778,25 +884,6 @@ func (dc *DirCache) nextGenerationLocked() uint64 {
 	return dc.gen
 }
 
-// Generation hands a caller about to issue a remote read a value identifying
-// that request. Hand it back on install (PutListing) or completion (Observe) so
-// the cache can tell whether anything has overtaken it.
-//
-// The value comes from the clock and advances it, so every call is unique and
-// later calls sort after earlier ones. That uniqueness is what orders two
-// overlapping requests against each other: reporting the directory's
-// last-event value instead would give two requests issued between the same pair
-// of events the same value, and an older response could then be mistaken for
-// the newer one.
-func (dc *DirCache) Generation(dirPath string) uint64 {
-	if dc == nil || dirPath == "" {
-		return 0
-	}
-	dc.mu.Lock()
-	defer dc.mu.Unlock()
-	return dc.nextGenerationLocked()
-}
-
 func (dc *DirCache) getEntryLocked(dirPath string, now time.Time) (*dirCacheEntry, bool) {
 	entry, ok := dc.entries[dirPath]
 	if !ok {
@@ -820,14 +907,6 @@ func (dc *DirCache) getEntryLocked(dirPath string, now time.Time) (*dirCacheEntr
 // server can simply list again. If every name is locally owned, the incoming
 // item is not cached at all.
 func (e *dirCacheEntry) upsert(item CachedFileInfo, maxEntries int) (evicted bool) {
-	return e.upsertWithAuthority(item, maxEntries, false)
-}
-
-// upsertWithAuthority is upsert for an authoritative local write. Such a name is
-// admitted even when every cached name is locally owned: a committed child must
-// never be hidden from readdir, so the cap yields to it rather than the other
-// way round.
-func (e *dirCacheEntry) upsertWithAuthority(item CachedFileInfo, maxEntries int, authoritative bool) (evicted bool) {
 	if item.Name == "" {
 		return false
 	}
@@ -839,34 +918,24 @@ func (e *dirCacheEntry) upsertWithAuthority(item CachedFileInfo, maxEntries int,
 	}
 	if _, exists := e.items[item.Name]; !exists {
 		if maxEntries > 0 && len(e.items) >= maxEntries {
-			victim := -1
-			for i, name := range e.order {
-				if _, local := e.localGen[name]; !local {
-					victim = i
-					break
-				}
+			if len(e.order) == 0 {
+				return true
 			}
-			if victim < 0 {
-				// Every cached name is locally owned, so nothing may be
-				// displaced. An authoritative local write is still admitted
-				// (kept past the cap); a server-listed name simply is not
-				// cached, since the server can list it again.
-				if !authoritative {
-					return true
-				}
-			} else {
-				evict := e.order[victim]
-				e.order = append(e.order[:victim], e.order[victim+1:]...)
-				delete(e.items, evict)
-				delete(e.negatives, evict)
-				evicted = true
-			}
-			// Either a name was displaced or authoritative state is present
-			// beyond what the cap can hold; neither leaves the cache a complete
-			// picture of the directory, so both kinds of miss authority go with
-			// it. A surviving session marker would otherwise answer a lookup for
-			// a name this entry could not hold as "created here, so absent" —
-			// a false ENOENT for a child this mount just committed.
+			evict := e.order[0]
+			e.order = e.order[1:]
+			delete(e.items, evict)
+			delete(e.negatives, evict)
+			evicted = true
+			// The entry cannot hold the whole directory any more, so it must
+			// stop speaking for the names it could not keep: a surviving
+			// complete or session marker would answer a lookup for one of them
+			// as "absent", which is a false ENOENT for a name the server has.
+			// Revoking it sends such a lookup to the server instead.
+			//
+			// maxEntries is a hard bound even for authoritative writes: growing
+			// past a caller-configured limit is not this cache's decision, and
+			// the served view below keeps the evicted name visible to the
+			// request that is being answered.
 			e.complete = false
 			e.completeExpires = time.Time{}
 			e.sessionExpires = time.Time{}

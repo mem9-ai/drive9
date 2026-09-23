@@ -61,10 +61,11 @@ func assertCachedChild(t *testing.T, dc *DirCache, dirPath, name string, check f
 	check(item)
 }
 
-// listInstall mirrors production: capture the fencing value, then install the
-// response that request produced.
+// listInstall mirrors production: register the request, then install the
+// response it produced.
 func listInstall(dc *DirCache, dirPath string, items []CachedFileInfo) []CachedFileInfo {
-	return dc.PutListing(dirPath, items, dc.Generation(dirPath))
+	request := dc.BeginRequest(dirPath)
+	return dc.PutListing(dirPath, items, request)
 }
 
 // --- The core invariant: an install never removes a committed name ---------
@@ -77,10 +78,10 @@ func TestDirCacheInstallKeepsChildCommittedDuringRTT(t *testing.T) {
 
 	// The listing request is issued (its generation captured), then a commit
 	// for b.dat settles during its RTT.
-	requestGen := dc.Generation("/d")
+	request := dc.BeginRequest("/d")
 	dc.Upsert("/d", CachedFileInfo{Name: "b.dat"})
 
-	view := dc.PutListing("/d", []CachedFileInfo{{Name: "a.dat"}}, requestGen)
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "a.dat"}}, request)
 	if !containsName(viewNames(view), "b.dat") {
 		t.Fatalf("caller served a view without the committed child: view=%v", viewNames(view))
 	}
@@ -99,10 +100,10 @@ func TestDirCacheInstallNeverDropsCommittedNames(t *testing.T) {
 	for i := range committed {
 		name := fmt.Sprintf("u_%03d.dat", i)
 		committedNames = append(committedNames, name)
-		requestGen := dc.Generation("/d")
+		request := dc.BeginRequest("/d")
 		dc.Upsert("/d", CachedFileInfo{Name: name})
 		// Every commit races an unrelated response taken before it.
-		dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}, {Name: "other.dat"}}, requestGen)
+		dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}, {Name: "other.dat"}}, request)
 	}
 
 	names := cachedNames(t, dc, "/d")
@@ -119,9 +120,9 @@ func TestDirCacheInstallDoesNotResurrectRemovedChild(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "gone.dat"}, {Name: "keep.dat"}})
 
-	requestGen := dc.Generation("/d")
+	request := dc.BeginRequest("/d")
 	dc.Remove("/d", "gone.dat")
-	view := dc.PutListing("/d", []CachedFileInfo{{Name: "gone.dat"}, {Name: "keep.dat"}}, requestGen)
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "gone.dat"}, {Name: "keep.dat"}}, request)
 
 	if containsName(viewNames(view), "gone.dat") {
 		t.Fatalf("view resurrected a removed child: %v", viewNames(view))
@@ -138,10 +139,10 @@ func TestDirCacheInstallDoesNotResurrectRemovedChild(t *testing.T) {
 // is what carries the removal forward until an entry exists.
 func TestDirCacheInstallDoesNotResurrectRemovalOnColdParent(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
-	requestGen := dc.Generation("/d")
+	request := dc.BeginRequest("/d")
 	dc.Remove("/d", "gone.dat")
 
-	view := dc.PutListing("/d", []CachedFileInfo{{Name: "gone.dat"}}, requestGen)
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "gone.dat"}}, request)
 	if containsName(viewNames(view), "gone.dat") {
 		t.Fatalf("view resurrected a removal recorded before any cache entry: %v", viewNames(view))
 	}
@@ -153,9 +154,9 @@ func TestDirCacheInstallViewCarriesUpdatedSameName(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 10, Revision: 1}})
 
-	requestGen := dc.Generation("/d")
+	request := dc.BeginRequest("/d")
 	dc.Upsert("/d", CachedFileInfo{Name: "f.dat", Size: 20, Revision: 2})
-	view := dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 10, Revision: 1}}, requestGen)
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 10, Revision: 1}}, request)
 
 	for _, item := range view {
 		if item.Name == "f.dat" {
@@ -174,9 +175,9 @@ func TestDirCacheInstallViewCanBeEmpty(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "only.dat"}})
 
-	requestGen := dc.Generation("/d")
+	request := dc.BeginRequest("/d")
 	dc.Remove("/d", "only.dat")
-	view := dc.PutListing("/d", []CachedFileInfo{{Name: "only.dat"}}, requestGen)
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "only.dat"}}, request)
 
 	if len(view) != 0 {
 		t.Fatalf("view carried a removed name: %v", viewNames(view))
@@ -237,7 +238,7 @@ func TestDirCacheObservationAppliesWhenNothingChanged(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 5, Revision: 1}})
 
-	token := dc.BeginObservation("/d")
+	token := dc.BeginRequest("/d")
 	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 8, Revision: 1}, token)
 
 	assertCachedChild(t, dc, "/d", "f.dat", func(item CachedFileInfo) {
@@ -253,7 +254,7 @@ func TestDirCacheObservationAppliesSameRevisionMetadataChange(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 50, Revision: 5, Mode: 0o644, HasMode: true}})
 
-	token := dc.BeginObservation("/d")
+	token := dc.BeginRequest("/d")
 	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 50, Revision: 5, Mode: 0o600, HasMode: true}, token)
 
 	assertCachedChild(t, dc, "/d", "f.dat", func(item CachedFileInfo) {
@@ -269,7 +270,7 @@ func TestDirCacheObservationSupersededByInstallIsDiscarded(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "keep.dat"}})
 
-	token := dc.BeginObservation("/d")
+	token := dc.BeginRequest("/d")
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "keep.dat"}})
 
 	dc.Observe("/d", CachedFileInfo{Name: "late.dat", Size: 9}, token)
@@ -292,7 +293,7 @@ func TestDirCacheObservationSupersededByLocalUpsertIsDiscarded(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "base.dat"}})
 
-	token := dc.BeginObservation("/d")
+	token := dc.BeginRequest("/d")
 	dc.Upsert("/d", CachedFileInfo{Name: "f.dat", Size: 20, Revision: 2})
 	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 10, Revision: 1}, token)
 
@@ -309,7 +310,7 @@ func TestDirCacheObservationSupersededByLocalRemoveIsDiscarded(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 10, Revision: 10, ResourceID: "res-A"}})
 
-	token := dc.BeginObservation("/d")
+	token := dc.BeginRequest("/d")
 	dc.Remove("/d", "f.dat")
 	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 10, Revision: 10, ResourceID: "res-A"}, token)
 
@@ -325,7 +326,7 @@ func TestDirCacheObservationDoesNotRestoreDeletedObjectIdentity(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 10, Revision: 10, ResourceID: "res-A"}})
 
-	token := dc.BeginObservation("/d")
+	token := dc.BeginRequest("/d")
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1, ResourceID: "res-B"}})
 	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 10, Revision: 10, ResourceID: "res-A"}, token)
 
@@ -343,7 +344,7 @@ func TestDirCacheObservationDoesNotSurviveEntryRetirement(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1, ResourceID: "res-B"}})
 
-	token := dc.BeginObservation("/d")
+	token := dc.BeginRequest("/d")
 	dc.Invalidate("/d")
 	if _, ok := dc.entries["/d"]; ok {
 		t.Fatal("fixture bug: the entry must be retired")
@@ -360,7 +361,7 @@ func TestDirCacheObservationDoesNotSurviveEntryRetirement(t *testing.T) {
 func TestDirCacheUncachedObservationTokenDoesNotMatchLaterEntry(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 
-	token := dc.BeginObservation("/d")
+	token := dc.BeginRequest("/d")
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1, ResourceID: "res-B"}})
 	dc.Invalidate("/d")
 	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 10, Revision: 10, ResourceID: "res-A"}, token)
@@ -375,7 +376,7 @@ func TestDirCacheUncachedObservationTokenDoesNotMatchLaterEntry(t *testing.T) {
 func TestDirCacheUncachedObservationAppliesWhenNothingIntervenes(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 
-	token := dc.BeginObservation("/d")
+	token := dc.BeginRequest("/d")
 	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 7, Revision: 1}, token)
 
 	if got := dc.Lookup("/d", "f.dat"); got.kind != namespaceLookupPositive || got.item.Size != 7 {
@@ -388,7 +389,7 @@ func TestDirCacheZeroObservationTokenIsDiscarded(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "keep.dat"}})
 
-	dc.Observe("/d", CachedFileInfo{Name: "late.dat", Size: 9}, ObservationToken{})
+	dc.Observe("/d", CachedFileInfo{Name: "late.dat", Size: 9}, RequestToken{})
 
 	if names := cachedNames(t, dc, "/d"); containsName(names, "late.dat") {
 		t.Fatalf("zero token published a child: %v", names)
@@ -402,7 +403,7 @@ func TestDirCacheDiscardedObservationClearsNegativeMarker(t *testing.T) {
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "keep.dat"}})
 	dc.MarkNegative("/d", "f.dat")
 
-	token := dc.BeginObservation("/d")
+	token := dc.BeginRequest("/d")
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "keep.dat"}})
 	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 3, Revision: 1}, token)
 
@@ -551,7 +552,7 @@ func TestDirCacheObservationFenceMatrix(t *testing.T) {
 		{"upsert", func(dc *DirCache) { dc.Upsert("/d", CachedFileInfo{Name: "after.dat", Revision: 5}) }},
 		{"remove", func(dc *DirCache) { dc.Remove("/d", "f.dat") }},
 		{"install", func(dc *DirCache) {
-			dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Revision: 3}}, dc.Generation("/d"))
+			listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Revision: 3}})
 		}},
 		{"invalidate", func(dc *DirCache) { dc.Invalidate("/d") }},
 	}
@@ -562,7 +563,7 @@ func TestDirCacheObservationFenceMatrix(t *testing.T) {
 				listInstall(dc, "/d", []CachedFileInfo{{Name: "seed.dat", Revision: 1}})
 				pre.run(dc)
 
-				token := dc.BeginObservation("/d")
+				token := dc.BeginRequest("/d")
 				post.run(dc)
 
 				// A late read of an object that existed before the directory
@@ -586,25 +587,25 @@ func TestDirCacheObservationFenceMatrix(t *testing.T) {
 func TestDirCacheInstallInvariantMatrix(t *testing.T) {
 	type event struct {
 		name string
-		run  func(dc *DirCache, pending *[]uint64)
+		run  func(dc *DirCache, pending *[]RequestToken)
 	}
 	events := []event{
-		{"install", func(dc *DirCache, pending *[]uint64) {
+		{"install", func(dc *DirCache, pending *[]RequestToken) {
 			// Install every response still outstanding, oldest first.
 			for _, g := range *pending {
 				dc.PutListing("/d", []CachedFileInfo{{Name: "resp.dat"}}, g)
 			}
 		}},
-		{"commit", func(dc *DirCache, pending *[]uint64) {
+		{"commit", func(dc *DirCache, pending *[]RequestToken) {
 			dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Revision: 2})
 		}},
-		{"remove", func(dc *DirCache, pending *[]uint64) {
+		{"remove", func(dc *DirCache, pending *[]RequestToken) {
 			dc.Remove("/d", "victim.dat")
 		}},
-		{"newRequest", func(dc *DirCache, pending *[]uint64) {
-			*pending = append(*pending, dc.Generation("/d"))
+		{"newRequest", func(dc *DirCache, pending *[]RequestToken) {
+			*pending = append(*pending, dc.BeginRequest("/d"))
 		}},
-		{"invalidate", func(dc *DirCache, pending *[]uint64) { dc.Invalidate("/d") }},
+		{"invalidate", func(dc *DirCache, pending *[]RequestToken) { dc.Invalidate("/d") }},
 	}
 	seq := make([]int, 3)
 	for i := range events {
@@ -613,7 +614,7 @@ func TestDirCacheInstallInvariantMatrix(t *testing.T) {
 				seq[0], seq[1], seq[2] = i, j, k
 				dc := NewDirCache(10 * time.Second)
 				listInstall(dc, "/d", []CachedFileInfo{{Name: "victim.dat"}, {Name: "resp.dat"}})
-				pending := []uint64{}
+				pending := []RequestToken{}
 				removed, committed, invalidated := false, false, false
 				for _, idx := range seq {
 					switch events[idx].name {
@@ -653,11 +654,11 @@ func TestDirCacheListingIsNotInstalledAcrossRetirement(t *testing.T) {
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "seed.dat"}})
 
 	// A listing request is issued (its generation captured)...
-	requestGen := dc.Generation("/d")
+	request := dc.BeginRequest("/d")
 	// ...then an SSE reset retires the directory...
 	dc.Invalidate("/d")
 	// ...and the stale response arrives afterwards.
-	view := dc.PutListing("/d", []CachedFileInfo{{Name: "resurrected.dat"}}, requestGen)
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "resurrected.dat"}}, request)
 
 	// The request still gets its own answer.
 	if !containsName(viewNames(view), "resurrected.dat") {
@@ -679,32 +680,44 @@ func TestDirCacheListingAfterRetirementInstalls(t *testing.T) {
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "seed.dat"}})
 	dc.Invalidate("/d")
 
-	requestGen := dc.Generation("/d")
-	dc.PutListing("/d", []CachedFileInfo{{Name: "fresh.dat"}}, requestGen)
+	request := dc.BeginRequest("/d")
+	dc.PutListing("/d", []CachedFileInfo{{Name: "fresh.dat"}}, request)
 
 	if names := cachedNames(t, dc, "/d"); !containsName(names, "fresh.dat") {
 		t.Fatalf("a listing issued after the retirement was refused: %v", names)
 	}
 }
 
-// At the cache cap, a name this mount committed must not be the one displaced
-// to make room for a name the server can simply list again. (Review round 3.)
-func TestDirCacheEvictionNeverDropsLocallyCommittedName(t *testing.T) {
+// At the cache cap, a name this mount committed must not be the one displaced to
+// cache a server name: the committed child stays, and the entry stops claiming
+// it can answer misses for whatever it could not hold.
+func TestDirCacheCapKeepsCommittedChildVisibleWithoutHoldingIt(t *testing.T) {
 	const cap = 2
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, cap)
 	// The committed name is cached FIRST, so it sits at the head of the
 	// eviction order. A policy that simply drops order[0] takes exactly the
 	// name the race protection exists to keep.
-	dc := NewNamespaceCache(10*time.Second, 10*time.Second, cap)
 	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Revision: 2})
-	dc.PutListing("/d", []CachedFileInfo{{Name: "server.dat"}}, 0)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "server.dat"}})
 
 	view := listInstall(dc, "/d", []CachedFileInfo{{Name: "server.dat"}, {Name: "other.dat"}})
 
-	if !containsName(cachedNames(t, dc, "/d"), "committed.dat") {
-		t.Fatalf("a committed child was evicted to cache a server name: %v", cachedNames(t, dc, "/d"))
-	}
+	// The request being answered must not be handed a reply that hides the
+	// committed child, even though the cap forced it out of the cache.
 	if !containsName(viewNames(view), "committed.dat") {
-		t.Fatalf("the view dropped the committed child: %v", viewNames(view))
+		t.Fatalf("the served view dropped the committed child: %v", viewNames(view))
+	}
+	// maxEntries stays a hard bound, so the cache itself holds only the cap.
+	if got := len(dc.entries["/d"].items); got > cap {
+		t.Fatalf("cache grew past maxEntries: %d > %d", got, cap)
+	}
+	// And the entry must not answer the evicted name as absent: without miss
+	// authority the lookup reaches the server and finds it.
+	if dc.CanAnswerMisses("/d") {
+		t.Fatalf("an entry that could not hold the directory still answers misses: %v", cachedNames(t, dc, "/d"))
+	}
+	if got := dc.Lookup("/d", "committed.dat"); got.kind == namespaceLookupCompleteMiss || got.kind == namespaceLookupSessionMiss {
+		t.Fatalf("evicted committed child answered as absent: kind=%v", got.kind)
 	}
 }
 
@@ -718,7 +731,7 @@ func TestDirCacheInstallIsNotCompleteWhenTheCacheCouldNotHoldIt(t *testing.T) {
 	// Force an eviction by caching a locally owned name first, at the head of
 	// the eviction order.
 	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Revision: 2})
-	dc.PutListing("/d", []CachedFileInfo{{Name: "server.dat"}}, 0)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "server.dat"}})
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "server.dat"}, {Name: "other.dat"}})
 
 	if dc.CanAnswerMisses("/d") {
@@ -734,12 +747,12 @@ func TestDirCacheRetirementWatermarkOutlivesAnyRead(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1, ResourceID: "res-B"}})
 
-	requestGen := dc.Generation("/d")
+	request := dc.BeginRequest("/d")
 	dc.Invalidate("/d")
 	// A local write afterwards must not discard the watermark: the older
 	// response is still older than the retirement, for the names it carries.
 	dc.Upsert("/d", CachedFileInfo{Name: "other.dat", Revision: 9})
-	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1, ResourceID: "res-B"}}, requestGen)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1, ResourceID: "res-B"}}, request)
 
 	if names := cachedNames(t, dc, "/d"); containsName(names, "f.dat") {
 		t.Fatalf("a pre-retirement response was reinstated after a local write: %v", names)
@@ -755,7 +768,7 @@ func TestDirCacheListingAfterRetirementStillFencesOlder(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "seed.dat"}})
 
-	older := dc.Generation("/d")
+	older := dc.BeginRequest("/d")
 	dc.Invalidate("/d")
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "fresh.dat"}})
 	dc.PutListing("/d", []CachedFileInfo{{Name: "resurrected.dat"}}, older)
@@ -787,10 +800,11 @@ func TestDirCacheOversizedInstallClearsStaleCompleteness(t *testing.T) {
 }
 
 // When every cached name is locally owned the cap has nothing it may displace,
-// but an authoritative local write must still be admitted: hiding a child this
-// mount just committed is worse than exceeding the cache bound. The entry also
-// loses its miss authority, since it no longer holds the whole directory.
-func TestDirCacheAllLocalSaturationKeepsCommittedChild(t *testing.T) {
+// so a further authoritative write is left uncached (maxEntries stays a hard
+// bound) and the entry loses its miss authority, so a lookup for that name
+// reaches the server instead of being answered "absent" from a cache that
+// simply could not hold it.
+func TestDirCacheAllLocalSaturationRevokesMissAuthority(t *testing.T) {
 	const cap = 2
 	dc := NewNamespaceCache(10*time.Second, 10*time.Second, cap)
 	dc.MarkSessionCreatedDir("/d")
@@ -799,14 +813,15 @@ func TestDirCacheAllLocalSaturationKeepsCommittedChild(t *testing.T) {
 		dc.Upsert("/d", CachedFileInfo{Name: name, Revision: 1})
 	}
 
-	if !containsName(cachedNames(t, dc, "/d"), "c.dat") {
-		t.Fatalf("committed child missing from an all-local saturated entry: %v", cachedNames(t, dc, "/d"))
-	}
-	if got := dc.Lookup("/d", "c.dat"); got.kind != namespaceLookupPositive {
-		t.Fatalf("committed child resolved as absent: kind=%v", got.kind)
+	if got := len(dc.entries["/d"].items); got > cap {
+		t.Fatalf("authoritative writes grew the cache past maxEntries: %d > %d", got, cap)
 	}
 	if dc.CanAnswerMisses("/d") {
 		t.Fatal("an over-cap entry still claims to answer misses")
+	}
+	got := dc.Lookup("/d", "c.dat")
+	if got.kind == namespaceLookupCompleteMiss || got.kind == namespaceLookupSessionMiss {
+		t.Fatalf("a name the cache could not hold was answered as absent: kind=%v", got.kind)
 	}
 }
 
@@ -817,7 +832,7 @@ func TestDirCacheOlderInstallDoesNotDowngradeNewer(t *testing.T) {
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 10, Revision: 1}})
 
 	// Request A is issued, then request B, and B's response lands first.
-	older := dc.Generation("/d")
+	older := dc.BeginRequest("/d")
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 99, Revision: 9}})
 
 	// A's response now arrives carrying the older metadata.
@@ -858,5 +873,148 @@ func TestDirCacheExpiredListingDoesNotRetainRemoteDeletions(t *testing.T) {
 	// Names this mount changed after the request are still carried over.
 	if !containsName(cachedNames(t, dc, "/d"), "other.dat") {
 		t.Fatalf("local commit lost by the rebuild: %v", cachedNames(t, dc, "/d"))
+	}
+}
+
+// --- Eighth review round on #966: bounded resource lifetime -----------------
+
+// The reconciliation state must not accumulate per path a mount has merely
+// invalidated. An invalidation with no request outstanding has no reader to
+// fence, so it must not leave a permanent record, and a burst of distinct
+// directories must leave the map exactly as it found it.
+func TestDirCacheNoStateAccumulatesForAbsentPaths(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+
+	// None of these paths is cached or has anything in flight.
+	for i := range 10000 {
+		dc.Invalidate(fmt.Sprintf("/never-cached/%05d", i))
+	}
+
+	if got := len(dc.retired); got != 0 {
+		t.Fatalf("invalidating %d absent paths retained %d retirement records", 10000, got)
+	}
+	if got := len(dc.inFlight); got != 0 {
+		t.Fatalf("in-flight registry grew to %d entries", got)
+	}
+}
+
+// A retirement only has to fence requests that were already outstanding, so it
+// is released with the last one: a long-running mount keeps no history.
+func TestDirCacheRetirementReleasedWithLastRequest(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1}})
+
+	// Two overlapping requests, then the directory is retired.
+	first := dc.BeginRequest("/d")
+	second := dc.BeginRequest("/d")
+	dc.Invalidate("/d")
+	if got := len(dc.retired); got != 1 {
+		t.Fatalf("fixture: expected the retirement to be recorded while reads are outstanding, got %d", got)
+	}
+
+	// The first completing request releases its own registration only.
+	dc.EndRequest(first)
+	if got := len(dc.retired); got != 1 {
+		t.Fatalf("retirement released while a request was still outstanding (%d reads left)", len(dc.inFlight))
+	}
+
+	// The last one releases it: nothing can still consult it.
+	dc.EndRequest(second)
+	if got := len(dc.retired); got != 0 {
+		t.Fatalf("retirement retained after the last request completed: %d records", got)
+	}
+	if got := len(dc.inFlight); got != 0 {
+		t.Fatalf("in-flight registry not emptied: %d entries", got)
+	}
+}
+
+// Per-name stamps are only readable by the requests that were outstanding when
+// they were written; they are released with the last of them.
+func TestDirCacheNameStampsReleasedWithLastRequest(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "seed.dat"}})
+
+	// A request is outstanding, then a commit lands: the stamp matters only to
+	// that request.
+	request := dc.BeginRequest("/d")
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Revision: 2})
+	if got := len(dc.entries["/d"].localGen); got == 0 {
+		t.Fatal("fixture: expected the commit to stamp the name")
+	}
+
+	dc.EndRequest(request)
+
+	if got := len(dc.entries["/d"].localGen); got != 0 {
+		t.Fatalf("name stamps retained after the last request: %d", got)
+	}
+	// The committed name itself stays: released reconciliation state must not
+	// take the cache entry with it.
+	if !containsName(cachedNames(t, dc, "/d"), "committed.dat") {
+		t.Fatalf("releasing stamps dropped cached state: %v", cachedNames(t, dc, "/d"))
+	}
+}
+
+// maxEntries is a hard bound: repeated authoritative writes to a directory that
+// is already at the cap must not grow it, and the entry must stop answering
+// misses rather than report an uncached name as absent.
+func TestDirCacheAuthoritativeWritesRespectMaxEntries(t *testing.T) {
+	const cap = 4
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, cap)
+	dc.MarkSessionCreatedDir("/d")
+
+	for i := range 100 {
+		dc.Upsert("/d", CachedFileInfo{Name: fmt.Sprintf("f_%03d.dat", i), Revision: 1})
+	}
+
+	entry := dc.entries["/d"]
+	if len(entry.items) > cap {
+		t.Fatalf("authoritative writes grew the cache past maxEntries: %d > %d", len(entry.items), cap)
+	}
+	// Whatever it could not hold must not be answered as absent: without miss
+	// authority the lookup falls through to the server.
+	if dc.CanAnswerMisses("/d") {
+		t.Fatalf("an entry that could not hold the directory still answers misses: %v", cachedNames(t, dc, "/d"))
+	}
+	got := dc.Lookup("/d", "f_099.dat")
+	if got.kind == namespaceLookupCompleteMiss || got.kind == namespaceLookupSessionMiss {
+		t.Fatalf("uncached authoritative name answered as absent: kind=%v", got.kind)
+	}
+}
+
+// Every request registration must be released on every exit path, including the
+// retry loop and the early returns that never reach an install. A registration
+// that outlives its request would pin the directory's reconciliation state for
+// the mount's lifetime, which is the leak this lifetime scheme exists to avoid.
+func TestRemotePathsReleaseEveryRegistration(t *testing.T) {
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("list") != "" {
+			listCalls.Add(1)
+			http.Error(w, "list failed", http.StatusInternalServerError)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	// Both list paths, repeatedly, all failing: the retry loop starts a new
+	// registration per attempt, so a missing release shows up as a count.
+	for range 5 {
+		_, _, _ = fs.remoteDirectoryHasChildren(context.Background(), "/leak")
+		_, _, _ = fs.lookupListWithRetry(nil, "/leak")
+	}
+
+	if got := len(fs.dirCache.inFlight); got != 0 {
+		t.Fatalf("in-flight registrations leaked across failing requests: %d", got)
+	}
+	if got := len(fs.dirCache.retired); got != 0 {
+		t.Fatalf("retirements accumulated for directories with no reader: %d", got)
+	}
+	if listCalls.Load() == 0 {
+		t.Fatal("fixture: expected the list attempts to reach the server")
 	}
 }

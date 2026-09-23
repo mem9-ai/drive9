@@ -6650,7 +6650,8 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	apiPath := fs.remotePath(parentPath)
 	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
-	listGen := fs.dirCache.Generation(parentPath)
+	request := fs.dirCache.BeginRequest(parentPath)
+	defer fs.dirCache.EndRequest(request)
 	items, err := fs.client.ListCtx(ctx, apiPath)
 	cf()
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
@@ -6662,7 +6663,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		// settled during this LIST's RTT is absent from the response and,
 		// being already committed, is gone from the pending overlay too, so
 		// nothing later in this request could restore it.
-		items = reconciledFileInfos(fs.dirCache.PutListing(parentPath, cachedFileInfos(items), listGen))
+		items = reconciledFileInfos(fs.dirCache.PutListing(parentPath, cachedFileInfos(items), request))
 		fs.mountViewMu.RUnlock()
 		return items, generation, nil
 	}
@@ -6682,7 +6683,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		// original transient failure immediately.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
 		listStart = fs.perfStart()
-		listGen = fs.dirCache.Generation(parentPath)
+		request = fs.dirCache.BeginRequest(parentPath)
 		items, err = fs.client.ListCtx(retryCtx, apiPath)
 		retryCancel()
 		fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
@@ -6690,7 +6691,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 			if !fs.lockMountViewRead(generation) {
 				return nil, 0, syscall.EAGAIN
 			}
-			items = reconciledFileInfos(fs.dirCache.PutListing(parentPath, cachedFileInfos(items), listGen))
+			items = reconciledFileInfos(fs.dirCache.PutListing(parentPath, cachedFileInfos(items), request))
 			fs.mountViewMu.RUnlock()
 			return items, generation, nil
 		}
@@ -6698,6 +6699,10 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 			return items, 0, fs.resetMountViewOnAuthorizationError(err)
 		}
 		lastErr = err
+		// This attempt produced nothing, so release it before the next one (or
+		// before returning). The deferred release holds the original token, so
+		// getting this wrong would leave one registration per call.
+		fs.dirCache.EndRequest(request)
 	}
 	return nil, 0, lastErr
 }
@@ -7191,7 +7196,8 @@ func (fs *Dat9FS) snapshotDeletedPaths() map[string]struct{} {
 func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string) (bool, uint64, error) {
 	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
-	listGen := fs.dirCache.Generation(dirPath)
+	request := fs.dirCache.BeginRequest(dirPath)
+	defer fs.dirCache.EndRequest(request)
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
@@ -7226,7 +7232,7 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 		return false, 0, syscall.EAGAIN
 	}
 	if fs.dirCache != nil {
-		fs.dirCache.PutListing(dirPath, cachedFileInfos(liveItems), listGen)
+		fs.dirCache.PutListing(dirPath, cachedFileInfos(liveItems), request)
 	}
 	// Emptiness is decided from the response, not from the merged cache view.
 	// The merged view is for serving readdir: it never removes a name, so a
@@ -7874,7 +7880,13 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// Capture the observation baseline before the read: a listing installed
 	// while this stat is in flight is the newer whole-directory view, and the
 	// response must not be applied on top of it.
-	observation := fs.dirCache.BeginObservation(parentPath)
+	observation := fs.dirCache.BeginRequest(parentPath)
+	// Release on every exit, not just the ones that reach Observe: this path has
+	// several early returns (EAGAIN/EIO/ENOENT), and a registration that is
+	// never released would keep the directory's reconciliation state alive for
+	// the mount's lifetime. Observe releases the same token itself, so the
+	// deferred call is a no-op on the installed path.
+	defer fs.dirCache.EndRequest(observation)
 	stat, statGeneration, err := fs.lookupStatWithRetry(cancel, childP)
 	if err != nil {
 		statNotFound := isNotFoundErr(err)
@@ -12137,7 +12149,8 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	// Capture the fencing value before the request: a local mutation landing
 	// during its RTT makes the response unable to speak for the names it
 	// touches.
-	listGen := fs.dirCache.Generation(dirPath)
+	request := fs.dirCache.BeginRequest(dirPath)
+	defer fs.dirCache.EndRequest(request)
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
@@ -12156,7 +12169,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	// this LIST's RTT is absent from the response, and the pending overlay
 	// cannot restore it (its commit already removed the pending entry), so
 	// serving the raw response would hide it from this readdir.
-	cached = fs.dirCache.PutListing(dirPath, cached, listGen)
+	cached = fs.dirCache.PutListing(dirPath, cached, request)
 	fs.mountViewMu.RUnlock()
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached, generation)
 
