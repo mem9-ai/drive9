@@ -80,6 +80,29 @@ func TestTransportTimeoutBoundsCall(t *testing.T) {
 	}
 }
 
+// TestTransportCallPassesOpToEnter pins the teardown gate's plumbing: Call must
+// hand Enter the op name so the hold can exempt the session-cleanup RPC.
+func TestTransportCallPassesOpToEnter(t *testing.T) {
+	t.Parallel()
+	var got string
+	tr := NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
+		return []byte(`{"errno":0}`), 0, nil
+	})
+	tr.Enter = func(op string) bool {
+		got = op
+		return true
+	}
+	var resp struct {
+		Errno int `json:"errno"`
+	}
+	if st := tr.Call(jfsmeta.Background(), jfsmeta.Drive9OpCleanStaleSession, map[string]any{}, &resp); st != 0 {
+		t.Fatalf("Call status=%v", st)
+	}
+	if got != jfsmeta.Drive9OpCleanStaleSession {
+		t.Fatalf("Enter op = %q, want %q", got, jfsmeta.Drive9OpCleanStaleSession)
+	}
+}
+
 // TestTransportCallMapsBackendErrorToEIO keeps a genuine transport failure
 // distinct from the timeout and interrupt mappings.
 func TestTransportCallMapsBackendErrorToEIO(t *testing.T) {
