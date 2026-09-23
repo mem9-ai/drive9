@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -67,38 +68,53 @@ type dirCacheEntry struct {
 	missWindowStart   time.Time
 	escalateNotBefore time.Time
 
+	// Reconciliation state, kept across listing installs.
+	//
 	// localSeq records the namespace sequence at which each child was last
-	// recorded locally (Upsert). An installed listing can only speak for the
-	// state at its own request time, so a child recorded after that request
-	// was issued must survive the install even when the response omits it.
-	// localItem holds that child's entry, kept independently of the served
-	// items so the payload outlives an install that legitimately drops it.
+	// recorded by an authoritative local mutation (Upsert). An installed
+	// listing can only speak for the state at its own request time, so a child
+	// recorded after that request was issued must survive the install even
+	// when the response omits it. localItem holds that child's entry, kept
+	// independently of the served items so the payload outlives an install
+	// that legitimately drops it.
 	//
 	// removedSeq is the mirror image: the sequence at which a child was
 	// removed locally. A listing issued before the removal still contains the
 	// name, and installing that response must not resurrect it.
 	//
-	// Records are retained across installs and only dropped once seqExpires
-	// lapses: listing requests overlap, so an install whose snapshot is older
-	// can land after one whose snapshot is newer, and both must still see the
-	// record they were issued against.
-	localSeq   map[string]uint64
-	localItem  map[string]CachedFileInfo
-	removedSeq map[string]uint64
-	seqExpires time.Time
+	// outstanding counts in-flight listing requests per snapshot sequence. A
+	// record only matters to a listing issued before it, so it is retained
+	// until every outstanding snapshot postdates it. This is deliberately not
+	// a time bound: a listing request has no client-side deadline, so no TTL
+	// can promise to outlive one.
+	localSeq    map[string]uint64
+	localItem   map[string]CachedFileInfo
+	removedSeq  map[string]uint64
+	outstanding map[uint64]int
+}
+
+// listingFlight is the release handle for one in-flight listing request. The
+// caller's snapshot and the cache share it, so releasing it twice (an install
+// plus a deferred EndListing, say) is a no-op rather than a double decrement.
+type listingFlight struct {
+	dir      string
+	seq      uint64
+	released bool
 }
 
 // ListingSnapshot marks the local namespace state at the moment a directory
 // listing request is issued. Pass it to PutListing when the response arrives:
 // children recorded (or removed) after this point cannot be represented by
 // that response and are merged in or filtered out instead of being taken
-// verbatim.
+// verbatim. If the response will never be installed, release the snapshot
+// with EndListing so the records it still needs can be reclaimed.
 //
 // The zero value means "no baseline" and installs the listing as-is.
 type ListingSnapshot struct {
-	dir   string
-	seq   uint64
-	valid bool
+	dir    string
+	seq    uint64
+	flight *listingFlight
+	valid  bool
 }
 
 // DirCache is a thread-safe, TTL-based namespace cache.
@@ -172,13 +188,92 @@ func (dc *DirCache) Get(dirPath string) ([]CachedFileInfo, bool) {
 // request. Call it immediately before issuing the request and hand the result
 // to PutListing when the response arrives, so children recorded while the
 // request was in flight are not dropped by the install.
+//
+// If the request never produces an install (it failed, or the caller bailed
+// out), call EndListing with the returned snapshot so the reconciliation
+// records it holds can be reclaimed.
 func (dc *DirCache) BeginListing(dirPath string) ListingSnapshot {
 	if dc == nil || dirPath == "" {
 		return ListingSnapshot{}
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	return ListingSnapshot{dir: dirPath, seq: dc.seq, valid: true}
+	flight := &listingFlight{dir: dirPath, seq: dc.seq}
+	entry := dc.ensureEntryLocked(dirPath)
+	if entry.outstanding == nil {
+		entry.outstanding = make(map[uint64]int)
+	}
+	entry.outstanding[flight.seq]++
+	return ListingSnapshot{dir: dirPath, seq: flight.seq, flight: flight, valid: true}
+}
+
+// EndListing releases an in-flight listing snapshot that will not be
+// installed. Installing through PutListing releases it automatically.
+func (dc *DirCache) EndListing(snapshot ListingSnapshot) {
+	if dc == nil || !snapshot.valid || snapshot.flight == nil {
+		return
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	dc.releaseListingLocked(snapshot.flight)
+}
+
+// releaseListingLocked retires one in-flight snapshot and reclaims records no
+// outstanding listing can still observe. Caller holds dc.mu.
+func (dc *DirCache) releaseListingLocked(flight *listingFlight) {
+	if flight == nil || flight.released {
+		return
+	}
+	flight.released = true
+	entry, ok := dc.entries[flight.dir]
+	if !ok {
+		return
+	}
+	if entry.outstanding != nil {
+		if n := entry.outstanding[flight.seq]; n > 1 {
+			entry.outstanding[flight.seq] = n - 1
+		} else {
+			delete(entry.outstanding, flight.seq)
+		}
+	}
+	entry.reclaimRecordsLocked()
+}
+
+// reclaimRecordsLocked drops reconciliation records that no outstanding
+// listing can still observe. A record is dead once every in-flight snapshot
+// postdates it (or none remain). Caller holds dc.mu.
+func (e *dirCacheEntry) reclaimRecordsLocked() {
+	if e == nil {
+		return
+	}
+	if len(e.outstanding) == 0 {
+		e.localSeq = nil
+		e.localItem = nil
+		e.removedSeq = nil
+		return
+	}
+	var oldest uint64
+	first := true
+	for seq := range e.outstanding {
+		if first || seq < oldest {
+			oldest = seq
+			first = false
+		}
+	}
+	for name, seq := range e.localSeq {
+		if seq <= oldest {
+			delete(e.localSeq, name)
+			delete(e.localItem, name)
+		}
+	}
+	for name, seq := range e.removedSeq {
+		if seq <= oldest {
+			delete(e.removedSeq, name)
+		}
+	}
+	if len(e.localSeq) == 0 {
+		e.localItem = nil
+	}
 }
 
 // Put stores directory entries in the cache with an expiration of now + ttl.
@@ -191,16 +286,24 @@ func (dc *DirCache) Put(dirPath string, items []CachedFileInfo) {
 }
 
 // PutListing installs a directory listing response that was issued at the
-// namespace baseline in snapshot.
+// namespace baseline in snapshot, and returns the reconciled view callers
+// must serve from.
 //
-// Children recorded locally after that baseline are not present in the
-// response (the request predates them) and are carried over instead of being
-// dropped; children removed locally after the baseline are filtered out, so a
-// stale response cannot resurrect a name the mount already deleted. Everything
-// else follows the response verbatim, so remote deletions still take effect.
-func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot ListingSnapshot) {
+// Children recorded by an authoritative local mutation after that baseline are
+// not present in the response (the request predates them) and are carried over
+// instead of being dropped; children removed locally after the baseline are
+// filtered out, so a stale response cannot resurrect a name the mount already
+// deleted. Everything else follows the response verbatim, so remote deletions
+// still take effect.
+//
+// The returned slice is the response plus those amendments. The cache is only
+// what a *later* readdir will see; a caller that serves the raw response to
+// this request still hides a child that committed during its RTT, and a
+// committed child is already gone from the pending overlay, so nothing else
+// can restore it.
+func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot ListingSnapshot) []CachedFileInfo {
 	if dc == nil || dirPath == "" {
-		return
+		return items
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
@@ -216,6 +319,10 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 	if limit > dc.maxEntries {
 		limit = dc.maxEntries
 	}
+	// served tracks the names this install publishes, which starts as the
+	// response itself (truncated at the entry cap, matching what the cache
+	// holds) and is amended below by the reconciliation.
+	served := make(map[string]CachedFileInfo, limit)
 	for i := 0; i < limit; i++ {
 		item := items[i]
 		if oldEntry != nil {
@@ -224,6 +331,7 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 			}
 		}
 		entry.upsert(item, dc.maxEntries)
+		served[item.Name] = item
 	}
 	// Completeness is decided before the replay below: a carried-over child that
 	// overflows the entry evicts and clears it, and a listing must not claim to
@@ -234,16 +342,17 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 		entry.completeExpires = now.Add(dc.ttl)
 	}
 	if oldEntry != nil {
-		// Records are carried over in full, at their original expiry. Listing
+		// Records and in-flight snapshots are carried over in full. Listing
 		// requests overlap: an install whose snapshot is OLDER can land after
 		// one whose snapshot is NEWER, and publishing only the records newer
 		// than the current snapshot would already have discarded the ones that
 		// install still needs. The replay below is what applies the snapshot
-		// filter.
+		// filter, and reclaimRecordsLocked (driven by the carried-over
+		// outstanding set) is what eventually drops the records.
 		entry.localSeq = cloneSeqTimes(oldEntry.localSeq)
 		entry.removedSeq = cloneSeqTimes(oldEntry.removedSeq)
 		entry.localItem = cloneCachedItems(oldEntry.localItem)
-		entry.seqExpires = oldEntry.seqExpires
+		entry.outstanding = cloneSeqCounts(oldEntry.outstanding)
 	}
 	hasBaseline := oldEntry != nil && snapshot.valid && snapshot.dir == dirPath
 	if hasBaseline {
@@ -257,6 +366,7 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 				continue
 			}
 			entry.remove(name)
+			delete(served, name)
 		}
 		for name, seq := range oldEntry.localSeq {
 			if seq <= snapshot.seq {
@@ -279,9 +389,38 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 				}
 			}
 			entry.upsert(item, dc.maxEntries)
+			served[name] = item
 		}
 	}
 	dc.entries[dirPath] = entry
+	// Release this request's flight and reclaim what it no longer needs.
+	dc.releaseListingLocked(snapshot.flight)
+
+	if len(served) == 0 {
+		return nil
+	}
+	// Emit in the cache's order so the reply matches what the next readdir
+	// would serve, then append any amended child the cap pushed out of it.
+	out := make([]CachedFileInfo, 0, len(served))
+	for _, name := range entry.order {
+		item, ok := served[name]
+		if !ok {
+			continue
+		}
+		out = append(out, item)
+		delete(served, name)
+	}
+	if len(served) > 0 {
+		names := make([]string, 0, len(served))
+		for name := range served {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			out = append(out, served[name])
+		}
+	}
+	return out
 }
 
 // Lookup returns the namespace-cache state for parent/name.
@@ -313,7 +452,38 @@ func (dc *DirCache) Lookup(parentPath, name string) namespaceLookupResult {
 }
 
 // Upsert records or refreshes a known child entry for a parent.
+//
+// This is the authoritative entry point: it means *this mount* established the
+// child's current state (a commit settled, a namespace object was created or
+// renamed, a local overlay resolved). Such a record outranks a listing
+// response that was issued before it, because the server side of that response
+// cannot have observed the mutation yet.
+//
+// For a child learned from a plain remote read, use Observe instead: a read is
+// a point-in-time observation, not a mutation, so it must not displace the
+// whole-directory view a listing install just fetched.
 func (dc *DirCache) Upsert(parentPath string, item CachedFileInfo) {
+	dc.upsertInternal(parentPath, item, true)
+}
+
+// Observe records or refreshes a child entry learned from a remote read (a
+// stat/HEAD refresh, for example).
+//
+// The difference from Upsert is authority, not freshness: request completion
+// order is not a version order, so an observation that happens to land after a
+// listing install may still describe an older state than the listing does.
+// Observations therefore populate the cache but are never replayed over a
+// listing response; the response keeps its own entry for any name it carries,
+// and an observation for a name the response carries is likewise not used to
+// resurrect the name if the response omits it (the listing is the newer
+// whole-directory view).
+func (dc *DirCache) Observe(parentPath string, item CachedFileInfo) {
+	dc.upsertInternal(parentPath, item, false)
+}
+
+// upsertInternal stores a child entry. authoritative selects whether the write
+// is recorded as a local mutation that a later listing install must replay.
+func (dc *DirCache) upsertInternal(parentPath string, item CachedFileInfo, authoritative bool) {
 	if item.Name == "" {
 		return
 	}
@@ -325,21 +495,25 @@ func (dc *DirCache) Upsert(parentPath string, item CachedFileInfo) {
 	entry.expires = now.Add(dc.ttl)
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
-	entry.noteLocal(item.Name, item, dc.nextSeqLocked(), now, dc.ttl)
+	if authoritative {
+		entry.noteLocal(item.Name, item, dc.nextSeqLocked())
+	}
 }
 
 // Remove deletes a known child entry from a parent without implying the parent
 // namespace is complete.
+//
+// The removal is recorded even when the parent has no cached state yet, so a
+// list request already in flight cannot resurrect the name: the interleaving
+// "cold parent -> BeginListing -> successful Unlink -> stale response" is
+// exactly when the parent's cache holds nothing to correct.
 func (dc *DirCache) Remove(parentPath, name string) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	entry, ok := dc.entries[parentPath]
-	if !ok {
-		return
-	}
+	entry := dc.ensureEntryLocked(parentPath)
 	entry.remove(name)
-	entry.noteRemoved(name, dc.nextSeqLocked(), time.Now(), dc.ttl)
+	entry.noteRemoved(name, dc.nextSeqLocked())
 	if !entry.hasState() {
 		delete(dc.entries, parentPath)
 	}
@@ -536,11 +710,26 @@ func cloneSeqTimes(src map[string]uint64) map[string]uint64 {
 	return dst
 }
 
+// cloneCachedItems copies a child-entry map so an install cannot alias the
+// entry it has just replaced.
 func cloneCachedItems(src map[string]CachedFileInfo) map[string]CachedFileInfo {
 	if len(src) == 0 {
 		return nil
 	}
 	dst := make(map[string]CachedFileInfo, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+// cloneSeqCounts copies the outstanding-snapshot counter map so an install
+// cannot alias the entry it has just replaced.
+func cloneSeqCounts(src map[uint64]int) map[uint64]int {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[uint64]int, len(src))
 	for k, v := range src {
 		dst[k] = v
 	}
@@ -553,11 +742,11 @@ func (dc *DirCache) nextSeqLocked() uint64 {
 	return dc.seq
 }
 
-// noteLocal records that name was recorded locally at seq, keeping its entry
-// so a listing install issued before this record can still replay it. now and
-// ttl bound how long records are retained: they only have to outlive listing
-// requests that were already in flight when the child was recorded.
-func (e *dirCacheEntry) noteLocal(name string, item CachedFileInfo, seq uint64, now time.Time, ttl time.Duration) {
+// noteLocal records that name was recorded by an authoritative local mutation
+// at seq, keeping its entry so a listing install issued before this record can
+// still replay it. Retention is bounded by the outstanding in-flight listing
+// set, not by time: see reclaimRecordsLocked.
+func (e *dirCacheEntry) noteLocal(name string, item CachedFileInfo, seq uint64) {
 	if seq == 0 {
 		return
 	}
@@ -570,11 +759,10 @@ func (e *dirCacheEntry) noteLocal(name string, item CachedFileInfo, seq uint64, 
 	e.localSeq[name] = seq
 	e.localItem[name] = item
 	delete(e.removedSeq, name)
-	e.seqExpires = now.Add(ttl)
 }
 
 // noteRemoved records that name was removed locally at seq.
-func (e *dirCacheEntry) noteRemoved(name string, seq uint64, now time.Time, ttl time.Duration) {
+func (e *dirCacheEntry) noteRemoved(name string, seq uint64) {
 	if seq == 0 {
 		return
 	}
@@ -584,7 +772,6 @@ func (e *dirCacheEntry) noteRemoved(name string, seq uint64, now time.Time, ttl 
 	e.removedSeq[name] = seq
 	delete(e.localSeq, name)
 	delete(e.localItem, name)
-	e.seqExpires = now.Add(ttl)
 }
 
 func (dc *DirCache) ensureEntryLocked(dirPath string) *dirCacheEntry {
@@ -608,6 +795,13 @@ func (dc *DirCache) getEntryLocked(dirPath string, now time.Time) (*dirCacheEntr
 		return nil, false
 	}
 	entry.prune(now)
+	// Records are only useful to a listing that was already in flight when
+	// they were written. This is the probe path, so reclaim on the in-flight
+	// set rather than on a timer: a listing request has no client-side
+	// deadline, so no TTL could bound this safely. Install never reaches here
+	// (PutListing reads dc.entries directly), which keeps its replay from
+	// racing its own reclamation.
+	entry.reclaimRecordsLocked()
 	if !entry.hasState() {
 		delete(dc.entries, dirPath)
 		return nil, false
@@ -678,22 +872,10 @@ func (e *dirCacheEntry) prune(now time.Time) {
 		e.order = nil
 		e.expires = time.Time{}
 		e.complete = false
-		// The child payloads and records were only held to protect a listing
-		// request that was already in flight; with the served items gone there
-		// is nothing for an install to merge against.
-		e.localSeq = make(map[string]uint64)
-		e.localItem = make(map[string]CachedFileInfo)
-		e.removedSeq = make(map[string]uint64)
-		e.seqExpires = time.Time{}
-	}
-	if !e.seqExpires.IsZero() && now.After(e.seqExpires) {
-		// The records are only held to protect listing requests that were
-		// already in flight when they were written; past one TTL no such
-		// request can still be outstanding.
-		e.localSeq = nil
-		e.localItem = nil
-		e.removedSeq = nil
-		e.seqExpires = time.Time{}
+		// The served items are stale, but the reconciliation records are not
+		// cleared here: a listing issued before them is still in flight and
+		// still needs them. reclaimRecordsLocked decides that, on the
+		// in-flight set rather than on time.
 	}
 	if !e.completeExpires.IsZero() && now.After(e.completeExpires) {
 		e.completeExpires = time.Time{}
@@ -730,23 +912,37 @@ func (e *dirCacheEntry) listingValid(now time.Time) bool {
 	return e.complete && e.completeValid(now)
 }
 
+// completeValid reports whether the installed listing is still within its own
+// TTL and may therefore answer misses as a complete directory.
 func (e *dirCacheEntry) completeValid(now time.Time) bool {
 	return e.complete && !e.completeExpires.IsZero() && !now.After(e.completeExpires)
 }
 
+// sessionValid reports whether a session-created-directory marker is still
+// active, which lets misses be answered locally for a directory this mount
+// created and has been managing.
 func (e *dirCacheEntry) sessionValid(now time.Time) bool {
 	return !e.sessionExpires.IsZero() && !now.After(e.sessionExpires)
 }
 
+// negativeValid reports whether name still has an unexpired explicit
+// ENOENT marker.
 func (e *dirCacheEntry) negativeValid(name string, now time.Time) bool {
 	expires, ok := e.negatives[name]
 	return ok && !now.After(expires)
 }
 
+// hasState reports whether the entry still holds anything worth keeping. An
+// entry that answers false is dropped from the cache on the next lookup.
 func (e *dirCacheEntry) hasState() bool {
 	return len(e.items) > 0 || len(e.negatives) > 0 || e.complete ||
 		!e.completeExpires.IsZero() || !e.sessionExpires.IsZero() ||
 		!e.missWindowStart.IsZero() || !e.escalateNotBefore.IsZero() ||
+		// An in-flight listing snapshot must keep the entry alive: a cache
+		// lookup landing between BeginListing and the install would otherwise
+		// drop the entry and take the snapshot (and the records its install
+		// still needs) with it.
+		len(e.outstanding) > 0 ||
 		// Records outlive the served items: an install that drops a
 		// locally-recorded child still needs them to replay for an older
 		// snapshot that is still in flight.

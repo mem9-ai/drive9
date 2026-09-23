@@ -6656,12 +6656,18 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err == nil {
 		if !fs.lockMountViewRead(generation) {
+			fs.dirCache.EndListing(snapshot)
 			return nil, 0, syscall.EAGAIN
 		}
-		fs.dirCache.PutListing(parentPath, cachedFileInfos(items), snapshot)
+		// Serve the reconciled view, not the raw response: a child whose
+		// commit settled during this LIST's RTT is absent from the response
+		// and, being already committed, is gone from the pending overlay too,
+		// so nothing later in this request could restore it.
+		items = reconciledFileInfos(items, fs.dirCache.PutListing(parentPath, cachedFileInfos(items), snapshot))
 		fs.mountViewMu.RUnlock()
 		return items, generation, nil
 	}
+	fs.dirCache.EndListing(snapshot)
 	if !isTransientLookupErr(err) {
 		return items, 0, fs.resetMountViewOnAuthorizationError(err)
 	}
@@ -6684,18 +6690,61 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 		if err == nil {
 			if !fs.lockMountViewRead(generation) {
+				fs.dirCache.EndListing(snapshot)
 				return nil, 0, syscall.EAGAIN
 			}
-			fs.dirCache.PutListing(parentPath, cachedFileInfos(items), snapshot)
+			items = reconciledFileInfos(items, fs.dirCache.PutListing(parentPath, cachedFileInfos(items), snapshot))
 			fs.mountViewMu.RUnlock()
 			return items, generation, nil
 		}
+		fs.dirCache.EndListing(snapshot)
 		if !isTransientLookupErr(err) {
 			return items, 0, fs.resetMountViewOnAuthorizationError(err)
 		}
 		lastErr = err
 	}
 	return nil, 0, lastErr
+}
+
+// reconciledFileInfos projects a reconciled view back onto the client
+// FileInfo shape the list callers work in.
+//
+// The pending overlay is applied by composeDirEntries for readdir, so only
+// entries that carry listing metadata are projected here: a carried-over child
+// whose FileInfo is not in the response still has to reach the caller, which
+// is what makes a commit landing mid-LIST visible to that same request.
+func reconciledFileInfos(original []client.FileInfo, reconciled []CachedFileInfo) []client.FileInfo {
+	if len(reconciled) == 0 {
+		return original
+	}
+	byName := make(map[string]client.FileInfo, len(original))
+	for _, item := range original {
+		byName[item.Name] = item
+	}
+	out := make([]client.FileInfo, 0, len(reconciled))
+	for _, item := range reconciled {
+		if existing, ok := byName[item.Name]; ok {
+			out = append(out, existing)
+			continue
+		}
+		var mtime int64
+		if !item.Mtime.IsZero() {
+			mtime = item.Mtime.Unix()
+		}
+		out = append(out, client.FileInfo{
+			Name:       item.Name,
+			Size:       item.Size,
+			IsDir:      item.IsDir,
+			Mtime:      mtime,
+			Revision:   item.Revision,
+			Mode:       item.Mode,
+			HasMode:    item.HasMode,
+			ResourceID: item.ResourceID,
+			Nlink:      item.Nlink,
+			ExtentIno:  item.ExtentIno,
+		})
+	}
+	return out
 }
 
 func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
@@ -7179,10 +7228,17 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 		liveItems = append(liveItems, item)
 	}
 	if !fs.lockMountViewRead(generation) {
+		if fs.dirCache != nil {
+			fs.dirCache.EndListing(snapshot)
+		}
 		return false, 0, syscall.EAGAIN
 	}
 	if fs.dirCache != nil {
-		fs.dirCache.PutListing(dirPath, cachedFileInfos(liveItems), snapshot)
+		// Decide from the reconciled view: a child whose commit settled during
+		// this LIST's RTT is absent from the response, and reporting the
+		// directory as empty would let a concurrent Rmdir proceed against a
+		// directory that still holds an acknowledged file.
+		liveItems = reconciledFileInfos(liveItems, fs.dirCache.PutListing(dirPath, cachedFileInfos(liveItems), snapshot))
 	}
 	fs.mountViewMu.RUnlock()
 	return len(liveItems) > 0, generation, nil
@@ -7921,7 +7977,11 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if !stat.IsDir && stat.ContentLayout == client.ContentLayoutExtent {
 		fs.extentRefreshFromVFS(ino, childP, 0)
 	}
-	fs.dirCache.Upsert(parentPath, cachedInfoFromStat(name, stat))
+	// This is a plain remote read, not a mutation: record it as an observation
+	// so a listing response fetched meanwhile keeps its own (newer, whole
+	// directory) entry for this name instead of being overwritten by a stat
+	// that merely finished later.
+	fs.dirCache.Observe(parentPath, cachedInfoFromStat(name, stat))
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		fs.mountViewMu.RUnlock()
@@ -12076,18 +12136,25 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
+		fs.dirCache.EndListing(snapshot)
 		return nil, fs.resetMountViewOnAuthorizationError(err)
 	}
 
 	// Store in dir cache
 	cached := cachedFileInfos(items)
 	if err := fs.applyBatchStats(ctx, dirPath, cached); err != nil {
+		fs.dirCache.EndListing(snapshot)
 		return nil, err
 	}
 	if !fs.lockMountViewRead(generation) {
+		fs.dirCache.EndListing(snapshot)
 		return nil, syscall.EAGAIN
 	}
-	fs.dirCache.PutListing(dirPath, cached, snapshot)
+	// Build the reply from the reconciled view: a child whose commit settled
+	// during this LIST's RTT is absent from the response, and the pending
+	// overlay cannot restore it (its commit already removed the pending
+	// entry), so serving the raw response would hide it from this readdir.
+	cached = fs.dirCache.PutListing(dirPath, cached, snapshot)
 	fs.mountViewMu.RUnlock()
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached, generation)
 

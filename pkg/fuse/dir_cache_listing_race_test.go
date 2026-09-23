@@ -35,18 +35,27 @@ func containsName(names []string, want string) bool {
 // readdir until the listing expires.
 func TestDirCacheListingInstallKeepsConcurrentUpsert(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
+	// Pre-existing cached state, installed by its own completed listing.
+	dc.PutListing("/d", []CachedFileInfo{{Name: "a.dat"}}, dc.BeginListing("/d"))
 
-	// The listing snapshot the caller is about to install, taken before the
-	// concurrent commit landed.
+	// A listing request is issued; its response will say {a.dat}.
 	snapshot := dc.BeginListing("/d")
-	dc.PutListing("/d", []CachedFileInfo{{Name: "a.dat"}}, snapshot)
 
-	// A commit for b.dat settles while the listing request is in flight.
+	// A commit for b.dat settles while that request is in flight.
 	dc.Upsert("/d", CachedFileInfo{Name: "b.dat"})
 
 	// The stale response arrives and is installed.
-	dc.PutListing("/d", []CachedFileInfo{{Name: "a.dat"}}, snapshot)
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "a.dat"}}, snapshot)
 
+	// The requesting caller must be served the reconciled view...
+	outNames := make([]string, 0, len(view))
+	for _, item := range view {
+		outNames = append(outNames, item.Name)
+	}
+	if !containsName(outNames, "b.dat") {
+		t.Fatalf("caller served the raw response and lost the committed child: view=%v", outNames)
+	}
+	// ... and the cache must agree for the next readdir.
 	names := dirCacheNames(t, dc, "/d")
 	if !containsName(names, "a.dat") {
 		t.Fatalf("listing entry lost after install: names=%v", names)
@@ -131,10 +140,11 @@ func TestDirCacheUpsertVisibleImmediately(t *testing.T) {
 func TestDirCacheListingInstallUnderConcurrentUpserts(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 
-	snapshot := dc.BeginListing("/d")
 	base := []CachedFileInfo{{Name: "base.dat"}}
-	dc.PutListing("/d", base, snapshot)
+	dc.PutListing("/d", base, dc.BeginListing("/d"))
 
+	// One listing request is in flight while many commits settle.
+	snapshot := dc.BeginListing("/d")
 	const committed = 64
 	for i := range committed {
 		dc.Upsert("/d", CachedFileInfo{Name: fmt.Sprintf("u_%03d.dat", i)})
@@ -309,5 +319,222 @@ func TestDirCacheListingInstallDoesNotClaimCompletenessAfterEviction(t *testing.
 	// The evicted name must not be answerable as a "complete listing" miss.
 	if dc.CanAnswerMisses("/d") {
 		t.Fatalf("listing claims completeness after replay eviction; names=%v", dirCacheNames(t, dc, "/d"))
+	}
+}
+
+// --- Regressions for the review findings on #966 -------------------------
+
+// The request that loses the race must not be served the raw response.
+// Serving the unmerged items hides a child that committed during the LIST's
+// RTT, and because a committed child is already gone from the pending overlay,
+// nothing later in that request can restore it.
+func TestDirCacheListingInstallReturnsReconciledView(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, dc.BeginListing("/d"))
+
+	// The listing request is issued, then a commit settles during its RTT.
+	snapshot := dc.BeginListing("/d")
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Size: 7})
+
+	// The response predates the commit, so it does not contain the child.
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, snapshot)
+
+	outNames := make([]string, 0, len(view))
+	for _, item := range view {
+		outNames = append(outNames, item.Name)
+	}
+	if !containsName(outNames, "committed.dat") {
+		t.Fatalf("caller was served the raw response and lost the committed child: view=%v", outNames)
+	}
+	if !containsName(outNames, "base.dat") {
+		t.Fatalf("response child missing from the reconciled view: view=%v", outNames)
+	}
+	for _, item := range view {
+		if item.Name == "committed.dat" && item.Size != 7 {
+			t.Fatalf("reconciled child lost its metadata: size=%d, want 7", item.Size)
+		}
+	}
+}
+
+// A removal that happens while the parent has no cached state must still be
+// recorded, or the in-flight response resurrects the deleted name for the
+// listing TTL. "Parent entry absent -> unlink -> stale response" is exactly
+// the interleaving where the cache holds nothing to correct from.
+func TestDirCacheListingInstallAfterColdParentRemoval(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+
+	// A listing request is issued; then the parent's cache state is dropped
+	// (an invalidation, an expiry, or an rmdir of that directory) before the
+	// unlink arrives.
+	snapshot := dc.BeginListing("/d")
+	dc.Invalidate("/d")
+	if _, ok := dc.entries["/d"]; ok {
+		t.Fatal("fixture bug: the parent entry must be gone")
+	}
+
+	// A file is unlinked while the request is still in flight.
+	dc.Remove("/d", "gone.dat")
+
+	// The response was taken before the unlink and still carries the name.
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "gone.dat"}}, snapshot)
+
+	outNames := make([]string, 0, len(view))
+	for _, item := range view {
+		outNames = append(outNames, item.Name)
+	}
+	if containsName(outNames, "gone.dat") {
+		t.Fatalf("removed child resurrected in the served view: view=%v", outNames)
+	}
+	if names := dirCacheNames(t, dc, "/d"); containsName(names, "gone.dat") {
+		t.Fatalf("removed child resurrected in the cache: names=%v", names)
+	}
+}
+
+// A record must survive as long as the listing that needs it is outstanding,
+// even past the directory TTL: a listing request has no client-side deadline,
+// so lifetime cannot be tied to a timer. The record is released by the install
+// (or EndListing), not by expiry.
+//
+// The probes below matter: entry pruning only runs when the cache is touched,
+// so a test that merely sleeps exercises nothing. Real traffic keeps probing
+// the directory while the slow listing is in flight.
+func TestDirCacheRecordsOutliveDirTTLWhileListingInFlight(t *testing.T) {
+	dc := NewNamespaceCache(50*time.Millisecond, 50*time.Millisecond, defaultNamespaceCacheMaxEntries)
+
+	dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, dc.BeginListing("/d"))
+
+	// A slow listing request is issued, then a commit lands during its RTT.
+	snapshot := dc.BeginListing("/d")
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Size: 3})
+
+	// Outlast several directory TTLs, probing the cache the way concurrent
+	// traffic does. Each probe prunes the entry.
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		dc.Get("/d")
+		dc.Lookup("/d", "committed.dat")
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, snapshot)
+
+	outNames := make([]string, 0, len(view))
+	for _, item := range view {
+		outNames = append(outNames, item.Name)
+	}
+	if !containsName(outNames, "committed.dat") {
+		t.Fatalf("record expired on the cache TTL while its listing was still in flight: view=%v", outNames)
+	}
+}
+
+// Records must not leak once nothing can observe them: with no listing in
+// flight, the next install (or an explicit EndListing) reclaims them.
+func TestDirCacheRecordsReclaimedWithoutInFlightListing(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, dc.BeginListing("/d"))
+
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat"})
+	snapshot := dc.BeginListing("/d")
+	dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, snapshot)
+
+	// The install consumed the only in-flight snapshot, so nothing can still
+	// observe the record.
+	entry := dc.entries["/d"]
+	if len(entry.localSeq) != 0 || len(entry.removedSeq) != 0 || len(entry.outstanding) != 0 {
+		t.Fatalf("records not reclaimed: localSeq=%v removedSeq=%v outstanding=%v",
+			entry.localSeq, entry.removedSeq, entry.outstanding)
+	}
+
+	// A failed listing must also release its snapshot.
+	abandoned := dc.BeginListing("/d")
+	dc.Upsert("/d", CachedFileInfo{Name: "later.dat"})
+	dc.EndListing(abandoned)
+	if got := len(dc.entries["/d"].outstanding); got != 0 {
+		t.Fatalf("EndListing left %d outstanding snapshots", got)
+	}
+}
+
+// An observation from a plain remote read must not displace the whole-directory
+// view a listing install just fetched: request completion order is not a
+// version order, so a stat that simply finished later may describe an older
+// state than the listing does.
+func TestDirCacheObserveDoesNotDisplaceListingResponse(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 100, Revision: 5}}, dc.BeginListing("/d"))
+
+	// A listing request is issued and its response carries the newer state.
+	snapshot := dc.BeginListing("/d")
+	// A stat for the same name completes after the request was issued but
+	// describes the older state (size 0, revision 0).
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 0, Revision: 0})
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 100, Revision: 5}}, snapshot)
+
+	items, ok := dc.Get("/d")
+	if !ok {
+		t.Fatal("expected cached listing")
+	}
+	for _, item := range items {
+		if item.Name == "f.dat" {
+			if item.Size != 100 || item.Revision != 5 {
+				t.Fatalf("stale observation displaced the listing response: size=%d rev=%d, want 100/5", item.Size, item.Revision)
+			}
+			return
+		}
+	}
+	t.Fatalf("child missing: names=%v", dirCacheNames(t, dc, "/d"))
+}
+
+// An observation must not resurrect a name the listing response omitted: the
+// response is the newer whole-directory view, and it is the one that decides
+// which names exist.
+func TestDirCacheObserveDoesNotResurrectOmittedChild(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, dc.BeginListing("/d"))
+
+	snapshot := dc.BeginListing("/d")
+	// A stat that finished later reports a child the listing no longer has
+	// (a remote delete landed in between, for example).
+	dc.Observe("/d", CachedFileInfo{Name: "deleted.dat", Size: 4})
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, snapshot)
+
+	outNames := make([]string, 0, len(view))
+	for _, item := range view {
+		outNames = append(outNames, item.Name)
+	}
+	if containsName(outNames, "deleted.dat") {
+		t.Fatalf("observation resurrected a name the listing omitted: view=%v", outNames)
+	}
+	if names := dirCacheNames(t, dc, "/d"); containsName(names, "deleted.dat") {
+		t.Fatalf("observation resurrected a name the listing omitted: names=%v", names)
+	}
+}
+
+// A cache lookup landing between BeginListing and the install must not drop
+// the entry: the in-flight snapshot and the records its install still needs
+// live on that entry.
+func TestDirCacheListingStateSurvivesConcurrentCacheLookup(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+
+	// The parent starts cold and a listing request is issued.
+	snapshot := dc.BeginListing("/d")
+
+	// Concurrent cache traffic for the same directory: a readdir cache probe
+	// and a child lookup, both of which walk getEntryLocked.
+	if _, ok := dc.Get("/d"); ok {
+		t.Fatal("fixture bug: the parent must start cold")
+	}
+	dc.Lookup("/d", "anything.dat")
+
+	// A file is unlinked while the request is in flight, then the stale
+	// response (taken before the unlink) arrives.
+	dc.Remove("/d", "gone.dat")
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "gone.dat"}}, snapshot)
+
+	outNames := make([]string, 0, len(view))
+	for _, item := range view {
+		outNames = append(outNames, item.Name)
+	}
+	if containsName(outNames, "gone.dat") {
+		t.Fatalf("removed child resurrected after concurrent cache lookups: view=%v", outNames)
 	}
 }
