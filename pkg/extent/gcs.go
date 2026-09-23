@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 
@@ -40,8 +41,10 @@ type gcsTokenStorage struct {
 // accessToken. A non-empty endpoint is the Cloud Storage JSON API base path
 // (e.g. https://storage.googleapis.com/storage/v1/, or an emulator's
 // .../storage/v1/), not a bare host: it replaces the generated client's
-// BasePath verbatim. opts are appended last for tests.
-func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint string, opts ...option.ClientOption) (*gcsTokenStorage, error) {
+// BasePath verbatim and receives the bearer token, so it is a trusted
+// control-plane value. Anything without an http(s) scheme and a path fails
+// closed.
+func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint string) (*gcsTokenStorage, error) {
 	bucket = strings.TrimSpace(bucket)
 	if bucket == "" {
 		return nil, fmt.Errorf("gcs bucket is required")
@@ -49,13 +52,17 @@ func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint strin
 	if strings.TrimSpace(accessToken) == "" {
 		return nil, fmt.Errorf("gcs access token is required")
 	}
-	allOpts := make([]option.ClientOption, 0, len(opts)+2)
-	if endpoint = strings.TrimSpace(endpoint); endpoint != "" {
-		allOpts = append(allOpts, option.WithEndpoint(endpoint))
+	opts := []option.ClientOption{
+		option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: accessToken})),
 	}
-	allOpts = append(allOpts, option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: accessToken})))
-	allOpts = append(allOpts, opts...)
-	client, err := storage.NewClient(ctx, allOpts...)
+	if endpoint = strings.TrimSpace(endpoint); endpoint != "" {
+		u, err := url.Parse(endpoint)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || strings.Trim(u.Path, "/") == "" {
+			return nil, fmt.Errorf("gcs endpoint %q must be an http(s) JSON API base path, not a bare host", endpoint)
+		}
+		opts = append(opts, option.WithEndpoint(endpoint))
+	}
+	client, err := storage.NewClient(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("gcs client: %w", err)
 	}
@@ -73,8 +80,14 @@ func (g *gcsTokenStorage) Get(ctx context.Context, key string, off, limit int64,
 }
 
 func (g *gcsTokenStorage) Put(ctx context.Context, key string, in io.Reader, _ ...object.AttrGetter) error {
+	// Cancel the upload context on failure: that aborts the resumable session,
+	// whereas Close() would finalize a truncated object under the block key.
+	// (CloseWithError is deprecated for exactly this reason.)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	writer := g.writer(ctx, key)
 	if _, err := io.Copy(writer, in); err != nil {
+		cancel()
 		_ = writer.Close()
 		return err
 	}

@@ -13,6 +13,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/mem9-ai/drive9/pkg/extent"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
@@ -22,6 +23,11 @@ import (
 // runtime has been torn down and must not be re-created.
 var errExtentTornDown = errors.New("extent runtime: mount is tearing down")
 
+// extentRuntimeStartTimeout bounds the data-credential mint ensureExtentRuntime
+// performs while holding extentMu, so unmount cannot block indefinitely on a
+// stalled HTTP call.
+const extentRuntimeStartTimeout = 30 * time.Second
+
 // stopExtentRuntimeLoop marks the extent runtime torn down and stops and joins
 // its compaction loop. Teardown is marked under extentMu so a concurrent
 // ensureExtentRuntime cannot install a runtime after the pointer is cleared.
@@ -29,18 +35,19 @@ var errExtentTornDown = errors.New("extent runtime: mount is tearing down")
 // still sees it.
 func (fs *Dat9FS) stopExtentRuntimeLoop() {
 	fs.extentMu.Lock()
-	defer fs.extentMu.Unlock()
 	fs.extentTornDown = true
-	if fs.extentRT == nil {
+	er := fs.extentRT.Load()
+	fs.extentMu.Unlock()
+	if er == nil {
 		return
 	}
-	if fs.extentRT.stop != nil {
-		fs.extentRT.stop()
+	if er.stop != nil {
+		er.stop()
 	}
 	// Join the compaction loop before touching the VFS: a compaction in flight
 	// is uploading a merged blob and about to CAS it into meta, and returning
 	// from unmount in between would leak that blob.
-	fs.extentRT.wg.Wait()
+	er.wg.Wait()
 }
 
 // closeExtentRuntime releases the extent runtime's JuiceFS session and object
@@ -48,15 +55,15 @@ func (fs *Dat9FS) stopExtentRuntimeLoop() {
 // runtime as healthy.
 func (fs *Dat9FS) closeExtentRuntime() {
 	fs.extentMu.Lock()
-	defer fs.extentMu.Unlock()
-	er := fs.extentRT
+	er := fs.extentRT.Load()
+	fs.extentRT.Store(nil)
+	fs.extentMu.Unlock()
 	if er == nil {
 		return
 	}
 	if err := extent.CloseRuntime(er.rt); err != nil {
 		safeLogPrintf("close extent runtime: %v", err)
 	}
-	fs.extentRT = nil
 }
 
 type extentRuntime struct {
@@ -76,13 +83,15 @@ func (fs *Dat9FS) ensureExtentRuntime() error {
 	if fs.extentTornDown {
 		return errExtentTornDown
 	}
-	if fs.extentRT != nil {
+	if fs.extentRT.Load() != nil {
 		return nil
 	}
 	if fs.client == nil {
 		return fmt.Errorf("extent runtime: missing client")
 	}
-	cred, err := fs.client.GetDataCredential(context.Background())
+	mintCtx, mintCancel := context.WithTimeout(context.Background(), extentRuntimeStartTimeout)
+	defer mintCancel()
+	cred, err := fs.client.GetDataCredential(mintCtx)
 	if err != nil {
 		return fmt.Errorf("data credential: %w", err)
 	}
@@ -106,9 +115,13 @@ func (fs *Dat9FS) ensureExtentRuntime() error {
 		Storage:   store,
 	})
 	if err != nil {
+		// NewRuntime failed before it owned the store; release the client it
+		// would otherwise leak.
+		object.Shutdown(store)
 		return err
 	}
 	if rt.VFS == nil {
+		_ = extent.CloseRuntime(rt)
 		return fmt.Errorf("extent runtime: missing juicefs VFS")
 	}
 	fmt.Fprintf(os.Stderr, "drive9: extent juicefs cache-dir=%s buffer-size=%d\n",
@@ -119,7 +132,7 @@ func (fs *Dat9FS) ensureExtentRuntime() error {
 		meta: rt.Meta,
 		stop: cancel,
 	}
-	fs.extentRT = er
+	fs.extentRT.Store(er)
 	er.wg.Add(1)
 	go func() {
 		defer er.wg.Done()
@@ -129,10 +142,11 @@ func (fs *Dat9FS) ensureExtentRuntime() error {
 }
 
 func (fs *Dat9FS) extentVFS() *vfs.VFS {
-	if fs.extentRT == nil || fs.extentRT.rt == nil {
+	er := fs.extentRT.Load()
+	if er == nil || er.rt == nil {
 		return nil
 	}
-	return fs.extentRT.rt.VFS
+	return er.rt.VFS
 }
 
 func (fs *Dat9FS) jfsMetaCtx(pid, uid, gid uint32) jfsmeta.Context {
@@ -520,7 +534,8 @@ func (fs *Dat9FS) extentReadlink(entry *InodeEntry) ([]byte, gofuse.Status) {
 	if err := fs.ensureExtentRuntime(); err != nil {
 		return nil, gofuse.EIO
 	}
-	if fs.extentRT == nil || fs.extentRT.rt == nil || fs.extentRT.rt.Transport == nil {
+	er := fs.extentRT.Load()
+	if er == nil || er.rt == nil || er.rt.Transport == nil {
 		return nil, gofuse.EIO
 	}
 	var resp struct {
@@ -528,7 +543,7 @@ func (fs *Dat9FS) extentReadlink(entry *InodeEntry) ([]byte, gofuse.Status) {
 		Target []byte `json:"target"`
 	}
 	ctx := fs.jfsCtx(0, 0, 0)
-	if call := fs.extentRT.rt.Transport.Call(ctx, "readlink", map[string]any{"inode": entry.ExtentIno}, &resp); call != 0 {
+	if call := er.rt.Transport.Call(ctx, "readlink", map[string]any{"inode": entry.ExtentIno}, &resp); call != 0 {
 		return nil, gofuse.Status(call)
 	}
 	if resp.Errno != 0 {
@@ -541,7 +556,7 @@ func (fs *Dat9FS) extentRmdir(header *gofuse.InHeader, name, childP string) gofu
 	if !fs.extentEnabled() {
 		return gofuse.OK
 	}
-	if fs.extentRT == nil {
+	if fs.extentRT.Load() == nil {
 		return gofuse.OK
 	}
 	v := fs.extentVFS()

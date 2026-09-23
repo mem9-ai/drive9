@@ -419,7 +419,7 @@ func (fs *Dat9FS) extentMirrorDirAttr(input *gofuse.SetAttrIn, entry *InodeEntry
 	if fs == nil || input == nil || entry == nil || !entry.IsDir {
 		return
 	}
-	if fs.extentRT == nil && !fs.extentEnabled() {
+	if fs.extentRT.Load() == nil && !fs.extentEnabled() {
 		return
 	}
 	if err := fs.ensureExtentRuntime(); err != nil {
@@ -483,7 +483,7 @@ func (fs *Dat9FS) resolveJuiceIno(nodeID uint64, p string) (uint64, bool) {
 	if ino, ok := fs.cachedExtentIno(nodeID); ok {
 		return ino, true
 	}
-	if p != "" && (fs.extentRT != nil || fs.extentEnabled()) {
+	if p != "" && (fs.extentRT.Load() != nil || fs.extentEnabled()) {
 		if err := fs.ensureExtentRuntime(); err == nil {
 			if ino, ok := fs.extentLookupChild(fs.jfsCtx(0, 0, 0), p); ok {
 				if fs.inodes != nil && nodeID != 0 {
@@ -597,14 +597,15 @@ func (fs *Dat9FS) extentRename(cancel <-chan struct{}, input *gofuse.RenameIn, o
 	} else if err := fs.snapshotOpenHandlesBeforePathReplacement(std, newP); err != nil {
 		return httpToFuseStatus(err)
 	}
-	var sid uint64
-	if rt := fs.extentRT.rt; rt != nil {
-		sid = rt.SessionID
+	er := fs.extentRT.Load()
+	if er == nil || er.rt == nil {
+		return gofuse.EIO
 	}
+	sid := er.rt.SessionID
 	var resp struct {
 		Errno int `json:"errno"`
 	}
-	call := fs.extentRT.rt.Transport.Call(ctx, jfsmeta.Drive9OpRename, map[string]any{
+	call := er.rt.Transport.Call(ctx, jfsmeta.Drive9OpRename, map[string]any{
 		"src_parent": srcParent,
 		"src_name":   oldName,
 		"dst_parent": dstParent,
@@ -707,7 +708,8 @@ func (fs *Dat9FS) extentCompactLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if fs.extentRT == nil || fs.extentRT.rt == nil {
+		er := fs.extentRT.Load()
+		if er == nil || er.rt == nil {
 			select {
 			case <-ctx.Done():
 				return
@@ -715,7 +717,7 @@ func (fs *Dat9FS) extentCompactLoop(ctx context.Context) {
 			}
 			continue
 		}
-		ino, indx, taskID, receipt, err := extent.ClaimNextCompact(fs.extentRT.rt.Transport)
+		ino, indx, taskID, receipt, err := extent.ClaimNextCompact(er.rt.Transport)
 		if err != nil || taskID == "" || ino == 0 {
 			select {
 			case <-ctx.Done():
@@ -727,16 +729,16 @@ func (fs *Dat9FS) extentCompactLoop(ctx context.Context) {
 		// ExecuteCompact also reports success for a chunk that no longer
 		// needs work, so a successful run has to ack the row; only a real
 		// failure goes back on the queue, and it counts the attempt.
-		if err := extent.ExecuteCompact(ctx, fs.extentRT.rt, ino, indx); err != nil {
+		if err := extent.ExecuteCompact(ctx, er.rt, ino, indx); err != nil {
 			// A cancelled run (unmount, shutdown) is not a failed attempt: the
 			// work was never tried, and counting it would burn one of the
 			// task's max_attempts per event until the row parks FAILED. Leave
 			// it leased so the lease expiry reclaims it.
 			if ctx.Err() == nil {
-				_ = extent.RequeueCompact(fs.extentRT.rt.Transport, taskID, receipt, err)
+				_ = extent.RequeueCompact(er.rt.Transport, taskID, receipt, err)
 			}
 		} else {
-			_ = extent.CompleteCompact(fs.extentRT.rt.Transport, taskID, receipt)
+			_ = extent.CompleteCompact(er.rt.Transport, taskID, receipt)
 		}
 		select {
 		case <-ctx.Done():

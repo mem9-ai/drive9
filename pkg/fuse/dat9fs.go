@@ -233,7 +233,7 @@ type Dat9FS struct {
 	xattrs *XAttrStore
 
 	extentMu sync.Mutex
-	extentRT *extentRuntime
+	extentRT atomic.Pointer[extentRuntime]
 	// extentTornDown is set under extentMu when teardown starts; no extent
 	// runtime may be installed after it (see stopExtentRuntimeLoop).
 	extentTornDown bool

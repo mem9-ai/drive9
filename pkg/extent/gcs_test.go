@@ -98,7 +98,7 @@ func TestOpenStorageGCSAppliesTenantPrefix(t *testing.T) {
 		Bucket:      "prod-drive9-gcs-us-east1",
 		AccessToken: "downscoped-token",
 		Prefix:      "tenants/fs-1/t/tenant-z/",
-		Endpoint:    url,
+		Endpoint:    url + "/storage/v1/",
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +190,7 @@ func TestGCSDeleteIsIdempotent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f, url := newGCSFake(t, http.StatusNotFound)
 			f.deleteStatus = tc.deleteStatus
-			gs, err := newGCSTokenStorage(context.Background(), "bucket", "tok", url)
+			gs, err := newGCSTokenStorage(context.Background(), "bucket", "tok", url+"/storage/v1/")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -261,6 +261,31 @@ func TestSupersededStoreRetiredOnlyWhenIdle(t *testing.T) {
 	if got := rec.shutdowns.Load(); got != 1 {
 		t.Fatalf("superseded store shutdowns = %d, want 1", got)
 	}
+}
+
+// TestGCSEndpointValidation pins that a gcs endpoint must be an http(s) JSON
+// API base path: a bare host would receive the bearer token at a URL with no
+// API root.
+func TestGCSEndpointValidation(t *testing.T) {
+	ctx := context.Background()
+	for _, endpoint := range []string{
+		"http://127.0.0.1:9000",
+		"https://storage.googleapis.com",
+		"ftp://host/storage/v1/",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			if _, err := newGCSTokenStorage(ctx, "bucket", "tok", endpoint); err == nil {
+				t.Fatalf("endpoint %q must be rejected", endpoint)
+			}
+		})
+	}
+	t.Run("valid base path", func(t *testing.T) {
+		gs, err := newGCSTokenStorage(ctx, "bucket", "tok", "https://emulator.example/storage/v1/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		gs.Shutdown()
+	})
 }
 
 // TestOpenStorageCanonicalScheme pins that the Cloud Storage scheme is

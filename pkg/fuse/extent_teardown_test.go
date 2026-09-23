@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -28,10 +29,10 @@ func TestExtentTeardownStopsAndClosesRuntime(t *testing.T) {
 	rec := &extentShutdownRecorder{ObjectStorage: inner}
 	var stopped atomic.Bool
 	fs := &Dat9FS{}
-	fs.extentRT = &extentRuntime{
+	fs.extentRT.Store(&extentRuntime{
 		rt:   &extent.Runtime{Storage: rec},
 		stop: func() { stopped.Store(true) },
-	}
+	})
 
 	fs.stopExtentRuntimeLoop()
 	if !stopped.Load() {
@@ -42,7 +43,7 @@ func TestExtentTeardownStopsAndClosesRuntime(t *testing.T) {
 	}
 
 	fs.closeExtentRuntime()
-	if fs.extentRT != nil {
+	if fs.extentRT.Load() != nil {
 		t.Fatal("extentRT still set after teardown")
 	}
 	if got := rec.shutdowns.Load(); got != 1 {
@@ -51,5 +52,33 @@ func TestExtentTeardownStopsAndClosesRuntime(t *testing.T) {
 
 	if err := fs.ensureExtentRuntime(); err == nil {
 		t.Fatal("ensureExtentRuntime must refuse after teardown")
+	}
+}
+
+// TestExtentRuntimePointerRace drives a hot runtime reader concurrently with
+// the teardown that clears the pointer. Under -race it pins the atomic-snapshot
+// discipline: a bare field read/write here is a data race.
+func TestExtentRuntimePointerRace(t *testing.T) {
+	inner, err := object.CreateStorage("file", t.TempDir(), "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &extentShutdownRecorder{ObjectStorage: inner}
+	fs := &Dat9FS{}
+	fs.extentRT.Store(&extentRuntime{rt: &extent.Runtime{Storage: rec}})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			_ = fs.extentVFS()
+		}
+	}()
+	fs.stopExtentRuntimeLoop()
+	fs.closeExtentRuntime()
+	wg.Wait()
+	if fs.extentRT.Load() != nil {
+		t.Fatal("extentRT still set after teardown")
 	}
 }

@@ -2,6 +2,7 @@ package extent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -35,6 +36,9 @@ const (
 	// tenant that started in the same instant (rolling restart, fleet-wide
 	// remount) calls AssumeRole in the same instant.
 	credentialRefreshJitter = time.Minute
+	// credentialRefreshTimeout bounds the refresh mint, which runs under s.mu and
+	// would otherwise stall Shutdown on a stalled HTTP call.
+	credentialRefreshTimeout = 30 * time.Second
 	// jfsS3VHostStyleEnv is JuiceFS's only path-style switch
 	// (pkg/object/s3.go defaultPathStyle): unset/"0"/"false" selects path
 	// style, anything else virtual-host style. JuiceFS reads it once per
@@ -48,6 +52,8 @@ type Credential struct {
 	// Endpoint is the scheme-specific base. For "file" it is the storage root,
 	// for "s3" the S3 endpoint, and for "gcs" the Cloud Storage JSON API base
 	// path (e.g. https://storage.googleapis.com/storage/v1/), not a bare host.
+	// A "gcs" endpoint also receives the bearer access token, so it is a trusted
+	// control-plane value; the store fails closed on a bare host.
 	Endpoint        string `json:"endpoint"`
 	Bucket          string `json:"bucket,omitempty"`
 	Prefix          string `json:"prefix"`
@@ -76,7 +82,7 @@ type CredentialSource interface {
 }
 
 // errExtentStoreClosed is returned by every I/O entry point after Shutdown.
-var errExtentStoreClosed = fmt.Errorf("extent storage is closed")
+var errExtentStoreClosed = errors.New("extent storage is closed")
 
 // canonicalExtentScheme maps a data-credential scheme to the one this package
 // reports. Cloud Storage is minted as "gcs", while the object-backend/objectfs
@@ -183,8 +189,8 @@ func withS3StyleEnv(forcePathStyle bool, create func() (object.ObjectStorage, er
 }
 
 func openInner(cred *Credential) (object.ObjectStorage, error) {
-	switch strings.ToLower(strings.TrimSpace(cred.Scheme)) {
-	case SchemeFile, "":
+	switch canonicalExtentScheme(cred.Scheme) {
+	case SchemeFile:
 		root := cred.Endpoint
 		if root == "" {
 			return nil, fmt.Errorf("file storage endpoint is required")
@@ -203,11 +209,11 @@ func openInner(cred *Credential) (object.ObjectStorage, error) {
 	case SchemeS3:
 		ep := endpointWithBucket(cred.Endpoint, cred.Bucket)
 		return createS3Storage(ep, cred.AccessKeyID, cred.SecretAccessKey, cred.SessionToken, cred.ForcePathStyle)
-	case SchemeGCS, "gs":
-		// "gs" is accepted alongside "gcs": the object-backend/objectfs surfaces
-		// canonicalize Cloud Storage to "gs", while the extent data-credential
-		// wire value is "gcs". An endpoint is honoured for an emulator or a
-		// private/regional JSON API base; the server's own mint leaves it empty.
+	case SchemeGCS:
+		// canonicalExtentScheme folds the object-backend/objectfs "gs" spelling
+		// onto the extent wire value "gcs". An endpoint is honoured for an
+		// emulator or a private/regional JSON API base; the server's own mint
+		// leaves it empty.
 		st, err := newGCSTokenStorage(context.Background(), cred.Bucket, cred.AccessToken, cred.Endpoint)
 		if err != nil {
 			return nil, err
@@ -390,7 +396,11 @@ func (s *refreshingStore) innerStoreLocked(ctx context.Context) (object.ObjectSt
 		return s.inner, nil
 	}
 	start := time.Now()
-	next, err := s.src.GetDataCredential(ctx)
+	// Bound the mint: it runs under s.mu, so an unbounded call would also stall
+	// Shutdown.
+	mintCtx, mintCancel := context.WithTimeout(ctx, credentialRefreshTimeout)
+	defer mintCancel()
+	next, err := s.src.GetDataCredential(mintCtx)
 	if err != nil {
 		// Keep serving the old session, but never silently: an expired
 		// credential surfaces as a 403 from the object store, which is
