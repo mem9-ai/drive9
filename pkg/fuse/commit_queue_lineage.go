@@ -419,6 +419,15 @@ func (cq *CommitQueue) resolveStalePayloadAsIdempotent(ctx context.Context, entr
 	if int64(len(local)) > maxLandedPayloadBytes {
 		return false, nil
 	}
+	// The entry's own size is part of the claim being proved. Corrupt or stale
+	// queue metadata whose Size disagrees with the staged bytes must not be
+	// consumed here: the success tail records that size in the landed proof and
+	// writes it to the inode and dir cache while deleting the only local
+	// pending/shadow copy, so accepting it would publish a wrong size and
+	// destroy the data that could correct it.
+	if entry.Size != int64(len(local)) {
+		return false, nil
+	}
 	if cq.isEntryCanceled(entry) || (ctx != nil && ctx.Err() != nil) {
 		return false, nil
 	}
@@ -432,24 +441,37 @@ func (cq *CommitQueue) resolveStalePayloadAsIdempotent(ctx context.Context, entr
 	// The read carries no revision condition, so a same-size write between the
 	// Stat and the read could have returned newer bytes while this entry would
 	// record the older revision. Require the revision to be unchanged.
+	//
+	// A pending mode is part of the entry's intent, so it has to be part of
+	// the proof: the same bytes with different permissions is a different
+	// writer's outcome, and applying this entry's mode would overwrite it.
+	// Compute the expectation once and re-verify it on the confirmation stat
+	// below, because a chmod does not advance the content revision: a peer can
+	// change the durable mode mid-proof and leave the revision identical, so
+	// checking the mode only on the first stat would accept an entry whose mode
+	// no longer matches.
+	remoteModeApplied := false
+	modeKnown := false
+	if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
+		if !stat.HasMode || stat.Mode&posixPermissionModeMask != entry.Mode&posixPermissionModeMask {
+			return false, nil
+		}
+		// The durable mode already satisfies this entry; skip the redundant
+		// chmod rather than issue one for metadata the server already has.
+		remoteModeApplied = true
+		modeKnown = true
+	}
 	confirmCtx, confirmCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	confirm, cerr := cq.client.StatCtx(confirmCtx, cq.remotePath(entry.Path))
 	confirmCancel()
 	if cerr != nil || confirm == nil || confirm.Revision != stat.Revision {
 		return false, nil
 	}
-	// A pending mode is part of the entry's intent, so it has to be part of
-	// the proof: the same bytes with different permissions is a different
-	// writer's outcome, and applying this entry's mode would overwrite it.
-	remoteModeApplied := false
-	if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
+	if modeKnown {
 		want := entry.Mode & posixPermissionModeMask
-		if !stat.HasMode || stat.Mode&posixPermissionModeMask != want {
+		if !confirm.HasMode || confirm.Mode&posixPermissionModeMask != want {
 			return false, nil
 		}
-		// The durable mode already satisfies this entry; skip the redundant
-		// chmod rather than issue one for metadata the server already has.
-		remoteModeApplied = true
 	}
 	// Re-check after the round trips: an Unlink/Rmdir during them must win
 	// over turning this entry into a success.

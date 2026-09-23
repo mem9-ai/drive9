@@ -249,3 +249,66 @@ func TestCommitQueueStalePayloadSameSizeDifferentBytesStaysTerminal(t *testing.T
 		t.Fatal("pending data must be preserved")
 	}
 }
+
+// A chmod does not advance the content revision (See Store.Chmod: it writes
+// only `mode`). So a peer can change the durable mode between the initial stat
+// and the confirmation stat while both report the same revision. The proof must
+// re-verify the mode it accepted, not just the revision, or a stale entry is
+// consumed and its old mode is written back over the peer's newer one.
+func TestCommitQueueStalePayloadModeChangedMidProofStaysTerminal(t *testing.T) {
+	const path = "/mode-toctou"
+	payload := []byte("identical-bytes-and-size")
+	server, ts := newModeAwareServer(t, path, 7, payload, 0o600, true)
+	defer ts.Close()
+	// Between the two HEADs a peer chmods the durable file. The revision is
+	// deliberately left unchanged, which is exactly what a chmod does.
+	server.onHead = func(s *modeAwareServer) {
+		if s.headCalls == 2 {
+			s.mode = 0o644
+		}
+	}
+
+	_, shadow, pending, entry := newStaleEntryFixture(t, path, payload, 0o600, true)
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+
+	if err := cq.CommitNow(context.Background(), entry); err == nil {
+		t.Fatal("a mode changed mid-proof must not resolve as an idempotent success")
+	}
+	if got := server.mutationsSeen(); len(got) != 0 {
+		t.Fatalf("stale entry mutated the durable file after the peer chmod: %v", got)
+	}
+	if _, ok := pending.GetMeta(path); !ok {
+		t.Fatal("pending data must be preserved when the proof fails")
+	}
+}
+
+// The entry's own Size is part of the claim. Corrupt or stale queue metadata
+// whose Size disagrees with the staged bytes must fail closed: the success
+// tail would otherwise record the wrong size in the landed proof and in the
+// inode/dir cache while deleting the only local copy.
+func TestCommitQueueStalePayloadEntrySizeMismatchStaysTerminal(t *testing.T) {
+	const path = "/size-mismatch"
+	// Content is 12 bytes on both sides; the queue metadata claims 112.
+	payload := []byte("twelve-bytes")
+	server, ts := newModeAwareServer(t, path, 1, payload, 0o644, false)
+	defer ts.Close()
+
+	_, shadow, pending, entry := newStaleEntryFixture(t, path, payload, 0, false)
+	entry.Size = 112
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+
+	if err := cq.CommitNow(context.Background(), entry); err == nil {
+		t.Fatal("metadata/payload size mismatch must not resolve as an idempotent success")
+	}
+	if got := server.mutationsSeen(); len(got) != 0 {
+		t.Fatalf("size-mismatched entry mutated the durable file: %v", got)
+	}
+	if _, ok := pending.GetMeta(path); !ok {
+		t.Fatal("pending data must be preserved when the sizes disagree")
+	}
+	if shadow.ActiveGeneration(path) == 0 {
+		t.Fatal("shadow staging must be preserved when the sizes disagree")
+	}
+}
