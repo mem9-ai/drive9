@@ -19,15 +19,22 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
+type closeSyncAppendRequest struct {
+	revision, size int64
+	body           string
+}
+
 type closeSyncTruncateTest struct {
-	fs        *Dat9FS
-	header    gofuse.InHeader
-	old       uint64
-	mu        sync.Mutex
-	revision  int64
-	content   []byte
-	layout    string
-	beforePut func(http.ResponseWriter, []byte) bool
+	fs             *Dat9FS
+	header         gofuse.InHeader
+	old            uint64
+	mu             sync.Mutex
+	revision       int64
+	content        []byte
+	layout         client.ContentLayout
+	beforePut      func(http.ResponseWriter, []byte) bool
+	rebaseOnAppend bool
+	appends        []closeSyncAppendRequest
 }
 
 func newCloseSyncTruncateTest(t *testing.T) *closeSyncTruncateTest {
@@ -36,7 +43,42 @@ func newCloseSyncTruncateTest(t *testing.T) *closeSyncTruncateTest {
 	test.fs = newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 		test.mu.Lock()
 		defer test.mu.Unlock()
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/status" {
+			_, _ = w.Write([]byte(`{"inline_threshold":50000,"storage_capabilities":{"append_log_v1":true}}`))
+			return
+		}
 		switch r.Method {
+		case http.MethodPost:
+			if !r.URL.Query().Has("append-log") {
+				t.Errorf("unexpected POST: %s", r.URL)
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			revision, revErr := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			size, sizeErr := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Size"), 10, 64)
+			body, err := io.ReadAll(r.Body)
+			if revErr != nil || sizeErr != nil || err != nil {
+				t.Errorf("invalid append request: revision=%v size=%v body=%v", revErr, sizeErr, err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			test.appends = append(test.appends, closeSyncAppendRequest{revision, size, string(body)})
+			if test.rebaseOnAppend {
+				// Compaction changes the revision without changing committed size.
+				test.rebaseOnAppend = false
+				test.revision++
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "rebase required", "code": client.AppendLogCodeRebased})
+				return
+			}
+			if revision != test.revision || size != int64(len(test.content)) {
+				http.Error(w, `{"error":"append baseline conflict","code":"append_log_conflict"}`, http.StatusConflict)
+				return
+			}
+			test.content = append(test.content, body...)
+			test.revision++
+			test.layout = client.ContentLayoutAppendLog
+			_ = json.NewEncoder(w).Encode(client.AppendLogResult{Revision: test.revision, Size: int64(len(test.content))})
 		case http.MethodPut:
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -60,7 +102,7 @@ func newCloseSyncTruncateTest(t *testing.T) *closeSyncTruncateTest {
 			w.Header().Set("Content-Length", strconv.Itoa(len(test.content)))
 			w.Header().Set("X-Dat9-IsDir", "false")
 			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(test.revision, 10))
-			w.Header().Set("X-Dat9-Content-Layout", test.layout)
+			w.Header().Set("X-Dat9-Content-Layout", string(test.layout))
 		case http.MethodGet:
 			http.ServeContent(w, r, "race.txt", time.Time{}, bytes.NewReader(test.content))
 		default:
@@ -466,6 +508,9 @@ func TestCloseSyncRefreshCommittedRevisionRetiresRotatedShadow(t *testing.T) {
 			fs := test.fs
 			fh, _ := fs.fileHandles.Get(test.old)
 			generation := fs.shadowStore.ActiveGeneration(fh.Path)
+			fh.Lock()
+			fh.ShadowStageSeq = 17
+			fh.Unlock()
 			want := append(append([]byte(nil), header...), []byte("new tail")...)
 			test.mu.Lock()
 			test.content, test.revision = want, 4
@@ -506,6 +551,10 @@ func TestCloseSyncPathTruncateAdoptsConfirmedAppendLogBaseline(t *testing.T) {
 			fs := test.fs
 			fh, _ := fs.fileHandles.Get(test.old)
 			generation := fs.shadowStore.ActiveGeneration(fh.Path)
+			fh.Lock()
+			// The retired generation is stale; its sequence must be retired too.
+			fh.ShadowStageSeq = 17
+			fh.Unlock()
 			fs.recordCommittedRevisionWithSize(fh.Path, 4, size)
 			fs.syncOpenHandlesAfterPathTruncate(fh.Ino, size)
 			fh.Lock()
@@ -513,7 +562,7 @@ func TestCloseSyncPathTruncateAdoptsConfirmedAppendLogBaseline(t *testing.T) {
 			if fh.BaseRev != 4 || fh.OrigSize != size || fh.Dirty.Size() != size || fh.ZeroBase || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
 				t.Fatalf("passive truncate revision=%d original=%d size=%d zero=%t seq=%d dirty=%t", fh.BaseRev, fh.OrigSize, fh.Dirty.Size(), fh.ZeroBase, fh.DirtySeq, fh.Dirty.HasDirtyParts())
 			}
-			if fh.ShadowReady || fh.ShadowSpill || fh.ShadowStageGen != 0 || fh.ShadowStageSeq != 0 || fh.ShadowCommitReady || fh.ShadowCommitSeq != 0 || fh.Dirty.RestorePart != nil || fh.Dirty.OnPartFull != nil {
+			if fh.ShadowReady || fh.ShadowSpill || fh.ShadowStageGen != 0 || fh.ShadowStageSeq != 0 || fh.Dirty.RestorePart != nil || fh.Dirty.OnPartFull != nil {
 				t.Fatal("confirmed truncate retained shadow claim or callbacks")
 			}
 			if rev, gotSize := fh.appendLogCommittedBaseline(); rev != 4 || gotSize != size || fh.appendLogLayoutAt(4, size) != client.ContentLayoutAppendLog || !fh.appendLogCanUseTail() || fh.appendLog.hasRewriteBase || fh.appendLog.sqliteWALTruncated {
@@ -526,27 +575,120 @@ func TestCloseSyncPathTruncateAdoptsConfirmedAppendLogBaseline(t *testing.T) {
 	}
 }
 
-func TestCloseSyncPathTruncateWithoutConfirmedSizePreservesAppendState(t *testing.T) {
-	test := newCloseSyncTruncateTest(t)
-	fs := test.fs
-	fh, _ := fs.fileHandles.Get(test.old)
-	fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/race.txt"})
-	fh.Lock()
-	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 1, 4)
-	fh.appendLogAdoptCommittedBaseline(1, 4)
-	before := fh.appendLog
-	fh.Unlock()
-	// A revision-only notification invalidates the cached size, so this
-	// sibling must not adopt it or claim to own a pending truncate rewrite.
-	fs.recordCommittedRevision(fh.Path, 2)
-	fs.syncOpenHandlesAfterPathTruncate(fh.Ino, 2)
-	fh.Lock()
-	defer fh.Unlock()
-	if fh.BaseRev != 1 || fh.Dirty.Size() != 2 || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
-		t.Fatalf("unconfirmed truncate revision=%d size=%d seq=%d dirty=%t", fh.BaseRev, fh.Dirty.Size(), fh.DirtySeq, fh.Dirty.HasDirtyParts())
+func TestCloseSyncPathTruncateRevisionOnlyRefreshAppendsAtCommittedSize(t *testing.T) {
+	for _, size := range []int64{0, 2, 8} {
+		for _, rebase := range []bool{false, true} {
+			t.Run(fmt.Sprintf("size-%d/rebase-%t", size, rebase), func(t *testing.T) {
+				test := newCloseSyncTruncateTest(t)
+				fs := test.fs
+				fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/race.txt"})
+				fs.client.Warm(context.Background())
+				fh, _ := fs.fileHandles.Get(test.old)
+				fh.Lock()
+				fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 1, 4)
+				fh.appendLogAdoptCommittedBaseline(1, 4)
+				fh.Unlock()
+
+				// Model a committed truncate whose notification carries only a
+				// revision. SetAttr updates inode size even without a cached
+				// revision/size pair; the next Write must use that remote image.
+				truncated := make([]byte, size)
+				copy(truncated, "seed")
+				test.mu.Lock()
+				test.content, test.revision, test.layout = truncated, 2, client.ContentLayoutAppendLog
+				test.rebaseOnAppend = rebase
+				test.mu.Unlock()
+				fs.recordCommittedRevision(fh.Path, 2)
+				fs.syncOpenHandlesAfterPathTruncate(fh.Ino, size)
+				fs.inodes.UpdateRevision(fh.Ino, 2)
+				fs.inodes.UpdateSize(fh.Ino, size)
+				fh.Lock()
+				passive := fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() && fh.Dirty.Size() == size
+				fh.Unlock()
+				if !passive {
+					t.Fatal("sizing a passive sibling made it a truncate publisher")
+				}
+
+				if n, st := fs.Write(nil, &gofuse.WriteIn{InHeader: test.header, Fh: test.old, Offset: uint64(size)}, []byte("tail")); st != gofuse.OK || n != 4 {
+					t.Fatalf("append Write: n=%d status=%v", n, st)
+				}
+				test.flush(t, test.old)
+				wantRequests, wantRevision := 1, int64(3)
+				if rebase {
+					wantRequests, wantRevision = 2, 4
+				}
+				test.assertRemote(t, string(truncated)+"tail", wantRevision)
+				test.mu.Lock()
+				defer test.mu.Unlock()
+				if len(test.appends) != wantRequests {
+					t.Fatalf("append requests=%+v, want %d (no full rewrite)", test.appends, wantRequests)
+				}
+				for i, request := range test.appends {
+					if request.revision != int64(2+i) || request.size != size || request.body != "tail" {
+						t.Errorf("request %d=%+v, want revision=%d size=%d body=tail", i, request, 2+i, size)
+					}
+				}
+			})
+		}
 	}
-	if fh.appendLog != before {
-		t.Fatalf("passive sizing recorded a pending append-log mutation: before=%+v after=%+v", before, fh.appendLog)
+}
+
+func TestCloseSyncPassivePathTruncateResetsBufferedStreamer(t *testing.T) {
+	test := newCloseSyncTruncateTest(t)
+	fh, _ := test.fs.fileHandles.Get(test.old)
+	fh.Lock()
+	streamer := NewStreamUploader(test.fs.client, fh.Path, fh.BaseRev)
+	fh.Streamer = streamer
+	fh.Unlock()
+	if err := streamer.SubmitPart(context.Background(), 1, []byte("pre-truncate part"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !streamer.Started() || !streamer.HasStreamedParts() {
+		t.Fatal("fixture did not buffer a streaming part")
+	}
+	if st := test.truncate(8); st != gofuse.OK {
+		t.Fatalf("truncate: %v", st)
+	}
+	// RefreshExpectedRevision alone changes CAS but retains stale parts.
+	if streamer.ExpectedRevision() != 2 || streamer.Started() || streamer.HasStreamedParts() {
+		t.Fatalf("truncate retained prior streamer cycle: revision=%d started=%t parts=%t", streamer.ExpectedRevision(), streamer.Started(), streamer.HasStreamedParts())
+	}
+	test.write(t, test.old, "new")
+	test.flush(t, test.old)
+	test.assertRemote(t, "newd\x00\x00\x00\x00", 3)
+}
+
+func TestCloseSyncCallerOwnedTruncateCommitsBeforeSiblingAppend(t *testing.T) {
+	for _, size := range []int64{2, 8} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			test := newCloseSyncTruncateTest(t)
+			fs := test.fs
+			fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/race.txt"})
+			fs.client.Warm(context.Background())
+			writer := test.open(t, test.header.Pid)
+			test.write(t, writer, "pending")
+			if st := test.truncate(uint64(size)); st != gofuse.OK {
+				t.Fatalf("truncate: %v", st)
+			}
+			// The old clean handle sees the new size, but its close must not
+			// publish the other handle's uncommitted truncate, in either direction.
+			test.flush(t, test.old)
+			test.assertRemote(t, "seed", 1)
+			test.flush(t, writer)
+			truncated := make([]byte, size)
+			copy(truncated, "pending")
+			test.assertRemote(t, string(truncated), 2)
+			if n, st := fs.Write(nil, &gofuse.WriteIn{InHeader: test.header, Fh: test.old, Offset: uint64(size)}, []byte("tail")); st != gofuse.OK || n != 4 {
+				t.Fatalf("sibling append: n=%d status=%v", n, st)
+			}
+			test.flush(t, test.old)
+			test.assertRemote(t, string(truncated)+"tail", 3)
+			test.mu.Lock()
+			defer test.mu.Unlock()
+			if len(test.appends) != 1 || test.appends[0].revision != 2 || test.appends[0].size != size || test.appends[0].body != "tail" {
+				t.Fatalf("sibling did not append against the owner's committed baseline: %+v", test.appends)
+			}
+		})
 	}
 }
 
