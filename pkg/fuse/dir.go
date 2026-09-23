@@ -332,22 +332,28 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 	}
 	entry := newDirCacheEntry()
 	entry.expires = now.Add(dc.ttl)
+	// The cache keeps a bounded prefix of the response (the pre-existing
+	// large-directory guard: an over-cap listing answers positive lookups from
+	// its prefix and reports the rest as partial misses), but what this install
+	// publishes to its caller is every response item. Truncating the reply
+	// would hide names past the cap from this readdir, make the Lookup fallback
+	// miss them and cache a false ENOENT, and make
+	// remoteDirectoryHasChildren judge a populated directory empty.
 	limit := len(items)
 	if limit > dc.maxEntries {
 		limit = dc.maxEntries
 	}
-	// served tracks the names this install publishes, which starts as the
-	// response itself (truncated at the entry cap, matching what the cache
-	// holds) and is amended below by the reconciliation.
-	served := make(map[string]CachedFileInfo, limit)
-	for i := 0; i < limit; i++ {
+	served := make(map[string]CachedFileInfo, len(items))
+	for i := 0; i < len(items); i++ {
 		item := items[i]
 		if oldEntry != nil {
 			if oldItem, ok := oldEntry.items[item.Name]; ok {
 				item = mergeCachedOwner(item, oldItem)
 			}
 		}
-		entry.upsert(item, dc.maxEntries)
+		if i < limit {
+			entry.upsert(item, dc.maxEntries)
+		}
 		served[item.Name] = item
 	}
 	// Completeness is decided before the replay below: a carried-over child that
@@ -759,7 +765,7 @@ func (dc *DirCache) InvalidatePrefix(dirPath string) {
 	prefix += "/"
 	for p := range dc.entries {
 		if p == dirPath || strings.HasPrefix(p, prefix) {
-			delete(dc.entries, p)
+			dc.invalidateEntryLocked(p)
 		}
 	}
 }
@@ -769,7 +775,7 @@ func (dc *DirCache) Invalidate(dirPath string) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	delete(dc.entries, dirPath)
+	dc.invalidateEntryLocked(dirPath)
 }
 
 // InvalidateAll clears all cache entries.
@@ -777,7 +783,49 @@ func (dc *DirCache) InvalidateAll() {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	dc.entries = make(map[string]*dirCacheEntry)
+	// Retire each entry rather than replacing the map: entries with listings
+	// still in flight have to keep their reconciliation state.
+	for dirPath := range dc.entries {
+		dc.invalidateEntryLocked(dirPath)
+	}
+}
+
+// invalidateEntryLocked drops a directory's cached namespace state.
+//
+// An entry with listings still in flight is kept rather than deleted: those
+// requests hold a flight registered on it and will replay the reconciliation
+// records it carries. Deleting the entry would strand both — the flights would
+// later release onto whatever entry replaced it (and, because BeginListing does
+// not consume dc.seq, an older flight can even decrement a newer flight's
+// count), and a probe landing before the install would reclaim records the
+// install still needs. What invalidation must drop is the served namespace,
+// which is what this clears. Caller holds dc.mu.
+func (dc *DirCache) invalidateEntryLocked(dirPath string) {
+	entry, ok := dc.entries[dirPath]
+	if !ok {
+		return
+	}
+	if len(entry.outstanding) == 0 {
+		delete(dc.entries, dirPath)
+		return
+	}
+	entry.clearServedState()
+}
+
+// clearServedState drops everything the entry publishes while keeping the
+// reconciliation state (records, flights, install sequence) that in-flight
+// listings depend on.
+func (e *dirCacheEntry) clearServedState() {
+	e.items = make(map[string]CachedFileInfo)
+	e.order = nil
+	e.expires = time.Time{}
+	e.complete = false
+	e.completeExpires = time.Time{}
+	e.sessionExpires = time.Time{}
+	e.negatives = make(map[string]time.Time)
+	e.missWindowStart = time.Time{}
+	e.remoteMisses = 0
+	e.escalateNotBefore = time.Time{}
 }
 
 func newDirCacheEntry() *dirCacheEntry {

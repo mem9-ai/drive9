@@ -375,13 +375,11 @@ func TestDirCacheListingInstallReturnsReconciledView(t *testing.T) {
 func TestDirCacheListingInstallAfterColdParentRemoval(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 
-	// A listing request is issued; then the parent's cache state is dropped
-	// (an invalidation, an expiry, or an rmdir of that directory) before the
-	// unlink arrives.
+	// The parent has no served state at all: the listing request is the first
+	// thing to touch it, so there is nothing cached to correct from.
 	snapshot := dc.BeginListing("/d")
-	dc.Invalidate("/d")
-	if _, ok := dc.entries["/d"]; ok {
-		t.Fatal("fixture bug: the parent entry must be gone")
+	if entry := dc.entries["/d"]; entry == nil || len(entry.items) != 0 {
+		t.Fatal("fixture bug: the parent must hold no served state")
 	}
 
 	// A file is unlinked while the request is still in flight.
@@ -868,4 +866,103 @@ func outstandingFlights(entry *dirCacheEntry) int {
 		total += n
 	}
 	return total
+}
+
+// The view handed to a caller is not capped by the cache's entry limit: the cap
+// bounds what the cache retains, but a truncated reply would hide names past
+// the cap from this readdir, make the Lookup fallback miss them (and cache a
+// false ENOENT), and make remoteDirectoryHasChildren judge a populated
+// directory empty.
+func TestDirCacheListingViewIsNotCappedByMaxEntries(t *testing.T) {
+	const cap = 4
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, cap)
+
+	response := make([]CachedFileInfo, 0, cap*3)
+	for i := range cap * 3 {
+		response = append(response, CachedFileInfo{Name: fmt.Sprintf("f_%02d.dat", i), Revision: 1})
+	}
+	view, installed := dc.PutListing("/d", response, dc.BeginListing("/d"))
+	if !installed {
+		t.Fatal("expected a live install")
+	}
+	if len(view) != len(response) {
+		t.Fatalf("view truncated to the cache cap: got %d entries, want %d", len(view), len(response))
+	}
+	for _, want := range response {
+		if !containsName(func() []string {
+			names := make([]string, 0, len(view))
+			for _, item := range view {
+				names = append(names, item.Name)
+			}
+			return names
+		}(), want.Name) {
+			t.Fatalf("child %s missing from the view", want.Name)
+		}
+	}
+	// The cache itself still honours the cap. Read it through the entry: a
+	// listing the cache had to truncate cannot answer misses, so Get saying no
+	// is expected there and is not what this asserts.
+	entry := dc.entries["/d"]
+	if entry == nil {
+		t.Fatal("expected a cached entry")
+	}
+	if len(entry.items) > cap {
+		t.Fatalf("cache exceeded maxEntries: %d > %d", len(entry.items), cap)
+	}
+}
+
+// Invalidation must not strand a listing that is still in flight: the entry
+// carries both the flight and the reconciliation records its install will
+// replay. Deleting it let a probe reclaim those records first, so a child
+// committed during the request vanished from the installed view.
+func TestDirCacheInvalidateKeepsInFlightReconciliation(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, dc.BeginListing("/d"))
+
+	snapshot := dc.BeginListing("/d")
+	// An SSE reset (or any invalidation) lands while the request is in flight.
+	dc.Invalidate("/d")
+	// A local commit lands too, then a probe touches the directory.
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Size: 3})
+	dc.Lookup("/d", "committed.dat")
+	dc.Get("/d")
+
+	view, installed := dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, snapshot)
+	if !installed {
+		t.Fatal("expected a live install")
+	}
+	names := make([]string, 0, len(view))
+	for _, item := range view {
+		names = append(names, item.Name)
+	}
+	if !containsName(names, "committed.dat") {
+		t.Fatalf("invalidation dropped a record an in-flight install needed: view=%v", names)
+	}
+}
+
+// Overlapping listings whose snapshots share a sequence must not release each
+// other's flight: an older response installing first used to decrement the
+// newer flight's count, reclaiming the records the newer install still needed.
+func TestDirCacheSequencesSharedAcrossFlightsReleaseIndependently(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, dc.BeginListing("/d"))
+
+	// Both requests are issued before any mutation, so they share a sequence.
+	first := dc.BeginListing("/d")
+	dc.Invalidate("/d")
+	second := dc.BeginListing("/d")
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Size: 3})
+
+	// The first response installs first.
+	dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, first)
+	// The second response lands afterwards and predates the same mutation.
+	view, _ := dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, second)
+
+	names := make([]string, 0, len(view))
+	for _, item := range view {
+		names = append(names, item.Name)
+	}
+	if !containsName(names, "committed.dat") {
+		t.Fatalf("shared-sequence release reclaimed a record still in use: view=%v", names)
+	}
 }
