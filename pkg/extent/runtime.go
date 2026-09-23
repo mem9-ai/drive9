@@ -195,20 +195,21 @@ func CacheKeyForPrefix(prefix string) string {
 }
 
 func NewRuntime(cfg RuntimeConfig) (rt *Runtime, err error) {
+	// NewRuntime takes ownership of cfg.Storage: every error path releases it
+	// (object.Shutdown(nil) is a no-op), so the caller never has to compensate
+	// for a half-built runtime — a client that opened a GCS store would
+	// otherwise leak its HTTP client.
+	defer func() {
+		if err != nil {
+			object.Shutdown(cfg.Storage)
+		}
+	}()
 	if cfg.Transport == nil {
 		return nil, fmt.Errorf("extent runtime: missing meta transport")
 	}
 	if cfg.Storage == nil {
 		return nil, fmt.Errorf("extent runtime: missing object storage")
 	}
-	// NewRuntime takes ownership of cfg.Storage: every error path below releases
-	// it, so the caller never has to compensate for a half-built runtime (a
-	// client that opened a GCS store would otherwise leak its HTTP client).
-	defer func() {
-		if err != nil {
-			object.Shutdown(cfg.Storage)
-		}
-	}()
 	quietJuiceFSLogs()
 	conf := juiceMetaConf()
 	m := jfsmeta.NewDrive9Meta(conf, cfg.Transport)

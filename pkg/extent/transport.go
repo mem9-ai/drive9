@@ -27,8 +27,10 @@ type Transport struct {
 	Timeout time.Duration
 	// Enter/Leave, when set, bracket each meta RPC. A runtime sets them so its
 	// teardown can wait for in-flight metadata before closing the session.
-	// Enter reports false once the transport is closed.
-	Enter func() bool
+	// Enter receives the op name and reports false once the gate is closed, so
+	// teardown can refuse new work while still admitting the session-cleanup RPC
+	// it must run itself.
+	Enter func(op string) bool
 	Leave func()
 }
 
@@ -77,7 +79,7 @@ func (t *Transport) Call(ctx jfsmeta.Context, op string, req, resp any) syscall.
 	if t == nil || t.CallFn == nil {
 		return syscall.EIO
 	}
-	if t.Enter != nil && !t.Enter() {
+	if t.Enter != nil && !t.Enter(op) {
 		return syscall.EIO
 	}
 	if t.Leave != nil {

@@ -166,15 +166,36 @@ func (deadTransport) Call(ctx jfsmeta.Context, op string, req, resp any) syscall
 // takes cfg.Storage and must release it on every error path, so a caller that
 // opened a client-bearing store (GCS) can hand it over without compensating.
 func TestNewRuntimeReleasesStorageOnError(t *testing.T) {
-	inner, err := object.CreateStorage("file", t.TempDir(), "", "", "")
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name string
+		cfg  func(store object.ObjectStorage) RuntimeConfig
+	}{
+		{
+			name: "dead transport",
+			cfg: func(store object.ObjectStorage) RuntimeConfig {
+				return RuntimeConfig{Transport: deadTransport{}, Storage: store}
+			},
+		},
+		{
+			name: "missing transport",
+			cfg: func(store object.ObjectStorage) RuntimeConfig {
+				return RuntimeConfig{Storage: store}
+			},
+		},
 	}
-	rec := &runtimeShutdownRecorder{ObjectStorage: inner}
-	if _, err := NewRuntime(RuntimeConfig{Transport: deadTransport{}, Storage: rec}); err == nil {
-		t.Fatal("NewRuntime must fail with a dead transport")
-	}
-	if got := rec.shutdowns.Load(); got != 1 {
-		t.Fatalf("storage shutdowns = %d, want 1", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inner, err := object.CreateStorage("file", t.TempDir(), "", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := &runtimeShutdownRecorder{ObjectStorage: inner}
+			if _, err := NewRuntime(tc.cfg(rec)); err == nil {
+				t.Fatal("NewRuntime must fail")
+			}
+			if got := rec.shutdowns.Load(); got != 1 {
+				t.Fatalf("storage shutdowns = %d, want 1", got)
+			}
+		})
 	}
 }

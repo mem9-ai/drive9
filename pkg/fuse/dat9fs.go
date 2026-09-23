@@ -245,6 +245,10 @@ type Dat9FS struct {
 	extentBuildCond *sync.Cond
 	extentBuildGen  uint64
 	extentBuildErr  error
+	// extentBuildWaitHook, when non-nil, runs under extentMu just before a
+	// single-flight waiter parks. Tests use it to observe the park without a
+	// scheduler-timing sleep.
+	extentBuildWaitHook func()
 	// extentMisses caches "this path is not an extent file" so an
 	// extent-enabled mount does not pay a stat probe on every syscall against
 	// the classic files that share its glob (the mixed profile is the shape the

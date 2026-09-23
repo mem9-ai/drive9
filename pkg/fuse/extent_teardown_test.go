@@ -60,42 +60,44 @@ func TestExtentTeardownStopsAndClosesRuntime(t *testing.T) {
 	}
 }
 
-// TestExtentMetaHoldDrains pins the teardown drain: drain waits for in-flight
-// metadata RPCs instead of refusing them, so the session-close RPC teardown
-// issues next is still admitted; close (after the session is gone) refuses.
+// TestExtentMetaHoldDrains pins the teardown gate: it waits for in-flight
+// metadata RPCs, refuses new non-cleanup RPCs (a late handler), but admits the
+// session-cleanup RPC teardown must run itself.
 func TestExtentMetaHoldDrains(t *testing.T) {
 	h := newExtentMetaHold()
-	if !h.enter() {
+	if !h.enter(jfsmeta.Drive9OpLookup) {
 		t.Fatal("first enter must be admitted")
 	}
-	drained := make(chan bool, 1)
-	go func() { drained <- h.drain(2 * time.Second) }()
+	closed := make(chan bool, 1)
+	go func() { closed <- h.closeAndWait(2 * time.Second) }()
 	select {
-	case <-drained:
-		t.Fatal("drain returned with an RPC in flight")
+	case <-closed:
+		t.Fatal("closeAndWait returned with an RPC in flight")
 	case <-time.After(50 * time.Millisecond):
 	}
-	if !h.enter() {
-		t.Fatal("drain must keep admitting RPCs; teardown's session-close call needs the gate")
+	if h.enter(jfsmeta.Drive9OpLookup) {
+		t.Fatal("a late non-cleanup RPC must be refused once teardown starts")
 	}
-	h.leave()
-	h.leave()
+	if !h.enter(jfsmeta.Drive9OpCleanStaleSession) {
+		t.Fatal("the session-cleanup RPC must be admitted through the closed gate")
+	}
+	h.leave() // the cleanup RPC
+	h.leave() // the pre-teardown RPC
 	select {
-	case ok := <-drained:
+	case ok := <-closed:
 		if !ok {
-			t.Fatal("drain must report drained after the RPCs finished")
+			t.Fatal("closeAndWait must report drained after the RPCs finished")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("drain did not return after the RPCs finished")
+		t.Fatal("closeAndWait did not return after the RPCs finished")
 	}
-	if !h.enter() {
-		t.Fatal("enter must stay admitted until close; the session is still open")
+	if h.enter(jfsmeta.Drive9OpLookup) {
+		t.Fatal("a non-cleanup RPC must stay refused")
+	}
+	if !h.enter(jfsmeta.Drive9OpCleanStaleSession) {
+		t.Fatal("the cleanup RPC must stay admitted")
 	}
 	h.leave()
-	h.close()
-	if h.enter() {
-		t.Fatal("enter must be refused after close")
-	}
 }
 
 // holdGatedMeta is a jfsmeta.Meta whose only live method, CloseSession, mirrors
@@ -110,7 +112,7 @@ type holdGatedMeta struct {
 
 func (m *holdGatedMeta) CloseSession() error {
 	if m.hold != nil {
-		if !m.hold.enter() {
+		if !m.hold.enter(jfsmeta.Drive9OpCleanStaleSession) {
 			return syscall.EIO
 		}
 		defer m.hold.leave()
@@ -142,8 +144,8 @@ func TestCloseExtentRuntimeAttemptsSessionCleanup(t *testing.T) {
 	if got := rec.shutdowns.Load(); got != 1 {
 		t.Fatalf("storage shutdowns = %d, want 1", got)
 	}
-	if hold.enter() {
-		t.Fatal("enter must be refused after closeExtentRuntime")
+	if hold.enter(jfsmeta.Drive9OpLookup) {
+		t.Fatal("a late non-cleanup RPC must be refused after closeExtentRuntime")
 	}
 }
 
@@ -152,20 +154,20 @@ func TestCloseExtentRuntimeAttemptsSessionCleanup(t *testing.T) {
 // build condition so the waiter does not linger forever.
 func TestEnsureExtentRuntimeWaiterWakesOnTeardown(t *testing.T) {
 	fs := &Dat9FS{}
+	parked := make(chan struct{})
 	fs.extentMu.Lock()
 	fs.extentBuildCond = sync.NewCond(&fs.extentMu)
 	fs.extentBuilding = true
 	fs.extentBuildGen = 1
+	fs.extentBuildWaitHook = func() { close(parked) }
 	fs.extentMu.Unlock()
 
 	done := make(chan error, 1)
 	go func() { done <- fs.ensureExtentRuntime() }()
-	select {
-	case err := <-done:
-		t.Fatalf("waiter returned before teardown: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
+	<-parked // the waiter now holds extentMu and is about to park
 
+	// stopExtentRuntimeLoop blocks on extentMu until the waiter's Wait releases
+	// it, so the teardown broadcast can never race ahead of the park.
 	fs.stopExtentRuntimeLoop()
 	select {
 	case err := <-done:
@@ -183,22 +185,21 @@ func TestEnsureExtentRuntimeWaiterWakesOnTeardown(t *testing.T) {
 func TestEnsureExtentRuntimeWaitersShareBuildError(t *testing.T) {
 	boom := errors.New("build boom")
 	fs := &Dat9FS{}
+	parked := make(chan struct{})
 	fs.extentMu.Lock()
 	fs.extentBuildCond = sync.NewCond(&fs.extentMu)
 	fs.extentBuilding = true
 	fs.extentBuildGen = 1
+	fs.extentBuildWaitHook = func() { close(parked) }
 	fs.extentMu.Unlock()
 
 	done := make(chan error, 1)
 	go func() { done <- fs.ensureExtentRuntime() }()
-	select {
-	case err := <-done:
-		t.Fatalf("waiter returned before the build finished: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
+	<-parked // the waiter now holds extentMu and is about to park
 
 	// Simulate the in-progress build failing, as ensureExtentRuntime's deferred
-	// publisher would.
+	// publisher would. The waiter holds extentMu between the hook and Wait, so
+	// this lock can only be acquired after the waiter has parked — no race.
 	fs.extentMu.Lock()
 	fs.extentBuilding = false
 	fs.extentBuildErr = boom

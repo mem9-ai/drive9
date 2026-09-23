@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
+
 	"github.com/mem9-ai/drive9/pkg/extent"
 )
 
@@ -64,25 +66,24 @@ func (fs *Dat9FS) closeExtentRuntime() {
 	if er == nil {
 		return
 	}
-	// Wait for in-flight metadata RPCs before closing the session, so a late
-	// FUSE handler cannot use a closed one (the object store is refcounted
-	// separately). The gate keeps admitting RPCs during the drain: the session
-	// cleanup below is itself a metadata RPC, and refusing it would leave the
-	// JuiceFS session open. Only CloseRuntime's own call may still arrive, and
-	// the mount has stopped serving by now.
+	// Refuse new metadata RPCs and wait for the in-flight ones before closing the
+	// session, so a late FUSE handler cannot use a closed one (the object store is
+	// refcounted separately). The session-cleanup RPC CloseRuntime issues next is
+	// exempt from the gate: refusing it would leave the JuiceFS session open.
 	if er.hold != nil {
-		if !er.hold.drain(extentMetaDrainTimeout) {
+		if !er.hold.closeAndWait(extentMetaDrainTimeout) {
 			safeLogPrintf("extent metadata drain timed out after %s; closing the session anyway", extentMetaDrainTimeout)
 		}
 	}
 	if err := extent.CloseRuntime(er.rt); err != nil {
 		safeLogPrintf("close extent runtime: %v", err)
 	}
-	if er.hold != nil {
-		// The session is gone; refuse any further RPC.
-		er.hold.close()
-	}
 }
+
+// extentCleanupOp is the one metadata RPC teardown must run after the gate is
+// closed: CloseRuntime's release of the JuiceFS session. Every other RPC is
+// refused once teardown starts.
+const extentCleanupOp = jfsmeta.Drive9OpCleanStaleSession
 
 // extentMetaHold counts in-flight metadata RPCs so teardown can wait for them
 // before closing the JuiceFS session.
@@ -99,10 +100,13 @@ func newExtentMetaHold() *extentMetaHold {
 	return h
 }
 
-func (h *extentMetaHold) enter() bool {
+// enter reports whether a metadata RPC may run. Once teardown has closed the
+// gate only the session-cleanup RPC is admitted, so a late handler is refused
+// while CloseRuntime can still release the session it is protecting.
+func (h *extentMetaHold) enter(op string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closed {
+	if h.closed && op != extentCleanupOp {
 		return false
 	}
 	h.active++
@@ -118,13 +122,13 @@ func (h *extentMetaHold) leave() {
 	}
 }
 
-// drain returns once the in-flight RPCs finish, or false after timeout. Unlike
-// a refuse-then-wait gate it keeps admitting new RPCs, because teardown's own
-// session-close RPC must still get through the gate it is draining. Teardown
+// closeAndWait refuses new metadata RPCs (except the session-cleanup RPC) and
+// returns once the in-flight ones finish, or false after timeout. Teardown
 // proceeds either way: the process is exiting.
-func (h *extentMetaHold) drain(timeout time.Duration) bool {
+func (h *extentMetaHold) closeAndWait(timeout time.Duration) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.closed = true
 	deadline := time.Now().Add(timeout)
 	for h.active > 0 {
 		remain := time.Until(deadline)
@@ -140,14 +144,6 @@ func (h *extentMetaHold) drain(timeout time.Duration) bool {
 		timer.Stop()
 	}
 	return true
-}
-
-// close refuses new RPCs. Call it only after CloseRuntime: until then the
-// session is still open and its cleanup call must be admitted.
-func (h *extentMetaHold) close() {
-	h.mu.Lock()
-	h.closed = true
-	h.mu.Unlock()
 }
 
 type extentRuntime struct {
@@ -184,6 +180,9 @@ func (fs *Dat9FS) ensureExtentRuntime() (err error) {
 			break
 		}
 		gen := fs.extentBuildGen
+		if fs.extentBuildWaitHook != nil {
+			fs.extentBuildWaitHook()
+		}
 		fs.extentBuildCond.Wait()
 		if fs.extentBuildErr != nil && fs.extentBuildGen == gen {
 			// Share the failed build's outcome with every waiter instead of
