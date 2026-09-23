@@ -148,9 +148,27 @@ content and mode together using a single-item batch write with create-only CAS.
 The acknowledged mode generation is cleared only if it is still current; newer
 chmods remain pending and are applied against the committed file. A server that
 rejects the batch endpoint with HTTP 404/405 uses the existing PUT-then-chmod path.
+The mount logs that fallback and retries batch support after a one-minute cooldown;
+a transient gateway response does not disable the optimization for the mount's life.
 Transport failures, malformed responses and per-item errors do not fall back to
 PUT, because the commit outcome may be unknown. Overwrites, empty files,
-multipart uploads and other durability policies keep their existing mode flow.
+multipart uploads, locally staged recovery payloads and other durability policies
+keep their existing mode flow.
+
+Setting mode through batch-write is owner-only, matching the chmod endpoint.
+A scoped token may write content in its authorized paths without `hasMode`, but
+an item with `hasMode` is rejected with per-item 403 before changing content or
+permissions. The client reports that failure and retains dirty state; it does
+not ignore permissions or reinterpret a per-item denial as unsupported batch.
+This server-side enforcement requires the updated server; older deployments
+may still admit scoped batch mode changes.
+
+If the server commits a create but its acknowledgement is lost, the handle
+retains its create-only CAS and later flushes can continue failing with a
+conflict until the application reconciles with the remote file. This inherited
+limitation is deliberate: equal bytes/mode alone do not prove commit ownership.
+Automatic recovery needs a server-verifiable idempotency/commit identity; it
+must not overwrite or adopt another writer's object based only on a stat.
 
 `write-sync` can be dramatically slower for normal buffered writers because a
 single logical file copy may be split into many FUSE write requests. It is
