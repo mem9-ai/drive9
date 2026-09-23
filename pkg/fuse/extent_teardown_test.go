@@ -4,9 +4,11 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 
 	"github.com/mem9-ai/drive9/pkg/extent"
@@ -96,56 +98,52 @@ func TestExtentMetaHoldDrains(t *testing.T) {
 	}
 }
 
-// TestCloseExtentRuntimeDrainsWithoutRefusing drives closeExtentRuntime: while a
-// metadata RPC is in flight the drain waits, and it keeps admitting new RPCs so
-// the runtime's own session-close call is not refused by the gate that protects
-// the session. Only after the session is closed does it refuse further RPCs.
-func TestCloseExtentRuntimeDrainsWithoutRefusing(t *testing.T) {
+// holdGatedMeta is a jfsmeta.Meta whose only live method, CloseSession, mirrors
+// the transport's gate: it enters the hold before doing the cleanup and reports
+// EIO when the gate refuses. Embedding the interface leaves every other method
+// unimplemented, so a test that calls one panics loudly.
+type holdGatedMeta struct {
+	jfsmeta.Meta
+	hold   *extentMetaHold
+	closes atomic.Int64
+}
+
+func (m *holdGatedMeta) CloseSession() error {
+	if m.hold != nil {
+		if !m.hold.enter() {
+			return syscall.EIO
+		}
+		defer m.hold.leave()
+	}
+	m.closes.Add(1)
+	return nil
+}
+
+// TestCloseExtentRuntimeAttemptsSessionCleanup drives closeExtentRuntime and
+// asserts its own session-cleanup RPC is attempted and admitted. With the old
+// refuse-then-drain gate the hold was closed before CloseRuntime ran, so this
+// call returned EIO and the session was never released.
+func TestCloseExtentRuntimeAttemptsSessionCleanup(t *testing.T) {
 	inner, err := object.CreateStorage("file", t.TempDir(), "", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	rec := &extentShutdownRecorder{ObjectStorage: inner}
 	hold := newExtentMetaHold()
-	hold.mu.Lock()
-	hold.active = 1 // one in-flight metadata RPC
-	hold.mu.Unlock()
+	meta := &holdGatedMeta{hold: hold}
 
 	fs := &Dat9FS{}
-	fs.extentRT.Store(&extentRuntime{rt: &extent.Runtime{Storage: rec}, hold: hold})
+	fs.extentRT.Store(&extentRuntime{rt: &extent.Runtime{Meta: meta, Storage: rec}, hold: hold})
+	fs.closeExtentRuntime()
 
-	done := make(chan struct{})
-	go func() {
-		fs.closeExtentRuntime()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		t.Fatal("closeExtentRuntime returned while a metadata RPC was in flight")
-	case <-time.After(50 * time.Millisecond):
-	}
-	if !hold.enter() {
-		t.Fatal("drain must keep admitting RPCs; the session-close call needs the gate")
-	}
-	hold.leave()
-
-	// Finish the in-flight RPC; the drain can now complete.
-	hold.mu.Lock()
-	hold.active = 0
-	hold.cond.Broadcast()
-	hold.mu.Unlock()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("closeExtentRuntime did not finish after the RPC drained")
-	}
-	if hold.enter() {
-		t.Fatal("enter must be refused after closeExtentRuntime")
+	if got := meta.closes.Load(); got != 1 {
+		t.Fatalf("CloseSession calls = %d, want 1 (the drain gate refused the cleanup RPC)", got)
 	}
 	if got := rec.shutdowns.Load(); got != 1 {
 		t.Fatalf("storage shutdowns = %d, want 1", got)
+	}
+	if hold.enter() {
+		t.Fatal("enter must be refused after closeExtentRuntime")
 	}
 }
 
