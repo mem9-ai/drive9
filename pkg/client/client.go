@@ -404,8 +404,8 @@ type BatchWriteItem struct {
 // errors never map to 403; post-commit errors preserve their committed revision.
 // Only that per-item 403/0 is a definite authorization non-commit. Top-level
 // errors and other per-item errors do not establish whether content committed.
-// The server counterpart is TestBatchWriteScopedModeDeniedBeforeMutation in
-// tidbcloud/fs/pkg/server/batch_write_mode_test.go; see docs/design/fuse-durability-policy.md.
+// The server contract was introduced in https://github.com/tidbcloud/fs/pull/189;
+// see docs/design/fuse-durability-policy.md for client fallback semantics.
 type BatchWriteResult struct {
 	Path     string `json:"path"`
 	Status   int    `json:"status"`

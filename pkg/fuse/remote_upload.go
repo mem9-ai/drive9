@@ -37,6 +37,12 @@ const (
 
 var errInvalidShadowUpload = errors.New("invalid shadow upload configuration")
 
+// isInlineShadowUpload is shared by the ordinary uploader and combined-mode
+// eligibility. Empty files have their own direct-PUT path.
+func isInlineShadowUpload(size, threshold int64) bool {
+	return size > 0 && threshold > 0 && size < threshold
+}
+
 func uploadFromShadowRemoteWithRevision(ctx context.Context, c *client.Client, shadows *ShadowStore, localPath, remotePath string, expectedRevision int64) (int64, error) {
 	return uploadFromShadowRemote(ctx, c, shadows, localPath, remotePath, expectedRevision, 0, shadowUploadLocalDurable)
 }
@@ -70,7 +76,7 @@ func uploadFromShadowRemote(ctx context.Context, c *client.Client, shadows *Shad
 		return c.WriteCtxConditionalWithRevision(ctx, remotePath, nil, expectedRevision)
 	}
 	threshold := c.CachedSmallFileThreshold()
-	if threshold > 0 && size < threshold {
+	if isInlineShadowUpload(size, threshold) {
 		data := make([]byte, size)
 		if _, err := fd.ReadAt(data, 0); err != nil {
 			return 0, err

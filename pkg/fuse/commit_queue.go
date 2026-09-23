@@ -1837,7 +1837,10 @@ func (cq *CommitQueue) prepareBatchWriteItems(ctx context.Context, entries []*Co
 			ExpectedRevision: entry.BaseRev,
 			Data:             data,
 		}
-		if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
+		// Older batch endpoints may accept mode without enforcing chmod's
+		// authorization policy. Without the advertised contract, commit content
+		// only and let onCommitSuccessWithOptions apply the pending chmod.
+		if cq.client.CachedBatchWriteModeSupported() && shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 			item.Mode = remoteChmodMode(entry.Mode & posixPermissionModeMask)
 			item.HasMode = true
 		}

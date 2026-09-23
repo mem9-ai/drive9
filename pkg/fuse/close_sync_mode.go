@@ -51,7 +51,7 @@ func (fs *Dat9FS) closeSyncCreateModeLocked(fh *FileHandle, size, expectedRevisi
 		return nil
 	}
 	threshold := fs.client.CachedSmallFileThreshold()
-	if size <= 0 || threshold <= 0 || size >= threshold || size > client.MaxBatchWriteBytes {
+	if !isInlineShadowUpload(size, threshold) || size > client.MaxBatchWriteBytes {
 		return nil
 	}
 	entry, ok := fs.inodes.GetEntry(fh.Ino)
@@ -155,7 +155,7 @@ func (fs *Dat9FS) uploadCloseSyncCreateWithMode(ctx context.Context, localPath s
 		// The server rejects authorization before backend mutation. Retry only
 		// content via PUT, leaving mode pending so chmod reports its own denial.
 		// Do not disable batching for other paths or treat this as a mode ACK.
-		if fs.perf.isEnabled() {
+		if fs.perfEnabled() {
 			fs.perf.closeSyncModeForbiddenFallback.add(1)
 		}
 		return closeSyncUploadResult{outcome: closeSyncUploadForbidden}, nil

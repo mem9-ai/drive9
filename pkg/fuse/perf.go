@@ -534,8 +534,8 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	for i, stats := range p.remoteOps {
 		snap.RemoteOps[perfRemoteOpNames[i]] = stats.snapshot()
 	}
-	snap.Counters["read_cache_hit"] = p.readCacheHit.load()
 	snap.Counters["close_sync_mode_forbidden_fallback"] = p.closeSyncModeForbiddenFallback.load()
+	snap.Counters["read_cache_hit"] = p.readCacheHit.load()
 	snap.Counters["read_cache_miss"] = p.readCacheMiss.load()
 	snap.Counters["dir_cache_hit"] = p.dirCacheHit.load()
 	snap.Counters["dir_cache_miss"] = p.dirCacheMiss.load()

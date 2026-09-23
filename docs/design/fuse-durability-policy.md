@@ -189,10 +189,16 @@ authorization, actual mode application and post-commit revision tests live in
 The historical server source in this repository does not enforce or advertise
 this contract, so this client's combined path stays disabled against it.
 Deploying the server capability enables the optimization for newly negotiated
-clients; existing mounts may need remounting because status is cached. The
+clients on providers supporting inline batch storage; existing mounts may need
+remounting because status is cached. A failed or malformed initial status fetch
+also leaves the optimization disabled until successful negotiation, normally
+by remounting. The
 [release note](../release-notes/2026-09-23-close-sync-create-mode.md) records this
-compatibility boundary. This gate does not change the background commit queue
-or repair authorization in older servers.
+compatibility boundary. The background commit queue requires the same capability
+before attaching batch mode fields. Otherwise it batches content only, then
+applies pending mode through the ordinary chmod endpoint. Chmod denial preserves
+staging and is not acknowledged as a successful mode change. This client gate
+does not repair authorization in older servers.
 
 If the server commits a create but its acknowledgement is lost, the handle
 retains its create-only CAS and later flushes can continue failing with a
