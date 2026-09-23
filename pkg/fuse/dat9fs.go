@@ -6662,7 +6662,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		// settled during this LIST's RTT is absent from the response and,
 		// being already committed, is gone from the pending overlay too, so
 		// nothing later in this request could restore it.
-		items = reconciledFileInfos(items, fs.dirCache.PutListing(parentPath, cachedFileInfos(items), listGen))
+		items = reconciledFileInfos(fs.dirCache.PutListing(parentPath, cachedFileInfos(items), listGen))
 		fs.mountViewMu.RUnlock()
 		return items, generation, nil
 	}
@@ -6690,7 +6690,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 			if !fs.lockMountViewRead(generation) {
 				return nil, 0, syscall.EAGAIN
 			}
-			items = reconciledFileInfos(items, fs.dirCache.PutListing(parentPath, cachedFileInfos(items), listGen))
+			items = reconciledFileInfos(fs.dirCache.PutListing(parentPath, cachedFileInfos(items), listGen))
 			fs.mountViewMu.RUnlock()
 			return items, generation, nil
 		}
@@ -6705,16 +6705,21 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 // reconciledFileInfos projects a merged listing view back onto the client
 // FileInfo shape the list callers work in.
 //
-// The merged view is what the request must serve: a child that committed during
-// the request's round trip is in the merge but absent from the response, and
-// nothing downstream can restore it (its commit already removed the pending
-// entry). Metadata is projected per entry from the merged item rather than
-// reusing the response's struct wherever a name matches, because a mutation
-// that landed mid-RTT can have moved the same name to a newer revision or size.
-func reconciledFileInfos(original []client.FileInfo, view []CachedFileInfo) []client.FileInfo {
-	if view == nil {
-		return original
-	}
+// The merged view is always the answer this request serves: a child that
+// committed during the request's round trip is in the merge but absent from the
+// response, and nothing downstream can restore it (its commit already removed
+// the pending entry). Metadata is projected per entry from the merged item
+// rather than reusing the response's struct wherever a name matches, because a
+// mutation that landed mid-RTT can have moved the same name to a newer revision
+// or size.
+//
+// There is deliberately no fallback to the raw response: an empty merged view
+// means every name the request's cache state implies is gone (a local removal
+// during the round trip), and serving the response instead would reinstate a
+// name this mount just removed. Keeping that distinction out of the signature
+// is the point — a nil-versus-empty check here is what the first version of
+// this fix got wrong.
+func reconciledFileInfos(view []CachedFileInfo) []client.FileInfo {
 	out := make([]client.FileInfo, 0, len(view))
 	for _, item := range view {
 		var mtime int64

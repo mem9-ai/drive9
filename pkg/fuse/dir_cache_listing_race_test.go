@@ -8,8 +8,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // This file covers issue #966: a directory listing that lands while a commit
@@ -442,14 +440,9 @@ func TestDirCacheInvalidateDropsServedState(t *testing.T) {
 // is what the first implementation got wrong: the cache was reconciled but the
 // caller was still handed the raw response.
 func TestReconciledFileInfosProjectsTheMergedView(t *testing.T) {
-	original := []client.FileInfo{{Name: "base.dat", Size: 5, Revision: 4}}
-
-	if got := reconciledFileInfos(original, nil); len(got) != 1 || got[0].Name != "base.dat" {
-		t.Fatalf("nil view must fall back to the response: %v", got)
-	}
-
+	// A child committed during the LIST RTT must reach the caller.
 	merged := []CachedFileInfo{{Name: "base.dat", Size: 5, Revision: 4}, {Name: "new.dat", Size: 7, Revision: 9}}
-	got := reconciledFileInfos(original, merged)
+	got := reconciledFileInfos(merged)
 	names := make([]string, 0, len(got))
 	for _, item := range got {
 		names = append(names, item.Name)
@@ -458,10 +451,17 @@ func TestReconciledFileInfosProjectsTheMergedView(t *testing.T) {
 		t.Fatalf("committed child missing from the projection: %v", names)
 	}
 
+	// Same-name metadata comes from the merged item, not a response struct.
 	updated := []CachedFileInfo{{Name: "base.dat", Size: 50, Revision: 6}}
-	got = reconciledFileInfos(original, updated)
+	got = reconciledFileInfos(updated)
 	if got[0].Size != 50 || got[0].Revision != 6 {
-		t.Fatalf("projection reused the response's stale struct: %+v", got[0])
+		t.Fatalf("projection carried stale metadata: %+v", got[0])
+	}
+
+	// An empty merged view is a real answer: the projection must not fall back
+	// to the raw response, which would reinstate a locally removed name.
+	if got := reconciledFileInfos(nil); len(got) != 0 {
+		t.Fatalf("empty merged view produced entries: %v", got)
 	}
 }
 
@@ -640,5 +640,176 @@ func TestDirCacheInstallInvariantMatrix(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// --- Third review round on #966 -------------------------------------------
+
+// A response taken before the directory was retired must not republish what the
+// retirement discarded: it may answer its own request, but installing it would
+// undo the invalidation until the entry lapsed on its own.
+func TestDirCacheListingIsNotInstalledAcrossRetirement(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "seed.dat"}})
+
+	// A listing request is issued (its generation captured)...
+	requestGen := dc.Generation("/d")
+	// ...then an SSE reset retires the directory...
+	dc.Invalidate("/d")
+	// ...and the stale response arrives afterwards.
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "resurrected.dat"}}, requestGen)
+
+	// The request still gets its own answer.
+	if !containsName(viewNames(view), "resurrected.dat") {
+		t.Fatalf("the issuing request must still receive its response: %v", viewNames(view))
+	}
+	// But nothing was republished into the cache.
+	if _, ok := dc.entries["/d"]; ok {
+		t.Fatalf("a pre-retirement response was installed after the retirement: %v", cachedNames(t, dc, "/d"))
+	}
+	if got := dc.Lookup("/d", "resurrected.dat"); got.kind != namespaceLookupNone {
+		t.Fatalf("retired directory resolved a name from a pre-retirement response: kind=%v", got.kind)
+	}
+}
+
+// A listing issued after a retirement installs normally: the refusal is about
+// ordering, not about the directory being poisoned.
+func TestDirCacheListingAfterRetirementInstalls(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "seed.dat"}})
+	dc.Invalidate("/d")
+
+	requestGen := dc.Generation("/d")
+	dc.PutListing("/d", []CachedFileInfo{{Name: "fresh.dat"}}, requestGen)
+
+	if names := cachedNames(t, dc, "/d"); !containsName(names, "fresh.dat") {
+		t.Fatalf("a listing issued after the retirement was refused: %v", names)
+	}
+}
+
+// At the cache cap, a name this mount committed must not be the one displaced
+// to make room for a name the server can simply list again. (Review round 3.)
+func TestDirCacheEvictionNeverDropsLocallyCommittedName(t *testing.T) {
+	const cap = 2
+	// The committed name is cached FIRST, so it sits at the head of the
+	// eviction order. A policy that simply drops order[0] takes exactly the
+	// name the race protection exists to keep.
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, cap)
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Revision: 2})
+	dc.PutListing("/d", []CachedFileInfo{{Name: "server.dat"}}, 0)
+
+	view := listInstall(dc, "/d", []CachedFileInfo{{Name: "server.dat"}, {Name: "other.dat"}})
+
+	if !containsName(cachedNames(t, dc, "/d"), "committed.dat") {
+		t.Fatalf("a committed child was evicted to cache a server name: %v", cachedNames(t, dc, "/d"))
+	}
+	if !containsName(viewNames(view), "committed.dat") {
+		t.Fatalf("the view dropped the committed child: %v", viewNames(view))
+	}
+}
+
+// When merging evicts or the cap truncates, the listing must not claim to be
+// complete: a complete-listing miss is a false ENOENT for a name that exists.
+func TestDirCacheInstallIsNotCompleteWhenTheCacheCouldNotHoldIt(t *testing.T) {
+	const cap = 2
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, cap)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "server.dat"}})
+
+	// Force an eviction by caching a locally owned name first, at the head of
+	// the eviction order.
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Revision: 2})
+	dc.PutListing("/d", []CachedFileInfo{{Name: "server.dat"}}, 0)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "server.dat"}, {Name: "other.dat"}})
+
+	if dc.CanAnswerMisses("/d") {
+		t.Fatalf("listing claims completeness though the cache could not hold it: %v", cachedNames(t, dc, "/d"))
+	}
+}
+
+// Retirement tombstones must not accumulate: a long-running mount that
+// invalidates many distinct directories should not retain one record per path
+// forever. They lapse once no in-flight read can still be covered.
+func TestDirCacheRetirementTombstonesAreBounded(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+
+	const dirs = 200
+	for i := range dirs {
+		dir := fmt.Sprintf("/burst/%03d", i)
+		listInstall(dc, dir, []CachedFileInfo{{Name: "f.dat"}})
+		dc.Invalidate(dir)
+	}
+	if got := len(dc.retired); got != dirs {
+		t.Fatalf("fixture: expected %d live tombstones, got %d", dirs, got)
+	}
+
+	// A tombstone older than the retention window no longer participates and is
+	// dropped on the next use.
+	dc.mu.Lock()
+	stale := dc.retired["/burst/000"]
+	stale.at = time.Now().Add(-2 * retiredTTL)
+	dc.retired["/burst/000"] = stale
+	dc.mu.Unlock()
+
+	// A read captured against the directory observes the lapsed tombstone.
+	token := dc.BeginObservation("/burst/000")
+	if token.gen == stale.gen {
+		t.Fatalf("expired tombstone still reported as the directory generation: %d", token.gen)
+	}
+	dc.mu.Lock()
+	_, stillThere := dc.retired["/burst/000"]
+	dc.mu.Unlock()
+	if stillThere {
+		t.Fatal("expired tombstone was not reclaimed")
+	}
+}
+
+// An older concurrent response must not downgrade what a newer install already
+// published. Listings overlap, so response order is not request order.
+func TestDirCacheOlderInstallDoesNotDowngradeNewer(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 10, Revision: 1}})
+
+	// Request A is issued, then request B, and B's response lands first.
+	older := dc.Generation("/d")
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 99, Revision: 9}})
+
+	// A's response now arrives carrying the older metadata.
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 10, Revision: 1}}, older)
+
+	assertCachedChild(t, dc, "/d", "f.dat", func(item CachedFileInfo) {
+		if item.Size != 99 || item.Revision != 9 {
+			t.Fatalf("older install downgraded the cache: size=%d rev=%d, want 99/9", item.Size, item.Revision)
+		}
+	})
+	for _, item := range view {
+		if item.Name == "f.dat" && (item.Size != 99 || item.Revision != 9) {
+			t.Fatalf("older install served downgraded metadata: size=%d rev=%d", item.Size, item.Revision)
+		}
+	}
+}
+
+// A lapsed listing cannot be the additive base. An unrelated local write keeps
+// the entry alive past the listing's own expiry, so an additive merge would
+// replay a remotely deleted name indefinitely and renew it on every install.
+func TestDirCacheExpiredListingDoesNotRetainRemoteDeletions(t *testing.T) {
+	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "gone.dat"}, {Name: "keep.dat"}})
+
+	// The listing lapses, then an unrelated local write refreshes the entry.
+	time.Sleep(150 * time.Millisecond)
+	dc.Upsert("/d", CachedFileInfo{Name: "other.dat", Revision: 2})
+
+	// A fresh listing omits the remotely deleted name.
+	view := listInstall(dc, "/d", []CachedFileInfo{{Name: "keep.dat"}, {Name: "other.dat"}})
+
+	if names := cachedNames(t, dc, "/d"); containsName(names, "gone.dat") {
+		t.Fatalf("lapsed listing retained a remotely deleted name: %v", names)
+	}
+	if containsName(viewNames(view), "gone.dat") {
+		t.Fatalf("lapsed listing served a remotely deleted name: %v", viewNames(view))
+	}
+	// Names this mount changed after the request are still carried over.
+	if !containsName(cachedNames(t, dc, "/d"), "other.dat") {
+		t.Fatalf("local commit lost by the rebuild: %v", cachedNames(t, dc, "/d"))
 	}
 }

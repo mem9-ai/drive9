@@ -74,6 +74,11 @@ type dirCacheEntry struct {
 	// older value is superseded by whatever changed since.
 	gen uint64
 
+	// installGen is the request generation of the newest listing install this
+	// entry accepted. A response taken before it is stale for every name that
+	// install could have carried, so its items are not applied.
+	installGen uint64
+
 	// localGen stamps each name this mount wrote or removed with the clock
 	// value at that moment. A listing response describes the directory as of
 	// when its request was taken, so a response item carrying a stamp newer
@@ -108,9 +113,24 @@ type DirCache struct {
 	// retired remembers the fencing value of directories whose entry was
 	// dropped. Without it, retiring an entry would erase the very fact an
 	// in-flight read needs: that its directory changed while the read was
-	// outstanding. Tombstones are superseded (and dropped) as soon as a fresh
-	// entry for the same directory takes a larger value.
-	retired map[string]uint64
+	// outstanding. A tombstone is superseded (and dropped) as soon as a fresh
+	// entry for the same directory takes a larger value, and it lapses after
+	// retiredTTL so a long-running mount cannot accumulate one per path it has
+	// ever invalidated.
+	retired map[string]retiredDir
+}
+
+// retainedTTL bounds how long a retirement is remembered. It only has to cover
+// reads that were already in flight when the directory was retired; past that a
+// late response can no longer republish anything, because the entry it would
+// have installed into is long gone.
+const retiredTTL = 2 * time.Minute
+
+// retiredDir is a directory's retirement tombstone: the fencing value in force
+// when its entry was dropped, and when that happened.
+type retiredDir struct {
+	gen uint64
+	at  time.Time
 }
 
 // NewDirCache creates a new DirCache with the given TTL.
@@ -132,7 +152,7 @@ func NewNamespaceCache(ttl, negativeTTL time.Duration, maxEntries int) *DirCache
 	}
 	return &DirCache{
 		entries:     make(map[string]*dirCacheEntry),
-		retired:     make(map[string]uint64),
+		retired:     make(map[string]retiredDir),
 		ttl:         ttl,
 		negativeTTL: negativeTTL,
 		maxEntries:  maxEntries,
@@ -207,11 +227,44 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 	defer dc.mu.Unlock()
 
 	now := time.Now()
+	// A response taken before the directory was retired describes state the
+	// retirement removed (an SSE reset discards the whole directory). It may
+	// answer the request that issued it, but republishing it into the cache
+	// would undo the invalidation until the entry lapsed on its own.
+	if retired, ok := dc.retiredAtLocked(dirPath, now); ok && requestGen < retired {
+		return items
+	}
 	if old, ok := dc.entries[dirPath]; ok && old != nil {
 		old.prune(now)
 	}
 	entry := dc.ensureEntryLocked(dirPath)
 	entry.expires = now.Add(dc.ttl)
+
+	// A lapsed listing cannot serve as the additive base. Its names are as old
+	// as its expiry, and an unrelated local write refreshes the entry's own TTL
+	// while the listing's has already gone, so an additive merge would replay a
+	// remotely deleted name indefinitely — and renew it on every install. Once
+	// the listing has lapsed the response is the newest word on which of those
+	// names still exist, so the base is reset and only names this mount changed
+	// after the request was taken are carried over: the ones the response
+	// cannot know about. This is also the escape hatch for a remote deletion
+	// that no invalidation reported (see the trade-off in the doc comment).
+	if !(entry.complete && !entry.completeExpires.IsZero()) {
+		keptItems := make(map[string]CachedFileInfo, len(entry.items))
+		keptOrder := make([]string, 0, len(entry.items))
+		for _, name := range entry.order {
+			item, live := entry.items[name]
+			if !live {
+				continue
+			}
+			if stamp := entry.localGen[name]; stamp > requestGen {
+				keptItems[name] = item
+				keptOrder = append(keptOrder, name)
+			}
+		}
+		entry.items = keptItems
+		entry.order = keptOrder
+	}
 
 	// The cache retains a bounded prefix of the response (the pre-existing
 	// large-directory guard: an over-cap listing answers positive lookups from
@@ -222,8 +275,15 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 	if limit > dc.maxEntries {
 		limit = dc.maxEntries
 	}
-	// The served set is the response plus whatever the cache holds beyond it.
+	// A response taken before another install cannot overwrite what that
+	// install published: listings overlap, so the older request's response may
+	// describe each name at an older revision than the cache already has. Its
+	// cache effect is limited to names it is still the newest word on, and the
+	// caller is served the accepted state either way.
+	staleInstall := entry.installGen > requestGen
+
 	served := make(map[string]CachedFileInfo, len(items)+len(entry.items))
+	complete := len(items) <= dc.maxEntries
 	for i := 0; i < len(items); i++ {
 		item := items[i]
 		if stamp, changed := entry.localGen[item.Name]; changed && stamp > requestGen {
@@ -234,8 +294,19 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 			}
 			continue
 		}
+		if staleInstall {
+			// Keep whatever the newer install published for this name.
+			if current, live := entry.items[item.Name]; live {
+				served[item.Name] = current
+			}
+			continue
+		}
 		if i < limit {
-			entry.upsert(item, dc.maxEntries)
+			if entry.upsert(item, dc.maxEntries) {
+				// A name was displaced to make room, so the cache no longer
+				// holds the whole listing.
+				complete = false
+			}
 		}
 		served[item.Name] = item
 	}
@@ -244,11 +315,18 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 			served[name] = item
 		}
 	}
-	if len(items) <= dc.maxEntries {
+	// A listing is only complete when the cache holds all of it: a response
+	// larger than the cap is served in full but cached in part, and a complete
+	// miss for a name the cache never held is a false ENOENT.
+	if complete {
 		entry.complete = true
 		entry.completeExpires = now.Add(dc.ttl)
 	}
 	entry.gen = dc.nextGenerationLocked()
+	if !staleInstall {
+		// This install is now the newest word on the directory's names.
+		entry.installGen = requestGen
+	}
 
 	// Emit in the cache's order so the reply matches what a later readdir would
 	// serve, then append the rest deterministically.
@@ -626,9 +704,9 @@ func (dc *DirCache) invalidateEntryLocked(dirPath string) {
 	// that the directory changed while it was outstanding.
 	delete(dc.entries, dirPath)
 	if dc.retired == nil {
-		dc.retired = make(map[string]uint64)
+		dc.retired = make(map[string]retiredDir)
 	}
-	dc.retired[dirPath] = dc.nextGenerationLocked()
+	dc.retired[dirPath] = retiredDir{gen: dc.nextGenerationLocked(), at: time.Now()}
 }
 
 func newDirCacheEntry() *dirCacheEntry {
@@ -665,11 +743,46 @@ func (dc *DirCache) ensureEntryLocked(dirPath string) *dirCacheEntry {
 // generationLocked is the directory's effective fencing value: the live
 // entry's, or the value it was retired at. Caller holds dc.mu.
 func (dc *DirCache) generationLocked(dirPath string) uint64 {
-	gen := dc.retired[dirPath]
+	return dc.generationAtLocked(dirPath, time.Now())
+}
+
+// generationAtLocked is generationLocked against an explicit clock, so callers
+// that already hold a timestamp do not pay for a second one. An expired
+// tombstone is dropped and no longer participates. Caller holds dc.mu.
+func (dc *DirCache) generationAtLocked(dirPath string, now time.Time) uint64 {
+	gen := uint64(0)
+	if tomb, ok := dc.retired[dirPath]; ok {
+		if now.Sub(tomb.at) > retiredTTL {
+			delete(dc.retired, dirPath)
+		} else {
+			gen = tomb.gen
+		}
+	}
 	if entry, ok := dc.entries[dirPath]; ok && entry != nil && entry.gen > gen {
 		gen = entry.gen
 	}
 	return gen
+}
+
+// retiredAtLocked reports the value a directory was retired at, if that
+// retirement is still in force. Caller holds dc.mu.
+func (dc *DirCache) retiredAtLocked(dirPath string, now time.Time) (uint64, bool) {
+	tomb, ok := dc.retired[dirPath]
+	if !ok || now.Sub(tomb.at) > retiredTTL {
+		return 0, false
+	}
+	return tomb.gen, true
+}
+
+// servedOrder returns mapping keys in a deterministic order, so a cache rebuild
+// produces a stable readdir order regardless of Go's map iteration.
+func servedOrder(served map[string]CachedFileInfo) []string {
+	names := make([]string, 0, len(served))
+	for name := range served {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // nextGenerationLocked advances the fencing clock. Caller holds dc.mu.
@@ -678,21 +791,23 @@ func (dc *DirCache) nextGenerationLocked() uint64 {
 	return dc.gen
 }
 
-// Generation returns the directory's current fencing value, for a caller that
-// is about to issue a remote read and needs to know whether the answer still
-// speaks for the directory by the time it arrives.
+// Generation hands a caller about to issue a remote read a value identifying
+// that request. Hand it back on install (PutListing) or completion (Observe) so
+// the cache can tell whether anything has overtaken it.
+//
+// The value comes from the clock and advances it, so every call is unique and
+// later calls sort after earlier ones. That uniqueness is what orders two
+// overlapping requests against each other: reporting the directory's
+// last-event value instead would give two requests issued between the same pair
+// of events the same value, and an older response could then be mistaken for
+// the newer one.
 func (dc *DirCache) Generation(dirPath string) uint64 {
 	if dc == nil || dirPath == "" {
 		return 0
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	// A directory with no entry has no local state, so any later change takes a
-	// strictly newer value than the clock reports now.
-	if entry, ok := dc.entries[dirPath]; ok && entry != nil {
-		return entry.gen
-	}
-	return dc.gen
+	return dc.nextGenerationLocked()
 }
 
 func (dc *DirCache) getEntryLocked(dirPath string, now time.Time) (*dirCacheEntry, bool) {
@@ -708,9 +823,18 @@ func (dc *DirCache) getEntryLocked(dirPath string, now time.Time) (*dirCacheEntr
 	return entry, true
 }
 
-func (e *dirCacheEntry) upsert(item CachedFileInfo, maxEntries int) {
+// upsert stores a child entry, reporting whether the entry had to displace
+// another name to make room (the caller uses that to avoid claiming the
+// listing is complete).
+//
+// At the cap the eviction scans for a name with no local stamp: a name this
+// mount committed is exactly what the listing race protection exists to keep
+// visible, so it must not be the one dropped to make room for a name the
+// server can simply list again. If every name is locally owned, the incoming
+// item is not cached at all.
+func (e *dirCacheEntry) upsert(item CachedFileInfo, maxEntries int) (evicted bool) {
 	if item.Name == "" {
-		return
+		return false
 	}
 	if e.items == nil {
 		e.items = make(map[string]CachedFileInfo)
@@ -720,20 +844,31 @@ func (e *dirCacheEntry) upsert(item CachedFileInfo, maxEntries int) {
 	}
 	if _, exists := e.items[item.Name]; !exists {
 		if maxEntries > 0 && len(e.items) >= maxEntries {
-			if len(e.order) == 0 {
-				return
+			victim := -1
+			for i, name := range e.order {
+				if _, local := e.localGen[name]; !local {
+					victim = i
+					break
+				}
 			}
-			evict := e.order[0]
-			e.order = e.order[1:]
+			if victim < 0 {
+				// Every cached name is locally owned; keep them and leave the
+				// incoming name uncached.
+				return true
+			}
+			evict := e.order[victim]
+			e.order = append(e.order[:victim], e.order[victim+1:]...)
 			delete(e.items, evict)
 			delete(e.negatives, evict)
 			e.complete = false
 			e.completeExpires = time.Time{}
 			e.sessionExpires = time.Time{}
+			evicted = true
 		}
 		e.order = append(e.order, item.Name)
 	}
 	e.items[item.Name] = item
+	return evicted
 }
 
 func mergeCachedOwner(item, existing CachedFileInfo) CachedFileInfo {
