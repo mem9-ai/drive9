@@ -1523,7 +1523,10 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			return
 		}
 		if errors.Is(err, errCommitPayloadStale) {
-			if cq.resolveStalePayloadAsIdempotent(entryCtx, entry) {
+			// The resolver holds the path lock (taken above and kept through
+			// this point), so a synchronous same-path writer cannot commit
+			// newer bytes between its equality proof and its bookkeeping.
+			if resolved, _ := cq.resolveStalePayloadAsIdempotent(entryCtx, entry); resolved {
 				unlockPath()
 				return
 			}
@@ -1748,7 +1751,14 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 					continue
 				}
 				if errors.Is(verr, errCommitPayloadStale) {
-					if cq.resolveStalePayloadAsIdempotent(entryCtx, entry) {
+					// The batch released its path locks before this point, so
+					// reacquire this entry's lock: the resolver's equality
+					// proof and its success bookkeeping must not straddle a
+					// synchronous same-path commit.
+					unlockEntry := cq.lockPath(entry.Path)
+					resolved, _ := cq.resolveStalePayloadAsIdempotent(entryCtx, entry)
+					unlockEntry()
+					if resolved {
 						cq.endInFlight(entry)
 						continue
 					}
@@ -2144,8 +2154,14 @@ func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *Co
 	}
 	committedRev, err := cq.uploadEntry(ctx, entry)
 	if err != nil {
-		if errors.Is(err, errCommitPayloadStale) && cq.resolveStalePayloadAsIdempotent(ctx, entry) {
-			return nil
+		if errors.Is(err, errCommitPayloadStale) {
+			// Report a partial resolution: the bytes are durable, but if the
+			// entry's post-commit bookkeeping (its pending chmod, for
+			// instance) failed, a strict synchronous caller must not be told
+			// durability succeeded.
+			if resolved, postErr := cq.resolveStalePayloadAsIdempotent(ctx, entry); resolved {
+				return postErr
+			}
 		}
 		if cq.perf != nil {
 			cq.perf.commitFailure.add(1)
