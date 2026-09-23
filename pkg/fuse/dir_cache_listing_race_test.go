@@ -475,31 +475,23 @@ func TestDirCacheRecordsReclaimedWithoutInFlightListing(t *testing.T) {
 // An observation from a plain remote read must not displace the whole-directory
 // view a listing install just fetched: request completion order is not a
 // version order, so a stat that simply finished later may describe an older
-// state than the listing does.
+// state than the listing does. The token is what tells them apart.
 func TestDirCacheObserveDoesNotDisplaceListingResponse(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 100, Revision: 5}}, dc.BeginListing("/d"))
 
-	// A listing request is issued and its response carries the newer state.
-	snapshot := dc.BeginListing("/d")
-	// A stat for the same name completes after the request was issued but
-	// describes the older state (size 0, revision 0).
-	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 0, Revision: 0})
-	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 100, Revision: 5}}, snapshot)
+	// The stat request is issued first...
+	token := dc.BeginObservation("/d")
+	// ...then a newer listing installs for the same name...
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 100, Revision: 5}}, dc.BeginListing("/d"))
+	// ...and only now does the older stat complete.
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 0, Revision: 0}, token)
 
-	items, ok := dc.Get("/d")
-	if !ok {
-		t.Fatal("expected cached listing")
-	}
-	for _, item := range items {
-		if item.Name == "f.dat" {
-			if item.Size != 100 || item.Revision != 5 {
-				t.Fatalf("stale observation displaced the listing response: size=%d rev=%d, want 100/5", item.Size, item.Revision)
-			}
-			return
+	assertDirCacheChild(t, dc, "/d", "f.dat", func(item CachedFileInfo) {
+		if item.Size != 100 || item.Revision != 5 {
+			t.Fatalf("late observation displaced the listing response: size=%d rev=%d, want 100/5", item.Size, item.Revision)
 		}
-	}
-	t.Fatalf("child missing: names=%v", dirCacheNames(t, dc, "/d"))
+	})
 }
 
 // An observation must not resurrect a name the listing response omitted: the
@@ -509,14 +501,14 @@ func TestDirCacheObserveDoesNotResurrectOmittedChild(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
 	dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, dc.BeginListing("/d"))
 
-	snapshot := dc.BeginListing("/d")
-	// A stat that finished later reports a child the listing no longer has
-	// (a remote delete landed in between, for example).
-	dc.Observe("/d", CachedFileInfo{Name: "deleted.dat", Size: 4})
-	view, installed := dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, snapshot)
+	// The stat is issued first, the listing omitting deleted.dat installs
+	// while it is in flight, then the stat completes.
+	token := dc.BeginObservation("/d")
+	view, installed := dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, dc.BeginListing("/d"))
 	if !installed {
 		t.Fatal("install did not run for a live snapshot")
 	}
+	dc.Observe("/d", CachedFileInfo{Name: "deleted.dat", Size: 4}, token)
 
 	outNames := make([]string, 0, len(view))
 	for _, item := range view {
@@ -528,6 +520,166 @@ func TestDirCacheObserveDoesNotResurrectOmittedChild(t *testing.T) {
 	if names := dirCacheNames(t, dc, "/d"); containsName(names, "deleted.dat") {
 		t.Fatalf("observation resurrected a name the listing omitted: names=%v", names)
 	}
+}
+
+// A stat that began BEFORE a listing install carries no authority over what
+// that install published, even when its revision is numerically higher. This
+// is the delete+recreate case: the recreated object restarts at a low revision
+// while the deleted one had a high revision, so ranking by revision would let
+// the stale stat drag the cache back to the deleted object's identity.
+func TestDirCacheLateObservationDoesNotRestoreDeletedObjectIdentity(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 10, Revision: 10, ResourceID: "res-A"}}, dc.BeginListing("/d"))
+
+	// The old object is unlinked and recreated; a listing installs the new one.
+	token := dc.BeginObservation("/d")
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1, ResourceID: "res-B"}}, dc.BeginListing("/d"))
+
+	// The stat of the deleted object completes late, carrying its higher
+	// numeric revision and its old identity.
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 10, Revision: 10, ResourceID: "res-A"}, token)
+
+	assertDirCacheChild(t, dc, "/d", "f.dat", func(item CachedFileInfo) {
+		if item.ResourceID != "res-B" || item.Revision != 1 || item.Size != 1 {
+			t.Fatalf("late stat restored the deleted object: res=%q rev=%d size=%d, want res-B/1/1",
+				item.ResourceID, item.Revision, item.Size)
+		}
+	})
+}
+
+// A stat issued AFTER the listing must still be able to refresh metadata the
+// revision cannot express: a remote chmod changes mode without advancing the
+// revision, so an equal-revision observation carries newer metadata and has to
+// be applied. Ranking by revision alone would reject it and serve the old mode.
+func TestDirCacheObservationAppliesSameRevisionMetadataChange(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 50, Revision: 5, Mode: 0o644, HasMode: true}}, dc.BeginListing("/d"))
+
+	// The stat is issued after that install, so its token matches the current
+	// install sequence and it outranks nothing newer.
+	token := dc.BeginObservation("/d")
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 50, Revision: 5, Mode: 0o600, HasMode: true}, token)
+
+	assertDirCacheChild(t, dc, "/d", "f.dat", func(item CachedFileInfo) {
+		if !item.HasMode || item.Mode != 0o600 {
+			t.Fatalf("same-revision metadata change rejected: mode=%#o has=%t, want 0600", item.Mode, item.HasMode)
+		}
+	})
+}
+
+// An observation whose token no longer matches the install state is discarded
+// entirely: the listing installed meanwhile is the newer view, and it decides
+// the directory's contents whether or not it carries this name.
+func TestDirCacheStaleTokenObservationIsDiscarded(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, dc.BeginListing("/d"))
+
+	// A stat is issued, then a newer listing installs before it completes.
+	token := dc.BeginObservation("/d")
+	dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, dc.BeginListing("/d"))
+
+	// The stat completes late and must not publish anything, not even a name
+	// the current listing happens not to carry.
+	dc.Observe("/d", CachedFileInfo{Name: "late.dat", Size: 9}, token)
+	if names := dirCacheNames(t, dc, "/d"); containsName(names, "late.dat") {
+		t.Fatalf("stale-token observation published a child: names=%v", names)
+	}
+	// It also must not overwrite an entry the newer listing carries.
+	dc.Observe("/d", CachedFileInfo{Name: "keep.dat", Size: 99}, token)
+	assertDirCacheChild(t, dc, "/d", "keep.dat", func(item CachedFileInfo) {
+		if item.Size == 99 {
+			t.Fatal("stale-token observation overwrote a published entry")
+		}
+	})
+}
+
+// A read issued after the last install matches the current sequence, so it is
+// applied: that is how a change the revision cannot express still lands.
+func TestDirCacheCurrentTokenObservationApplies(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 5, Revision: 1}}, dc.BeginListing("/d"))
+
+	token := dc.BeginObservation("/d")
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 8, Revision: 1}, token)
+
+	assertDirCacheChild(t, dc, "/d", "f.dat", func(item CachedFileInfo) {
+		if item.Size != 8 {
+			t.Fatalf("current-token observation was rejected: size=%d, want 8", item.Size)
+		}
+	})
+}
+
+// A local authoritative record always outranks an observation, even one whose
+// token is current: the server side of that observation cannot have seen this
+// mount's own mutation yet.
+func TestDirCacheObservationDoesNotOverwriteLocalMutation(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, dc.BeginListing("/d"))
+
+	// This mount settles a write of its own for f.dat.
+	dc.Upsert("/d", CachedFileInfo{Name: "f.dat", Size: 20, Revision: 2})
+
+	// A stat of the same name completes afterwards, describing the state
+	// before this mount's write.
+	token := dc.BeginObservation("/d")
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 10, Revision: 1}, token)
+
+	assertDirCacheChild(t, dc, "/d", "f.dat", func(item CachedFileInfo) {
+		if item.Size != 20 || item.Revision != 2 {
+			t.Fatalf("observation overwrote a local mutation: size=%d rev=%d, want 20/2", item.Size, item.Revision)
+		}
+	})
+}
+
+// An observation still proves the name exists, so it clears a stale negative
+// marker even when it cannot replace the published entry.
+func TestDirCacheObservationClearsNegativeMarker(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{}, dc.BeginListing("/d"))
+	dc.MarkNegative("/d", "f.dat")
+
+	// The stat is issued after that install, so its token is current.
+	token := dc.BeginObservation("/d")
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 3, Revision: 1}, token)
+
+	if got := dc.Lookup("/d", "f.dat"); got.kind != namespaceLookupPositive {
+		t.Fatalf("observation did not publish the child: kind=%v", got.kind)
+	}
+}
+
+// A discarded observation still clears a stale ENOENT marker for the name it
+// proves exists: the marker is about existence, not about which view wins.
+func TestDirCacheDiscardedObservationClearsNegativeMarker(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{}, dc.BeginListing("/d"))
+	dc.MarkNegative("/d", "f.dat")
+
+	// The stat is issued, then a listing installs before it completes.
+	token := dc.BeginObservation("/d")
+	dc.PutListing("/d", []CachedFileInfo{}, dc.BeginListing("/d"))
+
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 3, Revision: 1}, token)
+
+	if got := dc.Lookup("/d", "f.dat"); got.kind == namespaceLookupNegative {
+		t.Fatal("stale ENOENT marker survived an observation that proves existence")
+	}
+}
+
+// assertDirCacheChild runs check against the cached child, failing if the
+// listing or the child is missing.
+func assertDirCacheChild(t *testing.T, dc *DirCache, dirPath, name string, check func(CachedFileInfo)) {
+	t.Helper()
+	items, ok := dc.Get(dirPath)
+	if !ok {
+		t.Fatalf("expected a cached listing for %s", dirPath)
+	}
+	for _, item := range items {
+		if item.Name == name {
+			check(item)
+			return
+		}
+	}
+	t.Fatalf("child %s missing: names=%v", name, dirCacheNames(t, dc, dirPath))
 }
 
 // A cache lookup landing between BeginListing and the install must not drop
@@ -562,8 +714,6 @@ func TestDirCacheListingStateSurvivesConcurrentCacheLookup(t *testing.T) {
 		t.Fatalf("removed child resurrected after concurrent cache lookups: view=%v", outNames)
 	}
 }
-
-// --- Regressions for the second review round on #966 ---------------------
 
 // An install that legitimately filtered every response entry must be served as
 // an empty listing, not silently replaced by the stale response. N1: the
@@ -642,87 +792,6 @@ func TestDirCacheReconciledViewCarriesUpdatedSameName(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("child missing from the view: %v", view)
-	}
-}
-
-// N3: a slow remote stat that STARTED before a listing and completes after it
-// must not regress the cache to its older revision. Completion order is not a
-// version order; the fence is the revision.
-func TestDirCacheLateObservationDoesNotRegressNewerListing(t *testing.T) {
-	dc := NewDirCache(10 * time.Second)
-
-	// A stat request begins (its result will be rev 2).
-	// Then a newer listing installs rev 5 for the same name.
-	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 50, Revision: 5}}, dc.BeginListing("/d"))
-
-	// The older stat now completes.
-	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 20, Revision: 2})
-
-	items, ok := dc.Get("/d")
-	if !ok {
-		t.Fatal("expected cached listing")
-	}
-	for _, item := range items {
-		if item.Name == "f.dat" {
-			if item.Revision != 5 || item.Size != 50 {
-				t.Fatalf("late observation regressed the listing: rev=%d size=%d, want 5/50", item.Revision, item.Size)
-			}
-			return
-		}
-	}
-	t.Fatalf("child missing: %v", dirCacheNames(t, dc, "/d"))
-}
-
-// An observation that cannot be ordered against the published entry (no
-// revision) must not displace it either, in either completion order.
-func TestDirCacheUnversionedObservationDoesNotDisplacePublishedEntry(t *testing.T) {
-	dc := NewDirCache(10 * time.Second)
-	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 50, Revision: 5}}, dc.BeginListing("/d"))
-
-	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 7})
-
-	items, _ := dc.Get("/d")
-	for _, item := range items {
-		if item.Name == "f.dat" {
-			if item.Size != 50 {
-				t.Fatalf("unorderable observation displaced the published entry: size=%d, want 50", item.Size)
-			}
-			return
-		}
-	}
-	t.Fatal("child missing")
-}
-
-// A newer observation still updates the cache: the fence must not freeze it.
-func TestDirCacheNewerObservationStillUpdates(t *testing.T) {
-	dc := NewDirCache(10 * time.Second)
-	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 50, Revision: 5}}, dc.BeginListing("/d"))
-
-	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 80, Revision: 6})
-
-	items, _ := dc.Get("/d")
-	for _, item := range items {
-		if item.Name == "f.dat" {
-			if item.Revision != 6 || item.Size != 80 {
-				t.Fatalf("newer observation rejected: rev=%d size=%d, want 6/80", item.Revision, item.Size)
-			}
-			return
-		}
-	}
-	t.Fatal("child missing")
-}
-
-// An observation still proves the name exists, so it clears a stale negative
-// marker even when it cannot replace the published entry.
-func TestDirCacheObservationClearsNegativeMarker(t *testing.T) {
-	dc := NewDirCache(10 * time.Second)
-	dc.PutListing("/d", []CachedFileInfo{}, dc.BeginListing("/d"))
-	dc.MarkNegative("/d", "f.dat")
-
-	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 3, Revision: 1})
-
-	if got := dc.Lookup("/d", "f.dat"); got.kind != namespaceLookupPositive {
-		t.Fatalf("observation did not publish the child: kind=%v", got.kind)
 	}
 }
 

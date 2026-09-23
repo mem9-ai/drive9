@@ -7877,6 +7877,10 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		return cacheStatus
 	}
 
+	// Capture the observation baseline before the read: a listing installed
+	// while this stat is in flight is the newer whole-directory view, and the
+	// response must not be applied on top of it.
+	observation := fs.dirCache.BeginObservation(parentPath)
 	stat, statGeneration, err := fs.lookupStatWithRetry(cancel, childP)
 	if err != nil {
 		statNotFound := isNotFoundErr(err)
@@ -7981,10 +7985,11 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.extentRefreshFromVFS(ino, childP, 0)
 	}
 	// This is a plain remote read, not a mutation: record it as an observation
-	// so a listing response fetched meanwhile keeps its own (newer, whole
-	// directory) entry for this name instead of being overwritten by a stat
-	// that merely finished later.
-	fs.dirCache.Observe(parentPath, cachedInfoFromStat(name, stat))
+	// so a listing fetched meanwhile keeps its own (newer, whole directory)
+	// entry for this name instead of being overwritten by a stat that merely
+	// finished later. The token captured before the request is what proves
+	// which of the two is newer.
+	fs.dirCache.Observe(parentPath, cachedInfoFromStat(name, stat), observation)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		fs.mountViewMu.RUnlock()

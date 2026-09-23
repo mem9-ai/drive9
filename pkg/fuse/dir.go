@@ -91,6 +91,12 @@ type dirCacheEntry struct {
 	localItem   map[string]CachedFileInfo
 	removedSeq  map[string]uint64
 	outstanding map[uint64]int
+
+	// installSeq is dc.installs' value at this directory's last listing
+	// install. It is the ordering primitive for remote observations: an
+	// observation only installs while no listing has been installed since the
+	// observation began.
+	installSeq uint64
 }
 
 // listingFlight is the release handle for one in-flight listing request. The
@@ -135,6 +141,10 @@ type DirCache struct {
 	// listing install distinguish "the response already covers this" from
 	// "this happened after the request was issued".
 	seq uint64
+	// installs counts listing installs. An observation captured against an
+	// older value is superseded by whatever the install published, so it must
+	// not be applied on top of it.
+	installs uint64
 }
 
 // NewDirCache creates a new DirCache with the given TTL.
@@ -399,6 +409,8 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 			served[name] = item
 		}
 	}
+	dc.installs++
+	entry.installSeq = dc.installs
 	dc.entries[dirPath] = entry
 	// Release this request's flight and reclaim what it no longer needs.
 	dc.releaseListingLocked(snapshot.flight)
@@ -473,46 +485,93 @@ func (dc *DirCache) Upsert(parentPath string, item CachedFileInfo) {
 	dc.upsertInternal(parentPath, item, true)
 }
 
-// Observe records or refreshes a child entry learned from a remote read (a
-// stat/HEAD refresh, for example).
+// ObservationToken marks the cache state at the moment a remote read is
+// issued. Hand it to Observe when the read completes so a response that is
+// merely late cannot overwrite a listing installed while it was in flight.
 //
-// The difference from Upsert is authority, not freshness: request completion
-// order is not a version order, so an observation that happens to land after a
-// listing install may still describe an older state than the listing does.
-// Observations therefore populate the cache but are never replayed over a
-// listing response, and they only replace a cached child when their revision
-// proves them newer (see observationSupersedes). A name the response omits is
-// never resurrected by an observation: the listing is the newer
-// whole-directory view.
-func (dc *DirCache) Observe(parentPath string, item CachedFileInfo) {
-	dc.upsertInternal(parentPath, item, false)
+// The primitive is the install sequence, not the revision. A revision only
+// orders content within one resource identity, and not every visible metadata
+// change advances it (a remote chmod leaves the revision untouched), so trying
+// to order a stat against a listing by revision is wrong in both directions:
+// it ranks a recreated lower-revision object below the deleted one it
+// replaced, and it rejects a same-revision observation that carries newer
+// metadata.
+//
+// The zero value carries no ordering information, so Observe discards it: it
+// can never install, only clear an ENOENT marker for the name it observed.
+type ObservationToken struct {
+	dir        string
+	installSeq uint64
+	valid      bool
 }
 
-// observationSupersedes reports whether a non-authoritative observation may
-// replace the entry currently cached for the same name.
+// BeginObservation captures the token for a remote read of one child under
+// dirPath. Call it immediately before issuing the request; the directory's
+// install sequence is what the completing response is checked against.
+func (dc *DirCache) BeginObservation(dirPath string) ObservationToken {
+	if dc == nil || dirPath == "" {
+		return ObservationToken{}
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	var seq uint64
+	if entry, ok := dc.entries[dirPath]; ok && entry != nil {
+		seq = entry.installSeq
+	}
+	return ObservationToken{dir: dirPath, installSeq: seq, valid: true}
+}
+
+// Observe records a child entry learned from a remote read (a stat/HEAD
+// refresh, for example), paired with the token for that read.
 //
-// Completion order alone cannot decide this: a stat that started before a
-// listing request can finish after it, and the listing's whole-directory view
-// must not be regressed to that older observation. A cached revision may only
-// be replaced by a strictly newer known one, and a revision-less observation
-// may not displace a revision-carrying entry at all — it cannot be ordered
-// against what is already published, so the published view wins. Caller holds
-// dc.mu.
-func (e *dirCacheEntry) observationSupersedes(item CachedFileInfo) bool {
+// Unlike Upsert this is not an authoritative local mutation: completion order
+// is not a version order, so an observation may not be replayed over a listing
+// response and may not resurrect a name a listing omitted. Within those limits
+// it does refresh metadata, which is what carries a change the revision cannot
+// express, such as a remote chmod.
+//
+// The token decides whether the observation can still be applied: if a listing
+// was installed after the token was taken, that listing is the newer
+// whole-directory view — for the names it carries and for the names it omits —
+// so the response is discarded rather than allowed to fill perceived gaps in
+// it. A read issued after the last install matches the current sequence and is
+// applied, which is how a metadata change the revision cannot express (a remote
+// chmod, say) still reaches the cache.
+//
+// Either way the observation proves the name exists now, so an unexpired
+// ENOENT marker for it is cleared even when the entry itself is not replaced.
+func (dc *DirCache) Observe(parentPath string, item CachedFileInfo, token ObservationToken) {
+	dc.upsertObserved(parentPath, item, token)
+}
+
+// upsertObserved applies an observation under the token's authority.
+func (dc *DirCache) upsertObserved(parentPath string, item CachedFileInfo, token ObservationToken) {
+	if item.Name == "" {
+		return
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	entry := dc.ensureEntryLocked(parentPath)
+	// The token must still describe the current install state. A listing
+	// installed while this read was in flight is the newer whole-directory
+	// view, covering names the read carries and names it omits alike, so a
+	// response that began before that install is discarded wholesale rather
+	// than allowed to fill perceived gaps in it.
+	if !token.valid || token.dir != parentPath || entry.installSeq != token.installSeq {
+		delete(entry.negatives, item.Name)
+		return
+	}
 	// A local authoritative record for this name outranks any observation: it
 	// reflects this mount's own mutation, which the server side of that
 	// observation cannot have observed yet.
-	if _, ok := e.localSeq[item.Name]; ok {
-		return false
+	if _, local := entry.localSeq[item.Name]; local {
+		delete(entry.negatives, item.Name)
+		return
 	}
-	existing, ok := e.items[item.Name]
-	if !ok {
-		return true
-	}
-	if item.Revision <= 0 {
-		return false
-	}
-	return item.Revision > existing.Revision
+	entry.expires = time.Now().Add(dc.ttl)
+	entry.upsert(item, dc.maxEntries)
+	delete(entry.negatives, item.Name)
 }
 
 // upsertInternal stores a child entry. authoritative selects whether the write
@@ -526,13 +585,6 @@ func (dc *DirCache) upsertInternal(parentPath string, item CachedFileInfo, autho
 
 	now := time.Now()
 	entry := dc.ensureEntryLocked(parentPath)
-	if !authoritative && !entry.observationSupersedes(item) {
-		// The observation cannot be shown newer than what is already
-		// published, so it must not replace it. It still proves the name
-		// exists, so a stale ENOENT marker for it is dropped either way.
-		delete(entry.negatives, item.Name)
-		return
-	}
 	entry.expires = now.Add(dc.ttl)
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
