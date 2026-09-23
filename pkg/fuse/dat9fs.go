@@ -23,6 +23,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/extent"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
@@ -17203,6 +17204,13 @@ func (fs *Dat9FS) FlushAll() {
 
 	if fs.perf != nil {
 		fs.perf.printSummary(os.Stderr)
+	}
+
+	// Release the extent runtime: close the JuiceFS session and then the object
+	// store, which for GCS owns an HTTP client. Without this a mount torn down
+	// and re-established in the same process leaves one client behind per cycle.
+	if fs.extentRT != nil {
+		_ = extent.CloseRuntime(fs.extentRT.rt)
 	}
 }
 

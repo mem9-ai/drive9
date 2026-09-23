@@ -24,8 +24,12 @@ const gcsExtentChunkSize = 5 << 20
 // JuiceFS's own "gs" backend builds storage.NewClient(ctx) from Application
 // Default Credentials and ignores the accessKey/secretKey/token arguments, so
 // the server's downscoped, tenant-prefix-bound OAuth token cannot be delivered
-// through it. This store presents that token as the bearer credential instead:
-// the token, not the mount's own identity, is the tenant isolation boundary.
+// through it. This store presents that token as the bearer credential instead.
+//
+// The store cannot verify the token's scope: it applies the tenant prefix
+// client-side only. The requirement is on the producer — accessToken must be
+// downscoped to projects/_/buckets/<bucket>/objects/<prefix>, because a
+// bucket-wide token would let a mount reach every tenant's blocks.
 type gcsTokenStorage struct {
 	object.DefaultObjectStorage
 	client *storage.Client
@@ -33,8 +37,10 @@ type gcsTokenStorage struct {
 }
 
 // newGCSTokenStorage builds a bucket-scoped GCS store that authenticates with
-// accessToken. A non-empty endpoint retargets the API (an emulator, or a
-// private/regional endpoint); opts are appended last for tests.
+// accessToken. A non-empty endpoint is the Cloud Storage JSON API base path
+// (e.g. https://storage.googleapis.com/storage/v1/, or an emulator's
+// .../storage/v1/), not a bare host: it replaces the generated client's
+// BasePath verbatim. opts are appended last for tests.
 func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint string, opts ...option.ClientOption) (*gcsTokenStorage, error) {
 	bucket = strings.TrimSpace(bucket)
 	if bucket == "" {

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
 )
@@ -21,21 +22,29 @@ import (
 type gcsFake struct {
 	mu     sync.Mutex
 	status int
-	auth   string
-	uri    string
-	hits   int
+	// deleteStatus overrides status for DELETE requests (0 keeps status).
+	deleteStatus int
+	auth         string
+	uri          string
+	hits         int
 }
 
 func (f *gcsFake) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.auth = r.Header.Get("Authorization")
-		f.uri = r.URL.String()
+		f.uri = r.URL.Path
 		f.hits++
+		status := f.status
+		if r.Method == http.MethodDelete && f.deleteStatus != 0 {
+			status = f.deleteStatus
+		}
 		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(f.status)
-		_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":"stub"}}`, f.status)
+		w.WriteHeader(status)
+		if status >= http.StatusBadRequest {
+			_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":"stub"}}`, status)
+		}
 	})
 }
 
@@ -45,7 +54,7 @@ func (f *gcsFake) snapshot() (auth string, hits int) {
 	return f.auth, f.hits
 }
 
-func (f *gcsFake) lastURI() string {
+func (f *gcsFake) lastPath() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.uri
@@ -107,8 +116,8 @@ func TestOpenStorageGCSAppliesTenantPrefix(t *testing.T) {
 	if _, err := st.Head(context.Background(), "chunks/1"); err == nil {
 		t.Fatal("Head against the fake must fail with not-found")
 	}
-	if uri := f.lastURI(); !strings.Contains(uri, "tenant-z") {
-		t.Fatalf("request URI %q does not contain the tenant prefix", uri)
+	if uri := f.lastPath(); !strings.Contains(uri, "tenant-z") {
+		t.Fatalf("request path %q does not contain the tenant prefix", uri)
 	}
 }
 
@@ -144,7 +153,8 @@ func TestGCSStoreHonoursEndpointAndPresentsToken(t *testing.T) {
 		Scheme:      SchemeGCS,
 		Bucket:      "bucket",
 		AccessToken: "downscoped-token",
-		Endpoint:    url,
+		// The endpoint is the JSON API base path, not a bare host.
+		Endpoint: url + "/storage/v1/",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -162,20 +172,33 @@ func TestGCSStoreHonoursEndpointAndPresentsToken(t *testing.T) {
 	if auth != "Bearer downscoped-token" {
 		t.Fatalf("Authorization = %q, want the downscoped token", auth)
 	}
+	if uri := f.lastPath(); !strings.HasPrefix(uri, "/storage/v1/b/") {
+		t.Fatalf("request path %q is not under the JSON API base", uri)
+	}
 }
 
-// TestGCSDeleteIsIdempotentWhenMissing mirrors JuiceFS's gs backend: a delete
-// for an object that is already gone is a success, even when the SDK returns
-// the sentinel wrapped.
-func TestGCSDeleteIsIdempotentWhenMissing(t *testing.T) {
-	_, url := newGCSFake(t, http.StatusNotFound)
-	gs, err := newGCSTokenStorage(context.Background(), "bucket", "tok", url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer gs.Shutdown()
-	if err := gs.Delete(context.Background(), "t/tenant-z/chunks/1"); err != nil {
-		t.Fatalf("Delete on a missing object = %v, want nil", err)
+// TestGCSDeleteIsIdempotent mirrors JuiceFS's gs backend: deleting an object is
+// a success whether the object was there (200) or already gone (404).
+func TestGCSDeleteIsIdempotent(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		deleteStatus int
+	}{
+		{"present", http.StatusOK},
+		{"already gone", http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, url := newGCSFake(t, http.StatusNotFound)
+			f.deleteStatus = tc.deleteStatus
+			gs, err := newGCSTokenStorage(context.Background(), "bucket", "tok", url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gs.Shutdown()
+			if err := gs.Delete(context.Background(), "t/tenant-z/chunks/1"); err != nil {
+				t.Fatalf("Delete = %v, want nil", err)
+			}
+		})
 	}
 }
 
@@ -231,4 +254,47 @@ func TestCloseRuntimeShutsStorage(t *testing.T) {
 	if got := rec.shutdowns.Load(); got != 1 {
 		t.Fatalf("storage shutdowns = %d, want 1", got)
 	}
+}
+
+// TestRefreshDisposesSupersededStore pins the per-renewal disposal: replacing
+// the inner store on a credential refresh shuts the superseded one down exactly
+// once (a GCS store owns a client), and a failed refresh disposes nothing.
+func TestRefreshDisposesSupersededStore(t *testing.T) {
+	expired := time.Now().Add(-time.Minute).Format(time.RFC3339)
+
+	t.Run("success disposes the superseded store", func(t *testing.T) {
+		rec := newShutdownRecorder(t)
+		st := &refreshingStore{
+			src: staticCredentialSource{cred: &Credential{
+				Scheme: SchemeGCS, Bucket: "bucket", AccessToken: "fresh", ExpiresAt: expired,
+			}},
+			inner:  object.WithPrefix(rec, "t/x/"),
+			cred:   Credential{Scheme: SchemeGCS, Bucket: "bucket", AccessToken: "old", ExpiresAt: expired},
+			scheme: SchemeGCS,
+		}
+		t.Cleanup(func() { object.Shutdown(st.inner) })
+		if _, err := st.innerStore(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if got := rec.shutdowns.Load(); got != 1 {
+			t.Fatalf("superseded shutdowns = %d, want 1", got)
+		}
+	})
+
+	t.Run("failed open disposes nothing", func(t *testing.T) {
+		rec := newShutdownRecorder(t)
+		st := &refreshingStore{
+			// Missing access token: OpenStorage fails, so the old store must stay.
+			src:    staticCredentialSource{cred: &Credential{Scheme: SchemeGCS, Bucket: "bucket", ExpiresAt: expired}},
+			inner:  object.WithPrefix(rec, "t/x/"),
+			cred:   Credential{Scheme: SchemeGCS, Bucket: "bucket", AccessToken: "old", ExpiresAt: expired},
+			scheme: SchemeGCS,
+		}
+		if _, err := st.innerStore(context.Background()); err == nil {
+			t.Fatal("expected the refresh open to fail")
+		}
+		if got := rec.shutdowns.Load(); got != 0 {
+			t.Fatalf("superseded shutdowns = %d, want 0", got)
+		}
+	})
 }

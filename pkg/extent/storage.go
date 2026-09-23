@@ -44,7 +44,10 @@ const (
 
 // Credential is the tenant-prefix object-store session from POST /v1/data-credential.
 type Credential struct {
-	Scheme          string `json:"scheme"`
+	Scheme string `json:"scheme"`
+	// Endpoint is the scheme-specific base. For "file" it is the storage root,
+	// for "s3" the S3 endpoint, and for "gcs" the Cloud Storage JSON API base
+	// path (e.g. https://storage.googleapis.com/storage/v1/), not a bare host.
 	Endpoint        string `json:"endpoint"`
 	Bucket          string `json:"bucket,omitempty"`
 	Prefix          string `json:"prefix"`
@@ -180,9 +183,11 @@ func openInner(cred *Credential) (object.ObjectStorage, error) {
 	case SchemeS3:
 		ep := endpointWithBucket(cred.Endpoint, cred.Bucket)
 		return createS3Storage(ep, cred.AccessKeyID, cred.SecretAccessKey, cred.SessionToken, cred.ForcePathStyle)
-	case SchemeGCS:
-		// An endpoint is honoured for emulators and private/regional APIs; the
-		// server's own mint leaves it empty.
+	case SchemeGCS, "gs":
+		// "gs" is accepted alongside "gcs": the object-backend/objectfs surfaces
+		// canonicalize Cloud Storage to "gs", while the extent data-credential
+		// wire value is "gcs". An endpoint is honoured for an emulator or a
+		// private/regional JSON API base; the server's own mint leaves it empty.
 		st, err := newGCSTokenStorage(context.Background(), cred.Bucket, cred.AccessToken, cred.Endpoint)
 		if err != nil {
 			return nil, err
@@ -233,6 +238,10 @@ type refreshingStore struct {
 	inner  object.ObjectStorage
 	cred   Credential
 	scheme string
+	// closed is set under mu by Shutdown; innerStore refuses to serve or refresh
+	// after teardown, so a late renewal cannot resurrect a client nothing will
+	// close.
+	closed bool
 	// refreshLead is how long before expiry this store renews, jittered per
 	// store instance (see credentialRefreshLead).
 	refreshLead time.Duration
@@ -255,6 +264,12 @@ func (s *refreshingStore) Shutdown() {
 	if s == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
 	object.Shutdown(s.inner)
 }
 
@@ -283,6 +298,9 @@ func tenantFromPrefix(prefix string) string {
 func (s *refreshingStore) innerStore(ctx context.Context) (object.ObjectStorage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil, fmt.Errorf("extent storage is closed")
+	}
 	if s.src == nil || s.cred.ExpiresAt == "" {
 		return s.inner, nil
 	}

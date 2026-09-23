@@ -290,11 +290,14 @@ func CloseRuntime(rt *Runtime) error {
 	if rt == nil {
 		return nil
 	}
-	object.Shutdown(rt.Storage)
-	if rt.Meta == nil {
-		return nil
+	// Close the session first: session-owned background work may still be using
+	// the store. Then release the store, which for GCS owns an HTTP client.
+	var err error
+	if rt.Meta != nil {
+		err = rt.Meta.CloseSession()
 	}
-	return rt.Meta.CloseSession()
+	object.Shutdown(rt.Storage)
+	return err
 }
 
 var vfsStateMu sync.Mutex
