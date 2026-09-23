@@ -141,6 +141,15 @@ waits for remote durability. Failed uploads retain dirty state for retry, but
 their unacknowledged bytes are not additionally guaranteed to survive a machine
 crash in the local shadow. Writeback and recovery upload paths retain local sync.
 
+For a new nonempty inline file with deferred permissions, close-sync can publish
+content and mode together using a single-item batch write with create-only CAS.
+The acknowledged mode generation is cleared only if it is still current; newer
+chmods remain pending and are applied against the committed file. A server that
+rejects the batch endpoint with HTTP 404/405 uses the existing PUT-then-chmod path.
+Transport failures, malformed responses and per-item errors do not fall back to
+PUT, because the commit outcome may be unknown. Overwrites, empty files,
+multipart uploads and other durability policies keep their existing mode flow.
+
 `write-sync` can be dramatically slower for normal buffered writers because a
 single logical file copy may be split into many FUSE write requests. It is
 intended for explicit durability-sensitive workloads, not as the default.

@@ -96,6 +96,7 @@ type Dat9FS struct {
 	kernelCacheBypassSweepTimer *time.Timer
 	kernelCacheBypassSweepAt    time.Time
 	modeSeq                     atomic.Uint64
+	closeSyncBatchUnsupported   atomic.Bool
 	specialMu                   sync.RWMutex
 	specialByPath               map[string]uint64
 	uid                         uint32
@@ -4058,15 +4059,23 @@ func (fs *Dat9FS) applyPendingModeForHandleLocked(ctx context.Context, fh *FileH
 		}
 		return err
 	}
+	fs.finishPendingModeForHandleLocked(fh, mode, modeGen)
+	return nil
+}
+
+// finishPendingModeForHandleLocked acknowledges only the mode generation that
+// actually committed. Like applyPendingModeForHandleLocked it may drop fh.mu
+// while clearing sibling handles, so callers must recheck content/path state.
+func (fs *Dat9FS) finishPendingModeForHandleLocked(fh *FileHandle, mode uint32, modeGen uint64) {
 	if !pendingModeMatchesLocked(fh, mode, modeGen) {
-		return nil
+		return
 	}
+	ino := fh.Ino
 	fs.inodes.UpdateMode(ino, mode)
 	clearPendingModeLocked(fh)
 	fh.Unlock()
 	fs.clearPendingModeForInodeGeneration(ino, fh, mode, modeGen)
 	fh.Lock()
-	return nil
 }
 
 func (fs *Dat9FS) applyPendingModeWithTimeoutLocked(fh *FileHandle) error {
@@ -14459,8 +14468,17 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 			// shadow is only an upload source, not a local durability barrier.
 			uploadShadow = uploadFromShadowRemoteWithoutLocalSync
 		}
+		modeCommit, combineMode := fs.closeSyncCreateModeLocked(fh, size, expectedRevision)
 		fh.Unlock()
-		committedRev, err := uploadShadow(ctx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen)
+		var committedRev int64
+		var err error
+		var modeCommitted bool
+		if combineMode {
+			committedRev, modeCommitted, err = fs.uploadCloseSyncCreateWithMode(ctx, handlePath, size, stagingGens.ShadowGen, modeCommit.mode)
+		}
+		if err == nil && !modeCommitted {
+			committedRev, err = uploadShadow(ctx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen)
+		}
 		var committedMutationRev int64
 		if err == nil {
 			committedMutationRev = fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
@@ -14494,6 +14512,24 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 		}
 		if fh.Path != handlePath || fh.DirtySeq != mutationSeq {
 			return gofuse.OK
+		}
+		if modeCommitted {
+			// Content and this mode are already committed. A concurrent chmod
+			// back to 0644 must not take the "new file has default mode" shortcut,
+			// and a later retry must use the committed CAS base, not create-only.
+			fh.IsNew = false
+			fh.BaseRev = committedRev
+			fh.OrigSize = size
+			fs.inodes.UpdateRevision(handleIno, committedRev)
+			if fh.HasPendingMode && !pendingModeMatchesLocked(fh, modeCommit.mode, modeCommit.generation) {
+				fh.PreviousMode = modeCommit.mode
+				fh.HasPreviousMode = true
+				fh.PreviousModeKnown = true
+			}
+			fs.finishPendingModeForHandleLocked(fh, modeCommit.mode, modeCommit.generation)
+			if fh.Unlinked || fh.Path != handlePath || fh.DirtySeq != mutationSeq {
+				return gofuse.OK
+			}
 		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 			safeLogPrintf("sync handle shadowspill pending chmod failed for %s: %v", fh.Path, err)
