@@ -513,7 +513,7 @@ func TestSQLiteCheckpointABStaleHandleReleaseFreshRemoteKeepsCheckpointB(t *test
 		stale.Unlock()
 		t.Fatal(err)
 	}
-	if err := fs.snapshotWriteBackLocked(stale); err != nil {
+	if err := fs.snapshotWriteBackLocked(stale, true); err != nil {
 		stale.Unlock()
 		t.Fatal(err)
 	}

@@ -468,8 +468,11 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 	}
 	fs.inodes.UpdateRevision(fh.Ino, result.Revision)
 	fs.inodes.UpdateSize(fh.Ino, publishedSize)
+	// Async commit completion is a derived refresh: UpdateMtimeDerived keeps
+	// an armed local time override (explicit utimensat while this append was
+	// in flight), and cacheFileForPath resolves it centrally for the cache.
 	committedAt := time.Now()
-	fs.inodes.UpdateMtime(fh.Ino, committedAt)
+	fs.inodes.UpdateMtimeDerived(fh.Ino, committedAt)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, result.Revision, fh, result.Size)
 	fs.invalidateAppendLogReadTargets(snapshotPath, fh, result.Size)
 	fs.cacheFileForPath(snapshotPath, publishedSize, committedAt, result.Revision)
@@ -812,8 +815,11 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	}
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.inodes.UpdateSize(fh.Ino, sqliteWALHeaderSize)
+	// Async commit completion is a derived refresh: UpdateMtimeDerived keeps
+	// an armed local time override (explicit utimensat while this commit was
+	// in flight), and cacheFileForPath resolves it centrally for the cache.
 	committedAt := time.Now()
-	fs.inodes.UpdateMtime(fh.Ino, committedAt)
+	fs.inodes.UpdateMtimeDerived(fh.Ino, committedAt)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, revision, fh, sqliteWALHeaderSize)
 	fs.invalidateAppendLogReadTargets(snapshotPath, fh, sqliteWALHeaderSize)
 	fs.cacheFileForPath(snapshotPath, sqliteWALHeaderSize, committedAt, revision)
@@ -962,8 +968,11 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	}
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.inodes.UpdateSize(fh.Ino, publishedSize)
+	// Async commit completion is a derived refresh: UpdateMtimeDerived keeps
+	// an armed local time override (explicit utimensat while this rewrite was
+	// in flight), and cacheFileForPath resolves it centrally for the cache.
 	committedAt := time.Now()
-	fs.inodes.UpdateMtime(fh.Ino, committedAt)
+	fs.inodes.UpdateMtimeDerived(fh.Ino, committedAt)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(snapshotPath, revision, fh, snapshot.Size())
 	fs.invalidateAppendLogReadTargets(snapshotPath, fh, snapshot.Size())
 	fs.cacheFileForPath(snapshotPath, publishedSize, committedAt, revision)

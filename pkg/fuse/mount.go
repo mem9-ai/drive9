@@ -92,6 +92,16 @@ type MountOptions struct {
 	PerfCounters                 bool          // print low-overhead FUSE perf counter summary on shutdown
 	EnableGitWorkspaces          bool          // enable fast-clone git workspace overlay discovery
 	Profiling                    ProfilingOptions
+	// WritebackLazyStaging switches write-back close staging from fsynced
+	// local writes (power-loss safe) to plain writes (issue #964): staged
+	// data lands in the kernel page cache of the cache volume — ext4's
+	// durability ladder (daemon-crash safe, not power-loss safe) — and a
+	// background WAL syncer / fsync(2) / umount make it durable.
+	WritebackLazyStaging bool
+	// WritebackSyncWindow bounds the power-loss exposure when
+	// WritebackLazyStaging is on: the WAL syncer fsyncs at this interval.
+	// 0 disables the syncer (only fsync(2)/umount pay).
+	WritebackSyncWindow time.Duration
 	// RemoteCommitWaitTimeout bounds how long a FUSE write/flush handler waits
 	// for a background commit to finish before proceeding anyway. This prevents
 	// the FUSE daemon from hanging indefinitely when a backend upload is slow.
@@ -510,9 +520,22 @@ func Mount(opts *MountOptions) (err error) {
 				fmt.Fprintf(os.Stderr, "drive9: journal init failed: %v (continuing without)\n", err)
 			} else {
 				dat9fs.journal = journal
+				// Route durable pending-meta publication through the WAL
+				// (group-committed fsync) instead of per-entry atomicWrite.
+				pendingIdx.SetJournal(journal)
+				if opts.WritebackLazyStaging {
+					// Issue #964: close stages into the page cache; the
+					// background syncer bounds the power-loss window.
+					pendingIdx.SetJournalSyncOnPut(false)
+					if opts.WritebackSyncWindow > 0 {
+						syncerCtx, syncerCancel := context.WithCancel(context.Background())
+						dat9fs.journalSyncerCancel = syncerCancel
+						go journal.SyncLoop(syncerCtx, opts.WritebackSyncWindow)
+					}
+				}
 				// Replay journal for crash recovery. Preserve the original kind
 				// and base revision so CommitQueue.RecoverPending can re-enqueue.
-				if err := replayJournalIntoPending(journal, pendingIdx); err != nil {
+				if err := replayJournalIntoPending(journal, pendingIdx, shadowStore); err != nil {
 					fmt.Fprintf(os.Stderr, "drive9: journal replay: %v\n", err)
 				}
 				// Drop frames already covered by commit markers so the WAL does
@@ -575,6 +598,10 @@ func Mount(opts *MountOptions) (err error) {
 			}
 			if gvisorWriteBackRequiresCommitQueue(opts, wbCache, dat9fs.commitQueue) {
 				if journal != nil {
+					if dat9fs.journalSyncerCancel != nil {
+						dat9fs.journalSyncerCancel()
+					}
+					_ = journal.FsyncShared()
 					_ = journal.Close()
 				}
 				if shadowStore != nil {

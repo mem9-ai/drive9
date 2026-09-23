@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -8,20 +9,22 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // JournalOp identifies the type of operation recorded in a journal entry.
 type JournalOp int
 
 const (
-	JournalWrite    JournalOp = iota // Write data to a file
-	JournalTruncate                  // Truncate a file
-	JournalRename                    // Rename a file
-	JournalUnlink                    // Delete a file
-	JournalMkdir                     // Create a directory
-	JournalRmdir                     // Remove a directory
-	JournalFsync                     // Fsync a file (local durability marker)
-	JournalCommit                    // Remote commit completed (can be compacted)
+	JournalWrite       JournalOp = iota // Write data to a file
+	JournalTruncate                     // Truncate a file
+	JournalRename                       // Rename a file
+	JournalUnlink                       // Delete a file
+	JournalMkdir                        // Create a directory
+	JournalRmdir                        // Remove a directory
+	JournalFsync                        // Fsync a file (local durability marker)
+	JournalCommit                       // Remote commit completed (can be compacted)
+	JournalPendingMeta                  // Durable pending-index record (Meta carries the serialized WriteBackMeta)
 )
 
 // JournalEntry represents a single operation in the WAL.
@@ -39,6 +42,11 @@ type JournalEntry struct {
 	// file, so crash recovery must rebuild the pending entry in spill mode
 	// (streamed upload) instead of full-memory ReadAll.
 	ShadowSpill bool `json:"shadow_spill,omitempty"`
+	// Meta is the serialized WriteBackMeta for JournalPendingMeta frames:
+	// the durable pending-index record published through the WAL instead of
+	// a per-file atomicWrite (issue #959/#960 follow-up — one group-committed
+	// fsync replaces two per-close fsyncs).
+	Meta []byte `json:"meta,omitempty"`
 }
 
 // Journal is an append-only WAL for crash recovery. Each entry is
@@ -54,6 +62,12 @@ type Journal struct {
 	fd   *os.File
 	seq  atomic.Uint64
 	path string
+
+	// syncMu serializes actual fd.Sync calls so concurrent FsyncShared
+	// waiters coalesce into one fsync (group commit). doneGen (guarded by
+	// mu) is the highest seq known durable; it only advances on success.
+	syncMu  sync.Mutex
+	doneGen uint64
 }
 
 // NewJournal opens or creates a journal WAL file at the given path. The
@@ -139,9 +153,76 @@ func (j *Journal) Append(entry JournalEntry) error {
 
 // Fsync ensures all journal entries are durable on disk.
 func (j *Journal) Fsync() error {
+	return j.FsyncShared()
+}
+
+// FsyncShared makes every entry appended before the call durable, coalescing
+// concurrent waiters into a single fsync: the first caller becomes the sync
+// leader and everyone who appended before its snapshot returns with it.
+// Callers whose entries were already covered by a successful sync return
+// immediately. A failed sync is returned to the leader and to waiters that
+// queued behind it; doneGen never advances on failure, so later callers retry.
+func (j *Journal) FsyncShared() error {
+	j.mu.Lock()
+	target := j.seq.Load()
+	if j.doneGen >= target {
+		j.mu.Unlock()
+		return nil
+	}
+	j.mu.Unlock()
+
+	j.syncMu.Lock()
+	defer j.syncMu.Unlock()
+
+	// Another leader may have covered our target while we queued on syncMu.
+	j.mu.Lock()
+	if j.doneGen >= target {
+		j.mu.Unlock()
+		return nil
+	}
+	j.mu.Unlock()
+
+	// Snapshot everything appended so far; the sync covers up to here.
+	j.mu.Lock()
+	snapshot := j.seq.Load()
+	j.mu.Unlock()
+	if err := j.fd.Sync(); err != nil {
+		return err
+	}
+	j.mu.Lock()
+	if snapshot > j.doneGen {
+		j.doneGen = snapshot
+	}
+	j.mu.Unlock()
+	return nil
+}
+
+// SyncLoop periodically calls FsyncShared until the channel closes, bounding
+// the power-loss exposure of un-fsynced appends (issue #964). It stops on
+// channel close or context cancellation and returns.
+func (j *Journal) SyncLoop(ctx context.Context, interval time.Duration) {
+	if j == nil || interval <= 0 {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			_ = j.FsyncShared()
+		}
+	}
+}
+
+// DurableSeq reports the highest journal sequence known to be on stable
+// storage (advanced only by successful fsyncs). Exposed for tests and
+// diagnostics.
+func (j *Journal) DurableSeq() uint64 {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return j.fd.Sync()
+	return j.doneGen
 }
 
 // Replay reads all entries from the journal file and calls fn for each
@@ -170,6 +251,10 @@ func (j *Journal) Replay(fn func(JournalEntry)) error {
 // Compact removes all committed entries from the journal by rewriting
 // the file with only uncommitted entries.
 func (j *Journal) Compact() error {
+	// syncMu before mu matches FsyncShared's order and keeps the fd swap
+	// below from racing an in-flight Sync.
+	j.syncMu.Lock()
+	defer j.syncMu.Unlock()
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
@@ -237,12 +322,13 @@ func (j *Journal) Close() error {
 //
 // Entries whose .meta survived (already present in the pending index) are
 // left untouched: the .meta file carries strictly more metadata than the WAL.
-func replayJournalIntoPending(j *Journal, idx *PendingIndex) error {
+func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStore) error {
 	if j == nil || idx == nil {
 		return nil
 	}
 
 	latestData := make(map[string]JournalEntry) // path → latest fsync entry
+	latestMeta := make(map[string]JournalEntry) // path → latest pending-meta entry
 	latestDone := make(map[string]uint64)       // path → latest commit/unlink seq
 	if err := j.Replay(func(e JournalEntry) {
 		switch e.Op {
@@ -256,17 +342,48 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex) error {
 			if prev, ok := latestData[e.Path]; !ok || e.Seq > prev.Seq {
 				latestData[e.Path] = e
 			}
+		case JournalPendingMeta:
+			if prev, ok := latestMeta[e.Path]; !ok || e.Seq > prev.Seq {
+				latestMeta[e.Path] = e
+			}
 		}
 	}); err != nil {
 		return err
 	}
 
-	for path, e := range latestData {
+	// A path can have both frame kinds (close published a meta frame, a later
+	// fsync(2) added a data frame, or vice versa); the newest frame wins.
+	ressurrect := func(path string, e JournalEntry, fromMeta bool) error {
 		if doneSeq, ok := latestDone[path]; ok && doneSeq > e.Seq {
-			continue // committed or unlinked after the last local fsync
+			return nil // committed or unlinked after the last local record
 		}
 		if idx.HasPending(path) {
-			continue
+			return nil
+		}
+		if fromMeta {
+			var meta WriteBackMeta
+			if err := json.Unmarshal(e.Meta, &meta); err != nil {
+				return fmt.Errorf("journal replay resurrect %s: %w", path, err)
+			}
+			// Issue #964: close staging is un-fsynced, so the WAL meta frame
+			// may reach disk while the shadow content did not. A frame whose
+			// content is short is a lost file (same outcome as ext4 dropping
+			// un-flushed page cache) — drop the entry instead of uploading
+			// torn bytes. The guard must cover non-spill frames too: both
+			// kinds upload from the shadow file, and a lazy overwrite of a
+			// pre-existing file would otherwise CAS-commit truncated content
+			// over a good remote revision.
+			if shadows != nil {
+				if size, ok := shadows.ContentSize(path); ok && size < meta.Size {
+					// Partial content: the file is not recoverable.
+					shadows.Remove(path)
+					return nil
+				}
+			}
+			if err := idx.publishRecoveredMeta(e.Meta); err != nil {
+				return fmt.Errorf("journal replay resurrect %s: %w", path, err)
+			}
+			return nil
 		}
 		kind := PendingOverwrite
 		if e.BaseRev == 0 {
@@ -280,6 +397,23 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex) error {
 		}
 		if err != nil {
 			return fmt.Errorf("journal replay resurrect %s: %w", path, err)
+		}
+		return nil
+	}
+	for path, e := range latestData {
+		if m, ok := latestMeta[path]; ok && m.Seq > e.Seq {
+			continue // the meta frame is newer and carries full fidelity
+		}
+		if err := ressurrect(path, e, false); err != nil {
+			return err
+		}
+	}
+	for path, e := range latestMeta {
+		if d, ok := latestData[path]; ok && d.Seq > e.Seq {
+			continue // the fsync frame is newer
+		}
+		if err := ressurrect(path, e, true); err != nil {
+			return err
 		}
 	}
 	return nil

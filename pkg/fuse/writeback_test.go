@@ -482,6 +482,73 @@ func TestWriteBackUploader_SubmitAndUpload(t *testing.T) {
 	}
 }
 
+// TestWriteBackUploader_SubmitBackpressureNeverDrops verifies Submit's
+// backpressure contract: while the upload channel stays full, Submit must
+// block until a worker frees space (or time out into the synchronous
+// fallback) — it must never return while silently dropping the path.
+func TestWriteBackUploader_SubmitBackpressureNeverDrops(t *testing.T) {
+	const total = 300 // > uploadCh capacity (256) + workers, so Submit must wait
+	release := make(chan struct{})
+	var puts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			puts.Add(1)
+			<-release // hold every upload until the queue is provably saturated
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(ts.URL)
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	for i := 0; i < total; i++ {
+		// NoSync staging: the test only needs the entries readable by the
+		// uploader, not durable.
+		if _, _, err := cache.PutWithBaseRevAndModeAndLineageTimingsNoSync(fmt.Sprintf("/bp/f%03d.txt", i), []byte("x"), 1, PendingNew, 0, 0, false, "", "", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var submitted atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < total; i++ {
+			submitted.Add(1)
+			uploader.Submit(fmt.Sprintf("/bp/f%03d.txt", i))
+		}
+	}()
+
+	// Saturation: the queue is full and the submitter has counted past what
+	// capacity can hold — that Submit is inside its backpressure wait (or,
+	// in the regression, already returned without enqueuing).
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(uploader.uploadCh) == cap(uploader.uploadCh) && int(submitted.Load()) >= cap(uploader.uploadCh)+1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(uploader.uploadCh) != cap(uploader.uploadCh) || int(submitted.Load()) < cap(uploader.uploadCh)+1 {
+		t.Fatalf("queue never saturated: submitted=%d queued=%d", submitted.Load(), len(uploader.uploadCh))
+	}
+	close(release)
+	<-done
+	uploader.DrainAll()
+
+	if n := puts.Load(); n != total {
+		t.Fatalf("uploaded %d of %d submitted paths — Submit dropped acknowledged work under backpressure", n, total)
+	}
+}
+
 func TestWriteBackUploader_RecoverPending(t *testing.T) {
 	var uploadCount atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3044,7 +3111,7 @@ func testFsyncWALFrameDurableBeforeEnqueue(t *testing.T, spill bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := replayJournalIntoPending(journal, idx); err != nil {
+	if err := replayJournalIntoPending(journal, idx, nil); err != nil {
 		t.Fatal(err)
 	}
 	if idx.HasPending(remotePath) {

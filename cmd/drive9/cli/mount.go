@@ -193,6 +193,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
 	trustProcessLocalEvents := fs.Bool("trust-process-local-events", false, "allow revision-bound GetAttr dir-cache hits using process-local SSE freshness; only safe for single-server/sticky routing or cluster-wide event streams")
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
+wbSyncWindow := fs.String("writeback-sync-window", "1s", "write-back close staging durability: a duration bounds the power-loss window via a background WAL syncer (default 1s); \"0\"/\"off\" defers all fsyncs to fsync(2)/umount; \"close\" restores fsync-at-close staging (legacy power-loss-safe behavior; see issue #964)")
 	layerRef := fs.String("layer", "", "mount through writable fs layer (layer id, name, or tag ref)")
 	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
 	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
@@ -533,6 +534,17 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
+	wbLazyStaging, wbSyncWindowDur, err := parseWritebackSyncWindow(*wbSyncWindow)
+	if err != nil {
+		return err
+	}
+	if wbLazyStaging && writePolicyVal != fuseWritePolicyWriteBack {
+		// close-sync/write-sync pay synchronous durability at every
+		// write/close; lazy staging is meaningless there. Downgrade to the
+		// legacy flag value instead of erroring, so default-argument mounts
+		// of the strict tiers keep working (issue #964).
+		wbLazyStaging, wbSyncWindowDur = false, 0
+	}
 	if *writeBackBatchWindow > 0 && writePolicyVal != fuseWritePolicyWriteBack {
 		return fmt.Errorf("drive9 mount: --writeback-batch-window requires --durability auto, interactive, or fsync")
 	}
@@ -837,6 +849,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		TrustLocalEvents:             *trustProcessLocalEvents,
 		SyncMode:                     syncModeVal,
 		WritePolicy:                  writePolicyVal,
+		WritebackLazyStaging:         wbLazyStaging,
+		WritebackSyncWindow:          wbSyncWindowDur,
 		Profile:                      profileCfg.Name,
 		LayerRef:                     strings.TrimSpace(*layerRef),
 		CheckpointRef:                strings.TrimSpace(*checkpointRef),

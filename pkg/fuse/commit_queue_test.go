@@ -3118,7 +3118,7 @@ func TestCommitQueueCancelPathJournalsCommitMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := replayJournalIntoPending(journal, recovered); err != nil {
+	if err := replayJournalIntoPending(journal, recovered, nil); err != nil {
 		t.Fatal(err)
 	}
 	if recovered.HasPending("/gone.txt") {

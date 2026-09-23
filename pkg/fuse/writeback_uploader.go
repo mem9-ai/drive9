@@ -76,6 +76,10 @@ type WriteBackUploader struct {
 	inflightMu sync.Mutex
 	inflight   map[string]*pathState
 
+	// submitMu serializes Submit's channel send against DrainAll's
+	// stop+close, so a late Submit can never send on a closed channel.
+	submitMu sync.Mutex
+
 	perf      *fusePerfCounters
 	OnSuccess WriteBackSuccessFunc
 	// SnapshotStagingGens optionally captures the pendingIndex/shadowStore
@@ -214,7 +218,15 @@ func (u *WriteBackUploader) Submit(localPath string) {
 	if u.perf != nil {
 		u.perf.uploaderSubmit.add(1)
 	}
+	// Serialize the stopped-check + send against DrainAll's stop+close: a
+	// late Release after unmount drains would otherwise send on a closed
+	// channel and panic the daemon mid-cleanup (observed in issue #964
+	// verification). Holding submitMu across the buffered send is safe —
+	// the channel buffer is the actual backpressure, and DrainAll waits for
+	// workers via wg after close, not on this lock.
+	u.submitMu.Lock()
 	if u.stopped.Load() {
+		u.submitMu.Unlock()
 		safeLogPrintf("writeback uploader: already stopped, uploading synchronously for %s", localPath)
 		if u.perf != nil {
 			u.perf.uploaderSyncFallback.add(1)
@@ -224,19 +236,29 @@ func (u *WriteBackUploader) Submit(localPath string) {
 	}
 	select {
 	case u.uploadCh <- localPath:
+		u.submitMu.Unlock()
+		return
 	default:
-		// Channel full — block with timeout, then fallback to sync upload.
-		timer := time.NewTimer(submitTimeout)
-		defer timer.Stop()
-		select {
-		case u.uploadCh <- localPath:
-		case <-timer.C:
-			safeLogPrintf("writeback uploader: channel full after %v, uploading synchronously for %s", submitTimeout, localPath)
-			if u.perf != nil {
-				u.perf.uploaderSyncFallback.add(1)
-			}
-			u.uploadOne(localPath)
+	}
+	// Channel full — block until a worker frees space or the timeout
+	// expires, then upload synchronously in this goroutine so an
+	// acknowledged path is never dropped. This wait stays under submitMu:
+	// the send must not race DrainAll's close (which also holds submitMu),
+	// workers never take this lock — they keep draining the channel, which
+	// is what unblocks the wait — and submitTimeout bounds how long
+	// DrainAll can be held off.
+	timer := time.NewTimer(submitTimeout)
+	defer timer.Stop()
+	select {
+	case u.uploadCh <- localPath:
+		u.submitMu.Unlock()
+	case <-timer.C:
+		u.submitMu.Unlock()
+		safeLogPrintf("writeback uploader: channel full after %v, uploading synchronously for %s", submitTimeout, localPath)
+		if u.perf != nil {
+			u.perf.uploaderSyncFallback.add(1)
 		}
+		u.uploadOne(localPath)
 	}
 }
 
@@ -271,8 +293,10 @@ func (u *WriteBackUploader) DrainAll() {
 		}
 	}()
 	u.stopOnce.Do(func() {
+		u.submitMu.Lock()
 		u.stopped.Store(true)
 		close(u.uploadCh)
+		u.submitMu.Unlock()
 	})
 	u.wg.Wait()
 }

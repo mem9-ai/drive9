@@ -121,7 +121,8 @@ type Dat9FS struct {
 	syncMode SyncMode
 
 	// journal is the append-only WAL for crash recovery (P1).
-	journal *Journal
+	journal             *Journal
+	journalSyncerCancel context.CancelFunc
 
 	// commitQueue is the ordered background remote commit queue (P1).
 	commitQueue *CommitQueue
@@ -2100,8 +2101,30 @@ func (fs *Dat9FS) dirtyHandleSize(ino uint64) (int64, bool) {
 }
 
 func (fs *Dat9FS) markDirtySize(ino uint64, size int64) uint64 {
+	return fs.markDirtySizeOptions(ino, size, true)
+}
+
+// markDirtySizeRestore re-registers dirty state without a user data
+// mutation: writable re-opens loading staged writeback/shadow content, and
+// write-sync failure restores. Unlike markDirtySize it keeps armed local
+// time overrides — reconstructing an open handle is not a write, so a
+// utimensat acknowledged while the previous close is still uploading must
+// survive the re-open.
+func (fs *Dat9FS) markDirtySizeRestore(ino uint64, size int64) uint64 {
+	return fs.markDirtySizeOptions(ino, size, false)
+}
+
+func (fs *Dat9FS) markDirtySizeOptions(ino uint64, size int64, clearLocalTimes bool) uint64 {
 	fs.dirtyMu.Lock()
 	defer fs.dirtyMu.Unlock()
+
+	// A local data mutation (write/truncate) is the canonical
+	// user-mutation point: drop any armed local time override so the later
+	// commit settle and stat refreshes can advance the mtime again
+	// (utimensat-then-write must not leave the mtime frozen).
+	if clearLocalTimes {
+		fs.inodes.ClearLocalTimes(ino)
+	}
 
 	fs.dirtySeq++
 	seq := fs.dirtySeq
@@ -4520,7 +4543,13 @@ func (fs *Dat9FS) enqueueStagedShadowCommitLocked(fh *FileHandle) error {
 	return nil
 }
 
-func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
+// snapshotWriteBackLocked stages the handle's current contents into the
+// write-back cache. durable selects whether the snapshot's own .dat/.meta
+// writes fsync: pass false only when a durable shadow stage + pending-index
+// entry for the same contents already exist (the Flush post-stage path), so
+// the snapshot remains a pure cache; pass true when the snapshot is the only
+// persisted copy (fallback paths without shadow/pendingIndex).
+func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle, durable bool) error {
 	if fs.writeBack == nil {
 		return nil
 	}
@@ -4581,7 +4610,15 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 	bvDur := time.Since(bvStart)
 
 	snapshotID, parentSnapshotID := ensureStagedSnapshotLineageLocked(fh)
-	gen, timings, err := fs.writeBack.PutWithBaseRevAndModeAndLineageTimings(
+	putFn := fs.writeBack.PutWithBaseRevAndModeAndLineageTimings
+	if !durable {
+		// The durable authority for this payload is the shadow store +
+		// pending index (staged durably before this snapshot); the write-back
+		// .dat/.meta are a read/upload cache, so skip their fsyncs (issue
+		// #960: ~12ms of redundant per-close fsyncs on cloud volumes).
+		putFn = fs.writeBack.PutWithBaseRevAndModeAndLineageTimingsNoSync
+	}
+	gen, timings, err := putFn(
 		fh.Path,
 		data,
 		fh.Dirty.Size(),
@@ -4666,7 +4703,7 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 		fh.BaseRev = rev
 	}
 	if zeroOverwrite {
-		fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
+		fh.DirtySeq = fs.markDirtySizeRestore(fh.Ino, 0)
 		fh.StagedSnapshotID = meta.SnapshotID
 		fh.StagedParentSnapshotID = meta.ParentSnapshotID
 		fh.stagedAncestors = processLocalMetaAncestors(meta)
@@ -4716,7 +4753,7 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 		fs.setPendingModeLocked(fh, mode, 0)
 		fs.inodes.UpdateMode(fh.Ino, mode)
 	}
-	fh.DirtySeq = fs.markDirtySize(fh.Ino, int64(len(data)))
+	fh.DirtySeq = fs.markDirtySizeRestore(fh.Ino, int64(len(data)))
 	fh.WriteBackSeq = fh.DirtySeq
 	fh.StagedSnapshotID = meta.SnapshotID
 	fh.StagedParentSnapshotID = meta.ParentSnapshotID
@@ -6730,6 +6767,16 @@ func (fs *Dat9FS) cacheFileForPath(p string, size int64, mtime time.Time, revisi
 	if mtime.IsZero() {
 		mtime = time.Now()
 	}
+	// Commit-settle sites stamp the dir cache with the commit time. An
+	// armed local time override (explicit utimensat acknowledged while the
+	// commit was still in flight) wins, so the cache entry cannot resurrect
+	// the commit time on the next cached readdir/stat. Resolving this here
+	// keeps the invariant enforced at the write side for every settle site.
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		if t, armed := fs.inodes.MtimeOverride(ino); armed {
+			mtime = t
+		}
+	}
 	parentPath, name := cacheParentName(p)
 	fs.dirCache.Upsert(parentPath, CachedFileInfo{
 		Name:     name,
@@ -6810,7 +6857,7 @@ func (fs *Dat9FS) updateEntryFromStat(entry *InodeEntry, stat *client.StatResult
 	entry.IsDir = stat.IsDir
 	fs.inodes.UpdateSize(entry.Ino, stat.Size)
 	if stat.ResourceID != "" || stat.Nlink > 0 {
-		fs.inodes.SetIdentity(entry.Ino, stat.ResourceID, stat.Nlink)
+		fs.inodes.SetIdentityWithKind(entry.Ino, stat.ResourceID, stat.Nlink, stat.IsDir)
 		entry.ResourceID = stat.ResourceID
 		entry.Nlink = stat.Nlink
 	}
@@ -6823,9 +6870,12 @@ func (fs *Dat9FS) updateEntryFromStat(entry *InodeEntry, stat *client.StatResult
 		entry.HasMode = true
 		fs.inodes.UpdateMode(entry.Ino, stat.Mode)
 	}
-	if !stat.Mtime.IsZero() {
+	// A remote stat is a derived refresh: keep an armed local time override
+	// (explicit utimensat still diverged from the server view) instead of the
+	// server mtime, which for a just-committed file is the commit time.
+	if !stat.Mtime.IsZero() && !fs.inodes.HasMtimeOverride(entry.Ino) {
 		entry.Mtime = stat.Mtime
-		fs.inodes.UpdateMtime(entry.Ino, stat.Mtime)
+		fs.inodes.UpdateMtimeDerived(entry.Ino, stat.Mtime)
 	}
 	return entry
 }
@@ -7488,8 +7538,12 @@ func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
 	if entry.Revision > 0 && item.Revision > 0 && item.Revision < entry.Revision {
 		return nil, false
 	}
+	// An armed local time override (explicit utimensat) always wins over the
+	// dir-cache mtime, which for a just-committed file is the commit time.
 	mtime := item.Mtime
-	if mtime.IsZero() || (!entry.Mtime.IsZero() && entry.Mtime.After(mtime)) {
+	if override, ok := fs.inodes.MtimeOverride(entry.Ino); ok {
+		mtime = override
+	} else if mtime.IsZero() || (!entry.Mtime.IsZero() && entry.Mtime.After(mtime)) {
 		mtime = entry.Mtime
 	}
 	if mtime.IsZero() {
@@ -7511,7 +7565,7 @@ func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
 		fs.inodes.UpdateRevision(entry.Ino, item.Revision)
 	}
 	fs.inodes.UpdateSize(entry.Ino, item.Size)
-	fs.inodes.UpdateMtime(entry.Ino, mtime)
+	fs.inodes.UpdateMtimeDerived(entry.Ino, mtime)
 	if item.HasMode {
 		cached.Mode = item.Mode
 		cached.HasMode = true
@@ -8497,6 +8551,13 @@ func (fs *Dat9FS) hasQueuedCommit(p string) bool {
 	return fs.commitQueue != nil && fs.commitQueue.HasPath(p)
 }
 
+// stageDurableAtClose reports whether close-path staging fsyncs its local
+// artifacts. Legacy: true (power-loss safe close). Issue #964 lazy staging:
+// false — plain writes into the kernel page cache, ext4-equivalent ladder.
+func (fs *Dat9FS) stageDurableAtClose() bool {
+	return fs == nil || fs.opts == nil || !fs.opts.WritebackLazyStaging
+}
+
 func (fs *Dat9FS) waitQueuedRemoteCommitBeforeWrite(p string) func() {
 	if fs == nil || p == "" {
 		return func() {}
@@ -8747,7 +8808,10 @@ func (fs *Dat9FS) openHandleEntry(p string) (*InodeEntry, bool) {
 			return nil, false
 		}
 		fs.inodes.UpdateSize(fh.Ino, size)
-		fs.inodes.UpdateMtime(fh.Ino, time.Now())
+		// Dentry reconstruction for an already-open writable file is a
+		// derived refresh, not a user mutation: keep an armed local time
+		// override.
+		fs.inodes.UpdateMtimeDerived(fh.Ino, time.Now())
 		return fs.inodes.GetEntry(fh.Ino)
 	}
 	return nil, false
@@ -8882,12 +8946,15 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 			entry = gitEntry
 		} else if fs.writeBack != nil && !entry.IsDir {
 			// Check pending index first (in-memory, O(1)), then fall back
-			// to old GetMeta for backward compatibility.
+			// to old GetMeta for backward compatibility. Pending metadata is
+			// a derived view of staged state: an armed local time override
+			// (explicit utimensat while the commit is still in flight) wins.
 			pendingFound := false
 			if fs.pendingIndex != nil {
 				if meta, ok := fs.pendingIndex.GetMeta(entry.Path); ok {
 					entry.Size = meta.Size
-					if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
+					if !fs.inodes.HasMtimeOverride(input.NodeId) &&
+						!meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
 						entry.Mtime = meta.Mtime
 					}
 					pendingFound = true
@@ -8896,7 +8963,8 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 			if !pendingFound {
 				if meta, ok := fs.writeBack.GetMeta(entry.Path); ok {
 					entry.Size = meta.Size
-					if !meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
+					if !fs.inodes.HasMtimeOverride(input.NodeId) &&
+						!meta.Mtime.IsZero() && (entry.Mtime.IsZero() || meta.Mtime.After(entry.Mtime)) {
 						entry.Mtime = meta.Mtime
 					}
 					pendingFound = true
@@ -8920,8 +8988,13 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				entry.Size = stat.Size
 				entry.IsDir = stat.IsDir
 				fs.inodes.UpdateSize(input.NodeId, stat.Size)
+				// A stat whose resource identity replaces the inode's known
+				// one means a different object owns the path now; detect it
+				// before SetIdentityWithKind drops the old identity state.
+				replacedIdentity := stat.ResourceID != "" &&
+					fs.inodes.ReplacesIdentity(input.NodeId, stat.ResourceID, stat.IsDir)
 				if stat.ResourceID != "" || stat.Nlink > 0 {
-					fs.inodes.SetIdentity(input.NodeId, stat.ResourceID, stat.Nlink)
+					fs.inodes.SetIdentityWithKind(input.NodeId, stat.ResourceID, stat.Nlink, stat.IsDir)
 					entry.ResourceID = stat.ResourceID
 					entry.Nlink = stat.Nlink
 				}
@@ -8938,10 +9011,18 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 					// have a newer local mtime. This prevents a stale remote mtime
 					// (e.g. creation time from before a local truncation) from
 					// clobbering a locally-updated mtime after the dirty handle is
-					// flushed and the remote stat path runs.
-					if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
+					// flushed and the remote stat path runs. An armed local time
+					// override (explicit utimensat) always wins — except on
+					// identity replacement, where the local time belongs to the
+					// previous object and the replacement's mtime is authoritative
+					// even when older.
+					if replacedIdentity {
 						entry.Mtime = stat.Mtime
-						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+						fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
+					} else if !fs.inodes.HasMtimeOverride(input.NodeId) &&
+						(entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime)) {
+						entry.Mtime = stat.Mtime
+						fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
 					}
 				}
 			}
@@ -8962,8 +9043,10 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				entry.Size = stat.Size
 				entry.IsDir = stat.IsDir
 				fs.inodes.UpdateSize(input.NodeId, stat.Size)
+				replacedIdentity := stat.ResourceID != "" &&
+					fs.inodes.ReplacesIdentity(input.NodeId, stat.ResourceID, stat.IsDir)
 				if stat.ResourceID != "" || stat.Nlink > 0 {
-					fs.inodes.SetIdentity(input.NodeId, stat.ResourceID, stat.Nlink)
+					fs.inodes.SetIdentityWithKind(input.NodeId, stat.ResourceID, stat.Nlink, stat.IsDir)
 					entry.ResourceID = stat.ResourceID
 					entry.Nlink = stat.Nlink
 				}
@@ -8976,9 +9059,16 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 					fs.inodes.UpdateMode(input.NodeId, stat.Mode)
 				}
 				if !stat.Mtime.IsZero() {
-					if entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime) {
+					// Identity replacement: the previous object's local time
+					// (possibly an explicit future utimensat) must not shadow
+					// the replacement's server mtime, even when older.
+					if replacedIdentity {
 						entry.Mtime = stat.Mtime
-						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+						fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
+					} else if !fs.inodes.HasMtimeOverride(input.NodeId) &&
+						(entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime)) {
+						entry.Mtime = stat.Mtime
+						fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
 					}
 				}
 			}
@@ -9315,6 +9405,26 @@ func setAttrCallerOwner(input *gofuse.SetAttrIn) gofuse.Owner {
 	return gofuse.Owner{Uid: header.Uid, Gid: header.Gid}
 }
 
+// setattrTimeOnlyValid is the SetAttr flag subset that only touches
+// timestamps: mtime/atime (including the "now" variants), an optional file
+// handle, and the ctime the kernel attaches to metadata updates.
+const setattrTimeOnlyValid = gofuse.FATTR_MTIME | gofuse.FATTR_ATIME |
+	gofuse.FATTR_MTIME_NOW | gofuse.FATTR_ATIME_NOW |
+	gofuse.FATTR_FH | gofuse.FATTR_CTIME
+
+// isTimeOnlySetAttr reports whether this SetAttr only updates times. Such a
+// request mutates no remotely-committed state, so it must not wait for (or
+// order against) a pending writeback commit of the same path. Any other flag
+// — size, mode, owner, lock owner, suid/sgid kill — keeps the original
+// commit fence.
+func isTimeOnlySetAttr(input *gofuse.SetAttrIn) bool {
+	if input.Valid&^setattrTimeOnlyValid != 0 {
+		return false
+	}
+	return input.Valid&(gofuse.FATTR_MTIME|gofuse.FATTR_ATIME|
+		gofuse.FATTR_MTIME_NOW|gofuse.FATTR_ATIME_NOW) != 0
+}
+
 func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseSetAttr, perfStart, status, 0) }()
@@ -9443,22 +9553,35 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			return fs.extentSetAttr(cancel, input, entry, out)
 		}
 	}
-	unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(entry.Path)
-	defer unlockRemoteCommit()
+	// A time-only SetAttr (utimensat/futimens, including the NOW variants)
+	// mutates no remotely-committed state — times never ride remote commits
+	// and the remaining branches below are no-ops for it — so it must not
+	// wait for (or order against) the path's pending writeback commit:
+	// fencing there serialized tools that restore timestamps right after
+	// close() (unzip, rsync -t, cp -p) behind each file's full commit
+	// settle (~150ms in #954). All other flag combinations keep the fence.
+	if !isTimeOnlySetAttr(input) {
+		unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(entry.Path)
+		defer unlockRemoteCommit()
+	}
 
 	metadataChanged := false
 
-	// Handle mtime updates
+	// Handle mtime updates. Times are mount-local (not part of remote
+	// commits): apply the requested value and arm the local time override
+	// so the in-flight commit's completion, stat refreshes, and directory
+	// reseedings cannot clobber it. The next local data mutation
+	// (markDirtySize) clears the override again.
 	if mtime, ok := input.GetMTime(); ok {
 		entry.Mtime = mtime
-		fs.inodes.UpdateMtime(input.NodeId, mtime)
+		fs.inodes.SetLocalMtime(input.NodeId, mtime)
 		metadataChanged = true
 	}
 
 	// Handle atime updates.
 	if atime, ok := input.GetATime(); ok {
 		entry.Atime = atime
-		fs.inodes.UpdateAtime(input.NodeId, atime)
+		fs.inodes.SetLocalAtime(input.NodeId, atime)
 		metadataChanged = true
 	}
 
@@ -13857,9 +13980,13 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
 	writeSyncAppendLogState := appendLogHandleState{}
 	writeSyncBeforeDirtySeq := fh.DirtySeq
+	writeSyncTimeOverrides := (*localTimeOverrides)(nil)
 	if fh.WritePolicy == WritePolicyWriteSync {
 		writeSyncSnapshot = fh.Dirty.snapshot()
 		writeSyncAppendLogState = fh.appendLog
+		// The dirty-mutation hook below clears armed local time overrides;
+		// a failed write that rolls its content back must re-arm them.
+		writeSyncTimeOverrides = fs.inodes.SnapshotLocalTimes(fh.Ino)
 	}
 
 	writeOffset := int64(input.Offset)
@@ -13979,7 +14106,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 				if state, ok := fs.committedMutation(fh.Ino); ok && fh.DirtySeq != 0 && fh.DirtySeq <= state.committedSeq {
 					fs.discardSupersededMutationLocked(fh)
 				} else if !contentCommitted && !newerDirtyGeneration {
-					fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot, writeSyncBeforeDirtySeq)
+					fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot, writeSyncBeforeDirtySeq, writeSyncTimeOverrides)
 					fh.appendLogRestoreFailedWriteState(writeSyncAppendLogState)
 				}
 			}
@@ -13989,10 +14116,14 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	return n, gofuse.OK
 }
 
-func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBufferSnapshot, restoreDirtySeq uint64) {
+func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBufferSnapshot, restoreDirtySeq uint64, timeOverrides *localTimeOverrides) {
 	if fh == nil {
 		return
 	}
+	// The failed write cleared the local time overrides at its dirty-mutation
+	// hook; with the content rolled back, the pre-write state — including an
+	// explicitly SetAttr'd time acknowledged before the write — is restored.
+	fs.inodes.RestoreLocalTimes(fh.Ino, timeOverrides)
 	if fh.DirtySeq != 0 {
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
@@ -14009,7 +14140,7 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 				fh.DirtySeq = restoreDirtySeq
 				fs.restoreDirtySize(fh.Ino, restoreDirtySeq, fh.Dirty.Size())
 			} else {
-				fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+				fh.DirtySeq = fs.markDirtySizeRestore(fh.Ino, fh.Dirty.Size())
 			}
 		}
 		fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
@@ -14620,7 +14751,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					phase = "small-stage-shadow"
 					stageStart := time.Now()
 					fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
-					err := fs.stageShadowForQueuedCommitLocked(fh, true)
+					err := fs.stageShadowForQueuedCommitLocked(fh, fs.stageDurableAtClose())
 					if errors.Is(err, syscall.EAGAIN) {
 						return gofuse.EAGAIN
 					}
@@ -14644,7 +14775,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 						// the snapshot or falls back to the synchronous flush —
 						// the staged shadow + pendingIndex already carry the
 						// durable commit path.
-						if err := fs.snapshotWriteBackLocked(fh); err != nil {
+						if err := fs.snapshotWriteBackLocked(fh, false); err != nil {
 							safeLogPrintf("writeback snapshot failed for %s: %v", fh.Path, err)
 						} else {
 							fh.WriteBackSeq = fh.DirtySeq
@@ -14656,7 +14787,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 
 				phase = "small-snapshot-writeback"
 				snapWBStart2 := time.Now()
-				if err := fs.snapshotWriteBackLocked(fh); err != nil {
+				if err := fs.snapshotWriteBackLocked(fh, true); err != nil {
 					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
 					safeLogPrintf("writeback cache put failed for %s: %v, falling back to sync upload", fh.Path, err)
 				} else {
@@ -14700,7 +14831,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			size := fh.Dirty.Size()
 			stageStart := time.Now()
 			fs.debugf("flush shadowspill stage start path=%s size=%d durable=true", fh.Path, size)
-			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			err := fs.stageShadowForQueuedCommitLocked(fh, fs.stageDurableAtClose())
 			if errors.Is(err, syscall.EAGAIN) {
 				return gofuse.EAGAIN
 			}
@@ -14865,7 +14996,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				size := fh.Dirty.Size()
 				stageStart := time.Now()
 				fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
-				err := fs.stageShadowForQueuedCommitLocked(fh, true)
+				err := fs.stageShadowForQueuedCommitLocked(fh, fs.stageDurableAtClose())
 				if errors.Is(err, syscall.EAGAIN) {
 					return gofuse.EAGAIN
 				}
@@ -14878,7 +15009,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 						return gofuse.OK
 					}
 					phase = "large-snapshot-writeback"
-					if err := fs.snapshotWriteBackLocked(fh); err != nil {
+					if err := fs.snapshotWriteBackLocked(fh, false); err != nil {
 						safeLogPrintf("flush: writeback snapshot failed for %s: %v", fh.Path, err)
 					} else {
 						// See the small-snapshot-writeback path: only claim a
@@ -15058,7 +15189,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 						ShadowSpill: true,
 					}
 					_ = fs.journal.Append(entry)
-					_ = fs.journal.Fsync()
+					_ = fs.journal.FsyncShared()
 				}
 				if fs.commitQueue != nil {
 					phase = "interactive-shadowspill-enqueue"
@@ -15097,7 +15228,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 						BaseRev: fh.BaseRev,
 					}
 					_ = fs.journal.Append(entry)
-					_ = fs.journal.Fsync()
+					_ = fs.journal.FsyncShared()
 				}
 				if fs.commitQueue != nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path) {
 					phase = "interactive-enqueue"
@@ -15108,7 +15239,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 					}
 				} else {
 					fs.releaseHandleRemoteCommitPathLocked(fh)
-					if err := fs.snapshotWriteBackLocked(fh); err != nil {
+					if err := fs.snapshotWriteBackLocked(fh, true); err != nil {
 						safeLogPrintf("fsync writeback snapshot failed for %s: %v", fh.Path, err)
 					} else {
 						// See the small-snapshot-writeback path: only claim a
@@ -16879,10 +17010,14 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		// Ensure the inode's mtime advances to at least the commit time.
 		// Without this, GetAttr may report a stale mtime from before the
 		// write/truncation if it reads the inode directly (bypassing the
-		// dir cache), causing POSIX mtime-advance checks to fail.
+		// dir cache), causing POSIX mtime-advance checks to fail. The
+		// settle is a derived refresh: an explicit utimensat acknowledged
+		// while this upload was in flight wins (the write itself already
+		// cleared the override at markDirtySize); UpdateMtimeDerived guards
+		// the inode and cacheFileForPath resolves the dir-cache stamp.
 		if entry, ok := fs.inodes.GetEntry(handleIno); ok {
 			if entry.Mtime.Before(commitTime) {
-				fs.inodes.UpdateMtime(handleIno, commitTime)
+				fs.inodes.UpdateMtimeDerived(handleIno, commitTime)
 			}
 		}
 	}
@@ -16918,6 +17053,43 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 // FlushAll flushes all open file handles, drains pending debounced uploads,
 // drains the write-back uploader, and waits for inflight async kernel
 // notifications to complete. Used during graceful shutdown.
+// drainLatePendingEntries rescues staged-but-uncommitted entries left after
+// the primary unmount drains (issue #964). Late FUSE Release arrivals and
+// drain timeouts leave recoverable pending state; commit them synchronously
+// here so a graceful unmount leaves nothing behind locally. Loop a few times:
+// each sync commit may surface follow-up work (mode/lineage follow-ups), and
+// the pending index is the loop condition.
+func (fs *Dat9FS) drainLatePendingEntries() {
+	const (
+		settle   = 100 * time.Millisecond
+		deadline = 120 * time.Second
+	)
+	if fs.pendingIndex == nil || len(fs.pendingIndex.ListPendingPaths()) == 0 {
+		return
+	}
+	start := time.Now()
+	for round := 0; ; round++ {
+		paths := fs.pendingIndex.ListPendingPaths()
+		if len(paths) == 0 {
+			safeLogPrintf("late pending drain: clean after %d rounds (%s)", round, time.Since(start).Round(time.Millisecond))
+			return
+		}
+		if time.Since(start) > deadline {
+			safeLogPrintf("late pending drain: %d entries still pending after %s; leaving them for next-mount recovery", len(paths), deadline)
+			return
+		}
+		safeLogPrintf("late pending drain: round %d, %d entries pending", round, len(paths))
+		var n int
+		if fs.commitQueue != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), deadline-time.Since(start))
+			n = fs.commitQueue.RecoverPendingSync(ctx)
+			cancel()
+		}
+		_ = n
+		time.Sleep(settle)
+	}
+}
+
 func (fs *Dat9FS) FlushAll() {
 	if fs.extentRT != nil {
 		if fs.extentRT.stop != nil {
@@ -16992,12 +17164,27 @@ func (fs *Dat9FS) FlushAll() {
 		fs.commitQueue.DrainAll()
 	}
 
+	// Issue #964: lazy close staging decouples staging from the remote
+	// commit, and FUSE Release can arrive after the drains above (the
+	// kernel delivers Release lazily once the last fd closes, which may be
+	// during or after our sweep). Those late entries stay in the pending
+	// index and would only be rescued by the next mount's RecoverPending.
+	// Loop: give late Releases a moment to land, re-enqueue via recovery,
+	// and re-drain until the pending index is empty or the deadline hits.
+	if fs.pendingIndex != nil && fs.pendingIndex.ListPendingPaths() != nil {
+		fs.drainLatePendingEntries()
+	}
+
 	if fs.diskReadCache != nil {
 		fs.diskReadCache.Close()
 	}
 
 	// Close journal.
 	if fs.journal != nil {
+		if fs.journalSyncerCancel != nil {
+			fs.journalSyncerCancel()
+		}
+		_ = fs.journal.FsyncShared()
 		_ = fs.journal.Close()
 	}
 
@@ -17157,15 +17344,19 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		// are updated above. Kernel will see new attrs on next access.
 	} else {
 		fs.invalidateReadCacheAndTargets(entry.Path)
+		settleMtime := time.Now()
 		if entry.Inode > 0 {
 			fs.inodes.UpdateSize(entry.Inode, entry.Size)
-			fs.inodes.UpdateMtime(entry.Inode, time.Now())
+			// Derived refresh: an armed local time override (explicit
+			// utimensat acknowledged while this commit was in flight) wins;
+			// cacheFileForPath resolves the same for the dir-cache stamp.
+			fs.inodes.UpdateMtimeDerived(entry.Inode, settleMtime)
 			if entry.HasMode {
 				fs.inodes.UpdateMode(entry.Inode, entry.Mode&posixPermissionModeMask)
 			}
 			fs.notifyInode(entry.Inode)
 		}
-		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
+		fs.cacheFileForPath(entry.Path, entry.Size, settleMtime, 0)
 	}
 }
 
@@ -17272,6 +17463,7 @@ func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int6
 	} else {
 		fs.forgetCommittedRevision(meta.Path)
 	}
+	// cacheFileForPath resolves an armed local time override centrally.
 	fs.cacheFileForPath(meta.Path, meta.Size, time.Now(), committedRev)
 	// Clean up pendingIndex and shadowStore so that Unlink does not see a
 	// stale PendingNew entry and skip the remote DELETE (thinking the file

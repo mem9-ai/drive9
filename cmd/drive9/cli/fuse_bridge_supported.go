@@ -44,6 +44,8 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		TrustLocalEvents:             opts.TrustLocalEvents,
 		SyncMode:                     mode,
 		WritePolicy:                  writePolicy,
+		WritebackLazyStaging:         opts.WritebackLazyStaging,
+		WritebackSyncWindow:          opts.WritebackSyncWindow,
 		Profile:                      opts.Profile,
 		LayerRef:                     opts.LayerRef,
 		CheckpointRef:                opts.CheckpointRef,

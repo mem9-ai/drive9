@@ -2002,6 +2002,66 @@ func (cq *CommitQueue) entryUploadContext(parent context.Context, entry *CommitE
 	return uploadCtx, cleanup, true
 }
 
+// RecoverPendingSync synchronously commits every recoverable pending entry,
+// for use after the async queue has already been drained and stopped at
+// unmount (issue #964): late FUSE Release arrivals and drain timeouts leave
+// staged entries behind, and this path uploads them without needing live
+// workers. Returns the number of successfully committed entries.
+func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
+	if cq == nil || cq.index == nil {
+		return 0
+	}
+	committed := 0
+	for path := range cq.index.ListPendingPaths() {
+		meta, ok := cq.index.GetMeta(path)
+		if !ok {
+			continue
+		}
+		if cq.shadows != nil && !cq.shadows.Has(path) {
+			safeLogPrintf("commit queue: pruning orphaned pending entry for %s (shadow missing)", path)
+			cq.index.Remove(path)
+			continue
+		}
+		if meta.Kind == PendingConflict {
+			continue
+		}
+		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
+			continue
+		}
+		size := meta.Size
+		if cq.shadows != nil {
+			if shadowSize := cq.shadows.Size(path); shadowSize >= 0 {
+				size = shadowSize
+			}
+		}
+		entry := &CommitEntry{
+			Path:              path,
+			BaseRev:           meta.BaseRev,
+			Size:              size,
+			Kind:              meta.Kind,
+			ShadowSpill:       meta.ShadowSpill,
+			Mode:              meta.Mode,
+			HasMode:           meta.HasMode,
+			PayloadBaseRev:    meta.BaseRev,
+			PayloadBaseRevSet: true,
+			PendingIndexGen:   meta.Generation,
+			recovered:         true,
+		}
+		if cq.shadows != nil {
+			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path, meta.BaseRev)
+			if entry.ShadowGen == 0 {
+				continue
+			}
+		}
+		if err := cq.CommitNow(ctx, entry); err != nil {
+			safeLogPrintf("commit queue: late sync commit failed for %s: %v", path, err)
+			continue
+		}
+		committed++
+	}
+	return committed
+}
+
 // CommitNow uploads an entry synchronously through the same commit path used
 // by workers. It is used as a fallback when the async queue rejects an entry
 // after local state has already moved to the final path.

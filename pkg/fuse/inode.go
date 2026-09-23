@@ -32,6 +32,17 @@ type InodeEntry struct {
 	// ExtentIno is the JuiceFS inode for content_layout=extent files.
 	// Shared across hardlink aliases of the same FUSE inode.
 	ExtentIno uint64
+	// MtimeOverride/AtimeOverride hold times explicitly set by a time-only
+	// SetAttr (utimensat/futimens), including while the file's content commit
+	// is still pending. While armed, derived refreshes (async commit
+	// completion, remote stat, directory re-listings) must not clobber them;
+	// a later local data mutation (write, truncate — see markDirtySize) or a
+	// remote identity replacement clears them. Mode-only changes (chmod) do
+	// not: POSIX does not advance mtime for them. The pointed-to values are
+	// immutable once published; holders only replace the pointer, never
+	// mutate through it.
+	MtimeOverride *time.Time
+	AtimeOverride *time.Time
 }
 
 // InodeToPath provides a bidirectional mapping between inode numbers and
@@ -522,22 +533,218 @@ func (m *InodeToPath) UpdateSize(ino uint64, size int64) {
 }
 
 // UpdateMtime updates the mtime of the entry identified by the given inode.
+// This is the user-mutation variant: the new time is authoritative, so any
+// armed local time override is cleared.
 func (m *InodeToPath) UpdateMtime(ino uint64, mtime time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Mtime = mtime
+		entry.MtimeOverride = nil
 	}
 }
 
 // UpdateAtime updates the atime of the entry identified by the given inode.
+// This is the user-mutation variant: the new time is authoritative, so any
+// armed local time override is cleared.
 func (m *InodeToPath) UpdateAtime(ino uint64, atime time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Atime = atime
+		entry.AtimeOverride = nil
+	}
+}
+
+// SetLocalMtime records an mtime explicitly requested via SetAttr and arms
+// the local override so derived refreshes (commit completion, stat, listings)
+// cannot clobber it until the next local mutation clears it.
+func (m *InodeToPath) SetLocalMtime(ino uint64, mtime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Mtime = mtime
+		t := mtime
+		entry.MtimeOverride = &t
+	}
+}
+
+// SetLocalAtime records an atime explicitly requested via SetAttr and arms
+// the local override so derived refreshes cannot clobber it.
+func (m *InodeToPath) SetLocalAtime(ino uint64, atime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Atime = atime
+		t := atime
+		entry.AtimeOverride = &t
+	}
+}
+
+// MtimeOverride returns the armed local mtime override, if any.
+func (m *InodeToPath) MtimeOverride(ino uint64) (time.Time, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok || entry.MtimeOverride == nil {
+		return time.Time{}, false
+	}
+	return *entry.MtimeOverride, true
+}
+
+// HasMtimeOverride reports whether a local mtime override is armed.
+func (m *InodeToPath) HasMtimeOverride(ino uint64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entry, ok := m.byInode[ino]
+	return ok && entry.MtimeOverride != nil
+}
+
+// HasAtimeOverride reports whether a local atime override is armed.
+func (m *InodeToPath) HasAtimeOverride(ino uint64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entry, ok := m.byInode[ino]
+	return ok && entry.AtimeOverride != nil
+}
+
+// UpdateMtimeDerived updates the mtime from a derived source (async commit
+// completion, remote stat refresh). An armed local override wins.
+func (m *InodeToPath) UpdateMtimeDerived(ino uint64, mtime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok || entry.MtimeOverride != nil {
+		return
+	}
+	entry.Mtime = mtime
+}
+
+// ClearLocalTimes drops any armed local time overrides without changing the
+// current times. It marks the canonical user-mutation point (a local data
+// write/truncate, see markDirtySize): later commit settles and stat
+// refreshes become authoritative again, so utimensat-then-write cannot leave
+// the mtime frozen at the explicitly requested value.
+func (m *InodeToPath) ClearLocalTimes(ino uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		clearTimeOverridesLocked(entry)
+	}
+}
+
+// clearTimeOverridesLocked drops both local time overrides on an entry the
+// caller holds locked. Used at every point where the inode's object or
+// mutation history invalidates explicitly SetAttr'd times: local data
+// mutations, kind changes, and remote identity replacements.
+func clearTimeOverridesLocked(entry *InodeEntry) {
+	entry.MtimeOverride = nil
+	entry.AtimeOverride = nil
+}
+
+// localTimeOverrides is a snapshot of the armed local time overrides. The
+// pointed-to values are immutable once published, so sharing the pointers
+// is safe.
+type localTimeOverrides struct {
+	mtime *time.Time
+	atime *time.Time
+}
+
+// SnapshotLocalTimes captures the armed local time overrides as a rollback
+// point. A write-sync attempt clears them at its dirty-mutation hook; if
+// the write fails and the content rolls back, the snapshot re-arms them.
+func (m *InodeToPath) SnapshotLocalTimes(ino uint64) *localTimeOverrides {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok || (entry.MtimeOverride == nil && entry.AtimeOverride == nil) {
+		return nil
+	}
+	return &localTimeOverrides{mtime: entry.MtimeOverride, atime: entry.AtimeOverride}
+}
+
+// RestoreLocalTimes re-arms overrides from a snapshot taken before a failed
+// mutation. A slot armed after the snapshot (a newer concurrent utimensat)
+// wins and is kept; a nil snapshot is a no-op.
+func (m *InodeToPath) RestoreLocalTimes(ino uint64, snap *localTimeOverrides) {
+	if snap == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return
+	}
+	if snap.mtime != nil && entry.MtimeOverride == nil {
+		entry.MtimeOverride = snap.mtime
+	}
+	if snap.atime != nil && entry.AtimeOverride == nil {
+		entry.AtimeOverride = snap.atime
+	}
+}
+
+// ReplacesIdentity reports whether binding the observed resourceID/isDir to
+// the inode would replace a known identity — i.e. a different drive9 object
+// (kind change or both resource ids known and different) now owns the path.
+func (m *InodeToPath) ReplacesIdentity(ino uint64, resourceID string, isDir bool) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return false
+	}
+	if entry.IsDir != isDir {
+		return true
+	}
+	return identityReplacedLocked(entry, inodeResourceKey(resourceID, isDir))
+}
+
+// dropIdentityLocked removes the identity index entry for an object that no
+// longer owns this inode, so a stale byID mapping cannot rejoin the inode
+// from the old resource id at another path.
+func (m *InodeToPath) dropIdentityLocked(entry *InodeEntry) {
+	if entry.ResourceID != "" {
+		if m.byID[entry.ResourceID] == entry.Ino {
+			delete(m.byID, entry.ResourceID)
+		}
+		entry.ResourceID = ""
+	}
+}
+
+// SetIdentityWithKind is SetIdentity with the object kind of the incoming
+// observation. A kind change or a known-and-different resource id means a
+// different drive9 object now owns this inode: the old identity index entry
+// and the previous object's explicit time overrides are dropped so the
+// replacement's metadata is adopted.
+func (m *InodeToPath) SetIdentityWithKind(ino uint64, resourceID string, nlink uint32, isDir bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return
+	}
+	if entry.IsDir != isDir || identityReplacedLocked(entry, inodeResourceKey(resourceID, isDir)) {
+		m.dropIdentityLocked(entry)
+		clearTimeOverridesLocked(entry)
+	}
+	entry.IsDir = isDir
+	m.setIdentityLocked(entry, resourceID)
+	if nlink > 0 {
+		entry.Nlink = nlink
 	}
 }
 
@@ -735,6 +942,13 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 	// directory.
 	if entry.IsDir != isDir {
 		entry.ExtentIno = 0
+		// The new object must not inherit the previous object's explicitly
+		// SetAttr'd times, and the old identity index entry must go too:
+		// the replacement (a directory here) has an empty identity key, so
+		// setIdentityLocked would early-return and leave the stale byID
+		// mapping able to rejoin this inode from the old resource id.
+		m.dropIdentityLocked(entry)
+		clearTimeOverridesLocked(entry)
 	}
 	entry.IsDir = isDir
 	// Listing/create-cache often still has size=0 after JuiceFS writes.
@@ -743,13 +957,31 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 	if entry.ExtentIno == 0 || isDir || size >= entry.Size {
 		entry.Size = size
 	}
-	entry.Mtime = mtime
+	// Clear the previous object's time overrides BEFORE the mtime line
+	// below: an identity replacement (different drive9 file at this path)
+	// adopts the incoming listing metadata instead.
+	if identityReplacedLocked(entry, inodeResourceKey(resourceID, isDir)) {
+		clearTimeOverridesLocked(entry)
+	}
+	// A listing reseed is a derived refresh: keep an explicitly SetAttr'd
+	// time (still pending or diverged from the server view) instead of the
+	// listing mtime, which for a just-committed file is the commit time.
+	if entry.MtimeOverride == nil {
+		entry.Mtime = mtime
+	}
 	m.setIdentityLocked(entry, resourceID)
 	if nlink > 0 {
 		entry.Nlink = nlink
 	} else if entry.Nlink == 0 && !isDir {
 		entry.Nlink = 1
 	}
+}
+
+// identityReplacedLocked reports whether both the entry's current identity
+// and the incoming key are known and differ — i.e. a different drive9 object
+// now owns this path.
+func identityReplacedLocked(entry *InodeEntry, key string) bool {
+	return entry.ResourceID != "" && key != "" && entry.ResourceID != key
 }
 
 func (m *InodeToPath) setIdentityLocked(entry *InodeEntry, resourceID string) {
@@ -765,8 +997,14 @@ func (m *InodeToPath) setIdentityLocked(entry *InodeEntry, resourceID string) {
 	// (possibly drained) extent inode. Only clear when both identities are
 	// known: create-shaped entries carry no resource id yet and must keep the
 	// routing this mount just stamped.
-	if entry.ResourceID != "" && key != "" {
+	if identityReplacedLocked(entry, key) {
 		entry.ExtentIno = 0
+		// The new object also must not inherit the previous object's
+		// explicitly SetAttr'd times: drop the local time overrides so the
+		// incoming listing/stat metadata is adopted instead. (updateEntryLocked
+		// clears these before applying a listing mtime; this covers identity
+		// updates that arrive through SetIdentity/stat refreshes.)
+		clearTimeOverridesLocked(entry)
 	}
 	entry.ResourceID = key
 	m.byID[key] = entry.Ino

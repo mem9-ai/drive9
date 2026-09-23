@@ -1500,6 +1500,27 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 }
 
 // Has reports whether a shadow file exists for the path.
+// ContentSize reports the current shadow content length for remotePath, if
+// the shadow file is known (memory index or on disk). Used by WAL replay to
+// detect torn content after un-fsynced staging (issue #964).
+func (s *ShadowStore) ContentSize(remotePath string) (int64, bool) {
+	s.mu.RLock()
+	sf, ok := s.files[remotePath]
+	var size int64
+	if ok {
+		size = sf.size
+	}
+	s.mu.RUnlock()
+	if ok {
+		return size, true
+	}
+	sp := s.shadowPath(remotePath)
+	if st, err := os.Stat(sp); err == nil && !st.IsDir() {
+		return st.Size(), true
+	}
+	return 0, false
+}
+
 func (s *ShadowStore) Has(remotePath string) bool {
 	s.mu.RLock()
 	_, ok := s.files[remotePath]
