@@ -280,13 +280,18 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	}, nil
 }
 
-// CloseRuntime releases what a Runtime holds: the JuiceFS session (which
-// flushes stats and stops the delete-slice tasks). Nothing else is stoppable
-// through the ChunkStore interface — the cached store's cache monitor
-// goroutine keeps running — so callers that build runtimes repeatedly (the
-// server's compact fallback) must reuse one Runtime per tenant instead.
+// CloseRuntime releases what a Runtime holds: the object store (for a store
+// that owns a client, such as GCS) and the JuiceFS session (which flushes stats
+// and stops the delete-slice tasks). Nothing else is stoppable through the
+// ChunkStore interface — the cached store's cache monitor goroutine keeps
+// running — so callers that build runtimes repeatedly (the server's compact
+// fallback) must reuse one Runtime per tenant instead.
 func CloseRuntime(rt *Runtime) error {
-	if rt == nil || rt.Meta == nil {
+	if rt == nil {
+		return nil
+	}
+	object.Shutdown(rt.Storage)
+	if rt.Meta == nil {
 		return nil
 	}
 	return rt.Meta.CloseSession()

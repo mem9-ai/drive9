@@ -2,6 +2,7 @@ package extent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -32,9 +33,9 @@ type gcsTokenStorage struct {
 }
 
 // newGCSTokenStorage builds a bucket-scoped GCS store that authenticates with
-// accessToken. opts are appended after the token source for tests that need to
-// retarget the endpoint.
-func newGCSTokenStorage(ctx context.Context, bucket, accessToken string, opts ...option.ClientOption) (*gcsTokenStorage, error) {
+// accessToken. A non-empty endpoint retargets the API (an emulator, or a
+// private/regional endpoint); opts are appended last for tests.
+func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint string, opts ...option.ClientOption) (*gcsTokenStorage, error) {
 	bucket = strings.TrimSpace(bucket)
 	if bucket == "" {
 		return nil, fmt.Errorf("gcs bucket is required")
@@ -42,9 +43,12 @@ func newGCSTokenStorage(ctx context.Context, bucket, accessToken string, opts ..
 	if strings.TrimSpace(accessToken) == "" {
 		return nil, fmt.Errorf("gcs access token is required")
 	}
-	allOpts := append([]option.ClientOption{
-		option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: accessToken})),
-	}, opts...)
+	allOpts := make([]option.ClientOption, 0, len(opts)+2)
+	if endpoint = strings.TrimSpace(endpoint); endpoint != "" {
+		allOpts = append(allOpts, option.WithEndpoint(endpoint))
+	}
+	allOpts = append(allOpts, option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: accessToken})))
+	allOpts = append(allOpts, opts...)
 	client, err := storage.NewClient(ctx, allOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("gcs client: %w", err)
@@ -63,8 +67,7 @@ func (g *gcsTokenStorage) Get(ctx context.Context, key string, off, limit int64,
 }
 
 func (g *gcsTokenStorage) Put(ctx context.Context, key string, in io.Reader, _ ...object.AttrGetter) error {
-	writer := g.client.Bucket(g.bucket).Object(key).NewWriter(ctx)
-	writer.ChunkSize = gcsExtentChunkSize
+	writer := g.writer(ctx, key)
 	if _, err := io.Copy(writer, in); err != nil {
 		_ = writer.Close()
 		return err
@@ -72,10 +75,19 @@ func (g *gcsTokenStorage) Put(ctx context.Context, key string, in io.Reader, _ .
 	return writer.Close()
 }
 
+// writer builds the object writer used for every block. The chunk-size contract
+// (one 4 MiB block per chunk, without buffering the whole object) is pinned
+// through this seam by TestGCSWriterUsesExtentChunkSize.
+func (g *gcsTokenStorage) writer(ctx context.Context, key string) *storage.Writer {
+	writer := g.client.Bucket(g.bucket).Object(key).NewWriter(ctx)
+	writer.ChunkSize = gcsExtentChunkSize
+	return writer
+}
+
 // Delete is idempotent, mirroring JuiceFS's gs backend: deleting an object that
 // is already gone is a success.
 func (g *gcsTokenStorage) Delete(ctx context.Context, key string, _ ...object.AttrGetter) error {
-	if err := g.client.Bucket(g.bucket).Object(key).Delete(ctx); err != nil && err != storage.ErrObjectNotExist {
+	if err := g.client.Bucket(g.bucket).Object(key).Delete(ctx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
 		return err
 	}
 	return nil
@@ -84,7 +96,7 @@ func (g *gcsTokenStorage) Delete(ctx context.Context, key string, _ ...object.At
 func (g *gcsTokenStorage) Head(ctx context.Context, key string) (object.Object, error) {
 	attrs, err := g.client.Bucket(g.bucket).Object(key).Attrs(ctx)
 	if err != nil {
-		if err == storage.ErrObjectNotExist {
+		if errors.Is(err, storage.ErrObjectNotExist) {
 			return nil, os.ErrNotExist
 		}
 		return nil, err
@@ -92,8 +104,9 @@ func (g *gcsTokenStorage) Head(ctx context.Context, key string) (object.Object, 
 	return &blockObj{key: key, size: attrs.Size, mtime: attrs.Updated}, nil
 }
 
-// Shutdown releases the client's connections; JuiceFS calls it through
-// object.Shutdown when the vfs is closed.
+// Shutdown releases the client. object.Shutdown reaches it through the prefix
+// wrapper: CloseRuntime calls it at teardown, and the credential refresh closes
+// the client it supersedes.
 func (g *gcsTokenStorage) Shutdown() {
 	if g != nil && g.client != nil {
 		_ = g.client.Close()

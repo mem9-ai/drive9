@@ -181,7 +181,9 @@ func openInner(cred *Credential) (object.ObjectStorage, error) {
 		ep := endpointWithBucket(cred.Endpoint, cred.Bucket)
 		return createS3Storage(ep, cred.AccessKeyID, cred.SecretAccessKey, cred.SessionToken, cred.ForcePathStyle)
 	case SchemeGCS:
-		st, err := newGCSTokenStorage(context.Background(), cred.Bucket, cred.AccessToken)
+		// An endpoint is honoured for emulators and private/regional APIs; the
+		// server's own mint leaves it empty.
+		st, err := newGCSTokenStorage(context.Background(), cred.Bucket, cred.AccessToken, cred.Endpoint)
 		if err != nil {
 			return nil, err
 		}
@@ -246,6 +248,16 @@ func (s *refreshingStore) Scheme() string { return s.scheme }
 
 func (s *refreshingStore) Prefix() string { return s.cred.Prefix }
 
+// Shutdown releases the inner store's resources (for example the GCS client).
+// object.Shutdown unwraps the prefix wrapper, so forwarding here reaches it;
+// CloseRuntime calls it once per runtime.
+func (s *refreshingStore) Shutdown() {
+	if s == nil {
+		return
+	}
+	object.Shutdown(s.inner)
+}
+
 func (s *refreshingStore) PutCount() int64 { return s.puts.Load() }
 
 func (s *refreshingStore) GetCount() int64 { return s.gets.Load() }
@@ -300,6 +312,7 @@ func (s *refreshingStore) innerStore(ctx context.Context) (object.ObjectStorage,
 		s.recordRefreshFailure(ctx, "open", start, err)
 		return nil, err
 	}
+	superseded := s.inner
 	if rs, ok := inner.(*refreshingStore); ok {
 		s.inner = rs.inner
 		s.cred = rs.cred
@@ -309,6 +322,10 @@ func (s *refreshingStore) innerStore(ctx context.Context) (object.ObjectStorage,
 		s.cred = *next
 		s.scheme = next.Scheme
 	}
+	// A GCS store owns a storage client; replacing it without closing the old
+	// one would leak a client per renewal. S3/file stores are not Shutdownable,
+	// so this is a no-op for them.
+	object.Shutdown(superseded)
 	metrics.RecordTenantOperation(s.tenantLabel(), "extent_storage", "refresh_credential", "ok", time.Since(start))
 	return s.inner, nil
 }
