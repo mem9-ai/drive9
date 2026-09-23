@@ -15,6 +15,8 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 type closeSyncTruncateTest struct {
@@ -291,27 +293,9 @@ func TestCloseSyncPathTruncateWaitsForRemoteWithCleanHandle(t *testing.T) {
 func TestCloseSyncPathTruncateRetiresRotatedShadow(t *testing.T) {
 	for _, size := range []int64{16, 48} {
 		t.Run(fmt.Sprint(size), func(t *testing.T) {
-			test := newCloseSyncTruncateTest(t)
+			test, headerBytes := newCloseSyncRotatedShadowTest(t)
 			fs := test.fs
-			headerBytes := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
-			header, ok := parseSQLiteWALHeader(headerBytes)
-			if !ok {
-				t.Fatal("invalid test WAL header")
-			}
-			test.write(t, test.old, string(headerBytes))
-			test.flush(t, test.old)
 			fh, _ := fs.fileHandles.Get(test.old)
-			if err := fs.shadowStore.WriteFull(fh.Path, headerBytes, 2); err != nil {
-				t.Fatal(err)
-			}
-			fh.Lock()
-			fh.ShadowReady, fh.ShadowSpill = true, true
-			fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
-			// Use the actual generation-reset transition that leaves a clean
-			// handle with a superseded shadow claim and a new live shadow.
-			fs.rotateAppendLogGenerationShadowLocked(fh, fh.Path, header, 2)
-			fh.Unlock()
-			fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/race.txt"})
 			test.mu.Lock()
 			test.layout = "append_log"
 			test.mu.Unlock()
@@ -322,14 +306,14 @@ func TestCloseSyncPathTruncateRetiresRotatedShadow(t *testing.T) {
 			}
 			want := make([]byte, size)
 			copy(want, headerBytes)
-			test.assertRemote(t, string(want), 3)
-			if rev, gotSize := fh.appendLogCommittedBaseline(); rev != 3 || gotSize != size {
-				t.Errorf("append baseline=%d/%d, want 3/%d", rev, gotSize, size)
+			test.assertRemote(t, string(want), 4)
+			if rev, gotSize := fh.appendLogCommittedBaseline(); rev != 4 || gotSize != size {
+				t.Errorf("append baseline=%d/%d, want 4/%d", rev, gotSize, size)
 			}
 			test.write(t, test.old, "x")
 			test.flush(t, test.old)
 			want[0] = 'x'
-			test.assertRemote(t, string(want), 4)
+			test.assertRemote(t, string(want), 5)
 		})
 	}
 }
@@ -341,8 +325,10 @@ func TestCloseSyncPathTruncateDoesNotMutateNewerShadow(t *testing.T) {
 	if err := fs.shadowStore.WriteFull(fh.Path, []byte("old"), 1); err != nil {
 		t.Fatal(err)
 	}
+	fh.Lock()
 	fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
 	fh.ShadowReady, fh.ShadowSpill = true, true
+	fh.Unlock()
 	if err := fs.shadowStore.WriteFull(fh.Path, []byte("newer writer"), 2); err != nil {
 		t.Fatal(err)
 	}
@@ -428,5 +414,152 @@ func TestCloseSyncPathTruncateClearsCleanSiblingRestoreCallbacks(t *testing.T) {
 	test.fs.syncOpenHandlesAfterPathTruncate(fh.Ino, 2)
 	if fh.Dirty.RestorePart != nil || fh.Dirty.OnPartFull != nil || fh.Dirty.HasDirtyParts() || fh.DirtySeq != 0 {
 		t.Fatal("clean sibling retained staging callbacks or became dirty")
+	}
+}
+
+// newCloseSyncRotatedShadowTest drives the actual header-write/reset commit,
+// including the remote CAS and shadow rotation, rather than setting the clean
+// post-reset claim fields directly.
+func newCloseSyncRotatedShadowTest(t *testing.T) (*closeSyncTruncateTest, []byte) {
+	t.Helper()
+	test := newCloseSyncTruncateTest(t)
+	fs := test.fs
+	oldHeaderBytes := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2)
+	oldHeader, ok := parseSQLiteWALHeader(oldHeaderBytes)
+	if !ok {
+		t.Fatal("invalid old WAL header")
+	}
+	oldImage := append(append([]byte(nil), oldHeaderBytes...), bytes.Repeat([]byte("o"), 32)...)
+	test.write(t, test.old, string(oldImage))
+	test.flush(t, test.old)
+	fh, _ := fs.fileHandles.Get(test.old)
+	fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/race.txt"})
+	fh.Lock()
+	if err := fs.shadowStore.WriteFull(fh.Path, oldImage, 2); err != nil {
+		fh.Unlock()
+		t.Fatal(err)
+	}
+	fh.ShadowReady, fh.ShadowSpill = true, true
+	fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 2, int64(len(oldImage)))
+	fh.appendLogObserveCommittedSQLiteWALHeader(oldHeader)
+	fh.Unlock()
+
+	newHeader := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 3, 4)
+	test.write(t, test.old, string(newHeader))
+	fh.Lock()
+	reset := fs.tryAppendLogGenerationResetLocked(context.Background(), fh)
+	passive := fs.isPassiveCloseSyncHandleLocked(fh)
+	rotated := fh.ShadowReady && fh.ShadowSpill && fh.ShadowStageGen != fs.shadowStore.ActiveGeneration(fh.Path)
+	fh.Unlock()
+	if reset.route != appendLogRouteCommitted || reset.status != gofuse.OK || !passive || !rotated {
+		t.Fatalf("reset=%+v passive=%t rotated=%t", reset, passive, rotated)
+	}
+	test.assertRemote(t, string(newHeader), 3)
+	return test, newHeader
+}
+
+func TestCloseSyncRefreshCommittedRevisionRetiresRotatedShadow(t *testing.T) {
+	for _, explicitSize := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicit-size-%t", explicitSize), func(t *testing.T) {
+			test, header := newCloseSyncRotatedShadowTest(t)
+			fs := test.fs
+			fh, _ := fs.fileHandles.Get(test.old)
+			generation := fs.shadowStore.ActiveGeneration(fh.Path)
+			want := append(append([]byte(nil), header...), []byte("new tail")...)
+			test.mu.Lock()
+			test.content, test.revision = want, 4
+			test.mu.Unlock()
+			fs.inodes.UpdateSize(fh.Ino, int64(len(want)))
+			fs.inodes.UpdateRevision(fh.Ino, 4)
+			fs.recordCommittedRevisionWithSize(fh.Path, 4, int64(len(want)))
+			if explicitSize {
+				fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, 4, nil, int64(len(want)))
+			} else {
+				fs.refreshCommittedRevisionForOpenHandles(fh.Path, 4, nil)
+			}
+			// Once BaseRev advances, Read cannot rely on the lazy revision
+			// refresh to notice and repair a stale 32-byte shadow source.
+			result, status := fs.Read(nil, &gofuse.ReadIn{InHeader: test.header, Fh: test.old, Size: uint32(len(want))}, nil)
+			if status != gofuse.OK {
+				t.Fatalf("Read: %v", status)
+			}
+			data, status := result.Bytes(make([]byte, len(want)))
+			result.Done()
+			if status != gofuse.OK || !bytes.Equal(data, want) {
+				t.Errorf("read=%q status=%v, want %q", data, status, want)
+			}
+			if fh.BaseRev != 4 || fh.Dirty.Size() != int64(len(want)) || fh.ShadowReady || fh.ShadowSpill || fh.ShadowStageGen != 0 || fh.ShadowStageSeq != 0 {
+				t.Errorf("refresh retained an obsolete shadow claim or baseline: revision=%d size=%d ready=%t spill=%t gen=%d seq=%d", fh.BaseRev, fh.Dirty.Size(), fh.ShadowReady, fh.ShadowSpill, fh.ShadowStageGen, fh.ShadowStageSeq)
+			}
+			if data, err := fs.shadowStore.ReadAllIfGeneration(fh.Path, generation); err != nil || !bytes.Equal(data, header) {
+				t.Fatalf("refresh mutated the shared shadow: %x, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestCloseSyncPathTruncateAdoptsConfirmedAppendLogBaseline(t *testing.T) {
+	for _, size := range []int64{16, 40} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			test, header := newCloseSyncRotatedShadowTest(t)
+			fs := test.fs
+			fh, _ := fs.fileHandles.Get(test.old)
+			generation := fs.shadowStore.ActiveGeneration(fh.Path)
+			fs.recordCommittedRevisionWithSize(fh.Path, 4, size)
+			fs.syncOpenHandlesAfterPathTruncate(fh.Ino, size)
+			fh.Lock()
+			defer fh.Unlock()
+			if fh.BaseRev != 4 || fh.OrigSize != size || fh.Dirty.Size() != size || fh.ZeroBase || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+				t.Fatalf("passive truncate revision=%d original=%d size=%d zero=%t seq=%d dirty=%t", fh.BaseRev, fh.OrigSize, fh.Dirty.Size(), fh.ZeroBase, fh.DirtySeq, fh.Dirty.HasDirtyParts())
+			}
+			if fh.ShadowReady || fh.ShadowSpill || fh.ShadowStageGen != 0 || fh.ShadowStageSeq != 0 || fh.ShadowCommitReady || fh.ShadowCommitSeq != 0 || fh.Dirty.RestorePart != nil || fh.Dirty.OnPartFull != nil {
+				t.Fatal("confirmed truncate retained shadow claim or callbacks")
+			}
+			if rev, gotSize := fh.appendLogCommittedBaseline(); rev != 4 || gotSize != size || fh.appendLogLayoutAt(4, size) != client.ContentLayoutAppendLog || !fh.appendLogCanUseTail() || fh.appendLog.hasRewriteBase || fh.appendLog.sqliteWALTruncated {
+				t.Fatalf("confirmed append baseline=%d/%d state=%+v", rev, gotSize, fh.appendLog)
+			}
+			if data, err := fs.shadowStore.ReadAllIfGeneration(fh.Path, generation); err != nil || !bytes.Equal(data, header) {
+				t.Fatalf("passive truncate mutated shared shadow: %x, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestCloseSyncPathTruncateWithoutConfirmedSizePreservesAppendState(t *testing.T) {
+	test := newCloseSyncTruncateTest(t)
+	fs := test.fs
+	fh, _ := fs.fileHandles.Get(test.old)
+	fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/race.txt"})
+	fh.Lock()
+	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, 1, 4)
+	fh.appendLogAdoptCommittedBaseline(1, 4)
+	before := fh.appendLog
+	fh.Unlock()
+	// A revision-only notification invalidates the cached size, so this
+	// sibling must not adopt it or claim to own a pending truncate rewrite.
+	fs.recordCommittedRevision(fh.Path, 2)
+	fs.syncOpenHandlesAfterPathTruncate(fh.Ino, 2)
+	fh.Lock()
+	defer fh.Unlock()
+	if fh.BaseRev != 1 || fh.Dirty.Size() != 2 || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		t.Fatalf("unconfirmed truncate revision=%d size=%d seq=%d dirty=%t", fh.BaseRev, fh.Dirty.Size(), fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+	if fh.appendLog != before {
+		t.Fatalf("passive sizing recorded a pending append-log mutation: before=%+v after=%+v", before, fh.appendLog)
+	}
+}
+
+func TestPassiveCloseSyncHandleExcludesUncommittedCreate(t *testing.T) {
+	fs := &Dat9FS{}
+	for _, isNew := range []bool{false, true} {
+		fh := &FileHandle{Path: "/new", WritePolicy: WritePolicyCloseSync, IsNew: isNew, Dirty: NewWriteBuffer("/new", 1024, 0)}
+		fh.Lock()
+		eligible := fs.handleCanAdoptCommittedRevisionLocked(fh)
+		passive := fs.isPassiveCloseSyncHandleLocked(fh)
+		fh.Unlock()
+		if !eligible || passive == isNew {
+			t.Fatalf("IsNew=%t clean=%t passive=%t", isNew, eligible, passive)
+		}
 	}
 }

@@ -1718,11 +1718,7 @@ func (fs *Dat9FS) removeShadowPendingStagingGenerationLocked(fh *FileHandle, loc
 		fh.PendingIndexGen = 0
 	}
 	if shadowGen != 0 && (fh.ShadowStageGen == 0 || fh.ShadowStageGen == shadowGen) {
-		fh.ShadowStageGen = 0
-		fh.ShadowReady = false
-		fh.ShadowSpill = false
-		fh.ShadowCommitReady = false
-		fh.ShadowCommitSeq = 0
+		clearCleanHandleShadowClaimLocked(fh)
 	}
 }
 
@@ -2586,11 +2582,12 @@ func (fs *Dat9FS) updateOpenHandleBaseRevisionForPath(remotePath string, revisio
 			// This truncate is already durable. A clean handle may be awaiting
 			// asynchronous Release after a successful Flush; updating its view
 			// must not give it another mutation to publish on Release.
-			fh.appendLogRecordTruncate()
 			fh.ZeroBase = false
 			fs.adoptCleanCommittedRevisionLocked(fh, revision, truncateSize)
 			fh.appendLogAdoptCommittedBaseline(revision, truncateSize)
 			if fh.Streamer != nil {
+				// Adoption refreshes the CAS token; truncate also discards any
+				// buffered streaming parts from the previous file image.
 				fh.Streamer.ResetForNextWrite(expectedRevisionForHandle(fh))
 			}
 			fh.Unlock()
@@ -2841,14 +2838,7 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision i
 				fh.Unlock()
 				continue
 			}
-			fh.IsNew = false
-			fh.BaseRev = revision
-			if fh.Streamer != nil {
-				fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
-			}
-			if cleanBuffer {
-				fs.rebindCleanWriteBufferToRemoteLocked(fh, fs.committedHandleSizeLocked(fh))
-			}
+			fs.adoptCleanCommittedRevisionLocked(fh, revision, fs.committedHandleSizeLocked(fh))
 		}
 		fh.Unlock()
 	}
@@ -2879,14 +2869,7 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandlesWithSize(path string, re
 				fh.Unlock()
 				continue
 			}
-			fh.IsNew = false
-			fh.BaseRev = revision
-			if fh.Streamer != nil {
-				fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
-			}
-			if cleanBuffer {
-				fs.rebindCleanWriteBufferToRemoteLocked(fh, committedSize)
-			}
+			fs.adoptCleanCommittedRevisionLocked(fh, revision, committedSize)
 		}
 		fh.Unlock()
 	}
@@ -3056,10 +3039,7 @@ func (fs *Dat9FS) clearRemovedCommittedShadowLocked(fh *FileHandle, committedRev
 	if fh.Streamer != nil {
 		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
 	}
-	fh.ShadowReady = false
-	fh.ShadowSpill = false
-	fh.ShadowCommitReady = false
-	fh.ShadowCommitSeq = 0
+	clearCleanHandleShadowClaimLocked(fh)
 	if releaseRemoteCommitLock {
 		fs.releaseHandleRemoteCommitPathLocked(fh)
 	}
@@ -3684,9 +3664,6 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 			continue
 		}
 		keepClean := fs.isPassiveCloseSyncHandleLocked(fh)
-		if keepClean {
-			fh.appendLogRecordTruncate()
-		}
 		if fs.appendLogPathConfigured(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
 			if revision, committedSize, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && revision > 0 && committedSize == newSize {
 				if keepClean {
@@ -3735,6 +3712,8 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 		if keepClean {
 			// The remote path or the caller's dirty owner owns the truncate.
 			// Sizing a clean sibling's view must not create a second publisher.
+			// Without a confirmed committed size, retain its append-log state:
+			// this handle did not perform a pending truncate/rewrite mutation.
 			fh.Dirty.ClearDirty()
 			fh.ZeroBase = false
 			clearCleanHandleShadowClaimLocked(fh)
