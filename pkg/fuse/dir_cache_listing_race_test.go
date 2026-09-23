@@ -726,40 +726,87 @@ func TestDirCacheInstallIsNotCompleteWhenTheCacheCouldNotHoldIt(t *testing.T) {
 	}
 }
 
-// Retirement tombstones must not accumulate: a long-running mount that
-// invalidates many distinct directories should not retain one record per path
-// forever. They lapse once no in-flight read can still be covered.
-func TestDirCacheRetirementTombstonesAreBounded(t *testing.T) {
+// A retirement watermark must hold until the directory moves on, not until some
+// wall-clock window lapses: a list request has no client-side deadline, so a
+// response arriving after such a window would be reinstated as though the
+// retirement had never happened.
+func TestDirCacheRetirementWatermarkOutlivesAnyRead(t *testing.T) {
 	dc := NewDirCache(10 * time.Second)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1, ResourceID: "res-B"}})
 
-	const dirs = 200
-	for i := range dirs {
-		dir := fmt.Sprintf("/burst/%03d", i)
-		listInstall(dc, dir, []CachedFileInfo{{Name: "f.dat"}})
-		dc.Invalidate(dir)
+	requestGen := dc.Generation("/d")
+	dc.Invalidate("/d")
+	// A local write afterwards must not discard the watermark: the older
+	// response is still older than the retirement, for the names it carries.
+	dc.Upsert("/d", CachedFileInfo{Name: "other.dat", Revision: 9})
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1, ResourceID: "res-B"}}, requestGen)
+
+	if names := cachedNames(t, dc, "/d"); containsName(names, "f.dat") {
+		t.Fatalf("a pre-retirement response was reinstated after a local write: %v", names)
 	}
-	if got := len(dc.retired); got != dirs {
-		t.Fatalf("fixture: expected %d live tombstones, got %d", dirs, got)
+	if got := dc.Lookup("/d", "f.dat"); got.kind == namespaceLookupPositive {
+		t.Fatalf("retired identity resolved after a pre-retirement response: res=%q", got.item.ResourceID)
+	}
+}
+
+// A listing issued after a retirement installs normally, and the fresh entry
+// continues to fence responses older than it.
+func TestDirCacheListingAfterRetirementStillFencesOlder(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "seed.dat"}})
+
+	older := dc.Generation("/d")
+	dc.Invalidate("/d")
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "fresh.dat"}})
+	dc.PutListing("/d", []CachedFileInfo{{Name: "resurrected.dat"}}, older)
+
+	if names := cachedNames(t, dc, "/d"); containsName(names, "resurrected.dat") {
+		t.Fatalf("pre-retirement response installed over a post-retirement one: %v", names)
+	}
+}
+
+// An oversized install after a complete listing must clear completeness: the
+// entry may still hold a valid-looking complete flag from the smaller listing,
+// and a complete miss for a name the cache could not hold is a false ENOENT.
+func TestDirCacheOversizedInstallClearsStaleCompleteness(t *testing.T) {
+	const cap = 2
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, cap)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "a.dat"}, {Name: "b.dat"}})
+	if !dc.CanAnswerMisses("/d") {
+		t.Fatal("fixture: a complete listing should answer misses")
 	}
 
-	// A tombstone older than the retention window no longer participates and is
-	// dropped on the next use.
-	dc.mu.Lock()
-	stale := dc.retired["/burst/000"]
-	stale.at = time.Now().Add(-2 * retiredTTL)
-	dc.retired["/burst/000"] = stale
-	dc.mu.Unlock()
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "a.dat"}, {Name: "b.dat"}, {Name: "c.dat"}})
 
-	// A read captured against the directory observes the lapsed tombstone.
-	token := dc.BeginObservation("/burst/000")
-	if token.gen == stale.gen {
-		t.Fatalf("expired tombstone still reported as the directory generation: %d", token.gen)
+	if dc.CanAnswerMisses("/d") {
+		t.Fatalf("oversized install kept stale completeness: %v", cachedNames(t, dc, "/d"))
 	}
-	dc.mu.Lock()
-	_, stillThere := dc.retired["/burst/000"]
-	dc.mu.Unlock()
-	if stillThere {
-		t.Fatal("expired tombstone was not reclaimed")
+	if got := dc.Lookup("/d", "c.dat"); got.kind == namespaceLookupCompleteMiss || got.kind == namespaceLookupSessionMiss {
+		t.Fatalf("a name the cache could not hold was answered as absent: kind=%v", got.kind)
+	}
+}
+
+// When every cached name is locally owned the cap has nothing it may displace,
+// but an authoritative local write must still be admitted: hiding a child this
+// mount just committed is worse than exceeding the cache bound. The entry also
+// loses its miss authority, since it no longer holds the whole directory.
+func TestDirCacheAllLocalSaturationKeepsCommittedChild(t *testing.T) {
+	const cap = 2
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, cap)
+	dc.MarkSessionCreatedDir("/d")
+
+	for _, name := range []string{"a.dat", "b.dat", "c.dat"} {
+		dc.Upsert("/d", CachedFileInfo{Name: name, Revision: 1})
+	}
+
+	if !containsName(cachedNames(t, dc, "/d"), "c.dat") {
+		t.Fatalf("committed child missing from an all-local saturated entry: %v", cachedNames(t, dc, "/d"))
+	}
+	if got := dc.Lookup("/d", "c.dat"); got.kind != namespaceLookupPositive {
+		t.Fatalf("committed child resolved as absent: kind=%v", got.kind)
+	}
+	if dc.CanAnswerMisses("/d") {
+		t.Fatal("an over-cap entry still claims to answer misses")
 	}
 }
 

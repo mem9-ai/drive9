@@ -110,27 +110,25 @@ type DirCache struct {
 	// that can invalidate an in-flight read, so a generation a token holds can
 	// never recur.
 	gen uint64
-	// retired remembers the fencing value of directories whose entry was
-	// dropped. Without it, retiring an entry would erase the very fact an
-	// in-flight read needs: that its directory changed while the read was
-	// outstanding. A tombstone is superseded (and dropped) as soon as a fresh
-	// entry for the same directory takes a larger value, and it lapses after
-	// retiredTTL so a long-running mount cannot accumulate one per path it has
-	// ever invalidated.
-	retired map[string]retiredDir
-}
-
-// retainedTTL bounds how long a retirement is remembered. It only has to cover
-// reads that were already in flight when the directory was retired; past that a
-// late response can no longer republish anything, because the entry it would
-// have installed into is long gone.
-const retiredTTL = 2 * time.Minute
-
-// retiredDir is a directory's retirement tombstone: the fencing value in force
-// when its entry was dropped, and when that happened.
-type retiredDir struct {
-	gen uint64
-	at  time.Time
+	// retired is a per-directory watermark recording that a directory was
+	// retired, and at which fencing value. It outlives the entry it retired:
+	// without it, dropping the entry would erase the very fact an in-flight
+	// read needs, that its directory changed while the read was outstanding.
+	//
+	// It is deliberately not time-bounded. There is no client-side deadline on
+	// a list request, so no wall-clock window can promise to cover one, and a
+	// response arriving after the window would be reinstated as though nothing
+	// had happened. The watermark is instead superseded only by strictly newer
+	// activity in the same directory, which is exactly when it stops mattering.
+	//
+	// Reclaiming the map: that limited-time reasoning was the reason for one
+	// entry per invalidated path to look like a leak. It is bounded by the
+	// directories a mount actually invalidates, and it holds one uint64 each;
+	// a mount that invalidates a million distinct paths pays eight megabytes
+	// for a fence that cannot be defeated. Trading that for a bounded-looking
+	// map that fails open under load is the wrong way round for a correctness
+	// guard, so the watermark stays until the directory moves on.
+	retired map[string]uint64
 }
 
 // NewDirCache creates a new DirCache with the given TTL.
@@ -152,7 +150,7 @@ func NewNamespaceCache(ttl, negativeTTL time.Duration, maxEntries int) *DirCache
 	}
 	return &DirCache{
 		entries:     make(map[string]*dirCacheEntry),
-		retired:     make(map[string]retiredDir),
+		retired:     make(map[string]uint64),
 		ttl:         ttl,
 		negativeTTL: negativeTTL,
 		maxEntries:  maxEntries,
@@ -231,7 +229,7 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 	// retirement removed (an SSE reset discards the whole directory). It may
 	// answer the request that issued it, but republishing it into the cache
 	// would undo the invalidation until the entry lapsed on its own.
-	if retired, ok := dc.retiredAtLocked(dirPath, now); ok && requestGen < retired {
+	if retired := dc.retired[dirPath]; requestGen < retired {
 		return items
 	}
 	if old, ok := dc.entries[dirPath]; ok && old != nil {
@@ -318,10 +316,15 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 	}
 	// A listing is only complete when the cache holds all of it: a response
 	// larger than the cap is served in full but cached in part, and a complete
-	// miss for a name the cache never held is a false ENOENT.
+	// miss for a name the cache never held is a false ENOENT. Clearing is
+	// explicit rather than merely skipping the assignment below, because the
+	// entry may hold completeness from an earlier, smaller listing.
 	if complete {
 		entry.complete = true
 		entry.completeExpires = now.Add(dc.ttl)
+	} else {
+		entry.complete = false
+		entry.completeExpires = time.Time{}
 	}
 	entry.gen = dc.nextGenerationLocked()
 	if !staleInstall {
@@ -486,11 +489,13 @@ func (dc *DirCache) upsertInternal(parentPath string, item CachedFileInfo) {
 
 	entry := dc.ensureEntryLocked(parentPath)
 	entry.expires = time.Now().Add(dc.ttl)
-	entry.upsert(item, dc.maxEntries)
-	delete(entry.negatives, item.Name)
+	// Stamp the name before storing it: upsert needs to know an incoming name is
+	// authoritative, and localGen is also how later installs recognise it.
 	stamp := dc.nextGenerationLocked()
 	entry.gen = stamp
 	entry.localGen[item.Name] = stamp
+	entry.upsertWithAuthority(item, dc.maxEntries, true)
+	delete(entry.negatives, item.Name)
 }
 
 // Remove deletes a known child entry from a parent without implying the parent
@@ -705,9 +710,9 @@ func (dc *DirCache) invalidateEntryLocked(dirPath string) {
 	// that the directory changed while it was outstanding.
 	delete(dc.entries, dirPath)
 	if dc.retired == nil {
-		dc.retired = make(map[string]retiredDir)
+		dc.retired = make(map[string]uint64)
 	}
-	dc.retired[dirPath] = retiredDir{gen: dc.nextGenerationLocked(), at: time.Now()}
+	dc.retireLocked(dirPath)
 }
 
 func newDirCacheEntry() *dirCacheEntry {
@@ -721,12 +726,17 @@ func (dc *DirCache) ensureEntryLocked(dirPath string) *dirCacheEntry {
 	entry, ok := dc.entries[dirPath]
 	if !ok {
 		entry = newDirCacheEntry()
-		// A created entry takes a fresh generation. The clock only increases, so
-		// a recreated entry can never reuse the value a retired entry held, and
-		// the fresh value supersedes any retirement tombstone: nothing that was
-		// in flight for the retired entry can match it.
+		// A created entry takes a fresh generation from the global clock, which
+		// only increases, so it is necessarily ahead of any retirement watermark
+		// already recorded for this directory: a response taken before that
+		// retirement stays older than the entry it would install into.
+		//
+		// The watermark is deliberately NOT cleared here. Clearing it was an
+		// earlier version of this fix, and it reopened the very window it was
+		// meant to close, because any local write recreates the entry and the
+		// next pre-retirement response is then installed as though the
+		// retirement had never happened.
 		entry.gen = dc.nextGenerationLocked()
-		delete(dc.retired, dirPath)
 		dc.entries[dirPath] = entry
 	}
 	if entry.items == nil {
@@ -742,37 +752,24 @@ func (dc *DirCache) ensureEntryLocked(dirPath string) *dirCacheEntry {
 }
 
 // generationLocked is the directory's effective fencing value: the live
-// entry's, or the value it was retired at. Caller holds dc.mu.
+// entry's, or the watermark it was retired at. Caller holds dc.mu.
 func (dc *DirCache) generationLocked(dirPath string) uint64 {
-	return dc.generationAtLocked(dirPath, time.Now())
-}
-
-// generationAtLocked is generationLocked against an explicit clock, so callers
-// that already hold a timestamp do not pay for a second one. An expired
-// tombstone is dropped and no longer participates. Caller holds dc.mu.
-func (dc *DirCache) generationAtLocked(dirPath string, now time.Time) uint64 {
-	gen := uint64(0)
-	if tomb, ok := dc.retired[dirPath]; ok {
-		if now.Sub(tomb.at) > retiredTTL {
-			delete(dc.retired, dirPath)
-		} else {
-			gen = tomb.gen
-		}
-	}
+	gen := dc.retired[dirPath]
 	if entry, ok := dc.entries[dirPath]; ok && entry != nil && entry.gen > gen {
 		gen = entry.gen
 	}
 	return gen
 }
 
-// retiredAtLocked reports the value a directory was retired at, if that
-// retirement is still in force. Caller holds dc.mu.
-func (dc *DirCache) retiredAtLocked(dirPath string, now time.Time) (uint64, bool) {
-	tomb, ok := dc.retired[dirPath]
-	if !ok || now.Sub(tomb.at) > retiredTTL {
-		return 0, false
+// retireLocked records that a directory changed out from under any read in
+// flight, and returns the watermark. Caller holds dc.mu.
+func (dc *DirCache) retireLocked(dirPath string) uint64 {
+	gen := dc.nextGenerationLocked()
+	if dc.retired == nil {
+		dc.retired = make(map[string]uint64)
 	}
-	return tomb.gen, true
+	dc.retired[dirPath] = gen
+	return gen
 }
 
 // nextGenerationLocked advances the fencing clock. Caller holds dc.mu.
@@ -823,6 +820,14 @@ func (dc *DirCache) getEntryLocked(dirPath string, now time.Time) (*dirCacheEntr
 // server can simply list again. If every name is locally owned, the incoming
 // item is not cached at all.
 func (e *dirCacheEntry) upsert(item CachedFileInfo, maxEntries int) (evicted bool) {
+	return e.upsertWithAuthority(item, maxEntries, false)
+}
+
+// upsertWithAuthority is upsert for an authoritative local write. Such a name is
+// admitted even when every cached name is locally owned: a committed child must
+// never be hidden from readdir, so the cap yields to it rather than the other
+// way round.
+func (e *dirCacheEntry) upsertWithAuthority(item CachedFileInfo, maxEntries int, authoritative bool) (evicted bool) {
 	if item.Name == "" {
 		return false
 	}
@@ -842,18 +847,29 @@ func (e *dirCacheEntry) upsert(item CachedFileInfo, maxEntries int) (evicted boo
 				}
 			}
 			if victim < 0 {
-				// Every cached name is locally owned; keep them and leave the
-				// incoming name uncached.
-				return true
+				// Every cached name is locally owned, so nothing may be
+				// displaced. An authoritative local write is still admitted
+				// (kept past the cap); a server-listed name simply is not
+				// cached, since the server can list it again.
+				if !authoritative {
+					return true
+				}
+			} else {
+				evict := e.order[victim]
+				e.order = append(e.order[:victim], e.order[victim+1:]...)
+				delete(e.items, evict)
+				delete(e.negatives, evict)
+				evicted = true
 			}
-			evict := e.order[victim]
-			e.order = append(e.order[:victim], e.order[victim+1:]...)
-			delete(e.items, evict)
-			delete(e.negatives, evict)
+			// Either a name was displaced or authoritative state is present
+			// beyond what the cap can hold; neither leaves the cache a complete
+			// picture of the directory, so both kinds of miss authority go with
+			// it. A surviving session marker would otherwise answer a lookup for
+			// a name this entry could not hold as "created here, so absent" —
+			// a false ENOENT for a child this mount just committed.
 			e.complete = false
 			e.completeExpires = time.Time{}
 			e.sessionExpires = time.Time{}
-			evicted = true
 		}
 		e.order = append(e.order, item.Name)
 	}
