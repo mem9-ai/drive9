@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -338,6 +339,68 @@ func landedIdentityMatches(proof pathCommitLandmark, serverRev, serverSize int64
 		return false
 	}
 	return payloadChecksum(serverBody) == proof.checksum
+}
+
+// resolveStalePayloadAsIdempotent acknowledges a queued entry that the
+// preflight rejected as stale while its staged bytes are exactly what is
+// already durable at that path.
+//
+// Two upload paths can carry the same bytes for one path: the direct-PUT path
+// on Release commits the file first, and the queued entry — staged before that
+// commit and still carrying base revision 0 — is then rejected by
+// validateEntryPayloadFreshCtx because its base revision is older than the
+// path's durable watermark. That is a redundant upload, not a conflict:
+// reporting it as one marks a fully durable file PendingConflict and emits a
+// conflict event for a path no other writer touched. The preflight fails
+// before any PUT, so the 409 auto-resolve path — the only other place that
+// compares payload bytes with the durable image — never runs.
+//
+// The comparison is the proof. Only byte equality against the live durable
+// image resolves the entry; every ambiguous case (payload unbound, shadow
+// generation replaced under us, image too large to compare, remote read
+// failure, cancellation) fails closed and leaves the entry on the terminal
+// path. Returns true when the entry was resolved and cleaned up.
+func (cq *CommitQueue) resolveStalePayloadAsIdempotent(ctx context.Context, entry *CommitEntry) bool {
+	if cq == nil || entry == nil || cq.shadows == nil {
+		return false
+	}
+	// Layer mounts upload through layer endpoints; Stat/Read here would
+	// compare against the base FS namespace, where the entry's bytes may not
+	// (and need not) appear. Keep layer rejections terminal, matching
+	// tryAutoResolveConflict.
+	if cq.layerRefSnapshot() != "" {
+		return false
+	}
+	// ShadowSpill payloads stream from the shadow file instead of being held
+	// in memory, so the whole-payload comparison below does not apply.
+	if entry.ShadowSpill {
+		return false
+	}
+	local, err := cq.readEntryPayloadRaw(entry)
+	if err != nil {
+		return false
+	}
+	if int64(len(local)) > maxLandedPayloadBytes {
+		return false
+	}
+	if cq.isEntryCanceled(entry) || (ctx != nil && ctx.Err() != nil) {
+		return false
+	}
+	rev, size, body, err := cq.readRemoteSnapshot(ctx, entry.Path)
+	if err != nil {
+		return false
+	}
+	if size != int64(len(local)) || !bytes.Equal(local, body) {
+		return false
+	}
+	// Re-check after the round trip: an Unlink/Rmdir during the read must win
+	// over turning this entry into a success.
+	if cq.isEntryCanceled(entry) || (ctx != nil && ctx.Err() != nil) {
+		return false
+	}
+	safeLogPrintf("commit queue: stale payload for %s is byte-identical to durable rev %d; resolving the rejected entry as an already-landed duplicate", entry.Path, rev)
+	cq.finishIdempotentCommit(ctx, entry, rev)
+	return true
 }
 
 // maybeRebaseGrownPayloadAgainstRemote authorizes the #896/#935 descendant

@@ -1523,6 +1523,10 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			return
 		}
 		if errors.Is(err, errCommitPayloadStale) {
+			if cq.resolveStalePayloadAsIdempotent(entryCtx, entry) {
+				unlockPath()
+				return
+			}
 			safeLogPrintf("commit queue: stale payload rejected for %s: %v", entry.Path, err)
 			cq.onCommitTerminalFailure(entry, err)
 			unlockPath()
@@ -1744,6 +1748,10 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 					continue
 				}
 				if errors.Is(verr, errCommitPayloadStale) {
+					if cq.resolveStalePayloadAsIdempotent(entryCtx, entry) {
+						cq.endInFlight(entry)
+						continue
+					}
 					safeLogPrintf("commit queue: stale batched payload rejected for %s: %v", entry.Path, verr)
 					cq.onCommitTerminalFailure(entry, verr)
 					cq.endInFlight(entry)
@@ -1970,6 +1978,19 @@ func (cq *CommitQueue) readEntryPayloadCtx(ctx context.Context, entry *CommitEnt
 	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return nil, err
 	}
+	return cq.readEntryPayloadRaw(entry)
+}
+
+// readEntryPayloadRaw reads the staged payload without running the generation
+// and watermark preflight, so callers decide for themselves whether the bytes
+// are still the ones the entry is responsible for. It exists for the one case
+// that must look at rejected bytes: proving that a payload the preflight
+// called stale is byte-identical to the durable remote image, which makes the
+// entry a redundant upload rather than a conflict.
+func (cq *CommitQueue) readEntryPayloadRaw(entry *CommitEntry) ([]byte, error) {
+	if entry == nil {
+		return nil, fmt.Errorf("nil commit entry")
+	}
 	if entry.payloadBound {
 		return entry.payload, nil
 	}
@@ -2123,6 +2144,9 @@ func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *Co
 	}
 	committedRev, err := cq.uploadEntry(ctx, entry)
 	if err != nil {
+		if errors.Is(err, errCommitPayloadStale) && cq.resolveStalePayloadAsIdempotent(ctx, entry) {
+			return nil
+		}
 		if cq.perf != nil {
 			cq.perf.commitFailure.add(1)
 		}
