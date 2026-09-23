@@ -658,7 +658,7 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	sf.fd = newFd
 	sf.size = n
 	s.quotaBytes.Add(n - sf.writtenBytes)
-	sf.written = nil
+	sf.written = shadowWrittenRanges{}
 	sf.written.add(0, n)
 	sf.writtenBytes = n
 	sf.baseRev = baseRev
@@ -751,7 +751,7 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 
 	// Preflight the union before any I/O, including filling existing holes.
 	s.mu.RLock()
-	planned := append(shadowWrittenRanges(nil), sf.written...)
+	planned := sf.written.clone()
 	oldWritten := sf.writtenBytes
 	s.mu.RUnlock()
 	for _, e := range extents {

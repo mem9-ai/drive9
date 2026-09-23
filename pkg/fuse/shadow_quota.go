@@ -4,6 +4,8 @@ import (
 	"io"
 	"os"
 	"syscall"
+
+	"github.com/google/btree"
 )
 
 // writeShadowAt preserves the actual byte count on partial I/O failures.
@@ -42,21 +44,45 @@ func writeShadowAt(file *os.File, data []byte, offset int64) (int, error) {
 	return total, writeErr
 }
 
-// shadowWrittenRanges is the sorted, non-overlapping union of bytes written by
-// this process. Adjacent ranges are merged, so sequential writes use one entry.
-// It is never recovered from logical file sizes or persisted to disk.
-type shadowWrittenRanges []DirtyExtent
+// shadowWrittenRanges is the ordered union of bytes written in this process.
+// Adjacent ranges are merged. The B-tree keeps sparse, fragmented writes from
+// scanning every earlier range; no ranges are persisted or recovered.
+type shadowWrittenRanges struct {
+	tree  *btree.BTreeG[DirtyExtent]
+	total int64
+}
+
+func newShadowWrittenTree() *btree.BTreeG[DirtyExtent] {
+	return btree.NewG[DirtyExtent](32, func(a, b DirtyExtent) bool {
+		return a.Offset < b.Offset
+	})
+}
+
+func (r shadowWrittenRanges) clone() shadowWrittenRanges {
+	if r.tree == nil {
+		return r
+	}
+	return shadowWrittenRanges{tree: r.tree.Clone(), total: r.total}
+}
 
 func (r shadowWrittenRanges) addedBytes(offset, length int64) int64 {
-	end, added := offset+length, length
-	for _, e := range r {
-		if e.Offset >= end {
-			break
-		}
-		if overlap := min(end, e.Offset+e.Length) - max(offset, e.Offset); overlap > 0 {
-			added -= overlap
-		}
+	if length <= 0 || r.tree == nil {
+		return length
 	}
+	end, added := offset+length, length
+	r.tree.DescendLessOrEqual(DirtyExtent{Offset: offset}, func(e DirtyExtent) bool {
+		if e.Offset < offset && e.Offset+e.Length > offset {
+			added -= min(end, e.Offset+e.Length) - offset
+		}
+		return false
+	})
+	r.tree.AscendGreaterOrEqual(DirtyExtent{Offset: offset}, func(e DirtyExtent) bool {
+		if e.Offset >= end {
+			return false
+		}
+		added -= min(end, e.Offset+e.Length) - e.Offset
+		return true
+	})
 	return added
 }
 
@@ -64,41 +90,67 @@ func (r *shadowWrittenRanges) add(offset, length int64) {
 	if length <= 0 {
 		return
 	}
+	r.total += r.addedBytes(offset, length)
+	if r.tree == nil {
+		r.tree = newShadowWrittenTree()
+	}
 	end := offset + length
-	i := 0
-	for i < len(*r) && (*r)[i].Offset+(*r)[i].Length < offset {
-		i++
+	start := offset
+	var removed []DirtyExtent
+	r.tree.DescendLessOrEqual(DirtyExtent{Offset: offset}, func(e DirtyExtent) bool {
+		if e.Offset < offset && e.Offset+e.Length >= offset {
+			start = e.Offset
+			end = max(end, e.Offset+e.Length)
+			removed = append(removed, e)
+		}
+		return false
+	})
+	r.tree.AscendGreaterOrEqual(DirtyExtent{Offset: offset}, func(e DirtyExtent) bool {
+		if e.Offset > end {
+			return false
+		}
+		end = max(end, e.Offset+e.Length)
+		removed = append(removed, e)
+		return true
+	})
+	for _, e := range removed {
+		r.tree.Delete(e)
 	}
-	j := i
-	for j < len(*r) && (*r)[j].Offset <= end {
-		offset = min(offset, (*r)[j].Offset)
-		end = max(end, (*r)[j].Offset+(*r)[j].Length)
-		j++
-	}
-	if i == j {
-		*r = append(*r, DirtyExtent{})
-		copy((*r)[i+1:], (*r)[i:])
-	} else {
-		copy((*r)[i+1:], (*r)[j:])
-		*r = (*r)[:len(*r)-(j-i)+1]
-	}
-	(*r)[i] = DirtyExtent{Offset: offset, Length: end - offset}
+	r.tree.ReplaceOrInsert(DirtyExtent{Offset: start, Length: end - start})
 }
 
 func (r *shadowWrittenRanges) truncate(size int64) int64 {
-	var total int64
-	n := 0
-	for _, e := range *r {
-		if e.Offset >= size {
-			break
-		}
-		e.Length = min(e.Length, size-e.Offset)
-		(*r)[n] = e
-		total += e.Length
-		n++
+	if size <= 0 {
+		r.tree = nil
+		r.total = 0
+		return 0
 	}
-	*r = (*r)[:n]
-	return total
+	if r.tree == nil {
+		return 0
+	}
+	var clipped DirtyExtent
+	r.tree.DescendLessOrEqual(DirtyExtent{Offset: size}, func(e DirtyExtent) bool {
+		if e.Offset < size && e.Offset+e.Length > size {
+			clipped = e
+		}
+		return false
+	})
+	if clipped.Length > 0 {
+		r.tree.Delete(clipped)
+		r.total -= clipped.Offset + clipped.Length - size
+		clipped.Length = size - clipped.Offset
+		r.tree.ReplaceOrInsert(clipped)
+	}
+	var removed []DirtyExtent
+	r.tree.AscendGreaterOrEqual(DirtyExtent{Offset: size}, func(e DirtyExtent) bool {
+		removed = append(removed, e)
+		return true
+	})
+	for _, e := range removed {
+		r.tree.Delete(e)
+		r.total -= e.Length
+	}
+	return r.total
 }
 
 // recordWrite accounts actual I/O, even when a partial write also returned an

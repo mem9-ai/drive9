@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math/rand"
 	"syscall"
 	"testing"
 	"time"
@@ -100,6 +101,103 @@ func TestShadowRuntimeQuotaMergesOutOfOrderRanges(t *testing.T) {
 	}
 	if _, err := s.WriteAt("/file", 9, []byte("x"), 1); !errors.Is(err, syscall.ENOSPC) {
 		t.Fatalf("write outside union at quota: %v", err)
+	}
+}
+
+func TestShadowWrittenRangesFragmented(t *testing.T) {
+	const count = 1 << 16
+	var ranges shadowWrittenRanges
+	for i := 0; i < count; i++ {
+		ranges.add(int64(i)<<13, 1<<12)
+	}
+	if want := int64(count) << 12; ranges.total != want {
+		t.Fatalf("fragmented total=%d, want %d", ranges.total, want)
+	}
+	if got := ranges.addedBytes(int64(count)<<13, 1<<12); got != 1<<12 {
+		t.Fatalf("new sparse page adds %d bytes", got)
+	}
+	if got := ranges.addedBytes(0, int64(count)<<13); got != int64(count)<<12 {
+		t.Fatalf("all holes add %d bytes", got)
+	}
+	copy := ranges.clone()
+	copy.add(1<<12, 1<<12) // Bridge the first two pages.
+	if copy.total != ranges.total+(1<<12) || ranges.total != int64(count)<<12 {
+		t.Fatal("clone mutation changed original coverage")
+	}
+	cut := int64(count/2)<<13 | 1<<11
+	if want := int64(count/2)<<12 | 1<<11; ranges.truncate(cut) != want {
+		t.Fatalf("truncated total=%d, want %d", ranges.total, want)
+	}
+	var reverse shadowWrittenRanges
+	for i := count - 1; i >= 0; i-- {
+		reverse.add(int64(i)<<13, 1<<12)
+	}
+	if reverse.total != int64(count)<<12 {
+		t.Fatalf("reverse insertion total=%d", reverse.total)
+	}
+}
+
+func TestShadowWrittenRangesAgainstByteMap(t *testing.T) {
+	const size = 2048
+	rng := rand.New(rand.NewSource(973))
+	covered := make([]bool, size)
+	var ranges shadowWrittenRanges
+	for step := 0; step < 5000; step++ {
+		if step%17 == 0 {
+			end := rng.Intn(size + 1)
+			for i := end; i < size; i++ {
+				covered[i] = false
+			}
+			var want int64
+			for _, yes := range covered {
+				if yes {
+					want++
+				}
+			}
+			if got := ranges.truncate(int64(end)); got != want {
+				t.Fatalf("step %d truncate to %d: got %d, want %d", step, end, got, want)
+			}
+			continue
+		}
+		start := rng.Intn(size)
+		end := start + 1 + rng.Intn(size-start)
+		var wantAdded int64
+		for i := start; i < end; i++ {
+			if !covered[i] {
+				wantAdded++
+			}
+		}
+		if got := ranges.addedBytes(int64(start), int64(end-start)); got != wantAdded {
+			t.Fatalf("step %d add [%d,%d): got %d, want %d", step, start, end, got, wantAdded)
+		}
+		ranges.add(int64(start), int64(end-start))
+		for i := start; i < end; i++ {
+			covered[i] = true
+		}
+		var wantTotal int64
+		for _, yes := range covered {
+			if yes {
+				wantTotal++
+			}
+		}
+		if ranges.total != wantTotal {
+			t.Fatalf("step %d total=%d, want %d", step, ranges.total, wantTotal)
+		}
+	}
+}
+
+func BenchmarkShadowWrittenRangesFragmentedAppend(b *testing.B) {
+	for _, existing := range []int{0, 1 << 18} {
+		b.Run(fmt.Sprintf("existing=%d", existing), func(b *testing.B) {
+			var ranges shadowWrittenRanges
+			for i := 0; i < existing; i++ {
+				ranges.add(int64(i)<<13, 1<<12)
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				ranges.add(int64(existing+i)<<13, 1<<12)
+			}
+		})
 	}
 }
 
