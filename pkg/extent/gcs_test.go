@@ -22,6 +22,7 @@ type gcsFake struct {
 	mu     sync.Mutex
 	status int
 	auth   string
+	uri    string
 	hits   int
 }
 
@@ -29,6 +30,7 @@ func (f *gcsFake) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.auth = r.Header.Get("Authorization")
+		f.uri = r.URL.String()
 		f.hits++
 		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -41,6 +43,12 @@ func (f *gcsFake) snapshot() (auth string, hits int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.auth, f.hits
+}
+
+func (f *gcsFake) lastURI() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.uri
 }
 
 func newGCSFake(t *testing.T, status int) (*gcsFake, string) {
@@ -71,14 +79,17 @@ func TestOpenStorageGCSRequiresBucketAndToken(t *testing.T) {
 }
 
 // TestOpenStorageGCSAppliesTenantPrefix pins that a gcs credential uses the
-// bucket the server named and still gets the tenant block prefix applied by
-// OpenStorage, exactly like the s3 path.
+// bucket the server named and that the tenant block prefix reaches the actual
+// request, not just Prefix(): a regression that left Get/Head keys unprefixed
+// would still pass a Prefix()-only assertion.
 func TestOpenStorageGCSAppliesTenantPrefix(t *testing.T) {
+	f, url := newGCSFake(t, http.StatusNotFound)
 	st, err := OpenStorage(&Credential{
 		Scheme:      SchemeGCS,
 		Bucket:      "prod-drive9-gcs-us-east1",
 		AccessToken: "downscoped-token",
 		Prefix:      "tenants/fs-1/t/tenant-z/",
+		Endpoint:    url,
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -92,6 +103,12 @@ func TestOpenStorageGCSAppliesTenantPrefix(t *testing.T) {
 	}
 	if rs.Prefix() != "tenants/fs-1/t/tenant-z/" {
 		t.Fatalf("prefix = %q", rs.Prefix())
+	}
+	if _, err := st.Head(context.Background(), "chunks/1"); err == nil {
+		t.Fatal("Head against the fake must fail with not-found")
+	}
+	if uri := f.lastURI(); !strings.Contains(uri, "tenant-z") {
+		t.Fatalf("request URI %q does not contain the tenant prefix", uri)
 	}
 }
 
