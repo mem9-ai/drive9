@@ -78,8 +78,15 @@ func TestReadDirPlusUnknownRevisionInFlightListAndFreshRemoteChange(t *testing.T
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/file.dat", false, 0, time.Now())
-	done := make(chan uint64, 1)
-	go func() { done <- readDirPlusAttrs(t, fs, 1, "/")["file.dat"].Size }()
+	type result struct {
+		size uint64
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		attrs, err := readDirPlusHandleAttrsResult(fs, &DirHandle{Ino: 1, Path: "/"})
+		done <- result{attrs["file.dat"].Size, err}
+	}()
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
@@ -88,9 +95,12 @@ func TestReadDirPlusUnknownRevisionInFlightListAndFreshRemoteChange(t *testing.T
 	fs.onCommitQueueSuccess(&CommitEntry{Path: "/file.dat", Inode: ino, Size: 4096}, 0)
 	unblock()
 	select {
-	case size := <-done:
-		if size != 4096 {
-			t.Fatalf("in-flight zero-revision listing published size %d", size)
+	case got := <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.size != 4096 {
+			t.Fatalf("in-flight zero-revision listing published size %d", got.size)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("listing did not complete")
@@ -155,11 +165,17 @@ func TestReadDirPlusColdPendingMetadata(t *testing.T) {
 			fs.dirCache.Put("/", []CachedFileInfo{{Name: "file.dat", ResourceID: "resource-1", Nlink: 2,
 				Size: 0, Revision: 3, Uid: 123, Gid: 456, HasUID: true, HasGID: true, Mode: 0o640, HasMode: true}})
 			attr := readDirPlusAttrs(t, fs, 1, "/")["file.dat"]
-			if attr.Size != 4096 || attr.Uid != 123 || attr.Gid != 456 || attr.Nlink != 2 || attr.Mode&0o777 != 0o640 {
+			// Main publishes the number of locally known paths in fillAttr.
+			// Preserve the server link count on the inode independently.
+			wantLinks := uint32(1)
+			if alias {
+				wantLinks = 2
+			}
+			if attr.Size != 4096 || attr.Uid != 123 || attr.Gid != 456 || attr.Nlink != wantLinks || attr.Mode&0o777 != 0o640 {
 				t.Errorf("cold pending attributes = %+v", attr)
 			}
 			entry, ok := fs.inodes.GetEntry(attr.NodeId)
-			if !ok || entry.ResourceID != "resource-1" || entry.Revision != 3 {
+			if !ok || entry.ResourceID != "resource-1" || entry.Revision != 3 || entry.Nlink != 2 {
 				t.Errorf("cold pending inode = %+v", entry)
 			}
 			if alias && attr.NodeId != other {
@@ -252,13 +268,22 @@ func TestReadDirPlusDoesNotWaitForUnpublishedWriteBack(t *testing.T) {
 	fs.writeBack = wb
 	fs.dirCache.Put("/", []CachedFileInfo{{Name: "file.dat", Size: 4096}})
 	pl := wb.acquirePathLock("/file.dat")
-	done := make(chan struct{})
-	go func() { defer close(done); readDirPlusAttrs(t, fs, 1, "/") }()
+	done := make(chan error, 1)
+	go func() {
+		_, err := readDirPlusHandleAttrsResult(fs, &DirHandle{Ino: 1, Path: "/"})
+		done <- err
+	}()
 	select {
-	case <-done:
+	case err := <-done:
+		wb.releasePathLock("/file.dat", pl)
+		if err != nil {
+			t.Fatal(err)
+		}
 	case <-time.After(time.Second):
-		t.Error("READDIRPLUS waits on a per-path write-back lock for a remote entry")
+		wb.releasePathLock("/file.dat", pl)
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+		t.Fatal("READDIRPLUS waits on a per-path write-back lock for a remote entry")
 	}
-	wb.releasePathLock("/file.dat", pl)
-	<-done
 }

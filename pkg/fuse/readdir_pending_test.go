@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -20,39 +22,49 @@ func readDirPlusAttrs(t *testing.T, fs *Dat9FS, dirIno uint64, dirPath string) m
 
 func readDirPlusHandleAttrs(t *testing.T, fs *Dat9FS, dh *DirHandle) map[string]gofuse.EntryOut {
 	t.Helper()
+	attrs, err := readDirPlusHandleAttrsResult(fs, dh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return attrs
+}
+
+// The error-returning form is safe in worker goroutines; assertions belong
+// to the parent test goroutine, so every worker sends a completion result.
+func readDirPlusHandleAttrsResult(fs *Dat9FS, dh *DirHandle) (map[string]gofuse.EntryOut, error) {
 	fh := fs.dirHandles.Allocate(dh)
 	defer fs.dirHandles.Delete(fh)
 	out := gofuse.NewDirEntryList(make([]byte, 8192), 0)
 	if st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
 		InHeader: gofuse.InHeader{NodeId: dh.Ino}, Fh: fh, Size: 8192,
 	}, out); st != gofuse.OK {
-		t.Fatalf("ReadDirPlus: %v", st)
+		return nil, fmt.Errorf("ReadDirPlus: %v", st)
 	}
 	attrs := make(map[string]gofuse.EntryOut)
-	buf := dirEntryListBuf(t, out)
+	buf := reflect.ValueOf(out).Elem().FieldByName("buf").Bytes()
 	for len(buf) > 0 {
 		var attr gofuse.EntryOut
 		attrSize := binary.Size(attr)
 		if len(buf) < attrSize+24 {
-			t.Fatalf("short READDIRPLUS record: %d bytes", len(buf))
+			return nil, fmt.Errorf("short READDIRPLUS record: %d bytes", len(buf))
 		}
 		if err := binary.Read(bytes.NewReader(buf[:attrSize]), nativeEndian, &attr); err != nil {
-			t.Fatal(err)
+			return nil, err
 		}
 		buf = buf[attrSize:]
 		nameLen := int(nativeEndian.Uint32(buf[16:20]))
 		recordSize := (24 + nameLen + 7) &^ 7
 		if recordSize > len(buf) {
-			t.Fatalf("short dirent: %d bytes, want %d", len(buf), recordSize)
+			return nil, fmt.Errorf("short dirent: %d bytes, want %d", len(buf), recordSize)
 		}
 		name := string(buf[24 : 24+nameLen])
 		if _, exists := attrs[name]; exists {
-			t.Fatalf("duplicate directory entry %q", name)
+			return nil, fmt.Errorf("duplicate directory entry %q", name)
 		}
 		attrs[name] = attr
 		buf = buf[recordSize:]
 	}
-	return attrs
+	return attrs, nil
 }
 
 func TestReadDirPlusPendingSameNameAttributes(t *testing.T) {

@@ -56,7 +56,9 @@ func (fs *Dat9FS) localDirEntryInfo(childP string, item CachedFileInfo, live *In
 		}
 		item.Size = meta.Size
 		item.IsDir = false
-		if !meta.Mtime.IsZero() {
+		if live != nil && live.MtimeOverride != nil {
+			item.Mtime = live.Mtime
+		} else if !meta.Mtime.IsZero() {
 			item.Mtime = meta.Mtime
 		}
 		if meta.HasMode {

@@ -829,8 +829,10 @@ func TestCachedToDirEntriesClearsRoutingFromIdLessPredecessor(t *testing.T) {
 	dir := fs.inodes.Lookup("/final/p", true, 0, time.Now())
 	fs.inodes.SetExtentIno(dir, 5)
 
+	// This fresh listing starts after the directory was created. A zero
+	// observation version would instead model an older, in-flight listing.
 	got := fs.cachedToDirEntries("/final", []CachedFileInfo{
-		{Name: "p", Size: 12, ResourceID: "file-2"},
+		{Name: "p", Size: 12, ResourceID: "file-2", observedVersion: fs.inodes.AttrVersion()},
 	})
 	if len(got) != 1 {
 		t.Fatalf("listing = %+v", got)
