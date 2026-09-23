@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"syscall"
 	"testing"
+	"time"
 
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
 )
@@ -56,6 +57,25 @@ func TestTransportCallInjectsBlockFlag(t *testing.T) {
 	}
 	if obj["block"] != true {
 		t.Fatalf("payload=%s, want block=true", got)
+	}
+}
+
+// TestTransportTimeoutBoundsCall pins the init-only bound: a meta RPC that
+// never answers is cut off at Timeout instead of hanging forever.
+func TestTransportTimeoutBoundsCall(t *testing.T) {
+	t.Parallel()
+	tr := NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
+		<-ctx.Done()
+		return nil, int(syscall.EIO), ctx.Err()
+	})
+	tr.Timeout = 20 * time.Millisecond
+	start := time.Now()
+	var resp struct{}
+	if st := tr.Call(jfsmeta.Background(), "load", map[string]any{}, &resp); st == 0 {
+		t.Fatal("Call must fail when the bounded context expires")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Call took %v, want it bounded by Timeout", elapsed)
 	}
 }
 

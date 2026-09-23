@@ -4,6 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
 
@@ -31,6 +32,7 @@ func TestExtentTeardownStopsAndClosesRuntime(t *testing.T) {
 	fs := &Dat9FS{}
 	fs.extentRT.Store(&extentRuntime{
 		rt:   &extent.Runtime{Storage: rec},
+		hold: newExtentMetaHold(),
 		stop: func() { stopped.Store(true) },
 	})
 
@@ -55,6 +57,31 @@ func TestExtentTeardownStopsAndClosesRuntime(t *testing.T) {
 	}
 }
 
+// TestExtentMetaHoldDrains pins the teardown drain: closeAndWait returns only
+// after in-flight metadata RPCs finish, and new ones are refused.
+func TestExtentMetaHoldDrains(t *testing.T) {
+	h := newExtentMetaHold()
+	if !h.enter() {
+		t.Fatal("first enter must be admitted")
+	}
+	done := make(chan struct{})
+	go func() { h.closeAndWait(); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("closeAndWait returned with an RPC in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	h.leave()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("closeAndWait did not return after the RPC finished")
+	}
+	if h.enter() {
+		t.Fatal("enter must be refused after closeAndWait")
+	}
+}
+
 // TestExtentRuntimePointerRace drives a hot runtime reader concurrently with
 // the teardown that clears the pointer. Under -race it pins the atomic-snapshot
 // discipline: a bare field read/write here is a data race.
@@ -65,7 +92,7 @@ func TestExtentRuntimePointerRace(t *testing.T) {
 	}
 	rec := &extentShutdownRecorder{ObjectStorage: inner}
 	fs := &Dat9FS{}
-	fs.extentRT.Store(&extentRuntime{rt: &extent.Runtime{Storage: rec}})
+	fs.extentRT.Store(&extentRuntime{rt: &extent.Runtime{Storage: rec}, hold: newExtentMetaHold()})
 
 	var wg sync.WaitGroup
 	wg.Add(1)

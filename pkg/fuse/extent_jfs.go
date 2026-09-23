@@ -61,14 +61,65 @@ func (fs *Dat9FS) closeExtentRuntime() {
 	if er == nil {
 		return
 	}
+	// Wait for in-flight metadata RPCs before closing the session, so a late
+	// FUSE handler cannot use a closed one (the object store is refcounted
+	// separately).
+	if er.hold != nil {
+		er.hold.closeAndWait()
+	}
 	if err := extent.CloseRuntime(er.rt); err != nil {
 		safeLogPrintf("close extent runtime: %v", err)
+	}
+}
+
+// extentMetaHold counts in-flight metadata RPCs so teardown can wait for them
+// before closing the JuiceFS session.
+type extentMetaHold struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	active int
+	closed bool
+}
+
+func newExtentMetaHold() *extentMetaHold {
+	h := &extentMetaHold{}
+	h.cond = sync.NewCond(&h.mu)
+	return h
+}
+
+func (h *extentMetaHold) enter() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return false
+	}
+	h.active++
+	return true
+}
+
+func (h *extentMetaHold) leave() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.active--
+	if h.active == 0 {
+		h.cond.Broadcast()
+	}
+}
+
+// closeAndWait refuses new RPCs and returns once the in-flight ones finish.
+func (h *extentMetaHold) closeAndWait() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.closed = true
+	for h.active > 0 {
+		h.cond.Wait()
 	}
 }
 
 type extentRuntime struct {
 	rt   *extent.Runtime
 	meta jfsmeta.Meta
+	hold *extentMetaHold
 	stop context.CancelFunc
 	// wg tracks the background compaction loop. FlushAll cancels it and then
 	// joins it, so unmount cannot return while a compaction is still
@@ -113,10 +164,17 @@ func (fs *Dat9FS) ensureExtentRuntime() error {
 	if cacheDir == "" && fs.opts != nil {
 		cacheDir = fs.opts.CacheDir
 	}
+	hold := newExtentMetaHold()
+	transport := extent.NewHTTPTransport(fs.client)
+	transport.Enter = hold.enter
+	transport.Leave = hold.leave
+	// Bound only initialization; clear the timeout before the runtime serves
+	// so blocking Flock/Setlk can wait indefinitely as designed.
+	transport.Timeout = extentRuntimeStartTimeout
 	rt, err := extent.NewRuntime(extent.RuntimeConfig{
 		CacheDir:  cacheDir,
 		CacheKey:  extent.CacheKeyForPrefix(cred.Prefix),
-		Transport: extent.NewHTTPTransport(fs.client),
+		Transport: transport,
 		Storage:   store,
 	})
 	if err != nil {
@@ -129,8 +187,11 @@ func (fs *Dat9FS) ensureExtentRuntime() error {
 		_ = extent.CloseRuntime(rt)
 		return fmt.Errorf("extent runtime: missing juicefs VFS")
 	}
+	// Initialization is done: drop the init-only timeout so the runtime's own
+	// metadata ops (blocking Flock/Setlk) can wait as designed.
+	transport.Timeout = 0
 	ctx, cancel := context.WithCancel(context.Background())
-	er := &extentRuntime{rt: rt, meta: rt.Meta, stop: cancel}
+	er := &extentRuntime{rt: rt, meta: rt.Meta, hold: hold, stop: cancel}
 
 	fs.extentMu.Lock()
 	defer fs.extentMu.Unlock()
