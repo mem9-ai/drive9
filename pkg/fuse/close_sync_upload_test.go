@@ -25,7 +25,8 @@ func newCloseSyncShadowTestFS(t *testing.T, handler http.HandlerFunc) *Dat9FS {
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(server.URL), opts)
 	var err error
-	fs.shadowStore, err = NewShadowStore(t.TempDir())
+	// Durability tests do not depend on the host disk free-space ratio.
+	fs.shadowStore, err = NewShadowStoreWithQuota(t.TempDir(), 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
