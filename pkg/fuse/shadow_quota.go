@@ -1,5 +1,47 @@
 package fuse
 
+import (
+	"io"
+	"os"
+	"syscall"
+)
+
+// writeShadowAt preserves the actual byte count on partial I/O failures.
+// Go 1.25's os.File.WriteAt discards the count when its internal pwrite returns
+// both bytes and an error. SyscallConn keeps the descriptor alive during I/O.
+func writeShadowAt(file *os.File, data []byte, offset int64) (int, error) {
+	conn, err := file.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var total int
+	var writeErr error
+	err = conn.Write(func(fd uintptr) bool {
+		for total < len(data) {
+			n, err := syscall.Pwrite(int(fd), data[total:], offset+int64(total))
+			if n > 0 {
+				total += n
+			}
+			if err == syscall.EINTR {
+				continue
+			}
+			if err != nil {
+				writeErr = err
+				break
+			}
+			if n == 0 {
+				writeErr = io.ErrShortWrite
+				break
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return total, err
+	}
+	return total, writeErr
+}
+
 // shadowWrittenRanges is the sorted, non-overlapping union of bytes written by
 // this process. Adjacent ranges are merged, so sequential writes use one entry.
 // It is never recovered from logical file sizes or persisted to disk.

@@ -450,7 +450,7 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 		}
 	}
 
-	n, err := sf.fd.WriteAt(data, offset)
+	n, err := writeShadowAt(sf.fd, data, offset)
 	s.recordWrite(remotePath, sf, offset, n, baseRev)
 	if err != nil {
 		return n, fmt.Errorf("shadow write at %d: %w", offset, err)
@@ -488,7 +488,7 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 	s.bumpWriteGenLocked(remotePath)
 	s.mu.Unlock()
 	if len(data) > 0 {
-		n, err := sf.fd.WriteAt(data, 0)
+		n, err := writeShadowAt(sf.fd, data, 0)
 		s.recordWrite(remotePath, sf, 0, n, baseRev)
 		if err != nil {
 			return fmt.Errorf("shadow write full: %w", err)
@@ -765,7 +765,7 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 		if !small {
 			data = wb.PartData(int(e.Offset/partSize) + 1)
 		}
-		n, err := sf.fd.WriteAt(data, e.Offset)
+		n, err := writeShadowAt(sf.fd, data, e.Offset)
 		s.recordWrite(remotePath, sf, e.Offset, n, baseRev)
 		if err != nil {
 			return fmt.Errorf("shadow pwrite at %d: %w", e.Offset, err)
