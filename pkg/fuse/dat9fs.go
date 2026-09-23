@@ -2578,6 +2578,19 @@ func (fs *Dat9FS) updateOpenHandleBaseRevisionForPath(remotePath string, revisio
 		// conservative O_TRUNC heuristic below never fires for real O_TRUNC
 		// writers and their next commit would CAS-conflict forever.
 		callerOwned := callerPID != 0 && fh.OpenPID != 0 && fh.OpenPID == callerPID
+		if callerOwned && fh.WritePolicy == WritePolicyCloseSync && !fh.IsNew && fs.handleCanAdoptCommittedRevisionLocked(fh) {
+			// This truncate is already durable. A clean handle may be awaiting
+			// asynchronous Release after a successful Flush; updating its view
+			// must not give it another mutation to publish on Release.
+			fh.BaseRev = revision
+			fh.ZeroBase = false
+			fs.rebindCleanWriteBufferToRemoteLocked(fh, truncateSize)
+			if fh.Streamer != nil {
+				fh.Streamer.ResetForNextWrite(expectedRevisionForHandle(fh))
+			}
+			fh.Unlock()
+			continue
+		}
 		if callerOwned || shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
 			var err error
 			abortStreamer, err = fs.truncateWritableHandleLocked(fh, truncateSize)
@@ -2743,6 +2756,8 @@ func (fs *Dat9FS) adoptOpenHandlePathTruncate(entry *InodeEntry, ino uint64, cal
 // where the remote stayed at 0 bytes while the local read was correct).
 // Returns true when a caller-owned handle adopted the truncate; the caller
 // then syncs sibling buffers and skips the remote truncate entirely.
+// Clean close-sync handles are excluded: their close may have completed even
+// though asynchronous Release has not removed them from the handle table yet.
 func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, newSize int64) bool {
 	if callerPID == 0 {
 		return false
@@ -2763,7 +2778,13 @@ func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, ne
 		if fh.OpenPID != callerPID {
 			return false
 		}
-		if owner == nil {
+		fh.Lock()
+		// Flush can finish before the kernel dispatches Release. Such a
+		// clean close-sync handle is not an owner for a new path mutation:
+		// SetAttr must commit it rather than leave a delayed Release upload.
+		canOwn := fh.WritePolicy != WritePolicyCloseSync || fh.IsNew || !fs.handleCanAdoptCommittedRevisionLocked(fh)
+		fh.Unlock()
+		if owner == nil && canOwn {
 			owner = fh
 		}
 	}
@@ -2771,6 +2792,11 @@ func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, ne
 		return false
 	}
 	owner.Lock()
+	// A concurrent Flush may have committed the candidate while we scanned.
+	if owner.WritePolicy == WritePolicyCloseSync && !owner.IsNew && fs.handleCanAdoptCommittedRevisionLocked(owner) {
+		owner.Unlock()
+		return false
+	}
 	abortStreamer, err := fs.truncateWritableHandleLocked(owner, newSize)
 	owner.Unlock()
 	if abortStreamer != nil {
@@ -3630,6 +3656,7 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 			fh.Unlock()
 			continue
 		}
+		keepClean := fh.WritePolicy == WritePolicyCloseSync && !fh.IsNew && fs.handleCanAdoptCommittedRevisionLocked(fh)
 		if fs.appendLogPathConfigured(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
 			if revision, committedSize, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && revision > 0 && committedSize == newSize {
 				fs.adoptCommittedStorageClassLocked(fh, newSize)
@@ -3668,7 +3695,14 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 				fh.OrigSize = newSize
 			}
 		}
-		fh.DirtySeq = fs.markDirtySize(ino, newSize)
+		if keepClean {
+			// The remote path or the caller's dirty owner owns the truncate.
+			// Sizing a clean sibling's view must not create a second publisher.
+			fh.Dirty.ClearDirty()
+			fh.ZeroBase = false
+		} else {
+			fh.DirtySeq = fs.markDirtySize(ino, newSize)
+		}
 		fh.Unlock()
 	}
 }
@@ -9713,7 +9747,8 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			// path: whichever revision lands first wins and the other is
 			// terminally refused, losing data either way (the
 			// O_TRUNC-on-hardlink regression). Without a caller-owned handle,
-			// keep the remote path.
+			// keep the remote path. Clean close-sync handles cannot own new
+			// path mutations because they may already be awaiting Release.
 			if fs.adoptCallerOwnedInodeTruncate(input.NodeId, input.Pid, newSize) {
 				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
 			} else {
