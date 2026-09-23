@@ -174,8 +174,11 @@ applies the pending mode through chmod. Authorized bytes can therefore commit
 even when chmod is denied, matching the ordinary PUT-then-chmod path. Close still
 reports the chmod error and retains the pending mode; a failed fallback PUT also
 remains an error. This fallback neither acknowledges mode nor disables batching.
-This server-side enforcement requires the updated server; older deployments
-may still admit scoped batch mode changes.
+This server-side enforcement is maintained in
+[`tidbcloud/fs`](https://github.com/tidbcloud/fs) and requires deploying its
+[batch mode authorization fix](https://github.com/tidbcloud/fs/pull/189)
+before releasing the combined-create client path;
+older deployments may still admit scoped batch mode changes.
 
 If the server commits a create but its acknowledgement is lost, the handle
 retains its create-only CAS and later flushes can continue failing with a

@@ -3180,14 +3180,6 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 			results[i].Error = msg
 			continue
 		}
-		// Mode changes have the same owner-only contract as handleChmod.
-		// Reject the whole item before writing content; never silently ignore
-		// HasMode or allow a scoped write grant to change permissions.
-		if item.HasMode && scope != nil && scope.IsScoped {
-			results[i].Status = http.StatusForbidden
-			results[i].Error = "chmod is owner-only"
-			continue
-		}
 		allowedIndexes = append(allowedIndexes, i)
 		backendItems = append(backendItems, backend.BatchWriteItem{
 			Path:             item.Path,
