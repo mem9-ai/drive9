@@ -36,6 +36,15 @@ func uploadFromShadowRemoteWithRevisionAndGeneration(ctx context.Context, c *cli
 	if err := shadows.SyncIfGeneration(localPath, expectedGen); err != nil {
 		return 0, err
 	}
+	return uploadFromShadowRemoteWithoutLocalSync(ctx, c, shadows, localPath, remotePath, expectedRevision, expectedGen)
+}
+
+// uploadFromShadowRemoteWithoutLocalSync retains the generation fence and the
+// shadow path lock throughout the upload, but does not make the shadow durable.
+// Callers must either sync it first or wait for a remote-durable commit before
+// acknowledging the operation. Foreground callers skipping local sync must use
+// a nonzero generation; legacy recovery keeps the syncing wrapper above.
+func uploadFromShadowRemoteWithoutLocalSync(ctx context.Context, c *client.Client, shadows *ShadowStore, localPath, remotePath string, expectedRevision int64, expectedGen uint64) (int64, error) {
 	fd, size, release, err := shadows.OpenIfGeneration(localPath, expectedGen)
 	if err != nil {
 		return 0, err

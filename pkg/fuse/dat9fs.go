@@ -14453,8 +14453,14 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 		stagingGens := fs.captureHandleStagingGensLocked(fh)
 		uploadStart := time.Now()
 		fs.debugf("sync handle shadowspill upload start path=%s size=%d expected_rev=%d", handlePath, size, expectedRevision)
+		uploadShadow := uploadFromShadowRemoteWithRevisionAndGeneration
+		if fh.WritePolicy == WritePolicyCloseSync && stagingGens.ShadowGen != 0 {
+			// close-sync waits for remote durability. The generation-pinned
+			// shadow is only an upload source, not a local durability barrier.
+			uploadShadow = uploadFromShadowRemoteWithoutLocalSync
+		}
 		fh.Unlock()
-		committedRev, err := uploadFromShadowRemoteWithRevisionAndGeneration(ctx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen)
+		committedRev, err := uploadShadow(ctx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen)
 		var committedMutationRev int64
 		if err == nil {
 			committedMutationRev = fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)

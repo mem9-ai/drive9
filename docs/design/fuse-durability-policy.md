@@ -135,6 +135,11 @@ prefer this over close-sync.
 
 `close-sync` improves cross-client/cloud visibility after close, but close
 latency includes network, server, database, and S3/db9 latency.
+Foreground close-sync shadow uploads with a known content generation omit the
+local shadow fsync: generation fencing pins the upload source, and success still
+waits for remote durability. Failed uploads retain dirty state for retry, but
+their unacknowledged bytes are not additionally guaranteed to survive a machine
+crash in the local shadow. Writeback and recovery upload paths retain local sync.
 
 `write-sync` can be dramatically slower for normal buffered writers because a
 single logical file copy may be split into many FUSE write requests. It is
