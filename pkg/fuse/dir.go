@@ -68,59 +68,23 @@ type dirCacheEntry struct {
 	missWindowStart   time.Time
 	escalateNotBefore time.Time
 
-	// Reconciliation state, kept across listing installs.
-	//
-	// localSeq records the namespace sequence at which each child was last
-	// recorded by an authoritative local mutation (Upsert). An installed
-	// listing can only speak for the state at its own request time, so a child
-	// recorded after that request was issued must survive the install even
-	// when the response omits it. localItem holds that child's entry, kept
-	// independently of the served items so the payload outlives an install
-	// that legitimately drops it.
-	//
-	// removedSeq is the mirror image: the sequence at which a child was
-	// removed locally. A listing issued before the removal still contains the
-	// name, and installing that response must not resurrect it.
-	//
-	// outstanding counts in-flight listing requests per snapshot sequence. A
-	// record only matters to a listing issued before it, so it is retained
-	// until every outstanding snapshot postdates it. This is deliberately not
-	// a time bound: a listing request has no client-side deadline, so no TTL
-	// can promise to outlive one.
-	localSeq    map[string]uint64
-	localItem   map[string]CachedFileInfo
-	removedSeq  map[string]uint64
-	outstanding map[uint64]int
+	// gen is this directory's part of the global fencing clock: the value
+	// DirCache.gen held when the directory last changed (an install, an
+	// authoritative local write, or a local removal). A read that began at an
+	// older value is superseded by whatever changed since.
+	gen uint64
 
-	// installSeq is dc.installs' value at this directory's last listing
-	// install. It is the ordering primitive for remote observations: an
-	// observation only installs while no listing has been installed since the
-	// observation began.
-	installSeq uint64
-}
-
-// listingFlight is the release handle for one in-flight listing request. The
-// caller's snapshot and the cache share it, so releasing it twice (an install
-// plus a deferred EndListing, say) is a no-op rather than a double decrement.
-type listingFlight struct {
-	dir      string
-	seq      uint64
-	released bool
-}
-
-// ListingSnapshot marks the local namespace state at the moment a directory
-// listing request is issued. Pass it to PutListing when the response arrives:
-// children recorded (or removed) after this point cannot be represented by
-// that response and are merged in or filtered out instead of being taken
-// verbatim. If the response will never be installed, release the snapshot
-// with EndListing so the records it still needs can be reclaimed.
-//
-// The zero value means "no baseline" and installs the listing as-is.
-type ListingSnapshot struct {
-	dir    string
-	seq    uint64
-	flight *listingFlight
-	valid  bool
+	// localGen stamps each name this mount wrote or removed with the clock
+	// value at that moment. A listing response describes the directory as of
+	// when its request was taken, so a response item carrying a stamp newer
+	// than the request cannot speak for that name: it is this mount's own,
+	// newer state. A name with a stamp and no items entry was removed locally
+	// and must not be reinstated by a response.
+	//
+	// The stamps need no expiry of their own: one entry per name is bounded by
+	// the directory's size, and a stale stamp only ever means "this mount
+	// changed the name after that older request", which stays true.
+	localGen map[string]uint64
 }
 
 // DirCache is a thread-safe, TTL-based namespace cache.
@@ -136,15 +100,17 @@ type DirCache struct {
 	ttl         time.Duration
 	negativeTTL time.Duration
 	maxEntries  int
-	// seq is a monotonic local-namespace counter. Every local namespace
-	// mutation (Upsert/Remove) takes the next value, which is what lets a
-	// listing install distinguish "the response already covers this" from
-	// "this happened after the request was issued".
-	seq uint64
-	// installs counts listing installs. An observation captured against an
-	// older value is superseded by whatever the install published, so it must
-	// not be applied on top of it.
-	installs uint64
+	// gen is the global fencing clock for remote reads. It only increases;
+	// each entry takes a fresh value whenever its directory changes in a way
+	// that can invalidate an in-flight read, so a generation a token holds can
+	// never recur.
+	gen uint64
+	// retired remembers the fencing value of directories whose entry was
+	// dropped. Without it, retiring an entry would erase the very fact an
+	// in-flight read needs: that its directory changed while the read was
+	// outstanding. Tombstones are superseded (and dropped) as soon as a fresh
+	// entry for the same directory takes a larger value.
+	retired map[string]uint64
 }
 
 // NewDirCache creates a new DirCache with the given TTL.
@@ -166,6 +132,7 @@ func NewNamespaceCache(ttl, negativeTTL time.Duration, maxEntries int) *DirCache
 	}
 	return &DirCache{
 		entries:     make(map[string]*dirCacheEntry),
+		retired:     make(map[string]uint64),
 		ttl:         ttl,
 		negativeTTL: negativeTTL,
 		maxEntries:  maxEntries,
@@ -194,238 +161,97 @@ func (dc *DirCache) Get(dirPath string) ([]CachedFileInfo, bool) {
 	return items, true
 }
 
-// BeginListing captures the local namespace baseline for a directory listing
-// request. Call it immediately before issuing the request and hand the result
-// to PutListing when the response arrives, so children recorded while the
-// request was in flight are not dropped by the install.
-//
-// If the request never produces an install (it failed, or the caller bailed
-// out), call EndListing with the returned snapshot so the reconciliation
-// records it holds can be reclaimed.
-func (dc *DirCache) BeginListing(dirPath string) ListingSnapshot {
-	if dc == nil || dirPath == "" {
-		return ListingSnapshot{}
-	}
-	dc.mu.Lock()
-	defer dc.mu.Unlock()
-	flight := &listingFlight{dir: dirPath, seq: dc.seq}
-	entry := dc.ensureEntryLocked(dirPath)
-	if entry.outstanding == nil {
-		entry.outstanding = make(map[uint64]int)
-	}
-	entry.outstanding[flight.seq]++
-	return ListingSnapshot{dir: dirPath, seq: flight.seq, flight: flight, valid: true}
-}
-
-// EndListing releases an in-flight listing snapshot that will not be
-// installed. Installing through PutListing releases it automatically.
-func (dc *DirCache) EndListing(snapshot ListingSnapshot) {
-	if dc == nil || !snapshot.valid || snapshot.flight == nil {
-		return
-	}
-	dc.mu.Lock()
-	defer dc.mu.Unlock()
-	dc.releaseListingLocked(snapshot.flight)
-}
-
-// releaseListingLocked retires one in-flight snapshot and reclaims records no
-// outstanding listing can still observe. Caller holds dc.mu.
-func (dc *DirCache) releaseListingLocked(flight *listingFlight) {
-	if flight == nil || flight.released {
-		return
-	}
-	flight.released = true
-	entry, ok := dc.entries[flight.dir]
-	if !ok {
-		return
-	}
-	if entry.outstanding != nil {
-		if n := entry.outstanding[flight.seq]; n > 1 {
-			entry.outstanding[flight.seq] = n - 1
-		} else {
-			delete(entry.outstanding, flight.seq)
-		}
-	}
-	entry.reclaimRecordsLocked()
-}
-
-// reclaimRecordsLocked drops reconciliation records that no outstanding
-// listing can still observe. A record is dead once every in-flight snapshot
-// postdates it (or none remain). Caller holds dc.mu.
-func (e *dirCacheEntry) reclaimRecordsLocked() {
-	if e == nil {
-		return
-	}
-	if len(e.outstanding) == 0 {
-		e.localSeq = nil
-		e.localItem = nil
-		e.removedSeq = nil
-		return
-	}
-	var oldest uint64
-	first := true
-	for seq := range e.outstanding {
-		if first || seq < oldest {
-			oldest = seq
-			first = false
-		}
-	}
-	for name, seq := range e.localSeq {
-		if seq <= oldest {
-			delete(e.localSeq, name)
-			delete(e.localItem, name)
-		}
-	}
-	for name, seq := range e.removedSeq {
-		if seq <= oldest {
-			delete(e.removedSeq, name)
-		}
-	}
-	if len(e.localSeq) == 0 {
-		e.localItem = nil
-	}
-}
-
 // Put stores directory entries in the cache with an expiration of now + ttl.
-//
-// Prefer BeginListing + PutListing for listing responses: this variant has no
-// baseline, so it installs the items verbatim and can drop children recorded
-// while the response was in flight.
 func (dc *DirCache) Put(dirPath string, items []CachedFileInfo) {
-	dc.PutListing(dirPath, items, ListingSnapshot{})
+	dc.PutListing(dirPath, items, dc.Generation(dirPath))
 }
 
-// PutListing installs a directory listing response that was issued at the
-// namespace baseline in snapshot, and returns the reconciled view callers
-// must serve from together with whether that view is authoritative.
+// PutListing merges a directory listing response into the cache, given the
+// fencing value the request was issued at, and returns the view that request
+// must serve.
 //
-// Children recorded by an authoritative local mutation after that baseline are
-// not present in the response (the request predates them) and are carried over
-// instead of being dropped; children removed locally after the baseline are
-// filtered out, so a stale response cannot resurrect a name the mount already
-// deleted. Everything else follows the response verbatim, so remote deletions
-// still take effect.
+// # Why the merge is additive
 //
-// The returned slice is the response plus those amendments, so it is the view
-// this request must serve. The cache is only what a *later* readdir will see;
-// a caller that serves the raw response still hides a child that committed
-// during its RTT, and a committed child is already gone from the pending
-// overlay, so nothing else can restore it.
+// A response describes the directory as of the moment its request was taken.
+// Between that moment and the install, this mount may have committed new
+// children, and a child committed after the request was issued is simply
+// absent from the response — not deleted. Since a settled commit has already
+// left the pending overlay, nothing downstream can restore such a name, so an
+// install that trusted the response's omissions would hide an acknowledged
+// file from readdir (issue #966). Names therefore enter the served set through
+// upsert and leave it only through an explicit local removal or a whole-entry
+// retirement (invalidation, expiry), which gives one structural invariant:
 //
-// installed reports whether the install actually ran; it is false only when
-// the call was a no-op because there is no cache to install into, in which
-// case the caller keeps the raw response. Callers must branch on it rather
-// than on the length of the view: an install that legitimately filtered every
-// response entry yields an empty view, and treating that as "nothing to say"
-// would restore the stale response the reconciliation just corrected.
-func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot ListingSnapshot) (view []CachedFileInfo, installed bool) {
+//	A name this mount has committed cannot disappear from readdir because of
+//	a racing listing.
+//
+// Remote deletions are not lost by this: they are the directory cache's
+// ordinary bounded staleness, covered by the SSE invalidation the server emits
+// for structural operations (a delete is a ResetEvent) and, as the fallback,
+// by this entry's TTL. That is the contract docs/specs/cache-invalidation.md
+// assigns to this cache; prompt removal on install was an extra the response
+// cannot justify, because it cannot distinguish a deleted name from one
+// committed during its own round trip.
+//
+// Two per-name rules keep a response from speaking for state it predates, both
+// answered by the stamps described on dirCacheEntry.localGen:
+//
+//   - A name this mount changed after requestGen keeps its local state; the
+//     response item does not overwrite it (nor contribute to the view).
+//   - A name this mount removed after requestGen stays removed.
+func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGen uint64) []CachedFileInfo {
 	if dc == nil || dirPath == "" {
-		return items, false
+		return items
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
 	now := time.Now()
-	oldEntry := dc.entries[dirPath]
-	if oldEntry != nil {
-		oldEntry.prune(now)
+	if old, ok := dc.entries[dirPath]; ok && old != nil {
+		old.prune(now)
 	}
-	entry := newDirCacheEntry()
+	entry := dc.ensureEntryLocked(dirPath)
 	entry.expires = now.Add(dc.ttl)
-	// The cache keeps a bounded prefix of the response (the pre-existing
+
+	// The cache retains a bounded prefix of the response (the pre-existing
 	// large-directory guard: an over-cap listing answers positive lookups from
-	// its prefix and reports the rest as partial misses), but what this install
-	// publishes to its caller is every response item. Truncating the reply
-	// would hide names past the cap from this readdir, make the Lookup fallback
-	// miss them and cache a false ENOENT, and make
-	// remoteDirectoryHasChildren judge a populated directory empty.
+	// its prefix and reports the rest as partial misses), but callers receive
+	// every response item. Truncating the reply would hide names past the cap
+	// from this readdir and make the lookup fallback cache a false ENOENT.
 	limit := len(items)
 	if limit > dc.maxEntries {
 		limit = dc.maxEntries
 	}
-	served := make(map[string]CachedFileInfo, len(items))
+	// The served set is the response plus whatever the cache holds beyond it.
+	served := make(map[string]CachedFileInfo, len(items)+len(entry.items))
 	for i := 0; i < len(items); i++ {
 		item := items[i]
-		if oldEntry != nil {
-			if oldItem, ok := oldEntry.items[item.Name]; ok {
-				item = mergeCachedOwner(item, oldItem)
+		if stamp, changed := entry.localGen[item.Name]; changed && stamp > requestGen {
+			// This mount wrote or removed the name after the request was
+			// taken; the response cannot speak for it.
+			if local, live := entry.items[item.Name]; live {
+				served[item.Name] = local
 			}
+			continue
 		}
 		if i < limit {
 			entry.upsert(item, dc.maxEntries)
 		}
 		served[item.Name] = item
 	}
-	// Completeness is decided before the replay below: a carried-over child that
-	// overflows the entry evicts and clears it, and a listing must not claim to
-	// be complete after that point, or the next miss is answered with a wrong
-	// ENOENT instead of reaching the server.
+	for name, item := range entry.items {
+		if _, fromResponse := served[name]; !fromResponse {
+			served[name] = item
+		}
+	}
 	if len(items) <= dc.maxEntries {
 		entry.complete = true
 		entry.completeExpires = now.Add(dc.ttl)
 	}
-	if oldEntry != nil {
-		// Records and in-flight snapshots are carried over in full. Listing
-		// requests overlap: an install whose snapshot is OLDER can land after
-		// one whose snapshot is NEWER, and publishing only the records newer
-		// than the current snapshot would already have discarded the ones that
-		// install still needs. The replay below is what applies the snapshot
-		// filter, and reclaimRecordsLocked (driven by the carried-over
-		// outstanding set) is what eventually drops the records.
-		entry.localSeq = cloneSeqTimes(oldEntry.localSeq)
-		entry.removedSeq = cloneSeqTimes(oldEntry.removedSeq)
-		entry.localItem = cloneCachedItems(oldEntry.localItem)
-		entry.outstanding = cloneSeqCounts(oldEntry.outstanding)
-	}
-	hasBaseline := oldEntry != nil && snapshot.valid && snapshot.dir == dirPath
-	if hasBaseline {
-		// Both record kinds are replayed so the newest local state wins over a
-		// response that predates it. Removals run first: noteLocal/noteRemoved
-		// keep the two maps mutually exclusive per name, so a name that was
-		// removed and then recreated carries only localSeq and is rewritten by
-		// the loop below.
-		for name, seq := range oldEntry.removedSeq {
-			if seq <= snapshot.seq {
-				continue
-			}
-			entry.remove(name)
-			delete(served, name)
-		}
-		for name, seq := range oldEntry.localSeq {
-			if seq <= snapshot.seq {
-				continue
-			}
-			// The response either predates this child (it is absent, and
-			// dropping it would hide an already-acknowledged file until the
-			// listing expires) or carries its pre-mutation entry (a
-			// remove-then-recreate). Both lose to the newer local record;
-			// upsert keeps any owner/handle info the response contributed.
-			//
-			// The child's own copy is kept separately from the served items so
-			// a later install that legitimately drops the name (a newer
-			// snapshot) still leaves the bytes replayable for an older
-			// snapshot still in flight.
-			item, ok := oldEntry.localItem[name]
-			if !ok {
-				if item, ok = oldEntry.items[name]; !ok {
-					continue
-				}
-			}
-			entry.upsert(item, dc.maxEntries)
-			served[name] = item
-		}
-	}
-	dc.installs++
-	entry.installSeq = dc.installs
-	dc.entries[dirPath] = entry
-	// Release this request's flight and reclaim what it no longer needs.
-	dc.releaseListingLocked(snapshot.flight)
+	entry.gen = dc.nextGenerationLocked()
 
-	if len(served) == 0 {
-		return nil, true
-	}
-	// Emit in the cache's order so the reply matches what the next readdir
-	// would serve, then append any amended child the cap pushed out of it.
+	// Emit in the cache's order so the reply matches what a later readdir would
+	// serve, then append the rest deterministically.
 	out := make([]CachedFileInfo, 0, len(served))
 	for _, name := range entry.order {
 		item, ok := served[name]
@@ -445,7 +271,7 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 			out = append(out, served[name])
 		}
 	}
-	return out, true
+	return out
 }
 
 // Lookup returns the namespace-cache state for parent/name.
@@ -476,148 +302,133 @@ func (dc *DirCache) Lookup(parentPath, name string) namespaceLookupResult {
 	return namespaceLookupResult{}
 }
 
-// Upsert records or refreshes a known child entry for a parent.
-//
-// This is the authoritative entry point: it means *this mount* established the
-// child's current state (a commit settled, a namespace object was created or
-// renamed, a local overlay resolved). Such a record outranks a listing
-// response that was issued before it, because the server side of that response
-// cannot have observed the mutation yet.
-//
-// For a child learned from a plain remote read, use Observe instead: a read is
-// a point-in-time observation, not a mutation, so it must not displace the
-// whole-directory view a listing install just fetched.
-func (dc *DirCache) Upsert(parentPath string, item CachedFileInfo) {
-	dc.upsertInternal(parentPath, item, true)
-}
-
 // ObservationToken marks the cache state at the moment a remote read is
 // issued. Hand it to Observe when the read completes so a response that is
-// merely late cannot overwrite a listing installed while it was in flight.
+// merely late cannot republish state a newer event superseded.
 //
-// The primitive is the install sequence, not the revision. A revision only
-// orders content within one resource identity, and not every visible metadata
-// change advances it (a remote chmod leaves the revision untouched), so trying
-// to order a stat against a listing by revision is wrong in both directions:
-// it ranks a recreated lower-revision object below the deleted one it
-// replaced, and it rejects a same-revision observation that carries newer
-// metadata.
+// The fence is the directory's generation (see dirCacheEntry.gen), not the
+// revision: a revision only orders content inside one resource identity and is
+// not advanced by every visible metadata change, so ranking a read against a
+// listing by revision is wrong in both directions — it ranks a recreated
+// lower-revision object below the deleted one it replaced, and it rejects a
+// same-revision observation that carries newer metadata.
 //
-// The zero value carries no ordering information, so Observe discards it: it
-// can never install, only clear an ENOENT marker for the name it observed.
+// The zero value carries no ordering information, so Observe discards it.
 type ObservationToken struct {
-	dir        string
-	installSeq uint64
-	valid      bool
+	dir   string
+	gen   uint64
+	valid bool
 }
 
 // BeginObservation captures the token for a remote read of one child under
-// dirPath. Call it immediately before issuing the request; the directory's
-// install sequence is what the completing response is checked against.
+// dirPath. Call it immediately before issuing the request.
 func (dc *DirCache) BeginObservation(dirPath string) ObservationToken {
 	if dc == nil || dirPath == "" {
 		return ObservationToken{}
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	// An uncached directory has no install sequence yet, so the baseline is the
-	// current global counter — the same value ensureEntryLocked seeds into an
-	// entry it creates. Reading 0 here would collide with a fresh entry's
-	// initial 0 and let a read that predates a listing match the entry that
-	// listing created (then later recreated after a drop).
-	seq := dc.installs
-	if entry, ok := dc.entries[dirPath]; ok && entry != nil {
-		seq = entry.installSeq
-	}
-	return ObservationToken{dir: dirPath, installSeq: seq, valid: true}
+	return ObservationToken{dir: dirPath, gen: dc.generationLocked(dirPath), valid: true}
 }
 
 // Observe records a child entry learned from a remote read (a stat/HEAD
 // refresh, for example), paired with the token for that read.
 //
 // Unlike Upsert this is not an authoritative local mutation: completion order
-// is not a version order, so an observation may not be replayed over a listing
-// response and may not resurrect a name a listing omitted. Within those limits
-// it does refresh metadata, which is what carries a change the revision cannot
-// express, such as a remote chmod.
+// is not a version order, so an observation may not resurrect a name a local
+// removal took away, and it may not overwrite what a newer event published.
+// Within those limits it does refresh metadata, which is what carries a change
+// the revision cannot express, such as a remote chmod.
 //
-// The token decides whether the observation can still be applied: if a listing
-// was installed after the token was taken, that listing is the newer
-// whole-directory view — for the names it carries and for the names it omits —
-// so the response is discarded rather than allowed to fill perceived gaps in
-// it. A read issued after the last install matches the current sequence and is
-// applied, which is how a metadata change the revision cannot express (a remote
-// chmod, say) still reaches the cache.
+// The token decides whether the observation can still be applied. It can only
+// when nothing has changed the directory since the read began, which the
+// generation answers in one comparison:
 //
-// Either way the observation proves the name exists now, so an unexpired
-// ENOENT marker for it is cleared even when the entry itself is not replaced.
+//   - entry present, generation unchanged   -> apply
+//   - entry present, generation changed     -> discard (a newer event won)
+//   - entry retired since (absent, was cached) -> discard
+//   - entry absent and none was cached      -> apply: no event has touched this
+//     directory, so the read is the freshest information there is. A later
+//     creation always takes a fresh generation, so this cannot race one.
 func (dc *DirCache) Observe(parentPath string, item CachedFileInfo, token ObservationToken) {
-	dc.upsertObserved(parentPath, item, token)
-}
-
-// upsertObserved applies an observation under the token's authority.
-func (dc *DirCache) upsertObserved(parentPath string, item CachedFileInfo, token ObservationToken) {
-	if item.Name == "" {
+	if item.Name == "" || dc == nil {
 		return
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
+	if !token.valid || token.dir != parentPath {
+		return
+	}
+	// The directory must still be at the value the read began against. A
+	// retirement advances that value too, so a read outstanding across an
+	// invalidation is discarded rather than allowed to recreate the directory
+	// from stale knowledge.
+	if dc.generationLocked(parentPath) != token.gen {
+		// The read still proves the name exists, which is all an ENOENT marker
+		// denies.
+		if entry, ok := dc.entries[parentPath]; ok && entry != nil {
+			delete(entry.negatives, item.Name)
+		}
+		return
+	}
 	entry := dc.ensureEntryLocked(parentPath)
-	// The token must still describe the current install state. A listing
-	// installed while this read was in flight is the newer whole-directory
-	// view, covering names the read carries and names it omits alike, so a
-	// response that began before that install is discarded wholesale rather
-	// than allowed to fill perceived gaps in it.
-	if !token.valid || token.dir != parentPath || entry.installSeq != token.installSeq {
-		delete(entry.negatives, item.Name)
-		return
-	}
-	// A local authoritative record for this name outranks any observation: it
-	// reflects this mount's own mutation, which the server side of that
-	// observation cannot have observed yet.
-	if _, local := entry.localSeq[item.Name]; local {
-		delete(entry.negatives, item.Name)
-		return
-	}
 	entry.expires = time.Now().Add(dc.ttl)
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
+	// An observation is still this mount's knowledge of the name, stamped now
+	// so a response taken before it cannot overwrite it.
+	stamp := dc.nextGenerationLocked()
+	entry.gen = stamp
+	entry.localGen[item.Name] = stamp
 }
 
-// upsertInternal stores a child entry. authoritative selects whether the write
-// is recorded as a local mutation that a later listing install must replay.
-func (dc *DirCache) upsertInternal(parentPath string, item CachedFileInfo, authoritative bool) {
+// Upsert records or refreshes a known child entry for a parent.
+//
+// This is the authoritative entry point: it means *this mount* established the
+// child's current state (a commit settled, a namespace object was created or
+// renamed, a local overlay resolved). It adds or refreshes the name and
+// advances the directory's generation, so any remote read in flight for this
+// directory can no longer overwrite what it published.
+//
+// For a child learned from a plain remote read, use Observe instead: a read is
+// a point-in-time observation, not a mutation.
+func (dc *DirCache) Upsert(parentPath string, item CachedFileInfo) {
+	dc.upsertInternal(parentPath, item)
+}
+
+// upsertInternal stores a child entry and advances the fencing generation.
+func (dc *DirCache) upsertInternal(parentPath string, item CachedFileInfo) {
 	if item.Name == "" {
 		return
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	now := time.Now()
 	entry := dc.ensureEntryLocked(parentPath)
-	entry.expires = now.Add(dc.ttl)
+	entry.expires = time.Now().Add(dc.ttl)
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
-	if authoritative {
-		entry.noteLocal(item.Name, item, dc.nextSeqLocked())
-	}
+	stamp := dc.nextGenerationLocked()
+	entry.gen = stamp
+	entry.localGen[item.Name] = stamp
 }
 
 // Remove deletes a known child entry from a parent without implying the parent
 // namespace is complete.
 //
-// The removal is recorded even when the parent has no cached state yet, so a
-// list request already in flight cannot resurrect the name: the interleaving
-// "cold parent -> BeginListing -> successful Unlink -> stale response" is
-// exactly when the parent's cache holds nothing to correct.
+// The entry is created when absent even though there is nothing to delete: the
+// generation this advances is what stops a remote read that began before the
+// removal from republishing the removed name.
 func (dc *DirCache) Remove(parentPath, name string) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
 	entry := dc.ensureEntryLocked(parentPath)
 	entry.remove(name)
-	entry.noteRemoved(name, dc.nextSeqLocked())
+	stamp := dc.nextGenerationLocked()
+	entry.gen = stamp
+	entry.localGen[name] = stamp
 	if !entry.hasState() {
 		delete(dc.entries, parentPath)
 	}
@@ -805,135 +616,38 @@ func (dc *DirCache) InvalidateAll() {
 // An entry with listings still in flight is kept rather than deleted: those
 // requests hold a flight registered on it and will replay the reconciliation
 // records it carries. Deleting the entry would strand both — the flights would
-// later release onto whatever entry replaced it (and, because BeginListing does
-// not consume dc.seq, an older flight can even decrement a newer flight's
-// count), and a probe landing before the install would reclaim records the
-// install still needs. What invalidation must drop is the served namespace,
-// which is what this clears. Caller holds dc.mu.
+// Only what the cache serves is dropped: an entry that is retired simply goes
+// away, and a later read for it starts from a fresh generation (see
+// ensureEntryLocked), so nothing that was in flight for the old entry can
+// republish into the new one. Caller holds dc.mu.
 func (dc *DirCache) invalidateEntryLocked(dirPath string) {
-	entry, ok := dc.entries[dirPath]
-	if !ok {
-		return
+	// Retiring an entry must advance the directory's fencing value, not erase
+	// it: a read that began against the retired entry has to be able to tell
+	// that the directory changed while it was outstanding.
+	delete(dc.entries, dirPath)
+	if dc.retired == nil {
+		dc.retired = make(map[string]uint64)
 	}
-	if len(entry.outstanding) == 0 {
-		delete(dc.entries, dirPath)
-		return
-	}
-	entry.clearServedState()
-}
-
-// clearServedState drops everything the entry publishes while keeping the
-// reconciliation state (records, flights, install sequence) that in-flight
-// listings depend on.
-func (e *dirCacheEntry) clearServedState() {
-	e.items = make(map[string]CachedFileInfo)
-	e.order = nil
-	e.expires = time.Time{}
-	e.complete = false
-	e.completeExpires = time.Time{}
-	e.sessionExpires = time.Time{}
-	e.negatives = make(map[string]time.Time)
-	e.missWindowStart = time.Time{}
-	e.remoteMisses = 0
-	e.escalateNotBefore = time.Time{}
+	dc.retired[dirPath] = dc.nextGenerationLocked()
 }
 
 func newDirCacheEntry() *dirCacheEntry {
 	return &dirCacheEntry{
-		items:      make(map[string]CachedFileInfo),
-		negatives:  make(map[string]time.Time),
-		localSeq:   make(map[string]uint64),
-		localItem:  make(map[string]CachedFileInfo),
-		removedSeq: make(map[string]uint64),
+		items:     make(map[string]CachedFileInfo),
+		negatives: make(map[string]time.Time),
 	}
-}
-
-// cloneSeqTimes copies a sequence map so an install cannot alias the entry it
-// has just replaced.
-func cloneSeqTimes(src map[string]uint64) map[string]uint64 {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make(map[string]uint64, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
-
-// cloneCachedItems copies a child-entry map so an install cannot alias the
-// entry it has just replaced.
-func cloneCachedItems(src map[string]CachedFileInfo) map[string]CachedFileInfo {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make(map[string]CachedFileInfo, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
-
-// cloneSeqCounts copies the outstanding-snapshot counter map so an install
-// cannot alias the entry it has just replaced.
-func cloneSeqCounts(src map[uint64]int) map[uint64]int {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make(map[uint64]int, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
-
-// nextSeqLocked returns the next local namespace sequence. Caller holds dc.mu.
-func (dc *DirCache) nextSeqLocked() uint64 {
-	dc.seq++
-	return dc.seq
-}
-
-// noteLocal records that name was recorded by an authoritative local mutation
-// at seq, keeping its entry so a listing install issued before this record can
-// still replay it. Retention is bounded by the outstanding in-flight listing
-// set, not by time: see reclaimRecordsLocked.
-func (e *dirCacheEntry) noteLocal(name string, item CachedFileInfo, seq uint64) {
-	if seq == 0 {
-		return
-	}
-	if e.localSeq == nil {
-		e.localSeq = make(map[string]uint64)
-	}
-	if e.localItem == nil {
-		e.localItem = make(map[string]CachedFileInfo)
-	}
-	e.localSeq[name] = seq
-	e.localItem[name] = item
-	delete(e.removedSeq, name)
-}
-
-// noteRemoved records that name was removed locally at seq.
-func (e *dirCacheEntry) noteRemoved(name string, seq uint64) {
-	if seq == 0 {
-		return
-	}
-	if e.removedSeq == nil {
-		e.removedSeq = make(map[string]uint64)
-	}
-	e.removedSeq[name] = seq
-	delete(e.localSeq, name)
-	delete(e.localItem, name)
 }
 
 func (dc *DirCache) ensureEntryLocked(dirPath string) *dirCacheEntry {
 	entry, ok := dc.entries[dirPath]
 	if !ok {
 		entry = newDirCacheEntry()
-		// Seed the install baseline from the global counter rather than leaving
-		// zero. The counter never decreases, so an entry recreated after a
-		// listing install inherits a value at or above that install, and a
-		// token captured before it can no longer match (see BeginObservation).
-		entry.installSeq = dc.installs
+		// A created entry takes a fresh generation. The clock only increases, so
+		// a recreated entry can never reuse the value a retired entry held, and
+		// the fresh value supersedes any retirement tombstone: nothing that was
+		// in flight for the retired entry can match it.
+		entry.gen = dc.nextGenerationLocked()
+		delete(dc.retired, dirPath)
 		dc.entries[dirPath] = entry
 	}
 	if entry.items == nil {
@@ -942,7 +656,43 @@ func (dc *DirCache) ensureEntryLocked(dirPath string) *dirCacheEntry {
 	if entry.negatives == nil {
 		entry.negatives = make(map[string]time.Time)
 	}
+	if entry.localGen == nil {
+		entry.localGen = make(map[string]uint64)
+	}
 	return entry
+}
+
+// generationLocked is the directory's effective fencing value: the live
+// entry's, or the value it was retired at. Caller holds dc.mu.
+func (dc *DirCache) generationLocked(dirPath string) uint64 {
+	gen := dc.retired[dirPath]
+	if entry, ok := dc.entries[dirPath]; ok && entry != nil && entry.gen > gen {
+		gen = entry.gen
+	}
+	return gen
+}
+
+// nextGenerationLocked advances the fencing clock. Caller holds dc.mu.
+func (dc *DirCache) nextGenerationLocked() uint64 {
+	dc.gen++
+	return dc.gen
+}
+
+// Generation returns the directory's current fencing value, for a caller that
+// is about to issue a remote read and needs to know whether the answer still
+// speaks for the directory by the time it arrives.
+func (dc *DirCache) Generation(dirPath string) uint64 {
+	if dc == nil || dirPath == "" {
+		return 0
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	// A directory with no entry has no local state, so any later change takes a
+	// strictly newer value than the clock reports now.
+	if entry, ok := dc.entries[dirPath]; ok && entry != nil {
+		return entry.gen
+	}
+	return dc.gen
 }
 
 func (dc *DirCache) getEntryLocked(dirPath string, now time.Time) (*dirCacheEntry, bool) {
@@ -951,13 +701,6 @@ func (dc *DirCache) getEntryLocked(dirPath string, now time.Time) (*dirCacheEntr
 		return nil, false
 	}
 	entry.prune(now)
-	// Records are only useful to a listing that was already in flight when
-	// they were written. This is the probe path, so reclaim on the in-flight
-	// set rather than on a timer: a listing request has no client-side
-	// deadline, so no TTL could bound this safely. Install never reaches here
-	// (PutListing reads dc.entries directly), which keeps its replay from
-	// racing its own reclamation.
-	entry.reclaimRecordsLocked()
 	if !entry.hasState() {
 		delete(dc.entries, dirPath)
 		return nil, false
@@ -984,9 +727,6 @@ func (e *dirCacheEntry) upsert(item CachedFileInfo, maxEntries int) {
 			e.order = e.order[1:]
 			delete(e.items, evict)
 			delete(e.negatives, evict)
-			delete(e.localSeq, evict)
-			delete(e.localItem, evict)
-			delete(e.removedSeq, evict)
 			e.complete = false
 			e.completeExpires = time.Time{}
 			e.sessionExpires = time.Time{}
@@ -1028,10 +768,9 @@ func (e *dirCacheEntry) prune(now time.Time) {
 		e.order = nil
 		e.expires = time.Time{}
 		e.complete = false
-		// The served items are stale, but the reconciliation records are not
-		// cleared here: a listing issued before them is still in flight and
-		// still needs them. reclaimRecordsLocked decides that, on the
-		// in-flight set rather than on time.
+		// localGen is deliberately kept: a stamp only ever means "this mount
+		// changed the name at that point", which stays true, and dropping it
+		// would let a response taken before the change reinstate a removal.
 	}
 	if !e.completeExpires.IsZero() && now.After(e.completeExpires) {
 		e.completeExpires = time.Time{}
@@ -1094,15 +833,12 @@ func (e *dirCacheEntry) hasState() bool {
 	return len(e.items) > 0 || len(e.negatives) > 0 || e.complete ||
 		!e.completeExpires.IsZero() || !e.sessionExpires.IsZero() ||
 		!e.missWindowStart.IsZero() || !e.escalateNotBefore.IsZero() ||
-		// An in-flight listing snapshot must keep the entry alive: a cache
-		// lookup landing between BeginListing and the install would otherwise
-		// drop the entry and take the snapshot (and the records its install
-		// still needs) with it.
-		len(e.outstanding) > 0 ||
-		// Records outlive the served items: an install that drops a
-		// locally-recorded child still needs them to replay for an older
-		// snapshot that is still in flight.
-		len(e.localSeq) > 0 || len(e.removedSeq) > 0
+		// Session markers keep an entry alive so a mount-created directory can
+		// answer misses; see MarkSessionCreatedDir.
+		!e.sessionExpires.IsZero() ||
+		// A removal leaves only its stamp behind, and that stamp is what keeps
+		// a response predating the removal from reinstating the name.
+		len(e.localGen) > 0
 }
 
 func cacheParentName(p string) (string, string) {
