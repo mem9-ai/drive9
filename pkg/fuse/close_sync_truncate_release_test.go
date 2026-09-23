@@ -349,6 +349,7 @@ func TestCloseSyncPathTruncateRetiresRotatedShadow(t *testing.T) {
 			want := make([]byte, size)
 			copy(want, headerBytes)
 			test.assertRemote(t, string(want), 4)
+			test.assertReadOnlyOpen(t, want)
 			if rev, gotSize := fh.appendLogCommittedBaseline(); rev != 4 || gotSize != size {
 				t.Errorf("append baseline=%d/%d, want 4/%d", rev, gotSize, size)
 			}
@@ -507,7 +508,6 @@ func TestCloseSyncRefreshCommittedRevisionRetiresRotatedShadow(t *testing.T) {
 			test, header := newCloseSyncRotatedShadowTest(t)
 			fs := test.fs
 			fh, _ := fs.fileHandles.Get(test.old)
-			generation := fs.shadowStore.ActiveGeneration(fh.Path)
 			fh.Lock()
 			fh.ShadowStageSeq = 17
 			fh.Unlock()
@@ -537,10 +537,39 @@ func TestCloseSyncRefreshCommittedRevisionRetiresRotatedShadow(t *testing.T) {
 			if fh.BaseRev != 4 || fh.Dirty.Size() != int64(len(want)) || fh.ShadowReady || fh.ShadowSpill || fh.ShadowStageGen != 0 || fh.ShadowStageSeq != 0 {
 				t.Errorf("refresh retained an obsolete shadow claim or baseline: revision=%d size=%d ready=%t spill=%t gen=%d seq=%d", fh.BaseRev, fh.Dirty.Size(), fh.ShadowReady, fh.ShadowSpill, fh.ShadowStageGen, fh.ShadowStageSeq)
 			}
-			if data, err := fs.shadowStore.ReadAllIfGeneration(fh.Path, generation); err != nil || !bytes.Equal(data, header) {
-				t.Fatalf("refresh mutated the shared shadow: %x, %v", data, err)
+			if fs.shadowStore.Has(fh.Path) {
+				t.Fatal("refresh retained the obsolete resident shadow")
 			}
+			test.assertReadOnlyOpen(t, want)
 		})
+	}
+}
+
+func TestCloseSyncCommittedRefreshPreservesPendingWriterShadow(t *testing.T) {
+	test, header := newCloseSyncRotatedShadowTest(t)
+	fs := test.fs
+	writerID := test.open(t, test.header.Pid)
+	writer, _ := fs.fileHandles.Get(writerID)
+	test.write(t, writerID, "pending")
+	// This generation is based on revision 3 but belongs to a live dirty
+	// writer. An observed revision 4 must not remove its recoverable bytes.
+	want := append([]byte(nil), header...)
+	copy(want, "pending")
+	if err := fs.shadowStore.WriteFull(writer.Path, want, 3); err != nil {
+		t.Fatal(err)
+	}
+	generation := fs.shadowStore.ActiveGeneration(writer.Path)
+	writer.Lock()
+	writer.ShadowReady, writer.ShadowStageGen = true, generation
+	writer.Unlock()
+	fs.recordCommittedRevisionWithSize(writer.Path, 4, 40)
+	fs.refreshCommittedRevisionForOpenHandlesWithSize(writer.Path, 4, nil, 40)
+	data, err := fs.shadowStore.ReadAllIfGeneration(writer.Path, generation)
+	if err != nil || !bytes.Equal(data, want) {
+		t.Fatalf("refresh removed pending writer shadow: data=%x err=%v", data, err)
+	}
+	if writer.BaseRev != 3 || writer.DirtySeq == 0 || !writer.Dirty.HasDirtyParts() {
+		t.Fatal("refresh changed the dirty writer's CAS baseline or ownership")
 	}
 }
 
@@ -550,11 +579,17 @@ func TestCloseSyncPathTruncateAdoptsConfirmedAppendLogBaseline(t *testing.T) {
 			test, header := newCloseSyncRotatedShadowTest(t)
 			fs := test.fs
 			fh, _ := fs.fileHandles.Get(test.old)
-			generation := fs.shadowStore.ActiveGeneration(fh.Path)
 			fh.Lock()
 			// The retired generation is stale; its sequence must be retired too.
 			fh.ShadowStageSeq = 17
 			fh.Unlock()
+			want := make([]byte, size)
+			copy(want, header)
+			test.mu.Lock()
+			test.content, test.revision = want, 4
+			test.mu.Unlock()
+			fs.inodes.UpdateSize(fh.Ino, size)
+			fs.inodes.UpdateRevision(fh.Ino, 4)
 			fs.recordCommittedRevisionWithSize(fh.Path, 4, size)
 			fs.syncOpenHandlesAfterPathTruncate(fh.Ino, size)
 			fh.Lock()
@@ -568,9 +603,12 @@ func TestCloseSyncPathTruncateAdoptsConfirmedAppendLogBaseline(t *testing.T) {
 			if rev, gotSize := fh.appendLogCommittedBaseline(); rev != 4 || gotSize != size || fh.appendLogLayoutAt(4, size) != client.ContentLayoutAppendLog || !fh.appendLogCanUseTail() || fh.appendLog.hasRewriteBase || fh.appendLog.sqliteWALTruncated {
 				t.Fatalf("confirmed append baseline=%d/%d state=%+v", rev, gotSize, fh.appendLog)
 			}
-			if data, err := fs.shadowStore.ReadAllIfGeneration(fh.Path, generation); err != nil || !bytes.Equal(data, header) {
-				t.Fatalf("passive truncate mutated shared shadow: %x, %v", data, err)
+			if fs.shadowStore.Has(fh.Path) {
+				t.Fatal("confirmed truncate retained the obsolete resident shadow")
 			}
+			fh.Unlock()
+			test.assertReadOnlyOpen(t, want)
+			fh.Lock()
 		})
 	}
 }
@@ -656,6 +694,98 @@ func TestCloseSyncPassivePathTruncateResetsBufferedStreamer(t *testing.T) {
 	test.write(t, test.old, "new")
 	test.flush(t, test.old)
 	test.assertRemote(t, "newd\x00\x00\x00\x00", 3)
+}
+
+// A path sizing notification may precede the owning handle's remote commit.
+// Keep the remote CAS baseline separate from that locally visible size.
+func TestCloseSyncSiblingWriteBeforeTruncateOwnerCommit(t *testing.T) {
+	for _, size := range []int64{0, 2, 8} {
+		for _, layout := range []client.ContentLayout{client.ContentLayoutSingle, client.ContentLayoutAppendLog} {
+			t.Run(fmt.Sprintf("size-%d/%s", size, layout), func(t *testing.T) {
+				test := newCloseSyncTruncateTest(t)
+				fs := test.fs
+				fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/race.txt"})
+				fs.client.Warm(context.Background())
+				test.mu.Lock()
+				test.layout = layout
+				test.mu.Unlock()
+				writer := test.open(t, test.header.Pid)
+				test.write(t, writer, "seed")
+				if st := test.truncate(uint64(size)); st != gofuse.OK {
+					t.Fatalf("truncate: %v", st)
+				}
+				fh, _ := fs.fileHandles.Get(test.old)
+				if rev, baseSize := fh.appendLogCommittedBaseline(); rev != 1 || baseSize != 4 {
+					t.Errorf("uncommitted truncate changed remote baseline to %d/%d, want 1/4", rev, baseSize)
+				}
+				test.flush(t, test.old)
+				test.assertRemote(t, "seed", 1)
+				if n, st := fs.Write(nil, &gofuse.WriteIn{InHeader: test.header, Fh: test.old, Offset: uint64(size)}, []byte("tail")); st != gofuse.OK || n != 4 {
+					t.Fatalf("sibling Write: n=%d status=%v", n, st)
+				}
+				test.flush(t, test.old)
+				want := make([]byte, size)
+				copy(want, "seed")
+				test.assertRemote(t, string(want)+"tail", 2)
+				// The older dirty owner must not overwrite the acknowledged
+				// result when its delayed Release attempts a stale commit.
+				test.release(writer)
+				test.assertRemote(t, string(want)+"tail", 2)
+			})
+		}
+	}
+}
+
+func (test *closeSyncTruncateTest) assertReadOnlyOpen(t *testing.T, want []byte) {
+	t.Helper()
+	var opened gofuse.OpenOut
+	if st := test.fs.Open(nil, &gofuse.OpenIn{InHeader: test.header, Flags: syscall.O_RDONLY}, &opened); st != gofuse.OK {
+		t.Fatalf("read-only Open: %v", st)
+	}
+	defer test.release(opened.Fh)
+	result, st := test.fs.Read(nil, &gofuse.ReadIn{InHeader: test.header, Fh: opened.Fh, Size: uint32(len(want) + 16)}, nil)
+	if st != gofuse.OK {
+		t.Fatalf("read-only Read: %v", st)
+	}
+	data, st := result.Bytes(make([]byte, len(want)+16))
+	result.Done()
+	if st != gofuse.OK || !bytes.Equal(data, want) {
+		t.Fatalf("new reader got %x status=%v, want %x", data, st, want)
+	}
+}
+
+func TestWriteSyncPathTruncateAdoptsConfirmedAppendLogBaseline(t *testing.T) {
+	for _, size := range []int64{2, 8} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			test := newCloseSyncTruncateTest(t)
+			fs := test.fs
+			fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/race.txt"})
+			fs.client.Warm(context.Background())
+			fh, _ := fs.fileHandles.Get(test.old)
+			fh.WritePolicy = WritePolicyWriteSync
+			truncated := make([]byte, size)
+			copy(truncated, "seed")
+			test.mu.Lock()
+			test.content, test.revision, test.layout = truncated, 2, client.ContentLayoutAppendLog
+			test.mu.Unlock()
+			fs.recordCommittedRevisionWithSize(fh.Path, 2, size)
+			fs.syncOpenHandlesAfterPathTruncate(fh.Ino, size)
+			if fh.BaseRev != 2 || fh.OrigSize != size || fh.Dirty.Size() != size || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+				t.Fatalf("confirmed active baseline revision=%d original=%d size=%d seq=%d", fh.BaseRev, fh.OrigSize, fh.Dirty.Size(), fh.DirtySeq)
+			}
+			if n, st := fs.Write(nil, &gofuse.WriteIn{InHeader: test.header, Fh: test.old, Offset: uint64(size)}, []byte("tail")); st != gofuse.OK || n != 4 {
+				t.Fatalf("Write: n=%d status=%v", n, st)
+			}
+			test.assertRemote(t, string(truncated)+"tail", 3)
+			test.flush(t, test.old)
+			test.release(test.old)
+			test.mu.Lock()
+			defer test.mu.Unlock()
+			if len(test.appends) != 1 || test.appends[0] != (closeSyncAppendRequest{2, size, "tail"}) {
+				t.Fatalf("append requests=%+v", test.appends)
+			}
+		})
+	}
 }
 
 func TestCloseSyncCallerOwnedTruncateCommitsBeforeSiblingAppend(t *testing.T) {
