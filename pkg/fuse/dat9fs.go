@@ -6650,6 +6650,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	apiPath := fs.remotePath(parentPath)
 	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
+	snapshot := fs.dirCache.BeginListing(parentPath)
 	items, err := fs.client.ListCtx(ctx, apiPath)
 	cf()
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
@@ -6657,7 +6658,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		if !fs.lockMountViewRead(generation) {
 			return nil, 0, syscall.EAGAIN
 		}
-		fs.dirCache.Put(parentPath, cachedFileInfos(items))
+		fs.dirCache.PutListing(parentPath, cachedFileInfos(items), snapshot)
 		fs.mountViewMu.RUnlock()
 		return items, generation, nil
 	}
@@ -6677,6 +6678,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		// original transient failure immediately.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
 		listStart = fs.perfStart()
+		snapshot = fs.dirCache.BeginListing(parentPath)
 		items, err = fs.client.ListCtx(retryCtx, apiPath)
 		retryCancel()
 		fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
@@ -6684,7 +6686,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 			if !fs.lockMountViewRead(generation) {
 				return nil, 0, syscall.EAGAIN
 			}
-			fs.dirCache.Put(parentPath, cachedFileInfos(items))
+			fs.dirCache.PutListing(parentPath, cachedFileInfos(items), snapshot)
 			fs.mountViewMu.RUnlock()
 			return items, generation, nil
 		}
@@ -7145,6 +7147,7 @@ func (fs *Dat9FS) snapshotDeletedPaths() map[string]struct{} {
 func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string) (bool, uint64, error) {
 	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
+	snapshot := fs.dirCache.BeginListing(dirPath)
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
@@ -7179,7 +7182,7 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 		return false, 0, syscall.EAGAIN
 	}
 	if fs.dirCache != nil {
-		fs.dirCache.Put(dirPath, cachedFileInfos(liveItems))
+		fs.dirCache.PutListing(dirPath, cachedFileInfos(liveItems), snapshot)
 	}
 	fs.mountViewMu.RUnlock()
 	return len(liveItems) > 0, generation, nil
@@ -12069,6 +12072,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 
 	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
+	snapshot := fs.dirCache.BeginListing(dirPath)
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
@@ -12083,7 +12087,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	if !fs.lockMountViewRead(generation) {
 		return nil, syscall.EAGAIN
 	}
-	fs.dirCache.Put(dirPath, cached)
+	fs.dirCache.PutListing(dirPath, cached, snapshot)
 	fs.mountViewMu.RUnlock()
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached, generation)
 
