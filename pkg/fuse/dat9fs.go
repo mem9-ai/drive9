@@ -1718,7 +1718,7 @@ func (fs *Dat9FS) removeShadowPendingStagingGenerationLocked(fh *FileHandle, loc
 		fh.PendingIndexGen = 0
 	}
 	if shadowGen != 0 && (fh.ShadowStageGen == 0 || fh.ShadowStageGen == shadowGen) {
-		clearCleanHandleShadowClaimLocked(fh)
+		clearHandleShadowClaimLocked(fh)
 	}
 }
 
@@ -2300,10 +2300,7 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 	}
 	fh.DirtySeq = 0
 	fh.WriteBackSeq = 0
-	fh.ShadowReady = false
-	fh.ShadowSpill = false
-	fh.ShadowCommitReady = false
-	fh.ShadowCommitSeq = 0
+	clearHandleShadowClaimLocked(fh)
 	fh.appendSnapshot = false
 	fh.ZeroBase = false
 	fh.IsNew = false
@@ -2907,10 +2904,10 @@ func (fs *Dat9FS) isPassiveCloseSyncHandleLocked(fh *FileHandle) bool {
 		!fh.IsNew && fs.handleCanAdoptCommittedRevisionLocked(fh)
 }
 
-// clearCleanHandleShadowClaimLocked drops only this handle's obsolete claim.
-// The path may hold a newer generation belonging to another writer: do not
-// Ensure, Truncate or Remove that shared shadow while adopting a clean view.
-func clearCleanHandleShadowClaimLocked(fh *FileHandle) {
+// clearHandleShadowClaimLocked retires only this handle's shadow staging claim.
+// It does not mutate the path-keyed store, which may contain a newer writer's
+// generation. Callers own any generation-scoped store cleanup and buffer rebind.
+func clearHandleShadowClaimLocked(fh *FileHandle) {
 	fh.ShadowReady = false
 	fh.ShadowSpill = false
 	fh.ShadowStageGen = 0
@@ -2924,7 +2921,7 @@ func clearCleanHandleShadowClaimLocked(fh *FileHandle) {
 func (fs *Dat9FS) adoptCleanCommittedRevisionLocked(fh *FileHandle, revision, size int64) {
 	fh.IsNew = false
 	fh.BaseRev = revision
-	clearCleanHandleShadowClaimLocked(fh)
+	clearHandleShadowClaimLocked(fh)
 	fs.rebindCleanWriteBufferToRemoteLocked(fh, size)
 	if fh.Streamer != nil {
 		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
@@ -3039,7 +3036,7 @@ func (fs *Dat9FS) clearRemovedCommittedShadowLocked(fh *FileHandle, committedRev
 	if fh.Streamer != nil {
 		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
 	}
-	clearCleanHandleShadowClaimLocked(fh)
+	clearHandleShadowClaimLocked(fh)
 	if releaseRemoteCommitLock {
 		fs.releaseHandleRemoteCommitPathLocked(fh)
 	}
@@ -3400,10 +3397,7 @@ func (fs *Dat9FS) markHandleRevisionOnlyLocked(fh *FileHandle, revision int64, s
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, revision, fh, snapshotSize)
 	fs.removeHandleStagingLocked(fh)
-	fh.ShadowReady = false
-	fh.ShadowSpill = false
-	fh.ShadowCommitReady = false
-	fh.ShadowCommitSeq = 0
+	clearHandleShadowClaimLocked(fh)
 }
 
 func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64) {
@@ -3432,10 +3426,7 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	fs.rebaselineCommittedDirtyBufferLocked(fh)
 	fs.removeHandleStagingLocked(fh)
 	clearPreinstalledUnlinkSnapshotLocked(fh)
-	fh.ShadowReady = false
-	fh.ShadowSpill = false
-	fh.ShadowCommitReady = false
-	fh.ShadowCommitSeq = 0
+	clearHandleShadowClaimLocked(fh)
 	fh.appendSnapshot = false
 }
 
@@ -3712,11 +3703,16 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 		if keepClean {
 			// The remote path or the caller's dirty owner owns the truncate.
 			// Sizing a clean sibling's view must not create a second publisher.
-			// Without a confirmed committed size, retain its append-log state:
-			// this handle did not perform a pending truncate/rewrite mutation.
+			// This size can also come from an uncommitted caller-owned truncate,
+			// so it must not become an append-log committed baseline here. When
+			// a newer committed revision is observed, Write calls
+			// adoptCommittedRevisionLocked before changing bytes; it rebinds
+			// OrigSize (including a grow) from the
+			// committed-size cache or updated inode. An append-log path truncate
+			// with confirmed revision/size takes the adoption branch above.
 			fh.Dirty.ClearDirty()
 			fh.ZeroBase = false
-			clearCleanHandleShadowClaimLocked(fh)
+			clearHandleShadowClaimLocked(fh)
 			fs.rebaselineCommittedDirtyBufferLocked(fh)
 		} else {
 			fh.DirtySeq = fs.markDirtySize(ino, newSize)
@@ -14225,11 +14221,7 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 	clearReadTargetForLockedHandle(fh)
 	if fs.shadowStore != nil && fh.ShadowReady {
 		fs.shadowStore.Remove(fh.Path)
-		fh.ShadowReady = false
-		fh.ShadowSpill = false
-		fh.ShadowCommitReady = false
-		fh.ShadowCommitSeq = 0
-		fh.ShadowStageGen = 0
+		clearHandleShadowClaimLocked(fh)
 	}
 }
 
@@ -14677,11 +14669,7 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 	fs.inodes.UpdateSize(fh.Ino, 0)
 	fs.cacheFileForPath(fh.Path, 0, time.Now(), committedRev)
 	fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
-	fh.ShadowReady = false
-	fh.ShadowSpill = false
-	fh.ShadowCommitReady = false
-	fh.ShadowCommitSeq = 0
-	fh.ShadowStageGen = 0
+	clearHandleShadowClaimLocked(fh)
 	fh.PendingIndexGen = 0
 	if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync {
 		fs.finishSyncCommitKernelCacheBoundary(fh.Ino, fh.Path, committedRev, 0)

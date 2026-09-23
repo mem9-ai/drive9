@@ -58,8 +58,7 @@ func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle
 	fh.Dirty.ClearDirty()
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fh.DirtySeq, fh.WriteBackSeq = 0, 0
-	fh.ShadowCommitReady, fh.ShadowCommitSeq = false, 0
-	fh.ShadowReady, fh.ShadowSpill = false, false
+	clearHandleShadowClaimLocked(fh)
 	fh.appendSnapshot = false
 	publishStagedSnapshotLineageLocked(fh)
 	fs.adoptCommittedRevisionLocked(fh)
