@@ -22,6 +22,7 @@ import (
 const (
 	SchemeFile = "file"
 	SchemeS3   = "s3"
+	SchemeGCS  = "gcs"
 
 	// credentialRefreshWindow is how long before expiry the data plane renews
 	// its STS session. The old session stays valid while the replacement is
@@ -51,8 +52,12 @@ type Credential struct {
 	AccessKeyID     string `json:"access_key_id,omitempty"`
 	SecretAccessKey string `json:"secret_access_key,omitempty"`
 	SessionToken    string `json:"session_token,omitempty"`
-	Region          string `json:"region,omitempty"`
-	ForcePathStyle  bool   `json:"force_path_style,omitempty"`
+	// AccessToken is a short-lived, tenant-prefix-scoped OAuth token (scheme
+	// "gcs"). The mount presents it to Cloud Storage directly, so it is a
+	// bearer credential and must never be logged.
+	AccessToken    string `json:"access_token,omitempty"`
+	Region         string `json:"region,omitempty"`
+	ForcePathStyle bool   `json:"force_path_style,omitempty"`
 	// EncryptionMode/KeyID describe the deployment's resolved S3 object
 	// encryption policy. The server only mints this credential when the extent
 	// data plane can honour it (no per-object SSE), so the values are
@@ -69,8 +74,9 @@ type CredentialSource interface {
 
 // OpenStorage builds a JuiceFS ObjectStorage from a data-credential response.
 // file is the in-process mock used by unit tests. s3 is the production and
-// local-MinIO data plane (STS or static keys). Blocks are never proxied
-// through drive9-server.
+// local-MinIO data plane (STS or static keys). gcs is the Google Cloud Storage
+// data plane, authenticated with the server's downscoped, tenant-prefix-bound
+// OAuth token. Blocks are never proxied through drive9-server.
 func OpenStorage(cred *Credential, src CredentialSource) (object.ObjectStorage, error) {
 	if cred == nil {
 		return nil, fmt.Errorf("nil data credential")
@@ -174,6 +180,12 @@ func openInner(cred *Credential) (object.ObjectStorage, error) {
 	case SchemeS3:
 		ep := endpointWithBucket(cred.Endpoint, cred.Bucket)
 		return createS3Storage(ep, cred.AccessKeyID, cred.SecretAccessKey, cred.SessionToken, cred.ForcePathStyle)
+	case SchemeGCS:
+		st, err := newGCSTokenStorage(context.Background(), cred.Bucket, cred.AccessToken)
+		if err != nil {
+			return nil, err
+		}
+		return st, nil
 	case "drive9":
 		return nil, fmt.Errorf("extent data plane does not proxy blocks through drive9-server")
 	default:

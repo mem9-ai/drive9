@@ -53,6 +53,11 @@ TEST_PKGS ?= ./...
 # Trim JuiceFS object-store and meta-engine SDKs we do not use. The drive9
 # meta driver always compiles (no build tag). Keep this list aligned with
 # juicefs Makefile juicefs.lite, plus noredis.
+#
+# nogs trims JuiceFS's own gs backend, which builds its client from Application
+# Default Credentials. pkg/extent still links cloud.google.com/go/storage
+# directly for the GCS extent data plane, because the server's downscoped,
+# tenant-scoped token cannot be delivered through the ADC-only backend.
 GO_TAGS ?= nogspt,noredis,nosqlite,nomysql,nopg,notikv,nobadger,noetcd,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nocifs,nostorj,noqiniu,notos,noks3,nowebdav,nogateway
 
 BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
