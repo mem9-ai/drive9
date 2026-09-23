@@ -239,9 +239,12 @@ type Dat9FS struct {
 	extentTornDown bool
 	// extentBuilding single-flights the unlocked runtime build;
 	// extentBuildCond (initialised lazily under extentMu) wakes late callers
-	// when it finishes.
+	// when it finishes. extentBuildGen/Err let those waiters share the finished
+	// build's outcome rather than each starting a fresh one.
 	extentBuilding  bool
 	extentBuildCond *sync.Cond
+	extentBuildGen  uint64
+	extentBuildErr  error
 	// extentMisses caches "this path is not an extent file" so an
 	// extent-enabled mount does not pay a stat probe on every syscall against
 	// the classic files that share its glob (the mixed profile is the shape the
@@ -17204,7 +17207,6 @@ func (fs *Dat9FS) FlushAll() {
 	if fs.perf != nil {
 		fs.perf.printSummary(os.Stderr)
 	}
-
 }
 
 // StatFs reports a generous virtual capacity so that apps (Obsidian, Finder)

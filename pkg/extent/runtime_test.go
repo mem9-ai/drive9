@@ -4,11 +4,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
 )
 
 func TestJuiceMetaConfOpenCacheForHTTP(t *testing.T) {
@@ -141,5 +144,37 @@ func TestApplyChunkCacheDirKeepsDiskCacheWithoutStaging(t *testing.T) {
 	}
 	if conf.BufferSize != juiceChunkBufferSize {
 		t.Fatalf("BufferSize=%d, want %d", conf.BufferSize, juiceChunkBufferSize)
+	}
+}
+
+// runtimeShutdownRecorder is an object store that records Shutdown calls.
+type runtimeShutdownRecorder struct {
+	object.ObjectStorage
+	shutdowns atomic.Int64
+}
+
+func (s *runtimeShutdownRecorder) Shutdown() { s.shutdowns.Add(1) }
+
+// deadTransport fails every meta RPC, so NewRuntime cannot finish.
+type deadTransport struct{}
+
+func (deadTransport) Call(ctx jfsmeta.Context, op string, req, resp any) syscall.Errno {
+	return syscall.EIO
+}
+
+// TestNewRuntimeReleasesStorageOnError pins the ownership contract: NewRuntime
+// takes cfg.Storage and must release it on every error path, so a caller that
+// opened a client-bearing store (GCS) can hand it over without compensating.
+func TestNewRuntimeReleasesStorageOnError(t *testing.T) {
+	inner, err := object.CreateStorage("file", t.TempDir(), "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &runtimeShutdownRecorder{ObjectStorage: inner}
+	if _, err := NewRuntime(RuntimeConfig{Transport: deadTransport{}, Storage: rec}); err == nil {
+		t.Fatal("NewRuntime must fail with a dead transport")
+	}
+	if got := rec.shutdowns.Load(); got != 1 {
+		t.Fatalf("storage shutdowns = %d, want 1", got)
 	}
 }

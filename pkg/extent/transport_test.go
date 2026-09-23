@@ -3,6 +3,7 @@ package extent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"syscall"
 	"testing"
 	"time"
@@ -71,11 +72,24 @@ func TestTransportTimeoutBoundsCall(t *testing.T) {
 	tr.Timeout = 20 * time.Millisecond
 	start := time.Now()
 	var resp struct{}
-	if st := tr.Call(jfsmeta.Background(), "load", map[string]any{}, &resp); st == 0 {
-		t.Fatal("Call must fail when the bounded context expires")
+	if st := tr.Call(jfsmeta.Background(), "load", map[string]any{}, &resp); st != syscall.ETIMEDOUT {
+		t.Fatalf("Call status=%v, want ETIMEDOUT (not EINTR)", st)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("Call took %v, want it bounded by Timeout", elapsed)
+	}
+}
+
+// TestTransportCallMapsBackendErrorToEIO keeps a genuine transport failure
+// distinct from the timeout and interrupt mappings.
+func TestTransportCallMapsBackendErrorToEIO(t *testing.T) {
+	t.Parallel()
+	tr := NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
+		return nil, 0, errors.New("backend down")
+	})
+	var resp struct{}
+	if st := tr.Call(jfsmeta.Background(), "load", map[string]any{}, &resp); st != syscall.EIO {
+		t.Fatalf("Call status=%v, want EIO", st)
 	}
 }
 
