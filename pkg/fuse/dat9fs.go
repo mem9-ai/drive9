@@ -34,6 +34,10 @@ import (
 // candidate after discovery but before the second TryLock in candidateLoop.
 var testHookAfterSamePathDirtyHandleScan func(path string)
 
+// testHookAfterCallerOwnedTruncateScan gates the ownership recheck after a
+// candidate was found but before a concurrent Flush can make it passive.
+var testHookAfterCallerOwnedTruncateScan func(path string)
+
 // testHookBeforeGVisorShadowSpillFlushFence lets race-focused unit tests pause
 // a gVisor ShadowSpill Flush after its initial supersession check but before it
 // acquires the same-path remote commit fence.
@@ -2578,13 +2582,14 @@ func (fs *Dat9FS) updateOpenHandleBaseRevisionForPath(remotePath string, revisio
 		// conservative O_TRUNC heuristic below never fires for real O_TRUNC
 		// writers and their next commit would CAS-conflict forever.
 		callerOwned := callerPID != 0 && fh.OpenPID != 0 && fh.OpenPID == callerPID
-		if callerOwned && fh.WritePolicy == WritePolicyCloseSync && !fh.IsNew && fs.handleCanAdoptCommittedRevisionLocked(fh) {
+		if callerOwned && fs.isPassiveCloseSyncHandleLocked(fh) {
 			// This truncate is already durable. A clean handle may be awaiting
 			// asynchronous Release after a successful Flush; updating its view
 			// must not give it another mutation to publish on Release.
-			fh.BaseRev = revision
+			fh.appendLogRecordTruncate()
 			fh.ZeroBase = false
-			fs.rebindCleanWriteBufferToRemoteLocked(fh, truncateSize)
+			fs.adoptCleanCommittedRevisionLocked(fh, revision, truncateSize)
+			fh.appendLogAdoptCommittedBaseline(revision, truncateSize)
 			if fh.Streamer != nil {
 				fh.Streamer.ResetForNextWrite(expectedRevisionForHandle(fh))
 			}
@@ -2782,7 +2787,7 @@ func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, ne
 		// Flush can finish before the kernel dispatches Release. Such a
 		// clean close-sync handle is not an owner for a new path mutation:
 		// SetAttr must commit it rather than leave a delayed Release upload.
-		canOwn := fh.WritePolicy != WritePolicyCloseSync || fh.IsNew || !fs.handleCanAdoptCommittedRevisionLocked(fh)
+		canOwn := !fs.isPassiveCloseSyncHandleLocked(fh)
 		fh.Unlock()
 		if owner == nil && canOwn {
 			owner = fh
@@ -2791,9 +2796,12 @@ func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, ne
 	if owner == nil {
 		return false
 	}
+	if testHookAfterCallerOwnedTruncateScan != nil {
+		testHookAfterCallerOwnedTruncateScan(owner.Path)
+	}
 	owner.Lock()
 	// A concurrent Flush may have committed the candidate while we scanned.
-	if owner.WritePolicy == WritePolicyCloseSync && !owner.IsNew && fs.handleCanAdoptCommittedRevisionLocked(owner) {
+	if fs.isPassiveCloseSyncHandleLocked(owner) {
 		owner.Unlock()
 		return false
 	}
@@ -2909,6 +2917,37 @@ func (fs *Dat9FS) handleCanAdoptCommittedRevisionLocked(fh *FileHandle) bool {
 	return true
 }
 
+// isPassiveCloseSyncHandleLocked identifies acknowledged handles which may
+// still await Release but must not take ownership of a new path truncate.
+func (fs *Dat9FS) isPassiveCloseSyncHandleLocked(fh *FileHandle) bool {
+	return fh != nil && fh.WritePolicy == WritePolicyCloseSync &&
+		!fh.IsNew && fs.handleCanAdoptCommittedRevisionLocked(fh)
+}
+
+// clearCleanHandleShadowClaimLocked drops only this handle's obsolete claim.
+// The path may hold a newer generation belonging to another writer: do not
+// Ensure, Truncate or Remove that shared shadow while adopting a clean view.
+func clearCleanHandleShadowClaimLocked(fh *FileHandle) {
+	fh.ShadowReady = false
+	fh.ShadowSpill = false
+	fh.ShadowStageGen = 0
+	fh.ShadowStageSeq = 0
+	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
+}
+
+// adoptCleanCommittedRevisionLocked rebinds an eligible clean handle to a
+// committed remote image, including its shadow claim and eviction callbacks.
+func (fs *Dat9FS) adoptCleanCommittedRevisionLocked(fh *FileHandle, revision, size int64) {
+	fh.IsNew = false
+	fh.BaseRev = revision
+	clearCleanHandleShadowClaimLocked(fh)
+	fs.rebindCleanWriteBufferToRemoteLocked(fh, size)
+	if fh.Streamer != nil {
+		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+	}
+}
+
 func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) bool {
 	if fs == nil || fh == nil || fh.Dirty == nil || !fs.handleCanAdoptCommittedRevisionLocked(fh) {
 		return false
@@ -2917,24 +2956,12 @@ func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) b
 	if revision <= 0 || revision <= fh.BaseRev {
 		return false
 	}
-	fh.IsNew = false
-	fh.BaseRev = revision
-	if fh.Streamer != nil {
-		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
-	}
-	if fs.clearRemovedCommittedShadowLocked(fh, revision, fs.committedHandleSizeLocked(fh), false) {
-		return true
-	}
 	if fh.ShadowReady || fh.ShadowSpill {
 		if fs.canRemoveActiveStaleShadowForCleanRefreshLocked(fh) {
 			fs.shadowStore.Remove(fh.Path)
 		}
-		fh.ShadowReady = false
-		fh.ShadowSpill = false
-		fh.ShadowCommitReady = false
-		fh.ShadowCommitSeq = 0
 	}
-	fs.rebindCleanWriteBufferToRemoteLocked(fh, fs.committedHandleSizeLocked(fh))
+	fs.adoptCleanCommittedRevisionLocked(fh, revision, fs.committedHandleSizeLocked(fh))
 	return true
 }
 
@@ -3656,9 +3683,19 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 			fh.Unlock()
 			continue
 		}
-		keepClean := fh.WritePolicy == WritePolicyCloseSync && !fh.IsNew && fs.handleCanAdoptCommittedRevisionLocked(fh)
+		keepClean := fs.isPassiveCloseSyncHandleLocked(fh)
+		if keepClean {
+			fh.appendLogRecordTruncate()
+		}
 		if fs.appendLogPathConfigured(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
 			if revision, committedSize, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && revision > 0 && committedSize == newSize {
+				if keepClean {
+					fh.ZeroBase = false
+					fs.adoptCleanCommittedRevisionLocked(fh, revision, newSize)
+					fh.appendLogAdoptCommittedBaseline(revision, newSize)
+					fh.Unlock()
+					continue
+				}
 				fs.adoptCommittedStorageClassLocked(fh, newSize)
 				if fh.Dirty.Size() != newSize {
 					if err := fh.Dirty.Truncate(newSize); err != nil {
@@ -3700,6 +3737,8 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 			// Sizing a clean sibling's view must not create a second publisher.
 			fh.Dirty.ClearDirty()
 			fh.ZeroBase = false
+			clearCleanHandleShadowClaimLocked(fh)
+			fs.rebaselineCommittedDirtyBufferLocked(fh)
 		} else {
 			fh.DirtySeq = fs.markDirtySize(ino, newSize)
 		}
@@ -8592,19 +8631,24 @@ func (fs *Dat9FS) stageDurableAtClose() bool {
 	return fs == nil || fs.opts == nil || !fs.opts.WritebackLazyStaging
 }
 
-// foregroundShadowUploadDurabilityLocked permits only strict close-sync Flush
-// and Release to omit local fsync. The shadow must be generation-pinned and not
-// referenced by local recovery metadata. Mixed interactive/auto library mounts
-// and staged handles keep the barrier; explicit Fsync and recovery do not use
-// this policy. Caller holds fh.mu and the remote commit path lock.
+// foregroundShadowUploadDurabilityLocked narrows a Flush/Release request to
+// omit local fsync. Only strict close-sync with a generation-pinned source and
+// no live pending-index/write-back metadata qualifies. This checks live staging,
+// not historical journal frames; recovery still uses the recorded CAS base.
+// Caller holds fh.mu and the remote commit path lock.
 func (fs *Dat9FS) foregroundShadowUploadDurabilityLocked(fh *FileHandle, gens StagingGens) shadowUploadDurability {
 	if fs.syncMode != SyncStrict || fh.WritePolicy != WritePolicyCloseSync ||
-		gens.ShadowGen == 0 || gens.PendingIndexGen != 0 || gens.WriteBackGen != 0 ||
+		gens.ShadowGen == 0 {
+		return shadowUploadLocalDurable
+	}
+	// Defensive exclusions for restored handles and library configurations;
+	// normal strict close-sync handles do not publish this staging state.
+	if gens.PendingIndexGen != 0 || gens.WriteBackGen != 0 ||
 		fh.ShadowCommitReady || fh.WriteBackSeq != 0 {
 		return shadowUploadLocalDurable
 	}
 	// A sibling/recovered entry need not be owned by this handle.
-	if fs.pendingIndex != nil && fs.pendingIndex.Generation(fh.Path) != 0 {
+	if fs.hasPendingMetadataState(fh.Path) {
 		return shadowUploadLocalDurable
 	}
 	return shadowUploadRemoteDurable
@@ -8830,7 +8874,7 @@ func (fs *Dat9FS) syncOpenSourceForHardlink(ctx context.Context, ino uint64) gof
 			fs.debouncer.CancelNoWait(fh.Path)
 		}
 		syncCtx, cancel := context.WithTimeout(ctx, releaseTimeout(size))
-		st := fs.syncHandleToRemoteLocked(syncCtx, fh)
+		st := fs.syncHandleToRemoteLocked(syncCtx, fh, shadowUploadLocalDurable)
 		cancel()
 		fh.Unlock()
 		if st != gofuse.OK {
@@ -14445,25 +14489,26 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 
 // syncHandleToRemoteLocked makes the current dirty handle remote-durable.
 // Caller must hold fh.mu. The method may temporarily release fh.mu around
-// network I/O, matching flushHandle's locking contract.
-func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
+// network I/O, matching flushHandle's locking contract. Only Flush/Release
+// request remote-only shadow durability; the upload gate may narrow it further.
+func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle, durability shadowUploadDurability) gofuse.Status {
 	if fh != nil && !fh.Unlinked && fs.appendLogConfiguredLocked(fh) {
-		status, _ := fs.syncAppendLogHandleToRemoteLocked(ctx, fh)
+		status, _ := fs.syncAppendLogHandleToRemoteLocked(ctx, fh, durability)
 		return status
 	}
-	return fs.syncHandleToRemoteWithoutAppendLogLocked(ctx, fh)
+	return fs.syncHandleToRemoteWithoutAppendLogLocked(ctx, fh, durability)
 }
 
 // syncAppendLogHandleToRemoteLocked returns whether the synchronous route used
 // a full rewrite. Caller must hold fh.mu.
-func (fs *Dat9FS) syncAppendLogHandleToRemoteLocked(ctx context.Context, fh *FileHandle) (gofuse.Status, bool) {
+func (fs *Dat9FS) syncAppendLogHandleToRemoteLocked(ctx context.Context, fh *FileHandle, durability shadowUploadDurability) (gofuse.Status, bool) {
 	if handled, status, fullRewrite := fs.routeAppendLogLocked(ctx, fh); handled {
 		return status, fullRewrite
 	}
-	return fs.syncHandleToRemoteWithoutAppendLogLocked(ctx, fh), true
+	return fs.syncHandleToRemoteWithoutAppendLogLocked(ctx, fh, durability), true
 }
 
-func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
+func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, fh *FileHandle, durability shadowUploadDurability) gofuse.Status {
 	if fh == nil || fh.Dirty == nil {
 		return gofuse.OK
 	}
@@ -14506,7 +14551,9 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 		stagingGens := fs.captureHandleStagingGensLocked(fh)
 		uploadStart := time.Now()
 		fs.debugf("sync handle shadowspill upload start path=%s size=%d expected_rev=%d", handlePath, size, expectedRevision)
-		durability := fs.foregroundShadowUploadDurabilityLocked(fh, stagingGens)
+		if durability == shadowUploadRemoteDurable {
+			durability = fs.foregroundShadowUploadDurabilityLocked(fh, stagingGens)
+		}
 		fh.Unlock()
 		committedRev, err := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen, durability)
 		var committedMutationRev int64
@@ -14762,7 +14809,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		}
 		syncCtx, syncCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 		defer syncCancel()
-		return fs.syncHandleToRemoteLocked(syncCtx, fh)
+		return fs.syncHandleToRemoteLocked(syncCtx, fh, shadowUploadRemoteDurable)
 	}
 
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() &&
@@ -14771,7 +14818,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		syncCtx, syncCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 		defer syncCancel()
 		phase = fh.WritePolicy.String()
-		return fs.syncHandleToRemoteLocked(syncCtx, fh)
+		return fs.syncHandleToRemoteLocked(syncCtx, fh, shadowUploadRemoteDurable)
 	}
 
 	requiresRemoteSync := isSQLitePersistentJournalPath(fh.Path)
@@ -15202,7 +15249,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		syncStart := time.Now()
 		syncCtx, syncCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 		defer syncCancel()
-		status, fullRewrite := fs.syncAppendLogHandleToRemoteLocked(syncCtx, fh)
+		status, fullRewrite := fs.syncAppendLogHandleToRemoteLocked(syncCtx, fh, shadowUploadLocalDurable)
 		if recordSync && fs.perfEnabled() {
 			fs.perf.recordAppendLogFsync(fullRewrite, time.Since(syncStart))
 		}
@@ -15780,7 +15827,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				size = fh.Dirty.Size()
 			}
 			flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
-			flushStatus = fs.syncHandleToRemoteLocked(flushCtx, fh)
+			flushStatus = fs.syncHandleToRemoteLocked(flushCtx, fh, shadowUploadRemoteDurable)
 			flushCancel()
 			// The content finalizer may have succeeded before chmod failed.
 			// Let the existing Release mode finalizer retry only the mode; on
@@ -15812,7 +15859,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 				flushStart := time.Now()
 				fs.debugf("release write policy sync start path=%s size=%d policy=%s timeout=%s", fh.Path, size, fh.WritePolicy, releaseTimeout(size))
-				flushStatus = fs.syncHandleToRemoteLocked(flushCtx, fh)
+				flushStatus = fs.syncHandleToRemoteLocked(flushCtx, fh, shadowUploadRemoteDurable)
 				fs.debugDurationf(flushStart, 0, "release write policy sync done path=%s size=%d status=%d", fh.Path, size, flushStatus)
 				flushCancel()
 			}

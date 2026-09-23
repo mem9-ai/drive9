@@ -136,12 +136,18 @@ prefer this over close-sync.
 `close-sync` improves cross-client/cloud visibility after close, but close
 latency includes network, server, database, and S3/db9 latency.
 Strict close-sync `Flush` and `Release` shadow uploads omit local fsync only
-when the content generation is known and no local recovery metadata references
-the shadow. Generation fencing pins the source through remote acknowledgement.
+when the content generation is known and no live pending-index or write-back
+metadata references the path. Generation fencing pins the source through remote
+acknowledgement. Only Flush/Release request this optimization from the shared
+uploader; generic shadow uploads for explicit fsync and link-source synchronization
+retain the local barrier, including the append-log fallback into that uploader.
 Failed uploads retain dirty state for an in-process retry; unacknowledged shadow
 bytes are not guaranteed to survive a machine crash. Explicit strict `fsync(2)`
 shadow uploads deliberately retain local sync, as do writeback, recovery, staged
 handles, and library mounts combining close-sync with interactive/auto sync.
+The eligibility check uses live staging state, not a scan of historical WAL
+frames. Recovery of historical frames retains its recorded revision and existing
+CAS checks; this optimization does not add journal commit markers or retire them.
 
 `write-sync` can be dramatically slower for normal buffered writers because a
 single logical file copy may be split into many FUSE write requests. It is

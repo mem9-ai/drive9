@@ -17466,7 +17466,7 @@ func TestSyncHandleShadowSpillConcurrentWritePreservesDirtyState(t *testing.T) {
 	flushDone := make(chan gofuse.Status, 1)
 	go func() {
 		fh.Lock()
-		st := fs.syncHandleToRemoteLocked(context.Background(), fh)
+		st := fs.syncHandleToRemoteLocked(context.Background(), fh, shadowUploadLocalDurable)
 		fh.Unlock()
 		flushDone <- st
 	}()

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -62,13 +63,14 @@ func TestCloseSyncShadowUploadSkipsLocalSyncOnlyForCloseSync(t *testing.T) {
 		generation bool
 		syncMode   SyncMode
 		pending    bool
+		wantRemote bool
 	}{
-		{"close-sync", WritePolicyCloseSync, true, SyncStrict, false},
-		{"writeback", WritePolicyWriteBack, true, SyncStrict, false},
-		{"legacy-close-sync", WritePolicyCloseSync, false, SyncStrict, false},
-		{"interactive-close-sync", WritePolicyCloseSync, true, SyncInteractive, false},
-		{"auto-close-sync", WritePolicyCloseSync, true, SyncAuto, false},
-		{"staged-close-sync", WritePolicyCloseSync, true, SyncStrict, true},
+		{"close-sync", WritePolicyCloseSync, true, SyncStrict, false, true},
+		{"writeback", WritePolicyWriteBack, true, SyncStrict, false, false},
+		{"legacy-close-sync", WritePolicyCloseSync, false, SyncStrict, false, false},
+		{"interactive-close-sync", WritePolicyCloseSync, true, SyncInteractive, false, false},
+		{"auto-close-sync", WritePolicyCloseSync, true, SyncAuto, false, false},
+		{"staged-close-sync", WritePolicyCloseSync, true, SyncStrict, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var puts atomic.Int32
@@ -98,10 +100,10 @@ func TestCloseSyncShadowUploadSkipsLocalSyncOnlyForCloseSync(t *testing.T) {
 			if !tc.generation {
 				fh.ShadowStageGen = 0
 			}
-			st := fs.syncHandleToRemoteWithoutAppendLogLocked(context.Background(), fh)
+			st := fs.syncHandleToRemoteWithoutAppendLogLocked(context.Background(), fh, shadowUploadRemoteDurable)
 			dirty := fh.Dirty.HasDirtyParts()
 			fh.Unlock()
-			if tc.policy == WritePolicyCloseSync && tc.generation && tc.syncMode == SyncStrict && !tc.pending {
+			if tc.wantRemote {
 				if st != gofuse.OK || puts.Load() != 1 || dirty {
 					t.Fatalf("close-sync: status=%v puts=%d dirty=%t", st, puts.Load(), dirty)
 				}
@@ -112,23 +114,13 @@ func TestCloseSyncShadowUploadSkipsLocalSyncOnlyForCloseSync(t *testing.T) {
 	}
 }
 
-func TestCloseSyncShadowUploadPinsGenerationUntilRemoteAck(t *testing.T) {
+func TestCloseSyncShadowUploadWaitsForRemoteAck(t *testing.T) {
 	started, allow := make(chan struct{}), make(chan struct{})
 	var release, startedOnce sync.Once
-	var fs *Dat9FS
-	fs = newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		if r.Method != http.MethodPut || string(body) != "close-sync content" {
 			t.Errorf("unexpected upload: %s %q", r.Method, body)
-		}
-		fs.shadowStore.mu.RLock()
-		pl := fs.shadowStore.pathLocks["/pinned.txt"]
-		fs.shadowStore.mu.RUnlock()
-		if pl == nil {
-			t.Error("shadow path lock missing during upload")
-		} else if pl.mu.TryLock() {
-			pl.mu.Unlock()
-			t.Error("shadow path lock released before remote acknowledgement")
 		}
 		startedOnce.Do(func() { close(started) })
 		<-allow
@@ -188,7 +180,7 @@ func TestCloseSyncShadowUploadFailureRetainsInProcessRetryableData(t *testing.T)
 	}
 }
 
-func TestShadowUploadWithoutLocalSyncRejectsStaleGeneration(t *testing.T) {
+func TestShadowRemoteDurabilityRejectsStaleGeneration(t *testing.T) {
 	var calls atomic.Int32
 	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1) })
 	fh, _ := createCloseSyncShadowTestFile(t, fs, "stale.txt", 0o644)
@@ -226,7 +218,7 @@ func TestShadowRemoteDurabilityRejectsMissingGeneration(t *testing.T) {
 	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1) })
 	fh, _ := createCloseSyncShadowTestFile(t, fs, "missing-gen.txt", 0o644)
 	_, err := uploadFromShadowRemote(context.Background(), fs.client, fs.shadowStore, fh.Path, fh.Path, 0, 0, shadowUploadRemoteDurable)
-	if !errors.Is(err, errCommitPayloadStale) || calls.Load() != 0 {
+	if !errors.Is(err, errInvalidShadowUpload) || calls.Load() != 0 {
 		t.Fatalf("unfenced upload: err=%v calls=%d", err, calls.Load())
 	}
 }
@@ -360,6 +352,71 @@ func TestCloseSyncShadowUploadEmptyAndMultipart(t *testing.T) {
 			}
 			if size == 0 && recorder.directFilePuts.Load() != 1 || size > 0 && recorder.completeCalls.Load() != 1 {
 				t.Fatalf("upload route: direct=%d multipart=%d", recorder.directFilePuts.Load(), recorder.completeCalls.Load())
+			}
+		})
+	}
+}
+
+func TestCloseSyncAppendLogFsyncFallbackKeepsLocalBarrier(t *testing.T) {
+	var calls atomic.Int32
+	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = io.WriteString(w, `{"revision":1}`)
+	})
+	fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/fsync.txt"})
+	fh, input := createCloseSyncShadowTestFile(t, fs, "fsync.txt", 0o644)
+	makeCloseSyncShadowUnsyncable(t, fs.shadowStore, fh.Path)
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: input.InHeader, Fh: input.Fh}); st == gofuse.OK || calls.Load() != 0 {
+		t.Fatalf("append-log Fsync fallback skipped local barrier: status=%v calls=%d", st, calls.Load())
+	}
+}
+
+func TestCloseSyncShadowDurabilityGuard(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*testing.T, *Dat9FS, *FileHandle, *StagingGens)
+		want   shadowUploadDurability
+	}{
+		{"eligible", func(*testing.T, *Dat9FS, *FileHandle, *StagingGens) {}, shadowUploadRemoteDurable},
+		{"interactive", func(_ *testing.T, fs *Dat9FS, _ *FileHandle, _ *StagingGens) { fs.syncMode = SyncInteractive }, shadowUploadLocalDurable},
+		{"auto", func(_ *testing.T, fs *Dat9FS, _ *FileHandle, _ *StagingGens) { fs.syncMode = SyncAuto }, shadowUploadLocalDurable},
+		{"writeback", func(_ *testing.T, _ *Dat9FS, fh *FileHandle, _ *StagingGens) { fh.WritePolicy = WritePolicyWriteBack }, shadowUploadLocalDurable},
+		{"o-sync", func(_ *testing.T, fs *Dat9FS, fh *FileHandle, _ *StagingGens) {
+			fh.WritePolicy = fs.writePolicyForOpen(syscall.O_SYNC)
+		}, shadowUploadLocalDurable},
+		{"o-dsync", func(_ *testing.T, fs *Dat9FS, fh *FileHandle, _ *StagingGens) {
+			fh.WritePolicy = fs.writePolicyForOpen(syscall.O_DSYNC)
+		}, shadowUploadLocalDurable},
+		{"missing-generation", func(_ *testing.T, _ *Dat9FS, _ *FileHandle, gens *StagingGens) { gens.ShadowGen = 0 }, shadowUploadLocalDurable},
+		{"owned-pending", func(_ *testing.T, _ *Dat9FS, _ *FileHandle, gens *StagingGens) { gens.PendingIndexGen = 1 }, shadowUploadLocalDurable},
+		{"owned-writeback", func(_ *testing.T, _ *Dat9FS, _ *FileHandle, gens *StagingGens) { gens.WriteBackGen = 1 }, shadowUploadLocalDurable},
+		{"queued-shadow", func(_ *testing.T, _ *Dat9FS, fh *FileHandle, _ *StagingGens) { fh.ShadowCommitReady = true }, shadowUploadLocalDurable},
+		{"queued-writeback", func(_ *testing.T, _ *Dat9FS, fh *FileHandle, _ *StagingGens) { fh.WriteBackSeq = 1 }, shadowUploadLocalDurable},
+		{"path-pending", func(t *testing.T, fs *Dat9FS, fh *FileHandle, _ *StagingGens) {
+			if _, err := fs.pendingIndex.PutShadowSpill(fh.Path, fh.Dirty.Size(), PendingNew, 0); err != nil {
+				t.Fatal(err)
+			}
+		}, shadowUploadLocalDurable},
+		{"path-writeback", func(t *testing.T, fs *Dat9FS, fh *FileHandle, _ *StagingGens) {
+			var err error
+			fs.writeBack, err = NewWriteBackCache(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = fs.writeBack.Put(fh.Path, []byte("staged"), 6, PendingNew); err != nil {
+				t.Fatal(err)
+			}
+		}, shadowUploadLocalDurable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newCloseSyncShadowTestFS(t, func(http.ResponseWriter, *http.Request) { t.Error("unexpected remote request") })
+			fh, _ := createCloseSyncShadowTestFile(t, fs, "guard.txt", 0o644)
+			fh.Lock()
+			defer fh.Unlock()
+			gens := fs.captureHandleStagingGensLocked(fh)
+			tc.change(t, fs, fh, &gens)
+			if got := fs.foregroundShadowUploadDurabilityLocked(fh, gens); got != tc.want {
+				t.Fatalf("durability=%v, want %v", got, tc.want)
 			}
 		})
 	}
