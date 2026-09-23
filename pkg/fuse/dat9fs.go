@@ -8601,6 +8601,24 @@ func (fs *Dat9FS) stageDurableAtClose() bool {
 	return fs == nil || fs.opts == nil || !fs.opts.WritebackLazyStaging
 }
 
+// foregroundShadowUploadDurabilityLocked permits only strict close-sync Flush
+// and Release to omit local fsync. The shadow must be generation-pinned and not
+// referenced by local recovery metadata. Mixed interactive/auto library mounts
+// and staged handles keep the barrier; explicit Fsync and recovery do not use
+// this policy. Caller holds fh.mu and the remote commit path lock.
+func (fs *Dat9FS) foregroundShadowUploadDurabilityLocked(fh *FileHandle, gens StagingGens) shadowUploadDurability {
+	if fs.syncMode != SyncStrict || fh.WritePolicy != WritePolicyCloseSync ||
+		gens.ShadowGen == 0 || gens.PendingIndexGen != 0 || gens.WriteBackGen != 0 ||
+		fh.ShadowCommitReady || fh.WriteBackSeq != 0 {
+		return shadowUploadLocalDurable
+	}
+	// A sibling/recovered entry need not be owned by this handle.
+	if fs.pendingIndex != nil && fs.pendingIndex.Generation(fh.Path) != 0 {
+		return shadowUploadLocalDurable
+	}
+	return shadowUploadRemoteDurable
+}
+
 func (fs *Dat9FS) waitQueuedRemoteCommitBeforeWrite(p string) func() {
 	if fs == nil || p == "" {
 		return func() {}
@@ -14497,13 +14515,9 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 		stagingGens := fs.captureHandleStagingGensLocked(fh)
 		uploadStart := time.Now()
 		fs.debugf("sync handle shadowspill upload start path=%s size=%d expected_rev=%d", handlePath, size, expectedRevision)
-		uploadShadow := uploadFromShadowRemoteWithRevisionAndGeneration
-		if fh.WritePolicy == WritePolicyCloseSync && stagingGens.ShadowGen != 0 {
-			// close-sync waits for remote durability. The generation-pinned
-			// shadow is only an upload source, not a local durability barrier.
-			uploadShadow = uploadFromShadowRemoteWithoutLocalSync
-		}
+		durability := fs.foregroundShadowUploadDurabilityLocked(fh, stagingGens)
 		modeCommit, combineMode := fs.closeSyncCreateModeLocked(fh, size, expectedRevision)
+		combineMode = combineMode && durability == shadowUploadRemoteDurable
 		fh.Unlock()
 		var committedRev int64
 		var err error
@@ -14512,7 +14526,7 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 			committedRev, modeCommitted, err = fs.uploadCloseSyncCreateWithMode(ctx, handlePath, size, stagingGens.ShadowGen, modeCommit.mode)
 		}
 		if err == nil && !modeCommitted {
-			committedRev, err = uploadShadow(ctx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen)
+			committedRev, err = uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen, durability)
 		}
 		var committedMutationRev int64
 		if err == nil {
@@ -14978,7 +14992,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			uploadStart := time.Now()
 			fs.debugf("flush shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 			fh.Unlock()
-			committedRev, err := uploadFromShadowRemoteWithRevisionAndGeneration(uploadCtx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen)
+			committedRev, err := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen, shadowUploadLocalDurable)
 			// Record the committed revision while still holding remoteCommitLock
 			// so a waiting Unlink re-check observes the upload and issues a DELETE.
 			if err == nil && committedRev > 0 {
@@ -15372,7 +15386,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		uploadStart := time.Now()
 		fs.debugf("fsync shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 		fh.Unlock()
-		committedRev, err := uploadFromShadowRemoteWithRevisionAndGeneration(uploadCtx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen)
+		committedRev, err := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen, shadowUploadLocalDurable)
 		// Record the committed revision while still holding remoteCommitLock
 		// so a waiting Unlink re-check observes the upload and issues a DELETE.
 		if err == nil && committedRev > 0 {
@@ -15915,7 +15929,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					phase = "shadowspill-sync-upload"
 					uploadStart := time.Now()
 					fs.debugf("release shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
-					committedRev, uploadErr := uploadFromShadowRemoteWithRevisionAndGeneration(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevision, entry.ShadowGen)
+					committedRev, uploadErr := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevision, entry.ShadowGen, shadowUploadLocalDurable)
 					var uploadBytes uint64
 					if size > 0 {
 						uploadBytes = uint64(size)

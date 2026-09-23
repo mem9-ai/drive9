@@ -38,7 +38,7 @@ Valid values:
 | `auto` | Buffered locally. | RTT-based: strict on low-latency mounts, interactive on high-latency mounts. | Existing write-back behavior. | Default, preserve current latency/compatibility behavior. |
 | `interactive` | Buffered locally. | Local shadow/journal durable; remote commit async. | Existing write-back behavior. | Editors and WAN mounts where low latency matters more than immediate cross-client visibility. |
 | `fsync` | Buffered locally. | Remote-durable before fsync returns. | Existing write-back behavior except existing strict large-file flush behavior. | Tools that explicitly call fsync when they need durability. |
-| `close-sync` | Buffered locally. | Remote-durable before fsync returns. | Remote-durable before close can report success. | JuiceFS-like close-to-cloud semantics, sync tools, cross-client visibility after close. |
+| `close-sync` ([local staging tradeoff](#expected-tradeoffs)) | Buffered locally. | Remote-durable before fsync returns. | Remote-durable before close can report success. | JuiceFS-like close-to-cloud semantics, sync tools, cross-client visibility after close. |
 | `write-sync` | Remote-durable before each write returns. | Normally clean after successful writes. | Normally clean after successful writes. | Strongest semantics, tests, low-frequency writes. |
 
 Default is `auto`.
@@ -135,11 +135,13 @@ prefer this over close-sync.
 
 `close-sync` improves cross-client/cloud visibility after close, but close
 latency includes network, server, database, and S3/db9 latency.
-Foreground close-sync shadow uploads with a known content generation omit the
-local shadow fsync: generation fencing pins the upload source, and success still
-waits for remote durability. Failed uploads retain dirty state for retry, but
-their unacknowledged bytes are not additionally guaranteed to survive a machine
-crash in the local shadow. Writeback and recovery upload paths retain local sync.
+Strict close-sync `Flush` and `Release` shadow uploads omit local fsync only
+when the content generation is known and no local recovery metadata references
+the shadow. Generation fencing pins the source through remote acknowledgement.
+Failed uploads retain dirty state for an in-process retry; unacknowledged shadow
+bytes are not guaranteed to survive a machine crash. Explicit strict `fsync(2)`
+shadow uploads deliberately retain local sync, as do writeback, recovery, staged
+handles, and library mounts combining close-sync with interactive/auto sync.
 
 For a new nonempty inline file with deferred permissions, close-sync can publish
 content and mode together using a single-item batch write with create-only CAS.
