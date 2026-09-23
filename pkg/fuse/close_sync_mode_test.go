@@ -20,6 +20,53 @@ import (
 	"github.com/mem9-ai/drive9/pkg/logger"
 )
 
+func newCloseSyncModeTestFS(t *testing.T, handler http.HandlerFunc) *Dat9FS {
+	t.Helper()
+	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/status" {
+			_, _ = io.WriteString(w, `{"storage_capabilities":{"batch_write_mode_v1":true}}`)
+			return
+		}
+		handler(w, r)
+	})
+	fs.client.Warm(context.Background())
+	return fs
+}
+
+func TestCloseSyncCombinedModeRequiresAdvertisedContract(t *testing.T) {
+	for _, status := range []string{`{}`, `{"storage_capabilities":{}}`, `{"storage_capabilities":{"batch_write_mode_v1":false}}`, `invalid`} {
+		t.Run(status, func(t *testing.T) {
+			var batches, puts, chmods atomic.Int32
+			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/v1/status":
+					_, _ = io.WriteString(w, status)
+				case r.URL.Path == "/v1/fs:batch-write":
+					batches.Add(1)
+					replyCloseSyncBatch(w, readCloseSyncBatchItem(t, r), http.StatusOK, 1)
+				case r.Method == http.MethodPut:
+					puts.Add(1)
+					if r.Header.Get("X-Dat9-Expected-Revision") != "0" {
+						t.Error("ordinary PUT lost create-only CAS")
+					}
+					_, _ = io.WriteString(w, `{"revision":1}`)
+				case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+					chmods.Add(1)
+					w.WriteHeader(http.StatusForbidden)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			})
+			fs.client.Warm(context.Background())
+			fh, input := createCloseSyncShadowTestFile(t, fs, "unadvertised.txt", 0o755)
+			if st := fs.Flush(nil, input); st != gofuse.EACCES || batches.Load() != 0 || puts.Load() != 1 || chmods.Load() != 1 || !fh.HasPendingMode {
+				t.Fatalf("unadvertised server: status=%v batch=%d PUT=%d chmod=%d pending=%t", st, batches.Load(), puts.Load(), chmods.Load(), fh.HasPendingMode)
+			}
+		})
+	}
+}
+
 func readCloseSyncBatchItem(t *testing.T, r *http.Request) client.BatchWriteItem {
 	t.Helper()
 	var req struct {
@@ -42,7 +89,7 @@ func TestCloseSyncCombinedModeCommitsContentAndMode(t *testing.T) {
 	for _, mode := range []uint32{0o755, 0, 0o4755} {
 		t.Run(fmt.Sprintf("%o", mode), func(t *testing.T) {
 			var batches atomic.Int32
-			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+			fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.Method != http.MethodPost || r.URL.Path != "/v1/fs:batch-write" {
 					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
 					w.WriteHeader(http.StatusInternalServerError)
@@ -83,7 +130,7 @@ func TestCloseSyncCombinedModeFallsBackForUnsupportedEndpoint(t *testing.T) {
 	for _, code := range []int{http.StatusNotFound, http.StatusMethodNotAllowed} {
 		t.Run(fmt.Sprint(code), func(t *testing.T) {
 			var batches, puts, chmods atomic.Int32
-			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+			fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.URL.Path == "/v1/fs:batch-write":
 					batches.Add(1)
@@ -130,7 +177,7 @@ func TestCloseSyncCombinedModeForbiddenFallsBackWithoutBypassingPermissions(t *t
 			var batches, puts, chmods atomic.Int32
 			var remote atomic.Value
 			remote.Store(tc.initial)
-			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+			fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.URL.Path == "/v1/fs:batch-write":
 					batches.Add(1)
@@ -152,6 +199,10 @@ func TestCloseSyncCombinedModeForbiddenFallsBackWithoutBypassingPermissions(t *t
 						w.WriteHeader(tc.putStatus)
 						return
 					}
+					if remote.Load().(string) != "" {
+						w.WriteHeader(http.StatusConflict)
+						return
+					}
 					remote.Store(string(data))
 					_, _ = io.WriteString(w, `{"revision":1}`)
 				case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
@@ -165,6 +216,7 @@ func TestCloseSyncCombinedModeForbiddenFallsBackWithoutBypassingPermissions(t *t
 					w.WriteHeader(http.StatusInternalServerError)
 				}
 			})
+			fs.perf = newFusePerfCounters(true)
 			fh, input := createCloseSyncShadowTestFile(t, fs, "scoped.txt", 0o755)
 			generation := fh.ShadowStageGen
 			if st := fs.Flush(nil, input); st != tc.wantStatus {
@@ -182,6 +234,21 @@ func TestCloseSyncCombinedModeForbiddenFallsBackWithoutBypassingPermissions(t *t
 			}
 			if !fs.closeSyncBatchAvailable(time.Now()) {
 				t.Fatal("per-item denial disabled batching for other creates")
+			}
+			if got := fs.perf.snapshot().Counters["close_sync_mode_forbidden_fallback"]; got != 1 {
+				t.Fatalf("forbidden fallback counter=%d, want 1", got)
+			}
+			if tc.putStatus == http.StatusOK {
+				// Match ordinary PUT-then-chmod: a failed chmod retains dirty
+				// state and create-only CAS. Retry must not overwrite the bytes
+				// which already committed, even if another writer changes them.
+				remote.Store("newer writer")
+				if st := fs.Flush(nil, input); st != gofuse.Status(syscall.EEXIST) {
+					t.Fatalf("second Flush=%v, want create-only conflict", st)
+				}
+				if puts.Load() != 2 || chmods.Load() != 1 || remote.Load().(string) != "newer writer" || !fh.HasPendingMode || !fh.Dirty.HasDirtyParts() {
+					t.Fatalf("retry changed committed state: PUT=%d chmod=%d bytes=%q", puts.Load(), chmods.Load(), remote.Load())
+				}
 			}
 		})
 	}
@@ -216,7 +283,7 @@ func TestCloseSyncCombinedModeErrorsKeepDirtyWithoutFallback(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var batches, fallback atomic.Int32
-			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+			fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != "/v1/fs:batch-write" {
 					fallback.Add(1)
 					w.WriteHeader(http.StatusInternalServerError)
@@ -249,7 +316,7 @@ func TestCloseSyncCombinedModeErrorsKeepDirtyWithoutFallback(t *testing.T) {
 // automatic adoption requires a server-verifiable idempotency identity.
 func TestCloseSyncCombinedModeLostAckDoesNotOverwriteCommittedFile(t *testing.T) {
 	var batches, fallback atomic.Int32
-	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+	fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/fs:batch-write" {
 			fallback.Add(1)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -288,7 +355,7 @@ func TestCloseSyncCombinedModePreservesConcurrentChmod(t *testing.T) {
 			started, allow := make(chan struct{}), make(chan struct{})
 			var release, startedOnce sync.Once
 			var batches, chmods atomic.Int32
-			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+			fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.URL.Path == "/v1/fs:batch-write":
 					batches.Add(1)
@@ -351,7 +418,7 @@ func TestCloseSyncCombinedModeConcurrentChmodFailureKeepsCommittedCAS(t *testing
 	started, allow := make(chan struct{}), make(chan struct{})
 	var release, startedOnce sync.Once
 	var batches, puts, chmods atomic.Int32
-	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+	fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/fs:batch-write":
 			batches.Add(1)
@@ -416,7 +483,7 @@ func TestCloseSyncCombinedModeDoesNotFinalizeChangedHandle(t *testing.T) {
 			started, allow := make(chan struct{}), make(chan struct{})
 			var release, startedOnce sync.Once
 			var otherCalls atomic.Int32
-			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+			fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != "/v1/fs:batch-write" {
 					otherCalls.Add(1)
 					w.WriteHeader(http.StatusInternalServerError)
@@ -472,7 +539,7 @@ func TestCloseSyncCombinedModeKeepsMultipartBoundary(t *testing.T) {
 	for _, threshold := range []int64{0, int64(len("close-sync content"))} {
 		t.Run(fmt.Sprint(threshold), func(t *testing.T) {
 			var initiates atomic.Int32
-			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+			fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/v2/uploads/initiate" {
 					initiates.Add(1)
 				} else {
@@ -503,7 +570,7 @@ func TestCloseSyncCombinedModeLeavesOtherUploadsUnchanged(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var puts, chmods atomic.Int32
-			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+			fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.Method == http.MethodPut:
 					puts.Add(1)
@@ -540,7 +607,7 @@ func TestCloseSyncCombinedModeLeavesOtherUploadsUnchanged(t *testing.T) {
 
 func TestCloseSyncCombinedModeReprobesAfterCooldown(t *testing.T) {
 	var batches, puts, chmods atomic.Int32
-	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+	fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/fs:batch-write":
 			if batches.Add(1) == 1 {
@@ -574,7 +641,7 @@ func TestCloseSyncCombinedModeReprobesAfterCooldown(t *testing.T) {
 }
 
 func TestCloseSyncCombinedModeLogsFallbackOncePerCooldown(t *testing.T) {
-	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusMethodNotAllowed) })
+	fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusMethodNotAllowed) })
 	core, logs := observer.New(zap.WarnLevel)
 	ctx := logger.WithContext(context.Background(), zap.New(core))
 	fh, _ := createCloseSyncShadowTestFile(t, fs, "fallback-log.txt", 0o755)
@@ -605,6 +672,11 @@ func TestCloseSyncBatchCooldownDoesNotExtendForInflightFailures(t *testing.T) {
 		t.Fatal("first failure did not start a cooldown")
 	}
 	retryAt := now.Add(closeSyncBatchRetryInterval)
+	// Structural equality intentionally checks the monotonic reading too;
+	// time.Time.Equal would accept a deadline that silently discarded it.
+	if got := fs.closeSyncBatchRetryAt.Load(); got == nil || *got != retryAt || *got == got.Round(0) { //nolint:staticcheck // Compare monotonic state, not just the instant.
+		t.Fatal("cooldown discarded the monotonic clock reading")
+	}
 	justBefore := retryAt.Add(-time.Nanosecond)
 	if fs.closeSyncBatchAvailable(justBefore) || fs.deferCloseSyncBatchRetry(justBefore) {
 		t.Fatal("in-flight failure restarted the active cooldown")
@@ -616,7 +688,7 @@ func TestCloseSyncBatchCooldownDoesNotExtendForInflightFailures(t *testing.T) {
 
 func TestCloseSyncCombinedModeAcceptsLastInlineSize(t *testing.T) {
 	var batches atomic.Int32
-	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+	fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/fs:batch-write" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 			w.WriteHeader(500)
@@ -636,7 +708,7 @@ func TestCloseSyncCombinedModeCannotBypassLocalBarrier(t *testing.T) {
 	for _, staged := range []bool{false, true} {
 		t.Run(fmt.Sprint(staged), func(t *testing.T) {
 			var calls atomic.Int32
-			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1) })
+			fs := newCloseSyncModeTestFS(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1) })
 			fh, input := createCloseSyncShadowTestFile(t, fs, "local-barrier.txt", 0o755)
 			if staged {
 				if _, err := fs.pendingIndex.PutShadowSpill(fh.Path, fh.Dirty.Size(), PendingNew, 0); err != nil {

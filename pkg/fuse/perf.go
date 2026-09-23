@@ -115,8 +115,9 @@ type fusePerfCounters struct {
 	enabled bool
 	start   time.Time
 
-	fuseOps   [perfFuseOpCount]perfAtomicStats
-	remoteOps [perfRemoteOpCount]perfAtomicStats
+	fuseOps                        [perfFuseOpCount]perfAtomicStats
+	remoteOps                      [perfRemoteOpCount]perfAtomicStats
+	closeSyncModeForbiddenFallback atomicUint64
 
 	readCacheHit  atomicUint64
 	readCacheMiss atomicUint64
@@ -534,6 +535,7 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 		snap.RemoteOps[perfRemoteOpNames[i]] = stats.snapshot()
 	}
 	snap.Counters["read_cache_hit"] = p.readCacheHit.load()
+	snap.Counters["close_sync_mode_forbidden_fallback"] = p.closeSyncModeForbiddenFallback.load()
 	snap.Counters["read_cache_miss"] = p.readCacheMiss.load()
 	snap.Counters["dir_cache_hit"] = p.dirCacheHit.load()
 	snap.Counters["dir_cache_miss"] = p.dirCacheMiss.load()

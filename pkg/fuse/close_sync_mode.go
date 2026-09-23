@@ -46,7 +46,7 @@ func (fs *Dat9FS) deferCloseSyncBatchRetry(now time.Time) bool {
 // deferred-chmod behavior. Caller holds fh.mu.
 func (fs *Dat9FS) closeSyncCreateModeLocked(fh *FileHandle, size, expectedRevision int64, durability shadowUploadDurability) *closeSyncModeCommit {
 	if durability != shadowUploadRemoteDurable || fh.WritePolicy != WritePolicyCloseSync || !fh.IsNew || expectedRevision != 0 ||
-		fh.ShadowStageGen == 0 || fh.PendingModeGen == 0 || !fs.closeSyncBatchAvailable(time.Now()) ||
+		fh.ShadowStageGen == 0 || fh.PendingModeGen == 0 || !fs.client.CachedBatchWriteModeSupported() || !fs.closeSyncBatchAvailable(time.Now()) ||
 		fs.layerEnabled() || fs.appendLogConfiguredLocked(fh) || fh.GitWorkspaceID != "" || fh.isExtent() {
 		return nil
 	}
@@ -72,7 +72,8 @@ type closeSyncUploadOutcome uint8
 
 const (
 	closeSyncUploadUnconfirmed closeSyncUploadOutcome = iota
-	closeSyncUploadCommitted
+	closeSyncUploadContentCommitted
+	closeSyncUploadContentAndModeCommitted
 	closeSyncUploadUnsupported
 	closeSyncUploadForbidden
 )
@@ -80,7 +81,7 @@ const (
 type closeSyncUploadResult struct {
 	outcome  closeSyncUploadOutcome
 	revision int64
-	mode     *closeSyncModeCommit
+	mode     closeSyncModeCommit
 }
 
 // uploadCloseSyncShadow selects the combined create or the ordinary shadow
@@ -93,7 +94,7 @@ func (fs *Dat9FS) uploadCloseSyncShadow(ctx context.Context, path string, size, 
 			return result, err
 		}
 		switch result.outcome {
-		case closeSyncUploadCommitted:
+		case closeSyncUploadContentAndModeCommitted:
 			return result, nil
 		case closeSyncUploadUnsupported, closeSyncUploadForbidden:
 			// Both are definite non-commits. The ordinary upload preserves CAS
@@ -106,7 +107,7 @@ func (fs *Dat9FS) uploadCloseSyncShadow(ctx context.Context, path string, size, 
 	if err != nil {
 		return closeSyncUploadResult{}, err
 	}
-	return closeSyncUploadResult{outcome: closeSyncUploadCommitted, revision: revision}, nil
+	return closeSyncUploadResult{outcome: closeSyncUploadContentCommitted, revision: revision}, nil
 }
 
 // uploadCloseSyncCreateWithMode explicitly distinguishes confirmed commits from
@@ -154,6 +155,9 @@ func (fs *Dat9FS) uploadCloseSyncCreateWithMode(ctx context.Context, localPath s
 		// The server rejects authorization before backend mutation. Retry only
 		// content via PUT, leaving mode pending so chmod reports its own denial.
 		// Do not disable batching for other paths or treat this as a mode ACK.
+		if fs.perf.isEnabled() {
+			fs.perf.closeSyncModeForbiddenFallback.add(1)
+		}
 		return closeSyncUploadResult{outcome: closeSyncUploadForbidden}, nil
 	}
 	if !results[0].OK() {
@@ -162,17 +166,19 @@ func (fs *Dat9FS) uploadCloseSyncCreateWithMode(ctx context.Context, localPath s
 	if results[0].Revision <= 0 {
 		return closeSyncUploadResult{}, fmt.Errorf("combined create returned no committed revision")
 	}
-	return closeSyncUploadResult{outcome: closeSyncUploadCommitted, revision: results[0].Revision, mode: mode}, nil
+	return closeSyncUploadResult{outcome: closeSyncUploadContentAndModeCommitted, revision: results[0].Revision, mode: *mode}, nil
 }
 
 // adoptCombinedCommitLocked acknowledges content and its mode without retiring
 // shadow staging: the caller must reseed the read cache before removing it.
 // It returns false if mode acknowledgement unlocked fh and it was unlinked,
 // renamed, or received a newer content mutation while sibling modes were cleared.
+// The caller's earlier checks cannot cover the new unlock/relock window inside
+// finishPendingModeForHandleLocked, so this second ownership check is required.
 // The confirmed revision must survive a later chmod failure so retry uses CAS
 // against this commit rather than attempting another create-only upload.
 func (fs *Dat9FS) adoptCombinedCommitLocked(fh *FileHandle, path string, mutationSeq uint64, size int64, result closeSyncUploadResult) bool {
-	if result.mode == nil {
+	if result.outcome != closeSyncUploadContentAndModeCommitted {
 		// Ordinary and fallback uploads acknowledge content only.
 		return true
 	}
