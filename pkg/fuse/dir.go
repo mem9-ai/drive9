@@ -520,7 +520,12 @@ func (dc *DirCache) BeginObservation(dirPath string) ObservationToken {
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	var seq uint64
+	// An uncached directory has no install sequence yet, so the baseline is the
+	// current global counter — the same value ensureEntryLocked seeds into an
+	// entry it creates. Reading 0 here would collide with a fresh entry's
+	// initial 0 and let a read that predates a listing match the entry that
+	// listing created (then later recreated after a drop).
+	seq := dc.installs
 	if entry, ok := dc.entries[dirPath]; ok && entry != nil {
 		seq = entry.installSeq
 	}
@@ -758,7 +763,12 @@ func (dc *DirCache) InvalidatePrefix(dirPath string) {
 	defer dc.mu.Unlock()
 
 	if dirPath == "/" {
-		dc.entries = make(map[string]*dirCacheEntry)
+		// Retire every entry rather than replacing the map: entries with
+		// listings or observations still in flight have to keep their
+		// reconciliation state (see invalidateEntryLocked).
+		for p := range dc.entries {
+			dc.invalidateEntryLocked(p)
+		}
 		return
 	}
 	prefix := dirPath
@@ -919,6 +929,11 @@ func (dc *DirCache) ensureEntryLocked(dirPath string) *dirCacheEntry {
 	entry, ok := dc.entries[dirPath]
 	if !ok {
 		entry = newDirCacheEntry()
+		// Seed the install baseline from the global counter rather than leaving
+		// zero. The counter never decreases, so an entry recreated after a
+		// listing install inherits a value at or above that install, and a
+		// token captured before it can no longer match (see BeginObservation).
+		entry.installSeq = dc.installs
 		dc.entries[dirPath] = entry
 	}
 	if entry.items == nil {

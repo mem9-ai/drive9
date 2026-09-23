@@ -966,3 +966,69 @@ func TestDirCacheSequencesSharedAcrossFlightsReleaseIndependently(t *testing.T) 
 		t.Fatalf("shared-sequence release reclaimed a record still in use: view=%v", names)
 	}
 }
+
+// A token captured while the directory was uncached must not match the entry a
+// later listing creates and a later drop recreates. The install sequence of an
+// uncached directory is the current global counter, exactly what a recreated
+// entry is seeded with, so a read that predates the listing cannot pass the
+// fence and republish the identity the listing replaced.
+func TestDirCacheUncachedTokenDoesNotSurviveEntryDrop(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+
+	// The stat is issued while /d is uncached.
+	token := dc.BeginObservation("/d")
+
+	// A listing installs the recreated object...
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1, ResourceID: "res-B"}}, dc.BeginListing("/d"))
+	// ...and the entry is then dropped (invalidation with no in-flight
+	// listings, or TTL reclamation).
+	dc.Invalidate("/d")
+	if _, ok := dc.entries["/d"]; ok {
+		t.Fatal("fixture bug: the entry must be gone")
+	}
+
+	// The stat of the deleted object now completes late.
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 10, Revision: 10, ResourceID: "res-A"}, token)
+
+	if got := dc.Lookup("/d", "f.dat"); got.kind == namespaceLookupPositive {
+		t.Fatalf("late uncached-token observation republished the deleted identity: resourceID=%q rev=%d",
+			got.item.ResourceID, got.item.Revision)
+	}
+}
+
+// A read issued while the directory is uncached and completing with no listing
+// in between still applies: nothing newer exists to defer to.
+func TestDirCacheUncachedTokenAppliesWhenNoListingFollows(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+
+	token := dc.BeginObservation("/d")
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 7, Revision: 1}, token)
+
+	if got := dc.Lookup("/d", "f.dat"); got.kind != namespaceLookupPositive || got.item.Size != 7 {
+		t.Fatalf("uncached-token observation with no competing listing was dropped: kind=%v item=%+v", got.kind, got.item)
+	}
+}
+
+// InvalidatePrefix("/") must retire entries the same way Invalidate does: a
+// listing still in flight needs the entry's reconciliation records.
+func TestDirCacheInvalidatePrefixRootKeepsInFlightReconciliation(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, dc.BeginListing("/d"))
+
+	snapshot := dc.BeginListing("/d")
+	dc.InvalidatePrefix("/")
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Size: 3})
+	dc.Get("/d")
+
+	view, installed := dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, snapshot)
+	if !installed {
+		t.Fatal("expected a live install")
+	}
+	names := make([]string, 0, len(view))
+	for _, item := range view {
+		names = append(names, item.Name)
+	}
+	if !containsName(names, "committed.dat") {
+		t.Fatalf("InvalidatePrefix(\"/\") dropped a record an in-flight install needed: view=%v", names)
+	}
+}
