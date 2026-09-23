@@ -249,7 +249,8 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, requestGe
 	// after the request was taken are carried over: the ones the response
 	// cannot know about. This is also the escape hatch for a remote deletion
 	// that no invalidation reported (see the trade-off in the doc comment).
-	if !(entry.complete && !entry.completeExpires.IsZero()) {
+	listingLapsed := !entry.complete || entry.completeExpires.IsZero()
+	if listingLapsed {
 		keptItems := make(map[string]CachedFileInfo, len(entry.items))
 		keptOrder := make([]string, 0, len(entry.items))
 		for _, name := range entry.order {
@@ -772,17 +773,6 @@ func (dc *DirCache) retiredAtLocked(dirPath string, now time.Time) (uint64, bool
 		return 0, false
 	}
 	return tomb.gen, true
-}
-
-// servedOrder returns mapping keys in a deterministic order, so a cache rebuild
-// produces a stable readdir order regardless of Go's map iteration.
-func servedOrder(served map[string]CachedFileInfo) []string {
-	names := make([]string, 0, len(served))
-	for name := range served {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
 }
 
 // nextGenerationLocked advances the fencing clock. Caller holds dc.mu.
