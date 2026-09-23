@@ -287,7 +287,7 @@ func (dc *DirCache) Put(dirPath string, items []CachedFileInfo) {
 
 // PutListing installs a directory listing response that was issued at the
 // namespace baseline in snapshot, and returns the reconciled view callers
-// must serve from.
+// must serve from together with whether that view is authoritative.
 //
 // Children recorded by an authoritative local mutation after that baseline are
 // not present in the response (the request predates them) and are carried over
@@ -296,14 +296,21 @@ func (dc *DirCache) Put(dirPath string, items []CachedFileInfo) {
 // deleted. Everything else follows the response verbatim, so remote deletions
 // still take effect.
 //
-// The returned slice is the response plus those amendments. The cache is only
-// what a *later* readdir will see; a caller that serves the raw response to
-// this request still hides a child that committed during its RTT, and a
-// committed child is already gone from the pending overlay, so nothing else
-// can restore it.
-func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot ListingSnapshot) []CachedFileInfo {
+// The returned slice is the response plus those amendments, so it is the view
+// this request must serve. The cache is only what a *later* readdir will see;
+// a caller that serves the raw response still hides a child that committed
+// during its RTT, and a committed child is already gone from the pending
+// overlay, so nothing else can restore it.
+//
+// installed reports whether the install actually ran; it is false only when
+// the call was a no-op because there is no cache to install into, in which
+// case the caller keeps the raw response. Callers must branch on it rather
+// than on the length of the view: an install that legitimately filtered every
+// response entry yields an empty view, and treating that as "nothing to say"
+// would restore the stale response the reconciliation just corrected.
+func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot ListingSnapshot) (view []CachedFileInfo, installed bool) {
 	if dc == nil || dirPath == "" {
-		return items
+		return items, false
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
@@ -397,7 +404,7 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 	dc.releaseListingLocked(snapshot.flight)
 
 	if len(served) == 0 {
-		return nil
+		return nil, true
 	}
 	// Emit in the cache's order so the reply matches what the next readdir
 	// would serve, then append any amended child the cap pushed out of it.
@@ -420,7 +427,7 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 			out = append(out, served[name])
 		}
 	}
-	return out
+	return out, true
 }
 
 // Lookup returns the namespace-cache state for parent/name.
@@ -473,12 +480,39 @@ func (dc *DirCache) Upsert(parentPath string, item CachedFileInfo) {
 // order is not a version order, so an observation that happens to land after a
 // listing install may still describe an older state than the listing does.
 // Observations therefore populate the cache but are never replayed over a
-// listing response; the response keeps its own entry for any name it carries,
-// and an observation for a name the response carries is likewise not used to
-// resurrect the name if the response omits it (the listing is the newer
-// whole-directory view).
+// listing response, and they only replace a cached child when their revision
+// proves them newer (see observationSupersedes). A name the response omits is
+// never resurrected by an observation: the listing is the newer
+// whole-directory view.
 func (dc *DirCache) Observe(parentPath string, item CachedFileInfo) {
 	dc.upsertInternal(parentPath, item, false)
+}
+
+// observationSupersedes reports whether a non-authoritative observation may
+// replace the entry currently cached for the same name.
+//
+// Completion order alone cannot decide this: a stat that started before a
+// listing request can finish after it, and the listing's whole-directory view
+// must not be regressed to that older observation. A cached revision may only
+// be replaced by a strictly newer known one, and a revision-less observation
+// may not displace a revision-carrying entry at all — it cannot be ordered
+// against what is already published, so the published view wins. Caller holds
+// dc.mu.
+func (e *dirCacheEntry) observationSupersedes(item CachedFileInfo) bool {
+	// A local authoritative record for this name outranks any observation: it
+	// reflects this mount's own mutation, which the server side of that
+	// observation cannot have observed yet.
+	if _, ok := e.localSeq[item.Name]; ok {
+		return false
+	}
+	existing, ok := e.items[item.Name]
+	if !ok {
+		return true
+	}
+	if item.Revision <= 0 {
+		return false
+	}
+	return item.Revision > existing.Revision
 }
 
 // upsertInternal stores a child entry. authoritative selects whether the write
@@ -492,6 +526,13 @@ func (dc *DirCache) upsertInternal(parentPath string, item CachedFileInfo, autho
 
 	now := time.Now()
 	entry := dc.ensureEntryLocked(parentPath)
+	if !authoritative && !entry.observationSupersedes(item) {
+		// The observation cannot be shown newer than what is already
+		// published, so it must not replace it. It still proves the name
+		// exists, so a stale ENOENT marker for it is dropped either way.
+		delete(entry.negatives, item.Name)
+		return
+	}
 	entry.expires = now.Add(dc.ttl)
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)

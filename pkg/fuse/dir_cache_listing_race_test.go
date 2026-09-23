@@ -1,9 +1,15 @@
 package fuse
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 func dirCacheNames(t *testing.T, dc *DirCache, dirPath string) []string {
@@ -45,7 +51,10 @@ func TestDirCacheListingInstallKeepsConcurrentUpsert(t *testing.T) {
 	dc.Upsert("/d", CachedFileInfo{Name: "b.dat"})
 
 	// The stale response arrives and is installed.
-	view := dc.PutListing("/d", []CachedFileInfo{{Name: "a.dat"}}, snapshot)
+	view, installed := dc.PutListing("/d", []CachedFileInfo{{Name: "a.dat"}}, snapshot)
+	if !installed {
+		t.Fatal("install did not run for a live snapshot")
+	}
 
 	// The requesting caller must be served the reconciled view...
 	outNames := make([]string, 0, len(view))
@@ -337,7 +346,10 @@ func TestDirCacheListingInstallReturnsReconciledView(t *testing.T) {
 	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Size: 7})
 
 	// The response predates the commit, so it does not contain the child.
-	view := dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, snapshot)
+	view, installed := dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, snapshot)
+	if !installed {
+		t.Fatal("install did not run for a live snapshot")
+	}
 
 	outNames := make([]string, 0, len(view))
 	for _, item := range view {
@@ -376,7 +388,10 @@ func TestDirCacheListingInstallAfterColdParentRemoval(t *testing.T) {
 	dc.Remove("/d", "gone.dat")
 
 	// The response was taken before the unlink and still carries the name.
-	view := dc.PutListing("/d", []CachedFileInfo{{Name: "gone.dat"}}, snapshot)
+	view, installed := dc.PutListing("/d", []CachedFileInfo{{Name: "gone.dat"}}, snapshot)
+	if !installed {
+		t.Fatal("install did not run for a live snapshot")
+	}
 
 	outNames := make([]string, 0, len(view))
 	for _, item := range view {
@@ -416,7 +431,10 @@ func TestDirCacheRecordsOutliveDirTTLWhileListingInFlight(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	view := dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, snapshot)
+	view, installed := dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, snapshot)
+	if !installed {
+		t.Fatal("install did not run for a live snapshot")
+	}
 
 	outNames := make([]string, 0, len(view))
 	for _, item := range view {
@@ -495,7 +513,10 @@ func TestDirCacheObserveDoesNotResurrectOmittedChild(t *testing.T) {
 	// A stat that finished later reports a child the listing no longer has
 	// (a remote delete landed in between, for example).
 	dc.Observe("/d", CachedFileInfo{Name: "deleted.dat", Size: 4})
-	view := dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, snapshot)
+	view, installed := dc.PutListing("/d", []CachedFileInfo{{Name: "keep.dat"}}, snapshot)
+	if !installed {
+		t.Fatal("install did not run for a live snapshot")
+	}
 
 	outNames := make([]string, 0, len(view))
 	for _, item := range view {
@@ -528,7 +549,10 @@ func TestDirCacheListingStateSurvivesConcurrentCacheLookup(t *testing.T) {
 	// A file is unlinked while the request is in flight, then the stale
 	// response (taken before the unlink) arrives.
 	dc.Remove("/d", "gone.dat")
-	view := dc.PutListing("/d", []CachedFileInfo{{Name: "gone.dat"}}, snapshot)
+	view, installed := dc.PutListing("/d", []CachedFileInfo{{Name: "gone.dat"}}, snapshot)
+	if !installed {
+		t.Fatal("install did not run for a live snapshot")
+	}
 
 	outNames := make([]string, 0, len(view))
 	for _, item := range view {
@@ -537,4 +561,242 @@ func TestDirCacheListingStateSurvivesConcurrentCacheLookup(t *testing.T) {
 	if containsName(outNames, "gone.dat") {
 		t.Fatalf("removed child resurrected after concurrent cache lookups: view=%v", outNames)
 	}
+}
+
+// --- Regressions for the second review round on #966 ---------------------
+
+// An install that legitimately filtered every response entry must be served as
+// an empty listing, not silently replaced by the stale response. N1: the
+// projection used to fall back to `original` whenever the reconciled view was
+// empty, so a lookup after "every child was removed during the RTT" resurrected
+// a deleted name, and remoteDirectoryHasChildren reported the directory non-empty.
+func TestReconciledFileInfosKeepsEmptyAuthoritativeView(t *testing.T) {
+	original := []client.FileInfo{{Name: "gone.dat", Size: 10, Revision: 1}}
+	if got := reconciledFileInfos(original, nil, true); len(got) != 0 {
+		t.Fatalf("empty authoritative view was replaced by the stale response: %v", got)
+	}
+	// A no-op install (no cache) keeps the raw response.
+	if got := reconciledFileInfos(original, nil, false); len(got) != 1 {
+		t.Fatalf("non-install must keep the response: %v", got)
+	}
+}
+
+// N1 on the production path: a child the local mutation removed during the LIST
+// RTT must not come back through the lookup fallback's projection.
+func TestDirCacheEmptyReconciledViewHasNoChildren(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	response := []CachedFileInfo{{Name: "only.dat", Size: 5, Revision: 1}}
+	dc.PutListing("/d", response, dc.BeginListing("/d"))
+
+	// The request is issued, then the only child is deleted locally.
+	snapshot := dc.BeginListing("/d")
+	dc.Remove("/d", "only.dat")
+	view, installed := dc.PutListing("/d", response, snapshot)
+	if !installed {
+		t.Fatal("expected a live install")
+	}
+	if len(view) != 0 {
+		t.Fatalf("removed child survived the reconciled view: %v", view)
+	}
+	if items, ok := dc.Get("/d"); ok && len(items) != 0 {
+		t.Fatalf("cache still lists the removed child: %v", items)
+	}
+}
+
+// N2: when a local mutation moves the SAME name to a newer revision/size during
+// the LIST RTT, the requesting consumer must get the reconciled metadata, not
+// the response's older struct for that name.
+func TestReconciledFileInfosProjectsUpdatedSameName(t *testing.T) {
+	original := []client.FileInfo{{Name: "f.dat", Size: 10, Revision: 1}}
+	view := []CachedFileInfo{{Name: "f.dat", Size: 20, Revision: 2}}
+	got := reconciledFileInfos(original, view, true)
+	if len(got) != 1 {
+		t.Fatalf("want 1 entry, got %v", got)
+	}
+	if got[0].Revision != 2 || got[0].Size != 20 {
+		t.Fatalf("served the response's stale struct for a reconciled name: rev=%d size=%d, want 2/20",
+			got[0].Revision, got[0].Size)
+	}
+}
+
+// N2 on the production path: an authoritative Upsert landing mid-RTT must move
+// the name for the consumer that is being answered right now.
+func TestDirCacheReconciledViewCarriesUpdatedSameName(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 10, Revision: 1}}, dc.BeginListing("/d"))
+
+	snapshot := dc.BeginListing("/d")
+	dc.Upsert("/d", CachedFileInfo{Name: "f.dat", Size: 20, Revision: 2})
+	view, installed := dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 10, Revision: 1}}, snapshot)
+	if !installed {
+		t.Fatal("expected a live install")
+	}
+	found := false
+	for _, item := range view {
+		if item.Name == "f.dat" {
+			found = true
+			if item.Size != 20 || item.Revision != 2 {
+				t.Fatalf("view carries the response's older metadata: size=%d rev=%d, want 20/2", item.Size, item.Revision)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("child missing from the view: %v", view)
+	}
+}
+
+// N3: a slow remote stat that STARTED before a listing and completes after it
+// must not regress the cache to its older revision. Completion order is not a
+// version order; the fence is the revision.
+func TestDirCacheLateObservationDoesNotRegressNewerListing(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+
+	// A stat request begins (its result will be rev 2).
+	// Then a newer listing installs rev 5 for the same name.
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 50, Revision: 5}}, dc.BeginListing("/d"))
+
+	// The older stat now completes.
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 20, Revision: 2})
+
+	items, ok := dc.Get("/d")
+	if !ok {
+		t.Fatal("expected cached listing")
+	}
+	for _, item := range items {
+		if item.Name == "f.dat" {
+			if item.Revision != 5 || item.Size != 50 {
+				t.Fatalf("late observation regressed the listing: rev=%d size=%d, want 5/50", item.Revision, item.Size)
+			}
+			return
+		}
+	}
+	t.Fatalf("child missing: %v", dirCacheNames(t, dc, "/d"))
+}
+
+// An observation that cannot be ordered against the published entry (no
+// revision) must not displace it either, in either completion order.
+func TestDirCacheUnversionedObservationDoesNotDisplacePublishedEntry(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 50, Revision: 5}}, dc.BeginListing("/d"))
+
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 7})
+
+	items, _ := dc.Get("/d")
+	for _, item := range items {
+		if item.Name == "f.dat" {
+			if item.Size != 50 {
+				t.Fatalf("unorderable observation displaced the published entry: size=%d, want 50", item.Size)
+			}
+			return
+		}
+	}
+	t.Fatal("child missing")
+}
+
+// A newer observation still updates the cache: the fence must not freeze it.
+func TestDirCacheNewerObservationStillUpdates(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f.dat", Size: 50, Revision: 5}}, dc.BeginListing("/d"))
+
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 80, Revision: 6})
+
+	items, _ := dc.Get("/d")
+	for _, item := range items {
+		if item.Name == "f.dat" {
+			if item.Revision != 6 || item.Size != 80 {
+				t.Fatalf("newer observation rejected: rev=%d size=%d, want 6/80", item.Revision, item.Size)
+			}
+			return
+		}
+	}
+	t.Fatal("child missing")
+}
+
+// An observation still proves the name exists, so it clears a stale negative
+// marker even when it cannot replace the published entry.
+func TestDirCacheObservationClearsNegativeMarker(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{}, dc.BeginListing("/d"))
+	dc.MarkNegative("/d", "f.dat")
+
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Size: 3, Revision: 1})
+
+	if got := dc.Lookup("/d", "f.dat"); got.kind != namespaceLookupPositive {
+		t.Fatalf("observation did not publish the child: kind=%v", got.kind)
+	}
+}
+
+// N4: a failed LIST must release its snapshot, or the directory keeps an
+// outstanding flight forever and its records can never be reclaimed. Repeated
+// failed probes must not accumulate state.
+func TestDirCacheFailedListingReleasesSnapshot(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+
+	// Take a snapshot and abandon it the way a failed ListCtx does.
+	for range 3 {
+		dc.EndListing(dc.BeginListing("/d"))
+		if flights := outstandingFlights(dc.entries["/d"]); flights != 0 {
+			t.Fatalf("abandoned listing left %d outstanding flights", flights)
+		}
+	}
+
+	// A record written while one flight was outstanding must be reclaimable
+	// once that flight is released: otherwise it pins state forever.
+	snapshot := dc.BeginListing("/d")
+	dc.Upsert("/d", CachedFileInfo{Name: "f.dat", Revision: 1})
+	dc.EndListing(snapshot)
+	entry := dc.entries["/d"]
+	// The authoritative record survives (it is not superseded), but the flight
+	// must be gone so later reclamation can proceed.
+	if flights := outstandingFlights(entry); flights != 0 {
+		t.Fatalf("failed LIST left the snapshot outstanding: %v", entry.outstanding)
+	}
+}
+
+// N4 on the production path: when the LIST inside remoteDirectoryHasChildren
+// fails, the listing snapshot must be released. An unreleased flight keeps the
+// directory's reconciliation records from ever being reclaimed, so repeated
+// failed probes accumulate state without bound.
+func TestRemoteDirectoryHasChildrenReleasesSnapshotOnListError(t *testing.T) {
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("list") != "" {
+			listCalls.Add(1)
+			http.Error(w, "list failed", http.StatusInternalServerError)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	for range 3 {
+		if _, _, err := fs.remoteDirectoryHasChildren(context.Background(), "/leak"); err == nil {
+			t.Fatal("expected the list failure to surface")
+		}
+	}
+	if got := listCalls.Load(); got != 3 {
+		t.Fatalf("list calls = %d, want 3", got)
+	}
+	entry := fs.dirCache.entries["/leak"]
+	if flights := outstandingFlights(entry); flights != 0 {
+		t.Fatalf("failed LISTs left %d outstanding flights; records can never be reclaimed", flights)
+	}
+}
+
+// outstandingFlights totals the in-flight listing snapshots an entry is
+// tracking, counting multiplicity: concurrent listings can share one snapshot
+// sequence.
+func outstandingFlights(entry *dirCacheEntry) int {
+	if entry == nil {
+		return 0
+	}
+	total := 0
+	for _, n := range entry.outstanding {
+		total += n
+	}
+	return total
 }

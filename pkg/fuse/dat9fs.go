@@ -6663,7 +6663,8 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		// commit settled during this LIST's RTT is absent from the response
 		// and, being already committed, is gone from the pending overlay too,
 		// so nothing later in this request could restore it.
-		items = reconciledFileInfos(items, fs.dirCache.PutListing(parentPath, cachedFileInfos(items), snapshot))
+		view, installed := fs.dirCache.PutListing(parentPath, cachedFileInfos(items), snapshot)
+		items = reconciledFileInfos(items, view, installed)
 		fs.mountViewMu.RUnlock()
 		return items, generation, nil
 	}
@@ -6693,7 +6694,8 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 				fs.dirCache.EndListing(snapshot)
 				return nil, 0, syscall.EAGAIN
 			}
-			items = reconciledFileInfos(items, fs.dirCache.PutListing(parentPath, cachedFileInfos(items), snapshot))
+			view, installed := fs.dirCache.PutListing(parentPath, cachedFileInfos(items), snapshot)
+			items = reconciledFileInfos(items, view, installed)
 			fs.mountViewMu.RUnlock()
 			return items, generation, nil
 		}
@@ -6706,27 +6708,23 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	return nil, 0, lastErr
 }
 
-// reconciledFileInfos projects a reconciled view back onto the client
+// reconciledFileInfos projects a reconciled listing view back onto the client
 // FileInfo shape the list callers work in.
 //
-// The pending overlay is applied by composeDirEntries for readdir, so only
-// entries that carry listing metadata are projected here: a carried-over child
-// whose FileInfo is not in the response still has to reach the caller, which
-// is what makes a commit landing mid-LIST visible to that same request.
-func reconciledFileInfos(original []client.FileInfo, reconciled []CachedFileInfo) []client.FileInfo {
-	if len(reconciled) == 0 {
+// The view is authoritative whenever the install ran, so two things matter
+// here. First, an empty view is a real answer — every entry in the response
+// was removed locally during the request — and must not be replaced by the
+// stale response. Second, metadata is projected per entry from the reconciled
+// item rather than reusing the response's struct wherever a name matches: a
+// local mutation that landed mid-RTT can have moved the same name to a newer
+// revision or size, and serving the response's older struct for that name
+// would hand this request the very state the reconciliation corrected.
+func reconciledFileInfos(original []client.FileInfo, view []CachedFileInfo, installed bool) []client.FileInfo {
+	if !installed {
 		return original
 	}
-	byName := make(map[string]client.FileInfo, len(original))
-	for _, item := range original {
-		byName[item.Name] = item
-	}
-	out := make([]client.FileInfo, 0, len(reconciled))
-	for _, item := range reconciled {
-		if existing, ok := byName[item.Name]; ok {
-			out = append(out, existing)
-			continue
-		}
+	out := make([]client.FileInfo, 0, len(view))
+	for _, item := range view {
 		var mtime int64
 		if !item.Mtime.IsZero() {
 			mtime = item.Mtime.Unix()
@@ -7200,6 +7198,10 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
+		// Release the snapshot on the failure path too: an unreleased flight
+		// keeps this directory's reconciliation records from ever being
+		// reclaimed, so repeated failed probes would accumulate state.
+		fs.dirCache.EndListing(snapshot)
 		return false, 0, err
 	}
 	// Filter out entries that have active delete tombstones. This handles
@@ -7238,7 +7240,8 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 		// this LIST's RTT is absent from the response, and reporting the
 		// directory as empty would let a concurrent Rmdir proceed against a
 		// directory that still holds an acknowledged file.
-		liveItems = reconciledFileInfos(liveItems, fs.dirCache.PutListing(dirPath, cachedFileInfos(liveItems), snapshot))
+		view, installed := fs.dirCache.PutListing(dirPath, cachedFileInfos(liveItems), snapshot)
+		liveItems = reconciledFileInfos(liveItems, view, installed)
 	}
 	fs.mountViewMu.RUnlock()
 	return len(liveItems) > 0, generation, nil
@@ -12154,7 +12157,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	// during this LIST's RTT is absent from the response, and the pending
 	// overlay cannot restore it (its commit already removed the pending
 	// entry), so serving the raw response would hide it from this readdir.
-	cached = fs.dirCache.PutListing(dirPath, cached, snapshot)
+	cached, _ = fs.dirCache.PutListing(dirPath, cached, snapshot)
 	fs.mountViewMu.RUnlock()
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached, generation)
 
