@@ -323,9 +323,11 @@ jobs:
         run: bash e2e/layer-fs-smoke-test.sh
 
       - name: Test pending READDIRPLUS attributes through Linux FUSE
+        id: fuse-readdir-pending
+        continue-on-error: true
         env:
           DRIVE9_REQUIRE_KERNEL_FUSE: "1"
-        run: go test ./pkg/fuse -run '^TestReadDirPlusPendingKernel$' -count=1 -timeout=2m
+        run: make test TEST_PKGS=./pkg/fuse TEST_RUN='^TestReadDirPlusPendingKernel$' TEST_TIMEOUT=2m
 
       - name: Run FUSE release gate
         id: fuse-smoke
@@ -518,6 +520,7 @@ jobs:
             echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
             echo "| Object-store smoke | ${{ steps.object-store-smoke.outcome || 'skipped' }} |"
             echo "| Layer FS smoke | ${{ steps.layer-fs-smoke.outcome || 'skipped' }} |"
+            echo "| FUSE pending READDIRPLUS | ${{ steps.fuse-readdir-pending.outcome || 'skipped' }} |"
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
             echo "| FUSE patch storage-class e2e | ${{ steps.fuse-patch-storage-class.outcome || 'skipped' }} |"
             echo "| Git operations smoke | ${{ steps.git-ops-smoke.outcome || 'skipped' }} |"
@@ -565,6 +568,7 @@ jobs:
             "cli-smoke": "${{ steps.cli-smoke.outcome }}",
             "object-store-smoke": "${{ steps.object-store-smoke.outcome }}",
             "layer-fs-smoke": "${{ steps.layer-fs-smoke.outcome }}",
+            "fuse-readdir-pending": "${{ steps.fuse-readdir-pending.outcome }}",
             "fuse-smoke": "${{ steps.fuse-smoke.outcome }}",
             "fuse-patch-storage-class": "${{ steps.fuse-patch-storage-class.outcome }}",
             "git-ops-smoke": "${{ steps.git-ops-smoke.outcome }}",
@@ -667,6 +671,7 @@ jobs:
           check_required "CLI smoke" "${{ steps.cli-smoke.outcome }}"
           check_required "Object-store smoke" "${{ steps.object-store-smoke.outcome }}"
           check_required "Layer FS smoke" "${{ steps.layer-fs-smoke.outcome }}"
+          check_required "FUSE pending READDIRPLUS" "${{ steps.fuse-readdir-pending.outcome }}"
           check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
           check_required "Git operations smoke" "${{ steps.git-ops-smoke.outcome }}"
           check_required "Git workspace on-demand discovery smoke" "${{ steps.git-workspace-ondemand-smoke.outcome }}"

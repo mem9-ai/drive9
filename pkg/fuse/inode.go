@@ -204,6 +204,10 @@ func (m *InodeToPath) changedAttrsLocked(entry *InodeEntry) {
 // EnsureDirEntry checks snapshot freshness and installs all attributes under
 // the same lock as inode mutations. Existing hardlink identities are reused.
 func (m *InodeToPath) EnsureDirEntry(path string, item CachedFileInfo, preserve bool) *InodeEntry {
+	return m.ensureDirEntry(path, item, preserve, false)
+}
+
+func (m *InodeToPath) ensureDirEntry(path string, item CachedFileInfo, preserve, openReference bool) *InodeEntry {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	keep := func(entry *InodeEntry) bool {
@@ -216,7 +220,7 @@ func (m *InodeToPath) EnsureDirEntry(path string, item CachedFileInfo, preserve 
 		if entry.IsDir != item.IsDir || (entry.ResourceID != "" && item.ResourceID != "" && entry.ResourceID != item.ResourceID) {
 			// The pathname now names a different object. Detach only this path;
 			// old hardlinks and kernel references must retain the old inode.
-			m.removePathWithMutationLocked(path, true, true, false)
+			m.removePathWithMutationLocked(path, true, entry.Nlookup > 0 || openReference, false)
 			found = false
 		}
 	}
@@ -227,6 +231,19 @@ func (m *InodeToPath) EnsureDirEntry(path string, item CachedFileInfo, preserve 
 	}
 	if found {
 		entry := m.byInode[ino]
+		// Extent listings can lag content writes. Retain their live size,
+		// but never lend routing to an observation of unknown identity.
+		same := sameKnownDirEntryResource(entry, item)
+		different := entry.IsDir != item.IsDir || (entry.ResourceID != "" && item.ResourceID != "" && !same)
+		if !preserve && !different && entry.ExtentIno != 0 && !entry.IsDir && entry.Size > item.Size {
+			item.Size = entry.Size
+		}
+		if item.ExtentIno == 0 && same {
+			item.ExtentIno = entry.ExtentIno
+		}
+		if !preserve && !different && !same {
+			entry.ExtentIno = 0
+		}
 		if keep(entry) {
 			m.addPathLocked(entry, path)
 			return copyInodeEntryLocked(entry)
@@ -248,7 +265,11 @@ func (m *InodeToPath) EnsureDirEntry(path string, item CachedFileInfo, preserve 
 	}
 	entry := m.byInode[ino]
 	m.addPathLocked(entry, path)
-	entry.IsDir, entry.Size, entry.Mtime = item.IsDir, item.Size, mtime
+	entry.IsDir, entry.Size = item.IsDir, item.Size
+	if entry.MtimeOverride == nil {
+		entry.Mtime = mtime
+	}
+	entry.ExtentIno = item.ExtentIno
 	m.setIdentityLocked(entry, item.ResourceID)
 	if item.Nlink > 0 {
 		entry.Nlink = item.Nlink
@@ -374,7 +395,7 @@ func (m *InodeToPath) Forget(ino uint64, nlookup uint64) {
 }
 
 func shouldKeepForgetMapping(entry *InodeEntry) bool {
-	if entry == nil {
+	if entry == nil || (entry.Unlinked && len(entry.Paths) == 0) {
 		return false
 	}
 	if entry.IsDir || entry.ResourceID != "" {
@@ -675,6 +696,7 @@ func (m *InodeToPath) SetLocalMtime(ino uint64, mtime time.Time) {
 		entry.Mtime = mtime
 		t := mtime
 		entry.MtimeOverride = &t
+		m.changedAttrsLocked(entry)
 	}
 }
 
@@ -688,6 +710,7 @@ func (m *InodeToPath) SetLocalAtime(ino uint64, atime time.Time) {
 		entry.Atime = atime
 		t := atime
 		entry.AtimeOverride = &t
+		m.changedAttrsLocked(entry)
 	}
 }
 
@@ -1126,9 +1149,11 @@ func (m *InodeToPath) setIdentityLocked(entry *InodeEntry, resourceID string) {
 
 func (m *InodeToPath) removeEntryLocked(ino uint64, entry *InodeEntry) {
 	for p := range entry.Paths {
-		delete(m.byPath, p)
+		if m.byPath[p] == ino {
+			delete(m.byPath, p)
+		}
 	}
-	if entry.Path != "" {
+	if entry.Path != "" && m.byPath[entry.Path] == ino {
 		delete(m.byPath, entry.Path)
 	}
 	if entry.ResourceID != "" && m.byID[entry.ResourceID] == ino {

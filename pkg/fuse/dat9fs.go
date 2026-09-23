@@ -6638,7 +6638,7 @@ func cachedFileInfos(items []client.FileInfo, observedVersion uint64) []CachedFi
 			HasMode:         item.HasMode,
 			ResourceID:      item.ResourceID,
 			Nlink:           item.Nlink,
-			ExtentIno: item.ExtentIno,
+			ExtentIno:       item.ExtentIno,
 		})
 	}
 	return cached
@@ -6722,7 +6722,7 @@ func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
 		HasGID:          entry.HasGID,
 		ResourceID:      entry.ResourceID,
 		Nlink:           entry.Nlink,
-		ExtentIno: entry.ExtentIno,
+		ExtentIno:       entry.ExtentIno,
 	}
 }
 
@@ -7461,27 +7461,21 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 			fs.perf.dirCacheHit.add(1)
 			fs.perf.namespacePositiveHit.add(1)
 		}
-		item := result.item
-		fs.applyLayerFileModeToCachedInfo(childP, &item)
-		mtime := item.Mtime
-		if mtime.IsZero() {
-			mtime = time.Now()
+		// Directory-cache lookups are observations, not local mutations.
+		// Share the pending projection and atomic installer with READDIRPLUS.
+		items := fs.cachedToDirEntries(parentPath, []CachedFileInfo{result.item})
+		if len(items) != 1 || !fs.inodes.IncrementLookup(items[0].Ino) {
+			// A concurrent replacement may reclaim an unreferenced listing
+			// inode before we reserve it. Fall back to authoritative Lookup.
+			return false, gofuse.OK
 		}
-		// Do not FindByExtentIno from dir-cache ExtentIno: after rename-replace
-		// the dest name can still cache the old dest juicefs ino, which would
-		// alias dest's FUSE nodeid onto the source path (pjdfstest expected N
-		// got N+2). Stat-path Lookup still reuses by live juicefs identity.
-		ino := fs.inodes.LookupWithIdentity(childP, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
-		if item.Revision > 0 {
-			fs.inodes.UpdateRevision(ino, item.Revision)
-		}
-		if item.HasMode {
-			fs.inodes.UpdateMode(ino, item.Mode)
-		}
-		entry, ok := fs.inodes.GetEntry(ino)
+		item := items[0]
+		entry, ok := fs.inodes.GetEntry(item.Ino)
 		if !ok {
 			return true, gofuse.EIO
 		}
+		entry.Size, entry.Mtime = item.Size, item.Mtime
+		entry.Mode, entry.HasMode = item.AttrMode, item.HasMode
 		fs.fillEntryOut(entry, out)
 		return true, gofuse.OK
 	case namespaceLookupNegative, namespaceLookupCompleteMiss, namespaceLookupSessionMiss:
@@ -12100,15 +12094,6 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntriesWithLocal(dirPath, entries, local)))
 }
 
-func (fs *Dat9FS) composeDirEntries(ctx context.Context, dirPath string, entries []DirEntry) ([]DirEntry, error) {
-	// Extent children need no overlay here: their layout rides on the listing
-	// row as CachedFileInfo.ExtentIno, which cachedToDirEntries has already
-	// stamped onto the FUSE inode. Matching jfs entries by bare name (what this
-	// used to do) could hand a single-layout file the JuiceFS inode of an
-	// unrelated jfs subtree.
-	return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
-}
-
 func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []CachedFileInfo) error {
 	if len(items) == 0 {
 		return nil
@@ -12406,7 +12391,8 @@ func (fs *Dat9FS) cachedToDirEntriesWithLocal(dirPath string, items []CachedFile
 		}
 		observedVersion := item.observedVersion
 		item, preserve := fs.localDirEntryInfo(childP, item, live, local)
-		entry := fs.inodes.EnsureDirEntry(childP, item, preserve)
+		openReference := live != nil && fs.openHandles.Has(live.Ino, "")
+		entry := fs.inodes.ensureDirEntry(childP, item, preserve, openReference)
 		item, _ = fs.localDirEntryInfo(childP, cachedInfoFromEntry(item.Name, entry), entry, local)
 		// Cache provenance belongs to the observation, while attrVersion on
 		// the inode records mutations. Do not lose the original read fence.
