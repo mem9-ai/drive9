@@ -96,7 +96,7 @@ type Dat9FS struct {
 	kernelCacheBypassSweepTimer *time.Timer
 	kernelCacheBypassSweepAt    time.Time
 	modeSeq                     atomic.Uint64
-	closeSyncBatchRetryAfter    atomic.Int64
+	closeSyncBatchRetryAt       atomic.Pointer[time.Time]
 	specialMu                   sync.RWMutex
 	specialByPath               map[string]uint64
 	uid                         uint32

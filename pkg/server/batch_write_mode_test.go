@@ -105,4 +105,10 @@ func TestBatchWriteScopedModeDeniedBeforeMutation(t *testing.T) {
 	if err != nil || stat.Size != 5 {
 		t.Fatalf("ordinary scoped content write: stat=%+v err=%v", stat, err)
 	}
+	for path, want := range map[string]string{"/existing.txt": "original", "/plain.txt": "plain"} {
+		data, err := c.ReadCtx(ctx, path)
+		if err != nil || string(data) != want {
+			t.Errorf("read %s: bytes=%q, want %q, err=%v", path, data, want, err)
+		}
+	}
 }

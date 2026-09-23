@@ -148,18 +148,26 @@ content and mode together using a single-item batch write with create-only CAS.
 The acknowledged mode generation is cleared only if it is still current; newer
 chmods remain pending and are applied against the committed file. A server that
 rejects the batch endpoint with HTTP 404/405 uses the existing PUT-then-chmod path.
-The mount logs that fallback and retries batch support after a one-minute cooldown;
+The close-sync path logs that fallback and retries batch support after a one-minute cooldown;
 a transient gateway response does not disable the optimization for the mount's life.
-Transport failures, malformed responses and per-item errors do not fall back to
-PUT, because the commit outcome may be unknown. Overwrites, empty files,
+This retry policy is limited to foreground close-sync. The existing background
+commit queue still disables batching until remount after a top-level 404/405 and
+uses its single-entry recovery path. Changing that queue's scheduling and retry
+policy is separate work; the foreground optimization does not alter it.
+Transport failures, malformed responses and other per-item errors do not fall
+back to PUT, because the commit outcome may be unknown. Overwrites, empty files,
 multipart uploads, locally staged recovery payloads and other durability policies
 keep their existing mode flow.
 
 Setting mode through batch-write is owner-only, matching the chmod endpoint.
 A scoped token may write content in its authorized paths without `hasMode`, but
 an item with `hasMode` is rejected with per-item 403 before changing content or
-permissions. The client reports that failure and retains dirty state; it does
-not ignore permissions or reinterpret a per-item denial as unsupported batch.
+permissions. A per-item 403 with no committed revision is a definite non-commit:
+close-sync falls back to content-only PUT with the same create-only CAS, then
+applies the pending mode through chmod. Authorized bytes can therefore commit
+even when chmod is denied, matching the ordinary PUT-then-chmod path. Close still
+reports the chmod error and retains the pending mode; a failed fallback PUT also
+remains an error. This fallback neither acknowledges mode nor disables batching.
 This server-side enforcement requires the updated server; older deployments
 may still admit scoped batch mode changes.
 

@@ -3,6 +3,7 @@ package fuse
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"syscall"
 	"time"
 
@@ -19,12 +20,33 @@ type closeSyncModeCommit struct {
 	generation uint64
 }
 
+func (fs *Dat9FS) closeSyncBatchAvailable(now time.Time) bool {
+	retryAt := fs.closeSyncBatchRetryAt.Load()
+	return retryAt == nil || !now.Before(*retryAt)
+}
+
+// deferCloseSyncBatchRetry returns true only for the caller starting a cooldown.
+// Keep time.Time's monotonic reading, and do not extend an active window for
+// other uploads that were already in flight when the endpoint failed.
+func (fs *Dat9FS) deferCloseSyncBatchRetry(now time.Time) bool {
+	retryAt := now.Add(closeSyncBatchRetryInterval)
+	for {
+		previous := fs.closeSyncBatchRetryAt.Load()
+		if previous != nil && now.Before(*previous) {
+			return false
+		}
+		if fs.closeSyncBatchRetryAt.CompareAndSwap(previous, &retryAt) {
+			return true
+		}
+	}
+}
+
 // closeSyncCreateModeLocked limits the combined commit to the first upload of
 // a new, nonempty inline file. All other paths retain their existing upload and
 // deferred-chmod behavior. Caller holds fh.mu.
 func (fs *Dat9FS) closeSyncCreateModeLocked(fh *FileHandle, size, expectedRevision int64, durability shadowUploadDurability) *closeSyncModeCommit {
 	if durability != shadowUploadRemoteDurable || fh.WritePolicy != WritePolicyCloseSync || !fh.IsNew || expectedRevision != 0 ||
-		fh.ShadowStageGen == 0 || fh.PendingModeGen == 0 || time.Now().UnixNano() < fs.closeSyncBatchRetryAfter.Load() ||
+		fh.ShadowStageGen == 0 || fh.PendingModeGen == 0 || !fs.closeSyncBatchAvailable(time.Now()) ||
 		fs.layerEnabled() || fs.appendLogConfiguredLocked(fh) || fh.GitWorkspaceID != "" || fh.isExtent() {
 		return nil
 	}
@@ -46,29 +68,53 @@ func (fs *Dat9FS) closeSyncCreateModeLocked(fh *FileHandle, size, expectedRevisi
 	return &closeSyncModeCommit{mode: mode, generation: fh.PendingModeGen}
 }
 
+type closeSyncUploadOutcome uint8
+
+const (
+	closeSyncUploadUnconfirmed closeSyncUploadOutcome = iota
+	closeSyncUploadCommitted
+	closeSyncUploadUnsupported
+	closeSyncUploadForbidden
+)
+
 type closeSyncUploadResult struct {
+	outcome  closeSyncUploadOutcome
 	revision int64
 	mode     *closeSyncModeCommit
 }
 
 // uploadCloseSyncShadow selects the combined create or the ordinary shadow
-// upload while preserving the caller's explicit local durability requirement.
+// upload. The caller obtains mode from closeSyncCreateModeLocked, which owns
+// eligibility; durability still controls the ordinary/fallback shadow upload.
 func (fs *Dat9FS) uploadCloseSyncShadow(ctx context.Context, path string, size, expectedRevision int64, generation uint64, durability shadowUploadDurability, mode *closeSyncModeCommit) (closeSyncUploadResult, error) {
-	if mode != nil && durability == shadowUploadRemoteDurable {
+	if mode != nil {
 		result, err := fs.uploadCloseSyncCreateWithMode(ctx, path, size, generation, mode)
-		if err != nil || result.mode != nil {
+		if err != nil {
 			return result, err
+		}
+		switch result.outcome {
+		case closeSyncUploadCommitted:
+			return result, nil
+		case closeSyncUploadUnsupported, closeSyncUploadForbidden:
+			// Both are definite non-commits. The ordinary upload preserves CAS
+			// and path authorization; pending chmod still has to succeed.
+		default:
+			return closeSyncUploadResult{}, fmt.Errorf("combined create returned an unconfirmed outcome")
 		}
 	}
 	revision, err := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, path, fs.remotePath(path), expectedRevision, generation, durability)
-	return closeSyncUploadResult{revision: revision}, err
+	if err != nil {
+		return closeSyncUploadResult{}, err
+	}
+	return closeSyncUploadResult{outcome: closeSyncUploadCommitted, revision: revision}, nil
 }
 
-// uploadCloseSyncCreateWithMode returns an empty result with a nil error only
-// when the batch endpoint is explicitly unsupported. Transport,
-// decoding and per-item errors must not trigger a fallback PUT: the transaction
-// may already have committed. The caller retains dirty state on those errors.
+// uploadCloseSyncCreateWithMode explicitly distinguishes confirmed commits from
+// definite rejections: top-level 404/405 and per-item 403 without a revision.
+// Other failures must not trigger a fallback PUT: the transaction may already
+// have committed. A zero result is unconfirmed and must never imply fallback.
 func (fs *Dat9FS) uploadCloseSyncCreateWithMode(ctx context.Context, localPath string, expectedSize int64, generation uint64, mode *closeSyncModeCommit) (closeSyncUploadResult, error) {
+	// Keep the I/O boundary fail-closed even if a future caller bypasses the gate.
 	if generation == 0 {
 		return closeSyncUploadResult{}, fmt.Errorf("%w: combined create requires a shadow generation", errCommitPayloadStale)
 	}
@@ -93,36 +139,41 @@ func (fs *Dat9FS) uploadCloseSyncCreateWithMode(ctx context.Context, localPath s
 		HasMode:          true,
 	}})
 	if err != nil {
-		// Only a top-level 404/405 means this endpoint is unavailable. A
-		// per-item error, including 404, is an ordinary commit failure.
+		// Only a top-level 404/405 means this endpoint is unavailable.
 		if isBatchWriteUnsupported(err) {
-			now := time.Now()
-			retryAfter := now.Add(closeSyncBatchRetryInterval).UnixNano()
-			if fs.closeSyncBatchRetryAfter.Swap(retryAfter) <= now.UnixNano() {
+			if fs.deferCloseSyncBatchRetry(time.Now()) {
 				logger.Warn(ctx, "close-sync batch endpoint unavailable; using PUT and chmod until retry",
 					zap.Error(err), zap.Duration("retry_after", closeSyncBatchRetryInterval))
 			}
-			return closeSyncUploadResult{}, nil
+			return closeSyncUploadResult{outcome: closeSyncUploadUnsupported}, nil
 		}
 		return closeSyncUploadResult{}, err
 	}
 	// BatchWriteCtx validates both the result count and the returned path.
+	if results[0].Status == http.StatusForbidden && results[0].Revision == 0 {
+		// The server rejects authorization before backend mutation. Retry only
+		// content via PUT, leaving mode pending so chmod reports its own denial.
+		// Do not disable batching for other paths or treat this as a mode ACK.
+		return closeSyncUploadResult{outcome: closeSyncUploadForbidden}, nil
+	}
 	if !results[0].OK() {
 		return closeSyncUploadResult{}, batchWriteResultError(results[0])
 	}
 	if results[0].Revision <= 0 {
 		return closeSyncUploadResult{}, fmt.Errorf("combined create returned no committed revision")
 	}
-	return closeSyncUploadResult{revision: results[0].Revision, mode: mode}, nil
+	return closeSyncUploadResult{outcome: closeSyncUploadCommitted, revision: results[0].Revision, mode: mode}, nil
 }
 
 // adoptCombinedCommitLocked acknowledges content and its mode without retiring
 // shadow staging: the caller must reseed the read cache before removing it.
-// It returns false if mode acknowledgement unlocked fh and its ownership moved.
+// It returns false if mode acknowledgement unlocked fh and it was unlinked,
+// renamed, or received a newer content mutation while sibling modes were cleared.
 // The confirmed revision must survive a later chmod failure so retry uses CAS
 // against this commit rather than attempting another create-only upload.
 func (fs *Dat9FS) adoptCombinedCommitLocked(fh *FileHandle, path string, mutationSeq uint64, size int64, result closeSyncUploadResult) bool {
 	if result.mode == nil {
+		// Ordinary and fallback uploads acknowledge content only.
 		return true
 	}
 	fh.IsNew = false

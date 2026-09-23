@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -78,7 +79,7 @@ func TestCloseSyncCombinedModeCommitsContentAndMode(t *testing.T) {
 	}
 }
 
-func TestCloseSyncCombinedModeFallsBackOnlyForUnsupportedEndpoint(t *testing.T) {
+func TestCloseSyncCombinedModeFallsBackForUnsupportedEndpoint(t *testing.T) {
 	for _, code := range []int{http.StatusNotFound, http.StatusMethodNotAllowed} {
 		t.Run(fmt.Sprint(code), func(t *testing.T) {
 			var batches, puts, chmods atomic.Int32
@@ -113,6 +114,79 @@ func TestCloseSyncCombinedModeFallsBackOnlyForUnsupportedEndpoint(t *testing.T) 
 	}
 }
 
+func TestCloseSyncCombinedModeForbiddenFallsBackWithoutBypassingPermissions(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		putStatus  int
+		wantStatus gofuse.Status
+		initial    string
+		wantBytes  string
+	}{
+		{"mode-denied", http.StatusOK, gofuse.EACCES, "", "close-sync content"},
+		{"content-denied", http.StatusForbidden, gofuse.EACCES, "", ""},
+		{"concurrent-create", http.StatusConflict, gofuse.Status(syscall.EEXIST), "other writer", "other writer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var batches, puts, chmods atomic.Int32
+			var remote atomic.Value
+			remote.Store(tc.initial)
+			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/v1/fs:batch-write":
+					batches.Add(1)
+					item := readCloseSyncBatchItem(t, r)
+					if !item.HasMode || item.ExpectedRevision != 0 {
+						t.Errorf("combined create = %+v", item)
+					}
+					replyCloseSyncBatch(w, item, http.StatusForbidden, 0)
+				case r.Method == http.MethodPut:
+					puts.Add(1)
+					if r.Header.Get("X-Dat9-Expected-Revision") != "0" {
+						t.Error("fallback lost create-only CAS")
+					}
+					data, err := io.ReadAll(r.Body)
+					if err != nil || string(data) != "close-sync content" {
+						t.Errorf("fallback bytes = %q, err=%v", data, err)
+					}
+					if tc.putStatus != http.StatusOK {
+						w.WriteHeader(tc.putStatus)
+						return
+					}
+					remote.Store(string(data))
+					_, _ = io.WriteString(w, `{"revision":1}`)
+				case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+					chmods.Add(1)
+					if remote.Load().(string) != "close-sync content" {
+						t.Error("chmod ran before content committed")
+					}
+					w.WriteHeader(http.StatusForbidden)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			})
+			fh, input := createCloseSyncShadowTestFile(t, fs, "scoped.txt", 0o755)
+			generation := fh.ShadowStageGen
+			if st := fs.Flush(nil, input); st != tc.wantStatus {
+				t.Fatalf("Flush = %v, want %v", st, tc.wantStatus)
+			}
+			wantChmod := int32(0)
+			if tc.putStatus == http.StatusOK {
+				wantChmod = 1
+			}
+			if batches.Load() != 1 || puts.Load() != 1 || chmods.Load() != wantChmod || remote.Load().(string) != tc.wantBytes {
+				t.Fatalf("batch=%d put=%d chmod=%d remote=%q", batches.Load(), puts.Load(), chmods.Load(), remote.Load())
+			}
+			if !fh.HasPendingMode || !fh.Dirty.HasDirtyParts() || fs.shadowStore.ActiveGeneration(fh.Path) != generation {
+				t.Fatal("failed mode/content commit discarded pending state")
+			}
+			if !fs.closeSyncBatchAvailable(time.Now()) {
+				t.Fatal("per-item denial disabled batching for other creates")
+			}
+		})
+	}
+}
+
 func TestCloseSyncCombinedModeErrorsKeepDirtyWithoutFallback(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -120,8 +194,9 @@ func TestCloseSyncCombinedModeErrorsKeepDirtyWithoutFallback(t *testing.T) {
 	}{
 		{"server-error", func(w http.ResponseWriter, _ client.BatchWriteItem) { w.WriteHeader(http.StatusInternalServerError) }},
 		{"request-conflict", func(w http.ResponseWriter, _ client.BatchWriteItem) { w.WriteHeader(http.StatusConflict) }},
-		{"item-forbidden", func(w http.ResponseWriter, i client.BatchWriteItem) {
-			replyCloseSyncBatch(w, i, http.StatusForbidden, 0)
+		{"request-forbidden", func(w http.ResponseWriter, _ client.BatchWriteItem) { w.WriteHeader(http.StatusForbidden) }},
+		{"item-forbidden-with-revision", func(w http.ResponseWriter, i client.BatchWriteItem) {
+			replyCloseSyncBatch(w, i, http.StatusForbidden, 1)
 		}},
 		{"item-conflict", func(w http.ResponseWriter, i client.BatchWriteItem) {
 			replyCloseSyncBatch(w, i, http.StatusConflict, 0)
@@ -485,7 +560,8 @@ func TestCloseSyncCombinedModeReprobesAfterCooldown(t *testing.T) {
 	})
 	for i := range 3 {
 		if i == 2 {
-			fs.closeSyncBatchRetryAfter.Store(time.Now().Add(-time.Second).UnixNano())
+			retryAt := time.Now().Add(-time.Second)
+			fs.closeSyncBatchRetryAt.Store(&retryAt)
 		}
 		_, input := createCloseSyncShadowTestFile(t, fs, fmt.Sprintf("retry-batch-%d", i), 0o755)
 		if st := fs.Flush(nil, input); st != gofuse.OK {
@@ -502,14 +578,39 @@ func TestCloseSyncCombinedModeLogsFallbackOncePerCooldown(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
 	ctx := logger.WithContext(context.Background(), zap.New(core))
 	fh, _ := createCloseSyncShadowTestFile(t, fs, "fallback-log.txt", 0o755)
-	for range 2 {
-		_, err := fs.uploadCloseSyncCreateWithMode(ctx, fh.Path, fh.Dirty.Size(), fh.ShadowStageGen, &closeSyncModeCommit{mode: 0o755})
-		if err != nil {
-			t.Fatal(err)
+	errors := make(chan error, 8)
+	for range cap(errors) {
+		go func() {
+			result, err := fs.uploadCloseSyncCreateWithMode(ctx, fh.Path, fh.Dirty.Size(), fh.ShadowStageGen, &closeSyncModeCommit{mode: 0o755})
+			if err == nil && result.outcome != closeSyncUploadUnsupported {
+				err = fmt.Errorf("unsupported endpoint outcome = %d", result.outcome)
+			}
+			errors <- err
+		}()
+	}
+	for range cap(errors) {
+		if err := <-errors; err != nil {
+			t.Error(err)
 		}
 	}
 	if logs.Len() != 1 {
 		t.Fatalf("fallback log count=%d, want 1", logs.Len())
+	}
+}
+
+func TestCloseSyncBatchCooldownDoesNotExtendForInflightFailures(t *testing.T) {
+	fs := &Dat9FS{}
+	now := time.Now()
+	if !fs.closeSyncBatchAvailable(now) || !fs.deferCloseSyncBatchRetry(now) {
+		t.Fatal("first failure did not start a cooldown")
+	}
+	retryAt := now.Add(closeSyncBatchRetryInterval)
+	justBefore := retryAt.Add(-time.Nanosecond)
+	if fs.closeSyncBatchAvailable(justBefore) || fs.deferCloseSyncBatchRetry(justBefore) {
+		t.Fatal("in-flight failure restarted the active cooldown")
+	}
+	if !fs.closeSyncBatchAvailable(retryAt) || !fs.deferCloseSyncBatchRetry(retryAt) {
+		t.Fatal("cooldown did not allow a new probe at the original deadline")
 	}
 }
 
