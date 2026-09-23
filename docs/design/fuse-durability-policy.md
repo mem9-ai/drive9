@@ -189,7 +189,7 @@ authorization, actual mode application and post-commit revision tests live in
 The historical server source in this repository does not enforce or advertise
 this contract, so this client's combined path stays disabled against it.
 Deploying the server capability enables the optimization for newly negotiated
-clients on providers supporting inline batch storage; existing mounts may need
+clients on backends supporting inline batch storage; existing mounts may need
 remounting because status is cached. A failed or malformed initial status fetch
 also leaves the optimization disabled until successful negotiation, normally
 by remounting. The
