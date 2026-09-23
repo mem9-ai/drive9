@@ -8558,6 +8558,28 @@ func (fs *Dat9FS) stageDurableAtClose() bool {
 	return fs == nil || fs.opts == nil || !fs.opts.WritebackLazyStaging
 }
 
+// stageLargeAtCloseEnabled reports whether a large-file close may stage the
+// dirty buffer locally and let Release enqueue the upload asynchronously,
+// instead of blocking Flush until the remote PUT completes. This is the
+// write-back policy's defining behaviour, so it is keyed on the write policy
+// rather than the sync mode: a write-back mount stays async on close(2) in
+// both the interactive and fsync tiers, and fsync(2) remains the remote-
+// durable pay-up moment for the latter. Close-sync and write-sync owe remote
+// durability on close(2)/write(2) themselves and must block here. Mirrors the
+// small-file path, which has never consulted the sync mode (#964, #971).
+//
+// Both policies are checked: a handle can be stricter than its mount (an
+// O_SYNC open upgrades the handle to write-sync) and must keep its
+// synchronous close even when it still holds dirty bytes from a failed
+// write. An empty handle policy means "inherit the mount" and defaults to
+// write-back, matching mountWritePolicy.
+func (fs *Dat9FS) stageLargeAtCloseEnabled(fh *FileHandle) bool {
+	if fs == nil || fh == nil || fs.mountWritePolicy() != WritePolicyWriteBack {
+		return false
+	}
+	return fh.WritePolicy == "" || fh.WritePolicy == WritePolicyWriteBack
+}
+
 func (fs *Dat9FS) waitQueuedRemoteCommitBeforeWrite(p string) func() {
 	if fs == nil || p == "" {
 		return func() {}
@@ -14809,24 +14831,28 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	// Large file path. Returning OK here without persisting the file would
 	// break close→drop_caches→open: the kernel re-issues Lookup, which falls
 	// through to a remote stat that has not yet seen the upload, returning
-	// ENOENT (juicefs bench reproduces this).
+	// ENOENT (juicefs bench reproduces this). Staging also registers the entry
+	// in pendingIndex so subsequent Lookups hit the in-memory overlay.
 	//
-	// Two strategies, depending on sync mode:
+	// Two strategies, depending on the write policy — not the sync mode. The
+	// fsync tier's durability contract is fsync(2), not close(2), exactly as
+	// for the small-file path above (#964); close-sync/write-sync are the
+	// tiers that must pay remote durability on close(2) itself:
 	//
-	//   • SyncInteractive: stage the buffer to the local shadow store + journal
-	//     (durable on the host) and register it in pendingIndex so subsequent
-	//     Lookups hit the in-memory overlay. Release will pick this up via
-	//     its write-back cache fast path and enqueue the actual server upload
-	//     into the CommitQueue. close(2) is fast; remote durability is async.
+	//   • WriteBack: stage the buffer to the local shadow store + journal and
+	//     let Release pick it up via the write-back cache fast path, which
+	//     enqueues the actual server upload into the CommitQueue. close(2) is
+	//     fast; remote durability is async and fsync(2) is the pay-up moment.
 	//
-	//   • SyncStrict (or interactive fall-through on stage failure): block in
-	//     Flush until the upload completes. Use a size-proportional timeout
-	//     (releaseTimeout) instead of the 30s fuseCtx — large uploads need it.
+	//   • CloseSync/WriteSync (or write-back fall-through on stage failure):
+	//     block in Flush until the upload completes. Use a size-proportional
+	//     timeout (releaseTimeout) instead of the 30s fuseCtx — large uploads
+	//     need it.
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() && fh.Dirty.Size() >= writeBackThreshold {
-		// ShadowSpill interactive path: stage shadow journal + set ShadowCommitReady.
+		// ShadowSpill stage path: stage shadow journal + set ShadowCommitReady.
 		// Does NOT use snapshotWriteBackLocked or WriteBackSeq — those assume
 		// writeBack cache holds complete file data, which ShadowSpill does not.
-		if !requiresRemoteSync && fh.ShadowSpill && fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
+		if !requiresRemoteSync && fh.ShadowSpill && fs.stageLargeAtCloseEnabled(fh) && fs.shadowStore != nil && fs.pendingIndex != nil {
 			phase = "large-shadowspill-stage"
 			size := fh.Dirty.Size()
 			stageStart := time.Now()
@@ -14851,7 +14877,8 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			}
 		}
 
-		// ShadowSpill strict path: synchronous streaming upload from shadow.
+		// ShadowSpill fall-through (close-sync/write-sync, or a failed stage):
+		// synchronous streaming upload from shadow.
 		if fh.ShadowSpill {
 			size := fh.Dirty.Size()
 			uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
@@ -14990,7 +15017,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			return gofuse.OK
 		}
 
-		if !requiresRemoteSync && fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
+		if !requiresRemoteSync && fs.stageLargeAtCloseEnabled(fh) && fs.shadowStore != nil && fs.pendingIndex != nil {
 			if fs.canStageShadowFastLocked(fh) || fh.Dirty.CanMaterializeFull() {
 				phase = "large-stage-shadow"
 				size := fh.Dirty.Size()
