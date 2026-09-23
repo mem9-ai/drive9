@@ -18,19 +18,6 @@ import (
 // cannot disappear from readdir because of a racing listing — plus the
 // per-name stamps that keep a response from speaking for state it predates.
 
-func dirCacheNames(t *testing.T, dc *DirCache, dirPath string) []string {
-	t.Helper()
-	items, ok := dc.Get(dirPath)
-	if !ok {
-		return nil
-	}
-	names := make([]string, 0, len(items))
-	for _, item := range items {
-		names = append(names, item.Name)
-	}
-	return names
-}
-
 func cachedNames(t *testing.T, dc *DirCache, dirPath string) []string {
 	t.Helper()
 	entry := dc.entries[dirPath]
