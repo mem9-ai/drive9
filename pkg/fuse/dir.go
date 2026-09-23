@@ -71,15 +71,19 @@ type dirCacheEntry struct {
 	// recorded locally (Upsert). An installed listing can only speak for the
 	// state at its own request time, so a child recorded after that request
 	// was issued must survive the install even when the response omits it.
+	// localItem holds that child's entry, kept independently of the served
+	// items so the payload outlives an install that legitimately drops it.
 	//
 	// removedSeq is the mirror image: the sequence at which a child was
 	// removed locally. A listing issued before the removal still contains the
 	// name, and installing that response must not resurrect it.
 	//
-	// Both maps only need to cover entries that can still race an in-flight
-	// listing, so installs drop the ones older than their own snapshot and
-	// prune drops the maps altogether once seqExpires lapses.
+	// Records are retained across installs and only dropped once seqExpires
+	// lapses: listing requests overlap, so an install whose snapshot is older
+	// can land after one whose snapshot is newer, and both must still see the
+	// record they were issued against.
 	localSeq   map[string]uint64
+	localItem  map[string]CachedFileInfo
 	removedSeq map[string]uint64
 	seqExpires time.Time
 }
@@ -221,6 +225,26 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 		}
 		entry.upsert(item, dc.maxEntries)
 	}
+	// Completeness is decided before the replay below: a carried-over child that
+	// overflows the entry evicts and clears it, and a listing must not claim to
+	// be complete after that point, or the next miss is answered with a wrong
+	// ENOENT instead of reaching the server.
+	if len(items) <= dc.maxEntries {
+		entry.complete = true
+		entry.completeExpires = now.Add(dc.ttl)
+	}
+	if oldEntry != nil {
+		// Records are carried over in full, at their original expiry. Listing
+		// requests overlap: an install whose snapshot is OLDER can land after
+		// one whose snapshot is NEWER, and publishing only the records newer
+		// than the current snapshot would already have discarded the ones that
+		// install still needs. The replay below is what applies the snapshot
+		// filter.
+		entry.localSeq = cloneSeqTimes(oldEntry.localSeq)
+		entry.removedSeq = cloneSeqTimes(oldEntry.removedSeq)
+		entry.localItem = cloneCachedItems(oldEntry.localItem)
+		entry.seqExpires = oldEntry.seqExpires
+	}
 	hasBaseline := oldEntry != nil && snapshot.valid && snapshot.dir == dirPath
 	if hasBaseline {
 		// Both record kinds are replayed so the newest local state wins over a
@@ -233,14 +257,9 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 				continue
 			}
 			entry.remove(name)
-			entry.noteRemoved(name, seq, now, dc.ttl)
 		}
 		for name, seq := range oldEntry.localSeq {
 			if seq <= snapshot.seq {
-				continue
-			}
-			item, ok := oldEntry.items[name]
-			if !ok {
 				continue
 			}
 			// The response either predates this child (it is absent, and
@@ -248,13 +267,19 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, snapshot 
 			// listing expires) or carries its pre-mutation entry (a
 			// remove-then-recreate). Both lose to the newer local record;
 			// upsert keeps any owner/handle info the response contributed.
+			//
+			// The child's own copy is kept separately from the served items so
+			// a later install that legitimately drops the name (a newer
+			// snapshot) still leaves the bytes replayable for an older
+			// snapshot still in flight.
+			item, ok := oldEntry.localItem[name]
+			if !ok {
+				if item, ok = oldEntry.items[name]; !ok {
+					continue
+				}
+			}
 			entry.upsert(item, dc.maxEntries)
-			entry.noteLocal(name, seq, now, dc.ttl)
 		}
-	}
-	if len(items) <= dc.maxEntries {
-		entry.complete = true
-		entry.completeExpires = now.Add(dc.ttl)
 	}
 	dc.entries[dirPath] = entry
 }
@@ -300,8 +325,7 @@ func (dc *DirCache) Upsert(parentPath string, item CachedFileInfo) {
 	entry.expires = now.Add(dc.ttl)
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
-	delete(entry.removedSeq, item.Name)
-	entry.noteLocal(item.Name, dc.nextSeqLocked(), now, dc.ttl)
+	entry.noteLocal(item.Name, item, dc.nextSeqLocked(), now, dc.ttl)
 }
 
 // Remove deletes a known child entry from a parent without implying the parent
@@ -494,8 +518,33 @@ func newDirCacheEntry() *dirCacheEntry {
 		items:      make(map[string]CachedFileInfo),
 		negatives:  make(map[string]time.Time),
 		localSeq:   make(map[string]uint64),
+		localItem:  make(map[string]CachedFileInfo),
 		removedSeq: make(map[string]uint64),
 	}
+}
+
+// cloneSeqTimes copies a sequence map so an install cannot alias the entry it
+// has just replaced.
+func cloneSeqTimes(src map[string]uint64) map[string]uint64 {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]uint64, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func cloneCachedItems(src map[string]CachedFileInfo) map[string]CachedFileInfo {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]CachedFileInfo, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 // nextSeqLocked returns the next local namespace sequence. Caller holds dc.mu.
@@ -504,17 +553,22 @@ func (dc *DirCache) nextSeqLocked() uint64 {
 	return dc.seq
 }
 
-// noteLocal records that name was recorded locally at seq. now is used to
-// bound how long the record is kept: it only has to outlive a listing request
-// that was already in flight when the child was recorded.
-func (e *dirCacheEntry) noteLocal(name string, seq uint64, now time.Time, ttl time.Duration) {
+// noteLocal records that name was recorded locally at seq, keeping its entry
+// so a listing install issued before this record can still replay it. now and
+// ttl bound how long records are retained: they only have to outlive listing
+// requests that were already in flight when the child was recorded.
+func (e *dirCacheEntry) noteLocal(name string, item CachedFileInfo, seq uint64, now time.Time, ttl time.Duration) {
 	if seq == 0 {
 		return
 	}
 	if e.localSeq == nil {
 		e.localSeq = make(map[string]uint64)
 	}
+	if e.localItem == nil {
+		e.localItem = make(map[string]CachedFileInfo)
+	}
 	e.localSeq[name] = seq
+	e.localItem[name] = item
 	delete(e.removedSeq, name)
 	e.seqExpires = now.Add(ttl)
 }
@@ -529,6 +583,7 @@ func (e *dirCacheEntry) noteRemoved(name string, seq uint64, now time.Time, ttl 
 	}
 	e.removedSeq[name] = seq
 	delete(e.localSeq, name)
+	delete(e.localItem, name)
 	e.seqExpires = now.Add(ttl)
 }
 
@@ -580,6 +635,7 @@ func (e *dirCacheEntry) upsert(item CachedFileInfo, maxEntries int) {
 			delete(e.items, evict)
 			delete(e.negatives, evict)
 			delete(e.localSeq, evict)
+			delete(e.localItem, evict)
 			delete(e.removedSeq, evict)
 			e.complete = false
 			e.completeExpires = time.Time{}
@@ -622,17 +678,20 @@ func (e *dirCacheEntry) prune(now time.Time) {
 		e.order = nil
 		e.expires = time.Time{}
 		e.complete = false
-		// The carried-over children and removals were only held to protect a
-		// listing request that was already in flight; once the entry itself
-		// expires there is nothing left for an install to merge against.
+		// The child payloads and records were only held to protect a listing
+		// request that was already in flight; with the served items gone there
+		// is nothing for an install to merge against.
 		e.localSeq = make(map[string]uint64)
+		e.localItem = make(map[string]CachedFileInfo)
 		e.removedSeq = make(map[string]uint64)
 		e.seqExpires = time.Time{}
 	}
 	if !e.seqExpires.IsZero() && now.After(e.seqExpires) {
-		// Same bound for the anti-resurrection records when the entry is kept
-		// alive by other state (negatives, completeness, session marker).
+		// The records are only held to protect listing requests that were
+		// already in flight when they were written; past one TTL no such
+		// request can still be outstanding.
 		e.localSeq = nil
+		e.localItem = nil
 		e.removedSeq = nil
 		e.seqExpires = time.Time{}
 	}
@@ -688,7 +747,10 @@ func (e *dirCacheEntry) hasState() bool {
 	return len(e.items) > 0 || len(e.negatives) > 0 || e.complete ||
 		!e.completeExpires.IsZero() || !e.sessionExpires.IsZero() ||
 		!e.missWindowStart.IsZero() || !e.escalateNotBefore.IsZero() ||
-		len(e.removedSeq) > 0
+		// Records outlive the served items: an install that drops a
+		// locally-recorded child still needs them to replay for an older
+		// snapshot that is still in flight.
+		len(e.localSeq) > 0 || len(e.removedSeq) > 0
 }
 
 func cacheParentName(p string) (string, string) {

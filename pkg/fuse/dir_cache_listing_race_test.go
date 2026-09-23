@@ -201,3 +201,113 @@ func TestDirCacheListingInstallAfterRemoveThenRecreate(t *testing.T) {
 	}
 	t.Fatalf("recreated child missing: names=%v", dirCacheNames(t, dc, "/d"))
 }
+
+// Listing requests overlap, so an install whose snapshot is OLDER can land
+// after one whose snapshot is NEWER. Both must see the records their own
+// snapshot predates, even when the newer install already settled them.
+func TestDirCacheOlderListingInstallLandsAfterNewer(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, ListingSnapshot{})
+
+	// Request A is issued, then a commit and a removal land, then request B is
+	// issued. Both mutations therefore sit strictly between A and B, which is
+	// the window where a newer install must not discard the records that an
+	// older install still needs.
+	snapshotA := dc.BeginListing("/d")
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Size: 11})
+	dc.Remove("/d", "base.dat")
+	snapshotB := dc.BeginListing("/d")
+
+	// B lands first. Its response was taken after the mutations, so it
+	// already reflects them and needs no replay.
+	dc.PutListing("/d", []CachedFileInfo{{Name: "committed.dat"}}, snapshotB)
+	names := dirCacheNames(t, dc, "/d")
+	if !containsName(names, "committed.dat") || containsName(names, "base.dat") {
+		t.Fatalf("newer install wrong: names=%v", names)
+	}
+
+	// A lands second. Its response predates both mutations, so it must still
+	// carry the committed child over and keep the removal applied.
+	dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, snapshotA)
+	names = dirCacheNames(t, dc, "/d")
+	if !containsName(names, "committed.dat") {
+		t.Fatalf("older install dropped the committed child: names=%v", names)
+	}
+	if containsName(names, "base.dat") {
+		t.Fatalf("older install resurrected the removed child: names=%v", names)
+	}
+}
+
+// The mirror case: the newer request lands second and must reach the same
+// conclusion for the mutations it predates.
+func TestDirCacheNewerListingInstallLandsAfterOlder(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, ListingSnapshot{})
+
+	snapshotA := dc.BeginListing("/d")
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Size: 11})
+	dc.Remove("/d", "base.dat")
+	snapshotB := dc.BeginListing("/d")
+
+	// The older request lands first and replays both mutations.
+	dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, snapshotA)
+	names := dirCacheNames(t, dc, "/d")
+	if !containsName(names, "committed.dat") || containsName(names, "base.dat") {
+		t.Fatalf("older install wrong: names=%v", names)
+	}
+
+	// The newer response already reflects them and must stay consistent.
+	dc.PutListing("/d", []CachedFileInfo{{Name: "committed.dat"}}, snapshotB)
+	names = dirCacheNames(t, dc, "/d")
+	if !containsName(names, "committed.dat") {
+		t.Fatalf("newer install lost the committed child: names=%v", names)
+	}
+	if containsName(names, "base.dat") {
+		t.Fatalf("newer install resurrected the removed child: names=%v", names)
+	}
+}
+
+// A request issued BEFORE a commit must not drop it even when a NEWER request
+// (issued after the commit) has already installed and settled its records.
+func TestDirCacheOlderListingInstallSurvivesNewerResponseThatKnowsTheChild(t *testing.T) {
+	dc := NewDirCache(10 * time.Second)
+	dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, ListingSnapshot{})
+
+	snapshotOld := dc.BeginListing("/d")
+	dc.Upsert("/d", CachedFileInfo{Name: "committed.dat", Size: 11})
+	snapshotNew := dc.BeginListing("/d")
+
+	// The newer response knows the child, so the install needs no replay and
+	// must not be taken as licence to drop the older request's record.
+	dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}, {Name: "committed.dat"}}, snapshotNew)
+
+	// The older response predates the commit: without the record the child
+	// would vanish from readdir.
+	dc.PutListing("/d", []CachedFileInfo{{Name: "base.dat"}}, snapshotOld)
+	if names := dirCacheNames(t, dc, "/d"); !containsName(names, "committed.dat") {
+		t.Fatalf("older install dropped the committed child: names=%v", names)
+	}
+}
+
+// A carried-over child that overflows the entry during replay evicts other
+// names and clears completeness. The install must not then claim the listing
+// is complete, or a subsequent miss would be answered with a wrong ENOENT
+// instead of reaching the server.
+func TestDirCacheListingInstallDoesNotClaimCompletenessAfterEviction(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 4)
+
+	// Fill the entry to its limit.
+	dc.PutListing("/d", []CachedFileInfo{{Name: "a.dat"}, {Name: "b.dat"}, {Name: "c.dat"}, {Name: "d.dat"}}, ListingSnapshot{})
+
+	snapshot := dc.BeginListing("/d")
+	// Commit a new child while the listing is in flight: replay will need a
+	// slot and evict "a.dat" at the cap.
+	dc.Upsert("/d", CachedFileInfo{Name: "e.dat"})
+
+	dc.PutListing("/d", []CachedFileInfo{{Name: "a.dat"}, {Name: "b.dat"}, {Name: "c.dat"}, {Name: "d.dat"}}, snapshot)
+
+	// The evicted name must not be answerable as a "complete listing" miss.
+	if dc.CanAnswerMisses("/d") {
+		t.Fatalf("listing claims completeness after replay eviction; names=%v", dirCacheNames(t, dc, "/d"))
+	}
+}
