@@ -11323,7 +11323,7 @@ func TestReadCleanShadowBackedHandleRefreshesActiveStaleShadow(t *testing.T) {
 	})
 	defer cleanup()
 
-	shadow, err := NewShadowStore(t.TempDir())
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -11348,6 +11348,15 @@ func TestReadCleanShadowBackedHandleRefreshesActiveStaleShadow(t *testing.T) {
 	}
 	fh.Dirty.ClearDirty()
 	fhID := fs.allocateFileHandle(fh)
+
+	var earlyReader gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &earlyReader); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	defer fs.Release(nil, &gofuse.ReleaseIn{Fh: earlyReader.Fh})
 
 	fs.inodes.UpdateSize(ino, int64(len(fresh)))
 	fs.recordCommittedRevision(filePath, 2)
@@ -11382,15 +11391,12 @@ func TestReadCleanShadowBackedHandleRefreshesActiveStaleShadow(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("read-only Open status = %v, want OK", st)
 	}
-	got, st, err = readDat9FSTestRange(fs, ino, roOut.Fh, 0, len(fresh))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st != gofuse.OK {
-		t.Fatalf("read-only Read status = %v, want OK", st)
-	}
-	if !bytes.Equal(got, fresh) {
-		t.Fatalf("read-only handle pinned stale active shadow: got %q want %q", got, fresh)
+	defer fs.Release(nil, &gofuse.ReleaseIn{Fh: roOut.Fh})
+	for _, id := range []uint64{earlyReader.Fh, roOut.Fh} {
+		got, st, err = readDat9FSTestRange(fs, ino, id, 0, len(fresh))
+		if err != nil || st != gofuse.OK || !bytes.Equal(got, fresh) {
+			t.Fatalf("read-only handle %d used stale active shadow: got %q/%v/%v want %q", id, got, st, err, fresh)
+		}
 	}
 }
 

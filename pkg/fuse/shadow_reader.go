@@ -1,20 +1,21 @@
 package fuse
 
-// refreshReadOnlyShadowLocked is shared by Open and Read. A resident append-log
-// cache must be based on the currently known committed revision at each read,
-// not just when the descriptor opened. Durable pending metadata has its own
-// authority; explicitly retired reset/unlink snapshots keep their lifetime.
+// refreshReadOnlyShadowLocked is shared by Open and Read. An append-log cache,
+// or any cache superseded by a locally observed commit, must match the known
+// revision at each read, not just when the descriptor opened. Pending metadata
+// has its own authority; retired reset/unlink snapshots keep their lifetime.
 // The caller owns the new handle or holds fh.mu, including through a gen read.
 func (fs *Dat9FS) refreshReadOnlyShadowLocked(fh *FileHandle) {
 	if fs.shadowStore == nil || fh.Dirty != nil || fh.Unlinked || fh.UnlinkedSnapshot {
 		return
 	}
-	appendLog := fs.appendLogPathConfigured(fh.Path)
-	if !appendLog && fh.ShadowPinned {
+	committedRevision := fs.latestCommittedRevision(fh.Path)
+	checkRevision := fs.appendLogPathConfigured(fh.Path) || committedRevision > 0
+	if !checkRevision && fh.ShadowPinned {
 		return
 	}
 	pending := fs.hasPendingMetadataState(fh.Path)
-	minRevision := max(fh.BaseRev, fs.latestCommittedRevision(fh.Path))
+	minRevision := max(fh.BaseRev, committedRevision)
 	if entry, ok := fs.inodes.GetEntry(fh.Ino); ok && entry != nil {
 		minRevision = max(minRevision, entry.Revision)
 	}
@@ -37,7 +38,7 @@ func (fs *Dat9FS) refreshReadOnlyShadowLocked(fh *FileHandle) {
 	// pending writer may now have supplied a usable generation.
 	var gen uint64
 	var ok bool
-	if appendLog && !pending {
+	if checkRevision && !pending {
 		gen, ok = fs.shadowStore.PinResidentOrDiscardDisk(fh.Path, minRevision)
 	} else {
 		gen, ok = fs.shadowStore.PinIfExists(fh.Path)

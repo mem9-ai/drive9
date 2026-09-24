@@ -149,8 +149,8 @@ The eligibility check uses live staging state, not a scan of historical WAL
 frames. Recovery of historical frames retains its recorded revision and existing
 CAS checks; this optimization does not add journal commit markers or retire them.
 
-For configured append-log paths, read-only `Open` and `Read` share a checked
-shadow-pin path. Resident caches must have a known base revision at least as new
+For configured append-log paths and paths with a locally observed remote
+commit, read-only `Open` and `Read` share a checked shadow-pin path. Resident caches must have a known base revision at least as new
 as the handle, inode and locally observed committed revision. Existing pins are
 revalidated, and rejected/ordinary-commit-retired pins can acquire a fresh local
 cache on a later read. Raw path reads cannot bypass that check. Explicitly
