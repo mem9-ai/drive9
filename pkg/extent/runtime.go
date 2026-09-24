@@ -194,7 +194,16 @@ func CacheKeyForPrefix(prefix string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
+func NewRuntime(cfg RuntimeConfig) (rt *Runtime, err error) {
+	// NewRuntime takes ownership of cfg.Storage: every error path releases it
+	// (object.Shutdown(nil) is a no-op), so the caller never has to compensate
+	// for a half-built runtime — a client that opened a GCS store would
+	// otherwise leak its HTTP client.
+	defer func() {
+		if err != nil {
+			object.Shutdown(cfg.Storage)
+		}
+	}()
 	if cfg.Transport == nil {
 		return nil, fmt.Errorf("extent runtime: missing meta transport")
 	}
@@ -218,6 +227,11 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 		return nil, fmt.Errorf("load extent format: %w", err)
 	}
 	if err := m.NewSession(true); err != nil {
+		// NewSession starts its refresh goroutine before it can fail; close the
+		// session (safe here: Load set m.fmt, so FlushSession cannot deref nil)
+		// or that goroutine keeps issuing RPCs — and can os.Exit on a format
+		// change — for the life of the process.
+		_ = m.CloseSession()
 		return nil, fmt.Errorf("extent session: %w", err)
 	}
 	// The block cache is a read cache: with Writeback off below, a write holds
@@ -280,16 +294,24 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	}, nil
 }
 
-// CloseRuntime releases what a Runtime holds: the JuiceFS session (which
-// flushes stats and stops the delete-slice tasks). Nothing else is stoppable
-// through the ChunkStore interface — the cached store's cache monitor
-// goroutine keeps running — so callers that build runtimes repeatedly (the
-// server's compact fallback) must reuse one Runtime per tenant instead.
+// CloseRuntime releases what a Runtime holds: the object store (for a store
+// that owns a client, such as GCS) and the JuiceFS session (which flushes stats
+// and stops the delete-slice tasks). Nothing else is stoppable through the
+// ChunkStore interface — the cached store's cache monitor goroutine keeps
+// running — so callers that build runtimes repeatedly (the server's compact
+// fallback) must reuse one Runtime per tenant instead.
 func CloseRuntime(rt *Runtime) error {
-	if rt == nil || rt.Meta == nil {
+	if rt == nil {
 		return nil
 	}
-	return rt.Meta.CloseSession()
+	// Close the session first: session-owned background work may still be using
+	// the store. Then release the store, which for GCS owns an HTTP client.
+	var err error
+	if rt.Meta != nil {
+		err = rt.Meta.CloseSession()
+	}
+	object.Shutdown(rt.Storage)
+	return err
 }
 
 var vfsStateMu sync.Mutex

@@ -50,6 +50,11 @@ var testHookBeforeUnlinkedTransition func()
 // handshake that attach has entered lock contention.
 var testHookAfterUnlinkHandleSetLockAttempt func()
 
+// testHookExtentBuildWait runs under extentMu just before a single-flight
+// extent-runtime waiter parks, letting tests observe the park without a
+// scheduler-timing sleep.
+var testHookExtentBuildWait func()
+
 // errAppendRefreshBusy marks transient sibling-handle lock contention. Write
 // may retry it after yielding fh.mu and the path fence; lineage rejection uses
 // syscall.EAGAIN directly and returns to the caller without an internal spin.
@@ -233,7 +238,13 @@ type Dat9FS struct {
 	xattrs *XAttrStore
 
 	extentMu sync.Mutex
-	extentRT *extentRuntime
+	extentRT atomic.Pointer[extentRuntime]
+	// extentTornDown is set under extentMu when teardown starts; no extent
+	// runtime may be installed after it (see stopExtentRuntimeLoop).
+	extentTornDown bool
+	// extentBuild single-flights the unlocked runtime build (see
+	// extentBuildState in extent_runtime.go).
+	extentBuild extentBuildState
 	// extentMisses caches "this path is not an extent file" so an
 	// extent-enabled mount does not pay a stat probe on every syscall against
 	// the classic files that share its glob (the mixed profile is the shape the
@@ -17172,15 +17183,7 @@ func (fs *Dat9FS) drainLatePendingEntries() {
 }
 
 func (fs *Dat9FS) FlushAll() {
-	if fs.extentRT != nil {
-		if fs.extentRT.stop != nil {
-			fs.extentRT.stop()
-		}
-		// Join the compaction loop before touching the VFS: a compaction in
-		// flight is uploading a merged blob and about to CAS it into meta, and
-		// returning from unmount in between would leak that blob.
-		fs.extentRT.wg.Wait()
-	}
+	fs.stopExtentRuntimeLoop()
 	if v := fs.extentVFS(); v != nil {
 		_ = v.FlushAll("")
 	}
