@@ -2920,10 +2920,14 @@ func clearHandleShadowClaimLocked(fh *FileHandle) {
 // adoptCleanCommittedRevisionLocked rebinds an eligible clean handle to a
 // committed remote image, including its shadow claim and eviction callbacks.
 func (fs *Dat9FS) adoptCleanCommittedRevisionLocked(fh *FileHandle, revision, size int64) {
+	if fs == nil || fh == nil {
+		return
+	}
 	// A rotated WAL shadow is a clean resident cache, not an active staging
-	// claim. Retire it when its base predates this commit, so later read-only
-	// opens cannot pin the obsolete image. Capture the generation before
-	// inspecting its base; generation-checked removal preserves a racing write.
+	// claim. Evict it when safe; correctness does not depend on this best-effort
+	// cleanup because read-only Open independently rejects stale revisions.
+	// Capture the generation before inspecting its base; generation-checked
+	// removal preserves a racing write.
 	if fs.shadowStore != nil && revision > 0 {
 		gen := fs.shadowStore.ActiveGeneration(fh.Path)
 		if gen != 0 && fs.shadowStore.BaseRev(fh.Path) < revision && fs.canRemoveActiveStaleShadowForCleanRefreshLocked(fh) {
@@ -2956,7 +2960,7 @@ func (fs *Dat9FS) canRemoveActiveStaleShadowForCleanRefreshLocked(fh *FileHandle
 	if fs == nil || fh == nil || fs.shadowStore == nil || fh.Path == "" || !fs.shadowStore.Has(fh.Path) {
 		return false
 	}
-	if fs.hasPendingLocalStateExceptShadow(fh.Path) {
+	if fs.hasPendingMetadataState(fh.Path) {
 		return false
 	}
 	if fs.hasQueuedCommit(fh.Path) {
@@ -2966,23 +2970,6 @@ func (fs *Dat9FS) canRemoveActiveStaleShadowForCleanRefreshLocked(fh *FileHandle
 		return false
 	}
 	return true
-}
-
-func (fs *Dat9FS) hasPendingLocalStateExceptShadow(p string) bool {
-	if fs == nil {
-		return false
-	}
-	if fs.pendingIndex != nil {
-		if _, ok := fs.pendingIndex.GetMeta(p); ok {
-			return true
-		}
-	}
-	if fs.writeBack != nil {
-		if _, ok := fs.writeBack.GetMeta(p); ok {
-			return true
-		}
-	}
-	return false
 }
 
 func (fs *Dat9FS) hasOtherPendingOpenHandleState(path string, skip *FileHandle) bool {
@@ -3364,16 +3351,9 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 			fs.adoptCleanCommittedRevisionLocked(fh, revision, committedSize)
 		}
 	}
-	if fs.clearRemovedCommittedShadowLocked(fh, revision, committedSize, false) {
-		return
-	}
-	if advanced && fh.ShadowReady && fs.shadowStore != nil {
-		if err := fs.shadowStore.Ensure(fh.Path, committedSize, revision); err != nil {
-			safeLogPrintf("shadow base revision adopt failed for %s: %v", fh.Path, err)
-		} else {
-			fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
-		}
-	}
+	// Adoption never promotes a shadow by resizing it: writable handles
+	// were rebound above; read-only handles validate their shadow at Open.
+	fs.clearRemovedCommittedShadowLocked(fh, revision, committedSize, false)
 }
 
 // markHandleRevisionOnlyLocked updates the handle's committed revision,
@@ -8591,6 +8571,9 @@ func (fs *Dat9FS) hasPendingLocalState(p string) bool {
 }
 
 func (fs *Dat9FS) hasPendingMetadataState(p string) bool {
+	if fs == nil {
+		return false
+	}
 	if fs.pendingIndex != nil {
 		if _, ok := fs.pendingIndex.GetMeta(p); ok {
 			return true
@@ -13031,14 +13014,14 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		// Atomically pin shadow for read-only opens so commit queue cleanup
 		// doesn't delete the shadow file while this handle is reading from it.
 		// Configured append-log paths without pending metadata only accept a
-		// current-process shadow; a disk-only shadow may contain an uncommitted
-		// tail left by a crashed process.
+		// current-process shadow based on at least the committed revision.
+		// A disk-only shadow may contain a tail left by a crashed process.
 		if !fh.ShadowPinned && fs.shadowStore != nil {
-			pendingShadow := fs.pendingIndex != nil && fs.pendingIndex.HasPending(p)
+			pendingShadow := fs.hasPendingMetadataState(p)
 			var gen uint64
 			var ok bool
 			if fs.appendLogPathConfigured(p) && !pendingShadow {
-				gen, ok = fs.shadowStore.PinResidentOrDiscardDisk(p)
+				gen, ok = fs.shadowStore.PinResidentOrDiscardDisk(p, max(fh.BaseRev, fs.latestCommittedRevision(p)))
 			} else {
 				gen, ok = fs.shadowStore.PinIfExists(p)
 			}
@@ -13565,7 +13548,12 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			sz = fs.shadowStore.SizeGen(fh.ShadowGen)
 			useGen = sz >= 0
 		}
-		if !useGen && !isSQLitePersistentJournalPath(fh.Path) {
+		// Append-log cache shadows must pass the revision check at pin time.
+		// Falling back by path would reuse an image Open deliberately rejected.
+		// Durable pending metadata remains an independent local read authority.
+		allowPathShadow := !isSQLitePersistentJournalPath(fh.Path) &&
+			(!fs.appendLogPathConfigured(fh.Path) || fs.hasPendingMetadataState(fh.Path))
+		if !useGen && allowPathShadow {
 			if fs.shadowStore.Has(fh.Path) {
 				sz = fs.shadowStore.Size(fh.Path)
 			}
@@ -14678,8 +14666,9 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 	fs.inodes.UpdateSize(fh.Ino, 0)
 	fs.cacheFileForPath(fh.Path, 0, time.Now(), committedRev)
 	fs.removeShadowPendingStagingGenerationLocked(fh, fh.Path, stagingGens.ShadowGen, stagingGens.PendingIndexGen)
-	// Unknown-revision finalization need not clear the claim, and generation
-	// cleanup above is conditional (including when no shadow token was captured).
+	// Always retire this handle's claim, including when no generation token
+	// was captured. An unnameable store entry is left for generation-checked
+	// cleanup; a fresh reader independently validates its revision.
 	clearHandleShadowClaimLocked(fh)
 	fh.PendingIndexGen = 0
 	if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync {
