@@ -312,6 +312,14 @@ dump_mount_log() {
     echo "=== drive9 mount log: $MOUNT_LOG ==="
     cat "$MOUNT_LOG"
   fi
+  # Also dump any other mount logs under RUN_ROOT that weren't the last one.
+  if [ -n "${RUN_ROOT:-}" ] && [ -d "$RUN_ROOT" ]; then
+    find "$RUN_ROOT" -xdev -name '*.log' -type f 2>/dev/null | while read -r logf; do
+      [ "$logf" = "${MOUNT_LOG:-}" ] && continue
+      echo "=== drive9 mount log: $logf ==="
+      cat "$logf"
+    done
+  fi
 }
 
 audit_mount_log() {
@@ -649,7 +657,22 @@ run_repo_scenario() {
 }
 
 cleanup() {
+  # First, unmount the currently tracked mount (if any).
   stop_mount
+  # Then sweep RUN_ROOT for any leftover FUSE mounts that were not cleaned
+  # up — e.g. when set -e triggers exit between start_mount and stop_mount
+  # in a multi-mount scenario (sandbox_restore, fast_worktree).
+  if [ -n "${RUN_ROOT:-}" ] && [ -d "$RUN_ROOT" ]; then
+    while IFS= read -r mp; do
+      [ -z "$mp" ] && continue
+      MOUNT_POINT="$mp"
+      stop_mount
+    done < <(find "$RUN_ROOT" -maxdepth 2 -name mount -type d -prune 2>/dev/null | while read -r d; do
+      if is_mounted "$d" 2>/dev/null; then
+        printf '%s\n' "$d"
+      fi
+    done)
+  fi
   if [ -n "${CLI_BIN:-}" ]; then
     rm -f "$CLI_BIN"
   fi
