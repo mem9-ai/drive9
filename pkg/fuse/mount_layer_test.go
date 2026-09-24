@@ -192,6 +192,258 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	}
 }
 
+func TestRestoreLayerReplayDoesNotOverwriteNewerNamespaceMutation(t *testing.T) {
+	tests := []struct {
+		name        string
+		replay      client.FSLayerEntry
+		seed        func(*Dat9FS)
+		mutate      func(*Dat9FS) gofuse.Status
+		assertFinal func(*testing.T, *Dat9FS)
+	}{
+		{
+			name:   "mkdir-wins-over-stale-whiteout",
+			replay: client.FSLayerEntry{LayerID: "layer-1", Path: "/repo/node", Op: "whiteout", Kind: "dir", EntrySeq: 1},
+			mutate: func(fs *Dat9FS) gofuse.Status {
+				return fs.Mkdir(nil, &gofuse.MkdirIn{InHeader: gofuse.InHeader{NodeId: 1}, Mode: 0o750}, "node", &gofuse.EntryOut{})
+			},
+			assertFinal: func(t *testing.T, fs *Dat9FS) {
+				if fs.isLayerWhiteout("/node") {
+					t.Fatal("stale replay whiteout replaced newer mkdir")
+				}
+				if mode, ok := fs.layerDirMode("/node"); !ok || mode != 0o750 {
+					t.Fatalf("final layer directory = (%#o, %t), want 0750 true", mode, ok)
+				}
+			},
+		},
+		{
+			name:   "rmdir-wins-over-stale-mkdir",
+			replay: client.FSLayerEntry{LayerID: "layer-1", Path: "/repo/node", Op: "mkdir", Kind: "dir", Mode: 0o755, EntrySeq: 1},
+			seed: func(fs *Dat9FS) {
+				fs.markLayerDir("/node", 0o755)
+				fs.inodes.Lookup("/node", true, 0, time.Now())
+			},
+			mutate: func(fs *Dat9FS) gofuse.Status {
+				return fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "node")
+			},
+			assertFinal: func(t *testing.T, fs *Dat9FS) {
+				if !fs.isLayerWhiteout("/node") {
+					t.Fatal("stale replay mkdir replaced newer rmdir whiteout")
+				}
+				if _, ok := fs.layerDirMode("/node"); ok {
+					t.Fatal("stale replay mkdir remained visible after newer rmdir")
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			replayFetched := make(chan struct{})
+			allowReplay := make(chan struct{})
+			testHookAfterLayerReplayFetched = func() {
+				close(replayFetched)
+				<-allowReplay
+			}
+			t.Cleanup(func() { testHookAfterLayerReplayFetched = nil })
+
+			var mutationSeq int64 = 2
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+					_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{tc.replay}})
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries":
+					var req client.FSLayerEntryRequest
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						t.Errorf("decode mutation: %v", err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					_ = json.NewEncoder(w).Encode(client.FSLayerEntry{LayerID: "layer-1", Path: req.Path, Op: req.Op, Kind: req.Kind, Mode: req.Mode, EntrySeq: mutationSeq})
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/node" && r.URL.Query().Get("list") == "1":
+					_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FileInfo{}})
+				case r.Method == http.MethodHead:
+					http.NotFound(w, r)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer ts.Close()
+
+			shadow, err := NewShadowStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer shadow.Close()
+			pending, err := NewPendingIndex(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+			fs := NewDat9FS(client.New(ts.URL, ""), opts)
+			if tc.seed != nil {
+				tc.seed(fs)
+			}
+			restoreDone := make(chan error, 1)
+			go func() {
+				restoreDone <- restoreLayerEntries(context.Background(), client.New(ts.URL, ""), opts, shadow, pending, fs)
+			}()
+			select {
+			case <-replayFetched:
+			case <-time.After(5 * time.Second):
+				t.Fatal("restore did not fetch replay snapshot")
+			}
+			if st := tc.mutate(fs); st != gofuse.OK {
+				t.Fatalf("newer local mutation status = %v, want OK", st)
+			}
+			close(allowReplay)
+			if err := <-restoreDone; err != nil {
+				t.Fatalf("restore stale replay: %v", err)
+			}
+			tc.assertFinal(t, fs)
+		})
+	}
+}
+
+func TestRestoreLayerDirectoryRenameProjectsSubtreeWithoutFileState(t *testing.T) {
+	renameEntry := client.FSLayerEntry{
+		LayerID: "layer-1", Path: "/repo/old", Op: "rename", Kind: "dir",
+		ContentText: "/repo/new", Mode: 0o750, EntrySeq: 7,
+	}
+	childEntry := client.FSLayerEntry{
+		LayerID: "layer-1", Path: "/repo/new/layer-child.txt", Op: "upsert", Kind: "file",
+		Mode: 0o640, SizeBytes: 5, EntrySeq: 8,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+			// The real server sorts the folded projection lexicographically, so
+			// /new/layer-child.txt arrives before the /old -> /new rename.
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{childEntry, renameEntry}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries" && r.URL.Query().Get("path") == "/repo/new/layer-child.txt":
+			full := childEntry
+			full.Content = []byte("layer")
+			_ = json.NewEncoder(w).Encode(full)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/repo/new/main-child.txt":
+			w.Header().Set("Content-Length", "5")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "11")
+			w.Header().Set("X-Dat9-Mode", "420")
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request (directory rename must not use file restore): %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.markLayerDir("/old", 0o755)
+	fs.markLayerFileMode("/old/retained.txt", 0o600)
+	fs.inodes.Lookup("/old", true, 0, time.Now())
+	fs.inodes.Lookup("/old/main-child.txt", false, 5, time.Now())
+
+	if err := restoreLayerEntries(context.Background(), client.New(ts.URL, ""), opts, shadow, pending, fs); err != nil {
+		t.Fatalf("restore directory rename: %v", err)
+	}
+	if !fs.isLayerWhiteout("/old") {
+		t.Fatal("directory rename source whiteout missing")
+	}
+	if mode, ok := fs.layerDirMode("/new"); !ok || mode != 0o750 {
+		t.Fatalf("directory rename target = (%#o, %t), want 0750 true", mode, ok)
+	}
+	if mode, ok := fs.layerFileMode("/new/retained.txt"); !ok || mode != 0o600 {
+		t.Fatalf("retained descendant = (%#o, %t), want moved 0600 true", mode, ok)
+	}
+	if _, ok := fs.layerFileMode("/old/retained.txt"); ok {
+		t.Fatal("retained descendant remained under rename source")
+	}
+	if mode, ok := fs.layerFileMode("/new/layer-child.txt"); !ok || mode != 0o640 {
+		t.Fatalf("server-sorted renamed child = (%#o, %t), want restored 0640 true", mode, ok)
+	}
+	if meta, ok := pending.GetMeta("/new/layer-child.txt"); !ok || !meta.LayerCommitted || meta.Generation == 0 {
+		t.Fatalf("renamed child pending meta = %+v, want committed generation", meta)
+	}
+	if got, err := shadow.ReadAll("/new/layer-child.txt"); err != nil || string(got) != "layer" {
+		t.Fatalf("renamed child shadow = %q, %v; want layer", got, err)
+	}
+	if pending.HasPending("/old") || pending.HasPending("/new") || shadow.Has("/old") || shadow.Has("/new") {
+		t.Fatal("directory rename manufactured file shadow/pending state")
+	}
+
+	var oldOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "old", &oldOut); st != gofuse.ENOENT {
+		t.Fatalf("lookup rename source = %v, want ENOENT", st)
+	}
+	var targetOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "new", &targetOut); st != gofuse.OK || targetOut.NodeId == 0 {
+		t.Fatalf("lookup rename target = %v node=%d, want directory", st, targetOut.NodeId)
+	}
+	var childOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: targetOut.NodeId}, "main-child.txt", &childOut); st != gofuse.OK {
+		t.Fatalf("lookup renamed main-backed child = %v, want OK", st)
+	}
+}
+
+func TestRestoreLayerDirectoryRenamePreservesDirtyDescendant(t *testing.T) {
+	entry := client.FSLayerEntry{
+		LayerID: "layer-1", Path: "/repo/from", Op: "rename", Kind: "dir",
+		ContentText: "/repo/to", Mode: 0o750, EntrySeq: 7,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{entry}})
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/from/dirty.txt", []byte("local"), 3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode("/from/dirty.txt", 5, PendingOverwrite, 3, 0o600, true); err != nil {
+		t.Fatal(err)
+	}
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.markLayerDir("/from", 0o755)
+	if err := restoreLayerEntries(context.Background(), client.New(ts.URL, ""), opts, shadow, pending, fs); err != nil {
+		t.Fatalf("restore directory rename: %v", err)
+	}
+	if fs.isLayerWhiteout("/from") {
+		t.Fatal("peer directory rename hid a local unfinished descendant")
+	}
+	if _, ok := fs.layerDirMode("/to"); ok {
+		t.Fatal("peer directory rename published target over a local unfinished descendant")
+	}
+	if got, err := shadow.ReadAll("/from/dirty.txt"); err != nil || string(got) != "local" {
+		t.Fatalf("dirty descendant = %q, %v; want local", got, err)
+	}
+}
+
 func TestRestoreLayerEntriesRejectsCheckpointLayerMismatch(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

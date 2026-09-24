@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1435,6 +1436,36 @@ func lockLayerRestoreTransaction(fs *Dat9FS) func(error) {
 }
 
 var testHookBeforeLayerRestoreViewPublish func(paths []string)
+var testHookAfterLayerReplayFetched func()
+
+// orderLayerRestoreEntries establishes directory rename projections before
+// applying the folded entries below their targets. The server returns the
+// merged projection sorted by path, so a target such as /new/child sorts
+// before its rename source /old. Applying that order would restore the child
+// and then let the directory rename replace the target subtree, discarding
+// the child's namespace projection and replay sequence. Directory renames are
+// ordered chronologically; all remaining entries retain server order.
+func orderLayerRestoreEntries(entries []client.FSLayerEntry) []client.FSLayerEntry {
+	ordered := append([]client.FSLayerEntry(nil), entries...)
+	isDirRename := func(entry client.FSLayerEntry) bool {
+		return entry.Op == "rename" && entry.Kind == "dir"
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		iRename := isDirRename(ordered[i])
+		jRename := isDirRename(ordered[j])
+		if iRename != jRename {
+			return iRename
+		}
+		if !iRename {
+			return false
+		}
+		if ordered[i].EntrySeq != ordered[j].EntrySeq {
+			return ordered[i].EntrySeq < ordered[j].EntrySeq
+		}
+		return ordered[i].Path < ordered[j].Path
+	})
+	return ordered
+}
 
 // publishLayerRestoreView publishes the in-memory namespace view and drops
 // every cache derived from its predecessor. Callers must still hold the
@@ -1442,14 +1473,16 @@ var testHookBeforeLayerRestoreViewPublish func(paths []string)
 // barrier is released ensures a queued local mutation is the later winner,
 // rather than allowing a peer replay to overwrite the local result after its
 // durable pending/shadow transaction has already completed.
-func publishLayerRestoreView(fs *Dat9FS, paths []string, publish func()) {
+func publishLayerRestoreView(fs *Dat9FS, paths []string, publish func() bool) bool {
 	if fs == nil {
-		return
+		return false
 	}
 	if testHookBeforeLayerRestoreViewPublish != nil {
 		testHookBeforeLayerRestoreViewPublish(append([]string(nil), paths...))
 	}
-	publish()
+	if !publish() {
+		return false
+	}
 	seen := make(map[string]struct{}, len(paths))
 	for _, p := range paths {
 		if p == "" || p == "/" {
@@ -1461,6 +1494,7 @@ func publishLayerRestoreView(fs *Dat9FS, paths []string, publish func()) {
 		seen[p] = struct{}{}
 		invalidateLayerRefreshPath(fs, p)
 	}
+	return true
 }
 
 func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS) (retErr error) {
@@ -1499,6 +1533,10 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 	if err != nil {
 		return err
 	}
+	entries = orderLayerRestoreEntries(entries)
+	if testHookAfterLayerReplayFetched != nil {
+		testHookAfterLayerReplayFetched()
+	}
 	for _, entry := range entries {
 		localPath, ok := mountpath.ToLocal(opts.RemoteRoot, entry.Path)
 		if !ok {
@@ -1507,12 +1545,24 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 		switch entry.Op {
 		case "whiteout":
 			finishRestore := lockLayerRestoreTransaction(fs)
-			publishLayerRestoreView(fs, []string{localPath}, func() { fs.markLayerWhiteout(localPath) })
+			if _, owned := layerRestorePendingGeneration(pending, localPath); !owned {
+				finishRestore(nil)
+				continue
+			}
+			publishLayerRestoreView(fs, []string{localPath}, func() bool {
+				return fs.markLayerWhiteoutAtSeq(localPath, entry.EntrySeq)
+			})
 			finishRestore(nil)
 			continue
 		case "mkdir":
 			finishRestore := lockLayerRestoreTransaction(fs)
-			publishLayerRestoreView(fs, []string{localPath}, func() { fs.markLayerDir(localPath, entry.Mode) })
+			if _, owned := layerRestorePendingGeneration(pending, localPath); !owned {
+				finishRestore(nil)
+				continue
+			}
+			publishLayerRestoreView(fs, []string{localPath}, func() bool {
+				return fs.markLayerDirAtSeq(localPath, entry.Mode, entry.EntrySeq)
+			})
 			finishRestore(nil)
 			continue
 		case "chmod":
@@ -1523,27 +1573,32 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 				continue
 			}
 			finishRestore := lockLayerRestoreTransaction(fs)
+			if fs != nil && fs.layerReplayStale([]string{localPath}, entry.EntrySeq) {
+				finishRestore(nil)
+				continue
+			}
 			unlock := func() {}
 			if fs != nil {
 				unlock = fs.lockRemoteCommitPath(localPath)
 			}
 			applied, err := pending.restoreLayerModeIfGeneration(localPath, expectedPendingGen, entry.Mode)
 			if err == nil && applied {
-				publishLayerRestoreView(fs, []string{localPath}, func() {
+				publishLayerRestoreView(fs, []string{localPath}, func() bool {
 					switch entry.Kind {
 					case "file":
-						fs.markLayerFileMode(localPath, entry.Mode)
+						return fs.markLayerFileAtSeq(localPath, entry.Mode, true, entry.EntrySeq)
 					case "dir":
-						fs.markLayerDir(localPath, entry.Mode)
+						return fs.markLayerDirAtSeq(localPath, entry.Mode, entry.EntrySeq)
 					case "symlink":
 						if target, existingMode, ok := fs.layerSymlink(localPath); ok {
 							nextMode := (existingMode &^ uint32(0o777)) | (entry.Mode & 0o777)
 							if nextMode&uint32(syscall.S_IFMT) == 0 {
 								nextMode |= uint32(syscall.S_IFLNK)
 							}
-							fs.markLayerSymlink(localPath, target, nextMode)
+							return fs.markLayerSymlinkAtSeq(localPath, target, nextMode, entry.EntrySeq)
 						}
 					}
+					return false
 				})
 			}
 			unlock()
@@ -1578,7 +1633,13 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 				return fmt.Errorf("restore fs layer symlink entry %s: missing target", entry.Path)
 			}
 			finishRestore := lockLayerRestoreTransaction(fs)
-			publishLayerRestoreView(fs, []string{localPath}, func() { fs.markLayerSymlink(localPath, target, entry.Mode) })
+			if _, owned := layerRestorePendingGeneration(pending, localPath); !owned {
+				finishRestore(nil)
+				continue
+			}
+			publishLayerRestoreView(fs, []string{localPath}, func() bool {
+				return fs.markLayerSymlinkAtSeq(localPath, target, entry.Mode, entry.EntrySeq)
+			})
 			finishRestore(nil)
 			continue
 		}
@@ -1621,6 +1682,13 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 			}
 		}
 		finishRestore := lockLayerRestoreTransaction(fs)
+		if fs != nil && fs.layerReplayStale([]string{localPath}, entry.EntrySeq) {
+			finishRestore(nil)
+			if stagedObjectPath != "" {
+				_ = os.Remove(stagedObjectPath)
+			}
+			continue
+		}
 		unlock := func() {}
 		if fs != nil {
 			unlock = fs.lockRemoteCommitPath(localPath)
@@ -1662,12 +1730,8 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 			},
 		)
 		if err == nil && restored {
-			publishLayerRestoreView(fs, []string{localPath}, func() {
-				if fullEntry.Mode != 0 {
-					fs.markLayerFileMode(localPath, fullEntry.Mode)
-				} else {
-					fs.markLayerFile(localPath)
-				}
+			publishLayerRestoreView(fs, []string{localPath}, func() bool {
+				return fs.markLayerFileAtSeq(localPath, fullEntry.Mode, fullEntry.Mode != 0, entry.EntrySeq)
 			})
 		}
 		unlock()
@@ -1710,6 +1774,24 @@ func layerRestoreShadowGeneration(shadows *ShadowStore, localPath string) uint64
 		return 0
 	}
 	return shadows.EnsureActiveGeneration(localPath, 0)
+}
+
+func layerRestoreDirectoryRenameOwned(pending *PendingIndex, oldPath, newPath string) bool {
+	if pending == nil {
+		return true
+	}
+	check := func(root string) bool {
+		if meta, ok := pending.GetMeta(root); ok && !meta.LayerCommitted {
+			return false
+		}
+		for _, meta := range pending.ListByPrefix(strings.TrimSuffix(root, "/") + "/") {
+			if meta != nil && !meta.LayerCommitted {
+				return false
+			}
+		}
+		return true
+	}
+	return check(oldPath) && check(newPath)
 }
 
 func layerEntryFetchMaxSeq(entry *client.FSLayerEntry, hasCheckpoint bool, checkpointMaxSeq int64) *int64 {
@@ -1769,6 +1851,26 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 	if !ok {
 		return "", nil
 	}
+	if fullEntry.Kind == "dir" {
+		finishRestore := lockLayerRestoreTransaction(fs)
+		if !layerRestoreDirectoryRenameOwned(pending, oldLocalPath, newLocalPath) {
+			finishRestore(nil)
+			return newLocalPath, nil
+		}
+		applied := false
+		if fs != nil {
+			if testHookBeforeLayerRestoreViewPublish != nil {
+				testHookBeforeLayerRestoreViewPublish([]string{oldLocalPath, newLocalPath})
+			}
+			applied = fs.markLayerDirRenameAtSeq(oldLocalPath, newLocalPath, fullEntry.Mode, fullEntry.EntrySeq)
+			if applied {
+				invalidateLayerRefreshSubtree(fs, oldLocalPath)
+				invalidateLayerRefreshSubtree(fs, newLocalPath)
+			}
+		}
+		finishRestore(nil)
+		return newLocalPath, nil
+	}
 	expectedOldPendingGen, oldOwned := layerRestorePendingGeneration(pending, oldLocalPath)
 	expectedNewPendingGen, newOwned := layerRestorePendingGeneration(pending, newLocalPath)
 	if !oldOwned || !newOwned {
@@ -1786,6 +1888,10 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 		fallbackData = data
 	}
 	finishRestore := lockLayerRestoreTransaction(fs)
+	if fs != nil && fs.layerReplayStale([]string{oldLocalPath, newLocalPath}, fullEntry.EntrySeq) {
+		finishRestore(nil)
+		return newLocalPath, nil
+	}
 	unlock := func() {}
 	if fs != nil {
 		unlock = fs.lockRemoteCommitPaths(oldLocalPath, newLocalPath)
@@ -1819,13 +1925,8 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 		},
 	)
 	if err == nil && applied {
-		publishLayerRestoreView(fs, []string{oldLocalPath, newLocalPath}, func() {
-			fs.markLayerWhiteout(oldLocalPath)
-			if fullEntry.Mode != 0 {
-				fs.markLayerFileMode(newLocalPath, fullEntry.Mode)
-			} else {
-				fs.markLayerFile(newLocalPath)
-			}
+		publishLayerRestoreView(fs, []string{oldLocalPath, newLocalPath}, func() bool {
+			return fs.markLayerRenameAtSeq(oldLocalPath, newLocalPath, fullEntry.Mode, fullEntry.EntrySeq)
 		})
 	}
 	unlock()

@@ -110,3 +110,26 @@ func invalidateLayerRefreshPath(fs *Dat9FS, p string) {
 		fs.notifyEntry(parentIno, path.Base(p))
 	}
 }
+
+func invalidateLayerRefreshSubtree(fs *Dat9FS, p string) {
+	if fs == nil || p == "" || p == "/" {
+		return
+	}
+	invalidateLayerRefreshPath(fs, p)
+	prefix := strings.TrimSuffix(p, "/") + "/"
+	if fs.readCache != nil {
+		fs.readCache.InvalidatePrefix(prefix)
+	}
+	fs.invalidateDiskReadCachePrefix(prefix)
+	if fs.dirCache != nil {
+		fs.dirCache.InvalidatePrefix(p)
+	}
+	if fs.inodes != nil {
+		for _, entry := range fs.inodes.Snapshot() {
+			if strings.HasPrefix(entry.Path, prefix) {
+				fs.invalidateReadCacheAndTargets(entry.Path)
+				fs.notifyInode(entry.Ino)
+			}
+		}
+	}
+}
