@@ -559,6 +559,7 @@ func Mount(opts *MountOptions) (err error) {
 			// Migrate legacy writeBack entries to shadow store so
 			// CommitQueue.RecoverPending sees them and doesn't prune.
 			if err := migrateLegacyWriteBack(shadowStore, wbCache, pendingIdx); err != nil {
+				closeFailedMountStaging(dat9fs)
 				return fmt.Errorf("mount: %w", err)
 			}
 
@@ -582,8 +583,10 @@ func Mount(opts *MountOptions) (err error) {
 				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {
 					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
 				}
-				cq.RecoverPending()
+				// Reconcile cold disk accounting before recovery workers mutate
+				// or remove files; no rescan belongs on the live read path.
 				shadowStore.RecoverPendingBytes()
+				cq.RecoverPending()
 				if opts.LayerRef != "" {
 					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
 						return fmt.Errorf("mount: restore fs layer entries: %w", err)
@@ -593,16 +596,7 @@ func Mount(opts *MountOptions) (err error) {
 				dat9fs.commitQueue = cq
 			}
 			if gvisorWriteBackRequiresCommitQueue(opts, wbCache, dat9fs.commitQueue) {
-				if journal != nil {
-					if dat9fs.journalSyncerCancel != nil {
-						dat9fs.journalSyncerCancel()
-					}
-					_ = journal.FsyncShared()
-					_ = journal.Close()
-				}
-				if shadowStore != nil {
-					shadowStore.Close()
-				}
+				closeFailedMountStaging(dat9fs)
 				return errors.New("mount: gvisor compat write-back requires pending index and shadow store")
 			}
 
@@ -1682,12 +1676,17 @@ func generateMountID() string {
 }
 
 // migrateLegacyWriteBack runs before pending recovery binds shadow sources.
-// The legacy .meta owns .dat; an existing orphan is not evidence of migration.
+// An existing shadow may be newer than a best-effort .dat snapshot, even when
+// the surviving .meta belongs to that older snapshot. Migration only fills a
+// missing shadow; it never replaces one without proof of payload identity.
 func migrateLegacyWriteBack(shadows *ShadowStore, cache *WriteBackCache, pending *PendingIndex) error {
 	if shadows == nil || cache == nil {
 		return nil
 	}
 	for _, entry := range cache.ListPending() {
+		if shadows.Has(entry.Meta.Path) {
+			continue
+		}
 		if entry.Meta.ShadowSpill {
 			continue // this metadata explicitly owns the shadow payload
 		}
@@ -1702,4 +1701,19 @@ func migrateLegacyWriteBack(shadows *ShadowStore, cache *WriteBackCache, pending
 		}
 	}
 	return nil
+}
+
+// closeFailedMountStaging releases staging resources when initialization fails
+// before a mount takes ownership. Stop the syncer before closing its journal.
+func closeFailedMountStaging(fs *Dat9FS) {
+	if fs.journalSyncerCancel != nil {
+		fs.journalSyncerCancel()
+	}
+	if fs.journal != nil {
+		_ = fs.journal.FsyncShared()
+		_ = fs.journal.Close()
+	}
+	if fs.shadowStore != nil {
+		fs.shadowStore.Close()
+	}
 }

@@ -12466,7 +12466,13 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	// CREATE starts a new path incarnation. Preserve the old inode for open
 	// handles and hardlink aliases, but never inherit its revision or identity.
-	fs.inodes.RemoveLinkPreserve(childP)
+	if oldIno, ok := fs.inodes.GetInode(childP); ok &&
+		(fs.hasOpenHandle(oldIno, childP) || fs.inodeHasPendingMutationState(oldIno, childP, true)) {
+		fs.inodes.RemoveLinkPreserve(childP)
+	} else {
+		// RemoveLink already retains any surviving hardlink aliases.
+		fs.inodes.RemoveLink(childP)
+	}
 	fs.forgetCommittedRevisionPrefix(childP)
 	ino := fs.inodes.Lookup(childP, false, 0, time.Now())
 	fs.inodes.UpdateMode(ino, mode)

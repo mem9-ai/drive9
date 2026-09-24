@@ -42,6 +42,9 @@ func TestReadOnlyShadowWriteBackOwnsOnlyDat(t *testing.T) {
 					t.Fatal(st)
 				}
 				defer fs.Release(nil, &gofuse.ReleaseIn{Fh: out.Fh})
+				if reader, _ := fs.fileHandles.Get(out.Fh); reader.ShadowPinned {
+					t.Fatal("Open authorized a shadow using only write-back metadata")
+				}
 				got, st, err := readDat9FSTestRange(fs, ino, out.Fh, 0, 30)
 				if err != nil || st != gofuse.OK || string(got) != "GOOD" {
 					t.Fatalf("read=%q/%v/%v", got, st, err)
@@ -241,7 +244,7 @@ func TestShadowDiscardOrphanAccounting(t *testing.T) {
 	}
 }
 
-func TestLegacyWriteBackMigrationReplacesOrphan(t *testing.T) {
+func TestLegacyWriteBackMigrationPreservesExistingShadow(t *testing.T) {
 	s, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -255,14 +258,14 @@ func TestLegacyWriteBackMigrationReplacesOrphan(t *testing.T) {
 	if err := cache.PutWithBaseRev(path, []byte("GOOD"), 4, PendingOverwrite, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(s.shadowPath(path), []byte("TORN"), 0o600); err != nil {
+	if err := os.WriteFile(s.shadowPath(path), []byte("NEWER"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := migrateLegacyWriteBack(s, cache, nil); err != nil {
 		t.Fatal(err)
 	}
 	data, err := s.ReadAll(path)
-	if err != nil || string(data) != "GOOD" {
+	if err != nil || string(data) != "NEWER" {
 		t.Fatalf("migrated=%q/%v", data, err)
 	}
 }

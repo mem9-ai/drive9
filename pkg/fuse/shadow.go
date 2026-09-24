@@ -40,6 +40,18 @@ type ShadowFile struct {
 	writtenBytes int64 // current-process coverage; zero for recovered shadows
 }
 
+// establishProvenance records successful initialization or refreshes an
+// already-known image after mutation. A partial edit never verifies recovered
+// bytes, and an absent revision never erases a known base on a partial edit.
+// The caller holds the store mutex.
+func (sf *ShadowFile) establishProvenance(baseRev int64, coversWholeImage bool) {
+	if !coversWholeImage && (baseRev == 0 || (sf.baseRev == 0 && !sf.localNew)) {
+		return
+	}
+	sf.baseRev = baseRev
+	sf.localNew = baseRev == 0
+}
+
 // DirtyExtent tracks a dirty region in a shadow file.
 type DirtyExtent struct {
 	Offset int64
@@ -325,7 +337,9 @@ func (s *ShadowStore) AddPendingBytes(n int64) {}
 // Deprecated: do not call; kept for backward compatibility.
 func (s *ShadowStore) SubPendingBytes(n int64) {}
 
-// PendingBytes returns the current pending write-back byte count.
+// PendingBytes returns logical shadow bytes for reporting. Quota enforcement
+// uses quotaBytes (current-process written coverage), not this recovered total.
+// RecoverPendingBytes remains the cold startup reconciliation path.
 func (s *ShadowStore) PendingBytes() int64 {
 	return s.pendingBytes.Load()
 }
@@ -444,8 +458,7 @@ func (s *ShadowStore) Ensure(remotePath string, size int64, baseRev int64) error
 		// A successful empty reset (Create), or extension of an empty
 		// image with zeros, establishes all bytes locally. Merely opening
 		// or partially resizing recovered contents cannot establish this.
-		sf.baseRev = baseRev
-		sf.localNew = baseRev == 0
+		sf.establishProvenance(baseRev, true)
 	}
 	s.bumpWriteGenLocked(remotePath)
 	s.mu.Unlock()
@@ -536,8 +549,7 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 
 	s.mu.Lock()
 	sf.size = newSize
-	sf.baseRev = baseRev
-	sf.localNew = baseRev == 0
+	sf.establishProvenance(baseRev, true)
 	s.bumpWriteGenLocked(remotePath)
 	s.mu.Unlock()
 	return nil
@@ -695,8 +707,7 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	sf.written = shadowWrittenRanges{}
 	sf.written.add(0, n)
 	sf.writtenBytes = n
-	sf.baseRev = baseRev
-	sf.localNew = baseRev == 0
+	sf.establishProvenance(baseRev, true)
 	s.bumpWriteGenLocked(remotePath)
 	s.mu.Unlock()
 	// Safe to close: ReadAt/ReadAll hold RLock during the actual fd.ReadAt
@@ -735,12 +746,7 @@ func (s *ShadowStore) Truncate(remotePath string, size int64, baseRev int64) err
 	s.mu.Lock()
 	sf.size = size
 	s.resizeWrittenLocked(sf, size)
-	if size == 0 || oldSize == 0 {
-		sf.baseRev = baseRev
-		sf.localNew = baseRev == 0
-	} else if baseRev != 0 && (sf.baseRev != 0 || sf.localNew) {
-		sf.baseRev = baseRev
-	}
+	sf.establishProvenance(baseRev, size == 0 || oldSize == 0)
 	s.bumpWriteGenLocked(remotePath)
 	s.mu.Unlock()
 	s.pendingBytes.Add(delta)
@@ -816,12 +822,9 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 	oldSize := sf.size
 	sf.size = newSize
 	s.resizeWrittenLocked(sf, newSize)
-	if newSize == 0 {
-		sf.baseRev = baseRev
-		sf.localNew = baseRev == 0
-	} else if baseRev != 0 && (sf.writtenBytes == newSize || sf.baseRev != 0 || sf.localNew) {
-		sf.baseRev = baseRev
-	}
+	// Accumulated written coverage can verify a supplied base, but does not
+	// mean this partial operation created a new revision-zero incarnation.
+	sf.establishProvenance(baseRev, newSize == 0 || (baseRev != 0 && sf.writtenBytes == newSize))
 	s.bumpWriteGenLocked(remotePath)
 	s.mu.Unlock()
 	s.pendingBytes.Add(newSize - oldSize)
@@ -1443,6 +1446,10 @@ func (s *ShadowStore) ActiveGeneration(remotePath string) uint64 {
 // state; CommitQueue must mint one before binding a recovered CommitEntry so
 // later uploads and cleanup remain generation-scoped instead of path-wide.
 func (s *ShadowStore) EnsureActiveGeneration(remotePath string) uint64 {
+	return s.ensureActiveGeneration(remotePath, 0)
+}
+
+func (s *ShadowStore) ensureActiveGeneration(remotePath string, minSize int64) uint64 {
 	if s == nil || remotePath == "" {
 		return 0
 	}
@@ -1473,7 +1480,7 @@ func (s *ShadowStore) EnsureActiveGeneration(remotePath string) uint64 {
 			s.files[remotePath] = sf
 		}
 	}
-	if sf == nil {
+	if sf == nil || sf.size < minSize {
 		return 0
 	}
 	if gen := s.writeGen[remotePath]; gen != 0 {

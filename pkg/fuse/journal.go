@@ -321,7 +321,8 @@ func (j *Journal) Close() error {
 // upload torn content under old metadata.
 //
 // Entries whose .meta survived (already present in the pending index) are
-// left untouched: the .meta file carries strictly more metadata than the WAL.
+// left untouched by legacy fsync frames. Full pending-meta WAL frames can
+// replace an older .meta left by a failed best-effort write-back snapshot.
 func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStore) error {
 	if j == nil || idx == nil {
 		return nil
@@ -357,14 +358,22 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 		if doneSeq, ok := latestDone[path]; ok && doneSeq > e.Seq {
 			return nil // committed or unlinked after the last local record
 		}
-		if idx.HasPending(path) {
-			return nil
-		}
+		var meta WriteBackMeta
 		if fromMeta {
-			var meta WriteBackMeta
 			if err := json.Unmarshal(e.Meta, &meta); err != nil {
 				return fmt.Errorf("journal replay resurrect %s: %w", path, err)
 			}
+		}
+		if current, ok := idx.GetMeta(path); ok {
+			// .meta and .dat may be an older best-effort snapshot even though
+			// a later Flush durably published shadow + full WAL metadata.
+			// Legacy fsync frames have no full publication timestamp, so they
+			// cannot displace a surviving metadata record on that evidence.
+			if !fromMeta || !current.Mtime.Before(meta.Mtime) {
+				return nil
+			}
+		}
+		if fromMeta {
 			// Issue #964: close staging is un-fsynced, so the WAL meta frame
 			// may reach disk while the shadow content did not. A frame whose
 			// content is short is a lost file (same outcome as ext4 dropping
@@ -377,6 +386,9 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 				if size, ok := shadows.ContentSize(path); ok && size < meta.Size {
 					// Partial content: the file is not recoverable.
 					shadows.Remove(path)
+					// Do not let an older .meta/.dat entry resurrect a rejected
+					// newer publication during the migration that follows replay.
+					idx.Remove(path)
 					return nil
 				}
 			}
