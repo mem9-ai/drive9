@@ -40,6 +40,28 @@ check_eq() {
   fi
 }
 
+# run_with_watchdog LIMIT LOG CMD...: portable `timeout`. Returns 124 and
+# kills the child when CMD outlives LIMIT seconds, so a regression that makes
+# the child hang turns into a prompt, attributable failure instead of a stuck
+# harness.
+run_with_watchdog() {
+  local limit="$1" log="$2"; shift 2
+  "$@" >"$log" 2>&1 &
+  local pid=$!
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$limit" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" >/dev/null 2>&1 || true
+    sleep 0.2
+    echo "watchdog: child exceeded ${limit}s and was killed" >&2
+    return 124
+  fi
+  wait "$pid" 2>/dev/null
+}
+
 check_le() {
   local desc="$1" got="$2" max="$3"
   if [ "$got" -le "$max" ] 2>/dev/null; then
@@ -94,13 +116,20 @@ PY
 # bootstrap would hang forever on it.
 write_fake_stall() {
   cat >"$1" <<'PY'
-import socket, sys
+import os, signal, socket, sys
 
+lifetime = int(os.environ.get("FAKE_STALL_LIFETIME_S", "120"))
 srv = socket.socket()
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("127.0.0.1", int(sys.argv[1])))
 srv.listen(16)
 conns = []
+
+def _shutdown(signum, frame):
+    os._exit(0)
+
+signal.signal(signal.SIGALRM, _shutdown)
+signal.alarm(lifetime)
 while True:
     conns.append(srv.accept()[0])
 PY
@@ -369,13 +398,20 @@ test_object_store_first_unhealthy() {
   echo "--- D: object-store first candidate unhealthy, second healthy"
   new_harness
   local rc=0
+  local t0 elapsed
+  t0=$(date +%s)
   CLI_SOURCE=invalid OBJECT_BOOTSTRAP_ONLY=1 \
     MINIO_IMAGE=registry.invalid/bad:tag \
     DRIVE9_MINIO_FALLBACK_IMAGE=registry.invalid/good:tag \
     FAKE_HEALTHY_IMAGES="registry.invalid/good:tag" \
     MINIO_PORT=$FAKE_PORT MINIO_HEALTH_TIMEOUT_S=3 PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
     bash "$REPO_ROOT/e2e/object-store-smoke-test.sh" >"$FAKE_RUN_DIR/suite.log" 2>&1 || rc=$?
+  elapsed=$(( $(date +%s) - t0 ))
   check_eq "bootstrap exit status" "$rc" "0"
+  # The empty port must be dismissed by the one-shot reuse probe, not by a
+  # retry loop: the whole two-candidate bootstrap stays well under a single
+  # default health budget.
+  check_le "clean-port bootstrap is prompt" "$elapsed" 20
   check_eq "second candidate was run" "$(read_state run_image | tail -1)" "registry.invalid/good:tag"
   # Two removals: the unhealthy candidate inside the loop, plus the suite's
   # EXIT-trap cleanup of the accepted container.
@@ -434,14 +470,15 @@ test_stalled_http_probe_recovers_local_minio() {
   local rc=0
   local t0
   t0=$(date +%s)
-  DRIVE9_MINIO_PORT=$FAKE_PORT FAKE_HEALTHY_IMAGES="registry.invalid/good:tag" \
+  run_with_watchdog 60 "$FAKE_RUN_DIR/ensure.log" env \
+    DRIVE9_MINIO_PORT=$FAKE_PORT FAKE_HEALTHY_IMAGES="registry.invalid/good:tag" \
     FAKE_STALL_IMAGES="registry.invalid/stall:tag" \
     DRIVE9_MINIO_IMAGE=registry.invalid/stall:tag \
     DRIVE9_MINIO_FALLBACK_IMAGE=registry.invalid/good:tag \
     MINIO_HEALTH_TIMEOUT_S=4 PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
-    bash "$SCRIPT_DIR/local-minio.sh" ensure >"$FAKE_RUN_DIR/ensure.log" 2>&1 || rc=$?
+    bash "$SCRIPT_DIR/local-minio.sh" ensure || rc=$?
   local elapsed=$(( $(date +%s) - t0 ))
-  check_eq "ensure exit status" "$rc" "0"
+  check_eq "ensure exit status (124 = watchdog fired)" "$rc" "0"
   check_eq "good candidate took over" "$(read_state run_image | tail -1)" "registry.invalid/good:tag"
   check_eq "stalled candidate removed" "$(grep -c '^removed=' "$FAKE_STATE" || true)" "1"
   check_eq "binary fallback not used" "$(grep -c '^invoked' "$FAKE_STATE" || true)" "0"
@@ -457,15 +494,16 @@ test_stalled_http_probe_recovers_object_store() {
   local rc=0
   local t0
   t0=$(date +%s)
-  CLI_SOURCE=invalid OBJECT_BOOTSTRAP_ONLY=1 \
+  run_with_watchdog 60 "$FAKE_RUN_DIR/suite.log" env \
+    CLI_SOURCE=invalid OBJECT_BOOTSTRAP_ONLY=1 \
     MINIO_IMAGE=registry.invalid/stall:tag \
     DRIVE9_MINIO_FALLBACK_IMAGE=registry.invalid/good:tag \
     FAKE_HEALTHY_IMAGES="registry.invalid/good:tag" \
     FAKE_STALL_IMAGES="registry.invalid/stall:tag" \
     MINIO_PORT=$FAKE_PORT MINIO_HEALTH_TIMEOUT_S=4 PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
-    bash "$REPO_ROOT/e2e/object-store-smoke-test.sh" >"$FAKE_RUN_DIR/suite.log" 2>&1 || rc=$?
+    bash "$REPO_ROOT/e2e/object-store-smoke-test.sh" || rc=$?
   local elapsed=$(( $(date +%s) - t0 ))
-  check_eq "bootstrap exit status" "$rc" "0"
+  check_eq "bootstrap exit status (124 = watchdog fired)" "$rc" "0"
   check_eq "good candidate took over" "$(read_state run_image | tail -1)" "registry.invalid/good:tag"
   # One removal inside the loop plus the suite's EXIT-trap cleanup.
   check_eq "stalled candidate removed" "$(grep -c '^removed=' "$FAKE_STATE" || true)" "2"
