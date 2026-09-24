@@ -3359,6 +3359,45 @@ func TestGitignoreAwareGateFailsOpenWithoutWorkspace(t *testing.T) {
 	}
 }
 
+// TestGitignoreAwareGateFailsOpenWhenOracleUnavailable covers the case where a
+// workspace is loaded but the ignore oracle cannot answer (here, the hydrated
+// clean tree is absent — the same path a missing `git` binary or a timeout
+// takes). The pattern's overlay must be kept rather than dropped.
+func TestGitignoreAwareGateFailsOpenWhenOracleUnavailable(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.treeNodes = []client.GitTreeNode{
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "src",
+			Name:        "src",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		},
+	}
+	// Deliberately do NOT create gitcache.TreeRoot, so `git check-ignore` has no
+	// work tree to run against and reports "not cacheable".
+	localRoot := t.TempDir()
+	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+
+	confirmed, verified := fs.gitIgnoreConfirmsLocalOnly(context.Background(), "/repo/node_modules/x/y.js", false)
+	if verified {
+		t.Fatalf("oracle reported verified=%t without a work tree, want unverified", verified)
+	}
+	if confirmed {
+		t.Fatal("unverified oracle must not report confirmed")
+	}
+	if got := fs.observePathPolicy("/repo/node_modules/x/y.js"); got != PathLayerLocalOnly {
+		t.Errorf("node_modules with an unavailable oracle = %s, want local-only (fail open)", got)
+	}
+}
+
 // TestGitWorkspaceGitDirStaysLocal covers `.git` routing: it is local-only
 // inside a loaded Git workspace even though it is not a default local-only
 // pattern, and remote-persistent outside one.
@@ -3414,6 +3453,78 @@ func TestGitIgnoredAncestorCached(t *testing.T) {
 	}
 	if fs.gitIgnoredAncestorCached(rt, "other/x.js") {
 		t.Error("unrelated path should not be confirmed")
+	}
+
+	// An ancestor confirmed through a plain path lookup (dirHint=false) also
+	// confirms its subtree, so a directory reached without a directory
+	// classification still amortizes.
+	fs.git.ignoreCache[gitIgnoreCacheKey(rt, "vendor", false)] = true
+	if !fs.gitIgnoredAncestorCached(rt, "vendor/keep/a.txt") {
+		t.Error("descendant of a path-keyed ignored ancestor should be confirmed")
+	}
+}
+
+// TestGitignoreAwareAmortizesWithinIgnoredDir verifies that confirming one file
+// under an ignored directory caches the directory, so sibling files do not each
+// spawn a `git check-ignore`. This bounds the per-file cost of the gate.
+func TestGitignoreAwareAmortizesWithinIgnoredDir(t *testing.T) {
+	treeNodes := []client.GitTreeNode{
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        ".gitignore",
+			Name:        ".gitignore",
+			Kind:        "file",
+			Mode:        "100644",
+			ObjectSHA:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			SizeBytes:   20,
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "src",
+			Name:        "src",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		},
+	}
+	fixture, localRoot := newGitIgnoreFixture(t, map[string]string{
+		".gitignore": "node_modules/\n",
+	}, treeNodes)
+
+	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+
+	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/deep/a/node_modules/f000.js")
+	if !ok || rt == nil {
+		t.Fatal("expected a loaded workspace for the fixture")
+	}
+
+	// First file: real check-ignore, which also confirms and caches the parent.
+	if got := fs.observePathPolicy("/repo/deep/a/node_modules/f000.js"); got != PathLayerLocalOnly {
+		t.Fatalf("first file = %s, want local-only", got)
+	}
+	parentKey := gitIgnoreCacheKey(rt, "deep/a/node_modules", true)
+	fs.git.mu.Lock()
+	parentIgnored, cached := fs.git.ignoreCache[parentKey]
+	fs.git.mu.Unlock()
+	if !cached || !parentIgnored {
+		t.Fatalf("parent directory not cached as ignored (cached=%t ignored=%t)", cached, parentIgnored)
+	}
+
+	// A sibling file must now be confirmed straight from the cached ancestor,
+	// with no new check-ignore. Assert the ancestor path is what the short
+	// circuit consults.
+	if !fs.gitIgnoredAncestorCached(rt, "deep/a/node_modules/f001.js") {
+		t.Fatal("sibling should be confirmed by the cached parent directory")
+	}
+	if got := fs.observePathPolicy("/repo/deep/a/node_modules/f001.js"); got != PathLayerLocalOnly {
+		t.Errorf("sibling = %s, want local-only", got)
 	}
 }
 

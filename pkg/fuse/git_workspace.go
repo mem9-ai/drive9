@@ -1342,20 +1342,56 @@ func (fs *Dat9FS) gitIgnoreConfirmsLocalOnly(ctx context.Context, localPath stri
 	fs.git.mu.Unlock()
 
 	ignored, cacheable := fs.gitCheckIgnoredPath(ctx, rt, rel, dirHint)
-	if cacheable {
-		fs.git.mu.Lock()
-		if fs.git.ignoreCache == nil {
-			fs.git.ignoreCache = make(map[string]bool)
-		}
-		fs.git.ignoreCache[key] = ignored
-		fs.git.mu.Unlock()
+	if !cacheable {
+		// The ignore oracle could not answer: `git` is missing, the call timed
+		// out, or the git dir/state could not be resolved. Report the result as
+		// unverified so the caller keeps the pattern's overlay (fail open)
+		// rather than dropping it. This keeps a mount on a git-less host, or a
+		// transient git hiccup, from silently pushing local-only trees such as
+		// node_modules to the remote.
+		return false, false
 	}
+
+	// When a path is confirmed ignored, its parent directory is almost always
+	// the ignored directory (node_modules/x.js under node_modules/). Confirm and
+	// cache that parent under the directory key so the rest of the subtree
+	// short-circuits on gitIgnoredAncestorCached instead of spawning one
+	// check-ignore per sibling file. This costs one extra probe for the first
+	// file in a directory, not one per file.
+	var parentDir string
+	var parentIgnored bool
+	if ignored && !dirHint {
+		if parent := path.Dir(rel); parent != "." && parent != "/" && parent != "" {
+			if pIgnored, pCacheable := fs.gitCheckIgnoredPath(ctx, rt, parent, true); pCacheable && pIgnored {
+				parentDir, parentIgnored = parent, true
+			}
+		}
+	}
+
+	fs.git.mu.Lock()
+	if fs.git.ignoreCache == nil {
+		fs.git.ignoreCache = make(map[string]bool)
+	}
+	fs.git.ignoreCache[key] = ignored
+	if parentIgnored {
+		fs.git.ignoreCache[gitIgnoreCacheKey(rt, parentDir, true)] = true
+	}
+	fs.git.mu.Unlock()
 	return ignored, true
 }
 
 // gitIgnoredAncestorCached reports whether a strict ancestor directory of rel
 // is cached as ignored. rel's own path is not consulted; the caller handles it
 // via the ignore cache.
+//
+// Both cache keys are consulted. An ancestor is a directory by construction, so
+// whether it was confirmed through a directory classification (dirHint=true) or
+// through a plain path lookup (dirHint=false, e.g. the kernel resolving a deep
+// file and looking up each component with no directory hint), an ignored
+// ancestor ignores its whole subtree — Git does not allow re-including a path
+// under an excluded directory. Matching both keys keeps a large ignored tree
+// from paying one `git check-ignore` per file when only the file-path key was
+// populated.
 func (fs *Dat9FS) gitIgnoredAncestorCached(rt *gitWorkspaceRuntime, rel string) bool {
 	rel = strings.Trim(rel, "/")
 	if rel == "" || fs == nil || fs.git == nil {
@@ -1371,6 +1407,9 @@ func (fs *Dat9FS) gitIgnoredAncestorCached(rt *gitWorkspaceRuntime, rel string) 
 	for i := 1; i <= depth; i++ {
 		ancestor := strings.Join(parts[:i], "/")
 		if ignored, ok := fs.git.ignoreCache[gitIgnoreCacheKey(rt, ancestor, true)]; ok && ignored {
+			return true
+		}
+		if ignored, ok := fs.git.ignoreCache[gitIgnoreCacheKey(rt, ancestor, false)]; ok && ignored {
 			return true
 		}
 	}
