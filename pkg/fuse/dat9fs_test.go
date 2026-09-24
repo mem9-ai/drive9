@@ -22262,6 +22262,10 @@ func TestRenamePendingNewCommitGitLooseObjectSyncFailureKeepsRecoverableShadow(t
 	fs2 := NewDat9FS(c, opts)
 	fs2.shadowStore = shadow2
 	fs2.pendingIndex = pending2
+	// Complete the pending-shadow binding performed by mount recovery before
+	// serving reads; loading metadata alone does not verify disk bytes.
+	pending2.setShadowStore(shadow2)
+	pending2.recoverShadowSource(newP, pending2.Generation(newP), shadow2)
 	dirIno2 := fs2.inodes.Lookup("/repo/.git/objects/7e", true, 0, time.Now())
 	var entryOut gofuse.EntryOut
 	st = fs2.Lookup(nil, &gofuse.InHeader{NodeId: dirIno2}, finalName, &entryOut)
@@ -22510,6 +22514,10 @@ func testRenamePendingNewCommitDurablePolicyFailureReturnsErrorAndKeepsShadow(t 
 	fs2 := NewDat9FS(newTestClient(ts.URL), opts)
 	fs2.shadowStore = shadow2
 	fs2.pendingIndex = pending2
+	// Complete the pending-shadow binding performed by mount recovery before
+	// serving reads; loading metadata alone does not verify disk bytes.
+	pending2.setShadowStore(shadow2)
+	pending2.recoverShadowSource(newP, pending2.Generation(newP), shadow2)
 	dirIno2 := fs2.inodes.Lookup("/app", true, 0, time.Now())
 	var entryOut gofuse.EntryOut
 	st = fs2.Lookup(nil, &gofuse.InHeader{NodeId: dirIno2}, finalName, &entryOut)
