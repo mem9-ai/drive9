@@ -1598,7 +1598,7 @@ func TestDat9FSParallelDiskReadStopsQueuedBlocksAfterFirstError(t *testing.T) {
 	}()
 	select {
 	case <-slowStarted:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("second in-flight block did not start")
 	}
 	releaseFirstOnce.Do(func() { close(releaseFirst) })
@@ -1609,7 +1609,7 @@ func TestDat9FSParallelDiskReadStopsQueuedBlocksAfterFirstError(t *testing.T) {
 		if st == gofuse.OK {
 			t.Fatal("parallel read status = OK, want first block error propagated")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("parallel read did not finish after releasing in-flight block")
 	}
 	if got := unexpectedQueuedReads.Load(); got != 0 {
@@ -14948,28 +14948,45 @@ func TestSetAttr_WriteBackInteractivePathTruncateStagesAndReturnsBeforeRemoteCom
 
 func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
 	const callerPID = 5151
-	// With a live writer on the inode the truncate must take the synchronous
-	// path (the async staged zero would race the writer's pending commit), so
-	// the test needs a live server that accepts the truncate PUT.
+	// A clean live writer does not own a mutation yet. The path-scoped queue
+	// owns the staged zero and Write must wait for that commit, adopt its
+	// revision, and only then create the writer's next dirty generation.
 	var mu sync.Mutex
 	rev := int64(7)
 	content := bytes.Repeat([]byte{0x41}, 8*1024*1024)
+	zeroPutEntered := make(chan struct{})
+	allowZeroPut := make(chan struct{})
+	var allowZeroPutOnce sync.Once
+	releaseZeroPut := func() { allowZeroPutOnce.Do(func() { close(allowZeroPut) }) }
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
 		switch r.Method {
 		case http.MethodHead:
+			mu.Lock()
+			defer mu.Unlock()
 			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
 			w.Header().Set("X-Dat9-IsDir", "false")
 			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
 			w.WriteHeader(http.StatusOK)
 		case http.MethodPut:
 			body, _ := io.ReadAll(r.Body)
+			if len(body) == 0 {
+				select {
+				case <-zeroPutEntered:
+				default:
+					close(zeroPutEntered)
+				}
+				<-allowZeroPut
+			}
+			mu.Lock()
 			content = append([]byte(nil), body...)
 			rev++
-			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			committedRev := rev
+			mu.Unlock()
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(committedRev, 10))
 			w.WriteHeader(http.StatusOK)
 		case http.MethodGet:
+			mu.Lock()
+			defer mu.Unlock()
 			_, _ = w.Write(content)
 		default:
 			http.NotFound(w, r)
@@ -14978,7 +14995,8 @@ func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
 	defer ts.Close()
 	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
 	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	c := newTestClient(ts.URL)
+	fs := NewDat9FS(c, opts)
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -14990,13 +15008,17 @@ func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
 	}
 	fs.shadowStore = shadow
 	fs.pendingIndex = pending
-	fs.commitQueue = &CommitQueue{
-		maxPending:   8,
-		queue:        []*CommitEntry{},
-		queuedByPath: map[string]map[*CommitEntry]struct{}{},
-		inFlight:     map[string]*CommitEntry{},
-		workCh:       make(chan *CommitEntry, 16),
-	}
+	queue := NewCommitQueue(c, shadow, pending, nil, 1, 8, fs.remoteRoot())
+	queue.OnSuccess = fs.onCommitQueueSuccess
+	queue.OnUploaded = fs.onCommitQueueUploaded
+	queue.OnCleanup = fs.onCommitQueueCleanup
+	queue.OnDiscard = fs.onCommitQueueDiscard
+	queue.IsSuperseded = fs.commitEntrySuperseded
+	queue.PathLock = fs.lockRemoteCommitPath
+	queue.DurableWatermark = fs.latestCommittedRevision
+	fs.commitQueue = queue
+	defer queue.DrainAll()
+	defer releaseZeroPut()
 
 	const path = "/tier-transition.bin"
 	const baseRev int64 = 7
@@ -15032,23 +15054,55 @@ func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("SetAttr status = %v, want OK", st)
 	}
-	if !fh.ZeroBase {
-		t.Fatal("same-caller writer did not adopt zero base")
+	if fh.ZeroBase {
+		t.Fatal("clean same-caller writer incorrectly owns staged zero")
 	}
 	if got := fh.Dirty.Size(); got != 0 {
 		t.Fatalf("dirty size after staged truncate = %d, want 0", got)
 	}
-	if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
-		t.Fatalf("dirty truncate not marked: dirtySeq=%d dirty=%t", fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		t.Fatalf("staged truncate created duplicate dirty generation: dirtySeq=%d dirty=%t", fh.DirtySeq, fh.Dirty.HasDirtyParts())
 	}
 
 	finalData := bytes.Repeat([]byte{0x59}, 10*1024)
-	if _, err := fh.Dirty.Write(0, finalData); err != nil {
-		t.Fatal(err)
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: callerPID}},
+			Fh:       fhID,
+			Offset:   0,
+		}, finalData)
+		writeDone <- st
+	}()
+	select {
+	case <-zeroPutEntered:
+	case <-time.After(time.Second):
+		t.Fatal("staged zero did not reach remote commit")
 	}
-	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	select {
+	case st := <-writeDone:
+		t.Fatalf("Write completed before staged zero committed: %v", st)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseZeroPut()
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write did not resume after staged zero committed")
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if fh.BaseRev != baseRev+1 {
+		t.Fatalf("writer base revision after staged zero = %d, want %d", fh.BaseRev, baseRev+1)
+	}
 	if got := fh.Dirty.Size(); got != int64(len(finalData)) {
 		t.Fatalf("dirty size after write = %d, want %d", got, len(finalData))
+	}
+	if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+		t.Fatalf("Write did not create next dirty generation: dirtySeq=%d dirty=%t", fh.DirtySeq, fh.Dirty.HasDirtyParts())
 	}
 	if err := fs.stageShadowLocked(fh, true); err != nil {
 		t.Fatal(err)

@@ -1825,13 +1825,18 @@ func TestWriteBackTierTransitionOpenThenSetAttrRebasesWriterAcrossPIDs(t *testin
 		parts    map[int][]byte
 	}
 	var (
-		mu            sync.Mutex
-		content             = bytes.Repeat([]byte{0x11}, smallSize)
-		revision      int64 = 1
-		directPuts    int
-		completeCalls int
-		active        multipartState
+		mu             sync.Mutex
+		content              = bytes.Repeat([]byte{0x11}, smallSize)
+		revision       int64 = 1
+		directPuts     int
+		completeCalls  int
+		active         multipartState
+		zeroPutEntered = make(chan struct{})
+		allowZeroPut   = make(chan struct{})
+		allowZeroOnce  sync.Once
 	)
+	releaseZeroPut := func() { allowZeroOnce.Do(func() { close(allowZeroPut) }) }
+	defer releaseZeroPut()
 
 	checkExpected := func(raw string) bool {
 		if raw == "" {
@@ -1866,6 +1871,14 @@ func TestWriteBackTierTransitionOpenThenSetAttrRebasesWriterAcrossPIDs(t *testin
 				t.Errorf("read direct PUT body: %v", err)
 				http.Error(w, "read body", http.StatusInternalServerError)
 				return
+			}
+			if len(body) == 0 {
+				select {
+				case <-zeroPutEntered:
+				default:
+					close(zeroPutEntered)
+				}
+				<-allowZeroPut
 			}
 			mu.Lock()
 			defer mu.Unlock()
@@ -2069,17 +2082,45 @@ func TestWriteBackTierTransitionOpenThenSetAttrRebasesWriterAcrossPIDs(t *testin
 	}}, &attrOut); st != gofuse.OK {
 		t.Fatalf("SetAttr truncate status = %v, want OK", st)
 	}
-	queue.WaitPath(path)
+	large := bytes.Repeat([]byte{0x2b}, largeSize)
+	const chunkSize = 1024 * 1024
+	firstWriteDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+			Fh:       second.Fh,
+			Offset:   0,
+		}, large[:chunkSize])
+		firstWriteDone <- st
+	}()
+	select {
+	case <-zeroPutEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued zero did not reach direct PUT")
+	}
+	select {
+	case st := <-firstWriteDone:
+		t.Fatalf("PID B Write completed before queued zero committed: %v", st)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseZeroPut()
+	select {
+	case st := <-firstWriteDone:
+		if st != gofuse.OK {
+			t.Fatalf("first PID B Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PID B Write did not resume after queued zero committed")
+	}
 	secondFH, _ := fs.fileHandles.Get(second.Fh)
 	secondFH.Lock()
-	if secondFH.BaseRev != 2 || writableHandleHasPendingContentLocked(secondFH) || secondFH.Dirty.Size() != 0 {
-		t.Fatalf("PID B handle after queued truncate = base %d pending %t size %d, want base 2 pending false size 0",
-			secondFH.BaseRev, writableHandleHasPendingContentLocked(secondFH), secondFH.Dirty.Size())
+	if secondFH.BaseRev != 2 || !writableHandleHasPendingContentLocked(secondFH) || secondFH.Dirty.Size() != chunkSize {
+		t.Fatalf("PID B handle after first Write = base %d pending %t size %d, want base 2 pending true size %d",
+			secondFH.BaseRev, writableHandleHasPendingContentLocked(secondFH), secondFH.Dirty.Size(), chunkSize)
 	}
 	secondFH.Unlock()
-	large := bytes.Repeat([]byte{0x2b}, largeSize)
-	for offset := 0; offset < len(large); offset += 1024 * 1024 {
-		end := min(offset+1024*1024, len(large))
+	for offset := chunkSize; offset < len(large); offset += chunkSize {
+		end := min(offset+chunkSize, len(large))
 		if _, st := fs.Write(nil, &gofuse.WriteIn{
 			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
 			Fh:       second.Fh,
