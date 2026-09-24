@@ -2991,10 +2991,9 @@ func TestGitWorkspaceDependencyDirUsesLocalOverlay(t *testing.T) {
 
 	localRoot := t.TempDir()
 	opts := &MountOptions{
-		LocalRoot:                    localRoot,
-		Profile:                      MountProfileCodingAgent,
-		EnableGitWorkspaces:          true,
-		DisableGitignoreAwareOverlay: true,
+		LocalRoot:           localRoot,
+		Profile:             MountProfileCodingAgent,
+		EnableGitWorkspaces: true,
 	}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
@@ -3249,7 +3248,7 @@ func TestGitignoreAwareGateRequiresRepositoryIgnore(t *testing.T) {
 
 	// Root ignores the Cargo target; crates/foo ignores its own target. A
 	// directory named `target` under crates/ (no same-directory rule) is not
-	// ignored, and node_modules is ignored so the dependency default confirms.
+	// ignored. node_modules is listed in [local] and overlaid unconditionally.
 	fixture, localRoot := newGitIgnoreFixture(t, map[string]string{
 		".gitignore":            "/target/\n/node_modules/\n",
 		"crates/foo/.gitignore": "target/\n",
@@ -3282,17 +3281,16 @@ func TestGitignoreAwareGateRequiresRepositoryIgnore(t *testing.T) {
 		}
 	}
 
-	// Matched by a default pattern but NOT ignored by the repository:
-	// remote-persistent.
-	for _, path := range []string{
-		// crates/.gitignore does not exist; only the root rule ignores target,
-		// and it is anchored to the root.
-		"/repo/crates/target/debug/app",
-		"/repo/src/node_modules/kept/index.js",
-	} {
-		if got := fs.observePathPolicy(path); got != PathLayerRemotePersistent {
-			t.Errorf("Classify(%q) = %s, want remote persistent", path, got)
-		}
+	// Within the gitignore-aware list, a match NOT ignored by the repository is
+	// remote-persistent: crates/.gitignore does not exist, and the root rule is
+	// anchored to the root, so crates/target is not ignored.
+	if got := fs.observePathPolicy("/repo/crates/target/debug/app"); got != PathLayerRemotePersistent {
+		t.Errorf("unignored crates/target = %s, want remote persistent", got)
+	}
+	// node_modules is in [local], not the gated list, so it overlays even when
+	// the repository does not ignore it.
+	if got := fs.observePathPolicy("/repo/src/node_modules/kept/index.js"); got != PathLayerLocalOnly {
+		t.Errorf("ungated node_modules = %s, want local-only", got)
 	}
 	// A tracked clean file is never treated as ignored output.
 	if got := fs.observePathPolicy("/repo/src/app.py"); got != PathLayerRemotePersistent {
@@ -3300,10 +3298,10 @@ func TestGitignoreAwareGateRequiresRepositoryIgnore(t *testing.T) {
 	}
 }
 
-// TestGitignoreAwareGateDisabledOverlaysPatternMatches covers the opt-out: when
-// gitignore-aware is disabled, a local-only pattern overlays its matches
-// regardless of the repository's ignore rules.
-func TestGitignoreAwareGateDisabledOverlaysPatternMatches(t *testing.T) {
+// TestLocalOnlyUngatedOverlaysRegardlessOfGitignore covers the [local] /
+// --local-only contract: matched paths overlay unconditionally, without
+// consulting the repository.
+func TestLocalOnlyUngatedOverlaysRegardlessOfGitignore(t *testing.T) {
 	treeNodes := []client.GitTreeNode{
 		{
 			WorkspaceID: "ws1",
@@ -3315,16 +3313,17 @@ func TestGitignoreAwareGateDisabledOverlaysPatternMatches(t *testing.T) {
 			ObjectSHA:   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		},
 	}
+	// The repository ignores nothing relevant here.
 	fixture, localRoot := newGitIgnoreFixture(t, map[string]string{
 		".gitignore": "*.log\n",
 	}, treeNodes)
 
 	opts := &MountOptions{
-		LocalRoot:                    localRoot,
-		Profile:                      MountProfileCodingAgent,
-		EnableGitWorkspaces:          true,
-		LocalOnlyPatterns:            []string{"**/scratch/**"},
-		DisableGitignoreAwareOverlay: true,
+		LocalRoot:                   localRoot,
+		Profile:                     MountProfileCodingAgent,
+		EnableGitWorkspaces:         true,
+		LocalOnlyPatterns:           []string{"**/scratch/**"},
+		LocalGitignoreAwarePatterns: []string{"**/gen/**"},
 	}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
@@ -3332,24 +3331,33 @@ func TestGitignoreAwareGateDisabledOverlaysPatternMatches(t *testing.T) {
 		t.Fatalf("ensureGitWorkspaces: %v", err)
 	}
 
+	// [local]/--local-only: overlaid even though not ignored.
 	if got := fs.observePathPolicy("/repo/scratch/file.bin"); got != PathLayerLocalOnly {
-		t.Errorf("scratch with gitignore-aware disabled = %s, want local-only", got)
+		t.Errorf("ungated scratch = %s, want local-only", got)
 	}
-	// A default dependency pattern still overlays unconditionally too.
+	// node_modules is ungated too.
 	if got := fs.observePathPolicy("/repo/node_modules/x/y.js"); got != PathLayerLocalOnly {
-		t.Errorf("node_modules with gitignore-aware disabled = %s, want local-only", got)
+		t.Errorf("ungated node_modules = %s, want local-only", got)
+	}
+	// [local-gitignore-aware]/--local-only-gitignore-aware: gated, and this
+	// repository does not ignore gen/, so it stays remote.
+	if got := fs.observePathPolicy("/repo/gen/out.bin"); got != PathLayerRemotePersistent {
+		t.Errorf("gated but unignored gen = %s, want remote persistent", got)
+	}
+	// An ignored path under the gated list overlays.
+	if got := fs.observePathPolicy("/repo/src/notes.log"); got == PathLayerLocalOnly {
+		t.Errorf("log is not a gated pattern, should not be local-only: %s", got)
 	}
 }
 
 // TestGitignoreAwareGateFailsOpenWithoutWorkspace covers the case where no Git
-// workspace is loaded: the gate cannot confirm anything, so a pattern match
-// keeps its overlay rather than being dropped.
+// workspace is loaded: the gate cannot confirm anything, so a gated pattern
+// match keeps its overlay rather than being dropped.
 func TestGitignoreAwareGateFailsOpenWithoutWorkspace(t *testing.T) {
 	opts := &MountOptions{
-		LocalRoot:                    t.TempDir(),
-		Profile:                      MountProfileCodingAgent,
-		LocalOnlyPatterns:            []string{"**/scratch/**"},
-		DisableGitignoreAwareOverlay: false,
+		LocalRoot:                   t.TempDir(),
+		Profile:                     MountProfileCodingAgent,
+		LocalGitignoreAwarePatterns: []string{"**/scratch/**"},
 	}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
@@ -3386,15 +3394,16 @@ func TestGitignoreAwareGateFailsOpenWhenOracleUnavailable(t *testing.T) {
 		t.Fatalf("ensureGitWorkspaces: %v", err)
 	}
 
-	confirmed, verified := fs.gitIgnoreConfirmsLocalOnly(context.Background(), "/repo/node_modules/x/y.js", false)
+	// target is on the gated list by default.
+	confirmed, verified := fs.gitIgnoreConfirmsLocalOnly(context.Background(), "/repo/target/debug/app", false)
 	if verified {
 		t.Fatalf("oracle reported verified=%t without a work tree, want unverified", verified)
 	}
 	if confirmed {
 		t.Fatal("unverified oracle must not report confirmed")
 	}
-	if got := fs.observePathPolicy("/repo/node_modules/x/y.js"); got != PathLayerLocalOnly {
-		t.Errorf("node_modules with an unavailable oracle = %s, want local-only (fail open)", got)
+	if got := fs.observePathPolicy("/repo/target/debug/app"); got != PathLayerLocalOnly {
+		t.Errorf("gated target with an unavailable oracle = %s, want local-only (fail open)", got)
 	}
 }
 
@@ -3491,7 +3500,8 @@ func TestGitIgnoredAncestorCached(t *testing.T) {
 
 // TestGitignoreAwareAmortizesWithinIgnoredDir verifies that confirming one file
 // under an ignored directory caches the directory, so sibling files do not each
-// spawn a `git check-ignore`. This bounds the per-file cost of the gate.
+// spawn a `git check-ignore`. This bounds the per-file cost of the gate. It uses
+// a gated pattern (`target`), since the gate only runs for gated matches.
 func TestGitignoreAwareAmortizesWithinIgnoredDir(t *testing.T) {
 	treeNodes := []client.GitTreeNode{
 		{
@@ -3515,7 +3525,7 @@ func TestGitignoreAwareAmortizesWithinIgnoredDir(t *testing.T) {
 		},
 	}
 	fixture, localRoot := newGitIgnoreFixture(t, map[string]string{
-		".gitignore": "node_modules/\n",
+		".gitignore": "target/\n",
 	}, treeNodes)
 
 	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
@@ -3525,16 +3535,16 @@ func TestGitignoreAwareAmortizesWithinIgnoredDir(t *testing.T) {
 		t.Fatalf("ensureGitWorkspaces: %v", err)
 	}
 
-	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/deep/a/node_modules/f000.js")
+	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/deep/a/target/f000.o")
 	if !ok || rt == nil {
 		t.Fatal("expected a loaded workspace for the fixture")
 	}
 
 	// First file: real check-ignore, which also confirms and caches the parent.
-	if got := fs.observePathPolicy("/repo/deep/a/node_modules/f000.js"); got != PathLayerLocalOnly {
+	if got := fs.observePathPolicy("/repo/deep/a/target/f000.o"); got != PathLayerLocalOnly {
 		t.Fatalf("first file = %s, want local-only", got)
 	}
-	parentKey := gitIgnoreCacheKey(rt, "deep/a/node_modules", true)
+	parentKey := gitIgnoreCacheKey(rt, "deep/a/target", true)
 	fs.git.mu.Lock()
 	parentIgnored, cached := fs.git.ignoreCache[parentKey]
 	fs.git.mu.Unlock()
@@ -3545,10 +3555,10 @@ func TestGitignoreAwareAmortizesWithinIgnoredDir(t *testing.T) {
 	// A sibling file must now be confirmed straight from the cached ancestor,
 	// with no new check-ignore. Assert the ancestor path is what the short
 	// circuit consults.
-	if !fs.gitIgnoredAncestorCached(rt, "deep/a/node_modules/f001.js") {
+	if !fs.gitIgnoredAncestorCached(rt, "deep/a/target/f001.o") {
 		t.Fatal("sibling should be confirmed by the cached parent directory")
 	}
-	if got := fs.observePathPolicy("/repo/deep/a/node_modules/f001.js"); got != PathLayerLocalOnly {
+	if got := fs.observePathPolicy("/repo/deep/a/target/f001.o"); got != PathLayerLocalOnly {
 		t.Errorf("sibling = %s, want local-only", got)
 	}
 }

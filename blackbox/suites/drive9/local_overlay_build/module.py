@@ -586,15 +586,10 @@ class Drive9LocalOverlayBuild(Drive9WorkflowBase):
         extra: list[str] = []
         if bool(cfg.get("allow_other", False)):
             extra.append("--allow-other")
-        patterns = self.extra_local_only_patterns(ctx, repo)
-        for pattern in patterns:
+        # --local-only is overlapped unconditionally, so the module's configured
+        # build-output patterns do not need the gitignore-aware gate.
+        for pattern in self.extra_local_only_patterns(ctx, repo):
             extra.extend(["--local-only", pattern])
-        if patterns:
-            # This module routes configured build output to the local overlay to
-            # benchmark local builds. Its patterns are deliberate, so opt out of
-            # the gitignore-aware gate (which would drop any pattern the target
-            # repo does not happen to list in its .gitignore).
-            extra.append("--local-only-gitignore-aware=false")
         return extra
 
     def extra_local_only_patterns(self, ctx: Context, repo: dict[str, Any]) -> list[str]:

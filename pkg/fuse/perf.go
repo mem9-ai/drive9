@@ -440,7 +440,9 @@ func (p *fusePerfCounters) recordLocalPolicy(source policyMatchSource) {
 		return
 	}
 	switch source {
-	case policyMatchLocalOnly:
+	case policyMatchLocalOnly, policyMatchLocalGated:
+		// Both are local-only overlays; recordLocalPolicy is called after the
+		// gitignore gate, so a gated match counted here stayed local.
 		p.localPolicyLocalOnly.add(1)
 	case policyMatchRemoteOverride:
 		p.localPolicyRemoteOverride.add(1)

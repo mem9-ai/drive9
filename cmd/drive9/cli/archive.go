@@ -194,20 +194,25 @@ func Archive(c *client.Client, args []string) error {
 // buildArchiveOptions merges profile rules with explicit flags into
 // client.ArchiveOptions.
 //
-//	exclude           = profile.[local]  + --exclude
+//	exclude           = profile.[local] + profile.[local-gitignore-aware] + --exclude
 //	include-override  = profile.[remote]                (override, restores an excluded path)
 //	include-whitelist = --include                        (only these are kept when non-empty)
+//
+// A bulk archive has no Git ignore oracle, so [local-gitignore-aware] patterns
+// are applied directly as excludes (the same set a mount would overlay when the
+// repository ignores them).
 func buildArchiveOptions(profileName string, includes, excludes stringListFlag, format string, flat bool, jobs int) (client.ArchiveOptions, error) {
-	var profileLocalOnly, profileRemoteOnly []string
+	var profileLocalOnly, profileLocalGitignoreAware, profileRemoteOnly []string
 	if strings.TrimSpace(profileName) != "" {
 		cfg, err := loadProfileConfig(profileName)
 		if err != nil {
 			return client.ArchiveOptions{}, fmt.Errorf("load profile %q: %w", profileName, err)
 		}
 		profileLocalOnly = cfg.LocalOnlyPatterns
+		profileLocalGitignoreAware = cfg.LocalGitignoreAwarePatterns
 		profileRemoteOnly = cfg.RemoteOnlyPatterns
 	}
-	excludePatterns := mergeProfileValues(profileLocalOnly, []string(excludes))
+	excludePatterns := mergeProfileValues(profileLocalOnly, profileLocalGitignoreAware, []string(excludes))
 	includePatterns := mergeProfileValues(nil, []string(includes))
 	overridePatterns := mergeProfileValues(profileRemoteOnly)
 

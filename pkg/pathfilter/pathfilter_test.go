@@ -204,6 +204,9 @@ func TestMatcherExcludeOverridesInclude(t *testing.T) {
 	}
 }
 
+// The union of the coding-agent [local] and [local-gitignore-aware] defaults.
+// The FUSE layer gates the second list on the repository's ignore rules; bulk
+// archive applies both directly, which is what this matcher models.
 func TestCodingAgentDefaultPatternsDropDependencyAndBuildOutput(t *testing.T) {
 	patterns := []string{"**/node_modules/**", "**/.venv/**", "**/target/**"}
 	m := NewMatcher(nil, patterns, nil)

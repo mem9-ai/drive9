@@ -29,17 +29,26 @@ const (
 	policyMatchDisabled       policyMatchSource = "disabled"
 	policyMatchRemoteDefault  policyMatchSource = "remote_default"
 	policyMatchLocalOnly      policyMatchSource = "local_only"
+	policyMatchLocalGated     policyMatchSource = "local_gitignore_aware"
 	policyMatchRemoteOverride policyMatchSource = "remote_override"
 )
 
+// LocalPolicy routes paths to the local overlay or remote-persistent storage.
+//
+// There are two local lists with different confirmation rules:
+//
+//   - localOnly is overlaid unconditionally.
+//   - localGitignoreAware is overlaid only when the repository's Git ignore
+//     rules also ignore the path (see Dat9FS.observePathPolicyWithHint). This
+//     keeps a directory that merely shares a name with generated output out of
+//     the overlay.
+//
+// remoteOnly wins over both.
 type LocalPolicy struct {
-	enabled bool
-	// gitignoreAware requires a path matched by a local-only pattern to also be
-	// ignored by its repository's Git ignore rules before it is overlaid. It
-	// defaults to true; see MountOptions.LocalOnlyGitignoreAware.
-	gitignoreAware bool
-	localOnly      []pathfilter.Pattern
-	remoteOnly     []pathfilter.Pattern
+	enabled             bool
+	localOnly           []pathfilter.Pattern
+	localGitignoreAware []pathfilter.Pattern
+	remoteOnly          []pathfilter.Pattern
 }
 
 // AppendLogMatcher recognizes operator-declared append-log paths without
@@ -68,9 +77,10 @@ func (matcher *AppendLogMatcher) Matches(localPath string) bool {
 	return false
 }
 
-func NewLocalPolicy(profile string, localOnlyPatterns []string, remoteOnlyPatterns []string, gitignoreAware bool) *LocalPolicy {
-	policy := &LocalPolicy{gitignoreAware: gitignoreAware}
-	if !profileAllowsLocalPolicy(profile) && len(localOnlyPatterns) == 0 && len(remoteOnlyPatterns) == 0 {
+func NewLocalPolicy(profile string, localOnlyPatterns, localGitignoreAwarePatterns, remoteOnlyPatterns []string) *LocalPolicy {
+	policy := &LocalPolicy{}
+	if !profileAllowsLocalPolicy(profile) &&
+		len(localOnlyPatterns) == 0 && len(localGitignoreAwarePatterns) == 0 && len(remoteOnlyPatterns) == 0 {
 		return policy
 	}
 
@@ -78,6 +88,9 @@ func NewLocalPolicy(profile string, localOnlyPatterns []string, remoteOnlyPatter
 	localPatterns := append([]string{}, defaultCodingAgentLocalOnlyPatterns(profile)...)
 	localPatterns = append(localPatterns, localOnlyPatterns...)
 	policy.localOnly = pathfilter.CompileAll(localPatterns)
+	gatedPatterns := append([]string{}, defaultCodingAgentGitignoreAwarePatterns(profile)...)
+	gatedPatterns = append(gatedPatterns, localGitignoreAwarePatterns...)
+	policy.localGitignoreAware = pathfilter.CompileAll(gatedPatterns)
 	policy.remoteOnly = pathfilter.CompileAll(remoteOnlyPatterns)
 	return policy
 }
@@ -112,32 +125,36 @@ func validMountProfileName(profile string) bool {
 	return true
 }
 
+// defaultCodingAgentLocalOnlyPatterns are overlaid unconditionally. Only
+// dependency trees are listed: their names are unambiguous generated trees, so
+// there is no need to consult the repository. VCS metadata is deliberately
+// absent: `.git` state is kept local only inside a Git workspace, and is
+// remote-persistent elsewhere.
 func defaultCodingAgentLocalOnlyPatterns(profile string) []string {
 	if profile != MountProfileCodingAgent {
 		return nil
 	}
-	// Only dependency and heavy build-output trees are listed: Node
-	// dependencies, Python virtualenvs, and Rust build output. By default the
-	// gitignore-aware gate (see LocalPolicy.gitignoreAware) further requires
-	// each of these paths to be ignored by the repository, so a directory that
-	// merely shares a name with generated output is not overlaid. VCS metadata
-	// is deliberately absent: `.git` state is kept local only inside a Git
-	// workspace, and is remote-persistent elsewhere.
 	return []string{
 		"**/node_modules/**",
 		"**/.venv/**",
+	}
+}
+
+// defaultCodingAgentGitignoreAwarePatterns are overlaid only when the
+// repository's Git ignore rules also ignore them. Rust build output is listed
+// here because `target` is a common directory name that is not always build
+// output.
+func defaultCodingAgentGitignoreAwarePatterns(profile string) []string {
+	if profile != MountProfileCodingAgent {
+		return nil
+	}
+	return []string{
 		"**/target/**",
 	}
 }
 
 func (policy *LocalPolicy) Enabled() bool {
 	return policy != nil && policy.enabled
-}
-
-// GitignoreAware reports whether local-only pattern matches require
-// confirmation from the repository's Git ignore rules before being overlaid.
-func (policy *LocalPolicy) GitignoreAware() bool {
-	return policy != nil && policy.enabled && policy.gitignoreAware
 }
 
 func (policy *LocalPolicy) Classify(localPath string) PathLayer {
@@ -163,6 +180,11 @@ func (policy *LocalPolicy) classifyWithSource(localPath string) (PathLayer, poli
 			return PathLayerLocalOnly, policyMatchLocalOnly
 		}
 	}
+	for _, pattern := range policy.localGitignoreAware {
+		if pattern.MatchCanonical(cleaned) {
+			return PathLayerLocalOnly, policyMatchLocalGated
+		}
+	}
 	return PathLayerRemotePersistent, policyMatchRemoteDefault
 }
 
@@ -183,10 +205,10 @@ func (fs *Dat9FS) observePathPolicyWithHint(ctx context.Context, localPath strin
 		return PathLayerRemotePersistent
 	}
 	layer, source := fs.localPolicy.classifyWithSource(localPath)
-	if layer == PathLayerLocalOnly && source == policyMatchLocalOnly && fs.localPolicy.GitignoreAware() {
-		// A local-only pattern is honored only when the repository also ignores
-		// the path. When no Git ignore oracle is available (no loaded
-		// workspace) the pattern stands on its own.
+	if layer == PathLayerLocalOnly && source == policyMatchLocalGated {
+		// A path matched by a gitignore-aware pattern is overlaid only when the
+		// repository also ignores it. When no Git ignore oracle is available (no
+		// loaded workspace) the pattern stands on its own.
 		if confirmed, verified := fs.gitIgnoreConfirmsLocalOnly(ctx, localPath, dirHint); verified && !confirmed {
 			layer = PathLayerRemotePersistent
 			source = policyMatchRemoteDefault
@@ -219,8 +241,8 @@ func canonicalPolicyPath(value string) (string, error) {
 	return strings.TrimPrefix(cleaned, "/"), nil
 }
 
-func validateLocalPolicyPatterns(localOnlyPatterns []string, remoteOnlyPatterns []string) error {
-	return pathfilter.Validate(localOnlyPatterns, remoteOnlyPatterns)
+func validateLocalPolicyPatterns(localOnlyPatterns, localGitignoreAwarePatterns, remoteOnlyPatterns []string) error {
+	return pathfilter.Validate(localOnlyPatterns, localGitignoreAwarePatterns, remoteOnlyPatterns)
 }
 
 func validateAppendLogPatterns(patterns []string) error {

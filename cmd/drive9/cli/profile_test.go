@@ -131,18 +131,21 @@ func TestBuiltinCodingAgentDefaultsOmitVCSMetadata(t *testing.T) {
 	}
 }
 
-func TestProfileLocalOnlyGitignoreAwareRoundTrip(t *testing.T) {
-	writeTestProfile(t, "no-gate", "local-only-gitignore-aware = false\n[local]\n**/scratch/**\n")
-	cfg, err := loadProfileConfig("no-gate")
+func TestProfileLocalGitignoreAwareSectionRoundTrip(t *testing.T) {
+	writeTestProfile(t, "gated", "[local]\n**/node_modules/**\n[local-gitignore-aware]\n**/target/**\n")
+	cfg, err := loadProfileConfig("gated")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.LocalOnlyGitignoreAware == nil || *cfg.LocalOnlyGitignoreAware {
-		t.Fatalf("LocalOnlyGitignoreAware = %v, want explicit false", cfg.LocalOnlyGitignoreAware)
+	if !reflect.DeepEqual(cfg.LocalOnlyPatterns, []string{"**/node_modules/**"}) {
+		t.Fatalf("LocalOnlyPatterns = %v", cfg.LocalOnlyPatterns)
+	}
+	if !reflect.DeepEqual(cfg.LocalGitignoreAwarePatterns, []string{"**/target/**"}) {
+		t.Fatalf("LocalGitignoreAwarePatterns = %v", cfg.LocalGitignoreAwarePatterns)
 	}
 	out := formatProfileConfig(cfg)
-	if !strings.Contains(out, "local-only-gitignore-aware = false") {
-		t.Fatalf("formatted profile missing setting: %q", out)
+	if !strings.Contains(out, "[local-gitignore-aware]\n**/target/**\n") {
+		t.Fatalf("formatted profile missing gated section: %q", out)
 	}
 	roundTrip, err := parseProfileConfig(cfg.Name, cfg.Source, out)
 	if err != nil {
@@ -153,40 +156,29 @@ func TestProfileLocalOnlyGitignoreAwareRoundTrip(t *testing.T) {
 	}
 }
 
-func TestBuiltinProfilesDefaultGitignoreAwareTrue(t *testing.T) {
+func TestBuiltinProfilesSeparateGatedPatterns(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	for _, name := range []string{"", "coding-agent", "portable", "coding-agent-extent"} {
 		cfg, err := loadProfileConfig(name)
 		if err != nil {
 			t.Fatalf("loadProfileConfig(%q): %v", name, err)
 		}
-		if cfg.LocalOnlyGitignoreAware == nil || !*cfg.LocalOnlyGitignoreAware {
-			t.Fatalf("builtin %q gitignore-aware = %v, want explicit true", name, cfg.LocalOnlyGitignoreAware)
+		if !reflect.DeepEqual(cfg.LocalOnlyPatterns, []string{"**/node_modules/**", "**/.venv/**"}) {
+			t.Fatalf("builtin %q LocalOnlyPatterns = %v", name, cfg.LocalOnlyPatterns)
 		}
-		// Show must surface the setting so it is discoverable.
-		if out := formatProfileConfig(cfg); !strings.Contains(out, "local-only-gitignore-aware = true") {
-			t.Fatalf("builtin %q show output missing setting: %q", name, out)
+		if !reflect.DeepEqual(cfg.LocalGitignoreAwarePatterns, []string{"**/target/**"}) {
+			t.Fatalf("builtin %q LocalGitignoreAwarePatterns = %v", name, cfg.LocalGitignoreAwarePatterns)
 		}
-	}
-}
-
-func TestProfileShowOmitsGitignoreAwareForNonOverlay(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	for _, name := range []string{"none", "extent"} {
-		cfg, err := loadProfileConfig(name)
-		if err != nil {
-			t.Fatalf("loadProfileConfig(%q): %v", name, err)
-		}
-		if out := formatProfileConfig(cfg); strings.Contains(out, localOnlyGitignoreAwareKey) {
-			t.Fatalf("%q is not an overlay profile and should not print the setting: %q", name, out)
+		if out := formatProfileConfig(cfg); !strings.Contains(out, "[local-gitignore-aware]\n**/target/**\n") {
+			t.Fatalf("builtin %q show output missing gated section: %q", name, out)
 		}
 	}
 }
 
-func TestProfileLocalOnlyGitignoreAwareRejectsUnknownValue(t *testing.T) {
-	writeTestProfile(t, "bad", "local-only-gitignore-aware = maybe\n[local]\n**/scratch/**\n")
+func TestProfileRejectsUnknownSection(t *testing.T) {
+	writeTestProfile(t, "bad", "[locl]\n**/scratch/**\n")
 	if _, err := loadProfileConfig("bad"); err == nil {
-		t.Fatal("invalid boolean should fail profile parsing")
+		t.Fatal("unknown section should fail profile parsing")
 	}
 }
 

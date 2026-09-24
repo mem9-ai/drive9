@@ -610,10 +610,11 @@ async function buildMatcher(client: Client, opts: ArchiveOptions): Promise<Match
   return m;
 }
 
-// Mirrors the Go CLI's coding-agent default skip set: dependency and
-// build-output trees. The Go mount layer additionally requires these paths to
-// be ignored by the repository (local-only-gitignore-aware); a bulk archive
-// has no such oracle and applies the patterns directly.
+// Mirrors the Go CLI's coding-agent default skip set. The Go mount layer
+// splits these into [local] (node_modules, .venv — overlaid unconditionally)
+// and [local-gitignore-aware] (target — overlaid only when the repository
+// ignores it). A bulk archive has no Git ignore oracle, so it applies the union
+// directly.
 export const codingAgentLocalOnly = [
   "**/node_modules/**",
   "**/.venv/**",

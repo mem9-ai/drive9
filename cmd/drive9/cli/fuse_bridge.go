@@ -60,8 +60,8 @@ type mountFuseOptions struct {
 	CheckpointRef                string
 	LocalRoot                    string
 	LocalOnlyPatterns            []string
+	LocalGitignoreAwarePatterns  []string
 	RemoteOnlyPatterns           []string
-	LocalOnlyGitignoreAware      bool
 	AppendLogPatterns            []string
 	PackPaths                    []string
 	ExtentPaths                  []string

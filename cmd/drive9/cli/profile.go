@@ -25,15 +25,10 @@ type profileConfig struct {
 	AppendLogPatterns  []string
 	PackPaths          []string
 	ExtentPatterns     []string
-	// LocalOnlyGitignoreAware gates whether a local-only pattern overlays a
-	// path unconditionally (false) or only when the repository's Git ignore
-	// rules also ignore it (true). nil means unset, which defaults to true.
-	LocalOnlyGitignoreAware *bool
+	// LocalGitignoreAwarePatterns are local-only patterns overlaid only when
+	// the repository's Git ignore rules also ignore the path.
+	LocalGitignoreAwarePatterns []string
 }
-
-// localOnlyGitignoreAwareKey is the profile setting name, also the suffix of
-// the --local-only-gitignore-aware CLI flag.
-const localOnlyGitignoreAwareKey = "local-only-gitignore-aware"
 
 func Profile(args []string) error {
 	if len(args) == 0 {
@@ -166,24 +161,24 @@ func builtinExtentProfile() profileConfig {
 
 func builtinCodingAgentProfile() profileConfig {
 	return profileConfig{
-		Name:                    defaultMountProfile,
-		Source:                  "builtin:coding-agent",
-		LocalOnlyPatterns:       builtinCodingAgentLocalOnlyPatterns(),
-		RemoteOnlyPatterns:      nil,
-		LocalOnlyGitignoreAware: boolPtr(true),
-		AppendLogPatterns:       []string{"**/*-wal"},
-		PackPaths:               nil,
+		Name:                        defaultMountProfile,
+		Source:                      "builtin:coding-agent",
+		LocalOnlyPatterns:           builtinCodingAgentLocalOnlyPatterns(),
+		RemoteOnlyPatterns:          nil,
+		LocalGitignoreAwarePatterns: builtinCodingAgentGitignoreAwarePatterns(),
+		AppendLogPatterns:           []string{"**/*-wal"},
+		PackPaths:                   nil,
 	}
 }
 
 func builtinPortableProfile() profileConfig {
 	return profileConfig{
-		Name:                    portableMountProfile,
-		Source:                  "builtin:portable",
-		LocalOnlyPatterns:       builtinCodingAgentLocalOnlyPatterns(),
-		RemoteOnlyPatterns:      nil,
-		LocalOnlyGitignoreAware: boolPtr(true),
-		PackPaths:               []string{"/"},
+		Name:                        portableMountProfile,
+		Source:                      "builtin:portable",
+		LocalOnlyPatterns:           builtinCodingAgentLocalOnlyPatterns(),
+		RemoteOnlyPatterns:          nil,
+		LocalGitignoreAwarePatterns: builtinCodingAgentGitignoreAwarePatterns(),
+		PackPaths:                   []string{"/"},
 	}
 }
 
@@ -214,26 +209,32 @@ func mergeProfileValues(groups ...[]string) []string {
 	return out
 }
 
-// builtinCodingAgentLocalOnlyPatterns is the shared local-only overlay policy
-// for the coding-agent, coding-agent-extent, and portable profiles.
+// builtinCodingAgentLocalOnlyPatterns is the shared [local] overlay policy for
+// the coding-agent, coding-agent-extent, and portable profiles. These paths are
+// overlaid unconditionally.
 //
-// By default the gitignore-aware gate (see the profile-level
-// local-only-gitignore-aware setting) requires each matched path to also be
-// ignored by the repository. Other build/cache output stays remote-persistent;
-// VCS metadata is absent because `.git` is kept local only inside a Git
-// workspace and is remote-persistent elsewhere.
+// Only dependency trees are listed: their names unambiguously denote generated
+// trees. Other build/cache output stays remote-persistent; VCS metadata is
+// absent because `.git` is kept local only inside a Git workspace.
 func builtinCodingAgentLocalOnlyPatterns() []string {
 	return []string{
 		"**/node_modules/**",
 		"**/.venv/**",
+	}
+}
+
+// builtinCodingAgentGitignoreAwarePatterns is the shared [local-gitignore-aware]
+// policy: paths overlaid only when the repository's Git ignore rules also
+// ignore them. Rust build output is here because `target` is a common
+// directory name that is not always build output.
+func builtinCodingAgentGitignoreAwarePatterns() []string {
+	return []string{
 		"**/target/**",
 	}
 }
 
 func parseProfileConfig(name, source, body string) (profileConfig, error) {
-	// Default the gitignore-aware gate to true, matching the built-in behavior;
-	// an explicit `local-only-gitignore-aware = false|true` line overrides it.
-	cfg := profileConfig{Name: name, Source: source, LocalOnlyGitignoreAware: boolPtr(true)}
+	cfg := profileConfig{Name: name, Source: source}
 	section := "local"
 	for lineNo, raw := range strings.Split(body, "\n") {
 		line := strings.TrimSpace(raw)
@@ -243,26 +244,17 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")))
 			switch section {
-			case "local", "remote", "pack", "append-log", "extent":
+			case "local", "local-gitignore-aware", "remote", "pack", "append-log", "extent":
 			default:
 				return profileConfig{}, fmt.Errorf("profile %q line %d: unknown section [%s]", name, lineNo+1, section)
 			}
 			continue
 		}
-		// Profile settings: `key = value`. Only known keys are recognized and
-		// accepted anywhere in the file; anything else is treated as a pattern
-		// for the current section.
-		if key, value, ok := splitProfileSetting(line); ok && key == localOnlyGitignoreAwareKey {
-			parsed, err := parseProfileBool(value)
-			if err != nil {
-				return profileConfig{}, fmt.Errorf("profile %q line %d: %s: %w", name, lineNo+1, localOnlyGitignoreAwareKey, err)
-			}
-			cfg.LocalOnlyGitignoreAware = &parsed
-			continue
-		}
 		switch section {
 		case "local":
 			cfg.LocalOnlyPatterns = append(cfg.LocalOnlyPatterns, line)
+		case "local-gitignore-aware":
+			cfg.LocalGitignoreAwarePatterns = append(cfg.LocalGitignoreAwarePatterns, line)
 		case "remote":
 			cfg.RemoteOnlyPatterns = append(cfg.RemoteOnlyPatterns, line)
 		case "pack":
@@ -282,51 +274,14 @@ func formatProfileConfig(cfg profileConfig) string {
 	if cfg.Source != "" {
 		fmt.Fprintf(&b, "# source: %s\n", cfg.Source)
 	}
-	// Show the setting for every overlay profile so it is discoverable via
-	// `drive9 profile show`; an unset value means the true default.
-	if profileAllowsOverlay(cfg.Name) {
-		aware := true
-		if cfg.LocalOnlyGitignoreAware != nil {
-			aware = *cfg.LocalOnlyGitignoreAware
-		}
-		fmt.Fprintf(&b, "%s = %t\n", localOnlyGitignoreAwareKey, aware)
-	}
 	writeProfileSection(&b, "local", cfg.LocalOnlyPatterns, "no local-only overlay paths")
+	writeProfileSection(&b, "local-gitignore-aware", cfg.LocalGitignoreAwarePatterns,
+		"no gitignore-aware local-only paths")
 	writeProfileSection(&b, "remote", cfg.RemoteOnlyPatterns, "no remote override paths")
 	writeProfileSection(&b, "pack", cfg.PackPaths, "no automatic pack paths")
 	writeProfileSection(&b, "append-log", cfg.AppendLogPatterns, "no append-log optimization paths")
 	writeProfileSection(&b, "extent", cfg.ExtentPatterns, "no extent path patterns")
 	return b.String()
-}
-
-func boolPtr(v bool) *bool { return &v }
-
-// splitProfileSetting splits a `key = value` line. It reports ok only when the
-// line has the exact shape (a non-empty key and a non-empty value around a
-// single '='), so that a path pattern containing '=' is left to the pattern
-// sections.
-func splitProfileSetting(line string) (key, value string, ok bool) {
-	eq := strings.IndexByte(line, '=')
-	if eq < 0 {
-		return "", "", false
-	}
-	key = strings.ToLower(strings.TrimSpace(line[:eq]))
-	value = strings.TrimSpace(line[eq+1:])
-	if key == "" || value == "" {
-		return "", "", false
-	}
-	return key, value, true
-}
-
-func parseProfileBool(value string) (bool, error) {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "true", "1", "yes", "on":
-		return true, nil
-	case "false", "0", "no", "off":
-		return false, nil
-	default:
-		return false, fmt.Errorf("invalid boolean %q", value)
-	}
 }
 
 func writeProfileSection(b *strings.Builder, name string, values []string, emptyComment string) {

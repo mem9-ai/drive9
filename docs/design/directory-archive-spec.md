@@ -25,7 +25,7 @@ drive9 fs archive <remote:/dir> [<out>] [flags]
 | `--format tar.gz\|zip` | `tar.gz` | Archive format |
 | `--exclude <pattern>` | — | Skip paths matching pattern (repeatable) |
 | `--include <pattern>` | — | Keep only paths matching pattern (repeatable) |
-| `--profile <name>` | `none` | Apply profile `[local]`/`[remote]` rules |
+| `--profile <name>` | `none` | Apply profile `[local]`/`[local-gitignore-aware]`/`[remote]` rules |
 | `--jobs <n>` | `16` | Concurrent file downloads |
 | `--stdout` | off | Write archive to stdout (pipe-friendly) |
 | `--flat` | off | Strip directory hierarchy; archive basenames only |
@@ -55,7 +55,7 @@ a bulk-download context). `--profile` loads a profile's rules and translates
 them internally:
 
 ```
-exclude           = profile.[local]  + --exclude          (deduped)
+exclude           = profile.[local] + profile.[local-gitignore-aware] + --exclude  (deduped)
 include-override  = profile.[remote]                    (deduped; profile-only)
 include-whitelist = --include                            (--profile does not participate)
 ```

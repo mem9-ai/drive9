@@ -57,9 +57,9 @@ type MountOptions struct {
 	LayerRef                     string        // optional writable fs layer ref (layer_id, name, or tag ref)
 	CheckpointRef                string        // optional checkpoint ref to restore as the layer view baseline
 	LocalRoot                    string        // local-only overlay root for overlay-profile mounts
-	LocalOnlyPatterns            []string      // additional local-only path patterns for overlay-profile mounts
+	LocalOnlyPatterns            []string      // local-only path patterns overlaid unconditionally for overlay-profile mounts
+	LocalGitignoreAwarePatterns  []string      // local-only path patterns overlaid only when the repository's Git ignore rules also ignore them
 	RemoteOnlyPatterns           []string      // remote-persistent override path patterns for overlay-profile mounts
-	DisableGitignoreAwareOverlay bool          // when false (the default) a local-only pattern overlays a path only if the repository also ignores it; set true to overlay matched paths unconditionally
 	AppendLogPatterns            []string      // remote-persistent files eligible for append-log synchronization
 	PackPaths                    []string      // local overlay paths auto-packed after unmount
 	ExtentPaths                  []string      // path globs created as content_layout=extent
@@ -1311,7 +1311,8 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	if opts.WriteBackBatchWindow > 0 && opts.WritePolicy != WritePolicyWriteBack {
 		return fmt.Errorf("mount: WriteBackBatchWindow requires writeback policy")
 	}
-	hasOverlayOptions := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0 || len(opts.PackPaths) > 0
+	hasOverlayOptions := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 ||
+		len(opts.LocalGitignoreAwarePatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0 || len(opts.PackPaths) > 0
 	if !profileAllowsLocalPolicy(opts.Profile) {
 		if hasOverlayOptions {
 			return fmt.Errorf("mount: overlay options require an overlay profile")
@@ -1324,7 +1325,7 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	if !filepath.IsAbs(opts.LocalRoot) {
 		return fmt.Errorf("mount: LocalRoot must be an absolute path")
 	}
-	if err := validateLocalPolicyPatterns(opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns); err != nil {
+	if err := validateLocalPolicyPatterns(opts.LocalOnlyPatterns, opts.LocalGitignoreAwarePatterns, opts.RemoteOnlyPatterns); err != nil {
 		return fmt.Errorf("mount: %w", err)
 	}
 	return nil

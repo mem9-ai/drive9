@@ -175,7 +175,7 @@ func TestDispatchHelpCommandShowsVisualTreeHelp(t *testing.T) {
 		"--read-cache-max-file-mb MB",
 		"--parallel-read-concurrency N",
 		"--local-only PATTERN",
-		"--local-only-gitignore-aware",
+		"--local-only-gitignore-aware PATTERN",
 		"--checkpoint REF",
 		"--perf-cpu-interval DURATION",
 		"drive9 mount drain [--timeout duration] [--json] <mountpoint>",
