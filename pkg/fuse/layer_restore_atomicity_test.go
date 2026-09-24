@@ -251,6 +251,59 @@ func TestLayerRestoreTransactionCrashRecoveryRestoresOldPair(t *testing.T) {
 	assertNoLayerRestoreArtifacts(t, shadowDir, pendingDir)
 }
 
+func TestLayerRestoreTransactionCorruptionAndRollbackFailureFailClosed(t *testing.T) {
+	t.Run("corrupt marker", func(t *testing.T) {
+		pendingDir := t.TempDir()
+		marker := filepath.Join(pendingDir, layerRestoreTxnPrefix+"corrupt"+layerRestoreTxnSuffix)
+		if err := os.WriteFile(marker, []byte("{not-json"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := NewPendingIndex(pendingDir); err == nil || !strings.Contains(err.Error(), "decode layer restore transaction") {
+			t.Fatalf("NewPendingIndex error = %v, want corrupt transaction rejection", err)
+		}
+	})
+
+	t.Run("missing rollback snapshot", func(t *testing.T) {
+		root := t.TempDir()
+		shadowDir := filepath.Join(root, "shadow")
+		pendingDir := filepath.Join(root, "pending")
+		shadows, err := NewShadowStore(shadowDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending, err := NewPendingIndex(pendingDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seedCommittedLayerCache(t, shadows, pending, "/failure.txt", []byte("old"), 61, 0o640)
+		tx, err := beginLayerRestoreTxn(pendingDir, shadows.shadowPath("/failure.txt"), filepath.Join(pendingDir, hashPath("/failure.txt")+".meta"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, snap := range tx.record.Files {
+			if snap.Existed && strings.HasSuffix(snap.Path, ".shadow") {
+				if err := os.Remove(snap.BackupPath); err != nil {
+					t.Fatal(err)
+				}
+				break
+			}
+		}
+		if err := atomicWrite(shadows.shadowPath("/failure.txt"), []byte("mixed")); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.rollback(); err == nil {
+			t.Fatal("rollback error = nil, want missing snapshot failure")
+		}
+		if _, err := os.Stat(tx.markerPath); err != nil {
+			t.Fatalf("rollback removed recovery marker after failure: %v", err)
+		}
+		shadows.Close()
+		if _, err := NewPendingIndex(pendingDir); err == nil || !strings.Contains(err.Error(), "recover") {
+			t.Fatalf("restart error = %v, want fail-closed rollback recovery failure", err)
+		}
+	})
+}
+
 func newLayerRestoreAtomicityServer(t *testing.T, entry client.FSLayerEntry, object []byte) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

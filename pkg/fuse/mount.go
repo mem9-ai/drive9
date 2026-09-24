@@ -550,6 +550,13 @@ func Mount(opts *MountOptions) (err error) {
 			// Initialize PendingIndex (in-memory authoritative metadata).
 			pendingIdx, err := NewPendingIndex(pendingDir)
 			if err != nil {
+				// Layer restore may have found a durable rollback marker whose
+				// snapshots cannot be decoded or restored. Continuing without the
+				// index would expose the possibly mixed shadow/.meta pair, so layer
+				// mounts must fail before the kernel mount becomes visible.
+				if opts.LayerRef != "" {
+					return fmt.Errorf("mount: layer pending index init: %w", err)
+				}
 				fmt.Fprintf(os.Stderr, "drive9: pending index init failed: %v (continuing without)\n", err)
 			} else {
 				if err := pendingIdx.RecoverFromDisk(); err != nil {
