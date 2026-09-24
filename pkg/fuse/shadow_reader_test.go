@@ -218,3 +218,34 @@ func TestReadOnlyShadowPendingMetadataOwnsCurrentGeneration(t *testing.T) {
 		t.Fatal("pending metadata revived the retired pin")
 	}
 }
+
+func TestReadOnlyShadowRetirementInvalidatesPrefetchWithoutCommittedSize(t *testing.T) {
+	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("new"))
+	})
+	const path = "/prefetched.bin"
+	ino := fs.inodes.Lookup(path, false, 3, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	if err := fs.shadowStore.WriteFull(path, []byte("old"), 1); err != nil {
+		t.Fatal(err)
+	}
+	var out gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	defer fs.Release(nil, &gofuse.ReleaseIn{Fh: out.Fh})
+	reader, _ := fs.fileHandles.Get(out.Fh)
+	prefetch := NewPrefetcher(fs.client, path, 3)
+	ready := make(chan struct{})
+	close(ready)
+	prefetch.cache[0] = &prefetchBlock{data: []byte("old"), ready: ready}
+	reader.Prefetch = prefetch
+	fs.removeShadowPendingStagingGenerationLocked(nil, path, fs.shadowStore.ActiveGeneration(path), 0)
+	// Ordinary commit publication need not include a size in committedSize.
+	fs.recordCommittedRevision(path, 2)
+	fs.inodes.UpdateRevision(ino, 2)
+	got, st, err := readDat9FSTestRange(fs, ino, out.Fh, 0, 3)
+	if err != nil || st != gofuse.OK || string(got) != "new" {
+		t.Fatalf("read after invalidating shadow=%q/%v/%v, want new", got, st, err)
+	}
+}

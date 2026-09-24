@@ -36,11 +36,15 @@ func (fs *Dat9FS) refreshReadOnlyShadowLocked(fh *FileHandle) {
 		fh.ShadowPinned, fh.ShadowGen = false, 0
 		fs.shadowStore.Unpin(gen)
 		clearReadTargetForLockedHandle(fh)
+		prefetchSize := int64(-1)
 		if revision, size, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && revision >= minRevision {
 			fh.BaseRev, fh.OrigSize = revision, size
-			if fh.Prefetch != nil {
-				fh.Prefetch.invalidateWithSize(size)
-			}
+			prefetchSize = size
+		}
+		if fh.Prefetch != nil {
+			// An unknown committed size does not make old prefetched bytes
+			// valid after rejecting their shadow source.
+			fh.Prefetch.invalidateWithSize(prefetchSize)
 		}
 	}
 	// A previously rejected or retired pin is retryable: a newer cache or
