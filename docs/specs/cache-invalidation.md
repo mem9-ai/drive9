@@ -75,13 +75,17 @@ Key = (path, revision, offset, length)
 
 ```text
 Key = (dir_path)
-Value = { entries: [...], expires: timestamp }
+Value = { entries: [ {name, meta, fresh_until}, ... ], complete_until, session_until }
 ```
 
 - `dir_path`: Absolute path of the directory within the mount.
-- `expires`: TTL-based expiry (primary invalidation mechanism for directories, since directory revision is not yet exposed by the server API — see §1.1).
+- `fresh_until` (per entry): the deadline of the evidence holding that name's value up — the listing that carried it, or the stat that observed it. Only newer evidence about *that name* rewrites it, so a listing that omits a name neither renews nor removes it, and an unrelated local write cannot extend it. After the deadline the name is dropped and a lookup for it goes to the server (`PartialMiss`), never answered as absent. A name this mount established itself (`Upsert`) has a zero deadline: a settled commit is this mount's own state, so only invalidation retires it — see the note below.
+- `complete_until`: how long the newest listing may answer a child miss as a complete directory (a false-ENOENT guard, not a per-name lifetime). Cleared when a listing cannot be cached in full (a response past the entry cap) or when a prune drops names, because neither leaves the cache able to speak for the whole directory.
+- `session_until`: the same for a directory this mount created and manages.
 - SSE invalidation (ChangeEvent for child paths, or ResetEvent for structural ops) also triggers invalidation.
-- A cache hit is valid ONLY if: (a) no SSE invalidation has been received for this directory since the entry was stored, AND (b) the entry is not marked "unverified" due to SSE disconnect.
+- A cache hit is valid ONLY if: (a) no SSE invalidation has been received for this directory since the entry was stored, (b) the entry is not marked "unverified" due to SSE disconnect, AND (c) for a positive hit, that specific name's own deadline has not passed.
+
+**Why a name can outlive every TTL.** A listing response describes the directory as of the moment its request was taken, so a name committed during that request's round trip is *absent from the response without being deleted*. Trusting an omission would hide an acknowledged file from readdir (#966), so installs are additive: a response never removes a name. The bounded-staleness guarantee this section makes for remotely deleted names therefore needs the name to have come from a response in the first place, which is what `fresh_until` records — a name no response ever carried has no TTL to expire, and invalidation (SSE, or the §5 reset path) is what retires it.
 
 ### 3.3 Stat/Attr Cache
 

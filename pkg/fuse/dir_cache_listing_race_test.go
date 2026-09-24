@@ -13,15 +13,23 @@ import (
 // This file covers issue #966: a directory listing that lands while a commit
 // settles must not hide the committed child. The mechanism under test is the
 // invariant that a listing install is additive — a name this mount committed
-// cannot disappear from readdir because of a racing listing — plus the
-// per-name stamps that keep a response from speaking for state it predates.
+// cannot disappear from readdir because of a racing listing — plus the per-name
+// deadlines and stamps that keep each response from speaking for state it
+// predates.
 
+// cachedNames reports what the cache holds for dirPath, after the same prune
+// every read path performs. Pruning here is what makes these helpers observe
+// the cache a caller sees rather than the raw fields: a name past its own
+// deadline is not part of the answer, whether or not some read has swept it yet.
 func cachedNames(t *testing.T, dc *DirCache, dirPath string) []string {
 	t.Helper()
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
 	entry := dc.entries[dirPath]
 	if entry == nil {
 		return nil
 	}
+	entry.prune(time.Now())
 	names := make([]string, 0, len(entry.items))
 	for _, name := range entry.order {
 		if _, ok := entry.items[name]; ok {
@@ -50,11 +58,18 @@ func containsName(names []string, want string) bool {
 
 func assertCachedChild(t *testing.T, dc *DirCache, dirPath, name string, check func(CachedFileInfo)) {
 	t.Helper()
+	dc.mu.Lock()
 	entry := dc.entries[dirPath]
+	var item CachedFileInfo
+	var ok bool
+	if entry != nil {
+		entry.prune(time.Now())
+		item, ok = entry.items[name]
+	}
+	dc.mu.Unlock()
 	if entry == nil {
 		t.Fatalf("expected an entry for %s", dirPath)
 	}
-	item, ok := entry.items[name]
 	if !ok {
 		t.Fatalf("child %s missing: names=%v", name, cachedNames(t, dc, dirPath))
 	}
@@ -1013,6 +1028,180 @@ func TestDirCacheListingLapseKeepsObservedName(t *testing.T) {
 	})
 	if !containsName(viewNames(view), "f.dat") {
 		t.Fatalf("lapse hid an observed name from readdir: %v", viewNames(view))
+	}
+}
+
+// --- Eleventh review round on #966: who renews a name, and until when -------
+
+// A second listing must not renew a name it does not carry. The deadline
+// belongs to the name, so the response that stopped listing it says nothing
+// about it — and a directory listed more often than the TTL must still let a
+// remotely deleted name go: otherwise continuous readdir keeps it alive
+// forever, which is unbounded staleness the spec does not permit.
+func TestDirCacheListingDoesNotRenewAnOmittedName(t *testing.T) {
+	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "gone.dat"}, {Name: "live.dat"}})
+
+	// A second listing 50ms later: inside the first deadline, and it carries
+	// only live.dat, so gone.dat keeps the deadline the *first* response gave it.
+	time.Sleep(50 * time.Millisecond)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "live.dat"}})
+
+	// Past the first response's deadline (t0+80ms), inside the second's.
+	time.Sleep(50 * time.Millisecond)
+
+	if names := cachedNames(t, dc, "/d"); containsName(names, "gone.dat") {
+		t.Fatalf("a listing renewed a name it does not carry: %v", names)
+	}
+	if got := dc.Lookup("/d", "gone.dat"); got.kind == namespaceLookupPositive {
+		t.Fatal("an omitted name still answered a positive lookup past its own deadline")
+	}
+	// The name the second response did carry stays.
+	if got := dc.Lookup("/d", "live.dat"); got.kind != namespaceLookupPositive {
+		t.Fatalf("a re-listed name = %v, want positive", got.kind)
+	}
+}
+
+// A stat observation is a remote read, so it expires on its own clock: it must
+// not turn into mount-authoritative state. Promoting it left a remote chmod or
+// delete that SSE did not report able to outlive every TTL the cache has.
+func TestDirCacheObservationExpiresOnItsOwnDeadline(t *testing.T) {
+	dc := NewNamespaceCache(60*time.Millisecond, 60*time.Millisecond, defaultNamespaceCacheMaxEntries)
+
+	request := dc.BeginRequest("/d")
+	dc.Observe("/d", CachedFileInfo{Name: "observed.dat", Revision: 1}, request)
+
+	// Past the observation's deadline, an unrelated local write refreshes
+	// nothing but its own name.
+	time.Sleep(100 * time.Millisecond)
+	dc.Upsert("/d", CachedFileInfo{Name: "local.dat", Revision: 2})
+
+	view := listInstall(dc, "/d", []CachedFileInfo{{Name: "local.dat"}})
+
+	if names := cachedNames(t, dc, "/d"); containsName(names, "observed.dat") {
+		t.Fatalf("an expired observation survived an unrelated local write: %v", names)
+	}
+	if containsName(viewNames(view), "observed.dat") {
+		t.Fatalf("view served an expired observation: %v", viewNames(view))
+	}
+	if got := dc.Lookup("/d", "observed.dat"); got.kind == namespaceLookupPositive {
+		t.Fatal("an expired observation still answered a positive lookup")
+	}
+}
+
+// A local commit, by contrast, carries no deadline: it is this mount's own
+// state, and neither a listing omitting it nor the passage of time may retire
+// it — that omission is exactly the #966 invisibility. Only invalidation says
+// otherwise, because only invalidation reflects the server's word.
+func TestDirCacheLocalNameOutlivesEveryRemoteDeadline(t *testing.T) {
+	dc := NewNamespaceCache(60*time.Millisecond, 60*time.Millisecond, defaultNamespaceCacheMaxEntries)
+
+	dc.Upsert("/d", CachedFileInfo{Name: "acked.dat", Revision: 3})
+
+	// Many listings that never carry the committed name, spread over several
+	// TTLs: a commit whose upload is still in flight is invisible to each.
+	for range 4 {
+		time.Sleep(100 * time.Millisecond)
+		view := listInstall(dc, "/d", []CachedFileInfo{{Name: "later.dat"}})
+		if !containsName(viewNames(view), "acked.dat") {
+			t.Fatalf("a listing hid a locally committed name: %v", viewNames(view))
+		}
+	}
+
+	if got := dc.Lookup("/d", "acked.dat"); got.kind != namespaceLookupPositive {
+		t.Fatalf("lookup of a locally committed name = %v, want positive", got.kind)
+	}
+	if names := cachedNames(t, dc, "/d"); !containsName(names, "acked.dat") {
+		t.Fatalf("a locally committed name aged out: %v", names)
+	}
+
+	// Invalidation is what retires it.
+	dc.Invalidate("/d")
+	if got := dc.Lookup("/d", "acked.dat"); got.kind == namespaceLookupPositive {
+		t.Fatal("invalidation left a locally committed name positive")
+	}
+}
+
+// The two expiries an entry has are independent: a name's own deadline expiring
+// drops that name without claiming anything about the directory, so a second
+// name whose own evidence is still running must survive it — and the entry must
+// not keep answering misses for the dropped one.
+func TestDirCachePerNameDeadlinesAreIndependent(t *testing.T) {
+	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+
+	// observed.dat is seen at t0, keep.dat is listed at t0+50ms.
+	request := dc.BeginRequest("/d")
+	dc.Observe("/d", CachedFileInfo{Name: "observed.dat", Revision: 1}, request)
+	time.Sleep(50 * time.Millisecond)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "keep.dat"}})
+
+	// Past the observation's deadline, inside the listing's.
+	time.Sleep(50 * time.Millisecond)
+
+	if names := cachedNames(t, dc, "/d"); containsName(names, "observed.dat") {
+		t.Fatalf("an expired observation outlived its deadline while a listing was fresh: %v", names)
+	}
+	if got := dc.Lookup("/d", "keep.dat"); got.kind != namespaceLookupPositive {
+		t.Fatalf("a fresh name = %v, want positive", got.kind)
+	}
+	// The dropped name must fall through to the server, not be answered absent:
+	// the cache pruned it because its evidence ran out, which is not a statement
+	// that the server no longer has it.
+	if got := dc.Lookup("/d", "observed.dat"); got.kind != namespaceLookupPartialMiss {
+		t.Fatalf("lookup of an expired name = %v, want partial miss (remote fallback)", got.kind)
+	}
+}
+
+// The expiry guard must stay O(1) on the read path, which means an entry has to
+// know the earliest deadline it is holding: too late and a name outlives its
+// evidence, too early only costs a scan. This pins the hint's two ends — it
+// tracks the earliest live deadline, and it goes back to zero once nothing with
+// a deadline is left.
+func TestDirCacheFreshnessHintTracksTheEarliestDeadline(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, defaultNamespaceCacheMaxEntries)
+
+	// A locally committed name has no deadline, so it must not wake the guard.
+	dc.Upsert("/d", CachedFileInfo{Name: "local.dat"})
+	entry := dc.entries["/d"]
+	if !entry.freshnessHint.IsZero() {
+		t.Fatalf("a deadline-free write armed the expiry guard: %v", entry.freshnessHint)
+	}
+
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "remote.dat"}})
+	listDeadline := entry.freshnessHint
+	if listDeadline.IsZero() {
+		t.Fatal("an installed listing did not arm the expiry guard")
+	}
+
+	// An observation is a later deadline, so it must not push the guard out.
+	request := dc.BeginRequest("/d")
+	dc.Observe("/d", CachedFileInfo{Name: "observed.dat", Revision: 1}, request)
+	if entry.freshnessHint.After(listDeadline) {
+		t.Fatalf("a later deadline moved the guard past the earliest one: %v > %v", entry.freshnessHint, listDeadline)
+	}
+
+	// Expire everything: the guard must be disarmed, not left pointing at a
+	// deadline that is already behind us, or every read would scan forever.
+	dc.mu.Lock()
+	for name, item := range entry.items {
+		if item.freshUntil.IsZero() {
+			continue
+		}
+		item.freshUntil = time.Now().Add(-time.Second)
+		entry.items[name] = item
+	}
+	entry.freshnessHint = time.Now().Add(-time.Second)
+	dc.mu.Unlock()
+	if names := cachedNames(t, dc, "/d"); containsName(names, "remote.dat") {
+		t.Fatalf("expired names survived a prune: %v", names)
+	}
+	if !entry.freshnessHint.IsZero() {
+		t.Fatalf("the expiry guard stayed armed with nothing left to expire: %v", entry.freshnessHint)
+	}
+	// The locally committed name has no deadline and must still be there.
+	if !containsName(cachedNames(t, dc, "/d"), "local.dat") {
+		t.Fatalf("a deadline-free name was dropped: %v", cachedNames(t, dc, "/d"))
 	}
 }
 
