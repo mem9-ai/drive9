@@ -65,10 +65,19 @@ func ExampleClient_filesystemCRUDAndMetadata() {
 	_ = c.WriteCtxConditionalWithTags(ctx, "/workspace/tagged.txt", []byte("tagged"), -1, map[string]string{"kind": "note"})
 	_ = c.WriteCtxConditionalWithDescription(ctx, "/workspace/described.txt", []byte("body"), -1, "short description")
 	_, _ = c.WriteCtxConditionalWithRevision(ctx, "/workspace/revision.txt", []byte("body"), -1)
-	batchResults, _ := c.BatchWriteCtx(ctx, []drive9.BatchWriteItem{
-		{Path: "/workspace/batch-a.txt", ExpectedRevision: 0, Data: []byte("a"), Mode: 0o644, HasMode: true},
+	batchItems := []drive9.BatchWriteItem{
+		{Path: "/workspace/batch-a.txt", ExpectedRevision: 0, Data: []byte("a")},
 		{Path: "/workspace/batch-b.txt", ExpectedRevision: -1, Data: []byte("b")},
-	})
+	}
+	// Warm caches server capabilities. This check performs no I/O and is false
+	// until a server advertises batch_write_mode_v1. Explicit modes still
+	// require an owner key; the capability does not grant permission.
+	c.Warm(ctx)
+	if c.CachedBatchWriteModeSupported() {
+		batchItems[0].Mode = 0o644
+		batchItems[0].HasMode = true
+	}
+	batchResults, _ := c.BatchWriteCtx(ctx, batchItems)
 	for _, result := range batchResults {
 		_ = result.OK()
 	}
@@ -709,6 +718,7 @@ var coveredClientMethods = map[string]bool{
 	"BatchStatCtx":                         true,
 	"BatchWriteCtx":                        true,
 	"CachedAppendLogSupported":             true,
+	"CachedBatchWriteModeSupported":        true,
 	"CachedSmallFileThreshold":             true,
 	"CheckpointFSLayer":                    true,
 	"Chmod":                                true,

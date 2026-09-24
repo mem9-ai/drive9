@@ -4623,12 +4623,14 @@ func TestShadowSpill_RecoverPendingPreservesShadowSpill(t *testing.T) {
 		t.Fatal("PutShadowSpill should persist ShadowSpill=true")
 	}
 
-	// Create a shadow file so RecoverPending doesn't prune it.
-	shadows, err := NewShadowStore(shadowDir)
+	// Recovery requires a complete payload. Use a sparse file of the declared
+	// size; an empty placeholder would correctly be rejected as torn data.
+	shadows, err := NewShadowStoreWithQuota(shadowDir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := shadows.Ensure(path, 0, 0); err != nil {
+	t.Cleanup(shadows.Close)
+	if err := shadows.Ensure(path, meta.Size, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4672,6 +4674,9 @@ func TestShadowSpill_RecoverPendingPreservesShadowSpill(t *testing.T) {
 	}
 	if !queue[0].ShadowSpill {
 		t.Fatal("recovered CommitEntry must have ShadowSpill=true")
+	}
+	if queue[0].Size != meta.Size || queue[0].ShadowGen == 0 {
+		t.Fatalf("recovered size/generation=%d/%d, want %d/nonzero", queue[0].Size, queue[0].ShadowGen, meta.Size)
 	}
 }
 

@@ -2972,9 +2972,9 @@ func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 }
 
 // TestCommitQueueRecoverPendingUsesShadowSize verifies that recovery routes
-// the upload by the actual shadow file size, not stale pending metadata. A
-// WAL-resurrected meta can carry an old size; routing on it would direct-PUT
-// a file the server requires to be multipart (or vice versa).
+// the upload and publishes its result using the actual shadow file size after
+// growth. A shadow shorter than metadata is now rejected by the recovery-size
+// guard; the safe growth case must still report the complete committed size.
 func TestCommitQueueRecoverPendingUsesShadowSize(t *testing.T) {
 	data := []byte("0123456789abcdef") // 16 bytes, well under the 50KB threshold
 	var putBody []byte
@@ -2993,7 +2993,7 @@ func TestCommitQueueRecoverPendingUsesShadowSize(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	shadow, err := NewShadowStore(t.TempDir())
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3006,12 +3006,17 @@ func TestCommitQueueRecoverPendingUsesShadowSize(t *testing.T) {
 	if err := shadow.WriteFull("/stale.bin", data, 5); err != nil {
 		t.Fatal(err)
 	}
-	// Stale meta: claims 60000 bytes (> 50KB threshold → would multipart).
-	if _, err := pending.PutWithBaseRev("/stale.bin", 60000, PendingOverwrite, 5); err != nil {
+	// Older metadata can be smaller than the complete staged image.
+	if _, err := pending.PutWithBaseRev("/stale.bin", 4, PendingOverwrite, 5); err != nil {
 		t.Fatal(err)
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, _ int64) {
+		if entry.Size != int64(len(data)) {
+			t.Errorf("published committed size = %d, want %d", entry.Size, len(data))
+		}
+	}
 	cq.RecoverPending()
 	cq.DrainAll()
 

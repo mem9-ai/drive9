@@ -213,7 +213,7 @@ func TestAppendLogReleaseRetriesOnlyPendingMode(t *testing.T) {
 				if persistentFailure {
 					failMode = false
 					sibling.Lock()
-					status := fs.syncHandleToRemoteLocked(context.Background(), sibling)
+					status := fs.syncHandleToRemoteLocked(context.Background(), sibling, shadowUploadLocalDurable)
 					sibling.Unlock()
 					if status != gofuse.OK || sibling.HasPendingMode || modeCalls != 3 || contentCalls != 1 {
 						t.Errorf("sibling mode retry = %d pending=%t chmod=%d content=%d", status, sibling.HasPendingMode, modeCalls, contentCalls)

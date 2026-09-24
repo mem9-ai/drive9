@@ -82,6 +82,9 @@ type WriteBackMeta struct {
 	// copied with in-memory re-home/rename metadata but deliberately omitted
 	// from JSON, so recovery remains fail-closed.
 	liveAncestors []string
+	// shadowSource binds only PendingIndex publication to its exact payload.
+	// WriteBackCache owns .dat bytes; its metadata never authorizes .shadow.
+	shadowSource shadowReadSource
 }
 
 func cloneWriteBackMeta(meta *WriteBackMeta) WriteBackMeta {

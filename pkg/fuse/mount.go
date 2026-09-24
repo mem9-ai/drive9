@@ -578,6 +578,8 @@ func Mount(opts *MountOptions) (err error) {
 				dat9fs.shadowStore = shadowStore
 			}
 
+			pendingIdx.setShadowStore(shadowStore)
+
 			// Initialize Journal WAL.
 			journalPath := filepath.Join(cacheBase, mountHash, "journal.wal")
 			journal, err := NewJournal(journalPath)
@@ -601,7 +603,8 @@ func Mount(opts *MountOptions) (err error) {
 				// Replay journal for crash recovery. Preserve the original kind
 				// and base revision so CommitQueue.RecoverPending can re-enqueue.
 				if err := replayJournalIntoPending(journal, pendingIdx, shadowStore); err != nil {
-					fmt.Fprintf(os.Stderr, "drive9: journal replay: %v\n", err)
+					closeFailedMountStaging(dat9fs)
+					return fmt.Errorf("mount: journal replay: %w", err)
 				}
 				// Drop frames already covered by commit markers so the WAL does
 				// not grow unboundedly across mounts. Safe here: mount init is
@@ -621,14 +624,9 @@ func Mount(opts *MountOptions) (err error) {
 
 			// Migrate legacy writeBack entries to shadow store so
 			// CommitQueue.RecoverPending sees them and doesn't prune.
-			if wbCache != nil && shadowStore != nil {
-				for _, pe := range wbCache.ListPending() {
-					if !shadowStore.Has(pe.Meta.Path) {
-						if err := shadowStore.WriteFull(pe.Meta.Path, pe.Data, pe.Meta.BaseRev); err != nil {
-							safeStderrPrintf("drive9: migrate legacy entry %s to shadow: %v\n", pe.Meta.Path, err)
-						}
-					}
-				}
+			if err := migrateLegacyWriteBack(shadowStore, wbCache, pendingIdx); err != nil {
+				closeFailedMountStaging(dat9fs)
+				return fmt.Errorf("mount: %w", err)
 			}
 
 			// Initialize CommitQueue for background remote commits.
@@ -638,6 +636,7 @@ func Mount(opts *MountOptions) (err error) {
 					cqMaxPending = opts.CommitQueueMaxPending
 				}
 				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, cqMaxPending, opts.RemoteRoot)
+				dat9fs.commitQueue = cq
 				cq.SetLayerRef(opts.LayerRef)
 				cq.SetPerfCounters(dat9fs.perf)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
@@ -652,26 +651,16 @@ func Mount(opts *MountOptions) (err error) {
 					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
 				}
 				cq.RecoverPending()
-				shadowStore.RecoverPendingBytes()
 				if opts.LayerRef != "" {
 					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
+						closeFailedMountStaging(dat9fs)
 						return fmt.Errorf("mount: restore fs layer entries: %w", err)
 					}
 					layerEventWatcherStop = StartLayerEventWatcher(dat9fs, c, opts, shadowStore, pendingIdx)
 				}
-				dat9fs.commitQueue = cq
 			}
 			if gvisorWriteBackRequiresCommitQueue(opts, wbCache, dat9fs.commitQueue) {
-				if journal != nil {
-					if dat9fs.journalSyncerCancel != nil {
-						dat9fs.journalSyncerCancel()
-					}
-					_ = journal.FsyncShared()
-					_ = journal.Close()
-				}
-				if shadowStore != nil {
-					shadowStore.Close()
-				}
+				closeFailedMountStaging(dat9fs)
 				return errors.New("mount: gvisor compat write-back requires pending index and shadow store")
 			}
 
@@ -708,7 +697,9 @@ func Mount(opts *MountOptions) (err error) {
 		}
 		dat9fs.pendingIndex = pendingIdx
 		dat9fs.shadowStore = shadowStore
+		pendingIdx.setShadowStore(shadowStore)
 		if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
+			closeFailedMountStaging(dat9fs)
 			return fmt.Errorf("mount: restore fs layer entries: %w", err)
 		}
 	}
@@ -1755,7 +1746,7 @@ func layerRestoreShadowGeneration(shadows *ShadowStore, localPath string) uint64
 	if !shadows.Has(localPath) {
 		return 0
 	}
-	return shadows.EnsureActiveGeneration(localPath, 0)
+	return shadows.EnsureActiveGeneration(localPath)
 }
 
 func layerRestoreDirectoryRenameOwned(pending *PendingIndex, oldPath, newPath string) bool {
@@ -2124,4 +2115,55 @@ func generateMountID() string {
 		return fmt.Sprintf("mount-%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// migrateLegacyWriteBack runs before pending recovery binds shadow sources.
+// An existing shadow may be newer than a best-effort .dat snapshot, even when
+// the surviving .meta belongs to that older snapshot. Repair a missing or short
+// shadow only from the snapshot selected by recovery; preserve complete shadows
+// and never substitute an older snapshot for a selected newer WAL publication.
+func migrateLegacyWriteBack(shadows *ShadowStore, cache *WriteBackCache, pending *PendingIndex) error {
+	if shadows == nil || cache == nil {
+		return nil
+	}
+	for _, entry := range cache.ListPending() {
+		if size, ok := shadows.ContentSize(entry.Meta.Path); ok && size >= entry.Meta.Size {
+			continue
+		}
+		if entry.Meta.ShadowSpill {
+			continue // this metadata explicitly owns the shadow payload
+		}
+		if pending != nil {
+			if current, ok := pending.GetMeta(entry.Meta.Path); ok &&
+				(current.Generation != entry.Meta.Generation || !current.Mtime.Equal(entry.Meta.Mtime)) {
+				continue // WAL replay selected a different pending publication
+			}
+		}
+		if int64(len(entry.Data)) < entry.Meta.Size {
+			continue // an incomplete snapshot cannot repair another payload
+		}
+		if err := shadows.WriteFull(entry.Meta.Path, entry.Data, entry.Meta.BaseRev); err != nil {
+			return fmt.Errorf("migrate legacy entry %s to shadow: %w", entry.Meta.Path, err)
+		}
+	}
+	return nil
+}
+
+// closeFailedMountStaging releases staging resources when initialization fails
+// before a mount takes ownership. Workers may still use staging during failed
+// layer restore, so drain them before closing the journal and shadow descriptors.
+func closeFailedMountStaging(fs *Dat9FS) {
+	if fs.journalSyncerCancel != nil {
+		fs.journalSyncerCancel()
+	}
+	if fs.commitQueue != nil {
+		fs.commitQueue.DrainAll()
+	}
+	if fs.journal != nil {
+		_ = fs.journal.FsyncShared()
+		_ = fs.journal.Close()
+	}
+	if fs.shadowStore != nil {
+		fs.shadowStore.Close()
+	}
 }

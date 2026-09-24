@@ -849,6 +849,8 @@ func TestAppendLogRefreshClearsRemovedCleanSiblingShadow(t *testing.T) {
 	owner.OrigSize = 5
 	owner.ShadowReady = true
 	owner.ShadowSpill = true
+	owner.ShadowStageGen = 42
+	owner.ShadowStageSeq = 43
 	fs.openHandles.Add(owner)
 	defer fs.openHandles.Remove(owner)
 
@@ -856,8 +858,8 @@ func TestAppendLogRefreshClearsRemovedCleanSiblingShadow(t *testing.T) {
 	// sibling removed the active path shadow. The later revision refresh must
 	// clear the now-invalid local source before publishing the new revision.
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(owner.Path, 7, nil, 9)
-	if owner.ShadowReady || owner.ShadowSpill {
-		t.Fatalf("refresh retained removed shadow flags: ready=%t spill=%t", owner.ShadowReady, owner.ShadowSpill)
+	if owner.ShadowReady || owner.ShadowSpill || owner.ShadowStageGen != 0 || owner.ShadowStageSeq != 0 {
+		t.Fatalf("refresh retained removed shadow claim: ready=%t spill=%t gen=%d seq=%d", owner.ShadowReady, owner.ShadowSpill, owner.ShadowStageGen, owner.ShadowStageSeq)
 	}
 	if owner.BaseRev != 7 || owner.Dirty.Size() != 9 {
 		t.Fatalf("refresh rebind = base=%d size=%d, want 7/9", owner.BaseRev, owner.Dirty.Size())

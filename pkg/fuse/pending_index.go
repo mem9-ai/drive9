@@ -44,6 +44,7 @@ type PendingIndex struct {
 	// restoreTxnMarkerRemove is a narrow, per-index commit-point test seam.
 	// Production leaves it nil; transactions then use removeLayerRestoreMarker.
 	restoreTxnMarkerRemove func(string) error
+	shadows                *ShadowStore // wired once before staging/recovery
 }
 
 type layerRestoreMetaPublish func()
@@ -526,6 +527,13 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 		ParentSnapshotID: parentSnapshotID,
 		lineageTrusted:   lineageTrusted,
 		liveAncestors:    append([]string(nil), liveAncestors...),
+	}
+
+	idx.mu.RLock()
+	shadows := idx.shadows
+	idx.mu.RUnlock()
+	if shadows != nil && kind != PendingChmod {
+		meta.shadowSource = shadowReadSource{shadows, shadows.ActiveGeneration(remotePath)}
 	}
 
 	// Durable publication first, then the in-memory publish.

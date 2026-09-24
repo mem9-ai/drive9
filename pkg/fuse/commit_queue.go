@@ -220,6 +220,7 @@ type CommitQueue struct {
 
 // NewCommitQueue creates a CommitQueue with background workers.
 func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex, journal *Journal, numWorkers int, maxPending int, remoteRoot ...string) *CommitQueue {
+	index.setShadowStore(shadows)
 	if numWorkers <= 0 {
 		numWorkers = 4
 	}
@@ -692,6 +693,11 @@ func (cq *CommitQueue) RecoverPending() {
 	if cq.index == nil {
 		return
 	}
+	// Startup only: reconcile cold disk accounting before the first enqueue
+	// lets workers mutate or remove any recovered payload.
+	if cq.shadows != nil {
+		cq.shadows.RecoverPendingBytes()
+	}
 	layer := cq.layerRefSnapshot() != ""
 	for path := range cq.index.ListPendingPaths() {
 		meta, ok := cq.index.GetMeta(path)
@@ -705,6 +711,7 @@ func (cq *CommitQueue) RecoverPending() {
 			cq.index.Remove(path)
 			continue
 		}
+		shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
 		if meta.Kind == PendingConflict {
 			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
 			continue
@@ -739,9 +746,9 @@ func (cq *CommitQueue) RecoverPending() {
 			PendingIndexGen:   meta.Generation,
 		}
 		if cq.shadows != nil {
-			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path, meta.BaseRev)
+			entry.ShadowGen = shadowGen
 			if entry.ShadowGen == 0 {
-				safeLogPrintf("commit queue: skipping recovered pending entry for %s (shadow generation unavailable)", path)
+				safeLogPrintf("commit queue: skipping recovered pending entry for %s (shadow missing, short, or metadata replaced)", path)
 				if _, err := cq.index.MarkConflictIfGeneration(path, meta.Generation); err != nil {
 					safeLogPrintf("commit queue: mark recovered pending conflict failed for %s: %v", path, err)
 				}
@@ -1864,7 +1871,10 @@ func (cq *CommitQueue) prepareBatchWriteItems(ctx context.Context, entries []*Co
 			ExpectedRevision: entry.BaseRev,
 			Data:             data,
 		}
-		if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
+		// Older batch endpoints may accept mode without enforcing chmod's
+		// authorization policy. Without the advertised contract, commit content
+		// only and let onCommitSuccessWithOptions apply the pending chmod.
+		if cq.client.CachedBatchWriteModeSupported() && shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 			item.Mode = remoteChmodMode(entry.Mode & posixPermissionModeMask)
 			item.HasMode = true
 		}
@@ -2063,6 +2073,7 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 			cq.index.Remove(path)
 			continue
 		}
+		shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
 		if meta.Kind == PendingConflict {
 			continue
 		}
@@ -2092,7 +2103,7 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 			recovered:         true,
 		}
 		if cq.shadows != nil {
-			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path, meta.BaseRev)
+			entry.ShadowGen = shadowGen
 			if entry.ShadowGen == 0 {
 				continue
 			}

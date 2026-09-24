@@ -1471,6 +1471,7 @@ func TestShadowSpillSyncCleanupKeepsNewerGeneration(t *testing.T) {
 		ShadowSpill:       true,
 		ShadowCommitReady: true,
 		ShadowStageGen:    oldShadowGen,
+		ShadowStageSeq:    17,
 		PendingIndexGen:   oldPendingGen,
 	}
 
@@ -1486,6 +1487,9 @@ func TestShadowSpillSyncCleanupKeepsNewerGeneration(t *testing.T) {
 	}
 
 	fs.removeShadowPendingStagingGenerationLocked(fh, path, oldShadowGen, oldPendingGen)
+	if fh.ShadowReady || fh.ShadowSpill || fh.ShadowStageGen != 0 || fh.ShadowStageSeq != 0 || fh.ShadowCommitReady || fh.ShadowCommitSeq != 0 {
+		t.Fatal("stale cleanup retained the old handle's shadow claim")
+	}
 
 	meta, ok := pending.GetMeta(path)
 	if !ok {
