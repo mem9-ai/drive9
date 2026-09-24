@@ -40,6 +40,17 @@ check_eq() {
   fi
 }
 
+check_le() {
+  local desc="$1" got="$2" max="$3"
+  if [ "$got" -le "$max" ] 2>/dev/null; then
+    echo "PASS $desc ($got <= $max)"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL $desc (want<=$max got=$got)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Fake runtime machinery
 # ---------------------------------------------------------------------------
@@ -75,6 +86,23 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+PY
+}
+
+# fake_stall.py accepts TCP connections and never answers them, modelling a
+# server whose health endpoint stalls: without per-probe curl timeouts the
+# bootstrap would hang forever on it.
+write_fake_stall() {
+  cat >"$1" <<'PY'
+import socket, sys
+
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", int(sys.argv[1])))
+srv.listen(16)
+conns = []
+while True:
+    conns.append(srv.accept()[0])
 PY
 }
 
@@ -176,10 +204,18 @@ case "$cmd" in
     image="${1:-}"
     log_state "run_image" "$image"
     : >"$(marker "$name")"
-    case " ${FAKE_HEALTHY_IMAGES:-} " in
+    case " ${FAKE_STALL_IMAGES:-} " in
       *" $image "*)
-        python3 "$SELF_DIR/fake_s3.py" "$port" >/dev/null 2>&1 &
+        python3 "$SELF_DIR/fake_stall.py" "$port" >/dev/null 2>&1 &
         echo $! >"$(pidfile "$name")"
+        ;;
+      *)
+        case " ${FAKE_HEALTHY_IMAGES:-} " in
+          *" $image "*)
+            python3 "$SELF_DIR/fake_s3.py" "$port" >/dev/null 2>&1 &
+            echo $! >"$(pidfile "$name")"
+            ;;
+        esac
         ;;
     esac
     echo "fake-container-id"
@@ -235,6 +271,7 @@ new_harness() {
   mkdir -p "$FAKE_BIN_DIR" "$FAKE_RUN_DIR"
   : >"$FAKE_STATE"
   write_fake_s3 "$FAKE_BIN_DIR/fake_s3.py"
+  write_fake_stall "$FAKE_BIN_DIR/fake_stall.py"
   write_fake_docker
   write_fake_podman
   FAKE_PORT=""
@@ -387,12 +424,64 @@ command -v python3 >/dev/null 2>&1 || {
   exit 2
 }
 
+# Test G: a candidate whose server accepts TCP but never answers the health
+# request must be given up on within the health budget (the per-probe curl
+# timeouts), removed, and replaced by the next candidate — without the
+# bootstrap hanging forever.
+test_stalled_http_probe_recovers_local_minio() {
+  echo "--- G: stalled-HTTP candidate does not hang local-minio.sh"
+  new_harness
+  local rc=0
+  local t0
+  t0=$(date +%s)
+  DRIVE9_MINIO_PORT=$FAKE_PORT FAKE_HEALTHY_IMAGES="registry.invalid/good:tag" \
+    FAKE_STALL_IMAGES="registry.invalid/stall:tag" \
+    DRIVE9_MINIO_IMAGE=registry.invalid/stall:tag \
+    DRIVE9_MINIO_FALLBACK_IMAGE=registry.invalid/good:tag \
+    MINIO_HEALTH_TIMEOUT_S=4 PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
+    bash "$SCRIPT_DIR/local-minio.sh" ensure >"$FAKE_RUN_DIR/ensure.log" 2>&1 || rc=$?
+  local elapsed=$(( $(date +%s) - t0 ))
+  check_eq "ensure exit status" "$rc" "0"
+  check_eq "good candidate took over" "$(read_state run_image | tail -1)" "registry.invalid/good:tag"
+  check_eq "stalled candidate removed" "$(grep -c '^removed=' "$FAKE_STATE" || true)" "1"
+  check_eq "binary fallback not used" "$(grep -c '^invoked' "$FAKE_STATE" || true)" "0"
+  check_le "bootstrap finished within budget" "$elapsed" 30
+  teardown_harness
+}
+
+# Test H: the same stalled-HTTP scenario through object-store's candidate
+# loop and OBJECT_BOOTSTRAP_ONLY hook.
+test_stalled_http_probe_recovers_object_store() {
+  echo "--- H: stalled-HTTP candidate does not hang object-store"
+  new_harness
+  local rc=0
+  local t0
+  t0=$(date +%s)
+  CLI_SOURCE=invalid OBJECT_BOOTSTRAP_ONLY=1 \
+    MINIO_IMAGE=registry.invalid/stall:tag \
+    DRIVE9_MINIO_FALLBACK_IMAGE=registry.invalid/good:tag \
+    FAKE_HEALTHY_IMAGES="registry.invalid/good:tag" \
+    FAKE_STALL_IMAGES="registry.invalid/stall:tag" \
+    MINIO_PORT=$FAKE_PORT MINIO_HEALTH_TIMEOUT_S=4 PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
+    bash "$REPO_ROOT/e2e/object-store-smoke-test.sh" >"$FAKE_RUN_DIR/suite.log" 2>&1 || rc=$?
+  local elapsed=$(( $(date +%s) - t0 ))
+  check_eq "bootstrap exit status" "$rc" "0"
+  check_eq "good candidate took over" "$(read_state run_image | tail -1)" "registry.invalid/good:tag"
+  # One removal inside the loop plus the suite's EXIT-trap cleanup.
+  check_eq "stalled candidate removed" "$(grep -c '^removed=' "$FAKE_STATE" || true)" "2"
+  check_eq "bootstrap hook reached" "$(grep -c 'bootstrap-only: MinIO provisioning finished' "$FAKE_RUN_DIR/suite.log" || true)" "1"
+  check_le "bootstrap finished within budget" "$elapsed" 30
+  teardown_harness
+}
+
 test_first_unhealthy_second_healthy
 test_all_unhealthy_falls_back_to_binary
 test_preexisting_unhealthy_container_replaced
 test_object_store_first_unhealthy
 test_object_store_binary_fallback
 test_object_store_total_failure
+test_stalled_http_probe_recovers_local_minio
+test_stalled_http_probe_recovers_object_store
 
 echo "TOTAL=$PASS PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

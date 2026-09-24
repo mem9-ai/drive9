@@ -49,6 +49,10 @@ fi
 # hermetic tests (a candidate only holds the loop this long when something
 # answers slowly — a refused connection fails immediately).
 MINIO_HEALTH_TIMEOUT_S="${MINIO_HEALTH_TIMEOUT_S:-40}"
+# Per-probe bounds. Without them a server that accepts TCP but never answers
+# the health request would stall `curl` past any deadline: the overall
+# --max-time is what makes MINIO_HEALTH_TIMEOUT_S effective.
+MINIO_HEALTH_CONNECT_TIMEOUT_S="${MINIO_HEALTH_CONNECT_TIMEOUT_S:-2}"
 
 HEALTH_HOST="$BIND"
 if [ "$BIND" = "0.0.0.0" ] || [ "$BIND" = "::" ] || [ "$BIND" = "[::]" ]; then
@@ -64,7 +68,13 @@ shell_quote() {
 }
 
 url_healthy() {
-  curl -sf "$1/minio/health/live" >/dev/null 2>&1
+  # Bounded probe: connect-timeout covers a black-holed peer, and --max-time
+  # (default: the full health budget) covers a server that accepts TCP but
+  # stalls the HTTP response. $2 overrides the cap for callers with a running
+  # deadline (wait_healthy passes the seconds it has left).
+  local url="$1"
+  local max_time="${2:-$MINIO_HEALTH_TIMEOUT_S}"
+  curl -sf --connect-timeout "$MINIO_HEALTH_CONNECT_TIMEOUT_S" --max-time "$max_time" "$url/minio/health/live" >/dev/null 2>&1
 }
 
 candidate_runtimes() {
@@ -148,12 +158,14 @@ PY
 wait_healthy() {
   local url="$1"
   local deadline=$(($(date +%s) + MINIO_HEALTH_TIMEOUT_S))
+  local remaining
   while :; do
-    if url_healthy "$url"; then
-      return 0
-    fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
+    remaining=$((deadline - $(date +%s)))
+    if [ "$remaining" -le 0 ]; then
       return 1
+    fi
+    if url_healthy "$url" "$remaining"; then
+      return 0
     fi
     sleep 0.3
   done

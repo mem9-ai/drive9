@@ -53,6 +53,10 @@ fi
 # hermetic tests (a refused connection fails immediately; the deadline only
 # bounds a slow-answering candidate).
 MINIO_HEALTH_TIMEOUT_S="${MINIO_HEALTH_TIMEOUT_S:-40}"
+# Per-probe bounds. Without them a server that accepts TCP but never answers
+# the health request would stall `curl` past any deadline: the overall
+# --max-time is what makes MINIO_HEALTH_TIMEOUT_S effective.
+MINIO_HEALTH_CONNECT_TIMEOUT_S="${MINIO_HEALTH_CONNECT_TIMEOUT_S:-2}"
 
 check_eq() {
   local desc="$1" got="$2" want="$3"
@@ -230,29 +234,20 @@ start_minio_bin() {
   MINIO_PID=$!
 }
 
-wait_http() {
-  local url="$1"
-  local deadline=$(($(date +%s) + 40))
-  while :; do
-    if curl -sf "$url" >/dev/null; then
-      return 0
-    fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      return 1
-    fi
-    sleep 0.4
-  done
-}
-
 wait_health() {
+  # Bounded probe loop: each curl carries --connect-timeout/--max-time so a
+  # server that accepts TCP but stalls the HTTP response cannot hang past the
+  # deadline (the probe's --max-time is the seconds the wait has left).
   local url="$1"
   local deadline=$(($(date +%s) + MINIO_HEALTH_TIMEOUT_S))
+  local remaining
   while :; do
-    if curl -sf "$url" >/dev/null; then
-      return 0
-    fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
+    remaining=$((deadline - $(date +%s)))
+    if [ "$remaining" -le 0 ]; then
       return 1
+    fi
+    if curl -sf --connect-timeout "$MINIO_HEALTH_CONNECT_TIMEOUT_S" --max-time "$remaining" "$url" >/dev/null 2>&1; then
+      return 0
     fi
     sleep 0.4
   done
@@ -431,7 +426,7 @@ else
   export AWS_REGION="${AWS_REGION:-us-east-1}"
   export AWS_DEFAULT_REGION="$AWS_REGION"
 
-  if curl -sf "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null 2>&1; then
+  if wait_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"; then
     echo "reusing MinIO on :$MINIO_PORT"
   elif pick_runtime; then
     echo "starting MinIO with $RUNTIME on :$MINIO_PORT"
@@ -485,7 +480,7 @@ else
       exit 1
     fi
   fi
-  check_cmd "MinIO health" wait_http "http://127.0.0.1:${MINIO_PORT}/minio/health/live"
+  check_cmd "MinIO health" wait_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"
   check_cmd "create MinIO bucket $MINIO_BUCKET" create_bucket "127.0.0.1:${MINIO_PORT}" "$MINIO_BUCKET"
 
   if [ "${OBJECT_BOOTSTRAP_ONLY:-0}" = "1" ]; then
