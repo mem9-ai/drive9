@@ -102,8 +102,13 @@ type CommitEntry struct {
 	cancelCommit                 context.CancelFunc
 	cancelUpload                 context.CancelFunc
 	mutationPublished            bool
-	payload                      []byte
-	payloadBound                 bool
+	// layerVersion is the authoritative tuple returned by a successful layer
+	// upload. It is published before the pending generation is marked clean so
+	// replay cannot replace that committed child-layer result with an older
+	// snapshot.
+	layerVersion layerEntryVersion
+	payload      []byte
+	payloadBound bool
 }
 
 func (entry *CommitEntry) payloadBaseRevision() int64 {
@@ -693,6 +698,7 @@ func (cq *CommitQueue) RecoverPending() {
 	if cq.shadows != nil {
 		cq.shadows.RecoverPendingBytes()
 	}
+	layer := cq.layerRefSnapshot() != ""
 	for path := range cq.index.ListPendingPaths() {
 		meta, ok := cq.index.GetMeta(path)
 		if !ok {
@@ -710,7 +716,10 @@ func (cq *CommitQueue) RecoverPending() {
 			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
 			continue
 		}
-		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
+		if layer && meta.LayerCommitted {
+			continue
+		}
+		if !layer && meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
 			safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
 			continue
 		}
@@ -2052,6 +2061,7 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 	if cq == nil || cq.index == nil {
 		return 0
 	}
+	layer := cq.layerRefSnapshot() != ""
 	committed := 0
 	for path := range cq.index.ListPendingPaths() {
 		meta, ok := cq.index.GetMeta(path)
@@ -2067,7 +2077,10 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 		if meta.Kind == PendingConflict {
 			continue
 		}
-		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
+		if layer && meta.LayerCommitted {
+			continue
+		}
+		if !layer && meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
 			continue
 		}
 		size := meta.Size
@@ -2102,6 +2115,32 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 		committed++
 	}
 	return committed
+}
+
+// pendingRecoveryCount reports durable entries that can still make remote
+// progress. A layer's successfully uploaded entries remain in the same index
+// as its overlay data source, but LayerCommitted keeps them out of recovery;
+// a newer Put creates a fresh, uncommitted generation and is counted again.
+func (cq *CommitQueue) pendingRecoveryCount() int {
+	if cq == nil || cq.index == nil {
+		return 0
+	}
+	layer := cq.layerRefSnapshot() != ""
+	count := 0
+	for path := range cq.index.ListPendingPaths() {
+		meta, ok := cq.index.GetMeta(path)
+		if !ok || meta.Kind == PendingConflict {
+			continue
+		}
+		if layer && meta.LayerCommitted {
+			continue
+		}
+		if !layer && meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 // CommitNow uploads an entry synchronously through the same commit path used
@@ -2348,6 +2387,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 }
 
 func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string) (int64, error) {
+	entry.layerVersion = layerEntryVersion{}
 	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return 0, err
 	}
@@ -2365,9 +2405,13 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 			return 0, fmt.Errorf("layer entry %s size mismatch: metadata=%d actual=%d", entry.Path, entry.Size, actualSize)
 		}
 		start := time.Now()
-		_, err = cq.client.UploadFSLayerFile(ctx, layerRef, apiPath, fd, actualSize, expectedRevision, entry.Mode, entry.HasMode)
+		serverEntry, uploadErr := cq.client.UploadFSLayerFile(ctx, layerRef, apiPath, fd, actualSize, expectedRevision, entry.Mode, entry.HasMode)
+		err = uploadErr
 		if cq.perf != nil {
 			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(actualSize))
+		}
+		if err == nil {
+			entry.layerVersion = layerVersion(serverEntry)
 		}
 		return 0, err
 	}
@@ -2394,9 +2438,13 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 		req.Mode = entry.Mode & 0o777
 	}
 	start := time.Now()
-	_, err = cq.client.UpsertFSLayerEntry(ctx, layerRef, req)
+	serverEntry, uploadErr := cq.client.UpsertFSLayerEntry(ctx, layerRef, req)
+	err = uploadErr
 	if cq.perf != nil {
 		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
+	}
+	if err == nil {
+		entry.layerVersion = layerVersion(serverEntry)
 	}
 	return 0, err
 }
@@ -2513,8 +2561,9 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	// crash recovery never re-uploads an already committed entry.
 	if cq.journal != nil {
 		if err := cq.journal.Append(JournalEntry{
-			Op:   JournalCommit,
-			Path: entry.Path,
+			Op:         JournalCommit,
+			Path:       entry.Path,
+			Generation: entry.PendingIndexGen,
 		}); err != nil {
 			safeLogPrintf("commit queue: journal commit marker failed for %s: %v (keeping local state)", entry.Path, err)
 			cq.removeFromQueue(entry)
@@ -2543,7 +2592,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		}
 	}
 	if cq.index != nil && cq.layerRefSnapshot() != "" {
-		if err := cq.index.MarkCommitted(entry.Path, committedRev); err != nil {
+		if _, err := cq.index.MarkLayerCommitted(entry.Path, entry.PendingIndexGen, committedRev); err != nil {
 			return err
 		}
 	}
@@ -3005,8 +3054,9 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error
 	}
 	if cq.journal != nil {
 		if err := cq.journal.Append(JournalEntry{
-			Op:   JournalCommit, // treated as "done" so recovery won't re-enqueue
-			Path: entry.Path,
+			Op:         JournalCommit, // treated as "done" so recovery won't re-enqueue
+			Path:       entry.Path,
+			Generation: entry.PendingIndexGen,
 		}); err != nil {
 			safeLogPrintf("commit queue: journal done marker failed for %s: %v", entry.Path, err)
 		}

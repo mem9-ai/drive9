@@ -999,6 +999,7 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `FUSE_GIT_CLONE_TIMEOUT_S` | `180` | `fuse-smoke-test.sh` |
 | `RUN_FUSE_UMOUNT_DURABLE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `RUN_FUSE_LOG_AUDIT` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
+| `RUN_SYNCHRONOUS_PROMOTION_E2E` | `0` (enabled only by the pinned `tidbcloud/fs` cross-repo gate; server requires `DRIVE9_ENABLE_SYNCHRONOUS_PROMOTION=1`) | `fuse-smoke-test.sh` |
 | `RUN_GIT_WORKSPACE_SMOKE` | `0` | `smoke-all.sh` post-merge extra |
 | `RUN_JOURNAL_SMOKE` | `0` | `smoke-all.sh` post-merge extra |
 | `RUN_POSIX_SMOKE` | `0` | `smoke-all.sh` post-merge extra |

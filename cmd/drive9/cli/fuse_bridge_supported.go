@@ -50,6 +50,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		LayerRef:                     opts.LayerRef,
 		CheckpointRef:                opts.CheckpointRef,
 		LocalRoot:                    opts.LocalRoot,
+		EnableSynchronousPromotion:   opts.EnableSynchronousPromotion,
 		LocalOnlyPatterns:            opts.LocalOnlyPatterns,
 		RemoteOnlyPatterns:           opts.RemoteOnlyPatterns,
 		AppendLogPatterns:            opts.AppendLogPatterns,

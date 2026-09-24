@@ -22,6 +22,7 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"go.uber.org/zap"
 
+	"github.com/mem9-ai/drive9/internal/drivehttp"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
@@ -64,12 +65,36 @@ var testHookExtentBuildWait func()
 // syscall.EAGAIN directly and returns to the caller without an internal spin.
 var errAppendRefreshBusy = errors.New("append refresh source busy")
 
+// layerEntryVersion is scoped to one fs layer. EntrySeq is monotonic only
+// within LayerID: an inherited parent entry at seq 100 must not outrank the
+// first mutation (seq 1) written to the mounted child layer.
+type layerEntryVersion struct {
+	LayerID  string
+	EntrySeq int64
+}
+
+func layerVersion(entry *client.FSLayerEntry) layerEntryVersion {
+	if entry == nil {
+		return layerEntryVersion{}
+	}
+	return layerEntryVersion{LayerID: entry.LayerID, EntrySeq: entry.EntrySeq}
+}
+
+func (version layerEntryVersion) valid() bool {
+	return version.EntrySeq > 0
+}
+
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
 // operations to the dat9 HTTP API via the Go SDK client.
 type Dat9FS struct {
 	gofuse.RawFileSystem
 
 	client              *client.Client
+	promotionRootLock   *os.File
+	promotionHTTPClient *http.Client
+	promotionBaseURL    string
+	promotionCredential string
+	promotionActor      string
 	inodes              *InodeToPath
 	fileHandles         *HandleTable[*FileHandle]
 	openHandles         *OpenHandleIndex
@@ -196,6 +221,15 @@ type Dat9FS struct {
 	extentCacheDir string
 	// localOverlay stores local-only paths under MountOptions.LocalRoot.
 	localOverlay *LocalOverlay
+	// promotionBarrier freezes FUSE opens and namespace/data mutations while a
+	// local-only tree is scanned and atomically published. It is only consulted
+	// when the preview feature is enabled.
+	promotionBarrier sync.RWMutex
+	promotionBlocked atomic.Bool
+	// promotionLifecycleMu serializes the single durable promotion journal
+	// with its released-phase background cleanup. It never gates ordinary FUSE
+	// work, so a slow receipt acknowledgement cannot freeze the mount.
+	promotionLifecycleMu sync.Mutex
 	// transientLocalOverlay stores mount-local runtime sidecars that must be
 	// shared by all handles in one mount, but must not become remote state.
 	transientLocalOverlay *LocalOverlay
@@ -227,6 +261,12 @@ type Dat9FS struct {
 	layerFiles                map[string]uint32
 	layerDirs                 map[string]uint32
 	layerSymlinks             map[string]layerSymlinkState
+	// layerEntryVersion records the newest authoritative layer version published
+	// for each local path. Event replay is fetched outside the lifecycle
+	// barrier, so its snapshot can become stale while a local namespace
+	// mutation is already in flight. Versions include layer identity because
+	// EntrySeq is monotonic per layer, not across a parent/child chain.
+	layerEntryVersion map[string]layerEntryVersion
 	// layerAbandoned is set when the layer-event watcher observes a
 	// rollback event, signalling that the mounted layer is now abandoned.
 	// Subsequent write ops short-circuit with errLayerRolledBack (→ ESTALE)
@@ -458,40 +498,54 @@ type layerSymlinkState struct {
 
 // NewDat9FS creates a new FUSE filesystem backed by the given dat9 client.
 func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
-	return &Dat9FS{
-		RawFileSystem:     gofuse.NewDefaultRawFileSystem(),
-		client:            c,
-		inodes:            NewInodeToPath(),
-		fileHandles:       NewHandleTable[*FileHandle](),
-		openHandles:       NewOpenHandleIndex(),
-		locks:             newFuseLockTable(),
-		dirHandles:        NewHandleTable[*DirHandle](),
-		committedRev:      make(map[string]int64),
-		committedSize:     make(map[string]int64),
-		remoteCommitLocks: make(map[string]*sync.Mutex),
-		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, opts.ReadCacheTTL, opts.ReadCacheMaxFileBytes),
-		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, dirCacheMaxEntriesOrDefault(opts.DirCacheMaxEntries)),
-		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
-		dirtyInodes:       make(map[uint64]dirtyInodeState),
-		kernelCacheBypass: make(map[uint64]kernelCacheBypassMarker),
-		specialByPath:     make(map[string]uint64),
-		uid:               uint32(os.Getuid()),
-		gid:               uint32(os.Getgid()),
-		opts:              opts,
-		syncMode:          opts.SyncMode,
-		debouncer:         newFlushDebouncer(opts.FlushDebounce),
-		perf:              newFusePerfCounters(opts.PerfCounters || opts.Profiling.PerfSamplesPath != ""),
-		localPolicy:       NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
-		appendLogMatcher:  NewAppendLogMatcher(opts.AppendLogPatterns),
-		localOverlay:      NewLocalOverlay(opts.LocalRoot),
-		git:               newGitWorkspaceLayer(),
-		gitCheckpoints:    newFlushDebouncer(gitCheckpointDebounce),
-		gitOverlayPending: make(map[string]map[string][]pendingGitOverlayEntry),
-		readFlight:        NewSingleFlight(),
-		remoteReadTimeout: fuseTimeout,
-		xattrs:            NewXAttrStore(),
-		deletedPaths:      make(map[string]time.Time),
+	credential := opts.APIKey
+	if opts.Token != "" {
+		credential = opts.Token
 	}
+	if credential == "" && c != nil {
+		credential = c.APIKey()
+	}
+	fs := &Dat9FS{
+		RawFileSystem:       gofuse.NewDefaultRawFileSystem(),
+		client:              c,
+		promotionHTTPClient: drivehttp.NewClient(),
+		promotionCredential: credential,
+		promotionActor:      opts.actorID,
+		inodes:              NewInodeToPath(),
+		fileHandles:         NewHandleTable[*FileHandle](),
+		openHandles:         NewOpenHandleIndex(),
+		locks:               newFuseLockTable(),
+		dirHandles:          NewHandleTable[*DirHandle](),
+		committedRev:        make(map[string]int64),
+		committedSize:       make(map[string]int64),
+		remoteCommitLocks:   make(map[string]*sync.Mutex),
+		readCache:           NewReadCacheWithMaxFileSize(opts.CacheSize, opts.ReadCacheTTL, opts.ReadCacheMaxFileBytes),
+		dirCache:            NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, dirCacheMaxEntriesOrDefault(opts.DirCacheMaxEntries)),
+		readSlots:           make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
+		dirtyInodes:         make(map[uint64]dirtyInodeState),
+		kernelCacheBypass:   make(map[uint64]kernelCacheBypassMarker),
+		specialByPath:       make(map[string]uint64),
+		uid:                 uint32(os.Getuid()),
+		gid:                 uint32(os.Getgid()),
+		opts:                opts,
+		syncMode:            opts.SyncMode,
+		debouncer:           newFlushDebouncer(opts.FlushDebounce),
+		perf:                newFusePerfCounters(opts.PerfCounters || opts.Profiling.PerfSamplesPath != ""),
+		localPolicy:         NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
+		appendLogMatcher:    NewAppendLogMatcher(opts.AppendLogPatterns),
+		localOverlay:        NewLocalOverlay(opts.LocalRoot),
+		git:                 newGitWorkspaceLayer(),
+		gitCheckpoints:      newFlushDebouncer(gitCheckpointDebounce),
+		gitOverlayPending:   make(map[string]map[string][]pendingGitOverlayEntry),
+		readFlight:          NewSingleFlight(),
+		remoteReadTimeout:   fuseTimeout,
+		xattrs:              NewXAttrStore(),
+		deletedPaths:        make(map[string]time.Time),
+	}
+	if c != nil {
+		fs.promotionBaseURL = c.BaseURL()
+	}
+	return fs
 }
 
 // SetWriteBack configures the write-back cache and uploader on the filesystem.
@@ -846,17 +900,22 @@ func (fs *Dat9FS) isLayerAbandoned() bool {
 }
 
 func (fs *Dat9FS) upsertLayerEntry(ctx context.Context, req client.FSLayerEntryRequest, bytes uint64) error {
+	_, err := fs.upsertLayerEntryResult(ctx, req, bytes)
+	return err
+}
+
+func (fs *Dat9FS) upsertLayerEntryResult(ctx context.Context, req client.FSLayerEntryRequest, bytes uint64) (*client.FSLayerEntry, error) {
 	if fs.isLayerAbandoned() {
-		return errLayerRolledBack
+		return nil, errLayerRolledBack
 	}
 	layerRef := fs.layerRef()
 	if layerRef == "" {
-		return fmt.Errorf("fs layer is not configured")
+		return nil, fmt.Errorf("fs layer is not configured")
 	}
 	start := fs.perfStart()
-	_, err := fs.client.UpsertFSLayerEntry(ctx, layerRef, req)
+	entry, err := fs.client.UpsertFSLayerEntry(ctx, layerRef, req)
 	fs.perfRecordRemote(perfRemoteMutation, start, err, bytes)
-	return err
+	return entry, err
 }
 
 func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []byte, expectedRevision int64, mode uint32, hasMode bool) error {
@@ -865,16 +924,12 @@ func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []
 			return errLayerRolledBack
 		}
 		start := fs.perfStart()
-		_, err := fs.client.UploadFSLayerFile(ctx, fs.layerRef(), fs.remotePath(localPath), bytes.NewReader(data), int64(len(data)), expectedRevision, mode, hasMode)
+		entry, err := fs.client.UploadFSLayerFile(ctx, fs.layerRef(), fs.remotePath(localPath), bytes.NewReader(data), int64(len(data)), expectedRevision, mode, hasMode)
 		fs.perfRecordRemote(perfRemoteMutation, start, err, uint64(len(data)))
 		if err != nil {
 			return err
 		}
-		if hasMode {
-			fs.markLayerFileMode(localPath, mode)
-		} else {
-			fs.markLayerFile(localPath)
-		}
+		fs.markLayerFileAtVersion(localPath, mode, hasMode, layerVersion(entry))
 		return nil
 	}
 	req := client.FSLayerEntryRequest{
@@ -888,27 +943,25 @@ func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []
 	if hasMode {
 		req.Mode = mode & 0o777
 	}
-	if err := fs.upsertLayerEntry(ctx, req, uint64(len(data))); err != nil {
+	entry, err := fs.upsertLayerEntryResult(ctx, req, uint64(len(data)))
+	if err != nil {
 		return err
 	}
-	if hasMode {
-		fs.markLayerFileMode(localPath, mode)
-	} else {
-		fs.markLayerFile(localPath)
-	}
+	fs.markLayerFileAtVersion(localPath, mode, hasMode, layerVersion(entry))
 	return nil
 }
 
 func (fs *Dat9FS) upsertLayerMkdir(ctx context.Context, localPath string, mode uint32) error {
-	if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+	entry, err := fs.upsertLayerEntryResult(ctx, client.FSLayerEntryRequest{
 		Path: fs.remotePath(localPath),
 		Op:   "mkdir",
 		Kind: "dir",
 		Mode: mode & 0o777,
-	}, 0); err != nil {
+	}, 0)
+	if err != nil {
 		return err
 	}
-	fs.markLayerDir(localPath, mode)
+	fs.markLayerDirAtVersion(localPath, mode, layerVersion(entry))
 	return nil
 }
 
@@ -917,14 +970,15 @@ func (fs *Dat9FS) upsertLayerWhiteout(ctx context.Context, localPath string, kin
 	if kind == deleteKindDir {
 		entryKind = "dir"
 	}
-	if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+	entry, err := fs.upsertLayerEntryResult(ctx, client.FSLayerEntryRequest{
 		Path: fs.remotePath(localPath),
 		Op:   "whiteout",
 		Kind: entryKind,
-	}, 0); err != nil {
+	}, 0)
+	if err != nil {
 		return err
 	}
-	fs.markLayerWhiteout(localPath)
+	fs.markLayerWhiteoutAtVersion(localPath, layerVersion(entry))
 	return nil
 }
 
@@ -956,13 +1010,23 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 			}
 			if fs.pendingIndex != nil {
 				if !hadPending {
-					if _, err := fs.pendingIndex.PutWithBaseRevAndMode(localPath, int64(len(data)), pendingKind, baseRev, mode, true); err != nil {
+					gen, err := fs.pendingIndex.PutWithBaseRevAndMode(localPath, int64(len(data)), pendingKind, baseRev, mode, true)
+					if err != nil {
 						return fmt.Errorf("put pending mode for layer chmod %s: %w", localPath, err)
+					}
+					if _, err := fs.pendingIndex.MarkLayerCommitted(localPath, gen, baseRev); err != nil {
+						return fmt.Errorf("mark pending mode committed for layer chmod %s: %w", localPath, err)
 					}
 					return nil
 				}
-				if err := fs.pendingIndex.UpdateMode(localPath, mode); err != nil {
+				gen, err := fs.pendingIndex.UpdateMode(localPath, mode)
+				if err != nil {
 					return fmt.Errorf("update pending mode for layer chmod %s: %w", localPath, err)
+				}
+				if gen != 0 {
+					if _, err := fs.pendingIndex.MarkLayerCommitted(localPath, gen, baseRev); err != nil {
+						return fmt.Errorf("mark pending mode committed for layer chmod %s: %w", localPath, err)
+					}
 				}
 			}
 			return nil
@@ -981,8 +1045,12 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 				return err
 			}
 			if fs.pendingIndex != nil {
-				if _, err := fs.pendingIndex.PutWithBaseRevAndMode(localPath, int64(len(entry.Content)), pendingKind, baseRev, mode, true); err != nil {
+				gen, err := fs.pendingIndex.PutWithBaseRevAndMode(localPath, int64(len(entry.Content)), pendingKind, baseRev, mode, true)
+				if err != nil {
 					return fmt.Errorf("put pending mode for layer chmod %s: %w", localPath, err)
+				}
+				if _, err := fs.pendingIndex.MarkLayerCommitted(localPath, gen, baseRev); err != nil {
+					return fmt.Errorf("mark pending mode committed for layer chmod %s: %w", localPath, err)
 				}
 			}
 			return nil
@@ -991,26 +1059,28 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 			return err
 		}
 	}
-	if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+	entry, err := fs.upsertLayerEntryResult(ctx, client.FSLayerEntryRequest{
 		Path: fs.remotePath(localPath),
 		Op:   "chmod",
 		Kind: kind,
 		Mode: mode & 0o777,
-	}, 0); err != nil {
+	}, 0)
+	if err != nil {
 		return err
 	}
+	version := layerVersion(entry)
 	switch kind {
 	case "file":
-		fs.markLayerFileMode(localPath, mode)
+		fs.markLayerFileAtVersion(localPath, mode, true, version)
 	case "dir":
-		fs.markLayerDir(localPath, mode)
+		fs.markLayerDirAtVersion(localPath, mode, version)
 	case "symlink":
 		if target, existingMode, ok := fs.layerSymlink(localPath); ok {
 			nextMode := (existingMode &^ uint32(0o777)) | (mode & 0o777)
 			if nextMode&uint32(syscall.S_IFMT) == 0 {
 				nextMode |= uint32(syscall.S_IFLNK)
 			}
-			fs.markLayerSymlink(localPath, target, nextMode)
+			fs.markLayerSymlinkAtVersion(localPath, target, nextMode, version)
 		}
 	}
 	return nil
@@ -1049,17 +1119,18 @@ func (fs *Dat9FS) layerEntryKind(ctx context.Context, localPath string) string {
 }
 
 func (fs *Dat9FS) upsertLayerSymlink(ctx context.Context, localPath string, target string) error {
-	if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+	entry, err := fs.upsertLayerEntryResult(ctx, client.FSLayerEntryRequest{
 		Path:        fs.remotePath(localPath),
 		Op:          "symlink",
 		Kind:        "symlink",
 		ContentText: target,
 		SizeBytes:   int64(len(target)),
 		Mode:        symlinkMode(),
-	}, uint64(len(target))); err != nil {
+	}, uint64(len(target)))
+	if err != nil {
 		return err
 	}
-	fs.markLayerSymlink(localPath, target, symlinkMode())
+	fs.markLayerSymlinkAtVersion(localPath, target, symlinkMode(), layerVersion(entry))
 	return nil
 }
 
@@ -1070,17 +1141,18 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 		if mode == 0 {
 			mode = symlinkMode()
 		}
-		if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+		entry, err := fs.upsertLayerEntryResult(ctx, client.FSLayerEntryRequest{
 			Path:        newRemote,
 			Op:          "symlink",
 			Kind:        "symlink",
 			ContentText: target,
 			SizeBytes:   int64(len(target)),
 			Mode:        mode,
-		}, uint64(len(target))); err != nil {
+		}, uint64(len(target)))
+		if err != nil {
 			return err
 		}
-		fs.markLayerSymlink(newLocalPath, target, mode)
+		fs.markLayerSymlinkAtVersion(newLocalPath, target, mode, layerVersion(entry))
 		if err := fs.upsertLayerWhiteout(ctx, oldLocalPath, deleteKindFile); err != nil {
 			return err
 		}
@@ -1130,17 +1202,17 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 			} else if !isNotFoundErr(err) {
 				return err
 			}
-			if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+			entry, err := fs.upsertLayerEntryResult(ctx, client.FSLayerEntryRequest{
 				Path:        oldRemote,
 				Op:          "rename",
 				Kind:        "dir",
 				ContentText: newRemote,
 				Mode:        sourceStat.Mode & 0o777,
-			}, 0); err != nil {
+			}, 0)
+			if err != nil {
 				return err
 			}
-			fs.markLayerWhiteout(oldLocalPath)
-			fs.markLayerDir(newLocalPath, sourceStat.Mode&0o777)
+			fs.markLayerDirRenameAtVersion(oldLocalPath, newLocalPath, sourceStat.Mode&0o777, layerVersion(entry))
 			return nil
 		}
 		data, err = fs.client.ReadCtx(ctx, oldRemote)
@@ -1255,6 +1327,7 @@ func (fs *Dat9FS) clearLayerOverlay() {
 	fs.layerFiles = make(map[string]uint32)
 	fs.layerDirs = make(map[string]uint32)
 	fs.layerSymlinks = make(map[string]layerSymlinkState)
+	fs.layerEntryVersion = make(map[string]layerEntryVersion)
 	fs.layerMu.Unlock()
 }
 
@@ -1379,6 +1452,308 @@ func (fs *Dat9FS) applyLayerRollback(shadows *ShadowStore, pending *PendingIndex
 	fmt.Fprintf(os.Stderr, "drive9: fs layer rolled back — mount now reflects base view; pending local writes preserved as conflict for manual recovery\n")
 }
 
+// layerVersionNewer reports whether current must fence candidate. Sequences
+// are comparable only inside one layer. The mounted writable layer always
+// wins over an inherited ancestor, even when the ancestor's numeric sequence
+// is larger; mounts resolve LayerRef to its canonical layer ID at startup.
+func (fs *Dat9FS) layerVersionNewer(current, candidate layerEntryVersion) bool {
+	if !current.valid() || !candidate.valid() {
+		return false
+	}
+	if current.LayerID == candidate.LayerID || current.LayerID == "" || candidate.LayerID == "" {
+		return current.EntrySeq > candidate.EntrySeq
+	}
+	mountedLayerID := fs.layerRef()
+	if current.LayerID == mountedLayerID {
+		return true
+	}
+	if candidate.LayerID == mountedLayerID {
+		return false
+	}
+	// Parent layers are immutable after a fork and a folded replay contains
+	// only one effective entry per path. There is no sound numeric ordering
+	// across two ancestor layer IDs, so accept the authoritative replay tuple.
+	return false
+}
+
+// layerReplayStale reports whether an entry fetched before the lifecycle
+// barrier is older than a mutation already published by this mount. Callers
+// that act on the result must hold promotionBarrier exclusively.
+func (fs *Dat9FS) layerReplayStale(paths []string, version layerEntryVersion) bool {
+	if fs == nil || !version.valid() {
+		return false
+	}
+	fs.layerMu.RLock()
+	defer fs.layerMu.RUnlock()
+	for _, p := range paths {
+		if fs.layerVersionNewer(fs.layerEntryVersion[p], version) {
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *Dat9FS) acceptLayerEntryVersionLocked(paths []string, version layerEntryVersion) bool {
+	if !version.valid() {
+		return true
+	}
+	for _, p := range paths {
+		if fs.layerVersionNewer(fs.layerEntryVersion[p], version) {
+			return false
+		}
+	}
+	if fs.layerEntryVersion == nil {
+		fs.layerEntryVersion = make(map[string]layerEntryVersion)
+	}
+	for _, p := range paths {
+		if p != "" {
+			fs.layerEntryVersion[p] = version
+		}
+	}
+	return true
+}
+
+func (fs *Dat9FS) recordLayerEntryVersion(localPath string, version layerEntryVersion) bool {
+	if fs == nil || localPath == "" || !version.valid() {
+		return false
+	}
+	fs.layerMu.Lock()
+	defer fs.layerMu.Unlock()
+	return fs.acceptLayerEntryVersionLocked([]string{localPath}, version)
+}
+
+func (fs *Dat9FS) markLayerWhiteoutAtVersion(localPath string, version layerEntryVersion) bool {
+	if fs == nil || localPath == "" {
+		return false
+	}
+	fs.layerMu.Lock()
+	defer fs.layerMu.Unlock()
+	if fs.layerAbandoned.Load() || !fs.acceptLayerEntryVersionLocked([]string{localPath}, version) {
+		return false
+	}
+	if fs.layerWhiteouts == nil {
+		fs.layerWhiteouts = make(map[string]struct{})
+	}
+	fs.layerWhiteouts[localPath] = struct{}{}
+	delete(fs.layerFiles, localPath)
+	delete(fs.layerDirs, localPath)
+	delete(fs.layerSymlinks, localPath)
+	return true
+}
+
+func (fs *Dat9FS) markLayerFileAtVersion(localPath string, mode uint32, hasMode bool, version layerEntryVersion) bool {
+	if fs == nil || localPath == "" {
+		return false
+	}
+	fs.layerMu.Lock()
+	defer fs.layerMu.Unlock()
+	if fs.layerAbandoned.Load() || !fs.acceptLayerEntryVersionLocked([]string{localPath}, version) {
+		return false
+	}
+	delete(fs.layerWhiteouts, localPath)
+	delete(fs.layerDirs, localPath)
+	delete(fs.layerSymlinks, localPath)
+	if hasMode {
+		if fs.layerFiles == nil {
+			fs.layerFiles = make(map[string]uint32)
+		}
+		fs.layerFiles[localPath] = mode & 0o777
+	} else {
+		delete(fs.layerFiles, localPath)
+	}
+	return true
+}
+
+func (fs *Dat9FS) markLayerDirAtVersion(localPath string, mode uint32, version layerEntryVersion) bool {
+	if fs == nil || localPath == "" {
+		return false
+	}
+	fs.layerMu.Lock()
+	defer fs.layerMu.Unlock()
+	if fs.layerAbandoned.Load() || !fs.acceptLayerEntryVersionLocked([]string{localPath}, version) {
+		return false
+	}
+	if fs.layerDirs == nil {
+		fs.layerDirs = make(map[string]uint32)
+	}
+	fs.layerDirs[localPath] = mode & 0o777
+	delete(fs.layerWhiteouts, localPath)
+	delete(fs.layerFiles, localPath)
+	delete(fs.layerSymlinks, localPath)
+	return true
+}
+
+func (fs *Dat9FS) markLayerSymlinkAtVersion(localPath, target string, mode uint32, version layerEntryVersion) bool {
+	if fs == nil || localPath == "" {
+		return false
+	}
+	if mode == 0 {
+		mode = symlinkMode()
+	} else if mode&uint32(syscall.S_IFMT) == 0 {
+		mode = uint32(syscall.S_IFLNK) | (mode & 0o777)
+	}
+	fs.layerMu.Lock()
+	defer fs.layerMu.Unlock()
+	if fs.layerAbandoned.Load() || !fs.acceptLayerEntryVersionLocked([]string{localPath}, version) {
+		return false
+	}
+	if fs.layerSymlinks == nil {
+		fs.layerSymlinks = make(map[string]layerSymlinkState)
+	}
+	fs.layerSymlinks[localPath] = layerSymlinkState{Target: target, Mode: mode}
+	delete(fs.layerWhiteouts, localPath)
+	delete(fs.layerFiles, localPath)
+	delete(fs.layerDirs, localPath)
+	return true
+}
+
+func (fs *Dat9FS) markLayerRenameAtVersion(oldPath, newPath string, mode uint32, version layerEntryVersion) bool {
+	if fs == nil || oldPath == "" || newPath == "" {
+		return false
+	}
+	fs.layerMu.Lock()
+	defer fs.layerMu.Unlock()
+	if fs.layerAbandoned.Load() || !fs.acceptLayerEntryVersionLocked([]string{oldPath, newPath}, version) {
+		return false
+	}
+	if fs.layerWhiteouts == nil {
+		fs.layerWhiteouts = make(map[string]struct{})
+	}
+	fs.layerWhiteouts[oldPath] = struct{}{}
+	delete(fs.layerFiles, oldPath)
+	delete(fs.layerDirs, oldPath)
+	delete(fs.layerSymlinks, oldPath)
+	delete(fs.layerWhiteouts, newPath)
+	delete(fs.layerDirs, newPath)
+	delete(fs.layerSymlinks, newPath)
+	if mode != 0 {
+		if fs.layerFiles == nil {
+			fs.layerFiles = make(map[string]uint32)
+		}
+		fs.layerFiles[newPath] = mode & 0o777
+	} else {
+		delete(fs.layerFiles, newPath)
+	}
+	return true
+}
+
+func layerPathWithin(p, root string) bool {
+	return p == root || strings.HasPrefix(p, strings.TrimSuffix(root, "/")+"/")
+}
+
+// markLayerDirRenameAtVersion applies the namespace projection of a server-side
+// directory rename without manufacturing file shadow/pending state. Existing
+// retained overlay descendants move with the directory. A replay snapshot may
+// replace them only when no later local server mutation has already published
+// either side of the subtree.
+func (fs *Dat9FS) markLayerDirRenameAtVersion(oldPath, newPath string, mode uint32, version layerEntryVersion) bool {
+	if fs == nil || oldPath == "" || newPath == "" {
+		return false
+	}
+	fs.layerMu.Lock()
+	defer fs.layerMu.Unlock()
+	if fs.layerAbandoned.Load() {
+		return false
+	}
+	if version.valid() {
+		for p, current := range fs.layerEntryVersion {
+			if (layerPathWithin(p, oldPath) || layerPathWithin(p, newPath)) && fs.layerVersionNewer(current, version) {
+				return false
+			}
+		}
+	}
+
+	movePath := func(p string) string { return newPath + strings.TrimPrefix(p, oldPath) }
+	moveModes := func(values map[string]uint32) {
+		moved := make(map[string]uint32)
+		for p, value := range values {
+			if layerPathWithin(p, oldPath) {
+				moved[movePath(p)] = value
+				delete(values, p)
+			} else if layerPathWithin(p, newPath) {
+				delete(values, p)
+			}
+		}
+		for p, value := range moved {
+			values[p] = value
+		}
+	}
+	moveSymlinks := func(values map[string]layerSymlinkState) {
+		moved := make(map[string]layerSymlinkState)
+		for p, value := range values {
+			if layerPathWithin(p, oldPath) {
+				moved[movePath(p)] = value
+				delete(values, p)
+			} else if layerPathWithin(p, newPath) {
+				delete(values, p)
+			}
+		}
+		for p, value := range moved {
+			values[p] = value
+		}
+	}
+	moveWhiteouts := func(values map[string]struct{}) {
+		moved := make(map[string]struct{})
+		for p := range values {
+			if layerPathWithin(p, oldPath) {
+				moved[movePath(p)] = struct{}{}
+				delete(values, p)
+			} else if layerPathWithin(p, newPath) {
+				delete(values, p)
+			}
+		}
+		for p := range moved {
+			values[p] = struct{}{}
+		}
+	}
+
+	moveModes(fs.layerFiles)
+	moveModes(fs.layerDirs)
+	moveSymlinks(fs.layerSymlinks)
+	moveWhiteouts(fs.layerWhiteouts)
+	if fs.layerEntryVersion == nil {
+		fs.layerEntryVersion = make(map[string]layerEntryVersion)
+	}
+	movedVersions := make(map[string]layerEntryVersion)
+	for p, current := range fs.layerEntryVersion {
+		if layerPathWithin(p, oldPath) {
+			target := movePath(p)
+			if version.valid() {
+				current = version
+			}
+			movedVersions[target] = current
+			if version.valid() {
+				fs.layerEntryVersion[p] = version
+			}
+		} else if layerPathWithin(p, newPath) {
+			delete(fs.layerEntryVersion, p)
+		}
+	}
+	for p, movedVersion := range movedVersions {
+		fs.layerEntryVersion[p] = movedVersion
+	}
+	if version.valid() {
+		fs.layerEntryVersion[oldPath] = version
+		fs.layerEntryVersion[newPath] = version
+	}
+
+	if fs.layerWhiteouts == nil {
+		fs.layerWhiteouts = make(map[string]struct{})
+	}
+	if fs.layerDirs == nil {
+		fs.layerDirs = make(map[string]uint32)
+	}
+	fs.layerWhiteouts[oldPath] = struct{}{}
+	delete(fs.layerFiles, oldPath)
+	delete(fs.layerDirs, oldPath)
+	delete(fs.layerSymlinks, oldPath)
+	delete(fs.layerWhiteouts, newPath)
+	delete(fs.layerFiles, newPath)
+	delete(fs.layerSymlinks, newPath)
+	fs.layerDirs[newPath] = mode & 0o777
+	return true
+}
+
 func (fs *Dat9FS) markLayerWhiteout(localPath string) {
 	if fs == nil || localPath == "" {
 		return
@@ -1395,22 +1770,6 @@ func (fs *Dat9FS) markLayerWhiteout(localPath string) {
 		fs.layerWhiteouts = make(map[string]struct{})
 	}
 	fs.layerWhiteouts[localPath] = struct{}{}
-	delete(fs.layerFiles, localPath)
-	delete(fs.layerDirs, localPath)
-	delete(fs.layerSymlinks, localPath)
-	fs.layerMu.Unlock()
-}
-
-func (fs *Dat9FS) markLayerFile(localPath string) {
-	if fs == nil || localPath == "" {
-		return
-	}
-	fs.layerMu.Lock()
-	if fs.layerAbandoned.Load() {
-		fs.layerMu.Unlock()
-		return
-	}
-	delete(fs.layerWhiteouts, localPath)
 	delete(fs.layerFiles, localPath)
 	delete(fs.layerDirs, localPath)
 	delete(fs.layerSymlinks, localPath)
@@ -2414,7 +2773,7 @@ func shouldAdoptSingleHandlePathTruncate(fh *FileHandle, callerPID uint32, match
 	if callerPID == 0 || matchCount != 1 {
 		return false
 	}
-	return fh.OpenPID == callerPID
+	return fh.OpenPID == callerPID && writableHandleHasPendingContentLocked(fh)
 }
 
 func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) (func(), error) {
@@ -2579,15 +2938,14 @@ func (fs *Dat9FS) updateOpenHandleBaseRevisionForPath(remotePath string, revisio
 		adoptedPathTruncate := false
 		fh.Lock()
 		fs.adoptCommittedStorageClassLocked(fh, truncateSize)
-		// The truncating caller's own handle always adopts the truncate and
-		// the fresh base revision, regardless of the O_TRUNC flag or the
-		// sibling-handle count: the caller's own history includes the
-		// truncation, and the kernel does not propagate O_TRUNC into the FUSE
-		// open flags (it issues the truncate as a separate SetAttr), so the
-		// conservative O_TRUNC heuristic below never fires for real O_TRUNC
-		// writers and their next commit would CAS-conflict forever.
-		callerOwned := callerPID != 0 && fh.OpenPID != 0 && fh.OpenPID == callerPID
-		if callerOwned && fs.isPassiveCloseSyncHandleLocked(fh) {
+		// The truncating caller's own pending-content handle adopts the
+		// truncate and fresh base revision. A clean same-PID handle may instead
+		// be an older close-sync handle whose Release is delayed; the committed
+		// truncate path rebases that handle without making it dirty below.
+		callerMatches := callerPID != 0 && fh.OpenPID != 0 && fh.OpenPID == callerPID
+		callerOwned := callerMatches &&
+			writableHandleHasPendingContentLocked(fh)
+		if callerMatches && !callerOwned && fs.isPassiveCloseSyncHandleLocked(fh) {
 			// This truncate is already durable. A clean handle may be awaiting
 			// asynchronous Release after a successful Flush; updating its view
 			// must not give it another mutation to publish on Release.
@@ -2778,26 +3136,22 @@ func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, ne
 	// remote path there.
 	var owner *FileHandle
 	for _, fh := range fs.fileHandlesForInode(ino) {
-		if fh == nil || fh.Dirty == nil || fh.Unlinked {
-			continue
-		}
-		if !localFileHandleOpenedWritable(fh) {
+		if fh == nil {
 			continue
 		}
 		fh.Lock()
-		// Flush can finish before the kernel dispatches Release. Such a
-		// clean close-sync handle is not an owner for a new path mutation:
-		// SetAttr must commit it rather than leave a delayed Release upload.
-		canOwn := !fs.isPassiveCloseSyncHandleLocked(fh)
-		foreign := fh.OpenPID != callerPID
+		liveWriter := !fh.Unlinked && fh.Dirty != nil && localFileHandleOpenedWritable(fh)
+		pendingContent := liveWriter && writableHandleHasPendingContentLocked(fh)
+		openPID := fh.OpenPID
+		passive := liveWriter && fs.isPassiveCloseSyncHandleLocked(fh)
 		fh.Unlock()
-		if !canOwn {
+		if !liveWriter || passive {
 			continue
 		}
-		if foreign {
+		if openPID != callerPID {
 			return false
 		}
-		if owner == nil {
+		if pendingContent && owner == nil {
 			owner = fh
 		}
 	}
@@ -2808,8 +3162,11 @@ func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, ne
 		testHookAfterCallerOwnedTruncateScan(owner.Path)
 	}
 	owner.Lock()
-	// A concurrent Flush may have committed the candidate while we scanned.
-	if fs.isPassiveCloseSyncHandleLocked(owner) {
+	// Release is asynchronous from the kernel's perspective. A handle that
+	// was dirty when sampled above may have completed its close-sync commit
+	// before we acquired its lock. Do not turn that now-clean, not-yet-released
+	// handle into the owner of a later path truncate from the same process.
+	if owner.Unlinked || fs.isPassiveCloseSyncHandleLocked(owner) || !writableHandleHasPendingContentLocked(owner) {
 		owner.Unlock()
 		return false
 	}
@@ -2823,6 +3180,19 @@ func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, ne
 		return false
 	}
 	return true
+}
+
+// writableHandleHasPendingContentLocked reports whether a writable handle
+// still owns an uncommitted content generation. Merely having a WriteBuffer is
+// insufficient: close-sync keeps a clean buffer on the handle until the
+// kernel eventually sends Release, and a subsequent O_TRUNC from the same PID
+// must not be folded into that older handle.
+func writableHandleHasPendingContentLocked(fh *FileHandle) bool {
+	if fh == nil || fh.Dirty == nil {
+		return false
+	}
+	return fh.IsNew || fh.ZeroBase || fh.DirtySeq != 0 || fh.WriteBackSeq != 0 ||
+		fh.ShadowCommitReady || fh.ShadowCommitSeq != 0 || fh.Dirty.HasDirtyParts()
 }
 
 func (fs *Dat9FS) clearRemovedCommittedShadowForOpenHandles(path string, committedRev, committedSize int64) {
@@ -3081,6 +3451,32 @@ func (fs *Dat9FS) lockRemoteCommitPath(path string) func() {
 
 	lock.Lock()
 	return lock.Unlock
+}
+
+// lockRemoteCommitPaths takes the same per-path locks used by writers in a
+// stable order. It is cooperative rather than an ownership proof (writers may
+// time out and proceed); replay must still use pending/shadow generation CAS
+// before publishing local state.
+func (fs *Dat9FS) lockRemoteCommitPaths(paths ...string) func() {
+	if fs == nil {
+		return func() {}
+	}
+	ordered := append([]string(nil), paths...)
+	sort.Strings(ordered)
+	unlocks := make([]func(), 0, len(ordered))
+	last := ""
+	for _, p := range ordered {
+		if p == "" || p == last {
+			continue
+		}
+		last = p
+		unlocks = append(unlocks, fs.lockRemoteCommitPath(p))
+	}
+	return func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}
 }
 
 // lockRemoteCommitPathTimeout is like lockRemoteCommitPath but bounded by a
@@ -3455,7 +3851,7 @@ func (fs *Dat9FS) fileHandlesForInode(ino uint64) []*FileHandle {
 func (fs *Dat9FS) setPendingMetadataMode(path string, mode uint32) {
 	mode &= posixPermissionModeMask
 	if fs.pendingIndex != nil {
-		if err := fs.pendingIndex.UpdateMode(path, mode); err != nil {
+		if _, err := fs.pendingIndex.UpdateMode(path, mode); err != nil {
 			safeLogPrintf("pending index mode update failed for %s: %v", path, err)
 		}
 	}
@@ -3757,10 +4153,11 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 
 	writeStart := fs.perfStart()
 	var err error
+	var committedRevision int64
 	if newSize > maxPathTruncateInMemoryBytes {
 		err = uploadRemoteTruncateFile(ctx, fs.client, apiPath, entry.Size, newSize, -1)
 	} else {
-		err = uploadBufferedRemoteFile(ctx, fs.client, apiPath, data, -1)
+		committedRevision, err = uploadBufferedRemoteFileWithRevision(ctx, fs.client, apiPath, data, -1)
 	}
 	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(newSize))
 	if err != nil {
@@ -3781,18 +4178,31 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 	fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
 	if statErr != nil {
 		safeLogPrintf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, ino, statErr)
+		if committedRevision <= 0 {
+			// Multipart completion currently does not return the committed
+			// revision. Without a successful Stat, returning success would leave
+			// open handles on the pre-truncate CAS base; a delayed Release could
+			// then publish an unintended generation. Fail explicitly instead of
+			// reporting a successful truncate with stale local revision state.
+			fs.invalidateReadCacheAndTargets(entry.Path)
+			return gofuse.EIO
+		}
 	} else if stat != nil {
 		if stat.Revision > 0 {
-			refreshedRevision = stat.Revision
-			entry.Revision = stat.Revision
-			fs.inodes.UpdateRevision(ino, stat.Revision)
-			fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, pid, newSize)
+			committedRevision = stat.Revision
 		}
 		if !stat.Mtime.IsZero() {
 			refreshedMtime = stat.Mtime
 			entry.Mtime = stat.Mtime
 			fs.inodes.UpdateMtime(ino, stat.Mtime)
 		}
+	}
+	if committedRevision > 0 {
+		refreshedRevision = committedRevision
+		entry.Revision = committedRevision
+		fs.inodes.UpdateRevision(ino, committedRevision)
+		fs.recordCommittedRevisionWithSize(entry.Path, committedRevision, newSize)
+		fs.updateOpenHandleBaseRevision(entry.Path, committedRevision, pid, newSize)
 	}
 	fs.invalidateReadCacheAndTargets(entry.Path)
 	fs.cacheFileForPath(entry.Path, newSize, refreshedMtime, refreshedRevision)
@@ -5369,6 +5779,8 @@ func httpToFuseStatus(err error) gofuse.Status {
 			return gofuse.EACCES
 		case http.StatusRequestEntityTooLarge:
 			return gofuse.Status(syscall.EFBIG)
+		case http.StatusInsufficientStorage:
+			return gofuse.Status(syscall.ENOSPC)
 		case http.StatusPreconditionFailed:
 			return gofuse.Status(syscall.ESTALE)
 		case http.StatusBadRequest:
@@ -5400,6 +5812,8 @@ func httpToFuseStatus(err error) gofuse.Status {
 		return gofuse.EACCES
 	case strings.Contains(msg, "HTTP 413"):
 		return gofuse.Status(syscall.EFBIG)
+	case strings.Contains(msg, "HTTP 507"):
+		return gofuse.Status(syscall.ENOSPC)
 	case strings.Contains(msg, "HTTP 412"):
 		return gofuse.Status(syscall.ESTALE)
 	case strings.Contains(msg, "HTTP 400"):
@@ -7558,6 +7972,9 @@ func (fs *Dat9FS) notifyInodeAtSyncCommit(ino uint64) {
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseLookup, perfStart, status, 0) }()
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -8750,6 +9167,9 @@ func (fs *Dat9FS) cleanupCommittedInode(ino uint64, p string) {
 func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseGetAttr, perfStart, status, 0) }()
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -9341,6 +9761,11 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -9617,6 +10042,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			if fs.adoptCallerOwnedInodeTruncate(input.NodeId, input.Pid, newSize) {
 				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
 			} else {
+				stagedRemoteTruncate := newSize == 0 && fs.canStagePathTruncateToZero(entry)
 				if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
 					return st
 				}
@@ -9625,7 +10051,11 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				// sync, a subsequent fstat(fd) on an open dirty handle returns the
 				// stale (pre-truncate) size via dirtyHandleSize(), causing
 				// fstat() mismatch failures (LTP ftest01 m_fstat case).
-				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
+				if stagedRemoteTruncate {
+					fs.syncOpenHandlesAfterStagedPathTruncate(input.NodeId, input.Pid, newSize)
+				} else {
+					fs.syncOpenHandlesAfterCommittedPathTruncate(input.NodeId, input.Pid, newSize)
+				}
 			}
 		}
 		entry.Size = newSize
@@ -9678,6 +10108,9 @@ func (fs *Dat9FS) setAttrOutTimeout(out *gofuse.AttrOut, sizeChanged bool) {
 func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out []byte, status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseReadlink, perfStart, status, uint64(len(out))) }()
+	if fs.promotionBlocked.Load() {
+		return nil, gofuse.EIO
+	}
 
 	entry, ok := fs.inodes.GetEntry(header.NodeId)
 	if !ok {
@@ -9734,6 +10167,11 @@ func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name stri
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 
 	childP, st := fs.childPath(input.NodeId, name)
 	if st != gofuse.OK {
@@ -9854,6 +10292,11 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	childP, st := fs.childPath(input.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -9938,6 +10381,11 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 
 	childP, st := fs.childPath(header.NodeId, linkName)
 	if st != gofuse.OK {
@@ -10072,6 +10520,11 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 
 	srcEntry, ok := fs.inodes.GetEntry(input.Oldnodeid)
 	if !ok {
@@ -10285,6 +10738,11 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -10627,6 +11085,11 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -11325,6 +11788,12 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	// Check the fail-closed outcome-unknown barrier before doing path-policy
+	// lookups. The local-to-remote promotion branch takes the write side of
+	// promotionBarrier itself, so it cannot take lockPromotionMutation here.
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 	// renameat2 flags are not implemented: drive9 rename always replaces the
 	// target, so doing a plain rename for RENAME_NOREPLACE would silently
 	// clobber the destination and RENAME_EXCHANGE would destroy one side
@@ -11359,8 +11828,16 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 	if oldLayer == PathLayerLocalOnly || newLayer == PathLayerLocalOnly {
 		if oldLayer != newLayer {
+			if oldLayer == PathLayerLocalOnly && newLayer == PathLayerRemotePersistent && fs.synchronousPromotionEnabled() {
+				return fs.promoteLocalTree(ctx, input, oldP, newP)
+			}
 			return gofuse.Status(syscall.EXDEV)
 		}
+		promotionUnlock, ok := fs.lockPromotionMutation()
+		if !ok {
+			return gofuse.EIO
+		}
+		defer promotionUnlock()
 		if fs.localOverlay == nil {
 			return gofuse.EIO
 		}
@@ -11377,6 +11854,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		fs.scheduleGitStateCheckpoint(newP)
 		return gofuse.OK
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	if handled, st := fs.renameGitPath(ctx, input, oldP, newP); handled {
 		return st
 	}
@@ -11566,6 +12048,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseOpenDir, perfStart, status, 0) }()
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	p, ok := fs.inodes.GetPath(input.NodeId)
@@ -11643,6 +12130,9 @@ func (dh *DirHandle) updateEntryIno(generation uint64, index int, ino uint64) {
 func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseReadDir, perfStart, status, 0) }()
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 	dh, ok := fs.dirHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.ENOENT
@@ -11701,6 +12191,9 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseReadDirPlus, perfStart, status, 0) }()
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 	dh, ok := fs.dirHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.ENOENT
@@ -11905,6 +12398,9 @@ func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
 func (fs *Dat9FS) FsyncDir(cancel <-chan struct{}, input *gofuse.FsyncIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFsyncDir, perfStart, status, 0) }()
+	if fs.promotionBlocked.Load() {
+		return gofuse.EIO
+	}
 
 	dh, ok := fs.dirHandles.Get(input.Fh)
 	if !ok {
@@ -12499,6 +12995,11 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 
 	childP, st := fs.childPath(input.NodeId, name)
 	if st != gofuse.OK {
@@ -12647,6 +13148,11 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseOpen, perfStart, status, 0) }()
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -12900,6 +13406,10 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}
 		fs.debugf("read path=%s fh=%d ino=%d off=%d req=%d got=%d source=%s status=%d dur=%s", logPath, input.Fh, logIno, input.Offset, input.Size, bytesRead, source, status, d)
 	}()
+	if fs.promotionBlocked.Load() {
+		source = "promotion-blocked"
+		return nil, gofuse.EIO
+	}
 
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
@@ -13732,6 +14242,12 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		source = "readonly"
 		return 0, gofuse.EROFS
 	}
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		source = "promotion-blocked"
+		return 0, gofuse.EIO
+	}
+	defer promotionUnlock()
 
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
@@ -14491,15 +15007,20 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFlush, perfStart, status, 0) }()
-	fh, ok := fs.fileHandles.Get(input.Fh)
-	if ok && fh.isExtent() {
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
+	fh, found := fs.fileHandles.Get(input.Fh)
+	if found && fh.isExtent() {
 		// Extent handles release POSIX locks inside JuiceFS VFS.Flush.
 		return fs.extentFlush(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh, input.LockOwner)
 	}
 	if lockOwner := fuseLockOwner(input.LockOwner, input.Pid, input.Fh); lockOwner != 0 {
 		fs.locks.release(input.NodeId, lockOwner)
 	}
-	if !ok {
+	if !found {
 		return gofuse.OK
 	}
 	ctx, cf := fuseCtx(cancel)
@@ -14927,8 +15448,13 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFsync, perfStart, status, 0) }()
-	fh, ok := fs.fileHandles.Get(input.Fh)
+	promotionUnlock, ok := fs.lockPromotionMutation()
 	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
+	fh, found := fs.fileHandles.Get(input.Fh)
+	if !found {
 		return gofuse.OK
 	}
 	if fh.isExtent() {
@@ -15063,6 +15589,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 					entry := JournalEntry{
 						Op:          JournalFsync,
 						Path:        fh.Path,
+						Generation:  fh.PendingIndexGen,
 						Length:      fh.Dirty.Size(),
 						BaseRev:     fh.BaseRev,
 						ShadowSpill: true,
@@ -15101,10 +15628,11 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 				// this fsync frame or replay resurrects a committed path.
 				if fs.journal != nil {
 					entry := JournalEntry{
-						Op:      JournalFsync,
-						Path:    fh.Path,
-						Length:  fh.Dirty.Size(),
-						BaseRev: fh.BaseRev,
+						Op:         JournalFsync,
+						Path:       fh.Path,
+						Generation: fh.PendingIndexGen,
+						Length:     fh.Dirty.Size(),
+						BaseRev:    fh.BaseRev,
 					}
 					_ = fs.journal.Append(entry)
 					_ = fs.journal.FsyncShared()
@@ -15376,6 +15904,12 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
+		promotionUnlock, mutationAllowed := fs.lockPromotionMutation()
+		if !mutationAllowed {
+			fs.releasePromotionBlockedHandle(input, fh)
+			return
+		}
+		defer promotionUnlock()
 		ctx, cf := fuseCtx(cancel)
 		defer cf()
 		fs.observePathPolicyWithContext(ctx, fh.Path)
@@ -15946,6 +16480,65 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		}
 
 	}
+}
+
+// releasePromotionBlockedHandle closes one kernel handle without publishing any
+// buffered mutation. Release has no status result, so it must not use the
+// normal best-effort flush path after an outcome-unknown promotion has frozen
+// the mount. The application has already received EIO from Flush/Fsync; the
+// only safe work left here is ownership-scoped cleanup and handle teardown.
+func (fs *Dat9FS) releasePromotionBlockedHandle(input *gofuse.ReleaseIn, fh *FileHandle) {
+	if fh == nil {
+		return
+	}
+	if fh.isExtent() {
+		if v := fs.extentVFS(); v != nil {
+			v.Abort(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh.extentIno, fh.extentFh)
+		}
+		fs.deleteFileHandle(input.Fh, fh)
+		return
+	}
+
+	fh.Lock()
+	if fs.debouncer != nil {
+		fs.debouncer.CancelNoWaitIfOwner(fh.Path, fh)
+	}
+	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+	fs.removeHandleOwnedStagingLocked(fh)
+	if fh.Dirty != nil {
+		fh.Dirty.ClearDirty()
+	}
+	fh.DirtySeq = 0
+	fh.WriteBackSeq = 0
+	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
+	fh.appendSnapshot = false
+	fs.releaseHandleRemoteCommitPathLocked(fh)
+	localFile := fh.LocalFile
+	fh.LocalFile = nil
+	streamer := fh.Streamer
+	fh.Streamer = nil
+	prefetch := fh.Prefetch
+	fh.Prefetch = nil
+	unlinkedShadowGen := fh.UnlinkedShadowGen
+	fh.UnlinkedShadowGen = 0
+	fh.Unlock()
+
+	if localFile != nil {
+		_ = localFile.Close()
+	}
+	if streamer != nil {
+		streamer.Abort()
+	}
+	if prefetch != nil {
+		prefetch.Close()
+	}
+	fs.releaseHandleShadowPin(fh)
+	if unlinkedShadowGen != 0 && fs.shadowStore != nil {
+		fs.shadowStore.Unpin(unlinkedShadowGen)
+	}
+	fs.deleteFileHandle(input.Fh, fh)
+	fs.cleanupReleasedInode(fh.Ino, fh.Path)
 }
 
 // flushHandleDebounced wraps flushHandle with optional debouncing for small files.
@@ -16938,38 +17531,46 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 // here so a graceful unmount leaves nothing behind locally. Loop a few times:
 // each sync commit may surface follow-up work (mode/lineage follow-ups), and
 // the pending index is the loop condition.
-func (fs *Dat9FS) drainLatePendingEntries() {
-	const (
-		settle   = 100 * time.Millisecond
-		deadline = 120 * time.Second
-	)
-	if fs.pendingIndex == nil || len(fs.pendingIndex.ListPendingPaths()) == 0 {
+func (fs *Dat9FS) drainLatePendingEntries(ctx context.Context) {
+	const settle = 100 * time.Millisecond
+	if fs == nil || fs.commitQueue == nil || fs.commitQueue.pendingRecoveryCount() == 0 {
 		return
 	}
 	start := time.Now()
 	for round := 0; ; round++ {
-		paths := fs.pendingIndex.ListPendingPaths()
-		if len(paths) == 0 {
+		pending := fs.commitQueue.pendingRecoveryCount()
+		if pending == 0 {
 			safeLogPrintf("late pending drain: clean after %d rounds (%s)", round, time.Since(start).Round(time.Millisecond))
 			return
 		}
-		if time.Since(start) > deadline {
-			safeLogPrintf("late pending drain: %d entries still pending after %s; leaving them for next-mount recovery", len(paths), deadline)
+		if err := ctx.Err(); err != nil {
+			safeLogPrintf("late pending drain: %d entries still pending after %s; leaving them for next-mount recovery", pending, time.Since(start).Round(time.Millisecond))
 			return
 		}
-		safeLogPrintf("late pending drain: round %d, %d entries pending", round, len(paths))
+		safeLogPrintf("late pending drain: round %d, %d entries pending", round, pending)
 		var n int
 		if fs.commitQueue != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), deadline-time.Since(start))
 			n = fs.commitQueue.RecoverPendingSync(ctx)
-			cancel()
 		}
 		_ = n
-		time.Sleep(settle)
+		timer := time.NewTimer(settle)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+		}
 	}
 }
 
 func (fs *Dat9FS) FlushAll() {
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		// The durable local cache is intentionally frozen. Do not let graceful
+		// shutdown publish shadow/pending state that an unresolved restore marker
+		// may roll back on the next start.
+		return
+	}
+	defer promotionUnlock()
 	fs.stopExtentRuntimeLoop()
 	if v := fs.extentVFS(); v != nil {
 		_ = v.FlushAll("")
@@ -17041,9 +17642,14 @@ func (fs *Dat9FS) FlushAll() {
 	// during or after our sweep). Those late entries stay in the pending
 	// index and would only be rescued by the next mount's RecoverPending.
 	// Loop: give late Releases a moment to land, re-enqueue via recovery,
-	// and re-drain until the pending index is empty or the deadline hits.
+	// and re-drain until no recoverable generation remains or the deadline hits.
+	// Layer mounts retain successful overlay generations in the same index;
+	// pendingRecoveryCount excludes only those explicitly committed generations
+	// while still rescuing staging created after the queue stopped.
 	if fs.pendingIndex != nil && fs.pendingIndex.ListPendingPaths() != nil {
-		fs.drainLatePendingEntries()
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		fs.drainLatePendingEntries(ctx)
+		cancel()
 	}
 
 	if fs.diskReadCache != nil {
@@ -17094,6 +17700,9 @@ func (fs *Dat9FS) StatFs(cancel <-chan struct{}, header *gofuse.InHeader, out *g
 // --- Xattr handlers (in-memory, session-scoped) ----------------------------
 
 func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string, dest []byte) (uint32, gofuse.Status) {
+	if fs.promotionBlocked.Load() {
+		return 0, gofuse.EIO
+	}
 	path, ok := fs.inodes.GetPath(header.NodeId)
 	if !ok {
 		return 0, gofuse.ENOENT
@@ -17113,6 +17722,9 @@ func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr
 }
 
 func (fs *Dat9FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, dest []byte) (uint32, gofuse.Status) {
+	if fs.promotionBlocked.Load() {
+		return 0, gofuse.EIO
+	}
 	path, ok := fs.inodes.GetPath(header.NodeId)
 	if !ok {
 		return 0, gofuse.ENOENT
@@ -17138,6 +17750,11 @@ func (fs *Dat9FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, des
 }
 
 func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, attr string, data []byte) gofuse.Status {
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	path, ok := fs.inodes.GetPath(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -17149,6 +17766,11 @@ func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, att
 }
 
 func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string) gofuse.Status {
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		return gofuse.EIO
+	}
+	defer promotionUnlock()
 	path, ok := fs.inodes.GetPath(header.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -17280,7 +17902,13 @@ func (fs *Dat9FS) captureHandleStagingGensLocked(fh *FileHandle) StagingGens {
 }
 
 func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) {
-	if fs == nil || entry == nil || !fs.gvisorCompatibilityEnabled() {
+	if fs == nil || entry == nil {
+		return
+	}
+	if fs.layerEnabled() {
+		fs.recordLayerEntryVersion(entry.Path, entry.layerVersion)
+	}
+	if !fs.gvisorCompatibilityEnabled() {
 		return
 	}
 	if entry.mutationPublished {

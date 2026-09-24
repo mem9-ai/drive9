@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,8 +38,17 @@ type PendingIndex struct {
 	// (issue #964, false): the frame lands in the kernel page cache and a
 	// background SyncLoop / fsync(2) / umount make it durable.
 	journalSyncOnPut bool
-	shadows          *ShadowStore // wired once before staging/recovery
+	// restoreMetaWrite is a narrow test seam for the cross-file layer cache
+	// transaction. Production always uses atomicWrite.
+	restoreMetaWrite func(string, []byte) error
+	// restoreTxnMarkerRemove is a narrow, per-index commit-point test seam.
+	// Production leaves it nil; transactions then use removeLayerRestoreMarker.
+	restoreTxnMarkerRemove func(string) error
+	shadows                *ShadowStore // wired once before staging/recovery
 }
+
+type layerRestoreMetaPublish func(shadows *ShadowStore, shadowGeneration uint64)
+type layerRestoreMetaPrepare func(size int64) (layerRestoreMetaPublish, error)
 
 // SetJournal wires the WAL used for durable pending-meta publication. It is
 // wired once during mount init, before the first Put.
@@ -133,12 +143,22 @@ func NewPendingIndex(dir string) (*PendingIndex, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("pending index dir: %w", err)
 	}
+	if err := recoverLayerRestoreTransactions(dir); err != nil {
+		return nil, fmt.Errorf("pending index recover layer restore transaction: %w", errors.Join(errLayerRestoreRecoveryFailed, err))
+	}
 	idx := &PendingIndex{
 		items:     make(map[string]*WriteBackMeta),
 		dir:       dir,
 		pathLocks: make(map[string]*pendingPathLock),
 	}
 	return idx, nil
+}
+
+func (idx *PendingIndex) writeLayerRestoreMeta(path string, data []byte) error {
+	if idx.restoreMetaWrite != nil {
+		return idx.restoreMetaWrite(path, data)
+	}
+	return atomicWrite(path, data)
 }
 
 // RecoverFromDisk scans .meta files in the directory and rebuilds in-memory
@@ -193,6 +213,271 @@ func (idx *PendingIndex) PutWithBaseRev(remotePath string, size int64, kind Pend
 // file mode that must be applied after the pending data commits remotely.
 func (idx *PendingIndex) PutWithBaseRevAndMode(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
 	return idx.PutWithBaseRevAndModeAndLineage(remotePath, size, kind, baseRev, mode, hasMode, "", "", false)
+}
+
+// PutLayerCommitted stores a retained overlay reconstructed from authoritative
+// layer state. Unlike Put, it publishes the committed marker in one atomic
+// .meta replacement and intentionally does not append an uncommitted WAL
+// frame: the remote layer is already the durable source and a crash may simply
+// rebuild this local cache again.
+func (idx *PendingIndex) PutLayerCommitted(remotePath string, size, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
+	gen := idx.nextGen.Add(1)
+	meta := &WriteBackMeta{
+		Path:           remotePath,
+		Size:           size,
+		Mtime:          time.Now(),
+		CreatedAt:      time.Now(),
+		Generation:     gen,
+		Kind:           PendingOverwrite,
+		BaseRev:        baseRev,
+		LayerCommitted: true,
+		Mode:           mode & posixPermissionModeMask,
+		HasMode:        hasMode,
+	}
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return 0, fmt.Errorf("pending index marshal committed layer: %w", err)
+	}
+	if err := atomicWrite(filepath.Join(idx.dir, hashPath(remotePath)+".meta"), metaBytes); err != nil {
+		return 0, fmt.Errorf("pending index put committed layer: %w", err)
+	}
+	idx.mu.Lock()
+	idx.items[remotePath] = meta
+	idx.mu.Unlock()
+	return gen, nil
+}
+
+// restoreLayerGenerationLocked returns the current entry when it still
+// represents the committed generation observed by a layer restore. Generation
+// zero means the restore observed no pending entry. Callers must hold the path
+// lock for remotePath; the method takes idx.mu only for the map lookup.
+func (idx *PendingIndex) restoreLayerGenerationLocked(remotePath string, expectedGeneration uint64) (*WriteBackMeta, bool) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	meta, ok := idx.items[remotePath]
+	if expectedGeneration == 0 {
+		return nil, !ok
+	}
+	if !ok || meta.Generation != expectedGeneration || !meta.LayerCommitted {
+		return nil, false
+	}
+	cp := cloneWriteBackMeta(meta)
+	return &cp, true
+}
+
+// restoreLayerCommittedIfGeneration installs authoritative layer content only
+// while the path still has the committed generation observed before the remote
+// fetch. The pending path lock stays held while apply performs its shadow-store
+// generation CAS, so a writer that bypasses the remote-commit lock can change
+// the shadow but cannot publish matching pending metadata until this operation
+// either observes that change and aborts or finishes first.
+func (idx *PendingIndex) restoreLayerCommittedIfGeneration(
+	remotePath string,
+	expectedGeneration uint64,
+	baseRev int64,
+	mode uint32,
+	hasMode bool,
+	shadowPath string,
+	apply func(tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (applied bool, err error),
+) (bool, error) {
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
+	if _, ok := idx.restoreLayerGenerationLocked(remotePath, expectedGeneration); !ok {
+		return false, nil
+	}
+	tx, err := beginLayerRestoreTxn(idx.dir, filepath.Join(idx.dir, hashPath(remotePath)+".meta"), shadowPath)
+	if err != nil {
+		return false, err
+	}
+	tx.removeMarker = idx.restoreTxnMarkerRemove
+	published := false
+	prepareMeta := func(size int64) (layerRestoreMetaPublish, error) {
+		gen := idx.nextGen.Add(1)
+		now := time.Now()
+		meta := &WriteBackMeta{
+			Path:           remotePath,
+			Size:           size,
+			Mtime:          now,
+			CreatedAt:      now,
+			Generation:     gen,
+			Kind:           PendingOverwrite,
+			BaseRev:        baseRev,
+			LayerCommitted: true,
+			Mode:           mode & posixPermissionModeMask,
+			HasMode:        hasMode,
+		}
+		metaBytes, err := json.Marshal(meta)
+		if err != nil {
+			return nil, fmt.Errorf("pending index marshal restored layer: %w", err)
+		}
+		if err := idx.writeLayerRestoreMeta(filepath.Join(idx.dir, hashPath(remotePath)+".meta"), metaBytes); err != nil {
+			return nil, fmt.Errorf("pending index restore committed layer: %w", err)
+		}
+		return func(shadows *ShadowStore, shadowGeneration uint64) {
+			meta.shadowSource = shadowReadSource{store: shadows, generation: shadowGeneration}
+			idx.mu.Lock()
+			idx.items[remotePath] = meta
+			idx.mu.Unlock()
+			published = true
+		}, nil
+	}
+	applied, err := apply(tx, prepareMeta)
+	if err != nil || !applied {
+		if err != nil {
+			return false, rollbackLayerRestoreFailure(tx, err)
+		}
+		if cleanupErr := tx.rollback(); cleanupErr != nil {
+			return false, fmt.Errorf("%w: %v", errLayerRestoreStateUncertain, cleanupErr)
+		}
+		return false, nil
+	}
+	if !published {
+		err := fmt.Errorf("pending index restore committed layer: shadow applied without metadata")
+		return false, rollbackLayerRestoreFailure(tx, err)
+	}
+	return true, nil
+}
+
+// restoreLayerModeIfGeneration applies a peer chmod only to the committed
+// retained generation that was observed by restore. A newer unfinished local
+// generation is never relabeled as remotely committed.
+func (idx *PendingIndex) restoreLayerModeIfGeneration(remotePath string, expectedGeneration uint64, mode uint32) (bool, error) {
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
+	meta, ok := idx.restoreLayerGenerationLocked(remotePath, expectedGeneration)
+	if !ok {
+		return false, nil
+	}
+	if meta == nil {
+		// Chmod-only layer entries can refer to a remote base file for which no
+		// retained local content exists. There is no pending metadata to update.
+		return true, nil
+	}
+	meta.Mode = mode & posixPermissionModeMask
+	meta.HasMode = true
+	meta.LayerCommitted = true
+	meta.Generation = idx.nextGen.Add(1)
+	meta.Mtime = time.Now()
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return false, fmt.Errorf("pending index marshal restored layer mode: %w", err)
+	}
+	if err := atomicWrite(filepath.Join(idx.dir, hashPath(remotePath)+".meta"), metaBytes); err != nil {
+		return false, fmt.Errorf("pending index restore layer mode: %w", err)
+	}
+	idx.mu.Lock()
+	idx.items[remotePath] = meta
+	idx.mu.Unlock()
+	return true, nil
+}
+
+// restoreLayerrenameIfGenerations applies the pending-index half of a peer
+// rename only while both paths still match the committed/absent generations
+// observed before any remote read. apply must perform the corresponding
+// shadow-store generation CAS. Holding both pending path locks across apply
+// prevents a lock-timeout writer from publishing metadata between the shadow
+// CAS and this durable metadata move.
+func (idx *PendingIndex) restoreLayerrenameIfGenerations(
+	oldPath, newPath string,
+	expectedOldGeneration, expectedNewGeneration uint64,
+	baseRev int64,
+	mode uint32,
+	hasMode bool,
+	oldShadowPath, newShadowPath string,
+	apply func(tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (applied bool, err error),
+) (bool, error) {
+	pla, plb := idx.acquireTwoPathLocks(oldPath, newPath)
+	defer idx.releaseTwoPathLocks(oldPath, newPath, pla, plb)
+
+	oldMeta, oldOK := idx.restoreLayerGenerationLocked(oldPath, expectedOldGeneration)
+	if !oldOK {
+		return false, nil
+	}
+	if _, newOK := idx.restoreLayerGenerationLocked(newPath, expectedNewGeneration); !newOK {
+		return false, nil
+	}
+	tx, err := beginLayerRestoreTxn(
+		idx.dir,
+		filepath.Join(idx.dir, hashPath(oldPath)+".meta"),
+		filepath.Join(idx.dir, hashPath(newPath)+".meta"),
+		oldShadowPath,
+		newShadowPath,
+	)
+	if err != nil {
+		return false, err
+	}
+	tx.removeMarker = idx.restoreTxnMarkerRemove
+	published := false
+	prepareMeta := func(size int64) (layerRestoreMetaPublish, error) {
+		now := time.Now()
+		newMeta := &WriteBackMeta{
+			Path:           newPath,
+			Size:           size,
+			Mtime:          now,
+			CreatedAt:      now,
+			Kind:           PendingOverwrite,
+			BaseRev:        baseRev,
+			LayerCommitted: true,
+			Mode:           mode & posixPermissionModeMask,
+			HasMode:        hasMode,
+		}
+		if oldMeta != nil {
+			copied := cloneWriteBackMeta(oldMeta)
+			newMeta = &copied
+			newMeta.Path = newPath
+			newMeta.Size = size
+			newMeta.Mtime = now
+			newMeta.Kind = PendingOverwrite
+			newMeta.LayerCommitted = true
+		}
+		newMeta.Generation = idx.nextGen.Add(1)
+		metaBytes, err := json.Marshal(newMeta)
+		if err != nil {
+			return nil, fmt.Errorf("pending index marshal restored layer rename: %w", err)
+		}
+		if err := idx.writeLayerRestoreMeta(filepath.Join(idx.dir, hashPath(newPath)+".meta"), metaBytes); err != nil {
+			return nil, fmt.Errorf("pending index restore layer rename: %w", err)
+		}
+		if oldPath != newPath {
+			oldMetaPath := filepath.Join(idx.dir, hashPath(oldPath)+".meta")
+			if err := os.Remove(oldMetaPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("pending index remove restored layer source: %w", err)
+			}
+			if err := fsyncDir(idx.dir); err != nil {
+				return nil, fmt.Errorf("pending index sync restored layer rename: %w", err)
+			}
+		}
+		return func(shadows *ShadowStore, shadowGeneration uint64) {
+			newMeta.shadowSource = shadowReadSource{store: shadows, generation: shadowGeneration}
+			idx.mu.Lock()
+			if oldPath != newPath {
+				delete(idx.items, oldPath)
+			}
+			idx.items[newPath] = newMeta
+			idx.mu.Unlock()
+			published = true
+		}, nil
+	}
+	applied, err := apply(tx, prepareMeta)
+	if err != nil || !applied {
+		if err != nil {
+			return false, rollbackLayerRestoreFailure(tx, err)
+		}
+		if cleanupErr := tx.rollback(); cleanupErr != nil {
+			return false, fmt.Errorf("%w: %v", errLayerRestoreStateUncertain, cleanupErr)
+		}
+		return false, nil
+	}
+	if !published {
+		err := fmt.Errorf("pending index restore layer rename: shadow applied without metadata")
+		return false, rollbackLayerRestoreFailure(tx, err)
+	}
+	return true, nil
 }
 
 // PutWithBaseRevAndModeAndLineage attaches process-local causal identity to
@@ -268,10 +553,11 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 		// callers fsync the content (shadow / durable snapshot) before Put,
 		// and JournalPendingMeta replay rebuilds this entry after a crash.
 		if err := journal.Append(JournalEntry{
-			Op:        JournalPendingMeta,
-			Path:      remotePath,
-			Timestamp: time.Now().Unix(),
-			Meta:      metaBytes,
+			Op:         JournalPendingMeta,
+			Path:       remotePath,
+			Generation: gen,
+			Timestamp:  time.Now().Unix(),
+			Meta:       metaBytes,
 		}); err != nil {
 			return 0, fmt.Errorf("pending index journal append: %w", err)
 		}
@@ -298,6 +584,12 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 // during crash recovery. It is in-memory only: the WAL record remains on disk
 // until compaction drops it behind the path's commit marker, so re-publishing
 // the .meta file would be redundant.
+//
+// A layer commit persists its retained-overlay marker as a .meta file. A later
+// edit to the same path is published through the WAL, so replay must prefer
+// that strictly newer generation over the older .meta marker. Equal or older
+// WAL generations still lose to .meta because the standalone file may carry
+// metadata not present in legacy WAL records.
 func (idx *PendingIndex) publishRecoveredMeta(metaBytes []byte) error {
 	var meta WriteBackMeta
 	if err := json.Unmarshal(metaBytes, &meta); err != nil {
@@ -307,14 +599,15 @@ func (idx *PendingIndex) publishRecoveredMeta(metaBytes []byte) error {
 		return fmt.Errorf("recovered meta has empty path")
 	}
 	idx.mu.Lock()
-	idx.items[meta.Path] = &meta
-	// Future publication must not reuse a generation restored from the WAL.
-	for previous := idx.nextGen.Load(); previous < meta.Generation; previous = idx.nextGen.Load() {
-		if idx.nextGen.CompareAndSwap(previous, meta.Generation) {
+	if current, ok := idx.items[meta.Path]; !ok || meta.Generation > current.Generation {
+		idx.items[meta.Path] = &meta
+	}
+	idx.mu.Unlock()
+	for current := idx.nextGen.Load(); meta.Generation > current; current = idx.nextGen.Load() {
+		if idx.nextGen.CompareAndSwap(current, meta.Generation) {
 			break
 		}
 	}
-	idx.mu.Unlock()
 	return nil
 }
 
@@ -570,8 +863,10 @@ func (idx *PendingIndex) UpdateSize(remotePath string, size int64) {
 	}
 }
 
-// UpdateMode updates the pending mode metadata for an existing entry.
-func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
+// UpdateMode updates the pending mode metadata for an existing entry and
+// returns the new generation. The generation is always uncommitted until the
+// caller proves the corresponding remote mutation succeeded.
+func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) (uint64, error) {
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
 
@@ -580,29 +875,36 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 
 	meta, ok := idx.items[remotePath]
 	if !ok {
-		return nil
+		return 0, nil
 	}
 	updated := cloneWriteBackMeta(meta)
 	updated.Mode = mode & posixPermissionModeMask
 	updated.HasMode = true
+	// This is a new local mutation generation. It is not remotely committed
+	// merely because the preceding retained layer generation was.
+	updated.LayerCommitted = false
 	updated.Generation = idx.nextGen.Add(1)
+	updated.Mtime = time.Now()
 
 	metaBytes, err := json.Marshal(&updated)
 	if err != nil {
-		return fmt.Errorf("pending index marshal mode: %w", err)
+		return 0, fmt.Errorf("pending index marshal mode: %w", err)
 	}
 	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
 	if err := atomicWrite(metaPath, metaBytes); err != nil {
-		return fmt.Errorf("pending index update mode: %w", err)
+		return 0, fmt.Errorf("pending index update mode: %w", err)
 	}
 	cp := updated
 	idx.items[remotePath] = &cp
-	return nil
+	return updated.Generation, nil
 }
 
-// MarkCommitted keeps the pending entry as a local overlay data source but no
-// longer treats it as never-persisted new data.
-func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) error {
+// MarkLayerCommitted keeps the pending entry as a local overlay data source but
+// excludes the exact uploaded generation from recovery. It returns false when
+// the caller has no generation fence or a newer same-path generation replaced
+// the uploaded entry before bookkeeping completed; that generation must remain
+// recoverable.
+func (idx *PendingIndex) MarkLayerCommitted(remotePath string, expectedGen uint64, committedRev int64) (bool, error) {
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
 
@@ -611,10 +913,14 @@ func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) er
 
 	meta, ok := idx.items[remotePath]
 	if !ok {
-		return nil
+		return true, nil
+	}
+	if expectedGen == 0 || meta.Generation != expectedGen {
+		return false, nil
 	}
 	updated := cloneWriteBackMeta(meta)
 	updated.Kind = PendingOverwrite
+	updated.LayerCommitted = true
 	if committedRev > 0 {
 		updated.BaseRev = committedRev
 	}
@@ -623,15 +929,15 @@ func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) er
 
 	metaBytes, err := json.Marshal(&updated)
 	if err != nil {
-		return fmt.Errorf("pending index marshal committed: %w", err)
+		return false, fmt.Errorf("pending index marshal committed: %w", err)
 	}
 	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
 	if err := atomicWrite(metaPath, metaBytes); err != nil {
-		return fmt.Errorf("pending index mark committed: %w", err)
+		return false, fmt.Errorf("pending index mark committed: %w", err)
 	}
 	cp := updated
 	idx.items[remotePath] = &cp
-	return nil
+	return true, nil
 }
 
 // MarkConflict marks a pending entry as conflicted so that RecoverPending

@@ -555,6 +555,119 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 	return nil
 }
 
+// writeFullIfGeneration replaces the shadow only when its content generation
+// still matches the caller's pre-fetch snapshot. This is the final ownership
+// gate for layer replay: a writer may deliberately proceed after timing out on
+// the remote-commit lock, but every writer still changes the shadow generation.
+func (s *ShadowStore) writeFullIfGeneration(remotePath string, data []byte, baseRev int64, expectedGen uint64, tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (bool, error) {
+	tmpFd, err := os.CreateTemp(s.dir, ".layer-restore-*.shadow.tmp")
+	if err != nil {
+		return false, fmt.Errorf("shadow full tmp create: %w", err)
+	}
+	tmpPath := tmpFd.Name()
+	defer func() {
+		_ = tmpFd.Close()
+		_ = os.Remove(tmpPath)
+	}()
+	if len(data) > 0 {
+		n, writeErr := tmpFd.Write(data)
+		if writeErr != nil {
+			return false, fmt.Errorf("shadow full tmp write: %w", writeErr)
+		}
+		if n != len(data) {
+			return false, fmt.Errorf("shadow full tmp write: short write %d/%d", n, len(data))
+		}
+	}
+	if err := tmpFd.Sync(); err != nil {
+		return false, fmt.Errorf("shadow full tmp sync: %w", err)
+	}
+	if err := tmpFd.Close(); err != nil {
+		return false, fmt.Errorf("shadow full tmp close: %w", err)
+	}
+	return s.installLayerRestoreTempIfGeneration(remotePath, tmpPath, int64(len(data)), baseRev, expectedGen, tx, prepareMeta)
+}
+
+// installLayerRestoreTempIfGeneration commits a fully staged restore file and
+// its pending metadata as one recoverable local transaction. The durable
+// rollback marker is created by PendingIndex before this method. Shadow memory
+// remains unchanged until the metadata write succeeds; on any failure after
+// the disk swap, the old shadow and metadata snapshots are restored while the
+// shadow path lock and s.mu still exclude readers and writers.
+func (s *ShadowStore) installLayerRestoreTempIfGeneration(remotePath, tmpPath string, size, baseRev int64, expectedGen uint64, tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (bool, error) {
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	s.mu.Lock()
+	if s.writeGen[remotePath] != expectedGen {
+		s.mu.Unlock()
+		return false, nil
+	}
+	sf := s.files[remotePath]
+	oldSize := int64(0)
+	oldWritten := int64(0)
+	if sf != nil {
+		oldSize = sf.size
+		oldWritten = sf.writtenBytes
+	}
+	if err := s.checkQuotaForDelta(size - oldWritten); err != nil {
+		s.mu.Unlock()
+		return false, err
+	}
+	shadowFile := s.shadowPath(remotePath)
+	if err := os.Rename(tmpPath, shadowFile); err != nil {
+		s.mu.Unlock()
+		return false, fmt.Errorf("shadow layer restore rename: %w", err)
+	}
+	rollback := func(primary error) (bool, error) {
+		result := rollbackLayerRestoreFailure(tx, primary)
+		s.mu.Unlock()
+		return false, result
+	}
+	if err := fsyncDir(s.dir); err != nil {
+		return rollback(fmt.Errorf("shadow layer restore dir sync: %w", err))
+	}
+	newFd, err := os.OpenFile(shadowFile, os.O_RDWR, 0o644)
+	if err != nil {
+		return rollback(fmt.Errorf("shadow layer restore reopen: %w", err))
+	}
+	publishMeta, err := prepareMeta(size)
+	if err != nil {
+		_ = newFd.Close()
+		return rollback(err)
+	}
+	// Marker removal is the durable commit point. Do it before publishing the
+	// new shadow or metadata to process memory. If marker cleanup or its
+	// directory fsync fails, rollback still runs while both path locks and s.mu
+	// exclude successor writers, so the process and the next restart agree on
+	// the old pair.
+	if err := tx.commit(); err != nil {
+		_ = newFd.Close()
+		return rollback(err)
+	}
+	oldFd := (*os.File)(nil)
+	if sf == nil {
+		sf = &ShadowFile{}
+		s.files[remotePath] = sf
+	} else {
+		oldFd = sf.fd
+	}
+	sf.fd = newFd
+	sf.size = size
+	s.quotaBytes.Add(size - oldWritten)
+	sf.written = shadowWrittenRanges{}
+	sf.written.add(0, size)
+	sf.writtenBytes = size
+	sf.baseRev = baseRev
+	shadowGeneration := s.bumpWriteGenLocked(remotePath)
+	publishMeta(s, shadowGeneration)
+	s.mu.Unlock()
+	if oldFd != nil {
+		_ = oldFd.Close()
+	}
+	s.pendingBytes.Add(size - oldSize)
+	return true, nil
+}
+
 // quotaCopyBufSize is the chunk size for quota-aware streaming copies.
 const quotaCopyBufSize = 32 << 10 // 32KB
 
@@ -716,6 +829,48 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	_ = oldFd.Close()
 	s.pendingBytes.Add(delta)
 	return n, nil
+}
+
+// stageLayerRestoreStream downloads authoritative object content into a
+// private temporary file without holding either the remote-commit lock or the
+// mount-wide restore lifecycle barrier. A timeout writer can therefore make
+// progress during a slow object read; the later install CAS decides ownership.
+func (s *ShadowStore) stageLayerRestoreStream(remotePath string, r io.Reader) (string, int64, error) {
+	s.mu.RLock()
+	oldWrittenSnapshot := int64(0)
+	if sf := s.files[remotePath]; sf != nil {
+		oldWrittenSnapshot = sf.writtenBytes
+	}
+	s.mu.RUnlock()
+
+	tmpFd, err := os.CreateTemp(s.dir, ".layer-restore-*.shadow.tmp")
+	if err != nil {
+		return "", 0, fmt.Errorf("shadow stream tmp create: %w", err)
+	}
+	tmpPath := tmpFd.Name()
+	keep := false
+	defer func() {
+		_ = tmpFd.Close()
+		if !keep {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	n, err := s.quotaCopy(tmpFd, r, oldWrittenSnapshot)
+	if err != nil {
+		if errors.Is(err, syscall.ENOSPC) {
+			return "", 0, err
+		}
+		return "", n, fmt.Errorf("shadow write stream: %w", err)
+	}
+	if err := tmpFd.Sync(); err != nil {
+		return "", n, fmt.Errorf("shadow stream sync: %w", err)
+	}
+	if err := tmpFd.Close(); err != nil {
+		return "", n, fmt.Errorf("shadow stream close: %w", err)
+	}
+	keep = true
+	return tmpPath, n, nil
 }
 
 // Truncate updates the shadow file length without syncing it.
@@ -1583,6 +1738,111 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 		s.pendingBytes.Add(-replacedSize)
 	}
 	return true
+}
+
+// renameIfGenerations moves a retained layer shadow only while both source and
+// target still match the generations observed before replay fetched the remote
+// rename entry. matched=false means a concurrent local writer owns one of the
+// paths and the caller must preserve it unchanged.
+func (s *ShadowStore) renameIfGenerations(oldPath, newPath string, expectedOldGen, expectedNewGen uint64, tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (moved, matched bool, err error) {
+	pla, plb := s.acquireTwoPathLocks(oldPath, newPath)
+	defer s.releaseTwoPathLocks(oldPath, newPath, pla, plb)
+
+	s.mu.Lock()
+	if s.writeGen[oldPath] != expectedOldGen || s.writeGen[newPath] != expectedNewGen {
+		s.mu.Unlock()
+		return false, false, nil
+	}
+	sf, ok := s.files[oldPath]
+	if !ok {
+		s.mu.Unlock()
+		return false, true, nil
+	}
+	if oldPath == newPath {
+		size := sf.size
+		publishMeta, err := prepareMeta(size)
+		if err != nil {
+			result := rollbackLayerRestoreFailure(tx, err)
+			s.mu.Unlock()
+			return false, true, result
+		}
+		if err := tx.commit(); err != nil {
+			result := rollbackLayerRestoreFailure(tx, err)
+			s.mu.Unlock()
+			return false, true, result
+		}
+		shadowGeneration := s.writeGen[oldPath]
+		if shadowGeneration == 0 {
+			shadowGeneration = s.bumpWriteGenLocked(oldPath)
+		}
+		publishMeta(s, shadowGeneration)
+		s.mu.Unlock()
+		return true, true, nil
+	}
+
+	oldSP := s.shadowPath(oldPath)
+	newSP := s.shadowPath(newPath)
+	if err := os.Rename(oldSP, newSP); err != nil {
+		s.mu.Unlock()
+		return false, true, nil
+	}
+	rollback := func(primary error) (bool, bool, error) {
+		result := rollbackLayerRestoreFailure(tx, primary)
+		s.mu.Unlock()
+		return false, true, result
+	}
+	if err := fsyncDir(s.dir); err != nil {
+		return rollback(fmt.Errorf("shadow layer rename dir sync: %w", err))
+	}
+	publishMeta, err := prepareMeta(sf.size)
+	if err != nil {
+		return rollback(err)
+	}
+	if err := tx.commit(); err != nil {
+		return rollback(err)
+	}
+	replacedSF := s.files[newPath]
+	replacedGen := s.active[newPath]
+	var replacedSize int64
+	if replacedSF != nil {
+		replacedSize = replacedSF.size
+		s.resizeWrittenLocked(replacedSF, 0)
+	}
+	delete(s.files, oldPath)
+	s.files[newPath] = sf
+	oldWriteGen := s.writeGen[oldPath]
+	if oldWriteGen != 0 {
+		s.writeGen[newPath] = oldWriteGen
+		delete(s.writeGen, oldPath)
+	} else {
+		delete(s.writeGen, newPath)
+	}
+	oldGen := s.active[oldPath]
+	if oldGen != 0 {
+		s.active[newPath] = oldGen
+		delete(s.active, oldPath)
+	} else if replacedGen != 0 {
+		delete(s.active, newPath)
+	}
+	if replacedGen != 0 && replacedGen != oldGen {
+		delete(s.genFile, replacedGen)
+		if s.refs[replacedGen] > 0 && replacedSF != nil {
+			s.retired[replacedGen] = &retiredShadow{fd: replacedSF.fd, size: replacedSF.size}
+		} else {
+			delete(s.refs, replacedGen)
+			if replacedSF != nil {
+				_ = replacedSF.fd.Close()
+			}
+		}
+	} else if replacedSF != nil && replacedSF != sf {
+		_ = replacedSF.fd.Close()
+	}
+	publishMeta(s, s.writeGen[newPath])
+	s.mu.Unlock()
+	if replacedSize > 0 {
+		s.pendingBytes.Add(-replacedSize)
+	}
+	return true, true, nil
 }
 
 // Has reports whether a shadow file exists for the path.

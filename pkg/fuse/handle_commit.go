@@ -171,26 +171,38 @@ func (fs *Dat9FS) syncPassivePathTruncateLocked(fh *FileHandle, size, revision i
 
 // syncOpenHandlesAfterPathTruncate truncates the WriteBuffer of every open
 // dirty handle for the given inode after a path-based truncate(path, size).
-//
-// Without this, applyRemoteTruncate updates the remote file and the inode's
-// cached size, but the open handle's WriteBuffer still holds the pre-truncate
-// data. A subsequent fstat(fd) calls GetAttr → dirtyHandleSize(ino), which
-// returns the stale WriteBuffer size instead of the truncated size, causing
-// fstat() mismatch (LTP ftest01 m_fstat case).
-//
-// Both shrink and grow are handled. For shrink, the buffer is truncated.
-// For grow, the buffer is zero-extended so a later flush uploads the correct
-// size (not stale shorter content that could shrink the file back).
 func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
+	fs.syncOpenHandlesAfterPathTruncateWithCommit(ino, 0, newSize, false)
+}
+
+func (fs *Dat9FS) syncOpenHandlesAfterCommittedPathTruncate(ino uint64, callerPID uint32, newSize int64) {
+	fs.syncOpenHandlesAfterPathTruncateWithCommit(ino, callerPID, newSize, true)
+}
+
+func (fs *Dat9FS) syncOpenHandlesAfterPathTruncateWithCommit(ino uint64, callerPID uint32, newSize int64, remoteCommitted bool) {
+	fs.syncOpenHandlesAfterPathTruncateState(ino, callerPID, newSize, remoteCommitted, false)
+}
+
+// syncOpenHandlesAfterStagedPathTruncate updates open-handle views after a
+// path truncate has been durably staged but is still owned by CommitQueue.
+// Clean handles stay clean until queue completion publishes the new revision.
+func (fs *Dat9FS) syncOpenHandlesAfterStagedPathTruncate(ino uint64, callerPID uint32, newSize int64) {
+	fs.syncOpenHandlesAfterPathTruncateState(ino, callerPID, newSize, false, true)
+}
+
+func (fs *Dat9FS) syncOpenHandlesAfterPathTruncateState(ino uint64, callerPID uint32, newSize int64, remoteCommitted, remoteStaged bool) {
 	for _, fh := range fs.fileHandlesForInode(ino) {
 		fh.Lock()
 		if fh.Dirty == nil {
 			fh.Unlock()
 			continue
 		}
+		// A close-sync handle whose commit already completed may still await
+		// asynchronous Release. It reflects the path mutation but never becomes
+		// a second publisher.
 		if fs.isPassiveCloseSyncHandleLocked(fh) {
 			var committedRevision int64
-			if fs.appendLogPathConfigured(fh.Path) {
+			if remoteCommitted || fs.appendLogPathConfigured(fh.Path) {
 				if revision, size, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && size == newSize {
 					committedRevision = revision
 				}
@@ -201,31 +213,52 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 			fh.Unlock()
 			continue
 		}
-		if fs.appendLogPathConfigured(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
+
+		cleanHandle := !writableHandleHasPendingContentLocked(fh)
+		// A completed remote path truncate is authoritative for every clean
+		// kernel-owned handle, including an older process whose Release is late.
+		mayRebaseCleanHandle := fs.appendLogPathConfigured(fh.Path) ||
+			(remoteCommitted && fh.OpenPID != 0)
+		if cleanHandle && mayRebaseCleanHandle {
 			if revision, committedSize, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && revision > 0 && committedSize == newSize {
 				fs.adoptCommittedStorageClassLocked(fh, newSize)
 				if fh.Dirty.Size() != newSize {
 					if err := fh.Dirty.Truncate(newSize); err != nil {
-						safeLogPrintf("append-log path-truncate sync failed for %s: %v", fh.Path, err)
+						safeLogPrintf("clean path-truncate rebase failed for %s: %v", fh.Path, err)
 						fh.Unlock()
 						continue
 					}
 					fh.Dirty.ResetSequentialState(newSize)
 				}
 				fh.Dirty.ClearDirty()
-				fh.BaseRev = revision
 				fh.OrigSize = newSize
 				fh.ZeroBase = false
-				fh.appendLogAdoptCommittedBaseline(revision, newSize)
+				fs.adoptCleanCommittedRevisionLocked(fh, revision, newSize)
 				fh.Unlock()
 				continue
 			}
 		}
-		// Upload routing follows the truncated size. This notification can
-		// precede the caller-owned handle's remote commit.
+		if cleanHandle && (remoteStaged || (remoteCommitted && fs.layerEnabled())) {
+			// CommitQueue or the layer entry owns this mutation. Reflect its
+			// acknowledged size without creating a hidden Release generation.
+			fs.adoptCommittedStorageClassLocked(fh, newSize)
+			if fh.Dirty.Size() != newSize {
+				if err := fh.Dirty.Truncate(newSize); err != nil {
+					safeLogPrintf("staged path-truncate sync failed for %s: %v", fh.Path, err)
+					fh.Unlock()
+					continue
+				}
+				fh.Dirty.ResetSequentialState(newSize)
+			}
+			fh.Dirty.ClearDirty()
+			fh.OrigSize = newSize
+			fh.ZeroBase = false
+			fh.Unlock()
+			continue
+		}
+
 		fs.adoptCommittedStorageClassLocked(fh, newSize)
-		curSize := fh.Dirty.Size()
-		if curSize != newSize {
+		if fh.Dirty.Size() != newSize {
 			if err := fh.Dirty.Truncate(newSize); err != nil {
 				safeLogPrintf("path-truncate sync: dirty buffer truncate failed for %s: %v", fh.Path, err)
 				fh.Unlock()
@@ -233,8 +266,6 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 			}
 			fh.Dirty.ResetSequentialState(newSize)
 			fh.ZeroBase = newSize == 0
-			// Reset OrigSize only when truncating to 0 or shrinking to
-			// prevent PatchFile on db9-backed files (see B5 rationale).
 			if newSize == 0 || newSize < fh.OrigSize {
 				fh.OrigSize = newSize
 			}

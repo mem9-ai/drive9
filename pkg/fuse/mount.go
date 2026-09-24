@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -91,6 +92,7 @@ type MountOptions struct {
 	Debug                        bool          // enable FUSE debug logging
 	PerfCounters                 bool          // print low-overhead FUSE perf counter summary on shutdown
 	EnableGitWorkspaces          bool          // enable fast-clone git workspace overlay discovery
+	EnableSynchronousPromotion   bool          // preview: synchronously publish a closed local-only tree to an absent remote target
 	Profiling                    ProfilingOptions
 	// WritebackLazyStaging switches write-back close staging from fsynced
 	// local writes (power-loss safe) to plain writes (issue #964): staged
@@ -112,6 +114,7 @@ type MountOptions struct {
 	SkipProcessState bool
 	// Supervised marks this worker as managed by an external supervisor (logging only).
 	Supervised bool
+	actorID    string
 }
 
 const defaultUploadConcurrency = 16
@@ -299,6 +302,20 @@ func remoteRootValidationError(remoteRoot string, err error) *MountExitError {
 	return ExitStartupTransientErr(fmt.Sprintf("remote root %q", remoteRoot), err)
 }
 
+func promotionRecoveryMountExit(err error) *MountExitError {
+	if isPermanentPromotionRecoveryError(err) {
+		return ExitStartupPermanentErr("recover synchronous promotion", err)
+	}
+	return ExitStartupTransientErr("recover synchronous promotion", err)
+}
+
+func validateMountPlatform(goos string, opts *MountOptions) error {
+	if goos == "windows" && (strings.TrimSpace(opts.LocalRoot) != "" || opts.EnableSynchronousPromotion) {
+		return fmt.Errorf("mount: LocalRoot and synchronous promotion are not supported on Windows")
+	}
+	return nil
+}
+
 // Mount creates and serves a FUSE mount. It blocks until the filesystem
 // is unmounted or a signal (SIGINT, SIGTERM) is received.
 func Mount(opts *MountOptions) (err error) {
@@ -308,6 +325,26 @@ func Mount(opts *MountOptions) (err error) {
 	opts.setDefaults()
 	if err := validateMountOptionsProfile(opts); err != nil {
 		return ExitStartupPermanentErr("invalid mount profile", err)
+	}
+	// The exported library entry point must enforce the same Windows boundary
+	// as the CLI. Windows does not provide the LocalRoot flock/recovery contract;
+	// reject before creating, reading, or recovering any local state.
+	if err := validateMountPlatform(runtime.GOOS, opts); err != nil {
+		return ExitStartupPermanentErr("unsupported mount platform", err)
+	}
+	if opts.EnableSynchronousPromotion && strings.TrimSpace(opts.LocalRoot) == "" {
+		return ExitStartupPermanentErr("synchronous promotion requires LocalRoot", nil)
+	}
+	var promotionRootLock *os.File
+	// LocalRoot is a single-writer store regardless of whether this process is
+	// allowed to begin a new promotion. Otherwise a gate-off mount could race an
+	// enabled mount, or serve a root that still has a pending promotion journal.
+	if strings.TrimSpace(opts.LocalRoot) != "" {
+		promotionRootLock, err = acquirePromotionRootLock(opts.LocalRoot)
+		if err != nil {
+			return ExitStartupPermanentErr("lock LocalRoot", err)
+		}
+		defer releasePromotionRootLock(promotionRootLock)
 	}
 	var (
 		mountBecameActive bool
@@ -373,6 +410,7 @@ func Mount(opts *MountOptions) (err error) {
 
 	// Generate per-mount actor ID for SSE self-filtering.
 	actorID := generateMountID()
+	opts.actorID = actorID
 
 	// Create client and verify connectivity. The constructor choice binds
 	// the mount's principal kind for its entire lifetime (see Invariant #3
@@ -392,6 +430,16 @@ func Mount(opts *MountOptions) (err error) {
 		return ExitStartupPermanentErr("normalize remote root", err)
 	}
 	opts.RemoteRoot = remoteRoot
+	// Validate any durable local journal against this exact server/principal
+	// before the mount makes its first remote request. A LocalRoot accidentally
+	// restarted against another tenant must fail closed without probing it.
+	dat9fs := NewDat9FS(c, opts)
+	dat9fs.promotionRootLock = promotionRootLock
+	if dat9fs.localOverlay != nil {
+		if _, err := dat9fs.readPromotionRecord(); err != nil {
+			return ExitStartupPermanentErr("validate synchronous promotion journal", err)
+		}
+	}
 	if err := validateRemoteRoot(context.Background(), c, remoteRoot); err != nil {
 		return err
 	}
@@ -415,8 +463,18 @@ func Mount(opts *MountOptions) (err error) {
 		fmt.Fprintf(os.Stderr, "drive9: fs layer: %s\n", layer.LayerID)
 	}
 
-	// Build FUSE filesystem
-	dat9fs := NewDat9FS(c, opts)
+	// Recover the local filesystem before FUSE begins serving.
+	if dat9fs.localOverlay != nil {
+		recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), promotionRequestTimeout)
+		err := dat9fs.recoverSynchronousPromotion(recoveryCtx)
+		recoveryCancel()
+		if err != nil {
+			if isPermanentPromotionRecoveryError(err) {
+				fmt.Fprintf(os.Stderr, "drive9: synchronous promotion recovery requires operator action: %v\n", err)
+			}
+			return promotionRecoveryMountExit(err)
+		}
+	}
 	layerEventWatcherStop := func() {}
 
 	profiler, err := StartProfiler(opts.Profiling)
@@ -493,6 +551,13 @@ func Mount(opts *MountOptions) (err error) {
 			// Initialize PendingIndex (in-memory authoritative metadata).
 			pendingIdx, err := NewPendingIndex(pendingDir)
 			if err != nil {
+				// Layer restore may have found a durable rollback marker whose
+				// snapshots cannot be decoded or restored. Continuing without the
+				// index would expose the possibly mixed shadow/.meta pair, so layer
+				// mounts must fail before the kernel mount becomes visible.
+				if opts.LayerRef != "" || errors.Is(err, errLayerRestoreRecoveryFailed) {
+					return ExitStartupPermanentErr("layer pending index recovery", err)
+				}
 				fmt.Fprintf(os.Stderr, "drive9: pending index init failed: %v (continuing without)\n", err)
 			} else {
 				if err := pendingIdx.RecoverFromDisk(); err != nil {
@@ -621,7 +686,7 @@ func Mount(opts *MountOptions) (err error) {
 		shadowDir = filepath.Join(cacheBase, mountHash, "shadow-ro")
 		pendingIdx, pErr := NewPendingIndex(pendingDir)
 		if pErr != nil {
-			return fmt.Errorf("mount: read-only pending index: %w", pErr)
+			return ExitStartupPermanentErr("read-only layer pending index recovery", pErr)
 		}
 		if err := pendingIdx.RecoverFromDisk(); err != nil {
 			fmt.Fprintf(os.Stderr, "drive9: read-only pending recovery: %v\n", err)
@@ -1341,6 +1406,78 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 }
 
 func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS) error {
+	return restoreLayerEntriesInternal(ctx, c, opts, shadows, pending, fs)
+}
+
+// lockLayerRestoreTransaction takes the exclusive side of the same lifecycle
+// barrier held by every FUSE mutation. finish must be called before returning;
+// it publishes an uncertain-state freeze before releasing the barrier, so a
+// writer already queued on the read side wakes only to observe the block.
+func lockLayerRestoreTransaction(fs *Dat9FS) func(error) {
+	if fs == nil {
+		return func(error) {}
+	}
+	fs.promotionBarrier.Lock()
+	return func(err error) {
+		if errors.Is(err, errLayerRestoreStateUncertain) {
+			fs.promotionBlocked.Store(true)
+		}
+		fs.promotionBarrier.Unlock()
+	}
+}
+
+var testHookBeforeLayerRestoreViewPublish func(paths []string)
+var testHookAfterLayerReplayFetched func()
+
+// orderLayerRestoreEntries preserves the server's replay order. replay=1 is
+// an effective operation log ordered root-to-tip and by entry sequence within
+// each layer. EntrySeq is not comparable across layers, and moving a directory
+// rename ahead of an earlier upsert would resurrect the upsert at its old
+// prefix instead of moving it with the directory.
+func orderLayerRestoreEntries(entries []client.FSLayerEntry) []client.FSLayerEntry {
+	return append([]client.FSLayerEntry(nil), entries...)
+}
+
+// publishLayerRestoreView publishes the in-memory namespace view and drops
+// every cache derived from its predecessor. Callers must still hold the
+// exclusive restore lifecycle barrier. Keeping this publication before that
+// barrier is released ensures a queued local mutation is the later winner,
+// rather than allowing a peer replay to overwrite the local result after its
+// durable pending/shadow transaction has already completed.
+func publishLayerRestoreView(fs *Dat9FS, paths []string, publish func() bool) bool {
+	if fs == nil {
+		return false
+	}
+	if testHookBeforeLayerRestoreViewPublish != nil {
+		testHookBeforeLayerRestoreViewPublish(append([]string(nil), paths...))
+	}
+	if !publish() {
+		return false
+	}
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		if p == "" || p == "/" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		invalidateLayerRefreshPath(fs, p)
+	}
+	return true
+}
+
+func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS) (retErr error) {
+	defer func() {
+		// A rollback failure leaves a durable marker precisely because disk state
+		// is no longer safe to expose. Startup already fails before mounting; a
+		// live event watcher must freeze the existing mount as well so successor
+		// writers cannot build on state that the next restart will reject or undo.
+		if retErr != nil && errors.Is(retErr, errLayerRestoreStateUncertain) && fs != nil {
+			fs.promotionBlocked.Store(true)
+		}
+	}()
 	if c == nil || opts == nil || shadows == nil || pending == nil || strings.TrimSpace(opts.LayerRef) == "" {
 		return nil
 	}
@@ -1367,7 +1504,10 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 	if err != nil {
 		return err
 	}
-	restoredUpserts := make(map[string]struct{})
+	entries = orderLayerRestoreEntries(entries)
+	if testHookAfterLayerReplayFetched != nil {
+		testHookAfterLayerReplayFetched()
+	}
 	for _, entry := range entries {
 		localPath, ok := mountpath.ToLocal(opts.RemoteRoot, entry.Path)
 		if !ok {
@@ -1375,47 +1515,84 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		}
 		switch entry.Op {
 		case "whiteout":
-			if fs != nil {
-				fs.markLayerWhiteout(localPath)
+			finishRestore := lockLayerRestoreTransaction(fs)
+			if _, owned := layerRestorePendingGeneration(pending, localPath); !owned {
+				finishRestore(nil)
+				continue
 			}
+			publishLayerRestoreView(fs, []string{localPath}, func() bool {
+				return fs.markLayerWhiteoutAtVersion(localPath, layerVersion(&entry))
+			})
+			finishRestore(nil)
 			continue
 		case "mkdir":
-			if fs != nil {
-				fs.markLayerDir(localPath, entry.Mode)
+			finishRestore := lockLayerRestoreTransaction(fs)
+			if _, owned := layerRestorePendingGeneration(pending, localPath); !owned {
+				finishRestore(nil)
+				continue
 			}
+			publishLayerRestoreView(fs, []string{localPath}, func() bool {
+				return fs.markLayerDirAtVersion(localPath, entry.Mode, layerVersion(&entry))
+			})
+			finishRestore(nil)
 			continue
 		case "chmod":
-			if pending != nil {
-				if err := pending.UpdateMode(localPath, entry.Mode); err != nil {
-					return fmt.Errorf("restore fs layer chmod pending %s: %w", localPath, err)
-				}
+			expectedPendingGen, owned := layerRestorePendingGeneration(pending, localPath)
+			if !owned {
+				// A local unfinished generation owns both its content and mode.
+				// A peer chmod cannot relabel that generation as committed.
+				continue
 			}
+			finishRestore := lockLayerRestoreTransaction(fs)
+			if fs != nil && fs.layerReplayStale([]string{localPath}, layerVersion(&entry)) {
+				finishRestore(nil)
+				continue
+			}
+			unlock := func() {}
 			if fs != nil {
-				switch entry.Kind {
-				case "file":
-					fs.markLayerFileMode(localPath, entry.Mode)
-				case "dir":
-					fs.markLayerDir(localPath, entry.Mode)
-				case "symlink":
-					if target, existingMode, ok := fs.layerSymlink(localPath); ok {
-						nextMode := (existingMode &^ uint32(0o777)) | (entry.Mode & 0o777)
-						if nextMode&uint32(syscall.S_IFMT) == 0 {
-							nextMode |= uint32(syscall.S_IFLNK)
+				unlock = fs.lockRemoteCommitPath(localPath)
+			}
+			applied, err := pending.restoreLayerModeIfGeneration(localPath, expectedPendingGen, entry.Mode)
+			if err == nil && applied {
+				publishLayerRestoreView(fs, []string{localPath}, func() bool {
+					switch entry.Kind {
+					case "file":
+						return fs.markLayerFileAtVersion(localPath, entry.Mode, true, layerVersion(&entry))
+					case "dir":
+						return fs.markLayerDirAtVersion(localPath, entry.Mode, layerVersion(&entry))
+					case "symlink":
+						if target, existingMode, ok := fs.layerSymlink(localPath); ok {
+							nextMode := (existingMode &^ uint32(0o777)) | (entry.Mode & 0o777)
+							if nextMode&uint32(syscall.S_IFMT) == 0 {
+								nextMode |= uint32(syscall.S_IFLNK)
+							}
+							return fs.markLayerSymlinkAtVersion(localPath, target, nextMode, layerVersion(&entry))
 						}
-						fs.markLayerSymlink(localPath, target, nextMode)
 					}
-				}
+					return false
+				})
+			}
+			unlock()
+			finishRestore(err)
+			if err != nil {
+				return fmt.Errorf("restore fs layer chmod pending %s: %w", localPath, err)
+			}
+			if !applied {
+				continue
 			}
 			continue
 		case "rename":
-			if err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)); err != nil {
+			entryLayerID, entryMaxSeq := layerEntryFetchScope(&entry, opts.LayerRef, hasCheckpoint, maxSeq)
+			_, err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, entryLayerID, entryMaxSeq)
+			if err != nil {
 				return err
 			}
 			continue
 		case "symlink":
 			fullEntry := &entry
 			if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
-				fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq))
+				entryLayerID, entryMaxSeq := layerEntryFetchScope(&entry, opts.LayerRef, hasCheckpoint, maxSeq)
+				fetched, err := getLayerEntryForRestore(ctx, c, entryLayerID, entry.Path, entryMaxSeq)
 				if err != nil {
 					return fmt.Errorf("restore fs layer symlink entry %s: %w", entry.Path, err)
 				}
@@ -1428,77 +1605,241 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 			if target == "" {
 				return fmt.Errorf("restore fs layer symlink entry %s: missing target", entry.Path)
 			}
-			if fs != nil {
-				fs.markLayerSymlink(localPath, target, entry.Mode)
+			finishRestore := lockLayerRestoreTransaction(fs)
+			if _, owned := layerRestorePendingGeneration(pending, localPath); !owned {
+				finishRestore(nil)
+				continue
 			}
+			publishLayerRestoreView(fs, []string{localPath}, func() bool {
+				return fs.markLayerSymlinkAtVersion(localPath, target, entry.Mode, layerVersion(&entry))
+			})
+			finishRestore(nil)
 			continue
 		}
 		if entry.Op != "upsert" || entry.Kind != "file" {
 			continue
 		}
-		if _, ok := pending.GetMeta(localPath); ok {
-			if _, restored := restoredUpserts[localPath]; !restored {
-				continue
-			}
+		expectedPendingGen, owned := layerRestorePendingGeneration(pending, localPath)
+		if !owned {
+			// A genuinely unfinished local generation is newer ownership than
+			// replayed layer state and must not be overwritten. A retained
+			// committed overlay, however, is only a local cache of server truth:
+			// replay may replace it with a later layer entry.
+			continue
 		}
-		entryMaxSeq := layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)
-		fullEntry, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, entryMaxSeq)
+		expectedShadowGen := layerRestoreShadowGeneration(shadows, localPath)
+		entryLayerID, entryMaxSeq := layerEntryFetchScope(&entry, opts.LayerRef, hasCheckpoint, maxSeq)
+		fullEntry, err := getLayerEntryForRestore(ctx, c, entryLayerID, entry.Path, entryMaxSeq)
 		if err != nil {
 			return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
 		}
-		var sizeBytes int64
+		var stagedObjectPath string
+		var stagedObjectSize int64
 		if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
-			rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, entryMaxSeq)
+			rc, err := c.ReadFSLayerFileStream(ctx, entryLayerID, entry.Path, entryMaxSeq)
 			if err != nil {
 				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
 			}
-			n, writeErr := shadows.WriteStream(localPath, rc, fullEntry.BaseRevision)
+			stagedObjectPath, stagedObjectSize, err = shadows.stageLayerRestoreStream(localPath, rc)
 			closeErr := rc.Close()
-			if writeErr != nil {
-				return fmt.Errorf("restore fs layer shadow %s: %w", localPath, writeErr)
+			if err != nil {
+				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
 			}
 			if closeErr != nil {
+				_ = os.Remove(stagedObjectPath)
 				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, closeErr)
 			}
-			sizeBytes = n
-		} else {
-			content := fullEntry.Content
-			if err := shadows.WriteFull(localPath, content, fullEntry.BaseRevision); err != nil {
-				return fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
+			if fullEntry.SizeBytes > 0 && stagedObjectSize != fullEntry.SizeBytes {
+				_ = os.Remove(stagedObjectPath)
+				return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, stagedObjectSize, fullEntry.SizeBytes)
 			}
-			sizeBytes = int64(len(content))
 		}
-		if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
-			return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
+		finishRestore := lockLayerRestoreTransaction(fs)
+		if fs != nil && fs.layerReplayStale([]string{localPath}, layerVersion(&entry)) {
+			finishRestore(nil)
+			if stagedObjectPath != "" {
+				_ = os.Remove(stagedObjectPath)
+			}
+			continue
 		}
-		if _, err := pending.PutWithBaseRevAndMode(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
-			return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
-		}
+		unlock := func() {}
 		if fs != nil {
-			if fullEntry.Mode != 0 {
-				fs.markLayerFileMode(localPath, fullEntry.Mode)
-			} else {
-				fs.markLayerFile(localPath)
-			}
+			unlock = fs.lockRemoteCommitPath(localPath)
 		}
-		restoredUpserts[localPath] = struct{}{}
+		restored, err := pending.restoreLayerCommittedIfGeneration(
+			localPath,
+			expectedPendingGen,
+			fullEntry.BaseRevision,
+			fullEntry.Mode,
+			fullEntry.Mode != 0,
+			shadows.shadowPath(localPath),
+			func(tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (bool, error) {
+				checkedPrepare := func(sizeBytes int64) (layerRestoreMetaPublish, error) {
+					if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
+						return nil, fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
+					}
+					return prepareMeta(sizeBytes)
+				}
+				if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
+					applied, writeErr := shadows.installLayerRestoreTempIfGeneration(localPath, stagedObjectPath, stagedObjectSize, fullEntry.BaseRevision, expectedShadowGen, tx, checkedPrepare)
+					if writeErr != nil {
+						return false, fmt.Errorf("restore fs layer shadow %s: %w", localPath, writeErr)
+					}
+					if !applied {
+						return false, nil
+					}
+					return true, nil
+				} else {
+					content := fullEntry.Content
+					applied, err := shadows.writeFullIfGeneration(localPath, content, fullEntry.BaseRevision, expectedShadowGen, tx, checkedPrepare)
+					if err != nil {
+						return false, fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
+					}
+					if !applied {
+						return false, nil
+					}
+					return true, nil
+				}
+			},
+		)
+		if err == nil && restored {
+			publishLayerRestoreView(fs, []string{localPath}, func() bool {
+				return fs.markLayerFileAtVersion(localPath, fullEntry.Mode, fullEntry.Mode != 0, layerVersion(&entry))
+			})
+		}
+		unlock()
+		finishRestore(err)
+		if stagedObjectPath != "" {
+			_ = os.Remove(stagedObjectPath)
+		}
+		if err != nil {
+			return err
+		}
+		if !restored {
+			continue
+		}
 	}
 	return nil
 }
 
-func layerEntryFetchMaxSeq(entry *client.FSLayerEntry, hasCheckpoint bool, checkpointMaxSeq int64) *int64 {
-	// Checkpoint restores must stay pinned to the checkpoint tip. Ancestor
-	// rows can carry a larger entry_seq than the child tip; using that seq
-	// against the child layer would leak later child writes into the view.
-	if hasCheckpoint {
-		seq := checkpointMaxSeq
-		return &seq
+func layerRestorePendingGeneration(pending *PendingIndex, localPath string) (uint64, bool) {
+	if pending == nil {
+		return 0, true
 	}
+	meta, ok := pending.GetMeta(localPath)
+	if !ok {
+		return 0, true
+	}
+	if !meta.LayerCommitted {
+		return 0, false
+	}
+	return meta.Generation, true
+}
+
+func layerRestoreShadowGeneration(shadows *ShadowStore, localPath string) uint64 {
+	if shadows == nil || localPath == "" {
+		return 0
+	}
+	if gen := shadows.ActiveGeneration(localPath); gen != 0 {
+		return gen
+	}
+	if !shadows.Has(localPath) {
+		return 0
+	}
+	return shadows.EnsureActiveGeneration(localPath)
+}
+
+func layerRestoreDirectoryRenameOwned(pending *PendingIndex, oldPath, newPath string) bool {
+	if pending == nil {
+		return true
+	}
+	check := func(root string) bool {
+		if meta, ok := pending.GetMeta(root); ok && !meta.LayerCommitted {
+			return false
+		}
+		for _, meta := range pending.ListByPrefix(strings.TrimSuffix(root, "/") + "/") {
+			if meta != nil && !meta.LayerCommitted {
+				return false
+			}
+		}
+		return true
+	}
+	return check(oldPath) && check(newPath)
+}
+
+// restoreLayerDirectoryCommittedDescendants moves the retained local cache of
+// remotely committed layer files with a peer directory rename. The namespace
+// projection, inode table, and open handles are published only after every
+// cached descendant has reached the matching path. A genuinely unfinished
+// generation is rejected by layerRestoreDirectoryRenameOwned before this
+// helper runs.
+func restoreLayerDirectoryCommittedDescendants(shadows *ShadowStore, pending *PendingIndex, oldPath, newPath string) (bool, error) {
+	if shadows == nil || pending == nil {
+		return true, nil
+	}
+	metas := pending.ListByPrefix(strings.TrimSuffix(oldPath, "/") + "/")
+	sort.Slice(metas, func(i, j int) bool {
+		if metas[i] == nil {
+			return false
+		}
+		if metas[j] == nil {
+			return true
+		}
+		return metas[i].Path < metas[j].Path
+	})
+	moves := make([]layerRestoreRenameMove, 0, len(metas))
+	for _, observed := range metas {
+		if observed == nil || !observed.LayerCommitted {
+			return false, nil
+		}
+		oldChild := observed.Path
+		newChild := newPath + strings.TrimPrefix(oldChild, oldPath)
+		expectedNewPendingGen, newOwned := layerRestorePendingGeneration(pending, newChild)
+		if !newOwned {
+			return false, nil
+		}
+		expectedOldShadowGen := layerRestoreShadowGeneration(shadows, oldChild)
+		expectedNewShadowGen := layerRestoreShadowGeneration(shadows, newChild)
+		if expectedOldShadowGen == 0 {
+			return false, fmt.Errorf("restore fs layer directory rename %s to %s: committed shadow missing", oldChild, newChild)
+		}
+		moves = append(moves, layerRestoreRenameMove{
+			oldPath:               oldChild,
+			newPath:               newChild,
+			expectedOldPendingGen: observed.Generation,
+			expectedNewPendingGen: expectedNewPendingGen,
+			expectedOldShadowGen:  expectedOldShadowGen,
+			expectedNewShadowGen:  expectedNewShadowGen,
+		})
+	}
+	applied, err := restoreLayerRenameGroupIfGenerations(shadows, pending, moves)
+	if err != nil {
+		return false, fmt.Errorf("restore fs layer directory rename %s to %s: %w", oldPath, newPath, err)
+	}
+	return applied, nil
+}
+
+func layerEntryFetchScope(entry *client.FSLayerEntry, tipLayerID string, hasCheckpoint bool, checkpointMaxSeq int64) (string, *int64) {
+	layerID := tipLayerID
+	if entry != nil && strings.TrimSpace(entry.LayerID) != "" {
+		layerID = entry.LayerID
+	}
+	// Replay returns raw effective-log operations. Read an omitted body from
+	// the operation's own layer and sequence: applying an ancestor EntrySeq as
+	// a tip-layer max_seq mixes independent sequence domains and can resolve a
+	// later child projection instead of this operation. The replay request has
+	// already applied a checkpoint cap to the tip and origin caps to ancestors.
 	if entry != nil && entry.EntrySeq > 0 {
 		seq := entry.EntrySeq
-		return &seq
+		return layerID, &seq
 	}
-	return nil
+	// Older/mock responses can omit the operation sequence. Only the tip may
+	// then inherit the checkpoint cap; it must never be applied to an ancestor.
+	if hasCheckpoint && layerID == tipLayerID {
+		seq := checkpointMaxSeq
+		return layerID, &seq
+	}
+	return layerID, nil
 }
 
 func fsLayerMountStateAllowed(state string, checkpoint bool) bool {
@@ -1520,15 +1861,15 @@ func getLayerEntryForRestore(ctx context.Context, c *client.Client, layerID, pat
 	return c.GetFSLayerEntry(ctx, layerID, path)
 }
 
-func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry, maxSeq *int64) error {
+func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry, entryLayerID string, maxSeq *int64) (string, error) {
 	if entry == nil {
-		return nil
+		return "", nil
 	}
 	fullEntry := entry
 	if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
-		fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, maxSeq)
+		fetched, err := getLayerEntryForRestore(ctx, c, entryLayerID, entry.Path, maxSeq)
 		if err != nil {
-			return fmt.Errorf("restore fs layer rename entry %s: %w", entry.Path, err)
+			return "", fmt.Errorf("restore fs layer rename entry %s: %w", entry.Path, err)
 		}
 		fullEntry = fetched
 	}
@@ -1537,34 +1878,115 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 		targetRemote = string(fullEntry.Content)
 	}
 	if targetRemote == "" {
-		return fmt.Errorf("restore fs layer rename entry %s: missing target", entry.Path)
-	}
-	if fs != nil {
-		fs.markLayerWhiteout(oldLocalPath)
+		return "", fmt.Errorf("restore fs layer rename entry %s: missing target", entry.Path)
 	}
 	newLocalPath, ok := mountpath.ToLocal(opts.RemoteRoot, targetRemote)
 	if !ok {
-		return nil
+		return "", nil
 	}
-	movedShadow := shadows.Rename(oldLocalPath, newLocalPath)
-	movedPending := pending.RenamePending(oldLocalPath, newLocalPath)
-	if movedShadow || movedPending {
-		return nil
+	if fullEntry.Kind == "dir" {
+		finishRestore := lockLayerRestoreTransaction(fs)
+		if !layerRestoreDirectoryRenameOwned(pending, oldLocalPath, newLocalPath) {
+			finishRestore(nil)
+			return newLocalPath, nil
+		}
+		migrated, err := restoreLayerDirectoryCommittedDescendants(shadows, pending, oldLocalPath, newLocalPath)
+		if err != nil {
+			finishRestore(err)
+			return newLocalPath, err
+		}
+		if !migrated {
+			finishRestore(nil)
+			return newLocalPath, nil
+		}
+		applied := false
+		if fs != nil {
+			if testHookBeforeLayerRestoreViewPublish != nil {
+				testHookBeforeLayerRestoreViewPublish([]string{oldLocalPath, newLocalPath})
+			}
+			applied = fs.markLayerDirRenameAtVersion(oldLocalPath, newLocalPath, fullEntry.Mode, layerVersion(fullEntry))
+			if applied {
+				fs.inodes.Rename(oldLocalPath, newLocalPath)
+				fs.retargetOpenHandlesForRename(oldLocalPath, newLocalPath)
+				if fs.xattrs != nil {
+					fs.xattrs.Rename(oldLocalPath, newLocalPath)
+				}
+				fs.forgetCommittedRevisionPrefix(oldLocalPath)
+				fs.forgetCommittedRevisionPrefix(newLocalPath)
+				invalidateLayerRefreshSubtree(fs, oldLocalPath)
+				invalidateLayerRefreshSubtree(fs, newLocalPath)
+			}
+		}
+		finishRestore(nil)
+		return newLocalPath, nil
 	}
-	if pending.HasPending(newLocalPath) {
-		return nil
+	expectedOldPendingGen, oldOwned := layerRestorePendingGeneration(pending, oldLocalPath)
+	expectedNewPendingGen, newOwned := layerRestorePendingGeneration(pending, newLocalPath)
+	if !oldOwned || !newOwned {
+		return newLocalPath, nil
 	}
-	data, err := c.ReadCtx(ctx, fullEntry.Path)
+	expectedOldShadowGen := layerRestoreShadowGeneration(shadows, oldLocalPath)
+	expectedNewShadowGen := layerRestoreShadowGeneration(shadows, newLocalPath)
+
+	var fallbackData []byte
+	if expectedOldShadowGen == 0 {
+		data, err := c.ReadCtx(ctx, fullEntry.Path)
+		if err != nil {
+			return newLocalPath, fmt.Errorf("restore fs layer renamed source %s: %w", fullEntry.Path, err)
+		}
+		fallbackData = data
+	}
+	finishRestore := lockLayerRestoreTransaction(fs)
+	if fs != nil && fs.layerReplayStale([]string{oldLocalPath, newLocalPath}, layerVersion(fullEntry)) {
+		finishRestore(nil)
+		return newLocalPath, nil
+	}
+	unlock := func() {}
+	if fs != nil {
+		unlock = fs.lockRemoteCommitPaths(oldLocalPath, newLocalPath)
+	}
+	applied, err := pending.restoreLayerrenameIfGenerations(
+		oldLocalPath,
+		newLocalPath,
+		expectedOldPendingGen,
+		expectedNewPendingGen,
+		0,
+		fullEntry.Mode,
+		fullEntry.Mode != 0,
+		shadows.shadowPath(oldLocalPath),
+		shadows.shadowPath(newLocalPath),
+		func(tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (bool, error) {
+			moved, matched, err := shadows.renameIfGenerations(
+				oldLocalPath,
+				newLocalPath,
+				expectedOldShadowGen,
+				expectedNewShadowGen,
+				tx,
+				prepareMeta,
+			)
+			if err != nil || moved || !matched {
+				return moved, err
+			}
+			if fallbackData == nil {
+				return false, nil
+			}
+			return shadows.writeFullIfGeneration(newLocalPath, fallbackData, 0, expectedNewShadowGen, tx, prepareMeta)
+		},
+	)
+	if err == nil && applied {
+		publishLayerRestoreView(fs, []string{oldLocalPath, newLocalPath}, func() bool {
+			return fs.markLayerRenameAtVersion(oldLocalPath, newLocalPath, fullEntry.Mode, layerVersion(fullEntry))
+		})
+	}
+	unlock()
+	finishRestore(err)
 	if err != nil {
-		return fmt.Errorf("restore fs layer renamed source %s: %w", fullEntry.Path, err)
+		return newLocalPath, fmt.Errorf("restore fs layer rename %s to %s: %w", oldLocalPath, newLocalPath, err)
 	}
-	if err := shadows.WriteFull(newLocalPath, data, 0); err != nil {
-		return fmt.Errorf("restore fs layer renamed shadow %s: %w", newLocalPath, err)
+	if !applied {
+		return newLocalPath, nil
 	}
-	if _, err := pending.PutWithBaseRevAndMode(newLocalPath, int64(len(data)), PendingOverwrite, 0, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
-		return fmt.Errorf("restore fs layer renamed pending %s: %w", newLocalPath, err)
-	}
-	return nil
+	return newLocalPath, nil
 }
 
 func mountCredentialKind(opts *MountOptions) string {

@@ -1654,6 +1654,508 @@ func TestCloseSyncFlushSupersedesPathZeroShadowBeforeRelease(t *testing.T) {
 	}
 }
 
+func TestCloseSyncPathTruncateDoesNotAdoptCleanUnreleasedHandle(t *testing.T) {
+	const path = "/supervise-probe.txt"
+	const (
+		firstPID  = 4242
+		secondPID = 4343
+	)
+
+	var (
+		mu           sync.Mutex
+		content            = []byte("seed\n")
+		rev          int64 = 1
+		putCalls     int
+		failNextHead bool
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			if failNextHead {
+				failNextHead = false
+				http.Error(w, "injected post-truncate stat failure", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			_, _ = w.Write(content)
+		case http.MethodPut:
+			expected, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				expected = -1
+			}
+			if expected >= 0 && expected != rev {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			rev++
+			putCalls++
+			content = append(content[:0], body...)
+			if putCalls == 2 {
+				// The second PUT is SetAttr's zero truncate. Its response carries
+				// the authoritative revision; the follow-up HEAD may fail without
+				// leaving clean, unreleased handles on the old CAS base.
+				failNextHead = true
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": rev})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict, WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	ino := fs.inodes.Lookup(path, false, int64(len(content)), time.Now())
+	fs.inodes.UpdateRevision(ino, rev)
+
+	openWriter := func(pid uint32) gofuse.OpenOut {
+		t.Helper()
+		var out gofuse.OpenOut
+		if st := fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+			Flags:    uint32(syscall.O_WRONLY),
+		}, &out); st != gofuse.OK {
+			t.Fatalf("Open status = %v, want OK", st)
+		}
+		return out
+	}
+	writeAndFlush := func(pid uint32, out gofuse.OpenOut, data []byte) gofuse.Status {
+		t.Helper()
+		if _, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+			Fh:       out.Fh,
+			Offset:   0,
+		}, data); st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+		return fs.Flush(nil, &gofuse.FlushIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+			Fh:       out.Fh,
+		})
+	}
+
+	// Keep the first, already-flushed handle registered. Linux may delay its
+	// Release until after a later process has started the next O_TRUNC open.
+	// The path SetAttr must not fold that new truncate into this clean old
+	// handle: its delayed Release would publish a hidden zero-byte generation
+	// and make the new writer's CAS stale.
+	first := openWriter(firstPID)
+	if st := writeAndFlush(firstPID, first, []byte("first\n")); st != gofuse.OK {
+		t.Fatalf("first Flush status = %v, want OK", st)
+	}
+
+	var attrOut gofuse.AttrOut
+	if st := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+		Valid:    gofuse.FATTR_SIZE,
+		Size:     0,
+	}}, &attrOut); st != gofuse.OK {
+		t.Fatalf("SetAttr truncate status = %v, want OK", st)
+	}
+
+	second := openWriter(secondPID)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+		Fh:       second.Fh,
+		Offset:   0,
+	}, []byte("second\n")); st != gofuse.OK {
+		t.Fatalf("second Write status = %v, want OK", st)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: firstPID}}, Fh: first.Fh})
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+		Fh:       second.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("second Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}}, Fh: second.Fh})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := string(content); got != "second\n" {
+		t.Fatalf("remote content = %q, want %q", got, "second\n")
+	}
+	if rev != 4 {
+		t.Fatalf("remote revision = %d, want 4", rev)
+	}
+	if failNextHead {
+		t.Fatal("post-truncate HEAD failure injection was not exercised")
+	}
+}
+
+func TestWriteBackTierTransitionOpenThenSetAttrRebasesWriterAcrossPIDs(t *testing.T) {
+	const (
+		path      = "/tier-transition.bin"
+		firstPID  = 4242
+		secondPID = 4343
+		smallSize = 10 * 1024
+		largeSize = 8 * 1024 * 1024
+	)
+
+	type multipartState struct {
+		expected int64
+		size     int64
+		parts    map[int][]byte
+	}
+	var (
+		mu             sync.Mutex
+		content              = bytes.Repeat([]byte{0x11}, smallSize)
+		revision       int64 = 1
+		directPuts     int
+		completeCalls  int
+		active         multipartState
+		zeroPutEntered = make(chan struct{})
+		allowZeroPut   = make(chan struct{})
+		allowZeroOnce  sync.Once
+	)
+	releaseZeroPut := func() { allowZeroOnce.Do(func() { close(allowZeroPut) }) }
+	defer releaseZeroPut()
+
+	checkExpected := func(raw string) bool {
+		if raw == "" {
+			return true
+		}
+		expected, err := strconv.ParseInt(raw, 10, 64)
+		return err == nil && (expected < 0 || expected == revision)
+	}
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+path:
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+path:
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			_, _ = w.Write(content)
+
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+path:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read direct PUT body: %v", err)
+				http.Error(w, "read body", http.StatusInternalServerError)
+				return
+			}
+			if len(body) == 0 {
+				select {
+				case <-zeroPutEntered:
+				default:
+					close(zeroPutEntered)
+				}
+				<-allowZeroPut
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !checkExpected(r.Header.Get("X-Dat9-Expected-Revision")) {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			content = append(content[:0], body...)
+			revision++
+			directPuts++
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": revision})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode initiate: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if req.Path != path || req.TotalSize <= 0 || req.TotalSize > largeSize || req.ExpectedRevision == nil {
+				t.Errorf("initiate = path %q size %d expected %v, want %q/(0,%d]/non-nil", req.Path, req.TotalSize, req.ExpectedRevision, path, largeSize)
+				http.Error(w, "bad initiate", http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			active = multipartState{expected: *req.ExpectedRevision, size: req.TotalSize, parts: make(map[int][]byte)}
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "tier-upload",
+				"key":         "tier-object",
+				"part_size":   int64(s3client.PartSize),
+				"total_parts": int((req.TotalSize + int64(s3client.PartSize) - 1) / int64(s3client.PartSize)),
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/tier-upload/presign-batch":
+			mu.Lock()
+			activeSize := active.size
+			mu.Unlock()
+			parts := make([]map[string]any, 0, 2)
+			for partNum, offset := 1, int64(0); offset < activeSize; partNum, offset = partNum+1, offset+int64(s3client.PartSize) {
+				size := min(int64(s3client.PartSize), activeSize-offset)
+				parts = append(parts, map[string]any{
+					"number": partNum,
+					"url":    ts.URL + "/s3/tier-upload/" + strconv.Itoa(partNum),
+					"size":   size,
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"parts": parts})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/tier-upload/presign":
+			var req struct {
+				PartNumber int `json:"part_number"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode presign: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": req.PartNumber,
+				"url":    ts.URL + "/s3/tier-upload/" + strconv.Itoa(req.PartNumber),
+				"size":   int64(s3client.PartSize),
+			})
+
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/tier-upload/"):
+			partNum, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/s3/tier-upload/"))
+			if err != nil {
+				t.Errorf("parse part number: %v", err)
+				http.Error(w, "bad part", http.StatusBadRequest)
+				return
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read part body: %v", err)
+				http.Error(w, "read part", http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			active.parts[partNum] = body
+			mu.Unlock()
+			w.Header().Set("ETag", fmt.Sprintf("etag-%d", partNum))
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/tier-upload/complete":
+			mu.Lock()
+			defer mu.Unlock()
+			if active.expected != revision {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			assembled := make([]byte, 0, active.size)
+			for partNum := 1; int64(len(assembled)) < active.size; partNum++ {
+				part, ok := active.parts[partNum]
+				if !ok {
+					http.Error(w, "missing part", http.StatusBadRequest)
+					return
+				}
+				assembled = append(assembled, part...)
+			}
+			content = assembled
+			revision++
+			completeCalls++
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodDelete && r.URL.Path == "/v2/uploads/tier-upload":
+			w.WriteHeader(http.StatusNoContent)
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(50_000)
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	writeBack, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploader := NewWriteBackUploader(c, writeBack, 1, fs.remoteRoot())
+	uploader.OnSuccess = fs.onWriteBackUploadSuccess
+	uploader.SnapshotStagingGens = fs.snapshotStagingGens
+	fs.SetWriteBack(writeBack, uploader)
+	queue := NewCommitQueue(c, shadow, pending, nil, 1, 8, fs.remoteRoot())
+	queue.OnSuccess = fs.onCommitQueueSuccess
+	queue.OnUploaded = fs.onCommitQueueUploaded
+	queue.OnCleanup = fs.onCommitQueueCleanup
+	queue.OnDiscard = fs.onCommitQueueDiscard
+	queue.IsSuperseded = fs.commitEntrySuperseded
+	queue.PathLock = fs.lockRemoteCommitPath
+	queue.DurableWatermark = fs.latestCommittedRevision
+	fs.commitQueue = queue
+	t.Cleanup(func() {
+		queue.DrainAll()
+		uploader.DrainAll()
+	})
+
+	ino := fs.inodes.Lookup(path, false, int64(len(content)), time.Now())
+	fs.inodes.UpdateRevision(ino, revision)
+
+	openWriter := func(pid uint32, flags uint32) gofuse.OpenOut {
+		t.Helper()
+		var out gofuse.OpenOut
+		if st := fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+			Flags:    flags,
+		}, &out); st != gofuse.OK {
+			t.Fatalf("Open(pid=%d, flags=%#x) status = %v, want OK", pid, flags, st)
+		}
+		return out
+	}
+
+	// PID A observes the already-committed 10KiB generation and closes it.
+	// The required mounted gate then starts a different process for the 8MiB
+	// rewrite; keeping the PIDs distinct prevents a same-caller shortcut from
+	// masking the production ordering.
+	first := openWriter(firstPID, uint32(syscall.O_WRONLY))
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: firstPID}},
+		Fh:       first.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("first Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: firstPID}},
+		Fh:       first.Fh,
+	})
+
+	// Linux delivered the failing production sequence as OPEN(WRONLY), then
+	// SETATTR(size=0), then writes on the same PID B handle. The kernel strips
+	// O_TRUNC from FUSE_OPEN in this form. The zero truncate is staged through
+	// CommitQueue and may commit before the first Write; PID B must adopt that
+	// authoritative revision rather than prepare its 8MiB payload on rev 1.
+	second := openWriter(secondPID, uint32(syscall.O_WRONLY))
+	var attrOut gofuse.AttrOut
+	if st := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+		Valid:    gofuse.FATTR_SIZE,
+		Size:     0,
+	}}, &attrOut); st != gofuse.OK {
+		t.Fatalf("SetAttr truncate status = %v, want OK", st)
+	}
+	large := bytes.Repeat([]byte{0x2b}, largeSize)
+	const chunkSize = 1024 * 1024
+	firstWriteDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+			Fh:       second.Fh,
+			Offset:   0,
+		}, large[:chunkSize])
+		firstWriteDone <- st
+	}()
+	select {
+	case <-zeroPutEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued zero did not reach direct PUT")
+	}
+	select {
+	case st := <-firstWriteDone:
+		t.Fatalf("PID B Write completed before queued zero committed: %v", st)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseZeroPut()
+	select {
+	case st := <-firstWriteDone:
+		if st != gofuse.OK {
+			t.Fatalf("first PID B Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PID B Write did not resume after queued zero committed")
+	}
+	secondFH, _ := fs.fileHandles.Get(second.Fh)
+	secondFH.Lock()
+	if secondFH.BaseRev != 2 || !writableHandleHasPendingContentLocked(secondFH) || secondFH.Dirty.Size() != chunkSize {
+		t.Fatalf("PID B handle after first Write = base %d pending %t size %d, want base 2 pending true size %d",
+			secondFH.BaseRev, writableHandleHasPendingContentLocked(secondFH), secondFH.Dirty.Size(), chunkSize)
+	}
+	secondFH.Unlock()
+	for offset := chunkSize; offset < len(large); offset += chunkSize {
+		end := min(offset+chunkSize, len(large))
+		if _, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+			Fh:       second.Fh,
+			Offset:   uint64(offset),
+		}, large[offset:end]); st != gofuse.OK {
+			t.Fatalf("second Write(offset=%d) status = %v, want OK", offset, st)
+		}
+	}
+
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+		Fh:       second.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("second Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+		Fh:       second.Fh,
+	})
+	queue.WaitPath(path)
+	uploader.DrainAll()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if directPuts != 1 {
+		t.Fatalf("direct PUT calls = %d, want 1 zero truncate", directPuts)
+	}
+	if completeCalls == 0 {
+		t.Fatal("multipart complete calls = 0, want at least one committed tier transition")
+	}
+	if len(content) != largeSize || !bytes.Equal(content, large) {
+		t.Fatalf("remote multipart content = size %d matching=%t, want size %d matching=true", len(content), bytes.Equal(content, large), largeSize)
+	}
+}
+
 func TestWriteSyncUploadsBeforeWriteReturns(t *testing.T) {
 	var putCalls atomic.Int32
 	var uploaded []byte

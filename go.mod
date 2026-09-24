@@ -271,7 +271,7 @@ require (
 	github.com/docker/docker v28.5.2+incompatible // indirect
 	github.com/docker/go-connections v0.6.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
-	github.com/ebitengine/purego v0.10.0 // indirect
+	github.com/ebitengine/purego v0.10.0
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -344,9 +344,10 @@ replace github.com/vmware/go-nfs-client v0.0.0-20190605212624-d43b92724c1b => gi
 
 replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/juicedata/minio v0.0.0-20260515071949-69a6cfc9da65
 
-// JuiceFS fork with the drive9 HTTP meta engine (extend-v1.4 from v1.4.1).
-// Pin the GitHub commit; do not replace with a local path.
-replace github.com/juicedata/juicefs => github.com/mornyx/juicefs v1.4.2-0.20260914103651-ec5ea9b23d11
+// JuiceFS fork with the drive9 HTTP meta engine (extend-v1.4 from v1.4.1)
+// and no-flush handle abort used by outcome-unknown fencing. Pin the GitHub
+// commit; do not replace with a local path.
+replace github.com/juicedata/juicefs => github.com/qiffang/juicefs v1.4.0-dev.0.20260922170904-d30a153405c5
 
 // Upstream juicefs replaces hashicorp/golang-lru with the juicedata fork that
 // adds LRU.AddIf; a dependency replace is ignored, so consumers must carry it.

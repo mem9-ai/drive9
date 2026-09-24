@@ -64,6 +64,14 @@ func (fs *Dat9FS) Drain(ctx context.Context) mountcontrol.DrainResponse {
 	startedAt := time.Now().UTC()
 	resp := mountcontrol.NewDrainResponse(fs.mountPointForDrain(), startedAt)
 	fs.populateNativeSyncFSSupport(&resp)
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		resp.Fail("local_state_uncertain", "", errLayerRestoreStateUncertain)
+		resp.Pending = fs.snapshotDrainPending()
+		resp.Finish(time.Now().UTC())
+		return resp
+	}
+	defer promotionUnlock()
 	runPhase := func(name string, fn func() error) bool {
 		phaseStart := time.Now()
 		err := fn()

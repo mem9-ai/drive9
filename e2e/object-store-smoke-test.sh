@@ -11,6 +11,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/minio-defaults.sh
+source "$REPO_ROOT/scripts/minio-defaults.sh"
 CLI_SOURCE="${CLI_SOURCE:-build}"
 CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
 CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
@@ -19,7 +21,11 @@ OBJECT_STRICT_CROSS="${OBJECT_STRICT_CROSS:-$OBJECT_STRICT_MOUNT}"
 OBJECT_CMD_TIMEOUT_S="${OBJECT_CMD_TIMEOUT_S:-120}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-2}"
-MINIO_IMAGE="${MINIO_IMAGE:-${DRIVE9_MINIO_IMAGE:-minio/minio:RELEASE.2024-12-18T13-15-44Z}}"
+# Docker Hub removed the historical minio/minio repository used by this gate.
+# Keep the local smoke deterministic on Rancher's frozen multi-arch mirror of
+# the official image (including the same `server /data` entrypoint contract);
+# callers can still override it through MINIO_IMAGE/DRIVE9_MINIO_IMAGE.
+MINIO_IMAGE="${MINIO_IMAGE:-${DRIVE9_MINIO_IMAGE:-$DRIVE9_DEFAULT_MINIO_IMAGE}}"
 MINIO_PORT="${MINIO_PORT:-${DRIVE9_MINIO_PORT:-19000}}"
 MINIO_ROOT_USER="${MINIO_ROOT_USER:-${DRIVE9_MINIO_USER:-drive9minio}}"
 MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-${DRIVE9_MINIO_PASSWORD:-drive9minio}}"

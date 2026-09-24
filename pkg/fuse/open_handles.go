@@ -118,6 +118,22 @@ func (idx *OpenHandleIndex) Has(ino uint64, p string) bool {
 	return p != "" && len(idx.byPath[p]) > 0
 }
 
+// HasPathPrefix reports whether any open handle is at root or below it.
+func (idx *OpenHandleIndex) HasPathPrefix(root string) bool {
+	if idx == nil || root == "" {
+		return false
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	prefix := strings.TrimSuffix(root, "/") + "/"
+	for p := range idx.byPath {
+		if p == root || strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (idx *OpenHandleIndex) SnapshotPath(p string) []*FileHandle {
 	if idx == nil || p == "" {
 		return nil

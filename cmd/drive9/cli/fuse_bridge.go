@@ -59,6 +59,7 @@ type mountFuseOptions struct {
 	LayerRef                     string
 	CheckpointRef                string
 	LocalRoot                    string
+	EnableSynchronousPromotion   bool
 	LocalOnlyPatterns            []string
 	RemoteOnlyPatterns           []string
 	AppendLogPatterns            []string
