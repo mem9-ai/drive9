@@ -44,6 +44,9 @@ type WriteBuffer struct {
 	parts        map[int][]byte // 0-based part index → part data
 	dirtyParts   map[int]bool   // 0-based part index → dirty flag
 	touched      bool
+	// visibleTruncate makes this uncommitted buffer authoritative for reads
+	// through other handles of the same inode after an fd-based truncate.
+	visibleTruncate bool
 
 	// Callback (optional)
 	LoadPart LoadPartFunc // called to lazily load part data
@@ -52,9 +55,9 @@ type WriteBuffer struct {
 	// remoteSize: the part may exist only in the local shadow.
 	RestorePart LoadPartFunc
 
-	// remoteSize is the original remote file size, set when lazy loading
-	// is configured. ensurePart() only calls LoadPart for parts whose
-	// start offset < remoteSize. Parts beyond this are new (zero-filled).
+	// remoteSize is the retained remote prefix length, set when lazy loading
+	// is configured and reduced on shrink. ensurePart() only calls LoadPart
+	// for parts whose start offset < remoteSize. Parts beyond it are zero-filled.
 	// Zero means "no remote data" (e.g. new file or eager-loaded file).
 	remoteSize int64
 
@@ -81,23 +84,24 @@ type WriteBuffer struct {
 }
 
 type writeBufferSnapshot struct {
-	path          string
-	totalSize     int64
-	maxSize       int64
-	partSize      int64
-	smallFileMax  int64
-	parts         map[int][]byte
-	dirtyParts    map[int]bool
-	touched       bool
-	LoadPart      LoadPartFunc
-	RestorePart   LoadPartFunc
-	remoteSize    int64
-	curMemory     int64
-	appendCursor  int64
-	sequential    bool
-	uploadedParts map[int]bool
-	OnPartFull    func(partIdx int, data []byte)
-	smallFileData []byte
+	path            string
+	totalSize       int64
+	maxSize         int64
+	partSize        int64
+	smallFileMax    int64
+	parts           map[int][]byte
+	dirtyParts      map[int]bool
+	touched         bool
+	visibleTruncate bool
+	LoadPart        LoadPartFunc
+	RestorePart     LoadPartFunc
+	remoteSize      int64
+	curMemory       int64
+	appendCursor    int64
+	sequential      bool
+	uploadedParts   map[int]bool
+	OnPartFull      func(partIdx int, data []byte)
+	smallFileData   []byte
 }
 
 func (wb *WriteBuffer) snapshot() *writeBufferSnapshot {
@@ -105,23 +109,24 @@ func (wb *WriteBuffer) snapshot() *writeBufferSnapshot {
 		return nil
 	}
 	return &writeBufferSnapshot{
-		path:          wb.path,
-		totalSize:     wb.totalSize,
-		maxSize:       wb.maxSize,
-		partSize:      wb.partSize,
-		smallFileMax:  wb.smallFileMax,
-		parts:         cloneByteMap(wb.parts),
-		dirtyParts:    cloneBoolMap(wb.dirtyParts),
-		touched:       wb.touched,
-		LoadPart:      wb.LoadPart,
-		RestorePart:   wb.RestorePart,
-		remoteSize:    wb.remoteSize,
-		curMemory:     wb.curMemory,
-		appendCursor:  wb.appendCursor,
-		sequential:    wb.sequential,
-		uploadedParts: cloneBoolMap(wb.uploadedParts),
-		OnPartFull:    wb.OnPartFull,
-		smallFileData: cloneBytes(wb.smallFileData),
+		path:            wb.path,
+		totalSize:       wb.totalSize,
+		maxSize:         wb.maxSize,
+		partSize:        wb.partSize,
+		smallFileMax:    wb.smallFileMax,
+		parts:           cloneByteMap(wb.parts),
+		dirtyParts:      cloneBoolMap(wb.dirtyParts),
+		touched:         wb.touched,
+		visibleTruncate: wb.visibleTruncate,
+		LoadPart:        wb.LoadPart,
+		RestorePart:     wb.RestorePart,
+		remoteSize:      wb.remoteSize,
+		curMemory:       wb.curMemory,
+		appendCursor:    wb.appendCursor,
+		sequential:      wb.sequential,
+		uploadedParts:   cloneBoolMap(wb.uploadedParts),
+		OnPartFull:      wb.OnPartFull,
+		smallFileData:   cloneBytes(wb.smallFileData),
 	}
 }
 
@@ -137,6 +142,7 @@ func (wb *WriteBuffer) restore(snapshot *writeBufferSnapshot) {
 	wb.parts = cloneByteMap(snapshot.parts)
 	wb.dirtyParts = cloneBoolMap(snapshot.dirtyParts)
 	wb.touched = snapshot.touched
+	wb.visibleTruncate = snapshot.visibleTruncate
 	wb.LoadPart = snapshot.LoadPart
 	wb.RestorePart = snapshot.RestorePart
 	wb.remoteSize = snapshot.remoteSize
@@ -582,6 +588,9 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 		if wb.smallFileData != nil {
 			wb.smallFileData = wb.smallFileData[:size]
 			wb.totalSize = size
+			if wb.remoteSize > size {
+				wb.remoteSize = size
+			}
 			wb.touched = true
 			wb.dirtyParts[0] = true
 			return nil
@@ -629,6 +638,9 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 		}
 
 		wb.totalSize = size
+		if wb.remoteSize > size {
+			wb.remoteSize = size
+		}
 
 	case size > cur:
 		if wb.smallFileData != nil {
@@ -986,6 +998,7 @@ func (wb *WriteBuffer) LoadMissingParts() error {
 func (wb *WriteBuffer) Reset() {
 	wb.parts = make(map[int][]byte)
 	wb.dirtyParts = make(map[int]bool)
+	wb.visibleTruncate = false
 	wb.totalSize = 0
 	wb.curMemory = 0
 	wb.smallFileData = nil
@@ -994,6 +1007,7 @@ func (wb *WriteBuffer) Reset() {
 func (wb *WriteBuffer) ClearDirty() {
 	wb.dirtyParts = make(map[int]bool)
 	wb.touched = false
+	wb.visibleTruncate = false
 	// Note: we intentionally do NOT clear smallFileData here.
 	// ClearDirty is called after successful flush/upload; the data remains
 	// valid for reads until the handle is released or Reset is called.
