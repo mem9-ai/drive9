@@ -214,6 +214,64 @@ so forgetting an old incarnation cannot remove a replacement's mapping.
 The next lifecycle refactor is tracked in
 [Shadow claim encapsulation](fuse-shadow-claim-lifecycle.md).
 
+For a new nonempty inline file with deferred permissions, close-sync can publish
+content and mode together using a single-item batch write with create-only CAS.
+This optimization requires a successful `/v1/status` negotiation advertising
+`storage_capabilities.batch_write_mode_v1: true`. Missing or false capability,
+failed negotiation, and older servers use the ordinary PUT-then-chmod flow.
+The check reads the existing status cache and adds no hot-path request.
+The acknowledged mode generation is cleared only if it is still current; newer
+chmods remain pending and are applied against the committed file. A server that
+rejects the batch endpoint with HTTP 404/405 uses the existing PUT-then-chmod path.
+The close-sync path logs that fallback and retries batch support after a one-minute cooldown;
+a transient gateway response does not disable the optimization for the mount's life.
+This retry policy is limited to foreground close-sync. The existing background
+commit queue still disables batching until remount after a top-level 404/405 and
+uses its single-entry recovery path. Changing that queue's scheduling and retry
+policy is separate work; the foreground optimization does not alter it.
+Transport failures, malformed responses and other per-item errors do not fall
+back to PUT, because the commit outcome may be unknown. Overwrites, empty files,
+multipart uploads, locally staged recovery payloads and other durability policies
+keep their existing mode flow.
+
+On servers advertising `batch_write_mode_v1`, setting mode through batch-write
+is owner-only, matching the chmod endpoint.
+A scoped token may write content in its authorized paths without `hasMode`, but
+an item with `hasMode` is rejected with per-item 403 before changing content or
+permissions. A per-item 403 with no committed revision is a definite non-commit:
+close-sync falls back to content-only PUT with the same create-only CAS, then
+applies the pending mode through chmod. Authorized bytes can therefore commit
+even when chmod is denied, matching the ordinary PUT-then-chmod path. Close still
+reports the chmod error and retains the pending mode; a failed fallback PUT also
+remains an error. This fallback neither acknowledges mode nor disables batching.
+With perf enabled, `close_sync_mode_forbidden_fallback` counts these extra requests.
+Backend per-item errors must never map to 403, and post-commit errors must retain
+their committed revision. A zero revision on any other error does not establish
+that nothing committed; top-level 403 and ambiguous results still fail closed.
+The public client contract is documented on `client.BatchWriteResult`; server
+authorization, actual mode application and post-commit revision tests live in
+[`tidbcloud/fs#189`](https://github.com/tidbcloud/fs/pull/189).
+The historical server source in this repository does not enforce or advertise
+this contract, so this client's combined path stays disabled against it.
+Deploying the server capability enables the optimization for newly negotiated
+clients on backends supporting inline batch storage; existing mounts may need
+remounting because status is cached. A failed or malformed initial status fetch
+also leaves the optimization disabled until successful negotiation, normally
+by remounting. The
+[release note](../release-notes/2026-09-23-close-sync-create-mode.md) records this
+compatibility boundary. The background commit queue requires the same capability
+before attaching batch mode fields. Otherwise it batches content only, then
+applies pending mode through the ordinary chmod endpoint. Chmod denial preserves
+staging and is not acknowledged as a successful mode change. This client gate
+does not repair authorization in older servers.
+
+If the server commits a create but its acknowledgement is lost, the handle
+retains its create-only CAS and later flushes can continue failing with a
+conflict until the application reconciles with the remote file. This inherited
+limitation is deliberate: equal bytes/mode alone do not prove commit ownership.
+Automatic recovery needs a server-verifiable idempotency/commit identity; it
+must not overwrite or adopt another writer's object based only on a stat.
+
 `write-sync` can be dramatically slower for normal buffered writers because a
 single logical file copy may be split into many FUSE write requests. It is
 intended for explicit durability-sensitive workloads, not as the default.

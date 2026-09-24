@@ -105,6 +105,7 @@ type Dat9FS struct {
 	kernelCacheBypassSweepTimer *time.Timer
 	kernelCacheBypassSweepAt    time.Time
 	modeSeq                     atomic.Uint64
+	closeSyncBatchRetryAt       atomic.Pointer[time.Time]
 	specialMu                   sync.RWMutex
 	specialByPath               map[string]uint64
 	uid                         uint32
@@ -3836,15 +3837,23 @@ func (fs *Dat9FS) applyPendingModeForHandleLocked(ctx context.Context, fh *FileH
 		}
 		return err
 	}
+	fs.finishPendingModeForHandleLocked(fh, mode, modeGen)
+	return nil
+}
+
+// finishPendingModeForHandleLocked acknowledges only the mode generation that
+// actually committed. Like applyPendingModeForHandleLocked it may drop fh.mu
+// while clearing sibling handles, so callers must recheck content/path state.
+func (fs *Dat9FS) finishPendingModeForHandleLocked(fh *FileHandle, mode uint32, modeGen uint64) {
 	if !pendingModeMatchesLocked(fh, mode, modeGen) {
-		return nil
+		return
 	}
+	ino := fh.Ino
 	fs.inodes.UpdateMode(ino, mode)
 	clearPendingModeLocked(fh)
 	fh.Unlock()
 	fs.clearPendingModeForInodeGeneration(ino, fh, mode, modeGen)
 	fh.Lock()
-	return nil
 }
 
 func (fs *Dat9FS) applyPendingModeWithTimeoutLocked(fh *FileHandle) error {
@@ -14319,8 +14328,10 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 		if durability == shadowUploadRemoteDurable {
 			durability = fs.foregroundShadowUploadDurabilityLocked(fh, stagingGens)
 		}
+		modeCommit := fs.closeSyncCreateModeLocked(fh, size, expectedRevision, durability)
 		fh.Unlock()
-		committedRev, err := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, handlePath, fs.remotePath(handlePath), expectedRevision, stagingGens.ShadowGen, durability)
+		uploadResult, err := fs.uploadCloseSyncShadow(ctx, handlePath, size, expectedRevision, stagingGens.ShadowGen, durability, modeCommit)
+		committedRev := uploadResult.revision
 		var committedMutationRev int64
 		if err == nil {
 			committedMutationRev = fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
@@ -14353,6 +14364,9 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 			return gofuse.OK
 		}
 		if fh.Path != handlePath || fh.DirtySeq != mutationSeq {
+			return gofuse.OK
+		}
+		if !fs.adoptCombinedCommitLocked(fh, handlePath, mutationSeq, size, uploadResult) {
 			return gofuse.OK
 		}
 		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
