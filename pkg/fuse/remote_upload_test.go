@@ -11,8 +11,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/s3client"
 )
@@ -29,6 +32,7 @@ type multipartUploadRecorder struct {
 	presignCalls     atomic.Int32
 	completeCalls    atomic.Int32
 	statCalls        atomic.Int32
+	failStat         atomic.Bool
 	s3PutCalls       atomic.Int32
 	directFilePuts   atomic.Int32
 	completeStarted  chan struct{}
@@ -85,6 +89,10 @@ func newMultipartUploadRecorder(t *testing.T, wantPath string, wantSize int64, w
 
 		case r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
 			rec.statCalls.Add(1)
+			if rec.failStat.Load() {
+				http.Error(w, "injected post-commit stat failure", http.StatusServiceUnavailable)
+				return
+			}
 			gotPath := strings.TrimPrefix(r.URL.Path, "/v1/fs")
 			if gotPath != rec.wantPath {
 				t.Fatalf("stat path = %q, want %q", gotPath, rec.wantPath)
@@ -321,6 +329,66 @@ func TestUploadFromShadowRemoteWithRevisionUsesMultipartAtThreshold(t *testing.T
 	if rec.initiateCalls.Load() != 1 || rec.presignCalls.Load() != 1 || rec.completeCalls.Load() != 1 || rec.s3PutCalls.Load() != 1 {
 		t.Fatalf("multipart flow calls = initiate:%d presign:%d complete:%d s3put:%d, want 1 each",
 			rec.initiateCalls.Load(), rec.presignCalls.Load(), rec.completeCalls.Load(), rec.s3PutCalls.Load())
+	}
+}
+
+func TestSetAttrPathTruncateMultipartPostStatFailureDoesNotFalseSucceed(t *testing.T) {
+	const remotePath = "/multipart-truncate.bin"
+	const callerPID = 5151
+	newSize := int64(len("exact threshold data"))
+	rec := newMultipartUploadRecorder(t, remotePath, newSize, nil)
+	rec.failStat.Store(true)
+
+	c := rec.client()
+	// Equality with the threshold deliberately selects multipart, whose
+	// completion response does not currently expose the committed revision.
+	c.SetSmallFileThresholdForTests(newSize)
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+
+	ino := fs.inodes.Lookup(remotePath, false, 0, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     remotePath,
+		Dirty:    NewWriteBuffer(remotePath, maxPreloadSize, 0),
+		BaseRev:  1,
+		OrigSize: 0,
+		OpenPID:  callerPID,
+		Flags:    uint32(syscall.O_WRONLY),
+	}
+	fhID := fs.fileHandles.Allocate(fh)
+	fs.openHandles.Add(fh)
+
+	var out gofuse.AttrOut
+	status := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: callerPID}},
+		Valid:    gofuse.FATTR_SIZE,
+		Size:     uint64(newSize),
+	}}, &out)
+	if status != gofuse.EIO {
+		t.Fatalf("SetAttr status = %v, want EIO", status)
+	}
+	if rec.completeCalls.Load() != 1 || rec.statCalls.Load() != 1 {
+		t.Fatalf("multipart complete/stat calls = %d/%d, want 1/1", rec.completeCalls.Load(), rec.statCalls.Load())
+	}
+
+	fh.Lock()
+	if fh.BaseRev != 1 || fh.DirtySeq != 0 || fh.ZeroBase || fh.Dirty.HasDirtyParts() || fh.Dirty.Size() != 0 {
+		t.Fatalf("clean handle mutated after unknown committed revision: base=%d seq=%d zero=%t dirty=%t size=%d",
+			fh.BaseRev, fh.DirtySeq, fh.ZeroBase, fh.Dirty.HasDirtyParts(), fh.Dirty.Size())
+	}
+	fh.Unlock()
+
+	// Release must only close the still-clean handle. In particular it must
+	// not create another hidden remote generation after the failed SetAttr.
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: callerPID}},
+		Fh:       fhID,
+	})
+	if rec.completeCalls.Load() != 1 || rec.directFilePuts.Load() != 0 {
+		t.Fatalf("Release caused hidden upload: complete=%d direct=%d, want 1/0", rec.completeCalls.Load(), rec.directFilePuts.Load())
 	}
 }
 
