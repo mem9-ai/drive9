@@ -1466,7 +1466,7 @@ func TestShadowStoreRemoveIfGenerationRaceStaleVsNewerWrite(t *testing.T) {
 
 func TestShadowStoreEnsureActiveGenerationKeepsExistingBaseRevision(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1484,7 +1484,7 @@ func TestShadowStoreEnsureActiveGenerationKeepsExistingBaseRevision(t *testing.T
 		t.Fatalf("initial base revision = %d, want 7", got)
 	}
 
-	if gotGen := ss.EnsureActiveGeneration(path, 9); gotGen != gen {
+	if gotGen := ss.EnsureActiveGeneration(path); gotGen != gen {
 		t.Fatalf("EnsureActiveGeneration returned gen %d, want existing gen %d", gotGen, gen)
 	}
 	if got := ss.BaseRev(path); got != 7 {
@@ -1495,12 +1495,12 @@ func TestShadowStoreEnsureActiveGenerationKeepsExistingBaseRevision(t *testing.T
 	if err := os.WriteFile(ss.shadowPath(recoveredPath), []byte("recovered"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	recoveredGen := ss.EnsureActiveGeneration(recoveredPath, 11)
+	recoveredGen := ss.EnsureActiveGeneration(recoveredPath)
 	if recoveredGen == 0 {
 		t.Fatal("expected recovered shadow to get an active generation")
 	}
-	if got := ss.BaseRev(recoveredPath); got != 11 {
-		t.Fatalf("recovered base revision = %d, want 11", got)
+	if got := ss.BaseRev(recoveredPath); got != 0 {
+		t.Fatalf("recovered base revision = %d, want unknown (0)", got)
 	}
 }
 
@@ -1649,6 +1649,9 @@ func TestShadowResidentPinRejectsOldRevisionWithoutRemovingStaging(t *testing.T)
 	if pin, ok := ss.PinResidentOrDiscardDisk(path, 4); ok || pin != 0 {
 		t.Fatalf("pinned stale image: pin=%d ok=%t", pin, ok)
 	}
+	if info, err := os.Stat(ss.shadowPath(path)); err != nil || info.Size() != 9 {
+		t.Fatalf("rejected pin removed/resized the staging path: info=%v err=%v", info, err)
+	}
 	if data, err := ss.ReadAllIfGeneration(path, generation); err != nil || string(data) != "old image" {
 		t.Fatalf("rejecting a read pin removed staging: data=%q err=%v", data, err)
 	}
@@ -1666,5 +1669,55 @@ func TestShadowResidentPinRejectsOldRevisionWithoutRemovingStaging(t *testing.T)
 	defer ss.Unpin(pin)
 	if n, err := ss.ReadAtGen(pin, 0, buf); err != nil || n != len(buf) || string(buf) != "new image" {
 		t.Fatalf("fresh pin read n=%d data=%q err=%v", n, buf, err)
+	}
+}
+
+func TestShadowRecoveredGenerationIsNotRevisionVerified(t *testing.T) {
+	for _, recoverHash := range []bool{false, true} {
+		name := "disk"
+		if recoverHash {
+			name = "hash"
+		}
+		t.Run(name, func(t *testing.T) {
+			ss, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(ss.Close)
+			const path = "/recovered-wal"
+			if err := os.WriteFile(ss.shadowPath(path), []byte("recovered"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if recoverHash {
+				if err := ss.RecoverFromDisk(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gen := ss.EnsureActiveGeneration(path)
+			if gen == 0 || ss.BaseRev(path) != 0 {
+				t.Fatal("generation minting asserted a content revision")
+			}
+			for _, revision := range []int64{0, 11} {
+				if pin, ok := ss.PinResidentOrDiscardDisk(path, revision); ok || pin != 0 {
+					t.Errorf("recovered bytes accepted as verified cache at revision %d", revision)
+				}
+			}
+			// Pending recovery can still bind/read the bytes using its own
+			// metadata authority, without promoting them into a clean cache.
+			pin, ok := ss.PinIfExists(path)
+			if !ok {
+				t.Fatal("recovery lost its staging source")
+			}
+			defer ss.Unpin(pin)
+			if !ss.canReadGeneration(pin, 11, true) || ss.canReadGeneration(pin, 11, false) {
+				t.Fatal("pending authority and committed-cache proof were conflated")
+			}
+			if got, err := ss.ReadAllIfGeneration(path, gen); err != nil || string(got) != "recovered" {
+				t.Fatalf("recovery data=%q err=%v", got, err)
+			}
+			if info, err := os.Stat(ss.shadowPath(path)); err != nil || info.Size() != 9 {
+				t.Fatalf("recovery path lost: info=%v err=%v", info, err)
+			}
+		})
 	}
 }

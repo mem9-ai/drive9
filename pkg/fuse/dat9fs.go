@@ -2579,8 +2579,7 @@ func (fs *Dat9FS) updateOpenHandleBaseRevisionForPath(remotePath string, revisio
 			// This truncate is already durable. A clean handle may be awaiting
 			// asynchronous Release after a successful Flush; updating its view
 			// must not give it another mutation to publish on Release.
-			fh.ZeroBase = false
-			fs.adoptCleanCommittedRevisionLocked(fh, revision, truncateSize)
+			_ = fs.syncPassivePathTruncateLocked(fh, truncateSize, revision)
 			if fh.Streamer != nil {
 				// Adoption refreshes the CAS token; truncate also discards any
 				// buffered streaming parts from the previous file image.
@@ -2808,191 +2807,6 @@ func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, ne
 		return false
 	}
 	return true
-}
-
-func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision int64, skip *FileHandle) {
-	if fs == nil || fs.openHandles == nil || path == "" || revision <= 0 {
-		return
-	}
-
-	for _, fh := range fs.openHandles.SnapshotPath(path) {
-		if fh == nil || fh == skip {
-			continue
-		}
-		// This method is called from commit paths that may already hold another
-		// same-path handle lock. Never block on sibling handles here: two
-		// concurrent commits can otherwise deadlock by each holding one handle
-		// and waiting for the other. Clean locked siblings refresh lazily in
-		// Read before serving any loaded clean writable-buffer bytes.
-		if !fh.TryLock() {
-			continue
-		}
-		fs.discardSupersededMutationLocked(fh)
-		if fs.handleCanAdoptCommittedRevisionLocked(fh) {
-			cleanBuffer := fh.Dirty != nil
-			if cleanBuffer && fs.clearRemovedCommittedShadowLocked(fh, revision, fs.committedHandleSizeLocked(fh), true) {
-				fh.Unlock()
-				continue
-			}
-			fs.adoptCleanCommittedRevisionLocked(fh, revision, fs.committedHandleSizeLocked(fh))
-		}
-		fh.Unlock()
-	}
-}
-
-// refreshCommittedRevisionForOpenHandlesWithSize is like
-// refreshCommittedRevisionForOpenHandles but uses an explicit committed
-// size instead of reading from the inode table. This is needed in the
-// Path 2 concurrent-write case where the inode size has already been
-// updated by the concurrent Write() but the committed revision
-// corresponds to the pre-write snapshot.
-func (fs *Dat9FS) refreshCommittedRevisionForOpenHandlesWithSize(path string, revision int64, skip *FileHandle, committedSize int64) {
-	if fs == nil || fs.openHandles == nil || path == "" || revision <= 0 {
-		return
-	}
-
-	for _, fh := range fs.openHandles.SnapshotPath(path) {
-		if fh == nil || fh == skip {
-			continue
-		}
-		if !fh.TryLock() {
-			continue
-		}
-		fs.discardSupersededMutationLocked(fh)
-		if fs.handleCanAdoptCommittedRevisionLocked(fh) {
-			cleanBuffer := fh.Dirty != nil
-			if cleanBuffer && fs.clearRemovedCommittedShadowLocked(fh, revision, committedSize, true) {
-				fh.Unlock()
-				continue
-			}
-			fs.adoptCleanCommittedRevisionLocked(fh, revision, committedSize)
-		}
-		fh.Unlock()
-	}
-}
-
-func (fs *Dat9FS) handleCanAdoptCommittedRevisionLocked(fh *FileHandle) bool {
-	if fh == nil {
-		return false
-	}
-	if fh.WriteBackSeq != 0 || fh.ShadowCommitReady || fh.ShadowCommitSeq != 0 {
-		return false
-	}
-	if fs != nil && fh.PendingIndexGen != 0 && fs.pendingIndex != nil && fs.pendingIndex.Generation(fh.Path) == fh.PendingIndexGen {
-		return false
-	}
-	if fs != nil && fh.ShadowStageGen != 0 && fs.shadowStore != nil && fs.shadowStore.ActiveGeneration(fh.Path) == fh.ShadowStageGen {
-		return false
-	}
-	// A dirty handle's bytes were prepared against its current BaseRev.
-	// Advancing only the revision token after a sibling commit would create
-	// the silent-rollback shape: old payload + new CAS base. This applies to
-	// SQLite sidecar journals too: before staging, a dirty app.db-wal handle
-	// is still old WAL payload and must not silently become "based on" a newer
-	// sibling checkpoint revision.
-	if fh.DirtySeq != 0 || (fh.Dirty != nil && fh.Dirty.HasDirtyParts()) {
-		return false
-	}
-	return true
-}
-
-// isPassiveCloseSyncHandleLocked identifies acknowledged handles which may
-// still await Release but must not take ownership of a new path truncate.
-func (fs *Dat9FS) isPassiveCloseSyncHandleLocked(fh *FileHandle) bool {
-	return fh != nil && fh.WritePolicy == WritePolicyCloseSync &&
-		!fh.IsNew && fs.handleCanAdoptCommittedRevisionLocked(fh)
-}
-
-// clearHandleShadowClaimLocked retires the handle's staging/commit claim:
-// ready/spill flags and staging/commit generation/sequence tokens. The read pin
-// (ShadowGen/ShadowPinned) has an independent lifetime and is not retired here.
-// This does not mutate the path-keyed store, which may contain a newer writer's
-// generation. Callers own generation-scoped store cleanup and buffer rebind.
-func clearHandleShadowClaimLocked(fh *FileHandle) {
-	fh.ShadowReady = false
-	fh.ShadowSpill = false
-	fh.ShadowStageGen = 0
-	fh.ShadowStageSeq = 0
-	fh.ShadowCommitReady = false
-	fh.ShadowCommitSeq = 0
-}
-
-// adoptCleanCommittedRevisionLocked rebinds an eligible clean handle to a
-// committed remote image, including its shadow claim and eviction callbacks.
-func (fs *Dat9FS) adoptCleanCommittedRevisionLocked(fh *FileHandle, revision, size int64) {
-	if fs == nil || fh == nil {
-		return
-	}
-	// A rotated WAL shadow is a clean resident cache, not an active staging
-	// claim. Evict it when safe; correctness does not depend on this best-effort
-	// cleanup because read-only Open independently rejects stale revisions.
-	// Capture the generation before inspecting its base; generation-checked
-	// removal preserves a racing write.
-	if fs.shadowStore != nil && revision > 0 {
-		gen := fs.shadowStore.ActiveGeneration(fh.Path)
-		if gen != 0 && fs.shadowStore.BaseRev(fh.Path) < revision && fs.canRemoveActiveStaleShadowForCleanRefreshLocked(fh) {
-			fs.shadowStore.RemoveIfGeneration(fh.Path, gen)
-		}
-	}
-	fh.IsNew = false
-	fh.BaseRev = revision
-	clearHandleShadowClaimLocked(fh)
-	fs.rebindCleanWriteBufferToRemoteLocked(fh, size)
-	fh.appendLogAdoptCommittedBaseline(revision, size)
-	if fh.Streamer != nil {
-		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
-	}
-}
-
-func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) bool {
-	if fs == nil || fh == nil || fh.Dirty == nil || !fs.handleCanAdoptCommittedRevisionLocked(fh) {
-		return false
-	}
-	revision := fs.latestCommittedRevision(fh.Path)
-	if revision <= 0 || revision <= fh.BaseRev {
-		return false
-	}
-	fs.adoptCleanCommittedRevisionLocked(fh, revision, fs.committedHandleSizeLocked(fh))
-	return true
-}
-
-func (fs *Dat9FS) canRemoveActiveStaleShadowForCleanRefreshLocked(fh *FileHandle) bool {
-	if fs == nil || fh == nil || fs.shadowStore == nil || fh.Path == "" || !fs.shadowStore.Has(fh.Path) {
-		return false
-	}
-	if fs.hasPendingMetadataState(fh.Path) {
-		return false
-	}
-	if fs.hasQueuedCommit(fh.Path) {
-		return false
-	}
-	if fs.hasOtherPendingOpenHandleState(fh.Path, fh) {
-		return false
-	}
-	return true
-}
-
-func (fs *Dat9FS) hasOtherPendingOpenHandleState(path string, skip *FileHandle) bool {
-	if fs == nil || fs.openHandles == nil || path == "" {
-		return false
-	}
-	for _, fh := range fs.openHandles.SnapshotPath(path) {
-		if fh == nil || fh == skip {
-			continue
-		}
-		if !fh.TryLock() {
-			return true
-		}
-		pending := fh.IsNew || fh.DirtySeq != 0 || fh.WriteBackSeq != 0 || fh.ShadowCommitReady
-		if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
-			pending = true
-		}
-		fh.Unlock()
-		if pending {
-			return true
-		}
-	}
-	return false
 }
 
 func (fs *Dat9FS) clearRemovedCommittedShadowForOpenHandles(path string, committedRev, committedSize int64) {
@@ -3620,94 +3434,6 @@ func (fs *Dat9FS) fileHandlesForInode(ino uint64) []*FileHandle {
 		}
 	})
 	return handles
-}
-
-// syncOpenHandlesAfterPathTruncate truncates the WriteBuffer of every open
-// dirty handle for the given inode after a path-based truncate(path, size).
-//
-// Without this, applyRemoteTruncate updates the remote file and the inode's
-// cached size, but the open handle's WriteBuffer still holds the pre-truncate
-// data. A subsequent fstat(fd) calls GetAttr → dirtyHandleSize(ino), which
-// returns the stale WriteBuffer size instead of the truncated size, causing
-// fstat() mismatch (LTP ftest01 m_fstat case).
-//
-// Both shrink and grow are handled. For shrink, the buffer is truncated.
-// For grow, the buffer is zero-extended so a later flush uploads the correct
-// size (not stale shorter content that could shrink the file back).
-func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
-	for _, fh := range fs.fileHandlesForInode(ino) {
-		fh.Lock()
-		if fh.Dirty == nil {
-			fh.Unlock()
-			continue
-		}
-		keepClean := fs.isPassiveCloseSyncHandleLocked(fh)
-		if fs.appendLogPathConfigured(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
-			if revision, committedSize, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && revision > 0 && committedSize == newSize {
-				if keepClean {
-					fh.ZeroBase = false
-					fs.adoptCleanCommittedRevisionLocked(fh, revision, newSize)
-					fh.Unlock()
-					continue
-				}
-				fs.adoptCommittedStorageClassLocked(fh, newSize)
-				if fh.Dirty.Size() != newSize {
-					if err := fh.Dirty.Truncate(newSize); err != nil {
-						safeLogPrintf("append-log path-truncate sync failed for %s: %v", fh.Path, err)
-						fh.Unlock()
-						continue
-					}
-					fh.Dirty.ResetSequentialState(newSize)
-				}
-				fh.Dirty.ClearDirty()
-				fh.BaseRev = revision
-				fh.OrigSize = newSize
-				fh.ZeroBase = false
-				fh.appendLogAdoptCommittedBaseline(revision, newSize)
-				fh.Unlock()
-				continue
-			}
-		}
-		// Upload routing follows the truncated size. This notification can
-		// precede the caller-owned handle's remote commit.
-		fs.adoptCommittedStorageClassLocked(fh, newSize)
-		curSize := fh.Dirty.Size()
-		if curSize != newSize {
-			if keepClean && fs.appendLogPathConfigured(fh.Path) {
-				// This can be an uncommitted sibling truncate. Preserve the
-				// committed revision/size before the local sizing below changes
-				// OrigSize; a later write needs a rewrite, not an append against
-				// a size the server has never committed.
-				fh.appendLogRecordTruncate()
-			}
-			if err := fh.Dirty.Truncate(newSize); err != nil {
-				safeLogPrintf("path-truncate sync: dirty buffer truncate failed for %s: %v", fh.Path, err)
-				fh.Unlock()
-				continue
-			}
-			fh.Dirty.ResetSequentialState(newSize)
-			fh.ZeroBase = newSize == 0
-			// Reset OrigSize only when truncating to 0 or shrinking to
-			// prevent PatchFile on db9-backed files (see B5 rationale).
-			if newSize == 0 || newSize < fh.OrigSize {
-				fh.OrigSize = newSize
-			}
-		}
-		if keepClean {
-			// The remote path or the caller's dirty owner owns the truncate.
-			// Sizing a clean sibling's view must not create a second publisher.
-			// OrigSize may shrink for upload routing, while append-log keeps
-			// its separate rewrite baseline until a committed revision/size
-			// is adopted. A notification alone does not prove a remote commit.
-			fh.Dirty.ClearDirty()
-			fh.ZeroBase = false
-			clearHandleShadowClaimLocked(fh)
-			fs.rebaselineCommittedDirtyBufferLocked(fh)
-		} else {
-			fh.DirtySeq = fs.markDirtySize(ino, newSize)
-		}
-		fh.Unlock()
-	}
 }
 
 func (fs *Dat9FS) setPendingMetadataMode(path string, mode uint32) {
@@ -13011,25 +12737,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.Prefetch.SetParallelRead(fs.parallelReadConcurrency(), fs.parallelReadBlockSize())
 			fh.Prefetch.SetPerfCounters(fs.perf)
 		}
-		// Atomically pin shadow for read-only opens so commit queue cleanup
-		// doesn't delete the shadow file while this handle is reading from it.
-		// Configured append-log paths without pending metadata only accept a
-		// current-process shadow based on at least the committed revision.
-		// A disk-only shadow may contain a tail left by a crashed process.
-		if !fh.ShadowPinned && fs.shadowStore != nil {
-			pendingShadow := fs.hasPendingMetadataState(p)
-			var gen uint64
-			var ok bool
-			if fs.appendLogPathConfigured(p) && !pendingShadow {
-				gen, ok = fs.shadowStore.PinResidentOrDiscardDisk(p, max(fh.BaseRev, fs.latestCommittedRevision(p)))
-			} else {
-				gen, ok = fs.shadowStore.PinIfExists(p)
-			}
-			if ok {
-				fh.ShadowGen = gen
-				fh.ShadowPinned = true
-			}
-		}
+		fs.refreshReadOnlyShadowLocked(fh)
 	}
 
 	out.Fh = fs.allocateFileHandle(fh)
@@ -13088,7 +12796,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	fh.Lock()
 	lockWait := time.Since(lockStart)
 	fs.applySQLiteZeroTruncateLocked(fh)
-	fs.refreshAppendLogReaderShadowLocked(fh)
+	if fh.ShadowPinned {
+		fs.refreshReadOnlyShadowLocked(fh)
+	}
 	if fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 		fs.debugf("read lock wait path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, lockWait)
 	}
@@ -13537,26 +13247,16 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	//
 	// If the handle holds a generation token (ShadowGen != 0), try the
 	// generation-based read first — this works even after the shadow has
-	// been retired by commit queue cleanup. Otherwise use path-based ReadAt.
+	// been retired for a reset snapshot. Open and Read use the same checked pin
+	// acquisition; raw path reads must not bypass a rejected cache generation.
 	if fh.Dirty == nil && fs.shadowStore != nil {
 		// Keep a concurrent Read from releasing this handle's obsolete pin
 		// while its generation is being read below.
 		fh.Lock()
+		fs.refreshReadOnlyShadowLocked(fh)
 		var sz int64 = -1
-		var useGen bool
 		if fh.ShadowGen != 0 {
 			sz = fs.shadowStore.SizeGen(fh.ShadowGen)
-			useGen = sz >= 0
-		}
-		// Append-log cache shadows must pass the revision check at pin time.
-		// Falling back by path would reuse an image Open deliberately rejected.
-		// Durable pending metadata remains an independent local read authority.
-		allowPathShadow := !isSQLitePersistentJournalPath(fh.Path) &&
-			(!fs.appendLogPathConfigured(fh.Path) || fs.hasPendingMetadataState(fh.Path))
-		if !useGen && allowPathShadow {
-			if fs.shadowStore.Has(fh.Path) {
-				sz = fs.shadowStore.Size(fh.Path)
-			}
 		}
 		if sz >= 0 {
 			offset := int64(input.Offset)
@@ -13571,13 +13271,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 				end = sz
 			}
 			buf := make([]byte, end-offset)
-			var n int
-			var err error
-			if useGen {
-				n, err = fs.shadowStore.ReadAtGen(fh.ShadowGen, offset, buf)
-			} else {
-				n, err = fs.shadowStore.ReadAt(fh.Path, offset, buf)
-			}
+			n, err := fs.shadowStore.ReadAtGen(fh.ShadowGen, offset, buf)
 			if (err == nil || errors.Is(err, io.EOF)) && n >= 0 {
 				fh.Unlock()
 				source = "shadow-store"

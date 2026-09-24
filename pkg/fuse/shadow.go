@@ -1149,11 +1149,13 @@ func (s *ShadowStore) PinResidentOrDiscardDisk(remotePath string, minRevision in
 	sf, ok := s.files[remotePath]
 	if !ok {
 		s.mu.Unlock()
-		_ = os.Remove(s.shadowPath(remotePath))
-		s.RecoverPendingBytes()
+		if err := os.Remove(s.shadowPath(remotePath)); err == nil {
+			// A retry on an absent cache must not rescan the whole cache dir.
+			s.RecoverPendingBytes()
+		}
 		return 0, false
 	}
-	if sf.baseRev < minRevision {
+	if !sf.readableAtRevision(minRevision) {
 		s.mu.Unlock()
 		return 0, false
 	}
@@ -1167,6 +1169,27 @@ func (s *ShadowStore) PinResidentOrDiscardDisk(remotePath string, minRevision in
 	s.refs[gen]++
 	s.mu.Unlock()
 	return gen, true
+}
+
+// readableAtRevision applies only to cache reads without pending metadata.
+// Revision zero is unknown, including recovered bytes merely loaded from disk.
+func (sf *ShadowFile) readableAtRevision(minRevision int64) bool {
+	return sf != nil && sf.baseRev >= max(1, minRevision)
+}
+
+// canReadGeneration validates both resident and retired read pins. Only an
+// explicit retirement without an ordinary-commit revision preserves a reset
+// snapshot; resident cache pins must track known commits even if no cleanup ran.
+func (s *ShadowStore) canReadGeneration(gen uint64, minRevision int64, pending bool) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if sf := s.genFile[gen]; sf != nil {
+		return pending || sf.readableAtRevision(minRevision)
+	}
+	if retired := s.retired[gen]; retired != nil {
+		return retired.appendLogRevision == 0
+	}
+	return false
 }
 
 // Unpin decrements the reference count for the given generation. If the
@@ -1329,15 +1352,6 @@ func (s *ShadowStore) removeAfterAppendLogCommit(remotePath string, revision int
 	s.releasePathLock(remotePath, pl)
 }
 
-func (s *ShadowStore) appendLogRetiredRevision(gen uint64) int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if retired := s.retired[gen]; retired != nil {
-		return retired.appendLogRevision
-	}
-	return 0
-}
-
 // RemoveIfGeneration removes the shadow file for remotePath only if its current
 // content generation matches expectedGen, and does so atomically: the
 // generation check and the map deletions/retirement run under a single s.mu
@@ -1379,7 +1393,7 @@ func (s *ShadowStore) ActiveGeneration(remotePath string) uint64 {
 // generation for it. Recovered shadows start without memory-only writeGen
 // state; CommitQueue must mint one before binding a recovered CommitEntry so
 // later uploads and cleanup remain generation-scoped instead of path-wide.
-func (s *ShadowStore) EnsureActiveGeneration(remotePath string, baseRev int64) uint64 {
+func (s *ShadowStore) EnsureActiveGeneration(remotePath string) uint64 {
 	if s == nil || remotePath == "" {
 		return 0
 	}
@@ -1416,9 +1430,8 @@ func (s *ShadowStore) EnsureActiveGeneration(remotePath string, baseRev int64) u
 	if gen := s.writeGen[remotePath]; gen != 0 {
 		return gen
 	}
-	if baseRev != 0 {
-		sf.baseRev = baseRev
-	}
+	// Minting a token does not verify recovered bytes. Their authority stays
+	// in pending metadata; do not turn them into a revision-verified cache.
 	return s.bumpWriteGenLocked(remotePath)
 }
 

@@ -730,7 +730,7 @@ func (cq *CommitQueue) RecoverPending() {
 			PendingIndexGen:   meta.Generation,
 		}
 		if cq.shadows != nil {
-			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path, meta.BaseRev)
+			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path)
 			if entry.ShadowGen == 0 {
 				safeLogPrintf("commit queue: skipping recovered pending entry for %s (shadow generation unavailable)", path)
 				if _, err := cq.index.MarkConflictIfGeneration(path, meta.Generation); err != nil {
@@ -2048,7 +2048,7 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 			recovered:         true,
 		}
 		if cq.shadows != nil {
-			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path, meta.BaseRev)
+			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path)
 			if entry.ShadowGen == 0 {
 				continue
 			}

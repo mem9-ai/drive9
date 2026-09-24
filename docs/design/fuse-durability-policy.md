@@ -149,6 +149,17 @@ The eligibility check uses live staging state, not a scan of historical WAL
 frames. Recovery of historical frames retains its recorded revision and existing
 CAS checks; this optimization does not add journal commit markers or retire them.
 
+For configured append-log paths, read-only `Open` and `Read` share a checked
+shadow-pin path. Resident caches must have a known base revision at least as new
+as the handle, inode and locally observed committed revision. Existing pins are
+revalidated, and rejected/ordinary-commit-retired pins can acquire a fresh local
+cache on a later read. Raw path reads cannot bypass that check. Explicitly
+retired WAL reset snapshots and unlinked snapshots keep their existing lifetime;
+durable pending metadata remains an independent authority for staged bytes.
+Minting a recovered shadow's content-generation token does not certify its
+revision: the recovery queue takes its CAS base from pending metadata instead.
+Read freshness does not require best-effort sibling-lock-based cache eviction.
+
 `write-sync` can be dramatically slower for normal buffered writers because a
 single logical file copy may be split into many FUSE write requests. It is
 intended for explicit durability-sensitive workloads, not as the default.

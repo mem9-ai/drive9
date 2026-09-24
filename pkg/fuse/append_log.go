@@ -991,32 +991,6 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 }
 
-// refreshAppendLogReaderShadowLocked drops a pin retired by an ordinary
-// append-log commit. Read-time repair also reaches siblings skipped by TryLock
-// during publication. Reset/unlink snapshots keep their original lifetime.
-// The caller holds fh.mu.
-func (fs *Dat9FS) refreshAppendLogReaderShadowLocked(fh *FileHandle) {
-	if fs.shadowStore == nil || fh.Dirty != nil || !fh.ShadowPinned || fh.Unlinked || fh.UnlinkedSnapshot {
-		return
-	}
-	retiredRevision := fs.shadowStore.appendLogRetiredRevision(fh.ShadowGen)
-	if retiredRevision == 0 {
-		return
-	}
-	gen := fh.ShadowGen
-	fh.ShadowPinned = false
-	fh.ShadowGen = 0
-	fs.shadowStore.Unpin(gen)
-	clearReadTargetForLockedHandle(fh)
-	if revision, size, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && revision >= retiredRevision {
-		fh.BaseRev = revision
-		fh.OrigSize = size
-		if fh.Prefetch != nil {
-			fh.Prefetch.invalidateWithSize(size)
-		}
-	}
-}
-
 // invalidateAppendLogReadTargets drops prefetched bytes independently of the
 // sibling handle lock, as resetMountView does. A busy reader must not retain
 // cached bytes just because the best-effort ReadTarget clear skips its lock.
