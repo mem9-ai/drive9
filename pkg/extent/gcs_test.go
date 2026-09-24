@@ -264,6 +264,73 @@ func TestGCSTokenSourceRefreshesInPlace(t *testing.T) {
 	}
 }
 
+// blockingCredentialSource blocks the first mint until released, for the
+// non-blocking-mint test.
+type blockingCredentialSource struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingCredentialSource) GetDataCredential(ctx context.Context) (*Credential, error) {
+	b.once.Do(func() { close(b.started) })
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return &Credential{AccessToken: "fresh", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339)}, nil
+}
+
+// TestGCSTokenSourceDoesNotBlockOnInFlightMint pins the head-of-line fix: while
+// one request mints, another must serve the current token instead of queueing
+// behind the mint.
+func TestGCSTokenSourceDoesNotBlockOnInFlightMint(t *testing.T) {
+	src := &blockingCredentialSource{started: make(chan struct{}), release: make(chan struct{})}
+	ts := newGCSTokenSource(Credential{AccessToken: "stale", ExpiresAt: time.Now().Add(-time.Minute).Format(time.RFC3339)}, src)
+	done := make(chan struct{})
+	go func() {
+		_, _ = ts.Token()
+		close(done)
+	}()
+	<-src.started // a mint is in flight
+
+	start := time.Now()
+	tok, err := ts.Token()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.AccessToken != "stale" {
+		t.Fatalf("token = %q, want the current stale token while minting", tok.AccessToken)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("second Token blocked %v behind the in-flight mint", elapsed)
+	}
+	close(src.release)
+	<-done
+}
+
+// TestGCSShutdownDuringReadDoesNotPanic pins the property the teardown comments
+// rely on: object operations resolved through the inner client are safe across
+// Client.Close (no panic, no race).
+func TestGCSShutdownDuringReadDoesNotPanic(t *testing.T) {
+	_, url := newGCSFake(t, http.StatusNotFound)
+	gs, err := newGCSTokenStorage(context.Background(), "bucket", newGCSTokenSource(Credential{AccessToken: "tok"}, nil), url+"/storage/v1/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			_, _ = gs.Head(context.Background(), "t/tenant-z/chunks/1")
+		}
+	}()
+	gs.Shutdown()
+	wg.Wait()
+}
+
 // TestGCSDeleteIsIdempotent mirrors JuiceFS's gs backend: deleting an object is
 // a success whether the object was there (200) or already gone (404).
 func TestGCSDeleteIsIdempotent(t *testing.T) {

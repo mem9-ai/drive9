@@ -52,10 +52,16 @@ type gcsTokenSource struct {
 	src  CredentialSource
 	lead time.Duration
 
-	mu   sync.Mutex
-	cred Credential
-	tok  *oauth2.Token
+	mu         sync.Mutex
+	cred       Credential
+	tok        *oauth2.Token
+	minting    bool
+	retryAfter time.Time
 }
+
+// credentialMintBackoff is how long a failed mint is not retried, so a stalled
+// credential source is not hammered by every object request.
+const credentialMintBackoff = 5 * time.Second
 
 func newGCSTokenSource(cred Credential, src CredentialSource) *gcsTokenSource {
 	return &gcsTokenSource{
@@ -72,19 +78,34 @@ func newGCSTokenSource(cred Credential, src CredentialSource) *gcsTokenSource {
 // object store, with the refresh metric distinguishing it from a data-plane bug.
 func (t *gcsTokenSource) Token() (*oauth2.Token, error) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	// No source or no expiry means a static credential: never refresh.
 	if t.src == nil || t.tok.Expiry.IsZero() {
-		return t.tok, nil
+		tok := t.tok
+		t.mu.Unlock()
+		return tok, nil
 	}
-	if time.Until(t.tok.Expiry) > t.lead {
-		return t.tok, nil
+	if time.Until(t.tok.Expiry) > t.lead || time.Now().Before(t.retryAfter) || t.minting {
+		// Fresh enough, in failure backoff, or a mint is already in flight:
+		// serve the current token rather than serializing every object request
+		// behind one mint.
+		tok := t.tok
+		t.mu.Unlock()
+		return tok, nil
 	}
+	t.minting = true
+	t.mu.Unlock()
+
+	// Mint off the lock: the HTTP call must not block unrelated requests.
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), CredentialMintTimeout)
-	defer cancel()
 	next, err := t.src.GetDataCredential(ctx)
+	cancel()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.minting = false
 	if err != nil {
+		t.retryAfter = time.Now().Add(credentialMintBackoff)
 		logger.Warn(context.Background(), "extent_credential_refresh_failed",
 			zap.String("prefix", t.cred.Prefix),
 			zap.String("step", "mint"),
@@ -114,7 +135,10 @@ func credentialExpiry(raw string) time.Time {
 	}
 	exp, err := time.Parse(time.RFC3339, raw)
 	if err != nil {
-		return time.Time{}
+		// Treat an unparseable expiry as "due now" rather than "never refresh",
+		// so a server emitting one cannot wedge the data plane forever.
+		logger.Warn(context.Background(), "extent_credential_expiry_unparseable", zap.String("expires_at", raw))
+		return time.Now()
 	}
 	return exp
 }
@@ -266,8 +290,8 @@ func (g *gcsTokenStorage) Head(ctx context.Context, key string) (object.Object, 
 }
 
 // Shutdown releases the client. object.Shutdown reaches it through the prefix
-// wrapper: CloseRuntime calls it at teardown, and the credential refresh closes
-// the client it supersedes.
+// wrapper; CloseRuntime calls it at teardown. The token source never supersedes
+// the client, so this is the only close.
 func (g *gcsTokenStorage) Shutdown() {
 	if g != nil && g.client != nil {
 		_ = g.client.Close()

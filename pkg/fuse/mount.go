@@ -946,9 +946,11 @@ func Mount(opts *MountOptions) (err error) {
 	waitServeClosed(serveDone, opts.MountPoint)
 	// Closing here is safe even though go-fuse does not join handler goroutines
 	// on every platform: closeExtentRuntime refuses new metadata RPCs and waits
-	// for the in-flight ones to drain, object I/O is protected by the store's
-	// refcount, and FlushAll stopped and joined the compaction loop. Handler
-	// goroutines therefore cannot use a closed session.
+	// for the in-flight ones to drain; an object operation that already resolved
+	// its client survives Client.Close (it errors rather than panicking, because
+	// the inner httpStorageClient fields are untouched); and FlushAll stopped and
+	// joined the compaction loop. Handler goroutines therefore cannot use a
+	// closed session.
 	dat9fs.closeExtentRuntime()
 
 	uptime := time.Since(mountStartedAt).Round(time.Second)

@@ -442,19 +442,23 @@ func TestExtentRuntimePointerRace(t *testing.T) {
 	fs := &Dat9FS{}
 	fs.extentRT.Store(&extentRuntime{rt: &extent.Runtime{Storage: rec}, hold: newExtentMetaHold()})
 
+	var stop atomic.Bool
 	started := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		close(started)
-		for i := 0; i < 2000; i++ {
+		for !stop.Load() {
 			_ = fs.extentVFS()
 		}
 	}()
-	<-started // overlap the reader with teardown, or the window is never hit
+	<-started
+	// Teardown runs while the reader is still looping, so the read/write window
+	// is actually exercised.
 	fs.stopExtentRuntimeLoop()
 	fs.closeExtentRuntime()
+	stop.Store(true)
 	wg.Wait()
 	if fs.extentRT.Load() != nil {
 		t.Fatal("extentRT still set after teardown")

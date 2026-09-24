@@ -80,8 +80,6 @@ func TestTransportTimeoutBoundsCall(t *testing.T) {
 	}
 }
 
-// TestTransportCallPassesOpToEnter pins the teardown gate's plumbing: Call must
-// hand Enter the op name so the hold can exempt the session-cleanup RPC.
 // TestNewTransportDefaultsMetaCallTimeout pins the default every transport
 // (mount, CLI/SDK, server-side compactor) now relies on; deleting it would
 // silently restore unbounded metadata RPCs.
@@ -95,6 +93,8 @@ func TestNewTransportDefaultsMetaCallTimeout(t *testing.T) {
 	}
 }
 
+// TestTransportCallPassesOpToEnter pins the teardown gate's plumbing: Call must
+// hand Enter the op name so the hold can exempt the session-cleanup RPC.
 func TestTransportCallPassesOpToEnter(t *testing.T) {
 	t.Parallel()
 	var got string

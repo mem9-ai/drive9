@@ -73,10 +73,10 @@ func (fs *Dat9FS) closeExtentRuntime() {
 	}
 	er.closeOnce.Do(func() {
 		// Refuse new metadata RPCs and wait for the in-flight ones before closing
-		// the session, so a late FUSE handler cannot use a closed one (the object
-		// store is refcounted separately). The session-cleanup RPC CloseRuntime
-		// issues next is exempt from the gate: refusing it would leave the JuiceFS
-		// session open.
+		// the session, so a late FUSE handler cannot use a closed one (object
+		// operations hold no session state and are safe across the store close).
+		// The session-cleanup RPC CloseRuntime issues next is exempt from the
+		// gate: refusing it would leave the JuiceFS session open.
 		if er.hold != nil {
 			if !er.hold.closeAndWait(extentMetaDrainTimeout) {
 				safeLogPrintf("extent metadata drain timed out after %s; closing the session anyway", extentMetaDrainTimeout)

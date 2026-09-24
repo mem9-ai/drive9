@@ -128,12 +128,11 @@ func OpenStorage(cred *Credential, src CredentialSource) (object.ObjectStorage, 
 		wrapperSrc = nil
 	}
 	return &refreshingStore{
-		src:      wrapperSrc,
-		inner:    inner,
-		cred:     *cred,
-		scheme:   canonicalExtentScheme(cred.Scheme),
-		prefix:   prefix,
-		tenantID: cred.TenantID,
+		src:    wrapperSrc,
+		inner:  inner,
+		cred:   *cred,
+		scheme: canonicalExtentScheme(cred.Scheme),
+		prefix: prefix,
 		// One jittered lead per mount: mounts of the same tenant then renew
 		// at spread-out instants instead of together.
 		refreshLead: credentialRefreshLead(credentialRefreshWindow, credentialRefreshJitter, rand.Int64N),
@@ -275,11 +274,10 @@ type refreshingStore struct {
 	inner  object.ObjectStorage
 	cred   Credential
 	scheme string
-	// prefix and tenantID come from the first credential and are stable across
-	// refreshes, so the read-only accessors can serve them without taking mu
-	// (scheme is likewise written once at construction).
-	prefix   string
-	tenantID string
+	// prefix comes from the first credential and is stable across refreshes, so
+	// the read-only accessors can serve it without taking mu (scheme is likewise
+	// written once at construction).
+	prefix string
 	// closed is set under mu by Shutdown; store() refuses to serve or refresh
 	// after teardown.
 	closed bool
@@ -395,8 +393,8 @@ func (s *refreshingStore) innerStoreLocked(ctx context.Context) (object.ObjectSt
 	}
 	s.inner = rs.inner
 	s.cred = rs.cred // refresh the expiry the next call checks
-	// scheme/prefix/tenantID are stable across refreshes and stay immutable, so
-	// the read-only accessors never race with this write.
+	// scheme/prefix are stable across refreshes and stay immutable, so the
+	// read-only accessors never race with this write.
 	// Only stateless S3/file stores reach here, so releasing the superseded one
 	// is a no-op; GCS renews its own client in place.
 	object.Shutdown(superseded)
