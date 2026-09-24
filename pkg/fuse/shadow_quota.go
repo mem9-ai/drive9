@@ -161,14 +161,7 @@ func (s *ShadowStore) recordWrite(remotePath string, sf *ShadowFile, offset int6
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	established := sf.size == 0 || sf.baseRev != 0 || sf.localNew || (offset == 0 && int64(n) >= sf.size)
-	if baseRev == 0 && (sf.size == 0 || (offset == 0 && int64(n) >= sf.size)) {
-		// Actual I/O into an empty image establishes new local staging,
-		// including sparse zeros. Partial writes over recovered nonempty
-		// contents must not bless the untouched bytes.
-		sf.baseRev = 0
-		sf.localNew = true
-	}
+	sf.establishProvenance(baseRev, sf.size == 0 || (offset == 0 && int64(n) >= sf.size))
 	added := sf.written.addedBytes(offset, int64(n))
 	sf.written.add(offset, int64(n))
 	sf.writtenBytes += added
@@ -176,9 +169,6 @@ func (s *ShadowStore) recordWrite(remotePath string, sf *ShadowFile, offset int6
 	newSize := max(sf.size, offset+int64(n))
 	s.pendingBytes.Add(newSize - sf.size)
 	sf.size = newSize
-	if baseRev != 0 && established {
-		sf.baseRev = baseRev
-	}
 	s.bumpWriteGenLocked(remotePath)
 }
 

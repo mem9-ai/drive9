@@ -700,7 +700,7 @@ func (cq *CommitQueue) RecoverPending() {
 			cq.index.Remove(path)
 			continue
 		}
-		cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
+		shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
 		if meta.Kind == PendingConflict {
 			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
 			continue
@@ -732,9 +732,9 @@ func (cq *CommitQueue) RecoverPending() {
 			PendingIndexGen:   meta.Generation,
 		}
 		if cq.shadows != nil {
-			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path)
+			entry.ShadowGen = shadowGen
 			if entry.ShadowGen == 0 {
-				safeLogPrintf("commit queue: skipping recovered pending entry for %s (shadow generation unavailable)", path)
+				safeLogPrintf("commit queue: skipping recovered pending entry for %s (shadow missing, short, or metadata replaced)", path)
 				if _, err := cq.index.MarkConflictIfGeneration(path, meta.Generation); err != nil {
 					safeLogPrintf("commit queue: mark recovered pending conflict failed for %s: %v", path, err)
 				}
@@ -2055,6 +2055,7 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 			cq.index.Remove(path)
 			continue
 		}
+		shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
 		if meta.Kind == PendingConflict {
 			continue
 		}
@@ -2081,7 +2082,7 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 			recovered:         true,
 		}
 		if cq.shadows != nil {
-			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path)
+			entry.ShadowGen = shadowGen
 			if entry.ShadowGen == 0 {
 				continue
 			}

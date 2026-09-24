@@ -141,8 +141,9 @@ metadata references the path. Generation fencing pins the source through remote
 acknowledgement. Only Flush/Release request this optimization from the shared
 uploader. Explicit fsync and link-source synchronization retain the local
 barrier, including their append-log fallbacks into the generic uploader.
-Foreground close-sync Flush/Release fallbacks remain eligible for remote-only
-durability under the same generation and pending-metadata guards.
+The primary foreground close-sync Flush/Release path requests remote-only
+eligibility. The inline ShadowSpill error/recovery fallbacks retain local fsync;
+those conservative routes do not request this optimization.
 Failed uploads retain dirty state for an in-process retry; unacknowledged shadow
 bytes are not guaranteed to survive a machine crash. Explicit strict `fsync(2)`
 shadow uploads deliberately retain local sync, as do writeback, recovery, staged
@@ -180,7 +181,16 @@ The binding includes the ShadowStore instance and is never persisted. Unbound
 metadata falls back to ordinary revision validation; WriteBackCache metadata
 owns only its `.dat` payload and never authorizes `.shadow`. Recovery explicitly
 binds the selected payload after journal replay and legacy `.dat` migration,
-before requests are served. Recovery uploads retain the metadata's CAS base.
+before requests are served. Both asynchronous and synchronous recovery refuse
+a shadow shorter than the selected metadata, including when journal setup
+failed and only `.meta` survived. Recovery uploads retain the metadata's CAS base.
+
+Legacy migration only fills a missing shadow: a best-effort `.dat` snapshot can
+be older than acknowledged shadow staging. Full WAL metadata with a newer
+publication timestamp supersedes older disk metadata left by a failed snapshot;
+older WAL metadata and legacy fsync frames do not displace newer disk metadata.
+Recovered publication generations advance the counter before new writes start.
+Migration errors close the initialized journal, syncer and shadow descriptors.
 
 `Read` checks its shadow pin once at the shadow-read branch using resident state
 only: no path lock, disk lookup or unlink on a cache miss. `Open` applies the
@@ -188,7 +198,9 @@ same eligibility rules and separately discards unclaimed disk-only orphans.
 A newly published resident source remains discoverable even if its revision has
 not changed. Raw path reads cannot bypass the checked pin. Creating a new file
 detaches the old path incarnation so stale inode revisions cannot hide local
-staging; old open handles and surviving hardlink aliases retain their inode.
+staging; old open handles, pending mutations and surviving hardlink aliases
+retain their inode as needed. Later cleanup removes only path mappings owned by that inode,
+so forgetting an old incarnation cannot remove a replacement's mapping.
 
 
 The next lifecycle refactor is tracked in

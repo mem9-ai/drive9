@@ -308,6 +308,12 @@ func (idx *PendingIndex) publishRecoveredMeta(metaBytes []byte) error {
 	}
 	idx.mu.Lock()
 	idx.items[meta.Path] = &meta
+	// Future publication must not reuse a generation restored from the WAL.
+	for previous := idx.nextGen.Load(); previous < meta.Generation; previous = idx.nextGen.Load() {
+		if idx.nextGen.CompareAndSwap(previous, meta.Generation) {
+			break
+		}
+	}
 	idx.mu.Unlock()
 	return nil
 }
