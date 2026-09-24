@@ -1,6 +1,8 @@
 package fuse
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -159,6 +161,76 @@ func TestCloseExtentRuntimeAttemptsSessionCleanup(t *testing.T) {
 	}
 	if hold.enter(jfsmeta.Drive9OpLookup) {
 		t.Fatal("a late non-cleanup RPC must be refused after closeExtentRuntime")
+	}
+}
+
+// TestExtentTeardownOpsCoverRealCloseSession drives a real jfsmeta.Meta's
+// CloseSession through a closed gate and records every op the gate is asked
+// about, so a JuiceFS bump that adds a third teardown RPC fails here instead of
+// silently leaking at unmount. The op set comes from the vendored code path,
+// not from the allowlist, so this is not circular.
+//
+// delete_slice is not exercised: firing it needs a non-empty dead-slice queue
+// (a full write + Compact path), and CloseSession's queue is empty here. It is
+// admitted because extentTeardownOp covers it, and the vendored trace below is
+// what a dependency bump must re-check.
+//
+// Mirrors juicefs pkg/meta/base.go CloseSession: FlushSession is inert for the
+// drive9 engine (doFlushStats/doUpdateDirStat/doFlushQuotas are no-ops);
+// doCleanStaleSession sends clean_stale_session; stopDeleteSliceTasks drains the
+// delete-slice workers, whose deleteSlice_ -> doDeleteSlice sends delete_slice.
+func TestExtentTeardownOpsCoverRealCloseSession(t *testing.T) {
+	var mu sync.Mutex
+	var ops []string
+	record := func(op string) {
+		mu.Lock()
+		ops = append(ops, op)
+		mu.Unlock()
+	}
+	tr := extent.NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
+		return []byte("{}"), 0, nil
+	})
+	hold := newExtentMetaHold()
+	tr.Enter = func(op string) bool {
+		record(op)
+		return hold.enter(op)
+	}
+	tr.Leave = hold.leave
+
+	// ReadOnly skips FlushSession (inert for drive9 anyway) while
+	// doCleanStaleSession still runs for sid > 0.
+	conf := jfsmeta.DefaultConf()
+	conf.NoBGJob = true
+	conf.ReadOnly = true
+	conf.Sid = 42
+	m := jfsmeta.NewDrive9Meta(conf, tr)
+
+	hold.closeAndWait(0) // closed gate: only teardown-owned ops may pass
+	mu.Lock()
+	ops = nil
+	mu.Unlock()
+	if err := m.CloseSession(); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ops) == 0 {
+		t.Fatal("CloseSession issued no metadata RPC")
+	}
+	for _, op := range ops {
+		if !extentTeardownOp(op) {
+			t.Fatalf("CloseSession issued %q; the closed gate refuses it and teardown would leak", op)
+		}
+	}
+	found := false
+	for _, op := range ops {
+		if op == jfsmeta.Drive9OpCleanStaleSession {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected clean_stale_session among %v", ops)
 	}
 }
 

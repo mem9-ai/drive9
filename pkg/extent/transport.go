@@ -34,11 +34,13 @@ type Transport struct {
 	Leave func()
 }
 
-// MetaCallTimeout is the default bound for each non-blocking meta RPC: the
-// mount's credential mint, runtime Init/Load/NewSession, and the compaction
-// loop's ClaimNextCompact. It sits next to CredentialMintTimeout so both
-// network steps of the mount share one budget. Blocking Flock/Setlk are exempt
-// inside Call.
+// MetaCallTimeout bounds every non-blocking metadata RPC the extent runtime's
+// transport serves, for its whole life: Init/Load/NewSession and the compaction
+// loop's ClaimNextCompact, plus the steady-state FUSE read/write/getattr/
+// setattr/lookup/unlink/rename calls that share this transport. A stalled
+// endpoint therefore surfaces as ETIMEDOUT to the caller instead of hanging the
+// request; blocking Flock/Setlk are exempt inside Call. The credential mint is
+// a separate client call bounded by CredentialMintTimeout.
 const MetaCallTimeout = 30 * time.Second
 
 func NewTransport(fn MetaOpFunc) *Transport {

@@ -62,6 +62,10 @@ func (fs *Dat9FS) stopExtentRuntimeLoop() {
 // runtime as healthy.
 func (fs *Dat9FS) closeExtentRuntime() {
 	fs.extentMu.Lock()
+	// Mark torn down here too: a standalone caller must not clear the pointer
+	// and leave the fs free to build a replacement that nothing would close.
+	// It is idempotent with stopExtentRuntimeLoop.
+	fs.extentTornDown = true
 	er := fs.extentRT.Load()
 	fs.extentRT.Store(nil)
 	fs.extentMu.Unlock()
@@ -134,7 +138,7 @@ func (h *extentMetaHold) leave() {
 	}
 }
 
-// closeAndWait refuses new metadata RPCs (except the session-cleanup RPC) and
+// closeAndWait refuses new metadata RPCs (except the teardown-owned ones) and
 // returns once the in-flight ones finish, or false after timeout. Teardown
 // proceeds either way: the process is exiting.
 func (h *extentMetaHold) closeAndWait(timeout time.Duration) bool {

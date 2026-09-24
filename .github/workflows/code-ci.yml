@@ -9,8 +9,7 @@ jobs:
   code-ci:
     name: Code CI
     runs-on: ubuntu-latest
-    # lint + a 25m test budget + the scoped race target (15m) + failpoint + builds
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,9 +53,6 @@ jobs:
       - name: Test
         run: make test TEST_TIMEOUT=25m
 
-      - name: Test (race)
-        run: make test-race TEST_TIMEOUT=15m
-
       - name: Cleanup test containers
         if: always()
         run: docker rm -f $(docker ps -aq --filter "ancestor=pingcap/tidb") 2>/dev/null || true
@@ -75,3 +71,22 @@ jobs:
       # Windows files upstream, nosqlite's mattn/go-sqlite3 needs CGO).
       - name: Build Windows CLI
         run: make build-cli GOOS=windows GOARCH=amd64 CLI_BIN=/tmp/drive9-windows-amd64.exe
+
+  # Its own job so a slow race leg (two `go test -timeout 15m` invocations)
+  # cannot cancel the main lint/test/failpoint/build steps.
+  extent-race:
+    name: Extent race
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test extent lifecycle (race)
+        run: make test-race TEST_TIMEOUT=15m

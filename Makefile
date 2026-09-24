@@ -103,8 +103,8 @@ test:
 # tests because pkg/fuse has pre-existing unrelated races elsewhere
 # (kernel_cache_bypass) that are not this change's concern.
 test-race:
-	$(GO) test -race -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/extent/...
-	$(GO) test -race -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/fuse/ -run 'TestExtent|TestEnsureExtent|TestCloseExtentRuntime'
+	$(GO) test -race -count=1 -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/extent/...
+	$(GO) test -race -count=1 -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/fuse/ -run 'TestExtent|TestEnsureExtent|TestCloseExtentRuntime'
 
 # Run only failpoint-tagged tests through repository-wide instrumentation.
 # Do not run this concurrently with the normal test target because failpoint-ctl

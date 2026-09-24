@@ -419,15 +419,17 @@ func (s *refreshingStore) innerStoreLocked(ctx context.Context) (object.ObjectSt
 		return nil, err
 	}
 	superseded := s.inner
-	if rs, ok := inner.(*refreshingStore); ok {
-		s.inner = rs.inner
-		s.cred = rs.cred
-		s.scheme = rs.scheme
-	} else {
-		s.inner = inner
-		s.cred = *next
-		s.scheme = canonicalExtentScheme(next.Scheme)
+	// OpenStorage always wraps its result in a *refreshingStore; adopt that
+	// store's internals rather than re-deriving the scheme from the credential
+	// here (a second source of truth for the scheme).
+	rs, ok := inner.(*refreshingStore)
+	if !ok {
+		object.Shutdown(inner)
+		return nil, fmt.Errorf("extent storage refresh: %T is not a refreshingStore", inner)
 	}
+	s.inner = rs.inner
+	s.cred = rs.cred
+	s.scheme = rs.scheme
 	// A GCS store owns a storage client; replacing it without releasing the old
 	// one would leak a client per renewal. S3/file stores are not Shutdownable,
 	// so this is a no-op for them. Retire rather than close in place, so an
