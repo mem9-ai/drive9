@@ -1225,7 +1225,7 @@ func TestLayerSetAttrTruncateDoesNotGiveDelayedCleanHandleAnEmptyGeneration(t *t
 		LayerRef:      "layer-1",
 		RemoteRoot:    "/repo",
 		SyncMode:      SyncStrict,
-		WritePolicy:   WritePolicyCloseSync,
+		WritePolicy:   WritePolicyWriteSync,
 		FlushDebounce: 0,
 	}
 	opts.setDefaults()
@@ -1286,20 +1286,6 @@ func TestLayerSetAttrTruncateDoesNotGiveDelayedCleanHandleAnEmptyGeneration(t *t
 	}
 	mu.Unlock()
 
-	// A delayed Release of the older clean handle is lifecycle-only. Without
-	// the clean-layer rebase above it sends a second empty upsert here.
-	fs.Release(nil, &gofuse.ReleaseIn{
-		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: oldPID}},
-		Fh:       old.Fh,
-	})
-	mu.Lock()
-	if len(requests) != 1 {
-		got := append([]clientLayerEntryRequest(nil), requests...)
-		mu.Unlock()
-		t.Fatalf("delayed clean Release appended a layer entry: %+v", got)
-	}
-	mu.Unlock()
-
 	if n, st := fs.Write(nil, &gofuse.WriteIn{
 		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: writerPID}},
 		Fh:       writer.Fh,
@@ -1319,6 +1305,14 @@ func TestLayerSetAttrTruncateDoesNotGiveDelayedCleanHandleAnEmptyGeneration(t *t
 		Fh:       writer.Fh,
 	})
 
+	// Deliver the older handle's Release only after the current writer has
+	// committed its content. This is the real kernel ordering which previously
+	// let a hidden empty generation become the final layer entry.
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: oldPID}},
+		Fh:       old.Fh,
+	})
+
 	mu.Lock()
 	got := append([]clientLayerEntryRequest(nil), requests...)
 	mu.Unlock()
@@ -1327,6 +1321,104 @@ func TestLayerSetAttrTruncateDoesNotGiveDelayedCleanHandleAnEmptyGeneration(t *t
 	}
 	if !bytes.Equal(got[1].Content, updated) || got[1].SizeBytes != int64(len(updated)) {
 		t.Fatalf("final layer entry = %+v, want content %q", got[1], updated)
+	}
+}
+
+func TestLayerLatePendingDrainDoesNotReplayRetainedOverlay(t *testing.T) {
+	const localPath = "/base.txt"
+	data := []byte("edited in layer")
+
+	var (
+		mu       sync.Mutex
+		requests []clientLayerEntryRequest
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var req clientLayerEntryRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode layer entry: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, req)
+		seq := len(requests)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+			LayerID:      "layer-1",
+			Path:         req.Path,
+			Op:           req.Op,
+			Kind:         req.Kind,
+			BaseRevision: req.BaseRevision,
+			Content:      req.Content,
+			SizeBytes:    req.SizeBytes,
+			EntrySeq:     int64(seq),
+		})
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(localPath, data, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(localPath, int64(len(data)), PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	cq := NewCommitQueue(fs.client, shadow, pending, nil, 1, 8, opts.RemoteRoot)
+	cq.SetLayerRef(opts.LayerRef)
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = cq
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
+		Path:    localPath,
+		BaseRev: 7,
+		Size:    int64(len(data)),
+		Kind:    PendingOverwrite,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if !pending.HasPending(localPath) || !shadow.Has(localPath) {
+		t.Fatal("successful layer upload must retain its pending metadata and shadow")
+	}
+	mu.Lock()
+	before := append([]clientLayerEntryRequest(nil), requests...)
+	mu.Unlock()
+	if len(before) != 1 || !bytes.Equal(before[0].Content, data) {
+		t.Fatalf("initial layer requests = %+v, want one content upsert", before)
+	}
+
+	// A graceful unmount's late-pending rescue is only for unfinished base
+	// writeback. The retained layer overlay above is already committed; replaying
+	// it can append a stale shadow after a newer layer entry and make stale data
+	// authoritative. Bound the call so deleting the layer guard fails quickly.
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	fs.drainLatePendingEntries(ctx)
+
+	mu.Lock()
+	after := append([]clientLayerEntryRequest(nil), requests...)
+	mu.Unlock()
+	if len(after) != 1 {
+		t.Fatalf("late pending drain replayed committed layer overlay: %+v", after)
 	}
 }
 
