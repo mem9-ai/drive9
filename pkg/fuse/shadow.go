@@ -644,8 +644,6 @@ func (s *ShadowStore) installLayerRestoreTempIfGeneration(remotePath, tmpPath st
 		_ = newFd.Close()
 		return rollback(err)
 	}
-	publishMeta()
-
 	oldFd := (*os.File)(nil)
 	if sf == nil {
 		sf = &ShadowFile{}
@@ -660,7 +658,8 @@ func (s *ShadowStore) installLayerRestoreTempIfGeneration(remotePath, tmpPath st
 	sf.written.add(0, size)
 	sf.writtenBytes = size
 	sf.baseRev = baseRev
-	s.bumpWriteGenLocked(remotePath)
+	shadowGeneration := s.bumpWriteGenLocked(remotePath)
+	publishMeta(s, shadowGeneration)
 	s.mu.Unlock()
 	if oldFd != nil {
 		_ = oldFd.Close()
@@ -1772,7 +1771,11 @@ func (s *ShadowStore) renameIfGenerations(oldPath, newPath string, expectedOldGe
 			s.mu.Unlock()
 			return false, true, result
 		}
-		publishMeta()
+		shadowGeneration := s.writeGen[oldPath]
+		if shadowGeneration == 0 {
+			shadowGeneration = s.bumpWriteGenLocked(oldPath)
+		}
+		publishMeta(s, shadowGeneration)
 		s.mu.Unlock()
 		return true, true, nil
 	}
@@ -1798,8 +1801,6 @@ func (s *ShadowStore) renameIfGenerations(oldPath, newPath string, expectedOldGe
 	if err := tx.commit(); err != nil {
 		return rollback(err)
 	}
-	publishMeta()
-
 	replacedSF := s.files[newPath]
 	replacedGen := s.active[newPath]
 	var replacedSize int64
@@ -1836,6 +1837,7 @@ func (s *ShadowStore) renameIfGenerations(oldPath, newPath string, expectedOldGe
 	} else if replacedSF != nil && replacedSF != sf {
 		_ = replacedSF.fd.Close()
 	}
+	publishMeta(s, s.writeGen[newPath])
 	s.mu.Unlock()
 	if replacedSize > 0 {
 		s.pendingBytes.Add(-replacedSize)

@@ -47,7 +47,7 @@ type PendingIndex struct {
 	shadows                *ShadowStore // wired once before staging/recovery
 }
 
-type layerRestoreMetaPublish func()
+type layerRestoreMetaPublish func(shadows *ShadowStore, shadowGeneration uint64)
 type layerRestoreMetaPrepare func(size int64) (layerRestoreMetaPublish, error)
 
 // SetJournal wires the WAL used for durable pending-meta publication. It is
@@ -317,7 +317,8 @@ func (idx *PendingIndex) restoreLayerCommittedIfGeneration(
 		if err := idx.writeLayerRestoreMeta(filepath.Join(idx.dir, hashPath(remotePath)+".meta"), metaBytes); err != nil {
 			return nil, fmt.Errorf("pending index restore committed layer: %w", err)
 		}
-		return func() {
+		return func(shadows *ShadowStore, shadowGeneration uint64) {
+			meta.shadowSource = shadowReadSource{store: shadows, generation: shadowGeneration}
 			idx.mu.Lock()
 			idx.items[remotePath] = meta
 			idx.mu.Unlock()
@@ -451,7 +452,8 @@ func (idx *PendingIndex) restoreLayerrenameIfGenerations(
 				return nil, fmt.Errorf("pending index sync restored layer rename: %w", err)
 			}
 		}
-		return func() {
+		return func(shadows *ShadowStore, shadowGeneration uint64) {
+			newMeta.shadowSource = shadowReadSource{store: shadows, generation: shadowGeneration}
 			idx.mu.Lock()
 			if oldPath != newPath {
 				delete(idx.items, oldPath)

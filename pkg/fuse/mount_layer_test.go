@@ -95,6 +95,7 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pending.setShadowStore(shadow)
 	journal, err := NewJournal(filepath.Join(t.TempDir(), "restore.wal"))
 	if err != nil {
 		t.Fatal(err)
@@ -127,6 +128,18 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	if meta, ok := pending.GetMeta("/a.txt"); !ok || meta.Kind != PendingOverwrite || !meta.LayerCommitted {
 		t.Fatalf("a.txt pending meta = %+v, want committed PendingOverwrite", meta)
 	}
+	pendingShadowGen := pending.shadowReadGeneration("/a.txt", shadow)
+	if pendingShadowGen == 0 {
+		t.Fatal("restored a.txt pending metadata is not bound to its resident shadow")
+	}
+	reader := &FileHandle{Path: "/a.txt"}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.openReadOnlyShadowLocked(reader)
+	if !reader.ShadowPinned || !shadow.canReadGeneration(reader.ShadowGen, 0, pendingShadowGen) {
+		t.Fatalf("restored a.txt is not readable from shadow: pinned=%t gen=%d pending_gen=%d", reader.ShadowPinned, reader.ShadowGen, pendingShadowGen)
+	}
+	shadow.Unpin(reader.ShadowGen)
 	if meta, ok := pending.GetMeta("/a.txt"); !ok || !meta.HasMode || meta.Mode != 0o600 {
 		t.Fatalf("a.txt pending mode = %+v, want 0600", meta)
 	}
@@ -158,6 +171,16 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	if meta, ok := pending.GetMeta("/renamed-to.txt"); !ok || meta.Kind != PendingOverwrite || !meta.LayerCommitted {
 		t.Fatalf("renamed target pending meta = %+v, want committed PendingOverwrite", meta)
 	}
+	renamedPendingShadowGen := pending.shadowReadGeneration("/renamed-to.txt", shadow)
+	if renamedPendingShadowGen == 0 {
+		t.Fatal("restored renamed target pending metadata is not bound to its resident shadow")
+	}
+	renamedReader := &FileHandle{Path: "/renamed-to.txt"}
+	fs.openReadOnlyShadowLocked(renamedReader)
+	if !renamedReader.ShadowPinned || !shadow.canReadGeneration(renamedReader.ShadowGen, 0, renamedPendingShadowGen) {
+		t.Fatalf("restored renamed target is not readable from shadow: pinned=%t gen=%d pending_gen=%d", renamedReader.ShadowPinned, renamedReader.ShadowGen, renamedPendingShadowGen)
+	}
+	shadow.Unpin(renamedReader.ShadowGen)
 	if pending.HasPending("/b.txt") || shadow.Has("/b.txt") {
 		t.Fatal("b.txt should not be restored past checkpoint seq")
 	}
