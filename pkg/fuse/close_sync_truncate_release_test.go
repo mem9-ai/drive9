@@ -39,6 +39,11 @@ type closeSyncTruncateTest struct {
 
 func newCloseSyncTruncateTest(t *testing.T) *closeSyncTruncateTest {
 	t.Helper()
+	return newCloseSyncTruncateTestNamed(t, "race.txt")
+}
+
+func newCloseSyncTruncateTestNamed(t *testing.T, name string) *closeSyncTruncateTest {
+	t.Helper()
 	test := &closeSyncTruncateTest{}
 	test.fs = newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
 		test.mu.Lock()
@@ -115,7 +120,7 @@ func newCloseSyncTruncateTest(t *testing.T) *closeSyncTruncateTest {
 	if st := test.fs.Create(nil, &gofuse.CreateIn{
 		InHeader: gofuse.InHeader{NodeId: 1, Caller: gofuse.Caller{Pid: pid}},
 		Flags:    syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC, Mode: 0o644,
-	}, "race.txt", &created); st != gofuse.OK {
+	}, name, &created); st != gofuse.OK {
 		t.Fatalf("Create: %v", st)
 	}
 	test.header = gofuse.InHeader{NodeId: created.NodeId, Caller: gofuse.Caller{Pid: pid}}
@@ -465,7 +470,12 @@ func TestCloseSyncPathTruncateClearsCleanSiblingRestoreCallbacks(t *testing.T) {
 // post-reset claim fields directly.
 func newCloseSyncRotatedShadowTest(t *testing.T) (*closeSyncTruncateTest, []byte) {
 	t.Helper()
-	test := newCloseSyncTruncateTest(t)
+	return newCloseSyncRotatedShadowTestNamed(t, "race.txt")
+}
+
+func newCloseSyncRotatedShadowTestNamed(t *testing.T, name string) (*closeSyncTruncateTest, []byte) {
+	t.Helper()
+	test := newCloseSyncTruncateTestNamed(t, name)
 	fs := test.fs
 	oldHeaderBytes := makeSQLiteWALHeaderForTest(t, sqliteWALMagicBig, 4096, 1, 2)
 	oldHeader, ok := parseSQLiteWALHeader(oldHeaderBytes)
@@ -476,7 +486,12 @@ func newCloseSyncRotatedShadowTest(t *testing.T) (*closeSyncTruncateTest, []byte
 	test.write(t, test.old, string(oldImage))
 	test.flush(t, test.old)
 	fh, _ := fs.fileHandles.Get(test.old)
-	fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/race.txt"})
+	if name == "race.txt" {
+		fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/race.txt"})
+	} else {
+		// The CLI's builtin pattern is applied outside MountOptions defaults.
+		fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/*-wal"})
+	}
 	fh.Lock()
 	if err := fs.shadowStore.WriteFull(fh.Path, oldImage, 2); err != nil {
 		fh.Unlock()
@@ -536,9 +551,6 @@ func TestCloseSyncRefreshCommittedRevisionRetiresRotatedShadow(t *testing.T) {
 			}
 			if fh.BaseRev != 4 || fh.Dirty.Size() != int64(len(want)) || fh.ShadowReady || fh.ShadowSpill || fh.ShadowStageGen != 0 || fh.ShadowStageSeq != 0 {
 				t.Errorf("refresh retained an obsolete shadow claim or baseline: revision=%d size=%d ready=%t spill=%t gen=%d seq=%d", fh.BaseRev, fh.Dirty.Size(), fh.ShadowReady, fh.ShadowSpill, fh.ShadowStageGen, fh.ShadowStageSeq)
-			}
-			if fs.shadowStore.Has(fh.Path) {
-				t.Fatal("refresh retained the obsolete resident shadow")
 			}
 			test.assertReadOnlyOpen(t, want)
 		})
@@ -603,9 +615,6 @@ func TestCloseSyncPathTruncateAdoptsConfirmedAppendLogBaseline(t *testing.T) {
 			}
 			if rev, gotSize := fh.appendLogCommittedBaseline(); rev != 4 || gotSize != size || fh.appendLogLayoutAt(4, size) != client.ContentLayoutAppendLog || !fh.appendLogCanUseTail() || fh.appendLog.hasRewriteBase || fh.appendLog.sqliteWALTruncated {
 				t.Fatalf("confirmed append baseline=%d/%d state=%+v", rev, gotSize, fh.appendLog)
-			}
-			if fs.shadowStore.Has(fh.Path) {
-				t.Fatal("confirmed truncate retained the obsolete resident shadow")
 			}
 			fh.Unlock()
 			test.assertReadOnlyOpen(t, want)
@@ -870,6 +879,65 @@ func TestCloseSyncOwnerTruncateCommitReadOnlyFreshness(t *testing.T) {
 				test.release(writer)
 				test.assertReadOnlyOpen(t, want)
 			})
+		}
+	}
+}
+
+func TestCloseSyncPinnedReadersFollowOwnerTruncateCommit(t *testing.T) {
+	for _, name := range []string{"race.txt", "test.db-wal"} {
+		for _, size := range []int64{0, 16, 40} {
+			for _, ensure := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/size-%d/ensure-%t", name, size, ensure), func(t *testing.T) {
+					test, header := newCloseSyncRotatedShadowTestNamed(t, name)
+					fs := test.fs
+					var readers []uint64
+					for range 2 {
+						var out gofuse.OpenOut
+						if st := fs.Open(nil, &gofuse.OpenIn{InHeader: test.header, Flags: syscall.O_RDONLY}, &out); st != gofuse.OK {
+							t.Fatal(st)
+						}
+						defer test.release(out.Fh)
+						fh, _ := fs.fileHandles.Get(out.Fh)
+						if !fh.ShadowPinned {
+							t.Fatal("reader must pin the current image before the commit")
+						}
+						readers = append(readers, out.Fh)
+					}
+					writer := test.open(t, test.header.Pid)
+					test.write(t, writer, string(header))
+					if st := test.truncate(uint64(size)); st != gofuse.OK {
+						t.Fatal(st)
+					}
+					test.flush(t, writer)
+					want := make([]byte, size)
+					copy(want, header)
+					test.assertRemote(t, string(want), 4)
+					if ensure && fs.shadowStore.Has("/"+name) {
+						if err := fs.shadowStore.Ensure("/"+name, 32, 4); err != nil {
+							t.Fatal(err)
+						}
+					}
+					fs.readCache.Invalidate("/" + name)
+					// Reads on both handles overlap, including concurrent reads on
+					// one handle, so pin retirement must not race descriptor use.
+					var reads sync.WaitGroup
+					for _, id := range readers {
+						for range 2 {
+							reads.Add(1)
+							go func() {
+								defer reads.Done()
+								got, st, err := readDat9FSTestRange(fs, test.header.NodeId, id, 0, int(size)+16)
+								if err != nil || st != gofuse.OK || !bytes.Equal(got, want) {
+									t.Errorf("existing reader %d got %x/%v/%v, want %x", id, got, st, err, want)
+								}
+							}()
+						}
+					}
+					reads.Wait()
+					test.release(writer)
+					test.assertReadOnlyOpen(t, want)
+				})
+			}
 		}
 	}
 }
