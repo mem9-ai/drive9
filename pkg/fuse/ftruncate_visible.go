@@ -53,12 +53,14 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRangeOnce(reader *FileHandle, entry
 	var newest *FileHandle
 	var newestSeq uint64
 	marked := readerMarked && readerSeq != 0
+	busy := false
 	for _, src := range fs.openHandles.SnapshotInode(reader.Ino) {
 		if src == nil || src == reader {
 			continue
 		}
 		if !src.TryLock() {
-			return nil, 0, false, gofuse.OK, true
+			busy = true
+			continue
 		}
 		_, linked := entry.Paths[src.Path]
 		valid := linked && src.Ino == reader.Ino && src.Dirty != nil && src.DirtySeq != 0 &&
@@ -72,7 +74,12 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRangeOnce(reader *FileHandle, entry
 		src.Unlock()
 	}
 	if !marked {
-		return nil, 0, false, gofuse.OK, false
+		return nil, 0, false, gofuse.OK, busy
+	}
+	// A busy sibling may hide the latest writer. A locked candidate with the
+	// inode's latest sequence is already newer than every busy sibling.
+	if busy && newestSeq != latestSeq {
+		return nil, 0, false, gofuse.OK, true
 	}
 	if readerSeq > newestSeq {
 		if readerMarked && readerSeq == latestSeq {
