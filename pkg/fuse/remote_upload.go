@@ -18,6 +18,10 @@ func uploadBufferedRemoteFile(ctx context.Context, c *client.Client, remotePath 
 }
 
 func uploadBufferedRemoteFileWithRevision(ctx context.Context, c *client.Client, remotePath string, data []byte, expectedRevision int64) (int64, error) {
+	threshold := c.CachedSmallFileThreshold()
+	if len(data) == 0 || (threshold > 0 && int64(len(data)) < threshold) {
+		return c.WriteCtxConditionalWithRevision(ctx, remotePath, data, expectedRevision)
+	}
 	if err := c.WriteStreamConditional(ctx, remotePath, bytes.NewReader(data), int64(len(data)), nil, expectedRevision); err != nil {
 		return 0, err
 	}

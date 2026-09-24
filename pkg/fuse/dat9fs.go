@@ -4054,6 +4054,15 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 	fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
 	if statErr != nil {
 		safeLogPrintf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, ino, statErr)
+		if committedRevision <= 0 {
+			// Multipart completion currently does not return the committed
+			// revision. Without a successful Stat, returning success would leave
+			// open handles on the pre-truncate CAS base; a delayed Release could
+			// then publish an unintended generation. Fail explicitly instead of
+			// reporting a successful truncate with stale local revision state.
+			fs.invalidateReadCacheAndTargets(entry.Path)
+			return gofuse.EIO
+		}
 	} else if stat != nil {
 		if stat.Revision > 0 {
 			committedRevision = stat.Revision

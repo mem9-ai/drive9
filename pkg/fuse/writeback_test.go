@@ -1592,15 +1592,22 @@ func TestCloseSyncPathTruncateDoesNotAdoptCleanUnreleasedHandle(t *testing.T) {
 	const pid = 4242
 
 	var (
-		mu      sync.Mutex
-		content       = []byte("seed\n")
-		rev     int64 = 1
+		mu           sync.Mutex
+		content            = []byte("seed\n")
+		rev          int64 = 1
+		putCalls     int
+		failNextHead bool
 	)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 		switch r.Method {
 		case http.MethodHead:
+			if failNextHead {
+				failNextHead = false
+				http.Error(w, "injected post-truncate stat failure", http.StatusServiceUnavailable)
+				return
+			}
 			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
 			w.Header().Set("X-Dat9-IsDir", "false")
 			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
@@ -1621,7 +1628,14 @@ func TestCloseSyncPathTruncateDoesNotAdoptCleanUnreleasedHandle(t *testing.T) {
 			}
 			body, _ := io.ReadAll(r.Body)
 			rev++
+			putCalls++
 			content = append(content[:0], body...)
+			if putCalls == 2 {
+				// The second PUT is SetAttr's zero truncate. Its response carries
+				// the authoritative revision; the follow-up HEAD may fail without
+				// leaving clean, unreleased handles on the old CAS base.
+				failNextHead = true
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": rev})
 		default:
