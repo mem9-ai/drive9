@@ -961,7 +961,7 @@ start_mount() {
   if [ "$mode" = "ro" ]; then
     args+=(--read-only)
   fi
-  if [ -n "$FUSE_PROFILE" ]; then
+  if [ -n "${FUSE_PROFILE:-}" ]; then
     args+=(--profile "$FUSE_PROFILE")
   fi
   args+=("$MOUNT_POINT")
