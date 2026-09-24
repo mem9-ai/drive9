@@ -3307,6 +3307,32 @@ func (fs *Dat9FS) lockRemoteCommitPath(path string) func() {
 	return lock.Unlock
 }
 
+// lockRemoteCommitPaths takes the same per-path locks used by writers in a
+// stable order. It is cooperative rather than an ownership proof (writers may
+// time out and proceed); replay must still use pending/shadow generation CAS
+// before publishing local state.
+func (fs *Dat9FS) lockRemoteCommitPaths(paths ...string) func() {
+	if fs == nil {
+		return func() {}
+	}
+	ordered := append([]string(nil), paths...)
+	sort.Strings(ordered)
+	unlocks := make([]func(), 0, len(ordered))
+	last := ""
+	for _, p := range ordered {
+		if p == "" || p == last {
+			continue
+		}
+		last = p
+		unlocks = append(unlocks, fs.lockRemoteCommitPath(p))
+	}
+	return func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}
+}
+
 // lockRemoteCommitPathTimeout is like lockRemoteCommitPath but bounded by a
 // deadline. If the deadline expires, it returns (nil, false) and the caller
 // must proceed without the lock. This prevents close_range Flush from

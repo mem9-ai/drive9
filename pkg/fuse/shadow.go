@@ -509,6 +509,65 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 	return nil
 }
 
+// writeFullIfGeneration replaces the shadow only when its content generation
+// still matches the caller's pre-fetch snapshot. This is the final ownership
+// gate for layer replay: a writer may deliberately proceed after timing out on
+// the remote-commit lock, but every writer still changes the shadow generation.
+func (s *ShadowStore) writeFullIfGeneration(remotePath string, data []byte, baseRev int64, expectedGen uint64, commitMeta func(size int64) error) (bool, error) {
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	s.mu.RLock()
+	currentGen := s.writeGen[remotePath]
+	s.mu.RUnlock()
+	if currentGen != expectedGen {
+		return false, nil
+	}
+
+	sf, err := s.ensureShadowFile(remotePath, baseRev)
+	if err != nil {
+		return false, err
+	}
+	newSize := int64(len(data))
+	s.mu.RLock()
+	oldWritten := sf.writtenBytes
+	s.mu.RUnlock()
+	if err := s.checkQuotaForDelta(newSize - oldWritten); err != nil {
+		return false, err
+	}
+	if err := sf.fd.Truncate(0); err != nil {
+		return false, fmt.Errorf("shadow reset truncate: %w", err)
+	}
+	s.mu.Lock()
+	s.pendingBytes.Add(-sf.size)
+	sf.size = 0
+	s.resizeWrittenLocked(sf, 0)
+	s.bumpWriteGenLocked(remotePath)
+	s.mu.Unlock()
+	if len(data) > 0 {
+		n, err := writeShadowAt(sf.fd, data, 0)
+		s.recordWrite(remotePath, sf, 0, n, baseRev)
+		if err != nil {
+			return false, fmt.Errorf("shadow write full: %w", err)
+		}
+		if n != len(data) {
+			return false, fmt.Errorf("shadow write full: short write %d/%d", n, len(data))
+		}
+	}
+	if err := sf.fd.Truncate(newSize); err != nil {
+		return false, fmt.Errorf("shadow final truncate: %w", err)
+	}
+	s.mu.Lock()
+	sf.size = newSize
+	sf.baseRev = baseRev
+	s.bumpWriteGenLocked(remotePath)
+	s.mu.Unlock()
+	if err := commitMeta(newSize); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // quotaCopyBufSize is the chunk size for quota-aware streaming copies.
 const quotaCopyBufSize = 32 << 10 // 32KB
 
@@ -670,6 +729,102 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	_ = oldFd.Close()
 	s.pendingBytes.Add(delta)
 	return n, nil
+}
+
+// writeStreamIfGeneration stages the remote stream in a private temporary file
+// without holding the path lock, then swaps it into place only if the active
+// shadow generation is unchanged. A lock-timeout writer can therefore make
+// progress during a slow object download and wins the final CAS instead of
+// having its local generation overwritten by replay.
+func (s *ShadowStore) writeStreamIfGeneration(remotePath string, r io.Reader, baseRev int64, expectedGen uint64, commitMeta func(size int64) error) (int64, bool, error) {
+	s.mu.RLock()
+	oldWrittenSnapshot := int64(0)
+	if sf := s.files[remotePath]; sf != nil {
+		oldWrittenSnapshot = sf.writtenBytes
+	}
+	s.mu.RUnlock()
+
+	tmpFd, err := os.CreateTemp(s.dir, ".layer-restore-*.shadow.tmp")
+	if err != nil {
+		return 0, false, fmt.Errorf("shadow stream tmp create: %w", err)
+	}
+	tmpPath := tmpFd.Name()
+	keepTmp := false
+	defer func() {
+		_ = tmpFd.Close()
+		if !keepTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	n, err := s.quotaCopy(tmpFd, r, oldWrittenSnapshot)
+	if err != nil {
+		if errors.Is(err, syscall.ENOSPC) {
+			return 0, false, err
+		}
+		return n, false, fmt.Errorf("shadow write stream: %w", err)
+	}
+	if err := tmpFd.Sync(); err != nil {
+		return n, false, fmt.Errorf("shadow stream sync: %w", err)
+	}
+	if err := tmpFd.Close(); err != nil {
+		return n, false, fmt.Errorf("shadow stream close: %w", err)
+	}
+
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+	s.mu.RLock()
+	currentGen := s.writeGen[remotePath]
+	sf := s.files[remotePath]
+	oldSize := int64(0)
+	oldWritten := int64(0)
+	if sf != nil {
+		oldSize = sf.size
+		oldWritten = sf.writtenBytes
+	}
+	s.mu.RUnlock()
+	if currentGen != expectedGen {
+		return n, false, nil
+	}
+	if err := s.checkQuotaForDelta(n - oldWritten); err != nil {
+		return n, false, err
+	}
+
+	shadowFile := s.shadowPath(remotePath)
+	if err := os.Rename(tmpPath, shadowFile); err != nil {
+		return n, false, fmt.Errorf("shadow stream rename: %w", err)
+	}
+	keepTmp = true // tmpPath no longer exists after the atomic rename.
+	newFd, err := os.OpenFile(shadowFile, os.O_RDWR, 0o644)
+	if err != nil {
+		return n, false, fmt.Errorf("shadow stream reopen: %w", err)
+	}
+
+	s.mu.Lock()
+	oldFd := (*os.File)(nil)
+	if sf == nil {
+		sf = &ShadowFile{}
+		s.files[remotePath] = sf
+	} else {
+		oldFd = sf.fd
+	}
+	sf.fd = newFd
+	sf.size = n
+	s.quotaBytes.Add(n - oldWritten)
+	sf.written = shadowWrittenRanges{}
+	sf.written.add(0, n)
+	sf.writtenBytes = n
+	sf.baseRev = baseRev
+	s.bumpWriteGenLocked(remotePath)
+	s.mu.Unlock()
+	if oldFd != nil {
+		_ = oldFd.Close()
+	}
+	s.pendingBytes.Add(n - oldSize)
+	if err := commitMeta(n); err != nil {
+		return n, false, err
+	}
+	return n, true, nil
 }
 
 // Truncate updates the shadow file length without syncing it.
@@ -1492,6 +1647,87 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 		s.pendingBytes.Add(-replacedSize)
 	}
 	return true
+}
+
+// renameIfGenerations moves a retained layer shadow only while both source and
+// target still match the generations observed before replay fetched the remote
+// rename entry. matched=false means a concurrent local writer owns one of the
+// paths and the caller must preserve it unchanged.
+func (s *ShadowStore) renameIfGenerations(oldPath, newPath string, expectedOldGen, expectedNewGen uint64, commitMeta func(size int64) error) (moved, matched bool, err error) {
+	pla, plb := s.acquireTwoPathLocks(oldPath, newPath)
+	defer s.releaseTwoPathLocks(oldPath, newPath, pla, plb)
+
+	s.mu.Lock()
+	if s.writeGen[oldPath] != expectedOldGen || s.writeGen[newPath] != expectedNewGen {
+		s.mu.Unlock()
+		return false, false, nil
+	}
+	sf, ok := s.files[oldPath]
+	if !ok {
+		s.mu.Unlock()
+		return false, true, nil
+	}
+	if oldPath == newPath {
+		size := sf.size
+		s.mu.Unlock()
+		if err := commitMeta(size); err != nil {
+			return false, true, err
+		}
+		return true, true, nil
+	}
+
+	oldSP := s.shadowPath(oldPath)
+	newSP := s.shadowPath(newPath)
+	if err := os.Rename(oldSP, newSP); err != nil {
+		s.mu.Unlock()
+		return false, true, nil
+	}
+
+	replacedSF := s.files[newPath]
+	replacedGen := s.active[newPath]
+	var replacedSize int64
+	if replacedSF != nil {
+		replacedSize = replacedSF.size
+		s.resizeWrittenLocked(replacedSF, 0)
+	}
+	delete(s.files, oldPath)
+	s.files[newPath] = sf
+	oldWriteGen := s.writeGen[oldPath]
+	if oldWriteGen != 0 {
+		s.writeGen[newPath] = oldWriteGen
+		delete(s.writeGen, oldPath)
+	} else {
+		delete(s.writeGen, newPath)
+	}
+	oldGen := s.active[oldPath]
+	if oldGen != 0 {
+		s.active[newPath] = oldGen
+		delete(s.active, oldPath)
+	} else if replacedGen != 0 {
+		delete(s.active, newPath)
+	}
+	if replacedGen != 0 && replacedGen != oldGen {
+		delete(s.genFile, replacedGen)
+		if s.refs[replacedGen] > 0 && replacedSF != nil {
+			s.retired[replacedGen] = &retiredShadow{fd: replacedSF.fd, size: replacedSF.size}
+		} else {
+			delete(s.refs, replacedGen)
+			if replacedSF != nil {
+				_ = replacedSF.fd.Close()
+			}
+		}
+	} else if replacedSF != nil && replacedSF != sf {
+		_ = replacedSF.fd.Close()
+	}
+	movedSize := sf.size
+	s.mu.Unlock()
+	if replacedSize > 0 {
+		s.pendingBytes.Add(-replacedSize)
+	}
+	if err := commitMeta(movedSize); err != nil {
+		return false, true, err
+	}
+	return true, true, nil
 }
 
 // Has reports whether a shadow file exists for the path.

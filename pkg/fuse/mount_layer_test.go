@@ -531,6 +531,305 @@ func TestRestoreLayerEntriesDoesNotOverwriteConcurrentUncommittedGeneration(t *t
 	}
 }
 
+func TestRestoreLayerEntriesSlowObjectDoesNotOverwriteLockTimeoutWriter(t *testing.T) {
+	const localPath = "/shared.bin"
+	streamStarted := make(chan struct{})
+	allowStream := make(chan struct{})
+	entry := client.FSLayerEntry{
+		LayerID: "layer-1", Path: "/repo/shared.bin", Op: "upsert", Kind: "file",
+		StorageType: "s3", StorageRef: "layers/layer-1/shared", SizeBytes: 6,
+		BaseRevision: 9, Mode: 0o640, EntrySeq: 2,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{entry}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries":
+			_ = json.NewEncoder(w).Encode(entry)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/objects":
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			close(streamStarted)
+			<-allowStream
+			_, _ = w.Write([]byte("remote"))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(localPath, []byte("v1"), 8); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := pending.PutWithBaseRevAndMode(localPath, 2, PendingOverwrite, 8, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := pending.MarkLayerCommitted(localPath, gen, 8); err != nil || !marked {
+		t.Fatalf("mark v1 committed = (%t, %v), want true, nil", marked, err)
+	}
+
+	opts := &MountOptions{
+		LayerRef:                "layer-1",
+		RemoteRoot:              "/repo",
+		RemoteCommitWaitTimeout: 20 * time.Millisecond,
+	}
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- restoreLayerEntries(context.Background(), client.New(ts.URL, ""), opts, shadow, pending, fs)
+	}()
+	select {
+	case <-streamStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("restore did not begin the slow object stream")
+	}
+
+	writerDone := make(chan error, 1)
+	go func() {
+		unlock := fs.lockWritableRemoteCommitPath(localPath)
+		defer unlock()
+		if err := shadow.WriteFull(localPath, []byte("local"), 8); err != nil {
+			writerDone <- err
+			return
+		}
+		_, err := pending.PutWithBaseRevAndMode(localPath, 5, PendingOverwrite, 8, 0o600, true)
+		writerDone <- err
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got, readErr := shadow.ReadAll(localPath)
+		if readErr == nil && bytes.Equal(got, []byte("local")) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lock-timeout writer did not bypass replay lock; shadow=%q err=%v", got, readErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(allowStream)
+	if err := <-restoreDone; err != nil {
+		t.Fatalf("restore with lock-timeout writer: %v", err)
+	}
+	if err := <-writerDone; err != nil {
+		t.Fatalf("lock-timeout writer: %v", err)
+	}
+	if got, err := shadow.ReadAll(localPath); err != nil || !bytes.Equal(got, []byte("local")) {
+		t.Fatalf("lock-timeout local generation after restore = %q, %v; want local", got, err)
+	}
+	if meta, ok := pending.GetMeta(localPath); !ok || meta.LayerCommitted || meta.Size != 5 || meta.Mode != 0o600 {
+		t.Fatalf("lock-timeout local metadata after restore = %+v", meta)
+	}
+}
+
+func TestRestoreLayerChmodPreservesUncommittedGeneration(t *testing.T) {
+	const localPath = "/shared.txt"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{{
+				LayerID: "layer-1", Path: "/repo/shared.txt", Op: "chmod", Kind: "file", Mode: 0o640, EntrySeq: 2,
+			}}})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(localPath, []byte("local"), 8); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := pending.PutWithBaseRevAndMode(localPath, 5, PendingOverwrite, 8, 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"})
+	fs.markLayerFileMode(localPath, 0o600)
+	if err := restoreLayerEntries(context.Background(), client.New(ts.URL, ""), &MountOptions{
+		LayerRef: "layer-1", RemoteRoot: "/repo",
+	}, shadow, pending, fs); err != nil {
+		t.Fatalf("restore peer chmod: %v", err)
+	}
+	meta, ok := pending.GetMeta(localPath)
+	if !ok || meta.Generation != gen || meta.LayerCommitted || meta.Mode != 0o600 {
+		t.Fatalf("unfinished generation after peer chmod = %+v, want gen=%d uncommitted mode=0600", meta, gen)
+	}
+	if mode, ok := fs.layerFileMode(localPath); !ok || mode != 0o600 {
+		t.Fatalf("visible layer mode after skipped peer chmod = (%#o, %t), want 0600 true", mode, ok)
+	}
+}
+
+func TestRestoreLayerRenamePreservesDirtySourceAndTarget(t *testing.T) {
+	for _, dirtyPath := range []string{"source", "target"} {
+		t.Run(dirtyPath, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+					_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{{
+						LayerID: "layer-1", Path: "/repo/from.txt", Op: "rename", Kind: "file",
+						ContentText: "/repo/to.txt", Mode: 0o644, EntrySeq: 2,
+					}}})
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer ts.Close()
+
+			shadow, err := NewShadowStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer shadow.Close()
+			pending, err := NewPendingIndex(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			seed := func(path string, data string, committed bool) {
+				t.Helper()
+				if err := shadow.WriteFull(path, []byte(data), 8); err != nil {
+					t.Fatal(err)
+				}
+				gen, err := pending.PutWithBaseRevAndMode(path, int64(len(data)), PendingOverwrite, 8, 0o600, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if committed {
+					if marked, err := pending.MarkLayerCommitted(path, gen, 8); err != nil || !marked {
+						t.Fatalf("mark %s committed = (%t, %v)", path, marked, err)
+					}
+				}
+			}
+			seed("/from.txt", "source", dirtyPath != "source")
+			seed("/to.txt", "target", dirtyPath != "target")
+			fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"})
+			if err := restoreLayerEntries(context.Background(), client.New(ts.URL, ""), &MountOptions{
+				LayerRef: "layer-1", RemoteRoot: "/repo",
+			}, shadow, pending, fs); err != nil {
+				t.Fatalf("restore peer rename: %v", err)
+			}
+			for path, want := range map[string]string{"/from.txt": "source", "/to.txt": "target"} {
+				got, err := shadow.ReadAll(path)
+				if err != nil || string(got) != want {
+					t.Fatalf("%s after peer rename = %q, %v; want %q", path, got, err, want)
+				}
+			}
+			if fs.isLayerWhiteout("/from.txt") {
+				t.Fatal("skipped peer rename installed source whiteout over local generation")
+			}
+			dirtyLocalPath := "/from.txt"
+			if dirtyPath == "target" {
+				dirtyLocalPath = "/to.txt"
+			}
+			if meta, ok := pending.GetMeta(dirtyLocalPath); !ok || meta.LayerCommitted {
+				t.Fatalf("dirty %s metadata after peer rename = %+v, want unfinished", dirtyPath, meta)
+			}
+		})
+	}
+}
+
+func TestRestoreLayerRenameDoesNotOverwriteTargetWrittenDuringEntryFetch(t *testing.T) {
+	fetchStarted := make(chan struct{})
+	allowFetch := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{{
+				LayerID: "layer-1", Path: "/repo/from.txt", Op: "rename", Kind: "file", EntrySeq: 2,
+			}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries":
+			close(fetchStarted)
+			<-allowFetch
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+				LayerID: "layer-1", Path: "/repo/from.txt", Op: "rename", Kind: "file",
+				ContentText: "/repo/to.txt", Mode: 0o644, EntrySeq: 2,
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/from.txt", []byte("source"), 8); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := pending.PutWithBaseRevAndMode("/from.txt", 6, PendingOverwrite, 8, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := pending.MarkLayerCommitted("/from.txt", gen, 8); err != nil || !marked {
+		t.Fatalf("mark source committed = (%t, %v)", marked, err)
+	}
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- restoreLayerEntries(context.Background(), client.New(ts.URL, ""), opts, shadow, pending, fs)
+	}()
+	select {
+	case <-fetchStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rename restore did not begin fetching the authoritative tuple")
+	}
+	if err := shadow.WriteFull("/to.txt", []byte("local-target"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode("/to.txt", 12, PendingNew, 0, 0o600, true); err != nil {
+		t.Fatal(err)
+	}
+	close(allowFetch)
+	if err := <-restoreDone; err != nil {
+		t.Fatalf("restore peer rename: %v", err)
+	}
+	if got, err := shadow.ReadAll("/to.txt"); err != nil || string(got) != "local-target" {
+		t.Fatalf("concurrent target after peer rename = %q, %v; want local-target", got, err)
+	}
+	if meta, ok := pending.GetMeta("/to.txt"); !ok || meta.LayerCommitted || meta.Size != 12 {
+		t.Fatalf("concurrent target metadata after peer rename = %+v", meta)
+	}
+	if fs.isLayerWhiteout("/from.txt") {
+		t.Fatal("skipped concurrent peer rename installed source whiteout")
+	}
+}
+
 func TestRestoreLayerEntriesStreamsObjectBackedFile(t *testing.T) {
 	payload := bytes.Repeat([]byte("x"), 128*1024+13)
 	objectReads := 0

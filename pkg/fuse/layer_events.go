@@ -78,7 +78,8 @@ func refreshLayerEvents(ctx context.Context, c *client.Client, opts *MountOption
 		fs.applyLayerRollback(shadows, pending)
 		return maxSeq, nil
 	}
-	if err := restoreLayerEntries(ctx, c, opts, shadows, pending, fs); err != nil {
+	renameTargets := make(map[string]string)
+	if err := restoreLayerEntriesWithRenameTargets(ctx, c, opts, shadows, pending, fs, renameTargets); err != nil {
 		return since, err
 	}
 	// The restored shadow is now authoritative for these paths. Drop all
@@ -89,16 +90,26 @@ func refreshLayerEvents(ctx context.Context, c *client.Client, opts *MountOption
 		if !ok || p == "" || p == "/" {
 			continue
 		}
-		fs.invalidateReadCacheAndTargets(p)
-		fs.invalidateExtentReaders(p)
-		fs.dirCache.Invalidate(parentDir(p))
-		fs.dirCache.InvalidatePrefix(p)
-		if ino, ok := fs.inodes.GetInode(p); ok {
-			fs.notifyInode(ino)
-		}
-		if parentIno, ok := fs.inodes.GetInode(parentDir(p)); ok {
-			fs.notifyEntry(parentIno, path.Base(p))
+		invalidateLayerRefreshPath(fs, p)
+		if target := renameTargets[p]; target != "" && target != p {
+			invalidateLayerRefreshPath(fs, target)
 		}
 	}
 	return maxSeq, nil
+}
+
+func invalidateLayerRefreshPath(fs *Dat9FS, p string) {
+	if fs == nil || p == "" || p == "/" {
+		return
+	}
+	fs.invalidateReadCacheAndTargets(p)
+	fs.invalidateExtentReaders(p)
+	fs.dirCache.Invalidate(parentDir(p))
+	fs.dirCache.InvalidatePrefix(p)
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		fs.notifyInode(ino)
+	}
+	if parentIno, ok := fs.inodes.GetInode(parentDir(p)); ok {
+		fs.notifyEntry(parentIno, path.Base(p))
+	}
 }

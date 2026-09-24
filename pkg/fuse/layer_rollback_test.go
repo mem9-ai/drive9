@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"syscall"
 	"testing"
+	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
@@ -262,5 +263,80 @@ func TestRefreshLayerEventsSkipsRollbackWhenNoRollbackEvent(t *testing.T) {
 	}
 	if got, ok := fs.readCache.Get("/a.txt", 1); ok {
 		t.Fatalf("same-layer refresh retained stale read cache = %q", got)
+	}
+}
+
+func TestRefreshLayerEventsInvalidatesRenameSourceAndTarget(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-rename/events":
+			_ = json.NewEncoder(w).Encode(map[string]any{"events": []client.FSLayerEvent{{
+				EventID: "layer-rename:2", LayerID: "layer-rename", Seq: 2,
+				Op: "rename", Path: "/repo/old/from.txt",
+			}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-rename/diff":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{{
+				LayerID: "layer-rename", Path: "/repo/old/from.txt", Op: "rename", Kind: "file",
+				ContentText: "/repo/new/to.txt", Mode: 0o644, EntrySeq: 2,
+			}}})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/old/from.txt", []byte("source"), 8); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := pending.PutWithBaseRevAndMode("/old/from.txt", 6, PendingOverwrite, 8, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := pending.MarkLayerCommitted("/old/from.txt", gen, 8); err != nil || !marked {
+		t.Fatalf("mark source committed = (%t, %v)", marked, err)
+	}
+
+	c := client.New(ts.URL, "")
+	fs := NewDat9FS(c, &MountOptions{LayerRef: "layer-rename", RemoteRoot: "/repo", PerfCounters: true})
+	fs.inodes.EnsureInode("/old", true, 0, time.Now())
+	fs.inodes.EnsureInode("/new", true, 0, time.Now())
+	fs.inodes.EnsureInode("/old/from.txt", false, 6, time.Now())
+	fs.inodes.EnsureInode("/new/to.txt", false, 6, time.Now())
+	fs.readCache.Put("/old/from.txt", []byte("stale-source"), 8)
+	fs.readCache.Put("/new/to.txt", []byte("stale-target"), 8)
+	fs.dirCache.Put("/old", []CachedFileInfo{{Name: "from.txt", Revision: 8}})
+	fs.dirCache.Put("/new", []CachedFileInfo{{Name: "missing.txt", Revision: 8}})
+
+	if _, err := refreshLayerEvents(context.Background(), c, &MountOptions{
+		LayerRef: "layer-rename", RemoteRoot: "/repo",
+	}, shadow, pending, fs, 0); err != nil {
+		t.Fatalf("refreshLayerEvents rename: %v", err)
+	}
+	for _, p := range []string{"/old/from.txt", "/new/to.txt"} {
+		if got, ok := fs.readCache.Get(p, 8); ok {
+			t.Fatalf("rename refresh retained read cache for %s: %q", p, got)
+		}
+	}
+	for _, p := range []string{"/old", "/new"} {
+		if got, ok := fs.dirCache.Get(p); ok {
+			t.Fatalf("rename refresh retained dir cache for %s: %+v", p, got)
+		}
+	}
+	if got := fs.perf.notifyEntry.load(); got < 2 {
+		t.Fatalf("rename refresh entry notifications = %d, want source+target", got)
+	}
+	if got := fs.perf.notifyInode.load(); got < 2 {
+		t.Fatalf("rename refresh inode notifications = %d, want source+target", got)
 	}
 }

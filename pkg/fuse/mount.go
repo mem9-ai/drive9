@@ -1407,6 +1407,10 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 }
 
 func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS) error {
+	return restoreLayerEntriesWithRenameTargets(ctx, c, opts, shadows, pending, fs, nil)
+}
+
+func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, renameTargets map[string]string) error {
 	if c == nil || opts == nil || shadows == nil || pending == nil || strings.TrimSpace(opts.LayerRef) == "" {
 		return nil
 	}
@@ -1450,16 +1454,23 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 			}
 			continue
 		case "chmod":
-			if pending != nil {
-				gen, err := pending.UpdateMode(localPath, entry.Mode)
-				if err != nil {
-					return fmt.Errorf("restore fs layer chmod pending %s: %w", localPath, err)
-				}
-				if gen != 0 {
-					if _, err := pending.MarkLayerCommitted(localPath, gen, 0); err != nil {
-						return fmt.Errorf("restore fs layer chmod commit marker %s: %w", localPath, err)
-					}
-				}
+			expectedPendingGen, owned := layerRestorePendingGeneration(pending, localPath)
+			if !owned {
+				// A local unfinished generation owns both its content and mode.
+				// A peer chmod cannot relabel that generation as committed.
+				continue
+			}
+			unlock := func() {}
+			if fs != nil {
+				unlock = fs.lockRemoteCommitPath(localPath)
+			}
+			applied, err := pending.restoreLayerModeIfGeneration(localPath, expectedPendingGen, entry.Mode)
+			unlock()
+			if err != nil {
+				return fmt.Errorf("restore fs layer chmod pending %s: %w", localPath, err)
+			}
+			if !applied {
+				continue
 			}
 			if fs != nil {
 				switch entry.Kind {
@@ -1479,8 +1490,12 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 			}
 			continue
 		case "rename":
-			if err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)); err != nil {
+			targetPath, err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq))
+			if err != nil {
 				return err
+			}
+			if renameTargets != nil && targetPath != "" {
+				renameTargets[localPath] = targetPath
 			}
 			continue
 		case "symlink":
@@ -1507,62 +1522,68 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		if entry.Op != "upsert" || entry.Kind != "file" {
 			continue
 		}
-		if existing, ok := pending.GetMeta(localPath); ok && !existing.LayerCommitted {
+		expectedPendingGen, owned := layerRestorePendingGeneration(pending, localPath)
+		if !owned {
 			// A genuinely unfinished local generation is newer ownership than
 			// replayed layer state and must not be overwritten. A retained
 			// committed overlay, however, is only a local cache of server truth:
 			// replay may replace it with a later layer entry.
 			continue
 		}
+		expectedShadowGen := layerRestoreShadowGeneration(shadows, localPath)
 		entryMaxSeq := layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)
 		fullEntry, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, entryMaxSeq)
 		if err != nil {
 			return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
 		}
-		restored, err := func() (bool, error) {
-			unlock := func() {}
-			if fs != nil {
-				unlock = fs.lockRemoteCommitPath(localPath)
-			}
-			defer unlock()
-
-			// The entry fetch above intentionally does not hold the path lock.
-			// Recheck after acquiring it: a writer may have installed a newer
-			// unfinished local generation while the remote entry was in flight.
-			if existing, ok := pending.GetMeta(localPath); ok && !existing.LayerCommitted {
-				return false, nil
-			}
-
-			var sizeBytes int64
-			if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
-				rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, entryMaxSeq)
-				if err != nil {
-					return false, fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
+		unlock := func() {}
+		if fs != nil {
+			unlock = fs.lockRemoteCommitPath(localPath)
+		}
+		restored, err := pending.restoreLayerCommittedIfGeneration(
+			localPath,
+			expectedPendingGen,
+			fullEntry.BaseRevision,
+			fullEntry.Mode,
+			fullEntry.Mode != 0,
+			func(commitMeta func(size int64) error) (bool, error) {
+				checkedCommit := func(sizeBytes int64) error {
+					if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
+						return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
+					}
+					return commitMeta(sizeBytes)
 				}
-				n, writeErr := shadows.WriteStream(localPath, rc, fullEntry.BaseRevision)
-				closeErr := rc.Close()
-				if writeErr != nil {
-					return false, fmt.Errorf("restore fs layer shadow %s: %w", localPath, writeErr)
+				if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
+					rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, entryMaxSeq)
+					if err != nil {
+						return false, fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
+					}
+					_, applied, writeErr := shadows.writeStreamIfGeneration(localPath, rc, fullEntry.BaseRevision, expectedShadowGen, checkedCommit)
+					closeErr := rc.Close()
+					if writeErr != nil {
+						return false, fmt.Errorf("restore fs layer shadow %s: %w", localPath, writeErr)
+					}
+					if closeErr != nil {
+						return false, fmt.Errorf("restore fs layer object %s: %w", entry.Path, closeErr)
+					}
+					if !applied {
+						return false, nil
+					}
+					return true, nil
+				} else {
+					content := fullEntry.Content
+					applied, err := shadows.writeFullIfGeneration(localPath, content, fullEntry.BaseRevision, expectedShadowGen, checkedCommit)
+					if err != nil {
+						return false, fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
+					}
+					if !applied {
+						return false, nil
+					}
+					return true, nil
 				}
-				if closeErr != nil {
-					return false, fmt.Errorf("restore fs layer object %s: %w", entry.Path, closeErr)
-				}
-				sizeBytes = n
-			} else {
-				content := fullEntry.Content
-				if err := shadows.WriteFull(localPath, content, fullEntry.BaseRevision); err != nil {
-					return false, fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
-				}
-				sizeBytes = int64(len(content))
-			}
-			if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
-				return false, fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
-			}
-			if _, err := pending.PutLayerCommitted(localPath, sizeBytes, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
-				return false, fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
-			}
-			return true, nil
-		}()
+			},
+		)
+		unlock()
 		if err != nil {
 			return err
 		}
@@ -1578,6 +1599,33 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		}
 	}
 	return nil
+}
+
+func layerRestorePendingGeneration(pending *PendingIndex, localPath string) (uint64, bool) {
+	if pending == nil {
+		return 0, true
+	}
+	meta, ok := pending.GetMeta(localPath)
+	if !ok {
+		return 0, true
+	}
+	if !meta.LayerCommitted {
+		return 0, false
+	}
+	return meta.Generation, true
+}
+
+func layerRestoreShadowGeneration(shadows *ShadowStore, localPath string) uint64 {
+	if shadows == nil || localPath == "" {
+		return 0
+	}
+	if gen := shadows.ActiveGeneration(localPath); gen != 0 {
+		return gen
+	}
+	if !shadows.Has(localPath) {
+		return 0
+	}
+	return shadows.EnsureActiveGeneration(localPath, 0)
 }
 
 func layerEntryFetchMaxSeq(entry *client.FSLayerEntry, hasCheckpoint bool, checkpointMaxSeq int64) *int64 {
@@ -1614,15 +1662,15 @@ func getLayerEntryForRestore(ctx context.Context, c *client.Client, layerID, pat
 	return c.GetFSLayerEntry(ctx, layerID, path)
 }
 
-func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry, maxSeq *int64) error {
+func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry, maxSeq *int64) (string, error) {
 	if entry == nil {
-		return nil
+		return "", nil
 	}
 	fullEntry := entry
 	if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
 		fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, maxSeq)
 		if err != nil {
-			return fmt.Errorf("restore fs layer rename entry %s: %w", entry.Path, err)
+			return "", fmt.Errorf("restore fs layer rename entry %s: %w", entry.Path, err)
 		}
 		fullEntry = fetched
 	}
@@ -1631,34 +1679,73 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 		targetRemote = string(fullEntry.Content)
 	}
 	if targetRemote == "" {
-		return fmt.Errorf("restore fs layer rename entry %s: missing target", entry.Path)
-	}
-	if fs != nil {
-		fs.markLayerWhiteout(oldLocalPath)
+		return "", fmt.Errorf("restore fs layer rename entry %s: missing target", entry.Path)
 	}
 	newLocalPath, ok := mountpath.ToLocal(opts.RemoteRoot, targetRemote)
 	if !ok {
-		return nil
+		return "", nil
 	}
-	movedShadow := shadows.Rename(oldLocalPath, newLocalPath)
-	movedPending := pending.RenamePending(oldLocalPath, newLocalPath)
-	if movedShadow || movedPending {
-		return nil
+	expectedOldPendingGen, oldOwned := layerRestorePendingGeneration(pending, oldLocalPath)
+	expectedNewPendingGen, newOwned := layerRestorePendingGeneration(pending, newLocalPath)
+	if !oldOwned || !newOwned {
+		return newLocalPath, nil
 	}
-	if pending.HasPending(newLocalPath) {
-		return nil
+	expectedOldShadowGen := layerRestoreShadowGeneration(shadows, oldLocalPath)
+	expectedNewShadowGen := layerRestoreShadowGeneration(shadows, newLocalPath)
+
+	var fallbackData []byte
+	if expectedOldShadowGen == 0 {
+		data, err := c.ReadCtx(ctx, fullEntry.Path)
+		if err != nil {
+			return newLocalPath, fmt.Errorf("restore fs layer renamed source %s: %w", fullEntry.Path, err)
+		}
+		fallbackData = data
 	}
-	data, err := c.ReadCtx(ctx, fullEntry.Path)
+	unlock := func() {}
+	if fs != nil {
+		unlock = fs.lockRemoteCommitPaths(oldLocalPath, newLocalPath)
+	}
+	applied, err := pending.restoreLayerrenameIfGenerations(
+		oldLocalPath,
+		newLocalPath,
+		expectedOldPendingGen,
+		expectedNewPendingGen,
+		0,
+		fullEntry.Mode,
+		fullEntry.Mode != 0,
+		func(commitMeta func(size int64) error) (bool, error) {
+			moved, matched, err := shadows.renameIfGenerations(
+				oldLocalPath,
+				newLocalPath,
+				expectedOldShadowGen,
+				expectedNewShadowGen,
+				commitMeta,
+			)
+			if err != nil || moved || !matched {
+				return moved, err
+			}
+			if fallbackData == nil {
+				return false, nil
+			}
+			return shadows.writeFullIfGeneration(newLocalPath, fallbackData, 0, expectedNewShadowGen, commitMeta)
+		},
+	)
+	unlock()
 	if err != nil {
-		return fmt.Errorf("restore fs layer renamed source %s: %w", fullEntry.Path, err)
+		return newLocalPath, fmt.Errorf("restore fs layer rename %s to %s: %w", oldLocalPath, newLocalPath, err)
 	}
-	if err := shadows.WriteFull(newLocalPath, data, 0); err != nil {
-		return fmt.Errorf("restore fs layer renamed shadow %s: %w", newLocalPath, err)
+	if !applied {
+		return newLocalPath, nil
 	}
-	if _, err := pending.PutLayerCommitted(newLocalPath, int64(len(data)), 0, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
-		return fmt.Errorf("restore fs layer renamed pending %s: %w", newLocalPath, err)
+	if fs != nil {
+		fs.markLayerWhiteout(oldLocalPath)
+		if fullEntry.Mode != 0 {
+			fs.markLayerFileMode(newLocalPath, fullEntry.Mode)
+		} else {
+			fs.markLayerFile(newLocalPath)
+		}
 	}
-	return nil
+	return newLocalPath, nil
 }
 
 func mountCredentialKind(opts *MountOptions) string {
