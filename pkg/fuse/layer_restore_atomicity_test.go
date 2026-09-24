@@ -214,6 +214,204 @@ func TestRestoreLayerRenameMetadataFailureRestoresSourceTargetAndRestart(t *test
 	assertNoLayerRestoreArtifacts(t, shadowDir, pendingDir)
 }
 
+func TestRestoreLayerDirectoryRenameGroupFailureRestoresInlineObjectAndExistingTarget(t *testing.T) {
+	inlineData := []byte("inline-source")
+	objectData := bytes.Repeat([]byte("object-source-"), 8*1024)
+	targetData := []byte("existing-target")
+	inlineEntry := client.FSLayerEntry{
+		LayerID: "layer-1", Path: "/repo/old/inline.txt", Op: "upsert", Kind: "file",
+		Content: inlineData, SizeBytes: int64(len(inlineData)), BaseRevision: 11, Mode: 0o640, EntrySeq: 1,
+	}
+	objectEntry := client.FSLayerEntry{
+		LayerID: "layer-1", Path: "/repo/old/object.bin", Op: "upsert", Kind: "file",
+		StorageType: "s3", StorageRef: "objects/source", SizeBytes: int64(len(objectData)), BaseRevision: 12, Mode: 0o600, EntrySeq: 2,
+	}
+	renameEntry := client.FSLayerEntry{
+		LayerID: "layer-1", Path: "/repo/old/", Op: "rename", Kind: "dir",
+		ContentText: "/repo/new/", Mode: 0o750, EntrySeq: 3,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{inlineEntry, objectEntry, renameEntry}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries":
+			switch r.URL.Query().Get("path") {
+			case inlineEntry.Path:
+				_ = json.NewEncoder(w).Encode(inlineEntry)
+			case objectEntry.Path:
+				_ = json.NewEncoder(w).Encode(objectEntry)
+			default:
+				t.Errorf("unexpected layer entry path: %s", r.URL.RawQuery)
+				w.WriteHeader(http.StatusNotFound)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/objects" && r.URL.Query().Get("path") == objectEntry.Path:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(objectData)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadowDir, pendingDir := t.TempDir(), t.TempDir()
+	shadows, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetMeta := seedCommittedLayerCache(t, shadows, pending, "/new/object.bin", targetData, 7, 0o644)
+
+	// The two upserts first become committed retained entries. Fail only after
+	// the directory group has already moved/written the inline descendant and
+	// is installing the object descendant over an existing target.
+	failingMetaPath := filepath.Join(pendingDir, hashPath("/new/object.bin")+".meta")
+	pending.restoreMetaWrite = func(path string, data []byte) error {
+		if path == failingMetaPath {
+			if err := atomicWrite(path, data); err != nil {
+				return err
+			}
+			return errInjectedLayerRestoreMeta
+		}
+		return atomicWrite(path, data)
+	}
+	t.Cleanup(func() { pending.restoreMetaWrite = nil })
+
+	err = restoreLayerEntries(context.Background(), client.New(ts.URL, ""), &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}, shadows, pending, nil)
+	if !errors.Is(err, errInjectedLayerRestoreMeta) {
+		t.Fatalf("directory restore error = %v, want injected second-descendant failure", err)
+	}
+	for path, want := range map[string][]byte{
+		"/old/inline.txt": inlineData,
+		"/old/object.bin": objectData,
+		"/new/object.bin": targetData,
+	} {
+		got, readErr := shadows.ReadAll(path)
+		if readErr != nil || !bytes.Equal(got, want) {
+			t.Fatalf("shadow %s after group rollback = %q, %v; want %q", path, got, readErr, want)
+		}
+		if meta, ok := pending.GetMeta(path); !ok || !meta.LayerCommitted {
+			t.Fatalf("pending %s after group rollback = %+v, want committed", path, meta)
+		}
+	}
+	if shadows.Has("/new/inline.txt") || pending.HasPending("/new/inline.txt") {
+		t.Fatal("partially migrated inline descendant remained at target")
+	}
+	if meta, ok := pending.GetMeta("/new/object.bin"); !ok || meta.Generation != targetMeta.Generation || meta.BaseRev != targetMeta.BaseRev {
+		t.Fatalf("existing target meta after group rollback = %+v, want %+v", meta, targetMeta)
+	}
+
+	shadows.Close()
+	restartedShadows, restartedPending := reopenLayerRestoreCache(t, shadowDir, pendingDir)
+	for path, want := range map[string][]byte{
+		"/old/inline.txt": inlineData,
+		"/old/object.bin": objectData,
+		"/new/object.bin": targetData,
+	} {
+		got, readErr := restartedShadows.ReadAll(path)
+		if readErr != nil || !bytes.Equal(got, want) {
+			t.Fatalf("restarted shadow %s = %q, %v; want %q", path, got, readErr, want)
+		}
+		if _, ok := restartedPending.GetMeta(path); !ok {
+			t.Fatalf("restarted pending %s missing", path)
+		}
+	}
+	if restartedShadows.Has("/new/inline.txt") || restartedPending.HasPending("/new/inline.txt") {
+		t.Fatal("restart exposed partially migrated inline descendant")
+	}
+	assertNoLayerRestoreArtifacts(t, shadowDir, pendingDir)
+}
+
+func TestRestoreLayerDirectoryRenameGroupRollbackFailureFreezesMount(t *testing.T) {
+	entries := []client.FSLayerEntry{
+		{LayerID: "layer-1", Path: "/repo/old/a.txt", Op: "upsert", Kind: "file", Content: []byte("a"), SizeBytes: 1, EntrySeq: 1},
+		{LayerID: "layer-1", Path: "/repo/old/b.txt", Op: "upsert", Kind: "file", Content: []byte("b"), SizeBytes: 1, EntrySeq: 2},
+		{LayerID: "layer-1", Path: "/repo/old/", Op: "rename", Kind: "dir", ContentText: "/repo/new/", EntrySeq: 3},
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/layers/layer-1/diff":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries})
+		case r.URL.Path == "/v1/layers/layer-1/entries":
+			for _, entry := range entries[:2] {
+				if entry.Path == r.URL.Query().Get("path") {
+					_ = json.NewEncoder(w).Encode(entry)
+					return
+				}
+			}
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadowDir := t.TempDir()
+	shadows, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingDir := t.TempDir()
+	pending, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failingMetaPath := filepath.Join(pendingDir, hashPath("/new/b.txt")+".meta")
+	pending.restoreMetaWrite = func(path string, data []byte) error {
+		if path == failingMetaPath {
+			return errInjectedLayerRestoreMeta
+		}
+		return atomicWrite(path, data)
+	}
+	pending.restoreTxnMarkerRemove = func(marker string) error {
+		raw, readErr := os.ReadFile(marker)
+		if readErr != nil {
+			return readErr
+		}
+		var record layerRestoreTxnRecord
+		if err := json.Unmarshal(raw, &record); err != nil {
+			return err
+		}
+		if len(record.Files) > 4 {
+			return errInjectedLayerRestoreCommit
+		}
+		return removeLayerRestoreMarker(marker)
+	}
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"})
+	err = restoreLayerEntries(context.Background(), fs.client, &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}, shadows, pending, fs)
+	if !errors.Is(err, errLayerRestoreStateUncertain) {
+		t.Fatalf("directory restore error = %v, want uncertain rollback failure", err)
+	}
+	if !fs.promotionBlocked.Load() {
+		t.Fatal("rollback failure did not freeze the live mount")
+	}
+	// Model the process stopping in the fail-closed state. The retained marker
+	// must make startup finish the whole-group rollback before either index is
+	// exposed; it must not preserve only the first descendant move.
+	shadows.Close()
+	restartedShadows, restartedPending := reopenLayerRestoreCache(t, shadowDir, pendingDir)
+	for path, want := range map[string][]byte{"/old/a.txt": []byte("a"), "/old/b.txt": []byte("b")} {
+		got, readErr := restartedShadows.ReadAll(path)
+		if readErr != nil || !bytes.Equal(got, want) {
+			t.Fatalf("restarted shadow %s = %q, %v; want %q", path, got, readErr, want)
+		}
+		if _, ok := restartedPending.GetMeta(path); !ok {
+			t.Fatalf("restarted pending %s missing", path)
+		}
+	}
+	for _, path := range []string{"/new/a.txt", "/new/b.txt"} {
+		if restartedShadows.Has(path) || restartedPending.HasPending(path) {
+			t.Fatalf("restart retained partial group target %s", path)
+		}
+	}
+	assertNoLayerRestoreArtifacts(t, shadowDir, pendingDir)
+}
+
 func TestLayerRestoreTransactionCrashRecoveryRestoresOldPair(t *testing.T) {
 	const path = "/crash.txt"
 	shadowDir, pendingDir := t.TempDir(), t.TempDir()

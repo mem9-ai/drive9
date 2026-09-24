@@ -1796,6 +1796,7 @@ func restoreLayerDirectoryCommittedDescendants(shadows *ShadowStore, pending *Pe
 		}
 		return metas[i].Path < metas[j].Path
 	})
+	moves := make([]layerRestoreRenameMove, 0, len(metas))
 	for _, observed := range metas {
 		if observed == nil || !observed.LayerCommitted {
 			return false, nil
@@ -1811,39 +1812,20 @@ func restoreLayerDirectoryCommittedDescendants(shadows *ShadowStore, pending *Pe
 		if expectedOldShadowGen == 0 {
 			return false, fmt.Errorf("restore fs layer directory rename %s to %s: committed shadow missing", oldChild, newChild)
 		}
-		applied, err := pending.restoreLayerrenameIfGenerations(
-			oldChild,
-			newChild,
-			observed.Generation,
-			expectedNewPendingGen,
-			observed.BaseRev,
-			observed.Mode,
-			observed.HasMode,
-			shadows.shadowPath(oldChild),
-			shadows.shadowPath(newChild),
-			func(tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (bool, error) {
-				moved, matched, moveErr := shadows.renameIfGenerations(
-					oldChild,
-					newChild,
-					expectedOldShadowGen,
-					expectedNewShadowGen,
-					tx,
-					prepareMeta,
-				)
-				if moveErr != nil || moved || !matched {
-					return moved, moveErr
-				}
-				return false, nil
-			},
-		)
-		if err != nil {
-			return false, fmt.Errorf("restore fs layer directory rename %s to %s: %w", oldChild, newChild, err)
-		}
-		if !applied {
-			return false, nil
-		}
+		moves = append(moves, layerRestoreRenameMove{
+			oldPath:               oldChild,
+			newPath:               newChild,
+			expectedOldPendingGen: observed.Generation,
+			expectedNewPendingGen: expectedNewPendingGen,
+			expectedOldShadowGen:  expectedOldShadowGen,
+			expectedNewShadowGen:  expectedNewShadowGen,
+		})
 	}
-	return true, nil
+	applied, err := restoreLayerRenameGroupIfGenerations(shadows, pending, moves)
+	if err != nil {
+		return false, fmt.Errorf("restore fs layer directory rename %s to %s: %w", oldPath, newPath, err)
+	}
+	return applied, nil
 }
 
 func layerEntryFetchScope(entry *client.FSLayerEntry, tipLayerID string, hasCheckpoint bool, checkpointMaxSeq int64) (string, *int64) {

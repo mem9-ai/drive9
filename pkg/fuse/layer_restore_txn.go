@@ -37,10 +37,11 @@ type layerRestoreTxnRecord struct {
 	Files   []layerRestoreFileSnapshot `json:"files"`
 }
 
-// layerRestoreTxn is a durable rollback record for the two-file layer cache
-// commit (shadow content plus pending metadata). Layer data is authoritative on
-// the server, but the local pair must still be old-or-new across an I/O error or
-// process crash: a mixed pair can be mistaken for an unfinished local write.
+// layerRestoreTxn is a durable rollback record for one or more layer-cache
+// commits (shadow content plus pending metadata). Layer data is authoritative
+// on the server, but every captured pair/group must still be old-or-new across
+// an I/O error or process crash: mixed state can be mistaken for an unfinished
+// local write or expose a partially renamed directory subtree.
 //
 // The marker is the commit record. While it exists, startup always restores the
 // snapshots. A successful caller fsyncs both new files before removing the
