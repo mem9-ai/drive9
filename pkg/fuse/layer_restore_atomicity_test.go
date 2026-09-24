@@ -334,10 +334,10 @@ func TestRestoreLayerDirectoryRenameGroupRollbackFailureFreezesMount(t *testing.
 	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.URL.Path == "/v1/layers/layer-1/diff":
+		switch r.URL.Path {
+		case "/v1/layers/layer-1/diff":
 			_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries})
-		case r.URL.Path == "/v1/layers/layer-1/entries":
+		case "/v1/layers/layer-1/entries":
 			for _, entry := range entries[:2] {
 				if entry.Path == r.URL.Query().Get("path") {
 					_ = json.NewEncoder(w).Encode(entry)
