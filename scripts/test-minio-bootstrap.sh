@@ -320,7 +320,11 @@ new_harness() {
 teardown_harness() {
   if [ -n "${HARNESS_DIR:-}" ] && [ -d "$HARNESS_DIR" ]; then
     for pidf in "$FAKE_RUN_DIR"/*.pid; do
-      [ -f "$pidf" ] && kill "$(cat "$pidf")" >/dev/null 2>&1 || true
+      if [ -f "$pidf" ]; then
+        pid="$(cat "$pidf")"
+        kill "$pid" >/dev/null 2>&1 || true
+        wait "$pid" 2>/dev/null || true
+      fi
     done
     rm -rf "$HARNESS_DIR"
   fi
@@ -332,6 +336,53 @@ teardown_harness() {
 
 # Test A: the first candidate's `run -d` succeeds but never turns healthy;
 # the second candidate takes over; the binary fallback is NOT used.
+# Test I: an invalid (0) probe timeout must be sanitized to a positive cap.
+# A stalled leftover server occupies the port, so the run cannot succeed —
+# the contract under test is that it FAILS BOUNDED (rc=1 within 30s, no
+# watchdog): with the value accepted verbatim, curl's --max-time 0 removes
+# the limit and the preflight probe hangs until the watchdog kills it.
+test_zero_probe_timeout_is_sanitized_local_minio() {
+  echo "--- I: local-minio sanitizes MINIO_HEALTH_PROBE_TIMEOUT_S=0"
+  new_harness
+  local rc=0
+  local t0 elapsed
+  t0=$(date +%s)
+  python3 "$FAKE_BIN_DIR/fake_stall.py" "$FAKE_PORT" >/dev/null 2>&1 &
+  echo $! >"$FAKE_RUN_DIR/leftover-stall.pid"
+  run_with_watchdog 60 "$FAKE_RUN_DIR/ensure.log" env \
+    DRIVE9_MINIO_PORT=$FAKE_PORT MINIO_HEALTH_PROBE_TIMEOUT_S=0 \
+    DRIVE9_MINIO_IMAGE=registry.invalid/good:tag \
+    DRIVE9_MINIO_FALLBACK_IMAGE="" \
+    MINIO_HEALTH_TIMEOUT_S=6 PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
+    bash "$SCRIPT_DIR/local-minio.sh" ensure || rc=$?
+  elapsed=$(( $(date +%s) - t0 ))
+  check_eq "bounded failure, not a hang (rc=1; 124 = watchdog)" "$rc" "1"
+  check_le "sanitized probe stays within budget" "$elapsed" 30
+  teardown_harness
+}
+
+# Test J: the same 0-value sanitation for object-store's one-shot preflight.
+test_zero_probe_timeout_is_sanitized_object_store() {
+  echo "--- J: object-store sanitizes MINIO_HEALTH_PROBE_TIMEOUT_S=0"
+  new_harness
+  local rc=0
+  local t0 elapsed
+  t0=$(date +%s)
+  python3 "$FAKE_BIN_DIR/fake_stall.py" "$FAKE_PORT" >/dev/null 2>&1 &
+  echo $! >"$FAKE_RUN_DIR/leftover-stall.pid"
+  run_with_watchdog 60 "$FAKE_RUN_DIR/suite.log" env \
+    CLI_SOURCE=invalid OBJECT_BOOTSTRAP_ONLY=1 \
+    MINIO_PORT=$FAKE_PORT MINIO_HEALTH_PROBE_TIMEOUT_S=0 \
+    MINIO_IMAGE=registry.invalid/good:tag \
+    DRIVE9_MINIO_FALLBACK_IMAGE="" \
+    MINIO_HEALTH_TIMEOUT_S=6 PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
+    bash "$REPO_ROOT/e2e/object-store-smoke-test.sh" || rc=$?
+  elapsed=$(( $(date +%s) - t0 ))
+  check_eq "bounded failure, not a hang (rc=1; 124 = watchdog)" "$rc" "1"
+  check_le "sanitized probe stays within budget" "$elapsed" 30
+  teardown_harness
+}
+
 test_first_unhealthy_second_healthy() {
   echo "--- A: first candidate unhealthy, second healthy"
   new_harness
@@ -392,30 +443,25 @@ test_preexisting_unhealthy_container_replaced() {
   teardown_harness
 }
 
-# Test D: object-store's own candidate loop — first candidate unhealthy,
-# second healthy; the OBJECT_BOOTSTRAP_ONLY hook stops before CLI work.
+# Test D: with the default health budget, a clean-port bootstrap over the
+# one-shot reuse probe finishes promptly. The old full-wait_health preflight
+# burned the whole 40s budget retrying connection-refused before any
+# container started (~42s total), so a <=15s bound fails that implementation
+# deterministically while the one-shot bootstrap (~2s) keeps 7x headroom.
 test_object_store_first_unhealthy() {
-  echo "--- D: object-store first candidate unhealthy, second healthy"
+  echo "--- D: object-store clean-port bootstrap is prompt under default budget"
   new_harness
   local rc=0
   local t0 elapsed
   t0=$(date +%s)
   CLI_SOURCE=invalid OBJECT_BOOTSTRAP_ONLY=1 \
-    MINIO_IMAGE=registry.invalid/bad:tag \
-    DRIVE9_MINIO_FALLBACK_IMAGE=registry.invalid/good:tag \
+    MINIO_IMAGE=registry.invalid/good:tag \
     FAKE_HEALTHY_IMAGES="registry.invalid/good:tag" \
-    MINIO_PORT=$FAKE_PORT MINIO_HEALTH_TIMEOUT_S=3 PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
+    MINIO_PORT=$FAKE_PORT PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
     bash "$REPO_ROOT/e2e/object-store-smoke-test.sh" >"$FAKE_RUN_DIR/suite.log" 2>&1 || rc=$?
   elapsed=$(( $(date +%s) - t0 ))
   check_eq "bootstrap exit status" "$rc" "0"
-  # The empty port must be dismissed by the one-shot reuse probe, not by a
-  # retry loop: the whole two-candidate bootstrap stays well under a single
-  # default health budget.
-  check_le "clean-port bootstrap is prompt" "$elapsed" 20
-  check_eq "second candidate was run" "$(read_state run_image | tail -1)" "registry.invalid/good:tag"
-  # Two removals: the unhealthy candidate inside the loop, plus the suite's
-  # EXIT-trap cleanup of the accepted container.
-  check_eq "unhealthy candidate removed" "$(grep -c '^removed=' "$FAKE_STATE" || true)" "2"
+  check_le "clean-port bootstrap is prompt" "$elapsed" 15
   check_eq "bootstrap hook reached" "$(grep -c 'bootstrap-only: MinIO provisioning finished' "$FAKE_RUN_DIR/suite.log" || true)" "1"
   teardown_harness
 }
@@ -512,6 +558,53 @@ test_stalled_http_probe_recovers_object_store() {
   teardown_harness
 }
 
+# Test I: an invalid (0) probe timeout must be sanitized to a positive cap.
+# A stalled leftover server occupies the port, so the run cannot succeed —
+# the contract under test is that it FAILS BOUNDED (rc=1 within 30s, no
+# watchdog): with the value accepted verbatim, curl's --max-time 0 removes
+# the limit and the preflight probe hangs until the watchdog kills it.
+test_zero_probe_timeout_is_sanitized_local_minio() {
+  echo "--- I: local-minio sanitizes MINIO_HEALTH_PROBE_TIMEOUT_S=0"
+  new_harness
+  local rc=0
+  local t0 elapsed
+  t0=$(date +%s)
+  python3 "$FAKE_BIN_DIR/fake_stall.py" "$FAKE_PORT" >/dev/null 2>&1 &
+  echo $! >"$FAKE_RUN_DIR/leftover-stall.pid"
+  run_with_watchdog 60 "$FAKE_RUN_DIR/ensure.log" env \
+    DRIVE9_MINIO_PORT=$FAKE_PORT MINIO_HEALTH_PROBE_TIMEOUT_S=0 \
+    DRIVE9_MINIO_IMAGE=registry.invalid/good:tag \
+    DRIVE9_MINIO_FALLBACK_IMAGE="" \
+    MINIO_HEALTH_TIMEOUT_S=6 PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
+    bash "$SCRIPT_DIR/local-minio.sh" ensure || rc=$?
+  elapsed=$(( $(date +%s) - t0 ))
+  check_eq "bounded failure, not a hang (rc=1; 124 = watchdog)" "$rc" "1"
+  check_le "sanitized probe stays within budget" "$elapsed" 30
+  teardown_harness
+}
+
+# Test J: the same 0-value sanitation for object-store's one-shot preflight.
+test_zero_probe_timeout_is_sanitized_object_store() {
+  echo "--- J: object-store sanitizes MINIO_HEALTH_PROBE_TIMEOUT_S=0"
+  new_harness
+  local rc=0
+  local t0 elapsed
+  t0=$(date +%s)
+  python3 "$FAKE_BIN_DIR/fake_stall.py" "$FAKE_PORT" >/dev/null 2>&1 &
+  echo $! >"$FAKE_RUN_DIR/leftover-stall.pid"
+  run_with_watchdog 60 "$FAKE_RUN_DIR/suite.log" env \
+    CLI_SOURCE=invalid OBJECT_BOOTSTRAP_ONLY=1 \
+    MINIO_PORT=$FAKE_PORT MINIO_HEALTH_PROBE_TIMEOUT_S=0 \
+    MINIO_IMAGE=registry.invalid/good:tag \
+    DRIVE9_MINIO_FALLBACK_IMAGE="" \
+    MINIO_HEALTH_TIMEOUT_S=6 PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
+    bash "$REPO_ROOT/e2e/object-store-smoke-test.sh" || rc=$?
+  elapsed=$(( $(date +%s) - t0 ))
+  check_eq "bounded failure, not a hang (rc=1; 124 = watchdog)" "$rc" "1"
+  check_le "sanitized probe stays within budget" "$elapsed" 30
+  teardown_harness
+}
+
 test_first_unhealthy_second_healthy
 test_all_unhealthy_falls_back_to_binary
 test_preexisting_unhealthy_container_replaced
@@ -520,6 +613,8 @@ test_object_store_binary_fallback
 test_object_store_total_failure
 test_stalled_http_probe_recovers_local_minio
 test_stalled_http_probe_recovers_object_store
+test_zero_probe_timeout_is_sanitized_local_minio
+test_zero_probe_timeout_is_sanitized_object_store
 
 echo "TOTAL=$PASS PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

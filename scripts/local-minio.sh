@@ -56,6 +56,36 @@ MINIO_HEALTH_CONNECT_TIMEOUT_S="${MINIO_HEALTH_CONNECT_TIMEOUT_S:-2}"
 # Cap for one-shot probes (reuse checks, status). Retry loops pass their
 # remaining budget explicitly instead of using this default.
 MINIO_HEALTH_PROBE_TIMEOUT_S="${MINIO_HEALTH_PROBE_TIMEOUT_S:-5}"
+# curl treats --max-time 0 as "no limit", so every knob must be a positive
+# integer or the bounded-probe contract silently breaks. Invalid values fall
+# back to the defaults instead.
+positive_int() {
+  case "${1:-}" in
+    '' | *[!0-9]*) return 1 ;;
+    *) [ "$1" -ge 1 ] ;;
+  esac
+}
+while :; do
+  if positive_int "$MINIO_HEALTH_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_TIMEOUT_S='$MINIO_HEALTH_TIMEOUT_S' is not a positive integer; using 40" >&2
+    MINIO_HEALTH_TIMEOUT_S=40
+  fi
+  if positive_int "$MINIO_HEALTH_CONNECT_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_CONNECT_TIMEOUT_S='$MINIO_HEALTH_CONNECT_TIMEOUT_S' is not a positive integer; using 2" >&2
+    MINIO_HEALTH_CONNECT_TIMEOUT_S=2
+  fi
+  if positive_int "$MINIO_HEALTH_PROBE_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_PROBE_TIMEOUT_S='$MINIO_HEALTH_PROBE_TIMEOUT_S' is not a positive integer; using 5" >&2
+    MINIO_HEALTH_PROBE_TIMEOUT_S=5
+  fi
+  break
+done
 
 HEALTH_HOST="$BIND"
 if [ "$BIND" = "0.0.0.0" ] || [ "$BIND" = "::" ] || [ "$BIND" = "[::]" ]; then

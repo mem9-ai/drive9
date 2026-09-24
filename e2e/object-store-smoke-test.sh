@@ -61,6 +61,36 @@ MINIO_HEALTH_CONNECT_TIMEOUT_S="${MINIO_HEALTH_CONNECT_TIMEOUT_S:-2}"
 # bounded probe — no retries — so a clean port costs nothing and a stalled
 # leftover server costs at most this many seconds.
 MINIO_HEALTH_PROBE_TIMEOUT_S="${MINIO_HEALTH_PROBE_TIMEOUT_S:-5}"
+# curl treats --max-time 0 as "no limit", so every knob must be a positive
+# integer or the bounded-probe contract silently breaks. Invalid values fall
+# back to the defaults instead.
+positive_int() {
+  case "${1:-}" in
+    '' | *[!0-9]*) return 1 ;;
+    *) [ "$1" -ge 1 ] ;;
+  esac
+}
+while :; do
+  if positive_int "$MINIO_HEALTH_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_TIMEOUT_S='$MINIO_HEALTH_TIMEOUT_S' is not a positive integer; using 40" >&2
+    MINIO_HEALTH_TIMEOUT_S=40
+  fi
+  if positive_int "$MINIO_HEALTH_CONNECT_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_CONNECT_TIMEOUT_S='$MINIO_HEALTH_CONNECT_TIMEOUT_S' is not a positive integer; using 2" >&2
+    MINIO_HEALTH_CONNECT_TIMEOUT_S=2
+  fi
+  if positive_int "$MINIO_HEALTH_PROBE_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_PROBE_TIMEOUT_S='$MINIO_HEALTH_PROBE_TIMEOUT_S' is not a positive integer; using 5" >&2
+    MINIO_HEALTH_PROBE_TIMEOUT_S=5
+  fi
+  break
+done
 
 check_eq() {
   local desc="$1" got="$2" want="$3"
