@@ -812,9 +812,11 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 	oldSize := sf.size
 	sf.size = newSize
 	s.resizeWrittenLocked(sf, newSize)
-	if newSize == 0 || sf.writtenBytes == newSize || sf.baseRev != 0 || sf.localNew {
+	if newSize == 0 {
 		sf.baseRev = baseRev
 		sf.localNew = baseRev == 0
+	} else if baseRev != 0 && (sf.writtenBytes == newSize || sf.baseRev != 0 || sf.localNew) {
+		sf.baseRev = baseRev
 	}
 	s.bumpWriteGenLocked(remotePath)
 	s.mu.Unlock()

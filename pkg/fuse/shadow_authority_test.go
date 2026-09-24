@@ -332,3 +332,36 @@ func TestLegacyWriteBackMigrationPreservesNewerPending(t *testing.T) {
 		t.Fatalf("newer pending=%q/%v", data, err)
 	}
 }
+
+func TestShadowPartialMutationWithoutRevisionKeepsKnownBase(t *testing.T) {
+	for _, extents := range []bool{false, true} {
+		t.Run(fmt.Sprint(extents), func(t *testing.T) {
+			s, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			const path = "/known"
+			if err := s.WriteFull(path, []byte("contents"), 7); err != nil {
+				t.Fatal(err)
+			}
+			if extents {
+				wb := NewWriteBuffer(path, 0, 4)
+				wb.totalSize = 8
+				if _, err := wb.Write(0, []byte("xy")); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.WriteExtents(path, wb, 0); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if _, err := s.WriteAt(path, 0, []byte("xy"), 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := s.BaseRev(path); got != 7 {
+				t.Fatalf("known base=%d, want 7", got)
+			}
+		})
+	}
+}
