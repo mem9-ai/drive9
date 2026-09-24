@@ -25,5 +25,4 @@ The background commit queue uses the same capability gate for batch mode fields.
 Without support, it batches content only and applies pending permissions through
 the ordinary chmod endpoint; a denied chmod remains an error and retains staging.
 For active tenants, servers advertise this capability from the serving backend's
-inline support, including DB-only db9 deployments. Provisioning and suspended
-tenants use the provider default; capability support does not imply readiness. Multipart/S3 uploads and the durability contract are unchanged.
+inline support, including DB-only db9 deployments. Non-active tenants use the provider default; capability support does not imply readiness. Multipart/S3 uploads and the durability contract are unchanged.
