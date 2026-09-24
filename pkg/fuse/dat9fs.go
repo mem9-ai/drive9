@@ -478,8 +478,9 @@ func (fs *Dat9FS) warmInlineThreshold(ctx context.Context) {
 }
 
 type dirtyInodeState struct {
-	size int64
-	seq  uint64
+	size            int64
+	seq             uint64
+	visibleTruncate bool
 }
 
 type inodeMutationState struct {
@@ -1326,6 +1327,9 @@ func (fs *Dat9FS) openFlagsForHandle(fh *FileHandle) uint32 {
 	if fs.kernelCacheBypassActive(fh) {
 		return gofuse.FOPEN_DIRECT_IO
 	}
+	if _, pending := fs.pendingFtruncateSeq(fh.Ino); pending {
+		return gofuse.FOPEN_DIRECT_IO
+	}
 	return flags
 }
 
@@ -1479,6 +1483,22 @@ func (fs *Dat9FS) dirtyHandleSize(ino uint64) (int64, bool) {
 	return state.size, true
 }
 
+func (fs *Dat9FS) pendingFtruncateSeq(ino uint64) (uint64, bool) {
+	fs.dirtyMu.Lock()
+	defer fs.dirtyMu.Unlock()
+	state, ok := fs.dirtyInodes[ino]
+	return state.seq, ok && state.visibleTruncate
+}
+
+func (fs *Dat9FS) markVisibleFtruncate(ino uint64) {
+	fs.dirtyMu.Lock()
+	defer fs.dirtyMu.Unlock()
+	if state, ok := fs.dirtyInodes[ino]; ok {
+		state.visibleTruncate = true
+		fs.dirtyInodes[ino] = state
+	}
+}
+
 func (fs *Dat9FS) markDirtySize(ino uint64, size int64) uint64 {
 	return fs.markDirtySizeOptions(ino, size, true)
 }
@@ -1507,7 +1527,8 @@ func (fs *Dat9FS) markDirtySizeOptions(ino uint64, size int64, clearLocalTimes b
 
 	fs.dirtySeq++
 	seq := fs.dirtySeq
-	fs.dirtyInodes[ino] = dirtyInodeState{size: size, seq: seq}
+	previous := fs.dirtyInodes[ino]
+	fs.dirtyInodes[ino] = dirtyInodeState{size: size, seq: seq, visibleTruncate: previous.visibleTruncate}
 	if fs.gvisorCompatibilityEnabled() {
 		if fs.mutationInodes == nil {
 			fs.mutationInodes = make(map[uint64]inodeMutationState)
@@ -9365,6 +9386,10 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
 				}
+				if !isSQLiteDirectIOPath(fh.Path) {
+					fh.Dirty.visibleTruncate = true
+					fs.markVisibleFtruncate(fh.Ino)
+				}
 				publishTruncate := newSize == 0 && isSQLitePersistentJournalPath(entry.Path) &&
 					!entry.Unlinked && !fh.Unlinked && !fh.UnlinkedSnapshot && fh.UnlinkedData == nil
 				truncateSeq := fh.DirtySeq
@@ -12868,6 +12893,21 @@ readHandleState:
 		bytesRead = n
 		return gofuse.ReadResultData(result), gofuse.OK
 	}
+	if !fh.Unlinked && !fh.UnlinkedSnapshot && fh.UnlinkedData == nil && !isSQLiteDirectIOPath(fh.Path) {
+		readerPath := fh.Path
+		readerSeq := fh.DirtySeq
+		readerMarked := fh.Dirty != nil && fh.Dirty.visibleTruncate
+		fh.Unlock()
+		if data, n, ok, st := fs.readPendingFtruncateVisibleRange(fh, readerPath, readerSeq, readerMarked, int64(input.Offset), input.Size); ok || st != gofuse.OK {
+			source = "pending-ftruncate"
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
+		fh.Lock()
+	}
 	fs.refreshCleanCommittedRevisionForHandleLocked(fh)
 	appendEligible := !appendChecked && !fh.Unlinked && fh.Layer != PathLayerGitWorkspace &&
 		(fh.Dirty == nil || (fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts())) &&
@@ -13775,7 +13815,7 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 		if fh.Dirty.HasDirtyParts() {
 			if restoreDirtySeq != 0 {
 				fh.DirtySeq = restoreDirtySeq
-				fs.restoreDirtySize(fh.Ino, restoreDirtySeq, fh.Dirty.Size())
+				fs.restoreDirtySize(fh.Ino, restoreDirtySeq, fh.Dirty.Size(), fh.Dirty.visibleTruncate)
 			} else {
 				fh.DirtySeq = fs.markDirtySizeRestore(fh.Ino, fh.Dirty.Size())
 			}
@@ -13790,12 +13830,12 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 	}
 }
 
-func (fs *Dat9FS) restoreDirtySize(ino, seq uint64, size int64) {
+func (fs *Dat9FS) restoreDirtySize(ino, seq uint64, size int64, visibleTruncate bool) {
 	if fs == nil || seq == 0 {
 		return
 	}
 	fs.dirtyMu.Lock()
-	fs.dirtyInodes[ino] = dirtyInodeState{size: size, seq: seq}
+	fs.dirtyInodes[ino] = dirtyInodeState{size: size, seq: seq, visibleTruncate: visibleTruncate}
 	fs.dirtyMu.Unlock()
 }
 
