@@ -13768,42 +13768,56 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		return 0, gofuse.Status(syscall.EFBIG)
 	}
 
-	// ShadowSpill: write shadow FIRST, before Dirty. If shadow fails, return
-	// EIO without touching Dirty — OnPartFull may evict the part, so writing
-	// Dirty first could lose data if shadow then fails.
-	// Restore evicted Dirty parts before mutating shadow so a restore failure
-	// cannot leave authoritative staging bytes from a Write the caller saw fail.
-	if fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil && fh.Dirty != nil {
+	// Write shadow before Dirty for both spill and write-through handles, so a
+	// quota rejection cannot leave rejected bytes in the in-memory read source.
+	// Restore lazy/evicted parts first so Dirty.Write cannot fail loading them
+	// after the authoritative shadow has already changed.
+	if fh.ShadowReady && fs.shadowStore != nil && (fh.ShadowSpill || fh.Dirty.LoadPart != nil || fh.Dirty.RestorePart != nil) {
 		if err := fh.Dirty.EnsurePartsForWrite(writeOffset, writeLen); err != nil {
 			source = "dirty-restore-error"
 			return 0, gofuse.EIO
 		}
 	}
-	if fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
+	fs.appendLogCaptureSQLiteWALPreWriteLocked(fh, writeOffset, writeLen)
+	if fh.ShadowReady && fs.shadowStore != nil {
 		shadowStart := time.Now()
+		source = "shadow-through"
+		if fh.ShadowSpill {
+			source = "shadow-spill"
+		}
 		unlockShadowWrite := fs.lockHandleRemoteCommitPathLocked(fh)
-		_, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev)
-		if err == nil {
+		shadowWritten, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev)
+		if err == nil || shadowWritten > 0 {
 			fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
 		}
 		unlockShadowWrite()
 		if err != nil {
-			if errors.Is(err, syscall.ENOSPC) {
-				source = "shadow-spill-nospace"
+			if shadowWritten > 0 {
+				// POSIX writes report partial progress as a successful short
+				// write. Keep Dirty in step with bytes already in the shadow;
+				// the caller can retry the remainder.
+				data = data[:shadowWritten]
+				source += "-partial"
+			} else if errors.Is(err, syscall.ENOSPC) {
+				source += "-nospace"
 				return 0, gofuse.Status(syscall.ENOSPC)
+			} else {
+				safeLogPrintf("shadow write failed for %s: %v", fh.Path, err)
+				source += "-error"
+				if fh.ShadowSpill {
+					return 0, gofuse.EIO
+				}
+				fs.shadowStore.Remove(fh.Path)
+				fh.ShadowReady = false
+				fh.ShadowStageGen = 0
 			}
-			safeLogPrintf("shadow write failed for ShadowSpill %s: %v", fh.Path, err)
-			source = "shadow-spill-error"
-			return 0, gofuse.EIO
 		}
 		if fs.debugEnabled() && time.Since(shadowStart) >= fuseDebugSlowOpThreshold {
-			fs.debugf("write shadow-spill done path=%s off=%d size=%d dur=%s", fh.Path, input.Offset, len(data), time.Since(shadowStart))
+			fs.debugf("write %s done path=%s off=%d size=%d dur=%s", source, fh.Path, input.Offset, len(data), time.Since(shadowStart))
 		}
-		source = "shadow-spill"
 	}
 
 	preWriteSize := fh.Dirty.Size()
-	fs.appendLogCaptureSQLiteWALPreWriteLocked(fh, writeOffset, int64(len(data)))
 	n, err := fh.Dirty.Write(writeOffset, data)
 	if err != nil {
 		source = "dirty-write-error"
@@ -13818,34 +13832,6 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 	written = n
 
-	// Non-ShadowSpill: write-through to shadow after Dirty (best-effort for
-	// I/O errors, but ENOSPC from quota guard is propagated to the caller so
-	// write-back disk protection is enforced).
-	if !fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
-		shadowStart := time.Now()
-		unlockShadowWrite := fs.lockHandleRemoteCommitPathLocked(fh)
-		_, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev)
-		if err == nil {
-			fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
-		}
-		unlockShadowWrite()
-		if err != nil {
-			if errors.Is(err, syscall.ENOSPC) {
-				source = "shadow-through-nospace"
-				return 0, gofuse.Status(syscall.ENOSPC)
-			}
-			safeLogPrintf("shadow write-through failed for %s: %v", fh.Path, err)
-			fs.shadowStore.Remove(fh.Path)
-			fh.ShadowReady = false
-			fh.ShadowStageGen = 0
-			source = "shadow-through-error"
-		} else {
-			source = "shadow-through"
-		}
-		if fs.debugEnabled() && time.Since(shadowStart) >= fuseDebugSlowOpThreshold {
-			fs.debugf("write shadow-through done path=%s off=%d size=%d dur=%s", fh.Path, input.Offset, len(data), time.Since(shadowStart))
-		}
-	}
 	if source == "start" || source == "new-dirty-buffer" {
 		source = "dirty-buffer"
 	}

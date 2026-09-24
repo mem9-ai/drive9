@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,8 @@ import (
 	"io"
 	"slices"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // pathCommitLandmark is the last exact snapshot this queue itself landed for
@@ -304,8 +307,18 @@ func (cq *CommitQueue) maybeRebaseGrownPayloadOntoWatermark(ctx context.Context,
 }
 
 func (cq *CommitQueue) readRemoteSnapshot(parent context.Context, path string) (rev, size int64, body []byte, err error) {
+	st, body, err := cq.readRemoteSnapshotStat(parent, path)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	return st.Revision, st.Size, body, nil
+}
+
+// readRemoteSnapshotStat is readRemoteSnapshot with the stat the body was read
+// from, for callers that need more than the revision (mode, for instance).
+func (cq *CommitQueue) readRemoteSnapshotStat(parent context.Context, path string) (*client.StatResult, []byte, error) {
 	if cq == nil || cq.client == nil || path == "" {
-		return 0, 0, nil, fmt.Errorf("missing remote snapshot source")
+		return nil, nil, fmt.Errorf("missing remote snapshot source")
 	}
 	if parent == nil {
 		parent = context.Background()
@@ -315,19 +328,22 @@ func (cq *CommitQueue) readRemoteSnapshot(parent context.Context, path string) (
 	apiPath := cq.remotePath(path)
 	st, err := cq.client.StatCtx(ctx, apiPath)
 	if err != nil {
-		return 0, 0, nil, err
+		return nil, nil, err
 	}
 	if st == nil || st.Size < 0 || st.Size > maxLandedPayloadBytes {
-		return 0, 0, nil, fmt.Errorf("remote snapshot exceeds lineage proof limit")
+		return nil, nil, fmt.Errorf("remote snapshot exceeds lineage proof limit")
 	}
 	// Bound the response even if the remote object grows after Stat.
 	reader, err := cq.client.ReadStreamRange(ctx, apiPath, 0, maxLandedPayloadBytes+1)
 	if err != nil {
-		return 0, 0, nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = reader.Close() }()
-	body, err = io.ReadAll(io.LimitReader(reader, maxLandedPayloadBytes+1))
-	return st.Revision, st.Size, body, err
+	body, err := io.ReadAll(io.LimitReader(reader, maxLandedPayloadBytes+1))
+	if err != nil {
+		return nil, nil, err
+	}
+	return st, body, nil
 }
 
 func landedIdentityMatches(proof pathCommitLandmark, serverRev, serverSize int64, serverBody []byte) bool {
@@ -338,6 +354,136 @@ func landedIdentityMatches(proof pathCommitLandmark, serverRev, serverSize int64
 		return false
 	}
 	return payloadChecksum(serverBody) == proof.checksum
+}
+
+// resolveStalePayloadAsIdempotent acknowledges a queued entry that the
+// preflight rejected as stale while its staged bytes are exactly what is
+// already durable at that path.
+//
+// Two upload paths can carry the same bytes for one path: the direct-PUT path
+// on Release commits the file first, and the queued entry — staged before that
+// commit and still carrying base revision 0 — is then rejected by
+// validateEntryPayloadFreshCtx because its base revision is older than the
+// path's durable watermark. That is a redundant upload, not a conflict:
+// reporting it as one marks a fully durable file PendingConflict and emits a
+// conflict event for a path no other writer touched. The preflight fails
+// before any PUT, so the 409 auto-resolve path — the only other place that
+// compares payload bytes with the durable image — never runs.
+//
+// The comparison is the proof, and it has to be a proof of the whole entry,
+// not just of its bytes:
+//
+//   - The entry's staging generation must still be active, so a newer
+//     same-path write cannot be answered for by superseded bytes (this also
+//     covers an already-bound payload from an earlier attempt).
+//   - The bytes must equal the durable image, and the revision that image was
+//     read from must still be current afterwards.
+//   - If the entry carries a mode to apply, the durable file must already
+//     carry it; otherwise a genuinely newer writer landed the same bytes with
+//     different permissions and this entry must not overwrite them.
+//
+// Every ambiguous case (payload unbound, image too large to compare, remote
+// read failure, changed revision, mode mismatch, cancellation) fails closed
+// and leaves the entry on the terminal path. Returns (false, nil) when the
+// caller must continue with its terminal handling, and (true, err) when the
+// entry was consumed — with err non-nil if its post-commit bookkeeping (such
+// as the pending chmod) could not be completed.
+func (cq *CommitQueue) resolveStalePayloadAsIdempotent(ctx context.Context, entry *CommitEntry) (bool, error) {
+	if cq == nil || entry == nil || cq.shadows == nil {
+		return false, nil
+	}
+	// Layer mounts upload through layer endpoints; Stat/Read here would
+	// compare against the base FS namespace, where the entry's bytes may not
+	// (and need not) appear. Keep layer rejections terminal, matching
+	// tryAutoResolveConflict.
+	if cq.layerRefSnapshot() != "" {
+		return false, nil
+	}
+	// ShadowSpill payloads stream from the shadow file instead of being held
+	// in memory, so the whole-payload comparison below does not apply.
+	if entry.ShadowSpill {
+		return false, nil
+	}
+	// A replaced generation means a newer writer superseded this entry: its
+	// bytes may still match the remote by coincidence, but consuming this
+	// entry would run success bookkeeping for superseded state.
+	if entry.ShadowGen != 0 {
+		if active := cq.shadows.ActiveGeneration(entry.Path); active != entry.ShadowGen {
+			return false, nil
+		}
+	}
+	local, err := cq.readEntryPayloadRaw(entry)
+	if err != nil {
+		return false, nil
+	}
+	if int64(len(local)) > maxLandedPayloadBytes {
+		return false, nil
+	}
+	// The entry's own size is part of the claim being proved. Corrupt or stale
+	// queue metadata whose Size disagrees with the staged bytes must not be
+	// consumed here: the success tail records that size in the landed proof and
+	// writes it to the inode and dir cache while deleting the only local
+	// pending/shadow copy, so accepting it would publish a wrong size and
+	// destroy the data that could correct it.
+	if entry.Size != int64(len(local)) {
+		return false, nil
+	}
+	if cq.isEntryCanceled(entry) || (ctx != nil && ctx.Err() != nil) {
+		return false, nil
+	}
+	stat, body, err := cq.readRemoteSnapshotStat(ctx, entry.Path)
+	if err != nil || stat == nil {
+		return false, nil
+	}
+	if stat.Size != int64(len(local)) || !bytes.Equal(local, body) {
+		return false, nil
+	}
+	// The read carries no revision condition, so a same-size write between the
+	// Stat and the read could have returned newer bytes while this entry would
+	// record the older revision. Require the revision to be unchanged.
+	//
+	// A pending mode is part of the entry's intent, so it has to be part of
+	// the proof: the same bytes with different permissions is a different
+	// writer's outcome, and applying this entry's mode would overwrite it.
+	// Compute the expectation once and re-verify it on the confirmation stat
+	// below, because a chmod does not advance the content revision: a peer can
+	// change the durable mode mid-proof and leave the revision identical, so
+	// checking the mode only on the first stat would accept an entry whose mode
+	// no longer matches.
+	remoteModeApplied := false
+	modeKnown := false
+	if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
+		if !stat.HasMode || stat.Mode&posixPermissionModeMask != entry.Mode&posixPermissionModeMask {
+			return false, nil
+		}
+		// The durable mode already satisfies this entry; skip the redundant
+		// chmod rather than issue one for metadata the server already has.
+		remoteModeApplied = true
+		modeKnown = true
+	}
+	confirmCtx, confirmCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	confirm, cerr := cq.client.StatCtx(confirmCtx, cq.remotePath(entry.Path))
+	confirmCancel()
+	if cerr != nil || confirm == nil || confirm.Revision != stat.Revision {
+		return false, nil
+	}
+	if modeKnown {
+		want := entry.Mode & posixPermissionModeMask
+		if !confirm.HasMode || confirm.Mode&posixPermissionModeMask != want {
+			return false, nil
+		}
+	}
+	// Re-check after the round trips: an Unlink/Rmdir during them must win
+	// over turning this entry into a success.
+	if cq.isEntryCanceled(entry) || (ctx != nil && ctx.Err() != nil) {
+		return false, nil
+	}
+	safeLogPrintf("commit queue: stale payload for %s is byte-identical to durable rev %d; resolving the rejected entry as an already-landed duplicate", entry.Path, stat.Revision)
+	if err := cq.onCommitSuccessWithOptions(entry, stat.Revision, stat.Revision, remoteModeApplied); err != nil {
+		cq.onCommitPostUploadFailure(entry, err)
+		return true, err
+	}
+	return true, nil
 }
 
 // maybeRebaseGrownPayloadAgainstRemote authorizes the #896/#935 descendant
