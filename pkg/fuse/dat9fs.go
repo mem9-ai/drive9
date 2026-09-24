@@ -8282,7 +8282,7 @@ func (fs *Dat9FS) snapshotUnlinkedRemoteToShadow(ctx context.Context, p string, 
 	for i := 0; i < pinCount; i++ {
 		gen = fs.shadowStore.Pin(p)
 	}
-	fs.shadowStore.Remove(p)
+	fs.shadowStore.retireSnapshot(p)
 	return gen, nil
 }
 
@@ -12737,7 +12737,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.Prefetch.SetParallelRead(fs.parallelReadConcurrency(), fs.parallelReadBlockSize())
 			fh.Prefetch.SetPerfCounters(fs.perf)
 		}
-		fs.refreshReadOnlyShadowLocked(fh)
+		fs.openReadOnlyShadowLocked(fh)
 	}
 
 	out.Fh = fs.allocateFileHandle(fh)
@@ -12796,9 +12796,6 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	fh.Lock()
 	lockWait := time.Since(lockStart)
 	fs.applySQLiteZeroTruncateLocked(fh)
-	if fh.ShadowPinned {
-		fs.refreshReadOnlyShadowLocked(fh)
-	}
 	if fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 		fs.debugf("read lock wait path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, lockWait)
 	}

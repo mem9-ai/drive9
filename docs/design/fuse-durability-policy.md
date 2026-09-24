@@ -139,8 +139,10 @@ Strict close-sync `Flush` and `Release` shadow uploads omit local fsync only
 when the content generation is known and no live pending-index or write-back
 metadata references the path. Generation fencing pins the source through remote
 acknowledgement. Only Flush/Release request this optimization from the shared
-uploader; generic shadow uploads for explicit fsync and link-source synchronization
-retain the local barrier, including the append-log fallback into that uploader.
+uploader. Explicit fsync and link-source synchronization retain the local
+barrier, including their append-log fallbacks into the generic uploader.
+Foreground close-sync Flush/Release fallbacks remain eligible for remote-only
+durability under the same generation and pending-metadata guards.
 Failed uploads retain dirty state for an in-process retry; unacknowledged shadow
 bytes are not guaranteed to survive a machine crash. Explicit strict `fsync(2)`
 shadow uploads deliberately retain local sync, as do writeback, recovery, staged
@@ -150,15 +152,33 @@ frames. Recovery of historical frames retains its recorded revision and existing
 CAS checks; this optimization does not add journal commit markers or retire them.
 
 For configured append-log paths and paths with a locally observed remote
-commit, read-only `Open` and `Read` share a checked shadow-pin path. Resident caches must have a known base revision at least as new
-as the handle, inode and locally observed committed revision. Existing pins are
-revalidated, and rejected/ordinary-commit-retired pins can acquire a fresh local
-cache on a later read. Raw path reads cannot bypass that check. Explicitly
-retired WAL reset snapshots and unlinked snapshots keep their existing lifetime;
-durable pending metadata remains an independent authority for staged bytes.
-Minting a recovered shadow's content-generation token does not certify its
-revision: the recovery queue takes its CAS base from pending metadata instead.
-Read freshness does not require best-effort sibling-lock-based cache eviction.
+commit, read-only `Open` and `Read` share a checked shadow-pin path. Resident
+caches must have a base revision at least as new as the handle, inode and locally
+observed commit. Locally initialized new-file staging at revision zero is also
+readable while no committed revision is known; unverified recovered bytes do not
+get that authority merely by loading or minting a generation token.
+
+Retirement has an explicit reason. Ordinary cleanup invalidates future reads
+from that generation, even when the upload returned no revision. Cleanup alone
+does not prove that the retired shadow matches the uploaded image, so it never
+labels those bytes with a committed revision. Existing readers repin a current
+source or use the remote/read cache. Explicit WAL reset and anonymous inode
+snapshots (including rename-overwrite) keep their existing lifetime.
+
+Pending metadata is deliberately an independent read authority for the current
+staged image and may override a newer known remote revision while local changes
+await publication. It never revives an invalidated retired generation. Recovery
+uploads still take their CAS base from pending metadata.
+
+`Read` checks its shadow pin once at the shadow-read branch. Checked retries
+inspect resident state only: no path lock, disk lookup or unlink on a cache miss.
+`Open` separately discards disk-only restart orphans when no pending metadata
+authorizes them. A newly installed resident image remains discoverable even if
+its revision has not changed. Raw path reads cannot bypass the checked pin, and
+freshness does not rely on best-effort sibling-lock-based cache eviction.
+
+The next lifecycle refactor is tracked in
+[Shadow claim encapsulation](fuse-shadow-claim-lifecycle.md).
 
 `write-sync` can be dramatically slower for normal buffered writers because a
 single logical file copy may be split into many FUSE write requests. It is

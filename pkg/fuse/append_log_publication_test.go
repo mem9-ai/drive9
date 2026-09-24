@@ -213,7 +213,7 @@ func TestAppendLogRetiredPinPreservesUnlinkedSnapshot(t *testing.T) {
 		Unlinked: true, UnlinkedSnapshot: true, UnlinkedData: []byte("anonymous")}
 	id := fs.allocateFileHandle(reader)
 	defer fs.deleteFileHandle(id, reader)
-	shadow.removeAfterAppendLogCommit(fh.Path, 6)
+	shadow.Remove(fh.Path)
 	got, status, err := readDat9FSTestRange(fs, fh.Ino, id, 0, 9)
 	if err != nil || status != gofuse.OK || string(got) != "anonymous" || reader.ShadowGen != gen {
 		t.Fatalf("unlinked snapshot changed: %q/%d/%v gen=%d", got, status, err, reader.ShadowGen)
@@ -333,7 +333,7 @@ func TestAppendLogReaderRepinsFreshShadow(t *testing.T) {
 				t.Fatal("unexpected initial pin eligibility")
 			}
 			if retired {
-				shadow.removeAfterAppendLogCommit(path, 6)
+				shadow.Remove(path)
 			}
 			fs.recordCommittedRevisionWithSize(path, 6, 3)
 			fs.inodes.UpdateRevision(ino, 6)
