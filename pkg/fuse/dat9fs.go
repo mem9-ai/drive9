@@ -717,6 +717,27 @@ func fuseCtxWithTimeout(cancel <-chan struct{}, timeout time.Duration) (context.
 	return ctx, cf
 }
 
+// syncDataCommitContext derives the context for the synchronous remote data
+// commit behind close-sync/write-sync Flush, Fsync, and Release (and the git
+// checkpoint flushes on those paths). Under interrupt-safe mutations (the
+// default) the commit detaches from the FUSE cancel channel, for the same
+// reason as namespaceMutationCommitContext: the kernel waits uninterruptibly
+// for the FLUSH/FSYNC reply once the request is queued, and a durability
+// policy promises the commit before the syscall returns — aborting the
+// in-flight upload on an interrupt cannot roll it back, it only cancels a
+// commit that was about to succeed and surfaces EAGAIN to close(2)/fsync(2).
+// The timeout budget is unchanged. With --legacy-interruptible-mutations the
+// interruptible behavior is restored. gVisor compatibility takes precedence
+// over the legacy option (matching namespaceMutationCommitContext): a gVisor
+// mount always detaches, so the documented "no effect with --gvisor-compat"
+// contract holds for data commits too.
+func (fs *Dat9FS) syncDataCommitContext(cancel <-chan struct{}, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if fs.gvisorCompatibilityEnabled() || fs.interruptSafeMutationsEnabled() {
+		return context.WithTimeout(context.Background(), timeout)
+	}
+	return fuseCtxWithTimeout(cancel, timeout)
+}
+
 func detachedSharedReadCtx(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
 		timeout = fuseTimeout
@@ -2170,10 +2191,12 @@ func (fs *Dat9FS) gvisorCompatibilityEnabled() bool {
 	return fs != nil && fs.opts != nil && fs.opts.GVisorCompat
 }
 
-// interruptSafeMutationsEnabled reports whether the remote commit of an
-// idempotent namespace mutation should run detached from the FUSE cancel
-// channel (see namespaceMutationCommitContext). Enabled by default (a nil
-// receiver or nil options mean default-on, unlike
+// interruptSafeMutationsEnabled reports whether remote commits should run
+// detached from the FUSE cancel channel: the idempotent namespace mutations
+// (see namespaceMutationCommitContext) and the synchronous data commits
+// (write-sync Write, close-sync/write-sync/append-log Flush, Fsync, Release,
+// and the git checkpoint flushes; see syncDataCommitContext). Enabled by
+// default (a nil receiver or nil options mean default-on, unlike
 // gvisorCompatibilityEnabled); MountOptions.LegacyInterruptibleMutations
 // opts back into the legacy behavior where a FUSE interrupt cancels the
 // in-flight commit.
@@ -10162,7 +10185,13 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	if fs.writeBack != nil && fs.uploader != nil {
 		fs.uploader.WaitPath(srcP)
 		fs.uploader.WaitPath(dstP)
-		if err := fs.flushPendingWriteBack(ctx, srcP); err != nil {
+		// The write-back upload must land before the hardlink commit; keep it
+		// detached from the FUSE cancel channel like the hardlink commit so an
+		// interrupt cannot turn an about-to-succeed sync upload into EAGAIN.
+		pendingCtx, pendingCancel := fs.namespaceMutationCommitContext(ctx)
+		err := fs.flushPendingWriteBack(pendingCtx, srcP)
+		pendingCancel()
+		if err != nil {
 			return httpToFuseStatus(err)
 		}
 		if fs.hasPendingLocalState(dstP) {
@@ -11112,19 +11141,20 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 		commitPendingRenameNow := func() error {
 			if entry.ShadowSpill {
 				// Spill uploads need a size-aware budget and must not inherit
-				// the 30s FUSE request deadline. Non-spill commits keep the
-				// request context so git/small-file renames stay interruptible
-				// when gVisor compatibility is off.
+				// the 30s FUSE request deadline; the upload is always detached
+				// from the FUSE cancel channel.
 				commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout(entry.Size))
 				defer commitCancel()
 				return fs.commitQueue.commitNowPathLocked(commitCtx, entry)
 			}
-			// Non-spill commits keep the request context so git/small-file renames
-			// stay interruptible when gVisor compatibility is off. This is a
-			// pending-upload commit (data transfer), not a namespace mutation,
-			// so interrupt-safe mutation detachment deliberately does not
-			// apply here; only gVisor compatibility detaches it.
-			commitCtx, commitCancel := fs.gvisorOnlyCommitContext(ctx)
+			// Non-spill commits detach like namespace mutations (the spill
+			// branch above detaches unconditionally): under a durable-rename
+			// policy the kernel waits uninterruptibly for the rename reply
+			// while this commit makes the rename durable, so canceling it on
+			// a FUSE interrupt only surfaces EAGAIN for a rename whose data
+			// commit was about to succeed. Interrupt-safe detachment keeps
+			// the request's remaining deadline as the budget.
+			commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
 			defer commitCancel()
 			return fs.commitQueue.commitNowPathLocked(commitCtx, entry)
 		}
@@ -11459,14 +11489,22 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		// Slow path: either oldP is not pending, or it's a pending-overwrite
 		// (existing remote file edited locally). Flush both sides first, then
 		// do a server-side rename.
-		if err := fs.flushPendingWriteBack(ctx, oldP); err != nil {
+		// The write-back upload is part of rename's durability work: it must
+		// land before the server-side rename, so detach it from the FUSE
+		// cancel channel under interrupt-safe mutations like the rename
+		// commit itself.
+		pendingCtx, pendingCancel := fs.namespaceMutationCommitContext(ctx)
+		if err := fs.flushPendingWriteBack(pendingCtx, oldP); err != nil {
+			pendingCancel()
 			safeLogPrintf("rename: flush pending write-back for %s: %v", oldP, err)
 			return httpToFuseStatus(err)
 		}
-		if err := fs.flushPendingWriteBack(ctx, newP); err != nil {
+		if err := fs.flushPendingWriteBack(pendingCtx, newP); err != nil {
+			pendingCancel()
 			safeLogPrintf("rename: flush pending write-back for %s: %v", newP, err)
 			return httpToFuseStatus(err)
 		}
+		pendingCancel()
 	}
 
 	renameCtx, renameCancel := fs.namespaceMutationCommitContext(ctx)
@@ -13963,7 +14001,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	if fh.WritePolicy == WritePolicyWriteSync {
 		writeDirtySeq := fh.DirtySeq
 		size := fh.Dirty.Size()
-		writeCtx, writeCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+		writeCtx, writeCancel := fs.syncDataCommitContext(cancel, releaseTimeout(size))
 		defer writeCancel()
 		source = "write-sync"
 		var st gofuse.Status
@@ -14551,7 +14589,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		}
 		if gitState && localFileHandleOpenedWritable(fh) {
 			phase = "local-git-checkpoint"
-			checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+			checkpointCtx, checkpointCancel := fs.syncDataCommitContext(cancel, gitCheckpointTimeout)
 			defer checkpointCancel()
 			if err := fs.checkpointGitStateAfterLocalWrite(checkpointCtx, fh.Path, fs.syncMode == SyncStrict); err != nil {
 				return httpToFuseStatus(err)
@@ -14561,7 +14599,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	}
 	if fh.Layer == PathLayerGitWorkspace {
 		phase = "git-overlay"
-		flushCtx, flushCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+		flushCtx, flushCancel := fs.syncDataCommitContext(cancel, gitCheckpointTimeout)
 		defer flushCancel()
 		return fs.flushGitHandleLockedWithPolicy(flushCtx, fh, fs.syncMode == SyncStrict)
 	}
@@ -14585,7 +14623,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		if fh.Dirty != nil {
 			size = fh.Dirty.Size()
 		}
-		syncCtx, syncCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+		syncCtx, syncCancel := fs.syncDataCommitContext(cancel, releaseTimeout(size))
 		defer syncCancel()
 		return fs.syncHandleToRemoteLocked(syncCtx, fh, shadowUploadRemoteDurable)
 	}
@@ -14593,7 +14631,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() &&
 		(fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync) {
 		size := fh.Dirty.Size()
-		syncCtx, syncCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+		syncCtx, syncCancel := fs.syncDataCommitContext(cancel, releaseTimeout(size))
 		defer syncCancel()
 		phase = fh.WritePolicy.String()
 		return fs.syncHandleToRemoteLocked(syncCtx, fh, shadowUploadRemoteDurable)
@@ -14733,7 +14771,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		// ShadowSpill strict path: synchronous streaming upload from shadow.
 		if fh.ShadowSpill {
 			size := fh.Dirty.Size()
-			uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+			uploadCtx, uploadCancel := fs.syncDataCommitContext(cancel, releaseTimeout(size))
 			defer uploadCancel()
 			if fs.layerEnabled() {
 				phase = "large-shadowspill-layer-sync-upload"
@@ -14913,7 +14951,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		// a size-aware timeout. Must NOT debounce — debounce returns OK and
 		// uploads asynchronously, which would re-introduce the same bug.
 		size := fh.Dirty.Size()
-		flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+		flushCtx, flushCancel := fs.syncDataCommitContext(cancel, releaseTimeout(size))
 		defer flushCancel()
 		phase = "large-sync-flush"
 		fs.debugf("flush sync upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
@@ -14921,7 +14959,15 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	}
 
 	phase = "debounced-or-sync-flush"
-	return fs.flushHandleDebounced(ctx, fh, false)
+	// flushHandleDebounced resolves synchronously for layer mounts, SQLite
+	// persistent journals, buffers over the inline threshold, and disabled
+	// debounce — production paths whose upload must survive a FUSE interrupt
+	// like every other sync data commit. The deferred-callback path never
+	// reads this context (the callback owns its lifecycle), so the
+	// policy-aware context only changes the synchronous resolutions.
+	debounceCtx, debounceCancel := fs.syncDataCommitContext(cancel, fuseTimeout)
+	defer debounceCancel()
+	return fs.flushHandleDebounced(debounceCtx, fh, false)
 }
 
 func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status gofuse.Status) {
@@ -14934,7 +14980,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if fh.isExtent() {
 		return fs.extentFsync(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh, int(input.FsyncFlags))
 	}
-	ctx, cf := fuseCtx(cancel)
+	ctx, cf := fs.syncDataCommitContext(cancel, fuseTimeout)
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, fh.Path)
 
@@ -14989,7 +15035,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 		if localPathShouldCheckpointGitState(fh.Path) && localFileHandleOpenedWritable(fh) {
 			phase = "local-git-checkpoint"
-			checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+			checkpointCtx, checkpointCancel := fs.syncDataCommitContext(cancel, gitCheckpointTimeout)
 			defer checkpointCancel()
 			if err := fs.checkpointGitStateAfterLocalWrite(checkpointCtx, fh.Path, true); err != nil {
 				return httpToFuseStatus(err)
@@ -14999,7 +15045,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	}
 	if fh.Layer == PathLayerGitWorkspace {
 		phase = "git-overlay"
-		flushCtx, flushCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+		flushCtx, flushCancel := fs.syncDataCommitContext(cancel, gitCheckpointTimeout)
 		defer flushCancel()
 		return fs.flushGitHandleLockedWithPolicy(flushCtx, fh, fs.syncMode == SyncStrict)
 	}
@@ -15025,7 +15071,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 		recordSync := fh.IsNew || (fh.Dirty != nil && fh.Dirty.HasDirtyParts())
 		syncStart := time.Now()
-		syncCtx, syncCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+		syncCtx, syncCancel := fs.syncDataCommitContext(cancel, releaseTimeout(size))
 		defer syncCancel()
 		status, fullRewrite := fs.syncAppendLogHandleToRemoteLocked(syncCtx, fh, shadowUploadLocalDurable)
 		if recordSync && fs.perfEnabled() {
@@ -15138,7 +15184,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	// ShadowSpill strict: synchronous streaming upload from shadow.
 	if fh.ShadowSpill && fs.shadowStore != nil {
 		size := fh.Dirty.Size()
-		uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+		uploadCtx, uploadCancel := fs.syncDataCommitContext(cancel, releaseTimeout(size))
 		defer uploadCancel()
 		if fs.layerEnabled() {
 			phase = "shadowspill-layer-sync-upload"
@@ -15376,7 +15422,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
-		ctx, cf := fuseCtx(cancel)
+		ctx, cf := fs.syncDataCommitContext(cancel, fuseTimeout)
 		defer cf()
 		fs.observePathPolicyWithContext(ctx, fh.Path)
 		if fh.isExtent() {
@@ -15433,7 +15479,15 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			}
 
 			if flushStatus == gofuse.OK || retryPendingModeAfterContentCommit {
-				modeCtx, modeCancel := fuseCtxWithTimeout(cancel, 30*time.Second)
+				// The pending chmod completes the Release content commit, so
+				// it runs under the same interrupt-safe policy as the upload:
+				// a FUSE interrupt that arrived during the detached upload
+				// must not hand the chmod an already-canceled context and
+				// drop the mode from an otherwise complete commit. The
+				// non-layer route re-detaches inside
+				// namespaceMutationCommitContext anyway; the layer route
+				// (upsertLayerChmod) relies on this context being detached.
+				modeCtx, modeCancel := fs.syncDataCommitContext(cancel, 30*time.Second)
 				err := retryPostUploadMode(modeCtx, func() error {
 					return fs.applyRemoteMode(modeCtx, localPath, pendingMode)
 				})
@@ -15546,7 +15600,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			}
 			if flushStatus == gofuse.OK && gitState && openedWritable {
 				phase = "local-git-checkpoint"
-				checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+				checkpointCtx, checkpointCancel := fs.syncDataCommitContext(cancel, gitCheckpointTimeout)
 				err := fs.checkpointGitStateAfterLocalWrite(checkpointCtx, localPath, fs.syncMode == SyncStrict)
 				checkpointCancel()
 				if err != nil {
@@ -15567,7 +15621,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			if fh.Dirty != nil {
 				flushSize = fh.Dirty.Size()
 			}
-			flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(flushSize))
+			flushCtx, flushCancel := fs.syncDataCommitContext(cancel, releaseTimeout(flushSize))
 			flushStatus = fs.flushGitHandleLocked(flushCtx, fh)
 			flushCancel()
 			localFile := fh.LocalFile
@@ -15604,7 +15658,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			if fh.Dirty != nil {
 				size = fh.Dirty.Size()
 			}
-			flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+			flushCtx, flushCancel := fs.syncDataCommitContext(cancel, releaseTimeout(size))
 			flushStatus = fs.syncHandleToRemoteLocked(flushCtx, fh, shadowUploadRemoteDurable)
 			flushCancel()
 			// The content finalizer may have succeeded before chmod failed.
@@ -15634,7 +15688,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			}
 			if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
 				size := fh.Dirty.Size()
-				flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+				flushCtx, flushCancel := fs.syncDataCommitContext(cancel, releaseTimeout(size))
 				flushStart := time.Now()
 				fs.debugf("release write policy sync start path=%s size=%d policy=%s timeout=%s", fh.Path, size, fh.WritePolicy, releaseTimeout(size))
 				flushStatus = fs.syncHandleToRemoteLocked(flushCtx, fh, shadowUploadRemoteDurable)
@@ -15713,7 +15767,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					flushStatus = gofuse.EIO
 					safeLogPrintf("release: layer mode preserves ShadowSpill pending state for %s after enqueue failure", fh.Path)
 				} else {
-					uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+					uploadCtx, uploadCancel := fs.syncDataCommitContext(cancel, releaseTimeout(size))
 					phase = "shadowspill-sync-upload"
 					uploadStart := time.Now()
 					fs.debugf("release shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
@@ -15925,7 +15979,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		if fh.Dirty != nil {
 			flushSize = fh.Dirty.Size()
 		}
-		flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(flushSize))
+		flushCtx, flushCancel := fs.syncDataCommitContext(cancel, releaseTimeout(flushSize))
 		flushStart := time.Now()
 		fs.debugf("release sync flush start path=%s size=%d timeout=%s", fh.Path, flushSize, releaseTimeout(flushSize))
 		st := fs.flushHandle(flushCtx, fh)
