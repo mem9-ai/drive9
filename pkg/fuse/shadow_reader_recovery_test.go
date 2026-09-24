@@ -153,9 +153,11 @@ func TestReadOnlyShadowPendingDiskRecovery(t *testing.T) {
 				if err := os.WriteFile(fs.shadowStore.shadowPath(path), []byte("staged"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := fs.pendingIndex.PutShadowSpill(path, 6, PendingOverwrite, 6); err != nil {
+				gen, err := fs.pendingIndex.PutShadowSpill(path, 6, PendingOverwrite, 6)
+				if err != nil {
 					t.Fatal(err)
 				}
+				fs.pendingIndex.recoverShadowSource(path, gen, fs.shadowStore)
 			}
 			if !afterOpen {
 				stage()

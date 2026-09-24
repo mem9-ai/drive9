@@ -173,21 +173,23 @@ snapshots (including rename-overwrite) keep their existing lifetime. Unlinked
 handles read their captured generation directly; they do not use the ordinary
 path's source-selection policy.
 
-Pending metadata is deliberately an independent read authority for the current
-staged image and may override a newer known remote revision while local changes
-await publication. It never revives an invalidated retired generation. Recovery
-uploads still take their CAS base from pending metadata.
+PendingIndex metadata may override a newer known remote revision only for the
+exact shadow content generation bound when that metadata was published. Pin
+identity alone does not prove content identity: writes can change the same fd.
+The binding includes the ShadowStore instance and is never persisted. Unbound
+metadata falls back to ordinary revision validation; WriteBackCache metadata
+owns only its `.dat` payload and never authorizes `.shadow`. Recovery explicitly
+binds the selected payload after journal replay and legacy `.dat` migration,
+before requests are served. Recovery uploads retain the metadata's CAS base.
 
-`Read` checks its shadow pin once at the shadow-read branch. Without pending
-metadata, retries inspect resident state only: no path lock, disk lookup or
-unlink on a cache miss. Missing candidates skip inode access and write-back
-metadata locks; candidate validation reads only the inode revision instead of
-copying the inode and its paths. Pending-index recovery remains discoverable
-even when it is published after Open and can explicitly authorize a disk load.
-`Open` separately discards disk-only restart orphans when no pending metadata
-authorizes them. A newly installed resident image remains discoverable even if
-its revision has not changed. Raw path reads cannot bypass the checked pin, and
-freshness does not rely on best-effort sibling-lock-based cache eviction.
+`Read` checks its shadow pin once at the shadow-read branch using resident state
+only: no path lock, disk lookup or unlink on a cache miss. `Open` applies the
+same eligibility rules and separately discards unclaimed disk-only orphans.
+A newly published resident source remains discoverable even if its revision has
+not changed. Raw path reads cannot bypass the checked pin. Creating a new file
+detaches the old path incarnation so stale inode revisions cannot hide local
+staging; old open handles and surviving hardlink aliases retain their inode.
+
 
 The next lifecycle refactor is tracked in
 [Shadow claim encapsulation](fuse-shadow-claim-lifecycle.md).

@@ -5,8 +5,10 @@ func (fs *Dat9FS) openReadOnlyShadowLocked(fh *FileHandle) {
 	if fs.shadowStore == nil {
 		return
 	}
-	pending := fs.hasPendingMetadataState(fh.Path)
-	if !pending {
+	pending := fs.pendingIndex.shadowReadGeneration(fh.Path, fs.shadowStore)
+	// Unbound pending metadata protects recovery data from deletion, but
+	// cannot make that data readable. WriteBackCache only protects its .dat.
+	if pending == 0 && (fs.pendingIndex == nil || !fs.pendingIndex.HasPending(fh.Path)) {
 		fs.shadowStore.discardDiskOnly(fh.Path)
 	}
 	fs.refreshReadOnlyShadowWithPendingLocked(fh, pending)
@@ -21,19 +23,14 @@ func (fs *Dat9FS) refreshReadOnlyShadowLocked(fh *FileHandle) {
 		return
 	}
 	if !fh.ShadowPinned && !fs.shadowStore.hasResident(fh.Path) {
-		// A normal cache miss needs neither inode copying nor a write-back
-		// metadata path lock. Pending recovery published after Open may
-		// still authorize a disk-only image; this probe is memory-only.
-		if fs.pendingIndex == nil || !fs.pendingIndex.HasPending(fh.Path) {
-			return
-		}
+		return
 	}
-	fs.refreshReadOnlyShadowWithPendingLocked(fh, fs.hasPendingMetadataState(fh.Path))
+	fs.refreshReadOnlyShadowWithPendingLocked(fh, fs.pendingIndex.shadowReadGeneration(fh.Path, fs.shadowStore))
 }
 
-// Open checks pending recovery even without a resident candidate. Read can
-// skip that work on misses; both use exactly the same source-selection rules.
-func (fs *Dat9FS) refreshReadOnlyShadowWithPendingLocked(fh *FileHandle, pending bool) {
+// Open and Read use the same revision/content-generation eligibility check.
+// Recovery must publish a bound resident payload before it becomes readable.
+func (fs *Dat9FS) refreshReadOnlyShadowWithPendingLocked(fh *FileHandle, pending uint64) {
 	committedRevision := fs.latestCommittedRevision(fh.Path)
 	// Pending metadata deliberately exposes the current staged image even
 	// when its CAS base predates a known commit. It never validates a retired
@@ -60,13 +57,7 @@ func (fs *Dat9FS) refreshReadOnlyShadowWithPendingLocked(fh *FileHandle, pending
 	}
 	// A previously rejected or retired pin is retryable: a newer cache or
 	// pending writer may now have supplied a usable generation.
-	var gen uint64
-	var ok bool
-	if pending {
-		gen, ok = fs.shadowStore.PinIfExists(fh.Path)
-	} else {
-		gen, ok = fs.shadowStore.PinResident(fh.Path, minRevision)
-	}
+	gen, ok := fs.shadowStore.pinReadable(fh.Path, minRevision, pending)
 	if ok {
 		fh.ShadowGen, fh.ShadowPinned = gen, true
 	}

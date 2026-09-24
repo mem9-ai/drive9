@@ -210,10 +210,10 @@ func TestReadOnlyShadowPendingMetadataOwnsCurrentGeneration(t *testing.T) {
 	fs.shadowStore.Remove(path)
 	fs.recordCommittedRevisionWithSize(path, 3, 3)
 	fs.inodes.UpdateRevision(ino, 3)
-	if _, err := fs.pendingIndex.Put(path, 6, PendingOverwrite); err != nil {
+	if err := fs.shadowStore.WriteFull(path, []byte("staged"), 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := fs.shadowStore.WriteFull(path, []byte("staged"), 1); err != nil {
+	if _, err := fs.pendingIndex.Put(path, 6, PendingOverwrite); err != nil {
 		t.Fatal(err)
 	}
 	got, st, err := readDat9FSTestRange(fs, ino, out.Fh, 0, 20)
