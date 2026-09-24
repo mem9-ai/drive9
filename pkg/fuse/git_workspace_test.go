@@ -3407,63 +3407,24 @@ func TestGitignoreAwareGateFailsOpenWhenOracleUnavailable(t *testing.T) {
 	}
 }
 
-// TestGitWorkspaceGitDirStaysLocal covers `.git` routing: it is local-only
-// inside a loaded Git workspace even though it is not a default local-only
-// pattern, and remote-persistent outside one.
-func TestGitWorkspaceGitDirStaysLocal(t *testing.T) {
-	src := createGitRepoWithReadme(t, []byte("hello base\n"))
-	fixture := newGitWorkspaceFixture(t)
-	fixture.repoURL = src
-	fixture.headCommit = fuseGitOutputForTest(t, src, "rev-parse", "HEAD")
-	fixture.readmeObjectSHA = fuseGitOutputForTest(t, src, "hash-object", "README.md")
-	fixture.readmeSize = int64(len("hello base\n"))
-
-	localRoot := t.TempDir()
-	runFuseTestGit(t, "", "clone", "--no-checkout", src, filepath.Join(localRoot, "overlay", "repo"))
-
-	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
+// TestGitDirIsLocalOnlyByPattern pins why VCS metadata stays in the default
+// [local] list: `git clone --fast` writes the working `.git` before the
+// workspace row is registered, so `.git` must be local from the pattern alone,
+// with no workspace loaded and no gitignore gate.
+func TestGitDirIsLocalOnlyByPattern(t *testing.T) {
+	opts := &MountOptions{LocalRoot: t.TempDir(), Profile: MountProfileCodingAgent}
 	opts.setDefaults()
-	fs := NewDat9FS(fixture.client(), opts)
-	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
-		t.Fatalf("ensureGitWorkspaces: %v", err)
-	}
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
 
 	for _, path := range []string{"/repo/.git", "/repo/.git/config", "/repo/.git/objects/ab/cd"} {
 		if got := fs.observePathPolicy(path); got != PathLayerLocalOnly {
-			t.Errorf("workspace %q = %s, want local-only", path, got)
+			t.Errorf("%q = %s, want local-only", path, got)
 		}
 	}
-
-	// Without a loaded workspace, `.git` is remote-persistent.
-	plainOpts := &MountOptions{LocalRoot: t.TempDir(), Profile: MountProfileCodingAgent}
-	plainOpts.setDefaults()
-	plain := NewDat9FS(newTestClient("http://127.0.0.1"), plainOpts)
-	if got := plain.observePathPolicy("/repo/.git/config"); got != PathLayerRemotePersistent {
-		t.Errorf("non-workspace .git = %s, want remote persistent", got)
-	}
-}
-
-func TestPathHasGitDirSegment(t *testing.T) {
-	tests := []struct {
-		path string
-		want bool
-	}{
-		{path: "/repo/.git", want: true},
-		{path: "/repo/.git/", want: true},
-		{path: "/repo/.git/config", want: true},
-		{path: "/repo/.git/objects/ab/cd", want: true},
-		{path: "/.git", want: true},
-		// Segment-exact: these must not match.
-		{path: "/repo/.gitignore", want: false},
-		{path: "/repo/.gitattributes", want: false},
-		{path: "/repo/notes.git.txt", want: false},
-		{path: "/repo/git/config", want: false},
-		{path: "/repo/src/main.go", want: false},
-		{path: "", want: false},
-	}
-	for _, test := range tests {
-		if got := pathHasGitDirSegment(test.path); got != test.want {
-			t.Errorf("pathHasGitDirSegment(%q) = %t, want %t", test.path, got, test.want)
+	// Segment-exact: these are not VCS metadata.
+	for _, path := range []string{"/repo/.gitignore", "/repo/notes.git.txt"} {
+		if got := fs.observePathPolicy(path); got != PathLayerRemotePersistent {
+			t.Errorf("%q = %s, want remote persistent", path, got)
 		}
 	}
 }

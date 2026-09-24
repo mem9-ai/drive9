@@ -266,17 +266,18 @@ func TestArchiveProfileCodingAgentSkipsDefaults(t *testing.T) {
 		t.Fatalf("Archive: %v", err)
 	}
 	got := tarEntries(t, out)
-	// Archive applies the profile [local] patterns as plain excludes (without
-	// the FUSE gitignore-aware gate), so the default dependency/build patterns
-	// are skipped. `.git` is not a default pattern, so it is included.
+	// Archive applies the profile local-only patterns as plain excludes
+	// (both [local] and [local-gitignore-aware], since it has no gitignore
+	// oracle), so VCS metadata, dependencies, and build output are skipped.
+	// Other build/cache output such as dist/ and .cache/ is not a default.
 	for _, name := range got {
-		for _, bad := range []string{"node_modules", "target/"} {
+		for _, bad := range []string{"node_modules", "target/", ".git/"} {
 			if strings.Contains(name, bad) {
 				t.Fatalf("coding-agent profile should skip %q but found %q", bad, name)
 			}
 		}
 	}
-	for _, want := range []string{"proj/main.go", "proj/dist/bundle.js", "proj/.cache/foo", "proj/.git/HEAD"} {
+	for _, want := range []string{"proj/main.go", "proj/dist/bundle.js", "proj/.cache/foo"} {
 		if !contains(got, want) {
 			t.Fatalf("coding-agent profile should keep %q: %v", want, got)
 		}

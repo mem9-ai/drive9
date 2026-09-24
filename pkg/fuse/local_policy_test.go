@@ -16,15 +16,14 @@ func TestLocalPolicyCodingAgentDefaultsMatchGitSegmentExactly(t *testing.T) {
 		{path: "/repo/node_modules/react/index.js", want: PathLayerLocalOnly},
 		{path: "/repo/target/debug/app", want: PathLayerLocalOnly},
 		{path: "/repo/node_modules_extra/x.js", want: PathLayerRemotePersistent},
+		// Segment-exact VCS metadata.
+		{path: "/repo/.git", want: PathLayerLocalOnly},
+		{path: "/repo/.git/config", want: PathLayerLocalOnly},
+		{path: "/repo/.hg/store/data", want: PathLayerLocalOnly},
+		{path: "/repo/.svn/pristine/aa", want: PathLayerLocalOnly},
 		{path: "/repo/.gitignore", want: PathLayerRemotePersistent},
 		{path: "/repo/.gitattributes", want: PathLayerRemotePersistent},
 		{path: "/repo/notes.git.txt", want: PathLayerRemotePersistent},
-		// VCS metadata is no longer a default local-only pattern; `.git` is
-		// kept local only inside a Git workspace (handled at the fs layer).
-		{path: "/repo/.git", want: PathLayerRemotePersistent},
-		{path: "/repo/.git/config", want: PathLayerRemotePersistent},
-		{path: "/repo/.hg/store/data", want: PathLayerRemotePersistent},
-		{path: "/repo/.svn/pristine/aa", want: PathLayerRemotePersistent},
 	}
 
 	for _, test := range tests {
@@ -109,10 +108,10 @@ func TestLocalPolicyDefaultsDependencyAndTargetToLocalOnly(t *testing.T) {
 func TestLocalPolicyDefaultsLeaveOtherBuildOutputRemote(t *testing.T) {
 	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil, nil)
 
-	// The default pattern list is intentionally short: node_modules, .venv, and
-	// target are matched (and .venv/target only overlay when the gitignore-aware
-	// gate confirms them, which Classify does not apply). Everything else stays
-	// remote-persistent by default.
+	// The default lists are intentionally short: VCS metadata, node_modules,
+	// .venv, and target. Everything else stays remote-persistent by default.
+	// (Classify does not apply the gitignore gate; target lives on the gated
+	// list and is confirmed at the fs layer.)
 	for _, path := range []string{
 		"/repo/.pnpm-store/v3/files/pkg",
 		"/repo/.tox/py312/lib/python3.12/site-packages/x.py",

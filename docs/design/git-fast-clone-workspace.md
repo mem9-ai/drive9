@@ -101,8 +101,8 @@ Coding-agent local overlay policy
   - `[local]` (`--local-only`): overlaid unconditionally. Defaults to dependency trees `node_modules` and `.venv`, whose names unambiguously denote generated trees.
   - `[local-gitignore-aware]` (`--local-only-gitignore-aware`): overlaid only when the repository's own Git ignore rules also ignore the path. Defaults to Rust build output `target`, because `target` is a common directory name that is not always build output. See "Git-ignore policy" below.
 - Both lists name the trees whose file counts routinely overwhelm remote storage and are essentially never hand-edited.
-- Other build and cache output (`dist`, `build`, `.cache`, `coverage`, tool caches such as `__pycache__`/`.pytest_cache`, and so on) and VCS metadata (`.git`, `.hg`, `.svn`) are left remote-persistent by default. Projects that want a specific tree overlaid can add explicit `[local]` patterns (unconditional) or `[local-gitignore-aware]` patterns (repository-confirmed).
-- `.git` is the one structural exception: inside a loaded Git workspace the working `.git` is always local-only, independent of the pattern list and the gate. In an ordinary (non-workspace) repository `.git` is remote-persistent. See "`.git` routing" below.
+- Other build and cache output (`dist`, `build`, `.cache`, `coverage`, tool caches such as `__pycache__`/`.pytest_cache`, and so on) is left remote-persistent by default. Projects that want a specific tree overlaid can add explicit `[local]` patterns (unconditional) or `[local-gitignore-aware]` patterns (repository-confirmed).
+- VCS metadata (`.git`, `.hg`, `.svn`) stays in the `[local]` list and is overlaid unconditionally. `.git` must be covered by the pattern alone: `git clone --fast` writes the working `.git` before the workspace row is registered, so a workspace-scoped rule would miss that window and upload `.git` to the remote. See "`.git` routing" below.
 - These local-only paths are still merged into FUSE directory listings with tracked Git workspace entries, so generated directories under a tracked source directory remain visible to local build tools without being uploaded to Drive9.
 - Local-only dependency and generated-output files are a rebuildable performance layer. Their ordinary FUSE `Flush` path does not force `fsync`; it refreshes local inode metadata only. Explicit `Fsync` still syncs the local file.
 - Lightweight `.git` state is checkpointed asynchronously and coalesced per workspace. Foreground `Flush`, `Fsync`, `Release`, `Rename`, and `Unlink` on local `.git` files only perform the necessary local filesystem operation and schedule a checkpoint; `FlushAll`/unmount drains pending checkpoints.
@@ -119,9 +119,8 @@ Git-ignore policy
 
 `.git` routing
 
-- `.git` is not a default local-only pattern. It is overlaid only when the path is the working `.git` of a loaded Git workspace; that state is served from the local overlay and never uploaded.
-- This keeps a plain coding-agent mount of a remote tree from overlying every `.git` directory it happens to contain, while the fast-clone workspace keeps its local `.git` and its checkpoint semantics.
-- Because this runs for every remote-default path, it first rejects any path without a `.git` segment (segment-exact, so `.gitignore` does not match) before doing workspace routing. Only paths at or under a `.git` directory pay for arm-marker scans and liveness revalidation.
+- `**/.git/**` is a default `[local]` pattern, so the working `.git` is overlaid unconditionally from the first write. This matters because `git clone --fast` creates `.git` before the workspace is registered.
+- The state served from the overlay is still Git metadata: it is checkpointed (see below), not treated as durable project content.
 
 ## Clone Flow
 

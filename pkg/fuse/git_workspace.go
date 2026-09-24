@@ -39,7 +39,6 @@ const gitWorkspaceListBackoffMin = time.Second
 const gitWorkspaceListBackoffMax = 30 * time.Second
 const gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
 const gitWorkspaceModeFastBlobless = "fast-blobless"
-const gitDirSegment = ".git"
 const gitLocalObjectMaxBlobBytes int64 = 5 << 20
 const gitLocalObjectMaxPackBytes int64 = 256 << 20
 
@@ -1411,50 +1410,6 @@ func (fs *Dat9FS) gitIgnoredAncestorCached(rt *gitWorkspaceRuntime, rel string) 
 			return true
 		}
 		if ignored, ok := fs.git.ignoreCache[gitIgnoreCacheKey(rt, ancestor, false)]; ok && ignored {
-			return true
-		}
-	}
-	return false
-}
-
-// gitWorkspaceGitDirLocalOnly reports whether localPath is the working `.git`
-// of a loaded Git workspace, or lives inside it. That state is always local:
-// the workspace serves its working `.git` from the local overlay and never
-// uploads object databases. This is independent of the profile pattern list
-// and the gitignore-aware gate, so `.git` in an ordinary (non-workspace)
-// repository stays remote-persistent.
-func (fs *Dat9FS) gitWorkspaceGitDirLocalOnly(ctx context.Context, localPath string) bool {
-	if fs == nil || fs.opts == nil || !profileAllowsLocalPolicy(fs.opts.Profile) {
-		return false
-	}
-	if fs.git == nil || fs.localOverlay == nil {
-		return false
-	}
-	// Cheap necessary condition: working Git state only lives at or under a
-	// `.git` segment. This is called for every remote-default path, so the
-	// common case (no `.git` segment) is rejected before paying for workspace
-	// routing (arm-marker scan, liveness revalidation, workspace list walk).
-	if !pathHasGitDirSegment(localPath) {
-		return false
-	}
-	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
-	if !ok || rt == nil {
-		return false
-	}
-	return rel == ".git" || strings.HasPrefix(rel, ".git/")
-}
-
-// pathHasGitDirSegment reports whether localPath contains a path segment named
-// exactly ".git". Segment-exact matters: `.gitignore` and `notes.git.txt` must
-// not match.
-func pathHasGitDirSegment(localPath string) bool {
-	// Fast reject: most paths do not contain ".git" at all, which avoids the
-	// split allocation below.
-	if !strings.Contains(localPath, gitDirSegment) {
-		return false
-	}
-	for _, part := range strings.Split(localPath, "/") {
-		if part == gitDirSegment {
 			return true
 		}
 	}

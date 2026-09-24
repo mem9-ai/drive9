@@ -125,16 +125,25 @@ func validMountProfileName(profile string) bool {
 	return true
 }
 
-// defaultCodingAgentLocalOnlyPatterns are overlaid unconditionally. Only
-// dependency trees are listed: their names are unambiguous generated trees, so
-// there is no need to consult the repository. VCS metadata is deliberately
-// absent: `.git` state is kept local only inside a Git workspace, and is
-// remote-persistent elsewhere.
+// defaultCodingAgentLocalOnlyPatterns are overlaid unconditionally.
+//
+// VCS metadata must stay here. `git clone --fast` creates the working `.git`
+// before the workspace row is registered, so a workspace-scoped rule cannot see
+// it yet; without the pattern those `.git` writes would upload to the remote
+// before registration ever happens, and `.git` also drives the git-state
+// recovery refresh path. The `.git` state itself is still never durable content
+// — it is checkpointed, not treated as project files.
+//
+// Dependency trees are listed here too: their names unambiguously denote
+// generated trees, so there is no need to consult the repository.
 func defaultCodingAgentLocalOnlyPatterns(profile string) []string {
 	if profile != MountProfileCodingAgent {
 		return nil
 	}
 	return []string{
+		"**/.git/**",
+		"**/.hg/**",
+		"**/.svn/**",
 		"**/node_modules/**",
 		"**/.venv/**",
 	}
@@ -213,10 +222,6 @@ func (fs *Dat9FS) observePathPolicyWithHint(ctx context.Context, localPath strin
 			layer = PathLayerRemotePersistent
 			source = policyMatchRemoteDefault
 		}
-	}
-	if layer == PathLayerRemotePersistent && source == policyMatchRemoteDefault && fs.gitWorkspaceGitDirLocalOnly(ctx, localPath) {
-		layer = PathLayerLocalOnly
-		source = policyMatchLocalOnly
 	}
 	if fs.perfEnabled() {
 		fs.perf.recordLocalPolicy(source)

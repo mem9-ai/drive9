@@ -616,6 +616,9 @@ async function buildMatcher(client: Client, opts: ArchiveOptions): Promise<Match
 // ignores it). A bulk archive has no Git ignore oracle, so it applies the union
 // directly.
 export const codingAgentLocalOnly = [
+  "**/.git/**",
+  "**/.hg/**",
+  "**/.svn/**",
   "**/node_modules/**",
   "**/.venv/**",
   "**/target/**",

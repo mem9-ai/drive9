@@ -123,14 +123,6 @@ func TestLoadProfileConfigExtentIsNonePlusAllFilesExtent(t *testing.T) {
 	}
 }
 
-func TestBuiltinCodingAgentDefaultsOmitVCSMetadata(t *testing.T) {
-	for _, pattern := range builtinCodingAgentLocalOnlyPatterns() {
-		if strings.Contains(pattern, ".git") || strings.Contains(pattern, ".hg") || strings.Contains(pattern, ".svn") {
-			t.Fatalf("default local-only pattern %q should not reference VCS metadata", pattern)
-		}
-	}
-}
-
 func TestProfileLocalGitignoreAwareSectionRoundTrip(t *testing.T) {
 	writeTestProfile(t, "gated", "[local]\n**/node_modules/**\n[local-gitignore-aware]\n**/target/**\n")
 	cfg, err := loadProfileConfig("gated")
@@ -163,7 +155,7 @@ func TestBuiltinProfilesSeparateGatedPatterns(t *testing.T) {
 		if err != nil {
 			t.Fatalf("loadProfileConfig(%q): %v", name, err)
 		}
-		if !reflect.DeepEqual(cfg.LocalOnlyPatterns, []string{"**/node_modules/**", "**/.venv/**"}) {
+		if !reflect.DeepEqual(cfg.LocalOnlyPatterns, builtinCodingAgentLocalOnlyPatterns()) {
 			t.Fatalf("builtin %q LocalOnlyPatterns = %v", name, cfg.LocalOnlyPatterns)
 		}
 		if !reflect.DeepEqual(cfg.LocalGitignoreAwarePatterns, []string{"**/target/**"}) {

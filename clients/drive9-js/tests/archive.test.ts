@@ -150,12 +150,13 @@ describe("archive", () => {
     const stream = await client.archive("/proj", { profile: "coding-agent" });
     const names = readTarGz(await streamToBuffer(stream));
     expect(names).toContain("proj/main.go");
-    // Dependency and build-output trees are skipped by default; VCS metadata
-    // and other build output such as dist/ stay included.
+    // VCS metadata, dependency, and build-output trees are skipped by default;
+    // other build output such as dist/ stays included.
     expect(names).toContain("proj/dist/bundle.js");
-    expect(names).toContain("proj/.git/HEAD");
     for (const n of names) {
-      expect(n.includes("node_modules") || n.includes(".venv/") || n.includes("target/")).toBe(false);
+      expect(
+        n.includes("node_modules") || n.includes(".venv/") || n.includes("target/") || n.includes(".git/"),
+      ).toBe(false);
     }
   });
 
