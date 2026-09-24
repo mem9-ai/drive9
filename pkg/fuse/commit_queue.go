@@ -102,8 +102,13 @@ type CommitEntry struct {
 	cancelCommit                 context.CancelFunc
 	cancelUpload                 context.CancelFunc
 	mutationPublished            bool
-	payload                      []byte
-	payloadBound                 bool
+	// layerVersion is the authoritative tuple returned by a successful layer
+	// upload. It is published before the pending generation is marked clean so
+	// replay cannot replace that committed child-layer result with an older
+	// snapshot.
+	layerVersion layerEntryVersion
+	payload      []byte
+	payloadBound bool
 }
 
 func (entry *CommitEntry) payloadBaseRevision() int64 {
@@ -2371,6 +2376,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 }
 
 func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string) (int64, error) {
+	entry.layerVersion = layerEntryVersion{}
 	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return 0, err
 	}
@@ -2388,9 +2394,13 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 			return 0, fmt.Errorf("layer entry %s size mismatch: metadata=%d actual=%d", entry.Path, entry.Size, actualSize)
 		}
 		start := time.Now()
-		_, err = cq.client.UploadFSLayerFile(ctx, layerRef, apiPath, fd, actualSize, expectedRevision, entry.Mode, entry.HasMode)
+		serverEntry, uploadErr := cq.client.UploadFSLayerFile(ctx, layerRef, apiPath, fd, actualSize, expectedRevision, entry.Mode, entry.HasMode)
+		err = uploadErr
 		if cq.perf != nil {
 			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(actualSize))
+		}
+		if err == nil {
+			entry.layerVersion = layerVersion(serverEntry)
 		}
 		return 0, err
 	}
@@ -2417,9 +2427,13 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 		req.Mode = entry.Mode & 0o777
 	}
 	start := time.Now()
-	_, err = cq.client.UpsertFSLayerEntry(ctx, layerRef, req)
+	serverEntry, uploadErr := cq.client.UpsertFSLayerEntry(ctx, layerRef, req)
+	err = uploadErr
 	if cq.perf != nil {
 		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
+	}
+	if err == nil {
+		entry.layerVersion = layerVersion(serverEntry)
 	}
 	return 0, err
 }

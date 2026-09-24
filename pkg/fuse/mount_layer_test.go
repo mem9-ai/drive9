@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -194,11 +195,14 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 
 func TestRestoreLayerReplayDoesNotOverwriteNewerNamespaceMutation(t *testing.T) {
 	tests := []struct {
-		name        string
-		replay      client.FSLayerEntry
-		seed        func(*Dat9FS)
-		mutate      func(*Dat9FS) gofuse.Status
-		assertFinal func(*testing.T, *Dat9FS)
+		name            string
+		mountedLayerID  string
+		mutationLayerID string
+		mutationSeq     int64
+		replay          client.FSLayerEntry
+		seed            func(*Dat9FS)
+		mutate          func(*Dat9FS) gofuse.Status
+		assertFinal     func(*testing.T, *Dat9FS)
 	}{
 		{
 			name:   "mkdir-wins-over-stale-whiteout",
@@ -234,6 +238,42 @@ func TestRestoreLayerReplayDoesNotOverwriteNewerNamespaceMutation(t *testing.T) 
 				}
 			},
 		},
+		{
+			name:            "child-first-mkdir-wins-over-high-seq-parent-whiteout",
+			mountedLayerID:  "child-1",
+			mutationLayerID: "child-1",
+			mutationSeq:     1,
+			replay:          client.FSLayerEntry{LayerID: "parent-1", Path: "/repo/node", Op: "whiteout", Kind: "dir", EntrySeq: 100},
+			mutate: func(fs *Dat9FS) gofuse.Status {
+				return fs.Mkdir(nil, &gofuse.MkdirIn{InHeader: gofuse.InHeader{NodeId: 1}, Mode: 0o750}, "node", &gofuse.EntryOut{})
+			},
+			assertFinal: func(t *testing.T, fs *Dat9FS) {
+				if fs.isLayerWhiteout("/node") {
+					t.Fatal("high-sequence parent replay replaced first child-layer mkdir")
+				}
+				if mode, ok := fs.layerDirMode("/node"); !ok || mode != 0o750 {
+					t.Fatalf("final child-layer directory = (%#o, %t), want 0750 true", mode, ok)
+				}
+			},
+		},
+		{
+			name:            "child-first-symlink-wins-over-high-seq-parent-whiteout",
+			mountedLayerID:  "child-1",
+			mutationLayerID: "child-1",
+			mutationSeq:     1,
+			replay:          client.FSLayerEntry{LayerID: "parent-1", Path: "/repo/node", Op: "whiteout", Kind: "symlink", EntrySeq: 100},
+			mutate: func(fs *Dat9FS) gofuse.Status {
+				return fs.Symlink(nil, &gofuse.InHeader{NodeId: 1}, "target.txt", "node", &gofuse.EntryOut{})
+			},
+			assertFinal: func(t *testing.T, fs *Dat9FS) {
+				if fs.isLayerWhiteout("/node") {
+					t.Fatal("high-sequence parent replay replaced first child-layer symlink")
+				}
+				if target, _, ok := fs.layerSymlink("/node"); !ok || target != "target.txt" {
+					t.Fatalf("final child-layer symlink = (%q, %t), want target.txt true", target, ok)
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -246,20 +286,31 @@ func TestRestoreLayerReplayDoesNotOverwriteNewerNamespaceMutation(t *testing.T) 
 			}
 			t.Cleanup(func() { testHookAfterLayerReplayFetched = nil })
 
-			var mutationSeq int64 = 2
+			mountedLayerID := tc.mountedLayerID
+			if mountedLayerID == "" {
+				mountedLayerID = "layer-1"
+			}
+			mutationLayerID := tc.mutationLayerID
+			if mutationLayerID == "" {
+				mutationLayerID = mountedLayerID
+			}
+			mutationSeq := tc.mutationSeq
+			if mutationSeq == 0 {
+				mutationSeq = 2
+			}
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				switch {
-				case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/"+mountedLayerID+"/diff":
 					_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{tc.replay}})
-				case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries":
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/"+mountedLayerID+"/entries":
 					var req client.FSLayerEntryRequest
 					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 						t.Errorf("decode mutation: %v", err)
 						w.WriteHeader(http.StatusBadRequest)
 						return
 					}
-					_ = json.NewEncoder(w).Encode(client.FSLayerEntry{LayerID: "layer-1", Path: req.Path, Op: req.Op, Kind: req.Kind, Mode: req.Mode, EntrySeq: mutationSeq})
+					_ = json.NewEncoder(w).Encode(client.FSLayerEntry{LayerID: mutationLayerID, Path: req.Path, Op: req.Op, Kind: req.Kind, Mode: req.Mode, EntrySeq: mutationSeq})
 				case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/node" && r.URL.Query().Get("list") == "1":
 					_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FileInfo{}})
 				case r.Method == http.MethodHead:
@@ -280,7 +331,7 @@ func TestRestoreLayerReplayDoesNotOverwriteNewerNamespaceMutation(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+			opts := &MountOptions{LayerRef: mountedLayerID, RemoteRoot: "/repo"}
 			fs := NewDat9FS(client.New(ts.URL, ""), opts)
 			if tc.seed != nil {
 				tc.seed(fs)
@@ -302,6 +353,140 @@ func TestRestoreLayerReplayDoesNotOverwriteNewerNamespaceMutation(t *testing.T) 
 				t.Fatalf("restore stale replay: %v", err)
 			}
 			tc.assertFinal(t, fs)
+		})
+	}
+}
+
+func TestRestoreLayerReplayDoesNotOverwriteCommittedChildWriteback(t *testing.T) {
+	for _, shadowSpill := range []bool{false, true} {
+		name := "inline"
+		if shadowSpill {
+			name = "object"
+		}
+		t.Run(name, func(t *testing.T) {
+			const (
+				localPath  = "/node.txt"
+				remotePath = "/repo/node.txt"
+			)
+			oldData := []byte("parent")
+			newData := []byte("child")
+			replayFetched := make(chan struct{})
+			allowReplay := make(chan struct{})
+			testHookAfterLayerReplayFetched = func() {
+				close(replayFetched)
+				<-allowReplay
+			}
+			t.Cleanup(func() { testHookAfterLayerReplayFetched = nil })
+
+			var uploadCalls atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/child-1/diff":
+					_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{{
+						LayerID: "parent-1", Path: remotePath, Op: "upsert", Kind: "file",
+						SizeBytes: int64(len(oldData)), EntrySeq: 100,
+					}}})
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/child-1/entries":
+					_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+						LayerID: "parent-1", Path: remotePath, Op: "upsert", Kind: "file",
+						Content: oldData, SizeBytes: int64(len(oldData)), EntrySeq: 100,
+					})
+				case r.Method == http.MethodPost && (r.URL.Path == "/v1/layers/child-1/entries" || r.URL.Path == "/v1/layers/child-1/objects"):
+					if shadowSpill && r.URL.Path != "/v1/layers/child-1/objects" {
+						t.Errorf("object writeback used %s", r.URL.Path)
+					}
+					if !shadowSpill && r.URL.Path != "/v1/layers/child-1/entries" {
+						t.Errorf("inline writeback used %s", r.URL.Path)
+					}
+					uploadCalls.Add(1)
+					_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+						LayerID: "child-1", Path: remotePath, Op: "upsert", Kind: "file",
+						SizeBytes: int64(len(newData)), EntrySeq: 1,
+					})
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/child-1/uploads/initiate" && shadowSpill:
+					// Exercise the object response path while keeping this test's
+					// server minimal: 404 is the specified legacy-object fallback.
+					http.NotFound(w, r)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer ts.Close()
+
+			shadow, err := NewShadowStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer shadow.Close()
+			pending, err := NewPendingIndex(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := shadow.WriteFull(localPath, newData, 0); err != nil {
+				t.Fatal(err)
+			}
+			pendingGen, err := pending.PutWithBaseRev(localPath, int64(len(newData)), PendingOverwrite, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			shadowGen := shadow.ActiveGeneration(localPath)
+
+			opts := &MountOptions{LayerRef: "child-1", RemoteRoot: "/repo"}
+			opts.setDefaults()
+			c := client.New(ts.URL, "")
+			fs := NewDat9FS(c, opts)
+			fs.shadowStore = shadow
+			fs.pendingIndex = pending
+			cq := NewCommitQueue(c, shadow, pending, nil, 1, 8, opts.RemoteRoot)
+			cq.SetLayerRef(opts.LayerRef)
+			cq.OnUploaded = fs.onCommitQueueUploaded
+			cq.OnSuccess = fs.onCommitQueueSuccess
+			fs.commitQueue = cq
+			defer cq.DrainAll()
+
+			restoreDone := make(chan error, 1)
+			go func() {
+				restoreDone <- restoreLayerEntries(context.Background(), c, opts, shadow, pending, fs)
+			}()
+			select {
+			case <-replayFetched:
+			case <-time.After(5 * time.Second):
+				t.Fatal("restore did not fetch parent replay")
+			}
+
+			if err := cq.Enqueue(&CommitEntry{
+				Path: localPath, BaseRev: 0, Size: int64(len(newData)), Kind: PendingOverwrite,
+				ShadowSpill: shadowSpill, ShadowGen: shadowGen, PendingIndexGen: pendingGen,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			cq.WaitPath(localPath)
+			if got := uploadCalls.Load(); got != 1 {
+				t.Fatalf("child-layer uploads = %d, want 1", got)
+			}
+			if meta, ok := pending.GetMeta(localPath); !ok || !meta.LayerCommitted {
+				t.Fatalf("child writeback pending meta = %+v, want committed", meta)
+			}
+
+			close(allowReplay)
+			if err := <-restoreDone; err != nil {
+				t.Fatalf("restore stale parent replay: %v", err)
+			}
+			got, err := shadow.ReadAll(localPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, newData) {
+				t.Fatalf("shadow after stale parent replay = %q, want %q", got, newData)
+			}
+			fs.layerMu.RLock()
+			version := fs.layerEntryVersion[localPath]
+			fs.layerMu.RUnlock()
+			if version != (layerEntryVersion{LayerID: "child-1", EntrySeq: 1}) {
+				t.Fatalf("child writeback version = %+v, want child-1/1", version)
+			}
 		})
 	}
 }
@@ -441,6 +626,102 @@ func TestRestoreLayerDirectoryRenamePreservesDirtyDescendant(t *testing.T) {
 	}
 	if got, err := shadow.ReadAll("/from/dirty.txt"); err != nil || string(got) != "local" {
 		t.Fatalf("dirty descendant = %q, %v; want local", got, err)
+	}
+}
+
+func TestRestoreLayerDirectoryRenameRetargetsOpenDirtyChild(t *testing.T) {
+	entry := client.FSLayerEntry{
+		LayerID: "layer-1", Path: "/repo/old", Op: "rename", Kind: "dir",
+		ContentText: "/repo/new", Mode: 0o750, EntrySeq: 7,
+	}
+	payload := []byte("dirty child")
+	var (
+		mu       sync.Mutex
+		requests []clientLayerEntryRequest
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{entry}})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries":
+			var req clientLayerEntryRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode layer child flush: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			requests = append(requests, req)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+				LayerID: "layer-1", Path: req.Path, Op: req.Op, Kind: req.Kind,
+				Content: req.Content, SizeBytes: req.SizeBytes, EntrySeq: 8,
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo", WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.markLayerDir("/old", 0o755)
+	fs.inodes.Lookup("/old", true, 0, time.Now())
+	ino := fs.inodes.Lookup("/old/child.txt", false, int64(len(payload)), time.Now())
+	dirty := NewWriteBuffer("/old/child.txt", maxPreloadSize, 0)
+	if _, err := dirty.Write(0, payload); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino: ino, Path: "/old/child.txt", Dirty: dirty,
+		DirtySeq: fs.markDirtySize(ino, int64(len(payload))), IsNew: true,
+		WritePolicy: WritePolicyCloseSync,
+	}
+	fhID := fs.allocateFileHandle(fh)
+	defer fs.deleteFileHandle(fhID, fh)
+
+	if err := restoreLayerEntries(context.Background(), fs.client, opts, shadow, pending, fs); err != nil {
+		t.Fatalf("restore peer directory rename: %v", err)
+	}
+	if got, ok := fs.inodes.GetPath(ino); !ok || got != "/new/child.txt" {
+		t.Fatalf("open child inode path = (%q, %t), want /new/child.txt", got, ok)
+	}
+	fh.Lock()
+	gotHandlePath := fh.Path
+	gotDirtyPath := fh.Dirty.path
+	fh.Unlock()
+	if gotHandlePath != "/new/child.txt" || gotDirtyPath != "/new/child.txt" {
+		t.Fatalf("retargeted handle paths = (%q, %q), want /new/child.txt", gotHandlePath, gotDirtyPath)
+	}
+
+	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fhID}); st != gofuse.OK {
+		t.Fatalf("Flush renamed dirty child = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fhID})
+
+	mu.Lock()
+	got := append([]clientLayerEntryRequest(nil), requests...)
+	mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("layer child flushes = %+v, want one", got)
+	}
+	if got[0].Path != "/repo/new/child.txt" || !bytes.Equal(got[0].Content, payload) {
+		t.Fatalf("renamed child request = %+v, want /repo/new/child.txt with %q", got[0], payload)
+	}
+	if got[0].Path == "/repo/old/child.txt" {
+		t.Fatal("peer directory rename allowed open handle to recreate the old path")
 	}
 }
 

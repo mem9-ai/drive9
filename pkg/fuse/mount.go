@@ -1550,7 +1550,7 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 				continue
 			}
 			publishLayerRestoreView(fs, []string{localPath}, func() bool {
-				return fs.markLayerWhiteoutAtSeq(localPath, entry.EntrySeq)
+				return fs.markLayerWhiteoutAtVersion(localPath, layerVersion(&entry))
 			})
 			finishRestore(nil)
 			continue
@@ -1561,7 +1561,7 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 				continue
 			}
 			publishLayerRestoreView(fs, []string{localPath}, func() bool {
-				return fs.markLayerDirAtSeq(localPath, entry.Mode, entry.EntrySeq)
+				return fs.markLayerDirAtVersion(localPath, entry.Mode, layerVersion(&entry))
 			})
 			finishRestore(nil)
 			continue
@@ -1573,7 +1573,7 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 				continue
 			}
 			finishRestore := lockLayerRestoreTransaction(fs)
-			if fs != nil && fs.layerReplayStale([]string{localPath}, entry.EntrySeq) {
+			if fs != nil && fs.layerReplayStale([]string{localPath}, layerVersion(&entry)) {
 				finishRestore(nil)
 				continue
 			}
@@ -1586,16 +1586,16 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 				publishLayerRestoreView(fs, []string{localPath}, func() bool {
 					switch entry.Kind {
 					case "file":
-						return fs.markLayerFileAtSeq(localPath, entry.Mode, true, entry.EntrySeq)
+						return fs.markLayerFileAtVersion(localPath, entry.Mode, true, layerVersion(&entry))
 					case "dir":
-						return fs.markLayerDirAtSeq(localPath, entry.Mode, entry.EntrySeq)
+						return fs.markLayerDirAtVersion(localPath, entry.Mode, layerVersion(&entry))
 					case "symlink":
 						if target, existingMode, ok := fs.layerSymlink(localPath); ok {
 							nextMode := (existingMode &^ uint32(0o777)) | (entry.Mode & 0o777)
 							if nextMode&uint32(syscall.S_IFMT) == 0 {
 								nextMode |= uint32(syscall.S_IFLNK)
 							}
-							return fs.markLayerSymlinkAtSeq(localPath, target, nextMode, entry.EntrySeq)
+							return fs.markLayerSymlinkAtVersion(localPath, target, nextMode, layerVersion(&entry))
 						}
 					}
 					return false
@@ -1638,7 +1638,7 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 				continue
 			}
 			publishLayerRestoreView(fs, []string{localPath}, func() bool {
-				return fs.markLayerSymlinkAtSeq(localPath, target, entry.Mode, entry.EntrySeq)
+				return fs.markLayerSymlinkAtVersion(localPath, target, entry.Mode, layerVersion(&entry))
 			})
 			finishRestore(nil)
 			continue
@@ -1682,7 +1682,7 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 			}
 		}
 		finishRestore := lockLayerRestoreTransaction(fs)
-		if fs != nil && fs.layerReplayStale([]string{localPath}, entry.EntrySeq) {
+		if fs != nil && fs.layerReplayStale([]string{localPath}, layerVersion(&entry)) {
 			finishRestore(nil)
 			if stagedObjectPath != "" {
 				_ = os.Remove(stagedObjectPath)
@@ -1731,7 +1731,7 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 		)
 		if err == nil && restored {
 			publishLayerRestoreView(fs, []string{localPath}, func() bool {
-				return fs.markLayerFileAtSeq(localPath, fullEntry.Mode, fullEntry.Mode != 0, entry.EntrySeq)
+				return fs.markLayerFileAtVersion(localPath, fullEntry.Mode, fullEntry.Mode != 0, layerVersion(&entry))
 			})
 		}
 		unlock()
@@ -1862,8 +1862,15 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 			if testHookBeforeLayerRestoreViewPublish != nil {
 				testHookBeforeLayerRestoreViewPublish([]string{oldLocalPath, newLocalPath})
 			}
-			applied = fs.markLayerDirRenameAtSeq(oldLocalPath, newLocalPath, fullEntry.Mode, fullEntry.EntrySeq)
+			applied = fs.markLayerDirRenameAtVersion(oldLocalPath, newLocalPath, fullEntry.Mode, layerVersion(fullEntry))
 			if applied {
+				fs.inodes.Rename(oldLocalPath, newLocalPath)
+				fs.retargetOpenHandlesForRename(oldLocalPath, newLocalPath)
+				if fs.xattrs != nil {
+					fs.xattrs.Rename(oldLocalPath, newLocalPath)
+				}
+				fs.forgetCommittedRevisionPrefix(oldLocalPath)
+				fs.forgetCommittedRevisionPrefix(newLocalPath)
 				invalidateLayerRefreshSubtree(fs, oldLocalPath)
 				invalidateLayerRefreshSubtree(fs, newLocalPath)
 			}
@@ -1888,7 +1895,7 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 		fallbackData = data
 	}
 	finishRestore := lockLayerRestoreTransaction(fs)
-	if fs != nil && fs.layerReplayStale([]string{oldLocalPath, newLocalPath}, fullEntry.EntrySeq) {
+	if fs != nil && fs.layerReplayStale([]string{oldLocalPath, newLocalPath}, layerVersion(fullEntry)) {
 		finishRestore(nil)
 		return newLocalPath, nil
 	}
@@ -1926,7 +1933,7 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 	)
 	if err == nil && applied {
 		publishLayerRestoreView(fs, []string{oldLocalPath, newLocalPath}, func() bool {
-			return fs.markLayerRenameAtSeq(oldLocalPath, newLocalPath, fullEntry.Mode, fullEntry.EntrySeq)
+			return fs.markLayerRenameAtVersion(oldLocalPath, newLocalPath, fullEntry.Mode, layerVersion(fullEntry))
 		})
 	}
 	unlock()

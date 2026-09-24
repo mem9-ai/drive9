@@ -61,6 +61,25 @@ var testHookExtentBuildWait func()
 // syscall.EAGAIN directly and returns to the caller without an internal spin.
 var errAppendRefreshBusy = errors.New("append refresh source busy")
 
+// layerEntryVersion is scoped to one fs layer. EntrySeq is monotonic only
+// within LayerID: an inherited parent entry at seq 100 must not outrank the
+// first mutation (seq 1) written to the mounted child layer.
+type layerEntryVersion struct {
+	LayerID  string
+	EntrySeq int64
+}
+
+func layerVersion(entry *client.FSLayerEntry) layerEntryVersion {
+	if entry == nil {
+		return layerEntryVersion{}
+	}
+	return layerEntryVersion{LayerID: entry.LayerID, EntrySeq: entry.EntrySeq}
+}
+
+func (version layerEntryVersion) valid() bool {
+	return version.EntrySeq > 0
+}
+
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
 // operations to the dat9 HTTP API via the Go SDK client.
 type Dat9FS struct {
@@ -237,13 +256,12 @@ type Dat9FS struct {
 	layerFiles                map[string]uint32
 	layerDirs                 map[string]uint32
 	layerSymlinks             map[string]layerSymlinkState
-	// layerEntrySeq records the newest authoritative layer sequence published
+	// layerEntryVersion records the newest authoritative layer version published
 	// for each local path. Event replay is fetched outside the lifecycle
 	// barrier, so its snapshot can become stale while a local namespace
-	// mutation is already in flight. The sequence check prevents that older
-	// replay from overwriting the later local result after it obtains the
-	// exclusive side of the barrier.
-	layerEntrySeq map[string]int64
+	// mutation is already in flight. Versions include layer identity because
+	// EntrySeq is monotonic per layer, not across a parent/child chain.
+	layerEntryVersion map[string]layerEntryVersion
 	// layerAbandoned is set when the layer-event watcher observes a
 	// rollback event, signalling that the mounted layer is now abandoned.
 	// Subsequent write ops short-circuit with errLayerRolledBack (→ ESTALE)
@@ -906,11 +924,7 @@ func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []
 		if err != nil {
 			return err
 		}
-		entrySeq := int64(0)
-		if entry != nil {
-			entrySeq = entry.EntrySeq
-		}
-		fs.markLayerFileAtSeq(localPath, mode, hasMode, entrySeq)
+		fs.markLayerFileAtVersion(localPath, mode, hasMode, layerVersion(entry))
 		return nil
 	}
 	req := client.FSLayerEntryRequest{
@@ -928,11 +942,7 @@ func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []
 	if err != nil {
 		return err
 	}
-	entrySeq := int64(0)
-	if entry != nil {
-		entrySeq = entry.EntrySeq
-	}
-	fs.markLayerFileAtSeq(localPath, mode, hasMode, entrySeq)
+	fs.markLayerFileAtVersion(localPath, mode, hasMode, layerVersion(entry))
 	return nil
 }
 
@@ -946,11 +956,7 @@ func (fs *Dat9FS) upsertLayerMkdir(ctx context.Context, localPath string, mode u
 	if err != nil {
 		return err
 	}
-	entrySeq := int64(0)
-	if entry != nil {
-		entrySeq = entry.EntrySeq
-	}
-	fs.markLayerDirAtSeq(localPath, mode, entrySeq)
+	fs.markLayerDirAtVersion(localPath, mode, layerVersion(entry))
 	return nil
 }
 
@@ -967,11 +973,7 @@ func (fs *Dat9FS) upsertLayerWhiteout(ctx context.Context, localPath string, kin
 	if err != nil {
 		return err
 	}
-	entrySeq := int64(0)
-	if entry != nil {
-		entrySeq = entry.EntrySeq
-	}
-	fs.markLayerWhiteoutAtSeq(localPath, entrySeq)
+	fs.markLayerWhiteoutAtVersion(localPath, layerVersion(entry))
 	return nil
 }
 
@@ -1061,22 +1063,19 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 	if err != nil {
 		return err
 	}
-	entrySeq := int64(0)
-	if entry != nil {
-		entrySeq = entry.EntrySeq
-	}
+	version := layerVersion(entry)
 	switch kind {
 	case "file":
-		fs.markLayerFileAtSeq(localPath, mode, true, entrySeq)
+		fs.markLayerFileAtVersion(localPath, mode, true, version)
 	case "dir":
-		fs.markLayerDirAtSeq(localPath, mode, entrySeq)
+		fs.markLayerDirAtVersion(localPath, mode, version)
 	case "symlink":
 		if target, existingMode, ok := fs.layerSymlink(localPath); ok {
 			nextMode := (existingMode &^ uint32(0o777)) | (mode & 0o777)
 			if nextMode&uint32(syscall.S_IFMT) == 0 {
 				nextMode |= uint32(syscall.S_IFLNK)
 			}
-			fs.markLayerSymlinkAtSeq(localPath, target, nextMode, entrySeq)
+			fs.markLayerSymlinkAtVersion(localPath, target, nextMode, version)
 		}
 	}
 	return nil
@@ -1126,11 +1125,7 @@ func (fs *Dat9FS) upsertLayerSymlink(ctx context.Context, localPath string, targ
 	if err != nil {
 		return err
 	}
-	entrySeq := int64(0)
-	if entry != nil {
-		entrySeq = entry.EntrySeq
-	}
-	fs.markLayerSymlinkAtSeq(localPath, target, symlinkMode(), entrySeq)
+	fs.markLayerSymlinkAtVersion(localPath, target, symlinkMode(), layerVersion(entry))
 	return nil
 }
 
@@ -1152,11 +1147,7 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 		if err != nil {
 			return err
 		}
-		entrySeq := int64(0)
-		if entry != nil {
-			entrySeq = entry.EntrySeq
-		}
-		fs.markLayerSymlinkAtSeq(newLocalPath, target, mode, entrySeq)
+		fs.markLayerSymlinkAtVersion(newLocalPath, target, mode, layerVersion(entry))
 		if err := fs.upsertLayerWhiteout(ctx, oldLocalPath, deleteKindFile); err != nil {
 			return err
 		}
@@ -1216,11 +1207,7 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 			if err != nil {
 				return err
 			}
-			entrySeq := int64(0)
-			if entry != nil {
-				entrySeq = entry.EntrySeq
-			}
-			fs.markLayerDirRenameAtSeq(oldLocalPath, newLocalPath, sourceStat.Mode&0o777, entrySeq)
+			fs.markLayerDirRenameAtVersion(oldLocalPath, newLocalPath, sourceStat.Mode&0o777, layerVersion(entry))
 			return nil
 		}
 		data, err = fs.client.ReadCtx(ctx, oldRemote)
@@ -1335,7 +1322,7 @@ func (fs *Dat9FS) clearLayerOverlay() {
 	fs.layerFiles = make(map[string]uint32)
 	fs.layerDirs = make(map[string]uint32)
 	fs.layerSymlinks = make(map[string]layerSymlinkState)
-	fs.layerEntrySeq = make(map[string]int64)
+	fs.layerEntryVersion = make(map[string]layerEntryVersion)
 	fs.layerMu.Unlock()
 }
 
@@ -1460,52 +1447,83 @@ func (fs *Dat9FS) applyLayerRollback(shadows *ShadowStore, pending *PendingIndex
 	fmt.Fprintf(os.Stderr, "drive9: fs layer rolled back — mount now reflects base view; pending local writes preserved as conflict for manual recovery\n")
 }
 
+// layerVersionNewer reports whether current must fence candidate. Sequences
+// are comparable only inside one layer. The mounted writable layer always
+// wins over an inherited ancestor, even when the ancestor's numeric sequence
+// is larger; mounts resolve LayerRef to its canonical layer ID at startup.
+func (fs *Dat9FS) layerVersionNewer(current, candidate layerEntryVersion) bool {
+	if !current.valid() || !candidate.valid() {
+		return false
+	}
+	if current.LayerID == candidate.LayerID || current.LayerID == "" || candidate.LayerID == "" {
+		return current.EntrySeq > candidate.EntrySeq
+	}
+	mountedLayerID := fs.layerRef()
+	if current.LayerID == mountedLayerID {
+		return true
+	}
+	if candidate.LayerID == mountedLayerID {
+		return false
+	}
+	// Parent layers are immutable after a fork and a folded replay contains
+	// only one effective entry per path. There is no sound numeric ordering
+	// across two ancestor layer IDs, so accept the authoritative replay tuple.
+	return false
+}
+
 // layerReplayStale reports whether an entry fetched before the lifecycle
-// barrier is older than a namespace mutation already published by this mount.
-// Callers that act on the result must hold promotionBarrier exclusively so a
-// new local mutation cannot advance the sequence between this check and the
-// durable/view update.
-func (fs *Dat9FS) layerReplayStale(paths []string, entrySeq int64) bool {
-	if fs == nil || entrySeq <= 0 {
+// barrier is older than a mutation already published by this mount. Callers
+// that act on the result must hold promotionBarrier exclusively.
+func (fs *Dat9FS) layerReplayStale(paths []string, version layerEntryVersion) bool {
+	if fs == nil || !version.valid() {
 		return false
 	}
 	fs.layerMu.RLock()
 	defer fs.layerMu.RUnlock()
 	for _, p := range paths {
-		if fs.layerEntrySeq[p] > entrySeq {
+		if fs.layerVersionNewer(fs.layerEntryVersion[p], version) {
 			return true
 		}
 	}
 	return false
 }
 
-func (fs *Dat9FS) acceptLayerEntrySeqLocked(paths []string, entrySeq int64) bool {
-	if entrySeq <= 0 {
+func (fs *Dat9FS) acceptLayerEntryVersionLocked(paths []string, version layerEntryVersion) bool {
+	if !version.valid() {
 		return true
 	}
 	for _, p := range paths {
-		if fs.layerEntrySeq[p] > entrySeq {
+		if fs.layerVersionNewer(fs.layerEntryVersion[p], version) {
 			return false
 		}
 	}
-	if fs.layerEntrySeq == nil {
-		fs.layerEntrySeq = make(map[string]int64)
+	if fs.layerEntryVersion == nil {
+		fs.layerEntryVersion = make(map[string]layerEntryVersion)
 	}
 	for _, p := range paths {
-		if p != "" && entrySeq > fs.layerEntrySeq[p] {
-			fs.layerEntrySeq[p] = entrySeq
+		if p != "" {
+			fs.layerEntryVersion[p] = version
 		}
 	}
 	return true
 }
 
-func (fs *Dat9FS) markLayerWhiteoutAtSeq(localPath string, entrySeq int64) bool {
+func (fs *Dat9FS) recordLayerEntryVersion(localPath string, version layerEntryVersion) bool {
+	if fs == nil || localPath == "" || !version.valid() {
+		return false
+	}
+	fs.layerMu.Lock()
+	defer fs.layerMu.Unlock()
+	return fs.acceptLayerEntryVersionLocked([]string{localPath}, version)
+}
+
+func (fs *Dat9FS) markLayerWhiteoutAtVersion(localPath string, version layerEntryVersion) bool {
 	if fs == nil || localPath == "" {
 		return false
 	}
 	fs.layerMu.Lock()
 	defer fs.layerMu.Unlock()
-	if fs.layerAbandoned.Load() || !fs.acceptLayerEntrySeqLocked([]string{localPath}, entrySeq) {
+	if fs.layerAbandoned.Load() || !fs.acceptLayerEntryVersionLocked([]string{localPath}, version) {
 		return false
 	}
 	if fs.layerWhiteouts == nil {
@@ -1518,13 +1536,13 @@ func (fs *Dat9FS) markLayerWhiteoutAtSeq(localPath string, entrySeq int64) bool 
 	return true
 }
 
-func (fs *Dat9FS) markLayerFileAtSeq(localPath string, mode uint32, hasMode bool, entrySeq int64) bool {
+func (fs *Dat9FS) markLayerFileAtVersion(localPath string, mode uint32, hasMode bool, version layerEntryVersion) bool {
 	if fs == nil || localPath == "" {
 		return false
 	}
 	fs.layerMu.Lock()
 	defer fs.layerMu.Unlock()
-	if fs.layerAbandoned.Load() || !fs.acceptLayerEntrySeqLocked([]string{localPath}, entrySeq) {
+	if fs.layerAbandoned.Load() || !fs.acceptLayerEntryVersionLocked([]string{localPath}, version) {
 		return false
 	}
 	delete(fs.layerWhiteouts, localPath)
@@ -1541,13 +1559,13 @@ func (fs *Dat9FS) markLayerFileAtSeq(localPath string, mode uint32, hasMode bool
 	return true
 }
 
-func (fs *Dat9FS) markLayerDirAtSeq(localPath string, mode uint32, entrySeq int64) bool {
+func (fs *Dat9FS) markLayerDirAtVersion(localPath string, mode uint32, version layerEntryVersion) bool {
 	if fs == nil || localPath == "" {
 		return false
 	}
 	fs.layerMu.Lock()
 	defer fs.layerMu.Unlock()
-	if fs.layerAbandoned.Load() || !fs.acceptLayerEntrySeqLocked([]string{localPath}, entrySeq) {
+	if fs.layerAbandoned.Load() || !fs.acceptLayerEntryVersionLocked([]string{localPath}, version) {
 		return false
 	}
 	if fs.layerDirs == nil {
@@ -1560,7 +1578,7 @@ func (fs *Dat9FS) markLayerDirAtSeq(localPath string, mode uint32, entrySeq int6
 	return true
 }
 
-func (fs *Dat9FS) markLayerSymlinkAtSeq(localPath, target string, mode uint32, entrySeq int64) bool {
+func (fs *Dat9FS) markLayerSymlinkAtVersion(localPath, target string, mode uint32, version layerEntryVersion) bool {
 	if fs == nil || localPath == "" {
 		return false
 	}
@@ -1571,7 +1589,7 @@ func (fs *Dat9FS) markLayerSymlinkAtSeq(localPath, target string, mode uint32, e
 	}
 	fs.layerMu.Lock()
 	defer fs.layerMu.Unlock()
-	if fs.layerAbandoned.Load() || !fs.acceptLayerEntrySeqLocked([]string{localPath}, entrySeq) {
+	if fs.layerAbandoned.Load() || !fs.acceptLayerEntryVersionLocked([]string{localPath}, version) {
 		return false
 	}
 	if fs.layerSymlinks == nil {
@@ -1584,13 +1602,13 @@ func (fs *Dat9FS) markLayerSymlinkAtSeq(localPath, target string, mode uint32, e
 	return true
 }
 
-func (fs *Dat9FS) markLayerRenameAtSeq(oldPath, newPath string, mode uint32, entrySeq int64) bool {
+func (fs *Dat9FS) markLayerRenameAtVersion(oldPath, newPath string, mode uint32, version layerEntryVersion) bool {
 	if fs == nil || oldPath == "" || newPath == "" {
 		return false
 	}
 	fs.layerMu.Lock()
 	defer fs.layerMu.Unlock()
-	if fs.layerAbandoned.Load() || !fs.acceptLayerEntrySeqLocked([]string{oldPath, newPath}, entrySeq) {
+	if fs.layerAbandoned.Load() || !fs.acceptLayerEntryVersionLocked([]string{oldPath, newPath}, version) {
 		return false
 	}
 	if fs.layerWhiteouts == nil {
@@ -1618,12 +1636,12 @@ func layerPathWithin(p, root string) bool {
 	return p == root || strings.HasPrefix(p, strings.TrimSuffix(root, "/")+"/")
 }
 
-// markLayerDirRenameAtSeq applies the namespace projection of a server-side
+// markLayerDirRenameAtVersion applies the namespace projection of a server-side
 // directory rename without manufacturing file shadow/pending state. Existing
 // retained overlay descendants move with the directory. A replay snapshot may
 // replace them only when no later local server mutation has already published
 // either side of the subtree.
-func (fs *Dat9FS) markLayerDirRenameAtSeq(oldPath, newPath string, mode uint32, entrySeq int64) bool {
+func (fs *Dat9FS) markLayerDirRenameAtVersion(oldPath, newPath string, mode uint32, version layerEntryVersion) bool {
 	if fs == nil || oldPath == "" || newPath == "" {
 		return false
 	}
@@ -1632,9 +1650,9 @@ func (fs *Dat9FS) markLayerDirRenameAtSeq(oldPath, newPath string, mode uint32, 
 	if fs.layerAbandoned.Load() {
 		return false
 	}
-	if entrySeq > 0 {
-		for p, seq := range fs.layerEntrySeq {
-			if (layerPathWithin(p, oldPath) || layerPathWithin(p, newPath)) && seq > entrySeq {
+	if version.valid() {
+		for p, current := range fs.layerEntryVersion {
+			if (layerPathWithin(p, oldPath) || layerPathWithin(p, newPath)) && fs.layerVersionNewer(current, version) {
 				return false
 			}
 		}
@@ -1688,28 +1706,30 @@ func (fs *Dat9FS) markLayerDirRenameAtSeq(oldPath, newPath string, mode uint32, 
 	moveModes(fs.layerDirs)
 	moveSymlinks(fs.layerSymlinks)
 	moveWhiteouts(fs.layerWhiteouts)
-	if fs.layerEntrySeq == nil {
-		fs.layerEntrySeq = make(map[string]int64)
+	if fs.layerEntryVersion == nil {
+		fs.layerEntryVersion = make(map[string]layerEntryVersion)
 	}
-	movedSeq := make(map[string]int64)
-	for p, seq := range fs.layerEntrySeq {
+	movedVersions := make(map[string]layerEntryVersion)
+	for p, current := range fs.layerEntryVersion {
 		if layerPathWithin(p, oldPath) {
 			target := movePath(p)
-			if entrySeq > seq {
-				seq = entrySeq
+			if version.valid() {
+				current = version
 			}
-			movedSeq[target] = seq
-			fs.layerEntrySeq[p] = entrySeq
+			movedVersions[target] = current
+			if version.valid() {
+				fs.layerEntryVersion[p] = version
+			}
 		} else if layerPathWithin(p, newPath) {
-			delete(fs.layerEntrySeq, p)
+			delete(fs.layerEntryVersion, p)
 		}
 	}
-	for p, seq := range movedSeq {
-		fs.layerEntrySeq[p] = seq
+	for p, movedVersion := range movedVersions {
+		fs.layerEntryVersion[p] = movedVersion
 	}
-	if entrySeq > 0 {
-		fs.layerEntrySeq[oldPath] = entrySeq
-		fs.layerEntrySeq[newPath] = entrySeq
+	if version.valid() {
+		fs.layerEntryVersion[oldPath] = version
+		fs.layerEntryVersion[newPath] = version
 	}
 
 	if fs.layerWhiteouts == nil {
@@ -18180,7 +18200,13 @@ func (fs *Dat9FS) captureHandleStagingGensLocked(fh *FileHandle) StagingGens {
 }
 
 func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) {
-	if fs == nil || entry == nil || !fs.gvisorCompatibilityEnabled() {
+	if fs == nil || entry == nil {
+		return
+	}
+	if fs.layerEnabled() {
+		fs.recordLayerEntryVersion(entry.Path, entry.layerVersion)
+	}
+	if !fs.gvisorCompatibilityEnabled() {
 		return
 	}
 	if entry.mutationPublished {
