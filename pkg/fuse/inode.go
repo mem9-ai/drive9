@@ -241,9 +241,6 @@ func (m *InodeToPath) ensureDirEntry(path string, item CachedFileInfo, preserve,
 		if item.ExtentIno == 0 && same {
 			item.ExtentIno = entry.ExtentIno
 		}
-		if !preserve && !different && !same {
-			entry.ExtentIno = 0
-		}
 		if keep(entry) {
 			m.addPathLocked(entry, path)
 			return copyInodeEntryLocked(entry)
