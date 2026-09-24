@@ -1543,8 +1543,15 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
 			return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
 		}
-		if _, err := pending.PutWithBaseRevAndMode(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+		gen, err := pending.PutWithBaseRevAndMode(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0)
+		if err != nil {
 			return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
+		}
+		// Replay reconstructs an overlay generation that is already durable in
+		// the layer. Persist that fact immediately so graceful shutdown and the
+		// next restart do not mistake restored content for unfinished staging.
+		if _, err := pending.MarkLayerCommitted(localPath, gen, fullEntry.BaseRevision); err != nil {
+			return fmt.Errorf("restore fs layer pending commit marker %s: %w", localPath, err)
 		}
 		if fs != nil {
 			if fullEntry.Mode != 0 {
@@ -1633,8 +1640,12 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 	if err := shadows.WriteFull(newLocalPath, data, 0); err != nil {
 		return fmt.Errorf("restore fs layer renamed shadow %s: %w", newLocalPath, err)
 	}
-	if _, err := pending.PutWithBaseRevAndMode(newLocalPath, int64(len(data)), PendingOverwrite, 0, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+	gen, err := pending.PutWithBaseRevAndMode(newLocalPath, int64(len(data)), PendingOverwrite, 0, fullEntry.Mode, fullEntry.Mode != 0)
+	if err != nil {
 		return fmt.Errorf("restore fs layer renamed pending %s: %w", newLocalPath, err)
+	}
+	if _, err := pending.MarkLayerCommitted(newLocalPath, gen, 0); err != nil {
+		return fmt.Errorf("restore fs layer renamed pending commit marker %s: %w", newLocalPath, err)
 	}
 	return nil
 }

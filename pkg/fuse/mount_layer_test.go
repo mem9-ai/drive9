@@ -114,8 +114,8 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	if !pending.HasPending("/a.txt") {
 		t.Fatal("a.txt pending metadata missing")
 	}
-	if meta, ok := pending.GetMeta("/a.txt"); !ok || meta.Kind != PendingOverwrite {
-		t.Fatalf("a.txt pending meta = %+v, want PendingOverwrite", meta)
+	if meta, ok := pending.GetMeta("/a.txt"); !ok || meta.Kind != PendingOverwrite || !meta.LayerCommitted {
+		t.Fatalf("a.txt pending meta = %+v, want committed PendingOverwrite", meta)
 	}
 	if meta, ok := pending.GetMeta("/a.txt"); !ok || !meta.HasMode || meta.Mode != 0o600 {
 		t.Fatalf("a.txt pending mode = %+v, want 0600", meta)
@@ -325,8 +325,8 @@ func TestRestoreLayerEntriesReplaysSamePathUpsertOverwrite(t *testing.T) {
 	if !ok {
 		t.Fatal("new.txt pending metadata missing")
 	}
-	if meta.Size != 4 || !meta.HasMode || meta.Mode != 0o600 {
-		t.Fatalf("pending meta = %+v, want size=4 mode=0600", meta)
+	if meta.Size != 4 || !meta.HasMode || meta.Mode != 0o600 || !meta.LayerCommitted {
+		t.Fatalf("pending meta = %+v, want committed size=4 mode=0600", meta)
 	}
 	if mode, ok := fs.layerFileMode("/new.txt"); !ok || mode != 0o600 {
 		t.Fatalf("layer file mode = (%#o, %t), want 0600 true", mode, ok)
@@ -415,8 +415,8 @@ func TestRestoreLayerEntriesStreamsObjectBackedFile(t *testing.T) {
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("restored object payload mismatch: got %d bytes want %d", len(got), len(payload))
 	}
-	if meta, ok := pending.GetMeta("/large.bin"); !ok || meta.Size != int64(len(payload)) || !meta.HasMode || meta.Mode != 0o640 {
-		t.Fatalf("pending meta = %+v, want size %d mode 0640", meta, len(payload))
+	if meta, ok := pending.GetMeta("/large.bin"); !ok || meta.Size != int64(len(payload)) || !meta.HasMode || meta.Mode != 0o640 || !meta.LayerCommitted {
+		t.Fatalf("pending meta = %+v, want committed size %d mode 0640", meta, len(payload))
 	}
 }
 
