@@ -876,7 +876,15 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 	fs.git.mu.Lock()
 	hasWS := len(fs.git.workspaces) > 0
 	fs.git.mu.Unlock()
-	if hasWS && fs.shouldForceRefreshGitWorkspacesForGitStatePath(localPath) {
+	// Force discovery only for a root that is mid-creation (pending marker). A
+	// `.git` under some other, unrelated remote directory is ordinary content,
+	// and forcing a list for it turns every lookup into a throttled refresh
+	// storm. Workspace discovery on a fresh remount comes from the remote index
+	// probe, not from this path.
+	pendingRoot, hasPendingRoot := mountRootForGitDirPath(localPath)
+	if hasWS && hasPendingRoot &&
+		gitcache.WorkspacePending(baseCtx, fs.opts.LocalRoot, pendingRoot) &&
+		fs.shouldForceRefreshGitWorkspacesForGitStatePath(localPath) {
 		refreshCtx, refreshCancel := context.WithTimeout(baseCtx, fuseTimeout)
 		if err := fs.forceRefreshGitWorkspaces(refreshCtx); err != nil {
 			safeLogPrintf("git workspace forced refresh failed for git state path %s: %v", localPath, err)
