@@ -294,10 +294,27 @@ func TestDirtySiblingKeepsOriginalBaseRevAfterCommittedRevisionAdvances(t *testi
 	}
 }
 
+// isMutatingRequest reports whether r would change the server state. The
+// stale-payload fence may probe the durable image with a read-only request
+// (HEAD, plus a range GET when the sizes match) to prove that a rejected
+// payload is an already-landed duplicate of what the server holds; that proof
+// never writes. Tests below count writes, so a read-only probe must not trip
+// them.
+func isMutatingRequest(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+
 func TestCommitQueueRejectsPayloadOlderThanDurableWatermark(t *testing.T) {
 	var putCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		putCalls.Add(1)
+		if isMutatingRequest(r) {
+			putCalls.Add(1)
+		}
 		http.Error(w, "stale payload must not reach server", http.StatusInternalServerError)
 	}))
 	defer ts.Close()
@@ -344,7 +361,7 @@ func TestCommitQueueRejectsPayloadOlderThanDurableWatermark(t *testing.T) {
 		t.Fatalf("CommitNow err = %v, want errCommitPayloadStale", err)
 	}
 	if got := putCalls.Load(); got != 0 {
-		t.Fatalf("server saw %d uploads; stale checkpoint-A payload must not be PUT after checkpoint-B watermark", got)
+		t.Fatalf("server saw %d writes; stale checkpoint-A payload must not be PUT after checkpoint-B watermark", got)
 	}
 	if data, err := shadow.ReadAll(path); err != nil || string(data) != string(oldMain) {
 		t.Fatalf("shadow changed after rejected stale payload: data=%q err=%v", data, err)
@@ -363,6 +380,12 @@ func TestSQLiteCheckpointABStaleHandleCannotOverwriteDurableMainDB(t *testing.T)
 		}
 	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isMutatingRequest(r) {
+			// Read-only probe from the duplicate-payload proof. Failing it
+			// keeps the proof unavailable, which must fail closed.
+			http.Error(w, "read probe unavailable", http.StatusInternalServerError)
+			return
+		}
 		putCalls.Add(1)
 		body, _ := io.ReadAll(r.Body)
 		recordHandlerErr(fmt.Errorf("stale checkpoint-A payload reached server: expected_rev=%q body=%q", r.Header.Get("X-Dat9-Expected-Revision"), body))
@@ -440,7 +463,7 @@ func TestSQLiteCheckpointABStaleHandleCannotOverwriteDurableMainDB(t *testing.T)
 		t.Fatalf("CommitNow err = %v, want errCommitPayloadStale", err)
 	}
 	if got := putCalls.Load(); got != 0 {
-		t.Fatalf("server saw %d uploads; stale checkpoint-A must not become a newer revision after checkpoint-B", got)
+		t.Fatalf("server saw %d writes; stale checkpoint-A must not become a newer revision after checkpoint-B", got)
 	}
 	handlerMu.Lock()
 	err = handlerErr
@@ -513,7 +536,7 @@ func TestSQLiteCheckpointABStaleHandleReleaseFreshRemoteKeepsCheckpointB(t *test
 		stale.Unlock()
 		t.Fatal(err)
 	}
-	if err := fs.snapshotWriteBackLocked(stale); err != nil {
+	if err := fs.snapshotWriteBackLocked(stale, true); err != nil {
 		stale.Unlock()
 		t.Fatal(err)
 	}
@@ -1229,7 +1252,9 @@ func TestCommitQueueFencedConflictDoesNotLWWRebaseOldPayload(t *testing.T) {
 func TestCommitQueueLiveDurableWatermarkRejectsEntryThatBecameStaleAfterEnqueue(t *testing.T) {
 	var requestCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCalls.Add(1)
+		if isMutatingRequest(r) {
+			requestCalls.Add(1)
+		}
 		http.Error(w, "stale payload must be rejected before remote I/O", http.StatusInternalServerError)
 	}))
 	defer ts.Close()
@@ -1304,7 +1329,7 @@ func TestCommitQueueLiveDurableWatermarkRejectsEntryThatBecameStaleAfterEnqueue(
 	cq.DrainAll()
 
 	if got := requestCalls.Load(); got != 0 {
-		t.Fatalf("remote requests = %d, want 0; stale payload must be fenced at dispatch", got)
+		t.Fatalf("remote writes = %d, want 0; stale payload must be fenced at dispatch", got)
 	}
 	if entry.DurableWatermarkRev != 3 || !entry.DisableAutoResolveLWW {
 		t.Fatalf("entry watermark/lww = %d/%t, want 3/true", entry.DurableWatermarkRev, entry.DisableAutoResolveLWW)

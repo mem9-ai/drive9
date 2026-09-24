@@ -1523,6 +1523,13 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			return
 		}
 		if errors.Is(err, errCommitPayloadStale) {
+			// The resolver holds the path lock (taken above and kept through
+			// this point), so a synchronous same-path writer cannot commit
+			// newer bytes between its equality proof and its bookkeeping.
+			if resolved, _ := cq.resolveStalePayloadAsIdempotent(entryCtx, entry); resolved {
+				unlockPath()
+				return
+			}
 			safeLogPrintf("commit queue: stale payload rejected for %s: %v", entry.Path, err)
 			cq.onCommitTerminalFailure(entry, err)
 			unlockPath()
@@ -1744,6 +1751,17 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 					continue
 				}
 				if errors.Is(verr, errCommitPayloadStale) {
+					// The batch released its path locks before this point, so
+					// reacquire this entry's lock: the resolver's equality
+					// proof and its success bookkeeping must not straddle a
+					// synchronous same-path commit.
+					unlockEntry := cq.lockPath(entry.Path)
+					resolved, _ := cq.resolveStalePayloadAsIdempotent(entryCtx, entry)
+					unlockEntry()
+					if resolved {
+						cq.endInFlight(entry)
+						continue
+					}
 					safeLogPrintf("commit queue: stale batched payload rejected for %s: %v", entry.Path, verr)
 					cq.onCommitTerminalFailure(entry, verr)
 					cq.endInFlight(entry)
@@ -1970,6 +1988,19 @@ func (cq *CommitQueue) readEntryPayloadCtx(ctx context.Context, entry *CommitEnt
 	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return nil, err
 	}
+	return cq.readEntryPayloadRaw(entry)
+}
+
+// readEntryPayloadRaw reads the staged payload without running the generation
+// and watermark preflight, so callers decide for themselves whether the bytes
+// are still the ones the entry is responsible for. It exists for the one case
+// that must look at rejected bytes: proving that a payload the preflight
+// called stale is byte-identical to the durable remote image, which makes the
+// entry a redundant upload rather than a conflict.
+func (cq *CommitQueue) readEntryPayloadRaw(entry *CommitEntry) ([]byte, error) {
+	if entry == nil {
+		return nil, fmt.Errorf("nil commit entry")
+	}
 	if entry.payloadBound {
 		return entry.payload, nil
 	}
@@ -2000,6 +2031,66 @@ func (cq *CommitQueue) entryUploadContext(parent context.Context, entry *CommitE
 		uploadCancel()
 	}
 	return uploadCtx, cleanup, true
+}
+
+// RecoverPendingSync synchronously commits every recoverable pending entry,
+// for use after the async queue has already been drained and stopped at
+// unmount (issue #964): late FUSE Release arrivals and drain timeouts leave
+// staged entries behind, and this path uploads them without needing live
+// workers. Returns the number of successfully committed entries.
+func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
+	if cq == nil || cq.index == nil {
+		return 0
+	}
+	committed := 0
+	for path := range cq.index.ListPendingPaths() {
+		meta, ok := cq.index.GetMeta(path)
+		if !ok {
+			continue
+		}
+		if cq.shadows != nil && !cq.shadows.Has(path) {
+			safeLogPrintf("commit queue: pruning orphaned pending entry for %s (shadow missing)", path)
+			cq.index.Remove(path)
+			continue
+		}
+		if meta.Kind == PendingConflict {
+			continue
+		}
+		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
+			continue
+		}
+		size := meta.Size
+		if cq.shadows != nil {
+			if shadowSize := cq.shadows.Size(path); shadowSize >= 0 {
+				size = shadowSize
+			}
+		}
+		entry := &CommitEntry{
+			Path:              path,
+			BaseRev:           meta.BaseRev,
+			Size:              size,
+			Kind:              meta.Kind,
+			ShadowSpill:       meta.ShadowSpill,
+			Mode:              meta.Mode,
+			HasMode:           meta.HasMode,
+			PayloadBaseRev:    meta.BaseRev,
+			PayloadBaseRevSet: true,
+			PendingIndexGen:   meta.Generation,
+			recovered:         true,
+		}
+		if cq.shadows != nil {
+			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path, meta.BaseRev)
+			if entry.ShadowGen == 0 {
+				continue
+			}
+		}
+		if err := cq.CommitNow(ctx, entry); err != nil {
+			safeLogPrintf("commit queue: late sync commit failed for %s: %v", path, err)
+			continue
+		}
+		committed++
+	}
+	return committed
 }
 
 // CommitNow uploads an entry synchronously through the same commit path used
@@ -2063,6 +2154,15 @@ func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *Co
 	}
 	committedRev, err := cq.uploadEntry(ctx, entry)
 	if err != nil {
+		if errors.Is(err, errCommitPayloadStale) {
+			// Report a partial resolution: the bytes are durable, but if the
+			// entry's post-commit bookkeeping (its pending chmod, for
+			// instance) failed, a strict synchronous caller must not be told
+			// durability succeeded.
+			if resolved, postErr := cq.resolveStalePayloadAsIdempotent(ctx, entry); resolved {
+				return postErr
+			}
+		}
 		if cq.perf != nil {
 			cq.perf.commitFailure.add(1)
 		}

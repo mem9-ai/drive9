@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"strings"
 	"fmt"
 	"time"
 )
@@ -52,6 +53,8 @@ type mountFuseOptions struct {
 	TrustLocalEvents             bool
 	SyncMode                     fuseSyncMode
 	WritePolicy                  fuseWritePolicy
+	WritebackLazyStaging         bool
+	WritebackSyncWindow          time.Duration
 	Profile                      string
 	LayerRef                     string
 	CheckpointRef                string
@@ -108,6 +111,24 @@ type vaultMountOptions struct {
 var mountFuse = mountFuseImpl
 
 var mountVault = mountVaultImpl
+
+// parseWritebackSyncWindow parses --writeback-sync-window (issue #964):
+// "close" -> legacy fsync-at-close staging; "0"/"off" -> lazy with no
+// background syncer; otherwise a duration -> lazy with a bounded syncer.
+func parseWritebackSyncWindow(v string) (lazy bool, window time.Duration, err error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "close":
+		return false, 0, nil
+	case "0", "off", "none":
+		return true, 0, nil
+	default:
+		d, perr := time.ParseDuration(v)
+		if perr != nil || d < 0 {
+			return false, 0, fmt.Errorf("invalid --writeback-sync-window %q (use a duration, \"0\"/\"off\", or \"close\")", v)
+		}
+		return true, d, nil
+	}
+}
 
 func parseFuseDurability(s string) (fuseSyncMode, fuseWritePolicy, error) {
 	switch fuseDurability(s) {

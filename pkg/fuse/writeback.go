@@ -276,6 +276,20 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 // used by FileHandle staging. Legacy callers deliberately store empty lineage,
 // which is safe because such metadata cannot authorize a growth rebase.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, true, liveAncestors)
+}
+
+// PutWithBaseRevAndModeAndLineageTimingsNoSync is the non-durable variant of
+// PutWithBaseRevAndModeAndLineageTimings: the .dat/.meta snapshot files are
+// written atomically (tmp+rename) but without their own fsyncs. Callers must
+// only use it when the durable authority for the payload is already persisted
+// elsewhere — the shadow store + pending index — so at most the snapshot's
+// freshness (not its integrity) is lost on a crash.
+func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsNoSync(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, false, liveAncestors)
+}
+
+func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, durable bool, liveAncestors []string) (uint64, WriteBackPutTimings, error) {
 	var t WriteBackPutTimings
 
 	// Phase 1: acquire per-path lock (serializes same-path Put/Remove/etc.)
@@ -290,8 +304,12 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath strin
 	gen := c.nextGen.Add(1)
 
 	// Phase 2: file I/O outside global lock (only per-path serialized).
+	writeFn := atomicWrite
+	if !durable {
+		writeFn = atomicWriteNoSync
+	}
 	datStart := time.Now()
-	if err := atomicWrite(datPath, data); err != nil {
+	if err := writeFn(datPath, data); err != nil {
 		c.releasePathLock(remotePath, pl)
 		return 0, t, fmt.Errorf("writeback put data: %w", err)
 	}
@@ -319,7 +337,7 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath strin
 		return 0, t, fmt.Errorf("writeback marshal meta: %w", err)
 	}
 	metaStart := time.Now()
-	if err := atomicWrite(metaPath, metaBytes); err != nil {
+	if err := writeFn(metaPath, metaBytes); err != nil {
 		// Best-effort cleanup of the .dat file if meta write fails.
 		_ = os.Remove(datPath)
 		c.releasePathLock(remotePath, pl)
@@ -850,6 +868,20 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 
 // atomicWrite writes data to path atomically using a temp file + fsync + rename.
 func atomicWrite(path string, data []byte) error {
+	return atomicWriteOpt(path, data, true)
+}
+
+// atomicWriteNoSync is atomicWrite without the durability fsyncs. The
+// rename still keeps the visible file old-or-new across a crash (never
+// torn); only the durability window changes. It is meant for snapshot
+// writes whose durable authority is already carried elsewhere (shadow
+// store + pending index), e.g. the post-durable-stage Flush snapshot —
+// see Dat9FS.snapshotWriteBackLocked.
+func atomicWriteNoSync(path string, data []byte) error {
+	return atomicWriteOpt(path, data, false)
+}
+
+func atomicWriteOpt(path string, data []byte, sync bool) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
@@ -865,10 +897,12 @@ func atomicWrite(path string, data []byte) error {
 	}
 
 	// Fsync to ensure data reaches disk before rename.
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
+	if sync {
+		if err := tmp.Sync(); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpName)
+			return err
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
@@ -881,6 +915,9 @@ func atomicWrite(path string, data []byte) error {
 		return err
 	}
 
+	if !sync {
+		return nil
+	}
 	// Fsync parent directory so the rename is durable across power loss.
 	if testHookBeforeAtomicWriteDirSync != nil {
 		if err := testHookBeforeAtomicWriteDirSync(path); err != nil {
