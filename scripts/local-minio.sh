@@ -19,12 +19,16 @@
 #   DRIVE9_MINIO_PASSWORD      (default drive9minio)
 #   DRIVE9_MINIO_BUCKET        (default drive9-local)
 #   DRIVE9_MINIO_CONTAINER     (default drive9-local-minio)
-#   DRIVE9_MINIO_IMAGE         (default minio/minio:RELEASE.2024-12-18T13-15-44Z)
+#   DRIVE9_MINIO_IMAGE         (default from scripts/minio-defaults.sh)
 #   DRIVE9_S3_ENDPOINT         advertised endpoint (presign / clients; e.g. Orb)
 #
 # Compatible with macOS bash 3.2.
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/minio-defaults.sh
+source "$SCRIPT_DIR/minio-defaults.sh"
 
 PORT="${DRIVE9_MINIO_PORT:-19000}"
 BIND="${DRIVE9_MINIO_BIND:-127.0.0.1}"
@@ -32,7 +36,7 @@ ACCESS_KEY="${DRIVE9_MINIO_USER:-drive9minio}"
 SECRET_KEY="${DRIVE9_MINIO_PASSWORD:-drive9minio}"
 BUCKET="${DRIVE9_MINIO_BUCKET:-drive9-local}"
 CONTAINER="${DRIVE9_MINIO_CONTAINER:-drive9-local-minio}"
-IMAGE="${DRIVE9_MINIO_IMAGE:-minio/minio:RELEASE.2024-12-18T13-15-44Z}"
+IMAGE="${DRIVE9_MINIO_IMAGE:-$DRIVE9_DEFAULT_MINIO_IMAGE}"
 PID_FILE="${DRIVE9_MINIO_PID_FILE:-${TMPDIR:-/tmp}/drive9-local-minio.pid}"
 DATA_DIR="${DRIVE9_MINIO_DATA_DIR:-${TMPDIR:-/tmp}/drive9-local-minio-data}"
 

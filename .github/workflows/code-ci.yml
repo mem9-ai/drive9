@@ -18,6 +18,9 @@ jobs:
       - name: Test hosted config smoke guards
         run: bash scripts/test-hosted-config-smoke-guards.sh
 
+      - name: Test local MinIO image contract
+        run: bash scripts/test-local-minio-image.sh
+
       - name: Test E2E durability override contract
         run: bash e2e/durability-contract-test.sh
 
