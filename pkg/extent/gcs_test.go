@@ -310,25 +310,52 @@ func TestGCSTokenSourceDoesNotBlockOnInFlightMint(t *testing.T) {
 	<-done
 }
 
-// TestGCSShutdownDuringReadDoesNotPanic pins the property the teardown comments
-// rely on: object operations resolved through the inner client are safe across
-// Client.Close (no panic, no race).
-func TestGCSShutdownDuringReadDoesNotPanic(t *testing.T) {
-	_, url := newGCSFake(t, http.StatusNotFound)
-	gs, err := newGCSTokenStorage(context.Background(), "bucket", newGCSTokenSource(Credential{AccessToken: "tok"}, nil), url+"/storage/v1/")
+// TestGCSTokenSourceMalformedExpiryDoesNotStampede pins that a producer mints
+// which always answer an unusable expiry do not become one mint per request.
+func TestGCSTokenSourceMalformedExpiryDoesNotStampede(t *testing.T) {
+	src := &countingCredentialSource{cred: &Credential{AccessToken: "fresh", ExpiresAt: "not-a-time"}}
+	ts := newGCSTokenSource(Credential{AccessToken: "stale", ExpiresAt: "also-bad"}, src)
+	for i := 0; i < 5; i++ {
+		if _, err := ts.Token(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if src.calls > 1 {
+		t.Fatalf("mints = %d for five Token() calls, want at most 1", src.calls)
+	}
+}
+
+// TestGCSShutdownDuringRead pins the property the teardown comments rely on: a
+// read parked in the transport when Shutdown closes the client fails cleanly
+// (no panic, no hang).
+func TestGCSShutdownDuringRead(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(started) })
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("{\"name\":\"obj\",\"size\":1,\"updated\":\"2020-01-01T00:00:00Z\"}"))
+	}))
+	defer srv.Close()
+
+	gs, err := newGCSTokenStorage(context.Background(), "bucket", newGCSTokenSource(Credential{AccessToken: "tok"}, nil), srv.URL+"/storage/v1/")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var wg sync.WaitGroup
-	wg.Add(1)
+	headErr := make(chan error, 1)
 	go func() {
-		defer wg.Done()
-		for i := 0; i < 50; i++ {
-			_, _ = gs.Head(context.Background(), "t/tenant-z/chunks/1")
-		}
+		_, err := gs.Head(context.Background(), "t/tenant-z/chunks/1")
+		headErr <- err
 	}()
+	<-started // the read is parked in the transport
 	gs.Shutdown()
-	wg.Wait()
+	close(release)
+	if err := <-headErr; err == nil {
+		t.Fatal("Head across Shutdown must return an error")
+	}
 }
 
 // TestGCSDeleteIsIdempotent mirrors JuiceFS's gs backend: deleting an object is

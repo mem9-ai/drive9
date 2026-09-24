@@ -64,11 +64,12 @@ type gcsTokenSource struct {
 const credentialMintBackoff = 5 * time.Second
 
 func newGCSTokenSource(cred Credential, src CredentialSource) *gcsTokenSource {
+	exp, _ := credentialExpiry(cred.ExpiresAt)
 	return &gcsTokenSource{
 		src:  src,
 		lead: credentialRefreshLead(credentialRefreshWindow, credentialRefreshJitter, rand.Int64N),
 		cred: cred,
-		tok:  &oauth2.Token{AccessToken: strings.TrimSpace(cred.AccessToken), Expiry: credentialExpiry(cred.ExpiresAt)},
+		tok:  &oauth2.Token{AccessToken: strings.TrimSpace(cred.AccessToken), Expiry: exp},
 	}
 }
 
@@ -95,15 +96,22 @@ func (t *gcsTokenSource) Token() (*oauth2.Token, error) {
 	t.minting = true
 	t.mu.Unlock()
 
+	// Reset minting on every path, including a panic in the mint, so a bad
+	// credential source cannot permanently short-circuit refreshes.
+	defer func() {
+		t.mu.Lock()
+		t.minting = false
+		t.mu.Unlock()
+	}()
+
 	// Mint off the lock: the HTTP call must not block unrelated requests.
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), CredentialMintTimeout)
+	defer cancel()
 	next, err := t.src.GetDataCredential(ctx)
-	cancel()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.minting = false
 	if err != nil {
 		t.retryAfter = time.Now().Add(credentialMintBackoff)
 		logger.Warn(context.Background(), "extent_credential_refresh_failed",
@@ -114,7 +122,13 @@ func (t *gcsTokenSource) Token() (*oauth2.Token, error) {
 		return t.tok, nil
 	}
 	t.cred = *next
-	t.tok = &oauth2.Token{AccessToken: strings.TrimSpace(next.AccessToken), Expiry: credentialExpiry(next.ExpiresAt)}
+	exp, ok := credentialExpiry(next.ExpiresAt)
+	t.tok = &oauth2.Token{AccessToken: strings.TrimSpace(next.AccessToken), Expiry: exp}
+	if !ok {
+		// The producer minted a token with an unusable expiry; back off so this
+		// does not become one mint per object request.
+		t.retryAfter = time.Now().Add(credentialMintBackoff)
+	}
 	metrics.RecordTenantOperation(t.tenantLabel(), "extent_storage", "refresh_credential", "ok", time.Since(start))
 	return t.tok, nil
 }
@@ -126,21 +140,20 @@ func (t *gcsTokenSource) tenantLabel() string {
 	return tenantFromPrefix(t.cred.Prefix)
 }
 
-// credentialExpiry parses an RFC3339 expiry; empty or malformed means "never
-// refresh" (zero time).
-func credentialExpiry(raw string) time.Time {
+// credentialExpiry parses an RFC3339 expiry. Empty means a static credential
+// that is never refreshed; malformed reports ok=false and a fallback lifetime
+// so the caller can arm a backoff rather than mint once per object request.
+func credentialExpiry(raw string) (time.Time, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return time.Time{}
+		return time.Time{}, true
 	}
 	exp, err := time.Parse(time.RFC3339, raw)
 	if err != nil {
-		// Treat an unparseable expiry as "due now" rather than "never refresh",
-		// so a server emitting one cannot wedge the data plane forever.
 		logger.Warn(context.Background(), "extent_credential_expiry_unparseable", zap.String("expires_at", raw))
-		return time.Now()
+		return time.Now().Add(credentialRefreshWindow), false
 	}
-	return exp
+	return exp, true
 }
 
 // newGCSTokenStorage builds a bucket-scoped GCS store that authenticates with
