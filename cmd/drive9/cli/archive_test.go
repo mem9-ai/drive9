@@ -522,3 +522,35 @@ func contains(s []string, v string) bool {
 	}
 	return false
 }
+
+func TestArchiveExcludeSets(t *testing.T) {
+	// A plain archive carries no profile: unfiltered, so `.git` stays.
+	plainOpts, err := buildArchiveOptions("", nil, nil, "tar.gz", false, 1)
+	if err != nil {
+		t.Fatalf("buildArchiveOptions(plain): %v", err)
+	}
+	if len(plainOpts.Exclude) != 0 {
+		t.Fatalf("plain archive excludes = %v, want none", plainOpts.Exclude)
+	}
+	plainMatcher := pathfilter.NewMatcher(plainOpts.Include, plainOpts.Exclude, plainOpts.Override)
+	for _, keep := range []string{"proj/.git/HEAD", "proj/src/main.go", "proj/node_modules/x.js"} {
+		if !plainMatcher.Match(keep) {
+			t.Fatalf("plain archive should keep %q", keep)
+		}
+	}
+
+	// A profiled archive drops VCS metadata and the profile's local-only sets.
+	profiledOpts, err := buildArchiveOptions("coding-agent", nil, nil, "tar.gz", false, 1)
+	if err != nil {
+		t.Fatalf("buildArchiveOptions(coding-agent): %v", err)
+	}
+	profiledMatcher := pathfilter.NewMatcher(profiledOpts.Include, profiledOpts.Exclude, profiledOpts.Override)
+	for _, drop := range []string{"proj/.git/HEAD", "proj/node_modules/x.js", "proj/target/debug/app"} {
+		if profiledMatcher.Match(drop) {
+			t.Fatalf("profiled archive should drop %q; excludes = %v", drop, profiledOpts.Exclude)
+		}
+	}
+	if !profiledMatcher.Match("proj/src/main.go") {
+		t.Fatalf("profiled archive should keep source; excludes = %v", profiledOpts.Exclude)
+	}
+}

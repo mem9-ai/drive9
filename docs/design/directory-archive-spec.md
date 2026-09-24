@@ -55,7 +55,8 @@ a bulk-download context). `--profile` loads a profile's rules and translates
 them internally:
 
 ```
-exclude           = VCS metadata + profile.[local] + profile.[local-gitignore-aware] + --exclude  (deduped)
+exclude           = profile.[local] + profile.[local-gitignore-aware] + --exclude  (deduped)
+                    (+ VCS metadata: profile.[local-gitignore-aware] and VCS metadata are added only when --profile is given)
 include-override  = profile.[remote]                    (deduped; profile-only)
 include-whitelist = --include                            (--profile does not participate)
 ```

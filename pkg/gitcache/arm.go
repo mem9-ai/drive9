@@ -129,13 +129,35 @@ func WorkspacePendingDir(localRoot string) string {
 }
 
 // WorkspacePendingMarkerPath returns the pending marker for a mount-local
-// workspace root path (for example "/repo", or "/" for the mount root).
+// workspace root path (for example "/repo", or "/" for the mount root). The
+// root is laid out as one path segment per component so the marker name is
+// readable; each segment is sanitized independently.
 func WorkspacePendingMarkerPath(localRoot, mountRoot string) string {
-	return filepath.Join(WorkspacePendingDir(localRoot), safePathSegment(normalizeMountRoot(mountRoot)))
+	dir := WorkspacePendingDir(localRoot)
+	segments := mountRootSegments(mountRoot)
+	if len(segments) == 0 {
+		return filepath.Join(dir, "root")
+	}
+	parts := append([]string{dir}, segments...)
+	return filepath.Join(parts...)
 }
 
-func normalizeMountRoot(mountRoot string) string {
-	return "/" + strings.Trim(strings.TrimSpace(mountRoot), "/")
+// mountRootSegments normalizes a mount-local root into sanitized path segments;
+// the mount root "/" yields no segments.
+func mountRootSegments(mountRoot string) []string {
+	trimmed := strings.Trim(strings.TrimSpace(mountRoot), "/")
+	if trimmed == "" {
+		return nil
+	}
+	raw := strings.Split(trimmed, "/")
+	out := make([]string, 0, len(raw))
+	for _, segment := range raw {
+		if segment == "" {
+			continue
+		}
+		out = append(out, safePathSegment(segment))
+	}
+	return out
 }
 
 // MarkWorkspacePending records that a git workspace is being created at
@@ -160,7 +182,7 @@ func MarkWorkspacePending(ctx context.Context, localRoot, mountRoot string) erro
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	body := normalizeMountRoot(mountRoot) + "\n" + time.Now().UTC().Format(time.RFC3339Nano) + "\n"
+	body := strings.TrimSpace(mountRoot) + "\n" + time.Now().UTC().Format(time.RFC3339Nano) + "\n"
 	if err := os.WriteFile(marker, []byte(body), 0o644); err != nil {
 		return fmt.Errorf("write git workspace pending marker %q: %w", marker, err)
 	}

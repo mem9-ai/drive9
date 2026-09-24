@@ -727,6 +727,8 @@ run_case() {
   local repo_a="$mount_a/repo"
   local repo_b="$mount_b/repo"
   local state_dir="$case_root/state"
+  local native_pack_archive="$remote_root/native-git-state.tar.gz"
+  local use_native_pack=0
 
   mkdir -p "$case_root"
   echo
@@ -738,14 +740,24 @@ run_case() {
   check_cmd "$slug git operations before remount" exercise_git_operations "$repo_a" "$marker" "$state_dir"
   check_cmd "$slug first mount log audit" audit_mount_log "$log_a"
 
-  # A plain `git clone` is not a drive9 workspace, so its `.git` is ordinary
-  # remote-backed content and survives a fresh local root without any pack. A
-  # `--fast`/`--blobless` clone is a workspace, so `.git` is local-only and its
-  # recovery goes through the workspace checkpoint path. Either way the second
-  # mount just uses a fresh local root; nothing is packed here.
-  stop_mount 1
-  check_workspace_refresh_budget "$slug first mount workspace refresh within budget" "$log_a"
-  check_cmd "$slug second mount starts" start_mount "$profile" "$mount_b" "$local_root_b" "$log_b" "$remote_root" 1
+  # If `.git` landed in the local overlay it is local-only for this mount (the
+  # profile pins it, e.g. the portable fixture's `[local] **/.git/**`), so a
+  # fresh local root can only recover it through an explicit pack/unpack. When
+  # `.git` is not in the overlay (the builtin coding-agent routes it to the
+  # backend) the second mount restores it from the remote with no pack.
+  if [ "$mode" = "native" ] && [ -d "$local_root_a/overlay/repo/.git" ]; then
+    use_native_pack=1
+  fi
+
+  if [ "$use_native_pack" = "1" ]; then
+    stop_mount 1 "$native_pack_archive" "repo/.git"
+    check_workspace_refresh_budget "$slug first mount workspace refresh within budget" "$log_a"
+    check_cmd "$slug second mount starts" start_mount "$profile" "$mount_b" "$local_root_b" "$log_b" "$remote_root" 1 "$native_pack_archive"
+  else
+    stop_mount 1
+    check_workspace_refresh_budget "$slug first mount workspace refresh within budget" "$log_a"
+    check_cmd "$slug second mount starts" start_mount "$profile" "$mount_b" "$local_root_b" "$log_b" "$remote_root" 1
+  fi
 
   verify_restored_git_state "$repo_b" "$state_dir"
   check_cmd "$slug post-restore commit" commit_after_restore "$repo_b" "$marker"

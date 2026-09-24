@@ -206,3 +206,22 @@ func TestClearLocalArmSignalsDropsPendingMarkers(t *testing.T) {
 		t.Fatal("ClearLocalArmSignals should drop pending markers")
 	}
 }
+
+func TestWorkspacePendingMarkerPathLayout(t *testing.T) {
+	root := "/local/root"
+	tests := []struct {
+		mountRoot string
+		want      string
+	}{
+		{mountRoot: "/", want: filepath.Join(root, "git-workspaces", "pending", "root")},
+		{mountRoot: "", want: filepath.Join(root, "git-workspaces", "pending", "root")},
+		{mountRoot: "repo", want: filepath.Join(root, "git-workspaces", "pending", "repo")},
+		{mountRoot: "/repo/", want: filepath.Join(root, "git-workspaces", "pending", "repo")},
+		{mountRoot: "/a/b", want: filepath.Join(root, "git-workspaces", "pending", "a", "b")},
+	}
+	for _, test := range tests {
+		if got := WorkspacePendingMarkerPath(root, test.mountRoot); got != test.want {
+			t.Errorf("WorkspacePendingMarkerPath(%q) = %q, want %q", test.mountRoot, got, test.want)
+		}
+	}
+}

@@ -1472,7 +1472,11 @@ func mountRootForGitDirPath(localPath string) (string, bool) {
 		if part != gitDirSegment {
 			continue
 		}
-		return "/" + strings.Join(parts[:i], "/"), true
+		root := strings.Join(parts[:i], "/") // leading "" yields the mount root ""
+		if root == "" {
+			return "/", true
+		}
+		return root, true
 	}
 	return "", false
 }
