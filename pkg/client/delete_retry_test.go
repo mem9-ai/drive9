@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
@@ -14,6 +15,16 @@ import (
 	"testing"
 	"time"
 )
+
+type closeTrackingDeleteBody struct {
+	io.ReadCloser
+	closed chan struct{}
+}
+
+func (b *closeTrackingDeleteBody) Close() error {
+	close(b.closed)
+	return b.ReadCloser.Close()
+}
 
 func TestDeleteFileReusesConnectionAfterSuccessBody(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +65,64 @@ func TestDeleteFileSuccessBodyReadFailureDoesNotRetry(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("requests = %d, want 1", calls)
+	}
+}
+
+func TestDeleteFileStalledSuccessBodyReturnsWithoutRetry(t *testing.T) {
+	var calls atomic.Int32
+	releaseBody := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-releaseBody:
+			_, _ = fmt.Fprint(w, `{"status":"ok"}`)
+		}
+	}))
+	defer ts.Close()
+	defer close(releaseBody)
+
+	c := New(ts.URL, "")
+	closed := make(chan struct{})
+	transport := c.httpClient.Transport
+	c.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		resp, err := transport.RoundTrip(req)
+		if err == nil {
+			resp.Body = &closeTrackingDeleteBody{ReadCloser: resp.Body, closed: closed}
+		}
+		return resp, err
+	})
+	done := make(chan error, 1)
+	go func() { done <- c.DeleteFileCtx(context.Background(), "/file") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("acknowledged delete returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DeleteFileCtx blocked on a stalled success body")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("success response body was not closed")
+	}
+}
+
+func TestDeleteFileDrainBudgetStartsAfterHeaders(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(maxDeleteSuccessDrainTime + 100*time.Millisecond)
+		_, _ = fmt.Fprint(w, `{"status":"ok"}`)
+	}))
+	defer ts.Close()
+
+	if err := New(ts.URL, "").DeleteFileCtx(context.Background(), "/file"); err != nil {
+		t.Fatalf("DELETE with slow response headers: %v", err)
 	}
 }
 
