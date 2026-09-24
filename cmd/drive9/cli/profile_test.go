@@ -167,6 +167,47 @@ func TestBuiltinProfilesSeparateGatedPatterns(t *testing.T) {
 	}
 }
 
+// TestCustomCodingAgentNameDoesNotInjectBuiltins covers the name-collision
+// case: a user's ~/.drive9/profiles/coding-agent must be used verbatim, not
+// merged with the built-in coding-agent defaults.
+func TestCustomCodingAgentNameDoesNotInjectBuiltins(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	writeTestProfile(t, "coding-agent", "[local]\n**/my-deps/**\n")
+
+	cfg, err := loadProfileConfig("coding-agent")
+	if err != nil {
+		t.Fatalf("loadProfileConfig: %v", err)
+	}
+	if cfg.Builtin {
+		t.Fatal("a profile loaded from a user file must not be marked builtin")
+	}
+	if !reflect.DeepEqual(cfg.LocalOnlyPatterns, []string{"**/my-deps/**"}) {
+		t.Fatalf("custom coding-agent LocalOnlyPatterns = %v, want only the custom rule", cfg.LocalOnlyPatterns)
+	}
+	if len(cfg.LocalGitignoreAwarePatterns) != 0 {
+		t.Fatalf("custom coding-agent LocalGitignoreAwarePatterns = %v, want none", cfg.LocalGitignoreAwarePatterns)
+	}
+	out := formatProfileConfig(cfg)
+	for _, unwanted := range []string{"node_modules", ".venv", "target"} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("custom coding-agent show output leaked builtin %q: %q", unwanted, out)
+		}
+	}
+}
+
+func TestBuiltinProfilesAreMarkedBuiltin(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, name := range []string{"", "coding-agent", "portable", "coding-agent-extent"} {
+		cfg, err := loadProfileConfig(name)
+		if err != nil {
+			t.Fatalf("loadProfileConfig(%q): %v", name, err)
+		}
+		if !cfg.Builtin {
+			t.Fatalf("builtin %q should be marked builtin", name)
+		}
+	}
+}
+
 func TestProfileRejectsUnknownSection(t *testing.T) {
 	writeTestProfile(t, "bad", "[locl]\n**/scratch/**\n")
 	if _, err := loadProfileConfig("bad"); err == nil {

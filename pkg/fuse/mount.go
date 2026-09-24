@@ -60,6 +60,12 @@ type MountOptions struct {
 	LocalOnlyPatterns            []string      // local-only path patterns overlaid unconditionally for overlay-profile mounts
 	LocalGitignoreAwarePatterns  []string      // local-only path patterns overlaid only when the repository's Git ignore rules also ignore them
 	RemoteOnlyPatterns           []string      // remote-persistent override path patterns for overlay-profile mounts
+	// DisableBuiltinOverlayDefaults stops the built-in local-only defaults for
+	// Profile from being added on top of the given patterns. The CLI resolves
+	// the effective (builtin or custom) profile itself and sets this, so a
+	// custom profile that reuses a builtin name is not silently merged with the
+	// builtins. Direct library callers leave it false and keep the defaults.
+	DisableBuiltinOverlayDefaults bool
 	AppendLogPatterns            []string      // remote-persistent files eligible for append-log synchronization
 	PackPaths                    []string      // local overlay paths auto-packed after unmount
 	ExtentPaths                  []string      // path globs created as content_layout=extent

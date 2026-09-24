@@ -3573,6 +3573,102 @@ func TestGitignoreAwareAmortizesWithinIgnoredDir(t *testing.T) {
 	}
 }
 
+// TestGitignoreAwareForceAddedDescendantSyncs covers the force-add exception to
+// the ancestor short circuit: `git add -f` tracks a file inside an ignored
+// directory without moving HEAD, so it must become remote-persistent. The git
+// state lives in the mount's local overlay, which is where the index changes.
+func TestGitignoreAwareForceAddedDescendantSyncs(t *testing.T) {
+	treeNodes := []client.GitTreeNode{
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        ".gitignore",
+			Name:        ".gitignore",
+			Kind:        "file",
+			Mode:        "100644",
+			ObjectSHA:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			SizeBytes:   20,
+		},
+	}
+	fixture, localRoot := newGitIgnoreFixture(t, map[string]string{
+		".gitignore": "target/\n",
+	}, treeNodes)
+	// A real repo at the workspace local root (its .git is the live git dir the
+	// FUSE layer uses for check-ignore), plus the hydrated clean tree holding
+	// .gitignore.
+	repo := t.TempDir()
+	runFuseTestGit(t, "", "init", "-b", "main", repo)
+	runFuseTestGit(t, repo, "config", "user.email", "t@e.invalid")
+	runFuseTestGit(t, repo, "config", "user.name", "T")
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("target/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runFuseTestGit(t, repo, "add", "-A")
+	runFuseTestGit(t, repo, "commit", "-m", "init")
+	fixture.repoURL = repo
+	fixture.headCommit = fuseGitOutputForTest(t, repo, "rev-parse", "HEAD")
+	fixture.readmeObjectSHA = "2222222222222222222222222222222222222222"
+	fixture.readmeSize = 0
+	// Working tree at the overlay, exactly as a mount would have it.
+	overlayRepo := filepath.Join(localRoot, "overlay", "repo")
+	runFuseTestGit(t, "", "clone", "--no-checkout", repo, overlayRepo)
+	// The runtime keys its clean-tree cache on the real HEAD, so hydrate there.
+	treeRoot := gitcache.TreeRoot(localRoot, "ws1", fixture.headCommit)
+	if err := os.MkdirAll(treeRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(treeRoot, ".gitignore"), []byte("target/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+
+	// Baseline: an ignored path is confirmed local and caches its parent.
+	if got := fs.observePathPolicy("/repo/target/gen.o"); got != PathLayerLocalOnly {
+		t.Fatalf("ignored target/gen.o = %s, want local-only", got)
+	}
+
+	// Force-add a sibling: git tracks it, check-ignore reports it not ignored.
+	if err := os.MkdirAll(filepath.Join(overlayRepo, "target"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(overlayRepo, "target", "keep.bin"), []byte("tracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runFuseTestGit(t, overlayRepo, "add", "-f", "target/keep.bin")
+
+	// Touch an ignored sibling first: this re-caches `target/` as ignored after
+	// the index changed, so only the index-tracked exception (not the cache
+	// invalidation alone) keeps the force-added file remote-persistent.
+	if got := fs.observePathPolicy("/repo/target/other.o"); got != PathLayerLocalOnly {
+		t.Errorf("ignored target/other.o = %s, want local-only", got)
+	}
+	if got := fs.observePathPolicy("/repo/target/keep.bin"); got != PathLayerRemotePersistent {
+		t.Errorf("force-added target/keep.bin = %s, want remote persistent", got)
+	}
+
+	// Pin the exception against the exact window the invalidation alone does not
+	// close: the index fingerprint is already current, so no further
+	// invalidation runs, and `target/` is cached as ignored. A force-added
+	// descendant must still be remote-persistent.
+	rt, rel, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/target/keep.bin")
+	if !ok || rt == nil || rel == "" {
+		t.Fatal("expected a loaded workspace")
+	}
+	fs.git.mu.Lock()
+	fs.git.ignoreCacheIndexFP[gitStateKey(rt)] = fs.gitIndexFingerprint(rt)
+	fs.git.ignoreCache[gitIgnoreCacheKey(rt, "target", true)] = true
+	fs.git.mu.Unlock()
+	if got := fs.observePathPolicy("/repo/target/keep.bin"); got != PathLayerRemotePersistent {
+		t.Errorf("force-added target/keep.bin with parent cached ignored = %s, want remote persistent", got)
+	}
+}
+
 func TestSliceReadNegativeSizeReadsToEOF(t *testing.T) {
 	got := sliceRead([]byte("abcdef"), 2, -1)
 	if string(got) != "cdef" {

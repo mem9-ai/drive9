@@ -77,7 +77,12 @@ func (matcher *AppendLogMatcher) Matches(localPath string) bool {
 	return false
 }
 
-func NewLocalPolicy(profile string, localOnlyPatterns, localGitignoreAwarePatterns, remoteOnlyPatterns []string) *LocalPolicy {
+// NewLocalPolicy builds a routing policy. applyBuiltinDefaults selects whether
+// the built-in local-only defaults for the profile are added; callers that have
+// already resolved an effective profile (the CLI, which merges builtin and
+// custom rules) pass false, so a custom profile that reuses a builtin name is
+// not silently merged with the builtins.
+func NewLocalPolicy(profile string, localOnlyPatterns, localGitignoreAwarePatterns, remoteOnlyPatterns []string, applyBuiltinDefaults bool) *LocalPolicy {
 	policy := &LocalPolicy{}
 	if !profileAllowsLocalPolicy(profile) &&
 		len(localOnlyPatterns) == 0 && len(localGitignoreAwarePatterns) == 0 && len(remoteOnlyPatterns) == 0 {
@@ -85,11 +90,13 @@ func NewLocalPolicy(profile string, localOnlyPatterns, localGitignoreAwarePatter
 	}
 
 	policy.enabled = true
-	localPatterns := append([]string{}, defaultCodingAgentLocalOnlyPatterns(profile)...)
-	localPatterns = append(localPatterns, localOnlyPatterns...)
+	localPatterns := localOnlyPatterns
+	gatedPatterns := localGitignoreAwarePatterns
+	if applyBuiltinDefaults {
+		localPatterns = append(append([]string{}, defaultCodingAgentLocalOnlyPatterns(profile)...), localOnlyPatterns...)
+		gatedPatterns = append(append([]string{}, defaultCodingAgentGitignoreAwarePatterns(profile)...), localGitignoreAwarePatterns...)
+	}
 	policy.localOnly = pathfilter.CompileAll(localPatterns)
-	gatedPatterns := append([]string{}, defaultCodingAgentGitignoreAwarePatterns(profile)...)
-	gatedPatterns = append(gatedPatterns, localGitignoreAwarePatterns...)
 	policy.localGitignoreAware = pathfilter.CompileAll(gatedPatterns)
 	policy.remoteOnly = pathfilter.CompileAll(remoteOnlyPatterns)
 	return policy

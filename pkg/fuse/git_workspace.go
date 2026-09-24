@@ -107,6 +107,15 @@ type gitWorkspaceLayer struct {
 	hydrateStarted  map[string]struct{}
 	ignoreCache     map[string]bool
 	gitStateRefresh map[string]time.Time
+	// ignoreCacheIndexFP records the git index fingerprint each cached ignore
+	// decision was computed against. `git add -f` / `git rm --cached` / commit
+	// change the index without moving HEAD, and both change check-ignore
+	// results, so a changed fingerprint invalidates the ignore cache.
+	ignoreCacheIndexFP map[string]string
+	// trackedCache maps a git-workspace state key to the set of index (tracked)
+	// paths, so the ignored-ancestor short circuit can exempt a force-added
+	// descendant without re-running check-ignore per file.
+	trackedCache map[string]map[string]struct{}
 }
 
 type gitWorkspaceRuntime struct {
@@ -173,12 +182,14 @@ type pendingGitOverlayEntry struct {
 func newGitWorkspaceLayer() *gitWorkspaceLayer {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &gitWorkspaceLayer{
-		stopCtx:         ctx,
-		stopCancel:      cancel,
-		materialize:     make(map[string]*gitMaterializeCall),
-		hydrateStarted:  make(map[string]struct{}),
-		ignoreCache:     make(map[string]bool),
-		gitStateRefresh: make(map[string]time.Time),
+		stopCtx:            ctx,
+		stopCancel:         cancel,
+		materialize:        make(map[string]*gitMaterializeCall),
+		hydrateStarted:     make(map[string]struct{}),
+		ignoreCache:        make(map[string]bool),
+		gitStateRefresh:    make(map[string]time.Time),
+		ignoreCacheIndexFP: make(map[string]string),
+		trackedCache:       make(map[string]map[string]struct{}),
 	}
 }
 
@@ -1312,6 +1323,10 @@ func (fs *Dat9FS) gitIgnoreConfirmsLocalOnly(ctx context.Context, localPath stri
 	if !ok || rt == nil || rel == "" || rel == "." {
 		return false, false
 	}
+	// check-ignore reads the index, so an index-only change (force-add, rm
+	// --cached, commit) can flip a result without moving HEAD. Drop cached
+	// decisions for this workspace when its index fingerprint moved.
+	fs.invalidateIgnoreCacheIfIndexChanged(rt)
 	if rel == ".git" || strings.HasPrefix(rel, ".git/") {
 		return false, true
 	}
@@ -1338,6 +1353,14 @@ func (fs *Dat9FS) gitIgnoreConfirmsLocalOnly(ctx context.Context, localPath stri
 	// `git check-ignore` subprocess. Directory classifications populate these
 	// entries, which keeps a large ignored tree (node_modules) from spawning
 	// one process per file.
+	//
+	// A force-added descendant (`git add -f target/keep.bin`) is the exception:
+	// Git tracks it in the index, so `check-ignore` reports it NOT ignored and
+	// it must stay remote-persistent. Exempt any index-tracked path before the
+	// subtree shortcut.
+	if tracked, ok := fs.gitPathIsIndexTracked(ctx, rt, rel); ok && tracked {
+		return false, true
+	}
 	if fs.gitIgnoredAncestorCached(rt, rel) {
 		return true, true
 	}
@@ -1387,6 +1410,136 @@ func (fs *Dat9FS) gitIgnoreConfirmsLocalOnly(ctx context.Context, localPath stri
 	}
 	fs.git.mu.Unlock()
 	return ignored, true
+}
+
+// gitStateKey identifies a workspace's local git state for the ignore/tracked
+// caches. Both rotate on HEAD change; an index-only change is caught by the
+// separate index fingerprint.
+func gitStateKey(rt *gitWorkspaceRuntime) string {
+	if rt == nil {
+		return ""
+	}
+	return rt.workspace.WorkspaceID + ":" + rt.workspace.HeadCommit
+}
+
+// gitIndexFingerprint returns a cheap fingerprint of the working `.git/index`,
+// or "" when it cannot be read. A missing index (no state restored yet) yields
+// "", and the ignore cache is then keyed on HEAD alone.
+func (fs *Dat9FS) gitIndexFingerprint(rt *gitWorkspaceRuntime) string {
+	if fs == nil || rt == nil {
+		return ""
+	}
+	gitDir, err := fs.gitDirForRuntime(rt)
+	if err != nil || gitDir == "" {
+		return ""
+	}
+	info, err := os.Stat(filepath.Join(filepath.FromSlash(gitDir), "index"))
+	if err != nil {
+		return ""
+	}
+	return strconv.FormatInt(info.Size(), 10) + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10)
+}
+
+// invalidateIgnoreCacheIfIndexChanged drops this workspace's cached ignore
+// decisions and tracked-path set when the index moved. Callers must not hold
+// fs.git.mu.
+func (fs *Dat9FS) invalidateIgnoreCacheIfIndexChanged(rt *gitWorkspaceRuntime) {
+	if fs == nil || fs.git == nil || rt == nil {
+		return
+	}
+	key := gitStateKey(rt)
+	if key == "" {
+		return
+	}
+	fp := fs.gitIndexFingerprint(rt)
+	fs.git.mu.Lock()
+	defer fs.git.mu.Unlock()
+	prev, ok := fs.git.ignoreCacheIndexFP[key]
+	if ok && prev == fp {
+		return
+	}
+	fs.git.ignoreCacheIndexFP[key] = fp
+	delete(fs.git.trackedCache, key)
+	for k := range fs.git.ignoreCache {
+		if strings.HasPrefix(k, key+":") {
+			delete(fs.git.ignoreCache, k)
+		}
+	}
+}
+
+// gitPathIsIndexTracked reports whether rel is tracked in the workspace index,
+// and whether that could be determined. It backs the ignored-ancestor
+// short-circuit exception for force-added descendants. Results are cached per
+// workspace state and invalidated with the index fingerprint.
+func (fs *Dat9FS) gitPathIsIndexTracked(ctx context.Context, rt *gitWorkspaceRuntime, rel string) (bool, bool) {
+	if fs == nil || fs.git == nil || rt == nil {
+		return false, false
+	}
+	key := gitStateKey(rt)
+	if key == "" {
+		return false, false
+	}
+	fs.git.mu.Lock()
+	set, ok := fs.git.trackedCache[key]
+	fs.git.mu.Unlock()
+	if !ok {
+		loaded, ok := fs.gitLoadIndexTrackedSet(ctx, rt)
+		if !ok {
+			return false, false
+		}
+		set = loaded
+		fs.git.mu.Lock()
+		if fs.git.trackedCache == nil {
+			fs.git.trackedCache = make(map[string]map[string]struct{})
+		}
+		fs.git.trackedCache[key] = set
+		fs.git.mu.Unlock()
+	}
+	if _, tracked := set[strings.Trim(rel, "/")]; tracked {
+		return true, true
+	}
+	return false, true
+}
+
+// gitLoadIndexTrackedSet returns the set of index-tracked paths for a workspace.
+// An empty working tree (no index yet) yields an empty set; a git failure is
+// reported as not-ok so the caller falls back to check-ignore.
+func (fs *Dat9FS) gitLoadIndexTrackedSet(ctx context.Context, rt *gitWorkspaceRuntime) (map[string]struct{}, bool) {
+	if fs == nil || rt == nil {
+		return nil, false
+	}
+	treeRoot := ""
+	if strings.TrimSpace(fs.opts.LocalRoot) != "" {
+		treeRoot = gitcache.TreeRoot(fs.opts.LocalRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit)
+	}
+	if info, err := os.Stat(treeRoot); err != nil || !info.IsDir() {
+		return nil, false
+	}
+	if ctx == nil {
+		ctx = context.TODO()
+	}
+	ctx, cancel := context.WithTimeout(ctx, gitCheckIgnoreTimeout)
+	defer cancel()
+	if err := fs.ensureGitStateRestored(ctx, rt); err != nil {
+		return nil, false
+	}
+	gitDir, err := fs.gitDirForRuntime(rt)
+	if err != nil || gitDir == "" {
+		return nil, false
+	}
+	out, err := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "--work-tree", treeRoot,
+		"ls-files", "-z", "--cached", "--full-name").Output()
+	if err != nil {
+		return nil, false
+	}
+	set := make(map[string]struct{})
+	for _, rec := range bytes.Split(out, []byte{0}) {
+		if len(rec) == 0 {
+			continue
+		}
+		set[strings.Trim(string(rec), "/")] = struct{}{}
+	}
+	return set, true
 }
 
 // gitIgnoredAncestorCached reports whether a strict ancestor directory of rel

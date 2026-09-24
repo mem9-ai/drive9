@@ -99,6 +99,7 @@ Coding-agent local overlay policy
 - The coding-agent mount profile routes heavyweight local state and generated output to `<local-root>/overlay` instead of Drive9 backend storage.
 - The default local-only patterns are deliberately narrow, and split into two lists:
   - `[local]` (`--local-only`): overlaid unconditionally. Defaults to dependency trees `node_modules` and `.venv`, whose names unambiguously denote generated trees. VCS metadata is **not** a static pattern (see "`.git` routing"): it is routed by workspace membership instead.
+  - These defaults belong to the **built-in** profiles. A user file at `~/.drive9/profiles/<name>` is used verbatim, so a custom profile that reuses a built-in name (for example `coding-agent`) does not silently inherit the built-in defaults; `drive9 profile show` reports exactly the effective rules.
   - `[local-gitignore-aware]` (`--local-only-gitignore-aware`): overlaid only when the repository's own Git ignore rules also ignore the path. Defaults to Rust build output `target`, because `target` is a common directory name that is not always build output. See "Git-ignore policy" below.
 - Both lists name the trees whose file counts routinely overwhelm remote storage and are essentially never hand-edited.
 - Other build and cache output (`dist`, `build`, `.cache`, `coverage`, tool caches such as `__pycache__`/`.pytest_cache`, and so on) is left remote-persistent by default. Projects that want a specific tree overlaid can add explicit `[local]` patterns (unconditional) or `[local-gitignore-aware]` patterns (repository-confirmed).
@@ -115,6 +116,7 @@ Git-ignore policy
 - The gate applies only to the `[local-gitignore-aware]` / `--local-only-gitignore-aware` list, for every profile that enables the local overlay (`coding-agent`, `coding-agent-extent`, `portable`, and custom overlay profiles). `[local]` / `--local-only` matches are overlaid unconditionally.
 - The check runs cached `git check-ignore` (against the hydrated clean tree and the local `.git` state). Tracked clean paths and durable Git overlay entries are never treated as ignored output.
 - When no Git workspace is loaded there is no ignore oracle, so the gate keeps the pattern's overlay rather than dropping it (fail open). An ignored directory confirms its whole subtree without a per-file subprocess.
+- The ignored-ancestor short circuit exempts index-tracked paths: `git add -f target/keep.bin` tracks a file inside an ignored directory without moving HEAD, and a tracked file must stay remote-persistent. The ignore cache is also invalidated when the git index changes (force-add, `rm --cached`, commit), since `check-ignore` reads the index.
 - `[remote]` override patterns and `.git` routing are unaffected.
 
 `.git` routing

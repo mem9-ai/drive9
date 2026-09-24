@@ -25,6 +25,12 @@ type profileConfig struct {
 	AppendLogPatterns  []string
 	PackPaths          []string
 	ExtentPatterns     []string
+	// Builtin marks a config produced by a built-in profile rather than a user
+	// file. It distinguishes `coding-agent` the builtin from a user's
+	// ~/.drive9/profiles/coding-agent: only the builtin carries the built-in
+	// local-only defaults, so a same-named custom file is not silently merged
+	// with them.
+	Builtin bool
 	// LocalGitignoreAwarePatterns are local-only patterns overlaid only when
 	// the repository's Git ignore rules also ignore the path.
 	LocalGitignoreAwarePatterns []string
@@ -86,7 +92,7 @@ func loadProfileConfig(name string) (profileConfig, error) {
 		return builtinExtentProfile(), nil
 	}
 	if name == "interactive" {
-		return profileConfig{Name: "interactive", Source: "builtin:interactive"}, nil
+		return profileConfig{Name: "interactive", Source: "builtin:interactive", Builtin: true}, nil
 	}
 	if path := profileConfigPath(name); path != "" {
 		if data, err := os.ReadFile(path); err == nil {
@@ -148,7 +154,7 @@ func validateProfileName(name string) error {
 }
 
 func builtinNoneProfile() profileConfig {
-	return profileConfig{Name: noneMountProfile, Source: "builtin:none"}
+	return profileConfig{Name: noneMountProfile, Source: "builtin:none", Builtin: true}
 }
 
 func builtinExtentProfile() profileConfig {
@@ -156,6 +162,7 @@ func builtinExtentProfile() profileConfig {
 		Name:           extentMountProfile,
 		Source:         "builtin:extent",
 		ExtentPatterns: []string{"*"},
+		Builtin:        true,
 	}
 }
 
@@ -168,6 +175,7 @@ func builtinCodingAgentProfile() profileConfig {
 		LocalGitignoreAwarePatterns: builtinCodingAgentGitignoreAwarePatterns(),
 		AppendLogPatterns:           []string{"**/*-wal"},
 		PackPaths:                   nil,
+		Builtin:                     true,
 	}
 }
 
@@ -179,6 +187,7 @@ func builtinPortableProfile() profileConfig {
 		RemoteOnlyPatterns:          nil,
 		LocalGitignoreAwarePatterns: builtinCodingAgentGitignoreAwarePatterns(),
 		PackPaths:                   []string{"/"},
+		Builtin:                     true,
 	}
 }
 
