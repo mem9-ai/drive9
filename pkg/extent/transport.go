@@ -3,6 +3,7 @@ package extent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"syscall"
 	"time"
 
@@ -20,10 +21,35 @@ type MetaOpFunc func(ctx context.Context, op string, raw json.RawMessage) (json.
 type Transport struct {
 	CallFn MetaOpFunc
 	Delay  time.Duration
+	// Timeout bounds each non-blocking meta RPC when > 0. Blocking Flock/Setlk
+	// are exempt: they legitimately wait for the lock. It must be set before the
+	// transport is handed to extent.NewRuntime (never mutated afterwards).
+	Timeout time.Duration
+	// Enter/Leave, when set, bracket each meta RPC. A runtime sets them so its
+	// teardown can wait for in-flight metadata before closing the session.
+	// Enter receives the op name and reports false once the gate is closed, so
+	// teardown can refuse new work while still admitting the session-cleanup RPC
+	// it must run itself.
+	Enter func(op string) bool
+	Leave func()
 }
 
+// MetaCallTimeout bounds every non-blocking metadata RPC the extent runtime's
+// transport serves, for its whole life: Init/Load/NewSession and the compaction
+// loop's ClaimNextCompact, plus the steady-state FUSE read/write/getattr/
+// setattr/lookup/unlink/rename calls that share this transport. A stalled
+// endpoint therefore surfaces as ETIMEDOUT to the caller instead of hanging the
+// request; blocking Flock/Setlk are exempt inside Call. The commit-style
+// mutating ops (compact, unlink, delete_sustained) are bounded too: their
+// server-side work is a CAS or a batch enqueue, not the object transfer, so 30s
+// is a liveness cap rather than a limit on the bulk of the operation. The
+// credential mint is a separate client call bounded by CredentialMintTimeout.
+const MetaCallTimeout = 30 * time.Second
+
 func NewTransport(fn MetaOpFunc) *Transport {
-	return &Transport{CallFn: fn}
+	// Default the bound here so every construction (FUSE, CLI/SDK, server-side
+	// compactor) inherits it; a caller may override before use.
+	return &Transport{CallFn: fn, Timeout: MetaCallTimeout}
 }
 
 // ExtentMetaClient is the HTTP meta RPC used by FUSE and drive9 fs.
@@ -60,6 +86,12 @@ func (t *Transport) Call(ctx jfsmeta.Context, op string, req, resp any) syscall.
 	if t == nil || t.CallFn == nil {
 		return syscall.EIO
 	}
+	if t.Enter != nil && !t.Enter(op) {
+		return syscall.EIO
+	}
+	if t.Leave != nil {
+		defer t.Leave()
+	}
 	if t.Delay > 0 {
 		time.Sleep(t.Delay)
 	}
@@ -82,6 +114,12 @@ func (t *Transport) Call(ctx jfsmeta.Context, op string, req, resp any) syscall.
 		std = ctx
 	}
 	httpCtx := context.WithoutCancel(std)
+	// Bound non-blocking RPCs; blocking Flock/Setlk must be allowed to wait.
+	if !block && t.Timeout > 0 {
+		var cancel context.CancelFunc
+		httpCtx, cancel = context.WithTimeout(httpCtx, t.Timeout)
+		defer cancel()
+	}
 	if block {
 		var stop context.CancelFunc
 		httpCtx, stop = context.WithCancel(httpCtx)
@@ -115,10 +153,15 @@ func (t *Transport) Call(ctx jfsmeta.Context, op string, req, resp any) syscall.
 			zap.Duration("duration", d))
 	}
 	if err != nil {
-		if httpCtx.Err() != nil {
+		switch {
+		case errors.Is(httpCtx.Err(), context.DeadlineExceeded):
+			// The RPC's own bound fired: report a timeout, not an interruption.
+			return syscall.ETIMEDOUT
+		case httpCtx.Err() != nil:
 			return syscall.EINTR
+		default:
+			return syscall.EIO
 		}
-		return syscall.EIO
 	}
 	if resp == nil {
 		return 0

@@ -6,7 +6,6 @@ import (
 	"os"
 	"path"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -17,77 +16,12 @@ import (
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
-type extentRuntime struct {
-	rt   *extent.Runtime
-	meta jfsmeta.Meta
-	stop context.CancelFunc
-	// wg tracks the background compaction loop. FlushAll cancels it and then
-	// joins it, so unmount cannot return while a compaction is still
-	// uploading or committing: exiting between the object PUT and the compact
-	// CAS would leak the merged blob.
-	wg sync.WaitGroup
-}
-
-func (fs *Dat9FS) ensureExtentRuntime() error {
-	fs.extentMu.Lock()
-	defer fs.extentMu.Unlock()
-	if fs.extentRT != nil {
-		return nil
-	}
-	if fs.client == nil {
-		return fmt.Errorf("extent runtime: missing client")
-	}
-	cred, err := fs.client.GetDataCredential(context.Background())
-	if err != nil {
-		return fmt.Errorf("data credential: %w", err)
-	}
-	store, err := extent.OpenStorage(cred, fs.client)
-	if err != nil {
-		return fmt.Errorf("extent storage: %w", err)
-	}
-	// The extent data plane keeps a read block cache under the mount-scoped
-	// drive9 cache dir (JuiceFS puts it in its jfs/ subdir); chunk-store
-	// staging stays off, so this directory holds only blocks that are already
-	// durable in object storage. The per-tenant key keeps two tenants that
-	// share --cache-dir from serving each other's blocks.
-	cacheDir := fs.extentCacheDir
-	if cacheDir == "" && fs.opts != nil {
-		cacheDir = fs.opts.CacheDir
-	}
-	rt, err := extent.NewRuntime(extent.RuntimeConfig{
-		CacheDir:  cacheDir,
-		CacheKey:  extent.CacheKeyForPrefix(cred.Prefix),
-		Transport: extent.NewHTTPTransport(fs.client),
-		Storage:   store,
-	})
-	if err != nil {
-		return err
-	}
-	if rt.VFS == nil {
-		return fmt.Errorf("extent runtime: missing juicefs VFS")
-	}
-	fmt.Fprintf(os.Stderr, "drive9: extent juicefs cache-dir=%s buffer-size=%d\n",
-		rt.ChunkConf.CacheDir, rt.ChunkConf.BufferSize)
-	ctx, cancel := context.WithCancel(context.Background())
-	er := &extentRuntime{
-		rt:   rt,
-		meta: rt.Meta,
-		stop: cancel,
-	}
-	fs.extentRT = er
-	er.wg.Add(1)
-	go func() {
-		defer er.wg.Done()
-		fs.extentCompactLoop(ctx)
-	}()
-	return nil
-}
-
 func (fs *Dat9FS) extentVFS() *vfs.VFS {
-	if fs.extentRT == nil || fs.extentRT.rt == nil {
+	er := fs.extentRT.Load()
+	if er == nil || er.rt == nil {
 		return nil
 	}
-	return fs.extentRT.rt.VFS
+	return er.rt.VFS
 }
 
 func (fs *Dat9FS) jfsMetaCtx(pid, uid, gid uint32) jfsmeta.Context {
@@ -475,7 +409,8 @@ func (fs *Dat9FS) extentReadlink(entry *InodeEntry) ([]byte, gofuse.Status) {
 	if err := fs.ensureExtentRuntime(); err != nil {
 		return nil, gofuse.EIO
 	}
-	if fs.extentRT == nil || fs.extentRT.rt == nil || fs.extentRT.rt.Transport == nil {
+	er := fs.extentRT.Load()
+	if er == nil || er.rt == nil || er.rt.Transport == nil {
 		return nil, gofuse.EIO
 	}
 	var resp struct {
@@ -483,7 +418,7 @@ func (fs *Dat9FS) extentReadlink(entry *InodeEntry) ([]byte, gofuse.Status) {
 		Target []byte `json:"target"`
 	}
 	ctx := fs.jfsCtx(0, 0, 0)
-	if call := fs.extentRT.rt.Transport.Call(ctx, "readlink", map[string]any{"inode": entry.ExtentIno}, &resp); call != 0 {
+	if call := er.rt.Transport.Call(ctx, "readlink", map[string]any{"inode": entry.ExtentIno}, &resp); call != 0 {
 		return nil, gofuse.Status(call)
 	}
 	if resp.Errno != 0 {
@@ -496,7 +431,7 @@ func (fs *Dat9FS) extentRmdir(header *gofuse.InHeader, name, childP string) gofu
 	if !fs.extentEnabled() {
 		return gofuse.OK
 	}
-	if fs.extentRT == nil {
+	if fs.extentRT.Load() == nil {
 		return gofuse.OK
 	}
 	v := fs.extentVFS()

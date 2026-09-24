@@ -3,8 +3,10 @@ package extent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"syscall"
 	"testing"
+	"time"
 
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
 )
@@ -56,6 +58,74 @@ func TestTransportCallInjectsBlockFlag(t *testing.T) {
 	}
 	if obj["block"] != true {
 		t.Fatalf("payload=%s, want block=true", got)
+	}
+}
+
+// TestTransportTimeoutBoundsCall pins that a non-blocking meta RPC that never
+// answers is cut off at Timeout instead of hanging forever.
+func TestTransportTimeoutBoundsCall(t *testing.T) {
+	t.Parallel()
+	tr := NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
+		<-ctx.Done()
+		return nil, int(syscall.EIO), ctx.Err()
+	})
+	tr.Timeout = 20 * time.Millisecond
+	start := time.Now()
+	var resp struct{}
+	if st := tr.Call(jfsmeta.Background(), "load", map[string]any{}, &resp); st != syscall.ETIMEDOUT {
+		t.Fatalf("Call status=%v, want ETIMEDOUT (not EINTR)", st)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Call took %v, want it bounded by Timeout", elapsed)
+	}
+}
+
+// TestNewTransportDefaultsMetaCallTimeout pins the default every transport
+// (mount, CLI/SDK, server-side compactor) now relies on; deleting it would
+// silently restore unbounded metadata RPCs.
+func TestNewTransportDefaultsMetaCallTimeout(t *testing.T) {
+	t.Parallel()
+	tr := NewTransport(func(context.Context, string, json.RawMessage) (json.RawMessage, int, error) {
+		return nil, 0, nil
+	})
+	if tr.Timeout != MetaCallTimeout {
+		t.Fatalf("NewTransport Timeout = %v, want %v", tr.Timeout, MetaCallTimeout)
+	}
+}
+
+// TestTransportCallPassesOpToEnter pins the teardown gate's plumbing: Call must
+// hand Enter the op name so the hold can exempt the session-cleanup RPC.
+func TestTransportCallPassesOpToEnter(t *testing.T) {
+	t.Parallel()
+	var got string
+	tr := NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
+		return []byte(`{"errno":0}`), 0, nil
+	})
+	tr.Enter = func(op string) bool {
+		got = op
+		return true
+	}
+	var resp struct {
+		Errno int `json:"errno"`
+	}
+	if st := tr.Call(jfsmeta.Background(), jfsmeta.Drive9OpCleanStaleSession, map[string]any{}, &resp); st != 0 {
+		t.Fatalf("Call status=%v", st)
+	}
+	if got != jfsmeta.Drive9OpCleanStaleSession {
+		t.Fatalf("Enter op = %q, want %q", got, jfsmeta.Drive9OpCleanStaleSession)
+	}
+}
+
+// TestTransportCallMapsBackendErrorToEIO keeps a genuine transport failure
+// distinct from the timeout and interrupt mappings.
+func TestTransportCallMapsBackendErrorToEIO(t *testing.T) {
+	t.Parallel()
+	tr := NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
+		return nil, 0, errors.New("backend down")
+	})
+	var resp struct{}
+	if st := tr.Call(jfsmeta.Background(), "load", map[string]any{}, &resp); st != syscall.EIO {
+		t.Fatalf("Call status=%v, want EIO", st)
 	}
 }
 

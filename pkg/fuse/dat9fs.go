@@ -51,6 +51,11 @@ var testHookBeforeUnlinkedTransition func()
 // handshake that attach has entered lock contention.
 var testHookAfterUnlinkHandleSetLockAttempt func()
 
+// testHookExtentBuildWait runs under extentMu just before a single-flight
+// extent-runtime waiter parks, letting tests observe the park without a
+// scheduler-timing sleep.
+var testHookExtentBuildWait func()
+
 // errAppendRefreshBusy marks transient sibling-handle lock contention. Write
 // may retry it after yielding fh.mu and the path fence; lineage rejection uses
 // syscall.EAGAIN directly and returns to the caller without an internal spin.
@@ -248,7 +253,13 @@ type Dat9FS struct {
 	xattrs *XAttrStore
 
 	extentMu sync.Mutex
-	extentRT *extentRuntime
+	extentRT atomic.Pointer[extentRuntime]
+	// extentTornDown is set under extentMu when teardown starts; no extent
+	// runtime may be installed after it (see stopExtentRuntimeLoop).
+	extentTornDown bool
+	// extentBuild single-flights the unlocked runtime build (see
+	// extentBuildState in extent_runtime.go).
+	extentBuild extentBuildState
 	// extentMisses caches "this path is not an extent file" so an
 	// extent-enabled mount does not pay a stat probe on every syscall against
 	// the classic files that share its glob (the mixed profile is the shape the
@@ -6793,6 +6804,8 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	apiPath := fs.remotePath(parentPath)
 	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
+	request := fs.dirCache.BeginRequest(parentPath)
+	defer fs.dirCache.EndRequest(request)
 	items, err := fs.client.ListCtx(ctx, apiPath)
 	cf()
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
@@ -6800,7 +6813,11 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		if !fs.lockMountViewRead(generation) {
 			return nil, 0, syscall.EAGAIN
 		}
-		fs.dirCache.Put(parentPath, cachedFileInfos(items))
+		// Serve the merged view, not the raw response: a child whose commit
+		// settled during this LIST's RTT is absent from the response and,
+		// being already committed, is gone from the pending overlay too, so
+		// nothing later in this request could restore it.
+		items = reconciledFileInfos(fs.dirCache.PutListing(parentPath, cachedFileInfos(items), request))
 		fs.mountViewMu.RUnlock()
 		return items, generation, nil
 	}
@@ -6814,29 +6831,83 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 
 	lastErr := err
 	for range retryCount {
-		// Keep list fallback retries detached from FUSE cancel for the same reason
-		// as stat retries above: this path is a compatibility probe after HEAD
-		// said "not found", and cancel-coupled retries would collapse to the
-		// original transient failure immediately.
-		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
-		listStart = fs.perfStart()
-		items, err = fs.client.ListCtx(retryCtx, apiPath)
-		retryCancel()
-		fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
-		if err == nil {
-			if !fs.lockMountViewRead(generation) {
-				return nil, 0, syscall.EAGAIN
+		// Each attempt runs in its own scope with its own release, so no exit —
+		// including the two early returns below — can leave its registration
+		// behind. The function-level defer holds the first attempt's token, so
+		// a missed release here would pin the directory's reconciliation state
+		// for the mount's lifetime.
+		attempt := func() ([]client.FileInfo, uint64, error, bool) {
+			// Keep list fallback retries detached from FUSE cancel for the same
+			// reason as stat retries above: this path is a compatibility probe
+			// after HEAD said "not found", and cancel-coupled retries would
+			// collapse to the original transient failure immediately.
+			retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
+			listStart := fs.perfStart()
+			request := fs.dirCache.BeginRequest(parentPath)
+			defer fs.dirCache.EndRequest(request)
+			listItems, listErr := fs.client.ListCtx(retryCtx, apiPath)
+			retryCancel()
+			fs.perfRecordRemote(perfRemoteList, listStart, listErr, 0)
+			if listErr == nil {
+				if !fs.lockMountViewRead(generation) {
+					return nil, 0, syscall.EAGAIN, true
+				}
+				view := reconciledFileInfos(fs.dirCache.PutListing(parentPath, cachedFileInfos(listItems), request))
+				fs.mountViewMu.RUnlock()
+				return view, generation, nil, true
 			}
-			fs.dirCache.Put(parentPath, cachedFileInfos(items))
-			fs.mountViewMu.RUnlock()
-			return items, generation, nil
+			if !isTransientLookupErr(listErr) {
+				return listItems, 0, fs.resetMountViewOnAuthorizationError(listErr), true
+			}
+			return listItems, 0, listErr, false
 		}
-		if !isTransientLookupErr(err) {
-			return items, 0, fs.resetMountViewOnAuthorizationError(err)
+		attemptItems, attemptGen, attemptErr, done := attempt()
+		if done {
+			return attemptItems, attemptGen, attemptErr
 		}
-		lastErr = err
+		lastErr = attemptErr
 	}
 	return nil, 0, lastErr
+}
+
+// reconciledFileInfos projects a merged listing view back onto the client
+// FileInfo shape the list callers work in.
+//
+// The merged view is always the answer this request serves: a child that
+// committed during the request's round trip is in the merge but absent from the
+// response, and nothing downstream can restore it (its commit already removed
+// the pending entry). Metadata is projected per entry from the merged item
+// rather than reusing the response's struct wherever a name matches, because a
+// mutation that landed mid-RTT can have moved the same name to a newer revision
+// or size.
+//
+// There is deliberately no fallback to the raw response: an empty merged view
+// means every name the request's cache state implies is gone (a local removal
+// during the round trip), and serving the response instead would reinstate a
+// name this mount just removed. Keeping that distinction out of the signature
+// is the point — a nil-versus-empty check here is what the first version of
+// this fix got wrong.
+func reconciledFileInfos(view []CachedFileInfo) []client.FileInfo {
+	out := make([]client.FileInfo, 0, len(view))
+	for _, item := range view {
+		var mtime int64
+		if !item.Mtime.IsZero() {
+			mtime = item.Mtime.Unix()
+		}
+		out = append(out, client.FileInfo{
+			Name:       item.Name,
+			Size:       item.Size,
+			IsDir:      item.IsDir,
+			Mtime:      mtime,
+			Revision:   item.Revision,
+			Mode:       item.Mode,
+			HasMode:    item.HasMode,
+			ResourceID: item.ResourceID,
+			Nlink:      item.Nlink,
+			ExtentIno:  item.ExtentIno,
+		})
+	}
+	return out
 }
 
 func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
@@ -7288,6 +7359,8 @@ func (fs *Dat9FS) snapshotDeletedPaths() map[string]struct{} {
 func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string) (bool, uint64, error) {
 	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
+	request := fs.dirCache.BeginRequest(dirPath)
+	defer fs.dirCache.EndRequest(request)
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
@@ -7322,8 +7395,17 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 		return false, 0, syscall.EAGAIN
 	}
 	if fs.dirCache != nil {
-		fs.dirCache.Put(dirPath, cachedFileInfos(liveItems))
+		fs.dirCache.PutListing(dirPath, cachedFileInfos(liveItems), request)
 	}
+	// Emptiness is decided from the response, not from the merged cache view.
+	// The merged view is for serving readdir: it never removes a name, so a
+	// child another actor deleted would keep this directory looking occupied
+	// until the entry expired and block a legitimate Rmdir. The question this
+	// function answers is whether the remote directory is empty, and the
+	// response is its direct evidence (tombstones above already filter this
+	// mount's own in-flight unlinks). A child committed during the RTT is
+	// already durable on the server, so the server enforces it regardless of
+	// what this pre-check concludes.
 	fs.mountViewMu.RUnlock()
 	return len(liveItems) > 0, generation, nil
 }
@@ -7961,6 +8043,16 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		return cacheStatus
 	}
 
+	// Capture the observation baseline before the read: a listing installed
+	// while this stat is in flight is the newer whole-directory view, and the
+	// response must not be applied on top of it.
+	observation := fs.dirCache.BeginRequest(parentPath)
+	// Release on every exit, not just the ones that reach Observe: this path has
+	// several early returns (EAGAIN/EIO/ENOENT), and a registration that is
+	// never released would keep the directory's reconciliation state alive for
+	// the mount's lifetime. Observe releases the same token itself, so the
+	// deferred call is a no-op on the installed path.
+	defer fs.dirCache.EndRequest(observation)
 	stat, statGeneration, err := fs.lookupStatWithRetry(cancel, childP)
 	if err != nil {
 		statNotFound := isNotFoundErr(err)
@@ -8064,7 +8156,12 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if !stat.IsDir && stat.ContentLayout == client.ContentLayoutExtent {
 		fs.extentRefreshFromVFS(ino, childP, 0)
 	}
-	fs.dirCache.Upsert(parentPath, cachedInfoFromStat(name, stat))
+	// This is a plain remote read, not a mutation: record it as an observation
+	// so a listing fetched meanwhile keeps its own (newer, whole directory)
+	// entry for this name instead of being overwritten by a stat that merely
+	// finished later. The token captured before the request is what proves
+	// which of the two is newer.
+	fs.dirCache.Observe(parentPath, cachedInfoFromStat(name, stat), observation)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		fs.mountViewMu.RUnlock()
@@ -12294,6 +12391,11 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 
 	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
+	// Capture the fencing value before the request: a local mutation landing
+	// during its RTT makes the response unable to speak for the names it
+	// touches.
+	request := fs.dirCache.BeginRequest(dirPath)
+	defer fs.dirCache.EndRequest(request)
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
@@ -12308,7 +12410,11 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	if !fs.lockMountViewRead(generation) {
 		return nil, syscall.EAGAIN
 	}
-	fs.dirCache.Put(dirPath, cached)
+	// Build the reply from the merged view: a child whose commit settled during
+	// this LIST's RTT is absent from the response, and the pending overlay
+	// cannot restore it (its commit already removed the pending entry), so
+	// serving the raw response would hide it from this readdir.
+	cached = fs.dirCache.PutListing(dirPath, cached, request)
 	fs.mountViewMu.RUnlock()
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached, generation)
 
@@ -17393,15 +17499,7 @@ func (fs *Dat9FS) drainLatePendingEntries(ctx context.Context) {
 }
 
 func (fs *Dat9FS) FlushAll() {
-	if fs.extentRT != nil {
-		if fs.extentRT.stop != nil {
-			fs.extentRT.stop()
-		}
-		// Join the compaction loop before touching the VFS: a compaction in
-		// flight is uploading a merged blob and about to CAS it into meta, and
-		// returning from unmount in between would leak that blob.
-		fs.extentRT.wg.Wait()
-	}
+	fs.stopExtentRuntimeLoop()
 	if v := fs.extentVFS(); v != nil {
 		_ = v.FlushAll("")
 	}

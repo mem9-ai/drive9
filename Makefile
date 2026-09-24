@@ -53,6 +53,11 @@ TEST_PKGS ?= ./...
 # Trim JuiceFS object-store and meta-engine SDKs we do not use. The drive9
 # meta driver always compiles (no build tag). Keep this list aligned with
 # juicefs Makefile juicefs.lite, plus noredis.
+#
+# nogs trims JuiceFS's own gs backend, which builds its client from Application
+# Default Credentials. pkg/extent still links cloud.google.com/go/storage
+# directly for the GCS extent data plane, because the server's downscoped,
+# tenant-scoped token cannot be delivered through the ADC-only backend.
 GO_TAGS ?= nogspt,noredis,nosqlite,nomysql,nopg,notikv,nobadger,noetcd,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nocifs,nostorj,noqiniu,notos,noks3,nowebdav,nogateway
 
 BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
@@ -60,7 +65,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
+.PHONY: mod test test-race test-failpoint test-podman fmt lint install-lint build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
@@ -92,6 +97,14 @@ test:
 		fi; \
 	fi; \
 	$(GO) test $$test_p_flag $$test_run_flag -tags "$(GO_TAGS)" -v -timeout $(TEST_TIMEOUT) $(TEST_PKGS)
+
+# Race-detector run for the extent lifecycle: teardown ordering and the
+# in-flight-holder guards are only observable under -race. Scoped to the extent
+# tests because pkg/fuse has pre-existing unrelated races elsewhere
+# (kernel_cache_bypass) that are not this change's concern.
+test-race:
+	$(GO) test -race -count=1 -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/extent/...
+	$(GO) test -race -count=1 -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/fuse/ -run 'TestExtent|TestEnsureExtent|TestCloseExtentRuntime'
 
 # Run only failpoint-tagged tests through repository-wide instrumentation.
 # Do not run this concurrently with the normal test target because failpoint-ctl
