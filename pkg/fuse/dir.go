@@ -155,6 +155,10 @@ type DirCache struct {
 	ttl         time.Duration
 	negativeTTL time.Duration
 	maxEntries  int
+	// now is the clock this cache reads, held in a field so tests can advance
+	// time explicitly instead of sleeping and hoping a deadline passed while the
+	// scheduler looked elsewhere. Production always leaves it as time.Now.
+	now func() time.Time
 	// gen is the global fencing clock for remote reads. It only increases;
 	// each entry takes a fresh value whenever its directory changes in a way
 	// that can invalidate an in-flight read, so a generation a token holds can
@@ -173,6 +177,16 @@ type DirCache struct {
 	// exists only for those directories: an invalidation with nothing
 	// outstanding has no reader to fence, so it records nothing.
 	retired map[string]uint64
+	// installFloor is the newest listing install recorded for a directory, held
+	// outside the entry because it has to outlive the entry itself. A newer
+	// install can be the last state an entry holds, and once every deadline on
+	// it passes an ordinary read drops the entry — while the listing request
+	// that began before that install is still outstanding and still has to learn
+	// it lost. Rebuilding the entry from scratch would start installSeq at 0 and
+	// let the superseded response republish a namespace a newer listing already
+	// replaced. Like retired, it lives exactly as long as some request could
+	// consult it.
+	installFloor map[string]uint64
 }
 
 // requestRef is shared by a request token and the cache so a token can be
@@ -200,12 +214,14 @@ func NewNamespaceCache(ttl, negativeTTL time.Duration, maxEntries int) *DirCache
 		maxEntries = defaultNamespaceCacheMaxEntries
 	}
 	return &DirCache{
-		entries:     make(map[string]*dirCacheEntry),
-		inFlight:    make(map[string]int),
-		retired:     make(map[string]uint64),
-		ttl:         ttl,
-		negativeTTL: negativeTTL,
-		maxEntries:  maxEntries,
+		entries:      make(map[string]*dirCacheEntry),
+		inFlight:     make(map[string]int),
+		retired:      make(map[string]uint64),
+		installFloor: make(map[string]uint64),
+		ttl:          ttl,
+		negativeTTL:  negativeTTL,
+		maxEntries:   maxEntries,
+		now:          time.Now,
 	}
 }
 
@@ -218,7 +234,7 @@ func (dc *DirCache) Get(dirPath string) ([]CachedFileInfo, bool) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	now := time.Now()
+	now := dc.now()
 	entry, ok := dc.getEntryLocked(dirPath, now)
 	if !ok || !entry.completeValid(now) {
 		return nil, false
@@ -288,7 +304,7 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	now := time.Now()
+	now := dc.now()
 	// A response taken before the directory was retired describes state the
 	// retirement removed (an SSE reset discards the whole directory). It may
 	// answer the request that issued it, but republishing it into the cache
@@ -310,7 +326,18 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 	// cache effect is limited to names it is still the newest word on, and the
 	// caller is served the accepted state either way. A stale install also
 	// neither renews nor retires anything: both belong to the newer install.
-	staleInstall := entry.installSeq > request.seq
+	//
+	// The comparison reads the newest install from both places it can live. The
+	// entry holds it while the entry exists; the cache-level floor holds it
+	// across the entry's death, because the request that has to learn it lost
+	// may outlive every deadline on the entry. Taking the entry's value first
+	// and never the smaller of the two is what makes the fence monotone while
+	// requests overlap.
+	newestInstall := entry.installSeq
+	if floor := dc.installFloor[dirPath]; floor > newestInstall {
+		newestInstall = floor
+	}
+	staleInstall := newestInstall > request.seq
 
 	// The cache retains a bounded prefix of the response (the pre-existing
 	// large-directory guard: an over-cap listing answers positive lookups from
@@ -353,7 +380,18 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 			continue
 		}
 		if staleInstall {
-			// Keep whatever the newer install published for this name.
+			// Keep whatever the newer install published for this name: this
+			// response is the older word, so it may neither change the cache nor
+			// answer for a directory state a newer listing superseded.
+			//
+			// A name only this response carries is therefore absent from the
+			// reply even though the server listed it (#967 review, Codex). That
+			// is the same trade the bug this PR fixes is about: the response
+			// describes the directory as of its own request, so serving names
+			// from it after a newer listing has spoken would republish a
+			// namespace that listing replaced. The mount's readdir is a
+			// point-in-time answer either way, and the next readdir — no longer
+			// overlapping — lists the directory in full.
 			if current, live := entry.items[item.Name]; live {
 				served[item.Name] = current
 			}
@@ -398,8 +436,15 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 			entry.complete = false
 			entry.completeExpires = time.Time{}
 		}
-		// This install is now the newest word on the directory's names.
+		// This install is now the newest word on the directory's names. The
+		// floor records it too, and only while another request can still
+		// consult it: with none outstanding, no response remains that could
+		// need to be recognized as stale, and a later request is newer than
+		// this install by construction.
 		entry.installSeq = request.seq
+		if dc.inFlight[dirPath] > 0 {
+			dc.installFloor[dirPath] = request.seq
+		}
 	}
 	entry.gen = dc.nextGenerationLocked()
 	// Releasing here is what retires this request's stamps once it was the last
@@ -435,7 +480,7 @@ func (dc *DirCache) Lookup(parentPath, name string) namespaceLookupResult {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	now := time.Now()
+	now := dc.now()
 	entry, ok := dc.getEntryLocked(parentPath, now)
 	if !ok {
 		return namespaceLookupResult{}
@@ -544,8 +589,9 @@ func (dc *DirCache) releaseRequestLocked(token RequestToken) {
 		delete(dc.inFlight, token.dir)
 	}
 	// Nothing is outstanding for this directory, so no response can still be
-	// waiting to consult its stamps or watermark.
+	// waiting to consult its stamps, watermark, or install floor.
 	delete(dc.retired, token.dir)
+	delete(dc.installFloor, token.dir)
 	if entry, ok := dc.entries[token.dir]; ok && entry != nil {
 		entry.reclaimReconciliationLocked()
 	}
@@ -635,7 +681,7 @@ func (dc *DirCache) Observe(parentPath string, item CachedFileInfo, token Reques
 	// the directory cache has.
 	observed := item
 	if observed.freshUntil.IsZero() {
-		observed.freshUntil = time.Now().Add(dc.ttl)
+		observed.freshUntil = dc.now().Add(dc.ttl)
 	}
 	entry.upsert(observed, dc.maxEntries)
 	delete(entry.negatives, item.Name)
@@ -701,7 +747,7 @@ func (dc *DirCache) HasPositiveEntries(dirPath string) bool {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	entry, ok := dc.getEntryLocked(dirPath, time.Now())
+	entry, ok := dc.getEntryLocked(dirPath, dc.now())
 	if !ok {
 		return false
 	}
@@ -717,7 +763,7 @@ func (dc *DirCache) HasPositiveEntriesExceptTombstones(dirPath string, tombstone
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	entry, ok := dc.getEntryLocked(dirPath, time.Now())
+	entry, ok := dc.getEntryLocked(dirPath, dc.now())
 	if !ok {
 		return false
 	}
@@ -747,7 +793,7 @@ func (dc *DirCache) MarkNegative(parentPath, name string) {
 	if entry.negatives == nil {
 		entry.negatives = make(map[string]time.Time)
 	}
-	entry.negatives[name] = time.Now().Add(dc.negativeTTL)
+	entry.negatives[name] = dc.now().Add(dc.negativeTTL)
 }
 
 // MarkSessionCreatedDir records a directory created by this mount as having a
@@ -758,7 +804,7 @@ func (dc *DirCache) MarkSessionCreatedDir(dirPath string) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	now := time.Now()
+	now := dc.now()
 	entry := dc.ensureEntryLocked(dirPath)
 	entry.complete = true
 	entry.completeExpires = now.Add(dc.ttl)
@@ -774,7 +820,7 @@ func (dc *DirCache) RecordRemoteNegative(dirPath string) bool {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	now := time.Now()
+	now := dc.now()
 	entry := dc.ensureEntryLocked(dirPath)
 	if !entry.escalateNotBefore.IsZero() && now.Before(entry.escalateNotBefore) {
 		return false
@@ -809,7 +855,7 @@ func (dc *DirCache) DeferEscalation(dirPath string) {
 	defer dc.mu.Unlock()
 
 	entry := dc.ensureEntryLocked(dirPath)
-	entry.escalateNotBefore = time.Now().Add(dc.ttl)
+	entry.escalateNotBefore = dc.now().Add(dc.ttl)
 	entry.remoteMisses = 0
 	entry.missWindowStart = time.Time{}
 }
@@ -820,7 +866,7 @@ func (dc *DirCache) CanAnswerMisses(dirPath string) bool {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	now := time.Now()
+	now := dc.now()
 	entry, ok := dc.getEntryLocked(dirPath, now)
 	if !ok {
 		return false

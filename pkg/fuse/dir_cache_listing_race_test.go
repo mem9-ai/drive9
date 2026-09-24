@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -29,7 +30,7 @@ func cachedNames(t *testing.T, dc *DirCache, dirPath string) []string {
 	if entry == nil {
 		return nil
 	}
-	entry.prune(time.Now())
+	entry.prune(dc.now())
 	names := make([]string, 0, len(entry.items))
 	for _, name := range entry.order {
 		if _, ok := entry.items[name]; ok {
@@ -63,7 +64,7 @@ func assertCachedChild(t *testing.T, dc *DirCache, dirPath, name string, check f
 	var item CachedFileInfo
 	var ok bool
 	if entry != nil {
-		entry.prune(time.Now())
+		entry.prune(dc.now())
 		item, ok = entry.items[name]
 	}
 	dc.mu.Unlock()
@@ -81,6 +82,40 @@ func assertCachedChild(t *testing.T, dc *DirCache, dirPath, name string, check f
 func listInstall(dc *DirCache, dirPath string, items []CachedFileInfo) []CachedFileInfo {
 	request := dc.BeginRequest(dirPath)
 	return dc.PutListing(dirPath, items, request)
+}
+
+// testClock drives a DirCache deterministically, so expiry is decided by an
+// explicit advance instead of by sleeping and hoping the scheduler cooperated.
+// Codex flagged the sleep-based windows on #967 as a flakiness source.
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newTestClock() *testClock {
+	return &testClock{now: time.Now()}
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+// Advance moves the clock forward, never backward: deadlines are compared with
+// After, so only monotonic movement is meaningful.
+func (c *testClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// newControlledCache builds a cache of the given geometry on a test clock.
+func newControlledCache(ttl, negativeTTL time.Duration, maxEntries int) (*DirCache, *testClock) {
+	dc := NewNamespaceCache(ttl, negativeTTL, maxEntries)
+	clock := newTestClock()
+	dc.now = clock.Now
+	return dc, clock
 }
 
 // --- The core invariant: an install never removes a committed name ---------
@@ -203,7 +238,7 @@ func TestDirCacheInstallViewCanBeEmpty(t *testing.T) {
 // deleted remotely leaves the cache through invalidation or expiry, not through
 // the next listing. Pinning it here keeps the behaviour explicit.
 func TestDirCacheRemoteDeleteLeavesOnExpiryNotOnInstall(t *testing.T) {
-	dc := NewNamespaceCache(60*time.Millisecond, 60*time.Millisecond, defaultNamespaceCacheMaxEntries)
+	dc, clock := newControlledCache(60*time.Millisecond, 60*time.Millisecond, defaultNamespaceCacheMaxEntries)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "gone.dat"}, {Name: "keep.dat"}})
 
 	// A later response omitting gone.dat does not remove it.
@@ -212,13 +247,9 @@ func TestDirCacheRemoteDeleteLeavesOnExpiryNotOnInstall(t *testing.T) {
 		t.Fatalf("fixture: expected the name to still be cached, names=%v", names)
 	}
 
-	// Expiry retires the whole entry, the documented fallback when a structural
+	// Expiry retires the name, the documented fallback when a structural
 	// operation's invalidation is not what removed it.
-	deadline := time.Now().Add(400 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		dc.Get("/d")
-		time.Sleep(10 * time.Millisecond)
-	}
+	clock.Advance(200 * time.Millisecond)
 	if names := cachedNames(t, dc, "/d"); containsName(names, "gone.dat") {
 		t.Fatalf("expired entry still holds the remotely deleted name: %v", names)
 	}
@@ -869,11 +900,11 @@ func TestDirCacheOlderInstallDoesNotDowngradeNewer(t *testing.T) {
 // the entry alive past the listing's own expiry, so an additive merge would
 // replay a remotely deleted name indefinitely and renew it on every install.
 func TestDirCacheExpiredListingDoesNotRetainRemoteDeletions(t *testing.T) {
-	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+	dc, clock := newControlledCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "gone.dat"}, {Name: "keep.dat"}})
 
 	// The listing lapses, then an unrelated local write refreshes the entry.
-	time.Sleep(150 * time.Millisecond)
+	clock.Advance(150 * time.Millisecond)
 	dc.Upsert("/d", CachedFileInfo{Name: "other.dat", Revision: 2})
 
 	// A fresh listing omits the remotely deleted name.
@@ -897,7 +928,7 @@ func TestDirCacheExpiredListingDoesNotRetainRemoteDeletions(t *testing.T) {
 // write refreshing the entry's TTL must not extend that prefix's life either.
 func TestDirCacheExpiredPartialListingDropsUnrelistedName(t *testing.T) {
 	const cap = 3
-	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, cap)
+	dc, clock := newControlledCache(80*time.Millisecond, 80*time.Millisecond, cap)
 
 	// Over-cap: cached as the bounded prefix, and not complete.
 	listInstall(dc, "/d", []CachedFileInfo{
@@ -909,7 +940,7 @@ func TestDirCacheExpiredPartialListingDropsUnrelistedName(t *testing.T) {
 
 	// The listing lapses; an unrelated local write refreshes the entry's TTL and
 	// evicts keep1.dat (FIFO) but leaves gone.dat in place.
-	time.Sleep(150 * time.Millisecond)
+	clock.Advance(150 * time.Millisecond)
 	dc.Upsert("/d", CachedFileInfo{Name: "local.dat", Revision: 2})
 
 	view := listInstall(dc, "/d", []CachedFileInfo{{Name: "keep2.dat"}, {Name: "local.dat"}})
@@ -933,13 +964,13 @@ func TestDirCacheExpiredPartialListingDropsUnrelistedName(t *testing.T) {
 // A name the response re-lists gets a fresh deadline: a live directory whose
 // every listing carries it must not lose it to the first listing's expiry.
 func TestDirCacheReListedNameOutlivesItsFirstDeadline(t *testing.T) {
-	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+	dc, clock := newControlledCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
 
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "live.dat"}})
-	time.Sleep(50 * time.Millisecond)
+	clock.Advance(50 * time.Millisecond)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "live.dat"}})
 	// Past the first install's deadline, inside the second's.
-	time.Sleep(50 * time.Millisecond)
+	clock.Advance(50 * time.Millisecond)
 
 	if names := cachedNames(t, dc, "/d"); !containsName(names, "live.dat") {
 		t.Fatalf("re-listed name retired by its first deadline: %v", names)
@@ -955,12 +986,12 @@ func TestDirCacheReListedNameOutlivesItsFirstDeadline(t *testing.T) {
 // has not landed, so rebuilding around the response alone would hide it
 // (the bug #966 reports).
 func TestDirCacheListingLapseKeepsLocalNames(t *testing.T) {
-	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+	dc, clock := newControlledCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
 
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "remote.dat"}})
 	// Past the listing's deadline, a local write extends the entry's own TTL
 	// without touching the listing's.
-	time.Sleep(120 * time.Millisecond)
+	clock.Advance(120 * time.Millisecond)
 	dc.Upsert("/d", CachedFileInfo{Name: "acked.dat", Revision: 3})
 
 	// The response cannot carry acked.dat: no LIST has run since the commit.
@@ -983,10 +1014,10 @@ func TestDirCacheListingLapseKeepsLocalNames(t *testing.T) {
 // window the mount already guards elsewhere (see markPathDeleted) — and the
 // served view still has to carry what the mount committed.
 func TestDirCacheListingLapseKeepsLocallyRewrittenName(t *testing.T) {
-	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+	dc, clock := newControlledCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
 
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1}, {Name: "gone.dat"}})
-	time.Sleep(120 * time.Millisecond)
+	clock.Advance(120 * time.Millisecond)
 	// No request in flight, so the write carries no stamp of its own: only its
 	// provenance can keep it across the lapse.
 	dc.Upsert("/d", CachedFileInfo{Name: "f.dat", Size: 2, Revision: 2})
@@ -1011,10 +1042,10 @@ func TestDirCacheListingLapseKeepsLocallyRewrittenName(t *testing.T) {
 // an observation (the revision does not advance), and dropping it would revert
 // the mode until the next listing reinstates it.
 func TestDirCacheListingLapseKeepsObservedName(t *testing.T) {
-	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+	dc, clock := newControlledCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
 
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Mode: 0o644, HasMode: true, Revision: 1}})
-	time.Sleep(120 * time.Millisecond)
+	clock.Advance(120 * time.Millisecond)
 
 	token := dc.BeginRequest("/d")
 	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Mode: 0o600, HasMode: true, Revision: 1}, token)
@@ -1039,17 +1070,17 @@ func TestDirCacheListingLapseKeepsObservedName(t *testing.T) {
 // remotely deleted name go: otherwise continuous readdir keeps it alive
 // forever, which is unbounded staleness the spec does not permit.
 func TestDirCacheListingDoesNotRenewAnOmittedName(t *testing.T) {
-	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+	dc, clock := newControlledCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
 
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "gone.dat"}, {Name: "live.dat"}})
 
 	// A second listing 50ms later: inside the first deadline, and it carries
 	// only live.dat, so gone.dat keeps the deadline the *first* response gave it.
-	time.Sleep(50 * time.Millisecond)
+	clock.Advance(50 * time.Millisecond)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "live.dat"}})
 
 	// Past the first response's deadline (t0+80ms), inside the second's.
-	time.Sleep(50 * time.Millisecond)
+	clock.Advance(50 * time.Millisecond)
 
 	if names := cachedNames(t, dc, "/d"); containsName(names, "gone.dat") {
 		t.Fatalf("a listing renewed a name it does not carry: %v", names)
@@ -1067,14 +1098,14 @@ func TestDirCacheListingDoesNotRenewAnOmittedName(t *testing.T) {
 // not turn into mount-authoritative state. Promoting it left a remote chmod or
 // delete that SSE did not report able to outlive every TTL the cache has.
 func TestDirCacheObservationExpiresOnItsOwnDeadline(t *testing.T) {
-	dc := NewNamespaceCache(60*time.Millisecond, 60*time.Millisecond, defaultNamespaceCacheMaxEntries)
+	dc, clock := newControlledCache(60*time.Millisecond, 60*time.Millisecond, defaultNamespaceCacheMaxEntries)
 
 	request := dc.BeginRequest("/d")
 	dc.Observe("/d", CachedFileInfo{Name: "observed.dat", Revision: 1}, request)
 
 	// Past the observation's deadline, an unrelated local write refreshes
 	// nothing but its own name.
-	time.Sleep(100 * time.Millisecond)
+	clock.Advance(100 * time.Millisecond)
 	dc.Upsert("/d", CachedFileInfo{Name: "local.dat", Revision: 2})
 
 	view := listInstall(dc, "/d", []CachedFileInfo{{Name: "local.dat"}})
@@ -1095,14 +1126,14 @@ func TestDirCacheObservationExpiresOnItsOwnDeadline(t *testing.T) {
 // it — that omission is exactly the #966 invisibility. Only invalidation says
 // otherwise, because only invalidation reflects the server's word.
 func TestDirCacheLocalNameOutlivesEveryRemoteDeadline(t *testing.T) {
-	dc := NewNamespaceCache(60*time.Millisecond, 60*time.Millisecond, defaultNamespaceCacheMaxEntries)
+	dc, clock := newControlledCache(60*time.Millisecond, 60*time.Millisecond, defaultNamespaceCacheMaxEntries)
 
 	dc.Upsert("/d", CachedFileInfo{Name: "acked.dat", Revision: 3})
 
 	// Many listings that never carry the committed name, spread over several
 	// TTLs: a commit whose upload is still in flight is invisible to each.
 	for range 4 {
-		time.Sleep(100 * time.Millisecond)
+		clock.Advance(100 * time.Millisecond)
 		view := listInstall(dc, "/d", []CachedFileInfo{{Name: "later.dat"}})
 		if !containsName(viewNames(view), "acked.dat") {
 			t.Fatalf("a listing hid a locally committed name: %v", viewNames(view))
@@ -1128,16 +1159,16 @@ func TestDirCacheLocalNameOutlivesEveryRemoteDeadline(t *testing.T) {
 // name whose own evidence is still running must survive it — and the entry must
 // not keep answering misses for the dropped one.
 func TestDirCachePerNameDeadlinesAreIndependent(t *testing.T) {
-	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+	dc, clock := newControlledCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
 
 	// observed.dat is seen at t0, keep.dat is listed at t0+50ms.
 	request := dc.BeginRequest("/d")
 	dc.Observe("/d", CachedFileInfo{Name: "observed.dat", Revision: 1}, request)
-	time.Sleep(50 * time.Millisecond)
+	clock.Advance(50 * time.Millisecond)
 	listInstall(dc, "/d", []CachedFileInfo{{Name: "keep.dat"}})
 
 	// Past the observation's deadline, inside the listing's.
-	time.Sleep(50 * time.Millisecond)
+	clock.Advance(50 * time.Millisecond)
 
 	if names := cachedNames(t, dc, "/d"); containsName(names, "observed.dat") {
 		t.Fatalf("an expired observation outlived its deadline while a listing was fresh: %v", names)
@@ -1202,6 +1233,107 @@ func TestDirCacheFreshnessHintTracksTheEarliestDeadline(t *testing.T) {
 	// The locally committed name has no deadline and must still be there.
 	if !containsName(cachedNames(t, dc, "/d"), "local.dat") {
 		t.Fatalf("a deadline-free name was dropped: %v", cachedNames(t, dc, "/d"))
+	}
+}
+
+// --- Thirteenth review round on #966: an install fence that outlives its entry --
+
+// The install fence must be written where it survives its own entry. A newer
+// install can be the last state the entry holds, and if every deadline on it
+// then passes, an ordinary read drops the whole entry — including the sequence
+// that would have told the still-outstanding older request it lost. That request
+// finds a fresh entry with installSeq 0, so it republishes a namespace the newer
+// listing had already superseded, for a full TTL. LIST RTT has no upper bound
+// below the cache TTL, so this is not a timing accident that a shorter window
+// avoids.
+func TestDirCacheStaleInstallFenceOutlivesItsEntry(t *testing.T) {
+	dc, clock := newControlledCache(time.Minute, time.Minute, defaultNamespaceCacheMaxEntries)
+
+	// A is issued first, B second, B installs first.
+	older := dc.BeginRequest("/d")
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "live.dat"}})
+
+	// Every deadline on the entry passes, and an ordinary read drops it.
+	clock.Advance(2 * time.Minute)
+	if _, ok := dc.Get("/d"); ok {
+		t.Fatal("fixture: the entry should have expired")
+	}
+
+	// A finally returns, carrying a name B's listing had already removed.
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "deleted.dat"}}, older)
+
+	if containsName(viewNames(view), "deleted.dat") {
+		t.Fatalf("a superseded response served its pre-B namespace: %v", viewNames(view))
+	}
+	if got := dc.Lookup("/d", "deleted.dat"); got.kind == namespaceLookupPositive {
+		t.Fatal("a superseded response republished a name the newer listing had removed")
+	}
+	// Nothing of A's response may be cached, and A must not be able to answer
+	// misses on B's behalf now that the fence is intact.
+	if names := cachedNames(t, dc, "/d"); containsName(names, "deleted.dat") {
+		t.Fatalf("cache republished a superseded name: %v", names)
+	}
+	if dc.CanAnswerMisses("/d") {
+		t.Fatal("a superseded response granted miss authority after its entry expired")
+	}
+}
+
+// The same fence, without the entry expiring: nothing about the guard may be
+// load-bearing on the entry still being alive.
+func TestDirCacheStaleInstallFenceWhileEntryLives(t *testing.T) {
+	dc, _ := newControlledCache(time.Minute, time.Minute, defaultNamespaceCacheMaxEntries)
+
+	older := dc.BeginRequest("/d")
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "live.dat"}})
+
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "deleted.dat"}}, older)
+
+	if containsName(viewNames(view), "deleted.dat") {
+		t.Fatalf("a superseded response served its pre-B namespace: %v", viewNames(view))
+	}
+	if names := cachedNames(t, dc, "/d"); containsName(names, "deleted.dat") {
+		t.Fatalf("cache republished a superseded name: %v", names)
+	}
+}
+
+// Once every request that could consult the fence has settled, it goes away:
+// the guard is concurrency-bounded, not history-bounded.
+func TestDirCacheInstallFenceIsReleasedWithItsLastRequest(t *testing.T) {
+	dc, _ := newControlledCache(time.Minute, time.Minute, defaultNamespaceCacheMaxEntries)
+
+	older := dc.BeginRequest("/d")
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "live.dat"}})
+
+	if got := len(dc.installFloor); got != 1 {
+		t.Fatalf("expected the fence to be recorded while a request is outstanding, got %d", got)
+	}
+
+	dc.EndRequest(older)
+
+	if got := len(dc.installFloor); got != 0 {
+		t.Fatalf("fence records outlived the requests that could consult them: %d", got)
+	}
+}
+
+// A name this mount deleted after the request must not come back through the
+// reply of the response that predates the removal.
+func TestDirCacheStaleInstallStillHidesLocallyRemovedNames(t *testing.T) {
+	const cap = 2
+	dc, _ := newControlledCache(time.Minute, time.Minute, cap)
+
+	older := dc.BeginRequest("/d")
+	dc.Remove("/d", "gone.dat")
+
+	var over []CachedFileInfo
+	for i := range cap * 3 {
+		over = append(over, CachedFileInfo{Name: fmt.Sprintf("new_%02d.dat", i), Revision: 1})
+	}
+	listInstall(dc, "/d", over)
+
+	view := dc.PutListing("/d", []CachedFileInfo{{Name: "gone.dat"}}, older)
+
+	if containsName(viewNames(view), "gone.dat") {
+		t.Fatalf("stale response served a locally removed name: %v", viewNames(view))
 	}
 }
 
@@ -1271,7 +1403,7 @@ func TestDirCacheStaleInstallDoesNotRevokeCompleteness(t *testing.T) {
 // tens of milliseconds, the quadratic form needs seconds.
 func TestDirCacheBulkExpiryIsLinear(t *testing.T) {
 	const n = 100000
-	dc := NewNamespaceCache(time.Millisecond, time.Millisecond, n)
+	dc, clock := newControlledCache(time.Minute, time.Minute, n)
 
 	response := make([]CachedFileInfo, 0, n)
 	for i := range n {
@@ -1279,7 +1411,7 @@ func TestDirCacheBulkExpiryIsLinear(t *testing.T) {
 	}
 	request := dc.BeginRequest("/d")
 	dc.PutListing("/d", response, request)
-	time.Sleep(3 * time.Millisecond)
+	clock.Advance(2 * time.Minute)
 
 	start := time.Now()
 	names := cachedNames(t, dc, "/d")
@@ -1299,14 +1431,14 @@ func BenchmarkDirCacheBulkExpiry(b *testing.B) {
 	for _, n := range []int{1000, 10000, 100000} {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
 			for b.Loop() {
-				dc := NewNamespaceCache(time.Millisecond, time.Millisecond, n)
+				dc, clock := newControlledCache(time.Minute, time.Minute, n)
 				response := make([]CachedFileInfo, 0, n)
 				for i := range n {
 					response = append(response, CachedFileInfo{Name: fmt.Sprintf("f_%07d.dat", i)})
 				}
 				request := dc.BeginRequest("/d")
 				dc.PutListing("/d", response, request)
-				time.Sleep(2 * time.Millisecond)
+				clock.Advance(2 * time.Minute)
 				// The sweep under test.
 				dc.Get("/d")
 			}
