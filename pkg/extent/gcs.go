@@ -5,15 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/juicedata/juicefs/pkg/object"
+	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 	"google.golang.org/api/option"
+
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // gcsExtentChunkSize matches JuiceFS's gs backend. Extent blocks are 4 MiB, so a
@@ -38,8 +45,84 @@ type gcsTokenStorage struct {
 	bucket string
 }
 
+// gcsTokenSource renews the tenant's GCS bearer token in place. Because the
+// storage client is created once over this source and never superseded, none of
+// the per-generation store/client refcount machinery is needed.
+type gcsTokenSource struct {
+	src  CredentialSource
+	lead time.Duration
+
+	mu   sync.Mutex
+	cred Credential
+	tok  *oauth2.Token
+}
+
+func newGCSTokenSource(cred Credential, src CredentialSource) *gcsTokenSource {
+	return &gcsTokenSource{
+		src:  src,
+		lead: credentialRefreshLead(credentialRefreshWindow, credentialRefreshJitter, rand.Int64N),
+		cred: cred,
+		tok:  &oauth2.Token{AccessToken: strings.TrimSpace(cred.AccessToken), Expiry: credentialExpiry(cred.ExpiresAt)},
+	}
+}
+
+// Token returns the current bearer token, minting a replacement when the current
+// one is within the refresh lead of expiry. A mint failure keeps serving the
+// current token; an actually-expired token then surfaces as a 403 from the
+// object store, with the refresh metric distinguishing it from a data-plane bug.
+func (t *gcsTokenSource) Token() (*oauth2.Token, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// No source or no expiry means a static credential: never refresh.
+	if t.src == nil || t.tok.Expiry.IsZero() {
+		return t.tok, nil
+	}
+	if time.Until(t.tok.Expiry) > t.lead {
+		return t.tok, nil
+	}
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), CredentialMintTimeout)
+	defer cancel()
+	next, err := t.src.GetDataCredential(ctx)
+	if err != nil {
+		logger.Warn(context.Background(), "extent_credential_refresh_failed",
+			zap.String("prefix", t.cred.Prefix),
+			zap.String("step", "mint"),
+			zap.Error(err))
+		metrics.RecordTenantOperation(t.tenantLabel(), "extent_storage", "refresh_credential", metrics.ResultForError(err), time.Since(start))
+		return t.tok, nil
+	}
+	t.cred = *next
+	t.tok = &oauth2.Token{AccessToken: strings.TrimSpace(next.AccessToken), Expiry: credentialExpiry(next.ExpiresAt)}
+	metrics.RecordTenantOperation(t.tenantLabel(), "extent_storage", "refresh_credential", "ok", time.Since(start))
+	return t.tok, nil
+}
+
+func (t *gcsTokenSource) tenantLabel() string {
+	if t.cred.TenantID != "" {
+		return t.cred.TenantID
+	}
+	return tenantFromPrefix(t.cred.Prefix)
+}
+
+// credentialExpiry parses an RFC3339 expiry; empty or malformed means "never
+// refresh" (zero time).
+func credentialExpiry(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	exp, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return exp
+}
+
 // newGCSTokenStorage builds a bucket-scoped GCS store that authenticates with
-// accessToken. A non-empty endpoint is the Cloud Storage JSON API root
+// tokenSource, which renews the server-minted tenant token in place so the
+// client is created once and never superseded. A non-empty endpoint is the
+// Cloud Storage JSON API root
 // (https://storage.googleapis.com/storage/v1/, or an emulator's
 // .../storage/v1/), not a bare host and not a path-prefixed proxy base: it
 // replaces the generated client's BasePath and receives the bearer token, but
@@ -48,14 +131,13 @@ type gcsTokenStorage struct {
 // both legs under the configured endpoint. It must be https; plaintext http is
 // accepted only on loopback (a local emulator, where the credential never
 // leaves the box). Reads use the JSON API so this base path is honoured.
-func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint string) (*gcsTokenStorage, error) {
+func newGCSTokenStorage(ctx context.Context, bucket string, tokenSource oauth2.TokenSource, endpoint string) (*gcsTokenStorage, error) {
 	bucket = strings.TrimSpace(bucket)
 	if bucket == "" {
 		return nil, fmt.Errorf("gcs bucket is required")
 	}
-	accessToken = strings.TrimSpace(accessToken)
-	if accessToken == "" {
-		return nil, fmt.Errorf("gcs access token is required")
+	if tokenSource == nil {
+		return nil, fmt.Errorf("gcs token source is required")
 	}
 	// storage.NewClient diverts to its emulator branch whenever
 	// STORAGE_EMULATOR_HOST is set, and that branch installs
@@ -72,7 +154,7 @@ func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint strin
 		}
 	}
 	opts := []option.ClientOption{
-		option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: accessToken})),
+		option.WithTokenSource(tokenSource),
 		// Read through the JSON API: the XML read path drops the configured
 		// /storage/v1/ base path, so Head could succeed while Get failed.
 		storage.WithJSONReads(),

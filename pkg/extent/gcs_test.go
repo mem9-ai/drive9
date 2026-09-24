@@ -124,7 +124,7 @@ func TestOpenStorageGCSAppliesTenantPrefix(t *testing.T) {
 // TestOpenInnerGCSStore pins the bucket-scoped store itself: OpenStorage wraps
 // it in object.WithPrefix, so the concrete type is only visible here.
 func TestOpenInnerGCSStore(t *testing.T) {
-	st, err := openInner(&Credential{Scheme: SchemeGCS, Bucket: "prod-drive9-gcs-us-east1", AccessToken: "tok"})
+	st, err := openInner(&Credential{Scheme: SchemeGCS, Bucket: "prod-drive9-gcs-us-east1", AccessToken: "tok"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestGCSStoreHonoursEndpointAndPresentsToken(t *testing.T) {
 		// Slash-less base path: it must be normalised so requests still land
 		// under /storage/v1/b/.
 		Endpoint: url + "/storage/v1",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestGCSStoreHonoursEndpointAndPresentsToken(t *testing.T) {
 // endpoint must be the API root.
 func TestGCSUploadUsesAPIRoot(t *testing.T) {
 	f, url := newGCSFake(t, http.StatusNotFound)
-	gs, err := newGCSTokenStorage(context.Background(), "bucket", "tok", url+"/storage/v1/")
+	gs, err := newGCSTokenStorage(context.Background(), "bucket", newGCSTokenSource(Credential{AccessToken: "tok"}, nil), url+"/storage/v1/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,18 +202,66 @@ func TestGCSUploadUsesAPIRoot(t *testing.T) {
 func TestGCSEmulatorHostMustBeLoopback(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("STORAGE_EMULATOR_HOST", "evil.example")
-	if _, err := newGCSTokenStorage(ctx, "bucket", "tok", ""); err == nil {
+	if _, err := newGCSTokenStorage(ctx, "bucket", newGCSTokenSource(Credential{AccessToken: "tok"}, nil), ""); err == nil {
 		t.Fatal("a non-loopback STORAGE_EMULATOR_HOST must be rejected")
 	}
 	t.Setenv("STORAGE_EMULATOR_HOST", "127.0.0.1:9000")
-	if _, err := newGCSTokenStorage(ctx, "bucket", "tok", "https://gw.example.com/storage/v1/"); err == nil {
+	if _, err := newGCSTokenStorage(ctx, "bucket", newGCSTokenSource(Credential{AccessToken: "tok"}, nil), "https://gw.example.com/storage/v1/"); err == nil {
 		t.Fatal("STORAGE_EMULATOR_HOST with an explicit endpoint must be rejected")
 	}
-	gs, err := newGCSTokenStorage(ctx, "bucket", "tok", "")
+	gs, err := newGCSTokenStorage(ctx, "bucket", newGCSTokenSource(Credential{AccessToken: "tok"}, nil), "")
 	if err != nil {
 		t.Fatalf("loopback emulator host rejected: %v", err)
 	}
 	gs.Shutdown()
+}
+
+// countingCredentialSource counts mints.
+type countingCredentialSource struct {
+	mu    sync.Mutex
+	calls int
+	cred  *Credential
+}
+
+func (c *countingCredentialSource) GetDataCredential(context.Context) (*Credential, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	return c.cred, nil
+}
+
+// TestGCSTokenSourceRefreshesInPlace pins the design that replaced the
+// per-generation client refcount: one token source mints when due and reuses the
+// token otherwise, so the client is never superseded.
+func TestGCSTokenSourceRefreshesInPlace(t *testing.T) {
+	src := &countingCredentialSource{cred: &Credential{AccessToken: "fresh", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339)}}
+	ts := newGCSTokenSource(Credential{AccessToken: "stale", ExpiresAt: time.Now().Add(-time.Minute).Format(time.RFC3339)}, src)
+	tok, err := ts.Token()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.AccessToken != "fresh" {
+		t.Fatalf("token = %q, want fresh", tok.AccessToken)
+	}
+	if src.calls != 1 {
+		t.Fatalf("mints = %d, want 1", src.calls)
+	}
+	if _, err := ts.Token(); err != nil {
+		t.Fatal(err)
+	}
+	if src.calls != 1 {
+		t.Fatalf("mints = %d after a fresh token, want 1", src.calls)
+	}
+
+	// A credential without an expiry is static and never mints.
+	staticSrc := &countingCredentialSource{cred: &Credential{AccessToken: "unused"}}
+	staticTS := newGCSTokenSource(Credential{AccessToken: "static"}, staticSrc)
+	if _, err := staticTS.Token(); err != nil {
+		t.Fatal(err)
+	}
+	if staticSrc.calls != 0 {
+		t.Fatalf("static credential minted %d times, want 0", staticSrc.calls)
+	}
 }
 
 // TestGCSDeleteIsIdempotent mirrors JuiceFS's gs backend: deleting an object is
@@ -229,7 +277,7 @@ func TestGCSDeleteIsIdempotent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f, url := newGCSFake(t, http.StatusNotFound)
 			f.deleteStatus = tc.deleteStatus
-			gs, err := newGCSTokenStorage(context.Background(), "bucket", "tok", url+"/storage/v1/")
+			gs, err := newGCSTokenStorage(context.Background(), "bucket", newGCSTokenSource(Credential{AccessToken: "tok"}, nil), url+"/storage/v1/")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -262,41 +310,22 @@ func TestClosedStoreRefusesIO(t *testing.T) {
 	}
 }
 
-// TestSupersededStoreRetiredOnlyWhenIdle pins the refcount: a store held by an
-// in-flight operation is not shut down by a refresh until the last holder
-// releases.
-func TestSupersededStoreRetiredOnlyWhenIdle(t *testing.T) {
-	ctx := context.Background()
+// TestRefreshReplacesSupersededStore pins the simplified refresh: a due
+// credential re-opens the stateless S3/file store and releases the one it
+// replaces. There is no held-generation refcount because such a store owns no
+// client; the GCS client renews its own token instead of being replaced.
+func TestRefreshReplacesSupersededStore(t *testing.T) {
 	rec := newShutdownRecorder(t)
+	due := time.Now().Add(-time.Minute).Format(time.RFC3339)
 	st := &refreshingStore{
-		src:    staticCredentialSource{cred: &Credential{Scheme: SchemeGCS, Bucket: "bucket", AccessToken: "fresh", ExpiresAt: time.Now().Add(-time.Minute).Format(time.RFC3339)}},
+		src:    staticCredentialSource{cred: &Credential{Scheme: SchemeGCS, Bucket: "bucket", AccessToken: "fresh", ExpiresAt: due}},
 		inner:  object.WithPrefix(rec, "t/x/"),
-		cred:   Credential{Scheme: SchemeGCS},
+		cred:   Credential{Scheme: SchemeGCS, ExpiresAt: due},
 		scheme: SchemeGCS,
 	}
-	// First holder: the seeded credential has no expiry, so no refresh happens.
-	_, release1, err := st.acquireInner(ctx)
-	if err != nil {
+	if _, err := st.store(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// Make the current credential due so the next acquire refreshes.
-	st.mu.Lock()
-	st.cred.ExpiresAt = time.Now().Add(-time.Minute).Format(time.RFC3339)
-	st.mu.Unlock()
-
-	_, release2, err := st.acquireInner(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { object.Shutdown(st.inner) })
-	if got := rec.shutdowns.Load(); got != 0 {
-		t.Fatalf("superseded store shut down with a holder: %d", got)
-	}
-	release1()
-	if got := rec.shutdowns.Load(); got != 0 {
-		t.Fatalf("superseded store shut down with a holder: %d", got)
-	}
-	release2()
 	if got := rec.shutdowns.Load(); got != 1 {
 		t.Fatalf("superseded store shutdowns = %d, want 1", got)
 	}
@@ -314,7 +343,7 @@ func TestGCSEndpointValidation(t *testing.T) {
 		"https://gw.example.com/gcs/storage/v1/", // path prefix: uploads would drop it
 	} {
 		t.Run("reject "+endpoint, func(t *testing.T) {
-			if _, err := newGCSTokenStorage(ctx, "bucket", "tok", endpoint); err == nil {
+			if _, err := newGCSTokenStorage(ctx, "bucket", newGCSTokenSource(Credential{AccessToken: "tok"}, nil), endpoint); err == nil {
 				t.Fatalf("endpoint %q must be rejected", endpoint)
 			}
 		})
@@ -325,7 +354,7 @@ func TestGCSEndpointValidation(t *testing.T) {
 		"http://127.0.0.1:9000/storage/v1/",   // loopback emulator
 	} {
 		t.Run("accept "+endpoint, func(t *testing.T) {
-			gs, err := newGCSTokenStorage(ctx, "bucket", "tok", endpoint)
+			gs, err := newGCSTokenStorage(ctx, "bucket", newGCSTokenSource(Credential{AccessToken: "tok"}, nil), endpoint)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -358,7 +387,7 @@ func TestOpenStorageCanonicalScheme(t *testing.T) {
 // TestGCSWriterUsesExtentChunkSize pins the upload chunk contract: a dropped
 // ChunkSize would otherwise only show up as buffered uploads in production.
 func TestGCSWriterUsesExtentChunkSize(t *testing.T) {
-	gs, err := newGCSTokenStorage(context.Background(), "bucket", "tok", "")
+	gs, err := newGCSTokenStorage(context.Background(), "bucket", newGCSTokenSource(Credential{AccessToken: "tok"}, nil), "")
 	if err != nil {
 		t.Fatal(err)
 	}

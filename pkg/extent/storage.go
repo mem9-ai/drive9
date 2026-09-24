@@ -110,7 +110,7 @@ func OpenStorage(cred *Credential, src CredentialSource) (object.ObjectStorage, 
 	if cred == nil {
 		return nil, fmt.Errorf("nil data credential")
 	}
-	inner, err := openInner(cred)
+	inner, err := openInner(cred, src)
 	if err != nil {
 		return nil, err
 	}
@@ -121,8 +121,14 @@ func OpenStorage(cred *Credential, src CredentialSource) (object.ObjectStorage, 
 	if prefix != "" {
 		inner = object.WithPrefix(inner, prefix)
 	}
+	// The GCS client renews its own token in place, so the wrapper never swaps
+	// it; only the stateless S3/file arms re-open on refresh.
+	wrapperSrc := src
+	if canonicalExtentScheme(cred.Scheme) == SchemeGCS {
+		wrapperSrc = nil
+	}
 	return &refreshingStore{
-		src:      src,
+		src:      wrapperSrc,
 		inner:    inner,
 		cred:     *cred,
 		scheme:   canonicalExtentScheme(cred.Scheme),
@@ -190,7 +196,7 @@ func withS3StyleEnv(forcePathStyle bool, create func() (object.ObjectStorage, er
 	return st, err
 }
 
-func openInner(cred *Credential) (object.ObjectStorage, error) {
+func openInner(cred *Credential, src CredentialSource) (object.ObjectStorage, error) {
 	switch canonicalExtentScheme(cred.Scheme) {
 	case SchemeFile:
 		root := cred.Endpoint
@@ -215,12 +221,11 @@ func openInner(cred *Credential) (object.ObjectStorage, error) {
 		// canonicalExtentScheme folds the object-backend/objectfs "gs" spelling
 		// onto the extent wire value "gcs". An endpoint is honoured for an
 		// emulator or a private/regional JSON API base; the server's own mint
-		// leaves it empty.
-		st, err := newGCSTokenStorage(context.Background(), cred.Bucket, cred.AccessToken, cred.Endpoint)
-		if err != nil {
-			return nil, err
+		// leaves it empty. The client renews its own token from src in place.
+		if strings.TrimSpace(cred.AccessToken) == "" {
+			return nil, fmt.Errorf("gcs access token is required")
 		}
-		return st, nil
+		return newGCSTokenStorage(context.Background(), cred.Bucket, newGCSTokenSource(*cred, src), cred.Endpoint)
 	case "drive9":
 		return nil, fmt.Errorf("extent data plane does not proxy blocks through drive9-server")
 	default:
@@ -259,11 +264,10 @@ func endpointWithBucket(endpoint, bucket string) string {
 	return trimmed + "/" + bucket
 }
 
-// refreshingStore swaps its inner store when the credential is about to expire.
-// The refcount/retire machinery below exists for client-owning stores (GCS): a
-// superseded store holds a client that must be closed exactly once and never
-// under an in-flight caller. S3/file refreshes do append to retired whenever a
-// caller is in flight, but object.Shutdown is a no-op for those arms.
+// refreshingStore renews a stateless S3/file session by re-opening the inner
+// store when the credential is near expiry. The GCS client is not handled here:
+// it renews its own token in place (see gcsTokenSource), so no superseded store
+// ever owns a resource that needs exactly-once teardown.
 type refreshingStore struct {
 	object.DefaultObjectStorage
 	src    CredentialSource
@@ -276,16 +280,9 @@ type refreshingStore struct {
 	// (scheme is likewise written once at construction).
 	prefix   string
 	tenantID string
-	// closed is set under mu by Shutdown; acquireInner refuses to serve or
-	// refresh after teardown, so a late renewal cannot resurrect a client
-	// nothing will close.
+	// closed is set under mu by Shutdown; store() refuses to serve or refresh
+	// after teardown.
 	closed bool
-	// inflight counts callers holding an inner store outside mu, and retired
-	// holds stores that must be disposed once inflight drops to zero. A
-	// superseded or closed store is therefore never shut down under an
-	// in-flight caller.
-	inflight int
-	retired  []object.ObjectStorage
 	// refreshLead is how long before expiry this store renews, jittered per
 	// store instance (see credentialRefreshLead).
 	refreshLead time.Duration
@@ -302,8 +299,7 @@ func (s *refreshingStore) Scheme() string { return s.scheme }
 func (s *refreshingStore) Prefix() string { return s.prefix }
 
 // Shutdown releases the inner store's resources (for example the GCS client).
-// It is idempotent, and a store still held by an in-flight operation is
-// disposed when the last holder releases rather than under it.
+// It is idempotent.
 func (s *refreshingStore) Shutdown() {
 	if s == nil {
 		return
@@ -314,57 +310,19 @@ func (s *refreshingStore) Shutdown() {
 		return
 	}
 	s.closed = true
-	s.retireLocked(s.inner)
+	object.Shutdown(s.inner)
 }
 
-// release ends one acquireInner hold, disposing retired stores once no caller
-// holds an inner store.
-func (s *refreshingStore) release() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.inflight == 0 {
-		return
-	}
-	s.inflight--
-	if s.inflight == 0 {
-		s.flushRetiredLocked()
-	}
-}
-
-// retireLocked releases store now when no caller holds an inner store, else
-// defers it until the last holder releases.
-func (s *refreshingStore) retireLocked(store object.ObjectStorage) {
-	if store == nil {
-		return
-	}
-	if s.inflight > 0 {
-		s.retired = append(s.retired, store)
-		return
-	}
-	object.Shutdown(store)
-}
-
-func (s *refreshingStore) flushRetiredLocked() {
-	for _, store := range s.retired {
-		object.Shutdown(store)
-	}
-	s.retired = nil
-}
-
-// acquireInner returns the inner store for one operation and the release the
-// caller must run when it is done, so the store cannot be disposed mid-use.
-func (s *refreshingStore) acquireInner(ctx context.Context) (object.ObjectStorage, func(), error) {
+// store returns the inner store for one operation, refreshing the session first
+// when needed. The returned store is safe to use without a hold: S3/file stores
+// are stateless and the GCS client is never replaced.
+func (s *refreshingStore) store(ctx context.Context) (object.ObjectStorage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil, nil, errExtentStoreClosed
+		return nil, errExtentStoreClosed
 	}
-	inner, err := s.innerStoreLocked(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	s.inflight++
-	return inner, s.release, nil
+	return s.innerStoreLocked(ctx)
 }
 
 func (s *refreshingStore) PutCount() int64 { return s.puts.Load() }
@@ -439,11 +397,9 @@ func (s *refreshingStore) innerStoreLocked(ctx context.Context) (object.ObjectSt
 	s.cred = rs.cred // refresh the expiry the next call checks
 	// scheme/prefix/tenantID are stable across refreshes and stay immutable, so
 	// the read-only accessors never race with this write.
-	// A GCS store owns a storage client; replacing it without releasing the old
-	// one would leak a client per renewal. S3/file stores are not Shutdownable,
-	// so this is a no-op for them. Retire rather than close in place, so an
-	// in-flight caller keeps a live client.
-	s.retireLocked(superseded)
+	// Only stateless S3/file stores reach here, so releasing the superseded one
+	// is a no-op; GCS renews its own client in place.
+	object.Shutdown(superseded)
 	metrics.RecordTenantOperation(s.tenantLabel(), "extent_storage", "refresh_credential", "ok", time.Since(start))
 	return s.inner, nil
 }
@@ -458,58 +414,36 @@ func (s *refreshingStore) recordRefreshFailure(ctx context.Context, step string,
 	metrics.RecordTenantOperation(tenant, "extent_storage", "refresh_credential", metrics.ResultForError(err), time.Since(start))
 }
 
-// releasingReadCloser keeps a store generation alive until the reader is
-// closed, so a concurrent refresh cannot dispose the client mid-stream.
-type releasingReadCloser struct {
-	io.ReadCloser
-	once    sync.Once
-	release func()
-}
-
-func (r *releasingReadCloser) Close() error {
-	err := r.ReadCloser.Close()
-	r.once.Do(r.release)
-	return err
-}
-
 func (s *refreshingStore) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
-	inner, release, err := s.acquireInner(ctx)
+	inner, err := s.store(ctx)
 	if err != nil {
-		return nil, err
-	}
-	rc, err := inner.Get(ctx, key, off, limit, getters...)
-	if err != nil {
-		release()
 		return nil, err
 	}
 	s.gets.Add(1)
-	return &releasingReadCloser{ReadCloser: rc, release: release}, nil
+	return inner.Get(ctx, key, off, limit, getters...)
 }
 
 func (s *refreshingStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
-	inner, release, err := s.acquireInner(ctx)
+	inner, err := s.store(ctx)
 	if err != nil {
 		return err
 	}
-	defer release()
 	s.puts.Add(1)
 	return inner.Put(ctx, key, in, getters...)
 }
 
 func (s *refreshingStore) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
-	inner, release, err := s.acquireInner(ctx)
+	inner, err := s.store(ctx)
 	if err != nil {
 		return err
 	}
-	defer release()
 	return inner.Delete(ctx, key, getters...)
 }
 
 func (s *refreshingStore) Head(ctx context.Context, key string) (object.Object, error) {
-	inner, release, err := s.acquireInner(ctx)
+	inner, err := s.store(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer release()
 	return inner.Head(ctx, key)
 }
