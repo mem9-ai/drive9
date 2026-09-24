@@ -688,6 +688,11 @@ func (cq *CommitQueue) RecoverPending() {
 	if cq.index == nil {
 		return
 	}
+	// Startup only: reconcile cold disk accounting before the first enqueue
+	// lets workers mutate or remove any recovered payload.
+	if cq.shadows != nil {
+		cq.shadows.RecoverPendingBytes()
+	}
 	for path := range cq.index.ListPendingPaths() {
 		meta, ok := cq.index.GetMeta(path)
 		if !ok {
