@@ -3751,12 +3751,15 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncateState(ino uint64, callerPID ui
 				continue
 			}
 		}
-		if cleanHandle && remoteStaged {
-			// The path-scoped queue entry, not this handle, owns the zero
-			// mutation. Reflect the acknowledged local view without creating a
-			// second dirty generation. Write() drains the queued path commit
-			// before taking the commit fence; its success callback can therefore
-			// advance BaseRev before any new payload is prepared.
+		if cleanHandle && (remoteStaged || (remoteCommitted && fs.layerEnabled())) {
+			// The path-scoped queue entry (normal mounts) or the already-durable
+			// layer entry owns the zero mutation. Reflect the acknowledged local
+			// view without creating a second dirty generation. In layer mode the
+			// base revision deliberately remains the underlying file revision: a
+			// later layer upsert is another overlay entry against that same base.
+			// Marking every clean handle dirty here lets a delayed Release append
+			// an empty layer entry after a newer content entry, so the layer commit
+			// silently publishes an empty file.
 			fs.adoptCommittedStorageClassLocked(fh, newSize)
 			if fh.Dirty.Size() != newSize {
 				if err := fh.Dirty.Truncate(newSize); err != nil {

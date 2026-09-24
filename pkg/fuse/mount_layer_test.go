@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1162,6 +1163,170 @@ func TestLayerSetAttrTruncateWritesLayerEntryNotBase(t *testing.T) {
 	meta, ok := pending.GetMeta("/base.txt")
 	if !ok || meta.Size != 0 || meta.BaseRev != 7 || !meta.HasMode || meta.Mode != 0o640 {
 		t.Fatalf("pending meta = %+v, want empty base rev 7 mode 0640", meta)
+	}
+}
+
+func TestLayerSetAttrTruncateDoesNotGiveDelayedCleanHandleAnEmptyGeneration(t *testing.T) {
+	const (
+		localPath    = "/base.txt"
+		remotePath   = "/repo/base.txt"
+		baseRevision = int64(7)
+		oldPID       = uint32(4101)
+		writerPID    = uint32(4102)
+	)
+	base := []byte("base content")
+	updated := []byte("edited in layer")
+
+	var (
+		mu       sync.Mutex
+		requests []clientLayerEntryRequest
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+remotePath:
+			w.Header().Set("Content-Length", strconv.Itoa(len(base)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(baseRevision, 10))
+			w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(0o644), 10))
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+remotePath:
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(baseRevision, 10))
+			_, _ = w.Write(base)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries":
+			var req clientLayerEntryRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode layer entry: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			requests = append(requests, req)
+			seq := len(requests)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+				LayerID:      "layer-1",
+				Path:         req.Path,
+				Op:           req.Op,
+				Kind:         req.Kind,
+				BaseRevision: req.BaseRevision,
+				Content:      req.Content,
+				SizeBytes:    req.SizeBytes,
+				EntrySeq:     int64(seq),
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{
+		LayerRef:      "layer-1",
+		RemoteRoot:    "/repo",
+		SyncMode:      SyncStrict,
+		WritePolicy:   WritePolicyCloseSync,
+		FlushDebounce: 0,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	ino := fs.inodes.Lookup(localPath, false, int64(len(base)), time.Now())
+	fs.inodes.UpdateRevision(ino, baseRevision)
+
+	openWriter := func(pid uint32) gofuse.OpenOut {
+		t.Helper()
+		var out gofuse.OpenOut
+		if st := fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+			Flags:    uint32(syscall.O_WRONLY),
+		}, &out); st != gofuse.OK {
+			t.Fatalf("Open(pid=%d) status = %v, want OK", pid, st)
+		}
+		return out
+	}
+
+	// Keep a clean handle from an earlier process registered while a later
+	// writer performs the OPEN -> SETATTR(O_TRUNC) sequence. Layer truncate is
+	// already durable after the first upsert; neither handle may acquire a
+	// second dirty zero generation whose delayed Release can become the latest
+	// layer entry after the writer's content.
+	old := openWriter(oldPID)
+	writer := openWriter(writerPID)
+	var attrOut gofuse.AttrOut
+	if st := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: writerPID}},
+		Valid:    gofuse.FATTR_SIZE,
+		Size:     0,
+	}}, &attrOut); st != gofuse.OK {
+		t.Fatalf("SetAttr truncate status = %v, want OK", st)
+	}
+	for name, id := range map[string]uint64{"old": old.Fh, "writer": writer.Fh} {
+		fh, ok := fs.fileHandles.Get(id)
+		if !ok {
+			t.Fatalf("%s handle missing after SetAttr", name)
+		}
+		fh.Lock()
+		dirtySeq := fh.DirtySeq
+		dirty := fh.Dirty != nil && fh.Dirty.HasDirtyParts()
+		size := int64(-1)
+		if fh.Dirty != nil {
+			size = fh.Dirty.Size()
+		}
+		fh.Unlock()
+		if dirtySeq != 0 || dirty || size != 0 {
+			t.Fatalf("%s handle after durable layer truncate: seq=%d dirty=%t size=%d, want clean size 0", name, dirtySeq, dirty, size)
+		}
+	}
+
+	mu.Lock()
+	if len(requests) != 1 || requests[0].SizeBytes != 0 || len(requests[0].Content) != 0 {
+		got := append([]clientLayerEntryRequest(nil), requests...)
+		mu.Unlock()
+		t.Fatalf("layer requests after truncate = %+v, want one empty upsert", got)
+	}
+	mu.Unlock()
+
+	// A delayed Release of the older clean handle is lifecycle-only. Without
+	// the clean-layer rebase above it sends a second empty upsert here.
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: oldPID}},
+		Fh:       old.Fh,
+	})
+	mu.Lock()
+	if len(requests) != 1 {
+		got := append([]clientLayerEntryRequest(nil), requests...)
+		mu.Unlock()
+		t.Fatalf("delayed clean Release appended a layer entry: %+v", got)
+	}
+	mu.Unlock()
+
+	if n, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: writerPID}},
+		Fh:       writer.Fh,
+		Offset:   0,
+		Size:     uint32(len(updated)),
+	}, updated); st != gofuse.OK || n != uint32(len(updated)) {
+		t.Fatalf("Write = (%d, %v), want (%d, OK)", n, st, len(updated))
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: writerPID}},
+		Fh:       writer.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: writerPID}},
+		Fh:       writer.Fh,
+	})
+
+	mu.Lock()
+	got := append([]clientLayerEntryRequest(nil), requests...)
+	mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("layer requests = %+v, want truncate then content", got)
+	}
+	if !bytes.Equal(got[1].Content, updated) || got[1].SizeBytes != int64(len(updated)) {
+		t.Fatalf("final layer entry = %+v, want content %q", got[1], updated)
 	}
 }
 
