@@ -166,22 +166,24 @@ func builtinExtentProfile() profileConfig {
 
 func builtinCodingAgentProfile() profileConfig {
 	return profileConfig{
-		Name:               defaultMountProfile,
-		Source:             "builtin:coding-agent",
-		LocalOnlyPatterns:  builtinCodingAgentLocalOnlyPatterns(),
-		RemoteOnlyPatterns: nil,
-		AppendLogPatterns:  []string{"**/*-wal"},
-		PackPaths:          nil,
+		Name:                    defaultMountProfile,
+		Source:                  "builtin:coding-agent",
+		LocalOnlyPatterns:       builtinCodingAgentLocalOnlyPatterns(),
+		RemoteOnlyPatterns:      nil,
+		LocalOnlyGitignoreAware: boolPtr(true),
+		AppendLogPatterns:       []string{"**/*-wal"},
+		PackPaths:               nil,
 	}
 }
 
 func builtinPortableProfile() profileConfig {
 	return profileConfig{
-		Name:               portableMountProfile,
-		Source:             "builtin:portable",
-		LocalOnlyPatterns:  builtinCodingAgentLocalOnlyPatterns(),
-		RemoteOnlyPatterns: nil,
-		PackPaths:          []string{"/"},
+		Name:                    portableMountProfile,
+		Source:                  "builtin:portable",
+		LocalOnlyPatterns:       builtinCodingAgentLocalOnlyPatterns(),
+		RemoteOnlyPatterns:      nil,
+		LocalOnlyGitignoreAware: boolPtr(true),
+		PackPaths:               []string{"/"},
 	}
 }
 
@@ -228,7 +230,9 @@ func builtinCodingAgentLocalOnlyPatterns() []string {
 }
 
 func parseProfileConfig(name, source, body string) (profileConfig, error) {
-	cfg := profileConfig{Name: name, Source: source}
+	// Default the gitignore-aware gate to true, matching the built-in behavior;
+	// an explicit `local-only-gitignore-aware = false|true` line overrides it.
+	cfg := profileConfig{Name: name, Source: source, LocalOnlyGitignoreAware: boolPtr(true)}
 	section := "local"
 	for lineNo, raw := range strings.Split(body, "\n") {
 		line := strings.TrimSpace(raw)
@@ -277,10 +281,14 @@ func formatProfileConfig(cfg profileConfig) string {
 	if cfg.Source != "" {
 		fmt.Fprintf(&b, "# source: %s\n", cfg.Source)
 	}
-	// Emit the setting only when explicitly set so builtins round-trip and the
-	// default (true) is not restated for every profile.
-	if cfg.LocalOnlyGitignoreAware != nil {
-		fmt.Fprintf(&b, "%s = %t\n", localOnlyGitignoreAwareKey, *cfg.LocalOnlyGitignoreAware)
+	// Show the setting for every overlay profile so it is discoverable via
+	// `drive9 profile show`; an unset value means the true default.
+	if profileAllowsOverlay(cfg.Name) {
+		aware := true
+		if cfg.LocalOnlyGitignoreAware != nil {
+			aware = *cfg.LocalOnlyGitignoreAware
+		}
+		fmt.Fprintf(&b, "%s = %t\n", localOnlyGitignoreAwareKey, aware)
 	}
 	writeProfileSection(&b, "local", cfg.LocalOnlyPatterns, "no local-only overlay paths")
 	writeProfileSection(&b, "remote", cfg.RemoteOnlyPatterns, "no remote override paths")
@@ -289,6 +297,8 @@ func formatProfileConfig(cfg profileConfig) string {
 	writeProfileSection(&b, "extent", cfg.ExtentPatterns, "no extent path patterns")
 	return b.String()
 }
+
+func boolPtr(v bool) *bool { return &v }
 
 // splitProfileSetting splits a `key = value` line. It reports ok only when the
 // line has the exact shape (a non-empty key and a non-empty value around a

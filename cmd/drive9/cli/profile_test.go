@@ -153,15 +153,32 @@ func TestProfileLocalOnlyGitignoreAwareRoundTrip(t *testing.T) {
 	}
 }
 
-func TestBuiltinProfilesLeaveGitignoreAwareUnset(t *testing.T) {
+func TestBuiltinProfilesDefaultGitignoreAwareTrue(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	for _, name := range []string{"", "coding-agent", "portable", "coding-agent-extent"} {
 		cfg, err := loadProfileConfig(name)
 		if err != nil {
 			t.Fatalf("loadProfileConfig(%q): %v", name, err)
 		}
-		if cfg.LocalOnlyGitignoreAware != nil {
-			t.Fatalf("builtin %q should leave gitignore-aware unset for the default, got %v", name, *cfg.LocalOnlyGitignoreAware)
+		if cfg.LocalOnlyGitignoreAware == nil || !*cfg.LocalOnlyGitignoreAware {
+			t.Fatalf("builtin %q gitignore-aware = %v, want explicit true", name, cfg.LocalOnlyGitignoreAware)
+		}
+		// Show must surface the setting so it is discoverable.
+		if out := formatProfileConfig(cfg); !strings.Contains(out, "local-only-gitignore-aware = true") {
+			t.Fatalf("builtin %q show output missing setting: %q", name, out)
+		}
+	}
+}
+
+func TestProfileShowOmitsGitignoreAwareForNonOverlay(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, name := range []string{"none", "extent"} {
+		cfg, err := loadProfileConfig(name)
+		if err != nil {
+			t.Fatalf("loadProfileConfig(%q): %v", name, err)
+		}
+		if out := formatProfileConfig(cfg); strings.Contains(out, localOnlyGitignoreAwareKey) {
+			t.Fatalf("%q is not an overlay profile and should not print the setting: %q", name, out)
 		}
 	}
 }
