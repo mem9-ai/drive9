@@ -185,12 +185,20 @@ before requests are served. Both asynchronous and synchronous recovery refuse
 a shadow shorter than the selected metadata, including when journal setup
 failed and only `.meta` survived. Recovery uploads retain the metadata's CAS base.
 
-Legacy migration only fills a missing shadow: a best-effort `.dat` snapshot can
-be older than acknowledged shadow staging. Full WAL metadata with a newer
+Legacy migration repairs a missing or short shadow from a complete `.dat`
+snapshot only when recovery still selects that snapshot's metadata. A complete
+shadow is preserved because a best-effort `.dat` snapshot can be older than
+acknowledged shadow staging. Full WAL metadata with a newer
 publication timestamp supersedes older disk metadata left by a failed snapshot;
 older WAL metadata and legacy fsync frames do not displace newer disk metadata.
+Rejecting missing or short WAL data preserves an older complete `.meta`/`.dat`
+publication with its original CAS revision. Before restoring those bytes,
+recovery durably appends the fallback metadata to supersede the rejected frame;
+a second crash cannot bind the restored bytes to that frame's newer revision.
+Failure to publish this recovery decision aborts mount before migration.
 Recovered publication generations advance the counter before new writes start.
-Migration errors close the initialized journal, syncer and shadow descriptors.
+Startup accounting is reconciled before the first recovery enqueue. Replay,
+migration and layer-restore errors stop workers before closing staging resources.
 
 `Read` checks its shadow pin once at the shadow-read branch using resident state
 only: no path lock, disk lookup or unlink on a cache miss. `Open` applies the

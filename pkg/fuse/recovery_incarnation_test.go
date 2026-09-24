@@ -342,6 +342,7 @@ func TestFailedMountStagingClosesResources(t *testing.T) {
 		t.Fatal(err)
 	}
 	fs.journal = j
+	fs.commitQueue = NewCommitQueue(fs.client, fs.shadowStore, fs.pendingIndex, j, 1, 8)
 	ctx, cancel := context.WithCancel(context.Background())
 	fs.journalSyncerCancel = cancel
 	if err := fs.shadowStore.WriteFull("/file", []byte("data"), 1); err != nil {
@@ -349,6 +350,9 @@ func TestFailedMountStagingClosesResources(t *testing.T) {
 	}
 	fd := fs.shadowStore.files["/file"].fd
 	closeFailedMountStaging(fs)
+	if !fs.commitQueue.stopped {
+		t.Fatal("commit workers not stopped before staging was closed")
+	}
 	if ctx.Err() != context.Canceled {
 		t.Fatal("syncer not canceled")
 	}
@@ -422,57 +426,6 @@ func TestReplayFullMetadataKeepsNewerDiskPublication(t *testing.T) {
 	got, _ := idx.GetMeta("/file")
 	if got.Generation != latest || got.Size != 4 || got.BaseRev != 8 {
 		t.Fatalf("newer disk metadata replaced: %+v", got)
-	}
-}
-
-func TestReplayTornNewPublicationDoesNotResurrectOldSnapshot(t *testing.T) {
-	s, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	idx, err := NewPendingIndex(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	cache, err := NewWriteBackCache(idx.dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const path = "/file"
-	if err := cache.PutWithBaseRev(path, []byte("old"), 3, PendingOverwrite, 7); err != nil {
-		t.Fatal(err)
-	}
-	if err := idx.RecoverFromDisk(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(s.shadowPath(path), []byte("to"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	meta := WriteBackMeta{Path: path, Size: 10, Generation: 9, Kind: PendingOverwrite, BaseRev: 7, Mtime: time.Now()}
-	raw, err := json.Marshal(meta)
-	if err != nil {
-		t.Fatal(err)
-	}
-	j, err := NewJournal(filepath.Join(t.TempDir(), "wal"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = j.Close() }()
-	mustAppend(t, j, JournalEntry{Op: JournalPendingMeta, Path: path, Meta: raw})
-	mustFsync(t, j)
-	if err := replayJournalIntoPending(j, idx, s); err != nil {
-		t.Fatal(err)
-	}
-	after, err := NewWriteBackCache(idx.dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := migrateLegacyWriteBack(s, after, idx); err != nil {
-		t.Fatal(err)
-	}
-	if s.Has(path) || idx.HasPending(path) {
-		t.Fatal("rejected publication resurrected via older cache metadata")
 	}
 }
 
