@@ -21,7 +21,6 @@ CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
 FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
-FUSE_DEBUG="${FUSE_DEBUG:-0}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 RUN_FUSE_GIT_CLONE="${RUN_FUSE_GIT_CLONE:-0}"
 RUN_FUSE_UMOUNT_DURABLE="${RUN_FUSE_UMOUNT_DURABLE:-0}"
@@ -954,21 +953,14 @@ native_sync_f_available() {
 
 start_mount() {
   local mode="$1"
-  local args=(mount --mode=fuse)
-  if [ "$FUSE_DEBUG" = "1" ]; then
-    args+=(--debug)
-  fi
-  if [ "$mode" = "ro" ]; then
-    args+=(--read-only)
-  fi
-  if [ -n "${FUSE_PROFILE:-}" ]; then
-    args+=(--profile "$FUSE_PROFILE")
-  fi
-  args+=("$MOUNT_POINT")
   {
     echo "=== drive9 mount start mode=$mode time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
   } >>"$MOUNT_LOG"
-  drive9 "${args[@]}" >>"$MOUNT_LOG" 2>&1 &
+  if [ "$mode" = "ro" ]; then
+    drive9 mount --mode=fuse --read-only ${FUSE_PROFILE:+--profile} ${FUSE_PROFILE:+"$FUSE_PROFILE"} "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+  else
+    drive9 mount --mode=fuse ${FUSE_PROFILE:+--profile} ${FUSE_PROFILE:+"$FUSE_PROFILE"} "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+  fi
   MOUNT_PID="$!"
 
   if wait_mount_state mounted; then

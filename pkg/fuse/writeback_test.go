@@ -1810,7 +1810,7 @@ func TestCloseSyncPathTruncateDoesNotAdoptCleanUnreleasedHandle(t *testing.T) {
 	}
 }
 
-func TestWriteSyncTierTransitionRebasesCleanUnreleasedHandleAcrossPIDs(t *testing.T) {
+func TestWriteBackTierTransitionOpenThenSetAttrRebasesWriterAcrossPIDs(t *testing.T) {
 	const (
 		path      = "/tier-transition.bin"
 		firstPID  = 4242
@@ -1826,7 +1826,7 @@ func TestWriteSyncTierTransitionRebasesCleanUnreleasedHandleAcrossPIDs(t *testin
 	}
 	var (
 		mu            sync.Mutex
-		content             = []byte("seed\n")
+		content             = bytes.Repeat([]byte{0x11}, smallSize)
 		revision      int64 = 1
 		directPuts    int
 		completeCalls int
@@ -1988,7 +1988,7 @@ func TestWriteSyncTierTransitionRebasesCleanUnreleasedHandleAcrossPIDs(t *testin
 
 	c := newTestClient(ts.URL)
 	c.SetSmallFileThresholdForTests(50_000)
-	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict, WritePolicy: WritePolicyWriteSync}
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict, WritePolicy: WritePolicyWriteBack}
 	opts.setDefaults()
 	fs := NewDat9FS(c, opts)
 	shadow, err := NewShadowStore(t.TempDir())
@@ -2002,6 +2002,27 @@ func TestWriteSyncTierTransitionRebasesCleanUnreleasedHandleAcrossPIDs(t *testin
 	}
 	fs.shadowStore = shadow
 	fs.pendingIndex = pending
+	writeBack, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploader := NewWriteBackUploader(c, writeBack, 1, fs.remoteRoot())
+	uploader.OnSuccess = fs.onWriteBackUploadSuccess
+	uploader.SnapshotStagingGens = fs.snapshotStagingGens
+	fs.SetWriteBack(writeBack, uploader)
+	queue := NewCommitQueue(c, shadow, pending, nil, 1, 8, fs.remoteRoot())
+	queue.OnSuccess = fs.onCommitQueueSuccess
+	queue.OnUploaded = fs.onCommitQueueUploaded
+	queue.OnCleanup = fs.onCommitQueueCleanup
+	queue.OnDiscard = fs.onCommitQueueDiscard
+	queue.IsSuperseded = fs.commitEntrySuperseded
+	queue.PathLock = fs.lockRemoteCommitPath
+	queue.DurableWatermark = fs.latestCommittedRevision
+	fs.commitQueue = queue
+	t.Cleanup(func() {
+		queue.DrainAll()
+		uploader.DrainAll()
+	})
 
 	ino := fs.inodes.Lookup(path, false, int64(len(content)), time.Now())
 	fs.inodes.UpdateRevision(ino, revision)
@@ -2018,31 +2039,28 @@ func TestWriteSyncTierTransitionRebasesCleanUnreleasedHandleAcrossPIDs(t *testin
 		return out
 	}
 
+	// PID A observes the already-committed 10KiB generation and closes it.
+	// The required mounted gate then starts a different process for the 8MiB
+	// rewrite; keeping the PIDs distinct prevents a same-caller shortcut from
+	// masking the production ordering.
 	first := openWriter(firstPID, uint32(syscall.O_WRONLY))
-	small := bytes.Repeat([]byte{0x11}, smallSize)
-	if _, st := fs.Write(nil, &gofuse.WriteIn{
-		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: firstPID}},
-		Fh:       first.Fh,
-		Offset:   0,
-	}, small); st != gofuse.OK {
-		t.Fatalf("first Write status = %v, want OK", st)
-	}
 	if st := fs.Flush(nil, &gofuse.FlushIn{
 		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: firstPID}},
 		Fh:       first.Fh,
 	}); st != gofuse.OK {
 		t.Fatalf("first Flush status = %v, want OK", st)
 	}
-	firstFH, _ := fs.fileHandles.Get(first.Fh)
-	firstFH.Lock()
-	if firstFH.BaseRev != 2 || writableHandleHasPendingContentLocked(firstFH) {
-		t.Fatalf("first handle before truncate = base %d pending %t, want base 2 pending false", firstFH.BaseRev, writableHandleHasPendingContentLocked(firstFH))
-	}
-	firstFH.Unlock()
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: firstPID}},
+		Fh:       first.Fh,
+	})
 
-	// Model the kernel ordering observed in the real FUSE gate: the second
-	// process commits the path zero-truncate while the first process's clean
-	// handle remains registered, then opens its O_TRUNC writer.
+	// Linux delivered the failing production sequence as OPEN(WRONLY), then
+	// SETATTR(size=0), then writes on the same PID B handle. The kernel strips
+	// O_TRUNC from FUSE_OPEN in this form. The zero truncate is staged through
+	// CommitQueue and may commit before the first Write; PID B must adopt that
+	// authoritative revision rather than prepare its 8MiB payload on rev 1.
+	second := openWriter(secondPID, uint32(syscall.O_WRONLY))
 	var attrOut gofuse.AttrOut
 	if st := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
 		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
@@ -2051,20 +2069,14 @@ func TestWriteSyncTierTransitionRebasesCleanUnreleasedHandleAcrossPIDs(t *testin
 	}}, &attrOut); st != gofuse.OK {
 		t.Fatalf("SetAttr truncate status = %v, want OK", st)
 	}
-	firstFH.Lock()
-	if firstFH.BaseRev != 3 || writableHandleHasPendingContentLocked(firstFH) || firstFH.Dirty.Size() != 0 {
-		t.Fatalf("clean cross-PID handle after truncate = base %d pending %t size %d, want base 3 pending false size 0",
-			firstFH.BaseRev, writableHandleHasPendingContentLocked(firstFH), firstFH.Dirty.Size())
+	queue.WaitPath(path)
+	secondFH, _ := fs.fileHandles.Get(second.Fh)
+	secondFH.Lock()
+	if secondFH.BaseRev != 2 || writableHandleHasPendingContentLocked(secondFH) || secondFH.Dirty.Size() != 0 {
+		t.Fatalf("PID B handle after queued truncate = base %d pending %t size %d, want base 2 pending false size 0",
+			secondFH.BaseRev, writableHandleHasPendingContentLocked(secondFH), secondFH.Dirty.Size())
 	}
-	firstFH.Unlock()
-	// Release from the previous process is one-way and may be handled after
-	// the next process's SetAttr but before that process starts writing.
-	fs.Release(nil, &gofuse.ReleaseIn{
-		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: firstPID}},
-		Fh:       first.Fh,
-	})
-
-	second := openWriter(secondPID, uint32(syscall.O_WRONLY|syscall.O_TRUNC))
+	secondFH.Unlock()
 	large := bytes.Repeat([]byte{0x2b}, largeSize)
 	for offset := 0; offset < len(large); offset += 1024 * 1024 {
 		end := min(offset+1024*1024, len(large))
@@ -2087,11 +2099,13 @@ func TestWriteSyncTierTransitionRebasesCleanUnreleasedHandleAcrossPIDs(t *testin
 		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
 		Fh:       second.Fh,
 	})
+	queue.WaitPath(path)
+	uploader.DrainAll()
 
 	mu.Lock()
 	defer mu.Unlock()
-	if directPuts != 2 {
-		t.Fatalf("direct PUT calls = %d, want 2 (10KiB write + zero truncate)", directPuts)
+	if directPuts != 1 {
+		t.Fatalf("direct PUT calls = %d, want 1 zero truncate", directPuts)
 	}
 	if completeCalls == 0 {
 		t.Fatal("multipart complete calls = 0, want at least one committed tier transition")

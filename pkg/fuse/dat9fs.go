@@ -3685,6 +3685,21 @@ func (fs *Dat9FS) syncOpenHandlesAfterCommittedPathTruncate(ino uint64, callerPI
 }
 
 func (fs *Dat9FS) syncOpenHandlesAfterPathTruncateWithCommit(ino uint64, callerPID uint32, newSize int64, remoteCommitted bool) {
+	fs.syncOpenHandlesAfterPathTruncateState(ino, callerPID, newSize, remoteCommitted, false)
+}
+
+// syncOpenHandlesAfterStagedPathTruncate updates open-handle views after a
+// path truncate has been durably staged but is still owned by CommitQueue.
+// Clean handles must stay clean: the queue completion will publish the new
+// revision and rebase them before a later Write can acquire the path commit
+// fence. Turning them into a dirty generation here would pair the staged
+// bytes with the pre-truncate BaseRev and make a following write fail the
+// durable-watermark check after the zero truncate commits.
+func (fs *Dat9FS) syncOpenHandlesAfterStagedPathTruncate(ino uint64, callerPID uint32, newSize int64) {
+	fs.syncOpenHandlesAfterPathTruncateState(ino, callerPID, newSize, false, true)
+}
+
+func (fs *Dat9FS) syncOpenHandlesAfterPathTruncateState(ino uint64, callerPID uint32, newSize int64, remoteCommitted, remoteStaged bool) {
 	for _, fh := range fs.fileHandlesForInode(ino) {
 		fh.Lock()
 		if fh.Dirty == nil {
@@ -3735,6 +3750,27 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncateWithCommit(ino uint64, callerP
 				fh.Unlock()
 				continue
 			}
+		}
+		if cleanHandle && remoteStaged {
+			// The path-scoped queue entry, not this handle, owns the zero
+			// mutation. Reflect the acknowledged local view without creating a
+			// second dirty generation. Write() drains the queued path commit
+			// before taking the commit fence; its success callback can therefore
+			// advance BaseRev before any new payload is prepared.
+			fs.adoptCommittedStorageClassLocked(fh, newSize)
+			if fh.Dirty.Size() != newSize {
+				if err := fh.Dirty.Truncate(newSize); err != nil {
+					safeLogPrintf("staged path-truncate sync failed for %s: %v", fh.Path, err)
+					fh.Unlock()
+					continue
+				}
+				fh.Dirty.ResetSequentialState(newSize)
+			}
+			fh.Dirty.ClearDirty()
+			fh.OrigSize = newSize
+			fh.ZeroBase = false
+			fh.Unlock()
+			continue
 		}
 		// The path truncate committed a full re-upload of newSize remotely;
 		// the storage class follows from that size.
@@ -9832,6 +9868,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			if fs.adoptCallerOwnedInodeTruncate(input.NodeId, input.Pid, newSize) {
 				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
 			} else {
+				stagedRemoteTruncate := newSize == 0 && fs.canStagePathTruncateToZero(entry)
 				if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
 					return st
 				}
@@ -9840,7 +9877,11 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				// sync, a subsequent fstat(fd) on an open dirty handle returns the
 				// stale (pre-truncate) size via dirtyHandleSize(), causing
 				// fstat() mismatch failures (LTP ftest01 m_fstat case).
-				fs.syncOpenHandlesAfterCommittedPathTruncate(input.NodeId, input.Pid, newSize)
+				if stagedRemoteTruncate {
+					fs.syncOpenHandlesAfterStagedPathTruncate(input.NodeId, input.Pid, newSize)
+				} else {
+					fs.syncOpenHandlesAfterCommittedPathTruncate(input.NodeId, input.Pid, newSize)
+				}
 			}
 		}
 		entry.Size = newSize
