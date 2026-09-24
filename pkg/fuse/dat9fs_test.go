@@ -9142,6 +9142,32 @@ func TestDefaultTTLIs60Seconds(t *testing.T) {
 	}
 }
 
+func TestCodingAgentDefaultPositiveKernelCacheTTL(t *testing.T) {
+	opts := &MountOptions{Profile: MountProfileCodingAgent}
+	opts.setDefaults()
+	if opts.AttrTTL != defaultCodingAgentPositiveKernelCacheTTL {
+		t.Fatalf("coding-agent AttrTTL = %v, want %v", opts.AttrTTL, defaultCodingAgentPositiveKernelCacheTTL)
+	}
+	if opts.EntryTTL != defaultCodingAgentPositiveKernelCacheTTL {
+		t.Fatalf("coding-agent EntryTTL = %v, want %v", opts.EntryTTL, defaultCodingAgentPositiveKernelCacheTTL)
+	}
+}
+
+func TestCodingAgentKeepsExplicitPositiveKernelCacheTTL(t *testing.T) {
+	opts := &MountOptions{
+		Profile:  MountProfileCodingAgent,
+		AttrTTL:  5 * time.Second,
+		EntryTTL: 6 * time.Second,
+	}
+	opts.setDefaults()
+	if opts.AttrTTL != 5*time.Second {
+		t.Fatalf("explicit AttrTTL = %v, want 5s", opts.AttrTTL)
+	}
+	if opts.EntryTTL != 6*time.Second {
+		t.Fatalf("explicit EntryTTL = %v, want 6s", opts.EntryTTL)
+	}
+}
+
 func TestMountOptionsReadCacheTTLDefaults(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

@@ -11,9 +11,11 @@ const (
 	defaultReadCacheMaxSize = 128 << 20        // 128MB
 	defaultReadCacheTTL     = 30 * time.Second // 30s
 	readCacheNoExpiryTTL    = -1
-	// defaultPositiveKernelCacheTTL keeps positive path metadata hot across
-	// repeated scans while SSE/self-invalidation still handles namespace changes.
-	defaultPositiveKernelCacheTTL = 60 * time.Second
+	// Positive kernel caches stay bounded for generic mounts. The coding-agent
+	// profile keeps them hot longer because its local and SSE invalidation paths
+	// cover the repeated metadata scans common to development tools.
+	defaultPositiveKernelCacheTTL            = 60 * time.Second
+	defaultCodingAgentPositiveKernelCacheTTL = 5 * time.Minute
 	// defaultSmallFileThreshold is the local fallback used when no server
 	// value has been negotiated yet. The authoritative value is fetched from
 	// /v1/status on the dat9 client and propagated through FS.smallFileMax.
