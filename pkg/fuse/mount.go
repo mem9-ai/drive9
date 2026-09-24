@@ -298,6 +298,13 @@ func promotionRecoveryMountExit(err error) *MountExitError {
 	return ExitStartupTransientErr("recover synchronous promotion", err)
 }
 
+func validateMountPlatform(goos string, opts *MountOptions) error {
+	if goos == "windows" && (strings.TrimSpace(opts.LocalRoot) != "" || opts.EnableSynchronousPromotion) {
+		return fmt.Errorf("mount: LocalRoot and synchronous promotion are not supported on Windows")
+	}
+	return nil
+}
+
 // Mount creates and serves a FUSE mount. It blocks until the filesystem
 // is unmounted or a signal (SIGINT, SIGTERM) is received.
 func Mount(opts *MountOptions) (err error) {
@@ -308,6 +315,12 @@ func Mount(opts *MountOptions) (err error) {
 	if err := validateMountOptionsProfile(opts); err != nil {
 		return ExitStartupPermanentErr("invalid mount profile", err)
 	}
+	// The exported library entry point must enforce the same Windows boundary
+	// as the CLI. Windows does not provide the LocalRoot flock/recovery contract;
+	// reject before creating, reading, or recovering any local state.
+	if err := validateMountPlatform(runtime.GOOS, opts); err != nil {
+		return ExitStartupPermanentErr("unsupported mount platform", err)
+	}
 	if opts.EnableSynchronousPromotion && strings.TrimSpace(opts.LocalRoot) == "" {
 		return ExitStartupPermanentErr("synchronous promotion requires LocalRoot", nil)
 	}
@@ -315,7 +328,7 @@ func Mount(opts *MountOptions) (err error) {
 	// LocalRoot is a single-writer store regardless of whether this process is
 	// allowed to begin a new promotion. Otherwise a gate-off mount could race an
 	// enabled mount, or serve a root that still has a pending promotion journal.
-	if strings.TrimSpace(opts.LocalRoot) != "" && (runtime.GOOS != "windows" || opts.EnableSynchronousPromotion) {
+	if strings.TrimSpace(opts.LocalRoot) != "" {
 		promotionRootLock, err = acquirePromotionRootLock(opts.LocalRoot)
 		if err != nil {
 			return ExitStartupPermanentErr("lock LocalRoot", err)

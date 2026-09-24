@@ -221,6 +221,11 @@ namespace behavior is unchanged and cross-layer rename continues to return
 `EXDEV`. Enabling the gate requires the atomic-import server endpoint and the
 FUSE coordinator from the same release.
 
+`pkg/fuse.Mount` does not support `LocalRoot` on Windows, even with promotion
+disabled. It rejects the configuration before creating, reading, or recovering
+local state because Windows does not provide this phase's LocalRoot flock and
+recovery contract. The CLI enforces the same boundary.
+
 Two correctness locks are deliberately not gated per process. Any mount with a
 LocalRoot takes `LocalRoot/.drive9/promotion/local-root.lock`, so a gate-off
 mount cannot race an enabled mount or bypass a pending journal. Server
