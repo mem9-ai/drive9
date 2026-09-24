@@ -17363,26 +17363,21 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 // the pending index is the loop condition.
 func (fs *Dat9FS) drainLatePendingEntries(ctx context.Context) {
 	const settle = 100 * time.Millisecond
-	// A writable layer deliberately retains committed pending metadata and its
-	// shadow as the local overlay source until the layer is committed or rolled
-	// back. Those entries are not abandoned writeback work. Replaying them here
-	// would append the whole overlay repeatedly during unmount and can make an
-	// older retained shadow the final authoritative layer entry.
-	if fs == nil || fs.layerEnabled() || fs.pendingIndex == nil || len(fs.pendingIndex.ListPendingPaths()) == 0 {
+	if fs == nil || fs.commitQueue == nil || fs.commitQueue.pendingRecoveryCount() == 0 {
 		return
 	}
 	start := time.Now()
 	for round := 0; ; round++ {
-		paths := fs.pendingIndex.ListPendingPaths()
-		if len(paths) == 0 {
+		pending := fs.commitQueue.pendingRecoveryCount()
+		if pending == 0 {
 			safeLogPrintf("late pending drain: clean after %d rounds (%s)", round, time.Since(start).Round(time.Millisecond))
 			return
 		}
 		if err := ctx.Err(); err != nil {
-			safeLogPrintf("late pending drain: %d entries still pending after %s; leaving them for next-mount recovery", len(paths), time.Since(start).Round(time.Millisecond))
+			safeLogPrintf("late pending drain: %d entries still pending after %s; leaving them for next-mount recovery", pending, time.Since(start).Round(time.Millisecond))
 			return
 		}
-		safeLogPrintf("late pending drain: round %d, %d entries pending", round, len(paths))
+		safeLogPrintf("late pending drain: round %d, %d entries pending", round, pending)
 		var n int
 		if fs.commitQueue != nil {
 			n = fs.commitQueue.RecoverPendingSync(ctx)
@@ -17477,9 +17472,10 @@ func (fs *Dat9FS) FlushAll() {
 	// during or after our sweep). Those late entries stay in the pending
 	// index and would only be rescued by the next mount's RecoverPending.
 	// Loop: give late Releases a moment to land, re-enqueue via recovery,
-	// and re-drain until the pending index is empty or the deadline hits. Layer
-	// mounts skip this in drainLatePendingEntries because their retained pending
-	// index is durable overlay state rather than unfinished remote work.
+	// and re-drain until no recoverable generation remains or the deadline hits.
+	// Layer mounts retain successful overlay generations in the same index;
+	// pendingRecoveryCount excludes only those explicitly committed generations
+	// while still rescuing staging created after the queue stopped.
 	if fs.pendingIndex != nil && fs.pendingIndex.ListPendingPaths() != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		fs.drainLatePendingEntries(ctx)

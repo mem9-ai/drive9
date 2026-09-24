@@ -320,8 +320,10 @@ func (j *Journal) Close() error {
 // and a stale WAL entry could pair with a newer session's shadow file and
 // upload torn content under old metadata.
 //
-// Entries whose .meta survived (already present in the pending index) are
-// left untouched: the .meta file carries strictly more metadata than the WAL.
+// Entries whose .meta survived are normally left untouched because the file
+// can carry more metadata than a legacy WAL record. A strictly newer WAL
+// generation is authoritative, however: layer mounts retain a committed
+// overlay as .meta and publish a later same-path edit through the WAL.
 func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStore) error {
 	if j == nil || idx == nil {
 		return nil
@@ -357,9 +359,6 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 		if doneSeq, ok := latestDone[path]; ok && doneSeq > e.Seq {
 			return nil // committed or unlinked after the last local record
 		}
-		if idx.HasPending(path) {
-			return nil
-		}
 		if fromMeta {
 			var meta WriteBackMeta
 			if err := json.Unmarshal(e.Meta, &meta); err != nil {
@@ -383,6 +382,9 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 			if err := idx.publishRecoveredMeta(e.Meta); err != nil {
 				return fmt.Errorf("journal replay resurrect %s: %w", path, err)
 			}
+			return nil
+		}
+		if idx.HasPending(path) {
 			return nil
 		}
 		kind := PendingOverwrite

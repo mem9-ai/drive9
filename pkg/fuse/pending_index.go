@@ -290,6 +290,12 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 // during crash recovery. It is in-memory only: the WAL record remains on disk
 // until compaction drops it behind the path's commit marker, so re-publishing
 // the .meta file would be redundant.
+//
+// A layer commit persists its retained-overlay marker as a .meta file. A later
+// edit to the same path is published through the WAL, so replay must prefer
+// that strictly newer generation over the older .meta marker. Equal or older
+// WAL generations still lose to .meta because the standalone file may carry
+// metadata not present in legacy WAL records.
 func (idx *PendingIndex) publishRecoveredMeta(metaBytes []byte) error {
 	var meta WriteBackMeta
 	if err := json.Unmarshal(metaBytes, &meta); err != nil {
@@ -299,8 +305,15 @@ func (idx *PendingIndex) publishRecoveredMeta(metaBytes []byte) error {
 		return fmt.Errorf("recovered meta has empty path")
 	}
 	idx.mu.Lock()
-	idx.items[meta.Path] = &meta
+	if current, ok := idx.items[meta.Path]; !ok || meta.Generation > current.Generation {
+		idx.items[meta.Path] = &meta
+	}
 	idx.mu.Unlock()
+	for current := idx.nextGen.Load(); meta.Generation > current; current = idx.nextGen.Load() {
+		if idx.nextGen.CompareAndSwap(current, meta.Generation) {
+			break
+		}
+	}
 	return nil
 }
 
@@ -586,9 +599,12 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 	return nil
 }
 
-// MarkCommitted keeps the pending entry as a local overlay data source but no
-// longer treats it as never-persisted new data.
-func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) error {
+// MarkLayerCommitted keeps the pending entry as a local overlay data source but
+// excludes the exact uploaded generation from recovery. It returns false when
+// the caller has no generation fence or a newer same-path generation replaced
+// the uploaded entry before bookkeeping completed; that generation must remain
+// recoverable.
+func (idx *PendingIndex) MarkLayerCommitted(remotePath string, expectedGen uint64, committedRev int64) (bool, error) {
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
 
@@ -597,10 +613,14 @@ func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) er
 
 	meta, ok := idx.items[remotePath]
 	if !ok {
-		return nil
+		return true, nil
+	}
+	if expectedGen == 0 || meta.Generation != expectedGen {
+		return false, nil
 	}
 	updated := cloneWriteBackMeta(meta)
 	updated.Kind = PendingOverwrite
+	updated.LayerCommitted = true
 	if committedRev > 0 {
 		updated.BaseRev = committedRev
 	}
@@ -609,15 +629,15 @@ func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) er
 
 	metaBytes, err := json.Marshal(&updated)
 	if err != nil {
-		return fmt.Errorf("pending index marshal committed: %w", err)
+		return false, fmt.Errorf("pending index marshal committed: %w", err)
 	}
 	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
 	if err := atomicWrite(metaPath, metaBytes); err != nil {
-		return fmt.Errorf("pending index mark committed: %w", err)
+		return false, fmt.Errorf("pending index mark committed: %w", err)
 	}
 	cp := updated
 	idx.items[remotePath] = &cp
-	return nil
+	return true, nil
 }
 
 // MarkConflict marks a pending entry as conflicted so that RecoverPending

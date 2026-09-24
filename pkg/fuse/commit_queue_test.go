@@ -873,19 +873,21 @@ func TestCommitQueueLayerUploadWritesEntryAndKeepsPending(t *testing.T) {
 	if err := shadow.WriteFull("/ok.txt", []byte("data"), 7); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pending.PutWithBaseRevAndMode("/ok.txt", 4, PendingOverwrite, 7, 0o600, true); err != nil {
+	pendingGen, err := pending.PutWithBaseRevAndMode("/ok.txt", 4, PendingOverwrite, 7, 0o600, true)
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8, "/remote")
 	cq.SetLayerRef("layer-1")
 	if err := cq.Enqueue(&CommitEntry{
-		Path:    "/ok.txt",
-		BaseRev: 7,
-		Size:    4,
-		Kind:    PendingOverwrite,
-		Mode:    0o600,
-		HasMode: true,
+		Path:            "/ok.txt",
+		BaseRev:         7,
+		Size:            4,
+		Kind:            PendingOverwrite,
+		Mode:            0o600,
+		HasMode:         true,
+		PendingIndexGen: pendingGen,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -967,19 +969,21 @@ func TestCommitQueueLayerUploadAcceptsShadowSpillWithoutBaseWrite(t *testing.T) 
 	if err := shadow.WriteFull("/spill.bin", []byte("spill-data"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pending.PutShadowSpillWithMode("/spill.bin", 10, PendingNew, 0, 0o644, true); err != nil {
+	pendingGen, err := pending.PutShadowSpillWithMode("/spill.bin", 10, PendingNew, 0, 0o644, true)
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8, "/remote")
 	cq.SetLayerRef("layer-1")
 	if err := cq.Enqueue(&CommitEntry{
-		Path:        "/spill.bin",
-		Size:        10,
-		Kind:        PendingNew,
-		ShadowSpill: true,
-		Mode:        0o644,
-		HasMode:     true,
+		Path:            "/spill.bin",
+		Size:            10,
+		Kind:            PendingNew,
+		ShadowSpill:     true,
+		Mode:            0o644,
+		HasMode:         true,
+		PendingIndexGen: pendingGen,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1537,17 +1541,19 @@ func TestCommitQueueLayerModeRetainsShadowAndPendingAfterUpload(t *testing.T) {
 	if err := shadow.WriteFull("/layered.bin", data, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pending.PutWithBaseRev("/layered.bin", int64(len(data)), PendingNew, 0); err != nil {
+	pendingGen, err := pending.PutWithBaseRev("/layered.bin", int64(len(data)), PendingNew, 0)
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	cq.SetLayerRef("layer-1")
 	if err := cq.Enqueue(&CommitEntry{
-		Path:    "/layered.bin",
-		BaseRev: 0,
-		Size:    int64(len(data)),
-		Kind:    PendingNew,
+		Path:            "/layered.bin",
+		BaseRev:         0,
+		Size:            int64(len(data)),
+		Kind:            PendingNew,
+		PendingIndexGen: pendingGen,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1570,16 +1576,18 @@ func TestCommitQueueLayerModeRetainsShadowAndPendingAfterUpload(t *testing.T) {
 	if err := shadow.WriteFull("/layered.bin", data2, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pending.PutWithBaseRev("/layered.bin", int64(len(data2)), PendingOverwrite, 0); err != nil {
+	pendingGen, err = pending.PutWithBaseRev("/layered.bin", int64(len(data2)), PendingOverwrite, 0)
+	if err != nil {
 		t.Fatal(err)
 	}
 	cq2 := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	cq2.SetLayerRef("layer-1")
 	if err := cq2.Enqueue(&CommitEntry{
-		Path:    "/layered.bin",
-		BaseRev: 0,
-		Size:    int64(len(data2)),
-		Kind:    PendingOverwrite,
+		Path:            "/layered.bin",
+		BaseRev:         0,
+		Size:            int64(len(data2)),
+		Kind:            PendingOverwrite,
+		PendingIndexGen: pendingGen,
 	}); err != nil {
 		t.Fatal(err)
 	}

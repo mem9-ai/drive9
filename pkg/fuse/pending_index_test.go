@@ -166,6 +166,107 @@ func TestPendingIndexRecoverFromDisk(t *testing.T) {
 	}
 }
 
+func TestPendingIndexLayerCommittedMarkerIsPersistentAndGenerationScoped(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := idx.PutWithBaseRev("/layer.txt", 4, PendingOverwrite, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marked, err := idx.MarkLayerCommitted("/layer.txt", 0, 8)
+	if err != nil || marked {
+		t.Fatalf("unfenced MarkLayerCommitted = (%t, %v), want false, nil", marked, err)
+	}
+	marked, err = idx.MarkLayerCommitted("/layer.txt", gen, 8)
+	if err != nil || !marked {
+		t.Fatalf("MarkLayerCommitted = (%t, %v), want true, nil", marked, err)
+	}
+
+	recovered, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := recovered.GetMeta("/layer.txt")
+	if !ok || !meta.LayerCommitted || meta.BaseRev != 8 {
+		t.Fatalf("recovered committed metadata = %+v, want marker and rev 8", meta)
+	}
+
+	newGen, err := recovered.PutWithBaseRev("/layer.txt", 5, PendingOverwrite, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newGen == meta.Generation {
+		t.Fatalf("replacement generation = %d, want newer than committed generation", newGen)
+	}
+	marked, err = recovered.MarkLayerCommitted("/layer.txt", meta.Generation, 9)
+	if err != nil || marked {
+		t.Fatalf("stale MarkLayerCommitted = (%t, %v), want false, nil", marked, err)
+	}
+	meta, ok = recovered.GetMeta("/layer.txt")
+	if !ok || meta.LayerCommitted || meta.Generation != newGen || meta.BaseRev != 8 {
+		t.Fatalf("replacement metadata after stale marker = %+v, want uncommitted generation %d rev 8", meta, newGen)
+	}
+}
+
+func TestPendingIndexWALNewGenerationSupersedesLayerCommittedMarker(t *testing.T) {
+	dir := t.TempDir()
+	pendingDir := filepath.Join(dir, "pending")
+	idx, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := idx.PutWithBaseRev("/layer.txt", 4, PendingOverwrite, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marked, err := idx.MarkLayerCommitted("/layer.txt", gen, 8)
+	if err != nil || !marked {
+		t.Fatalf("MarkLayerCommitted = (%t, %v), want true, nil", marked, err)
+	}
+
+	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = j.Close() }()
+	idx.SetJournal(j)
+	newGen, err := idx.PutWithBaseRev("/layer.txt", 9, PendingOverwrite, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.FsyncShared(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if err := replayJournalIntoPending(j, recovered, nil); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := recovered.GetMeta("/layer.txt")
+	if !ok || meta.LayerCommitted || meta.Generation != newGen || meta.Size != 9 || meta.BaseRev != 8 {
+		t.Fatalf("recovered metadata = %+v, want newer uncommitted WAL generation %d", meta, newGen)
+	}
+	nextGen, err := recovered.PutWithBaseRev("/next.txt", 1, PendingNew, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextGen <= newGen {
+		t.Fatalf("generation after WAL recovery = %d, want > %d", nextGen, newGen)
+	}
+}
+
 func TestPendingIndexListPendingPaths(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := NewPendingIndex(dir)

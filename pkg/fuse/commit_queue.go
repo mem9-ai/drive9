@@ -687,6 +687,7 @@ func (cq *CommitQueue) RecoverPending() {
 	if cq.index == nil {
 		return
 	}
+	layer := cq.layerRefSnapshot() != ""
 	for path := range cq.index.ListPendingPaths() {
 		meta, ok := cq.index.GetMeta(path)
 		if !ok {
@@ -703,7 +704,10 @@ func (cq *CommitQueue) RecoverPending() {
 			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
 			continue
 		}
-		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
+		if layer && meta.LayerCommitted {
+			continue
+		}
+		if !layer && meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
 			safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
 			continue
 		}
@@ -2042,6 +2046,7 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 	if cq == nil || cq.index == nil {
 		return 0
 	}
+	layer := cq.layerRefSnapshot() != ""
 	committed := 0
 	for path := range cq.index.ListPendingPaths() {
 		meta, ok := cq.index.GetMeta(path)
@@ -2056,7 +2061,10 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 		if meta.Kind == PendingConflict {
 			continue
 		}
-		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
+		if layer && meta.LayerCommitted {
+			continue
+		}
+		if !layer && meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
 			continue
 		}
 		size := meta.Size
@@ -2091,6 +2099,32 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 		committed++
 	}
 	return committed
+}
+
+// pendingRecoveryCount reports durable entries that can still make remote
+// progress. A layer's successfully uploaded entries remain in the same index
+// as its overlay data source, but LayerCommitted keeps them out of recovery;
+// a newer Put creates a fresh, uncommitted generation and is counted again.
+func (cq *CommitQueue) pendingRecoveryCount() int {
+	if cq == nil || cq.index == nil {
+		return 0
+	}
+	layer := cq.layerRefSnapshot() != ""
+	count := 0
+	for path := range cq.index.ListPendingPaths() {
+		meta, ok := cq.index.GetMeta(path)
+		if !ok || meta.Kind == PendingConflict {
+			continue
+		}
+		if layer && meta.LayerCommitted {
+			continue
+		}
+		if !layer && meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 // CommitNow uploads an entry synchronously through the same commit path used
@@ -2532,7 +2566,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		}
 	}
 	if cq.index != nil && cq.layerRefSnapshot() != "" {
-		if err := cq.index.MarkCommitted(entry.Path, committedRev); err != nil {
+		if _, err := cq.index.MarkLayerCommitted(entry.Path, entry.PendingIndexGen, committedRev); err != nil {
 			return err
 		}
 	}

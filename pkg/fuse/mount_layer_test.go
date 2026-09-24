@@ -1399,6 +1399,10 @@ func TestLayerLatePendingDrainDoesNotReplayRetainedOverlay(t *testing.T) {
 	if !pending.HasPending(localPath) || !shadow.Has(localPath) {
 		t.Fatal("successful layer upload must retain its pending metadata and shadow")
 	}
+	meta, ok := pending.GetMeta(localPath)
+	if !ok || !meta.LayerCommitted {
+		t.Fatalf("retained layer metadata = %+v, want committed overlay marker", meta)
+	}
 	mu.Lock()
 	before := append([]clientLayerEntryRequest(nil), requests...)
 	mu.Unlock()
@@ -1419,6 +1423,144 @@ func TestLayerLatePendingDrainDoesNotReplayRetainedOverlay(t *testing.T) {
 	mu.Unlock()
 	if len(after) != 1 {
 		t.Fatalf("late pending drain replayed committed layer overlay: %+v", after)
+	}
+}
+
+func TestLayerLateReleaseAfterQueueStopIsRecoveredOnce(t *testing.T) {
+	const (
+		localPath  = "/late.txt"
+		remotePath = "/repo/late.txt"
+		baseRev    = int64(0)
+	)
+	data := []byte("late release data")
+
+	var (
+		mu       sync.Mutex
+		requests []clientLayerEntryRequest
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var req clientLayerEntryRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode layer entry: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, req)
+		seq := len(requests)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+			LayerID:      "layer-1",
+			Path:         req.Path,
+			Op:           req.Op,
+			Kind:         req.Kind,
+			BaseRevision: req.BaseRevision,
+			Content:      req.Content,
+			SizeBytes:    req.SizeBytes,
+			EntrySeq:     int64(seq),
+		})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cq := NewCommitQueue(fs.client, shadow, pending, nil, 1, 8, opts.RemoteRoot)
+	cq.SetLayerRef(opts.LayerRef)
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = cq
+	fs.syncMode = SyncInteractive
+	writeBack, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploader := NewWriteBackUploader(fs.client, writeBack, 1, opts.RemoteRoot)
+	defer uploader.DrainAll()
+	fs.SetWriteBack(writeBack, uploader)
+	// Unmount has already stopped the async queue when this delayed Release
+	// arrives from the kernel. The handle has not staged anything yet: its late
+	// Flush must durably create the shadow and pending generation, then Release
+	// observes the stopped queue while transferring ownership.
+	cq.DrainAll()
+	if shadow.Has(localPath) || pending.HasPending(localPath) {
+		t.Fatal("test setup unexpectedly staged the late handle before queue stop")
+	}
+
+	ino := fs.inodes.Lookup(localPath, false, int64(len(data)), time.Now())
+	fs.inodes.UpdateRevision(ino, baseRev)
+	dirty := NewWriteBuffer(localPath, maxPreloadSize, 0)
+	if _, err := dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	dirtySeq := fs.markDirtySize(ino, int64(len(data)))
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        localPath,
+		Dirty:       dirty,
+		DirtySeq:    dirtySeq,
+		BaseRev:     baseRev,
+		OrigSize:    int64(len(data)),
+		WritePolicy: WritePolicyWriteBack,
+	}
+	fhID := fs.fileHandles.Allocate(fh)
+	fs.openHandles.Add(fh)
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       fhID,
+	}); st != gofuse.OK {
+		t.Fatalf("late Flush after queue stop = %v, want OK after durable local staging", st)
+	}
+	if !shadow.Has(localPath) || !pending.HasPending(localPath) {
+		t.Fatal("late Flush did not durably stage shadow and pending metadata after queue stop")
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: fhID})
+
+	mu.Lock()
+	before := len(requests)
+	mu.Unlock()
+	if before != 0 {
+		t.Fatalf("late Release uploaded through stopped queue: %d requests", before)
+	}
+	meta, ok := pending.GetMeta(localPath)
+	if !ok || meta.LayerCommitted {
+		t.Fatalf("late Release metadata = %+v, want recoverable uncommitted generation", meta)
+	}
+	if meta.Kind != PendingOverwrite || meta.BaseRev != 0 {
+		t.Fatalf("late Release metadata = %+v, want layer overwrite at absent base revision", meta)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	fs.drainLatePendingEntries(ctx)
+
+	mu.Lock()
+	after := append([]clientLayerEntryRequest(nil), requests...)
+	mu.Unlock()
+	if len(after) != 1 || after[0].Path != remotePath || !bytes.Equal(after[0].Content, data) {
+		t.Fatalf("rescued layer requests = %+v, want one %s content upsert", after, remotePath)
+	}
+	meta, ok = pending.GetMeta(localPath)
+	if !ok || !meta.LayerCommitted {
+		t.Fatalf("rescued layer metadata = %+v, want committed retained overlay", meta)
+	}
+	if got := fs.commitQueue.pendingRecoveryCount(); got != 0 {
+		t.Fatalf("recoverable pending entries after rescue = %d, want 0", got)
 	}
 }
 

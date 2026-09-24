@@ -58,18 +58,22 @@ const (
 // WriteBackMeta stores metadata alongside cached file data so that the
 // background uploader (and crash-recovery) knows the remote path and size.
 type WriteBackMeta struct {
-	Path             string      `json:"path"`
-	Size             int64       `json:"size"`
-	Mtime            time.Time   `json:"mtime"`
-	CreatedAt        time.Time   `json:"created_at"`
-	Generation       uint64      `json:"generation,omitempty"`
-	Kind             PendingKind `json:"kind"`
-	BaseRev          int64       `json:"base_rev,omitempty"`
-	ShadowSpill      bool        `json:"shadow_spill,omitempty"`
-	Mode             uint32      `json:"mode,omitempty"`
-	HasMode          bool        `json:"has_mode,omitempty"`
-	SnapshotID       string      `json:"-"`
-	ParentSnapshotID string      `json:"-"`
+	Path        string      `json:"path"`
+	Size        int64       `json:"size"`
+	Mtime       time.Time   `json:"mtime"`
+	CreatedAt   time.Time   `json:"created_at"`
+	Generation  uint64      `json:"generation,omitempty"`
+	Kind        PendingKind `json:"kind"`
+	BaseRev     int64       `json:"base_rev,omitempty"`
+	ShadowSpill bool        `json:"shadow_spill,omitempty"`
+	// LayerCommitted distinguishes a layer entry retained as the durable local
+	// overlay source after a successful upload from a newly staged entry that
+	// still needs recovery. Base mounts remove successful entries instead.
+	LayerCommitted   bool   `json:"layer_committed,omitempty"`
+	Mode             uint32 `json:"mode,omitempty"`
+	HasMode          bool   `json:"has_mode,omitempty"`
+	SnapshotID       string `json:"-"`
+	ParentSnapshotID string `json:"-"`
 	// lineageTrusted is deliberately process-local and never serialized.
 	// Recovering a mutable path-keyed payload cannot prove that the bytes and
 	// JSON metadata were replaced atomically across a crash.
