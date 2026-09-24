@@ -13,6 +13,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.10
 	github.com/c4pt0r/agfs/agfs-server v0.0.0-20260410081414-678f51854d2a
 	github.com/go-sql-driver/mysql v1.9.3
+	github.com/google/btree v1.1.2
 	github.com/google/uuid v1.6.0
 	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/jackc/pgx/v5 v5.9.2
@@ -117,7 +118,6 @@ require (
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
-	github.com/google/btree v1.1.2 // indirect
 	github.com/google/flatbuffers v25.2.10+incompatible // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/google/readahead v0.0.0-20161222183148-eaceba169032 // indirect

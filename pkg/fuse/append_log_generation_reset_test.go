@@ -944,7 +944,9 @@ func TestAppendLogGenerationResetShadowFailureKeepsRemoteReset(t *testing.T) {
 	})
 	defer closeServer()
 
-	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 1)
+	// Stage the original image before constraining the quota. The reset must
+	// reach the remote commit, then fail while creating its new local shadow.
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -957,6 +959,7 @@ func TestAppendLogGenerationResetShadowFailureKeepsRemoteReset(t *testing.T) {
 	if _, err := shadow.WriteAt(fh.Path, 0, shadowImage, fh.BaseRev); err != nil {
 		t.Fatal(err)
 	}
+	shadow.writeCacheMaxBytes = 1
 	fh.ShadowReady = true
 	fh.ShadowSpill = true
 	fh.Dirty.OnPartFull = func(int, []byte) {}
