@@ -112,10 +112,20 @@ type gitWorkspaceLayer struct {
 	// change the index without moving HEAD, and both change check-ignore
 	// results, so a changed fingerprint invalidates the ignore cache.
 	ignoreCacheIndexFP map[string]string
+	// ignoreCacheFP records the effective ignore-inputs fingerprint (see
+	// gitIgnoreRuleChain) each cached decision was computed against. Unlike the
+	// index fingerprint it also covers the ignore-rule files themselves —
+	// working-tree `.gitignore` edits and the git dir's info/exclude — so an
+	// edit flips cached decisions without moving HEAD or the index.
+	ignoreCacheFP map[string]string
 	// trackedCache maps a git-workspace state key to the set of index (tracked)
 	// paths, so the ignored-ancestor short circuit can exempt a force-added
 	// descendant without re-running check-ignore per file.
 	trackedCache map[string]map[string]struct{}
+	// syncedIgnoreFiles records which ignore-rule files were last materialized
+	// into the hydrated clean tree the oracle runs against, keyed by workspace
+	// state + rule path and valued by the mount-view identity that was synced.
+	syncedIgnoreFiles map[string]string
 }
 
 type gitWorkspaceRuntime struct {
@@ -189,7 +199,9 @@ func newGitWorkspaceLayer() *gitWorkspaceLayer {
 		ignoreCache:        make(map[string]bool),
 		gitStateRefresh:    make(map[string]time.Time),
 		ignoreCacheIndexFP: make(map[string]string),
+		ignoreCacheFP:      make(map[string]string),
 		trackedCache:       make(map[string]map[string]struct{}),
+		syncedIgnoreFiles:  make(map[string]string),
 	}
 }
 
@@ -1323,10 +1335,19 @@ func (fs *Dat9FS) gitIgnoreConfirmsLocalOnly(ctx context.Context, localPath stri
 	if !ok || rt == nil || rel == "" || rel == "." {
 		return false, false
 	}
+	// Restore the workspace state before fingerprinting anything: the index
+	// only exists once the local `.git` is restored, and a fingerprint captured
+	// before restore would mismatch every later one and churn the caches.
+	_ = fs.ensureGitStateRestored(ctx, rt)
 	// check-ignore reads the index, so an index-only change (force-add, rm
 	// --cached, commit) can flip a result without moving HEAD. Drop cached
 	// decisions for this workspace when its index fingerprint moved.
 	fs.invalidateIgnoreCacheIfIndexChanged(rt)
+	// The effective ignore inputs reach beyond the index: working-tree
+	// .gitignore edits and the git dir's info/exclude change check-ignore
+	// results without touching either. Every cached decision below is stamped
+	// with the chain fingerprint and only trusted while it still matches.
+	chain := fs.gitIgnoreRuleChainFor(ctx, rt, rel)
 	if rel == ".git" || strings.HasPrefix(rel, ".git/") {
 		return false, true
 	}
@@ -1361,17 +1382,27 @@ func (fs *Dat9FS) gitIgnoreConfirmsLocalOnly(ctx context.Context, localPath stri
 	if tracked, ok := fs.gitPathIsIndexTracked(ctx, rt, rel); ok && tracked {
 		return false, true
 	}
-	if fs.gitIgnoredAncestorCached(rt, rel) {
+	if fs.gitIgnoredAncestorCached(rt, chain) {
 		return true, true
 	}
 
 	key := gitIgnoreCacheKey(rt, rel, dirHint)
 	fs.git.mu.Lock()
-	if ignored, ok := fs.git.ignoreCache[key]; ok {
+	if ignored, ok := fs.git.ignoreCache[key]; ok && fs.git.ignoreCacheFP[key] == chain.self {
 		fs.git.mu.Unlock()
 		return ignored, true
 	}
 	fs.git.mu.Unlock()
+
+	// The oracle reads the hydrated clean tree, so the working view's
+	// ignore-rule files must be reflected there first; a rule the mount user
+	// just edited would otherwise be invisible to check-ignore.
+	if err := fs.syncGitIgnoreInputs(ctx, rt, chain); err != nil {
+		// The effective working-tree rule could not be established. Report the
+		// result as unverified so the caller keeps the pattern's overlay (fail
+		// open) rather than deciding from a stale rule.
+		return false, false
+	}
 
 	ignored, cacheable := fs.gitCheckIgnoredPath(ctx, rt, rel, dirHint)
 	if !cacheable {
@@ -1404,9 +1435,18 @@ func (fs *Dat9FS) gitIgnoreConfirmsLocalOnly(ctx context.Context, localPath stri
 	if fs.git.ignoreCache == nil {
 		fs.git.ignoreCache = make(map[string]bool)
 	}
+	if fs.git.ignoreCacheFP == nil {
+		fs.git.ignoreCacheFP = make(map[string]string)
+	}
 	fs.git.ignoreCache[key] = ignored
+	fs.git.ignoreCacheFP[key] = chain.self
 	if parentIgnored {
-		fs.git.ignoreCache[gitIgnoreCacheKey(rt, parentDir, true)] = true
+		parentKey := gitIgnoreCacheKey(rt, parentDir, true)
+		fs.git.ignoreCache[parentKey] = true
+		// The parent's own chain is the chain of the directory above it: its
+		// ignore status depends on the rules above it, not on its own
+		// .gitignore. dirs[len-1] is the parent; fps[len-1] is its chain fp.
+		fs.git.ignoreCacheFP[parentKey] = chain.fps[len(chain.fps)-2]
 	}
 	fs.git.mu.Unlock()
 	return ignored, true
@@ -1463,8 +1503,208 @@ func (fs *Dat9FS) invalidateIgnoreCacheIfIndexChanged(rt *gitWorkspaceRuntime) {
 	for k := range fs.git.ignoreCache {
 		if strings.HasPrefix(k, key+":") {
 			delete(fs.git.ignoreCache, k)
+			delete(fs.git.ignoreCacheFP, k)
 		}
 	}
+}
+
+// gitIgnoreRuleChain captures the effective ignore-rule inputs for one path as
+// the mount's working view sees them. `git check-ignore` derives a path's
+// status from the `.gitignore` files in the path's directory chain (a rule in
+// directory D applies to paths inside D), the git dir's `info/exclude`, and
+// the excludes file — so a cached decision is only valid while those inputs
+// are unchanged.
+//
+// The chain records, for every directory from the mount root down to the
+// path's parent, the identity of that directory's `.gitignore` in the working
+// view: the dirty mirror (uncommitted edit), else the durable overlay entry,
+// else the local HEAD tree when one is loaded (it shadows the clean tree), else
+// the clean tree node, else absent. A committed edit moves local HEAD, an
+// uncommitted edit writes the dirty mirror, and both change identities without
+// moving the remote HEAD or the index.
+type gitIgnoreRuleChain struct {
+	// dirs is the directory chain of rel, mount root first ("", "a", "a/b",
+	// ...), excluding rel itself.
+	dirs []string
+	// ids[i] is the working-view identity of dirs[i]/.gitignore.
+	ids []string
+	// fps[i] is the fingerprint over the ignore inputs of dirs[i]'s own
+	// directory chain: the base inputs plus ids[0..i-1]. fps[0] is the base
+	// fingerprint alone (the mount root's ignore status depends on no
+	// .gitignore). len(fps) == len(dirs)+1.
+	fps []string
+	// self is the fingerprint over the full chain — the inputs that decide
+	// rel's own status.
+	self string
+}
+
+// gitIgnoreBaseFingerprint fingerprints the chain-independent ignore inputs:
+// the index, the git dir's info/exclude, and the local HEAD commit. The local
+// HEAD commit participates because a loaded local tree shadows the clean tree
+// the oracle reads.
+func (fs *Dat9FS) gitIgnoreBaseFingerprint(rt *gitWorkspaceRuntime) string {
+	if fs == nil || rt == nil {
+		return ""
+	}
+	parts := []string{"idx=" + fs.gitIndexFingerprint(rt)}
+	rt.mu.RLock()
+	parts = append(parts, "local="+rt.localTreeCommit)
+	rt.mu.RUnlock()
+	if gitDir, err := fs.gitDirForRuntime(rt); err == nil && gitDir != "" {
+		if info, err := os.Stat(filepath.Join(filepath.FromSlash(gitDir), "info", "exclude")); err == nil {
+			parts = append(parts, "exclude="+strconv.FormatInt(info.Size(), 10)+":"+strconv.FormatInt(info.ModTime().UnixNano(), 10))
+		}
+	}
+	return strings.Join(parts, "|")
+}
+
+// gitIgnoreFileIdentity reports the working-view identity of dir's `.gitignore`
+// (dir "" is the mount root). The precedence mirrors the inode lookup: dirty
+// mirror, then durable overlay, then the local HEAD tree when loaded (it
+// shadows the clean tree), then the clean tree. An empty result means the
+// working view has no `.gitignore` there.
+func (fs *Dat9FS) gitIgnoreFileIdentity(ctx context.Context, rt *gitWorkspaceRuntime, dir string) string {
+	gitignoreRel := ".gitignore"
+	if dir != "" {
+		gitignoreRel = dir + "/.gitignore"
+	}
+	if info, ok := fs.gitWorkspaceDirtyMirrorStat(rt, gitignoreRel); ok {
+		return "dm:" + strconv.FormatInt(info.Size(), 10) + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10)
+	}
+	if e, ok := rt.overlayEntry(gitignoreRel); ok {
+		if e.Op == "whiteout" {
+			return "ov:whiteout"
+		}
+		return "ov:" + e.ChecksumSHA256 + ":" + e.StorageRefHash + ":" + strconv.FormatInt(e.UpdatedAt.UnixNano(), 10) + ":" + strconv.FormatInt(e.SizeBytes, 10)
+	}
+	if localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt); localTree {
+		if n, ok := rt.localHeadNode(gitignoreRel); ok {
+			return "lh:" + n.ObjectSHA
+		}
+		return ""
+	}
+	if n, ok := rt.cleanNode(gitignoreRel); ok {
+		return "cl:" + n.ObjectSHA
+	}
+	return ""
+}
+
+// gitIgnoreRuleChainFor computes the effective ignore-rule inputs for rel. All
+// lookups are in-memory or local stats, so this is cheap enough to run on
+// every gated classification.
+func (fs *Dat9FS) gitIgnoreRuleChainFor(ctx context.Context, rt *gitWorkspaceRuntime, rel string) *gitIgnoreRuleChain {
+	trimmed := strings.Trim(rel, "/")
+	// Resolve the local head tree before fingerprinting: its commit feeds the
+	// base fingerprint and its nodes feed the identities, and the lazy first
+	// resolution must not straddle the two or one chain would mix pre- and
+	// post-resolution state.
+	_, _ = fs.ensureGitLocalHeadTree(ctx, rt)
+	base := fs.gitIgnoreBaseFingerprint(rt)
+	chain := &gitIgnoreRuleChain{fps: []string{base}}
+	if trimmed == "" || trimmed == "." {
+		chain.self = base
+		return chain
+	}
+	parts := strings.Split(trimmed, "/")
+	// dirs is the directory chain above rel — every proper prefix of rel's
+	// path, mount root first (""): a root .gitignore participates in every
+	// decision below it, and rel's own .gitignore (if any) does not affect
+	// rel itself.
+	chain.dirs = make([]string, 0, len(parts))
+	chain.ids = make([]string, 0, len(parts))
+	for i := 0; i < len(parts); i++ {
+		chain.dirs = append(chain.dirs, strings.Join(parts[:i], "/"))
+	}
+	for _, dir := range chain.dirs {
+		id := fs.gitIgnoreFileIdentity(ctx, rt, dir)
+		chain.ids = append(chain.ids, id)
+		chain.fps = append(chain.fps, chain.fps[len(chain.fps)-1]+"|gi["+dir+"]="+id)
+	}
+	chain.self = chain.fps[len(chain.fps)-1]
+	return chain
+}
+
+// syncGitIgnoreInputs materializes the working view's `.gitignore` files for
+// the chain into the hydrated clean tree the oracle runs against. The clean
+// tree holds the remote HEAD's content, so uncommitted or locally committed
+// rule edits are invisible to check-ignore until synced here; a `.gitignore`
+// absent from the working view is removed. Clean-tree identities need no sync
+// (the tree was hydrated from that same commit). Returns an error when the
+// working rule could not be established, which the caller treats as
+// unverified (fail open, no caching).
+func (fs *Dat9FS) syncGitIgnoreInputs(ctx context.Context, rt *gitWorkspaceRuntime, chain *gitIgnoreRuleChain) error {
+	if fs == nil || fs.git == nil || rt == nil || chain == nil {
+		return nil
+	}
+	localRoot := strings.TrimSpace(fs.opts.LocalRoot)
+	if localRoot == "" {
+		return nil
+	}
+	treeRoot := gitcache.TreeRoot(localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit)
+	if info, err := os.Stat(treeRoot); err != nil || !info.IsDir() {
+		// Nothing to sync into; the oracle reports uncacheable on its own.
+		return nil
+	}
+	stateKey := gitStateKey(rt)
+	for i, dir := range chain.dirs {
+		gitignoreRel := ".gitignore"
+		if dir != "" {
+			gitignoreRel = dir + "/.gitignore"
+		}
+		id := chain.ids[i]
+		memoKey := stateKey + ":" + gitignoreRel
+		fs.git.mu.Lock()
+		prev, alreadySynced := fs.git.syncedIgnoreFiles[memoKey]
+		fs.git.mu.Unlock()
+		if alreadySynced && prev == id {
+			continue
+		}
+		target := filepath.Join(treeRoot, filepath.FromSlash(gitignoreRel))
+		switch {
+		case id == "" || id == "ov:whiteout":
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove stale ignore rule %s: %w", gitignoreRel, err)
+			}
+		case strings.HasPrefix(id, "cl:"):
+			// The clean tree was hydrated from this same commit.
+		default:
+			data, err := fs.gitIgnoreSourceContent(ctx, rt, gitignoreRel)
+			if err != nil {
+				return fmt.Errorf("read working ignore rule %s: %w", gitignoreRel, err)
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return fmt.Errorf("create ignore rule dir %s: %w", filepath.Dir(target), err)
+			}
+			if err := os.WriteFile(target, data, 0o644); err != nil {
+				return fmt.Errorf("write working ignore rule %s: %w", gitignoreRel, err)
+			}
+		}
+		fs.git.mu.Lock()
+		fs.git.syncedIgnoreFiles[memoKey] = id
+		fs.git.mu.Unlock()
+	}
+	return nil
+}
+
+// gitIgnoreSourceContent reads a chain `.gitignore` from its working-view
+// source: the dirty mirror for uncommitted edits, the durable overlay
+// otherwise (including local HEAD trees, whose nodes are resolved through the
+// overlay read path only when mirrored there).
+func (fs *Dat9FS) gitIgnoreSourceContent(ctx context.Context, rt *gitWorkspaceRuntime, gitignoreRel string) ([]byte, error) {
+	if data, ok, err := fs.readGitDirtyMirror(rt, gitignoreRel, 0, -1); err != nil {
+		return nil, err
+	} else if ok {
+		return data, nil
+	}
+	if e, ok := rt.overlayEntry(gitignoreRel); ok && e.Op != "whiteout" {
+		return fs.readGitOverlayFile(ctx, rt, "", gitignoreRel, e, 0, -1)
+	}
+	if localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt); localTree {
+		if n, ok := rt.localHeadNode(gitignoreRel); ok {
+			return fs.materializeGitBlob(ctx, rt, rt.localTreeCommit, n.ObjectSHA)
+		}
+	}
+	return nil, fmt.Errorf("no working source for %s", gitignoreRel)
 }
 
 // gitPathIsIndexTracked reports whether rel is tracked in the workspace index,
@@ -1544,7 +1784,9 @@ func (fs *Dat9FS) gitLoadIndexTrackedSet(ctx context.Context, rt *gitWorkspaceRu
 
 // gitIgnoredAncestorCached reports whether a strict ancestor directory of rel
 // is cached as ignored. rel's own path is not consulted; the caller handles it
-// via the ignore cache.
+// via the ignore cache. Ancestors come from the chain, and a cached ancestor is
+// only trusted while its ignore-inputs fingerprint still matches — an edited
+// rule above the ancestor invalidates the subtree confirmation.
 //
 // Both cache keys are consulted. An ancestor is a directory by construction, so
 // whether it was confirmed through a directory classification (dirHint=true) or
@@ -1554,24 +1796,19 @@ func (fs *Dat9FS) gitLoadIndexTrackedSet(ctx context.Context, rt *gitWorkspaceRu
 // under an excluded directory. Matching both keys keeps a large ignored tree
 // from paying one `git check-ignore` per file when only the file-path key was
 // populated.
-func (fs *Dat9FS) gitIgnoredAncestorCached(rt *gitWorkspaceRuntime, rel string) bool {
-	rel = strings.Trim(rel, "/")
-	if rel == "" || fs == nil || fs.git == nil {
-		return false
-	}
-	parts := strings.Split(rel, "/")
-	depth := len(parts) - 1
-	if depth <= 0 {
+func (fs *Dat9FS) gitIgnoredAncestorCached(rt *gitWorkspaceRuntime, chain *gitIgnoreRuleChain) bool {
+	if fs == nil || fs.git == nil || rt == nil || chain == nil {
 		return false
 	}
 	fs.git.mu.Lock()
 	defer fs.git.mu.Unlock()
-	for i := 1; i <= depth; i++ {
-		ancestor := strings.Join(parts[:i], "/")
-		if ignored, ok := fs.git.ignoreCache[gitIgnoreCacheKey(rt, ancestor, true)]; ok && ignored {
+	for i, ancestor := range chain.dirs {
+		// ancestor dirs[i]'s own chain ends above it: fps[i].
+		fp := chain.fps[i]
+		if ignored, ok := fs.git.ignoreCache[gitIgnoreCacheKey(rt, ancestor, true)]; ok && ignored && fs.git.ignoreCacheFP[gitIgnoreCacheKey(rt, ancestor, true)] == fp {
 			return true
 		}
-		if ignored, ok := fs.git.ignoreCache[gitIgnoreCacheKey(rt, ancestor, false)]; ok && ignored {
+		if ignored, ok := fs.git.ignoreCache[gitIgnoreCacheKey(rt, ancestor, false)]; ok && ignored && fs.git.ignoreCacheFP[gitIgnoreCacheKey(rt, ancestor, false)] == fp {
 			return true
 		}
 	}
@@ -5572,6 +5809,13 @@ func (fs *Dat9FS) removeGitWorkspaceRoot(ctx context.Context, rt *gitWorkspaceRu
 	if fs.opts != nil && strings.TrimSpace(fs.opts.LocalRoot) != "" {
 		if err := gitcache.MarkWorkspaceDeleted(ctx, fs.opts.LocalRoot, wsID); err != nil {
 			safeLogPrintf("git workspace local deleted marker workspace=%s: %v", wsID, err)
+		}
+		// The clone/worktree that wrote this marker deliberately left it in
+		// place for the workspace's lifetime. Clear it now so a later ordinary
+		// clone at the same root is remote-backed again; other roots' markers
+		// are preserved.
+		if err := gitcache.ClearWorkspacePending(ctx, fs.opts.LocalRoot, rt.localRoot); err != nil {
+			safeLogPrintf("git workspace clear pending marker workspace=%s root=%s: %v", wsID, rt.localRoot, err)
 		}
 	}
 	fs.git.mu.Lock()

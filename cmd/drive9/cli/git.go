@@ -582,6 +582,12 @@ func gitWorktreeRemove(args []string) error {
 	if err := markLocalGitWorkspaceDeleted(cmdCtx, resolved, ws.WorkspaceID); err != nil {
 		cleanupErrs = append(cleanupErrs, fmt.Errorf("mark linked git workspace deleted locally: %w", err))
 	}
+	// The `git worktree add --fast` pending marker lives for the workspace's
+	// lifetime; drop it now so a later ordinary clone at this root is
+	// remote-backed again. Other roots' markers are preserved.
+	if err := gitcache.ClearWorkspacePending(cmdCtx, resolved.LocalRoot, mountLocalRootForTarget(resolved)); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("clear git workspace pending marker: %w", err))
+	}
 	if overlayRoot, err := localOverlayRootForMountedTarget(resolved); err == nil && overlayRoot != "" {
 		if err := os.RemoveAll(overlayRoot); err != nil {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove linked local overlay root: %w", err))

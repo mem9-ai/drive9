@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -129,35 +130,37 @@ func WorkspacePendingDir(localRoot string) string {
 }
 
 // WorkspacePendingMarkerPath returns the pending marker for a mount-local
-// workspace root path (for example "/repo", or "/" for the mount root). The
-// root is laid out as one path segment per component so the marker name is
-// readable; each segment is sanitized independently.
+// workspace root path (for example "/repo", or "/" for the mount root).
+//
+// The marker name is a flat key derived from the canonical root, not a
+// per-segment layout: segment layouts cannot distinguish the mount root "/"
+// from a workspace root named "root", and parent/child roots ("/repo" and
+// "/repo/sub") collide as file-vs-directory. The canonical root is stored in
+// the marker body and re-validated by WorkspacePending, so a hash collision
+// cannot misroute `.git` to the wrong root.
 func WorkspacePendingMarkerPath(localRoot, mountRoot string) string {
-	dir := WorkspacePendingDir(localRoot)
-	segments := mountRootSegments(mountRoot)
-	if len(segments) == 0 {
-		return filepath.Join(dir, "root")
-	}
-	parts := append([]string{dir}, segments...)
-	return filepath.Join(parts...)
+	name := fmt.Sprintf("pending-%016x", pendingMarkerKey(canonicalMountRoot(mountRoot)))
+	return filepath.Join(WorkspacePendingDir(localRoot), name)
 }
 
-// mountRootSegments normalizes a mount-local root into sanitized path segments;
-// the mount root "/" yields no segments.
-func mountRootSegments(mountRoot string) []string {
-	trimmed := strings.Trim(strings.TrimSpace(mountRoot), "/")
+// canonicalMountRoot normalizes a mount-local workspace root to the canonical
+// form used for the pending-marker key and body: absolute and slash-clean with
+// no trailing slash.
+func canonicalMountRoot(mountRoot string) string {
+	trimmed := strings.TrimSpace(mountRoot)
 	if trimmed == "" {
-		return nil
+		return "/"
 	}
-	raw := strings.Split(trimmed, "/")
-	out := make([]string, 0, len(raw))
-	for _, segment := range raw {
-		if segment == "" {
-			continue
-		}
-		out = append(out, safePathSegment(segment))
+	if !strings.HasPrefix(trimmed, "/") {
+		trimmed = "/" + trimmed
 	}
-	return out
+	return path.Clean(trimmed)
+}
+
+func pendingMarkerKey(canonicalRoot string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(canonicalRoot))
+	return h.Sum64()
 }
 
 // MarkWorkspacePending records that a git workspace is being created at
@@ -182,7 +185,7 @@ func MarkWorkspacePending(ctx context.Context, localRoot, mountRoot string) erro
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	body := strings.TrimSpace(mountRoot) + "\n" + time.Now().UTC().Format(time.RFC3339Nano) + "\n"
+	body := canonicalMountRoot(mountRoot) + "\n" + time.Now().UTC().Format(time.RFC3339Nano) + "\n"
 	if err := os.WriteFile(marker, []byte(body), 0o644); err != nil {
 		return fmt.Errorf("write git workspace pending marker %q: %w", marker, err)
 	}
@@ -208,7 +211,10 @@ func ClearWorkspacePending(ctx context.Context, localRoot, mountRoot string) err
 	return nil
 }
 
-// WorkspacePending reports whether a pending marker exists for mountRoot.
+// WorkspacePending reports whether a pending marker exists for mountRoot. The
+// marker body must carry the canonical root: a flat hash key could in
+// principle collide with a different root, and a body mismatch is treated as
+// not pending rather than misrouting `.git`.
 func WorkspacePending(ctx context.Context, localRoot, mountRoot string) bool {
 	if ctx == nil {
 		ctx = context.Background()
@@ -220,8 +226,25 @@ func WorkspacePending(ctx context.Context, localRoot, mountRoot string) bool {
 	if localRoot == "" {
 		return false
 	}
-	_, err := os.Stat(WorkspacePendingMarkerPath(localRoot, mountRoot))
-	return err == nil
+	marker := WorkspacePendingMarkerPath(localRoot, mountRoot)
+	info, err := os.Stat(marker)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		return false
+	}
+	root := canonicalMountRoot(mountRoot)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// The body's first non-empty line is the canonical root.
+		return line == root
+	}
+	return false
 }
 
 // MarkWorkspaceRegistered updates local signals after a successful remote
