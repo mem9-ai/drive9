@@ -1345,6 +1345,9 @@ const removeAllMaxRetries = 4
 // removeAllMaxRetries and needs no cap.
 const removeAllMaxRetryDelay = 60 * time.Second
 
+// Successful DELETE responses only carry a small JSON acknowledgment.
+const maxDeleteSuccessBodyBytes int64 = 4 << 10
+
 // removeAllRetryDelay computes how long to wait before retrying a recursive
 // delete after a 503. A valid, non-negative Retry-After value (integer
 // delta-seconds) is honored, clamped to removeAllMaxRetryDelay; a missing or
@@ -1402,6 +1405,11 @@ func (c *Client) deleteCtx(ctx context.Context, path string, recursive bool, kin
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 300 {
 			return readError(resp)
+		}
+		if resp.StatusCode >= http.StatusOK {
+			// Reaching EOF lets HTTP/1.1 reuse the connection. Bound unexpected
+			// bodies, and do not turn an acknowledged delete into a failure.
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDeleteSuccessBodyBytes+1))
 		}
 		return nil
 	}
