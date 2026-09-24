@@ -70,6 +70,8 @@ type WriteBackMeta struct {
 	HasMode          bool        `json:"has_mode,omitempty"`
 	SnapshotID       string      `json:"-"`
 	ParentSnapshotID string      `json:"-"`
+	Inode            uint64      `json:"-"`
+	MutationSeq      uint64      `json:"-"`
 	// lineageTrusted is deliberately process-local and never serialized.
 	// Recovering a mutable path-keyed payload cannot prove that the bytes and
 	// JSON metadata were replaced atomically across a crash.
@@ -276,7 +278,7 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 // used by FileHandle staging. Legacy callers deliberately store empty lineage,
 // which is safe because such metadata cannot authorize a growth rebase.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
-	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, true, liveAncestors)
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, true, liveAncestors, 0, 0)
 }
 
 // PutWithBaseRevAndModeAndLineageTimingsNoSync is the non-durable variant of
@@ -286,10 +288,14 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath strin
 // elsewhere — the shadow store + pending index — so at most the snapshot's
 // freshness (not its integrity) is lost on a crash.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsNoSync(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
-	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, false, liveAncestors)
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, false, liveAncestors, 0, 0)
 }
 
-func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, durable bool, liveAncestors []string) (uint64, WriteBackPutTimings, error) {
+func (c *WriteBackCache) putHandleSnapshot(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted, durable bool, liveAncestors []string, ino, seq uint64) (uint64, WriteBackPutTimings, error) {
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, durable, liveAncestors, ino, seq)
+}
+
+func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, durable bool, liveAncestors []string, ino, seq uint64) (uint64, WriteBackPutTimings, error) {
 	var t WriteBackPutTimings
 
 	// Phase 1: acquire per-path lock (serializes same-path Put/Remove/etc.)
@@ -328,6 +334,8 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 		HasMode:          hasMode,
 		SnapshotID:       snapshotID,
 		ParentSnapshotID: parentSnapshotID,
+		Inode:            ino,
+		MutationSeq:      seq,
 		lineageTrusted:   lineageTrusted,
 		liveAncestors:    append([]string(nil), liveAncestors...),
 	}
