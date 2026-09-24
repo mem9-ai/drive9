@@ -98,7 +98,7 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer journal.Close()
+	defer func() { _ = journal.Close() }()
 	pending.SetJournal(journal)
 	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
 		LayerRef:   "layer-1",
