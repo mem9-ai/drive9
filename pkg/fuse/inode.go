@@ -246,6 +246,17 @@ func (m *InodeToPath) GetInode(path string) (uint64, bool) {
 	return ino, ok
 }
 
+// GetRevision reads the revision without copying the inode's paths or metadata.
+// Zero means either no known server revision or no inode entry.
+func (m *InodeToPath) GetRevision(ino uint64) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if entry := m.byInode[ino]; entry != nil {
+		return entry.Revision
+	}
+	return 0
+}
+
 // GetEntry returns a copy of the InodeEntry for the given inode number. A copy
 // is returned to avoid data races. The second return value is false if the
 // inode is not found.

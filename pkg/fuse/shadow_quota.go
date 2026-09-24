@@ -161,6 +161,13 @@ func (s *ShadowStore) recordWrite(remotePath string, sf *ShadowFile, offset int6
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if baseRev == 0 && sf.size == 0 {
+		// Actual I/O into an empty image establishes new local staging,
+		// including sparse zeros. Partial writes over recovered nonempty
+		// contents must not bless the untouched bytes.
+		sf.baseRev = 0
+		sf.localNew = true
+	}
 	added := sf.written.addedBytes(offset, int64(n))
 	sf.written.add(offset, int64(n))
 	sf.writtenBytes += added

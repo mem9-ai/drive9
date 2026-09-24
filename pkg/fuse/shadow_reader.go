@@ -2,34 +2,45 @@ package fuse
 
 // openReadOnlyShadowLocked discards restart orphans once. Read retries in memory.
 func (fs *Dat9FS) openReadOnlyShadowLocked(fh *FileHandle) {
-	if fs.shadowStore != nil && !fs.hasPendingMetadataState(fh.Path) &&
-		(fs.appendLogPathConfigured(fh.Path) || fs.latestCommittedRevision(fh.Path) > 0) {
+	if fs.shadowStore == nil {
+		return
+	}
+	pending := fs.hasPendingMetadataState(fh.Path)
+	if !pending {
 		fs.shadowStore.discardDiskOnly(fh.Path)
 	}
-	fs.refreshReadOnlyShadowLocked(fh)
+	fs.refreshReadOnlyShadowWithPendingLocked(fh, pending)
 }
 
-// refreshReadOnlyShadowLocked is shared by Open and Read. An append-log cache,
-// or any cache superseded by a locally observed commit, must match the known
-// revision at each read, not just when the descriptor opened. Pending metadata
-// has its own authority; retired reset/unlink snapshots keep their lifetime.
+// refreshReadOnlyShadowLocked checks every path against the known revision,
+// not just append-log paths or paths committed by this mount. Pending metadata
+// has its own authority; retired inode/WAL snapshots keep their lifetime.
 // The caller owns the new handle or holds fh.mu, including through a gen read.
 func (fs *Dat9FS) refreshReadOnlyShadowLocked(fh *FileHandle) {
 	if fs.shadowStore == nil || fh.Dirty != nil || fh.Unlinked || fh.UnlinkedSnapshot {
 		return
 	}
+	if !fh.ShadowPinned && !fs.shadowStore.hasResident(fh.Path) {
+		// A normal cache miss needs neither inode copying nor a write-back
+		// metadata path lock. Pending recovery published after Open may
+		// still authorize a disk-only image; this probe is memory-only.
+		if fs.pendingIndex == nil || !fs.pendingIndex.HasPending(fh.Path) {
+			return
+		}
+	}
+	fs.refreshReadOnlyShadowWithPendingLocked(fh, fs.hasPendingMetadataState(fh.Path))
+}
+
+// Open checks pending recovery even without a resident candidate. Read can
+// skip that work on misses; both use exactly the same source-selection rules.
+func (fs *Dat9FS) refreshReadOnlyShadowWithPendingLocked(fh *FileHandle, pending bool) {
 	committedRevision := fs.latestCommittedRevision(fh.Path)
-	checkRevision := fs.appendLogPathConfigured(fh.Path) || committedRevision > 0
 	// Pending metadata deliberately exposes the current staged image even
 	// when its CAS base predates a known commit. It never validates a retired
 	// image: metadata for a replacement must not resurrect the old pin.
-	pending := fs.hasPendingMetadataState(fh.Path)
-	minRevision := max(fh.BaseRev, committedRevision)
-	if entry, ok := fs.inodes.GetEntry(fh.Ino); ok && entry != nil {
-		minRevision = max(minRevision, entry.Revision)
-	}
+	minRevision := max(fh.BaseRev, committedRevision, fs.inodes.GetRevision(fh.Ino))
 	if fh.ShadowPinned {
-		if fs.shadowStore.canReadGeneration(fh.ShadowGen, minRevision, pending || !checkRevision) {
+		if fs.shadowStore.canReadGeneration(fh.ShadowGen, minRevision, pending) {
 			return
 		}
 		gen := fh.ShadowGen
@@ -51,10 +62,10 @@ func (fs *Dat9FS) refreshReadOnlyShadowLocked(fh *FileHandle) {
 	// pending writer may now have supplied a usable generation.
 	var gen uint64
 	var ok bool
-	if checkRevision && !pending {
-		gen, ok = fs.shadowStore.PinResident(fh.Path, minRevision)
-	} else {
+	if pending {
 		gen, ok = fs.shadowStore.PinIfExists(fh.Path)
+	} else {
+		gen, ok = fs.shadowStore.PinResident(fh.Path, minRevision)
 	}
 	if ok {
 		fh.ShadowGen, fh.ShadowPinned = gen, true
