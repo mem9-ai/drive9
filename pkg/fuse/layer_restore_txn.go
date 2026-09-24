@@ -21,6 +21,8 @@ const (
 
 var nextLayerRestoreTxnID atomic.Uint64
 
+var errLayerRestoreStateUncertain = errors.New("layer restore local state is uncertain")
+
 type layerRestoreFileSnapshot struct {
 	Path       string `json:"path"`
 	BackupPath string `json:"backup_path,omitempty"`
@@ -46,6 +48,12 @@ type layerRestoreTxn struct {
 	markerPath string
 	record     layerRestoreTxnRecord
 	finished   bool
+	// removeMarker is a per-transaction test seam. Production transactions
+	// leave it nil and use removeLayerRestoreMarker. Keeping the seam on the
+	// transaction (rather than package-global) makes failure injection safe for
+	// parallel tests and lets us exercise both remove and directory-fsync
+	// failures at the actual commit point.
+	removeMarker func(string) error
 }
 
 func beginLayerRestoreTxn(pendingDir string, paths ...string) (*layerRestoreTxn, error) {
@@ -187,7 +195,7 @@ func (tx *layerRestoreTxn) rollback() error {
 			return fmt.Errorf("layer restore rollback %s: %w", snap.Path, err)
 		}
 	}
-	if err := removeLayerRestoreMarker(tx.markerPath); err != nil {
+	if err := tx.removeDurableMarker(); err != nil {
 		return err
 	}
 	cleanupLayerRestoreBackups(tx.record.Files)
@@ -207,12 +215,30 @@ func (tx *layerRestoreTxn) commit() error {
 	// Removing and syncing the marker is the final commit point. Backups are
 	// deliberately removed afterwards so a crash can never leave a marker
 	// whose rollback material has already been discarded.
-	if err := removeLayerRestoreMarker(tx.markerPath); err != nil {
+	if err := tx.removeDurableMarker(); err != nil {
 		return err
 	}
 	cleanupLayerRestoreBackups(tx.record.Files)
 	tx.finished = true
 	return nil
+}
+
+func (tx *layerRestoreTxn) removeDurableMarker() error {
+	if tx.removeMarker != nil {
+		return tx.removeMarker(tx.markerPath)
+	}
+	return removeLayerRestoreMarker(tx.markerPath)
+}
+
+// rollbackLayerRestoreFailure keeps the original failure while marking a
+// second rollback failure as a mount-wide fail-closed condition. The caller
+// still holds the pending/shadow path locks, so no successor writer can
+// publish between the failed commit point and this rollback attempt.
+func rollbackLayerRestoreFailure(tx *layerRestoreTxn, primary error) error {
+	if rollbackErr := tx.rollback(); rollbackErr != nil {
+		return errors.Join(primary, fmt.Errorf("%w: %v", errLayerRestoreStateUncertain, rollbackErr))
+	}
+	return primary
 }
 
 func removeLayerRestoreMarker(markerPath string) error {

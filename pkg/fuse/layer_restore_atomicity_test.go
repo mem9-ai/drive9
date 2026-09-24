@@ -16,6 +16,7 @@ import (
 )
 
 var errInjectedLayerRestoreMeta = errors.New("injected layer restore metadata durability failure")
+var errInjectedLayerRestoreCommit = errors.New("injected layer restore commit-point failure")
 
 func seedCommittedLayerCache(t *testing.T, shadows *ShadowStore, pending *PendingIndex, path string, data []byte, baseRev int64, mode uint32) WriteBackMeta {
 	t.Helper()
@@ -302,6 +303,156 @@ func TestLayerRestoreTransactionCorruptionAndRollbackFailureFailClosed(t *testin
 			t.Fatalf("restart error = %v, want fail-closed rollback recovery failure", err)
 		}
 	})
+}
+
+func TestRestoreLayerCommitPointFailureRollsBackBeforeSuccessorWriter(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fail func(string) error
+	}{
+		{
+			name: "marker remove",
+			fail: func(string) error { return errInjectedLayerRestoreCommit },
+		},
+		{
+			name: "marker dir fsync",
+			fail: func(marker string) error {
+				if err := os.Remove(marker); err != nil {
+					return err
+				}
+				return errInjectedLayerRestoreCommit
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const path = "/commit-point.txt"
+			entry := client.FSLayerEntry{
+				LayerID: "layer-1", Path: "/repo/commit-point.txt", Op: "upsert", Kind: "file",
+				Content: []byte("remote-new"), SizeBytes: int64(len("remote-new")), BaseRevision: 72, Mode: 0o600, EntrySeq: 2,
+			}
+			ts := newLayerRestoreAtomicityServer(t, entry, nil)
+			defer ts.Close()
+
+			shadowDir, pendingDir := t.TempDir(), t.TempDir()
+			shadows, err := NewShadowStore(shadowDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending, err := NewPendingIndex(pendingDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldMeta := seedCommittedLayerCache(t, shadows, pending, path, []byte("old"), 71, 0o640)
+			failed := false
+			pending.restoreTxnMarkerRemove = func(marker string) error {
+				if !failed {
+					failed = true
+					return tc.fail(marker)
+				}
+				return removeLayerRestoreMarker(marker)
+			}
+
+			err = restoreLayerEntries(context.Background(), client.New(ts.URL, ""), &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}, shadows, pending, nil)
+			if !errors.Is(err, errInjectedLayerRestoreCommit) {
+				t.Fatalf("restore error = %v, want commit-point failure", err)
+			}
+			assertLayerRestoreCacheState(t, shadows, pending, path, []byte("old"), oldMeta)
+			assertNoLayerRestoreArtifacts(t, shadowDir, pendingDir)
+
+			// A successor writer starts only after rollback and must survive restart;
+			// the failed restore must not leave a marker that later rewinds it.
+			successor := []byte("successor-local")
+			if err := shadows.WriteFull(path, successor, oldMeta.BaseRev); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pending.PutWithBaseRevAndMode(path, int64(len(successor)), PendingOverwrite, oldMeta.BaseRev, 0o600, true); err != nil {
+				t.Fatal(err)
+			}
+			successorMeta, ok := pending.GetMeta(path)
+			if !ok {
+				t.Fatal("successor metadata missing")
+			}
+			shadows.Close()
+			restartedShadows, restartedPending := reopenLayerRestoreCache(t, shadowDir, pendingDir)
+			assertLayerRestoreCacheState(t, restartedShadows, restartedPending, path, successor, *successorMeta)
+			assertNoLayerRestoreArtifacts(t, shadowDir, pendingDir)
+		})
+	}
+}
+
+func TestRestoreLayerCommitPointRollbackFailureBlocksSuccessorWriters(t *testing.T) {
+	const path = "/blocked.txt"
+	entry := client.FSLayerEntry{
+		LayerID: "layer-1", Path: "/repo/blocked.txt", Op: "upsert", Kind: "file",
+		Content: []byte("remote-new"), SizeBytes: int64(len("remote-new")), BaseRevision: 82, Mode: 0o600, EntrySeq: 2,
+	}
+	ts := newLayerRestoreAtomicityServer(t, entry, nil)
+	defer ts.Close()
+
+	shadows, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadows.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedCommittedLayerCache(t, shadows, pending, path, []byte("old"), 81, 0o640)
+	pending.restoreTxnMarkerRemove = func(string) error { return errInjectedLayerRestoreCommit }
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	err = restoreLayerEntries(context.Background(), client.New(ts.URL, ""), opts, shadows, pending, fs)
+	if !errors.Is(err, errLayerRestoreStateUncertain) {
+		t.Fatalf("restore error = %v, want uncertain local state", err)
+	}
+	if !fs.promotionBlocked.Load() {
+		t.Fatal("rollback failure did not freeze the live mount")
+	}
+	if unlock, ok := fs.lockPromotionMutation(); ok {
+		unlock()
+		t.Fatal("successor writer allowed after rollback failure")
+	}
+}
+
+func TestMountRejectsCorruptLayerRestoreMarkerBeforeFuseServer(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/repo":
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.Header().Set("X-Dat9-Revision", "1")
+		case r.Method == http.MethodHead && r.URL.Path == "/":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1":
+			_ = json.NewEncoder(w).Encode(client.FSLayer{LayerID: "layer-1", BaseRootPath: "/repo", State: "active"})
+		default:
+			t.Errorf("unexpected request before pending recovery: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	cacheDir := t.TempDir()
+	mountPoint := t.TempDir()
+	pendingDir := filepath.Join(cacheDir, MountLayerHash(ts.URL, mountPoint, "/repo", "layer-1", ""), "pending")
+	if err := os.MkdirAll(pendingDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(pendingDir, layerRestoreTxnPrefix+"corrupt"+layerRestoreTxnSuffix)
+	if err := os.WriteFile(marker, []byte("{not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Mount(&MountOptions{
+		Server: ts.URL, APIKey: "sk-test", MountPoint: mountPoint, RemoteRoot: "/repo",
+		CacheDir: cacheDir, LayerRef: "layer-1",
+	})
+	assertMountExit(t, err, ExitStartupPermanent, ExitReasonStartupPermanent)
+	if !strings.Contains(err.Error(), "layer pending index recovery") {
+		t.Fatalf("Mount error = %v, want pending rollback diagnosis", err)
+	}
 }
 
 func newLayerRestoreAtomicityServer(t *testing.T, entry client.FSLayerEntry, object []byte) *httptest.Server {

@@ -41,7 +41,13 @@ type PendingIndex struct {
 	// restoreMetaWrite is a narrow test seam for the cross-file layer cache
 	// transaction. Production always uses atomicWrite.
 	restoreMetaWrite func(string, []byte) error
+	// restoreTxnMarkerRemove is a narrow, per-index commit-point test seam.
+	// Production leaves it nil; transactions then use removeLayerRestoreMarker.
+	restoreTxnMarkerRemove func(string) error
 }
+
+type layerRestoreMetaPublish func()
+type layerRestoreMetaPrepare func(size int64) (layerRestoreMetaPublish, error)
 
 // SetJournal wires the WAL used for durable pending-meta publication. It is
 // wired once during mount init, before the first Put.
@@ -274,7 +280,7 @@ func (idx *PendingIndex) restoreLayerCommittedIfGeneration(
 	mode uint32,
 	hasMode bool,
 	shadowPath string,
-	apply func(tx *layerRestoreTxn, commitMeta func(size int64) error) (applied bool, err error),
+	apply func(tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (applied bool, err error),
 ) (bool, error) {
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
@@ -286,8 +292,9 @@ func (idx *PendingIndex) restoreLayerCommittedIfGeneration(
 	if err != nil {
 		return false, err
 	}
-	committed := false
-	commitMeta := func(size int64) error {
+	tx.removeMarker = idx.restoreTxnMarkerRemove
+	published := false
+	prepareMeta := func(size int64) (layerRestoreMetaPublish, error) {
 		gen := idx.nextGen.Add(1)
 		now := time.Now()
 		meta := &WriteBackMeta{
@@ -304,39 +311,31 @@ func (idx *PendingIndex) restoreLayerCommittedIfGeneration(
 		}
 		metaBytes, err := json.Marshal(meta)
 		if err != nil {
-			return fmt.Errorf("pending index marshal restored layer: %w", err)
+			return nil, fmt.Errorf("pending index marshal restored layer: %w", err)
 		}
 		if err := idx.writeLayerRestoreMeta(filepath.Join(idx.dir, hashPath(remotePath)+".meta"), metaBytes); err != nil {
-			return fmt.Errorf("pending index restore committed layer: %w", err)
+			return nil, fmt.Errorf("pending index restore committed layer: %w", err)
 		}
-		idx.mu.Lock()
-		idx.items[remotePath] = meta
-		idx.mu.Unlock()
-		committed = true
-		return nil
+		return func() {
+			idx.mu.Lock()
+			idx.items[remotePath] = meta
+			idx.mu.Unlock()
+			published = true
+		}, nil
 	}
-	applied, err := apply(tx, commitMeta)
+	applied, err := apply(tx, prepareMeta)
 	if err != nil || !applied {
 		if err != nil {
-			if rollbackErr := tx.rollback(); rollbackErr != nil {
-				return false, errors.Join(err, rollbackErr)
-			}
-			return false, err
+			return false, rollbackLayerRestoreFailure(tx, err)
 		}
-		if cleanupErr := tx.commit(); cleanupErr != nil {
-			return false, cleanupErr
+		if cleanupErr := tx.rollback(); cleanupErr != nil {
+			return false, fmt.Errorf("%w: %v", errLayerRestoreStateUncertain, cleanupErr)
 		}
 		return false, nil
 	}
-	if !committed {
+	if !published {
 		err := fmt.Errorf("pending index restore committed layer: shadow applied without metadata")
-		if rollbackErr := tx.rollback(); rollbackErr != nil {
-			return false, errors.Join(err, rollbackErr)
-		}
-		return false, err
-	}
-	if err := tx.commit(); err != nil {
-		return false, err
+		return false, rollbackLayerRestoreFailure(tx, err)
 	}
 	return true, nil
 }
@@ -388,7 +387,7 @@ func (idx *PendingIndex) restoreLayerrenameIfGenerations(
 	mode uint32,
 	hasMode bool,
 	oldShadowPath, newShadowPath string,
-	apply func(tx *layerRestoreTxn, commitMeta func(size int64) error) (applied bool, err error),
+	apply func(tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (applied bool, err error),
 ) (bool, error) {
 	pla, plb := idx.acquireTwoPathLocks(oldPath, newPath)
 	defer idx.releaseTwoPathLocks(oldPath, newPath, pla, plb)
@@ -410,8 +409,9 @@ func (idx *PendingIndex) restoreLayerrenameIfGenerations(
 	if err != nil {
 		return false, err
 	}
-	committed := false
-	commitMeta := func(size int64) error {
+	tx.removeMarker = idx.restoreTxnMarkerRemove
+	published := false
+	prepareMeta := func(size int64) (layerRestoreMetaPublish, error) {
 		now := time.Now()
 		newMeta := &WriteBackMeta{
 			Path:           newPath,
@@ -436,51 +436,43 @@ func (idx *PendingIndex) restoreLayerrenameIfGenerations(
 		newMeta.Generation = idx.nextGen.Add(1)
 		metaBytes, err := json.Marshal(newMeta)
 		if err != nil {
-			return fmt.Errorf("pending index marshal restored layer rename: %w", err)
+			return nil, fmt.Errorf("pending index marshal restored layer rename: %w", err)
 		}
 		if err := idx.writeLayerRestoreMeta(filepath.Join(idx.dir, hashPath(newPath)+".meta"), metaBytes); err != nil {
-			return fmt.Errorf("pending index restore layer rename: %w", err)
+			return nil, fmt.Errorf("pending index restore layer rename: %w", err)
 		}
 		if oldPath != newPath {
 			oldMetaPath := filepath.Join(idx.dir, hashPath(oldPath)+".meta")
 			if err := os.Remove(oldMetaPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("pending index remove restored layer source: %w", err)
+				return nil, fmt.Errorf("pending index remove restored layer source: %w", err)
 			}
 			if err := fsyncDir(idx.dir); err != nil {
-				return fmt.Errorf("pending index sync restored layer rename: %w", err)
+				return nil, fmt.Errorf("pending index sync restored layer rename: %w", err)
 			}
 		}
-		idx.mu.Lock()
-		if oldPath != newPath {
-			delete(idx.items, oldPath)
-		}
-		idx.items[newPath] = newMeta
-		idx.mu.Unlock()
-		committed = true
-		return nil
+		return func() {
+			idx.mu.Lock()
+			if oldPath != newPath {
+				delete(idx.items, oldPath)
+			}
+			idx.items[newPath] = newMeta
+			idx.mu.Unlock()
+			published = true
+		}, nil
 	}
-	applied, err := apply(tx, commitMeta)
+	applied, err := apply(tx, prepareMeta)
 	if err != nil || !applied {
 		if err != nil {
-			if rollbackErr := tx.rollback(); rollbackErr != nil {
-				return false, errors.Join(err, rollbackErr)
-			}
-			return false, err
+			return false, rollbackLayerRestoreFailure(tx, err)
 		}
-		if cleanupErr := tx.commit(); cleanupErr != nil {
-			return false, cleanupErr
+		if cleanupErr := tx.rollback(); cleanupErr != nil {
+			return false, fmt.Errorf("%w: %v", errLayerRestoreStateUncertain, cleanupErr)
 		}
 		return false, nil
 	}
-	if !committed {
+	if !published {
 		err := fmt.Errorf("pending index restore layer rename: shadow applied without metadata")
-		if rollbackErr := tx.rollback(); rollbackErr != nil {
-			return false, errors.Join(err, rollbackErr)
-		}
-		return false, err
-	}
-	if err := tx.commit(); err != nil {
-		return false, err
+		return false, rollbackLayerRestoreFailure(tx, err)
 	}
 	return true, nil
 }

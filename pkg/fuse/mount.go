@@ -555,7 +555,7 @@ func Mount(opts *MountOptions) (err error) {
 				// index would expose the possibly mixed shadow/.meta pair, so layer
 				// mounts must fail before the kernel mount becomes visible.
 				if opts.LayerRef != "" {
-					return fmt.Errorf("mount: layer pending index init: %w", err)
+					return ExitStartupPermanentErr("layer pending index recovery", err)
 				}
 				fmt.Fprintf(os.Stderr, "drive9: pending index init failed: %v (continuing without)\n", err)
 			} else {
@@ -1417,7 +1417,16 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 	return restoreLayerEntriesWithRenameTargets(ctx, c, opts, shadows, pending, fs, nil)
 }
 
-func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, renameTargets map[string]string) error {
+func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, renameTargets map[string]string) (retErr error) {
+	defer func() {
+		// A rollback failure leaves a durable marker precisely because disk state
+		// is no longer safe to expose. Startup already fails before mounting; a
+		// live event watcher must freeze the existing mount as well so successor
+		// writers cannot build on state that the next restart will reject or undo.
+		if retErr != nil && errors.Is(retErr, errLayerRestoreStateUncertain) && fs != nil {
+			fs.promotionBlocked.Store(true)
+		}
+	}()
 	if c == nil || opts == nil || shadows == nil || pending == nil || strings.TrimSpace(opts.LayerRef) == "" {
 		return nil
 	}
@@ -1554,19 +1563,19 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 			fullEntry.Mode,
 			fullEntry.Mode != 0,
 			shadows.shadowPath(localPath),
-			func(tx *layerRestoreTxn, commitMeta func(size int64) error) (bool, error) {
-				checkedCommit := func(sizeBytes int64) error {
+			func(tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (bool, error) {
+				checkedPrepare := func(sizeBytes int64) (layerRestoreMetaPublish, error) {
 					if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
-						return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
+						return nil, fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
 					}
-					return commitMeta(sizeBytes)
+					return prepareMeta(sizeBytes)
 				}
 				if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
 					rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, entryMaxSeq)
 					if err != nil {
 						return false, fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
 					}
-					_, applied, writeErr := shadows.writeStreamIfGeneration(localPath, rc, fullEntry.BaseRevision, expectedShadowGen, tx, checkedCommit)
+					_, applied, writeErr := shadows.writeStreamIfGeneration(localPath, rc, fullEntry.BaseRevision, expectedShadowGen, tx, checkedPrepare)
 					closeErr := rc.Close()
 					if writeErr != nil {
 						return false, fmt.Errorf("restore fs layer shadow %s: %w", localPath, writeErr)
@@ -1580,7 +1589,7 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 					return true, nil
 				} else {
 					content := fullEntry.Content
-					applied, err := shadows.writeFullIfGeneration(localPath, content, fullEntry.BaseRevision, expectedShadowGen, tx, checkedCommit)
+					applied, err := shadows.writeFullIfGeneration(localPath, content, fullEntry.BaseRevision, expectedShadowGen, tx, checkedPrepare)
 					if err != nil {
 						return false, fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
 					}
@@ -1723,14 +1732,14 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 		fullEntry.Mode != 0,
 		shadows.shadowPath(oldLocalPath),
 		shadows.shadowPath(newLocalPath),
-		func(tx *layerRestoreTxn, commitMeta func(size int64) error) (bool, error) {
+		func(tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (bool, error) {
 			moved, matched, err := shadows.renameIfGenerations(
 				oldLocalPath,
 				newLocalPath,
 				expectedOldShadowGen,
 				expectedNewShadowGen,
 				tx,
-				commitMeta,
+				prepareMeta,
 			)
 			if err != nil || moved || !matched {
 				return moved, err
@@ -1738,7 +1747,7 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 			if fallbackData == nil {
 				return false, nil
 			}
-			return shadows.writeFullIfGeneration(newLocalPath, fallbackData, 0, expectedNewShadowGen, tx, commitMeta)
+			return shadows.writeFullIfGeneration(newLocalPath, fallbackData, 0, expectedNewShadowGen, tx, prepareMeta)
 		},
 	)
 	unlock()
