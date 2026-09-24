@@ -786,12 +786,11 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	return n, nil
 }
 
-// writeStreamIfGeneration stages the remote stream in a private temporary file
-// without holding the path lock, then swaps it into place only if the active
-// shadow generation is unchanged. A lock-timeout writer can therefore make
-// progress during a slow object download and wins the final CAS instead of
-// having its local generation overwritten by replay.
-func (s *ShadowStore) writeStreamIfGeneration(remotePath string, r io.Reader, baseRev int64, expectedGen uint64, tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (int64, bool, error) {
+// stageLayerRestoreStream downloads authoritative object content into a
+// private temporary file without holding either the remote-commit lock or the
+// mount-wide restore lifecycle barrier. A timeout writer can therefore make
+// progress during a slow object read; the later install CAS decides ownership.
+func (s *ShadowStore) stageLayerRestoreStream(remotePath string, r io.Reader) (string, int64, error) {
 	s.mu.RLock()
 	oldWrittenSnapshot := int64(0)
 	if sf := s.files[remotePath]; sf != nil {
@@ -801,30 +800,32 @@ func (s *ShadowStore) writeStreamIfGeneration(remotePath string, r io.Reader, ba
 
 	tmpFd, err := os.CreateTemp(s.dir, ".layer-restore-*.shadow.tmp")
 	if err != nil {
-		return 0, false, fmt.Errorf("shadow stream tmp create: %w", err)
+		return "", 0, fmt.Errorf("shadow stream tmp create: %w", err)
 	}
 	tmpPath := tmpFd.Name()
+	keep := false
 	defer func() {
 		_ = tmpFd.Close()
-		_ = os.Remove(tmpPath)
+		if !keep {
+			_ = os.Remove(tmpPath)
+		}
 	}()
 
 	n, err := s.quotaCopy(tmpFd, r, oldWrittenSnapshot)
 	if err != nil {
 		if errors.Is(err, syscall.ENOSPC) {
-			return 0, false, err
+			return "", 0, err
 		}
-		return n, false, fmt.Errorf("shadow write stream: %w", err)
+		return "", n, fmt.Errorf("shadow write stream: %w", err)
 	}
 	if err := tmpFd.Sync(); err != nil {
-		return n, false, fmt.Errorf("shadow stream sync: %w", err)
+		return "", n, fmt.Errorf("shadow stream sync: %w", err)
 	}
 	if err := tmpFd.Close(); err != nil {
-		return n, false, fmt.Errorf("shadow stream close: %w", err)
+		return "", n, fmt.Errorf("shadow stream close: %w", err)
 	}
-
-	applied, err := s.installLayerRestoreTempIfGeneration(remotePath, tmpPath, n, baseRev, expectedGen, tx, prepareMeta)
-	return n, applied, err
+	keep = true
+	return tmpPath, n, nil
 }
 
 // Truncate updates the shadow file length without syncing it.

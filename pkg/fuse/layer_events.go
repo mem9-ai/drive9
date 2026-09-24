@@ -85,23 +85,13 @@ func refreshLayerEvents(ctx context.Context, c *client.Client, opts *MountOption
 		fs.applyLayerRollback(shadows, pending)
 		return maxSeq, nil
 	}
-	renameTargets := make(map[string]string)
-	if err := restoreLayerEntriesWithRenameTargets(ctx, c, opts, shadows, pending, fs, renameTargets); err != nil {
+	if err := restoreLayerEntriesInternal(ctx, c, opts, shadows, pending, fs); err != nil {
 		return since, err
 	}
-	// The restored shadow is now authoritative for these paths. Drop all
-	// userspace and kernel-facing read state so a long-lived same-layer mount
-	// observes the refreshed entry rather than a cached pre-event generation.
-	for i := range events {
-		p, ok := fs.localPath(events[i].Path)
-		if !ok || p == "" || p == "/" {
-			continue
-		}
-		invalidateLayerRefreshPath(fs, p)
-		if target := renameTargets[p]; target != "" && target != p {
-			invalidateLayerRefreshPath(fs, target)
-		}
-	}
+	// restoreLayerEntries publishes the overlay and invalidates every affected
+	// source/target cache before releasing its lifecycle barrier. Doing another
+	// invalidation here would run after a queued local writer and could erase
+	// that writer's freshly-published cache state.
 	return maxSeq, nil
 }
 

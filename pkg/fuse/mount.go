@@ -1414,7 +1414,7 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 }
 
 func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS) error {
-	return restoreLayerEntriesWithRenameTargets(ctx, c, opts, shadows, pending, fs, nil)
+	return restoreLayerEntriesInternal(ctx, c, opts, shadows, pending, fs)
 }
 
 // lockLayerRestoreTransaction takes the exclusive side of the same lifecycle
@@ -1434,7 +1434,36 @@ func lockLayerRestoreTransaction(fs *Dat9FS) func(error) {
 	}
 }
 
-func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, renameTargets map[string]string) (retErr error) {
+var testHookBeforeLayerRestoreViewPublish func(paths []string)
+
+// publishLayerRestoreView publishes the in-memory namespace view and drops
+// every cache derived from its predecessor. Callers must still hold the
+// exclusive restore lifecycle barrier. Keeping this publication before that
+// barrier is released ensures a queued local mutation is the later winner,
+// rather than allowing a peer replay to overwrite the local result after its
+// durable pending/shadow transaction has already completed.
+func publishLayerRestoreView(fs *Dat9FS, paths []string, publish func()) {
+	if fs == nil {
+		return
+	}
+	if testHookBeforeLayerRestoreViewPublish != nil {
+		testHookBeforeLayerRestoreViewPublish(append([]string(nil), paths...))
+	}
+	publish()
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		if p == "" || p == "/" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		invalidateLayerRefreshPath(fs, p)
+	}
+}
+
+func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS) (retErr error) {
 	defer func() {
 		// A rollback failure leaves a durable marker precisely because disk state
 		// is no longer safe to expose. Startup already fails before mounting; a
@@ -1477,14 +1506,14 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 		}
 		switch entry.Op {
 		case "whiteout":
-			if fs != nil {
-				fs.markLayerWhiteout(localPath)
-			}
+			finishRestore := lockLayerRestoreTransaction(fs)
+			publishLayerRestoreView(fs, []string{localPath}, func() { fs.markLayerWhiteout(localPath) })
+			finishRestore(nil)
 			continue
 		case "mkdir":
-			if fs != nil {
-				fs.markLayerDir(localPath, entry.Mode)
-			}
+			finishRestore := lockLayerRestoreTransaction(fs)
+			publishLayerRestoreView(fs, []string{localPath}, func() { fs.markLayerDir(localPath, entry.Mode) })
+			finishRestore(nil)
 			continue
 		case "chmod":
 			expectedPendingGen, owned := layerRestorePendingGeneration(pending, localPath)
@@ -1499,6 +1528,24 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 				unlock = fs.lockRemoteCommitPath(localPath)
 			}
 			applied, err := pending.restoreLayerModeIfGeneration(localPath, expectedPendingGen, entry.Mode)
+			if err == nil && applied {
+				publishLayerRestoreView(fs, []string{localPath}, func() {
+					switch entry.Kind {
+					case "file":
+						fs.markLayerFileMode(localPath, entry.Mode)
+					case "dir":
+						fs.markLayerDir(localPath, entry.Mode)
+					case "symlink":
+						if target, existingMode, ok := fs.layerSymlink(localPath); ok {
+							nextMode := (existingMode &^ uint32(0o777)) | (entry.Mode & 0o777)
+							if nextMode&uint32(syscall.S_IFMT) == 0 {
+								nextMode |= uint32(syscall.S_IFLNK)
+							}
+							fs.markLayerSymlink(localPath, target, nextMode)
+						}
+					}
+				})
+			}
 			unlock()
 			finishRestore(err)
 			if err != nil {
@@ -1507,30 +1554,11 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 			if !applied {
 				continue
 			}
-			if fs != nil {
-				switch entry.Kind {
-				case "file":
-					fs.markLayerFileMode(localPath, entry.Mode)
-				case "dir":
-					fs.markLayerDir(localPath, entry.Mode)
-				case "symlink":
-					if target, existingMode, ok := fs.layerSymlink(localPath); ok {
-						nextMode := (existingMode &^ uint32(0o777)) | (entry.Mode & 0o777)
-						if nextMode&uint32(syscall.S_IFMT) == 0 {
-							nextMode |= uint32(syscall.S_IFLNK)
-						}
-						fs.markLayerSymlink(localPath, target, nextMode)
-					}
-				}
-			}
 			continue
 		case "rename":
-			targetPath, err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq))
+			_, err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq))
 			if err != nil {
 				return err
-			}
-			if renameTargets != nil && targetPath != "" {
-				renameTargets[localPath] = targetPath
 			}
 			continue
 		case "symlink":
@@ -1549,9 +1577,9 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 			if target == "" {
 				return fmt.Errorf("restore fs layer symlink entry %s: missing target", entry.Path)
 			}
-			if fs != nil {
-				fs.markLayerSymlink(localPath, target, entry.Mode)
-			}
+			finishRestore := lockLayerRestoreTransaction(fs)
+			publishLayerRestoreView(fs, []string{localPath}, func() { fs.markLayerSymlink(localPath, target, entry.Mode) })
+			finishRestore(nil)
 			continue
 		}
 		if entry.Op != "upsert" || entry.Kind != "file" {
@@ -1570,6 +1598,27 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 		fullEntry, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, entryMaxSeq)
 		if err != nil {
 			return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
+		}
+		var stagedObjectPath string
+		var stagedObjectSize int64
+		if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
+			rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, entryMaxSeq)
+			if err != nil {
+				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
+			}
+			stagedObjectPath, stagedObjectSize, err = shadows.stageLayerRestoreStream(localPath, rc)
+			closeErr := rc.Close()
+			if err != nil {
+				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
+			}
+			if closeErr != nil {
+				_ = os.Remove(stagedObjectPath)
+				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, closeErr)
+			}
+			if fullEntry.SizeBytes > 0 && stagedObjectSize != fullEntry.SizeBytes {
+				_ = os.Remove(stagedObjectPath)
+				return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, stagedObjectSize, fullEntry.SizeBytes)
+			}
 		}
 		finishRestore := lockLayerRestoreTransaction(fs)
 		unlock := func() {}
@@ -1591,17 +1640,9 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 					return prepareMeta(sizeBytes)
 				}
 				if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
-					rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, entryMaxSeq)
-					if err != nil {
-						return false, fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
-					}
-					_, applied, writeErr := shadows.writeStreamIfGeneration(localPath, rc, fullEntry.BaseRevision, expectedShadowGen, tx, checkedPrepare)
-					closeErr := rc.Close()
+					applied, writeErr := shadows.installLayerRestoreTempIfGeneration(localPath, stagedObjectPath, stagedObjectSize, fullEntry.BaseRevision, expectedShadowGen, tx, checkedPrepare)
 					if writeErr != nil {
 						return false, fmt.Errorf("restore fs layer shadow %s: %w", localPath, writeErr)
-					}
-					if closeErr != nil {
-						return false, fmt.Errorf("restore fs layer object %s: %w", entry.Path, closeErr)
 					}
 					if !applied {
 						return false, nil
@@ -1620,20 +1661,25 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 				}
 			},
 		)
+		if err == nil && restored {
+			publishLayerRestoreView(fs, []string{localPath}, func() {
+				if fullEntry.Mode != 0 {
+					fs.markLayerFileMode(localPath, fullEntry.Mode)
+				} else {
+					fs.markLayerFile(localPath)
+				}
+			})
+		}
 		unlock()
 		finishRestore(err)
+		if stagedObjectPath != "" {
+			_ = os.Remove(stagedObjectPath)
+		}
 		if err != nil {
 			return err
 		}
 		if !restored {
 			continue
-		}
-		if fs != nil {
-			if fullEntry.Mode != 0 {
-				fs.markLayerFileMode(localPath, fullEntry.Mode)
-			} else {
-				fs.markLayerFile(localPath)
-			}
 		}
 	}
 	return nil
@@ -1772,6 +1818,16 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 			return shadows.writeFullIfGeneration(newLocalPath, fallbackData, 0, expectedNewShadowGen, tx, prepareMeta)
 		},
 	)
+	if err == nil && applied {
+		publishLayerRestoreView(fs, []string{oldLocalPath, newLocalPath}, func() {
+			fs.markLayerWhiteout(oldLocalPath)
+			if fullEntry.Mode != 0 {
+				fs.markLayerFileMode(newLocalPath, fullEntry.Mode)
+			} else {
+				fs.markLayerFile(newLocalPath)
+			}
+		})
+	}
 	unlock()
 	finishRestore(err)
 	if err != nil {
@@ -1779,14 +1835,6 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 	}
 	if !applied {
 		return newLocalPath, nil
-	}
-	if fs != nil {
-		fs.markLayerWhiteout(oldLocalPath)
-		if fullEntry.Mode != 0 {
-			fs.markLayerFileMode(newLocalPath, fullEntry.Mode)
-		} else {
-			fs.markLayerFile(newLocalPath)
-		}
 	}
 	return newLocalPath, nil
 }

@@ -535,6 +535,9 @@ func TestRestoreLayerEntriesSlowObjectDoesNotOverwriteLockTimeoutWriter(t *testi
 	const localPath = "/shared.bin"
 	streamStarted := make(chan struct{})
 	allowStream := make(chan struct{})
+	var allowStreamOnce sync.Once
+	releaseStream := func() { allowStreamOnce.Do(func() { close(allowStream) }) }
+	defer releaseStream()
 	entry := client.FSLayerEntry{
 		LayerID: "layer-1", Path: "/repo/shared.bin", Op: "upsert", Kind: "file",
 		StorageType: "s3", StorageRef: "layers/layer-1/shared", SizeBytes: 6,
@@ -601,6 +604,12 @@ func TestRestoreLayerEntriesSlowObjectDoesNotOverwriteLockTimeoutWriter(t *testi
 
 	writerDone := make(chan error, 1)
 	go func() {
+		unlockMutation, ok := fs.lockPromotionMutation()
+		if !ok {
+			writerDone <- syscall.EIO
+			return
+		}
+		defer unlockMutation()
 		unlock := fs.lockWritableRemoteCommitPath(localPath)
 		defer unlock()
 		if err := shadow.WriteFull(localPath, []byte("local"), 8); err != nil {
@@ -622,7 +631,7 @@ func TestRestoreLayerEntriesSlowObjectDoesNotOverwriteLockTimeoutWriter(t *testi
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	close(allowStream)
+	releaseStream()
 	if err := <-restoreDone; err != nil {
 		t.Fatalf("restore with lock-timeout writer: %v", err)
 	}
@@ -634,6 +643,212 @@ func TestRestoreLayerEntriesSlowObjectDoesNotOverwriteLockTimeoutWriter(t *testi
 	}
 	if meta, ok := pending.GetMeta(localPath); !ok || meta.LayerCommitted || meta.Size != 5 || meta.Mode != 0o600 {
 		t.Fatalf("lock-timeout local metadata after restore = %+v", meta)
+	}
+}
+
+func TestRestoreLayerChmodPublishesViewBeforeQueuedWriter(t *testing.T) {
+	const localPath = "/shared.txt"
+	entry := client.FSLayerEntry{
+		LayerID: "layer-1", Path: "/repo/shared.txt", Op: "chmod", Kind: "file",
+		Mode: 0o640, EntrySeq: 2,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/layers/layer-1/diff" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{entry}})
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := pending.PutWithBaseRevAndMode(localPath, 1, PendingOverwrite, 8, 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := pending.MarkLayerCommitted(localPath, gen, 8); err != nil || !marked {
+		t.Fatalf("mark committed = (%t, %v)", marked, err)
+	}
+
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.markLayerFileMode(localPath, 0o600)
+	publishReached := make(chan struct{})
+	allowPublish := make(chan struct{})
+	testHookBeforeLayerRestoreViewPublish = func(paths []string) {
+		if len(paths) == 1 && paths[0] == localPath {
+			close(publishReached)
+			<-allowPublish
+		}
+	}
+	t.Cleanup(func() { testHookBeforeLayerRestoreViewPublish = nil })
+
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- restoreLayerEntries(context.Background(), client.New(ts.URL, ""), opts, shadow, pending, fs)
+	}()
+	select {
+	case <-publishReached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("peer chmod did not reach view publication")
+	}
+
+	writerStarted := make(chan struct{})
+	writerAcquired := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		close(writerStarted)
+		unlock, ok := fs.lockPromotionMutation()
+		if !ok {
+			return
+		}
+		close(writerAcquired)
+		fs.markLayerFileMode(localPath, 0o660)
+		fs.readCache.Put(localPath, []byte("newer"), 9)
+		unlock()
+		close(writerDone)
+	}()
+	<-writerStarted
+	select {
+	case <-writerAcquired:
+		t.Fatal("queued chmod writer passed lifecycle barrier before peer view publication")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowPublish)
+	if err := <-restoreDone; err != nil {
+		t.Fatalf("restore peer chmod: %v", err)
+	}
+	select {
+	case <-writerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued chmod writer did not resume")
+	}
+	if mode, ok := fs.layerFileMode(localPath); !ok || mode != 0o660 {
+		t.Fatalf("visible mode after queued chmod = (%#o, %t), want writer mode 0660", mode, ok)
+	}
+	if got, ok := fs.readCache.Get(localPath, 9); !ok || string(got) != "newer" {
+		t.Fatalf("writer cache after peer chmod = %q, %t; peer invalidation ran after writer", got, ok)
+	}
+}
+
+func TestRestoreLayerRenamePublishesBothPathsBeforeQueuedWriter(t *testing.T) {
+	entry := client.FSLayerEntry{
+		LayerID: "layer-1", Path: "/repo/from.txt", Op: "rename", Kind: "file",
+		ContentText: "/repo/to.txt", Mode: 0o640, EntrySeq: 2,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/layers/layer-1/diff" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{entry}})
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/from.txt", []byte("peer"), 8); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := pending.PutWithBaseRevAndMode("/from.txt", 4, PendingOverwrite, 8, 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := pending.MarkLayerCommitted("/from.txt", gen, 8); err != nil || !marked {
+		t.Fatalf("mark committed = (%t, %v)", marked, err)
+	}
+
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.markLayerFileMode("/from.txt", 0o600)
+	publishReached := make(chan struct{})
+	allowPublish := make(chan struct{})
+	testHookBeforeLayerRestoreViewPublish = func(paths []string) {
+		if len(paths) == 2 && paths[0] == "/from.txt" && paths[1] == "/to.txt" {
+			close(publishReached)
+			<-allowPublish
+		}
+	}
+	t.Cleanup(func() { testHookBeforeLayerRestoreViewPublish = nil })
+
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- restoreLayerEntries(context.Background(), client.New(ts.URL, ""), opts, shadow, pending, fs)
+	}()
+	select {
+	case <-publishReached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("peer rename did not reach view publication")
+	}
+
+	writerStarted := make(chan struct{})
+	writerAcquired := make(chan struct{})
+	writerDone := make(chan error, 1)
+	go func() {
+		close(writerStarted)
+		unlock, ok := fs.lockPromotionMutation()
+		if !ok {
+			writerDone <- syscall.EIO
+			return
+		}
+		defer unlock()
+		close(writerAcquired)
+		if err := shadow.WriteFull("/from.txt", []byte("newer"), 9); err != nil {
+			writerDone <- err
+			return
+		}
+		if _, err := pending.PutWithBaseRevAndMode("/from.txt", 5, PendingOverwrite, 9, 0o660, true); err != nil {
+			writerDone <- err
+			return
+		}
+		fs.markLayerFileMode("/from.txt", 0o660)
+		fs.markLayerWhiteout("/to.txt")
+		fs.readCache.Put("/from.txt", []byte("newer"), 9)
+		writerDone <- nil
+	}()
+	<-writerStarted
+	select {
+	case <-writerAcquired:
+		t.Fatal("queued rename writer passed lifecycle barrier before peer source/target publication")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowPublish)
+	if err := <-restoreDone; err != nil {
+		t.Fatalf("restore peer rename: %v", err)
+	}
+	if err := <-writerDone; err != nil {
+		t.Fatalf("queued rename writer: %v", err)
+	}
+	if fs.isLayerWhiteout("/from.txt") {
+		t.Fatal("peer rename whiteout overwrote later local source generation")
+	}
+	if !fs.isLayerWhiteout("/to.txt") {
+		t.Fatal("later local target whiteout was overwritten by peer rename")
+	}
+	if mode, ok := fs.layerFileMode("/from.txt"); !ok || mode != 0o660 {
+		t.Fatalf("visible source mode after queued rename = (%#o, %t), want 0660", mode, ok)
+	}
+	if got, ok := fs.readCache.Get("/from.txt", 9); !ok || string(got) != "newer" {
+		t.Fatalf("writer cache after peer rename = %q, %t; peer invalidation ran after writer", got, ok)
 	}
 }
 
