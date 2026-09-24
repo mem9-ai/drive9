@@ -213,14 +213,13 @@ func mergeProfileValues(groups ...[]string) []string {
 // the coding-agent, coding-agent-extent, and portable profiles. These paths are
 // overlaid unconditionally.
 //
-// VCS metadata stays here: `git clone --fast` writes the working `.git` before
-// the workspace is registered, so a workspace-scoped rule would miss it. Other
-// build/cache output stays remote-persistent.
+// `.git` stays here: `git clone --fast` writes the working `.git` before the
+// workspace is registered, so a workspace-scoped rule would miss it. `.hg` and
+// `.svn` are not overlaid and sync to the remote. Other build/cache output
+// stays remote-persistent.
 func builtinCodingAgentLocalOnlyPatterns() []string {
 	return []string{
 		"**/.git/**",
-		"**/.hg/**",
-		"**/.svn/**",
 		"**/node_modules/**",
 		"**/.venv/**",
 	}

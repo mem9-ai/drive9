@@ -16,11 +16,12 @@ func TestLocalPolicyCodingAgentDefaultsMatchGitSegmentExactly(t *testing.T) {
 		{path: "/repo/node_modules/react/index.js", want: PathLayerLocalOnly},
 		{path: "/repo/target/debug/app", want: PathLayerLocalOnly},
 		{path: "/repo/node_modules_extra/x.js", want: PathLayerRemotePersistent},
-		// Segment-exact VCS metadata.
+		// Segment-exact `.git` metadata.
 		{path: "/repo/.git", want: PathLayerLocalOnly},
 		{path: "/repo/.git/config", want: PathLayerLocalOnly},
-		{path: "/repo/.hg/store/data", want: PathLayerLocalOnly},
-		{path: "/repo/.svn/pristine/aa", want: PathLayerLocalOnly},
+		// `.hg`/`.svn` are not overlaid; only `.git` has fast-clone coupling.
+		{path: "/repo/.hg/store/data", want: PathLayerRemotePersistent},
+		{path: "/repo/.svn/pristine/aa", want: PathLayerRemotePersistent},
 		{path: "/repo/.gitignore", want: PathLayerRemotePersistent},
 		{path: "/repo/.gitattributes", want: PathLayerRemotePersistent},
 		{path: "/repo/notes.git.txt", want: PathLayerRemotePersistent},

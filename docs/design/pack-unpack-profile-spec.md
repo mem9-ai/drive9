@@ -64,7 +64,7 @@ The built-in profiles are:
 
 | Profile | Local overlay policy | Automatic pack policy |
 | --- | --- | --- |
-| `coding-agent` | `[local]` VCS metadata and dependency trees (`.git`/`.hg`/`.svn`, `node_modules`, `.venv`, overlaid unconditionally) and `[local-gitignore-aware]` build output (`target`, overlaid only when the repository also ignores it; see [git-fast-clone-workspace](./git-fast-clone-workspace.md)). This is the default FUSE profile. | No automatic pack paths. Nothing is packed unless the user explicitly asks. |
+| `coding-agent` | `[local]` `.git` and dependency trees (`node_modules`, `.venv`, overlaid unconditionally) and `[local-gitignore-aware]` build output (`target`, overlaid only when the repository also ignores it; see [git-fast-clone-workspace](./git-fast-clone-workspace.md)). `.hg`/`.svn` sync to the remote. This is the default FUSE profile. | No automatic pack paths. Nothing is packed unless the user explicitly asks. |
 | `portable` | Uses the same local overlay policy as `coding-agent`. | Packs all files and directories that currently exist under `local-root/overlay`. |
 | `none` | No local overlay policy. | No pack policy. |
 

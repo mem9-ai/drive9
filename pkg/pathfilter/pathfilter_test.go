@@ -204,13 +204,15 @@ func TestMatcherExcludeOverridesInclude(t *testing.T) {
 	}
 }
 
-// The union of the coding-agent [local] and [local-gitignore-aware] defaults.
-// The FUSE layer gates the second list on the repository's ignore rules; bulk
-// archive applies both directly, which is what this matcher models.
+// The union of the coding-agent [local] and [local-gitignore-aware] defaults
+// (.git, node_modules, .venv, target). The FUSE layer gates the second list on
+// the repository's ignore rules; bulk archive applies both directly, which is
+// what this matcher models. `.hg`/`.svn` are not defaults.
 func TestCodingAgentDefaultPatternsDropDependencyAndBuildOutput(t *testing.T) {
-	patterns := []string{"**/node_modules/**", "**/.venv/**", "**/target/**"}
+	patterns := []string{"**/.git/**", "**/node_modules/**", "**/.venv/**", "**/target/**"}
 	m := NewMatcher(nil, patterns, nil)
 	drop := []string{
+		".git/HEAD", "proj/.git/config",
 		"node_modules/react/index.js", "proj/node_modules/pkg/x.js",
 		"proj/.venv/bin/python",
 		"proj/.venv/lib/python3.12/site-packages/numpy/core.py",
@@ -221,10 +223,10 @@ func TestCodingAgentDefaultPatternsDropDependencyAndBuildOutput(t *testing.T) {
 			t.Fatalf("coding-agent pattern should drop %q", p)
 		}
 	}
-	// VCS metadata and other build/cache output are not default patterns.
+	// `.hg`/`.svn` and other build/cache output are not default patterns.
 	keep := []string{
 		"proj/src/main.go", "README.md", "proj/go.mod", "proj/.gitignore",
-		".git/HEAD", "proj/.hg/store/data", "proj/.svn/pristine/aa",
+		".hg/HEAD", "proj/.svn/pristine/aa",
 		"proj/dist/bundle.js", "proj/build/output.o", "proj/.tox/py312/lib/python3.12/x.py",
 		"proj/__pycache__/mod.cpython-312.pyc", "proj/.cache/state.json",
 	}

@@ -63,7 +63,7 @@ npm install
 The interaction does not require the user to understand Drive9 internals:
 
 - Durable files such as source code, docs, and config enter the layer.
-- `.git`, `node_modules`, and `.venv` prefer the existing local-only overlay unconditionally; `target` when the repository ignores it. Other build/cache output stays remote-managed unless the profile opts it in.
+- `.git`, `node_modules`, and `.venv` prefer the existing local-only overlay unconditionally; `target` when the repository ignores it. Other build/cache output and `.hg`/`.svn` stay remote-managed unless the profile opts them in.
 - File `close`, `fsync`, checkpoint, and unmount advance the durable layer to the backend.
 - Regular Drive9 mount behavior remains unchanged when no layer is used.
 

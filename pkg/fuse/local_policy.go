@@ -127,12 +127,15 @@ func validMountProfileName(profile string) bool {
 
 // defaultCodingAgentLocalOnlyPatterns are overlaid unconditionally.
 //
-// VCS metadata must stay here. `git clone --fast` creates the working `.git`
-// before the workspace row is registered, so a workspace-scoped rule cannot see
-// it yet; without the pattern those `.git` writes would upload to the remote
-// before registration ever happens, and `.git` also drives the git-state
-// recovery refresh path. The `.git` state itself is still never durable content
-// — it is checkpointed, not treated as project files.
+// `.git` must stay here. `git clone --fast` writes the working `.git` before
+// the workspace row is registered, so a workspace-scoped rule cannot see it
+// during the clone; without the pattern those writes upload to the remote,
+// which the fast-clone design forbids ("do not persist the full Git object
+// database in Drive9"). The `.git` content is still Git state, not project
+// files: it is checkpointed, never treated as durable content.
+//
+// `.hg` and `.svn` are deliberately absent: nothing overlays them for a
+// workspace, so they sync to the remote like ordinary files.
 //
 // Dependency trees are listed here too: their names unambiguously denote
 // generated trees, so there is no need to consult the repository.
@@ -142,8 +145,6 @@ func defaultCodingAgentLocalOnlyPatterns(profile string) []string {
 	}
 	return []string{
 		"**/.git/**",
-		"**/.hg/**",
-		"**/.svn/**",
 		"**/node_modules/**",
 		"**/.venv/**",
 	}
