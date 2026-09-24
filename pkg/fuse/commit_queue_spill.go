@@ -14,7 +14,7 @@ import (
 func (cq *CommitQueue) uploadShadowSpill(ctx context.Context, entry *CommitEntry, expectedRevision int64) (int64, error) {
 	apiPath := cq.remotePath(entry.Path)
 	if entry.Size < 0 || entry.Size > maxLandedPayloadBytes {
-		return uploadFromShadowRemoteWithRevisionAndGeneration(ctx, cq.client, cq.shadows, entry.Path, apiPath, expectedRevision, entry.ShadowGen)
+		return uploadFromShadowRemote(ctx, cq.client, cq.shadows, entry.Path, apiPath, expectedRevision, entry.ShadowGen, shadowUploadLocalDurable)
 	}
 	if err := cq.shadows.SyncIfGeneration(entry.Path, entry.ShadowGen); err != nil {
 		return 0, err

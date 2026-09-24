@@ -404,7 +404,7 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 				fs.recordCommittedRevisionWithSize(snapshotPath, result.Revision, result.Size)
 			}
 			if !snapshotOwnsShadow && fs.shadowStore != nil {
-				fs.shadowStore.removeAfterAppendLogCommit(snapshotPath, result.Revision)
+				fs.shadowStore.Remove(snapshotPath)
 				fs.clearRemovedCommittedShadowForOpenHandles(snapshotPath, result.Revision, result.Size)
 			}
 			fs.recordAppendLogCommittedGeneration(snapshotIno, snapshotDirtySeq, result.Revision, result.Size)
@@ -668,7 +668,7 @@ func (fs *Dat9FS) rotateAppendLogGenerationShadowLocked(fh *FileHandle, path str
 		return
 	}
 
-	fs.shadowStore.Remove(path)
+	fs.shadowStore.retireSnapshot(path)
 	if shadowPinned {
 		fs.shadowStore.Unpin(shadowGen)
 	}
@@ -918,7 +918,7 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 		if err == nil {
 			fs.recordCommittedRevisionWithSize(snapshotPath, revision, snapshot.Size())
 			if !snapshotOwnsShadow && fs.shadowStore != nil {
-				fs.shadowStore.removeAfterAppendLogCommit(snapshotPath, revision)
+				fs.shadowStore.Remove(snapshotPath)
 				fs.clearRemovedCommittedShadowForOpenHandles(snapshotPath, revision, snapshot.Size())
 			}
 			fs.recordAppendLogCommittedGeneration(snapshotIno, snapshotDirtySeq, revision, snapshot.Size())
@@ -989,32 +989,6 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 	}
 	return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
-}
-
-// refreshAppendLogReaderShadowLocked drops a pin retired by an ordinary
-// append-log commit. Read-time repair also reaches siblings skipped by TryLock
-// during publication. Reset/unlink snapshots keep their original lifetime.
-// The caller holds fh.mu.
-func (fs *Dat9FS) refreshAppendLogReaderShadowLocked(fh *FileHandle) {
-	if fs.shadowStore == nil || fh.Dirty != nil || !fh.ShadowPinned || fh.Unlinked || fh.UnlinkedSnapshot {
-		return
-	}
-	retiredRevision := fs.shadowStore.appendLogRetiredRevision(fh.ShadowGen)
-	if retiredRevision == 0 {
-		return
-	}
-	gen := fh.ShadowGen
-	fh.ShadowPinned = false
-	fh.ShadowGen = 0
-	fs.shadowStore.Unpin(gen)
-	clearReadTargetForLockedHandle(fh)
-	if revision, size, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && revision >= retiredRevision {
-		fh.BaseRev = revision
-		fh.OrigSize = size
-		if fh.Prefetch != nil {
-			fh.Prefetch.invalidateWithSize(size)
-		}
-	}
 }
 
 // invalidateAppendLogReadTargets drops prefetched bytes independently of the
@@ -1181,7 +1155,7 @@ func (fs *Dat9FS) rewriteAppendLogPathTruncate(ctx context.Context, entry *Inode
 	if newSize == 0 && fs.shadowStore != nil {
 		// Path truncate has no handle to publish the empty shadow. Retire
 		// the old backing so linked readers cannot keep its pre-truncate bytes.
-		fs.shadowStore.removeAfterAppendLogCommit(entry.Path, revision)
+		fs.shadowStore.Remove(entry.Path)
 		fs.clearRemovedCommittedShadowForOpenHandles(entry.Path, revision, newSize)
 	}
 	entry.Revision = revision

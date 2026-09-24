@@ -38,7 +38,7 @@ Valid values:
 | `auto` | Buffered locally. | RTT-based: strict on low-latency mounts, interactive on high-latency mounts. | Existing write-back behavior. | Default, preserve current latency/compatibility behavior. |
 | `interactive` | Buffered locally. | Local shadow/journal durable; remote commit async. | Existing write-back behavior. | Editors and WAN mounts where low latency matters more than immediate cross-client visibility. |
 | `fsync` | Buffered locally. | Remote-durable before fsync returns. | Existing write-back behavior except existing strict large-file flush behavior. | Tools that explicitly call fsync when they need durability. |
-| `close-sync` | Buffered locally. | Remote-durable before fsync returns. | Remote-durable before close can report success. | JuiceFS-like close-to-cloud semantics, sync tools, cross-client visibility after close. |
+| `close-sync` ([local staging tradeoff](#expected-tradeoffs)) | Buffered locally. | Remote-durable before fsync returns. | Remote-durable before close can report success. | JuiceFS-like close-to-cloud semantics, sync tools, cross-client visibility after close. |
 | `write-sync` | Remote-durable before each write returns. | Normally clean after successful writes. | Normally clean after successful writes. | Strongest semantics, tests, low-frequency writes. |
 
 Default is `auto`.
@@ -135,6 +135,84 @@ prefer this over close-sync.
 
 `close-sync` improves cross-client/cloud visibility after close, but close
 latency includes network, server, database, and S3/db9 latency.
+Strict close-sync `Flush` and `Release` shadow uploads omit local fsync only
+when the content generation is known and no live pending-index or write-back
+metadata references the path. Generation fencing pins the source through remote
+acknowledgement. Only Flush/Release request this optimization from the shared
+uploader. Explicit fsync and link-source synchronization retain the local
+barrier, including their append-log fallbacks into the generic uploader.
+The primary foreground close-sync Flush/Release path requests remote-only
+eligibility. The inline ShadowSpill error/recovery fallbacks retain local fsync;
+those conservative routes do not request this optimization.
+Failed uploads retain dirty state for an in-process retry; unacknowledged shadow
+bytes are not guaranteed to survive a machine crash. Explicit strict `fsync(2)`
+shadow uploads deliberately retain local sync, as do writeback, recovery, staged
+handles, and library mounts combining close-sync with interactive/auto sync.
+The eligibility check uses live staging state, not a scan of historical WAL
+frames. Recovery of historical frames retains its recorded revision and existing
+CAS checks; this optimization does not add journal commit markers or retire them.
+
+For every path, read-only `Open` and `Read` share a checked shadow-pin path.
+Without pending metadata, only resident caches with a base revision at least
+as new as the handle, inode and locally observed commit can be selected.
+Absence of append-log configuration or local commit history does not authorize
+an unknown disk image, including a torn shadow left after an acknowledged
+close-sync upload and restart.
+
+Locally initialized new-file staging at revision zero is also readable while
+no committed revision is known. Successful empty initialization (including
+Create over a leftover shadow), actual writes into an empty image, and complete
+content replacement establish that provenance. Merely opening, syncing,
+partially resizing or partially overwriting recovered bytes does not.
+
+Retirement has an explicit reason. Ordinary cleanup invalidates future reads
+from that generation, even when the upload returned no revision. Cleanup alone
+does not prove that the retired shadow matches the uploaded image, so it never
+labels those bytes with a committed revision. Existing readers repin a current
+source or use the remote/read cache. Explicit WAL reset and anonymous inode
+snapshots (including rename-overwrite) keep their existing lifetime. Unlinked
+handles read their captured generation directly; they do not use the ordinary
+path's source-selection policy.
+
+PendingIndex metadata may override a newer known remote revision only for the
+exact shadow content generation bound when that metadata was published. Pin
+identity alone does not prove content identity: writes can change the same fd.
+The binding includes the ShadowStore instance and is never persisted. Unbound
+metadata falls back to ordinary revision validation; WriteBackCache metadata
+owns only its `.dat` payload and never authorizes `.shadow`. Recovery explicitly
+binds the selected payload after journal replay and legacy `.dat` migration,
+before requests are served. Both asynchronous and synchronous recovery refuse
+a shadow shorter than the selected metadata, including when journal setup
+failed and only `.meta` survived. Recovery uploads retain the metadata's CAS base.
+
+Legacy migration repairs a missing or short shadow from a complete `.dat`
+snapshot only when recovery still selects that snapshot's metadata. A complete
+shadow is preserved because a best-effort `.dat` snapshot can be older than
+acknowledged shadow staging. Full WAL metadata with a newer
+publication timestamp supersedes older disk metadata left by a failed snapshot;
+older WAL metadata and legacy fsync frames do not displace newer disk metadata.
+Rejecting missing or short WAL data preserves an older complete `.meta`/`.dat`
+publication with its original CAS revision. Before restoring those bytes,
+recovery durably appends the fallback metadata to supersede the rejected frame;
+a second crash cannot bind the restored bytes to that frame's newer revision.
+Failure to publish this recovery decision aborts mount before migration.
+Recovered publication generations advance the counter before new writes start.
+Startup accounting is reconciled before the first recovery enqueue. Replay,
+migration and layer-restore errors stop workers before closing staging resources.
+
+`Read` checks its shadow pin once at the shadow-read branch using resident state
+only: no path lock, disk lookup or unlink on a cache miss. `Open` applies the
+same eligibility rules and separately discards unclaimed disk-only orphans.
+A newly published resident source remains discoverable even if its revision has
+not changed. Raw path reads cannot bypass the checked pin. Creating a new file
+detaches the old path incarnation so stale inode revisions cannot hide local
+staging; old open handles, pending mutations and surviving hardlink aliases
+retain their inode as needed. Later cleanup removes only path mappings owned by that inode,
+so forgetting an old incarnation cannot remove a replacement's mapping.
+
+
+The next lifecycle refactor is tracked in
+[Shadow claim encapsulation](fuse-shadow-claim-lifecycle.md).
 
 `write-sync` can be dramatically slower for normal buffered writers because a
 single logical file copy may be split into many FUSE write requests. It is
