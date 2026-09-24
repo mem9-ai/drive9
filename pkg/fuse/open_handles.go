@@ -9,17 +9,19 @@ import (
 // It is intentionally separate from HandleTable so FUSE fh lookup remains a
 // simple id table while hot path lifecycle checks can avoid full-table scans.
 type OpenHandleIndex struct {
-	mu           sync.RWMutex
-	byInode      map[uint64]map[*FileHandle]struct{}
-	byPath       map[string]map[*FileHandle]struct{}
-	pathByHandle map[*FileHandle]string
+	mu               sync.RWMutex
+	byInode          map[uint64]map[*FileHandle]struct{}
+	byPath           map[string]map[*FileHandle]struct{}
+	visibleTruncates map[uint64]map[*FileHandle]uint64
+	pathByHandle     map[*FileHandle]string
 }
 
 func NewOpenHandleIndex() *OpenHandleIndex {
 	return &OpenHandleIndex{
-		byInode:      make(map[uint64]map[*FileHandle]struct{}),
-		byPath:       make(map[string]map[*FileHandle]struct{}),
-		pathByHandle: make(map[*FileHandle]string),
+		byInode:          make(map[uint64]map[*FileHandle]struct{}),
+		byPath:           make(map[string]map[*FileHandle]struct{}),
+		visibleTruncates: make(map[uint64]map[*FileHandle]uint64),
+		pathByHandle:     make(map[*FileHandle]string),
 	}
 }
 
@@ -48,6 +50,12 @@ func (idx *OpenHandleIndex) Remove(fh *FileHandle) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	removeHandleFromSet(idx.byInode, fh.Ino, fh)
+	if marked := idx.visibleTruncates[fh.Ino]; marked != nil {
+		delete(marked, fh)
+		if len(marked) == 0 {
+			delete(idx.visibleTruncates, fh.Ino)
+		}
+	}
 	if p, ok := idx.pathByHandle[fh]; ok {
 		removeHandleFromSet(idx.byPath, p, fh)
 		delete(idx.pathByHandle, fh)
@@ -56,6 +64,67 @@ func (idx *OpenHandleIndex) Remove(fh *FileHandle) {
 			removeHandleFromSet(idx.byPath, p, fh)
 		}
 	}
+}
+
+func (idx *OpenHandleIndex) MarkVisibleTruncate(fh *FileHandle, seq uint64) {
+	if idx == nil || fh == nil || fh.Ino == 0 {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if _, open := idx.byInode[fh.Ino][fh]; !open {
+		return
+	}
+	marked := idx.visibleTruncates[fh.Ino]
+	if marked == nil {
+		marked = make(map[*FileHandle]uint64)
+		idx.visibleTruncates[fh.Ino] = marked
+	}
+	marked[fh] = seq
+}
+
+func (idx *OpenHandleIndex) UnmarkVisibleTruncate(fh *FileHandle) {
+	if idx == nil || fh == nil {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if marked := idx.visibleTruncates[fh.Ino]; marked != nil {
+		delete(marked, fh)
+		if len(marked) == 0 {
+			delete(idx.visibleTruncates, fh.Ino)
+		}
+	}
+}
+
+// VisibleTruncateSeq returns the newest open fd-truncate sequence that a
+// committed mutation has not superseded. Sequence zero reserves the hint
+// while SetAttr is assigning the truncate's sequence under the handle lock.
+func (idx *OpenHandleIndex) VisibleTruncateSeq(ino, committedSeq uint64) (uint64, bool) {
+	if idx == nil || ino == 0 {
+		return 0, false
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	var latest uint64
+	provisional := false
+	for _, seq := range idx.visibleTruncates[ino] {
+		if seq == 0 {
+			provisional = true
+		} else if seq > committedSeq && seq > latest {
+			latest = seq
+		}
+	}
+	return latest, latest != 0 || provisional
+}
+
+func (idx *OpenHandleIndex) HasVisibleTruncate(ino uint64) bool {
+	if idx == nil || ino == 0 {
+		return false
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return len(idx.visibleTruncates[ino]) != 0
 }
 
 // UnlinkPath detaches currently open handles from a removed directory entry's

@@ -325,10 +325,10 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				}
 			}
 			var mutationRevision int64
-			if err == nil && gvisorCompat {
+			if err == nil && (gvisorCompat || fs.openHandles.HasVisibleTruncate(handleIno)) {
 				mutationRevision = fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
 				fs.recordCommittedMutation(handleIno, mutationSeq, mutationRevision, size)
-				if mutationRevision > 0 {
+				if gvisorCompat && mutationRevision > 0 {
 					fs.refreshCommittedRevisionForOpenHandlesWithSize(handlePath, mutationRevision, fh, size)
 				}
 			}
