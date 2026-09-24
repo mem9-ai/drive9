@@ -57,6 +57,14 @@ func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint strin
 	if accessToken == "" {
 		return nil, fmt.Errorf("gcs access token is required")
 	}
+	// storage.NewClient diverts to its emulator branch whenever
+	// STORAGE_EMULATOR_HOST is set, and that branch installs
+	// option.WithoutAuthentication plus an unvalidated endpoint template. A
+	// non-loopback value would silently relocate this credential-bearing store
+	// (and drop the bearer token), so fail closed instead.
+	if emu := strings.TrimSpace(os.Getenv("STORAGE_EMULATOR_HOST")); emu != "" && !isLoopbackHost(emulatorHostname(emu)) {
+		return nil, fmt.Errorf("STORAGE_EMULATOR_HOST %q must be loopback for the extent GCS store", emu)
+	}
 	opts := []option.ClientOption{
 		option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: accessToken})),
 		// Read through the JSON API: the XML read path drops the configured
@@ -86,6 +94,20 @@ func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint strin
 		return nil, fmt.Errorf("gcs client: %w", err)
 	}
 	return &gcsTokenStorage{client: client, bucket: bucket}, nil
+}
+
+// emulatorHostname extracts the host from STORAGE_EMULATOR_HOST, which may be
+// a bare host, host:port, or a full URL.
+func emulatorHostname(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 // isLoopbackHost reports whether host is a loopback name or address, the only

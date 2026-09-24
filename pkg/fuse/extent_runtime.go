@@ -38,10 +38,10 @@ const extentMetaDrainTimeout = extent.MetaCallTimeout + 5*time.Second
 func (fs *Dat9FS) stopExtentRuntimeLoop() {
 	fs.extentMu.Lock()
 	fs.extentTornDown = true
-	if fs.extentBuildCond != nil {
+	if fs.extentBuild.cond != nil {
 		// Wake single-flight waiters: a build that is still running can no
 		// longer be installed, so they must observe the teardown.
-		fs.extentBuildCond.Broadcast()
+		fs.extentBuild.cond.Broadcast()
 	}
 	er := fs.extentRT.Load()
 	fs.extentMu.Unlock()
@@ -61,11 +61,10 @@ func (fs *Dat9FS) stopExtentRuntimeLoop() {
 // store and clears the pointer, so a torn-down fs never advertises a dead
 // runtime as healthy.
 func (fs *Dat9FS) closeExtentRuntime() {
+	// Idempotent with FlushAll's stopExtentRuntimeLoop; doing it here too keeps a
+	// standalone caller from closing the session under a running compaction loop.
+	fs.stopExtentRuntimeLoop()
 	fs.extentMu.Lock()
-	// Mark torn down here too: a standalone caller must not clear the pointer
-	// and leave the fs free to build a replacement that nothing would close.
-	// It is idempotent with stopExtentRuntimeLoop.
-	fs.extentTornDown = true
 	er := fs.extentRT.Load()
 	fs.extentRT.Store(nil)
 	fs.extentMu.Unlock()
@@ -162,6 +161,16 @@ func (h *extentMetaHold) closeAndWait(timeout time.Duration) bool {
 	return true
 }
 
+// extentBuildState single-flights the unlocked runtime build. cond is created
+// lazily under extentMu; gen/err let waiters that parked on one build share its
+// finished outcome instead of each starting a fresh one.
+type extentBuildState struct {
+	building bool
+	cond     *sync.Cond
+	gen      uint64
+	err      error
+}
+
 type extentRuntime struct {
 	rt   *extent.Runtime
 	hold *extentMetaHold
@@ -175,8 +184,8 @@ type extentRuntime struct {
 
 func (fs *Dat9FS) ensureExtentRuntime() (err error) {
 	fs.extentMu.Lock()
-	if fs.extentBuildCond == nil {
-		fs.extentBuildCond = sync.NewCond(&fs.extentMu)
+	if fs.extentBuild.cond == nil {
+		fs.extentBuild.cond = sync.NewCond(&fs.extentMu)
 	}
 	for {
 		if fs.extentTornDown {
@@ -187,24 +196,24 @@ func (fs *Dat9FS) ensureExtentRuntime() (err error) {
 			fs.extentMu.Unlock()
 			return nil
 		}
-		if !fs.extentBuilding {
+		if !fs.extentBuild.building {
 			// Single-flight: only the first caller builds; the rest wait for it
 			// rather than each constructing a full runtime with its own session.
-			fs.extentBuilding = true
-			fs.extentBuildGen++
-			fs.extentBuildErr = nil
+			fs.extentBuild.building = true
+			fs.extentBuild.gen++
+			fs.extentBuild.err = nil
 			break
 		}
-		gen := fs.extentBuildGen
+		gen := fs.extentBuild.gen
 		if testHookExtentBuildWait != nil {
 			testHookExtentBuildWait()
 		}
-		fs.extentBuildCond.Wait()
-		if fs.extentBuildErr != nil && fs.extentBuildGen == gen {
+		fs.extentBuild.cond.Wait()
+		if fs.extentBuild.err != nil && fs.extentBuild.gen == gen {
 			// Share the failed build's outcome with every waiter instead of
 			// letting each one serially retry a full build against a dead
 			// endpoint. A later caller starts a fresh build (generation moves on).
-			err := fs.extentBuildErr
+			err := fs.extentBuild.err
 			fs.extentMu.Unlock()
 			return err
 		}
@@ -216,9 +225,9 @@ func (fs *Dat9FS) ensureExtentRuntime() (err error) {
 	// never wait on them). Publish the outcome and wake the waiters on every path.
 	defer func() {
 		fs.extentMu.Lock()
-		fs.extentBuilding = false
-		fs.extentBuildErr = err
-		fs.extentBuildCond.Broadcast()
+		fs.extentBuild.building = false
+		fs.extentBuild.err = err
+		fs.extentBuild.cond.Broadcast()
 		fs.extentMu.Unlock()
 	}()
 
@@ -245,12 +254,9 @@ func (fs *Dat9FS) ensureExtentRuntime() (err error) {
 		cacheDir = fs.opts.CacheDir
 	}
 	hold := newExtentMetaHold()
-	transport := extent.NewHTTPTransport(fs.client)
+	transport := extent.NewHTTPTransport(fs.client) // Timeout defaults to MetaCallTimeout
 	transport.Enter = hold.enter
 	transport.Leave = hold.leave
-	// Bound the non-blocking metadata RPCs (blocking Flock/Setlk are exempt in
-	// Call). Set before NewRuntime publishes the transport to its goroutines.
-	transport.Timeout = extent.MetaCallTimeout
 	rt, err := extent.NewRuntime(extent.RuntimeConfig{
 		CacheDir:  cacheDir,
 		CacheKey:  extent.CacheKeyForPrefix(cred.Prefix),

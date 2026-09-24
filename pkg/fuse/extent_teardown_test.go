@@ -170,15 +170,16 @@ func TestCloseExtentRuntimeAttemptsSessionCleanup(t *testing.T) {
 // silently leaking at unmount. The op set comes from the vendored code path,
 // not from the allowlist, so this is not circular.
 //
-// delete_slice is not exercised: firing it needs a non-empty dead-slice queue
-// (a full write + Compact path), and CloseSession's queue is empty here. It is
-// admitted because extentTeardownOp covers it, and the vendored trace below is
-// what a dependency bump must re-check.
+// The format is initialized and ReadOnly is left false, so FlushSession runs as
+// it does in production (its drive9 flush methods are no-ops today, but a bump
+// that moved one onto an RPC would be caught here).
 //
-// Mirrors juicefs pkg/meta/base.go CloseSession: FlushSession is inert for the
-// drive9 engine (doFlushStats/doUpdateDirStat/doFlushQuotas are no-ops);
-// doCleanStaleSession sends clean_stale_session; stopDeleteSliceTasks drains the
-// delete-slice workers, whose deleteSlice_ -> doDeleteSlice sends delete_slice.
+// Only clean_stale_session is test-pinned. delete_slice needs a non-empty
+// dead-slice queue (a full write + Compact path), so its allowlist entry rests
+// on the vendored trace a dependency bump must re-check: juicefs
+// pkg/meta/base.go CloseSession -> doCleanStaleSession sends
+// clean_stale_session, and stopDeleteSliceTasks drains the delete-slice
+// workers, whose deleteSlice_ -> doDeleteSlice sends delete_slice.
 func TestExtentTeardownOpsCoverRealCloseSession(t *testing.T) {
 	var mu sync.Mutex
 	var ops []string
@@ -197,13 +198,15 @@ func TestExtentTeardownOpsCoverRealCloseSession(t *testing.T) {
 	}
 	tr.Leave = hold.leave
 
-	// ReadOnly skips FlushSession (inert for drive9 anyway) while
-	// doCleanStaleSession still runs for sid > 0.
 	conf := jfsmeta.DefaultConf()
 	conf.NoBGJob = true
-	conf.ReadOnly = true
 	conf.Sid = 42
 	m := jfsmeta.NewDrive9Meta(conf, tr)
+	// Init sets m.fmt, so CloseSession's FlushSession leg runs (as production
+	// does with ReadOnly=false) instead of dereferencing a nil format.
+	if err := m.Init(&jfsmeta.Format{Name: "drive9", UUID: "drive9-extent", Storage: "file", BlockSize: 4 << 20}, false); err != nil {
+		t.Fatal(err)
+	}
 
 	hold.closeAndWait(0) // closed gate: only teardown-owned ops may pass
 	mu.Lock()
@@ -241,9 +244,9 @@ func TestEnsureExtentRuntimeWaiterWakesOnTeardown(t *testing.T) {
 	fs := &Dat9FS{}
 	parked := make(chan struct{})
 	fs.extentMu.Lock()
-	fs.extentBuildCond = sync.NewCond(&fs.extentMu)
-	fs.extentBuilding = true
-	fs.extentBuildGen = 1
+	fs.extentBuild.cond = sync.NewCond(&fs.extentMu)
+	fs.extentBuild.building = true
+	fs.extentBuild.gen = 1
 	testHookExtentBuildWait = func() { close(parked) }
 	t.Cleanup(func() { testHookExtentBuildWait = nil })
 	fs.extentMu.Unlock()
@@ -273,9 +276,9 @@ func TestEnsureExtentRuntimeWaitersShareBuildError(t *testing.T) {
 	fs := &Dat9FS{}
 	parked := make(chan struct{})
 	fs.extentMu.Lock()
-	fs.extentBuildCond = sync.NewCond(&fs.extentMu)
-	fs.extentBuilding = true
-	fs.extentBuildGen = 1
+	fs.extentBuild.cond = sync.NewCond(&fs.extentMu)
+	fs.extentBuild.building = true
+	fs.extentBuild.gen = 1
 	testHookExtentBuildWait = func() { close(parked) }
 	t.Cleanup(func() { testHookExtentBuildWait = nil })
 	fs.extentMu.Unlock()
@@ -288,9 +291,9 @@ func TestEnsureExtentRuntimeWaitersShareBuildError(t *testing.T) {
 	// publisher would. The waiter holds extentMu between the hook and Wait, so
 	// this lock can only be acquired after the waiter has parked — no race.
 	fs.extentMu.Lock()
-	fs.extentBuilding = false
-	fs.extentBuildErr = boom
-	fs.extentBuildCond.Broadcast()
+	fs.extentBuild.building = false
+	fs.extentBuild.err = boom
+	fs.extentBuild.cond.Broadcast()
 	fs.extentMu.Unlock()
 
 	select {

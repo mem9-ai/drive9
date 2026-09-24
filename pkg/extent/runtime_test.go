@@ -1,9 +1,14 @@
 package extent
 
 import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -197,5 +202,66 @@ func TestNewRuntimeReleasesStorageOnError(t *testing.T) {
 				t.Fatalf("storage shutdowns = %d, want 1", got)
 			}
 		})
+	}
+}
+
+// TestNewRuntimeClosesSessionOnNewSessionFailure pins that a NewRuntime failure
+// after NewSession was entered closes the session. NewSession starts its refresh
+// goroutine before it can fail, and without CloseSession that goroutine keeps
+// issuing RPCs — and can os.Exit on a format change — for the process's life.
+func TestNewRuntimeClosesSessionOnNewSessionFailure(t *testing.T) {
+	formatJSON, err := json.Marshal(&jfsmeta.Format{
+		Name:      "drive9",
+		UUID:      "drive9-extent",
+		Storage:   "file",
+		BlockSize: 4 << 20,
+		TrashDays: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// doLoad's Format field is []byte, so the format JSON travels base64-encoded.
+	loadBody := []byte("{\"format\":\"" + base64.StdEncoding.EncodeToString(formatJSON) + "\"}")
+
+	var mu sync.Mutex
+	var ops []string
+	tr := NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
+		mu.Lock()
+		ops = append(ops, op)
+		mu.Unlock()
+		switch op {
+		case jfsmeta.Drive9OpLoad:
+			return loadBody, 0, nil
+		case jfsmeta.Drive9OpIncrCounter:
+			return []byte("{\"value\":1}"), 0, nil
+		case jfsmeta.Drive9OpNewSession:
+			return nil, 0, errors.New("new_session boom")
+		default:
+			return []byte("{}"), 0, nil
+		}
+	})
+
+	inner, err := object.CreateStorage("file", t.TempDir(), "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &runtimeShutdownRecorder{ObjectStorage: inner}
+	if _, err := NewRuntime(RuntimeConfig{Transport: tr, Storage: rec}); err == nil {
+		t.Fatal("NewRuntime must fail when NewSession fails")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, op := range ops {
+		if op == jfsmeta.Drive9OpCleanStaleSession {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("CloseSession was not called after NewSession failed; ops=%v", ops)
+	}
+	if got := rec.shutdowns.Load(); got != 1 {
+		t.Fatalf("storage shutdowns = %d, want 1", got)
 	}
 }

@@ -708,6 +708,7 @@ func Mount(opts *MountOptions) (err error) {
 			cause:        err,
 			stopWatchers: stopWatchers,
 			flushAll:     dat9fs.FlushAll,
+			closeRuntime: dat9fs.closeExtentRuntime,
 			unmount:      server.Unmount,
 			forceUnmount: forceUnmount,
 		})
@@ -724,6 +725,7 @@ func Mount(opts *MountOptions) (err error) {
 			cause:        err,
 			stopWatchers: stopWatchers,
 			flushAll:     dat9fs.FlushAll,
+			closeRuntime: dat9fs.closeExtentRuntime,
 			unmount:      server.Unmount,
 			forceUnmount: forceUnmount,
 		})
@@ -787,6 +789,7 @@ func Mount(opts *MountOptions) (err error) {
 				cause:        err,
 				stopWatchers: stopWatchers,
 				flushAll:     dat9fs.FlushAll,
+				closeRuntime: dat9fs.closeExtentRuntime,
 				unmount:      server.Unmount,
 				forceUnmount: forceUnmount,
 			})
@@ -1082,6 +1085,9 @@ type mountStartCleanup struct {
 	cause        error
 	stopWatchers func()
 	flushAll     func()
+	// closeRuntime releases the extent runtime (session + store) that may have
+	// been built during the brief serving window before this failure.
+	closeRuntime func()
 	unmount      func() error
 	forceUnmount func(string)
 	// forceUnmountWithoutServer is for the go-fuse NewServer post-mount/pre-server
@@ -1116,6 +1122,9 @@ func cleanupMountStartFailure(cleanup mountStartCleanup) {
 	}
 	if cleanup.flushAll != nil {
 		cleanup.flushAll()
+	}
+	if cleanup.closeRuntime != nil {
+		cleanup.closeRuntime()
 	}
 	if cleanup.unmount == nil {
 		if cleanup.forceUnmountWithoutServer && cleanup.forceUnmount != nil && mountPoint != "" {

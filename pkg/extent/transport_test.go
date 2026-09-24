@@ -61,8 +61,8 @@ func TestTransportCallInjectsBlockFlag(t *testing.T) {
 	}
 }
 
-// TestTransportTimeoutBoundsCall pins the init-only bound: a meta RPC that
-// never answers is cut off at Timeout instead of hanging forever.
+// TestTransportTimeoutBoundsCall pins that a non-blocking meta RPC that never
+// answers is cut off at Timeout instead of hanging forever.
 func TestTransportTimeoutBoundsCall(t *testing.T) {
 	t.Parallel()
 	tr := NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {

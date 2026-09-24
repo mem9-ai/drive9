@@ -44,7 +44,9 @@ type Transport struct {
 const MetaCallTimeout = 30 * time.Second
 
 func NewTransport(fn MetaOpFunc) *Transport {
-	return &Transport{CallFn: fn}
+	// Default the bound here so every construction (FUSE, CLI/SDK, server-side
+	// compactor) inherits it; a caller may override before use.
+	return &Transport{CallFn: fn, Timeout: MetaCallTimeout}
 }
 
 // ExtentMetaClient is the HTTP meta RPC used by FUSE and drive9 fs.

@@ -196,6 +196,23 @@ func TestGCSUploadUsesAPIRoot(t *testing.T) {
 	}
 }
 
+// TestGCSEmulatorHostMustBeLoopback pins the fail-closed guard: storage.NewClient
+// drops the bearer token and installs an unvalidated endpoint whenever
+// STORAGE_EMULATOR_HOST is set, so a non-loopback value must be rejected.
+func TestGCSEmulatorHostMustBeLoopback(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("STORAGE_EMULATOR_HOST", "evil.example")
+	if _, err := newGCSTokenStorage(ctx, "bucket", "tok", ""); err == nil {
+		t.Fatal("a non-loopback STORAGE_EMULATOR_HOST must be rejected")
+	}
+	t.Setenv("STORAGE_EMULATOR_HOST", "127.0.0.1:9000")
+	gs, err := newGCSTokenStorage(ctx, "bucket", "tok", "")
+	if err != nil {
+		t.Fatalf("loopback emulator host rejected: %v", err)
+	}
+	gs.Shutdown()
+}
+
 // TestGCSDeleteIsIdempotent mirrors JuiceFS's gs backend: deleting an object is
 // a success whether the object was there (200) or already gone (404).
 func TestGCSDeleteIsIdempotent(t *testing.T) {

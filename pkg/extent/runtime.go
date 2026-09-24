@@ -227,6 +227,11 @@ func NewRuntime(cfg RuntimeConfig) (rt *Runtime, err error) {
 		return nil, fmt.Errorf("load extent format: %w", err)
 	}
 	if err := m.NewSession(true); err != nil {
+		// NewSession starts its refresh goroutine before it can fail; close the
+		// session (safe here: Load set m.fmt, so FlushSession cannot deref nil)
+		// or that goroutine keeps issuing RPCs — and can os.Exit on a format
+		// change — for the life of the process.
+		_ = m.CloseSession()
 		return nil, fmt.Errorf("extent session: %w", err)
 	}
 	// The block cache is a read cache: with Writeback off below, a write holds
