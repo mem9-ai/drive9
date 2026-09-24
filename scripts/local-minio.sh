@@ -53,6 +53,9 @@ MINIO_HEALTH_TIMEOUT_S="${MINIO_HEALTH_TIMEOUT_S:-40}"
 # the health request would stall `curl` past any deadline: the overall
 # --max-time is what makes MINIO_HEALTH_TIMEOUT_S effective.
 MINIO_HEALTH_CONNECT_TIMEOUT_S="${MINIO_HEALTH_CONNECT_TIMEOUT_S:-2}"
+# Cap for one-shot probes (reuse checks, status). Retry loops pass their
+# remaining budget explicitly instead of using this default.
+MINIO_HEALTH_PROBE_TIMEOUT_S="${MINIO_HEALTH_PROBE_TIMEOUT_S:-5}"
 
 HEALTH_HOST="$BIND"
 if [ "$BIND" = "0.0.0.0" ] || [ "$BIND" = "::" ] || [ "$BIND" = "[::]" ]; then
@@ -73,7 +76,7 @@ url_healthy() {
   # stalls the HTTP response. $2 overrides the cap for callers with a running
   # deadline (wait_healthy passes the seconds it has left).
   local url="$1"
-  local max_time="${2:-$MINIO_HEALTH_TIMEOUT_S}"
+  local max_time="${2:-$MINIO_HEALTH_PROBE_TIMEOUT_S}"
   curl -sf --connect-timeout "$MINIO_HEALTH_CONNECT_TIMEOUT_S" --max-time "$max_time" "$url/minio/health/live" >/dev/null 2>&1
 }
 

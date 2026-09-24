@@ -57,6 +57,10 @@ MINIO_HEALTH_TIMEOUT_S="${MINIO_HEALTH_TIMEOUT_S:-40}"
 # the health request would stall `curl` past any deadline: the overall
 # --max-time is what makes MINIO_HEALTH_TIMEOUT_S effective.
 MINIO_HEALTH_CONNECT_TIMEOUT_S="${MINIO_HEALTH_CONNECT_TIMEOUT_S:-2}"
+# One-shot reuse checks answer "is a MinIO already there?" with a single
+# bounded probe — no retries — so a clean port costs nothing and a stalled
+# leftover server costs at most this many seconds.
+MINIO_HEALTH_PROBE_TIMEOUT_S="${MINIO_HEALTH_PROBE_TIMEOUT_S:-5}"
 
 check_eq() {
   local desc="$1" got="$2" want="$3"
@@ -232,6 +236,14 @@ start_minio_bin() {
   MINIO_ROOT_USER="$MINIO_ROOT_USER" MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
     "$MINIO_BIN" server "$data" --address "127.0.0.1:${MINIO_PORT}" >"$WORKDIR/minio.log" 2>&1 &
   MINIO_PID=$!
+}
+
+# probe_health is a single bounded probe for reuse detection: it answers
+# immediately when nothing is listening (connection refused) and cannot hang
+# on a stalled server. Retry-until-deadline semantics belong to wait_health,
+# which is only for a process this script just started.
+probe_health() {
+  curl -sf --connect-timeout "$MINIO_HEALTH_CONNECT_TIMEOUT_S" --max-time "$MINIO_HEALTH_PROBE_TIMEOUT_S" "$1" >/dev/null 2>&1
 }
 
 wait_health() {
@@ -426,7 +438,7 @@ else
   export AWS_REGION="${AWS_REGION:-us-east-1}"
   export AWS_DEFAULT_REGION="$AWS_REGION"
 
-  if wait_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"; then
+  if probe_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"; then
     echo "reusing MinIO on :$MINIO_PORT"
   elif pick_runtime; then
     echo "starting MinIO with $RUNTIME on :$MINIO_PORT"
