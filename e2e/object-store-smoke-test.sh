@@ -20,9 +20,10 @@ OBJECT_CMD_TIMEOUT_S="${OBJECT_CMD_TIMEOUT_S:-120}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-2}"
 # Docker Hub removed the historical minio/minio repository used by this gate.
-# Keep the local smoke deterministic on Bitnami's frozen legacy mirror; callers
-# can still override it through MINIO_IMAGE/DRIVE9_MINIO_IMAGE.
-MINIO_IMAGE="${MINIO_IMAGE:-${DRIVE9_MINIO_IMAGE:-bitnamilegacy/minio:2025.7.23-debian-12-r5}}"
+# Keep the local smoke deterministic on Rancher's frozen multi-arch mirror of
+# the official image (including the same `server /data` entrypoint contract);
+# callers can still override it through MINIO_IMAGE/DRIVE9_MINIO_IMAGE.
+MINIO_IMAGE="${MINIO_IMAGE:-${DRIVE9_MINIO_IMAGE:-rancher/mirrored-minio-minio:RELEASE.2023-07-07T07-13-57Z}}"
 MINIO_PORT="${MINIO_PORT:-${DRIVE9_MINIO_PORT:-19000}}"
 MINIO_ROOT_USER="${MINIO_ROOT_USER:-${DRIVE9_MINIO_USER:-drive9minio}}"
 MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-${DRIVE9_MINIO_PASSWORD:-drive9minio}}"
