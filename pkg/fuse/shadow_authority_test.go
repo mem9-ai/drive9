@@ -365,3 +365,36 @@ func TestShadowPartialMutationWithoutRevisionKeepsKnownBase(t *testing.T) {
 		})
 	}
 }
+
+func TestShadowRecoveredAccountingSurvivesRename(t *testing.T) {
+	s, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for path, data := range map[string]string{"/source": "src", "/dest": "dest"} {
+		if err := os.WriteFile(s.shadowPath(path), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.RecoverPendingBytes()
+	pin, ok := s.PinIfExists("/source")
+	if !ok {
+		t.Fatal("pin recovered source")
+	}
+	defer s.Unpin(pin)
+	if !s.Rename("/source", "/dest") {
+		t.Fatal("rename")
+	}
+	if got := s.PendingBytes(); got != 3 {
+		t.Fatalf("after replacing disk-only destination=%d", got)
+	}
+	s.discardDiskOnly("/source")
+	if got := s.PendingBytes(); got != 3 {
+		t.Fatalf("old path discard subtracted renamed contents: %d", got)
+	}
+	s.Remove("/dest")
+	if got := s.PendingBytes(); got != 0 {
+		t.Fatalf("after removal=%d", got)
+	}
+}

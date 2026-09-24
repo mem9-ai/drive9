@@ -353,7 +353,11 @@ func (s *ShadowStore) RecoverPendingBytes() {
 	}
 	s.mu.Lock()
 	for path := range s.files {
-		delete(sizes, s.shadowPath(path))
+		diskPath := s.shadowPath(path)
+		if strings.HasPrefix(path, "__hash:") {
+			diskPath = filepath.Join(s.dir, strings.TrimPrefix(path, "__hash:")+".shadow")
+		}
+		delete(sizes, diskPath)
 	}
 	s.recoveredSizes = sizes
 	s.pendingBytes.Store(total)
@@ -1521,7 +1525,9 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 
 	replacedSF := s.files[newPath]
 	replacedGen := s.active[newPath]
-	var replacedSize int64
+	replacedSize := s.recoveredSizes[newSP]
+	delete(s.recoveredSizes, oldSP)
+	delete(s.recoveredSizes, newSP)
 	if replacedSF != nil {
 		replacedSize = replacedSF.size
 		s.resizeWrittenLocked(replacedSF, 0)
