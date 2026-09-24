@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -79,6 +80,25 @@ func refreshLayerEvents(ctx context.Context, c *client.Client, opts *MountOption
 	}
 	if err := restoreLayerEntries(ctx, c, opts, shadows, pending, fs); err != nil {
 		return since, err
+	}
+	// The restored shadow is now authoritative for these paths. Drop all
+	// userspace and kernel-facing read state so a long-lived same-layer mount
+	// observes the refreshed entry rather than a cached pre-event generation.
+	for i := range events {
+		p, ok := fs.localPath(events[i].Path)
+		if !ok || p == "" || p == "/" {
+			continue
+		}
+		fs.invalidateReadCacheAndTargets(p)
+		fs.invalidateExtentReaders(p)
+		fs.dirCache.Invalidate(parentDir(p))
+		fs.dirCache.InvalidatePrefix(p)
+		if ino, ok := fs.inodes.GetInode(p); ok {
+			fs.notifyInode(ino)
+		}
+		if parentIno, ok := fs.inodes.GetInode(parentDir(p)); ok {
+			fs.notifyEntry(parentIno, path.Base(p))
+		}
 	}
 	return maxSeq, nil
 }

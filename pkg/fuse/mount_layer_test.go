@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,15 +83,23 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	shadow, err := NewShadowStore(t.TempDir())
+	shadowDir := t.TempDir()
+	shadow, err := NewShadowStore(shadowDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer shadow.Close()
-	pending, err := NewPendingIndex(t.TempDir())
+	pendingDir := t.TempDir()
+	pending, err := NewPendingIndex(pendingDir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	journal, err := NewJournal(filepath.Join(t.TempDir(), "restore.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	pending.SetJournal(journal)
 	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
 		LayerRef:   "layer-1",
 		RemoteRoot: "/repo",
@@ -145,11 +154,41 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	if !pending.HasPending("/renamed-to.txt") {
 		t.Fatal("renamed target pending metadata missing")
 	}
-	if meta, ok := pending.GetMeta("/renamed-to.txt"); !ok || meta.Kind != PendingOverwrite {
-		t.Fatalf("renamed target pending meta = %+v, want PendingOverwrite", meta)
+	if meta, ok := pending.GetMeta("/renamed-to.txt"); !ok || meta.Kind != PendingOverwrite || !meta.LayerCommitted {
+		t.Fatalf("renamed target pending meta = %+v, want committed PendingOverwrite", meta)
 	}
 	if pending.HasPending("/b.txt") || shadow.Has("/b.txt") {
 		t.Fatal("b.txt should not be restored past checkpoint seq")
+	}
+
+	// A restored overlay is already durable in the remote layer. Graceful
+	// late-drain and crash/restart recovery must not append it again.
+	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8, "/repo")
+	cq.SetLayerRef("layer-1")
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = cq
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	fs.drainLatePendingEntries(ctx)
+	if got := journal.UncommittedFrameCount(); got != 0 {
+		t.Fatalf("restore journal uncommitted frames = %d, want 0", got)
+	}
+
+	recovered, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if err := replayJournalIntoPending(journal, recovered, shadow); err != nil {
+		t.Fatal(err)
+	}
+	recoveredQueue := NewCommitQueue(client.New(ts.URL, ""), shadow, recovered, nil, 1, 8, "/repo")
+	recoveredQueue.SetLayerRef("layer-1")
+	if got := recoveredQueue.RecoverPendingSync(context.Background()); got != 0 {
+		t.Fatalf("restart recovered committed layer entries = %d, want 0", got)
 	}
 }
 
@@ -330,6 +369,165 @@ func TestRestoreLayerEntriesReplaysSamePathUpsertOverwrite(t *testing.T) {
 	}
 	if mode, ok := fs.layerFileMode("/new.txt"); !ok || mode != 0o600 {
 		t.Fatalf("layer file mode = (%#o, %t), want 0600 true", mode, ok)
+	}
+}
+
+func TestRestoreLayerEntriesRefreshesCommittedOverlayButPreservesUncommittedGeneration(t *testing.T) {
+	const localPath = "/shared.txt"
+	var entryFetches int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{{
+				LayerID: "layer-1", Path: "/repo/shared.txt", Op: "upsert", Kind: "file",
+				SizeBytes: 2, BaseRevision: 9, Mode: 0o640, EntrySeq: 2,
+			}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries":
+			entryFetches++
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+				LayerID: "layer-1", Path: "/repo/shared.txt", Op: "upsert", Kind: "file",
+				Content: []byte("v2"), SizeBytes: 2, BaseRevision: 9, Mode: 0o640, EntrySeq: 2,
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(localPath, []byte("v1"), 8); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := pending.PutWithBaseRevAndMode(localPath, 2, PendingOverwrite, 8, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := pending.MarkLayerCommitted(localPath, gen, 8); err != nil || !marked {
+		t.Fatalf("mark v1 committed = (%t, %v), want true, nil", marked, err)
+	}
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+	if err := restoreLayerEntries(context.Background(), client.New(ts.URL, ""), opts, shadow, pending, nil); err != nil {
+		t.Fatalf("refresh committed overlay: %v", err)
+	}
+	if got, err := shadow.ReadAll(localPath); err != nil || !bytes.Equal(got, []byte("v2")) {
+		t.Fatalf("refreshed committed overlay = %q, %v; want v2", got, err)
+	}
+	if meta, ok := pending.GetMeta(localPath); !ok || !meta.LayerCommitted || meta.BaseRev != 9 || meta.Mode != 0o640 {
+		t.Fatalf("refreshed committed metadata = %+v", meta)
+	}
+
+	// A later unfinished local generation owns the path and must fence the
+	// same replay result instead of being overwritten by server cache refresh.
+	if err := shadow.WriteFull(localPath, []byte("local"), 9); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode(localPath, 5, PendingOverwrite, 9, 0o600, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreLayerEntries(context.Background(), client.New(ts.URL, ""), opts, shadow, pending, nil); err != nil {
+		t.Fatalf("refresh with unfinished local generation: %v", err)
+	}
+	if got, err := shadow.ReadAll(localPath); err != nil || !bytes.Equal(got, []byte("local")) {
+		t.Fatalf("unfinished local generation after refresh = %q, %v; want local", got, err)
+	}
+	if meta, ok := pending.GetMeta(localPath); !ok || meta.LayerCommitted || meta.Size != 5 || meta.Mode != 0o600 {
+		t.Fatalf("unfinished local metadata after refresh = %+v", meta)
+	}
+	if entryFetches != 1 {
+		t.Fatalf("layer entry fetches = %d, want 1 (committed refresh only)", entryFetches)
+	}
+}
+
+func TestRestoreLayerEntriesDoesNotOverwriteConcurrentUncommittedGeneration(t *testing.T) {
+	const localPath = "/shared.txt"
+	fetchStarted := make(chan struct{})
+	allowResponse := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{{
+				LayerID: "layer-1", Path: "/repo/shared.txt", Op: "upsert", Kind: "file",
+				SizeBytes: 2, BaseRevision: 9, Mode: 0o640, EntrySeq: 2,
+			}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries":
+			close(fetchStarted)
+			<-allowResponse
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+				LayerID: "layer-1", Path: "/repo/shared.txt", Op: "upsert", Kind: "file",
+				Content: []byte("v2"), SizeBytes: 2, BaseRevision: 9, Mode: 0o640, EntrySeq: 2,
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(localPath, []byte("v1"), 8); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := pending.PutWithBaseRevAndMode(localPath, 2, PendingOverwrite, 8, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := pending.MarkLayerCommitted(localPath, gen, 8); err != nil || !marked {
+		t.Fatalf("mark v1 committed = (%t, %v), want true, nil", marked, err)
+	}
+
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- restoreLayerEntries(context.Background(), client.New(ts.URL, ""), opts, shadow, pending, fs)
+	}()
+	select {
+	case <-fetchStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("restore did not begin fetching the refreshed layer entry")
+	}
+
+	// Model the normal writer lock discipline while the network fetch is in
+	// flight. Restore must recheck ownership after that fetch, not overwrite
+	// this newer unfinished generation using its stale pre-fetch observation.
+	unlock := fs.lockRemoteCommitPath(localPath)
+	if err := shadow.WriteFull(localPath, []byte("local"), 8); err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode(localPath, 5, PendingOverwrite, 8, 0o600, true); err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	unlock()
+	close(allowResponse)
+	if err := <-restoreDone; err != nil {
+		t.Fatalf("restore with concurrent local generation: %v", err)
+	}
+	if got, err := shadow.ReadAll(localPath); err != nil || !bytes.Equal(got, []byte("local")) {
+		t.Fatalf("concurrent local generation after refresh = %q, %v; want local", got, err)
+	}
+	if meta, ok := pending.GetMeta(localPath); !ok || meta.LayerCommitted || meta.Size != 5 || meta.Mode != 0o600 {
+		t.Fatalf("concurrent local metadata after refresh = %+v", meta)
 	}
 }
 
@@ -1080,8 +1278,8 @@ func TestLayerChmodCoalescesShadowFileWithoutPendingMeta(t *testing.T) {
 		t.Fatalf("mode = %#o, want 0600", got.Mode)
 	}
 	meta, ok := pending.GetMeta("/new.txt")
-	if !ok || meta.Kind != PendingNew || !meta.HasMode || meta.Mode != 0o600 {
-		t.Fatalf("pending mode = %+v, want PendingNew 0600", meta)
+	if !ok || meta.Kind != PendingOverwrite || !meta.LayerCommitted || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("pending mode = %+v, want committed PendingOverwrite 0600", meta)
 	}
 	if mode, ok := fs.layerFileMode("/new.txt"); !ok || mode != 0o600 {
 		t.Fatalf("layer file mode = (%#o, %t), want 0600 true", mode, ok)
@@ -1160,8 +1358,8 @@ func TestLayerChmodCoalescesExistingLayerUpsertContent(t *testing.T) {
 		t.Fatalf("mode = %#o, want 0600", got.Mode)
 	}
 	meta, ok := pending.GetMeta("/new.txt")
-	if !ok || meta.Kind != PendingNew || !meta.HasMode || meta.Mode != 0o600 {
-		t.Fatalf("pending mode = %+v, want PendingNew 0600", meta)
+	if !ok || meta.Kind != PendingOverwrite || !meta.LayerCommitted || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("pending mode = %+v, want committed PendingOverwrite 0600", meta)
 	}
 }
 

@@ -194,6 +194,41 @@ func (idx *PendingIndex) PutWithBaseRevAndMode(remotePath string, size int64, ki
 	return idx.PutWithBaseRevAndModeAndLineage(remotePath, size, kind, baseRev, mode, hasMode, "", "", false)
 }
 
+// PutLayerCommitted stores a retained overlay reconstructed from authoritative
+// layer state. Unlike Put, it publishes the committed marker in one atomic
+// .meta replacement and intentionally does not append an uncommitted WAL
+// frame: the remote layer is already the durable source and a crash may simply
+// rebuild this local cache again.
+func (idx *PendingIndex) PutLayerCommitted(remotePath string, size, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
+	gen := idx.nextGen.Add(1)
+	meta := &WriteBackMeta{
+		Path:           remotePath,
+		Size:           size,
+		Mtime:          time.Now(),
+		CreatedAt:      time.Now(),
+		Generation:     gen,
+		Kind:           PendingOverwrite,
+		BaseRev:        baseRev,
+		LayerCommitted: true,
+		Mode:           mode & posixPermissionModeMask,
+		HasMode:        hasMode,
+	}
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return 0, fmt.Errorf("pending index marshal committed layer: %w", err)
+	}
+	if err := atomicWrite(filepath.Join(idx.dir, hashPath(remotePath)+".meta"), metaBytes); err != nil {
+		return 0, fmt.Errorf("pending index put committed layer: %w", err)
+	}
+	idx.mu.Lock()
+	idx.items[remotePath] = meta
+	idx.mu.Unlock()
+	return gen, nil
+}
+
 // PutWithBaseRevAndModeAndLineage attaches process-local causal identity to
 // the durable metadata. The IDs are intentionally excluded from JSON; empty
 // lineage is accepted but can never authorize a growth rebase.

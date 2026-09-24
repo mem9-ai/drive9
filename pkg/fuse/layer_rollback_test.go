@@ -242,6 +242,7 @@ func TestRefreshLayerEventsSkipsRollbackWhenNoRollbackEvent(t *testing.T) {
 
 	c := client.New(ts.URL, "")
 	fs := NewDat9FS(c, &MountOptions{LayerRef: "layer-norm", RemoteRoot: "/repo"})
+	fs.readCache.Put("/a.txt", []byte("stale"), 1)
 	fs.commitQueue = NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	fs.commitQueue.SetLayerRef("layer-norm")
 
@@ -258,5 +259,8 @@ func TestRefreshLayerEventsSkipsRollbackWhenNoRollbackEvent(t *testing.T) {
 	}
 	if fs.isLayerAbandoned() {
 		t.Fatal("layer should NOT be abandoned for non-rollback events")
+	}
+	if got, ok := fs.readCache.Get("/a.txt", 1); ok {
+		t.Fatalf("same-layer refresh retained stale read cache = %q", got)
 	}
 }
