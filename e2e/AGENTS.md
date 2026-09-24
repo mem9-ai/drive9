@@ -249,6 +249,10 @@ bash scripts/local-minio.sh stop         # named container / recorded pid only
 
 MinIO is reused across runs (like the local TiDB container). Orb/VMs can bind
 `DRIVE9_MINIO_BIND=0.0.0.0` and advertise `DRIVE9_S3_ENDPOINT` for presign.
+The `minio/minio` image and `dl.min.io` binary downloads were removed upstream
+(the community edition went source-only), so MinIO is pulled from
+`cgr.dev/chainguard/minio` by default; override with `DRIVE9_MINIO_IMAGE`
+(first candidate) and `DRIVE9_MINIO_FALLBACK_IMAGE` (empty disables it).
 
 FUSE suites honor `FUSE_PROFILE` (`drive9 mount --profile`). Example:
 

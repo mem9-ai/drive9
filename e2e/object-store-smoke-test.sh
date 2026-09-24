@@ -20,6 +20,11 @@ OBJECT_CMD_TIMEOUT_S="${OBJECT_CMD_TIMEOUT_S:-120}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-2}"
 MINIO_IMAGE="${MINIO_IMAGE:-${DRIVE9_MINIO_IMAGE:-minio/minio:RELEASE.2024-12-18T13-15-44Z}}"
+# The minio/minio image no longer exists upstream (the community edition went
+# source-only in 2025/2026 and its Docker Hub repository was removed), so the
+# maintained Chainguard build is the default pull source; set
+# DRIVE9_MINIO_FALLBACK_IMAGE empty to pin the chain to MINIO_IMAGE alone.
+MINIO_FALLBACK_IMAGE="${DRIVE9_MINIO_FALLBACK_IMAGE-cgr.dev/chainguard/minio:latest}"
 MINIO_PORT="${MINIO_PORT:-${DRIVE9_MINIO_PORT:-19000}}"
 MINIO_ROOT_USER="${MINIO_ROOT_USER:-${DRIVE9_MINIO_USER:-drive9minio}}"
 MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-${DRIVE9_MINIO_PASSWORD:-drive9minio}}"
@@ -39,6 +44,11 @@ MINIO_PID=""
 MOUNT_POINT=""
 CACHE_DIR=""
 WORKDIR=""
+
+MINIO_IMAGE_CANDIDATES="$MINIO_IMAGE"
+if [ -n "$MINIO_FALLBACK_IMAGE" ] && [ "$MINIO_FALLBACK_IMAGE" != "$MINIO_IMAGE" ]; then
+  MINIO_IMAGE_CANDIDATES="$MINIO_IMAGE_CANDIDATES $MINIO_FALLBACK_IMAGE"
+fi
 
 check_eq() {
   local desc="$1" got="$2" want="$3"
@@ -192,8 +202,18 @@ ensure_minio_bin() {
   local arch
   arch="$(minio_arch)" || return 1
   MINIO_BIN="$WORKDIR/minio"
-  echo "fetching MinIO $arch to $MINIO_BIN"
-  curl -fsSL "https://dl.min.io/server/minio/release/${arch}/minio" -o "$MINIO_BIN"
+  if [ -x "$MINIO_BIN" ]; then
+    return 0
+  fi
+  # MinIO discontinued community downloads: dl.min.io binary paths return 410
+  # since the community edition went source-only. Provide the binary via PATH,
+  # WORKDIR, or MINIO_DOWNLOAD_URL.
+  if [ -z "${MINIO_DOWNLOAD_URL:-}" ]; then
+    echo "no minio binary in PATH and upstream community downloads are discontinued; set MINIO_DOWNLOAD_URL or install minio"
+    return 1
+  fi
+  echo "fetching MinIO $arch from $MINIO_DOWNLOAD_URL to $MINIO_BIN"
+  curl -fsSL "$MINIO_DOWNLOAD_URL" -o "$MINIO_BIN"
   chmod +x "$MINIO_BIN"
 }
 
@@ -398,18 +418,30 @@ else
   elif pick_runtime; then
     echo "starting MinIO with $RUNTIME on :$MINIO_PORT"
     MINIO_CID="drive9-e2e-minio-$$"
-    if ! "$RUNTIME" run -d --name "$MINIO_CID" \
-      -p "${MINIO_PORT}:9000" \
-      -e "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
-      -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
-      "$MINIO_IMAGE" server /data >/dev/null; then
-      echo "FAIL start MinIO container"
-      exit 1
+    container_started=""
+    image=""
+    for image in $MINIO_IMAGE_CANDIDATES; do
+      if "$RUNTIME" run -d --name "$MINIO_CID" \
+        -p "${MINIO_PORT}:9000" \
+        -e "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
+        -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
+        "$image" server /data >/dev/null; then
+        container_started=1
+        break
+      fi
+      "$RUNTIME" rm -f "$MINIO_CID" >/dev/null 2>&1 || true
+    done
+    if [ -z "$container_started" ]; then
+      echo "no MinIO image could start; falling back to the MinIO binary"
+      if ! start_minio_bin; then
+        echo "FAIL need docker, podman, or a minio binary (or set OBJECT_S3_URI)"
+        exit 1
+      fi
     fi
   else
     echo "no docker/podman; starting MinIO binary on 127.0.0.1:${MINIO_PORT}"
     if ! start_minio_bin; then
-      echo "FAIL need docker, podman, or a downloadable MinIO binary (or set OBJECT_S3_URI)"
+      echo "FAIL need docker, podman, or a minio binary (or set OBJECT_S3_URI)"
       exit 1
     fi
   fi
