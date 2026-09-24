@@ -156,6 +156,7 @@ func restoreLayerRenameGroupIfGenerations(shadows *ShadowStore, pending *Pending
 		move.replaced = shadows.files[move.newPath]
 		move.oldActiveGen = shadows.active[move.oldPath]
 		move.replacedGen = shadows.active[move.newPath]
+		move.replacedSize = shadows.recoveredSizes[shadows.shadowPath(move.newPath)]
 		if move.replaced != nil {
 			move.replacedSize = move.replaced.size
 		}
@@ -232,6 +233,11 @@ func restoreLayerRenameGroupIfGenerations(shadows *ShadowStore, pending *Pending
 
 	var replacedBytes int64
 	for _, move := range prepared {
+		delete(shadows.recoveredSizes, shadows.shadowPath(move.oldPath))
+		delete(shadows.recoveredSizes, shadows.shadowPath(move.newPath))
+		if move.replaced != nil {
+			shadows.resizeWrittenLocked(move.replaced, 0)
+		}
 		delete(shadows.files, move.oldPath)
 		shadows.files[move.newPath] = move.shadow
 		oldWriteGen := shadows.writeGen[move.oldPath]
@@ -250,7 +256,11 @@ func restoreLayerRenameGroupIfGenerations(shadows *ShadowStore, pending *Pending
 		if move.replacedGen != 0 && move.replacedGen != move.oldActiveGen {
 			delete(shadows.genFile, move.replacedGen)
 			if shadows.refs[move.replacedGen] > 0 && move.replaced != nil {
-				shadows.retired[move.replacedGen] = &retiredShadow{fd: move.replaced.fd, size: move.replaced.size}
+				shadows.retired[move.replacedGen] = &retiredShadow{
+					fd:     move.replaced.fd,
+					size:   move.replaced.size,
+					reason: shadowRetiredSnapshot,
+				}
 			} else {
 				delete(shadows.refs, move.replacedGen)
 				if move.replaced != nil {

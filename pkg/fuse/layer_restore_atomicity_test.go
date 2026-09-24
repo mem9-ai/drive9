@@ -326,6 +326,75 @@ func TestRestoreLayerDirectoryRenameGroupFailureRestoresInlineObjectAndExistingT
 	assertNoLayerRestoreArtifacts(t, shadowDir, pendingDir)
 }
 
+func TestRestoreLayerDirectoryRenameGroupReplacePreservesPinnedTargetAndAccounting(t *testing.T) {
+	shadows, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadows.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const sourcePath = "/old/file.txt"
+	const targetPath = "/new/file.txt"
+	sourceData := []byte("source replacement")
+	targetData := []byte("pinned target snapshot")
+	sourceMeta := seedCommittedLayerCache(t, shadows, pending, sourcePath, sourceData, 11, 0o640)
+	targetMeta := seedCommittedLayerCache(t, shadows, pending, targetPath, targetData, 12, 0o600)
+	targetPin := shadows.Pin(targetPath)
+	defer shadows.Unpin(targetPin)
+	if !shadows.canReadGeneration(targetPin, targetMeta.BaseRev, targetMeta.Generation) {
+		t.Fatal("target pin was not readable before group replace")
+	}
+
+	oldDiskPath := shadows.shadowPath(sourcePath)
+	newDiskPath := shadows.shadowPath(targetPath)
+	shadows.mu.Lock()
+	shadows.recoveredSizes = make(map[string]int64)
+	shadows.recoveredSizes[oldDiskPath] = int64(len(sourceData))
+	shadows.recoveredSizes[newDiskPath] = int64(len(targetData))
+	shadows.mu.Unlock()
+	beforePending := shadows.PendingBytes()
+	beforeQuota := shadows.quotaBytes.Load()
+
+	moved, err := restoreLayerRenameGroupIfGenerations(shadows, pending, []layerRestoreRenameMove{{
+		oldPath:               sourcePath,
+		newPath:               targetPath,
+		expectedOldPendingGen: sourceMeta.Generation,
+		expectedNewPendingGen: targetMeta.Generation,
+		expectedOldShadowGen:  shadows.ActiveGeneration(sourcePath),
+		expectedNewShadowGen:  shadows.ActiveGeneration(targetPath),
+	}})
+	if err != nil || !moved {
+		t.Fatalf("group replace = (%t, %v), want success", moved, err)
+	}
+	if got, readErr := shadows.ReadAll(targetPath); readErr != nil || !bytes.Equal(got, sourceData) {
+		t.Fatalf("active target after group replace = %q, %v; want %q", got, readErr, sourceData)
+	}
+	if !shadows.canReadGeneration(targetPin, targetMeta.BaseRev, targetMeta.Generation) {
+		t.Fatal("group replace invalidated the already-open target snapshot")
+	}
+	buf := make([]byte, len(targetData))
+	if n, readErr := shadows.ReadAtGen(targetPin, 0, buf); readErr != nil || n != len(buf) || !bytes.Equal(buf, targetData) {
+		t.Fatalf("pinned target after group replace = %q, n=%d, err=%v; want %q", buf[:max(0, n)], n, readErr, targetData)
+	}
+	if got, want := shadows.PendingBytes(), beforePending-int64(len(targetData)); got != want {
+		t.Fatalf("pending bytes after group replace = %d, want %d", got, want)
+	}
+	if got, want := shadows.quotaBytes.Load(), beforeQuota-int64(len(targetData)); got != want {
+		t.Fatalf("quota bytes after group replace = %d, want %d", got, want)
+	}
+	shadows.mu.RLock()
+	_, oldRecovered := shadows.recoveredSizes[oldDiskPath]
+	_, newRecovered := shadows.recoveredSizes[newDiskPath]
+	shadows.mu.RUnlock()
+	if oldRecovered || newRecovered {
+		t.Fatalf("group replace retained recovery accounting: old=%t new=%t", oldRecovered, newRecovered)
+	}
+}
+
 func TestRestoreLayerDirectoryRenameGroupRollbackFailureFreezesMount(t *testing.T) {
 	entries := []client.FSLayerEntry{
 		{LayerID: "layer-1", Path: "/repo/old/a.txt", Op: "upsert", Kind: "file", Content: []byte("a"), SizeBytes: 1, EntrySeq: 1},
