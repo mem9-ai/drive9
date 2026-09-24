@@ -59,11 +59,17 @@ func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint strin
 	}
 	// storage.NewClient diverts to its emulator branch whenever
 	// STORAGE_EMULATOR_HOST is set, and that branch installs
-	// option.WithoutAuthentication plus an unvalidated endpoint template. A
-	// non-loopback value would silently relocate this credential-bearing store
-	// (and drop the bearer token), so fail closed instead.
-	if emu := strings.TrimSpace(os.Getenv("STORAGE_EMULATOR_HOST")); emu != "" && !isLoopbackHost(emulatorHostname(emu)) {
-		return nil, fmt.Errorf("STORAGE_EMULATOR_HOST %q must be loopback for the extent GCS store", emu)
+	// option.WithoutAuthentication plus an unvalidated endpoint template. It
+	// would silently relocate this credential-bearing store and drop the bearer
+	// token, and with an explicit endpoint the (unauthenticated) request would
+	// still go to that endpoint. Fail closed on either shape.
+	if emu := strings.TrimSpace(os.Getenv("STORAGE_EMULATOR_HOST")); emu != "" {
+		if strings.TrimSpace(endpoint) != "" {
+			return nil, fmt.Errorf("STORAGE_EMULATOR_HOST %q cannot be combined with an explicit gcs endpoint", emu)
+		}
+		if !isLoopbackHost(emulatorHostname(emu)) {
+			return nil, fmt.Errorf("STORAGE_EMULATOR_HOST %q must be loopback for the extent GCS store", emu)
+		}
 	}
 	opts := []option.ClientOption{
 		option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: accessToken})),

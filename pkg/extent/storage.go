@@ -122,10 +122,12 @@ func OpenStorage(cred *Credential, src CredentialSource) (object.ObjectStorage, 
 		inner = object.WithPrefix(inner, prefix)
 	}
 	return &refreshingStore{
-		src:    src,
-		inner:  inner,
-		cred:   *cred,
-		scheme: canonicalExtentScheme(cred.Scheme),
+		src:      src,
+		inner:    inner,
+		cred:     *cred,
+		scheme:   canonicalExtentScheme(cred.Scheme),
+		prefix:   prefix,
+		tenantID: cred.TenantID,
 		// One jittered lead per mount: mounts of the same tenant then renew
 		// at spread-out instants instead of together.
 		refreshLead: credentialRefreshLead(credentialRefreshWindow, credentialRefreshJitter, rand.Int64N),
@@ -260,8 +262,8 @@ func endpointWithBucket(endpoint, bucket string) string {
 // refreshingStore swaps its inner store when the credential is about to expire.
 // The refcount/retire machinery below exists for client-owning stores (GCS): a
 // superseded store holds a client that must be closed exactly once and never
-// under an in-flight caller. The S3 and file arms pre-date it and never
-// populate retired.
+// under an in-flight caller. S3/file refreshes do append to retired whenever a
+// caller is in flight, but object.Shutdown is a no-op for those arms.
 type refreshingStore struct {
 	object.DefaultObjectStorage
 	src    CredentialSource
@@ -269,6 +271,11 @@ type refreshingStore struct {
 	inner  object.ObjectStorage
 	cred   Credential
 	scheme string
+	// prefix and tenantID come from the first credential and are stable across
+	// refreshes, so the read-only accessors can serve them without taking mu
+	// (scheme is likewise written once at construction).
+	prefix   string
+	tenantID string
 	// closed is set under mu by Shutdown; acquireInner refuses to serve or
 	// refresh after teardown, so a late renewal cannot resurrect a client
 	// nothing will close.
@@ -292,7 +299,7 @@ func (s *refreshingStore) String() string {
 
 func (s *refreshingStore) Scheme() string { return s.scheme }
 
-func (s *refreshingStore) Prefix() string { return s.cred.Prefix }
+func (s *refreshingStore) Prefix() string { return s.prefix }
 
 // Shutdown releases the inner store's resources (for example the GCS client).
 // It is idempotent, and a store still held by an in-flight operation is
@@ -367,6 +374,7 @@ func (s *refreshingStore) GetCount() int64 { return s.gets.Load() }
 // tenantLabel identifies the tenant for logs and metrics: the explicit
 // credential field when the server sent one, else the tenant parsed out of the
 // prefix ("t/<tenant>/") for older servers.
+// tenantLabel is only called while s.mu is held, so it may read s.cred.
 func (s *refreshingStore) tenantLabel() string {
 	if s.cred.TenantID != "" {
 		return s.cred.TenantID
@@ -428,8 +436,9 @@ func (s *refreshingStore) innerStoreLocked(ctx context.Context) (object.ObjectSt
 		return nil, fmt.Errorf("extent storage refresh: %T is not a refreshingStore", inner)
 	}
 	s.inner = rs.inner
-	s.cred = rs.cred
-	s.scheme = rs.scheme
+	s.cred = rs.cred // refresh the expiry the next call checks
+	// scheme/prefix/tenantID are stable across refreshes and stay immutable, so
+	// the read-only accessors never race with this write.
 	// A GCS store owns a storage client; replacing it without releasing the old
 	// one would leak a client per renewal. S3/file stores are not Shutdownable,
 	// so this is a no-op for them. Retire rather than close in place, so an
@@ -443,7 +452,7 @@ func (s *refreshingStore) recordRefreshFailure(ctx context.Context, step string,
 	tenant := s.tenantLabel()
 	logger.Warn(ctx, "extent_credential_refresh_failed",
 		zap.String("tenant", tenant),
-		zap.String("prefix", s.cred.Prefix),
+		zap.String("prefix", s.prefix),
 		zap.String("step", step),
 		zap.Error(err))
 	metrics.RecordTenantOperation(tenant, "extent_storage", "refresh_credential", metrics.ResultForError(err), time.Since(start))

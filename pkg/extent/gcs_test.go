@@ -206,6 +206,9 @@ func TestGCSEmulatorHostMustBeLoopback(t *testing.T) {
 		t.Fatal("a non-loopback STORAGE_EMULATOR_HOST must be rejected")
 	}
 	t.Setenv("STORAGE_EMULATOR_HOST", "127.0.0.1:9000")
+	if _, err := newGCSTokenStorage(ctx, "bucket", "tok", "https://gw.example.com/storage/v1/"); err == nil {
+		t.Fatal("STORAGE_EMULATOR_HOST with an explicit endpoint must be rejected")
+	}
 	gs, err := newGCSTokenStorage(ctx, "bucket", "tok", "")
 	if err != nil {
 		t.Fatalf("loopback emulator host rejected: %v", err)
