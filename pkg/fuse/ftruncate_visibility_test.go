@@ -250,6 +250,32 @@ func TestReadWriteBackFtruncateBusyWriterDoesNotReadOldRemote(t *testing.T) {
 	}
 }
 
+func TestReadWriteBackFtruncateIgnoresBusyReadOnlySibling(t *testing.T) {
+	remote := []byte("hello world")
+	fs, ino, remoteReads := newFtruncateVisibilityFS(t, remote)
+	writerID := addFtruncateTestHandle(t, fs, ino, "/file.bin", remote)
+	readerID := addFtruncateTestHandle(t, fs, ino, "/file.bin", nil)
+	busyReaderID := addFtruncateTestHandle(t, fs, ino, "/file.bin", nil)
+	if st := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Valid:    gofuse.FATTR_FH | gofuse.FATTR_SIZE,
+		Fh:       writerID,
+		Size:     5,
+	}}, &gofuse.AttrOut{}); st != gofuse.OK {
+		t.Fatalf("ftruncate status = %v", st)
+	}
+	busyReader, _ := fs.fileHandles.Get(busyReaderID)
+	busyReader.Lock()
+	defer busyReader.Unlock()
+	got, st, err := readDat9FSTestRange(fs, ino, readerID, 0, len(remote))
+	if err != nil || st != gofuse.OK || string(got) != "hello" {
+		t.Fatalf("read with unrelated busy reader = %q/%v/%v, want hello/OK", got, st, err)
+	}
+	if remoteReads.Load() != 0 {
+		t.Fatalf("old remote GETs = %d, want 0", remoteReads.Load())
+	}
+}
+
 func TestReadWriteBackFtruncateDoesNotUseOlderTruncateAfterNewerWriter(t *testing.T) {
 	remote := []byte("hello world")
 	fs, ino, remoteReads := newFtruncateVisibilityFS(t, remote)
