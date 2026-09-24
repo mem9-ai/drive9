@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -247,7 +248,7 @@ func TestShadowStoreFinalUnpinWaitsForRetiredRename(t *testing.T) {
 	gen := ss.Pin("/retire-race")
 	pl := ss.acquirePathLock("/retire-race")
 	ss.mu.Lock()
-	cleanup, ok := ss.removeCoreLocked("/retire-race", 0)
+	cleanup, ok := ss.removeCoreLocked("/retire-race", 0, shadowRetiredInvalidated)
 	ss.mu.Unlock()
 	if !ok || !cleanup.retire {
 		ss.releasePathLock("/retire-race", pl)
@@ -1636,7 +1637,7 @@ func TestShadowResidentPinRejectsOldRevisionWithoutRemovingStaging(t *testing.T)
 	if err := ss.WriteFull(path, []byte("old image"), 3); err != nil {
 		t.Fatal(err)
 	}
-	oldPin, ok := ss.PinResidentOrDiscardDisk(path, 3)
+	oldPin, ok := ss.PinResident(path, 3)
 	if !ok {
 		t.Fatal("current revision cannot be pinned")
 	}
@@ -1646,7 +1647,7 @@ func TestShadowResidentPinRejectsOldRevisionWithoutRemovingStaging(t *testing.T)
 		t.Fatal(err)
 	}
 	generation := ss.ActiveGeneration(path)
-	if pin, ok := ss.PinResidentOrDiscardDisk(path, 4); ok || pin != 0 {
+	if pin, ok := ss.PinResident(path, 4); ok || pin != 0 {
 		t.Fatalf("pinned stale image: pin=%d ok=%t", pin, ok)
 	}
 	if info, err := os.Stat(ss.shadowPath(path)); err != nil || info.Size() != 9 {
@@ -1662,7 +1663,7 @@ func TestShadowResidentPinRejectsOldRevisionWithoutRemovingStaging(t *testing.T)
 	if err := ss.WriteFull(path, []byte("new image"), 4); err != nil {
 		t.Fatal(err)
 	}
-	pin, ok := ss.PinResidentOrDiscardDisk(path, 4)
+	pin, ok := ss.PinResident(path, 4)
 	if !ok {
 		t.Fatal("fresh replacement could not be pinned")
 	}
@@ -1698,7 +1699,7 @@ func TestShadowRecoveredGenerationIsNotRevisionVerified(t *testing.T) {
 				t.Fatal("generation minting asserted a content revision")
 			}
 			for _, revision := range []int64{0, 11} {
-				if pin, ok := ss.PinResidentOrDiscardDisk(path, revision); ok || pin != 0 {
+				if pin, ok := ss.PinResident(path, revision); ok || pin != 0 {
 					t.Errorf("recovered bytes accepted as verified cache at revision %d", revision)
 				}
 			}
@@ -1717,6 +1718,42 @@ func TestShadowRecoveredGenerationIsNotRevisionVerified(t *testing.T) {
 			}
 			if info, err := os.Stat(ss.shadowPath(path)); err != nil || info.Size() != 9 {
 				t.Fatalf("recovery path lost: info=%v err=%v", info, err)
+			}
+		})
+	}
+}
+
+func TestShadowLocalNewRevisionZeroAuthority(t *testing.T) {
+	for _, route := range []string{"ensure", "full", "stream"} {
+		t.Run(route, func(t *testing.T) {
+			ss, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(ss.Close)
+			const path = "/new-wal"
+			switch route {
+			case "ensure":
+				err = ss.Ensure(path, 3, 0)
+			case "full":
+				err = ss.WriteFull(path, []byte("new"), 0)
+			case "stream":
+				_, err = ss.WriteStream(path, strings.NewReader("new"), 0)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			pin, ok := ss.PinResident(path, 0)
+			if !ok {
+				t.Fatal("initialized local new-file staging must be readable")
+			}
+			defer ss.Unpin(pin)
+			if ss.canReadGeneration(pin, 1, false) {
+				t.Fatal("new-file staging ignored a known committed revision")
+			}
+			if pin, ok := ss.PinResident(path, 1); ok {
+				ss.Unpin(pin)
+				t.Fatal("new-file staging can be repinned past a commit")
 			}
 		})
 	}

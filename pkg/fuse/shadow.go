@@ -31,10 +31,11 @@ const diskCheckInterval = 5 * time.Second
 
 // ShadowFile represents a per-path local shadow file with extent tracking.
 type ShadowFile struct {
-	fd      *os.File
-	size    int64
-	baseRev int64         // server revision at open/write time
-	extents []DirtyExtent // dirty regions
+	fd       *os.File
+	size     int64
+	baseRev  int64         // server revision at open/write time
+	localNew bool          // initialized locally at revision 0; never set by recovery
+	extents  []DirtyExtent // dirty regions
 }
 
 // DirtyExtent tracks a dirty region in a shadow file.
@@ -42,6 +43,16 @@ type DirtyExtent struct {
 	Offset int64
 	Length int64
 }
+
+type shadowRetirementReason string
+
+const (
+	// Ordinary cleanup is not proof that the retired bytes match a commit.
+	// Keep the fd alive for in-flight reads, but require future reads to repin.
+	shadowRetiredInvalidated shadowRetirementReason = "invalidated"
+	// Only an explicit WAL reset or anonymous inode snapshot gets this lifetime.
+	shadowRetiredSnapshot shadowRetirementReason = "snapshot"
+)
 
 // retiredShadow holds a shadow file that has been logically removed from the
 // active path map but still has pinned readers. When the last reader Unpins,
@@ -53,9 +64,7 @@ type retiredShadow struct {
 	// cleanupDone closes after the active shadow is renamed (or removed). A
 	// final Unpin waits so it cannot orphan the retired disk path.
 	cleanupDone chan struct{}
-	// Nonzero only when an ordinary append-log commit invalidated this
-	// generation. Reset/unlink snapshots remain readable until final Unpin.
-	appendLogRevision int64
+	reason      shadowRetirementReason
 }
 
 // ShadowStore manages per-path shadow files for local staging of writes.
@@ -371,9 +380,10 @@ func (s *ShadowStore) ensureShadowFile(remotePath string, baseRev int64) (*Shado
 		return nil, fmt.Errorf("shadow stat: %w", err)
 	}
 	sf := &ShadowFile{
-		fd:      fd,
-		size:    fi.Size(),
-		baseRev: baseRev,
+		fd:       fd,
+		size:     fi.Size(),
+		baseRev:  baseRev,
+		localNew: baseRev == 0 && fi.Size() == 0,
 	}
 	s.files[remotePath] = sf
 	// New shadow file — assign a content generation so callers can snapshot it
@@ -515,6 +525,7 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 	s.mu.Lock()
 	sf.size = newSize
 	sf.baseRev = baseRev
+	sf.localNew = baseRev == 0
 	s.bumpWriteGenLocked(remotePath)
 	s.mu.Unlock()
 	s.pendingBytes.Add(delta)
@@ -668,6 +679,7 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	sf.fd = newFd
 	sf.size = n
 	sf.baseRev = baseRev
+	sf.localNew = baseRev == 0
 	s.bumpWriteGenLocked(remotePath)
 	s.mu.Unlock()
 	// Safe to close: ReadAt/ReadAll hold RLock during the actual fd.ReadAt
@@ -1131,32 +1143,33 @@ func (s *ShadowStore) PinIfExists(remotePath string) (uint64, bool) {
 	return gen, true
 }
 
-// PinResidentOrDiscardDisk pins a shadow created by this process. A disk-only
-// shadow has no current-process durability proof, so it is discarded instead
-// of becoming a read source after restart. The path lock keeps a concurrent
-// writer from creating a replacement between the resident check and discard.
-// A resident image older than minRevision is not a read source. Leave it in
-// place: a live writer may still own it for staging/rollback. Pin eligibility
-// and the revision check are atomic, independent of sibling handle locks.
-func (s *ShadowStore) PinResidentOrDiscardDisk(remotePath string, minRevision int64) (uint64, bool) {
+// discardDiskOnly removes an unverified restart orphan at Open, never on the
+// repeated Read path. The path lock excludes a concurrent staging writer.
+func (s *ShadowStore) discardDiskOnly(remotePath string) {
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+	s.mu.RLock()
+	_, resident := s.files[remotePath]
+	s.mu.RUnlock()
+	if !resident {
+		if err := os.Remove(s.shadowPath(remotePath)); err == nil {
+			s.RecoverPendingBytes()
+		}
+	}
+}
+
+// PinResident atomically checks revision eligibility and pins a resident
+// shadow. Misses do no disk I/O and take no path lock, so Read can retry when
+// a writer publishes a fresh shadow even without a committed-revision change.
+// Rejected images remain available to their staging owner.
+func (s *ShadowStore) PinResident(remotePath string, minRevision int64) (uint64, bool) {
 	if s == nil {
 		return 0, false
 	}
-	pl := s.acquirePathLock(remotePath)
-	defer s.releasePathLock(remotePath, pl)
-
 	s.mu.Lock()
-	sf, ok := s.files[remotePath]
-	if !ok {
-		s.mu.Unlock()
-		if err := os.Remove(s.shadowPath(remotePath)); err == nil {
-			// A retry on an absent cache must not rescan the whole cache dir.
-			s.RecoverPendingBytes()
-		}
-		return 0, false
-	}
+	defer s.mu.Unlock()
+	sf := s.files[remotePath]
 	if !sf.readableAtRevision(minRevision) {
-		s.mu.Unlock()
 		return 0, false
 	}
 	gen := s.active[remotePath]
@@ -1167,27 +1180,28 @@ func (s *ShadowStore) PinResidentOrDiscardDisk(remotePath string, minRevision in
 		s.genFile[gen] = sf
 	}
 	s.refs[gen]++
-	s.mu.Unlock()
 	return gen, true
 }
 
-// readableAtRevision applies only to cache reads without pending metadata.
-// Revision zero is unknown, including recovered bytes merely loaded from disk.
+// readableAtRevision applies to reads without pending metadata. Revision zero
+// is readable only for explicitly initialized local new-file staging with no
+// known remote commit; loading recovered bytes never provides that authority.
 func (sf *ShadowFile) readableAtRevision(minRevision int64) bool {
-	return sf != nil && sf.baseRev >= max(1, minRevision)
+	return sf != nil && (sf.baseRev >= max(1, minRevision) ||
+		(sf.localNew && sf.baseRev == 0 && minRevision == 0))
 }
 
-// canReadGeneration validates both resident and retired read pins. Only an
-// explicit retirement without an ordinary-commit revision preserves a reset
-// snapshot; resident cache pins must track known commits even if no cleanup ran.
-func (s *ShadowStore) canReadGeneration(gen uint64, minRevision int64, pending bool) bool {
+// canReadGeneration checks resident authority and explicit snapshot lifetime.
+// allowUnverified applies only to the active resident image: pending metadata
+// for a newer generation must never resurrect an invalidated retired pin.
+func (s *ShadowStore) canReadGeneration(gen uint64, minRevision int64, allowUnverified bool) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if sf := s.genFile[gen]; sf != nil {
-		return pending || sf.readableAtRevision(minRevision)
+		return allowUnverified || sf.readableAtRevision(minRevision)
 	}
 	if retired := s.retired[gen]; retired != nil {
-		return retired.appendLogRevision == 0
+		return retired.reason == shadowRetiredSnapshot
 	}
 	return false
 }
@@ -1247,7 +1261,7 @@ type shadowRemoveCleanup struct {
 // does not match. This makes the generation check + retirement/removal atomic
 // so a concurrent same-path write cannot bump writeGen between the check and
 // the actual map deletions.
-func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64) (shadowRemoveCleanup, bool) {
+func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64, reason shadowRetirementReason) (shadowRemoveCleanup, bool) {
 	if expectedGen != 0 && s.writeGen[remotePath] != expectedGen {
 		return shadowRemoveCleanup{}, false
 	}
@@ -1278,6 +1292,7 @@ func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64) (s
 				diskPath:    retiredPath,
 				size:        sf.size,
 				cleanupDone: make(chan struct{}),
+				reason:      reason,
 			}
 			s.retired[gen] = retired
 			cleanup.retired = retired
@@ -1326,30 +1341,33 @@ func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 
 // Remove removes a shadow file from memory and disk. If the path has active
 // pins, the shadow is "retired" — removed from the active files map so new
-// writers get a fresh shadow, but kept alive for existing readers until the
-// last Unpin.
+// writers get a fresh shadow. The fd stays alive until the last Unpin for
+// in-flight reads, but future read-source checks reject this invalidated pin.
+// Use retireSnapshot only when an old inode/WAL generation must stay readable.
 //
 // The per-path lock is held across map removal AND disk cleanup so a
 // concurrent same-path write cannot open/reuse the shared disk path in
 // between.
 func (s *ShadowStore) Remove(remotePath string) {
-	s.removeAfterAppendLogCommit(remotePath, 0)
+	s.remove(remotePath, 0, shadowRetiredInvalidated)
 }
 
-func (s *ShadowStore) removeAfterAppendLogCommit(remotePath string, revision int64) {
+// retireSnapshot explicitly preserves read pins across a WAL reset or unlink.
+// Ordinary commit cleanup must use Remove/RemoveIfGeneration instead.
+func (s *ShadowStore) retireSnapshot(remotePath string) {
+	s.remove(remotePath, 0, shadowRetiredSnapshot)
+}
+
+func (s *ShadowStore) remove(remotePath string, expectedGen uint64, reason shadowRetirementReason) bool {
 	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
 	s.mu.Lock()
-	cleanup, ok := s.removeCoreLocked(remotePath, 0)
-	if revision > 0 && cleanup.retired != nil {
-		cleanup.retired.appendLogRevision = revision
-	}
+	cleanup, ok := s.removeCoreLocked(remotePath, expectedGen, reason)
 	s.mu.Unlock()
-	if !ok {
-		s.releasePathLock(remotePath, pl)
-		return
+	if ok {
+		s.runRemoveCleanup(cleanup)
 	}
-	s.runRemoveCleanup(cleanup)
-	s.releasePathLock(remotePath, pl)
+	return ok
 }
 
 // RemoveIfGeneration removes the shadow file for remotePath only if its current
@@ -1365,17 +1383,7 @@ func (s *ShadowStore) removeAfterAppendLogCommit(remotePath string, revision int
 // could create its new shadow at the shared disk path after the in-memory
 // check but before the stale cleanup removed/renamed it.
 func (s *ShadowStore) RemoveIfGeneration(remotePath string, expectedGen uint64) bool {
-	pl := s.acquirePathLock(remotePath)
-	s.mu.Lock()
-	cleanup, ok := s.removeCoreLocked(remotePath, expectedGen)
-	s.mu.Unlock()
-	if !ok {
-		s.releasePathLock(remotePath, pl)
-		return false
-	}
-	s.runRemoveCleanup(cleanup)
-	s.releasePathLock(remotePath, pl)
-	return true
+	return s.remove(remotePath, expectedGen, shadowRetiredInvalidated)
 }
 
 // ActiveGeneration returns the current content generation for remotePath, or 0
@@ -1497,8 +1505,9 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 		delete(s.genFile, replacedGen)
 		if s.refs[replacedGen] > 0 && replacedSF != nil {
 			s.retired[replacedGen] = &retiredShadow{
-				fd:   replacedSF.fd,
-				size: replacedSF.size,
+				fd:     replacedSF.fd,
+				size:   replacedSF.size,
+				reason: shadowRetiredSnapshot,
 			}
 		} else {
 			delete(s.refs, replacedGen)

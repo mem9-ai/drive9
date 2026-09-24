@@ -1,5 +1,14 @@
 package fuse
 
+// openReadOnlyShadowLocked discards restart orphans once. Read retries in memory.
+func (fs *Dat9FS) openReadOnlyShadowLocked(fh *FileHandle) {
+	if fs.shadowStore != nil && !fs.hasPendingMetadataState(fh.Path) &&
+		(fs.appendLogPathConfigured(fh.Path) || fs.latestCommittedRevision(fh.Path) > 0) {
+		fs.shadowStore.discardDiskOnly(fh.Path)
+	}
+	fs.refreshReadOnlyShadowLocked(fh)
+}
+
 // refreshReadOnlyShadowLocked is shared by Open and Read. An append-log cache,
 // or any cache superseded by a locally observed commit, must match the known
 // revision at each read, not just when the descriptor opened. Pending metadata
@@ -11,16 +20,16 @@ func (fs *Dat9FS) refreshReadOnlyShadowLocked(fh *FileHandle) {
 	}
 	committedRevision := fs.latestCommittedRevision(fh.Path)
 	checkRevision := fs.appendLogPathConfigured(fh.Path) || committedRevision > 0
-	if !checkRevision && fh.ShadowPinned {
-		return
-	}
+	// Pending metadata deliberately exposes the current staged image even
+	// when its CAS base predates a known commit. It never validates a retired
+	// image: metadata for a replacement must not resurrect the old pin.
 	pending := fs.hasPendingMetadataState(fh.Path)
 	minRevision := max(fh.BaseRev, committedRevision)
 	if entry, ok := fs.inodes.GetEntry(fh.Ino); ok && entry != nil {
 		minRevision = max(minRevision, entry.Revision)
 	}
 	if fh.ShadowPinned {
-		if fs.shadowStore.canReadGeneration(fh.ShadowGen, minRevision, pending) {
+		if fs.shadowStore.canReadGeneration(fh.ShadowGen, minRevision, pending || !checkRevision) {
 			return
 		}
 		gen := fh.ShadowGen
@@ -39,7 +48,7 @@ func (fs *Dat9FS) refreshReadOnlyShadowLocked(fh *FileHandle) {
 	var gen uint64
 	var ok bool
 	if checkRevision && !pending {
-		gen, ok = fs.shadowStore.PinResidentOrDiscardDisk(fh.Path, minRevision)
+		gen, ok = fs.shadowStore.PinResident(fh.Path, minRevision)
 	} else {
 		gen, ok = fs.shadowStore.PinIfExists(fh.Path)
 	}
