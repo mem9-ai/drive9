@@ -20,6 +20,10 @@
 #   DRIVE9_MINIO_BUCKET        (default drive9-local)
 #   DRIVE9_MINIO_CONTAINER     (default drive9-local-minio)
 #   DRIVE9_MINIO_IMAGE         (default minio/minio:RELEASE.2024-12-18T13-15-44Z)
+#   DRIVE9_MINIO_FALLBACK_IMAGE (default cgr.dev/chainguard/minio:latest; empty
+#                               disables the fallback — the minio/minio image
+#                               no longer exists upstream, so the default
+#                               chain is the primary pull source)
 #   DRIVE9_S3_ENDPOINT         advertised endpoint (presign / clients; e.g. Orb)
 #
 # Compatible with macOS bash 3.2.
@@ -33,8 +37,14 @@ SECRET_KEY="${DRIVE9_MINIO_PASSWORD:-drive9minio}"
 BUCKET="${DRIVE9_MINIO_BUCKET:-drive9-local}"
 CONTAINER="${DRIVE9_MINIO_CONTAINER:-drive9-local-minio}"
 IMAGE="${DRIVE9_MINIO_IMAGE:-minio/minio:RELEASE.2024-12-18T13-15-44Z}"
+FALLBACK_IMAGE="${DRIVE9_MINIO_FALLBACK_IMAGE-cgr.dev/chainguard/minio:latest}"
 PID_FILE="${DRIVE9_MINIO_PID_FILE:-${TMPDIR:-/tmp}/drive9-local-minio.pid}"
 DATA_DIR="${DRIVE9_MINIO_DATA_DIR:-${TMPDIR:-/tmp}/drive9-local-minio-data}"
+
+MINIO_IMAGE_CANDIDATES="$IMAGE"
+if [ -n "$FALLBACK_IMAGE" ] && [ "$FALLBACK_IMAGE" != "$IMAGE" ]; then
+  MINIO_IMAGE_CANDIDATES="$MINIO_IMAGE_CANDIDATES $FALLBACK_IMAGE"
+fi
 
 HEALTH_HOST="$BIND"
 if [ "$BIND" = "0.0.0.0" ] || [ "$BIND" = "::" ] || [ "$BIND" = "[::]" ]; then
@@ -164,11 +174,18 @@ start_container() {
     "$runtime" start "$CONTAINER" >/dev/null
     return 0
   fi
-  "$runtime" run -d --name "$CONTAINER" \
-    -p "${BIND}:${PORT}:9000" \
-    -e "MINIO_ROOT_USER=${ACCESS_KEY}" \
-    -e "MINIO_ROOT_PASSWORD=${SECRET_KEY}" \
-    "$IMAGE" server /data >/dev/null
+  local image
+  for image in $MINIO_IMAGE_CANDIDATES; do
+    if "$runtime" run -d --name "$CONTAINER" \
+      -p "${BIND}:${PORT}:9000" \
+      -e "MINIO_ROOT_USER=${ACCESS_KEY}" \
+      -e "MINIO_ROOT_PASSWORD=${SECRET_KEY}" \
+      "$image" server /data >/dev/null; then
+      return 0
+    fi
+    "$runtime" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  done
+  return 1
 }
 
 minio_arch() {
@@ -196,8 +213,17 @@ start_binary() {
     bin="${DATA_DIR}/minio"
     mkdir -p "$DATA_DIR"
     if [ ! -x "$bin" ]; then
-      echo "fetching MinIO $arch" >&2
-      curl -fsSL "https://dl.min.io/server/minio/release/${arch}/minio" -o "$bin"
+      # MinIO discontinued community downloads: dl.min.io binary paths return
+      # 410 since the community edition went source-only. A host without a
+      # container runtime must provide a minio binary in PATH, at
+      # $DATA_DIR/minio, or via MINIO_DOWNLOAD_URL.
+      local url="${MINIO_DOWNLOAD_URL:-}"
+      if [ -z "$url" ]; then
+        echo "no minio binary in PATH and upstream community downloads are discontinued; set MINIO_DOWNLOAD_URL or install minio" >&2
+        return 1
+      fi
+      echo "fetching MinIO $arch from $url" >&2
+      curl -fsSL "$url" -o "$bin" || return 1
       chmod +x "$bin"
     fi
   fi
