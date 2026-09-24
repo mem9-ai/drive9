@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -235,6 +236,122 @@ func TestExtentTeardownOpsCoverRealCloseSession(t *testing.T) {
 	if !found {
 		t.Fatalf("expected clean_stale_session among %v", ops)
 	}
+}
+
+// TestExtentTeardownAdmitsDeleteSliceThroughClosedGate drives the other
+// teardown-owned op through real vendored code with the gate already closed:
+// compactChunk's CAS-loss branch queues the new slice for deletion, and with no
+// session started baseMeta.deleteSlice runs it inline (deleteSlice_ ->
+// doDeleteSlice), so Transport.Enter sees delete_slice while closed. The
+// dead-slice queue is empty in the CloseSession test, so this is what actually
+// pins Drive9OpDeleteSlice in the allowlist.
+func TestExtentTeardownAdmitsDeleteSliceThroughClosedGate(t *testing.T) {
+	var mu sync.Mutex
+	var ops []string
+	var admitted []string
+	record := func(op string) {
+		mu.Lock()
+		ops = append(ops, op)
+		mu.Unlock()
+	}
+
+	// Two contiguous 4 KiB slices for one chunk.
+	slices := append(teardownTestSlice(0, 1, 4096, 0, 4096), teardownTestSlice(4096, 2, 4096, 0, 4096)...)
+	getAttrBody, err := json.Marshal(map[string]any{
+		"inode": 1,
+		"attr":  map[string]any{"Typ": 1, "Length": 1 << 22, "Full": true, "Tier": 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readBody, err := json.Marshal(map[string]any{"slices": slices})
+	if err != nil {
+		t.Fatal(err)
+	}
+	incrBody, err := json.Marshal(map[string]any{"value": int64(1) << 40}) // non-zero nextChunk
+	if err != nil {
+		t.Fatal(err)
+	}
+	compactBody, err := json.Marshal(map[string]any{"errno": 22}) // EINVAL: CAS lost
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hold := newExtentMetaHold()
+	var closeOnce sync.Once
+	// Close the gate only when the CAS-loss branch is about to run, so the
+	// delete_slice it triggers sees a closed gate while the reads that set it up
+	// do not.
+	closeGate := func() { closeOnce.Do(func() { hold.closeAndWait(0) }) }
+	tr := extent.NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
+		switch op {
+		case jfsmeta.Drive9OpGetAttr:
+			return getAttrBody, 0, nil
+		case jfsmeta.Drive9OpRead:
+			return readBody, 0, nil
+		case jfsmeta.Drive9OpIncrCounter:
+			return incrBody, 0, nil
+		case jfsmeta.Drive9OpCompact:
+			closeGate()
+			return compactBody, 0, nil
+		case jfsmeta.Drive9OpDeleteSlice:
+			// Reached only if the closed gate admitted it.
+			mu.Lock()
+			admitted = append(admitted, op)
+			mu.Unlock()
+			return []byte("{}"), 0, nil
+		default:
+			return []byte("{}"), 0, nil
+		}
+	})
+	tr.Enter = func(op string) bool {
+		record(op)
+		return hold.enter(op)
+	}
+	tr.Leave = hold.leave
+
+	conf := jfsmeta.DefaultConf()
+	conf.NoBGJob = true
+	conf.Sid = 42
+	conf.MaxDeletes = 1
+	m := jfsmeta.NewDrive9Meta(conf, tr)
+	if err := m.Init(&jfsmeta.Format{Name: "drive9", UUID: "drive9-extent", Storage: "file", BlockSize: 4 << 20}, false); err != nil {
+		t.Fatal(err)
+	}
+	// newMsg short-circuits the compact and delete-slice steps without a callback.
+	m.OnMsg(jfsmeta.CompactChunk, func(...interface{}) error { return nil })
+	m.OnMsg(jfsmeta.DeleteSlice, func(...interface{}) error { return nil })
+
+	mu.Lock()
+	ops = nil
+	mu.Unlock()
+	noop := func() {}
+	// inode 2, not RootInode: the root path synthesizes a directory attr.
+	if st := m.Compact(jfsmeta.Background(), 2, 1, noop, noop); st != 0 {
+		t.Fatalf("Compact = %v; ops=%v", st, ops)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, op := range admitted {
+		if op == jfsmeta.Drive9OpDeleteSlice {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("delete_slice did not reach the RPC (refused by the closed gate); attempted=%v", ops)
+	}
+}
+
+func teardownTestSlice(pos uint32, id uint64, size, off, length uint32) []byte {
+	b := make([]byte, 0, 24)
+	b = binary.BigEndian.AppendUint32(b, pos)
+	b = binary.BigEndian.AppendUint64(b, id)
+	b = binary.BigEndian.AppendUint32(b, size)
+	b = binary.BigEndian.AppendUint32(b, off)
+	b = binary.BigEndian.AppendUint32(b, length)
+	return b
 }
 
 // TestEnsureExtentRuntimeWaiterWakesOnTeardown parks a single-flight waiter
