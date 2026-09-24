@@ -1435,17 +1435,27 @@ func (fs *Dat9FS) gitDirShouldBeLocalOverlay(ctx context.Context, localPath stri
 	}
 	// Cheap necessary condition: only a path with a `.git` segment can match.
 	// This runs for every remote-default path, so the common case is rejected
-	// before paying for workspace routing or a pending-marker stat.
+	// before any workspace or marker work.
 	if !pathHasGitDirSegment(localPath) {
 		return false
 	}
-	if rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath); ok && rt != nil {
+	// Pending marker first: during `git clone --fast` git writes `.git` heavily,
+	// and the marker is a single local stat. Checking it before the workspace
+	// lookup keeps the clone from driving workspace refresh machinery per file.
+	if root, ok := mountRootForGitDirPath(localPath); ok &&
+		gitcache.WorkspacePending(ctx, fs.opts.LocalRoot, root) {
+		return true
+	}
+	// A loaded workspace covers the steady state without a refresh; the full
+	// lookup (which may refresh) is the fallback for a remount whose workspace
+	// has not been loaded yet.
+	if rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath); ok && rt != nil {
 		if rel == ".git" || strings.HasPrefix(rel, ".git/") {
 			return true
 		}
 	}
-	if root, ok := mountRootForGitDirPath(localPath); ok {
-		return gitcache.WorkspacePending(ctx, fs.opts.LocalRoot, root)
+	if rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath); ok && rt != nil {
+		return rel == ".git" || strings.HasPrefix(rel, ".git/")
 	}
 	return false
 }
