@@ -142,6 +142,7 @@ describe("archive", () => {
       { path: "/proj/main.go", body: "package main\n" },
       { path: "/proj/dist/bundle.js", body: "bundle\n" },
       { path: "/proj/node_modules/react/x.js", body: "x\n" },
+      { path: "/proj/.venv/bin/python", body: "py\n" },
       { path: "/proj/target/debug/app", body: "bin\n" },
       { path: "/proj/.git/HEAD", body: "ref: main\n" },
     ]);
@@ -154,7 +155,7 @@ describe("archive", () => {
     expect(names).toContain("proj/dist/bundle.js");
     expect(names).toContain("proj/.git/HEAD");
     for (const n of names) {
-      expect(n.includes("node_modules") || n.includes("target/")).toBe(false);
+      expect(n.includes("node_modules") || n.includes(".venv/") || n.includes("target/")).toBe(false);
     }
   });
 

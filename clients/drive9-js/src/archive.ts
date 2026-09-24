@@ -616,6 +616,7 @@ async function buildMatcher(client: Client, opts: ArchiveOptions): Promise<Match
 // has no such oracle and applies the patterns directly.
 export const codingAgentLocalOnly = [
   "**/node_modules/**",
+  "**/.venv/**",
   "**/target/**",
 ];
 

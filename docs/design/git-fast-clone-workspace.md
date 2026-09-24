@@ -97,9 +97,9 @@ Hidden local clean cache
 Coding-agent local overlay policy
 
 - The coding-agent mount profile routes heavyweight local state and generated output to `<local-root>/overlay` instead of Drive9 backend storage.
-- The default local-only patterns are deliberately narrow: dependency and build-output trees (`node_modules`, `target`). These are the trees whose file counts routinely overwhelm remote storage, and they are essentially never hand-edited.
+- The default local-only patterns are deliberately narrow: dependency and heavy build-output trees (`node_modules`, `.venv`, `target`). These are the trees whose file counts routinely overwhelm remote storage, and they are essentially never hand-edited.
 - By default those patterns are **gitignore-aware**: a matched path is overlaid only when the repository's own Git ignore rules also ignore it, so a directory that merely shares a name with generated output is not overlaid. See "Git-ignore policy" below.
-- Other build and cache output (`dist`, `build`, `.venv`, `.cache`, `coverage`, tool caches, and so on) and VCS metadata (`.git`, `.hg`, `.svn`) are left remote-persistent by default. Projects that want a specific tree overlaid can add explicit `[local]` patterns via `--local-only` or a custom profile, and can opt out of the gitignore gate.
+- Other build and cache output (`dist`, `build`, `.cache`, `coverage`, tool caches such as `__pycache__`/`.pytest_cache`, and so on) and VCS metadata (`.git`, `.hg`, `.svn`) are left remote-persistent by default. Projects that want a specific tree overlaid can add explicit `[local]` patterns via `--local-only` or a custom profile, and can opt out of the gitignore gate.
 - `.git` is the one structural exception: inside a loaded Git workspace the working `.git` is always local-only, independent of the pattern list and the gate. In an ordinary (non-workspace) repository `.git` is remote-persistent. See "`.git` routing" below.
 - These local-only paths are still merged into FUSE directory listings with tracked Git workspace entries, so generated directories under a tracked source directory remain visible to local build tools without being uploaded to Drive9.
 - Local-only dependency and generated-output files are a rebuildable performance layer. Their ordinary FUSE `Flush` path does not force `fsync`; it refreshes local inode metadata only. Explicit `Fsync` still syncs the local file.
@@ -244,7 +244,7 @@ Edit a file:
 
 - When a tracked clean file is written, FUSE stores the new content in a `git_workspace_overlay` `upsert` entry.
 - New files and directories also enter the overlay.
-- In the coding-agent profile, an untracked dependency or build-output directory (`node_modules`, `target`) that the repository ignores is local-only. This keeps tens of thousands of generated files off Drive9 while a directory that is not actually ignored stays remote-managed.
+- In the coding-agent profile, an untracked dependency or build-output directory (`node_modules`, `.venv`, `target`) that the repository ignores is local-only. This keeps tens of thousands of generated files off Drive9 while a directory that is not actually ignored stays remote-managed.
 - Deleting a clean file writes a `whiteout`.
 - Writable opens for tracked files preload from the Git workspace manifest or dirty overlay entry into a hidden local dirty mirror under `LocalRoot`. FUSE serves the write handle from that local file and converts it into a Drive9 overlay snapshot on flush/release. This is especially important for append-style writes: local file semantics preserve the complete current file content before appending the new bytes, while Drive9 still owns the durable cross-sandbox overlay.
 - Clean tracked files may use the kernel page cache because their content is immutable for a given manifest entry. Dirty overlay files are different: they are the authoritative edited working tree view, so read-only opens for content-changing overlay entries bypass the kernel page cache. This keeps `git add` and index refresh from reading stale clean pages or seeing size/content mismatches after append-heavy edits, while preserving cache hits for clean build reads.
@@ -302,7 +302,7 @@ The current implementation does not introduce SQLite.
 Local fast workspace state includes:
 
 - `<local-root>/overlay/.../.git`: local `.git` (workspace-scoped, always local).
-- `<local-root>/overlay/.../<local-only-path>`: coding-agent local-only files for paths matched by local-only patterns and confirmed by the gitignore-aware gate (for example `node_modules`, `target`).
+- `<local-root>/overlay/.../<local-only-path>`: coding-agent local-only files for paths matched by local-only patterns and confirmed by the gitignore-aware gate (for example `node_modules`, `.venv`, `target`).
 - `<local-root>/git-workspaces/<workspace-id>/<head-commit>/tree`: hidden hydrated clean source tree cache.
 - `<local-root>/git-workspaces/<workspace-id>/<head-commit>/blobs`: hidden read-through clean blob cache.
 - `<local-root>/overlay/.../.git/objects`: local Git object database. In blobless mode hydrate fills clean blobs here from the hidden tree cache so `git status`, `git diff`, `git add`, and `git commit` do not fan out into promisor lazy fetches.

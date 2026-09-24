@@ -116,7 +116,8 @@ func defaultCodingAgentLocalOnlyPatterns(profile string) []string {
 	if profile != MountProfileCodingAgent {
 		return nil
 	}
-	// Only dependency and heavy build-output trees are listed. By default the
+	// Only dependency and heavy build-output trees are listed: Node
+	// dependencies, Python virtualenvs, and Rust build output. By default the
 	// gitignore-aware gate (see LocalPolicy.gitignoreAware) further requires
 	// each of these paths to be ignored by the repository, so a directory that
 	// merely shares a name with generated output is not overlaid. VCS metadata
@@ -124,6 +125,7 @@ func defaultCodingAgentLocalOnlyPatterns(profile string) []string {
 	// workspace, and is remote-persistent elsewhere.
 	return []string{
 		"**/node_modules/**",
+		"**/.venv/**",
 		"**/target/**",
 	}
 }

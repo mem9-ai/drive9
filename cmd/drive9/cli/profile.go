@@ -225,6 +225,7 @@ func mergeProfileValues(groups ...[]string) []string {
 func builtinCodingAgentLocalOnlyPatterns() []string {
 	return []string{
 		"**/node_modules/**",
+		"**/.venv/**",
 		"**/target/**",
 	}
 }

@@ -96,6 +96,8 @@ func TestLocalPolicyDefaultsDependencyAndTargetToLocalOnly(t *testing.T) {
 
 	for _, path := range []string{
 		"/repo/node_modules/pkg/index.js",
+		"/repo/.venv/bin/python",
+		"/repo/.venv/lib/python3.12/site-packages/numpy/core.py",
 		"/repo/target/debug/app",
 	} {
 		if got := policy.Classify(path); got != PathLayerLocalOnly {
@@ -107,12 +109,13 @@ func TestLocalPolicyDefaultsDependencyAndTargetToLocalOnly(t *testing.T) {
 func TestLocalPolicyDefaultsLeaveOtherBuildOutputRemote(t *testing.T) {
 	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil, true)
 
-	// The default pattern list is intentionally short: only node_modules and
-	// target are matched (and target only overlays when the gitignore-aware
-	// gate confirms it, which Classify does not apply). Everything else stays
+	// The default pattern list is intentionally short: node_modules, .venv, and
+	// target are matched (and .venv/target only overlay when the gitignore-aware
+	// gate confirms them, which Classify does not apply). Everything else stays
 	// remote-persistent by default.
 	for _, path := range []string{
 		"/repo/.pnpm-store/v3/files/pkg",
+		"/repo/.tox/py312/lib/python3.12/site-packages/x.py",
 		"/repo/dist/app.js",
 		"/repo/build/output.bin",
 		"/repo/coverage/lcov.info",
@@ -128,7 +131,6 @@ func TestLocalPolicyDefaultsLeaveOtherBuildOutputRemote(t *testing.T) {
 		"/repo/.ruff_cache/content",
 		"/repo/pkg/__pycache__/mod.cpython-312.pyc",
 		"/repo/.gradle/caches/modules-2/files-2.1",
-		"/repo/.venv/bin/python",
 	} {
 		if got := policy.Classify(path); got != PathLayerRemotePersistent {
 			t.Errorf("Classify(%q) = %s, want remote persistent default", path, got)

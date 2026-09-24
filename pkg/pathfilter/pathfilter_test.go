@@ -205,10 +205,12 @@ func TestMatcherExcludeOverridesInclude(t *testing.T) {
 }
 
 func TestCodingAgentDefaultPatternsDropDependencyAndBuildOutput(t *testing.T) {
-	patterns := []string{"**/node_modules/**", "**/target/**"}
+	patterns := []string{"**/node_modules/**", "**/.venv/**", "**/target/**"}
 	m := NewMatcher(nil, patterns, nil)
 	drop := []string{
 		"node_modules/react/index.js", "proj/node_modules/pkg/x.js",
+		"proj/.venv/bin/python",
+		"proj/.venv/lib/python3.12/site-packages/numpy/core.py",
 		"proj/target/debug/app", "crates/foo/target/build/out.o",
 	}
 	for _, p := range drop {
@@ -220,8 +222,8 @@ func TestCodingAgentDefaultPatternsDropDependencyAndBuildOutput(t *testing.T) {
 	keep := []string{
 		"proj/src/main.go", "README.md", "proj/go.mod", "proj/.gitignore",
 		".git/HEAD", "proj/.hg/store/data", "proj/.svn/pristine/aa",
-		"proj/dist/bundle.js", "proj/build/output.o", "proj/.venv/bin/python",
-		"proj/.cache/state.json",
+		"proj/dist/bundle.js", "proj/build/output.o", "proj/.tox/py312/lib/python3.12/x.py",
+		"proj/__pycache__/mod.cpython-312.pyc", "proj/.cache/state.json",
 	}
 	for _, p := range keep {
 		if !m.Match(p) {
