@@ -151,27 +151,39 @@ The eligibility check uses live staging state, not a scan of historical WAL
 frames. Recovery of historical frames retains its recorded revision and existing
 CAS checks; this optimization does not add journal commit markers or retire them.
 
-For configured append-log paths and paths with a locally observed remote
-commit, read-only `Open` and `Read` share a checked shadow-pin path. Resident
-caches must have a base revision at least as new as the handle, inode and locally
-observed commit. Locally initialized new-file staging at revision zero is also
-readable while no committed revision is known; unverified recovered bytes do not
-get that authority merely by loading or minting a generation token.
+For every path, read-only `Open` and `Read` share a checked shadow-pin path.
+Without pending metadata, only resident caches with a base revision at least
+as new as the handle, inode and locally observed commit can be selected.
+Absence of append-log configuration or local commit history does not authorize
+an unknown disk image, including a torn shadow left after an acknowledged
+close-sync upload and restart.
+
+Locally initialized new-file staging at revision zero is also readable while
+no committed revision is known. Successful empty initialization (including
+Create over a leftover shadow), actual writes into an empty image, and complete
+content replacement establish that provenance. Merely opening, syncing,
+partially resizing or partially overwriting recovered bytes does not.
 
 Retirement has an explicit reason. Ordinary cleanup invalidates future reads
 from that generation, even when the upload returned no revision. Cleanup alone
 does not prove that the retired shadow matches the uploaded image, so it never
 labels those bytes with a committed revision. Existing readers repin a current
 source or use the remote/read cache. Explicit WAL reset and anonymous inode
-snapshots (including rename-overwrite) keep their existing lifetime.
+snapshots (including rename-overwrite) keep their existing lifetime. Unlinked
+handles read their captured generation directly; they do not use the ordinary
+path's source-selection policy.
 
 Pending metadata is deliberately an independent read authority for the current
 staged image and may override a newer known remote revision while local changes
 await publication. It never revives an invalidated retired generation. Recovery
 uploads still take their CAS base from pending metadata.
 
-`Read` checks its shadow pin once at the shadow-read branch. Checked retries
-inspect resident state only: no path lock, disk lookup or unlink on a cache miss.
+`Read` checks its shadow pin once at the shadow-read branch. Without pending
+metadata, retries inspect resident state only: no path lock, disk lookup or
+unlink on a cache miss. Missing candidates skip inode access and write-back
+metadata locks; candidate validation reads only the inode revision instead of
+copying the inode and its paths. Pending-index recovery remains discoverable
+even when it is published after Open and can explicitly authorize a disk load.
 `Open` separately discards disk-only restart orphans when no pending metadata
 authorizes them. A newly installed resident image remains discoverable even if
 its revision has not changed. Raw path reads cannot bypass the checked pin, and

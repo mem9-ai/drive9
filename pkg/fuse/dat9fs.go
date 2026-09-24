@@ -8310,7 +8310,7 @@ func (fs *Dat9FS) hasPendingMetadataState(p string) bool {
 		return false
 	}
 	if fs.pendingIndex != nil {
-		if _, ok := fs.pendingIndex.GetMeta(p); ok {
+		if fs.pendingIndex.HasPending(p) {
 			return true
 		}
 	}

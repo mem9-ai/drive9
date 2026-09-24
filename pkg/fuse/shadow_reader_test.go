@@ -3,6 +3,7 @@ package fuse
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -140,45 +141,50 @@ func TestReadOnlyShadowPinsNewWALBeforeCommit(t *testing.T) {
 }
 
 func TestReadOnlyShadowMissDoesNotTouchDiskOrPathLock(t *testing.T) {
-	fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("remote"))
-	})
-	const path = "/missing-wal"
-	fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/*-wal"})
-	ino := fs.inodes.Lookup(path, false, 6, time.Now())
-	fs.inodes.UpdateRevision(ino, 1)
-	fs.recordCommittedRevisionWithSize(path, 1, 6)
-	var out gofuse.OpenOut
-	if st := fs.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out); st != gofuse.OK {
-		t.Fatal(st)
-	}
-	defer fs.Release(nil, &gofuse.ReleaseIn{Fh: out.Fh})
-	// An orphan appearing after Open must not be opened or unlinked by Read.
-	if err := os.WriteFile(fs.shadowStore.shadowPath(path), []byte("orphan"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	pl := fs.shadowStore.acquirePathLock(path)
-	unlock := sync.OnceFunc(func() { fs.shadowStore.releasePathLock(path, pl) })
-	defer unlock()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for range 3 {
-			got, st, err := readDat9FSTestRange(fs, ino, out.Fh, 0, 6)
-			if err != nil || st != gofuse.OK || string(got) != "remote" {
-				t.Errorf("read=%q/%v/%v", got, st, err)
+	for _, configured := range []bool{false, true} {
+		t.Run(fmt.Sprintf("configured=%t", configured), func(t *testing.T) {
+			fs := newCloseSyncShadowTestFS(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte("remote"))
+			})
+			const path = "/missing-wal"
+			if configured {
+				fs.appendLogMatcher = NewAppendLogMatcher([]string{"**/*-wal"})
 			}
-		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		unlock()
-		<-done
-		t.Fatal("cache miss waited for a disk mutation's path lock")
-	}
-	if got, err := os.ReadFile(fs.shadowStore.shadowPath(path)); err != nil || string(got) != "orphan" {
-		t.Fatalf("Read changed the disk orphan: %q/%v", got, err)
+			ino := fs.inodes.Lookup(path, false, 6, time.Now())
+			fs.inodes.UpdateRevision(ino, 1)
+			var out gofuse.OpenOut
+			if st := fs.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			defer fs.Release(nil, &gofuse.ReleaseIn{Fh: out.Fh})
+			// An orphan appearing after Open must not be opened or unlinked by Read.
+			if err := os.WriteFile(fs.shadowStore.shadowPath(path), []byte("orphan"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			pl := fs.shadowStore.acquirePathLock(path)
+			unlock := sync.OnceFunc(func() { fs.shadowStore.releasePathLock(path, pl) })
+			defer unlock()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				for range 3 {
+					got, st, err := readDat9FSTestRange(fs, ino, out.Fh, 0, 6)
+					if err != nil || st != gofuse.OK || string(got) != "remote" {
+						t.Errorf("read=%q/%v/%v", got, st, err)
+					}
+				}
+			}()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				unlock()
+				<-done
+				t.Fatal("cache miss waited for a disk mutation's path lock")
+			}
+			if got, err := os.ReadFile(fs.shadowStore.shadowPath(path)); err != nil || string(got) != "orphan" {
+				t.Fatalf("Read changed the disk orphan: %q/%v", got, err)
+			}
+		})
 	}
 }
 

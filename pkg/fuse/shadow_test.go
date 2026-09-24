@@ -1715,3 +1715,59 @@ func TestShadowLocalNewRevisionZeroAuthority(t *testing.T) {
 		})
 	}
 }
+
+func TestShadowLocalInitializationDoesNotBlessRecoveredBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		initial  string
+		mutate   func(*ShadowStore, string) error
+		readable bool
+	}{
+		{"empty-reset", "old bytes", func(s *ShadowStore, p string) error { return s.Ensure(p, 0, 0) }, true},
+		{"ensure-empty-zeros", "", func(s *ShadowStore, p string) error { return s.Ensure(p, 3, 0) }, true},
+		{"ensure-retains-bytes", "old bytes", func(s *ShadowStore, p string) error { return s.Ensure(p, 3, 0) }, false},
+		{"ensure-retains-prefix", "old", func(s *ShadowStore, p string) error { return s.Ensure(p, 9, 0) }, false},
+		{"partial-write", "old bytes", func(s *ShadowStore, p string) error {
+			_, err := s.WriteAt(p, 0, []byte("new"), 0)
+			return err
+		}, false},
+		{"empty-write", "", func(s *ShadowStore, p string) error {
+			_, err := s.WriteAt(p, 3, []byte("new"), 0)
+			return err
+		}, true},
+		{"sync-empty-recovery", "", func(s *ShadowStore, p string) error { return s.Sync(p) }, false},
+		{"full-replacement", "old bytes", func(s *ShadowStore, p string) error {
+			return s.WriteFull(p, []byte("new"), 0)
+		}, true},
+		{"stream-replacement", "old bytes", func(s *ShadowStore, p string) error {
+			_, err := s.WriteStream(p, strings.NewReader("new"), 0)
+			return err
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(s.Close)
+			const path = "/file"
+			if err := os.WriteFile(s.shadowPath(path), []byte(tc.initial), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.mutate(s, path); err != nil {
+				t.Fatal(err)
+			}
+			pin, ok := s.PinResident(path, 0)
+			if ok {
+				defer s.Unpin(pin)
+			}
+			if ok != tc.readable {
+				t.Fatalf("readable=%t, want %t", ok, tc.readable)
+			}
+			if pin, ok := s.PinResident(path, 1); ok {
+				s.Unpin(pin)
+				t.Fatal("revision-zero initialization overrode a known commit")
+			}
+		})
+	}
+}

@@ -51,7 +51,8 @@ const (
 	// Ordinary cleanup is not proof that the retired bytes match a commit.
 	// Keep the fd alive for in-flight reads, but require future reads to repin.
 	shadowRetiredInvalidated shadowRetirementReason = "invalidated"
-	// Only an explicit WAL reset or anonymous inode snapshot gets this lifetime.
+	// Explicit WAL resets and inode snapshots (unlink/rename-overwrite) keep
+	// this lifetime. Rename records it while replacing the destination pin.
 	shadowRetiredSnapshot shadowRetirementReason = "snapshot"
 )
 
@@ -380,10 +381,9 @@ func (s *ShadowStore) ensureShadowFile(remotePath string, baseRev int64) (*Shado
 		return nil, fmt.Errorf("shadow stat: %w", err)
 	}
 	sf := &ShadowFile{
-		fd:       fd,
-		size:     fi.Size(),
-		baseRev:  baseRev,
-		localNew: baseRev == 0 && fi.Size() == 0,
+		fd:      fd,
+		size:    fi.Size(),
+		baseRev: baseRev,
 	}
 	s.files[remotePath] = sf
 	// New shadow file — assign a content generation so callers can snapshot it
@@ -423,6 +423,13 @@ func (s *ShadowStore) Ensure(remotePath string, size int64, baseRev int64) error
 	s.resizeWrittenLocked(sf, size)
 	// Resizing an existing image does not prove its bytes came from a
 	// newer revision. Only initialization or a content write sets baseRev.
+	if baseRev == 0 && (size == 0 || oldSize == 0) {
+		// A successful empty reset (Create), or extension of an empty
+		// image with zeros, establishes all bytes locally. Merely opening
+		// or partially resizing recovered contents cannot establish this.
+		sf.baseRev = 0
+		sf.localNew = true
+	}
 	s.bumpWriteGenLocked(remotePath)
 	s.mu.Unlock()
 	s.pendingBytes.Add(delta)
@@ -1144,6 +1151,14 @@ func (s *ShadowStore) discardDiskOnly(remotePath string) {
 			s.RecoverPendingBytes()
 		}
 	}
+}
+
+// hasResident is a memory-only candidate check. It provides no read authority;
+// acquisition must still check the revision or pending metadata.
+func (s *ShadowStore) hasResident(remotePath string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.files[remotePath] != nil
 }
 
 // PinResident atomically checks revision eligibility and pins a resident
