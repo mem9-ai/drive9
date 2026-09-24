@@ -64,7 +64,7 @@ The built-in profiles are:
 
 | Profile | Local overlay policy | Automatic pack policy |
 | --- | --- | --- |
-| `coding-agent` | Routes VCS metadata (`.git`, `.hg`, `.svn`) and dependency trees (`node_modules`) to local disk. A Rust `target/` directory is additionally overlaid when the repository ignores it in place (see [git-fast-clone-workspace](./git-fast-clone-workspace.md)). This is the default FUSE profile. | No automatic pack paths. Nothing is packed unless the user explicitly asks. |
+| `coding-agent` | Dependency and build-output trees (`node_modules`, `target`), overlaid only when the repository also ignores them (the gitignore-aware gate; see [git-fast-clone-workspace](./git-fast-clone-workspace.md)). `.git` is local only inside a Git workspace. This is the default FUSE profile. | No automatic pack paths. Nothing is packed unless the user explicitly asks. |
 | `portable` | Uses the same local overlay policy as `coding-agent`. | Packs all files and directories that currently exist under `local-root/overlay`. |
 | `none` | No local overlay policy. | No pack policy. |
 

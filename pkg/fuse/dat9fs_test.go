@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
@@ -9381,8 +9383,8 @@ func TestDat9FSClassifiesCodingAgentLocalPolicy(t *testing.T) {
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
 
-	if got := fs.observePathPolicy("/repo/.git/config"); got != PathLayerLocalOnly {
-		t.Fatalf(".git classification = %s, want local-only", got)
+	if got := fs.observePathPolicy("/repo/node_modules/pkg/index.js"); got != PathLayerLocalOnly {
+		t.Fatalf("node_modules classification = %s, want local-only", got)
 	}
 	if got := fs.observePathPolicy("/repo/src/main.go"); got != PathLayerRemotePersistent {
 		t.Fatalf("source classification = %s, want remote persistent", got)
@@ -9414,17 +9416,17 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
-	var gitOut gofuse.EntryOut
+	var libOut gofuse.EntryOut
 	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
 		InHeader: gofuse.InHeader{NodeId: repoIno},
 		Mode:     0o755,
-	}, ".git", &gitOut); st != gofuse.OK {
-		t.Fatalf("Mkdir .git: %v", st)
+	}, "node_modules", &libOut); st != gofuse.OK {
+		t.Fatalf("Mkdir node_modules: %v", st)
 	}
 
 	var createOut gofuse.CreateOut
 	if st := fs.Create(nil, &gofuse.CreateIn{
-		InHeader: gofuse.InHeader{NodeId: gitOut.NodeId},
+		InHeader: gofuse.InHeader{NodeId: libOut.NodeId},
 		Flags:    uint32(syscall.O_RDWR),
 		Mode:     0o644,
 	}, "config", &createOut); st != gofuse.OK {
@@ -9448,7 +9450,7 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 	}
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
 
-	localPath := localRoot + "/overlay/repo/.git/config"
+	localPath := localRoot + "/overlay/repo/node_modules/config"
 	gotFile, err := os.ReadFile(localPath)
 	if err != nil {
 		t.Fatalf("ReadFile local overlay: %v", err)
@@ -9458,7 +9460,7 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 	}
 
 	var lookupOut gofuse.EntryOut
-	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: gitOut.NodeId}, "config", &lookupOut); st != gofuse.OK {
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: libOut.NodeId}, "config", &lookupOut); st != gofuse.OK {
 		t.Fatalf("Lookup config: %v", st)
 	}
 	var openOut gofuse.OpenOut
@@ -9537,14 +9539,14 @@ func TestFsyncDirLocalOverlaySyncsDirectory(t *testing.T) {
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
 
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
-	var gitOut gofuse.EntryOut
+	var libOut gofuse.EntryOut
 	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
 		InHeader: gofuse.InHeader{NodeId: repoIno},
 		Mode:     0o755,
-	}, ".git", &gitOut); st != gofuse.OK {
-		t.Fatalf("Mkdir .git: %v", st)
+	}, "node_modules", &libOut); st != gofuse.OK {
+		t.Fatalf("Mkdir node_modules: %v", st)
 	}
-	fh := fs.dirHandles.Allocate(&DirHandle{Ino: gitOut.NodeId, Path: "/repo/.git"})
+	fh := fs.dirHandles.Allocate(&DirHandle{Ino: libOut.NodeId, Path: "/repo/node_modules"})
 
 	if st := fs.FsyncDir(nil, &gofuse.FsyncIn{Fh: fh}); st != gofuse.OK {
 		t.Fatalf("FsyncDir local overlay status = %v, want OK", st)
@@ -9833,7 +9835,14 @@ func TestCodingAgentLocalOverlayFlushSkipsSyncForGeneratedPath(t *testing.T) {
 	}
 }
 
+// TestCodingAgentLocalOverlayFlushSyncsGitState verifies that a writable
+// local-only `.git` state file is fsynced on Flush (unlike generated output,
+// see TestCodingAgentLocalOverlayFlushSkipsSyncForGeneratedPath). `.git` is
+// local-only inside a loaded Git workspace.
 func TestCodingAgentLocalOverlayFlushSyncsGitState(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
 	var syncCalls atomic.Int32
 	previousSync := syncOpenLocalFile
 	syncOpenLocalFile = func(file *os.File) error {
@@ -9844,29 +9853,39 @@ func TestCodingAgentLocalOverlayFlushSyncsGitState(t *testing.T) {
 		syncOpenLocalFile = previousSync
 	})
 
-	opts := &MountOptions{
-		Profile:   MountProfileCodingAgent,
-		LocalRoot: t.TempDir(),
-	}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	src := createGitRepoWithReadme(t, []byte("hello base\n"))
+	fixture := newGitWorkspaceFixture(t)
+	fixture.repoURL = src
+	fixture.headCommit = fuseGitOutputForTest(t, src, "rev-parse", "HEAD")
+	fixture.readmeObjectSHA = fuseGitOutputForTest(t, src, "hash-object", "README.md")
+	fixture.readmeSize = int64(len("hello base\n"))
 
+	localRoot := t.TempDir()
+	runFuseTestGit(t, "", "clone", "--no-checkout", src, filepath.Join(localRoot, "overlay", "repo"))
+
+	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+
+	if got := fs.observePathPolicy("/repo/.git/config"); got != PathLayerLocalOnly {
+		t.Fatalf(".git/config policy = %s, want local-only", got)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 	var gitOut gofuse.EntryOut
-	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
-		InHeader: gofuse.InHeader{NodeId: repoIno},
-		Mode:     0o755,
-	}, ".git", &gitOut); st != gofuse.OK {
-		t.Fatalf("Mkdir .git: %v", st)
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, ".git", &gitOut); st != gofuse.OK {
+		t.Fatalf("Lookup .git: %v", st)
 	}
 
 	var createOut gofuse.CreateOut
 	if st := fs.Create(nil, &gofuse.CreateIn{
 		InHeader: gofuse.InHeader{NodeId: gitOut.NodeId},
-		Flags:    uint32(syscall.O_RDWR),
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
 		Mode:     0o644,
-	}, "config", &createOut); st != gofuse.OK {
-		t.Fatalf("Create config: %v", st)
+	}, "config.local", &createOut); st != gofuse.OK {
+		t.Fatalf("Create .git/config.local: %v", st)
 	}
 	t.Cleanup(func() {
 		fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
@@ -9879,17 +9898,17 @@ func TestCodingAgentLocalOverlayFlushSyncsGitState(t *testing.T) {
 		Size:     uint32(len(content)),
 	}, content)
 	if st != gofuse.OK {
-		t.Fatalf("Write config: %v", st)
+		t.Fatalf("Write .git/config.local: %v", st)
 	}
 	if written != uint32(len(content)) {
 		t.Fatalf("Write bytes = %d, want %d", written, len(content))
 	}
 
 	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
-		t.Fatalf("Flush .git config status = %v, want OK", st)
+		t.Fatalf("Flush .git state status = %v, want OK", st)
 	}
 	if got := syncCalls.Load(); got != 1 {
-		t.Fatalf("Flush sync calls = %d, want 1", got)
+		t.Fatalf("Flush .git state sync calls = %d, want 1", got)
 	}
 }
 
@@ -9902,11 +9921,11 @@ func TestCodingAgentLocalOverlayCrossLayerRenameReturnsEXDEV(t *testing.T) {
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
 
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
-	gitIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
-	fs.inodes.Lookup("/repo/.git/config.lock", false, 4, time.Now())
+	libIno := fs.inodes.Lookup("/repo/node_modules", true, 0, time.Now())
+	fs.inodes.Lookup("/repo/node_modules/config.lock", false, 4, time.Now())
 
 	st := fs.Rename(nil, &gofuse.RenameIn{
-		InHeader: gofuse.InHeader{NodeId: gitIno},
+		InHeader: gofuse.InHeader{NodeId: libIno},
 		Newdir:   repoIno,
 	}, "config.lock", "config")
 	if st != gofuse.Status(syscall.EXDEV) {
@@ -9917,10 +9936,10 @@ func TestCodingAgentLocalOverlayCrossLayerRenameReturnsEXDEV(t *testing.T) {
 // TestRenameDirectoryMovesLocalOverlaySubtree verifies that renaming a
 // remote-classified directory also moves local-only descendants held in the
 // local overlay. Regression test for issue #934: the coding-agent profile
-// routes "**/dist/**" (and similar) to the local overlay, so a remote staging
-// directory can contain a local-only tree; a remote-only rename orphaned those
-// files at the stale path and the extracted package silently lost ~99% of its
-// files while rename(2) returned success.
+// routes "**/node_modules/**" (and similar) to the local overlay, so a remote
+// staging directory can contain a local-only tree; a remote-only rename
+// orphaned those files at the stale path and the extracted package silently
+// lost ~99% of its files while rename(2) returned success.
 func TestRenameDirectoryMovesLocalOverlaySubtree(t *testing.T) {
 	var renameCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -10000,11 +10019,11 @@ func TestCodingAgentLocalOverlayReadDirMergesRemoteAndLocalEntries(t *testing.T)
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
 
-	if err := os.MkdirAll(localRoot+"/overlay/repo/.git", 0o755); err != nil {
-		t.Fatalf("MkdirAll local .git: %v", err)
+	if err := os.MkdirAll(localRoot+"/overlay/repo/node_modules", 0o755); err != nil {
+		t.Fatalf("MkdirAll local node_modules: %v", err)
 	}
 	remote := []DirEntry{
-		{Name: ".git", Ino: 99, Mode: uint32(syscall.S_IFREG) | 0o644},
+		{Name: "node_modules", Ino: 99, Mode: uint32(syscall.S_IFREG) | 0o644},
 		{Name: "README.md", Ino: 100, Mode: uint32(syscall.S_IFREG) | 0o644},
 	}
 	entries, err := fs.mergeLocalDirEntries(context.Background(), "/repo", remote)
@@ -10015,11 +10034,15 @@ func TestCodingAgentLocalOverlayReadDirMergesRemoteAndLocalEntries(t *testing.T)
 	if len(entries) != 2 {
 		t.Fatalf("entry count = %d, want 2: %#v", len(entries), entries)
 	}
-	if entries[0].Name != ".git" || !entries[0].IsDir {
-		t.Fatalf("first entry = %#v, want local .git directory override", entries[0])
+	byName := make(map[string]DirEntry, len(entries))
+	for _, entry := range entries {
+		byName[entry.Name] = entry
 	}
-	if entries[1].Name != "README.md" {
-		t.Fatalf("second entry = %#v, want README.md", entries[1])
+	if entry, ok := byName["node_modules"]; !ok || !entry.IsDir {
+		t.Fatalf("node_modules entry = %#v (present=%t), want local directory override", entry, ok)
+	}
+	if _, ok := byName["README.md"]; !ok {
+		t.Fatalf("README.md missing from merged entries: %#v", entries)
 	}
 }
 

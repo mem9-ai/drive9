@@ -204,24 +204,24 @@ func TestMatcherExcludeOverridesInclude(t *testing.T) {
 	}
 }
 
-func TestCodingAgentDefaultPatternsDropOnlyDependencyAndVCSState(t *testing.T) {
-	patterns := []string{"**/.git/**", "**/.hg/**", "**/.svn/**", "**/node_modules/**"}
+func TestCodingAgentDefaultPatternsDropDependencyAndBuildOutput(t *testing.T) {
+	patterns := []string{"**/node_modules/**", "**/target/**"}
 	m := NewMatcher(nil, patterns, nil)
 	drop := []string{
-		".git/HEAD", "proj/.git/config", "node_modules/react/index.js",
-		"proj/.hg/store/data", "proj/.svn/pristine/aa",
+		"node_modules/react/index.js", "proj/node_modules/pkg/x.js",
+		"proj/target/debug/app", "crates/foo/target/build/out.o",
 	}
 	for _, p := range drop {
 		if m.Match(p) {
 			t.Fatalf("coding-agent pattern should drop %q", p)
 		}
 	}
-	// Build and cache output stays remote-persistent; only `target/` gets a
-	// conditional overlay, decided by the FUSE Git layer.
+	// VCS metadata and other build/cache output are not default patterns.
 	keep := []string{
 		"proj/src/main.go", "README.md", "proj/go.mod", "proj/.gitignore",
+		".git/HEAD", "proj/.hg/store/data", "proj/.svn/pristine/aa",
 		"proj/dist/bundle.js", "proj/build/output.o", "proj/.venv/bin/python",
-		"proj/target/debug/app", "proj/.cache/state.json",
+		"proj/.cache/state.json",
 	}
 	for _, p := range keep {
 		if !m.Match(p) {

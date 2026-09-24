@@ -610,14 +610,13 @@ async function buildMatcher(client: Client, opts: ArchiveOptions): Promise<Match
   return m;
 }
 
-// Mirrors the Go CLI's coding-agent default skip set: only VCS metadata and
-// dependency trees. A Rust `target/` directory is overlaid by the mount layer
-// when the repository ignores it in place, which a bulk archive cannot observe.
+// Mirrors the Go CLI's coding-agent default skip set: dependency and
+// build-output trees. The Go mount layer additionally requires these paths to
+// be ignored by the repository (local-only-gitignore-aware); a bulk archive
+// has no such oracle and applies the patterns directly.
 export const codingAgentLocalOnly = [
-  "**/.git/**",
-  "**/.hg/**",
-  "**/.svn/**",
   "**/node_modules/**",
+  "**/target/**",
 ];
 
 export { match, hasInclude };

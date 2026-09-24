@@ -25,7 +25,15 @@ type profileConfig struct {
 	AppendLogPatterns  []string
 	PackPaths          []string
 	ExtentPatterns     []string
+	// LocalOnlyGitignoreAware gates whether a local-only pattern overlays a
+	// path unconditionally (false) or only when the repository's Git ignore
+	// rules also ignore it (true). nil means unset, which defaults to true.
+	LocalOnlyGitignoreAware *bool
 }
+
+// localOnlyGitignoreAwareKey is the profile setting name, also the suffix of
+// the --local-only-gitignore-aware CLI flag.
+const localOnlyGitignoreAwareKey = "local-only-gitignore-aware"
 
 func Profile(args []string) error {
 	if len(args) == 0 {
@@ -207,15 +215,15 @@ func mergeProfileValues(groups ...[]string) []string {
 // builtinCodingAgentLocalOnlyPatterns is the shared local-only overlay policy
 // for the coding-agent, coding-agent-extent, and portable profiles.
 //
-// Only VCS metadata and dependency trees are overlaid unconditionally. Other
-// build/cache output stays remote-persistent; Rust `target/` output is
-// overlaid by the FUSE layer when the repository ignores it in place.
+// By default the gitignore-aware gate (see the profile-level
+// local-only-gitignore-aware setting) requires each matched path to also be
+// ignored by the repository. Other build/cache output stays remote-persistent;
+// VCS metadata is absent because `.git` is kept local only inside a Git
+// workspace and is remote-persistent elsewhere.
 func builtinCodingAgentLocalOnlyPatterns() []string {
 	return []string{
-		"**/.git/**",
-		"**/.hg/**",
-		"**/.svn/**",
 		"**/node_modules/**",
+		"**/target/**",
 	}
 }
 
@@ -234,6 +242,19 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 			default:
 				return profileConfig{}, fmt.Errorf("profile %q line %d: unknown section [%s]", name, lineNo+1, section)
 			}
+			continue
+		}
+		// Top-of-file settings: `key = value`. Only known keys are accepted;
+		// anything else is treated as a pattern for the current section.
+		if key, value, ok := splitProfileSetting(line); ok && key == localOnlyGitignoreAwareKey {
+			if section != "local" {
+				return profileConfig{}, fmt.Errorf("profile %q line %d: %s must appear before the first section", name, lineNo+1, localOnlyGitignoreAwareKey)
+			}
+			parsed, err := parseProfileBool(value)
+			if err != nil {
+				return profileConfig{}, fmt.Errorf("profile %q line %d: %s: %w", name, lineNo+1, localOnlyGitignoreAwareKey, err)
+			}
+			cfg.LocalOnlyGitignoreAware = &parsed
 			continue
 		}
 		switch section {
@@ -258,12 +279,45 @@ func formatProfileConfig(cfg profileConfig) string {
 	if cfg.Source != "" {
 		fmt.Fprintf(&b, "# source: %s\n", cfg.Source)
 	}
+	// Emit the setting only when explicitly set so builtins round-trip and the
+	// default (true) is not restated for every profile.
+	if cfg.LocalOnlyGitignoreAware != nil {
+		fmt.Fprintf(&b, "%s = %t\n", localOnlyGitignoreAwareKey, *cfg.LocalOnlyGitignoreAware)
+	}
 	writeProfileSection(&b, "local", cfg.LocalOnlyPatterns, "no local-only overlay paths")
 	writeProfileSection(&b, "remote", cfg.RemoteOnlyPatterns, "no remote override paths")
 	writeProfileSection(&b, "pack", cfg.PackPaths, "no automatic pack paths")
 	writeProfileSection(&b, "append-log", cfg.AppendLogPatterns, "no append-log optimization paths")
 	writeProfileSection(&b, "extent", cfg.ExtentPatterns, "no extent path patterns")
 	return b.String()
+}
+
+// splitProfileSetting splits a `key = value` line. It reports ok only when the
+// line has the exact shape (a non-empty key and a non-empty value around a
+// single '='), so that a path pattern containing '=' is left to the pattern
+// sections.
+func splitProfileSetting(line string) (key, value string, ok bool) {
+	eq := strings.IndexByte(line, '=')
+	if eq < 0 {
+		return "", "", false
+	}
+	key = strings.ToLower(strings.TrimSpace(line[:eq]))
+	value = strings.TrimSpace(line[eq+1:])
+	if key == "" || value == "" {
+		return "", "", false
+	}
+	return key, value, true
+}
+
+func parseProfileBool(value string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "1", "yes", "on":
+		return true, nil
+	case "false", "0", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid boolean %q", value)
+	}
 }
 
 func writeProfileSection(b *strings.Builder, name string, values []string, emptyComment string) {

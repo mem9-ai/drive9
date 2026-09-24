@@ -52,6 +52,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		LocalRoot:                    opts.LocalRoot,
 		LocalOnlyPatterns:            opts.LocalOnlyPatterns,
 		RemoteOnlyPatterns:           opts.RemoteOnlyPatterns,
+		DisableGitignoreAwareOverlay: !opts.LocalOnlyGitignoreAware,
 		AppendLogPatterns:            opts.AppendLogPatterns,
 		PackPaths:                    opts.PackPaths,
 		ExtentPaths:                  opts.ExtentPaths,

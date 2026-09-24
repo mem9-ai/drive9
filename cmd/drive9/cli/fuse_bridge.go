@@ -61,6 +61,7 @@ type mountFuseOptions struct {
 	LocalRoot                    string
 	LocalOnlyPatterns            []string
 	RemoteOnlyPatterns           []string
+	LocalOnlyGitignoreAware      bool
 	AppendLogPatterns            []string
 	PackPaths                    []string
 	ExtentPaths                  []string

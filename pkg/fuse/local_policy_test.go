@@ -6,18 +6,25 @@ import (
 )
 
 func TestLocalPolicyCodingAgentDefaultsMatchGitSegmentExactly(t *testing.T) {
-	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
+	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil, true)
 
 	tests := []struct {
 		path string
 		want PathLayer
 	}{
-		{path: "/repo/.git", want: PathLayerLocalOnly},
-		{path: "/repo/.git/config", want: PathLayerLocalOnly},
-		{path: "/repo/src/.git/objects/ab/cd", want: PathLayerLocalOnly},
+		{path: "/repo/node_modules", want: PathLayerLocalOnly},
+		{path: "/repo/node_modules/react/index.js", want: PathLayerLocalOnly},
+		{path: "/repo/target/debug/app", want: PathLayerLocalOnly},
+		{path: "/repo/node_modules_extra/x.js", want: PathLayerRemotePersistent},
 		{path: "/repo/.gitignore", want: PathLayerRemotePersistent},
 		{path: "/repo/.gitattributes", want: PathLayerRemotePersistent},
 		{path: "/repo/notes.git.txt", want: PathLayerRemotePersistent},
+		// VCS metadata is no longer a default local-only pattern; `.git` is
+		// kept local only inside a Git workspace (handled at the fs layer).
+		{path: "/repo/.git", want: PathLayerRemotePersistent},
+		{path: "/repo/.git/config", want: PathLayerRemotePersistent},
+		{path: "/repo/.hg/store/data", want: PathLayerRemotePersistent},
+		{path: "/repo/.svn/pristine/aa", want: PathLayerRemotePersistent},
 	}
 
 	for _, test := range tests {
@@ -32,6 +39,7 @@ func TestLocalPolicyRemoteOnlyOverridesLocalOnly(t *testing.T) {
 		MountProfileCodingAgent,
 		[]string{"**/node_modules/**"},
 		[]string{"**/node_modules/keep/**"},
+		true,
 	)
 
 	if got := policy.Classify("/repo/node_modules/pkg/index.js"); got != PathLayerLocalOnly {
@@ -43,7 +51,7 @@ func TestLocalPolicyRemoteOnlyOverridesLocalOnly(t *testing.T) {
 }
 
 func TestLocalPolicyRemoteOnlyOverridesBuiltinTmpRule(t *testing.T) {
-	policy := NewLocalPolicy(MountProfileCodingAgent, nil, []string{"**/tmp/**"})
+	policy := NewLocalPolicy(MountProfileCodingAgent, nil, []string{"**/tmp/**"}, true)
 
 	if got := policy.Classify("/repo/tmp/object.blob"); got != PathLayerRemotePersistent {
 		t.Fatalf("tmp object policy = %s, want remote persistent", got)
@@ -54,7 +62,7 @@ func TestLocalPolicyRemoteOnlyOverridesBuiltinTmpRule(t *testing.T) {
 }
 
 func TestLocalPolicyDisabledForExtentProfile(t *testing.T) {
-	policy := NewLocalPolicy(MountProfileExtent, nil, nil)
+	policy := NewLocalPolicy(MountProfileExtent, nil, nil, true)
 	if policy.Enabled() {
 		t.Fatal("extent profile must not enable coding-agent local overlay")
 	}
@@ -64,7 +72,7 @@ func TestLocalPolicyDisabledForExtentProfile(t *testing.T) {
 }
 
 func TestLocalPolicyDisabledForOrdinaryMount(t *testing.T) {
-	policy := NewLocalPolicy("", nil, nil)
+	policy := NewLocalPolicy("", nil, nil, true)
 	if policy.Enabled() {
 		t.Fatal("ordinary mount policy should be disabled")
 	}
@@ -74,7 +82,7 @@ func TestLocalPolicyDisabledForOrdinaryMount(t *testing.T) {
 }
 
 func TestLocalPolicyMatchesNestedSubpath(t *testing.T) {
-	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
+	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil, true)
 	if got := policy.Classify("/repo/a/b/node_modules/c/util.js"); got != PathLayerLocalOnly {
 		t.Fatalf("nested node_modules = %s, want local-only", got)
 	}
@@ -83,13 +91,12 @@ func TestLocalPolicyMatchesNestedSubpath(t *testing.T) {
 	}
 }
 
-func TestLocalPolicyDefaultsDependencyAndVCSStateToLocalOnly(t *testing.T) {
-	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
+func TestLocalPolicyDefaultsDependencyAndTargetToLocalOnly(t *testing.T) {
+	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil, true)
 
 	for _, path := range []string{
 		"/repo/node_modules/pkg/index.js",
-		"/repo/.hg/store/data",
-		"/repo/.svn/pristine/aa",
+		"/repo/target/debug/app",
 	} {
 		if got := policy.Classify(path); got != PathLayerLocalOnly {
 			t.Errorf("Classify(%q) = %s, want local-only default", path, got)
@@ -97,12 +104,13 @@ func TestLocalPolicyDefaultsDependencyAndVCSStateToLocalOnly(t *testing.T) {
 	}
 }
 
-func TestLocalPolicyDefaultsLeaveBuildAndCacheOutputRemote(t *testing.T) {
-	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
+func TestLocalPolicyDefaultsLeaveOtherBuildOutputRemote(t *testing.T) {
+	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil, true)
 
-	// Only `target/` is conditionally overlaid (via the Git ignore check), and
-	// even then only when the repository ignores it in place. Everything else
-	// here must stay remote-persistent by default.
+	// The default pattern list is intentionally short: only node_modules and
+	// target are matched (and target only overlays when the gitignore-aware
+	// gate confirms it, which Classify does not apply). Everything else stays
+	// remote-persistent by default.
 	for _, path := range []string{
 		"/repo/.pnpm-store/v3/files/pkg",
 		"/repo/dist/app.js",
@@ -113,7 +121,6 @@ func TestLocalPolicyDefaultsLeaveBuildAndCacheOutputRemote(t *testing.T) {
 		"/repo/packages/node-sdk/.tmp-api-extractor/dts/index.d.ts",
 		"/repo/.cache/tool/state.json",
 		"/repo/.turbo/cache/state.json",
-		"/repo/target/debug/app",
 		"/repo/web/.next/cache/webpack.bin",
 		"/repo/docs/.vitepress/cache/deps/package.json",
 		"/repo/.pytest_cache/v/cache/nodeids",
@@ -154,16 +161,16 @@ func TestValidateLocalPolicyPatternsRejectsUnsafeNormalization(t *testing.T) {
 }
 
 func TestLocalPolicyInvalidRuntimePathDoesNotMatchLocalOnly(t *testing.T) {
-	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
-	if got := policy.Classify(`repo\\.git\\config`); got != PathLayerRemotePersistent {
+	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil, true)
+	if got := policy.Classify(`repo\\node_modules\\pkg\\index.js`); got != PathLayerRemotePersistent {
 		t.Fatalf("invalid backslash runtime path = %s, want remote persistent", got)
 	}
 }
 
 func TestLocalPolicyRuntimePathWhitespaceIsNotTrimmedIntoMatch(t *testing.T) {
-	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
-	if got := policy.Classify("/repo/.git "); got != PathLayerRemotePersistent {
-		t.Fatalf("runtime path with spaced .git segment = %s, want remote persistent", got)
+	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil, true)
+	if got := policy.Classify("/repo/node_modules "); got != PathLayerRemotePersistent {
+		t.Fatalf("runtime path with spaced node_modules segment = %s, want remote persistent", got)
 	}
 }
 
@@ -193,7 +200,7 @@ func TestAppendLogPolicyUsesCanonicalPathfilterSemantics(t *testing.T) {
 }
 
 func TestAppendLogPolicyDoesNotChangeLocalPolicyClassification(t *testing.T) {
-	local := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
+	local := NewLocalPolicy(MountProfileCodingAgent, nil, nil, true)
 	appendLog := NewAppendLogMatcher([]string{"**/node_modules/**"})
 	if !appendLog.Matches("/repo/node_modules/wal") {
 		t.Fatal("append-log matcher should recognize configured path")

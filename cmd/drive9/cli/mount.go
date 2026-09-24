@@ -205,6 +205,7 @@ wbSyncWindow := fs.String("writeback-sync-window", "1s", "write-back close stagi
 	var unpackArchives stringListFlag
 	noAutoUnpack := fs.Bool("no-auto-unpack", false, "disable automatic profile pack restore before mounting")
 	fs.Var(&localOnlyPatterns, "local-only", "route matching paths to the local-only overlay; adds to profile rules; repeatable; env $DRIVE9_MOUNT_LOCAL_ONLY_PATTERNS uses one pattern per line")
+	localOnlyGitignoreAware := fs.Bool("local-only-gitignore-aware", true, "overlay a local-only path only when the repository's Git ignore rules also ignore it; set false to overlay matched paths unconditionally")
 	fs.Var(&remoteOnlyPatterns, "remote-only", "force matching paths to remote-persistent storage; overrides local-only routing; repeatable; env $DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS uses one pattern per line")
 	fs.Var(&appendLogPatterns, "append-log", "use append-log sync optimization for matching remote-persistent files; repeatable; env $DRIVE9_MOUNT_APPEND_LOG_PATTERNS uses one pattern per line")
 	fs.Var(&extentPatterns, "extent", "create matching files with content_layout=extent (JuiceFS data plane); repeatable; env $DRIVE9_MOUNT_EXTENT_PATTERNS uses one pattern per line")
@@ -529,6 +530,14 @@ wbSyncWindow := fs.String("writeback-sync-window", "1s", "write-back close stagi
 	effectiveLocalOnlyPatterns := mergeProfileValues(profileCfg.LocalOnlyPatterns, envLocalOnlyPatterns, localOnlyPatterns)
 	effectiveRemoteOnlyPatterns := mergeProfileValues(profileCfg.RemoteOnlyPatterns, envRemoteOnlyPatterns, remoteOnlyPatterns)
 	effectivePackPaths := mergeProfileValues(profileCfg.PackPaths)
+	// gitignore-aware local-only gate: flag wins, then profile, then default true.
+	effectiveGitignoreAware := true
+	if profileCfg.LocalOnlyGitignoreAware != nil {
+		effectiveGitignoreAware = *profileCfg.LocalOnlyGitignoreAware
+	}
+	if flagProvided(fs, "local-only-gitignore-aware") {
+		effectiveGitignoreAware = *localOnlyGitignoreAware
+	}
 	normalizedLocalRoot := strings.TrimSpace(*localRoot)
 	syncModeVal, writePolicyVal, err := parseFuseDurability(*durability)
 	if err != nil {
@@ -678,6 +687,7 @@ wbSyncWindow := fs.String("writeback-sync-window", "1s", "write-back close stagi
 			LocalRoot:                    normalizedLocalRoot,
 			LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 			RemoteOnlyPatterns:           append([]string(nil), effectiveRemoteOnlyPatterns...),
+			LocalOnlyGitignoreAware:      effectiveGitignoreAware,
 			AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),
 			PackPaths:                    append([]string(nil), effectivePackPaths...),
 			ExtentPaths:                  append([]string(nil), effectiveExtentPatterns...),
@@ -811,6 +821,7 @@ wbSyncWindow := fs.String("writeback-sync-window", "1s", "write-back close stagi
 			LocalRoot:                    normalizedLocalRoot,
 			LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 			RemoteOnlyPatterns:           append([]string(nil), effectiveRemoteOnlyPatterns...),
+			LocalOnlyGitignoreAware:      effectiveGitignoreAware,
 			AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),
 			PackPaths:                    append([]string(nil), effectivePackPaths...),
 			ExtentPaths:                  append([]string(nil), effectiveExtentPatterns...),
@@ -857,6 +868,7 @@ wbSyncWindow := fs.String("writeback-sync-window", "1s", "write-back close stagi
 		LocalRoot:                    normalizedLocalRoot,
 		LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 		RemoteOnlyPatterns:           append([]string(nil), effectiveRemoteOnlyPatterns...),
+		LocalOnlyGitignoreAware:      effectiveGitignoreAware,
 		AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),
 		PackPaths:                    append([]string(nil), effectivePackPaths...),
 		ExtentPaths:                  append([]string(nil), effectiveExtentPatterns...),

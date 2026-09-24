@@ -33,9 +33,13 @@ const (
 )
 
 type LocalPolicy struct {
-	enabled    bool
-	localOnly  []pathfilter.Pattern
-	remoteOnly []pathfilter.Pattern
+	enabled bool
+	// gitignoreAware requires a path matched by a local-only pattern to also be
+	// ignored by its repository's Git ignore rules before it is overlaid. It
+	// defaults to true; see MountOptions.LocalOnlyGitignoreAware.
+	gitignoreAware bool
+	localOnly      []pathfilter.Pattern
+	remoteOnly     []pathfilter.Pattern
 }
 
 // AppendLogMatcher recognizes operator-declared append-log paths without
@@ -64,8 +68,8 @@ func (matcher *AppendLogMatcher) Matches(localPath string) bool {
 	return false
 }
 
-func NewLocalPolicy(profile string, localOnlyPatterns []string, remoteOnlyPatterns []string) *LocalPolicy {
-	policy := &LocalPolicy{}
+func NewLocalPolicy(profile string, localOnlyPatterns []string, remoteOnlyPatterns []string, gitignoreAware bool) *LocalPolicy {
+	policy := &LocalPolicy{gitignoreAware: gitignoreAware}
 	if !profileAllowsLocalPolicy(profile) && len(localOnlyPatterns) == 0 && len(remoteOnlyPatterns) == 0 {
 		return policy
 	}
@@ -112,22 +116,26 @@ func defaultCodingAgentLocalOnlyPatterns(profile string) []string {
 	if profile != MountProfileCodingAgent {
 		return nil
 	}
+	// Only dependency and heavy build-output trees are listed. By default the
+	// gitignore-aware gate (see LocalPolicy.gitignoreAware) further requires
+	// each of these paths to be ignored by the repository, so a directory that
+	// merely shares a name with generated output is not overlaid. VCS metadata
+	// is deliberately absent: `.git` state is kept local only inside a Git
+	// workspace, and is remote-persistent elsewhere.
 	return []string{
-		// VCS metadata: the git workspace layer keeps `.git` state in the
-		// local overlay and must never upload object databases.
-		"**/.git/**",
-		"**/.hg/**",
-		"**/.svn/**",
-		// Dependency trees: the one generated directory whose file count is
-		// routinely large enough to overwhelm remote storage. Other build and
-		// cache output is left remote-persistent; a Rust `target/` directory is
-		// additionally overlaid when the repository ignores it in place.
 		"**/node_modules/**",
+		"**/target/**",
 	}
 }
 
 func (policy *LocalPolicy) Enabled() bool {
 	return policy != nil && policy.enabled
+}
+
+// GitignoreAware reports whether local-only pattern matches require
+// confirmation from the repository's Git ignore rules before being overlaid.
+func (policy *LocalPolicy) GitignoreAware() bool {
+	return policy != nil && policy.enabled && policy.gitignoreAware
 }
 
 func (policy *LocalPolicy) Classify(localPath string) PathLayer {
@@ -173,7 +181,16 @@ func (fs *Dat9FS) observePathPolicyWithHint(ctx context.Context, localPath strin
 		return PathLayerRemotePersistent
 	}
 	layer, source := fs.localPolicy.classifyWithSource(localPath)
-	if layer == PathLayerRemotePersistent && source == policyMatchRemoteDefault && fs.gitIgnoredTargetDirLocalOnly(ctx, localPath, dirHint) {
+	if layer == PathLayerLocalOnly && source == policyMatchLocalOnly && fs.localPolicy.GitignoreAware() {
+		// A local-only pattern is honored only when the repository also ignores
+		// the path. When no Git ignore oracle is available (no loaded
+		// workspace) the pattern stands on its own.
+		if confirmed, verified := fs.gitIgnoreConfirmsLocalOnly(ctx, localPath, dirHint); verified && !confirmed {
+			layer = PathLayerRemotePersistent
+			source = policyMatchRemoteDefault
+		}
+	}
+	if layer == PathLayerRemotePersistent && source == policyMatchRemoteDefault && fs.gitWorkspaceGitDirLocalOnly(ctx, localPath) {
 		layer = PathLayerLocalOnly
 		source = policyMatchLocalOnly
 	}
@@ -189,9 +206,10 @@ func canonicalRuntimePolicyPath(value string) (string, error) {
 
 func canonicalPolicyPath(value string) (string, error) {
 	// NOTE: deliberately do NOT TrimSpace here. Runtime paths keep their
-	// surrounding whitespace so that a path like "/repo/.git " does NOT match
-	// the **/.git/** pattern (whitespace is significant at the runtime boundary).
-	// Pattern-side canonicalization trims; runtime-side canonicalization does not.
+	// surrounding whitespace so that a path like "/repo/node_modules " does NOT
+	// match the **/node_modules/** pattern (whitespace is significant at the
+	// runtime boundary). Pattern-side canonicalization trims; runtime-side
+	// canonicalization does not.
 	cleaned, err := pathutil.Canonicalize(value)
 	if err != nil {
 		return "", err

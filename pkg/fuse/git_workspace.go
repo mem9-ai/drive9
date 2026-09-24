@@ -1275,27 +1275,24 @@ func (fs *Dat9FS) gitWorkspaceOwnsPath(ctx context.Context, localPath string) bo
 	return rt.hasImpliedDir(rel)
 }
 
-// targetDirName is the Rust/Cargo build output directory. It is the only
-// generated directory (besides dependency trees) whose file count is routinely
-// large enough to justify a local-only overlay, and its name is common enough
-// that it must be confirmed against the repository's own ignore rules.
-const targetDirName = "target"
-
-// gitIgnoredTargetDirLocalOnly reports whether localPath is a directory named
-// "target" — or lives under one — that a .gitignore in the same directory
-// declares ignored.
+// gitIgnoreConfirmsLocalOnly reports whether the repository ignores localPath,
+// and whether the repository could be consulted at all.
 //
-// Earlier revisions routed every repository-ignored path to the local overlay.
-// That overlaid arbitrary repo-specific generated trees, so it was narrowed to
-// one high-signal case: Cargo build output. Requiring a same-directory
-// .gitignore rule keeps an unrelated source directory that merely happens to be
-// called "target" out of the overlay.
-func (fs *Dat9FS) gitIgnoredTargetDirLocalOnly(ctx context.Context, localPath string, dirHint bool) bool {
+// It backs the gitignore-aware gate for local-only pattern matches (see
+// LocalPolicy.gitignoreAware): a path selected by a [local] or --local-only
+// pattern is overlaid only when this confirms the repository ignores it.
+// verified is false when there is no loaded Git workspace to consult (for
+// example a plain coding-agent mount of a remote tree, or a repository the
+// agent never cloned with --fast). The caller keeps the pattern's overlay in
+// that case: the gate exists to drop paths the repository keeps, not to
+// disable the overlay wherever a Git ignore oracle is unavailable.
+//
+// The check runs cached `git check-ignore` against the hidden hydrated clean
+// tree and the local `.git` state. Paths that are tracked/clean or carry a
+// durable Git workspace overlay entry are never treated as ignored output.
+func (fs *Dat9FS) gitIgnoreConfirmsLocalOnly(ctx context.Context, localPath string, dirHint bool) (confirmed bool, verified bool) {
 	if fs == nil || fs.opts == nil || fs.git == nil || fs.localOverlay == nil {
-		return false
-	}
-	if !profileAllowsLocalPolicy(fs.opts.Profile) {
-		return false
+		return false, false
 	}
 	if !dirHint {
 		if info, err := fs.localOverlay.Lstat(localPath); err == nil && info.IsDir() {
@@ -1304,49 +1301,47 @@ func (fs *Dat9FS) gitIgnoredTargetDirLocalOnly(ctx context.Context, localPath st
 	}
 	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok || rt == nil || rel == "" || rel == "." {
-		return false
+		return false, false
 	}
 	if rel == ".git" || strings.HasPrefix(rel, ".git/") {
-		return false
+		return false, true
 	}
 	if _, ok := rt.overlayEntry(rel); ok {
-		return false
+		return false, true
 	}
 	if localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt); localTree {
 		if _, ok := rt.localHeadNode(rel); ok {
-			return false
+			return false, true
 		}
 		if rt.hasLocalHeadImpliedDir(rel) {
-			return false
+			return false, true
 		}
 	}
 	if _, ok := rt.cleanNode(rel); ok {
-		return false
+		return false, true
 	}
 	if rt.hasImpliedDir(rel) {
-		return false
+		return false, true
 	}
 
-	targetRel, isTargetItself, ok := targetDirAncestor(rel)
-	if !ok {
-		return false
-	}
-	// A regular file named "target" is not build output. A directory is either
-	// confirmed by the caller (dirHint) or by the local overlay above; a bare
-	// "target" with neither is treated as non-directory.
-	if isTargetItself && !dirHint {
-		return false
+	// An ignored directory ignores its whole subtree, so a path under an
+	// already-confirmed ignored directory is confirmed without another
+	// `git check-ignore` subprocess. Directory classifications populate these
+	// entries, which keeps a large ignored tree (node_modules) from spawning
+	// one process per file.
+	if fs.gitIgnoredAncestorCached(rt, rel) {
+		return true, true
 	}
 
-	key := gitTargetIgnoreCacheKey(rt, targetRel)
+	key := gitIgnoreCacheKey(rt, rel, dirHint)
 	fs.git.mu.Lock()
 	if ignored, ok := fs.git.ignoreCache[key]; ok {
 		fs.git.mu.Unlock()
-		return ignored
+		return ignored, true
 	}
 	fs.git.mu.Unlock()
 
-	ignored, cacheable := fs.gitCheckTargetDirIgnored(ctx, rt, targetRel)
+	ignored, cacheable := fs.gitCheckIgnoredPath(ctx, rt, rel, dirHint)
 	if cacheable {
 		fs.git.mu.Lock()
 		if fs.git.ignoreCache == nil {
@@ -1355,31 +1350,61 @@ func (fs *Dat9FS) gitIgnoredTargetDirLocalOnly(ctx context.Context, localPath st
 		fs.git.ignoreCache[key] = ignored
 		fs.git.mu.Unlock()
 	}
-	return ignored
+	return ignored, true
 }
 
-// targetDirAncestor returns the nearest "/target" ancestor of rel (which may be
-// rel itself), whether rel is exactly that directory, and whether one exists.
-func targetDirAncestor(rel string) (targetRel string, isTargetItself bool, ok bool) {
+// gitIgnoredAncestorCached reports whether a strict ancestor directory of rel
+// is cached as ignored. rel's own path is not consulted; the caller handles it
+// via the ignore cache.
+func (fs *Dat9FS) gitIgnoredAncestorCached(rt *gitWorkspaceRuntime, rel string) bool {
 	rel = strings.Trim(rel, "/")
-	if rel == "" {
-		return "", false, false
+	if rel == "" || fs == nil || fs.git == nil {
+		return false
 	}
 	parts := strings.Split(rel, "/")
-	for i, part := range parts {
-		if part != targetDirName {
-			continue
-		}
-		return strings.Join(parts[:i+1], "/"), i == len(parts)-1, true
+	depth := len(parts) - 1
+	if depth <= 0 {
+		return false
 	}
-	return "", false, false
+	fs.git.mu.Lock()
+	defer fs.git.mu.Unlock()
+	for i := 1; i <= depth; i++ {
+		ancestor := strings.Join(parts[:i], "/")
+		if ignored, ok := fs.git.ignoreCache[gitIgnoreCacheKey(rt, ancestor, true)]; ok && ignored {
+			return true
+		}
+	}
+	return false
 }
 
-func gitTargetIgnoreCacheKey(rt *gitWorkspaceRuntime, targetRel string) string {
-	return rt.workspace.WorkspaceID + ":" + rt.workspace.HeadCommit + ":" + targetRel
+// gitWorkspaceGitDirLocalOnly reports whether localPath is the working `.git`
+// of a loaded Git workspace, or lives inside it. That state is always local:
+// the workspace serves its working `.git` from the local overlay and never
+// uploads object databases. This is independent of the profile pattern list
+// and the gitignore-aware gate, so `.git` in an ordinary (non-workspace)
+// repository stays remote-persistent.
+func (fs *Dat9FS) gitWorkspaceGitDirLocalOnly(ctx context.Context, localPath string) bool {
+	if fs == nil || fs.opts == nil || !profileAllowsLocalPolicy(fs.opts.Profile) {
+		return false
+	}
+	if fs.git == nil || fs.localOverlay == nil {
+		return false
+	}
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
+	if !ok || rt == nil {
+		return false
+	}
+	return rel == ".git" || strings.HasPrefix(rel, ".git/")
 }
 
-func (fs *Dat9FS) gitCheckTargetDirIgnored(ctx context.Context, rt *gitWorkspaceRuntime, targetRel string) (bool, bool) {
+func gitIgnoreCacheKey(rt *gitWorkspaceRuntime, rel string, dirHint bool) string {
+	if dirHint {
+		rel += "/"
+	}
+	return rt.workspace.WorkspaceID + ":" + rt.workspace.HeadCommit + ":" + rel
+}
+
+func (fs *Dat9FS) gitCheckIgnoredPath(ctx context.Context, rt *gitWorkspaceRuntime, rel string, dirHint bool) (bool, bool) {
 	if strings.TrimSpace(fs.opts.LocalRoot) == "" {
 		return false, false
 	}
@@ -1399,102 +1424,28 @@ func (fs *Dat9FS) gitCheckTargetDirIgnored(ctx context.Context, rt *gitWorkspace
 	if err != nil {
 		return false, false
 	}
-	return runGitCheckIgnoreTargetDir(ctx, gitDir, treeRoot, targetRel)
-}
-
-// runGitCheckIgnoreTargetDir reports whether the .gitignore sitting in
-// targetRel's own directory ignores targetRel. It asks Git for the matching
-// rule with `check-ignore -v` (so global excludes and parent-directory rules
-// are visible and can be rejected) and accepts only a rule whose source file
-// lives in targetRel's directory and whose pattern names exactly "target".
-func runGitCheckIgnoreTargetDir(ctx context.Context, gitDir, workTree, targetRel string) (bool, bool) {
-	targetRel = strings.Trim(targetRel, "/")
-	if targetRel == "" {
-		return false, false
+	ignored, cacheable := runGitCheckIgnore(ctx, gitDir, treeRoot, rel)
+	if ignored || !cacheable || !dirHint {
+		return ignored, cacheable
 	}
-	parent := path.Dir(targetRel)
-	if parent == "." {
-		parent = ""
-	}
-	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "--work-tree", workTree, "check-ignore", "-v", "--", targetRel+"/")
-	cmd.Dir = workTree
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	err := cmd.Run()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			return false, true
-		}
-		return false, false
-	}
-	for _, line := range strings.Split(stdout.String(), "\n") {
-		source, pattern, parsed := parseCheckIgnoreVerbose(line)
-		if !parsed {
-			continue
-		}
-		if !checkIgnoreSourceInDir(source, workTree, parent) {
-			continue
-		}
-		if !checkIgnorePatternIsTarget(pattern) {
-			continue
-		}
-		return true, true
+	if !strings.HasSuffix(rel, "/") {
+		return runGitCheckIgnore(ctx, gitDir, treeRoot, rel+"/")
 	}
 	return false, true
 }
 
-// parseCheckIgnoreVerbose splits one `git check-ignore -v` line of the form
-// "<source>:<lineno>:<pattern>\t<pathname>".
-func parseCheckIgnoreVerbose(line string) (source, pattern string, ok bool) {
-	tab := strings.IndexByte(line, '\t')
-	if tab < 0 {
-		return "", "", false
+func runGitCheckIgnore(ctx context.Context, gitDir, workTree, rel string) (bool, bool) {
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "--work-tree", workTree, "check-ignore", "-q", "--", rel)
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	err := cmd.Run()
+	if err == nil {
+		return true, true
 	}
-	meta := line[:tab]
-	first := strings.IndexByte(meta, ':')
-	if first < 0 {
-		return "", "", false
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, true
 	}
-	rest := meta[first+1:]
-	second := strings.IndexByte(rest, ':')
-	if second < 0 {
-		return "", "", false
-	}
-	return meta[:first], rest[second+1:], true
-}
-
-// checkIgnoreSourceInDir reports whether an ignore-rule source file (as printed
-// by `git check-ignore -v`, relative to workTree because the command runs with
-// that working directory) sits directly in dir.
-func checkIgnoreSourceInDir(source, workTree, dir string) bool {
-	source = filepath.ToSlash(strings.TrimSpace(source))
-	if source == "" {
-		return false
-	}
-	if filepath.IsAbs(source) || strings.HasPrefix(source, "/") {
-		rel, err := filepath.Rel(workTree, filepath.FromSlash(source))
-		if err != nil || strings.HasPrefix(rel, "..") {
-			return false
-		}
-		source = filepath.ToSlash(rel)
-	}
-	source = strings.TrimPrefix(source, "./")
-	sourceDir := path.Dir(source)
-	if sourceDir == "." {
-		sourceDir = ""
-	}
-	return sourceDir == dir
-}
-
-func checkIgnorePatternIsTarget(pattern string) bool {
-	pattern = strings.TrimSpace(pattern)
-	pattern = strings.TrimSuffix(pattern, "/")
-	if pattern == "" {
-		return false
-	}
-	return path.Base(pattern) == targetDirName
+	return false, false
 }
 
 func (rt *gitWorkspaceRuntime) overlayEntry(rel string) (client.GitOverlayEntry, bool) {

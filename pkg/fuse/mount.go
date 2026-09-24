@@ -59,6 +59,7 @@ type MountOptions struct {
 	LocalRoot                    string        // local-only overlay root for overlay-profile mounts
 	LocalOnlyPatterns            []string      // additional local-only path patterns for overlay-profile mounts
 	RemoteOnlyPatterns           []string      // remote-persistent override path patterns for overlay-profile mounts
+	DisableGitignoreAwareOverlay bool          // when false (the default) a local-only pattern overlays a path only if the repository also ignores it; set true to overlay matched paths unconditionally
 	AppendLogPatterns            []string      // remote-persistent files eligible for append-log synchronization
 	PackPaths                    []string      // local overlay paths auto-packed after unmount
 	ExtentPaths                  []string      // path globs created as content_layout=extent

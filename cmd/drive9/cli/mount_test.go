@@ -2686,6 +2686,85 @@ func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
 	if !reflect.DeepEqual(got.RemoteOnlyPatterns, []string{"**/node_modules/keep/**"}) {
 		t.Fatalf("RemoteOnlyPatterns = %v", got.RemoteOnlyPatterns)
 	}
+	if !got.LocalOnlyGitignoreAware {
+		t.Fatal("gitignore-aware should default to true")
+	}
+}
+
+func TestMountCmdLocalOnlyGitignoreAwareFlagAndProfile(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	t.Run("flag disables the gate", func(t *testing.T) {
+		var got *mountFuseOptions
+		mountFuse = func(opts *mountFuseOptions) error {
+			copied := *opts
+			got = &copied
+			return nil
+		}
+		if err := MountCmd([]string{
+			"--foreground", "--mode", "fuse",
+			"--server", "https://drive9.example", "--api-key", "sk-test",
+			"--profile", "coding-agent",
+			"--local-root", t.TempDir(),
+			"--local-only-gitignore-aware=false",
+			t.TempDir(),
+		}); err != nil {
+			t.Fatalf("MountCmd: %v", err)
+		}
+		if got == nil {
+			t.Fatal("mountFuse was not called")
+		}
+		if got.LocalOnlyGitignoreAware {
+			t.Fatal("--local-only-gitignore-aware=false should disable the gate")
+		}
+	})
+
+	t.Run("profile setting applies, flag overrides", func(t *testing.T) {
+		writeTestProfile(t, "ungated", "local-only-gitignore-aware = false\n[local]\n**/scratch/**\n")
+		var got *mountFuseOptions
+		mountFuse = func(opts *mountFuseOptions) error {
+			copied := *opts
+			got = &copied
+			return nil
+		}
+		if err := MountCmd([]string{
+			"--foreground", "--mode", "fuse",
+			"--server", "https://drive9.example", "--api-key", "sk-test",
+			"--profile", "ungated",
+			"--local-root", t.TempDir(),
+			t.TempDir(),
+		}); err != nil {
+			t.Fatalf("MountCmd: %v", err)
+		}
+		if got == nil || got.LocalOnlyGitignoreAware {
+			t.Fatalf("profile setting should disable the gate, got %+v", got)
+		}
+	})
+
+	t.Run("flag enables the gate over an ungated profile", func(t *testing.T) {
+		writeTestProfile(t, "ungated2", "local-only-gitignore-aware = false\n[local]\n**/scratch/**\n")
+		var got *mountFuseOptions
+		mountFuse = func(opts *mountFuseOptions) error {
+			copied := *opts
+			got = &copied
+			return nil
+		}
+		if err := MountCmd([]string{
+			"--foreground", "--mode", "fuse",
+			"--server", "https://drive9.example", "--api-key", "sk-test",
+			"--profile", "ungated2",
+			"--local-root", t.TempDir(),
+			"--local-only-gitignore-aware=true",
+			t.TempDir(),
+		}); err != nil {
+			t.Fatalf("MountCmd: %v", err)
+		}
+		if got == nil || !got.LocalOnlyGitignoreAware {
+			t.Fatalf("flag should re-enable the gate, got %+v", got)
+		}
+	})
 }
 
 func TestMountCmdCodingAgentProfileMergesPolicyEnvironment(t *testing.T) {

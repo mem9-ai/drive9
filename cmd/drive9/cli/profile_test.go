@@ -123,6 +123,56 @@ func TestLoadProfileConfigExtentIsNonePlusAllFilesExtent(t *testing.T) {
 	}
 }
 
+func TestBuiltinCodingAgentDefaultsOmitVCSMetadata(t *testing.T) {
+	for _, pattern := range builtinCodingAgentLocalOnlyPatterns() {
+		if strings.Contains(pattern, ".git") || strings.Contains(pattern, ".hg") || strings.Contains(pattern, ".svn") {
+			t.Fatalf("default local-only pattern %q should not reference VCS metadata", pattern)
+		}
+	}
+}
+
+func TestProfileLocalOnlyGitignoreAwareRoundTrip(t *testing.T) {
+	writeTestProfile(t, "no-gate", "local-only-gitignore-aware = false\n[local]\n**/scratch/**\n")
+	cfg, err := loadProfileConfig("no-gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LocalOnlyGitignoreAware == nil || *cfg.LocalOnlyGitignoreAware {
+		t.Fatalf("LocalOnlyGitignoreAware = %v, want explicit false", cfg.LocalOnlyGitignoreAware)
+	}
+	out := formatProfileConfig(cfg)
+	if !strings.Contains(out, "local-only-gitignore-aware = false") {
+		t.Fatalf("formatted profile missing setting: %q", out)
+	}
+	roundTrip, err := parseProfileConfig(cfg.Name, cfg.Source, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(roundTrip, cfg) {
+		t.Fatalf("round trip = %#v, want %#v", roundTrip, cfg)
+	}
+}
+
+func TestBuiltinProfilesLeaveGitignoreAwareUnset(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, name := range []string{"", "coding-agent", "portable", "coding-agent-extent"} {
+		cfg, err := loadProfileConfig(name)
+		if err != nil {
+			t.Fatalf("loadProfileConfig(%q): %v", name, err)
+		}
+		if cfg.LocalOnlyGitignoreAware != nil {
+			t.Fatalf("builtin %q should leave gitignore-aware unset for the default, got %v", name, *cfg.LocalOnlyGitignoreAware)
+		}
+	}
+}
+
+func TestProfileLocalOnlyGitignoreAwareRejectsUnknownValue(t *testing.T) {
+	writeTestProfile(t, "bad", "local-only-gitignore-aware = maybe\n[local]\n**/scratch/**\n")
+	if _, err := loadProfileConfig("bad"); err == nil {
+		t.Fatal("invalid boolean should fail profile parsing")
+	}
+}
+
 func TestProfileAllowsOverlayExtentLikeNone(t *testing.T) {
 	if profileAllowsOverlay("extent") {
 		t.Fatal("extent must not require --local-root (same as none)")

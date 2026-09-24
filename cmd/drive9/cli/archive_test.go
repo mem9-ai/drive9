@@ -251,6 +251,7 @@ func TestArchiveProfileCodingAgentSkipsDefaults(t *testing.T) {
 		"/proj/main.go":                 "package main\n",
 		"/proj/dist/bundle.js":          "bundle\n",
 		"/proj/node_modules/react/x.js": "x\n",
+		"/proj/target/debug/app":        "bin\n",
 		"/proj/.git/HEAD":               "ref: refs/heads/main\n",
 		"/proj/.cache/foo":              "cached\n",
 	})
@@ -265,16 +266,17 @@ func TestArchiveProfileCodingAgentSkipsDefaults(t *testing.T) {
 		t.Fatalf("Archive: %v", err)
 	}
 	got := tarEntries(t, out)
-	// The coding-agent default skip set is only VCS metadata and dependency
-	// trees; build/cache output such as dist/ and .cache/ stays included.
+	// Archive applies the profile [local] patterns as plain excludes (without
+	// the FUSE gitignore-aware gate), so the default dependency/build patterns
+	// are skipped. `.git` is not a default pattern, so it is included.
 	for _, name := range got {
-		for _, bad := range []string{"node_modules", ".git/"} {
+		for _, bad := range []string{"node_modules", "target/"} {
 			if strings.Contains(name, bad) {
 				t.Fatalf("coding-agent profile should skip %q but found %q", bad, name)
 			}
 		}
 	}
-	for _, want := range []string{"proj/main.go", "proj/dist/bundle.js", "proj/.cache/foo"} {
+	for _, want := range []string{"proj/main.go", "proj/dist/bundle.js", "proj/.cache/foo", "proj/.git/HEAD"} {
 		if !contains(got, want) {
 			t.Fatalf("coding-agent profile should keep %q: %v", want, got)
 		}
