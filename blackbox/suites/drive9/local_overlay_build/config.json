@@ -25,7 +25,9 @@
           "make build"
         ],
         "local_only_patterns": [
-          "**/bin/**"
+          "**/bin/**",
+          "**/.cache/**",
+          "**/tmp/**"
         ],
         "probe_paths": [
           ".git/drive9-blackbox-local-overlay-probe",

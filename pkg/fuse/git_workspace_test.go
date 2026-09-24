@@ -2954,7 +2954,7 @@ func TestGitWorkspaceTrackedLocalOnlyPathBypassesLocalOverlay(t *testing.T) {
 	}
 }
 
-func TestGitWorkspaceGeneratedTmpApiExtractorUsesLocalOverlay(t *testing.T) {
+func TestGitWorkspaceDependencyDirUsesLocalOverlay(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	fixture.treeNodes = []client.GitTreeNode{
 		{
@@ -3006,8 +3006,8 @@ func TestGitWorkspaceGeneratedTmpApiExtractorUsesLocalOverlay(t *testing.T) {
 	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
 		InHeader: gofuse.InHeader{NodeId: nodeSDKIno},
 		Mode:     0o755,
-	}, ".tmp-api-extractor", &dirOut); st != gofuse.OK {
-		t.Fatalf("Mkdir .tmp-api-extractor status = %v, want OK", st)
+	}, "node_modules", &dirOut); st != gofuse.OK {
+		t.Fatalf("Mkdir node_modules status = %v, want OK", st)
 	}
 
 	var fileOut gofuse.CreateOut
@@ -3035,12 +3035,12 @@ func TestGitWorkspaceGeneratedTmpApiExtractorUsesLocalOverlay(t *testing.T) {
 	}
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: fileOut.Fh})
 
-	got, err := os.ReadFile(filepath.Join(localRoot, "overlay/repo/packages/node-sdk/.tmp-api-extractor/index.d.ts"))
+	got, err := os.ReadFile(filepath.Join(localRoot, "overlay/repo/packages/node-sdk/node_modules/index.d.ts"))
 	if err != nil {
-		t.Fatalf("read local generated dts: %v", err)
+		t.Fatalf("read local dependency file: %v", err)
 	}
 	if string(got) != string(content) {
-		t.Fatalf("local generated dts = %q, want %q", got, content)
+		t.Fatalf("local dependency file = %q, want %q", got, content)
 	}
 
 	entries, err := fs.listDir(context.Background(), "/repo/packages/node-sdk")
@@ -3051,8 +3051,8 @@ func TestGitWorkspaceGeneratedTmpApiExtractorUsesLocalOverlay(t *testing.T) {
 	for _, entry := range entries {
 		names[entry.Name] = struct{}{}
 	}
-	if _, ok := names[".tmp-api-extractor"]; !ok {
-		t.Fatalf("listDir missing local .tmp-api-extractor entry: %#v", entries)
+	if _, ok := names["node_modules"]; !ok {
+		t.Fatalf("listDir missing local node_modules entry: %#v", entries)
 	}
 	if _, ok := names["src"]; !ok {
 		t.Fatalf("listDir missing tracked src entry: %#v", entries)
@@ -3141,91 +3141,31 @@ func TestGitStateCheckpointSkipsTransientLockFiles(t *testing.T) {
 	}
 }
 
-func TestGitWorkspaceGitIgnoredGeneratedPathsUseLocalOverlay(t *testing.T) {
+// newTargetIgnoreFixture builds a git workspace fixture whose hydrated clean
+// tree carries the given .gitignore files (keyed by tree-relative path), backed
+// by a real archived .git directory so `git check-ignore` can run.
+func newTargetIgnoreFixture(t *testing.T, ignores map[string]string, treeNodes []client.GitTreeNode) (*gitWorkspaceFixture, string) {
+	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found")
 	}
 	fixture := newGitWorkspaceFixture(t)
-	fixture.treeNodes = []client.GitTreeNode{
-		{
-			WorkspaceID: "ws1",
-			CommitSHA:   fixtureHeadCommit,
-			Path:        ".gitignore",
-			ParentPath:  "",
-			Name:        ".gitignore",
-			Kind:        "file",
-			Mode:        "100644",
-			ObjectSHA:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			SizeBytes:   96,
-		},
-		{
-			WorkspaceID: "ws1",
-			CommitSHA:   fixtureHeadCommit,
-			Path:        "src",
-			ParentPath:  "",
-			Name:        "src",
-			Kind:        "dir",
-			Mode:        "040000",
-			ObjectSHA:   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		},
-		{
-			WorkspaceID: "ws1",
-			CommitSHA:   fixtureHeadCommit,
-			Path:        "src/kimi_cli",
-			ParentPath:  "src",
-			Name:        "kimi_cli",
-			Kind:        "dir",
-			Mode:        "040000",
-			ObjectSHA:   "cccccccccccccccccccccccccccccccccccccccc",
-		},
-		{
-			WorkspaceID: "ws1",
-			CommitSHA:   fixtureHeadCommit,
-			Path:        "src/kimi_cli/vis",
-			ParentPath:  "src/kimi_cli",
-			Name:        "vis",
-			Kind:        "dir",
-			Mode:        "040000",
-			ObjectSHA:   "dddddddddddddddddddddddddddddddddddddddd",
-		},
-		{
-			WorkspaceID: "ws1",
-			CommitSHA:   fixtureHeadCommit,
-			Path:        "src/kimi_cli/web",
-			ParentPath:  "src/kimi_cli",
-			Name:        "web",
-			Kind:        "dir",
-			Mode:        "040000",
-			ObjectSHA:   "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-		},
-		{
-			WorkspaceID: "ws1",
-			CommitSHA:   fixtureHeadCommit,
-			Path:        "src/kimi_cli/web/static",
-			ParentPath:  "src/kimi_cli/web",
-			Name:        "static",
-			Kind:        "dir",
-			Mode:        "040000",
-			ObjectSHA:   "ffffffffffffffffffffffffffffffffffffffff",
-		},
-	}
+	fixture.treeNodes = treeNodes
 
-	ignoreFile := strings.Join([]string{
-		"src/kimi_cli/deps/bin",
-		"src/kimi_cli/deps/tmp",
-		"src/kimi_cli/_build_info.py",
-		"src/kimi_cli/web/static/assets/",
-		"src/kimi_cli/vis/static/",
-		"",
-	}, "\n")
 	repo := t.TempDir()
 	runFuseTestGit(t, "", "init", "-b", "main", repo)
 	runFuseTestGit(t, repo, "config", "user.email", "drive9-test@example.invalid")
 	runFuseTestGit(t, repo, "config", "user.name", "Drive9 Test")
-	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte(ignoreFile), 0o644); err != nil {
-		t.Fatalf("write .gitignore: %v", err)
+	for rel, body := range ignores {
+		path := filepath.Join(repo, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir for %s: %v", rel, err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
 	}
-	runFuseTestGit(t, repo, "add", ".gitignore")
+	runFuseTestGit(t, repo, "add", "-A")
 	runFuseTestGit(t, repo, "commit", "-m", "ignore generated outputs")
 	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
 	if err != nil {
@@ -3238,15 +3178,86 @@ func TestGitWorkspaceGitIgnoredGeneratedPathsUseLocalOverlay(t *testing.T) {
 	if err := os.MkdirAll(treeRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(treeRoot, ".gitignore"), []byte(ignoreFile), 0o644); err != nil {
-		t.Fatalf("write hydrated .gitignore: %v", err)
+	for rel, body := range ignores {
+		path := filepath.Join(treeRoot, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write hydrated %s: %v", rel, err)
+		}
 	}
+	return fixture, localRoot
+}
+
+// TestGitWorkspaceIgnoredTargetDirUsesLocalOverlay covers the narrowed rule:
+// a directory named `target` that its own directory's .gitignore ignores is
+// overlaid locally, while other repository-ignored paths stay remote.
+func TestGitWorkspaceIgnoredTargetDirUsesLocalOverlay(t *testing.T) {
+	treeNodes := []client.GitTreeNode{
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        ".gitignore",
+			Name:        ".gitignore",
+			Kind:        "file",
+			Mode:        "100644",
+			ObjectSHA:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			SizeBytes:   96,
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "src",
+			Name:        "src",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "src/app.py",
+			ParentPath:  "src",
+			Name:        "app.py",
+			Kind:        "file",
+			Mode:        "100644",
+			ObjectSHA:   "cccccccccccccccccccccccccccccccccccccccc",
+			SizeBytes:   12,
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "crates",
+			Name:        "crates",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "dddddddddddddddddddddddddddddddddddddddd",
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "crates/foo",
+			ParentPath:  "crates",
+			Name:        "foo",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+		},
+	}
+
+	fixture, localRoot := newTargetIgnoreFixture(t, map[string]string{
+		// Root ignore: an anchored Cargo target plus an unrelated generated
+		// tree that must NOT be overlaid.
+		".gitignore":            "/target/\nignored-output/\n",
+		"crates/foo/.gitignore": "target/\n",
+		"crates/.gitignore":     "generated/\n",
+	}, treeNodes)
 
 	opts := &MountOptions{
 		LocalRoot:           localRoot,
 		Profile:             MountProfileCodingAgent,
 		EnableGitWorkspaces: true,
-		PerfCounters:        true,
 	}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
@@ -3254,67 +3265,151 @@ func TestGitWorkspaceGitIgnoredGeneratedPathsUseLocalOverlay(t *testing.T) {
 		t.Fatalf("ensureGitWorkspaces: %v", err)
 	}
 
-	if got := fs.observePathPolicy("/repo/src/kimi_cli/_build_info.py"); got != PathLayerLocalOnly {
-		t.Fatalf("_build_info.py policy = %s, want local-only", got)
+	// Cargo output inside an ignored target tree is local-only without a
+	// directory hint.
+	for _, path := range []string{
+		"/repo/target/debug/app",
+		"/repo/crates/foo/target/debug/build/out.o",
+	} {
+		if got := fs.observePathPolicy(path); got != PathLayerLocalOnly {
+			t.Errorf("Classify(%q) = %s, want local-only", path, got)
+		}
 	}
-	if got := fs.observePathPolicy("/repo/src/kimi_cli/web/static/assets/app.js"); got != PathLayerLocalOnly {
-		t.Fatalf("web assets policy = %s, want local-only", got)
-	}
-	if got := fs.observePathPolicy("/repo/src/kimi_cli/web/app.py"); got != PathLayerRemotePersistent {
-		t.Fatalf("source policy = %s, want remote persistent", got)
-	}
-
-	kimiCLIIno := fs.inodes.Lookup("/repo/src/kimi_cli", true, 0, time.Now())
-	var buildInfoOut gofuse.CreateOut
-	if st := fs.Create(nil, &gofuse.CreateIn{
-		InHeader: gofuse.InHeader{NodeId: kimiCLIIno},
-		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
-		Mode:     0o644,
-	}, "_build_info.py", &buildInfoOut); st != gofuse.OK {
-		t.Fatalf("Create _build_info.py status = %v, want OK", st)
-	}
-	content := []byte("version = 'test'\n")
-	written, st := fs.Write(nil, &gofuse.WriteIn{
-		InHeader: gofuse.InHeader{NodeId: buildInfoOut.NodeId},
-		Fh:       buildInfoOut.Fh,
-		Size:     uint32(len(content)),
-	}, content)
-	if st != gofuse.OK {
-		t.Fatalf("Write _build_info.py status = %v, want OK", st)
-	}
-	if written != uint32(len(content)) {
-		t.Fatalf("Write _build_info.py bytes = %d, want %d", written, len(content))
-	}
-	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: buildInfoOut.Fh}); st != gofuse.OK {
-		t.Fatalf("Flush _build_info.py status = %v, want OK", st)
-	}
-	fs.Release(nil, &gofuse.ReleaseIn{Fh: buildInfoOut.Fh})
-
-	visIno := fs.inodes.Lookup("/repo/src/kimi_cli/vis", true, 0, time.Now())
-	var staticOut gofuse.EntryOut
-	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
-		InHeader: gofuse.InHeader{NodeId: visIno},
-		Mode:     0o755,
-	}, "static", &staticOut); st != gofuse.OK {
-		t.Fatalf("Mkdir vis/static status = %v, want OK", st)
+	for _, dir := range []string{"/repo/target", "/repo/crates/foo/target"} {
+		if got := fs.observeDirPathPolicyWithContext(context.Background(), dir); got != PathLayerLocalOnly {
+			t.Errorf("ClassifyDir(%q) = %s, want local-only", dir, got)
+		}
 	}
 
-	if _, err := os.Stat(filepath.Join(localRoot, "overlay/repo/src/kimi_cli/vis/static")); err != nil {
-		t.Fatalf("local ignored directory missing: %v", err)
+	// Repository-ignored paths that are not a well-marked `target` directory
+	// stay remote-persistent.
+	for _, path := range []string{
+		"/repo/ignored-output/data.bin",
+		"/repo/crates/generated/blob",
+		"/repo/src/app.py",
+	} {
+		if got := fs.observePathPolicy(path); got != PathLayerRemotePersistent {
+			t.Errorf("Classify(%q) = %s, want remote persistent", path, got)
+		}
 	}
-	got, err := os.ReadFile(filepath.Join(localRoot, "overlay/repo/src/kimi_cli/_build_info.py"))
-	if err != nil {
-		t.Fatalf("read local ignored file: %v", err)
+}
+
+// TestGitWorkspaceTargetDirRequiresSameDirIgnore guards the false-positive
+// cases: an unrelated `target` directory (not ignored, or ignored only by an
+// unanchored ancestor rule) must not be overlaid, nor must a plain file named
+// `target`.
+func TestGitWorkspaceTargetDirRequiresSameDirIgnore(t *testing.T) {
+	treeNodes := []client.GitTreeNode{
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "src",
+			Name:        "src",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "data",
+			Name:        "data",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "cccccccccccccccccccccccccccccccccccccccc",
+		},
 	}
-	if string(got) != string(content) {
-		t.Fatalf("local ignored file = %q, want %q", got, content)
+
+	// `target/` at the root is ignored; `src/target` has no same-directory
+	// rule of its own, so the root rule must not leak into it.
+	fixture, localRoot := newTargetIgnoreFixture(t, map[string]string{
+		".gitignore": "target/\n",
+	}, treeNodes)
+
+	opts := &MountOptions{
+		LocalRoot:           localRoot,
+		Profile:             MountProfileCodingAgent,
+		EnableGitWorkspaces: true,
 	}
-	fixture.mu.Lock()
-	_, overlayFile := fixture.overlay["src/kimi_cli/_build_info.py"]
-	_, overlayDir := fixture.overlay["src/kimi_cli/vis/static"]
-	fixture.mu.Unlock()
-	if overlayFile || overlayDir {
-		t.Fatalf("ignored generated path entered git overlay: file=%t dir=%t", overlayFile, overlayDir)
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+
+	if got := fs.observePathPolicy("/repo/target/debug/app"); got != PathLayerLocalOnly {
+		t.Errorf("root target/debug/app = %s, want local-only", got)
+	}
+	if got := fs.observePathPolicy("/repo/src/target/debug/app"); got != PathLayerRemotePersistent {
+		t.Errorf("nested src/target/debug/app = %s, want remote persistent", got)
+	}
+	if got := fs.observeDirPathPolicyWithContext(context.Background(), "/repo/src/target"); got != PathLayerRemotePersistent {
+		t.Errorf("nested src/target dir = %s, want remote persistent", got)
+	}
+}
+
+func TestTargetDirAncestor(t *testing.T) {
+	tests := []struct {
+		rel        string
+		wantRel    string
+		wantSelf   bool
+		wantExists bool
+	}{
+		{rel: "target", wantRel: "target", wantSelf: true, wantExists: true},
+		{rel: "target/debug/app", wantRel: "target", wantExists: true},
+		{rel: "crates/foo/target", wantRel: "crates/foo/target", wantSelf: true, wantExists: true},
+		{rel: "crates/foo/target/x", wantRel: "crates/foo/target", wantExists: true},
+		{rel: "crates/target-a/x", wantExists: false},
+		{rel: "src/main.rs", wantExists: false},
+		{rel: "", wantExists: false},
+	}
+	for _, test := range tests {
+		gotRel, gotSelf, gotExists := targetDirAncestor(test.rel)
+		if gotRel != test.wantRel || gotSelf != test.wantSelf || gotExists != test.wantExists {
+			t.Errorf("targetDirAncestor(%q) = (%q,%t,%t), want (%q,%t,%t)",
+				test.rel, gotRel, gotSelf, gotExists, test.wantRel, test.wantSelf, test.wantExists)
+		}
+	}
+}
+
+func TestParseCheckIgnoreVerboseAndPatterns(t *testing.T) {
+	source, pattern, ok := parseCheckIgnoreVerbose(".gitignore:2:target/\ttarget/")
+	if !ok || source != ".gitignore" || pattern != "target/" {
+		t.Fatalf("parseCheckIgnoreVerbose = (%q,%q,%t)", source, pattern, ok)
+	}
+	if _, _, ok := parseCheckIgnoreVerbose("no-tabs-here"); ok {
+		t.Fatal("line without a tab should not parse")
+	}
+
+	for pattern, want := range map[string]bool{
+		"target/":    true,
+		"/target/":   true,
+		"target":     true,
+		"**/target/": true,
+		"targets/":   false,
+		"mytarget/":  false,
+		"":           false,
+	} {
+		if got := checkIgnorePatternIsTarget(pattern); got != want {
+			t.Errorf("checkIgnorePatternIsTarget(%q) = %t, want %t", pattern, got, want)
+		}
+	}
+
+	workTree := "/work/tree"
+	if !checkIgnoreSourceInDir(".gitignore", workTree, "") {
+		t.Error("root .gitignore should be in the root dir")
+	}
+	if !checkIgnoreSourceInDir("crates/foo/.gitignore", workTree, "crates/foo") {
+		t.Error("nested .gitignore should be in its own dir")
+	}
+	if checkIgnoreSourceInDir("crates/.gitignore", workTree, "crates/foo") {
+		t.Error("ancestor .gitignore must not count as same-dir")
+	}
+	if !checkIgnoreSourceInDir("/work/tree/crates/foo/.gitignore", workTree, "crates/foo") {
+		t.Error("absolute source inside work tree should map to its dir")
+	}
+	if checkIgnoreSourceInDir("/elsewhere/.gitignore", workTree, "crates/foo") {
+		t.Error("absolute source outside the work tree must be rejected")
 	}
 }
 

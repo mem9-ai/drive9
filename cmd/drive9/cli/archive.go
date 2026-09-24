@@ -24,7 +24,7 @@ import (
 // read awkwardly in a bulk-download context). --profile loads a profile's
 // [local] rules as excludes and [remote] rules as include-overrides, so a
 // single `--profile coding-agent` reproduces the same skip set that mount
-// applies to node_modules/.git/dist/etc.
+// applies to node_modules and VCS state.
 
 // splitArchiveArgs separates positional args from flag tokens so users can
 // place flags before OR after the positional source/output. A token starting

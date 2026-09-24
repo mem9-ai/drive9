@@ -73,7 +73,7 @@ Directories are never extent objects. Patterns are matched against the **basenam
 
 | Profile | Contents | Use |
 |---|---|---|
-| `coding-agent` (default) | local-only overlay patterns (`.git`, `node_modules`, `dist`, caches, …) + `[append-log] **/*-wal` | agent workspaces on a normal drive9 tree |
+| `coding-agent` (default) | local-only overlay patterns (VCS metadata and `node_modules`; plus a same-directory-ignored Rust `target/`) + `[append-log] **/*-wal` | agent workspaces on a normal drive9 tree |
 | `coding-agent-extent` | `coding-agent` **plus** `[extent] *` | the SQLite/product gate: every file on the mount is `extent` |
 | `extent` | `[extent] *` only | a pure extent volume, no overlay rules |
 | `portable` | local-only patterns + `[pack] /` | pack/unpack archives |

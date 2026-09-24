@@ -265,15 +265,19 @@ func TestArchiveProfileCodingAgentSkipsDefaults(t *testing.T) {
 		t.Fatalf("Archive: %v", err)
 	}
 	got := tarEntries(t, out)
+	// The coding-agent default skip set is only VCS metadata and dependency
+	// trees; build/cache output such as dist/ and .cache/ stays included.
 	for _, name := range got {
-		for _, bad := range []string{"node_modules", "/dist/", ".git/", ".cache/"} {
+		for _, bad := range []string{"node_modules", ".git/"} {
 			if strings.Contains(name, bad) {
 				t.Fatalf("coding-agent profile should skip %q but found %q", bad, name)
 			}
 		}
 	}
-	if !contains(got, "proj/main.go") {
-		t.Fatalf("main.go missing: %v", got)
+	for _, want := range []string{"proj/main.go", "proj/dist/bundle.js", "proj/.cache/foo"} {
+		if !contains(got, want) {
+			t.Fatalf("coding-agent profile should keep %q: %v", want, got)
+		}
 	}
 }
 

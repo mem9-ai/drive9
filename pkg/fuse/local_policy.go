@@ -113,28 +113,16 @@ func defaultCodingAgentLocalOnlyPatterns(profile string) []string {
 		return nil
 	}
 	return []string{
+		// VCS metadata: the git workspace layer keeps `.git` state in the
+		// local overlay and must never upload object databases.
 		"**/.git/**",
 		"**/.hg/**",
 		"**/.svn/**",
+		// Dependency trees: the one generated directory whose file count is
+		// routinely large enough to overwhelm remote storage. Other build and
+		// cache output is left remote-persistent; a Rust `target/` directory is
+		// additionally overlaid when the repository ignores it in place.
 		"**/node_modules/**",
-		"**/.pnpm-store/**",
-		"**/target/**",
-		"**/dist/**",
-		"**/build/**",
-		"**/coverage/**",
-		"**/tmp/**",
-		"**/.tmp/**",
-		"**/.tmp-api-extractor/**",
-		"**/.cache/**",
-		"**/.turbo/**",
-		"**/.next/cache/**",
-		"**/.vitepress/cache/**",
-		"**/.gradle/**",
-		"**/.venv/**",
-		"**/__pycache__/**",
-		"**/.pytest_cache/**",
-		"**/.mypy_cache/**",
-		"**/.ruff_cache/**",
 	}
 }
 
@@ -185,7 +173,7 @@ func (fs *Dat9FS) observePathPolicyWithHint(ctx context.Context, localPath strin
 		return PathLayerRemotePersistent
 	}
 	layer, source := fs.localPolicy.classifyWithSource(localPath)
-	if layer == PathLayerRemotePersistent && source == policyMatchRemoteDefault && fs.gitIgnoredPathLocalOnly(ctx, localPath, dirHint) {
+	if layer == PathLayerRemotePersistent && source == policyMatchRemoteDefault && fs.gitIgnoredTargetDirLocalOnly(ctx, localPath, dirHint) {
 		layer = PathLayerLocalOnly
 		source = policyMatchLocalOnly
 	}

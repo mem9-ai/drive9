@@ -148,8 +148,11 @@ describe("archive", () => {
     const stream = await client.archive("/proj", { profile: "coding-agent" });
     const names = readTarGz(await streamToBuffer(stream));
     expect(names).toContain("proj/main.go");
+    // Only VCS metadata and dependency trees are skipped by default; build
+    // output such as dist/ stays included.
+    expect(names).toContain("proj/dist/bundle.js");
     for (const n of names) {
-      expect(n.includes("node_modules") || n.includes(".git/") || n.includes("dist/")).toBe(false);
+      expect(n.includes("node_modules") || n.includes(".git/")).toBe(false);
     }
   });
 

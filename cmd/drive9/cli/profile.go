@@ -204,30 +204,18 @@ func mergeProfileValues(groups ...[]string) []string {
 	return out
 }
 
+// builtinCodingAgentLocalOnlyPatterns is the shared local-only overlay policy
+// for the coding-agent, coding-agent-extent, and portable profiles.
+//
+// Only VCS metadata and dependency trees are overlaid unconditionally. Other
+// build/cache output stays remote-persistent; Rust `target/` output is
+// overlaid by the FUSE layer when the repository ignores it in place.
 func builtinCodingAgentLocalOnlyPatterns() []string {
 	return []string{
 		"**/.git/**",
 		"**/.hg/**",
 		"**/.svn/**",
 		"**/node_modules/**",
-		"**/.pnpm-store/**",
-		"**/target/**",
-		"**/dist/**",
-		"**/build/**",
-		"**/coverage/**",
-		"**/tmp/**",
-		"**/.tmp/**",
-		"**/.tmp-api-extractor/**",
-		"**/.cache/**",
-		"**/.turbo/**",
-		"**/.next/cache/**",
-		"**/.vitepress/cache/**",
-		"**/.gradle/**",
-		"**/.venv/**",
-		"**/__pycache__/**",
-		"**/.pytest_cache/**",
-		"**/.mypy_cache/**",
-		"**/.ruff_cache/**",
 	}
 }
 

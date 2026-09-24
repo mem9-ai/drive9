@@ -204,28 +204,25 @@ func TestMatcherExcludeOverridesInclude(t *testing.T) {
 	}
 }
 
-func TestCodingAgentDefaultPatterns(t *testing.T) {
-	patterns := []string{
-		"**/.git/**", "**/.hg/**", "**/.svn/**", "**/node_modules/**",
-		"**/.pnpm-store/**", "**/target/**", "**/dist/**", "**/build/**",
-		"**/coverage/**", "**/tmp/**", "**/.tmp/**", "**/.tmp-api-extractor/**",
-		"**/.cache/**", "**/.turbo/**", "**/.next/cache/**", "**/.vitepress/cache/**",
-		"**/.gradle/**", "**/.venv/**", "**/__pycache__/**", "**/.pytest_cache/**",
-		"**/.mypy_cache/**", "**/.ruff_cache/**",
-	}
+func TestCodingAgentDefaultPatternsDropOnlyDependencyAndVCSState(t *testing.T) {
+	patterns := []string{"**/.git/**", "**/.hg/**", "**/.svn/**", "**/node_modules/**"}
 	m := NewMatcher(nil, patterns, nil)
 	drop := []string{
 		".git/HEAD", "proj/.git/config", "node_modules/react/index.js",
-		"proj/dist/bundle.js", "proj/build/output.o", "proj/.venv/bin/python",
-		"proj/__pycache__/foo.cpython-311.pyc", "proj/.next/cache/abc",
-		"proj/.pytest_cache/v/cache/lastfailed",
+		"proj/.hg/store/data", "proj/.svn/pristine/aa",
 	}
 	for _, p := range drop {
 		if m.Match(p) {
 			t.Fatalf("coding-agent pattern should drop %q", p)
 		}
 	}
-	keep := []string{"proj/src/main.go", "README.md", "proj/go.mod", "proj/.gitignore"}
+	// Build and cache output stays remote-persistent; only `target/` gets a
+	// conditional overlay, decided by the FUSE Git layer.
+	keep := []string{
+		"proj/src/main.go", "README.md", "proj/go.mod", "proj/.gitignore",
+		"proj/dist/bundle.js", "proj/build/output.o", "proj/.venv/bin/python",
+		"proj/target/debug/app", "proj/.cache/state.json",
+	}
 	for _, p := range keep {
 		if !m.Match(p) {
 			t.Fatalf("coding-agent pattern should keep %q", p)

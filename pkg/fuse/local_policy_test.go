@@ -75,19 +75,35 @@ func TestLocalPolicyDisabledForOrdinaryMount(t *testing.T) {
 
 func TestLocalPolicyMatchesNestedSubpath(t *testing.T) {
 	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
-	if got := policy.Classify("/repo/web/.next/cache/webpack.bin"); got != PathLayerLocalOnly {
-		t.Fatalf(".next/cache = %s, want local-only", got)
+	if got := policy.Classify("/repo/a/b/node_modules/c/util.js"); got != PathLayerLocalOnly {
+		t.Fatalf("nested node_modules = %s, want local-only", got)
 	}
-	if got := policy.Classify("/repo/web/.next/server/page.js"); got != PathLayerRemotePersistent {
-		t.Fatalf(".next/server = %s, want remote persistent", got)
+	if got := policy.Classify("/repo/web/node_modules_extra/util.js"); got != PathLayerRemotePersistent {
+		t.Fatalf("node_modules_extra = %s, want remote persistent", got)
 	}
 }
 
-func TestLocalPolicyDefaultsCodingAgentCacheSegmentsToLocalOnly(t *testing.T) {
+func TestLocalPolicyDefaultsDependencyAndVCSStateToLocalOnly(t *testing.T) {
 	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
 
 	for _, path := range []string{
 		"/repo/node_modules/pkg/index.js",
+		"/repo/.hg/store/data",
+		"/repo/.svn/pristine/aa",
+	} {
+		if got := policy.Classify(path); got != PathLayerLocalOnly {
+			t.Errorf("Classify(%q) = %s, want local-only default", path, got)
+		}
+	}
+}
+
+func TestLocalPolicyDefaultsLeaveBuildAndCacheOutputRemote(t *testing.T) {
+	policy := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
+
+	// Only `target/` is conditionally overlaid (via the Git ignore check), and
+	// even then only when the repository ignores it in place. Everything else
+	// here must stay remote-persistent by default.
+	for _, path := range []string{
 		"/repo/.pnpm-store/v3/files/pkg",
 		"/repo/dist/app.js",
 		"/repo/build/output.bin",
@@ -107,8 +123,8 @@ func TestLocalPolicyDefaultsCodingAgentCacheSegmentsToLocalOnly(t *testing.T) {
 		"/repo/.gradle/caches/modules-2/files-2.1",
 		"/repo/.venv/bin/python",
 	} {
-		if got := policy.Classify(path); got != PathLayerLocalOnly {
-			t.Errorf("Classify(%q) = %s, want local-only default", path, got)
+		if got := policy.Classify(path); got != PathLayerRemotePersistent {
+			t.Errorf("Classify(%q) = %s, want remote persistent default", path, got)
 		}
 	}
 }
@@ -178,11 +194,11 @@ func TestAppendLogPolicyUsesCanonicalPathfilterSemantics(t *testing.T) {
 
 func TestAppendLogPolicyDoesNotChangeLocalPolicyClassification(t *testing.T) {
 	local := NewLocalPolicy(MountProfileCodingAgent, nil, nil)
-	appendLog := NewAppendLogMatcher([]string{"**/tmp/**"})
-	if !appendLog.Matches("/repo/tmp/wal") {
+	appendLog := NewAppendLogMatcher([]string{"**/node_modules/**"})
+	if !appendLog.Matches("/repo/node_modules/wal") {
 		t.Fatal("append-log matcher should recognize configured path")
 	}
-	if got := local.Classify("/repo/tmp/wal"); got != PathLayerLocalOnly {
+	if got := local.Classify("/repo/node_modules/wal"); got != PathLayerLocalOnly {
 		t.Fatalf("local policy classification = %s, want local-only", got)
 	}
 }

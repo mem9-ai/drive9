@@ -65,7 +65,7 @@ def build_fixture(root: Path, tree_files: int = 0) -> dict[str, str]:
     write(source / "script.sh", "#!/usr/bin/env sh\nprintf 'drive9-fixture\\n'\n")
     os.chmod(source / "script.sh", 0o755)
     write(source / "binary.bin", bytes(range(32)), "wb")
-    write(source / ".gitignore", "ignored-build/\n*.tmp\nagent-bench/local-only/\n")
+    write(source / ".gitignore", "ignored-build/\n*.tmp\nagent-bench/local-only/\ntarget/\n")
     os.symlink("README.md", source / "link-to-readme")
     for idx in range(tree_files):
         write(source / "tree" / f"dir{idx // 16:02d}" / f"file{idx:04d}.txt", f"fixture tree file {idx}\n")
