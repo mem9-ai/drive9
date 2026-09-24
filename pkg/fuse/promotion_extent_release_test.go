@@ -29,7 +29,7 @@ func TestPromotionOutcomeUnknownReleaseDropsExtentHandleWithoutCommit(t *testing
 	}
 
 	fs := newPromotionTestFS(t, "http://127.0.0.1")
-	fs.extentRT = &extentRuntime{rt: &extent.Runtime{VFS: jfs}}
+	fs.extentRT.Store(&extentRuntime{rt: &extent.Runtime{VFS: jfs}})
 	fuseIno := fs.inodes.Lookup("/blocked-release.db", false, 0, time.Now())
 	fs.inodes.SetExtentIno(fuseIno, uint64(entry.Inode))
 	fh := &FileHandle{
