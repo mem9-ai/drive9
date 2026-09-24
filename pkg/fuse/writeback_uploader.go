@@ -80,8 +80,9 @@ type WriteBackUploader struct {
 	// stop+close, so a late Submit can never send on a closed channel.
 	submitMu sync.Mutex
 
-	perf      *fusePerfCounters
-	OnSuccess WriteBackSuccessFunc
+	perf            *fusePerfCounters
+	OnSuccess       WriteBackSuccessFunc
+	OnDataCommitted func(meta WriteBackMeta, committedRev int64)
 	// SnapshotStagingGens optionally captures the pendingIndex/shadowStore
 	// generations for a path so OnSuccess can do generation-guarded cleanup.
 	SnapshotStagingGens SnapshotStagingGensFunc
@@ -494,6 +495,9 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		return
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+	if u.OnDataCommitted != nil {
+		u.OnDataCommitted(*meta, committedRev)
+	}
 	chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	modeErr := u.applyMode(chmodCtx, meta)
 	chmodCancel()
@@ -605,6 +609,9 @@ func (u *WriteBackUploader) uploadSyncWithAppendSnapshot(ctx context.Context, lo
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	proof.rev = committedRev
+	if u.OnDataCommitted != nil {
+		u.OnDataCommitted(*meta, committedRev)
+	}
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
 	err = u.applyMode(chmodCtx, meta)
 	chmodCancel()

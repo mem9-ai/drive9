@@ -1,18 +1,118 @@
 package fuse
 
 import (
+	"context"
 	"errors"
 	"io"
+	"sort"
 	"syscall"
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
 
+type ftruncateWriteRange struct {
+	start, end int64
+	seq        uint64
+}
+
+func (fh *FileHandle) recordFtruncateWriteLocked(start, end int64) {
+	if end <= start || fh.DirtySeq == 0 {
+		return
+	}
+	if count := len(fh.ftruncateWrites); count != 0 {
+		last := &fh.ftruncateWrites[count-1]
+		if start >= last.end {
+			fh.ftruncateWrites = append(fh.ftruncateWrites, ftruncateWriteRange{start, end, fh.DirtySeq})
+			return
+		}
+		if start == last.start && end == last.end {
+			last.seq = fh.DirtySeq
+			return
+		}
+	}
+	next := make([]ftruncateWriteRange, 0, len(fh.ftruncateWrites)+2)
+	for _, r := range fh.ftruncateWrites {
+		if r.end <= start || r.start >= end {
+			next = append(next, r)
+			continue
+		}
+		if r.start < start {
+			next = append(next, ftruncateWriteRange{r.start, start, r.seq})
+		}
+		if r.end > end {
+			next = append(next, ftruncateWriteRange{end, r.end, r.seq})
+		}
+	}
+	next = append(next, ftruncateWriteRange{start, end, fh.DirtySeq})
+	sort.Slice(next, func(i, j int) bool { return next[i].start < next[j].start })
+	fh.ftruncateWrites = next
+}
+
+func (fh *FileHandle) discardFtruncateWritesFromSeqLocked(seq uint64) {
+	kept := fh.ftruncateWrites[:0]
+	for _, r := range fh.ftruncateWrites {
+		if r.seq < seq {
+			kept = append(kept, r)
+		}
+	}
+	fh.ftruncateWrites = kept
+}
+
+func (fh *FileHandle) coversFtruncateWrites(start, end int64, markedSeq uint64) bool {
+	if end <= start {
+		return true
+	}
+	for _, r := range fh.ftruncateWrites {
+		if r.end <= start {
+			continue
+		}
+		if r.start > start {
+			return false
+		}
+		if r.seq <= markedSeq || r.seq > fh.DirtySeq {
+			return false
+		}
+		start = r.end
+		if start >= end {
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *Dat9FS) pendingFtruncateHandleSize(ino, seq uint64) (int64, bool, bool) {
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok || entry.Unlinked {
+		return 0, false, false
+	}
+	var size int64
+	found, busy := false, false
+	for _, fh := range fs.openHandles.SnapshotInode(ino) {
+		if fh == nil {
+			continue
+		}
+		if !fh.TryLock() {
+			busy = busy || fh.Flags&syscall.O_ACCMODE != syscall.O_RDONLY
+			continue
+		}
+		_, linked := entry.Paths[fh.Path]
+		if linked && fh.Dirty != nil && fh.DirtySeq == seq && !fh.Unlinked &&
+			!fh.UnlinkedSnapshot && fh.UnlinkedData == nil {
+			size, found = fh.Dirty.Size(), true
+		}
+		fh.Unlock()
+	}
+	if busy {
+		return 0, false, true
+	}
+	return size, found, false
+}
+
 // readPendingFtruncateVisibleRange serves an fd truncate's uncommitted image
 // before an older shadow, cache, or remote image can win a sibling read.
 // The caller must not hold any FileHandle lock while scanning siblings.
-func (fs *Dat9FS) readPendingFtruncateVisibleRange(reader *FileHandle, readerPath string, readerSeq uint64, readerMarked bool, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+func (fs *Dat9FS) readPendingFtruncateVisibleRange(ctx context.Context, reader *FileHandle, readerPath string, readerSeq uint64, readerMarked bool, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
 	if fs == nil || reader == nil || fs.openHandles == nil || reader.Ino == 0 || reqSize == 0 {
 		return nil, 0, false, gofuse.OK
 	}
@@ -23,7 +123,7 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRange(reader *FileHandle, readerPat
 	for {
 		latestSeq, pending := fs.pendingFtruncateSeq(reader.Ino)
 		if !pending {
-			return nil, 0, false, gofuse.OK
+			return fs.readSupersededFtruncateRange(ctx, reader.Ino, readerPath, offset, reqSize)
 		}
 		entry, ok := fs.inodes.GetEntry(reader.Ino)
 		if !ok || entry.Unlinked {
@@ -31,9 +131,6 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRange(reader *FileHandle, readerPat
 		}
 		if _, linked := entry.Paths[readerPath]; !linked {
 			return nil, 0, false, gofuse.OK
-		}
-		if readerMarked && readerSeq == latestSeq {
-			return nil, 0, false, gofuse.OK // The caller's own Dirty path is current.
 		}
 		data, n, handled, status, retry := fs.readPendingFtruncateVisibleRangeOnce(reader, entry, readerSeq, readerMarked, latestSeq, offset, reqSize)
 		if handled || status != gofuse.OK {
@@ -49,17 +146,75 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRange(reader *FileHandle, readerPat
 	}
 }
 
+// A newer committed inode mutation suppresses the old fd truncate while its
+// handle is still open. Bypass that handle's pinned shadow and stale caches;
+// a newer local pending image remains fail-closed until it can be selected.
+func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, ino uint64, readerPath string, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+	if !fs.openHandles.HasVisibleTruncate(ino) {
+		return nil, 0, false, gofuse.OK
+	}
+	committedSeq := fs.ftruncateCommittedSeq(ino)
+	if committedSeq == 0 {
+		return nil, 0, false, gofuse.OK
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok || entry.Unlinked {
+		return nil, 0, false, gofuse.OK
+	}
+	if _, linked := entry.Paths[readerPath]; !linked {
+		return nil, 0, false, gofuse.OK
+	}
+	fs.dirtyMu.Lock()
+	dirty := fs.dirtyInodes[ino]
+	fs.dirtyMu.Unlock()
+	if entry.Size == 0 && dirty.seq > committedSeq && dirty.size == 0 {
+		return nil, 0, true, gofuse.OK
+	}
+	if dirty.seq > committedSeq {
+		return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+	}
+	for path := range entry.Paths {
+		if fs.pendingIndex != nil && fs.pendingIndex.HasPending(path) {
+			return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+		}
+		if fs.writeBack != nil {
+			if _, pending := fs.writeBack.GetMeta(path); pending {
+				return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+			}
+		}
+	}
+	if fs.layerEnabled() {
+		return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+	}
+	data, err := fs.client.ReadAtCtx(ctx, fs.remotePath(readerPath), offset, int64(reqSize))
+	if err != nil {
+		return nil, 0, false, httpToFuseStatus(err)
+	}
+	current, ok := fs.inodes.GetEntry(ino)
+	if !ok || current.Unlinked {
+		return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+	}
+	if _, linked := current.Paths[readerPath]; !linked {
+		return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+	}
+	return data, len(data), true, gofuse.OK
+}
+
 func (fs *Dat9FS) readPendingFtruncateVisibleRangeOnce(reader *FileHandle, entry *InodeEntry, readerSeq uint64, readerMarked bool, latestSeq uint64, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, bool) {
 	var newest *FileHandle
 	var newestSeq uint64
 	marked := readerMarked && readerSeq != 0
+	markedSeq := uint64(0)
+	if marked {
+		markedSeq = readerSeq
+	}
 	busy := false
 	for _, src := range fs.openHandles.SnapshotInode(reader.Ino) {
 		if src == nil || src == reader {
 			continue
 		}
 		if !src.TryLock() {
-			busy = true
+			busy = busy || src.Flags&syscall.O_ACCMODE != syscall.O_RDONLY
 			continue
 		}
 		_, linked := entry.Paths[src.Path]
@@ -67,6 +222,9 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRangeOnce(reader *FileHandle, entry
 			!src.Unlinked && !src.UnlinkedSnapshot && src.UnlinkedData == nil
 		if valid {
 			marked = marked || src.Dirty.visibleTruncate
+			if src.Dirty.visibleTruncate && src.DirtySeq > markedSeq {
+				markedSeq = src.DirtySeq
+			}
 			if src.DirtySeq > newestSeq {
 				newest, newestSeq = src, src.DirtySeq
 			}
@@ -76,10 +234,37 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRangeOnce(reader *FileHandle, entry
 	if !marked {
 		return nil, 0, false, gofuse.OK, busy
 	}
-	// A busy sibling may hide the latest writer. A locked candidate with the
-	// inode's latest sequence is already newer than every busy sibling.
-	if busy && newestSeq != latestSeq {
+	if busy {
 		return nil, 0, false, gofuse.OK, true
+	}
+	latestSeq = max(latestSeq, readerSeq, newestSeq)
+	if readerMarked && readerSeq != 0 && readerSeq == latestSeq {
+		return nil, 0, false, gofuse.OK, false // The caller's Dirty path is current.
+	}
+	if readerSeq != 0 && readerSeq == latestSeq && !readerMarked {
+		if !reader.TryLock() {
+			return nil, 0, false, gofuse.OK, true
+		}
+		defer reader.Unlock()
+		if reader.Dirty == nil || reader.DirtySeq != readerSeq || reader.Unlinked ||
+			reader.UnlinkedSnapshot || reader.UnlinkedData != nil {
+			return nil, 0, false, gofuse.OK, true
+		}
+		if _, linked := entry.Paths[reader.Path]; !linked || reader.Ino != entry.Ino {
+			return nil, 0, false, gofuse.OK, true
+		}
+		if currentSeq, pending := fs.pendingFtruncateSeq(reader.Ino); !pending || currentSeq > readerSeq {
+			return nil, 0, false, gofuse.OK, true
+		}
+		end := offset + int64(reqSize)
+		if end < offset {
+			return nil, 0, false, gofuse.EINVAL, false
+		}
+		end = min(end, reader.Dirty.Size())
+		if offset < end && !reader.coversFtruncateWrites(offset, end, markedSeq) {
+			return nil, 0, false, gofuse.Status(syscall.EAGAIN), false
+		}
+		return fs.readPendingFtruncateHandleLocked(reader, offset, reqSize, false)
 	}
 	if readerSeq > newestSeq {
 		if readerMarked && readerSeq == latestSeq {
@@ -98,16 +283,19 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRangeOnce(reader *FileHandle, entry
 		newest.UnlinkedSnapshot || newest.UnlinkedData != nil {
 		return nil, 0, false, gofuse.OK, true
 	}
+	if newestSeq <= fs.ftruncateCommittedSeq(reader.Ino) {
+		return nil, 0, false, gofuse.OK, true
+	}
 	if !newest.Dirty.visibleTruncate {
 		return nil, 0, false, gofuse.Status(syscall.EAGAIN), false
 	}
 	if _, linked := entry.Paths[newest.Path]; !linked {
 		return nil, 0, false, gofuse.OK, true
 	}
-	return fs.readPendingFtruncateHandleLocked(newest, offset, reqSize)
+	return fs.readPendingFtruncateHandleLocked(newest, offset, reqSize, true)
 }
 
-func (fs *Dat9FS) readPendingFtruncateHandleLocked(src *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, bool) {
+func (fs *Dat9FS) readPendingFtruncateHandleLocked(src *FileHandle, offset int64, reqSize uint32, allowRemoteLoad bool) ([]byte, int, bool, gofuse.Status, bool) {
 	size := src.Dirty.Size()
 	if offset >= size {
 		return nil, 0, true, gofuse.OK, false
@@ -145,6 +333,9 @@ func (fs *Dat9FS) readPendingFtruncateHandleLocked(src *FileHandle, offset int64
 	for part := first; part <= last; part++ {
 		if evicted[part] && !src.Dirty.IsPartLoaded(part) {
 			return nil, 0, false, gofuse.EIO, false
+		}
+		if !allowRemoteLoad && !src.Dirty.IsPartLoaded(part) {
+			return nil, 0, false, gofuse.Status(syscall.EAGAIN), false
 		}
 		if err := src.Dirty.EnsureLoaded(part); err != nil {
 			return nil, 0, false, gofuse.EIO, false

@@ -538,9 +538,8 @@ func (fs *Dat9FS) warmInlineThreshold(ctx context.Context) {
 }
 
 type dirtyInodeState struct {
-	size            int64
-	seq             uint64
-	visibleTruncate bool
+	size int64
+	seq  uint64
 }
 
 type inodeMutationState struct {
@@ -1532,31 +1531,35 @@ func (fs *Dat9FS) localPath(remotePath string) (string, bool) {
 	return mountpath.ToLocal(fs.remoteRoot(), remotePath)
 }
 
-func (fs *Dat9FS) dirtyHandleSize(ino uint64) (int64, bool) {
+func (fs *Dat9FS) dirtyHandleSize(ino uint64) (int64, bool, bool) {
 	fs.dirtyMu.Lock()
-	defer fs.dirtyMu.Unlock()
-
 	state, ok := fs.dirtyInodes[ino]
-	if !ok {
-		return 0, false
+	fs.dirtyMu.Unlock()
+	if latestSeq, pending := fs.pendingFtruncateSeq(ino); pending {
+		if ok && state.seq == latestSeq {
+			return state.size, true, false
+		}
+		return fs.pendingFtruncateHandleSize(ino, latestSeq)
 	}
-	return state.size, true
+	if !ok {
+		return 0, false, false
+	}
+	return state.size, true, false
 }
 
 func (fs *Dat9FS) pendingFtruncateSeq(ino uint64) (uint64, bool) {
 	fs.dirtyMu.Lock()
-	defer fs.dirtyMu.Unlock()
-	state, ok := fs.dirtyInodes[ino]
-	return state.seq, ok && state.visibleTruncate
-}
-
-func (fs *Dat9FS) markVisibleFtruncate(ino uint64) {
-	fs.dirtyMu.Lock()
-	defer fs.dirtyMu.Unlock()
-	if state, ok := fs.dirtyInodes[ino]; ok {
-		state.visibleTruncate = true
-		fs.dirtyInodes[ino] = state
+	state := fs.dirtyInodes[ino]
+	committedSeq := fs.mutationInodes[ino].committedSeq
+	fs.dirtyMu.Unlock()
+	markedSeq, pending := fs.openHandles.VisibleTruncateSeq(ino, committedSeq)
+	if !pending {
+		return 0, false
 	}
+	if state.seq > markedSeq && state.seq > committedSeq {
+		return state.seq, true
+	}
+	return markedSeq, true
 }
 
 func (fs *Dat9FS) markDirtySize(ino uint64, size int64) uint64 {
@@ -1587,8 +1590,7 @@ func (fs *Dat9FS) markDirtySizeOptions(ino uint64, size int64, clearLocalTimes b
 
 	fs.dirtySeq++
 	seq := fs.dirtySeq
-	previous := fs.dirtyInodes[ino]
-	fs.dirtyInodes[ino] = dirtyInodeState{size: size, seq: seq, visibleTruncate: previous.visibleTruncate}
+	fs.dirtyInodes[ino] = dirtyInodeState{size: size, seq: seq}
 	if fs.gvisorCompatibilityEnabled() {
 		if fs.mutationInodes == nil {
 			fs.mutationInodes = make(map[uint64]inodeMutationState)
@@ -1632,7 +1634,7 @@ func (fs *Dat9FS) interruptSafeMutationsEnabled() bool {
 }
 
 func (fs *Dat9FS) recordCommittedMutation(ino uint64, seq uint64, revision int64, size int64) {
-	if !fs.gvisorCompatibilityEnabled() || ino == 0 || seq == 0 {
+	if ino == 0 || seq == 0 || (!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(ino)) {
 		return
 	}
 
@@ -1650,10 +1652,16 @@ func (fs *Dat9FS) recordCommittedMutation(ino uint64, seq uint64, revision int64
 		state.latestSeq = seq
 	}
 	fs.mutationInodes[ino] = state
-	if dirty, ok := fs.dirtyInodes[ino]; ok && dirty.seq <= state.committedSeq {
+	if dirty, ok := fs.dirtyInodes[ino]; fs.gvisorCompatibilityEnabled() && ok && dirty.seq <= state.committedSeq {
 		delete(fs.dirtyInodes, ino)
 	}
 	fs.dirtyMu.Unlock()
+}
+
+func (fs *Dat9FS) ftruncateCommittedSeq(ino uint64) uint64 {
+	fs.dirtyMu.Lock()
+	defer fs.dirtyMu.Unlock()
+	return fs.mutationInodes[ino].committedSeq
 }
 
 // recordAppendLogCommittedGeneration publishes an in-process append-log
@@ -3863,15 +3871,8 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle, durable bool) error {
 	bvDur := time.Since(bvStart)
 
 	snapshotID, parentSnapshotID := ensureStagedSnapshotLineageLocked(fh)
-	putFn := fs.writeBack.PutWithBaseRevAndModeAndLineageTimings
-	if !durable {
-		// The durable authority for this payload is the shadow store +
-		// pending index (staged durably before this snapshot); the write-back
-		// .dat/.meta are a read/upload cache, so skip their fsyncs (issue
-		// #960: ~12ms of redundant per-close fsyncs on cloud volumes).
-		putFn = fs.writeBack.PutWithBaseRevAndModeAndLineageTimingsNoSync
-	}
-	gen, timings, err := putFn(
+	// The process-local inode sequence is published with this cache generation.
+	gen, timings, err := fs.writeBack.putHandleSnapshot(
 		fh.Path,
 		data,
 		fh.Dirty.Size(),
@@ -3882,7 +3883,10 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle, durable bool) error {
 		snapshotID,
 		parentSnapshotID,
 		fh.StagedLineageTrusted,
-		fh.stagedAncestors...,
+		durable,
+		fh.stagedAncestors,
+		fh.Ino,
+		fh.DirtySeq,
 	)
 	if err == nil {
 		// Record the staged generation so unlink-discard can remove only this
@@ -8772,7 +8776,9 @@ func (fs *Dat9FS) getAttrOnce(cancel <-chan struct{}, input *gofuse.GetAttrIn, o
 		return gofuse.OK
 	}
 	if entry.Unlinked {
-		if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
+		if size, ok, busy := fs.dirtyHandleSize(input.NodeId); busy {
+			return gofuse.Status(syscall.EAGAIN)
+		} else if ok {
 			entry.Size = size
 		}
 		fs.fillAttr(entry, &out.Attr)
@@ -8832,7 +8838,9 @@ func (fs *Dat9FS) getAttrOnce(cancel <-chan struct{}, input *gofuse.GetAttrIn, o
 		return gofuse.OK
 	}
 	{
-		if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
+		if size, ok, busy := fs.dirtyHandleSize(input.NodeId); busy {
+			return gofuse.Status(syscall.EAGAIN)
+		} else if ok {
 			entry.Size = size
 		} else if gitEntry, handled := fs.gitEntry(ctx, entry.Path, false); handled {
 			if gitEntry == nil {
@@ -9598,15 +9606,23 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				var abortStreamer func()
 				fh.Lock()
 				fs.discardSupersededMutationLocked(fh)
+				markVisible := !isSQLiteDirectIOPath(fh.Path)
+				newMarker := markVisible && !fh.Dirty.visibleTruncate
+				if newMarker {
+					fs.openHandles.MarkVisibleTruncate(fh, 0)
+				}
 				var err error
 				abortStreamer, err = fs.truncateWritableHandleLocked(fh, newSize)
 				if err != nil {
+					if newMarker {
+						fs.openHandles.UnmarkVisibleTruncate(fh)
+					}
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
 				}
-				if !isSQLiteDirectIOPath(fh.Path) {
+				if markVisible {
 					fh.Dirty.visibleTruncate = true
-					fs.markVisibleFtruncate(fh.Ino)
+					fs.openHandles.MarkVisibleTruncate(fh, fh.DirtySeq)
 				}
 				publishTruncate := newSize == 0 && isSQLitePersistentJournalPath(entry.Path) &&
 					!entry.Unlinked && !fh.Unlinked && !fh.UnlinkedSnapshot && fh.UnlinkedData == nil
@@ -13007,7 +13023,7 @@ readHandleState:
 		readerSeq := fh.DirtySeq
 		readerMarked := fh.Dirty != nil && fh.Dirty.visibleTruncate
 		fh.Unlock()
-		if data, n, ok, st := fs.readPendingFtruncateVisibleRange(fh, readerPath, readerSeq, readerMarked, int64(input.Offset), input.Size); ok || st != gofuse.OK {
+		if data, n, ok, st := fs.readPendingFtruncateVisibleRange(ctx, fh, readerPath, readerSeq, readerMarked, int64(input.Offset), input.Size); ok || st != gofuse.OK {
 			source = "pending-ftruncate"
 			bytesRead = n
 			if st != gofuse.OK {
@@ -13826,8 +13842,10 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	writeSyncAppendLogState := appendLogHandleState{}
 	writeSyncBeforeDirtySeq := fh.DirtySeq
 	writeSyncTimeOverrides := (*localTimeOverrides)(nil)
+	var writeSyncFtruncateWrites []ftruncateWriteRange
 	if fh.WritePolicy == WritePolicyWriteSync {
 		writeSyncSnapshot = fh.Dirty.snapshot()
+		writeSyncFtruncateWrites = append(writeSyncFtruncateWrites, fh.ftruncateWrites...)
 		writeSyncAppendLogState = fh.appendLog
 		// The dirty-mutation hook below clears armed local time overrides;
 		// a failed write that rolls its content back must re-arm them.
@@ -13912,6 +13930,11 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		source = "dirty-buffer"
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+	if fh.Dirty.visibleTruncate {
+		fs.openHandles.MarkVisibleTruncate(fh, fh.DirtySeq)
+	} else if _, pending := fs.pendingFtruncateSeq(fh.Ino); pending {
+		fh.recordFtruncateWriteLocked(writeOffset, writeOffset+int64(n))
+	}
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
 	if fh.Flags&syscall.O_TRUNC != 0 {
 		fs.armKernelCacheBypass(fh.Ino, fh.Path, fh.BaseRev, fh.Dirty.Size(), "truncate-write")
@@ -13938,6 +13961,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 					fs.discardSupersededMutationLocked(fh)
 				} else if !contentCommitted && !newerDirtyGeneration {
 					fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot, writeSyncBeforeDirtySeq, writeSyncTimeOverrides)
+					fh.ftruncateWrites = writeSyncFtruncateWrites
 					fh.appendLogRestoreFailedWriteState(writeSyncAppendLogState)
 				}
 			}
@@ -13956,6 +13980,7 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 	// explicitly SetAttr'd time acknowledged before the write — is restored.
 	fs.inodes.RestoreLocalTimes(fh.Ino, timeOverrides)
 	if fh.DirtySeq != 0 {
+		fh.discardFtruncateWritesFromSeqLocked(fh.DirtySeq)
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
 	}
@@ -13969,12 +13994,17 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 		if fh.Dirty.HasDirtyParts() {
 			if restoreDirtySeq != 0 {
 				fh.DirtySeq = restoreDirtySeq
-				fs.restoreDirtySize(fh.Ino, restoreDirtySeq, fh.Dirty.Size(), fh.Dirty.visibleTruncate)
+				fs.restoreDirtySize(fh.Ino, restoreDirtySeq, fh.Dirty.Size())
 			} else {
 				fh.DirtySeq = fs.markDirtySizeRestore(fh.Ino, fh.Dirty.Size())
 			}
 		}
 		fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
+	}
+	if fh.Dirty != nil && fh.Dirty.visibleTruncate && fh.DirtySeq != 0 {
+		fs.openHandles.MarkVisibleTruncate(fh, fh.DirtySeq)
+	} else {
+		fs.openHandles.UnmarkVisibleTruncate(fh)
 	}
 	fh.WriteBackSeq = 0
 	clearReadTargetForLockedHandle(fh)
@@ -13984,12 +14014,12 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 	}
 }
 
-func (fs *Dat9FS) restoreDirtySize(ino, seq uint64, size int64, visibleTruncate bool) {
+func (fs *Dat9FS) restoreDirtySize(ino, seq uint64, size int64) {
 	if fs == nil || seq == 0 {
 		return
 	}
 	fs.dirtyMu.Lock()
-	fs.dirtyInodes[ino] = dirtyInodeState{size: size, seq: seq, visibleTruncate: visibleTruncate}
+	fs.dirtyInodes[ino] = dirtyInodeState{size: size, seq: seq}
 	fs.dirtyMu.Unlock()
 }
 
@@ -14784,13 +14814,15 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 	}
 	mutationExpectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	mutationRecorded := false
+	mutationUploadCommitted := false
 	recordMutationBeforeFenceRelease := func() {
-		if mutationRecorded || !fs.gvisorCompatibilityEnabled() || err != nil || mutationSeq == 0 {
+		if mutationRecorded || !mutationUploadCommitted || mutationSeq == 0 ||
+			(!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(mutationIno)) {
 			return
 		}
 		revision := fs.resolveCommittedMutationRevision(mutationPath, fs.latestCommittedRevision(mutationPath), mutationExpectedRevision)
 		fs.recordCommittedMutation(mutationIno, mutationSeq, revision, mutationSize)
-		if revision > 0 {
+		if fs.gvisorCompatibilityEnabled() && revision > 0 {
 			fs.refreshCommittedRevisionForOpenHandlesWithSize(mutationPath, revision, fh, mutationSize)
 		}
 		mutationRecorded = true
@@ -14837,6 +14869,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		perfUploadStart := fs.perfStart()
 		err = streamer.FinishStreaming(ctx, size,
 			lastPartNum, lastCp, dirtyParts)
+		mutationUploadCommitted = err == nil
 		recordMutationBeforeFenceRelease()
 		unlockRemoteCommit()
 		remoteCommitReleased = true
@@ -14921,6 +14954,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		fh.Unlock()
 		perfUploadStart := fs.perfStart()
 		err = streamer.UploadAll(ctx, size, partSnapshots)
+		mutationUploadCommitted = err == nil
 		recordMutationBeforeFenceRelease()
 		unlockRemoteCommit()
 		remoteCommitReleased = true
@@ -15211,6 +15245,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 			}
 		}
 	}
+	mutationUploadCommitted = err == nil
 	recordMutationBeforeFenceRelease()
 
 	// Release remoteCommitLock AFTER upload + revision recording but
@@ -15865,7 +15900,7 @@ func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) 
 	if fs != nil && entry != nil {
 		fs.publishLinkedAppendCommit(entry.Path, entry.Inode, committedRev, entry.Size)
 	}
-	if fs == nil || entry == nil || !fs.gvisorCompatibilityEnabled() {
+	if fs == nil || entry == nil || (!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(entry.Inode)) {
 		return
 	}
 	if entry.mutationPublished {
@@ -15876,13 +15911,15 @@ func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) 
 		fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, 0, entry.Size)
 		return
 	}
-	committedRev = fs.resolveCommittedMutationRevision(entry.Path, committedRev, entry.BaseRev)
-	if committedRev <= 0 {
-		return
+	if fs.gvisorCompatibilityEnabled() {
+		committedRev = fs.resolveCommittedMutationRevision(entry.Path, committedRev, entry.BaseRev)
+		if committedRev <= 0 {
+			return
+		}
 	}
 	entry.mutationPublished = true
 	fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, committedRev, entry.Size)
-	if committedRev > 0 {
+	if fs.gvisorCompatibilityEnabled() && committedRev > 0 {
 		fs.refreshCommittedRevisionForOpenHandlesWithSize(entry.Path, committedRev, nil, entry.Size)
 	}
 }
@@ -15903,6 +15940,12 @@ func (fs *Dat9FS) snapshotStagingGens(remotePath string) StagingGens {
 		g.ShadowGen = fs.shadowStore.ActiveGeneration(remotePath)
 	}
 	return g
+}
+
+func (fs *Dat9FS) onWriteBackDataCommitted(meta WriteBackMeta, committedRev int64) {
+	if fs != nil && meta.Inode != 0 && meta.MutationSeq != 0 {
+		fs.recordCommittedMutation(meta.Inode, meta.MutationSeq, committedRev, meta.Size)
+	}
 }
 
 func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int64, gens StagingGens) {
