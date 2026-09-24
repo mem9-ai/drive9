@@ -49,6 +49,10 @@ MINIO_IMAGE_CANDIDATES="$MINIO_IMAGE"
 if [ -n "$MINIO_FALLBACK_IMAGE" ] && [ "$MINIO_FALLBACK_IMAGE" != "$MINIO_IMAGE" ]; then
   MINIO_IMAGE_CANDIDATES="$MINIO_IMAGE_CANDIDATES $MINIO_FALLBACK_IMAGE"
 fi
+# Seconds to wait for one candidate's health endpoint; overridable for
+# hermetic tests (a refused connection fails immediately; the deadline only
+# bounds a slow-answering candidate).
+MINIO_HEALTH_TIMEOUT_S="${MINIO_HEALTH_TIMEOUT_S:-40}"
 
 check_eq() {
   local desc="$1" got="$2" want="$3"
@@ -240,6 +244,20 @@ wait_http() {
   done
 }
 
+wait_health() {
+  local url="$1"
+  local deadline=$(($(date +%s) + MINIO_HEALTH_TIMEOUT_S))
+  while :; do
+    if curl -sf "$url" >/dev/null; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep 0.4
+  done
+}
+
 create_bucket() {
   local host="$1" bucket="$2"
   python3 - "$host" "$bucket" <<'PY'
@@ -418,21 +436,43 @@ else
   elif pick_runtime; then
     echo "starting MinIO with $RUNTIME on :$MINIO_PORT"
     MINIO_CID="drive9-e2e-minio-$$"
+    # A candidate is accepted only when its container actually turns healthy:
+    # `run -d` succeeding says nothing about the server inside (entrypoint or
+    # platform mismatches exit right after start). An unhealthy candidate is
+    # logged, removed, and replaced by the next one; the binary fallback runs
+    # only after every candidate failed this way. This also applies to a
+    # pre-existing same-name container that is not healthy.
     container_started=""
     image=""
     for image in $MINIO_IMAGE_CANDIDATES; do
+      if "$RUNTIME" inspect "$MINIO_CID" >/dev/null 2>&1; then
+        if [ "$("$RUNTIME" inspect -f '{{.State.Running}}' "$MINIO_CID" 2>/dev/null)" != "true" ]; then
+          "$RUNTIME" start "$MINIO_CID" >/dev/null 2>&1 || true
+        fi
+        if wait_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"; then
+          container_started=1
+          break
+        fi
+        echo "MinIO container ($image via $RUNTIME) is not healthy; removing and trying the next candidate"
+        "$RUNTIME" logs "$MINIO_CID" 2>&1 | tail -5 || true
+        "$RUNTIME" rm -f "$MINIO_CID" >/dev/null 2>&1 || true
+        continue
+      fi
       if "$RUNTIME" run -d --name "$MINIO_CID" \
         -p "${MINIO_PORT}:9000" \
         -e "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
         -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
-        "$image" server /data >/dev/null; then
+        "$image" server /data >/dev/null 2>&1 \
+        && wait_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"; then
         container_started=1
         break
       fi
+      echo "MinIO image $image did not become healthy via $RUNTIME; trying the next candidate"
+      "$RUNTIME" logs "$MINIO_CID" 2>&1 | tail -5 || true
       "$RUNTIME" rm -f "$MINIO_CID" >/dev/null 2>&1 || true
     done
     if [ -z "$container_started" ]; then
-      echo "no MinIO image could start; falling back to the MinIO binary"
+      echo "no MinIO image became healthy; falling back to the MinIO binary"
       if ! start_minio_bin; then
         echo "FAIL need docker, podman, or a minio binary (or set OBJECT_S3_URI)"
         exit 1
@@ -447,6 +487,14 @@ else
   fi
   check_cmd "MinIO health" wait_http "http://127.0.0.1:${MINIO_PORT}/minio/health/live"
   check_cmd "create MinIO bucket $MINIO_BUCKET" create_bucket "127.0.0.1:${MINIO_PORT}" "$MINIO_BUCKET"
+
+  if [ "${OBJECT_BOOTSTRAP_ONLY:-0}" = "1" ]; then
+    # Hermetic hook for scripts/test-minio-bootstrap.sh: with a fake runtime
+    # on PATH, run only the MinIO provisioning above and stop before any CLI
+    # work.
+    echo "bootstrap-only: MinIO provisioning finished"
+    exit 0
+  fi
 
   OBJ_BASE="s3://${MINIO_BUCKET}/${PREFIX}"
   OBJ_QUERY="?region=${AWS_REGION}&endpoint=$(urlencode "http://127.0.0.1:${MINIO_PORT}")&forcePathStyle=true"

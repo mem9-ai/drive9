@@ -60,7 +60,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
+.PHONY: mod test test-failpoint test-podman test-minio-bootstrap fmt lint install-lint build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
@@ -98,6 +98,11 @@ test:
 # rewrites the source tree while the tests are running.
 test-failpoint:
 	./scripts/run_failpoint_tests.py
+
+# Hermetic MinIO bootstrap regression (fake container runtime + real local
+# health probes); no docker/podman required.
+test-minio-bootstrap:
+	bash scripts/test-minio-bootstrap.sh
 
 fmt:
 	$(MAKE) install-lint

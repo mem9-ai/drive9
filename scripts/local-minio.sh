@@ -45,6 +45,10 @@ MINIO_IMAGE_CANDIDATES="$IMAGE"
 if [ -n "$FALLBACK_IMAGE" ] && [ "$FALLBACK_IMAGE" != "$IMAGE" ]; then
   MINIO_IMAGE_CANDIDATES="$MINIO_IMAGE_CANDIDATES $FALLBACK_IMAGE"
 fi
+# Seconds to wait for one candidate's health endpoint; overridable for
+# hermetic tests (a candidate only holds the loop this long when something
+# answers slowly — a refused connection fails immediately).
+MINIO_HEALTH_TIMEOUT_S="${MINIO_HEALTH_TIMEOUT_S:-40}"
 
 HEALTH_HOST="$BIND"
 if [ "$BIND" = "0.0.0.0" ] || [ "$BIND" = "::" ] || [ "$BIND" = "[::]" ]; then
@@ -143,7 +147,7 @@ PY
 
 wait_healthy() {
   local url="$1"
-  local deadline=$(($(date +%s) + 40))
+  local deadline=$(($(date +%s) + MINIO_HEALTH_TIMEOUT_S))
   while :; do
     if url_healthy "$url"; then
       return 0
@@ -167,22 +171,36 @@ print_env() {
 
 start_container() {
   local runtime="$1"
-  if "$runtime" inspect "$CONTAINER" >/dev/null 2>&1; then
-    if [ "$("$runtime" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]; then
-      return 0
-    fi
-    "$runtime" start "$CONTAINER" >/dev/null
-    return 0
-  fi
+  # A candidate is accepted only when its container actually turns healthy:
+  # `run -d` succeeding says nothing about the server inside (entrypoint or
+  # platform mismatches exit right after start). An unhealthy candidate is
+  # logged, removed, and replaced by the next one; the caller falls back to
+  # the binary only after every candidate failed this way. This also applies
+  # to a pre-existing same-name container that is not healthy.
   local image
   for image in $MINIO_IMAGE_CANDIDATES; do
+    if "$runtime" inspect "$CONTAINER" >/dev/null 2>&1; then
+      if [ "$("$runtime" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]; then
+        "$runtime" start "$CONTAINER" >/dev/null 2>&1 || true
+      fi
+      if wait_healthy "$HEALTH_URL"; then
+        return 0
+      fi
+      echo "MinIO container ($image via $runtime) is not healthy; removing and trying the next candidate" >&2
+      "$runtime" logs "$CONTAINER" 2>&1 | tail -5 >&2 || true
+      "$runtime" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+      continue
+    fi
     if "$runtime" run -d --name "$CONTAINER" \
       -p "${BIND}:${PORT}:9000" \
       -e "MINIO_ROOT_USER=${ACCESS_KEY}" \
       -e "MINIO_ROOT_PASSWORD=${SECRET_KEY}" \
-      "$image" server /data >/dev/null; then
+      "$image" server /data >/dev/null 2>&1 \
+      && wait_healthy "$HEALTH_URL"; then
       return 0
     fi
+    echo "MinIO image $image did not become healthy via $runtime; trying the next candidate" >&2
+    "$runtime" logs "$CONTAINER" 2>&1 | tail -5 >&2 || true
     "$runtime" rm -f "$CONTAINER" >/dev/null 2>&1 || true
   done
   return 1
@@ -258,14 +276,11 @@ cmd_ensure() {
   runtimes="$(candidate_runtimes || true)"
   for runtime in $runtimes; do
     echo "starting MinIO via $runtime on ${BIND}:${PORT}" >&2
-    if start_container "$runtime" && wait_healthy "$HEALTH_URL"; then
+    if start_container "$runtime"; then
       ensure_bucket
       return 0
     fi
     echo "MinIO via $runtime was not healthy at $HEALTH_URL" >&2
-    if [ -n "$runtime" ]; then
-      "$runtime" logs "$CONTAINER" 2>&1 | tail -20 >&2 || true
-    fi
   done
 
   echo "starting MinIO binary on ${BIND}:${PORT}" >&2
