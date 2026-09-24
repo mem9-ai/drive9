@@ -1625,3 +1625,46 @@ func TestShadowStoreTwoPathLocksReverseOrder(t *testing.T) {
 		t.Fatal("second acquirer never entered /a after waiter released")
 	}
 }
+
+func TestShadowResidentPinRejectsOldRevisionWithoutRemovingStaging(t *testing.T) {
+	ss, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ss.Close)
+	const path = "/resident-wal"
+	if err := ss.WriteFull(path, []byte("old image"), 3); err != nil {
+		t.Fatal(err)
+	}
+	oldPin, ok := ss.PinResidentOrDiscardDisk(path, 3)
+	if !ok {
+		t.Fatal("current revision cannot be pinned")
+	}
+	defer ss.Unpin(oldPin)
+	// An Ensure at a higher revision cannot certify the untouched bytes.
+	if err := ss.Ensure(path, 9, 4); err != nil {
+		t.Fatal(err)
+	}
+	generation := ss.ActiveGeneration(path)
+	if pin, ok := ss.PinResidentOrDiscardDisk(path, 4); ok || pin != 0 {
+		t.Fatalf("pinned stale image: pin=%d ok=%t", pin, ok)
+	}
+	if data, err := ss.ReadAllIfGeneration(path, generation); err != nil || string(data) != "old image" {
+		t.Fatalf("rejecting a read pin removed staging: data=%q err=%v", data, err)
+	}
+	buf := make([]byte, 9)
+	if n, err := ss.ReadAtGen(oldPin, 0, buf); err != nil || n != len(buf) || string(buf) != "old image" {
+		t.Fatalf("existing pin lost its independent lifetime: n=%d data=%q err=%v", n, buf, err)
+	}
+	if err := ss.WriteFull(path, []byte("new image"), 4); err != nil {
+		t.Fatal(err)
+	}
+	pin, ok := ss.PinResidentOrDiscardDisk(path, 4)
+	if !ok {
+		t.Fatal("fresh replacement could not be pinned")
+	}
+	defer ss.Unpin(pin)
+	if n, err := ss.ReadAtGen(pin, 0, buf); err != nil || n != len(buf) || string(buf) != "new image" {
+		t.Fatalf("fresh pin read n=%d data=%q err=%v", n, buf, err)
+	}
+}

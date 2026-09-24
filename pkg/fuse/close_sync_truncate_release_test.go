@@ -564,6 +564,7 @@ func TestCloseSyncCommittedRefreshPreservesPendingWriterShadow(t *testing.T) {
 	writer.Unlock()
 	fs.recordCommittedRevisionWithSize(writer.Path, 4, 40)
 	fs.refreshCommittedRevisionForOpenHandlesWithSize(writer.Path, 4, nil, 40)
+	test.assertReadOnlyOpen(t, want)
 	data, err := fs.shadowStore.ReadAllIfGeneration(writer.Path, generation)
 	if err != nil || !bytes.Equal(data, want) {
 		t.Fatalf("refresh removed pending writer shadow: data=%x err=%v", data, err)
@@ -832,6 +833,43 @@ func TestPassiveCloseSyncHandleExcludesUncommittedCreate(t *testing.T) {
 		fh.Unlock()
 		if !eligible || passive == isNew {
 			t.Fatalf("IsNew=%t clean=%t passive=%t", isNew, eligible, passive)
+		}
+	}
+}
+
+// The commit owner holds its lock while refreshing siblings. Cleanup may
+// conservatively leave a resident cache; that cache must not become a new
+// reader's source after the owner has committed a different image.
+func TestCloseSyncOwnerTruncateCommitReadOnlyFreshness(t *testing.T) {
+	for _, size := range []int64{0, 16, 40} {
+		for _, ensure := range []bool{false, true} {
+			t.Run(fmt.Sprintf("size-%d/ensure-%t", size, ensure), func(t *testing.T) {
+				test, header := newCloseSyncRotatedShadowTest(t)
+				fs := test.fs
+				writer := test.open(t, test.header.Pid)
+				test.write(t, writer, string(header))
+				if st := test.truncate(uint64(size)); st != gofuse.OK {
+					t.Fatalf("truncate: %v", st)
+				}
+				old, _ := fs.fileHandles.Get(test.old)
+				if old.ShadowReady || old.ShadowSpill || old.ShadowStageGen != 0 || old.ShadowStageSeq != 0 || old.ShadowCommitReady || old.ShadowCommitSeq != 0 {
+					t.Fatal("passive sizing retained the rotated staging claim")
+				}
+				test.flush(t, writer)
+				want := make([]byte, size)
+				copy(want, header)
+				test.assertRemote(t, string(want), 4)
+				if ensure && fs.shadowStore.Has(old.Path) {
+					// A metadata/size refresh is not proof that the shadow's
+					// retained bytes were replaced by this committed image.
+					if err := fs.shadowStore.Ensure(old.Path, 32, 4); err != nil {
+						t.Fatal(err)
+					}
+				}
+				test.assertReadOnlyOpen(t, want)
+				test.release(writer)
+				test.assertReadOnlyOpen(t, want)
+			})
 		}
 	}
 }

@@ -408,9 +408,8 @@ func (s *ShadowStore) Ensure(remotePath string, size int64, baseRev int64) error
 		return fmt.Errorf("shadow ensure truncate: %w", err)
 	}
 	sf.size = size
-	if baseRev != 0 {
-		sf.baseRev = baseRev
-	}
+	// Resizing an existing image does not prove its bytes came from a
+	// newer revision. Only initialization or a content write sets baseRev.
 	s.bumpWriteGenLocked(remotePath)
 	s.mu.Unlock()
 	s.pendingBytes.Add(delta)
@@ -1136,7 +1135,10 @@ func (s *ShadowStore) PinIfExists(remotePath string) (uint64, bool) {
 // shadow has no current-process durability proof, so it is discarded instead
 // of becoming a read source after restart. The path lock keeps a concurrent
 // writer from creating a replacement between the resident check and discard.
-func (s *ShadowStore) PinResidentOrDiscardDisk(remotePath string) (uint64, bool) {
+// A resident image older than minRevision is not a read source. Leave it in
+// place: a live writer may still own it for staging/rollback. Pin eligibility
+// and the revision check are atomic, independent of sibling handle locks.
+func (s *ShadowStore) PinResidentOrDiscardDisk(remotePath string, minRevision int64) (uint64, bool) {
 	if s == nil {
 		return 0, false
 	}
@@ -1149,6 +1151,10 @@ func (s *ShadowStore) PinResidentOrDiscardDisk(remotePath string) (uint64, bool)
 		s.mu.Unlock()
 		_ = os.Remove(s.shadowPath(remotePath))
 		s.RecoverPendingBytes()
+		return 0, false
+	}
+	if sf.baseRev < minRevision {
+		s.mu.Unlock()
 		return 0, false
 	}
 	gen := s.active[remotePath]
