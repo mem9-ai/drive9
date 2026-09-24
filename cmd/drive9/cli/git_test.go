@@ -656,6 +656,28 @@ func TestResolveMountedGitTargetUsesMountMetadata(t *testing.T) {
 	}
 }
 
+func TestMountLocalRootForTarget(t *testing.T) {
+	tests := []struct {
+		name     string
+		mountRel string
+		want     string
+	}{
+		{name: "root", mountRel: "", want: "/"},
+		{name: "dot", mountRel: ".", want: "/"},
+		{name: "root_slash", mountRel: "/", want: "/"},
+		{name: "nested", mountRel: "repos/drive9", want: "/repos/drive9"},
+		{name: "nested_slashes", mountRel: "/repos/drive9/", want: "/repos/drive9"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := mountLocalRootForTarget(mountedGitTarget{MountRel: test.mountRel})
+			if got != test.want {
+				t.Fatalf("mountLocalRootForTarget(%q) = %q, want %q", test.mountRel, got, test.want)
+			}
+		})
+	}
+}
+
 func TestLocalPathForRemoteInMount(t *testing.T) {
 	mountPoint := t.TempDir()
 	resolved := mountedGitTarget{

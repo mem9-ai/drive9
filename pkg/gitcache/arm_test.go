@@ -157,3 +157,52 @@ func TestLocalArmSignalEmptyRefreshDir(t *testing.T) {
 		t.Fatalf("LocalArmSignal with empty refresh/ only ok=%v gen=%q", ok, gen)
 	}
 }
+
+func TestWorkspacePendingMarkerLifecycle(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+
+	if WorkspacePending(ctx, root, "/repo") {
+		t.Fatal("no marker should mean not pending")
+	}
+	if err := MarkWorkspacePending(ctx, root, "/repo"); err != nil {
+		t.Fatalf("MarkWorkspacePending: %v", err)
+	}
+	if !WorkspacePending(ctx, root, "/repo") {
+		t.Fatal("marker written but WorkspacePending = false")
+	}
+	// Trailing/leading slashes normalize to the same key.
+	if !WorkspacePending(ctx, root, "repo/") {
+		t.Fatal("normalized root should match the same marker")
+	}
+	if WorkspacePending(ctx, root, "/other") {
+		t.Fatal("unrelated root must not be pending")
+	}
+	if err := ClearWorkspacePending(ctx, root, "/repo"); err != nil {
+		t.Fatalf("ClearWorkspacePending: %v", err)
+	}
+	if WorkspacePending(ctx, root, "/repo") {
+		t.Fatal("marker cleared but WorkspacePending = true")
+	}
+	// Clearing an absent marker is not an error.
+	if err := ClearWorkspacePending(ctx, root, "/repo"); err != nil {
+		t.Fatalf("ClearWorkspacePending(absent): %v", err)
+	}
+	if err := ClearWorkspacePending(ctx, root, "/other"); err != nil {
+		t.Fatalf("ClearWorkspacePending(other): %v", err)
+	}
+}
+
+func TestClearLocalArmSignalsDropsPendingMarkers(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := MarkWorkspacePending(ctx, root, "/repo"); err != nil {
+		t.Fatalf("MarkWorkspacePending: %v", err)
+	}
+	if err := ClearLocalArmSignals(ctx, root); err != nil {
+		t.Fatalf("ClearLocalArmSignals: %v", err)
+	}
+	if WorkspacePending(ctx, root, "/repo") {
+		t.Fatal("ClearLocalArmSignals should drop pending markers")
+	}
+}

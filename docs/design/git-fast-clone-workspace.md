@@ -98,11 +98,11 @@ Coding-agent local overlay policy
 
 - The coding-agent mount profile routes heavyweight local state and generated output to `<local-root>/overlay` instead of Drive9 backend storage.
 - The default local-only patterns are deliberately narrow, and split into two lists:
-  - `[local]` (`--local-only`): overlaid unconditionally. Defaults to dependency trees `node_modules` and `.venv`, whose names unambiguously denote generated trees.
+  - `[local]` (`--local-only`): overlaid unconditionally. Defaults to dependency trees `node_modules` and `.venv`, whose names unambiguously denote generated trees. VCS metadata is **not** a static pattern (see "`.git` routing"): it is routed by workspace membership instead.
   - `[local-gitignore-aware]` (`--local-only-gitignore-aware`): overlaid only when the repository's own Git ignore rules also ignore the path. Defaults to Rust build output `target`, because `target` is a common directory name that is not always build output. See "Git-ignore policy" below.
 - Both lists name the trees whose file counts routinely overwhelm remote storage and are essentially never hand-edited.
 - Other build and cache output (`dist`, `build`, `.cache`, `coverage`, tool caches such as `__pycache__`/`.pytest_cache`, and so on) is left remote-persistent by default. Projects that want a specific tree overlaid can add explicit `[local]` patterns (unconditional) or `[local-gitignore-aware]` patterns (repository-confirmed).
-- `.git` stays in the `[local]` list and is overlaid unconditionally. It must be covered by the pattern alone: `git clone --fast` writes the working `.git` before the workspace row is registered, so a workspace-scoped rule would miss that window and upload `.git` to the remote, which the fast-clone design forbids. `.hg` and `.svn` sync to the remote like ordinary files. See "`.git` routing" below.
+- `.git` is not a static pattern. It is local only for a registered drive9 workspace, or one that is being created (a pending marker), and remote otherwise — so an ordinary `git clone`'s `.git` syncs to the remote, while `drive9 git clone --fast` overlays `.git` locally. `.hg` and `.svn` always sync to the remote. See "`.git` routing" below.
 - These local-only paths are still merged into FUSE directory listings with tracked Git workspace entries, so generated directories under a tracked source directory remain visible to local build tools without being uploaded to Drive9.
 - Local-only dependency and generated-output files are a rebuildable performance layer. Their ordinary FUSE `Flush` path does not force `fsync`; it refreshes local inode metadata only. Explicit `Fsync` still syncs the local file.
 - Lightweight `.git` state is checkpointed asynchronously and coalesced per workspace. Foreground `Flush`, `Fsync`, `Release`, `Rename`, and `Unlink` on local `.git` files only perform the necessary local filesystem operation and schedule a checkpoint; `FlushAll`/unmount drains pending checkpoints.
@@ -119,8 +119,10 @@ Git-ignore policy
 
 `.git` routing
 
-- `**/.git/**` is a default `[local]` pattern, so the working `.git` is overlaid unconditionally from the first write. This matters because `git clone --fast` creates `.git` before the workspace is registered.
-- The state served from the overlay is still Git metadata: it is checkpointed (see below), not treated as durable project content.
+- `.git` follows workspace membership, not a pattern: a path at or under a `.git` directory is overlaid locally when it belongs to a loaded Git workspace, otherwise it is remote.
+- `drive9 git clone --fast` (and `git worktree add --fast`) write a local *pending* marker under `<local-root>/git-workspaces/pending/` before running git. The workspace row is only registered after the clone, so during the clone the pending marker is what keeps `.git` local; without it the clone's `.git` writes would upload to the remote, which the fast-clone design forbids. The marker is cleared on failure and dropped when the last workspace is deleted.
+- An ordinary `git clone` writes neither a workspace row nor a pending marker, so its `.git` is ordinary remote-backed content and round-trips across local roots.
+- The `.git` state served from the overlay is still Git metadata: it is checkpointed (see below), not treated as durable project content.
 
 ## Clone Flow
 

@@ -39,6 +39,7 @@ const gitWorkspaceListBackoffMin = time.Second
 const gitWorkspaceListBackoffMax = 30 * time.Second
 const gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
 const gitWorkspaceModeFastBlobless = "fast-blobless"
+const gitDirSegment = ".git"
 const gitLocalObjectMaxBlobBytes int64 = 5 << 20
 const gitLocalObjectMaxPackBytes int64 = 256 << 20
 
@@ -1414,6 +1415,66 @@ func (fs *Dat9FS) gitIgnoredAncestorCached(rt *gitWorkspaceRuntime, rel string) 
 		}
 	}
 	return false
+}
+
+// gitDirShouldBeLocalOverlay reports whether localPath is (or is under) a
+// `.git` directory that belongs to a drive9 Git workspace, either already
+// registered or still being created (a pending marker).
+//
+// This is the "registered workspace ⇒ local, otherwise ⇒ remote" rule for VCS
+// metadata: an ordinary `git clone` (no workspace, no pending marker) keeps its
+// `.git` on the remote, while `drive9 git clone --fast` overlays `.git` locally
+// from the moment it starts writing — the workspace row is only registered
+// after the clone, so a pending marker covers that window.
+func (fs *Dat9FS) gitDirShouldBeLocalOverlay(ctx context.Context, localPath string) bool {
+	if fs == nil || fs.opts == nil || !profileAllowsLocalPolicy(fs.opts.Profile) {
+		return false
+	}
+	if fs.git == nil || fs.localOverlay == nil {
+		return false
+	}
+	// Cheap necessary condition: only a path with a `.git` segment can match.
+	// This runs for every remote-default path, so the common case is rejected
+	// before paying for workspace routing or a pending-marker stat.
+	if !pathHasGitDirSegment(localPath) {
+		return false
+	}
+	if rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath); ok && rt != nil {
+		if rel == ".git" || strings.HasPrefix(rel, ".git/") {
+			return true
+		}
+	}
+	if root, ok := mountRootForGitDirPath(localPath); ok {
+		return gitcache.WorkspacePending(ctx, fs.opts.LocalRoot, root)
+	}
+	return false
+}
+
+// pathHasGitDirSegment reports whether localPath contains a path segment named
+// exactly ".git". Segment-exact matters: `.gitignore` must not match.
+func pathHasGitDirSegment(localPath string) bool {
+	if !strings.Contains(localPath, gitDirSegment) {
+		return false
+	}
+	for _, part := range strings.Split(localPath, "/") {
+		if part == gitDirSegment {
+			return true
+		}
+	}
+	return false
+}
+
+// mountRootForGitDirPath returns the mount-local root that owns the nearest
+// `.git` segment of localPath (for example "/repo" for "/repo/.git/config").
+func mountRootForGitDirPath(localPath string) (string, bool) {
+	parts := strings.Split(localPath, "/")
+	for i, part := range parts {
+		if part != gitDirSegment {
+			continue
+		}
+		return "/" + strings.Join(parts[:i], "/"), true
+	}
+	return "", false
 }
 
 func gitIgnoreCacheKey(rt *gitWorkspaceRuntime, rel string, dirHint bool) string {

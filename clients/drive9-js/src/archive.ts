@@ -611,10 +611,11 @@ async function buildMatcher(client: Client, opts: ArchiveOptions): Promise<Match
 }
 
 // Mirrors the Go CLI's coding-agent default skip set. The Go mount layer
-// splits these into [local] (.git, node_modules, .venv — overlaid
-// unconditionally) and [local-gitignore-aware] (target — overlaid only when the
-// repository ignores it). A bulk archive has no Git ignore oracle, so it
-// applies the union directly.
+// splits these into [local] (node_modules, .venv, overlaid unconditionally) and
+// [local-gitignore-aware] (target, overlaid only when the repository ignores
+// it); `.git` is routed structurally by the mount and is not listed here. A
+// bulk archive has no Git ignore oracle, so it applies the union directly, with
+// `.git` skipped as it always has been for archives.
 export const codingAgentLocalOnly = [
   "**/.git/**",
   "**/node_modules/**",

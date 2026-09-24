@@ -121,6 +121,87 @@ func LocalArmSignal(ctx context.Context, localRoot string) (armed bool, gen stri
 	return true, fmt.Sprintf("%016x", h.Sum64())
 }
 
+// WorkspacePendingDir returns the directory that holds pre-registration
+// markers. A pending marker means "a git workspace is being created at this
+// mount-local root but is not registered yet".
+func WorkspacePendingDir(localRoot string) string {
+	return filepath.Join(strings.TrimSpace(localRoot), "git-workspaces", "pending")
+}
+
+// WorkspacePendingMarkerPath returns the pending marker for a mount-local
+// workspace root path (for example "/repo", or "/" for the mount root).
+func WorkspacePendingMarkerPath(localRoot, mountRoot string) string {
+	return filepath.Join(WorkspacePendingDir(localRoot), safePathSegment(normalizeMountRoot(mountRoot)))
+}
+
+func normalizeMountRoot(mountRoot string) string {
+	return "/" + strings.Trim(strings.TrimSpace(mountRoot), "/")
+}
+
+// MarkWorkspacePending records that a git workspace is being created at
+// mountRoot (a mount-local path) before it is registered, so a live mount
+// overlays `.git` under that root locally instead of uploading it during
+// `git clone --fast`.
+func MarkWorkspacePending(ctx context.Context, localRoot, mountRoot string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	localRoot = strings.TrimSpace(localRoot)
+	if localRoot == "" {
+		return nil
+	}
+	marker := WorkspacePendingMarkerPath(localRoot, mountRoot)
+	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		return fmt.Errorf("create git workspace pending dir %q: %w", filepath.Dir(marker), err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	body := normalizeMountRoot(mountRoot) + "\n" + time.Now().UTC().Format(time.RFC3339Nano) + "\n"
+	if err := os.WriteFile(marker, []byte(body), 0o644); err != nil {
+		return fmt.Errorf("write git workspace pending marker %q: %w", marker, err)
+	}
+	return nil
+}
+
+// ClearWorkspacePending removes the pending marker for mountRoot.
+func ClearWorkspacePending(ctx context.Context, localRoot, mountRoot string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	localRoot = strings.TrimSpace(localRoot)
+	if localRoot == "" {
+		return nil
+	}
+	marker := WorkspacePendingMarkerPath(localRoot, mountRoot)
+	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove git workspace pending marker %q: %w", marker, err)
+	}
+	return nil
+}
+
+// WorkspacePending reports whether a pending marker exists for mountRoot.
+func WorkspacePending(ctx context.Context, localRoot, mountRoot string) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	localRoot = strings.TrimSpace(localRoot)
+	if localRoot == "" {
+		return false
+	}
+	_, err := os.Stat(WorkspacePendingMarkerPath(localRoot, mountRoot))
+	return err == nil
+}
+
 // MarkWorkspaceRegistered updates local signals after a successful remote
 // git-workspace registration: refresh marker for the id, clear deleted, touch armed.
 func MarkWorkspaceRegistered(ctx context.Context, localRoot, workspaceID string) error {
@@ -130,9 +211,9 @@ func MarkWorkspaceRegistered(ctx context.Context, localRoot, workspaceID string)
 	return TouchWorkspaceArmed(ctx, localRoot)
 }
 
-// ClearLocalArmSignals removes the LocalRoot armed file and refresh markers so a
-// mount can stay dormant after the last workspace is deleted. Deleted markers
-// under git-workspaces/deleted/ are left intact.
+// ClearLocalArmSignals removes the LocalRoot armed file, refresh markers, and
+// pre-registration markers so a mount can stay dormant after the last workspace
+// is deleted. Deleted markers under git-workspaces/deleted/ are left intact.
 func ClearLocalArmSignals(ctx context.Context, localRoot string) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -166,6 +247,9 @@ func ClearLocalArmSignals(ctx context.Context, localRoot string) error {
 	// Drop the refresh directory itself so LocalArmSignal does not treat an empty
 	// dir mtime as an arm signal.
 	_ = os.Remove(refreshDir)
+	// Drop pre-registration markers too: with no workspaces left, no root should
+	// still be treated as a workspace-in-progress.
+	_ = os.RemoveAll(WorkspacePendingDir(localRoot))
 	if len(errs) == 0 {
 		return nil
 	}

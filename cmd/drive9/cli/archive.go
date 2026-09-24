@@ -191,10 +191,16 @@ func Archive(c *client.Client, args []string) error {
 	return sourceClient.ArchiveDir(ctx, srcRP.Path, out, opts)
 }
 
+// archiveVCSExcludes are skipped by every profiled archive. The mount routes
+// `.git` structurally (only a Git workspace's `.git` is local, so it is not in
+// the profile [local] list), but an archive is a bulk download with no
+// workspace awareness: VCS metadata is never wanted in the tarball.
+var archiveVCSExcludes = []string{"**/.git/**", "**/.hg/**", "**/.svn/**"}
+
 // buildArchiveOptions merges profile rules with explicit flags into
 // client.ArchiveOptions.
 //
-//	exclude           = profile.[local] + profile.[local-gitignore-aware] + --exclude
+//	exclude           = VCS metadata + profile.[local] + profile.[local-gitignore-aware] + --exclude
 //	include-override  = profile.[remote]                (override, restores an excluded path)
 //	include-whitelist = --include                        (only these are kept when non-empty)
 //
@@ -212,7 +218,7 @@ func buildArchiveOptions(profileName string, includes, excludes stringListFlag, 
 		profileLocalGitignoreAware = cfg.LocalGitignoreAwarePatterns
 		profileRemoteOnly = cfg.RemoteOnlyPatterns
 	}
-	excludePatterns := mergeProfileValues(profileLocalOnly, profileLocalGitignoreAware, []string(excludes))
+	excludePatterns := mergeProfileValues(archiveVCSExcludes, profileLocalOnly, profileLocalGitignoreAware, []string(excludes))
 	includePatterns := mergeProfileValues(nil, []string(includes))
 	overridePatterns := mergeProfileValues(profileRemoteOnly)
 

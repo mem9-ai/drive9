@@ -110,6 +110,23 @@ func gitClone(args []string) error {
 		return err
 	}
 
+	// Mark the root as a workspace-in-progress BEFORE git writes `.git`. The
+	// workspace row is only registered after the clone, so without this marker a
+	// live mount would classify `.git` as remote during the clone and upload the
+	// object database. The marker is cleared on failure; on success it is left in
+	// place (the registered workspace takes over, and ClearLocalArmSignals drops
+	// it when the last workspace is deleted).
+	workspaceRoot := mountLocalRootForTarget(resolved)
+	if err := gitcache.MarkWorkspacePending(cmdCtx, resolved.LocalRoot, workspaceRoot); err != nil {
+		return fmt.Errorf("mark git workspace pending: %w", err)
+	}
+	registered := false
+	defer func() {
+		if !registered {
+			_ = gitcache.ClearWorkspacePending(context.Background(), resolved.LocalRoot, workspaceRoot)
+		}
+	}()
+
 	if existingFastGitCheckout(cmdCtx, target) {
 		if err := checkFastCloneResumeIdentity(cmdCtx, target, repoURL); err != nil {
 			return err
@@ -195,6 +212,7 @@ func gitClone(args []string) error {
 	if err := markLocalGitWorkspaceRegistered(cmdCtx, resolved, ws.WorkspaceID); err != nil {
 		return fmt.Errorf("registered git workspace %s, but writing local discovery marker failed: %w", ws.WorkspaceID, err)
 	}
+	registered = true
 
 	fmt.Fprintf(os.Stderr, "drive9: registered git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, resolved.RemotePath, len(nodes))
 	if *blobless {
@@ -288,6 +306,20 @@ func gitWorktreeAdd(args []string) error {
 	if !sameDrive9Mount(baseResolved, worktreeResolved) {
 		return fmt.Errorf("base repo and worktree path must be inside the same drive9 mount")
 	}
+
+	// Mark the worktree root as a workspace-in-progress before `git worktree add`
+	// writes its `.git` file and the linked gitdir under the base repo. See the
+	// equivalent note in gitClone.
+	worktreeRoot := mountLocalRootForTarget(worktreeResolved)
+	if err := gitcache.MarkWorkspacePending(cmdCtx, worktreeResolved.LocalRoot, worktreeRoot); err != nil {
+		return fmt.Errorf("mark git worktree pending: %w", err)
+	}
+	worktreeRegistered := false
+	defer func() {
+		if !worktreeRegistered {
+			_ = gitcache.ClearWorkspacePending(context.Background(), worktreeResolved.LocalRoot, worktreeRoot)
+		}
+	}()
 
 	c := NewFromEnv()
 	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
@@ -411,6 +443,7 @@ func gitWorktreeAdd(args []string) error {
 	if err := markLocalGitWorkspaceRegistered(cmdCtx, worktreeResolved, ws.WorkspaceID); err != nil {
 		return fmt.Errorf("registered linked git workspace %s, but writing local discovery marker failed: %w", ws.WorkspaceID, err)
 	}
+	worktreeRegistered = true
 
 	fmt.Fprintf(os.Stderr, "drive9: registered linked git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, worktreeResolved.RemotePath, len(nodes))
 	if linkedBlobless {
@@ -821,6 +854,17 @@ func localGitDirForMountedTarget(localRoot, rel string) (string, error) {
 		localPath = filepath.Join(localPath, rel)
 	}
 	return filepath.Join(localPath, ".git"), nil
+}
+
+// mountLocalRootForTarget returns the mount-local root path of a workspace
+// (for example "/repo", or "/" for the mount root). This is the key under which
+// the FUSE mount classifies paths, and under which a pending marker is written.
+func mountLocalRootForTarget(resolved mountedGitTarget) string {
+	rel := strings.Trim(resolved.MountRel, "/")
+	if rel == "" || rel == "." {
+		return "/"
+	}
+	return "/" + rel
 }
 
 func localOverlayRootForMountedTarget(resolved mountedGitTarget) (string, error) {

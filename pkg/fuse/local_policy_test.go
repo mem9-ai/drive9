@@ -16,10 +16,11 @@ func TestLocalPolicyCodingAgentDefaultsMatchGitSegmentExactly(t *testing.T) {
 		{path: "/repo/node_modules/react/index.js", want: PathLayerLocalOnly},
 		{path: "/repo/target/debug/app", want: PathLayerLocalOnly},
 		{path: "/repo/node_modules_extra/x.js", want: PathLayerRemotePersistent},
-		// Segment-exact `.git` metadata.
-		{path: "/repo/.git", want: PathLayerLocalOnly},
-		{path: "/repo/.git/config", want: PathLayerLocalOnly},
-		// `.hg`/`.svn` are not overlaid; only `.git` has fast-clone coupling.
+		// VCS metadata is not a static pattern; `.git` is routed by workspace
+		// membership at the fs layer (see TestGitDirRoutesByWorkspace), so a
+		// bare policy classifies it as remote.
+		{path: "/repo/.git", want: PathLayerRemotePersistent},
+		{path: "/repo/.git/config", want: PathLayerRemotePersistent},
 		{path: "/repo/.hg/store/data", want: PathLayerRemotePersistent},
 		{path: "/repo/.svn/pristine/aa", want: PathLayerRemotePersistent},
 		{path: "/repo/.gitignore", want: PathLayerRemotePersistent},

@@ -127,24 +127,20 @@ func validMountProfileName(profile string) bool {
 
 // defaultCodingAgentLocalOnlyPatterns are overlaid unconditionally.
 //
-// `.git` must stay here. `git clone --fast` writes the working `.git` before
-// the workspace row is registered, so a workspace-scoped rule cannot see it
-// during the clone; without the pattern those writes upload to the remote,
-// which the fast-clone design forbids ("do not persist the full Git object
-// database in Drive9"). The `.git` content is still Git state, not project
-// files: it is checkpointed, never treated as durable content.
+// VCS metadata is deliberately absent. `.git` is routed structurally: it is
+// local only when the path belongs to a registered Git workspace or one that is
+// being created (see gitDirShouldBeLocalOverlay). An ordinary clone's `.git`
+// therefore syncs to the remote, and `drive9 git clone --fast` overlays its
+// `.git` locally from the first write via a pending marker. `.hg`/`.svn` have no
+// workspace coupling and always sync to the remote.
 //
-// `.hg` and `.svn` are deliberately absent: nothing overlays them for a
-// workspace, so they sync to the remote like ordinary files.
-//
-// Dependency trees are listed here too: their names unambiguously denote
-// generated trees, so there is no need to consult the repository.
+// Dependency trees are listed here: their names unambiguously denote generated
+// trees, so there is no need to consult the repository.
 func defaultCodingAgentLocalOnlyPatterns(profile string) []string {
 	if profile != MountProfileCodingAgent {
 		return nil
 	}
 	return []string{
-		"**/.git/**",
 		"**/node_modules/**",
 		"**/.venv/**",
 	}
@@ -223,6 +219,13 @@ func (fs *Dat9FS) observePathPolicyWithHint(ctx context.Context, localPath strin
 			layer = PathLayerRemotePersistent
 			source = policyMatchRemoteDefault
 		}
+	}
+	// `.git` belongs to a workspace, not to a static pattern: overlay it locally
+	// when the path is a registered workspace's `.git`, or a workspace is being
+	// created there (pending marker). An ordinary clone's `.git` stays remote.
+	if layer == PathLayerRemotePersistent && source == policyMatchRemoteDefault && fs.gitDirShouldBeLocalOverlay(ctx, localPath) {
+		layer = PathLayerLocalOnly
+		source = policyMatchLocalOnly
 	}
 	if fs.perfEnabled() {
 		fs.perf.recordLocalPolicy(source)

@@ -3411,21 +3411,70 @@ func TestGitignoreAwareGateFailsOpenWhenOracleUnavailable(t *testing.T) {
 // [local] list: `git clone --fast` writes the working `.git` before the
 // workspace row is registered, so `.git` must be local from the pattern alone,
 // with no workspace loaded and no gitignore gate.
-func TestGitDirIsLocalOnlyByPattern(t *testing.T) {
-	opts := &MountOptions{LocalRoot: t.TempDir(), Profile: MountProfileCodingAgent}
+// TestGitDirRoutesByWorkspace covers the `.git` rule with no workspace loaded:
+// a registered workspace's `.git` is local, a plain clone's `.git` is remote,
+// and a pending marker makes an in-progress workspace local.
+func TestGitDirRoutesByWorkspace(t *testing.T) {
+	localRoot := t.TempDir()
+	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	ctx := context.Background()
 
+	// No workspace, no pending marker: `.git` is ordinary content (remote).
 	for _, path := range []string{"/repo/.git", "/repo/.git/config", "/repo/.git/objects/ab/cd"} {
-		if got := fs.observePathPolicy(path); got != PathLayerLocalOnly {
-			t.Errorf("%q = %s, want local-only", path, got)
+		if got := fs.observePathPolicy(path); got != PathLayerRemotePersistent {
+			t.Errorf("%q with no workspace = %s, want remote persistent", path, got)
 		}
 	}
-	// Segment-exact: these are not VCS metadata.
+	// Segment-exact matching still holds.
 	for _, path := range []string{"/repo/.gitignore", "/repo/notes.git.txt"} {
 		if got := fs.observePathPolicy(path); got != PathLayerRemotePersistent {
 			t.Errorf("%q = %s, want remote persistent", path, got)
 		}
+	}
+
+	// A pending workspace root marks `/repo` as in-progress: `.git` is local.
+	if err := gitcache.MarkWorkspacePending(ctx, localRoot, "/repo"); err != nil {
+		t.Fatalf("MarkWorkspacePending: %v", err)
+	}
+	for _, path := range []string{"/repo/.git", "/repo/.git/config", "/repo/.git/objects/ab/cd"} {
+		if got := fs.observePathPolicy(path); got != PathLayerLocalOnly {
+			t.Errorf("%q with pending marker = %s, want local-only", path, got)
+		}
+	}
+	// A different root stays remote, and segment-exact paths stay remote.
+	for _, path := range []string{"/other/.git/config", "/repo/.gitignore"} {
+		if got := fs.observePathPolicy(path); got != PathLayerRemotePersistent {
+			t.Errorf("%q = %s, want remote persistent", path, got)
+		}
+	}
+
+	// Clearing the marker returns the root to remote.
+	if err := gitcache.ClearWorkspacePending(ctx, localRoot, "/repo"); err != nil {
+		t.Fatalf("ClearWorkspacePending: %v", err)
+	}
+	if got := fs.observePathPolicy("/repo/.git/config"); got != PathLayerRemotePersistent {
+		t.Errorf("after clear, .git = %s, want remote persistent", got)
+	}
+}
+
+// TestGitDirPendingMarkerKeyedByMountRoot covers the root form: the mount root
+// "/" marker covers `.git` at the mount root only.
+func TestGitDirPendingMarkerKeyedByMountRoot(t *testing.T) {
+	localRoot := t.TempDir()
+	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	if err := gitcache.MarkWorkspacePending(context.Background(), localRoot, "/"); err != nil {
+		t.Fatalf("MarkWorkspacePending: %v", err)
+	}
+	if got := fs.observePathPolicy("/.git/config"); got != PathLayerLocalOnly {
+		t.Errorf("mount-root .git = %s, want local-only", got)
+	}
+	if got := fs.observePathPolicy("/repo/.git/config"); got != PathLayerRemotePersistent {
+		t.Errorf("unrelated /repo/.git = %s, want remote persistent", got)
 	}
 }
 
