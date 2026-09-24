@@ -3675,8 +3675,20 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncateWithCommit(ino uint64, callerP
 		// that old handle dirty makes its delayed Release publish a hidden zero
 		// generation and stale the new writer's CAS base.
 		cleanHandle := !writableHandleHasPendingContentLocked(fh)
+		// Once the path truncate is remotely committed, every clean handle with a
+		// kernel-supplied owner PID can adopt that authoritative generation.
+		// Release delivery is asynchronous and the clean handle may belong to an
+		// earlier process, for example two consecutive `open(path, O_TRUNC)`
+		// shell helpers.
+		// Restricting the rebase to callerPID turns the older cross-process
+		// handle into a new dirty zero generation below; its delayed Release can
+		// then advance the CAS revision ahead of the current writer and discard
+		// that writer's multipart commit. Pending handles still bypass this
+		// branch and retain the stale-writer conflict fence. Handles without an
+		// owner PID keep the conservative legacy path because their lifecycle
+		// cannot be distinguished from a synthetic truncate helper.
 		mayRebaseCleanHandle := fs.appendLogPathConfigured(fh.Path) ||
-			(remoteCommitted && callerPID != 0 && fh.OpenPID == callerPID)
+			(remoteCommitted && fh.OpenPID != 0)
 		if cleanHandle && mayRebaseCleanHandle {
 			if revision, committedSize, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && revision > 0 && committedSize == newSize {
 				fs.adoptCommittedStorageClassLocked(fh, newSize)

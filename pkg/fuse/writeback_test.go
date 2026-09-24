@@ -1589,7 +1589,10 @@ func TestCloseSyncFlushSupersedesPathZeroShadowBeforeRelease(t *testing.T) {
 
 func TestCloseSyncPathTruncateDoesNotAdoptCleanUnreleasedHandle(t *testing.T) {
 	const path = "/supervise-probe.txt"
-	const pid = 4242
+	const (
+		firstPID  = 4242
+		secondPID = 4343
+	)
 
 	var (
 		mu           sync.Mutex
@@ -1664,7 +1667,7 @@ func TestCloseSyncPathTruncateDoesNotAdoptCleanUnreleasedHandle(t *testing.T) {
 	ino := fs.inodes.Lookup(path, false, int64(len(content)), time.Now())
 	fs.inodes.UpdateRevision(ino, rev)
 
-	openWriter := func() gofuse.OpenOut {
+	openWriter := func(pid uint32) gofuse.OpenOut {
 		t.Helper()
 		var out gofuse.OpenOut
 		if st := fs.Open(nil, &gofuse.OpenIn{
@@ -1675,7 +1678,7 @@ func TestCloseSyncPathTruncateDoesNotAdoptCleanUnreleasedHandle(t *testing.T) {
 		}
 		return out
 	}
-	writeAndFlush := func(out gofuse.OpenOut, data []byte) gofuse.Status {
+	writeAndFlush := func(pid uint32, out gofuse.OpenOut, data []byte) gofuse.Status {
 		t.Helper()
 		if _, st := fs.Write(nil, &gofuse.WriteIn{
 			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
@@ -1691,41 +1694,41 @@ func TestCloseSyncPathTruncateDoesNotAdoptCleanUnreleasedHandle(t *testing.T) {
 	}
 
 	// Keep the first, already-flushed handle registered. Linux may delay its
-	// Release until after the same process has started the next O_TRUNC open.
+	// Release until after a later process has started the next O_TRUNC open.
 	// The path SetAttr must not fold that new truncate into this clean old
 	// handle: its delayed Release would publish a hidden zero-byte generation
 	// and make the new writer's CAS stale.
-	first := openWriter()
-	if st := writeAndFlush(first, []byte("first\n")); st != gofuse.OK {
+	first := openWriter(firstPID)
+	if st := writeAndFlush(firstPID, first, []byte("first\n")); st != gofuse.OK {
 		t.Fatalf("first Flush status = %v, want OK", st)
 	}
 
 	var attrOut gofuse.AttrOut
 	if st := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
-		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
 		Valid:    gofuse.FATTR_SIZE,
 		Size:     0,
 	}}, &attrOut); st != gofuse.OK {
 		t.Fatalf("SetAttr truncate status = %v, want OK", st)
 	}
 
-	second := openWriter()
+	second := openWriter(secondPID)
 	if _, st := fs.Write(nil, &gofuse.WriteIn{
-		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
 		Fh:       second.Fh,
 		Offset:   0,
 	}, []byte("second\n")); st != gofuse.OK {
 		t.Fatalf("second Write status = %v, want OK", st)
 	}
 
-	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}}, Fh: first.Fh})
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: firstPID}}, Fh: first.Fh})
 	if st := fs.Flush(nil, &gofuse.FlushIn{
-		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
 		Fh:       second.Fh,
 	}); st != gofuse.OK {
 		t.Fatalf("second Flush status = %v, want OK", st)
 	}
-	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}}, Fh: second.Fh})
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}}, Fh: second.Fh})
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -1737,6 +1740,297 @@ func TestCloseSyncPathTruncateDoesNotAdoptCleanUnreleasedHandle(t *testing.T) {
 	}
 	if failNextHead {
 		t.Fatal("post-truncate HEAD failure injection was not exercised")
+	}
+}
+
+func TestWriteSyncTierTransitionRebasesCleanUnreleasedHandleAcrossPIDs(t *testing.T) {
+	const (
+		path      = "/tier-transition.bin"
+		firstPID  = 4242
+		secondPID = 4343
+		smallSize = 10 * 1024
+		largeSize = 8 * 1024 * 1024
+	)
+
+	type multipartState struct {
+		expected int64
+		size     int64
+		parts    map[int][]byte
+	}
+	var (
+		mu            sync.Mutex
+		content             = []byte("seed\n")
+		revision      int64 = 1
+		directPuts    int
+		completeCalls int
+		active        multipartState
+	)
+
+	checkExpected := func(raw string) bool {
+		if raw == "" {
+			return true
+		}
+		expected, err := strconv.ParseInt(raw, 10, 64)
+		return err == nil && (expected < 0 || expected == revision)
+	}
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+path:
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+path:
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			_, _ = w.Write(content)
+
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+path:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read direct PUT body: %v", err)
+				http.Error(w, "read body", http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !checkExpected(r.Header.Get("X-Dat9-Expected-Revision")) {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			content = append(content[:0], body...)
+			revision++
+			directPuts++
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": revision})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode initiate: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if req.Path != path || req.TotalSize <= 0 || req.TotalSize > largeSize || req.ExpectedRevision == nil {
+				t.Errorf("initiate = path %q size %d expected %v, want %q/(0,%d]/non-nil", req.Path, req.TotalSize, req.ExpectedRevision, path, largeSize)
+				http.Error(w, "bad initiate", http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			active = multipartState{expected: *req.ExpectedRevision, size: req.TotalSize, parts: make(map[int][]byte)}
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "tier-upload",
+				"key":         "tier-object",
+				"part_size":   int64(s3client.PartSize),
+				"total_parts": int((req.TotalSize + int64(s3client.PartSize) - 1) / int64(s3client.PartSize)),
+			})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/tier-upload/presign-batch":
+			mu.Lock()
+			activeSize := active.size
+			mu.Unlock()
+			parts := make([]map[string]any, 0, 2)
+			for partNum, offset := 1, int64(0); offset < activeSize; partNum, offset = partNum+1, offset+int64(s3client.PartSize) {
+				size := min(int64(s3client.PartSize), activeSize-offset)
+				parts = append(parts, map[string]any{
+					"number": partNum,
+					"url":    ts.URL + "/s3/tier-upload/" + strconv.Itoa(partNum),
+					"size":   size,
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"parts": parts})
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/tier-upload/presign":
+			var req struct {
+				PartNumber int `json:"part_number"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode presign: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": req.PartNumber,
+				"url":    ts.URL + "/s3/tier-upload/" + strconv.Itoa(req.PartNumber),
+				"size":   int64(s3client.PartSize),
+			})
+
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/tier-upload/"):
+			partNum, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/s3/tier-upload/"))
+			if err != nil {
+				t.Errorf("parse part number: %v", err)
+				http.Error(w, "bad part", http.StatusBadRequest)
+				return
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read part body: %v", err)
+				http.Error(w, "read part", http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			active.parts[partNum] = body
+			mu.Unlock()
+			w.Header().Set("ETag", fmt.Sprintf("etag-%d", partNum))
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/tier-upload/complete":
+			mu.Lock()
+			defer mu.Unlock()
+			if active.expected != revision {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			assembled := make([]byte, 0, active.size)
+			for partNum := 1; int64(len(assembled)) < active.size; partNum++ {
+				part, ok := active.parts[partNum]
+				if !ok {
+					http.Error(w, "missing part", http.StatusBadRequest)
+					return
+				}
+				assembled = append(assembled, part...)
+			}
+			content = assembled
+			revision++
+			completeCalls++
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodDelete && r.URL.Path == "/v2/uploads/tier-upload":
+			w.WriteHeader(http.StatusNoContent)
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(50_000)
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict, WritePolicy: WritePolicyWriteSync}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	ino := fs.inodes.Lookup(path, false, int64(len(content)), time.Now())
+	fs.inodes.UpdateRevision(ino, revision)
+
+	openWriter := func(pid uint32, flags uint32) gofuse.OpenOut {
+		t.Helper()
+		var out gofuse.OpenOut
+		if st := fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+			Flags:    flags,
+		}, &out); st != gofuse.OK {
+			t.Fatalf("Open(pid=%d, flags=%#x) status = %v, want OK", pid, flags, st)
+		}
+		return out
+	}
+
+	first := openWriter(firstPID, uint32(syscall.O_WRONLY))
+	small := bytes.Repeat([]byte{0x11}, smallSize)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: firstPID}},
+		Fh:       first.Fh,
+		Offset:   0,
+	}, small); st != gofuse.OK {
+		t.Fatalf("first Write status = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: firstPID}},
+		Fh:       first.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("first Flush status = %v, want OK", st)
+	}
+	firstFH, _ := fs.fileHandles.Get(first.Fh)
+	firstFH.Lock()
+	if firstFH.BaseRev != 2 || writableHandleHasPendingContentLocked(firstFH) {
+		t.Fatalf("first handle before truncate = base %d pending %t, want base 2 pending false", firstFH.BaseRev, writableHandleHasPendingContentLocked(firstFH))
+	}
+	firstFH.Unlock()
+
+	// Model the kernel ordering observed in the real FUSE gate: the second
+	// process commits the path zero-truncate while the first process's clean
+	// handle remains registered, then opens its O_TRUNC writer.
+	var attrOut gofuse.AttrOut
+	if st := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+		Valid:    gofuse.FATTR_SIZE,
+		Size:     0,
+	}}, &attrOut); st != gofuse.OK {
+		t.Fatalf("SetAttr truncate status = %v, want OK", st)
+	}
+	firstFH.Lock()
+	if firstFH.BaseRev != 3 || writableHandleHasPendingContentLocked(firstFH) || firstFH.Dirty.Size() != 0 {
+		t.Fatalf("clean cross-PID handle after truncate = base %d pending %t size %d, want base 3 pending false size 0",
+			firstFH.BaseRev, writableHandleHasPendingContentLocked(firstFH), firstFH.Dirty.Size())
+	}
+	firstFH.Unlock()
+	// Release from the previous process is one-way and may be handled after
+	// the next process's SetAttr but before that process starts writing.
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: firstPID}},
+		Fh:       first.Fh,
+	})
+
+	second := openWriter(secondPID, uint32(syscall.O_WRONLY|syscall.O_TRUNC))
+	large := bytes.Repeat([]byte{0x2b}, largeSize)
+	for offset := 0; offset < len(large); offset += 1024 * 1024 {
+		end := min(offset+1024*1024, len(large))
+		if _, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+			Fh:       second.Fh,
+			Offset:   uint64(offset),
+		}, large[offset:end]); st != gofuse.OK {
+			t.Fatalf("second Write(offset=%d) status = %v, want OK", offset, st)
+		}
+	}
+
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+		Fh:       second.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("second Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: secondPID}},
+		Fh:       second.Fh,
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if directPuts != 2 {
+		t.Fatalf("direct PUT calls = %d, want 2 (10KiB write + zero truncate)", directPuts)
+	}
+	if completeCalls == 0 {
+		t.Fatal("multipart complete calls = 0, want at least one committed tier transition")
+	}
+	if len(content) != largeSize || !bytes.Equal(content, large) {
+		t.Fatalf("remote multipart content = size %d matching=%t, want size %d matching=true", len(content), bytes.Equal(content, large), largeSize)
 	}
 }
 

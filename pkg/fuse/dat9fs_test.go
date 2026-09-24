@@ -20983,6 +20983,16 @@ func TestSetAttr_PathTruncateDoesNotRefreshStaleWriterHandle(t *testing.T) {
 	if !ok {
 		t.Fatal("stale writer handle not found")
 	}
+	// A cross-process handle with pending content must retain its old CAS
+	// baseline across another process's path truncate. Clean cross-process
+	// handles are instead safe to rebase to the committed truncate revision.
+	if _, st = fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: stalePID}},
+		Fh:       staleOut.Fh,
+		Offset:   0,
+	}, []byte("pending")); st != gofuse.OK {
+		t.Fatalf("stale writer pre-truncate Write status = %v, want OK", st)
+	}
 
 	var truncOut gofuse.OpenOut
 	st = fs.Open(nil, &gofuse.OpenIn{
@@ -21045,7 +21055,7 @@ func TestSetAttr_PathTruncateDoesNotRefreshStaleWriterHandle(t *testing.T) {
 	}
 }
 
-func TestSetAttr_PathTruncateSingleStaleWriterHandleKeepsOriginalRevision(t *testing.T) {
+func TestSetAttr_PathTruncateSingleCleanWriterHandleRebasesCommittedRevision(t *testing.T) {
 	const (
 		stalePID    = 8001
 		truncatePID = 8002
@@ -21140,8 +21150,8 @@ func TestSetAttr_PathTruncateSingleStaleWriterHandleKeepsOriginalRevision(t *tes
 		t.Fatalf("SetAttr status = %v, want OK", st)
 	}
 
-	if staleFH.BaseRev != 1 {
-		t.Fatalf("single stale writer base revision = %d, want 1", staleFH.BaseRev)
+	if staleFH.BaseRev != 2 {
+		t.Fatalf("single clean writer base revision = %d, want 2", staleFH.BaseRev)
 	}
 
 	if _, st = fs.Write(nil, &gofuse.WriteIn{
@@ -21155,8 +21165,8 @@ func TestSetAttr_PathTruncateSingleStaleWriterHandleKeepsOriginalRevision(t *tes
 	staleFH.Lock()
 	flushStatus := fs.flushHandle(context.Background(), staleFH)
 	staleFH.Unlock()
-	if flushStatus != gofuse.EIO {
-		t.Fatalf("single stale writer flush status = %v, want %v", flushStatus, gofuse.EIO)
+	if flushStatus != gofuse.OK {
+		t.Fatalf("single rebased writer flush status = %v, want %v", flushStatus, gofuse.OK)
 	}
 
 	mu.Lock()
@@ -21165,11 +21175,11 @@ func TestSetAttr_PathTruncateSingleStaleWriterHandleKeepsOriginalRevision(t *tes
 		t.Fatal(handlerErr)
 	}
 	defer mu.Unlock()
-	if got := string(content); got != "" {
-		t.Fatalf("remote content after single stale writer conflict = %q, want empty", got)
+	if got := string(content); got != "stale" {
+		t.Fatalf("remote content after rebased writer flush = %q, want %q", got, "stale")
 	}
-	if revision != 2 {
-		t.Fatalf("remote revision after single stale writer conflict = %d, want 2", revision)
+	if revision != 3 {
+		t.Fatalf("remote revision after rebased writer flush = %d, want 3", revision)
 	}
 }
 
