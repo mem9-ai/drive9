@@ -876,6 +876,146 @@ func TestDirCacheExpiredListingDoesNotRetainRemoteDeletions(t *testing.T) {
 	}
 }
 
+// Tenth review round: the same lapse rule has to cover an *incomplete* listing.
+// An over-cap response never sets the complete marker, so nothing but the
+// listing's own expiry can retire the prefix it cached — and an unrelated local
+// write refreshing the entry's TTL must not extend that prefix's life either.
+func TestDirCacheExpiredPartialListingDropsUnrelistedName(t *testing.T) {
+	const cap = 3
+	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, cap)
+
+	// Over-cap: cached as the bounded prefix, and not complete.
+	listInstall(dc, "/d", []CachedFileInfo{
+		{Name: "keep1.dat"}, {Name: "gone.dat"}, {Name: "keep2.dat"}, {Name: "uncached.dat"},
+	})
+	if _, ok := dc.Get("/d"); ok {
+		t.Fatal("fixture: an over-cap listing must not be served as complete")
+	}
+
+	// The listing lapses; an unrelated local write refreshes the entry's TTL and
+	// evicts keep1.dat (FIFO) but leaves gone.dat in place.
+	time.Sleep(150 * time.Millisecond)
+	dc.Upsert("/d", CachedFileInfo{Name: "local.dat", Revision: 2})
+
+	view := listInstall(dc, "/d", []CachedFileInfo{{Name: "keep2.dat"}, {Name: "local.dat"}})
+
+	if names := cachedNames(t, dc, "/d"); containsName(names, "gone.dat") {
+		t.Fatalf("lapsed partial listing retained a remotely deleted name: %v", names)
+	}
+	if containsName(viewNames(view), "gone.dat") {
+		t.Fatalf("lapsed partial listing served a remotely deleted name: %v", viewNames(view))
+	}
+	served := viewNames(view)
+	if !containsName(served, "local.dat") || !containsName(served, "keep2.dat") {
+		t.Fatalf("view lost names the cache must keep: %v", served)
+	}
+	// A lookup for the lapsed name must not answer from the cache either.
+	if got := dc.Lookup("/d", "gone.dat"); got.kind == namespaceLookupPositive {
+		t.Fatalf("lapsed partial listing answered a positive lookup: %v", got.kind)
+	}
+}
+
+// A name the response re-lists gets a fresh deadline: a live directory whose
+// every listing carries it must not lose it to the first listing's expiry.
+func TestDirCacheReListedNameOutlivesItsFirstDeadline(t *testing.T) {
+	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "live.dat"}})
+	time.Sleep(50 * time.Millisecond)
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "live.dat"}})
+	// Past the first install's deadline, inside the second's.
+	time.Sleep(50 * time.Millisecond)
+
+	if names := cachedNames(t, dc, "/d"); !containsName(names, "live.dat") {
+		t.Fatalf("re-listed name retired by its first deadline: %v", names)
+	}
+	if got := dc.Lookup("/d", "live.dat"); got.kind != namespaceLookupPositive {
+		t.Fatalf("lookup of a re-listed name = %v, want positive", got.kind)
+	}
+}
+
+// A listing lapse retires what a *response* supplied, never what this mount
+// wrote: the entry's own TTL is what says the cache is still in use, and a
+// commit settled here is invisible to the server's listing for as long as it
+// has not landed, so rebuilding around the response alone would hide it
+// (the bug #966 reports).
+func TestDirCacheListingLapseKeepsLocalNames(t *testing.T) {
+	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "remote.dat"}})
+	// Past the listing's deadline, a local write extends the entry's own TTL
+	// without touching the listing's.
+	time.Sleep(120 * time.Millisecond)
+	dc.Upsert("/d", CachedFileInfo{Name: "acked.dat", Revision: 3})
+
+	// The response cannot carry acked.dat: no LIST has run since the commit.
+	view := listInstall(dc, "/d", []CachedFileInfo{{Name: "remote2.dat"}})
+
+	for _, names := range [][]string{cachedNames(t, dc, "/d"), viewNames(view)} {
+		if !containsName(names, "acked.dat") {
+			t.Fatalf("listing lapse hid a locally committed name: %v", names)
+		}
+	}
+	if names := cachedNames(t, dc, "/d"); containsName(names, "remote.dat") {
+		t.Fatalf("lapsed listing retained a remotely deleted name: %v", names)
+	}
+}
+
+// The same for a name the mount did not create but did write: a listing first
+// supplied it, the mount then committed new content over it, so the cached
+// value is the commit's and a listing deadline passing must not retire it.
+// The response that lands after the lapse omits the name — the stale-listing
+// window the mount already guards elsewhere (see markPathDeleted) — and the
+// served view still has to carry what the mount committed.
+func TestDirCacheListingLapseKeepsLocallyRewrittenName(t *testing.T) {
+	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Size: 1, Revision: 1}, {Name: "gone.dat"}})
+	time.Sleep(120 * time.Millisecond)
+	// No request in flight, so the write carries no stamp of its own: only its
+	// provenance can keep it across the lapse.
+	dc.Upsert("/d", CachedFileInfo{Name: "f.dat", Size: 2, Revision: 2})
+
+	view := listInstall(dc, "/d", []CachedFileInfo{{Name: "other.dat"}})
+
+	assertCachedChild(t, dc, "/d", "f.dat", func(item CachedFileInfo) {
+		if item.Size != 2 || item.Revision != 2 {
+			t.Fatalf("lapse dropped a locally rewritten name's value: size=%d rev=%d", item.Size, item.Revision)
+		}
+	})
+	if !containsName(viewNames(view), "f.dat") {
+		t.Fatalf("lapse hid a locally rewritten name from readdir: %v", viewNames(view))
+	}
+	if names := cachedNames(t, dc, "/d"); containsName(names, "gone.dat") {
+		t.Fatalf("lapse retained a response name the new response omits: %v", names)
+	}
+}
+
+// A stat observation is newer evidence than the listing it replaces, so it must
+// outlive that listing's deadline too: a chmod a remote actor made is carried by
+// an observation (the revision does not advance), and dropping it would revert
+// the mode until the next listing reinstates it.
+func TestDirCacheListingLapseKeepsObservedName(t *testing.T) {
+	dc := NewNamespaceCache(80*time.Millisecond, 80*time.Millisecond, defaultNamespaceCacheMaxEntries)
+
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "f.dat", Mode: 0o644, HasMode: true, Revision: 1}})
+	time.Sleep(120 * time.Millisecond)
+
+	token := dc.BeginRequest("/d")
+	dc.Observe("/d", CachedFileInfo{Name: "f.dat", Mode: 0o600, HasMode: true, Revision: 1}, token)
+
+	view := listInstall(dc, "/d", []CachedFileInfo{{Name: "other.dat"}})
+
+	assertCachedChild(t, dc, "/d", "f.dat", func(item CachedFileInfo) {
+		if !item.HasMode || item.Mode != 0o600 {
+			t.Fatalf("lapse dropped an observed mode: hasMode=%t mode=%o", item.HasMode, item.Mode)
+		}
+	})
+	if !containsName(viewNames(view), "f.dat") {
+		t.Fatalf("lapse hid an observed name from readdir: %v", viewNames(view))
+	}
+}
+
 // --- Eighth review round on #966: bounded resource lifetime -----------------
 
 // The reconciliation state must not accumulate per path a mount has merely

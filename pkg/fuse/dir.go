@@ -68,6 +68,30 @@ type dirCacheEntry struct {
 	missWindowStart   time.Time
 	escalateNotBefore time.Time
 
+	// listingExpires is the deadline of the newest installed listing's
+	// response-derived state, complete or not. Unlike expires it is never
+	// refreshed by a local mutation, so an unrelated commit stream cannot keep a
+	// response's names alive past one TTL; and unlike completeExpires the
+	// install sets it whether or not the whole listing fits in the cache, so a
+	// directory too large to cache in full is bounded here too. A past deadline
+	// is meaningful — it marks the response-derived state as lapsed — so prune
+	// leaves it alone.
+	listingExpires time.Time
+
+	// fromListing holds the names whose currently cached value came from a
+	// listing response, and is always a subset of items. It is what makes an
+	// otherwise stale omission evidence: for such a name the response that
+	// supplied it is the only thing vouching for it, so a newer response
+	// omitting it, or this listing's own deadline passing, retires it. A name
+	// this mount wrote or observed never enters the set — that state stays
+	// authoritative even while the server has not caught up with it, and
+	// dropping it is the readdir invisibility this cache exists to prevent
+	// (issue #966).
+	//
+	// The map is allocated only when a response actually installs a name, so a
+	// directory this mount only ever writes into carries no extra allocation.
+	fromListing map[string]struct{}
+
 	// gen is this directory's part of the global fencing clock: the value
 	// DirCache.gen held when the directory last changed (an install, an
 	// authoritative local write, or a local removal). A read that began at an
@@ -203,8 +227,10 @@ func (dc *DirCache) Put(dirPath string, items []CachedFileInfo) {
 // left the pending overlay, nothing downstream can restore such a name, so an
 // install that trusted the response's omissions would hide an acknowledged
 // file from readdir (issue #966). Names therefore enter the served set through
-// upsert and leave it only through an explicit local removal or a whole-entry
-// retirement (invalidation, expiry), which gives one structural invariant:
+// upsert and leave it only through an explicit local removal, a whole-entry
+// retirement (invalidation, expiry), or a name whose only evidence — a
+// response (see dirCacheEntry.fromListing) — has since been superseded, which
+// gives one structural invariant:
 //
 //	A name this mount has committed cannot disappear from readdir because of
 //	a racing listing.
@@ -247,38 +273,13 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 	entry := dc.ensureEntryLocked(dirPath)
 	entry.expires = now.Add(dc.ttl)
 
-	// A lapsed listing cannot serve as the additive base. Its names are as old
-	// as its expiry, and an unrelated local write refreshes the entry's own TTL
-	// while the listing's has already gone, so an additive merge would replay a
-	// remotely deleted name indefinitely — and renew it on every install. Once
-	// the listing has lapsed the response is the newest word on which of those
-	// names still exist, so the base is reset and only names this mount changed
-	// after the request was taken are carried over: the ones the response
-	// cannot know about. This is also the escape hatch for a remote deletion
-	// that no invalidation reported (see the trade-off in the doc comment).
-	//
-	// The test is the lapsed shape specifically: an install set `complete` and
-	// expiry clearing it, so `complete` still holds while the deadline is gone.
-	// An entry that never held a listing is not lapsed — its names are this
-	// mount's own knowledge, which the response cannot speak for either, so
-	// they stay.
-	listingLapsed := entry.complete && entry.completeExpires.IsZero()
-	if listingLapsed {
-		keptItems := make(map[string]CachedFileInfo, len(entry.items))
-		keptOrder := make([]string, 0, len(entry.items))
-		for _, name := range entry.order {
-			item, live := entry.items[name]
-			if !live {
-				continue
-			}
-			if stamp := entry.localGen[name]; stamp > request.event {
-				keptItems[name] = item
-				keptOrder = append(keptOrder, name)
-			}
-		}
-		entry.items = keptItems
-		entry.order = keptOrder
-	}
+	// A response taken before another install cannot overwrite what that
+	// install published: listings overlap, so the older request's response may
+	// describe each name at an older revision than the cache already has. Its
+	// cache effect is limited to names it is still the newest word on, and the
+	// caller is served the accepted state either way. A stale install also
+	// neither renews nor retires anything: both belong to the newer install.
+	staleInstall := entry.installSeq > request.seq
 
 	// The cache retains a bounded prefix of the response (the pre-existing
 	// large-directory guard: an over-cap listing answers positive lookups from
@@ -289,12 +290,6 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 	if limit > dc.maxEntries {
 		limit = dc.maxEntries
 	}
-	// A response taken before another install cannot overwrite what that
-	// install published: listings overlap, so the older request's response may
-	// describe each name at an older revision than the cache already has. Its
-	// cache effect is limited to names it is still the newest word on, and the
-	// caller is served the accepted state either way.
-	staleInstall := entry.installSeq > request.seq
 
 	// Names the cache held before this install. They are served to this request
 	// even if the merge has to evict one for room: the reply must not omit a
@@ -329,6 +324,9 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 				// holds the whole listing.
 				complete = false
 			}
+			// The name's cached value is now the response's, so only a newer
+			// response (or this listing's deadline) can vouch for it again.
+			entry.markFromListing(item.Name)
 		}
 		served[item.Name] = item
 	}
@@ -356,8 +354,10 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 	}
 	entry.gen = dc.nextGenerationLocked()
 	if !staleInstall {
-		// This install is now the newest word on the directory's names.
+		// This install is now the newest word on the directory's names, and
+		// what it published lapses one TTL from now.
 		entry.installSeq = request.seq
+		entry.listingExpires = now.Add(dc.ttl)
 	}
 	// Releasing here is what retires this request's stamps once it was the last
 	// one outstanding.
@@ -584,6 +584,9 @@ func (dc *DirCache) Observe(parentPath string, item CachedFileInfo, token Reques
 	entry.expires = time.Now().Add(dc.ttl)
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
+	// An observation is this mount's knowledge of the name, so it owns the value
+	// just like a local write does: a listing deadline passing may not retire it.
+	delete(entry.fromListing, item.Name)
 	// An observation is still this mount's knowledge of the name, so a response
 	// taken before it must not overwrite it. Both the stamp and this request are
 	// released together, so neither outlives the readers that could consult it.
@@ -617,6 +620,10 @@ func (dc *DirCache) upsertInternal(parentPath string, item CachedFileInfo) {
 	entry.expires = time.Now().Add(dc.ttl)
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
+	// The name is this mount's own now: a later listing omitting it (a commit
+	// the server has not listed yet) or a listing deadline passing must not
+	// retire state the mount established itself.
+	delete(entry.fromListing, item.Name)
 	dc.noteLocalLocked(entry, parentPath, item.Name)
 }
 
@@ -942,6 +949,7 @@ func (e *dirCacheEntry) upsert(item CachedFileInfo, maxEntries int) (evicted boo
 			e.order = e.order[1:]
 			delete(e.items, evict)
 			delete(e.negatives, evict)
+			delete(e.fromListing, evict)
 			evicted = true
 			// The entry cannot hold the whole directory any more, so it must
 			// stop speaking for the names it could not keep: a surviving
@@ -981,6 +989,7 @@ func mergeCachedOwner(item, existing CachedFileInfo) CachedFileInfo {
 func (e *dirCacheEntry) remove(name string) {
 	delete(e.items, name)
 	delete(e.negatives, name)
+	delete(e.fromListing, name)
 	for i, existing := range e.order {
 		if existing == name {
 			e.order = append(e.order[:i], e.order[i+1:]...)
@@ -989,15 +998,57 @@ func (e *dirCacheEntry) remove(name string) {
 	}
 }
 
+// markFromListing records that name's cached value is the word of a listing
+// response, so that a lapsed listing gives it up. Only a name the cache holds
+// can carry provenance. Caller holds dc.mu.
+func (e *dirCacheEntry) markFromListing(name string) {
+	if _, live := e.items[name]; !live {
+		return
+	}
+	if e.fromListing == nil {
+		e.fromListing = make(map[string]struct{})
+	}
+	e.fromListing[name] = struct{}{}
+}
+
 func (e *dirCacheEntry) prune(now time.Time) {
 	if !e.expires.IsZero() && now.After(e.expires) {
 		e.items = make(map[string]CachedFileInfo)
 		e.order = nil
 		e.expires = time.Time{}
 		e.complete = false
+		// Every name went with the items, so there is nothing left for
+		// provenance to single out.
+		e.fromListing = nil
 		// localGen is deliberately kept: a stamp only ever means "this mount
 		// changed the name at that point", which stays true, and dropping it
 		// would let a response taken before the change reinstate a removal.
+	}
+	// A listing deadline that has gone retires the names only it vouched for.
+	// They are the response's word, so once that word is stale the next response
+	// is a newer word on which of them still exist, and a deletion it reflects
+	// has to take effect — otherwise a name the server no longer has survives as
+	// long as any unrelated local write keeps refreshing the entry's own TTL.
+	// Names this mount wrote itself are not in the set and are untouched: the
+	// server may not have caught up with them yet.
+	//
+	// This is keyed on the listing's own deadline rather than on the complete
+	// marker, because a response larger than the cache cap never sets that
+	// marker and its cached prefix would otherwise never lapse.
+	if !e.listingExpires.IsZero() && now.After(e.listingExpires) {
+		dropped := false
+		for name := range e.fromListing {
+			e.remove(name)
+			dropped = true
+		}
+		e.fromListing = nil
+		if dropped {
+			// Names just left, so the cache can no longer claim to hold the
+			// whole directory: a miss for one of them must go to the server
+			// instead of being answered from a set that dropped it.
+			e.complete = false
+			e.completeExpires = time.Time{}
+		}
 	}
 	if !e.completeExpires.IsZero() && now.After(e.completeExpires) {
 		e.completeExpires = time.Time{}
