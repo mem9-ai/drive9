@@ -113,7 +113,7 @@ Git-ignore policy
 - The gitignore-aware gate applies to every profile that enables the local overlay (`coding-agent`, `coding-agent-extent`, `portable`, and custom overlay profiles): a path matched by a `[local]` or `--local-only` pattern is overlaid only when the repository also ignores it.
 - The check runs cached `git check-ignore` (against the hydrated clean tree and the local `.git` state). Tracked clean paths and durable Git overlay entries are never treated as ignored output.
 - When no Git workspace is loaded there is no ignore oracle, so the gate keeps the pattern's overlay rather than dropping it (fail open). An ignored directory confirms its whole subtree without a per-file subprocess.
-- The setting is exposed as the profile-level `local-only-gitignore-aware = true|false` key (must appear before the first section) and the `--local-only-gitignore-aware` flag, which overrides the profile. Both default to true; set false to overlay matched paths unconditionally.
+- The setting is exposed as the profile-level `local-only-gitignore-aware = true|false` key and the `--local-only-gitignore-aware` flag, which overrides the profile. Both default to true; set false to overlay matched paths unconditionally.
 - The result is cached per workspace and head commit. `[remote]` override patterns and `.git` routing are unaffected.
 
 `.git` routing

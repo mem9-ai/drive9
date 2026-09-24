@@ -244,12 +244,10 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 			}
 			continue
 		}
-		// Top-of-file settings: `key = value`. Only known keys are accepted;
-		// anything else is treated as a pattern for the current section.
+		// Profile settings: `key = value`. Only known keys are recognized and
+		// accepted anywhere in the file; anything else is treated as a pattern
+		// for the current section.
 		if key, value, ok := splitProfileSetting(line); ok && key == localOnlyGitignoreAwareKey {
-			if section != "local" {
-				return profileConfig{}, fmt.Errorf("profile %q line %d: %s must appear before the first section", name, lineNo+1, localOnlyGitignoreAwareKey)
-			}
 			parsed, err := parseProfileBool(value)
 			if err != nil {
 				return profileConfig{}, fmt.Errorf("profile %q line %d: %s: %w", name, lineNo+1, localOnlyGitignoreAwareKey, err)
