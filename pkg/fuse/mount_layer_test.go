@@ -387,7 +387,10 @@ func TestRestoreLayerReplayDoesNotOverwriteCommittedChildWriteback(t *testing.T)
 						LayerID: "parent-1", Path: remotePath, Op: "upsert", Kind: "file",
 						SizeBytes: int64(len(oldData)), EntrySeq: 100,
 					}}})
-				case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/child-1/entries":
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/parent-1/entries":
+					if got := r.URL.Query().Get("max_seq"); got != "100" {
+						t.Errorf("parent entry max_seq = %q, want 100", got)
+					}
 					_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
 						LayerID: "parent-1", Path: remotePath, Op: "upsert", Kind: "file",
 						Content: oldData, SizeBytes: int64(len(oldData)), EntrySeq: 100,
@@ -493,21 +496,29 @@ func TestRestoreLayerReplayDoesNotOverwriteCommittedChildWriteback(t *testing.T)
 
 func TestRestoreLayerDirectoryRenameProjectsSubtreeWithoutFileState(t *testing.T) {
 	renameEntry := client.FSLayerEntry{
-		LayerID: "layer-1", Path: "/repo/old", Op: "rename", Kind: "dir",
-		ContentText: "/repo/new", Mode: 0o750, EntrySeq: 7,
+		LayerID: "layer-1", Path: "/repo/old/", Op: "rename", Kind: "dir",
+		ContentText: "/repo/new/", Mode: 0o750, EntrySeq: 7,
 	}
 	childEntry := client.FSLayerEntry{
-		LayerID: "layer-1", Path: "/repo/new/layer-child.txt", Op: "upsert", Kind: "file",
-		Mode: 0o640, SizeBytes: 5, EntrySeq: 8,
+		LayerID: "layer-1", Path: "/repo/old/layer-child.txt", Op: "upsert", Kind: "file",
+		Mode: 0o640, SizeBytes: 5, EntrySeq: 6,
 	}
+	var postCount int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
-			// The real server sorts the folded projection lexicographically, so
-			// /new/layer-child.txt arrives before the /old -> /new rename.
+			if r.URL.Query().Get("replay") != "1" {
+				t.Errorf("layer replay query = %q, want 1", r.URL.RawQuery)
+			}
+			// replay=1 is the causal effective log, not a path-sorted folded
+			// projection: the file body is installed at the source prefix and
+			// the later directory rename must carry it to the target.
 			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{childEntry, renameEntry}})
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries" && r.URL.Query().Get("path") == "/repo/new/layer-child.txt":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries" && r.URL.Query().Get("path") == "/repo/old/layer-child.txt":
+			if got := r.URL.Query().Get("max_seq"); got != "6" {
+				t.Errorf("layer entry max_seq = %q, want 6", got)
+			}
 			full := childEntry
 			full.Content = []byte("layer")
 			_ = json.NewEncoder(w).Encode(full)
@@ -517,6 +528,10 @@ func TestRestoreLayerDirectoryRenameProjectsSubtreeWithoutFileState(t *testing.T
 			w.Header().Set("X-Dat9-Revision", "11")
 			w.Header().Set("X-Dat9-Mode", "420")
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost:
+			postCount++
+			t.Errorf("committed restored state must not be replayed: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
 		default:
 			t.Errorf("unexpected request (directory rename must not use file restore): %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
@@ -524,13 +539,24 @@ func TestRestoreLayerDirectoryRenameProjectsSubtreeWithoutFileState(t *testing.T
 	}))
 	defer ts.Close()
 
-	shadow, err := NewShadowStore(t.TempDir())
+	shadowDir := t.TempDir()
+	pendingDir := t.TempDir()
+	shadow, err := NewShadowStore(shadowDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer shadow.Close()
-	pending, err := NewPendingIndex(t.TempDir())
+	pending, err := NewPendingIndex(pendingDir)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/old/retained.txt", []byte("retained"), 3); err != nil {
+		t.Fatal(err)
+	}
+	retainedGen, err := pending.PutWithBaseRevAndMode("/old/retained.txt", int64(len("retained")), PendingOverwrite, 3, 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.MarkLayerCommitted("/old/retained.txt", retainedGen, 0); err != nil {
 		t.Fatal(err)
 	}
 	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
@@ -552,11 +578,20 @@ func TestRestoreLayerDirectoryRenameProjectsSubtreeWithoutFileState(t *testing.T
 	if mode, ok := fs.layerFileMode("/new/retained.txt"); !ok || mode != 0o600 {
 		t.Fatalf("retained descendant = (%#o, %t), want moved 0600 true", mode, ok)
 	}
+	if got, err := shadow.ReadAll("/new/retained.txt"); err != nil || string(got) != "retained" {
+		t.Fatalf("retained descendant shadow = %q, %v; want retained", got, err)
+	}
+	if meta, ok := pending.GetMeta("/new/retained.txt"); !ok || !meta.LayerCommitted || meta.Path != "/new/retained.txt" {
+		t.Fatalf("retained descendant pending meta = %+v, want committed target", meta)
+	}
+	if shadow.Has("/old/retained.txt") || pending.HasPending("/old/retained.txt") {
+		t.Fatal("retained descendant cache remained under directory rename source")
+	}
 	if _, ok := fs.layerFileMode("/old/retained.txt"); ok {
 		t.Fatal("retained descendant remained under rename source")
 	}
 	if mode, ok := fs.layerFileMode("/new/layer-child.txt"); !ok || mode != 0o640 {
-		t.Fatalf("server-sorted renamed child = (%#o, %t), want restored 0640 true", mode, ok)
+		t.Fatalf("effective-log renamed child = (%#o, %t), want restored 0640 true", mode, ok)
 	}
 	if meta, ok := pending.GetMeta("/new/layer-child.txt"); !ok || !meta.LayerCommitted || meta.Generation == 0 {
 		t.Fatalf("renamed child pending meta = %+v, want committed generation", meta)
@@ -579,6 +614,194 @@ func TestRestoreLayerDirectoryRenameProjectsSubtreeWithoutFileState(t *testing.T
 	var childOut gofuse.EntryOut
 	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: targetOut.NodeId}, "main-child.txt", &childOut); st != gofuse.OK {
 		t.Fatalf("lookup renamed main-backed child = %v, want OK", st)
+	}
+
+	// The directory rename must persist the committed descendant move, not
+	// merely retarget the current process's in-memory layer projection.
+	shadow.Close()
+	reopenedShadow, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedShadow.Close()
+	if err := reopenedShadow.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedPending, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopenedPending.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := reopenedShadow.ReadAll("/new/layer-child.txt"); err != nil || string(got) != "layer" {
+		t.Fatalf("reopened renamed child shadow = %q, %v; want layer", got, err)
+	}
+	if meta, ok := reopenedPending.GetMeta("/new/layer-child.txt"); !ok || !meta.LayerCommitted {
+		t.Fatalf("reopened renamed child meta = %+v, want committed", meta)
+	}
+	for _, oldPath := range []string{"/old/layer-child.txt", "/old/retained.txt"} {
+		if reopenedShadow.Has(oldPath) || reopenedPending.HasPending(oldPath) {
+			t.Fatalf("reopened old prefix retained %s", oldPath)
+		}
+	}
+	reopenedFS := NewDat9FS(client.New(ts.URL, ""), opts)
+	reopenedCQ := NewCommitQueue(reopenedFS.client, reopenedShadow, reopenedPending, nil, 1, 8, opts.RemoteRoot)
+	defer reopenedCQ.DrainAll()
+	reopenedCQ.SetLayerRef(opts.LayerRef)
+	reopenedFS.shadowStore = reopenedShadow
+	reopenedFS.pendingIndex = reopenedPending
+	reopenedFS.commitQueue = reopenedCQ
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	reopenedFS.drainLatePendingEntries(ctx)
+	if postCount != 0 {
+		t.Fatalf("late drain replay posts = %d, want 0", postCount)
+	}
+}
+
+func TestRestoreLayerDirectoryRenamePreservesForkReplayOrderAndAncestorObject(t *testing.T) {
+	objectData := []byte("ancestor object body")
+	upsert := client.FSLayerEntry{
+		LayerID: "parent-1", Path: "/repo/a/x.bin", Op: "upsert", Kind: "file",
+		StorageType: "s3", StorageRef: "objects/parent-x", SizeBytes: int64(len(objectData)),
+		Mode: 0o640, EntrySeq: 99,
+	}
+	parentRename := client.FSLayerEntry{
+		LayerID: "parent-1", Path: "/repo/a/", Op: "rename", Kind: "dir",
+		ContentText: "/repo/b/", Mode: 0o750, EntrySeq: 100,
+	}
+	childRename := client.FSLayerEntry{
+		LayerID: "child-1", Path: "/repo/b/", Op: "rename", Kind: "dir",
+		ContentText: "/repo/c/", Mode: 0o700, EntrySeq: 1,
+	}
+	var postCount int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/child-1/diff":
+			if r.URL.Query().Get("replay") != "1" {
+				t.Errorf("layer replay query = %q, want replay=1", r.URL.RawQuery)
+			}
+			// This is the real root-to-tip effective-log shape. Parent EntrySeq
+			// 100 precedes child EntrySeq 1 because sequence domains are local
+			// to each layer.
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{
+				upsert, parentRename, childRename,
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/parent-1/entries":
+			if got := r.URL.Query().Get("path"); got != upsert.Path {
+				t.Errorf("ancestor entry path = %q, want %q", got, upsert.Path)
+			}
+			if got := r.URL.Query().Get("max_seq"); got != "99" {
+				t.Errorf("ancestor entry max_seq = %q, want 99", got)
+			}
+			_ = json.NewEncoder(w).Encode(upsert)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/parent-1/objects":
+			if got := r.URL.Query().Get("path"); got != upsert.Path {
+				t.Errorf("ancestor object path = %q, want %q", got, upsert.Path)
+			}
+			if got := r.URL.Query().Get("max_seq"); got != "99" {
+				t.Errorf("ancestor object max_seq = %q, want 99", got)
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(objectData)
+		case r.Method == http.MethodPost:
+			postCount++
+			t.Errorf("committed fork replay must not POST: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadowDir := t.TempDir()
+	pendingDir := t.TempDir()
+	shadow, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := &MountOptions{LayerRef: "child-1", RemoteRoot: "/repo"}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.markLayerDir("/a", 0o755)
+	fs.inodes.Lookup("/a", true, 0, time.Now())
+	fs.inodes.Lookup("/a/x.bin", false, int64(len(objectData)), time.Now())
+
+	if err := restoreLayerEntries(context.Background(), fs.client, opts, shadow, pending, fs); err != nil {
+		t.Fatalf("restore fork rename chain: %v", err)
+	}
+	for _, oldPath := range []string{"/a", "/b"} {
+		if !fs.isLayerWhiteout(oldPath) {
+			t.Fatalf("rename chain source %s is not hidden", oldPath)
+		}
+	}
+	if mode, ok := fs.layerDirMode("/c"); !ok || mode != 0o700 {
+		t.Fatalf("rename chain target = (%#o, %t), want 0700 true", mode, ok)
+	}
+	if mode, ok := fs.layerFileMode("/c/x.bin"); !ok || mode != 0o640 {
+		t.Fatalf("rename chain child = (%#o, %t), want 0640 true", mode, ok)
+	}
+	if got, err := shadow.ReadAll("/c/x.bin"); err != nil || !bytes.Equal(got, objectData) {
+		t.Fatalf("rename chain object = %q, %v; want %q", got, err, objectData)
+	}
+	if meta, ok := pending.GetMeta("/c/x.bin"); !ok || !meta.LayerCommitted || meta.Path != "/c/x.bin" {
+		t.Fatalf("rename chain pending meta = %+v, want committed /c/x.bin", meta)
+	}
+	for _, oldPath := range []string{"/a/x.bin", "/b/x.bin"} {
+		if shadow.Has(oldPath) || pending.HasPending(oldPath) {
+			t.Fatalf("rename chain retained old persistent path %s", oldPath)
+		}
+	}
+	if _, ok := fs.inodes.GetInode("/c/x.bin"); !ok {
+		t.Fatal("rename chain did not retarget child inode")
+	}
+
+	shadow.Close()
+	reopenedShadow, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedShadow.Close()
+	if err := reopenedShadow.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedPending, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopenedPending.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := reopenedShadow.ReadAll("/c/x.bin"); err != nil || !bytes.Equal(got, objectData) {
+		t.Fatalf("reopened rename chain object = %q, %v; want %q", got, err, objectData)
+	}
+	if meta, ok := reopenedPending.GetMeta("/c/x.bin"); !ok || !meta.LayerCommitted {
+		t.Fatalf("reopened rename chain meta = %+v, want committed", meta)
+	}
+	for _, oldPath := range []string{"/a/x.bin", "/b/x.bin"} {
+		if reopenedShadow.Has(oldPath) || reopenedPending.HasPending(oldPath) {
+			t.Fatalf("reopened rename chain retained old path %s", oldPath)
+		}
+	}
+	reopenedFS := NewDat9FS(client.New(ts.URL, ""), opts)
+	reopenedCQ := NewCommitQueue(reopenedFS.client, reopenedShadow, reopenedPending, nil, 1, 8, opts.RemoteRoot)
+	defer reopenedCQ.DrainAll()
+	reopenedCQ.SetLayerRef(opts.LayerRef)
+	reopenedFS.shadowStore = reopenedShadow
+	reopenedFS.pendingIndex = reopenedPending
+	reopenedFS.commitQueue = reopenedCQ
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	reopenedFS.drainLatePendingEntries(ctx)
+	if postCount != 0 {
+		t.Fatalf("late drain replay posts = %d, want 0", postCount)
 	}
 }
 
@@ -1665,7 +1888,7 @@ func TestRestoreLayerEntriesStreamsObjectBackedFile(t *testing.T) {
 	}
 }
 
-func TestRestoreLayerEntriesHonorsChildCheckpointTipNotAncestorSeq(t *testing.T) {
+func TestRestoreLayerEntriesUsesAncestorVersionDomainUnderChildCheckpoint(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -1686,14 +1909,14 @@ func TestRestoreLayerEntriesHonorsChildCheckpointTipNotAncestorSeq(t *testing.T)
 					{LayerID: "parent-1", Path: "/repo/a.txt", Op: "upsert", Kind: "file", SizeBytes: 2, EntrySeq: 10},
 				},
 			})
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/child-1/entries":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/parent-1/entries":
 			if r.URL.Query().Get("path") != "/repo/a.txt" {
 				t.Errorf("unexpected entry path: %q", r.URL.Query().Get("path"))
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			if r.URL.Query().Get("max_seq") != "0" {
-				t.Errorf("entry max_seq = %q, want checkpoint tip 0 not ancestor seq 10", r.URL.Query().Get("max_seq"))
+			if r.URL.Query().Get("max_seq") != "10" {
+				t.Errorf("entry max_seq = %q, want ancestor operation seq 10", r.URL.Query().Get("max_seq"))
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}

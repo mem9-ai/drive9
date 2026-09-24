@@ -1438,33 +1438,13 @@ func lockLayerRestoreTransaction(fs *Dat9FS) func(error) {
 var testHookBeforeLayerRestoreViewPublish func(paths []string)
 var testHookAfterLayerReplayFetched func()
 
-// orderLayerRestoreEntries establishes directory rename projections before
-// applying the folded entries below their targets. The server returns the
-// merged projection sorted by path, so a target such as /new/child sorts
-// before its rename source /old. Applying that order would restore the child
-// and then let the directory rename replace the target subtree, discarding
-// the child's namespace projection and replay sequence. Directory renames are
-// ordered chronologically; all remaining entries retain server order.
+// orderLayerRestoreEntries preserves the server's replay order. replay=1 is
+// an effective operation log ordered root-to-tip and by entry sequence within
+// each layer. EntrySeq is not comparable across layers, and moving a directory
+// rename ahead of an earlier upsert would resurrect the upsert at its old
+// prefix instead of moving it with the directory.
 func orderLayerRestoreEntries(entries []client.FSLayerEntry) []client.FSLayerEntry {
-	ordered := append([]client.FSLayerEntry(nil), entries...)
-	isDirRename := func(entry client.FSLayerEntry) bool {
-		return entry.Op == "rename" && entry.Kind == "dir"
-	}
-	sort.SliceStable(ordered, func(i, j int) bool {
-		iRename := isDirRename(ordered[i])
-		jRename := isDirRename(ordered[j])
-		if iRename != jRename {
-			return iRename
-		}
-		if !iRename {
-			return false
-		}
-		if ordered[i].EntrySeq != ordered[j].EntrySeq {
-			return ordered[i].EntrySeq < ordered[j].EntrySeq
-		}
-		return ordered[i].Path < ordered[j].Path
-	})
-	return ordered
+	return append([]client.FSLayerEntry(nil), entries...)
 }
 
 // publishLayerRestoreView publishes the in-memory namespace view and drops
@@ -1611,7 +1591,8 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 			}
 			continue
 		case "rename":
-			_, err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq))
+			entryLayerID, entryMaxSeq := layerEntryFetchScope(&entry, opts.LayerRef, hasCheckpoint, maxSeq)
+			_, err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, entryLayerID, entryMaxSeq)
 			if err != nil {
 				return err
 			}
@@ -1619,7 +1600,8 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 		case "symlink":
 			fullEntry := &entry
 			if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
-				fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq))
+				entryLayerID, entryMaxSeq := layerEntryFetchScope(&entry, opts.LayerRef, hasCheckpoint, maxSeq)
+				fetched, err := getLayerEntryForRestore(ctx, c, entryLayerID, entry.Path, entryMaxSeq)
 				if err != nil {
 					return fmt.Errorf("restore fs layer symlink entry %s: %w", entry.Path, err)
 				}
@@ -1655,15 +1637,15 @@ func restoreLayerEntriesInternal(ctx context.Context, c *client.Client, opts *Mo
 			continue
 		}
 		expectedShadowGen := layerRestoreShadowGeneration(shadows, localPath)
-		entryMaxSeq := layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)
-		fullEntry, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, entryMaxSeq)
+		entryLayerID, entryMaxSeq := layerEntryFetchScope(&entry, opts.LayerRef, hasCheckpoint, maxSeq)
+		fullEntry, err := getLayerEntryForRestore(ctx, c, entryLayerID, entry.Path, entryMaxSeq)
 		if err != nil {
 			return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
 		}
 		var stagedObjectPath string
 		var stagedObjectSize int64
 		if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
-			rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, entryMaxSeq)
+			rc, err := c.ReadFSLayerFileStream(ctx, entryLayerID, entry.Path, entryMaxSeq)
 			if err != nil {
 				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
 			}
@@ -1794,19 +1776,97 @@ func layerRestoreDirectoryRenameOwned(pending *PendingIndex, oldPath, newPath st
 	return check(oldPath) && check(newPath)
 }
 
-func layerEntryFetchMaxSeq(entry *client.FSLayerEntry, hasCheckpoint bool, checkpointMaxSeq int64) *int64 {
-	// Checkpoint restores must stay pinned to the checkpoint tip. Ancestor
-	// rows can carry a larger entry_seq than the child tip; using that seq
-	// against the child layer would leak later child writes into the view.
-	if hasCheckpoint {
-		seq := checkpointMaxSeq
-		return &seq
+// restoreLayerDirectoryCommittedDescendants moves the retained local cache of
+// remotely committed layer files with a peer directory rename. The namespace
+// projection, inode table, and open handles are published only after every
+// cached descendant has reached the matching path. A genuinely unfinished
+// generation is rejected by layerRestoreDirectoryRenameOwned before this
+// helper runs.
+func restoreLayerDirectoryCommittedDescendants(shadows *ShadowStore, pending *PendingIndex, oldPath, newPath string) (bool, error) {
+	if shadows == nil || pending == nil {
+		return true, nil
 	}
+	metas := pending.ListByPrefix(strings.TrimSuffix(oldPath, "/") + "/")
+	sort.Slice(metas, func(i, j int) bool {
+		if metas[i] == nil {
+			return false
+		}
+		if metas[j] == nil {
+			return true
+		}
+		return metas[i].Path < metas[j].Path
+	})
+	for _, observed := range metas {
+		if observed == nil || !observed.LayerCommitted {
+			return false, nil
+		}
+		oldChild := observed.Path
+		newChild := newPath + strings.TrimPrefix(oldChild, oldPath)
+		expectedNewPendingGen, newOwned := layerRestorePendingGeneration(pending, newChild)
+		if !newOwned {
+			return false, nil
+		}
+		expectedOldShadowGen := layerRestoreShadowGeneration(shadows, oldChild)
+		expectedNewShadowGen := layerRestoreShadowGeneration(shadows, newChild)
+		if expectedOldShadowGen == 0 {
+			return false, fmt.Errorf("restore fs layer directory rename %s to %s: committed shadow missing", oldChild, newChild)
+		}
+		applied, err := pending.restoreLayerrenameIfGenerations(
+			oldChild,
+			newChild,
+			observed.Generation,
+			expectedNewPendingGen,
+			observed.BaseRev,
+			observed.Mode,
+			observed.HasMode,
+			shadows.shadowPath(oldChild),
+			shadows.shadowPath(newChild),
+			func(tx *layerRestoreTxn, prepareMeta layerRestoreMetaPrepare) (bool, error) {
+				moved, matched, moveErr := shadows.renameIfGenerations(
+					oldChild,
+					newChild,
+					expectedOldShadowGen,
+					expectedNewShadowGen,
+					tx,
+					prepareMeta,
+				)
+				if moveErr != nil || moved || !matched {
+					return moved, moveErr
+				}
+				return false, nil
+			},
+		)
+		if err != nil {
+			return false, fmt.Errorf("restore fs layer directory rename %s to %s: %w", oldChild, newChild, err)
+		}
+		if !applied {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func layerEntryFetchScope(entry *client.FSLayerEntry, tipLayerID string, hasCheckpoint bool, checkpointMaxSeq int64) (string, *int64) {
+	layerID := tipLayerID
+	if entry != nil && strings.TrimSpace(entry.LayerID) != "" {
+		layerID = entry.LayerID
+	}
+	// Replay returns raw effective-log operations. Read an omitted body from
+	// the operation's own layer and sequence: applying an ancestor EntrySeq as
+	// a tip-layer max_seq mixes independent sequence domains and can resolve a
+	// later child projection instead of this operation. The replay request has
+	// already applied a checkpoint cap to the tip and origin caps to ancestors.
 	if entry != nil && entry.EntrySeq > 0 {
 		seq := entry.EntrySeq
-		return &seq
+		return layerID, &seq
 	}
-	return nil
+	// Older/mock responses can omit the operation sequence. Only the tip may
+	// then inherit the checkpoint cap; it must never be applied to an ancestor.
+	if hasCheckpoint && layerID == tipLayerID {
+		seq := checkpointMaxSeq
+		return layerID, &seq
+	}
+	return layerID, nil
 }
 
 func fsLayerMountStateAllowed(state string, checkpoint bool) bool {
@@ -1828,13 +1888,13 @@ func getLayerEntryForRestore(ctx context.Context, c *client.Client, layerID, pat
 	return c.GetFSLayerEntry(ctx, layerID, path)
 }
 
-func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry, maxSeq *int64) (string, error) {
+func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry, entryLayerID string, maxSeq *int64) (string, error) {
 	if entry == nil {
 		return "", nil
 	}
 	fullEntry := entry
 	if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
-		fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, maxSeq)
+		fetched, err := getLayerEntryForRestore(ctx, c, entryLayerID, entry.Path, maxSeq)
 		if err != nil {
 			return "", fmt.Errorf("restore fs layer rename entry %s: %w", entry.Path, err)
 		}
@@ -1854,6 +1914,15 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 	if fullEntry.Kind == "dir" {
 		finishRestore := lockLayerRestoreTransaction(fs)
 		if !layerRestoreDirectoryRenameOwned(pending, oldLocalPath, newLocalPath) {
+			finishRestore(nil)
+			return newLocalPath, nil
+		}
+		migrated, err := restoreLayerDirectoryCommittedDescendants(shadows, pending, oldLocalPath, newLocalPath)
+		if err != nil {
+			finishRestore(err)
+			return newLocalPath, err
+		}
+		if !migrated {
 			finishRestore(nil)
 			return newLocalPath, nil
 		}
