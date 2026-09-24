@@ -14989,18 +14989,20 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFlush, perfStart, status, 0) }()
-	if fs.promotionBlocked.Load() {
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
 		return gofuse.EIO
 	}
-	fh, ok := fs.fileHandles.Get(input.Fh)
-	if ok && fh.isExtent() {
+	defer promotionUnlock()
+	fh, found := fs.fileHandles.Get(input.Fh)
+	if found && fh.isExtent() {
 		// Extent handles release POSIX locks inside JuiceFS VFS.Flush.
 		return fs.extentFlush(fs.jfsCtx(input.Pid, input.Uid, input.Gid), fh, input.LockOwner)
 	}
 	if lockOwner := fuseLockOwner(input.LockOwner, input.Pid, input.Fh); lockOwner != 0 {
 		fs.locks.release(input.NodeId, lockOwner)
 	}
-	if !ok {
+	if !found {
 		return gofuse.OK
 	}
 	ctx, cf := fuseCtx(cancel)
@@ -15428,11 +15430,13 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFsync, perfStart, status, 0) }()
-	if fs.promotionBlocked.Load() {
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
 		return gofuse.EIO
 	}
-	fh, ok := fs.fileHandles.Get(input.Fh)
-	if !ok {
+	defer promotionUnlock()
+	fh, found := fs.fileHandles.Get(input.Fh)
+	if !found {
 		return gofuse.OK
 	}
 	if fh.isExtent() {
@@ -17541,6 +17545,14 @@ func (fs *Dat9FS) drainLatePendingEntries(ctx context.Context) {
 }
 
 func (fs *Dat9FS) FlushAll() {
+	promotionUnlock, ok := fs.lockPromotionMutation()
+	if !ok {
+		// The durable local cache is intentionally frozen. Do not let graceful
+		// shutdown publish shadow/pending state that an unresolved restore marker
+		// may roll back on the next start.
+		return
+	}
+	defer promotionUnlock()
 	fs.stopExtentRuntimeLoop()
 	if v := fs.extentVFS(); v != nil {
 		_ = v.FlushAll("")

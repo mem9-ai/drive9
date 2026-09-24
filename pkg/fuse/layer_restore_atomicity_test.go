@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
@@ -303,6 +304,41 @@ func TestLayerRestoreTransactionCorruptionAndRollbackFailureFailClosed(t *testin
 			t.Fatalf("restart error = %v, want fail-closed rollback recovery failure", err)
 		}
 	})
+
+	t.Run("overlapping markers", func(t *testing.T) {
+		root := t.TempDir()
+		shadowDir := filepath.Join(root, "shadow")
+		pendingDir := filepath.Join(root, "pending")
+		shadows, err := NewShadowStore(shadowDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending, err := NewPendingIndex(pendingDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seedCommittedLayerCache(t, shadows, pending, "/overlap.txt", []byte("old"), 62, 0o640)
+		tx1, err := beginLayerRestoreTxn(pendingDir, shadows.shadowPath("/overlap.txt"), filepath.Join(pendingDir, hashPath("/overlap.txt")+".meta"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx2, err := beginLayerRestoreTxn(pendingDir, shadows.shadowPath("/overlap.txt"), filepath.Join(pendingDir, hashPath("/overlap.txt")+".meta"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = tx1
+		_ = tx2
+		shadows.Close()
+		if _, err := NewPendingIndex(pendingDir); err == nil || !strings.Contains(err.Error(), "overlapping layer restore transactions") {
+			t.Fatalf("restart error = %v, want overlapping-marker fail closed", err)
+		}
+		if _, err := os.Stat(tx1.markerPath); err != nil {
+			t.Fatalf("overlap detection modified first marker: %v", err)
+		}
+		if _, err := os.Stat(tx2.markerPath); err != nil {
+			t.Fatalf("overlap detection modified second marker: %v", err)
+		}
+	})
 }
 
 func TestRestoreLayerCommitPointFailureRollsBackBeforeSuccessorWriter(t *testing.T) {
@@ -416,6 +452,96 @@ func TestRestoreLayerCommitPointRollbackFailureBlocksSuccessorWriters(t *testing
 	}
 }
 
+func TestRestoreLayerBeginAmbiguityFreezesQueuedWriterBeforePathPublication(t *testing.T) {
+	const path = "/begin-ambiguous.txt"
+	entry := client.FSLayerEntry{
+		LayerID: "layer-1", Path: "/repo/begin-ambiguous.txt", Op: "upsert", Kind: "file",
+		Content: []byte("remote-new"), SizeBytes: int64(len("remote-new")), BaseRevision: 92, Mode: 0o600, EntrySeq: 2,
+	}
+	ts := newLayerRestoreAtomicityServer(t, entry, nil)
+	defer ts.Close()
+
+	shadowDir, pendingDir := t.TempDir(), t.TempDir()
+	shadows, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldMeta := seedCommittedLayerCache(t, shadows, pending, path, []byte("old"), 91, 0o640)
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	markerInstalled := make(chan struct{})
+	allowBeginFailure := make(chan struct{})
+	testHookBeforeAtomicWriteDirSync = func(writtenPath string) error {
+		if !strings.HasPrefix(filepath.Base(writtenPath), layerRestoreTxnPrefix) {
+			return nil
+		}
+		select {
+		case <-markerInstalled:
+		default:
+			close(markerInstalled)
+		}
+		<-allowBeginFailure
+		return errInjectedLayerRestoreCommit
+	}
+	t.Cleanup(func() { testHookBeforeAtomicWriteDirSync = nil })
+
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- restoreLayerEntries(context.Background(), client.New(ts.URL, ""), opts, shadows, pending, fs)
+	}()
+	<-markerInstalled
+
+	writerAttempted := make(chan struct{})
+	writerDone := make(chan bool, 1)
+	go func() {
+		close(writerAttempted)
+		unlock, ok := fs.lockPromotionMutation()
+		if !ok {
+			writerDone <- false
+			return
+		}
+		defer unlock()
+		if err := shadows.WriteFull(path, []byte("queued-writer"), oldMeta.BaseRev); err != nil {
+			writerDone <- true
+			return
+		}
+		_, putErr := pending.PutWithBaseRevAndMode(path, int64(len("queued-writer")), PendingOverwrite, oldMeta.BaseRev, 0o600, true)
+		writerDone <- putErr == nil
+	}()
+	<-writerAttempted
+	select {
+	case <-writerDone:
+		t.Fatal("writer passed lifecycle barrier while restore begin held it")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowBeginFailure)
+
+	if err := <-restoreDone; !errors.Is(err, errLayerRestoreStateUncertain) {
+		t.Fatalf("restore error = %v, want ambiguous-begin fail closed", err)
+	}
+	if wrote := <-writerDone; wrote {
+		t.Fatal("queued writer published after ambiguous transaction begin")
+	}
+	if !fs.promotionBlocked.Load() {
+		t.Fatal("ambiguous transaction begin did not freeze live mount")
+	}
+	assertLayerRestoreCacheState(t, shadows, pending, path, []byte("old"), oldMeta)
+
+	// Startup owns the surviving marker and converges it before exposing any
+	// state. The writer rejected above was never authorized, so restart remains
+	// at the begin snapshot with no successor generation to rewind.
+	testHookBeforeAtomicWriteDirSync = nil
+	shadows.Close()
+	restartedShadows, restartedPending := reopenLayerRestoreCache(t, shadowDir, pendingDir)
+	assertLayerRestoreCacheState(t, restartedShadows, restartedPending, path, []byte("old"), oldMeta)
+	assertNoLayerRestoreArtifacts(t, shadowDir, pendingDir)
+}
+
 func TestMountRejectsCorruptLayerRestoreMarkerBeforeFuseServer(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -452,6 +578,95 @@ func TestMountRejectsCorruptLayerRestoreMarkerBeforeFuseServer(t *testing.T) {
 	assertMountExit(t, err, ExitStartupPermanent, ExitReasonStartupPermanent)
 	if !strings.Contains(err.Error(), "layer pending index recovery") {
 		t.Fatalf("Mount error = %v, want pending rollback diagnosis", err)
+	}
+}
+
+func TestMountRejectsCorruptLayerRestoreMarkerForOrdinaryAndReadOnlyLibraryPaths(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/repo":
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.Header().Set("X-Dat9-Revision", "1")
+		case r.Method == http.MethodHead && r.URL.Path == "/":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1":
+			_ = json.NewEncoder(w).Encode(client.FSLayer{LayerID: "layer-1", BaseRootPath: "/repo", State: "active"})
+		default:
+			t.Errorf("unexpected request before pending recovery: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	for _, tc := range []struct {
+		name       string
+		layerRef   string
+		readOnly   bool
+		pendingSub string
+		hash       func(server, mountPoint string) string
+	}{
+		{
+			name: "ordinary writable library mount", pendingSub: "pending",
+			hash: func(server, mountPoint string) string { return MountHash(server, mountPoint, "/repo") },
+		},
+		{
+			name: "read-only layer library mount", layerRef: "layer-1", readOnly: true, pendingSub: "pending-ro",
+			hash: func(server, mountPoint string) string {
+				return MountLayerHash(server, mountPoint, "/repo", "layer-1", "")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cacheDir := t.TempDir()
+			mountPoint := t.TempDir()
+			pendingDir := filepath.Join(cacheDir, tc.hash(ts.URL, mountPoint), tc.pendingSub)
+			if err := os.MkdirAll(pendingDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(pendingDir, layerRestoreTxnPrefix+"corrupt"+layerRestoreTxnSuffix)
+			if err := os.WriteFile(marker, []byte("{not-json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			err := Mount(&MountOptions{
+				Server: ts.URL, APIKey: "sk-test", MountPoint: mountPoint, RemoteRoot: "/repo",
+				CacheDir: cacheDir, LayerRef: tc.layerRef, ReadOnly: tc.readOnly,
+			})
+			assertMountExit(t, err, ExitStartupPermanent, ExitReasonStartupPermanent)
+			if !strings.Contains(err.Error(), "pending index recovery") {
+				t.Fatalf("Mount error = %v, want pending rollback diagnosis", err)
+			}
+		})
+	}
+}
+
+func TestLayerRestoreRollbackFailureStopsEventRetryBeforeRemoteRead(t *testing.T) {
+	var requests int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		t.Errorf("blocked event retry reached server: %s %s", r.Method, r.URL.String())
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+	shadows, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadows.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"}
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+	fs.promotionBlocked.Store(true)
+
+	if _, err := refreshLayerEvents(context.Background(), client.New(ts.URL, ""), opts, shadows, pending, fs, 7); !errors.Is(err, errLayerRestoreStateUncertain) {
+		t.Fatalf("refresh error = %v, want fail-closed sentinel", err)
+	}
+	if requests != 0 {
+		t.Fatalf("blocked refresh made %d remote requests", requests)
 	}
 }
 

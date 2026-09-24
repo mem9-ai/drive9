@@ -21,7 +21,10 @@ const (
 
 var nextLayerRestoreTxnID atomic.Uint64
 
-var errLayerRestoreStateUncertain = errors.New("layer restore local state is uncertain")
+var (
+	errLayerRestoreStateUncertain = errors.New("layer restore local state is uncertain")
+	errLayerRestoreRecoveryFailed = errors.New("layer restore recovery failed")
+)
 
 type layerRestoreFileSnapshot struct {
 	Path       string `json:"path"`
@@ -108,8 +111,16 @@ func beginLayerRestoreTxn(pendingDir string, paths ...string) (*layerRestoreTxn,
 		// later startup can safely roll back the still-unchanged old files.
 		if _, statErr := os.Stat(markerPath); errors.Is(statErr, os.ErrNotExist) {
 			cleanupLayerRestoreBackups(record.Files)
+			return nil, fmt.Errorf("layer restore transaction persist: %w", err)
 		}
-		return nil, fmt.Errorf("layer restore transaction persist: %w", err)
+		// atomicWrite renamed the marker but could not prove the parent
+		// directory durable. That marker may survive and roll back a successor
+		// writer after restart, so the live mount must enter the same fail-closed
+		// state as a failed transaction rollback.
+		return nil, errors.Join(
+			fmt.Errorf("layer restore transaction persist: %w", err),
+			errLayerRestoreStateUncertain,
+		)
 	}
 	return &layerRestoreTxn{markerPath: markerPath, record: record}, nil
 }
@@ -270,6 +281,8 @@ func recoverLayerRestoreTransactions(pendingDir string) error {
 	if err != nil {
 		return err
 	}
+	txns := make([]*layerRestoreTxn, 0)
+	owners := make(map[string]string)
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasPrefix(name, layerRestoreTxnPrefix) || !strings.HasSuffix(name, layerRestoreTxnSuffix) {
@@ -287,9 +300,25 @@ func recoverLayerRestoreTransactions(pendingDir string) error {
 			}
 			return fmt.Errorf("decode layer restore transaction %s: %w", markerPath, err)
 		}
-		tx := &layerRestoreTxn{markerPath: markerPath, record: record}
+		for _, snap := range record.Files {
+			cleanPath := filepath.Clean(snap.Path)
+			if owner, exists := owners[cleanPath]; exists {
+				// One current implementation can never start a second transaction
+				// for a path while the first still owns its path lock. Overlap means
+				// an older/crashed implementation left ambiguous rollback order;
+				// applying either snapshot first could destroy the other generation.
+				return fmt.Errorf("overlapping layer restore transactions %s and %s for %s", owner, markerPath, cleanPath)
+			}
+			owners[cleanPath] = markerPath
+		}
+		txns = append(txns, &layerRestoreTxn{markerPath: markerPath, record: record})
+	}
+	// Decode and conflict-check every marker before modifying any file. This
+	// makes malformed/multi-marker startup deterministic and fail-closed rather
+	// than partially rolling back one generation before discovering another.
+	for _, tx := range txns {
 		if err := tx.rollback(); err != nil {
-			return fmt.Errorf("recover %s: %w", markerPath, err)
+			return fmt.Errorf("recover %s: %w", tx.markerPath, err)
 		}
 	}
 	return nil

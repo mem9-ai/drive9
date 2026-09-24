@@ -143,7 +143,7 @@ func NewPendingIndex(dir string) (*PendingIndex, error) {
 		return nil, fmt.Errorf("pending index dir: %w", err)
 	}
 	if err := recoverLayerRestoreTransactions(dir); err != nil {
-		return nil, fmt.Errorf("pending index recover layer restore transaction: %w", err)
+		return nil, fmt.Errorf("pending index recover layer restore transaction: %w", errors.Join(errLayerRestoreRecoveryFailed, err))
 	}
 	idx := &PendingIndex{
 		items:     make(map[string]*WriteBackMeta),

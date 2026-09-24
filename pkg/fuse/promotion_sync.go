@@ -101,8 +101,11 @@ func (fs *Dat9FS) synchronousPromotionEnabled() bool {
 	return fs != nil && fs.opts != nil && fs.opts.EnableSynchronousPromotion
 }
 
-// lockPromotionMutation prevents a promotion scan/commit from racing a FUSE
-// open or mutation. Gate-off takes no lock and preserves the old path.
+// lockPromotionMutation prevents both promotion and authoritative layer-cache
+// restore from racing a FUSE open or mutation. All mutations retain the read
+// side through their final shadow/pending/WAL publication; layer restore owns
+// the write side from transaction begin through commit/rollback and blocked
+// publication. This is intentionally active even when promotion is gate-off.
 func (fs *Dat9FS) lockPromotionMutation() (func(), bool) {
 	// promotionBlocked is also the mount-wide fail-closed barrier used when a
 	// durable layer-cache rollback cannot complete. Check it even when the
@@ -110,9 +113,6 @@ func (fs *Dat9FS) lockPromotionMutation() (func(), bool) {
 	// writers could build on a shadow/.meta pair that startup will reject.
 	if fs.promotionBlocked.Load() {
 		return nil, false
-	}
-	if !fs.synchronousPromotionEnabled() {
-		return func() {}, true
 	}
 	fs.promotionBarrier.RLock()
 	if fs.promotionBlocked.Load() {

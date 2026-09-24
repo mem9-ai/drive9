@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -35,6 +36,9 @@ func StartLayerEventWatcher(fs *Dat9FS, c *client.Client, opts *MountOptions, sh
 				nextSeq, err := refreshLayerEvents(ctx, c, opts, shadows, pending, fs, lastSeq)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "drive9: fs layer refresh failed: %v\n", err)
+					if errors.Is(err, errLayerRestoreStateUncertain) {
+						return
+					}
 					continue
 				}
 				if nextSeq > lastSeq {
@@ -53,6 +57,9 @@ func StartLayerEventWatcher(fs *Dat9FS, c *client.Client, opts *MountOptions, sh
 }
 
 func refreshLayerEvents(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, since int64) (int64, error) {
+	if fs != nil && fs.promotionBlocked.Load() {
+		return since, errLayerRestoreStateUncertain
+	}
 	events, err := c.ListFSLayerEvents(ctx, opts.LayerRef, since)
 	if err != nil {
 		return since, err

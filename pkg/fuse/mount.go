@@ -554,7 +554,7 @@ func Mount(opts *MountOptions) (err error) {
 				// snapshots cannot be decoded or restored. Continuing without the
 				// index would expose the possibly mixed shadow/.meta pair, so layer
 				// mounts must fail before the kernel mount becomes visible.
-				if opts.LayerRef != "" {
+				if opts.LayerRef != "" || errors.Is(err, errLayerRestoreRecoveryFailed) {
 					return ExitStartupPermanentErr("layer pending index recovery", err)
 				}
 				fmt.Fprintf(os.Stderr, "drive9: pending index init failed: %v (continuing without)\n", err)
@@ -696,7 +696,7 @@ func Mount(opts *MountOptions) (err error) {
 		shadowDir = filepath.Join(cacheBase, mountHash, "shadow-ro")
 		pendingIdx, pErr := NewPendingIndex(pendingDir)
 		if pErr != nil {
-			return fmt.Errorf("mount: read-only pending index: %w", pErr)
+			return ExitStartupPermanentErr("read-only layer pending index recovery", pErr)
 		}
 		if err := pendingIdx.RecoverFromDisk(); err != nil {
 			fmt.Fprintf(os.Stderr, "drive9: read-only pending recovery: %v\n", err)
@@ -1417,6 +1417,23 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 	return restoreLayerEntriesWithRenameTargets(ctx, c, opts, shadows, pending, fs, nil)
 }
 
+// lockLayerRestoreTransaction takes the exclusive side of the same lifecycle
+// barrier held by every FUSE mutation. finish must be called before returning;
+// it publishes an uncertain-state freeze before releasing the barrier, so a
+// writer already queued on the read side wakes only to observe the block.
+func lockLayerRestoreTransaction(fs *Dat9FS) func(error) {
+	if fs == nil {
+		return func(error) {}
+	}
+	fs.promotionBarrier.Lock()
+	return func(err error) {
+		if errors.Is(err, errLayerRestoreStateUncertain) {
+			fs.promotionBlocked.Store(true)
+		}
+		fs.promotionBarrier.Unlock()
+	}
+}
+
 func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, renameTargets map[string]string) (retErr error) {
 	defer func() {
 		// A rollback failure leaves a durable marker precisely because disk state
@@ -1476,12 +1493,14 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 				// A peer chmod cannot relabel that generation as committed.
 				continue
 			}
+			finishRestore := lockLayerRestoreTransaction(fs)
 			unlock := func() {}
 			if fs != nil {
 				unlock = fs.lockRemoteCommitPath(localPath)
 			}
 			applied, err := pending.restoreLayerModeIfGeneration(localPath, expectedPendingGen, entry.Mode)
 			unlock()
+			finishRestore(err)
 			if err != nil {
 				return fmt.Errorf("restore fs layer chmod pending %s: %w", localPath, err)
 			}
@@ -1552,6 +1571,7 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 		if err != nil {
 			return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
 		}
+		finishRestore := lockLayerRestoreTransaction(fs)
 		unlock := func() {}
 		if fs != nil {
 			unlock = fs.lockRemoteCommitPath(localPath)
@@ -1601,6 +1621,7 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 			},
 		)
 		unlock()
+		finishRestore(err)
 		if err != nil {
 			return err
 		}
@@ -1718,6 +1739,7 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 		}
 		fallbackData = data
 	}
+	finishRestore := lockLayerRestoreTransaction(fs)
 	unlock := func() {}
 	if fs != nil {
 		unlock = fs.lockRemoteCommitPaths(oldLocalPath, newLocalPath)
@@ -1751,6 +1773,7 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 		},
 	)
 	unlock()
+	finishRestore(err)
 	if err != nil {
 		return newLocalPath, fmt.Errorf("restore fs layer rename %s to %s: %w", oldLocalPath, newLocalPath, err)
 	}
