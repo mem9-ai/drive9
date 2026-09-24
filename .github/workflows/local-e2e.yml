@@ -325,9 +325,22 @@ jobs:
       - name: Run FUSE release gate
         id: fuse-smoke
         env:
+          # Keep the supervised worker trace available when the mounted
+          # writeback gate fails; the top-level supervisor log does not contain
+          # kernel request ordering or handle-generation transitions.
+          FUSE_DEBUG: "1"
           RUN_FUSE_CONCURRENCY_STRESS: "0"
           RUN_FUSE_POSIX_FSX: "0"
         run: bash e2e/fuse-release-gate.sh
+
+      - name: Upload FUSE worker logs on failure
+        if: failure() && steps.fuse-smoke.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuse-worker-logs-${{ github.run_id }}
+          path: ~/.cache/drive9/mount-logs/
+          if-no-files-found: warn
+          retention-days: 3
 
       - name: Run FUSE patch storage-class e2e
         id: fuse-patch-storage-class
