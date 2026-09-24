@@ -20765,7 +20765,7 @@ func TestSetAttr_PathTruncateOverflowSizeReturnsEFBIG(t *testing.T) {
 	}
 }
 
-func TestSetAttr_PathTruncateSingleCallerWriterAdoptsZeroBase(t *testing.T) {
+func TestSetAttr_PathTruncateCleanCallerWriterCommitsRemoteGeneration(t *testing.T) {
 	const callerPID = 5151
 
 	var (
@@ -20858,13 +20858,15 @@ func TestSetAttr_PathTruncateSingleCallerWriterAdoptsZeroBase(t *testing.T) {
 		t.Fatalf("SetAttr status = %v, want OK", st)
 	}
 
-	// Folded truncate: the base revision stays at the open value; the
-	// caller's next commit CAS-succeeds at it (no remote zero is committed).
-	if fh.BaseRev != 1 {
-		t.Fatalf("open handle base revision after path truncate = %d, want 1 (folded truncate)", fh.BaseRev)
+	// A clean writable handle can be an earlier close-sync handle whose
+	// kernel Release is delayed. The truncate must commit remotely and rebase
+	// that handle without making it dirty; otherwise delayed Release can
+	// publish a hidden zero-byte generation ahead of the next writer.
+	if fh.BaseRev != 2 {
+		t.Fatalf("open handle base revision after path truncate = %d, want 2", fh.BaseRev)
 	}
-	if !fh.ZeroBase {
-		t.Fatal("expected same-caller writer handle to adopt zero base")
+	if fh.ZeroBase || fh.Dirty.HasDirtyParts() || fh.DirtySeq != 0 {
+		t.Fatalf("clean caller handle became dirty after committed truncate: zero=%t dirty=%t seq=%d", fh.ZeroBase, fh.Dirty.HasDirtyParts(), fh.DirtySeq)
 	}
 	if got := fh.Dirty.Size(); got != 0 {
 		t.Fatalf("dirty size after path truncate = %d, want 0", got)
@@ -20894,8 +20896,8 @@ func TestSetAttr_PathTruncateSingleCallerWriterAdoptsZeroBase(t *testing.T) {
 	if got := string(content); got != "overwrite" {
 		t.Fatalf("remote content = %q, want %q", got, "overwrite")
 	}
-	if revision != 2 {
-		t.Fatalf("remote revision = %d, want 2", revision)
+	if revision != 3 {
+		t.Fatalf("remote revision = %d, want 3", revision)
 	}
 }
 

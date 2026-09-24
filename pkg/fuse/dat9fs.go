@@ -2411,7 +2411,7 @@ func shouldAdoptSingleHandlePathTruncate(fh *FileHandle, callerPID uint32, match
 	if callerPID == 0 || matchCount != 1 {
 		return false
 	}
-	return fh.OpenPID == callerPID
+	return fh.OpenPID == callerPID && writableHandleHasPendingContentLocked(fh)
 }
 
 func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) (func(), error) {
@@ -2576,14 +2576,12 @@ func (fs *Dat9FS) updateOpenHandleBaseRevisionForPath(remotePath string, revisio
 		adoptedPathTruncate := false
 		fh.Lock()
 		fs.adoptCommittedStorageClassLocked(fh, truncateSize)
-		// The truncating caller's own handle always adopts the truncate and
-		// the fresh base revision, regardless of the O_TRUNC flag or the
-		// sibling-handle count: the caller's own history includes the
-		// truncation, and the kernel does not propagate O_TRUNC into the FUSE
-		// open flags (it issues the truncate as a separate SetAttr), so the
-		// conservative O_TRUNC heuristic below never fires for real O_TRUNC
-		// writers and their next commit would CAS-conflict forever.
-		callerOwned := callerPID != 0 && fh.OpenPID != 0 && fh.OpenPID == callerPID
+		// The truncating caller's own pending-content handle adopts the
+		// truncate and fresh base revision. A clean same-PID handle may instead
+		// be an older close-sync handle whose Release is delayed; the committed
+		// truncate path rebases that handle without making it dirty below.
+		callerOwned := callerPID != 0 && fh.OpenPID != 0 && fh.OpenPID == callerPID &&
+			writableHandleHasPendingContentLocked(fh)
 		if callerOwned || shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
 			var err error
 			abortStreamer, err = fs.truncateWritableHandleLocked(fh, truncateSize)
@@ -2760,16 +2758,21 @@ func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, ne
 	// remote path there.
 	var owner *FileHandle
 	for _, fh := range fs.fileHandlesForInode(ino) {
-		if fh == nil || fh.Dirty == nil || fh.Unlinked {
+		if fh == nil {
 			continue
 		}
-		if !localFileHandleOpenedWritable(fh) {
+		fh.Lock()
+		liveWriter := !fh.Unlinked && fh.Dirty != nil && localFileHandleOpenedWritable(fh)
+		pendingContent := liveWriter && writableHandleHasPendingContentLocked(fh)
+		openPID := fh.OpenPID
+		fh.Unlock()
+		if !liveWriter {
 			continue
 		}
-		if fh.OpenPID != callerPID {
+		if openPID != callerPID {
 			return false
 		}
-		if owner == nil {
+		if pendingContent && owner == nil {
 			owner = fh
 		}
 	}
@@ -2777,6 +2780,14 @@ func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, ne
 		return false
 	}
 	owner.Lock()
+	// Release is asynchronous from the kernel's perspective. A handle that
+	// was dirty when sampled above may have completed its close-sync commit
+	// before we acquired its lock. Do not turn that now-clean, not-yet-released
+	// handle into the owner of a later path truncate from the same process.
+	if owner.Unlinked || !writableHandleHasPendingContentLocked(owner) {
+		owner.Unlock()
+		return false
+	}
 	abortStreamer, err := fs.truncateWritableHandleLocked(owner, newSize)
 	owner.Unlock()
 	if abortStreamer != nil {
@@ -2787,6 +2798,19 @@ func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, ne
 		return false
 	}
 	return true
+}
+
+// writableHandleHasPendingContentLocked reports whether a writable handle
+// still owns an uncommitted content generation. Merely having a WriteBuffer is
+// insufficient: close-sync keeps a clean buffer on the handle until the
+// kernel eventually sends Release, and a subsequent O_TRUNC from the same PID
+// must not be folded into that older handle.
+func writableHandleHasPendingContentLocked(fh *FileHandle) bool {
+	if fh == nil || fh.Dirty == nil {
+		return false
+	}
+	return fh.IsNew || fh.ZeroBase || fh.DirtySeq != 0 || fh.WriteBackSeq != 0 ||
+		fh.ShadowCommitReady || fh.ShadowCommitSeq != 0 || fh.Dirty.HasDirtyParts()
 }
 
 func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision int64, skip *FileHandle) {
@@ -3630,18 +3654,35 @@ func (fs *Dat9FS) fileHandlesForInode(ino uint64) []*FileHandle {
 // For grow, the buffer is zero-extended so a later flush uploads the correct
 // size (not stale shorter content that could shrink the file back).
 func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
+	fs.syncOpenHandlesAfterPathTruncateWithCommit(ino, 0, newSize, false)
+}
+
+func (fs *Dat9FS) syncOpenHandlesAfterCommittedPathTruncate(ino uint64, callerPID uint32, newSize int64) {
+	fs.syncOpenHandlesAfterPathTruncateWithCommit(ino, callerPID, newSize, true)
+}
+
+func (fs *Dat9FS) syncOpenHandlesAfterPathTruncateWithCommit(ino uint64, callerPID uint32, newSize int64, remoteCommitted bool) {
 	for _, fh := range fs.fileHandlesForInode(ino) {
 		fh.Lock()
 		if fh.Dirty == nil {
 			fh.Unlock()
 			continue
 		}
-		if fs.appendLogPathConfigured(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
+		// A completed remote path truncate must rebase clean writable handles,
+		// not turn them into a new dirty generation. Release is asynchronous:
+		// an already-flushed handle from the same PID can still be registered
+		// when a later shell redirection issues SetAttr(FATTR_SIZE, 0). Marking
+		// that old handle dirty makes its delayed Release publish a hidden zero
+		// generation and stale the new writer's CAS base.
+		cleanHandle := !writableHandleHasPendingContentLocked(fh)
+		mayRebaseCleanHandle := fs.appendLogPathConfigured(fh.Path) ||
+			(remoteCommitted && callerPID != 0 && fh.OpenPID == callerPID)
+		if cleanHandle && mayRebaseCleanHandle {
 			if revision, committedSize, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && revision > 0 && committedSize == newSize {
 				fs.adoptCommittedStorageClassLocked(fh, newSize)
 				if fh.Dirty.Size() != newSize {
 					if err := fh.Dirty.Truncate(newSize); err != nil {
-						safeLogPrintf("append-log path-truncate sync failed for %s: %v", fh.Path, err)
+						safeLogPrintf("clean path-truncate rebase failed for %s: %v", fh.Path, err)
 						fh.Unlock()
 						continue
 					}
@@ -3649,9 +3690,13 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 				}
 				fh.Dirty.ClearDirty()
 				fh.BaseRev = revision
+				fh.IsNew = false
 				fh.OrigSize = newSize
 				fh.ZeroBase = false
 				fh.appendLogAdoptCommittedBaseline(revision, newSize)
+				if fh.Streamer != nil {
+					fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+				}
 				fh.Unlock()
 				continue
 			}
@@ -3984,10 +4029,11 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 
 	writeStart := fs.perfStart()
 	var err error
+	var committedRevision int64
 	if newSize > maxPathTruncateInMemoryBytes {
 		err = uploadRemoteTruncateFile(ctx, fs.client, apiPath, entry.Size, newSize, -1)
 	} else {
-		err = uploadBufferedRemoteFile(ctx, fs.client, apiPath, data, -1)
+		committedRevision, err = uploadBufferedRemoteFileWithRevision(ctx, fs.client, apiPath, data, -1)
 	}
 	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(newSize))
 	if err != nil {
@@ -4010,16 +4056,20 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 		safeLogPrintf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, ino, statErr)
 	} else if stat != nil {
 		if stat.Revision > 0 {
-			refreshedRevision = stat.Revision
-			entry.Revision = stat.Revision
-			fs.inodes.UpdateRevision(ino, stat.Revision)
-			fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, pid, newSize)
+			committedRevision = stat.Revision
 		}
 		if !stat.Mtime.IsZero() {
 			refreshedMtime = stat.Mtime
 			entry.Mtime = stat.Mtime
 			fs.inodes.UpdateMtime(ino, stat.Mtime)
 		}
+	}
+	if committedRevision > 0 {
+		refreshedRevision = committedRevision
+		entry.Revision = committedRevision
+		fs.inodes.UpdateRevision(ino, committedRevision)
+		fs.recordCommittedRevisionWithSize(entry.Path, committedRevision, newSize)
+		fs.updateOpenHandleBaseRevision(entry.Path, committedRevision, pid, newSize)
 	}
 	fs.invalidateReadCacheAndTargets(entry.Path)
 	fs.cacheFileForPath(entry.Path, newSize, refreshedMtime, refreshedRevision)
@@ -9646,7 +9696,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				// sync, a subsequent fstat(fd) on an open dirty handle returns the
 				// stale (pre-truncate) size via dirtyHandleSize(), causing
 				// fstat() mismatch failures (LTP ftest01 m_fstat case).
-				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
+				fs.syncOpenHandlesAfterCommittedPathTruncate(input.NodeId, input.Pid, newSize)
 			}
 		}
 		entry.Size = newSize

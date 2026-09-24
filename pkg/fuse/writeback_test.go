@@ -1587,6 +1587,142 @@ func TestCloseSyncFlushSupersedesPathZeroShadowBeforeRelease(t *testing.T) {
 	}
 }
 
+func TestCloseSyncPathTruncateDoesNotAdoptCleanUnreleasedHandle(t *testing.T) {
+	const path = "/supervise-probe.txt"
+	const pid = 4242
+
+	var (
+		mu      sync.Mutex
+		content       = []byte("seed\n")
+		rev     int64 = 1
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			_, _ = w.Write(content)
+		case http.MethodPut:
+			expected, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				expected = -1
+			}
+			if expected >= 0 && expected != rev {
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			rev++
+			content = append(content[:0], body...)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": rev})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict, WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	ino := fs.inodes.Lookup(path, false, int64(len(content)), time.Now())
+	fs.inodes.UpdateRevision(ino, rev)
+
+	openWriter := func() gofuse.OpenOut {
+		t.Helper()
+		var out gofuse.OpenOut
+		if st := fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+			Flags:    uint32(syscall.O_WRONLY),
+		}, &out); st != gofuse.OK {
+			t.Fatalf("Open status = %v, want OK", st)
+		}
+		return out
+	}
+	writeAndFlush := func(out gofuse.OpenOut, data []byte) gofuse.Status {
+		t.Helper()
+		if _, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+			Fh:       out.Fh,
+			Offset:   0,
+		}, data); st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+		return fs.Flush(nil, &gofuse.FlushIn{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+			Fh:       out.Fh,
+		})
+	}
+
+	// Keep the first, already-flushed handle registered. Linux may delay its
+	// Release until after the same process has started the next O_TRUNC open.
+	// The path SetAttr must not fold that new truncate into this clean old
+	// handle: its delayed Release would publish a hidden zero-byte generation
+	// and make the new writer's CAS stale.
+	first := openWriter()
+	if st := writeAndFlush(first, []byte("first\n")); st != gofuse.OK {
+		t.Fatalf("first Flush status = %v, want OK", st)
+	}
+
+	var attrOut gofuse.AttrOut
+	if st := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+		Valid:    gofuse.FATTR_SIZE,
+		Size:     0,
+	}}, &attrOut); st != gofuse.OK {
+		t.Fatalf("SetAttr truncate status = %v, want OK", st)
+	}
+
+	second := openWriter()
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+		Fh:       second.Fh,
+		Offset:   0,
+	}, []byte("second\n")); st != gofuse.OK {
+		t.Fatalf("second Write status = %v, want OK", st)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}}, Fh: first.Fh})
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}},
+		Fh:       second.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("second Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: pid}}, Fh: second.Fh})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := string(content); got != "second\n" {
+		t.Fatalf("remote content = %q, want %q", got, "second\n")
+	}
+	if rev != 4 {
+		t.Fatalf("remote revision = %d, want 4", rev)
+	}
+}
+
 func TestWriteSyncUploadsBeforeWriteReturns(t *testing.T) {
 	var putCalls atomic.Int32
 	var uploaded []byte
