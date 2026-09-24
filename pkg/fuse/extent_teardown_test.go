@@ -325,14 +325,17 @@ func TestExtentRuntimePointerRace(t *testing.T) {
 	fs := &Dat9FS{}
 	fs.extentRT.Store(&extentRuntime{rt: &extent.Runtime{Storage: rec}, hold: newExtentMetaHold()})
 
+	started := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		close(started)
 		for i := 0; i < 2000; i++ {
 			_ = fs.extentVFS()
 		}
 	}()
+	<-started // overlap the reader with teardown, or the window is never hit
 	fs.stopExtentRuntimeLoop()
 	fs.closeExtentRuntime()
 	wg.Wait()

@@ -39,8 +39,11 @@ type Transport struct {
 // loop's ClaimNextCompact, plus the steady-state FUSE read/write/getattr/
 // setattr/lookup/unlink/rename calls that share this transport. A stalled
 // endpoint therefore surfaces as ETIMEDOUT to the caller instead of hanging the
-// request; blocking Flock/Setlk are exempt inside Call. The credential mint is
-// a separate client call bounded by CredentialMintTimeout.
+// request; blocking Flock/Setlk are exempt inside Call. The commit-style
+// mutating ops (compact, unlink, delete_sustained) are bounded too: their
+// server-side work is a CAS or a batch enqueue, not the object transfer, so 30s
+// is a liveness cap rather than a limit on the bulk of the operation. The
+// credential mint is a separate client call bounded by CredentialMintTimeout.
 const MetaCallTimeout = 30 * time.Second
 
 func NewTransport(fn MetaOpFunc) *Transport {

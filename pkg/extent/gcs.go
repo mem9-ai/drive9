@@ -144,8 +144,11 @@ func (g *gcsTokenStorage) Put(ctx context.Context, key string, in io.Reader, _ .
 	defer cancel()
 	writer := g.writer(ctx, key)
 	if _, err := io.Copy(writer, in); err != nil {
+		// Abort, don't Close: cancel() makes the storage package's monitorCancel
+		// goroutine call CloseWithError(ctx.Err()), so the truncated object is
+		// never finalized. A Close() here would race that goroutine and could
+		// commit the partial body while returning the copy error.
 		cancel()
-		_ = writer.Close()
 		return err
 	}
 	return writer.Close()

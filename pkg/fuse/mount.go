@@ -1147,6 +1147,9 @@ func cleanupMountStartFailure(cleanup mountStartCleanup) {
 	}
 }
 
+// cleanupNewServerFailure is the one startup-failure path with no closeRuntime:
+// it is reached only when go-fuse's NewServer failed, before Serve, so no FUSE
+// handler — and therefore no lazily-built extent runtime — can exist yet.
 func cleanupNewServerFailure(
 	mountPoint string,
 	cause error,

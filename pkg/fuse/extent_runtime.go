@@ -71,18 +71,21 @@ func (fs *Dat9FS) closeExtentRuntime() {
 	if er == nil {
 		return
 	}
-	// Refuse new metadata RPCs and wait for the in-flight ones before closing the
-	// session, so a late FUSE handler cannot use a closed one (the object store is
-	// refcounted separately). The session-cleanup RPC CloseRuntime issues next is
-	// exempt from the gate: refusing it would leave the JuiceFS session open.
-	if er.hold != nil {
-		if !er.hold.closeAndWait(extentMetaDrainTimeout) {
-			safeLogPrintf("extent metadata drain timed out after %s; closing the session anyway", extentMetaDrainTimeout)
+	er.closeOnce.Do(func() {
+		// Refuse new metadata RPCs and wait for the in-flight ones before closing
+		// the session, so a late FUSE handler cannot use a closed one (the object
+		// store is refcounted separately). The session-cleanup RPC CloseRuntime
+		// issues next is exempt from the gate: refusing it would leave the JuiceFS
+		// session open.
+		if er.hold != nil {
+			if !er.hold.closeAndWait(extentMetaDrainTimeout) {
+				safeLogPrintf("extent metadata drain timed out after %s; closing the session anyway", extentMetaDrainTimeout)
+			}
 		}
-	}
-	if err := extent.CloseRuntime(er.rt); err != nil {
-		safeLogPrintf("close extent runtime: %v", err)
-	}
+		if err := extent.CloseRuntime(er.rt); err != nil {
+			safeLogPrintf("close extent runtime: %v", err)
+		}
+	})
 }
 
 // extentTeardownOp reports whether op is one of the metadata RPCs that
@@ -131,7 +134,9 @@ func (h *extentMetaHold) enter(op string) bool {
 func (h *extentMetaHold) leave() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.active--
+	if h.active > 0 {
+		h.active--
+	}
 	if h.active == 0 {
 		h.cond.Broadcast()
 	}
@@ -175,6 +180,9 @@ type extentRuntime struct {
 	rt   *extent.Runtime
 	hold *extentMetaHold
 	stop context.CancelFunc
+	// closeOnce makes closeExtentRuntime idempotent even if two callers race
+	// past the pointer clear.
+	closeOnce sync.Once
 	// wg tracks the background compaction loop. FlushAll cancels it and then
 	// joins it, so unmount cannot return while a compaction is still
 	// uploading or committing: exiting between the object PUT and the compact
