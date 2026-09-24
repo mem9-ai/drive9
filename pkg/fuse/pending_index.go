@@ -260,10 +260,11 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 		// callers fsync the content (shadow / durable snapshot) before Put,
 		// and JournalPendingMeta replay rebuilds this entry after a crash.
 		if err := journal.Append(JournalEntry{
-			Op:        JournalPendingMeta,
-			Path:      remotePath,
-			Timestamp: time.Now().Unix(),
-			Meta:      metaBytes,
+			Op:         JournalPendingMeta,
+			Path:       remotePath,
+			Generation: gen,
+			Timestamp:  time.Now().Unix(),
+			Meta:       metaBytes,
 		}); err != nil {
 			return 0, fmt.Errorf("pending index journal append: %w", err)
 		}
@@ -569,8 +570,10 @@ func (idx *PendingIndex) UpdateSize(remotePath string, size int64) {
 	}
 }
 
-// UpdateMode updates the pending mode metadata for an existing entry.
-func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
+// UpdateMode updates the pending mode metadata for an existing entry and
+// returns the new generation. The generation is always uncommitted until the
+// caller proves the corresponding remote mutation succeeded.
+func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) (uint64, error) {
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
 
@@ -579,24 +582,28 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 
 	meta, ok := idx.items[remotePath]
 	if !ok {
-		return nil
+		return 0, nil
 	}
 	updated := cloneWriteBackMeta(meta)
 	updated.Mode = mode & posixPermissionModeMask
 	updated.HasMode = true
+	// This is a new local mutation generation. It is not remotely committed
+	// merely because the preceding retained layer generation was.
+	updated.LayerCommitted = false
 	updated.Generation = idx.nextGen.Add(1)
+	updated.Mtime = time.Now()
 
 	metaBytes, err := json.Marshal(&updated)
 	if err != nil {
-		return fmt.Errorf("pending index marshal mode: %w", err)
+		return 0, fmt.Errorf("pending index marshal mode: %w", err)
 	}
 	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
 	if err := atomicWrite(metaPath, metaBytes); err != nil {
-		return fmt.Errorf("pending index update mode: %w", err)
+		return 0, fmt.Errorf("pending index update mode: %w", err)
 	}
 	cp := updated
 	idx.items[remotePath] = &cp
-	return nil
+	return updated.Generation, nil
 }
 
 // MarkLayerCommitted keeps the pending entry as a local overlay data source but

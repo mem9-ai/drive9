@@ -980,13 +980,23 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 			}
 			if fs.pendingIndex != nil {
 				if !hadPending {
-					if _, err := fs.pendingIndex.PutWithBaseRevAndMode(localPath, int64(len(data)), pendingKind, baseRev, mode, true); err != nil {
+					gen, err := fs.pendingIndex.PutWithBaseRevAndMode(localPath, int64(len(data)), pendingKind, baseRev, mode, true)
+					if err != nil {
 						return fmt.Errorf("put pending mode for layer chmod %s: %w", localPath, err)
+					}
+					if _, err := fs.pendingIndex.MarkLayerCommitted(localPath, gen, baseRev); err != nil {
+						return fmt.Errorf("mark pending mode committed for layer chmod %s: %w", localPath, err)
 					}
 					return nil
 				}
-				if err := fs.pendingIndex.UpdateMode(localPath, mode); err != nil {
+				gen, err := fs.pendingIndex.UpdateMode(localPath, mode)
+				if err != nil {
 					return fmt.Errorf("update pending mode for layer chmod %s: %w", localPath, err)
+				}
+				if gen != 0 {
+					if _, err := fs.pendingIndex.MarkLayerCommitted(localPath, gen, baseRev); err != nil {
+						return fmt.Errorf("mark pending mode committed for layer chmod %s: %w", localPath, err)
+					}
 				}
 			}
 			return nil
@@ -1005,8 +1015,12 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 				return err
 			}
 			if fs.pendingIndex != nil {
-				if _, err := fs.pendingIndex.PutWithBaseRevAndMode(localPath, int64(len(entry.Content)), pendingKind, baseRev, mode, true); err != nil {
+				gen, err := fs.pendingIndex.PutWithBaseRevAndMode(localPath, int64(len(entry.Content)), pendingKind, baseRev, mode, true)
+				if err != nil {
 					return fmt.Errorf("put pending mode for layer chmod %s: %w", localPath, err)
+				}
+				if _, err := fs.pendingIndex.MarkLayerCommitted(localPath, gen, baseRev); err != nil {
+					return fmt.Errorf("mark pending mode committed for layer chmod %s: %w", localPath, err)
 				}
 			}
 			return nil
@@ -3812,7 +3826,7 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncateState(ino uint64, callerPID ui
 func (fs *Dat9FS) setPendingMetadataMode(path string, mode uint32) {
 	mode &= posixPermissionModeMask
 	if fs.pendingIndex != nil {
-		if err := fs.pendingIndex.UpdateMode(path, mode); err != nil {
+		if _, err := fs.pendingIndex.UpdateMode(path, mode); err != nil {
 			safeLogPrintf("pending index mode update failed for %s: %v", path, err)
 		}
 	}
@@ -15527,6 +15541,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 					entry := JournalEntry{
 						Op:          JournalFsync,
 						Path:        fh.Path,
+						Generation:  fh.PendingIndexGen,
 						Length:      fh.Dirty.Size(),
 						BaseRev:     fh.BaseRev,
 						ShadowSpill: true,
@@ -15565,10 +15580,11 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 				// this fsync frame or replay resurrects a committed path.
 				if fs.journal != nil {
 					entry := JournalEntry{
-						Op:      JournalFsync,
-						Path:    fh.Path,
-						Length:  fh.Dirty.Size(),
-						BaseRev: fh.BaseRev,
+						Op:         JournalFsync,
+						Path:       fh.Path,
+						Generation: fh.PendingIndexGen,
+						Length:     fh.Dirty.Size(),
+						BaseRev:    fh.BaseRev,
 					}
 					_ = fs.journal.Append(entry)
 					_ = fs.journal.FsyncShared()

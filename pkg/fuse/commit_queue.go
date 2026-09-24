@@ -2536,8 +2536,9 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	// crash recovery never re-uploads an already committed entry.
 	if cq.journal != nil {
 		if err := cq.journal.Append(JournalEntry{
-			Op:   JournalCommit,
-			Path: entry.Path,
+			Op:         JournalCommit,
+			Path:       entry.Path,
+			Generation: entry.PendingIndexGen,
 		}); err != nil {
 			safeLogPrintf("commit queue: journal commit marker failed for %s: %v (keeping local state)", entry.Path, err)
 			cq.removeFromQueue(entry)
@@ -3028,8 +3029,9 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error
 	}
 	if cq.journal != nil {
 		if err := cq.journal.Append(JournalEntry{
-			Op:   JournalCommit, // treated as "done" so recovery won't re-enqueue
-			Path: entry.Path,
+			Op:         JournalCommit, // treated as "done" so recovery won't re-enqueue
+			Path:       entry.Path,
+			Generation: entry.PendingIndexGen,
 		}); err != nil {
 			safeLogPrintf("commit queue: journal done marker failed for %s: %v", entry.Path, err)
 		}

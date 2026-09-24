@@ -883,14 +883,135 @@ func TestLayerSetAttrModeCoalescesPendingFileContent(t *testing.T) {
 		t.Fatalf("mode = %#o, want 0600", got.Mode)
 	}
 	meta, ok := pending.GetMeta("/new.txt")
-	if !ok || meta.Kind != PendingNew || !meta.HasMode || meta.Mode != 0o600 {
-		t.Fatalf("pending mode = %+v, want PendingNew 0600", meta)
+	if !ok || meta.Kind != PendingOverwrite || !meta.LayerCommitted || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("pending mode = %+v, want committed PendingOverwrite 0600", meta)
 	}
 	if mode, ok := fs.layerFileMode("/new.txt"); !ok || mode != 0o600 {
 		t.Fatalf("layer file mode = (%#o, %t), want 0600 true", mode, ok)
 	}
 	if got, want := out.Mode&0o777, uint32(0o600); got != want {
 		t.Fatalf("SetAttr output mode = %o, want %o", got, want)
+	}
+}
+
+func TestLayerSetAttrModeFailureLeavesNewGenerationRecoverable(t *testing.T) {
+	const (
+		localPath  = "/committed.txt"
+		remotePath = "/repo/committed.txt"
+	)
+	data := []byte("committed layer data")
+	var (
+		mu       sync.Mutex
+		requests []clientLayerEntryRequest
+		failPost = true
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var req clientLayerEntryRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode layer entry: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, req)
+		shouldFail := failPost
+		seq := len(requests)
+		mu.Unlock()
+		if shouldFail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+			LayerID:      "layer-1",
+			Path:         req.Path,
+			Op:           req.Op,
+			Kind:         req.Kind,
+			BaseRevision: req.BaseRevision,
+			Mode:         req.Mode,
+			Content:      req.Content,
+			SizeBytes:    req.SizeBytes,
+			EntrySeq:     int64(seq),
+		})
+	}))
+	defer ts.Close()
+
+	shadowDir := t.TempDir()
+	pendingDir := t.TempDir()
+	shadow, err := NewShadowStore(shadowDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(localPath, data, 8); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := pending.PutWithBaseRevAndMode(localPath, int64(len(data)), PendingOverwrite, 8, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marked, err := pending.MarkLayerCommitted(localPath, gen, 8)
+	if err != nil || !marked {
+		t.Fatalf("mark initial layer generation committed = (%t, %v), want true, nil", marked, err)
+	}
+	committedMeta, _ := pending.GetMeta(localPath)
+
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{LayerRef: "layer-1", RemoteRoot: "/repo"})
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	ino := fs.inodes.Lookup(localPath, false, int64(len(data)), time.Now())
+	fs.inodes.UpdateRevision(ino, 8)
+	fs.inodes.UpdateMode(ino, 0o644)
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Valid:    gofuse.FATTR_MODE,
+		Mode:     0o600,
+	}}, &out)
+	if st == gofuse.OK {
+		t.Fatal("layer chmod with rejected POST unexpectedly succeeded")
+	}
+	meta, ok := pending.GetMeta(localPath)
+	if !ok || meta.LayerCommitted || meta.Generation <= committedMeta.Generation || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("failed chmod metadata = %+v, want newer recoverable mode generation", meta)
+	}
+
+	// Simulate restart after the remote rejection. The new metadata generation
+	// must survive and be uploaded; the preceding committed overlay must not be
+	// the generation replayed.
+	recovered, err := NewPendingIndex(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	failPost = false
+	mu.Unlock()
+	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, recovered, nil, 1, 8, "/repo")
+	cq.SetLayerRef("layer-1")
+	if got := cq.RecoverPendingSync(context.Background()); got != 1 {
+		t.Fatalf("recovered chmod commits = %d, want 1", got)
+	}
+	mu.Lock()
+	gotRequests := append([]clientLayerEntryRequest(nil), requests...)
+	mu.Unlock()
+	if len(gotRequests) != 2 || gotRequests[1].Path != remotePath || gotRequests[1].Mode != 0o600 || !bytes.Equal(gotRequests[1].Content, data) {
+		t.Fatalf("recovered chmod requests = %+v, want failed then recovered content upsert", gotRequests)
+	}
+	meta, ok = recovered.GetMeta(localPath)
+	if !ok || !meta.LayerCommitted {
+		t.Fatalf("recovered chmod metadata = %+v, want committed retained overlay", meta)
 	}
 }
 

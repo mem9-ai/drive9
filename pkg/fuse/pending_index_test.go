@@ -267,6 +267,56 @@ func TestPendingIndexWALNewGenerationSupersedesLayerCommittedMarker(t *testing.T
 	}
 }
 
+func TestJournalGenerationCommitDoesNotSupersedeNewerPendingMeta(t *testing.T) {
+	dir := t.TempDir()
+	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = j.Close() }()
+
+	idx, err := NewPendingIndex(filepath.Join(dir, "live-pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.SetJournal(j)
+	oldGen, err := idx.PutWithBaseRev("/layer.txt", 4, PendingOverwrite, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newGen, err := idx.PutWithBaseRev("/layer.txt", 9, PendingOverwrite, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The older upload completes after the newer generation already reached
+	// the WAL. Its completion must fence only oldGen, never the whole path.
+	if err := j.Append(JournalEntry{
+		Op:         JournalCommit,
+		Path:       "/layer.txt",
+		Generation: oldGen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.FsyncShared(); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := NewPendingIndex(filepath.Join(dir, "recovered-pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replayJournalIntoPending(j, recovered, nil); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := recovered.GetMeta("/layer.txt")
+	if !ok || meta.Generation != newGen || meta.Size != 9 || meta.BaseRev != 8 || meta.LayerCommitted {
+		t.Fatalf("recovered metadata = %+v, want newer uncommitted generation %d", meta, newGen)
+	}
+}
+
 func TestPendingIndexListPendingPaths(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := NewPendingIndex(dir)

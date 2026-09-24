@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -1594,6 +1595,114 @@ func TestCommitQueueLayerModeRetainsShadowAndPendingAfterUpload(t *testing.T) {
 	cq2.DrainAll()
 	if !bytes.Equal(gotContent, data2) {
 		t.Fatalf("second uploaded content = %q, want %q", gotContent, data2)
+	}
+}
+
+func TestCommitQueueLayerOldCompletionPreservesNewerWALGeneration(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var req clientLayerEntryRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode layer entry: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if !bytes.Equal(req.Content, []byte("old")) {
+			t.Errorf("in-flight content = %q, want old", req.Content)
+		}
+		close(requestStarted)
+		<-releaseResponse
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+			LayerID:      "layer-1",
+			Path:         req.Path,
+			Op:           req.Op,
+			Kind:         req.Kind,
+			BaseRevision: req.BaseRevision,
+			Content:      req.Content,
+			SizeBytes:    req.SizeBytes,
+			EntrySeq:     8,
+		})
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	j, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = j.Close() }()
+	shadow, err := NewShadowStore(filepath.Join(dir, "shadow"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(filepath.Join(dir, "pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending.SetJournal(j)
+	if err := shadow.WriteFull("/same.txt", []byte("old"), 7); err != nil {
+		t.Fatal(err)
+	}
+	oldShadowGen := shadow.ActiveGeneration("/same.txt")
+	oldGen, err := pending.PutWithBaseRev("/same.txt", 3, PendingOverwrite, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, j, 1, 8, "/repo")
+	cq.SetLayerRef("layer-1")
+	if err := cq.Enqueue(&CommitEntry{
+		Path:            "/same.txt",
+		BaseRev:         7,
+		Size:            3,
+		Kind:            PendingOverwrite,
+		ShadowGen:       oldShadowGen,
+		PendingIndexGen: oldGen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("old layer upload did not reach the server")
+	}
+
+	// Publish N+1 while N is in flight. The older completion marker is written
+	// after this WAL frame and therefore exercises the dangerous inverse order.
+	if err := shadow.WriteFull("/same.txt", []byte("new-value"), 8); err != nil {
+		t.Fatal(err)
+	}
+	newGen, err := pending.PutWithBaseRev("/same.txt", 9, PendingOverwrite, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(releaseResponse)
+	cq.DrainAll()
+	if err := j.FsyncShared(); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := NewPendingIndex(filepath.Join(dir, "recovered"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replayJournalIntoPending(j, recovered, shadow); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := recovered.GetMeta("/same.txt")
+	if !ok || meta.Generation != newGen || meta.Size != 9 || meta.BaseRev != 8 || meta.LayerCommitted {
+		t.Fatalf("recovered metadata = %+v, want newer uncommitted generation %d", meta, newGen)
 	}
 }
 

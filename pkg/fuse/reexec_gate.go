@@ -276,24 +276,22 @@ func (j *Journal) UncommittedFrameCount() int {
 		return 0
 	}
 
-	latestData := make(map[string]uint64) // path → latest JournalFsync seq
-	latestDone := make(map[string]uint64) // path → latest JournalCommit/Unlink seq
+	latestData := make(map[string]JournalEntry) // path → latest JournalFsync
+	done := newJournalDoneState()
 	scanJournalFrames(data, func(entry JournalEntry, _ []byte) {
 		switch entry.Op {
 		case JournalCommit, JournalUnlink:
-			if entry.Seq > latestDone[entry.Path] {
-				latestDone[entry.Path] = entry.Seq
-			}
+			done.observe(entry)
 		case JournalFsync:
-			if entry.Seq > latestData[entry.Path] {
-				latestData[entry.Path] = entry.Seq
+			if previous, ok := latestData[entry.Path]; !ok || entry.Seq > previous.Seq {
+				latestData[entry.Path] = entry
 			}
 		}
 	})
 
 	count := 0
-	for path, dataSeq := range latestData {
-		if doneSeq, ok := latestDone[path]; ok && doneSeq > dataSeq {
+	for _, entry := range latestData {
+		if done.supersedes(entry) {
 			continue
 		}
 		count++

@@ -1452,8 +1452,14 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 			continue
 		case "chmod":
 			if pending != nil {
-				if err := pending.UpdateMode(localPath, entry.Mode); err != nil {
+				gen, err := pending.UpdateMode(localPath, entry.Mode)
+				if err != nil {
 					return fmt.Errorf("restore fs layer chmod pending %s: %w", localPath, err)
+				}
+				if gen != 0 {
+					if _, err := pending.MarkLayerCommitted(localPath, gen, 0); err != nil {
+						return fmt.Errorf("restore fs layer chmod commit marker %s: %w", localPath, err)
+					}
 				}
 			}
 			if fs != nil {

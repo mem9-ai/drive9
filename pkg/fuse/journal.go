@@ -29,15 +29,19 @@ const (
 
 // JournalEntry represents a single operation in the WAL.
 type JournalEntry struct {
-	Seq       uint64    `json:"seq"`
-	Op        JournalOp `json:"op"`
-	Inode     uint64    `json:"inode,omitempty"`
-	Path      string    `json:"path"`
-	NewPath   string    `json:"new_path,omitempty"` // for Rename
-	Offset    int64     `json:"offset,omitempty"`   // for Write
-	Length    int64     `json:"length,omitempty"`   // for Write
-	BaseRev   int64     `json:"base_rev,omitempty"`
-	Timestamp int64     `json:"timestamp,omitempty"`
+	Seq uint64    `json:"seq"`
+	Op  JournalOp `json:"op"`
+	// Generation binds a completion marker to the exact pending-index
+	// generation it uploaded. Zero preserves the legacy path-scoped semantics
+	// used by unlink/cancel and old journals.
+	Generation uint64 `json:"generation,omitempty"`
+	Inode      uint64 `json:"inode,omitempty"`
+	Path       string `json:"path"`
+	NewPath    string `json:"new_path,omitempty"` // for Rename
+	Offset     int64  `json:"offset,omitempty"`   // for Write
+	Length     int64  `json:"length,omitempty"`   // for Write
+	BaseRev    int64  `json:"base_rev,omitempty"`
+	Timestamp  int64  `json:"timestamp,omitempty"`
 	// ShadowSpill records that the fsync'd data lives in a streaming shadow
 	// file, so crash recovery must rebuild the pending entry in spill mode
 	// (streamed upload) instead of full-memory ReadAll.
@@ -47,6 +51,69 @@ type JournalEntry struct {
 	// a per-file atomicWrite (issue #959/#960 follow-up — one group-committed
 	// fsync replaces two per-close fsyncs).
 	Meta []byte `json:"meta,omitempty"`
+}
+
+type journalDoneState struct {
+	path       map[string]uint64
+	generation map[string]map[uint64]uint64
+}
+
+func newJournalDoneState() *journalDoneState {
+	return &journalDoneState{
+		path:       make(map[string]uint64),
+		generation: make(map[string]map[uint64]uint64),
+	}
+}
+
+func journalEntryGeneration(entry JournalEntry) uint64 {
+	if entry.Generation != 0 {
+		return entry.Generation
+	}
+	if entry.Op != JournalPendingMeta || len(entry.Meta) == 0 {
+		return 0
+	}
+	var meta WriteBackMeta
+	if json.Unmarshal(entry.Meta, &meta) != nil {
+		return 0
+	}
+	return meta.Generation
+}
+
+func (state *journalDoneState) observe(entry JournalEntry) {
+	if entry.Op != JournalCommit && entry.Op != JournalUnlink {
+		return
+	}
+	gen := entry.Generation
+	if entry.Op == JournalUnlink || gen == 0 {
+		if entry.Seq > state.path[entry.Path] {
+			state.path[entry.Path] = entry.Seq
+		}
+		return
+	}
+	byGeneration := state.generation[entry.Path]
+	if byGeneration == nil {
+		byGeneration = make(map[uint64]uint64)
+		state.generation[entry.Path] = byGeneration
+	}
+	if entry.Seq > byGeneration[gen] {
+		byGeneration[gen] = entry.Seq
+	}
+}
+
+func (state *journalDoneState) supersedes(entry JournalEntry) bool {
+	if state.path[entry.Path] > entry.Seq {
+		return true
+	}
+	gen := journalEntryGeneration(entry)
+	return gen != 0 && state.generation[entry.Path][gen] > entry.Seq
+}
+
+func (state *journalDoneState) coversForCompaction(entry JournalEntry) bool {
+	if state.path[entry.Path] >= entry.Seq {
+		return true
+	}
+	gen := journalEntryGeneration(entry)
+	return gen != 0 && state.generation[entry.Path][gen] >= entry.Seq
 }
 
 // Journal is an append-only WAL for crash recovery. Each entry is
@@ -263,17 +330,17 @@ func (j *Journal) Compact() error {
 		return err
 	}
 
-	// First pass: find the highest committed sequence per path.
-	// Only entries with Seq <= committedUpTo[path] are safe to discard.
-	// Entries written after the commit must be preserved for recovery.
-	committedUpTo := make(map[string]uint64) // path → max committed seq
+	// First pass: find path-scoped legacy boundaries and exact-generation
+	// completion boundaries. A completion for generation N must never discard a
+	// newer generation N+1 that happened to reach the WAL first.
+	done := newJournalDoneState()
 	scanJournalFrames(data, func(entry JournalEntry, _ []byte) {
-		if entry.Op == JournalCommit && entry.Seq > committedUpTo[entry.Path] {
-			committedUpTo[entry.Path] = entry.Seq
+		if entry.Op == JournalCommit {
+			done.observe(entry)
 		}
 	})
 
-	if len(committedUpTo) == 0 {
+	if len(done.path) == 0 && len(done.generation) == 0 {
 		return nil // nothing to compact
 	}
 
@@ -281,8 +348,7 @@ func (j *Journal) Compact() error {
 	// for their path, and all frames for paths without a commit marker.
 	var kept []byte
 	scanJournalFrames(data, func(entry JournalEntry, frame []byte) {
-		boundary, hasCommit := committedUpTo[entry.Path]
-		if !hasCommit || entry.Seq > boundary {
+		if !done.coversForCompaction(entry) {
 			kept = append(kept, frame...)
 		}
 	})
@@ -331,13 +397,11 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 
 	latestData := make(map[string]JournalEntry) // path → latest fsync entry
 	latestMeta := make(map[string]JournalEntry) // path → latest pending-meta entry
-	latestDone := make(map[string]uint64)       // path → latest commit/unlink seq
+	done := newJournalDoneState()
 	if err := j.Replay(func(e JournalEntry) {
 		switch e.Op {
 		case JournalCommit, JournalUnlink:
-			if e.Seq > latestDone[e.Path] {
-				latestDone[e.Path] = e.Seq
-			}
+			done.observe(e)
 		case JournalFsync:
 			// Only fsync frames assert "shadow data is durable"; other ops
 			// (write/rename/mkdir/...) must not resurrect pending uploads.
@@ -356,7 +420,7 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 	// A path can have both frame kinds (close published a meta frame, a later
 	// fsync(2) added a data frame, or vice versa); the newest frame wins.
 	ressurrect := func(path string, e JournalEntry, fromMeta bool) error {
-		if doneSeq, ok := latestDone[path]; ok && doneSeq > e.Seq {
+		if done.supersedes(e) {
 			return nil // committed or unlinked after the last local record
 		}
 		if fromMeta {
