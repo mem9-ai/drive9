@@ -383,18 +383,25 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 	// miss for a name the cache never held is a false ENOENT. Clearing is
 	// explicit rather than merely skipping the assignment below, because the
 	// entry may hold completeness from an earlier, smaller listing.
-	if complete {
-		entry.complete = true
-		entry.completeExpires = deadline
-	} else {
-		entry.complete = false
-		entry.completeExpires = time.Time{}
-	}
-	entry.gen = dc.nextGenerationLocked()
+	//
+	// Miss authority belongs to the newest install alone, together with the
+	// deadline it runs on. A stale response neither restores it (it is the older
+	// word, and the newer listing may have revoked it precisely because it could
+	// not be cached whole) nor revokes it (the newer one knows whether it fits).
+	// Touching it here is how a losing response turned names the winner had
+	// proven to exist, but could not hold, into false ENOENTs.
 	if !staleInstall {
+		if complete {
+			entry.complete = true
+			entry.completeExpires = deadline
+		} else {
+			entry.complete = false
+			entry.completeExpires = time.Time{}
+		}
 		// This install is now the newest word on the directory's names.
 		entry.installSeq = request.seq
 	}
+	entry.gen = dc.nextGenerationLocked()
 	// Releasing here is what retires this request's stamps once it was the last
 	// one outstanding.
 	dc.releaseRequestLocked(request)
@@ -1049,9 +1056,14 @@ func (e *dirCacheEntry) remove(name string) {
 // before it merges.
 //
 // Dropping a name is not a claim about the directory, so it is the entry's miss
-// authority that has to give way, not a name: a lookup for a name the cache no
-// longer holds must reach the server rather than be answered "absent" from a
-// set that simply let it expire. That is the same rule eviction follows.
+// authority that has to give way: a lookup for a name the cache no longer holds
+// must reach the server rather than be answered "absent" from a set that simply
+// let it expire. That is the same rule eviction follows.
+//
+// The sweep rewrites the ordering in one pass rather than deleting name by name,
+// because a listing gives every name it carries the same deadline: expiring one
+// expires the whole directory, and a per-name removal rescans the ordering for
+// each — quadratic at the 200k default cap, and it runs under the cache mutex.
 func (e *dirCacheEntry) prune(now time.Time) {
 	if !e.freshnessHint.IsZero() && !now.Before(e.freshnessHint) {
 		hint := time.Time{}
@@ -1061,9 +1073,10 @@ func (e *dirCacheEntry) prune(now time.Time) {
 				continue
 			}
 			if now.After(item.freshUntil) {
-				// Removing from a map while ranging it is well defined: an
+				// Deleting from a map while ranging it is well defined: an
 				// entry deleted before the range reaches it is not produced.
-				e.remove(name)
+				delete(e.items, name)
+				delete(e.negatives, name)
 				dropped = true
 				continue
 			}
@@ -1071,13 +1084,29 @@ func (e *dirCacheEntry) prune(now time.Time) {
 				hint = item.freshUntil
 			}
 		}
-		e.freshnessHint = hint
 		if dropped {
+			// Rebuild the ordering in one pass instead of removing name by
+			// name: a listing gives every name it carries the same deadline, so
+			// one expiry empties the whole directory, and a per-name removal
+			// rescans (and shifts) the ordering for each of them — quadratic at
+			// the 200k default cap, while holding the cache mutex.
+			kept := e.order[:0]
+			for _, name := range e.order {
+				if _, live := e.items[name]; live {
+					kept = append(kept, name)
+				}
+			}
+			// Drop the references past the new length so a swept directory does
+			// not keep the expired names alive through the backing array.
+			clear(e.order[len(kept):])
+			e.order = kept
 			e.complete = false
 			e.completeExpires = time.Time{}
 			e.sessionExpires = time.Time{}
 		}
+		e.freshnessHint = hint
 	}
+
 	if !e.completeExpires.IsZero() && now.After(e.completeExpires) {
 		e.completeExpires = time.Time{}
 		// The flag means "the newest listing is still authoritative", which it

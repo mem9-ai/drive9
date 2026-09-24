@@ -1205,6 +1205,115 @@ func TestDirCacheFreshnessHintTracksTheEarliestDeadline(t *testing.T) {
 	}
 }
 
+// --- Twelfth review round on #966: bulk expiry and stale completeness -------
+
+// A response that lost the race must not speak for the directory's
+// completeness. The newer install owns that authority, and an older response
+// restoring it turns names the newer listing proved to exist — but could not
+// cache, being past the cap — into false ENOENT.
+func TestDirCacheStaleInstallDoesNotRestoreCompleteness(t *testing.T) {
+	const cap = 2
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, cap)
+
+	// Request A is issued first, request B second.
+	older := dc.BeginRequest("/d")
+
+	// B lands first, over-cap: the cache holds only a prefix of it and must
+	// therefore not answer misses.
+	over := make([]CachedFileInfo, 0, cap*3)
+	for i := range cap * 3 {
+		over = append(over, CachedFileInfo{Name: fmt.Sprintf("f_%02d.dat", i), Revision: 1})
+	}
+	listInstall(dc, "/d", over)
+
+	// A lands late carrying one name. It is stale for every cache effect.
+	dc.PutListing("/d", []CachedFileInfo{{Name: "f_00.dat", Revision: 1}}, older)
+
+	if dc.CanAnswerMisses("/d") {
+		t.Fatal("a stale install restored the complete authority the newer listing revoked")
+	}
+	// A name the newer listing carried but the cache could not hold must reach
+	// the server, not be answered absent.
+	if got := dc.Lookup("/d", "f_05.dat"); got.kind != namespaceLookupPartialMiss {
+		t.Fatalf("lookup of an uncached name = %v, want partial miss (remote fallback)", got.kind)
+	}
+}
+
+// The mirror: a stale install must not *revoke* completeness either. The newer
+// listing fit in the cache, so it may answer misses, and the older over-cap
+// response arriving afterwards may not take that away.
+func TestDirCacheStaleInstallDoesNotRevokeCompleteness(t *testing.T) {
+	const cap = 4
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, cap)
+
+	older := dc.BeginRequest("/d")
+	listInstall(dc, "/d", []CachedFileInfo{{Name: "a.dat"}, {Name: "b.dat"}})
+
+	over := make([]CachedFileInfo, 0, cap*2)
+	for i := range cap * 2 {
+		over = append(over, CachedFileInfo{Name: fmt.Sprintf("f_%02d.dat", i), Revision: 1})
+	}
+	dc.PutListing("/d", over, older)
+
+	if !dc.CanAnswerMisses("/d") {
+		t.Fatal("a stale install revoked the complete authority the newer listing established")
+	}
+}
+
+// A listing gives every name it carries the same deadline, so the first read
+// after that deadline expires a whole directory in one sweep. That sweep must
+// stay linear in the directory size: a per-name removal rescans (and shifts) the
+// ordering for each name expired, which is quadratic and runs while holding the
+// cache mutex, blocking every other directory operation on the mount.
+//
+// The bound is absolute rather than a timing ratio because the two shapes are
+// three orders of magnitude apart at this size: linear sweeps 100k names in
+// tens of milliseconds, the quadratic form needs seconds.
+func TestDirCacheBulkExpiryIsLinear(t *testing.T) {
+	const n = 100000
+	dc := NewNamespaceCache(time.Millisecond, time.Millisecond, n)
+
+	response := make([]CachedFileInfo, 0, n)
+	for i := range n {
+		response = append(response, CachedFileInfo{Name: fmt.Sprintf("f_%07d.dat", i), Revision: 1})
+	}
+	request := dc.BeginRequest("/d")
+	dc.PutListing("/d", response, request)
+	time.Sleep(3 * time.Millisecond)
+
+	start := time.Now()
+	names := cachedNames(t, dc, "/d")
+	elapsed := time.Since(start)
+
+	if len(names) != 0 {
+		t.Fatalf("expired directory kept %d names", len(names))
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("expiring %d names took %v: the sweep is not linear", n, elapsed)
+	}
+}
+
+// BenchmarkDirCacheBulkExpiry measures the same sweep, so a change of shape
+// shows up as a changed slope rather than a threshold crossing.
+func BenchmarkDirCacheBulkExpiry(b *testing.B) {
+	for _, n := range []int{1000, 10000, 100000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			for b.Loop() {
+				dc := NewNamespaceCache(time.Millisecond, time.Millisecond, n)
+				response := make([]CachedFileInfo, 0, n)
+				for i := range n {
+					response = append(response, CachedFileInfo{Name: fmt.Sprintf("f_%07d.dat", i)})
+				}
+				request := dc.BeginRequest("/d")
+				dc.PutListing("/d", response, request)
+				time.Sleep(2 * time.Millisecond)
+				// The sweep under test.
+				dc.Get("/d")
+			}
+		})
+	}
+}
+
 // --- Eighth review round on #966: bounded resource lifetime -----------------
 
 // The reconciliation state must not accumulate per path a mount has merely
