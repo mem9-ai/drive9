@@ -39,13 +39,15 @@ type gcsTokenStorage struct {
 }
 
 // newGCSTokenStorage builds a bucket-scoped GCS store that authenticates with
-// accessToken. A non-empty endpoint is the Cloud Storage JSON API base path
-// (e.g. https://storage.googleapis.com/storage/v1/, or an emulator's
-// .../storage/v1/), not a bare host: it replaces the generated client's
-// BasePath verbatim and receives the bearer token, so it is a trusted
-// control-plane value. It must be https with a path; plaintext http is accepted
-// only on loopback (a local emulator, where the credential never leaves the
-// box). Reads use the JSON API so this base path is honoured.
+// accessToken. A non-empty endpoint is the Cloud Storage JSON API root
+// (https://storage.googleapis.com/storage/v1/, or an emulator's
+// .../storage/v1/), not a bare host and not a path-prefixed proxy base: it
+// replaces the generated client's BasePath and receives the bearer token, but
+// reads honour BasePath while resumable uploads use an absolute
+// /upload/storage/v1/... reference that discards it, so only the API root keeps
+// both legs under the configured endpoint. It must be https; plaintext http is
+// accepted only on loopback (a local emulator, where the credential never
+// leaves the box). Reads use the JSON API so this base path is honoured.
 func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint string) (*gcsTokenStorage, error) {
 	bucket = strings.TrimSpace(bucket)
 	if bucket == "" {
@@ -63,15 +65,19 @@ func newGCSTokenStorage(ctx context.Context, bucket, accessToken, endpoint strin
 	}
 	if endpoint = strings.TrimSpace(endpoint); endpoint != "" {
 		u, err := url.Parse(endpoint)
-		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || strings.Trim(u.Path, "/") == "" {
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 			return nil, fmt.Errorf("gcs endpoint %q must be an https JSON API base path, not a bare host", endpoint)
 		}
 		if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
 			return nil, fmt.Errorf("gcs endpoint %q is plaintext; a bearer credential requires https except on loopback", endpoint)
 		}
-		// googleapi.ResolveRelative merges the request path, which drops the
-		// last base segment when the base has no trailing slash; normalise so a
-		// slash-less base path cannot silently misroute.
+		// Reads merge this base path via ResolveRelative, but resumable uploads
+		// use an absolute /upload/storage/v1/... reference that drops any path
+		// prefix. Only the API root is safe: a prefixed endpoint would read fine
+		// and then fail every block upload, so fail closed on anything else.
+		if strings.Trim(u.Path, "/") != "storage/v1" {
+			return nil, fmt.Errorf("gcs endpoint %q must be the JSON API root (.../storage/v1/); a path prefix is not honoured by uploads", endpoint)
+		}
 		endpoint = strings.TrimRight(endpoint, "/") + "/"
 		opts = append(opts, option.WithEndpoint(endpoint))
 	}

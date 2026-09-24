@@ -50,6 +50,11 @@ var testHookBeforeUnlinkedTransition func()
 // handshake that attach has entered lock contention.
 var testHookAfterUnlinkHandleSetLockAttempt func()
 
+// testHookExtentBuildWait runs under extentMu just before a single-flight
+// extent-runtime waiter parks, letting tests observe the park without a
+// scheduler-timing sleep.
+var testHookExtentBuildWait func()
+
 // errAppendRefreshBusy marks transient sibling-handle lock contention. Write
 // may retry it after yielding fh.mu and the path fence; lineage rejection uses
 // syscall.EAGAIN directly and returns to the caller without an internal spin.
@@ -245,10 +250,6 @@ type Dat9FS struct {
 	extentBuildCond *sync.Cond
 	extentBuildGen  uint64
 	extentBuildErr  error
-	// extentBuildWaitHook, when non-nil, runs under extentMu just before a
-	// single-flight waiter parks. Tests use it to observe the park without a
-	// scheduler-timing sleep.
-	extentBuildWaitHook func()
 	// extentMisses caches "this path is not an extent file" so an
 	// extent-enabled mount does not pay a stat probe on every syscall against
 	// the classic files that share its glob (the mixed profile is the shape the

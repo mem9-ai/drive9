@@ -178,6 +178,24 @@ func TestGCSStoreHonoursEndpointAndPresentsToken(t *testing.T) {
 	}
 }
 
+// TestGCSUploadUsesAPIRoot pins the upload leg's contract: BasePath feeds reads,
+// but the generated client builds resumable uploads from an absolute
+// /upload/storage/v1/... reference that drops any base path, which is why the
+// endpoint must be the API root.
+func TestGCSUploadUsesAPIRoot(t *testing.T) {
+	f, url := newGCSFake(t, http.StatusNotFound)
+	gs, err := newGCSTokenStorage(context.Background(), "bucket", "tok", url+"/storage/v1/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gs.Shutdown()
+	// The fake 404s the resumable session; the request path is what matters.
+	_ = gs.Put(context.Background(), "t/tenant-z/chunks/1", strings.NewReader("x"))
+	if uri := f.lastPath(); !strings.HasPrefix(uri, "/upload/storage/v1/b/") {
+		t.Fatalf("upload path %q must be the API root's /upload/... (BasePath only feeds reads)", uri)
+	}
+}
+
 // TestGCSDeleteIsIdempotent mirrors JuiceFS's gs backend: deleting an object is
 // a success whether the object was there (200) or already gone (404).
 func TestGCSDeleteIsIdempotent(t *testing.T) {
@@ -269,10 +287,11 @@ func TestSupersededStoreRetiredOnlyWhenIdle(t *testing.T) {
 func TestGCSEndpointValidation(t *testing.T) {
 	ctx := context.Background()
 	for _, endpoint := range []string{
-		"http://127.0.0.1:9000",              // bare host, no API root
-		"https://storage.googleapis.com",     // bare host, no API root
-		"ftp://host/storage/v1/",             // unsupported scheme
-		"http://storage.example/storage/v1/", // plaintext off loopback
+		"http://127.0.0.1:9000",                  // bare host, no API root
+		"https://storage.googleapis.com",         // bare host, no API root
+		"ftp://host/storage/v1/",                 // unsupported scheme
+		"http://storage.example/storage/v1/",     // plaintext off loopback
+		"https://gw.example.com/gcs/storage/v1/", // path prefix: uploads would drop it
 	} {
 		t.Run("reject "+endpoint, func(t *testing.T) {
 			if _, err := newGCSTokenStorage(ctx, "bucket", "tok", endpoint); err == nil {

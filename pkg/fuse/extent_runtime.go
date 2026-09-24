@@ -25,7 +25,9 @@ var errExtentTornDown = errors.New("extent runtime: mount is tearing down")
 // extentMetaDrainTimeout bounds closeExtentRuntime's wait for in-flight
 // metadata RPCs before it releases the session anyway (logged). It must exceed
 // extent.MetaCallTimeout: draining cannot succeed while a bounded non-blocking
-// RPC may still be running for that long.
+// RPC may still be running for that long. Blocking Flock/Setlk are exempt from
+// that bound, so a still-waiting lock can outlive this drain; unmount cancels
+// the FUSE request, and the gate refusing any retry keeps the session safe.
 const extentMetaDrainTimeout = extent.MetaCallTimeout + 5*time.Second
 
 // stopExtentRuntimeLoop marks the extent runtime torn down and stops and joins
@@ -80,10 +82,20 @@ func (fs *Dat9FS) closeExtentRuntime() {
 	}
 }
 
-// extentCleanupOp is the one metadata RPC teardown must run after the gate is
-// closed: CloseRuntime's release of the JuiceFS session. Every other RPC is
-// refused once teardown starts.
-const extentCleanupOp = jfsmeta.Drive9OpCleanStaleSession
+// extentTeardownOp reports whether op is one of the metadata RPCs that
+// CloseSession itself flushes after the gate closes: releasing the JuiceFS
+// session (clean_stale_session) and draining its dead-slice queue
+// (delete_slice, whose block-GC task is the only reclaimer of an orphaned
+// slice). Every other RPC is refused once teardown starts, so a late FUSE
+// handler cannot use a closing session.
+func extentTeardownOp(op string) bool {
+	switch op {
+	case jfsmeta.Drive9OpCleanStaleSession, jfsmeta.Drive9OpDeleteSlice:
+		return true
+	default:
+		return false
+	}
+}
 
 // extentMetaHold counts in-flight metadata RPCs so teardown can wait for them
 // before closing the JuiceFS session.
@@ -101,12 +113,12 @@ func newExtentMetaHold() *extentMetaHold {
 }
 
 // enter reports whether a metadata RPC may run. Once teardown has closed the
-// gate only the session-cleanup RPC is admitted, so a late handler is refused
-// while CloseRuntime can still release the session it is protecting.
+// gate only its own cleanup RPCs are admitted, so a late handler is refused
+// while CloseRuntime can still release the session and drain its slice queue.
 func (h *extentMetaHold) enter(op string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closed && op != extentCleanupOp {
+	if h.closed && !extentTeardownOp(op) {
 		return false
 	}
 	h.active++
@@ -180,8 +192,8 @@ func (fs *Dat9FS) ensureExtentRuntime() (err error) {
 			break
 		}
 		gen := fs.extentBuildGen
-		if fs.extentBuildWaitHook != nil {
-			fs.extentBuildWaitHook()
+		if testHookExtentBuildWait != nil {
+			testHookExtentBuildWait()
 		}
 		fs.extentBuildCond.Wait()
 		if fs.extentBuildErr != nil && fs.extentBuildGen == gen {

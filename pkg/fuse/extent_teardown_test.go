@@ -61,9 +61,10 @@ func TestExtentTeardownStopsAndClosesRuntime(t *testing.T) {
 }
 
 // TestExtentMetaHoldDrains pins the teardown gate: it waits for in-flight
-// metadata RPCs, refuses new non-cleanup RPCs (a late handler), but admits the
-// session-cleanup RPC teardown must run itself.
+// metadata RPCs, refuses a late handler RPC, but admits the teardown-owned RPCs
+// CloseRuntime flushes itself (session cleanup and dead-slice drain).
 func TestExtentMetaHoldDrains(t *testing.T) {
+	teardownOps := []string{jfsmeta.Drive9OpCleanStaleSession, jfsmeta.Drive9OpDeleteSlice}
 	h := newExtentMetaHold()
 	if !h.enter(jfsmeta.Drive9OpLookup) {
 		t.Fatal("first enter must be admitted")
@@ -76,10 +77,12 @@ func TestExtentMetaHoldDrains(t *testing.T) {
 	if h.enter(jfsmeta.Drive9OpLookup) {
 		t.Fatal("a late non-cleanup RPC must be refused once the gate is closed")
 	}
-	if !h.enter(jfsmeta.Drive9OpCleanStaleSession) {
-		t.Fatal("the session-cleanup RPC must be admitted through the closed gate")
+	for _, op := range teardownOps {
+		if !h.enter(op) {
+			t.Fatalf("teardown RPC %q must be admitted through the closed gate", op)
+		}
+		h.leave()
 	}
-	h.leave() // the cleanup RPC
 
 	// The original lookup is still in flight: a real closeAndWait returns true
 	// only after it finishes.
@@ -97,10 +100,12 @@ func TestExtentMetaHoldDrains(t *testing.T) {
 	if h.enter(jfsmeta.Drive9OpLookup) {
 		t.Fatal("a non-cleanup RPC must stay refused")
 	}
-	if !h.enter(jfsmeta.Drive9OpCleanStaleSession) {
-		t.Fatal("the cleanup RPC must stay admitted")
+	for _, op := range teardownOps {
+		if !h.enter(op) {
+			t.Fatalf("teardown RPC %q must stay admitted", op)
+		}
+		h.leave()
 	}
-	h.leave()
 }
 
 // holdGatedMeta is a jfsmeta.Meta whose only live method, CloseSession, mirrors
@@ -115,19 +120,24 @@ type holdGatedMeta struct {
 
 func (m *holdGatedMeta) CloseSession() error {
 	if m.hold != nil {
-		if !m.hold.enter(jfsmeta.Drive9OpCleanStaleSession) {
-			return syscall.EIO
+		// CloseSession flushes both a session cleanup and its dead-slice queue;
+		// both must pass the closed gate or the held blob is never released.
+		for _, op := range []string{jfsmeta.Drive9OpCleanStaleSession, jfsmeta.Drive9OpDeleteSlice} {
+			if !m.hold.enter(op) {
+				return syscall.EIO
+			}
+			m.hold.leave()
 		}
-		defer m.hold.leave()
 	}
 	m.closes.Add(1)
 	return nil
 }
 
 // TestCloseExtentRuntimeAttemptsSessionCleanup drives closeExtentRuntime and
-// asserts its own session-cleanup RPC is attempted and admitted. With the old
-// refuse-then-drain gate the hold was closed before CloseRuntime ran, so this
-// call returned EIO and the session was never released.
+// asserts its own teardown RPCs (session cleanup and dead-slice drain) are
+// attempted and admitted. With a refuse-all gate the hold was closed before
+// CloseRuntime ran, so this call returned EIO and the held blob was never
+// released.
 func TestCloseExtentRuntimeAttemptsSessionCleanup(t *testing.T) {
 	inner, err := object.CreateStorage("file", t.TempDir(), "", "", "")
 	if err != nil {
@@ -162,7 +172,8 @@ func TestEnsureExtentRuntimeWaiterWakesOnTeardown(t *testing.T) {
 	fs.extentBuildCond = sync.NewCond(&fs.extentMu)
 	fs.extentBuilding = true
 	fs.extentBuildGen = 1
-	fs.extentBuildWaitHook = func() { close(parked) }
+	testHookExtentBuildWait = func() { close(parked) }
+	t.Cleanup(func() { testHookExtentBuildWait = nil })
 	fs.extentMu.Unlock()
 
 	done := make(chan error, 1)
@@ -193,7 +204,8 @@ func TestEnsureExtentRuntimeWaitersShareBuildError(t *testing.T) {
 	fs.extentBuildCond = sync.NewCond(&fs.extentMu)
 	fs.extentBuilding = true
 	fs.extentBuildGen = 1
-	fs.extentBuildWaitHook = func() { close(parked) }
+	testHookExtentBuildWait = func() { close(parked) }
+	t.Cleanup(func() { testHookExtentBuildWait = nil })
 	fs.extentMu.Unlock()
 
 	done := make(chan error, 1)

@@ -257,6 +257,11 @@ func endpointWithBucket(endpoint, bucket string) string {
 	return trimmed + "/" + bucket
 }
 
+// refreshingStore swaps its inner store when the credential is about to expire.
+// The refcount/retire machinery below exists for client-owning stores (GCS): a
+// superseded store holds a client that must be closed exactly once and never
+// under an in-flight caller. The S3 and file arms pre-date it and never
+// populate retired.
 type refreshingStore struct {
 	object.DefaultObjectStorage
 	src    CredentialSource
