@@ -7569,7 +7569,7 @@ func TestRemoteListSkipsInvalidDirEntryNames(t *testing.T) {
 		{Name: "bad/name"},
 		{Name: "ok.txt"},
 	}
-	cached := cachedFileInfos(items)
+	cached := cachedFileInfos(items, 0)
 	if len(cached) != 1 || cached[0].Name != "ok.txt" {
 		t.Fatalf("cachedFileInfos = %+v, want only ok.txt", cached)
 	}

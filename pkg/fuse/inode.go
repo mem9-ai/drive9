@@ -43,6 +43,8 @@ type InodeEntry struct {
 	// mutate through it.
 	MtimeOverride *time.Time
 	AtimeOverride *time.Time
+
+	attrVersion uint64 // last metadata mutation, ordered by InodeToPath.mu
 }
 
 // InodeToPath provides a bidirectional mapping between inode numbers and
@@ -53,6 +55,8 @@ type InodeToPath struct {
 	byPath  map[string]uint64
 	byID    map[string]uint64
 	nextIno uint64
+
+	attrVersion uint64
 }
 
 // NewInodeToPath creates a new InodeToPath initialized with the root inode
@@ -120,6 +124,7 @@ func (m *InodeToPath) LookupWithIdentity(path, resourceID string, nlink uint32, 
 	if entry.Nlink == 0 && !entry.IsDir {
 		entry.Nlink = 1
 	}
+	m.changedAttrsLocked(entry)
 	m.byInode[ino] = entry
 	m.byPath[path] = ino
 	if entry.ResourceID != "" {
@@ -140,7 +145,10 @@ func (m *InodeToPath) EnsureInode(path string, isDir bool, size int64, mtime tim
 func (m *InodeToPath) EnsureInodeWithIdentity(path, resourceID string, nlink uint32, isDir bool, size int64, mtime time.Time) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.ensureInodeWithIdentityLocked(path, resourceID, nlink, isDir, size, mtime)
+}
 
+func (m *InodeToPath) ensureInodeWithIdentityLocked(path, resourceID string, nlink uint32, isDir bool, size int64, mtime time.Time) uint64 {
 	if ino, ok := m.byPath[path]; ok {
 		entry := m.byInode[ino]
 		m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
@@ -172,12 +180,112 @@ func (m *InodeToPath) EnsureInodeWithIdentity(path, resourceID string, nlink uin
 	if entry.Nlink == 0 && !entry.IsDir {
 		entry.Nlink = 1
 	}
+	m.changedAttrsLocked(entry)
 	m.byInode[ino] = entry
 	m.byPath[path] = ino
 	if entry.ResourceID != "" {
 		m.byID[entry.ResourceID] = ino
 	}
 	return ino
+}
+
+// AttrVersion captures the metadata ordering before a remote listing starts.
+func (m *InodeToPath) AttrVersion() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.attrVersion
+}
+
+func (m *InodeToPath) changedAttrsLocked(entry *InodeEntry) {
+	m.attrVersion++
+	entry.attrVersion = m.attrVersion
+}
+
+// EnsureDirEntry checks snapshot freshness and installs all attributes under
+// the same lock as inode mutations. Existing hardlink identities are reused.
+func (m *InodeToPath) EnsureDirEntry(path string, item CachedFileInfo, preserve bool) *InodeEntry {
+	return m.ensureDirEntry(path, item, preserve, false)
+}
+
+func (m *InodeToPath) ensureDirEntry(path string, item CachedFileInfo, preserve, openReference bool) *InodeEntry {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	keep := func(entry *InodeEntry) bool {
+		return preserve || entry.attrVersion > item.observedVersion ||
+			(sameKnownDirEntryResource(entry, item) && entry.Revision > item.Revision)
+	}
+	ino, found := m.byPath[path]
+	if found && !keep(m.byInode[ino]) {
+		entry := m.byInode[ino]
+		if entry.IsDir != item.IsDir || (entry.ResourceID != "" && item.ResourceID != "" && entry.ResourceID != item.ResourceID) {
+			// The pathname now names a different object. Detach only this path;
+			// old hardlinks and kernel references must retain the old inode.
+			m.removePathWithMutationLocked(path, true, entry.Nlookup > 0 || openReference, false)
+			found = false
+		}
+	}
+	if !found {
+		if key := inodeResourceKey(item.ResourceID, item.IsDir); key != "" {
+			ino, found = m.byID[key]
+		}
+	}
+	if found {
+		entry := m.byInode[ino]
+		// Extent listings can lag content writes. Retain their live size,
+		// but never lend routing to an observation of unknown identity.
+		same := sameKnownDirEntryResource(entry, item)
+		different := entry.IsDir != item.IsDir || (entry.ResourceID != "" && item.ResourceID != "" && !same)
+		if !preserve && !different && entry.ExtentIno != 0 && !entry.IsDir && entry.Size > item.Size {
+			item.Size = entry.Size
+		}
+		if item.ExtentIno == 0 && same {
+			item.ExtentIno = entry.ExtentIno
+		}
+		if keep(entry) {
+			m.addPathLocked(entry, path)
+			return copyInodeEntryLocked(entry)
+		}
+	}
+	mtime := item.Mtime
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
+	if !found {
+		ino = m.nextIno
+		m.nextIno++
+		m.byInode[ino] = &InodeEntry{Ino: ino}
+		if preserve {
+			// A cold authoritative entry represents a recovered pending write.
+			// Seed its mutation fence once; recovery commits can have Inode=0.
+			m.changedAttrsLocked(m.byInode[ino])
+		}
+	}
+	entry := m.byInode[ino]
+	m.addPathLocked(entry, path)
+	entry.IsDir, entry.Size = item.IsDir, item.Size
+	if entry.MtimeOverride == nil {
+		entry.Mtime = mtime
+	}
+	entry.ExtentIno = item.ExtentIno
+	m.setIdentityLocked(entry, item.ResourceID)
+	if item.Nlink > 0 {
+		entry.Nlink = item.Nlink
+	} else if entry.Nlink == 0 && !entry.IsDir {
+		entry.Nlink = 1
+	}
+	entry.Revision = item.Revision
+	if item.HasMode {
+		entry.Mode, entry.HasMode = item.Mode, true
+	}
+	if item.HasUID {
+		entry.Uid, entry.HasUID = item.Uid, true
+	}
+	if item.HasGID {
+		entry.Gid, entry.HasGID = item.Gid, true
+	}
+	// Keep the inode's last mutation version. Ordinary remote/cache
+	// observations must not manufacture newer local state.
+	return copyInodeEntryLocked(entry)
 }
 
 // EnsureInodeNoUpdate returns the inode for path, allocating one if needed.
@@ -204,6 +312,7 @@ func (m *InodeToPath) EnsureInodeNoUpdate(path string, isDir bool, size int64, m
 		Size:    size,
 		Mtime:   mtime,
 	}
+	m.changedAttrsLocked(entry)
 	m.byInode[ino] = entry
 	m.byPath[path] = ino
 	return ino
@@ -260,6 +369,20 @@ func (m *InodeToPath) GetEntry(ino uint64) (*InodeEntry, bool) {
 	return copyInodeEntryLocked(entry), true
 }
 
+// dirEntryWithBinding snapshots a directory entry's inode and its current
+// pathname binding atomically. Callers must capture path-keyed metadata before
+// this read and must not project it when bound is false. Namespace changes
+// since that capture are also fenced by the copied inode's attrVersion.
+func (m *InodeToPath) dirEntryWithBinding(ino uint64, path string) (entry *InodeEntry, bound bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	live, found := m.byInode[ino]
+	if !found {
+		return nil, false
+	}
+	return copyInodeEntryLocked(live), m.byPath[path] == ino
+}
+
 // Forget decrements the Nlookup count for the given inode by nlookup. Some
 // visible mappings are retained after lookup refs drop so later lookups can
 // preserve POSIX inode identity and local owner metadata across rename.
@@ -283,7 +406,7 @@ func (m *InodeToPath) Forget(ino uint64, nlookup uint64) {
 }
 
 func shouldKeepForgetMapping(entry *InodeEntry) bool {
-	if entry == nil {
+	if entry == nil || (entry.Unlinked && len(entry.Paths) == 0) {
 		return false
 	}
 	if entry.IsDir || entry.ResourceID != "" {
@@ -486,6 +609,7 @@ func (m *InodeToPath) SetIdentity(ino uint64, resourceID string, nlink uint32) {
 	if nlink > 0 {
 		entry.Nlink = nlink
 	}
+	m.changedAttrsLocked(entry)
 }
 
 // UpdateLinkCount updates the known hardlink count for an inode.
@@ -498,6 +622,7 @@ func (m *InodeToPath) UpdateLinkCount(ino uint64, nlink uint32) {
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Nlink = nlink
+		m.changedAttrsLocked(entry)
 	}
 }
 
@@ -519,6 +644,7 @@ func (m *InodeToPath) AdjustLinkCount(ino uint64, delta int32) (*InodeEntry, boo
 		next = 2
 	}
 	entry.Nlink = uint32(next)
+	m.changedAttrsLocked(entry)
 	return copyInodeEntryLocked(entry), true
 }
 
@@ -529,6 +655,17 @@ func (m *InodeToPath) UpdateSize(ino uint64, size int64) {
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Size = size
+		m.changedAttrsLocked(entry)
+	}
+}
+
+// UpdateCommittedSize publishes the committed size and revision atomically.
+func (m *InodeToPath) UpdateCommittedSize(ino uint64, size, revision int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Size, entry.Revision = size, revision
+		m.changedAttrsLocked(entry)
 	}
 }
 
@@ -542,6 +679,7 @@ func (m *InodeToPath) UpdateMtime(ino uint64, mtime time.Time) {
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Mtime = mtime
 		entry.MtimeOverride = nil
+		m.changedAttrsLocked(entry)
 	}
 }
 
@@ -569,6 +707,7 @@ func (m *InodeToPath) SetLocalMtime(ino uint64, mtime time.Time) {
 		entry.Mtime = mtime
 		t := mtime
 		entry.MtimeOverride = &t
+		m.changedAttrsLocked(entry)
 	}
 }
 
@@ -582,6 +721,7 @@ func (m *InodeToPath) SetLocalAtime(ino uint64, atime time.Time) {
 		entry.Atime = atime
 		t := atime
 		entry.AtimeOverride = &t
+		m.changedAttrsLocked(entry)
 	}
 }
 
@@ -755,6 +895,7 @@ func (m *InodeToPath) UpdateCtime(ino uint64, ctime time.Time) {
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Ctime = ctime
+		m.changedAttrsLocked(entry)
 	}
 }
 
@@ -772,6 +913,7 @@ func (m *InodeToPath) UpdateOwner(ino uint64, uid, gid uint32, hasUID, hasGID bo
 			entry.Gid = gid
 			entry.HasGID = true
 		}
+		m.changedAttrsLocked(entry)
 	}
 }
 
@@ -782,6 +924,7 @@ func (m *InodeToPath) UpdateRevision(ino uint64, revision int64) {
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Revision = revision
+		m.changedAttrsLocked(entry)
 	}
 }
 
@@ -797,6 +940,7 @@ func (m *InodeToPath) UpdateRdev(ino uint64, rdev uint32) {
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Rdev = rdev
+		m.changedAttrsLocked(entry)
 	}
 }
 
@@ -808,6 +952,7 @@ func (m *InodeToPath) SetModeState(ino uint64, mode uint32, hasMode bool) {
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Mode = mode
 		entry.HasMode = hasMode
+		m.changedAttrsLocked(entry)
 	}
 }
 
@@ -837,6 +982,7 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 	delete(entry.Paths, oldPath)
 	entry.Paths[newPath] = struct{}{}
 	entry.Path = newPath
+	m.changedAttrsLocked(entry)
 
 	// If it is a directory, update all children with a matching prefix.
 	if entry.IsDir {
@@ -863,6 +1009,7 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 			delete(childEntry.Paths, c.oldChildPath)
 			childEntry.Paths[newChildPath] = struct{}{}
 			childEntry.Path = newChildPath
+			m.changedAttrsLocked(childEntry)
 		}
 	}
 }
@@ -935,6 +1082,7 @@ func (m *InodeToPath) addPathLocked(entry *InodeEntry, path string) {
 }
 
 func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID string, nlink uint32, isDir bool, size int64, mtime time.Time) {
+	m.changedAttrsLocked(entry)
 	m.addPathLocked(entry, path)
 	// A kind change means a different object owns this path now. setIdentityLocked
 	// below cannot see it (its key is "" for a directory), so drop the old
@@ -1012,9 +1160,11 @@ func (m *InodeToPath) setIdentityLocked(entry *InodeEntry, resourceID string) {
 
 func (m *InodeToPath) removeEntryLocked(ino uint64, entry *InodeEntry) {
 	for p := range entry.Paths {
-		delete(m.byPath, p)
+		if m.byPath[p] == ino {
+			delete(m.byPath, p)
+		}
 	}
-	if entry.Path != "" {
+	if entry.Path != "" && m.byPath[entry.Path] == ino {
 		delete(m.byPath, entry.Path)
 	}
 	if entry.ResourceID != "" && m.byID[entry.ResourceID] == ino {
@@ -1024,6 +1174,12 @@ func (m *InodeToPath) removeEntryLocked(ino uint64, entry *InodeEntry) {
 }
 
 func (m *InodeToPath) removePathLocked(path string, consumeLink bool, preserveIfLast bool) {
+	m.removePathWithMutationLocked(path, consumeLink, preserveIfLast, true)
+}
+
+// Remote replacement observations detach the old path without advancing its
+// mutation version; locally initiated namespace changes still advance it.
+func (m *InodeToPath) removePathWithMutationLocked(path string, consumeLink bool, preserveIfLast bool, localMutation bool) {
 	ino, ok := m.byPath[path]
 	if !ok {
 		return
@@ -1035,6 +1191,9 @@ func (m *InodeToPath) removePathLocked(path string, consumeLink bool, preserveIf
 	}
 	delete(m.byPath, path)
 	delete(entry.Paths, path)
+	if localMutation {
+		m.changedAttrsLocked(entry)
+	}
 	if consumeLink && !entry.IsDir {
 		if entry.Nlink > 1 {
 			entry.Nlink--

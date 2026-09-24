@@ -35,6 +35,9 @@ type CachedFileInfo struct {
 	ResourceID string
 	Nlink      uint32
 	ExtentIno  uint64 // JuiceFS inode for content_layout=extent files
+	// observedVersion is captured before fetching remote directory metadata.
+	// It is mount-local and is never persisted or sent to the server.
+	observedVersion uint64
 }
 
 type namespaceLookupKind uint8
@@ -150,7 +153,11 @@ func (dc *DirCache) Put(dirPath string, items []CachedFileInfo) {
 		item := items[i]
 		if oldEntry != nil {
 			if oldItem, ok := oldEntry.items[item.Name]; ok {
-				item = mergeCachedOwner(item, oldItem)
+				if oldItem.observedVersion > item.observedVersion {
+					item = oldItem
+				} else {
+					item = mergeCachedOwner(item, oldItem)
+				}
 			}
 		}
 		entry.upsert(item, dc.maxEntries)
