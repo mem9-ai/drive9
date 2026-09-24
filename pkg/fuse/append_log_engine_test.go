@@ -220,6 +220,8 @@ func TestAppendLogReadOnlyOpenRetainsPendingDiskOnlyShadow(t *testing.T) {
 	}
 	defer afterRestart.Close()
 	fs.shadowStore = afterRestart
+	pending.setShadowStore(afterRestart)
+	pending.recoverShadowSource(path, pending.Generation(path), afterRestart)
 
 	ino := fs.inodes.Lookup(path, false, 3, time.Now())
 	fs.inodes.UpdateRevision(ino, 5)

@@ -36,6 +36,7 @@ func newCloseSyncShadowTestFS(t *testing.T, handler http.HandlerFunc) *Dat9FS {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fs.pendingIndex.setShadowStore(fs.shadowStore)
 	return fs
 }
 

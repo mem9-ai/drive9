@@ -1667,7 +1667,7 @@ func TestShadowRecoveredGenerationIsNotRevisionVerified(t *testing.T) {
 				t.Fatal("recovery lost its staging source")
 			}
 			defer ss.Unpin(pin)
-			if !ss.canReadGeneration(pin, 11, true) || ss.canReadGeneration(pin, 11, false) {
+			if !ss.canReadGeneration(pin, 11, ss.ActiveGeneration(path)) || ss.canReadGeneration(pin, 11, 0) {
 				t.Fatal("pending authority and committed-cache proof were conflated")
 			}
 			if got, err := ss.ReadAllIfGeneration(path, gen); err != nil || string(got) != "recovered" {
@@ -1705,7 +1705,7 @@ func TestShadowLocalNewRevisionZeroAuthority(t *testing.T) {
 				t.Fatal("initialized local new-file staging must be readable")
 			}
 			defer ss.Unpin(pin)
-			if ss.canReadGeneration(pin, 1, false) {
+			if ss.canReadGeneration(pin, 1, 0) {
 				t.Fatal("new-file staging ignored a known committed revision")
 			}
 			if pin, ok := ss.PinResident(path, 1); ok {

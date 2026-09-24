@@ -2773,16 +2773,20 @@ func (fs *Dat9FS) adoptCallerOwnedInodeTruncate(ino uint64, callerPID uint32, ne
 		if !localFileHandleOpenedWritable(fh) {
 			continue
 		}
-		if fh.OpenPID != callerPID {
-			return false
-		}
 		fh.Lock()
 		// Flush can finish before the kernel dispatches Release. Such a
 		// clean close-sync handle is not an owner for a new path mutation:
 		// SetAttr must commit it rather than leave a delayed Release upload.
 		canOwn := !fs.isPassiveCloseSyncHandleLocked(fh)
+		foreign := fh.OpenPID != callerPID
 		fh.Unlock()
-		if owner == nil && canOwn {
+		if !canOwn {
+			continue
+		}
+		if foreign {
+			return false
+		}
+		if owner == nil {
 			owner = fh
 		}
 	}
@@ -12460,6 +12464,10 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		}
 	}()
 
+	// CREATE starts a new path incarnation. Preserve the old inode for open
+	// handles and hardlink aliases, but never inherit its revision or identity.
+	fs.inodes.RemoveLinkPreserve(childP)
+	fs.forgetCommittedRevisionPrefix(childP)
 	ino := fs.inodes.Lookup(childP, false, 0, time.Now())
 	fs.inodes.UpdateMode(ino, mode)
 	fs.inodes.UpdateOwner(ino, input.Uid, input.Gid, true, true)

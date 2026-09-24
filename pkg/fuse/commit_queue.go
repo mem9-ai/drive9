@@ -215,6 +215,7 @@ type CommitQueue struct {
 
 // NewCommitQueue creates a CommitQueue with background workers.
 func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex, journal *Journal, numWorkers int, maxPending int, remoteRoot ...string) *CommitQueue {
+	index.setShadowStore(shadows)
 	if numWorkers <= 0 {
 		numWorkers = 4
 	}
@@ -699,6 +700,7 @@ func (cq *CommitQueue) RecoverPending() {
 			cq.index.Remove(path)
 			continue
 		}
+		cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
 		if meta.Kind == PendingConflict {
 			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
 			continue

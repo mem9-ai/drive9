@@ -513,6 +513,8 @@ func Mount(opts *MountOptions) (err error) {
 				dat9fs.shadowStore = shadowStore
 			}
 
+			pendingIdx.setShadowStore(shadowStore)
+
 			// Initialize Journal WAL.
 			journalPath := filepath.Join(cacheBase, mountHash, "journal.wal")
 			journal, err := NewJournal(journalPath)
@@ -556,14 +558,8 @@ func Mount(opts *MountOptions) (err error) {
 
 			// Migrate legacy writeBack entries to shadow store so
 			// CommitQueue.RecoverPending sees them and doesn't prune.
-			if wbCache != nil && shadowStore != nil {
-				for _, pe := range wbCache.ListPending() {
-					if !shadowStore.Has(pe.Meta.Path) {
-						if err := shadowStore.WriteFull(pe.Meta.Path, pe.Data, pe.Meta.BaseRev); err != nil {
-							safeStderrPrintf("drive9: migrate legacy entry %s to shadow: %v\n", pe.Meta.Path, err)
-						}
-					}
-				}
+			if err := migrateLegacyWriteBack(shadowStore, wbCache, pendingIdx); err != nil {
+				return fmt.Errorf("mount: %w", err)
 			}
 
 			// Initialize CommitQueue for background remote commits.
@@ -643,6 +639,7 @@ func Mount(opts *MountOptions) (err error) {
 		}
 		dat9fs.pendingIndex = pendingIdx
 		dat9fs.shadowStore = shadowStore
+		pendingIdx.setShadowStore(shadowStore)
 		if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
 			return fmt.Errorf("mount: restore fs layer entries: %w", err)
 		}
@@ -1682,4 +1679,27 @@ func generateMountID() string {
 		return fmt.Sprintf("mount-%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// migrateLegacyWriteBack runs before pending recovery binds shadow sources.
+// The legacy .meta owns .dat; an existing orphan is not evidence of migration.
+func migrateLegacyWriteBack(shadows *ShadowStore, cache *WriteBackCache, pending *PendingIndex) error {
+	if shadows == nil || cache == nil {
+		return nil
+	}
+	for _, entry := range cache.ListPending() {
+		if entry.Meta.ShadowSpill {
+			continue // this metadata explicitly owns the shadow payload
+		}
+		if pending != nil {
+			if current, ok := pending.GetMeta(entry.Meta.Path); ok &&
+				(current.Generation != entry.Meta.Generation || !current.Mtime.Equal(entry.Meta.Mtime)) {
+				continue // WAL replay selected a different pending publication
+			}
+		}
+		if err := shadows.WriteFull(entry.Meta.Path, entry.Data, entry.Meta.BaseRev); err != nil {
+			return fmt.Errorf("migrate legacy entry %s to shadow: %w", entry.Meta.Path, err)
+		}
+	}
+	return nil
 }
