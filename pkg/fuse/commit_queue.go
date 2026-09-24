@@ -215,6 +215,7 @@ type CommitQueue struct {
 
 // NewCommitQueue creates a CommitQueue with background workers.
 func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex, journal *Journal, numWorkers int, maxPending int, remoteRoot ...string) *CommitQueue {
+	index.setShadowStore(shadows)
 	if numWorkers <= 0 {
 		numWorkers = 4
 	}
@@ -687,6 +688,11 @@ func (cq *CommitQueue) RecoverPending() {
 	if cq.index == nil {
 		return
 	}
+	// Startup only: reconcile cold disk accounting before the first enqueue
+	// lets workers mutate or remove any recovered payload.
+	if cq.shadows != nil {
+		cq.shadows.RecoverPendingBytes()
+	}
 	for path := range cq.index.ListPendingPaths() {
 		meta, ok := cq.index.GetMeta(path)
 		if !ok {
@@ -699,6 +705,7 @@ func (cq *CommitQueue) RecoverPending() {
 			cq.index.Remove(path)
 			continue
 		}
+		shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
 		if meta.Kind == PendingConflict {
 			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
 			continue
@@ -730,9 +737,9 @@ func (cq *CommitQueue) RecoverPending() {
 			PendingIndexGen:   meta.Generation,
 		}
 		if cq.shadows != nil {
-			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path, meta.BaseRev)
+			entry.ShadowGen = shadowGen
 			if entry.ShadowGen == 0 {
-				safeLogPrintf("commit queue: skipping recovered pending entry for %s (shadow generation unavailable)", path)
+				safeLogPrintf("commit queue: skipping recovered pending entry for %s (shadow missing, short, or metadata replaced)", path)
 				if _, err := cq.index.MarkConflictIfGeneration(path, meta.Generation); err != nil {
 					safeLogPrintf("commit queue: mark recovered pending conflict failed for %s: %v", path, err)
 				}
@@ -1523,6 +1530,13 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			return
 		}
 		if errors.Is(err, errCommitPayloadStale) {
+			// The resolver holds the path lock (taken above and kept through
+			// this point), so a synchronous same-path writer cannot commit
+			// newer bytes between its equality proof and its bookkeeping.
+			if resolved, _ := cq.resolveStalePayloadAsIdempotent(entryCtx, entry); resolved {
+				unlockPath()
+				return
+			}
 			safeLogPrintf("commit queue: stale payload rejected for %s: %v", entry.Path, err)
 			cq.onCommitTerminalFailure(entry, err)
 			unlockPath()
@@ -1744,6 +1758,17 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 					continue
 				}
 				if errors.Is(verr, errCommitPayloadStale) {
+					// The batch released its path locks before this point, so
+					// reacquire this entry's lock: the resolver's equality
+					// proof and its success bookkeeping must not straddle a
+					// synchronous same-path commit.
+					unlockEntry := cq.lockPath(entry.Path)
+					resolved, _ := cq.resolveStalePayloadAsIdempotent(entryCtx, entry)
+					unlockEntry()
+					if resolved {
+						cq.endInFlight(entry)
+						continue
+					}
 					safeLogPrintf("commit queue: stale batched payload rejected for %s: %v", entry.Path, verr)
 					cq.onCommitTerminalFailure(entry, verr)
 					cq.endInFlight(entry)
@@ -1837,7 +1862,10 @@ func (cq *CommitQueue) prepareBatchWriteItems(ctx context.Context, entries []*Co
 			ExpectedRevision: entry.BaseRev,
 			Data:             data,
 		}
-		if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
+		// Older batch endpoints may accept mode without enforcing chmod's
+		// authorization policy. Without the advertised contract, commit content
+		// only and let onCommitSuccessWithOptions apply the pending chmod.
+		if cq.client.CachedBatchWriteModeSupported() && shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 			item.Mode = remoteChmodMode(entry.Mode & posixPermissionModeMask)
 			item.HasMode = true
 		}
@@ -1970,6 +1998,19 @@ func (cq *CommitQueue) readEntryPayloadCtx(ctx context.Context, entry *CommitEnt
 	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return nil, err
 	}
+	return cq.readEntryPayloadRaw(entry)
+}
+
+// readEntryPayloadRaw reads the staged payload without running the generation
+// and watermark preflight, so callers decide for themselves whether the bytes
+// are still the ones the entry is responsible for. It exists for the one case
+// that must look at rejected bytes: proving that a payload the preflight
+// called stale is byte-identical to the durable remote image, which makes the
+// entry a redundant upload rather than a conflict.
+func (cq *CommitQueue) readEntryPayloadRaw(entry *CommitEntry) ([]byte, error) {
+	if entry == nil {
+		return nil, fmt.Errorf("nil commit entry")
+	}
 	if entry.payloadBound {
 		return entry.payload, nil
 	}
@@ -2022,6 +2063,7 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 			cq.index.Remove(path)
 			continue
 		}
+		shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
 		if meta.Kind == PendingConflict {
 			continue
 		}
@@ -2048,7 +2090,7 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 			recovered:         true,
 		}
 		if cq.shadows != nil {
-			entry.ShadowGen = cq.shadows.EnsureActiveGeneration(path, meta.BaseRev)
+			entry.ShadowGen = shadowGen
 			if entry.ShadowGen == 0 {
 				continue
 			}
@@ -2123,6 +2165,15 @@ func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *Co
 	}
 	committedRev, err := cq.uploadEntry(ctx, entry)
 	if err != nil {
+		if errors.Is(err, errCommitPayloadStale) {
+			// Report a partial resolution: the bytes are durable, but if the
+			// entry's post-commit bookkeeping (its pending chmod, for
+			// instance) failed, a strict synchronous caller must not be told
+			// durability succeeded.
+			if resolved, postErr := cq.resolveStalePayloadAsIdempotent(ctx, entry); resolved {
+				return postErr
+			}
+		}
 		if cq.perf != nil {
 			cq.perf.commitFailure.add(1)
 		}

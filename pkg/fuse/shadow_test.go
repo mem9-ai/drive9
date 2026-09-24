@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -247,7 +248,7 @@ func TestShadowStoreFinalUnpinWaitsForRetiredRename(t *testing.T) {
 	gen := ss.Pin("/retire-race")
 	pl := ss.acquirePathLock("/retire-race")
 	ss.mu.Lock()
-	cleanup, ok := ss.removeCoreLocked("/retire-race", 0)
+	cleanup, ok := ss.removeCoreLocked("/retire-race", 0, shadowRetiredInvalidated)
 	ss.mu.Unlock()
 	if !ok || !cleanup.retire {
 		ss.releasePathLock("/retire-race", pl)
@@ -1082,41 +1083,20 @@ func TestWriteStreamPeakDiskBounded(t *testing.T) {
 	}
 }
 
-func TestWriteStreamReplacementPeakBounded(t *testing.T) {
-	dir := t.TempDir()
-	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
-	if err != nil {
+func TestWriteStreamReplacementChargesNetCoverage(t *testing.T) {
+	ss := newRuntimeQuotaStore(t, 100)
+	if _, err := ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 50)), 1); err != nil {
 		t.Fatal(err)
 	}
-	defer ss.Close()
-
-	// Write an initial 50-byte shadow.
-	origData := bytes.Repeat([]byte("A"), 50)
-	if _, err := ss.WriteStream("/f.txt", bytes.NewReader(origData), 1); err != nil {
-		t.Fatalf("initial WriteStream: %v", err)
+	// The byte quota covers the active replacement, not both generations.
+	// Physical temporary-file protection remains the free-ratio guard's job.
+	want := bytes.Repeat([]byte("B"), 100)
+	if _, err := ss.WriteStream("/f.txt", bytes.NewReader(want), 2); err != nil {
+		t.Fatal(err)
 	}
-	if p := ss.PendingBytes(); p != 50 {
-		t.Fatalf("expected pending 50, got %d", p)
-	}
-
-	// Replace with 100 bytes. Final pending would be 100 (within quota),
-	// but peak disk is old(50) + tmp(100) = 150 which exceeds quota=100.
-	// The quota check uses the full temp size, so this must ENOSPC.
-	_, err = ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 100)), 2)
-	if err != syscall.ENOSPC {
-		t.Fatalf("expected ENOSPC for replacement peak exceeding quota, got %v", err)
-	}
-
-	// Original shadow must be preserved.
-	if p := ss.PendingBytes(); p != 50 {
-		t.Fatalf("expected pending 50 after rejected replacement, got %d", p)
-	}
-	data, err := ss.ReadAll("/f.txt")
-	if err != nil {
-		t.Fatalf("ReadAll after rejected replacement: %v", err)
-	}
-	if !bytes.Equal(data, origData) {
-		t.Fatalf("shadow content corrupted after rejected replacement")
+	got, err := ss.ReadAll("/f.txt")
+	if err != nil || !bytes.Equal(got, want) || ss.quotaBytes.Load() != 100 || ss.PendingBytes() != 100 {
+		t.Fatalf("replacement: quota=%d logical=%d err=%v", ss.quotaBytes.Load(), ss.PendingBytes(), err)
 	}
 }
 
@@ -1150,49 +1130,27 @@ func TestFreeRatioThrottledReEvaluatesCachedCapacity(t *testing.T) {
 	}
 }
 
-func TestEnsureQuotaEnforcement(t *testing.T) {
-	dir := t.TempDir()
-	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
-	if err != nil {
+func TestEnsureHolesDoNotConsumeRuntimeQuota(t *testing.T) {
+	ss := newRuntimeQuotaStore(t, 100)
+	if err := ss.Ensure("/f.txt", 200, 1); err != nil {
 		t.Fatal(err)
 	}
-	defer ss.Close()
-
-	// Ensure within quota should succeed and track pendingBytes.
-	if err := ss.Ensure("/f.txt", 80, 1); err != nil {
-		t.Fatalf("Ensure within quota should succeed: %v", err)
+	if ss.PendingBytes() != 200 || ss.quotaBytes.Load() != 0 {
+		t.Fatalf("Ensure: logical=%d quota=%d", ss.PendingBytes(), ss.quotaBytes.Load())
 	}
-	if p := ss.PendingBytes(); p != 80 {
-		t.Fatalf("expected pending 80 after Ensure, got %d", p)
+	if _, err := ss.WriteAt("/f.txt", 0, make([]byte, 80), 1); err != nil {
+		t.Fatal(err)
 	}
-
-	// Ensure exceeding quota should ENOSPC.
-	err = ss.Ensure("/f.txt", 200, 2)
-	if err != syscall.ENOSPC {
-		t.Fatalf("Ensure exceeding quota should ENOSPC, got %v", err)
+	if _, err := ss.WriteAt("/f.txt", 80, make([]byte, 30), 1); err != syscall.ENOSPC {
+		t.Fatalf("fill hole beyond quota: %v", err)
 	}
-	// Pending should still be 80.
-	if p := ss.PendingBytes(); p != 80 {
-		t.Fatalf("expected pending 80 after rejected Ensure, got %d", p)
-	}
-
-	// WriteAt within the Ensured range should not bypass quota.
-	// (delta=0 since WriteAt doesn't grow beyond Ensured size)
-	_, err = ss.WriteAt("/f.txt", 0, make([]byte, 80), 1)
-	if err != nil {
-		t.Fatalf("WriteAt within Ensured size should succeed: %v", err)
-	}
-	if p := ss.PendingBytes(); p != 80 {
-		t.Fatalf("expected pending 80 after WriteAt, got %d", p)
+	if ss.PendingBytes() != 200 || ss.quotaBytes.Load() != 80 {
+		t.Fatalf("fill hole: logical=%d quota=%d", ss.PendingBytes(), ss.quotaBytes.Load())
 	}
 }
 
-// TestWriteAtSparseDoesNotPoisonByteQuota verifies that a sparse write
-// (small data at a large offset) does not inflate pendingBytes to the
-// point where subsequent small writes are rejected with ENOSPC. The
-// WriteAt quota check uses physical data length, not logical file growth,
-// so sparse writes pass the free-space ratio check while the byte quota
-// (if configured) is not consulted for WriteAt.
+// TestWriteAtSparseDoesNotPoisonByteQuota verifies that holes contribute only
+// to logical pendingBytes, while the runtime quota charges written coverage.
 func TestWriteAtSparseDoesNotPoisonByteQuota(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota, no free-ratio
@@ -1363,7 +1321,7 @@ func TestDefaultByteQuotaEnforcesENOSPC(t *testing.T) {
 	defer ss.Close()
 
 	// Simulate pending bytes near the limit.
-	ss.pendingBytes.Store(maxBytes - 100)
+	ss.quotaBytes.Store(maxBytes - 100)
 	oversize := bytes.Repeat([]byte("b"), 200)
 	err = ss.WriteFull("/over", oversize, 1)
 	if err != syscall.ENOSPC {
@@ -1380,8 +1338,8 @@ func TestByteQuotaDisabledAllowsUnlimitedWrites(t *testing.T) {
 	}
 	defer ss.Close()
 
-	// Even with large pendingBytes, writes should succeed when quota is disabled.
-	ss.pendingBytes.Store(1 << 40) // 1TB fake pending
+	// Even with a large runtime charge, writes succeed when quota is disabled.
+	ss.quotaBytes.Store(1 << 40)
 	data := bytes.Repeat([]byte("x"), 1024)
 	if err := ss.WriteFull("/unlimited", data, 1); err != nil {
 		t.Fatalf("write with disabled quota: err=%v, want nil", err)
@@ -1466,7 +1424,7 @@ func TestShadowStoreRemoveIfGenerationRaceStaleVsNewerWrite(t *testing.T) {
 
 func TestShadowStoreEnsureActiveGenerationKeepsExistingBaseRevision(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStore(dir)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1484,7 +1442,7 @@ func TestShadowStoreEnsureActiveGenerationKeepsExistingBaseRevision(t *testing.T
 		t.Fatalf("initial base revision = %d, want 7", got)
 	}
 
-	if gotGen := ss.EnsureActiveGeneration(path, 9); gotGen != gen {
+	if gotGen := ss.EnsureActiveGeneration(path); gotGen != gen {
 		t.Fatalf("EnsureActiveGeneration returned gen %d, want existing gen %d", gotGen, gen)
 	}
 	if got := ss.BaseRev(path); got != 7 {
@@ -1495,12 +1453,12 @@ func TestShadowStoreEnsureActiveGenerationKeepsExistingBaseRevision(t *testing.T
 	if err := os.WriteFile(ss.shadowPath(recoveredPath), []byte("recovered"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	recoveredGen := ss.EnsureActiveGeneration(recoveredPath, 11)
+	recoveredGen := ss.EnsureActiveGeneration(recoveredPath)
 	if recoveredGen == 0 {
 		t.Fatal("expected recovered shadow to get an active generation")
 	}
-	if got := ss.BaseRev(recoveredPath); got != 11 {
-		t.Fatalf("recovered base revision = %d, want 11", got)
+	if got := ss.BaseRev(recoveredPath); got != 0 {
+		t.Fatalf("recovered base revision = %d, want unknown (0)", got)
 	}
 }
 
@@ -1623,5 +1581,193 @@ func TestShadowStoreTwoPathLocksReverseOrder(t *testing.T) {
 	case <-secondAcquired:
 	case <-time.After(2 * time.Second):
 		t.Fatal("second acquirer never entered /a after waiter released")
+	}
+}
+
+func TestShadowResidentPinRejectsOldRevisionWithoutRemovingStaging(t *testing.T) {
+	ss, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ss.Close)
+	const path = "/resident-wal"
+	if err := ss.WriteFull(path, []byte("old image"), 3); err != nil {
+		t.Fatal(err)
+	}
+	oldPin, ok := ss.PinResident(path, 3)
+	if !ok {
+		t.Fatal("current revision cannot be pinned")
+	}
+	defer ss.Unpin(oldPin)
+	// An Ensure at a higher revision cannot certify the untouched bytes.
+	if err := ss.Ensure(path, 9, 4); err != nil {
+		t.Fatal(err)
+	}
+	generation := ss.ActiveGeneration(path)
+	if pin, ok := ss.PinResident(path, 4); ok || pin != 0 {
+		t.Fatalf("pinned stale image: pin=%d ok=%t", pin, ok)
+	}
+	if info, err := os.Stat(ss.shadowPath(path)); err != nil || info.Size() != 9 {
+		t.Fatalf("rejected pin removed/resized the staging path: info=%v err=%v", info, err)
+	}
+	if data, err := ss.ReadAllIfGeneration(path, generation); err != nil || string(data) != "old image" {
+		t.Fatalf("rejecting a read pin removed staging: data=%q err=%v", data, err)
+	}
+	buf := make([]byte, 9)
+	if n, err := ss.ReadAtGen(oldPin, 0, buf); err != nil || n != len(buf) || string(buf) != "old image" {
+		t.Fatalf("existing pin lost its independent lifetime: n=%d data=%q err=%v", n, buf, err)
+	}
+	if err := ss.WriteFull(path, []byte("new image"), 4); err != nil {
+		t.Fatal(err)
+	}
+	pin, ok := ss.PinResident(path, 4)
+	if !ok {
+		t.Fatal("fresh replacement could not be pinned")
+	}
+	defer ss.Unpin(pin)
+	if n, err := ss.ReadAtGen(pin, 0, buf); err != nil || n != len(buf) || string(buf) != "new image" {
+		t.Fatalf("fresh pin read n=%d data=%q err=%v", n, buf, err)
+	}
+}
+
+func TestShadowRecoveredGenerationIsNotRevisionVerified(t *testing.T) {
+	for _, recoverHash := range []bool{false, true} {
+		name := "disk"
+		if recoverHash {
+			name = "hash"
+		}
+		t.Run(name, func(t *testing.T) {
+			ss, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(ss.Close)
+			const path = "/recovered-wal"
+			if err := os.WriteFile(ss.shadowPath(path), []byte("recovered"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if recoverHash {
+				if err := ss.RecoverFromDisk(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gen := ss.EnsureActiveGeneration(path)
+			if gen == 0 || ss.BaseRev(path) != 0 {
+				t.Fatal("generation minting asserted a content revision")
+			}
+			for _, revision := range []int64{0, 11} {
+				if pin, ok := ss.PinResident(path, revision); ok || pin != 0 {
+					t.Errorf("recovered bytes accepted as verified cache at revision %d", revision)
+				}
+			}
+			// Pending recovery can still bind/read the bytes using its own
+			// metadata authority, without promoting them into a clean cache.
+			pin, ok := ss.PinIfExists(path)
+			if !ok {
+				t.Fatal("recovery lost its staging source")
+			}
+			defer ss.Unpin(pin)
+			if !ss.canReadGeneration(pin, 11, ss.ActiveGeneration(path)) || ss.canReadGeneration(pin, 11, 0) {
+				t.Fatal("pending authority and committed-cache proof were conflated")
+			}
+			if got, err := ss.ReadAllIfGeneration(path, gen); err != nil || string(got) != "recovered" {
+				t.Fatalf("recovery data=%q err=%v", got, err)
+			}
+			if info, err := os.Stat(ss.shadowPath(path)); err != nil || info.Size() != 9 {
+				t.Fatalf("recovery path lost: info=%v err=%v", info, err)
+			}
+		})
+	}
+}
+
+func TestShadowLocalNewRevisionZeroAuthority(t *testing.T) {
+	for _, route := range []string{"ensure", "full", "stream"} {
+		t.Run(route, func(t *testing.T) {
+			ss, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(ss.Close)
+			const path = "/new-wal"
+			switch route {
+			case "ensure":
+				err = ss.Ensure(path, 3, 0)
+			case "full":
+				err = ss.WriteFull(path, []byte("new"), 0)
+			case "stream":
+				_, err = ss.WriteStream(path, strings.NewReader("new"), 0)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			pin, ok := ss.PinResident(path, 0)
+			if !ok {
+				t.Fatal("initialized local new-file staging must be readable")
+			}
+			defer ss.Unpin(pin)
+			if ss.canReadGeneration(pin, 1, 0) {
+				t.Fatal("new-file staging ignored a known committed revision")
+			}
+			if pin, ok := ss.PinResident(path, 1); ok {
+				ss.Unpin(pin)
+				t.Fatal("new-file staging can be repinned past a commit")
+			}
+		})
+	}
+}
+
+func TestShadowLocalInitializationDoesNotBlessRecoveredBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		initial  string
+		mutate   func(*ShadowStore, string) error
+		readable bool
+	}{
+		{"empty-reset", "old bytes", func(s *ShadowStore, p string) error { return s.Ensure(p, 0, 0) }, true},
+		{"ensure-empty-zeros", "", func(s *ShadowStore, p string) error { return s.Ensure(p, 3, 0) }, true},
+		{"ensure-retains-bytes", "old bytes", func(s *ShadowStore, p string) error { return s.Ensure(p, 3, 0) }, false},
+		{"ensure-retains-prefix", "old", func(s *ShadowStore, p string) error { return s.Ensure(p, 9, 0) }, false},
+		{"partial-write", "old bytes", func(s *ShadowStore, p string) error {
+			_, err := s.WriteAt(p, 0, []byte("new"), 0)
+			return err
+		}, false},
+		{"empty-write", "", func(s *ShadowStore, p string) error {
+			_, err := s.WriteAt(p, 3, []byte("new"), 0)
+			return err
+		}, true},
+		{"sync-empty-recovery", "", func(s *ShadowStore, p string) error { return s.Sync(p) }, false},
+		{"full-replacement", "old bytes", func(s *ShadowStore, p string) error {
+			return s.WriteFull(p, []byte("new"), 0)
+		}, true},
+		{"stream-replacement", "old bytes", func(s *ShadowStore, p string) error {
+			_, err := s.WriteStream(p, strings.NewReader("new"), 0)
+			return err
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(s.Close)
+			const path = "/file"
+			if err := os.WriteFile(s.shadowPath(path), []byte(tc.initial), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.mutate(s, path); err != nil {
+				t.Fatal(err)
+			}
+			pin, ok := s.PinResident(path, 0)
+			if ok {
+				defer s.Unpin(pin)
+			}
+			if ok != tc.readable {
+				t.Fatalf("readable=%t, want %t", ok, tc.readable)
+			}
+			if pin, ok := s.PinResident(path, 1); ok {
+				s.Unpin(pin)
+				t.Fatal("revision-zero initialization overrode a known commit")
+			}
+		})
 	}
 }

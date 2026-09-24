@@ -1,14 +1,22 @@
 package extent
 
 import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
 )
 
 func TestJuiceMetaConfOpenCacheForHTTP(t *testing.T) {
@@ -141,5 +149,119 @@ func TestApplyChunkCacheDirKeepsDiskCacheWithoutStaging(t *testing.T) {
 	}
 	if conf.BufferSize != juiceChunkBufferSize {
 		t.Fatalf("BufferSize=%d, want %d", conf.BufferSize, juiceChunkBufferSize)
+	}
+}
+
+// runtimeShutdownRecorder is an object store that records Shutdown calls.
+type runtimeShutdownRecorder struct {
+	object.ObjectStorage
+	shutdowns atomic.Int64
+}
+
+func (s *runtimeShutdownRecorder) Shutdown() { s.shutdowns.Add(1) }
+
+// deadTransport fails every meta RPC, so NewRuntime cannot finish.
+type deadTransport struct{}
+
+func (deadTransport) Call(ctx jfsmeta.Context, op string, req, resp any) syscall.Errno {
+	return syscall.EIO
+}
+
+// TestNewRuntimeReleasesStorageOnError pins the ownership contract: NewRuntime
+// takes cfg.Storage and must release it on every error path, so a caller that
+// opened a client-bearing store (GCS) can hand it over without compensating.
+func TestNewRuntimeReleasesStorageOnError(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  func(store object.ObjectStorage) RuntimeConfig
+	}{
+		{
+			name: "dead transport",
+			cfg: func(store object.ObjectStorage) RuntimeConfig {
+				return RuntimeConfig{Transport: deadTransport{}, Storage: store}
+			},
+		},
+		{
+			name: "missing transport",
+			cfg: func(store object.ObjectStorage) RuntimeConfig {
+				return RuntimeConfig{Storage: store}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inner, err := object.CreateStorage("file", t.TempDir(), "", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := &runtimeShutdownRecorder{ObjectStorage: inner}
+			if _, err := NewRuntime(tc.cfg(rec)); err == nil {
+				t.Fatal("NewRuntime must fail")
+			}
+			if got := rec.shutdowns.Load(); got != 1 {
+				t.Fatalf("storage shutdowns = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// TestNewRuntimeClosesSessionOnNewSessionFailure pins that a NewRuntime failure
+// after NewSession was entered closes the session. NewSession starts its refresh
+// goroutine before it can fail, and without CloseSession that goroutine keeps
+// issuing RPCs — and can os.Exit on a format change — for the process's life.
+func TestNewRuntimeClosesSessionOnNewSessionFailure(t *testing.T) {
+	formatJSON, err := json.Marshal(&jfsmeta.Format{
+		Name:      "drive9",
+		UUID:      "drive9-extent",
+		Storage:   "file",
+		BlockSize: 4 << 20,
+		TrashDays: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// doLoad's Format field is []byte, so the format JSON travels base64-encoded.
+	loadBody := []byte("{\"format\":\"" + base64.StdEncoding.EncodeToString(formatJSON) + "\"}")
+
+	var mu sync.Mutex
+	var ops []string
+	tr := NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
+		mu.Lock()
+		ops = append(ops, op)
+		mu.Unlock()
+		switch op {
+		case jfsmeta.Drive9OpLoad:
+			return loadBody, 0, nil
+		case jfsmeta.Drive9OpIncrCounter:
+			return []byte("{\"value\":1}"), 0, nil
+		case jfsmeta.Drive9OpNewSession:
+			return nil, 0, errors.New("new_session boom")
+		default:
+			return []byte("{}"), 0, nil
+		}
+	})
+
+	inner, err := object.CreateStorage("file", t.TempDir(), "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &runtimeShutdownRecorder{ObjectStorage: inner}
+	if _, err := NewRuntime(RuntimeConfig{Transport: tr, Storage: rec}); err == nil {
+		t.Fatal("NewRuntime must fail when NewSession fails")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, op := range ops {
+		if op == jfsmeta.Drive9OpCleanStaleSession {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("CloseSession was not called after NewSession failed; ops=%v", ops)
+	}
+	if got := rec.shutdowns.Load(); got != 1 {
+		t.Fatalf("storage shutdowns = %d, want 1", got)
 	}
 }

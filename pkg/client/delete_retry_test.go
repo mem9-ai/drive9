@@ -6,13 +6,159 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type closeTrackingDeleteBody struct {
+	io.ReadCloser
+	closed chan struct{}
+}
+
+func (b *closeTrackingDeleteBody) Close() error {
+	close(b.closed)
+	return b.ReadCloser.Close()
+}
+
+func TestDeleteFileReusesConnectionAfterSuccessBody(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Query().Get("kind") != "file" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+		}
+		_, _ = fmt.Fprint(w, `{"status":"ok"}`)
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	gotConn := make(chan bool, 2)
+	ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) { gotConn <- info.Reused },
+	})
+	for _, path := range []string{"/first", "/second"} {
+		if err := c.DeleteFileCtx(ctx, path); err != nil {
+			t.Fatalf("DeleteFileCtx(%q): %v", path, err)
+		}
+	}
+	if <-gotConn {
+		t.Fatal("first request unexpectedly reused a connection")
+	}
+	if !<-gotConn {
+		t.Fatal("second request did not reuse the first connection")
+	}
+}
+
+func TestDeleteFileSuccessBodyReadFailureDoesNotRetry(t *testing.T) {
+	c := New("http://example.test", "")
+	var calls int
+	c.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: http.StatusOK, Body: failingReadCloser{}}, nil
+	})
+	if err := c.DeleteFileCtx(context.Background(), "/file"); err != nil {
+		t.Fatalf("acknowledged delete returned body read error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("requests = %d, want 1", calls)
+	}
+}
+
+func TestDeleteFileStalledSuccessBodyReturnsWithoutRetry(t *testing.T) {
+	var calls atomic.Int32
+	releaseBody := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-releaseBody:
+			_, _ = fmt.Fprint(w, `{"status":"ok"}`)
+		}
+	}))
+	defer ts.Close()
+	defer close(releaseBody)
+
+	c := New(ts.URL, "")
+	closed := make(chan struct{})
+	transport := c.httpClient.Transport
+	c.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		resp, err := transport.RoundTrip(req)
+		if err == nil {
+			resp.Body = &closeTrackingDeleteBody{ReadCloser: resp.Body, closed: closed}
+		}
+		return resp, err
+	})
+	done := make(chan error, 1)
+	go func() { done <- c.DeleteFileCtx(context.Background(), "/file") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("acknowledged delete returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DeleteFileCtx blocked on a stalled success body")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("success response body was not closed")
+	}
+}
+
+func TestDeleteFileDrainBudgetStartsAfterHeaders(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(maxDeleteSuccessDrainTime + 100*time.Millisecond)
+		_, _ = fmt.Fprint(w, `{"status":"ok"}`)
+	}))
+	defer ts.Close()
+
+	if err := New(ts.URL, "").DeleteFileCtx(context.Background(), "/file"); err != nil {
+		t.Fatalf("DELETE with slow response headers: %v", err)
+	}
+}
+
+type countingDeleteBody struct {
+	reader *strings.Reader
+	read   int
+	closed bool
+}
+
+func (b *countingDeleteBody) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	b.read += n
+	return n, err
+}
+
+func (b *countingDeleteBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+func TestDeleteFileSuccessBodyDrainIsBounded(t *testing.T) {
+	body := &countingDeleteBody{reader: strings.NewReader(strings.Repeat("x", 1<<20))}
+	c := New("http://example.test", "")
+	c.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+	})
+	if err := c.DeleteFileCtx(context.Background(), "/file"); err != nil {
+		t.Fatalf("DeleteFileCtx: %v", err)
+	}
+	if body.read > int(maxDeleteSuccessBodyBytes+1) {
+		t.Fatalf("read %d bytes from oversized success body", body.read)
+	}
+	if !body.closed {
+		t.Fatal("success body was not closed")
+	}
+}
 
 // TestRemoveAllRetriesOn503 verifies the bounded retry loop around recursive
 // deletes: two 503 responses (honoring Retry-After) followed by a 200 must
@@ -67,6 +213,9 @@ func TestRemoveAllRetryLimitExceeded(t *testing.T) {
 	var se *StatusError
 	if !errors.As(err, &se) || se.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("error = %v, want 503 *StatusError", err)
+	}
+	if !strings.Contains(se.Message, "recursive delete in progress") {
+		t.Fatalf("error message = %q, want server response", se.Message)
 	}
 	if got, want := calls.Load(), int32(1+removeAllMaxRetries); got != want {
 		t.Fatalf("requests = %d, want %d", got, want)

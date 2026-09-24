@@ -2,6 +2,7 @@ package extent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -22,6 +23,7 @@ import (
 const (
 	SchemeFile = "file"
 	SchemeS3   = "s3"
+	SchemeGCS  = "gcs"
 
 	// credentialRefreshWindow is how long before expiry the data plane renews
 	// its STS session. The old session stays valid while the replacement is
@@ -34,6 +36,9 @@ const (
 	// tenant that started in the same instant (rolling restart, fleet-wide
 	// remount) calls AssumeRole in the same instant.
 	credentialRefreshJitter = time.Minute
+	// CredentialMintTimeout bounds a credential mint. It is exported so the
+	// mount's runtime initialization uses the same policy.
+	CredentialMintTimeout = 30 * time.Second
 	// jfsS3VHostStyleEnv is JuiceFS's only path-style switch
 	// (pkg/object/s3.go defaultPathStyle): unset/"0"/"false" selects path
 	// style, anything else virtual-host style. JuiceFS reads it once per
@@ -43,7 +48,12 @@ const (
 
 // Credential is the tenant-prefix object-store session from POST /v1/data-credential.
 type Credential struct {
-	Scheme          string `json:"scheme"`
+	Scheme string `json:"scheme"`
+	// Endpoint is the scheme-specific base. For "file" it is the storage root,
+	// for "s3" the S3 endpoint, and for "gcs" the Cloud Storage JSON API base
+	// path (e.g. https://storage.googleapis.com/storage/v1/), not a bare host.
+	// A "gcs" endpoint also receives the bearer access token, so it is a trusted
+	// control-plane value; the store fails closed on a bare host.
 	Endpoint        string `json:"endpoint"`
 	Bucket          string `json:"bucket,omitempty"`
 	Prefix          string `json:"prefix"`
@@ -51,8 +61,12 @@ type Credential struct {
 	AccessKeyID     string `json:"access_key_id,omitempty"`
 	SecretAccessKey string `json:"secret_access_key,omitempty"`
 	SessionToken    string `json:"session_token,omitempty"`
-	Region          string `json:"region,omitempty"`
-	ForcePathStyle  bool   `json:"force_path_style,omitempty"`
+	// AccessToken is a short-lived, tenant-prefix-scoped OAuth token (scheme
+	// "gcs"). The mount presents it to Cloud Storage directly, so it is a
+	// bearer credential and must never be logged.
+	AccessToken    string `json:"access_token,omitempty"`
+	Region         string `json:"region,omitempty"`
+	ForcePathStyle bool   `json:"force_path_style,omitempty"`
 	// EncryptionMode/KeyID describe the deployment's resolved S3 object
 	// encryption policy. The server only mints this credential when the extent
 	// data plane can honour it (no per-object SSE), so the values are
@@ -67,15 +81,36 @@ type CredentialSource interface {
 	GetDataCredential(ctx context.Context) (*Credential, error)
 }
 
+// errExtentStoreClosed is returned by every I/O entry point after Shutdown.
+var errExtentStoreClosed = errors.New("extent storage is closed")
+
+// canonicalExtentScheme maps a data-credential scheme to the one this package
+// reports. Cloud Storage is minted as "gcs", while the object-backend/objectfs
+// surfaces canonicalize to "gs"; both are accepted and reported as "gcs" so
+// String() and metric labels stay stable.
+func canonicalExtentScheme(scheme string) string {
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "", SchemeFile:
+		return SchemeFile
+	case SchemeS3:
+		return SchemeS3
+	case "gs", SchemeGCS:
+		return SchemeGCS
+	default:
+		return strings.ToLower(strings.TrimSpace(scheme))
+	}
+}
+
 // OpenStorage builds a JuiceFS ObjectStorage from a data-credential response.
 // file is the in-process mock used by unit tests. s3 is the production and
-// local-MinIO data plane (STS or static keys). Blocks are never proxied
-// through drive9-server.
+// local-MinIO data plane (STS or static keys). gcs is the Google Cloud Storage
+// data plane, authenticated with the server's downscoped, tenant-prefix-bound
+// OAuth token. Blocks are never proxied through drive9-server.
 func OpenStorage(cred *Credential, src CredentialSource) (object.ObjectStorage, error) {
 	if cred == nil {
 		return nil, fmt.Errorf("nil data credential")
 	}
-	inner, err := openInner(cred)
+	inner, err := openInner(cred, src)
 	if err != nil {
 		return nil, err
 	}
@@ -86,11 +121,18 @@ func OpenStorage(cred *Credential, src CredentialSource) (object.ObjectStorage, 
 	if prefix != "" {
 		inner = object.WithPrefix(inner, prefix)
 	}
+	// The GCS client renews its own token in place, so the wrapper never swaps
+	// it; only the stateless S3/file arms re-open on refresh.
+	wrapperSrc := src
+	if canonicalExtentScheme(cred.Scheme) == SchemeGCS {
+		wrapperSrc = nil
+	}
 	return &refreshingStore{
-		src:    src,
+		src:    wrapperSrc,
 		inner:  inner,
 		cred:   *cred,
-		scheme: cred.Scheme,
+		scheme: canonicalExtentScheme(cred.Scheme),
+		prefix: prefix,
 		// One jittered lead per mount: mounts of the same tenant then renew
 		// at spread-out instants instead of together.
 		refreshLead: credentialRefreshLead(credentialRefreshWindow, credentialRefreshJitter, rand.Int64N),
@@ -153,9 +195,9 @@ func withS3StyleEnv(forcePathStyle bool, create func() (object.ObjectStorage, er
 	return st, err
 }
 
-func openInner(cred *Credential) (object.ObjectStorage, error) {
-	switch strings.ToLower(strings.TrimSpace(cred.Scheme)) {
-	case SchemeFile, "":
+func openInner(cred *Credential, src CredentialSource) (object.ObjectStorage, error) {
+	switch canonicalExtentScheme(cred.Scheme) {
+	case SchemeFile:
 		root := cred.Endpoint
 		if root == "" {
 			return nil, fmt.Errorf("file storage endpoint is required")
@@ -174,6 +216,15 @@ func openInner(cred *Credential) (object.ObjectStorage, error) {
 	case SchemeS3:
 		ep := endpointWithBucket(cred.Endpoint, cred.Bucket)
 		return createS3Storage(ep, cred.AccessKeyID, cred.SecretAccessKey, cred.SessionToken, cred.ForcePathStyle)
+	case SchemeGCS:
+		// canonicalExtentScheme folds the object-backend/objectfs "gs" spelling
+		// onto the extent wire value "gcs". An endpoint is honoured for an
+		// emulator or a private/regional JSON API base; the server's own mint
+		// leaves it empty. The client renews its own token from src in place.
+		if strings.TrimSpace(cred.AccessToken) == "" {
+			return nil, fmt.Errorf("gcs access token is required")
+		}
+		return newGCSTokenStorage(context.Background(), cred.Bucket, newGCSTokenSource(*cred, src), cred.Endpoint)
 	case "drive9":
 		return nil, fmt.Errorf("extent data plane does not proxy blocks through drive9-server")
 	default:
@@ -212,6 +263,10 @@ func endpointWithBucket(endpoint, bucket string) string {
 	return trimmed + "/" + bucket
 }
 
+// refreshingStore renews a stateless S3/file session by re-opening the inner
+// store when the credential is near expiry. The GCS client is not handled here:
+// it renews its own token in place (see gcsTokenSource), so no superseded store
+// ever owns a resource that needs exactly-once teardown.
 type refreshingStore struct {
 	object.DefaultObjectStorage
 	src    CredentialSource
@@ -219,6 +274,13 @@ type refreshingStore struct {
 	inner  object.ObjectStorage
 	cred   Credential
 	scheme string
+	// prefix comes from the first credential and is stable across refreshes, so
+	// the read-only accessors can serve it without taking mu (scheme is likewise
+	// written once at construction).
+	prefix string
+	// closed is set under mu by Shutdown; store() refuses to serve or refresh
+	// after teardown.
+	closed bool
 	// refreshLead is how long before expiry this store renews, jittered per
 	// store instance (see credentialRefreshLead).
 	refreshLead time.Duration
@@ -232,7 +294,34 @@ func (s *refreshingStore) String() string {
 
 func (s *refreshingStore) Scheme() string { return s.scheme }
 
-func (s *refreshingStore) Prefix() string { return s.cred.Prefix }
+func (s *refreshingStore) Prefix() string { return s.prefix }
+
+// Shutdown releases the inner store's resources (for example the GCS client).
+// It is idempotent.
+func (s *refreshingStore) Shutdown() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	object.Shutdown(s.inner)
+}
+
+// store returns the inner store for one operation, refreshing the session first
+// when needed. The returned store is safe to use without a hold: S3/file stores
+// are stateless and the GCS client is never replaced.
+func (s *refreshingStore) store(ctx context.Context) (object.ObjectStorage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, errExtentStoreClosed
+	}
+	return s.innerStoreLocked(ctx)
+}
 
 func (s *refreshingStore) PutCount() int64 { return s.puts.Load() }
 
@@ -241,6 +330,7 @@ func (s *refreshingStore) GetCount() int64 { return s.gets.Load() }
 // tenantLabel identifies the tenant for logs and metrics: the explicit
 // credential field when the server sent one, else the tenant parsed out of the
 // prefix ("t/<tenant>/") for older servers.
+// tenantLabel is only called while s.mu is held, so it may read s.cred.
 func (s *refreshingStore) tenantLabel() string {
 	if s.cred.TenantID != "" {
 		return s.cred.TenantID
@@ -256,9 +346,9 @@ func tenantFromPrefix(prefix string) string {
 	return rest
 }
 
-func (s *refreshingStore) innerStore(ctx context.Context) (object.ObjectStorage, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// innerStoreLocked resolves the store for one operation and refreshes it when
+// the credential is near expiry. The caller holds s.mu.
+func (s *refreshingStore) innerStoreLocked(ctx context.Context) (object.ObjectStorage, error) {
 	if s.src == nil || s.cred.ExpiresAt == "" {
 		return s.inner, nil
 	}
@@ -275,7 +365,11 @@ func (s *refreshingStore) innerStore(ctx context.Context) (object.ObjectStorage,
 		return s.inner, nil
 	}
 	start := time.Now()
-	next, err := s.src.GetDataCredential(ctx)
+	// Bound the mint: it runs under s.mu, so an unbounded call would also stall
+	// Shutdown.
+	mintCtx, mintCancel := context.WithTimeout(ctx, CredentialMintTimeout)
+	defer mintCancel()
+	next, err := s.src.GetDataCredential(mintCtx)
 	if err != nil {
 		// Keep serving the old session, but never silently: an expired
 		// credential surfaces as a 403 from the object store, which is
@@ -288,15 +382,22 @@ func (s *refreshingStore) innerStore(ctx context.Context) (object.ObjectStorage,
 		s.recordRefreshFailure(ctx, "open", start, err)
 		return nil, err
 	}
-	if rs, ok := inner.(*refreshingStore); ok {
-		s.inner = rs.inner
-		s.cred = rs.cred
-		s.scheme = rs.scheme
-	} else {
-		s.inner = inner
-		s.cred = *next
-		s.scheme = next.Scheme
+	superseded := s.inner
+	// OpenStorage always wraps its result in a *refreshingStore; adopt that
+	// store's internals rather than re-deriving the scheme from the credential
+	// here (a second source of truth for the scheme).
+	rs, ok := inner.(*refreshingStore)
+	if !ok {
+		object.Shutdown(inner)
+		return nil, fmt.Errorf("extent storage refresh: %T is not a refreshingStore", inner)
 	}
+	s.inner = rs.inner
+	s.cred = rs.cred // refresh the expiry the next call checks
+	// scheme/prefix are stable across refreshes and stay immutable, so the
+	// read-only accessors never race with this write.
+	// Only stateless S3/file stores reach here, so releasing the superseded one
+	// is a no-op; GCS renews its own client in place.
+	object.Shutdown(superseded)
 	metrics.RecordTenantOperation(s.tenantLabel(), "extent_storage", "refresh_credential", "ok", time.Since(start))
 	return s.inner, nil
 }
@@ -305,14 +406,14 @@ func (s *refreshingStore) recordRefreshFailure(ctx context.Context, step string,
 	tenant := s.tenantLabel()
 	logger.Warn(ctx, "extent_credential_refresh_failed",
 		zap.String("tenant", tenant),
-		zap.String("prefix", s.cred.Prefix),
+		zap.String("prefix", s.prefix),
 		zap.String("step", step),
 		zap.Error(err))
 	metrics.RecordTenantOperation(tenant, "extent_storage", "refresh_credential", metrics.ResultForError(err), time.Since(start))
 }
 
 func (s *refreshingStore) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
-	inner, err := s.innerStore(ctx)
+	inner, err := s.store(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +422,7 @@ func (s *refreshingStore) Get(ctx context.Context, key string, off, limit int64,
 }
 
 func (s *refreshingStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
-	inner, err := s.innerStore(ctx)
+	inner, err := s.store(ctx)
 	if err != nil {
 		return err
 	}
@@ -330,7 +431,7 @@ func (s *refreshingStore) Put(ctx context.Context, key string, in io.Reader, get
 }
 
 func (s *refreshingStore) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
-	inner, err := s.innerStore(ctx)
+	inner, err := s.store(ctx)
 	if err != nil {
 		return err
 	}
@@ -338,7 +439,7 @@ func (s *refreshingStore) Delete(ctx context.Context, key string, getters ...obj
 }
 
 func (s *refreshingStore) Head(ctx context.Context, key string) (object.Object, error) {
-	inner, err := s.innerStore(ctx)
+	inner, err := s.store(ctx)
 	if err != nil {
 		return nil, err
 	}

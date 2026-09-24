@@ -1600,7 +1600,7 @@ func TestAppendLogShadowSpillUnsupportedV2ReroutesOnceToFullPUT(t *testing.T) {
 	fh.appendLogObserveLayout(client.ContentLayoutSingle, fh.BaseRev, fh.OrigSize)
 
 	fh.Lock()
-	status := fs.syncHandleToRemoteLocked(context.Background(), fh)
+	status := fs.syncHandleToRemoteLocked(context.Background(), fh, shadowUploadLocalDurable)
 	fh.Unlock()
 	if status != gofuse.OK {
 		t.Fatalf("sync status = %d, want OK", status)

@@ -37,6 +37,7 @@ type PendingIndex struct {
 	// (issue #964, false): the frame lands in the kernel page cache and a
 	// background SyncLoop / fsync(2) / umount make it durable.
 	journalSyncOnPut bool
+	shadows          *ShadowStore // wired once before staging/recovery
 }
 
 // SetJournal wires the WAL used for durable pending-meta publication. It is
@@ -245,6 +246,13 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 		liveAncestors:    append([]string(nil), liveAncestors...),
 	}
 
+	idx.mu.RLock()
+	shadows := idx.shadows
+	idx.mu.RUnlock()
+	if shadows != nil && kind != PendingChmod {
+		meta.shadowSource = shadowReadSource{shadows, shadows.ActiveGeneration(remotePath)}
+	}
+
 	// Durable publication first, then the in-memory publish.
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
@@ -300,6 +308,12 @@ func (idx *PendingIndex) publishRecoveredMeta(metaBytes []byte) error {
 	}
 	idx.mu.Lock()
 	idx.items[meta.Path] = &meta
+	// Future publication must not reuse a generation restored from the WAL.
+	for previous := idx.nextGen.Load(); previous < meta.Generation; previous = idx.nextGen.Load() {
+		if idx.nextGen.CompareAndSwap(previous, meta.Generation) {
+			break
+		}
+	}
 	idx.mu.Unlock()
 	return nil
 }

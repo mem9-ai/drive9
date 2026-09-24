@@ -213,7 +213,7 @@ func TestAppendLogRetiredPinPreservesUnlinkedSnapshot(t *testing.T) {
 		Unlinked: true, UnlinkedSnapshot: true, UnlinkedData: []byte("anonymous")}
 	id := fs.allocateFileHandle(reader)
 	defer fs.deleteFileHandle(id, reader)
-	shadow.removeAfterAppendLogCommit(fh.Path, 6)
+	shadow.Remove(fh.Path)
 	got, status, err := readDat9FSTestRange(fs, fh.Ino, id, 0, 9)
 	if err != nil || status != gofuse.OK || string(got) != "anonymous" || reader.ShadowGen != gen {
 		t.Fatalf("unlinked snapshot changed: %q/%d/%v gen=%d", got, status, err, reader.ShadowGen)
@@ -291,6 +291,69 @@ func TestAppendLogLateFinalizerPreservesNewerCommit(t *testing.T) {
 			}
 			if got, ok := fs.readCache.Get(fh.Path, 7); !ok || !bytes.Equal(got, want) {
 				t.Errorf("superseded finalizer replaced current read cache: %q/%t", got, ok)
+			}
+		})
+	}
+}
+
+func TestAppendLogReaderRepinsFreshShadow(t *testing.T) {
+	for _, retired := range []bool{false, true} {
+		name := "rejected"
+		if retired {
+			name = "retired"
+		}
+		t.Run(name, func(t *testing.T) {
+			const path = "/configured-log"
+			opts := &MountOptions{AppendLogPatterns: []string{"**/configured-log"}}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+			shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(shadow.Close)
+			fs.shadowStore = shadow
+			base := int64(4)
+			if retired {
+				base = 5
+			}
+			if err := shadow.WriteFull(path, []byte("old"), base); err != nil {
+				t.Fatal(err)
+			}
+			ino := fs.inodes.Lookup(path, false, 3, time.Now())
+			fs.inodes.UpdateRevision(ino, 5)
+			var out gofuse.OpenOut
+			if st := fs.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			reader, _ := fs.fileHandles.Get(out.Fh)
+			defer fs.Release(nil, &gofuse.ReleaseIn{Fh: out.Fh})
+			oldGen := reader.ShadowGen
+			if reader.ShadowPinned != retired {
+				t.Fatal("unexpected initial pin eligibility")
+			}
+			if retired {
+				shadow.Remove(path)
+			}
+			fs.recordCommittedRevisionWithSize(path, 6, 3)
+			fs.inodes.UpdateRevision(ino, 6)
+			if err := shadow.WriteFull(path, []byte("new"), 6); err != nil {
+				t.Fatal(err)
+			}
+			for range 3 {
+				got, st, err := readDat9FSTestRange(fs, ino, out.Fh, 0, 3)
+				if err != nil || st != gofuse.OK || string(got) != "new" {
+					t.Fatalf("fresh local shadow read=%q/%v/%v", got, st, err)
+				}
+			}
+			if !reader.ShadowPinned || reader.ShadowGen == 0 || (retired && reader.ShadowGen == oldGen) {
+				t.Fatal("reader never acquired the fresh generation")
+			}
+			shadow.mu.RLock()
+			refs := shadow.refs[reader.ShadowGen]
+			shadow.mu.RUnlock()
+			if refs != 1 {
+				t.Fatalf("repeated reads leaked pins: refs=%d", refs)
 			}
 		})
 	}
