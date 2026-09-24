@@ -1735,6 +1735,9 @@ func TestCloseSyncPathTruncateDoesNotAdoptCleanUnreleasedHandle(t *testing.T) {
 	if rev != 4 {
 		t.Fatalf("remote revision = %d, want 4", rev)
 	}
+	if failNextHead {
+		t.Fatal("post-truncate HEAD failure injection was not exercised")
+	}
 }
 
 func TestWriteSyncUploadsBeforeWriteReturns(t *testing.T) {
