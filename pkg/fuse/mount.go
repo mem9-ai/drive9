@@ -1546,7 +1546,8 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 			fullEntry.BaseRevision,
 			fullEntry.Mode,
 			fullEntry.Mode != 0,
-			func(commitMeta func(size int64) error) (bool, error) {
+			shadows.shadowPath(localPath),
+			func(tx *layerRestoreTxn, commitMeta func(size int64) error) (bool, error) {
 				checkedCommit := func(sizeBytes int64) error {
 					if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
 						return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
@@ -1558,7 +1559,7 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 					if err != nil {
 						return false, fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
 					}
-					_, applied, writeErr := shadows.writeStreamIfGeneration(localPath, rc, fullEntry.BaseRevision, expectedShadowGen, checkedCommit)
+					_, applied, writeErr := shadows.writeStreamIfGeneration(localPath, rc, fullEntry.BaseRevision, expectedShadowGen, tx, checkedCommit)
 					closeErr := rc.Close()
 					if writeErr != nil {
 						return false, fmt.Errorf("restore fs layer shadow %s: %w", localPath, writeErr)
@@ -1572,7 +1573,7 @@ func restoreLayerEntriesWithRenameTargets(ctx context.Context, c *client.Client,
 					return true, nil
 				} else {
 					content := fullEntry.Content
-					applied, err := shadows.writeFullIfGeneration(localPath, content, fullEntry.BaseRevision, expectedShadowGen, checkedCommit)
+					applied, err := shadows.writeFullIfGeneration(localPath, content, fullEntry.BaseRevision, expectedShadowGen, tx, checkedCommit)
 					if err != nil {
 						return false, fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
 					}
@@ -1713,12 +1714,15 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 		0,
 		fullEntry.Mode,
 		fullEntry.Mode != 0,
-		func(commitMeta func(size int64) error) (bool, error) {
+		shadows.shadowPath(oldLocalPath),
+		shadows.shadowPath(newLocalPath),
+		func(tx *layerRestoreTxn, commitMeta func(size int64) error) (bool, error) {
 			moved, matched, err := shadows.renameIfGenerations(
 				oldLocalPath,
 				newLocalPath,
 				expectedOldShadowGen,
 				expectedNewShadowGen,
+				tx,
 				commitMeta,
 			)
 			if err != nil || moved || !matched {
@@ -1727,7 +1731,7 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 			if fallbackData == nil {
 				return false, nil
 			}
-			return shadows.writeFullIfGeneration(newLocalPath, fallbackData, 0, expectedNewShadowGen, commitMeta)
+			return shadows.writeFullIfGeneration(newLocalPath, fallbackData, 0, expectedNewShadowGen, tx, commitMeta)
 		},
 	)
 	unlock()
