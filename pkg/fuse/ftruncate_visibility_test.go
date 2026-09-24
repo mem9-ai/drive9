@@ -42,6 +42,7 @@ func addFtruncateTestHandle(t *testing.T, fs *Dat9FS, ino uint64, path string, c
 	t.Helper()
 	fh := &FileHandle{Ino: ino, Path: path, WritePolicy: WritePolicyWriteBack}
 	if content != nil {
+		fh.Flags = uint32(syscall.O_RDWR)
 		fh.Dirty = fs.newWriteBuffer(path, maxPreloadSize, 0)
 		if _, err := fh.Dirty.Write(0, content); err != nil {
 			t.Fatal(err)
