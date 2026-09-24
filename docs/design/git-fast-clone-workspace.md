@@ -120,6 +120,7 @@ Git-ignore policy
 
 - `.git` is not a default local-only pattern. It is overlaid only when the path is the working `.git` of a loaded Git workspace; that state is served from the local overlay and never uploaded.
 - This keeps a plain coding-agent mount of a remote tree from overlying every `.git` directory it happens to contain, while the fast-clone workspace keeps its local `.git` and its checkpoint semantics.
+- Because this runs for every remote-default path, it first rejects any path without a `.git` segment (segment-exact, so `.gitignore` does not match) before doing workspace routing. Only paths at or under a `.git` directory pay for arm-marker scans and liveness revalidation.
 
 ## Clone Flow
 

@@ -3434,6 +3434,31 @@ func TestGitWorkspaceGitDirStaysLocal(t *testing.T) {
 	}
 }
 
+func TestPathHasGitDirSegment(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "/repo/.git", want: true},
+		{path: "/repo/.git/", want: true},
+		{path: "/repo/.git/config", want: true},
+		{path: "/repo/.git/objects/ab/cd", want: true},
+		{path: "/.git", want: true},
+		// Segment-exact: these must not match.
+		{path: "/repo/.gitignore", want: false},
+		{path: "/repo/.gitattributes", want: false},
+		{path: "/repo/notes.git.txt", want: false},
+		{path: "/repo/git/config", want: false},
+		{path: "/repo/src/main.go", want: false},
+		{path: "", want: false},
+	}
+	for _, test := range tests {
+		if got := pathHasGitDirSegment(test.path); got != test.want {
+			t.Errorf("pathHasGitDirSegment(%q) = %t, want %t", test.path, got, test.want)
+		}
+	}
+}
+
 func TestGitIgnoredAncestorCached(t *testing.T) {
 	rt := &gitWorkspaceRuntime{workspace: client.GitWorkspace{WorkspaceID: "ws1", HeadCommit: "deadbeef"}}
 	fs := &Dat9FS{git: newGitWorkspaceLayer()}
