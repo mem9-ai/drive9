@@ -37,7 +37,7 @@ Valid values:
 | --- | --- | --- | --- | --- |
 | `auto` | Buffered locally. | RTT-based: strict on low-latency mounts, interactive on high-latency mounts. | Existing write-back behavior. | Default, preserve current latency/compatibility behavior. |
 | `interactive` | Buffered locally. | Local shadow/journal durable; remote commit async. | Existing write-back behavior. | Editors and WAN mounts where low latency matters more than immediate cross-client visibility. |
-| `fsync` | Buffered locally. | Remote-durable before fsync returns. | Existing write-back behavior except existing strict large-file flush behavior. | Tools that explicitly call fsync when they need durability. |
+| `fsync` | Buffered locally. | Remote-durable before fsync returns. | Existing write-back behavior: close stages locally and returns without waiting for the remote upload. | Tools that explicitly call fsync when they need durability. |
 | `close-sync` ([local staging tradeoff](#expected-tradeoffs)) | Buffered locally. | Remote-durable before fsync returns. | Remote-durable before close can report success. | JuiceFS-like close-to-cloud semantics, sync tools, cross-client visibility after close. |
 | `write-sync` | Remote-durable before each write returns. | Normally clean after successful writes. | Normally clean after successful writes. | Strongest semantics, tests, low-frequency writes. |
 
@@ -78,11 +78,28 @@ an explicit fsync should not be weaker.
 - `SyncStrict`: fsync uploads to the drive9 server before returning success.
 - `SyncAuto`: mount-time RTT detection chooses one of the above.
 
-The implementation also uses `SyncMode` on the large-file Flush path. In
-interactive mode, a large Flush stages shadow/pending state so local
-close/drop/open flows can still see the file without waiting for remote upload.
-In strict mode, large Flush uploads before returning to avoid remote stat
-misses after cache drop.
+The large-file Flush path is keyed on the write policy, not the sync mode. On
+`WritePolicyWriteBack` mounts, a large Flush stages shadow/pending state and
+returns in both the interactive and fsync tiers: close/drop/open flows still
+see the file, and the remote upload happens asynchronously. `SyncMode` only
+decides what an explicit fsync means — in the fsync tier, `fsync(2)` remains
+the remote-durable pay-up moment and uploads to the drive9 server before
+returning success.
+
+Earlier revisions uploaded synchronously on a strict large Flush to avoid
+remote stat misses after a close followed by cache drop: without local state,
+the kernel re-issues `Lookup`, and a remote stat that has not yet seen the
+asynchronous upload would return ENOENT. Close-time staging removes that
+hazard at the source instead. The staged entry is registered in the pending
+index overlay, so subsequent `Lookup` calls resolve from local pending
+metadata and never issue the remote stat until the commit queue publishes the
+upload. The journal makes the pending registration durable, so a daemon
+restart replays the entry and re-enqueues the upload rather than dropping the
+path. With the default `--writeback-sync-window`, close-time staging is
+ext4-equivalent — daemon-crash safe, with the background WAL syncer bounding
+the power-loss window; `--writeback-sync-window close` restores fsynced
+staging, and `close-sync`/`write-sync` handles keep their synchronous close
+regardless of file size.
 
 ### WritePolicy
 
