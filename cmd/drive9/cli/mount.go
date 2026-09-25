@@ -41,6 +41,9 @@ const (
 	envMountLegacyInterruptibleMutations = "DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS"
 	// EnvMountLocalOnlyPatterns adds newline-delimited local-only mount rules.
 	EnvMountLocalOnlyPatterns = "DRIVE9_MOUNT_LOCAL_ONLY_PATTERNS"
+	// EnvMountLocalGitignoreAwarePatterns adds newline-delimited
+	// local-only-gitignore-aware mount rules.
+	EnvMountLocalGitignoreAwarePatterns = "DRIVE9_MOUNT_LOCAL_GITIGNORE_AWARE_PATTERNS"
 	// EnvMountRemoteOnlyPatterns adds newline-delimited remote-only mount rules.
 	EnvMountRemoteOnlyPatterns = "DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS"
 	// EnvMountAppendLogPatterns adds newline-delimited append-log mount rules.
@@ -199,12 +202,14 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
 	var localOnlyPatterns stringListFlag
+	var localGitignoreAwarePatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
 	var appendLogPatterns stringListFlag
 	var extentPatterns stringListFlag
 	var unpackArchives stringListFlag
 	noAutoUnpack := fs.Bool("no-auto-unpack", false, "disable automatic profile pack restore before mounting")
-	fs.Var(&localOnlyPatterns, "local-only", "route matching paths to the local-only overlay; adds to profile rules; repeatable; env $DRIVE9_MOUNT_LOCAL_ONLY_PATTERNS uses one pattern per line")
+	fs.Var(&localOnlyPatterns, "local-only", "route matching paths to the local-only overlay unconditionally; adds to profile rules; repeatable; env $DRIVE9_MOUNT_LOCAL_ONLY_PATTERNS uses one pattern per line")
+	fs.Var(&localGitignoreAwarePatterns, "local-only-gitignore-aware", "route matching paths to the local-only overlay only when the repository's Git ignore rules also ignore them; adds to profile rules; repeatable; env $DRIVE9_MOUNT_LOCAL_GITIGNORE_AWARE_PATTERNS uses one pattern per line")
 	fs.Var(&remoteOnlyPatterns, "remote-only", "force matching paths to remote-persistent storage; overrides local-only routing; repeatable; env $DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS uses one pattern per line")
 	fs.Var(&appendLogPatterns, "append-log", "use append-log sync optimization for matching remote-persistent files; repeatable; env $DRIVE9_MOUNT_APPEND_LOG_PATTERNS uses one pattern per line")
 	fs.Var(&extentPatterns, "extent", "create matching files with content_layout=extent (JuiceFS data plane); repeatable; env $DRIVE9_MOUNT_EXTENT_PATTERNS uses one pattern per line")
@@ -367,11 +372,15 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
+	envLocalGitignoreAwarePatterns, err := consumeMountPolicyPatternsEnv(EnvMountLocalGitignoreAwarePatterns)
+	if err != nil {
+		return err
+	}
 	envRemoteOnlyPatterns, err := consumeMountPolicyPatternsEnv(EnvMountRemoteOnlyPatterns)
 	if err != nil {
 		return err
 	}
-	policyEnvArgs := make([]string, 0, len(envAppendLogPatterns)+len(envExtentPatterns)+len(envLocalOnlyPatterns)+len(envRemoteOnlyPatterns))
+	policyEnvArgs := make([]string, 0, len(envAppendLogPatterns)+len(envExtentPatterns)+len(envLocalOnlyPatterns)+len(envLocalGitignoreAwarePatterns)+len(envRemoteOnlyPatterns))
 	for _, pattern := range envAppendLogPatterns {
 		policyEnvArgs = append(policyEnvArgs, "--append-log="+pattern)
 	}
@@ -380,6 +389,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	for _, pattern := range envLocalOnlyPatterns {
 		policyEnvArgs = append(policyEnvArgs, "--local-only="+pattern)
+	}
+	for _, pattern := range envLocalGitignoreAwarePatterns {
+		policyEnvArgs = append(policyEnvArgs, "--local-only-gitignore-aware="+pattern)
 	}
 	for _, pattern := range envRemoteOnlyPatterns {
 		policyEnvArgs = append(policyEnvArgs, "--remote-only="+pattern)
@@ -527,6 +539,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	effectiveExtentPatterns = mergeProfileValues(profileCfg.ExtentPatterns, effectiveExtentPatterns)
 	effectiveLocalOnlyPatterns := mergeProfileValues(profileCfg.LocalOnlyPatterns, envLocalOnlyPatterns, localOnlyPatterns)
+	effectiveLocalGitignoreAwarePatterns := mergeProfileValues(profileCfg.LocalGitignoreAwarePatterns, envLocalGitignoreAwarePatterns, localGitignoreAwarePatterns)
 	effectiveRemoteOnlyPatterns := mergeProfileValues(profileCfg.RemoteOnlyPatterns, envRemoteOnlyPatterns, remoteOnlyPatterns)
 	effectivePackPaths := mergeProfileValues(profileCfg.PackPaths)
 	normalizedLocalRoot := strings.TrimSpace(*localRoot)
@@ -651,7 +664,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			return err
 		}
 	}
-	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
+	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveLocalGitignoreAwarePatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
 		return err
 	}
 	if resolved == MountModeFUSE && runtime.GOOS != "windows" && len(profileCfg.AppendLogPatterns) > 0 {
@@ -677,6 +690,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			CheckpointRef:                strings.TrimSpace(*checkpointRef),
 			LocalRoot:                    normalizedLocalRoot,
 			LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
+			LocalGitignoreAwarePatterns:  append([]string(nil), effectiveLocalGitignoreAwarePatterns...),
 			RemoteOnlyPatterns:           append([]string(nil), effectiveRemoteOnlyPatterns...),
 			AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),
 			PackPaths:                    append([]string(nil), effectivePackPaths...),
@@ -810,6 +824,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			CheckpointRef:                strings.TrimSpace(*checkpointRef),
 			LocalRoot:                    normalizedLocalRoot,
 			LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
+			LocalGitignoreAwarePatterns:  append([]string(nil), effectiveLocalGitignoreAwarePatterns...),
 			RemoteOnlyPatterns:           append([]string(nil), effectiveRemoteOnlyPatterns...),
 			AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),
 			PackPaths:                    append([]string(nil), effectivePackPaths...),
@@ -856,6 +871,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		CheckpointRef:                strings.TrimSpace(*checkpointRef),
 		LocalRoot:                    normalizedLocalRoot,
 		LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
+		LocalGitignoreAwarePatterns:  append([]string(nil), effectiveLocalGitignoreAwarePatterns...),
 		RemoteOnlyPatterns:           append([]string(nil), effectiveRemoteOnlyPatterns...),
 		AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),
 		PackPaths:                    append([]string(nil), effectivePackPaths...),
@@ -1638,14 +1654,15 @@ func applyMountPerfDirDefaults(perfDir string, perfAddr string, profileHeap, pro
 	}
 }
 
-func validateMountProfileFlags(profile string, localRoot string, localOnlyPatterns []string, remoteOnlyPatterns []string, packPaths []string) error {
+func validateMountProfileFlags(profile string, localRoot string, localOnlyPatterns, localGitignoreAwarePatterns, remoteOnlyPatterns []string, packPaths []string) error {
 	if err := validateProfileName(profile); err != nil {
 		return err
 	}
-	hasPolicyFlags := localRoot != "" || len(localOnlyPatterns) > 0 || len(remoteOnlyPatterns) > 0 || len(packPaths) > 0
+	hasPolicyFlags := localRoot != "" || len(localOnlyPatterns) > 0 ||
+		len(localGitignoreAwarePatterns) > 0 || len(remoteOnlyPatterns) > 0 || len(packPaths) > 0
 	if !profileAllowsOverlay(profile) {
 		if hasPolicyFlags {
-			return fmt.Errorf("drive9 mount: --local-root, --local-only, --remote-only, and pack paths require an overlay profile")
+			return fmt.Errorf("drive9 mount: --local-root, --local-only, --local-only-gitignore-aware, --remote-only, and pack paths require an overlay profile")
 		}
 		return nil
 	}
@@ -1655,7 +1672,7 @@ func validateMountProfileFlags(profile string, localRoot string, localOnlyPatter
 	if !filepath.IsAbs(localRoot) {
 		return fmt.Errorf("drive9 mount: --local-root must be an absolute path")
 	}
-	if err := validateMountPolicyPatterns(localOnlyPatterns, remoteOnlyPatterns); err != nil {
+	if err := validateMountPolicyPatterns(localOnlyPatterns, localGitignoreAwarePatterns, remoteOnlyPatterns); err != nil {
 		return err
 	}
 	return nil

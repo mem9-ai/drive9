@@ -586,6 +586,8 @@ class Drive9LocalOverlayBuild(Drive9WorkflowBase):
         extra: list[str] = []
         if bool(cfg.get("allow_other", False)):
             extra.append("--allow-other")
+        # --local-only is overlapped unconditionally, so the module's configured
+        # build-output patterns do not need the gitignore-aware gate.
         for pattern in self.extra_local_only_patterns(ctx, repo):
             extra.extend(["--local-only", pattern])
         return extra

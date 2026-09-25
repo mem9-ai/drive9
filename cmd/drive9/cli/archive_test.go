@@ -251,6 +251,7 @@ func TestArchiveProfileCodingAgentSkipsDefaults(t *testing.T) {
 		"/proj/main.go":                 "package main\n",
 		"/proj/dist/bundle.js":          "bundle\n",
 		"/proj/node_modules/react/x.js": "x\n",
+		"/proj/target/debug/app":        "bin\n",
 		"/proj/.git/HEAD":               "ref: refs/heads/main\n",
 		"/proj/.cache/foo":              "cached\n",
 	})
@@ -265,15 +266,21 @@ func TestArchiveProfileCodingAgentSkipsDefaults(t *testing.T) {
 		t.Fatalf("Archive: %v", err)
 	}
 	got := tarEntries(t, out)
+	// Archive applies the profile local-only patterns as plain excludes
+	// (both [local] and [local-gitignore-aware], since it has no gitignore
+	// oracle), so VCS metadata, dependencies, and build output are skipped.
+	// Other build/cache output such as dist/ and .cache/ is not a default.
 	for _, name := range got {
-		for _, bad := range []string{"node_modules", "/dist/", ".git/", ".cache/"} {
+		for _, bad := range []string{"node_modules", "target/", ".git/"} {
 			if strings.Contains(name, bad) {
 				t.Fatalf("coding-agent profile should skip %q but found %q", bad, name)
 			}
 		}
 	}
-	if !contains(got, "proj/main.go") {
-		t.Fatalf("main.go missing: %v", got)
+	for _, want := range []string{"proj/main.go", "proj/dist/bundle.js", "proj/.cache/foo"} {
+		if !contains(got, want) {
+			t.Fatalf("coding-agent profile should keep %q: %v", want, got)
+		}
 	}
 }
 
@@ -514,4 +521,36 @@ func contains(s []string, v string) bool {
 		}
 	}
 	return false
+}
+
+func TestArchiveExcludeSets(t *testing.T) {
+	// A plain archive carries no profile: unfiltered, so `.git` stays.
+	plainOpts, err := buildArchiveOptions("", nil, nil, "tar.gz", false, 1)
+	if err != nil {
+		t.Fatalf("buildArchiveOptions(plain): %v", err)
+	}
+	if len(plainOpts.Exclude) != 0 {
+		t.Fatalf("plain archive excludes = %v, want none", plainOpts.Exclude)
+	}
+	plainMatcher := pathfilter.NewMatcher(plainOpts.Include, plainOpts.Exclude, plainOpts.Override)
+	for _, keep := range []string{"proj/.git/HEAD", "proj/src/main.go", "proj/node_modules/x.js"} {
+		if !plainMatcher.Match(keep) {
+			t.Fatalf("plain archive should keep %q", keep)
+		}
+	}
+
+	// A profiled archive drops VCS metadata and the profile's local-only sets.
+	profiledOpts, err := buildArchiveOptions("coding-agent", nil, nil, "tar.gz", false, 1)
+	if err != nil {
+		t.Fatalf("buildArchiveOptions(coding-agent): %v", err)
+	}
+	profiledMatcher := pathfilter.NewMatcher(profiledOpts.Include, profiledOpts.Exclude, profiledOpts.Override)
+	for _, drop := range []string{"proj/.git/HEAD", "proj/node_modules/x.js", "proj/target/debug/app"} {
+		if profiledMatcher.Match(drop) {
+			t.Fatalf("profiled archive should drop %q; excludes = %v", drop, profiledOpts.Exclude)
+		}
+	}
+	if !profiledMatcher.Match("proj/src/main.go") {
+		t.Fatalf("profiled archive should keep source; excludes = %v", profiledOpts.Exclude)
+	}
 }

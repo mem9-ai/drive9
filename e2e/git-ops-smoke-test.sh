@@ -735,14 +735,19 @@ run_case() {
   echo "=== [profile=$profile clone=$mode] ==="
   check_cmd "$slug create remote root" drive9 fs mkdir ":$remote_root"
 
-  if [ "$mode" = "native" ]; then
-    use_native_pack=1
-  fi
-
   check_cmd "$slug first mount starts" start_mount "$profile" "$mount_a" "$local_root_a" "$log_a" "$remote_root" 1
   check_cmd "$slug clone" clone_repo "$mode" "$repo_a"
   check_cmd "$slug git operations before remount" exercise_git_operations "$repo_a" "$marker" "$state_dir"
   check_cmd "$slug first mount log audit" audit_mount_log "$log_a"
+
+  # If `.git` landed in the local overlay it is local-only for this mount (the
+  # profile pins it, e.g. the portable fixture's `[local] **/.git/**`), so a
+  # fresh local root can only recover it through an explicit pack/unpack. When
+  # `.git` is not in the overlay (the builtin coding-agent routes it to the
+  # backend) the second mount restores it from the remote with no pack.
+  if [ "$mode" = "native" ] && [ -d "$local_root_a/overlay/repo/.git" ]; then
+    use_native_pack=1
+  fi
 
   if [ "$use_native_pack" = "1" ]; then
     stop_mount 1 "$native_pack_archive" "repo/.git"

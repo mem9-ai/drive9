@@ -249,6 +249,10 @@ bash scripts/local-minio.sh stop         # named container / recorded pid only
 
 MinIO is reused across runs (like the local TiDB container). Orb/VMs can bind
 `DRIVE9_MINIO_BIND=0.0.0.0` and advertise `DRIVE9_S3_ENDPOINT` for presign.
+The `minio/minio` image and `dl.min.io` binary downloads were removed upstream
+(the community edition went source-only), so MinIO is pulled from
+`cgr.dev/chainguard/minio` by default; override with `DRIVE9_MINIO_IMAGE`
+(first candidate) and `DRIVE9_MINIO_FALLBACK_IMAGE` (empty disables it).
 
 FUSE suites honor `FUSE_PROFILE` (`drive9 mount --profile`). Example:
 
@@ -367,7 +371,7 @@ each suite provisions a fresh tenant.
 3. CLI fork flow (`ctx add`, `ctx fork`, fork readiness polling, fork-context file read/write, fork delete)
 4. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `symlink`, `hardlink`, `rm`)
 5. CLI `cp` directory-target semantics (local->remote dir, remote->local dir, remote->remote dir all preserve source basename)
-6. CLI pack/unpack flow (coding-agent local overlay `.git` + `dist` archived to the default hidden pack slot and restored into a fresh local root)
+6. CLI pack/unpack flow (a custom-profile local overlay `.git` + `dist` archived to the default hidden pack slot and restored into a fresh local root)
 7. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
 8. CLI search flow (`fs grep`, `fs find`)
 9. CLI semantic and image-associated recall flow (`fs grep` paraphrase + image caption recall) with async polling

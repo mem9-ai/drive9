@@ -610,29 +610,17 @@ async function buildMatcher(client: Client, opts: ArchiveOptions): Promise<Match
   return m;
 }
 
+// Mirrors the Go CLI's coding-agent default skip set. The Go mount layer
+// splits these into [local] (node_modules, .venv, overlaid unconditionally) and
+// [local-gitignore-aware] (target, overlaid only when the repository ignores
+// it); `.git` is routed structurally by the mount and is not listed here. A
+// bulk archive has no Git ignore oracle, so it applies the union directly, with
+// `.git` skipped as it always has been for archives.
 export const codingAgentLocalOnly = [
   "**/.git/**",
-  "**/.hg/**",
-  "**/.svn/**",
   "**/node_modules/**",
-  "**/.pnpm-store/**",
-  "**/target/**",
-  "**/dist/**",
-  "**/build/**",
-  "**/coverage/**",
-  "**/tmp/**",
-  "**/.tmp/**",
-  "**/.tmp-api-extractor/**",
-  "**/.cache/**",
-  "**/.turbo/**",
-  "**/.next/cache/**",
-  "**/.vitepress/cache/**",
-  "**/.gradle/**",
   "**/.venv/**",
-  "**/__pycache__/**",
-  "**/.pytest_cache/**",
-  "**/.mypy_cache/**",
-  "**/.ruff_cache/**",
+  "**/target/**",
 ];
 
 export { match, hasInclude };

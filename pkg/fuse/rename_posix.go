@@ -476,9 +476,9 @@ func (fs *Dat9FS) renameRemoteFileToMissingTargetFallback(ctx context.Context, i
 // renameLocalOverlaySubtree moves a local-overlay subtree from oldP to newP.
 //
 // A directory can be remote-classified while still containing local-only
-// descendants: the coding-agent profile routes "**/dist/**",
-// "**/node_modules/**" and similar paths to the local overlay, so a remotely
-// created staging directory can hold a local-only build tree. The layer
+// descendants: the coding-agent profile routes "**/node_modules/**" (and
+// gitignore-confirmed Cargo `target/`) to the local overlay, so a remotely
+// created staging directory can hold a local-only tree. The layer
 // classification of the directory itself does not describe its children, so a
 // remote rename must move the overlay subtree independently instead of
 // leaving those files orphaned at the stale path.

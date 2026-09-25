@@ -142,14 +142,21 @@ describe("archive", () => {
       { path: "/proj/main.go", body: "package main\n" },
       { path: "/proj/dist/bundle.js", body: "bundle\n" },
       { path: "/proj/node_modules/react/x.js", body: "x\n" },
+      { path: "/proj/.venv/bin/python", body: "py\n" },
+      { path: "/proj/target/debug/app", body: "bin\n" },
       { path: "/proj/.git/HEAD", body: "ref: main\n" },
     ]);
     const client = new Client("http://localhost:9009", "test-key");
     const stream = await client.archive("/proj", { profile: "coding-agent" });
     const names = readTarGz(await streamToBuffer(stream));
     expect(names).toContain("proj/main.go");
+    // VCS metadata, dependency, and build-output trees are skipped by default;
+    // other build output such as dist/ stays included.
+    expect(names).toContain("proj/dist/bundle.js");
     for (const n of names) {
-      expect(n.includes("node_modules") || n.includes(".git/") || n.includes("dist/")).toBe(false);
+      expect(
+        n.includes("node_modules") || n.includes(".venv/") || n.includes("target/") || n.includes(".git/"),
+      ).toBe(false);
     }
   });
 

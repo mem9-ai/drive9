@@ -63,7 +63,7 @@ npm install
 The interaction does not require the user to understand Drive9 internals:
 
 - Durable files such as source code, docs, and config enter the layer.
-- `.git`, `node_modules`, and build/cache output prefer the existing local-only overlay.
+- `node_modules` and `.venv` prefer the existing local-only overlay unconditionally; `target` when the repository ignores it; `.git` when the path belongs to a Git workspace. Other build/cache output and `.hg`/`.svn` stay remote-managed unless the profile opts them in.
 - File `close`, `fsync`, checkpoint, and unmount advance the durable layer to the backend.
 - Regular Drive9 mount behavior remains unchanged when no layer is used.
 
@@ -219,7 +219,7 @@ Write order:
 
 Path classification order:
 
-1. `local-only` policy: `.git`, `node_modules`, and build/cache output continue using the existing local overlay.
+1. `local-only` policy: `node_modules`/`.venv`, gitignore-confirmed `target`, and workspace-local `.git` continue using the existing local overlay.
 2. `git_workspace`: the existing Git fast workspace continues handling clean tree + Git overlay.
 3. `fs_layer`: regular Drive9 files under layer mount/API use the generic layer resolver.
 4. `remote_persistent`: when there is no layer or the layer misses, use the existing base path.
