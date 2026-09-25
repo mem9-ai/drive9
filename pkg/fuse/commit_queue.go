@@ -88,6 +88,14 @@ type CommitEntry struct {
 	// terminal. Re-basing old bytes with a new BaseRev is exactly the silent
 	// rollback class this fence prevents.
 	DisableAutoResolveLWW bool
+	// Unconditional marks a PendingDelete whose revision guard must NOT run:
+	// either the unlink captured no committed revision (nothing to compare),
+	// or a commit for the path was already in flight when the delete was
+	// scheduled — that in-flight PUT legitimately advances the revision even
+	// though its bytes are the dying file's, and the DELETE must proceed
+	// after it. Recovered (post-crash) deletes keep the guard: a revision
+	// change while this mount was gone can only come from another writer.
+	Unconditional bool
 	// growthRebaseRev records a one-shot authorization to pair a descendant
 	// payload (#896 base-zero growth, #935 live same-path rewrite) with the revision it is safe to overwrite. PayloadBaseRev
 	// intentionally remains unchanged for auditability, so repeated
@@ -804,6 +812,18 @@ func (cq *CommitQueue) HasPath(path string) bool {
 		return true
 	}
 	return cq.hasQueuedPathLocked(path) || cq.hasImmediatePathLocked(path)
+}
+
+// InFlightPath reports whether a commit for the path is currently being
+// processed by a worker (unlike HasPath it ignores queued work).
+func (cq *CommitQueue) InFlightPath(path string) bool {
+	if cq == nil {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	_, inflight := cq.inFlight[path]
+	return inflight
 }
 
 func (cq *CommitQueue) hasImmediatePathLocked(path string) bool {
@@ -1668,6 +1688,25 @@ func (cq *CommitQueue) deleteOne(entry *CommitEntry) {
 		cq.mu.Unlock()
 
 		unlockPath := cq.lockPath(entry.Path)
+		// Revision guard: the path was captured at BaseRev when the unlink
+		// was scheduled. If the backend now shows a different revision, the
+		// file was recreated or rewritten by another writer between the
+		// local unlink and this deferred delete — retire the intent instead
+		// of removing newer content. Checked under the path lock so a
+		// same-path upload mid-flight serializes first. The remaining race
+		// shrinks to one round trip (stat → delete); a server-side
+		// conditional delete closes it entirely (#996 P3).
+		if !entry.Unconditional && entry.BaseRev > 0 {
+			statCtx, statCancel := context.WithTimeout(ctx, uploadTimeout)
+			stat, statErr := cq.client.StatCtx(statCtx, cq.remotePath(entry.Path))
+			statCancel()
+			if statErr == nil && stat != nil && stat.Revision > 0 && stat.Revision != entry.BaseRev {
+				unlockPath()
+				safeLogPrintf("commit queue: skipping deferred delete of %s: path changed from rev %d to %d after unlink", entry.Path, entry.BaseRev, stat.Revision)
+				cq.onDeferredDeleteSuccess(entry)
+				return
+			}
+		}
 		err := cq.deleteRemoteEntry(ctx, entry)
 		cq.mu.Lock()
 		entry.cancelUpload = nil

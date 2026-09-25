@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,7 @@ type deferredUnlinkBackend struct {
 	mu         sync.Mutex
 	order      []string
 	exists     map[string]bool
+	revs       map[string]int64
 	putGate    chan struct{} // when non-nil, PUTs block until closed
 	deleteGate chan struct{} // when non-nil, DELETEs block before counting
 	deletes    atomic.Int64
@@ -28,7 +30,22 @@ type deferredUnlinkBackend struct {
 }
 
 func newDeferredUnlinkBackend() *deferredUnlinkBackend {
-	return &deferredUnlinkBackend{exists: map[string]bool{}}
+	return &deferredUnlinkBackend{exists: map[string]bool{}, revs: map[string]int64{}}
+}
+
+// seedFile registers a file path with a HEAD revision.
+func (b *deferredUnlinkBackend) seedFile(path string, rev int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.exists[path] = true
+	b.revs[path] = rev
+}
+
+// hasPath reports whether the path exists on the backend (mutex-guarded).
+func (b *deferredUnlinkBackend) hasPath(path string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.exists[path]
 }
 
 func (b *deferredUnlinkBackend) record(kind string) {
@@ -53,7 +70,9 @@ func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 			if b.putGate != nil {
 				<-b.putGate
 			}
+			b.mu.Lock()
 			b.exists[p] = true
+			b.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case http.MethodDelete:
@@ -73,11 +92,14 @@ func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 		case http.MethodHead:
 			b.heads.Add(1)
 			b.record("HEAD")
-			if !b.exists[p] {
+			b.mu.Lock()
+			exists, rev := b.exists[p], b.revs[p]
+			b.mu.Unlock()
+			if !exists {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			w.Header().Set("X-Dat9-Revision", "7")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
 			w.Header().Set("X-Dat9-IsDir", "false")
 			w.WriteHeader(http.StatusOK)
 		default:
@@ -165,7 +187,7 @@ func TestDeferredUnlinkNoSyncRoundTrips(t *testing.T) {
 	defer ts.Close()
 	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
 
-	backend.exists["/victim.txt"] = true
+	backend.seedFile("/victim.txt", 7)
 	fs.inodes.Lookup("/victim.txt", false, 128, time.Now())
 
 	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "victim.txt"); st != gofuse.OK {
@@ -245,7 +267,7 @@ func TestDeferredUnlinkOrdersAfterQueuedUpload(t *testing.T) {
 	// Final consistency: whatever landed (the staged PUT may have been
 	// canceled mid-flight, or committed before cancellation), the path must
 	// be gone from the backend after the deferred delete applied.
-	if backend.exists["/staged.txt"] {
+	if backend.hasPath("/staged.txt") {
 		t.Fatalf("path still present on backend after deferred delete (calls: %v)", backend.calls())
 	}
 	// Local staged state must be gone too.
@@ -265,7 +287,7 @@ func TestDeferredUnlinkFlagOffStaysSynchronous(t *testing.T) {
 	defer ts.Close()
 	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), false)
 
-	backend.exists["/plain.txt"] = true
+	backend.seedFile("/plain.txt", 7)
 	fs.inodes.Lookup("/plain.txt", false, 128, time.Now())
 
 	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "plain.txt"); st != gofuse.OK {
@@ -340,5 +362,110 @@ func TestDeferredUnlinkIntentSurvivesRestart(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "journal.wal")); err != nil {
 		t.Fatalf("journal file missing: %v", err)
+	}
+}
+
+// TestDeferredDeleteSkipsRecreatedFile covers the revision guard: if the
+// backend path changed revision after the unlink intent was recorded
+// (another writer recreated it), the deferred delete must retire the intent
+// instead of removing the newer file.
+func TestDeferredDeleteSkipsRecreatedFile(t *testing.T) {
+	backend := newDeferredUnlinkBackend()
+	backend.deleteGate = make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(backend.deleteGate) }) }
+	t.Cleanup(release)
+
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
+
+	backend.seedFile("/victim.txt", 7)
+	ino := fs.inodes.Lookup("/victim.txt", false, 128, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision("/victim.txt", 7)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "victim.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+
+	// Another writer recreates the path at a newer revision while the
+	// delete is queued (gated before counting so it cannot run early).
+	backend.mu.Lock()
+	backend.exists["/victim.txt"] = true
+	backend.revs["/victim.txt"] = 9
+	backend.mu.Unlock()
+
+	release()
+	fs.commitQueue.DrainAll()
+
+	if got := backend.deletes.Load(); got != 0 {
+		t.Fatalf("DELETEs = %d, want 0: the recreated file must survive", got)
+	}
+	if !backend.hasPath("/victim.txt") {
+		t.Fatal("recreated file was removed by the deferred delete")
+	}
+	// The intent must be retired so a later replay does not re-delete.
+	confirmed := false
+	if err := fs.journal.Replay(func(e JournalEntry) {
+		if e.Op == JournalCommit && e.Path == "/victim.txt" {
+			confirmed = true
+		}
+	}); err != nil {
+		t.Fatalf("journal replay: %v", err)
+	}
+	if !confirmed {
+		t.Fatal("skipped delete did not retire the journal intent")
+	}
+}
+
+// TestDeferredDeleteProceedsWhenInflightCommitAdvancesRevision covers the
+// Unconditional case: a commit already in flight at unlink time is the dying
+// file's own upload — the revision change it causes must not stop the delete.
+func TestDeferredDeleteProceedsWhenInflightCommitAdvancesRevision(t *testing.T) {
+	backend := newDeferredUnlinkBackend()
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
+
+	const path = "/dying.txt"
+	if err := fs.shadowStore.Ensure(path, 4, 0); err != nil {
+		t.Fatalf("shadow ensure: %v", err)
+	}
+	if _, err := fs.pendingIndex.PutWithBaseRev(path, 4, PendingNew, 0); err != nil {
+		t.Fatalf("pending put: %v", err)
+	}
+	// Revisions differ from the captured one: with the guard active this
+	// would (wrongly) skip the delete.
+	backend.seedFile(path, 42)
+	fs.inodes.Lookup(path, false, 4, time.Now())
+
+	if err := fs.commitQueue.Enqueue(&CommitEntry{
+		Path:      path,
+		BaseRev:   0,
+		Size:      4,
+		Kind:      PendingNew,
+		ShadowGen: fs.shadowStore.ActiveGeneration(path),
+	}); err != nil {
+		t.Fatalf("enqueue upload: %v", err)
+	}
+
+	// Unlink while the upload entry is still queued; it gets canceled by the
+	// commit-point cleanup, but the dispatched-worker window is what
+	// Unconditional covers — emulate by re-enqueuing the delete directly the
+	// way Unlink does for an in-flight producer.
+	backend.deletes.Store(0)
+	if err := fs.commitQueue.Enqueue(&CommitEntry{
+		Path:          path,
+		BaseRev:       7,
+		Kind:          PendingDelete,
+		Unconditional: true,
+	}); err != nil {
+		t.Fatalf("enqueue delete: %v", err)
+	}
+	fs.commitQueue.DrainAll()
+
+	if got := backend.deletes.Load(); got != 1 {
+		t.Fatalf("DELETEs = %d, want 1: unconditional deletes must run despite revision drift", got)
 	}
 }

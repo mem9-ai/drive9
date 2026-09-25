@@ -611,14 +611,34 @@ func Mount(opts *MountOptions) (err error) {
 				// previous session never confirmed. The durable JournalUnlink
 				// frame is the intent; enqueueing here closes the crash window
 				// where a file is unlinked locally but still present remotely.
+				// A queue full of recovered uploads backs this off with
+				// retries instead of dropping the intent for the whole mount
+				// session: the queue drains as uploads complete, freeing
+				// slots.
 				if len(deferredDeletes) > 0 {
+					backoff := 200 * time.Millisecond
+					requeueDeadline := time.Now().Add(30 * time.Second)
 					for _, d := range deferredDeletes {
-						if err := cq.Enqueue(&CommitEntry{
-							Path:    d.Path,
-							BaseRev: d.BaseRev,
-							Kind:    PendingDelete,
-						}); err != nil {
-							safeLogPrintf("mount: deferred delete re-enqueue failed for %s: %v", d.Path, err)
+						for {
+							err := cq.Enqueue(&CommitEntry{
+								Path:    d.Path,
+								BaseRev: d.BaseRev,
+								Kind:    PendingDelete,
+							})
+							if err == nil {
+								break
+							}
+							if time.Now().After(requeueDeadline) {
+								// The durable WAL intent still replays on the
+								// next mount; keep mounting rather than
+								// blocking startup forever.
+								safeLogPrintf("mount: deferred delete re-enqueue failed for %s: %v (intent kept for next mount)", d.Path, err)
+								break
+							}
+							time.Sleep(backoff)
+							if backoff < 2*time.Second {
+								backoff *= 2
+							}
 						}
 					}
 				}

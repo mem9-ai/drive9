@@ -10737,13 +10737,21 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// the intent or the enqueue fails, fall back to a synchronous delete and
 	// mark the intent confirmed on success.
 	if deferredDelete {
+		// A commit already in flight for this path is our own dying file's
+		// upload: it legitimately advances the revision, so the delete must
+		// not be revision-guarded. Without in-flight work, any revision
+		// change after the captured one can only be another writer's
+		// recreate — exactly what the guard must protect.
+		unconditional := deferredBaseRev <= 0 ||
+			(fs.commitQueue != nil && fs.commitQueue.InFlightPath(childP))
 		if !fs.appendDeferredUnlinkIntent(childP, deferredIno, deferredBaseRev) {
 			fs.syncFallbackDeferredUnlink(childP)
 		} else if err := fs.commitQueue.Enqueue(&CommitEntry{
-			Path:    childP,
-			Inode:   deferredIno,
-			BaseRev: deferredBaseRev,
-			Kind:    PendingDelete,
+			Path:          childP,
+			Inode:         deferredIno,
+			BaseRev:       deferredBaseRev,
+			Kind:          PendingDelete,
+			Unconditional: unconditional,
 		}); err != nil {
 			safeLogPrintf("unlink: deferred delete enqueue failed for %s: %v (falling back to sync delete)", childP, err)
 			fs.syncFallbackDeferredUnlink(childP)
