@@ -93,6 +93,15 @@ func (p *siblingMetadataPrefetch) clear() {
 	p.mu.Unlock()
 }
 
+func (p *siblingMetadataPrefetch) requestCurrent(request metadataPrefetchRequest) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return request.epoch == p.epoch
+}
+
 func (p *siblingMetadataPrefetch) noteAccess(filePath string) {
 	if p == nil || filePath == "" || filePath == "/" {
 		return
@@ -363,7 +372,7 @@ func (fs *Dat9FS) maybePrefetchSiblingMetadata(ctx context.Context, filePath str
 }
 
 func (fs *Dat9FS) refreshSiblingMetadata(ctx context.Context, request metadataPrefetchRequest) error {
-	if !fs.statCacheVerified() || fs.mountViewGeneration.Load() != request.mountGeneration || fs.dirCache.mutationGeneration(request.parentPath) != request.mutationGeneration || fs.dirCache.namespaceGeneration() != request.namespaceGeneration {
+	if !fs.statCacheVerified() || !fs.metadataPrefetch.requestCurrent(request) || fs.mountViewGeneration.Load() != request.mountGeneration || fs.dirCache.mutationGeneration(request.parentPath) != request.mutationGeneration || fs.dirCache.namespaceGeneration() != request.namespaceGeneration {
 		return nil
 	}
 	if request.list {
@@ -389,6 +398,10 @@ func (fs *Dat9FS) refreshSiblingMetadataList(ctx context.Context, request metada
 		return err
 	}
 	if !fs.lockMountViewRead(request.mountGeneration) {
+		return nil
+	}
+	if !fs.statCacheVerified() || !fs.metadataPrefetch.requestCurrent(request) {
+		fs.mountViewMu.RUnlock()
 		return nil
 	}
 	_, receipt := fs.dirCache.putListing(request.parentPath, cached, observation)
@@ -458,6 +471,10 @@ func (fs *Dat9FS) refreshSiblingMetadataBatch(ctx context.Context, request metad
 		}
 	}
 	if len(items) == 0 || !fs.lockMountViewRead(request.mountGeneration) {
+		return nil
+	}
+	if !fs.statCacheVerified() || !fs.metadataPrefetch.requestCurrent(request) {
+		fs.mountViewMu.RUnlock()
 		return nil
 	}
 	receipt := fs.dirCache.observeBatch(request.parentPath, items, observation, request.mutationGeneration, request.namespaceGeneration)

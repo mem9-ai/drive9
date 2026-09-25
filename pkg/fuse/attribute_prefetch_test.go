@@ -1057,6 +1057,101 @@ func TestMetadataPrefetchBatchPreservesHEADCompletedDuringRequest(t *testing.T) 
 	}
 }
 
+func TestMetadataPrefetchListRejectsRequestAcrossSSEReconnect(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Query().Get("list") != "1" {
+			t.Errorf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		started <- struct{}{}
+		<-release
+		writeMetadataPrefetchListing(t, w, 1)
+	}))
+	defer server.Close()
+
+	fs := newMetadataPrefetchTestFS(server.URL)
+	request := metadataPrefetchRequest{
+		parentPath:          "/src",
+		mountGeneration:     fs.mountViewGeneration.Load(),
+		mutationGeneration:  fs.dirCache.mutationGeneration("/src"),
+		namespaceGeneration: fs.dirCache.namespaceGeneration(),
+		epoch:               fs.metadataPrefetch.epoch,
+		list:                true,
+	}
+	done := make(chan error, 1)
+	go func() { done <- fs.refreshSiblingMetadataList(context.Background(), request) }()
+	<-started
+	fs.markStatCacheUnverified()
+	fs.markStatCacheVerified()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("refresh across reconnect: %v", err)
+	}
+	if got := fs.dirCache.Lookup("/src", "file.0").kind; got == namespaceLookupPositive {
+		t.Fatal("stale listing was cached across SSE reconnect")
+	}
+	if fs.metadataPrefetch.valid("/src", "/src/file.0", request.mountGeneration, request.mutationGeneration, request.namespaceGeneration) {
+		t.Fatal("stale listing published a marker across SSE reconnect")
+	}
+}
+
+func TestMetadataPrefetchBatchRejectsRequestAcrossSSEReconnect(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs:batch-stat" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var body struct {
+			Paths []string `json:"paths"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode batch stat: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		started <- struct{}{}
+		<-release
+		results := make([]client.BatchStatResult, len(body.Paths))
+		for i, filePath := range body.Paths {
+			results[i] = client.BatchStatResult{Path: filePath, Status: http.StatusOK, Size: 1, Revision: 1}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
+	}))
+	defer server.Close()
+
+	fs := newMetadataPrefetchTestFS(server.URL)
+	request := metadataPrefetchRequest{
+		parentPath:          "/src",
+		mountGeneration:     fs.mountViewGeneration.Load(),
+		mutationGeneration:  fs.dirCache.mutationGeneration("/src"),
+		namespaceGeneration: fs.dirCache.namespaceGeneration(),
+		epoch:               fs.metadataPrefetch.epoch,
+		hotPaths:            []string{"/src/file.0"},
+	}
+	done := make(chan error, 1)
+	go func() { done <- fs.refreshSiblingMetadataBatch(context.Background(), request) }()
+	<-started
+	fs.markStatCacheUnverified()
+	fs.markStatCacheVerified()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("refresh across reconnect: %v", err)
+	}
+	if got := fs.dirCache.Lookup("/src", "file.0").kind; got == namespaceLookupPositive {
+		t.Fatal("stale batch result was cached across SSE reconnect")
+	}
+	if fs.metadataPrefetch.valid("/src", "/src/file.0", request.mountGeneration, request.mutationGeneration, request.namespaceGeneration) {
+		t.Fatal("stale batch result published a marker across SSE reconnect")
+	}
+}
+
 func TestMetadataPrefetchBatchBindsResultsByPath(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs:batch-stat" {
