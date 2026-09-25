@@ -123,7 +123,7 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRange(ctx context.Context, reader *
 	for {
 		latestSeq, pending := fs.pendingFtruncateSeq(reader.Ino)
 		if !pending {
-			return fs.readSupersededFtruncateRange(ctx, reader.Ino, readerPath, offset, reqSize)
+			return fs.readSupersededFtruncateRange(ctx, reader, readerPath, readerSeq, offset, reqSize)
 		}
 		entry, ok := fs.inodes.GetEntry(reader.Ino)
 		if !ok || entry.Unlinked {
@@ -149,7 +149,8 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRange(ctx context.Context, reader *
 // A newer committed inode mutation suppresses the old fd truncate while its
 // handle is still open. Bypass that handle's pinned shadow and stale caches;
 // a newer local pending image remains fail-closed until it can be selected.
-func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, ino uint64, readerPath string, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, reader *FileHandle, readerPath string, readerSeq uint64, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+	ino := reader.Ino
 	if !fs.openHandles.HasVisibleTruncate(ino) {
 		return nil, 0, false, gofuse.OK
 	}
@@ -171,7 +172,7 @@ func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, ino uint64, 
 		return nil, 0, true, gofuse.OK
 	}
 	if dirty.seq > committedSeq {
-		return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+		return fs.readSupersededFtruncateOwnRange(reader, readerPath, readerSeq, dirty.seq, committedSeq, offset, reqSize)
 	}
 	var chmodOnlyGens map[string]uint64
 	for path := range entry.Paths {
@@ -223,6 +224,48 @@ func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, ino uint64, 
 		}
 	}
 	return data, len(data), true, gofuse.OK
+}
+
+// A newer dirty reader can use only bytes it wrote after the committed
+// mutation. Uncovered bytes may still belong to the superseded truncate.
+func (fs *Dat9FS) readSupersededFtruncateOwnRange(reader *FileHandle, readerPath string, readerSeq, dirtySeq, committedSeq uint64, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+	failClosed := gofuse.Status(syscall.EAGAIN)
+	if readerSeq == 0 || readerSeq != dirtySeq || readerSeq <= committedSeq || !reader.TryLock() {
+		return nil, 0, false, failClosed
+	}
+	defer reader.Unlock()
+	if reader.Dirty == nil || reader.DirtySeq != readerSeq || reader.Path != readerPath ||
+		reader.Unlinked || reader.UnlinkedSnapshot || reader.UnlinkedData != nil {
+		return nil, 0, false, failClosed
+	}
+	entry, ok := fs.inodes.GetEntry(reader.Ino)
+	if !ok || entry.Unlinked {
+		return nil, 0, false, failClosed
+	}
+	if _, linked := entry.Paths[readerPath]; !linked {
+		return nil, 0, false, failClosed
+	}
+	end := offset + int64(reqSize)
+	if end < offset {
+		return nil, 0, false, gofuse.EINVAL
+	}
+	if end > reader.Dirty.Size() || !reader.coversFtruncateWrites(offset, end, committedSeq) {
+		return nil, 0, false, failClosed
+	}
+	stillCurrent := func() bool {
+		fs.dirtyMu.Lock()
+		defer fs.dirtyMu.Unlock()
+		return fs.dirtyInodes[reader.Ino].seq == readerSeq &&
+			fs.mutationInodes[reader.Ino].committedSeq == committedSeq
+	}
+	if !stillCurrent() {
+		return nil, 0, false, failClosed
+	}
+	data, n, handled, status, retry := fs.readPendingFtruncateHandleLocked(reader, offset, reqSize, false)
+	if retry || !handled || !stillCurrent() {
+		return nil, 0, false, failClosed
+	}
+	return data, n, true, status
 }
 
 func (fs *Dat9FS) readPendingFtruncateVisibleRangeOnce(ctx context.Context, reader *FileHandle, entry *InodeEntry, readerSeq uint64, readerMarked bool, latestSeq uint64, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, bool) {
