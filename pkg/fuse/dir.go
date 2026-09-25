@@ -227,6 +227,12 @@ type listingInstallReceipt struct {
 	installed           bool
 }
 
+type batchObservationReceipt struct {
+	accepted            []CachedFileInfo
+	mutationGeneration  uint64
+	namespaceGeneration uint64
+}
+
 type directoryPrefetchSnapshot struct {
 	parentPath          string
 	targetPath          string
@@ -457,6 +463,30 @@ func (dc *DirCache) directoryPrefetchSnapshotCurrentLocked(snapshot directoryPre
 	}
 	item, ok := parent.items[snapshot.name]
 	return ok && item.IsDir && item.ResourceID == snapshot.resourceID
+}
+
+func (dc *DirCache) directoryPrefetchCachedListing(snapshot directoryPrefetchSnapshot) ([]CachedFileInfo, bool) {
+	if dc == nil || snapshot.targetPath == "" {
+		return nil, false
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	now := dc.now()
+	if !dc.directoryPrefetchSnapshotCurrentLocked(snapshot, now) {
+		return nil, false
+	}
+	entry, ok := dc.getEntryLocked(snapshot.targetPath, now)
+	if !ok || !entry.completeValid(now) {
+		return nil, false
+	}
+	items := make([]CachedFileInfo, 0, len(entry.order))
+	for _, name := range entry.order {
+		if item, exists := entry.items[name]; exists {
+			items = append(items, item)
+		}
+	}
+	return items, true
 }
 
 func (dc *DirCache) putListingLocked(dirPath string, items []CachedFileInfo, request RequestToken) ([]CachedFileInfo, listingInstallReceipt) {
@@ -892,44 +922,63 @@ func (dc *DirCache) Observe(parentPath string, item CachedFileInfo, token Reques
 	dc.releaseRequestLocked(token)
 }
 
-func (dc *DirCache) observeBatch(parentPath string, items []CachedFileInfo, token RequestToken) (uint64, bool) {
+func (dc *DirCache) observeBatch(parentPath string, items []CachedFileInfo, token RequestToken, mutationGeneration, namespaceGeneration uint64) batchObservationReceipt {
 	if dc == nil || len(items) == 0 {
-		return 0, false
+		return batchObservationReceipt{}
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	if !token.valid || token.dir != parentPath || dc.generationLocked(parentPath) != token.event {
+	if !token.valid || token.dir != parentPath || dc.namespaceGen != namespaceGeneration || dc.mutationGenerationLocked(parentPath) != mutationGeneration {
 		dc.releaseRequestLocked(token)
-		return dc.generationLocked(parentPath), false
+		return batchObservationReceipt{}
+	}
+	if retired := dc.retired[parentPath]; token.seq < retired {
+		dc.releaseRequestLocked(token)
+		return batchObservationReceipt{}
 	}
 	entry := dc.ensureEntryLocked(parentPath)
+	newestInstall := entry.installSeq
+	if floor := dc.installFloor[parentPath]; floor > newestInstall {
+		newestInstall = floor
+	}
+	if newestInstall > token.seq {
+		dc.releaseRequestLocked(token)
+		return batchObservationReceipt{}
+	}
 	deadline := dc.now().Add(dc.ttl)
-	accepted := make([]string, 0, len(items))
+	accepted := make([]CachedFileInfo, 0, len(items))
 	for _, item := range items {
 		if item.Name == "" {
+			continue
+		}
+		if stamp, changed := entry.localGen[item.Name]; changed && stamp > token.event {
 			continue
 		}
 		item.freshUntil = deadline
 		entry.upsert(item, dc.maxEntries)
 		delete(entry.negatives, item.Name)
-		accepted = append(accepted, item.Name)
+		accepted = append(accepted, item)
 	}
 	if len(accepted) == 0 {
 		dc.releaseRequestLocked(token)
-		return dc.generationLocked(parentPath), false
+		return batchObservationReceipt{}
 	}
 	stamp := dc.nextGenerationLocked()
 	entry.gen = stamp
 	if dc.inFlight[parentPath] > 0 {
-		for _, name := range accepted {
-			entry.localGen[name] = stamp
+		for _, item := range accepted {
+			entry.localGen[item.Name] = stamp
 		}
 	} else {
 		entry.reclaimReconciliationLocked()
 	}
 	dc.releaseRequestLocked(token)
-	return stamp, true
+	return batchObservationReceipt{
+		accepted:            accepted,
+		mutationGeneration:  mutationGeneration,
+		namespaceGeneration: namespaceGeneration,
+	}
 }
 
 func (dc *DirCache) generation(dirPath string) uint64 {

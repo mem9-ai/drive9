@@ -991,6 +991,72 @@ func TestMetadataPrefetchRequestSurvivesReadInstallBeforeRefresh(t *testing.T) {
 	}
 }
 
+func TestMetadataPrefetchBatchPreservesHEADCompletedDuringRequest(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs:batch-stat" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var body struct {
+			Paths []string `json:"paths"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode batch stat: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		started <- struct{}{}
+		<-release
+		results := make([]client.BatchStatResult, len(body.Paths))
+		for i, filePath := range body.Paths {
+			results[i] = client.BatchStatResult{Path: filePath, Status: http.StatusOK, Size: int64(i + 1), Revision: 2}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
+	}))
+	defer server.Close()
+
+	fs := newMetadataPrefetchTestFS(server.URL)
+	mountGeneration := fs.mountViewGeneration.Load()
+	mutationGeneration := fs.dirCache.mutationGeneration("/src")
+	namespaceGeneration := fs.dirCache.namespaceGeneration()
+	if _, ok := fs.metadataPrefetch.beginMiss("/src/a.go", mountGeneration, mutationGeneration, namespaceGeneration); ok {
+		t.Fatal("first miss activated prefetch")
+	}
+	request, ok := fs.metadataPrefetch.beginMiss("/src/b.go", mountGeneration, mutationGeneration, namespaceGeneration)
+	if !ok {
+		t.Fatal("second miss did not activate prefetch")
+	}
+	headObservation := fs.dirCache.BeginRequest("/src")
+
+	done := make(chan error, 1)
+	go func() { done <- fs.refreshSiblingMetadata(context.Background(), request) }()
+	<-started
+	fs.dirCache.Observe("/src", CachedFileInfo{Name: "a.go", Size: 99, Revision: 9}, headObservation)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("refresh with racing HEAD: %v", err)
+	}
+
+	a := fs.dirCache.Lookup("/src", "a.go")
+	if a.kind != namespaceLookupPositive || a.item.Revision != 9 || a.item.Size != 99 {
+		t.Fatalf("a.go lookup = %+v, want newer HEAD revision 9", a)
+	}
+	b := fs.dirCache.Lookup("/src", "b.go")
+	if b.kind != namespaceLookupPositive || b.item.Revision != 2 {
+		t.Fatalf("b.go lookup = %+v, want accepted batch revision 2", b)
+	}
+	if fs.metadataPrefetch.valid("/src", "/src/a.go", mountGeneration, mutationGeneration, namespaceGeneration) {
+		t.Fatal("racing HEAD path received a batch marker")
+	}
+	if !fs.metadataPrefetch.valid("/src", "/src/b.go", mountGeneration, mutationGeneration, namespaceGeneration) {
+		t.Fatal("uncontended batch path did not receive a marker")
+	}
+}
+
 func TestMetadataPrefetchBatchBindsResultsByPath(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs:batch-stat" {
@@ -1162,8 +1228,8 @@ func installMetadataPrefetchBatch(t *testing.T, fs *Dat9FS, parentPath string, i
 	mutationGeneration := fs.dirCache.mutationGeneration(parentPath)
 	namespaceGeneration := fs.dirCache.namespaceGeneration()
 	observation := fs.dirCache.BeginRequest(parentPath)
-	_, accepted := fs.dirCache.observeBatch(parentPath, items, observation)
-	if !accepted {
+	receipt := fs.dirCache.observeBatch(parentPath, items, observation, mutationGeneration, namespaceGeneration)
+	if len(receipt.accepted) == 0 {
 		t.Fatal("metadata batch was not accepted")
 	}
 	request := metadataPrefetchRequest{
@@ -1173,7 +1239,7 @@ func installMetadataPrefetchBatch(t *testing.T, fs *Dat9FS, parentPath string, i
 		namespaceGeneration: namespaceGeneration,
 		epoch:               fs.metadataPrefetch.epoch,
 	}
-	fs.metadataPrefetch.rememberBatch(request, items, mutationGeneration, namespaceGeneration)
+	fs.metadataPrefetch.rememberBatch(request, receipt.accepted, receipt.mutationGeneration, receipt.namespaceGeneration)
 }
 
 func rememberMetadataPrefetchDirectorySize(fs *Dat9FS, parentPath string, childCount int) {

@@ -193,6 +193,148 @@ func TestDirectoryPrefetchForegroundJoinsAndReceivesFullListing(t *testing.T) {
 	}
 }
 
+func TestDirectoryPrefetchForegroundOwnRequestDoesNotUsePrefetchTimeout(t *testing.T) {
+	oldTimeout := directoryPrefetchTimeout
+	directoryPrefetchTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { directoryPrefetchTimeout = oldTimeout })
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		time.Sleep(40 * time.Millisecond)
+		writeDirectoryListing(t, w, []client.FileInfo{{Name: "slow.txt", Revision: 1}})
+	}))
+	defer server.Close()
+
+	fs := newDirectoryPrefetchTestFS(server.URL, defaultNamespaceCacheMaxEntries)
+	defer fs.OnUnmount()
+	installDirectoryPrefetchParent(t, fs.dirCache, "/repo", directoryChildren("a", "b"))
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	entries, err := fs.loadForegroundRemoteDirectory(ctx, "/repo/b", fs.mountViewGeneration.Load())
+	if err != nil {
+		t.Fatalf("slow foreground load error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "slow.txt" {
+		t.Fatalf("slow foreground entries = %+v, want slow.txt", entries)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("LIST calls = %d, want one foreground request", got)
+	}
+}
+
+func TestDirectoryPrefetchForegroundOwnRequestSurvivesInitiatorCancellation(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		started <- struct{}{}
+		<-release
+		writeDirectoryListing(t, w, []client.FileInfo{{Name: "shared.txt", Revision: 1}})
+	}))
+	defer server.Close()
+
+	fs := newDirectoryPrefetchTestFS(server.URL, defaultNamespaceCacheMaxEntries)
+	defer fs.OnUnmount()
+	installDirectoryPrefetchParent(t, fs.dirCache, "/repo", directoryChildren("a", "b"))
+
+	initiatorCtx, cancelInitiator := context.WithCancel(context.Background())
+	initiatorErr := make(chan error, 1)
+	go func() {
+		_, err := fs.loadForegroundRemoteDirectory(initiatorCtx, "/repo/b", fs.mountViewGeneration.Load())
+		initiatorErr <- err
+	}()
+	<-started
+	cancelInitiator()
+	if err := <-initiatorErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("initiator error = %v, want context canceled", err)
+	}
+
+	result := make(chan []CachedFileInfo, 1)
+	joinerErr := make(chan error, 1)
+	go func() {
+		entries, err := fs.loadForegroundRemoteDirectory(context.Background(), "/repo/b", fs.mountViewGeneration.Load())
+		result <- entries
+		joinerErr <- err
+	}()
+	waitForDirectoryPrefetchJoined(t, fs, "/repo/b")
+	close(release)
+	if err := <-joinerErr; err != nil {
+		t.Fatalf("joiner error = %v", err)
+	}
+	if entries := <-result; len(entries) != 1 || entries[0].Name != "shared.txt" {
+		t.Fatalf("joiner entries = %+v, want shared.txt", entries)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("LIST calls = %d, want one shared request", got)
+	}
+}
+
+func TestDirectoryPrefetchForegroundRechecksCompletedCache(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if calls.Add(1) == 1 {
+			started <- struct{}{}
+			<-release
+		}
+		writeDirectoryListing(t, w, []client.FileInfo{{Name: "cached.txt", Revision: 1}})
+	}))
+	defer server.Close()
+
+	fs := newDirectoryPrefetchTestFS(server.URL, defaultNamespaceCacheMaxEntries)
+	defer fs.OnUnmount()
+	installDirectoryPrefetchParent(t, fs.dirCache, "/repo", directoryChildren("a", "b"))
+	fs.maybePrefetchSiblingDirectories("/repo/a")
+	<-started
+	if _, ok := fs.dirCache.Get("/repo/b"); ok {
+		t.Fatal("target listing unexpectedly cached before background completion")
+	}
+	close(release)
+	waitForDirectoryPrefetchIdle(t, fs)
+
+	entries, err := fs.loadForegroundRemoteDirectory(context.Background(), "/repo/b", fs.mountViewGeneration.Load())
+	if err != nil {
+		t.Fatalf("foreground cache recheck error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "cached.txt" {
+		t.Fatalf("foreground cache recheck entries = %+v, want cached.txt", entries)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("LIST calls = %d, want completed prefetch reused", got)
+	}
+}
+
+func TestDirectoryPrefetchScheduleRechecksCompletedCache(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		writeDirectoryListing(t, w, nil)
+	}))
+	defer server.Close()
+
+	fs := newDirectoryPrefetchTestFS(server.URL, defaultNamespaceCacheMaxEntries)
+	defer fs.OnUnmount()
+	installDirectoryPrefetchParent(t, fs.dirCache, "/repo", directoryChildren("a", "b"))
+	snapshot, ok := fs.dirCache.directoryPrefetchSnapshot("/repo/b")
+	if !ok {
+		t.Fatal("missing snapshot for b")
+	}
+	request := fs.dirCache.BeginRequest("/repo/b")
+	fs.dirCache.PutListing("/repo/b", []CachedFileInfo{{Name: "cached.txt", Revision: 1}}, request)
+
+	scheduled, full := fs.directoryPrefetch.schedule(fs, snapshot, fs.mountViewGeneration.Load(), fs.statCacheTrustEpoch.Load())
+	if scheduled || full {
+		t.Fatalf("schedule = %v full=%v, want completed cache skipped", scheduled, full)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("LIST calls = %d, want no redundant background request", got)
+	}
+}
+
 func TestDirectoryPrefetchCanceledForegroundDoesNotFallback(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -366,6 +508,62 @@ func TestDirectoryPrefetchRejectsSSEDisconnectDuringRequest(t *testing.T) {
 	waitForDirectoryPrefetchIdle(t, fs)
 	if _, ok := fs.dirCache.Get("/repo/b"); ok {
 		t.Fatal("in-flight result installed after SSE disconnect")
+	}
+}
+
+func TestDirectoryPrefetchRejectsRequestAcrossSSEReconnect(t *testing.T) {
+	oldStarted := make(chan struct{}, 1)
+	oldRelease := make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if calls.Add(1) == 1 {
+			oldStarted <- struct{}{}
+			<-oldRelease
+			writeDirectoryListing(t, w, []client.FileInfo{{Name: "stale.txt", Revision: 1}})
+			return
+		}
+		writeDirectoryListing(t, w, []client.FileInfo{{Name: "fresh.txt", Revision: 2}})
+	}))
+	defer server.Close()
+
+	fs := newDirectoryPrefetchTestFS(server.URL, defaultNamespaceCacheMaxEntries)
+	defer fs.OnUnmount()
+	installDirectoryPrefetchParent(t, fs.dirCache, "/repo", directoryChildren("a", "b"))
+	fs.maybePrefetchSiblingDirectories("/repo/a")
+	<-oldStarted
+	fs.markStatCacheUnverified()
+	fs.markStatCacheVerified()
+
+	result := make(chan []CachedFileInfo, 1)
+	errs := make(chan error, 1)
+	go func() {
+		entries, err := fs.loadForegroundRemoteDirectory(context.Background(), "/repo/b", fs.mountViewGeneration.Load())
+		result <- entries
+		errs <- err
+	}()
+	select {
+	case err := <-errs:
+		if err != nil {
+			close(oldRelease)
+			t.Fatalf("post-reconnect foreground load error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(oldRelease)
+		t.Fatal("post-reconnect foreground joined the pre-disconnect request")
+	}
+	entries := <-result
+	if len(entries) != 1 || entries[0].Name != "fresh.txt" {
+		close(oldRelease)
+		t.Fatalf("post-reconnect entries = %+v, want fresh.txt", entries)
+	}
+	close(oldRelease)
+	waitForDirectoryPrefetchIdle(t, fs)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("LIST calls = %d, want old and post-reconnect requests", got)
+	}
+	cached, ok := fs.dirCache.Get("/repo/b")
+	if !ok || len(cached) != 1 || cached[0].Name != "fresh.txt" {
+		t.Fatalf("cached listing = %+v complete=%v, want fresh post-reconnect result", cached, ok)
 	}
 }
 

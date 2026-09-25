@@ -25,6 +25,7 @@ type directoryLoadKey struct {
 	path                string
 	resourceID          string
 	mountGeneration     uint64
+	trustEpoch          uint64
 	mutationGeneration  uint64
 	namespaceGeneration uint64
 }
@@ -68,27 +69,32 @@ func (p *siblingDirectoryPrefetch) shutdown() {
 	p.wg.Wait()
 }
 
-func directoryLoadKeyFor(snapshot directoryPrefetchSnapshot, mountGeneration uint64) directoryLoadKey {
+func directoryLoadKeyFor(snapshot directoryPrefetchSnapshot, mountGeneration, trustEpoch uint64) directoryLoadKey {
 	return directoryLoadKey{
 		path:                snapshot.targetPath,
 		resourceID:          snapshot.resourceID,
 		mountGeneration:     mountGeneration,
+		trustEpoch:          trustEpoch,
 		mutationGeneration:  snapshot.mutationGeneration,
 		namespaceGeneration: snapshot.namespaceGeneration,
 	}
 }
 
-func (p *siblingDirectoryPrefetch) schedule(fs *Dat9FS, snapshot directoryPrefetchSnapshot, mountGeneration uint64) (scheduled, full bool) {
+func (p *siblingDirectoryPrefetch) schedule(fs *Dat9FS, snapshot directoryPrefetchSnapshot, mountGeneration, trustEpoch uint64) (scheduled, full bool) {
 	if p == nil || fs == nil {
 		return false, false
 	}
-	key := directoryLoadKeyFor(snapshot, mountGeneration)
+	key := directoryLoadKeyFor(snapshot, mountGeneration, trustEpoch)
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
 		return false, false
 	}
 	if _, exists := p.calls[key]; exists {
+		p.mu.Unlock()
+		return false, false
+	}
+	if _, cached := fs.dirCache.directoryPrefetchCachedListing(snapshot); cached {
 		p.mu.Unlock()
 		return false, false
 	}
@@ -116,11 +122,11 @@ func (p *siblingDirectoryPrefetch) schedule(fs *Dat9FS, snapshot directoryPrefet
 	return true, false
 }
 
-func (p *siblingDirectoryPrefetch) loadForeground(ctx context.Context, fs *Dat9FS, snapshot directoryPrefetchSnapshot, mountGeneration uint64) ([]CachedFileInfo, bool, error) {
+func (p *siblingDirectoryPrefetch) loadForeground(ctx context.Context, fs *Dat9FS, snapshot directoryPrefetchSnapshot, mountGeneration, trustEpoch uint64) ([]CachedFileInfo, bool, error) {
 	if p == nil || fs == nil {
 		return nil, false, nil
 	}
-	key := directoryLoadKeyFor(snapshot, mountGeneration)
+	key := directoryLoadKeyFor(snapshot, mountGeneration, trustEpoch)
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -130,6 +136,10 @@ func (p *siblingDirectoryPrefetch) loadForeground(ctx context.Context, fs *Dat9F
 	if exists {
 		call.joined = true
 	} else {
+		if entries, cached := fs.dirCache.directoryPrefetchCachedListing(snapshot); cached {
+			p.mu.Unlock()
+			return entries, true, nil
+		}
 		call = &directoryLoadCall{done: make(chan struct{})}
 		p.calls[key] = call
 		p.wg.Add(1)
@@ -162,7 +172,7 @@ func (p *siblingDirectoryPrefetch) loadForeground(ctx context.Context, fs *Dat9F
 		}
 		return call.entries, true, nil
 	}
-	if call.background || errors.Is(call.err, errDirectoryLoadRejected) || errors.Is(call.err, context.DeadlineExceeded) {
+	if call.background || errors.Is(call.err, errDirectoryLoadRejected) {
 		if ctx.Err() != nil {
 			return nil, true, ctx.Err()
 		}
@@ -174,8 +184,16 @@ func (p *siblingDirectoryPrefetch) loadForeground(ctx context.Context, fs *Dat9F
 func (p *siblingDirectoryPrefetch) run(fs *Dat9FS, key directoryLoadKey, snapshot directoryPrefetchSnapshot, call *directoryLoadCall) {
 	defer p.wg.Done()
 	started := time.Now()
-	ctx, cancel := context.WithTimeout(p.ctx, directoryPrefetchTimeout)
-	entries, responseBytes, err := fs.loadRemoteDirectory(ctx, snapshot.targetPath, key.mountGeneration, &snapshot, call.background)
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if call.background {
+		ctx, cancel = context.WithTimeout(p.ctx, directoryPrefetchTimeout)
+	} else {
+		ctx, cancel = context.WithTimeout(p.ctx, fuseTimeout)
+	}
+	entries, responseBytes, err := fs.loadRemoteDirectory(ctx, snapshot.targetPath, key.mountGeneration, key.trustEpoch, &snapshot, call.background)
 	cancel()
 
 	p.mu.Lock()
@@ -211,12 +229,13 @@ func (fs *Dat9FS) maybePrefetchSiblingDirectories(currentPath string) {
 		return
 	}
 	mountGeneration := fs.mountViewGeneration.Load()
+	trustEpoch := fs.statCacheTrustEpoch.Load()
 	candidates := fs.dirCache.directoryPrefetchCandidates(currentPath, directoryPrefetchCandidateLimit)
 	for _, snapshot := range candidates {
 		if !fs.directoryPrefetchEligiblePath(snapshot.targetPath) || fs.hasPendingLocalState(snapshot.targetPath) || fs.hasQueuedCommit(snapshot.targetPath) {
 			continue
 		}
-		_, full := fs.directoryPrefetch.schedule(fs, snapshot, mountGeneration)
+		_, full := fs.directoryPrefetch.schedule(fs, snapshot, mountGeneration, trustEpoch)
 		if full {
 			return
 		}
@@ -236,7 +255,7 @@ func (fs *Dat9FS) directoryPrefetchEligiblePath(localPath string) bool {
 	return true
 }
 
-func (fs *Dat9FS) loadRemoteDirectory(ctx context.Context, dirPath string, mountGeneration uint64, snapshot *directoryPrefetchSnapshot, bounded bool) ([]CachedFileInfo, int64, error) {
+func (fs *Dat9FS) loadRemoteDirectory(ctx context.Context, dirPath string, mountGeneration, trustEpoch uint64, snapshot *directoryPrefetchSnapshot, bounded bool) ([]CachedFileInfo, int64, error) {
 	request := fs.dirCache.BeginRequest(dirPath)
 	defer fs.dirCache.EndRequest(request)
 
@@ -274,7 +293,7 @@ func (fs *Dat9FS) loadRemoteDirectory(ctx context.Context, dirPath string, mount
 	if snapshot == nil {
 		return fs.putDirectoryListing(dirPath, cached, request), responseBytes, nil
 	}
-	if !fs.statCacheVerified() {
+	if !fs.statCacheVerified() || fs.statCacheTrustEpoch.Load() != trustEpoch {
 		return nil, responseBytes, errDirectoryLoadRejected
 	}
 	view, receipt, installed := fs.dirCache.putListingIfSnapshot(cached, request, *snapshot)
@@ -289,13 +308,14 @@ func (fs *Dat9FS) loadRemoteDirectory(ctx context.Context, dirPath string, mount
 
 func (fs *Dat9FS) loadForegroundRemoteDirectory(ctx context.Context, dirPath string, mountGeneration uint64) ([]CachedFileInfo, error) {
 	if fs.directoryPrefetchEligiblePath(dirPath) {
+		trustEpoch := fs.statCacheTrustEpoch.Load()
 		if snapshot, ok := fs.dirCache.directoryPrefetchSnapshot(dirPath); ok {
-			entries, handled, err := fs.directoryPrefetch.loadForeground(ctx, fs, snapshot, mountGeneration)
+			entries, handled, err := fs.directoryPrefetch.loadForeground(ctx, fs, snapshot, mountGeneration, trustEpoch)
 			if handled {
 				return entries, err
 			}
 		}
 	}
-	entries, _, err := fs.loadRemoteDirectory(ctx, dirPath, mountGeneration, nil, false)
+	entries, _, err := fs.loadRemoteDirectory(ctx, dirPath, mountGeneration, 0, nil, false)
 	return entries, err
 }

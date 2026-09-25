@@ -90,6 +90,10 @@ type Dat9FS struct {
 	// MountOptions.TrustLocalEvents explicitly allows process-local SSE
 	// freshness for this deployment.
 	statCacheUnverified atomic.Bool
+	// statCacheTrustEpoch advances whenever the SSE stream loses trust. A
+	// request issued before a disconnect must not become installable merely
+	// because the stream reconnects before that request completes.
+	statCacheTrustEpoch atomic.Uint64
 	readSlots           chan struct{}
 	dirtyMu             sync.Mutex
 	dirtyInodes         map[uint64]dirtyInodeState
@@ -6910,6 +6914,7 @@ func (fs *Dat9FS) markStatCacheUnverified() {
 		return
 	}
 	fs.mountViewMu.Lock()
+	fs.statCacheTrustEpoch.Add(1)
 	fs.statCacheUnverified.Store(true)
 	if fs.metadataPrefetch != nil {
 		fs.metadataPrefetch.clear()

@@ -460,12 +460,10 @@ func (fs *Dat9FS) refreshSiblingMetadataBatch(ctx context.Context, request metad
 	if len(items) == 0 || !fs.lockMountViewRead(request.mountGeneration) {
 		return nil
 	}
-	_, accepted := fs.dirCache.observeBatch(request.parentPath, items, observation)
-	mutationGeneration := fs.dirCache.mutationGeneration(request.parentPath)
-	namespaceGeneration := fs.dirCache.namespaceGeneration()
+	receipt := fs.dirCache.observeBatch(request.parentPath, items, observation, request.mutationGeneration, request.namespaceGeneration)
 	fs.mountViewMu.RUnlock()
-	if accepted && fs.statCacheVerified() {
-		fs.metadataPrefetch.rememberBatch(request, items, mutationGeneration, namespaceGeneration)
+	if len(receipt.accepted) > 0 && fs.statCacheVerified() {
+		fs.metadataPrefetch.rememberBatch(request, receipt.accepted, receipt.mutationGeneration, receipt.namespaceGeneration)
 	}
 	return nil
 }
