@@ -257,15 +257,101 @@ func TestReadWriteBackFtruncateNewerCommitSupersedesA(t *testing.T) {
 	}
 }
 
+func TestReadWriteBackFtruncateRechecksAfterLazyLoad(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		commitRecorded bool
+	}{
+		{name: "commit-recorded", commitRecorded: true},
+		{name: "put-visible-before-callback"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := []byte("Hi")
+			revision := int64(1)
+			var mu sync.Mutex
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch r.Method {
+				case http.MethodHead:
+					w.Header().Set("Content-Length", strconv.Itoa(len(remote)))
+					w.Header().Set("X-Dat9-IsDir", "false")
+					w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+				case http.MethodGet:
+					_, _ = w.Write(remote)
+				default:
+					w.WriteHeader(http.StatusMethodNotAllowed)
+				}
+			}))
+			t.Cleanup(server.Close)
+			opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack, TrustLocalEvents: true}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(server.URL), opts)
+			ino := fs.inodes.Lookup("/file.bin", false, 2, time.Now())
+			fs.inodes.UpdateRevision(ino, 1)
+			a := &FileHandle{
+				Ino: ino, Path: "/file.bin", Flags: uint32(syscall.O_RDWR),
+				WritePolicy: WritePolicyWriteBack, BaseRev: 1, OrigSize: 2,
+				Dirty: fs.newWriteBuffer("/file.bin", 1024, 2),
+			}
+			a.Dirty.totalSize = 2
+			a.Dirty.remoteSize = 2
+			aID := fs.allocateFileHandle(a)
+			cID := addFtruncateTestHandle(t, fs, ino, "/file.bin", nil)
+			reviewFtruncate(t, fs, ino, aID, 4)
+			loads := 0
+			a.Dirty.LoadPart = func(partNum int) ([]byte, error) {
+				if partNum != 1 {
+					t.Fatalf("unexpected lazy part %d", partNum)
+				}
+				loads++
+				mu.Lock()
+				remote, revision = []byte("BYYY"), 2
+				mu.Unlock()
+				if tc.commitRecorded {
+					seq := fs.markDirtySize(ino, 4)
+					fs.recordCommittedMutation(ino, seq, 2, 4)
+				}
+				return []byte("BY"), nil
+			}
+			got, st, err := readDat9FSTestRange(fs, ino, cID, 0, 4)
+			if tc.commitRecorded {
+				if err != nil || st != gofuse.OK || string(got) != "BYYY" {
+					t.Fatalf("read after concurrent commit = %q/%v/%v, want BYYY/OK", got, st, err)
+				}
+				return
+			}
+			if err != nil || st != gofuse.Status(syscall.EAGAIN) {
+				t.Fatalf("read before commit callback = %q/%v/%v, want EAGAIN", got, st, err)
+			}
+			_, st, err = readDat9FSTestRange(fs, ino, cID, 0, 4)
+			if err != nil || st != gofuse.Status(syscall.EAGAIN) || loads != 2 {
+				t.Fatalf("retry after revision change = %v/%v, loads=%d, want EAGAIN and fresh load", st, err, loads)
+			}
+		})
+	}
+}
+
 func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 	remote := []byte("hello world")
+	var mu sync.Mutex
+	var cache *WriteBackCache
+	replaceMetaOnGet := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", strconv.Itoa(len(remote)))
 			w.Header().Set("X-Dat9-IsDir", "false")
 			w.Header().Set("X-Dat9-Revision", "1")
 		case http.MethodGet:
+			if replaceMetaOnGet {
+				replaceMetaOnGet = false
+				if _, _, err := cache.putHandleSnapshot("/file.bin", []byte("NEWER DATA!"), 11, PendingOverwrite, 2, 0o644, true, "", "", false, true, nil, 0, 0); err != nil {
+					t.Errorf("stage newer data during GET: %v", err)
+				}
+			}
 			_, _ = w.Write(remote)
 		case http.MethodPut:
 			data, err := io.ReadAll(r.Body)
@@ -288,9 +374,11 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 	fs.client.SetSmallFileThresholdForTests(1 << 20)
 	ino := fs.inodes.Lookup("/file.bin", false, int64(len(remote)), time.Now())
 	a := addFtruncateTestHandle(t, fs, ino, "/file.bin", remote)
+	c := addFtruncateTestHandle(t, fs, ino, "/file.bin", nil)
 	reviewFtruncate(t, fs, ino, a, 5)
 	newerSeq := fs.markDirtySize(ino, int64(len(remote)))
-	cache, err := NewWriteBackCache(t.TempDir())
+	var err error
+	cache, err = NewWriteBackCache(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,5 +395,20 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 	}
 	if got := fs.ftruncateCommittedSeq(ino); got != newerSeq || successCalled {
 		t.Fatalf("data-commit watermark = %d, OnSuccess = %t, want %d/false", got, successCalled, newerSeq)
+	}
+	meta, ok := cache.GetMeta("/file.bin")
+	if !ok || meta.Kind != PendingChmod {
+		t.Fatalf("cached meta = %+v/%t, want PendingChmod", meta, ok)
+	}
+	got, st, err := readDat9FSTestRange(fs, ino, c, 0, len(remote))
+	if err != nil || st != gofuse.OK || string(got) != "HELLO WORLD" {
+		t.Fatalf("read after data commit/chmod failure = %q/%v/%v, want HELLO WORLD/OK", got, st, err)
+	}
+	mu.Lock()
+	replaceMetaOnGet = true
+	mu.Unlock()
+	_, st, err = readDat9FSTestRange(fs, ino, c, 0, len(remote))
+	if err != nil || st != gofuse.Status(syscall.EAGAIN) {
+		t.Fatalf("read with a newer staged generation = %v/%v, want EAGAIN", st, err)
 	}
 }
