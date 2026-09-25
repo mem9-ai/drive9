@@ -35,6 +35,8 @@ GIT_OPS_REFRESH_BUDGET_PER_SEC="${GIT_OPS_REFRESH_BUDGET_PER_SEC:-6}"
 GIT_OPS_FORCED_REFRESH_BUDGET_BASE="${GIT_OPS_FORCED_REFRESH_BUDGET_BASE:-10}"
 GIT_OPS_FORCED_REFRESH_BUDGET_PER_SEC="${GIT_OPS_FORCED_REFRESH_BUDGET_PER_SEC:-3}"
 GIT_OPS_STATUS_SETTLE_TIMEOUT_S="${GIT_OPS_STATUS_SETTLE_TIMEOUT_S:-60}"
+GIT_OPS_DIR_PREFETCH_GUARD="${GIT_OPS_DIR_PREFETCH_GUARD:-1}"
+GIT_OPS_DIR_PREFETCH_IDLE_S="${GIT_OPS_DIR_PREFETCH_IDLE_S:-11}"
 
 export GIT_ALLOW_PROTOCOL="${GIT_ALLOW_PROTOCOL:-file:https:http:ssh}"
 
@@ -507,6 +509,26 @@ PY
   fi
 }
 
+check_directory_prefetch_metrics() {
+  local desc="$1"
+  local log_file="$2"
+  if [ "$GIT_OPS_DIR_PREFETCH_GUARD" != "1" ]; then
+    return 0
+  fi
+  TOTAL=$((TOTAL + 1))
+  local metrics
+  metrics=$(sed -n 's/.*directory_prefetch issued=\([0-9][0-9]*\).*max_concurrent=\([0-9][0-9]*\).*/\1 \2/p' "$log_file" | tail -n 1)
+  local issued max_concurrent
+  read -r issued max_concurrent <<<"$metrics"
+  if [ -n "${issued:-}" ] && [ "$issued" -gt 0 ] && [ -n "${max_concurrent:-}" ] && [ "$max_concurrent" -le 4 ]; then
+    echo "PASS $desc (issued=$issued max_concurrent=$max_concurrent)"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL $desc (issued=${issued:-missing} max_concurrent=${max_concurrent:-missing})" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 configure_git_identity() {
   local repo="$1"
   git_cmd -C "$repo" config user.email "drive9-e2e@example.test" || return
@@ -526,6 +548,17 @@ assert_clean_status() {
   local out
   out="$(git_cmd -C "$repo" status --porcelain=v1 --untracked-files=all)" || return
   [ -z "$out" ]
+}
+
+exercise_directory_prefetch() {
+  local repo="$1"
+  wait_repo_ops_ready "$repo" || return
+  sleep "$GIT_OPS_DIR_PREFETCH_IDLE_S"
+  assert_clean_status "$repo" || return
+  assert_clean_status "$repo" || return
+  local file_count
+  file_count=$(find "$repo/tree/dir00" -maxdepth 1 -type f | wc -l | tr -d '[:space:]') || return
+  [ "$file_count" = "16" ]
 }
 
 assert_fixture_reads() {
@@ -741,12 +774,18 @@ run_case() {
 
   check_cmd "$slug first mount starts" start_mount "$profile" "$mount_a" "$local_root_a" "$log_a" "$remote_root" 1
   check_cmd "$slug clone" clone_repo "$mode" "$repo_a"
+  if [ "$GIT_OPS_DIR_PREFETCH_GUARD" = "1" ] && [ "$profile" = "coding-agent" ] && [ "$mode" = "native" ]; then
+    check_cmd "$slug directory prefetch preserves expired-cache git and ls correctness" exercise_directory_prefetch "$repo_a"
+  fi
   check_cmd "$slug git operations before remount" exercise_git_operations "$repo_a" "$marker" "$state_dir"
   check_cmd "$slug first mount log audit" audit_mount_log "$log_a"
 
   if [ "$use_native_pack" = "1" ]; then
     stop_mount 1 "$native_pack_archive" "repo/.git"
     check_workspace_refresh_budget "$slug first mount workspace refresh within budget" "$log_a"
+    if [ "$GIT_OPS_DIR_PREFETCH_GUARD" = "1" ] && [ "$profile" = "coding-agent" ]; then
+      check_directory_prefetch_metrics "$slug first mount directory prefetch is active and bounded" "$log_a"
+    fi
     check_cmd "$slug second mount starts" start_mount "$profile" "$mount_b" "$local_root_b" "$log_b" "$remote_root" 1 "$native_pack_archive"
   else
     stop_mount 1

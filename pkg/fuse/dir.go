@@ -227,6 +227,15 @@ type listingInstallReceipt struct {
 	installed           bool
 }
 
+type directoryPrefetchSnapshot struct {
+	parentPath          string
+	targetPath          string
+	name                string
+	resourceID          string
+	mutationGeneration  uint64
+	namespaceGeneration uint64
+}
+
 // NewDirCache creates a new DirCache with the given TTL.
 // If ttl <= 0, defaultDirCacheTTL is used.
 func NewDirCache(ttl time.Duration) *DirCache {
@@ -281,6 +290,86 @@ func (dc *DirCache) Get(dirPath string) ([]CachedFileInfo, bool) {
 		}
 	}
 	return items, true
+}
+
+func (dc *DirCache) directoryPrefetchSnapshot(dirPath string) (directoryPrefetchSnapshot, bool) {
+	if dc == nil || dirPath == "" || dirPath == "/" {
+		return directoryPrefetchSnapshot{}, false
+	}
+	parentPath, name := cacheParentName(dirPath)
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.directoryPrefetchSnapshotLocked(parentPath, dirPath, name, dc.now())
+}
+
+func (dc *DirCache) directoryPrefetchCandidates(currentPath string, limit int) []directoryPrefetchSnapshot {
+	if dc == nil || currentPath == "" || currentPath == "/" || limit <= 0 {
+		return nil
+	}
+	parentPath, currentName := cacheParentName(currentPath)
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	now := dc.now()
+	parent, ok := dc.getEntryLocked(parentPath, now)
+	if !ok || !parent.completeValid(now) {
+		return nil
+	}
+	currentIndex := -1
+	for i, name := range parent.order {
+		if name == currentName {
+			if item, exists := parent.items[name]; exists && item.IsDir {
+				currentIndex = i
+			}
+			break
+		}
+	}
+	if currentIndex < 0 {
+		return nil
+	}
+
+	candidates := make([]directoryPrefetchSnapshot, 0, limit)
+	for _, name := range parent.order[currentIndex+1:] {
+		if len(candidates) >= limit {
+			break
+		}
+		item, exists := parent.items[name]
+		if !exists || !item.IsDir || item.ResourceID == "" {
+			continue
+		}
+		targetPath := dirEntryChildPath(parentPath, name)
+		if target, exists := dc.getEntryLocked(targetPath, now); exists && target.completeValid(now) {
+			continue
+		}
+		candidates = append(candidates, directoryPrefetchSnapshot{
+			parentPath:          parentPath,
+			targetPath:          targetPath,
+			name:                name,
+			resourceID:          item.ResourceID,
+			mutationGeneration:  dc.mutationGenerationLocked(targetPath),
+			namespaceGeneration: dc.namespaceGen,
+		})
+	}
+	return candidates
+}
+
+func (dc *DirCache) directoryPrefetchSnapshotLocked(parentPath, targetPath, name string, now time.Time) (directoryPrefetchSnapshot, bool) {
+	parent, ok := dc.getEntryLocked(parentPath, now)
+	if !ok || !parent.completeValid(now) {
+		return directoryPrefetchSnapshot{}, false
+	}
+	item, ok := parent.items[name]
+	if !ok || !item.IsDir || item.ResourceID == "" {
+		return directoryPrefetchSnapshot{}, false
+	}
+	return directoryPrefetchSnapshot{
+		parentPath:          parentPath,
+		targetPath:          targetPath,
+		name:                name,
+		resourceID:          item.ResourceID,
+		mutationGeneration:  dc.mutationGenerationLocked(targetPath),
+		namespaceGeneration: dc.namespaceGen,
+	}, true
 }
 
 // Put stores directory entries in the cache with an expiration of now + ttl.
@@ -341,6 +430,36 @@ func (dc *DirCache) putListing(dirPath string, items []CachedFileInfo, request R
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
+	return dc.putListingLocked(dirPath, items, request)
+}
+
+func (dc *DirCache) putListingIfSnapshot(items []CachedFileInfo, request RequestToken, snapshot directoryPrefetchSnapshot) ([]CachedFileInfo, listingInstallReceipt, bool) {
+	if dc == nil || snapshot.targetPath == "" {
+		return items, listingInstallReceipt{}, false
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if !dc.directoryPrefetchSnapshotCurrentLocked(snapshot, dc.now()) {
+		dc.releaseRequestLocked(request)
+		return items, listingInstallReceipt{}, false
+	}
+	view, receipt := dc.putListingLocked(snapshot.targetPath, items, request)
+	return view, receipt, receipt.installed
+}
+
+func (dc *DirCache) directoryPrefetchSnapshotCurrentLocked(snapshot directoryPrefetchSnapshot, now time.Time) bool {
+	if dc.namespaceGen != snapshot.namespaceGeneration || dc.mutationGenerationLocked(snapshot.targetPath) != snapshot.mutationGeneration {
+		return false
+	}
+	parent, ok := dc.getEntryLocked(snapshot.parentPath, now)
+	if !ok || !parent.completeValid(now) {
+		return false
+	}
+	item, ok := parent.items[snapshot.name]
+	return ok && item.IsDir && item.ResourceID == snapshot.resourceID
+}
+
+func (dc *DirCache) putListingLocked(dirPath string, items []CachedFileInfo, request RequestToken) ([]CachedFileInfo, listingInstallReceipt) {
 
 	now := dc.now()
 	// A response taken before the directory was retired describes state the

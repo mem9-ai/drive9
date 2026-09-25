@@ -274,6 +274,22 @@ type FileInfo struct {
 	ExtentIno uint64 `json:"extent_ino,omitempty"`
 }
 
+// ErrListResponseTooLarge reports that a bounded directory listing exceeded
+// the caller's response-byte limit.
+var ErrListResponseTooLarge = errors.New("list response too large")
+
+// ListOptions configures one directory listing request.
+type ListOptions struct {
+	MaxResponseBytes int64
+}
+
+// ListResult contains a directory listing and the number of response bytes
+// consumed while decoding it.
+type ListResult struct {
+	Entries       []FileInfo
+	ResponseBytes int64
+}
+
 // StatResult represents file metadata from HEAD.
 // StorageType identifies the server-side storage class of a file's content,
 // as advertised in the X-Dat9-Storage-Type stat header. It mirrors the
@@ -946,26 +962,82 @@ func (c *Client) List(path string) ([]FileInfo, error) {
 
 // ListCtx returns the entries in a directory with context support.
 func (c *Client) ListCtx(ctx context.Context, path string) ([]FileInfo, error) {
+	result, err := c.ListWithOptionsCtx(ctx, path, ListOptions{})
+	return result.Entries, err
+}
+
+// ListWithOptionsCtx returns a directory listing with optional response bounds.
+func (c *Client) ListWithOptionsCtx(ctx context.Context, path string, opts ListOptions) (ListResult, error) {
 	// Use an explicit value to avoid intermediaries dropping bare "?list".
 	req, err := c.newFSRequest(ctx, http.MethodGet, path, "?list=1", nil)
 	if err != nil {
-		return nil, err
+		return ListResult{}, err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return nil, err
+		return ListResult{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
-		return nil, readError(resp)
+		responseBytes := int64(0)
+		if opts.MaxResponseBytes > 0 {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, opts.MaxResponseBytes+1))
+			responseBytes = int64(len(body))
+			if readErr != nil {
+				return ListResult{ResponseBytes: responseBytes}, readErr
+			}
+			if int64(len(body)) > opts.MaxResponseBytes {
+				return ListResult{ResponseBytes: responseBytes}, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		return ListResult{ResponseBytes: responseBytes}, readError(resp)
 	}
 	var result struct {
 		Entries []FileInfo `json:"entries"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
+	reader := io.Reader(resp.Body)
+	var limited *io.LimitedReader
+	if opts.MaxResponseBytes > 0 {
+		limited = &io.LimitedReader{R: resp.Body, N: opts.MaxResponseBytes + 1}
+		reader = limited
 	}
-	return result.Entries, nil
+	counted := &countingReader{reader: reader}
+	decoder := json.NewDecoder(counted)
+	if err := decoder.Decode(&result); err != nil {
+		if opts.MaxResponseBytes > 0 && counted.bytes > opts.MaxResponseBytes {
+			return ListResult{ResponseBytes: counted.bytes}, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
+		}
+		return ListResult{ResponseBytes: counted.bytes}, fmt.Errorf("decode: %w", err)
+	}
+	if opts.MaxResponseBytes > 0 {
+		var extra any
+		err := decoder.Decode(&extra)
+		if counted.bytes > opts.MaxResponseBytes {
+			return ListResult{ResponseBytes: counted.bytes}, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
+		}
+		if !errors.Is(err, io.EOF) {
+			if err == nil {
+				return ListResult{ResponseBytes: counted.bytes}, fmt.Errorf("decode: unexpected trailing JSON value")
+			}
+			return ListResult{ResponseBytes: counted.bytes}, fmt.Errorf("decode: %w", err)
+		}
+		if limited != nil && limited.N == 0 {
+			return ListResult{ResponseBytes: counted.bytes}, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
+		}
+	}
+	return ListResult{Entries: result.Entries, ResponseBytes: counted.bytes}, nil
+}
+
+type countingReader struct {
+	reader io.Reader
+	bytes  int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.bytes += int64(n)
+	return n, err
 }
 
 // BatchStatCtx returns lightweight metadata for up to MaxBatchStatPaths paths.

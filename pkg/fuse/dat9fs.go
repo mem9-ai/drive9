@@ -82,6 +82,7 @@ type Dat9FS struct {
 	diskReadCache       *DiskReadCache
 	dirCache            *DirCache
 	metadataPrefetch    *siblingMetadataPrefetch
+	directoryPrefetch   *siblingDirectoryPrefetch
 	// statCacheUnverified is true while the SSE stream is not known-current.
 	// In that state, file stat cache hits embedded in DirCache must fall back
 	// to HEAD revalidation instead of serving TTL-only attrs. Even when the
@@ -488,6 +489,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		xattrs:            NewXAttrStore(),
 		deletedPaths:      make(map[string]time.Time),
 		metadataPrefetch:  newSiblingMetadataPrefetch(opts.DirTTL),
+		directoryPrefetch: newSiblingDirectoryPrefetch(),
 	}
 	return fs
 }
@@ -6904,18 +6906,24 @@ func (fs *Dat9FS) touchDirectoryChangeTime(dirPath string, t time.Time) {
 }
 
 func (fs *Dat9FS) markStatCacheUnverified() {
-	if fs != nil {
-		fs.statCacheUnverified.Store(true)
-		if fs.metadataPrefetch != nil {
-			fs.metadataPrefetch.clear()
-		}
+	if fs == nil {
+		return
 	}
+	fs.mountViewMu.Lock()
+	fs.statCacheUnverified.Store(true)
+	if fs.metadataPrefetch != nil {
+		fs.metadataPrefetch.clear()
+	}
+	fs.mountViewMu.Unlock()
 }
 
 func (fs *Dat9FS) markStatCacheVerified() {
-	if fs != nil {
-		fs.statCacheUnverified.Store(false)
+	if fs == nil {
+		return
 	}
+	fs.mountViewMu.Lock()
+	fs.statCacheUnverified.Store(false)
+	fs.mountViewMu.Unlock()
 }
 
 func (fs *Dat9FS) statCacheVerified() bool {
@@ -7714,6 +7722,12 @@ func (fs *Dat9FS) Init(server *gofuse.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), inlineThresholdWarmTimeout)
 	defer cancel()
 	fs.warmInlineThreshold(ctx)
+}
+
+func (fs *Dat9FS) OnUnmount() {
+	if fs != nil && fs.directoryPrefetch != nil {
+		fs.directoryPrefetch.shutdown()
+	}
 }
 
 // inlineThresholdWarmTimeout caps the synchronous status fetch on Init.
@@ -11887,13 +11901,16 @@ func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle, refre
 	}
 
 	dh.mu.Lock()
-	defer dh.mu.Unlock()
 	if fs.mountViewGeneration.Load() != generation {
+		dh.mu.Unlock()
 		return nil, 0, syscall.EAGAIN
 	}
 	dh.Entries = cloneLoadedDirEntries(entries)
 	dh.entriesGeneration = generation
-	return cloneLoadedDirEntries(entries), generation, nil
+	loaded := cloneLoadedDirEntries(entries)
+	dh.mu.Unlock()
+	fs.maybePrefetchSiblingDirectories(dh.Path)
+	return loaded, generation, nil
 }
 
 func cloneLoadedDirEntries(entries []DirEntry) []DirEntry {
@@ -12239,32 +12256,10 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	}
 
 	generation := fs.mountViewGeneration.Load()
-	listStart := fs.perfStart()
-	// Capture the fencing value before the request: a local mutation landing
-	// during its RTT makes the response unable to speak for the names it
-	// touches.
-	request := fs.dirCache.BeginRequest(dirPath)
-	defer fs.dirCache.EndRequest(request)
-	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
-	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
+	cached, err := fs.loadForegroundRemoteDirectory(ctx, dirPath, generation)
 	if err != nil {
-		return nil, fs.resetMountViewOnAuthorizationError(err)
-	}
-
-	// Store in dir cache
-	cached := cachedFileInfos(items)
-	if err := fs.applyBatchStats(ctx, dirPath, cached); err != nil {
 		return nil, err
 	}
-	if !fs.lockMountViewRead(generation) {
-		return nil, syscall.EAGAIN
-	}
-	// Build the reply from the merged view: a child whose commit settled during
-	// this LIST's RTT is absent from the response, and the pending overlay
-	// cannot restore it (its commit already removed the pending entry), so
-	// serving the raw response would hide it from this readdir.
-	cached = fs.putDirectoryListing(dirPath, cached, request)
-	fs.mountViewMu.RUnlock()
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached, generation)
 
 	entries := fs.cachedToDirEntries(dirPath, cached)
@@ -17257,6 +17252,9 @@ func (fs *Dat9FS) drainLatePendingEntries() {
 }
 
 func (fs *Dat9FS) FlushAll() {
+	if fs.directoryPrefetch != nil {
+		fs.directoryPrefetch.shutdown()
+	}
 	fs.stopExtentRuntimeLoop()
 	if v := fs.extentVFS(); v != nil {
 		_ = v.FlushAll("")
