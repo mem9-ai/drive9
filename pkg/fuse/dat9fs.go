@@ -5384,6 +5384,48 @@ func (fs *Dat9FS) readSamePathDirtyHandleVisibleRange(path string, skip *FileHan
 	return nil, 0, false, gofuse.OK, ""
 }
 
+func (fs *Dat9FS) hasDirtyAppend(path string, ino uint64, skip *FileHandle) bool {
+	// The latest inode marker can be cleared while an older append remains
+	// dirty on an open handle.
+	for _, src := range fs.openHandles.SnapshotPath(path) {
+		if src == nil || src == skip || src.Ino != ino || src.Flags&uint32(syscall.O_APPEND) == 0 {
+			continue
+		}
+		if !src.TryLock() {
+			return true
+		}
+		active := src.Dirty != nil && src.DirtySeq > 0 && !src.Unlinked
+		src.Unlock()
+		if active {
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *Dat9FS) readActiveAppendVisibleRange(ctx context.Context, path string, ino uint64, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, string) {
+	if reqSize == 0 || !fs.hasDirtyAppend(path, ino, skip) {
+		return nil, 0, false, gofuse.OK, ""
+	}
+	deadline := time.Now().Add(fs.remoteReadTimeout)
+	for {
+		if data, n, ok, st, source := fs.readSamePathDirtyHandleVisibleRange(path, skip, offset, reqSize); ok || st != gofuse.OK {
+			return data, n, ok, st, source
+		}
+		if !fs.hasDirtyAppend(path, ino, skip) {
+			return nil, 0, false, gofuse.OK, ""
+		}
+		if time.Now().After(deadline) {
+			return nil, 0, false, gofuse.EIO, "same-path-dirty-timeout"
+		}
+		select {
+		case <-ctx.Done():
+			return nil, 0, false, httpToFuseStatus(ctx.Err()), "same-path-dirty-canceled"
+		case <-time.After(samePathDirtyWaitInterval):
+		}
+	}
+}
+
 func (fs *Dat9FS) readSQLitePersistentJournalCommittedCache(path string, fallbackRevision int64, offset int64, reqSize uint32) ([]byte, int, bool) {
 	if fs == nil || fs.readCache == nil || !isSQLitePersistentJournalPath(path) || reqSize == 0 || offset < 0 {
 		return nil, 0, false
@@ -13227,6 +13269,28 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		return gofuse.ReadResultData(result), gofuse.OK
 	}
 	fs.refreshCleanCommittedRevisionForHandleLocked(fh)
+	if fh.Dirty != nil && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() && !fh.Unlinked &&
+		fh.WritePolicy == WritePolicyWriteBack && input.Size > 0 &&
+		!isSQLitePersistentJournalPath(fh.Path) && !isSQLiteVisibleSamePathDirtyPath(fh.Path) &&
+		fs.hasDirtyAppend(fh.Path, fh.Ino, fh) {
+		path, ino := fh.Path, fh.Ino
+		fh.Unlock()
+		data, n, ok, st, src := fs.readActiveAppendVisibleRange(ctx, path, ino, fh, int64(input.Offset), input.Size)
+		fh.Lock()
+		// A write or unlink on this reader may have completed while it was
+		// unlocked. Its own state takes precedence over a sibling snapshot.
+		if (ok || st != gofuse.OK) && fh.Path == path && fh.Ino == ino && !fh.Unlinked &&
+			fh.Dirty != nil && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
+			fh.Unlock()
+			source = src
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
+		fs.refreshCleanCommittedRevisionForHandleLocked(fh)
+	}
 
 	if fh.ShadowSpill && fs.shadowStore != nil && fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.Dirty.Size() == 0 && !fh.Dirty.hasDirtyPartMarks() && !fh.ZeroBase && fh.Flags&syscall.O_TRUNC == 0 {
 		handlePath := fh.Path
@@ -13543,63 +13607,30 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	if fh.Dirty == nil && !isSQLitePersistentJournalPath(fh.Path) {
-		hasDirtyAppend := func() bool {
-			// The latest inode marker can be cleared while an older append
-			// remains dirty on an open handle.
-			for _, src := range fs.openHandles.SnapshotPath(fh.Path) {
-				if src == nil || src == fh || src.Ino != fh.Ino || src.Flags&uint32(syscall.O_APPEND) == 0 {
-					continue
-				}
-				if !src.TryLock() {
-					return true
-				}
-				active := src.Dirty != nil && src.DirtySeq > 0 && !src.Unlinked
-				src.Unlock()
-				if active {
-					return true
-				}
-			}
-			return false
-		}
-		appendDirty := fh.WritePolicy == WritePolicyWriteBack && input.Size > 0 &&
-			!isSQLiteVisibleSamePathDirtyPath(fh.Path) && hasDirtyAppend()
-		if fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync || appendDirty {
+		var data []byte
+		var n int
+		var ok bool
+		st := gofuse.OK
+		src := ""
+		switch {
+		case fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync:
 			// A close-sync/write-sync writer can still be in userspace Release
-			// after close(2) returns to the caller. An O_APPEND writeback
-			// writer can acknowledge Write before Flush stages its bytes.
-			appendDeadline := time.Now().Add(fs.remoteReadTimeout)
-			for {
-				if data, n, ok, st, src := fs.readSamePathDirtyHandleVisibleRange(fh.Path, fh, int64(input.Offset), input.Size); ok || st != gofuse.OK {
-					source = src
-					bytesRead = n
-					if st != gofuse.OK {
-						return nil, st
-					}
-					return gofuse.ReadResultData(data), gofuse.OK
-				}
-				if !appendDirty || !hasDirtyAppend() {
-					break
-				}
-				if time.Now().After(appendDeadline) {
-					source = "same-path-dirty-timeout"
-					return nil, gofuse.EIO
-				}
-				select {
-				case <-ctx.Done():
-					source = "same-path-dirty-canceled"
-					return nil, httpToFuseStatus(ctx.Err())
-				case <-time.After(samePathDirtyWaitInterval):
-				}
+			// after close(2) returns to the caller.
+			data, n, ok, st, src = fs.readSamePathDirtyHandleVisibleRange(fh.Path, fh, int64(input.Offset), input.Size)
+		case fh.WritePolicy == WritePolicyWriteBack && !isSQLiteVisibleSamePathDirtyPath(fh.Path):
+			// An O_APPEND writer can acknowledge Write before Flush stages its bytes.
+			data, n, ok, st, src = fs.readActiveAppendVisibleRange(ctx, fh.Path, fh.Ino, fh, int64(input.Offset), input.Size)
+		case isSQLiteVisibleSamePathDirtyPath(fh.Path):
+			data, n, ok, st = fs.readSamePathDirtyHandle(fh.Path, fh, int64(input.Offset), input.Size)
+			src = "same-path-dirty"
+		}
+		if ok || st != gofuse.OK {
+			source = src
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
 			}
-		} else if isSQLiteVisibleSamePathDirtyPath(fh.Path) {
-			if data, n, ok, st := fs.readSamePathDirtyHandle(fh.Path, fh, int64(input.Offset), input.Size); ok || st != gofuse.OK {
-				source = "same-path-dirty"
-				bytesRead = n
-				if st != gofuse.OK {
-					return nil, st
-				}
-				return gofuse.ReadResultData(data), gofuse.OK
-			}
+			return gofuse.ReadResultData(data), gofuse.OK
 		}
 	}
 
