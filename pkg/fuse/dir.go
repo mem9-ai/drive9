@@ -66,8 +66,10 @@ const (
 )
 
 type namespaceLookupResult struct {
-	kind namespaceLookupKind
-	item CachedFileInfo
+	kind                namespaceLookupKind
+	item                CachedFileInfo
+	dirGeneration       uint64
+	namespaceGeneration uint64
 }
 
 // dirCacheEntry is one directory's cached namespace.
@@ -164,6 +166,11 @@ type DirCache struct {
 	// that can invalidate an in-flight read, so a generation a token holds can
 	// never recur.
 	gen uint64
+	// namespaceGen advances only when an authoritative namespace mutation or
+	// invalidation occurs. Unlike gen, ordinary reads and listing installs do
+	// not advance it, so callers can retain bounded directory-shape evidence
+	// across cache expiry without retaining one generation per directory.
+	namespaceGen uint64
 	// inFlight counts uncompleted remote reads per directory. It is the
 	// lifetime of every piece of reconciliation state below: a per-name stamp or
 	// a retirement watermark only matters to a request that was already issued
@@ -194,6 +201,15 @@ type DirCache struct {
 // double-counting.
 type requestRef struct {
 	released bool
+}
+
+type listingInstallReceipt struct {
+	accepted            []CachedFileInfo
+	childCount          int
+	dirGeneration       uint64
+	namespaceGeneration uint64
+	complete            bool
+	installed           bool
 }
 
 // NewDirCache creates a new DirCache with the given TTL.
@@ -298,8 +314,13 @@ func (dc *DirCache) Put(dirPath string, items []CachedFileInfo) {
 //     response item does not overwrite it (nor contribute to the view).
 //   - A name this mount removed after requestGen stays removed.
 func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request RequestToken) []CachedFileInfo {
+	out, _ := dc.putListing(dirPath, items, request)
+	return out
+}
+
+func (dc *DirCache) putListing(dirPath string, items []CachedFileInfo, request RequestToken) ([]CachedFileInfo, listingInstallReceipt) {
 	if dc == nil || dirPath == "" {
-		return items
+		return items, listingInstallReceipt{}
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
@@ -313,7 +334,7 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 		// The request is settled (its response is served) even though nothing is
 		// installed, so it releases like any other completion.
 		dc.releaseRequestLocked(request)
-		return items
+		return items, listingInstallReceipt{}
 	}
 	if old, ok := dc.entries[dirPath]; ok && old != nil {
 		old.prune(now)
@@ -364,6 +385,7 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 		prior[name] = item
 	}
 	served := make(map[string]CachedFileInfo, len(items)+len(prior))
+	acceptedNames := make(map[string]struct{}, len(items))
 	complete := len(items) <= dc.maxEntries
 	for i := 0; i < len(items); i++ {
 		// The response is this name's evidence, so its deadline is the
@@ -403,6 +425,7 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 				// holds the whole listing.
 				complete = false
 			}
+			acceptedNames[item.Name] = struct{}{}
 		}
 		served[item.Name] = item
 	}
@@ -447,6 +470,24 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 		}
 	}
 	entry.gen = dc.nextGenerationLocked()
+	receipt := listingInstallReceipt{}
+	if !staleInstall {
+		receipt = listingInstallReceipt{
+			childCount:          len(entry.items),
+			dirGeneration:       entry.gen,
+			namespaceGeneration: dc.namespaceGen,
+			complete:            entry.complete,
+			installed:           true,
+		}
+		for _, name := range entry.order {
+			if _, accepted := acceptedNames[name]; !accepted {
+				continue
+			}
+			if item, ok := entry.items[name]; ok {
+				receipt.accepted = append(receipt.accepted, item)
+			}
+		}
+	}
 	// Releasing here is what retires this request's stamps once it was the last
 	// one outstanding.
 	dc.releaseRequestLocked(request)
@@ -472,7 +513,7 @@ func (dc *DirCache) PutListing(dirPath string, items []CachedFileInfo, request R
 			out = append(out, served[name])
 		}
 	}
-	return out
+	return out, receipt
 }
 
 // Lookup returns the namespace-cache state for parent/name.
@@ -482,28 +523,48 @@ func (dc *DirCache) Lookup(parentPath, name string) namespaceLookupResult {
 
 	now := dc.now()
 	entry, ok := dc.getEntryLocked(parentPath, now)
+	result := namespaceLookupResult{
+		dirGeneration:       dc.generationLocked(parentPath),
+		namespaceGeneration: dc.namespaceGen,
+	}
 	if !ok {
-		return namespaceLookupResult{}
+		return result
 	}
 	// A name still in items is within its own deadline: getEntryLocked pruned
 	// the entry, and prune drops exactly the names whose evidence ran out. That
 	// is the one place the rule lives, so this cannot drift from it.
 	if item, ok := entry.items[name]; ok {
-		return namespaceLookupResult{kind: namespaceLookupPositive, item: item}
+		result.kind = namespaceLookupPositive
+		result.item = item
+		return result
 	}
 	if entry.negativeValid(name, now) {
-		return namespaceLookupResult{kind: namespaceLookupNegative}
+		result.kind = namespaceLookupNegative
+		return result
 	}
 	if entry.sessionValid(now) {
-		return namespaceLookupResult{kind: namespaceLookupSessionMiss}
+		result.kind = namespaceLookupSessionMiss
+		return result
 	}
 	if entry.completeValid(now) {
-		return namespaceLookupResult{kind: namespaceLookupCompleteMiss}
+		result.kind = namespaceLookupCompleteMiss
+		return result
 	}
 	if entry.hasState() {
-		return namespaceLookupResult{kind: namespaceLookupPartialMiss}
+		result.kind = namespaceLookupPartialMiss
+		return result
 	}
-	return namespaceLookupResult{}
+	return result
+}
+
+func (dc *DirCache) lookupSnapshotCurrent(parentPath string, result namespaceLookupResult) bool {
+	if dc == nil {
+		return false
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.generationLocked(parentPath) == result.dirGeneration &&
+		dc.namespaceGen == result.namespaceGeneration
 }
 
 // ObservationToken marks the cache state at the moment a remote read is
@@ -741,6 +802,15 @@ func (dc *DirCache) generation(dirPath string) uint64 {
 	return dc.generationLocked(dirPath)
 }
 
+func (dc *DirCache) namespaceGeneration() uint64 {
+	if dc == nil {
+		return 0
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.namespaceGen
+}
+
 // Upsert records or refreshes a known child entry for a parent.
 //
 // This is the authoritative entry point: it means *this mount* established the
@@ -771,6 +841,7 @@ func (dc *DirCache) upsertInternal(parentPath string, item CachedFileInfo) {
 	item.freshUntil = time.Time{}
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
+	dc.namespaceGen++
 	dc.noteLocalLocked(entry, parentPath, item.Name)
 }
 
@@ -786,6 +857,7 @@ func (dc *DirCache) Remove(parentPath, name string) {
 
 	entry := dc.ensureEntryLocked(parentPath)
 	entry.remove(name)
+	dc.namespaceGen++
 	dc.noteLocalLocked(entry, parentPath, name)
 	if !entry.hasState() {
 		delete(dc.entries, parentPath)
@@ -859,6 +931,7 @@ func (dc *DirCache) MarkSessionCreatedDir(dirPath string) {
 	entry.completeExpires = now.Add(dc.ttl)
 	entry.sessionExpires = now.Add(dc.ttl)
 	entry.negatives = make(map[string]time.Time)
+	dc.namespaceGen++
 }
 
 // RecordRemoteNegative notes that a remote stat for a child of dirPath
@@ -927,6 +1000,7 @@ func (dc *DirCache) CanAnswerMisses(dirPath string) bool {
 func (dc *DirCache) InvalidatePrefix(dirPath string) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
+	dc.namespaceGen++
 
 	if dirPath == "/" {
 		// Retire every entry rather than replacing the map: entries with
@@ -951,6 +1025,7 @@ func (dc *DirCache) Invalidate(dirPath string) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
+	dc.namespaceGen++
 	dc.invalidateEntryLocked(dirPath)
 }
 
@@ -958,6 +1033,7 @@ func (dc *DirCache) Invalidate(dirPath string) {
 func (dc *DirCache) InvalidateAll() {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
+	dc.namespaceGen++
 
 	// Retire each entry rather than replacing the map: entries with listings
 	// still in flight have to keep their reconciliation state.

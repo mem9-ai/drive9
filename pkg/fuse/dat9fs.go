@@ -487,9 +487,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		remoteReadTimeout: fuseTimeout,
 		xattrs:            NewXAttrStore(),
 		deletedPaths:      make(map[string]time.Time),
-	}
-	if opts.Profile == MountProfileCodingAgent {
-		fs.metadataPrefetch = newSiblingMetadataPrefetch(opts.DirTTL)
+		metadataPrefetch:  newSiblingMetadataPrefetch(opts.DirTTL),
 	}
 	return fs
 }
@@ -6682,7 +6680,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 		// settled during this LIST's RTT is absent from the response and,
 		// being already committed, is gone from the pending overlay too, so
 		// nothing later in this request could restore it.
-		items = reconciledFileInfos(fs.dirCache.PutListing(parentPath, cachedFileInfos(items), request))
+		items = reconciledFileInfos(fs.putDirectoryListing(parentPath, cachedFileInfos(items), request))
 		fs.mountViewMu.RUnlock()
 		return items, generation, nil
 	}
@@ -6717,7 +6715,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 				if !fs.lockMountViewRead(generation) {
 					return nil, 0, syscall.EAGAIN, true
 				}
-				view := reconciledFileInfos(fs.dirCache.PutListing(parentPath, cachedFileInfos(listItems), request))
+				view := reconciledFileInfos(fs.putDirectoryListing(parentPath, cachedFileInfos(listItems), request))
 				fs.mountViewMu.RUnlock()
 				return view, generation, nil, true
 			}
@@ -7263,7 +7261,7 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 		return false, 0, syscall.EAGAIN
 	}
 	if fs.dirCache != nil {
-		fs.dirCache.PutListing(dirPath, cachedFileInfos(liveItems), request)
+		fs.putDirectoryListing(dirPath, cachedFileInfos(liveItems), request)
 	}
 	// Emptiness is decided from the response, not from the merged cache view.
 	// The merged view is for serving readdir: it never removes a name, so a
@@ -7616,8 +7614,18 @@ func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
 	if fs == nil || fs.dirCache == nil || entry == nil || entry.Path == "/" || entry.IsDir || isLockFilePath(entry.Path) {
 		return nil, false
 	}
+	mountGeneration := fs.mountViewGeneration.Load()
+	if !fs.lockMountViewRead(mountGeneration) {
+		return nil, false
+	}
+	defer fs.mountViewMu.RUnlock()
+
 	parentPath, name := cacheParentName(entry.Path)
 	result := fs.dirCache.Lookup(parentPath, name)
+	return fs.cachedAttrEntryFromLookup(entry, parentPath, result, mountGeneration)
+}
+
+func (fs *Dat9FS) cachedAttrEntryFromLookup(entry *InodeEntry, parentPath string, result namespaceLookupResult, mountGeneration uint64) (*InodeEntry, bool) {
 	if result.kind != namespaceLookupPositive {
 		return nil, false
 	}
@@ -7625,9 +7633,9 @@ func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
 	if !trusted {
 		trusted = fs.statCacheVerified() && fs.metadataPrefetch != nil &&
 			!fs.hasPendingLocalState(entry.Path) && !fs.hasQueuedCommit(entry.Path) &&
-			fs.metadataPrefetch.valid(parentPath, entry.Path, fs.mountViewGeneration.Load(), fs.dirCache.generation(parentPath))
+			fs.metadataPrefetch.valid(parentPath, entry.Path, mountGeneration, result.dirGeneration, result.namespaceGeneration)
 	}
-	if !trusted {
+	if !trusted || fs.mountViewGeneration.Load() != mountGeneration || !fs.dirCache.lookupSnapshotCurrent(parentPath, result) {
 		return nil, false
 	}
 	return fs.cachedAttrEntryFromItem(entry, result.item)
@@ -7638,6 +7646,9 @@ func (fs *Dat9FS) cachedAttrEntryFromItem(entry *InodeEntry, item CachedFileInfo
 		return nil, false
 	}
 	if item.IsDir != entry.IsDir {
+		return nil, false
+	}
+	if item.ResourceID != "" && fs.inodes.ReplacesIdentity(entry.Ino, item.ResourceID, item.IsDir) {
 		return nil, false
 	}
 	if item.Revision <= 0 && !item.IsDir {
@@ -7661,6 +7672,15 @@ func (fs *Dat9FS) cachedAttrEntryFromItem(entry *InodeEntry, item CachedFileInfo
 	cached.Size = item.Size
 	cached.IsDir = item.IsDir
 	cached.Mtime = mtime
+	if item.ResourceID != "" || item.Nlink > 0 {
+		fs.inodes.SetIdentityWithKind(entry.Ino, item.ResourceID, item.Nlink, item.IsDir)
+		if item.ResourceID != "" {
+			cached.ResourceID = item.ResourceID
+		}
+		if item.Nlink > 0 {
+			cached.Nlink = item.Nlink
+		}
+	}
 	if item.HasUID || item.HasGID {
 		cached.Uid = item.Uid
 		cached.Gid = item.Gid
@@ -7948,6 +7968,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	defer fs.dirCache.EndRequest(observation)
 	stat, statGeneration, err := fs.lookupStatWithRetry(cancel, childP)
 	if err != nil {
+		if fs.metadataPrefetch != nil {
+			fs.metadataPrefetch.discardMiss(childP)
+		}
 		statNotFound := isNotFoundErr(err)
 		if isForbiddenErr(err) || (statNotFound && fs.opts.LegacyDirStatFallback) {
 			// Compatibility path for list-only scopes and private legacy servers
@@ -12240,7 +12263,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	// this LIST's RTT is absent from the response, and the pending overlay
 	// cannot restore it (its commit already removed the pending entry), so
 	// serving the raw response would hide it from this readdir.
-	cached = fs.dirCache.PutListing(dirPath, cached, request)
+	cached = fs.putDirectoryListing(dirPath, cached, request)
 	fs.mountViewMu.RUnlock()
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached, generation)
 
