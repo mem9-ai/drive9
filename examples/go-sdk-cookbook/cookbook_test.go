@@ -83,6 +83,8 @@ func ExampleClient_filesystemCRUDAndMetadata() {
 
 	_, _ = c.List("/workspace/")
 	_, _ = c.ListCtx(ctx, "/workspace/")
+	listResult, _ := c.ListWithOptionsCtx(ctx, "/workspace/", drive9.ListOptions{MaxResponseBytes: 1 << 20})
+	_ = listResult.ResponseBytes
 	_, _ = c.BatchStatCtx(ctx, []string{"/workspace/a.txt", "/workspace/b.txt"})
 	_, _ = c.BatchReadSmallCtx(ctx, []string{"/workspace/a.txt"}, 1<<20)
 
@@ -759,6 +761,7 @@ var coveredClientMethods = map[string]bool{
 	"IssueVaultToken":                      true,
 	"List":                                 true,
 	"ListCtx":                              true,
+	"ListWithOptionsCtx":                   true,
 	"ListFSLayerChain":                     true,
 	"ListFSLayerEvents":                    true,
 	"ListFSLayers":                         true,
