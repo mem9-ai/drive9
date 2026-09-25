@@ -324,6 +324,23 @@ func TestRenderDrive9VisualHelpDocumentsLLMZeroAndOmissionSemantics(t *testing.T
 	}
 }
 
+// The --legacy-interruptible-mutations contract covers synchronous data
+// commits (write/flush/fsync/release) in addition to namespace mutations;
+// the rendered help must say so, and must not regress to the stale
+// mutations-only wording.
+func TestRenderDrive9VisualHelpDocumentsInterruptibleCommitScope(t *testing.T) {
+	out := renderDrive9VisualHelp(false)
+	if !strings.Contains(out, "--legacy-interruptible-mutations") {
+		t.Fatalf("rendered help missing --legacy-interruptible-mutations:\n%s", out)
+	}
+	if !strings.Contains(out, "synchronous write/flush/fsync/release data commits") {
+		t.Fatalf("rendered help must document that interruptible mode covers synchronous data commits:\n%s", out)
+	}
+	if strings.Contains(out, "namespace-mutation commits") {
+		t.Fatalf("rendered help still uses the stale mutations-only wording:\n%s", out)
+	}
+}
+
 func TestIsPagerClosedPipe(t *testing.T) {
 	for _, err := range []error{
 		io.ErrClosedPipe,

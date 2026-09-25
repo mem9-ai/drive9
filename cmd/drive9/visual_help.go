@@ -731,7 +731,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "--foreground", Desc: "run in foreground and block until unmounted"},
 					{Name: "--direct-mount-strict", Desc: "Linux only; use mount(2) without fallback to fusermount"},
 					{Name: "--gvisor-compat", Desc: "enable gVisor-specific FUSE compatibility behavior; env DRIVE9_MOUNT_GVISOR_COMPAT"},
-					{Name: "--legacy-interruptible-mutations", Desc: "let FUSE interrupts cancel in-flight remote namespace-mutation commits (legacy EAGAIN behavior); no effect with --gvisor-compat; env DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS"},
+					{Name: "--legacy-interruptible-mutations", Desc: "let FUSE interrupts cancel in-flight remote commits: namespace mutations AND synchronous write/flush/fsync/release data commits (legacy EAGAIN behavior); no effect with --gvisor-compat; env DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS"},
 				}},
 				{Title: "Supervision", Flags: []visualHelpFlag{
 					{Name: "--supervise-foreground", Desc: "run this process as the supervisor and block until stop"},

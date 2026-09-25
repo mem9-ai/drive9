@@ -3588,3 +3588,24 @@ func TestRunUmountSkipsUnmountWhenKernelTableClean(t *testing.T) {
 		t.Fatalf("fusermount called %d times, want 0", runCalls)
 	}
 }
+
+// The --legacy-interruptible-mutations help must describe the real runtime
+// scope: interrupt-safe mode covers synchronous data commits (write-sync
+// writes, close-sync/fsync/release flushes and releases, git checkpoint
+// flushes) in addition to namespace mutations, and default-mode unmount waits
+// for detached data commits up to the releaseTimeout cap.
+func TestLegacyInterruptibleMutationsFlagHelpDocumentsDataCommitScope(t *testing.T) {
+	help := legacyInterruptibleMutationsFlagHelp
+	for _, want := range []string{
+		"synchronous data commits",
+		"close-sync/fsync/release flushes",
+		"15min releaseTimeout",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("flag help missing %q:\n%s", want, help)
+		}
+	}
+	if strings.Contains(help, "of idempotent namespace mutations, which") {
+		t.Fatalf("flag help still uses the stale mutations-only wording:\n%s", help)
+	}
+}
