@@ -190,16 +190,11 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 
 				phase = "small-snapshot-writeback"
 				snapWBStart2 := time.Now()
-				if err := fs.snapshotWriteBackLocked(fh, true); err != nil {
+				if err := fs.snapshotWriteBackWithPendingLocked(fh, true, true); err != nil {
 					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
 					safeLogPrintf("writeback cache put failed for %s: %v, falling back to sync upload", fh.Path, err)
 				} else {
 					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
-					if fs.pendingIndex != nil {
-						if gen, putErr := fs.pendingIndex.PutWithBaseRev(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev); putErr == nil {
-							fh.PendingIndexGen = gen
-						}
-					}
 					// Snapshot the dirty sequence at cache-write time so
 					// Release can detect whether new writes happened since.
 					fh.WriteBackSeq = fh.DirtySeq
