@@ -670,13 +670,12 @@ func TestAcceptedCompleteListingSeedsSmallDirectoryAfterCacheExpiry(t *testing.T
 	if _, ok := fs.dirCache.Get("/src"); ok {
 		t.Fatal("directory cache remained live after TTL")
 	}
-	dirGeneration := fs.dirCache.generation("/src")
 	mutationGeneration := fs.dirCache.mutationGeneration("/src")
 	namespaceGeneration := fs.dirCache.namespaceGeneration()
-	if _, ok := fs.metadataPrefetch.beginMiss("/src/a.go", 1, dirGeneration, mutationGeneration, namespaceGeneration); ok {
+	if _, ok := fs.metadataPrefetch.beginMiss("/src/a.go", 1, mutationGeneration, namespaceGeneration); ok {
 		t.Fatal("first miss activated prefetch")
 	}
-	prefetchRequest, ok := fs.metadataPrefetch.beginMiss("/src/b.go", 1, dirGeneration, mutationGeneration, namespaceGeneration)
+	prefetchRequest, ok := fs.metadataPrefetch.beginMiss("/src/b.go", 1, mutationGeneration, namespaceGeneration)
 	if !ok {
 		t.Fatal("second miss did not activate prefetch")
 	}
@@ -690,17 +689,17 @@ func TestBeginMissBoundsGetAttrHotSetAndDefersSnapshot(t *testing.T) {
 	now := time.Unix(100, 0)
 	prefetch.now = func() time.Time { return now }
 
-	if _, ok := prefetch.beginMiss("/src/a.go", 1, 2, 3, 4); ok {
+	if _, ok := prefetch.beginMiss("/src/a.go", 1, 3, 4); ok {
 		t.Fatal("first miss activated prefetch")
 	}
-	request, ok := prefetch.beginMiss("/src/b.go", 1, 2, 3, 4)
+	request, ok := prefetch.beginMiss("/src/b.go", 1, 3, 4)
 	if !ok {
 		t.Fatal("second miss did not activate prefetch")
 	}
 	if len(request.hotPaths) != 2 {
 		t.Fatalf("activation hot paths = %d, want 2", len(request.hotPaths))
 	}
-	joined, ok := prefetch.beginMiss("/src/c.go", 1, 2, 3, 4)
+	joined, ok := prefetch.beginMiss("/src/c.go", 1, 3, 4)
 	if !ok {
 		t.Fatal("active refresh was not joined")
 	}
@@ -710,7 +709,7 @@ func TestBeginMissBoundsGetAttrHotSetAndDefersSnapshot(t *testing.T) {
 	prefetch.finish(request)
 
 	for i := 0; i < metadataPrefetchMaxHotPaths*4; i++ {
-		if _, ok := prefetch.beginMiss(fmt.Sprintf("/src/getattr-%04d.go", i), 1, 2, 3, 4); ok {
+		if _, ok := prefetch.beginMiss(fmt.Sprintf("/src/getattr-%04d.go", i), 1, 3, 4); ok {
 			t.Fatalf("cooldown miss %d activated prefetch", i)
 		}
 	}
@@ -724,14 +723,14 @@ func TestBeginMissBoundsGetAttrHotSetAndDefersSnapshot(t *testing.T) {
 
 func TestActiveMetadataPrefetchJoinerCanExecuteSharedPlan(t *testing.T) {
 	prefetch := newSiblingMetadataPrefetch(time.Minute)
-	if _, ok := prefetch.beginMiss("/src/a.go", 1, 2, 3, 4); ok {
+	if _, ok := prefetch.beginMiss("/src/a.go", 1, 3, 4); ok {
 		t.Fatal("first miss activated prefetch")
 	}
-	owner, ok := prefetch.beginMiss("/src/b.go", 1, 2, 3, 4)
+	owner, ok := prefetch.beginMiss("/src/b.go", 1, 3, 4)
 	if !ok {
 		t.Fatal("second miss did not activate prefetch")
 	}
-	joiner, ok := prefetch.beginMiss("/src/c.go", 1, 2, 3, 4)
+	joiner, ok := prefetch.beginMiss("/src/c.go", 1, 3, 4)
 	if !ok {
 		t.Fatal("active refresh was not joined")
 	}
@@ -787,16 +786,15 @@ func TestUnrelatedDirectoryMutationKeepsRememberedDirectorySize(t *testing.T) {
 	}, []CachedFileInfo{{Name: "a.go"}}, mutationGeneration, namespaceGeneration)
 	dc.Upsert("/other", CachedFileInfo{Name: "new.go"})
 
-	dirGeneration := dc.generation("/src")
 	mutationGeneration = dc.mutationGeneration("/src")
 	namespaceGeneration = dc.namespaceGeneration()
 	if !prefetch.valid("/src", "/src/a.go", 1, mutationGeneration, namespaceGeneration) {
 		t.Fatal("unrelated directory mutation invalidated sibling marker")
 	}
-	if _, ok := prefetch.beginMiss("/src/a.go", 1, dirGeneration, mutationGeneration, namespaceGeneration); ok {
+	if _, ok := prefetch.beginMiss("/src/a.go", 1, mutationGeneration, namespaceGeneration); ok {
 		t.Fatal("first miss activated prefetch")
 	}
-	request, ok := prefetch.beginMiss("/src/b.go", 1, dirGeneration, mutationGeneration, namespaceGeneration)
+	request, ok := prefetch.beginMiss("/src/b.go", 1, mutationGeneration, namespaceGeneration)
 	if !ok {
 		t.Fatal("second miss did not activate prefetch")
 	}
@@ -811,13 +809,12 @@ func TestDirectoryMutationInvalidatesRememberedDirectorySize(t *testing.T) {
 	prefetch.rememberDirectorySize("/src", 2, dc.mutationGeneration("/src"), dc.namespaceGeneration())
 	dc.Upsert("/src", CachedFileInfo{Name: "new.go"})
 
-	dirGeneration := dc.generation("/src")
 	mutationGeneration := dc.mutationGeneration("/src")
 	namespaceGeneration := dc.namespaceGeneration()
-	if _, ok := prefetch.beginMiss("/src/a.go", 1, dirGeneration, mutationGeneration, namespaceGeneration); ok {
+	if _, ok := prefetch.beginMiss("/src/a.go", 1, mutationGeneration, namespaceGeneration); ok {
 		t.Fatal("first miss activated prefetch")
 	}
-	request, ok := prefetch.beginMiss("/src/b.go", 1, dirGeneration, mutationGeneration, namespaceGeneration)
+	request, ok := prefetch.beginMiss("/src/b.go", 1, mutationGeneration, namespaceGeneration)
 	if !ok {
 		t.Fatal("second miss did not activate prefetch")
 	}
@@ -846,11 +843,10 @@ func TestAncestorInvalidationRevokesDescendantPrefetchIdentity(t *testing.T) {
 	if prefetch.valid("/repo/src", "/repo/src/a.go", 1, mutationGeneration, namespaceGeneration) {
 		t.Fatal("ancestor invalidation left descendant marker valid")
 	}
-	dirGeneration := dc.generation("/repo/src")
-	if _, ok := prefetch.beginMiss("/repo/src/a.go", 1, dirGeneration, mutationGeneration, namespaceGeneration); ok {
+	if _, ok := prefetch.beginMiss("/repo/src/a.go", 1, mutationGeneration, namespaceGeneration); ok {
 		t.Fatal("first miss activated prefetch")
 	}
-	request, ok := prefetch.beginMiss("/repo/src/b.go", 1, dirGeneration, mutationGeneration, namespaceGeneration)
+	request, ok := prefetch.beginMiss("/repo/src/b.go", 1, mutationGeneration, namespaceGeneration)
 	if !ok {
 		t.Fatal("second miss did not activate prefetch")
 	}
@@ -936,6 +932,65 @@ func TestStaleListingReceiptCannotPublishMarker(t *testing.T) {
 	}
 }
 
+func TestMetadataPrefetchRequestSurvivesReadInstallBeforeRefresh(t *testing.T) {
+	var batchCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs:batch-stat" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		batchCalls.Add(1)
+		var body struct {
+			Paths []string `json:"paths"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode batch stat: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		results := make([]client.BatchStatResult, len(body.Paths))
+		for i, filePath := range body.Paths {
+			results[i] = client.BatchStatResult{Path: filePath, Status: http.StatusOK, Size: int64(i + 1), Revision: 2}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
+	}))
+	defer server.Close()
+
+	fs := newMetadataPrefetchTestFS(server.URL)
+	mountGeneration := fs.mountViewGeneration.Load()
+	mutationGeneration := fs.dirCache.mutationGeneration("/src")
+	namespaceGeneration := fs.dirCache.namespaceGeneration()
+	if _, ok := fs.metadataPrefetch.beginMiss("/src/a.go", mountGeneration, mutationGeneration, namespaceGeneration); ok {
+		t.Fatal("first miss activated prefetch")
+	}
+	request, ok := fs.metadataPrefetch.beginMiss("/src/b.go", mountGeneration, mutationGeneration, namespaceGeneration)
+	if !ok {
+		t.Fatal("second miss did not activate prefetch")
+	}
+
+	dirGeneration := fs.dirCache.generation("/src")
+	observation := fs.dirCache.BeginRequest("/src")
+	fs.dirCache.Observe("/src", CachedFileInfo{Name: "other.go", Revision: 1}, observation)
+	if fs.dirCache.generation("/src") == dirGeneration {
+		t.Fatal("ordinary read install did not advance directory generation")
+	}
+	if fs.dirCache.mutationGeneration("/src") != mutationGeneration {
+		t.Fatal("ordinary read install advanced mutation generation")
+	}
+
+	if err := fs.refreshSiblingMetadata(context.Background(), request); err != nil {
+		t.Fatalf("refresh after read install: %v", err)
+	}
+	if got := batchCalls.Load(); got != 1 {
+		t.Fatalf("batch stat calls = %d, want 1", got)
+	}
+	if !fs.metadataPrefetch.valid("/src", "/src/a.go", mountGeneration, mutationGeneration, namespaceGeneration) {
+		t.Fatal("read install prevented sibling marker publication")
+	}
+}
+
 func TestMetadataPrefetchBatchBindsResultsByPath(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs:batch-stat" {
@@ -969,7 +1024,6 @@ func TestMetadataPrefetchBatchBindsResultsByPath(t *testing.T) {
 	request := metadataPrefetchRequest{
 		parentPath:          "/src",
 		mountGeneration:     fs.mountViewGeneration.Load(),
-		dirGeneration:       fs.dirCache.generation("/src"),
 		mutationGeneration:  fs.dirCache.mutationGeneration("/src"),
 		namespaceGeneration: fs.dirCache.namespaceGeneration(),
 		epoch:               fs.metadataPrefetch.epoch,
@@ -1011,7 +1065,6 @@ func TestMetadataPrefetchBatchRejectsDuplicateResultPaths(t *testing.T) {
 	request := metadataPrefetchRequest{
 		parentPath:          "/src",
 		mountGeneration:     fs.mountViewGeneration.Load(),
-		dirGeneration:       fs.dirCache.generation("/src"),
 		mutationGeneration:  fs.dirCache.mutationGeneration("/src"),
 		namespaceGeneration: fs.dirCache.namespaceGeneration(),
 		epoch:               fs.metadataPrefetch.epoch,

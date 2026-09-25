@@ -46,7 +46,6 @@ type metadataPrefetchRequest struct {
 	key                 string
 	parentPath          string
 	mountGeneration     uint64
-	dirGeneration       uint64
 	mutationGeneration  uint64
 	epoch               uint64
 	namespaceGeneration uint64
@@ -125,7 +124,7 @@ func (p *siblingMetadataPrefetch) noteHotPathLocked(state *metadataPrefetchDirSt
 	}
 }
 
-func (p *siblingMetadataPrefetch) beginMiss(filePath string, mountGeneration, dirGeneration, mutationGeneration, namespaceGeneration uint64) (metadataPrefetchRequest, bool) {
+func (p *siblingMetadataPrefetch) beginMiss(filePath string, mountGeneration, mutationGeneration, namespaceGeneration uint64) (metadataPrefetchRequest, bool) {
 	if p == nil || filePath == "" || filePath == "/" {
 		return metadataPrefetchRequest{}, false
 	}
@@ -136,7 +135,7 @@ func (p *siblingMetadataPrefetch) beginMiss(filePath string, mountGeneration, di
 	state := p.dirStateLocked(parentPath)
 	p.noteHotPathLocked(state, filePath)
 	now := p.now()
-	key := fmt.Sprintf("%d:%d:%d:%d:%d:%s", p.epoch, mountGeneration, dirGeneration, mutationGeneration, namespaceGeneration, parentPath)
+	key := fmt.Sprintf("%d:%d:%d:%d:%s", p.epoch, mountGeneration, mutationGeneration, namespaceGeneration, parentPath)
 	if state.childrenKnown && (state.knownMutation != mutationGeneration || state.knownNamespace != namespaceGeneration) {
 		state.childrenKnown = false
 	}
@@ -144,7 +143,6 @@ func (p *siblingMetadataPrefetch) beginMiss(filePath string, mountGeneration, di
 		key:                 key,
 		parentPath:          parentPath,
 		mountGeneration:     mountGeneration,
-		dirGeneration:       dirGeneration,
 		mutationGeneration:  mutationGeneration,
 		namespaceGeneration: namespaceGeneration,
 		epoch:               p.epoch,
@@ -352,10 +350,9 @@ func (fs *Dat9FS) maybePrefetchSiblingMetadata(ctx context.Context, filePath str
 	}
 	mountGeneration := fs.mountViewGeneration.Load()
 	parentPath := parentDir(filePath)
-	dirGeneration := fs.dirCache.generation(parentPath)
 	mutationGeneration := fs.dirCache.mutationGeneration(parentPath)
 	namespaceGeneration := fs.dirCache.namespaceGeneration()
-	request, ok := fs.metadataPrefetch.beginMiss(filePath, mountGeneration, dirGeneration, mutationGeneration, namespaceGeneration)
+	request, ok := fs.metadataPrefetch.beginMiss(filePath, mountGeneration, mutationGeneration, namespaceGeneration)
 	if !ok {
 		return
 	}
@@ -366,7 +363,7 @@ func (fs *Dat9FS) maybePrefetchSiblingMetadata(ctx context.Context, filePath str
 }
 
 func (fs *Dat9FS) refreshSiblingMetadata(ctx context.Context, request metadataPrefetchRequest) error {
-	if !fs.statCacheVerified() || fs.mountViewGeneration.Load() != request.mountGeneration || fs.dirCache.generation(request.parentPath) != request.dirGeneration || fs.dirCache.mutationGeneration(request.parentPath) != request.mutationGeneration || fs.dirCache.namespaceGeneration() != request.namespaceGeneration {
+	if !fs.statCacheVerified() || fs.mountViewGeneration.Load() != request.mountGeneration || fs.dirCache.mutationGeneration(request.parentPath) != request.mutationGeneration || fs.dirCache.namespaceGeneration() != request.namespaceGeneration {
 		return nil
 	}
 	if request.list {
