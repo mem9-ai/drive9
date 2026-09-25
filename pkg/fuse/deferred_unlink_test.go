@@ -17,13 +17,14 @@ import (
 // deferredUnlinkBackend records the order of remote calls so tests can
 // assert that a DELETE lands after an in-flight PUT.
 type deferredUnlinkBackend struct {
-	mu      sync.Mutex
-	order   []string
-	exists  map[string]bool
-	putGate chan struct{} // when non-nil, PUTs block until closed
-	deletes atomic.Int64
-	puts    atomic.Int64
-	heads   atomic.Int64
+	mu         sync.Mutex
+	order      []string
+	exists     map[string]bool
+	putGate    chan struct{} // when non-nil, PUTs block until closed
+	deleteGate chan struct{} // when non-nil, DELETEs block before counting
+	deletes    atomic.Int64
+	puts       atomic.Int64
+	heads      atomic.Int64
 }
 
 func newDeferredUnlinkBackend() *deferredUnlinkBackend {
@@ -56,6 +57,11 @@ func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case http.MethodDelete:
+			// Gate before counting so a dispatched delete worker cannot
+			// move the counter during a pre-drain assertion.
+			if b.deleteGate != nil {
+				<-b.deleteGate
+			}
 			b.deletes.Add(1)
 			b.record("DELETE")
 			if !b.exists[p] {
@@ -146,6 +152,15 @@ func newDeferredUnlinkFS(t *testing.T, ts *httptest.Server, cacheDir string, def
 // trips; the DELETE arrives via the commit queue.
 func TestDeferredUnlinkNoSyncRoundTrips(t *testing.T) {
 	backend := newDeferredUnlinkBackend()
+	// Gate DELETEs before counting so the dispatched delete worker cannot
+	// race the pre-drain assertion; release before DrainAll (via cleanup in
+	// case the assertion fails first).
+	deleteGate := make(chan struct{})
+	backend.deleteGate = deleteGate
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(deleteGate) }) }
+	t.Cleanup(release)
+
 	ts := httptest.NewServer(backend.handler())
 	defer ts.Close()
 	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
@@ -160,6 +175,7 @@ func TestDeferredUnlinkNoSyncRoundTrips(t *testing.T) {
 		t.Fatalf("unlink issued %d synchronous backend calls, want 0", got)
 	}
 
+	release()
 	fs.commitQueue.DrainAll()
 	if got := backend.deletes.Load(); got != 1 {
 		t.Fatalf("async DELETEs = %d, want 1", got)
