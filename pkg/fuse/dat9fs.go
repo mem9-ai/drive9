@@ -81,6 +81,7 @@ type Dat9FS struct {
 	readCache           *ReadCache
 	diskReadCache       *DiskReadCache
 	dirCache            *DirCache
+	metadataPrefetch    *siblingMetadataPrefetch
 	// statCacheUnverified is true while the SSE stream is not known-current.
 	// In that state, file stat cache hits embedded in DirCache must fall back
 	// to HEAD revalidation instead of serving TTL-only attrs. Even when the
@@ -453,7 +454,7 @@ type layerSymlinkState struct {
 
 // NewDat9FS creates a new FUSE filesystem backed by the given dat9 client.
 func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
-	return &Dat9FS{
+	fs := &Dat9FS{
 		RawFileSystem:     gofuse.NewDefaultRawFileSystem(),
 		client:            c,
 		inodes:            NewInodeToPath(),
@@ -487,6 +488,10 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		xattrs:            NewXAttrStore(),
 		deletedPaths:      make(map[string]time.Time),
 	}
+	if opts.Profile == MountProfileCodingAgent {
+		fs.metadataPrefetch = newSiblingMetadataPrefetch(opts.DirTTL)
+	}
+	return fs
 }
 
 // SetWriteBack configures the write-back cache and uploader on the filesystem.
@@ -1294,6 +1299,9 @@ func (fs *Dat9FS) resetMountView() {
 	}
 	if fs.dirCache != nil {
 		fs.dirCache.InvalidateAll()
+	}
+	if fs.metadataPrefetch != nil {
+		fs.metadataPrefetch.clear()
 	}
 	fs.mountViewGeneration.Store(generation)
 	fs.mountViewMu.Unlock()
@@ -6900,6 +6908,9 @@ func (fs *Dat9FS) touchDirectoryChangeTime(dirPath string, t time.Time) {
 func (fs *Dat9FS) markStatCacheUnverified() {
 	if fs != nil {
 		fs.statCacheUnverified.Store(true)
+		if fs.metadataPrefetch != nil {
+			fs.metadataPrefetch.clear()
+		}
 	}
 }
 
@@ -7602,7 +7613,7 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 }
 
 func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
-	if fs == nil || fs.dirCache == nil || entry == nil || entry.Path == "/" || entry.IsDir || isLockFilePath(entry.Path) || !fs.statCacheTrustedAndVerified() {
+	if fs == nil || fs.dirCache == nil || entry == nil || entry.Path == "/" || entry.IsDir || isLockFilePath(entry.Path) {
 		return nil, false
 	}
 	parentPath, name := cacheParentName(entry.Path)
@@ -7610,7 +7621,22 @@ func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
 	if result.kind != namespaceLookupPositive {
 		return nil, false
 	}
-	item := result.item
+	trusted := fs.statCacheTrustedAndVerified()
+	if !trusted {
+		trusted = fs.statCacheVerified() && fs.metadataPrefetch != nil &&
+			!fs.hasPendingLocalState(entry.Path) && !fs.hasQueuedCommit(entry.Path) &&
+			fs.metadataPrefetch.valid(parentPath, entry.Path, fs.mountViewGeneration.Load(), fs.dirCache.generation(parentPath))
+	}
+	if !trusted {
+		return nil, false
+	}
+	return fs.cachedAttrEntryFromItem(entry, result.item)
+}
+
+func (fs *Dat9FS) cachedAttrEntryFromItem(entry *InodeEntry, item CachedFileInfo) (*InodeEntry, bool) {
+	if fs == nil || entry == nil {
+		return nil, false
+	}
 	if item.IsDir != entry.IsDir {
 		return nil, false
 	}
@@ -7887,11 +7913,24 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if !ok {
 		return gofuse.ENOENT
 	}
+	if fs.metadataPrefetch != nil {
+		fs.metadataPrefetch.noteAccess(childP)
+	}
 	cacheGeneration := fs.mountViewGeneration.Load()
 	if !fs.lockMountViewRead(cacheGeneration) {
 		return gofuse.Status(syscall.EAGAIN)
 	}
 	handled, cacheStatus := fs.lookupFromDirCache(parentPath, childP, name, out)
+	fs.mountViewMu.RUnlock()
+	if handled {
+		return cacheStatus
+	}
+	fs.maybePrefetchSiblingMetadata(ctx, childP)
+	cacheGeneration = fs.mountViewGeneration.Load()
+	if !fs.lockMountViewRead(cacheGeneration) {
+		return gofuse.Status(syscall.EAGAIN)
+	}
+	handled, cacheStatus = fs.lookupFromDirCache(parentPath, childP, name, out)
 	fs.mountViewMu.RUnlock()
 	if handled {
 		return cacheStatus
@@ -9074,6 +9113,13 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				}
 			}
 			if !pendingFound && input.NodeId != 1 {
+				fs.maybePrefetchSiblingMetadata(ctx, entry.Path)
+				if cachedEntry, ok := fs.cachedAttrEntry(entry); ok {
+					entry = cachedEntry
+					pendingFound = true
+				}
+			}
+			if !pendingFound && input.NodeId != 1 {
 				stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
 				if err != nil {
 					return listDirErrToFuseStatus(err)
@@ -9129,43 +9175,48 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 			if cachedEntry, ok := fs.cachedAttrEntry(entry); ok {
 				entry = cachedEntry
 			} else if !entry.IsDir {
-				stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
-				if err != nil {
-					return listDirErrToFuseStatus(err)
-				}
-				if !fs.lockMountViewRead(statGeneration) {
-					return gofuse.Status(syscall.EAGAIN)
-				}
-				defer fs.mountViewMu.RUnlock()
-				entry.Size = stat.Size
-				entry.IsDir = stat.IsDir
-				fs.inodes.UpdateSize(input.NodeId, stat.Size)
-				replacedIdentity := stat.ResourceID != "" &&
-					fs.inodes.ReplacesIdentity(input.NodeId, stat.ResourceID, stat.IsDir)
-				if stat.ResourceID != "" || stat.Nlink > 0 {
-					fs.inodes.SetIdentityWithKind(input.NodeId, stat.ResourceID, stat.Nlink, stat.IsDir)
-					entry.ResourceID = stat.ResourceID
-					entry.Nlink = stat.Nlink
-				}
-				if stat.Revision > 0 {
-					fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-				}
-				if stat.HasMode {
-					entry.Mode = stat.Mode
-					entry.HasMode = true
-					fs.inodes.UpdateMode(input.NodeId, stat.Mode)
-				}
-				if !stat.Mtime.IsZero() {
-					// Identity replacement: the previous object's local time
-					// (possibly an explicit future utimensat) must not shadow
-					// the replacement's server mtime, even when older.
-					if replacedIdentity {
-						entry.Mtime = stat.Mtime
-						fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
-					} else if !fs.inodes.HasMtimeOverride(input.NodeId) &&
-						(entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime)) {
-						entry.Mtime = stat.Mtime
-						fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
+				fs.maybePrefetchSiblingMetadata(ctx, entry.Path)
+				if cachedEntry, ok := fs.cachedAttrEntry(entry); ok {
+					entry = cachedEntry
+				} else {
+					stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
+					if err != nil {
+						return listDirErrToFuseStatus(err)
+					}
+					if !fs.lockMountViewRead(statGeneration) {
+						return gofuse.Status(syscall.EAGAIN)
+					}
+					defer fs.mountViewMu.RUnlock()
+					entry.Size = stat.Size
+					entry.IsDir = stat.IsDir
+					fs.inodes.UpdateSize(input.NodeId, stat.Size)
+					replacedIdentity := stat.ResourceID != "" &&
+						fs.inodes.ReplacesIdentity(input.NodeId, stat.ResourceID, stat.IsDir)
+					if stat.ResourceID != "" || stat.Nlink > 0 {
+						fs.inodes.SetIdentityWithKind(input.NodeId, stat.ResourceID, stat.Nlink, stat.IsDir)
+						entry.ResourceID = stat.ResourceID
+						entry.Nlink = stat.Nlink
+					}
+					if stat.Revision > 0 {
+						fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+					}
+					if stat.HasMode {
+						entry.Mode = stat.Mode
+						entry.HasMode = true
+						fs.inodes.UpdateMode(input.NodeId, stat.Mode)
+					}
+					if !stat.Mtime.IsZero() {
+						// Identity replacement: the previous object's local time
+						// (possibly an explicit future utimensat) must not shadow
+						// the replacement's server mtime, even when older.
+						if replacedIdentity {
+							entry.Mtime = stat.Mtime
+							fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
+						} else if !fs.inodes.HasMtimeOverride(input.NodeId) &&
+							(entry.Mtime.IsZero() || stat.Mtime.After(entry.Mtime)) {
+							entry.Mtime = stat.Mtime
+							fs.inodes.UpdateMtimeDerived(input.NodeId, stat.Mtime)
+						}
 					}
 				}
 			}

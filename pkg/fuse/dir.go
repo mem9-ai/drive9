@@ -692,6 +692,55 @@ func (dc *DirCache) Observe(parentPath string, item CachedFileInfo, token Reques
 	dc.releaseRequestLocked(token)
 }
 
+func (dc *DirCache) observeBatch(parentPath string, items []CachedFileInfo, token RequestToken) (uint64, bool) {
+	if dc == nil || len(items) == 0 {
+		return 0, false
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	if !token.valid || token.dir != parentPath || dc.generationLocked(parentPath) != token.event {
+		dc.releaseRequestLocked(token)
+		return dc.generationLocked(parentPath), false
+	}
+	entry := dc.ensureEntryLocked(parentPath)
+	deadline := dc.now().Add(dc.ttl)
+	accepted := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Name == "" {
+			continue
+		}
+		item.freshUntil = deadline
+		entry.upsert(item, dc.maxEntries)
+		delete(entry.negatives, item.Name)
+		accepted = append(accepted, item.Name)
+	}
+	if len(accepted) == 0 {
+		dc.releaseRequestLocked(token)
+		return dc.generationLocked(parentPath), false
+	}
+	stamp := dc.nextGenerationLocked()
+	entry.gen = stamp
+	if dc.inFlight[parentPath] > 0 {
+		for _, name := range accepted {
+			entry.localGen[name] = stamp
+		}
+	} else {
+		entry.reclaimReconciliationLocked()
+	}
+	dc.releaseRequestLocked(token)
+	return stamp, true
+}
+
+func (dc *DirCache) generation(dirPath string) uint64 {
+	if dc == nil {
+		return 0
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.generationLocked(dirPath)
+}
+
 // Upsert records or refreshes a known child entry for a parent.
 //
 // This is the authoritative entry point: it means *this mount* established the
