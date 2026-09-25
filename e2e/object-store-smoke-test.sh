@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Object-store CLI + mount smoke against a local MinIO (or an existing S3 URI).
 #
-# Does not need drive9-server. Starts MinIO via docker/podman unless
-# OBJECT_S3_URI is already set (then uses that URI and the process AWS env).
+# Does not need drive9-server. Starts MinIO via docker/podman, falling back to
+# a pinned release binary, unless OBJECT_S3_URI is already set.
 #
 #   bash e2e/object-store-smoke-test.sh
 #   OBJECT_S3_URI='s3://bucket/prefix/?region=us-east-1' bash e2e/object-store-smoke-test.sh
@@ -19,7 +19,8 @@ OBJECT_STRICT_CROSS="${OBJECT_STRICT_CROSS:-$OBJECT_STRICT_MOUNT}"
 OBJECT_CMD_TIMEOUT_S="${OBJECT_CMD_TIMEOUT_S:-120}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-2}"
-MINIO_IMAGE="${MINIO_IMAGE:-${DRIVE9_MINIO_IMAGE:-minio/minio:RELEASE.2024-12-18T13-15-44Z}}"
+MINIO_RELEASE="${MINIO_RELEASE:-${DRIVE9_MINIO_RELEASE:-RELEASE.2024-12-18T13-15-44Z}}"
+MINIO_IMAGE="${MINIO_IMAGE:-${DRIVE9_MINIO_IMAGE:-minio/minio:${MINIO_RELEASE}}}"
 MINIO_PORT="${MINIO_PORT:-${DRIVE9_MINIO_PORT:-19000}}"
 MINIO_ROOT_USER="${MINIO_ROOT_USER:-${DRIVE9_MINIO_USER:-drive9minio}}"
 MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-${DRIVE9_MINIO_PASSWORD:-drive9minio}}"
@@ -177,11 +178,18 @@ pick_runtime() {
 }
 
 minio_arch() {
-  case "$(uname -m)" in
-    x86_64 | amd64) echo "linux-amd64" ;;
-    aarch64 | arm64) echo "linux-arm64" ;;
+  local os arch
+  case "$(uname -s)" in
+    Darwin) os="darwin" ;;
+    Linux) os="linux" ;;
     *) return 1 ;;
   esac
+  case "$(uname -m)" in
+    x86_64 | amd64) arch="amd64" ;;
+    aarch64 | arm64) arch="arm64" ;;
+    *) return 1 ;;
+  esac
+  echo "${os}-${arch}"
 }
 
 ensure_minio_bin() {
@@ -193,7 +201,11 @@ ensure_minio_bin() {
   arch="$(minio_arch)" || return 1
   MINIO_BIN="$WORKDIR/minio"
   echo "fetching MinIO $arch to $MINIO_BIN"
-  curl -fsSL "https://dl.min.io/server/minio/release/${arch}/minio" -o "$MINIO_BIN"
+  if ! curl -fsSL --retry 3 --retry-all-errors \
+    "https://github.com/minio/minio/releases/download/${MINIO_RELEASE}/minio.${arch}.${MINIO_RELEASE}" \
+    -o "$MINIO_BIN"; then
+    return 1
+  fi
   chmod +x "$MINIO_BIN"
 }
 
@@ -403,8 +415,11 @@ else
       -e "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
       -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
       "$MINIO_IMAGE" server /data >/dev/null; then
-      echo "FAIL start MinIO container"
-      exit 1
+      echo "MinIO container unavailable; falling back to pinned release binary"
+      if ! start_minio_bin; then
+        echo "FAIL need a runnable MinIO container or pinned release binary (or set OBJECT_S3_URI)"
+        exit 1
+      fi
     fi
   else
     echo "no docker/podman; starting MinIO binary on 127.0.0.1:${MINIO_PORT}"

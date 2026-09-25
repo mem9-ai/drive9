@@ -19,7 +19,8 @@
 #   DRIVE9_MINIO_PASSWORD      (default drive9minio)
 #   DRIVE9_MINIO_BUCKET        (default drive9-local)
 #   DRIVE9_MINIO_CONTAINER     (default drive9-local-minio)
-#   DRIVE9_MINIO_IMAGE         (default minio/minio:RELEASE.2024-12-18T13-15-44Z)
+#   DRIVE9_MINIO_RELEASE       (default RELEASE.2024-12-18T13-15-44Z)
+#   DRIVE9_MINIO_IMAGE         (default minio/minio:$DRIVE9_MINIO_RELEASE)
 #   DRIVE9_S3_ENDPOINT         advertised endpoint (presign / clients; e.g. Orb)
 #
 # Compatible with macOS bash 3.2.
@@ -32,7 +33,8 @@ ACCESS_KEY="${DRIVE9_MINIO_USER:-drive9minio}"
 SECRET_KEY="${DRIVE9_MINIO_PASSWORD:-drive9minio}"
 BUCKET="${DRIVE9_MINIO_BUCKET:-drive9-local}"
 CONTAINER="${DRIVE9_MINIO_CONTAINER:-drive9-local-minio}"
-IMAGE="${DRIVE9_MINIO_IMAGE:-minio/minio:RELEASE.2024-12-18T13-15-44Z}"
+RELEASE="${DRIVE9_MINIO_RELEASE:-RELEASE.2024-12-18T13-15-44Z}"
+IMAGE="${DRIVE9_MINIO_IMAGE:-minio/minio:${RELEASE}}"
 PID_FILE="${DRIVE9_MINIO_PID_FILE:-${TMPDIR:-/tmp}/drive9-local-minio.pid}"
 DATA_DIR="${DRIVE9_MINIO_DATA_DIR:-${TMPDIR:-/tmp}/drive9-local-minio-data}"
 
@@ -197,7 +199,11 @@ start_binary() {
     mkdir -p "$DATA_DIR"
     if [ ! -x "$bin" ]; then
       echo "fetching MinIO $arch" >&2
-      curl -fsSL "https://dl.min.io/server/minio/release/${arch}/minio" -o "$bin"
+      if ! curl -fsSL --retry 3 --retry-all-errors \
+        "https://github.com/minio/minio/releases/download/${RELEASE}/minio.${arch}.${RELEASE}" \
+        -o "$bin"; then
+        return 1
+      fi
       chmod +x "$bin"
     fi
   fi
