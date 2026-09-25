@@ -668,12 +668,12 @@ PY
   else
     record "FAIL" "Git Working Tree Operations" "binary file modification" "binary edit failed"
   fi
-  mkdir -p "$repo/ignored-build"
-  printf 'ignored\n' > "$repo/ignored-build/cache.tmp"
-  if git -C "$repo" check-ignore -q ignored-build/cache.tmp; then
+  mkdir -p "$repo/target/local-only"
+  printf 'ignored\n' > "$repo/target/local-only/cache.tmp"
+  if git -C "$repo" check-ignore -q target/local-only/cache.tmp; then
     record "PASS" "Git Working Tree Operations" "ignored local-only generated files" "git check-ignore accepted"
   else
-    record "FAIL" "Git Working Tree Operations" "ignored local-only generated files" "ignored-build/cache.tmp was not ignored"
+    record "FAIL" "Git Working Tree Operations" "ignored local-only generated files" "target/local-only/cache.tmp was not ignored"
   fi
 
   printf 'reset me\n' > "$repo/generated/reset.txt"
@@ -912,13 +912,13 @@ PY
       record "FAIL" "Drive9 Git Workspace Behavior" "oversized staged object downgrade" "status=${status:-<empty>}"
     fi
   fi
-  mkdir -p "$restore_repo/ignored-build"
-  printf 'local ignored\n' > "$restore_repo/ignored-build/cache.tmp"
+  mkdir -p "$restore_repo/target/local-only"
+  printf 'local ignored\n' > "$restore_repo/target/local-only/cache.tmp"
   stop_mount "$mount_point_b" >/dev/null 2>&1 || true
   mkdir -p "$mount_point_b" "$RUN_ROOT/git-local-c"
   if start_git_feature_mount "$mount_point_b" "$RUN_ROOT/git-mount-c.log" "$RUN_ROOT/git-local-c" "$git_root_rel"; then
-    if [ ! -e "$mount_point_b/restore-workspace/ignored-build/cache.tmp" ]; then
-      record "PASS" "Sandbox Restore" "ignored generated files are non-durable by design" "ignored-build/cache.tmp absent after fresh local root"
+    if [ ! -e "$mount_point_b/restore-workspace/target/local-only/cache.tmp" ]; then
+      record "PASS" "Sandbox Restore" "ignored generated files are non-durable by design" "target/local-only/cache.tmp absent after fresh local root"
     else
       record "FAIL" "Sandbox Restore" "ignored generated files are non-durable by design" "ignored file unexpectedly restored"
     fi

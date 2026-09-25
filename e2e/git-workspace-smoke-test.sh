@@ -433,11 +433,13 @@ PY
 setup_ignored_local_only_probe() {
   local repo="$1"
   local marker="$2"
-  mkdir -p "$repo/.git/info" || return
-  printf '\nagent-bench/local-only/\n' >> "$repo/.git/info/exclude" || return
-  mkdir -p "$repo/agent-bench/local-only" || return
-  printf 'ignored local-only %s\n' "$marker" > "$repo/agent-bench/local-only/cache.txt" || return
-  git_cmd -C "$repo" check-ignore -q agent-bench/local-only/cache.txt
+  # The coding-agent overlay only routes a Rust `target/` directory to the local
+  # overlay, and only when a .gitignore in the same directory ignores it. The
+  # fixture's committed root .gitignore carries `target/`, so the probe lives
+  # directly under the repo root.
+  mkdir -p "$repo/target/local-only" || return
+  printf 'ignored local-only %s\n' "$marker" > "$repo/target/local-only/cache.txt" || return
+  git_cmd -C "$repo" check-ignore -q target/local-only/cache.txt
 }
 
 assert_clean_status() {
@@ -487,7 +489,7 @@ run_agent_edit_add_commit() {
   check_cmd "$slug $scenario append tracked files" select_and_append_existing "$repo" "$GIT_WORKSPACE_EXISTING_FILES" "$marker" "$selected"
   check_cmd "$slug $scenario write new files" write_new_files "$repo" "$GIT_WORKSPACE_NEW_FILES" "$marker"
   check_cmd "$slug $scenario git add commit" commit_all "$repo" "drive9 e2e $scenario"
-  check_cmd "$slug $scenario ignored file stays untracked" git_cmd -C "$repo" check-ignore -q agent-bench/local-only/cache.txt
+  check_cmd "$slug $scenario ignored file stays untracked" git_cmd -C "$repo" check-ignore -q target/local-only/cache.txt
   check_cmd "$slug $scenario mount log audit" audit_mount_log "$log_file"
   stop_mount
 }

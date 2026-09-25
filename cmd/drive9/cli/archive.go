@@ -24,7 +24,7 @@ import (
 // read awkwardly in a bulk-download context). --profile loads a profile's
 // [local] rules as excludes and [remote] rules as include-overrides, so a
 // single `--profile coding-agent` reproduces the same skip set that mount
-// applies to node_modules/.git/dist/etc.
+// applies to node_modules and VCS state.
 
 // splitArchiveArgs separates positional args from flag tokens so users can
 // place flags before OR after the positional source/output. A token starting
@@ -191,23 +191,42 @@ func Archive(c *client.Client, args []string) error {
 	return sourceClient.ArchiveDir(ctx, srcRP.Path, out, opts)
 }
 
+// archiveVCSExcludes are added to a profiled archive's excludes. The mount now
+// routes `.git` structurally (only a Git workspace's `.git` is local, so it is
+// not in the profile [local] list), but "apply the profile" has always meant
+// "skip VCS metadata" for a bulk download, so a profiled archive keeps skipping
+// it. A plain archive with no profile still contains every file.
+var archiveVCSExcludes = []string{"**/.git/**", "**/.hg/**", "**/.svn/**"}
+
 // buildArchiveOptions merges profile rules with explicit flags into
 // client.ArchiveOptions.
 //
-//	exclude           = profile.[local]  + --exclude
+//	exclude           = VCS metadata + profile.[local] + profile.[local-gitignore-aware] + --exclude
 //	include-override  = profile.[remote]                (override, restores an excluded path)
 //	include-whitelist = --include                        (only these are kept when non-empty)
+//
+// A bulk archive has no Git ignore oracle, so [local-gitignore-aware] patterns
+// are applied directly as excludes (the same set a mount would overlay when the
+// repository ignores them).
 func buildArchiveOptions(profileName string, includes, excludes stringListFlag, format string, flat bool, jobs int) (client.ArchiveOptions, error) {
-	var profileLocalOnly, profileRemoteOnly []string
+	var profileLocalOnly, profileLocalGitignoreAware, profileRemoteOnly []string
 	if strings.TrimSpace(profileName) != "" {
 		cfg, err := loadProfileConfig(profileName)
 		if err != nil {
 			return client.ArchiveOptions{}, fmt.Errorf("load profile %q: %w", profileName, err)
 		}
 		profileLocalOnly = cfg.LocalOnlyPatterns
+		profileLocalGitignoreAware = cfg.LocalGitignoreAwarePatterns
 		profileRemoteOnly = cfg.RemoteOnlyPatterns
 	}
-	excludePatterns := mergeProfileValues(profileLocalOnly, []string(excludes))
+	excludePatterns := mergeProfileValues(profileLocalOnly, profileLocalGitignoreAware, []string(excludes))
+	// "Use this profile" implies dropping VCS metadata, which is no longer in
+	// the profile [local] list (the mount routes `.git` structurally). Only
+	// add it when a profile was actually selected: a plain archive is
+	// unfiltered.
+	if strings.TrimSpace(profileName) != "" {
+		excludePatterns = mergeProfileValues(archiveVCSExcludes, excludePatterns)
+	}
 	includePatterns := mergeProfileValues(nil, []string(includes))
 	overridePatterns := mergeProfileValues(profileRemoteOnly)
 

@@ -204,28 +204,32 @@ func TestMatcherExcludeOverridesInclude(t *testing.T) {
 	}
 }
 
-func TestCodingAgentDefaultPatterns(t *testing.T) {
-	patterns := []string{
-		"**/.git/**", "**/.hg/**", "**/.svn/**", "**/node_modules/**",
-		"**/.pnpm-store/**", "**/target/**", "**/dist/**", "**/build/**",
-		"**/coverage/**", "**/tmp/**", "**/.tmp/**", "**/.tmp-api-extractor/**",
-		"**/.cache/**", "**/.turbo/**", "**/.next/cache/**", "**/.vitepress/cache/**",
-		"**/.gradle/**", "**/.venv/**", "**/__pycache__/**", "**/.pytest_cache/**",
-		"**/.mypy_cache/**", "**/.ruff_cache/**",
-	}
+// The union of the coding-agent [local] and [local-gitignore-aware] defaults
+// (.git, node_modules, .venv, target). The FUSE layer gates the second list on
+// the repository's ignore rules; bulk archive applies both directly, which is
+// what this matcher models. `.hg`/`.svn` are not defaults.
+func TestCodingAgentDefaultPatternsDropDependencyAndBuildOutput(t *testing.T) {
+	patterns := []string{"**/.git/**", "**/node_modules/**", "**/.venv/**", "**/target/**"}
 	m := NewMatcher(nil, patterns, nil)
 	drop := []string{
-		".git/HEAD", "proj/.git/config", "node_modules/react/index.js",
-		"proj/dist/bundle.js", "proj/build/output.o", "proj/.venv/bin/python",
-		"proj/__pycache__/foo.cpython-311.pyc", "proj/.next/cache/abc",
-		"proj/.pytest_cache/v/cache/lastfailed",
+		".git/HEAD", "proj/.git/config",
+		"node_modules/react/index.js", "proj/node_modules/pkg/x.js",
+		"proj/.venv/bin/python",
+		"proj/.venv/lib/python3.12/site-packages/numpy/core.py",
+		"proj/target/debug/app", "crates/foo/target/build/out.o",
 	}
 	for _, p := range drop {
 		if m.Match(p) {
 			t.Fatalf("coding-agent pattern should drop %q", p)
 		}
 	}
-	keep := []string{"proj/src/main.go", "README.md", "proj/go.mod", "proj/.gitignore"}
+	// `.hg`/`.svn` and other build/cache output are not default patterns.
+	keep := []string{
+		"proj/src/main.go", "README.md", "proj/go.mod", "proj/.gitignore",
+		".hg/HEAD", "proj/.svn/pristine/aa",
+		"proj/dist/bundle.js", "proj/build/output.o", "proj/.tox/py312/lib/python3.12/x.py",
+		"proj/__pycache__/mod.cpython-312.pyc", "proj/.cache/state.json",
+	}
 	for _, p := range keep {
 		if !m.Match(p) {
 			t.Fatalf("coding-agent pattern should keep %q", p)

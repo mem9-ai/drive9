@@ -25,7 +25,10 @@
           "make build"
         ],
         "local_only_patterns": [
-          "**/bin/**"
+          "**/bin/**",
+          "**/.cache/**",
+          "**/tmp/**",
+          "**/.git/**"
         ],
         "probe_paths": [
           ".git/drive9-blackbox-local-overlay-probe",
@@ -65,7 +68,9 @@
           "corepack pnpm run build"
         ],
         "local_only_patterns": [
-          "**/packages/node-sdk/.tmp-api-extractor/**"
+          "**/packages/node-sdk/.tmp-api-extractor/**",
+          "**/.git/**",
+          "**/node_modules/**"
         ],
         "probe_paths": [
           ".git/drive9-blackbox-local-overlay-probe",
