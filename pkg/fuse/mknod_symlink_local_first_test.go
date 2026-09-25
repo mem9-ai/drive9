@@ -1,0 +1,260 @@
+package fuse
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+)
+
+// localFirstBackend is a minimal fake backend that counts wire calls so
+// tests can assert how many round trips an operation makes.
+type localFirstBackend struct {
+	put     atomic.Int64
+	chmod   atomic.Int64
+	head    atomic.Int64
+	symPost atomic.Int64
+}
+
+func (b *localFirstBackend) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		q := r.URL.Query()
+		switch {
+		case r.Method == http.MethodPut:
+			b.put.Add(1)
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case r.Method == http.MethodPost && q.Has("chmod"):
+			b.chmod.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case r.Method == http.MethodPost && q.Has("symlink"):
+			if p == "/exists-link" {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			b.symPost.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case r.Method == http.MethodHead:
+			b.head.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"not found"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+}
+
+// newLocalFirstTestFS wires a write-back Dat9FS with the full staging stack
+// the way mount.go does, so local-first paths engage.
+func newLocalFirstTestFS(t *testing.T, ts *httptest.Server) *Dat9FS {
+	t.Helper()
+	dir := t.TempDir()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.WritePolicy = WritePolicyWriteBack
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	pIdx, err := NewPendingIndex(filepath.Join(dir, "pending"))
+	if err != nil {
+		t.Fatalf("pending index: %v", err)
+	}
+	if err := pIdx.RecoverFromDisk(); err != nil {
+		t.Fatalf("pending index recovery: %v", err)
+	}
+	fs.pendingIndex = pIdx
+
+	shadow, err := NewShadowStoreWithQuota(filepath.Join(dir, "shadow"), 0.1, 0)
+	if err != nil {
+		t.Fatalf("shadow store: %v", err)
+	}
+	fs.shadowStore = shadow
+	pIdx.setShadowStore(shadow)
+
+	jr, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	if err != nil {
+		t.Fatalf("journal: %v", err)
+	}
+	fs.journal = jr
+	pIdx.SetJournal(jr)
+
+	wb, err := NewWriteBackCache(filepath.Join(dir, "pending"))
+	if err != nil {
+		t.Fatalf("write-back cache: %v", err)
+	}
+	up := NewWriteBackUploader(newTestClient(ts.URL), wb, 2)
+	up.OnSuccess = fs.onWriteBackUploadSuccess
+	up.SnapshotStagingGens = fs.snapshotStagingGens
+	fs.SetWriteBack(wb, up)
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pIdx, jr, 2, maxCommitQueuePending)
+	cq.OnSuccess = fs.onCommitQueueSuccess
+	cq.OnUploaded = fs.onCommitQueueUploaded
+	cq.OnCleanup = fs.onCommitQueueCleanup
+	cq.OnDiscard = fs.onCommitQueueDiscard
+	cq.IsSuperseded = fs.commitEntrySuperseded
+	cq.PathLock = fs.lockRemoteCommitPath
+	cq.DurableWatermark = fs.latestCommittedRevision
+	fs.commitQueue = cq
+
+	t.Cleanup(func() {
+		cq.DrainAll()
+		up.DrainAll()
+		_ = jr.Close()
+	})
+	return fs
+}
+
+// TestMknodRegularLocalFirstNoSyncRoundTrips verifies that mknod of a regular
+// file on a staging-capable write-back mount answers from local state with
+// zero synchronous backend round trips, and that the empty image + mode are
+// committed asynchronously by the commit queue.
+func TestMknodRegularLocalFirstNoSyncRoundTrips(t *testing.T) {
+	backend := &localFirstBackend{}
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newLocalFirstTestFS(t, ts)
+
+	var out gofuse.EntryOut
+	st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFREG) | 0o600,
+	}, "created-by-mknod.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+	if got := backend.put.Load() + backend.chmod.Load() + backend.head.Load(); got != 0 {
+		t.Fatalf("mknod issued %d synchronous backend calls, want 0", got)
+	}
+	if got := out.Mode & uint32(syscall.S_IFMT); got != uint32(syscall.S_IFREG) {
+		t.Fatalf("mknod mode type = %o, want regular", got)
+	}
+	if got := out.Mode & 0o777; got != 0o600 {
+		t.Fatalf("mknod mode = %o, want 0600", got)
+	}
+
+	// The staged entry must be visible as pending metadata before the
+	// background commit lands.
+	if _, ok := fs.pendingIndex.GetMeta("/created-by-mknod.txt"); !ok {
+		t.Fatal("mknod did not stage pending index meta")
+	}
+
+	// The commit queue drains the empty image (direct PUT) and the mode.
+	fs.commitQueue.DrainAll()
+	if got := backend.put.Load(); got != 1 {
+		t.Fatalf("async create PUTs = %d, want 1", got)
+	}
+	if got := backend.chmod.Load(); got != 1 {
+		t.Fatalf("async chmod calls = %d, want 1", got)
+	}
+
+	// Staging is cleaned up after a successful commit.
+	if _, ok := fs.pendingIndex.GetMeta("/created-by-mknod.txt"); ok {
+		t.Fatal("pending meta survived commit")
+	}
+}
+
+// TestMknodRegularLocalFirstEEXISTOnPendingState verifies mknod refuses to
+// clobber locally staged state.
+func TestMknodRegularLocalFirstEEXISTOnPendingState(t *testing.T) {
+	backend := &localFirstBackend{}
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newLocalFirstTestFS(t, ts)
+
+	if err := fs.writeBack.Put("/staged.txt", []byte("staged"), 6, PendingNew); err != nil {
+		t.Fatalf("writeBack.Put: %v", err)
+	}
+
+	var out gofuse.EntryOut
+	st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFREG) | 0o600,
+	}, "staged.txt", &out)
+	if st != gofuse.Status(syscall.EEXIST) {
+		t.Fatalf("Mknod status = %v, want EEXIST", st)
+	}
+}
+
+// TestMknodRegularSyncFallbackWithoutStaging verifies mounts without staging
+// infrastructure keep the legacy synchronous create.
+func TestMknodRegularSyncFallbackWithoutStaging(t *testing.T) {
+	var puts, chmods, heads atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			puts.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmods.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case r.Method == http.MethodHead:
+			heads.Add(1)
+			w.Header().Set("X-Dat9-Revision", "3")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFREG) | 0o600,
+	}, "sync-mknod.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+	if got := puts.Load(); got != 1 {
+		t.Fatalf("create PUTs = %d, want 1", got)
+	}
+	if got := chmods.Load(); got != 1 {
+		t.Fatalf("chmod calls = %d, want 1", got)
+	}
+	if got := heads.Load(); got != 1 {
+		t.Fatalf("stat calls = %d, want 1", got)
+	}
+}
+
+// TestSymlinkSkipsPostCreateStat verifies symlink(2) issues exactly one
+// backend round trip (the POST) and still returns a complete entry.
+func TestSymlinkSkipsPostCreateStat(t *testing.T) {
+	backend := &localFirstBackend{}
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newLocalFirstTestFS(t, ts)
+
+	var out gofuse.EntryOut
+	st := fs.Symlink(nil, &gofuse.InHeader{NodeId: 1}, "/some/target", "created-link", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Symlink status = %v, want OK", st)
+	}
+	if got := backend.symPost.Load(); got != 1 {
+		t.Fatalf("symlink POSTs = %d, want 1", got)
+	}
+	if got := backend.head.Load(); got != 0 {
+		t.Fatalf("post-create stats = %d, want 0", got)
+	}
+	if got := out.Mode & uint32(syscall.S_IFMT); got != uint32(syscall.S_IFLNK) {
+		t.Fatalf("symlink mode type = %o, want symlink", got)
+	}
+	if got := out.Size; got != uint64(len("/some/target")) {
+		t.Fatalf("symlink size = %d, want %d", got, len("/some/target"))
+	}
+}
