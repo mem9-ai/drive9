@@ -371,7 +371,7 @@ each suite provisions a fresh tenant.
 3. CLI fork flow (`ctx add`, `ctx fork`, fork readiness polling, fork-context file read/write, fork delete)
 4. CLI small-file flow (`cp`, `ls`, `cat`, `mv`, `symlink`, `hardlink`, `rm`)
 5. CLI `cp` directory-target semantics (local->remote dir, remote->local dir, remote->remote dir all preserve source basename)
-6. CLI pack/unpack flow (coding-agent local overlay `.git` + `dist` archived to the default hidden pack slot and restored into a fresh local root)
+6. CLI pack/unpack flow (a custom-profile local overlay `.git` + `dist` archived to the default hidden pack slot and restored into a fresh local root)
 7. CLI batch small-file flow (`cp` many files + dir list count + stat + sample reads)
 8. CLI search flow (`fs grep`, `fs find`)
 9. CLI semantic and image-associated recall flow (`fs grep` paraphrase + image caption recall) with async polling

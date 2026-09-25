@@ -49,6 +49,48 @@ MINIO_IMAGE_CANDIDATES="$MINIO_IMAGE"
 if [ -n "$MINIO_FALLBACK_IMAGE" ] && [ "$MINIO_FALLBACK_IMAGE" != "$MINIO_IMAGE" ]; then
   MINIO_IMAGE_CANDIDATES="$MINIO_IMAGE_CANDIDATES $MINIO_FALLBACK_IMAGE"
 fi
+# Seconds to wait for one candidate's health endpoint; overridable for
+# hermetic tests (a refused connection fails immediately; the deadline only
+# bounds a slow-answering candidate).
+MINIO_HEALTH_TIMEOUT_S="${MINIO_HEALTH_TIMEOUT_S:-40}"
+# Per-probe bounds. Without them a server that accepts TCP but never answers
+# the health request would stall `curl` past any deadline: the overall
+# --max-time is what makes MINIO_HEALTH_TIMEOUT_S effective.
+MINIO_HEALTH_CONNECT_TIMEOUT_S="${MINIO_HEALTH_CONNECT_TIMEOUT_S:-2}"
+# One-shot reuse checks answer "is a MinIO already there?" with a single
+# bounded probe — no retries — so a clean port costs nothing and a stalled
+# leftover server costs at most this many seconds.
+MINIO_HEALTH_PROBE_TIMEOUT_S="${MINIO_HEALTH_PROBE_TIMEOUT_S:-5}"
+# curl treats --max-time 0 as "no limit", so every knob must be a positive
+# integer or the bounded-probe contract silently breaks. Invalid values fall
+# back to the defaults instead.
+positive_int() {
+  case "${1:-}" in
+    '' | *[!0-9]*) return 1 ;;
+    *) [ "$1" -ge 1 ] ;;
+  esac
+}
+while :; do
+  if positive_int "$MINIO_HEALTH_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_TIMEOUT_S='$MINIO_HEALTH_TIMEOUT_S' is not a positive integer; using 40" >&2
+    MINIO_HEALTH_TIMEOUT_S=40
+  fi
+  if positive_int "$MINIO_HEALTH_CONNECT_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_CONNECT_TIMEOUT_S='$MINIO_HEALTH_CONNECT_TIMEOUT_S' is not a positive integer; using 2" >&2
+    MINIO_HEALTH_CONNECT_TIMEOUT_S=2
+  fi
+  if positive_int "$MINIO_HEALTH_PROBE_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_PROBE_TIMEOUT_S='$MINIO_HEALTH_PROBE_TIMEOUT_S' is not a positive integer; using 5" >&2
+    MINIO_HEALTH_PROBE_TIMEOUT_S=5
+  fi
+  break
+done
 
 check_eq() {
   local desc="$1" got="$2" want="$3"
@@ -226,15 +268,28 @@ start_minio_bin() {
   MINIO_PID=$!
 }
 
-wait_http() {
+# probe_health is a single bounded probe for reuse detection: it answers
+# immediately when nothing is listening (connection refused) and cannot hang
+# on a stalled server. Retry-until-deadline semantics belong to wait_health,
+# which is only for a process this script just started.
+probe_health() {
+  curl -sf --connect-timeout "$MINIO_HEALTH_CONNECT_TIMEOUT_S" --max-time "$MINIO_HEALTH_PROBE_TIMEOUT_S" "$1" >/dev/null 2>&1
+}
+
+wait_health() {
+  # Bounded probe loop: each curl carries --connect-timeout/--max-time so a
+  # server that accepts TCP but stalls the HTTP response cannot hang past the
+  # deadline (the probe's --max-time is the seconds the wait has left).
   local url="$1"
-  local deadline=$(($(date +%s) + 40))
+  local deadline=$(($(date +%s) + MINIO_HEALTH_TIMEOUT_S))
+  local remaining
   while :; do
-    if curl -sf "$url" >/dev/null; then
-      return 0
-    fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
+    remaining=$((deadline - $(date +%s)))
+    if [ "$remaining" -le 0 ]; then
       return 1
+    fi
+    if curl -sf --connect-timeout "$MINIO_HEALTH_CONNECT_TIMEOUT_S" --max-time "$remaining" "$url" >/dev/null 2>&1; then
+      return 0
     fi
     sleep 0.4
   done
@@ -413,26 +468,48 @@ else
   export AWS_REGION="${AWS_REGION:-us-east-1}"
   export AWS_DEFAULT_REGION="$AWS_REGION"
 
-  if curl -sf "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null 2>&1; then
+  if probe_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"; then
     echo "reusing MinIO on :$MINIO_PORT"
   elif pick_runtime; then
     echo "starting MinIO with $RUNTIME on :$MINIO_PORT"
     MINIO_CID="drive9-e2e-minio-$$"
+    # A candidate is accepted only when its container actually turns healthy:
+    # `run -d` succeeding says nothing about the server inside (entrypoint or
+    # platform mismatches exit right after start). An unhealthy candidate is
+    # logged, removed, and replaced by the next one; the binary fallback runs
+    # only after every candidate failed this way. This also applies to a
+    # pre-existing same-name container that is not healthy.
     container_started=""
     image=""
     for image in $MINIO_IMAGE_CANDIDATES; do
+      if "$RUNTIME" inspect "$MINIO_CID" >/dev/null 2>&1; then
+        if [ "$("$RUNTIME" inspect -f '{{.State.Running}}' "$MINIO_CID" 2>/dev/null)" != "true" ]; then
+          "$RUNTIME" start "$MINIO_CID" >/dev/null 2>&1 || true
+        fi
+        if wait_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"; then
+          container_started=1
+          break
+        fi
+        echo "MinIO container ($image via $RUNTIME) is not healthy; removing and trying the next candidate"
+        "$RUNTIME" logs "$MINIO_CID" 2>&1 | tail -5 || true
+        "$RUNTIME" rm -f "$MINIO_CID" >/dev/null 2>&1 || true
+        continue
+      fi
       if "$RUNTIME" run -d --name "$MINIO_CID" \
         -p "${MINIO_PORT}:9000" \
         -e "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
         -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
-        "$image" server /data >/dev/null; then
+        "$image" server /data >/dev/null 2>&1 \
+        && wait_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"; then
         container_started=1
         break
       fi
+      echo "MinIO image $image did not become healthy via $RUNTIME; trying the next candidate"
+      "$RUNTIME" logs "$MINIO_CID" 2>&1 | tail -5 || true
       "$RUNTIME" rm -f "$MINIO_CID" >/dev/null 2>&1 || true
     done
     if [ -z "$container_started" ]; then
-      echo "no MinIO image could start; falling back to the MinIO binary"
+      echo "no MinIO image became healthy; falling back to the MinIO binary"
       if ! start_minio_bin; then
         echo "FAIL need docker, podman, or a minio binary (or set OBJECT_S3_URI)"
         exit 1
@@ -445,8 +522,16 @@ else
       exit 1
     fi
   fi
-  check_cmd "MinIO health" wait_http "http://127.0.0.1:${MINIO_PORT}/minio/health/live"
+  check_cmd "MinIO health" wait_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"
   check_cmd "create MinIO bucket $MINIO_BUCKET" create_bucket "127.0.0.1:${MINIO_PORT}" "$MINIO_BUCKET"
+
+  if [ "${OBJECT_BOOTSTRAP_ONLY:-0}" = "1" ]; then
+    # Hermetic hook for scripts/test-minio-bootstrap.sh: with a fake runtime
+    # on PATH, run only the MinIO provisioning above and stop before any CLI
+    # work.
+    echo "bootstrap-only: MinIO provisioning finished"
+    exit 0
+  fi
 
   OBJ_BASE="s3://${MINIO_BUCKET}/${PREFIX}"
   OBJ_QUERY="?region=${AWS_REGION}&endpoint=$(urlencode "http://127.0.0.1:${MINIO_PORT}")&forcePathStyle=true"

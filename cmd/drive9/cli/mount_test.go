@@ -2686,6 +2686,77 @@ func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
 	if !reflect.DeepEqual(got.RemoteOnlyPatterns, []string{"**/node_modules/keep/**"}) {
 		t.Fatalf("RemoteOnlyPatterns = %v", got.RemoteOnlyPatterns)
 	}
+	wantGated := builtinCodingAgentGitignoreAwarePatterns()
+	if !reflect.DeepEqual(got.LocalGitignoreAwarePatterns, wantGated) {
+		t.Fatalf("LocalGitignoreAwarePatterns = %v, want %v", got.LocalGitignoreAwarePatterns, wantGated)
+	}
+}
+
+func TestMountCmdLocalOnlyGitignoreAwareFlag(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+	if err := MountCmd([]string{
+		"--foreground", "--mode", "fuse",
+		"--server", "https://drive9.example", "--api-key", "sk-test",
+		"--profile", "coding-agent",
+		"--local-root", t.TempDir(),
+		"--local-only", "**/scratch/**",
+		"--local-only-gitignore-aware", "**/generated/**",
+		t.TempDir(),
+	}); err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	wantLocal := append(builtinCodingAgentLocalOnlyPatterns(), "**/scratch/**")
+	if !reflect.DeepEqual(got.LocalOnlyPatterns, wantLocal) {
+		t.Fatalf("LocalOnlyPatterns = %v, want %v", got.LocalOnlyPatterns, wantLocal)
+	}
+	wantGated := append(builtinCodingAgentGitignoreAwarePatterns(), "**/generated/**")
+	if !reflect.DeepEqual(got.LocalGitignoreAwarePatterns, wantGated) {
+		t.Fatalf("LocalGitignoreAwarePatterns = %v, want %v", got.LocalGitignoreAwarePatterns, wantGated)
+	}
+}
+
+func TestMountCmdLocalGitignoreAwareProfileSection(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	writeTestProfile(t, "gated", "[local]\n**/deps/**\n[local-gitignore-aware]\n**/build-out/**\n")
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+	if err := MountCmd([]string{
+		"--foreground", "--mode", "fuse",
+		"--server", "https://drive9.example", "--api-key", "sk-test",
+		"--profile", "gated",
+		"--local-root", t.TempDir(),
+		t.TempDir(),
+	}); err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if !reflect.DeepEqual(got.LocalOnlyPatterns, []string{"**/deps/**"}) {
+		t.Fatalf("LocalOnlyPatterns = %v, want [**/deps/**]", got.LocalOnlyPatterns)
+	}
+	if !reflect.DeepEqual(got.LocalGitignoreAwarePatterns, []string{"**/build-out/**"}) {
+		t.Fatalf("LocalGitignoreAwarePatterns = %v, want [**/build-out/**]", got.LocalGitignoreAwarePatterns)
+	}
 }
 
 func TestMountCmdCodingAgentProfileMergesPolicyEnvironment(t *testing.T) {

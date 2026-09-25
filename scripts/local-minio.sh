@@ -45,6 +45,47 @@ MINIO_IMAGE_CANDIDATES="$IMAGE"
 if [ -n "$FALLBACK_IMAGE" ] && [ "$FALLBACK_IMAGE" != "$IMAGE" ]; then
   MINIO_IMAGE_CANDIDATES="$MINIO_IMAGE_CANDIDATES $FALLBACK_IMAGE"
 fi
+# Seconds to wait for one candidate's health endpoint; overridable for
+# hermetic tests (a candidate only holds the loop this long when something
+# answers slowly — a refused connection fails immediately).
+MINIO_HEALTH_TIMEOUT_S="${MINIO_HEALTH_TIMEOUT_S:-40}"
+# Per-probe bounds. Without them a server that accepts TCP but never answers
+# the health request would stall `curl` past any deadline: the overall
+# --max-time is what makes MINIO_HEALTH_TIMEOUT_S effective.
+MINIO_HEALTH_CONNECT_TIMEOUT_S="${MINIO_HEALTH_CONNECT_TIMEOUT_S:-2}"
+# Cap for one-shot probes (reuse checks, status). Retry loops pass their
+# remaining budget explicitly instead of using this default.
+MINIO_HEALTH_PROBE_TIMEOUT_S="${MINIO_HEALTH_PROBE_TIMEOUT_S:-5}"
+# curl treats --max-time 0 as "no limit", so every knob must be a positive
+# integer or the bounded-probe contract silently breaks. Invalid values fall
+# back to the defaults instead.
+positive_int() {
+  case "${1:-}" in
+    '' | *[!0-9]*) return 1 ;;
+    *) [ "$1" -ge 1 ] ;;
+  esac
+}
+while :; do
+  if positive_int "$MINIO_HEALTH_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_TIMEOUT_S='$MINIO_HEALTH_TIMEOUT_S' is not a positive integer; using 40" >&2
+    MINIO_HEALTH_TIMEOUT_S=40
+  fi
+  if positive_int "$MINIO_HEALTH_CONNECT_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_CONNECT_TIMEOUT_S='$MINIO_HEALTH_CONNECT_TIMEOUT_S' is not a positive integer; using 2" >&2
+    MINIO_HEALTH_CONNECT_TIMEOUT_S=2
+  fi
+  if positive_int "$MINIO_HEALTH_PROBE_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_PROBE_TIMEOUT_S='$MINIO_HEALTH_PROBE_TIMEOUT_S' is not a positive integer; using 5" >&2
+    MINIO_HEALTH_PROBE_TIMEOUT_S=5
+  fi
+  break
+done
 
 HEALTH_HOST="$BIND"
 if [ "$BIND" = "0.0.0.0" ] || [ "$BIND" = "::" ] || [ "$BIND" = "[::]" ]; then
@@ -60,7 +101,13 @@ shell_quote() {
 }
 
 url_healthy() {
-  curl -sf "$1/minio/health/live" >/dev/null 2>&1
+  # Bounded probe: connect-timeout covers a black-holed peer, and --max-time
+  # (default: the full health budget) covers a server that accepts TCP but
+  # stalls the HTTP response. $2 overrides the cap for callers with a running
+  # deadline (wait_healthy passes the seconds it has left).
+  local url="$1"
+  local max_time="${2:-$MINIO_HEALTH_PROBE_TIMEOUT_S}"
+  curl -sf --connect-timeout "$MINIO_HEALTH_CONNECT_TIMEOUT_S" --max-time "$max_time" "$url/minio/health/live" >/dev/null 2>&1
 }
 
 candidate_runtimes() {
@@ -143,13 +190,15 @@ PY
 
 wait_healthy() {
   local url="$1"
-  local deadline=$(($(date +%s) + 40))
+  local deadline=$(($(date +%s) + MINIO_HEALTH_TIMEOUT_S))
+  local remaining
   while :; do
-    if url_healthy "$url"; then
-      return 0
-    fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
+    remaining=$((deadline - $(date +%s)))
+    if [ "$remaining" -le 0 ]; then
       return 1
+    fi
+    if url_healthy "$url" "$remaining"; then
+      return 0
     fi
     sleep 0.3
   done
@@ -167,22 +216,36 @@ print_env() {
 
 start_container() {
   local runtime="$1"
-  if "$runtime" inspect "$CONTAINER" >/dev/null 2>&1; then
-    if [ "$("$runtime" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]; then
-      return 0
-    fi
-    "$runtime" start "$CONTAINER" >/dev/null
-    return 0
-  fi
+  # A candidate is accepted only when its container actually turns healthy:
+  # `run -d` succeeding says nothing about the server inside (entrypoint or
+  # platform mismatches exit right after start). An unhealthy candidate is
+  # logged, removed, and replaced by the next one; the caller falls back to
+  # the binary only after every candidate failed this way. This also applies
+  # to a pre-existing same-name container that is not healthy.
   local image
   for image in $MINIO_IMAGE_CANDIDATES; do
+    if "$runtime" inspect "$CONTAINER" >/dev/null 2>&1; then
+      if [ "$("$runtime" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]; then
+        "$runtime" start "$CONTAINER" >/dev/null 2>&1 || true
+      fi
+      if wait_healthy "$HEALTH_URL"; then
+        return 0
+      fi
+      echo "MinIO container ($image via $runtime) is not healthy; removing and trying the next candidate" >&2
+      "$runtime" logs "$CONTAINER" 2>&1 | tail -5 >&2 || true
+      "$runtime" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+      continue
+    fi
     if "$runtime" run -d --name "$CONTAINER" \
       -p "${BIND}:${PORT}:9000" \
       -e "MINIO_ROOT_USER=${ACCESS_KEY}" \
       -e "MINIO_ROOT_PASSWORD=${SECRET_KEY}" \
-      "$image" server /data >/dev/null; then
+      "$image" server /data >/dev/null 2>&1 \
+      && wait_healthy "$HEALTH_URL"; then
       return 0
     fi
+    echo "MinIO image $image did not become healthy via $runtime; trying the next candidate" >&2
+    "$runtime" logs "$CONTAINER" 2>&1 | tail -5 >&2 || true
     "$runtime" rm -f "$CONTAINER" >/dev/null 2>&1 || true
   done
   return 1
@@ -258,14 +321,11 @@ cmd_ensure() {
   runtimes="$(candidate_runtimes || true)"
   for runtime in $runtimes; do
     echo "starting MinIO via $runtime on ${BIND}:${PORT}" >&2
-    if start_container "$runtime" && wait_healthy "$HEALTH_URL"; then
+    if start_container "$runtime"; then
       ensure_bucket
       return 0
     fi
     echo "MinIO via $runtime was not healthy at $HEALTH_URL" >&2
-    if [ -n "$runtime" ]; then
-      "$runtime" logs "$CONTAINER" 2>&1 | tail -20 >&2 || true
-    fi
   done
 
   echo "starting MinIO binary on ${BIND}:${PORT}" >&2

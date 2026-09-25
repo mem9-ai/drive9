@@ -64,7 +64,7 @@ The built-in profiles are:
 
 | Profile | Local overlay policy | Automatic pack policy |
 | --- | --- | --- |
-| `coding-agent` | Routes common agent/developer local state to local disk, including `.git`, `node_modules`, `.venv`, caches, and build output. This is the default FUSE profile. | No automatic pack paths. Nothing is packed unless the user explicitly asks. |
+| `coding-agent` | `[local]` dependency trees (`node_modules`, `.venv`, overlaid unconditionally) and `[local-gitignore-aware]` build output (`target`, overlaid only when the repository also ignores it; see [git-fast-clone-workspace](./git-fast-clone-workspace.md)). `.git` is local only for a Git workspace; `.hg`/`.svn` sync to the remote. This is the default FUSE profile. | No automatic pack paths. Nothing is packed unless the user explicitly asks. |
 | `portable` | Uses the same local overlay policy as `coding-agent`. | Packs all files and directories that currently exist under `local-root/overlay`. |
 | `none` | No local overlay policy. | No pack policy. |
 
@@ -284,7 +284,7 @@ If the overlay contains:
 ```text
 <local-root>/overlay/repo/.git/
 <local-root>/overlay/repo/node_modules/
-<local-root>/overlay/repo/dist/
+<local-root>/overlay/repo/target/
 ```
 
 then `portable` includes those local overlay entries. If a source file is
