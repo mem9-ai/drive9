@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,7 +85,9 @@ func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 			if b.putGate != nil {
 				<-b.putGate
 			}
+			b.mu.Lock()
 			b.exists[p] = true
+			b.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case http.MethodDelete:
@@ -138,11 +141,14 @@ func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 		case http.MethodHead:
 			b.heads.Add(1)
 			b.record("HEAD")
-			if !b.exists[p] {
+			b.mu.Lock()
+			exists, rev := b.exists[p], b.revs[p]
+			b.mu.Unlock()
+			if !exists {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			w.Header().Set("X-Dat9-Revision", "7")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
 			w.Header().Set("X-Dat9-IsDir", "false")
 			w.WriteHeader(http.StatusOK)
 		default:

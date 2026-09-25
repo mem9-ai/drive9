@@ -420,10 +420,11 @@ func (cq *CommitQueue) delayEntryLocked(entry *CommitEntry, window time.Duration
 // PendingDelete entries under prefix and returns them, so the caller can
 // replace the whole subtree's deletes with one recursive DELETE. The second
 // return is false when the prefix also has queued content commits — the
-// caller must drain instead of aggregating. Nothing is re-dispatched here:
-// on aggregation failure the caller re-enqueues fresh PendingDelete entries
-// (never the taken ones — a dispatched-but-unpicked entry may still live in
-// workCh, and re-Enqueueing it would double-dispatch).
+// caller must drain instead of aggregating. Entries whose coalescing timer
+// already fired (dispatched to the workers, possibly still unpicked) stay
+// untouched: they remain visible to CancelPrefix, which marks them canceled
+// in the caller's cleanup, and a dispatched entry re-enqueued on failure
+// would double-dispatch. Nothing is re-dispatched here.
 func (cq *CommitQueue) TakePendingDeletesUnderPrefix(prefix string) ([]*CommitEntry, bool) {
 	if cq == nil || prefix == "" {
 		return nil, false
@@ -441,7 +442,8 @@ func (cq *CommitQueue) TakePendingDeletesUnderPrefix(prefix string) ([]*CommitEn
 	var taken []*CommitEntry
 	remaining := cq.queue[:0]
 	for _, entry := range cq.queue {
-		if entry != nil && !entry.canceled && entry.Kind == PendingDelete && strings.HasPrefix(entry.Path, prefix) {
+		if entry != nil && !entry.canceled && !entry.dispatched &&
+			entry.Kind == PendingDelete && strings.HasPrefix(entry.Path, prefix) {
 			cq.stopDelayedLocked(entry)
 			cq.removeQueuedLocked(entry)
 			taken = append(taken, entry)

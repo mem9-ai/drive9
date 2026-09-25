@@ -7345,9 +7345,19 @@ func (fs *Dat9FS) tryAggregatedRmdir(ctx context.Context, dirPath string) bool {
 			}
 		}
 		deleteStart := time.Now()
-		err = fs.client.RemoveAllCtx(ctx, fs.remotePath(dirPath))
+		// Detached like every other namespace-mutation commit: a FUSE
+		// interrupt after the backend committed must not turn into a
+		// fallback that answers ENOENT for an rmdir that succeeded.
+		commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+		err = fs.client.RemoveAllCtx(commitCtx, fs.remotePath(dirPath))
+		commitCancel()
 		fs.perfRecordRemote(perfRemoteMutation, deleteStart, err, 0)
 		if err != nil && !isNotFoundErr(err) {
+			if fs.remotePathGoneDetached(dirPath) {
+				err = nil // committed despite the ambiguous outcome
+			}
+		}
+		if err != nil {
 			safeLogPrintf("rmdir: recursive delete failed for %s: %v (falling back to per-path deletes)", dirPath, err)
 			fs.reenqueueDeferredDeletes(taken)
 			return false
