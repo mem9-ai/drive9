@@ -323,19 +323,37 @@ func (j *Journal) Close() error {
 // Entries whose .meta survived (already present in the pending index) are
 // left untouched by legacy fsync frames. Full pending-meta WAL frames can
 // replace an older .meta left by a failed best-effort write-back snapshot.
-func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStore) error {
+// replayDeferredDelete is a JournalUnlink intent whose remote DELETE was
+// never observed to land: the WAL has no newer JournalCommit marker for the
+// path, and no newer local produce (meta/fsync frame) recreates it. The
+// mount re-enqueues these as PendingDelete commit entries after recovery.
+type replayDeferredDelete struct {
+	Path    string
+	BaseRev int64
+}
+
+func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStore) ([]replayDeferredDelete, error) {
 	if j == nil || idx == nil {
-		return nil
+		return nil, nil
 	}
 
 	latestData := make(map[string]JournalEntry) // path → latest fsync entry
 	latestMeta := make(map[string]JournalEntry) // path → latest pending-meta entry
 	latestDone := make(map[string]uint64)       // path → latest commit/unlink seq
+	latestUnlink := make(map[string]JournalEntry)
+	latestCommitDone := make(map[string]uint64)
 	if err := j.Replay(func(e JournalEntry) {
 		switch e.Op {
 		case JournalCommit, JournalUnlink:
 			if e.Seq > latestDone[e.Path] {
 				latestDone[e.Path] = e.Seq
+			}
+			if e.Op == JournalUnlink {
+				if prev, ok := latestUnlink[e.Path]; !ok || e.Seq > prev.Seq {
+					latestUnlink[e.Path] = e
+				}
+			} else if e.Seq > latestCommitDone[e.Path] {
+				latestCommitDone[e.Path] = e.Seq
 			}
 		case JournalFsync:
 			// Only fsync frames assert "shadow data is durable"; other ops
@@ -349,7 +367,23 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 			}
 		}
 	}); err != nil {
-		return err
+		return nil, err
+	}
+
+	// Deferred-delete intents whose remote DELETE never landed (no newer
+	// JournalCommit marker) and that no newer local produce recreates.
+	var deferredDeletes []replayDeferredDelete
+	for path, e := range latestUnlink {
+		if done, ok := latestCommitDone[path]; ok && done > e.Seq {
+			continue // the delete landed
+		}
+		if m, ok := latestMeta[path]; ok && m.Seq > e.Seq {
+			continue // the path was re-staged after the unlink intent
+		}
+		if d, ok := latestData[path]; ok && d.Seq > e.Seq {
+			continue // likewise, a newer fsynced produce wins
+		}
+		deferredDeletes = append(deferredDeletes, replayDeferredDelete{Path: path, BaseRev: e.BaseRev})
 	}
 
 	// A path can have both frame kinds (close published a meta frame, a later
@@ -430,7 +464,7 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 			continue // the meta frame is newer and carries full fidelity
 		}
 		if err := ressurrect(path, e, false); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	for path, e := range latestMeta {
@@ -438,8 +472,8 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 			continue // the fsync frame is newer
 		}
 		if err := ressurrect(path, e, true); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return deferredDeletes, nil
 }

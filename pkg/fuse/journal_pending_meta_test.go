@@ -39,7 +39,7 @@ func TestPendingIndexJournalRouteAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pending index 2: %v", err)
 	}
-	if err := replayJournalIntoPending(j, idx2, nil); err != nil {
+	if _, err := replayJournalIntoPending(j, idx2, nil); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	m, ok := idx2.GetMeta("/w/f1.bin")
@@ -88,7 +88,7 @@ func TestJournalPendingMetaSupersededByCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pending index 2: %v", err)
 	}
-	if err := replayJournalIntoPending(j, idx2, nil); err != nil {
+	if _, err := replayJournalIntoPending(j, idx2, nil); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	if idx2.HasPending("/w/f2.bin") {

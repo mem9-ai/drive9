@@ -6983,6 +6983,75 @@ func (fs *Dat9FS) markPathDeleted(path string) {
 	}
 }
 
+// deferredUnlinkActiveFor reports whether this unlink may apply the remote
+// DELETE asynchronously on the commit queue instead of on the unlink(2)
+// critical path. Only the write-back policy qualifies — close-sync and
+// write-sync promise remote durability at close/write time — and the mount
+// needs the full queue + journal stack. A legacy write-back snapshot means
+// the legacy uploader may still PUT this path outside the queue's ordering,
+// so those paths take the synchronous branch.
+func (fs *Dat9FS) deferredUnlinkActiveFor(childP string) bool {
+	if fs == nil || !fs.opts.DeferredUnlink || fs.commitQueue == nil || fs.journal == nil {
+		return false
+	}
+	if policy := fs.opts.WritePolicy; policy != WritePolicyWriteBack && policy != "" {
+		return false
+	}
+	if fs.layerEnabled() || fs.gvisorCompatibilityEnabled() {
+		return false
+	}
+	if fs.writeBack != nil {
+		if _, ok := fs.writeBack.GetMeta(childP); ok {
+			return false
+		}
+	}
+	return true
+}
+
+// appendDeferredUnlinkIntent durably records the unlink intent as a
+// JournalUnlink WAL frame. Replay already treats that opcode as a
+// done-marker (it suppresses resurrection of stale pending uploads for the
+// path), and mount recovery re-enqueues intents that have no newer
+// JournalCommit marker — so a crash between the local unlink and the
+// background DELETE cannot leave the file on the backend.
+func (fs *Dat9FS) appendDeferredUnlinkIntent(childP string, ino uint64, baseRev int64) bool {
+	if fs == nil || fs.journal == nil {
+		return false
+	}
+	if err := fs.journal.Append(JournalEntry{Op: JournalUnlink, Inode: ino, Path: childP, BaseRev: baseRev}); err != nil {
+		safeLogPrintf("unlink: journal intent append failed for %s: %v", childP, err)
+		return false
+	}
+	// Group-committed fsync: unlink(2) returning OK is what the application
+	// sees as "the file is gone", so the intent must be durable by then.
+	if err := fs.journal.FsyncShared(); err != nil {
+		safeLogPrintf("unlink: journal intent fsync failed for %s: %v", childP, err)
+		return false
+	}
+	return true
+}
+
+// syncFallbackDeferredUnlink is the synchronous escape hatch when the
+// deferred delete cannot be staged or enqueued. On success it appends the
+// confirming journal marker so the next mount does not re-delete the path.
+func (fs *Dat9FS) syncFallbackDeferredUnlink(childP string) {
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	err := fs.deleteRemoteFileWithInterruptRecovery(cleanupCtx, childP)
+	cleanupCancel()
+	if err != nil && !isNotFoundErr(err) {
+		// The durable intent (when written) re-applies the delete after
+		// restart; without it the file resurfaces remotely, matching the
+		// pre-delete crash semantics of the synchronous path.
+		safeLogPrintf("unlink: sync fallback delete failed for %s: %v", childP, err)
+		return
+	}
+	if fs.journal != nil {
+		if markerErr := fs.journal.Append(JournalEntry{Op: JournalCommit, Path: childP}); markerErr != nil {
+			safeLogPrintf("unlink: journal delete-done marker failed for %s: %v", childP, markerErr)
+		}
+	}
+}
+
 // pruneExpiredDeletedPathsLocked removes tombstones past their TTL.
 // Caller must hold deletedPathsMu.
 func (fs *Dat9FS) pruneExpiredDeletedPathsLocked() {
@@ -10498,13 +10567,18 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}
 	preserveOpen = markedAny
 
+	deferredUnlink := fs.deferredUnlinkActiveFor(childP)
 	if fs.writeBack != nil && fs.uploader != nil {
-		// Wait for any in-flight upload to finish so it doesn't "revive"
-		// the file on the server after we delete it.
-		waitStart := time.Now()
-		fs.debugf("unlink wait writeback start path=%s", childP)
-		fs.uploader.WaitPath(childP)
-		fs.debugDurationf(waitStart, 0, "unlink wait writeback done path=%s", childP)
+		if !deferredUnlink {
+			// Wait for any in-flight upload to finish so it doesn't "revive"
+			// the file on the server after we delete it. Deferred deletes
+			// skip this wait: the queued DELETE serializes behind any
+			// in-flight commit for the path instead.
+			waitStart := time.Now()
+			fs.debugf("unlink wait writeback start path=%s", childP)
+			fs.uploader.WaitPath(childP)
+			fs.debugDurationf(waitStart, 0, "unlink wait writeback done path=%s", childP)
+		}
 		// Check if the file was created locally and never uploaded. Read-only
 		// here: the destructive writeBack Remove is deferred to the commit
 		// point after a successful remote DELETE, so a failed DELETE leaves
@@ -10517,10 +10591,12 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// cannot resurrect the deleted file. The destructive CancelPath is
 	// deferred to the commit point (see writeBack note above).
 	if fs.commitQueue != nil {
-		waitStart := time.Now()
-		fs.debugf("unlink wait commit start path=%s", childP)
-		fs.commitQueue.WaitPath(childP)
-		fs.debugDurationf(waitStart, 0, "unlink wait commit done path=%s", childP)
+		if !deferredUnlink {
+			waitStart := time.Now()
+			fs.debugf("unlink wait commit start path=%s", childP)
+			fs.commitQueue.WaitPath(childP)
+			fs.debugDurationf(waitStart, 0, "unlink wait commit done path=%s", childP)
+		}
 
 		// Re-check pendingIndex after WaitPath. On a successful commit,
 		// commitQueue removes pendingIndex before taking the entry out of
@@ -10573,35 +10649,55 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 	}
 
+	// A deferred delete serializes behind any same-path commit still in the
+	// queue (beginInFlight + path lock), so an in-flight upload can never
+	// land after the DELETE — the path can be treated as remote-existing
+	// without waiting for that upload here.
+	if deferredUnlink && pendingNew && fs.commitQueue != nil && fs.commitQueue.HasPath(childP) {
+		pendingNew = false
+	}
+
+	deferredDelete := false
+	deferredIno, _ := fs.inodes.GetInode(childP)
+	deferredBaseRev := fs.latestCommittedRevision(childP)
 	if !pendingNew {
-		// File existed on server (or unknown) — issue remote DELETE.
-		// Tolerate 404 in case it was already deleted. The gVisor gate here
-		// governs only this orchestration context; the remote DELETE itself
-		// re-detaches inside deleteRemoteFileWithInterruptRecovery for every
-		// mount mode.
-		deleteCtx, deleteCancel := fuseCtx(cancel)
-		if fs.gvisorCompatibilityEnabled() {
+		if deferredUnlink {
+			// The remote DELETE is applied asynchronously by the commit
+			// queue. The durable journal intent is appended below, after the
+			// commit-point CancelPath, so its sequence is newer than any done
+			// marker that cleanup writes — replay must see it as pending.
+			deferredDelete = true
+			fs.debugf("unlink deferred delete staged path=%s base_rev=%d", childP, deferredBaseRev)
+		} else {
+			// File existed on server (or unknown) — issue remote DELETE.
+			// Tolerate 404 in case it was already deleted. The gVisor gate here
+			// governs only this orchestration context; the remote DELETE itself
+			// re-detaches inside deleteRemoteFileWithInterruptRecovery for every
+			// mount mode.
+			deleteCtx, deleteCancel := fuseCtx(cancel)
+			if fs.gvisorCompatibilityEnabled() {
+				deleteCancel()
+				deleteCtx, deleteCancel = fs.namespaceMutationCommitContext(ctx)
+			}
+			deleteStart := time.Now()
+			fs.debugf("unlink remote delete start path=%s", childP)
+			err := fs.deleteRemoteFileWithInterruptRecovery(deleteCtx, childP)
 			deleteCancel()
-			deleteCtx, deleteCancel = fs.namespaceMutationCommitContext(ctx)
-		}
-		deleteStart := time.Now()
-		fs.debugf("unlink remote delete start path=%s", childP)
-		err := fs.deleteRemoteFileWithInterruptRecovery(deleteCtx, childP)
-		deleteCancel()
-		fs.debugDurationf(deleteStart, 0, "unlink remote delete done path=%s err=%v", childP, err)
-		if err != nil {
-			if !isNotFoundErr(err) {
-				unlockRemoteCommit()
-				// Roll back pass-1 marking: the directory entry still exists
-				// remotely, so the handles must not be treated as unlinked —
-				// otherwise their next Flush/Fsync/Release discards dirty
-				// data (silent data loss after a transient DELETE error).
-				// No staging-store rollback is needed: every destructive
-				// Remove/CancelPath is deferred to the commit point below,
-				// which a failed DELETE never reaches.
-				fs.unmarkOpenHandlesAfterFailedUnlink(childP, markedHandles)
-				status = httpToFuseStatus(err)
-				return status
+			fs.debugDurationf(deleteStart, 0, "unlink remote delete done path=%s err=%v", childP, err)
+			if err != nil {
+				if !isNotFoundErr(err) {
+					unlockRemoteCommit()
+					// Roll back pass-1 marking: the directory entry still exists
+					// remotely, so the handles must not be treated as unlinked —
+					// otherwise their next Flush/Fsync/Release discards dirty
+					// data (silent data loss after a transient DELETE error).
+					// No staging-store rollback is needed: every destructive
+					// Remove/CancelPath is deferred to the commit point below,
+					// which a failed DELETE never reaches.
+					fs.unmarkOpenHandlesAfterFailedUnlink(childP, markedHandles)
+					status = httpToFuseStatus(err)
+					return status
+				}
 			}
 		}
 	}
@@ -10633,6 +10729,26 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// handle/inode bookkeeping takes fh.mu (lock order is fh.mu →
 	// remoteCommitLock everywhere else).
 	unlockRemoteCommit()
+
+	// Enqueue the deferred delete after the commit-point cleanup: CancelPath
+	// above must not see (and cancel) this entry. The journal intent is
+	// written here — newer than any done marker CancelPath wrote — so replay
+	// always treats the delete as pending until the queue confirms it. If
+	// the intent or the enqueue fails, fall back to a synchronous delete and
+	// mark the intent confirmed on success.
+	if deferredDelete {
+		if !fs.appendDeferredUnlinkIntent(childP, deferredIno, deferredBaseRev) {
+			fs.syncFallbackDeferredUnlink(childP)
+		} else if err := fs.commitQueue.Enqueue(&CommitEntry{
+			Path:    childP,
+			Inode:   deferredIno,
+			BaseRev: deferredBaseRev,
+			Kind:    PendingDelete,
+		}); err != nil {
+			safeLogPrintf("unlink: deferred delete enqueue failed for %s: %v (falling back to sync delete)", childP, err)
+			fs.syncFallbackDeferredUnlink(childP)
+		}
+	}
 
 	// Pass 2: handles that raced open between pass 1 and the DELETE escaped
 	// marking; mark them now (no remote snapshot — the path is already gone)

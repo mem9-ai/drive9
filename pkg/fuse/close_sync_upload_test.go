@@ -321,7 +321,7 @@ func TestCloseSyncShadowCommitHasNoRecoveryUpload(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = replay.Close() })
-			if err := replayJournalIntoPending(replay, recoveredPending, recoveredShadow); err != nil {
+			if _, err := replayJournalIntoPending(replay, recoveredPending, recoveredShadow); err != nil {
 				t.Fatal(err)
 			}
 			cq := NewCommitQueue(fs.client, recoveredShadow, recoveredPending, replay, 1, 8)

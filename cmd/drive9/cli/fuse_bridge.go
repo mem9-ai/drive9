@@ -1,8 +1,8 @@
 package cli
 
 import (
-	"strings"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -68,6 +68,7 @@ type mountFuseOptions struct {
 	UploadConcurrency            int
 	DirCacheMaxEntries           int
 	CommitQueueMaxPending        int
+	DeferredUnlink               bool
 	WriteBackBatchWindow         time.Duration
 	WriteBackBatchMaxFiles       int
 	WriteBackBatchMaxBytes       int64

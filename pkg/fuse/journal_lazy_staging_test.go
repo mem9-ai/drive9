@@ -43,7 +43,7 @@ func TestLazyStagingSurvivesDaemonRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pending2: %v", err)
 	}
-	if err := replayJournalIntoPending(j2, idx2, nil); err != nil {
+	if _, err := replayJournalIntoPending(j2, idx2, nil); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	if !idx2.HasPending("/w/l1") {
@@ -92,7 +92,7 @@ func TestLazyStagingTornShadowDropped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := replayJournalIntoPending(j, idx, shadows); err != nil {
+	if _, err := replayJournalIntoPending(j, idx, shadows); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	if idx.HasPending("/w/t1") {
@@ -146,7 +146,7 @@ func TestLazyStagingTornShadowDroppedNonSpill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := replayJournalIntoPending(j, idx, shadows); err != nil {
+	if _, err := replayJournalIntoPending(j, idx, shadows); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	if idx.HasPending("/w/o1") {
@@ -195,7 +195,7 @@ func TestLazyStagingNonSpillCompleteShadowKept(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := replayJournalIntoPending(j, idx, shadows); err != nil {
+	if _, err := replayJournalIntoPending(j, idx, shadows); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	if !idx.HasPending("/w/o2") {

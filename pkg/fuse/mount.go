@@ -73,32 +73,38 @@ type MountOptions struct {
 	WriteBackBatchWindow          time.Duration // writeback-only small-file batch window (default 0 disabled)
 	WriteBackBatchMaxFiles        int           // maximum files in one writeback batch (default 64 when enabled)
 	WriteBackBatchMaxBytes        int64         // maximum bytes in one writeback batch (default 4MiB when enabled)
-	WriteCacheFreeRatio           float64       // minimum free-space ratio on cache-dir partition before write-back refuses writes (default 0.10); negative disables
-	WriteCacheSizeMB              int64         // current-process shadow data quota in MiB (default 1024); negative disables
-	UploadConcurrency             int           // number of background upload workers (default 4)
-	ReadConcurrency               int           // maximum concurrent backend reads issued by FUSE (default 24)
-	ParallelReadConcurrency       int           // maximum concurrent block reads for one large FUSE read (default 4)
-	ParallelReadBlockSize         int64         // block size for parallel large-file reads in bytes (default 1MiB)
-	SyncRead                      bool          // disable kernel async read dispatch; at most one read in flight per file handle
-	DirectMountStrict             bool          // Linux only: mount with mount(2) and do not fall back to fusermount
-	GVisorCompat                  bool          // enable gVisor-specific FUSE compatibility behavior
-	LegacyInterruptibleMutations  bool          // restore legacy behavior where a FUSE interrupt cancels in-flight remote commits — idempotent namespace mutations AND synchronous data commits (write-sync writes, close-sync/fsync/release flushes and releases, git checkpoint flushes); default false: commits run detached and finish once started, and unmount waits for them up to their request deadlines (data commits: up to the 15min releaseTimeout); --gvisor-compat takes precedence and always keeps commits detached
-	LookupRetryCount              int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
-	LookupRetryTimeout            time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
-	LegacyDirStatFallback         bool          // on Lookup stat 404, list parent to support legacy servers without directory stat
-	ReadDirPrefetch               bool          // prefetch small files after readdir into ReadCache (default false)
-	PrefetchMaxFiles              int           // maximum files prefetched per directory read (default 32 when enabled)
-	PrefetchMaxFileBytes          int64         // maximum individual file size prefetched (default 50KB)
-	PrefetchMaxBytes              int64         // maximum aggregate bytes prefetched per directory read (default 1MB)
-	PrefetchTimeout               time.Duration // timeout for one readdir prefetch batch (default 1s)
-	DirCacheMaxEntries            int           // maximum entries per directory in DirCache (default 200000); directories exceeding this limit are not cached as complete
-	TrustLocalEvents              bool          // allow revision-bound GetAttr hits from DirCache using process-local SSE freshness; safe only for single-server/sticky or cluster-wide event streams
-	AllowOther                    bool          // allow other users to access mount
-	ReadOnly                      bool          // mount as read-only
-	Debug                         bool          // enable FUSE debug logging
-	PerfCounters                  bool          // print low-overhead FUSE perf counter summary on shutdown
-	EnableGitWorkspaces           bool          // enable fast-clone git workspace overlay discovery
-	Profiling                     ProfilingOptions
+	// DeferredUnlink applies remote DELETEs of unlinked files asynchronously
+	// on the write-back commit queue instead of on the unlink(2) critical
+	// path. The local namespace updates immediately; the durable
+	// JournalUnlink intent re-enqueues the delete after a crash. Only
+	// meaningful with the write-back policy; other tiers ignore it.
+	DeferredUnlink               bool
+	WriteCacheFreeRatio          float64       // minimum free-space ratio on cache-dir partition before write-back refuses writes (default 0.10); negative disables
+	WriteCacheSizeMB             int64         // current-process shadow data quota in MiB (default 1024); negative disables
+	UploadConcurrency            int           // number of background upload workers (default 4)
+	ReadConcurrency              int           // maximum concurrent backend reads issued by FUSE (default 24)
+	ParallelReadConcurrency      int           // maximum concurrent block reads for one large FUSE read (default 4)
+	ParallelReadBlockSize        int64         // block size for parallel large-file reads in bytes (default 1MiB)
+	SyncRead                     bool          // disable kernel async read dispatch; at most one read in flight per file handle
+	DirectMountStrict            bool          // Linux only: mount with mount(2) and do not fall back to fusermount
+	GVisorCompat                 bool          // enable gVisor-specific FUSE compatibility behavior
+	LegacyInterruptibleMutations bool          // restore legacy behavior where a FUSE interrupt cancels in-flight remote commits — idempotent namespace mutations AND synchronous data commits (write-sync writes, close-sync/fsync/release flushes and releases, git checkpoint flushes); default false: commits run detached and finish once started, and unmount waits for them up to their request deadlines (data commits: up to the 15min releaseTimeout); --gvisor-compat takes precedence and always keeps commits detached
+	LookupRetryCount             int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
+	LookupRetryTimeout           time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
+	LegacyDirStatFallback        bool          // on Lookup stat 404, list parent to support legacy servers without directory stat
+	ReadDirPrefetch              bool          // prefetch small files after readdir into ReadCache (default false)
+	PrefetchMaxFiles             int           // maximum files prefetched per directory read (default 32 when enabled)
+	PrefetchMaxFileBytes         int64         // maximum individual file size prefetched (default 50KB)
+	PrefetchMaxBytes             int64         // maximum aggregate bytes prefetched per directory read (default 1MB)
+	PrefetchTimeout              time.Duration // timeout for one readdir prefetch batch (default 1s)
+	DirCacheMaxEntries           int           // maximum entries per directory in DirCache (default 200000); directories exceeding this limit are not cached as complete
+	TrustLocalEvents             bool          // allow revision-bound GetAttr hits from DirCache using process-local SSE freshness; safe only for single-server/sticky or cluster-wide event streams
+	AllowOther                   bool          // allow other users to access mount
+	ReadOnly                     bool          // mount as read-only
+	Debug                        bool          // enable FUSE debug logging
+	PerfCounters                 bool          // print low-overhead FUSE perf counter summary on shutdown
+	EnableGitWorkspaces          bool          // enable fast-clone git workspace overlay discovery
+	Profiling                    ProfilingOptions
 	// WritebackLazyStaging switches write-back close staging from fsynced
 	// local writes (power-loss safe) to plain writes (issue #964): staged
 	// data lands in the kernel page cache of the cache volume — ext4's
@@ -522,6 +528,11 @@ func Mount(opts *MountOptions) (err error) {
 
 			pendingIdx.setShadowStore(shadowStore)
 
+			// Deferred-delete intents recovered from the WAL (JournalUnlink
+			// frames with no confirming marker); re-enqueued after the commit
+			// queue starts below.
+			var deferredDeletes []replayDeferredDelete
+
 			// Initialize Journal WAL.
 			journalPath := filepath.Join(cacheBase, mountHash, "journal.wal")
 			journal, err := NewJournal(journalPath)
@@ -533,8 +544,9 @@ func Mount(opts *MountOptions) (err error) {
 				// (group-committed fsync) instead of per-entry atomicWrite.
 				pendingIdx.SetJournal(journal)
 				if opts.WritebackLazyStaging {
-					// Issue #964: close stages into the page cache; the
-					// background syncer bounds the power-loss window.
+					// Issue #964: close staging is un-fsynced, so the WAL
+					// meta frame may reach disk while the shadow content did
+					// not. The background syncer bounds the power-loss window.
 					pendingIdx.SetJournalSyncOnPut(false)
 					if opts.WritebackSyncWindow > 0 {
 						syncerCtx, syncerCancel := context.WithCancel(context.Background())
@@ -544,9 +556,11 @@ func Mount(opts *MountOptions) (err error) {
 				}
 				// Replay journal for crash recovery. Preserve the original kind
 				// and base revision so CommitQueue.RecoverPending can re-enqueue.
-				if err := replayJournalIntoPending(journal, pendingIdx, shadowStore); err != nil {
+				var replayErr error
+				deferredDeletes, replayErr = replayJournalIntoPending(journal, pendingIdx, shadowStore)
+				if replayErr != nil {
 					closeFailedMountStaging(dat9fs)
-					return fmt.Errorf("mount: journal replay: %w", err)
+					return fmt.Errorf("mount: journal replay: %w", replayErr)
 				}
 				// Drop frames already covered by commit markers so the WAL does
 				// not grow unboundedly across mounts. Safe here: mount init is
@@ -593,6 +607,21 @@ func Mount(opts *MountOptions) (err error) {
 					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
 				}
 				cq.RecoverPending()
+				// Re-apply deferred-delete intents whose remote DELETE the
+				// previous session never confirmed. The durable JournalUnlink
+				// frame is the intent; enqueueing here closes the crash window
+				// where a file is unlinked locally but still present remotely.
+				if len(deferredDeletes) > 0 {
+					for _, d := range deferredDeletes {
+						if err := cq.Enqueue(&CommitEntry{
+							Path:    d.Path,
+							BaseRev: d.BaseRev,
+							Kind:    PendingDelete,
+						}); err != nil {
+							safeLogPrintf("mount: deferred delete re-enqueue failed for %s: %v", d.Path, err)
+						}
+					}
+				}
 				if opts.LayerRef != "" {
 					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
 						closeFailedMountStaging(dat9fs)

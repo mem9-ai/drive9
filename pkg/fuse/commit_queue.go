@@ -188,6 +188,11 @@ type CommitQueue struct {
 	// recovery entries remain unfiltered by the Dat9FS implementation.
 	IsSuperseded CommitSupersededFunc
 
+	// OnDeferredDeleteDone is called after a PendingDelete entry landed (or
+	// found the path already gone). Dat9FS uses it to retire the in-memory
+	// delete tombstone alongside the journal marker.
+	OnDeferredDeleteDone func(path string)
+
 	// serializeMutationInodes extends queue dispatch ordering across hardlink
 	// aliases for live-handle mutations. It is enabled only for gVisor mounts.
 	serializeMutationInodes bool
@@ -1426,6 +1431,10 @@ func (cq *CommitQueue) endInFlight(entry *CommitEntry) {
 
 // commitOne uploads a single entry to the server with exponential backoff.
 func (cq *CommitQueue) commitOne(entry *CommitEntry) {
+	if entry != nil && entry.Kind == PendingDelete {
+		cq.deleteOne(entry)
+		return
+	}
 	const maxRetries = 5
 	const baseDelay = 200 * time.Millisecond
 	const maxDelay = 30 * time.Second
@@ -1589,6 +1598,136 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		return
 	}
 	cq.onCommitTerminalFailure(entry, lastErr)
+}
+
+// deleteOne applies a deferred remote DELETE (PendingDelete) with the same
+// retry/backoff discipline as uploads. Per-path ordering is inherited from
+// the queue: beginInFlight excludes same-path entries and lockPath serializes
+// the DELETE behind any in-flight upload, so a staged PUT for the unlinked
+// path always lands before the delete removes it again.
+//
+// A 404 is success (already deleted). Terminal failure keeps the durable
+// JournalUnlink intent in the WAL: the next mount's replay re-enqueues the
+// delete, so giving up here only delays the remote cleanup.
+func (cq *CommitQueue) deleteOne(entry *CommitEntry) {
+	const maxRetries = 5
+	const baseDelay = 200 * time.Millisecond
+	const maxDelay = 30 * time.Second
+
+	entryCtx, entryCancel := context.WithCancel(context.Background())
+	cq.mu.Lock()
+	if entry.canceled {
+		cq.mu.Unlock()
+		entryCancel()
+		cq.removeFromQueue(entry)
+		safeLogPrintf("commit queue: delete entry for %s was canceled before retry loop", entry.Path)
+		return
+	}
+	entry.cancelCommit = entryCancel
+	cq.mu.Unlock()
+	defer func() {
+		cq.mu.Lock()
+		entry.cancelCommit = nil
+		entry.cancelUpload = nil
+		cq.mu.Unlock()
+		entryCancel()
+	}()
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			safeLogPrintf("commit queue: delete entry for %s was canceled during retry", entry.Path)
+			return
+		}
+		if attempt > 0 {
+			if cq.perf != nil {
+				cq.perf.commitRetry.add(1)
+			}
+			delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt-1)))
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			if !sleepWithCancel(entryCtx, delay) {
+				cq.removeFromQueue(entry)
+				safeLogPrintf("commit queue: delete entry for %s was canceled during retry backoff", entry.Path)
+				return
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(entryCtx, uploadTimeout)
+		cq.mu.Lock()
+		if entry.canceled {
+			cq.mu.Unlock()
+			cancel()
+			cq.removeFromQueue(entry)
+			safeLogPrintf("commit queue: delete entry for %s was canceled before delete", entry.Path)
+			return
+		}
+		entry.cancelUpload = cancel
+		cq.mu.Unlock()
+
+		unlockPath := cq.lockPath(entry.Path)
+		err := cq.deleteRemoteEntry(ctx, entry)
+		cq.mu.Lock()
+		entry.cancelUpload = nil
+		cq.mu.Unlock()
+		cancel()
+		unlockPath()
+
+		if err == nil || isNotFoundErr(err) {
+			if cq.isEntryCanceled(entry) {
+				// Canceled after success: keep the durable intent so the next
+				// mount re-checks the path (CancelPath replaced this entry
+				// with a newer producer for the same path).
+				cq.removeFromQueue(entry)
+				return
+			}
+			cq.onDeferredDeleteSuccess(entry)
+			return
+		}
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			safeLogPrintf("commit queue: delete entry for %s was canceled during delete", entry.Path)
+			return
+		}
+		lastErr = err
+		safeLogPrintf("commit queue: delete attempt %d/%d failed for %s: %v", attempt+1, maxRetries, entry.Path, err)
+	}
+
+	safeLogPrintf("commit queue: giving up on deferred delete of %s after %d retries: %v (journal intent kept for next mount)", entry.Path, maxRetries, lastErr)
+	cq.removeFromQueue(entry)
+}
+
+// deleteRemoteEntry issues the DELETE for a PendingDelete entry. Layer mounts
+// never enqueue delete entries (gated at the FUSE layer), so only the plain
+// namespace DELETE is needed.
+func (cq *CommitQueue) deleteRemoteEntry(ctx context.Context, entry *CommitEntry) error {
+	if cq == nil || entry == nil || cq.client == nil {
+		return fmt.Errorf("delete entry not runnable")
+	}
+	start := time.Now()
+	err := cq.client.DeleteFileCtx(ctx, cq.remotePath(entry.Path))
+	if cq.perf != nil {
+		cq.perf.recordRemoteOp(perfRemoteMutation, err, time.Since(start), 0)
+	}
+	return err
+}
+
+// onDeferredDeleteSuccess retires the durable intent: a JournalCommit marker
+// newer than the JournalUnlink frame tells the next mount's replay the delete
+// landed, so a stale intent can never delete a path another actor recreated
+// between mounts.
+func (cq *CommitQueue) onDeferredDeleteSuccess(entry *CommitEntry) {
+	if cq != nil && cq.journal != nil {
+		if err := cq.journal.Append(JournalEntry{Op: JournalCommit, Path: entry.Path}); err != nil {
+			safeLogPrintf("commit queue: journal delete-done marker failed for %s: %v", entry.Path, err)
+		}
+	}
+	if cq.OnDeferredDeleteDone != nil {
+		cq.OnDeferredDeleteDone(entry.Path)
+	}
+	cq.removeFromQueue(entry)
 }
 
 type commitBatchConfig struct {

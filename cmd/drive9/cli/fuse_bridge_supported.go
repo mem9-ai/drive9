@@ -63,6 +63,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		UploadConcurrency:             opts.UploadConcurrency,
 		DirCacheMaxEntries:            opts.DirCacheMaxEntries,
 		CommitQueueMaxPending:         opts.CommitQueueMaxPending,
+		DeferredUnlink:                opts.DeferredUnlink,
 		WriteBackBatchWindow:          opts.WriteBackBatchWindow,
 		WriteBackBatchMaxFiles:        opts.WriteBackBatchMaxFiles,
 		WriteBackBatchMaxBytes:        opts.WriteBackBatchMaxBytes,
