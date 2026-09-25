@@ -21952,15 +21952,38 @@ func TestFlushLargeFile_StrictUploadsBeforeReturning(t *testing.T) {
 	}
 }
 
-// TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex verifies that in
-// interactive mode the same close→drop→open sequence is served from the local
-// shadow + pendingIndex, without blocking Flush on a network upload. The
-// CommitQueue takes over the actual server write asynchronously.
+// TestFlushLargeFile_StagesShadowAndPendingIndex verifies that a large-file
+// close is served from the local shadow + pendingIndex — without blocking
+// Flush on a network upload, with the CommitQueue taking over the actual
+// server write asynchronously — for every write-back durability tier.
+//
+// The fsync tier (SyncStrict) is the regression this guards: its close path
+// used to gate large-file staging on SyncInteractive, so `--durability=fsync`
+// mounts uploaded the whole file inside Flush and close(2) blocked for the
+// full transfer (issue #971). The fsync tier's durability contract is
+// fsync(2), not close(2), exactly as for the small-file path (#964).
 //
 // We assert two invariants:
 //  1. Flush returns quickly without contacting the upload endpoints.
 //  2. A subsequent Lookup hits pendingIndex (no remote stat needed).
-func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
+func TestFlushLargeFile_StagesShadowAndPendingIndex(t *testing.T) {
+	cases := []struct {
+		name     string
+		syncMode SyncMode
+		policy   WritePolicy
+	}{
+		{"interactive-writeback", SyncInteractive, WritePolicyWriteBack},
+		// Issue #971: strict + writeback is the --durability=fsync mount.
+		{"strict-writeback", SyncStrict, WritePolicyWriteBack},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			testFlushLargeFileStages(t, tc.syncMode, tc.policy)
+		})
+	}
+}
+
+func testFlushLargeFileStages(t *testing.T, syncMode SyncMode, policy WritePolicy) {
 	const fileSize = int64(writeBackThreshold) // 10 MiB
 
 	var uploadAttempted atomic.Bool
@@ -21987,7 +22010,8 @@ func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
 	opts.setDefaults()
 	c := newTestClient(ts.URL)
 	fs := NewDat9FS(c, opts)
-	fs.syncMode = SyncInteractive
+	fs.syncMode = syncMode
+	fs.opts.WritePolicy = policy
 
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
@@ -22010,7 +22034,7 @@ func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
 	st := fs.Create(nil, &gofuse.CreateIn{
 		InHeader: gofuse.InHeader{NodeId: 1},
 		Flags:    uint32(syscall.O_RDWR),
-	}, "interactive.bin", &createOut)
+	}, "staged.bin", &createOut)
 	if st != gofuse.OK {
 		t.Fatalf("Create: %v", st)
 	}
@@ -22039,19 +22063,19 @@ func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Flush: %v", st)
 	}
-	// Interactive Flush should be local-only — no upload initiate during Flush.
+	// A write-back Flush must be local-only — no upload initiate during Flush.
 	if uploadAttempted.Load() {
-		t.Fatal("interactive Flush hit upload endpoints — expected stage-only fast path")
+		t.Fatal("Flush hit upload endpoints — expected stage-only fast path")
 	}
 	// Sanity: even on slow CI a 10 MiB shadow stage should be well under 5s.
 	if flushDur > 5*time.Second {
-		t.Fatalf("interactive Flush took %v — should be local fsync only", flushDur)
+		t.Fatalf("Flush took %v — should be local staging only", flushDur)
 	}
 
 	// pendingIndex must contain the file with the correct size.
-	meta, ok := pending.GetMeta("/interactive.bin")
+	meta, ok := pending.GetMeta("/staged.bin")
 	if !ok {
-		t.Fatal("pendingIndex missing entry after interactive Flush — Lookup will ENOENT")
+		t.Fatal("pendingIndex missing entry after Flush — Lookup will ENOENT")
 	}
 	if meta.Size != fileSize {
 		t.Fatalf("pendingIndex size = %d, want %d", meta.Size, fileSize)
@@ -22059,13 +22083,57 @@ func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
 
 	// Lookup must hit the in-memory overlay without remote stat.
 	var entryOut gofuse.EntryOut
-	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "interactive.bin", &entryOut)
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "staged.bin", &entryOut)
 	if st != gofuse.OK {
 		t.Fatalf("Lookup: %v, want OK", st)
 	}
 	if entryOut.Size != uint64(fileSize) {
 		t.Fatalf("Lookup size = %d, want %d", entryOut.Size, fileSize)
 	}
+}
+
+// TestStageLargeAtCloseEnabledPolicyMatrix pins the close-staging decision to
+// the write policy rather than the sync mode (issue #971). The handle policy
+// is checked in addition to the mount policy because an O_SYNC open upgrades a
+// single handle to write-sync on an otherwise write-back mount; that handle
+// must keep its synchronous close even when it still holds dirty bytes from a
+// failed write.
+func TestStageLargeAtCloseEnabledPolicyMatrix(t *testing.T) {
+	cases := []struct {
+		name         string
+		mountPolicy  WritePolicy
+		handlePolicy WritePolicy
+		want         bool
+	}{
+		{"writeback-mount-writeback-handle", WritePolicyWriteBack, WritePolicyWriteBack, true},
+		{"writeback-mount-empty-handle-inherits", WritePolicyWriteBack, "", true},
+		{"writeback-mount-write-sync-handle", WritePolicyWriteBack, WritePolicyWriteSync, false},
+		{"writeback-mount-close-sync-handle", WritePolicyWriteBack, WritePolicyCloseSync, false},
+		{"close-sync-mount", WritePolicyCloseSync, WritePolicyCloseSync, false},
+		{"write-sync-mount", WritePolicyWriteSync, WritePolicyWriteSync, false},
+		{"empty-mount-policy-defaults-writeback", "", WritePolicyWriteBack, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := &MountOptions{WritePolicy: tc.mountPolicy}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+			fh := &FileHandle{WritePolicy: tc.handlePolicy}
+			if got := fs.stageLargeAtCloseEnabled(fh); got != tc.want {
+				t.Fatalf("stageLargeAtCloseEnabled(mount=%q, handle=%q) = %t, want %t",
+					tc.mountPolicy, tc.handlePolicy, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("nil-handle", func(t *testing.T) {
+		opts := &MountOptions{WritePolicy: WritePolicyWriteBack}
+		opts.setDefaults()
+		fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+		if fs.stageLargeAtCloseEnabled(nil) {
+			t.Fatal("nil handle must not be staged")
+		}
+	})
 }
 
 func TestRenamePendingNewCommitSyncCommitsGitLooseObjectFinalPath(t *testing.T) {
