@@ -132,7 +132,7 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRange(ctx context.Context, reader *
 		if _, linked := entry.Paths[readerPath]; !linked {
 			return nil, 0, false, gofuse.OK
 		}
-		data, n, handled, status, retry := fs.readPendingFtruncateVisibleRangeOnce(reader, entry, readerSeq, readerMarked, latestSeq, offset, reqSize)
+		data, n, handled, status, retry := fs.readPendingFtruncateVisibleRangeOnce(ctx, reader, entry, readerSeq, readerMarked, latestSeq, offset, reqSize)
 		if handled || status != gofuse.OK {
 			return data, n, handled, status
 		}
@@ -173,13 +173,20 @@ func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, ino uint64, 
 	if dirty.seq > committedSeq {
 		return nil, 0, false, gofuse.Status(syscall.EAGAIN)
 	}
+	var chmodOnlyGens map[string]uint64
 	for path := range entry.Paths {
 		if fs.pendingIndex != nil && fs.pendingIndex.HasPending(path) {
 			return nil, 0, false, gofuse.Status(syscall.EAGAIN)
 		}
 		if fs.writeBack != nil {
-			if _, pending := fs.writeBack.GetMeta(path); pending {
-				return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+			if meta, pending := fs.writeBack.GetMeta(path); pending {
+				if meta.Kind != PendingChmod {
+					return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+				}
+				if chmodOnlyGens == nil {
+					chmodOnlyGens = make(map[string]uint64)
+				}
+				chmodOnlyGens[path] = meta.Generation
 			}
 		}
 	}
@@ -197,10 +204,28 @@ func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, ino uint64, 
 	if _, linked := current.Paths[readerPath]; !linked {
 		return nil, 0, false, gofuse.Status(syscall.EAGAIN)
 	}
+	fs.dirtyMu.Lock()
+	newerDirty := fs.dirtyInodes[ino].seq > fs.mutationInodes[ino].committedSeq
+	fs.dirtyMu.Unlock()
+	if newerDirty {
+		return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+	}
+	for path := range current.Paths {
+		if fs.pendingIndex != nil && fs.pendingIndex.HasPending(path) {
+			return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+		}
+		if fs.writeBack != nil {
+			if meta, pending := fs.writeBack.GetMeta(path); pending {
+				if gen, known := chmodOnlyGens[path]; !known || meta.Kind != PendingChmod || meta.Generation != gen {
+					return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+				}
+			}
+		}
+	}
 	return data, len(data), true, gofuse.OK
 }
 
-func (fs *Dat9FS) readPendingFtruncateVisibleRangeOnce(reader *FileHandle, entry *InodeEntry, readerSeq uint64, readerMarked bool, latestSeq uint64, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, bool) {
+func (fs *Dat9FS) readPendingFtruncateVisibleRangeOnce(ctx context.Context, reader *FileHandle, entry *InodeEntry, readerSeq uint64, readerMarked bool, latestSeq uint64, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, bool) {
 	var newest *FileHandle
 	var newestSeq uint64
 	marked := readerMarked && readerSeq != 0
@@ -292,7 +317,69 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRangeOnce(reader *FileHandle, entry
 	if _, linked := entry.Paths[newest.Path]; !linked {
 		return nil, 0, false, gofuse.OK, true
 	}
-	return fs.readPendingFtruncateHandleLocked(newest, offset, reqSize, true)
+	end := offset + int64(reqSize)
+	if end < offset {
+		return nil, 0, false, gofuse.EINVAL, false
+	}
+	end = min(end, newest.Dirty.Size())
+	var loadedRemoteParts []int
+	shadowReadable := fs.shadowStore != nil && (newest.ShadowReady || newest.ShadowSpill) && newest.ShadowStageGen != 0
+	if end > offset && newest.Dirty.LoadPart != nil && !shadowReadable {
+		partSize := newest.Dirty.PartSize()
+		for part := int(offset / partSize); part <= int((end-1)/partSize); part++ {
+			if int64(part)*partSize < newest.Dirty.remoteSize && !newest.Dirty.IsPartLoaded(part) {
+				if newest.Dirty.dirtyParts[part] {
+					return nil, 0, false, gofuse.Status(syscall.EAGAIN), false
+				}
+				loadedRemoteParts = append(loadedRemoteParts, part)
+			}
+		}
+	}
+	data, n, handled, status, retry := fs.readPendingFtruncateHandleLocked(newest, offset, reqSize, true)
+	if !handled || status != gofuse.OK {
+		discardFtruncateLoadedParts(newest.Dirty, loadedRemoteParts)
+		return data, n, handled, status, retry
+	}
+	current, ok := fs.inodes.GetEntry(reader.Ino)
+	currentSeq, pending := fs.pendingFtruncateSeq(reader.Ino)
+	if !ok || current.Unlinked || currentSeq != newestSeq || !pending {
+		discardFtruncateLoadedParts(newest.Dirty, loadedRemoteParts)
+		return nil, 0, false, gofuse.OK, true
+	}
+	if _, linked := current.Paths[newest.Path]; !linked {
+		discardFtruncateLoadedParts(newest.Dirty, loadedRemoteParts)
+		return nil, 0, false, gofuse.OK, true
+	}
+	if len(loadedRemoteParts) > 0 {
+		stat, err := fs.client.StatCtx(ctx, fs.remotePath(newest.Path))
+		if err != nil || stat == nil || newest.BaseRev <= 0 || stat.Revision != newest.BaseRev {
+			discardFtruncateLoadedParts(newest.Dirty, loadedRemoteParts)
+			return nil, 0, false, gofuse.Status(syscall.EAGAIN), false
+		}
+		current, ok = fs.inodes.GetEntry(reader.Ino)
+		currentSeq, pending = fs.pendingFtruncateSeq(reader.Ino)
+		if !ok || current.Unlinked || currentSeq != newestSeq || !pending {
+			discardFtruncateLoadedParts(newest.Dirty, loadedRemoteParts)
+			return nil, 0, false, gofuse.OK, true
+		}
+		if _, linked := current.Paths[newest.Path]; !linked {
+			discardFtruncateLoadedParts(newest.Dirty, loadedRemoteParts)
+			return nil, 0, false, gofuse.OK, true
+		}
+	}
+	return data, n, true, gofuse.OK, false
+}
+
+// discardFtruncateLoadedParts removes only clean parts first loaded by the
+// current read, so a failed revision check cannot poison later reads.
+// The source handle is locked and these parts were checked clean above.
+func discardFtruncateLoadedParts(wb *WriteBuffer, parts []int) {
+	for _, part := range parts {
+		if data, ok := wb.parts[part]; ok {
+			wb.curMemory -= int64(len(data))
+			delete(wb.parts, part)
+		}
+	}
 }
 
 func (fs *Dat9FS) readPendingFtruncateHandleLocked(src *FileHandle, offset int64, reqSize uint32, allowRemoteLoad bool) ([]byte, int, bool, gofuse.Status, bool) {
