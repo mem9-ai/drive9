@@ -9910,6 +9910,12 @@ func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, na
 // mount uses an environment with its own commit path, and the caller falls
 // back to the legacy synchronous create.
 func (fs *Dat9FS) mknodRegularLocalFirst(input *gofuse.MknodIn, name, childP string, mode uint32, out *gofuse.EntryOut) (bool, gofuse.Status) {
+	// Only the write-back policy defers the remote create. close-sync and
+	// write-sync wire the same staging components but promise remote
+	// durability at create/close time, so they keep the synchronous create.
+	if fs.mountWritePolicy() != WritePolicyWriteBack {
+		return false, gofuse.OK
+	}
 	if fs.commitQueue == nil || fs.shadowStore == nil || fs.pendingIndex == nil || fs.writeBack == nil || fs.uploader == nil {
 		return false, gofuse.OK
 	}
@@ -9933,6 +9939,36 @@ func (fs *Dat9FS) mknodRegularLocalFirst(input *gofuse.MknodIn, name, childP str
 	perm := mode & posixPermissionModeMask
 	now := time.Now()
 
+	// Stage the empty image BEFORE replacing the inode mapping: a staging
+	// failure must not leave a new inode mapped to the path, and no
+	// concurrent writer can observe the intermediate state (the kernel has
+	// not received the reply).
+	if err := fs.writeBack.PutWithBaseRevAndMode(childP, nil, 0, PendingNew, 0, perm, true); err != nil {
+		safeLogPrintf("mknod: write-back staging failed for %s: %v", childP, err)
+		return true, gofuse.EIO
+	}
+	if err := fs.shadowStore.Ensure(childP, 0, 0); err != nil {
+		fs.writeBack.Remove(childP)
+		safeLogPrintf("mknod: shadow staging failed for %s: %v", childP, err)
+		return true, gofuse.EIO
+	}
+	shadowGen := fs.shadowStore.ActiveGeneration(childP)
+	// Make the empty image durable before the enqueue-success path drops the
+	// fsynced write-back snapshot: recovery needs durable meta AND shadow,
+	// otherwise a power loss in that window loses the mknod'd file.
+	if err := fs.shadowStore.SyncIfGeneration(childP, shadowGen); err != nil {
+		fs.writeBack.Remove(childP)
+		fs.shadowStore.Remove(childP)
+		safeLogPrintf("mknod: shadow sync failed for %s: %v", childP, err)
+		return true, gofuse.EIO
+	}
+	if _, err := fs.pendingIndex.PutWithBaseRevAndMode(childP, 0, PendingNew, 0, perm, true); err != nil {
+		fs.writeBack.Remove(childP)
+		fs.shadowStore.Remove(childP)
+		safeLogPrintf("mknod: pending meta staging failed for %s: %v", childP, err)
+		return true, gofuse.EIO
+	}
+
 	// Start a new path incarnation (mirrors Create): preserve the old inode
 	// for open handles and hardlink aliases, never inherit revision/identity.
 	if oldIno, ok := fs.inodes.GetInode(childP); ok &&
@@ -9951,21 +9987,6 @@ func (fs *Dat9FS) mknodRegularLocalFirst(input *gofuse.MknodIn, name, childP str
 	fs.inodes.UpdateCtime(ino, now)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
-		return true, gofuse.EIO
-	}
-
-	if err := fs.writeBack.PutWithBaseRevAndMode(childP, nil, 0, PendingNew, 0, perm, true); err != nil {
-		safeLogPrintf("mknod: write-back staging failed for %s: %v", childP, err)
-		return true, gofuse.EIO
-	}
-	if err := fs.shadowStore.Ensure(childP, 0, 0); err != nil {
-		fs.writeBack.Remove(childP)
-		safeLogPrintf("mknod: shadow staging failed for %s: %v", childP, err)
-		return true, gofuse.EIO
-	}
-	if _, err := fs.pendingIndex.PutWithBaseRevAndMode(childP, 0, PendingNew, 0, perm, true); err != nil {
-		fs.writeBack.Remove(childP)
-		safeLogPrintf("mknod: pending meta staging failed for %s: %v", childP, err)
 		return true, gofuse.EIO
 	}
 
@@ -12957,6 +12978,21 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		} else {
 			// O_TRUNC: mark buffer as dirty so that close() without any
 			// writes still persists the truncation (POSIX semantics).
+			// A local-first mknod may still have its empty-file commit
+			// queued for this path. Re-staging the shadow below would strand
+			// that entry's payload generation, and this handle would
+			// otherwise stage a base-0 PendingOverwrite that uploadEntry
+			// rejects. Drain the queue for the path first: after WaitPath
+			// the pending meta is gone, the inode carries the committed
+			// revision, and the handle truncates as a well-based overwrite.
+			if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
+				fs.commitQueue.WaitPath(p)
+				if refreshedEntry, ok := fs.inodes.GetEntry(input.NodeId); ok {
+					fh.OrigSize = refreshedEntry.Size
+					fh.BaseRev = refreshedEntry.Revision
+					entry = refreshedEntry
+				}
+			}
 			fh.Dirty.maxSize = streamingWriteMaxSize
 			fh.Dirty.sequential = true
 			fh.Dirty.uploadedParts = make(map[int]bool)

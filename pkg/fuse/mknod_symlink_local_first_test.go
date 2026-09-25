@@ -1,10 +1,12 @@
 package fuse
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -19,6 +21,11 @@ type localFirstBackend struct {
 	chmod   atomic.Int64
 	head    atomic.Int64
 	symPost atomic.Int64
+	// putGate, when non-nil, blocks PUT handlers before they increment the
+	// counter, so tests can assert counter values deterministically.
+	putGate chan struct{}
+	// data records committed content by path when non-nil.
+	data map[string][]byte
 }
 
 func (b *localFirstBackend) handler() http.HandlerFunc {
@@ -27,7 +34,14 @@ func (b *localFirstBackend) handler() http.HandlerFunc {
 		q := r.URL.Query()
 		switch {
 		case r.Method == http.MethodPut:
+			if b.putGate != nil {
+				<-b.putGate
+			}
 			b.put.Add(1)
+			if b.data != nil {
+				body, _ := io.ReadAll(r.Body)
+				b.data[p] = body
+			}
 			w.Header().Set("X-Dat9-Revision", "5")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
@@ -57,10 +71,15 @@ func (b *localFirstBackend) handler() http.HandlerFunc {
 // the way mount.go does, so local-first paths engage.
 func newLocalFirstTestFS(t *testing.T, ts *httptest.Server) *Dat9FS {
 	t.Helper()
+	return newLocalFirstTestFSWithPolicy(t, ts, WritePolicyWriteBack)
+}
+
+func newLocalFirstTestFSWithPolicy(t *testing.T, ts *httptest.Server, policy WritePolicy) *Dat9FS {
+	t.Helper()
 	dir := t.TempDir()
 	opts := &MountOptions{}
 	opts.setDefaults()
-	opts.WritePolicy = WritePolicyWriteBack
+	opts.WritePolicy = policy
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	pIdx, err := NewPendingIndex(filepath.Join(dir, "pending"))
@@ -119,6 +138,17 @@ func newLocalFirstTestFS(t *testing.T, ts *httptest.Server) *Dat9FS {
 // committed asynchronously by the commit queue.
 func TestMknodRegularLocalFirstNoSyncRoundTrips(t *testing.T) {
 	backend := &localFirstBackend{}
+	// Gate PUTs before the counter increments so a dispatched commit worker
+	// cannot move the counters during the pre-drain assertions. The chmod
+	// only fires after the PUT completes, so it is gated transitively.
+	putGate := make(chan struct{})
+	backend.putGate = putGate
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(putGate) }) }
+	// Release before the FS cleanup (registered later, so it runs first):
+	// a failed assertion must not leave DrainAll blocked on a gated worker.
+	t.Cleanup(release)
+
 	ts := httptest.NewServer(backend.handler())
 	defer ts.Close()
 	fs := newLocalFirstTestFS(t, ts)
@@ -147,7 +177,9 @@ func TestMknodRegularLocalFirstNoSyncRoundTrips(t *testing.T) {
 		t.Fatal("mknod did not stage pending index meta")
 	}
 
-	// The commit queue drains the empty image (direct PUT) and the mode.
+	// Release the gate and let the commit queue drain the empty image
+	// (direct PUT) and the mode.
+	release()
 	fs.commitQueue.DrainAll()
 	if got := backend.put.Load(); got != 1 {
 		t.Fatalf("async create PUTs = %d, want 1", got)
@@ -256,5 +288,91 @@ func TestSymlinkSkipsPostCreateStat(t *testing.T) {
 	}
 	if got := out.Size; got != uint64(len("/some/target")) {
 		t.Fatalf("symlink size = %d, want %d", got, len("/some/target"))
+	}
+}
+
+// TestMknodLocalFirstOTruncOpenCommitsWrittenBytes covers open(O_TRUNC)
+// racing the still-queued empty-file commit of a local-first mknod: Open must
+// drain the queued commit first (so the inode carries the committed
+// revision), and the bytes written through the handle must be committed as a
+// well-based overwrite instead of being rejected for a missing base
+// revision.
+func TestMknodLocalFirstOTruncOpenCommitsWrittenBytes(t *testing.T) {
+	backend := &localFirstBackend{data: map[string][]byte{}}
+	putGate := make(chan struct{})
+	backend.putGate = putGate
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(putGate) }) }
+	t.Cleanup(release)
+
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newLocalFirstTestFS(t, ts)
+
+	var out gofuse.EntryOut
+	if st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFREG) | 0o600,
+	}, "trunced.txt", &out); st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+
+	// Let the queued empty-file commit run, then open with O_TRUNC. The
+	// handle's flush must commit the written bytes.
+	release()
+	openOut := gofuse.OpenOut{}
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: out.NodeId},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &openOut); st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	written := []byte("truncation survives")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: out.NodeId},
+		Fh:       openOut.Fh,
+		Offset:   0,
+		Size:     uint32(len(written)),
+	}, written); st != gofuse.OK {
+		t.Fatalf("Write status = %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: out.NodeId},
+		Fh:       openOut.Fh,
+	})
+	fs.commitQueue.DrainAll()
+
+	if got, ok := backend.data["/trunced.txt"]; !ok {
+		t.Fatal("written bytes were never committed to the backend")
+	} else if string(got) != string(written) {
+		t.Fatalf("committed bytes = %q, want %q", got, written)
+	}
+}
+
+// TestMknodRegularSyncFallbackForCloseSync verifies close-sync mounts keep
+// the synchronous remote create even though their staging components are
+// wired: mknod must PUT (and chmod) before returning.
+func TestMknodRegularSyncFallbackForCloseSync(t *testing.T) {
+	backend := &localFirstBackend{}
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newLocalFirstTestFSWithPolicy(t, ts, WritePolicyCloseSync)
+
+	var out gofuse.EntryOut
+	st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFREG) | 0o600,
+	}, "sync-close-sync.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+	if got := backend.put.Load(); got != 1 {
+		t.Fatalf("sync PUTs = %d, want 1 before returning", got)
+	}
+	if got := backend.chmod.Load(); got != 1 {
+		t.Fatalf("sync chmod calls = %d, want 1", got)
+	}
+	if _, ok := fs.pendingIndex.GetMeta("/sync-close-sync.txt"); ok {
+		t.Fatal("close-sync mknod staged pending meta; want synchronous create")
 	}
 }
