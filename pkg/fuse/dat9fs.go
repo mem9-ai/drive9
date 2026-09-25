@@ -9801,7 +9801,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				var abortStreamer func()
 				fh.Lock()
 				fs.discardSupersededMutationLocked(fh)
-				markVisible := !isSQLiteDirectIOPath(fh.Path)
+				markVisible := !fs.layerEnabled() && !isSQLiteDirectIOPath(fh.Path)
 				newMarker := markVisible && !fh.Dirty.visibleTruncate
 				if newMarker {
 					fs.openHandles.MarkVisibleTruncate(fh, 0)
@@ -14222,7 +14222,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 	if fh.Dirty.visibleTruncate {
 		fs.openHandles.MarkVisibleTruncate(fh, fh.DirtySeq)
-	} else if _, pending := fs.pendingFtruncateSeq(fh.Ino); pending {
+	} else if fs.openHandles.HasVisibleTruncate(fh.Ino) {
 		fh.recordFtruncateWriteLocked(writeOffset, writeOffset+int64(n))
 	}
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
@@ -17607,9 +17607,17 @@ func (fs *Dat9FS) snapshotStagingGens(remotePath string) StagingGens {
 	return g
 }
 
-func (fs *Dat9FS) onWriteBackDataCommitted(meta WriteBackMeta, committedRev int64) {
+// onWriteBackDataCommitted settles content staging before fallible chmod;
+// generation guards preserve any newer same-path write.
+func (fs *Dat9FS) onWriteBackDataCommitted(meta WriteBackMeta, committedRev int64, gens StagingGens) {
 	if fs != nil && meta.Inode != 0 && meta.MutationSeq != 0 {
 		fs.recordCommittedMutation(meta.Inode, meta.MutationSeq, committedRev, meta.Size)
+	}
+	if fs != nil && fs.pendingIndex != nil && gens.PendingIndexGen != 0 {
+		fs.pendingIndex.RemoveIfGeneration(meta.Path, gens.PendingIndexGen)
+	}
+	if fs != nil && fs.shadowStore != nil && gens.ShadowGen != 0 {
+		fs.shadowStore.RemoveIfGeneration(meta.Path, gens.ShadowGen)
 	}
 }
 
