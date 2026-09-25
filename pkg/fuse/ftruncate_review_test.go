@@ -124,6 +124,81 @@ func TestReadWriteBackFtruncateNewerWriterOwnRange(t *testing.T) {
 	}
 }
 
+func TestReadWriteBackFtruncateOwnRangeAfterCommit(t *testing.T) {
+	remote := []byte("hello world")
+	revision := int64(1)
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(remote)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+		case http.MethodGet:
+			_, _ = w.Write(remote)
+		case http.MethodPut:
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			remote, revision = data, revision+1
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(server.Close)
+	opts := &MountOptions{SyncMode: SyncStrict, WritePolicy: WritePolicyWriteBack, TrustLocalEvents: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(server.URL), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, int64(len(remote)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	a := addFtruncateTestHandle(t, fs, ino, "/file.bin", remote)
+	b := addFtruncateTestHandle(t, fs, ino, "/file.bin", remote)
+	c := addFtruncateTestHandle(t, fs, ino, "/file.bin", nil)
+	reviewFtruncate(t, fs, ino, a, 5)
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: a}); st != gofuse.OK {
+		t.Fatalf("commit A truncate = %v", st)
+	}
+	if fs.ftruncateCommittedSeq(ino) == 0 || !fs.openHandles.HasVisibleTruncate(ino) {
+		t.Fatal("committed A must retain a live marker while its fd is open")
+	}
+	if n, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: b}, []byte("X")); st != gofuse.OK || n != 1 {
+		t.Fatalf("B write = %d/%v", n, st)
+	}
+	got, st, err := readDat9FSTestRange(fs, ino, b, 0, 1)
+	if err != nil || st != gofuse.OK || string(got) != "X" {
+		t.Fatalf("B own covered read = %q/%v/%v, want X/OK", got, st, err)
+	}
+	if _, st, err := readDat9FSTestRange(fs, ino, b, 0, 2); err != nil || st != gofuse.Status(syscall.EAGAIN) {
+		t.Fatalf("B own uncovered read = %v/%v, want EAGAIN", st, err)
+	}
+	if _, st, err := readDat9FSTestRange(fs, ino, c, 0, 1); err != nil || st != gofuse.Status(syscall.EAGAIN) {
+		t.Fatalf("C read while B is pending = %v/%v, want EAGAIN", st, err)
+	}
+	want := []byte("HELLO WORLD")
+	if n, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: b}, want); st != gofuse.OK || n != uint32(len(want)) {
+		t.Fatalf("B full overwrite = %d/%v", n, st)
+	}
+	got, st, err = readDat9FSTestRange(fs, ino, b, 0, len(want))
+	if err != nil || st != gofuse.OK || !bytes.Equal(got, want) {
+		t.Fatalf("B own full read = %q/%v/%v, want %q/OK", got, st, err, want)
+	}
+}
+
+func TestReadWriteBackFtruncateLayerKeepsExistingReadRouting(t *testing.T) {
+	fs, ino, _ := newFtruncateVisibilityFS(t, []byte("hello world"))
+	fs.opts.LayerRef = "layer-1"
+	a := addFtruncateTestHandle(t, fs, ino, "/file.bin", []byte("hello world"))
+	reviewFtruncate(t, fs, ino, a, 5)
+	if fs.openHandles.HasVisibleTruncate(ino) {
+		t.Fatal("layer fd truncate armed ordinary writeback read marker")
+	}
+}
+
 func TestReadWriteBackFtruncateManyOwnRanges(t *testing.T) {
 	remote := []byte("hello world")
 	fs, ino, _ := newFtruncateVisibilityFS(t, remote)
@@ -377,7 +452,22 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 	c := addFtruncateTestHandle(t, fs, ino, "/file.bin", nil)
 	reviewFtruncate(t, fs, ino, a, 5)
 	newerSeq := fs.markDirtySize(ino, int64(len(remote)))
-	var err error
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(shadow.Close)
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore, fs.pendingIndex = shadow, pending
+	if err := shadow.WriteFull("/file.bin", []byte("HELLO WORLD"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode("/file.bin", int64(len(remote)), PendingOverwrite, 1, 0o644, true); err != nil {
+		t.Fatal(err)
+	}
 	cache, err = NewWriteBackCache(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -388,6 +478,7 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 	}
 	uploader := &WriteBackUploader{client: fs.client, cache: cache, remoteRoot: "/"}
 	uploader.OnDataCommitted = fs.onWriteBackDataCommitted
+	uploader.SnapshotStagingGens = fs.snapshotStagingGens
 	successCalled := false
 	uploader.OnSuccess = func(WriteBackMeta, int64, StagingGens) { successCalled = true }
 	if _, err := uploader.UploadSyncWithRevision(context.Background(), "/file.bin"); err == nil {
@@ -400,6 +491,9 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 	if !ok || meta.Kind != PendingChmod {
 		t.Fatalf("cached meta = %+v/%t, want PendingChmod", meta, ok)
 	}
+	if pending.HasPending("/file.bin") || shadow.Has("/file.bin") {
+		t.Fatal("data-committed content staging survived chmod-only failure")
+	}
 	got, st, err := readDat9FSTestRange(fs, ino, c, 0, len(remote))
 	if err != nil || st != gofuse.OK || string(got) != "HELLO WORLD" {
 		t.Fatalf("read after data commit/chmod failure = %q/%v/%v, want HELLO WORLD/OK", got, st, err)
@@ -410,5 +504,45 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 	_, st, err = readDat9FSTestRange(fs, ino, c, 0, len(remote))
 	if err != nil || st != gofuse.Status(syscall.EAGAIN) {
 		t.Fatalf("read with a newer staged generation = %v/%v, want EAGAIN", st, err)
+	}
+}
+
+func TestReadWriteBackFtruncateDataCommitPreservesNewerStaging(t *testing.T) {
+	fs, _, _ := newFtruncateVisibilityFS(t, []byte("hello world"))
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(shadow.Close)
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore, fs.pendingIndex = shadow, pending
+	if err := shadow.WriteFull("/file.bin", []byte("old"), 1); err != nil {
+		t.Fatal(err)
+	}
+	oldShadowGen := shadow.ActiveGeneration("/file.bin")
+	oldPendingGen, err := pending.PutWithBaseRev("/file.bin", 3, PendingOverwrite, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/file.bin", []byte("new"), 2); err != nil {
+		t.Fatal(err)
+	}
+	newShadowGen := shadow.ActiveGeneration("/file.bin")
+	newPendingGen, err := pending.PutWithBaseRev("/file.bin", 3, PendingOverwrite, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.onWriteBackDataCommitted(WriteBackMeta{Path: "/file.bin"}, 2, StagingGens{
+		PendingIndexGen: oldPendingGen,
+		ShadowGen:       oldShadowGen,
+	})
+	if got := pending.Generation("/file.bin"); got != newPendingGen {
+		t.Fatalf("pending generation = %d, want newer %d", got, newPendingGen)
+	}
+	if got := shadow.ActiveGeneration("/file.bin"); got != newShadowGen {
+		t.Fatalf("shadow generation = %d, want newer %d", got, newShadowGen)
 	}
 }

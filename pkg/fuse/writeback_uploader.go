@@ -51,7 +51,7 @@ type StagingGens struct {
 // SnapshotStagingGensFunc snapshots the pendingIndex and shadowStore generations
 // for a path. If either store is absent or has no entry, the corresponding gen
 // is 0 (which never matches, so the guarded remove is skipped). Optional — if
-// nil, OnSuccess receives zero-value gens.
+// nil, the data-commit and success callbacks receive zero-value gens.
 type SnapshotStagingGensFunc func(remotePath string) StagingGens
 
 // WriteBackUploader consumes pending write-back cache entries and uploads
@@ -82,9 +82,9 @@ type WriteBackUploader struct {
 
 	perf            *fusePerfCounters
 	OnSuccess       WriteBackSuccessFunc
-	OnDataCommitted func(meta WriteBackMeta, committedRev int64)
+	OnDataCommitted func(meta WriteBackMeta, committedRev int64, gens StagingGens)
 	// SnapshotStagingGens optionally captures the pendingIndex/shadowStore
-	// generations for a path so OnSuccess can do generation-guarded cleanup.
+	// generations for generation-guarded cleanup after data commit.
 	SnapshotStagingGens SnapshotStagingGensFunc
 }
 
@@ -471,7 +471,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	if u.OnDataCommitted != nil {
-		u.OnDataCommitted(*meta, committedRev)
+		u.OnDataCommitted(*meta, committedRev, stagingGens)
 	}
 	chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	modeErr := u.applyMode(chmodCtx, meta)
@@ -528,11 +528,17 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 
 	// Atomically read meta + data under one path lock so they are guaranteed
 	// to be from the same generation.
-	meta, data, ok := u.cache.GetMetaAndView(localPath)
+	var stagingGens StagingGens
+	meta, data, ok := u.cache.GetMetaAndViewWithCallback(localPath, func() {
+		if u.SnapshotStagingGens != nil {
+			stagingGens = u.SnapshotStagingGens(localPath)
+		}
+	})
 	if !ok {
 		return 0, nil // not in cache (removed between GetMeta and GetMetaAndView)
 	}
 	gen := meta.Generation
+	stagingGens.WriteBackGen = gen
 
 	expectedRevision, err := expectedRevisionForWriteBack(meta)
 	if err != nil {
@@ -567,7 +573,7 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	if u.OnDataCommitted != nil {
-		u.OnDataCommitted(*meta, committedRev)
+		u.OnDataCommitted(*meta, committedRev, stagingGens)
 	}
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
 	err = u.applyMode(chmodCtx, meta)
