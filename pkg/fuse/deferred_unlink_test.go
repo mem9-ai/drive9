@@ -318,7 +318,7 @@ func TestDeferredUnlinkIntentSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen journal: %v", err)
 	}
-	defer j2.Close()
+	defer func() { _ = j2.Close() }()
 	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
 	if err != nil {
 		t.Fatalf("pending index: %v", err)
