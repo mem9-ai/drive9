@@ -16,6 +16,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/telemetry"
 )
 
 func fakeLookPath(binMap map[string]bool) func(string) (string, error) {
@@ -1154,10 +1155,23 @@ func TestMountBackgroundEnvSnapshotsCredentials(t *testing.T) {
 		envMountGVisorCompat + "=true",
 		EnvServer + "=https://drive9.example",
 		EnvVaultToken + "=jwt-token",
+		// Background mounts are internal processes: they must never report
+		// their own telemetry events.
+		telemetry.EnvironmentVariable + "=off",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("env = %v, want %v", got, want)
 	}
+}
+
+func TestMountBackgroundEnvOverridesInheritedTelemetryOptIn(t *testing.T) {
+	got := mountBackgroundEnv([]string{"PATH=/bin", telemetry.EnvironmentVariable + "=on"}, mountBackgroundRequest{})
+	for _, kv := range got {
+		if kv == telemetry.EnvironmentVariable+"=off" {
+			return
+		}
+	}
+	t.Fatalf("env = %v, want an explicit telemetry opt-out", got)
 }
 
 func TestWorkerArgsForSupervisePreservesGVisorCompat(t *testing.T) {

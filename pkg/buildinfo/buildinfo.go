@@ -9,10 +9,12 @@ import (
 )
 
 var (
-	Version   = "dev"
-	GitHash   = "unknown"
-	GitBranch = "unknown"
-	BuildTime = "unknown"
+	Version           = "dev"
+	GitHash           = "unknown"
+	GitBranch         = "unknown"
+	BuildTime         = "unknown"
+	InstallSource     = ""
+	TelemetryEndpoint = ""
 )
 
 type Info struct {
