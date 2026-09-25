@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"container/list"
 	"path"
 	"sort"
 	"strings"
@@ -69,6 +70,7 @@ type namespaceLookupResult struct {
 	kind                namespaceLookupKind
 	item                CachedFileInfo
 	dirGeneration       uint64
+	mutationGeneration  uint64
 	namespaceGeneration uint64
 }
 
@@ -166,11 +168,18 @@ type DirCache struct {
 	// that can invalidate an in-flight read, so a generation a token holds can
 	// never recur.
 	gen uint64
-	// namespaceGen advances only when an authoritative namespace mutation or
-	// invalidation occurs. Unlike gen, ordinary reads and listing installs do
-	// not advance it, so callers can retain bounded directory-shape evidence
-	// across cache expiry without retaining one generation per directory.
+	// namespaceGen advances only when the whole namespace view loses trust.
+	// Directory-scoped mutations use mutationGenerations below so an unrelated
+	// write does not invalidate every directory's cached shape evidence.
 	namespaceGen uint64
+	// mutationGenerations is a bounded LRU of directory-scoped namespace
+	// identities. Reads allocate but do not advance an identity; authoritative
+	// mutations advance only the affected directory (or prefix). Reallocating
+	// an evicted identity always takes a newer value, so eviction is safely
+	// conservative rather than allowing an old marker to match again.
+	mutationGenerations map[string]directoryMutationState
+	mutationOrder       *list.List
+	mutationClock       uint64
 	// inFlight counts uncompleted remote reads per directory. It is the
 	// lifetime of every piece of reconciliation state below: a per-name stamp or
 	// a retirement watermark only matters to a request that was already issued
@@ -203,10 +212,16 @@ type requestRef struct {
 	released bool
 }
 
+type directoryMutationState struct {
+	generation uint64
+	element    *list.Element
+}
+
 type listingInstallReceipt struct {
 	accepted            []CachedFileInfo
 	childCount          int
 	dirGeneration       uint64
+	mutationGeneration  uint64
 	namespaceGeneration uint64
 	complete            bool
 	installed           bool
@@ -230,14 +245,16 @@ func NewNamespaceCache(ttl, negativeTTL time.Duration, maxEntries int) *DirCache
 		maxEntries = defaultNamespaceCacheMaxEntries
 	}
 	return &DirCache{
-		entries:      make(map[string]*dirCacheEntry),
-		inFlight:     make(map[string]int),
-		retired:      make(map[string]uint64),
-		installFloor: make(map[string]uint64),
-		ttl:          ttl,
-		negativeTTL:  negativeTTL,
-		maxEntries:   maxEntries,
-		now:          time.Now,
+		entries:             make(map[string]*dirCacheEntry),
+		mutationGenerations: make(map[string]directoryMutationState),
+		mutationOrder:       list.New(),
+		inFlight:            make(map[string]int),
+		retired:             make(map[string]uint64),
+		installFloor:        make(map[string]uint64),
+		ttl:                 ttl,
+		negativeTTL:         negativeTTL,
+		maxEntries:          maxEntries,
+		now:                 time.Now,
 	}
 }
 
@@ -475,6 +492,7 @@ func (dc *DirCache) putListing(dirPath string, items []CachedFileInfo, request R
 		receipt = listingInstallReceipt{
 			childCount:          len(entry.items),
 			dirGeneration:       entry.gen,
+			mutationGeneration:  dc.mutationGenerationLocked(dirPath),
 			namespaceGeneration: dc.namespaceGen,
 			complete:            entry.complete,
 			installed:           true,
@@ -525,6 +543,7 @@ func (dc *DirCache) Lookup(parentPath, name string) namespaceLookupResult {
 	entry, ok := dc.getEntryLocked(parentPath, now)
 	result := namespaceLookupResult{
 		dirGeneration:       dc.generationLocked(parentPath),
+		mutationGeneration:  dc.mutationGenerationLocked(parentPath),
 		namespaceGeneration: dc.namespaceGen,
 	}
 	if !ok {
@@ -564,6 +583,7 @@ func (dc *DirCache) lookupSnapshotCurrent(parentPath string, result namespaceLoo
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	return dc.generationLocked(parentPath) == result.dirGeneration &&
+		dc.mutationGenerationLocked(parentPath) == result.mutationGeneration &&
 		dc.namespaceGen == result.namespaceGeneration
 }
 
@@ -802,6 +822,15 @@ func (dc *DirCache) generation(dirPath string) uint64 {
 	return dc.generationLocked(dirPath)
 }
 
+func (dc *DirCache) mutationGeneration(dirPath string) uint64 {
+	if dc == nil {
+		return 0
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.mutationGenerationLocked(dirPath)
+}
+
 func (dc *DirCache) namespaceGeneration() uint64 {
 	if dc == nil {
 		return 0
@@ -841,7 +870,7 @@ func (dc *DirCache) upsertInternal(parentPath string, item CachedFileInfo) {
 	item.freshUntil = time.Time{}
 	entry.upsert(item, dc.maxEntries)
 	delete(entry.negatives, item.Name)
-	dc.namespaceGen++
+	dc.bumpMutationGenerationLocked(parentPath)
 	dc.noteLocalLocked(entry, parentPath, item.Name)
 }
 
@@ -857,7 +886,7 @@ func (dc *DirCache) Remove(parentPath, name string) {
 
 	entry := dc.ensureEntryLocked(parentPath)
 	entry.remove(name)
-	dc.namespaceGen++
+	dc.bumpMutationGenerationLocked(parentPath)
 	dc.noteLocalLocked(entry, parentPath, name)
 	if !entry.hasState() {
 		delete(dc.entries, parentPath)
@@ -931,7 +960,7 @@ func (dc *DirCache) MarkSessionCreatedDir(dirPath string) {
 	entry.completeExpires = now.Add(dc.ttl)
 	entry.sessionExpires = now.Add(dc.ttl)
 	entry.negatives = make(map[string]time.Time)
-	dc.namespaceGen++
+	dc.bumpMutationGenerationLocked(dirPath)
 }
 
 // RecordRemoteNegative notes that a remote stat for a child of dirPath
@@ -1000,9 +1029,11 @@ func (dc *DirCache) CanAnswerMisses(dirPath string) bool {
 func (dc *DirCache) InvalidatePrefix(dirPath string) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	dc.namespaceGen++
 
 	if dirPath == "/" {
+		dc.namespaceGen++
+		dc.mutationGenerations = make(map[string]directoryMutationState)
+		dc.mutationOrder.Init()
 		// Retire every entry rather than replacing the map: entries with
 		// listings or observations still in flight have to keep their
 		// reconciliation state (see invalidateEntryLocked).
@@ -1011,6 +1042,7 @@ func (dc *DirCache) InvalidatePrefix(dirPath string) {
 		}
 		return
 	}
+	dc.bumpMutationPrefixLocked(dirPath)
 	prefix := dirPath
 	prefix += "/"
 	for p := range dc.entries {
@@ -1025,7 +1057,7 @@ func (dc *DirCache) Invalidate(dirPath string) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
-	dc.namespaceGen++
+	dc.bumpMutationGenerationLocked(dirPath)
 	dc.invalidateEntryLocked(dirPath)
 }
 
@@ -1034,6 +1066,8 @@ func (dc *DirCache) InvalidateAll() {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	dc.namespaceGen++
+	dc.mutationGenerations = make(map[string]directoryMutationState)
+	dc.mutationOrder.Init()
 
 	// Retire each entry rather than replacing the map: entries with listings
 	// still in flight have to keep their reconciliation state.
@@ -1125,6 +1159,53 @@ func (dc *DirCache) retireLocked(dirPath string) uint64 {
 func (dc *DirCache) nextGenerationLocked() uint64 {
 	dc.gen++
 	return dc.gen
+}
+
+func (dc *DirCache) mutationGenerationLocked(dirPath string) uint64 {
+	if state, ok := dc.mutationGenerations[dirPath]; ok {
+		dc.mutationOrder.MoveToBack(state.element)
+		return state.generation
+	}
+	return dc.bumpMutationGenerationLocked(dirPath)
+}
+
+func (dc *DirCache) bumpMutationGenerationLocked(dirPath string) uint64 {
+	state, exists := dc.mutationGenerations[dirPath]
+	if !exists && len(dc.mutationGenerations) >= dc.maxEntries {
+		oldest := dc.mutationOrder.Front()
+		delete(dc.mutationGenerations, oldest.Value.(string))
+		dc.mutationOrder.Remove(oldest)
+	}
+	dc.mutationClock++
+	if exists {
+		dc.mutationOrder.MoveToBack(state.element)
+	} else {
+		state.element = dc.mutationOrder.PushBack(dirPath)
+	}
+	state.generation = dc.mutationClock
+	dc.mutationGenerations[dirPath] = directoryMutationState{
+		generation: state.generation,
+		element:    state.element,
+	}
+	return dc.mutationClock
+}
+
+func (dc *DirCache) bumpMutationPrefixLocked(dirPath string) {
+	prefix := dirPath + "/"
+	found := false
+	for candidate, state := range dc.mutationGenerations {
+		if candidate != dirPath && !strings.HasPrefix(candidate, prefix) {
+			continue
+		}
+		dc.mutationClock++
+		state.generation = dc.mutationClock
+		dc.mutationOrder.MoveToBack(state.element)
+		dc.mutationGenerations[candidate] = state
+		found = found || candidate == dirPath
+	}
+	if !found {
+		dc.bumpMutationGenerationLocked(dirPath)
+	}
 }
 
 func (dc *DirCache) getEntryLocked(dirPath string, now time.Time) (*dirCacheEntry, bool) {

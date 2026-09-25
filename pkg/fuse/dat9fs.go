@@ -7633,7 +7633,7 @@ func (fs *Dat9FS) cachedAttrEntryFromLookup(entry *InodeEntry, parentPath string
 	if !trusted {
 		trusted = fs.statCacheVerified() && fs.metadataPrefetch != nil &&
 			!fs.hasPendingLocalState(entry.Path) && !fs.hasQueuedCommit(entry.Path) &&
-			fs.metadataPrefetch.valid(parentPath, entry.Path, mountGeneration, result.dirGeneration, result.namespaceGeneration)
+			fs.metadataPrefetch.valid(parentPath, entry.Path, mountGeneration, result.mutationGeneration, result.namespaceGeneration)
 	}
 	if !trusted || fs.mountViewGeneration.Load() != mountGeneration || !fs.dirCache.lookupSnapshotCurrent(parentPath, result) {
 		return nil, false

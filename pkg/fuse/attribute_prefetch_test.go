@@ -36,7 +36,7 @@ func TestLookupSecondSiblingMissPrefetchesDirectory(t *testing.T) {
 	defer server.Close()
 
 	fs := newMetadataPrefetchTestFS(server.URL)
-	fs.metadataPrefetch.rememberDirectorySize("/src", 3, fs.dirCache.namespaceGeneration())
+	rememberMetadataPrefetchDirectorySize(fs, "/src", 3)
 	dirIno := fs.inodes.Lookup("/src", true, 0, time.Now())
 	for _, name := range []string{"file.0", "file.1", "file.2"} {
 		var out gofuse.EntryOut
@@ -306,7 +306,7 @@ func TestSiblingMetadataPrefetchFailureFallsBackToSinglePathStat(t *testing.T) {
 	defer server.Close()
 
 	fs := newMetadataPrefetchTestFS(server.URL)
-	fs.metadataPrefetch.rememberDirectorySize("/src", 3, fs.dirCache.namespaceGeneration())
+	rememberMetadataPrefetchDirectorySize(fs, "/src", 3)
 	dirIno := fs.inodes.Lookup("/src", true, 0, time.Now())
 	for _, name := range []string{"file.0", "file.1"} {
 		if status := fs.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, name, &gofuse.EntryOut{}); status != gofuse.OK {
@@ -342,7 +342,7 @@ func TestGetAttrUsesVerifiedSiblingPrefetchWithoutTrustLocalEvents(t *testing.T)
 	defer server.Close()
 
 	fs := newMetadataPrefetchTestFS(server.URL)
-	fs.metadataPrefetch.rememberDirectorySize("/src", 3, fs.dirCache.namespaceGeneration())
+	rememberMetadataPrefetchDirectorySize(fs, "/src", 3)
 	for i := 0; i < 3; i++ {
 		filePath := fmt.Sprintf("/src/file.%d", i)
 		ino := fs.inodes.Lookup(filePath, false, 0, time.Unix(1, 0))
@@ -359,6 +359,46 @@ func TestGetAttrUsesVerifiedSiblingPrefetchWithoutTrustLocalEvents(t *testing.T)
 	}
 	if got := listCalls.Load(); got != 1 {
 		t.Fatalf("LIST calls = %d, want 1", got)
+	}
+}
+
+func TestOrdinaryLookupInstallKeepsSiblingPrefetchMarker(t *testing.T) {
+	var headCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", "40")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "4")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	fs := newMetadataPrefetchTestFS(server.URL)
+	installMetadataPrefetchBatch(t, fs, "/src", []CachedFileInfo{{
+		Name:     "a.go",
+		Size:     10,
+		Revision: 2,
+	}})
+	aIno := fs.inodes.Lookup("/src/a.go", false, 0, time.Unix(1, 0))
+	dirIno := fs.inodes.Lookup("/src", true, 0, time.Now())
+	if status := fs.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, "d.go", &gofuse.EntryOut{}); status != gofuse.OK {
+		t.Fatalf("Lookup d.go = %v, want OK", status)
+	}
+
+	var out gofuse.AttrOut
+	if status := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: aIno}}, &out); status != gofuse.OK {
+		t.Fatalf("GetAttr a.go = %v, want OK", status)
+	}
+	if got, want := out.Size, uint64(10); got != want {
+		t.Fatalf("GetAttr a.go size = %d, want prefetched %d", got, want)
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want only unprefetched d.go", got)
 	}
 }
 
@@ -383,7 +423,7 @@ func TestVerifiedSiblingPrefetchFailsClosedAfterDirectoryMutation(t *testing.T) 
 	defer server.Close()
 
 	fs := newMetadataPrefetchTestFS(server.URL)
-	fs.metadataPrefetch.rememberDirectorySize("/src", 3, fs.dirCache.namespaceGeneration())
+	rememberMetadataPrefetchDirectorySize(fs, "/src", 3)
 	for i := 0; i < 2; i++ {
 		ino := fs.inodes.Lookup(fmt.Sprintf("/src/file.%d", i), false, 0, time.Unix(1, 0))
 		if status := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &gofuse.AttrOut{}); status != gofuse.OK {
@@ -525,7 +565,7 @@ func TestSiblingMetadataPrefetchSingleflightsConcurrentDirectoryRefresh(t *testi
 	defer server.Close()
 
 	fs := newMetadataPrefetchTestFS(server.URL)
-	fs.metadataPrefetch.rememberDirectorySize("/src", 3, fs.dirCache.namespaceGeneration())
+	rememberMetadataPrefetchDirectorySize(fs, "/src", 3)
 	dirIno := fs.inodes.Lookup("/src", true, 0, time.Now())
 	if status := fs.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, "file.0", &gofuse.EntryOut{}); status != gofuse.OK {
 		t.Fatalf("first Lookup = %v, want OK", status)
@@ -598,7 +638,7 @@ func TestLargeDirectorySiblingPrefetchUsesBoundedBatchStat(t *testing.T) {
 	defer server.Close()
 
 	fs := newMetadataPrefetchTestFS(server.URL)
-	fs.metadataPrefetch.rememberDirectorySize("/src", metadataPrefetchListThreshold+1, fs.dirCache.namespaceGeneration())
+	rememberMetadataPrefetchDirectorySize(fs, "/src", metadataPrefetchListThreshold+1)
 	dirIno := fs.inodes.Lookup("/src", true, 0, time.Now())
 	for _, name := range []string{"file.0", "file.1"} {
 		if status := fs.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, name, &gofuse.EntryOut{}); status != gofuse.OK {
@@ -631,11 +671,12 @@ func TestAcceptedCompleteListingSeedsSmallDirectoryAfterCacheExpiry(t *testing.T
 		t.Fatal("directory cache remained live after TTL")
 	}
 	dirGeneration := fs.dirCache.generation("/src")
+	mutationGeneration := fs.dirCache.mutationGeneration("/src")
 	namespaceGeneration := fs.dirCache.namespaceGeneration()
-	if _, ok := fs.metadataPrefetch.beginMiss("/src/a.go", 1, dirGeneration, namespaceGeneration); ok {
+	if _, ok := fs.metadataPrefetch.beginMiss("/src/a.go", 1, dirGeneration, mutationGeneration, namespaceGeneration); ok {
 		t.Fatal("first miss activated prefetch")
 	}
-	prefetchRequest, ok := fs.metadataPrefetch.beginMiss("/src/b.go", 1, dirGeneration, namespaceGeneration)
+	prefetchRequest, ok := fs.metadataPrefetch.beginMiss("/src/b.go", 1, dirGeneration, mutationGeneration, namespaceGeneration)
 	if !ok {
 		t.Fatal("second miss did not activate prefetch")
 	}
@@ -649,27 +690,27 @@ func TestBeginMissBoundsGetAttrHotSetAndDefersSnapshot(t *testing.T) {
 	now := time.Unix(100, 0)
 	prefetch.now = func() time.Time { return now }
 
-	if _, ok := prefetch.beginMiss("/src/a.go", 1, 2, 3); ok {
+	if _, ok := prefetch.beginMiss("/src/a.go", 1, 2, 3, 4); ok {
 		t.Fatal("first miss activated prefetch")
 	}
-	request, ok := prefetch.beginMiss("/src/b.go", 1, 2, 3)
+	request, ok := prefetch.beginMiss("/src/b.go", 1, 2, 3, 4)
 	if !ok {
 		t.Fatal("second miss did not activate prefetch")
 	}
 	if len(request.hotPaths) != 2 {
 		t.Fatalf("activation hot paths = %d, want 2", len(request.hotPaths))
 	}
-	joined, ok := prefetch.beginMiss("/src/c.go", 1, 2, 3)
+	joined, ok := prefetch.beginMiss("/src/c.go", 1, 2, 3, 4)
 	if !ok {
 		t.Fatal("active refresh was not joined")
 	}
-	if len(joined.hotPaths) != 0 {
-		t.Fatalf("active waiter built hot snapshot with %d paths", len(joined.hotPaths))
+	if fmt.Sprint(joined.hotPaths) != fmt.Sprint(request.hotPaths) {
+		t.Fatalf("active waiter plan = %v, want shared %v", joined.hotPaths, request.hotPaths)
 	}
 	prefetch.finish(request)
 
 	for i := 0; i < metadataPrefetchMaxHotPaths*4; i++ {
-		if _, ok := prefetch.beginMiss(fmt.Sprintf("/src/getattr-%04d.go", i), 1, 2, 3); ok {
+		if _, ok := prefetch.beginMiss(fmt.Sprintf("/src/getattr-%04d.go", i), 1, 2, 3, 4); ok {
 			t.Fatalf("cooldown miss %d activated prefetch", i)
 		}
 	}
@@ -681,28 +722,161 @@ func TestBeginMissBoundsGetAttrHotSetAndDefersSnapshot(t *testing.T) {
 	}
 }
 
-func TestNamespaceMutationInvalidatesRememberedDirectorySize(t *testing.T) {
+func TestActiveMetadataPrefetchJoinerCanExecuteSharedPlan(t *testing.T) {
+	prefetch := newSiblingMetadataPrefetch(time.Minute)
+	if _, ok := prefetch.beginMiss("/src/a.go", 1, 2, 3, 4); ok {
+		t.Fatal("first miss activated prefetch")
+	}
+	owner, ok := prefetch.beginMiss("/src/b.go", 1, 2, 3, 4)
+	if !ok {
+		t.Fatal("second miss did not activate prefetch")
+	}
+	joiner, ok := prefetch.beginMiss("/src/c.go", 1, 2, 3, 4)
+	if !ok {
+		t.Fatal("active refresh was not joined")
+	}
+
+	executed := make(chan []string, 1)
+	release := make(chan struct{})
+	joinerDone := make(chan struct{})
+	go func() {
+		defer close(joinerDone)
+		_, _, _ = prefetch.flight.Do(context.Background(), joiner.key, func() ([]byte, error) {
+			executed <- append([]string(nil), joiner.hotPaths...)
+			<-release
+			return nil, nil
+		})
+	}()
+
+	var executorCalls atomic.Int32
+	ownerDone := make(chan struct{})
+	paths := <-executed
+	go func() {
+		defer close(ownerDone)
+		_, _, _ = prefetch.flight.Do(context.Background(), owner.key, func() ([]byte, error) {
+			executorCalls.Add(1)
+			return nil, nil
+		})
+	}()
+	waitForWaiters(t, prefetch.flight, owner.key, 1)
+	close(release)
+	<-joinerDone
+	<-ownerDone
+	prefetch.finish(owner)
+
+	if fmt.Sprint(paths) != fmt.Sprint(owner.hotPaths) {
+		t.Fatalf("joiner executor plan = %v, want shared %v", paths, owner.hotPaths)
+	}
+	if executorCalls.Load() != 0 {
+		t.Fatal("owner callback ran after joiner had already become executor")
+	}
+}
+
+func TestUnrelatedDirectoryMutationKeepsRememberedDirectorySize(t *testing.T) {
 	dc := NewNamespaceCache(time.Minute, time.Second, 16)
 	prefetch := newSiblingMetadataPrefetch(time.Minute)
-	prefetch.rememberDirectorySize("/src", 2, dc.namespaceGeneration())
+	mutationGeneration := dc.mutationGeneration("/src")
+	namespaceGeneration := dc.namespaceGeneration()
+	prefetch.rememberDirectorySize("/src", 2, mutationGeneration, namespaceGeneration)
+	prefetch.rememberBatch(metadataPrefetchRequest{
+		parentPath:          "/src",
+		mountGeneration:     1,
+		mutationGeneration:  mutationGeneration,
+		namespaceGeneration: namespaceGeneration,
+		epoch:               prefetch.epoch,
+	}, []CachedFileInfo{{Name: "a.go"}}, mutationGeneration, namespaceGeneration)
 	dc.Upsert("/other", CachedFileInfo{Name: "new.go"})
 
 	dirGeneration := dc.generation("/src")
-	namespaceGeneration := dc.namespaceGeneration()
-	if _, ok := prefetch.beginMiss("/src/a.go", 1, dirGeneration, namespaceGeneration); ok {
+	mutationGeneration = dc.mutationGeneration("/src")
+	namespaceGeneration = dc.namespaceGeneration()
+	if !prefetch.valid("/src", "/src/a.go", 1, mutationGeneration, namespaceGeneration) {
+		t.Fatal("unrelated directory mutation invalidated sibling marker")
+	}
+	if _, ok := prefetch.beginMiss("/src/a.go", 1, dirGeneration, mutationGeneration, namespaceGeneration); ok {
 		t.Fatal("first miss activated prefetch")
 	}
-	request, ok := prefetch.beginMiss("/src/b.go", 1, dirGeneration, namespaceGeneration)
+	request, ok := prefetch.beginMiss("/src/b.go", 1, dirGeneration, mutationGeneration, namespaceGeneration)
+	if !ok {
+		t.Fatal("second miss did not activate prefetch")
+	}
+	if !request.list {
+		t.Fatal("unrelated directory mutation discarded remembered directory size")
+	}
+}
+
+func TestDirectoryMutationInvalidatesRememberedDirectorySize(t *testing.T) {
+	dc := NewNamespaceCache(time.Minute, time.Second, 16)
+	prefetch := newSiblingMetadataPrefetch(time.Minute)
+	prefetch.rememberDirectorySize("/src", 2, dc.mutationGeneration("/src"), dc.namespaceGeneration())
+	dc.Upsert("/src", CachedFileInfo{Name: "new.go"})
+
+	dirGeneration := dc.generation("/src")
+	mutationGeneration := dc.mutationGeneration("/src")
+	namespaceGeneration := dc.namespaceGeneration()
+	if _, ok := prefetch.beginMiss("/src/a.go", 1, dirGeneration, mutationGeneration, namespaceGeneration); ok {
+		t.Fatal("first miss activated prefetch")
+	}
+	request, ok := prefetch.beginMiss("/src/b.go", 1, dirGeneration, mutationGeneration, namespaceGeneration)
 	if !ok {
 		t.Fatal("second miss did not activate prefetch")
 	}
 	if request.list {
-		t.Fatal("stale directory size selected unbounded LIST")
+		t.Fatal("same-directory mutation retained stale directory size")
+	}
+}
+
+func TestAncestorInvalidationRevokesDescendantPrefetchIdentity(t *testing.T) {
+	dc := NewNamespaceCache(time.Minute, time.Second, 16)
+	prefetch := newSiblingMetadataPrefetch(time.Minute)
+	mutationGeneration := dc.mutationGeneration("/repo/src")
+	namespaceGeneration := dc.namespaceGeneration()
+	prefetch.rememberDirectorySize("/repo/src", 2, mutationGeneration, namespaceGeneration)
+	prefetch.rememberBatch(metadataPrefetchRequest{
+		parentPath:          "/repo/src",
+		mountGeneration:     1,
+		mutationGeneration:  mutationGeneration,
+		namespaceGeneration: namespaceGeneration,
+		epoch:               prefetch.epoch,
+	}, []CachedFileInfo{{Name: "a.go"}}, mutationGeneration, namespaceGeneration)
+
+	dc.InvalidatePrefix("/repo")
+	mutationGeneration = dc.mutationGeneration("/repo/src")
+	namespaceGeneration = dc.namespaceGeneration()
+	if prefetch.valid("/repo/src", "/repo/src/a.go", 1, mutationGeneration, namespaceGeneration) {
+		t.Fatal("ancestor invalidation left descendant marker valid")
+	}
+	dirGeneration := dc.generation("/repo/src")
+	if _, ok := prefetch.beginMiss("/repo/src/a.go", 1, dirGeneration, mutationGeneration, namespaceGeneration); ok {
+		t.Fatal("first miss activated prefetch")
+	}
+	request, ok := prefetch.beginMiss("/repo/src/b.go", 1, dirGeneration, mutationGeneration, namespaceGeneration)
+	if !ok {
+		t.Fatal("second miss did not activate prefetch")
+	}
+	if request.list {
+		t.Fatal("ancestor invalidation retained stale descendant directory size")
+	}
+}
+
+func TestDirectoryMutationIdentityEvictionCannotMatchOldMarker(t *testing.T) {
+	dc := NewNamespaceCache(time.Minute, time.Second, 2)
+	first := dc.mutationGeneration("/first")
+	dc.mutationGeneration("/second")
+	dc.mutationGeneration("/second")
+	dc.mutationGeneration("/third")
+	recreated := dc.mutationGeneration("/first")
+	if recreated == first {
+		t.Fatalf("recreated mutation identity = %d, want newer than evicted %d", recreated, first)
+	}
+	if got := len(dc.mutationGenerations); got != 2 {
+		t.Fatalf("tracked mutation identities = %d, want bounded 2", got)
 	}
 }
 
 func TestListingReceiptExcludesResponseRejectedByLocalMutation(t *testing.T) {
 	dc := NewNamespaceCache(time.Minute, time.Second, 16)
+	mutationGeneration := dc.mutationGeneration("/src")
 	request := dc.BeginRequest("/src")
 	dc.Upsert("/src", CachedFileInfo{Name: "file.go", Size: 20, Revision: 2})
 	_, receipt := dc.putListing("/src", []CachedFileInfo{{Name: "file.go", Size: 10, Revision: 1}}, request)
@@ -717,11 +891,12 @@ func TestListingReceiptExcludesResponseRejectedByLocalMutation(t *testing.T) {
 	prefetchRequest := metadataPrefetchRequest{
 		parentPath:          "/src",
 		mountGeneration:     3,
+		mutationGeneration:  mutationGeneration,
 		namespaceGeneration: receipt.namespaceGeneration,
 		epoch:               prefetch.epoch,
 	}
 	prefetch.rememberListing(prefetchRequest, receipt)
-	if prefetch.valid("/src", "/src/file.go", 3, receipt.dirGeneration, receipt.namespaceGeneration) {
+	if prefetch.valid("/src", "/src/file.go", 3, receipt.mutationGeneration, receipt.namespaceGeneration) {
 		t.Fatal("locally superseded response item received a marker")
 	}
 }
@@ -743,6 +918,7 @@ func TestStaleListingReceiptCannotPublishMarker(t *testing.T) {
 	prefetchRequest := metadataPrefetchRequest{
 		parentPath:          "/src",
 		mountGeneration:     3,
+		mutationGeneration:  newerReceipt.mutationGeneration,
 		namespaceGeneration: newerReceipt.namespaceGeneration,
 		epoch:               prefetch.epoch,
 	}
@@ -754,8 +930,8 @@ func TestStaleListingReceiptCannotPublishMarker(t *testing.T) {
 	if staleMarked {
 		t.Fatal("stale listing path was added to the marker")
 	}
-	currentGeneration := dc.generation("/src")
-	if prefetch.valid("/src", "/src/old.go", 3, currentGeneration, newerReceipt.namespaceGeneration) {
+	currentMutation := dc.mutationGeneration("/src")
+	if prefetch.valid("/src", "/src/old.go", 3, currentMutation, newerReceipt.namespaceGeneration) {
 		t.Fatal("stale listing path received a marker")
 	}
 }
@@ -794,6 +970,7 @@ func TestMetadataPrefetchBatchBindsResultsByPath(t *testing.T) {
 		parentPath:          "/src",
 		mountGeneration:     fs.mountViewGeneration.Load(),
 		dirGeneration:       fs.dirCache.generation("/src"),
+		mutationGeneration:  fs.dirCache.mutationGeneration("/src"),
 		namespaceGeneration: fs.dirCache.namespaceGeneration(),
 		epoch:               fs.metadataPrefetch.epoch,
 		hotPaths:            []string{"/src/a.go", "/src/b.go"},
@@ -835,6 +1012,7 @@ func TestMetadataPrefetchBatchRejectsDuplicateResultPaths(t *testing.T) {
 		parentPath:          "/src",
 		mountGeneration:     fs.mountViewGeneration.Load(),
 		dirGeneration:       fs.dirCache.generation("/src"),
+		mutationGeneration:  fs.dirCache.mutationGeneration("/src"),
 		namespaceGeneration: fs.dirCache.namespaceGeneration(),
 		epoch:               fs.metadataPrefetch.epoch,
 		hotPaths:            []string{"/src/a.go", "/src/b.go"},
@@ -855,6 +1033,7 @@ func TestMetadataPrefetchBatchMarkerAuthorizesOnlyRefreshedPaths(t *testing.T) {
 	request := metadataPrefetchRequest{
 		parentPath:          "/src",
 		mountGeneration:     3,
+		mutationGeneration:  7,
 		namespaceGeneration: 5,
 		epoch:               prefetch.epoch,
 	}
@@ -872,6 +1051,7 @@ func TestMetadataPrefetchLargeListingMarkerAuthorizesOnlyHotPaths(t *testing.T) 
 	request := metadataPrefetchRequest{
 		parentPath:          "/src",
 		mountGeneration:     3,
+		mutationGeneration:  7,
 		namespaceGeneration: 5,
 		epoch:               prefetch.epoch,
 		hotPaths:            []string{"/src/hot.go"},
@@ -885,6 +1065,7 @@ func TestMetadataPrefetchLargeListingMarkerAuthorizesOnlyHotPaths(t *testing.T) 
 		accepted:            items,
 		childCount:          len(items),
 		dirGeneration:       7,
+		mutationGeneration:  7,
 		namespaceGeneration: 5,
 		installed:           true,
 	})
@@ -925,19 +1106,30 @@ func writeMetadataPrefetchListing(t *testing.T, w http.ResponseWriter, count int
 
 func installMetadataPrefetchBatch(t *testing.T, fs *Dat9FS, parentPath string, items []CachedFileInfo) {
 	t.Helper()
+	mutationGeneration := fs.dirCache.mutationGeneration(parentPath)
 	namespaceGeneration := fs.dirCache.namespaceGeneration()
 	observation := fs.dirCache.BeginRequest(parentPath)
-	dirGeneration, accepted := fs.dirCache.observeBatch(parentPath, items, observation)
+	_, accepted := fs.dirCache.observeBatch(parentPath, items, observation)
 	if !accepted {
 		t.Fatal("metadata batch was not accepted")
 	}
 	request := metadataPrefetchRequest{
 		parentPath:          parentPath,
 		mountGeneration:     fs.mountViewGeneration.Load(),
+		mutationGeneration:  mutationGeneration,
 		namespaceGeneration: namespaceGeneration,
 		epoch:               fs.metadataPrefetch.epoch,
 	}
-	fs.metadataPrefetch.rememberBatch(request, items, dirGeneration, namespaceGeneration)
+	fs.metadataPrefetch.rememberBatch(request, items, mutationGeneration, namespaceGeneration)
+}
+
+func rememberMetadataPrefetchDirectorySize(fs *Dat9FS, parentPath string, childCount int) {
+	fs.metadataPrefetch.rememberDirectorySize(
+		parentPath,
+		childCount,
+		fs.dirCache.mutationGeneration(parentPath),
+		fs.dirCache.namespaceGeneration(),
+	)
 }
 
 func metadataPrefetchActiveKey(t *testing.T, prefetch *siblingMetadataPrefetch) string {
