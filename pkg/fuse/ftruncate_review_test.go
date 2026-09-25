@@ -423,7 +423,7 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 		case http.MethodGet:
 			if replaceMetaOnGet {
 				replaceMetaOnGet = false
-				if _, _, err := cache.putHandleSnapshot("/file.bin", []byte("NEWER DATA!"), 11, PendingOverwrite, 2, 0o644, true, "", "", false, true, nil, 0, 0); err != nil {
+				if _, _, err := cache.putHandleSnapshot("/file.bin", []byte("NEWER DATA!"), 11, PendingOverwrite, 2, 0o644, true, "", "", false, true, nil, 0, 0, StagingGens{}); err != nil {
 					t.Errorf("stage newer data during GET: %v", err)
 				}
 			}
@@ -473,7 +473,7 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 		t.Fatal(err)
 	}
 	fs.writeBack = cache
-	if _, _, err := cache.putHandleSnapshot("/file.bin", []byte("HELLO WORLD"), int64(len(remote)), PendingOverwrite, 1, 0o644, true, "", "", false, true, nil, ino, newerSeq); err != nil {
+	if _, _, err := cache.putHandleSnapshot("/file.bin", []byte("HELLO WORLD"), int64(len(remote)), PendingOverwrite, 1, 0o644, true, "", "", false, true, nil, ino, newerSeq, fs.snapshotStagingGens("/file.bin")); err != nil {
 		t.Fatal(err)
 	}
 	uploader := &WriteBackUploader{client: fs.client, cache: cache, remoteRoot: "/"}
@@ -535,7 +535,7 @@ func TestReadWriteBackFtruncateDataCommitPreservesNewerStaging(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fs.onWriteBackDataCommitted(WriteBackMeta{Path: "/file.bin"}, 2, StagingGens{
+	fs.onWriteBackDataCommitted(WriteBackMeta{Path: "/file.bin", ownedStagingKnown: true}, 2, StagingGens{
 		PendingIndexGen: oldPendingGen,
 		ShadowGen:       oldShadowGen,
 	})
@@ -544,5 +544,97 @@ func TestReadWriteBackFtruncateDataCommitPreservesNewerStaging(t *testing.T) {
 	}
 	if got := shadow.ActiveGeneration("/file.bin"); got != newShadowGen {
 		t.Fatalf("shadow generation = %d, want newer %d", got, newShadowGen)
+	}
+}
+
+func TestReadWriteBackFtruncateUploaderKeepsUnpublishedNewerStaging(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		name := "sync"
+		if async {
+			name = "async"
+		}
+		t.Run(name, func(t *testing.T) {
+			remote := []byte("old")
+			revision := int64(1)
+			var mu sync.Mutex
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch r.Method {
+				case http.MethodHead:
+					w.Header().Set("Content-Length", strconv.Itoa(len(remote)))
+					w.Header().Set("X-Dat9-IsDir", "false")
+					w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+				case http.MethodGet:
+					_, _ = w.Write(remote)
+				case http.MethodPut:
+					data, err := io.ReadAll(r.Body)
+					if err != nil {
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					remote, revision = data, revision+1
+					w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+				default:
+					w.WriteHeader(http.StatusMethodNotAllowed)
+				}
+			}))
+			t.Cleanup(server.Close)
+			opts := &MountOptions{SyncMode: SyncStrict, WritePolicy: WritePolicyWriteBack, TrustLocalEvents: true}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(server.URL), opts)
+			ino := fs.inodes.Lookup("/file.bin", false, 3, time.Now())
+			shadow, err := NewShadowStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(shadow.Close)
+			pending, err := NewPendingIndex(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cache, err := NewWriteBackCache(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			fs.shadowStore, fs.pendingIndex, fs.writeBack = shadow, pending, cache
+			if err := shadow.WriteFull("/file.bin", []byte("old"), 1); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pending.PutWithBaseRev("/file.bin", 3, PendingOverwrite, 1); err != nil {
+				t.Fatal(err)
+			}
+			owned := fs.snapshotStagingGens("/file.bin")
+			if _, _, err := cache.putHandleSnapshot("/file.bin", []byte("old"), 3, PendingOverwrite, 1, 0, false, "", "", false, true, nil, ino, 1, owned); err != nil {
+				t.Fatal(err)
+			}
+			// The next handle has staged, but has not published its cache snapshot.
+			if err := shadow.WriteFull("/file.bin", []byte("new"), 1); err != nil {
+				t.Fatal(err)
+			}
+			newShadowGen := shadow.ActiveGeneration("/file.bin")
+			newPendingGen, err := pending.PutWithBaseRev("/file.bin", 3, PendingOverwrite, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			uploader := &WriteBackUploader{
+				client: fs.client, cache: cache, remoteRoot: "/",
+				inflight: make(map[string]*pathState),
+			}
+			uploader.SnapshotStagingGens = fs.snapshotStagingGens
+			uploader.OnDataCommitted = fs.onWriteBackDataCommitted
+			uploader.OnSuccess = fs.onWriteBackUploadSuccess
+			if async {
+				uploader.uploadOne("/file.bin")
+			} else if _, err := uploader.UploadSyncWithRevision(context.Background(), "/file.bin"); err != nil {
+				t.Fatal(err)
+			}
+			if got := pending.Generation("/file.bin"); got != newPendingGen {
+				t.Fatalf("pending generation = %d, want unpublished newer %d", got, newPendingGen)
+			}
+			if got := shadow.ActiveGeneration("/file.bin"); got != newShadowGen {
+				t.Fatalf("shadow generation = %d, want unpublished newer %d", got, newShadowGen)
+			}
+		})
 	}
 }

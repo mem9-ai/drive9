@@ -4639,7 +4639,9 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle, durable bool) error {
 	bvDur := time.Since(bvStart)
 
 	snapshotID, parentSnapshotID := ensureStagedSnapshotLineageLocked(fh)
-	// The process-local inode sequence is published with this cache generation.
+	// Bind the handle's own staging generations to this cache snapshot. A
+	// path lookup by the uploader could observe a newer writer's staging.
+	ownedStaging := fs.captureHandleStagingGensLocked(fh)
 	gen, timings, err := fs.writeBack.putHandleSnapshot(
 		fh.Path,
 		data,
@@ -4655,6 +4657,7 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle, durable bool) error {
 		fh.stagedAncestors,
 		fh.Ino,
 		fh.DirtySeq,
+		ownedStaging,
 	)
 	if err == nil {
 		// Record the staged generation so unlink-discard can remove only this
@@ -17589,13 +17592,9 @@ func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) 
 	}
 }
 
-// snapshotStagingGens captures the pendingIndex and shadowStore content
-// generations for remotePath. It deliberately does NOT read writeBack.GetMeta
-// because GetMeta acquires the writeBack per-path lock — calling it from the
-// GetMetaAndViewWithCallback onLocked callback (which already holds that lock)
-// would self-deadlock. The WriteBackGen is set by the caller from the meta it
-// already holds (uploadOne sets it from meta.Generation; the debounced path
-// sets it separately via a safe GetMeta call outside any path lock).
+// snapshotStagingGens is a path-level fallback for legacy cache entries.
+// Handle snapshots carry their own staging generations from publication.
+// Do not read writeBack.GetMeta here: the caller already holds its path lock.
 func (fs *Dat9FS) snapshotStagingGens(remotePath string) StagingGens {
 	var g StagingGens
 	if fs.pendingIndex != nil {
@@ -17612,6 +17611,9 @@ func (fs *Dat9FS) snapshotStagingGens(remotePath string) StagingGens {
 func (fs *Dat9FS) onWriteBackDataCommitted(meta WriteBackMeta, committedRev int64, gens StagingGens) {
 	if fs != nil && meta.Inode != 0 && meta.MutationSeq != 0 {
 		fs.recordCommittedMutation(meta.Inode, meta.MutationSeq, committedRev, meta.Size)
+	}
+	if !meta.ownedStagingKnown {
+		return
 	}
 	if fs != nil && fs.pendingIndex != nil && gens.PendingIndexGen != 0 {
 		fs.pendingIndex.RemoveIfGeneration(meta.Path, gens.PendingIndexGen)
@@ -17649,8 +17651,8 @@ func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int6
 	// The cleanup is generation-guarded: a newer same-path write may have
 	// bumped the pendingIndex/shadowStore generations while this upload was in
 	// flight, and removing the fresher entry would lose that pending data.
-	// SnapshotStagingGens captured the generations at upload start; we only
-	// remove if they still match.
+	// Handle snapshots use their publication-time owned generations. Legacy
+	// entries retain the path-level fallback, and both remove only matches.
 	if fs.pendingIndex != nil && gens.PendingIndexGen != 0 {
 		fs.pendingIndex.RemoveIfGeneration(meta.Path, gens.PendingIndexGen)
 	}
