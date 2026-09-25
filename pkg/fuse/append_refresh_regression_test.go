@@ -301,6 +301,40 @@ func TestIssue986AppendVisibleBeforeWriterClose(t *testing.T) {
 	}
 }
 
+func TestIssue986AppendVisibleAfterNewerDirtyMarkerCleared(t *testing.T) {
+	const path = "/append-older-dirty.txt"
+	fs, ino := pr939HandleFS(t, path, "hello")
+	writer, writerID := pr939Handle(t, fs, ino, path, "hello", false)
+	t.Cleanup(func() { fs.deleteFileHandle(writerID, writer) })
+	if n, st := pr939Append(fs, ino, writerID, " gopher"); st != gofuse.OK || n != 7 {
+		t.Fatalf("append: n=%d status=%v", n, st)
+	}
+
+	// A later failed mutation can clear the inode's latest marker while this
+	// writer's acknowledged append remains in its open dirty handle.
+	laterSeq := fs.markDirtySize(ino, 12)
+	fs.clearDirtySize(ino, laterSeq)
+	if _, dirty := fs.dirtyHandleSize(ino); dirty || writer.DirtySeq == 0 {
+		t.Fatalf("setup: inode marker dirty=%t, writer seq=%d", dirty, writer.DirtySeq)
+	}
+	fs.readCache.Put(path, []byte("hello"), 1)
+
+	reader := &FileHandle{Ino: ino, Path: path, BaseRev: 1, OrigSize: 5, WritePolicy: WritePolicyWriteBack}
+	readerID := fs.allocateFileHandle(reader)
+	t.Cleanup(func() { fs.deleteFileHandle(readerID, reader) })
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino}, Fh: readerID, Size: uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("read: %v", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK || string(got) != "hello gopher" {
+		t.Fatalf("read after newer marker cleared: got %q status=%v, want hello gopher", got, st)
+	}
+}
+
 func TestIssue986BusyWriterDoesNotExposeStaleContent(t *testing.T) {
 	const path = "/append-busy-visible.txt"
 	fs, ino := pr939HandleFS(t, path, "hello")

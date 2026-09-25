@@ -13544,9 +13544,8 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 
 	if fh.Dirty == nil && !isSQLitePersistentJournalPath(fh.Path) {
 		hasDirtyAppend := func() bool {
-			if _, dirty := fs.dirtyHandleSize(fh.Ino); !dirty {
-				return false
-			}
+			// The latest inode marker can be cleared while an older append
+			// remains dirty on an open handle.
 			for _, src := range fs.openHandles.SnapshotPath(fh.Path) {
 				if src == nil || src == fh || src.Ino != fh.Ino || src.Flags&uint32(syscall.O_APPEND) == 0 {
 					continue
