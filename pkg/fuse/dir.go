@@ -759,8 +759,13 @@ type RequestToken struct {
 	// not by other requests merely starting, so concurrent reads of one
 	// directory do not supersede each other.
 	event uint64
-	ref   *requestRef
-	valid bool
+	// install is the newest listing installation observed when the request
+	// started. Batch observations may merge around per-path HEAD results, but
+	// not around a listing installed while the batch was in flight: that
+	// listing may carry newer metadata even when its request started earlier.
+	install uint64
+	ref     *requestRef
+	valid   bool
 }
 
 // BeginRequest registers a remote read of dirPath and returns the token that
@@ -784,12 +789,21 @@ func (dc *DirCache) BeginRequest(dirPath string) RequestToken {
 	}
 	dc.inFlight[dirPath]++
 	return RequestToken{
-		dir:   dirPath,
-		seq:   dc.nextGenerationLocked(),
-		event: dc.generationLocked(dirPath),
-		ref:   &requestRef{},
-		valid: true,
+		dir:     dirPath,
+		seq:     dc.nextGenerationLocked(),
+		event:   dc.generationLocked(dirPath),
+		install: dc.latestInstallLocked(dirPath),
+		ref:     &requestRef{},
+		valid:   true,
 	}
+}
+
+func (dc *DirCache) latestInstallLocked(dirPath string) uint64 {
+	latest := dc.installFloor[dirPath]
+	if entry := dc.entries[dirPath]; entry != nil && entry.installSeq > latest {
+		latest = entry.installSeq
+	}
+	return latest
 }
 
 // EndRequest releases a token whose request produced no install. Safe to call
@@ -937,15 +951,11 @@ func (dc *DirCache) observeBatch(parentPath string, items []CachedFileInfo, toke
 		dc.releaseRequestLocked(token)
 		return batchObservationReceipt{}
 	}
-	entry := dc.ensureEntryLocked(parentPath)
-	newestInstall := entry.installSeq
-	if floor := dc.installFloor[parentPath]; floor > newestInstall {
-		newestInstall = floor
-	}
-	if newestInstall > token.seq {
+	if dc.latestInstallLocked(parentPath) != token.install {
 		dc.releaseRequestLocked(token)
 		return batchObservationReceipt{}
 	}
+	entry := dc.ensureEntryLocked(parentPath)
 	deadline := dc.now().Add(dc.ttl)
 	accepted := make([]CachedFileInfo, 0, len(items))
 	for _, item := range items {

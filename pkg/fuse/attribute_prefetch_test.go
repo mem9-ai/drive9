@@ -1057,6 +1057,65 @@ func TestMetadataPrefetchBatchPreservesHEADCompletedDuringRequest(t *testing.T) 
 	}
 }
 
+func TestMetadataPrefetchBatchRejectsListingInstalledDuringRequest(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs:batch-stat" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var body struct {
+			Paths []string `json:"paths"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode batch stat: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		started <- struct{}{}
+		<-release
+		results := make([]client.BatchStatResult, len(body.Paths))
+		for i, filePath := range body.Paths {
+			results[i] = client.BatchStatResult{Path: filePath, Status: http.StatusOK, Size: 2, Revision: 2}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
+	}))
+	defer server.Close()
+
+	fs := newMetadataPrefetchTestFS(server.URL)
+	listRequest := fs.dirCache.BeginRequest("/src")
+	mountGeneration := fs.mountViewGeneration.Load()
+	mutationGeneration := fs.dirCache.mutationGeneration("/src")
+	namespaceGeneration := fs.dirCache.namespaceGeneration()
+	request := metadataPrefetchRequest{
+		parentPath:          "/src",
+		mountGeneration:     mountGeneration,
+		mutationGeneration:  mutationGeneration,
+		namespaceGeneration: namespaceGeneration,
+		epoch:               fs.metadataPrefetch.epoch,
+		hotPaths:            []string{"/src/file.0"},
+	}
+	done := make(chan error, 1)
+	go func() { done <- fs.refreshSiblingMetadataBatch(context.Background(), request) }()
+	<-started
+	fs.dirCache.putListing("/src", []CachedFileInfo{{Name: "file.0", Size: 9, Revision: 9}}, listRequest)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("refresh with racing listing: %v", err)
+	}
+
+	got := fs.dirCache.Lookup("/src", "file.0")
+	if got.kind != namespaceLookupPositive || got.item.Revision != 9 || got.item.Size != 9 {
+		t.Fatalf("file.0 lookup = %+v, want newer listing revision 9", got)
+	}
+	if fs.metadataPrefetch.valid("/src", "/src/file.0", mountGeneration, mutationGeneration, namespaceGeneration) {
+		t.Fatal("superseded batch path received a marker")
+	}
+}
+
 func TestMetadataPrefetchListRejectsRequestAcrossSSEReconnect(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
