@@ -219,9 +219,14 @@ type CommitQueue struct {
 	workCh chan *CommitEntry
 
 	zeroTruncateDelay time.Duration
-	batchWindow       time.Duration
-	batchMaxItems     int
-	batchMaxBytes     int64
+	// deleteCoalesceWindow holds PendingDelete entries briefly before
+	// dispatching so a directory rmdir that arrives mid-`rm -rf` can
+	// coalesce the whole subtree into one recursive DELETE. WaitPath,
+	// WaitPrefix, WaitIdle, and DrainAll force delayed deletes immediately.
+	deleteCoalesceWindow time.Duration
+	batchWindow          time.Duration
+	batchMaxItems        int
+	batchMaxBytes        int64
 
 	perf *fusePerfCounters
 }
@@ -365,6 +370,10 @@ func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 		cq.delayZeroTruncateLocked(entry)
 		return nil
 	}
+	if cq.shouldDelayDeleteLocked(entry) {
+		cq.delayEntryLocked(entry, cq.deleteCoalesceWindow)
+		return nil
+	}
 	entry.dispatched = true
 
 	// Send to workers while holding the lock. The channel buffer is always
@@ -380,6 +389,68 @@ func (cq *CommitQueue) shouldDelayZeroTruncateLocked(entry *CommitEntry) bool {
 		return false
 	}
 	return cq.zeroTruncateDelay > 0
+}
+
+// ConfigureDeleteCoalesceWindow enables the deferred-delete coalescing
+// window (mount startup only). Zero disables it.
+func (cq *CommitQueue) ConfigureDeleteCoalesceWindow(window time.Duration) {
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	cq.deleteCoalesceWindow = window
+}
+
+func (cq *CommitQueue) shouldDelayDeleteLocked(entry *CommitEntry) bool {
+	return cq != nil && entry != nil && !entry.canceled &&
+		entry.Kind == PendingDelete && cq.deleteCoalesceWindow > 0
+}
+
+// delayEntryLocked holds an entry in the delayed set for the window; the
+// timer dispatches it to the workers unless it is forced, canceled, taken
+// (TakePendingDeletesUnderPrefix), or the queue stops first.
+func (cq *CommitQueue) delayEntryLocked(entry *CommitEntry, window time.Duration) {
+	if cq.delayed == nil {
+		cq.delayed = make(map[*CommitEntry]*time.Timer)
+	}
+	cq.delayed[entry] = time.AfterFunc(window, func() {
+		cq.dispatchDelayed(entry)
+	})
+}
+
+// TakePendingDeletesUnderPrefix atomically removes queued and delayed
+// PendingDelete entries under prefix and returns them, so the caller can
+// replace the whole subtree's deletes with one recursive DELETE. The second
+// return is false when the prefix also has queued content commits — the
+// caller must drain instead of aggregating. Nothing is re-dispatched here:
+// on aggregation failure the caller re-enqueues fresh PendingDelete entries
+// (never the taken ones — a dispatched-but-unpicked entry may still live in
+// workCh, and re-Enqueueing it would double-dispatch).
+func (cq *CommitQueue) TakePendingDeletesUnderPrefix(prefix string) ([]*CommitEntry, bool) {
+	if cq == nil || prefix == "" {
+		return nil, false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	for _, entry := range cq.queue {
+		if entry == nil || entry.canceled || !strings.HasPrefix(entry.Path, prefix) {
+			continue
+		}
+		if entry.Kind != PendingDelete {
+			return nil, false
+		}
+	}
+	var taken []*CommitEntry
+	remaining := cq.queue[:0]
+	for _, entry := range cq.queue {
+		if entry != nil && !entry.canceled && entry.Kind == PendingDelete && strings.HasPrefix(entry.Path, prefix) {
+			cq.stopDelayedLocked(entry)
+			cq.removeQueuedLocked(entry)
+			taken = append(taken, entry)
+			continue
+		}
+		remaining = append(remaining, entry)
+	}
+	cq.queue = remaining
+	return taken, true
 }
 
 func (cq *CommitQueue) isDelayedLocked(entry *CommitEntry) bool {

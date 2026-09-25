@@ -7305,6 +7305,85 @@ func (fs *Dat9FS) deleteRemoteDirWithInterruptRecovery(ctx context.Context, loca
 	return fs.deleteRemotePathWithInterruptRecovery(ctx, localPath, deleteKindDir)
 }
 
+// tryAggregatedRmdir collapses a just-emptied subtree's deferred deletes
+// into one recursive backend DELETE. It returns true only when the recursive
+// delete fully succeeded (the directory is gone remotely); every other
+// outcome re-enqueues the taken PendingDelete entries and returns false so
+// the caller falls back to the standard drain + LIST + rmdir path, which
+// keeps the server-side ENOTEMPTY authority.
+//
+// The single LIST before the recursive delete is the safety net for
+// POSIX ENOTEMPTY across clients: a child this mount did not delete (another
+// actor's concurrent create) must produce ENOTEMPTY, never a silent
+// recursive removal — so unknown names abort the aggregation.
+func (fs *Dat9FS) tryAggregatedRmdir(ctx context.Context, dirPath string) bool {
+	if fs.deferredUnlinkActiveFor(dirPath) && !fs.extentDiscoveryEnabled() {
+		taken, ok := fs.commitQueue.TakePendingDeletesUnderPrefix(dirPath + "/")
+		if !ok || len(taken) == 0 {
+			// ok=false: content commits still queued under the prefix — drain.
+			// len==0: nothing to coalesce — the standard path is already cheap.
+			return false
+		}
+		items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
+		if err != nil {
+			fs.reenqueueDeferredDeletes(taken)
+			return false
+		}
+		tombstones := fs.snapshotDeletedPaths()
+		for _, item := range items {
+			child := dirPath + "/" + item.Name
+			if dirPath == "/" {
+				child = "/" + item.Name
+			}
+			if _, tombstoned := tombstones[child]; !tombstoned {
+				// A child this mount did not delete exists remotely: the
+				// directory is not empty by POSIX rules. Re-enqueue and let
+				// the standard path return ENOTEMPTY.
+				fs.debugf("rmdir aggregation aborted: unknown remote child %s", child)
+				fs.reenqueueDeferredDeletes(taken)
+				return false
+			}
+		}
+		deleteStart := time.Now()
+		err = fs.client.RemoveAllCtx(ctx, fs.remotePath(dirPath))
+		fs.perfRecordRemote(perfRemoteMutation, deleteStart, err, 0)
+		if err != nil && !isNotFoundErr(err) {
+			safeLogPrintf("rmdir: recursive delete failed for %s: %v (falling back to per-path deletes)", dirPath, err)
+			fs.reenqueueDeferredDeletes(taken)
+			return false
+		}
+		// Confirm the taken intents so a crash replay does not re-delete
+		// children the recursive delete already removed.
+		if fs.journal != nil {
+			for _, entry := range taken {
+				if jerr := fs.journal.Append(JournalEntry{Op: JournalCommit, Path: entry.Path}); jerr != nil {
+					safeLogPrintf("rmdir: journal aggregate marker failed for %s: %v", entry.Path, jerr)
+				}
+			}
+		}
+		fs.debugf("rmdir aggregated %d deferred deletes into one recursive delete path=%s dur=%s", len(taken), dirPath, time.Since(deleteStart))
+		return true
+	}
+	return false
+}
+
+// reenqueueDeferredDeletes re-enqueues fresh PendingDelete entries for paths
+// whose coalesced delete did not happen. Fresh entries, never the taken
+// ones: a taken entry that was already dispatched may still live in the
+// workers' channel, and re-Enqueueing it would double-dispatch.
+func (fs *Dat9FS) reenqueueDeferredDeletes(taken []*CommitEntry) {
+	for _, entry := range taken {
+		if err := fs.commitQueue.Enqueue(&CommitEntry{
+			Path:    entry.Path,
+			Inode:   entry.Inode,
+			BaseRev: entry.BaseRev,
+			Kind:    PendingDelete,
+		}); err != nil {
+			safeLogPrintf("rmdir: deferred delete re-enqueue failed for %s: %v", entry.Path, err)
+		}
+	}
+}
+
 func (fs *Dat9FS) deleteRemotePathWithInterruptRecovery(ctx context.Context, localPath string, kind deleteKind) error {
 	if fs.layerEnabled() {
 		return fs.upsertLayerWhiteout(ctx, localPath, kind)
@@ -10879,6 +10958,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	}
 	start := time.Now()
 	status = gofuse.OK
+	aggregatedDelete := false
 	fs.debugf("rmdir start path=%s parent_ino=%d name=%s", childP, header.NodeId, name)
 	defer func() {
 		fs.debugf("rmdir done path=%s status=%d dur=%s", childP, status, time.Since(start))
@@ -10964,99 +11044,108 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			status = gofuse.Status(syscall.ENOTEMPTY)
 			return status
 		}
-		// Wait for the commit queue to drain pending uploads under this
-		// directory before checking the remote listing. Without this, a
-		// rapid batch of Unlinks (e.g. mdtest deleting 1000 files) can leave
-		// the commit queue still processing uploads when rmdir checks the
-		// remote listing, causing a stale ENOTEMPTY even though every file
-		// has been locally unlinked and remotely deleted. The wait is
-		// bounded (10s) to avoid blocking indefinitely; the polling loop
-		// below provides additional eventual-consistency tolerance.
-		if fs.commitQueue != nil {
-			fs.commitQueue.WaitPrefixTimeout(childP+"/", 10*time.Second)
+		// rm -rf aggregation: when this mount just unlinked the subtree and
+		// the child deletes are still coalescing in the commit queue, replace
+		// them with one recursive DELETE instead of draining them one by one.
+		// Falls back (and re-enqueues) unless it fully succeeded.
+		aggregatedDelete = fs.tryAggregatedRmdir(ctx, childP)
+		if !aggregatedDelete {
+			// Wait for the commit queue to drain pending uploads under this
+			// directory before checking the remote listing. Without this, a
+			// rapid batch of Unlinks (e.g. mdtest deleting 1000 files) can leave
+			// the commit queue still processing uploads when rmdir checks the
+			// remote listing, causing a stale ENOTEMPTY even though every file
+			// has been locally unlinked and remotely deleted. The wait is
+			// bounded (10s) to avoid blocking indefinitely; the polling loop
+			// below provides additional eventual-consistency tolerance.
+			if fs.commitQueue != nil {
+				fs.commitQueue.WaitPrefixTimeout(childP+"/", 10*time.Second)
+			}
+			// Local state says empty. The remote listing may be stale due to
+			// eventual-consistency lag on just-completed Unlinks. We rely on
+			// tombstones + the cancel-aware polling loop below to handle any
+			// remaining eventual consistency.
+			// giving the backend time to propagate recent deletes.
+			hasChildren, listGeneration, err := fs.remoteDirectoryHasChildren(ctx, childP)
+			if errors.Is(err, syscall.EAGAIN) {
+				status = gofuse.Status(syscall.EAGAIN)
+				return status
+			}
+			if client.IsUnauthorized(err) {
+				status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
+				return status
+			}
+			if err == nil && !fs.lockMountViewRead(listGeneration) {
+				status = gofuse.Status(syscall.EAGAIN)
+				return status
+			}
+			if err == nil {
+				fs.mountViewMu.RUnlock()
+			}
+			if err == nil && hasChildren {
+				// Invalidate the dirCache entry that was just written from the
+				// potentially-stale remote listing, so hasKnownLocalDirectoryChildren
+				// checks only the local inode state (which is authoritative).
+				fs.dirCache.Invalidate(childP)
+				if !fs.hasKnownLocalDirectoryChildren(childP) {
+					fs.debugf("rmdir path=%s remote has children but no local children, polling for up to 2s", childP)
+					deadline := time.Now().Add(2 * time.Second)
+					for time.Now().Before(deadline) {
+						select {
+						case <-time.After(500 * time.Millisecond):
+						case <-ctx.Done():
+							status = gofuse.Status(syscall.EINTR)
+							return status
+						case <-cancel:
+							status = gofuse.Status(syscall.EINTR)
+							return status
+						}
+						hasChildren, listGeneration, err = fs.remoteDirectoryHasChildren(ctx, childP)
+						if errors.Is(err, syscall.EAGAIN) {
+							status = gofuse.Status(syscall.EAGAIN)
+							return status
+						}
+						if client.IsUnauthorized(err) {
+							status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
+							return status
+						}
+						if err == nil && !fs.lockMountViewRead(listGeneration) {
+							status = gofuse.Status(syscall.EAGAIN)
+							return status
+						}
+						if err == nil {
+							fs.mountViewMu.RUnlock()
+						}
+						if err != nil || !hasChildren {
+							break
+						}
+						fs.dirCache.Invalidate(childP)
+					}
+				}
+			}
+			if err == nil && hasChildren {
+				status = gofuse.Status(syscall.ENOTEMPTY)
+				return status
+			} else if err != nil {
+				fs.debugf("rmdir pre-delete list failed path=%s err=%v", childP, err)
+			}
 		}
-		// Local state says empty. The remote listing may be stale due to
-		// eventual-consistency lag on just-completed Unlinks. We rely on
-		// tombstones + the cancel-aware polling loop below to handle any
-		// remaining eventual consistency.
-		// giving the backend time to propagate recent deletes.
-		hasChildren, listGeneration, err := fs.remoteDirectoryHasChildren(ctx, childP)
-		if errors.Is(err, syscall.EAGAIN) {
-			status = gofuse.Status(syscall.EAGAIN)
+	}
+
+	if !aggregatedDelete {
+		if st := fs.extentRmdir(header, name, childP); st != gofuse.OK {
+			status = st
 			return status
 		}
-		if client.IsUnauthorized(err) {
+
+		deleteStart := time.Now()
+		fs.debugf("rmdir remote delete start path=%s", childP)
+		err := fs.deleteRemoteDirWithInterruptRecovery(ctx, childP)
+		fs.debugDurationf(deleteStart, 0, "rmdir remote delete done path=%s err=%v", childP, err)
+		if err != nil {
 			status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
 			return status
 		}
-		if err == nil && !fs.lockMountViewRead(listGeneration) {
-			status = gofuse.Status(syscall.EAGAIN)
-			return status
-		}
-		if err == nil {
-			fs.mountViewMu.RUnlock()
-		}
-		if err == nil && hasChildren {
-			// Invalidate the dirCache entry that was just written from the
-			// potentially-stale remote listing, so hasKnownLocalDirectoryChildren
-			// checks only the local inode state (which is authoritative).
-			fs.dirCache.Invalidate(childP)
-			if !fs.hasKnownLocalDirectoryChildren(childP) {
-				fs.debugf("rmdir path=%s remote has children but no local children, polling for up to 2s", childP)
-				deadline := time.Now().Add(2 * time.Second)
-				for time.Now().Before(deadline) {
-					select {
-					case <-time.After(500 * time.Millisecond):
-					case <-ctx.Done():
-						status = gofuse.Status(syscall.EINTR)
-						return status
-					case <-cancel:
-						status = gofuse.Status(syscall.EINTR)
-						return status
-					}
-					hasChildren, listGeneration, err = fs.remoteDirectoryHasChildren(ctx, childP)
-					if errors.Is(err, syscall.EAGAIN) {
-						status = gofuse.Status(syscall.EAGAIN)
-						return status
-					}
-					if client.IsUnauthorized(err) {
-						status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
-						return status
-					}
-					if err == nil && !fs.lockMountViewRead(listGeneration) {
-						status = gofuse.Status(syscall.EAGAIN)
-						return status
-					}
-					if err == nil {
-						fs.mountViewMu.RUnlock()
-					}
-					if err != nil || !hasChildren {
-						break
-					}
-					fs.dirCache.Invalidate(childP)
-				}
-			}
-		}
-		if err == nil && hasChildren {
-			status = gofuse.Status(syscall.ENOTEMPTY)
-			return status
-		} else if err != nil {
-			fs.debugf("rmdir pre-delete list failed path=%s err=%v", childP, err)
-		}
-	}
-
-	if st := fs.extentRmdir(header, name, childP); st != gofuse.OK {
-		status = st
-		return status
-	}
-
-	deleteStart := time.Now()
-	fs.debugf("rmdir remote delete start path=%s", childP)
-	err := fs.deleteRemoteDirWithInterruptRecovery(ctx, childP)
-	fs.debugDurationf(deleteStart, 0, "rmdir remote delete done path=%s err=%v", childP, err)
-	if err != nil {
-		status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
-		return status
 	}
 
 	// Clean write-back entries for files under the removed directory.

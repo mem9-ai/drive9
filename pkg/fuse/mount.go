@@ -606,6 +606,15 @@ func Mount(opts *MountOptions) (err error) {
 				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {
 					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
 				}
+				if opts.DeferredUnlink {
+					// Hold deferred deletes briefly so an rmdir arriving
+					// mid-`rm -rf` can coalesce the subtree into one
+					// recursive DELETE (#996 P0). WaitPath, WaitPrefix,
+					// WaitIdle, and DrainAll force delayed deletes
+					// immediately, so the window only delays the backend
+					// DELETE, never a namespace answer.
+					cq.ConfigureDeleteCoalesceWindow(deferredDeleteCoalesceWindow)
+				}
 				cq.RecoverPending()
 				// Re-apply deferred-delete intents whose remote DELETE the
 				// previous session never confirmed. The durable JournalUnlink

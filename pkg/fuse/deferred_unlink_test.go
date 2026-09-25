@@ -1,14 +1,15 @@
 package fuse
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -22,15 +23,28 @@ type deferredUnlinkBackend struct {
 	order      []string
 	exists     map[string]bool
 	revs       map[string]int64
+	dirs       map[string]bool
 	putGate    chan struct{} // when non-nil, PUTs block until closed
 	deleteGate chan struct{} // when non-nil, DELETEs block before counting
 	deletes    atomic.Int64
 	puts       atomic.Int64
 	heads      atomic.Int64
+	lists      atomic.Int64
 }
 
 func newDeferredUnlinkBackend() *deferredUnlinkBackend {
-	return &deferredUnlinkBackend{exists: map[string]bool{}, revs: map[string]int64{}}
+	return &deferredUnlinkBackend{exists: map[string]bool{}, revs: map[string]int64{}, dirs: map[string]bool{}}
+}
+
+// seedDir registers a directory with the given child names on the backend.
+func (b *deferredUnlinkBackend) seedDir(dir string, children ...string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.exists[dir] = true
+	b.dirs[dir] = true
+	for _, c := range children {
+		b.exists[dir+"/"+c] = true
+	}
 }
 
 // seedFile registers a file path with a HEAD revision.
@@ -70,9 +84,7 @@ func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 			if b.putGate != nil {
 				<-b.putGate
 			}
-			b.mu.Lock()
 			b.exists[p] = true
-			b.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case http.MethodDelete:
@@ -83,23 +95,54 @@ func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 			}
 			b.deletes.Add(1)
 			b.record("DELETE")
-			if !b.exists[p] {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			delete(b.exists, p)
-			w.WriteHeader(http.StatusNoContent)
-		case http.MethodHead:
-			b.heads.Add(1)
-			b.record("HEAD")
+			recursive := r.URL.Query().Has("recursive")
 			b.mu.Lock()
-			exists, rev := b.exists[p], b.revs[p]
+			if recursive {
+				prefix := strings.TrimSuffix(p, "/") + "/"
+				for path := range b.exists {
+					if path == p || strings.HasPrefix(path, prefix) {
+						delete(b.exists, path)
+						delete(b.dirs, path)
+					}
+				}
+			} else if b.exists[p] {
+				delete(b.exists, p)
+				delete(b.dirs, p)
+			}
 			b.mu.Unlock()
-			if !exists {
+			w.WriteHeader(http.StatusNoContent)
+		case http.MethodGet:
+			if !r.URL.Query().Has("list") {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			b.lists.Add(1)
+			b.record("LIST")
+			b.mu.Lock()
+			entries := []map[string]any{}
+			prefix := strings.TrimSuffix(p, "/") + "/"
+			for path := range b.exists {
+				if !strings.HasPrefix(path, prefix) {
+					continue
+				}
+				rest := path[len(prefix):]
+				if rest == "" || strings.Contains(rest, "/") {
+					continue
+				}
+				entries = append(entries, map[string]any{"name": rest, "isDir": b.dirs[path]})
+			}
+			b.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			body, _ := json.Marshal(map[string]any{"entries": entries})
+			_, _ = w.Write(body)
+		case http.MethodHead:
+			b.heads.Add(1)
+			b.record("HEAD")
+			if !b.exists[p] {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("X-Dat9-Revision", "7")
 			w.Header().Set("X-Dat9-IsDir", "false")
 			w.WriteHeader(http.StatusOK)
 		default:
@@ -159,6 +202,10 @@ func newDeferredUnlinkFS(t *testing.T, ts *httptest.Server, cacheDir string, def
 	cq.IsSuperseded = fs.commitEntrySuperseded
 	cq.PathLock = fs.lockRemoteCommitPath
 	cq.DurableWatermark = fs.latestCommittedRevision
+	if deferred {
+		// Mirror mount.go's wiring for --deferred-unlink.
+		cq.ConfigureDeleteCoalesceWindow(deferredDeleteCoalesceWindow)
+	}
 	fs.commitQueue = cq
 
 	t.Cleanup(func() {
@@ -187,7 +234,7 @@ func TestDeferredUnlinkNoSyncRoundTrips(t *testing.T) {
 	defer ts.Close()
 	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
 
-	backend.seedFile("/victim.txt", 7)
+	backend.exists["/victim.txt"] = true
 	fs.inodes.Lookup("/victim.txt", false, 128, time.Now())
 
 	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "victim.txt"); st != gofuse.OK {
@@ -267,7 +314,7 @@ func TestDeferredUnlinkOrdersAfterQueuedUpload(t *testing.T) {
 	// Final consistency: whatever landed (the staged PUT may have been
 	// canceled mid-flight, or committed before cancellation), the path must
 	// be gone from the backend after the deferred delete applied.
-	if backend.hasPath("/staged.txt") {
+	if backend.exists["/staged.txt"] {
 		t.Fatalf("path still present on backend after deferred delete (calls: %v)", backend.calls())
 	}
 	// Local staged state must be gone too.
@@ -287,7 +334,7 @@ func TestDeferredUnlinkFlagOffStaysSynchronous(t *testing.T) {
 	defer ts.Close()
 	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), false)
 
-	backend.seedFile("/plain.txt", 7)
+	backend.exists["/plain.txt"] = true
 	fs.inodes.Lookup("/plain.txt", false, 128, time.Now())
 
 	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "plain.txt"); st != gofuse.OK {
@@ -362,6 +409,123 @@ func TestDeferredUnlinkIntentSurvivesRestart(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "journal.wal")); err != nil {
 		t.Fatalf("journal file missing: %v", err)
+	}
+}
+
+// TestDeleteCoalesceWindowDelaysDispatch verifies the coalescing window
+// holds a deferred delete briefly before dispatch (so rmdir aggregation gets
+// a chance), without needing any test gate.
+func TestDeleteCoalesceWindowDelaysDispatch(t *testing.T) {
+	backend := newDeferredUnlinkBackend()
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
+
+	backend.exists["/lagged.txt"] = true
+	fs.inodes.Lookup("/lagged.txt", false, 128, time.Now())
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "lagged.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if got := backend.deletes.Load(); got != 0 {
+		t.Fatalf("DELETE dispatched within the coalesce window, want held (got %d)", got)
+	}
+	if !fs.commitQueue.HasPath("/lagged.txt") {
+		t.Fatal("delayed delete is invisible to HasPath")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for backend.deletes.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("delayed delete never dispatched after the window")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestRmdirAggregatesDeferredChildDeletes covers the rm -rf tail: children
+// unlinked with deferred deletes still coalescing, then rmdir replaces the
+// whole subtree's deletes with one recursive backend DELETE.
+func TestRmdirAggregatesDeferredChildDeletes(t *testing.T) {
+	backend := newDeferredUnlinkBackend()
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
+
+	backend.seedDir("/d", "a", "b")
+	fs.inodes.Lookup("/d", true, 0, time.Now())
+	fs.inodes.Lookup("/d/a", false, 8, time.Now())
+	fs.inodes.Lookup("/d/b", false, 8, time.Now())
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "d/a"); st != gofuse.OK {
+		t.Fatalf("Unlink d/a status = %v", st)
+	}
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "d/b"); st != gofuse.OK {
+		t.Fatalf("Unlink d/b status = %v", st)
+	}
+
+	// rmdir must take the coalescing deletes and issue one recursive DELETE.
+	if st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "d"); st != gofuse.OK {
+		t.Fatalf("Rmdir status = %v, want OK", st)
+	}
+
+	if got := backend.lists.Load(); got != 1 {
+		t.Fatalf("safety LISTs = %d, want 1", got)
+	}
+	if got := backend.deletes.Load(); got != 1 {
+		t.Fatalf("DELETEs = %d, want 1 recursive delete", got)
+	}
+	backend.mu.Lock()
+	remaining := len(backend.exists)
+	backend.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("backend still holds %d paths after the recursive delete", remaining)
+	}
+
+	// The taken intents must be confirmed so replay does not re-delete.
+	confirmed := map[string]bool{}
+	if err := fs.journal.Replay(func(e JournalEntry) {
+		if e.Op == JournalCommit {
+			confirmed[e.Path] = true
+		}
+	}); err != nil {
+		t.Fatalf("journal replay: %v", err)
+	}
+	if !confirmed["/d/a"] || !confirmed["/d/b"] {
+		t.Fatalf("child intents not confirmed: %v", confirmed)
+	}
+}
+
+// TestRmdirAggregationFallbackOnUnknownRemoteChild verifies the safety LIST:
+// a remote child this mount did not delete (another actor's create) aborts
+// the aggregation, re-enqueues the taken deletes, and the standard path
+// returns ENOTEMPTY instead of recursively removing someone else's file.
+func TestRmdirAggregationFallbackOnUnknownRemoteChild(t *testing.T) {
+	backend := newDeferredUnlinkBackend()
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
+
+	backend.seedDir("/d2", "a", "stranger")
+	fs.inodes.Lookup("/d2", true, 0, time.Now())
+	fs.inodes.Lookup("/d2/a", false, 8, time.Now())
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "d2/a"); st != gofuse.OK {
+		t.Fatalf("Unlink d2/a status = %v", st)
+	}
+
+	if st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "d2"); st != gofuse.Status(syscall.ENOTEMPTY) {
+		t.Fatalf("Rmdir status = %v, want ENOTEMPTY", st)
+	}
+	backend.mu.Lock()
+	_, dirStillThere := backend.exists["/d2"]
+	_, strangerStillThere := backend.exists["/d2/stranger"]
+	_, aStillThere := backend.exists["/d2/a"]
+	backend.mu.Unlock()
+	if !dirStillThere || !strangerStillThere {
+		t.Fatal("directory or foreign child was removed despite ENOTEMPTY")
+	}
+	if aStillThere {
+		t.Fatal("re-enqueued deferred delete for the unlinked child did not run")
 	}
 }
 
