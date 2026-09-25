@@ -423,7 +423,7 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 		case http.MethodGet:
 			if replaceMetaOnGet {
 				replaceMetaOnGet = false
-				if _, _, err := cache.putHandleSnapshot("/file.bin", []byte("NEWER DATA!"), 11, PendingOverwrite, 2, 0o644, true, "", "", false, true, nil, 0, 0, StagingGens{}); err != nil {
+				if _, _, err := cache.putHandleSnapshot("/file.bin", []byte("NEWER DATA!"), 11, PendingOverwrite, 2, 0o644, true, "", "", false, true, nil, 0, 0, StagingGens{}, nil); err != nil {
 					t.Errorf("stage newer data during GET: %v", err)
 				}
 			}
@@ -473,7 +473,7 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 		t.Fatal(err)
 	}
 	fs.writeBack = cache
-	if _, _, err := cache.putHandleSnapshot("/file.bin", []byte("HELLO WORLD"), int64(len(remote)), PendingOverwrite, 1, 0o644, true, "", "", false, true, nil, ino, newerSeq, fs.snapshotStagingGens("/file.bin")); err != nil {
+	if _, _, err := cache.putHandleSnapshot("/file.bin", []byte("HELLO WORLD"), int64(len(remote)), PendingOverwrite, 1, 0o644, true, "", "", false, true, nil, ino, newerSeq, fs.snapshotStagingGens("/file.bin"), nil); err != nil {
 		t.Fatal(err)
 	}
 	uploader := &WriteBackUploader{client: fs.client, cache: cache, remoteRoot: "/"}
@@ -605,7 +605,7 @@ func TestReadWriteBackFtruncateUploaderKeepsUnpublishedNewerStaging(t *testing.T
 				t.Fatal(err)
 			}
 			owned := fs.snapshotStagingGens("/file.bin")
-			if _, _, err := cache.putHandleSnapshot("/file.bin", []byte("old"), 3, PendingOverwrite, 1, 0, false, "", "", false, true, nil, ino, 1, owned); err != nil {
+			if _, _, err := cache.putHandleSnapshot("/file.bin", []byte("old"), 3, PendingOverwrite, 1, 0, false, "", "", false, true, nil, ino, 1, owned, nil); err != nil {
 				t.Fatal(err)
 			}
 			// The next handle has staged, but has not published its cache snapshot.
@@ -636,5 +636,70 @@ func TestReadWriteBackFtruncateUploaderKeepsUnpublishedNewerStaging(t *testing.T
 				t.Fatalf("shadow generation = %d, want unpublished newer %d", got, newShadowGen)
 			}
 		})
+	}
+}
+
+func TestReadWriteBackFtruncateFallbackSnapshotCleansPendingNew(t *testing.T) {
+	data := []byte("hello")
+	var uploaded []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var err error
+		uploaded, err = io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("X-Dat9-Revision", "1")
+	}))
+	t.Cleanup(server.Close)
+	opts := &MountOptions{SyncMode: SyncStrict, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(server.URL), opts)
+	fs.client.SetSmallFileThresholdForTests(1 << 20)
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A failed shadow-store init leaves pendingIndex and writeBack available.
+	fs.pendingIndex, fs.writeBack = pending, cache
+	ino := fs.inodes.Lookup("/file.bin", false, 0, time.Now())
+	fh := &FileHandle{
+		Ino: ino, Path: "/file.bin", Flags: uint32(syscall.O_RDWR),
+		Dirty: fs.newWriteBuffer("/file.bin", maxPreloadSize, 0),
+		IsNew: true, WritePolicy: WritePolicyWriteBack,
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fileHandle := fs.allocateFileHandle(fh)
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: fileHandle}); st != gofuse.OK {
+		t.Fatalf("fallback Flush = %v, want OK", st)
+	}
+	meta, ok := cache.GetMeta(fh.Path)
+	if !ok || !meta.ownedStagingKnown || meta.ownedStagingGens.PendingIndexGen == 0 ||
+		meta.ownedStagingGens.PendingIndexGen != pending.Generation(fh.Path) {
+		t.Fatalf("snapshot pending generation = %+v/%t, pending=%d", meta, ok, pending.Generation(fh.Path))
+	}
+	uploader := &WriteBackUploader{client: fs.client, cache: cache, remoteRoot: "/"}
+	uploader.SnapshotStagingGens = fs.snapshotStagingGens
+	uploader.OnDataCommitted = fs.onWriteBackDataCommitted
+	uploader.OnSuccess = fs.onWriteBackUploadSuccess
+	if _, err := uploader.UploadSyncWithRevision(context.Background(), fh.Path); err != nil {
+		t.Fatalf("fallback upload = %v", err)
+	}
+	if !bytes.Equal(uploaded, data) {
+		t.Fatalf("uploaded = %q, want %q", uploaded, data)
+	}
+	if pending.HasPending(fh.Path) {
+		t.Fatal("uploaded PendingNew still blocks remote Unlink")
 	}
 }

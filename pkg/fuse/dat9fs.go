@@ -4577,8 +4577,14 @@ func (fs *Dat9FS) enqueueStagedShadowCommitLocked(fh *FileHandle) error {
 // writes fsync: pass false only when a durable shadow stage + pending-index
 // entry for the same contents already exist (the Flush post-stage path), so
 // the snapshot remains a pure cache; pass true when the snapshot is the only
-// persisted copy (fallback paths without shadow/pendingIndex).
+// persisted payload (fallback paths without a durable shadow).
 func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle, durable bool) error {
+	return fs.snapshotWriteBackWithPendingLocked(fh, durable, false)
+}
+
+// The fallback publishes its pending index under the write-back path lock,
+// after the durable cache files exist but before uploaders can read the new meta.
+func (fs *Dat9FS) snapshotWriteBackWithPendingLocked(fh *FileHandle, durable, publishPendingIndex bool) error {
 	if fs.writeBack == nil {
 		return nil
 	}
@@ -4642,6 +4648,18 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle, durable bool) error {
 	// Bind the handle's own staging generations to this cache snapshot. A
 	// path lookup by the uploader could observe a newer writer's staging.
 	ownedStaging := fs.captureHandleStagingGensLocked(fh)
+	var publishPending func() uint64
+	if publishPendingIndex && fs.pendingIndex != nil {
+		publishPending = func() uint64 {
+			gen, err := fs.pendingIndex.PutWithBaseRev(fh.Path, fh.Dirty.Size(), fs.pendingKindForHandle(fh), fh.BaseRev)
+			if err != nil {
+				safeLogPrintf("fallback pending index put failed for %s: %v", fh.Path, err)
+				return 0
+			}
+			fh.PendingIndexGen = gen
+			return gen
+		}
+	}
 	gen, timings, err := fs.writeBack.putHandleSnapshot(
 		fh.Path,
 		data,
@@ -4658,6 +4676,7 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle, durable bool) error {
 		fh.Ino,
 		fh.DirtySeq,
 		ownedStaging,
+		publishPending,
 	)
 	if err == nil {
 		// Record the staged generation so unlink-discard can remove only this
@@ -14941,16 +14960,11 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 
 				phase = "small-snapshot-writeback"
 				snapWBStart2 := time.Now()
-				if err := fs.snapshotWriteBackLocked(fh, true); err != nil {
+				if err := fs.snapshotWriteBackWithPendingLocked(fh, true, true); err != nil {
 					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
 					safeLogPrintf("writeback cache put failed for %s: %v, falling back to sync upload", fh.Path, err)
 				} else {
 					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
-					if fs.pendingIndex != nil {
-						if gen, putErr := fs.pendingIndex.PutWithBaseRev(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev); putErr == nil {
-							fh.PendingIndexGen = gen
-						}
-					}
 					// Snapshot the dirty sequence at cache-write time so
 					// Release can detect whether new writes happened since.
 					fh.WriteBackSeq = fh.DirtySeq
