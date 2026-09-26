@@ -201,6 +201,13 @@ type CommitQueue struct {
 	// delete tombstone alongside the journal marker.
 	OnDeferredDeleteDone func(path string)
 
+	// RecordCommittedRevision records a backend revision this queue proved
+	// durable for a path (data landed; post-upload steps may still fail).
+	// Dat9FS feeds its committed-revision tracker so follow-up namespace
+	// operations (unlink, lookup) see the remote object instead of
+	// classifying the path as never-uploaded.
+	RecordCommittedRevision func(path string, rev int64)
+
 	// serializeMutationInodes extends queue dispatch ordering across hardlink
 	// aliases for live-handle mutations. It is enabled only for gVisor mounts.
 	serializeMutationInodes bool
@@ -794,6 +801,14 @@ func (cq *CommitQueue) RecoverPending() {
 		shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
 		if meta.Kind == PendingConflict {
 			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
+			continue
+		}
+		if meta.Kind == PendingChmod {
+			// Data already landed remotely; only the best-effort chmod was
+			// left. There is nothing to re-upload — keep the entry so
+			// Lookup/GetAttr still see the local metadata, and let the next
+			// successful commit for this path re-apply the mode.
+			safeLogPrintf("commit queue: skipping chmod-pending entry for %s (data already committed)", path)
 			continue
 		}
 		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
@@ -1773,7 +1788,23 @@ func (cq *CommitQueue) deleteOne(entry *CommitEntry) {
 			statCtx, statCancel := context.WithTimeout(ctx, uploadTimeout)
 			stat, statErr := cq.client.StatCtx(statCtx, cq.remotePath(entry.Path))
 			statCancel()
-			if statErr == nil && stat != nil && stat.Revision > 0 && stat.Revision != entry.BaseRev {
+			switch {
+			case statErr != nil && isNotFoundErr(statErr):
+				// Path already gone remotely — nothing to protect; retire
+				// the intent (counts as deleted).
+				unlockPath()
+				cq.onDeferredDeleteSuccess(entry)
+				return
+			case statErr != nil || stat == nil || stat.Revision <= 0:
+				// Identity check unavailable: fail CLOSED. Retry with
+				// backoff; the DELETE must never run blind. If retries are
+				// exhausted the durable journal intent is kept and the next
+				// mount re-verifies.
+				unlockPath()
+				lastErr = fmt.Errorf("deferred delete identity check unavailable for %s: %w", entry.Path, statErr)
+				safeLogPrintf("commit queue: %v (retrying with backoff; intent kept)", lastErr)
+				continue
+			case stat.Revision != entry.BaseRev:
 				unlockPath()
 				safeLogPrintf("commit queue: skipping deferred delete of %s: path changed from rev %d to %d after unlink", entry.Path, entry.BaseRev, stat.Revision)
 				cq.onDeferredDeleteSuccess(entry)
@@ -2755,6 +2786,19 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			if client.IsNotFound(err) {
 				safeLogPrintf("commit queue: post-upload chmod not found for %s (concurrent write likely replaced it); proceeding without mode update", entry.Path)
 			} else {
+				// The data bytes landed; only the best-effort mode update
+				// failed. Durably record "chmod pending" (RecoverPending
+				// skips it instead of re-uploading) and the committed
+				// revision — otherwise a follow-up unlink classifies the
+				// path as never-uploaded and leaks the remote object.
+				if cq.index != nil && entry.PendingIndexGen != 0 {
+					if _, markErr := cq.index.MarkChmodPendingIfGeneration(entry.Path, entry.PendingIndexGen); markErr != nil {
+						safeLogPrintf("commit queue: chmod-pending mark failed for %s: %v", entry.Path, markErr)
+					}
+				}
+				if cq.RecordCommittedRevision != nil {
+					cq.RecordCommittedRevision(entry.Path, committedRev)
+				}
 				return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
 			}
 		}

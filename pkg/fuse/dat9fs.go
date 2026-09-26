@@ -7335,12 +7335,50 @@ func (fs *Dat9FS) tryAggregatedRmdir(ctx context.Context, dirPath string) bool {
 			return false
 		}
 		tombstones := fs.snapshotDeletedPaths()
+		// Identity check for every listed child: a name may only be removed
+		// by the recursive DELETE when it is still the exact object this
+		// mount unlinked (revision matches the taken delete intent). A
+		// recreated or unknown child must abort the aggregation so the
+		// standard path keeps ENOTEMPTY / per-path semantics.
+		covered := make(map[string]bool, len(taken))
+		for _, takenEntry := range taken {
+			rest := strings.TrimPrefix(takenEntry.Path, dirPath+"/")
+			top := rest
+			if i := strings.Index(rest, "/"); i >= 0 {
+				top = rest[:i]
+			}
+			covered[top] = true
+		}
 		for _, item := range items {
 			child := dirPath + "/" + item.Name
 			if dirPath == "/" {
 				child = "/" + item.Name
 			}
-			if _, tombstoned := tombstones[child]; !tombstoned {
+			if _, tombstoned := tombstones[child]; tombstoned {
+				// Listed but locally unlinked: it must still be the exact
+				// object a taken intent covers, at the same revision.
+				var intent *CommitEntry
+				for _, takenEntry := range taken {
+					rest := strings.TrimPrefix(takenEntry.Path, dirPath+"/")
+					top := rest
+					if i := strings.Index(rest, "/"); i >= 0 {
+						top = rest[:i]
+					}
+					if top == item.Name {
+						intent = takenEntry
+						break
+					}
+				}
+				if intent == nil || item.IsDir || item.Revision <= 0 ||
+					intent.BaseRev <= 0 || intent.Unconditional ||
+					intent.BaseRev != item.Revision {
+					fs.debugf("rmdir aggregation aborted: %s is not the unlinked object (intent=%v rev=%d)", child, intent != nil, item.Revision)
+					fs.reenqueueDeferredDeletes(taken)
+					return false
+				}
+				continue
+			}
+			if !covered[item.Name] {
 				// A child this mount did not delete exists remotely: the
 				// directory is not empty by POSIX rules. Re-enqueue and let
 				// the standard path return ENOTEMPTY.
