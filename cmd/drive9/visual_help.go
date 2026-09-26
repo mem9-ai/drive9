@@ -794,7 +794,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "--flush-debounce DURATION", Desc: "debounce window for small-file flush coalescing; 0 disables"},
 					{Name: "--upload-concurrency N", Desc: "maximum concurrent background uploads issued by FUSE"},
 					{Name: "--commit-queue-max-pending N", Desc: "maximum pending entries in the commit queue before backpressure"},
-					{Name: "--deferred-unlink", Desc: "apply remote DELETEs asynchronously on the write-back commit queue; write-back durability only"},
+					{Name: "--deferred-unlink", Desc: "deferred remote DELETEs on the write-back commit queue (default on); -deferred-unlink=false deletes synchronously"},
 					{Name: "--write-cache-size-mb MB", Desc: "current-process shadow data quota in MiB; 0 disables; writes exceeding it return ENOSPC"},
 					{Name: "--write-cache-free-ratio FLOAT", Desc: "minimum filesystem free-space ratio before write-back refuses writes with ENOSPC; 0 disables"},
 					{Name: "--writeback-batch-window DURATION", Desc: "writeback-only small-file batch window; 0 disables"},

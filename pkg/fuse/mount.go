@@ -73,12 +73,13 @@ type MountOptions struct {
 	WriteBackBatchWindow          time.Duration // writeback-only small-file batch window (default 0 disabled)
 	WriteBackBatchMaxFiles        int           // maximum files in one writeback batch (default 64 when enabled)
 	WriteBackBatchMaxBytes        int64         // maximum bytes in one writeback batch (default 4MiB when enabled)
-	// DeferredUnlink applies remote DELETEs of unlinked files asynchronously
-	// on the write-back commit queue instead of on the unlink(2) critical
-	// path. The local namespace updates immediately; the durable
-	// JournalUnlink intent re-enqueues the delete after a crash. Only
-	// meaningful with the write-back policy; other tiers ignore it.
-	DeferredUnlink               bool
+	// DisableDeferredUnlink opts out of the write-back default where remote
+	// DELETEs of unlinked files are applied asynchronously on the commit
+	// queue instead of on the unlink(2) critical path. The local namespace
+	// updates immediately; the durable JournalUnlink intent re-enqueues the
+	// delete after a crash. Only meaningful with the write-back policy —
+	// close-sync and write-sync always delete synchronously.
+	DisableDeferredUnlink        bool
 	WriteCacheFreeRatio          float64       // minimum free-space ratio on cache-dir partition before write-back refuses writes (default 0.10); negative disables
 	WriteCacheSizeMB             int64         // current-process shadow data quota in MiB (default 1024); negative disables
 	UploadConcurrency            int           // number of background upload workers (default 4)
@@ -606,7 +607,7 @@ func Mount(opts *MountOptions) (err error) {
 				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {
 					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
 				}
-				if opts.DeferredUnlink {
+				if !opts.DisableDeferredUnlink {
 					// Hold deferred deletes briefly so an rmdir arriving
 					// mid-`rm -rf` can coalesce the subtree into one
 					// recursive DELETE (#996 P0). WaitPath, WaitPrefix,

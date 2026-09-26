@@ -228,7 +228,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	writeCacheFreeRatio := fs.Float64("write-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before write-back refuses writes with ENOSPC (0 disables)")
 	writeCacheSizeMB := fs.Int64("write-cache-size-mb", 1024, "current-process shadow data quota in MiB (default 1024; 0 disables); writes exceeding this return ENOSPC")
 	commitQueueMaxPending := fs.Int("commit-queue-max-pending", 500, "maximum pending entries in CommitQueue before backpressure")
-	deferredUnlink := fs.Bool("deferred-unlink", false, "apply remote DELETEs of unlinked files asynchronously on the write-back commit queue (local namespace updates immediately; durable journal intent re-applies the delete after a crash)")
+	deferredUnlink := fs.Bool("deferred-unlink", true, "apply remote DELETEs of unlinked files asynchronously on the write-back commit queue (default on for write-back durability; pass -deferred-unlink=false to delete synchronously; close-sync/write-sync always delete synchronously)")
 	writeBackBatchWindow := fs.Duration("writeback-batch-window", 0, "writeback-only small-file batch window (default 0 disables)")
 	writeBackBatchMaxFiles := fs.Int("writeback-batch-max-files", 64, "maximum files in one writeback batch when enabled")
 	writeBackBatchMaxBytes := fs.Int64("writeback-batch-max-bytes", client.MaxBatchWriteBytes, "maximum bytes in one writeback batch when enabled")
@@ -571,9 +571,6 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if *writeBackBatchWindow > 0 && writePolicyVal != fuseWritePolicyWriteBack {
 		return fmt.Errorf("drive9 mount: --writeback-batch-window requires --durability auto, interactive, or fsync")
 	}
-	if *deferredUnlink && writePolicyVal != fuseWritePolicyWriteBack {
-		return fmt.Errorf("drive9 mount: --deferred-unlink requires --durability auto, interactive, or fsync (write-back policy)")
-	}
 	if *readCacheMaxFile <= 0 {
 		return fmt.Errorf("drive9 mount: --read-cache-max-file-mb must be > 0")
 	}
@@ -892,7 +889,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		UploadConcurrency:            *uploadConcurrency,
 		DirCacheMaxEntries:           *dirCacheMaxEntries,
 		CommitQueueMaxPending:        *commitQueueMaxPending,
-		DeferredUnlink:               *deferredUnlink,
+		DisableDeferredUnlink:        !*deferredUnlink,
 		WriteBackBatchWindow:         *writeBackBatchWindow,
 		WriteBackBatchMaxFiles:       *writeBackBatchMaxFiles,
 		WriteBackBatchMaxBytes:       *writeBackBatchMaxBytes,

@@ -165,7 +165,7 @@ func newDeferredUnlinkFS(t *testing.T, ts *httptest.Server, cacheDir string, def
 	opts := &MountOptions{}
 	opts.setDefaults()
 	opts.WritePolicy = WritePolicyWriteBack
-	opts.DeferredUnlink = deferred
+	opts.DisableDeferredUnlink = !deferred
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	pIdx, err := NewPendingIndex(filepath.Join(cacheDir, "pending"))
@@ -209,7 +209,8 @@ func newDeferredUnlinkFS(t *testing.T, ts *httptest.Server, cacheDir string, def
 	cq.PathLock = fs.lockRemoteCommitPath
 	cq.DurableWatermark = fs.latestCommittedRevision
 	if deferred {
-		// Mirror mount.go's wiring for --deferred-unlink.
+		// Mirror mount.go's wiring: the coalesce window ships with the
+		// default-on deferred deletes.
 		cq.ConfigureDeleteCoalesceWindow(deferredDeleteCoalesceWindow)
 	}
 	fs.commitQueue = cq
