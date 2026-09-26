@@ -641,3 +641,42 @@ func TestDeferredDeleteProceedsWhenInflightCommitAdvancesRevision(t *testing.T) 
 		t.Fatalf("DELETEs = %d, want 1: unconditional deletes must run despite revision drift", got)
 	}
 }
+
+// TestDeferredDeleteAfterStaleTrackerTruncate reproduces the E2E failure
+// class from #998: a synchronous mutation (path truncate) lands rev2 on the
+// backend and refreshes only the inode revision, while the
+// committed-revision tracker stays at rev1. The deferred delete must capture
+// the inode revision (not the stale tracker) as its guard base, or the guard
+// mistakes this mount's own write for a third-party recreate and skips the
+// DELETE — leaving the file on the backend forever.
+func TestDeferredDeleteAfterStaleTrackerTruncate(t *testing.T) {
+	backend := newDeferredUnlinkBackend()
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir())
+
+	const path = "/trunc-victim.txt"
+	backend.seedFile(path, 1)
+	ino := fs.inodes.Lookup(path, false, 16, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.recordCommittedRevision(path, 1)
+
+	// Simulate a landed synchronous truncate: backend advances to rev2 and
+	// the inode refreshes, but the tracker is not updated (the pre-fix gap).
+	backend.mu.Lock()
+	backend.revs[path] = 2
+	backend.mu.Unlock()
+	fs.inodes.UpdateRevision(ino, 2)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "trunc-victim.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	fs.commitQueue.DrainAll()
+
+	if got := backend.deletes.Load(); got != 1 {
+		t.Fatalf("DELETEs = %d, want 1: the guard must not skip on its own truncate's revision advance", got)
+	}
+	if backend.hasPath(path) {
+		t.Fatal("file still present on backend after deferred delete")
+	}
+}

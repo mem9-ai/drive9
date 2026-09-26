@@ -3810,6 +3810,11 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 			entry.Revision = stat.Revision
 			fs.inodes.UpdateRevision(ino, stat.Revision)
 			fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, pid, newSize)
+			// Keep the committed-revision tracker in step with the backend:
+			// deferred-delete base capture and the durable-watermark fence
+			// read it, and a lag here makes a follow-up unlink treat this
+			// mount's own truncate as a third-party recreate.
+			fs.recordCommittedRevision(entry.Path, stat.Revision)
 		}
 		if !stat.Mtime.IsZero() {
 			refreshedMtime = stat.Mtime
@@ -10749,6 +10754,16 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	deferredDelete := false
 	deferredIno, _ := fs.inodes.GetInode(childP)
 	deferredBaseRev := fs.latestCommittedRevision(childP)
+	// The committed-revision tracker can lag the backend after synchronous
+	// mutations that refresh only the inode (applyRemoteTruncate's POST-stat
+	// refresh, post-chmod stats). The inode revision is the freshest
+	// locally-known backend revision; the deferred-delete revision guard
+	// needs it to tell "our own write landed" apart from "another writer
+	// recreated the path" — without it, unlink right after such a mutation
+	// captures a stale base and the guard silently skips the delete.
+	if inodeEntry, ok := fs.inodes.GetEntry(deferredIno); ok && inodeEntry != nil && inodeEntry.Revision > deferredBaseRev {
+		deferredBaseRev = inodeEntry.Revision
+	}
 	if !pendingNew {
 		if deferredUnlink {
 			// The remote DELETE is applied asynchronously by the commit
