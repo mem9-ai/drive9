@@ -53,6 +53,12 @@ const (
 	// PendingChmod means file data has already been uploaded remotely, but
 	// the post-upload chmod step still needs to be retried.
 	PendingChmod
+	// PendingDelete is a commit-queue-only op kind: the path was unlinked
+	// locally and the remote DELETE is applied asynchronously. It never
+	// persists in pending-index metadata — the durable intent lives in a
+	// JournalUnlink WAL frame, and a CommitEntry carries it through the
+	// queue. Nothing uploads a payload for it.
+	PendingDelete
 )
 
 // WriteBackMeta stores metadata alongside cached file data so that the

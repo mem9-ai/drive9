@@ -80,7 +80,7 @@ func TestRecoveryCompleteSnapshotFallback(t *testing.T) {
 						}
 						mustAppend(t, j, JournalEntry{Op: JournalPendingMeta, Path: path, Meta: raw})
 						mustFsync(t, j)
-						if err := replayJournalIntoPending(j, fs.pendingIndex, fs.shadowStore); err != nil {
+						if _, err := replayJournalIntoPending(j, fs.pendingIndex, fs.shadowStore); err != nil {
 							t.Fatal(err)
 						}
 						if meta, ok := fs.pendingIndex.GetMeta(path); !ok || meta.Generation != old.Generation || meta.Size != old.Size {
@@ -211,7 +211,7 @@ func TestRecoveryFallbackSurvivesSecondRestart(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = j.Close() })
-				if err := replayJournalIntoPending(j, idx, s); err != nil {
+				if _, err := replayJournalIntoPending(j, idx, s); err != nil {
 					t.Fatal(err)
 				}
 				if restart == 0 && (j.seq.Load() < 2 || j.DurableSeq() != j.seq.Load()) {
@@ -307,7 +307,7 @@ func TestRecoveryFallbackPublicationFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.Close)
-	if err := replayJournalIntoPending(j, idx, s); err == nil {
+	if _, err := replayJournalIntoPending(j, idx, s); err == nil {
 		t.Fatal("failed fallback publication must stop recovery before migration")
 	}
 	if meta, ok := idx.GetMeta(path); !ok || meta.BaseRev != 7 || meta.Size != 3 {

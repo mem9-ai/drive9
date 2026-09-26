@@ -3822,6 +3822,11 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 			entry.Revision = stat.Revision
 			fs.inodes.UpdateRevision(ino, stat.Revision)
 			fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, pid, newSize)
+			// Keep the committed-revision tracker in step with the backend:
+			// deferred-delete base capture and the durable-watermark fence
+			// read it, and a lag here makes a follow-up unlink treat this
+			// mount's own truncate as a third-party recreate.
+			fs.recordCommittedRevision(entry.Path, stat.Revision)
 		}
 		if !stat.Mtime.IsZero() {
 			refreshedMtime = stat.Mtime
@@ -6991,6 +6996,21 @@ func (fs *Dat9FS) hasKnownLocalDirectoryChildren(dirPath string) bool {
 // remoteDirectoryHasChildren can filter out stale backend listings during
 // the eventual-consistency window — even when the inode has been fully
 // removed (RemoveLink with no open handles).
+// awaitPendingRemoteDelete blocks until a queued deferred DELETE for the
+// path has landed. Namespace-creating operations (symlink, mkdir, create)
+// must not run while the old remote object is still present: the server
+// answers 409 and the create spuriously fails with EEXIST even though the
+// local namespace already unlinked the name. Only paths this mount just
+// unlinked pay the wait.
+func (fs *Dat9FS) awaitPendingRemoteDelete(path string) {
+	if fs == nil || fs.commitQueue == nil || path == "" {
+		return
+	}
+	if fs.commitQueue.HasPendingDelete(path) {
+		fs.commitQueue.WaitPath(path)
+	}
+}
+
 func (fs *Dat9FS) markPathDeleted(path string) {
 	if fs == nil || path == "" {
 		return
@@ -7005,6 +7025,75 @@ func (fs *Dat9FS) markPathDeleted(path string) {
 	// to avoid O(n) per-call overhead during bulk deletes (rm -rf).
 	if len(fs.deletedPaths)%100 == 0 {
 		fs.pruneExpiredDeletedPathsLocked()
+	}
+}
+
+// deferredUnlinkActiveFor reports whether this unlink may apply the remote
+// DELETE asynchronously on the commit queue instead of on the unlink(2)
+// critical path. Only the write-back policy qualifies — close-sync and
+// write-sync promise remote durability at close/write time — and the mount
+// needs the full queue + journal stack. A legacy write-back snapshot means
+// the legacy uploader may still PUT this path outside the queue's ordering,
+// so those paths take the synchronous branch.
+func (fs *Dat9FS) deferredUnlinkActiveFor(childP string) bool {
+	if fs == nil || fs.commitQueue == nil || fs.journal == nil {
+		return false
+	}
+	if policy := fs.opts.WritePolicy; policy != WritePolicyWriteBack && policy != "" {
+		return false
+	}
+	if fs.layerEnabled() || fs.gvisorCompatibilityEnabled() {
+		return false
+	}
+	if fs.writeBack != nil {
+		if _, ok := fs.writeBack.GetMeta(childP); ok {
+			return false
+		}
+	}
+	return true
+}
+
+// appendDeferredUnlinkIntent durably records the unlink intent as a
+// JournalUnlink WAL frame. Replay already treats that opcode as a
+// done-marker (it suppresses resurrection of stale pending uploads for the
+// path), and mount recovery re-enqueues intents that have no newer
+// JournalCommit marker — so a crash between the local unlink and the
+// background DELETE cannot leave the file on the backend.
+func (fs *Dat9FS) appendDeferredUnlinkIntent(childP string, ino uint64, baseRev int64) bool {
+	if fs == nil || fs.journal == nil {
+		return false
+	}
+	if err := fs.journal.Append(JournalEntry{Op: JournalUnlink, Inode: ino, Path: childP, BaseRev: baseRev}); err != nil {
+		safeLogPrintf("unlink: journal intent append failed for %s: %v", childP, err)
+		return false
+	}
+	// Group-committed fsync: unlink(2) returning OK is what the application
+	// sees as "the file is gone", so the intent must be durable by then.
+	if err := fs.journal.FsyncShared(); err != nil {
+		safeLogPrintf("unlink: journal intent fsync failed for %s: %v", childP, err)
+		return false
+	}
+	return true
+}
+
+// syncFallbackDeferredUnlink is the synchronous escape hatch when the
+// deferred delete cannot be staged or enqueued. On success it appends the
+// confirming journal marker so the next mount does not re-delete the path.
+func (fs *Dat9FS) syncFallbackDeferredUnlink(childP string) {
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	err := fs.deleteRemoteFileWithInterruptRecovery(cleanupCtx, childP)
+	cleanupCancel()
+	if err != nil && !isNotFoundErr(err) {
+		// The durable intent (when written) re-applies the delete after
+		// restart; without it the file resurfaces remotely, matching the
+		// pre-delete crash semantics of the synchronous path.
+		safeLogPrintf("unlink: sync fallback delete failed for %s: %v", childP, err)
+		return
+	}
+	if fs.journal != nil {
+		if markerErr := fs.journal.Append(JournalEntry{Op: JournalCommit, Path: childP}); markerErr != nil {
+			safeLogPrintf("unlink: journal delete-done marker failed for %s: %v", childP, markerErr)
+		}
 	}
 }
 
@@ -7259,6 +7348,133 @@ func (fs *Dat9FS) deleteRemoteFileWithInterruptRecovery(ctx context.Context, loc
 
 func (fs *Dat9FS) deleteRemoteDirWithInterruptRecovery(ctx context.Context, localPath string) error {
 	return fs.deleteRemotePathWithInterruptRecovery(ctx, localPath, deleteKindDir)
+}
+
+// tryAggregatedRmdir collapses a just-emptied subtree's deferred deletes
+// into one recursive backend DELETE. It returns true only when the recursive
+// delete fully succeeded (the directory is gone remotely); every other
+// outcome re-enqueues the taken PendingDelete entries and returns false so
+// the caller falls back to the standard drain + LIST + rmdir path, which
+// keeps the server-side ENOTEMPTY authority.
+//
+// The single LIST before the recursive delete is the safety net for
+// POSIX ENOTEMPTY across clients: a child this mount did not delete (another
+// actor's concurrent create) must produce ENOTEMPTY, never a silent
+// recursive removal — so unknown names abort the aggregation.
+func (fs *Dat9FS) tryAggregatedRmdir(ctx context.Context, dirPath string) bool {
+	if fs.deferredUnlinkActiveFor(dirPath) && !fs.extentDiscoveryEnabled() {
+		taken, ok := fs.commitQueue.TakePendingDeletesUnderPrefix(dirPath + "/")
+		if !ok || len(taken) == 0 {
+			// ok=false: content commits still queued under the prefix — drain.
+			// len==0: nothing to coalesce — the standard path is already cheap.
+			return false
+		}
+		items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
+		if err != nil {
+			fs.reenqueueDeferredDeletes(taken)
+			return false
+		}
+		tombstones := fs.snapshotDeletedPaths()
+		// Identity check for every listed child: a name may only be removed
+		// by the recursive DELETE when it is still the exact object this
+		// mount unlinked (revision matches the taken delete intent). A
+		// recreated or unknown child must abort the aggregation so the
+		// standard path keeps ENOTEMPTY / per-path semantics.
+		covered := make(map[string]bool, len(taken))
+		for _, takenEntry := range taken {
+			rest := strings.TrimPrefix(takenEntry.Path, dirPath+"/")
+			top := rest
+			if i := strings.Index(rest, "/"); i >= 0 {
+				top = rest[:i]
+			}
+			covered[top] = true
+		}
+		for _, item := range items {
+			child := dirPath + "/" + item.Name
+			if dirPath == "/" {
+				child = "/" + item.Name
+			}
+			if _, tombstoned := tombstones[child]; tombstoned {
+				// Listed but locally unlinked: it must still be the exact
+				// object a taken intent covers, at the same revision.
+				var intent *CommitEntry
+				for _, takenEntry := range taken {
+					rest := strings.TrimPrefix(takenEntry.Path, dirPath+"/")
+					top := rest
+					if i := strings.Index(rest, "/"); i >= 0 {
+						top = rest[:i]
+					}
+					if top == item.Name {
+						intent = takenEntry
+						break
+					}
+				}
+				if intent == nil || item.IsDir || item.Revision <= 0 ||
+					intent.BaseRev <= 0 || intent.Unconditional ||
+					intent.BaseRev != item.Revision {
+					fs.debugf("rmdir aggregation aborted: %s is not the unlinked object (intent=%v rev=%d)", child, intent != nil, item.Revision)
+					fs.reenqueueDeferredDeletes(taken)
+					return false
+				}
+				continue
+			}
+			if !covered[item.Name] {
+				// A child this mount did not delete exists remotely: the
+				// directory is not empty by POSIX rules. Re-enqueue and let
+				// the standard path return ENOTEMPTY.
+				fs.debugf("rmdir aggregation aborted: unknown remote child %s", child)
+				fs.reenqueueDeferredDeletes(taken)
+				return false
+			}
+		}
+		deleteStart := time.Now()
+		// Detached like every other namespace-mutation commit: a FUSE
+		// interrupt after the backend committed must not turn into a
+		// fallback that answers ENOENT for an rmdir that succeeded.
+		commitCtx, commitCancel := fs.namespaceMutationCommitContext(ctx)
+		err = fs.client.RemoveAllCtx(commitCtx, fs.remotePath(dirPath))
+		commitCancel()
+		fs.perfRecordRemote(perfRemoteMutation, deleteStart, err, 0)
+		if err != nil && !isNotFoundErr(err) {
+			if fs.remotePathGoneDetached(dirPath) {
+				err = nil // committed despite the ambiguous outcome
+			}
+		}
+		if err != nil {
+			safeLogPrintf("rmdir: recursive delete failed for %s: %v (falling back to per-path deletes)", dirPath, err)
+			fs.reenqueueDeferredDeletes(taken)
+			return false
+		}
+		// Confirm the taken intents so a crash replay does not re-delete
+		// children the recursive delete already removed.
+		if fs.journal != nil {
+			for _, entry := range taken {
+				if jerr := fs.journal.Append(JournalEntry{Op: JournalCommit, Path: entry.Path}); jerr != nil {
+					safeLogPrintf("rmdir: journal aggregate marker failed for %s: %v", entry.Path, jerr)
+				}
+			}
+		}
+		fs.debugf("rmdir aggregated %d deferred deletes into one recursive delete path=%s dur=%s", len(taken), dirPath, time.Since(deleteStart))
+		return true
+	}
+	return false
+}
+
+// reenqueueDeferredDeletes re-enqueues fresh PendingDelete entries for paths
+// whose coalesced delete did not happen. Fresh entries, never the taken
+// ones: a taken entry that was already dispatched may still live in the
+// workers' channel, and re-Enqueueing it would double-dispatch.
+func (fs *Dat9FS) reenqueueDeferredDeletes(taken []*CommitEntry) {
+	for _, entry := range taken {
+		if err := fs.commitQueue.Enqueue(&CommitEntry{
+			Path:    entry.Path,
+			Inode:   entry.Inode,
+			BaseRev: entry.BaseRev,
+			Kind:    PendingDelete,
+		}); err != nil {
+			safeLogPrintf("rmdir: deferred delete re-enqueue failed for %s: %v", entry.Path, err)
+		}
+	}
 }
 
 func (fs *Dat9FS) deleteRemotePathWithInterruptRecovery(ctx context.Context, localPath string, kind deleteKind) error {
@@ -10042,6 +10258,10 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 		return gofuse.OK
 	}
 
+	// Same as Symlink: a pending deferred DELETE for the name must land
+	// before the remote mkdir, or the server's 409 becomes a spurious
+	// EEXIST for a directory the local namespace already freed.
+	fs.awaitPendingRemoteDelete(childP)
 	if err := fs.mkdirRemoteWithTransientRetry(cancel, childP, mode); err != nil {
 		return httpToFuseStatus(err)
 	}
@@ -10125,6 +10345,11 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	if fs.shouldUseExtentPath(childP) {
 		return fs.extentSymlink(cancel, header, pointedTo, linkName, childP, out)
 	}
+
+	// A prior unlink of this name may still have its deferred remote DELETE
+	// in flight; creating the symlink before it lands would hit the stale
+	// remote object (server 409 -> spurious EEXIST).
+	fs.awaitPendingRemoteDelete(childP)
 
 	var err error
 	if fs.layerEnabled() {
@@ -10594,13 +10819,18 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}
 	preserveOpen = markedAny
 
+	deferredUnlink := fs.deferredUnlinkActiveFor(childP)
 	if fs.writeBack != nil && fs.uploader != nil {
-		// Wait for any in-flight upload to finish so it doesn't "revive"
-		// the file on the server after we delete it.
-		waitStart := time.Now()
-		fs.debugf("unlink wait writeback start path=%s", childP)
-		fs.uploader.WaitPath(childP)
-		fs.debugDurationf(waitStart, 0, "unlink wait writeback done path=%s", childP)
+		if !deferredUnlink {
+			// Wait for any in-flight upload to finish so it doesn't "revive"
+			// the file on the server after we delete it. Deferred deletes
+			// skip this wait: the queued DELETE serializes behind any
+			// in-flight commit for the path instead.
+			waitStart := time.Now()
+			fs.debugf("unlink wait writeback start path=%s", childP)
+			fs.uploader.WaitPath(childP)
+			fs.debugDurationf(waitStart, 0, "unlink wait writeback done path=%s", childP)
+		}
 		// Check if the file was created locally and never uploaded. Read-only
 		// here: the destructive writeBack Remove is deferred to the commit
 		// point after a successful remote DELETE, so a failed DELETE leaves
@@ -10613,10 +10843,12 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// cannot resurrect the deleted file. The destructive CancelPath is
 	// deferred to the commit point (see writeBack note above).
 	if fs.commitQueue != nil {
-		waitStart := time.Now()
-		fs.debugf("unlink wait commit start path=%s", childP)
-		fs.commitQueue.WaitPath(childP)
-		fs.debugDurationf(waitStart, 0, "unlink wait commit done path=%s", childP)
+		if !deferredUnlink {
+			waitStart := time.Now()
+			fs.debugf("unlink wait commit start path=%s", childP)
+			fs.commitQueue.WaitPath(childP)
+			fs.debugDurationf(waitStart, 0, "unlink wait commit done path=%s", childP)
+		}
 
 		// Re-check pendingIndex after WaitPath. On a successful commit,
 		// commitQueue removes pendingIndex before taking the entry out of
@@ -10669,35 +10901,65 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 	}
 
+	// A deferred delete serializes behind any same-path commit still in the
+	// queue (beginInFlight + path lock), so an in-flight upload can never
+	// land after the DELETE — the path can be treated as remote-existing
+	// without waiting for that upload here.
+	if deferredUnlink && pendingNew && fs.commitQueue != nil && fs.commitQueue.HasPath(childP) {
+		pendingNew = false
+	}
+
+	deferredDelete := false
+	deferredIno, _ := fs.inodes.GetInode(childP)
+	deferredBaseRev := fs.latestCommittedRevision(childP)
+	// The committed-revision tracker can lag the backend after synchronous
+	// mutations that refresh only the inode (applyRemoteTruncate's POST-stat
+	// refresh, post-chmod stats). The inode revision is the freshest
+	// locally-known backend revision; the deferred-delete revision guard
+	// needs it to tell "our own write landed" apart from "another writer
+	// recreated the path" — without it, unlink right after such a mutation
+	// captures a stale base and the guard silently skips the delete.
+	if inodeEntry, ok := fs.inodes.GetEntry(deferredIno); ok && inodeEntry != nil && inodeEntry.Revision > deferredBaseRev {
+		deferredBaseRev = inodeEntry.Revision
+	}
 	if !pendingNew {
-		// File existed on server (or unknown) — issue remote DELETE.
-		// Tolerate 404 in case it was already deleted. The gVisor gate here
-		// governs only this orchestration context; the remote DELETE itself
-		// re-detaches inside deleteRemoteFileWithInterruptRecovery for every
-		// mount mode.
-		deleteCtx, deleteCancel := fuseCtx(cancel)
-		if fs.gvisorCompatibilityEnabled() {
+		if deferredUnlink {
+			// The remote DELETE is applied asynchronously by the commit
+			// queue. The durable journal intent is appended below, after the
+			// commit-point CancelPath, so its sequence is newer than any done
+			// marker that cleanup writes — replay must see it as pending.
+			deferredDelete = true
+			fs.debugf("unlink deferred delete staged path=%s base_rev=%d", childP, deferredBaseRev)
+		} else {
+			// File existed on server (or unknown) — issue remote DELETE.
+			// Tolerate 404 in case it was already deleted. The gVisor gate here
+			// governs only this orchestration context; the remote DELETE itself
+			// re-detaches inside deleteRemoteFileWithInterruptRecovery for every
+			// mount mode.
+			deleteCtx, deleteCancel := fuseCtx(cancel)
+			if fs.gvisorCompatibilityEnabled() {
+				deleteCancel()
+				deleteCtx, deleteCancel = fs.namespaceMutationCommitContext(ctx)
+			}
+			deleteStart := time.Now()
+			fs.debugf("unlink remote delete start path=%s", childP)
+			err := fs.deleteRemoteFileWithInterruptRecovery(deleteCtx, childP)
 			deleteCancel()
-			deleteCtx, deleteCancel = fs.namespaceMutationCommitContext(ctx)
-		}
-		deleteStart := time.Now()
-		fs.debugf("unlink remote delete start path=%s", childP)
-		err := fs.deleteRemoteFileWithInterruptRecovery(deleteCtx, childP)
-		deleteCancel()
-		fs.debugDurationf(deleteStart, 0, "unlink remote delete done path=%s err=%v", childP, err)
-		if err != nil {
-			if !isNotFoundErr(err) {
-				unlockRemoteCommit()
-				// Roll back pass-1 marking: the directory entry still exists
-				// remotely, so the handles must not be treated as unlinked —
-				// otherwise their next Flush/Fsync/Release discards dirty
-				// data (silent data loss after a transient DELETE error).
-				// No staging-store rollback is needed: every destructive
-				// Remove/CancelPath is deferred to the commit point below,
-				// which a failed DELETE never reaches.
-				fs.unmarkOpenHandlesAfterFailedUnlink(childP, markedHandles)
-				status = httpToFuseStatus(err)
-				return status
+			fs.debugDurationf(deleteStart, 0, "unlink remote delete done path=%s err=%v", childP, err)
+			if err != nil {
+				if !isNotFoundErr(err) {
+					unlockRemoteCommit()
+					// Roll back pass-1 marking: the directory entry still exists
+					// remotely, so the handles must not be treated as unlinked —
+					// otherwise their next Flush/Fsync/Release discards dirty
+					// data (silent data loss after a transient DELETE error).
+					// No staging-store rollback is needed: every destructive
+					// Remove/CancelPath is deferred to the commit point below,
+					// which a failed DELETE never reaches.
+					fs.unmarkOpenHandlesAfterFailedUnlink(childP, markedHandles)
+					status = httpToFuseStatus(err)
+					return status
+				}
 			}
 		}
 	}
@@ -10729,6 +10991,34 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	// handle/inode bookkeeping takes fh.mu (lock order is fh.mu →
 	// remoteCommitLock everywhere else).
 	unlockRemoteCommit()
+
+	// Enqueue the deferred delete after the commit-point cleanup: CancelPath
+	// above must not see (and cancel) this entry. The journal intent is
+	// written here — newer than any done marker CancelPath wrote — so replay
+	// always treats the delete as pending until the queue confirms it. If
+	// the intent or the enqueue fails, fall back to a synchronous delete and
+	// mark the intent confirmed on success.
+	if deferredDelete {
+		// A commit already in flight for this path is our own dying file's
+		// upload: it legitimately advances the revision, so the delete must
+		// not be revision-guarded. Without in-flight work, any revision
+		// change after the captured one can only be another writer's
+		// recreate — exactly what the guard must protect.
+		unconditional := deferredBaseRev <= 0 ||
+			(fs.commitQueue != nil && fs.commitQueue.InFlightPath(childP))
+		if !fs.appendDeferredUnlinkIntent(childP, deferredIno, deferredBaseRev) {
+			fs.syncFallbackDeferredUnlink(childP)
+		} else if err := fs.commitQueue.Enqueue(&CommitEntry{
+			Path:          childP,
+			Inode:         deferredIno,
+			BaseRev:       deferredBaseRev,
+			Kind:          PendingDelete,
+			Unconditional: unconditional,
+		}); err != nil {
+			safeLogPrintf("unlink: deferred delete enqueue failed for %s: %v (falling back to sync delete)", childP, err)
+			fs.syncFallbackDeferredUnlink(childP)
+		}
+	}
 
 	// Pass 2: handles that raced open between pass 1 and the DELETE escaped
 	// marking; mark them now (no remote snapshot — the path is already gone)
@@ -10851,6 +11141,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	}
 	start := time.Now()
 	status = gofuse.OK
+	aggregatedDelete := false
 	fs.debugf("rmdir start path=%s parent_ino=%d name=%s", childP, header.NodeId, name)
 	defer func() {
 		fs.debugf("rmdir done path=%s status=%d dur=%s", childP, status, time.Since(start))
@@ -10936,99 +11227,108 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			status = gofuse.Status(syscall.ENOTEMPTY)
 			return status
 		}
-		// Wait for the commit queue to drain pending uploads under this
-		// directory before checking the remote listing. Without this, a
-		// rapid batch of Unlinks (e.g. mdtest deleting 1000 files) can leave
-		// the commit queue still processing uploads when rmdir checks the
-		// remote listing, causing a stale ENOTEMPTY even though every file
-		// has been locally unlinked and remotely deleted. The wait is
-		// bounded (10s) to avoid blocking indefinitely; the polling loop
-		// below provides additional eventual-consistency tolerance.
-		if fs.commitQueue != nil {
-			fs.commitQueue.WaitPrefixTimeout(childP+"/", 10*time.Second)
+		// rm -rf aggregation: when this mount just unlinked the subtree and
+		// the child deletes are still coalescing in the commit queue, replace
+		// them with one recursive DELETE instead of draining them one by one.
+		// Falls back (and re-enqueues) unless it fully succeeded.
+		aggregatedDelete = fs.tryAggregatedRmdir(ctx, childP)
+		if !aggregatedDelete {
+			// Wait for the commit queue to drain pending uploads under this
+			// directory before checking the remote listing. Without this, a
+			// rapid batch of Unlinks (e.g. mdtest deleting 1000 files) can leave
+			// the commit queue still processing uploads when rmdir checks the
+			// remote listing, causing a stale ENOTEMPTY even though every file
+			// has been locally unlinked and remotely deleted. The wait is
+			// bounded (10s) to avoid blocking indefinitely; the polling loop
+			// below provides additional eventual-consistency tolerance.
+			if fs.commitQueue != nil {
+				fs.commitQueue.WaitPrefixTimeout(childP+"/", 10*time.Second)
+			}
+			// Local state says empty. The remote listing may be stale due to
+			// eventual-consistency lag on just-completed Unlinks. We rely on
+			// tombstones + the cancel-aware polling loop below to handle any
+			// remaining eventual consistency.
+			// giving the backend time to propagate recent deletes.
+			hasChildren, listGeneration, err := fs.remoteDirectoryHasChildren(ctx, childP)
+			if errors.Is(err, syscall.EAGAIN) {
+				status = gofuse.Status(syscall.EAGAIN)
+				return status
+			}
+			if client.IsUnauthorized(err) {
+				status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
+				return status
+			}
+			if err == nil && !fs.lockMountViewRead(listGeneration) {
+				status = gofuse.Status(syscall.EAGAIN)
+				return status
+			}
+			if err == nil {
+				fs.mountViewMu.RUnlock()
+			}
+			if err == nil && hasChildren {
+				// Invalidate the dirCache entry that was just written from the
+				// potentially-stale remote listing, so hasKnownLocalDirectoryChildren
+				// checks only the local inode state (which is authoritative).
+				fs.dirCache.Invalidate(childP)
+				if !fs.hasKnownLocalDirectoryChildren(childP) {
+					fs.debugf("rmdir path=%s remote has children but no local children, polling for up to 2s", childP)
+					deadline := time.Now().Add(2 * time.Second)
+					for time.Now().Before(deadline) {
+						select {
+						case <-time.After(500 * time.Millisecond):
+						case <-ctx.Done():
+							status = gofuse.Status(syscall.EINTR)
+							return status
+						case <-cancel:
+							status = gofuse.Status(syscall.EINTR)
+							return status
+						}
+						hasChildren, listGeneration, err = fs.remoteDirectoryHasChildren(ctx, childP)
+						if errors.Is(err, syscall.EAGAIN) {
+							status = gofuse.Status(syscall.EAGAIN)
+							return status
+						}
+						if client.IsUnauthorized(err) {
+							status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
+							return status
+						}
+						if err == nil && !fs.lockMountViewRead(listGeneration) {
+							status = gofuse.Status(syscall.EAGAIN)
+							return status
+						}
+						if err == nil {
+							fs.mountViewMu.RUnlock()
+						}
+						if err != nil || !hasChildren {
+							break
+						}
+						fs.dirCache.Invalidate(childP)
+					}
+				}
+			}
+			if err == nil && hasChildren {
+				status = gofuse.Status(syscall.ENOTEMPTY)
+				return status
+			} else if err != nil {
+				fs.debugf("rmdir pre-delete list failed path=%s err=%v", childP, err)
+			}
 		}
-		// Local state says empty. The remote listing may be stale due to
-		// eventual-consistency lag on just-completed Unlinks. We rely on
-		// tombstones + the cancel-aware polling loop below to handle any
-		// remaining eventual consistency.
-		// giving the backend time to propagate recent deletes.
-		hasChildren, listGeneration, err := fs.remoteDirectoryHasChildren(ctx, childP)
-		if errors.Is(err, syscall.EAGAIN) {
-			status = gofuse.Status(syscall.EAGAIN)
+	}
+
+	if !aggregatedDelete {
+		if st := fs.extentRmdir(header, name, childP); st != gofuse.OK {
+			status = st
 			return status
 		}
-		if client.IsUnauthorized(err) {
+
+		deleteStart := time.Now()
+		fs.debugf("rmdir remote delete start path=%s", childP)
+		err := fs.deleteRemoteDirWithInterruptRecovery(ctx, childP)
+		fs.debugDurationf(deleteStart, 0, "rmdir remote delete done path=%s err=%v", childP, err)
+		if err != nil {
 			status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
 			return status
 		}
-		if err == nil && !fs.lockMountViewRead(listGeneration) {
-			status = gofuse.Status(syscall.EAGAIN)
-			return status
-		}
-		if err == nil {
-			fs.mountViewMu.RUnlock()
-		}
-		if err == nil && hasChildren {
-			// Invalidate the dirCache entry that was just written from the
-			// potentially-stale remote listing, so hasKnownLocalDirectoryChildren
-			// checks only the local inode state (which is authoritative).
-			fs.dirCache.Invalidate(childP)
-			if !fs.hasKnownLocalDirectoryChildren(childP) {
-				fs.debugf("rmdir path=%s remote has children but no local children, polling for up to 2s", childP)
-				deadline := time.Now().Add(2 * time.Second)
-				for time.Now().Before(deadline) {
-					select {
-					case <-time.After(500 * time.Millisecond):
-					case <-ctx.Done():
-						status = gofuse.Status(syscall.EINTR)
-						return status
-					case <-cancel:
-						status = gofuse.Status(syscall.EINTR)
-						return status
-					}
-					hasChildren, listGeneration, err = fs.remoteDirectoryHasChildren(ctx, childP)
-					if errors.Is(err, syscall.EAGAIN) {
-						status = gofuse.Status(syscall.EAGAIN)
-						return status
-					}
-					if client.IsUnauthorized(err) {
-						status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
-						return status
-					}
-					if err == nil && !fs.lockMountViewRead(listGeneration) {
-						status = gofuse.Status(syscall.EAGAIN)
-						return status
-					}
-					if err == nil {
-						fs.mountViewMu.RUnlock()
-					}
-					if err != nil || !hasChildren {
-						break
-					}
-					fs.dirCache.Invalidate(childP)
-				}
-			}
-		}
-		if err == nil && hasChildren {
-			status = gofuse.Status(syscall.ENOTEMPTY)
-			return status
-		} else if err != nil {
-			fs.debugf("rmdir pre-delete list failed path=%s err=%v", childP, err)
-		}
-	}
-
-	if st := fs.extentRmdir(header, name, childP); st != gofuse.OK {
-		status = st
-		return status
-	}
-
-	deleteStart := time.Now()
-	fs.debugf("rmdir remote delete start path=%s", childP)
-	err := fs.deleteRemoteDirWithInterruptRecovery(ctx, childP)
-	fs.debugDurationf(deleteStart, 0, "rmdir remote delete done path=%s err=%v", childP, err)
-	if err != nil {
-		status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
-		return status
 	}
 
 	// Clean write-back entries for files under the removed directory.
