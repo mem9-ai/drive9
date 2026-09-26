@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,14 +22,31 @@ type localFirstBackend struct {
 	chmod   atomic.Int64
 	head    atomic.Int64
 	symPost atomic.Int64
+	deletes atomic.Int64
 	// putGate, when non-nil, blocks PUT handlers before they increment the
 	// counter, so tests can assert counter values deterministically.
 	putGate chan struct{}
+	// chmodFails, when true, makes post-upload chmods answer 500.
+	chmodFails bool
 	// data records committed content by path when non-nil.
 	data map[string][]byte
+	// exists/revs track backend objects so HEAD/DELETE behave server-like.
+	exists map[string]bool
+	revs   map[string]int64
+	mu2    sync.Mutex
 }
 
 func (b *localFirstBackend) handler() http.HandlerFunc {
+	return b.handlerFunc()
+}
+
+func (b *localFirstBackend) handlerFunc() http.HandlerFunc {
+	b.mu2.Lock()
+	if b.exists == nil {
+		b.exists = map[string]bool{}
+		b.revs = map[string]int64{}
+	}
+	b.mu2.Unlock()
 	return func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
 		q := r.URL.Query()
@@ -38,15 +56,30 @@ func (b *localFirstBackend) handler() http.HandlerFunc {
 				<-b.putGate
 			}
 			b.put.Add(1)
+			b.mu2.Lock()
+			b.exists[p] = true
+			b.revs[p]++
+			b.mu2.Unlock()
 			if b.data != nil {
 				body, _ := io.ReadAll(r.Body)
 				b.data[p] = body
 			}
-			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(b.revs[p], 10))
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case r.Method == http.MethodDelete:
+			b.deletes.Add(1)
+			b.mu2.Lock()
+			delete(b.exists, p)
+			delete(b.revs, p)
+			b.mu2.Unlock()
+			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && q.Has("chmod"):
 			b.chmod.Add(1)
+			if b.chmodFails {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case r.Method == http.MethodPost && q.Has("symlink"):
@@ -59,8 +92,17 @@ func (b *localFirstBackend) handler() http.HandlerFunc {
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case r.Method == http.MethodHead:
 			b.head.Add(1)
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error":"not found"}`))
+			b.mu2.Lock()
+			exists, rev := b.exists[p], b.revs[p]
+			b.mu2.Unlock()
+			if !exists {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"error":"not found"}`))
+				return
+			}
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -115,6 +157,7 @@ func newLocalFirstTestFSWithPolicy(t *testing.T, ts *httptest.Server, policy Wri
 	fs.SetWriteBack(wb, up)
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pIdx, jr, 2, maxCommitQueuePending)
+	cq.RecordCommittedRevision = fs.recordCommittedRevision
 	cq.OnSuccess = fs.onCommitQueueSuccess
 	cq.OnUploaded = fs.onCommitQueueUploaded
 	cq.OnCleanup = fs.onCommitQueueCleanup
@@ -374,5 +417,60 @@ func TestMknodRegularSyncFallbackForCloseSync(t *testing.T) {
 	}
 	if _, ok := fs.pendingIndex.GetMeta("/sync-close-sync.txt"); ok {
 		t.Fatal("close-sync mknod staged pending meta; want synchronous create")
+	}
+}
+
+// TestMknodLocalFirstChmodFailureStillUnlinks covers the staged-failure path
+// qiffang flagged on #997: the queue lands the zero-byte PUT, then the
+// post-upload chmod fails. The durable pending state must be re-classified
+// (PendingChmod) and the committed revision recorded, so a follow-up unlink
+// still issues the remote DELETE instead of classifying the path as
+// never-uploaded and leaking the just-created remote object.
+func TestMknodLocalFirstChmodFailureStillUnlinks(t *testing.T) {
+	backend := &localFirstBackend{chmodFails: true}
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newLocalFirstTestFS(t, ts)
+
+	var out gofuse.EntryOut
+	st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFREG) | 0o600,
+	}, "chmod-fail.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+	fs.commitQueue.DrainAll()
+
+	if got := backend.put.Load(); got != 1 {
+		t.Fatalf("create PUTs = %d, want 1", got)
+	}
+	if got := backend.chmod.Load(); got == 0 {
+		t.Fatal("post-upload chmod was never attempted")
+	}
+	if !backend.exists["/chmod-fail.txt"] {
+		t.Fatal("remote object missing after PUT (data must have landed)")
+	}
+	// The durable pending state must no longer claim "never uploaded".
+	meta, ok := fs.pendingIndex.GetMeta("/chmod-fail.txt")
+	if !ok {
+		t.Fatal("pending meta missing after chmod failure")
+	}
+	if meta.Kind != PendingChmod {
+		t.Fatalf("pending kind = %v, want PendingChmod", meta.Kind)
+	}
+	if rev := fs.latestCommittedRevision("/chmod-fail.txt"); rev <= 0 {
+		t.Fatalf("committed revision tracker = %d, want > 0", rev)
+	}
+
+	// Unlink must still remove the landed remote object.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "chmod-fail.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if got := backend.deletes.Load(); got != 1 {
+		t.Fatalf("DELETEs = %d, want 1 (remote object must not leak)", got)
+	}
+	if _, exists := backend.exists["/chmod-fail.txt"]; exists {
+		t.Fatal("remote object leaked after unlink")
 	}
 }
