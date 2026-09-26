@@ -46,9 +46,9 @@ type MountOptions struct {
 	ReadCacheTTL                time.Duration // ReadCache TTL (default 30s; negative disables time-based expiry)
 	DiskReadCacheSize           int64         // disk-backed read cache max size in bytes (default 1GiB)
 	DiskReadCacheFreeRatio      float64       // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
-	DirTTL                      time.Duration // DirCache TTL (default 10s; coding-agent 30s)
-	AttrTTL                     time.Duration // kernel attr cache TTL (default 60s; coding-agent 5m)
-	EntryTTL                    time.Duration // kernel entry cache TTL (default 60s; coding-agent 5m)
+	DirTTL                      time.Duration // DirCache TTL (default 10s)
+	AttrTTL                     time.Duration // kernel attr cache TTL (default 60s; coding-agent 30s)
+	EntryTTL                    time.Duration // kernel entry cache TTL (default 60s)
 	NegativeEntryTTL            time.Duration // kernel negative entry cache TTL (default 1s)
 	FlushDebounce               time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
 	SyncMode                    SyncMode      // interactive, strict, or auto (default auto)
@@ -159,20 +159,18 @@ func (o *MountOptions) setDefaults() {
 	if o.DiskReadCacheFreeRatio <= 0 {
 		o.DiskReadCacheFreeRatio = defaultDiskReadCacheFreeRatio
 	}
-	dirCacheTTL := defaultDirCacheTTL
-	positiveKernelCacheTTL := defaultPositiveKernelCacheTTL
+	attrTTL := defaultPositiveKernelCacheTTL
 	if o.Profile == MountProfileCodingAgent {
-		dirCacheTTL = defaultCodingAgentDirCacheTTL
-		positiveKernelCacheTTL = defaultCodingAgentPositiveKernelCacheTTL
+		attrTTL = defaultCodingAgentAttrCacheTTL
 	}
 	if o.DirTTL <= 0 {
-		o.DirTTL = dirCacheTTL
+		o.DirTTL = defaultDirCacheTTL
 	}
 	if o.AttrTTL <= 0 {
-		o.AttrTTL = positiveKernelCacheTTL
+		o.AttrTTL = attrTTL
 	}
 	if o.EntryTTL <= 0 {
-		o.EntryTTL = positiveKernelCacheTTL
+		o.EntryTTL = defaultPositiveKernelCacheTTL
 	}
 	if o.NegativeEntryTTL <= 0 {
 		o.NegativeEntryTTL = time.Second

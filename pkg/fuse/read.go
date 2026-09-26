@@ -12,10 +12,9 @@ const (
 	defaultReadCacheTTL     = 30 * time.Second // 30s
 	readCacheNoExpiryTTL    = -1
 	// Positive kernel caches stay bounded for generic mounts. The coding-agent
-	// profile keeps them hot longer because its local and SSE invalidation paths
-	// cover the repeated metadata scans common to development tools.
-	defaultPositiveKernelCacheTTL            = 60 * time.Second
-	defaultCodingAgentPositiveKernelCacheTTL = 5 * time.Minute
+	// profile uses a shorter attribute TTL while leaving entry caching unchanged.
+	defaultPositiveKernelCacheTTL  = 60 * time.Second
+	defaultCodingAgentAttrCacheTTL = 30 * time.Second
 	// defaultSmallFileThreshold is the local fallback used when no server
 	// value has been negotiated yet. The authoritative value is fetched from
 	// /v1/status on the dat9 client and propagated through FS.smallFileMax.

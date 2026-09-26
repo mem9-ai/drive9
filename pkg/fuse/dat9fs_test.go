@@ -9150,14 +9150,14 @@ func TestDefaultCacheTTLs(t *testing.T) {
 func TestCodingAgentDefaultCacheTTLs(t *testing.T) {
 	opts := &MountOptions{Profile: MountProfileCodingAgent}
 	opts.setDefaults()
-	if opts.DirTTL != defaultCodingAgentDirCacheTTL {
-		t.Fatalf("coding-agent DirTTL = %v, want %v", opts.DirTTL, defaultCodingAgentDirCacheTTL)
+	if opts.DirTTL != defaultDirCacheTTL {
+		t.Fatalf("coding-agent DirTTL = %v, want %v", opts.DirTTL, defaultDirCacheTTL)
 	}
-	if opts.AttrTTL != defaultCodingAgentPositiveKernelCacheTTL {
-		t.Fatalf("coding-agent AttrTTL = %v, want %v", opts.AttrTTL, defaultCodingAgentPositiveKernelCacheTTL)
+	if opts.AttrTTL != defaultCodingAgentAttrCacheTTL {
+		t.Fatalf("coding-agent AttrTTL = %v, want %v", opts.AttrTTL, defaultCodingAgentAttrCacheTTL)
 	}
-	if opts.EntryTTL != defaultCodingAgentPositiveKernelCacheTTL {
-		t.Fatalf("coding-agent EntryTTL = %v, want %v", opts.EntryTTL, defaultCodingAgentPositiveKernelCacheTTL)
+	if opts.EntryTTL != defaultPositiveKernelCacheTTL {
+		t.Fatalf("coding-agent EntryTTL = %v, want %v", opts.EntryTTL, defaultPositiveKernelCacheTTL)
 	}
 }
 
@@ -9177,26 +9177,6 @@ func TestCodingAgentKeepsExplicitCacheTTLs(t *testing.T) {
 	}
 	if opts.EntryTTL != 6*time.Second {
 		t.Fatalf("explicit EntryTTL = %v, want 6s", opts.EntryTTL)
-	}
-}
-
-func TestCodingAgentDirCacheTTLExpiresAfterThirtySeconds(t *testing.T) {
-	opts := &MountOptions{Profile: MountProfileCodingAgent}
-	opts.setDefaults()
-
-	now := time.Unix(1, 0)
-	cache := NewDirCache(opts.DirTTL)
-	cache.now = func() time.Time { return now }
-	cache.Put("/repo", []CachedFileInfo{{Name: "README.md"}})
-
-	now = now.Add(15 * time.Second)
-	if _, ok := cache.Get("/repo"); !ok {
-		t.Fatal("coding-agent directory cache expired before 30 seconds")
-	}
-
-	now = now.Add(16 * time.Second)
-	if _, ok := cache.Get("/repo"); ok {
-		t.Fatal("coding-agent directory cache remained valid after 30 seconds")
 	}
 }
 
