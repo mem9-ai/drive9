@@ -126,6 +126,17 @@ type fusePerfCounters struct {
 	prefetchHit   atomicUint64
 	prefetchMiss  atomicUint64
 
+	directoryPrefetchIssued            atomicUint64
+	directoryPrefetchJoined            atomicUint64
+	directoryPrefetchJoinSuccess       atomicUint64
+	directoryPrefetchCompletedUnjoined atomicUint64
+	directoryPrefetchRejected          atomicUint64
+	directoryPrefetchEntries           atomicUint64
+	directoryPrefetchBytes             atomicUint64
+	directoryPrefetchDurationNS        atomicUint64
+	directoryPrefetchMaxConcurrent     atomicUint64
+	directoryPrefetchForegroundWaitNS  atomicUint64
+
 	namespacePositiveHit  atomicUint64
 	namespaceNegativeHit  atomicUint64
 	namespaceCompleteMiss atomicUint64
@@ -543,6 +554,16 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	snap.Counters["dir_cache_miss"] = p.dirCacheMiss.load()
 	snap.Counters["prefetch_hit"] = p.prefetchHit.load()
 	snap.Counters["prefetch_miss"] = p.prefetchMiss.load()
+	snap.Counters["directory_prefetch_issued"] = p.directoryPrefetchIssued.load()
+	snap.Counters["directory_prefetch_joined"] = p.directoryPrefetchJoined.load()
+	snap.Counters["directory_prefetch_join_success"] = p.directoryPrefetchJoinSuccess.load()
+	snap.Counters["directory_prefetch_completed_unjoined"] = p.directoryPrefetchCompletedUnjoined.load()
+	snap.Counters["directory_prefetch_rejected"] = p.directoryPrefetchRejected.load()
+	snap.Counters["directory_prefetch_entries"] = p.directoryPrefetchEntries.load()
+	snap.Counters["directory_prefetch_bytes"] = p.directoryPrefetchBytes.load()
+	snap.Counters["directory_prefetch_duration_ns"] = p.directoryPrefetchDurationNS.load()
+	snap.Counters["directory_prefetch_max_concurrent"] = p.directoryPrefetchMaxConcurrent.load()
+	snap.Counters["directory_prefetch_foreground_wait_ns"] = p.directoryPrefetchForegroundWaitNS.load()
 	snap.Counters["namespace_positive_hit"] = p.namespacePositiveHit.load()
 	snap.Counters["namespace_negative_hit"] = p.namespaceNegativeHit.load()
 	snap.Counters["namespace_complete_miss"] = p.namespaceCompleteMiss.load()
@@ -653,6 +674,12 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 		snap.Counters["read_cache_hit"], snap.Counters["read_cache_miss"],
 		snap.Counters["dir_cache_hit"], snap.Counters["dir_cache_miss"],
 		snap.Counters["prefetch_hit"], snap.Counters["prefetch_miss"])
+	writePerfLine(w, "drive9: perf directory_prefetch issued=%d joined=%d join_success=%d completed_unjoined=%d rejected=%d entries=%d bytes=%d duration=%s max_concurrent=%d foreground_wait=%s\n",
+		snap.Counters["directory_prefetch_issued"], snap.Counters["directory_prefetch_joined"],
+		snap.Counters["directory_prefetch_join_success"], snap.Counters["directory_prefetch_completed_unjoined"],
+		snap.Counters["directory_prefetch_rejected"], snap.Counters["directory_prefetch_entries"],
+		snap.Counters["directory_prefetch_bytes"], time.Duration(snap.Counters["directory_prefetch_duration_ns"]).Truncate(time.Microsecond),
+		snap.Counters["directory_prefetch_max_concurrent"], time.Duration(snap.Counters["directory_prefetch_foreground_wait_ns"]).Truncate(time.Microsecond))
 	writePerfLine(w, "drive9: perf namespace positive_hit=%d negative_hit=%d complete_miss=%d session_miss=%d partial_miss=%d\n",
 		snap.Counters["namespace_positive_hit"], snap.Counters["namespace_negative_hit"],
 		snap.Counters["namespace_complete_miss"], snap.Counters["namespace_session_miss"],

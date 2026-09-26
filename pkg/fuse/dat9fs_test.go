@@ -9130,9 +9130,12 @@ func TestLazyWritablePreloadUsesRenamedPath(t *testing.T) {
 	}
 }
 
-func TestDefaultTTLIs60Seconds(t *testing.T) {
+func TestDefaultCacheTTLs(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
+	if opts.DirTTL != defaultDirCacheTTL {
+		t.Fatalf("default DirTTL = %v, want %v", opts.DirTTL, defaultDirCacheTTL)
+	}
 	if opts.AttrTTL != defaultPositiveKernelCacheTTL {
 		t.Fatalf("default AttrTTL = %v, want %v", opts.AttrTTL, defaultPositiveKernelCacheTTL)
 	}
@@ -9141,6 +9144,39 @@ func TestDefaultTTLIs60Seconds(t *testing.T) {
 	}
 	if opts.NegativeEntryTTL != time.Second {
 		t.Fatalf("default NegativeEntryTTL = %v, want 1s", opts.NegativeEntryTTL)
+	}
+}
+
+func TestCodingAgentDefaultCacheTTLs(t *testing.T) {
+	opts := &MountOptions{Profile: MountProfileCodingAgent}
+	opts.setDefaults()
+	if opts.DirTTL != defaultDirCacheTTL {
+		t.Fatalf("coding-agent DirTTL = %v, want %v", opts.DirTTL, defaultDirCacheTTL)
+	}
+	if opts.AttrTTL != defaultCodingAgentAttrCacheTTL {
+		t.Fatalf("coding-agent AttrTTL = %v, want %v", opts.AttrTTL, defaultCodingAgentAttrCacheTTL)
+	}
+	if opts.EntryTTL != defaultPositiveKernelCacheTTL {
+		t.Fatalf("coding-agent EntryTTL = %v, want %v", opts.EntryTTL, defaultPositiveKernelCacheTTL)
+	}
+}
+
+func TestCodingAgentKeepsExplicitCacheTTLs(t *testing.T) {
+	opts := &MountOptions{
+		Profile:  MountProfileCodingAgent,
+		DirTTL:   7 * time.Second,
+		AttrTTL:  5 * time.Second,
+		EntryTTL: 6 * time.Second,
+	}
+	opts.setDefaults()
+	if opts.DirTTL != 7*time.Second {
+		t.Fatalf("explicit DirTTL = %v, want 7s", opts.DirTTL)
+	}
+	if opts.AttrTTL != 5*time.Second {
+		t.Fatalf("explicit AttrTTL = %v, want 5s", opts.AttrTTL)
+	}
+	if opts.EntryTTL != 6*time.Second {
+		t.Fatalf("explicit EntryTTL = %v, want 6s", opts.EntryTTL)
 	}
 }
 
