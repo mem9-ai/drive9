@@ -161,6 +161,21 @@ func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 			w.Header().Set("Content-Type", "application/json")
 			body, _ := json.Marshal(map[string]any{"entries": entries})
 			_, _ = w.Write(body)
+		case r.Method == http.MethodPost && r.URL.Query().Has("rename"):
+			src := r.Header.Get("X-Dat9-Rename-Source")
+			b.mu.Lock()
+			if !b.exists[src] {
+				b.mu.Unlock()
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			b.exists[p] = true
+			b.revs[p] = b.revs[src] + 1
+			delete(b.exists, src)
+			delete(b.revs, src)
+			b.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		case r.Method == http.MethodPost && r.URL.Query().Has("symlink"):
 			b.mu.Lock()
 			if b.exists[p] {
