@@ -66,6 +66,9 @@ type tenantStatusResponse struct {
 // A missing object means the server predates the contract.
 type StorageCapabilities struct {
 	AppendLogV1 bool `json:"append_log_v1"`
+	// BatchWriteModeV1 promises atomic content+mode create, owner-only mode
+	// authorization, and the definite-rejection contract on BatchWriteResult.
+	BatchWriteModeV1 bool `json:"batch_write_mode_v1"`
 }
 
 // MigrationCapabilities is the bounded Server contract. A missing object
@@ -411,6 +414,14 @@ type BatchWriteItem struct {
 }
 
 // BatchWriteResult is one per-path result from BatchWriteCtx.
+// Servers advertising storage_capabilities.batch_write_mode_v1 must reject
+// scoped hasMode items before mutation with per-item status 403 and revision 0
+// (or omitted). Other authorized content-only items may still commit. Backend
+// errors never map to 403; post-commit errors preserve their committed revision.
+// Only that per-item 403/0 is a definite authorization non-commit. Top-level
+// errors and other per-item errors do not establish whether content committed.
+// The server contract was introduced in https://github.com/tidbcloud/fs/pull/189;
+// see docs/design/fuse-durability-policy.md for client fallback semantics.
 type BatchWriteResult struct {
 	Path     string `json:"path"`
 	Status   int    `json:"status"`
@@ -595,6 +606,16 @@ func (c *Client) CachedAppendLogSupported() bool {
 	}
 	body := c.statusBody.Load()
 	return body != nil && body.StorageCapabilities != nil && body.StorageCapabilities.AppendLogV1
+}
+
+// CachedBatchWriteModeSupported reports the negotiated batch content+mode
+// contract without I/O. Missing, failed or older status responses disable it.
+func (c *Client) CachedBatchWriteModeSupported() bool {
+	if c == nil {
+		return false
+	}
+	body := c.statusBody.Load()
+	return body != nil && body.StorageCapabilities != nil && body.StorageCapabilities.BatchWriteModeV1
 }
 
 // ensureTenantStatus is the compatibility warm path. Legacy getters

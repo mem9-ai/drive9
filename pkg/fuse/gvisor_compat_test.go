@@ -2783,18 +2783,28 @@ func TestGVisorCompatDisabledRenameMetadataOnlySpecialTargetDeleteRemainsInterru
 }
 
 func TestGVisorCompatPendingNewGitRenameSyncCommitSurvivesInterrupt(t *testing.T) {
-	testGVisorCompatPendingNewRenameSyncCommitInterrupt(t, true, true, false, gofuse.OK)
+	testGVisorCompatPendingNewRenameSyncCommitInterrupt(t, true, true, false, false, gofuse.OK)
 }
 
 func TestGVisorCompatPendingNewRenameQueueFallbackSyncCommitSurvivesInterrupt(t *testing.T) {
-	testGVisorCompatPendingNewRenameSyncCommitInterrupt(t, true, false, true, gofuse.OK)
+	testGVisorCompatPendingNewRenameSyncCommitInterrupt(t, true, false, true, false, gofuse.OK)
 }
 
-func TestGVisorCompatDisabledPendingNewGitRenameSyncCommitRemainsInterruptible(t *testing.T) {
-	testGVisorCompatPendingNewRenameSyncCommitInterrupt(t, false, true, false, gofuse.EAGAIN)
+// Under interrupt-safe mutations (the default) a non-gVisor mount detaches
+// the pending-new rename sync commit too: the kernel waits uninterruptibly
+// for the rename reply while the commit makes the rename durable, so an
+// interrupt must not surface EAGAIN for a commit that was about to succeed.
+func TestInterruptSafePendingNewGitRenameSyncCommitSurvivesInterrupt(t *testing.T) {
+	testGVisorCompatPendingNewRenameSyncCommitInterrupt(t, false, true, false, false, gofuse.OK)
 }
 
-func testGVisorCompatPendingNewRenameSyncCommitInterrupt(t *testing.T, gvisorCompat, gitLooseObject, queueStopped bool, wantStatus gofuse.Status) {
+// --legacy-interruptible-mutations restores the historical contract where the
+// interrupt cancels the in-flight sync commit and rename surfaces EAGAIN.
+func TestLegacyInterruptiblePendingNewGitRenameSyncCommitSurfacesEAGAIN(t *testing.T) {
+	testGVisorCompatPendingNewRenameSyncCommitInterrupt(t, false, true, false, true, gofuse.EAGAIN)
+}
+
+func testGVisorCompatPendingNewRenameSyncCommitInterrupt(t *testing.T, gvisorCompat, gitLooseObject, queueStopped, legacy bool, wantStatus gofuse.Status) {
 	t.Helper()
 	oldP := "/repo/.git/objects/70/tmp_obj_interrupt"
 	newP := "/repo/.git/objects/70/24234d93f61104585962ac664bc5a7ed1d241d"
@@ -2850,7 +2860,7 @@ func testGVisorCompatPendingNewRenameSyncCommitInterrupt(t *testing.T, gvisorCom
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{GVisorCompat: gvisorCompat}
+	opts := &MountOptions{GVisorCompat: gvisorCompat, LegacyInterruptibleMutations: legacy}
 	opts.setDefaults()
 	c := newTestClient(ts.URL)
 	fs := NewDat9FS(c, opts)
@@ -2895,10 +2905,14 @@ func testGVisorCompatPendingNewRenameSyncCommitInterrupt(t *testing.T, gvisorCom
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for final-path PUT")
 	}
-	if gvisorCompat {
+	// The sync commit is detached from the FUSE cancel channel unless the
+	// mount opted into legacy interruptible mutations (gVisor compatibility
+	// also detaches, even with the legacy option).
+	commitDetached := gvisorCompat || !legacy
+	if commitDetached {
 		select {
 		case <-putCanceled:
-			// The final status assertion exposes an interruptible commit context.
+			t.Fatal("detached final-path PUT was canceled by the FUSE interrupt")
 		case <-time.After(100 * time.Millisecond):
 			closeAllow.Do(func() { close(allowPut) })
 		}
@@ -2920,7 +2934,7 @@ func testGVisorCompatPendingNewRenameSyncCommitInterrupt(t *testing.T, gvisorCom
 	if got := putCalls.Load(); got != 1 {
 		t.Fatalf("final-path PUTs = %d, want 1", got)
 	}
-	if gvisorCompat {
+	if wantStatus == gofuse.OK {
 		if pending.HasPending(newP) {
 			t.Fatal("final path remained pending after detached commit")
 		}

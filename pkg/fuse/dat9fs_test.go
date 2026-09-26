@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
@@ -9437,8 +9439,8 @@ func TestDat9FSClassifiesCodingAgentLocalPolicy(t *testing.T) {
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
 
-	if got := fs.observePathPolicy("/repo/.git/config"); got != PathLayerLocalOnly {
-		t.Fatalf(".git classification = %s, want local-only", got)
+	if got := fs.observePathPolicy("/repo/node_modules/pkg/index.js"); got != PathLayerLocalOnly {
+		t.Fatalf("node_modules classification = %s, want local-only", got)
 	}
 	if got := fs.observePathPolicy("/repo/src/main.go"); got != PathLayerRemotePersistent {
 		t.Fatalf("source classification = %s, want remote persistent", got)
@@ -9470,17 +9472,17 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
-	var gitOut gofuse.EntryOut
+	var libOut gofuse.EntryOut
 	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
 		InHeader: gofuse.InHeader{NodeId: repoIno},
 		Mode:     0o755,
-	}, ".git", &gitOut); st != gofuse.OK {
-		t.Fatalf("Mkdir .git: %v", st)
+	}, "node_modules", &libOut); st != gofuse.OK {
+		t.Fatalf("Mkdir node_modules: %v", st)
 	}
 
 	var createOut gofuse.CreateOut
 	if st := fs.Create(nil, &gofuse.CreateIn{
-		InHeader: gofuse.InHeader{NodeId: gitOut.NodeId},
+		InHeader: gofuse.InHeader{NodeId: libOut.NodeId},
 		Flags:    uint32(syscall.O_RDWR),
 		Mode:     0o644,
 	}, "config", &createOut); st != gofuse.OK {
@@ -9504,7 +9506,7 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 	}
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
 
-	localPath := localRoot + "/overlay/repo/.git/config"
+	localPath := localRoot + "/overlay/repo/node_modules/config"
 	gotFile, err := os.ReadFile(localPath)
 	if err != nil {
 		t.Fatalf("ReadFile local overlay: %v", err)
@@ -9514,7 +9516,7 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 	}
 
 	var lookupOut gofuse.EntryOut
-	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: gitOut.NodeId}, "config", &lookupOut); st != gofuse.OK {
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: libOut.NodeId}, "config", &lookupOut); st != gofuse.OK {
 		t.Fatalf("Lookup config: %v", st)
 	}
 	var openOut gofuse.OpenOut
@@ -9593,14 +9595,14 @@ func TestFsyncDirLocalOverlaySyncsDirectory(t *testing.T) {
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
 
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
-	var gitOut gofuse.EntryOut
+	var libOut gofuse.EntryOut
 	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
 		InHeader: gofuse.InHeader{NodeId: repoIno},
 		Mode:     0o755,
-	}, ".git", &gitOut); st != gofuse.OK {
-		t.Fatalf("Mkdir .git: %v", st)
+	}, "node_modules", &libOut); st != gofuse.OK {
+		t.Fatalf("Mkdir node_modules: %v", st)
 	}
-	fh := fs.dirHandles.Allocate(&DirHandle{Ino: gitOut.NodeId, Path: "/repo/.git"})
+	fh := fs.dirHandles.Allocate(&DirHandle{Ino: libOut.NodeId, Path: "/repo/node_modules"})
 
 	if st := fs.FsyncDir(nil, &gofuse.FsyncIn{Fh: fh}); st != gofuse.OK {
 		t.Fatalf("FsyncDir local overlay status = %v, want OK", st)
@@ -9889,7 +9891,14 @@ func TestCodingAgentLocalOverlayFlushSkipsSyncForGeneratedPath(t *testing.T) {
 	}
 }
 
+// TestCodingAgentLocalOverlayFlushSyncsGitState verifies that a writable
+// local-only `.git` state file is fsynced on Flush (unlike generated output,
+// see TestCodingAgentLocalOverlayFlushSkipsSyncForGeneratedPath). `.git` is
+// local-only inside a loaded Git workspace.
 func TestCodingAgentLocalOverlayFlushSyncsGitState(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
 	var syncCalls atomic.Int32
 	previousSync := syncOpenLocalFile
 	syncOpenLocalFile = func(file *os.File) error {
@@ -9900,29 +9909,39 @@ func TestCodingAgentLocalOverlayFlushSyncsGitState(t *testing.T) {
 		syncOpenLocalFile = previousSync
 	})
 
-	opts := &MountOptions{
-		Profile:   MountProfileCodingAgent,
-		LocalRoot: t.TempDir(),
-	}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	src := createGitRepoWithReadme(t, []byte("hello base\n"))
+	fixture := newGitWorkspaceFixture(t)
+	fixture.repoURL = src
+	fixture.headCommit = fuseGitOutputForTest(t, src, "rev-parse", "HEAD")
+	fixture.readmeObjectSHA = fuseGitOutputForTest(t, src, "hash-object", "README.md")
+	fixture.readmeSize = int64(len("hello base\n"))
 
+	localRoot := t.TempDir()
+	runFuseTestGit(t, "", "clone", "--no-checkout", src, filepath.Join(localRoot, "overlay", "repo"))
+
+	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+
+	if got := fs.observePathPolicy("/repo/.git/config"); got != PathLayerLocalOnly {
+		t.Fatalf(".git/config policy = %s, want local-only", got)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 	var gitOut gofuse.EntryOut
-	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
-		InHeader: gofuse.InHeader{NodeId: repoIno},
-		Mode:     0o755,
-	}, ".git", &gitOut); st != gofuse.OK {
-		t.Fatalf("Mkdir .git: %v", st)
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, ".git", &gitOut); st != gofuse.OK {
+		t.Fatalf("Lookup .git: %v", st)
 	}
 
 	var createOut gofuse.CreateOut
 	if st := fs.Create(nil, &gofuse.CreateIn{
 		InHeader: gofuse.InHeader{NodeId: gitOut.NodeId},
-		Flags:    uint32(syscall.O_RDWR),
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
 		Mode:     0o644,
-	}, "config", &createOut); st != gofuse.OK {
-		t.Fatalf("Create config: %v", st)
+	}, "config.local", &createOut); st != gofuse.OK {
+		t.Fatalf("Create .git/config.local: %v", st)
 	}
 	t.Cleanup(func() {
 		fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
@@ -9935,17 +9954,17 @@ func TestCodingAgentLocalOverlayFlushSyncsGitState(t *testing.T) {
 		Size:     uint32(len(content)),
 	}, content)
 	if st != gofuse.OK {
-		t.Fatalf("Write config: %v", st)
+		t.Fatalf("Write .git/config.local: %v", st)
 	}
 	if written != uint32(len(content)) {
 		t.Fatalf("Write bytes = %d, want %d", written, len(content))
 	}
 
 	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
-		t.Fatalf("Flush .git config status = %v, want OK", st)
+		t.Fatalf("Flush .git state status = %v, want OK", st)
 	}
 	if got := syncCalls.Load(); got != 1 {
-		t.Fatalf("Flush sync calls = %d, want 1", got)
+		t.Fatalf("Flush .git state sync calls = %d, want 1", got)
 	}
 }
 
@@ -9958,11 +9977,11 @@ func TestCodingAgentLocalOverlayCrossLayerRenameReturnsEXDEV(t *testing.T) {
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
 
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
-	gitIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
-	fs.inodes.Lookup("/repo/.git/config.lock", false, 4, time.Now())
+	libIno := fs.inodes.Lookup("/repo/node_modules", true, 0, time.Now())
+	fs.inodes.Lookup("/repo/node_modules/config.lock", false, 4, time.Now())
 
 	st := fs.Rename(nil, &gofuse.RenameIn{
-		InHeader: gofuse.InHeader{NodeId: gitIno},
+		InHeader: gofuse.InHeader{NodeId: libIno},
 		Newdir:   repoIno,
 	}, "config.lock", "config")
 	if st != gofuse.Status(syscall.EXDEV) {
@@ -9973,10 +9992,10 @@ func TestCodingAgentLocalOverlayCrossLayerRenameReturnsEXDEV(t *testing.T) {
 // TestRenameDirectoryMovesLocalOverlaySubtree verifies that renaming a
 // remote-classified directory also moves local-only descendants held in the
 // local overlay. Regression test for issue #934: the coding-agent profile
-// routes "**/dist/**" (and similar) to the local overlay, so a remote staging
-// directory can contain a local-only tree; a remote-only rename orphaned those
-// files at the stale path and the extracted package silently lost ~99% of its
-// files while rename(2) returned success.
+// routes "**/node_modules/**" (and similar) to the local overlay, so a remote
+// staging directory can contain a local-only tree; a remote-only rename
+// orphaned those files at the stale path and the extracted package silently
+// lost ~99% of its files while rename(2) returned success.
 func TestRenameDirectoryMovesLocalOverlaySubtree(t *testing.T) {
 	var renameCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -10056,11 +10075,11 @@ func TestCodingAgentLocalOverlayReadDirMergesRemoteAndLocalEntries(t *testing.T)
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
 
-	if err := os.MkdirAll(localRoot+"/overlay/repo/.git", 0o755); err != nil {
-		t.Fatalf("MkdirAll local .git: %v", err)
+	if err := os.MkdirAll(localRoot+"/overlay/repo/node_modules", 0o755); err != nil {
+		t.Fatalf("MkdirAll local node_modules: %v", err)
 	}
 	remote := []DirEntry{
-		{Name: ".git", Ino: 99, Mode: uint32(syscall.S_IFREG) | 0o644},
+		{Name: "node_modules", Ino: 99, Mode: uint32(syscall.S_IFREG) | 0o644},
 		{Name: "README.md", Ino: 100, Mode: uint32(syscall.S_IFREG) | 0o644},
 	}
 	entries, err := fs.mergeLocalDirEntries(context.Background(), "/repo", remote)
@@ -10071,11 +10090,15 @@ func TestCodingAgentLocalOverlayReadDirMergesRemoteAndLocalEntries(t *testing.T)
 	if len(entries) != 2 {
 		t.Fatalf("entry count = %d, want 2: %#v", len(entries), entries)
 	}
-	if entries[0].Name != ".git" || !entries[0].IsDir {
-		t.Fatalf("first entry = %#v, want local .git directory override", entries[0])
+	byName := make(map[string]DirEntry, len(entries))
+	for _, entry := range entries {
+		byName[entry.Name] = entry
 	}
-	if entries[1].Name != "README.md" {
-		t.Fatalf("second entry = %#v, want README.md", entries[1])
+	if entry, ok := byName["node_modules"]; !ok || !entry.IsDir {
+		t.Fatalf("node_modules entry = %#v (present=%t), want local directory override", entry, ok)
+	}
+	if _, ok := byName["README.md"]; !ok {
+		t.Fatalf("README.md missing from merged entries: %#v", entries)
 	}
 }
 
@@ -11379,7 +11402,7 @@ func TestReadCleanShadowBackedHandleRefreshesActiveStaleShadow(t *testing.T) {
 	})
 	defer cleanup()
 
-	shadow, err := NewShadowStore(t.TempDir())
+	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -11404,6 +11427,15 @@ func TestReadCleanShadowBackedHandleRefreshesActiveStaleShadow(t *testing.T) {
 	}
 	fh.Dirty.ClearDirty()
 	fhID := fs.allocateFileHandle(fh)
+
+	var earlyReader gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &earlyReader); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	defer fs.Release(nil, &gofuse.ReleaseIn{Fh: earlyReader.Fh})
 
 	fs.inodes.UpdateSize(ino, int64(len(fresh)))
 	fs.recordCommittedRevision(filePath, 2)
@@ -11438,15 +11470,12 @@ func TestReadCleanShadowBackedHandleRefreshesActiveStaleShadow(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("read-only Open status = %v, want OK", st)
 	}
-	got, st, err = readDat9FSTestRange(fs, ino, roOut.Fh, 0, len(fresh))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st != gofuse.OK {
-		t.Fatalf("read-only Read status = %v, want OK", st)
-	}
-	if !bytes.Equal(got, fresh) {
-		t.Fatalf("read-only handle pinned stale active shadow: got %q want %q", got, fresh)
+	defer fs.Release(nil, &gofuse.ReleaseIn{Fh: roOut.Fh})
+	for _, id := range []uint64{earlyReader.Fh, roOut.Fh} {
+		got, st, err = readDat9FSTestRange(fs, ino, id, 0, len(fresh))
+		if err != nil || st != gofuse.OK || !bytes.Equal(got, fresh) {
+			t.Fatalf("read-only handle %d used stale active shadow: got %q/%v/%v want %q", id, got, st, err, fresh)
+		}
 	}
 }
 
@@ -17522,7 +17551,7 @@ func TestSyncHandleShadowSpillConcurrentWritePreservesDirtyState(t *testing.T) {
 	flushDone := make(chan gofuse.Status, 1)
 	go func() {
 		fh.Lock()
-		st := fs.syncHandleToRemoteLocked(context.Background(), fh)
+		st := fs.syncHandleToRemoteLocked(context.Background(), fh, shadowUploadLocalDurable)
 		fh.Unlock()
 		flushDone <- st
 	}()
@@ -21979,15 +22008,38 @@ func TestFlushLargeFile_StrictUploadsBeforeReturning(t *testing.T) {
 	}
 }
 
-// TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex verifies that in
-// interactive mode the same close→drop→open sequence is served from the local
-// shadow + pendingIndex, without blocking Flush on a network upload. The
-// CommitQueue takes over the actual server write asynchronously.
+// TestFlushLargeFile_StagesShadowAndPendingIndex verifies that a large-file
+// close is served from the local shadow + pendingIndex — without blocking
+// Flush on a network upload, with the CommitQueue taking over the actual
+// server write asynchronously — for every write-back durability tier.
+//
+// The fsync tier (SyncStrict) is the regression this guards: its close path
+// used to gate large-file staging on SyncInteractive, so `--durability=fsync`
+// mounts uploaded the whole file inside Flush and close(2) blocked for the
+// full transfer (issue #971). The fsync tier's durability contract is
+// fsync(2), not close(2), exactly as for the small-file path (#964).
 //
 // We assert two invariants:
 //  1. Flush returns quickly without contacting the upload endpoints.
 //  2. A subsequent Lookup hits pendingIndex (no remote stat needed).
-func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
+func TestFlushLargeFile_StagesShadowAndPendingIndex(t *testing.T) {
+	cases := []struct {
+		name     string
+		syncMode SyncMode
+		policy   WritePolicy
+	}{
+		{"interactive-writeback", SyncInteractive, WritePolicyWriteBack},
+		// Issue #971: strict + writeback is the --durability=fsync mount.
+		{"strict-writeback", SyncStrict, WritePolicyWriteBack},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			testFlushLargeFileStages(t, tc.syncMode, tc.policy)
+		})
+	}
+}
+
+func testFlushLargeFileStages(t *testing.T, syncMode SyncMode, policy WritePolicy) {
 	const fileSize = int64(writeBackThreshold) // 10 MiB
 
 	var uploadAttempted atomic.Bool
@@ -22014,7 +22066,8 @@ func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
 	opts.setDefaults()
 	c := newTestClient(ts.URL)
 	fs := NewDat9FS(c, opts)
-	fs.syncMode = SyncInteractive
+	fs.syncMode = syncMode
+	fs.opts.WritePolicy = policy
 
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
@@ -22037,7 +22090,7 @@ func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
 	st := fs.Create(nil, &gofuse.CreateIn{
 		InHeader: gofuse.InHeader{NodeId: 1},
 		Flags:    uint32(syscall.O_RDWR),
-	}, "interactive.bin", &createOut)
+	}, "staged.bin", &createOut)
 	if st != gofuse.OK {
 		t.Fatalf("Create: %v", st)
 	}
@@ -22066,19 +22119,19 @@ func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
 	if st != gofuse.OK {
 		t.Fatalf("Flush: %v", st)
 	}
-	// Interactive Flush should be local-only — no upload initiate during Flush.
+	// A write-back Flush must be local-only — no upload initiate during Flush.
 	if uploadAttempted.Load() {
-		t.Fatal("interactive Flush hit upload endpoints — expected stage-only fast path")
+		t.Fatal("Flush hit upload endpoints — expected stage-only fast path")
 	}
 	// Sanity: even on slow CI a 10 MiB shadow stage should be well under 5s.
 	if flushDur > 5*time.Second {
-		t.Fatalf("interactive Flush took %v — should be local fsync only", flushDur)
+		t.Fatalf("Flush took %v — should be local staging only", flushDur)
 	}
 
 	// pendingIndex must contain the file with the correct size.
-	meta, ok := pending.GetMeta("/interactive.bin")
+	meta, ok := pending.GetMeta("/staged.bin")
 	if !ok {
-		t.Fatal("pendingIndex missing entry after interactive Flush — Lookup will ENOENT")
+		t.Fatal("pendingIndex missing entry after Flush — Lookup will ENOENT")
 	}
 	if meta.Size != fileSize {
 		t.Fatalf("pendingIndex size = %d, want %d", meta.Size, fileSize)
@@ -22086,13 +22139,57 @@ func TestFlushLargeFile_InteractiveStagesShadowAndPendingIndex(t *testing.T) {
 
 	// Lookup must hit the in-memory overlay without remote stat.
 	var entryOut gofuse.EntryOut
-	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "interactive.bin", &entryOut)
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "staged.bin", &entryOut)
 	if st != gofuse.OK {
 		t.Fatalf("Lookup: %v, want OK", st)
 	}
 	if entryOut.Size != uint64(fileSize) {
 		t.Fatalf("Lookup size = %d, want %d", entryOut.Size, fileSize)
 	}
+}
+
+// TestStageLargeAtCloseEnabledPolicyMatrix pins the close-staging decision to
+// the write policy rather than the sync mode (issue #971). The handle policy
+// is checked in addition to the mount policy because an O_SYNC open upgrades a
+// single handle to write-sync on an otherwise write-back mount; that handle
+// must keep its synchronous close even when it still holds dirty bytes from a
+// failed write.
+func TestStageLargeAtCloseEnabledPolicyMatrix(t *testing.T) {
+	cases := []struct {
+		name         string
+		mountPolicy  WritePolicy
+		handlePolicy WritePolicy
+		want         bool
+	}{
+		{"writeback-mount-writeback-handle", WritePolicyWriteBack, WritePolicyWriteBack, true},
+		{"writeback-mount-empty-handle-inherits", WritePolicyWriteBack, "", true},
+		{"writeback-mount-write-sync-handle", WritePolicyWriteBack, WritePolicyWriteSync, false},
+		{"writeback-mount-close-sync-handle", WritePolicyWriteBack, WritePolicyCloseSync, false},
+		{"close-sync-mount", WritePolicyCloseSync, WritePolicyCloseSync, false},
+		{"write-sync-mount", WritePolicyWriteSync, WritePolicyWriteSync, false},
+		{"empty-mount-policy-defaults-writeback", "", WritePolicyWriteBack, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := &MountOptions{WritePolicy: tc.mountPolicy}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+			fh := &FileHandle{WritePolicy: tc.handlePolicy}
+			if got := fs.stageLargeAtCloseEnabled(fh); got != tc.want {
+				t.Fatalf("stageLargeAtCloseEnabled(mount=%q, handle=%q) = %t, want %t",
+					tc.mountPolicy, tc.handlePolicy, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("nil-handle", func(t *testing.T) {
+		opts := &MountOptions{WritePolicy: WritePolicyWriteBack}
+		opts.setDefaults()
+		fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+		if fs.stageLargeAtCloseEnabled(nil) {
+			t.Fatal("nil handle must not be staged")
+		}
+	})
 }
 
 func TestRenamePendingNewCommitSyncCommitsGitLooseObjectFinalPath(t *testing.T) {
@@ -22312,6 +22409,10 @@ func TestRenamePendingNewCommitGitLooseObjectSyncFailureKeepsRecoverableShadow(t
 	fs2 := NewDat9FS(c, opts)
 	fs2.shadowStore = shadow2
 	fs2.pendingIndex = pending2
+	// Complete the pending-shadow binding performed by mount recovery before
+	// serving reads; loading metadata alone does not verify disk bytes.
+	pending2.setShadowStore(shadow2)
+	pending2.recoverShadowSource(newP, pending2.Generation(newP), shadow2)
 	dirIno2 := fs2.inodes.Lookup("/repo/.git/objects/7e", true, 0, time.Now())
 	var entryOut gofuse.EntryOut
 	st = fs2.Lookup(nil, &gofuse.InHeader{NodeId: dirIno2}, finalName, &entryOut)
@@ -22560,6 +22661,10 @@ func testRenamePendingNewCommitDurablePolicyFailureReturnsErrorAndKeepsShadow(t 
 	fs2 := NewDat9FS(newTestClient(ts.URL), opts)
 	fs2.shadowStore = shadow2
 	fs2.pendingIndex = pending2
+	// Complete the pending-shadow binding performed by mount recovery before
+	// serving reads; loading metadata alone does not verify disk bytes.
+	pending2.setShadowStore(shadow2)
+	pending2.recoverShadowSource(newP, pending2.Generation(newP), shadow2)
 	dirIno2 := fs2.inodes.Lookup("/app", true, 0, time.Now())
 	var entryOut gofuse.EntryOut
 	st = fs2.Lookup(nil, &gofuse.InHeader{NodeId: dirIno2}, finalName, &entryOut)

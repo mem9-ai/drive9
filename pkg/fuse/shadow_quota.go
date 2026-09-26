@@ -161,6 +161,7 @@ func (s *ShadowStore) recordWrite(remotePath string, sf *ShadowFile, offset int6
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	sf.establishProvenance(baseRev, sf.size == 0 || (offset == 0 && int64(n) >= sf.size))
 	added := sf.written.addedBytes(offset, int64(n))
 	sf.written.add(offset, int64(n))
 	sf.writtenBytes += added
@@ -168,9 +169,6 @@ func (s *ShadowStore) recordWrite(remotePath string, sf *ShadowFile, offset int6
 	newSize := max(sf.size, offset+int64(n))
 	s.pendingBytes.Add(newSize - sf.size)
 	sf.size = newSize
-	if baseRev != 0 {
-		sf.baseRev = baseRev
-	}
 	s.bumpWriteGenLocked(remotePath)
 }
 

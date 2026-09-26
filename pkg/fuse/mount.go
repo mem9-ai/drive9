@@ -35,63 +35,70 @@ import (
 // its entire lifetime (Invariant #3). To change credentials, umount and
 // remount; there is no in-process rebind.
 type MountOptions struct {
-	Server                       string        // drive9 server URL
-	APIKey                       string        // owner API key (mutually exclusive with Token)
-	Token                        string        // delegated capability JWT (mutually exclusive with APIKey)
-	MountPoint                   string        // local mount point
-	RemoteRoot                   string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
-	CacheDir                     string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
-	CacheSize                    int64         // ReadCache max size in bytes (default 128MB)
-	ReadCacheMaxFileBytes        int64         // largest single file admitted to ReadCache and fetched whole-file in one request (default 4MiB)
-	ReadCacheTTL                 time.Duration // ReadCache TTL (default 30s; negative disables time-based expiry)
-	DiskReadCacheSize            int64         // disk-backed read cache max size in bytes (default 1GiB)
-	DiskReadCacheFreeRatio       float64       // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
-	DirTTL                       time.Duration // DirCache TTL (default 10s; coding-agent 30s)
-	AttrTTL                      time.Duration // kernel attr cache TTL (default 60s; coding-agent 5m)
-	EntryTTL                     time.Duration // kernel entry cache TTL (default 60s; coding-agent 5m)
-	NegativeEntryTTL             time.Duration // kernel negative entry cache TTL (default 1s)
-	FlushDebounce                time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
-	SyncMode                     SyncMode      // interactive, strict, or auto (default auto)
-	WritePolicy                  WritePolicy   // writeback, close-sync, or write-sync (default writeback)
-	Profile                      string        // mount profile: "interactive", "coding-agent", "none", or a custom profile name
-	LayerRef                     string        // optional writable fs layer ref (layer_id, name, or tag ref)
-	CheckpointRef                string        // optional checkpoint ref to restore as the layer view baseline
-	LocalRoot                    string        // local-only overlay root for overlay-profile mounts
-	LocalOnlyPatterns            []string      // additional local-only path patterns for overlay-profile mounts
-	RemoteOnlyPatterns           []string      // remote-persistent override path patterns for overlay-profile mounts
-	AppendLogPatterns            []string      // remote-persistent files eligible for append-log synchronization
-	PackPaths                    []string      // local overlay paths auto-packed after unmount
-	ExtentPaths                  []string      // path globs created as content_layout=extent
-	CommitQueueMaxPending        int           // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
-	WriteBackBatchWindow         time.Duration // writeback-only small-file batch window (default 0 disabled)
-	WriteBackBatchMaxFiles       int           // maximum files in one writeback batch (default 64 when enabled)
-	WriteBackBatchMaxBytes       int64         // maximum bytes in one writeback batch (default 4MiB when enabled)
-	WriteCacheFreeRatio          float64       // minimum free-space ratio on cache-dir partition before write-back refuses writes (default 0.10); negative disables
-	WriteCacheSizeMB             int64         // current-process shadow data quota in MiB (default 1024); negative disables
-	UploadConcurrency            int           // number of background upload workers (default 4)
-	ReadConcurrency              int           // maximum concurrent backend reads issued by FUSE (default 24)
-	ParallelReadConcurrency      int           // maximum concurrent block reads for one large FUSE read (default 4)
-	ParallelReadBlockSize        int64         // block size for parallel large-file reads in bytes (default 1MiB)
-	SyncRead                     bool          // disable kernel async read dispatch; at most one read in flight per file handle
-	DirectMountStrict            bool          // Linux only: mount with mount(2) and do not fall back to fusermount
-	GVisorCompat                 bool          // enable gVisor-specific FUSE compatibility behavior
-	LegacyInterruptibleMutations bool          // restore legacy behavior where a FUSE interrupt cancels the in-flight remote commit of idempotent namespace mutations (default false: commits run detached and finish once started)
-	LookupRetryCount             int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
-	LookupRetryTimeout           time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
-	LegacyDirStatFallback        bool          // on Lookup stat 404, list parent to support legacy servers without directory stat
-	ReadDirPrefetch              bool          // prefetch small files after readdir into ReadCache (default false)
-	PrefetchMaxFiles             int           // maximum files prefetched per directory read (default 32 when enabled)
-	PrefetchMaxFileBytes         int64         // maximum individual file size prefetched (default 50KB)
-	PrefetchMaxBytes             int64         // maximum aggregate bytes prefetched per directory read (default 1MB)
-	PrefetchTimeout              time.Duration // timeout for one readdir prefetch batch (default 1s)
-	DirCacheMaxEntries           int           // maximum entries per directory in DirCache (default 200000); directories exceeding this limit are not cached as complete
-	TrustLocalEvents             bool          // allow revision-bound GetAttr hits from DirCache using process-local SSE freshness; safe only for single-server/sticky or cluster-wide event streams
-	AllowOther                   bool          // allow other users to access mount
-	ReadOnly                     bool          // mount as read-only
-	Debug                        bool          // enable FUSE debug logging
-	PerfCounters                 bool          // print low-overhead FUSE perf counter summary on shutdown
-	EnableGitWorkspaces          bool          // enable fast-clone git workspace overlay discovery
-	Profiling                    ProfilingOptions
+	Server                      string        // drive9 server URL
+	APIKey                      string        // owner API key (mutually exclusive with Token)
+	Token                       string        // delegated capability JWT (mutually exclusive with APIKey)
+	MountPoint                  string        // local mount point
+	RemoteRoot                  string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
+	CacheDir                    string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
+	CacheSize                   int64         // ReadCache max size in bytes (default 128MB)
+	ReadCacheMaxFileBytes       int64         // largest single file admitted to ReadCache and fetched whole-file in one request (default 4MiB)
+	ReadCacheTTL                time.Duration // ReadCache TTL (default 30s; negative disables time-based expiry)
+	DiskReadCacheSize           int64         // disk-backed read cache max size in bytes (default 1GiB)
+	DiskReadCacheFreeRatio      float64       // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
+	DirTTL                      time.Duration // DirCache TTL (default 10s; coding-agent 30s)
+	AttrTTL                     time.Duration // kernel attr cache TTL (default 60s; coding-agent 5m)
+	EntryTTL                    time.Duration // kernel entry cache TTL (default 60s; coding-agent 5m)
+	NegativeEntryTTL            time.Duration // kernel negative entry cache TTL (default 1s)
+	FlushDebounce               time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
+	SyncMode                    SyncMode      // interactive, strict, or auto (default auto)
+	WritePolicy                 WritePolicy   // writeback, close-sync, or write-sync (default writeback)
+	Profile                     string        // mount profile: "interactive", "coding-agent", "none", or a custom profile name
+	LayerRef                    string        // optional writable fs layer ref (layer_id, name, or tag ref)
+	CheckpointRef               string        // optional checkpoint ref to restore as the layer view baseline
+	LocalRoot                   string        // local-only overlay root for overlay-profile mounts
+	LocalOnlyPatterns           []string      // local-only path patterns overlaid unconditionally for overlay-profile mounts
+	LocalGitignoreAwarePatterns []string      // local-only path patterns overlaid only when the repository's Git ignore rules also ignore them
+	RemoteOnlyPatterns          []string      // remote-persistent override path patterns for overlay-profile mounts
+	// DisableBuiltinOverlayDefaults stops the built-in local-only defaults for
+	// Profile from being added on top of the given patterns. The CLI resolves
+	// the effective (builtin or custom) profile itself and sets this, so a
+	// custom profile that reuses a builtin name is not silently merged with the
+	// builtins. Direct library callers leave it false and keep the defaults.
+	DisableBuiltinOverlayDefaults bool
+	AppendLogPatterns             []string      // remote-persistent files eligible for append-log synchronization
+	PackPaths                     []string      // local overlay paths auto-packed after unmount
+	ExtentPaths                   []string      // path globs created as content_layout=extent
+	CommitQueueMaxPending         int           // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
+	WriteBackBatchWindow          time.Duration // writeback-only small-file batch window (default 0 disabled)
+	WriteBackBatchMaxFiles        int           // maximum files in one writeback batch (default 64 when enabled)
+	WriteBackBatchMaxBytes        int64         // maximum bytes in one writeback batch (default 4MiB when enabled)
+	WriteCacheFreeRatio           float64       // minimum free-space ratio on cache-dir partition before write-back refuses writes (default 0.10); negative disables
+	WriteCacheSizeMB              int64         // current-process shadow data quota in MiB (default 1024); negative disables
+	UploadConcurrency             int           // number of background upload workers (default 4)
+	ReadConcurrency               int           // maximum concurrent backend reads issued by FUSE (default 24)
+	ParallelReadConcurrency       int           // maximum concurrent block reads for one large FUSE read (default 4)
+	ParallelReadBlockSize         int64         // block size for parallel large-file reads in bytes (default 1MiB)
+	SyncRead                      bool          // disable kernel async read dispatch; at most one read in flight per file handle
+	DirectMountStrict             bool          // Linux only: mount with mount(2) and do not fall back to fusermount
+	GVisorCompat                  bool          // enable gVisor-specific FUSE compatibility behavior
+	LegacyInterruptibleMutations  bool          // restore legacy behavior where a FUSE interrupt cancels in-flight remote commits — idempotent namespace mutations AND synchronous data commits (write-sync writes, close-sync/fsync/release flushes and releases, git checkpoint flushes); default false: commits run detached and finish once started, and unmount waits for them up to their request deadlines (data commits: up to the 15min releaseTimeout); --gvisor-compat takes precedence and always keeps commits detached
+	LookupRetryCount              int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
+	LookupRetryTimeout            time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
+	LegacyDirStatFallback         bool          // on Lookup stat 404, list parent to support legacy servers without directory stat
+	ReadDirPrefetch               bool          // prefetch small files after readdir into ReadCache (default false)
+	PrefetchMaxFiles              int           // maximum files prefetched per directory read (default 32 when enabled)
+	PrefetchMaxFileBytes          int64         // maximum individual file size prefetched (default 50KB)
+	PrefetchMaxBytes              int64         // maximum aggregate bytes prefetched per directory read (default 1MB)
+	PrefetchTimeout               time.Duration // timeout for one readdir prefetch batch (default 1s)
+	DirCacheMaxEntries            int           // maximum entries per directory in DirCache (default 200000); directories exceeding this limit are not cached as complete
+	TrustLocalEvents              bool          // allow revision-bound GetAttr hits from DirCache using process-local SSE freshness; safe only for single-server/sticky or cluster-wide event streams
+	AllowOther                    bool          // allow other users to access mount
+	ReadOnly                      bool          // mount as read-only
+	Debug                         bool          // enable FUSE debug logging
+	PerfCounters                  bool          // print low-overhead FUSE perf counter summary on shutdown
+	EnableGitWorkspaces           bool          // enable fast-clone git workspace overlay discovery
+	Profiling                     ProfilingOptions
 	// WritebackLazyStaging switches write-back close staging from fsynced
 	// local writes (power-loss safe) to plain writes (issue #964): staged
 	// data lands in the kernel page cache of the cache volume — ext4's
@@ -519,6 +526,8 @@ func Mount(opts *MountOptions) (err error) {
 				dat9fs.shadowStore = shadowStore
 			}
 
+			pendingIdx.setShadowStore(shadowStore)
+
 			// Initialize Journal WAL.
 			journalPath := filepath.Join(cacheBase, mountHash, "journal.wal")
 			journal, err := NewJournal(journalPath)
@@ -542,7 +551,8 @@ func Mount(opts *MountOptions) (err error) {
 				// Replay journal for crash recovery. Preserve the original kind
 				// and base revision so CommitQueue.RecoverPending can re-enqueue.
 				if err := replayJournalIntoPending(journal, pendingIdx, shadowStore); err != nil {
-					fmt.Fprintf(os.Stderr, "drive9: journal replay: %v\n", err)
+					closeFailedMountStaging(dat9fs)
+					return fmt.Errorf("mount: journal replay: %w", err)
 				}
 				// Drop frames already covered by commit markers so the WAL does
 				// not grow unboundedly across mounts. Safe here: mount init is
@@ -562,14 +572,9 @@ func Mount(opts *MountOptions) (err error) {
 
 			// Migrate legacy writeBack entries to shadow store so
 			// CommitQueue.RecoverPending sees them and doesn't prune.
-			if wbCache != nil && shadowStore != nil {
-				for _, pe := range wbCache.ListPending() {
-					if !shadowStore.Has(pe.Meta.Path) {
-						if err := shadowStore.WriteFull(pe.Meta.Path, pe.Data, pe.Meta.BaseRev); err != nil {
-							safeStderrPrintf("drive9: migrate legacy entry %s to shadow: %v\n", pe.Meta.Path, err)
-						}
-					}
-				}
+			if err := migrateLegacyWriteBack(shadowStore, wbCache, pendingIdx); err != nil {
+				closeFailedMountStaging(dat9fs)
+				return fmt.Errorf("mount: %w", err)
 			}
 
 			// Initialize CommitQueue for background remote commits.
@@ -579,6 +584,7 @@ func Mount(opts *MountOptions) (err error) {
 					cqMaxPending = opts.CommitQueueMaxPending
 				}
 				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, cqMaxPending, opts.RemoteRoot)
+				dat9fs.commitQueue = cq
 				cq.SetLayerRef(opts.LayerRef)
 				cq.SetPerfCounters(dat9fs.perf)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
@@ -593,26 +599,16 @@ func Mount(opts *MountOptions) (err error) {
 					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
 				}
 				cq.RecoverPending()
-				shadowStore.RecoverPendingBytes()
 				if opts.LayerRef != "" {
 					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
+						closeFailedMountStaging(dat9fs)
 						return fmt.Errorf("mount: restore fs layer entries: %w", err)
 					}
 					layerEventWatcherStop = StartLayerEventWatcher(dat9fs, c, opts, shadowStore, pendingIdx)
 				}
-				dat9fs.commitQueue = cq
 			}
 			if gvisorWriteBackRequiresCommitQueue(opts, wbCache, dat9fs.commitQueue) {
-				if journal != nil {
-					if dat9fs.journalSyncerCancel != nil {
-						dat9fs.journalSyncerCancel()
-					}
-					_ = journal.FsyncShared()
-					_ = journal.Close()
-				}
-				if shadowStore != nil {
-					shadowStore.Close()
-				}
+				closeFailedMountStaging(dat9fs)
 				return errors.New("mount: gvisor compat write-back requires pending index and shadow store")
 			}
 
@@ -649,7 +645,9 @@ func Mount(opts *MountOptions) (err error) {
 		}
 		dat9fs.pendingIndex = pendingIdx
 		dat9fs.shadowStore = shadowStore
+		pendingIdx.setShadowStore(shadowStore)
 		if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
+			closeFailedMountStaging(dat9fs)
 			return fmt.Errorf("mount: restore fs layer entries: %w", err)
 		}
 	}
@@ -1336,7 +1334,8 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	if opts.WriteBackBatchWindow > 0 && opts.WritePolicy != WritePolicyWriteBack {
 		return fmt.Errorf("mount: WriteBackBatchWindow requires writeback policy")
 	}
-	hasOverlayOptions := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0 || len(opts.PackPaths) > 0
+	hasOverlayOptions := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 ||
+		len(opts.LocalGitignoreAwarePatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0 || len(opts.PackPaths) > 0
 	if !profileAllowsLocalPolicy(opts.Profile) {
 		if hasOverlayOptions {
 			return fmt.Errorf("mount: overlay options require an overlay profile")
@@ -1349,7 +1348,7 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	if !filepath.IsAbs(opts.LocalRoot) {
 		return fmt.Errorf("mount: LocalRoot must be an absolute path")
 	}
-	if err := validateLocalPolicyPatterns(opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns); err != nil {
+	if err := validateLocalPolicyPatterns(opts.LocalOnlyPatterns, opts.LocalGitignoreAwarePatterns, opts.RemoteOnlyPatterns); err != nil {
 		return fmt.Errorf("mount: %w", err)
 	}
 	return nil
@@ -1708,4 +1707,55 @@ func generateMountID() string {
 		return fmt.Sprintf("mount-%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// migrateLegacyWriteBack runs before pending recovery binds shadow sources.
+// An existing shadow may be newer than a best-effort .dat snapshot, even when
+// the surviving .meta belongs to that older snapshot. Repair a missing or short
+// shadow only from the snapshot selected by recovery; preserve complete shadows
+// and never substitute an older snapshot for a selected newer WAL publication.
+func migrateLegacyWriteBack(shadows *ShadowStore, cache *WriteBackCache, pending *PendingIndex) error {
+	if shadows == nil || cache == nil {
+		return nil
+	}
+	for _, entry := range cache.ListPending() {
+		if size, ok := shadows.ContentSize(entry.Meta.Path); ok && size >= entry.Meta.Size {
+			continue
+		}
+		if entry.Meta.ShadowSpill {
+			continue // this metadata explicitly owns the shadow payload
+		}
+		if pending != nil {
+			if current, ok := pending.GetMeta(entry.Meta.Path); ok &&
+				(current.Generation != entry.Meta.Generation || !current.Mtime.Equal(entry.Meta.Mtime)) {
+				continue // WAL replay selected a different pending publication
+			}
+		}
+		if int64(len(entry.Data)) < entry.Meta.Size {
+			continue // an incomplete snapshot cannot repair another payload
+		}
+		if err := shadows.WriteFull(entry.Meta.Path, entry.Data, entry.Meta.BaseRev); err != nil {
+			return fmt.Errorf("migrate legacy entry %s to shadow: %w", entry.Meta.Path, err)
+		}
+	}
+	return nil
+}
+
+// closeFailedMountStaging releases staging resources when initialization fails
+// before a mount takes ownership. Workers may still use staging during failed
+// layer restore, so drain them before closing the journal and shadow descriptors.
+func closeFailedMountStaging(fs *Dat9FS) {
+	if fs.journalSyncerCancel != nil {
+		fs.journalSyncerCancel()
+	}
+	if fs.commitQueue != nil {
+		fs.commitQueue.DrainAll()
+	}
+	if fs.journal != nil {
+		_ = fs.journal.FsyncShared()
+		_ = fs.journal.Close()
+	}
+	if fs.shadowStore != nil {
+		fs.shadowStore.Close()
+	}
 }

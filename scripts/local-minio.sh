@@ -20,6 +20,10 @@
 #   DRIVE9_MINIO_BUCKET        (default drive9-local)
 #   DRIVE9_MINIO_CONTAINER     (default drive9-local-minio)
 #   DRIVE9_MINIO_IMAGE         (default minio/minio:RELEASE.2024-12-18T13-15-44Z)
+#   DRIVE9_MINIO_FALLBACK_IMAGE (default cgr.dev/chainguard/minio:latest; empty
+#                               disables the fallback — the minio/minio image
+#                               no longer exists upstream, so the default
+#                               chain is the primary pull source)
 #   DRIVE9_S3_ENDPOINT         advertised endpoint (presign / clients; e.g. Orb)
 #
 # Compatible with macOS bash 3.2.
@@ -33,8 +37,55 @@ SECRET_KEY="${DRIVE9_MINIO_PASSWORD:-drive9minio}"
 BUCKET="${DRIVE9_MINIO_BUCKET:-drive9-local}"
 CONTAINER="${DRIVE9_MINIO_CONTAINER:-drive9-local-minio}"
 IMAGE="${DRIVE9_MINIO_IMAGE:-minio/minio:RELEASE.2024-12-18T13-15-44Z}"
+FALLBACK_IMAGE="${DRIVE9_MINIO_FALLBACK_IMAGE-cgr.dev/chainguard/minio:latest}"
 PID_FILE="${DRIVE9_MINIO_PID_FILE:-${TMPDIR:-/tmp}/drive9-local-minio.pid}"
 DATA_DIR="${DRIVE9_MINIO_DATA_DIR:-${TMPDIR:-/tmp}/drive9-local-minio-data}"
+
+MINIO_IMAGE_CANDIDATES="$IMAGE"
+if [ -n "$FALLBACK_IMAGE" ] && [ "$FALLBACK_IMAGE" != "$IMAGE" ]; then
+  MINIO_IMAGE_CANDIDATES="$MINIO_IMAGE_CANDIDATES $FALLBACK_IMAGE"
+fi
+# Seconds to wait for one candidate's health endpoint; overridable for
+# hermetic tests (a candidate only holds the loop this long when something
+# answers slowly — a refused connection fails immediately).
+MINIO_HEALTH_TIMEOUT_S="${MINIO_HEALTH_TIMEOUT_S:-40}"
+# Per-probe bounds. Without them a server that accepts TCP but never answers
+# the health request would stall `curl` past any deadline: the overall
+# --max-time is what makes MINIO_HEALTH_TIMEOUT_S effective.
+MINIO_HEALTH_CONNECT_TIMEOUT_S="${MINIO_HEALTH_CONNECT_TIMEOUT_S:-2}"
+# Cap for one-shot probes (reuse checks, status). Retry loops pass their
+# remaining budget explicitly instead of using this default.
+MINIO_HEALTH_PROBE_TIMEOUT_S="${MINIO_HEALTH_PROBE_TIMEOUT_S:-5}"
+# curl treats --max-time 0 as "no limit", so every knob must be a positive
+# integer or the bounded-probe contract silently breaks. Invalid values fall
+# back to the defaults instead.
+positive_int() {
+  case "${1:-}" in
+    '' | *[!0-9]*) return 1 ;;
+    *) [ "$1" -ge 1 ] ;;
+  esac
+}
+while :; do
+  if positive_int "$MINIO_HEALTH_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_TIMEOUT_S='$MINIO_HEALTH_TIMEOUT_S' is not a positive integer; using 40" >&2
+    MINIO_HEALTH_TIMEOUT_S=40
+  fi
+  if positive_int "$MINIO_HEALTH_CONNECT_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_CONNECT_TIMEOUT_S='$MINIO_HEALTH_CONNECT_TIMEOUT_S' is not a positive integer; using 2" >&2
+    MINIO_HEALTH_CONNECT_TIMEOUT_S=2
+  fi
+  if positive_int "$MINIO_HEALTH_PROBE_TIMEOUT_S"; then
+    :
+  else
+    echo "warning: MINIO_HEALTH_PROBE_TIMEOUT_S='$MINIO_HEALTH_PROBE_TIMEOUT_S' is not a positive integer; using 5" >&2
+    MINIO_HEALTH_PROBE_TIMEOUT_S=5
+  fi
+  break
+done
 
 HEALTH_HOST="$BIND"
 if [ "$BIND" = "0.0.0.0" ] || [ "$BIND" = "::" ] || [ "$BIND" = "[::]" ]; then
@@ -50,7 +101,13 @@ shell_quote() {
 }
 
 url_healthy() {
-  curl -sf "$1/minio/health/live" >/dev/null 2>&1
+  # Bounded probe: connect-timeout covers a black-holed peer, and --max-time
+  # (default: the full health budget) covers a server that accepts TCP but
+  # stalls the HTTP response. $2 overrides the cap for callers with a running
+  # deadline (wait_healthy passes the seconds it has left).
+  local url="$1"
+  local max_time="${2:-$MINIO_HEALTH_PROBE_TIMEOUT_S}"
+  curl -sf --connect-timeout "$MINIO_HEALTH_CONNECT_TIMEOUT_S" --max-time "$max_time" "$url/minio/health/live" >/dev/null 2>&1
 }
 
 candidate_runtimes() {
@@ -133,13 +190,15 @@ PY
 
 wait_healthy() {
   local url="$1"
-  local deadline=$(($(date +%s) + 40))
+  local deadline=$(($(date +%s) + MINIO_HEALTH_TIMEOUT_S))
+  local remaining
   while :; do
-    if url_healthy "$url"; then
-      return 0
-    fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
+    remaining=$((deadline - $(date +%s)))
+    if [ "$remaining" -le 0 ]; then
       return 1
+    fi
+    if url_healthy "$url" "$remaining"; then
+      return 0
     fi
     sleep 0.3
   done
@@ -157,18 +216,39 @@ print_env() {
 
 start_container() {
   local runtime="$1"
-  if "$runtime" inspect "$CONTAINER" >/dev/null 2>&1; then
-    if [ "$("$runtime" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]; then
+  # A candidate is accepted only when its container actually turns healthy:
+  # `run -d` succeeding says nothing about the server inside (entrypoint or
+  # platform mismatches exit right after start). An unhealthy candidate is
+  # logged, removed, and replaced by the next one; the caller falls back to
+  # the binary only after every candidate failed this way. This also applies
+  # to a pre-existing same-name container that is not healthy.
+  local image
+  for image in $MINIO_IMAGE_CANDIDATES; do
+    if "$runtime" inspect "$CONTAINER" >/dev/null 2>&1; then
+      if [ "$("$runtime" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]; then
+        "$runtime" start "$CONTAINER" >/dev/null 2>&1 || true
+      fi
+      if wait_healthy "$HEALTH_URL"; then
+        return 0
+      fi
+      echo "MinIO container ($image via $runtime) is not healthy; removing and trying the next candidate" >&2
+      "$runtime" logs "$CONTAINER" 2>&1 | tail -5 >&2 || true
+      "$runtime" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+      continue
+    fi
+    if "$runtime" run -d --name "$CONTAINER" \
+      -p "${BIND}:${PORT}:9000" \
+      -e "MINIO_ROOT_USER=${ACCESS_KEY}" \
+      -e "MINIO_ROOT_PASSWORD=${SECRET_KEY}" \
+      "$image" server /data >/dev/null 2>&1 \
+      && wait_healthy "$HEALTH_URL"; then
       return 0
     fi
-    "$runtime" start "$CONTAINER" >/dev/null
-    return 0
-  fi
-  "$runtime" run -d --name "$CONTAINER" \
-    -p "${BIND}:${PORT}:9000" \
-    -e "MINIO_ROOT_USER=${ACCESS_KEY}" \
-    -e "MINIO_ROOT_PASSWORD=${SECRET_KEY}" \
-    "$IMAGE" server /data >/dev/null
+    echo "MinIO image $image did not become healthy via $runtime; trying the next candidate" >&2
+    "$runtime" logs "$CONTAINER" 2>&1 | tail -5 >&2 || true
+    "$runtime" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  done
+  return 1
 }
 
 minio_arch() {
@@ -196,8 +276,17 @@ start_binary() {
     bin="${DATA_DIR}/minio"
     mkdir -p "$DATA_DIR"
     if [ ! -x "$bin" ]; then
-      echo "fetching MinIO $arch" >&2
-      curl -fsSL "https://dl.min.io/server/minio/release/${arch}/minio" -o "$bin"
+      # MinIO discontinued community downloads: dl.min.io binary paths return
+      # 410 since the community edition went source-only. A host without a
+      # container runtime must provide a minio binary in PATH, at
+      # $DATA_DIR/minio, or via MINIO_DOWNLOAD_URL.
+      local url="${MINIO_DOWNLOAD_URL:-}"
+      if [ -z "$url" ]; then
+        echo "no minio binary in PATH and upstream community downloads are discontinued; set MINIO_DOWNLOAD_URL or install minio" >&2
+        return 1
+      fi
+      echo "fetching MinIO $arch from $url" >&2
+      curl -fsSL "$url" -o "$bin" || return 1
       chmod +x "$bin"
     fi
   fi
@@ -232,14 +321,11 @@ cmd_ensure() {
   runtimes="$(candidate_runtimes || true)"
   for runtime in $runtimes; do
     echo "starting MinIO via $runtime on ${BIND}:${PORT}" >&2
-    if start_container "$runtime" && wait_healthy "$HEALTH_URL"; then
+    if start_container "$runtime"; then
       ensure_bucket
       return 0
     fi
     echo "MinIO via $runtime was not healthy at $HEALTH_URL" >&2
-    if [ -n "$runtime" ]; then
-      "$runtime" logs "$CONTAINER" 2>&1 | tail -20 >&2 || true
-    fi
   done
 
   echo "starting MinIO binary on ${BIND}:${PORT}" >&2

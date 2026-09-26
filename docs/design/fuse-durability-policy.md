@@ -37,8 +37,8 @@ Valid values:
 | --- | --- | --- | --- | --- |
 | `auto` | Buffered locally. | RTT-based: strict on low-latency mounts, interactive on high-latency mounts. | Existing write-back behavior. | Default, preserve current latency/compatibility behavior. |
 | `interactive` | Buffered locally. | Local shadow/journal durable; remote commit async. | Existing write-back behavior. | Editors and WAN mounts where low latency matters more than immediate cross-client visibility. |
-| `fsync` | Buffered locally. | Remote-durable before fsync returns. | Existing write-back behavior except existing strict large-file flush behavior. | Tools that explicitly call fsync when they need durability. |
-| `close-sync` | Buffered locally. | Remote-durable before fsync returns. | Remote-durable before close can report success. | JuiceFS-like close-to-cloud semantics, sync tools, cross-client visibility after close. |
+| `fsync` | Buffered locally. | Remote-durable before fsync returns. | Existing write-back behavior: close stages locally and returns without waiting for the remote upload. | Tools that explicitly call fsync when they need durability. |
+| `close-sync` ([local staging tradeoff](#expected-tradeoffs)) | Buffered locally. | Remote-durable before fsync returns. | Remote-durable before close can report success. | JuiceFS-like close-to-cloud semantics, sync tools, cross-client visibility after close. |
 | `write-sync` | Remote-durable before each write returns. | Normally clean after successful writes. | Normally clean after successful writes. | Strongest semantics, tests, low-frequency writes. |
 
 Default is `auto`.
@@ -78,11 +78,28 @@ an explicit fsync should not be weaker.
 - `SyncStrict`: fsync uploads to the drive9 server before returning success.
 - `SyncAuto`: mount-time RTT detection chooses one of the above.
 
-The implementation also uses `SyncMode` on the large-file Flush path. In
-interactive mode, a large Flush stages shadow/pending state so local
-close/drop/open flows can still see the file without waiting for remote upload.
-In strict mode, large Flush uploads before returning to avoid remote stat
-misses after cache drop.
+The large-file Flush path is keyed on the write policy, not the sync mode. On
+`WritePolicyWriteBack` mounts, a large Flush stages shadow/pending state and
+returns in both the interactive and fsync tiers: close/drop/open flows still
+see the file, and the remote upload happens asynchronously. `SyncMode` only
+decides what an explicit fsync means — in the fsync tier, `fsync(2)` remains
+the remote-durable pay-up moment and uploads to the drive9 server before
+returning success.
+
+Earlier revisions uploaded synchronously on a strict large Flush to avoid
+remote stat misses after a close followed by cache drop: without local state,
+the kernel re-issues `Lookup`, and a remote stat that has not yet seen the
+asynchronous upload would return ENOENT. Close-time staging removes that
+hazard at the source instead. The staged entry is registered in the pending
+index overlay, so subsequent `Lookup` calls resolve from local pending
+metadata and never issue the remote stat until the commit queue publishes the
+upload. The journal makes the pending registration durable, so a daemon
+restart replays the entry and re-enqueues the upload rather than dropping the
+path. With the default `--writeback-sync-window`, close-time staging is
+ext4-equivalent — daemon-crash safe, with the background WAL syncer bounding
+the power-loss window; `--writeback-sync-window close` restores fsynced
+staging, and `close-sync`/`write-sync` handles keep their synchronous close
+regardless of file size.
 
 ### WritePolicy
 
@@ -135,6 +152,142 @@ prefer this over close-sync.
 
 `close-sync` improves cross-client/cloud visibility after close, but close
 latency includes network, server, database, and S3/db9 latency.
+Strict close-sync `Flush` and `Release` shadow uploads omit local fsync only
+when the content generation is known and no live pending-index or write-back
+metadata references the path. Generation fencing pins the source through remote
+acknowledgement. Only Flush/Release request this optimization from the shared
+uploader. Explicit fsync and link-source synchronization retain the local
+barrier, including their append-log fallbacks into the generic uploader.
+The primary foreground close-sync Flush/Release path requests remote-only
+eligibility. The inline ShadowSpill error/recovery fallbacks retain local fsync;
+those conservative routes do not request this optimization.
+Failed uploads retain dirty state for an in-process retry; unacknowledged shadow
+bytes are not guaranteed to survive a machine crash. Explicit strict `fsync(2)`
+shadow uploads deliberately retain local sync, as do writeback, recovery, staged
+handles, and library mounts combining close-sync with interactive/auto sync.
+The eligibility check uses live staging state, not a scan of historical WAL
+frames. Recovery of historical frames retains its recorded revision and existing
+CAS checks; this optimization does not add journal commit markers or retire them.
+
+For every path, read-only `Open` and `Read` share a checked shadow-pin path.
+Without pending metadata, only resident caches with a base revision at least
+as new as the handle, inode and locally observed commit can be selected.
+Absence of append-log configuration or local commit history does not authorize
+an unknown disk image, including a torn shadow left after an acknowledged
+close-sync upload and restart.
+
+Locally initialized new-file staging at revision zero is also readable while
+no committed revision is known. Successful empty initialization (including
+Create over a leftover shadow), actual writes into an empty image, and complete
+content replacement establish that provenance. Merely opening, syncing,
+partially resizing or partially overwriting recovered bytes does not.
+
+Retirement has an explicit reason. Ordinary cleanup invalidates future reads
+from that generation, even when the upload returned no revision. Cleanup alone
+does not prove that the retired shadow matches the uploaded image, so it never
+labels those bytes with a committed revision. Existing readers repin a current
+source or use the remote/read cache. Explicit WAL reset and anonymous inode
+snapshots (including rename-overwrite) keep their existing lifetime. Unlinked
+handles read their captured generation directly; they do not use the ordinary
+path's source-selection policy.
+
+PendingIndex metadata may override a newer known remote revision only for the
+exact shadow content generation bound when that metadata was published. Pin
+identity alone does not prove content identity: writes can change the same fd.
+The binding includes the ShadowStore instance and is never persisted. Unbound
+metadata falls back to ordinary revision validation; WriteBackCache metadata
+owns only its `.dat` payload and never authorizes `.shadow`. Recovery explicitly
+binds the selected payload after journal replay and legacy `.dat` migration,
+before requests are served. Both asynchronous and synchronous recovery refuse
+a shadow shorter than the selected metadata, including when journal setup
+failed and only `.meta` survived. Recovery uploads retain the metadata's CAS base.
+
+Legacy migration repairs a missing or short shadow from a complete `.dat`
+snapshot only when recovery still selects that snapshot's metadata. A complete
+shadow is preserved because a best-effort `.dat` snapshot can be older than
+acknowledged shadow staging. Full WAL metadata with a newer
+publication timestamp supersedes older disk metadata left by a failed snapshot;
+older WAL metadata and legacy fsync frames do not displace newer disk metadata.
+Rejecting missing or short WAL data preserves an older complete `.meta`/`.dat`
+publication with its original CAS revision. Before restoring those bytes,
+recovery durably appends the fallback metadata to supersede the rejected frame;
+a second crash cannot bind the restored bytes to that frame's newer revision.
+Failure to publish this recovery decision aborts mount before migration.
+Recovered publication generations advance the counter before new writes start.
+Startup accounting is reconciled before the first recovery enqueue. Replay,
+migration and layer-restore errors stop workers before closing staging resources.
+
+`Read` checks its shadow pin once at the shadow-read branch using resident state
+only: no path lock, disk lookup or unlink on a cache miss. `Open` applies the
+same eligibility rules and separately discards unclaimed disk-only orphans.
+A newly published resident source remains discoverable even if its revision has
+not changed. Raw path reads cannot bypass the checked pin. Creating a new file
+detaches the old path incarnation so stale inode revisions cannot hide local
+staging; old open handles, pending mutations and surviving hardlink aliases
+retain their inode as needed. Later cleanup removes only path mappings owned by that inode,
+so forgetting an old incarnation cannot remove a replacement's mapping.
+
+
+The next lifecycle refactor is tracked in
+[Shadow claim encapsulation](fuse-shadow-claim-lifecycle.md).
+
+For a new nonempty inline file with deferred permissions, close-sync can publish
+content and mode together using a single-item batch write with create-only CAS.
+This optimization requires a successful `/v1/status` negotiation advertising
+`storage_capabilities.batch_write_mode_v1: true`. Missing or false capability,
+failed negotiation, and older servers use the ordinary PUT-then-chmod flow.
+The check reads the existing status cache and adds no hot-path request.
+The acknowledged mode generation is cleared only if it is still current; newer
+chmods remain pending and are applied against the committed file. A server that
+rejects the batch endpoint with HTTP 404/405 uses the existing PUT-then-chmod path.
+The close-sync path logs that fallback and retries batch support after a one-minute cooldown;
+a transient gateway response does not disable the optimization for the mount's life.
+This retry policy is limited to foreground close-sync. The existing background
+commit queue still disables batching until remount after a top-level 404/405 and
+uses its single-entry recovery path. Changing that queue's scheduling and retry
+policy is separate work; the foreground optimization does not alter it.
+Transport failures, malformed responses and other per-item errors do not fall
+back to PUT, because the commit outcome may be unknown. Overwrites, empty files,
+multipart uploads, locally staged recovery payloads and other durability policies
+keep their existing mode flow.
+
+On servers advertising `batch_write_mode_v1`, setting mode through batch-write
+is owner-only, matching the chmod endpoint.
+A scoped token may write content in its authorized paths without `hasMode`, but
+an item with `hasMode` is rejected with per-item 403 before changing content or
+permissions. A per-item 403 with no committed revision is a definite non-commit:
+close-sync falls back to content-only PUT with the same create-only CAS, then
+applies the pending mode through chmod. Authorized bytes can therefore commit
+even when chmod is denied, matching the ordinary PUT-then-chmod path. Close still
+reports the chmod error and retains the pending mode; a failed fallback PUT also
+remains an error. This fallback neither acknowledges mode nor disables batching.
+With perf enabled, `close_sync_mode_forbidden_fallback` counts these extra requests.
+Backend per-item errors must never map to 403, and post-commit errors must retain
+their committed revision. A zero revision on any other error does not establish
+that nothing committed; top-level 403 and ambiguous results still fail closed.
+The public client contract is documented on `client.BatchWriteResult`; server
+authorization, actual mode application and post-commit revision tests live in
+[`tidbcloud/fs#189`](https://github.com/tidbcloud/fs/pull/189).
+The historical server source in this repository does not enforce or advertise
+this contract, so this client's combined path stays disabled against it.
+Deploying the server capability enables the optimization for newly negotiated
+clients on backends supporting inline batch storage; existing mounts may need
+remounting because status is cached. A failed or malformed initial status fetch
+also leaves the optimization disabled until successful negotiation, normally
+by remounting. The
+[release note](../release-notes/2026-09-23-close-sync-create-mode.md) records this
+compatibility boundary. The background commit queue requires the same capability
+before attaching batch mode fields. Otherwise it batches content only, then
+applies pending mode through the ordinary chmod endpoint. Chmod denial preserves
+staging and is not acknowledged as a successful mode change. This client gate
+does not repair authorization in older servers.
+
+If the server commits a create but its acknowledgement is lost, the handle
+retains its create-only CAS and later flushes can continue failing with a
+conflict until the application reconciles with the remote file. This inherited
+limitation is deliberate: equal bytes/mode alone do not prove commit ownership.
+Automatic recovery needs a server-verifiable idempotency/commit identity; it
+must not overwrite or adopt another writer's object based only on a stat.
 
 `write-sync` can be dramatically slower for normal buffered writers because a
 single logical file copy may be split into many FUSE write requests. It is

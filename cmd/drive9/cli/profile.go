@@ -25,6 +25,15 @@ type profileConfig struct {
 	AppendLogPatterns  []string
 	PackPaths          []string
 	ExtentPatterns     []string
+	// Builtin marks a config produced by a built-in profile rather than a user
+	// file. It distinguishes `coding-agent` the builtin from a user's
+	// ~/.drive9/profiles/coding-agent: only the builtin carries the built-in
+	// local-only defaults, so a same-named custom file is not silently merged
+	// with them.
+	Builtin bool
+	// LocalGitignoreAwarePatterns are local-only patterns overlaid only when
+	// the repository's Git ignore rules also ignore the path.
+	LocalGitignoreAwarePatterns []string
 }
 
 func Profile(args []string) error {
@@ -83,7 +92,7 @@ func loadProfileConfig(name string) (profileConfig, error) {
 		return builtinExtentProfile(), nil
 	}
 	if name == "interactive" {
-		return profileConfig{Name: "interactive", Source: "builtin:interactive"}, nil
+		return profileConfig{Name: "interactive", Source: "builtin:interactive", Builtin: true}, nil
 	}
 	if path := profileConfigPath(name); path != "" {
 		if data, err := os.ReadFile(path); err == nil {
@@ -145,7 +154,7 @@ func validateProfileName(name string) error {
 }
 
 func builtinNoneProfile() profileConfig {
-	return profileConfig{Name: noneMountProfile, Source: "builtin:none"}
+	return profileConfig{Name: noneMountProfile, Source: "builtin:none", Builtin: true}
 }
 
 func builtinExtentProfile() profileConfig {
@@ -153,27 +162,32 @@ func builtinExtentProfile() profileConfig {
 		Name:           extentMountProfile,
 		Source:         "builtin:extent",
 		ExtentPatterns: []string{"*"},
+		Builtin:        true,
 	}
 }
 
 func builtinCodingAgentProfile() profileConfig {
 	return profileConfig{
-		Name:               defaultMountProfile,
-		Source:             "builtin:coding-agent",
-		LocalOnlyPatterns:  builtinCodingAgentLocalOnlyPatterns(),
-		RemoteOnlyPatterns: nil,
-		AppendLogPatterns:  []string{"**/*-wal"},
-		PackPaths:          nil,
+		Name:                        defaultMountProfile,
+		Source:                      "builtin:coding-agent",
+		LocalOnlyPatterns:           builtinCodingAgentLocalOnlyPatterns(),
+		RemoteOnlyPatterns:          nil,
+		LocalGitignoreAwarePatterns: builtinCodingAgentGitignoreAwarePatterns(),
+		AppendLogPatterns:           []string{"**/*-wal"},
+		PackPaths:                   nil,
+		Builtin:                     true,
 	}
 }
 
 func builtinPortableProfile() profileConfig {
 	return profileConfig{
-		Name:               portableMountProfile,
-		Source:             "builtin:portable",
-		LocalOnlyPatterns:  builtinCodingAgentLocalOnlyPatterns(),
-		RemoteOnlyPatterns: nil,
-		PackPaths:          []string{"/"},
+		Name:                        portableMountProfile,
+		Source:                      "builtin:portable",
+		LocalOnlyPatterns:           builtinCodingAgentLocalOnlyPatterns(),
+		RemoteOnlyPatterns:          nil,
+		LocalGitignoreAwarePatterns: builtinCodingAgentGitignoreAwarePatterns(),
+		PackPaths:                   []string{"/"},
+		Builtin:                     true,
 	}
 }
 
@@ -204,30 +218,27 @@ func mergeProfileValues(groups ...[]string) []string {
 	return out
 }
 
+// builtinCodingAgentLocalOnlyPatterns is the shared [local] overlay policy for
+// the coding-agent, coding-agent-extent, and portable profiles. These paths are
+// overlaid unconditionally.
+//
+// VCS metadata is absent: `.git` is routed structurally (local only for a
+// registered or in-progress Git workspace), and `.hg`/`.svn` sync to the
+// remote. Other build/cache output stays remote-persistent.
 func builtinCodingAgentLocalOnlyPatterns() []string {
 	return []string{
-		"**/.git/**",
-		"**/.hg/**",
-		"**/.svn/**",
 		"**/node_modules/**",
-		"**/.pnpm-store/**",
-		"**/target/**",
-		"**/dist/**",
-		"**/build/**",
-		"**/coverage/**",
-		"**/tmp/**",
-		"**/.tmp/**",
-		"**/.tmp-api-extractor/**",
-		"**/.cache/**",
-		"**/.turbo/**",
-		"**/.next/cache/**",
-		"**/.vitepress/cache/**",
-		"**/.gradle/**",
 		"**/.venv/**",
-		"**/__pycache__/**",
-		"**/.pytest_cache/**",
-		"**/.mypy_cache/**",
-		"**/.ruff_cache/**",
+	}
+}
+
+// builtinCodingAgentGitignoreAwarePatterns is the shared [local-gitignore-aware]
+// policy: paths overlaid only when the repository's Git ignore rules also
+// ignore them. Rust build output is here because `target` is a common
+// directory name that is not always build output.
+func builtinCodingAgentGitignoreAwarePatterns() []string {
+	return []string{
+		"**/target/**",
 	}
 }
 
@@ -242,7 +253,7 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")))
 			switch section {
-			case "local", "remote", "pack", "append-log", "extent":
+			case "local", "local-gitignore-aware", "remote", "pack", "append-log", "extent":
 			default:
 				return profileConfig{}, fmt.Errorf("profile %q line %d: unknown section [%s]", name, lineNo+1, section)
 			}
@@ -251,6 +262,8 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 		switch section {
 		case "local":
 			cfg.LocalOnlyPatterns = append(cfg.LocalOnlyPatterns, line)
+		case "local-gitignore-aware":
+			cfg.LocalGitignoreAwarePatterns = append(cfg.LocalGitignoreAwarePatterns, line)
 		case "remote":
 			cfg.RemoteOnlyPatterns = append(cfg.RemoteOnlyPatterns, line)
 		case "pack":
@@ -271,6 +284,8 @@ func formatProfileConfig(cfg profileConfig) string {
 		fmt.Fprintf(&b, "# source: %s\n", cfg.Source)
 	}
 	writeProfileSection(&b, "local", cfg.LocalOnlyPatterns, "no local-only overlay paths")
+	writeProfileSection(&b, "local-gitignore-aware", cfg.LocalGitignoreAwarePatterns,
+		"no gitignore-aware local-only paths")
 	writeProfileSection(&b, "remote", cfg.RemoteOnlyPatterns, "no remote override paths")
 	writeProfileSection(&b, "pack", cfg.PackPaths, "no automatic pack paths")
 	writeProfileSection(&b, "append-log", cfg.AppendLogPatterns, "no append-log optimization paths")

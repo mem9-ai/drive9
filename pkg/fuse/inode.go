@@ -246,6 +246,17 @@ func (m *InodeToPath) GetInode(path string) (uint64, bool) {
 	return ino, ok
 }
 
+// GetRevision reads the revision without copying the inode's paths or metadata.
+// Zero means either no known server revision or no inode entry.
+func (m *InodeToPath) GetRevision(ino uint64) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if entry := m.byInode[ino]; entry != nil {
+		return entry.Revision
+	}
+	return 0
+}
+
 // GetEntry returns a copy of the InodeEntry for the given inode number. A copy
 // is returned to avoid data races. The second return value is false if the
 // inode is not found.
@@ -1012,9 +1023,13 @@ func (m *InodeToPath) setIdentityLocked(entry *InodeEntry, resourceID string) {
 
 func (m *InodeToPath) removeEntryLocked(ino uint64, entry *InodeEntry) {
 	for p := range entry.Paths {
-		delete(m.byPath, p)
+		if m.byPath[p] == ino {
+			delete(m.byPath, p)
+		}
 	}
-	if entry.Path != "" {
+	// An unlinked inode can retain its old display path after a new inode
+	// takes that name. Forget/Release must only remove mappings it owns.
+	if entry.Path != "" && m.byPath[entry.Path] == ino {
 		delete(m.byPath, entry.Path)
 	}
 	if entry.ResourceID != "" && m.byID[entry.ResourceID] == ino {

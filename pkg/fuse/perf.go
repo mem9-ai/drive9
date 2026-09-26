@@ -115,8 +115,9 @@ type fusePerfCounters struct {
 	enabled bool
 	start   time.Time
 
-	fuseOps   [perfFuseOpCount]perfAtomicStats
-	remoteOps [perfRemoteOpCount]perfAtomicStats
+	fuseOps                        [perfFuseOpCount]perfAtomicStats
+	remoteOps                      [perfRemoteOpCount]perfAtomicStats
+	closeSyncModeForbiddenFallback atomicUint64
 
 	readCacheHit  atomicUint64
 	readCacheMiss atomicUint64
@@ -451,7 +452,9 @@ func (p *fusePerfCounters) recordLocalPolicy(source policyMatchSource) {
 		return
 	}
 	switch source {
-	case policyMatchLocalOnly:
+	case policyMatchLocalOnly, policyMatchLocalGated:
+		// Both are local-only overlays; recordLocalPolicy is called after the
+		// gitignore gate, so a gated match counted here stayed local.
 		p.localPolicyLocalOnly.add(1)
 	case policyMatchRemoteOverride:
 		p.localPolicyRemoteOverride.add(1)
@@ -544,6 +547,7 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	for i, stats := range p.remoteOps {
 		snap.RemoteOps[perfRemoteOpNames[i]] = stats.snapshot()
 	}
+	snap.Counters["close_sync_mode_forbidden_fallback"] = p.closeSyncModeForbiddenFallback.load()
 	snap.Counters["read_cache_hit"] = p.readCacheHit.load()
 	snap.Counters["read_cache_miss"] = p.readCacheMiss.load()
 	snap.Counters["dir_cache_hit"] = p.dirCacheHit.load()
@@ -664,6 +668,8 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 	writePerfLine(w, "drive9: FUSE perf summary uptime=%s\n", snap.Uptime.Truncate(time.Millisecond))
 	writePerfOps(w, "fuse", perfFuseOpNames[:], snap.FuseOps)
 	writePerfOps(w, "remote", perfRemoteOpNames[:], snap.RemoteOps)
+	writePerfLine(w, "drive9: perf close_sync_mode_forbidden_fallback=%d\n",
+		snap.Counters["close_sync_mode_forbidden_fallback"])
 	writePerfLine(w, "drive9: perf cache read_hit=%d read_miss=%d dir_hit=%d dir_miss=%d prefetch_hit=%d prefetch_miss=%d\n",
 		snap.Counters["read_cache_hit"], snap.Counters["read_cache_miss"],
 		snap.Counters["dir_cache_hit"], snap.Counters["dir_cache_miss"],

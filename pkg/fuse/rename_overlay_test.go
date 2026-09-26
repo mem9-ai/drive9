@@ -214,10 +214,10 @@ func TestRenameDirectoryPreservesRealOverlayEntries(t *testing.T) {
 			var err error
 			switch kind {
 			case "empty_local_dir":
-				protected = final + "/dist"
+				protected = final + "/node_modules"
 				err = os.Mkdir(protected, 0o755)
 			case "nested_local_dir":
-				protected = final + "/nested/dist"
+				protected = final + "/nested/node_modules"
 				err = os.Mkdir(protected, 0o755)
 			case "hidden_file":
 				protected = final + "/nested/file"

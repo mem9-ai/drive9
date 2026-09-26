@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -24,18 +25,47 @@ func uploadBufferedRemoteFileWithRevision(ctx context.Context, c *client.Client,
 	return 0, nil
 }
 
-// uploadFromShadowRemote streams a shadow file to the server without loading
-// the entire file into memory. localPath identifies the shadow entry;
-// remotePath is the API destination (may differ when using RemoteRoot).
-func uploadFromShadowRemoteWithRevision(ctx context.Context, c *client.Client, shadows *ShadowStore, localPath, remotePath string, expectedRevision int64) (int64, error) {
-	return uploadFromShadowRemoteWithRevisionAndGeneration(ctx, c, shadows, localPath, remotePath, expectedRevision, 0)
+// shadowUploadDurability selects the local barrier before a remote commit.
+type shadowUploadDurability uint8
+
+const (
+	// The zero value keeps the local barrier, including legacy recovery.
+	shadowUploadLocalDurable shadowUploadDurability = iota
+	// Foreground close-sync may rely on remote durability for an eligible source.
+	shadowUploadRemoteDurable
+)
+
+var errInvalidShadowUpload = errors.New("invalid shadow upload configuration")
+
+// isInlineShadowUpload is shared by the ordinary uploader and combined-mode
+// eligibility. Empty files have their own direct-PUT path.
+func isInlineShadowUpload(size, threshold int64) bool {
+	return size > 0 && threshold > 0 && size < threshold
 }
 
-func uploadFromShadowRemoteWithRevisionAndGeneration(ctx context.Context, c *client.Client, shadows *ShadowStore, localPath, remotePath string, expectedRevision int64, expectedGen uint64) (int64, error) {
-	// Sync shadow to disk before uploading to ensure all data is durable.
-	if err := shadows.SyncIfGeneration(localPath, expectedGen); err != nil {
-		return 0, err
+func uploadFromShadowRemoteWithRevision(ctx context.Context, c *client.Client, shadows *ShadowStore, localPath, remotePath string, expectedRevision int64) (int64, error) {
+	return uploadFromShadowRemote(ctx, c, shadows, localPath, remotePath, expectedRevision, 0, shadowUploadLocalDurable)
+}
+
+// uploadFromShadowRemote streams a shadow with generation fencing through remote
+// acknowledgement. localPath identifies the shadow; remotePath is the API path.
+// Remote-only durability requires an eligible generation-pinned foreground
+// source; the caller must wait for the remote commit before ACK.
+func uploadFromShadowRemote(ctx context.Context, c *client.Client, shadows *ShadowStore, localPath, remotePath string, expectedRevision int64, expectedGen uint64, durability shadowUploadDurability) (int64, error) {
+	switch durability {
+	case shadowUploadLocalDurable:
+		if err := shadows.SyncIfGeneration(localPath, expectedGen); err != nil {
+			return 0, err
+		}
+	case shadowUploadRemoteDurable:
+		// Guard future callers that might bypass foreground policy selection.
+		if expectedGen == 0 {
+			return 0, fmt.Errorf("%w: remote-durable shadow upload requires a generation", errInvalidShadowUpload)
+		}
+	default:
+		return 0, fmt.Errorf("%w: durability %d", errInvalidShadowUpload, durability)
 	}
+
 	fd, size, release, err := shadows.OpenIfGeneration(localPath, expectedGen)
 	if err != nil {
 		return 0, err
@@ -46,7 +76,7 @@ func uploadFromShadowRemoteWithRevisionAndGeneration(ctx context.Context, c *cli
 		return c.WriteCtxConditionalWithRevision(ctx, remotePath, nil, expectedRevision)
 	}
 	threshold := c.CachedSmallFileThreshold()
-	if threshold > 0 && size < threshold {
+	if isInlineShadowUpload(size, threshold) {
 		data := make([]byte, size)
 		if _, err := fd.ReadAt(data, 0); err != nil {
 			return 0, err

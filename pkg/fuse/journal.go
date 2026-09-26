@@ -321,7 +321,8 @@ func (j *Journal) Close() error {
 // upload torn content under old metadata.
 //
 // Entries whose .meta survived (already present in the pending index) are
-// left untouched: the .meta file carries strictly more metadata than the WAL.
+// left untouched by legacy fsync frames. Full pending-meta WAL frames can
+// replace an older .meta left by a failed best-effort write-back snapshot.
 func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStore) error {
 	if j == nil || idx == nil {
 		return nil
@@ -357,26 +358,50 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 		if doneSeq, ok := latestDone[path]; ok && doneSeq > e.Seq {
 			return nil // committed or unlinked after the last local record
 		}
-		if idx.HasPending(path) {
-			return nil
-		}
+		var meta WriteBackMeta
 		if fromMeta {
-			var meta WriteBackMeta
 			if err := json.Unmarshal(e.Meta, &meta); err != nil {
 				return fmt.Errorf("journal replay resurrect %s: %w", path, err)
 			}
+		}
+		if current, ok := idx.GetMeta(path); ok {
+			// .meta and .dat may be an older best-effort snapshot even though
+			// a later Flush durably published shadow + full WAL metadata.
+			// Legacy fsync frames have no full publication timestamp, so they
+			// cannot displace a surviving metadata record on that evidence.
+			if !fromMeta || !current.Mtime.Before(meta.Mtime) {
+				return nil
+			}
+		}
+		if fromMeta {
 			// Issue #964: close staging is un-fsynced, so the WAL meta frame
-			// may reach disk while the shadow content did not. A frame whose
-			// content is short is a lost file (same outcome as ext4 dropping
-			// un-flushed page cache) — drop the entry instead of uploading
-			// torn bytes. The guard must cover non-spill frames too: both
+			// may reach disk while the shadow content did not. Reject a frame
+			// with missing or short content rather than uploading torn bytes.
+			// The guard must cover non-spill frames too: both
 			// kinds upload from the shadow file, and a lazy overwrite of a
 			// pre-existing file would otherwise CAS-commit truncated content
 			// over a good remote revision.
 			if shadows != nil {
-				if size, ok := shadows.ContentSize(path); ok && size < meta.Size {
-					// Partial content: the file is not recoverable.
+				if size, ok := shadows.ContentSize(path); !ok || size < meta.Size {
 					shadows.Remove(path)
+					// This frame never became the selected publication. Preserve
+					// any older .meta/.dat snapshot so migration can recover it
+					// with its own original CAS revision.
+					if fallback, ok := idx.GetMeta(path); ok {
+						// Supersede the rejected frame durably BEFORE migration
+						// installs fallback bytes. Otherwise another crash could
+						// pair those bytes with this rejected frame's newer base.
+						raw, err := json.Marshal(fallback)
+						if err != nil {
+							return fmt.Errorf("journal recovery fallback %s: %w", path, err)
+						}
+						if err := j.Append(JournalEntry{Op: JournalPendingMeta, Path: path, Meta: raw}); err != nil {
+							return fmt.Errorf("journal recovery fallback %s: %w", path, err)
+						}
+						if err := j.FsyncShared(); err != nil {
+							return fmt.Errorf("journal recovery fallback sync %s: %w", path, err)
+						}
+					}
 					return nil
 				}
 			}
