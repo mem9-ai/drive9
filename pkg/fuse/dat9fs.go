@@ -6991,7 +6991,7 @@ func (fs *Dat9FS) markPathDeleted(path string) {
 // the legacy uploader may still PUT this path outside the queue's ordering,
 // so those paths take the synchronous branch.
 func (fs *Dat9FS) deferredUnlinkActiveFor(childP string) bool {
-	if fs == nil || fs.opts.DisableDeferredUnlink || fs.commitQueue == nil || fs.journal == nil {
+	if fs == nil || fs.commitQueue == nil || fs.journal == nil {
 		return false
 	}
 	if policy := fs.opts.WritePolicy; policy != WritePolicyWriteBack && policy != "" {

@@ -158,14 +158,18 @@ func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 }
 
 // newDeferredUnlinkFS wires a write-back Dat9FS with the full staging stack
-// (commit queue + shadow + pending index + journal), optionally with the
-// deferred-unlink flag enabled.
-func newDeferredUnlinkFS(t *testing.T, ts *httptest.Server, cacheDir string, deferred bool) *Dat9FS {
+// (commit queue + shadow + pending index + journal). Deferred unlink is the
+// default write-back behavior, so the coalescing window ships enabled.
+func newDeferredUnlinkFS(t *testing.T, ts *httptest.Server, cacheDir string) *Dat9FS {
+	t.Helper()
+	return newDeferredUnlinkFSWithPolicy(t, ts, cacheDir, WritePolicyWriteBack)
+}
+
+func newDeferredUnlinkFSWithPolicy(t *testing.T, ts *httptest.Server, cacheDir string, policy WritePolicy) *Dat9FS {
 	t.Helper()
 	opts := &MountOptions{}
 	opts.setDefaults()
-	opts.WritePolicy = WritePolicyWriteBack
-	opts.DisableDeferredUnlink = !deferred
+	opts.WritePolicy = policy
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
 	pIdx, err := NewPendingIndex(filepath.Join(cacheDir, "pending"))
@@ -208,11 +212,8 @@ func newDeferredUnlinkFS(t *testing.T, ts *httptest.Server, cacheDir string, def
 	cq.IsSuperseded = fs.commitEntrySuperseded
 	cq.PathLock = fs.lockRemoteCommitPath
 	cq.DurableWatermark = fs.latestCommittedRevision
-	if deferred {
-		// Mirror mount.go's wiring: the coalesce window ships with the
-		// default-on deferred deletes.
-		cq.ConfigureDeleteCoalesceWindow(deferredDeleteCoalesceWindow)
-	}
+	// Mirror mount.go's wiring: the coalescing window ships with the queue.
+	cq.ConfigureDeleteCoalesceWindow(deferredDeleteCoalesceWindow)
 	fs.commitQueue = cq
 
 	t.Cleanup(func() {
@@ -239,7 +240,7 @@ func TestDeferredUnlinkNoSyncRoundTrips(t *testing.T) {
 
 	ts := httptest.NewServer(backend.handler())
 	defer ts.Close()
-	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir())
 
 	backend.exists["/victim.txt"] = true
 	fs.inodes.Lookup("/victim.txt", false, 128, time.Now())
@@ -279,7 +280,7 @@ func TestDeferredUnlinkOrdersAfterQueuedUpload(t *testing.T) {
 	backend.putGate = make(chan struct{})
 	ts := httptest.NewServer(backend.handler())
 	defer ts.Close()
-	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir())
 
 	// Stage an upload for the path the way Release leaves it: shadow +
 	// pending-index meta removed at enqueue time, commit entry in flight.
@@ -333,13 +334,13 @@ func TestDeferredUnlinkOrdersAfterQueuedUpload(t *testing.T) {
 	}
 }
 
-// TestDeferredUnlinkFlagOffStaysSynchronous: without the flag, unlink keeps
-// today's behavior (one synchronous DELETE before returning).
-func TestDeferredUnlinkFlagOffStaysSynchronous(t *testing.T) {
+// TestDeferredUnlinkSyncOnCloseSyncTier: the strict durability tiers keep
+// the synchronous DELETE before unlink returns (policy gate, no option).
+func TestDeferredUnlinkSyncOnCloseSyncTier(t *testing.T) {
 	backend := newDeferredUnlinkBackend()
 	ts := httptest.NewServer(backend.handler())
 	defer ts.Close()
-	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), false)
+	fs := newDeferredUnlinkFSWithPolicy(t, ts, t.TempDir(), WritePolicyCloseSync)
 
 	backend.exists["/plain.txt"] = true
 	fs.inodes.Lookup("/plain.txt", false, 128, time.Now())
@@ -426,7 +427,7 @@ func TestDeleteCoalesceWindowDelaysDispatch(t *testing.T) {
 	backend := newDeferredUnlinkBackend()
 	ts := httptest.NewServer(backend.handler())
 	defer ts.Close()
-	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir())
 
 	backend.exists["/lagged.txt"] = true
 	fs.inodes.Lookup("/lagged.txt", false, 128, time.Now())
@@ -456,7 +457,7 @@ func TestRmdirAggregatesDeferredChildDeletes(t *testing.T) {
 	backend := newDeferredUnlinkBackend()
 	ts := httptest.NewServer(backend.handler())
 	defer ts.Close()
-	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir())
 
 	backend.seedDir("/d", "a", "b")
 	fs.inodes.Lookup("/d", true, 0, time.Now())
@@ -510,7 +511,7 @@ func TestRmdirAggregationFallbackOnUnknownRemoteChild(t *testing.T) {
 	backend := newDeferredUnlinkBackend()
 	ts := httptest.NewServer(backend.handler())
 	defer ts.Close()
-	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir())
 
 	backend.seedDir("/d2", "a", "stranger")
 	fs.inodes.Lookup("/d2", true, 0, time.Now())
@@ -549,7 +550,7 @@ func TestDeferredDeleteSkipsRecreatedFile(t *testing.T) {
 
 	ts := httptest.NewServer(backend.handler())
 	defer ts.Close()
-	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir())
 
 	backend.seedFile("/victim.txt", 7)
 	ino := fs.inodes.Lookup("/victim.txt", false, 128, time.Now())
@@ -597,7 +598,7 @@ func TestDeferredDeleteProceedsWhenInflightCommitAdvancesRevision(t *testing.T) 
 	backend := newDeferredUnlinkBackend()
 	ts := httptest.NewServer(backend.handler())
 	defer ts.Close()
-	fs := newDeferredUnlinkFS(t, ts, t.TempDir(), true)
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir())
 
 	const path = "/dying.txt"
 	if err := fs.shadowStore.Ensure(path, 4, 0); err != nil {

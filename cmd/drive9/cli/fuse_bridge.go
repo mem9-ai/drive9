@@ -68,7 +68,6 @@ type mountFuseOptions struct {
 	UploadConcurrency            int
 	DirCacheMaxEntries           int
 	CommitQueueMaxPending        int
-	DisableDeferredUnlink        bool
 	WriteBackBatchWindow         time.Duration
 	WriteBackBatchMaxFiles       int
 	WriteBackBatchMaxBytes       int64
