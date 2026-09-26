@@ -593,6 +593,7 @@ func Mount(opts *MountOptions) (err error) {
 				cq.serializeMutationInodes = opts.GVisorCompat
 				cq.PathLock = dat9fs.lockRemoteCommitPath
 				cq.DurableWatermark = dat9fs.latestCommittedRevision
+				cq.RecordCommittedRevision = dat9fs.recordCommittedRevision
 				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {
 					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
 				}

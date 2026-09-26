@@ -201,6 +201,13 @@ type CommitQueue struct {
 	// payload bytes after a sibling strict fsync advances the same path.
 	DurableWatermark func(path string) int64
 
+	// RecordCommittedRevision records a backend revision this queue proved
+	// durable for a path (data landed; post-upload steps may still fail).
+	// Dat9FS feeds its committed-revision tracker so follow-up namespace
+	// operations (unlink, lookup) see the remote object instead of
+	// classifying the path as never-uploaded.
+	RecordCommittedRevision func(path string, rev int64)
+
 	// workCh dispatches entries to upload workers. The buffer is always
 	// larger than maxPending so Enqueue never blocks.
 	workCh chan *CommitEntry
@@ -708,6 +715,14 @@ func (cq *CommitQueue) RecoverPending() {
 		shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
 		if meta.Kind == PendingConflict {
 			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
+			continue
+		}
+		if meta.Kind == PendingChmod {
+			// Data already landed remotely; only the best-effort chmod was
+			// left. There is nothing to re-upload — keep the entry so
+			// Lookup/GetAttr still see the local metadata, and let the next
+			// successful commit for this path re-apply the mode.
+			safeLogPrintf("commit queue: skipping chmod-pending entry for %s (data already committed)", path)
 			continue
 		}
 		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
@@ -2504,6 +2519,19 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			if client.IsNotFound(err) {
 				safeLogPrintf("commit queue: post-upload chmod not found for %s (concurrent write likely replaced it); proceeding without mode update", entry.Path)
 			} else {
+				// The data bytes landed; only the best-effort mode update
+				// failed. Durably record "chmod pending" (RecoverPending
+				// skips it instead of re-uploading) and the committed
+				// revision — otherwise a follow-up unlink classifies the
+				// path as never-uploaded and leaks the remote object.
+				if cq.index != nil && entry.PendingIndexGen != 0 {
+					if _, markErr := cq.index.MarkChmodPendingIfGeneration(entry.Path, entry.PendingIndexGen); markErr != nil {
+						safeLogPrintf("commit queue: chmod-pending mark failed for %s: %v", entry.Path, markErr)
+					}
+				}
+				if cq.RecordCommittedRevision != nil {
+					cq.RecordCommittedRevision(entry.Path, committedRev)
+				}
 				return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
 			}
 		}
