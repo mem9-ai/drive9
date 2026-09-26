@@ -83,8 +83,8 @@ func (b *deferredUnlinkBackend) calls() []string {
 func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
-		switch r.Method {
-		case http.MethodPut:
+		switch {
+		case r.Method == http.MethodPut:
 			b.puts.Add(1)
 			b.record("PUT")
 			if b.putGate != nil {
@@ -96,7 +96,7 @@ func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 			b.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
-		case http.MethodDelete:
+		case r.Method == http.MethodDelete:
 			// Gate before counting so a dispatched delete worker cannot
 			// move the counter during a pre-drain assertion.
 			if b.deleteGate != nil {
@@ -137,7 +137,7 @@ func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 			}
 			b.mu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
-		case http.MethodGet:
+		case r.Method == http.MethodGet:
 			if !r.URL.Query().Has("list") {
 				w.WriteHeader(http.StatusNotFound)
 				return
@@ -161,7 +161,26 @@ func (b *deferredUnlinkBackend) handler() http.HandlerFunc {
 			w.Header().Set("Content-Type", "application/json")
 			body, _ := json.Marshal(map[string]any{"entries": entries})
 			_, _ = w.Write(body)
-		case http.MethodHead:
+		case r.Method == http.MethodPost && r.URL.Query().Has("symlink"):
+			b.mu.Lock()
+			if b.exists[p] {
+				b.mu.Unlock()
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			b.exists[p] = true
+			b.revs[p]++
+			b.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			if b.chmodFails {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case r.Method == http.MethodHead:
 			b.heads.Add(1)
 			b.record("HEAD")
 			if b.failHeads {
@@ -802,5 +821,100 @@ func TestRmdirAggregationFallbackOnRecreatedSameName(t *testing.T) {
 	backend.mu.Unlock()
 	if !dirThere {
 		t.Fatal("directory was removed despite the recreated child")
+	}
+}
+
+// TestChmodFailureMarksPendingChmodAndKeepsUnlinkable: when the queue lands
+// the data PUT but the post-upload chmod fails, the durable pending state
+// must be re-classified (PendingChmod) with the committed revision recorded,
+// so a follow-up unlink still issues the remote DELETE instead of
+// classifying the path as never-uploaded and leaking the remote object.
+func TestChmodFailureMarksPendingChmodAndKeepsUnlinkable(t *testing.T) {
+	backend := newDeferredUnlinkBackend()
+	backend.chmodFails = true
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir())
+
+	const path = "/chmod-fail.txt"
+	// Mirror the meta-bearing staging flows (mknod local-first, fsync
+	// staging): pending meta + shadow + a queue entry carrying the mode.
+	if err := fs.shadowStore.Ensure(path, 4, 0); err != nil {
+		t.Fatalf("shadow ensure: %v", err)
+	}
+	if _, err := fs.shadowStore.WriteAt(path, 0, []byte("data"), 0); err != nil {
+		t.Fatalf("shadow write: %v", err)
+	}
+	gen, err := fs.pendingIndex.PutWithBaseRevAndMode(path, 4, PendingNew, 0, 0o600, true)
+	if err != nil {
+		t.Fatalf("pending put: %v", err)
+	}
+	if err := fs.commitQueue.Enqueue(&CommitEntry{
+		Path:            path,
+		BaseRev:         0,
+		Size:            4,
+		Kind:            PendingNew,
+		ShadowGen:       fs.shadowStore.ActiveGeneration(path),
+		PendingIndexGen: gen,
+		Mode:            0o600,
+		HasMode:         true,
+	}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	fs.commitQueue.DrainAll()
+
+	if !backend.hasPath(path) {
+		t.Fatal("remote object missing after PUT (data must have landed)")
+	}
+	meta, ok := fs.pendingIndex.GetMeta(path)
+	if !ok {
+		t.Fatal("pending meta missing after chmod failure")
+	}
+	if meta.Kind != PendingChmod {
+		t.Fatalf("pending kind = %v, want PendingChmod", meta.Kind)
+	}
+	if rev := fs.latestCommittedRevision(path); rev <= 0 {
+		t.Fatalf("committed revision tracker = %d, want > 0", rev)
+	}
+
+	// Unlink must still remove the landed remote object.
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "chmod-fail.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	fs.commitQueue.DrainAll()
+	if got := backend.deletes.Load(); got != 1 {
+		t.Fatalf("DELETEs = %d, want 1 (remote object must not leak)", got)
+	}
+	if backend.hasPath(path) {
+		t.Fatal("remote object leaked after unlink")
+	}
+}
+
+// TestCreateAfterDeferredUnlinkSameName covers the git-ops failure class:
+// rm X immediately followed by creating a new object at X. The deferred
+// remote DELETE must land before the creating op reaches the server,
+// otherwise the stale remote object answers 409 and the create spuriously
+// fails with EEXIST.
+func TestCreateAfterDeferredUnlinkSameName(t *testing.T) {
+	backend := newDeferredUnlinkBackend()
+	ts := httptest.NewServer(backend.handler())
+	defer ts.Close()
+	fs := newDeferredUnlinkFS(t, ts, t.TempDir())
+
+	const path = "/name-reuse"
+	backend.seedFile(path, 7)
+	ino := fs.inodes.Lookup(path, false, 16, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision(path, 7)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "name-reuse"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	// The name is immediately recreated as a symlink.
+	if st := fs.Symlink(nil, &gofuse.InHeader{NodeId: 1}, "target-value", "name-reuse", &gofuse.EntryOut{}); st != gofuse.OK {
+		t.Fatalf("Symlink status = %v, want OK (stale remote object must be gone first)", st)
+	}
+	if got := backend.deletes.Load(); got != 1 {
+		t.Fatalf("DELETEs = %d, want 1 before the symlink creates the name", got)
 	}
 }

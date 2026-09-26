@@ -902,6 +902,35 @@ func (cq *CommitQueue) HasPath(path string) bool {
 	return cq.hasQueuedPathLocked(path) || cq.hasImmediatePathLocked(path)
 }
 
+// HasPendingDelete reports whether a deferred remote DELETE (PendingDelete)
+// for the path is queued, delayed, or in flight.
+func (cq *CommitQueue) HasPendingDelete(path string) bool {
+	if cq == nil || path == "" {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if e := cq.inFlight[path]; e != nil && e.Kind == PendingDelete {
+		return true
+	}
+	for e := range cq.queuedByPath[path] {
+		if e != nil && e.Kind == PendingDelete {
+			return true
+		}
+	}
+	for e := range cq.immediate {
+		if e != nil && e.Path == path && e.Kind == PendingDelete {
+			return true
+		}
+	}
+	for e := range cq.delayed {
+		if e != nil && e.Path == path && e.Kind == PendingDelete {
+			return true
+		}
+	}
+	return false
+}
+
 // InFlightPath reports whether a commit for the path is currently being
 // processed by a worker (unlike HasPath it ignores queued work).
 func (cq *CommitQueue) InFlightPath(path string) bool {

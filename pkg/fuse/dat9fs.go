@@ -6971,6 +6971,21 @@ func (fs *Dat9FS) hasKnownLocalDirectoryChildren(dirPath string) bool {
 // remoteDirectoryHasChildren can filter out stale backend listings during
 // the eventual-consistency window — even when the inode has been fully
 // removed (RemoveLink with no open handles).
+// awaitPendingRemoteDelete blocks until a queued deferred DELETE for the
+// path has landed. Namespace-creating operations (symlink, mkdir, create)
+// must not run while the old remote object is still present: the server
+// answers 409 and the create spuriously fails with EEXIST even though the
+// local namespace already unlinked the name. Only paths this mount just
+// unlinked pay the wait.
+func (fs *Dat9FS) awaitPendingRemoteDelete(path string) {
+	if fs == nil || fs.commitQueue == nil || path == "" {
+		return
+	}
+	if fs.commitQueue.HasPendingDelete(path) {
+		fs.commitQueue.WaitPath(path)
+	}
+}
+
 func (fs *Dat9FS) markPathDeleted(path string) {
 	if fs == nil || path == "" {
 		return
@@ -10147,6 +10162,10 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 		return gofuse.OK
 	}
 
+	// Same as Symlink: a pending deferred DELETE for the name must land
+	// before the remote mkdir, or the server's 409 becomes a spurious
+	// EEXIST for a directory the local namespace already freed.
+	fs.awaitPendingRemoteDelete(childP)
 	if err := fs.mkdirRemoteWithTransientRetry(cancel, childP, mode); err != nil {
 		return httpToFuseStatus(err)
 	}
@@ -10230,6 +10249,11 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	if fs.shouldUseExtentPath(childP) {
 		return fs.extentSymlink(cancel, header, pointedTo, linkName, childP, out)
 	}
+
+	// A prior unlink of this name may still have its deferred remote DELETE
+	// in flight; creating the symlink before it lands would hit the stale
+	// remote object (server 409 -> spurious EEXIST).
+	fs.awaitPendingRemoteDelete(childP)
 
 	var err error
 	if fs.layerEnabled() {
