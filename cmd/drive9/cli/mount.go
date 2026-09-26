@@ -172,7 +172,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	readCacheTTL := fs.Duration("read-cache-ttl", 30*time.Second, "read cache TTL; 0 disables time-based expiry")
 	diskReadCacheSize := fs.Int64("disk-read-cache-size-mb", 1024, "disk-backed read cache size in MB")
 	diskReadCacheFreeRatio := fs.Float64("disk-read-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before disk read cache evicts")
-	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL")
+	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL (default 10s; coding-agent 30s)")
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL")
 	entryTTL := fs.Duration("entry-ttl", 10*time.Second, "kernel entry cache TTL")
 	flushDebounce := fs.Duration("flush-debounce", -1, "debounce window for small-file flush coalescing (default 2s, 0 disables)")

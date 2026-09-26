@@ -754,7 +754,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "--read-cache-ttl DURATION", Desc: "read cache TTL; 0 disables time-based expiry"},
 					{Name: "--disk-read-cache-size-mb MB", Desc: "disk-backed read cache size"},
 					{Name: "--disk-read-cache-free-ratio FLOAT", Desc: "minimum filesystem free-space ratio before disk cache evicts"},
-					{Name: "--dir-ttl DURATION", Desc: "directory cache TTL"},
+					{Name: "--dir-ttl DURATION", Desc: "directory cache TTL; default 10s, coding-agent 30s"},
 					{Name: "--dir-cache-max-entries N", Desc: "maximum entries per directory in the namespace cache before complete marking is disabled"},
 					{Name: "--attr-ttl DURATION", Desc: "kernel attr cache TTL"},
 					{Name: "--entry-ttl DURATION", Desc: "kernel entry cache TTL"},

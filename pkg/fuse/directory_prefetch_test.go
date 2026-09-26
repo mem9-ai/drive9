@@ -587,6 +587,36 @@ func TestDirectoryPrefetchDoesNotScheduleWhileSSEUnverified(t *testing.T) {
 	}
 }
 
+func TestCodingAgentListDirBypassesCachedListingWhileSSEUnverified(t *testing.T) {
+	var listCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || request.URL.Query().Get("list") != "1" {
+			t.Errorf("unexpected request %s %s?%s", request.Method, request.URL.Path, request.URL.RawQuery)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		listCalls.Add(1)
+		writeDirectoryListing(t, w, []client.FileInfo{{Name: "fresh.txt", Revision: 2}})
+	}))
+	defer server.Close()
+
+	fs := newDirectoryPrefetchTestFS(server.URL, defaultNamespaceCacheMaxEntries)
+	defer fs.OnUnmount()
+	fs.dirCache.Put("/repo", []CachedFileInfo{{Name: "stale.txt", Revision: 1}})
+	fs.markStatCacheUnverified()
+
+	entries, err := fs.listDir(context.Background(), "/repo")
+	if err != nil {
+		t.Fatalf("listDir: %v", err)
+	}
+	if got := listCalls.Load(); got != 1 {
+		t.Fatalf("LIST calls = %d, want 1 while SSE is unverified", got)
+	}
+	if len(entries) != 1 || entries[0].Name != "fresh.txt" {
+		t.Fatalf("entries = %+v, want fresh.txt", entries)
+	}
+}
+
 func TestDirectoryPrefetchUnmountCancelsSharedRequest(t *testing.T) {
 	started := make(chan struct{}, 1)
 	canceled := make(chan struct{}, 1)

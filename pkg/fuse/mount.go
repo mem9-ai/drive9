@@ -46,7 +46,7 @@ type MountOptions struct {
 	ReadCacheTTL                 time.Duration // ReadCache TTL (default 30s; negative disables time-based expiry)
 	DiskReadCacheSize            int64         // disk-backed read cache max size in bytes (default 1GiB)
 	DiskReadCacheFreeRatio       float64       // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
-	DirTTL                       time.Duration // DirCache TTL (default 10s)
+	DirTTL                       time.Duration // DirCache TTL (default 10s; coding-agent 30s)
 	AttrTTL                      time.Duration // kernel attr cache TTL (default 60s; coding-agent 5m)
 	EntryTTL                     time.Duration // kernel entry cache TTL (default 60s; coding-agent 5m)
 	NegativeEntryTTL             time.Duration // kernel negative entry cache TTL (default 1s)
@@ -152,12 +152,14 @@ func (o *MountOptions) setDefaults() {
 	if o.DiskReadCacheFreeRatio <= 0 {
 		o.DiskReadCacheFreeRatio = defaultDiskReadCacheFreeRatio
 	}
-	if o.DirTTL <= 0 {
-		o.DirTTL = defaultDirCacheTTL
-	}
+	dirCacheTTL := defaultDirCacheTTL
 	positiveKernelCacheTTL := defaultPositiveKernelCacheTTL
 	if o.Profile == MountProfileCodingAgent {
+		dirCacheTTL = defaultCodingAgentDirCacheTTL
 		positiveKernelCacheTTL = defaultCodingAgentPositiveKernelCacheTTL
+	}
+	if o.DirTTL <= 0 {
+		o.DirTTL = dirCacheTTL
 	}
 	if o.AttrTTL <= 0 {
 		o.AttrTTL = positiveKernelCacheTTL

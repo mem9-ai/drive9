@@ -9128,9 +9128,12 @@ func TestLazyWritablePreloadUsesRenamedPath(t *testing.T) {
 	}
 }
 
-func TestDefaultTTLIs60Seconds(t *testing.T) {
+func TestDefaultCacheTTLs(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
+	if opts.DirTTL != defaultDirCacheTTL {
+		t.Fatalf("default DirTTL = %v, want %v", opts.DirTTL, defaultDirCacheTTL)
+	}
 	if opts.AttrTTL != defaultPositiveKernelCacheTTL {
 		t.Fatalf("default AttrTTL = %v, want %v", opts.AttrTTL, defaultPositiveKernelCacheTTL)
 	}
@@ -9142,9 +9145,12 @@ func TestDefaultTTLIs60Seconds(t *testing.T) {
 	}
 }
 
-func TestCodingAgentDefaultPositiveKernelCacheTTL(t *testing.T) {
+func TestCodingAgentDefaultCacheTTLs(t *testing.T) {
 	opts := &MountOptions{Profile: MountProfileCodingAgent}
 	opts.setDefaults()
+	if opts.DirTTL != defaultCodingAgentDirCacheTTL {
+		t.Fatalf("coding-agent DirTTL = %v, want %v", opts.DirTTL, defaultCodingAgentDirCacheTTL)
+	}
 	if opts.AttrTTL != defaultCodingAgentPositiveKernelCacheTTL {
 		t.Fatalf("coding-agent AttrTTL = %v, want %v", opts.AttrTTL, defaultCodingAgentPositiveKernelCacheTTL)
 	}
@@ -9153,18 +9159,42 @@ func TestCodingAgentDefaultPositiveKernelCacheTTL(t *testing.T) {
 	}
 }
 
-func TestCodingAgentKeepsExplicitPositiveKernelCacheTTL(t *testing.T) {
+func TestCodingAgentKeepsExplicitCacheTTLs(t *testing.T) {
 	opts := &MountOptions{
 		Profile:  MountProfileCodingAgent,
+		DirTTL:   7 * time.Second,
 		AttrTTL:  5 * time.Second,
 		EntryTTL: 6 * time.Second,
 	}
 	opts.setDefaults()
+	if opts.DirTTL != 7*time.Second {
+		t.Fatalf("explicit DirTTL = %v, want 7s", opts.DirTTL)
+	}
 	if opts.AttrTTL != 5*time.Second {
 		t.Fatalf("explicit AttrTTL = %v, want 5s", opts.AttrTTL)
 	}
 	if opts.EntryTTL != 6*time.Second {
 		t.Fatalf("explicit EntryTTL = %v, want 6s", opts.EntryTTL)
+	}
+}
+
+func TestCodingAgentDirCacheTTLExpiresAfterThirtySeconds(t *testing.T) {
+	opts := &MountOptions{Profile: MountProfileCodingAgent}
+	opts.setDefaults()
+
+	now := time.Unix(1, 0)
+	cache := NewDirCache(opts.DirTTL)
+	cache.now = func() time.Time { return now }
+	cache.Put("/repo", []CachedFileInfo{{Name: "README.md"}})
+
+	now = now.Add(15 * time.Second)
+	if _, ok := cache.Get("/repo"); !ok {
+		t.Fatal("coding-agent directory cache expired before 30 seconds")
+	}
+
+	now = now.Add(16 * time.Second)
+	if _, ok := cache.Get("/repo"); ok {
+		t.Fatal("coding-agent directory cache remained valid after 30 seconds")
 	}
 }
 

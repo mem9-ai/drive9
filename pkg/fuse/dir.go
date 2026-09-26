@@ -11,6 +11,7 @@ import (
 
 const (
 	defaultDirCacheTTL              = 10 * time.Second
+	defaultCodingAgentDirCacheTTL   = 30 * time.Second
 	defaultNamespaceCacheMaxEntries = 200000
 
 	// escalateMissThreshold/escalateMissWindow detect negative-lookup storms:

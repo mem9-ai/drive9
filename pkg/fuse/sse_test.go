@@ -265,6 +265,22 @@ func TestSSEWatcherStreamCurrentVerifiesStatCache(t *testing.T) {
 	}
 }
 
+func TestSSEDisconnectInvalidatesDirectoryCache(t *testing.T) {
+	opts := &MountOptions{Profile: MountProfileCodingAgent}
+	opts.setDefaults()
+	fs := &Dat9FS{dirCache: NewDirCache(opts.DirTTL)}
+	fs.dirCache.Put("/repo", []CachedFileInfo{{Name: "stale.txt", Revision: 1}})
+
+	fs.markStatCacheUnverified()
+
+	if _, ok := fs.dirCache.Get("/repo"); ok {
+		t.Fatal("directory cache remained valid after SSE disconnect")
+	}
+	if fs.statCacheVerified() {
+		t.Fatal("stat cache remained verified after SSE disconnect")
+	}
+}
+
 func TestSSEWatcherHandleChangeFiltersAndRebasesRemoteRoot(t *testing.T) {
 	opts := &MountOptions{
 		CacheSize:  1 << 20,

@@ -6916,6 +6916,9 @@ func (fs *Dat9FS) markStatCacheUnverified() {
 	fs.mountViewMu.Lock()
 	fs.statCacheTrustEpoch.Add(1)
 	fs.statCacheUnverified.Store(true)
+	if fs.dirCache != nil {
+		fs.dirCache.InvalidateAll()
+	}
 	if fs.metadataPrefetch != nil {
 		fs.metadataPrefetch.clear()
 	}
@@ -12248,13 +12251,23 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 		return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergePendingDirEntries(dirPath, entries))
 	}
 
-	// Check dir cache first
-	if cached, ok := fs.dirCache.Get(dirPath); ok {
-		if fs.perf != nil {
-			fs.perf.dirCacheHit.add(1)
+	// A complete listing is safe to reuse only while the SSE stream is known
+	// current. During disconnect/replay, fetch a fresh snapshot instead of
+	// extending the profile's directory-cache window across an event gap.
+	if fs.statCacheVerified() {
+		cached, ok := fs.dirCache.Get(dirPath)
+		if ok {
+			if fs.perf != nil {
+				fs.perf.dirCacheHit.add(1)
+			}
+			entries := fs.cachedToDirEntries(dirPath, cached)
+			return fs.composeDirEntries(ctx, dirPath, entries)
 		}
-		entries := fs.cachedToDirEntries(dirPath, cached)
-		return fs.composeDirEntries(ctx, dirPath, entries)
+	} else {
+		// A listing fetched during replay must not merge with another snapshot
+		// from the same unverified window. Local mutations that race the new
+		// request are still preserved by the DirCache request-generation fence.
+		fs.dirCache.Invalidate(dirPath)
 	}
 	if fs.perf != nil {
 		fs.perf.dirCacheMiss.add(1)
