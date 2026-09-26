@@ -274,6 +274,318 @@ func TestPR939ReviewNormalSequentialAppend(t *testing.T) {
 	}
 }
 
+func TestIssue986AppendVisibleBeforeWriterClose(t *testing.T) {
+	const path = "/append-visible.txt"
+	fs, ino := pr939HandleFS(t, path, "hello")
+	fs.readCache.Put(path, []byte("hello"), 1)
+	writer, writerID := pr939Handle(t, fs, ino, path, "hello", false)
+	t.Cleanup(func() { fs.deleteFileHandle(writerID, writer) })
+
+	if n, st := pr939Append(fs, ino, writerID, " gopher"); st != gofuse.OK || n != 7 {
+		t.Fatalf("append: n=%d status=%v", n, st)
+	}
+
+	reader := &FileHandle{Ino: ino, Path: path, BaseRev: 1, OrigSize: 5, WritePolicy: WritePolicyWriteBack}
+	readerID := fs.allocateFileHandle(reader)
+	t.Cleanup(func() { fs.deleteFileHandle(readerID, reader) })
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino}, Fh: readerID, Size: uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("read: %v", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK || string(got) != "hello gopher" {
+		t.Fatalf("read before writer close: got %q status=%v, want hello gopher", got, st)
+	}
+}
+
+func TestIssue986PreopenedReadWriteReaderSeesAppend(t *testing.T) {
+	const path = "/append-preopened-rdwr.txt"
+	fs, ino := pr939HandleFS(t, path, "hello")
+	reader := &FileHandle{
+		Ino: ino, Path: path, BaseRev: 1, OrigSize: 5,
+		Flags: uint32(syscall.O_RDWR), WritePolicy: WritePolicyWriteBack,
+		LineageTrusted: true, Dirty: fs.newWriteBuffer(path, maxPreloadSize, 0),
+	}
+	if n, err := reader.Dirty.Write(0, []byte("hello")); err != nil || n != 5 {
+		t.Fatalf("preload reader: n=%d err=%v", n, err)
+	}
+	reader.Dirty.ClearDirty()
+	readerID := fs.allocateFileHandle(reader)
+	t.Cleanup(func() { fs.deleteFileHandle(readerID, reader) })
+
+	writer, writerID := pr939Handle(t, fs, ino, path, "hello", false)
+	t.Cleanup(func() { fs.deleteFileHandle(writerID, writer) })
+	if n, st := pr939Append(fs, ino, writerID, " gopher"); st != gofuse.OK || n != 7 {
+		t.Fatalf("append: n=%d status=%v", n, st)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		offset uint64
+		want   string
+	}{
+		{name: "whole file", offset: 0, want: "hello gopher"},
+		{name: "old EOF", offset: 5, want: " gopher"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := make([]byte, 64)
+			result, st := fs.Read(nil, &gofuse.ReadIn{
+				InHeader: gofuse.InHeader{NodeId: ino}, Fh: readerID,
+				Offset: tc.offset, Size: uint32(len(buf)),
+			}, buf)
+			if st != gofuse.OK {
+				t.Fatalf("read: %v", st)
+			}
+			got, st := result.Bytes(buf)
+			if st != gofuse.OK || string(got) != tc.want {
+				t.Fatalf("read: got %q status=%v, want %q", got, st, tc.want)
+			}
+		})
+	}
+
+	if n, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino}, Fh: readerID,
+	}, []byte("HELLO")); st != gofuse.OK || n != 5 {
+		t.Fatalf("reader's own write: n=%d status=%v", n, st)
+	}
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino}, Fh: readerID, Size: uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("read own write: %v", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK || string(got) != "HELLO" {
+		t.Fatalf("read own write: got %q status=%v, want HELLO", got, st)
+	}
+}
+
+func TestIssue986PreopenedReaderOwnWriteWinsDuringAppendRead(t *testing.T) {
+	const path = "/append-rdwr-race.txt"
+	fs, ino := pr939HandleFS(t, path, "hello")
+	reader := &FileHandle{
+		Ino: ino, Path: path, BaseRev: 1, OrigSize: 5,
+		Flags: uint32(syscall.O_RDWR), WritePolicy: WritePolicyWriteBack,
+		LineageTrusted: true, Dirty: fs.newWriteBuffer(path, maxPreloadSize, 0),
+	}
+	if n, err := reader.Dirty.Write(0, []byte("hello")); err != nil || n != 5 {
+		t.Fatalf("preload reader: n=%d err=%v", n, err)
+	}
+	reader.Dirty.ClearDirty()
+	readerID := fs.allocateFileHandle(reader)
+	t.Cleanup(func() { fs.deleteFileHandle(readerID, reader) })
+	writer, writerID := pr939Handle(t, fs, ino, path, "hello", false)
+	t.Cleanup(func() { fs.deleteFileHandle(writerID, writer) })
+	if n, st := pr939Append(fs, ino, writerID, " gopher"); st != gofuse.OK || n != 7 {
+		t.Fatalf("append: n=%d status=%v", n, st)
+	}
+
+	scanned := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce, hookOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		unblock()
+		testHookAfterSamePathDirtyHandleScan = nil
+	})
+	testHookAfterSamePathDirtyHandleScan = func(p string) {
+		if p == path {
+			hookOnce.Do(func() { close(scanned) })
+			<-release
+		}
+	}
+
+	type outcome struct {
+		data string
+		st   gofuse.Status
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		buf := make([]byte, 64)
+		result, st := fs.Read(nil, &gofuse.ReadIn{
+			InHeader: gofuse.InHeader{NodeId: ino}, Fh: readerID, Size: uint32(len(buf)),
+		}, buf)
+		if st != gofuse.OK {
+			done <- outcome{st: st}
+			return
+		}
+		data, st := result.Bytes(buf)
+		done <- outcome{data: string(data), st: st}
+	}()
+	select {
+	case <-scanned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader did not reach sibling append scan")
+	}
+	if n, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino}, Fh: readerID,
+	}, []byte("HELLO")); st != gofuse.OK || n != 5 {
+		t.Fatalf("reader's own write: n=%d status=%v", n, st)
+	}
+	unblock()
+	select {
+	case got := <-done:
+		if got.st != gofuse.OK || got.data != "HELLO" {
+			t.Fatalf("read after own write: got %+v, want HELLO", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader did not finish after sibling scan")
+	}
+}
+
+func TestIssue986AppendVisibleAfterNewerDirtyMarkerCleared(t *testing.T) {
+	const path = "/append-older-dirty.txt"
+	fs, ino := pr939HandleFS(t, path, "hello")
+	writer, writerID := pr939Handle(t, fs, ino, path, "hello", false)
+	t.Cleanup(func() { fs.deleteFileHandle(writerID, writer) })
+	if n, st := pr939Append(fs, ino, writerID, " gopher"); st != gofuse.OK || n != 7 {
+		t.Fatalf("append: n=%d status=%v", n, st)
+	}
+
+	// A later failed mutation can clear the inode's latest marker while this
+	// writer's acknowledged append remains in its open dirty handle.
+	laterSeq := fs.markDirtySize(ino, 12)
+	fs.clearDirtySize(ino, laterSeq)
+	if _, dirty := fs.dirtyHandleSize(ino); dirty || writer.DirtySeq == 0 {
+		t.Fatalf("setup: inode marker dirty=%t, writer seq=%d", dirty, writer.DirtySeq)
+	}
+	fs.readCache.Put(path, []byte("hello"), 1)
+
+	reader := &FileHandle{Ino: ino, Path: path, BaseRev: 1, OrigSize: 5, WritePolicy: WritePolicyWriteBack}
+	readerID := fs.allocateFileHandle(reader)
+	t.Cleanup(func() { fs.deleteFileHandle(readerID, reader) })
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino}, Fh: readerID, Size: uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("read: %v", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK || string(got) != "hello gopher" {
+		t.Fatalf("read after newer marker cleared: got %q status=%v, want hello gopher", got, st)
+	}
+}
+
+func TestIssue986BusyWriterDoesNotExposeStaleContent(t *testing.T) {
+	const path = "/append-busy-visible.txt"
+	fs, ino := pr939HandleFS(t, path, "hello")
+	fs.readCache.Put(path, []byte("hello"), 1)
+	writer, writerID := pr939Handle(t, fs, ino, path, "hello", false)
+	t.Cleanup(func() { fs.deleteFileHandle(writerID, writer) })
+	if n, st := pr939Append(fs, ino, writerID, " gopher"); st != gofuse.OK || n != 7 {
+		t.Fatalf("append: n=%d status=%v", n, st)
+	}
+
+	reader := &FileHandle{Ino: ino, Path: path, BaseRev: 1, OrigSize: 5, WritePolicy: WritePolicyWriteBack}
+	readerID := fs.allocateFileHandle(reader)
+	t.Cleanup(func() { fs.deleteFileHandle(readerID, reader) })
+	buf := make([]byte, 64)
+	input := &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino}, Fh: readerID, Size: uint32(len(buf)),
+	}
+	type readOutcome struct {
+		data string
+		st   gofuse.Status
+	}
+	cancel := make(chan struct{})
+	defer close(cancel)
+	done := make(chan readOutcome, 1)
+	writer.Lock()
+	go func() {
+		result, st := fs.Read(cancel, input, buf)
+		if st != gofuse.OK {
+			done <- readOutcome{st: st}
+			return
+		}
+		data, st := result.Bytes(buf)
+		done <- readOutcome{data: string(data), st: st}
+	}()
+	select {
+	case got := <-done:
+		writer.Unlock()
+		t.Fatalf("read returned while writer was busy: %+v", got)
+	case <-time.After(samePathDirtyWaitTimeout + 50*time.Millisecond):
+	}
+	writer.Unlock()
+	select {
+	case got := <-done:
+		if got.st != gofuse.OK || got.data != "hello gopher" {
+			t.Fatalf("read after writer unlock: got %+v, want hello gopher", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("read did not finish after writer unlocked")
+	}
+}
+
+func TestIssue986NewestUnreadableAppendDoesNotUseOlderSnapshot(t *testing.T) {
+	const path = "/append-newest-unreadable.txt"
+	fs, ino := pr939HandleFS(t, path, "old-data")
+	older, olderID := pr939Handle(t, fs, ino, path, "old-data", true)
+	t.Cleanup(func() { fs.deleteFileHandle(olderID, older) })
+	newer := &FileHandle{
+		Ino: ino, Path: path, BaseRev: 1,
+		Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND),
+		Dirty: fs.newWriteBuffer(path, maxPreloadSize, 4),
+	}
+	newer.Dirty.totalSize = 8
+	newer.Dirty.remoteSize = 8
+	newer.Dirty.LoadPart = func(int) ([]byte, error) { return nil, syscall.EIO }
+	newer.DirtySeq = fs.markDirtySize(ino, 8)
+	newerID := fs.allocateFileHandle(newer)
+	t.Cleanup(func() { fs.deleteFileHandle(newerID, newer) })
+
+	reader := &FileHandle{Ino: ino, Path: path, WritePolicy: WritePolicyWriteBack}
+	_, n, ok, st, pending := fs.readSamePathDirtyHandleAllowJournalsOnce(path, reader, 0, 8)
+	if ok || n != 0 || st != gofuse.OK || !pending {
+		t.Fatalf("newest unavailable: n=%d ok=%t status=%v pending=%t, want no older snapshot", n, ok, st, pending)
+	}
+	readerID := fs.allocateFileHandle(reader)
+	t.Cleanup(func() { fs.deleteFileHandle(readerID, reader) })
+	fs.remoteReadTimeout = time.Millisecond
+	buf := make([]byte, 8)
+	_, st = fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino}, Fh: readerID, Size: uint32(len(buf)),
+	}, buf)
+	if st != gofuse.EIO {
+		t.Fatalf("read with unavailable newest append: status=%v, want EIO instead of older bytes", st)
+	}
+}
+
+func TestIssue986ReadSkipsDifferentInodeAtSamePath(t *testing.T) {
+	const path = "/append-replaced.txt"
+	fs, ino := pr939HandleFS(t, path, "new")
+	fs.readCache.Put(path, []byte("new"), 1)
+	writer, writerID := pr939Handle(t, fs, ino, path, "new", false)
+	t.Cleanup(func() { fs.deleteFileHandle(writerID, writer) })
+	if n, st := pr939Append(fs, ino, writerID, " bytes"); st != gofuse.OK || n != 6 {
+		t.Fatalf("append: n=%d status=%v", n, st)
+	}
+
+	oldIno := fs.inodes.Lookup("/old-append.txt", false, 3, time.Now())
+	oldWriter, oldID := pr939Handle(t, fs, oldIno, path, "old", true)
+	t.Cleanup(func() { fs.deleteFileHandle(oldID, oldWriter) })
+	reader := &FileHandle{Ino: ino, Path: path, BaseRev: 1, OrigSize: 3, WritePolicy: WritePolicyWriteBack}
+	readerID := fs.allocateFileHandle(reader)
+	t.Cleanup(func() { fs.deleteFileHandle(readerID, reader) })
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino}, Fh: readerID, Size: uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("read: %v", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK || string(got) != "new bytes" {
+		t.Fatalf("read after path replacement: got %q status=%v, want new bytes", got, st)
+	}
+}
+
 func TestPR939ReviewShorterSiblingRefresh(t *testing.T) {
 	const path = "/_cacache/index-v5/review-shrink"
 	fs, ino := pr939HandleFS(t, path, "ABCDEF")
