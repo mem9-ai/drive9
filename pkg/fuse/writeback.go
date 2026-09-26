@@ -70,6 +70,12 @@ type WriteBackMeta struct {
 	HasMode          bool        `json:"has_mode,omitempty"`
 	SnapshotID       string      `json:"-"`
 	ParentSnapshotID string      `json:"-"`
+	Inode            uint64      `json:"-"`
+	MutationSeq      uint64      `json:"-"`
+	// Bound to a handle snapshot when it is published. A later path lookup
+	// cannot prove that staging still belongs to this cache generation.
+	ownedStagingGens  StagingGens
+	ownedStagingKnown bool
 	// lineageTrusted is deliberately process-local and never serialized.
 	// Recovering a mutable path-keyed payload cannot prove that the bytes and
 	// JSON metadata were replaced atomically across a crash.
@@ -279,7 +285,7 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 // used by FileHandle staging. Legacy callers deliberately store empty lineage,
 // which is safe because such metadata cannot authorize a growth rebase.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
-	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, true, liveAncestors)
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, true, liveAncestors, 0, 0, nil, nil)
 }
 
 // PutWithBaseRevAndModeAndLineageTimingsNoSync is the non-durable variant of
@@ -289,10 +295,14 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath strin
 // elsewhere — the shadow store + pending index — so at most the snapshot's
 // freshness (not its integrity) is lost on a crash.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsNoSync(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
-	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, false, liveAncestors)
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, false, liveAncestors, 0, 0, nil, nil)
 }
 
-func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, durable bool, liveAncestors []string) (uint64, WriteBackPutTimings, error) {
+func (c *WriteBackCache) putHandleSnapshot(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted, durable bool, liveAncestors []string, ino, seq uint64, ownedStaging StagingGens, publishPending func() uint64) (uint64, WriteBackPutTimings, error) {
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, durable, liveAncestors, ino, seq, &ownedStaging, publishPending)
+}
+
+func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, durable bool, liveAncestors []string, ino, seq uint64, ownedStaging *StagingGens, publishPending func() uint64) (uint64, WriteBackPutTimings, error) {
 	var t WriteBackPutTimings
 
 	// Phase 1: acquire per-path lock (serializes same-path Put/Remove/etc.)
@@ -331,8 +341,15 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 		HasMode:          hasMode,
 		SnapshotID:       snapshotID,
 		ParentSnapshotID: parentSnapshotID,
+		Inode:            ino,
+		MutationSeq:      seq,
 		lineageTrusted:   lineageTrusted,
 		liveAncestors:    append([]string(nil), liveAncestors...),
+	}
+	if ownedStaging != nil {
+		meta.ownedStagingGens = *ownedStaging
+		meta.ownedStagingGens.WriteBackGen = gen
+		meta.ownedStagingKnown = true
 	}
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
@@ -347,6 +364,14 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 		return 0, t, fmt.Errorf("writeback put meta: %w", err)
 	}
 	t.MetaWrite = time.Since(metaStart)
+	// Keep the cache path locked until the fallback pending index is published
+	// and bound to this snapshot. A queued uploader must not see the new cache
+	// generation with a zero (or previous) pending-index generation.
+	if publishPending != nil {
+		if pendingGen := publishPending(); pendingGen != 0 {
+			meta.ownedStagingGens.PendingIndexGen = pendingGen
+		}
+	}
 
 	// Phase 3: publish in-memory state under global lock (fast, no I/O).
 	c.mu.Lock()
@@ -519,10 +544,9 @@ func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []by
 
 // GetMetaAndViewWithCallback is like GetMetaAndView but invokes onLocked while
 // the per-path lock is still held (after the meta+data snapshot is read). This
-// lets callers atomically capture associated staging-store generations (e.g.
-// pendingIndex/shadowStore) under the same serialization window so a concurrent
-// same-path Put cannot race the snapshot and leave a stale upload holding newer
-// generations it is not responsible for.
+// lets legacy callers snapshot path staging under the cache serialization
+// window. A path snapshot is not proof of handle ownership: staging may have
+// changed before its newer cache snapshot was published.
 func (c *WriteBackCache) GetMetaAndViewWithCallback(remotePath string, onLocked func()) (*WriteBackMeta, []byte, bool) {
 	pl := c.acquirePathLock(remotePath)
 	defer c.releasePathLock(remotePath, pl)
@@ -542,8 +566,7 @@ func (c *WriteBackCache) GetMetaAndViewWithCallback(remotePath string, onLocked 
 		return nil, nil, false
 	}
 
-	// Invoke the callback while the path lock is still held so staging-gen
-	// snapshots are consistent with this meta+data read.
+	// Invoke the callback while the cache path lock is still held.
 	if onLocked != nil {
 		onLocked()
 	}

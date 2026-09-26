@@ -127,7 +127,7 @@ func (fs *Dat9FS) hasLocalWriteState(p string) bool {
 		if fs.hasOpenHandle(ino, p) {
 			return true
 		}
-		if _, dirty := fs.dirtyHandleSize(ino); dirty {
+		if _, dirty, busy := fs.dirtyHandleSize(ino); dirty || busy {
 			return true
 		}
 	}

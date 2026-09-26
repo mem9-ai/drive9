@@ -37,11 +37,9 @@ type pathState struct {
 
 type WriteBackSuccessFunc func(meta WriteBackMeta, committedRev int64, gens StagingGens)
 
-// StagingGens captures the generations of the writeBack, pendingIndex and
-// shadowStore entries associated with a writeBack entry at the moment it is
-// read for upload. This lets the OnSuccess callback perform generation-guarded
-// cleanup so a stale upload does not remove a fresher same-path staging entry
-// that was created by a concurrent write while the upload was in flight.
+// StagingGens identifies content staging associated with a writeBack entry.
+// Handle snapshots bind these generations when published; legacy entries use
+// a path snapshot at upload time. Cleanup removes only matching generations.
 type StagingGens struct {
 	WriteBackGen    uint64
 	PendingIndexGen uint64
@@ -49,9 +47,9 @@ type StagingGens struct {
 }
 
 // SnapshotStagingGensFunc snapshots the pendingIndex and shadowStore generations
-// for a path. If either store is absent or has no entry, the corresponding gen
-// is 0 (which never matches, so the guarded remove is skipped). Optional — if
-// nil, OnSuccess receives zero-value gens.
+// for a legacy entry. If either store is absent or has no entry, the
+// corresponding gen is 0 and guarded removal is skipped. Optional — if nil,
+// uploads without bound handle ownership receive zero-value gens.
 type SnapshotStagingGensFunc func(remotePath string) StagingGens
 
 // WriteBackUploader consumes pending write-back cache entries and uploads
@@ -80,10 +78,11 @@ type WriteBackUploader struct {
 	// stop+close, so a late Submit can never send on a closed channel.
 	submitMu sync.Mutex
 
-	perf      *fusePerfCounters
-	OnSuccess WriteBackSuccessFunc
+	perf            *fusePerfCounters
+	OnSuccess       WriteBackSuccessFunc
+	OnDataCommitted func(meta WriteBackMeta, committedRev int64, gens StagingGens)
 	// SnapshotStagingGens optionally captures the pendingIndex/shadowStore
-	// generations for a path so OnSuccess can do generation-guarded cleanup.
+	// generations for legacy uploads without handle-bound staging ownership.
 	SnapshotStagingGens SnapshotStagingGensFunc
 }
 
@@ -397,9 +396,8 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	// replace the data between GetMeta and getView, causing the uploader to
 	// upload new data with old baseRev/generation. The onLocked callback
 	// captures the staging-store generations under the same path-lock window so
-	// the OnSuccess cleanup is generation-guarded consistently — a concurrent
-	// same-path write cannot race the snapshot and leave a stale upload holding
-	// newer generations it is not responsible for.
+	// handle-bound snapshots override this path-level fallback below, since
+	// newer staging may exist before its cache snapshot is published.
 	var stagingGens StagingGens
 	meta, data, ok := u.cache.GetMetaAndViewWithCallback(localPath, func() {
 		if u.SnapshotStagingGens != nil {
@@ -410,9 +408,9 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		return // Already uploaded or removed.
 	}
 	gen := meta.Generation
-	// Use the writeBack generation we just read (authoritative) rather than
-	// a re-read from the snapshot callback, which could race with a concurrent
-	// Put between GetMetaAndView and the callback.
+	if meta.ownedStagingKnown {
+		stagingGens = meta.ownedStagingGens
+	}
 	stagingGens.WriteBackGen = gen
 
 	expectedRevision, err := expectedRevisionForWriteBack(meta)
@@ -469,6 +467,9 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		return
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+	if u.OnDataCommitted != nil {
+		u.OnDataCommitted(*meta, committedRev, stagingGens)
+	}
 	chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	modeErr := u.applyMode(chmodCtx, meta)
 	chmodCancel()
@@ -524,11 +525,20 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 
 	// Atomically read meta + data under one path lock so they are guaranteed
 	// to be from the same generation.
-	meta, data, ok := u.cache.GetMetaAndView(localPath)
+	var stagingGens StagingGens
+	meta, data, ok := u.cache.GetMetaAndViewWithCallback(localPath, func() {
+		if u.SnapshotStagingGens != nil {
+			stagingGens = u.SnapshotStagingGens(localPath)
+		}
+	})
 	if !ok {
 		return 0, nil // not in cache (removed between GetMeta and GetMetaAndView)
 	}
 	gen := meta.Generation
+	if meta.ownedStagingKnown {
+		stagingGens = meta.ownedStagingGens
+	}
+	stagingGens.WriteBackGen = gen
 
 	expectedRevision, err := expectedRevisionForWriteBack(meta)
 	if err != nil {
@@ -562,6 +572,9 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 		return 0, err
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+	if u.OnDataCommitted != nil {
+		u.OnDataCommitted(*meta, committedRev, stagingGens)
+	}
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
 	err = u.applyMode(chmodCtx, meta)
 	chmodCancel()

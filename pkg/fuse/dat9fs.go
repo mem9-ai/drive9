@@ -1992,6 +1992,9 @@ func (fs *Dat9FS) openFlagsForHandle(fh *FileHandle) uint32 {
 	if fs.kernelCacheBypassActive(fh) {
 		return gofuse.FOPEN_DIRECT_IO
 	}
+	if _, pending := fs.pendingFtruncateSeq(fh.Ino); pending {
+		return gofuse.FOPEN_DIRECT_IO
+	}
 	return flags
 }
 
@@ -2134,15 +2137,35 @@ func (fs *Dat9FS) localPath(remotePath string) (string, bool) {
 	return mountpath.ToLocal(fs.remoteRoot(), remotePath)
 }
 
-func (fs *Dat9FS) dirtyHandleSize(ino uint64) (int64, bool) {
+func (fs *Dat9FS) dirtyHandleSize(ino uint64) (int64, bool, bool) {
 	fs.dirtyMu.Lock()
-	defer fs.dirtyMu.Unlock()
-
 	state, ok := fs.dirtyInodes[ino]
+	fs.dirtyMu.Unlock()
+	if latestSeq, pending := fs.pendingFtruncateSeq(ino); pending {
+		if ok && state.seq == latestSeq {
+			return state.size, true, false
+		}
+		return fs.pendingFtruncateHandleSize(ino, latestSeq)
+	}
 	if !ok {
+		return 0, false, false
+	}
+	return state.size, true, false
+}
+
+func (fs *Dat9FS) pendingFtruncateSeq(ino uint64) (uint64, bool) {
+	fs.dirtyMu.Lock()
+	state := fs.dirtyInodes[ino]
+	committedSeq := fs.mutationInodes[ino].committedSeq
+	fs.dirtyMu.Unlock()
+	markedSeq, pending := fs.openHandles.VisibleTruncateSeq(ino, committedSeq)
+	if !pending {
 		return 0, false
 	}
-	return state.size, true
+	if state.seq > markedSeq && state.seq > committedSeq {
+		return state.seq, true
+	}
+	return markedSeq, true
 }
 
 func (fs *Dat9FS) markDirtySize(ino uint64, size int64) uint64 {
@@ -2217,7 +2240,7 @@ func (fs *Dat9FS) interruptSafeMutationsEnabled() bool {
 }
 
 func (fs *Dat9FS) recordCommittedMutation(ino uint64, seq uint64, revision int64, size int64) {
-	if !fs.gvisorCompatibilityEnabled() || ino == 0 || seq == 0 {
+	if ino == 0 || seq == 0 || (!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(ino)) {
 		return
 	}
 
@@ -2235,10 +2258,16 @@ func (fs *Dat9FS) recordCommittedMutation(ino uint64, seq uint64, revision int64
 		state.latestSeq = seq
 	}
 	fs.mutationInodes[ino] = state
-	if dirty, ok := fs.dirtyInodes[ino]; ok && dirty.seq <= state.committedSeq {
+	if dirty, ok := fs.dirtyInodes[ino]; fs.gvisorCompatibilityEnabled() && ok && dirty.seq <= state.committedSeq {
 		delete(fs.dirtyInodes, ino)
 	}
 	fs.dirtyMu.Unlock()
+}
+
+func (fs *Dat9FS) ftruncateCommittedSeq(ino uint64) uint64 {
+	fs.dirtyMu.Lock()
+	defer fs.dirtyMu.Unlock()
+	return fs.mutationInodes[ino].committedSeq
 }
 
 // recordAppendLogCommittedGeneration publishes an in-process append-log
@@ -4370,8 +4399,14 @@ func (fs *Dat9FS) enqueueStagedShadowCommitLocked(fh *FileHandle) error {
 // writes fsync: pass false only when a durable shadow stage + pending-index
 // entry for the same contents already exist (the Flush post-stage path), so
 // the snapshot remains a pure cache; pass true when the snapshot is the only
-// persisted copy (fallback paths without shadow/pendingIndex).
+// persisted payload (fallback paths without a durable shadow).
 func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle, durable bool) error {
+	return fs.snapshotWriteBackWithPendingLocked(fh, durable, false)
+}
+
+// The fallback publishes its pending index under the write-back path lock,
+// after the durable cache files exist but before uploaders can read the new meta.
+func (fs *Dat9FS) snapshotWriteBackWithPendingLocked(fh *FileHandle, durable, publishPendingIndex bool) error {
 	if fs.writeBack == nil {
 		return nil
 	}
@@ -4432,15 +4467,22 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle, durable bool) error {
 	bvDur := time.Since(bvStart)
 
 	snapshotID, parentSnapshotID := ensureStagedSnapshotLineageLocked(fh)
-	putFn := fs.writeBack.PutWithBaseRevAndModeAndLineageTimings
-	if !durable {
-		// The durable authority for this payload is the shadow store +
-		// pending index (staged durably before this snapshot); the write-back
-		// .dat/.meta are a read/upload cache, so skip their fsyncs (issue
-		// #960: ~12ms of redundant per-close fsyncs on cloud volumes).
-		putFn = fs.writeBack.PutWithBaseRevAndModeAndLineageTimingsNoSync
+	// Bind the handle's own staging generations to this cache snapshot. A
+	// path lookup by the uploader could observe a newer writer's staging.
+	ownedStaging := fs.captureHandleStagingGensLocked(fh)
+	var publishPending func() uint64
+	if publishPendingIndex && fs.pendingIndex != nil {
+		publishPending = func() uint64 {
+			gen, err := fs.pendingIndex.PutWithBaseRev(fh.Path, fh.Dirty.Size(), fs.pendingKindForHandle(fh), fh.BaseRev)
+			if err != nil {
+				safeLogPrintf("fallback pending index put failed for %s: %v", fh.Path, err)
+				return 0
+			}
+			fh.PendingIndexGen = gen
+			return gen
+		}
 	}
-	gen, timings, err := putFn(
+	gen, timings, err := fs.writeBack.putHandleSnapshot(
 		fh.Path,
 		data,
 		fh.Dirty.Size(),
@@ -4451,7 +4493,12 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle, durable bool) error {
 		snapshotID,
 		parentSnapshotID,
 		fh.StagedLineageTrusted,
-		fh.stagedAncestors...,
+		durable,
+		fh.stagedAncestors,
+		fh.Ino,
+		fh.DirtySeq,
+		ownedStaging,
+		publishPending,
 	)
 	if err == nil {
 		// Record the staged generation so unlink-discard can remove only this
@@ -8905,7 +8952,9 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		return gofuse.OK
 	}
 	if entry.Unlinked {
-		if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
+		if size, ok, busy := fs.dirtyHandleSize(input.NodeId); busy {
+			return gofuse.Status(syscall.EAGAIN)
+		} else if ok {
 			entry.Size = size
 		}
 		fs.fillAttr(entry, &out.Attr)
@@ -8965,7 +9014,9 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		return gofuse.OK
 	}
 	{
-		if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
+		if size, ok, busy := fs.dirtyHandleSize(input.NodeId); busy {
+			return gofuse.Status(syscall.EAGAIN)
+		} else if ok {
 			entry.Size = size
 		} else if gitEntry, handled := fs.gitEntry(ctx, entry.Path, false); handled {
 			if gitEntry == nil {
@@ -9726,11 +9777,23 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				var abortStreamer func()
 				fh.Lock()
 				fs.discardSupersededMutationLocked(fh)
+				markVisible := !fs.layerEnabled() && !isSQLiteDirectIOPath(fh.Path)
+				newMarker := markVisible && !fh.Dirty.visibleTruncate
+				if newMarker {
+					fs.openHandles.MarkVisibleTruncate(fh, 0)
+				}
 				var err error
 				abortStreamer, err = fs.truncateWritableHandleLocked(fh, newSize)
 				if err != nil {
+					if newMarker {
+						fs.openHandles.UnmarkVisibleTruncate(fh)
+					}
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
+				}
+				if markVisible {
+					fh.Dirty.visibleTruncate = true
+					fs.openHandles.MarkVisibleTruncate(fh, fh.DirtySeq)
 				}
 				publishTruncate := newSize == 0 && isSQLitePersistentJournalPath(entry.Path) &&
 					!entry.Unlinked && !fh.Unlinked && !fh.UnlinkedSnapshot && fh.UnlinkedData == nil
@@ -13171,6 +13234,21 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		bytesRead = n
 		return gofuse.ReadResultData(result), gofuse.OK
 	}
+	if !fh.Unlinked && !fh.UnlinkedSnapshot && fh.UnlinkedData == nil && !isSQLiteDirectIOPath(fh.Path) {
+		readerPath := fh.Path
+		readerSeq := fh.DirtySeq
+		readerMarked := fh.Dirty != nil && fh.Dirty.visibleTruncate
+		fh.Unlock()
+		if data, n, ok, st := fs.readPendingFtruncateVisibleRange(ctx, fh, readerPath, readerSeq, readerMarked, int64(input.Offset), input.Size); ok || st != gofuse.OK {
+			source = "pending-ftruncate"
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
+		fh.Lock()
+	}
 	fs.refreshCleanCommittedRevisionForHandleLocked(fh)
 
 	if fh.ShadowSpill && fs.shadowStore != nil && fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.Dirty.Size() == 0 && !fh.Dirty.hasDirtyPartMarks() && !fh.ZeroBase && fh.Flags&syscall.O_TRUNC == 0 {
@@ -14017,8 +14095,10 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	writeSyncAppendLogState := appendLogHandleState{}
 	writeSyncBeforeDirtySeq := fh.DirtySeq
 	writeSyncTimeOverrides := (*localTimeOverrides)(nil)
+	var writeSyncFtruncateWrites []ftruncateWriteRange
 	if fh.WritePolicy == WritePolicyWriteSync {
 		writeSyncSnapshot = fh.Dirty.snapshot()
+		writeSyncFtruncateWrites = append(writeSyncFtruncateWrites, fh.ftruncateWrites...)
 		writeSyncAppendLogState = fh.appendLog
 		// The dirty-mutation hook below clears armed local time overrides;
 		// a failed write that rolls its content back must re-arm them.
@@ -14103,6 +14183,11 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		source = "dirty-buffer"
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+	if fh.Dirty.visibleTruncate {
+		fs.openHandles.MarkVisibleTruncate(fh, fh.DirtySeq)
+	} else if fs.openHandles.HasVisibleTruncate(fh.Ino) {
+		fh.recordFtruncateWriteLocked(writeOffset, writeOffset+int64(n))
+	}
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
 	if fh.Flags&syscall.O_TRUNC != 0 {
 		fs.armKernelCacheBypass(fh.Ino, fh.Path, fh.BaseRev, fh.Dirty.Size(), "truncate-write")
@@ -14129,6 +14214,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 					fs.discardSupersededMutationLocked(fh)
 				} else if !contentCommitted && !newerDirtyGeneration {
 					fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot, writeSyncBeforeDirtySeq, writeSyncTimeOverrides)
+					fh.ftruncateWrites = writeSyncFtruncateWrites
 					fh.appendLogRestoreFailedWriteState(writeSyncAppendLogState)
 				}
 			}
@@ -14147,6 +14233,7 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 	// explicitly SetAttr'd time acknowledged before the write — is restored.
 	fs.inodes.RestoreLocalTimes(fh.Ino, timeOverrides)
 	if fh.DirtySeq != 0 {
+		fh.discardFtruncateWritesFromSeqLocked(fh.DirtySeq)
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
 	}
@@ -14166,6 +14253,11 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 			}
 		}
 		fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
+	}
+	if fh.Dirty != nil && fh.Dirty.visibleTruncate && fh.DirtySeq != 0 {
+		fs.openHandles.MarkVisibleTruncate(fh, fh.DirtySeq)
+	} else {
+		fs.openHandles.UnmarkVisibleTruncate(fh)
 	}
 	fh.WriteBackSeq = 0
 	clearReadTargetForLockedHandle(fh)
@@ -14813,16 +14905,11 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 
 				phase = "small-snapshot-writeback"
 				snapWBStart2 := time.Now()
-				if err := fs.snapshotWriteBackLocked(fh, true); err != nil {
+				if err := fs.snapshotWriteBackWithPendingLocked(fh, true, true); err != nil {
 					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
 					safeLogPrintf("writeback cache put failed for %s: %v, falling back to sync upload", fh.Path, err)
 				} else {
 					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
-					if fs.pendingIndex != nil {
-						if gen, putErr := fs.pendingIndex.PutWithBaseRev(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev); putErr == nil {
-							fh.PendingIndexGen = gen
-						}
-					}
 					// Snapshot the dirty sequence at cache-write time so
 					// Release can detect whether new writes happened since.
 					fh.WriteBackSeq = fh.DirtySeq
@@ -14948,10 +15035,10 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				}
 			}
 			var mutationRevision int64
-			if err == nil && gvisorCompat {
+			if err == nil && (gvisorCompat || fs.openHandles.HasVisibleTruncate(handleIno)) {
 				mutationRevision = fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
 				fs.recordCommittedMutation(handleIno, mutationSeq, mutationRevision, size)
-				if mutationRevision > 0 {
+				if gvisorCompat && mutationRevision > 0 {
 					fs.refreshCommittedRevisionForOpenHandlesWithSize(handlePath, mutationRevision, fh, size)
 				}
 			}
@@ -16479,13 +16566,15 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 	mutationExpectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	mutationRecorded := false
+	mutationUploadCommitted := false
 	recordMutationBeforeFenceRelease := func() {
-		if mutationRecorded || !fs.gvisorCompatibilityEnabled() || err != nil || mutationSeq == 0 {
+		if mutationRecorded || !mutationUploadCommitted || mutationSeq == 0 ||
+			(!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(mutationIno)) {
 			return
 		}
 		revision := fs.resolveCommittedMutationRevision(mutationPath, fs.latestCommittedRevision(mutationPath), mutationExpectedRevision)
 		fs.recordCommittedMutation(mutationIno, mutationSeq, revision, mutationSize)
-		if revision > 0 {
+		if fs.gvisorCompatibilityEnabled() && revision > 0 {
 			fs.refreshCommittedRevisionForOpenHandlesWithSize(mutationPath, revision, fh, mutationSize)
 		}
 		mutationRecorded = true
@@ -16532,6 +16621,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		perfUploadStart := fs.perfStart()
 		err = streamer.FinishStreaming(ctx, size,
 			lastPartNum, lastCp, dirtyParts)
+		mutationUploadCommitted = err == nil
 		recordMutationBeforeFenceRelease()
 		unlockRemoteCommit()
 		remoteCommitReleased = true
@@ -16616,6 +16706,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fh.Unlock()
 		perfUploadStart := fs.perfStart()
 		err = streamer.UploadAll(ctx, size, partSnapshots)
+		mutationUploadCommitted = err == nil
 		recordMutationBeforeFenceRelease()
 		unlockRemoteCommit()
 		remoteCommitReleased = true
@@ -16882,6 +16973,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	if err == nil {
 		fs.removeSupersededZeroTruncateStagingLocked(handlePath, committedBarrierRev, size)
 	}
+	mutationUploadCommitted = err == nil
 	recordMutationBeforeFenceRelease()
 
 	// Release remoteCommitLock AFTER upload + revision recording but
@@ -17451,7 +17543,7 @@ func (fs *Dat9FS) captureHandleStagingGensLocked(fh *FileHandle) StagingGens {
 }
 
 func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) {
-	if fs == nil || entry == nil || !fs.gvisorCompatibilityEnabled() {
+	if fs == nil || entry == nil || (!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(entry.Inode)) {
 		return
 	}
 	if entry.mutationPublished {
@@ -17462,24 +17554,22 @@ func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) 
 		fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, 0, entry.Size)
 		return
 	}
-	committedRev = fs.resolveCommittedMutationRevision(entry.Path, committedRev, entry.BaseRev)
-	if committedRev <= 0 {
-		return
+	if fs.gvisorCompatibilityEnabled() {
+		committedRev = fs.resolveCommittedMutationRevision(entry.Path, committedRev, entry.BaseRev)
+		if committedRev <= 0 {
+			return
+		}
 	}
 	entry.mutationPublished = true
 	fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, committedRev, entry.Size)
-	if committedRev > 0 {
+	if fs.gvisorCompatibilityEnabled() && committedRev > 0 {
 		fs.refreshCommittedRevisionForOpenHandlesWithSize(entry.Path, committedRev, nil, entry.Size)
 	}
 }
 
-// snapshotStagingGens captures the pendingIndex and shadowStore content
-// generations for remotePath. It deliberately does NOT read writeBack.GetMeta
-// because GetMeta acquires the writeBack per-path lock — calling it from the
-// GetMetaAndViewWithCallback onLocked callback (which already holds that lock)
-// would self-deadlock. The WriteBackGen is set by the caller from the meta it
-// already holds (uploadOne sets it from meta.Generation; the debounced path
-// sets it separately via a safe GetMeta call outside any path lock).
+// snapshotStagingGens is a path-level fallback for legacy cache entries.
+// Handle snapshots carry their own staging generations from publication.
+// Do not read writeBack.GetMeta here: the caller already holds its path lock.
 func (fs *Dat9FS) snapshotStagingGens(remotePath string) StagingGens {
 	var g StagingGens
 	if fs.pendingIndex != nil {
@@ -17489,6 +17579,23 @@ func (fs *Dat9FS) snapshotStagingGens(remotePath string) StagingGens {
 		g.ShadowGen = fs.shadowStore.ActiveGeneration(remotePath)
 	}
 	return g
+}
+
+// onWriteBackDataCommitted settles content staging before fallible chmod;
+// generation guards preserve any newer same-path write.
+func (fs *Dat9FS) onWriteBackDataCommitted(meta WriteBackMeta, committedRev int64, gens StagingGens) {
+	if fs != nil && meta.Inode != 0 && meta.MutationSeq != 0 {
+		fs.recordCommittedMutation(meta.Inode, meta.MutationSeq, committedRev, meta.Size)
+	}
+	if !meta.ownedStagingKnown {
+		return
+	}
+	if fs != nil && fs.pendingIndex != nil && gens.PendingIndexGen != 0 {
+		fs.pendingIndex.RemoveIfGeneration(meta.Path, gens.PendingIndexGen)
+	}
+	if fs != nil && fs.shadowStore != nil && gens.ShadowGen != 0 {
+		fs.shadowStore.RemoveIfGeneration(meta.Path, gens.ShadowGen)
+	}
 }
 
 func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int64, gens StagingGens) {
@@ -17519,8 +17626,8 @@ func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int6
 	// The cleanup is generation-guarded: a newer same-path write may have
 	// bumped the pendingIndex/shadowStore generations while this upload was in
 	// flight, and removing the fresher entry would lose that pending data.
-	// SnapshotStagingGens captured the generations at upload start; we only
-	// remove if they still match.
+	// Handle snapshots use their publication-time owned generations. Legacy
+	// entries retain the path-level fallback, and both remove only matches.
 	if fs.pendingIndex != nil && gens.PendingIndexGen != 0 {
 		fs.pendingIndex.RemoveIfGeneration(meta.Path, gens.PendingIndexGen)
 	}
