@@ -9,6 +9,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/pingcap/failpoint"
 )
 
 type ftruncateWriteRange struct {
@@ -154,7 +155,11 @@ func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, reader *File
 	if !fs.openHandles.HasVisibleTruncate(ino) {
 		return nil, 0, false, gofuse.OK
 	}
-	committedSeq := fs.ftruncateCommittedSeq(ino)
+	fs.dirtyMu.Lock()
+	committed := fs.mutationInodes[ino]
+	dirty := fs.dirtyInodes[ino]
+	fs.dirtyMu.Unlock()
+	committedSeq := committed.committedSeq
 	if committedSeq == 0 {
 		return nil, 0, false, gofuse.OK
 	}
@@ -165,9 +170,6 @@ func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, reader *File
 	if _, linked := entry.Paths[readerPath]; !linked {
 		return nil, 0, false, gofuse.OK
 	}
-	fs.dirtyMu.Lock()
-	dirty := fs.dirtyInodes[ino]
-	fs.dirtyMu.Unlock()
 	if entry.Size == 0 && dirty.seq > committedSeq && dirty.size == 0 {
 		return nil, 0, true, gofuse.OK
 	}
@@ -194,9 +196,30 @@ func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, reader *File
 	if fs.layerEnabled() {
 		return nil, 0, false, gofuse.Status(syscall.EAGAIN)
 	}
-	data, err := fs.client.ReadAtCtx(ctx, fs.remotePath(readerPath), offset, int64(reqSize))
-	if err != nil {
-		return nil, 0, false, httpToFuseStatus(err)
+	var data []byte
+	cacheHit := false
+	cacheView := fs.mountViewGeneration.Load()
+	if fs.readCache != nil && fs.statCacheVerified() && !fs.bypassStableRemoteReadCaches(readerPath) &&
+		committed.committedRevision > 0 && entry.Revision == committed.committedRevision &&
+		entry.Size == committed.committedSize {
+		if cached, ok := fs.readCache.Get(readerPath, committed.committedRevision); ok && int64(len(cached)) == committed.committedSize {
+			end := offset + int64(reqSize)
+			if end < offset {
+				return nil, 0, false, gofuse.EINVAL
+			}
+			if offset < int64(len(cached)) {
+				data = cached[offset:min(end, int64(len(cached)))]
+			}
+			cacheHit = true
+			failpoint.InjectCall("ftruncateCommittedCacheBeforeValidate", fs, ino, readerPath)
+		}
+	}
+	if !cacheHit {
+		var err error
+		data, err = fs.client.ReadAtCtx(ctx, fs.remotePath(readerPath), offset, int64(reqSize))
+		if err != nil {
+			return nil, 0, false, httpToFuseStatus(err)
+		}
 	}
 	current, ok := fs.inodes.GetEntry(ino)
 	if !ok || current.Unlinked {
@@ -221,6 +244,29 @@ func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, reader *File
 					return nil, 0, false, gofuse.Status(syscall.EAGAIN)
 				}
 			}
+		}
+	}
+	if cacheHit {
+		// A cache hit must still name the same committed image after all staging
+		// checks. A newer commit can finish (and clear its dirty state) meanwhile.
+		if !fs.lockMountViewRead(cacheView) {
+			return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+		}
+		defer fs.mountViewMu.RUnlock()
+		current, ok := fs.inodes.GetEntry(ino)
+		linkedIno, linked := fs.inodes.GetInode(readerPath)
+		if !ok || current.Unlinked || !linked || linkedIno != ino || current.ResourceID != entry.ResourceID ||
+			current.Revision != committed.committedRevision || current.Size != committed.committedSize ||
+			!fs.statCacheVerified() || fs.bypassStableRemoteReadCaches(readerPath) {
+			return nil, 0, false, gofuse.Status(syscall.EAGAIN)
+		}
+		fs.dirtyMu.Lock()
+		latest := fs.mutationInodes[ino]
+		unchanged := latest.committedSeq == committedSeq && latest.committedRevision == committed.committedRevision &&
+			latest.committedSize == committed.committedSize && fs.dirtyInodes[ino].seq <= committedSeq
+		fs.dirtyMu.Unlock()
+		if !unchanged {
+			return nil, 0, false, gofuse.Status(syscall.EAGAIN)
 		}
 	}
 	return data, len(data), true, gofuse.OK
