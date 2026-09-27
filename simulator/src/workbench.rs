@@ -887,13 +887,25 @@ fn serve_site(
     dir: &Path,
     requested_port: u16,
 ) -> Result<(Child, u16, PathBuf)> {
+    // port 0 = ephemeral: reserve a free port ourselves (bind :0, drop the
+    // listener) instead of parsing the server banner — the banner is
+    // block-buffered when redirected to a file and may never flush in time
+    let port = if requested_port == 0 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0")
+            .context("reserving an ephemeral port for the site server")?;
+        let p = l.local_addr().context("ephemeral port local_addr")?.port();
+        drop(l);
+        p
+    } else {
+        requested_port
+    };
     let log_path = home.join("serve.log");
     let log = std::fs::File::create(&log_path)?;
     let mut child = Command::new("python3")
         .args([
             "-m",
             "http.server",
-            &requested_port.to_string(),
+            &port.to_string(),
             "--bind",
             "127.0.0.1",
             "--directory",
@@ -904,30 +916,6 @@ fn serve_site(
         .stderr(log)
         .spawn()
         .context("spawning python3 -m http.server")?;
-
-    // port 0 = ephemeral: the banner line carries the real port
-    let port = if requested_port == 0 {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let s = std::fs::read_to_string(&log_path).unwrap_or_default();
-            if let Some(p) = s.split("port ").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()) {
-                if let Ok(n) = p.parse::<u16>() {
-                    break n;
-                }
-            }
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                bail!("http.server exited early; serve.log:\n{}", tail(&log_path, 10));
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("could not determine served port; serve.log:\n{}", tail(&log_path, 10));
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    } else {
-        requested_port
-    };
 
     // readiness: the root URL must answer (any HTTP status counts as "up")
     let url = format!("http://127.0.0.1:{port}/");

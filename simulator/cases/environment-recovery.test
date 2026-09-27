@@ -87,7 +87,7 @@ printf 'app dirty edit\n'           | cmp - proj/case-seed/src/app.js
 printf 'util committed\n'           | cmp - proj/case-seed/src/helpers.js
 printf 'uncommitted new feature\n'  | cmp - proj/case-seed/src/new-feature.js
 [ ! -e proj/case-seed/src/legacy.js ] && [ ! -e proj/case-seed/src/util.js ]
-[ -e proj/assets/hero.bin ]
+[ -e proj/case-seed/assets/hero.bin ]
 echo "tree verified bare"
 
 # ---- Leg 2 - client restart (same cache) ----
@@ -100,7 +100,7 @@ printf 'app dirty edit\n'           | cmp - proj/case-seed/src/app.js
 printf 'util committed\n'           | cmp - proj/case-seed/src/helpers.js
 printf 'uncommitted new feature\n'  | cmp - proj/case-seed/src/new-feature.js
 [ ! -e proj/case-seed/src/legacy.js ] && [ ! -e proj/case-seed/src/util.js ]
-[ -e proj/assets/hero.bin ]
+[ -e proj/case-seed/assets/hero.bin ]
 echo "tree verified bare"
 
 # ---- Leg 3 - clean environment (no original cache); first write only one
