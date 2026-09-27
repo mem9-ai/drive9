@@ -12386,6 +12386,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	fs.observePathPolicyWithContext(ctx, fh.Path)
 
 	appendChecked, usePublishedAppend := false, false
+	var appendCtx context.Context
 	lockStart := time.Now()
 	fh.Lock()
 	lockWait := time.Since(lockStart)
@@ -12496,10 +12497,32 @@ readHandleState:
 		return gofuse.ReadResultData(result), gofuse.OK
 	}
 	fs.refreshCleanCommittedRevisionForHandleLocked(fh)
-	if !appendChecked && !fh.Unlinked && fh.Layer != PathLayerGitWorkspace &&
+	appendEligible := !appendChecked && !fh.Unlinked && fh.Layer != PathLayerGitWorkspace &&
 		(fh.Dirty == nil || (fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts())) &&
-		fh.WritePolicy == WritePolicyWriteBack && input.Size > 0 && !isSQLiteDirectIOPath(fh.Path) &&
-		fs.hasDirtyAppend(fh.Path, fh.Ino, fh) {
+		fh.WritePolicy == WritePolicyWriteBack && input.Size > 0 && !isSQLiteDirectIOPath(fh.Path)
+	activeAppend := appendEligible && fs.hasDirtyAppend(fh.Path, fh.Ino, fh)
+	if appendEligible && !activeAppend {
+		// Inspect open writers before their published successors: staging
+		// clears DirtySeq only after publishing pending data. Commit cleanup
+		// may already have retired it, so refresh committed state once more.
+		usePublishedAppend = fs.hasPendingLocalState(fh.Path) || fs.hasQueuedCommit(fh.Path)
+		fs.refreshCleanCommittedRevisionForHandleLocked(fh)
+	}
+	if activeAppend {
+		if appendCtx == nil {
+			var cancelAppend context.CancelFunc
+			appendCtx, cancelAppend = context.WithTimeout(ctx, fs.remoteReadTimeout)
+			defer cancelAppend()
+		}
+		if err := appendCtx.Err(); err != nil {
+			fh.Unlock()
+			if errors.Is(err, context.DeadlineExceeded) {
+				source = "same-path-dirty-timeout"
+				return nil, gofuse.EIO
+			}
+			source = "same-path-dirty-canceled"
+			return nil, gofuse.EINTR
+		}
 		appendChecked = true
 		path, ino, revision, buffer := fh.Path, fh.Ino, fh.BaseRev, fh.Dirty
 		var version uint64
@@ -12507,7 +12530,7 @@ readHandleState:
 			version = buffer.contentVersion
 		}
 		fh.Unlock()
-		data, n, ok, st, src, published := fs.readActiveAppendVisibleRange(ctx, path, ino, fh, int64(input.Offset), input.Size)
+		data, n, ok, st, src, published := fs.readActiveAppendVisibleRange(appendCtx, path, ino, fh, int64(input.Offset), input.Size)
 		if testHookAfterAppendRead != nil {
 			testHookAfterAppendRead(path)
 		}
@@ -12516,6 +12539,11 @@ readHandleState:
 		if fh.Path != path || fh.Ino != ino || fh.Unlinked || changed || fh.BaseRev != revision || fh.DirtySeq != 0 {
 			// Restart identity/own-content selection, without consuming the old
 			// sibling result or repeating its wait after a same-reader mutation.
+			// A retarget needs discovery on the new identity, using the same
+			// deadline so repeated renames cannot restart the waiting budget.
+			if fh.Path != path || fh.Ino != ino {
+				appendChecked = false
+			}
 			usePublishedAppend = !changed && fh.Path == path && fh.Ino == ino && !fh.Unlinked && fh.BaseRev != revision
 			goto readHandleState
 		}

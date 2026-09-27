@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"syscall"
@@ -708,4 +709,126 @@ func TestIssue986PrefixSkipsUnprovedPinnedSnapshot(t *testing.T) {
 	if err != nil || st != gofuse.OK || string(data) != "old-data" {
 		t.Fatalf("proved prefix=%q status=%v error=%v", data, st, err)
 	}
+}
+
+func TestIssue986RetargetRechecksAppend(t *testing.T) {
+	for _, writable := range []bool{false, true} {
+		for _, offset := range []int64{0, 5} {
+			t.Run(fmt.Sprintf("writable=%v/offset=%d", writable, offset), func(t *testing.T) {
+				const p = "/retarget-append"
+				fs, ino := pr939HandleFS(t, p, "hello")
+				r, rid := pr939Handle(t, fs, ino, p, "hello", false)
+				r.Flags = uint32(syscall.O_RDWR)
+				r.WritePolicy = WritePolicyWriteBack
+				if !writable {
+					r.Dirty = nil
+					r.Flags = uint32(syscall.O_RDONLY)
+				}
+				defer fs.deleteFileHandle(rid, r)
+				w, wid := pr939Handle(t, fs, ino, p, "hello", false)
+				defer fs.deleteFileHandle(wid, w)
+				if _, st := pr939Append(fs, ino, wid, " gopher"); st != gofuse.OK {
+					t.Fatal(st)
+				}
+				calls := 0
+				testHookAfterAppendRead = func(path string) {
+					calls++
+					if calls <= 2 {
+						fs.retargetOpenHandlesForRename(path, path+"-renamed")
+					}
+				}
+				defer func() { testHookAfterAppendRead = nil }()
+				data, st, err := readDat9FSTestRange(fs, ino, rid, offset, 64)
+				want := "hello gopher"[offset:]
+				if err != nil || st != gofuse.OK || string(data) != want || calls != 3 {
+					t.Fatalf("retarget read=%q want=%q status=%v error=%v scans=%d", data, want, st, err, calls)
+				}
+			})
+		}
+	}
+}
+
+func TestIssue986RetargetKeepsAppendBudget(t *testing.T) {
+	const p = "/retarget-budget"
+	fs, ino := pr939HandleFS(t, p, "hello")
+	fs.remoteReadTimeout = 10 * time.Millisecond
+	r, rid := pr939Handle(t, fs, ino, p, "hello", false)
+	r.Flags = uint32(syscall.O_RDWR)
+	r.WritePolicy = WritePolicyWriteBack
+	defer fs.deleteFileHandle(rid, r)
+	w, wid := pr939Handle(t, fs, ino, p, "hello", false)
+	defer fs.deleteFileHandle(wid, w)
+	if _, st := pr939Append(fs, ino, wid, " gopher"); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	calls := 0
+	testHookAfterAppendRead = func(path string) {
+		calls++
+		// Consume the budget at the controlled unlocked boundary, then retarget.
+		if calls == 1 {
+			<-time.After(2 * fs.remoteReadTimeout)
+		}
+		fs.retargetOpenHandlesForRename(path, path+"-renamed")
+	}
+	defer func() { testHookAfterAppendRead = nil }()
+	_, st, _ := readDat9FSTestRange(fs, ino, rid, 5, 64)
+	if st != gofuse.EIO || calls != 1 {
+		t.Fatalf("expired retarget status=%v scans=%d", st, calls)
+	}
+}
+
+func TestIssue986ReadStartsAfterStaging(t *testing.T) {
+	const p = "/read-after-staging"
+	_, ts := newCASFileServer(t, p, 1, []byte("hello"))
+	defer ts.Close()
+	fs, ino := pr939HandleFS(t, p, "hello")
+	fs.client = newTestClient(ts.URL)
+	fs.client.SetSmallFileThresholdForTests(1 << 20)
+	r, rid := pr939Handle(t, fs, ino, p, "hello", false)
+	r.Flags = uint32(syscall.O_RDWR)
+	r.WritePolicy = WritePolicyWriteBack
+	defer fs.deleteFileHandle(rid, r)
+	w, wid := pr939Handle(t, fs, ino, p, "hello", false)
+	defer fs.deleteFileHandle(wid, w)
+	if _, st := pr939Append(fs, ino, wid, " gopher"); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	cq := NewCommitQueue(fs.client, fs.shadowStore, fs.pendingIndex, nil, 1, 8)
+	fs.commitQueue = cq
+	release := make(chan struct{})
+	cq.PathLock = func(string) func() { <-release; return func() {} }
+	cq.OnSuccess = fs.onCommitQueueSuccess
+	cq.OnCleanup = fs.onCommitQueueCleanup
+	defer cq.DrainAll()
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	w.Lock()
+	err := fs.stageShadowLocked(w, false)
+	if err == nil {
+		err = fs.enqueueStagedShadowCommitLocked(w)
+	}
+	w.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.DirtySeq != 0 || fs.hasDirtyAppend(p, ino, r) || !fs.hasPendingLocalState(p) {
+		t.Fatal("staged entry precondition")
+	}
+	check := func(phase string) {
+		t.Helper()
+		for _, offset := range []int64{0, 5} {
+			data, st, err := readDat9FSTestRange(fs, ino, rid, offset, 64)
+			if err != nil || st != gofuse.OK || string(data) != "hello gopher"[offset:] {
+				t.Fatalf("%s offset=%d data=%q status=%v error=%v", phase, offset, data, st, err)
+			}
+		}
+	}
+	check("queued")
+	// Discovery must also work after the append handle has been released.
+	fs.deleteFileHandle(wid, w)
+	check("writer-released")
+	unblock()
+	cq.DrainAll()
+	check("committed")
 }
