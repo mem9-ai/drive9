@@ -487,3 +487,133 @@ func (fs *Dat9FS) prepareFtruncateReleaseLocked(ctx context.Context, fh *FileHan
 		fh.Lock()
 	}
 }
+
+// readReleasedFtruncateLocked covers the clean writable sibling after the last
+// source marker disappears. Reads borrow immutable bytes, never cleanup tokens.
+// A missing proof fails closed rather than exposing the old clean buffer.
+func (fs *Dat9FS) readReleasedFtruncateLocked(fh *FileHandle, offset int64, size uint32) ([]byte, bool, error) {
+	data, handled, err := fs.readReleasedFtruncateOnceLocked(fh, offset, size)
+	if !errors.Is(err, errFtruncateBusy) {
+		return data, handled, err
+	}
+	event := fh.pendingFtruncate.Load()
+	deadline := time.Now().Add(samePathDirtyWaitTimeout)
+	for errors.Is(err, errFtruncateBusy) && time.Now().Before(deadline) {
+		// Buffered Linux reads can surface EAGAIN as EIO. Yield through a
+		// short active commit, as the existing live-source reader does.
+		fh.Unlock()
+		time.Sleep(samePathDirtyWaitInterval)
+		fh.Lock()
+		data, handled, err = fs.readReleasedFtruncateOnceLocked(fh, offset, size)
+		if !handled && fh.pendingFtruncate.Load() != event {
+			return nil, true, syscall.EAGAIN
+		}
+	}
+	return data, handled, err
+}
+
+func (fs *Dat9FS) readReleasedFtruncateOnceLocked(fh *FileHandle, offset int64, size uint32) ([]byte, bool, error) {
+	if !fs.ftruncateParticipates(fh) || fh.Dirty == nil || fh.DirtySeq != 0 ||
+		fh.Dirty.HasDirtyParts() || fs.openHandles.HasVisibleTruncate(fh.Ino) {
+		return nil, false, nil
+	}
+	event := fh.pendingFtruncate.Load()
+	if event.path != fh.Path || event.ino != fh.Ino || event.view != fs.mountViewGeneration.Load() {
+		return nil, true, syscall.EAGAIN
+	}
+	unlock, ok := fs.tryLockRemoteCommitPath(fh.Path)
+	if !ok {
+		return nil, true, errFtruncateBusy
+	}
+	defer unlock()
+	revision := fs.latestCommittedRevision(fh.Path)
+	localSeq := func() uint64 {
+		fs.dirtyMu.Lock()
+		defer fs.dirtyMu.Unlock()
+		return fs.dirtyInodes[fh.Ino].seq
+	}
+	seq := localSeq()
+	var meta *WriteBackMeta
+	if fs.pendingIndex != nil {
+		meta, _ = fs.pendingIndex.GetMeta(fh.Path)
+	}
+	// Once landed, the ordinary revision refresh can invalidate this clean
+	// buffer. An uncommitted successor must still take precedence below.
+	if meta == nil && revision > event.revision {
+		if seq > event.seq {
+			return nil, true, syscall.EAGAIN
+		}
+		return nil, false, nil
+	}
+	data, selectedSeq := event.data, event.seq
+	readShadowGen := uint64(0)
+	if meta != nil {
+		if !meta.lineageTrusted || (meta.SnapshotID != event.id && !slices.Contains(processLocalMetaAncestors(meta), event.id)) {
+			return nil, true, syscall.EAGAIN
+		}
+		if meta.SnapshotID != event.id {
+			// Publication binds the shadow token to this exact process-local
+			// metadata snapshot, including a retained failed commit.
+			shadowGen := meta.ownedStagingGens.ShadowGen
+			selectedSeq = meta.MutationSeq
+			if !meta.ownedStagingKnown || meta.Inode != fh.Ino {
+				return nil, true, syscall.EAGAIN
+			}
+			if shadowGen == 0 || fs.shadowStore == nil || meta.Size > maxLandedPayloadBytes {
+				return nil, true, syscall.EAGAIN
+			}
+			var err error
+			readShadowGen = shadowGen
+			data, err = fs.shadowStore.ReadAllIfGeneration(fh.Path, shadowGen)
+			if err != nil || int64(len(data)) != meta.Size {
+				return nil, true, syscall.EAGAIN
+			}
+		} else if !event.complete || int64(len(data)) != meta.Size {
+			return nil, true, syscall.EAGAIN
+		}
+	} else if !event.complete || revision > event.revision {
+		return nil, true, syscall.EAGAIN
+	}
+	if seq > selectedSeq {
+		return nil, true, syscall.EAGAIN
+	}
+	if revision > event.revision {
+		if selectedSeq <= fs.ftruncateCommittedSeq(fh.Ino) || (meta != nil && meta.SnapshotID == event.id) {
+			return nil, false, nil
+		}
+		// Do not serve an older pending child over an unrelated remote commit.
+		if fs.commitQueue == nil {
+			return nil, true, syscall.EAGAIN
+		}
+		proof := fs.commitQueue.landedCommit(fh.Path)
+		if proof.rev != revision || meta == nil || !slices.Contains(processLocalMetaAncestors(meta), proof.snapshotID) {
+			return nil, true, syscall.EAGAIN
+		}
+	}
+	if readShadowGen != 0 && fs.shadowStore.ActiveGeneration(fh.Path) != readShadowGen {
+		return nil, true, syscall.EAGAIN
+	}
+	failpoint.InjectCall("releasedFtruncateBeforeReadValidate", fs, fh)
+	entry, linked := fs.inodes.GetEntry(fh.Ino)
+	if !linked || entry.Unlinked {
+		return nil, true, syscall.EAGAIN
+	}
+	if _, linked = entry.Paths[fh.Path]; !linked || fh.pendingFtruncate.Load() != event ||
+		event.view != fs.mountViewGeneration.Load() || revision != fs.latestCommittedRevision(fh.Path) || seq != localSeq() {
+		return nil, true, syscall.EAGAIN
+	}
+	if fs.pendingIndex != nil {
+		current, exists := fs.pendingIndex.GetMeta(fh.Path)
+		if (meta == nil && exists) || (meta != nil && (!exists || current.Generation != meta.Generation || current.SnapshotID != meta.SnapshotID)) {
+			return nil, true, syscall.EAGAIN
+		}
+	}
+	if offset < 0 || offset > int64(^uint64(0)>>1)-int64(size) {
+		return nil, true, syscall.EINVAL
+	}
+	if offset >= int64(len(data)) {
+		return nil, true, nil
+	}
+	end := min(offset+int64(size), int64(len(data)))
+	return append([]byte(nil), data[offset:end]...), true, nil
+}

@@ -496,6 +496,11 @@ func (idx *PendingIndex) PrepareRename(oldPath, newPath string) (*WriteBackMeta,
 	pla, plb := idx.acquireTwoPathLocks(oldPath, newPath)
 	defer idx.releaseTwoPathLocks(oldPath, newPath, pla, plb)
 
+	return idx.prepareRenameLocked(oldPath, newPath)
+}
+
+// prepareRenameLocked requires the same path locks as PrepareRename.
+func (idx *PendingIndex) prepareRenameLocked(oldPath, newPath string) (*WriteBackMeta, error) {
 	idx.mu.RLock()
 	meta, ok := idx.items[oldPath]
 	if !ok {
@@ -525,6 +530,11 @@ func (idx *PendingIndex) CommitRename(oldPath string, newMeta *WriteBackMeta) {
 	pla, plb := idx.acquireTwoPathLocks(oldPath, newMeta.Path)
 	defer idx.releaseTwoPathLocks(oldPath, newMeta.Path, pla, plb)
 
+	idx.commitRenameLocked(oldPath, newMeta)
+}
+
+// commitRenameLocked requires the same path locks as CommitRename.
+func (idx *PendingIndex) commitRenameLocked(oldPath string, newMeta *WriteBackMeta) {
 	idx.mu.Lock()
 	delete(idx.items, oldPath)
 	idx.items[newMeta.Path] = newMeta
@@ -540,6 +550,11 @@ func (idx *PendingIndex) AbortRename(newPath string) {
 	pl := idx.acquirePathLock(newPath)
 	defer idx.releasePathLock(newPath, pl)
 
+	idx.abortRenameLocked(newPath)
+}
+
+// abortRenameLocked requires the same path locks as AbortRename.
+func (idx *PendingIndex) abortRenameLocked(newPath string) {
 	idx.mu.RLock()
 	_, live := idx.items[newPath]
 	idx.mu.RUnlock()
