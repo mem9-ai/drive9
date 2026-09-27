@@ -356,7 +356,7 @@ func TestLayerStartupRecoverySkipsCleanAndUploadsDirty(t *testing.T) {
 				t.Fatal(err)
 			}
 			if clean {
-				if _, err := pending.PutLayerCache("/a", 4, PendingOverwrite, 5, 0, false); err != nil {
+				if _, err := pending.PutLayerCache("/a", 4, 5, 0, false); err != nil {
 					t.Fatal(err)
 				}
 			} else {
@@ -429,7 +429,7 @@ func TestLayerRollbackOnlyConflictsUncommittedWrites(t *testing.T) {
 			if err := shadow.WriteFull("/a", []byte("data"), 0); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := pending.PutLayerCache("/a", 4, PendingOverwrite, 0, 0, false); err != nil {
+			if _, err := pending.PutLayerCache("/a", 4, 0, 0, false); err != nil {
 				t.Fatal(err)
 			}
 			if dirty {
@@ -445,7 +445,7 @@ func TestLayerRollbackOnlyConflictsUncommittedWrites(t *testing.T) {
 			defer fs.commitQueue.DrainAll()
 			fs.applyLayerRollback(shadow, pending)
 			m, ok := pending.GetMeta("/a")
-			if !ok || (m.Kind == PendingConflict) != dirty {
+			if ok != dirty || (dirty && m.Kind != PendingConflict) {
 				t.Fatalf("rollback metadata = %+v, dirty = %v", m, dirty)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -453,8 +453,12 @@ func TestLayerRollbackOnlyConflictsUncommittedWrites(t *testing.T) {
 			if err := fs.drainLatePendingEntries(ctx); (err != nil) != dirty {
 				t.Fatalf("drain error = %v, dirty = %v", err, dirty)
 			}
-			if got, err := shadow.ReadAll("/a"); err != nil || string(got) != "data" {
-				t.Fatalf("preserved data = %q, %v", got, err)
+			if dirty {
+				if got, err := shadow.ReadAll("/a"); err != nil || string(got) != "data" {
+					t.Fatalf("preserved data = %q, %v", got, err)
+				}
+			} else if shadow.Has("/a") {
+				t.Fatal("clean abandoned shadow still exists")
 			}
 		})
 	}

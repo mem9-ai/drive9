@@ -1302,8 +1302,28 @@ PY_FSYNC
   check_cmd "no-IO restore mount log clean" audit_mount_log "$log_c"
   start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" "$mount_c" "$local_c" "$log_c"
   check_eq "fresh restore includes post-checkpoint write" "$(cat "$mount_c/after.txt")" "fuse after checkpoint ${ts}"
+  check_cmd "delete and rename durable new layer files" python3 - "$mount_c" <<'PY_NAMESPACE'
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for name in ("durable-delete.txt", "durable-rename.txt"):
+    with (root / name).open("wb") as f:
+        f.write(b"durable layer content\n")
+        f.flush()
+        os.fsync(f.fileno())
+(root / "durable-delete.txt").unlink()
+(root / "durable-rename.txt").rename(root / "durable-renamed.txt")
+PY_NAMESPACE
   check_cmd "unmount full restore mount" unmount_layer_mount
   check_cmd "full restore mount log clean" audit_mount_log "$log_c"
+  start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" "$mount_c" "$local_c" "$log_c"
+  check_cmd_fail "deleted durable layer file stays absent after remount" test -e "$mount_c/durable-delete.txt"
+  check_cmd_fail "renamed durable layer source stays absent after remount" test -e "$mount_c/durable-rename.txt"
+  check_eq "durable layer rename target survives remount" "$(cat "$mount_c/durable-renamed.txt")" "durable layer content"
+  check_cmd "unmount namespace restore mount" unmount_layer_mount
+  check_cmd "namespace restore mount log clean" audit_mount_log "$log_c"
 
   fuse_commit_out=$(drive9_retry fs layer commit "tag:fuse_run=$ts")
   case "$fuse_commit_out" in
@@ -1353,6 +1373,9 @@ PY_FSYNC
   # Write a file through the layer mount — it should be visible via the overlay.
   printf 'rollback fuse new file %s\n' "$ts" >"$mount_rb/new.txt"
   check_eq "rollback fuse new file visible in layer mount" "$(cat "$mount_rb/new.txt")" "rollback fuse new file ${ts}"
+  printf 'rollback fuse changed base %s\n' "$ts" >"$mount_rb/base.txt"
+  check_eq "rollback fuse changed base visible in layer mount" "$(cat "$mount_rb/base.txt")" "rollback fuse changed base ${ts}"
+  check_cmd "drain layer writes before rollback" drive9 mount drain --timeout 10s "$mount_rb"
 
   # Roll back the layer from a separate CLI call (not through the mount).
   check_eq "rollback fuse command returns ok" "$(drive9_retry fs layer rollback "tag:rollback_fuse_run=$ts")" "ok"
@@ -1379,6 +1402,11 @@ PY_FSYNC
 
   # Base file should still be visible after rollback.
   check_eq "rollback fuse base still visible after hot refresh" "$(cat "$mount_rb/base.txt")" "$(cat "$rollback_fuse_base_local")"
+  check_cmd "rollback fuse directory excludes abandoned file" python3 - "$mount_rb" <<'PY_ROLLBACK'
+import os
+import sys
+assert "new.txt" not in os.listdir(sys.argv[1])
+PY_ROLLBACK
 
   # A new write through the now-abandoned mount should fail with ESTALE.
   rollback_write_err=""

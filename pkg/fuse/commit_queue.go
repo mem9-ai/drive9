@@ -683,6 +683,65 @@ func (cq *CommitQueue) DrainAll() {
 	cq.wg.Wait()
 }
 
+// recoveredEntry classifies and fences a recovered publication identically
+// for startup and late shutdown recovery. Unusable bytes become conflicts.
+func (cq *CommitQueue) recoveredEntry(path string) *CommitEntry {
+	meta, ok := cq.index.GetMeta(path)
+	if !ok || meta.LayerClean {
+		return nil
+	}
+	if cq.shadows != nil && !cq.shadows.Has(path) {
+		// Shadow file missing — prune orphaned pending index entry so
+		// Lookup/GetAttr don't serve stale metadata.
+		safeLogPrintf("commit queue: pruning orphaned pending entry for %s (shadow missing)", path)
+		cq.index.RemoveIfGeneration(path, meta.Generation)
+		return nil
+	}
+	shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
+	if meta.Kind == PendingConflict {
+		safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
+		return nil
+	}
+	if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 && cq.layerRefSnapshot() == "" {
+		safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
+		return nil
+	}
+	// The shadow file is the data actually uploaded; its size is
+	// authoritative. Meta size can be stale (memory-only updates, or a
+	// WAL-resurrected entry from an older fsync) and would mis-route the
+	// direct-PUT vs multipart decision in uploadEntry.
+	size := meta.Size
+	if cq.shadows != nil {
+		if shadowSize := cq.shadows.Size(path); shadowSize >= 0 {
+			size = shadowSize
+		}
+	}
+	entry := &CommitEntry{
+		Path:              path,
+		BaseRev:           meta.BaseRev,
+		Size:              size,
+		Kind:              meta.Kind,
+		ShadowSpill:       meta.ShadowSpill,
+		Mode:              meta.Mode,
+		HasMode:           meta.HasMode,
+		PayloadBaseRev:    meta.BaseRev,
+		PayloadBaseRevSet: true,
+		PendingIndexGen:   meta.Generation,
+	}
+	if cq.shadows != nil {
+		entry.ShadowGen = shadowGen
+		if entry.ShadowGen == 0 {
+			safeLogPrintf("commit queue: skipping recovered pending entry for %s (shadow missing, short, or metadata replaced)", path)
+			if _, err := cq.index.MarkConflictIfGeneration(path, meta.Generation); err != nil {
+				safeLogPrintf("commit queue: mark recovered pending conflict failed for %s: %v", path, err)
+			}
+			return nil
+		}
+	}
+	entry.recovered = true
+	return entry
+}
+
 // RecoverPending re-enqueues any locally persisted pending commits on startup.
 func (cq *CommitQueue) RecoverPending() {
 	if cq.index == nil {
@@ -694,59 +753,10 @@ func (cq *CommitQueue) RecoverPending() {
 		cq.shadows.RecoverPendingBytes()
 	}
 	for path := range cq.index.ListUncommittedPaths() {
-		meta, ok := cq.index.GetMeta(path)
-		if !ok || meta.LayerClean {
+		entry := cq.recoveredEntry(path)
+		if entry == nil {
 			continue
 		}
-		if cq.shadows != nil && !cq.shadows.Has(path) {
-			// Shadow file missing — prune orphaned pending index entry so
-			// Lookup/GetAttr don't serve stale metadata.
-			safeLogPrintf("commit queue: pruning orphaned pending entry for %s (shadow missing)", path)
-			cq.index.Remove(path)
-			continue
-		}
-		shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
-		if meta.Kind == PendingConflict {
-			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
-			continue
-		}
-		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 && cq.layerRefSnapshot() == "" {
-			safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
-			continue
-		}
-		// The shadow file is the data actually uploaded; its size is
-		// authoritative. Meta size can be stale (memory-only updates, or a
-		// WAL-resurrected entry from an older fsync) and would mis-route the
-		// direct-PUT vs multipart decision in uploadEntry.
-		size := meta.Size
-		if cq.shadows != nil {
-			if shadowSize := cq.shadows.Size(path); shadowSize >= 0 {
-				size = shadowSize
-			}
-		}
-		entry := &CommitEntry{
-			Path:              path,
-			BaseRev:           meta.BaseRev,
-			Size:              size,
-			Kind:              meta.Kind,
-			ShadowSpill:       meta.ShadowSpill,
-			Mode:              meta.Mode,
-			HasMode:           meta.HasMode,
-			PayloadBaseRev:    meta.BaseRev,
-			PayloadBaseRevSet: true,
-			PendingIndexGen:   meta.Generation,
-		}
-		if cq.shadows != nil {
-			entry.ShadowGen = shadowGen
-			if entry.ShadowGen == 0 {
-				safeLogPrintf("commit queue: skipping recovered pending entry for %s (shadow missing, short, or metadata replaced)", path)
-				if _, err := cq.index.MarkConflictIfGeneration(path, meta.Generation); err != nil {
-					safeLogPrintf("commit queue: mark recovered pending conflict failed for %s: %v", path, err)
-				}
-				continue
-			}
-		}
-		entry.recovered = true
 		if err := cq.Enqueue(entry); err != nil {
 			safeLogPrintf("commit queue: recover enqueue failed for %s: %v", path, err)
 		}
@@ -2057,46 +2067,9 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 		if ctx.Err() != nil {
 			break
 		}
-		meta, ok := cq.index.GetMeta(path)
-		if !ok || meta.LayerClean {
+		entry := cq.recoveredEntry(path)
+		if entry == nil {
 			continue
-		}
-		if cq.shadows != nil && !cq.shadows.Has(path) {
-			safeLogPrintf("commit queue: pruning orphaned pending entry for %s (shadow missing)", path)
-			cq.index.Remove(path)
-			continue
-		}
-		shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
-		if meta.Kind == PendingConflict {
-			continue
-		}
-		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 && cq.layerRefSnapshot() == "" {
-			continue
-		}
-		size := meta.Size
-		if cq.shadows != nil {
-			if shadowSize := cq.shadows.Size(path); shadowSize >= 0 {
-				size = shadowSize
-			}
-		}
-		entry := &CommitEntry{
-			Path:              path,
-			BaseRev:           meta.BaseRev,
-			Size:              size,
-			Kind:              meta.Kind,
-			ShadowSpill:       meta.ShadowSpill,
-			Mode:              meta.Mode,
-			HasMode:           meta.HasMode,
-			PayloadBaseRev:    meta.BaseRev,
-			PayloadBaseRevSet: true,
-			PendingIndexGen:   meta.Generation,
-			recovered:         true,
-		}
-		if cq.shadows != nil {
-			entry.ShadowGen = shadowGen
-			if entry.ShadowGen == 0 {
-				continue
-			}
 		}
 		if err := cq.CommitNow(ctx, entry); err != nil {
 			safeLogPrintf("commit queue: late sync commit failed for %s: %v", path, err)

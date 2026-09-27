@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -58,6 +59,9 @@ var testHookAfterUnlinkHandleSetLockAttempt func()
 // extent-runtime waiter parks, letting tests observe the park without a
 // scheduler-timing sleep.
 var testHookExtentBuildWait func()
+
+// testHookAfterLayerChmodShadowRead pins the read/ack ownership boundary.
+var testHookAfterLayerChmodShadowRead func(path string)
 
 // errAppendRefreshBusy marks transient sibling-handle lock contention. Write
 // may retry it after yielding fh.mu and the path fence; lineage rejection uses
@@ -960,25 +964,25 @@ func (fs *Dat9FS) upsertLayerWhiteout(ctx context.Context, localPath string, kin
 
 func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode uint32) error {
 	if fs.shadowStore != nil {
-		data, err := fs.shadowStore.ReadAll(localPath)
-		if err == nil {
-			baseRev := int64(0)
-			pendingKind := PendingNew
-			hadPending := false
-			var pendingGen uint64
-			if fs.pendingIndex != nil {
-				if meta, ok := fs.pendingIndex.GetMeta(localPath); ok {
-					baseRev = meta.BaseRev
-					pendingKind = meta.Kind
-					hadPending = true
-					pendingGen = meta.Generation
-				}
+		baseRev := int64(0)
+		hadPending := false
+		var pendingGen uint64
+		if fs.pendingIndex != nil {
+			if meta, ok := fs.pendingIndex.GetMeta(localPath); ok {
+				baseRev = meta.BaseRev
+				hadPending = true
+				pendingGen = meta.Generation
 			}
+		}
+		data, err := fs.shadowStore.ReadAll(localPath)
+		if testHookAfterLayerChmodShadowRead != nil {
+			testHookAfterLayerChmodShadowRead(localPath)
+		}
+		if err == nil {
 			if !hadPending && fs.client != nil {
 				stat, err := fs.client.StatCtx(ctx, fs.remotePath(localPath))
 				if err == nil && stat != nil && !stat.IsDir {
 					baseRev = stat.Revision
-					pendingKind = PendingOverwrite
 				} else if err != nil && !isNotFoundErr(err) {
 					return err
 				}
@@ -988,7 +992,7 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 			}
 			if fs.pendingIndex != nil {
 				if !hadPending {
-					if _, err := fs.pendingIndex.PutLayerCache(localPath, int64(len(data)), pendingKind, baseRev, mode, true); err != nil {
+					if _, err := fs.pendingIndex.putLayerCacheIfAbsent(localPath, int64(len(data)), baseRev, mode, true); err != nil {
 						return fmt.Errorf("put pending mode for layer chmod %s: %w", localPath, err)
 					}
 					return nil
@@ -1005,15 +1009,11 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 		entry, err := fs.client.GetFSLayerEntry(ctx, fs.layerRef(), fs.remotePath(localPath))
 		if err == nil && entry != nil && entry.Op == "upsert" && entry.Kind == "file" {
 			baseRev := entry.BaseRevision
-			pendingKind := PendingNew
-			if baseRev > 0 {
-				pendingKind = PendingOverwrite
-			}
 			if err := fs.upsertLayerFile(ctx, localPath, entry.Content, baseRev, mode, true); err != nil {
 				return err
 			}
 			if fs.pendingIndex != nil {
-				if _, err := fs.pendingIndex.PutLayerCache(localPath, int64(len(entry.Content)), pendingKind, baseRev, mode, true); err != nil {
+				if _, err := fs.pendingIndex.putLayerCacheIfAbsent(localPath, int64(len(entry.Content)), baseRev, mode, true); err != nil {
 					return fmt.Errorf("put pending mode for layer chmod %s: %w", localPath, err)
 				}
 			}
@@ -1183,13 +1183,11 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 		hasMode = sourceStat.HasMode
 	}
 	targetBaseRev := int64(0)
-	kind := PendingNew
 	if targetStat, err := fs.client.StatCtx(ctx, newRemote); err == nil {
 		if targetStat.IsDir {
 			return fmt.Errorf("rename target %s is a directory", newRemote)
 		}
 		targetBaseRev = targetStat.Revision
-		kind = PendingOverwrite
 	} else if !isNotFoundErr(err) {
 		return err
 	}
@@ -1202,7 +1200,7 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 		}
 	}
 	if fs.pendingIndex != nil {
-		if _, err := fs.pendingIndex.PutLayerCache(newLocalPath, int64(len(data)), kind, targetBaseRev, mode, hasMode); err != nil {
+		if _, err := fs.pendingIndex.PutLayerCache(newLocalPath, int64(len(data)), targetBaseRev, mode, hasMode); err != nil {
 			return err
 		}
 	}
@@ -1392,15 +1390,21 @@ func (fs *Dat9FS) applyLayerRollback(shadows *ShadowStore, pending *PendingIndex
 		fs.commitQueue.AbandonLayer()
 	}
 
-	// 3. Preserve local staged writes as PendingConflict so the user can
-	//    recover them; do not delete shadow blobs. RecoverPending skips
-	//    conflict entries, so they will not be retried against the dead layer.
+	// 3. Discard abandoned durable caches, retaining unsent bytes as conflicts.
 	if pending != nil {
+		pending.abandonLayer()
 		for p := range pending.ListPendingPaths() {
-			// Durable overlay caches are not unsent writes. Keep them out of
-			// conflict accounting so a fully drained rollback can exit cleanly.
-			if meta, ok := pending.GetMeta(p); ok && !meta.LayerClean {
-				_, _ = pending.markConflictIfGeneration(p, meta.Generation, true)
+			meta, ok := pending.GetMeta(p)
+			if !ok {
+				continue
+			}
+			if meta.LayerClean && meta.Kind != PendingConflict {
+				if err := pending.discardLayerCache(p, meta.Generation, shadows); err != nil {
+					safeLogPrintf("layer rollback: discard cache %s: %v", p, err)
+					_, _ = pending.MarkConflictIfGeneration(p, meta.Generation)
+				}
+			} else {
+				_, _ = pending.MarkConflictIfGeneration(p, meta.Generation)
 			}
 		}
 	}
@@ -3765,7 +3769,7 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 			}
 		}
 		if fs.pendingIndex != nil {
-			if _, err := fs.pendingIndex.PutLayerCache(entry.Path, newSize, PendingOverwrite, expectedRevision, mode, hasMode); err != nil {
+			if _, err := fs.pendingIndex.PutLayerCache(entry.Path, newSize, expectedRevision, mode, hasMode); err != nil {
 				safeLogPrintf("layer truncate pending index update failed for %s: %v", entry.Path, err)
 				return gofuse.EIO
 			}
@@ -7189,7 +7193,7 @@ func (fs *Dat9FS) upsertLayerHardlink(ctx context.Context, srcP, dstP string, mo
 		}
 	}
 	if fs.pendingIndex != nil {
-		if _, err := fs.pendingIndex.PutLayerCache(dstP, int64(len(data)), PendingNew, 0, mode, true); err != nil {
+		if _, err := fs.pendingIndex.PutLayerCache(dstP, int64(len(data)), 0, mode, true); err != nil {
 			return nil, err
 		}
 	}
@@ -16442,6 +16446,15 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			safeLogPrintf("layer flush failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
+		// write-sync handles need no staging before upload, but Layer reads
+		// still need a local overlay afterward: the file may not exist in base.
+		if fs.shadowStore != nil {
+			if err := fs.shadowStore.WriteFull(fh.Path, data, expectedRevision); err != nil {
+				return httpToFuseStatus(err)
+			}
+			fh.ShadowReady = true
+			fh.ShadowStageGen = fs.shadowStore.ActiveGeneration(fh.Path)
+		}
 		fs.recordCommittedMutation(fh.Ino, fh.DirtySeq, 0, size)
 		if fh.Dirty != nil {
 			fh.Dirty.ClearDirty()
@@ -16460,7 +16473,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		if fs.pendingIndex != nil {
-			if gen, putErr := fs.pendingIndex.PutLayerCache(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode); putErr != nil {
+			if gen, putErr := fs.pendingIndex.PutLayerCache(fh.Path, size, fh.BaseRev, mode, hasMode); putErr != nil {
 				safeLogPrintf("layer flush pending index update failed for %s: %v", fh.Path, putErr)
 			} else {
 				fh.PendingIndexGen = gen
@@ -17109,22 +17122,33 @@ func (fs *Dat9FS) drainLatePendingEntries(ctx context.Context) error {
 	if fs.pendingIndex == nil {
 		return nil
 	}
+	var previous map[string]uint64
 	for round := 0; ; round++ {
-		paths := fs.pendingIndex.ListUncommittedPaths()
-		if len(paths) == 0 {
+		before := fs.pendingIndex.uncommittedGenerations()
+		if len(before) == 0 {
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("%d uncommitted files preserved for recovery: %w", len(paths), err)
+			return fmt.Errorf("%d uncommitted files preserved for recovery: %w", len(before), err)
 		}
 		if fs.commitQueue == nil {
-			return fmt.Errorf("%d uncommitted files preserved for recovery: no commit queue", len(paths))
+			return fmt.Errorf("%d uncommitted files preserved for recovery: no commit queue", len(before))
 		}
-		if count, _, path := fs.pendingIndex.ConflictSummary(); count != 0 {
+		safeLogPrintf("late pending drain: round %d, %d entries pending", round, len(before))
+		committed := fs.commitQueue.RecoverPendingSync(ctx)
+		after := fs.pendingIndex.uncommittedGenerations()
+		if len(after) == 0 {
+			return nil
+		}
+		// Try all healthy paths before reporting existing or newly found conflicts.
+		if count, _, path := fs.pendingIndex.ConflictSummary(); count == len(after) {
 			return fmt.Errorf("%d conflicted files preserved for recovery (first: %s)", count, path)
 		}
-		safeLogPrintf("late pending drain: round %d, %d entries pending", round, len(paths))
-		fs.commitQueue.RecoverPendingSync(ctx)
+		if committed == 0 && maps.Equal(before, after) && maps.Equal(previous, after) {
+			return fmt.Errorf("%d uncommitted files preserved for recovery: no recoverable progress", len(after))
+		}
+		previous = after
+		// One grace interval lets late Releases publish before the no-progress check.
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case <-ctx.Done():

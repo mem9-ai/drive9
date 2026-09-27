@@ -958,8 +958,8 @@ func TestLayerChmodCoalescesShadowFileWithoutPendingMeta(t *testing.T) {
 		t.Fatalf("mode = %#o, want 0600", got.Mode)
 	}
 	meta, ok := pending.GetMeta("/new.txt")
-	if !ok || meta.Kind != PendingNew || !meta.HasMode || meta.Mode != 0o600 {
-		t.Fatalf("pending mode = %+v, want PendingNew 0600", meta)
+	if !ok || meta.Kind != PendingOverwrite || !meta.LayerClean || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("pending mode = %+v, want clean PendingOverwrite 0600", meta)
 	}
 	if mode, ok := fs.layerFileMode("/new.txt"); !ok || mode != 0o600 {
 		t.Fatalf("layer file mode = (%#o, %t), want 0600 true", mode, ok)
@@ -1038,8 +1038,8 @@ func TestLayerChmodCoalescesExistingLayerUpsertContent(t *testing.T) {
 		t.Fatalf("mode = %#o, want 0600", got.Mode)
 	}
 	meta, ok := pending.GetMeta("/new.txt")
-	if !ok || meta.Kind != PendingNew || !meta.HasMode || meta.Mode != 0o600 {
-		t.Fatalf("pending mode = %+v, want PendingNew 0600", meta)
+	if !ok || meta.Kind != PendingOverwrite || !meta.LayerClean || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("pending mode = %+v, want clean PendingOverwrite 0600", meta)
 	}
 }
 

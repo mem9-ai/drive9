@@ -971,16 +971,7 @@ func Mount(opts *MountOptions) (err error) {
 		At:           time.Now().UTC(),
 	}
 
-	if shutdownErr != nil {
-		exitRec.Reason = "drain_failed"
-		exitRec.Detail = shutdownErr.Error()
-		exitRec.Code = ExitForceQuit
-		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
-		return newMountExit(ExitForceQuit, MountExitReason("drain_failed"), "shutdown incomplete; local recovery state preserved", shutdownErr)
-	}
-
-	switch reason {
-	case ExitReasonSignal, ExitReasonExternalUnmount:
+	if reason == ExitReasonSignal || reason == ExitReasonExternalUnmount {
 		// Do not exit while the kernel mount-table entry is still listed:
 		// a lazy (MNT_DETACH) detach leaves the entry in place until the
 		// mount's last reference is reaped, and callers treat mount-process
@@ -990,6 +981,19 @@ func Mount(opts *MountOptions) (err error) {
 			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=mount_entry_linger mountpoint=%s timeout=%s\n",
 				opts.MountPoint, mountExitEntryClearTimeout)
 		}
+	}
+
+	if shutdownErr != nil {
+		exitRec.Reason = "drain_failed"
+		exitRec.Detail = shutdownErr.Error()
+		exitRec.Code = ExitForceQuit
+		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
+		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=%d reason=drain_failed mountpoint=%s\n", ExitForceQuit, opts.MountPoint)
+		return newMountExit(ExitForceQuit, MountExitReason("drain_failed"), "shutdown incomplete; local recovery state preserved", shutdownErr)
+	}
+
+	switch reason {
+	case ExitReasonSignal, ExitReasonExternalUnmount:
 		exitRec.Code = ExitOK
 		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
 		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=serve_end reason=%s mountpoint=%s pid=%d uptime=%s\n",
@@ -1399,6 +1403,11 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 				unlock := fs.lockRemoteCommitPath(localPath)
 				defer unlock()
 			}
+			// An orphan must not suppress the authoritative Layer replay. Recovery
+			// runs after restore, so prune it here under the same publication fence.
+			if meta, exists := pending.GetMeta(localPath); exists && !shadows.Has(localPath) {
+				pending.RemoveIfGeneration(localPath, meta.Generation)
+			}
 			// Recovery must upload local dirty content before it can be replaced by
 			// a server replay. Clean overlays can be refreshed normally.
 			if meta, exists := pending.GetMeta(localPath); exists && !meta.LayerClean && !opts.ReadOnly {
@@ -1469,8 +1478,18 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 			if entry.Op != "upsert" || entry.Kind != "file" {
 				return nil
 			}
-			if _, ok := pending.GetMeta(localPath); ok {
+			if meta, ok := pending.GetMeta(localPath); ok {
 				if _, restored := restoredUpserts[localPath]; !restored {
+					// Clean entries bypass upload recovery, so restore must bind
+					// their recovered payload before readers can use it.
+					if meta.LayerClean && meta.shadowSource.store != shadows {
+						if pending.recoverShadowSource(localPath, meta.Generation, shadows) == 0 {
+							return fmt.Errorf("restore fs layer cache %s: missing or short shadow", localPath)
+						}
+					}
+					if fs != nil {
+						fs.markLayerFileMode(localPath, meta.Mode)
+					}
 					return nil
 				}
 			}
@@ -1504,7 +1523,7 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 			if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
 				return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
 			}
-			if _, err := pending.PutLayerCache(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+			if _, err := pending.PutLayerCache(localPath, sizeBytes, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
 				return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
 			}
 			if fs != nil {
@@ -1599,7 +1618,7 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 	if err := shadows.WriteFull(newLocalPath, data, 0); err != nil {
 		return fmt.Errorf("restore fs layer renamed shadow %s: %w", newLocalPath, err)
 	}
-	if _, err := pending.PutLayerCache(newLocalPath, int64(len(data)), PendingOverwrite, 0, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+	if _, err := pending.PutLayerCache(newLocalPath, int64(len(data)), 0, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
 		return fmt.Errorf("restore fs layer renamed pending %s: %w", newLocalPath, err)
 	}
 	return nil
