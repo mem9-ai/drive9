@@ -1,0 +1,90 @@
+#!/bin/sh
+# Fault matrix X3: service throttling or temporary unavailability (rate-limit-storm).
+#
+# Scenario:
+#   Under HTTP-layer throttling (429/503 + Retry-After), errors surface explicitly
+#   and are recognizable as HTTP-layer (the error carries status-code semantics),
+#   with no silent hangs; client auto-retries are recorded separately (whether they
+#   back off per Retry-After, how many attempts) and a retry success is never merged
+#   into a first-attempt success; after the throttle is lifted, an explicit replay
+#   of the same writes converges to the exact final state; operations outside the
+#   window that the throttle does not directly hit stay undisturbed.
+#   Forbidden: emulating HTTP throttling with TCP RST / disconnects (insufficient
+#   fidelity means this is not covered); recording a silent hang as "waiting". If
+#   the http-limit effect is not implemented, the run is blocked as a whole (not
+#   covered) and must not be approximated.
+#
+# Environment (not part of the script logic): a controlled HTTP-aware proxy
+# between the client and the server.
+set -eu
+FILES=${FILES:-80}
+export FILES
+
+# --- Declare the fault: HTTP-layer throttling (429/503 + Retry-After) [X3] ---
+drive9-test-fault throttle http-limit --pattern 'PUT /v1/fs' --count 30 \
+    --hold 6s --expect may-fail-inflight
+
+# --- Bulk import inside the throttle window: errors surface explicitly and are
+#     logged one by one; the payload layer does not retry [X3] ---
+drive9-test-arm throttle
+drive9-test-window --expect may-fail-inflight --timeout 10m -- sh -c '
+mkdir -p src
+i=0
+while [ $i -lt "$FILES" ]; do
+  k=$((i+1))
+  if { head -c 65536 /dev/zero | tr "\0" x; printf "throttled payload %s\n" "$k"; } > "src/file-$k.txt.part" 2>/tmp/tl-err; then
+    chmod 644 "src/file-$k.txt.part" 2>/dev/null
+    if command -v fsync >/dev/null 2>&1; then fsync "src/file-$k.txt.part" 2>/dev/null || true; else sync -f "src/file-$k.txt.part" 2>/dev/null || true; fi
+    mv "src/file-$k.txt.part" "src/file-$k.txt" 2>/dev/null || echo "throttle mv-failed file=$k"
+  else
+    echo "throttle write-failed file=$k err=$(tail -1 /tmp/tl-err)"
+  fi
+  i=$((i+1))
+done
+'
+drive9-test-disarm throttle
+
+# --- Once the throttle is lifted, replay explicitly: converge to the exact final
+#     state [X3] ---
+mkdir -p src
+i=0
+while [ $i -lt $FILES ]; do
+  k=$((i+1))
+  { head -c 65536 /dev/zero | tr '\0' x; printf 'throttled payload %s\n' "$k"; } > "src/file-$k.txt.part"
+  if command -v fsync >/dev/null 2>&1; then fsync "src/file-$k.txt.part"; else sync -f "src/file-$k.txt.part" 2>/dev/null || true; fi
+  mv "src/file-$k.txt.part" "src/file-$k.txt"
+  i=$((i+1))
+done
+
+# --- Full-tree verification [X3]: after the replay every file must be in the
+#      complete written shape (64KiB 'x' prefix + payload line), i.e. converged to
+#      the exact final state; a short 20-byte payload would mismatch from byte 1 ---
+i=0
+while [ $i -lt $FILES ]; do
+  k=$((i+1))
+  if [ -e "src/file-$k.txt" ]; then
+    { head -c 65536 /dev/zero | tr '\0' x; printf 'throttled payload %s\n' "$k"; } > /tmp/x3-exp
+    cmp /tmp/x3-exp "src/file-$k.txt"
+  else
+    echo "MISSING-AFTER-REPLAY file=$k"; exit 1
+  fi
+  i=$((i+1))
+done
+echo "tree verified after window"
+
+drive9-test-sample final
+# Before verifying sync, wait for background task processing to finish: conflict
+#      items auto-resolved from the throttle window carry their own 60s retry
+#      window, and the wait must cover it; conflicts still present after 60s are a
+#      genuine convergence finding.
+drive9-test-hold --for 15s
+drive9-test-drain --mode best-effort --timeout 180s
+
+# --- Verdicts: each assertion = one case entry in the stats ---
+drive9-test-check fault-fired --fault throttle                        --req 'X3'
+# The evidence must be recognizable as HTTP-layer throttling (429/503/Retry-After),
+# not a connection-layer RST.
+drive9-test-check artifact-contains --artifact injector/proxy.jsonl \
+    --pattern '429|503|Retry-After'                                   --req 'X3'
+drive9-test-check manifest-equals --this control --against @final \
+    --ignore '.sim/**'                                                --req 'X3'

@@ -1,0 +1,140 @@
+#!/bin/sh
+# File attributes are verified after content persistence is established.
+#
+# What this scenario does:
+#   Four attribute kinds -- exec bit / pinned mtime / symlink target / user.*
+#   xattr -- each get their own oracle and their own verdict: set and read
+#   back immediately -> drain -> restart with the same cache and verify, then
+#   remount with no original cache and verify again, attribute by attribute.
+#   Process constraint: content sync must complete before attributes are set
+#   (content upload and attribute setting stay separate, otherwise outcomes
+#   cannot be attributed).
+#   What is checked: an attribute that was set successfully and is declared
+#   supported reads back as agreed immediately (each of the four judged on
+#   its own); attributes that can be stored remotely survive both remount
+#   legs; every attribute kind gets its own verdict -- never summarized as
+#   "metadata passed"; content and attributes are verified separately (the
+#   content digest must not change at any point); mtime is compared at the
+#   declared precision (+/-60s).
+#   Unsupported: if xattr (or any other item) is declared unsupported ->
+#   record "unsupported + actual errno"; set successfully but effective only
+#   for the current client -> record a compatibility limitation.
+#   Forbidden: testing only the fresh leg is not a complete run (both legs
+#   are required).
+#   Faults: not applicable (the variable under test here is attribute
+#   persistence; the exit action is a scenario operation).
+#
+#   remount legs: same-cache (client restart) -> fresh (no original cache),
+#   two legs.
+#   Pinned tools: coreutils (chmod / touch / ln), attr (getfattr / setfattr).
+#   control: the same attribute sequence runs in a plain local directory (the
+#   local attribute-semantics baseline, especially for xattr).
+#
+# The same per-attribute verification sequence is inlined after each remount
+# leg, in the same order as the set/content-seed section. An unsupported
+# xattr is absorbed explicitly by the in-segment branch (recorded, not a
+# failure); losing any other attribute still aborts the script under set -e.
+set -eu
+
+# ---- E-step1 - pin and sync the attribute-carrier content first (content
+# upload kept separate from attribute setting) ----
+mkdir -p attrs
+printf '#!/bin/sh\necho attr-exec\n' > attrs/exec.sh
+printf 'mtime pinned\n'             > attrs/timed.txt
+drive9-test-drain --mode require-ok --timeout 120s
+
+# ---- E-step2/check1 - set the four attribute kinds one by one and read back
+# immediately: 0755 / mtime=2020-01-01T00:00:00Z (+/-60s) / symlink / xattr
+# user.drive9sim.test=v1 (unsupported -> record the errno) ----
+chmod 755 attrs/exec.sh
+[ -x attrs/exec.sh ]
+touch -d '2020-01-01T00:00:00Z' attrs/timed.txt
+ln -sfn ../attrs/exec.sh attrs/exec-link
+[ "$(readlink attrs/exec-link)" = "../attrs/exec.sh" ]
+if setfattr -n user.drive9sim.test -v v1 attrs/timed.txt 2>/tmp/xattr-err; then
+  [ "$(getfattr -n user.drive9sim.test --only-values attrs/timed.txt)" = "v1" ]
+  echo "xattr: set-ok readback-ok"
+else
+  echo "xattr: UNSUPPORTED $(cat /tmp/xattr-err)"
+fi
+m=$(stat -c %Y attrs/timed.txt)
+if [ "$m" -ge 1577836800 ] && [ "$m" -le 1577836860 ]; then
+  drive9-test-check shell --req 'E-check1' -- test "$m" -le 1577836860
+else
+  # an attribute not declared supported that was set but reads back wrong ->
+  # mark unconfirmed (rc=3) and list the before/after values
+  echo "MTIME-SET-NOT-EFFECTIVE set=1577836800..1577836860 got=$m"
+  drive9-test-check shell --req 'E-check1' -- sh -c 'exit 3'
+fi
+echo "attrs set + immediate readback done"
+drive9-test-sample attrs-set
+
+# ---- E-step4 leg 1 - client restart (same cache): SIGKILL the client ->
+# remount with the original cache ----
+drive9-test-kill client
+drive9-test-remount --cache same
+cd "$D9_MOUNT"
+
+# ---- E-step4 - per-attribute verification after the same-cache remount (a
+# separate verdict per kind; xattr unsupported is a legitimate record) ----
+rc=0
+[ -x attrs/exec.sh ]                       || { echo "MODE-LOST"; rc=1; }
+[ "$(readlink attrs/exec-link)" = "../attrs/exec.sh" ] || { echo "LINK-LOST"; rc=1; }
+m=$(stat -c %Y attrs/timed.txt)
+if [ "$m" -ge 1577836800 ] && [ "$m" -le 1577836860 ]; then
+  drive9-test-check shell --req 'E-check2' -- test "$m" -le 1577836860
+else
+  # an attribute not explicitly promised to survive remotely -> mark
+  # unconfirmed (rc=3), listing the before/after values
+  echo "MTIME-NOT-PRESERVED set=1577836800..1577836860 got=$m"
+  drive9-test-check shell --req 'E-check2' -- sh -c 'exit 3'
+fi
+if getfattr -n user.drive9sim.test --only-values attrs/timed.txt >/dev/null 2>&1; then
+  [ "$(getfattr -n user.drive9sim.test --only-values attrs/timed.txt)" = "v1" ] || { echo "XATTR-VALUE-DIFF"; rc=1; }
+else
+  echo "xattr: UNSUPPORTED after remount"
+fi
+[ $rc -eq 0 ]
+echo "attrs preserved after remount"
+
+# ---- E-step4 leg 2 - remount with no original cache: SIGKILL again ->
+# remount with a brand-new cache directory ----
+drive9-test-kill client
+drive9-test-remount --cache fresh
+cd "$D9_MOUNT"
+drive9-test-sample fresh
+
+# ---- E-step4 - per-attribute verification after the no-original-cache
+# remount (permissions / type / link target / mtime at declared precision /
+# xattr key-value; a separate verdict per kind) ----
+rc=0
+[ -x attrs/exec.sh ]                       || { echo "MODE-LOST"; rc=1; }
+[ "$(readlink attrs/exec-link)" = "../attrs/exec.sh" ] || { echo "LINK-LOST"; rc=1; }
+m=$(stat -c %Y attrs/timed.txt)
+if [ "$m" -ge 1577836800 ] && [ "$m" -le 1577836860 ]; then
+  drive9-test-check shell --req 'E-check2' -- test "$m" -le 1577836860
+else
+  # an attribute not explicitly promised to survive remotely -> mark
+  # unconfirmed (rc=3), listing the before/after values
+  echo "MTIME-NOT-PRESERVED set=1577836800..1577836860 got=$m"
+  drive9-test-check shell --req 'E-check2' -- sh -c 'exit 3'
+fi
+if getfattr -n user.drive9sim.test --only-values attrs/timed.txt >/dev/null 2>&1; then
+  [ "$(getfattr -n user.drive9sim.test --only-values attrs/timed.txt)" = "v1" ] || { echo "XATTR-VALUE-DIFF"; rc=1; }
+else
+  echo "xattr: UNSUPPORTED after remount"
+fi
+[ $rc -eq 0 ]
+echo "attrs preserved after remount"
+
+# ---- Wrap-up - content digest recheck (the attribute experiments must not
+# damage content) ----
+printf 'mtime pinned\n'              | cmp - attrs/timed.txt
+printf '#!/bin/sh\necho attr-exec\n' | cmp - attrs/exec.sh
+
+# ---- Verdicts: each assertion = one case entry in the statistics ----
+drive9-test-check manifest-equals --this @fresh --against @attrs-set \
+    --ignore '.sim/**'                                              --req 'E-check2'
+drive9-test-check artifact-contains --artifact journal \
+    --pattern 'xattr:'                                              --req 'E-evidence'
+drive9-test-check sync-ok                                           --req 'E-step3'

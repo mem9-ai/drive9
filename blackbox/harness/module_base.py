@@ -14,7 +14,7 @@ class BaseModule:
     labels: tuple[str, ...] = ()
     manual = False
     timeout = 600
-    # Report profile: "functional", "performance", "compatibility", "customer".
+    # Report profile: "functional", "performance", "compatibility", "custom".
     # Empty string means "infer from labels".
     report_profile = ""
     # Whether this module needs the suite-level provider.setup() to have run
@@ -48,8 +48,8 @@ class BaseModule:
         if self.report_profile:
             return self.report_profile
         label_set = set(self.labels)
-        if "customer" in label_set:
-            return "customer"
+        if "custom" in label_set:
+            return "custom"
         if "performance" in label_set:
             return "performance"
         if "compatibility" in label_set:

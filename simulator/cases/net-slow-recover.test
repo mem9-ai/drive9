@@ -1,0 +1,114 @@
+#!/bin/sh
+# Anomaly matrix X2: the network slows down, and connections break and then recover.
+#
+# Scenario:
+#   Under the primary profile (every new connection pays a +2s connect delay),
+#   durable batch writes (publish + fsync) are allowed to get slower only: they must
+#   not fail, and no data may be lost silently. The cut variant profile covers the
+#   "recover after the connection breaks" shape: in-window failures are reported
+#   explicitly, and replaying the import after the window closes converges. The final
+#   tree state is checked exactly (manifest + digests all equal). Once the link is
+#   back to normal, drain must succeed and subsequent reads and writes must show no
+#   residual trouble (no backlog retry storm, no stuck uploads).
+#   Latency is judged per the budget policy: with a budget agreed on, judge against
+#   it; without one, report as unconfirmed together with the full data.
+#   Mis-readings this scenario forbids:
+#   - Failing the run because in-window latency exceeded a target when no budget was
+#     agreed; the only admissible outcome then is unconfirmed + data.
+#   - Mixing out-of-window latency samples into the fault-window statistics.
+#
+# Environment premise: durably committed writes (the basis of the
+# "may only get slower" promise).
+#
+# Faults (two profiles, outcomes reported separately):
+#   - slow-link: delay, from the 20th PUT on, hold 20s, slower-not-broken
+#   - cut-variant: blackhole at the 20th PUT, hold 8s, may-fail-inflight
+set -eu
+FILES=${FILES:-80}
+export FILES
+
+# ---- Fault declarations (two profiles, outcomes reported separately) [X2] ----
+drive9-test-fault slow-link delay --pattern 'PUT' --count 20 \
+    --hold 20s --expect slower-not-broken --delay 2s
+drive9-test-fault cut-variant blackhole --pattern 'PUT' --count 20 \
+    --hold 8s --expect may-fail-inflight
+
+# ---- Primary profile (slow-link): arm, then batch-import 80 files; all must succeed, only slower [X2] ----
+drive9-test-arm slow-link
+mkdir -p src
+i=0
+while [ $i -lt $FILES ]; do
+  k=$((i+1))
+  printf 'net payload %s\n' "$k" > "src/file-$k.txt.part"
+  if command -v fsync >/dev/null 2>&1; then fsync "src/file-$k.txt.part"; fi
+  mv "src/file-$k.txt.part" "src/file-$k.txt"
+  i=$((i+1))
+done
+echo "import under slow link complete"
+drive9-test-disarm slow-link
+
+# ---- Primary profile final-state check: compare every surviving file byte for byte [X2] ----
+i=0
+while [ $i -lt $FILES ]; do
+  k=$((i+1))
+  if [ -e "src/file-$k.txt" ]; then printf 'net payload %s\n' "$k" | cmp - "src/file-$k.txt"; fi
+  i=$((i+1))
+done
+echo "tree verified after window"
+
+# ---- Cut variant (cut-variant): import inside the blackout window; failures may surface explicitly (may-fail-inflight) [X2] ----
+drive9-test-arm cut-variant
+drive9-test-window --expect may-fail-inflight --timeout 10m -- sh -c '
+i=0
+while [ $i -lt "$FILES" ]; do
+  k=$((i+1))
+  if printf "cut payload %s\n" "$k" > "src/file-$k.txt.part" 2>/dev/null; then
+    if command -v fsync >/dev/null 2>&1; then fsync "src/file-$k.txt.part" 2>/dev/null || true; fi
+    r=0
+    while ! mv "src/file-$k.txt.part" "src/file-$k.txt" 2>/dev/null; do
+      r=$((r+1)); [ $r -ge 10 ] && { echo "mv-retry-exhausted file=$k"; break; }
+      sleep 1
+    done 2>/dev/null || echo "cut mv-failed file=$k"
+  else
+    echo "cut write-failed file=$k rc=$?"
+  fi
+  i=$((i+1))
+done
+'
+drive9-test-disarm cut-variant
+
+# ---- Replay the import after the window closes; it must converge [X2] ----
+mkdir -p src
+i=0
+while [ $i -lt $FILES ]; do
+  k=$((i+1))
+  printf 'net payload %s\n' "$k" > "src/file-$k.txt.part"
+  if command -v fsync >/dev/null 2>&1; then fsync "src/file-$k.txt.part"; fi
+  mv "src/file-$k.txt.part" "src/file-$k.txt"
+  i=$((i+1))
+done
+echo "import under slow link complete"
+
+# ---- Final-state check [X2] ----
+i=0
+while [ $i -lt $FILES ]; do
+  k=$((i+1))
+  if [ -e "src/file-$k.txt" ]; then printf 'net payload %s\n' "$k" | cmp - "src/file-$k.txt"; fi
+  i=$((i+1))
+done
+echo "tree verified after window"
+
+# ---- One round of ordinary reads and writes on the recovered link; confirm no residual trouble [X2] ----
+printf 'life after net events\n' > after.txt
+printf 'life after net events\n' | cmp - after.txt
+echo "post-recovery io ok"
+
+drive9-test-sample final
+drive9-test-drain --mode require-ok --timeout 180s
+
+# ---- Verdicts: each assertion below is one case entry in the statistics ----
+drive9-test-check fault-fired --fault slow-link                       --req 'X2'
+drive9-test-check fault-fired --fault cut-variant                     --req 'X2'
+drive9-test-check manifest-equals --this control --against @final \
+    --ignore '.sim/**'                                                --req 'X2'
+drive9-test-check metrics --metric op.write-fsync.p95 --budget write-fsync --req 'section5-latency'

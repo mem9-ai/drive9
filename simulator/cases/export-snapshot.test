@@ -1,0 +1,95 @@
+#!/bin/sh
+# Scenario 10: package and export a deterministic version of a project.
+#
+# What this scenario does:
+#   After writes stop, export the whole tree as an archive; unpacking and
+#   comparing must show a complete set with no anomalous duplication. After a
+#   change set, a second export must read the new version. Deliverables copied
+#   from local build output into drive9 must match their sources byte for byte
+#   and read back identically through an independent entry point after drain.
+#   Check points: traversal of a stable directory is complete with no anomalous
+#   duplicates (each version's count and manifest equal the other's); read
+#   content matches the exported version (per-file digest == fingerprint
+#   manifest); the second export reads the actual v2 state (new index in
+#   effect, styles.css gone, about.html present) without interference from
+#   stale directory or stale content caches; deliverables are byte-identical
+#   to their sources and read back identically via an independent entry point
+#   after drain.
+#   Forbidden mis-readings: comparing file counts only. "Export while
+#   modifying, with multi-file version consistency at one instant" is NOT this
+#   case's scope (snapshot-consistency capability needs a dedicated test and a
+#   public statement of its own).
+#
+#   Tooling pinned: tar, coreutils.
+#   control: the same tree is built in an ordinary local directory and put
+#   through the same tar → unpack → compare (tar's own behavior is
+#   whitelisted, e.g. pax header differences).
+#   Inputs: fixed site tree v1 (index.html / styles.css / src/app.js / 64KiB
+#   asset); change set v1→v2 (index replaced, styles removed,
+#   pages/about.html added); full SHA-256 manifests for both versions are
+#   fixed on the construction side.
+#
+# Notes:
+#   - mkdir -p site/pages precedes the redirect into site/pages/about.html
+#     (the target directory must exist first); semantics unchanged:
+#     pages/about.html is a new file.
+#   - Any unexpected failure inside a segment aborts the script via set -e and
+#     fails the run.
+set -eu
+
+# --- Step 1: build the v1 tree and fix its fingerprints (writes stopped) ---
+mkdir -p site/src site/assets
+printf '<html>export v1</html>\n'   > site/index.html
+printf 'body{}\n'                    > site/styles.css
+printf 'app v1\n'                    > site/src/app.js
+head -c 65536 /dev/zero | tr '\0' 'e' > site/assets/hero.bin
+( cd site && find . -type f | sort | xargs sha256sum > ../site-v1.SHA256SUMS )
+
+# --- Steps 2/3: first export - tar, unpack into a separate local directory,
+#      compare both ways against the fingerprint manifest (paths / sizes /
+#      digests all equal, counts match, complete, no anomalous duplication) ---
+rm -rf /tmp/x1 && mkdir -p /tmp/x1
+tar cf /tmp/e1.tar site
+tar xf /tmp/e1.tar -C /tmp/x1
+( cd /tmp/x1/site && find . -type f | sort | xargs sha256sum > ../got-v1 )
+cmp /tmp/x1/got-v1 site-v1.SHA256SUMS
+[ "$(wc -l < site-v1.SHA256SUMS)" -eq "$(wc -l < /tmp/x1/got-v1)" ]
+echo "export v1 complete no-dupes"
+
+# --- Apply the change set to reach v2 (second export starts after writes
+#     stop): replace index, remove styles, add about ---
+printf '<html>export v2</html>\n' > site/index.html
+rm site/styles.css
+mkdir -p site/pages
+printf '<html>about</html>\n'      > site/pages/about.html
+
+# --- Step 4: the second export must read the actual v2 state, unaffected by
+#     stale directory / stale content caches ---
+rm -rf /tmp/x2 && mkdir -p /tmp/x2
+tar cf /tmp/e2.tar site
+tar xf /tmp/e2.tar -C /tmp/x2
+[ "$(cat /tmp/x2/site/index.html)" = "<html>export v2</html>" ]
+[ -e /tmp/x2/site/pages/about.html ] && [ ! -e /tmp/x2/site/styles.css ]
+cmp /tmp/x2/site/src/app.js site/src/app.js
+echo "second export fresh"
+
+# --- Step 5: deliverable - local build output copied into the mount (the
+#     byte-exact check via an independent entry point after drain is done by
+#     the assertions below) ---
+rm -rf /tmp/dist && mkdir -p /tmp/dist
+printf 'deliverable artifact\n' > /tmp/dist/app.js
+mkdir -p deliverables
+cp -a /tmp/dist/app.js deliverables/app.js
+cmp deliverables/app.js /tmp/dist/app.js
+echo "deliverable copied byte-exact"
+
+# --- Final whole-tree sample + drain, then sample through the independent
+#     (remote) entry point ---
+drive9-test-sample final
+drive9-test-drain --mode require-ok --timeout 120s
+drive9-test-sample remote-final --as remote
+
+# --- Assertions: each assert is one case entry in the run statistics ---
+drive9-test-check manifest-equals --this @remote-final --against @final \
+    --ignore '.sim/**,site-v*.SHA256SUMS'                          --req 'scenario10-step5'
+drive9-test-check sync-ok                                          --req 'scenario10-step5'

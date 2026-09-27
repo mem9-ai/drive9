@@ -1,0 +1,125 @@
+#!/bin/sh
+# Connection cut during per-file synced saves (fsync-cut).
+#
+# Scenario:
+#   Template-style per-file saves (temp file -> write -> chmod -> fsync -> close ->
+#   rename) under a connection cut shaped as "in-flight requests never complete":
+#   errors must surface explicitly to the caller, a failed fsync must skip the
+#   rename, already finalized files must stay unaffected, replay after recovery must
+#   converge, and a late background upload must not resurrect temp paths that were
+#   already cleaned up.
+#
+# Environment (not part of the script logic; supplied via the run CLI):
+#   Input: two batches of fixed-content files (a settled control batch / an import
+#   batch); expected final state = the full import batch present and no *.tmp left.
+set -eu
+FILES=${FILES:-100}
+export FILES
+
+# --- Normal control round: the full per-file save sequence with no faults, logging
+#     each file as it completes. [A-step1/A-check1] ---
+mkdir -p cal
+i=0
+while [ $i -lt $FILES ]; do
+  k=$((i+1))
+  printf 'cal %s\n' "$k" > "cal/$k.txt.part"
+  chmod 644 "cal/$k.txt.part"
+  if command -v fsync >/dev/null 2>&1; then fsync "cal/$k.txt.part"; fi
+  mv "cal/$k.txt.part" "cal/$k.txt"
+  echo "normal-round file=$k"
+  i=$((i+1))
+done
+
+# --- Settled control batch (completed safely before the fault anchor; never
+#     modified afterwards) ---
+mkdir -p settled
+i=0
+while [ $i -lt 10 ]; do
+  k=$((i+1))
+  printf 'settled payload %s\n' "$k" > "settled/formal-$k.txt.part"
+  if command -v fsync >/dev/null 2>&1; then fsync "settled/formal-$k.txt.part"; fi
+  mv "settled/formal-$k.txt.part" "settled/formal-$k.txt"
+  i=$((i+1))
+done
+drive9-test-sample settled
+
+# --- Declare and arm the fault: blackhole / from the 40th PUT / hold 8s /
+#     may-fail-inflight [A-step2] ---
+drive9-test-fault cut blackhole --pattern 'PUT' --count 40 \
+    --hold 8s --expect may-fail-inflight
+drive9-test-arm cut
+
+# --- Per-file import inside the fault window [A-step2]:
+#      in-window failures are absorbed per may-fail-inflight (any explicit errno
+#      reaching the caller is legitimate);
+#      when fsync fails the rename is skipped for that file: the .part temp and the
+#      existing final file stay as they are.
+drive9-test-window --expect may-fail-inflight --timeout 10m -- sh -c '
+mkdir -p src
+i=0
+while [ $i -lt "$FILES" ]; do
+  k=$((i+1))
+  printf "import payload %s\n" "$k" > "src/file-$k.txt.part"
+  chmod 644 "src/file-$k.txt.part"
+  if command -v fsync >/dev/null 2>&1; then
+    if ! fsync "src/file-$k.txt.part"; then
+      echo "fsync-failed keep-temp file=$k"
+      i=$((i+1))
+      continue
+    fi
+  fi
+  if ! mv "src/file-$k.txt.part" "src/file-$k.txt"; then
+    echo "rename-failed keep-temp file=$k"
+  fi
+  echo "import file=$k"
+  i=$((i+1))
+done
+echo "import-cut segment ended (fault window)"
+'
+drive9-test-disarm cut
+drive9-test-hold --for 5s
+
+# --- Verify right after the cut [A-step3/A-check3]: existing final files stay
+#      intact; in-window failures must not fabricate files; afterwards temp files
+#      are removed explicitly and the removal is logged. ---
+i=0
+while [ $i -lt $FILES ]; do
+  k=$((i+1))
+  if [ -e "src/file-$k.txt" ]; then
+    printf 'import payload %s\n' "$k" | cmp - "src/file-$k.txt"
+  fi
+  i=$((i+1))
+done
+tmps=$(find src settled -name '*.part' -o -name '*.tmp' 2>/dev/null | wc -l)
+echo "pre-cleanup temp-count=$tmps src-exists=$([ -d src ] && echo yes || echo no) src-entries=$(ls src 2>/dev/null | wc -l)"
+find src -name '*.part' -delete
+rm -f src/*.tmp
+echo "explicit temp cleanup done"
+
+# --- After recovery, replay the same tree with the fixed save sequence
+#     [A-step4/A-check5] ---
+i=0
+while [ $i -lt $FILES ]; do
+  k=$((i+1))
+  printf 'import payload %s\n' "$k" > "src/file-$k.txt.part"
+  if command -v fsync >/dev/null 2>&1; then fsync "src/file-$k.txt.part"; fi
+  mv "src/file-$k.txt.part" "src/file-$k.txt"
+  i=$((i+1))
+done
+leftover=$(find src settled -name '*.part' -o -name '*.tmp' 2>/dev/null | wc -l)
+echo "retry converged leftover=$leftover"
+
+# --- Late-upload check window and final-state sampling [A-step5/A-check4] ---
+drive9-test-sample final
+drive9-test-drain --mode require-ok --timeout 120s
+drive9-test-hold --for 10s
+drive9-test-sample post-drain
+
+# --- Verdicts: each assertion = one case entry in the stats ---
+drive9-test-check fault-fired --fault cut                                --req 'A-step2'
+drive9-test-check manifest-contains --this @post-drain --against @settled \
+    --paths 'settled/'                                                   --req 'A-check4'
+drive9-test-check manifest-absent --this @post-drain --paths 'src/*.tmp' --req 'A-check4'
+drive9-test-check manifest-equals --this control --against @final \
+    --ignore '.sim/**,settled/'                                          --req 'A-check5'
+drive9-test-check sync-ok                                                --req 'A-check5'

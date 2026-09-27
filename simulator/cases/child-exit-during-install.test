@@ -1,0 +1,96 @@
+#!/bin/sh
+# Exception matrix X1 - a child process exits normally
+#
+# Scenario: a concurrent install (W workers, each item: write temp file ->
+# rename into the installed path) where some workers "exit normally" (exit 0
+# form - not signal-killed, not crashed). Uncancelled operations must not fail
+# without cause; completed items must be byte-for-byte correct; an explicit
+# replay converges to the full exact final state with no temp leftovers.
+# Forbidden mis-readings: conflating a normal child exit with a crash or kill
+# (it must be the exit-0 form); letting "the final replay succeeded" hide
+# operations that failed without cause mid-flight (record both layers
+# per item).
+# Optional build leg (parallel-build mount point): reuse this skeleton for a
+# build process group; when disabled the coverage matrix records it as
+# not-covered (reason: leg disabled).
+#
+# Inputs: ASSETS fixed 4KiB assets (SHA-256 manifest pinned under
+# /tmp/d9case/child-exit); final state = full installed manifest after replay.
+set -eu
+ASSETS=${ASSETS:-24}
+WORKERS=${WORKERS:-8}
+
+# --- Stage assets and pin fingerprints ---
+T=/tmp/d9case/child-exit
+rm -rf "$T" && mkdir -p "$T/assets" incoming installed
+i=0
+while [ $i -lt $ASSETS ]; do
+  k=$((i+1)); head -c 4096 /dev/zero | tr '\0' 'd' > "$T/assets/a-$k.bin"; i=$((i+1))
+done
+( cd "$T/assets" && sha256sum *.bin | sort -k2 > "$T/assets.SHA256SUMS" )
+
+# --- W workers install concurrently; half of them "exit normally" (exit 0)
+#      around 6s in, the rest finish their own items (partially completed
+#      batches are the scenario itself) ---
+N=$ASSETS; W=$WORKERS
+q=$(( (N + W - 1) / W ))
+worker() {
+  id=$1; lo=$(( (id-1)*q + 1 )); hi=$(( id*q )); [ $hi -gt $N ] && hi=$N
+  # half the workers schedule a normal exit at ~6s (leftover items = the
+  # unobserved tail)
+  if [ $((id % 2)) -eq 0 ]; then
+    ( sleep 6; exit 0 ) &
+    watchdog=$!
+  fi
+  j=$lo
+  while [ $j -le $hi ]; do
+    if [ -n "${watchdog:-}" ] && ! kill -0 $watchdog 2>/dev/null; then
+      echo "worker-normal-exit: worker=$id at-item=$j"; exit 0
+    fi
+    cp "$T/assets/a-$j.bin" "incoming/a-$j.tmp" && mv "incoming/a-$j.tmp" "installed/a-$j.bin"
+    j=$((j+1))
+  done
+}
+i=1
+while [ $i -le $W ]; do worker $i & i=$((i+1)); done
+wait
+echo "interrupted install round done"
+
+# --- Uncancelled-operation audit: existing items byte-for-byte correct;
+#      incomplete items counted honestly (not judged) ---
+N=$ASSETS
+present=0; missing=0
+j=1
+while [ $j -le $N ]; do
+  if [ -e "installed/a-$j.bin" ]; then
+    cmp "$T/assets/a-$j.bin" "installed/a-$j.bin"; present=$((present+1))
+  else
+    missing=$((missing+1))
+  fi
+  j=$((j+1))
+done
+echo "audit PRESENT=$present MISSING=$missing"
+[ $present -gt 0 ]
+
+# --- Explicit replay of the same install: converge to the full exact final
+#      state, no temp leftovers ---
+N=$ASSETS
+j=1
+while [ $j -le $N ]; do
+  cp "$T/assets/a-$j.bin" "incoming/a-$j.tmp" && mv "incoming/a-$j.tmp" "installed/a-$j.bin"
+  j=$((j+1))
+done
+sha256sum installed/a-*.bin | sed 's/  installed\//  /' | sort -k2 > /tmp/got-x1
+sort -k2 "$T/assets.SHA256SUMS" > /tmp/exp-x1
+cmp /tmp/got-x1 /tmp/exp-x1
+[ "$(ls incoming 2>/dev/null | wc -l)" -eq 0 ]
+echo "replay converged full"
+
+drive9-test-sample final
+drive9-test-drain --mode require-ok --timeout 120s
+
+# --- Verdicts ---
+drive9-test-check artifact-contains --artifact journal \
+    --pattern 'worker-normal-exit:'                                      --req 'X1'
+drive9-test-check manifest-equals --this control --against @final \
+    --ignore '.sim/**,incoming/**'                                       --req 'scenario4-check4'

@@ -1,0 +1,93 @@
+#!/bin/sh
+# Scenario 6: install dependencies and run package managers - overlay-local profile.
+#
+# Scope:
+#   The full lifecycle for pinned offline packages - install, reinstall, lockfile
+#   reinstall, upgrade, removal - must behave correctly. Two directory configurations
+#   produce separate verdicts: node_modules fully remote vs local overlay. This case
+#   is the overlay-local profile (the real production layout): node_modules stays in
+#   a local overlay while package.json / lockfile land on the remote side, so the
+#   install crosses the overlay boundary. It is independent of package-install.test
+#   (the all-remote profile); conclusions must not be extrapolated between profiles.
+#   What is checked: installing across the overlay boundary succeeds (packages land
+#   locally, manifest and lockfile land remotely) and the remote-side files are
+#   correct; require and bin both work; removals and replacements are reflected in
+#   directory enumeration; package-manager behaviors such as automatic retries or
+#   falling back to copying are recorded separately.
+#   Mis-readings this scenario forbids:
+#   - Letting "the install eventually completed" mask a first-time failure of some
+#     underlying operation in the middle (both layers' results matter).
+#   - Extrapolating the all-remote profile's conclusions to the overlay profile, or
+#     the other way around.
+#   Faults: none injected.
+#
+# The run needs --overlay 'node_modules/': the overlay-directory semantics are
+#   The run needs --overlay 'node_modules/': the overlay-directory semantics are
+#   supplied only via the run CLI and are not part of the script logic (node_modules
+#   belongs to the local overlay and does not take part in persistence comparisons;
+#   remote-side verdicts are scoped by the directory configuration).
+#   Tools are pinned: node + npm; dependencies are locally pre-packed tarballs
+#   (file: installs, no registry network access).
+#   control: the same install sequence executed in an ordinary local directory
+#   (including the .bin link forms and the npm metadata file whitelist).
+#   Inputs: locally built packages tiny 1.0.0 / 1.1.0, tarballs produced with npm
+#   pack (SHA-256 pinned), never passing through drive9; the expected require results
+#   and bin output for both versions are fixed.
+set -eu
+
+# ---- Setup: pre-build local packages tiny 1.0.0 / 1.1.0 (with executable bins),
+#      pack tarballs with npm pack; none of this goes through the mount ----
+T=/tmp/d9case/package-install
+rm -rf "$T" && mkdir -p "$T/tiny-1.0.0/bin" "$T/tiny-1.1.0/bin"
+printf '{"name":"tiny","version":"1.0.0","main":"index.js","bin":{"tiny":"bin/tiny.js"}}\n' > "$T/tiny-1.0.0/package.json"
+printf 'module.exports = { hello: () => "hi" };\n'  > "$T/tiny-1.0.0/index.js"
+printf '#!/usr/bin/env node\nconsole.log("tiny-bin-1.0.0");\n' > "$T/tiny-1.0.0/bin/tiny.js"
+cp -a "$T/tiny-1.0.0/." "$T/tiny-1.1.0/"
+printf '{"name":"tiny","version":"1.1.0","main":"index.js","bin":{"tiny":"bin/tiny.js"}}\n' > "$T/tiny-1.1.0/package.json"
+printf 'module.exports = { hello: () => "hi2" };\n'  > "$T/tiny-1.1.0/index.js"
+printf '#!/usr/bin/env node\nconsole.log("tiny-bin-1.1.0");\n' > "$T/tiny-1.1.0/bin/tiny.js"
+( cd "$T/tiny-1.0.0" && npm pack --silent >/dev/null )
+( cd "$T/tiny-1.1.0" && npm pack --silent >/dev/null )
+sha256sum "$T"/tiny-*/tiny-*.tgz
+
+# ---- scenario6-step2: cold install (starting from an empty node_modules; the install crosses the overlay boundary) ----
+npm install --no-audit --no-fund /tmp/d9case/package-install/tiny-1.0.0/tiny-1.0.0.tgz
+
+# ---- scenario6-step4: verify from a separate process: require works, the bin is executable, .bin links resolve correctly ----
+node -e 'const t=require("tiny"); if (t.hello()!=="hi") process.exit(3)'
+./node_modules/.bin/tiny | grep -qx tiny-bin-1.0.0
+[ -e node_modules/.bin/tiny ]
+echo "package usable require+bin"
+
+# ---- scenario6-step2: warm reinstall + lockfile reinstall (npm ci) ----
+npm install --no-audit --no-fund /tmp/d9case/package-install/tiny-1.0.0/tiny-1.0.0.tgz
+rm -rf node_modules
+npm ci --no-audit --no-fund
+node -e 'const t=require("tiny"); if (t.hello()!=="hi") process.exit(3)'
+echo "reinstall + npm ci stable"
+
+# ---- scenario6-step3: dependency change: upgrade to 1.1.0 (require / bin output
+#      changes accordingly), then removal leaves enumeration and reads consistent
+#      (nothing deleted is still listed, nothing installed fails to open; a require
+#      failure is expected) ----
+npm install --no-audit --no-fund /tmp/d9case/package-install/tiny-1.1.0/tiny-1.1.0.tgz
+node -e 'const t=require("tiny"); if (t.hello()!=="hi2") process.exit(3)'
+./node_modules/.bin/tiny | grep -qx tiny-bin-1.1.0
+npm remove tiny --no-audit --no-fund
+[ ! -e node_modules/tiny ] && [ ! -e node_modules/.bin/tiny ]
+if node -e 'require("tiny")' 2>/dev/null; then echo REMOVED-PACKAGE-STILL-LOADABLE; exit 1; fi
+echo "remove reflected in enumeration"
+
+# ---- scenario6-step1: final drain (T3), then re-verification through an independent entry point (T4, scoped by the directory configuration) ----
+drive9-test-sample final
+drive9-test-drain --mode require-ok --timeout 180s
+drive9-test-sample remote-final --as remote
+
+# ---- Verdicts: each assertion below is one case entry in the statistics ----
+# The remote side only checks remote files (node_modules belongs to the local
+# overlay and does not take part in persistence comparisons)
+drive9-test-check manifest-equals --this @remote-final --against @final \
+    --ignore '.sim/**,node_modules/**'                             --req 'scenario6-check1'
+drive9-test-check manifest-absent --this @remote-final \
+    --paths 'node_modules/tiny/index.js'                           --req 'section2-1'
+drive9-test-check sync-ok                                          --req 'scenario6-step2'

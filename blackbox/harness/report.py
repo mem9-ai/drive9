@@ -7,7 +7,7 @@ third-party dependencies.
 Each module can override ``render_report`` to produce a fully custom report.
 When it returns ``None``, the framework selects a built-in template based on
 the module's ``report_profile`` (functional / performance / compatibility /
-customer).
+custom).
 """
 from __future__ import annotations
 
@@ -105,8 +105,8 @@ def render_module_report(ctx: Context, module: Any, record: ModuleRecord) -> str
         return render_performance_module_report(ctx, module, record)
     if profile == "compatibility":
         return render_compatibility_module_report(ctx, module, record)
-    if profile == "customer":
-        return render_customer_module_report(ctx, module, record)
+    if profile == "custom":
+        return render_custom_module_report(ctx, module, record)
     return render_functional_module_report(ctx, module, record)
 
 
@@ -269,10 +269,10 @@ def render_compatibility_module_report(ctx: Context, module: Any, record: Module
     return "\n".join(lines) + "\n"
 
 
-def render_customer_module_report(ctx: Context, module: Any, record: ModuleRecord) -> str:
-    """Default customer report — delegates to the module's own render if available."""
+def render_custom_module_report(ctx: Context, module: Any, record: ModuleRecord) -> str:
+    """Default custom report — delegates to the module's own render if available."""
     # If the module provided a custom render_report, it was already called and
-    # this function won't be invoked. This is the fallback for customer-profiled
+    # this function won't be invoked. This is the fallback for custom-profiled
     # modules that don't override render_report.
     return render_functional_module_report(ctx, module, record)
 

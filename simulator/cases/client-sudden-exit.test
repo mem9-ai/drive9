@@ -1,0 +1,94 @@
+#!/bin/sh
+# Fault matrix X5: client or container exits suddenly (client-sudden-exit).
+#
+# Scenario:
+#   SIGKILL the mounted client (sudden exit, no chance to clean up) in the middle
+#   of a bulk import of FILES files: every file whose "write + close had already
+#   returned" before the cut (per the progress log /tmp/x5-progress.log) must be
+#   present and byte-correct (BAD=0); unfinished files are counted honestly as
+#   missing (LOST is reported, not judged, and survival is never fabricated); the
+#   recount happens on a fresh remount (three counts OK/LOST/BAD; counting via a
+#   remount that reuses the same cache is forbidden, otherwise you read the local
+#   cache instead of the remote truth); the replay converges to the exact final
+#   state; after recovery, reads/writes and sync are unaffected by pending tasks.
+#   Forbidden: letting "replay succeeded" mask BAD > 0 (two-layer verdicts).
+#
+# Input: FILES fixed-content files (per-file publish: temp -> write -> fsync ->
+#       rename; each progress line is also appended to the out-of-mount log
+#       /tmp/x5-progress.log, which stays readable after the kill);
+#       final state = the full manifest after the replay.
+# Note: rm -f /tmp/x5-progress.log at the top keeps repeated runs (--repeat) and
+# control runs from inheriting each other's progress logs.
+set -eu
+FILES=${FILES:-200}
+export FILES
+rm -f /tmp/x5-progress.log
+
+# --- Bulk import (getting SIGKILLed mid-import is the scenario) [X5 step1] ---
+drive9-test-async --timeout 10m -- sh -c '
+mkdir -p src
+i=0
+while [ $i -lt "$FILES" ]; do
+  k=$((i+1))
+  printf "sudden-exit payload %s\n" "$k" > "src/file-$k.txt.part"
+  if command -v fsync >/dev/null 2>&1; then
+    fsync "src/file-$k.txt.part" 2>/dev/null || true
+  fi
+  mv "src/file-$k.txt.part" "src/file-$k.txt"
+  echo "$k" >> /tmp/x5-progress.log
+  echo "import file=$k"
+  i=$((i+1))
+done
+'
+drive9-test-hold --for 8s
+
+# --- After 8s, SIGKILL the mounted client (sudden exit, no chance to clean up)
+#     [X5 step2] ---
+drive9-test-kill client
+
+# --- Harvest the still-running import payload (the client is dead; the remaining
+#      iterations fail and exit immediately) ---
+drive9-test-wait --expect interrupted --timeout 60s
+
+# --- Remount in a fresh environment with no prior cache [X5 step3] ---
+drive9-test-remount --cache fresh
+cd "$D9_MOUNT"
+
+# --- Fresh recount: every entry in the progress log must be present and
+#      byte-correct (BAD=0); unlogged entries are honestly counted as missing
+#      (LOST is reported, not judged) [X5 step4] ---
+ok=0; lost=0; bad=0
+for k in $(cat /tmp/x5-progress.log 2>/dev/null); do
+  if [ -f "src/file-$k.txt" ]; then
+    printf 'sudden-exit payload %s\n' "$k" | cmp - "src/file-$k.txt" && ok=$((ok+1)) || bad=$((bad+1))
+  else
+    lost=$((lost+1))
+  fi
+done
+echo "rescan OK=$ok LOST=$lost BAD=$bad"
+[ $bad -eq 0 ]
+
+# --- Replay the same bulk -> converge to the exact final state [X5 step5] ---
+mkdir -p src
+i=0
+while [ $i -lt $FILES ]; do
+  k=$((i+1))
+  printf 'sudden-exit payload %s\n' "$k" > "src/file-$k.txt.part"
+  if command -v fsync >/dev/null 2>&1; then fsync "src/file-$k.txt.part"; fi
+  mv "src/file-$k.txt.part" "src/file-$k.txt"
+  i=$((i+1))
+done
+
+# --- Keep reading/writing after recovery (unaffected by pending tasks)
+#     [X5 step6] ---
+printf 'life goes on\n' > after-recovery.txt
+printf 'life goes on\n' | cmp - after-recovery.txt
+echo "post-kill io ok"
+
+drive9-test-sample final
+drive9-test-drain --mode require-ok --timeout 180s
+
+# --- Verdicts ---
+drive9-test-check artifact-contains --artifact journal --pattern 'OK='    --req 'X5'
+drive9-test-check manifest-equals --this control --against @final \
+    --ignore '.sim/**'                                                    --req 'X5'

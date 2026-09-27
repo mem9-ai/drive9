@@ -1,0 +1,75 @@
+#!/bin/sh
+# Sudden exit after sync is explicitly confirmed successful (exit-recovery-synced).
+#
+# Scenario (the "synced" variant of the exit-recovery family):
+#   Only after drain has produced a success verdict and confirmed there are no
+#   pending items (otherwise the exit step must not be reached), SIGKILL the mounted
+#   client; recover into a fresh environment with no prior cache. Everything
+#   confirmed in this round (including the delete and the rename) is preserved
+#   exactly (the recovered manifest equals the pre-exit manifest exactly); after
+#   recovery, new reads/writes and sync work normally, with no pending tasks
+#   affecting subsequent operations.
+#   Forbidden: letting this variant's success stand in for actually running the
+#   other exit-recovery variants (each produces its own result); running one extra
+#   normal sync round before the exit.
+#   Family-wide baseline: previously saved control files that were not modified
+#   again are preserved intact (digests byte-identical).
+#
+# Input: a control file batch (not modified again after drain confirms it) + this
+#       round's fixed change set (2 adds / 1 overwrite / 1 rename / 1 delete).
+# control: not applicable (exit recovery has no local counterpart); this script
+# does not reference control.
+set -eu
+
+# --- Control file batch: write -> drain confirms -> never modified again
+#     [D-step1] ---
+mkdir -p data
+printf 'prior confirmed control\n' > data/prior-control.txt
+drive9-test-drain --mode require-ok --timeout 120s
+
+# --- This round's fixed change set: 2 adds (fsync) / 1 overwrite (fsync) /
+#     1 rename / 1 delete [D-step1] ---
+printf 'confirmed-1\n' > data/control-1.txt.part
+if command -v fsync >/dev/null 2>&1; then fsync data/control-1.txt.part; fi
+mv data/control-1.txt.part data/control-1.txt
+head -c 65536 /dev/zero | tr '\0' 'D' > data/control-2.bin.part
+if command -v fsync >/dev/null 2>&1; then fsync data/control-2.bin.part; fi
+mv data/control-2.bin.part data/control-2.bin
+printf 'deleted before exit\n' > data/doomed.txt
+if command -v fsync >/dev/null 2>&1; then fsync data/doomed.txt; fi
+mv data/control-2.bin data/renamed.bin
+rm data/doomed.txt
+drive9-test-sample pre-exit
+
+# --- Synced exit: drain must return a success verdict with no pending items before
+#     the exit step is allowed [D-step2/D-step4] ---
+drive9-test-drain --mode require-ok --timeout 120s
+
+# --- Stop the client suddenly at exactly this state (SIGKILL; no extra graceful
+#     exit-sync round) [D-step3] ---
+drive9-test-kill client
+
+# --- Remount fresh with no prior cache -> compare file by file [D-step5] ---
+drive9-test-remount --cache fresh
+cd "$D9_MOUNT"
+drive9-test-sample recovered
+
+# --- Recovery recount (bare checks): everything confirmed this round is preserved
+#      exactly; deleted files do not resurrect [D-step5/D-check1] ---
+printf 'prior confirmed control\n' | cmp - data/prior-control.txt
+printf 'confirmed-1\n'            | cmp - data/control-1.txt
+head -c 65536 /dev/zero | tr '\0' 'D' | cmp - data/renamed.bin
+[ ! -e data/doomed.txt ]
+echo "d3 rescan exact"
+
+# --- A round of fresh reads/writes after recovery (no pending tasks affecting
+#     subsequent operations) [D-step6/D-check4] ---
+printf 'post-d3\n' > data/next.txt
+printf 'post-d3\n' | cmp - data/next.txt
+
+# --- Verdicts ---
+drive9-test-check no-pending                                            --req 'D-step4'
+drive9-test-check manifest-equals --this @recovered --against @pre-exit \
+    --ignore '.sim/**'                                                  --req 'D-check1'
+drive9-test-check manifest-absent --this @recovered \
+    --paths 'data/doomed.txt'                                           --req 'D-check2'

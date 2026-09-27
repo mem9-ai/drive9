@@ -1,0 +1,105 @@
+#!/bin/sh
+# Exit recovery D2: a sync is started but interrupted by a sudden exit.
+#
+# What this scenario does:
+#   Start a drain in best-effort mode with a 1s budget only. Best-effort means
+#   the drain may time out, report an error, or still have pending work when it
+#   returns: starting a sync is not the same as completing one. The drain's
+#   complete output is preserved verbatim in the sync-*.json artifact (no
+#   last-line grabbing, no substitution with an ordinary sync). Immediately
+#   afterwards, SIGKILL the mounted client and recover with no prior cache.
+#   Verification follows what the drain actually confirmed: a sync that never
+#   reached its success condition must not be reported as a fully successful
+#   save. Variant: the drain is started while new writes keep arriving; its
+#   outcome is recorded separately and never mixed with the main line.
+#   Shared bottom line for the exit-recovery family (D1/D2/D3): saved control
+#   files that are not modified afterwards must be preserved intact (byte for
+#   byte identical digest).
+#   Forbidden mis-readings: recording a drain as "completed" when it was only
+#   "started"; sneaking in one extra normal sync before the exit.
+#
+# Inputs: an fsynced control file + an 8MiB non-fsynced volatile file (main
+#   line); a control file + continuously streamed writes (variant).
+# control: not applicable (exit recovery has no local counterpart) - this
+#   script does not reference control.
+#
+# Notes:
+#   - The concurrent writer runs as a drive9-test-async workload; the kill
+#     targets the client, not the workload. The async payload is reaped by the
+#     drive9-test-wait at the end.
+#   - After kill client, both the main line and the variant do
+#     remount --cache fresh and cd "$D9_MOUNT".
+#   - Any unexpected failure inside a segment aborts the script via set -e and
+#     fails the run.
+#   - Journal artifact-contains checks assert on the "bulk-outcome:" marker
+#     line in the script log; the sync-0.json artifact-contains keeps the
+#     evidence of D2's complete drain output.
+set -eu
+
+# --- Main line: control file (fsynced) + 8MiB non-fsynced volatile file [D-step1] ---
+mkdir -p data
+printf 'confirmed-1\n' > data/control-1.txt.part
+if command -v fsync >/dev/null 2>&1; then fsync data/control-1.txt.part; fi
+mv data/control-1.txt.part data/control-1.txt
+head -c 8388608 /dev/zero | tr '\0' 'B' > data/bulk-payload.bin
+drive9-test-sample pre-exit
+
+# --- Start a drain with a 1s budget only (best-effort: started != completed,
+#     output preserved verbatim) [D2-step3] ---
+drive9-test-drain --mode best-effort --timeout 1s
+
+# --- SIGKILL the mounted client immediately, then remount with no prior cache [D-step3/D-step5] ---
+drive9-test-kill client
+drive9-test-remount --cache fresh
+cd "$D9_MOUNT"
+drive9-test-sample recovered
+
+# --- Recovery inventory: the control survives; the volatile bulk is recorded
+#     as observed, not judged [D-step5/D-check3] ---
+printf 'confirmed-1\n' | cmp - data/control-1.txt
+if [ -e data/bulk-payload.bin ]; then
+  echo "bulk-outcome: survived"
+else
+  echo "bulk-outcome: lost"
+fi
+
+# --- Variant: a drain started while new writes keep arriving (recorded
+#     separately, never mixed with the main line) ---
+
+# --- Variant control file (fsynced) ---
+mkdir -p data2
+printf 'v2 control\n' > data2/control.txt.part
+if command -v fsync >/dev/null 2>&1; then fsync data2/control.txt.part; fi
+mv data2/control.txt.part data2/control.txt
+
+# --- Continuous writes (never stops): writes are still in flight when the
+#     drain is started ---
+drive9-test-async --timeout 10m -- sh -c '
+i=0
+while [ $i -lt 200 ]; do
+  k=$((i+1))
+  printf "streaming %s\n" "$k" > "data2/stream-$k.txt" || echo "stream-write-failed k=$k"
+  i=$((i+1))
+done
+'
+drive9-test-drain --mode best-effort --timeout 1s
+drive9-test-kill client
+drive9-test-remount --cache fresh
+cd "$D9_MOUNT"
+
+# --- Variant recovery inventory: the control survives; streamed writes are
+#     recorded by what was actually confirmed, not judged ---
+printf 'v2 control\n' | cmp - data2/control.txt
+n=$(ls data2/stream-*.txt 2>/dev/null | wc -l)
+echo "variant bulk-outcome: survived-stream-count=$n"
+
+# --- Reap the still-running async write payload (no kill workload in the
+#     variant segment; reaped at the end) ---
+drive9-test-wait --expect interrupted --timeout 60s
+
+# --- Assertions ---
+drive9-test-check manifest-contains --this @recovered --against @pre-exit \
+    --paths 'data/control-1.txt'                                         --req 'D-check3'
+drive9-test-check artifact-contains --artifact sync-0.json --pattern '.' --req 'D-step4'
+drive9-test-check artifact-contains --artifact journal \
+    --pattern 'bulk-outcome:'                                            --req 'D-check3'

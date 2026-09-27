@@ -19,7 +19,7 @@ from harness.module_base import BaseModule, module_config
 
 
 # Durability label -> drive9 mount --durability value.
-# The customer document speaks of "writeback" and "write-sync"; drive9's
+# The case2 spec speaks of "writeback" and "write-sync"; drive9's
 # durability flag uses "auto" (writeback write policy) and "write-sync".
 DURABILITY_WRITEBACK = "auto"
 DURABILITY_WRITE_SYNC = "write-sync"
@@ -53,7 +53,7 @@ class CustomCase2(BaseModule):
     )
     labels = ("drive9", "custom", "case2", "performance", "fuse")
     timeout = 7200
-    report_profile = "customer"
+    report_profile = "custom"
     # Cached report markdown from the last run(), used by render_report().
     _last_report_markdown: str = ""
 
@@ -1514,12 +1514,12 @@ class CustomCase2(BaseModule):
             for row in rows:
                 writer.writerow(row)
         write_json(summary_dir / "summary.json", {"rows": rows, "issues": issues})
-        self._last_report_markdown = self.render_customer_report(ctx, rows, issues)
+        self._last_report_markdown = self.render_custom_report(ctx, rows, issues)
 
     def render_report(self, ctx: Context, record: Any) -> str | None:
         return self._last_report_markdown or None
 
-    def render_customer_report(self, ctx: Context, rows: list[dict[str, Any]], issues: list[dict[str, Any]]) -> str:
+    def render_custom_report(self, ctx: Context, rows: list[dict[str, Any]], issues: list[dict[str, Any]]) -> str:
         status_counts: dict[str, int] = {}
         for row in rows:
             status_counts[str(row.get("status", ""))] = status_counts.get(str(row.get("status", "")), 0) + 1
@@ -1543,7 +1543,7 @@ class CustomCase2(BaseModule):
             "",
             "## Requirement Coverage",
             "",
-            "| Customer request | Evidence in this run | Status |",
+            "| Custom request | Evidence in this run | Status |",
             "|---|---|---|",
         ]
         coverage = [

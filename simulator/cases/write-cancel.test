@@ -1,0 +1,83 @@
+#!/bin/sh
+# Anomaly matrix X4: the writing process is cancelled.
+#
+# Scenario:
+#   While a batch of publish writes is in flight, the writing process is cancelled
+#   with SIGTERM: anything already presented as a "complete file" must be
+#   byte-for-byte correct (no truncation masquerading as completeness); missing
+#   files are counted honestly; after an explicit cleanup of temporaries, replaying
+#   the batch converges.
+#
+# Environment (passed through the run CLI, not scripted here):
+#   Inputs: FILES files with fixed contents (per-file publish: temp -> write ->
+#   fsync -> rename); the final state is the full manifest taken after replay.
+set -eu
+FILES=${FILES:-200}
+export FILES
+rm -f /tmp/x4-cancel-status
+
+# ---- Batch publish writes (being cancelled by an orchestrated SIGTERM is the scenario) [X4-step1] ----
+drive9-test-async --timeout 20m -- sh -c '
+mkdir -p bulk
+i=0
+while [ $i -lt "$FILES" ]; do
+  k=$((i+1))
+  printf "cancel payload %s\n" "$k" > "bulk/file-$k.txt.part"
+  if command -v fsync >/dev/null 2>&1; then
+    fsync "bulk/file-$k.txt.part" 2>/dev/null || true
+  fi
+  mv "bulk/file-$k.txt.part" "bulk/file-$k.txt"
+  echo "$k" > /tmp/x4-cancel-status
+  i=$((i+1))
+done
+'
+drive9-test-hold --for 3s
+
+# ---- After 3s, send SIGTERM to the writing process (cancellation semantics, not SIGKILL) [X4-step2] ----
+drive9-test-kill workload --method term
+drive9-test-wait --expect interrupted --timeout 60s
+
+# ---- Audit immediately after the cancel: everything "present" must be byte-for-byte
+#      complete; missing files are counted honestly; no zero-byte impostors [X4-step3] ----
+mkdir -p bulk
+present=0; missing=0; bad=0
+i=0
+while [ $i -lt $FILES ]; do
+  k=$((i+1))
+  if [ -f "bulk/file-$k.txt" ]; then
+    if printf 'cancel payload %s\n' "$k" | cmp - "bulk/file-$k.txt"; then
+      present=$((present+1))
+    else
+      bad=$((bad+1))
+    fi
+  else
+    missing=$((missing+1))
+  fi
+  i=$((i+1))
+done
+echo "audit PRESENT=$present MISSING=$missing BAD=$bad"
+[ $bad -eq 0 ]
+
+# ---- Explicitly clean up temporaries (fixed cleanup commands) [X4-step5] ----
+find bulk -name '*.part' -delete
+rm -f bulk/*.tmp
+echo "explicit cleanup done"
+
+# ---- Replay the same batch; it must converge to the exact final state [X4-step6] ----
+i=0
+while [ $i -lt $FILES ]; do
+  k=$((i+1))
+  printf 'cancel payload %s\n' "$k" > "bulk/file-$k.txt.part"
+  if command -v fsync >/dev/null 2>&1; then fsync "bulk/file-$k.txt.part"; fi
+  mv "bulk/file-$k.txt.part" "bulk/file-$k.txt"
+  i=$((i+1))
+done
+echo "replay converged"
+
+drive9-test-sample final
+drive9-test-drain --mode require-ok --timeout 180s
+
+# ---- Verdicts ----
+drive9-test-check artifact-contains --artifact journal --pattern 'PRESENT=' --req 'X4'
+drive9-test-check manifest-equals --this control --against @final \
+    --ignore '.sim/**,bulk/**/*.tmp,bulk/**/*.part'                          --req 'X4'

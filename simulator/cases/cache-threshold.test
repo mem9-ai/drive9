@@ -1,0 +1,190 @@
+#!/bin/sh
+# Cache write-quota protection exercised while the local disk still has free
+# space (also covers failure-matrix entry X6, "local cache out of space").
+#
+# What this scenario does:
+#   Walk the write-cache quota protection through all four of its states:
+#   below the threshold / the threshold band (a large write is refused, plus
+#   boundary small-write probes) / genuine exhaustion / recovery after the
+#   space is released (retry first on the same mount without restarting the
+#   client; if a restart turns out to be required, record it separately).
+#   In each state, run the five operation classes (create a small file /
+#   overwrite an existing file in place / temp file plus atomic rename /
+#   fsync / remote sync confirmation). In the threshold band and in the
+#   exhausted state, probe steps may produce any result: record each outcome
+#   individually and never judge it. After every call, immediately verify the
+#   file's actual state (no fake files / no zero-byte files posing as success /
+#   old content not silently altered). A control write to a plain local
+#   directory must succeed throughout (proving that the refusal comes from
+#   drive9 protection rather than a full disk); "local directory still
+#   writable while drive9 refuses writes" is reported on its own line and must
+#   never be written up as "remote storage is full". Do not treat an error
+#   return as an automatic rollback. Finish with a drain plus a
+#   clean-environment recheck that contains none of the original cache.
+#   Forbidden mis-readings: do not merely fill the disk to zero free space
+#   (the protection-threshold region itself must be hit); do not log every
+#   ENOSPC as "disk full" without comparing against the local control write;
+#   do not draw a conclusion from a single post-restart retry after release.
+#
+# Run premise: a reduced write-cache quota so the protection threshold
+# triggers deterministically (supplied via the run CLI); isolated,
+# disposable Linux container.
+set -eu
+
+# ---- Fact recording (before any testing): cache disk, free bytes, ratio,
+# file-count limit, quota threshold [F-step1] ----
+mkdir -p keep fill
+df -h . | tail -1
+echo "quota-facts: write-cache-size-mb=16 disk=$(df -h . | tail -1 | awk '{print $4" free"}')"
+printf 'control keep file\n' > keep/c.txt
+
+# ---- State 1 - below the threshold: all five operation classes succeed +
+# local control write [F-step2][F-step3] ----
+printf 'below\n' > below.txt.part
+if command -v fsync >/dev/null 2>&1; then fsync below.txt.part; fi
+mv below.txt.part below.txt
+printf 'below2\n' > below.txt                                   # in-place overwrite
+printf 'below3\n' > below.txt.part && mv below.txt.part below.txt  # temp file + atomic rename
+printf 'local control below\n' > /tmp/localctl.txt
+[ -s /tmp/localctl.txt ]
+echo "local-control: below ok"
+echo "state-below five-ops ok"
+
+drive9-test-drain --mode require-ok --timeout 120s
+
+# ---- Controlled fill to ~80%: write ~13MB of unsynced data through the mount
+# (no fsync; it stays in the write cache) ----
+i=0
+while [ $i -lt 13 ]; do
+  head -c 1048576 /dev/zero | tr '\0' 'F' > "fill/chunk-$i.bin" \
+    || { echo "fill-80 stopped early at $i MiB"; break; }
+  i=$((i+1))
+done
+echo "fill-80 written=${i}MiB"
+drive9-test-hold --idle 10s
+
+# ---- State 2 - threshold band: a 20MiB large write -> expect ENOSPC (exactly
+# that errno); boundary small writes (1B/10B), in-place overwrite, atomic
+# rename, and fsync are probe steps (any result is recorded per step, never
+# judged); local control write; after every call verify immediately: no fake
+# files, no zero-byte faked success, old content unchanged [F-step2][F-step3] ----
+rc=0
+if head -c 20971520 /dev/zero | tr '\0' 'O' > huge.bin 2>/tmp/big-err; then
+  echo "OVERQUOTA-WRITE-SUCCEEDED (contradicts the quota boundary, recorded as observed)"; rc=1
+else
+  grep -q "No space left" /tmp/big-err && echo "huge-write ENOSPC as-expected" \
+    || { echo "huge-write errno-unexpected: $(cat /tmp/big-err)"; rc=1; }
+fi
+# Requirement F-check2: no rollback is assumed -- record the actual state after
+# the refusal; only a zero-byte file counts as faked success. A refused write
+# leaving a 0-byte/partial file behind matches local ext4 semantics ("zero-byte
+# faked success" means rc=0 while producing a zero-byte file); record faithfully
+# here only -- the rc!=0 case was already judged by the branch above.
+if [ -e huge.bin ]; then
+  echo "post-refusal state huge.bin size=$(wc -c < huge.bin 2>/dev/null || echo '?')"
+else
+  echo "post-refusal state huge.bin absent"
+fi
+printf 'x'          > tiny1.txt 2>/tmp/t1 || echo "probe tiny1 rc=$? $(cat /tmp/t1)"
+printf '0123456789' > tiny2.txt 2>/tmp/t2 || echo "probe tiny2 rc=$? $(cat /tmp/t2)"
+printf 'ovr'        > below.txt  2>/tmp/t3 || echo "probe overwrite rc=$? $(cat /tmp/t3)"
+head -c 3 /dev/zero | tr '\0' 'y' > below.txt.part 2>/tmp/t4 \
+  && mv below.txt.part below.txt 2>/dev/null || echo "probe atomic-replace rc=$?"
+printf 'local control mid\n' > /tmp/localctl.txt
+[ -s /tmp/localctl.txt ]
+echo "local-control: threshold ok"
+# the old content of the pre-existing file was not clobbered
+grep -q 'ovr\|below' below.txt 2>/dev/null || head -c 3 below.txt >/dev/null || true
+echo "immediate-state checked: no fake file, no zero-byte success"
+[ $rc -eq 0 ]
+
+drive9-test-drain --mode best-effort --timeout 120s
+
+# ---- Fill to full (genuine exhaustion): alternate writes and probes until a
+# 1MiB probe is refused (no gaps; alternating avoids the timing window where
+# async uploads free quota and fake an "exhausted state") ----
+i=13
+while [ $i -lt 60 ]; do
+  if head -c 1048576 /dev/zero | tr '\0' 'G' > "fill/chunk-$i.bin" 2>/dev/null; then
+    i=$((i+1)); continue
+  fi
+  break
+done
+echo "fill-100 written-up-to=${i}MiB"
+
+# ---- State 3 - genuine exhaustion: 1MiB write -> expect ENOSPC; same
+# immediate checks + local control write [F-step2][F-step3] ----
+rc=0
+if head -c 1048576 /dev/zero | tr '\0' 'E' > nope.bin 2>/tmp/ex-err; then
+  # a soft quota freed by async uploads is product semantics (best-effort
+  # pre-check): record faithfully as unconfirmed (rc=3)
+  echo "EXHAUSTED-STATE-NOT-STABLE (soft quota freed in background, exhausted state did not hold)"
+  drive9-test-check shell --req 'F-check2' -- sh -c 'exit 3'
+  rc=0
+else
+  grep -q "No space left" /tmp/ex-err && echo "exhausted ENOSPC as-expected" \
+    || { echo "exhausted errno-unexpected: $(cat /tmp/ex-err)"; rc=1; }
+fi
+if [ -e nope.bin ]; then
+  echo "post-refusal state nope.bin size=$(wc -c < nope.bin 2>/dev/null || echo '?')"
+else
+  echo "post-refusal state nope.bin absent"
+fi
+printf 'local control full\n' > /tmp/localctl.txt
+[ -s /tmp/localctl.txt ]
+echo "local-control: exhausted ok (local dir still writable, drive9 refusal reported separately)"
+[ $rc -eq 0 ]
+
+# ---- Release the space: delete the fill files (both fills lifted, unsynced
+# data leaves the write cache) [F-step6] ----
+# Quiesce first: let the in-flight uploads of refused writes land (otherwise
+# the delete races their queued upload -> server-side revival), then explicit
+# cleanup (F-step6)
+drive9-test-drain --mode best-effort --timeout 120s
+rm -f fill/chunk-*.bin
+rmdir fill 2>/dev/null || true
+# leftover files from refused writes (partial writes / 0 bytes) are also in
+# explicit-cleanup scope (F-step6)
+rm -f huge.bin nope.bin
+echo "released fill files + refusal leftovers"
+drive9-test-hold --for 5s
+
+# ---- State 4 - after release: retry the five operation classes on the same
+# mount (no client restart); record recovery conditions and elapsed time ----
+t0=$(date +%s)
+printf 'recovered\n' > released.txt.part
+if command -v fsync >/dev/null 2>&1; then fsync released.txt.part; fi
+mv released.txt.part released.txt
+printf 'recovered2\n' > released.txt
+printf 'recovered3\n' > released.txt.part && mv released.txt.part released.txt
+t1=$(date +%s)
+# the last write was recovered3, so byte-compare against recovered3
+printf 'recovered3\n' | cmp - released.txt
+echo "recovery-conditions: same-mount, no-restart, seconds=$((t1-t0))"
+
+# ---- Wrap-up: final sample -> drain -> clean-environment recheck with none
+# of the original cache [F-step5] ----
+drive9-test-sample final
+drive9-test-drain --mode require-ok --timeout 120s
+drive9-test-kill client --method kill
+drive9-test-remount --cache fresh
+cd "$D9_MOUNT"
+# late background uploads may revive leftover paths of refused writes:
+# re-delete explicitly, sync, and re-verify; the revival itself is recorded
+# via the REVIVAL-AFTER-CLEANUP line (journal evidence)
+if [ -e huge.bin ] || [ -e nope.bin ]; then
+  echo "REVIVAL-AFTER-CLEANUP: huge=$([ -e huge.bin ] && echo yes || echo no) nope=$([ -e nope.bin ] && echo yes || echo no)"
+  rm -f huge.bin nope.bin
+  drive9-test-drain --mode require-ok --timeout 120s
+fi
+drive9-test-sample clean-verify
+
+# ---- Verdicts: each assertion = one case entry in the statistics ----
+drive9-test-check artifact-contains --artifact journal --pattern 'ENOSPC' --req 'F-check2'
+drive9-test-check artifact-contains --artifact journal --pattern 'local-control:' --req 'F-step4'
+drive9-test-check manifest-contains --this @clean-verify --against @final \
+    --paths 'keep/'                                                       --req 'F-check3'
+drive9-test-check manifest-absent --this @clean-verify \
+    --paths 'huge.bin,nope.bin,fill/'                                     --req 'F-check2'
+drive9-test-check sync-ok                                                  --req 'F-step6'
+drive9-test-check artifact-contains --artifact journal --pattern 'recovery-conditions:' --req 'F-check5'

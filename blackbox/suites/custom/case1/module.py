@@ -26,7 +26,7 @@ class CustomCase1(BaseModule):
     description = "Case1 sandbox workspace benchmark: namespace scale, small files, fsync, visibility, remount persistence, and same-host mounts."
     labels = ("drive9", "custom", "case1", "performance", "fuse")
     timeout = 3600
-    report_profile = "customer"
+    report_profile = "custom"
     # Cached report markdown from the last run(), used by render_report().
     _last_report_markdown: str = ""
 
@@ -1030,14 +1030,14 @@ class CustomCase1(BaseModule):
             for row in rows:
                 writer.writerow(row)
         write_json(summary_dir / "summary.json", {"rows": rows, "issues": issues})
-        # Cache the rendered customer report so render_report() can return it.
+        # Cache the rendered custom report so render_report() can return it.
         # The framework writes artifacts/<id>/report.md from render_report().
-        self._last_report_markdown = self.render_customer_report(ctx, rows, issues)
+        self._last_report_markdown = self.render_custom_report(ctx, rows, issues)
 
     def render_report(self, ctx: Context, record: Any) -> str | None:
         return self._last_report_markdown or None
 
-    def render_customer_report(self, ctx: Context, rows: list[dict[str, Any]], issues: list[dict[str, Any]]) -> str:
+    def render_custom_report(self, ctx: Context, rows: list[dict[str, Any]], issues: list[dict[str, Any]]) -> str:
         status_counts: dict[str, int] = {}
         for row in rows:
             status_counts[str(row.get("status", ""))] = status_counts.get(str(row.get("status", "")), 0) + 1
@@ -1057,7 +1057,7 @@ class CustomCase1(BaseModule):
             "",
             "## Requirement Coverage",
             "",
-            "| Customer request | Evidence in this run | Status |",
+            "| Custom request | Evidence in this run | Status |",
             "|---|---|---|",
             f"| 100MB/1GB/10GB, 1k/10k/100k mount/ls/stat/find | namespace rows={len(namespace_rows)} | {self.coverage_status(namespace_rows)} |",
             f"| single workspace and single-directory scale | dataset_generate rows for selected scales/layouts | {self.dataset_coverage(rows)} |",

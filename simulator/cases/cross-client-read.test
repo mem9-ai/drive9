@@ -1,0 +1,113 @@
+#!/bin/sh
+# Scenario 11 - inspect the file tree, source code, and images from outside
+# the writing container.
+#
+# What this scenario does:
+#   One mount writes; a second mount and an independent entrypoint read.
+#   Per-operation visibility is recorded on both ends (evidence only, no
+#   mid-run verdicts); after the drain everything must converge and agree.
+#   Independent reads are unaffected by the writer's death.
+#   The observer's second mount is opened before the first measured write and
+#   stays alive throughout (lazily started by the first --as observer
+#   sample); the remote stateless entrypoint is a fresh instance on every
+#   sample; both ends work in the same tenant workspace.
+#   What is checked: the current mount correctly reflects completed local
+#   operations; once sync is confirmed and the agreed visibility time
+#   reached, independently read directories and contents match the writer's
+#   state and old paths no longer return the old state; both reader kinds --
+#   the early-opened observer and the freshly created remote -- converge
+#   (stale cache differences must be gone after the drain); independent reads
+#   of saved files do not depend on the original writer still running.
+#   Forbidden: failing the case because some entrypoint temporarily cannot
+#   see a change mid-run (only record it -- this script's per-operation dual
+#   samples exist to preserve evidence; every convergence verdict lives in
+#   the post-drain checks); testing only a newly created reader does not
+#   count as covering "an already-open reading client".
+#   Faults: not applicable (the writer's death is a scenario operation during
+#   wrap-up; systemic client crashes are out of scope here -- failure-matrix
+#   entry X5 covers them).
+#
+# Environment (supplied via the run CLI, not script logic):
+#   control: not applicable (cross-endpoint visibility has no local
+#   counterpart; the convergence assertions act as the control).
+#   Input: four operation groups with fixed objects and expected final states
+#   (including 64KiB assets); expected contents are constructed locally and
+#   independently.
+set -eu
+
+# ---- The writer's first write (the engine lazily starts the observer after
+# this and before the measured operations; it stays alive throughout) ----
+# Bounded retries for writes through the mount: drive9 returns a retryable
+# EAGAIN when the namespace generation flips (more common with two clients
+# working concurrently), and the client retries on its own too (client-side
+# retries are recorded separately). Exhausted retries are a genuine failure.
+rt() {
+  n=0
+  while ! "$@"; do
+    n=$((n+1))
+    if [ $n -ge 8 ]; then echo "RETRY-EXHAUSTED: $*"; return 1; fi
+    echo "mount-op-retry $n: $*"
+    sleep 0.5
+  done
+}
+mkdir -p live/src live/assets
+rt sh -c 'printf "observer registers early\n" > live/init.txt'
+
+# ---- observer second mount in place (before any measured write; the first
+# sample starts it and pins the baseline) ----
+drive9-test-sample observer-open --as observer
+
+# ---- Group 1 - create: the writer executes and confirms the returns ----
+rt sh -c 'printf "app v1\n" > live/src/app.js'
+rt sh -c 'head -c 65536 /dev/zero | tr "\0" "p" > live/assets/pic.bin'
+# immediate observer / remote read records (mid-run: evidence only, no verdicts)
+drive9-test-sample obs-create --as observer --optional
+drive9-test-sample rem-create --as remote
+
+# ---- Group 2 - overwrite ----
+rt sh -c 'printf "app v2 only version\n" > live/src/app.js'
+printf 'app v2 only version\n' | cmp - live/src/app.js
+drive9-test-sample obs-overwrite --as observer --optional
+drive9-test-sample rem-overwrite --as remote
+
+# ---- Group 3 - rename ----
+rt sh -c 'mv live/src/app.js live/src/index.js'
+[ ! -e live/src/app.js ] && [ -e live/src/index.js ]
+drive9-test-sample obs-rename --as observer --optional
+drive9-test-sample rem-rename --as remote
+
+# ---- Group 4 - create then delete (after deleting the file, remove the
+# now-empty directory too: cross-entry empty-directory persistence is out of
+# scope here -- object stores usually do not materialize empty directories;
+# covering empty directories belongs to scenario 1) ----
+rt sh -c 'mkdir -p live/tmp && printf "doomed\n" > live/tmp/draft.txt'
+rm live/tmp/draft.txt
+rmdir live/tmp
+[ ! -e live/tmp/draft.txt ]
+drive9-test-sample obs-delete --as observer --optional
+drive9-test-sample rem-delete --as remote
+
+# ---- Post-drain convergence check: pin the writer's final state -> compare
+# a full remote-tree inventory against the writer's final state ----
+drive9-test-sample final
+drive9-test-drain --mode require-ok --timeout 120s
+drive9-test-sample rem-final --as remote
+
+# ---- Independent reads after the writer's death: kill the writer's mount
+# daemon -> the remote goes on listing directories / reading source / reading
+# assets -> consistent with the post-drain final state [scenario11-step5] ----
+drive9-test-kill client
+drive9-test-sample rem-after-death --as remote
+
+# ---- Verdicts: each assertion = one case entry in the statistics ----
+# Non-interference: the seed file the observer saw early still exists intact
+# after all write operations.
+drive9-test-check manifest-contains --this @final --against @observer-open \
+    --paths 'live/init.txt'                                        --req 'scenario11-step2'
+drive9-test-check manifest-equals --this @rem-final --against @final \
+    --ignore '.sim/**'                                             --req 'scenario11-check2'
+drive9-test-check manifest-absent --this @rem-final \
+    --paths 'live/tmp/draft.txt,live/src/app.js'                   --req 'scenario11-check2'
+drive9-test-check manifest-equals --this @rem-after-death --against @rem-final \
+    --ignore '.sim/**'                                             --req 'scenario11-check3'
+drive9-test-check sync-ok                                          --req 'scenario11-step3'

@@ -1,0 +1,39 @@
+name: Simulator CI
+
+on:
+  pull_request:
+    paths:
+      - "simulator/**"
+      - ".github/workflows/simulator-ci.yml"
+  push:
+    paths:
+      - "simulator/**"
+      - ".github/workflows/simulator-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simulator-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test drive9-simulator
+        working-directory: simulator
+        run: cargo test
+        env:
+          CARGO_TERM_COLOR: always

@@ -58,10 +58,10 @@ class Drive9SuiteProvider:
     def suite_goals(self) -> str:
         return (
             "The FUSE suite validates Drive9's FUSE filesystem across POSIX compliance, "
-            "performance, workflow correctness, and customer scenario fidelity. Modules "
+            "performance, workflow correctness, and custom scenario fidelity. Modules "
             "cover community test suites (pjdfstest, LTP, fio, mdtest, sqlite), JuiceFS-inspired "
             "stress tests, official Git functional/perf tests, Drive9 workflow scenarios, "
-            "and customer workspace benchmarks."
+            "and custom workspace benchmarks."
         )
 
 

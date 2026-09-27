@@ -1,0 +1,114 @@
+#!/bin/sh
+# Scenario 8: git version switch, where many files change at once.
+#
+# Scope:
+#   Two pinned versions A/B are built inside the mount (version A: index.html /
+#   app.js / styles.css / an 8KiB image / a 0755 tools/run.sh / a symlink pointing at
+#   run.sh; version B changeset: delete styles.css and the old image, modify app.js,
+#   swap in a new image, git mv tools to scripts, add page2.html), then checkouts
+#   alternate repeatedly (B-A-B-A-B, including two fast back-to-back switches): the
+#   set of files reached each time must match the target version exactly - git status
+#   clean, git ls-files an exact diff, key-file digests checked on every round, the
+#   executable bit and symlink targets preserved / restored across switches. No file
+#   that should be deleted may linger, none that should be added may be missing, and
+#   no previous-version stale content may come back. After a switch, search
+#   (grep-like) and one full read must not fail because of storage state (stale
+#   directory / missing / wrong length / corruption). After drain, an independent
+#   entry point must agree, and deleted paths must not resurrect (.git stays out of
+#   the byte-level oracle; the working tree is the contract).
+#   Mis-readings this scenario forbids:
+#   - Comparing file counts only.
+#   - Letting "the last switch was right" mask inconsistencies in intermediate rounds
+#     (every round is checked and its evidence kept).
+#
+# Environment (passed through the run CLI, not scripted here):
+#   Inputs: the expected ls-files sets for the two versions are built independently
+#   under /tmp/expect-a and /tmp/expect-b.
+#   control: not applicable - this script does not reference control.
+#
+# No tiers; no faults (anomalies during switching are layered on by the anomaly
+# matrix and the mandatory supplements in their own scenarios).
+set -eu
+
+# ---- Version A pinned tree (includes a 0755 script and a symlink to it) + commit [scenario8-step1] ----
+printf '<html>A</html>\n'            > index.html
+printf "console.log('app A');\n"     > app.js
+printf 'body{color:#111}\n'          > styles.css
+mkdir -p assets
+head -c 8192 /dev/zero | tr '\0' 'A' > assets/img.bin
+mkdir -p tools
+printf '#!/bin/sh\necho run-a\n'     > tools/run.sh
+chmod 755 tools/run.sh
+ln -sf ../tools/run.sh tools/run-link
+git init -q -b main
+git config user.email t@t && git config user.name t
+git add -A && git commit -qm A
+git ls-files | sort > /tmp/expect-a
+[ -z "$(git status --porcelain)" ]
+
+# ---- Version B changeset: delete styles.css and the old image, modify app.js, swap
+#      in a new image, git mv tools to scripts, add page2 [scenario8-step1] ----
+git rm -q styles.css assets/img.bin
+printf "console.log('app B');\n"     > app.js
+mkdir -p assets
+head -c 8192 /dev/zero | tr '\0' 'B' > assets/img-b.bin
+git mv tools scripts
+printf '<html>B extra page</html>\n' > page2.html
+git add -A && git commit -qm B
+git ls-files | sort > /tmp/expect-b
+[ -z "$(git status --porcelain)" ]
+
+# ---- Switch rounds: B-to-A checked, then A-to-B checked, then two fast back-to-back
+#      switches and another check. Every round: status clean, ls-files an exact
+#      diff, key digests, executable bit and link targets [scenario8-step2 /
+#      scenario8-step3 / scenario8-check1 / scenario8-check2] ----
+# B → A
+git checkout -q main~1
+[ -z "$(git status --porcelain)" ]
+git ls-files | sort | diff - /tmp/expect-a
+[ "$(cat app.js)" = "console.log('app A');" ]
+[ -x tools/run.sh ]
+[ "$(readlink tools/run-link)" = "../tools/run.sh" ]
+[ ! -e page2.html ] && [ -e assets/img.bin ] && [ ! -e scripts/run.sh ]
+# A → B
+git checkout -q main
+[ -z "$(git status --porcelain)" ]
+git ls-files | sort | diff - /tmp/expect-b
+[ "$(cat app.js)" = "console.log('app B');" ]
+[ -x scripts/run.sh ]
+# git mv moves the link file without rewriting its contents (matching local git
+# semantics); the link being dangling is expected
+[ "$(readlink scripts/run-link)" = "../tools/run.sh" ]
+[ ! -e tools ] && [ ! -e styles.css ] && [ ! -e assets/img.bin ]
+# Fast double switch B→A→B
+git checkout -q main~1 && git checkout -q main
+[ -z "$(git status --porcelain)" ]
+git ls-files | sort | diff - /tmp/expect-b
+head -c 8192 /dev/zero | tr '\0' 'B' > /tmp/exp-imgb
+cmp assets/img-b.bin /tmp/exp-imgb
+echo "switch rounds exact, no stale, no resurrect"
+
+# ---- Post-switch file search (grep-like) and full read (build-style read) must not
+#      fail because of storage state [scenario8-step3 / scenario8-step4 /
+#      scenario8-check3] ----
+grep -rq "app B" --include="*.js" .
+# The dangling symlink (after git mv, scripts/run-link → ../tools/run.sh) is skipped
+# for through-the-link reads, matching local git semantics; the link body surviving
+# is already covered by the readlink assertion
+git ls-files | while read -r f; do
+  [ "$(readlink "$f" 2>/dev/null)" = "../tools/run.sh" ] && continue
+  cat "$f" > /dev/null
+done
+echo "search + full read ok"
+
+# ---- Final-state sampling and sync confirmation [scenario8-step5] ----
+drive9-test-sample final
+drive9-test-drain --mode require-ok --timeout 180s
+drive9-test-sample remote-final --as remote
+
+# ---- Verdicts: each assertion below is one case entry in the statistics ----
+drive9-test-check manifest-equals --this @remote-final --against @final \
+    --ignore '.git/**,.sim/**'                                       --req 'scenario8-step5'
+drive9-test-check manifest-absent --this @remote-final \
+    --paths 'tools/run.sh,styles.css,assets/img.bin'                 --req 'scenario8-check2'
+drive9-test-check sync-ok                                            --req 'scenario8-step5'

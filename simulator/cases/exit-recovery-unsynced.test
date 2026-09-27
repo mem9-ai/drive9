@@ -1,0 +1,93 @@
+#!/bin/sh
+# Exit recovery D1: sudden exit with nothing synced.
+#
+# What this scenario does:
+#   Writes and closes have already returned. Without performing any remote
+#   sync confirmation, SIGKILL the mounted client, then recover in a fresh
+#   environment with no prior cache:
+#   - fsynced control-class changes must survive;
+#   - the non-fsynced volatile file is judged against the save policy's public
+#     commitment. If no commitment is published, the loss scope is recorded
+#     honestly via "volatile-outcome:" - never fabricate "everything should
+#     have been kept" or "everything may be lost";
+#   - deleted files must not resurrect; renames are recorded per the
+#     commitment;
+#   - after recovery, new reads/writes and syncs work normally, with no
+#     pending tasks affecting later operations.
+#   Shared bottom line for the exit-recovery family (D1/D2/D3): saved control
+#   files that are not modified afterwards must be preserved intact (byte for
+#   byte identical digest).
+#   Forbidden mis-readings: letting a cleanly-drained (D3) run substitute for
+#   this measured unsynced exit; recording a drain as "completed" when it was
+#   only "started"; sneaking in one extra normal sync before the exit.
+#
+# Inputs: a batch of control files (drained, confirmed, never modified
+#   afterwards) + this round's fixed changes (2 additions / 1 overwrite /
+#   1 rename / 1 delete, one of them a non-fsynced volatile file).
+# control: not applicable (exit recovery has no local counterpart) - this
+#   script does not reference control.
+#
+# Notes:
+#   - kill client sends SIGKILL to the mounted client; remount --cache fresh
+#     then cd "$D9_MOUNT" to re-enter the new mount.
+#   - Any unexpected failure inside a segment aborts the script via set -e and
+#     fails the run.
+#   - Journal artifact-contains checks assert on the "volatile-outcome:"
+#     marker line in the script log.
+set -eu
+
+# --- Control file batch: write to disk, drain-confirm, never modify again [D-step1] ---
+mkdir -p data
+printf 'prior confirmed control\n' > data/prior-control.txt
+drive9-test-drain --mode require-ok --timeout 120s
+
+# --- This round's fixed changes: 2 additions (fsynced) / 1 overwrite (fsynced)
+#      / 1 rename / 1 delete + 1 non-fsynced volatile file [D-step1] ---
+printf 'confirmed-1\n' > data/control-1.txt.part
+if command -v fsync >/dev/null 2>&1; then fsync data/control-1.txt.part; fi
+mv data/control-1.txt.part data/control-1.txt
+head -c 65536 /dev/zero | tr '\0' 'D' > data/control-2.bin.part
+if command -v fsync >/dev/null 2>&1; then fsync data/control-2.bin.part; fi
+mv data/control-2.bin.part data/control-2.bin
+head -c 65536 /dev/zero | tr '\0' 'V' > data/volatile.bin
+printf 'deleted before exit\n' > data/doomed.txt
+mv data/control-2.bin data/renamed.bin
+rm data/doomed.txt
+drive9-test-sample pre-exit
+
+# --- D1: no remote sync confirmation at all; SIGKILL the mounted client
+#     directly [D1-step3/D-step3] ---
+drive9-test-kill client
+
+# --- Remount into a fresh environment with no prior cache, then compare file
+#     by file [D-step5] ---
+drive9-test-remount --cache fresh
+cd "$D9_MOUNT"
+drive9-test-sample recovered
+
+# --- Recovery inventory (bare checks): unchanged controls and fsynced changes
+#     survive; the volatile file is recorded per the commitment, not judged
+#     [D-step5/D-check2] ---
+printf 'prior confirmed control\n' | cmp - data/prior-control.txt
+printf 'confirmed-1\n'            | cmp - data/control-1.txt
+head -c 65536 /dev/zero | tr '\0' 'D' | cmp - data/renamed.bin
+[ ! -e data/doomed.txt ]
+if [ -e data/volatile.bin ]; then
+  echo "volatile-outcome: survived"
+else
+  echo "volatile-outcome: lost"
+fi
+
+# --- Fresh reads/writes after recovery (no pending tasks affect later
+#     operations) [D-step6/D-check4] ---
+printf 'new round\n' > data/next.txt
+printf 'new round\n' | cmp - data/next.txt
+drive9-test-drain --mode require-ok --timeout 120s
+
+# --- Assertions ---
+drive9-test-check manifest-contains --this @recovered --against @pre-exit \
+    --paths 'data/prior-control.txt,data/control-1.txt,data/renamed.bin' --req 'D-check1'
+drive9-test-check manifest-absent --this @recovered \
+    --paths 'data/doomed.txt'                                           --req 'D-check2'
+drive9-test-check artifact-contains --artifact journal \
+    --pattern 'volatile-outcome:'                                       --req 'D-check2'

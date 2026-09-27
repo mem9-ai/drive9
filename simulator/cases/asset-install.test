@@ -1,0 +1,146 @@
+#!/bin/sh
+# Bulk install of images, fonts and other assets (asset-install).
+#
+# Scenario:
+#   Three install methods from temp file to final path (copy / hard link / rename
+#   within the same directory) all behave correctly under concurrency: data never
+#   crosses between assets, temp cleanup never damages final files, and unsupported
+#   operations are reported explicitly.
+#   Checks: a successful install produces files of the expected length and content;
+#   data never crosses between different assets (digest lists exactly equal, nothing
+#   shifted); after a successful rename the temp path is gone and the final path is
+#   readable; after a hard-linked install, deleting the temp link leaves the final
+#   file readable with nlink back down to 1; deleting temp paths does not affect
+#   final files; results are consistent across all concurrency levels (including
+#   serial): the content of the final path for entry i is exactly input entry i
+#   (any numbering shift = failure) and no failure is caused by concurrency itself.
+#   Unsupported: when a method (e.g. hard link) is declared unsupported, record
+#   "unsupported + the actual error (errno)"; never substitute a copy success for
+#   that method's verdict; that segment is judged independently.
+#   Forbidden: passing on a file-count comparison alone; the install worker reading
+#   back its own writes in place of "another process reads"; counting hard-link
+#   semantics as passed while nlink has not dropped back.
+#   Faults: not applicable (normal sub-process exits are covered by fault matrix X1;
+#   lost-response shapes have their own dedicated case).
+#
+# Environment (supplied via the run CLI, not inside the script):
+#   resources; the definition itself is not trimmed)
+#   Pinned tools: coreutils (cp / ln / mv / cmp / sha256sum).
+#   control: the same install sequence executed in an ordinary local directory
+#   (baseline for hard-link nlink).
+#   Input: assets in three sizes (4KiB/1MiB/20MiB, rotating by entry index) carrying
+#   four type labels; a full SHA-256 manifest is frozen; the expected output
+#   manifests for the three install methods are derived from the input.
+set -eu
+ASSETS=${ASSETS:-20}
+WORKERS=${WORKERS:-1}
+export ASSETS WORKERS
+
+# --- Step 1: prepare the assets: ASSETS files rotating through the 4KiB/1MiB/20MiB
+#     sizes; freeze the SHA-256 manifest ---
+T=/tmp/d9case/asset-install
+rm -rf "$T" && mkdir -p "$T/assets" incoming installed
+i=0
+while [ $i -lt $ASSETS ]; do
+  k=$((i+1)); m=$((i%3))
+  case $m in
+    0) head -c 4096     /dev/zero | tr '\0' 'a' > "$T/assets/a-$k.bin";;
+    1) head -c 1048576  /dev/zero | tr '\0' 'b' > "$T/assets/a-$k.bin";;
+    2) head -c 20971520 /dev/zero | tr '\0' 'c' > "$T/assets/a-$k.bin";;
+  esac
+  i=$((i+1))
+done
+( cd "$T/assets" && sha256sum *.bin | sort -k2 > "$T/assets.SHA256SUMS" )
+[ "$(wc -l < "$T/assets.SHA256SUMS")" -eq "$ASSETS" ]
+
+# --- Method 1, copy install: workers concurrently "write temp -> copy to final";
+#      right after each entry succeeds, another process reads and compares it, then
+#      deletes the temp and reads again (per-op immediate check; full digest
+#      re-check at the end of the segment) [scenario4-step3/step4] ---
+seq 1 "$ASSETS" | xargs -P "$WORKERS" -I{} sh -c '
+  k={};
+  cp "'"$T"'/assets/a-$k.bin" "incoming/a-$k.tmp" && cp "incoming/a-$k.tmp" "installed/copy-a-$k.bin"
+'
+# Another process verifies each entry immediately + deletes the temp and re-reads
+sh -c '
+  set -e
+  T='"$T"'; N='"$ASSETS"'
+  k=1
+  while [ $k -le $N ]; do
+    cmp "$T/assets/a-$k.bin" "installed/copy-a-$k.bin"
+    rm -f "incoming/a-$k.tmp"
+    cmp "$T/assets/a-$k.bin" "installed/copy-a-$k.bin"
+    k=$((k+1))
+  done
+'
+# Full re-check at end of segment (digest lists exactly equal, nothing shifted)
+( cd installed && sha256sum copy-a-*.bin | sed 's/  copy-a-/  a-/' ) | sort -k2 > /tmp/got-copy
+sort -k2 "$T/assets.SHA256SUMS" > /tmp/exp-copy
+cmp /tmp/got-copy /tmp/exp-copy
+[ "$(wc -l < /tmp/got-copy)" -eq "$ASSETS" ]
+echo "copy install verified n=$ASSETS w=$WORKERS"
+
+# --- Method 2, hard-link install: once the temp is in place, ln to the final path
+#      (no-clobber semantics); per-entry immediate check + after deleting the temp
+#      link the final file stays readable with nlink back to 1. If declared
+#      unsupported -> record the actual errno; the segment is judged independently ---
+hl_skip=0
+probe=$(ln "$T/assets/a-1.bin" incoming/link-probe 2>&1) && rm -f incoming/link-probe || hl_skip=1
+if [ "$hl_skip" -eq 0 ]; then
+  seq 1 "$ASSETS" | xargs -P "$WORKERS" -I{} sh -c '
+    k={};
+    cp "'"$T"'/assets/a-$k.bin" "incoming/a-$k.tmp" && ln "incoming/a-$k.tmp" "installed/link-a-$k.bin"
+  '
+  sh -c '
+    set -e
+    T='"$T"'; N='"$ASSETS"'
+    k=1
+    while [ $k -le $N ]; do
+      cmp "$T/assets/a-$k.bin" "installed/link-a-$k.bin"
+      rm -f "incoming/a-$k.tmp"
+      cmp "$T/assets/a-$k.bin" "installed/link-a-$k.bin"
+      nlink=$(stat -c %h "installed/link-a-$k.bin")
+      [ "$nlink" -eq 1 ] || { echo "NLINK-NOT-ONE link-$k nlink=$nlink"; exit 1; }
+      k=$((k+1))
+    done
+  '
+  ( cd installed && sha256sum link-a-*.bin | sed 's/  link-a-/  a-/' ) | sort -k2 > /tmp/got-link
+  cmp /tmp/got-link /tmp/exp-copy
+  echo "hardlink install verified nlink-resolved n=$ASSETS w=$WORKERS"
+else
+  echo "HARDLINK-UNSUPPORTED: $probe"
+  echo "hardlink unsupported: $probe"
+fi
+
+# --- Method 3, same-directory rename install: temp -> mv into the final path;
+#      per-entry immediate check + the temp path no longer exists after the rename ---
+seq 1 "$ASSETS" | xargs -P "$WORKERS" -I{} sh -c '
+  k={};
+  cp "'"$T"'/assets/a-$k.bin" "incoming/a-$k.tmp" && mv "incoming/a-$k.tmp" "installed/ren-a-$k.bin"
+'
+sh -c '
+  set -e
+  T='"$T"'; N='"$ASSETS"'
+  k=1
+  while [ $k -le $N ]; do
+    [ ! -e "incoming/a-$k.tmp" ] || { echo "TMP-SURVIVES ren-$k"; exit 1; }
+    cmp "$T/assets/a-$k.bin" "installed/ren-a-$k.bin"
+    k=$((k+1))
+  done
+'
+( cd installed && sha256sum ren-a-*.bin | sed 's/  ren-a-/  a-/' ) | sort -k2 > /tmp/got-ren
+cmp /tmp/got-ren /tmp/exp-copy
+echo "rename install verified n=$ASSETS w=$WORKERS"
+
+# --- Final: full-tree sample + drain -> manifest sampled via a separate remote
+#     entry [scenario4-step5] ---
+drive9-test-sample final
+drive9-test-drain --mode require-ok --timeout 300s
+drive9-test-sample remote-final --as remote
+
+# --- Verdicts: each assertion = one case entry in the stats ---
+drive9-test-check manifest-equals --this control --against @final \
+    --ignore '.sim/**,incoming/**'                                 --req 'scenario4-check1'
+drive9-test-check manifest-equals --this @remote-final --against @final \
+    --ignore '.sim/**,incoming/**'                                 --req 'scenario4-step4'
+drive9-test-check sync-ok                                          --req 'scenario4-step4'

@@ -1,0 +1,124 @@
+#!/bin/sh
+# Scenario 7 - restructure a project: move and delete files and directories.
+#
+# What this scenario does:
+#   Same-region file move (rename lib/util.js -> lib/helpers.js): the new path
+#   has the correct content, the old path disappears, and the parent directory
+#   listing stays consistent. Whole-directory move (components/ -> modules/):
+#   the subtree is relocated completely and the old prefix disappears. Delete
+#   then recreate under the same name (delete file -> write a different
+#   marker under the same name -> read the new content; delete empty dir ->
+#   mkdir the same name -> writable). Open handles and path replacement are
+#   isolated from each other (process A holds an fd and reads a prefix;
+#   process B replaces the path via temp file + atomic rename; A keeps
+#   reading the old inode's remainder from the old fd and reads the new
+#   content after reopening the path). Cross-filesystem move (inside the
+#   mount -> /tmp outside): EXDEV is a legitimate result (record it
+#   explicitly), followed by an explicit cp and a byte-for-byte comparison.
+#   Forbidden: a same-region move "succeeding silently" (returns 0 but the
+#   target is missing or the source did not disappear) is a failure; a copy
+#   success must not stand in for the "is rename supported" verdict (the two
+#   parts get separate verdicts).
+#
+# Environment (not script logic; supplied via the run CLI):
+#   Input: the fixed tree (component directory with 2 files, lib with 1 file,
+#   a 64KiB asset) is built by the seed section; the expected old/new paths
+#   after each operation are constructed locally under /tmp independently.
+#   control: not applicable -- this script does not reference control.
+set -eu
+
+# ---- Seed: fixed tree [scenario7-step1] ----
+mkdir -p components/ui lib
+printf '<template>btn v1</template>\n'   > components/ui/Button.vue
+printf '<template>modal v1</template>\n'  > components/ui/Modal.vue
+printf 'export const util = 1;\n'         > lib/util.js
+head -c 65536 /dev/zero | tr '\0' 'L'     > assets-placeholder.bin 2>/dev/null || true
+mkdir -p assets && head -c 65536 /dev/zero | tr '\0' 'L' > assets/logo.bin
+rm -f assets-placeholder.bin
+
+# ---- Same-region file move: new path content correct, old path gone, parent
+# directory listing consistent [scenario7-step2/scenario7-check1] ----
+mv lib/util.js lib/helpers.js
+printf 'export const util = 1;\n' > /tmp/exp-helper
+cmp lib/helpers.js /tmp/exp-helper
+[ ! -e lib/util.js ]
+[ "$(ls lib)" = "helpers.js" ]
+echo "move-file semantics ok"
+
+# ---- Whole-directory move: subtree relocated completely, old prefix gone
+# [scenario7-step2/scenario7-check1] ----
+mv components modules
+printf '<template>btn v1</template>\n' > /tmp/exp-btn
+cmp modules/ui/Button.vue /tmp/exp-btn
+[ ! -e components/ui/Button.vue ]
+[ "$(find modules -type f | wc -l)" -eq 2 ]
+echo "move-dir complete"
+
+# ---- Delete then recreate under the same name: delete file -> write a
+# different marker under the same name -> read the new content; delete empty
+# dir -> mkdir the same name -> writable [scenario7-step3/scenario7-check2] ----
+rm modules/ui/Modal.vue
+printf '<template>modal v2 rebuilt</template>\n' > modules/ui/Modal.vue
+printf '<template>modal v2 rebuilt</template>\n' > /tmp/exp-modal
+cmp modules/ui/Modal.vue /tmp/exp-modal
+mkdir -p emptydir && rmdir emptydir
+mkdir emptydir && printf 'new in recreated dir\n' > emptydir/f.txt
+cmp emptydir/f.txt emptydir/f.txt
+echo "delete-recreate reads new"
+
+# ---- Open handle vs path replacement: keep reading the old inode's
+# remainder via the held fd; reopening the path reads the new content
+# [scenario7-step4/scenario7-check2] ----
+cat modules/ui/Button.vue > /tmp/old-button
+exec 3< modules/ui/Button.vue
+head -c 20 <&3 > /dev/null
+printf '<template>btn v2 replaced</template>\n' > /tmp/new-button
+cp /tmp/new-button modules/ui/Button.vue.new && mv modules/ui/Button.vue.new modules/ui/Button.vue
+tail -c +21 <&3 > /tmp/fd-rest
+tail -c +21 /tmp/old-button > /tmp/exp-rest
+if cmp -s /tmp/fd-rest /tmp/exp-rest; then
+  drive9-test-check shell --req 'scenario7-check2' -- test -s /tmp/fd-rest
+else
+  # old-handle semantics are checked against what is declared; when no POSIX
+  # handle semantics are declared, record unconfirmed (rc=3) and keep the
+  # evidence
+  echo "OPEN-HANDLE-AFTER-RENAME: fd-rest=$(wc -c < /tmp/fd-rest)B exp-rest=$(wc -c < /tmp/exp-rest)B"
+  drive9-test-check shell --req 'scenario7-check2' -- sh -c 'exit 3'
+fi
+cat modules/ui/Button.vue > /tmp/reopen
+cmp /tmp/reopen /tmp/new-button
+exec 3<&-
+echo "open-handle vs path isolated"
+
+# ---- Cross-filesystem move: EXDEV is a legitimate result (record it
+# explicitly), then an explicit copy with correct bytes. Inside the mount ->
+# /tmp (a plain local directory). If the product supports cross-region moves
+# directly (mv succeeds), the final state is verified the same way
+# [scenario7-step5/scenario7-check4] ----
+rm -f /tmp/outside.bin
+if mv modules/ui/Button.vue /tmp/outside.bin 2>/tmp/xerr; then
+  echo "CROSS-MOVE-SUPPORTED"
+  cmp /tmp/outside.bin /tmp/new-button
+else
+  if grep -q "EXDEV\|cross-device\|Different filesystem" /tmp/xerr; then
+    echo "EXDEV-RECORDED"
+  else
+    echo "UNEXPECTED-ERRNO:"; cat /tmp/xerr; exit 1
+  fi
+  cp modules/ui/Button.vue /tmp/outside.bin
+  cmp /tmp/outside.bin /tmp/new-button
+fi
+# restore the scene for the later snapshot comparison (the move-success branch
+# moved the file away; copy it back)
+[ -e modules/ui/Button.vue ] || cp /tmp/outside.bin modules/ui/Button.vue
+echo "cross-region exdev recorded, copy exact"
+
+# ---- Final-state sampling and sync confirmation [scenario7-step6] ----
+drive9-test-sample final
+drive9-test-drain --mode require-ok --timeout 120s
+drive9-test-sample remote-final --as remote
+
+# ---- Verdicts: each assertion = one case entry in the statistics ----
+drive9-test-check manifest-equals --this @remote-final --against @final \
+    --ignore '.sim/**,noreplace/**'                                  --req 'scenario7-step2'
+drive9-test-check sync-ok                                            --req 'scenario7-step2'

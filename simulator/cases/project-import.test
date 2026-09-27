@@ -1,0 +1,112 @@
+#!/bin/sh
+# Scenario 1: create or import a complete website project.
+#
+# Scope:
+#   After a two-path bulk import (a. unzip an archive onto the mount; b. git clone +
+#   checkout of a pinned revision), directories, attributes, and content must all be
+#   fully correct immediately: once the import returns, a "separate process" scans
+#   everything - listing the directory tree / stat-ing every file / reading each file
+#   and comparing it against the input fingerprints. Chinese names / spaces / hidden
+#   entries / empty files / 0755 executables / symlink targets are each verified
+#   individually. After drain confirms, the manifest taken through an independent
+#   entry point must equal the manifest captured at import time; differences from the
+#   control run (an ordinary local directory) are limited to the whitelist.
+#   Mis-readings this scenario forbids:
+#   - Counting file-count equality alone as a pass (equal counts can still hide
+#     missing / replaced / corrupted files).
+#   - Letting the importing process perform the scan itself; that is not a "separate
+#     process".
+#
+# Environment (passed through the run CLI, not scripted here):
+#   Inputs: an ordinary local directory /tmp/d9case/project-import pre-seeded with a
+#   fixed tree (>= 4 levels deep, containing empty / hidden / Chinese / space-in-name
+#   / executable / symlink entries) plus an equivalent zip archive plus a pinned git
+#   repository (with a single commit); everything is constructed independently inside
+#   the script, with no reliance on external fixtures.
+#   control: this script references control (manifest-equals with an ignore
+#   whitelist); the /tmp staging area is rebuilt with rm -rf on every execution.
+#
+# FILES is an ordinary shell variable, overridable through the environment:
+# FILES=100 and FILES=1000 are two tiers that produce separate verdicts.
+set -eu
+FILES=${FILES:-100}
+export FILES
+
+# ---- Pre-build inputs: a fixed tree (>= 4 levels, with empty / hidden / Chinese /
+#      space-in-name / executable / symlink entries) + zip archive + git repository;
+#      everything lives in an ordinary local directory (/tmp) and never passes
+#      through the mount under test [scenario1-step1 prerequisite] ----
+T=/tmp/d9case/project-import
+rm -rf "$T" && mkdir -p "$T/staged/src/deep/a/b/c" "$T/staged/pages" "$T/staged/assets" "$T/repo"
+n=$FILES
+i=0
+while [ $i -lt $n ]; do
+  k=$((i+1))
+  printf 'payload %s\n' "$k"                        > "$T/staged/src/deep/a/b/c/mod-$k.js"
+  : > "$T/staged/src/empty-$k"
+  printf 'dot %s\n' "$k"                            > "$T/staged/src/.hidden-$k"
+  printf 'space %s\n' "$k"                          > "$T/staged/pages/note $k.md"
+  printf '页面 %s\n' "$k"                           > "$T/staged/pages/页面-$k.html"
+  head -c 4096 /dev/zero | tr '\0' 'a'              > "$T/staged/assets/img-$k.bin"
+  i=$((i+1))
+done
+printf '#!/bin/sh\necho run\n' > "$T/staged/src/tool.sh" && chmod 755 "$T/staged/src/tool.sh"
+ln -s ../assets/img-1.bin "$T/staged/src/img-link"
+( cd "$T/staged" && find . \( -type f -o -type l \) -print0 | sort -z | xargs -0 sha256sum > "$T/staged.SHA256SUMS" 2>/dev/null || \
+  ( cd "$T/staged" && find . -type f -print0 | sort -z | xargs -0 sha256sum > "$T/staged.SHA256SUMS" ) )
+# -y is mandatory: by default Info-ZIP zip follows symlinks and stores their
+# contents, so after unpacking a link would become an ordinary 4096-byte file (the
+# same happens when unpacking into a plain local directory), and each symlink entry
+# would gain a phantom duplicate.
+( cd "$T/staged" && zip -qry "$T/staged.zip" . )
+# Pinned git repository (with a single commit)
+cp -a "$T/staged/." "$T/repo/"
+( cd "$T/repo" && rm -rf .git && git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm base )
+find "$T/staged" -type f | wc -l
+
+# ---- Two-path import: a. unzip import; b. git clone of the pinned repository [scenario1-step1] ----
+T=/tmp/d9case/project-import
+mkdir -p by-zip by-git
+unzip -q "$T/staged.zip" -d by-zip
+git clone -q "$T/repo" by-git
+[ -n "$(find by-zip -type f | head -1)" ]
+
+# ---- Full scan by a "separate process" after the import: list the tree / stat /
+#      read every file and compare against the input fingerprints; types,
+#      permissions (0755), and link targets each checked [scenario1-step3 /
+#      scenario1-check2 / scenario1-check3] ----
+T=/tmp/d9case/project-import
+fail=0
+# Space-in-name entries (note $k.md) are legal input for this case: only
+# find -print0 + xargs -0 preserves them faithfully; bare xargs splitting on
+# whitespace would break ./pages/note 98.md into two nonexistent paths.
+for d in by-zip by-git; do
+  # Content level: file counts and per-file digests (skipping .git and the zip
+  # archive's own differences)
+  got=$(cd "$d" && find . -type f -not -path './.git/*' | wc -l)
+  exp=$(cd "$T/staged" && find . -type f | wc -l)
+  [ "$got" -eq "$exp" ] || { echo "COUNT-MISMATCH $d got=$got exp=$exp"; fail=1; }
+  ( cd "$d" && find . -type f -not -path './.git/*' -print0 | sort -z | xargs -0 sha256sum ) > "/tmp/scan-$d.sum"
+  ( cd "$T/staged" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > /tmp/scan-exp.sum
+  cmp -s "/tmp/scan-$d.sum" /tmp/scan-exp.sum || { echo "DIGEST-MISMATCH $d"; fail=1; }
+done
+[ -x by-zip/src/tool.sh ]            || { echo "EXEC-BIT-LOST"; fail=1; }
+[ "$(readlink by-zip/src/img-link)" = "../assets/img-1.bin" ] || { echo "LINK-TARGET-LOST"; fail=1; }
+[ -e "by-zip/pages/页面-1.html" ]    || { echo "CJK-NAME-LOST"; fail=1; }
+[ -e "by-zip/pages/note 1.md" ]      || { echo "SPACE-NAME-LOST"; fail=1; }
+[ -e by-zip/src/.hidden-1 ]          || { echo "HIDDEN-LOST"; fail=1; }
+[ -e by-zip/src/empty-1 ]            || { echo "EMPTY-LOST"; fail=1; }
+echo "scan done fail=$fail"
+[ $fail -eq 0 ]
+
+# ---- Sync confirmation and independent entry-point sampling [scenario1-step5] ----
+drive9-test-sample after-import
+drive9-test-drain --mode require-ok --timeout 180s
+drive9-test-sample remote-final --as remote
+
+# ---- Verdicts: each assertion below is one case entry in the statistics ----
+drive9-test-check manifest-equals --this control --against @after-import \
+    --ignore 'by-git/.git/**,.sim/**'                                --req 'scenario1-check1'
+drive9-test-check manifest-equals --this @remote-final --against @after-import \
+    --ignore 'by-git/.git/**,.sim/**'                                --req 'scenario1-check4'
+drive9-test-check sync-ok                                            --req 'scenario1-step5'
