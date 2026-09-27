@@ -21,6 +21,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/pingcap/failpoint"
 	"go.uber.org/zap"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -3482,6 +3483,9 @@ func ensureStagedSnapshotLineageLocked(fh *FileHandle) (snapshotID, parentSnapsh
 	fh.StagedSnapshotID = generateMountID()
 	fh.StagedParentSnapshotID = fh.ContentSnapshotID
 	fh.stagedAncestors = snapshotAncestors(fh.ContentSnapshotID, fh.contentAncestors)
+	if root := fh.ftruncateInherited; root != "" && !slices.Contains(fh.stagedAncestors, root) {
+		fh.stagedAncestors = append(fh.stagedAncestors[:min(len(fh.stagedAncestors), maxLiveSnapshotAncestors-1)], root)
+	}
 	fh.StagedSnapshotSeq = fh.DirtySeq
 	fh.StagedLineageTrusted = fh.LineageTrusted
 	return fh.StagedSnapshotID, fh.StagedParentSnapshotID
@@ -3533,6 +3537,9 @@ func (fs *Dat9FS) bindCommitEntryToHandleLocked(entry *CommitEntry, fh *FileHand
 	}
 	entry.PayloadBaseRev = payloadBaseRev
 	entry.PayloadBaseRevSet = true
+	if fs.ftruncateParticipates(fh) {
+		entry.DisableAutoResolveLWW = true
+	}
 	entry.SnapshotID = fh.StagedSnapshotID
 	entry.liveAncestors = fh.stagedAncestors
 	entry.ParentSnapshotID = fh.StagedParentSnapshotID
@@ -7951,6 +7958,7 @@ func (fs *Dat9FS) takeHandleRemoteCommitPathLocked(fh *FileHandle) func() {
 	if fh.RemoteCommitUnlock != nil {
 		unlock := fh.RemoteCommitUnlock
 		fh.RemoteCommitUnlock = nil
+		fh.ftruncateFence = false
 		return unlock
 	}
 	return fs.lockWritableRemoteCommitPath(fh.Path)
@@ -7962,6 +7970,7 @@ func (fs *Dat9FS) releaseHandleRemoteCommitPathLocked(fh *FileHandle) {
 	}
 	unlock := fh.RemoteCommitUnlock
 	fh.RemoteCommitUnlock = nil
+	fh.ftruncateFence = false
 	unlock()
 }
 
@@ -8818,9 +8827,21 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	// fencing there serialized tools that restore timestamps right after
 	// close() (unzip, rsync -t, cp -p) behind each file's full commit
 	// settle (~150ms in #954). All other flag combinations keep the fence.
-	if !isTimeOnlySetAttr(input) {
-		unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(entry.Path)
-		defer unlockRemoteCommit()
+	fdTruncate := input.Valid&(gofuse.FATTR_FH|gofuse.FATTR_SIZE) == gofuse.FATTR_FH|gofuse.FATTR_SIZE && !fs.layerEnabled() && !isSQLiteDirectIOPath(entry.Path)
+	if !isTimeOnlySetAttr(input) && !fdTruncate {
+		if input.Valid&gofuse.FATTR_SIZE != 0 && input.Size == 0 && entry.Nlink <= 1 && fs.openHandles.ftruncateInheritance(input.NodeId, entry.Path) != nil {
+			unlock, _, err := fs.lockFtruncateWritableOpen(input.NodeId, entry.Path)
+			if err != nil {
+				return httpToFuseStatus(err)
+			}
+			defer unlock()
+			if err := fs.checkFtruncatePathZero(input.NodeId, entry.Path); err != nil {
+				return httpToFuseStatus(err)
+			}
+		} else {
+			unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(entry.Path)
+			defer unlockRemoteCommit()
+		}
 	}
 
 	metadataChanged := false
@@ -8948,8 +8969,32 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			if ok && fh.Dirty != nil {
 				var abortStreamer func()
 				fh.Lock()
-				fs.discardSupersededMutationLocked(fh)
 				markVisible := !fs.layerEnabled() && !isSQLiteDirectIOPath(fh.Path)
+				var siblings []*FileHandle
+				if markVisible {
+					if err := fs.fenceFtruncateLocked(fh); err != nil {
+						fh.Unlock()
+						return httpToFuseStatus(err)
+					}
+					if err := fs.prepareFtruncateMutationLocked(ctx, fh); err != nil {
+						fs.releaseHandleRemoteCommitPathLocked(fh)
+						fh.Unlock()
+						return httpToFuseStatus(err)
+					}
+					for _, other := range fs.openHandles.SnapshotInode(fh.Ino) {
+						if other != fh && other.Flags&syscall.O_ACCMODE != syscall.O_RDONLY {
+							siblings = append(siblings, other)
+						}
+					}
+					var locked bool
+					siblings, locked = tryLockFileHandlesInOrder(siblings)
+					if !locked {
+						fs.releaseHandleRemoteCommitPathLocked(fh)
+						fh.Unlock()
+						return gofuse.EAGAIN
+					}
+				}
+				fs.discardSupersededMutationLocked(fh)
 				newMarker := markVisible && !fh.Dirty.visibleTruncate
 				if newMarker {
 					fs.openHandles.MarkVisibleTruncate(fh, 0)
@@ -8960,18 +9005,31 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					if newMarker {
 						fs.openHandles.UnmarkVisibleTruncate(fh)
 					}
+					unlockFileHandles(siblings)
+					if markVisible {
+						fs.releaseHandleRemoteCommitPathLocked(fh)
+					}
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
 				}
 				if markVisible {
 					fh.Dirty.visibleTruncate = true
 					fs.openHandles.MarkVisibleTruncate(fh, fh.DirtySeq)
+					fs.publishFtruncateInheritanceLocked(fh)
+					// Keep ordering through inode attribute publication, but detach
+					// the token so a concurrent call on this fd cannot borrow it.
+					unlockTruncate := fs.takeHandleRemoteCommitPathLocked(fh)
+					defer unlockTruncate()
 				}
+				unlockFileHandles(siblings)
 				publishTruncate := newSize == 0 && isSQLitePersistentJournalPath(entry.Path) &&
 					!entry.Unlinked && !fh.Unlinked && !fh.UnlinkedSnapshot && fh.UnlinkedData == nil
 				truncateSeq := fh.DirtySeq
 				truncateRevision := max(fh.BaseRev, fs.latestCommittedRevision(entry.Path))
 				fh.Unlock()
+				if markVisible {
+					failpoint.InjectCall("ftruncateBeforeAttrPublish", fs, fh)
+				}
 				if abortStreamer != nil {
 					abortStreamer()
 				}
@@ -12119,7 +12177,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		if fs.opts.ReadOnly {
 			return gofuse.EROFS
 		}
-		unlockRemoteCommit := fs.lockWritableRemoteCommitPathForWritableOpen(p)
+		unlockRemoteCommit, truncateOrdered, lockErr := fs.lockFtruncateWritableOpen(input.NodeId, p)
+		if lockErr != nil {
+			return httpToFuseStatus(lockErr)
+		}
 		defer func() {
 			if unlockRemoteCommit != nil {
 				unlockRemoteCommit()
@@ -12132,6 +12193,23 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		}
 
 		fh.Dirty = fs.newWriteBuffer(p, maxPreloadSize, 0)
+		if !fs.layerEnabled() && !isSQLiteDirectIOPath(p) {
+			if event := fs.openHandles.ftruncateInheritance(fh.Ino, p); event != nil {
+				// A newly observed event cannot use a legacy timeout fallback.
+				if !truncateOrdered {
+					return gofuse.EAGAIN
+				}
+				if input.Flags&syscall.O_TRUNC != 0 {
+					if fs.hasPendingMetadataState(p) {
+						return gofuse.EAGAIN
+					}
+					fh.pendingFtruncate.Store(event)
+					if err := fs.prepareFtruncateMutationLocked(ctx, fh); err != nil {
+						return httpToFuseStatus(err)
+					}
+				}
+			}
+		}
 
 		// Preload existing content for non-truncating opens so that
 		// random writes don't discard the original file data.
@@ -12189,6 +12267,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.appendLogRecordTruncate()
 			fh.ZeroBase = true
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
+			if fs.ftruncateParticipates(fh) {
+				ensureStagedSnapshotLineageLocked(fh)
+				publishStagedSnapshotLineageLocked(fh)
+			}
 			fs.inodes.UpdateSize(fh.Ino, 0)
 			// Truncation updates mtime and ctime (POSIX). The SetAttr
 			// FATTR_SIZE path does this via the trailing metadataChanged
@@ -13020,10 +13102,27 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		return 0, st
 	}
 
-	unlockRemoteCommit := fs.lockHandleRemoteCommitPathLocked(fh)
+	unlockRemoteCommit := func() {}
 	defer func() { unlockRemoteCommit() }()
-	deadline := time.Now().Add(fs.opts.RemoteCommitWaitTimeout)
+	var deadline time.Time
 	for {
+		if !fs.ftruncateParticipates(fh) {
+			unlockRemoteCommit = fs.lockHandleRemoteCommitPathLocked(fh)
+		}
+		// Recheck after every reacquisition, including a legacy wait during
+		// which this handle may have become an inheritance participant.
+		if fs.ftruncateParticipates(fh) {
+			if err := fs.fenceFtruncateLocked(fh); err != nil {
+				return 0, httpToFuseStatus(err)
+			}
+			unlockRemoteCommit = func() { fs.releaseHandleRemoteCommitPathLocked(fh) }
+			if err := fs.prepareFtruncateMutationLocked(ctx, fh); err != nil {
+				return 0, httpToFuseStatus(err)
+			}
+		}
+		if deadline.IsZero() {
+			deadline = time.Now().Add(fs.opts.RemoteCommitWaitTimeout)
+		}
 		fs.discardSupersededMutationLocked(fh)
 		fs.adoptCommittedRevisionLocked(fh)
 		if fh.Dirty == nil {
@@ -13056,7 +13155,6 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		case <-time.After(time.Millisecond):
 		}
 		fh.Lock()
-		unlockRemoteCommit = fs.lockHandleRemoteCommitPathLocked(fh)
 	}
 	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
 	writeSyncAppendLogState := appendLogHandleState{}
@@ -13150,6 +13248,9 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		source = "dirty-buffer"
 	}
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
+	if fs.ftruncateParticipates(fh) {
+		ensureStagedSnapshotLineageLocked(fh)
+	}
 	if fh.Dirty.visibleTruncate {
 		fs.openHandles.MarkVisibleTruncate(fh, fh.DirtySeq)
 	} else if fs.openHandles.HasVisibleTruncate(fh.Ino) {
@@ -13187,6 +13288,9 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			}
 			return 0, st
 		}
+	}
+	if fs.ftruncateParticipates(fh) {
+		publishStagedSnapshotLineageLocked(fh)
 	}
 	return n, gofuse.OK
 }
@@ -13229,7 +13333,11 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 	fh.WriteBackSeq = 0
 	clearReadTargetForLockedHandle(fh)
 	if fs.shadowStore != nil && fh.ShadowReady {
-		fs.shadowStore.Remove(fh.Path)
+		if fs.ftruncateParticipates(fh) {
+			fs.removeHandleOwnedStagingLocked(fh)
+		} else {
+			fs.shadowStore.Remove(fh.Path)
+		}
 		clearHandleShadowClaimLocked(fh)
 	}
 }
@@ -13956,6 +14064,9 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		phase = "unlinked-discard"
 		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
+	}
+	if handled, err := fs.prepareFtruncateCommitLocked(ctx, fh, true); handled || err != nil {
+		return httpToFuseStatus(err)
 	}
 	if fs.discardSupersededMutationLocked(fh) {
 		phase = "superseded-mutation"

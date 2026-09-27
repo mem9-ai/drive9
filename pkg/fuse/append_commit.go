@@ -46,6 +46,7 @@ func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle
 		if proof.rev > 0 {
 			fs.recordCommittedRevisionWithSize(entry.Path, proof.rev, proof.size)
 		}
+		fs.discardFtruncateRetriedAncestorLocked(ctx, fh)
 	}
 	unlock()
 	if err != nil {
