@@ -250,7 +250,7 @@ func TestRecoveryPreservesSecondFlushAfterSnapshotFailure(t *testing.T) {
 				}
 				defer func() { _ = replay.Close() }()
 				idx.setShadowStore(recovered)
-				if err := replayJournalIntoPending(replay, idx, recovered); err != nil {
+				if _, err := replayJournalIntoPending(replay, idx, recovered); err != nil {
 					t.Fatal(err)
 				}
 				oldCache, err := NewWriteBackCache(originalDir)
@@ -420,7 +420,7 @@ func TestReplayFullMetadataKeepsNewerDiskPublication(t *testing.T) {
 	defer func() { _ = j.Close() }()
 	mustAppend(t, j, JournalEntry{Op: JournalPendingMeta, Path: "/file", Meta: raw})
 	mustFsync(t, j)
-	if err := replayJournalIntoPending(j, idx, nil); err != nil {
+	if _, err := replayJournalIntoPending(j, idx, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := idx.GetMeta("/file")

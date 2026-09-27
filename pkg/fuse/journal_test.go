@@ -151,7 +151,7 @@ func TestReplayJournalIntoPendingHonorsCommitMarkers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := replayJournalIntoPending(j, idx, nil); err != nil {
+	if _, err := replayJournalIntoPending(j, idx, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -208,7 +208,7 @@ func TestReplayJournalIntoPendingPrefersSurvivingMeta(t *testing.T) {
 	if _, err := idx.PutWithBaseRev("/a.txt", 99, PendingOverwrite, 7); err != nil {
 		t.Fatal(err)
 	}
-	if err := replayJournalIntoPending(j, idx, nil); err != nil {
+	if _, err := replayJournalIntoPending(j, idx, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -250,7 +250,7 @@ func TestJournalCompactAfterReplayKeepsSeqMonotonic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := replayJournalIntoPending(j2, idx, nil); err != nil {
+	if _, err := replayJournalIntoPending(j2, idx, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := j2.Compact(); err != nil {

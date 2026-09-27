@@ -526,6 +526,11 @@ func Mount(opts *MountOptions) (err error) {
 
 			pendingIdx.setShadowStore(shadowStore)
 
+			// Deferred-delete intents recovered from the WAL (JournalUnlink
+			// frames with no confirming marker); re-enqueued after the commit
+			// queue starts below.
+			var deferredDeletes []replayDeferredDelete
+
 			// Initialize Journal WAL.
 			journalPath := filepath.Join(cacheBase, mountHash, "journal.wal")
 			journal, err := NewJournal(journalPath)
@@ -537,8 +542,9 @@ func Mount(opts *MountOptions) (err error) {
 				// (group-committed fsync) instead of per-entry atomicWrite.
 				pendingIdx.SetJournal(journal)
 				if opts.WritebackLazyStaging {
-					// Issue #964: close stages into the page cache; the
-					// background syncer bounds the power-loss window.
+					// Issue #964: close staging is un-fsynced, so the WAL
+					// meta frame may reach disk while the shadow content did
+					// not. The background syncer bounds the power-loss window.
 					pendingIdx.SetJournalSyncOnPut(false)
 					if opts.WritebackSyncWindow > 0 {
 						syncerCtx, syncerCancel := context.WithCancel(context.Background())
@@ -548,9 +554,11 @@ func Mount(opts *MountOptions) (err error) {
 				}
 				// Replay journal for crash recovery. Preserve the original kind
 				// and base revision so CommitQueue.RecoverPending can re-enqueue.
-				if err := replayJournalIntoPending(journal, pendingIdx, shadowStore); err != nil {
+				var replayErr error
+				deferredDeletes, replayErr = replayJournalIntoPending(journal, pendingIdx, shadowStore)
+				if replayErr != nil {
 					closeFailedMountStaging(dat9fs)
-					return fmt.Errorf("mount: journal replay: %w", err)
+					return fmt.Errorf("mount: journal replay: %w", replayErr)
 				}
 				// Drop frames already covered by commit markers so the WAL does
 				// not grow unboundedly across mounts. Safe here: mount init is
@@ -593,10 +601,54 @@ func Mount(opts *MountOptions) (err error) {
 				cq.serializeMutationInodes = opts.GVisorCompat
 				cq.PathLock = dat9fs.lockRemoteCommitPath
 				cq.DurableWatermark = dat9fs.latestCommittedRevision
+				cq.RecordCommittedRevision = dat9fs.recordCommittedRevision
 				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {
 					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
 				}
+				// Hold deferred deletes briefly so an rmdir arriving
+				// mid-`rm -rf` can coalesce the subtree into one
+				// recursive DELETE (#996 P0). WaitPath, WaitPrefix,
+				// WaitIdle, and DrainAll force delayed deletes
+				// immediately, so the window only delays the backend
+				// DELETE, never a namespace answer. Only the write-back
+				// policy ever enqueues PendingDelete entries.
+				cq.ConfigureDeleteCoalesceWindow(deferredDeleteCoalesceWindow)
 				cq.RecoverPending()
+				// Re-apply deferred-delete intents whose remote DELETE the
+				// previous session never confirmed. The durable JournalUnlink
+				// frame is the intent; enqueueing here closes the crash window
+				// where a file is unlinked locally but still present remotely.
+				// A queue full of recovered uploads backs this off with
+				// retries instead of dropping the intent for the whole mount
+				// session: the queue drains as uploads complete, freeing
+				// slots.
+				if len(deferredDeletes) > 0 {
+					backoff := 200 * time.Millisecond
+					requeueDeadline := time.Now().Add(30 * time.Second)
+					for _, d := range deferredDeletes {
+						for {
+							err := cq.Enqueue(&CommitEntry{
+								Path:    d.Path,
+								BaseRev: d.BaseRev,
+								Kind:    PendingDelete,
+							})
+							if err == nil {
+								break
+							}
+							if time.Now().After(requeueDeadline) {
+								// The durable WAL intent still replays on the
+								// next mount; keep mounting rather than
+								// blocking startup forever.
+								safeLogPrintf("mount: deferred delete re-enqueue failed for %s: %v (intent kept for next mount)", d.Path, err)
+								break
+							}
+							time.Sleep(backoff)
+							if backoff < 2*time.Second {
+								backoff *= 2
+							}
+						}
+					}
+				}
 				if opts.LayerRef != "" {
 					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
 						closeFailedMountStaging(dat9fs)

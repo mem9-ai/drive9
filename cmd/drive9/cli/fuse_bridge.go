@@ -1,8 +1,8 @@
 package cli
 
 import (
-	"strings"
 	"fmt"
+	"strings"
 	"time"
 )
 

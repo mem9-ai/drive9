@@ -716,6 +716,53 @@ func (idx *PendingIndex) MarkConflictIfGeneration(remotePath string, expectedGen
 	return false, nil
 }
 
+// MarkChmodPendingIfGeneration durably records that the entry's data bytes
+// landed remotely and only the best-effort post-upload chmod remains. The
+// commit queue uses it so a chmod failure can no longer leave the entry
+// classified as PendingNew (never-uploaded) — a follow-up unlink would then
+// skip the remote DELETE and leak the just-created remote object. Mirrors
+// MarkConflictIfGeneration's durability: .meta written before the in-memory
+// kind flips.
+func (idx *PendingIndex) MarkChmodPendingIfGeneration(remotePath string, expectedGen uint64) (bool, error) {
+	if expectedGen == 0 {
+		return false, nil
+	}
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
+	idx.mu.RLock()
+	meta, ok := idx.items[remotePath]
+	if !ok {
+		idx.mu.RUnlock()
+		return true, nil
+	}
+	if meta.Generation != expectedGen {
+		idx.mu.RUnlock()
+		return false, nil
+	}
+	chmod := *meta
+	chmod.Kind = PendingChmod
+	idx.mu.RUnlock()
+
+	metaBytes, err := json.Marshal(&chmod)
+	if err != nil {
+		return false, fmt.Errorf("pending index marshal chmod-pending: %w", err)
+	}
+	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
+	if err := atomicWrite(metaPath, metaBytes); err != nil {
+		return false, fmt.Errorf("pending index write chmod-pending: %w", err)
+	}
+
+	idx.mu.Lock()
+	if m, exists := idx.items[remotePath]; exists && m.Generation == expectedGen {
+		m.Kind = PendingChmod
+		idx.mu.Unlock()
+		return true, nil
+	}
+	idx.mu.Unlock()
+	return false, nil
+}
+
 // Count returns the number of pending entries.
 func (idx *PendingIndex) Count() int {
 	idx.mu.RLock()

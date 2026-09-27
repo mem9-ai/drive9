@@ -3111,7 +3111,7 @@ func testFsyncWALFrameDurableBeforeEnqueue(t *testing.T, spill bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := replayJournalIntoPending(journal, idx, nil); err != nil {
+	if _, err := replayJournalIntoPending(journal, idx, nil); err != nil {
 		t.Fatal(err)
 	}
 	if idx.HasPending(remotePath) {

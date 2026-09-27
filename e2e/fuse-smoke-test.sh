@@ -458,6 +458,9 @@ wait_remote_ls_missing_name() {
   local name="$2"
   local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
   local out rc
+  # With deferred unlink (write-back default), the remote DELETE lands
+  # asynchronously after unlink(2) returns, so a name may legitimately still
+  # be listed right after an rm — poll until it disappears (or the deadline).
   while :; do
     set +e
     out=$(drive9 fs ls "$parent" 2>&1)
@@ -473,6 +476,11 @@ PY
       then
         return 0
       fi
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        return 1
+      fi
+      sleep "$MOUNT_READY_INTERVAL_S"
+      continue
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
       return 1

@@ -88,6 +88,14 @@ type CommitEntry struct {
 	// terminal. Re-basing old bytes with a new BaseRev is exactly the silent
 	// rollback class this fence prevents.
 	DisableAutoResolveLWW bool
+	// Unconditional marks a PendingDelete whose revision guard must NOT run:
+	// either the unlink captured no committed revision (nothing to compare),
+	// or a commit for the path was already in flight when the delete was
+	// scheduled — that in-flight PUT legitimately advances the revision even
+	// though its bytes are the dying file's, and the DELETE must proceed
+	// after it. Recovered (post-crash) deletes keep the guard: a revision
+	// change while this mount was gone can only come from another writer.
+	Unconditional bool
 	// growthRebaseRev records a one-shot authorization to pair a descendant
 	// payload (#896 base-zero growth, #935 live same-path rewrite) with the revision it is safe to overwrite. PayloadBaseRev
 	// intentionally remains unchanged for auditability, so repeated
@@ -188,6 +196,18 @@ type CommitQueue struct {
 	// recovery entries remain unfiltered by the Dat9FS implementation.
 	IsSuperseded CommitSupersededFunc
 
+	// OnDeferredDeleteDone is called after a PendingDelete entry landed (or
+	// found the path already gone). Dat9FS uses it to retire the in-memory
+	// delete tombstone alongside the journal marker.
+	OnDeferredDeleteDone func(path string)
+
+	// RecordCommittedRevision records a backend revision this queue proved
+	// durable for a path (data landed; post-upload steps may still fail).
+	// Dat9FS feeds its committed-revision tracker so follow-up namespace
+	// operations (unlink, lookup) see the remote object instead of
+	// classifying the path as never-uploaded.
+	RecordCommittedRevision func(path string, rev int64)
+
 	// serializeMutationInodes extends queue dispatch ordering across hardlink
 	// aliases for live-handle mutations. It is enabled only for gVisor mounts.
 	serializeMutationInodes bool
@@ -206,9 +226,14 @@ type CommitQueue struct {
 	workCh chan *CommitEntry
 
 	zeroTruncateDelay time.Duration
-	batchWindow       time.Duration
-	batchMaxItems     int
-	batchMaxBytes     int64
+	// deleteCoalesceWindow holds PendingDelete entries briefly before
+	// dispatching so a directory rmdir that arrives mid-`rm -rf` can
+	// coalesce the whole subtree into one recursive DELETE. WaitPath,
+	// WaitPrefix, WaitIdle, and DrainAll force delayed deletes immediately.
+	deleteCoalesceWindow time.Duration
+	batchWindow          time.Duration
+	batchMaxItems        int
+	batchMaxBytes        int64
 
 	perf *fusePerfCounters
 }
@@ -352,6 +377,10 @@ func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 		cq.delayZeroTruncateLocked(entry)
 		return nil
 	}
+	if cq.shouldDelayDeleteLocked(entry) {
+		cq.delayEntryLocked(entry, cq.deleteCoalesceWindow)
+		return nil
+	}
 	entry.dispatched = true
 
 	// Send to workers while holding the lock. The channel buffer is always
@@ -367,6 +396,70 @@ func (cq *CommitQueue) shouldDelayZeroTruncateLocked(entry *CommitEntry) bool {
 		return false
 	}
 	return cq.zeroTruncateDelay > 0
+}
+
+// ConfigureDeleteCoalesceWindow enables the deferred-delete coalescing
+// window (mount startup only). Zero disables it.
+func (cq *CommitQueue) ConfigureDeleteCoalesceWindow(window time.Duration) {
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	cq.deleteCoalesceWindow = window
+}
+
+func (cq *CommitQueue) shouldDelayDeleteLocked(entry *CommitEntry) bool {
+	return cq != nil && entry != nil && !entry.canceled &&
+		entry.Kind == PendingDelete && cq.deleteCoalesceWindow > 0
+}
+
+// delayEntryLocked holds an entry in the delayed set for the window; the
+// timer dispatches it to the workers unless it is forced, canceled, taken
+// (TakePendingDeletesUnderPrefix), or the queue stops first.
+func (cq *CommitQueue) delayEntryLocked(entry *CommitEntry, window time.Duration) {
+	if cq.delayed == nil {
+		cq.delayed = make(map[*CommitEntry]*time.Timer)
+	}
+	cq.delayed[entry] = time.AfterFunc(window, func() {
+		cq.dispatchDelayed(entry)
+	})
+}
+
+// TakePendingDeletesUnderPrefix atomically removes queued and delayed
+// PendingDelete entries under prefix and returns them, so the caller can
+// replace the whole subtree's deletes with one recursive DELETE. The second
+// return is false when the prefix also has queued content commits — the
+// caller must drain instead of aggregating. Entries whose coalescing timer
+// already fired (dispatched to the workers, possibly still unpicked) stay
+// untouched: they remain visible to CancelPrefix, which marks them canceled
+// in the caller's cleanup, and a dispatched entry re-enqueued on failure
+// would double-dispatch. Nothing is re-dispatched here.
+func (cq *CommitQueue) TakePendingDeletesUnderPrefix(prefix string) ([]*CommitEntry, bool) {
+	if cq == nil || prefix == "" {
+		return nil, false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	for _, entry := range cq.queue {
+		if entry == nil || entry.canceled || !strings.HasPrefix(entry.Path, prefix) {
+			continue
+		}
+		if entry.Kind != PendingDelete {
+			return nil, false
+		}
+	}
+	var taken []*CommitEntry
+	remaining := cq.queue[:0]
+	for _, entry := range cq.queue {
+		if entry != nil && !entry.canceled && !entry.dispatched &&
+			entry.Kind == PendingDelete && strings.HasPrefix(entry.Path, prefix) {
+			cq.stopDelayedLocked(entry)
+			cq.removeQueuedLocked(entry)
+			taken = append(taken, entry)
+			continue
+		}
+		remaining = append(remaining, entry)
+	}
+	cq.queue = remaining
+	return taken, true
 }
 
 func (cq *CommitQueue) isDelayedLocked(entry *CommitEntry) bool {
@@ -710,6 +803,14 @@ func (cq *CommitQueue) RecoverPending() {
 			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
 			continue
 		}
+		if meta.Kind == PendingChmod {
+			// Data already landed remotely; only the best-effort chmod was
+			// left. There is nothing to re-upload — keep the entry so
+			// Lookup/GetAttr still see the local metadata, and let the next
+			// successful commit for this path re-apply the mode.
+			safeLogPrintf("commit queue: skipping chmod-pending entry for %s (data already committed)", path)
+			continue
+		}
 		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
 			safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
 			continue
@@ -799,6 +900,47 @@ func (cq *CommitQueue) HasPath(path string) bool {
 		return true
 	}
 	return cq.hasQueuedPathLocked(path) || cq.hasImmediatePathLocked(path)
+}
+
+// HasPendingDelete reports whether a deferred remote DELETE (PendingDelete)
+// for the path is queued, delayed, or in flight.
+func (cq *CommitQueue) HasPendingDelete(path string) bool {
+	if cq == nil || path == "" {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if e := cq.inFlight[path]; e != nil && e.Kind == PendingDelete {
+		return true
+	}
+	for e := range cq.queuedByPath[path] {
+		if e != nil && e.Kind == PendingDelete {
+			return true
+		}
+	}
+	for e := range cq.immediate {
+		if e != nil && e.Path == path && e.Kind == PendingDelete {
+			return true
+		}
+	}
+	for e := range cq.delayed {
+		if e != nil && e.Path == path && e.Kind == PendingDelete {
+			return true
+		}
+	}
+	return false
+}
+
+// InFlightPath reports whether a commit for the path is currently being
+// processed by a worker (unlike HasPath it ignores queued work).
+func (cq *CommitQueue) InFlightPath(path string) bool {
+	if cq == nil {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	_, inflight := cq.inFlight[path]
+	return inflight
 }
 
 func (cq *CommitQueue) hasImmediatePathLocked(path string) bool {
@@ -1426,6 +1568,10 @@ func (cq *CommitQueue) endInFlight(entry *CommitEntry) {
 
 // commitOne uploads a single entry to the server with exponential backoff.
 func (cq *CommitQueue) commitOne(entry *CommitEntry) {
+	if entry != nil && entry.Kind == PendingDelete {
+		cq.deleteOne(entry)
+		return
+	}
 	const maxRetries = 5
 	const baseDelay = 200 * time.Millisecond
 	const maxDelay = 30 * time.Second
@@ -1589,6 +1735,171 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		return
 	}
 	cq.onCommitTerminalFailure(entry, lastErr)
+}
+
+// deleteOne applies a deferred remote DELETE (PendingDelete) with the same
+// retry/backoff discipline as uploads. Per-path ordering is inherited from
+// the queue: beginInFlight excludes same-path entries and lockPath serializes
+// the DELETE behind any in-flight upload, so a staged PUT for the unlinked
+// path always lands before the delete removes it again.
+//
+// A 404 is success (already deleted). Terminal failure keeps the durable
+// JournalUnlink intent in the WAL: the next mount's replay re-enqueues the
+// delete, so giving up here only delays the remote cleanup.
+func (cq *CommitQueue) deleteOne(entry *CommitEntry) {
+	const maxRetries = 5
+	const baseDelay = 200 * time.Millisecond
+	const maxDelay = 30 * time.Second
+
+	entryCtx, entryCancel := context.WithCancel(context.Background())
+	cq.mu.Lock()
+	if entry.canceled {
+		cq.mu.Unlock()
+		entryCancel()
+		cq.removeFromQueue(entry)
+		safeLogPrintf("commit queue: delete entry for %s was canceled before retry loop", entry.Path)
+		return
+	}
+	entry.cancelCommit = entryCancel
+	cq.mu.Unlock()
+	defer func() {
+		cq.mu.Lock()
+		entry.cancelCommit = nil
+		entry.cancelUpload = nil
+		cq.mu.Unlock()
+		entryCancel()
+	}()
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			safeLogPrintf("commit queue: delete entry for %s was canceled during retry", entry.Path)
+			return
+		}
+		if attempt > 0 {
+			if cq.perf != nil {
+				cq.perf.commitRetry.add(1)
+			}
+			delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt-1)))
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			if !sleepWithCancel(entryCtx, delay) {
+				cq.removeFromQueue(entry)
+				safeLogPrintf("commit queue: delete entry for %s was canceled during retry backoff", entry.Path)
+				return
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(entryCtx, uploadTimeout)
+		cq.mu.Lock()
+		if entry.canceled {
+			cq.mu.Unlock()
+			cancel()
+			cq.removeFromQueue(entry)
+			safeLogPrintf("commit queue: delete entry for %s was canceled before delete", entry.Path)
+			return
+		}
+		entry.cancelUpload = cancel
+		cq.mu.Unlock()
+
+		unlockPath := cq.lockPath(entry.Path)
+		// Revision guard: the path was captured at BaseRev when the unlink
+		// was scheduled. If the backend now shows a different revision, the
+		// file was recreated or rewritten by another writer between the
+		// local unlink and this deferred delete — retire the intent instead
+		// of removing newer content. Checked under the path lock so a
+		// same-path upload mid-flight serializes first. The remaining race
+		// shrinks to one round trip (stat → delete); a server-side
+		// conditional delete closes it entirely (#996 P3).
+		if !entry.Unconditional && entry.BaseRev > 0 {
+			statCtx, statCancel := context.WithTimeout(ctx, uploadTimeout)
+			stat, statErr := cq.client.StatCtx(statCtx, cq.remotePath(entry.Path))
+			statCancel()
+			switch {
+			case statErr != nil && isNotFoundErr(statErr):
+				// Path already gone remotely — nothing to protect; retire
+				// the intent (counts as deleted).
+				unlockPath()
+				cq.onDeferredDeleteSuccess(entry)
+				return
+			case statErr != nil || stat == nil || stat.Revision <= 0:
+				// Identity check unavailable: fail CLOSED. Retry with
+				// backoff; the DELETE must never run blind. If retries are
+				// exhausted the durable journal intent is kept and the next
+				// mount re-verifies.
+				unlockPath()
+				lastErr = fmt.Errorf("deferred delete identity check unavailable for %s: %w", entry.Path, statErr)
+				safeLogPrintf("commit queue: %v (retrying with backoff; intent kept)", lastErr)
+				continue
+			case stat.Revision != entry.BaseRev:
+				unlockPath()
+				safeLogPrintf("commit queue: skipping deferred delete of %s: path changed from rev %d to %d after unlink", entry.Path, entry.BaseRev, stat.Revision)
+				cq.onDeferredDeleteSuccess(entry)
+				return
+			}
+		}
+		err := cq.deleteRemoteEntry(ctx, entry)
+		cq.mu.Lock()
+		entry.cancelUpload = nil
+		cq.mu.Unlock()
+		cancel()
+		unlockPath()
+
+		if err == nil || isNotFoundErr(err) {
+			if cq.isEntryCanceled(entry) {
+				// Canceled after success: keep the durable intent so the next
+				// mount re-checks the path (CancelPath replaced this entry
+				// with a newer producer for the same path).
+				cq.removeFromQueue(entry)
+				return
+			}
+			cq.onDeferredDeleteSuccess(entry)
+			return
+		}
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			safeLogPrintf("commit queue: delete entry for %s was canceled during delete", entry.Path)
+			return
+		}
+		lastErr = err
+		safeLogPrintf("commit queue: delete attempt %d/%d failed for %s: %v", attempt+1, maxRetries, entry.Path, err)
+	}
+
+	safeLogPrintf("commit queue: giving up on deferred delete of %s after %d retries: %v (journal intent kept for next mount)", entry.Path, maxRetries, lastErr)
+	cq.removeFromQueue(entry)
+}
+
+// deleteRemoteEntry issues the DELETE for a PendingDelete entry. Layer mounts
+// never enqueue delete entries (gated at the FUSE layer), so only the plain
+// namespace DELETE is needed.
+func (cq *CommitQueue) deleteRemoteEntry(ctx context.Context, entry *CommitEntry) error {
+	if cq == nil || entry == nil || cq.client == nil {
+		return fmt.Errorf("delete entry not runnable")
+	}
+	start := time.Now()
+	err := cq.client.DeleteFileCtx(ctx, cq.remotePath(entry.Path))
+	if cq.perf != nil {
+		cq.perf.recordRemoteOp(perfRemoteMutation, err, time.Since(start), 0)
+	}
+	return err
+}
+
+// onDeferredDeleteSuccess retires the durable intent: a JournalCommit marker
+// newer than the JournalUnlink frame tells the next mount's replay the delete
+// landed, so a stale intent can never delete a path another actor recreated
+// between mounts.
+func (cq *CommitQueue) onDeferredDeleteSuccess(entry *CommitEntry) {
+	if cq != nil && cq.journal != nil {
+		if err := cq.journal.Append(JournalEntry{Op: JournalCommit, Path: entry.Path}); err != nil {
+			safeLogPrintf("commit queue: journal delete-done marker failed for %s: %v", entry.Path, err)
+		}
+	}
+	if cq.OnDeferredDeleteDone != nil {
+		cq.OnDeferredDeleteDone(entry.Path)
+	}
+	cq.removeFromQueue(entry)
 }
 
 type commitBatchConfig struct {
@@ -2504,6 +2815,19 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			if client.IsNotFound(err) {
 				safeLogPrintf("commit queue: post-upload chmod not found for %s (concurrent write likely replaced it); proceeding without mode update", entry.Path)
 			} else {
+				// The data bytes landed; only the best-effort mode update
+				// failed. Durably record "chmod pending" (RecoverPending
+				// skips it instead of re-uploading) and the committed
+				// revision — otherwise a follow-up unlink classifies the
+				// path as never-uploaded and leaks the remote object.
+				if cq.index != nil && entry.PendingIndexGen != 0 {
+					if _, markErr := cq.index.MarkChmodPendingIfGeneration(entry.Path, entry.PendingIndexGen); markErr != nil {
+						safeLogPrintf("commit queue: chmod-pending mark failed for %s: %v", entry.Path, markErr)
+					}
+				}
+				if cq.RecordCommittedRevision != nil {
+					cq.RecordCommittedRevision(entry.Path, committedRev)
+				}
 				return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
 			}
 		}

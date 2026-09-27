@@ -97,6 +97,14 @@ const rttThreshold = 10 * time.Millisecond
 // maxCommitQueuePending is the backpressure limit for the commit queue.
 const maxCommitQueuePending = 500
 
+// deferredDeleteCoalesceWindow is how long a deferred delete (PendingDelete)
+// is held before dispatch when --deferred-unlink is on. An rmdir arriving
+// within the window — the tail of every `rm -rf` — takes the queued child
+// deletes and replaces them with one recursive backend DELETE. The window
+// only delays the backend DELETE, never a namespace answer: WaitPath,
+// WaitPrefix, WaitIdle, and DrainAll force delayed deletes immediately.
+const deferredDeleteCoalesceWindow = 250 * time.Millisecond
+
 // MeasureRTT measures the round-trip time to the server by issuing a HEAD
 // request to the root path. Returns the measured duration.
 func MeasureRTT(ctx context.Context, serverURL string) (time.Duration, error) {
