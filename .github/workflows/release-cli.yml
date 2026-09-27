@@ -66,3 +66,30 @@ jobs:
           git commit -m "release: drive9 CLIs ${{ env.VERSION }}"
           git pull --rebase
           git push
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum drive9-* kubectl-drive9-migration-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+
+      - name: Upload CLI binaries to S3 (latest)
+        run: |
+          aws s3 sync dist/ s3://drive9-releases/latest/ \
+            --exclude "*" \
+            --include "drive9-*" \
+            --include "kubectl-drive9-migration-*" \
+            --include "SHA256SUMS" \
+            --include "version" \
+            --cache-control "public, max-age=300" \
+            --content-type "application/octet-stream" \
+            --no-progress
+          echo "Uploaded ${{ env.VERSION }} to s3://drive9-releases/latest/"
+          aws s3 ls s3://drive9-releases/latest/
