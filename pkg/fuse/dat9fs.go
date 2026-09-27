@@ -965,11 +965,13 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 			baseRev := int64(0)
 			pendingKind := PendingNew
 			hadPending := false
+			var pendingGen uint64
 			if fs.pendingIndex != nil {
 				if meta, ok := fs.pendingIndex.GetMeta(localPath); ok {
 					baseRev = meta.BaseRev
 					pendingKind = meta.Kind
 					hadPending = true
+					pendingGen = meta.Generation
 				}
 			}
 			if !hadPending && fs.client != nil {
@@ -986,12 +988,12 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 			}
 			if fs.pendingIndex != nil {
 				if !hadPending {
-					if _, err := fs.pendingIndex.PutWithBaseRevAndMode(localPath, int64(len(data)), pendingKind, baseRev, mode, true); err != nil {
+					if _, err := fs.pendingIndex.PutLayerCache(localPath, int64(len(data)), pendingKind, baseRev, mode, true); err != nil {
 						return fmt.Errorf("put pending mode for layer chmod %s: %w", localPath, err)
 					}
 					return nil
 				}
-				if err := fs.pendingIndex.UpdateMode(localPath, mode); err != nil {
+				if err := fs.pendingIndex.MarkLayerCommittedIfGeneration(localPath, pendingGen, baseRev, mode, true); err != nil {
 					return fmt.Errorf("update pending mode for layer chmod %s: %w", localPath, err)
 				}
 			}
@@ -1011,7 +1013,7 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 				return err
 			}
 			if fs.pendingIndex != nil {
-				if _, err := fs.pendingIndex.PutWithBaseRevAndMode(localPath, int64(len(entry.Content)), pendingKind, baseRev, mode, true); err != nil {
+				if _, err := fs.pendingIndex.PutLayerCache(localPath, int64(len(entry.Content)), pendingKind, baseRev, mode, true); err != nil {
 					return fmt.Errorf("put pending mode for layer chmod %s: %w", localPath, err)
 				}
 			}
@@ -1200,7 +1202,7 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 		}
 	}
 	if fs.pendingIndex != nil {
-		if _, err := fs.pendingIndex.PutWithBaseRevAndMode(newLocalPath, int64(len(data)), kind, targetBaseRev, mode, hasMode); err != nil {
+		if _, err := fs.pendingIndex.PutLayerCache(newLocalPath, int64(len(data)), kind, targetBaseRev, mode, hasMode); err != nil {
 			return err
 		}
 	}
@@ -1395,7 +1397,11 @@ func (fs *Dat9FS) applyLayerRollback(shadows *ShadowStore, pending *PendingIndex
 	//    conflict entries, so they will not be retried against the dead layer.
 	if pending != nil {
 		for p := range pending.ListPendingPaths() {
-			_ = pending.MarkConflict(p)
+			// Durable overlay caches are not unsent writes. Keep them out of
+			// conflict accounting so a fully drained rollback can exit cleanly.
+			if meta, ok := pending.GetMeta(p); ok && !meta.LayerClean {
+				_, _ = pending.markConflictIfGeneration(p, meta.Generation, true)
+			}
 		}
 	}
 
@@ -3759,7 +3765,7 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 			}
 		}
 		if fs.pendingIndex != nil {
-			if _, err := fs.pendingIndex.PutWithBaseRevAndMode(entry.Path, newSize, PendingOverwrite, expectedRevision, mode, hasMode); err != nil {
+			if _, err := fs.pendingIndex.PutLayerCache(entry.Path, newSize, PendingOverwrite, expectedRevision, mode, hasMode); err != nil {
 				safeLogPrintf("layer truncate pending index update failed for %s: %v", entry.Path, err)
 				return gofuse.EIO
 			}
@@ -7183,7 +7189,7 @@ func (fs *Dat9FS) upsertLayerHardlink(ctx context.Context, srcP, dstP string, mo
 		}
 	}
 	if fs.pendingIndex != nil {
-		if _, err := fs.pendingIndex.PutWithBaseRevAndMode(dstP, int64(len(data)), PendingNew, 0, mode, true); err != nil {
+		if _, err := fs.pendingIndex.PutLayerCache(dstP, int64(len(data)), PendingNew, 0, mode, true); err != nil {
 			return nil, err
 		}
 	}
@@ -16454,7 +16460,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		if fs.pendingIndex != nil {
-			if gen, putErr := fs.pendingIndex.PutWithBaseRevAndMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode); putErr != nil {
+			if gen, putErr := fs.pendingIndex.PutLayerCache(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode); putErr != nil {
 				safeLogPrintf("layer flush pending index update failed for %s: %v", fh.Path, putErr)
 			} else {
 				fh.PendingIndexGen = gen
@@ -17097,53 +17103,53 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	return gofuse.OK
 }
 
-// FlushAll flushes all open file handles, drains pending debounced uploads,
-// drains the write-back uploader, and waits for inflight async kernel
-// notifications to complete. Used during graceful shutdown.
-// drainLatePendingEntries rescues staged-but-uncommitted entries left after
-// the primary unmount drains (issue #964). Late FUSE Release arrivals and
-// drain timeouts leave recoverable pending state; commit them synchronously
-// here so a graceful unmount leaves nothing behind locally. Loop a few times:
-// each sync commit may surface follow-up work (mode/lineage follow-ups), and
-// the pending index is the loop condition.
-func (fs *Dat9FS) drainLatePendingEntries() {
-	const (
-		settle   = 100 * time.Millisecond
-		deadline = 120 * time.Second
-	)
-	if fs.pendingIndex == nil || len(fs.pendingIndex.ListPendingPaths()) == 0 {
-		return
+// drainLatePendingEntries rescues staged writes left by late FUSE Release
+// arrivals after the primary queues stop. Clean Layer overlays stay cached.
+func (fs *Dat9FS) drainLatePendingEntries(ctx context.Context) error {
+	if fs.pendingIndex == nil {
+		return nil
 	}
-	start := time.Now()
 	for round := 0; ; round++ {
-		paths := fs.pendingIndex.ListPendingPaths()
+		paths := fs.pendingIndex.ListUncommittedPaths()
 		if len(paths) == 0 {
-			safeLogPrintf("late pending drain: clean after %d rounds (%s)", round, time.Since(start).Round(time.Millisecond))
-			return
+			return nil
 		}
-		if time.Since(start) > deadline {
-			safeLogPrintf("late pending drain: %d entries still pending after %s; leaving them for next-mount recovery", len(paths), deadline)
-			return
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%d uncommitted files preserved for recovery: %w", len(paths), err)
+		}
+		if fs.commitQueue == nil {
+			return fmt.Errorf("%d uncommitted files preserved for recovery: no commit queue", len(paths))
+		}
+		if count, _, path := fs.pendingIndex.ConflictSummary(); count != 0 {
+			return fmt.Errorf("%d conflicted files preserved for recovery (first: %s)", count, path)
 		}
 		safeLogPrintf("late pending drain: round %d, %d entries pending", round, len(paths))
-		var n int
-		if fs.commitQueue != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), deadline-time.Since(start))
-			n = fs.commitQueue.RecoverPendingSync(ctx)
-			cancel()
+		fs.commitQueue.RecoverPendingSync(ctx)
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
 		}
-		_ = n
-		time.Sleep(settle)
 	}
 }
 
+// FlushAll flushes open handles and pending uploads, closes local staging, and
+// reports incomplete shutdown instead of treating a drained queue as success.
 func (fs *Dat9FS) FlushAll() {
+	if err := fs.flushAll(); err != nil {
+		safeLogPrintf("mount shutdown: %v", err)
+	}
+}
+
+func (fs *Dat9FS) flushAll() error {
+	var shutdownErr error
 	if fs.directoryPrefetch != nil {
 		fs.directoryPrefetch.shutdown()
 	}
 	fs.stopExtentRuntimeLoop()
 	if v := fs.extentVFS(); v != nil {
-		_ = v.FlushAll("")
+		shutdownErr = errors.Join(shutdownErr, v.FlushAll(""))
 	}
 	// Drain all pending debounced uploads first.
 	fs.debouncer.FlushAll()
@@ -17170,9 +17176,13 @@ func (fs *Dat9FS) FlushAll() {
 		}
 		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(sz))
 		if e.fh.Layer == PathLayerGitWorkspace {
-			fs.flushGitHandleLocked(ctx, e.fh)
+			if st := fs.flushGitHandleLocked(ctx, e.fh); st != gofuse.OK {
+				shutdownErr = errors.Join(shutdownErr, newDrainStatusError(e.fh.Path, st))
+			}
 		} else {
-			fs.flushHandle(ctx, e.fh)
+			if st := fs.flushHandle(ctx, e.fh); st != gofuse.OK {
+				shutdownErr = errors.Join(shutdownErr, newDrainStatusError(e.fh.Path, st))
+			}
 		}
 		e.fh.Unlock()
 		cf()
@@ -17212,10 +17222,11 @@ func (fs *Dat9FS) FlushAll() {
 	// during or after our sweep). Those late entries stay in the pending
 	// index and would only be rescued by the next mount's RecoverPending.
 	// Loop: give late Releases a moment to land, re-enqueue via recovery,
-	// and re-drain until the pending index is empty or the deadline hits.
-	if fs.pendingIndex != nil && fs.pendingIndex.ListPendingPaths() != nil {
-		fs.drainLatePendingEntries()
-	}
+	// and re-drain until only clean overlay entries remain or the deadline hits.
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 120*time.Second)
+	shutdownErr = errors.Join(shutdownErr, fs.drainLatePendingEntries(drainCtx))
+	cancelDrain()
+	shutdownErr = errors.Join(shutdownErr, drainPendingWorkError(fs.snapshotDrainPending()))
 
 	if fs.diskReadCache != nil {
 		fs.diskReadCache.Close()
@@ -17226,8 +17237,8 @@ func (fs *Dat9FS) FlushAll() {
 		if fs.journalSyncerCancel != nil {
 			fs.journalSyncerCancel()
 		}
-		_ = fs.journal.FsyncShared()
-		_ = fs.journal.Close()
+		shutdownErr = errors.Join(shutdownErr, fs.journal.FsyncShared())
+		shutdownErr = errors.Join(shutdownErr, fs.journal.Close())
 	}
 
 	// Close shadow store.
@@ -17246,6 +17257,7 @@ func (fs *Dat9FS) FlushAll() {
 	if fs.perf != nil {
 		fs.perf.printSummary(os.Stderr)
 	}
+	return shutdownErr
 }
 
 // StatFs reports a generous virtual capacity so that apps (Obsidian, Finder)

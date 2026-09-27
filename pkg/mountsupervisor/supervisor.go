@@ -76,6 +76,7 @@ type supervisor struct {
 
 	mu             sync.Mutex
 	state          mountstate.SupervisorState
+	stopErr        error // retained across idempotent stopWorker/shutdownClean calls
 	stopRequested  bool
 	workerCmd      *exec.Cmd
 	workerWait     chan exitResult
@@ -451,6 +452,12 @@ func (s *supervisor) superviseRunning(sigCh <-chan os.Signal) (error, bool) {
 			s.stopWorker()
 			return nil, true
 		case res := <-s.workerWait:
+			if s.isStopRequested() || mountstate.StopTokenPresent(s.cfg.MountPoint) {
+				s.mu.Lock()
+				pid, creation := s.state.WorkerPID, s.state.WorkerCreation
+				s.mu.Unlock()
+				s.recordStopFailure(pid, creation, res)
+			}
 			s.clearWorker()
 			// Stable reset if long uptime.
 			if s.cfg.Now().Sub(started) >= s.cfg.StableReset {
@@ -567,6 +574,7 @@ func (s *supervisor) stopAdoptedWorker() {
 		}
 		s.cfg.Sleep(100 * time.Millisecond)
 	}
+	s.recordStopFailure(pid, creation, exitResult{code: drive9fuse.ExitForceQuit, err: fmt.Errorf("adopted worker shutdown exceeded %s; forced termination", s.cfg.StopTimeout)})
 	_ = proc.Kill()
 }
 
@@ -763,6 +771,29 @@ func (s *supervisor) writeAuthoritativeProcessState() error {
 	return err
 }
 
+// recordStopFailure preserves shutdown failures after the worker and supervisor
+// state files disappear. The unmount caller can match this record to its worker.
+func (s *supervisor) recordStopFailure(pid int, creation uint64, res exitResult) {
+	if res.err == nil && res.code == 0 {
+		return
+	}
+	code := res.code
+	if code <= 0 {
+		code = drive9fuse.ExitForceQuit
+	}
+	err := fmt.Errorf("mount worker pid %d failed during shutdown (exit %d): %v", pid, code, res.err)
+	s.mu.Lock()
+	s.stopErr = errors.Join(s.stopErr, err)
+	s.mu.Unlock()
+	// Preserve the worker's more specific diagnosis when available.
+	if rec, _, readErr := mountstate.ReadExitReason(s.cfg.MountPoint); readErr == nil && rec.PID == pid && rec.Code != 0 && rec.CreationTime == creation && creation != 0 {
+		return
+	}
+	_ = mountstate.WriteExitReason(s.cfg.MountPoint, mountstate.ExitReason{
+		PID: pid, CreationTime: creation, Code: code, Reason: "shutdown_failed", Detail: err.Error(), At: s.cfg.Now(),
+	})
+}
+
 func (s *supervisor) stopWorker() {
 	s.mu.Lock()
 	cmd := s.workerCmd
@@ -794,9 +825,11 @@ func (s *supervisor) stopWorker() {
 		return
 	}
 	select {
-	case <-waitCh:
+	case res := <-waitCh:
+		s.recordStopFailure(pid, creation, res)
 		return
 	case <-time.After(s.cfg.StopTimeout):
+		s.recordStopFailure(pid, creation, exitResult{code: drive9fuse.ExitForceQuit, err: fmt.Errorf("worker shutdown exceeded %s; forced termination", s.cfg.StopTimeout)})
 		_ = cmd.Process.Kill()
 		select {
 		case <-waitCh:
@@ -861,7 +894,9 @@ func (s *supervisor) shutdownClean() error {
 	// Remove pid file we own.
 	_ = os.Remove(mountstate.PIDFilePath(s.cfg.MountPoint))
 	s.alert("mount_stopped", "intentional stop")
-	return nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopErr
 }
 
 func (s *supervisor) requestStop(reason string) {

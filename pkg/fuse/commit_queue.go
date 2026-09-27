@@ -693,9 +693,9 @@ func (cq *CommitQueue) RecoverPending() {
 	if cq.shadows != nil {
 		cq.shadows.RecoverPendingBytes()
 	}
-	for path := range cq.index.ListPendingPaths() {
+	for path := range cq.index.ListUncommittedPaths() {
 		meta, ok := cq.index.GetMeta(path)
-		if !ok {
+		if !ok || meta.LayerClean {
 			continue
 		}
 		if cq.shadows != nil && !cq.shadows.Has(path) {
@@ -710,7 +710,7 @@ func (cq *CommitQueue) RecoverPending() {
 			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
 			continue
 		}
-		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
+		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 && cq.layerRefSnapshot() == "" {
 			safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
 			continue
 		}
@@ -2053,9 +2053,12 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 		return 0
 	}
 	committed := 0
-	for path := range cq.index.ListPendingPaths() {
+	for path := range cq.index.ListUncommittedPaths() {
+		if ctx.Err() != nil {
+			break
+		}
 		meta, ok := cq.index.GetMeta(path)
-		if !ok {
+		if !ok || meta.LayerClean {
 			continue
 		}
 		if cq.shadows != nil && !cq.shadows.Has(path) {
@@ -2067,7 +2070,7 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 		if meta.Kind == PendingConflict {
 			continue
 		}
-		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
+		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 && cq.layerRefSnapshot() == "" {
 			continue
 		}
 		size := meta.Size
@@ -2511,7 +2514,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 
 	// Write durable commit record BEFORE cleaning up local state so that
 	// crash recovery never re-uploads an already committed entry.
-	if cq.journal != nil {
+	if cq.journal != nil && layerRef == "" {
 		if err := cq.journal.Append(JournalEntry{
 			Op:   JournalCommit,
 			Path: entry.Path,
@@ -2543,7 +2546,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		}
 	}
 	if cq.index != nil && cq.layerRefSnapshot() != "" {
-		if err := cq.index.MarkCommitted(entry.Path, committedRev); err != nil {
+		if err := cq.index.MarkLayerCommittedIfGeneration(entry.Path, entry.PendingIndexGen, committedRev, entry.Mode, entry.HasMode); err != nil {
 			return err
 		}
 	}

@@ -195,11 +195,17 @@ func (idx *PendingIndex) PutWithBaseRevAndMode(remotePath string, size int64, ki
 	return idx.PutWithBaseRevAndModeAndLineage(remotePath, size, kind, baseRev, mode, hasMode, "", "", false)
 }
 
+// PutLayerCache publishes content already persisted in a Layer. It remains
+// visible through the overlay index, but does not require another upload.
+func (idx *PendingIndex) PutLayerCache(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
+	return idx.putInternal(remotePath, size, kind, baseRev, false, mode, hasMode, "", "", false, nil, true)
+}
+
 // PutWithBaseRevAndModeAndLineage attaches process-local causal identity to
 // the durable metadata. The IDs are intentionally excluded from JSON; empty
 // lineage is accepted but can never authorize a growth rebase.
 func (idx *PendingIndex) PutWithBaseRevAndModeAndLineage(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, error) {
-	return idx.putInternal(remotePath, size, kind, baseRev, false, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, liveAncestors)
+	return idx.putInternal(remotePath, size, kind, baseRev, false, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, liveAncestors, false)
 }
 
 // PutShadowSpill is like PutWithBaseRev but marks the entry as ShadowSpill
@@ -218,10 +224,10 @@ func (idx *PendingIndex) PutShadowSpillWithMode(remotePath string, size int64, k
 // PutShadowSpillWithModeAndLineage is the spill equivalent of
 // PutWithBaseRevAndModeAndLineage.
 func (idx *PendingIndex) PutShadowSpillWithModeAndLineage(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, error) {
-	return idx.putInternal(remotePath, size, kind, baseRev, true, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, liveAncestors)
+	return idx.putInternal(remotePath, size, kind, baseRev, true, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, liveAncestors, false)
 }
 
-func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors []string) (uint64, error) {
+func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors []string, layerClean bool) (uint64, error) {
 	// Hold the per-path lock across the disk write AND the in-memory publish
 	// so a generation-checked removal of a stale entry cannot delete this
 	// fresh .meta after already passing its in-memory check.
@@ -236,6 +242,7 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 		CreatedAt:        time.Now(),
 		Generation:       gen,
 		Kind:             kind,
+		LayerClean:       layerClean,
 		BaseRev:          baseRev,
 		ShadowSpill:      shadowSpill,
 		Mode:             mode & posixPermissionModeMask,
@@ -523,6 +530,20 @@ func (idx *PendingIndex) ListPendingPaths() map[string]struct{} {
 	return result
 }
 
+// ListUncommittedPaths excludes clean Layer overlays without hiding conflicts
+// or legacy records whose durability is unknown.
+func (idx *PendingIndex) ListUncommittedPaths() map[string]struct{} {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	paths := make(map[string]struct{})
+	for path, meta := range idx.items {
+		if !meta.LayerClean || meta.Kind == PendingConflict {
+			paths[path] = struct{}{}
+		}
+	}
+	return paths
+}
+
 // ConflictSummary reports pending entries preserved for manual recovery after
 // terminal commit failure.
 func (idx *PendingIndex) ConflictSummary() (count int, bytes int64, firstPath string) {
@@ -585,24 +606,35 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 	updated := cloneWriteBackMeta(meta)
 	updated.Mode = mode & posixPermissionModeMask
 	updated.HasMode = true
+	updated.LayerClean = false
 	updated.Generation = idx.nextGen.Add(1)
+	updated.Mtime = time.Now()
 
 	metaBytes, err := json.Marshal(&updated)
 	if err != nil {
 		return fmt.Errorf("pending index marshal mode: %w", err)
 	}
-	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
-	if err := atomicWrite(metaPath, metaBytes); err != nil {
-		return fmt.Errorf("pending index update mode: %w", err)
+	if idx.journal != nil {
+		if err := idx.journal.Append(JournalEntry{Op: JournalPendingMeta, Path: remotePath, Meta: metaBytes}); err != nil {
+			return fmt.Errorf("pending index journal mode: %w", err)
+		}
+		if err := idx.journal.FsyncShared(); err != nil {
+			return fmt.Errorf("pending index sync mode: %w", err)
+		}
+	} else {
+		metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
+		if err := atomicWrite(metaPath, metaBytes); err != nil {
+			return fmt.Errorf("pending index update mode: %w", err)
+		}
 	}
 	cp := updated
 	idx.items[remotePath] = &cp
 	return nil
 }
 
-// MarkCommitted keeps the pending entry as a local overlay data source but no
-// longer treats it as never-persisted new data.
-func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) error {
+// MarkLayerCommittedIfGeneration marks only the uploaded publication as a
+// durable overlay. An older completion cannot acknowledge a newer local edit.
+func (idx *PendingIndex) MarkLayerCommittedIfGeneration(remotePath string, generation uint64, committedRev int64, mode uint32, hasMode bool) error {
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
 
@@ -610,24 +642,39 @@ func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) er
 	defer idx.mu.Unlock()
 
 	meta, ok := idx.items[remotePath]
-	if !ok {
+	if !ok || generation == 0 || meta.Generation != generation {
 		return nil
 	}
 	updated := cloneWriteBackMeta(meta)
 	updated.Kind = PendingOverwrite
+	updated.LayerClean = true
+	if hasMode {
+		updated.Mode = mode & posixPermissionModeMask
+		updated.HasMode = true
+	}
 	if committedRev > 0 {
 		updated.BaseRev = committedRev
 	}
-	updated.Generation = idx.nextGen.Add(1)
 	updated.Mtime = time.Now()
 
 	metaBytes, err := json.Marshal(&updated)
 	if err != nil {
 		return fmt.Errorf("pending index marshal committed: %w", err)
 	}
-	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
-	if err := atomicWrite(metaPath, metaBytes); err != nil {
-		return fmt.Errorf("pending index mark committed: %w", err)
+	if idx.journal != nil {
+		// Publish under the same path lock as Put. A path-only commit marker
+		// could otherwise hide a newer WAL publication after a crash.
+		if err := idx.journal.Append(JournalEntry{Op: JournalPendingMeta, Path: remotePath, Meta: metaBytes}); err != nil {
+			return fmt.Errorf("pending index mark layer committed: %w", err)
+		}
+		if err := idx.journal.FsyncShared(); err != nil {
+			return fmt.Errorf("pending index sync layer commit: %w", err)
+		}
+	} else {
+		metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
+		if err := atomicWrite(metaPath, metaBytes); err != nil {
+			return fmt.Errorf("pending index mark layer committed: %w", err)
+		}
 	}
 	cp := updated
 	idx.items[remotePath] = &cp
@@ -677,7 +724,11 @@ func (idx *PendingIndex) MarkConflict(remotePath string) error {
 // same-path Put has already replaced the entry, so a stale commit failure does
 // not poison fresher pending data.
 func (idx *PendingIndex) MarkConflictIfGeneration(remotePath string, expectedGen uint64) (bool, error) {
-	if expectedGen == 0 {
+	return idx.markConflictIfGeneration(remotePath, expectedGen, false)
+}
+
+func (idx *PendingIndex) markConflictIfGeneration(remotePath string, expectedGen uint64, skipClean bool) (bool, error) {
+	if expectedGen == 0 && !skipClean {
 		return true, idx.MarkConflict(remotePath)
 	}
 	pl := idx.acquirePathLock(remotePath)
@@ -689,7 +740,7 @@ func (idx *PendingIndex) MarkConflictIfGeneration(remotePath string, expectedGen
 		idx.mu.RUnlock()
 		return true, nil
 	}
-	if meta.Generation != expectedGen {
+	if (expectedGen != 0 && meta.Generation != expectedGen) || (skipClean && meta.LayerClean) {
 		idx.mu.RUnlock()
 		return false, nil
 	}
@@ -707,7 +758,7 @@ func (idx *PendingIndex) MarkConflictIfGeneration(remotePath string, expectedGen
 	}
 
 	idx.mu.Lock()
-	if m, exists := idx.items[remotePath]; exists && m.Generation == expectedGen {
+	if m, exists := idx.items[remotePath]; exists && (expectedGen == 0 || m.Generation == expectedGen) {
 		m.Kind = PendingConflict
 		idx.mu.Unlock()
 		return true, nil

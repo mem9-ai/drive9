@@ -596,7 +596,6 @@ func Mount(opts *MountOptions) (err error) {
 				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {
 					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
 				}
-				cq.RecoverPending()
 				if opts.LayerRef != "" {
 					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
 						closeFailedMountStaging(dat9fs)
@@ -604,6 +603,7 @@ func Mount(opts *MountOptions) (err error) {
 					}
 					layerEventWatcherStop = StartLayerEventWatcher(dat9fs, c, opts, shadowStore, pendingIdx)
 				}
+				cq.RecoverPending()
 			}
 			if gvisorWriteBackRequiresCommitQueue(opts, wbCache, dat9fs.commitQueue) {
 				closeFailedMountStaging(dat9fs)
@@ -807,7 +807,8 @@ func Mount(opts *MountOptions) (err error) {
 		}()
 	}
 
-	shutdown := newMountShutdown(stopWatchers, dat9fs.FlushAll)
+	var shutdownErr error
+	shutdown := newMountShutdown(stopWatchers, func() { shutdownErr = dat9fs.flushAll() })
 	var unmountRequested atomic.Bool
 	mountStartedAt := time.Now()
 
@@ -968,6 +969,14 @@ func Mount(opts *MountOptions) (err error) {
 		PendingFiles: pendingFiles,
 		PendingBytes: pendingBytes,
 		At:           time.Now().UTC(),
+	}
+
+	if shutdownErr != nil {
+		exitRec.Reason = "drain_failed"
+		exitRec.Detail = shutdownErr.Error()
+		exitRec.Code = ExitForceQuit
+		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
+		return newMountExit(ExitForceQuit, MountExitReason("drain_failed"), "shutdown incomplete; local recovery state preserved", shutdownErr)
 	}
 
 	switch reason {
@@ -1381,119 +1390,136 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 	}
 	restoredUpserts := make(map[string]struct{})
 	for _, entry := range entries {
-		localPath, ok := mountpath.ToLocal(opts.RemoteRoot, entry.Path)
-		if !ok {
-			continue
-		}
-		switch entry.Op {
-		case "whiteout":
-			if fs != nil {
-				fs.markLayerWhiteout(localPath)
+		err := func() error {
+			localPath, ok := mountpath.ToLocal(opts.RemoteRoot, entry.Path)
+			if !ok {
+				return nil
 			}
-			continue
-		case "mkdir":
 			if fs != nil {
-				fs.markLayerDir(localPath, entry.Mode)
+				unlock := fs.lockRemoteCommitPath(localPath)
+				defer unlock()
 			}
-			continue
-		case "chmod":
-			if pending != nil {
-				if err := pending.UpdateMode(localPath, entry.Mode); err != nil {
-					return fmt.Errorf("restore fs layer chmod pending %s: %w", localPath, err)
+			// Recovery must upload local dirty content before it can be replaced by
+			// a server replay. Clean overlays can be refreshed normally.
+			if meta, exists := pending.GetMeta(localPath); exists && !meta.LayerClean && !opts.ReadOnly {
+				return nil
+			}
+			switch entry.Op {
+			case "whiteout":
+				if fs != nil {
+					fs.markLayerWhiteout(localPath)
 				}
-			}
-			if fs != nil {
-				switch entry.Kind {
-				case "file":
-					fs.markLayerFileMode(localPath, entry.Mode)
-				case "dir":
+				return nil
+			case "mkdir":
+				if fs != nil {
 					fs.markLayerDir(localPath, entry.Mode)
-				case "symlink":
-					if target, existingMode, ok := fs.layerSymlink(localPath); ok {
-						nextMode := (existingMode &^ uint32(0o777)) | (entry.Mode & 0o777)
-						if nextMode&uint32(syscall.S_IFMT) == 0 {
-							nextMode |= uint32(syscall.S_IFLNK)
+				}
+				return nil
+			case "chmod":
+				if pending != nil {
+					if meta, ok := pending.GetMeta(localPath); ok {
+						if err := pending.MarkLayerCommittedIfGeneration(localPath, meta.Generation, meta.BaseRev, entry.Mode, true); err != nil {
+							return fmt.Errorf("restore fs layer chmod pending %s: %w", localPath, err)
 						}
-						fs.markLayerSymlink(localPath, target, nextMode)
 					}
 				}
-			}
-			continue
-		case "rename":
-			if err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)); err != nil {
-				return err
-			}
-			continue
-		case "symlink":
-			fullEntry := &entry
-			if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
-				fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq))
-				if err != nil {
-					return fmt.Errorf("restore fs layer symlink entry %s: %w", entry.Path, err)
+				if fs != nil {
+					switch entry.Kind {
+					case "file":
+						fs.markLayerFileMode(localPath, entry.Mode)
+					case "dir":
+						fs.markLayerDir(localPath, entry.Mode)
+					case "symlink":
+						if target, existingMode, ok := fs.layerSymlink(localPath); ok {
+							nextMode := (existingMode &^ uint32(0o777)) | (entry.Mode & 0o777)
+							if nextMode&uint32(syscall.S_IFMT) == 0 {
+								nextMode |= uint32(syscall.S_IFLNK)
+							}
+							fs.markLayerSymlink(localPath, target, nextMode)
+						}
+					}
 				}
-				fullEntry = fetched
+				return nil
+			case "rename":
+				if err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)); err != nil {
+					return err
+				}
+				return nil
+			case "symlink":
+				fullEntry := &entry
+				if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
+					fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq))
+					if err != nil {
+						return fmt.Errorf("restore fs layer symlink entry %s: %w", entry.Path, err)
+					}
+					fullEntry = fetched
+				}
+				target := strings.TrimSpace(fullEntry.ContentText)
+				if target == "" && len(fullEntry.Content) > 0 {
+					target = string(fullEntry.Content)
+				}
+				if target == "" {
+					return fmt.Errorf("restore fs layer symlink entry %s: missing target", entry.Path)
+				}
+				if fs != nil {
+					fs.markLayerSymlink(localPath, target, entry.Mode)
+				}
+				return nil
 			}
-			target := strings.TrimSpace(fullEntry.ContentText)
-			if target == "" && len(fullEntry.Content) > 0 {
-				target = string(fullEntry.Content)
+			if entry.Op != "upsert" || entry.Kind != "file" {
+				return nil
 			}
-			if target == "" {
-				return fmt.Errorf("restore fs layer symlink entry %s: missing target", entry.Path)
+			if _, ok := pending.GetMeta(localPath); ok {
+				if _, restored := restoredUpserts[localPath]; !restored {
+					return nil
+				}
+			}
+			entryMaxSeq := layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)
+			fullEntry, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, entryMaxSeq)
+			if err != nil {
+				return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
+			}
+			var sizeBytes int64
+			if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
+				rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, entryMaxSeq)
+				if err != nil {
+					return fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
+				}
+				n, writeErr := shadows.WriteStream(localPath, rc, fullEntry.BaseRevision)
+				closeErr := rc.Close()
+				if writeErr != nil {
+					return fmt.Errorf("restore fs layer shadow %s: %w", localPath, writeErr)
+				}
+				if closeErr != nil {
+					return fmt.Errorf("restore fs layer object %s: %w", entry.Path, closeErr)
+				}
+				sizeBytes = n
+			} else {
+				content := fullEntry.Content
+				if err := shadows.WriteFull(localPath, content, fullEntry.BaseRevision); err != nil {
+					return fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
+				}
+				sizeBytes = int64(len(content))
+			}
+			if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
+				return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
+			}
+			if _, err := pending.PutLayerCache(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+				return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
 			}
 			if fs != nil {
-				fs.markLayerSymlink(localPath, target, entry.Mode)
+				if fullEntry.Mode != 0 {
+					fs.markLayerFileMode(localPath, fullEntry.Mode)
+				} else {
+					fs.markLayerFile(localPath)
+				}
 			}
-			continue
-		}
-		if entry.Op != "upsert" || entry.Kind != "file" {
-			continue
-		}
-		if _, ok := pending.GetMeta(localPath); ok {
-			if _, restored := restoredUpserts[localPath]; !restored {
-				continue
-			}
-		}
-		entryMaxSeq := layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)
-		fullEntry, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, entryMaxSeq)
+			restoredUpserts[localPath] = struct{}{}
+			return nil
+		}()
 		if err != nil {
-			return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
+			return err
 		}
-		var sizeBytes int64
-		if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
-			rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, entryMaxSeq)
-			if err != nil {
-				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
-			}
-			n, writeErr := shadows.WriteStream(localPath, rc, fullEntry.BaseRevision)
-			closeErr := rc.Close()
-			if writeErr != nil {
-				return fmt.Errorf("restore fs layer shadow %s: %w", localPath, writeErr)
-			}
-			if closeErr != nil {
-				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, closeErr)
-			}
-			sizeBytes = n
-		} else {
-			content := fullEntry.Content
-			if err := shadows.WriteFull(localPath, content, fullEntry.BaseRevision); err != nil {
-				return fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
-			}
-			sizeBytes = int64(len(content))
-		}
-		if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
-			return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
-		}
-		if _, err := pending.PutWithBaseRevAndMode(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
-			return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
-		}
-		if fs != nil {
-			if fullEntry.Mode != 0 {
-				fs.markLayerFileMode(localPath, fullEntry.Mode)
-			} else {
-				fs.markLayerFile(localPath)
-			}
-		}
-		restoredUpserts[localPath] = struct{}{}
 	}
 	return nil
 }
@@ -1573,7 +1599,7 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 	if err := shadows.WriteFull(newLocalPath, data, 0); err != nil {
 		return fmt.Errorf("restore fs layer renamed shadow %s: %w", newLocalPath, err)
 	}
-	if _, err := pending.PutWithBaseRevAndMode(newLocalPath, int64(len(data)), PendingOverwrite, 0, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+	if _, err := pending.PutLayerCache(newLocalPath, int64(len(data)), PendingOverwrite, 0, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
 		return fmt.Errorf("restore fs layer renamed pending %s: %w", newLocalPath, err)
 	}
 	return nil

@@ -1543,12 +1543,12 @@ func TestCommitQueueLayerModeRetainsShadowAndPendingAfterUpload(t *testing.T) {
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	cq.SetLayerRef("layer-1")
-	if err := cq.Enqueue(&CommitEntry{
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:    "/layered.bin",
 		BaseRev: 0,
 		Size:    int64(len(data)),
 		Kind:    PendingNew,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
@@ -1563,7 +1563,7 @@ func TestCommitQueueLayerModeRetainsShadowAndPendingAfterUpload(t *testing.T) {
 		t.Fatal("layer pending metadata should be retained after upload")
 	}
 	meta, ok := pending.GetMeta("/layered.bin")
-	if !ok || meta.Kind != PendingOverwrite {
+	if !ok || meta.Kind != PendingOverwrite || !meta.LayerClean {
 		t.Fatalf("layer pending metadata after upload = %+v, want PendingOverwrite", meta)
 	}
 	data2 := []byte("layer data v2")
@@ -1575,12 +1575,12 @@ func TestCommitQueueLayerModeRetainsShadowAndPendingAfterUpload(t *testing.T) {
 	}
 	cq2 := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
 	cq2.SetLayerRef("layer-1")
-	if err := cq2.Enqueue(&CommitEntry{
+	if err := cq2.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
 		Path:    "/layered.bin",
 		BaseRev: 0,
 		Size:    int64(len(data2)),
 		Kind:    PendingOverwrite,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cq2.DrainAll()

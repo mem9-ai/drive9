@@ -70,6 +70,9 @@ type WriteBackMeta struct {
 	HasMode          bool        `json:"has_mode,omitempty"`
 	SnapshotID       string      `json:"-"`
 	ParentSnapshotID string      `json:"-"`
+	// LayerClean retains a remotely durable overlay for reads, not recovery.
+	// Every new staging publication resets it; legacy records remain dirty.
+	LayerClean bool `json:"layer_clean,omitempty"`
 	// lineageTrusted is deliberately process-local and never serialized.
 	// Recovering a mutable path-keyed payload cannot prove that the bytes and
 	// JSON metadata were replaced atomically across a crash.

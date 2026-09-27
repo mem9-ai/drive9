@@ -1894,6 +1894,7 @@ type umountDeps struct {
 	remove           func(string) error
 	pidAlive         func(int) bool
 	packAfterUnmount func(context.Context, mountstate.ProcessState, []string, []string) error
+	readExitReason   func(string) (mountstate.ExitReason, string, error)
 	now              func() time.Time
 	sleep            func(time.Duration)
 	printErrf        func(string, ...any)
@@ -1924,6 +1925,7 @@ func defaultUmountDeps() umountDeps {
 		remove:           os.Remove,
 		pidAlive:         processAlive,
 		packAfterUnmount: defaultPackAfterUnmount,
+		readExitReason:   mountstate.ReadExitReason,
 		now:              time.Now,
 		sleep:            time.Sleep,
 		printErrf:        func(format string, args ...any) { fmt.Fprintf(os.Stderr, format, args...) },
@@ -1991,6 +1993,9 @@ func runUmount(args []string, deps umountDeps) error {
 	// Verify process identity (PID + creation time) before signaling so a reused
 	// PID from stale state cannot kill an unrelated process.
 	stoppedSupervisor := false
+	var stopErr error
+	workerPID := 0
+	var workerCreation uint64
 	var umountReceipt time.Time
 	umountGenPID := 0
 	var umountGenCreation uint64
@@ -2002,8 +2007,6 @@ func runUmount(args []string, deps umountDeps) error {
 		}
 		stopPID := 0
 		var stopCreation uint64
-		workerPID := 0
-		var workerCreation uint64
 		if deps.readProcessState != nil {
 			if st, _, rerr := deps.readProcessState(stateMountPoint); rerr == nil {
 				if st.SupervisorPID > 0 {
@@ -2039,8 +2042,8 @@ func runUmount(args []string, deps umountDeps) error {
 		if stopPID > 0 {
 			if processMatchesIdentity(stopPID, stopCreation) {
 				stoppedSupervisor = true
-				if terr := terminateProcessGraceful(stopPID, *waitTimeout); terr != nil && deps.printErrf != nil {
-					deps.printErrf("drive9 umount: stop supervisor pid %d: %v\n", stopPID, terr)
+				if terr := terminateProcessGraceful(stopPID, *waitTimeout); terr != nil {
+					stopErr = errors.Join(stopErr, fmt.Errorf("stop supervisor pid %d: %w", stopPID, terr))
 				}
 			} else if deps.printErrf != nil {
 				deps.printErrf("drive9 umount: skip stop for stale supervisor pid %d (identity mismatch)\n", stopPID)
@@ -2050,8 +2053,8 @@ func runUmount(args []string, deps umountDeps) error {
 		// stuck FUSE endpoint can be force-unmounted below.
 		if workerPID > 0 && processMatchesIdentity(workerPID, workerCreation) {
 			stoppedSupervisor = true // enable force-clean forgiveness path
-			if terr := terminateProcessGraceful(workerPID, *waitTimeout); terr != nil && deps.printErrf != nil {
-				deps.printErrf("drive9 umount: stop worker pid %d: %v\n", workerPID, terr)
+			if terr := terminateProcessGraceful(workerPID, *waitTimeout); terr != nil {
+				stopErr = errors.Join(stopErr, fmt.Errorf("stop worker pid %d: %w", workerPID, terr))
 			}
 		}
 	}
@@ -2112,8 +2115,8 @@ func runUmount(args []string, deps umountDeps) error {
 		})
 		if !owned {
 			// Successor already owns the mountpoint. Do not re-read pidfile,
-			// wait on B, pack B's overlay, or fusermount B.
-			return nil
+			// wait on B, pack B's overlay, or fusermount B. Preserve A's error.
+			return stopErr
 		}
 	} else if stoppedSupervisor && !mountPointStillActive(mountPoint) {
 		runErr = nil
@@ -2201,6 +2204,15 @@ func runUmount(args []string, deps umountDeps) error {
 		return runErr
 	}
 
+	runErr = errors.Join(runErr, stopErr)
+	if *waitTimeout > 0 && workerPID > 0 && deps.readExitReason != nil {
+		rec, _, readErr := deps.readExitReason(stateMountPoint)
+		if readErr == nil {
+			runErr = errors.Join(runErr, unmountWorkerExitError(rec, workerPID, workerCreation, umountReceipt))
+		} else if !errors.Is(readErr, os.ErrNotExist) {
+			runErr = errors.Join(runErr, fmt.Errorf("read mount exit status: %w", readErr))
+		}
+	}
 	state, path, stateOK, err := readUnmountProcessState(deps, stateMountPoint)
 	if err != nil {
 		if runErr != nil {
@@ -2261,6 +2273,20 @@ func runUmount(args []string, deps umountDeps) error {
 		return fmt.Errorf("%w (pid file: %s)", err, path)
 	}
 	return runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths)
+}
+
+// Ignore stale records and records belonging to a successor at this path.
+func unmountWorkerExitError(rec mountstate.ExitReason, pid int, creation uint64, requestedAt time.Time) error {
+	if rec.PID != pid || pid <= 0 || requestedAt.IsZero() || rec.At.Before(requestedAt) {
+		return nil
+	}
+	if rec.CreationTime != 0 && creation != 0 && rec.CreationTime != creation {
+		return nil
+	}
+	if rec.Code == 0 {
+		return nil
+	}
+	return fmt.Errorf("drive9 umount: worker pid %d exited with code %d (%s): %s; check mount logs and preserved recovery state", pid, rec.Code, rec.Reason, rec.Detail)
 }
 
 func readUnmountProcessState(deps umountDeps, mountPoint string) (mountstate.ProcessState, string, bool, error) {
@@ -2552,7 +2578,10 @@ func terminateProcess(pid int, waitTimeout time.Duration) error {
 	return terminateProcessWithSignal(pid, waitTimeout, true)
 }
 
+var errMountForcedStop = errors.New("graceful mount shutdown failed; forced termination")
+
 // terminateProcessGraceful sends SIGTERM first, then SIGKILL after waitTimeout.
+// A successful kill is cleanup, not a successful graceful shutdown.
 func terminateProcessGraceful(pid int, waitTimeout time.Duration) error {
 	return terminateProcessWithSignal(pid, waitTimeout, false)
 }
@@ -2565,6 +2594,7 @@ func terminateProcessWithSignal(pid int, waitTimeout time.Duration, killOnly boo
 	if err != nil {
 		return err
 	}
+	forced := false
 	if killOnly {
 		err = process.Kill()
 	} else {
@@ -2573,7 +2603,8 @@ func terminateProcessWithSignal(pid int, waitTimeout time.Duration, killOnly boo
 			if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
 				return nil
 			}
-			// Fall back to kill if SIGTERM fails.
+			// Fall back to kill if SIGTERM fails, retaining the failure.
+			forced = true
 			err = process.Kill()
 		}
 	}
@@ -2588,9 +2619,19 @@ func terminateProcessWithSignal(pid int, waitTimeout time.Duration, killOnly boo
 		if waitErr := waitForProcessExit(pid, waitTimeout); waitErr != nil {
 			// Escalate to SIGKILL after grace.
 			_ = process.Kill()
-			return waitForProcessExit(pid, 5*time.Second)
+			killErr := waitForProcessExit(pid, 5*time.Second)
+			if !killOnly {
+				return errors.Join(fmt.Errorf("%w: pid %d did not exit within %s: %v", errMountForcedStop, pid, waitTimeout, waitErr), killErr)
+			}
+			return killErr
+		}
+		if forced {
+			return errMountForcedStop
 		}
 		return nil
+	}
+	if forced {
+		return errMountForcedStop
 	}
 	return err
 }

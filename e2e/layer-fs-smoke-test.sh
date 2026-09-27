@@ -18,12 +18,13 @@ CLI_HOME="${DRIVE9_E2E_CLI_HOME:-$(mktemp -d)}"
 RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-0}"
 LAYER_FUSE_STRICT_PREREQS="${LAYER_FUSE_STRICT_PREREQS:-$RUN_LAYER_FUSE_SMOKE}"
 FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
-FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
+FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-15s}"
+LAYER_CLEAN_UMOUNT_MAX_S="${LAYER_CLEAN_UMOUNT_MAX_S:-10}"
 MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
 MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
 LAYER_DIFF_TIMEOUT_S="${LAYER_DIFF_TIMEOUT_S:-20}"
 LAYER_DIFF_INTERVAL_S="${LAYER_DIFF_INTERVAL_S:-1}"
-LAYER_FUSE_LOG_AUDIT_PATTERN="${LAYER_FUSE_LOG_AUDIT_PATTERN:-panic|fatal error|Resource temporarily unavailable|restore fs layer entries failed}"
+LAYER_FUSE_LOG_AUDIT_PATTERN="${LAYER_FUSE_LOG_AUDIT_PATTERN:-panic|fatal error|Resource temporarily unavailable|restore fs layer entries failed|force-quit|event=exit code=[1-9]|shutdown incomplete}"
 LAYER_CLI_LARGE_FILE_MB="${LAYER_CLI_LARGE_FILE_MB:-100}"
 
 PASS=0
@@ -461,19 +462,34 @@ expect_layer_mount_fail() {
 }
 
 unmount_layer_mount() {
-  if [ -z "${MOUNT_POINT:-}" ]; then
-    return 0
-  fi
-  if is_mounted_path "$MOUNT_POINT"; then
-    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT"
-  fi
-  wait_mount_state unmounted
-  if [ -n "${MOUNT_PID:-}" ]; then
-    set +e
-    wait "$MOUNT_PID" >/dev/null 2>&1
-    MOUNT_PID=""
-    set -e
-  fi
+	local cli_status=0 worker_status=0 started=$SECONDS deadline
+	if [[ -z "${MOUNT_POINT:-}" ]]; then
+		return 0
+	fi
+	if is_mounted_path "$MOUNT_POINT"; then
+		drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT" || cli_status=$?
+	fi
+	wait_mount_state unmounted || return 1
+	if [[ -n "${MOUNT_PID:-}" ]]; then
+		deadline=$((SECONDS + LAYER_CLEAN_UMOUNT_MAX_S))
+		while kill -0 "$MOUNT_PID" 2>/dev/null; do
+			if ((SECONDS >= deadline)); then
+				echo "layer worker did not exit after unmount" >&2
+				return 1
+			fi
+			sleep 0.1
+		done
+		wait "$MOUNT_PID" || worker_status=$?
+		MOUNT_PID=""
+	fi
+	if ((cli_status != 0 || worker_status != 0)); then
+		echo "layer unmount failed: cli=$cli_status worker=$worker_status" >&2
+		return 1
+	fi
+	if ((SECONDS - started >= LAYER_CLEAN_UMOUNT_MAX_S)); then
+		echo "clean layer unmount exceeded ${LAYER_CLEAN_UMOUNT_MAX_S}s" >&2
+		return 1
+	fi
 }
 
 audit_mount_log() {
@@ -1246,6 +1262,13 @@ if require_layer_fuse_prereqs; then
     "${fuse_root}/moved.txt" "upsert" \
     "${fuse_root}/link" "symlink" \
     "${fuse_root}/after.txt" "upsert")" "9"
+  check_cmd "fsync layer write before unmount" python3 - "$mount_a/new.txt" <<'PY_FSYNC'
+import os
+import sys
+with open(sys.argv[1], "r+b") as f:
+    os.fsync(f.fileno())
+PY_FSYNC
+  check_cmd "drain layer before unmount" drive9 mount drain --timeout 10s "$mount_a"
   check_cmd "unmount first layer mount" unmount_layer_mount
   check_cmd "first layer mount log clean" audit_mount_log "$log_a"
 
@@ -1273,6 +1296,10 @@ if require_layer_fuse_prereqs; then
   mount_c="${FUSE_MOUNT_ROOT%/}/drive9-layer-c-${ts}"
   local_c="/tmp/drive9-layer-local-c-${ts}"
   log_c="/tmp/drive9-layer-c-${ts}.log"
+  start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" "$mount_c" "$local_c" "$log_c"
+  # Restoring a nonempty layer creates clean overlay metadata before any read.
+  check_cmd "unmount nonempty restored layer without file IO" unmount_layer_mount
+  check_cmd "no-IO restore mount log clean" audit_mount_log "$log_c"
   start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" "$mount_c" "$local_c" "$log_c"
   check_eq "fresh restore includes post-checkpoint write" "$(cat "$mount_c/after.txt")" "fuse after checkpoint ${ts}"
   check_cmd "unmount full restore mount" unmount_layer_mount
