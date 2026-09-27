@@ -95,3 +95,13 @@ jobs:
             --no-progress
           echo "Uploaded ${{ env.VERSION }} to s3://drive9-releases/latest/"
           aws s3 ls s3://drive9-releases/latest/
+
+      - name: Invalidate CloudFront cache
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/latest/*" \
+            --query 'Invalidation.Id' --output text)
+          echo "Created invalidation ${INVALIDATION_ID} for /latest/*"
+          # Don't block the workflow on propagation (30-60s typical, but can spike).
+          # The invalidation is queued globally and will finish in the background.
