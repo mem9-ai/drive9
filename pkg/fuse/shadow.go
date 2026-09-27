@@ -1511,6 +1511,11 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 	pla, plb := s.acquireTwoPathLocks(oldPath, newPath)
 	defer s.releaseTwoPathLocks(oldPath, newPath, pla, plb)
 
+	return s.renameLocked(oldPath, newPath)
+}
+
+// renameLocked requires both shadow path locks.
+func (s *ShadowStore) renameLocked(oldPath, newPath string) bool {
 	s.mu.Lock()
 
 	sf, ok := s.files[oldPath]

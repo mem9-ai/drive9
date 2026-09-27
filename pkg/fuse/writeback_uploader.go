@@ -381,6 +381,9 @@ func (u *WriteBackUploader) acquirePath(localPath string) func() {
 		ps, ok := u.inflight[localPath]
 		if !ok {
 			// No in-flight upload — register ours.
+			if u.inflight == nil {
+				u.inflight = make(map[string]*pathState)
+			}
 			ps = &pathState{done: make(chan struct{})}
 			u.inflight[localPath] = ps
 			u.inflightMu.Unlock()
@@ -411,6 +414,9 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	if !chmodOK {
 		return // Already uploaded or removed.
 	}
+	if chmodMeta.Kind == PendingConflict {
+		return
+	}
 	if chmodMeta.Kind == PendingChmod {
 		_ = u.applyPendingChmod(context.Background(), localPath, chmodMeta, chmodMeta.Generation, false)
 		return
@@ -433,6 +439,9 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		return // Already uploaded or removed.
 	}
 	gen := meta.Generation
+	if meta.Kind == PendingConflict {
+		return
+	}
 	if meta.ownedStagingKnown {
 		stagingGens = meta.ownedStagingGens
 	}
@@ -546,8 +555,9 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 // return proof with a later mode error; callers must retain that mode obligation.
 func (u *WriteBackUploader) uploadSyncWithAppendSnapshot(ctx context.Context, localPath string) (int64, pathCommitLandmark, error) {
 	proof := pathCommitLandmark{}
-	// Wait for any in-flight background upload to complete first.
-	u.WaitPath(localPath)
+	// Share exclusion with background uploads and owned staging migration.
+	release := u.acquirePath(localPath)
+	defer release()
 
 	// PendingChmod entries have no .dat file (data already uploaded, only
 	// chmod remains). Read meta first so we can handle chmod without loading
@@ -555,6 +565,9 @@ func (u *WriteBackUploader) uploadSyncWithAppendSnapshot(ctx context.Context, lo
 	chmodMeta, chmodOK := u.cache.GetMeta(localPath)
 	if !chmodOK {
 		return 0, proof, nil // not in cache (may have been uploaded by the background worker we just waited for)
+	}
+	if chmodMeta.Kind == PendingConflict {
+		return 0, proof, fmt.Errorf("writeback snapshot %s is conflicted", localPath)
 	}
 	if chmodMeta.Kind == PendingChmod {
 		return 0, proof, u.applyPendingChmod(ctx, localPath, chmodMeta, chmodMeta.Generation, true)
@@ -572,6 +585,9 @@ func (u *WriteBackUploader) uploadSyncWithAppendSnapshot(ctx context.Context, lo
 		return 0, proof, nil // not in cache (removed between GetMeta and GetMetaAndView)
 	}
 	gen := meta.Generation
+	if meta.Kind == PendingConflict {
+		return 0, proof, fmt.Errorf("writeback snapshot %s is conflicted", localPath)
+	}
 	if meta.ownedStagingKnown {
 		stagingGens = meta.ownedStagingGens
 	}
