@@ -10743,6 +10743,11 @@ func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
 			continue
 		}
 		fh.Lock()
+		if event := fh.pendingFtruncate.Load(); event != nil && event.path == fh.Path && event.ino == fh.Ino {
+			moved := *event
+			moved.path = currentPath
+			fh.pendingFtruncate.Store(&moved)
+		}
 		fh.Path = currentPath
 		fh.ReadTarget = nil
 		fh.readTargetGen = 0
@@ -10952,9 +10957,21 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	// If oldP is a directory, pending children under oldP+"/", must be
 	// re-keyed to newP+"/". Without this the uploader would PUT to stale paths.
 	prefix := oldP + "/"
+	var migrationErr error
+	ownedMigrations := make(map[string]bool)
 	if fs.writeBack != nil {
 		for _, meta := range fs.writeBack.ListByPrefix(prefix) {
 			newChild := newP + meta.Path[len(oldP):]
+			if meta.ownedStagingKnown {
+				ownedMigrations[meta.Path] = true
+				moved, err := fs.renameOwnedWriteBack(meta.Path, newChild)
+				if err != nil {
+					migrationErr = errors.Join(migrationErr, err)
+				} else if moved && fs.uploader != nil {
+					fs.uploader.Submit(newChild)
+				}
+				continue
+			}
 			if fs.uploader != nil {
 				fs.uploader.WaitPath(meta.Path)
 			}
@@ -10968,6 +10985,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	// Meta-first order so a crash mid-migration cannot orphan a child's data.
 	if fs.pendingIndex != nil {
 		for _, meta := range fs.pendingIndex.ListByPrefix(prefix) {
+			if ownedMigrations[meta.Path] {
+				continue // Already migrated, or quarantined with its exact bytes.
+			}
 			newChild := newP + meta.Path[len(oldP):]
 			preparedMeta, err := fs.pendingIndex.PrepareRename(meta.Path, newChild)
 			if err != nil {
@@ -11004,6 +11024,10 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	// already committed remote rename.
 	if overlayErr != nil {
 		overlayErr = fs.renameLocalOverlaySubtree(oldP, newP)
+	}
+	if migrationErr != nil {
+		safeLogPrintf("rename: owned writeback migration failed: %v", migrationErr)
+		return gofuse.EIO
 	}
 	if overlayErr != nil {
 		safeLogPrintf("rename: migrate local overlay subtree %s -> %s failed after remote commit: %v", oldP, newP, overlayErr)
@@ -12507,6 +12531,15 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			return gofuse.ReadResultData(data), gofuse.OK
 		}
 		fh.Lock()
+	}
+	if data, handled, err := fs.readReleasedFtruncateLocked(fh, int64(input.Offset), input.Size); handled {
+		fh.Unlock()
+		source = "released-ftruncate"
+		bytesRead = len(data)
+		if err != nil {
+			return nil, httpToFuseStatus(err)
+		}
+		return gofuse.ReadResultData(data), gofuse.OK
 	}
 	fs.refreshCleanCommittedRevisionForHandleLocked(fh)
 

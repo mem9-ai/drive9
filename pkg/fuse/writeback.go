@@ -506,16 +506,19 @@ func (c *WriteBackCache) deleteDataLocked(remotePath string) {
 // where new data is on disk but metadata hasn't been published yet.
 func (c *WriteBackCache) GetMeta(remotePath string) (*WriteBackMeta, bool) {
 	pl := c.acquirePathLock(remotePath)
+	defer c.releasePathLock(remotePath, pl)
+	return c.getMetaLocked(remotePath)
+}
+
+// getMetaLocked requires the cache path lock.
+func (c *WriteBackCache) getMetaLocked(remotePath string) (*WriteBackMeta, bool) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	meta, ok := c.metas[remotePath]
 	if !ok {
-		c.mu.Unlock()
-		c.releasePathLock(remotePath, pl)
 		return nil, false
 	}
 	cp := cloneWriteBackMeta(meta)
-	c.mu.Unlock()
-	c.releasePathLock(remotePath, pl)
 	return &cp, true
 }
 
@@ -701,6 +704,11 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 		c.releasePathLock(first, pl1)
 	}()
 
+	return c.renamePendingLocked(oldPath, newPath)
+}
+
+// renamePendingLocked requires both cache path locks.
+func (c *WriteBackCache) renamePendingLocked(oldPath, newPath string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -1008,4 +1016,25 @@ func MountReadCacheHash(serverURL, mountPoint, remoteRoot, credentialKind, crede
 	input := serverURL + "\x00" + mountPoint + "\x00" + remoteRoot + "\x00" + credentialKind + "\x00" + hex.EncodeToString(credentialDigest[:])
 	h := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(h[:8])
+}
+
+// markRenameConflictLocked quarantines only the captured cache snapshot. The
+// caller holds its path lock and uploader exclusion. Memory is fenced even if
+// persisting the existing conflict kind fails; that failure must be surfaced.
+func (c *WriteBackCache) markRenameConflictLocked(path string, generation uint64) error {
+	c.mu.Lock()
+	meta, ok := c.metas[path]
+	if !ok || meta.Generation != generation {
+		c.mu.Unlock()
+		return nil
+	}
+	conflicted := cloneWriteBackMeta(meta)
+	conflicted.Kind = PendingConflict
+	c.metas[path] = &conflicted
+	c.mu.Unlock()
+	data, err := json.Marshal(&conflicted)
+	if err != nil {
+		return err
+	}
+	return atomicWrite(c.metaFile(path), data)
 }
