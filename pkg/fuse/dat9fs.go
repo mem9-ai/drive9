@@ -9926,6 +9926,14 @@ func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name stri
 }
 
 func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, name, childP string, mode uint32, out *gofuse.EntryOut) gofuse.Status {
+	if handled, st := fs.mknodRegularLocalFirst(input, name, childP, mode, out); handled {
+		return st
+	}
+
+	// Legacy synchronous create: the empty-file PUT (and its conditional
+	// chmod) is the mknod commit. Kept as the fallback for mounts without
+	// staging infrastructure (commit queue + shadow + pending index) and for
+	// environments with their own commit path (layer, gVisor, append-log).
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -9987,6 +9995,125 @@ func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, na
 	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.fillEntryOut(entry, out)
 	return gofuse.OK
+}
+
+// mknodRegularLocalFirst creates a regular file with zero backend round trips
+// on the mknod(2) critical path, staging the empty image the same way Create
+// stages a new file: pending-index meta + empty shadow + a write-back
+// snapshot, then an asynchronous CommitQueue entry (zero-byte payloads take
+// the direct-PUT route and carry the mode via the queue's post-upload chmod).
+// It reports handled=false when staging infrastructure is unavailable or the
+// mount uses an environment with its own commit path, and the caller falls
+// back to the legacy synchronous create.
+func (fs *Dat9FS) mknodRegularLocalFirst(input *gofuse.MknodIn, name, childP string, mode uint32, out *gofuse.EntryOut) (bool, gofuse.Status) {
+	// Only the write-back policy defers the remote create. close-sync and
+	// write-sync wire the same staging components but promise remote
+	// durability at create/close time, so they keep the synchronous create.
+	if fs.mountWritePolicy() != WritePolicyWriteBack {
+		return false, gofuse.OK
+	}
+	if fs.commitQueue == nil || fs.shadowStore == nil || fs.pendingIndex == nil || fs.writeBack == nil || fs.uploader == nil {
+		return false, gofuse.OK
+	}
+	if fs.layerEnabled() || fs.gvisorCompatibilityEnabled() || fs.appendLogNewPathActive(childP) {
+		return false, gofuse.OK
+	}
+	// POSIX EEXIST for state this mount already staged; a remotely-existing
+	// file without local state resolves as a commit conflict, exactly like
+	// the local-first Create path.
+	if fs.hasPendingLocalState(childP) || fs.hasQueuedCommit(childP) {
+		return true, gofuse.Status(syscall.EEXIST)
+	}
+
+	unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(childP)
+	defer func() {
+		if unlockRemoteCommit != nil {
+			unlockRemoteCommit()
+		}
+	}()
+
+	perm := mode & posixPermissionModeMask
+	now := time.Now()
+
+	// Stage the empty image BEFORE replacing the inode mapping: a staging
+	// failure must not leave a new inode mapped to the path, and no
+	// concurrent writer can observe the intermediate state (the kernel has
+	// not received the reply).
+	if err := fs.writeBack.PutWithBaseRevAndMode(childP, nil, 0, PendingNew, 0, perm, true); err != nil {
+		safeLogPrintf("mknod: write-back staging failed for %s: %v", childP, err)
+		return true, gofuse.EIO
+	}
+	if err := fs.shadowStore.Ensure(childP, 0, 0); err != nil {
+		fs.writeBack.Remove(childP)
+		safeLogPrintf("mknod: shadow staging failed for %s: %v", childP, err)
+		return true, gofuse.EIO
+	}
+	shadowGen := fs.shadowStore.ActiveGeneration(childP)
+	// Make the empty image durable before the enqueue-success path drops the
+	// fsynced write-back snapshot: recovery needs durable meta AND shadow,
+	// otherwise a power loss in that window loses the mknod'd file.
+	if err := fs.shadowStore.SyncIfGeneration(childP, shadowGen); err != nil {
+		fs.writeBack.Remove(childP)
+		fs.shadowStore.Remove(childP)
+		safeLogPrintf("mknod: shadow sync failed for %s: %v", childP, err)
+		return true, gofuse.EIO
+	}
+	if _, err := fs.pendingIndex.PutWithBaseRevAndMode(childP, 0, PendingNew, 0, perm, true); err != nil {
+		fs.writeBack.Remove(childP)
+		fs.shadowStore.Remove(childP)
+		safeLogPrintf("mknod: pending meta staging failed for %s: %v", childP, err)
+		return true, gofuse.EIO
+	}
+
+	// Start a new path incarnation (mirrors Create): preserve the old inode
+	// for open handles and hardlink aliases, never inherit revision/identity.
+	if oldIno, ok := fs.inodes.GetInode(childP); ok &&
+		(fs.hasOpenHandle(oldIno, childP) || fs.inodeHasPendingMutationState(oldIno, childP, true)) {
+		fs.inodes.RemoveLinkPreserve(childP)
+	} else {
+		fs.inodes.RemoveLink(childP)
+	}
+	fs.forgetCommittedRevisionPrefix(childP)
+
+	ino := fs.inodes.Lookup(childP, false, 0, now)
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|perm)
+	fs.inodes.UpdateOwner(ino, input.Uid, input.Gid, true, true)
+	fs.inodes.UpdateAtime(ino, now)
+	fs.inodes.UpdateMtime(ino, now)
+	fs.inodes.UpdateCtime(ino, now)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		return true, gofuse.EIO
+	}
+
+	commitEntry := &CommitEntry{
+		Path:    childP,
+		Inode:   ino,
+		BaseRev: 0,
+		Size:    0,
+		Kind:    PendingNew,
+		Mode:    perm,
+		HasMode: true,
+	}
+	fs.bindCommitEntryToPath(commitEntry, childP, 0)
+	if err := fs.commitQueue.Enqueue(commitEntry); err != nil {
+		// Queue saturated: the write-back snapshot stays as the payload for
+		// the legacy uploader's background retry (mirrors Release's fallback).
+		safeLogPrintf("mknod: commit enqueue failed for %s: %v (falling back to uploader)", childP, err)
+		fs.uploader.Submit(childP)
+	} else {
+		// CommitQueue owns the upload via shadow; drop the write-back
+		// snapshot so it doesn't serve stale data. No concurrent writer can
+		// exist for this path yet: the kernel has not received the reply.
+		fs.writeBack.Remove(childP)
+	}
+
+	fs.invalidateReadCacheAndTargets(childP)
+	parentPath, _ := fs.inodes.GetPath(input.NodeId)
+	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
+	fs.fillEntryOut(entry, out)
+	return true, gofuse.OK
 }
 
 func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
@@ -10161,22 +10288,13 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	ino := fs.inodes.Lookup(childP, false, int64(len(pointedTo)), time.Now())
 	fs.inodes.UpdateMode(ino, mode)
 	fs.inodes.UpdateOwner(ino, header.Uid, header.Gid, true, true)
-	if stat, err := fs.client.StatCtx(ctx, fs.remotePath(childP)); err == nil && stat != nil {
-		if stat.ResourceID != "" || stat.Nlink > 0 {
-			fs.inodes.SetIdentity(ino, stat.ResourceID, stat.Nlink)
-		}
-		if stat.Revision > 0 {
-			fs.inodes.UpdateRevision(ino, stat.Revision)
-		}
-		if !stat.Mtime.IsZero() {
-			fs.inodes.UpdateMtime(ino, stat.Mtime)
-		}
-		if stat.HasMode {
-			fs.inodes.UpdateMode(ino, stat.Mode)
-		}
-	} else if err != nil && !isNotFoundErr(err) {
-		safeLogPrintf("post-symlink stat refresh failed for %s: %v", childP, err)
-	}
+	// No post-create stat refresh: the backend already committed the symlink
+	// (the POST above would have failed otherwise), and every field the old
+	// refresh enriched (identity, revision, server mtime/mode) was already
+	// tolerated to stay unset whenever that stat failed transiently — the
+	// revision-0 state it leaves is a supported one. Dropping the round trip
+	// halves symlink(2) latency; identity/revision arrive with the next
+	// listing or stat refresh instead.
 
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
@@ -12947,6 +13065,21 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		} else {
 			// O_TRUNC: mark buffer as dirty so that close() without any
 			// writes still persists the truncation (POSIX semantics).
+			// A local-first mknod may still have its empty-file commit
+			// queued for this path. Re-staging the shadow below would strand
+			// that entry's payload generation, and this handle would
+			// otherwise stage a base-0 PendingOverwrite that uploadEntry
+			// rejects. Drain the queue for the path first: after WaitPath
+			// the pending meta is gone, the inode carries the committed
+			// revision, and the handle truncates as a well-based overwrite.
+			if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
+				fs.commitQueue.WaitPath(p)
+				if refreshedEntry, ok := fs.inodes.GetEntry(input.NodeId); ok {
+					fh.OrigSize = refreshedEntry.Size
+					fh.BaseRev = refreshedEntry.Revision
+					entry = refreshedEntry
+				}
+			}
 			fh.Dirty.maxSize = streamingWriteMaxSize
 			fh.Dirty.sequential = true
 			fh.Dirty.uploadedParts = make(map[int]bool)
