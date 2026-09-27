@@ -246,6 +246,32 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			fh.Unlock()
 			return
 		}
+		if handled, err := fs.prepareFtruncateReleaseLocked(ctx, fh); handled || err != nil {
+			if err != nil {
+				flushStatus = httpToFuseStatus(err)
+				releaseStatus = flushStatus
+				safeLogPrintf("release: fd-truncate handoff failed for %s: %v", fh.Path, err)
+			}
+			fh.Unlock()
+			return
+		}
+		if fs.ftruncateParticipates(fh) && fh.Dirty != nil && fh.Dirty.HasDirtyParts() &&
+			fs.commitQueue != nil && fs.shadowStore != nil && fs.pendingIndex != nil &&
+			fh.Dirty.Size() <= maxLandedPayloadBytes && fh.Dirty.CanMaterializeFull() {
+			err := fs.stageShadowLocked(fh, true)
+			if err == nil {
+				if enqueueErr := fs.enqueueStagedShadowCommitLocked(fh); enqueueErr != nil {
+					err = fs.retainFtruncateConflictLocked(fh, enqueueErr)
+				}
+			}
+			if err != nil {
+				flushStatus = httpToFuseStatus(err)
+				releaseStatus = flushStatus
+				safeLogPrintf("release: fd-truncate snapshot retained for %s: %v", fh.Path, err)
+			}
+			fh.Unlock()
+			return
+		}
 		if fs.discardSupersededMutationLocked(fh) {
 			phase = "superseded-mutation"
 			fh.Unlock()

@@ -99,6 +99,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
 	}
+	if handled, err := fs.prepareFtruncateCommitLocked(ctx, fh, false); handled || err != nil {
+		return httpToFuseStatus(err)
+	}
 	if fs.discardSupersededMutationLocked(fh) {
 		phase = "superseded-mutation"
 		return gofuse.OK

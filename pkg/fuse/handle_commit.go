@@ -188,6 +188,9 @@ func (fs *Dat9FS) syncPassivePathTruncateLocked(fh *FileHandle, size, revision i
 // For grow, the buffer is zero-extended so a later flush uploads the correct
 // size (not stale shorter content that could shrink the file back).
 func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
+	zeroID := ""
+	entry, _ := fs.inodes.GetEntry(ino)
+	samePath := entry != nil && entry.Nlink <= 1
 	for _, fh := range fs.fileHandlesForInode(ino) {
 		fh.Lock()
 		if fh.Dirty == nil {
@@ -246,6 +249,12 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 			}
 		}
 		fh.DirtySeq = fs.markDirtySize(ino, newSize)
+		if newSize == 0 && samePath && fs.ftruncateParticipates(fh) {
+			if zeroID == "" {
+				zeroID = generateMountID()
+			}
+			fs.resetFtruncateZeroImageLocked(fh, zeroID)
+		}
 		fh.Unlock()
 	}
 }

@@ -3,6 +3,7 @@ package fuse
 import (
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // OpenHandleIndex keeps O(1) indexes for currently open file handles.
@@ -38,9 +39,30 @@ func (idx *OpenHandleIndex) Add(fh *FileHandle) {
 // exists so a registration can be made atomic with another check (see
 // allocateGitWorkspaceFileHandle).
 func (idx *OpenHandleIndex) addLocked(fh *FileHandle) {
+	if fh.Dirty != nil && (fh.Flags&syscall.O_TRUNC == 0 || fh.ftruncateInherited != "") {
+		for sibling := range idx.byInode[fh.Ino] {
+			if event := sibling.pendingFtruncate.Load(); event != nil && event.path == fh.Path {
+				if prior := fh.pendingFtruncate.Load(); prior == nil || prior.seq < event.seq {
+					fh.pendingFtruncate.Store(event)
+				}
+			}
+		}
+	}
 	addHandleToSet(idx.byInode, fh.Ino, fh)
 	addHandleToSet(idx.byPath, fh.Path, fh)
 	idx.pathByHandle[fh] = fh.Path
+}
+
+func (idx *OpenHandleIndex) ftruncateInheritance(ino uint64, path string) *ftruncateInheritance {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	var latest *ftruncateInheritance
+	for fh := range idx.byInode[ino] {
+		if event := fh.pendingFtruncate.Load(); event != nil && event.path == path && (latest == nil || event.seq > latest.seq) {
+			latest = event
+		}
+	}
+	return latest
 }
 
 func (idx *OpenHandleIndex) Remove(fh *FileHandle) {
