@@ -59,6 +59,12 @@ enum Commands {
         /// TiDB Cloud private key for tidb_cloud_native provisioning
         #[arg(long)]
         tidbcloud_private_key: Option<String>,
+        /// External workload file set for the case: exported to the script
+        /// (and the control replay) as the read-only PAYLOAD_DIR variable;
+        /// cases that support it seed their input tree from here instead of
+        /// their default synthetic payload (see case-spec §4.2)
+        #[arg(long)]
+        payload_dir: Option<PathBuf>,
     },
     /// statically validate .test case files (lint)
     Validate {
@@ -103,6 +109,7 @@ fn main() -> Result<()> {
             write_cache_size_mb,
             tidbcloud_public_key,
             tidbcloud_private_key,
+            payload_dir,
         } => run::run(RunArgs {
             case,
             sandbox,
@@ -117,6 +124,7 @@ fn main() -> Result<()> {
             write_cache_size_mb,
             tidbcloud_public_key,
             tidbcloud_private_key,
+            payload_dir,
         })?,
         Commands::Validate { files, trace } => run::validate(files, trace)?,
         Commands::Workbench(a) => workbench::run(a)?,

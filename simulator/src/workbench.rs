@@ -41,6 +41,11 @@ pub struct WorkbenchArgs {
     tidbcloud_private_key: Option<String>,
     #[arg(long, default_value = "deepseek-flash")]
     model: String,
+    /// Port for the post-build artifact website server. 0 (default) = pick an
+    /// ephemeral port. The harness serves the detected build output dir and the
+    /// reviewer acceptance probes it with a simulated browser over HTTP.
+    #[arg(long, default_value = "0")]
+    serve_port: u16,
 }
 
 struct ModelBinding {
@@ -215,7 +220,47 @@ pub fn run(a: WorkbenchArgs) -> Result<i32> {
             findings: None,
         }
     } else {
-        post_run(&home)
+        post_run(&home.join("workspace"), &home)
+    };
+
+    // The writer's mount is still alive: serve the build output over HTTP for
+    // browser-style acceptance, and mount the reviewer's FRESH acceptance
+    // mount (separate mountpoint / cache-dir / local-root) for the
+    // cross-mount readability check. Both stay up for the whole review and
+    // are torn down right after it.
+    let (served, mut server_child) = if timed_out {
+        (
+            ServedAcceptance::skipped("worker timed out; build output not served"),
+            None,
+        )
+    } else {
+        serve_and_probe(&home, &workspace, a.serve_port)
+    };
+    let (review_acc, mut review_mount_child) = if timed_out {
+        (
+            ReviewAcceptance {
+                mounted: false,
+                detail: "worker timed out".into(),
+                manifest_match: None,
+                manifest_detail: String::new(),
+                entries: 0,
+                probe: None,
+                probe_detail: String::new(),
+                tree: String::new(),
+                key_files: String::new(),
+            },
+            None,
+        )
+    } else {
+        reviewer_acceptance(
+            &a.bin,
+            &a.server,
+            &tenant.api_key,
+            &home,
+            Some(&workspace),
+            &a.durability,
+            &a.profile,
+        )
     };
 
     let facts = build_facts(
@@ -226,13 +271,29 @@ pub fn run(a: WorkbenchArgs) -> Result<i32> {
         worker_secs,
         &marker,
         &post,
+        &served,
+        &review_acc,
     );
 
     let review_t = Instant::now();
     let review = run_reviewer(&binding, &home, &facts, timeout);
     let review_secs = review_t.elapsed().as_secs();
 
-    let _ = umount(&a.bin, &workspace, &home, &mut mount_child);
+    // teardown: reviewer acceptance mount, then the site server, then the
+    // writer's mount
+    if let Some(c) = review_mount_child.as_mut() {
+        let _ = umount(
+            &a.bin,
+            &home.join("review").join("workspace"),
+            &home.join("review").join("mount.log"),
+            c,
+        );
+    }
+    if let Some(c) = server_child.as_mut() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    let _ = umount(&a.bin, &workspace, &home.join("mount.log"), &mut mount_child);
 
     let reviewer_verdict = parse_verdict(&review);
     let final_v = compose_verdict(
@@ -251,6 +312,22 @@ pub fn run(a: WorkbenchArgs) -> Result<i32> {
             ("audit_protocol", (!a.no_audit).to_string()),
             ("worker_marker", marker.unwrap_or_default()),
             ("audit_status", post.audit.status.clone()),
+            ("served_url", served.url.clone().unwrap_or_default()),
+            (
+                "browser_all_ok",
+                if served.url.is_some() {
+                    served.all_ok.to_string()
+                } else {
+                    String::new()
+                },
+            ),
+            (
+                "cross_mount_identical",
+                match review_acc.manifest_match {
+                    Some(b) => b.to_string(),
+                    None => String::new(),
+                },
+            ),
         ],
         review,
         t_start,
@@ -423,18 +500,22 @@ fn provision(server: &str, public_key: &str, private_key: &str) -> Result<Tenant
     }
 }
 
-fn mount(
+/// Mount the tenant at an explicit mountpoint with explicit cache/local dirs.
+/// Both the writer mount (workspace) and the reviewer acceptance mount (a
+/// FRESH mountpoint with separate cache-dir and local-root, proving the
+/// committed content is readable cross-mount) go through here.
+fn mount_at(
     bin: &str,
     server: &str,
     api_key: &str,
-    home: &Path,
+    ws: &Path,
+    cache: &Path,
+    local: &Path,
+    log_path: &Path,
     durability: &str,
     profile: &str,
 ) -> Result<Child> {
-    let log = std::fs::File::create(home.join("mount.log"))?;
-    let cache = home.join("cache");
-    let local = home.join("local");
-    let ws = home.join("workspace");
+    let log = std::fs::File::create(log_path)?;
     let mut args: Vec<String> = vec![
         "mount".into(),
         "--mode".into(),
@@ -457,9 +538,13 @@ fn mount(
     args.push("--foreground".into());
     args.push(":/".into());
     args.push(ws.to_string_lossy().into());
+    let home = log_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
     let mut child = Command::new(bin)
         .args(&args)
-        .env("HOME", home)
+        .env("HOME", &home)
         .stdout(log.try_clone()?)
         .stderr(log)
         .spawn()
@@ -468,29 +553,50 @@ fn mount(
     loop {
         match child.try_wait() {
             Ok(Some(st)) => bail!(
-                "mount daemon exited early ({st:?}); mount.log:\n{}",
-                tail(&home.join("mount.log"), 30)
+                "mount daemon exited early ({st:?}); mount log:\n{}",
+                tail(log_path, 30)
             ),
             Ok(None) => {}
             Err(e) => bail!("waiting mount daemon: {e}"),
         }
-        if mount_alive(home)? {
+        if mount_alive_at(ws)? {
             return Ok(child);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!(
-                "mount not ready within 120s; mount.log:\n{}",
-                tail(&home.join("mount.log"), 30)
-            );
+            bail!("mount not ready within 120s; mount log:\n{}", tail(log_path, 30));
         }
         std::thread::sleep(Duration::from_millis(500));
     }
 }
 
+fn mount(
+    bin: &str,
+    server: &str,
+    api_key: &str,
+    home: &Path,
+    durability: &str,
+    profile: &str,
+) -> Result<Child> {
+    mount_at(
+        bin,
+        server,
+        api_key,
+        &home.join("workspace"),
+        &home.join("cache"),
+        &home.join("local"),
+        &home.join("mount.log"),
+        durability,
+        profile,
+    )
+}
+
 fn mount_alive(home: &Path) -> Result<bool> {
-    let ws = home.join("workspace");
+    mount_alive_at(&home.join("workspace"))
+}
+
+fn mount_alive_at(ws: &Path) -> Result<bool> {
     if cfg!(target_os = "linux") {
         let out = Command::new("stat")
             .args(["-f", "-c", "%T", &ws.to_string_lossy()])
@@ -506,7 +612,7 @@ fn mount_alive(home: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn umount(bin: &str, ws: &Path, home: &Path, child: &mut Child) -> Result<()> {
+fn umount(bin: &str, ws: &Path, log_path: &Path, child: &mut Child) -> Result<()> {
     let mut ok = Command::new(bin)
         .arg("umount")
         .arg(ws)
@@ -535,10 +641,7 @@ fn umount(bin: &str, ws: &Path, home: &Path, child: &mut Child) -> Result<()> {
         let _ = child.wait();
     }
     if !ok {
-        log::warn!(
-            "umount failed; mount.log tail:\n{}",
-            tail(&home.join("mount.log"), 10)
-        );
+        log::warn!("umount failed; mount log tail:\n{}", tail(log_path, 10));
     }
     Ok(())
 }
@@ -741,8 +844,515 @@ fn try_walk(ws: &Path) -> Result<Vec<Entry>, String> {
     }
 }
 
-fn post_run(home: &Path) -> PostRun {
-    let ws = home.join("workspace");
+// ---------------------------------------------------------------- site serve
+
+/// Build-output directory candidates, in priority order. The worker builds on
+/// the mount; the harness serves whatever static site it produced.
+const SITE_DIR_CANDIDATES: &[&str] = &["dist", "build", "_site", "out", "public", "site"];
+
+fn detect_site_dir(ws: &Path) -> Option<PathBuf> {
+    for c in SITE_DIR_CANDIDATES {
+        let d = ws.join(c);
+        if d.join("index.html").is_file() {
+            return Some(d);
+        }
+    }
+    if ws.join("index.html").is_file() {
+        return Some(ws.to_path_buf());
+    }
+    // relax: a candidate dir holding at least one .html page anywhere shallow
+    for c in SITE_DIR_CANDIDATES {
+        let d = ws.join(c);
+        if !d.is_dir() {
+            continue;
+        }
+        let has_html = Command::new("find")
+            .args([&d.to_string_lossy(), "-maxdepth", "2", "-name", "*.html"])
+            .output()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false);
+        if has_html {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// Serves the worker's build output over HTTP (127.0.0.1) so acceptance can
+/// fetch the product the way a browser would. Returns the server child, the
+/// actual port (parsed from the server banner when port 0 was requested) and
+/// the served directory.
+fn serve_site(
+    home: &Path,
+    dir: &Path,
+    requested_port: u16,
+) -> Result<(Child, u16, PathBuf)> {
+    let log_path = home.join("serve.log");
+    let log = std::fs::File::create(&log_path)?;
+    let mut child = Command::new("python3")
+        .args([
+            "-m",
+            "http.server",
+            &requested_port.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--directory",
+            &dir.to_string_lossy(),
+        ])
+        .current_dir(home)
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()
+        .context("spawning python3 -m http.server")?;
+
+    // port 0 = ephemeral: the banner line carries the real port
+    let port = if requested_port == 0 {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let s = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if let Some(p) = s.split("port ").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()) {
+                if let Ok(n) = p.parse::<u16>() {
+                    break n;
+                }
+            }
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                bail!("http.server exited early; serve.log:\n{}", tail(&log_path, 10));
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("could not determine served port; serve.log:\n{}", tail(&log_path, 10));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    } else {
+        requested_port
+    };
+
+    // readiness: the root URL must answer (any HTTP status counts as "up")
+    let url = format!("http://127.0.0.1:{port}/");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            bail!("http.server exited; serve.log:\n{}", tail(&log_path, 10));
+        }
+        let up = Command::new("curl")
+            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", &url])
+            .output()
+            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().eq("000"))
+            .unwrap_or(false);
+        if up {
+            return Ok((child, port, dir.to_path_buf()));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("served site not answering within 30s at {url}");
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
+
+const WEBCHECK_PY: &str = r#"#!/usr/bin/env python3
+"""Simulated-browser acceptance probe: fetches the served product over HTTP
+with a browser User-Agent, parses the HTML like a browser would (title,
+referenced assets, same-site links), then fetches every referenced asset and
+up to a few internal pages. Writes a fetch transcript as JSON."""
+import json
+import sys
+import urllib.error
+import urllib.request
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
+
+URL, OUT_JSON = sys.argv[1], sys.argv[2]
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/128.0 Safari/537.36 drive9-workbench-review")
+
+
+class Page(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.title = ""
+        self._in_title = False
+        self.assets = []
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "title":
+            self._in_title = True
+        src = a.get("src") or a.get("href")
+        if tag == "a" and a.get("href"):
+            self.links.append(a["href"])
+        elif src and tag in ("script", "img", "link", "source", "video", "audio"):
+            self.assets.append(src)
+
+    def handle_data(self, d):
+        if self._in_title:
+            self.title += d
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._in_title = False
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = r.read(4_000_000)
+            return {"url": url, "status": r.status,
+                    "type": r.headers.get("Content-Type", ""), "bytes": len(body),
+                    "body": body}
+    except urllib.error.HTTPError as e:
+        return {"url": url, "status": e.code, "type": "", "bytes": 0,
+                "body": None, "error": str(e)}
+    except Exception as e:  # noqa: BLE001 - transcript must record every failure
+        return {"url": url, "status": 0, "type": "", "bytes": 0,
+                "body": None, "error": repr(e)}
+
+
+def main():
+    origin = urlparse(URL)
+    t = {"url": URL, "ua": UA, "fetches": [], "title": ""}
+    home = fetch(URL)
+    t["fetches"].append({k: home[k] for k in ("url", "status", "type", "bytes")})
+    if home["status"] == 200 and "html" in home["type"] and home["body"] is not None:
+        p = Page()
+        p.feed(home["body"].decode("utf-8", "replace"))
+        t["title"] = p.title.strip()[:200]
+        for a in p.assets[:30]:
+            u = urljoin(URL, a)
+            if urlparse(u).netloc == origin.netloc:
+                r = fetch(u)
+                t["fetches"].append({k: r[k] for k in ("url", "status", "type", "bytes")})
+        followed = 0
+        for l in p.links[:15]:
+            u = urljoin(URL, l)
+            if urlparse(u).netloc != origin.netloc or not u.startswith("http"):
+                continue
+            if urlparse(u).path.rstrip("/") == origin.path.rstrip("/"):
+                continue
+            r = fetch(u)
+            t["fetches"].append({k: r[k] for k in ("url", "status", "type", "bytes")})
+            followed += 1
+            if followed >= 5:
+                break
+    t["ok_fetches"] = sum(1 for f in t["fetches"] if f["status"] == 200)
+    t["total_fetches"] = len(t["fetches"])
+    with open(OUT_JSON, "w") as f:
+        json.dump(t, f, indent=1)
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
+/// Result of the served-site acceptance leg.
+struct ServedAcceptance {
+    dir: Option<PathBuf>,
+    port: Option<u16>,
+    url: Option<String>,
+    transcript: serde_json::Value,
+    /// headless-chromium rendered DOM size, when a chromium binary exists
+    rendered_dom_bytes: Option<usize>,
+    /// true when every fetch in the transcript returned 200
+    all_ok: bool,
+    error: Option<String>,
+}
+
+impl ServedAcceptance {
+    fn skipped(reason: &str) -> Self {
+        Self {
+            dir: None,
+            port: None,
+            url: None,
+            transcript: serde_json::json!({}),
+            rendered_dom_bytes: None,
+            all_ok: false,
+            error: Some(reason.into()),
+        }
+    }
+
+    fn facts_text(&self) -> String {
+        let mut s = String::new();
+        match (&self.url, &self.error) {
+            (Some(u), None) => {
+                s.push_str(&format!(
+                    "served_dir: {}\nurl: {u}\ntitle: {}\nfetches: {} ok / {} total\n",
+                    self.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+                    self.transcript["title"].as_str().unwrap_or(""),
+                    self.transcript["ok_fetches"].as_u64().unwrap_or(0),
+                    self.transcript["total_fetches"].as_u64().unwrap_or(0),
+                ));
+                if let Some(f) = self.transcript["fetches"].as_array() {
+                    for e in f.iter().take(40) {
+                        s.push_str(&format!(
+                            "  {} {} {} {}\n",
+                            e["status"].as_i64().unwrap_or(0),
+                            e["type"].as_str().unwrap_or("?"),
+                            e["bytes"].as_u64().unwrap_or(0),
+                            e["url"].as_str().unwrap_or("?"),
+                        ));
+                    }
+                }
+                match self.rendered_dom_bytes {
+                    Some(n) => s.push_str(&format!("headless-chromium: rendered DOM {n} bytes\n")),
+                    None => s.push_str("headless-chromium: unavailable (transcript is the evidence)\n"),
+                }
+                s.push_str(if self.all_ok {
+                    "browser-verdict: every page and asset fetch returned 200\n"
+                } else {
+                    "browser-verdict: NON-200 FETCHES PRESENT (see transcript)\n"
+                });
+            }
+            (_, Some(e)) => s.push_str(&format!("not served: {e}\n")),
+            _ => s.push_str("not served\n"),
+        }
+        s
+    }
+}
+
+/// Serve the detected build output and probe it with the simulated browser.
+/// `kill_child` receives the live server child so the caller can keep it up
+/// during review and tear it down afterwards.
+fn serve_and_probe(
+    home: &Path,
+    ws: &Path,
+    requested_port: u16,
+) -> (ServedAcceptance, Option<Child>) {
+    let Some(dir) = detect_site_dir(ws) else {
+        return (ServedAcceptance::skipped("no web build output found (no index.html in dist/build/_site/out/public/site or workspace root)"), None);
+    };
+    let (mut child, port, served_dir) = match serve_site(home, &dir, requested_port) {
+        Ok(v) => v,
+        Err(e) => return (ServedAcceptance::skipped(&format!("{e:#}")), None),
+    };
+    let url = format!("http://127.0.0.1:{port}/");
+
+    // simulated-browser transcript
+    let script = home.join("webcheck.py");
+    if let Err(e) = std::fs::write(&script, WEBCHECK_PY) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return (ServedAcceptance::skipped(&format!("writing webcheck.py: {e}")), None);
+    }
+    let out_json = home.join("browser-transcript.json");
+    let probe = Command::new("python3")
+        .args([
+            script.to_string_lossy().as_ref(),
+            &url,
+            out_json.to_string_lossy().as_ref(),
+        ])
+        .output();
+    let transcript = match probe {
+        Ok(o) if o.status.success() => std::fs::read_to_string(&out_json)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::json!({"error": "unparsable transcript"})),
+        Ok(o) => serde_json::json!({
+            "error": String::from_utf8_lossy(&o.stderr).trim().to_string()
+        }),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
+    };
+
+    // optional true-browser rendering: headless chromium DOM dump
+    let rendered = ["chromium", "chromium-browser", "google-chrome"]
+        .iter()
+        .find_map(|c| {
+            let dom_path = home.join("browser-dom.html");
+            let st = Command::new(c)
+                .args([
+                    "--headless=new",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--dump-dom",
+                    "--virtual-time-budget=8000",
+                    &url,
+                ])
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())?;
+            let _ = std::fs::write(&dom_path, &st.stdout);
+            Some(st.stdout.len())
+        });
+
+    let ok_total = (
+        transcript["ok_fetches"].as_u64().unwrap_or(0),
+        transcript["total_fetches"].as_u64().unwrap_or(0),
+    );
+    let all_ok = ok_total.0 > 0 && ok_total.0 == ok_total.1;
+    (
+        ServedAcceptance {
+            dir: Some(served_dir),
+            port: Some(port),
+            url: Some(url),
+            transcript,
+            rendered_dom_bytes: rendered,
+            all_ok,
+            error: None,
+        },
+        Some(child),
+    )
+}
+
+// ------------------------------------------------------- reviewer acceptance
+
+/// Cross-mount acceptance evidence: the SAME tenant re-mounted at a fresh
+/// mountpoint with separate cache-dir and local-root, walked and compared
+/// against the writer's mount, plus a write probe on the fresh mount.
+struct ReviewAcceptance {
+    mounted: bool,
+    detail: String,
+    manifest_match: Option<bool>,
+    manifest_detail: String,
+    entries: usize,
+    probe: Option<bool>,
+    probe_detail: String,
+    tree: String,
+    key_files: String,
+}
+
+impl ReviewAcceptance {
+    fn facts_text(&self) -> String {
+        let mut s = String::new();
+        if !self.mounted {
+            s.push_str(&format!("fresh mount failed: {}\n", self.detail));
+            return s;
+        }
+        s.push_str(&format!("mounted (fresh): {}\n", self.detail));
+        match self.manifest_match {
+            Some(true) => s.push_str(&format!(
+                "manifest vs writer mount: IDENTICAL ({} files after ignores)\n",
+                self.entries
+            )),
+            Some(false) => s.push_str(&format!(
+                "manifest vs writer mount: DIFFER — {}\n",
+                self.manifest_detail
+            )),
+            None => s.push_str(&format!(
+                "manifest vs writer mount: unavailable ({})\n",
+                self.manifest_detail
+            )),
+        }
+        s.push_str(&format!(
+            "write probe on fresh mount: {} {}\n",
+            if self.probe == Some(true) { "ok" } else { "FAIL" },
+            self.probe_detail
+        ));
+        s
+    }
+}
+
+/// Mount the tenant at `<home>/review/workspace` (cache `<home>/review/cache`,
+/// local-root `<home>/review/local` — all distinct from the writer's) and
+/// collect the cross-mount acceptance evidence. The writer's mount must still
+/// be alive: the two manifests are compared side by side.
+fn reviewer_acceptance(
+    bin: &str,
+    server: &str,
+    api_key: &str,
+    home: &Path,
+    writer_ws: Option<&Path>,
+    durability: &str,
+    profile: &str,
+) -> (ReviewAcceptance, Option<Child>) {
+    let review_root = home.join("review");
+    let ws = review_root.join("workspace");
+    let cache = review_root.join("cache");
+    let local = review_root.join("local");
+    let _ = std::fs::remove_dir_all(&review_root);
+    let _ = std::fs::create_dir_all(&ws);
+    let _ = std::fs::create_dir_all(&cache);
+    let _ = std::fs::create_dir_all(&local);
+    let log_path = review_root.join("mount.log");
+    let child = match mount_at(
+        bin, server, api_key, &ws, &cache, &local, &log_path, durability, profile,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                ReviewAcceptance {
+                    mounted: false,
+                    detail: format!("{e:#}"),
+                    manifest_match: None,
+                    manifest_detail: String::new(),
+                    entries: 0,
+                    probe: None,
+                    probe_detail: String::new(),
+                    tree: String::new(),
+                    key_files: String::new(),
+                },
+                None,
+            )
+        }
+    };
+
+    let fstype = fstype(&ws);
+    let detail = format!(
+        "mountpoint {} (fstype {fstype}), cache-dir {}, local-root {}",
+        ws.display(),
+        cache.display(),
+        local.display()
+    );
+    log::info!("reviewer acceptance mount: {detail}");
+
+    // cross-mount readability: identical filtered manifests on both mounts
+    // (skipped when the writer's mount is not alive, e.g. in review-only)
+    let ignores: Vec<String> = AUDIT_IGNORES.iter().map(|s| s.to_string()).collect();
+    let (manifest_match, manifest_detail, entries) = match (
+        try_walk(&ws),
+        writer_ws.map(try_walk).unwrap_or(Err("writer mount not alive".into())),
+    ) {
+        (Ok(r), Ok(w)) => {
+            let fr = entries_filtered(&r, &ignores);
+            let fw = entries_filtered(&w, &ignores);
+            let n = fr.iter().filter(|e| e.kind == "file").count();
+            match manifest_equal(&fr, &fw) {
+                Some(d) => (Some(false), d, n),
+                None => (Some(true), String::new(), n),
+            }
+        }
+        (Ok(r), Err(e)) => {
+            let n = entries_filtered(&r, &ignores)
+                .iter()
+                .filter(|e| e.kind == "file")
+                .count();
+            (None, e, n)
+        }
+        (Err(e), _) => (None, e, 0),
+    };
+
+    let probe_ws = ws.clone();
+    let probe = run_with_timeout(Duration::from_secs(60), move || {
+        probe_write(&probe_ws)
+    });
+    let (probe_ok, probe_detail) = match &probe {
+        Some(Ok(ms)) => (true, format!("({ms}ms)")),
+        Some(Err(e)) => (false, e.clone()),
+        None => (false, "timed out after 60s".into()),
+    };
+
+    (
+        ReviewAcceptance {
+            mounted: true,
+            detail,
+            manifest_match,
+            manifest_detail,
+            entries,
+            probe: Some(probe_ok),
+            probe_detail,
+            tree: tree_snapshot(&ws),
+            key_files: key_files(&ws),
+        },
+        Some(child),
+    )
+}
+
+fn post_run(ws: &Path, home: &Path) -> PostRun {
+    let ws = ws.to_path_buf();
     let probe_ws = ws.clone();
     let probe = run_with_timeout(Duration::from_secs(60), move || probe_write(&probe_ws));
     let probe_err = match &probe {
@@ -766,7 +1376,7 @@ fn post_run(home: &Path) -> PostRun {
         Err(e) => {
             audit.status = "error".into();
             audit.detail = e;
-            return finish_post(home, audit);
+            return finish_post(&ws, home, audit);
         }
     };
     let second = match try_walk(&ws) {
@@ -774,7 +1384,7 @@ fn post_run(home: &Path) -> PostRun {
         Err(e) => {
             audit.status = "error".into();
             audit.detail = e;
-            return finish_post(home, audit);
+            return finish_post(&ws, home, audit);
         }
     };
     let ignores: Vec<String> = AUDIT_IGNORES.iter().map(|s| s.to_string()).collect();
@@ -807,15 +1417,15 @@ fn post_run(home: &Path) -> PostRun {
             }
         }
     }
-    finish_post(home, audit)
+    finish_post(&ws, home, audit)
 }
 
-fn finish_post(home: &Path, audit: AuditOutcome) -> PostRun {
+fn finish_post(ws: &Path, home: &Path, audit: AuditOutcome) -> PostRun {
     let _ = std::fs::write(
         home.join("audit.json"),
         serde_json::to_string_pretty(&audit).unwrap_or_default(),
     );
-    let ws_findings = home.join("workspace").join(FINDINGS_NAME);
+    let ws_findings = ws.join(FINDINGS_NAME);
     let findings = std::fs::read_to_string(&ws_findings).ok();
     if findings.is_some() {
         let _ = std::fs::copy(&ws_findings, home.join(FINDINGS_NAME));
@@ -925,31 +1535,62 @@ fn review_only(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(AuditOutcome::skipped);
     let mut findings = std::fs::read_to_string(home.join(FINDINGS_NAME)).ok();
-    let mut tree_override: Option<String> = None;
-    let ws_empty = std::fs::read_dir(home.join("workspace"))
-        .map(|mut d| d.next().is_none())
-        .unwrap_or(true);
-    if ws_empty
-        && let Ok(mut child) = mount(
-            &ra.bin,
-            &ra.server,
-            &ctx.tenant
-                .as_ref()
-                .map(|t| t.api_key.clone())
-                .unwrap_or_default(),
-            &home,
-            &ra.durability,
-            "none",
-        )
+
+    // review-only: bring the tenant up on the reviewer's FRESH acceptance
+    // mount (separate mountpoint / cache-dir / local-root, profile none — the
+    // pure remote view), collect the cross-mount evidence there, and re-serve
+    // the site from that fresh mount when the live run left no transcript.
+    let (review_acc, mut review_mount) = reviewer_acceptance(
+        &ra.bin,
+        &ra.server,
+        &ctx.tenant
+            .as_ref()
+            .map(|t| t.api_key.clone())
+            .unwrap_or_default(),
+        &home,
+        None,
+        &ra.durability,
+        "none",
+    );
+    let (served, mut server_child) = if review_acc.mounted
+        && !home.join("browser-transcript.json").exists()
     {
-        std::thread::sleep(Duration::from_secs(2));
-        tree_override = Some(format!(
-            "{}\n```\n### Key file contents (collected on remount)\n```\n{}",
-            tree_snapshot(&home.join("workspace")),
-            key_files(&home.join("workspace"))
-        ));
+        let review_ws = home.join("review").join("workspace");
+        if detect_site_dir(&review_ws).is_some() {
+            serve_and_probe(&home, &review_ws, ra.serve_port)
+        } else {
+            (
+                ServedAcceptance::skipped("no web build output on the review mount"),
+                None,
+            )
+        }
+    } else if home.join("browser-transcript.json").exists() {
+        let transcript = std::fs::read_to_string(home.join("browser-transcript.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::json!({}));
+        let ok = transcript["ok_fetches"].as_u64().unwrap_or(0);
+        let total = transcript["total_fetches"].as_u64().unwrap_or(0);
+        (
+            ServedAcceptance {
+                dir: None,
+                port: None,
+                url: transcript["url"].as_str().map(|u| u.to_string()),
+                transcript,
+                rendered_dom_bytes: None,
+                all_ok: ok > 0 && ok == total,
+                error: None,
+            },
+            None,
+        )
+    } else {
+        (ServedAcceptance::skipped("no transcript and no review mount"), None)
+    };
+
+    if review_acc.mounted {
+        let review_ws = home.join("review").join("workspace");
         if findings.is_none() {
-            let ws_findings = home.join("workspace").join(FINDINGS_NAME);
+            let ws_findings = review_ws.join(FINDINGS_NAME);
             if let Ok(f) = std::fs::read_to_string(&ws_findings) {
                 let _ = std::fs::copy(&ws_findings, home.join(FINDINGS_NAME));
                 findings = Some(f);
@@ -958,13 +1599,12 @@ fn review_only(
         if audit.status == "skipped" {
             // Re-run the deterministic audit against the remounted tenant so a
             // stale/skipped audit.json never blocks re-review.
-            let fresh = post_run(&home);
+            let fresh = post_run(&review_ws, &home);
             audit = fresh.audit;
             if findings.is_none() {
                 findings = fresh.findings;
             }
         }
-        let _ = umount(&ra.bin, &home.join("workspace"), &home, &mut child);
     }
     let post = PostRun { audit, findings };
     let facts = build_facts_with(
@@ -973,11 +1613,29 @@ fn review_only(
         worker_code,
         timed_out,
         worker_secs,
-        tree_override,
+        Some(format!(
+            "{}\n```\n### Key file contents (collected on the fresh review mount)\n```\n{}",
+            review_acc.tree, review_acc.key_files
+        )),
         &marker,
         &post,
+        &served,
+        &review_acc,
     );
     let review = run_reviewer(b, &home, &facts, timeout);
+
+    if let Some(c) = review_mount.as_mut() {
+        let _ = umount(
+            &ra.bin,
+            &home.join("review").join("workspace"),
+            &home.join("review").join("mount.log"),
+            c,
+        );
+    }
+    if let Some(c) = server_child.as_mut() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
     let verdict = compose_verdict(
         timed_out,
         marker
@@ -1024,6 +1682,8 @@ fn build_facts(
     worker_secs: u64,
     marker: &Option<String>,
     post: &PostRun,
+    served: &ServedAcceptance,
+    review_acc: &ReviewAcceptance,
 ) -> String {
     build_facts_with(
         a,
@@ -1034,6 +1694,8 @@ fn build_facts(
         None,
         marker,
         post,
+        served,
+        review_acc,
     )
 }
 
@@ -1047,6 +1709,8 @@ fn build_facts_with(
     tree_override: Option<String>,
     marker: &Option<String>,
     post: &PostRun,
+    served: &ServedAcceptance,
+    review_acc: &ReviewAcceptance,
 ) -> String {
     let home = &ctx.home;
     let bin_ver = Command::new(&a.bin)
@@ -1089,6 +1753,18 @@ fn build_facts_with(
         "```\n\n### Deterministic workspace audit (machine-collected, hard evidence)\n```\n",
     );
     s.push_str(&post.audit.facts_text());
+    s.push_str("\n```\n\n### Served-site browser acceptance (product fetched from the port the way a browser would)\n```\n");
+    s.push_str(&served.facts_text());
+    s.push_str("\n```\n\n### Cross-mount acceptance (reviewer FRESH mountpoint, separate cache-dir/local-root)\n```\n");
+    s.push_str(&review_acc.facts_text());
+    if review_acc.mounted {
+        s.push_str("\n```\n\n### Workspace tree (from the reviewer's fresh mount)\n```\n");
+        s.push_str(&review_acc.tree);
+        if !review_acc.key_files.trim().is_empty() {
+            s.push_str("\n```\n\n### Key file contents (from the reviewer's fresh mount)\n```\n");
+            s.push_str(&review_acc.key_files);
+        }
+    }
     s.push_str("\n```\n\n### Worker-reported fs findings (fs-findings.md)\n```\n");
     match &post.findings {
         Some(f) if !f.trim().is_empty() => s.push_str(f.trim()),
@@ -1490,7 +2166,7 @@ mod tests {
         )
         .unwrap();
 
-        let post = post_run(&dir);
+        let post = post_run(&dir.join("workspace"), &dir);
         assert_eq!(post.audit.status, "ok");
         assert_eq!(post.audit.stability, Some(true));
         assert_eq!(post.audit.probe, Some(true));

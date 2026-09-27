@@ -119,6 +119,22 @@ WORKERS=${WORKERS:-4}
 - Callers MAY override them via the environment (`FILES=1000 drive9-simulator run …`) to obtain multiple independent runs.
 - The engine performs no tier expansion and no text templating; this language has no tier concept.
 
+**Custom payload (`PAYLOAD_DIR`)** — a case whose workload is a file set (import / build / export / recovery over a project tree) SHOULD accept an externally supplied one:
+
+```sh
+PAYLOAD_DIR=${PAYLOAD_DIR:-}          # reserved name
+if [ -n "$PAYLOAD_DIR" ]; then
+    cp -a "$PAYLOAD_DIR/." target/    # copy in; never modify the source
+else
+    : # ... default synthetic generation ...
+fi
+```
+
+- `PAYLOAD_DIR` is provided either by the run CLI flag `--payload-dir <dir>` (validated: existing, non-empty directory; recorded in `run.json`; exported to BOTH the real run and the control replay) or directly as an environment variable.
+- The payload source is **read-only input**: the script MUST copy from it and MUST NOT write, move, or delete anything inside it; both executions (real + control) read the same source, so a consumed/mutated source corrupts the control oracle (§4.1).
+- With a custom payload the case's oracles must stay content-agnostic (derived from the copied input, or compared against `control`); fixed-content assertions that only hold for the default generation MUST be guarded by the existence of the referenced entries.
+- A case that declares `PAYLOAD_DIR` support MUST fail loudly when the directory is empty (a scenario that cannot produce evidence must never degrade silently, §4.3).
+
 ### 4.3 Injected-command rules
 
 - The prefix `drive9-test-` is **reserved**: the script MUST NOT define, alias or shadow any `drive9-test-*` name (functions, aliases, PATH substitution are all forbidden); calling a `drive9-test-*` name outside the registry is an error.
@@ -306,6 +322,7 @@ The control run's artifacts live under `control/`; its terminal state is the val
 drive9-simulator run <file.test> --sandbox host|firecracker [--server …] [--bin …]
     [--home …] [--repeat N] [--budget <name>=<threshold> …]
     [--timeout D] [--durability fsync|auto] [--overlay glob,…] [--write-cache-size-mb N]
+    [--payload-dir <dir>]
 drive9-simulator validate <file.test…> [--trace <file>]
 ```
 
@@ -337,8 +354,8 @@ drive9-test-check   <kind> [kind args…] --req T [--claim ID] [--accept S1,S2]
                     kind: shell | manifest-equals | manifest-contains | manifest-absent
                         | sync-ok | no-pending | fault-fired | metrics | artifact-contains
 
-run CLI  --timeout  --durability  --overlay  --write-cache-size-mb   (environment knobs, never in-script)
-env      D9_MOUNT  D9_CONTROL
+run CLI  --timeout  --durability  --overlay  --write-cache-size-mb  --payload-dir   (environment knobs, never in-script)
+env      D9_MOUNT  D9_CONTROL  PAYLOAD_DIR (§4.2, optional custom workload file set)
 ```
 
 (`vm` kill target = reserved, unimplemented.)

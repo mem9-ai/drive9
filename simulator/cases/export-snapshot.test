@@ -36,14 +36,27 @@
 #   - Any unexpected failure inside a segment aborts the script via set -e and
 #     fails the run.
 set -eu
+PAYLOAD_DIR=${PAYLOAD_DIR:-}
 
-# --- Step 1: build the v1 tree and fix its fingerprints (writes stopped) ---
+# --- Step 1: build the v1 tree and fix its fingerprints (writes stopped).
+#     PAYLOAD_DIR (optional, case-spec 4.2): an external site tree (e.g. a real
+#     workbench build) seeds `site/` instead of the synthetic v1 tree; the
+#     export/change-set oracles below are derived from the seeded tree, and the
+#     v2 change set picks index/removed/stable targets dynamically. ---
+if [ -n "$PAYLOAD_DIR" ]; then
+  mkdir -p site
+  cp -a "$PAYLOAD_DIR/." site/
+  [ -n "$(find site -type f | head -1)" ] || {
+    echo "PAYLOAD-EMPTY: $PAYLOAD_DIR has no files"; exit 1; }
+else
 mkdir -p site/src site/assets
 printf '<html>export v1</html>\n'   > site/index.html
 printf 'body{}\n'                    > site/styles.css
 printf 'app v1\n'                    > site/src/app.js
 head -c 65536 /dev/zero | tr '\0' 'e' > site/assets/hero.bin
+fi
 ( cd site && find . -type f | sort | xargs sha256sum > ../site-v1.SHA256SUMS )
+
 
 # --- Steps 2/3: first export - tar, unpack into a separate local directory,
 #      compare both ways against the fingerprint manifest (paths / sizes /
@@ -57,11 +70,16 @@ cmp /tmp/x1/got-v1 site-v1.SHA256SUMS
 echo "export v1 complete no-dupes"
 
 # --- Apply the change set to reach v2 (second export starts after writes
-#     stop): replace index, remove styles, add about ---
-printf '<html>export v2</html>\n' > site/index.html
-rm site/styles.css
+#     stop): replace index, remove styles, add about. In payload mode the
+#     targets are discovered from the seeded tree; a missing styles.css
+#     simply drops the removal leg (recorded). ---
+removed=""
+idx=$(find site -maxdepth 1 -type f -name 'index.html' | head -1)
+printf '<html>export v2</html>\n' > "${idx:-site/index.html}"
+if [ -e site/styles.css ]; then removed=styles.css; rm site/styles.css; fi
 mkdir -p site/pages
 printf '<html>about</html>\n'      > site/pages/about.html
+echo "v2 change set: index=${idx:-created} removed=${removed:-none}"
 
 # --- Step 4: the second export must read the actual v2 state, unaffected by
 #     stale directory / stale content caches ---
@@ -69,8 +87,12 @@ rm -rf /tmp/x2 && mkdir -p /tmp/x2
 tar cf /tmp/e2.tar site
 tar xf /tmp/e2.tar -C /tmp/x2
 [ "$(cat /tmp/x2/site/index.html)" = "<html>export v2</html>" ]
-[ -e /tmp/x2/site/pages/about.html ] && [ ! -e /tmp/x2/site/styles.css ]
-cmp /tmp/x2/site/src/app.js site/src/app.js
+[ -e /tmp/x2/site/pages/about.html ]
+if [ -n "$removed" ]; then [ ! -e /tmp/x2/site/styles.css ]; fi
+# one untouched file must survive the second export byte-identically (pick a
+# stable target that the change set did not touch)
+stable=$(cd site && find . -type f ! -name 'index.html' ! -name 'styles.css' ! -name 'about.html' | sort | head -1)
+if [ -n "$stable" ]; then cmp "/tmp/x2/site/$stable" "site/$stable"; fi
 echo "second export fresh"
 
 # --- Step 5: deliverable - local build output copied into the mount (the

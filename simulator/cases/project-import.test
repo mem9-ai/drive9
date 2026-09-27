@@ -30,14 +30,30 @@
 # FILES=100 and FILES=1000 are two tiers that produce separate verdicts.
 set -eu
 FILES=${FILES:-100}
+PAYLOAD_DIR=${PAYLOAD_DIR:-}
 export FILES
+
+# PAYLOAD_DIR (optional, see case-spec 4.2): when set to an external project
+# tree (e.g. exported from a simulator workbench run), it replaces the default
+# synthetic generation as the staged import input; the zip/clone/scan oracles
+# are all derived from the staged tree, so they hold for any payload. The
+# default generation's special-entry checks run only when the staged tree
+# actually contains those entries.
 
 # ---- Pre-build inputs: a fixed tree (>= 4 levels, with empty / hidden / Chinese /
 #      space-in-name / executable / symlink entries) + zip archive + git repository;
 #      everything lives in an ordinary local directory (/tmp) and never passes
 #      through the mount under test [scenario1-step1 prerequisite] ----
 T=/tmp/d9case/project-import
-rm -rf "$T" && mkdir -p "$T/staged/src/deep/a/b/c" "$T/staged/pages" "$T/staged/assets" "$T/repo"
+rm -rf "$T" && mkdir -p "$T/staged"
+if [ -n "$PAYLOAD_DIR" ]; then
+  # custom payload: copy the external tree in as the staged input (read-only
+  # source); FILES is ignored in this mode
+  cp -a "$PAYLOAD_DIR/." "$T/staged/"
+  [ -n "$(find "$T/staged" \( -type f -o -type l \) | head -1)" ] || {
+    echo "PAYLOAD-EMPTY: $PAYLOAD_DIR has no files"; exit 1; }
+else
+mkdir -p "$T/staged/src/deep/a/b/c" "$T/staged/pages" "$T/staged/assets"
 n=$FILES
 i=0
 while [ $i -lt $n ]; do
@@ -52,6 +68,7 @@ while [ $i -lt $n ]; do
 done
 printf '#!/bin/sh\necho run\n' > "$T/staged/src/tool.sh" && chmod 755 "$T/staged/src/tool.sh"
 ln -s ../assets/img-1.bin "$T/staged/src/img-link"
+fi
 ( cd "$T/staged" && find . \( -type f -o -type l \) -print0 | sort -z | xargs -0 sha256sum > "$T/staged.SHA256SUMS" 2>/dev/null || \
   ( cd "$T/staged" && find . -type f -print0 | sort -z | xargs -0 sha256sum > "$T/staged.SHA256SUMS" ) )
 # -y is mandatory: by default Info-ZIP zip follows symlinks and stores their
@@ -59,7 +76,9 @@ ln -s ../assets/img-1.bin "$T/staged/src/img-link"
 # same happens when unpacking into a plain local directory), and each symlink entry
 # would gain a phantom duplicate.
 ( cd "$T/staged" && zip -qry "$T/staged.zip" . )
-# Pinned git repository (with a single commit)
+# Pinned git repository (with a single commit) — built from the staged tree
+# (default generation or custom payload alike)
+mkdir -p "$T/repo"
 cp -a "$T/staged/." "$T/repo/"
 ( cd "$T/repo" && rm -rf .git && git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm base )
 find "$T/staged" -type f | wc -l
@@ -90,12 +109,14 @@ for d in by-zip by-git; do
   ( cd "$T/staged" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > /tmp/scan-exp.sum
   cmp -s "/tmp/scan-$d.sum" /tmp/scan-exp.sum || { echo "DIGEST-MISMATCH $d"; fail=1; }
 done
-[ -x by-zip/src/tool.sh ]            || { echo "EXEC-BIT-LOST"; fail=1; }
-[ "$(readlink by-zip/src/img-link)" = "../assets/img-1.bin" ] || { echo "LINK-TARGET-LOST"; fail=1; }
-[ -e "by-zip/pages/页面-1.html" ]    || { echo "CJK-NAME-LOST"; fail=1; }
-[ -e "by-zip/pages/note 1.md" ]      || { echo "SPACE-NAME-LOST"; fail=1; }
-[ -e by-zip/src/.hidden-1 ]          || { echo "HIDDEN-LOST"; fail=1; }
-[ -e by-zip/src/empty-1 ]            || { echo "EMPTY-LOST"; fail=1; }
+# attribute checks apply only to entries the staged input actually has (the
+# default generation always has them; a custom payload may not)
+[ ! -e "$T/staged/src/tool.sh" ]  || [ -x by-zip/src/tool.sh ]  || { echo "EXEC-BIT-LOST"; fail=1; }
+[ ! -L "$T/staged/src/img-link" ] || [ "$(readlink by-zip/src/img-link)" = "$(readlink "$T/staged/src/img-link")" ] || { echo "LINK-TARGET-LOST"; fail=1; }
+[ ! -e "$T/staged/pages/页面-1.html" ] || [ -e "by-zip/pages/页面-1.html" ] || { echo "CJK-NAME-LOST"; fail=1; }
+[ ! -e "$T/staged/pages/note 1.md" ]   || [ -e "by-zip/pages/note 1.md" ]   || { echo "SPACE-NAME-LOST"; fail=1; }
+[ ! -e "$T/staged/src/.hidden-1" ]     || [ -e by-zip/src/.hidden-1 ]       || { echo "HIDDEN-LOST"; fail=1; }
+[ ! -e "$T/staged/src/empty-1" ]       || [ -e by-zip/src/empty-1 ]         || { echo "EMPTY-LOST"; fail=1; }
 echo "scan done fail=$fail"
 [ $fail -eq 0 ]
 

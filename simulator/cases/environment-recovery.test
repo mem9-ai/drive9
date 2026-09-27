@@ -32,22 +32,35 @@
 #   git-committed and uncommitted dirty state side by side); the pre-exit
 #   manifest = the tree itself.
 set -eu
+PAYLOAD_DIR=${PAYLOAD_DIR:-}
 
 # ---- scenario12-step1 - seed: fixed project + add/modify/delete/rename
 # churn + git committed/uncommitted side by side; after the drain, pin the
-# pre-exit manifest (= the tree itself) ----
-mkdir -p proj/src proj/assets
-printf 'app committed\n'              > proj/src/app.js
-printf 'util committed\n'             > proj/src/util.js
-head -c 65536 /dev/zero | tr '\0' 'H' > proj/assets/hero.bin
+# pre-exit manifest (= the tree itself).
+# PAYLOAD_DIR (optional, case-spec 4.2): an external project tree (e.g. a real
+# workbench workspace export) is copied in at proj/ root as additional content
+# that must survive all three recovery legs digest-exactly (it is covered by
+# the manifest-equals checks). The case's fixed churn tree lives under the
+# case-owned proj/case-seed/ prefix so payload names can never collide with
+# the churn paths. ----
+mkdir -p proj
+if [ -n "$PAYLOAD_DIR" ]; then
+  cp -a "$PAYLOAD_DIR/." proj/
+  [ -n "$(find proj -type f | head -1)" ] || {
+    echo "PAYLOAD-EMPTY: $PAYLOAD_DIR has no files"; exit 1; }
+fi
+mkdir -p proj/case-seed/src proj/case-seed/assets
+printf 'app committed\n'              > proj/case-seed/src/app.js
+printf 'util committed\n'             > proj/case-seed/src/util.js
+head -c 65536 /dev/zero | tr '\0' 'H' > proj/case-seed/assets/hero.bin
 ( cd proj && git init -q && git config user.email t@t && git config user.name t \
   && git add -A && git commit -qm base )
 # churn (uncommitted)
-printf 'uncommitted new feature\n'    > proj/src/new-feature.js
-printf 'app dirty edit\n'             > proj/src/app.js
-printf 'doomed legacy\n'              > proj/src/legacy.js
-mv proj/src/util.js proj/src/helpers.js
-rm proj/src/legacy.js
+printf 'uncommitted new feature\n'    > proj/case-seed/src/new-feature.js
+printf 'app dirty edit\n'             > proj/case-seed/src/app.js
+printf 'doomed legacy\n'              > proj/case-seed/src/legacy.js
+mv proj/case-seed/src/util.js proj/case-seed/src/helpers.js
+rm proj/case-seed/src/legacy.js
 drive9-test-drain --mode require-ok --timeout 120s
 drive9-test-sample pre-exit
 
@@ -70,10 +83,10 @@ echo "resumed, mount serving"
 # ---- Leg 1 - bare verification (no init/install/build scripts run):
 # paths/contents/uncommitted changes/deleted stay deleted/renames preserved
 # [scenario12-step4/step5] ----
-printf 'app dirty edit\n'           | cmp - proj/src/app.js
-printf 'util committed\n'           | cmp - proj/src/helpers.js
-printf 'uncommitted new feature\n'  | cmp - proj/src/new-feature.js
-[ ! -e proj/src/legacy.js ] && [ ! -e proj/src/util.js ]
+printf 'app dirty edit\n'           | cmp - proj/case-seed/src/app.js
+printf 'util committed\n'           | cmp - proj/case-seed/src/helpers.js
+printf 'uncommitted new feature\n'  | cmp - proj/case-seed/src/new-feature.js
+[ ! -e proj/case-seed/src/legacy.js ] && [ ! -e proj/case-seed/src/util.js ]
 [ -e proj/assets/hero.bin ]
 echo "tree verified bare"
 
@@ -83,16 +96,16 @@ drive9-test-remount --cache same
 cd "$D9_MOUNT"
 
 # ---- Leg 2 - bare verification (same as above) ----
-printf 'app dirty edit\n'           | cmp - proj/src/app.js
-printf 'util committed\n'           | cmp - proj/src/helpers.js
-printf 'uncommitted new feature\n'  | cmp - proj/src/new-feature.js
-[ ! -e proj/src/legacy.js ] && [ ! -e proj/src/util.js ]
+printf 'app dirty edit\n'           | cmp - proj/case-seed/src/app.js
+printf 'util committed\n'           | cmp - proj/case-seed/src/helpers.js
+printf 'uncommitted new feature\n'  | cmp - proj/case-seed/src/new-feature.js
+[ ! -e proj/case-seed/src/legacy.js ] && [ ! -e proj/case-seed/src/util.js ]
 [ -e proj/assets/hero.bin ]
 echo "tree verified bare"
 
 # ---- Leg 3 - clean environment (no original cache); first write only one
 # new file (no old-data rebuild triggered) ----
-printf 'written after recovery\n' > proj/src/after-recovery.js
+printf 'written after recovery\n' > proj/case-seed/src/after-recovery.js
 drive9-test-drain --mode require-ok --timeout 120s
 drive9-test-sample pre-exit-2
 drive9-test-kill client
@@ -102,9 +115,9 @@ drive9-test-sample recovered-fresh
 
 # ---- Continue read/write + sync after recovery (no pending tasks affect
 # subsequent operations) [scenario12-step6] ----
-printf 'next round after recovery\n' > proj/src/next-round.js
-printf 'next round after recovery\n' | cmp - proj/src/next-round.js
-printf 'app dirty edit\n'            | cmp - proj/src/app.js
+printf 'next round after recovery\n' > proj/case-seed/src/next-round.js
+printf 'next round after recovery\n' | cmp - proj/case-seed/src/next-round.js
+printf 'app dirty edit\n'            | cmp - proj/case-seed/src/app.js
 echo "post-recovery readwrite ok"
 drive9-test-sample final
 drive9-test-drain --mode require-ok --timeout 120s
@@ -114,7 +127,7 @@ drive9-test-sample remote-final --as remote
 drive9-test-check manifest-equals --this @recovered-fresh --against @pre-exit-2 \
     --ignore '.git/**,.sim/**'                                     --req 'scenario12-check1'
 drive9-test-check manifest-absent --this @recovered-fresh \
-    --paths 'proj/src/legacy.js,proj/src/util.js'                  --req 'scenario12-check2'
+    --paths 'proj/case-seed/src/legacy.js,proj/case-seed/src/util.js'                  --req 'scenario12-check2'
 drive9-test-check manifest-contains --this @remote-final --against @final \
-    --paths 'proj/src/after-recovery.js,proj/src/next-round.js'    --req 'scenario12-check4'
+    --paths 'proj/case-seed/src/after-recovery.js,proj/case-seed/src/next-round.js'    --req 'scenario12-check4'
 drive9-test-check sync-ok                                          --req 'scenario12-step6'

@@ -66,6 +66,10 @@ pub struct RunArgs {
     pub write_cache_size_mb: Option<u64>,
     pub tidbcloud_public_key: Option<String>,
     pub tidbcloud_private_key: Option<String>,
+    /// External workload file set handed to the case via the PAYLOAD_DIR
+    /// script variable (see case-spec §4.2). None = the case's default
+    /// synthetic payload generation runs.
+    pub payload_dir: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------- outcomes
@@ -113,6 +117,7 @@ impl Outcome {
 // ---------------------------------------------------------------- run
 
 pub fn run(a: RunArgs) -> Result<i32> {
+    let mut a = a;
     if !matches!(a.sandbox.as_str(), "host" | "firecracker") {
         bail!("--sandbox {:?} unknown (host | firecracker)", a.sandbox);
     }
@@ -149,6 +154,37 @@ pub fn run(a: RunArgs) -> Result<i32> {
         Some(t) => parse_duration(t)?,
         None => Duration::from_secs(1800),
     };
+
+    // Resolve the payload directory once: it must be a readable directory,
+    // absolute, and is handed to the case script (and the control replay)
+    // as the read-only PAYLOAD_DIR source tree (case-spec §4.2).
+    let payload_dir = match &a.payload_dir {
+        Some(p) => {
+            let abs = if p.is_absolute() {
+                p.clone()
+            } else {
+                std::env::current_dir()?.join(p)
+            };
+            let meta = std::fs::metadata(&abs)
+                .with_context(|| format!("--payload-dir {}: not accessible", abs.display()))?;
+            anyhow::ensure!(
+                meta.is_dir(),
+                "--payload-dir {} is not a directory",
+                abs.display()
+            );
+            let n = std::fs::read_dir(&abs)
+                .with_context(|| format!("--payload-dir {}: not readable", abs.display()))?
+                .count();
+            anyhow::ensure!(
+                n > 0,
+                "--payload-dir {} is empty (a case needs a non-empty workload file set)",
+                abs.display()
+            );
+            Some(abs)
+        }
+        None => None,
+    };
+    a.payload_dir = payload_dir;
 
     let home = a.home.clone().unwrap_or_else(|| {
         let ts = std::time::SystemTime::now()
@@ -302,6 +338,7 @@ fn run_once(
         "ts": now_ms(), "kind": "run-start", "case": name,
         "server": a.server, "sandbox": a.sandbox,
         "durability": runner.durability, "tenant": tenant.0,
+        "payload_dir": a.payload_dir.as_ref().map(|p| p.display().to_string()),
     }));
 
     let runner = Arc::new(Mutex::new(runner));
@@ -391,6 +428,9 @@ fn run_once(
         .env("D9_MOUNT", &ws)
         .env("D9_RUN_DIR", run_dir)
         .env("D9_CONTROL", &sock_path);
+    if let Some(p) = &a.payload_dir {
+        cmd.env("PAYLOAD_DIR", p);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -455,7 +495,7 @@ fn run_once(
 
     // control run if any check references it
     if control_wanted.load(Ordering::Relaxed) {
-        let cres = run_control(script, run_dir, &bindir);
+        let cres = run_control(script, run_dir, &bindir, a.payload_dir.as_deref());
         match cres {
             Ok(entries_c) => {
                 let mut r = runner.lock().unwrap();
@@ -541,6 +581,7 @@ fn run_once(
             "case": name, "ts": now_ms(), "server": a.server,
             "durability": a.durability, "overlay": a.overlay,
             "write_cache_size_mb": a.write_cache_size_mb,
+            "payload_dir": a.payload_dir.as_ref().map(|p| p.display().to_string()),
             "terminal": terminal, "verdict": worst.tag(), "reasons": reasons,
         }))
         .unwrap_or_default(),
@@ -1683,7 +1724,12 @@ fn sb_exec(argv: &[&str], timeout: Duration) -> (bool, String) {
 
 // ---------------------------------------------------------------- control run
 
-fn run_control(script: &Path, run_dir: &Path, real_bindir: &Path) -> Result<Vec<Entry>> {
+fn run_control(
+    script: &Path,
+    run_dir: &Path,
+    real_bindir: &Path,
+    payload_dir: Option<&Path>,
+) -> Result<Vec<Entry>> {
     let cws = run_dir.join("control");
     let _ = std::fs::remove_dir_all(&cws);
     std::fs::create_dir_all(&cws)?;
@@ -1692,8 +1738,8 @@ fn run_control(script: &Path, run_dir: &Path, real_bindir: &Path) -> Result<Vec<
     let _ = real_bindir;
     let script_log = run_dir.join("logs").join("control.out");
     let orig_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
-    let status = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg("umask 022; exec sh \"$@\"")
         .arg("d9-control")
         .arg(script)
@@ -1705,9 +1751,13 @@ fn run_control(script: &Path, run_dir: &Path, real_bindir: &Path) -> Result<Vec<
         .env("D9_STUB", "1")
         .env("D9_MOUNT", &cws)
         .env("PATH", format!("{}:{}", stub_bin.display(), orig_path))
-        .env_remove("D9_CONTROL")
-        .status()
-        .context("control run spawn")?;
+        .env_remove("D9_CONTROL");
+    // The control replay reads the same read-only payload source as the real
+    // run so a payload-fed case reproduces the identical tree locally.
+    if let Some(p) = payload_dir {
+        cmd.env("PAYLOAD_DIR", p);
+    }
+    let status = cmd.status().context("control run spawn")?;
     let _ = status;
     walk(cws)
 }

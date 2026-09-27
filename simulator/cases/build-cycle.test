@@ -20,12 +20,24 @@
 # Input: SRC_PARTS fixed src/*.part files + a deterministic build.js (the SLOW env
 #       var injects a per-file delay, used by the interrupted segment);
 #       final state = the full-tree manifest after cleanup and rebuild.
+# PAYLOAD_DIR (optional, case-spec 4.2): an external source tree (e.g. a real
+# workbench project) replaces the synthetic src/*.part set; build.js reads
+# every regular file in src/ (sorted), so any file set builds; the change set
+# is derived from the actual file names.
 set -eu
 SRC_PARTS=${SRC_PARTS:-3}
+PAYLOAD_DIR=${PAYLOAD_DIR:-}
 
 # --- Fixed sources + deterministic build script (SLOW injects a per-file delay,
 #     used by the interrupted segment) [scenario9-step1] ---
 mkdir -p src
+if [ -n "$PAYLOAD_DIR" ]; then
+  # custom payload: the external source tree IS the src/ set (read-only
+  # source, copied in); SRC_PARTS is ignored in this mode
+  cp -a "$PAYLOAD_DIR/." src/
+  [ -n "$(find src -type f | head -1)" ] || {
+    echo "PAYLOAD-EMPTY: $PAYLOAD_DIR has no files"; exit 1; }
+else
 printf 'module one v1\n'  > src/1.part
 printf 'module two\n'     > src/2.part
 printf 'module three\n'   > src/3.part
@@ -34,11 +46,13 @@ while [ $i -le $SRC_PARTS ]; do
   printf 'module %s\n' "$i" > "src/$i.part"
   i=$((i+1))
 done
+fi
 cat > build.js <<'EOF'
 const fs = require('fs');
 const crypto = require('crypto');
 const slow = Number(process.env.SLOW || 0);
-const parts = fs.readdirSync('src').filter(f => f.endsWith('.part')).sort();
+const parts = fs.readdirSync('src', { withFileTypes: true })
+  .filter(e => e.isFile()).map(e => e.name).sort();
 let body = '';
 for (const p of parts) {
   body += fs.readFileSync('src/' + p, 'utf8');
@@ -68,9 +82,17 @@ node build.js
 echo "clean rebuild byte-identical"
 
 # --- Fixed source change set: 1 modify + 1 add + 1 delete [scenario9-step3] ---
+if [ -n "$PAYLOAD_DIR" ]; then
+  first=$(find src -maxdepth 1 -type f | sort | head -1)
+  last=$(find src -maxdepth 1 -type f | sort | tail -1)
+  printf 'case-modified v2\n' >> "$first"
+  printf 'module added-by-case\n' > src/case-added.part
+  if [ "$first" != "$last" ]; then rm -f "$last"; fi
+else
 printf 'module one v2\n' > src/1.part
 printf 'module four\n'   > src/4.part
 rm src/3.part
+fi
 
 # --- Build after the change: artifacts reflect the change set exactly (== the new
 #     control run) [scenario9-step3/check3] ---

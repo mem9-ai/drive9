@@ -41,6 +41,11 @@ Once you confirm a suspected filesystem problem per the rubric above:
 
    `TASK-COMPLETE`
 
+## Build-output convention (web deliverables)
+
+- When the task produces a website, build it to a static output directory under the working directory using one of the standard names — `dist/`, `build/`, `_site/`, `out/`, `public/`, or `site/` (or an `index.html` at the workspace root). The harness serves that directory over HTTP after you exit and runs a browser-shaped acceptance against it, so the final build output must be plain static files that load from that directory.
+- Do not leave the product only in a dev-server process: dev servers die with your session. The static output directory is the deliverable.
+
 ## Misc
 
 - The extra time spent on verification is a normal cost of this task; never merge or skip verification steps to save time.
