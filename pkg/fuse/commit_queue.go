@@ -3068,3 +3068,36 @@ func (cq *CommitQueue) lockEntryPath(entry *CommitEntry) func() {
 		}
 	}
 }
+
+// hasFtruncateInode includes closed-source jobs and synchronous claims. It
+// consults existing collections; no separate namespace lifetime/index is kept.
+func (cq *CommitQueue) hasFtruncateInode(ino uint64, paths []string) bool {
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	matches := func(e *CommitEntry) bool {
+		return e != nil && !e.canceled && e.Inode == ino && len(e.ftruncatePaths) != 0
+	}
+	for _, path := range paths {
+		if matches(cq.inFlight[path]) {
+			return true
+		}
+		for e := range cq.queuedByPath[path] {
+			if matches(e) {
+				return true
+			}
+		}
+	}
+	if cq.queuedByPath == nil {
+		for _, e := range cq.queue {
+			if matches(e) {
+				return true
+			}
+		}
+	}
+	for e := range cq.immediate {
+		if matches(e) {
+			return true
+		}
+	}
+	return false
+}
