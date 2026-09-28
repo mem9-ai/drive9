@@ -80,5 +80,8 @@ func refreshLayerEvents(ctx context.Context, c *client.Client, opts *MountOption
 	if err := restoreLayerEntries(ctx, c, opts, shadows, pending, fs); err != nil {
 		return since, err
 	}
+	// Existing handles and kernel pages must stop serving the old payload.
+	fs.resetMountView()
+	fs.markStatCacheUnverified()
 	return maxSeq, nil
 }

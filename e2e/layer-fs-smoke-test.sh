@@ -578,6 +578,30 @@ wait_layer_diff_entries() {
   done
 }
 
+wait_mounted_layer_file() {
+	python3 - "$1" "$2" "$LAYER_DIFF_TIMEOUT_S" <<'PY_LAYER_REFRESH'
+import subprocess
+import sys
+import time
+
+path, expected, timeout = sys.argv[1:]
+deadline = time.monotonic() + float(timeout)
+while time.monotonic() < deadline:
+    command = ["test", "-e", path] if expected == "absent" else ["cat", path]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=2)
+        if expected == "absent":
+            if result.returncode == 1:
+                sys.exit(0)
+        elif result.returncode == 0 and result.stdout.decode().rstrip("\n") == expected:
+            sys.exit(0)
+    except subprocess.TimeoutExpired:
+        pass
+    time.sleep(0.1)
+raise SystemExit(f"mounted Layer did not refresh {path}: expected {expected!r}")
+PY_LAYER_REFRESH
+}
+
 wait_layer_diff_file_mode() {
   local layer_ref="$1"
   local path="$2"
@@ -1268,6 +1292,12 @@ import sys
 with open(sys.argv[1], "r+b") as f:
     os.fsync(f.fileno())
 PY_FSYNC
+  printf 'external original %s\n' "$ts" >"$mount_a/external.txt"
+  check_eq "layer mount caches original content" "$(cat "$mount_a/external.txt")" "external original ${ts}"
+  put_layer_entry "$fuse_layer_name" "${fuse_root}/external.txt" "upsert" "file" "external changed ${ts}"
+  check_cmd "layer event refresh replaces clean cached content" wait_mounted_layer_file "$mount_a/external.txt" "external changed ${ts}"
+  put_layer_entry "$fuse_layer_name" "${fuse_root}/external.txt" "whiteout" "file" ""
+  check_cmd "layer event refresh removes clean cached file" wait_mounted_layer_file "$mount_a/external.txt" "absent"
   check_cmd "drain layer before unmount" drive9 mount drain --timeout 10s "$mount_a"
   check_cmd "unmount first layer mount" unmount_layer_mount
   check_cmd "first layer mount log clean" audit_mount_log "$log_a"
@@ -1302,6 +1332,7 @@ PY_FSYNC
   check_cmd "no-IO restore mount log clean" audit_mount_log "$log_c"
   start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" "$mount_c" "$local_c" "$log_c"
   check_eq "fresh restore includes post-checkpoint write" "$(cat "$mount_c/after.txt")" "fuse after checkpoint ${ts}"
+  check_cmd_fail "external deletion survives remount" test -e "$mount_c/external.txt"
   check_cmd "delete and rename durable new layer files" python3 - "$mount_c" <<'PY_NAMESPACE'
 import os
 import pathlib

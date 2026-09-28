@@ -2081,6 +2081,19 @@ func runUmount(args []string, deps umountDeps) error {
 		return fmt.Errorf("drive9 umount: --pack-path requires an auto-pack mount or --pack")
 	}
 
+	readWorkerExitError := func() error {
+		if *waitTimeout <= 0 || workerPID <= 0 || deps.readExitReason == nil {
+			return nil
+		}
+		rec, _, err := deps.readExitReason(stateMountPoint)
+		if err == nil {
+			return unmountWorkerExitError(rec, workerPID, workerCreation, umountReceipt)
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read mount exit status: %w", err)
+	}
 	var runErr error
 	// Supervised stop already asked the supervisor to unmount. Fusermount /
 	// force-unmount and token/state clear are generation+lock gated so a
@@ -2115,8 +2128,8 @@ func runUmount(args []string, deps umountDeps) error {
 		})
 		if !owned {
 			// Successor already owns the mountpoint. Do not re-read pidfile,
-			// wait on B, pack B's overlay, or fusermount B. Preserve A's error.
-			return stopErr
+			// wait on B, pack B's overlay, or fusermount B. Preserve A's errors.
+			return errors.Join(stopErr, readWorkerExitError())
 		}
 	} else if stoppedSupervisor && !mountPointStillActive(mountPoint) {
 		runErr = nil
@@ -2205,14 +2218,7 @@ func runUmount(args []string, deps umountDeps) error {
 	}
 
 	runErr = errors.Join(runErr, stopErr)
-	if *waitTimeout > 0 && workerPID > 0 && deps.readExitReason != nil {
-		rec, _, readErr := deps.readExitReason(stateMountPoint)
-		if readErr == nil {
-			runErr = errors.Join(runErr, unmountWorkerExitError(rec, workerPID, workerCreation, umountReceipt))
-		} else if !errors.Is(readErr, os.ErrNotExist) {
-			runErr = errors.Join(runErr, fmt.Errorf("read mount exit status: %w", readErr))
-		}
-	}
+	runErr = errors.Join(runErr, readWorkerExitError())
 	state, path, stateOK, err := readUnmountProcessState(deps, stateMountPoint)
 	if err != nil {
 		if runErr != nil {

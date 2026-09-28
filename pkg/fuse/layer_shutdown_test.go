@@ -243,7 +243,7 @@ func TestLayerCleanGenerationAndRecovery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := pending.MarkLayerCommittedIfGeneration("/a", gen, 0, 0, false); err != nil {
+			if err := pending.MarkLayerCommittedIfGeneration("/a", gen, 0, 0, false, LayerCacheIdentity{}); err != nil {
 				t.Fatal(err)
 			}
 			if len(pending.ListUncommittedPaths()) != 0 {
@@ -284,7 +284,7 @@ func TestLayerCleanGenerationAndRecovery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := pending.MarkLayerCommittedIfGeneration("/a", gen, 0, 0, false); err != nil {
+			if err := pending.MarkLayerCommittedIfGeneration("/a", gen, 0, 0, false, LayerCacheIdentity{}); err != nil {
 				t.Fatal(err)
 			}
 			for _, idx := range []*PendingIndex{pending, recoverIndex()} {
@@ -356,7 +356,7 @@ func TestLayerStartupRecoverySkipsCleanAndUploadsDirty(t *testing.T) {
 				t.Fatal(err)
 			}
 			if clean {
-				if _, err := pending.PutLayerCache("/a", 4, 5, 0, false); err != nil {
+				if _, err := pending.PutLayerCache("/a", 4, 5, 0, false, LayerCacheIdentity{}); err != nil {
 					t.Fatal(err)
 				}
 			} else {
@@ -429,7 +429,7 @@ func TestLayerRollbackOnlyConflictsUncommittedWrites(t *testing.T) {
 			if err := shadow.WriteFull("/a", []byte("data"), 0); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := pending.PutLayerCache("/a", 4, 0, 0, false); err != nil {
+			if _, err := pending.PutLayerCache("/a", 4, 0, 0, false, LayerCacheIdentity{}); err != nil {
 				t.Fatal(err)
 			}
 			if dirty {

@@ -58,6 +58,7 @@ type CommitEntry struct {
 	ShadowSpill          bool // true when data is only in shadow file (auto-resolve would OOM)
 	Mode                 uint32
 	HasMode              bool
+	LayerEntry           LayerCacheIdentity // server identity returned by this Layer upload
 	CoalesceZeroTruncate bool
 	// PayloadBaseRev is the revision that the local bytes were derived from.
 	// It is intentionally separate from BaseRev (the CAS revision sent to the
@@ -2341,7 +2342,10 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 			return 0, fmt.Errorf("layer entry %s size mismatch: metadata=%d actual=%d", entry.Path, entry.Size, actualSize)
 		}
 		start := time.Now()
-		_, err = cq.client.UploadFSLayerFile(ctx, layerRef, apiPath, fd, actualSize, expectedRevision, entry.Mode, entry.HasMode)
+		uploaded, err := cq.client.UploadFSLayerFile(ctx, layerRef, apiPath, fd, actualSize, expectedRevision, entry.Mode, entry.HasMode)
+		if err == nil {
+			entry.LayerEntry = layerCacheIdentity(uploaded, layerRef)
+		}
 		if cq.perf != nil {
 			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(actualSize))
 		}
@@ -2370,7 +2374,10 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 		req.Mode = entry.Mode & 0o777
 	}
 	start := time.Now()
-	_, err = cq.client.UpsertFSLayerEntry(ctx, layerRef, req)
+	uploaded, err := cq.client.UpsertFSLayerEntry(ctx, layerRef, req)
+	if err == nil {
+		entry.LayerEntry = layerCacheIdentity(uploaded, layerRef)
+	}
 	if cq.perf != nil {
 		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
 	}
@@ -2519,7 +2526,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		}
 	}
 	if cq.index != nil && cq.layerRefSnapshot() != "" {
-		if err := cq.index.MarkLayerCommittedIfGeneration(entry.Path, entry.PendingIndexGen, committedRev, entry.Mode, entry.HasMode); err != nil {
+		if err := cq.index.MarkLayerCommittedIfGeneration(entry.Path, entry.PendingIndexGen, committedRev, entry.Mode, entry.HasMode, entry.LayerEntry); err != nil {
 			return err
 		}
 	}

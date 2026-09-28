@@ -125,3 +125,64 @@ func TestRunUmountReportsWorkerFailureBeforePacking(t *testing.T) {
 		t.Fatalf("error=%v", err)
 	}
 }
+
+func TestRunUmountSuccessorPreservesOldWorkerExit(t *testing.T) {
+	for _, scenario := range []string{"failed", "clean", "successor_record", "stale_record", "missing", "unreadable", "no_wait"} {
+		t.Run(scenario, func(t *testing.T) {
+			t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+			mp := t.TempDir()
+			child := exec.Command("true")
+			if err := child.Run(); err != nil {
+				t.Fatal(err)
+			}
+			pid := child.ProcessState.Pid()
+			if processAliveImpl(pid) {
+				t.Skip("child PID was reused")
+			}
+			oldLock := tryExclusiveReadyTimeout
+			tryExclusiveReadyTimeout = func(string, func() error) (bool, error) { return false, nil }
+			t.Cleanup(func() { tryExclusiveReadyTimeout = oldLock; _ = mountstate.ClearStopToken(mp) })
+			deps := defaultUmountDeps()
+			reads := 0
+			deps.readProcessState = func(string) (mountstate.ProcessState, string, error) {
+				reads++
+				if reads > 1 {
+					t.Fatal("must not read successor process state")
+				}
+				return mountstate.ProcessState{PID: pid, CreationTime: 11}, "", nil
+			}
+			deps.readExitReason = func(string) (mountstate.ExitReason, string, error) {
+				rec := mountstate.ExitReason{PID: pid, CreationTime: 11, At: time.Now(), Code: 1, Reason: "drain_failed"}
+				switch scenario {
+				case "no_wait":
+					t.Fatal("no-wait unmount must not read an incomplete exit record")
+				case "clean":
+					rec.Code = 0
+				case "successor_record":
+					rec.CreationTime++
+				case "stale_record":
+					rec.At = time.Now().Add(-time.Minute)
+				case "missing":
+					return rec, "", os.ErrNotExist
+				case "unreadable":
+					return rec, "", os.ErrPermission
+				}
+				return rec, "", nil
+			}
+			deps.run = func([]string) error { t.Fatal("must not detach successor"); return nil }
+			deps.packAfterUnmount = func(context.Context, mountstate.ProcessState, []string, []string) error {
+				t.Fatal("must not pack successor")
+				return nil
+			}
+			timeout := "1s"
+			if scenario == "no_wait" {
+				timeout = "0"
+			}
+			err := runUmount([]string{"--no-auto-pack", "--timeout", timeout, mp}, deps)
+			wantError := scenario == "failed" || scenario == "unreadable"
+			if (err != nil) != wantError {
+				t.Fatalf("umount error = %v, want error=%t", err, wantError)
+			}
+		})
+	}
+}

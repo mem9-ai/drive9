@@ -63,7 +63,7 @@ func TestLayerDurableNamespaceMutation(t *testing.T) {
 			if err := shadow.WriteFull("/a", []byte("data"), 0); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := idx.PutLayerCache("/a", 4, 0, 0600, true); err != nil {
+			if _, err := idx.PutLayerCache("/a", 4, 0, 0600, true, LayerCacheIdentity{}); err != nil {
 				t.Fatal(err)
 			}
 			fs := NewDat9FS(newTestClient(ts.URL), &MountOptions{LayerRef: "layer-1", RemoteRoot: "/"})
@@ -126,7 +126,7 @@ func TestLayerRollbackDiscardsDurableView(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if _, err := idx.PutLayerCache("/clean", 4, 0, 0, false); err != nil {
+			if _, err := idx.PutLayerCache("/clean", 4, 0, 0, false, LayerCacheIdentity{}); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := idx.Put("/dirty", 4, PendingNew); err != nil {
@@ -361,7 +361,7 @@ func TestRestoreLayerRebindsCleanReadCache(t *testing.T) {
 	if err := shadow.WriteFull("/a", []byte("data"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := idx.PutLayerCache("/a", 4, 0, 0, false); err != nil {
+	if _, err := idx.PutLayerCache("/a", 4, 0, 0, false, LayerCacheIdentity{LayerID: "layer-1", EntrySeq: 1}); err != nil {
 		t.Fatal(err)
 	}
 	recovered, err := NewPendingIndex(idx.dir)
@@ -381,7 +381,7 @@ func TestRestoreLayerRebindsCleanReadCache(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/layers/layer-1/diff" {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{{Path: "/a", Op: "upsert", Kind: "file", Content: []byte("data"), SizeBytes: 4}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{{LayerID: "layer-1", EntrySeq: 1, Path: "/a", Op: "upsert", Kind: "file", Content: []byte("data"), SizeBytes: 4}}})
 			return
 		}
 		t.Errorf("durable local cache must serve read: %s %s", r.Method, r.URL)
@@ -451,7 +451,7 @@ func TestLayerRollbackFencesLatePublication(t *testing.T) {
 	if err := shadow.WriteFull("/a", []byte("old"), 0); err != nil {
 		t.Fatal(err)
 	}
-	gen, err := idx.PutLayerCache("/a", 3, 0, 0, false)
+	gen, err := idx.PutLayerCache("/a", 3, 0, 0, false, LayerCacheIdentity{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +465,7 @@ func TestLayerRollbackFencesLatePublication(t *testing.T) {
 	if got, err := shadow.ReadAll("/a"); err != nil || string(got) != "new" {
 		t.Fatalf("rollback deleted newer shadow: %q %v", got, err)
 	}
-	if _, err := idx.PutLayerCache("/a", 3, 0, 0, false); !errors.Is(err, errLayerRolledBack) {
+	if _, err := idx.PutLayerCache("/a", 3, 0, 0, false, LayerCacheIdentity{}); !errors.Is(err, errLayerRolledBack) {
 		t.Fatalf("late clean publication accepted: %v", err)
 	}
 	next, err := idx.Put("/a", 3, PendingNew)
@@ -473,7 +473,7 @@ func TestLayerRollbackFencesLatePublication(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, generation := range []uint64{gen, next} {
-		if err := idx.MarkLayerCommittedIfGeneration("/a", generation, 0, 0, false); err != nil {
+		if err := idx.MarkLayerCommittedIfGeneration("/a", generation, 0, 0, false, LayerCacheIdentity{}); err != nil {
 			t.Fatal(err)
 		}
 	}

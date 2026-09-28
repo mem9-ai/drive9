@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +50,8 @@ type JournalEntry struct {
 	Meta []byte `json:"meta,omitempty"`
 }
 
+const defaultJournalCompactBytes = 8 << 20
+
 // Journal is an append-only WAL for crash recovery. Each entry is
 // length-prefixed + CRC32 for integrity verification.
 //
@@ -58,10 +61,12 @@ type JournalEntry struct {
 //	[N bytes: JSON payload]
 //	[4 bytes: CRC32 of payload (little-endian uint32)]
 type Journal struct {
-	mu   sync.Mutex
-	fd   *os.File
-	seq  atomic.Uint64
-	path string
+	mu                sync.Mutex
+	fd                *os.File
+	seq               atomic.Uint64
+	path              string
+	appendedBytes     int64
+	compactAfterBytes int64
 
 	// syncMu serializes actual fd.Sync calls so concurrent FsyncShared
 	// waiters coalesce into one fsync (group commit). doneGen (guarded by
@@ -79,10 +84,12 @@ func NewJournal(path string) (*Journal, error) {
 		return nil, fmt.Errorf("journal open: %w", err)
 	}
 	j := &Journal{
-		fd:   fd,
-		path: path,
+		fd:                fd,
+		path:              path,
+		compactAfterBytes: defaultJournalCompactBytes,
 	}
 	if data, err := os.ReadFile(path); err == nil {
+		j.appendedBytes = int64(len(data))
 		var maxSeq uint64
 		scanJournalFrames(data, func(entry JournalEntry, _ []byte) {
 			if entry.Seq > maxSeq {
@@ -124,6 +131,13 @@ func scanJournalFrames(data []byte, fn func(entry JournalEntry, frame []byte)) {
 // Append writes a journal entry to the WAL. The entry is length-prefixed
 // and CRC32-checksummed for integrity.
 func (j *Journal) Append(entry JournalEntry) error {
+	if err := j.appendEntry(entry); err != nil {
+		return err
+	}
+	return j.compact(false)
+}
+
+func (j *Journal) appendEntry(entry JournalEntry) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
@@ -144,7 +158,8 @@ func (j *Journal) Append(entry JournalEntry) error {
 	checksum := crc32.ChecksumIEEE(payload)
 	binary.LittleEndian.PutUint32(frame[4+len(payload):], checksum)
 
-	_, err = j.fd.Write(frame)
+	n, err := j.fd.Write(frame)
+	j.appendedBytes += int64(n)
 	if err != nil {
 		return fmt.Errorf("journal write: %w", err)
 	}
@@ -248,9 +263,21 @@ func (j *Journal) Replay(fn func(JournalEntry)) error {
 	return nil
 }
 
-// Compact removes all committed entries from the journal by rewriting
-// the file with only uncommitted entries.
+// Compact removes completed history and publications superseded by a newer
+// complete pending-meta frame. Data recorded after that frame is retained.
 func (j *Journal) Compact() error {
+	return j.compact(true)
+}
+
+func (j *Journal) compact(force bool) error {
+	if !force {
+		j.mu.Lock()
+		needed := j.compactAfterBytes > 0 && j.appendedBytes >= j.compactAfterBytes
+		j.mu.Unlock()
+		if !needed {
+			return nil
+		}
+	}
 	// syncMu before mu matches FsyncShared's order and keeps the fd swap
 	// below from racing an in-flight Sync.
 	j.syncMu.Lock()
@@ -263,29 +290,31 @@ func (j *Journal) Compact() error {
 		return err
 	}
 
-	// First pass: find the highest committed sequence per path.
-	// Only entries with Seq <= committedUpTo[path] are safe to discard.
-	// Entries written after the commit must be preserved for recovery.
-	committedUpTo := make(map[string]uint64) // path → max committed seq
+	// Recheck under the rewrite locks: another appender may have compacted.
+	if !force && j.appendedBytes < j.compactAfterBytes {
+		return nil
+	}
+	done := make(map[string]uint64)
+	latestMeta := make(map[string]uint64)
 	scanJournalFrames(data, func(entry JournalEntry, _ []byte) {
-		if entry.Op == JournalCommit && entry.Seq > committedUpTo[entry.Path] {
-			committedUpTo[entry.Path] = entry.Seq
+		switch entry.Op {
+		case JournalCommit, JournalUnlink:
+			done[entry.Path] = max(done[entry.Path], entry.Seq)
+		case JournalPendingMeta:
+			latestMeta[entry.Path] = max(latestMeta[entry.Path], entry.Seq)
 		}
 	})
-
-	if len(committedUpTo) == 0 {
-		return nil // nothing to compact
-	}
-
-	// Second pass: keep frames that are newer than the commit boundary
-	// for their path, and all frames for paths without a commit marker.
 	var kept []byte
 	scanJournalFrames(data, func(entry JournalEntry, frame []byte) {
-		boundary, hasCommit := committedUpTo[entry.Path]
-		if !hasCommit || entry.Seq > boundary {
-			kept = append(kept, frame...)
+		if entry.Seq <= done[entry.Path] || entry.Seq < latestMeta[entry.Path] {
+			return
 		}
+		kept = append(kept, frame...)
 	})
+	if len(kept) == len(data) {
+		j.appendedBytes = 0
+		return nil
+	}
 
 	// Rewrite journal file.
 	tmpPath := j.path + ".compact"
@@ -303,6 +332,11 @@ func (j *Journal) Compact() error {
 		return fmt.Errorf("journal reopen: %w", err)
 	}
 	j.fd = fd
+	if err := fsyncDir(filepath.Dir(j.path)); err != nil {
+		return fmt.Errorf("journal compact sync directory: %w", err)
+	}
+	j.appendedBytes = 0
+	j.doneGen = j.seq.Load()
 	return nil
 }
 

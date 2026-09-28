@@ -199,14 +199,14 @@ func (idx *PendingIndex) PutWithBaseRevAndMode(remotePath string, size int64, ki
 
 // PutLayerCache publishes content already persisted in a Layer. It remains
 // visible through the overlay index, but does not require another upload.
-func (idx *PendingIndex) PutLayerCache(remotePath string, size int64, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
-	return idx.putInternal(WriteBackMeta{Path: remotePath, Size: size, Kind: PendingOverwrite, BaseRev: baseRev, Mode: mode, HasMode: hasMode, LayerClean: true})
+func (idx *PendingIndex) PutLayerCache(remotePath string, size int64, baseRev int64, mode uint32, hasMode bool, identity LayerCacheIdentity) (uint64, error) {
+	return idx.putInternal(WriteBackMeta{Path: remotePath, Size: size, Kind: PendingOverwrite, BaseRev: baseRev, Mode: mode, HasMode: hasMode, LayerClean: true, LayerID: identity.LayerID, LayerEntrySeq: identity.EntrySeq})
 }
 
 // putLayerCacheIfAbsent never replaces a publication that arrived while a
 // chmod with no initial metadata was reading or uploading its payload.
-func (idx *PendingIndex) putLayerCacheIfAbsent(path string, size, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
-	return idx.publishMeta(&WriteBackMeta{Path: path, Size: size, BaseRev: baseRev, Kind: PendingOverwrite, LayerClean: true, Mode: mode & posixPermissionModeMask, HasMode: hasMode}, true)
+func (idx *PendingIndex) putLayerCacheIfAbsent(path string, size, baseRev int64, mode uint32, hasMode bool, identity LayerCacheIdentity) (uint64, error) {
+	return idx.publishMeta(&WriteBackMeta{Path: path, Size: size, BaseRev: baseRev, Kind: PendingOverwrite, LayerClean: true, LayerID: identity.LayerID, LayerEntrySeq: identity.EntrySeq, Mode: mode & posixPermissionModeMask, HasMode: hasMode}, true)
 }
 
 // PutWithBaseRevAndModeAndLineage attaches process-local causal identity to
@@ -658,7 +658,7 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 
 // MarkLayerCommittedIfGeneration marks only the uploaded publication as a
 // durable overlay. An older completion cannot acknowledge a newer local edit.
-func (idx *PendingIndex) MarkLayerCommittedIfGeneration(remotePath string, generation uint64, committedRev int64, mode uint32, hasMode bool) error {
+func (idx *PendingIndex) MarkLayerCommittedIfGeneration(remotePath string, generation uint64, committedRev int64, mode uint32, hasMode bool, identity LayerCacheIdentity) error {
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
 
@@ -672,6 +672,8 @@ func (idx *PendingIndex) MarkLayerCommittedIfGeneration(remotePath string, gener
 	updated := cloneWriteBackMeta(meta)
 	updated.Kind = PendingOverwrite
 	updated.LayerClean = true
+	updated.LayerID = identity.LayerID
+	updated.LayerEntrySeq = identity.EntrySeq
 	if hasMode {
 		updated.Mode = mode & posixPermissionModeMask
 		updated.HasMode = true

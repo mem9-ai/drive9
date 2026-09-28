@@ -893,46 +893,6 @@ func (fs *Dat9FS) upsertLayerEntry(ctx context.Context, req client.FSLayerEntryR
 	return err
 }
 
-func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []byte, expectedRevision int64, mode uint32, hasMode bool) error {
-	if int64(len(data)) > maxInlineLayerEntryBytes {
-		if fs.isLayerAbandoned() {
-			return errLayerRolledBack
-		}
-		start := fs.perfStart()
-		_, err := fs.client.UploadFSLayerFile(ctx, fs.layerRef(), fs.remotePath(localPath), bytes.NewReader(data), int64(len(data)), expectedRevision, mode, hasMode)
-		fs.perfRecordRemote(perfRemoteMutation, start, err, uint64(len(data)))
-		if err != nil {
-			return err
-		}
-		if hasMode {
-			fs.markLayerFileMode(localPath, mode)
-		} else {
-			fs.markLayerFile(localPath)
-		}
-		return nil
-	}
-	req := client.FSLayerEntryRequest{
-		Path:         fs.remotePath(localPath),
-		Op:           "upsert",
-		Kind:         "file",
-		BaseRevision: expectedRevision,
-		Content:      data,
-		SizeBytes:    int64(len(data)),
-	}
-	if hasMode {
-		req.Mode = mode & 0o777
-	}
-	if err := fs.upsertLayerEntry(ctx, req, uint64(len(data))); err != nil {
-		return err
-	}
-	if hasMode {
-		fs.markLayerFileMode(localPath, mode)
-	} else {
-		fs.markLayerFile(localPath)
-	}
-	return nil
-}
-
 func (fs *Dat9FS) upsertLayerMkdir(ctx context.Context, localPath string, mode uint32) error {
 	if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
 		Path: fs.remotePath(localPath),
@@ -987,17 +947,18 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 					return err
 				}
 			}
-			if err := fs.upsertLayerFile(ctx, localPath, data, baseRev, mode, true); err != nil {
+			identity, err := fs.upsertLayerFile(ctx, localPath, data, baseRev, mode, true)
+			if err != nil {
 				return err
 			}
 			if fs.pendingIndex != nil {
 				if !hadPending {
-					if _, err := fs.pendingIndex.putLayerCacheIfAbsent(localPath, int64(len(data)), baseRev, mode, true); err != nil {
+					if _, err := fs.pendingIndex.putLayerCacheIfAbsent(localPath, int64(len(data)), baseRev, mode, true, identity); err != nil {
 						return fmt.Errorf("put pending mode for layer chmod %s: %w", localPath, err)
 					}
 					return nil
 				}
-				if err := fs.pendingIndex.MarkLayerCommittedIfGeneration(localPath, pendingGen, baseRev, mode, true); err != nil {
+				if err := fs.pendingIndex.MarkLayerCommittedIfGeneration(localPath, pendingGen, baseRev, mode, true, identity); err != nil {
 					return fmt.Errorf("update pending mode for layer chmod %s: %w", localPath, err)
 				}
 			}
@@ -1009,11 +970,12 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 		entry, err := fs.client.GetFSLayerEntry(ctx, fs.layerRef(), fs.remotePath(localPath))
 		if err == nil && entry != nil && entry.Op == "upsert" && entry.Kind == "file" {
 			baseRev := entry.BaseRevision
-			if err := fs.upsertLayerFile(ctx, localPath, entry.Content, baseRev, mode, true); err != nil {
+			identity, err := fs.upsertLayerFile(ctx, localPath, entry.Content, baseRev, mode, true)
+			if err != nil {
 				return err
 			}
 			if fs.pendingIndex != nil {
-				if _, err := fs.pendingIndex.putLayerCacheIfAbsent(localPath, int64(len(entry.Content)), baseRev, mode, true); err != nil {
+				if _, err := fs.pendingIndex.putLayerCacheIfAbsent(localPath, int64(len(entry.Content)), baseRev, mode, true, identity); err != nil {
 					return fmt.Errorf("put pending mode for layer chmod %s: %w", localPath, err)
 				}
 			}
@@ -1191,7 +1153,8 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 	} else if !isNotFoundErr(err) {
 		return err
 	}
-	if err := fs.upsertLayerFile(ctx, newLocalPath, data, targetBaseRev, mode, hasMode); err != nil {
+	identity, err := fs.upsertLayerFile(ctx, newLocalPath, data, targetBaseRev, mode, hasMode)
+	if err != nil {
 		return err
 	}
 	if fs.shadowStore != nil {
@@ -1200,7 +1163,7 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 		}
 	}
 	if fs.pendingIndex != nil {
-		if _, err := fs.pendingIndex.PutLayerCache(newLocalPath, int64(len(data)), targetBaseRev, mode, hasMode); err != nil {
+		if _, err := fs.pendingIndex.PutLayerCache(newLocalPath, int64(len(data)), targetBaseRev, mode, hasMode, identity); err != nil {
 			return err
 		}
 	}
@@ -3760,7 +3723,8 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 			mode = remoteChmodMode(entry.Mode)
 			hasMode = true
 		}
-		if err := fs.upsertLayerFile(ctx, entry.Path, data, expectedRevision, mode, hasMode); err != nil {
+		identity, err := fs.upsertLayerFile(ctx, entry.Path, data, expectedRevision, mode, hasMode)
+		if err != nil {
 			return httpToFuseStatus(err)
 		}
 		if fs.shadowStore != nil {
@@ -3769,7 +3733,7 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 			}
 		}
 		if fs.pendingIndex != nil {
-			if _, err := fs.pendingIndex.PutLayerCache(entry.Path, newSize, expectedRevision, mode, hasMode); err != nil {
+			if _, err := fs.pendingIndex.PutLayerCache(entry.Path, newSize, expectedRevision, mode, hasMode, identity); err != nil {
 				safeLogPrintf("layer truncate pending index update failed for %s: %v", entry.Path, err)
 				return gofuse.EIO
 			}
@@ -7184,7 +7148,8 @@ func (fs *Dat9FS) upsertLayerHardlink(ctx context.Context, srcP, dstP string, mo
 	if !hasMode {
 		mode = 0o644
 	}
-	if err := fs.upsertLayerFile(ctx, dstP, data, 0, mode, true); err != nil {
+	identity, err := fs.upsertLayerFile(ctx, dstP, data, 0, mode, true)
+	if err != nil {
 		return nil, err
 	}
 	if fs.shadowStore != nil {
@@ -7193,7 +7158,7 @@ func (fs *Dat9FS) upsertLayerHardlink(ctx context.Context, srcP, dstP string, mo
 		}
 	}
 	if fs.pendingIndex != nil {
-		if _, err := fs.pendingIndex.PutLayerCache(dstP, int64(len(data)), 0, mode, true); err != nil {
+		if _, err := fs.pendingIndex.PutLayerCache(dstP, int64(len(data)), 0, mode, true, identity); err != nil {
 			return nil, err
 		}
 	}
@@ -14567,7 +14532,8 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	stagingGens := fs.captureHandleStagingGensLocked(fh)
 	if fs.layerEnabled() {
-		if err := fs.upsertLayerFile(ctx, fh.Path, nil, expectedRevision, 0, false); err != nil {
+		_, err := fs.upsertLayerFile(ctx, fh.Path, nil, expectedRevision, 0, false)
+		if err != nil {
 			safeLogPrintf("sync empty layer create failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
@@ -16414,7 +16380,20 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 
 	size := fh.Dirty.Size()
 	if fs.layerEnabled() {
-		unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
+		// An inherited best-effort handle lock may only be a no-op after a
+		// timeout. Reacquire a proven lock before the upload/cache transaction;
+		// the mutation check below rejects writes superseded in this gap.
+		fs.releaseHandleRemoteCommitPathLocked(fh)
+		var unlockRemoteCommit func()
+		if fs.opts.RemoteCommitWaitTimeout <= 0 {
+			unlockRemoteCommit = fs.lockRemoteCommitPath(fh.Path)
+		} else {
+			var locked bool
+			unlockRemoteCommit, locked = fs.lockRemoteCommitPathTimeout(fh.Path, fs.opts.RemoteCommitWaitTimeout)
+			if !locked {
+				return gofuse.Status(syscall.EAGAIN)
+			}
+		}
 		defer unlockRemoteCommit()
 		if fs.discardSupersededMutationLocked(fh) {
 			fs.removeHandleOwnedStagingLocked(fh)
@@ -16442,7 +16421,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 		data := fh.Dirty.bytesView()
 		mode, hasMode := fs.modeForPendingHandle(fh)
-		if err := fs.upsertLayerFile(ctx, fh.Path, data, expectedRevision, mode, hasMode); err != nil {
+		identity, err := fs.upsertLayerFile(ctx, fh.Path, data, expectedRevision, mode, hasMode)
+		if err != nil {
 			safeLogPrintf("layer flush failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
@@ -16473,7 +16453,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		if fs.pendingIndex != nil {
-			if gen, putErr := fs.pendingIndex.PutLayerCache(fh.Path, size, fh.BaseRev, mode, hasMode); putErr != nil {
+			if gen, putErr := fs.pendingIndex.PutLayerCache(fh.Path, size, fh.BaseRev, mode, hasMode, identity); putErr != nil {
 				safeLogPrintf("layer flush pending index update failed for %s: %v", fh.Path, putErr)
 			} else {
 				fh.PendingIndexGen = gen
@@ -17262,6 +17242,9 @@ func (fs *Dat9FS) flushAll() error {
 			fs.journalSyncerCancel()
 		}
 		shutdownErr = errors.Join(shutdownErr, fs.journal.FsyncShared())
+		if shutdownErr == nil {
+			shutdownErr = errors.Join(shutdownErr, fs.journal.Compact())
+		}
 		shutdownErr = errors.Join(shutdownErr, fs.journal.Close())
 	}
 

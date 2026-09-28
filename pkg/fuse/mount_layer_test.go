@@ -1065,14 +1065,14 @@ func TestLayerFileUpsertClearsStaleNamespaceState(t *testing.T) {
 		RemoteRoot: "/repo",
 	})
 	fs.markLayerSymlink("/file.txt", "old-target", symlinkMode())
-	if err := fs.upsertLayerFile(context.Background(), "/file.txt", []byte("file"), 0, 0o644, true); err != nil {
+	if _, err := fs.upsertLayerFile(context.Background(), "/file.txt", []byte("file"), 0, 0o644, true); err != nil {
 		t.Fatalf("upsertLayerFile over symlink: %v", err)
 	}
 	if _, _, ok := fs.layerSymlink("/file.txt"); ok {
 		t.Fatal("file upsert left stale layer symlink")
 	}
 	fs.markLayerWhiteout("/file.txt")
-	if err := fs.upsertLayerFile(context.Background(), "/file.txt", []byte("file2"), 0, 0o644, true); err != nil {
+	if _, err := fs.upsertLayerFile(context.Background(), "/file.txt", []byte("file2"), 0, 0o644, true); err != nil {
 		t.Fatalf("upsertLayerFile over whiteout: %v", err)
 	}
 	if fs.isLayerWhiteout("/file.txt") {
