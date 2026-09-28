@@ -1530,7 +1530,7 @@ func (fs *Dat9FS) interruptSafeMutationsEnabled() bool {
 }
 
 func (fs *Dat9FS) recordCommittedMutation(ino uint64, seq uint64, revision int64, size int64) {
-	if ino == 0 || seq == 0 || (!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(ino)) {
+	if ino == 0 || seq == 0 || (!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(ino) && !fs.hasFtruncateInheritance(ino)) {
 		return
 	}
 
@@ -3539,6 +3539,11 @@ func (fs *Dat9FS) bindCommitEntryToHandleLocked(entry *CommitEntry, fh *FileHand
 	entry.PayloadBaseRevSet = true
 	if fs.ftruncateParticipates(fh) {
 		entry.DisableAutoResolveLWW = true
+		if paths := fs.ftruncateAliasPaths(fh.Ino); len(paths) > 1 {
+			ino, view := fh.Ino, fs.mountViewGeneration.Load()
+			entry.ftruncatePaths = paths
+			entry.ftruncateValid = func() bool { return fs.ftruncateAliasesValid(ino, paths, view) }
+		}
 	}
 	entry.SnapshotID = fh.StagedSnapshotID
 	entry.liveAncestors = fh.stagedAncestors
@@ -8994,6 +8999,14 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 						return gofuse.EAGAIN
 					}
 				}
+				for _, other := range siblings {
+					if other.Path != fh.Path && !other.Unlinked && fs.ftruncateAliasLinked(other) && other.DirtySeq != 0 && other.pendingFtruncate.Load() == nil {
+						unlockFileHandles(siblings)
+						fs.releaseHandleRemoteCommitPathLocked(fh)
+						fh.Unlock()
+						return gofuse.EAGAIN
+					}
+				}
 				fs.discardSupersededMutationLocked(fh)
 				newMarker := markVisible && !fh.Dirty.visibleTruncate
 				if newMarker {
@@ -12517,6 +12530,14 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		bytesRead = n
 		return gofuse.ReadResultData(result), gofuse.OK
 	}
+	if data, handled, err := fs.readFtruncateAliasLocked(ctx, fh, int64(input.Offset), input.Size); handled {
+		fh.Unlock()
+		source, bytesRead = "alias-ftruncate", len(data)
+		if err != nil {
+			return nil, httpToFuseStatus(err)
+		}
+		return gofuse.ReadResultData(data), gofuse.OK
+	}
 	if !fh.Unlinked && !fh.UnlinkedSnapshot && fh.UnlinkedData == nil && !isSQLiteDirectIOPath(fh.Path) {
 		readerPath := fh.Path
 		readerSeq := fh.DirtySeq
@@ -14150,7 +14171,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	mutationUploadCommitted := false
 	recordMutationBeforeFenceRelease := func() {
 		if mutationRecorded || !mutationUploadCommitted || mutationSeq == 0 ||
-			(!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(mutationIno)) {
+			(!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(mutationIno) && !fs.hasFtruncateInheritance(mutationIno)) {
 			return
 		}
 		revision := fs.resolveCommittedMutationRevision(mutationPath, fs.latestCommittedRevision(mutationPath), mutationExpectedRevision)
@@ -15146,7 +15167,7 @@ func (fs *Dat9FS) captureHandleStagingGensLocked(fh *FileHandle) StagingGens {
 }
 
 func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) {
-	if fs == nil || entry == nil || (!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(entry.Inode)) {
+	if fs == nil || entry == nil || (!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(entry.Inode) && !fs.hasFtruncateInheritance(entry.Inode)) {
 		return
 	}
 	if entry.mutationPublished {

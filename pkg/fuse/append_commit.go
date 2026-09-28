@@ -13,8 +13,11 @@ import (
 // As on the existing synchronous write-back path, metadata finalization follows
 // the content commit while the handle remains locked.
 func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle) (bool, gofuse.Status) {
+	// Every participating alias commit needs a landed identity, including
+	// subsequent writes after the first inherited snapshot was committed.
+	aliasSnapshot := fs.ftruncateParticipates(fh) && len(fs.ftruncateAliasPaths(fh.Ino)) > 1
 	if fs.commitQueue == nil || fs.layerEnabled() || fh.Unlinked || fh.Dirty == nil ||
-		(!fh.appendSnapshot && fh.Flags&uint32(syscall.O_APPEND) == 0) ||
+		(!fh.appendSnapshot && fh.Flags&uint32(syscall.O_APPEND) == 0 && !aliasSnapshot) ||
 		isSQLitePersistentJournalPath(fh.Path) || fh.Dirty.Size() > maxLandedPayloadBytes ||
 		(fh.Streamer != nil && fh.Streamer.Started()) {
 		return false, gofuse.OK

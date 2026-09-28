@@ -41,9 +41,11 @@ func (idx *OpenHandleIndex) Add(fh *FileHandle) {
 func (idx *OpenHandleIndex) addLocked(fh *FileHandle) {
 	if fh.Dirty != nil && (fh.Flags&syscall.O_TRUNC == 0 || fh.ftruncateInherited != "") {
 		for sibling := range idx.byInode[fh.Ino] {
-			if event := sibling.pendingFtruncate.Load(); event != nil && event.path == fh.Path {
+			if event := sibling.pendingFtruncate.Load(); event != nil && event.ino == fh.Ino {
 				if prior := fh.pendingFtruncate.Load(); prior == nil || prior.seq < event.seq {
-					fh.pendingFtruncate.Store(event)
+					copy := *event
+					copy.path = fh.Path
+					fh.pendingFtruncate.Store(&copy)
 				}
 			}
 		}
