@@ -1,0 +1,18 @@
+{
+  "python_files": 63,
+  "shell_files": 5,
+  "cases": 51,
+  "execution_rows": 306,
+  "node_official_tests": 244,
+  "gcp_fault_cases": 5,
+  "syntax": "pass",
+  "local_imports": "pass",
+  "runner_lists": "pass",
+  "summary_coverage": "pass",
+  "checksums": "pass",
+  "live_tests": "not run",
+  "node_parser_tests": "3 passed",
+  "go_fault_proxy_tests": "5 passed",
+  "node_temp_path": "short Unix-socket-safe",
+  "mount_preset_argv_tests": "6 presets passed for site and X"
+}

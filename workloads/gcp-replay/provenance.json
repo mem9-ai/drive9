@@ -1,0 +1,331 @@
+{
+  "document_url": "",
+  "document_revision": 103,
+  "sources": [
+    {
+      "file": "site/b_mount_retry.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/b_mount_retry.py",
+      "source_sha256": "258ccb1454ba0ded440c88ab7f6dd3b43c4231b128612e9a9ea6ead9911d2a4a"
+    },
+    {
+      "file": "site/a_fsync_interrupt.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/a_fsync_interrupt.py",
+      "source_sha256": "99ad62a1dcf295ed237eaa1085a65f2d8910df1c5a8094b67bfa2b264c25d4c2"
+    },
+    {
+      "file": "site/s10_export.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/s10_export.py",
+      "source_sha256": "42cbea56fbf80bb674fa5d08ea6565e1072d5d01dd79a911546c584ba0b6a3ae"
+    },
+    {
+      "file": "site/read_verify.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/read_verify.py",
+      "source_sha256": "ce2a7b6fc40c0b13ef83e007ce21c388d4c37a50b32a3221e262335817b52538"
+    },
+    {
+      "file": "site/e_attributes.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/e_attributes.py",
+      "source_sha256": "41a8b6d52487f1ebca5820d7f58070da72deee1cb2d5c53b199a28fdb768b78d"
+    },
+    {
+      "file": "site/s07_refactor.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/s07_refactor.py",
+      "source_sha256": "5fc1a06e09f1bf19dccae56d167e92a0d57968b980f3b9a5843cfda9e68f8a10"
+    },
+    {
+      "file": "site/s12_recovery.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/s12_recovery.py",
+      "source_sha256": "6e8cc0e63a9e2ad6fe1e7e41a68a63ee82d138da69fc58808cb8e8e8441fe1f5"
+    },
+    {
+      "file": "site/d_sync_states.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/d_sync_states.py",
+      "source_sha256": "80813c31932352866a02cefc1eed19bfc4faed4283d159991ebc6c10ad0999e4"
+    },
+    {
+      "file": "site/summarize.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/summarize.py",
+      "source_sha256": "f6e335f43f4ebd46c753921178b2162021e63bae023973ba03ab9c44c9d508dc"
+    },
+    {
+      "file": "site/s03_watch.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/s03_watch.py",
+      "source_sha256": "3703976bf6d1d7f0f5448f554e9b864743b2efc4138eae4c197bbe3ad79b0a4b"
+    },
+    {
+      "file": "site/scan_tree.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/scan_tree.py",
+      "source_sha256": "65551af74092a21ee54cfb3f86174a9cb94c7b3bfcc1bf75b22f11ec056c25cf"
+    },
+    {
+      "file": "site/s06_npm.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/s06_npm.py",
+      "source_sha256": "790f30dc75228a11259517a34fb9b5d25750e4bb6e2d88672996f1b6fa7c8874"
+    },
+    {
+      "file": "site/f_cache_cap.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/f_cache_cap.py",
+      "source_sha256": "f8bb93bdbdf2ba06f7ae6e61bb92f75b9e415ac937aedbd29dfbe679304fe71f"
+    },
+    {
+      "file": "site/bootstrap.sh",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/bootstrap.sh",
+      "source_sha256": "04ab6b64fe49ba5e12ab59a2d1894b3c40123b1d62c720001f9f0218cfa501b1"
+    },
+    {
+      "file": "site/s02_save_read.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/s02_save_read.py",
+      "source_sha256": "0724ec1b0f5292649b9b33eebf5d16a632a43befff025ff23ae4183a1c66219a"
+    },
+    {
+      "file": "site/fixtures_gen.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/fixtures_gen.py",
+      "source_sha256": "730df61877ef68acb0cc8547a667e12ea200edd5a6da81a6be2faba5392991db"
+    },
+    {
+      "file": "site/c_response_lost.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/c_response_lost.py",
+      "source_sha256": "123479ca8731bcc01c02251e5737e5f842b9044fa0793d244c26d82f2ca9ac6c"
+    },
+    {
+      "file": "site/s09_build.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/s09_build.py",
+      "source_sha256": "40a2de013caf5be6c951f73e0d6cd853e1bc9759a313a3f4c2c5839c83af09c2"
+    },
+    {
+      "file": "site/s01_import.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/s01_import.py",
+      "source_sha256": "8241b55460dd5f3d87bc69b77993712163441b15dc54ccf2d1d1c833db38466d"
+    },
+    {
+      "file": "site/s11_external.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/s11_external.py",
+      "source_sha256": "37b0d8384898c7054ce379f716ab6e6dd925572c10556caaf23dbfd5a2f7dc9b"
+    },
+    {
+      "file": "site/run_all.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/run_all.py",
+      "source_sha256": "a8192f33345cdb36cf6f8b8599d3fcce8d9b3a6c9f57e6be5662eba74b9e2a1f"
+    },
+    {
+      "file": "site/s05_conflict.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/s05_conflict.py",
+      "source_sha256": "7c65c8b6ab6b52f6728f2639973ae24eb1ecc65badf0dba58db29d7fb8f85e7f"
+    },
+    {
+      "file": "site/build_tool.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/build_tool.py",
+      "source_sha256": "7ea0cfd7225c9923972f200b4a699a25d665141b8e398802fe89cfc6f1f9ec25"
+    },
+    {
+      "file": "site/s08_git.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/s08_git.py",
+      "source_sha256": "0ebfb4ad3e09bb6d7ee270c086cd0885867b40fe3c32dc198fdd047f065241ac"
+    },
+    {
+      "file": "site/run-all.sh",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/run-all.sh",
+      "source_sha256": "b7d56908da3ab5f515786bfe05241f4d6249a9a1cbe4ae3ba6bc269341759d52"
+    },
+    {
+      "file": "site/s04_assets.py",
+      "source": "claude-notes/drive9-site-acceptance-fe581b9f.tar.gz:drive9-site-acceptance/s04_assets.py",
+      "source_sha256": "e8803665c7fd498bc67e8f4ea7255a85f636d084597b18d8e2ef22d5cf175e60"
+    },
+    {
+      "file": "site/config.example.env",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "90f5d04842a040ba542a94fcaddd809a0a6b3d1490b6063405d03a1629f2d576"
+    },
+    {
+      "file": "site/config.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "1ec651ceb34383e2669c11a9a760e432701c74b687a4c5aecf2e9ba1ff4a465c"
+    },
+    {
+      "file": "site/common.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "237ccf85ecb6ed9169c28614094af6d8fb5cd4a72d5f2235fa3f18dc1216fe31"
+    },
+    {
+      "file": "site/dn/dn_common.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "6466cf0acc734e17347208f5ab910f926ad726c0496d4c4e5843dbb8416f1584"
+    },
+    {
+      "file": "site/dn/dn_worker.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "af0d02889922aa962e15f5d198dc3689ceeea178ee9f5ead40f03c6d4afb39a9"
+    },
+    {
+      "file": "site/run-dn.sh",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "3a26bc94b04e2686e970bc3c4caa118056fb1ab8c85adf7c1baf630e44f9db24"
+    },
+    {
+      "file": "site/setup-tools.sh",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "4d635904bb33898c0a391e5bbcb0c1a22bbe86b530e4cad453e2bdaeb5b0c866"
+    },
+    {
+      "file": "site/summarize_dn.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "be7f10d6dbb77061c314ddd0ff5d831197829b8189ba020354162eac434d827b"
+    },
+    {
+      "file": "site/dn/d01_append_tail.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "a8bb4ea900c0ed699055817997a08edc9e03aeaaefe5649e9f5dac8709aa3046"
+    },
+    {
+      "file": "site/dn/d02_kill_resume.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "13126b9cd39ed17dc359536c31e313b116ce97c2f540a60d898feb514609539b"
+    },
+    {
+      "file": "site/dn/d03_patch_apply.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "af0b9ab7de3dba6d6c1abfabcc092c6b48be360da42f166bf23b3902cd42c69e"
+    },
+    {
+      "file": "site/dn/d04_multi_agent.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "85b62b14c7aed178ecd05ca19178aca5348281ce03142381a2cf064144a5ae64"
+    },
+    {
+      "file": "site/dn/d05_lock_semantics.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "9d9044e43a9132087cbd96c9db40e10d1c2fe716388aa391a17ffb371c34c1b8"
+    },
+    {
+      "file": "site/dn/d06_watcher_loop.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "609f98eab4884935145950eb619520e74053acd82bcdc2fa3430db0d22697675"
+    },
+    {
+      "file": "site/dn/d07_exec_after_write.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "624e22cbd24588e10c1ec79b579f9e1c1be1cb209752714545a2b04a9e8c55f8"
+    },
+    {
+      "file": "site/dn/d08_temp_storm.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "afa1679579e29555748661b629e14984a5da32a02796acbdd5520dce256d2e51"
+    },
+    {
+      "file": "site/dn/d09_fd_replaced.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "fca86f2d97702eca331e6ffdb6241cd365f36d16a15549023da2c6a9cfcdac1c"
+    },
+    {
+      "file": "site/dn/d10_weird_names.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "cee5f56b8ceb4c8da30bfc4b64d33364240691ee136a38815ea354c6cf4b244f"
+    },
+    {
+      "file": "site/dn/d11_deep_wide_scan.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "1f4ab74086b7b72f079b78decaaad869d5bcf56446689e13dc39c517692655a3"
+    },
+    {
+      "file": "site/dn/n01_pnpm_layout.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "ee6313c1a1f76c1da7069665c52fc6b1e9f573bf6ef6249d51226a6254b95c75"
+    },
+    {
+      "file": "site/dn/n02_workspaces.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "b0e6d6bfb4481fb4e85f9192cffd1573933838751be326707a36ca4f45693ff1"
+    },
+    {
+      "file": "site/dn/n03_tsc_incremental.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "480e9e6aa4db958e2fe18b7c8b2ffd3e915c71e522b248fbc01eb8556395011f"
+    },
+    {
+      "file": "site/dn/n04_vitest.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "3b4cdffd1e16048f916550be57e2fd892d55f75bf08208deae8e3c158e1419b5"
+    },
+    {
+      "file": "site/dn/n05_pack_tarball.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "46b3d6b4423b7e4ce02ed5caa232a5f7e5b91c90ed4a3161bc7ed5766c9eb2a4"
+    },
+    {
+      "file": "site/dn/n06_ci_interrupt.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "32444d7d636def81093a79dba1c78b25d8861f3fddd8bdda6d901dc7085ff9ba"
+    },
+    {
+      "file": "site/dn/n07_cache_concurrency.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "826e0f6fdcb185dcb21e912ef9eae5e749244b2529d2673c5cd872b21f53076a"
+    },
+    {
+      "file": "site/dn/n08_rm_node_modules.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "0c75d7ee916aaa7dca37e3e6c4c97a68bf10e1c08862f15d25513ad96cc1a768"
+    },
+    {
+      "file": "site/dn/n09_node_watch.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "3864b277e4b7643281ce81c768b9d89f2f25f6032c8a58cfa6018f2a72eaca72"
+    },
+    {
+      "file": "site/dn/n10_npx_corepack.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "7515ca6d581eec0badfefdf30670a815fcd83093eeb21044edda4c44bca94cfc"
+    },
+    {
+      "file": "site/dn/d12_nfc_nfd_alias.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "7f9b30a631ce44ad9efe7a061799c4e7c174d733b58bb0b0928d352e151fa32b"
+    },
+    {
+      "file": "site/dn/n11_cache_inside_mount.py",
+      "source": "Feishu section 8 revision 103",
+      "source_sha256": "7cda532d2427ba2afb3977ae89f0bfbbcadd5ff62ea97ddedc6633550e0e4fef"
+    },
+    {
+      "file": "sixway/cases.py",
+      "source": "workloads/main/cases.py",
+      "source_sha256": "b2a577758aaa8c63c73438ebcf96679f39a4673c3958c521e9944dbb9b48b475"
+    }
+  ],
+  "adaptations": [
+    "Python formatting normalized with Ruff; workload A AST equals workloads/main/cases.py.",
+    "Reconstructed GCP four-group serial runner; one existing tenant, fresh run paths, no EFS/EBS.",
+    "Restored 18-case acceptance runner; C response-loss supplement last; nonzero failures are preserved.",
+    "Applied document section 8.7 split: D10 alias probe removed, N07 cache outside mount, D12/N11 appended with isolated mounts.",
+    "N10 npx cache moved outside mount; in-mount corepack completeness probe retained.",
+    "Shared drain helper records wall time; secondary mount ownership uses current UID/GID.",
+    "DN summary import path corrected for root-level deployment; both summaries cover missing rows and use current version.",
+    "Config/bootstrap/tool setup adapted for fresh Debian VM and pinned Node tools.",
+    "Runtime Linux verification, auxiliary mount behavior and historical compatibility limitations remain for later smoke/live stage."
+  ],
+  "node_official": {
+    "version": "v22.13.0",
+    "manifest": "node_fs/manifest.json",
+    "test_files": 244,
+    "source_url": "https://nodejs.org/dist/v22.13.0/node-v22.13.0.tar.xz",
+    "source_sha256": "e50db6730716ba2ae953cf99d10c80295bd33bb72d3c829d9e99f6af56d626c7",
+    "upstream_runner": "tools/test.py"
+  },
+  "gcp_faults": {
+    "manifest": "faults/manifest.json",
+    "cases": [
+      "x1",
+      "x2",
+      "x3",
+      "x4",
+      "x5"
+    ],
+    "proxy_source": "faults/proxy/main.go",
+    "proxy_binary": "faults/proxy-linux-amd64",
+    "proxy_binary_generated": true,
+    "test_only": true,
+    "upstream": "https://drive9.example.invalid",
+    "implementation_note": "GCP loopback fault categories; not Firecracker reproduction"
+  }
+}

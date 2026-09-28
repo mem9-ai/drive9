@@ -1,0 +1,2756 @@
+[
+  {
+    "suite": "A",
+    "case": "rename",
+    "script": "sixway/cases.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "rename",
+    "script": "sixway/cases.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "rename",
+    "script": "sixway/cases.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "rename",
+    "script": "sixway/cases.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "rename",
+    "script": "sixway/cases.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "rename",
+    "script": "sixway/cases.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "atomic-replace",
+    "script": "sixway/cases.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "atomic-replace",
+    "script": "sixway/cases.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "atomic-replace",
+    "script": "sixway/cases.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "atomic-replace",
+    "script": "sixway/cases.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "atomic-replace",
+    "script": "sixway/cases.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "atomic-replace",
+    "script": "sixway/cases.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "ls-stat-consistency",
+    "script": "sixway/cases.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "ls-stat-consistency",
+    "script": "sixway/cases.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "ls-stat-consistency",
+    "script": "sixway/cases.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "ls-stat-consistency",
+    "script": "sixway/cases.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "ls-stat-consistency",
+    "script": "sixway/cases.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "ls-stat-consistency",
+    "script": "sixway/cases.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "copy-file",
+    "script": "sixway/cases.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "copy-file",
+    "script": "sixway/cases.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "copy-file",
+    "script": "sixway/cases.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "copy-file",
+    "script": "sixway/cases.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "copy-file",
+    "script": "sixway/cases.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "copy-file",
+    "script": "sixway/cases.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "copy-tree",
+    "script": "sixway/cases.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "copy-tree",
+    "script": "sixway/cases.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "copy-tree",
+    "script": "sixway/cases.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "copy-tree",
+    "script": "sixway/cases.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "copy-tree",
+    "script": "sixway/cases.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "copy-tree",
+    "script": "sixway/cases.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "overwrite-delete-recreate",
+    "script": "sixway/cases.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "overwrite-delete-recreate",
+    "script": "sixway/cases.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "overwrite-delete-recreate",
+    "script": "sixway/cases.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "overwrite-delete-recreate",
+    "script": "sixway/cases.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "overwrite-delete-recreate",
+    "script": "sixway/cases.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "overwrite-delete-recreate",
+    "script": "sixway/cases.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "many-small-files",
+    "script": "sixway/cases.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "many-small-files",
+    "script": "sixway/cases.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "many-small-files",
+    "script": "sixway/cases.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "many-small-files",
+    "script": "sixway/cases.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "many-small-files",
+    "script": "sixway/cases.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "many-small-files",
+    "script": "sixway/cases.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "medium-file",
+    "script": "sixway/cases.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "medium-file",
+    "script": "sixway/cases.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "medium-file",
+    "script": "sixway/cases.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "medium-file",
+    "script": "sixway/cases.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "medium-file",
+    "script": "sixway/cases.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "medium-file",
+    "script": "sixway/cases.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "concurrent-files",
+    "script": "sixway/cases.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "concurrent-files",
+    "script": "sixway/cases.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "concurrent-files",
+    "script": "sixway/cases.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "concurrent-files",
+    "script": "sixway/cases.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "concurrent-files",
+    "script": "sixway/cases.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "concurrent-files",
+    "script": "sixway/cases.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "permissions",
+    "script": "sixway/cases.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "permissions",
+    "script": "sixway/cases.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "permissions",
+    "script": "sixway/cases.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "permissions",
+    "script": "sixway/cases.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "permissions",
+    "script": "sixway/cases.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "A",
+    "case": "permissions",
+    "script": "sixway/cases.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s01-import",
+    "script": "site/s01_import.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s01-import",
+    "script": "site/s01_import.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s01-import",
+    "script": "site/s01_import.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s01-import",
+    "script": "site/s01_import.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s01-import",
+    "script": "site/s01_import.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s01-import",
+    "script": "site/s01_import.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s02-save-read",
+    "script": "site/s02_save_read.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s02-save-read",
+    "script": "site/s02_save_read.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s02-save-read",
+    "script": "site/s02_save_read.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s02-save-read",
+    "script": "site/s02_save_read.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s02-save-read",
+    "script": "site/s02_save_read.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s02-save-read",
+    "script": "site/s02_save_read.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s03-watch",
+    "script": "site/s03_watch.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s03-watch",
+    "script": "site/s03_watch.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s03-watch",
+    "script": "site/s03_watch.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s03-watch",
+    "script": "site/s03_watch.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s03-watch",
+    "script": "site/s03_watch.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s03-watch",
+    "script": "site/s03_watch.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s04-assets",
+    "script": "site/s04_assets.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s04-assets",
+    "script": "site/s04_assets.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s04-assets",
+    "script": "site/s04_assets.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s04-assets",
+    "script": "site/s04_assets.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s04-assets",
+    "script": "site/s04_assets.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s04-assets",
+    "script": "site/s04_assets.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s05-conflict",
+    "script": "site/s05_conflict.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s05-conflict",
+    "script": "site/s05_conflict.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s05-conflict",
+    "script": "site/s05_conflict.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s05-conflict",
+    "script": "site/s05_conflict.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s05-conflict",
+    "script": "site/s05_conflict.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s05-conflict",
+    "script": "site/s05_conflict.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s06-npm",
+    "script": "site/s06_npm.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s06-npm",
+    "script": "site/s06_npm.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s06-npm",
+    "script": "site/s06_npm.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s06-npm",
+    "script": "site/s06_npm.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s06-npm",
+    "script": "site/s06_npm.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s06-npm",
+    "script": "site/s06_npm.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s07-refactor",
+    "script": "site/s07_refactor.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s07-refactor",
+    "script": "site/s07_refactor.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s07-refactor",
+    "script": "site/s07_refactor.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s07-refactor",
+    "script": "site/s07_refactor.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s07-refactor",
+    "script": "site/s07_refactor.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s07-refactor",
+    "script": "site/s07_refactor.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s08-git",
+    "script": "site/s08_git.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s08-git",
+    "script": "site/s08_git.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s08-git",
+    "script": "site/s08_git.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s08-git",
+    "script": "site/s08_git.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s08-git",
+    "script": "site/s08_git.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s08-git",
+    "script": "site/s08_git.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s09-build",
+    "script": "site/s09_build.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s09-build",
+    "script": "site/s09_build.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s09-build",
+    "script": "site/s09_build.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s09-build",
+    "script": "site/s09_build.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s09-build",
+    "script": "site/s09_build.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s09-build",
+    "script": "site/s09_build.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s10-export",
+    "script": "site/s10_export.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s10-export",
+    "script": "site/s10_export.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s10-export",
+    "script": "site/s10_export.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s10-export",
+    "script": "site/s10_export.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s10-export",
+    "script": "site/s10_export.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s10-export",
+    "script": "site/s10_export.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s11-external",
+    "script": "site/s11_external.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s11-external",
+    "script": "site/s11_external.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s11-external",
+    "script": "site/s11_external.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s11-external",
+    "script": "site/s11_external.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s11-external",
+    "script": "site/s11_external.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s11-external",
+    "script": "site/s11_external.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s12-recovery",
+    "script": "site/s12_recovery.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s12-recovery",
+    "script": "site/s12_recovery.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s12-recovery",
+    "script": "site/s12_recovery.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s12-recovery",
+    "script": "site/s12_recovery.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s12-recovery",
+    "script": "site/s12_recovery.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "s12-recovery",
+    "script": "site/s12_recovery.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "e-attributes",
+    "script": "site/e_attributes.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "e-attributes",
+    "script": "site/e_attributes.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "e-attributes",
+    "script": "site/e_attributes.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "e-attributes",
+    "script": "site/e_attributes.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "e-attributes",
+    "script": "site/e_attributes.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "e-attributes",
+    "script": "site/e_attributes.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "f-cache-cap",
+    "script": "site/f_cache_cap.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "f-cache-cap",
+    "script": "site/f_cache_cap.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "f-cache-cap",
+    "script": "site/f_cache_cap.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "f-cache-cap",
+    "script": "site/f_cache_cap.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "f-cache-cap",
+    "script": "site/f_cache_cap.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "f-cache-cap",
+    "script": "site/f_cache_cap.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "d-sync-states",
+    "script": "site/d_sync_states.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "d-sync-states",
+    "script": "site/d_sync_states.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "d-sync-states",
+    "script": "site/d_sync_states.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "d-sync-states",
+    "script": "site/d_sync_states.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "d-sync-states",
+    "script": "site/d_sync_states.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "d-sync-states",
+    "script": "site/d_sync_states.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "b-mount-retry",
+    "script": "site/b_mount_retry.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "b-mount-retry",
+    "script": "site/b_mount_retry.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "b-mount-retry",
+    "script": "site/b_mount_retry.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "b-mount-retry",
+    "script": "site/b_mount_retry.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "b-mount-retry",
+    "script": "site/b_mount_retry.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "b-mount-retry",
+    "script": "site/b_mount_retry.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "a-fsync-interrupt",
+    "script": "site/a_fsync_interrupt.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "a-fsync-interrupt",
+    "script": "site/a_fsync_interrupt.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "a-fsync-interrupt",
+    "script": "site/a_fsync_interrupt.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "a-fsync-interrupt",
+    "script": "site/a_fsync_interrupt.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "a-fsync-interrupt",
+    "script": "site/a_fsync_interrupt.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "a-fsync-interrupt",
+    "script": "site/a_fsync_interrupt.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "c-response-lost",
+    "script": "site/c_response_lost.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "c-response-lost",
+    "script": "site/c_response_lost.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "c-response-lost",
+    "script": "site/c_response_lost.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "c-response-lost",
+    "script": "site/c_response_lost.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "c-response-lost",
+    "script": "site/c_response_lost.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "B",
+    "case": "c-response-lost",
+    "script": "site/c_response_lost.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d01-append-tail",
+    "script": "site/dn/d01_append_tail.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d01-append-tail",
+    "script": "site/dn/d01_append_tail.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d01-append-tail",
+    "script": "site/dn/d01_append_tail.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d01-append-tail",
+    "script": "site/dn/d01_append_tail.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d01-append-tail",
+    "script": "site/dn/d01_append_tail.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d01-append-tail",
+    "script": "site/dn/d01_append_tail.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d02-kill-resume",
+    "script": "site/dn/d02_kill_resume.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d02-kill-resume",
+    "script": "site/dn/d02_kill_resume.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d02-kill-resume",
+    "script": "site/dn/d02_kill_resume.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d02-kill-resume",
+    "script": "site/dn/d02_kill_resume.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d02-kill-resume",
+    "script": "site/dn/d02_kill_resume.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d02-kill-resume",
+    "script": "site/dn/d02_kill_resume.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d03-patch-apply",
+    "script": "site/dn/d03_patch_apply.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d03-patch-apply",
+    "script": "site/dn/d03_patch_apply.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d03-patch-apply",
+    "script": "site/dn/d03_patch_apply.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d03-patch-apply",
+    "script": "site/dn/d03_patch_apply.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d03-patch-apply",
+    "script": "site/dn/d03_patch_apply.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d03-patch-apply",
+    "script": "site/dn/d03_patch_apply.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d04-multi-agent",
+    "script": "site/dn/d04_multi_agent.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d04-multi-agent",
+    "script": "site/dn/d04_multi_agent.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d04-multi-agent",
+    "script": "site/dn/d04_multi_agent.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d04-multi-agent",
+    "script": "site/dn/d04_multi_agent.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d04-multi-agent",
+    "script": "site/dn/d04_multi_agent.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d04-multi-agent",
+    "script": "site/dn/d04_multi_agent.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d05-lock-semantics",
+    "script": "site/dn/d05_lock_semantics.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d05-lock-semantics",
+    "script": "site/dn/d05_lock_semantics.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d05-lock-semantics",
+    "script": "site/dn/d05_lock_semantics.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d05-lock-semantics",
+    "script": "site/dn/d05_lock_semantics.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d05-lock-semantics",
+    "script": "site/dn/d05_lock_semantics.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d05-lock-semantics",
+    "script": "site/dn/d05_lock_semantics.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d06-watcher-loop",
+    "script": "site/dn/d06_watcher_loop.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d06-watcher-loop",
+    "script": "site/dn/d06_watcher_loop.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d06-watcher-loop",
+    "script": "site/dn/d06_watcher_loop.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d06-watcher-loop",
+    "script": "site/dn/d06_watcher_loop.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d06-watcher-loop",
+    "script": "site/dn/d06_watcher_loop.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d06-watcher-loop",
+    "script": "site/dn/d06_watcher_loop.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d07-exec-after-write",
+    "script": "site/dn/d07_exec_after_write.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d07-exec-after-write",
+    "script": "site/dn/d07_exec_after_write.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d07-exec-after-write",
+    "script": "site/dn/d07_exec_after_write.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d07-exec-after-write",
+    "script": "site/dn/d07_exec_after_write.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d07-exec-after-write",
+    "script": "site/dn/d07_exec_after_write.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d07-exec-after-write",
+    "script": "site/dn/d07_exec_after_write.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d08-temp-storm",
+    "script": "site/dn/d08_temp_storm.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d08-temp-storm",
+    "script": "site/dn/d08_temp_storm.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d08-temp-storm",
+    "script": "site/dn/d08_temp_storm.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d08-temp-storm",
+    "script": "site/dn/d08_temp_storm.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d08-temp-storm",
+    "script": "site/dn/d08_temp_storm.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d08-temp-storm",
+    "script": "site/dn/d08_temp_storm.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d09-fd-replaced",
+    "script": "site/dn/d09_fd_replaced.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d09-fd-replaced",
+    "script": "site/dn/d09_fd_replaced.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d09-fd-replaced",
+    "script": "site/dn/d09_fd_replaced.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d09-fd-replaced",
+    "script": "site/dn/d09_fd_replaced.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d09-fd-replaced",
+    "script": "site/dn/d09_fd_replaced.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d09-fd-replaced",
+    "script": "site/dn/d09_fd_replaced.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d10-weird-names",
+    "script": "site/dn/d10_weird_names.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d10-weird-names",
+    "script": "site/dn/d10_weird_names.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d10-weird-names",
+    "script": "site/dn/d10_weird_names.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d10-weird-names",
+    "script": "site/dn/d10_weird_names.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d10-weird-names",
+    "script": "site/dn/d10_weird_names.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d10-weird-names",
+    "script": "site/dn/d10_weird_names.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d11-deep-wide-scan",
+    "script": "site/dn/d11_deep_wide_scan.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d11-deep-wide-scan",
+    "script": "site/dn/d11_deep_wide_scan.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d11-deep-wide-scan",
+    "script": "site/dn/d11_deep_wide_scan.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d11-deep-wide-scan",
+    "script": "site/dn/d11_deep_wide_scan.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d11-deep-wide-scan",
+    "script": "site/dn/d11_deep_wide_scan.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d11-deep-wide-scan",
+    "script": "site/dn/d11_deep_wide_scan.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n01-pnpm-layout",
+    "script": "site/dn/n01_pnpm_layout.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n01-pnpm-layout",
+    "script": "site/dn/n01_pnpm_layout.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n01-pnpm-layout",
+    "script": "site/dn/n01_pnpm_layout.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n01-pnpm-layout",
+    "script": "site/dn/n01_pnpm_layout.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n01-pnpm-layout",
+    "script": "site/dn/n01_pnpm_layout.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n01-pnpm-layout",
+    "script": "site/dn/n01_pnpm_layout.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n02-workspaces",
+    "script": "site/dn/n02_workspaces.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n02-workspaces",
+    "script": "site/dn/n02_workspaces.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n02-workspaces",
+    "script": "site/dn/n02_workspaces.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n02-workspaces",
+    "script": "site/dn/n02_workspaces.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n02-workspaces",
+    "script": "site/dn/n02_workspaces.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n02-workspaces",
+    "script": "site/dn/n02_workspaces.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n03-tsc-incremental",
+    "script": "site/dn/n03_tsc_incremental.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n03-tsc-incremental",
+    "script": "site/dn/n03_tsc_incremental.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n03-tsc-incremental",
+    "script": "site/dn/n03_tsc_incremental.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n03-tsc-incremental",
+    "script": "site/dn/n03_tsc_incremental.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n03-tsc-incremental",
+    "script": "site/dn/n03_tsc_incremental.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n03-tsc-incremental",
+    "script": "site/dn/n03_tsc_incremental.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n04-vitest",
+    "script": "site/dn/n04_vitest.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n04-vitest",
+    "script": "site/dn/n04_vitest.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n04-vitest",
+    "script": "site/dn/n04_vitest.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n04-vitest",
+    "script": "site/dn/n04_vitest.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n04-vitest",
+    "script": "site/dn/n04_vitest.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n04-vitest",
+    "script": "site/dn/n04_vitest.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n05-pack-tarball",
+    "script": "site/dn/n05_pack_tarball.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n05-pack-tarball",
+    "script": "site/dn/n05_pack_tarball.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n05-pack-tarball",
+    "script": "site/dn/n05_pack_tarball.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n05-pack-tarball",
+    "script": "site/dn/n05_pack_tarball.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n05-pack-tarball",
+    "script": "site/dn/n05_pack_tarball.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n05-pack-tarball",
+    "script": "site/dn/n05_pack_tarball.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n06-ci-interrupt",
+    "script": "site/dn/n06_ci_interrupt.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n06-ci-interrupt",
+    "script": "site/dn/n06_ci_interrupt.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n06-ci-interrupt",
+    "script": "site/dn/n06_ci_interrupt.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n06-ci-interrupt",
+    "script": "site/dn/n06_ci_interrupt.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n06-ci-interrupt",
+    "script": "site/dn/n06_ci_interrupt.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n06-ci-interrupt",
+    "script": "site/dn/n06_ci_interrupt.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n07-cache-concurrency",
+    "script": "site/dn/n07_cache_concurrency.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n07-cache-concurrency",
+    "script": "site/dn/n07_cache_concurrency.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n07-cache-concurrency",
+    "script": "site/dn/n07_cache_concurrency.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n07-cache-concurrency",
+    "script": "site/dn/n07_cache_concurrency.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n07-cache-concurrency",
+    "script": "site/dn/n07_cache_concurrency.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n07-cache-concurrency",
+    "script": "site/dn/n07_cache_concurrency.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n08-rm-node-modules",
+    "script": "site/dn/n08_rm_node_modules.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n08-rm-node-modules",
+    "script": "site/dn/n08_rm_node_modules.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n08-rm-node-modules",
+    "script": "site/dn/n08_rm_node_modules.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n08-rm-node-modules",
+    "script": "site/dn/n08_rm_node_modules.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n08-rm-node-modules",
+    "script": "site/dn/n08_rm_node_modules.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n08-rm-node-modules",
+    "script": "site/dn/n08_rm_node_modules.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n09-node-watch",
+    "script": "site/dn/n09_node_watch.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n09-node-watch",
+    "script": "site/dn/n09_node_watch.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n09-node-watch",
+    "script": "site/dn/n09_node_watch.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n09-node-watch",
+    "script": "site/dn/n09_node_watch.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n09-node-watch",
+    "script": "site/dn/n09_node_watch.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n09-node-watch",
+    "script": "site/dn/n09_node_watch.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n10-npx-corepack",
+    "script": "site/dn/n10_npx_corepack.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n10-npx-corepack",
+    "script": "site/dn/n10_npx_corepack.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n10-npx-corepack",
+    "script": "site/dn/n10_npx_corepack.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n10-npx-corepack",
+    "script": "site/dn/n10_npx_corepack.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n10-npx-corepack",
+    "script": "site/dn/n10_npx_corepack.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "n10-npx-corepack",
+    "script": "site/dn/n10_npx_corepack.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": false
+  },
+  {
+    "suite": "C",
+    "case": "d12-nfc-nfd-alias",
+    "script": "site/dn/d12_nfc_nfd_alias.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": true
+  },
+  {
+    "suite": "C",
+    "case": "d12-nfc-nfd-alias",
+    "script": "site/dn/d12_nfc_nfd_alias.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": true
+  },
+  {
+    "suite": "C",
+    "case": "d12-nfc-nfd-alias",
+    "script": "site/dn/d12_nfc_nfd_alias.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": true
+  },
+  {
+    "suite": "C",
+    "case": "d12-nfc-nfd-alias",
+    "script": "site/dn/d12_nfc_nfd_alias.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": true
+  },
+  {
+    "suite": "C",
+    "case": "d12-nfc-nfd-alias",
+    "script": "site/dn/d12_nfc_nfd_alias.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": true
+  },
+  {
+    "suite": "C",
+    "case": "d12-nfc-nfd-alias",
+    "script": "site/dn/d12_nfc_nfd_alias.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": true
+  },
+  {
+    "suite": "C",
+    "case": "n11-cache-inside-mount",
+    "script": "site/dn/n11_cache_inside_mount.py",
+    "group": "G01",
+    "profile": "none",
+    "durability": "interactive",
+    "isolated": true
+  },
+  {
+    "suite": "C",
+    "case": "n11-cache-inside-mount",
+    "script": "site/dn/n11_cache_inside_mount.py",
+    "group": "G02",
+    "profile": "none",
+    "durability": "close-sync",
+    "isolated": true
+  },
+  {
+    "suite": "C",
+    "case": "n11-cache-inside-mount",
+    "script": "site/dn/n11_cache_inside_mount.py",
+    "group": "G03",
+    "profile": "none",
+    "durability": "write-sync",
+    "isolated": true
+  },
+  {
+    "suite": "C",
+    "case": "n11-cache-inside-mount",
+    "script": "site/dn/n11_cache_inside_mount.py",
+    "group": "G04",
+    "profile": "coding-agent",
+    "durability": "interactive",
+    "isolated": true
+  },
+  {
+    "suite": "C",
+    "case": "n11-cache-inside-mount",
+    "script": "site/dn/n11_cache_inside_mount.py",
+    "group": "G05",
+    "profile": "coding-agent",
+    "durability": "close-sync",
+    "isolated": true
+  },
+  {
+    "suite": "C",
+    "case": "n11-cache-inside-mount",
+    "script": "site/dn/n11_cache_inside_mount.py",
+    "group": "G06",
+    "profile": "coding-agent",
+    "durability": "write-sync",
+    "isolated": true
+  }
+]

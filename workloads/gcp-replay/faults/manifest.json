@@ -1,0 +1,12 @@
+{
+  "environment": "GCP psc-test-vm",
+  "upstream": "https://drive9.example.invalid",
+  "transport": "loopback HTTP to verified PSC HTTPS",
+  "cases": [
+    {"id": "x1", "fault": "first write request hangs, then connection resets", "evidence": "hang_end_reset"},
+    {"id": "x2", "fault": "write requests slow; second connection resets", "evidence": "reset_after_delay"},
+    {"id": "x3", "fault": "first write returns 429 with Retry-After: 1", "evidence": "injected_429"},
+    {"id": "x4", "fault": "first mount request connection resets", "evidence": "reset_during_mount"},
+    {"id": "x5", "fault": "first successful upstream write response is lost", "evidence": "upstream_success_response_dropped"}
+  ]
+}

@@ -1,0 +1,10 @@
+# Local credentials and environment configuration
+config.env
+credentials/
+*-credentials.json
+.drive9-create.json
+
+# Generated distribution archives and fault proxy
+/*.tar.gz
+/*.tar.gz.sha256
+/gcp-replay/faults/proxy-linux-*
