@@ -94,9 +94,17 @@ func (r *layerRestorer) restoreEntry(ctx context.Context, entry client.FSLayerEn
 	if meta, exists := pending.GetMeta(localPath); exists && (!meta.LayerClean || meta.Kind == PendingConflict) && !opts.ReadOnly {
 		return nil
 	}
-	if meta, exists := pending.GetMeta(localPath); exists && r.cacheCoversReplay(meta, r.tips[entry.Path]) {
+	tip := r.tips[entry.Path]
+	if meta, exists := pending.GetMeta(localPath); exists && r.cacheCoversReplay(meta, tip) {
 		// The full replay can include older whiteouts and upserts. Compare
 		// against its final path identity before replaying any of that history.
+		// Matching content identity must not skip a replayed permission change.
+		if tip.Op == "chmod" && meta.LayerEntrySeq == tip.EntrySeq && (!meta.HasMode || meta.Mode != tip.Mode&posixPermissionModeMask) {
+			if err := pending.MarkLayerCommittedIfGeneration(localPath, meta.Generation, meta.BaseRev, tip.Mode, true, layerCacheIdentity(&tip, opts.LayerRef)); err != nil {
+				return fmt.Errorf("restore fs layer cached mode %s: %w", localPath, err)
+			}
+			meta.Mode = tip.Mode & posixPermissionModeMask
+		}
 		if meta.shadowSource.store != shadows && pending.recoverShadowSource(localPath, meta.Generation, shadows) == 0 {
 			return fmt.Errorf("restore fs layer cache %s: missing or short shadow", localPath)
 		}

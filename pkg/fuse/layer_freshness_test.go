@@ -178,12 +178,12 @@ func TestLayerFlushRequiresCommitLock(t *testing.T) {
 }
 
 func TestLayerRestoreCacheIdentityBoundaries(t *testing.T) {
-	for _, scenario := range []string{"same", "legacy", "newer_remote", "newer_local", "checkpoint", "ancestor_pin", "historical_whiteout"} {
+	for _, scenario := range []string{"same", "legacy", "newer_remote", "newer_local", "checkpoint", "ancestor_pin", "historical_whiteout", "chmod_same_sequence"} {
 		t.Run(scenario, func(t *testing.T) {
 			id := LayerCacheIdentity{LayerID: "layer-1", EntrySeq: 1}
 			entry := client.FSLayerEntry{LayerID: "layer-1", Path: "/a", Op: "upsert", Kind: "file", EntrySeq: 1, Content: []byte("newer"), SizeBytes: 5}
 			opts := &MountOptions{LayerRef: "layer-1", RemoteRoot: "/", CacheSize: 1 << 20}
-			reuse := scenario == "same" || scenario == "newer_local" || scenario == "historical_whiteout"
+			reuse := scenario == "same" || scenario == "newer_local" || scenario == "historical_whiteout" || scenario == "chmod_same_sequence"
 			switch scenario {
 			case "legacy":
 				id = LayerCacheIdentity{}
@@ -198,6 +198,8 @@ func TestLayerRestoreCacheIdentityBoundaries(t *testing.T) {
 				id.LayerID, id.EntrySeq, entry.LayerID = "parent", 9, "parent"
 			case "historical_whiteout":
 				id.EntrySeq, entry.EntrySeq = 3, 3
+			case "chmod_same_sequence":
+				entry.Op, entry.Mode = "chmod", 0640
 			}
 			idx, shadows := newLayerShutdownState(t)
 			if err := shadows.WriteFull("/a", []byte("cache"), 0); err != nil {
@@ -250,6 +252,11 @@ func TestLayerRestoreCacheIdentityBoundaries(t *testing.T) {
 			fs.pendingIndex, fs.shadowStore = recovered, shadows
 			if err := restoreLayerEntries(context.Background(), fs.client, opts, shadows, recovered, fs); err != nil {
 				t.Fatal(err)
+			}
+			if scenario == "chmod_same_sequence" {
+				if meta, ok := recovered.GetMeta("/a"); !ok || !meta.HasMode || meta.Mode != 0640 {
+					t.Fatalf("cached identity skipped chmod: %+v", meta)
+				}
 			}
 			var node gofuse.EntryOut
 			if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "a", &node); st != gofuse.OK {
