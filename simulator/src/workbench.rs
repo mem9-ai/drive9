@@ -223,11 +223,16 @@ pub fn run(a: WorkbenchArgs) -> Result<i32> {
         post_run(&home.join("workspace"), &home)
     };
 
-    // The writer's mount is still alive: serve the build output over HTTP for
+    // The writer's mount is still alive: flush every async commit first so
+    // the fresh-mount comparison below judges the server state, not the
+    // writer's pending layer. Then serve the build output over HTTP for
     // browser-style acceptance, and mount the reviewer's FRESH acceptance
     // mount (separate mountpoint / cache-dir / local-root) for the
     // cross-mount readability check. Both stay up for the whole review and
     // are torn down right after it.
+    if !timed_out {
+        drain_mount(&a.bin, &workspace);
+    }
     let (served, mut server_child) = if timed_out {
         (
             ServedAcceptance::skipped("worker timed out; build output not served"),
@@ -727,6 +732,37 @@ const FINDINGS_NAME: &str = "fs-findings.md";
 /// Excluded from the stability manifests: dependency trees dominate walk cost
 /// and the probe file must never enter a manifest even if its unlink fails.
 const AUDIT_IGNORES: &[&str] = &["node_modules/**", ".git/**", ".d9-audit-probe"];
+/// Extra exclusions for the cross-mount manifest comparison: long-lived
+/// servers the worker may leave running (e.g. a vite dev server) keep
+/// appending to their own log file through a live fd, so that file stays in
+/// the writer's pending layer and must not fail the comparison.
+const REVIEW_IGNORES: &[&str] = &["node_modules/**", ".git/**", ".d9-audit-probe", "devserver.log"];
+
+/// Best-effort drain of the writer's mount so every async commit is flushed
+/// to the server BEFORE the reviewer's fresh mount compares manifests —
+/// otherwise a still-pending file reads as a cross-mount difference that is
+/// really just an unflushed writer.
+fn drain_mount(bin: &str, ws: &Path) {
+    let out = Command::new(bin)
+        .args([
+            "mount",
+            "drain",
+            "--timeout",
+            "120s",
+            "--json",
+            &ws.to_string_lossy(),
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            log::info!(
+                "writer mount drained: {}",
+                String::from_utf8_lossy(&o.stdout).trim()
+            )
+        }
+        _ => log::warn!("writer mount drain failed (continuing)"),
+    }
+}
 
 /// Deterministic post-run workspace audit. Runs on the host against the still-
 /// mounted drive9 workspace — no LLM, no conflict of interest — and hard-fails
@@ -1289,7 +1325,7 @@ fn reviewer_acceptance(
 
     // cross-mount readability: identical filtered manifests on both mounts
     // (skipped when the writer's mount is not alive, e.g. in review-only)
-    let ignores: Vec<String> = AUDIT_IGNORES.iter().map(|s| s.to_string()).collect();
+    let ignores: Vec<String> = REVIEW_IGNORES.iter().map(|s| s.to_string()).collect();
     let (manifest_match, manifest_detail, entries) = match (
         try_walk(&ws),
         writer_ws.map(try_walk).unwrap_or(Err("writer mount not alive".into())),
