@@ -12307,6 +12307,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			if fs.ftruncateParticipates(fh) {
 				ensureStagedSnapshotLineageLocked(fh)
 				publishStagedSnapshotLineageLocked(fh)
+				fh.Dirty.visibleTruncate = true
 			}
 			fs.inodes.UpdateSize(fh.Ino, 0)
 			// Truncation updates mtime and ctime (POSIX). The SetAttr
@@ -12367,10 +12368,19 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.Prefetch.SetParallelRead(fs.parallelReadConcurrency(), fs.parallelReadBlockSize())
 			fh.Prefetch.SetPerfCounters(fs.perf)
 		}
+		// Register before acquiring a pin so a publisher cannot disappear
+		// between pin acquisition and observer registration. Prefetch is fully
+		// initialized before publication (mount reset reads that pointer).
+		fh.Lock()
+		defer fh.Unlock()
+		out.Fh = fs.allocateFileHandle(fh)
+		failpoint.InjectCall("ftruncateReaderRegistered", fs, fh)
 		fs.openReadOnlyShadowLocked(fh)
 	}
 
-	out.Fh = fs.allocateFileHandle(fh)
+	if fh.Dirty != nil {
+		out.Fh = fs.allocateFileHandle(fh)
+	}
 	out.OpenFlags = fs.openFlagsForHandle(fh)
 	fs.debugf("open path=%s fh=%d ino=%d flags=0x%x open_flags=%d dirty=%t prefetch=%t orig_size=%d base_rev=%d shadow_ready=%t shadow_spill=%t write_policy=%s", p, out.Fh, fh.Ino, input.Flags, out.OpenFlags, fh.Dirty != nil, fh.Prefetch != nil, fh.OrigSize, fh.BaseRev, fh.ShadowReady, fh.ShadowSpill, fh.WritePolicy)
 	return gofuse.OK

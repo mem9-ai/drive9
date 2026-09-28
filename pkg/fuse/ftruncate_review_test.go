@@ -109,8 +109,12 @@ func TestReadWriteBackFtruncateNewerWriterOwnRange(t *testing.T) {
 			if err != nil || st != gofuse.OK || string(got) != tc.want {
 				t.Fatalf("own read = %q/%v/%v, want %q/OK", got, st, err, tc.want)
 			}
-			if _, st, err := readDat9FSTestRange(fs, ino, c, 0, len(remote)); err != nil || st != gofuse.Status(syscall.EAGAIN) {
-				t.Fatalf("other reader = %v/%v, want EAGAIN", st, err)
+			wantSibling := tc.want
+			if tc.name == "partial" {
+				wantSibling = "Xello"
+			}
+			if got, st, err := readDat9FSTestRange(fs, ino, c, 0, len(remote)); err != nil || st != gofuse.OK || string(got) != wantSibling {
+				t.Fatalf("other reader = %q/%v/%v, want proven %q", got, st, err, wantSibling)
 			}
 			if tc.name == "partial" {
 				if _, st, err := readDat9FSTestRange(fs, ino, b, 0, len(remote)); err != nil || st != gofuse.Status(syscall.EAGAIN) {
@@ -176,8 +180,8 @@ func TestReadWriteBackFtruncateOwnRangeAfterCommit(t *testing.T) {
 	if _, st, err := readDat9FSTestRange(fs, ino, b, 0, 2); err != nil || st != gofuse.Status(syscall.EAGAIN) {
 		t.Fatalf("B own uncovered read = %v/%v, want EAGAIN", st, err)
 	}
-	if _, st, err := readDat9FSTestRange(fs, ino, c, 0, 1); err != nil || st != gofuse.Status(syscall.EAGAIN) {
-		t.Fatalf("C read while B is pending = %v/%v, want EAGAIN", st, err)
+	if got, st, err := readDat9FSTestRange(fs, ino, c, 0, 1); err != nil || st != gofuse.OK || string(got) != "X" {
+		t.Fatalf("C proven successor read = %q/%v/%v, want X/OK", got, st, err)
 	}
 	want := []byte("HELLO WORLD")
 	if n, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: b}, want); st != gofuse.OK || n != uint32(len(want)) {
@@ -410,6 +414,7 @@ func TestReadWriteBackFtruncateRechecksAfterLazyLoad(t *testing.T) {
 func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 	remote := []byte("hello world")
 	var mu sync.Mutex
+	revision := "1"
 	var cache *WriteBackCache
 	replaceMetaOnGet := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -419,7 +424,7 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", strconv.Itoa(len(remote)))
 			w.Header().Set("X-Dat9-IsDir", "false")
-			w.Header().Set("X-Dat9-Revision", "1")
+			w.Header().Set("X-Dat9-Revision", revision)
 		case http.MethodGet:
 			if replaceMetaOnGet {
 				replaceMetaOnGet = false
@@ -434,7 +439,7 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			remote = data
+			remote, revision = data, "2"
 			w.Header().Set("X-Dat9-Revision", "2")
 		case http.MethodPost:
 			w.WriteHeader(http.StatusForbidden) // Data landed; chmod did not.
@@ -498,6 +503,7 @@ func TestReadWriteBackFtruncateLegacyUploadRecordsBeforeChmod(t *testing.T) {
 	if err != nil || st != gofuse.OK || string(got) != "HELLO WORLD" {
 		t.Fatalf("read after data commit/chmod failure = %q/%v/%v, want HELLO WORLD/OK", got, st, err)
 	}
+	fs.readCache.Invalidate("/file.bin")
 	mu.Lock()
 	replaceMetaOnGet = true
 	mu.Unlock()
