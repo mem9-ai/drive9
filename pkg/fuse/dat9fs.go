@@ -43,6 +43,7 @@ var testHookAfterCallerOwnedTruncateScan func(path string)
 var testHookAfterAppendRead func(path string)
 var testHookAfterAppendPrefixScan func(path string)
 var testHookBeforeFlushRelock func(path string)
+var testHookAfterAliasPublishedPin func(path string)
 
 // testHookBeforeGVisorShadowSpillFlushFence lets race-focused unit tests pause
 // a gVisor ShadowSpill Flush after its initial supersession check but before it
@@ -4260,6 +4261,12 @@ func (fs *Dat9FS) rebindStaleCleanSamePathReadCandidateLocked(fh *FileHandle) bo
 }
 
 func (fs *Dat9FS) readSamePathDirtyHandleAllowJournalsOnce(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, bool) {
+	return fs.readDirtyHandleScopeOnce(path, skip, offset, reqSize, false)
+}
+
+// readDirtyHandleScopeOnce keeps existing same-path callers separate from
+// append reads, whose source may be another hardlink name for the same inode.
+func (fs *Dat9FS) readDirtyHandleScopeOnce(path string, skip *FileHandle, offset int64, reqSize uint32, inodeScope bool) ([]byte, int, bool, gofuse.Status, bool) {
 	if fs == nil || fs.openHandles == nil || path == "" || reqSize == 0 {
 		return nil, 0, false, gofuse.OK, false
 	}
@@ -4273,7 +4280,13 @@ restartLoop:
 	for {
 		var candidates []candidate
 		pending := false
-		for _, src := range fs.openHandles.SnapshotPath(path) {
+		var handles []*FileHandle
+		if inodeScope && skip != nil {
+			handles = fs.openHandles.SnapshotInode(skip.Ino)
+		} else {
+			handles = fs.openHandles.SnapshotPath(path)
+		}
+		for _, src := range handles {
 			if src == nil || src == skip || (skip != nil && skip.Ino != 0 && src.Ino != skip.Ino) {
 				continue
 			}
@@ -4281,7 +4294,7 @@ restartLoop:
 				pending = true
 				continue
 			}
-			if src.Dirty != nil && src.DirtySeq > 0 {
+			if src.Dirty != nil && src.DirtySeq > 0 && (!inodeScope || !src.Unlinked) {
 				candidates = append(candidates, candidate{fh: src, dirtySeq: src.DirtySeq})
 			}
 			src.Unlock()
@@ -4301,7 +4314,7 @@ restartLoop:
 			if !src.TryLock() {
 				return nil, 0, false, gofuse.OK, true
 			}
-			if src.Dirty == nil || src.DirtySeq == 0 {
+			if src.Dirty == nil || src.DirtySeq == 0 || (inodeScope && src.Unlinked) {
 				src.Unlock()
 				continue
 			}
@@ -4333,10 +4346,34 @@ restartLoop:
 			buf := make([]byte, end-offset)
 
 			if fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) {
+				if !inodeScope {
+					src.Unlock()
+					n, err := fs.shadowStore.ReadAt(path, offset, buf)
+					if err != nil && !errors.Is(err, io.EOF) {
+						fs.debugf("read same-path shadow miss path=%s off=%d req=%d err=%v", path, offset, reqSize, err)
+						return nil, 0, false, gofuse.OK, true
+					}
+					return buf[:n], n, true, gofuse.OK, false
+				}
+				sourcePath, buffer, version := src.Path, src.Dirty, src.Dirty.contentVersion
+				pendingGen := src.ShadowStageGen
+				if pendingGen == 0 || fs.shadowStore.ActiveGeneration(sourcePath) != pendingGen {
+					src.Unlock()
+					return nil, 0, false, gofuse.OK, true
+				}
+				gen, pinned := fs.shadowStore.pinReadable(sourcePath, max(src.BaseRev, fs.inodes.GetRevision(src.Ino)), pendingGen)
 				src.Unlock()
-				n, err := fs.shadowStore.ReadAt(path, offset, buf)
-				if err != nil && !errors.Is(err, io.EOF) {
-					fs.debugf("read same-path shadow miss path=%s off=%d req=%d err=%v", path, offset, reqSize, err)
+				if !pinned {
+					return nil, 0, false, gofuse.OK, true
+				}
+				n, err := fs.shadowStore.ReadAtGen(gen, offset, buf)
+				fs.shadowStore.Unpin(gen)
+				if !src.TryLock() {
+					return nil, 0, false, gofuse.OK, true
+				}
+				stable := !src.Unlinked && src.Ino == skip.Ino && src.Path == sourcePath && src.Dirty == buffer && buffer.contentVersion == version && src.DirtySeq == c.dirtySeq
+				src.Unlock()
+				if !stable || fs.shadowStore.ActiveGeneration(sourcePath) != pendingGen || (err != nil && !errors.Is(err, io.EOF)) {
 					return nil, 0, false, gofuse.OK, true
 				}
 				return buf[:n], n, true, gofuse.OK, false
@@ -4394,10 +4431,148 @@ func (fs *Dat9FS) readSamePathDirtyHandleVisibleRange(path string, skip *FileHan
 	return nil, 0, false, gofuse.OK, ""
 }
 
+func (fs *Dat9FS) appendReadPaths(ino uint64) []string {
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		return nil
+	}
+	paths := make([]string, 0, len(entry.Paths))
+	for p := range entry.Paths {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func (fs *Dat9FS) appendContentPending(p string) bool {
+	metadataOnly := false
+	if fs.pendingIndex != nil {
+		if meta, ok := fs.pendingIndex.GetMeta(p); ok {
+			if meta.Kind != PendingChmod {
+				return true
+			}
+			metadataOnly = true
+		}
+	}
+	if fs.writeBack != nil {
+		if meta, ok := fs.writeBack.GetMeta(p); ok {
+			if meta.Kind != PendingChmod {
+				return true
+			}
+			metadataOnly = true
+		}
+	}
+	return !metadataOnly && fs.hasQueuedCommit(p)
+}
+
+func (fs *Dat9FS) hasOtherAliasPending(path string, ino uint64) bool {
+	for _, p := range fs.appendReadPaths(ino) {
+		if p != path && fs.appendContentPending(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// Reuse bound pending generation and immutable writeback snapshots; never guess
+// between independent pending images. The existing append deadline owns retries.
+func (fs *Dat9FS) readAliasPublishedOnce(path string, ino uint64, offset int64, size uint32) ([]byte, int, bool, gofuse.Status, bool) {
+	selected := ""
+	for _, p := range fs.appendReadPaths(ino) {
+		if fs.appendContentPending(p) {
+			if selected != "" {
+				return nil, 0, false, gofuse.OK, true
+			}
+			selected = p
+		}
+	}
+	if selected == "" || selected == path {
+		return nil, 0, false, gofuse.OK, false
+	}
+	matches := func() bool {
+		current, ok := fs.inodes.GetInode(selected)
+		return ok && current == ino
+	}
+	if !matches() {
+		return nil, 0, false, gofuse.EIO, false
+	}
+	if offset < 0 || offset > int64(^uint64(0)>>1)-int64(size) {
+		return nil, 0, false, gofuse.EINVAL, false
+	}
+	if fs.shadowStore != nil {
+		pending := fs.pendingIndex.shadowReadGeneration(selected, fs.shadowStore)
+		hasShadowMeta := false
+		if fs.pendingIndex != nil {
+			if meta, ok := fs.pendingIndex.GetMeta(selected); ok && meta.Kind != PendingChmod {
+				hasShadowMeta = true
+			}
+		}
+		if hasShadowMeta && (pending == 0 || fs.shadowStore.ActiveGeneration(selected) != pending) {
+			return nil, 0, false, gofuse.OK, true
+		}
+		minimum := max(fs.inodes.GetRevision(ino), fs.latestCommittedRevision(selected))
+		gen, pinned := uint64(0), false
+		if hasShadowMeta {
+			gen, pinned = fs.shadowStore.pinReadable(selected, minimum, pending)
+		}
+		if hasShadowMeta && !pinned {
+			return nil, 0, false, gofuse.OK, true
+		}
+		if pinned {
+			defer fs.shadowStore.Unpin(gen)
+			if testHookAfterAliasPublishedPin != nil {
+				testHookAfterAliasPublishedPin(selected)
+			}
+			total := fs.shadowStore.SizeGen(gen)
+			end := min(offset+int64(size), total)
+			if end < offset {
+				end = offset
+			}
+			data := make([]byte, end-offset)
+			n, err := fs.shadowStore.ReadAtGen(gen, offset, data)
+			if !matches() {
+				return nil, 0, false, gofuse.EIO, false
+			}
+			if hasShadowMeta && fs.shadowStore.ActiveGeneration(selected) != pending {
+				return nil, 0, false, gofuse.OK, true
+			}
+			if err != nil && !errors.Is(err, io.EOF) {
+				return nil, 0, false, gofuse.OK, true
+			}
+			return data[:n], n, true, gofuse.OK, false
+		}
+	}
+	if fs.writeBack != nil {
+		if _, data, ok := fs.writeBack.GetMetaAndView(selected); ok {
+			if !matches() {
+				return nil, 0, false, gofuse.EIO, false
+			}
+			start := min(offset, int64(len(data)))
+			end := min(offset+int64(size), int64(len(data)))
+			result := append([]byte(nil), data[start:end]...)
+			return result, len(result), true, gofuse.OK, false
+		}
+	}
+	return nil, 0, false, gofuse.OK, true
+}
+
+// Read-local floor from existing publication; do not mutate alias watermarks.
+func (fs *Dat9FS) appendAliasCommittedRevision(ino uint64) int64 {
+	paths := fs.appendReadPaths(ino)
+	if len(paths) < 2 {
+		return 0
+	}
+	revision := fs.inodes.GetRevision(ino)
+	for _, p := range paths {
+		revision = max(revision, fs.latestCommittedRevision(p))
+	}
+	return revision
+}
+
 func (fs *Dat9FS) hasDirtyAppend(path string, ino uint64, skip *FileHandle) bool {
 	// The latest inode marker can be cleared while an older append remains
 	// dirty on an open handle.
-	for _, src := range fs.openHandles.SnapshotPath(path) {
+	for _, src := range fs.openHandles.SnapshotInode(ino) {
 		if src == nil || src == skip || src.Ino != ino || src.Flags&uint32(syscall.O_APPEND) == 0 {
 			continue
 		}
@@ -4425,7 +4600,8 @@ func (fs *Dat9FS) canReadAppendPrefix(path string, ino uint64, reader *FileHandl
 	var buffer *WriteBuffer
 	var version, sequence uint64
 	var revision int64
-	for _, h := range fs.openHandles.SnapshotPath(path) {
+	var sourcePath string
+	for _, h := range fs.openHandles.SnapshotInode(ino) {
 		if h == nil || h == reader || h.Ino != ino {
 			continue
 		}
@@ -4437,7 +4613,7 @@ func (fs *Dat9FS) canReadAppendPrefix(path string, ino uint64, reader *FileHandl
 			h.Unlock()
 			continue
 		}
-		eligible := source == nil && h.Path == path && !h.Unlinked && !h.IsNew && !h.ZeroBase &&
+		eligible := source == nil && !h.Unlinked && !h.IsNew && !h.ZeroBase &&
 			h.Flags&uint32(syscall.O_APPEND) != 0 && h.Flags&uint32(syscall.O_TRUNC) == 0 &&
 			h.Dirty != nil && h.DirtySeq != 0 && h.Dirty.prefixRevision > 0 &&
 			h.Dirty.prefixRevision == h.BaseRev && end <= h.Dirty.prefixEnd
@@ -4446,6 +4622,7 @@ func (fs *Dat9FS) canReadAppendPrefix(path string, ino uint64, reader *FileHandl
 			return false
 		}
 		source, buffer, version, sequence, revision = h, h.Dirty, h.Dirty.contentVersion, h.DirtySeq, h.BaseRev
+		sourcePath = h.Path
 		h.Unlock()
 	}
 	if source == nil {
@@ -4454,13 +4631,15 @@ func (fs *Dat9FS) canReadAppendPrefix(path string, ino uint64, reader *FileHandl
 	if testHookAfterAppendPrefixScan != nil {
 		testHookAfterAppendPrefixScan(path)
 	}
-	if fs.hasPendingLocalState(path) || fs.hasQueuedCommit(path) {
-		return false
+	for _, p := range fs.appendReadPaths(ino) {
+		if fs.hasPendingLocalState(p) || fs.hasQueuedCommit(p) || fs.latestCommittedRevision(p) > revision {
+			return false
+		}
 	}
 	if !source.TryLock() {
 		return false
 	}
-	stable := source.Path == path && source.Ino == ino && !source.Unlinked && source.Dirty == buffer &&
+	stable := source.Path == sourcePath && source.Ino == ino && !source.Unlinked && source.Dirty == buffer &&
 		buffer.contentVersion == version && source.DirtySeq == sequence && source.BaseRev == revision
 	source.Unlock()
 	if !stable || !reader.TryLock() {
@@ -4469,11 +4648,12 @@ func (fs *Dat9FS) canReadAppendPrefix(path string, ino uint64, reader *FileHandl
 	stable = reader.Path == path && reader.Ino == ino && !reader.Unlinked && reader.BaseRev == revision &&
 		(reader.Dirty == nil || (reader.DirtySeq == 0 && !reader.Dirty.HasDirtyParts() && reader.Dirty.prefixRevision == revision && end <= reader.Dirty.prefixEnd))
 	reader.Unlock()
-	return stable && fs.latestCommittedRevision(path) <= revision
+	return stable && fs.latestCommittedRevision(path) <= revision && fs.inodes.GetRevision(ino) <= revision
 }
 
-// The caller already observed an active append. An unhandled read must select
-// published sources unless the requested prefix was proved unchanged.
+// The caller observed an active append or another alias's pending content.
+// An unhandled read selects published sources unless the requested prefix
+// was proved unchanged.
 func (fs *Dat9FS) readActiveAppendVisibleRange(ctx context.Context, path string, ino uint64, reader *FileHandle, offset int64, reqSize uint32) (data []byte, n int, ok bool, st gofuse.Status, source string, usePublished bool) {
 	deadline := time.Now().Add(fs.remoteReadTimeout)
 	if d, hasDeadline := ctx.Deadline(); hasDeadline && d.Before(deadline) {
@@ -4508,7 +4688,11 @@ func (fs *Dat9FS) readActiveAppendVisibleRange(ctx context.Context, path string,
 		if !time.Now().Before(deadline) {
 			return nil, 0, false, gofuse.EIO, "same-path-dirty-timeout", false
 		}
-		data, n, ok, st, _ = fs.readSamePathDirtyHandleAllowJournalsOnce(path, reader, offset, reqSize)
+		if fs.hasDirtyAppend(path, ino, reader) {
+			data, n, ok, st, _ = fs.readDirtyHandleScopeOnce(path, reader, offset, reqSize, true)
+		} else {
+			data, n, ok, st = nil, 0, false, gofuse.OK
+		}
 		if ctx.Err() != nil {
 			st, source = canceled()
 			return nil, 0, false, st, source, false
@@ -4520,7 +4704,20 @@ func (fs *Dat9FS) readActiveAppendVisibleRange(ctx context.Context, path string,
 			return data, n, ok, st, "same-path-dirty", false
 		}
 		if !fs.hasDirtyAppend(path, ino, reader) {
-			return nil, 0, false, gofuse.OK, "", true
+			data, n, ok, st, pending := fs.readAliasPublishedOnce(path, ino, offset, reqSize)
+			if ctx.Err() != nil {
+				st, source = canceled()
+				return nil, 0, false, st, source, false
+			}
+			if !time.Now().Before(deadline) {
+				return nil, 0, false, gofuse.EIO, "same-path-dirty-timeout", false
+			}
+			if ok || st != gofuse.OK {
+				return data, n, ok, st, "alias-published", false
+			}
+			if !pending {
+				return nil, 0, false, gofuse.OK, "", true
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -6108,7 +6305,13 @@ func (fs *Dat9FS) updateEntryFromStat(entry *InodeEntry, stat *client.StatResult
 }
 
 func (fs *Dat9FS) revalidateReadCacheEntryIfUntrusted(cancel <-chan struct{}, p string, entry *InodeEntry) (*InodeEntry, error) {
-	if fs == nil || entry == nil || entry.IsDir || entry.Revision <= 0 || fs.statCacheTrustedAndVerified() {
+	return fs.revalidateReadCacheEntryAtLeast(cancel, p, entry, 0)
+}
+
+// revalidateReadCacheEntryAtLeast cannot accept a delayed Stat below a known
+// alias commit, or pair another resource with the reader's cached identity.
+func (fs *Dat9FS) revalidateReadCacheEntryAtLeast(cancel <-chan struct{}, p string, entry *InodeEntry, minimumRevision int64) (*InodeEntry, error) {
+	if fs == nil || entry == nil || entry.IsDir || (entry.Revision <= 0 && minimumRevision == 0) || (fs.statCacheTrustedAndVerified() && entry.Revision >= minimumRevision) {
 		return entry, nil
 	}
 	cachedRevision := entry.Revision
@@ -6120,6 +6323,9 @@ func (fs *Dat9FS) revalidateReadCacheEntryIfUntrusted(cancel <-chan struct{}, p 
 		return nil, syscall.EAGAIN
 	}
 	defer fs.mountViewMu.RUnlock()
+	if minimumRevision > 0 && (stat == nil || stat.Revision < minimumRevision || (entry.ResourceID != "" && stat.ResourceID != "" && entry.ResourceID != stat.ResourceID)) {
+		return nil, syscall.EIO
+	}
 	entry = fs.updateEntryFromStat(entry, stat)
 	if stat == nil || stat.IsDir || stat.Revision <= 0 || stat.Revision != cachedRevision {
 		fs.invalidateReadCacheAndTargets(p)
@@ -12500,12 +12706,16 @@ readHandleState:
 	appendEligible := !appendChecked && !fh.Unlinked && fh.Layer != PathLayerGitWorkspace &&
 		(fh.Dirty == nil || (fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts())) &&
 		fh.WritePolicy == WritePolicyWriteBack && input.Size > 0 && !isSQLiteDirectIOPath(fh.Path)
-	activeAppend := appendEligible && fs.hasDirtyAppend(fh.Path, fh.Ino, fh)
+	aliasReadRevision := int64(0)
+	if appendEligible {
+		aliasReadRevision = fs.appendAliasCommittedRevision(fh.Ino)
+	}
+	activeAppend := appendEligible && (fs.hasDirtyAppend(fh.Path, fh.Ino, fh) || fs.hasOtherAliasPending(fh.Path, fh.Ino))
 	if appendEligible && !activeAppend {
 		// Inspect open writers before their published successors: staging
 		// clears DirtySeq only after publishing pending data. Commit cleanup
 		// may already have retired it, so refresh committed state once more.
-		usePublishedAppend = fs.hasPendingLocalState(fh.Path) || fs.hasQueuedCommit(fh.Path)
+		usePublishedAppend = fs.hasPendingLocalState(fh.Path) || fs.hasQueuedCommit(fh.Path) || aliasReadRevision > fh.BaseRev
 		fs.refreshCleanCommittedRevisionForHandleLocked(fh)
 	}
 	if activeAppend {
@@ -12768,7 +12978,18 @@ readHandleState:
 	bypassStableCaches := fs.bypassStableRemoteReadCaches(p)
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
 	revalidatedForRead := false
-	if entry != nil && !fs.statCacheVerified() {
+	if appendEligible {
+		aliasReadRevision = max(aliasReadRevision, fs.appendAliasCommittedRevision(fh.Ino))
+	}
+	if entry != nil && aliasReadRevision > entry.Revision {
+		refreshed, err := fs.revalidateReadCacheEntryAtLeast(cancel, p, entry, aliasReadRevision)
+		if err != nil {
+			source = "alias-commit-revalidate-error"
+			return nil, listDirErrToFuseStatus(err)
+		}
+		entry, revalidatedForRead = refreshed, true
+	}
+	if entry != nil && !revalidatedForRead && !fs.statCacheVerified() {
 		if refreshed, err := fs.revalidateReadCacheEntryIfUntrusted(cancel, p, entry); err != nil {
 			source = "read-cache-revalidate-error"
 			return nil, listDirErrToFuseStatus(err)
