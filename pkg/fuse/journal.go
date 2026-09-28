@@ -67,6 +67,8 @@ type Journal struct {
 	path              string
 	appendedBytes     int64
 	compactAfterBytes int64
+	compactRetryAt    time.Time
+	closed            bool
 
 	// syncMu serializes actual fd.Sync calls so concurrent FsyncShared
 	// waiters coalesce into one fsync (group commit). doneGen (guarded by
@@ -131,13 +133,6 @@ func scanJournalFrames(data []byte, fn func(entry JournalEntry, frame []byte)) {
 // Append writes a journal entry to the WAL. The entry is length-prefixed
 // and CRC32-checksummed for integrity.
 func (j *Journal) Append(entry JournalEntry) error {
-	if err := j.appendEntry(entry); err != nil {
-		return err
-	}
-	return j.compact(false)
-}
-
-func (j *Journal) appendEntry(entry JournalEntry) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
@@ -212,9 +207,9 @@ func (j *Journal) FsyncShared() error {
 	return nil
 }
 
-// SyncLoop periodically calls FsyncShared until the channel closes, bounding
-// the power-loss exposure of un-fsynced appends (issue #964). It stops on
-// channel close or context cancellation and returns.
+// SyncLoop bounds the power-loss exposure of un-fsynced appends (issue #964)
+// and performs due compaction outside pending-index publication locks.
+// Maintenance failures back off independently of append and fsync results.
 func (j *Journal) SyncLoop(ctx context.Context, interval time.Duration) {
 	if j == nil || interval <= 0 {
 		return
@@ -227,6 +222,9 @@ func (j *Journal) SyncLoop(ctx context.Context, interval time.Duration) {
 			return
 		case <-t.C:
 			_ = j.FsyncShared()
+			if err := j.compact(false); err != nil && ctx.Err() == nil {
+				safeLogPrintf("journal background compaction failed: %v", err)
+			}
 		}
 	}
 }
@@ -269,10 +267,10 @@ func (j *Journal) Compact() error {
 	return j.compact(true)
 }
 
-func (j *Journal) compact(force bool) error {
+func (j *Journal) compact(force bool) (err error) {
 	if !force {
 		j.mu.Lock()
-		needed := j.compactAfterBytes > 0 && j.appendedBytes >= j.compactAfterBytes
+		needed := j.compactAfterBytes > 0 && j.appendedBytes >= j.compactAfterBytes && !time.Now().Before(j.compactRetryAt)
 		j.mu.Unlock()
 		if !needed {
 			return nil
@@ -285,28 +283,42 @@ func (j *Journal) compact(force bool) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
+	if j.closed {
+		return os.ErrClosed
+	}
+	// Maintenance errors never invalidate an append. Back off so persistent
+	// failures do not trigger a full rewrite on every sync-loop tick.
+	if !force && (j.appendedBytes < j.compactAfterBytes || time.Now().Before(j.compactRetryAt)) {
+		return nil
+	}
+	defer func() {
+		if err != nil {
+			j.compactRetryAt = time.Now().Add(30 * time.Second)
+		} else {
+			j.compactRetryAt = time.Time{}
+		}
+	}()
 	data, err := os.ReadFile(j.path)
 	if err != nil {
 		return err
 	}
 
-	// Recheck under the rewrite locks: another appender may have compacted.
-	if !force && j.appendedBytes < j.compactAfterBytes {
-		return nil
-	}
 	done := make(map[string]uint64)
 	latestMeta := make(map[string]uint64)
+	latestFsync := make(map[string]uint64)
 	scanJournalFrames(data, func(entry JournalEntry, _ []byte) {
 		switch entry.Op {
 		case JournalCommit, JournalUnlink:
 			done[entry.Path] = max(done[entry.Path], entry.Seq)
 		case JournalPendingMeta:
 			latestMeta[entry.Path] = max(latestMeta[entry.Path], entry.Seq)
+		case JournalFsync:
+			latestFsync[entry.Path] = max(latestFsync[entry.Path], entry.Seq)
 		}
 	})
 	var kept []byte
 	scanJournalFrames(data, func(entry JournalEntry, frame []byte) {
-		if entry.Seq <= done[entry.Path] || entry.Seq < latestMeta[entry.Path] {
+		if entry.Seq <= done[entry.Path] || entry.Seq < latestMeta[entry.Path] || (entry.Op == JournalFsync && entry.Seq < latestFsync[entry.Path]) {
 			return
 		}
 		kept = append(kept, frame...)
@@ -321,17 +333,20 @@ func (j *Journal) compact(force bool) error {
 	if err := atomicWrite(tmpPath, kept); err != nil {
 		return fmt.Errorf("journal compact write: %w", err)
 	}
+	// Prepare a usable replacement before touching the live descriptor. A
+	// failed open or rename must leave subsequent appends on the old WAL.
+	fd, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("journal compact open: %w", err)
+	}
 	if err := os.Rename(tmpPath, j.path); err != nil {
+		_ = fd.Close()
 		return fmt.Errorf("journal compact rename: %w", err)
 	}
-
-	// Reopen.
-	_ = j.fd.Close()
-	fd, err := os.OpenFile(j.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
-	if err != nil {
-		return fmt.Errorf("journal reopen: %w", err)
-	}
+	old := j.fd
 	j.fd = fd
+	_ = old.Close()
+
 	if err := fsyncDir(filepath.Dir(j.path)); err != nil {
 		return fmt.Errorf("journal compact sync directory: %w", err)
 	}
@@ -342,8 +357,11 @@ func (j *Journal) compact(force bool) error {
 
 // Close closes the journal file.
 func (j *Journal) Close() error {
+	j.syncMu.Lock()
+	defer j.syncMu.Unlock()
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	j.closed = true
 	return j.fd.Close()
 }
 

@@ -41,12 +41,41 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 	for _, entry := range entries {
 		r.tips[entry.Path] = entry
 	}
-	for _, entry := range entries {
+	for _, entry := range layerReplayContent(entries) {
 		if err := r.restoreEntry(ctx, entry); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// layerReplayContent drops overwritten payloads, retaining namespace operations
+// and the last body before chmod. A rename can consume an earlier snapshot
+// (including descendants of a directory), so it is a dependency barrier.
+func layerReplayContent(entries []client.FSLayerEntry) []client.FSLayerEntry {
+	superseded := make(map[string]bool)
+	skip := make([]bool, len(entries))
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		switch e.Op {
+		case "rename":
+			clear(superseded)
+		case "upsert":
+			if e.Kind == "file" {
+				skip[i] = superseded[e.Path]
+				superseded[e.Path] = true
+			}
+		case "whiteout", "mkdir", "symlink":
+			superseded[e.Path] = true
+		}
+	}
+	out := make([]client.FSLayerEntry, 0, len(entries))
+	for i, entry := range entries {
+		if !skip[i] {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 type layerRestorer struct {
@@ -86,8 +115,17 @@ func (r *layerRestorer) restoreEntry(ctx context.Context, entry client.FSLayerEn
 	}
 	// An orphan must not suppress the authoritative Layer replay. Recovery
 	// runs after restore, so prune it here under the same publication fence.
-	if meta, exists := pending.GetMeta(localPath); exists && !shadows.Has(localPath) {
-		pending.RemoveIfGeneration(localPath, meta.Generation)
+	if meta, exists := pending.GetMeta(localPath); exists {
+		size, present := shadows.ContentSize(localPath)
+		if meta.LayerClean && meta.Kind != PendingConflict && (!present || size < meta.Size) {
+			// A clean cache is replaceable. Drop the torn publication durably
+			// and restore from the Layer; never upload its incomplete payload.
+			if err := pending.discardLayerCache(localPath, meta.Generation, shadows); err != nil {
+				return fmt.Errorf("discard incomplete fs layer cache %s: %w", localPath, err)
+			}
+		} else if !present {
+			pending.RemoveIfGeneration(localPath, meta.Generation)
+		}
 	}
 	// Recovery must upload local dirty content before it can be replaced by
 	// a server replay. Clean overlays can be refreshed normally.

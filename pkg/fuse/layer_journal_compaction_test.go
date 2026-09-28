@@ -1,11 +1,13 @@
 package fuse
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLayerJournalCompactsSupersededPublications(t *testing.T) {
@@ -62,6 +64,10 @@ func TestLayerJournalCompactsWhileMountedAndOnShutdown(t *testing.T) {
 			t.Cleanup(func() { _ = j.Close() })
 			if automatic {
 				j.compactAfterBytes = 1024
+				ctx, cancel := context.WithCancel(context.Background())
+				done := make(chan struct{})
+				go func() { j.SyncLoop(ctx, time.Millisecond); close(done) }()
+				t.Cleanup(func() { cancel(); <-done })
 			}
 			idx.SetJournal(j)
 			if err := shadows.WriteFull("/a", []byte("data"), 0); err != nil {
@@ -73,9 +79,19 @@ func TestLayerJournalCompactsWhileMountedAndOnShutdown(t *testing.T) {
 				}
 			}
 			if automatic {
-				info, err := os.Stat(j.path)
-				if err != nil || info.Size() > 2*j.compactAfterBytes {
-					t.Fatalf("WAL not bounded during writes: %v %v", info, err)
+				deadline := time.Now().Add(time.Second)
+				for {
+					info, err := os.Stat(j.path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if info.Size() <= 2*j.compactAfterBytes {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("background WAL compaction did not run: %d bytes", info.Size())
+					}
+					time.Sleep(time.Millisecond)
 				}
 			} else {
 				fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), &MountOptions{LayerRef: "layer-1", RemoteRoot: "/"})

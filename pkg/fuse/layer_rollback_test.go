@@ -113,7 +113,7 @@ func TestUpsertLayerEntryReturnsErrLayerRolledBack(t *testing.T) {
 	})
 	fs.setLayerAbandoned()
 
-	err := fs.upsertLayerEntry(context.Background(), client.FSLayerEntryRequest{
+	_, err := fs.upsertLayerEntry(context.Background(), client.FSLayerEntryRequest{
 		Path:      "/repo/a.txt",
 		Op:        "upsert",
 		Kind:      "file",

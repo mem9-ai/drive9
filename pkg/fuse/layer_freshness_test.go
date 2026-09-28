@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"sync"
 	"syscall"
@@ -178,7 +179,7 @@ func TestLayerFlushRequiresCommitLock(t *testing.T) {
 }
 
 func TestLayerRestoreCacheIdentityBoundaries(t *testing.T) {
-	for _, scenario := range []string{"same", "legacy", "newer_remote", "newer_local", "checkpoint", "ancestor_pin", "historical_whiteout", "chmod_same_sequence"} {
+	for _, scenario := range []string{"same", "legacy", "newer_remote", "newer_local", "checkpoint", "ancestor_pin", "historical_whiteout", "chmod_same_sequence", "short_clean"} {
 		t.Run(scenario, func(t *testing.T) {
 			id := LayerCacheIdentity{LayerID: "layer-1", EntrySeq: 1}
 			entry := client.FSLayerEntry{LayerID: "layer-1", Path: "/a", Op: "upsert", Kind: "file", EntrySeq: 1, Content: []byte("newer"), SizeBytes: 5}
@@ -214,6 +215,11 @@ func TestLayerRestoreCacheIdentityBoundaries(t *testing.T) {
 				t.Fatal(err)
 			}
 			shadows.Close()
+			if scenario == "short_clean" {
+				if err := os.Truncate(shadows.shadowPath("/a"), 2); err != nil {
+					t.Fatal(err)
+				}
+			}
 			shadows, err = NewShadowStoreWithQuota(shadows.dir, 0, 1<<20)
 			if err != nil {
 				t.Fatal(err)

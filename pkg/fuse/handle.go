@@ -46,6 +46,7 @@ type FileHandle struct {
 	Prefetch          *Prefetcher     // nil for writable handles; sequential read prefetcher
 	ReadTarget        *client.ReadTarget
 	readTargetGen     uint64
+	releasing         bool        // final Release owns the dirty buffer; guarded by mu
 	WritePolicy       WritePolicy // per-handle remote durability policy chosen at open/create
 	GitWorkspaceID    string      // set for handles served by the git workspace layer
 	GitRelPath        string
