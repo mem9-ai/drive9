@@ -123,8 +123,8 @@ func TestFtruncateReleasedReadDoesNotHideLaterLiveWrite(t *testing.T) {
 	if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: c.Fh}, []byte("H")); st != gofuse.OK {
 		t.Fatal(st)
 	}
-	if got, st, _ := readDat9FSTestRange(fs, ino, b, 0, 5); st != gofuse.EAGAIN {
-		t.Fatalf("hid newer live write with %q/%v", got, st)
+	if got, st, err := readDat9FSTestRange(fs, ino, b, 0, 5); err != nil || st != gofuse.OK || string(got) != "Hello" {
+		t.Fatalf("hid proven live successor with %q/%v/%v", got, st, err)
 	}
 	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: c.Fh}); st != gofuse.OK {
 		t.Fatal(st)

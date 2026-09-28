@@ -12806,6 +12806,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			if fs.ftruncateParticipates(fh) {
 				ensureStagedSnapshotLineageLocked(fh)
 				publishStagedSnapshotLineageLocked(fh)
+				fh.Dirty.visibleTruncate = true
 			}
 			fs.inodes.UpdateSize(fh.Ino, 0)
 			// Truncation updates mtime and ctime (POSIX). The SetAttr
@@ -12866,7 +12867,6 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.Prefetch.SetParallelRead(fs.parallelReadConcurrency(), fs.parallelReadBlockSize())
 			fh.Prefetch.SetPerfCounters(fs.perf)
 		}
-		fs.openReadOnlyShadowLocked(fh)
 	}
 
 	if entry == nil {
@@ -12879,7 +12879,18 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	if testHookBeforeSurvivorOpenRegister != nil {
 		testHookBeforeSurvivorOpenRegister(fh)
 	}
+	// Register readers before acquiring a pin, with Prefetch initialized.
+	// Survivor validation acquires fh.mu itself and stays outside this window.
+	readonly := fh.Dirty == nil
+	if readonly {
+		fh.Lock()
+	}
 	out.Fh = fs.allocateFileHandle(fh)
+	if readonly {
+		failpoint.InjectCall("ftruncateReaderRegistered", fs, fh)
+		fs.openReadOnlyShadowLocked(fh)
+		fh.Unlock()
+	}
 	if testHookAfterSurvivorOpenRegister != nil {
 		testHookAfterSurvivorOpenRegister(fh)
 	}
