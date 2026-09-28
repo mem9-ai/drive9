@@ -135,6 +135,17 @@ fi
 - With a custom payload the case's oracles must stay content-agnostic (derived from the copied input, or compared against `control`); fixed-content assertions that only hold for the default generation MUST be guarded by the existence of the referenced entries.
 - A case that declares `PAYLOAD_DIR` support MUST fail loudly when the directory is empty (a scenario that cannot produce evidence must never degrade silently, §4.3).
 
+**Bystander payload (`--seed`, engine-level, works with ANY case)** — the complement to `PAYLOAD_DIR` for cases that do not (or cannot) consume an external tree as their input:
+
+```text
+drive9-simulator run <case.test> --seed <dir>
+```
+
+- Before the script starts, the engine copies the tree onto the mount at the reserved path `__payload__/` (the copy itself travels through the mount under test) and drains, so the baseline lives on the server before any workload or fault runs. The control replay receives the identical tree, so every `manifest-equals` against `control` stays balanced.
+- After the script ends, the engine samples the terminal state from a **remote vantage** and compares `__payload__/` against the source (path / kind / size / sha256; mode is not compared). Divergence is fail-grade evidence; the check is journal-recorded as `seed-integrity` and appears in `run.json` (`seed_dir`).
+- Semantics: **non-interference + survival** — a real project tree (e.g. exported from a simulator workbench run) rides through the case's workload and faults untouched, which is the "the real project survives the scenario" reading of acceptance. `--seed` and `--payload-dir` MAY be combined.
+- `__payload__/` is a reserved mount path; scripts MUST NOT write into it.
+
 ### 4.3 Injected-command rules
 
 - The prefix `drive9-test-` is **reserved**: the script MUST NOT define, alias or shadow any `drive9-test-*` name (functions, aliases, PATH substitution are all forbidden); calling a `drive9-test-*` name outside the registry is an error.

@@ -23,6 +23,11 @@ use crate::utils::{
 
 // ---------------------------------------------------------------- registry
 
+/// Reserved mount path for the bystander payload (`--seed`, case-spec §4.2):
+/// pre-seeded before the script starts, present identically in the control
+/// replay, and integrity-checked at run end from a remote vantage.
+pub const SEED_DIR: &str = "__payload__";
+
 pub const COMMANDS: &[&str] = &[
     "fault", "arm", "disarm", "window", "async", "wait", "kill", "remount", "hold", "sample",
     "drain", "check",
@@ -70,6 +75,12 @@ pub struct RunArgs {
     /// script variable (see case-spec §4.2). None = the case's default
     /// synthetic payload generation runs.
     pub payload_dir: Option<PathBuf>,
+    /// Bystander payload: pre-seeded onto the mount at __payload__/ (and into
+    /// the control replay) BEFORE the case script starts, then integrity-
+    /// checked against the source at run end from a remote vantage. Lets ANY
+    /// case run with a real workbench project tree in the blast radius without
+    /// case changes (non-interference + survival semantics, case-spec §4.2).
+    pub seed_dir: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------- outcomes
@@ -185,6 +196,25 @@ pub fn run(a: RunArgs) -> Result<i32> {
         None => None,
     };
     a.payload_dir = payload_dir;
+    let seed_dir = match &a.seed_dir {
+        Some(p) => {
+            let abs = if p.is_absolute() {
+                p.clone()
+            } else {
+                std::env::current_dir()?.join(p)
+            };
+            let meta = std::fs::metadata(&abs)
+                .with_context(|| format!("--seed {}: not accessible", abs.display()))?;
+            anyhow::ensure!(meta.is_dir(), "--seed {} is not a directory", abs.display());
+            let n = std::fs::read_dir(&abs)
+                .with_context(|| format!("--seed {}: not readable", abs.display()))?
+                .count();
+            anyhow::ensure!(n > 0, "--seed {} is empty", abs.display());
+            Some(abs)
+        }
+        None => None,
+    };
+    a.seed_dir = seed_dir;
 
     let home = a.home.clone().unwrap_or_else(|| {
         let ts = std::time::SystemTime::now()
@@ -339,6 +369,7 @@ fn run_once(
         "server": a.server, "sandbox": a.sandbox,
         "durability": runner.durability, "tenant": tenant.0,
         "payload_dir": a.payload_dir.as_ref().map(|p| p.display().to_string()),
+        "seed_dir": a.seed_dir.as_ref().map(|p| p.display().to_string()),
     }));
 
     let runner = Arc::new(Mutex::new(runner));
@@ -396,6 +427,30 @@ fn run_once(
         let mut r = runner.lock().unwrap();
         let ok = r.mount(false);
         r.journal(json!({"ts": now_ms(), "kind":"mount", "ok": ok.is_ok_and(|v| v)}));
+        if let Some(seed) = &a.seed_dir {
+            // Bystander payload: copy the external tree onto the mount at a
+            // fixed reserved path, then drain so the baseline lives on the
+            // server before the case's workload/faults start. The copy itself
+            // travels through the FUSE mount under test.
+            // TODO(firecracker): route through the sandbox API when the FC
+            // mount is only reachable inside the microVM.
+            let dst = ws.join(SEED_DIR);
+            let seeded = std::fs::create_dir_all(&dst).is_ok()
+                && Command::new("cp")
+                    .args(["-a", &format!("{}/.", seed.display()), &dst.to_string_lossy()])
+                    .status()
+                    .map(|st| st.success())
+                    .unwrap_or(false);
+            if !seeded {
+                r.journal(json!({"ts": now_ms(), "kind":"seed", "ok": false}));
+                return (Outcome::Blocked, run_dir.to_path_buf());
+            }
+            let _ = Command::new(&a.bin)
+                .args(["mount", "drain", "--timeout", "120s", "--json", &ws.to_string_lossy()])
+                .output();
+            r.journal(json!({"ts": now_ms(), "kind":"seed", "ok": true, "dir": seed.display().to_string(),
+                             "files": walk(seed.clone()).map(|v| v.iter().filter(|e| e.kind=="file").count()).unwrap_or(0)}));
+        }
     }
 
     // spawn script with cwd on the mount
@@ -493,9 +548,69 @@ fn run_once(
         }
     }
 
+    // Bystander-payload final integrity check: read the server-side terminal
+    // state from an independent remote vantage and compare against the source
+    // tree (path/kind/size/sha256; mode is not compared — the mount may
+    // legitimately normalize it). Divergence is fail-grade evidence.
+    if let Some(seed) = &a.seed_dir {
+        let sampled = {
+            let mut r = runner.lock().unwrap();
+            r.sample("seed-final", "remote").is_ok()
+        };
+        let mut r = runner.lock().unwrap();
+        if !sampled {
+            evidence_failed
+                .lock()
+                .unwrap()
+                .push("seed final sample failed (remote vantage unavailable)".into());
+        } else if let Some(got) = r.snapshots.get("seed-final") {
+            let want = walk(seed.clone()).unwrap_or_default();
+            let prefix = format!("{SEED_DIR}/");
+            let strip = |e: &Entry| {
+                let mut e = e.clone();
+                e.path = e.path.strip_prefix(&prefix).unwrap_or(&e.path).to_string();
+                e
+            };
+            let mut got_f: Vec<Entry> = got
+                .iter()
+                .filter(|e| e.path.starts_with(&prefix) && e.path != SEED_DIR && e.path != format!("{SEED_DIR}/"))
+                .map(strip)
+                .collect();
+            let mut want_f: Vec<Entry> = want
+                .iter()
+                .filter(|e| !e.path.is_empty())
+                .map(|e| {
+                    let mut e = e.clone();
+                    e.mode = String::new();
+                    e
+                })
+                .collect();
+            for e in got_f.iter_mut() {
+                e.mode = String::new();
+            }
+            got_f.sort_by(|x, y| x.path.cmp(&y.path));
+            want_f.sort_by(|x, y| x.path.cmp(&y.path));
+            let files = want_f.iter().filter(|e| e.kind == "file").count();
+            match manifest_equal(&got_f, &want_f) {
+                None => r.journal(json!({"ts": now_ms(), "kind":"seed-integrity", "ok": true, "files": files})),
+                Some(d) => {
+                    let msg = format!("seed payload diverged from source ({d})");
+                    r.journal(json!({"ts": now_ms(), "kind":"seed-integrity", "ok": false, "detail": msg}));
+                    evidence_failed.lock().unwrap().push(msg);
+                }
+            }
+        }
+    }
+
     // control run if any check references it
     if control_wanted.load(Ordering::Relaxed) {
-        let cres = run_control(script, run_dir, &bindir, a.payload_dir.as_deref());
+        let cres = run_control(
+            script,
+            run_dir,
+            &bindir,
+            a.payload_dir.as_deref(),
+            a.seed_dir.as_deref(),
+        );
         match cres {
             Ok(entries_c) => {
                 let mut r = runner.lock().unwrap();
@@ -582,6 +697,7 @@ fn run_once(
             "durability": a.durability, "overlay": a.overlay,
             "write_cache_size_mb": a.write_cache_size_mb,
             "payload_dir": a.payload_dir.as_ref().map(|p| p.display().to_string()),
+            "seed_dir": a.seed_dir.as_ref().map(|p| p.display().to_string()),
             "terminal": terminal, "verdict": worst.tag(), "reasons": reasons,
         }))
         .unwrap_or_default(),
@@ -1729,10 +1845,23 @@ fn run_control(
     run_dir: &Path,
     real_bindir: &Path,
     payload_dir: Option<&Path>,
+    seed_dir: Option<&Path>,
 ) -> Result<Vec<Entry>> {
     let cws = run_dir.join("control");
     let _ = std::fs::remove_dir_all(&cws);
     std::fs::create_dir_all(&cws)?;
+    // The bystander payload must be present in the control replay too, so
+    // every manifest-equals against `control` stays balanced (both sides carry
+    // the same __payload__ tree).
+    if let Some(seed) = seed_dir {
+        let dst = cws.join(SEED_DIR);
+        std::fs::create_dir_all(&dst)?;
+        let st = Command::new("cp")
+            .args(["-a", &format!("{}/.", seed.display()), &dst.to_string_lossy()])
+            .status()
+            .context("seeding payload into the control replay")?;
+        anyhow::ensure!(st.success(), "seeding control replay failed");
+    }
     // stub bindir: same binaries, D9_STUB=1 flips behavior
     let stub_bin = run_dir.join("bin"); // same bin dir; stub flag via env
     let _ = real_bindir;

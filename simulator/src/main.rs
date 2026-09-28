@@ -65,6 +65,14 @@ enum Commands {
         /// their default synthetic payload (see case-spec §4.2)
         #[arg(long)]
         payload_dir: Option<PathBuf>,
+        /// Bystander payload: pre-seeded onto the mount at __payload__/ (and
+        /// into the control replay) before the case starts, and integrity-
+        /// checked against the source at run end from a remote vantage. Works
+        /// with ANY case without case changes — the real project tree simply
+        /// rides through the case's workload and faults (non-interference +
+        /// survival; case-spec §4.2)
+        #[arg(long)]
+        seed: Option<PathBuf>,
     },
     /// statically validate .test case files (lint)
     Validate {
@@ -110,6 +118,7 @@ fn main() -> Result<()> {
             tidbcloud_public_key,
             tidbcloud_private_key,
             payload_dir,
+            seed,
         } => run::run(RunArgs {
             case,
             sandbox,
@@ -125,6 +134,7 @@ fn main() -> Result<()> {
             tidbcloud_public_key,
             tidbcloud_private_key,
             payload_dir,
+            seed_dir: seed,
         })?,
         Commands::Validate { files, trace } => run::validate(files, trace)?,
         Commands::Workbench(a) => workbench::run(a)?,
