@@ -66,6 +66,8 @@ var (
 	errMountProcessStateUnsafe = errors.New("drive9 umount: unsafe mount process state")
 )
 
+const defaultCodingAgentWriteBackBatchWindow = 20 * time.Millisecond
+
 type mountBackgroundRequest struct {
 	Args       []string
 	MountPoint string
@@ -228,7 +230,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	writeCacheFreeRatio := fs.Float64("write-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before write-back refuses writes with ENOSPC (0 disables)")
 	writeCacheSizeMB := fs.Int64("write-cache-size-mb", 1024, "current-process shadow data quota in MiB (default 1024; 0 disables); writes exceeding this return ENOSPC")
 	commitQueueMaxPending := fs.Int("commit-queue-max-pending", 500, "maximum pending entries in CommitQueue before backpressure")
-	writeBackBatchWindow := fs.Duration("writeback-batch-window", 0, "writeback-only small-file batch window (default 0 disables)")
+	writeBackBatchWindow := fs.Duration("writeback-batch-window", 0, "writeback-only small-file batch window (coding-agent default 20ms; 0 disables)")
 	writeBackBatchMaxFiles := fs.Int("writeback-batch-max-files", 64, "maximum files in one writeback batch when enabled")
 	writeBackBatchMaxBytes := fs.Int64("writeback-batch-max-bytes", client.MaxBatchWriteBytes, "maximum bytes in one writeback batch when enabled")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
@@ -422,6 +424,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	lookupRetryCountGiven := flagProvided(fs, "lookup-retry-count")
 	lookupRetryTimeoutGiven := flagProvided(fs, "lookup-retry-timeout")
 	readCacheTTLGiven := flagProvided(fs, "read-cache-ttl")
+	writeBackBatchWindowGiven := flagProvided(fs, "writeback-batch-window")
 	trustProcessLocalEventsGiven := flagProvided(fs, "trust-process-local-events")
 	perfDirGiven := flagProvided(fs, "perf-dir")
 	perfIntervalGiven := flagProvided(fs, "perf-interval")
@@ -556,6 +559,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
+	*writeBackBatchWindow = profileWriteBackBatchWindow(profileCfg, writePolicyVal, *writeBackBatchWindow, writeBackBatchWindowGiven)
 	wbLazyStaging, wbSyncWindowDur, err := parseWritebackSyncWindow(*wbSyncWindow)
 	if err != nil {
 		return err
@@ -1820,6 +1824,19 @@ func durationFlagValue(fs *flag.FlagSet, name string, value time.Duration) time.
 		return value
 	}
 	return 0
+}
+
+func profileWriteBackBatchWindow(profile profileConfig, writePolicy fuseWritePolicy, configured time.Duration, explicit bool) time.Duration {
+	if explicit {
+		return configured
+	}
+	if writePolicy != fuseWritePolicyWriteBack {
+		return 0
+	}
+	if profile.Builtin && profile.Name == defaultMountProfile {
+		return defaultCodingAgentWriteBackBatchWindow
+	}
+	return configured
 }
 
 func mountBoolFromEnv(name string) (bool, error) {

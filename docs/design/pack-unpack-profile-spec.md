@@ -71,6 +71,14 @@ The built-in profiles are:
 `coding-agent` is optimized for interactive local performance. `portable` is
 optimized for moving that local overlay state across machines.
 
+On write-back mounts, the built-in `coding-agent` profile also enables a 20ms
+small-file batch window. Eligible asynchronous commits are combined through the
+existing bounded batch-write path while keeping per-file revision checks and
+results. Strict close/write policies, layer writes, large files, spill-backed
+payloads, and explicit fsync commits retain their existing paths. Pass
+`--writeback-batch-window=0` to disable batching. A custom profile file named
+`coding-agent` does not inherit this built-in performance default.
+
 ### Append-log defaults
 
 The built-in `coding-agent` profile includes:
