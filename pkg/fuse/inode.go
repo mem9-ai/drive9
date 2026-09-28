@@ -1088,3 +1088,12 @@ func copyInodeEntryLocked(entry *InodeEntry) *InodeEntry {
 	}
 	return &cp
 }
+
+// advanceRevision publishes out-of-order data commit callbacks monotonically.
+func (m *InodeToPath) advanceRevision(ino uint64, revision int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e := m.byInode[ino]; e != nil && e.Revision < revision {
+		e.Revision = revision
+	}
+}

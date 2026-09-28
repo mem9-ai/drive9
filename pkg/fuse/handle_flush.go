@@ -326,6 +326,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			if err == nil && (gvisorCompat || fs.openHandles.HasVisibleTruncate(handleIno) || fs.hasFtruncateInheritance(handleIno)) {
 				mutationRevision = fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
 				fs.recordCommittedMutation(handleIno, mutationSeq, mutationRevision, size)
+				fs.captureFtruncateIdentity(ctx, handleIno, handlePath, mutationRevision)
 				if gvisorCompat && mutationRevision > 0 {
 					fs.refreshCommittedRevisionForOpenHandlesWithSize(handlePath, mutationRevision, fh, size)
 				}

@@ -412,6 +412,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 						fh.Lock()
 						mutationRevision := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
 						fs.recordCommittedMutation(fh.Ino, mutationSeq, mutationRevision, size)
+						fs.captureFtruncateIdentity(ctx, fh.Ino, fh.Path, mutationRevision)
 						if mutationRevision > 0 {
 							fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, mutationRevision, fh, size)
 						}

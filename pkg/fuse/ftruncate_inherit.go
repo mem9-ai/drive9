@@ -232,8 +232,7 @@ func (fs *Dat9FS) installFtruncateImageLocked(fh *FileHandle, data []byte, revis
 	buffer.ClearDirty()
 	fh.Dirty, fh.DirtySeq, fh.WriteBackSeq = buffer, 0, 0
 	fh.BaseRev, fh.OrigSize, fh.ZeroBase = revision, int64(len(data)), len(data) == 0
-	fh.ShadowReady, fh.ShadowSpill, fh.ShadowCommitReady = false, false, false
-	fh.ShadowCommitSeq = 0
+	clearHandleShadowClaimLocked(fh)
 	fh.WriteBackGen, fh.PendingIndexGen, fh.ShadowStageGen = 0, 0, 0
 	clearStagedSnapshotLineageLocked(fh)
 	fh.ContentSnapshotID, fh.contentAncestors, fh.LineageTrusted = id, ancestors, true
@@ -244,6 +243,11 @@ func (fs *Dat9FS) installFtruncateImageLocked(fh *FileHandle, data []byte, revis
 }
 
 func (fs *Dat9FS) prepareFtruncateMutationLocked(ctx context.Context, fh *FileHandle) error {
+	if fh != nil {
+		if err := fs.recoverFtruncateViewLocked(ctx, fh); err != nil {
+			return err
+		}
+	}
 	if fh != nil && !fh.Unlinked {
 		for _, alias := range fs.ftruncateAliasPaths(fh.Ino) {
 			if alias != fh.Path && fs.commitQueue != nil && fs.commitQueue.HasPath(alias) {
@@ -435,37 +439,45 @@ func (fs *Dat9FS) prepareFtruncateCommitLocked(ctx context.Context, fh *FileHand
 }
 
 func (fs *Dat9FS) lockFtruncateWritableOpen(ino uint64, path string) (func(), bool, error) {
-	if fs.layerEnabled() || isSQLiteDirectIOPath(path) || fs.openHandles.ftruncateInheritance(ino, path) == nil {
+	if fs.layerEnabled() || isSQLiteDirectIOPath(path) {
+		return fs.lockWritableRemoteCommitPathForWritableOpen(path), false, nil
+	}
+	queued := func() bool {
+		return fs.commitQueue != nil && fs.commitQueue.hasFtruncateInode(ino, fs.ftruncateAliasPaths(ino))
+	}
+	if len(fs.ftruncateAliasPaths(ino)) <= 1 && !queued() && fs.openHandles.ftruncateInheritance(ino, path) == nil {
 		return fs.lockWritableRemoteCommitPathForWritableOpen(path), false, nil
 	}
 	deadline := time.Now().Add(fs.opts.RemoteCommitWaitTimeout)
 	for {
-		remaining := time.Until(deadline)
-		if fs.opts.RemoteCommitWaitTimeout > 0 && remaining <= 0 {
+		if fs.opts.RemoteCommitWaitTimeout > 0 && time.Now().After(deadline) {
 			return nil, true, syscall.EAGAIN
 		}
-		if fs.commitQueue != nil && fs.commitQueue.HasPath(path) {
-			interval := 50 * time.Millisecond
-			if fs.opts.RemoteCommitWaitTimeout > 0 {
-				interval = min(interval, remaining)
+		// Never wait for a worker while holding any path fence it needs.
+		if queued() {
+			for _, p := range fs.ftruncateAliasPaths(ino) {
+				fs.commitQueue.WaitPathTimeout(p, samePathDirtyWaitInterval)
 			}
-			fs.commitQueue.WaitPathTimeout(path, interval)
 			continue
 		}
-		var unlock func()
-		if fs.opts.RemoteCommitWaitTimeout <= 0 {
-			unlock = fs.lockRemoteCommitPath(path)
-		} else {
-			var ok bool
-			unlock, ok = fs.lockRemoteCommitPathTimeout(path, remaining)
-			if !ok {
-				return nil, true, syscall.EAGAIN
+		unlock, ok := fs.tryLockFtruncateAliases(&FileHandle{Ino: ino, Path: path})
+		if !ok {
+			time.Sleep(samePathDirtyWaitInterval)
+			continue
+		}
+		if queued() {
+			unlock()
+			continue
+		}
+		for _, p := range fs.ftruncateAliasPaths(ino) {
+			if fs.pendingIndex != nil {
+				if meta, ok := fs.pendingIndex.GetMeta(p); ok && meta.Inode == ino && meta.Kind == PendingConflict {
+					unlock()
+					return nil, true, syscall.EAGAIN
+				}
 			}
 		}
-		if fs.commitQueue == nil || !fs.commitQueue.HasPath(path) {
-			return unlock, true, nil
-		}
-		unlock()
+		return unlock, true, nil
 	}
 }
 

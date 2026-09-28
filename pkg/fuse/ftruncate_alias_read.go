@@ -54,7 +54,13 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 		return nil, true, syscall.EINVAL
 	}
 	event := fh.pendingFtruncate.Load()
-	if event.view != fs.mountViewGeneration.Load() || !fs.ftruncateAliasLinked(fh) {
+	if event.view != fs.mountViewGeneration.Load() {
+		if err := fs.recoverFtruncateViewLocked(ctx, fh); err != nil {
+			return nil, true, err
+		}
+		return nil, false, nil
+	}
+	if !fs.ftruncateAliasLinked(fh) {
 		return nil, true, syscall.EAGAIN
 	}
 	unlock, ok := fs.tryLockFtruncateAliases(fh)
@@ -107,6 +113,7 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 		chosenSeq, chosenID, data, origin = event.seq, event.id, append([]byte(nil), event.data...), "event"
 		chosenAncestors = event.ancestors
 	}
+	var rangeCandidate *aliasLiveProof
 	var live []aliasLiveProof
 	for _, other := range fs.openHandles.SnapshotInode(fh.Ino) {
 		if other == fh || other.Flags&syscall.O_ACCMODE == syscall.O_RDONLY {
@@ -120,7 +127,7 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 				other.Unlock()
 				continue // A known ancestor is not an independent dirty branch.
 			}
-			if !fs.ftruncateAliasLinked(other) || !ftruncateDescends(other, event.id) || !other.Dirty.CanMaterializeFull() || other.Dirty.Size() > maxLandedPayloadBytes {
+			if !fs.ftruncateAliasLinked(other) || !ftruncateDescends(other, event.id) {
 				other.Unlock()
 				return nil, true, syscall.EAGAIN
 			}
@@ -143,7 +150,13 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 					return nil, true, syscall.EAGAIN
 				}
 				chosenAncestors = append([]string(nil), ancestors...)
-				chosenSeq, chosenID, data, origin = other.DirtySeq, id, other.Dirty.Bytes(), "live"
+				chosenSeq, chosenID, origin = other.DirtySeq, id, "live"
+				if other.Dirty.Size() > maxLandedPayloadBytes || !other.Dirty.CanMaterializeFull() {
+					ref := live[len(live)-1]
+					rangeCandidate, data = &ref, nil
+				} else {
+					rangeCandidate, data = nil, other.Dirty.Bytes()
+				}
 			}
 		}
 		other.Unlock()
@@ -191,6 +204,32 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 			chosenSeq, chosenID, data, origin = meta.MutationSeq, meta.SnapshotID, next, "staged"
 		}
 	}
+	var rangeSource *FileHandle
+	var loaded []int
+	var rangeBase int64
+	var rangeShadow uint64
+	rangeValid := false
+	if origin == "live" && rangeCandidate != nil {
+		rangeSource = rangeCandidate.fh
+		if !rangeSource.TryLock() {
+			return nil, true, errFtruncateBusy
+		}
+		defer rangeSource.Unlock()
+		defer func() {
+			if !rangeValid {
+				discardFtruncateLoadedParts(rangeSource.Dirty, loaded)
+			}
+		}()
+		if rangeSource.DirtySeq != chosenSeq || ftruncateSnapshotID(rangeSource) != chosenID || rangeSource.Path != rangeCandidate.path || !fs.ftruncateAliasLinked(rangeSource) {
+			return nil, true, syscall.EAGAIN
+		}
+		rangeBase, rangeShadow = rangeSource.BaseRev, rangeSource.ShadowStageGen
+		var err error
+		data, loaded, err = fs.readFtruncateLiveRangeLocked(ctx, rangeSource, offset, size)
+		if err != nil {
+			return nil, true, err
+		}
+	}
 	warmID := ""
 	if proof.rev == committed.committedRevision {
 		warmID = proof.snapshotID
@@ -218,7 +257,7 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 			}
 		}
 	}
-	ranged := false
+	ranged := rangeSource != nil
 	readCommitted := readonly || len(entry.Paths) == 1
 	if origin == "committed" && readCommitted {
 		var err error
@@ -258,11 +297,13 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 		for _, h := range fs.openHandles.SnapshotInode(fh.Ino) {
 			found = found || h == ref.fh
 		}
-		if !found || !ref.fh.TryLock() {
+		if !found || (ref.fh != rangeSource && !ref.fh.TryLock()) {
 			return nil, true, syscall.EAGAIN
 		}
 		valid := ref.fh.Path == ref.path && ref.fh.DirtySeq == ref.seq && ftruncateSnapshotID(ref.fh) == ref.id && fs.ftruncateAliasLinked(ref.fh)
-		ref.fh.Unlock()
+		if ref.fh != rangeSource {
+			ref.fh.Unlock()
+		}
 		if !valid {
 			return nil, true, syscall.EAGAIN
 		}
@@ -316,6 +357,13 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 		if !ok || ino != fh.Ino {
 			return nil, true, syscall.EAGAIN
 		}
+	}
+	if rangeSource != nil {
+		if rangeSource.BaseRev != rangeBase || rangeSource.ShadowStageGen != rangeShadow ||
+			(rangeShadow != 0 && (fs.shadowStore == nil || fs.shadowStore.ActiveGeneration(rangeSource.Path) != rangeShadow)) {
+			return nil, true, syscall.EAGAIN
+		}
+		rangeValid = true
 	}
 	if origin == "committed" && !warm && !readCommitted && fh.WriteBackGen == 0 && fh.PendingIndexGen == 0 && fh.ShadowStageGen == 0 && fs.handleCanAdoptCommittedRevisionLocked(fh) {
 		fs.installFtruncateImageLocked(fh, data, committed.committedRevision, chosenID, chosenAncestors)
@@ -401,4 +449,37 @@ func (fs *Dat9FS) readFtruncateObserverCommitted(ctx context.Context, fh *FileHa
 		return nil, ranged, syscall.EAGAIN
 	}
 	return data, ranged, nil
+}
+
+// The caller retains src.mu through final selection validation. Loaded parts
+// remain provisional until that validation succeeds, including on remote errors.
+func (fs *Dat9FS) readFtruncateLiveRangeLocked(ctx context.Context, src *FileHandle, offset int64, size uint32) ([]byte, []int, error) {
+	var loaded []int
+	end := min(offset+int64(size), src.Dirty.Size())
+	shadow := fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) && src.ShadowStageGen != 0
+	if end > offset && src.Dirty.LoadPart != nil && !shadow {
+		ps := src.Dirty.PartSize()
+		for part := int(offset / ps); part <= int((end-1)/ps); part++ {
+			if int64(part)*ps < src.Dirty.remoteSize && !src.Dirty.IsPartLoaded(part) {
+				if src.Dirty.dirtyParts[part] {
+					return nil, loaded, syscall.EAGAIN
+				}
+				loaded = append(loaded, part)
+			}
+		}
+	}
+	data, _, handled, status, retry := fs.readPendingFtruncateHandleLocked(src, offset, size, true)
+	if status != 0 {
+		return nil, loaded, syscall.Errno(status)
+	}
+	if !handled || retry {
+		return nil, loaded, syscall.EAGAIN
+	}
+	if len(loaded) != 0 {
+		stat, err := fs.client.StatCtx(ctx, fs.remotePath(src.Path))
+		if err != nil || stat == nil || src.BaseRev <= 0 || stat.Revision != src.BaseRev {
+			return nil, loaded, syscall.EAGAIN
+		}
+	}
+	return data, loaded, nil
 }

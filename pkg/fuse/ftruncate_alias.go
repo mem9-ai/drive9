@@ -16,13 +16,16 @@ func (fs *Dat9FS) ftruncateAliasLinked(fh *FileHandle) bool {
 	return linked && exists && ino == fh.Ino
 }
 
+// Observations retain commit bookkeeping across a reset; their old view never
+// grants read or write authority. A late successful upload must remain visible
+// to lazy clean-handle recovery.
 func (fs *Dat9FS) hasFtruncateInheritance(ino uint64) bool {
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok || entry.Unlinked {
 		return false
 	}
 	for _, fh := range fs.openHandles.SnapshotInode(ino) {
-		if e := fh.pendingFtruncate.Load(); e != nil && e.ino == ino && e.view == fs.mountViewGeneration.Load() {
+		if e := fh.pendingFtruncate.Load(); e != nil && e.ino == ino {
 			if _, linked := entry.Paths[e.path]; linked {
 				return true
 			}
