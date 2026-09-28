@@ -3206,6 +3206,18 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 			refreshedRevision = stat.Revision
 			entry.Revision = stat.Revision
 			fs.inodes.UpdateRevision(ino, stat.Revision)
+			if fs.hasFtruncateInheritance(ino) && stat.Size == newSize && entry.ResourceID != "" && stat.ResourceID == entry.ResourceID {
+				// This is a real remote pathname mutation, not a dirty passive
+				// handle. Publish before retiring the old observer-gated ledger.
+				fs.dirtyMu.Lock()
+				fs.dirtySeq++
+				seq := fs.dirtySeq
+				fs.dirtyMu.Unlock()
+				fs.recordCommittedMutation(ino, seq, stat.Revision, newSize)
+				for path := range entry.Paths {
+					fs.recordCommittedRevisionWithSize(path, stat.Revision, newSize)
+				}
+			}
 			fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, pid, newSize)
 		}
 		if !stat.Mtime.IsZero() {
@@ -3591,10 +3603,17 @@ func (fs *Dat9FS) bindCommitEntryToHandleLocked(entry *CommitEntry, fh *FileHand
 	entry.PayloadBaseRevSet = true
 	if fs.ftruncateParticipates(fh) {
 		entry.DisableAutoResolveLWW = true
-		if paths := fs.ftruncateAliasPaths(fh.Ino); len(paths) > 1 {
-			ino, view := fh.Ino, fs.mountViewGeneration.Load()
-			entry.ftruncatePaths = paths
-			entry.ftruncateValid = func() bool { return fs.ftruncateAliasesValid(ino, paths, view) }
+		paths := fs.ftruncateAliasPaths(fh.Ino)
+		entry.ftruncatePaths = paths
+		if len(paths) > 1 {
+			ino, path, view := fh.Ino, entry.Path, fs.mountViewGeneration.Load()
+			identity, _ := fs.inodes.GetEntry(ino)
+			entry.ftruncateValid = func() bool {
+				current, ok := fs.inodes.GetEntry(ino)
+				linked, exists := fs.inodes.GetInode(path)
+				return identity != nil && ok && exists && linked == ino && !current.Unlinked && view == fs.mountViewGeneration.Load() &&
+					(identity.ResourceID == "" || current.ResourceID == identity.ResourceID)
+			}
 		}
 	}
 	entry.SnapshotID = fh.StagedSnapshotID
@@ -9490,6 +9509,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					fh.Dirty.visibleTruncate = true
 					fs.openHandles.MarkVisibleTruncate(fh, fh.DirtySeq)
 					fs.publishFtruncateInheritanceLocked(fh)
+					fs.captureFtruncateIdentity(ctx, fh.Ino, fh.Path, fh.BaseRev)
 					// Keep ordering through inode attribute publication, but detach
 					// the token so a concurrent call on this fd cannot borrow it.
 					unlockTruncate := fs.takeHandleRemoteCommitPathLocked(fh)
@@ -13819,6 +13839,9 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	defer func() { unlockRemoteCommit() }()
 	var deadline time.Time
 	for {
+		if fs.commitQueue != nil && fs.commitQueue.hasFtruncateInode(fh.Ino, fs.ftruncateAliasPaths(fh.Ino)) {
+			return 0, gofuse.EAGAIN
+		}
 		if !fs.ftruncateParticipates(fh) {
 			unlockRemoteCommit = fs.lockHandleRemoteCommitPathLocked(fh)
 		}
@@ -13835,6 +13858,9 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		}
 		if deadline.IsZero() {
 			deadline = time.Now().Add(fs.opts.RemoteCommitWaitTimeout)
+		}
+		if fs.commitQueue != nil && fs.commitQueue.hasFtruncateInode(fh.Ino, fs.ftruncateAliasPaths(fh.Ino)) {
+			return 0, gofuse.EAGAIN
 		}
 		fs.discardSupersededMutationLocked(fh)
 		fs.adoptCommittedRevisionLocked(fh)
@@ -14363,6 +14389,7 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 		if err == nil {
 			committedMutationRev = fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
 			fs.recordCommittedMutation(handleIno, mutationSeq, committedMutationRev, size)
+			fs.captureFtruncateIdentity(ctx, handleIno, handlePath, committedMutationRev)
 			if committedMutationRev > 0 {
 				fs.refreshCommittedRevisionForOpenHandlesWithSize(handlePath, committedMutationRev, fh, size)
 			}
@@ -14483,6 +14510,7 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 	}
 	committedMutationRev := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
 	fs.recordCommittedMutation(fh.Ino, mutationSeq, committedMutationRev, 0)
+	fs.captureFtruncateIdentity(ctx, fh.Ino, fh.Path, committedMutationRev)
 	if committedMutationRev > 0 {
 		fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, committedMutationRev, fh, 0)
 	}
@@ -14651,6 +14679,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		}
 		mutationRevision := fs.resolveCommittedMutationRevision(filePath, committedRev, expectedRevision)
 		fs.recordCommittedMutation(ino, snapshotSeq, mutationRevision, int64(len(data)))
+		fs.captureFtruncateIdentity(ctx, ino, filePath, mutationRevision)
 		if mutationRevision > 0 {
 			fs.refreshCommittedRevisionForOpenHandlesWithSize(filePath, mutationRevision, handle, int64(len(data)))
 		}
@@ -14835,6 +14864,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 		revision := fs.resolveCommittedMutationRevision(mutationPath, fs.latestCommittedRevision(mutationPath), mutationExpectedRevision)
 		fs.recordCommittedMutation(mutationIno, mutationSeq, revision, mutationSize)
+		fs.captureFtruncateIdentity(ctx, mutationIno, mutationPath, revision)
 		if fs.gvisorCompatibilityEnabled() && revision > 0 {
 			fs.refreshCommittedRevisionForOpenHandlesWithSize(mutationPath, revision, fh, mutationSize)
 		}
@@ -15848,6 +15878,16 @@ func (fs *Dat9FS) captureHandleStagingGensLocked(fh *FileHandle) StagingGens {
 }
 
 func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) {
+	// A source may already be closed and a renamed alias may have no live
+	// inheritance marker. Its next clean write still needs the landed CAS base.
+	if fs != nil && entry != nil && committedRev > 0 && len(entry.ftruncatePaths) != 0 {
+		if ino, ok := fs.inodes.GetInode(entry.Path); ok && ino == entry.Inode {
+			for _, path := range fs.ftruncateAliasPaths(ino) {
+				fs.recordCommittedRevisionWithSize(path, committedRev, entry.Size)
+			}
+			fs.inodes.advanceRevision(ino, committedRev)
+		}
+	}
 	if fs == nil || entry == nil || (!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(entry.Inode) && !fs.hasFtruncateInheritance(entry.Inode)) {
 		return
 	}
@@ -15867,6 +15907,7 @@ func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) 
 	}
 	entry.mutationPublished = true
 	fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, committedRev, entry.Size)
+	fs.captureFtruncateIdentity(context.Background(), entry.Inode, entry.Path, committedRev)
 	if fs.gvisorCompatibilityEnabled() && committedRev > 0 {
 		fs.refreshCommittedRevisionForOpenHandlesWithSize(entry.Path, committedRev, nil, entry.Size)
 	}
@@ -15889,17 +15930,51 @@ func (fs *Dat9FS) snapshotStagingGens(remotePath string) StagingGens {
 // onWriteBackDataCommitted settles content staging before fallible chmod;
 // generation guards preserve any newer same-path write.
 func (fs *Dat9FS) onWriteBackDataCommitted(meta WriteBackMeta, committedRev int64, gens StagingGens) {
-	if fs != nil && meta.Inode != 0 && meta.MutationSeq != 0 {
-		fs.recordCommittedMutation(meta.Inode, meta.MutationSeq, committedRev, meta.Size)
-	}
-	if !meta.ownedStagingKnown {
+	if fs == nil {
 		return
 	}
-	if fs != nil && fs.pendingIndex != nil && gens.PendingIndexGen != 0 {
-		fs.pendingIndex.RemoveIfGeneration(meta.Path, gens.PendingIndexGen)
+	if meta.Inode != 0 && meta.MutationSeq != 0 {
+		fs.recordCommittedMutation(meta.Inode, meta.MutationSeq, committedRev, meta.Size)
+		fs.captureFtruncateIdentity(context.Background(), meta.Inode, meta.Path, committedRev)
 	}
-	if fs != nil && fs.shadowStore != nil && gens.ShadowGen != 0 {
-		fs.shadowStore.RemoveIfGeneration(meta.Path, gens.ShadowGen)
+	if meta.ownedStagingKnown {
+		if fs.pendingIndex != nil && gens.PendingIndexGen != 0 {
+			fs.pendingIndex.RemoveIfGeneration(meta.Path, gens.PendingIndexGen)
+		}
+		if fs.shadowStore != nil && gens.ShadowGen != 0 {
+			fs.shadowStore.RemoveIfGeneration(meta.Path, gens.ShadowGen)
+		}
+	}
+	if committedRev <= 0 {
+		return
+	}
+	ino, linked := fs.inodes.GetInode(meta.Path)
+	if meta.Inode != 0 && (!linked || ino != meta.Inode) {
+		return
+	}
+	fs.recordCommittedRevisionWithSize(meta.Path, committedRev, meta.Size)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok || entry.Revision > committedRev {
+		return
+	}
+	for path := range entry.Paths {
+		fs.recordCommittedRevisionWithSize(path, committedRev, meta.Size)
+	}
+	fs.inodes.advanceRevision(ino, committedRev)
+	// Do not settle dirty handles here or overwrite the inode's effective
+	// dirty size. Only clean buffers may adopt this exact committed image.
+	for _, fh := range fs.openHandles.SnapshotInode(ino) {
+		if !fh.TryLock() {
+			continue
+		}
+		if !fh.Unlinked && fh.BaseRev < committedRev && fs.handleCanAdoptCommittedRevisionLocked(fh) && (fh.Streamer == nil || !fh.Streamer.Started()) {
+			if fh.Streamer != nil {
+				fh.Streamer.Abort()
+				fh.Streamer = nil
+			}
+			fs.adoptCleanCommittedRevisionLocked(fh, committedRev, meta.Size)
+		}
+		fh.Unlock()
 	}
 }
 
