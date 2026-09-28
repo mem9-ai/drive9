@@ -44,16 +44,18 @@ func (fs *Dat9FS) readFtruncateAliasLocked(ctx context.Context, fh *FileHandle, 
 }
 
 func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHandle, offset int64, size uint32) ([]byte, bool, error) {
-	if !fs.ftruncateParticipates(fh) || fh.Dirty == nil || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+	readonly := fh.Flags&syscall.O_ACCMODE == syscall.O_RDONLY && fh.Dirty == nil
+	if (!readonly && (fh.Dirty == nil || !fs.ftruncateParticipates(fh))) || fh.pendingFtruncate.Load() == nil ||
+		fh.Unlinked || fh.UnlinkedSnapshot || fh.UnlinkedData != nil || fs.layerEnabled() || isSQLiteDirectIOPath(fh.Path) ||
+		fh.DirtySeq != 0 || (fh.Dirty != nil && fh.Dirty.HasDirtyParts()) {
 		return nil, false, nil
+	}
+	if offset < 0 || offset > int64(^uint64(0)>>1)-int64(size) {
+		return nil, true, syscall.EINVAL
 	}
 	event := fh.pendingFtruncate.Load()
 	if event.view != fs.mountViewGeneration.Load() || !fs.ftruncateAliasLinked(fh) {
 		return nil, true, syscall.EAGAIN
-	}
-	paths := fs.ftruncateAliasPaths(fh.Ino)
-	if len(paths) <= 1 {
-		return nil, false, nil
 	}
 	unlock, ok := fs.tryLockFtruncateAliases(fh)
 	if !ok {
@@ -63,7 +65,23 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
 	fs.dirtyMu.Lock()
 	committed := fs.mutationInodes[fh.Ino]
+	dirty := fs.dirtyInodes[fh.Ino]
 	fs.dirtyMu.Unlock()
+	// Preserve pathname truncate's explicit zero-size view. It resets all
+	// buffers and may have no inheritable lineage (e.g. a hardlink pathname).
+	if committed.committedSeq > 0 && entry.Size == 0 && dirty.seq > committed.committedSeq && dirty.size == 0 && fs.openHandles.HasVisibleTruncate(fh.Ino) {
+		data, _, handled, status := fs.readSupersededFtruncateRange(ctx, fh, fh.Path, 0, offset, size)
+		if handled && status == 0 {
+			failpoint.InjectCall("ftruncateAliasReadSelected", fs, fh, "zero")
+			fs.dirtyMu.Lock()
+			unchanged := fs.dirtyInodes[fh.Ino] == dirty && fs.mutationInodes[fh.Ino] == committed
+			fs.dirtyMu.Unlock()
+			if unchanged && fh.pendingFtruncate.Load() == event && event.view == fs.mountViewGeneration.Load() && fs.ftruncateAliasLinked(fh) {
+				return data, true, nil
+			}
+		}
+		return nil, true, syscall.EAGAIN
+	}
 	chosenSeq := committed.committedSeq
 	chosenID := ""
 	var data []byte
@@ -76,6 +94,14 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 	origin := "committed"
 	if event.seq > chosenSeq {
 		if !event.complete {
+			// Preserve the existing live-source range path for large truncates.
+			path := fh.Path
+			fh.Unlock()
+			data, _, handled, status := fs.readPendingFtruncateVisibleRange(ctx, fh, path, 0, false, offset, size)
+			fh.Lock()
+			if handled && status == 0 && fh.pendingFtruncate.Load() == event && fs.ftruncateAliasLinked(fh) && event.view == fs.mountViewGeneration.Load() {
+				return data, true, nil
+			}
 			return nil, true, syscall.EAGAIN
 		}
 		chosenSeq, chosenID, data, origin = event.seq, event.id, append([]byte(nil), event.data...), "event"
@@ -172,14 +198,36 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 	if warmID == "" && committed.committedSeq == event.seq && event.complete {
 		warmID = event.id
 	}
-	warm := origin == "committed" && warmID != "" &&
+	warm := !readonly && origin == "committed" && warmID != "" &&
 		fh.BaseRev == committed.committedRevision && fh.ContentSnapshotID == warmID && fh.LineageTrusted &&
 		fh.Dirty.Size() == committed.committedSize && fh.Dirty.CanMaterializeFull()
 	if warm {
 		data = fh.Dirty.bytesView()
 		chosenAncestors = proof.ancestors
 	}
-	if origin == "committed" && !warm {
+	// A chmod-only retry does not hide committed content, but a replacement
+	// writeback generation must be detected even if there is no pending index.
+	writeback := make(map[string]uint64)
+	if origin == "committed" && fs.writeBack != nil {
+		for path := range entry.Paths {
+			if meta, ok := fs.writeBack.GetMeta(path); ok {
+				if meta.Kind != PendingChmod {
+					return nil, true, syscall.EAGAIN
+				}
+				writeback[path] = meta.Generation
+			}
+		}
+	}
+	ranged := false
+	readCommitted := readonly || len(entry.Paths) == 1
+	if origin == "committed" && readCommitted {
+		var err error
+		data, ranged, err = fs.readFtruncateObserverCommitted(ctx, fh, committed, offset, size)
+		if err != nil {
+			return nil, true, err
+		}
+	}
+	if origin == "committed" && !warm && !readCommitted {
 		if committed.committedSeq == 0 || committed.committedRevision <= 0 || committed.committedSize > maxLandedPayloadBytes {
 			return nil, true, syscall.EAGAIN
 		}
@@ -240,6 +288,19 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 			return nil, true, syscall.EAGAIN
 		}
 	}
+	if origin == "committed" && fs.writeBack != nil {
+		for path := range entry.Paths {
+			if meta, ok := fs.writeBack.GetMeta(path); ok && (meta.Kind != PendingChmod || meta.Generation != writeback[path]) {
+				return nil, true, syscall.EAGAIN
+			}
+		}
+	}
+	if readCommitted {
+		if !fs.lockMountViewRead(event.view) {
+			return nil, true, syscall.EAGAIN
+		}
+		defer fs.mountViewMu.RUnlock()
+	}
 	fs.dirtyMu.Lock()
 	now := fs.mutationInodes[fh.Ino]
 	dirtySeq := fs.dirtyInodes[fh.Ino].seq
@@ -256,8 +317,32 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 			return nil, true, syscall.EAGAIN
 		}
 	}
-	if origin == "committed" && !warm && fh.WriteBackGen == 0 && fh.PendingIndexGen == 0 && fh.ShadowStageGen == 0 && fs.handleCanAdoptCommittedRevisionLocked(fh) {
+	if origin == "committed" && !warm && !readCommitted && fh.WriteBackGen == 0 && fh.PendingIndexGen == 0 && fh.ShadowStageGen == 0 && fs.handleCanAdoptCommittedRevisionLocked(fh) {
 		fs.installFtruncateImageLocked(fh, data, committed.committedRevision, chosenID, chosenAncestors)
+	}
+	if readonly {
+		if fh.ftruncateReadSeq != chosenSeq || fh.ftruncateReadRevision != committed.committedRevision {
+			if fh.ShadowPinned && fs.shadowStore != nil {
+				fs.shadowStore.Unpin(fh.ShadowGen)
+				fh.ShadowPinned, fh.ShadowGen = false, 0
+			}
+			clearReadTargetForLockedHandle(fh)
+			if fh.Prefetch != nil {
+				fh.Prefetch.Invalidate()
+			}
+			fh.ftruncateReadSeq, fh.ftruncateReadRevision = chosenSeq, committed.committedRevision
+		}
+		if origin == "committed" {
+			fh.BaseRev, fh.OrigSize = committed.committedRevision, committed.committedSize
+		}
+	}
+	if origin == "committed" && readCommitted && !ranged && fs.readCache != nil && committed.committedRevision > 0 {
+		if cached, ok := fs.readCache.Get(fh.Path, committed.committedRevision); !ok || len(cached) != len(data) {
+			fs.readCache.Put(fh.Path, data, committed.committedRevision)
+		}
+	}
+	if ranged {
+		return data, true, nil
 	}
 	if offset < 0 {
 		return nil, true, syscall.EINVAL
@@ -270,4 +355,50 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 		return nil, true, syscall.EINVAL
 	}
 	return append([]byte(nil), data[offset:end]...), true, nil
+}
+
+// Readers need a verified committed content view, not a writable ancestry
+// proof. Fence the request with revision checks and keep the existing full-file
+// cache for bounded images; large files use bounded range reads.
+func (fs *Dat9FS) readFtruncateObserverCommitted(ctx context.Context, fh *FileHandle, committed inodeMutationState, offset int64, size uint32) ([]byte, bool, error) {
+	if offset < 0 || offset > int64(^uint64(0)>>1)-int64(size) {
+		return nil, false, syscall.EINVAL
+	}
+	if committed.committedSeq == 0 {
+		return nil, false, syscall.EAGAIN
+	}
+	entry, linked := fs.inodes.GetEntry(fh.Ino)
+	if linked && entry.Revision == committed.committedRevision && entry.Size == committed.committedSize &&
+		committed.committedRevision > 0 && fs.readCache != nil && fs.statCacheVerified() && !fs.bypassStableRemoteReadCaches(fh.Path) {
+		if data, ok := fs.readCache.Get(fh.Path, committed.committedRevision); ok && int64(len(data)) == committed.committedSize {
+			failpoint.InjectCall("ftruncateCommittedCacheBeforeValidate", fs, fh.Ino, fh.Path)
+			current, exists := fs.inodes.GetEntry(fh.Ino)
+			if !exists || current.Revision != entry.Revision || current.Size != entry.Size || !fs.statCacheVerified() || fs.bypassStableRemoteReadCaches(fh.Path) {
+				return nil, false, syscall.EAGAIN
+			}
+			return data, false, nil
+		}
+	}
+	path := fs.remotePath(fh.Path)
+	before, err := fs.client.StatCtx(ctx, path)
+	if err != nil || before == nil || (committed.committedRevision > 0 && before.Revision != committed.committedRevision) || before.Size != committed.committedSize {
+		return nil, false, syscall.EAGAIN
+	}
+	ranged := committed.committedSize > maxLandedPayloadBytes
+	start, length := int64(0), committed.committedSize
+	if ranged {
+		start, length = offset, min(int64(size), max(int64(0), committed.committedSize-offset))
+	}
+	var data []byte
+	if length > 0 {
+		data, err = fs.client.ReadAtCtx(ctx, path, start, length)
+	}
+	if err != nil || int64(len(data)) != length {
+		return nil, ranged, syscall.EAGAIN
+	}
+	after, err := fs.client.StatCtx(ctx, path)
+	if err != nil || after == nil || after.Revision != before.Revision || after.Size != before.Size {
+		return nil, ranged, syscall.EAGAIN
+	}
+	return data, ranged, nil
 }

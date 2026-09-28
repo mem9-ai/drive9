@@ -32,10 +32,14 @@ func (fs *Dat9FS) publishFtruncateInheritanceLocked(fh *FileHandle) {
 	if fh.Unlinked || fh.UnlinkedSnapshot || fh.UnlinkedData != nil {
 		return
 	}
+	// Even when writer inheritance is unavailable, readers must stop using
+	// pre-truncate pins. An observation without an identity grants no lineage.
+	event := &ftruncateInheritance{ino: fh.Ino, path: fh.Path, view: fs.mountViewGeneration.Load(), seq: fh.DirtySeq, revision: fh.BaseRev}
+	defer func() { fs.openHandles.notifyFtruncateReaders(event) }()
 	// SetAttr holds the writable siblings here. Independently dirty branches
 	// predating this truncate remain outside the clean-sibling contract.
 	for _, other := range fs.openHandles.SnapshotInode(fh.Ino) {
-		if other != fh && other.Ino == fh.Ino && !other.Unlinked && fs.ftruncateAliasLinked(other) && other.Dirty != nil && other.DirtySeq != 0 && other.pendingFtruncate.Load() == nil {
+		if other != fh && other.Flags&syscall.O_ACCMODE != syscall.O_RDONLY && other.Ino == fh.Ino && !other.Unlinked && fs.ftruncateAliasLinked(other) && other.Dirty != nil && other.DirtySeq != 0 && other.pendingFtruncate.Load() == nil {
 			return
 		}
 	}
@@ -47,12 +51,12 @@ func (fs *Dat9FS) publishFtruncateInheritanceLocked(fh *FileHandle) {
 	fh.LineageTrusted, fh.StagedLineageTrusted = true, true
 	fh.ftruncateInherited = id
 	publishStagedSnapshotLineageLocked(fh)
-	event := &ftruncateInheritance{ino: fh.Ino, path: fh.Path, view: fs.mountViewGeneration.Load(), seq: fh.DirtySeq, revision: fh.BaseRev, id: id, ancestors: append([]string(nil), fh.contentAncestors...)}
+	event.id, event.ancestors = id, append([]string(nil), fh.contentAncestors...)
 	if fh.Dirty.Size() <= maxLandedPayloadBytes && fh.Dirty.CanMaterializeFull() {
 		event.data, event.complete = fh.Dirty.Bytes(), true
 	}
 	for _, sibling := range fs.openHandles.SnapshotInode(fh.Ino) {
-		if sibling.Ino == fh.Ino && !sibling.Unlinked && fs.ftruncateAliasLinked(sibling) && sibling.Dirty != nil {
+		if sibling.Flags&syscall.O_ACCMODE != syscall.O_RDONLY && sibling.Ino == fh.Ino && !sibling.Unlinked && fs.ftruncateAliasLinked(sibling) && sibling.Dirty != nil {
 			copy := *event
 			copy.path = sibling.Path
 			sibling.pendingFtruncate.Store(&copy)
@@ -102,6 +106,7 @@ func (fs *Dat9FS) resetFtruncateZeroImageLocked(fh *FileHandle, id string) {
 	fh.pendingFtruncate.Store(&ftruncateInheritance{ino: fh.Ino, path: fh.Path,
 		view: fs.mountViewGeneration.Load(), seq: fh.DirtySeq, revision: fh.BaseRev,
 		id: id, complete: true})
+	fs.openHandles.notifyFtruncateReaders(fh.pendingFtruncate.Load())
 }
 
 func ftruncateSnapshotID(fh *FileHandle) string {
@@ -117,7 +122,7 @@ func ftruncateDescends(fh *FileHandle, id string) bool {
 }
 
 func (fs *Dat9FS) ftruncateParticipates(fh *FileHandle) bool {
-	return fh != nil && fh.pendingFtruncate.Load() != nil && !fh.Unlinked && !fh.UnlinkedSnapshot && fh.UnlinkedData == nil && !fs.layerEnabled()
+	return fh != nil && fh.Flags&syscall.O_ACCMODE != syscall.O_RDONLY && fh.pendingFtruncate.Load() != nil && !fh.Unlinked && !fh.UnlinkedSnapshot && fh.UnlinkedData == nil && !fs.layerEnabled()
 }
 
 // Unlike lockWritableRemoteCommitPath this never cancels another commit or

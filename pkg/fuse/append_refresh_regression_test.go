@@ -451,8 +451,8 @@ func TestIssue986AppendVisibleAfterNewerDirtyMarkerCleared(t *testing.T) {
 	// writer's acknowledged append remains in its open dirty handle.
 	laterSeq := fs.markDirtySize(ino, 12)
 	fs.clearDirtySize(ino, laterSeq)
-	if _, dirty := fs.dirtyHandleSize(ino); dirty || writer.DirtySeq == 0 {
-		t.Fatalf("setup: inode marker dirty=%t, writer seq=%d", dirty, writer.DirtySeq)
+	if _, dirty, busy := fs.dirtyHandleSize(ino); dirty || busy || writer.DirtySeq == 0 {
+		t.Fatalf("setup: inode marker dirty=%t busy=%t, writer seq=%d", dirty, busy, writer.DirtySeq)
 	}
 	fs.readCache.Put(path, []byte("hello"), 1)
 

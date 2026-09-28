@@ -173,8 +173,8 @@ func TestReleasedFtruncateRevalidatesEvent(t *testing.T) {
 	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: a})
 	reader, _ := fs.fileHandles.Get(b)
 	event := reader.pendingFtruncate.Load()
-	point := "github.com/mem9-ai/drive9/pkg/fuse/releasedFtruncateBeforeReadValidate"
-	if err := failpoint.EnableCall(point, func(observed *Dat9FS, fh *FileHandle) {
+	point := "github.com/mem9-ai/drive9/pkg/fuse/ftruncateAliasReadSelected"
+	if err := failpoint.EnableCall(point, func(observed *Dat9FS, fh *FileHandle, _ string) {
 		if observed != fs || fh != reader {
 			return
 		}

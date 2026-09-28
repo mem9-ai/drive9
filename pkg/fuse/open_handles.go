@@ -39,8 +39,11 @@ func (idx *OpenHandleIndex) Add(fh *FileHandle) {
 // exists so a registration can be made atomic with another check (see
 // allocateGitWorkspaceFileHandle).
 func (idx *OpenHandleIndex) addLocked(fh *FileHandle) {
-	if fh.Dirty != nil && (fh.Flags&syscall.O_TRUNC == 0 || fh.ftruncateInherited != "") {
+	if fh.Flags&syscall.O_TRUNC == 0 || fh.ftruncateInherited != "" {
 		for sibling := range idx.byInode[fh.Ino] {
+			if fh.Flags&syscall.O_ACCMODE != syscall.O_RDONLY && sibling.Flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+				continue // Observers never seed writer inheritance.
+			}
 			if event := sibling.pendingFtruncate.Load(); event != nil && event.ino == fh.Ino {
 				if prior := fh.pendingFtruncate.Load(); prior == nil || prior.seq < event.seq {
 					copy := *event
@@ -53,6 +56,26 @@ func (idx *OpenHandleIndex) addLocked(fh *FileHandle) {
 	addHandleToSet(idx.byInode, fh.Ino, fh)
 	addHandleToSet(idx.byPath, fh.Path, fh)
 	idx.pathByHandle[fh] = fh.Path
+	if fh.Dirty != nil && fh.Dirty.visibleTruncate {
+		if idx.visibleTruncates[fh.Ino] == nil {
+			idx.visibleTruncates[fh.Ino] = make(map[*FileHandle]uint64)
+		}
+		idx.visibleTruncates[fh.Ino][fh] = fh.DirtySeq
+	}
+}
+
+// Publication and registration share idx.mu; reader mutable fields are not
+// accessed while the publisher holds only writable sibling locks.
+func (idx *OpenHandleIndex) notifyFtruncateReaders(event *ftruncateInheritance) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	for fh := range idx.byInode[event.ino] {
+		if fh.Flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+			copy := *event
+			copy.path = idx.pathByHandle[fh]
+			fh.pendingFtruncate.Store(&copy)
+		}
+	}
 }
 
 func (idx *OpenHandleIndex) ftruncateInheritance(ino uint64, path string) *ftruncateInheritance {
@@ -60,6 +83,9 @@ func (idx *OpenHandleIndex) ftruncateInheritance(ino uint64, path string) *ftrun
 	defer idx.mu.RUnlock()
 	var latest *ftruncateInheritance
 	for fh := range idx.byInode[ino] {
+		if fh.Flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+			continue
+		}
 		if event := fh.pendingFtruncate.Load(); event != nil && event.path == path && (latest == nil || event.seq > latest.seq) {
 			latest = event
 		}

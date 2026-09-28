@@ -118,6 +118,8 @@ type FileHandle struct {
 	// path lock. Publish the event without taking that sibling's mu.
 	pendingSQLiteTruncate atomic.Pointer[sqliteHandleTruncate]
 	pendingFtruncate      atomic.Pointer[ftruncateInheritance]
+	ftruncateReadSeq      uint64 // readonly resource invalidation, never write authority
+	ftruncateReadRevision int64
 	ftruncateInherited    string // root truncate retained in the bounded ancestry proof
 	ftruncateFence        bool   // RemoteCommitUnlock is a real, non-fallback path lock
 	mu                    sync.Mutex
