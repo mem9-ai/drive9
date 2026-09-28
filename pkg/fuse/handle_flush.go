@@ -99,7 +99,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
 	}
-	if handled, err := fs.prepareFtruncateCommitLocked(ctx, fh, false); handled || err != nil {
+	if handled, err := fs.prepareFtruncateFlushLocked(ctx, fh); handled || err != nil {
 		return httpToFuseStatus(err)
 	}
 	if fs.discardSupersededMutationLocked(fh) {
@@ -323,7 +323,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				}
 			}
 			var mutationRevision int64
-			if err == nil && (gvisorCompat || fs.openHandles.HasVisibleTruncate(handleIno)) {
+			if err == nil && (gvisorCompat || fs.openHandles.HasVisibleTruncate(handleIno) || fs.hasFtruncateInheritance(handleIno)) {
 				mutationRevision = fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
 				fs.recordCommittedMutation(handleIno, mutationSeq, mutationRevision, size)
 				if gvisorCompat && mutationRevision > 0 {
