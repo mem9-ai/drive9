@@ -17,14 +17,15 @@ var errFtruncateBusy = fmt.Errorf("fd-truncate operation busy: %w", syscall.EAGA
 // A bounded immutable baseline survives the truncating fd. It owns no staging
 // generations: copying content never transfers another handle's cleanup rights.
 type ftruncateInheritance struct {
-	ino      uint64
-	path     string
-	view     uint64
-	seq      uint64
-	revision int64
-	id       string
-	data     []byte
-	complete bool
+	ino       uint64
+	path      string
+	view      uint64
+	seq       uint64
+	revision  int64
+	id        string
+	data      []byte
+	complete  bool
+	ancestors []string // bounded immutable ancestry of this baseline
 }
 
 func (fs *Dat9FS) publishFtruncateInheritanceLocked(fh *FileHandle) {
@@ -33,8 +34,8 @@ func (fs *Dat9FS) publishFtruncateInheritanceLocked(fh *FileHandle) {
 	}
 	// SetAttr holds the writable siblings here. Independently dirty branches
 	// predating this truncate remain outside the clean-sibling contract.
-	for _, other := range fs.openHandles.SnapshotPath(fh.Path) {
-		if other != fh && other.Ino == fh.Ino && other.Dirty != nil && other.DirtySeq != 0 && other.pendingFtruncate.Load() == nil {
+	for _, other := range fs.openHandles.SnapshotInode(fh.Ino) {
+		if other != fh && other.Ino == fh.Ino && !other.Unlinked && fs.ftruncateAliasLinked(other) && other.Dirty != nil && other.DirtySeq != 0 && other.pendingFtruncate.Load() == nil {
 			return
 		}
 	}
@@ -46,13 +47,15 @@ func (fs *Dat9FS) publishFtruncateInheritanceLocked(fh *FileHandle) {
 	fh.LineageTrusted, fh.StagedLineageTrusted = true, true
 	fh.ftruncateInherited = id
 	publishStagedSnapshotLineageLocked(fh)
-	event := &ftruncateInheritance{ino: fh.Ino, path: fh.Path, view: fs.mountViewGeneration.Load(), seq: fh.DirtySeq, revision: fh.BaseRev, id: id}
+	event := &ftruncateInheritance{ino: fh.Ino, path: fh.Path, view: fs.mountViewGeneration.Load(), seq: fh.DirtySeq, revision: fh.BaseRev, id: id, ancestors: append([]string(nil), fh.contentAncestors...)}
 	if fh.Dirty.Size() <= maxLandedPayloadBytes && fh.Dirty.CanMaterializeFull() {
 		event.data, event.complete = fh.Dirty.Bytes(), true
 	}
-	for _, sibling := range fs.openHandles.SnapshotPath(fh.Path) {
-		if sibling.Ino == fh.Ino && sibling.Dirty != nil {
-			sibling.pendingFtruncate.Store(event)
+	for _, sibling := range fs.openHandles.SnapshotInode(fh.Ino) {
+		if sibling.Ino == fh.Ino && !sibling.Unlinked && fs.ftruncateAliasLinked(sibling) && sibling.Dirty != nil {
+			copy := *event
+			copy.path = sibling.Path
+			sibling.pendingFtruncate.Store(&copy)
 		}
 	}
 }
@@ -124,7 +127,7 @@ func (fs *Dat9FS) fenceFtruncateLocked(fh *FileHandle) error {
 		return nil
 	}
 	fs.releaseHandleRemoteCommitPathLocked(fh)
-	unlock, ok := fs.tryLockRemoteCommitPath(fh.Path)
+	unlock, ok := fs.tryLockFtruncateAliases(fh)
 	if !ok {
 		return errFtruncateBusy
 	}
@@ -139,7 +142,7 @@ func (fs *Dat9FS) ftruncateChildLocked(fh *FileHandle) (*FileHandle, error) {
 	if (id == "" || fs.handleCanAdoptCommittedRevisionLocked(fh)) && fh.pendingFtruncate.Load() != nil {
 		id = fh.pendingFtruncate.Load().id
 	}
-	for _, other := range fs.openHandles.SnapshotPath(fh.Path) {
+	for _, other := range fs.openHandles.SnapshotInode(fh.Ino) {
 		if other == fh || other.Ino != fh.Ino || other.Flags&syscall.O_ACCMODE == syscall.O_RDONLY {
 			continue
 		}
@@ -176,7 +179,7 @@ func (fs *Dat9FS) adoptLandedFtruncateLocked(ctx context.Context, fh *FileHandle
 	if !ftruncateDescends(fh, event.id) {
 		base = min(base, event.revision)
 	}
-	if fs.latestCommittedRevision(fh.Path) <= base {
+	if fs.ftruncateAliasRevision(fh) <= base {
 		return false, nil
 	}
 	reader := &CommitQueue{client: fs.client, remoteRoot: fs.remoteRoot()}
@@ -190,14 +193,14 @@ func (fs *Dat9FS) adoptLandedFtruncateLocked(ctx context.Context, fh *FileHandle
 	}
 	proof := pathCommitLandmark{}
 	if fs.commitQueue != nil {
-		proof = fs.commitQueue.landedCommit(fh.Path)
+		proof = fs.ftruncateAliasProof(fh)
 	}
 	// The exact parent may land before its live child. Rebase only after
 	// proving that the remote is that parent's complete immutable image.
 	parentMatches := landedIdentityMatches(proof, rev, size, data) && ftruncateDescends(fh, proof.snapshotID)
 	if event.complete && size == int64(len(event.data)) && bytes.Equal(event.data, data) {
 		if !parentMatches {
-			proof.snapshotID, proof.ancestors = event.id, nil
+			proof.snapshotID, proof.ancestors = event.id, event.ancestors
 		}
 		parentMatches = ftruncateDescends(fh, proof.snapshotID)
 	}
@@ -207,7 +210,7 @@ func (fs *Dat9FS) adoptLandedFtruncateLocked(ctx context.Context, fh *FileHandle
 	}
 	verified := landedIdentityMatches(proof, rev, size, data) && (proof.snapshotID == id || slices.Contains(proof.ancestors, id))
 	if !verified && (fh.DirtySeq == 0 || id == event.id) && event.complete && bytes.Equal(event.data, data) && size == int64(len(data)) {
-		verified, proof.snapshotID = true, event.id
+		verified, proof.snapshotID, proof.ancestors = true, event.id, event.ancestors
 	}
 	if !verified {
 		return false, syscall.EAGAIN
@@ -236,11 +239,18 @@ func (fs *Dat9FS) installFtruncateImageLocked(fh *FileHandle, data []byte, revis
 }
 
 func (fs *Dat9FS) prepareFtruncateMutationLocked(ctx context.Context, fh *FileHandle) error {
+	if fh != nil && !fh.Unlinked {
+		for _, alias := range fs.ftruncateAliasPaths(fh.Ino) {
+			if alias != fh.Path && fs.commitQueue != nil && fs.commitQueue.HasPath(alias) {
+				return syscall.EAGAIN
+			}
+		}
+	}
 	if !fs.ftruncateParticipates(fh) {
 		return nil
 	}
 	event := fh.pendingFtruncate.Load()
-	if event.ino != fh.Ino || event.path != fh.Path || event.view != fs.mountViewGeneration.Load() {
+	if event.ino != fh.Ino || event.path != fh.Path || event.view != fs.mountViewGeneration.Load() || !fs.ftruncateAliasLinked(fh) {
 		return syscall.EAGAIN
 	}
 	if _, err := fs.adoptLandedFtruncateLocked(ctx, fh); err != nil {
@@ -279,7 +289,7 @@ func (fs *Dat9FS) prepareFtruncateMutationLocked(ctx context.Context, fh *FileHa
 	if !event.complete || !fs.handleCanAdoptCommittedRevisionLocked(fh) || (fh.Streamer != nil && fh.Streamer.Started()) {
 		return syscall.EAGAIN
 	}
-	fs.installFtruncateImageLocked(fh, event.data, event.revision, event.id, nil)
+	fs.installFtruncateImageLocked(fh, event.data, event.revision, event.id, event.ancestors)
 	return nil
 }
 
@@ -295,16 +305,19 @@ func (fs *Dat9FS) handoffFtruncateLocked(ctx context.Context, fh *FileHandle, st
 		return adopted, err
 	}
 	if fs.pendingIndex != nil && fs.commitQueue != nil {
-		if meta, ok := fs.pendingIndex.GetMeta(fh.Path); ok && meta.lineageTrusted &&
-			meta.SnapshotID != ftruncateSnapshotID(fh) && slices.Contains(processLocalMetaAncestors(meta), ftruncateSnapshotID(fh)) {
-			if fs.commitQueue.ownsFtruncateSnapshot(meta) {
-				if strict {
-					return true, syscall.EAGAIN
+		for _, alias := range fs.ftruncateAliasPaths(fh.Ino) {
+			if meta, ok := fs.pendingIndex.GetMeta(alias); ok && meta.lineageTrusted &&
+				meta.SnapshotID != ftruncateSnapshotID(fh) && slices.Contains(processLocalMetaAncestors(meta), ftruncateSnapshotID(fh)) {
+				if fs.commitQueue.ownsFtruncateSnapshot(meta) {
+					if strict {
+						return true, syscall.EAGAIN
+					}
+					fs.removeHandleOwnedStagingLocked(fh)
+					fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+					fh.Dirty.ClearDirty()
+					fh.DirtySeq, fh.WriteBackSeq = 0, 0
+					return true, nil
 				}
-				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
-				fh.Dirty.ClearDirty()
-				fh.DirtySeq, fh.WriteBackSeq = 0, 0
-				return true, nil
 			}
 		}
 	}
@@ -336,6 +349,7 @@ func (fs *Dat9FS) handoffFtruncateLocked(ctx context.Context, fh *FileHandle, st
 	if strict {
 		return true, syscall.EAGAIN
 	}
+	fs.removeHandleOwnedStagingLocked(fh)
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fh.Dirty.ClearDirty()
 	fh.DirtySeq, fh.WriteBackSeq = 0, 0
@@ -403,7 +417,7 @@ func (fs *Dat9FS) prepareFtruncateCommitLocked(ctx context.Context, fh *FileHand
 		return false, nil
 	}
 	event := fh.pendingFtruncate.Load()
-	if event.ino != fh.Ino || event.path != fh.Path || event.view != fs.mountViewGeneration.Load() {
+	if event.ino != fh.Ino || event.path != fh.Path || event.view != fs.mountViewGeneration.Load() || !fs.ftruncateAliasLinked(fh) {
 		return true, syscall.EAGAIN
 	}
 	if handled, err := fs.handoffFtruncateLocked(ctx, fh, strict); handled || err != nil {
@@ -616,4 +630,23 @@ func (fs *Dat9FS) readReleasedFtruncateOnceLocked(fh *FileHandle, offset int64, 
 	}
 	end := min(offset+int64(size), int64(len(data)))
 	return append([]byte(nil), data[offset:end]...), true, nil
+}
+
+// A final close can race the alias child's Release between durable staging
+// and queue ownership. Yield the parent handle through that short handoff;
+// do not return a transient lock collision as a failed close to the kernel.
+func (fs *Dat9FS) prepareFtruncateFlushLocked(ctx context.Context, fh *FileHandle) (bool, error) {
+	handled, err := fs.prepareFtruncateCommitLocked(ctx, fh, false)
+	if !errors.Is(err, errFtruncateBusy) || len(fs.ftruncateAliasPaths(fh.Ino)) <= 1 {
+		return handled, err
+	}
+	deadline := time.Now().Add(samePathDirtyWaitTimeout)
+	for errors.Is(err, errFtruncateBusy) && time.Now().Before(deadline) && ctx.Err() == nil {
+		failpoint.InjectCall("ftruncateAliasFlushWait", fs, fh)
+		fh.Unlock()
+		time.Sleep(samePathDirtyWaitInterval)
+		fh.Lock()
+		handled, err = fs.prepareFtruncateCommitLocked(ctx, fh, false)
+	}
+	return handled, err
 }

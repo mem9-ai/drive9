@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -104,7 +105,10 @@ type CommitEntry struct {
 	cancelUpload                 context.CancelFunc
 	mutationPublished            bool
 	payload                      []byte
-	payloadBound                 bool
+	// Process-local alias fence captured by a live truncate participant.
+	ftruncatePaths []string
+	ftruncateValid func() bool
+	payloadBound   bool
 }
 
 func (entry *CommitEntry) payloadBaseRevision() int64 {
@@ -1500,7 +1504,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		entry.cancelUpload = cancel
 		cq.mu.Unlock()
 
-		unlockPath := cq.lockPath(entry.Path)
+		unlockPath := cq.lockEntryPath(entry)
 		if cq.discardSupersededEntry(entry) || cq.discardLandedAncestor(entryCtx, entry) {
 			unlockPath()
 			return
@@ -1538,6 +1542,11 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			unlockPath()
 			cq.removeFromQueue(entry)
 			safeLogPrintf("commit queue: entry for %s was canceled during upload", entry.Path)
+			return
+		}
+		if errors.Is(err, syscall.ESTALE) {
+			cq.onCommitTerminalFailure(entry, err)
+			unlockPath()
 			return
 		}
 		if errors.Is(err, errCommitPayloadStale) {
@@ -1681,6 +1690,9 @@ func (cq *CommitQueue) canAddToBatch(entry *CommitEntry, seenPaths map[string]st
 }
 
 func (cq *CommitQueue) batchWriteEligible(entry *CommitEntry) bool {
+	if entry != nil && len(entry.ftruncatePaths) > 1 {
+		return false
+	}
 	if cq == nil || entry == nil || entry.canceled || entry.ShadowSpill || cq.shadows == nil || cq.client == nil {
 		return false
 	}
@@ -1946,6 +1958,9 @@ func (cq *CommitQueue) validateEntryPayloadFreshCtx(ctx context.Context, entry *
 	if entry == nil {
 		return nil
 	}
+	if entry.ftruncateValid != nil && !entry.ftruncateValid() {
+		return syscall.ESTALE
+	}
 	payloadBaseRev := entry.payloadBaseRevision()
 	watermark := cq.effectiveDurableWatermark(entry)
 	if watermark > 0 && payloadBaseRev >= 0 && payloadBaseRev < watermark {
@@ -2099,7 +2114,7 @@ func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error 
 	if release != nil {
 		defer release()
 	}
-	unlockPath := cq.lockPath(entry.Path)
+	unlockPath := cq.lockEntryPath(entry)
 	defer unlockPath()
 	return cq.commitNowClaimedPathLocked(ctx, entry)
 }
@@ -3034,5 +3049,22 @@ func classifyCommitTerminalReason(lastErr error) string {
 		return "conflict"
 	default:
 		return "upload_failure"
+	}
+}
+
+// lockEntryPath composes the existing raw path callback for a captured alias
+// set. Such entries are never batched, so overlapping sets are not re-locked.
+func (cq *CommitQueue) lockEntryPath(entry *CommitEntry) func() {
+	if len(entry.ftruncatePaths) == 0 {
+		return cq.lockPath(entry.Path)
+	}
+	unlocks := make([]func(), 0, len(entry.ftruncatePaths))
+	for _, p := range entry.ftruncatePaths {
+		unlocks = append(unlocks, cq.lockPath(p))
+	}
+	return func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
 	}
 }
