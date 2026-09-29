@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pingcap/failpoint"
+
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 )
@@ -1505,6 +1507,12 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cq.mu.Unlock()
 
 		unlockPath := cq.lockEntryPath(entry)
+		if err := cq.validateRecoveredEntry(entry); err != nil {
+			cancel()
+			cq.onCommitTerminalFailure(entry, err)
+			unlockPath()
+			return
+		}
 		if cq.discardSupersededEntry(entry) || cq.discardLandedAncestor(entryCtx, entry) {
 			unlockPath()
 			return
@@ -1744,8 +1752,14 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 	}
 	cq.mu.Unlock()
 	unlockPaths := cq.lockBatchPaths(entries)
+	failpoint.InjectCall("recoveredBatchLocked", cq)
 	active := entries[:0]
 	for _, entry := range entries {
+		if err := cq.validateRecoveredEntry(entry); err != nil {
+			cq.onCommitTerminalFailure(entry, err)
+			cq.endInFlight(entry)
+			continue
+		}
 		if cq.discardSupersededEntry(entry) || cq.discardLandedAncestor(ctx, entry) {
 			cq.endInFlight(entry)
 			continue
@@ -1767,6 +1781,21 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 
 	remoteItems, err := cq.prepareBatchWriteItems(ctx, entries)
 	if err != nil {
+		if errors.Is(err, syscall.ESTALE) {
+			survivors := entries[:0]
+			for _, entry := range entries {
+				if admissionErr := cq.validateRecoveredEntry(entry); admissionErr != nil {
+					cq.onCommitTerminalFailure(entry, admissionErr)
+					cq.endInFlight(entry)
+					continue
+				}
+				survivors = append(survivors, entry)
+			}
+			unlockPaths()
+			cancel()
+			cq.fallbackBatchEntries(survivors)
+			return
+		}
 		unlockPaths()
 		cancel()
 		if errors.Is(err, errCommitPayloadStale) {
@@ -1786,6 +1815,12 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 					// proof and its success bookkeeping must not straddle a
 					// synchronous same-path commit.
 					unlockEntry := cq.lockPath(entry.Path)
+					if admissionErr := cq.validateRecoveredEntry(entry); admissionErr != nil {
+						cq.onCommitTerminalFailure(entry, admissionErr)
+						unlockEntry()
+						cq.endInFlight(entry)
+						continue
+					}
 					resolved, _ := cq.resolveStalePayloadAsIdempotent(entryCtx, entry)
 					unlockEntry()
 					if resolved {
@@ -1880,6 +1915,7 @@ func (cq *CommitQueue) prepareBatchWriteItems(ctx context.Context, entries []*Co
 		if err != nil {
 			return nil, fmt.Errorf("read shadow %s: %w", entry.Path, err)
 		}
+		failpoint.InjectCall("batchPayloadPrepared", cq, entry)
 		item := client.BatchWriteItem{
 			Path:             cq.remotePath(entry.Path),
 			ExpectedRevision: entry.BaseRev,
@@ -1921,6 +1957,7 @@ func (cq *CommitQueue) lockBatchPaths(entries []*CommitEntry) func() {
 
 func (cq *CommitQueue) fallbackBatchEntries(entries []*CommitEntry) {
 	for _, entry := range entries {
+		failpoint.InjectCall("batchFallbackEntry", cq, entry)
 		if cq.isEntryCanceled(entry) {
 			cq.removeFromQueue(entry)
 			cq.endInFlight(entry)
@@ -1957,6 +1994,9 @@ func sleepWithCancel(ctx context.Context, delay time.Duration) bool {
 func (cq *CommitQueue) validateEntryPayloadFreshCtx(ctx context.Context, entry *CommitEntry) error {
 	if entry == nil {
 		return nil
+	}
+	if err := cq.validateRecoveredEntry(entry); err != nil {
+		return err
 	}
 	if entry.ftruncateValid != nil && !entry.ftruncateValid() {
 		return syscall.ESTALE
@@ -2148,6 +2188,9 @@ func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEnt
 }
 
 func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *CommitEntry) error {
+	if err := cq.validateRecoveredEntry(entry); err != nil {
+		return err
+	}
 	if cq.isCanceledImmediateEntry(entry) {
 		cq.removeFromQueue(entry)
 		return nil
@@ -2979,6 +3022,13 @@ func (cq *CommitQueue) onCommitPostUploadFailure(entry *CommitEntry, err error) 
 }
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error) {
+	// A rejected legacy recovery without an identity cannot authorize the
+	// unconditional marker or a path-only journal completion for newer data.
+	if entry.recovered && entry.PendingIndexGen == 0 {
+		cq.removeFromQueue(entry)
+		cq.recordCommitTerminalFailure(entry, lastErr)
+		return
+	}
 	// Mark the entry as conflicted in the pending index so that crash
 	// recovery (RecoverPending) skips it instead of retrying forever.
 	// Preserve both the shadow file and the pending metadata so the user
@@ -3045,7 +3095,7 @@ func classifyCommitTerminalReason(lastErr error) string {
 		return "conflict"
 	case errors.Is(lastErr, errLayerRolledBack):
 		return "abandoned"
-	case errors.Is(lastErr, client.ErrConflict), errors.Is(lastErr, errCommitPayloadStale):
+	case errors.Is(lastErr, client.ErrConflict), errors.Is(lastErr, errCommitPayloadStale), errors.Is(lastErr, syscall.ESTALE):
 		return "conflict"
 	default:
 		return "upload_failure"
@@ -3100,4 +3150,21 @@ func (cq *CommitQueue) hasFtruncateInode(ino uint64, paths []string) bool {
 		}
 	}
 	return false
+}
+
+// validateRecoveredEntry rechecks a recovery selection under the commit path
+// exclusion before upload or successful cleanup. Selection is not authority
+// after rename quarantine or same-path restaging. Live entries keep their rules.
+func (cq *CommitQueue) validateRecoveredEntry(entry *CommitEntry) error {
+	if entry == nil || !entry.recovered {
+		return nil
+	}
+	if cq.index == nil || entry.PendingIndexGen == 0 {
+		return syscall.ESTALE
+	}
+	meta, ok := cq.index.GetMeta(entry.Path)
+	if !ok || meta.Generation != entry.PendingIndexGen || meta.Kind == PendingConflict {
+		return syscall.ESTALE
+	}
+	return nil
 }
