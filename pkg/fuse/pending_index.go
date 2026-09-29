@@ -251,7 +251,15 @@ func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (ui
 	defer idx.releasePathLock(remotePath, pl)
 	idx.mu.RLock()
 	abandoned := idx.layerAbandoned
-	_, exists := idx.items[remotePath]
+	previous, exists := idx.items[remotePath]
+	if exists && !meta.LayerClean && previous.LayerID != "" {
+		// Dirty staging retains the Layer snapshot it was based on. Replay
+		// needs this identity to detect an external update after Flush.
+		meta.LayerID, meta.LayerEntrySeq = previous.LayerID, previous.LayerEntrySeq
+		if previous.Kind == PendingConflict {
+			meta.Kind = PendingConflict
+		}
+	}
 	idx.mu.RUnlock()
 	if onlyIfAbsent && exists {
 		return 0, nil

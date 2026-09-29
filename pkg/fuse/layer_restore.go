@@ -103,15 +103,23 @@ func (r *layerRestorer) cacheCoversReplay(meta *WriteBackMeta, tip client.FSLaye
 	return !r.hasCheckpoint && meta.LayerID == r.opts.LayerRef && meta.LayerEntrySeq > id.EntrySeq
 }
 
-func (r *layerRestorer) restoreEntry(ctx context.Context, entry client.FSLayerEntry) error {
+func (r *layerRestorer) restoreEntry(ctx context.Context, entry client.FSLayerEntry) (retErr error) {
 	c, opts, shadows, pending, fs := r.client, r.opts, r.shadows, r.pending, r.fs
 	localPath, ok := mountpath.ToLocal(opts.RemoteRoot, entry.Path)
 	if !ok {
 		return nil
 	}
+	var handles []*FileHandle
 	if fs != nil {
 		unlock := fs.lockRemoteCommitPath(localPath)
 		defer unlock()
+		var unlockHandles func()
+		var err error
+		handles, unlockHandles, err = fs.lockLayerReplayHandles(localPath)
+		if err != nil {
+			return err
+		}
+		defer unlockHandles()
 	}
 	// An orphan must not suppress the authoritative Layer replay. Recovery
 	// runs after restore, so prune it here under the same publication fence.
@@ -126,6 +134,19 @@ func (r *layerRestorer) restoreEntry(ctx context.Context, entry client.FSLayerEn
 		} else if !present {
 			pending.RemoveIfGeneration(localPath, meta.Generation)
 		}
+	}
+	if fs != nil {
+		if !opts.ReadOnly {
+			preserved, err := fs.preserveLayerReplayConflict(localPath, r.tips[entry.Path], handles, pending)
+			if preserved || err != nil {
+				return err
+			}
+		}
+		defer func() {
+			if retErr == nil {
+				retErr = fs.rebaseLayerReplayHandles(localPath, handles)
+			}
+		}()
 	}
 	// Recovery must upload local dirty content before it can be replaced by
 	// a server replay. Clean overlays can be refreshed normally.

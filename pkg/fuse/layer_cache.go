@@ -69,6 +69,9 @@ func (fs *Dat9FS) flushLayerHandleLocked(ctx context.Context, fh *FileHandle) go
 		return httpToFuseStatus(err)
 	}
 	defer unlockRemoteCommit()
+	if st := fs.layerHandleMutationStatusLocked(fh); st != gofuse.OK {
+		return st
+	}
 	if fh.releasing {
 		// Waiting for another transfer must not consume our upload budget.
 		var cancel context.CancelFunc

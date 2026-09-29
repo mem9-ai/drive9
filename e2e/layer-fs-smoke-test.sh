@@ -393,15 +393,23 @@ start_layer_mount() {
     echo "local_root=$local_root"
   } >>"$MOUNT_LOG"
 
-  local args=(mount --foreground --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$local_root" --durability="$durability" --flush-debounce=0 --layer "$layer_ref")
+  local profile="${FUSE_PROFILE:-coding-agent}"
+  local args=(mount --foreground --mode=fuse --profile="$profile" --durability="$durability" --flush-debounce=0 --layer "$layer_ref")
+  case "$profile" in
+    none|extent|interactive) ;;
+    *) args+=(--local-root "$local_root") ;;
+  esac
   if [ -n "$checkpoint_ref" ]; then
     args+=(--checkpoint "$checkpoint_ref")
   fi
   args+=(":$remote_root" "$MOUNT_POINT")
   drive9 "${args[@]}" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
-  wait_mount_state mounted
-  wait_mount_log_ready "$MOUNT_LOG"
+  if ! wait_mount_state mounted || ! wait_mount_log_ready "$MOUNT_LOG"; then
+    echo "FAIL layer mount did not become ready: $MOUNT_POINT" >&2
+    tail -n 80 "$MOUNT_LOG" >&2
+    return 1
+  fi
 }
 
 expect_layer_mount_fail() {
@@ -1299,6 +1307,66 @@ PY_FSYNC
   check_cmd "layer event refresh replaces clean cached content" wait_mounted_layer_file "$mount_a/external.txt" "external changed ${ts}"
   put_layer_entry "$fuse_layer_name" "${fuse_root}/external.txt" "whiteout" "file" ""
   check_cmd "layer event refresh removes clean cached file" wait_mounted_layer_file "$mount_a/external.txt" "absent"
+  DRIVE9_LAYER_TEST_KEY="$API_KEY" check_cmd \
+    "open writable handle follows external update and deletion" \
+    python3 - "$BASE" "$fuse_layer_id" "$fuse_root" "$mount_a" <<'PY_OPEN_REFRESH'
+import base64
+import errno
+import json
+import os
+import signal
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+signal.alarm(60)
+base, layer, remote_root, mount = sys.argv[1:]
+path = remote_root + "/open-refresh.txt"
+url = base + "/v1/layers/" + urllib.parse.quote(layer) + "/entries"
+headers = {"Authorization": "Bearer " + os.environ["DRIVE9_LAYER_TEST_KEY"],
+           "Content-Type": "application/json"}
+
+def mutate(op, data=b""):
+    body = {"path": path, "op": op, "kind": "file", "size_bytes": len(data)}
+    if data:
+        body["content"] = base64.b64encode(data).decode()
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as response:
+        assert response.status in (200, 201)
+
+fd = os.open(mount + "/open-refresh.txt", os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    assert os.write(fd, b"old") == 3
+    os.fsync(fd)
+    expected = b"external longer content"
+    mutate("upsert", expected)
+    deadline = time.monotonic() + 15
+    while os.pread(fd, 64, 0) != expected:
+        assert time.monotonic() < deadline, "O_RDWR handle kept old content"
+        time.sleep(0.1)
+    assert os.pwrite(fd, b"X", 0) == 1
+    os.fsync(fd)
+    req = urllib.request.Request(url + "?" + urllib.parse.urlencode({"path": path}), headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as response:
+        entry = json.load(response)
+    assert base64.b64decode(entry["content"]) == b"X" + expected[1:]
+    mutate("whiteout")
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            os.pread(fd, 64, 0)
+        except FileNotFoundError:
+            break
+        assert time.monotonic() < deadline, "O_RDWR handle kept deleted content"
+        time.sleep(0.1)
+finally:
+    try:
+        os.close(fd)
+    except OSError as error:
+        if error.errno != errno.ENOENT:
+            raise
+PY_OPEN_REFRESH
   check_cmd "drain layer before unmount" drive9 mount drain --timeout 10s "$mount_a"
   check_cmd "unmount first layer mount" unmount_layer_mount
   check_cmd "first layer mount log clean" audit_mount_log "$log_a"

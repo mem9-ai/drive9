@@ -3,6 +3,7 @@ package fuse
 import (
 	"context"
 	"fmt"
+	"io"
 	"syscall"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -230,7 +231,23 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 					return err
 				}
 				if err == nil {
-					data = entry.Content
+					if entry.StorageRef != "" || entry.StorageType == "s3" {
+						reader, err := fs.client.ReadFSLayerFileStream(ctx, fs.layerRef(), oldRemote, layerEntryFetchMaxSeq(entry, false, 0))
+						if err != nil {
+							return err
+						}
+						data, err = io.ReadAll(reader)
+						closeErr := reader.Close()
+						if err != nil {
+							return err
+						}
+						if closeErr != nil {
+							return closeErr
+						}
+					} else {
+						// Empty inline content is still authoritative Layer data.
+						data = append([]byte{}, entry.Content...)
+					}
 					if entry.Mode != 0 {
 						mode = entry.Mode
 						hasMode = true
@@ -320,6 +337,9 @@ func (fs *Dat9FS) commitLayerShadowLocked(ctx context.Context, fh *FileHandle, s
 	if fh.Unlinked {
 		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return nil
+	}
+	if st := fs.layerHandleMutationStatusLocked(fh); st != 0 {
+		return syscall.Errno(st)
 	}
 	if fs.discardSupersededMutationLocked(fh) {
 		fs.removeHandleOwnedStagingLocked(fh)
