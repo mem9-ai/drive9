@@ -872,3 +872,24 @@ func (idx *PendingIndex) uncommittedGenerations() map[string]uint64 {
 	}
 	return result
 }
+
+// markRenameConflictLocked requires the pending path lock. Unlike the public
+// conflict helpers, rename failure must fence memory even if persistence fails,
+// preventing this mount's late recovery drain from uploading the old path.
+func (idx *PendingIndex) markRenameConflictLocked(path string, gen uint64) error {
+	idx.mu.Lock()
+	meta := idx.items[path]
+	if gen == 0 || meta == nil || meta.Generation != gen {
+		idx.mu.Unlock()
+		return nil
+	}
+	conflicted := cloneWriteBackMeta(meta)
+	conflicted.Kind = PendingConflict
+	idx.items[path] = &conflicted
+	idx.mu.Unlock()
+	data, err := json.Marshal(&conflicted)
+	if err != nil {
+		return err
+	}
+	return atomicWrite(filepath.Join(idx.dir, hashPath(path)+".meta"), data)
+}
