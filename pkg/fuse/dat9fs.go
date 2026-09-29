@@ -4654,6 +4654,26 @@ func (fs *Dat9FS) canReadAppendPrefix(path string, ino uint64, reader *FileHandl
 	return stable && fs.latestCommittedRevision(path) <= revision && fs.inodes.GetRevision(ino) <= revision
 }
 
+// checkAppendFallback preserves only a freshly proved committed prefix when
+// an append source appears at a fallback boundary. Scan writers before their
+// published successors, as staging clears DirtySeq only after publication.
+// The returned prefix flag requires bypassing unproved reader pins/prefetch.
+func (fs *Dat9FS) checkAppendFallback(ctx context.Context, path string, ino uint64, reader *FileHandle, offset int64, size uint32) (bool, gofuse.Status) {
+	active := fs.hasDirtyAppend(path, ino, reader)
+	pending := fs.appendContentPending(path) || fs.hasOtherAliasPending(path, ino)
+	if !active && !pending {
+		return false, gofuse.OK
+	}
+	prefix := active && !pending && ctx.Err() == nil && fs.canReadAppendPrefix(path, ino, reader, offset, size)
+	if !prefix || ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return false, gofuse.EINTR
+		}
+		return false, gofuse.EIO
+	}
+	return true, gofuse.OK
+}
+
 // The caller observed an active append or content pending on a known inode path.
 // An unhandled read selects published sources unless the requested prefix
 // was proved unchanged.
@@ -12942,18 +12962,24 @@ readHandleState:
 		}
 	}
 
-	// Content may have appeared after append selection released the handle lock.
+	// Active or staged content may appear after selection releases the handle lock.
 	// A cache pin proves a revision, not ownership of these pending bytes. Fail
 	// closed here; a later read can retry without restarting this read's budget.
 	if appendEligible && testHookBeforePublishedFallback != nil {
 		testHookBeforePublishedFallback(fh.Path, false)
 	}
-	if appendEligible && (fs.appendContentPending(fh.Path) || fs.hasOtherAliasPending(fh.Path, fh.Ino)) {
-		source = "pending-publication-changed"
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return nil, gofuse.EINTR
+	if appendEligible {
+		fallbackCtx := ctx
+		if appendCtx != nil {
+			fallbackCtx = appendCtx
 		}
-		return nil, gofuse.EIO
+		prefix, st := fs.checkAppendFallback(fallbackCtx, fh.Path, fh.Ino, fh, int64(input.Offset), input.Size)
+		if st != gofuse.OK {
+			source = "append-source-changed"
+			return nil, st
+		}
+		// A source prefix proof does not certify the reader's old pin/prefetch.
+		usePublishedAppend = usePublishedAppend || prefix
 	}
 
 	// Read path priority for pending files:
@@ -13012,17 +13038,23 @@ readHandleState:
 		}
 		fh.Unlock()
 	}
-	// Shadow selection can itself race a publication. Do not let a miss
-	// expose an older writeback/cache/remote image while content is pending.
+	// Shadow selection can race an unstaged append or publication. Revalidate
+	// the fallback, including any unchanged-prefix proof, before older sources.
 	if appendEligible && testHookBeforePublishedFallback != nil {
 		testHookBeforePublishedFallback(fh.Path, true)
 	}
-	if appendEligible && (fs.appendContentPending(fh.Path) || fs.hasOtherAliasPending(fh.Path, fh.Ino)) {
-		source = "pending-publication-changed"
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return nil, gofuse.EINTR
+	if appendEligible {
+		fallbackCtx := ctx
+		if appendCtx != nil {
+			fallbackCtx = appendCtx
 		}
-		return nil, gofuse.EIO
+		prefix, st := fs.checkAppendFallback(fallbackCtx, fh.Path, fh.Ino, fh, int64(input.Offset), input.Size)
+		if st != gofuse.OK {
+			source = "append-source-changed"
+			return nil, st
+		}
+		// A source prefix proof does not certify the reader's old pin/prefetch.
+		usePublishedAppend = usePublishedAppend || prefix
 	}
 
 	// Close-to-open consistency: if a previous handle wrote data to the

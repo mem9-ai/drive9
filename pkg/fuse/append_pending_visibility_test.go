@@ -307,3 +307,149 @@ func TestIssue986PendingAppendCancellation(t *testing.T) {
 		t.Fatalf("pending read cancellation: %v, want EINTR", st)
 	}
 }
+
+// A Write can finish after append selection without publishing any staged
+// metadata. Neither fallback boundary may then return the old committed image.
+func TestIssue986UnstagedAppendAtFallback(t *testing.T) {
+	for _, alias := range []bool{false, true} {
+		for _, flags := range []uint32{uint32(syscall.O_RDONLY), uint32(syscall.O_RDWR)} {
+			for _, afterShadow := range []bool{false, true} {
+				for _, interrupted := range []bool{false, true} {
+					t.Run(fmt.Sprintf("alias=%v/flags=%d/afterShadow=%v/cancel=%v", alias, flags, afterShadow, interrupted), func(t *testing.T) {
+						var fs *Dat9FS
+						var ino, rid, wid uint64
+						var reader, writer *FileHandle
+						if alias {
+							fs, ino, reader, rid, writer, wid, _ = newAliasAppendTestFS(t, flags, false)
+						} else {
+							fs, ino, reader, rid, writer, wid, _, _, _ = newPendingAppendTestFS(t, flags)
+						}
+						cancel := make(chan struct{})
+						entered := false
+						testHookBeforePublishedFallback = func(path string, passedShadow bool) {
+							if path != reader.Path || passedShadow != afterShadow || entered {
+								return
+							}
+							entered = true
+							if n, st := pr939Append(fs, ino, wid, " gopher"); n != 7 || st != gofuse.OK {
+								t.Fatalf("late append: %d/%v", n, st)
+							}
+							writer.Lock()
+							dirty := writer.DirtySeq != 0 && writer.Dirty != nil && writer.Dirty.HasDirtyParts()
+							writer.Unlock()
+							if !dirty || fs.appendContentPending(writer.Path) {
+								t.Fatal("expected acknowledged dirty append without staged metadata")
+							}
+							if interrupted {
+								close(cancel)
+							}
+						}
+						defer func() { testHookBeforePublishedFallback = nil }()
+						buf := make([]byte, 64)
+						result, st := fs.Read(cancel, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: rid, Size: uint32(len(buf))}, buf)
+						var data []byte
+						if st == gofuse.OK {
+							data, _ = result.Bytes(buf)
+							result.Done()
+						}
+						want := gofuse.EIO
+						// The raw FUSE channel is bridged to ctx by a goroutine. An
+						// interruption racing this immediate fence can yield EIO before
+						// propagation, or EINTR after it; neither may return old success.
+						if interrupted && st == gofuse.EINTR {
+							want = gofuse.EINTR
+						}
+						if !entered || st != want {
+							t.Fatalf("late unstaged append: hook=%v data=%q status=%v, want %v", entered, data, st, want)
+						}
+						// This is a per-read fail-closed result, not a poisoned fd. A fresh
+						// uncanceled read selects the acknowledged in-memory append directly.
+						testHookBeforePublishedFallback = nil
+						assertAliasAppendRead(t, fs, ino, rid, "hello gopher")
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestIssue986LateFallbackPrefixSafety(t *testing.T) {
+	for _, alias := range []bool{false, true} {
+		for _, afterShadow := range []bool{false, true} {
+			for _, invalidate := range []bool{false, true} {
+				t.Run(fmt.Sprintf("alias=%v/afterShadow=%v/invalidate=%v", alias, afterShadow, invalidate), func(t *testing.T) {
+					var fs *Dat9FS
+					var ino, rid, wid uint64
+					var r, w *FileHandle
+					if alias {
+						fs, ino, r, rid, w, wid, _ = newAliasAppendTestFS(t, uint32(syscall.O_RDONLY), false)
+					} else {
+						fs, ino, r, rid, w, wid, _, _, _ = newPendingAppendTestFS(t, uint32(syscall.O_RDONLY))
+					}
+					w.Lock()
+					w.Dirty.markCommittedPrefix(1, 5)
+					w.Unlock()
+					fs.readCache.Put(r.Path, []byte("hello"), 1)
+					if err := fs.shadowStore.WriteFull(r.Path, []byte("WRONG"), 1); err != nil {
+						t.Fatal(err)
+					}
+					r.ShadowGen = fs.shadowStore.Pin(r.Path)
+					r.ShadowPinned = true
+					fs.shadowStore.Remove(r.Path)
+					r.Prefetch = NewPrefetcher(fs.client, r.Path, 5)
+					defer r.Prefetch.Close()
+					ready := make(chan struct{})
+					close(ready)
+					r.Prefetch.cache[0] = &prefetchBlock{offset: 0, data: []byte("WRONG"), ready: ready}
+					if invalidate {
+						if _, st := pr939Append(fs, ino, wid, " gopher"); st != gofuse.OK {
+							t.Fatal(st)
+						}
+					}
+					entered := false
+					testHookBeforePublishedFallback = func(path string, passedShadow bool) {
+						if path != r.Path || passedShadow != afterShadow || entered {
+							return
+						}
+						entered = true
+						if invalidate {
+							// Fault-inject a buffer mutation invalidating the previously certified
+							// prefix; this is the same white-box boundary used by prefix fences.
+							w.Lock()
+							_, err := w.Dirty.Write(0, []byte("HELLO"))
+							w.DirtySeq = fs.markDirtySize(ino, w.Dirty.Size())
+							w.Unlock()
+							if err != nil {
+								t.Fatal(err)
+							}
+						} else {
+							if _, st := pr939Append(fs, ino, wid, " gopher"); st != gofuse.OK {
+								t.Fatal(st)
+							}
+						}
+					}
+					defer func() { testHookBeforePublishedFallback = nil }()
+					data, st, err := readDat9FSTestRange(fs, ino, rid, 0, 5)
+					if !entered {
+						t.Fatal("fallback boundary not exercised")
+					}
+					if invalidate {
+						if st != gofuse.EIO {
+							t.Fatalf("expired prefix used: %q/%v/%v", data, st, err)
+						}
+					} else {
+						if st != gofuse.OK || err != nil || string(data) != "hello" {
+							t.Fatalf("safe prefix rejected or unproved reader source used: %q/%v/%v", data, st, err)
+						}
+					}
+					testHookBeforePublishedFallback = nil
+					want := "hello gopher"
+					if invalidate {
+						want = "HELLO gopher"
+					}
+					assertAliasAppendRead(t, fs, ino, rid, want)
+				})
+			}
+		}
+	}
+}
