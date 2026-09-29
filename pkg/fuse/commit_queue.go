@@ -2330,7 +2330,8 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 	}
 	// Read the main-namespace claim only after validation. Overlay upserts
 	// themselves do not advance main revisions or produce landed proofs.
-	expectedRevision := entry.BaseRev
+	// Layer entries use zero, not the base write API's -1 sentinel, for no claim.
+	expectedRevision := max(entry.BaseRev, 0)
 	if entry.Size > maxInlineLayerEntryBytes || entry.ShadowSpill {
 		fd, actualSize, release, err := cq.shadows.OpenIfGeneration(entry.Path, entry.ShadowGen)
 		if err != nil {

@@ -40,6 +40,9 @@ func TestLayerRefreshWritableHandle(t *testing.T) {
 							return
 						}
 						posts++
+						if req.BaseRevision != 0 {
+							t.Errorf("Layer-local rewrite claimed base revision %d", req.BaseRevision)
+						}
 						entry := client.FSLayerEntry{LayerID: "layer-1", Path: req.Path, Op: req.Op, Kind: req.Kind, Content: req.Content, SizeBytes: req.SizeBytes, EntrySeq: int64(len(entries) + 1)}
 						entries = append(entries, entry)
 						_ = json.NewEncoder(w).Encode(entry)

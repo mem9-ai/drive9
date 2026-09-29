@@ -33,6 +33,9 @@ func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []
 	if fs.isLayerAbandoned() {
 		return LayerCacheIdentity{}, errLayerRolledBack
 	}
+	// The base write API uses -1 for an unconditional write. Layer entries
+	// use zero for no base claim; a negative value fails commit preflight.
+	expectedRevision = max(expectedRevision, 0)
 	var entry *client.FSLayerEntry
 	var err error
 	if int64(len(data)) > maxInlineLayerEntryBytes {
