@@ -116,6 +116,12 @@ func (fs *Dat9FS) adoptCleanCommittedRevisionLocked(fh *FileHandle, revision, si
 	// Read pins validate freshness independently. Leave shared staging bytes
 	// to their generation-scoped owner/lifecycle rather than guessing ownership
 	// from whether a sibling mutex happens to be available.
+	if revision > fh.BaseRev {
+		clearReadTargetForLockedHandle(fh)
+		if fh.Prefetch != nil {
+			fh.Prefetch.invalidateWithSize(size)
+		}
+	}
 	fh.IsNew = false
 	fh.BaseRev = revision
 	clearHandleShadowClaimLocked(fh)

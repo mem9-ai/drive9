@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -18,16 +19,52 @@ import (
 func newAliasAppendTestFS(t *testing.T, flags uint32, writerFirst bool, requestHooks ...func(*http.Request)) (*Dat9FS, uint64, *FileHandle, uint64, *FileHandle, uint64, *casFileServer) {
 	t.Helper()
 	server := &casFileServer{t: t, path: "/a", revision: 1, body: []byte("hello")}
+	var aliasMu sync.Mutex
+	aliases := map[string]bool{"/a": true}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		for _, hook := range requestHooks {
 			hook(r)
 		}
+		name := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+		if r.Method == http.MethodDelete && testSurvivorDeleteStatus != nil {
+			if status := testSurvivorDeleteStatus(name); status != 0 {
+				http.Error(w, "injected delete failure", status)
+				return
+			}
+		}
+		aliasMu.Lock()
 		if r.Method == http.MethodPost && r.URL.Query().Get("hardlink") == "1" {
+			source := r.Header.Get("X-Dat9-Hardlink-Source")
+			if !aliases[source] || aliases[name] {
+				aliasMu.Unlock()
+				http.Error(w, "invalid link", http.StatusConflict)
+				return
+			}
+			aliases[name] = true
+			aliasMu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 			return
 		}
-		w.Header().Set("X-Dat9-Resource-ID", "alias-append-file")
-		w.Header().Set("X-Dat9-Nlink", "2")
+		if !aliases[name] {
+			aliasMu.Unlock()
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method == http.MethodDelete {
+			delete(aliases, name)
+			aliasMu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			return
+		}
+		nlink := len(aliases)
+		aliasMu.Unlock()
+
+		resourceID := "alias-append-file"
+		if testSurvivorResourceID != nil {
+			resourceID = testSurvivorResourceID(name)
+		}
+		w.Header().Set("X-Dat9-Resource-ID", resourceID)
+		w.Header().Set("X-Dat9-Nlink", strconv.Itoa(nlink))
 		if r.Method == http.MethodGet && r.Header.Get("Range") != "" {
 			_, body, _ := server.snapshot()
 			var first, last int

@@ -7617,6 +7617,10 @@ func (fs *Dat9FS) forceMarkOpenHandlesUnlinkedAfterCommit(p string) bool {
 			continue
 		}
 		fh.Lock()
+		if fh.Path != p {
+			fh.Unlock()
+			continue
+		}
 		_, _ = fs.attachUnlinkedHandleSnapshotLocked(fh, p, nil, 0, 0, 0, false)
 		fs.markHandleUnlinkedLocked(fh)
 		fh.Unlock()
@@ -7678,6 +7682,9 @@ func (fs *Dat9FS) attachAndMarkOpenHandlesLocked(ordered []*FileHandle, p string
 		}
 	}
 	for _, fh := range ordered {
+		if fh.Path != p {
+			continue
+		}
 		pin, fail := fs.attachUnlinkedHandleSnapshotLocked(fh, p, snapshot, snapshotShadowGen, size, revision, snapshotOK)
 		if fail && failClosed {
 			for _, h := range ordered {
@@ -7690,6 +7697,9 @@ func (fs *Dat9FS) attachAndMarkOpenHandlesLocked(ordered []*FileHandle, p string
 		}
 	}
 	for _, fh := range ordered {
+		if fh.Path != p {
+			continue
+		}
 		fs.markHandleUnlinkedLocked(fh)
 	}
 	return attachedPins, false
@@ -7969,7 +7979,7 @@ func (fs *Dat9FS) unmarkOpenHandlesAfterFailedUnlink(p string, handles []*FileHa
 			continue
 		}
 		fh.Lock()
-		if !fh.Unlinked {
+		if fh.Path != p || !fh.Unlinked {
 			fh.Unlock()
 			continue
 		}
@@ -7988,9 +7998,11 @@ func (fs *Dat9FS) unmarkOpenHandlesAfterFailedUnlink(p string, handles []*FileHa
 			// discardUnlinkedSnapshotPins for a completed mark pass.
 			fs.shadowStore.Unpin(gen)
 		}
+		// A delayed Open may already have rebound this fd to a survivor.
+		// Restore only this still-matching path while its handle lock is held.
+		fs.openHandles.RelinkPath(p, []*FileHandle{fh})
 		fh.Unlock()
 	}
-	fs.openHandles.RelinkPath(p, handles)
 }
 
 func (fs *Dat9FS) snapshotUnlinkedRemoteToShadow(ctx context.Context, p string, size int64, revision int64, pinCount int) (uint64, error) {
@@ -10067,6 +10079,13 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.debugf("unlink done path=%s status=%d dur=%s", childP, status, time.Since(start))
 	}()
 
+	survivor, prepareStatus := fs.prepareUnlinkSurvivor(ctx, childP)
+	if prepareStatus != gofuse.OK {
+		return prepareStatus
+	}
+	if testHookAfterUnlinkSurvivorPrepare != nil {
+		testHookAfterUnlinkSurvivorPrepare(childP, survivor)
+	}
 	pendingNew := false
 	preserveOpen := false
 	if fs.debouncer != nil {
@@ -10122,6 +10141,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		return status
 	}
 	preserveOpen = markedAny
+	if testHookAfterUnlinkFirstMark != nil {
+		testHookAfterUnlinkFirstMark(childP)
+	}
 
 	if fs.writeBack != nil && fs.uploader != nil {
 		// Wait for any in-flight upload to finish so it doesn't "revive"
@@ -12545,7 +12567,25 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		fs.openReadOnlyShadowLocked(fh)
 	}
 
+	if entry == nil {
+		return gofuse.EIO
+	}
+	if st := fs.validateOpenSurvivorBinding(ctx, fh, entry.ResourceID); st != gofuse.OK {
+		fs.discardUnexposedSurvivorOpen(fh)
+		return st
+	}
+	if testHookBeforeSurvivorOpenRegister != nil {
+		testHookBeforeSurvivorOpenRegister(fh)
+	}
 	out.Fh = fs.allocateFileHandle(fh)
+	if testHookAfterSurvivorOpenRegister != nil {
+		testHookAfterSurvivorOpenRegister(fh)
+	}
+	if st := fs.validateOpenSurvivorBinding(ctx, fh, entry.ResourceID); st != gofuse.OK {
+		fs.discardUnexposedSurvivorOpen(fh)
+		fs.deleteFileHandle(out.Fh, fh)
+		return st
+	}
 	out.OpenFlags = fs.openFlagsForHandle(fh)
 	fs.debugf("open path=%s fh=%d ino=%d flags=0x%x open_flags=%d dirty=%t prefetch=%t orig_size=%d base_rev=%d shadow_ready=%t shadow_spill=%t write_policy=%s", p, out.Fh, fh.Ino, input.Flags, out.OpenFlags, fh.Dirty != nil, fh.Prefetch != nil, fh.OrigSize, fh.BaseRev, fh.ShadowReady, fh.ShadowSpill, fh.WritePolicy)
 	return gofuse.OK
