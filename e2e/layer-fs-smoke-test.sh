@@ -380,6 +380,7 @@ start_layer_mount() {
   local mount_point="$4"
   local local_root="$5"
   local mount_log="$6"
+  local durability="${7:-write-sync}"
   MOUNT_POINT="$mount_point"
   MOUNT_LOG="$mount_log"
   mkdir -p "$MOUNT_POINT" "$local_root"
@@ -392,7 +393,7 @@ start_layer_mount() {
     echo "local_root=$local_root"
   } >>"$MOUNT_LOG"
 
-  local args=(mount --foreground --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$local_root" --durability=write-sync --flush-debounce=0 --layer "$layer_ref")
+  local args=(mount --foreground --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$local_root" --durability="$durability" --flush-debounce=0 --layer "$layer_ref")
   if [ -n "$checkpoint_ref" ]; then
     args+=(--checkpoint "$checkpoint_ref")
   fi
@@ -1355,6 +1356,51 @@ PY_NAMESPACE
   check_eq "durable layer rename target survives remount" "$(cat "$mount_c/durable-renamed.txt")" "durable layer content"
   check_cmd "unmount namespace restore mount" unmount_layer_mount
   check_cmd "namespace restore mount log clean" audit_mount_log "$log_c"
+
+  # A dup close issues Flush without Release. Strict fsync must replace the
+  # earlier staged length before acknowledging the appended shadow as clean.
+  FUSE_PROFILE=none start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" \
+    "$mount_c" "$local_c" "$log_c" fsync
+  check_cmd "duplicate close then append and strict fsync" \
+    python3 - "$mount_c/staged-append.bin" <<'PY_STAGED_FSYNC'
+import os
+import signal
+import sys
+
+signal.alarm(90)
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+other = os.dup(fd)
+try:
+    for _ in range(20):
+        assert os.write(fd, b"p" * (1024 * 1024)) == 1024 * 1024
+    os.close(other)
+    other = -1
+    assert os.write(fd, b"t" * (1024 * 1024)) == 1024 * 1024
+    os.fsync(fd)
+    assert os.fstat(fd).st_size == 21 * 1024 * 1024
+    assert os.stat(sys.argv[1]).st_size == 21 * 1024 * 1024
+finally:
+    if other != -1:
+        os.close(other)
+    os.close(fd)
+PY_STAGED_FSYNC
+  check_cmd "unmount staged append" unmount_layer_mount
+  FUSE_PROFILE=none start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" \
+    "$mount_c" "$local_c" "$log_c" fsync
+  check_cmd "staged append size and content survive same-cache remount" \
+    python3 - "$mount_c/staged-append.bin" <<'PY_STAGED_READ'
+import os
+import signal
+import sys
+
+signal.alarm(60)
+expected = b"p" * (20 * 1024 * 1024) + b"t" * (1024 * 1024)
+assert os.stat(sys.argv[1]).st_size == len(expected)
+with open(sys.argv[1], "rb") as f:
+    assert f.read() == expected
+PY_STAGED_READ
+  check_cmd "unmount staged append restore" unmount_layer_mount
+  check_cmd "staged append mount log clean" audit_mount_log "$log_c"
 
   fuse_commit_out=$(drive9_retry fs layer commit "tag:fuse_run=$ts")
   case "$fuse_commit_out" in

@@ -64,39 +64,17 @@ func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []
 // Caller holds fh.mu; Release may drop it while waiting for another transfer.
 func (fs *Dat9FS) flushLayerHandleLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
 	size := fh.Dirty.Size()
-	// An inherited best-effort handle lock may only be a no-op after a
-	// timeout. Reacquire a proven lock before the upload/cache transaction;
-	// the mutation check below rejects writes superseded in this gap.
-	fs.releaseHandleRemoteCommitPathLocked(fh)
-	var unlockRemoteCommit func()
+	unlockRemoteCommit, err := fs.lockLayerCommitPathLocked(fh)
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+	defer unlockRemoteCommit()
 	if fh.releasing {
-		// Release has no error reply to the application. Keep ownership of
-		// the dirty buffer until the current transfer gives up the path.
-		// Its completion may need fh.mu, so never hold that lock while waiting.
-		for {
-			path := fh.Path
-			fh.Unlock()
-			unlockRemoteCommit = fs.lockRemoteCommitPath(path)
-			fh.Lock()
-			if path == fh.Path {
-				break
-			}
-			unlockRemoteCommit()
-		}
 		// Waiting for another transfer must not consume our upload budget.
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout(size))
 		defer cancel()
-	} else if fs.opts.RemoteCommitWaitTimeout <= 0 {
-		unlockRemoteCommit = fs.lockRemoteCommitPath(fh.Path)
-	} else {
-		var locked bool
-		unlockRemoteCommit, locked = fs.lockRemoteCommitPathTimeout(fh.Path, fs.opts.RemoteCommitWaitTimeout)
-		if !locked {
-			return gofuse.Status(syscall.EAGAIN)
-		}
 	}
-	defer unlockRemoteCommit()
 	if fh.Unlinked {
 		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
@@ -169,4 +147,33 @@ func (fs *Dat9FS) flushLayerHandleLocked(ctx context.Context, fh *FileHandle) go
 		}
 	}
 	return gofuse.OK
+}
+
+// lockLayerCommitPathLocked returns a proven path fence with fh.mu held.
+// Drop fh.mu while waiting: the transfer owning the path may need it to finish.
+func (fs *Dat9FS) lockLayerCommitPathLocked(fh *FileHandle) (func(), error) {
+	// An inherited best-effort handle lock may be a no-op after a timeout.
+	fs.releaseHandleRemoteCommitPathLocked(fh)
+	for {
+		path := fh.Path
+		wait := fs.opts.RemoteCommitWaitTimeout
+		unbounded := fh.releasing || wait <= 0
+		fh.Unlock()
+		var unlock func()
+		locked := true
+		if unbounded {
+			// Release has no error reply: retain ownership until the lock is free.
+			unlock = fs.lockRemoteCommitPath(path)
+		} else {
+			unlock, locked = fs.lockRemoteCommitPathTimeout(path, wait)
+		}
+		fh.Lock()
+		if !locked {
+			return nil, syscall.EAGAIN
+		}
+		if path == fh.Path {
+			return unlock, nil
+		}
+		unlock()
+	}
 }

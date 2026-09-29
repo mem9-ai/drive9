@@ -310,7 +310,29 @@ func (fs *Dat9FS) commitLayerShadowLocked(ctx context.Context, fh *FileHandle, s
 		return fmt.Errorf("missing shadow for %s", fh.Path)
 	}
 	gvisorCompat := fs.gvisorCompatibilityEnabled()
-	pathLocked = pathLocked || fh.RemoteCommitUnlock != nil
+	if !pathLocked {
+		unlock, err := fs.lockLayerCommitPathLocked(fh)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
+	if fh.Unlinked {
+		fs.cancelUnlinkedRemotePublishLocked(fh)
+		return nil
+	}
+	if fs.discardSupersededMutationLocked(fh) {
+		fs.removeHandleOwnedStagingLocked(fh)
+		return nil
+	}
+	// A duplicate descriptor can append after an earlier Flush staged metadata.
+	// Publish the current size and shadow source under the upload fence before
+	// binding the generation that onCommitSuccess will acknowledge as clean.
+	if fs.pendingIndex != nil {
+		if err := fs.stageShadowLocked(fh, true); err != nil {
+			return err
+		}
+	}
 	handlePath := fh.Path
 	handleIno := fh.Ino
 	mutationSeq := fh.DirtySeq
@@ -334,12 +356,7 @@ func (fs *Dat9FS) commitLayerShadowLocked(ctx context.Context, fh *FileHandle, s
 	}
 	fs.bindCommitEntryToHandleLocked(entry, fh, payloadBaseRev)
 	fh.Unlock()
-	var err error
-	if pathLocked {
-		err = fs.commitQueue.commitNowPathLocked(ctx, entry)
-	} else {
-		err = fs.commitQueue.CommitNow(ctx, entry)
-	}
+	err := fs.commitQueue.commitNowPathLocked(ctx, entry)
 	fh.Lock()
 	if err != nil {
 		return err
