@@ -596,7 +596,6 @@ func Mount(opts *MountOptions) (err error) {
 				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {
 					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
 				}
-				cq.RecoverPending()
 				if opts.LayerRef != "" {
 					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
 						closeFailedMountStaging(dat9fs)
@@ -604,6 +603,7 @@ func Mount(opts *MountOptions) (err error) {
 					}
 					layerEventWatcherStop = StartLayerEventWatcher(dat9fs, c, opts, shadowStore, pendingIdx)
 				}
+				cq.RecoverPending()
 			}
 			if gvisorWriteBackRequiresCommitQueue(opts, wbCache, dat9fs.commitQueue) {
 				closeFailedMountStaging(dat9fs)
@@ -807,7 +807,8 @@ func Mount(opts *MountOptions) (err error) {
 		}()
 	}
 
-	shutdown := newMountShutdown(stopWatchers, dat9fs.FlushAll)
+	var shutdownErr error
+	shutdown := newMountShutdown(stopWatchers, func() { shutdownErr = dat9fs.flushAll() })
 	var unmountRequested atomic.Bool
 	mountStartedAt := time.Now()
 
@@ -970,8 +971,7 @@ func Mount(opts *MountOptions) (err error) {
 		At:           time.Now().UTC(),
 	}
 
-	switch reason {
-	case ExitReasonSignal, ExitReasonExternalUnmount:
+	if reason == ExitReasonSignal || reason == ExitReasonExternalUnmount {
 		// Do not exit while the kernel mount-table entry is still listed:
 		// a lazy (MNT_DETACH) detach leaves the entry in place until the
 		// mount's last reference is reaped, and callers treat mount-process
@@ -981,6 +981,19 @@ func Mount(opts *MountOptions) (err error) {
 			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=mount_entry_linger mountpoint=%s timeout=%s\n",
 				opts.MountPoint, mountExitEntryClearTimeout)
 		}
+	}
+
+	if shutdownErr != nil {
+		exitRec.Reason = "drain_failed"
+		exitRec.Detail = shutdownErr.Error()
+		exitRec.Code = ExitForceQuit
+		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
+		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=%d reason=drain_failed mountpoint=%s\n", ExitForceQuit, opts.MountPoint)
+		return newMountExit(ExitForceQuit, MountExitReason("drain_failed"), "shutdown incomplete; local recovery state preserved", shutdownErr)
+	}
+
+	switch reason {
+	case ExitReasonSignal, ExitReasonExternalUnmount:
 		exitRec.Code = ExitOK
 		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
 		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=serve_end reason=%s mountpoint=%s pid=%d uptime=%s\n",
@@ -1348,233 +1361,6 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	}
 	if err := validateLocalPolicyPatterns(opts.LocalOnlyPatterns, opts.LocalGitignoreAwarePatterns, opts.RemoteOnlyPatterns); err != nil {
 		return fmt.Errorf("mount: %w", err)
-	}
-	return nil
-}
-
-func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS) error {
-	if c == nil || opts == nil || shadows == nil || pending == nil || strings.TrimSpace(opts.LayerRef) == "" {
-		return nil
-	}
-	var maxSeq int64
-	hasCheckpoint := false
-	if strings.TrimSpace(opts.CheckpointRef) != "" {
-		checkpoint, err := c.GetFSLayerCheckpoint(ctx, opts.CheckpointRef)
-		if err != nil {
-			return fmt.Errorf("read fs layer checkpoint %s: %w", opts.CheckpointRef, err)
-		}
-		if checkpoint.LayerID != opts.LayerRef {
-			return fmt.Errorf("checkpoint %s belongs to layer %s, want %s", opts.CheckpointRef, checkpoint.LayerID, opts.LayerRef)
-		}
-		maxSeq = checkpoint.DurableSeq
-		hasCheckpoint = true
-	}
-	var entries []client.FSLayerEntry
-	var err error
-	if hasCheckpoint {
-		entries, err = c.ReplayFSLayerAtSeq(ctx, opts.LayerRef, maxSeq)
-	} else {
-		entries, err = c.ReplayFSLayer(ctx, opts.LayerRef)
-	}
-	if err != nil {
-		return err
-	}
-	restoredUpserts := make(map[string]struct{})
-	for _, entry := range entries {
-		localPath, ok := mountpath.ToLocal(opts.RemoteRoot, entry.Path)
-		if !ok {
-			continue
-		}
-		switch entry.Op {
-		case "whiteout":
-			if fs != nil {
-				fs.markLayerWhiteout(localPath)
-			}
-			continue
-		case "mkdir":
-			if fs != nil {
-				fs.markLayerDir(localPath, entry.Mode)
-			}
-			continue
-		case "chmod":
-			if pending != nil {
-				if err := pending.UpdateMode(localPath, entry.Mode); err != nil {
-					return fmt.Errorf("restore fs layer chmod pending %s: %w", localPath, err)
-				}
-			}
-			if fs != nil {
-				switch entry.Kind {
-				case "file":
-					fs.markLayerFileMode(localPath, entry.Mode)
-				case "dir":
-					fs.markLayerDir(localPath, entry.Mode)
-				case "symlink":
-					if target, existingMode, ok := fs.layerSymlink(localPath); ok {
-						nextMode := (existingMode &^ uint32(0o777)) | (entry.Mode & 0o777)
-						if nextMode&uint32(syscall.S_IFMT) == 0 {
-							nextMode |= uint32(syscall.S_IFLNK)
-						}
-						fs.markLayerSymlink(localPath, target, nextMode)
-					}
-				}
-			}
-			continue
-		case "rename":
-			if err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)); err != nil {
-				return err
-			}
-			continue
-		case "symlink":
-			fullEntry := &entry
-			if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
-				fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq))
-				if err != nil {
-					return fmt.Errorf("restore fs layer symlink entry %s: %w", entry.Path, err)
-				}
-				fullEntry = fetched
-			}
-			target := strings.TrimSpace(fullEntry.ContentText)
-			if target == "" && len(fullEntry.Content) > 0 {
-				target = string(fullEntry.Content)
-			}
-			if target == "" {
-				return fmt.Errorf("restore fs layer symlink entry %s: missing target", entry.Path)
-			}
-			if fs != nil {
-				fs.markLayerSymlink(localPath, target, entry.Mode)
-			}
-			continue
-		}
-		if entry.Op != "upsert" || entry.Kind != "file" {
-			continue
-		}
-		if _, ok := pending.GetMeta(localPath); ok {
-			if _, restored := restoredUpserts[localPath]; !restored {
-				continue
-			}
-		}
-		entryMaxSeq := layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)
-		fullEntry, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, entryMaxSeq)
-		if err != nil {
-			return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
-		}
-		var sizeBytes int64
-		if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
-			rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, entryMaxSeq)
-			if err != nil {
-				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
-			}
-			n, writeErr := shadows.WriteStream(localPath, rc, fullEntry.BaseRevision)
-			closeErr := rc.Close()
-			if writeErr != nil {
-				return fmt.Errorf("restore fs layer shadow %s: %w", localPath, writeErr)
-			}
-			if closeErr != nil {
-				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, closeErr)
-			}
-			sizeBytes = n
-		} else {
-			content := fullEntry.Content
-			if err := shadows.WriteFull(localPath, content, fullEntry.BaseRevision); err != nil {
-				return fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
-			}
-			sizeBytes = int64(len(content))
-		}
-		if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
-			return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
-		}
-		if _, err := pending.PutWithBaseRevAndMode(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
-			return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
-		}
-		if fs != nil {
-			if fullEntry.Mode != 0 {
-				fs.markLayerFileMode(localPath, fullEntry.Mode)
-			} else {
-				fs.markLayerFile(localPath)
-			}
-		}
-		restoredUpserts[localPath] = struct{}{}
-	}
-	return nil
-}
-
-func layerEntryFetchMaxSeq(entry *client.FSLayerEntry, hasCheckpoint bool, checkpointMaxSeq int64) *int64 {
-	// Checkpoint restores must stay pinned to the checkpoint tip. Ancestor
-	// rows can carry a larger entry_seq than the child tip; using that seq
-	// against the child layer would leak later child writes into the view.
-	if hasCheckpoint {
-		seq := checkpointMaxSeq
-		return &seq
-	}
-	if entry != nil && entry.EntrySeq > 0 {
-		seq := entry.EntrySeq
-		return &seq
-	}
-	return nil
-}
-
-func fsLayerMountStateAllowed(state string, checkpoint bool) bool {
-	if checkpoint {
-		switch state {
-		case "active", "sealed", "committed":
-			return true
-		default:
-			return false
-		}
-	}
-	return state == "active"
-}
-
-func getLayerEntryForRestore(ctx context.Context, c *client.Client, layerID, path string, maxSeq *int64) (*client.FSLayerEntry, error) {
-	if maxSeq != nil {
-		return c.GetFSLayerEntryAtSeq(ctx, layerID, path, *maxSeq)
-	}
-	return c.GetFSLayerEntry(ctx, layerID, path)
-}
-
-func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry, maxSeq *int64) error {
-	if entry == nil {
-		return nil
-	}
-	fullEntry := entry
-	if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
-		fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, maxSeq)
-		if err != nil {
-			return fmt.Errorf("restore fs layer rename entry %s: %w", entry.Path, err)
-		}
-		fullEntry = fetched
-	}
-	targetRemote := fullEntry.ContentText
-	if targetRemote == "" && len(fullEntry.Content) > 0 {
-		targetRemote = string(fullEntry.Content)
-	}
-	if targetRemote == "" {
-		return fmt.Errorf("restore fs layer rename entry %s: missing target", entry.Path)
-	}
-	if fs != nil {
-		fs.markLayerWhiteout(oldLocalPath)
-	}
-	newLocalPath, ok := mountpath.ToLocal(opts.RemoteRoot, targetRemote)
-	if !ok {
-		return nil
-	}
-	movedShadow := shadows.Rename(oldLocalPath, newLocalPath)
-	movedPending := pending.RenamePending(oldLocalPath, newLocalPath)
-	if movedShadow || movedPending {
-		return nil
-	}
-	if pending.HasPending(newLocalPath) {
-		return nil
-	}
-	data, err := c.ReadCtx(ctx, fullEntry.Path)
-	if err != nil {
-		return fmt.Errorf("restore fs layer renamed source %s: %w", fullEntry.Path, err)
-	}
-	if err := shadows.WriteFull(newLocalPath, data, 0); err != nil {
-		return fmt.Errorf("restore fs layer renamed shadow %s: %w", newLocalPath, err)
-	}
-	if _, err := pending.PutWithBaseRevAndMode(newLocalPath, int64(len(data)), PendingOverwrite, 0, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
-		return fmt.Errorf("restore fs layer renamed pending %s: %w", newLocalPath, err)
 	}
 	return nil
 }

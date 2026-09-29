@@ -21,11 +21,12 @@ import (
 // replacement Put's new .meta must never be deleted by a stale owner's
 // remove that already passed its generation check in memory.
 type PendingIndex struct {
-	mu        sync.RWMutex
-	items     map[string]*WriteBackMeta // path → metadata
-	dir       string                    // directory for .meta persistence
-	nextGen   atomic.Uint64
-	pathLocks map[string]*pendingPathLock
+	layerPublicationMu sync.RWMutex // rollback waits for publishers before dropping caches
+	mu                 sync.RWMutex
+	items              map[string]*WriteBackMeta // path → metadata
+	dir                string                    // directory for .meta persistence
+	nextGen            atomic.Uint64
+	pathLocks          map[string]*pendingPathLock
 	// journal, when set, is the durable publication channel for new pending
 	// entries: one group-committed WAL fsync replaces the per-entry
 	// atomicWrite (tmp fsync + dir fsync). Callers must have made the entry's
@@ -38,6 +39,7 @@ type PendingIndex struct {
 	// background SyncLoop / fsync(2) / umount make it durable.
 	journalSyncOnPut bool
 	shadows          *ShadowStore // wired once before staging/recovery
+	layerAbandoned   bool         // prevents late publications from reviving a rolled-back overlay
 }
 
 // SetJournal wires the WAL used for durable pending-meta publication. It is
@@ -195,11 +197,23 @@ func (idx *PendingIndex) PutWithBaseRevAndMode(remotePath string, size int64, ki
 	return idx.PutWithBaseRevAndModeAndLineage(remotePath, size, kind, baseRev, mode, hasMode, "", "", false)
 }
 
+// PutLayerCache publishes content already persisted in a Layer. It remains
+// visible through the overlay index, but does not require another upload.
+func (idx *PendingIndex) PutLayerCache(remotePath string, size int64, baseRev int64, mode uint32, hasMode bool, identity LayerCacheIdentity) (uint64, error) {
+	return idx.putInternal(WriteBackMeta{Path: remotePath, Size: size, Kind: PendingOverwrite, BaseRev: baseRev, Mode: mode, HasMode: hasMode, LayerClean: true, LayerID: identity.LayerID, LayerEntrySeq: identity.EntrySeq})
+}
+
+// putLayerCacheIfAbsent never replaces a publication that arrived while a
+// chmod with no initial metadata was reading or uploading its payload.
+func (idx *PendingIndex) putLayerCacheIfAbsent(path string, size, baseRev int64, mode uint32, hasMode bool, identity LayerCacheIdentity) (uint64, error) {
+	return idx.publishMeta(&WriteBackMeta{Path: path, Size: size, BaseRev: baseRev, Kind: PendingOverwrite, LayerClean: true, LayerID: identity.LayerID, LayerEntrySeq: identity.EntrySeq, Mode: mode & posixPermissionModeMask, HasMode: hasMode}, true)
+}
+
 // PutWithBaseRevAndModeAndLineage attaches process-local causal identity to
 // the durable metadata. The IDs are intentionally excluded from JSON; empty
 // lineage is accepted but can never authorize a growth rebase.
 func (idx *PendingIndex) PutWithBaseRevAndModeAndLineage(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, error) {
-	return idx.putInternal(remotePath, size, kind, baseRev, false, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, liveAncestors)
+	return idx.putInternal(WriteBackMeta{Path: remotePath, Size: size, Kind: kind, BaseRev: baseRev, Mode: mode, HasMode: hasMode, SnapshotID: snapshotID, ParentSnapshotID: parentSnapshotID, lineageTrusted: lineageTrusted, liveAncestors: liveAncestors})
 }
 
 // PutShadowSpill is like PutWithBaseRev but marks the entry as ShadowSpill
@@ -218,38 +232,55 @@ func (idx *PendingIndex) PutShadowSpillWithMode(remotePath string, size int64, k
 // PutShadowSpillWithModeAndLineage is the spill equivalent of
 // PutWithBaseRevAndModeAndLineage.
 func (idx *PendingIndex) PutShadowSpillWithModeAndLineage(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, error) {
-	return idx.putInternal(remotePath, size, kind, baseRev, true, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, liveAncestors)
+	return idx.putInternal(WriteBackMeta{Path: remotePath, Size: size, Kind: kind, BaseRev: baseRev, Mode: mode, HasMode: hasMode, SnapshotID: snapshotID, ParentSnapshotID: parentSnapshotID, lineageTrusted: lineageTrusted, liveAncestors: liveAncestors, ShadowSpill: true})
 }
 
-func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors []string) (uint64, error) {
-	// Hold the per-path lock across the disk write AND the in-memory publish
-	// so a generation-checked removal of a stale entry cannot delete this
-	// fresh .meta after already passing its in-memory check.
+func (idx *PendingIndex) putInternal(meta WriteBackMeta) (uint64, error) {
+	meta.Mode &= posixPermissionModeMask
+	meta.liveAncestors = append([]string(nil), meta.liveAncestors...)
+	return idx.publishMeta(&meta, false)
+}
+
+// publishMeta serializes a publication, including an optional absence check,
+// with acknowledgements and rollback cache removal.
+func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (uint64, error) {
+	idx.layerPublicationMu.RLock()
+	defer idx.layerPublicationMu.RUnlock()
+	remotePath := meta.Path
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
-
-	gen := idx.nextGen.Add(1)
-	meta := &WriteBackMeta{
-		Path:             remotePath,
-		Size:             size,
-		Mtime:            time.Now(),
-		CreatedAt:        time.Now(),
-		Generation:       gen,
-		Kind:             kind,
-		BaseRev:          baseRev,
-		ShadowSpill:      shadowSpill,
-		Mode:             mode & posixPermissionModeMask,
-		HasMode:          hasMode,
-		SnapshotID:       snapshotID,
-		ParentSnapshotID: parentSnapshotID,
-		lineageTrusted:   lineageTrusted,
-		liveAncestors:    append([]string(nil), liveAncestors...),
+	idx.mu.RLock()
+	abandoned := idx.layerAbandoned
+	previous, exists := idx.items[remotePath]
+	if exists && !meta.LayerClean {
+		// Dirty staging retains the Layer snapshot it was based on. Replay
+		// needs this identity to detect an external update after Flush.
+		meta.LayerID, meta.LayerEntrySeq = previous.LayerID, previous.LayerEntrySeq
+		// Re-staging is not conflict resolution. In particular, a first
+		// write can be conflicted without ever having had a Layer identity.
+		if previous.Kind == PendingConflict {
+			meta.Kind = PendingConflict
+		}
 	}
+	idx.mu.RUnlock()
+	if onlyIfAbsent && exists {
+		return 0, nil
+	}
+	if abandoned {
+		if meta.LayerClean {
+			return 0, errLayerRolledBack
+		}
+		meta.Kind = PendingConflict
+	}
+	meta.Mtime = time.Now()
+	meta.CreatedAt = meta.Mtime
+	gen := idx.nextGen.Add(1)
+	meta.Generation = gen
 
 	idx.mu.RLock()
 	shadows := idx.shadows
 	idx.mu.RUnlock()
-	if shadows != nil && kind != PendingChmod {
+	if shadows != nil && meta.Kind != PendingChmod {
 		meta.shadowSource = shadowReadSource{shadows, shadows.ActiveGeneration(remotePath)}
 	}
 
@@ -292,6 +323,16 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 	idx.mu.Unlock()
 
 	return gen, nil
+}
+
+// abandonLayer fences clean publishers already in progress and makes future
+// dirty publications conflicts instead of reviving the abandoned Layer.
+func (idx *PendingIndex) abandonLayer() {
+	idx.layerPublicationMu.Lock()
+	defer idx.layerPublicationMu.Unlock()
+	idx.mu.Lock()
+	idx.layerAbandoned = true
+	idx.mu.Unlock()
 }
 
 // publishRecoveredMeta installs a pending entry unmarshaled from a WAL frame
@@ -523,6 +564,20 @@ func (idx *PendingIndex) ListPendingPaths() map[string]struct{} {
 	return result
 }
 
+// ListUncommittedPaths excludes clean Layer overlays without hiding conflicts
+// or legacy records whose durability is unknown.
+func (idx *PendingIndex) ListUncommittedPaths() map[string]struct{} {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	paths := make(map[string]struct{})
+	for path, meta := range idx.items {
+		if !meta.LayerClean || meta.Kind == PendingConflict {
+			paths[path] = struct{}{}
+		}
+	}
+	return paths
+}
+
 // ConflictSummary reports pending entries preserved for manual recovery after
 // terminal commit failure.
 func (idx *PendingIndex) ConflictSummary() (count int, bytes int64, firstPath string) {
@@ -585,24 +640,35 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 	updated := cloneWriteBackMeta(meta)
 	updated.Mode = mode & posixPermissionModeMask
 	updated.HasMode = true
+	updated.LayerClean = false
 	updated.Generation = idx.nextGen.Add(1)
+	updated.Mtime = time.Now()
 
 	metaBytes, err := json.Marshal(&updated)
 	if err != nil {
 		return fmt.Errorf("pending index marshal mode: %w", err)
 	}
-	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
-	if err := atomicWrite(metaPath, metaBytes); err != nil {
-		return fmt.Errorf("pending index update mode: %w", err)
+	if idx.journal != nil {
+		if err := idx.journal.Append(JournalEntry{Op: JournalPendingMeta, Path: remotePath, Meta: metaBytes}); err != nil {
+			return fmt.Errorf("pending index journal mode: %w", err)
+		}
+		if err := idx.journal.FsyncShared(); err != nil {
+			return fmt.Errorf("pending index sync mode: %w", err)
+		}
+	} else {
+		metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
+		if err := atomicWrite(metaPath, metaBytes); err != nil {
+			return fmt.Errorf("pending index update mode: %w", err)
+		}
 	}
 	cp := updated
 	idx.items[remotePath] = &cp
 	return nil
 }
 
-// MarkCommitted keeps the pending entry as a local overlay data source but no
-// longer treats it as never-persisted new data.
-func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) error {
+// MarkLayerCommittedIfGeneration marks only the uploaded publication as a
+// durable overlay. An older completion cannot acknowledge a newer local edit.
+func (idx *PendingIndex) MarkLayerCommittedIfGeneration(remotePath string, generation uint64, committedRev int64, mode uint32, hasMode bool, identity LayerCacheIdentity) error {
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
 
@@ -610,24 +676,41 @@ func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) er
 	defer idx.mu.Unlock()
 
 	meta, ok := idx.items[remotePath]
-	if !ok {
+	if !ok || generation == 0 || meta.Generation != generation || idx.layerAbandoned || meta.Kind == PendingConflict {
 		return nil
 	}
 	updated := cloneWriteBackMeta(meta)
 	updated.Kind = PendingOverwrite
+	updated.LayerClean = true
+	updated.LayerID = identity.LayerID
+	updated.LayerEntrySeq = identity.EntrySeq
+	if hasMode {
+		updated.Mode = mode & posixPermissionModeMask
+		updated.HasMode = true
+	}
 	if committedRev > 0 {
 		updated.BaseRev = committedRev
 	}
-	updated.Generation = idx.nextGen.Add(1)
 	updated.Mtime = time.Now()
 
 	metaBytes, err := json.Marshal(&updated)
 	if err != nil {
 		return fmt.Errorf("pending index marshal committed: %w", err)
 	}
-	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
-	if err := atomicWrite(metaPath, metaBytes); err != nil {
-		return fmt.Errorf("pending index mark committed: %w", err)
+	if idx.journal != nil {
+		// Publish under the same path lock as Put. A path-only commit marker
+		// could otherwise hide a newer WAL publication after a crash.
+		if err := idx.journal.Append(JournalEntry{Op: JournalPendingMeta, Path: remotePath, Meta: metaBytes}); err != nil {
+			return fmt.Errorf("pending index mark layer committed: %w", err)
+		}
+		if err := idx.journal.FsyncShared(); err != nil {
+			return fmt.Errorf("pending index sync layer commit: %w", err)
+		}
+	} else {
+		metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
+		if err := atomicWrite(metaPath, metaBytes); err != nil {
+			return fmt.Errorf("pending index mark layer committed: %w", err)
+		}
 	}
 	cp := updated
 	idx.items[remotePath] = &cp
@@ -721,4 +804,56 @@ func (idx *PendingIndex) Count() int {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return len(idx.items)
+}
+
+// discardLayerCache removes only the captured clean publication. The WAL
+// tombstone is serialized with Put, so restart cannot resurrect the cache or
+// accidentally suppress a newer dirty publication. Newer shadow bytes survive.
+func (idx *PendingIndex) discardLayerCache(path string, generation uint64, shadows *ShadowStore) error {
+	pl := idx.acquirePathLock(path)
+	defer idx.releasePathLock(path, pl)
+	idx.mu.RLock()
+	meta, ok := idx.items[path]
+	journal := idx.journal
+	if !ok || meta.Generation != generation || !meta.LayerClean || meta.Kind == PendingConflict {
+		idx.mu.RUnlock()
+		return nil
+	}
+	shadowGen := meta.shadowSource.generation
+	idx.mu.RUnlock()
+	if shadows != nil && shadowGen == 0 {
+		shadowGen = shadows.EnsureActiveGeneration(path)
+	}
+	if journal != nil {
+		if err := journal.Append(JournalEntry{Op: JournalUnlink, Path: path}); err != nil {
+			return err
+		}
+		if err := journal.FsyncShared(); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(filepath.Join(idx.dir, hashPath(path)+".meta")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	idx.mu.Lock()
+	delete(idx.items, path)
+	idx.mu.Unlock()
+	if shadows != nil && shadowGen != 0 {
+		shadows.RemoveIfGeneration(path, shadowGen)
+	}
+	return nil
+}
+
+// uncommittedGenerations snapshots publication identities as well as paths:
+// replacing one unsent write with another is progress, even at the same path.
+func (idx *PendingIndex) uncommittedGenerations() map[string]uint64 {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	result := make(map[string]uint64)
+	for path, meta := range idx.items {
+		if !meta.LayerClean || meta.Kind == PendingConflict {
+			result[path] = meta.Generation
+		}
+	}
+	return result
 }

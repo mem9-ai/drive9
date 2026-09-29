@@ -58,6 +58,7 @@ type CommitEntry struct {
 	ShadowSpill          bool // true when data is only in shadow file (auto-resolve would OOM)
 	Mode                 uint32
 	HasMode              bool
+	LayerEntry           LayerCacheIdentity // server identity returned by this Layer upload
 	CoalesceZeroTruncate bool
 	// PayloadBaseRev is the revision that the local bytes were derived from.
 	// It is intentionally separate from BaseRev (the CAS revision sent to the
@@ -683,6 +684,65 @@ func (cq *CommitQueue) DrainAll() {
 	cq.wg.Wait()
 }
 
+// recoveredEntry classifies and fences a recovered publication identically
+// for startup and late shutdown recovery. Unusable bytes become conflicts.
+func (cq *CommitQueue) recoveredEntry(path string) *CommitEntry {
+	meta, ok := cq.index.GetMeta(path)
+	if !ok || meta.LayerClean {
+		return nil
+	}
+	if cq.shadows != nil && !cq.shadows.Has(path) {
+		// Shadow file missing — prune orphaned pending index entry so
+		// Lookup/GetAttr don't serve stale metadata.
+		safeLogPrintf("commit queue: pruning orphaned pending entry for %s (shadow missing)", path)
+		cq.index.RemoveIfGeneration(path, meta.Generation)
+		return nil
+	}
+	shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
+	if meta.Kind == PendingConflict {
+		safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
+		return nil
+	}
+	if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 && cq.layerRefSnapshot() == "" {
+		safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
+		return nil
+	}
+	// The shadow file is the data actually uploaded; its size is
+	// authoritative. Meta size can be stale (memory-only updates, or a
+	// WAL-resurrected entry from an older fsync) and would mis-route the
+	// direct-PUT vs multipart decision in uploadEntry.
+	size := meta.Size
+	if cq.shadows != nil {
+		if shadowSize := cq.shadows.Size(path); shadowSize >= 0 {
+			size = shadowSize
+		}
+	}
+	entry := &CommitEntry{
+		Path:              path,
+		BaseRev:           meta.BaseRev,
+		Size:              size,
+		Kind:              meta.Kind,
+		ShadowSpill:       meta.ShadowSpill,
+		Mode:              meta.Mode,
+		HasMode:           meta.HasMode,
+		PayloadBaseRev:    meta.BaseRev,
+		PayloadBaseRevSet: true,
+		PendingIndexGen:   meta.Generation,
+	}
+	if cq.shadows != nil {
+		entry.ShadowGen = shadowGen
+		if entry.ShadowGen == 0 {
+			safeLogPrintf("commit queue: skipping recovered pending entry for %s (shadow missing, short, or metadata replaced)", path)
+			if _, err := cq.index.MarkConflictIfGeneration(path, meta.Generation); err != nil {
+				safeLogPrintf("commit queue: mark recovered pending conflict failed for %s: %v", path, err)
+			}
+			return nil
+		}
+	}
+	entry.recovered = true
+	return entry
+}
+
 // RecoverPending re-enqueues any locally persisted pending commits on startup.
 func (cq *CommitQueue) RecoverPending() {
 	if cq.index == nil {
@@ -693,60 +753,11 @@ func (cq *CommitQueue) RecoverPending() {
 	if cq.shadows != nil {
 		cq.shadows.RecoverPendingBytes()
 	}
-	for path := range cq.index.ListPendingPaths() {
-		meta, ok := cq.index.GetMeta(path)
-		if !ok {
+	for path := range cq.index.ListUncommittedPaths() {
+		entry := cq.recoveredEntry(path)
+		if entry == nil {
 			continue
 		}
-		if cq.shadows != nil && !cq.shadows.Has(path) {
-			// Shadow file missing — prune orphaned pending index entry so
-			// Lookup/GetAttr don't serve stale metadata.
-			safeLogPrintf("commit queue: pruning orphaned pending entry for %s (shadow missing)", path)
-			cq.index.Remove(path)
-			continue
-		}
-		shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
-		if meta.Kind == PendingConflict {
-			safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
-			continue
-		}
-		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
-			safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
-			continue
-		}
-		// The shadow file is the data actually uploaded; its size is
-		// authoritative. Meta size can be stale (memory-only updates, or a
-		// WAL-resurrected entry from an older fsync) and would mis-route the
-		// direct-PUT vs multipart decision in uploadEntry.
-		size := meta.Size
-		if cq.shadows != nil {
-			if shadowSize := cq.shadows.Size(path); shadowSize >= 0 {
-				size = shadowSize
-			}
-		}
-		entry := &CommitEntry{
-			Path:              path,
-			BaseRev:           meta.BaseRev,
-			Size:              size,
-			Kind:              meta.Kind,
-			ShadowSpill:       meta.ShadowSpill,
-			Mode:              meta.Mode,
-			HasMode:           meta.HasMode,
-			PayloadBaseRev:    meta.BaseRev,
-			PayloadBaseRevSet: true,
-			PendingIndexGen:   meta.Generation,
-		}
-		if cq.shadows != nil {
-			entry.ShadowGen = shadowGen
-			if entry.ShadowGen == 0 {
-				safeLogPrintf("commit queue: skipping recovered pending entry for %s (shadow missing, short, or metadata replaced)", path)
-				if _, err := cq.index.MarkConflictIfGeneration(path, meta.Generation); err != nil {
-					safeLogPrintf("commit queue: mark recovered pending conflict failed for %s: %v", path, err)
-				}
-				continue
-			}
-		}
-		entry.recovered = true
 		if err := cq.Enqueue(entry); err != nil {
 			safeLogPrintf("commit queue: recover enqueue failed for %s: %v", path, err)
 		}
@@ -2053,47 +2064,13 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 		return 0
 	}
 	committed := 0
-	for path := range cq.index.ListPendingPaths() {
-		meta, ok := cq.index.GetMeta(path)
-		if !ok {
+	for path := range cq.index.ListUncommittedPaths() {
+		if ctx.Err() != nil {
+			break
+		}
+		entry := cq.recoveredEntry(path)
+		if entry == nil {
 			continue
-		}
-		if cq.shadows != nil && !cq.shadows.Has(path) {
-			safeLogPrintf("commit queue: pruning orphaned pending entry for %s (shadow missing)", path)
-			cq.index.Remove(path)
-			continue
-		}
-		shadowGen := cq.index.recoverShadowSource(path, meta.Generation, cq.shadows)
-		if meta.Kind == PendingConflict {
-			continue
-		}
-		if meta.Kind == PendingOverwrite && meta.BaseRev <= 0 {
-			continue
-		}
-		size := meta.Size
-		if cq.shadows != nil {
-			if shadowSize := cq.shadows.Size(path); shadowSize >= 0 {
-				size = shadowSize
-			}
-		}
-		entry := &CommitEntry{
-			Path:              path,
-			BaseRev:           meta.BaseRev,
-			Size:              size,
-			Kind:              meta.Kind,
-			ShadowSpill:       meta.ShadowSpill,
-			Mode:              meta.Mode,
-			HasMode:           meta.HasMode,
-			PayloadBaseRev:    meta.BaseRev,
-			PayloadBaseRevSet: true,
-			PendingIndexGen:   meta.Generation,
-			recovered:         true,
-		}
-		if cq.shadows != nil {
-			entry.ShadowGen = shadowGen
-			if entry.ShadowGen == 0 {
-				continue
-			}
 		}
 		if err := cq.CommitNow(ctx, entry); err != nil {
 			safeLogPrintf("commit queue: late sync commit failed for %s: %v", path, err)
@@ -2348,12 +2325,21 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 }
 
 func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string) (int64, error) {
+	// The queue may have captured this generation before replay observed an
+	// external tip. Recheck under the upload fence, not only during recovery.
+	if cq.index != nil {
+		if meta, ok := cq.index.GetMeta(entry.Path); ok && meta.Kind == PendingConflict {
+			entry.DisableAutoResolveLWW = true
+			return 0, &client.StatusError{StatusCode: http.StatusConflict, Message: "local Layer publication conflicts with an observed remote tip"}
+		}
+	}
 	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return 0, err
 	}
 	// Read the main-namespace claim only after validation. Overlay upserts
 	// themselves do not advance main revisions or produce landed proofs.
-	expectedRevision := entry.BaseRev
+	// Layer entries use zero, not the base write API's -1 sentinel, for no claim.
+	expectedRevision := max(entry.BaseRev, 0)
 	if entry.Size > maxInlineLayerEntryBytes || entry.ShadowSpill {
 		fd, actualSize, release, err := cq.shadows.OpenIfGeneration(entry.Path, entry.ShadowGen)
 		if err != nil {
@@ -2365,7 +2351,10 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 			return 0, fmt.Errorf("layer entry %s size mismatch: metadata=%d actual=%d", entry.Path, entry.Size, actualSize)
 		}
 		start := time.Now()
-		_, err = cq.client.UploadFSLayerFile(ctx, layerRef, apiPath, fd, actualSize, expectedRevision, entry.Mode, entry.HasMode)
+		uploaded, err := cq.client.UploadFSLayerFile(ctx, layerRef, apiPath, fd, actualSize, expectedRevision, entry.Mode, entry.HasMode)
+		if err == nil {
+			entry.LayerEntry = layerCacheIdentity(uploaded, layerRef)
+		}
 		if cq.perf != nil {
 			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(actualSize))
 		}
@@ -2394,7 +2383,10 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 		req.Mode = entry.Mode & 0o777
 	}
 	start := time.Now()
-	_, err = cq.client.UpsertFSLayerEntry(ctx, layerRef, req)
+	uploaded, err := cq.client.UpsertFSLayerEntry(ctx, layerRef, req)
+	if err == nil {
+		entry.LayerEntry = layerCacheIdentity(uploaded, layerRef)
+	}
 	if cq.perf != nil {
 		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
 	}
@@ -2511,7 +2503,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 
 	// Write durable commit record BEFORE cleaning up local state so that
 	// crash recovery never re-uploads an already committed entry.
-	if cq.journal != nil {
+	if cq.journal != nil && layerRef == "" {
 		if err := cq.journal.Append(JournalEntry{
 			Op:   JournalCommit,
 			Path: entry.Path,
@@ -2543,7 +2535,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		}
 	}
 	if cq.index != nil && cq.layerRefSnapshot() != "" {
-		if err := cq.index.MarkCommitted(entry.Path, committedRev); err != nil {
+		if err := cq.index.MarkLayerCommittedIfGeneration(entry.Path, entry.PendingIndexGen, committedRev, entry.Mode, entry.HasMode, entry.LayerEntry); err != nil {
 			return err
 		}
 	}

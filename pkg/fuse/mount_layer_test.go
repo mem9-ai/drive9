@@ -113,7 +113,7 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	if !pending.HasPending("/a.txt") {
 		t.Fatal("a.txt pending metadata missing")
 	}
-	if meta, ok := pending.GetMeta("/a.txt"); !ok || meta.Kind != PendingOverwrite {
+	if meta, ok := pending.GetMeta("/a.txt"); !ok || meta.Kind != PendingOverwrite || !meta.LayerClean {
 		t.Fatalf("a.txt pending meta = %+v, want PendingOverwrite", meta)
 	}
 	if meta, ok := pending.GetMeta("/a.txt"); !ok || !meta.HasMode || meta.Mode != 0o600 {
@@ -882,8 +882,8 @@ func TestLayerSetAttrModeCoalescesPendingFileContent(t *testing.T) {
 		t.Fatalf("mode = %#o, want 0600", got.Mode)
 	}
 	meta, ok := pending.GetMeta("/new.txt")
-	if !ok || meta.Kind != PendingNew || !meta.HasMode || meta.Mode != 0o600 {
-		t.Fatalf("pending mode = %+v, want PendingNew 0600", meta)
+	if !ok || meta.Kind != PendingOverwrite || !meta.LayerClean || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("pending mode = %+v, want clean PendingOverwrite 0600", meta)
 	}
 	if mode, ok := fs.layerFileMode("/new.txt"); !ok || mode != 0o600 {
 		t.Fatalf("layer file mode = (%#o, %t), want 0600 true", mode, ok)
@@ -958,8 +958,8 @@ func TestLayerChmodCoalescesShadowFileWithoutPendingMeta(t *testing.T) {
 		t.Fatalf("mode = %#o, want 0600", got.Mode)
 	}
 	meta, ok := pending.GetMeta("/new.txt")
-	if !ok || meta.Kind != PendingNew || !meta.HasMode || meta.Mode != 0o600 {
-		t.Fatalf("pending mode = %+v, want PendingNew 0600", meta)
+	if !ok || meta.Kind != PendingOverwrite || !meta.LayerClean || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("pending mode = %+v, want clean PendingOverwrite 0600", meta)
 	}
 	if mode, ok := fs.layerFileMode("/new.txt"); !ok || mode != 0o600 {
 		t.Fatalf("layer file mode = (%#o, %t), want 0600 true", mode, ok)
@@ -1038,8 +1038,8 @@ func TestLayerChmodCoalescesExistingLayerUpsertContent(t *testing.T) {
 		t.Fatalf("mode = %#o, want 0600", got.Mode)
 	}
 	meta, ok := pending.GetMeta("/new.txt")
-	if !ok || meta.Kind != PendingNew || !meta.HasMode || meta.Mode != 0o600 {
-		t.Fatalf("pending mode = %+v, want PendingNew 0600", meta)
+	if !ok || meta.Kind != PendingOverwrite || !meta.LayerClean || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("pending mode = %+v, want clean PendingOverwrite 0600", meta)
 	}
 }
 
@@ -1065,14 +1065,14 @@ func TestLayerFileUpsertClearsStaleNamespaceState(t *testing.T) {
 		RemoteRoot: "/repo",
 	})
 	fs.markLayerSymlink("/file.txt", "old-target", symlinkMode())
-	if err := fs.upsertLayerFile(context.Background(), "/file.txt", []byte("file"), 0, 0o644, true); err != nil {
+	if _, err := fs.upsertLayerFile(context.Background(), "/file.txt", []byte("file"), 0, 0o644, true); err != nil {
 		t.Fatalf("upsertLayerFile over symlink: %v", err)
 	}
 	if _, _, ok := fs.layerSymlink("/file.txt"); ok {
 		t.Fatal("file upsert left stale layer symlink")
 	}
 	fs.markLayerWhiteout("/file.txt")
-	if err := fs.upsertLayerFile(context.Background(), "/file.txt", []byte("file2"), 0, 0o644, true); err != nil {
+	if _, err := fs.upsertLayerFile(context.Background(), "/file.txt", []byte("file2"), 0, 0o644, true); err != nil {
 		t.Fatalf("upsertLayerFile over whiteout: %v", err)
 	}
 	if fs.isLayerWhiteout("/file.txt") {

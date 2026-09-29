@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -33,6 +34,11 @@ func StartLayerEventWatcher(fs *Dat9FS, c *client.Client, opts *MountOptions, sh
 			case <-ticker.C:
 				nextSeq, err := refreshLayerEvents(ctx, c, opts, shadows, pending, fs, lastSeq)
 				if err != nil {
+					if errors.Is(err, errLayerReplayBusy) {
+						// Keep the cursor unchanged and retry after the writer
+						// releases its handle. Contention is not a failed refresh.
+						continue
+					}
 					fmt.Fprintf(os.Stderr, "drive9: fs layer refresh failed: %v\n", err)
 					continue
 				}
@@ -80,5 +86,8 @@ func refreshLayerEvents(ctx context.Context, c *client.Client, opts *MountOption
 	if err := restoreLayerEntries(ctx, c, opts, shadows, pending, fs); err != nil {
 		return since, err
 	}
+	// Existing handles and kernel pages must stop serving the old payload.
+	fs.resetMountView()
+	fs.markStatCacheUnverified()
 	return maxSeq, nil
 }

@@ -1235,7 +1235,8 @@ func TestGVisorCompatLayerShadowCommitPreservesConcurrentWrite(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{GVisorCompat: true, LayerRef: "layer-test"}
+	// Exercise the best-effort concurrent writer while the upload owns the fence.
+	opts := &MountOptions{GVisorCompat: true, LayerRef: "layer-test", RemoteCommitWaitTimeout: 10 * time.Millisecond}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
