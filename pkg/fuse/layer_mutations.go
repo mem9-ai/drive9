@@ -97,7 +97,7 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 	kind := fs.layerEntryKind(ctx, localPath)
 	if kind == "file" && fs.client != nil {
 		entry, err := fs.client.GetFSLayerEntry(ctx, fs.layerRef(), fs.remotePath(localPath))
-		if err == nil && entry != nil && entry.Op == "upsert" && entry.Kind == "file" {
+		if err == nil && entry != nil && entry.Op == "upsert" && entry.Kind == "file" && entry.StorageRef == "" && entry.StorageType != "s3" {
 			baseRev := entry.BaseRevision
 			identity, err := fs.upsertLayerFile(ctx, localPath, entry.Content, baseRev, mode, true)
 			if err != nil {
