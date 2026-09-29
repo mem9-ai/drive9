@@ -53,6 +53,13 @@ func (fs *Dat9FS) upsertLayerWhiteout(ctx context.Context, localPath string, kin
 }
 
 func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode uint32) error {
+	// Chmod can publish the retained shadow even with no live writer. It
+	// cannot resolve an observed conflict by overwriting the remote tip.
+	if fs.pendingIndex != nil {
+		if meta, ok := fs.pendingIndex.GetMeta(localPath); ok && meta.Kind == PendingConflict {
+			return syscall.EAGAIN
+		}
+	}
 	if fs.shadowStore != nil {
 		baseRev := int64(0)
 		hadPending := false

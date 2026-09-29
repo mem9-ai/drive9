@@ -2325,6 +2325,14 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 }
 
 func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string) (int64, error) {
+	// The queue may have captured this generation before replay observed an
+	// external tip. Recheck under the upload fence, not only during recovery.
+	if cq.index != nil {
+		if meta, ok := cq.index.GetMeta(entry.Path); ok && meta.Kind == PendingConflict {
+			entry.DisableAutoResolveLWW = true
+			return 0, &client.StatusError{StatusCode: http.StatusConflict, Message: "local Layer publication conflicts with an observed remote tip"}
+		}
+	}
 	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return 0, err
 	}

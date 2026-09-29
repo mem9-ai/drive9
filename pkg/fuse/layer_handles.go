@@ -64,7 +64,9 @@ func (fs *Dat9FS) preserveLayerReplayConflict(path string, tip client.FSLayerEnt
 		return true, pending.MarkConflict(path)
 	}
 	if exists && !meta.LayerClean {
-		if !unchanged && meta.LayerEntrySeq > 0 {
+		// No prior identity means the local snapshot had no Layer tip.
+		// An observed tip is still a divergence, even after the writer closed.
+		if !unchanged {
 			return true, pending.MarkConflict(path)
 		}
 		return true, nil

@@ -252,10 +252,12 @@ func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (ui
 	idx.mu.RLock()
 	abandoned := idx.layerAbandoned
 	previous, exists := idx.items[remotePath]
-	if exists && !meta.LayerClean && previous.LayerID != "" {
+	if exists && !meta.LayerClean {
 		// Dirty staging retains the Layer snapshot it was based on. Replay
 		// needs this identity to detect an external update after Flush.
 		meta.LayerID, meta.LayerEntrySeq = previous.LayerID, previous.LayerEntrySeq
+		// Re-staging is not conflict resolution. In particular, a first
+		// write can be conflicted without ever having had a Layer identity.
 		if previous.Kind == PendingConflict {
 			meta.Kind = PendingConflict
 		}
