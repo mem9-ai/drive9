@@ -2724,14 +2724,27 @@ func createInputMode(inputMode uint32) (uint32, bool) {
 	return mode, mode != defaultRegularFileMode
 }
 
-// modeForPendingHandle returns the mode that still needs to be committed to
-// the server. Callers must hold fh.mu unless the handle has not been published.
+// modeForPendingHandle returns the mode to include in the next publication.
+// Callers must hold fh.mu unless the handle has not been published.
 func (fs *Dat9FS) modeForPendingHandle(fh *FileHandle) (uint32, bool) {
 	if fh == nil {
 		return 0, false
 	}
 	if fh.HasPendingMode {
 		return fh.PendingMode & posixPermissionModeMask, true
+	}
+	// A Layer upsert replaces the complete entry. Omitting the mode after
+	// the first Flush would reset a previously committed 0600/0755 file to
+	// the server default on its next write (including shell redirection).
+	if fs.layerEnabled() {
+		if fs.pendingIndex != nil {
+			if meta, ok := fs.pendingIndex.GetMeta(fh.Path); ok && meta.HasMode {
+				return meta.Mode & posixPermissionModeMask, true
+			}
+		}
+		if entry, ok := fs.inodes.GetEntry(fh.Ino); ok && entry.HasMode {
+			return entry.Mode & posixPermissionModeMask, true
+		}
 	}
 	return 0, false
 }
@@ -8815,7 +8828,12 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		for _, h := range fs.fileHandlesForInode(input.NodeId) {
 			h.Lock()
 			if h.Dirty != nil {
-				hasDirtyHandle = true
+				// A clean Release may already have passed its mode check. It
+				// cannot own new work, but still needs the new generation so
+				// its stale completion cannot restore the previous mode.
+				if !h.releasing || h.Dirty.HasDirtyParts() {
+					hasDirtyHandle = true
+				}
 				fs.setPendingModeLocked(h, mode, modeGen)
 				if !h.HasPreviousMode {
 					if entry.HasMode {

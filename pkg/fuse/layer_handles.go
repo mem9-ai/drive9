@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"errors"
 	"fmt"
 	"syscall"
 
@@ -8,6 +9,8 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
+
+var errLayerReplayBusy = errors.New("layer refresh handle busy")
 
 // lockLayerReplayHandles is called under the path publication fence. Never
 // wait for fh.mu here: a writer holding it may itself be waiting for that fence.
@@ -22,7 +25,7 @@ func (fs *Dat9FS) lockLayerReplayHandles(path string) ([]*FileHandle, func(), er
 	for _, fh := range fs.openHandles.SnapshotPath(path) {
 		if !fh.TryLock() {
 			unlock()
-			return nil, nil, fmt.Errorf("layer refresh handle busy %s: %w", path, syscall.EAGAIN)
+			return nil, nil, fmt.Errorf("%w: %s", errLayerReplayBusy, path)
 		}
 		if fh.Path != path || fh.Unlinked || isLocalFileHandle(fh) || fh.Layer == PathLayerGitWorkspace {
 			fh.Unlock()
@@ -47,7 +50,7 @@ func (fs *Dat9FS) preserveLayerReplayConflict(path string, tip client.FSLayerEnt
 		(meta.LayerEntrySeq == identity.EntrySeq || (meta.LayerID == fs.layerRef() && meta.LayerEntrySeq > identity.EntrySeq))
 	var newest *FileHandle
 	for _, fh := range handles {
-		if fh.Dirty != nil && fh.Dirty.HasDirtyParts() && (newest == nil || fh.DirtySeq > newest.DirtySeq) {
+		if fh.Dirty != nil && (fh.Dirty.HasDirtyParts() || fh.HasPendingMode) && (newest == nil || fh.DirtySeq > newest.DirtySeq) {
 			newest = fh
 		}
 	}

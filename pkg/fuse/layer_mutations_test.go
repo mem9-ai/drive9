@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"syscall"
 	"testing"
+
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
@@ -54,6 +57,102 @@ func TestLayerChmodPreservesObjectBackedContentWithoutShadow(t *testing.T) {
 				}
 			} else if posted.Op != "chmod" || len(posted.Content) != 0 {
 				t.Fatalf("object-backed chmod replaced remote content: %+v", posted)
+			}
+		})
+	}
+}
+
+func TestLayerChmodDoesNotDeferToReleasedHandle(t *testing.T) {
+	var posted client.FSLayerEntryRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries" {
+			if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
+				t.Error(err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{LayerID: "layer-1", Path: "/a", EntrySeq: 2, Mode: posted.Mode})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+	idx, shadows := newLayerShutdownState(t)
+	if err := shadows.WriteFull("/a", []byte("body"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.PutLayerCache("/a", 4, 0, 0644, true, LayerCacheIdentity{"layer-1", 1}); err != nil {
+		t.Fatal(err)
+	}
+	fs := NewDat9FS(newTestClient(ts.URL), &MountOptions{LayerRef: "layer-1", RemoteRoot: "/"})
+	fs.pendingIndex, fs.shadowStore = idx, shadows
+	fs.markLayerFileMode("/a", 0644)
+	var node gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "a", &node); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	// Release has finished its pending-mode check but has not removed the
+	// handle from the index yet. Chmod must not assign work to that handle.
+	fh := &FileHandle{Path: "/a", Ino: node.NodeId, Flags: syscall.O_RDWR, Dirty: fs.newWriteBuffer("/a", 0, 0), releasing: true}
+	id := fs.allocateFileHandle(fh)
+	defer fs.deleteFileHandle(id, fh)
+	in := &gofuse.SetAttrIn{}
+	in.NodeId, in.Valid, in.Mode = node.NodeId, gofuse.FATTR_MODE, 0600
+	if st := fs.SetAttr(nil, in, &gofuse.AttrOut{}); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	if posted.Mode != 0600 || string(posted.Content) != "body" {
+		t.Fatalf("chmod was lost behind Release: %+v", posted)
+	}
+	if meta, _ := idx.GetMeta("/a"); meta == nil || !meta.LayerClean || meta.Mode != 0600 {
+		t.Fatalf("chmod was not acknowledged: %+v", meta)
+	}
+}
+
+func TestLayerRewriteKeepsCommittedMode(t *testing.T) {
+	for _, mode := range []uint32{0600, 0755} {
+		t.Run(strconv.FormatUint(uint64(mode), 8), func(t *testing.T) {
+			var requests []client.FSLayerEntryRequest
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					http.NotFound(w, r)
+					return
+				}
+				var req client.FSLayerEntryRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Error(err)
+				}
+				requests = append(requests, req)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(client.FSLayerEntry{LayerID: "layer-1", Path: req.Path, EntrySeq: int64(len(requests)), Mode: req.Mode})
+			}))
+			defer ts.Close()
+			idx, shadows := newLayerShutdownState(t)
+			fs := NewDat9FS(newTestClient(ts.URL), &MountOptions{LayerRef: "layer-1", RemoteRoot: "/", WritePolicy: WritePolicyWriteSync})
+			fs.pendingIndex, fs.shadowStore = idx, shadows
+			var created gofuse.CreateOut
+			if st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}, Flags: syscall.O_RDWR, Mode: mode}, "a", &created); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			defer fs.Release(nil, &gofuse.ReleaseIn{Fh: created.Fh})
+			// Shell redirection closes a duplicate descriptor before printf.
+			if st := fs.Flush(nil, &gofuse.FlushIn{Fh: created.Fh}); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			for i := 0; i < 2; i++ {
+				if _, st := fs.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: created.NodeId}, Fh: created.Fh, Offset: uint64(i)}, []byte("x")); st != gofuse.OK {
+					t.Fatal(st)
+				}
+			}
+			if len(requests) < 2 {
+				t.Fatalf("only %d publications", len(requests))
+			}
+			for i, req := range requests {
+				if req.Mode != mode {
+					t.Fatalf("publication %d dropped mode: got %o want %o", i, req.Mode, mode)
+				}
+			}
+			if meta, _ := idx.GetMeta("/a"); meta == nil || !meta.HasMode || meta.Mode != mode {
+				t.Fatalf("cached mode lost: %+v", meta)
 			}
 		})
 	}

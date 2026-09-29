@@ -3,6 +3,7 @@ package fuse
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -111,7 +112,7 @@ func TestLayerRefreshWritableHandle(t *testing.T) {
 				fh.Lock()
 				seq, err := refresh()
 				fh.Unlock()
-				if err == nil || seq != 1 {
+				if !errors.Is(err, errLayerReplayBusy) || seq != 1 {
 					t.Fatalf("busy refresh advanced cursor: seq=%d err=%v", seq, err)
 				}
 			}

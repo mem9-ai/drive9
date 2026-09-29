@@ -1265,7 +1265,9 @@ if require_layer_fuse_prereqs; then
   start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" "$mount_a" "$local_a" "$log_a"
   check_eq "layer mount reads base before edit" "$(cat "$mount_a/base.txt")" "$(cat "$fuse_base_local")"
   printf 'fuse base edited in layer %s\n' "$ts" >"$mount_a/base.txt"
-  printf 'fuse new file %s\n' "$ts" >"$mount_a/new.txt"
+  # Redirection closes a duplicate fd before printf writes. Both publications
+  # must retain the restrictive create mode, including across checkpoint restore.
+  (umask 077; printf 'fuse new file %s\n' "$ts" >"$mount_a/new.txt")
   chmod 0600 "$mount_a/new.txt"
   mkdir "$mount_a/dir"
   printf 'fuse nested file %s\n' "$ts" >"$mount_a/dir/nested.txt"
@@ -1470,18 +1472,16 @@ PY_STAGED_READ
   check_cmd "unmount staged append restore" unmount_layer_mount
   check_cmd "staged append mount log clean" audit_mount_log "$log_c"
 
-  fuse_commit_out=$(drive9_retry fs layer commit "tag:fuse_run=$ts")
-  case "$fuse_commit_out" in
-    committed\ layer="$fuse_layer_id"\ applied=*)
-      fuse_commit_applied="${fuse_commit_out##*applied=}"
-      if [ "$fuse_commit_applied" -ge 9 ] 2>/dev/null; then
-        fuse_commit_status="ok"
-      else
-        fuse_commit_status="$fuse_commit_out"
-      fi
-      ;;
-    *) fuse_commit_status="$fuse_commit_out" ;;
-  esac
+  # Keep the response body on failure: the CLI's generic conflict error hides
+  # the path and reason needed to diagnose a failed commit in CI.
+  resp=$(curl_body_code POST "$BASE/v1/layers/$(url_escape "$fuse_layer_id")/commit" "$API_KEY" "{}")
+  body=$(json_body "$resp")
+  fuse_commit_status="HTTP $(http_code "$resp"): $body"
+  if [ "$(http_code "$resp")" = 200 ] && \
+      printf '%s' "$body" | jq -e --arg id "$fuse_layer_id" \
+        '.status == "committed" and .layer_id == $id and .applied >= 9' >/dev/null; then
+    fuse_commit_status="ok"
+  fi
   check_eq "commit FUSE layer after restore succeeds" "$fuse_commit_status" "ok"
   check_eq "committed FUSE base visible" "$(drive9_retry fs cat "${fuse_root}/base.txt")" "fuse base edited in layer ${ts}"
   check_eq "committed FUSE after file visible" "$(drive9_retry fs cat "${fuse_root}/after.txt")" "fuse after checkpoint ${ts}"
