@@ -10958,6 +10958,17 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 
 	renameCtx, renameCancel := fs.namespaceMutationCommitContext(ctx)
 	defer renameCancel()
+	var ownedRenamePaths map[string]uint64
+	unlockOwnedRename := func() {}
+	if oldInfo.isDir {
+		var err error
+		ownedRenamePaths, unlockOwnedRename, err = fs.lockOwnedRenamePaths(oldP, newP)
+		if err != nil {
+			return httpToFuseStatus(err)
+		}
+	}
+	defer unlockOwnedRename()
+	var renameUploads []string
 	renameErr := fs.renameRemoteWithTransientRetry(renameCtx, oldP, newP)
 	if renameErr != nil {
 		if handled, st := fs.renameRemoteFileToMissingTargetFallback(renameCtx, input, oldInfo, newInfo, renameErr); handled {
@@ -10997,20 +11008,27 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 			newChild := newP + meta.Path[len(oldP):]
 			if meta.ownedStagingKnown {
 				ownedMigrations[meta.Path] = true
-				moved, err := fs.renameOwnedWriteBack(meta.Path, newChild)
+				var moved bool
+				var err error
+				if _, covered := ownedRenamePaths[meta.Path]; covered {
+					moved, err = fs.renameOwnedWriteBackLocked(meta.Path, newChild)
+				} else {
+					// A late publication cannot borrow another path's exclusions.
+					moved, err = fs.renameOwnedWriteBack(meta.Path, newChild)
+				}
 				if err != nil {
 					migrationErr = errors.Join(migrationErr, err)
 				} else if moved && fs.uploader != nil {
-					fs.uploader.Submit(newChild)
+					renameUploads = append(renameUploads, newChild)
 				}
 				continue
 			}
-			if fs.uploader != nil {
+			if _, covered := ownedRenamePaths[meta.Path]; !covered && fs.uploader != nil {
 				fs.uploader.WaitPath(meta.Path)
 			}
 			fs.writeBack.RenamePending(meta.Path, newChild)
 			if fs.uploader != nil {
-				fs.uploader.Submit(newChild)
+				renameUploads = append(renameUploads, newChild)
 			}
 		}
 	}
@@ -11049,9 +11067,14 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 
+	// Reconciliation can acquire handle locks, and Submit may run synchronously.
+	unlockOwnedRename()
 	// The server's RenameDir already moved its jfs edge and projection subtree
 	// in one transaction; only local namespace reconciliation remains here.
 	fs.finishLocalRename(input, oldP, newP)
+	for _, p := range renameUploads {
+		fs.uploader.Submit(p)
+	}
 	// Retry after local namespace reconciliation. A persistent failure preserves
 	// its source bytes and is reported with handles/inodes aligned to the
 	// already committed remote rename.
