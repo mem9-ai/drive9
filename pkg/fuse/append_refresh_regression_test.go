@@ -221,6 +221,7 @@ func pr939HandleFS(t *testing.T, path, base string) (*Dat9FS, uint64) {
 	}
 	fs.shadowStore = shadow
 	fs.pendingIndex = pending
+	pending.setShadowStore(shadow)
 	ino := fs.inodes.Lookup(path, false, int64(len(base)), time.Now())
 	fs.inodes.UpdateRevision(ino, 1)
 	return fs, ino

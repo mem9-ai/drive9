@@ -15,10 +15,13 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
 
-func newAliasAppendTestFS(t *testing.T, flags uint32, writerFirst bool) (*Dat9FS, uint64, *FileHandle, uint64, *FileHandle, uint64, *casFileServer) {
+func newAliasAppendTestFS(t *testing.T, flags uint32, writerFirst bool, requestHooks ...func(*http.Request)) (*Dat9FS, uint64, *FileHandle, uint64, *FileHandle, uint64, *casFileServer) {
 	t.Helper()
 	server := &casFileServer{t: t, path: "/a", revision: 1, body: []byte("hello")}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, hook := range requestHooks {
+			hook(r)
+		}
 		if r.Method == http.MethodPost && r.URL.Query().Get("hardlink") == "1" {
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 			return

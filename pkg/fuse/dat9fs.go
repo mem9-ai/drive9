@@ -44,6 +44,8 @@ var testHookAfterAppendRead func(path string)
 var testHookAfterAppendPrefixScan func(path string)
 var testHookBeforeFlushRelock func(path string)
 var testHookAfterAliasPublishedPin func(path string)
+var testHookAfterPendingAppendRead func(path string, pending bool)
+var testHookBeforePublishedFallback func(path string, afterShadow bool)
 
 // testHookBeforeGVisorShadowSpillFlushFence lets race-focused unit tests pause
 // a gVisor ShadowSpill Flush after its initial supersession check but before it
@@ -4474,9 +4476,10 @@ func (fs *Dat9FS) hasOtherAliasPending(path string, ino uint64) bool {
 	return false
 }
 
-// Reuse bound pending generation and immutable writeback snapshots; never guess
-// between independent pending images. The existing append deadline owns retries.
-func (fs *Dat9FS) readAliasPublishedOnce(path string, ino uint64, offset int64, size uint32) ([]byte, int, bool, gofuse.Status, bool) {
+// readPublishedAppendOnce reads the unique pending image, whether it belongs to
+// the reader path or another alias. Reuse bound generations and immutable
+// snapshots; never guess between images. The existing append deadline owns retries.
+func (fs *Dat9FS) readPublishedAppendOnce(ino uint64, offset int64, size uint32) ([]byte, int, bool, gofuse.Status, bool) {
 	selected := ""
 	for _, p := range fs.appendReadPaths(ino) {
 		if fs.appendContentPending(p) {
@@ -4486,7 +4489,7 @@ func (fs *Dat9FS) readAliasPublishedOnce(path string, ino uint64, offset int64, 
 			selected = p
 		}
 	}
-	if selected == "" || selected == path {
+	if selected == "" {
 		return nil, 0, false, gofuse.OK, false
 	}
 	matches := func() bool {
@@ -4651,7 +4654,7 @@ func (fs *Dat9FS) canReadAppendPrefix(path string, ino uint64, reader *FileHandl
 	return stable && fs.latestCommittedRevision(path) <= revision && fs.inodes.GetRevision(ino) <= revision
 }
 
-// The caller observed an active append or another alias's pending content.
+// The caller observed an active append or content pending on a known inode path.
 // An unhandled read selects published sources unless the requested prefix
 // was proved unchanged.
 func (fs *Dat9FS) readActiveAppendVisibleRange(ctx context.Context, path string, ino uint64, reader *FileHandle, offset int64, reqSize uint32) (data []byte, n int, ok bool, st gofuse.Status, source string, usePublished bool) {
@@ -4704,7 +4707,10 @@ func (fs *Dat9FS) readActiveAppendVisibleRange(ctx context.Context, path string,
 			return data, n, ok, st, "same-path-dirty", false
 		}
 		if !fs.hasDirtyAppend(path, ino, reader) {
-			data, n, ok, st, pending := fs.readAliasPublishedOnce(path, ino, offset, reqSize)
+			data, n, ok, st, pending := fs.readPublishedAppendOnce(ino, offset, reqSize)
+			if testHookAfterPendingAppendRead != nil {
+				testHookAfterPendingAppendRead(path, pending)
+			}
 			if ctx.Err() != nil {
 				st, source = canceled()
 				return nil, 0, false, st, source, false
@@ -12710,7 +12716,7 @@ readHandleState:
 	if appendEligible {
 		aliasReadRevision = fs.appendAliasCommittedRevision(fh.Ino)
 	}
-	activeAppend := appendEligible && (fs.hasDirtyAppend(fh.Path, fh.Ino, fh) || fs.hasOtherAliasPending(fh.Path, fh.Ino))
+	activeAppend := appendEligible && (fs.hasDirtyAppend(fh.Path, fh.Ino, fh) || fs.appendContentPending(fh.Path) || fs.hasOtherAliasPending(fh.Path, fh.Ino))
 	if appendEligible && !activeAppend {
 		// Inspect open writers before their published successors: staging
 		// clears DirtySeq only after publishing pending data. Commit cleanup
@@ -12896,6 +12902,20 @@ readHandleState:
 		}
 	}
 
+	// Content may have appeared after append selection released the handle lock.
+	// A cache pin proves a revision, not ownership of these pending bytes. Fail
+	// closed here; a later read can retry without restarting this read's budget.
+	if appendEligible && testHookBeforePublishedFallback != nil {
+		testHookBeforePublishedFallback(fh.Path, false)
+	}
+	if appendEligible && (fs.appendContentPending(fh.Path) || fs.hasOtherAliasPending(fh.Path, fh.Ino)) {
+		source = "pending-publication-changed"
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, gofuse.EINTR
+		}
+		return nil, gofuse.EIO
+	}
+
 	// Read path priority for pending files:
 	// 1. ShadowStore (local SSD) — for files staged by Flush
 	// 2. WriteBackCache.Get (local disk, full file) — legacy path
@@ -12952,6 +12972,19 @@ readHandleState:
 		}
 		fh.Unlock()
 	}
+	// Shadow selection can itself race a publication. Do not let a miss
+	// expose an older writeback/cache/remote image while content is pending.
+	if appendEligible && testHookBeforePublishedFallback != nil {
+		testHookBeforePublishedFallback(fh.Path, true)
+	}
+	if appendEligible && (fs.appendContentPending(fh.Path) || fs.hasOtherAliasPending(fh.Path, fh.Ino)) {
+		source = "pending-publication-changed"
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, gofuse.EINTR
+		}
+		return nil, gofuse.EIO
+	}
+
 	// Close-to-open consistency: if a previous handle wrote data to the
 	// write-back cache (async upload still in progress), serve reads from
 	// that cached data instead of going to the server (which has stale data).
