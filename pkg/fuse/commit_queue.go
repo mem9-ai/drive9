@@ -3129,6 +3129,11 @@ func (cq *CommitQueue) validateRecoveredEntry(entry *CommitEntry) error {
 		return syscall.ESTALE
 	}
 	meta, ok := cq.index.GetMeta(entry.Path)
+	if ok && meta.Kind == PendingConflict && cq.layerRefSnapshot() != "" {
+		// Recovery now rejects before uploadLayerEntry, so retain its guard
+		// against automatically overwriting an observed Layer conflict.
+		entry.DisableAutoResolveLWW = true
+	}
 	if !ok || meta.Generation != entry.PendingIndexGen || meta.Kind == PendingConflict {
 		return syscall.ESTALE
 	}
