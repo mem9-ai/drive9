@@ -263,7 +263,7 @@ func TestOwnedRenameCommitFenceOrdering(t *testing.T) {
 		}
 	}
 }
-func TestOwnedRenameCaptureChangeBeforeRemote(t *testing.T) {
+func TestOwnedRenameCaptureChangeRetriesBeforeRemote(t *testing.T) {
 	for _, changed := range []string{"new_path", "new_generation"} {
 		t.Run(changed, func(t *testing.T) {
 			var posts atomic.Int32
@@ -277,8 +277,13 @@ func TestOwnedRenameCaptureChangeBeforeRemote(t *testing.T) {
 			fs.inodes.Lookup("/old", true, 0, time.Time{})
 			fs.inodes.Lookup("/new", true, 0, time.Time{})
 			stageOwnedRenameChild(t, fs, "/old/file.txt")
+			captures := 0
 			enableOwnedRenameFenceHook(t, fs, func(observed *Dat9FS, phase string) {
 				if observed != fs || phase != "captured" {
+					return
+				}
+				captures++
+				if captures > 1 {
 					return
 				}
 				p := "/old/file.txt"
@@ -288,10 +293,10 @@ func TestOwnedRenameCaptureChangeBeforeRemote(t *testing.T) {
 				stageOwnedRenameChild(t, fs, p)
 			})
 			st := fs.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "old", "new")
-			if st != gofuse.EAGAIN || posts.Load() != 0 {
-				t.Fatalf("changed capture rename=%v POSTs=%d", st, posts.Load())
+			if st != gofuse.OK || posts.Load() != 1 || captures != 2 {
+				t.Fatalf("changed capture rename=%v POSTs=%d captures=%d", st, posts.Load(), captures)
 			}
-			if data, err := fs.shadowStore.ReadAll("/old/file.txt"); err != nil || string(data) != "payload" {
+			if data, err := fs.shadowStore.ReadAll("/new/file.txt"); err != nil || string(data) != "payload" {
 				t.Fatalf("source lost: %q/%v", data, err)
 			}
 			t.Logf("CAPTURE change=%s status=%v POSTs=%d", changed, st, posts.Load())

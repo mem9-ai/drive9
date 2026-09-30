@@ -11143,6 +11143,12 @@ func fusePathVariants(p string) []string {
 }
 
 func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
+	fs.finishLocalRenameWithRelease(input, oldP, newP, nil)
+}
+
+// finishLocalRenameWithRelease publishes inode paths before releasing commit
+// exclusions, then retargets handles without holding locks they may need.
+func (fs *Dat9FS) finishLocalRenameWithRelease(input *gofuse.RenameIn, oldP, newP string, release func()) {
 	var oldEntry *InodeEntry
 	oldEntryOK := false
 	resolvedOld := oldP
@@ -11189,6 +11195,10 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 		}
 	}
 	fs.inodes.Rename(oldP, newP)
+	if release != nil {
+		release()
+		failpoint.InjectCall("ownedDirectoryRenamePhase", fs, "after_fence_release")
+	}
 	fs.renameSpecialNodeSubtree(oldP, newP)
 	// Migrate in-memory xattrs from old path to new path.
 	if fs.xattrs != nil {
@@ -11366,6 +11376,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		fs.commitQueue.WaitPath(newP)
 		fs.commitQueue.WaitPrefix(oldP + "/")
 	}
+	failpoint.InjectCall("ownedDirectoryRenamePhase", fs, "after_wait")
 
 	if fs.writeBack != nil && fs.uploader != nil {
 		// Wait for any in-flight uploads for both paths. This prevents a
@@ -11429,17 +11440,19 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 
 	renameCtx, renameCancel := fs.namespaceMutationCommitContext(ctx)
 	defer renameCancel()
+	failpoint.InjectCall("ownedRenameRetryContext", fs, ctx, &renameCtx)
 	var ownedRenamePaths map[string]uint64
 	unlockOwnedRename := func() {}
 	if oldInfo.isDir {
 		var err error
-		ownedRenamePaths, unlockOwnedRename, err = fs.lockOwnedRenamePaths(oldP, newP)
+		ownedRenamePaths, unlockOwnedRename, err = fs.lockOwnedRenamePaths(renameCtx, oldP, newP)
 		if err != nil {
 			return httpToFuseStatus(err)
 		}
 	}
 	defer unlockOwnedRename()
 	var renameUploads []string
+	failpoint.InjectCall("ownedDirectoryRenamePhase", fs, "before_remote")
 	renameErr := fs.renameRemoteWithTransientRetry(renameCtx, oldP, newP)
 	if renameErr != nil {
 		if handled, st := fs.renameRemoteFileToMissingTargetFallback(renameCtx, input, oldInfo, newInfo, renameErr); handled {
@@ -11447,6 +11460,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 		return httpToFuseStatus(renameErr)
 	}
+	failpoint.InjectCall("ownedDirectoryRenamePhase", fs, "after_remote")
 	if pendingRename == pendingRenameRemoteFallbackCleanupOld {
 		if fs.shadowStore != nil {
 			fs.shadowStore.Remove(oldP)
@@ -11539,10 +11553,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 
 	// Reconciliation can acquire handle locks, and Submit may run synchronously.
-	unlockOwnedRename()
 	// The server's RenameDir already moved its jfs edge and projection subtree
 	// in one transaction; only local namespace reconciliation remains here.
-	fs.finishLocalRename(input, oldP, newP)
+	fs.finishLocalRenameWithRelease(input, oldP, newP, unlockOwnedRename)
 	for _, p := range renameUploads {
 		fs.uploader.Submit(p)
 	}

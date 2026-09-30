@@ -361,3 +361,20 @@ func (fs *Dat9FS) deleteFileHandle(fhID uint64, fh *FileHandle) {
 	fs.fileHandles.Delete(fhID)
 	fs.openHandles.Remove(fh)
 }
+
+// ftruncatePathsByPrefix snapshots accepted live participants without fh.mu.
+// Release publishes pending ownership before removing a handle from this index.
+func (idx *OpenHandleIndex) ftruncatePathsByPrefix(prefix string) []string {
+	if idx == nil {
+		return nil
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	var paths []string
+	for fh, p := range idx.pathByHandle {
+		if strings.HasPrefix(p, prefix) && fh.pendingFtruncate.Load() != nil {
+			paths = append(paths, p)
+		}
+	}
+	return paths
+}
