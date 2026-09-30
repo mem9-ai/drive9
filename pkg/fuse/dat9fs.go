@@ -11371,18 +11371,18 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 
 	// Wait for any in-flight commitQueue uploads for both paths (and
 	// descendants) so a background commit cannot PUT to stale paths.
-	if fs.commitQueue != nil {
-		fs.commitQueue.WaitPath(oldP)
-		fs.commitQueue.WaitPath(newP)
-		fs.commitQueue.WaitPrefix(oldP + "/")
+	renameCtx, renameCancel := fs.namespaceMutationCommitContext(ctx)
+	defer renameCancel()
+	failpoint.InjectCall("ownedRenameRetryContext", fs, ctx, &renameCtx)
+	if err := fs.waitRenameCommits(renameCtx, oldP, newP); err != nil {
+		return httpToFuseStatus(err)
 	}
 	failpoint.InjectCall("ownedDirectoryRenamePhase", fs, "after_wait")
 
 	if fs.writeBack != nil && fs.uploader != nil {
-		// Wait for any in-flight uploads for both paths. This prevents a
-		// background worker from PUT-ing to oldP after we rename away from it.
-		fs.uploader.WaitPath(oldP)
-		fs.uploader.WaitPath(newP)
+		if err := renameCtx.Err(); err != nil {
+			return httpToFuseStatus(err)
+		}
 
 		// Fast path (vim :w): if oldP is a pending-new file (created locally,
 		// never existed on the server), rename it locally. The background
@@ -11424,23 +11424,17 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		// land before the server-side rename, so detach it from the FUSE
 		// cancel channel under interrupt-safe mutations like the rename
 		// commit itself.
-		pendingCtx, pendingCancel := fs.namespaceMutationCommitContext(ctx)
-		if err := fs.flushPendingWriteBack(pendingCtx, oldP); err != nil {
-			pendingCancel()
+		failpoint.InjectCall("ownedDirectoryRenamePhase", fs, "before_pending_flush")
+		if err := fs.uploader.uploadSyncForRename(renameCtx, oldP); err != nil {
 			safeLogPrintf("rename: flush pending write-back for %s: %v", oldP, err)
 			return httpToFuseStatus(err)
 		}
-		if err := fs.flushPendingWriteBack(pendingCtx, newP); err != nil {
-			pendingCancel()
+		if err := fs.uploader.uploadSyncForRename(renameCtx, newP); err != nil {
 			safeLogPrintf("rename: flush pending write-back for %s: %v", newP, err)
 			return httpToFuseStatus(err)
 		}
-		pendingCancel()
 	}
 
-	renameCtx, renameCancel := fs.namespaceMutationCommitContext(ctx)
-	defer renameCancel()
-	failpoint.InjectCall("ownedRenameRetryContext", fs, ctx, &renameCtx)
 	var ownedRenamePaths map[string]uint64
 	unlockOwnedRename := func() {}
 	if oldInfo.isDir {

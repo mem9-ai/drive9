@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pingcap/failpoint"
+
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 )
@@ -521,6 +523,38 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	// Share exclusion with background uploads and owned staging migration.
 	release := u.acquirePath(localPath)
 	defer release()
+	return u.uploadSyncWithRevisionLocked(ctx, localPath)
+}
+
+// uploadSyncForRename bounds re-acquisition after Rename's initial drain.
+// Other synchronous upload callers retain their existing admission behavior.
+func (u *WriteBackUploader) uploadSyncForRename(ctx context.Context, localPath string) error {
+	failpoint.InjectCall("renameUploadSyncContext", u, ctx, localPath)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if release, ok := u.tryAcquirePath(localPath); ok {
+			defer release()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			_, err := u.uploadSyncWithRevisionLocked(ctx, localPath)
+			return err
+		}
+		failpoint.InjectCall("renameUploadSyncBusy", u, localPath)
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// uploadSyncWithRevisionLocked requires uploader ownership of localPath.
+func (u *WriteBackUploader) uploadSyncWithRevisionLocked(ctx context.Context, localPath string) (int64, error) {
 
 	// PendingChmod entries have no .dat file (data already uploaded, only
 	// chmod remains). Read meta first so we can handle chmod without loading
