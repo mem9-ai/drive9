@@ -295,6 +295,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		fs.debugDurationf(uploadStart, 0, "fsync shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 		if err != nil {
 			safeLogPrintf("fsync: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
+			if status, matched := quotaErrToFuseStatus(err); matched {
+				return status
+			}
 			return gofuse.EIO
 		}
 		// If Unlink completed while remoteCommitLock was released (it

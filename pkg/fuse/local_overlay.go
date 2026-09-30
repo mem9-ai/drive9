@@ -290,6 +290,10 @@ func localErrToFuseStatus(err error) gofuse.Status {
 	if err == nil {
 		return gofuse.OK
 	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return gofuse.Status(errno)
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		return gofuse.ENOENT
 	}
@@ -301,10 +305,6 @@ func localErrToFuseStatus(err error) gofuse.Status {
 	}
 	if errors.Is(err, io.EOF) {
 		return gofuse.OK
-	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
-		return gofuse.Status(errno)
 	}
 	return gofuse.EIO
 }

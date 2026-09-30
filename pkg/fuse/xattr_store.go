@@ -1,10 +1,17 @@
 package fuse
 
 import (
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 )
+
+func xattrNamespaceSupported(attr string) bool {
+	return runtime.GOOS != "linux" || strings.HasPrefix(attr, "user.") ||
+		strings.HasPrefix(attr, "security.") || strings.HasPrefix(attr, "trusted.") ||
+		strings.HasPrefix(attr, "system.")
+}
 
 // XATTR_CREATE and XATTR_REPLACE flag values from Linux's setxattr(2).
 const (

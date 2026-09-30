@@ -342,6 +342,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			fs.debugDurationf(uploadStart, 0, "flush shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
 			if err != nil {
 				safeLogPrintf("flush: ShadowSpill sync upload failed for %s: %v", fh.Path, err)
+				if status, matched := quotaErrToFuseStatus(err); matched {
+					return status
+				}
 				return gofuse.EIO
 			}
 			if !gvisorCompat {
