@@ -634,3 +634,26 @@ func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath str
 	}
 	return nil
 }
+
+// tryAcquirePath uses the same ownership as acquirePath without waiting.
+// Rename uses it so partial lock acquisition cannot outlive its retry budget.
+func (u *WriteBackUploader) tryAcquirePath(p string) (func(), bool) {
+	u.inflightMu.Lock()
+	defer u.inflightMu.Unlock()
+	if u.inflight[p] != nil {
+		return nil, false
+	}
+	if u.inflight == nil {
+		u.inflight = make(map[string]*pathState)
+	}
+	owner := &pathState{done: make(chan struct{})}
+	u.inflight[p] = owner
+	return func() {
+		u.inflightMu.Lock()
+		if u.inflight[p] == owner {
+			delete(u.inflight, p)
+		}
+		u.inflightMu.Unlock()
+		close(owner.done)
+	}, true
+}

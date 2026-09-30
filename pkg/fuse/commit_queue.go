@@ -903,24 +903,7 @@ func (cq *CommitQueue) WaitPrefix(prefix string) {
 	for {
 		cq.mu.Lock()
 		cq.forceDelayedPrefixLocked(prefix)
-		found := false
-		for p := range cq.inFlight {
-			if strings.HasPrefix(p, prefix) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			for _, e := range cq.queue {
-				if strings.HasPrefix(e.Path, prefix) {
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			found = cq.hasImmediatePrefixLocked(prefix)
-		}
+		found := cq.hasPendingPrefixLocked(prefix)
 		cq.mu.Unlock()
 		if !found {
 			return
@@ -938,24 +921,7 @@ func (cq *CommitQueue) WaitPrefixTimeout(prefix string, timeout time.Duration) b
 	for {
 		cq.mu.Lock()
 		cq.forceDelayedPrefixLocked(prefix)
-		found := false
-		for p := range cq.inFlight {
-			if strings.HasPrefix(p, prefix) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			for _, e := range cq.queue {
-				if strings.HasPrefix(e.Path, prefix) {
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			found = cq.hasImmediatePrefixLocked(prefix)
-		}
+		found := cq.hasPendingPrefixLocked(prefix)
 		cq.mu.Unlock()
 		if !found {
 			return true // drained
@@ -3167,4 +3133,20 @@ func (cq *CommitQueue) validateRecoveredEntry(entry *CommitEntry) error {
 		return syscall.ESTALE
 	}
 	return nil
+}
+
+// hasPendingPrefixLocked requires cq.mu. Callers decide whether to activate
+// delayed work and whether to wait; rename admission must never wait here.
+func (cq *CommitQueue) hasPendingPrefixLocked(prefix string) bool {
+	for p := range cq.inFlight {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	for _, entry := range cq.queue {
+		if strings.HasPrefix(entry.Path, prefix) {
+			return true
+		}
+	}
+	return cq.hasImmediatePrefixLocked(prefix)
 }

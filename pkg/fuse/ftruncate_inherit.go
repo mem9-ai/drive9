@@ -134,6 +134,7 @@ func (fs *Dat9FS) fenceFtruncateLocked(fh *FileHandle) error {
 	fs.releaseHandleRemoteCommitPathLocked(fh)
 	unlock, ok := fs.tryLockFtruncateAliases(fh)
 	if !ok {
+		failpoint.InjectCall("ftruncateCommitFenceBusy", fs, fh)
 		return errFtruncateBusy
 	}
 	fh.RemoteCommitUnlock, fh.ftruncateFence = unlock, true
