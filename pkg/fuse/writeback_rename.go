@@ -214,6 +214,46 @@ func (fs *Dat9FS) tryLockOwnedRenamePaths(oldP, newP string) (map[string]uint64,
 	return captured, unlock, nil
 }
 
+// waitRenameCommits preserves the ordinary Rename pre-drain without ignoring
+// its operation budget. This observes readiness; later fences still revalidate
+// descendants. No commit exclusion is held while waiting for workers.
+func (fs *Dat9FS) waitRenameCommits(ctx context.Context, oldP, newP string) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		busy := false
+		if cq := fs.commitQueue; cq != nil {
+			cq.mu.Lock()
+			cq.forceDelayedPathLocked(oldP)
+			cq.forceDelayedPathLocked(newP)
+			cq.forceDelayedPrefixLocked(oldP + "/")
+			for _, p := range []string{oldP, newP} {
+				_, inflight := cq.inFlight[p]
+				busy = busy || inflight || cq.hasQueuedPathLocked(p) || cq.hasImmediatePathLocked(p)
+			}
+			busy = busy || cq.hasPendingPrefixLocked(oldP+"/")
+			cq.mu.Unlock()
+		}
+		if fs.writeBack != nil && fs.uploader != nil {
+			fs.uploader.inflightMu.Lock()
+			busy = busy || fs.uploader.inflight[oldP] != nil || fs.uploader.inflight[newP] != nil
+			fs.uploader.inflightMu.Unlock()
+		}
+		if !busy {
+			return ctx.Err()
+		}
+		failpoint.InjectCall("ownedDirectoryRenamePhase", fs, "initial_wait_busy")
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 // lockOwnedRenamePaths shares Rename's existing operation deadline across
 // retries. Every wait happens after releasing all attempt-owned exclusions.
 func (fs *Dat9FS) lockOwnedRenamePaths(ctx context.Context, oldP, newP string) (map[string]uint64, func(), error) {

@@ -33,6 +33,7 @@ func TestQueueOnlyFtruncateRenameInternalRetry(t *testing.T) {
 		{"live_fd_release_after_fence", false, "before_remote", "after_rename"},
 		{"live_fd_release_after_queue_check", false, "after_queue_check", "after_rename"},
 		{"queue_deadline", true, "after_wait", "after_rename"},
+		{"preexisting_queue_deadline", true, "before_rename_stalled", "after_rename"},
 		{"cancel_legacy", true, "after_wait", "after_rename"},
 		{"cancel_default", true, "after_wait", "after_rename"},
 	} {
@@ -187,6 +188,9 @@ func TestQueueOnlyFtruncateRenameInternalRetry(t *testing.T) {
 				resume()
 				fs.commitQueue.WaitPath(oldP)
 			}
+			if tc.handoff == "before_rename_stalled" {
+				handoff()
+			}
 			releasedAfterFence := make(chan struct{})
 			asyncRelease := false
 			busyBefore, busyAfter := make(chan struct{}), make(chan struct{})
@@ -219,7 +223,7 @@ func TestQueueOnlyFtruncateRenameInternalRetry(t *testing.T) {
 				ctxCalls++
 				requestCtx = parent
 				selectedCtx = chosen
-				if tc.name == "queue_deadline" {
+				if tc.name == "queue_deadline" || tc.name == "preexisting_queue_deadline" {
 					short, stop := context.WithTimeout(chosen, 80*time.Millisecond)
 					t.Cleanup(stop)
 					selectedCtx = short
@@ -354,7 +358,7 @@ func TestQueueOnlyFtruncateRenameInternalRetry(t *testing.T) {
 			if ctxCalls != 1 {
 				t.Errorf("operation context renewed %d times", ctxCalls)
 			}
-			if tc.name == "queue_deadline" || tc.name == "cancel_legacy" {
+			if tc.name == "queue_deadline" || tc.name == "preexisting_queue_deadline" || tc.name == "cancel_legacy" {
 				mu.Lock()
 				beforeRPC := posts
 				mu.Unlock()
