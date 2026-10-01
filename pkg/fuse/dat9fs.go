@@ -11349,6 +11349,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		return httpToFuseStatus(err)
 	}
 
+	fallbackView := fs.mountViewGeneration.Load()
 	oldInfo, newInfo, st := fs.renamePreflight(ctx, input, oldP, newP)
 	if st != gofuse.OK {
 		return st
@@ -11436,10 +11437,14 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 
 	var ownedRenamePaths map[string]uint64
-	unlockOwnedRename := func() {}
-	if oldInfo.isDir {
+	var unlockOwnedRename func()
+	{
 		var err error
-		ownedRenamePaths, unlockOwnedRename, err = fs.lockOwnedRenamePaths(renameCtx, oldP, newP)
+		if oldInfo.isDir {
+			ownedRenamePaths, unlockOwnedRename, err = fs.lockOwnedRenamePaths(renameCtx, oldP, newP)
+		} else {
+			ownedRenamePaths, unlockOwnedRename, err = fs.lockOwnedRenamePathsOfType(renameCtx, oldP, newP, true)
+		}
 		if err != nil {
 			return httpToFuseStatus(err)
 		}
@@ -11449,8 +11454,23 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	failpoint.InjectCall("ownedDirectoryRenamePhase", fs, "before_remote")
 	renameErr := fs.renameRemoteWithTransientRetry(renameCtx, oldP, newP)
 	if renameErr != nil {
-		if handled, st := fs.renameRemoteFileToMissingTargetFallback(renameCtx, input, oldInfo, newInfo, renameErr); handled {
-			return st
+		// A source commit can finish after preflight and retire its last fd.
+		// Recreating an empty target must not consume that changed source.
+		sourceUnchanged := false
+		_, coveredSource := ownedRenamePaths[oldP]
+		if !coveredSource && oldInfo.entry != nil && fallbackView == fs.mountViewGeneration.Load() {
+			current, known := fs.inodes.GetEntry(oldInfo.entry.Ino)
+			ino, linked := fs.inodes.GetInode(oldP)
+			if known && linked && ino == oldInfo.entry.Ino && !current.Unlinked &&
+				current.Size == oldInfo.entry.Size && current.Revision == oldInfo.entry.Revision &&
+				current.ResourceID == oldInfo.entry.ResourceID {
+				_, sourceUnchanged = current.Paths[oldP]
+			}
+		}
+		if sourceUnchanged {
+			if handled, st := fs.renameRemoteFileToMissingTargetFallback(renameCtx, input, oldInfo, newInfo, renameErr); handled {
+				return st
+			}
 		}
 		return httpToFuseStatus(renameErr)
 	}
@@ -11483,7 +11503,15 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	var migrationErr error
 	ownedMigrations := make(map[string]bool)
 	if fs.writeBack != nil {
-		for _, meta := range fs.writeBack.ListByPrefix(prefix) {
+		metas := fs.writeBack.ListByPrefix(prefix)
+		if !oldInfo.isDir {
+			if _, covered := ownedRenamePaths[oldP]; covered {
+				if m, ok := fs.writeBack.GetMeta(oldP); ok && m.ownedStagingKnown {
+					metas = append(metas, m)
+				}
+			}
+		}
+		for _, meta := range metas {
 			newChild := newP + meta.Path[len(oldP):]
 			if meta.ownedStagingKnown {
 				ownedMigrations[meta.Path] = true
@@ -11514,7 +11542,15 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	// Also migrate pendingIndex and shadowStore entries for descendants.
 	// Meta-first order so a crash mid-migration cannot orphan a child's data.
 	if fs.pendingIndex != nil {
-		for _, meta := range fs.pendingIndex.ListByPrefix(prefix) {
+		metas := fs.pendingIndex.ListByPrefix(prefix)
+		if !oldInfo.isDir {
+			if _, covered := ownedRenamePaths[oldP]; covered {
+				if m, ok := fs.pendingIndex.GetMeta(oldP); ok && m.ownedStagingKnown {
+					metas = append(metas, m)
+				}
+			}
+		}
+		for _, meta := range metas {
 			if ownedMigrations[meta.Path] {
 				continue // Already migrated, or quarantined with its exact bytes.
 			}
