@@ -177,6 +177,12 @@ func (fs *Dat9FS) ftruncateChildLocked(fh *FileHandle) (*FileHandle, error) {
 // Verify a landed image before retiring a live ancestor. A watermark alone is
 // not a content proof. This also handles a parent closing before B's first write.
 func (fs *Dat9FS) adoptLandedFtruncateLocked(ctx context.Context, fh *FileHandle) (bool, error) {
+	return fs.adoptLandedFtruncateImageLocked(ctx, fh, false)
+}
+
+// Rename can verify the current complete image after flushing its cache. Other
+// callers keep the original ancestor proof and adoption behavior.
+func (fs *Dat9FS) adoptLandedFtruncateImageLocked(ctx context.Context, fh *FileHandle, currentImage bool) (bool, error) {
 	event := fh.pendingFtruncate.Load()
 	if event == nil {
 		return false, nil
@@ -185,7 +191,8 @@ func (fs *Dat9FS) adoptLandedFtruncateLocked(ctx context.Context, fh *FileHandle
 	if !ftruncateDescends(fh, event.id) {
 		base = min(base, event.revision)
 	}
-	if fs.ftruncateAliasRevision(fh) <= base {
+	observed := fs.ftruncateAliasRevision(fh)
+	if observed <= base {
 		return false, nil
 	}
 	reader := &CommitQueue{client: fs.client, remoteRoot: fs.remoteRoot()}
@@ -196,6 +203,23 @@ func (fs *Dat9FS) adoptLandedFtruncateLocked(ctx context.Context, fh *FileHandle
 	id := ftruncateSnapshotID(fh)
 	if id == "" {
 		id = event.id
+	}
+
+	if currentImage && (event.ino != fh.Ino || event.path != fh.Path || event.view != fs.mountViewGeneration.Load() || !fs.ftruncateAliasLinked(fh)) {
+		return false, syscall.EAGAIN
+	}
+
+	if currentImage && fh.Dirty != nil && fh.DirtySeq != 0 && fh.LineageTrusted && id != "" &&
+		size == fh.Dirty.Size() && fh.Dirty.CanMaterializeFull() && rev > base && rev >= observed &&
+		bytes.Equal(data, fh.Dirty.bytesView()) {
+		ancestors := fh.contentAncestors
+		if fh.StagedSnapshotID == id && fh.StagedSnapshotSeq == fh.DirtySeq {
+			ancestors = fh.stagedAncestors
+		}
+		fs.removeHandleOwnedStagingLocked(fh)
+		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		fs.installFtruncateImageLocked(fh, data, rev, id, append([]string(nil), ancestors...))
+		return true, nil
 	}
 	proof := pathCommitLandmark{}
 	if fs.commitQueue != nil {

@@ -127,18 +127,62 @@ func (fs *Dat9FS) renameOwnedWriteBackLocked(oldPath, newPath string) (moved boo
 // namespace changes. Any contention releases the partial capture; callers must
 // not wait for uploads or acquire handle locks while holding these exclusions.
 func (fs *Dat9FS) tryLockOwnedRenamePaths(oldP, newP string) (map[string]uint64, func(), error) {
+	return fs.tryLockOwnedRenamePathsOfType(oldP, newP, false)
+}
+
+// exact selects a regular file; directory callers retain descendant coverage.
+func (fs *Dat9FS) tryLockOwnedRenamePathsOfType(oldP, newP string, exact bool) (map[string]uint64, func(), error) {
+	prefix := oldP + "/"
+	if exact {
+		prefix = oldP
+	}
+	includes := func(p string) bool { return !exact || p == oldP }
+	cacheMetas := func() []*WriteBackMeta {
+		if exact {
+			if m, ok := fs.writeBack.GetMeta(oldP); ok {
+				return []*WriteBackMeta{m}
+			}
+			return nil
+		}
+		return fs.writeBack.ListByPrefix(prefix)
+	}
+
 	captured := make(map[string]uint64)
 	paths := make(map[string]bool)
 	// Read live participants before pending owners: Release publishes pending
 	// before unregistering its handle, so a handoff cannot disappear between scans.
-	for _, p := range fs.openHandles.ftruncatePathsByPrefix(oldP + "/") {
+	var livePaths []string
+	if exact {
+		for _, fh := range fs.openHandles.SnapshotPath(oldP) {
+			if fh.pendingFtruncate.Load() != nil {
+				livePaths = append(livePaths, oldP)
+			}
+		}
+	} else {
+		livePaths = fs.openHandles.ftruncatePathsByPrefix(prefix)
+	}
+	for _, p := range livePaths {
+		if !includes(p) {
+			continue
+		}
 		captured[p] = 0 // Coverage only, never a cleanup generation.
 		paths[p] = true
 		paths[newP+p[len(oldP):]] = true
 	}
 
 	if fs.pendingIndex != nil {
-		for _, meta := range fs.pendingIndex.ListByPrefix(oldP + "/") {
+		var pendingMetas []*WriteBackMeta
+		if exact {
+			if m, ok := fs.pendingIndex.GetMeta(oldP); ok {
+				pendingMetas = append(pendingMetas, m)
+			}
+		} else {
+			pendingMetas = fs.pendingIndex.ListByPrefix(prefix)
+		}
+		for _, meta := range pendingMetas {
+			if !includes(meta.Path) {
+				continue
+			}
 			if meta.ownedStagingKnown {
 				captured[meta.Path] = 0
 				paths[meta.Path] = true
@@ -147,7 +191,10 @@ func (fs *Dat9FS) tryLockOwnedRenamePaths(oldP, newP string) (map[string]uint64,
 		}
 	}
 	if fs.writeBack != nil {
-		for _, meta := range fs.writeBack.ListByPrefix(oldP + "/") {
+		for _, meta := range cacheMetas() {
+			if !includes(meta.Path) {
+				continue
+			}
 			if !meta.ownedStagingKnown {
 				continue
 			}
@@ -191,7 +238,10 @@ func (fs *Dat9FS) tryLockOwnedRenamePaths(oldP, newP string) (map[string]uint64,
 	}
 	if fs.writeBack != nil {
 		// Zero means live/pending coverage, not ownership of a cache snapshot.
-		for _, meta := range fs.writeBack.ListByPrefix(oldP + "/") {
+		for _, meta := range cacheMetas() {
+			if !includes(meta.Path) {
+				continue
+			}
 			if generation, covered := captured[meta.Path]; (meta.ownedStagingKnown && (!covered || generation != meta.Generation)) || (generation != 0 && !meta.ownedStagingKnown) {
 				unlock()
 				return nil, func() {}, syscall.EAGAIN
@@ -203,12 +253,28 @@ func (fs *Dat9FS) tryLockOwnedRenamePaths(oldP, newP string) (map[string]uint64,
 	busy := false
 	if fs.commitQueue != nil {
 		fs.commitQueue.mu.Lock()
-		busy = fs.commitQueue.hasPendingPrefixLocked(oldP + "/")
+		if exact {
+			cq := fs.commitQueue
+			for _, p := range []string{oldP, newP} {
+				_, inflight := cq.inFlight[p]
+				busy = busy || inflight || cq.hasQueuedPathLocked(p) || cq.hasImmediatePathLocked(p)
+			}
+		} else {
+			busy = fs.commitQueue.hasPendingPrefixLocked(oldP + "/")
+		}
 		fs.commitQueue.mu.Unlock()
 	}
 	if busy {
 		unlock()
 		return nil, func() {}, syscall.EAGAIN
+	}
+	if exact && captured[oldP] == 0 && fs.pendingIndex != nil {
+		if m, ok := fs.pendingIndex.GetMeta(oldP); ok && m.ownedStagingKnown {
+			// Pending bytes alone do not identify a submission owner. Let the
+			// existing old-path commit finish before changing its namespace.
+			unlock()
+			return nil, func() {}, syscall.EAGAIN
+		}
 	}
 	failpoint.InjectCall("ownedRenamePathsLocked", fs)
 	return captured, unlock, nil
@@ -257,11 +323,24 @@ func (fs *Dat9FS) waitRenameCommits(ctx context.Context, oldP, newP string) erro
 // lockOwnedRenamePaths shares Rename's existing operation deadline across
 // retries. Every wait happens after releasing all attempt-owned exclusions.
 func (fs *Dat9FS) lockOwnedRenamePaths(ctx context.Context, oldP, newP string) (map[string]uint64, func(), error) {
+	return fs.lockOwnedRenamePathsOfType(ctx, oldP, newP, false)
+}
+
+// Both namespace forms share the same budget and release-before-wait loop.
+func (fs *Dat9FS) lockOwnedRenamePathsOfType(ctx context.Context, oldP, newP string, exact bool) (map[string]uint64, func(), error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, func() {}, err
 		}
-		paths, unlock, err := fs.tryLockOwnedRenamePaths(oldP, newP)
+		var paths map[string]uint64
+		unlock := func() {}
+		var err error
+		if exact {
+			err = fs.settleCommittedFileRenameFence(ctx, oldP)
+		}
+		if err == nil {
+			paths, unlock, err = fs.tryLockOwnedRenamePathsOfType(oldP, newP, exact)
+		}
 		if err == nil {
 			if err = ctx.Err(); err == nil {
 				return paths, unlock, nil
@@ -284,8 +363,17 @@ func (fs *Dat9FS) lockOwnedRenamePaths(ctx context.Context, oldP, newP string) (
 			busy := false
 			if cq := fs.commitQueue; cq != nil {
 				cq.mu.Lock()
-				cq.forceDelayedPrefixLocked(oldP + "/")
-				busy = cq.hasPendingPrefixLocked(oldP + "/")
+				if exact {
+					cq.forceDelayedPathLocked(oldP)
+					cq.forceDelayedPathLocked(newP)
+					for _, p := range []string{oldP, newP} {
+						_, inflight := cq.inFlight[p]
+						busy = busy || inflight || cq.hasQueuedPathLocked(p) || cq.hasImmediatePathLocked(p)
+					}
+				} else {
+					cq.forceDelayedPrefixLocked(oldP + "/")
+					busy = cq.hasPendingPrefixLocked(oldP + "/")
+				}
 				cq.mu.Unlock()
 			}
 			if !busy && waited {
@@ -304,4 +392,34 @@ func (fs *Dat9FS) lockOwnedRenamePaths(ctx context.Context, oldP, newP string) (
 			}
 		}
 	}
+}
+
+// Retire only a verified already-landed image before Rename takes exclusions.
+func (fs *Dat9FS) settleCommittedFileRenameFence(ctx context.Context, p string) error {
+	for _, fh := range fs.openHandles.SnapshotPath(p) {
+		if fh.Flags&syscall.O_ACCMODE == syscall.O_RDONLY || fh.pendingFtruncate.Load() == nil {
+			continue
+		}
+		if !fh.TryLock() {
+			return syscall.EAGAIN
+		}
+		if fs.ftruncateParticipates(fh) && fh.ftruncateFence && fh.RemoteCommitUnlock != nil {
+			event := fh.pendingFtruncate.Load()
+			if event.ino != fh.Ino || event.path != fh.Path || event.view != fs.mountViewGeneration.Load() || !fs.ftruncateAliasLinked(fh) {
+				fh.Unlock()
+				return syscall.EAGAIN
+			}
+
+			adopted, err := fs.adoptLandedFtruncateImageLocked(ctx, fh, true)
+			if err != nil {
+				fh.Unlock()
+				return err
+			}
+			if adopted {
+				fs.releaseHandleRemoteCommitPathLocked(fh)
+			}
+		}
+		fh.Unlock()
+	}
+	return nil
 }
