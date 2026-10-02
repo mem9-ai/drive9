@@ -265,6 +265,38 @@ func TestSSEWatcherStreamCurrentVerifiesStatCache(t *testing.T) {
 	}
 }
 
+func TestSSEWatcherTagsOnlyFirstInitialSyncBeforeCurrent(t *testing.T) {
+	for _, currentFirst := range []bool{false, true} {
+		t.Run(map[bool]string{false: "initial reset first", true: "current first"}[currentFirst], func(t *testing.T) {
+			fs := &Dat9FS{}
+			w := &SSEWatcher{fs: fs}
+			w.handleEvent(nil, &client.ResetEvent{Reason: "structural_change"})
+			if fs.initialSyncResetGeneration.Load() != 0 {
+				t.Fatal("structural reset acquired initial-sync tag")
+			}
+			if currentFirst {
+				w.handleStreamCurrent(1)
+			}
+			w.handleEvent(nil, &client.ResetEvent{Reason: "initial_sync"})
+			want := uint64(2)
+			if currentFirst {
+				want = 0
+			}
+			if got := fs.initialSyncResetGeneration.Load(); got != want {
+				t.Fatalf("initial tag = %d, want %d", got, want)
+			}
+			w.handleEvent(nil, &client.ResetEvent{Reason: "initial_sync"})
+			w.handleStreamCurrent(3)
+			fs.markStatCacheUnverified()
+			w.handleEvent(nil, &client.ResetEvent{Reason: "initial_sync"})
+			fs.resetMountView()
+			if got := fs.initialSyncResetGeneration.Load(); got != want {
+				t.Fatalf("initial tag changed after later resets/current/disconnect: %d, want %d", got, want)
+			}
+		})
+	}
+}
+
 func TestSSEDisconnectInvalidatesDirectoryCache(t *testing.T) {
 	opts := &MountOptions{Profile: MountProfileCodingAgent}
 	opts.setDefaults()

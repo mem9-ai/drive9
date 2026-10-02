@@ -63,6 +63,12 @@ var testHookExtentBuildWait func()
 // testHookAfterLayerChmodShadowRead pins the read/ack ownership boundary.
 var testHookAfterLayerChmodShadowRead func(path string)
 
+// Directory race hooks run without the handle or mount-view mutex held.
+var testHookAfterDirectoryList func(fs *Dat9FS, path string, generation uint64)
+var testHookBeforeDirectoryOutputCheck func(fs *Dat9FS, path string, generation uint64)
+
+var errDirectoryViewChanged = fmt.Errorf("directory mount view changed: %w", syscall.EAGAIN)
+
 // errAppendRefreshBusy marks transient sibling-handle lock contention. Write
 // may retry it after yielding fh.mu and the path fence; lineage rejection uses
 // syscall.EAGAIN directly and returns to the caller without an internal spin.
@@ -91,6 +97,8 @@ type Dat9FS struct {
 	dirCache            *DirCache
 	metadataPrefetch    *siblingMetadataPrefetch
 	directoryPrefetch   *siblingDirectoryPrefetch
+	// Set once by the first initial_sync before the SSE stream becomes current.
+	initialSyncResetGeneration atomic.Uint64
 	// statCacheUnverified is true while the SSE stream is not known-current.
 	// In that state, file stat cache hits embedded in DirCache must fall back
 	// to HEAD revalidation instead of serving TTL-only attrs. Even when the
@@ -869,6 +877,10 @@ func (fs *Dat9FS) remotePath(localPath string) string {
 // caches and notifies the directory inode, so future readdir/attr paths are
 // refreshed without detaching cwd names.
 func (fs *Dat9FS) resetMountView() {
+	fs.resetMountViewWithInitialSync(false)
+}
+
+func (fs *Dat9FS) resetMountViewWithInitialSync(initialSync bool) {
 	if fs == nil {
 		return
 	}
@@ -902,6 +914,9 @@ func (fs *Dat9FS) resetMountView() {
 	}
 	if fs.metadataPrefetch != nil {
 		fs.metadataPrefetch.clear()
+	}
+	if initialSync {
+		fs.initialSyncResetGeneration.CompareAndSwap(0, generation)
 	}
 	fs.mountViewGeneration.Store(generation)
 	fs.mountViewMu.Unlock()
@@ -10942,11 +10957,14 @@ func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle, refre
 	if err != nil {
 		return nil, 0, err
 	}
+	if testHookAfterDirectoryList != nil {
+		testHookAfterDirectoryList(fs, dh.Path, generation)
+	}
 
 	dh.mu.Lock()
 	if fs.mountViewGeneration.Load() != generation {
 		dh.mu.Unlock()
-		return nil, 0, syscall.EAGAIN
+		return nil, 0, errDirectoryViewChanged
 	}
 	dh.Entries = cloneLoadedDirEntries(entries)
 	dh.entriesGeneration = generation
@@ -10954,6 +10972,43 @@ func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle, refre
 	dh.mu.Unlock()
 	fs.maybePrefetchSiblingDirectories(dh.Path)
 	return loaded, generation, nil
+}
+
+// loadDirHandleEntriesForRead returns with mountViewMu read-locked on success.
+// Only the single tagged startup reset permits a reload, before any output or
+// lookup references. Each attempt retains the normal stale-view fences.
+func (fs *Dat9FS) loadDirHandleEntriesForRead(ctx context.Context, dh *DirHandle, refresh bool) ([]DirEntry, uint64, error) {
+	originalGeneration := fs.mountViewGeneration.Load()
+	for attempt := 0; ; attempt++ {
+		entries, generation, err := fs.loadDirHandleEntries(ctx, dh, refresh)
+		if err == nil {
+			if testHookBeforeDirectoryOutputCheck != nil {
+				testHookBeforeDirectoryOutputCheck(fs, dh.Path, generation)
+			}
+			if fs.lockMountViewRead(generation) {
+				return entries, generation, nil
+			}
+			err = errDirectoryViewChanged
+		}
+		if attempt != 0 || !errors.Is(err, errDirectoryViewChanged) {
+			return nil, 0, err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, 0, ctxErr
+		}
+		fs.mountViewMu.RLock()
+		currentGeneration := fs.mountViewGeneration.Load()
+		retry := fs.initialSyncResetGeneration.Load() != 0 &&
+			currentGeneration == fs.initialSyncResetGeneration.Load() &&
+			currentGeneration == originalGeneration+1
+		fs.mountViewMu.RUnlock()
+		if !retry {
+			return nil, 0, err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, 0, ctxErr
+		}
+	}
 }
 
 func cloneLoadedDirEntries(entries []DirEntry) []DirEntry {
@@ -10986,13 +11041,10 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	defer dh.unlockRead()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
 
-	entries, generation, err := fs.loadDirHandleEntries(ctx, dh, fs.opts.GVisorCompat && input.Offset == 0)
+	entries, _, err := fs.loadDirHandleEntriesForRead(ctx, dh, fs.opts.GVisorCompat && input.Offset == 0)
 	if err != nil {
 		safeLogPrintf("list dir failed for %s: %v", dh.Path, err)
 		return listDirErrToFuseStatus(err)
-	}
-	if !fs.lockMountViewRead(generation) {
-		return gofuse.Status(syscall.EAGAIN)
 	}
 	defer fs.mountViewMu.RUnlock()
 
@@ -11044,13 +11096,10 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	defer dh.unlockRead()
 	fs.observePathPolicyWithContext(ctx, dh.Path)
 
-	entries, generation, err := fs.loadDirHandleEntries(ctx, dh, fs.opts.GVisorCompat && input.Offset == 0)
+	entries, generation, err := fs.loadDirHandleEntriesForRead(ctx, dh, fs.opts.GVisorCompat && input.Offset == 0)
 	if err != nil {
 		safeLogPrintf("list dir plus failed for %s: %v", dh.Path, err)
 		return listDirErrToFuseStatus(err)
-	}
-	if !fs.lockMountViewRead(generation) {
-		return gofuse.Status(syscall.EAGAIN)
 	}
 	defer fs.mountViewMu.RUnlock()
 
