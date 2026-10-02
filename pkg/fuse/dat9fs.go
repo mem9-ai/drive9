@@ -67,7 +67,19 @@ var testHookAfterLayerChmodShadowRead func(path string)
 var testHookAfterDirectoryList func(fs *Dat9FS, path string, generation uint64)
 var testHookBeforeDirectoryOutputCheck func(fs *Dat9FS, path string, generation uint64)
 
-var errDirectoryViewChanged = fmt.Errorf("directory mount view changed: %w", syscall.EAGAIN)
+var errMountViewChanged = fmt.Errorf("mount view changed: %w", syscall.EAGAIN)
+
+type mountViewReadAttempt struct {
+	changed bool
+}
+
+func (attempt *mountViewReadAttempt) lock(fs *Dat9FS, generation uint64) bool {
+	if fs.lockMountViewRead(generation) {
+		return true
+	}
+	attempt.changed = true
+	return false
+}
 
 // errAppendRefreshBusy marks transient sibling-handle lock contention. Write
 // may retry it after yielding fh.mu and the path fence; lineage rejection uses
@@ -949,6 +961,16 @@ func (fs *Dat9FS) lockMountViewRead(generation uint64) bool {
 		return false
 	}
 	return true
+}
+
+func (fs *Dat9FS) initialSyncViewChangedFrom(generation uint64) bool {
+	fs.mountViewMu.RLock()
+	defer fs.mountViewMu.RUnlock()
+	currentGeneration := fs.mountViewGeneration.Load()
+	initialSyncGeneration := fs.initialSyncResetGeneration.Load()
+	return initialSyncGeneration != 0 &&
+		currentGeneration == initialSyncGeneration &&
+		currentGeneration == generation+1
 }
 
 // cancelUnlinkedRemotePublishLocked drops path-keyed staging that would
@@ -5681,7 +5703,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err == nil {
 		if !fs.lockMountViewRead(generation) {
-			return nil, 0, syscall.EAGAIN
+			return nil, 0, errMountViewChanged
 		}
 		// Serve the merged view, not the raw response: a child whose commit
 		// settled during this LIST's RTT is absent from the response and,
@@ -5720,7 +5742,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 			fs.perfRecordRemote(perfRemoteList, listStart, listErr, 0)
 			if listErr == nil {
 				if !fs.lockMountViewRead(generation) {
-					return nil, 0, syscall.EAGAIN, true
+					return nil, 0, errMountViewChanged, true
 				}
 				view := reconciledFileInfos(fs.putDirectoryListing(parentPath, cachedFileInfos(listItems), request))
 				fs.mountViewMu.RUnlock()
@@ -6810,13 +6832,24 @@ func (fs *Dat9FS) notifyInodeAtSyncCommit(ino uint64) {
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
 	// Layer events can reset the view while a remote stat/list is in flight.
-	// That invalidates our snapshot, not the application's open/create. Retry
-	// only a changed view, boundedly; preserve ordinary remote EAGAIN errors.
-	for attempt := 0; ; attempt++ {
+	// The first SSE initial_sync has the same effect. These invalidate our
+	// snapshot, not the application's lookup. Retry only a proven changed view:
+	// once for the tagged initial sync, or boundedly for layer events. Preserve
+	// ordinary remote EAGAIN errors.
+	initialSyncRetried := false
+	layerRetries := 0
+	for {
 		generation := fs.mountViewGeneration.Load()
-		status = fs.lookupOnce(cancel, header, name, out)
-		if status != gofuse.Status(syscall.EAGAIN) || !fs.layerEnabled() ||
-			generation == fs.mountViewGeneration.Load() || attempt >= 3 {
+		attempt := &mountViewReadAttempt{}
+		status = fs.lookupOnce(cancel, header, name, out, attempt)
+		if status != gofuse.Status(syscall.EAGAIN) || !attempt.changed {
+			return status
+		}
+		if !initialSyncRetried && fs.initialSyncViewChangedFrom(generation) {
+			initialSyncRetried = true
+		} else if fs.layerEnabled() && layerRetries < 3 {
+			layerRetries++
+		} else {
 			return status
 		}
 		select {
@@ -6828,7 +6861,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}
 }
 
-func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
+func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut, attempt *mountViewReadAttempt) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseLookup, perfStart, status, 0) }()
 	childP, st := fs.childPath(header.NodeId, name)
@@ -6940,7 +6973,7 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 		fs.metadataPrefetch.noteAccess(childP)
 	}
 	cacheGeneration := fs.mountViewGeneration.Load()
-	if !fs.lockMountViewRead(cacheGeneration) {
+	if !attempt.lock(fs, cacheGeneration) {
 		return gofuse.Status(syscall.EAGAIN)
 	}
 	handled, cacheStatus := fs.lookupFromDirCache(parentPath, childP, name, out)
@@ -6950,7 +6983,7 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 	}
 	fs.maybePrefetchSiblingMetadata(ctx, childP)
 	cacheGeneration = fs.mountViewGeneration.Load()
-	if !fs.lockMountViewRead(cacheGeneration) {
+	if !attempt.lock(fs, cacheGeneration) {
 		return gofuse.Status(syscall.EAGAIN)
 	}
 	handled, cacheStatus = fs.lookupFromDirCache(parentPath, childP, name, out)
@@ -6981,6 +7014,9 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 			// match by name.
 			items, listGeneration, listErr := fs.lookupListWithRetry(cancel, parentPath)
 			if listErr != nil {
+				if errors.Is(listErr, errMountViewChanged) {
+					attempt.changed = true
+				}
 				return listDirErrToFuseStatus(listErr)
 			}
 			var matched client.FileInfo
@@ -6994,7 +7030,7 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 			}
 			if !matchedFound {
 				fs.maybeListOnNegativeLookupStorm(cancel, parentPath, childP)
-				if !fs.lockMountViewRead(listGeneration) {
+				if !attempt.lock(fs, listGeneration) {
 					return gofuse.Status(syscall.EAGAIN)
 				}
 				fs.cacheRemoteNotFoundPath(childP)
@@ -7003,7 +7039,7 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 				fs.mountViewMu.RUnlock()
 				return gofuse.ENOENT
 			}
-			if !fs.lockMountViewRead(listGeneration) {
+			if !attempt.lock(fs, listGeneration) {
 				return gofuse.Status(syscall.EAGAIN)
 			}
 			mtime := time.Now()
@@ -7030,7 +7066,7 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 		// Cache negative lookup: tell kernel this entry doesn't exist
 		// for NegativeEntryTTL so it doesn't re-ask immediately.
 		fs.maybeListOnNegativeLookupStorm(cancel, parentPath, childP)
-		if !fs.lockMountViewRead(statGeneration) {
+		if !attempt.lock(fs, statGeneration) {
 			return gofuse.Status(syscall.EAGAIN)
 		}
 		fs.cacheRemoteNotFoundPath(childP)
@@ -7040,7 +7076,7 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 		return gofuse.ENOENT
 	}
 
-	if !fs.lockMountViewRead(statGeneration) {
+	if !attempt.lock(fs, statGeneration) {
 		return gofuse.Status(syscall.EAGAIN)
 	}
 	mtime := time.Now()
@@ -8061,6 +8097,22 @@ func (fs *Dat9FS) cleanupCommittedInode(ino uint64, p string) {
 func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseGetAttr, perfStart, status, 0) }()
+	generation := fs.mountViewGeneration.Load()
+	attempt := &mountViewReadAttempt{}
+	status = fs.getAttrOnce(cancel, input, out, attempt)
+	if status != gofuse.Status(syscall.EAGAIN) || !attempt.changed || !fs.initialSyncViewChangedFrom(generation) {
+		return status
+	}
+	select {
+	case <-cancel:
+		return gofuse.EINTR
+	default:
+	}
+	*out = gofuse.AttrOut{}
+	return fs.getAttrOnce(cancel, input, out, &mountViewReadAttempt{})
+}
+
+func (fs *Dat9FS) getAttrOnce(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut, attempt *mountViewReadAttempt) gofuse.Status {
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -8198,7 +8250,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				if err != nil {
 					return listDirErrToFuseStatus(err)
 				}
-				if !fs.lockMountViewRead(statGeneration) {
+				if !attempt.lock(fs, statGeneration) {
 					return gofuse.Status(syscall.EAGAIN)
 				}
 				defer fs.mountViewMu.RUnlock()
@@ -8257,7 +8309,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 					if err != nil {
 						return listDirErrToFuseStatus(err)
 					}
-					if !fs.lockMountViewRead(statGeneration) {
+					if !attempt.lock(fs, statGeneration) {
 						return gofuse.Status(syscall.EAGAIN)
 					}
 					defer fs.mountViewMu.RUnlock()
@@ -10964,7 +11016,7 @@ func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle, refre
 	dh.mu.Lock()
 	if fs.mountViewGeneration.Load() != generation {
 		dh.mu.Unlock()
-		return nil, 0, errDirectoryViewChanged
+		return nil, 0, errMountViewChanged
 	}
 	dh.Entries = cloneLoadedDirEntries(entries)
 	dh.entriesGeneration = generation
@@ -10988,21 +11040,15 @@ func (fs *Dat9FS) loadDirHandleEntriesForRead(ctx context.Context, dh *DirHandle
 			if fs.lockMountViewRead(generation) {
 				return entries, generation, nil
 			}
-			err = errDirectoryViewChanged
+			err = errMountViewChanged
 		}
-		if attempt != 0 || !errors.Is(err, errDirectoryViewChanged) {
+		if attempt != 0 || !errors.Is(err, errMountViewChanged) {
 			return nil, 0, err
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, 0, ctxErr
 		}
-		fs.mountViewMu.RLock()
-		currentGeneration := fs.mountViewGeneration.Load()
-		retry := fs.initialSyncResetGeneration.Load() != 0 &&
-			currentGeneration == fs.initialSyncResetGeneration.Load() &&
-			currentGeneration == originalGeneration+1
-		fs.mountViewMu.RUnlock()
-		if !retry {
+		if !fs.initialSyncViewChangedFrom(originalGeneration) {
 			return nil, 0, err
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
