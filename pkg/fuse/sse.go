@@ -18,6 +18,8 @@ type SSEWatcher struct {
 	actor  string // our own actor ID for self-filtering
 	cancel context.CancelFunc
 	doneCh chan struct{}
+	// Owned by the SSE dispatch goroutine; reconnects never clear it.
+	initialCurrentSeen bool
 }
 
 // StartSSEWatcher starts a background goroutine that connects to the
@@ -54,6 +56,7 @@ func (w *SSEWatcher) Stop() {
 }
 
 func (w *SSEWatcher) handleStreamCurrent(uint64) {
+	w.initialCurrentSeen = true
 	if w.fs != nil {
 		w.fs.markStatCacheVerified()
 	}
@@ -142,7 +145,7 @@ func (w *SSEWatcher) handleReset(resets ...*client.ResetEvent) {
 	fmt.Fprintf(os.Stderr, "drive9: SSE reset — invalidating all caches\n")
 	w.fs.debugf("sse reset start seq=%d reason=%s", seq, reason)
 
-	w.fs.resetMountView()
+	w.fs.resetMountViewWithInitialSync(reason == "initial_sync" && !w.initialCurrentSeen)
 
 	w.fs.debugf("sse reset done seq=%d reason=%s dur=%s", seq, reason, time.Since(start))
 }

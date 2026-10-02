@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -286,7 +285,7 @@ func (fs *Dat9FS) loadRemoteDirectory(ctx context.Context, dirPath string, mount
 		return nil, responseBytes, err
 	}
 	if !fs.lockMountViewRead(mountGeneration) {
-		return nil, responseBytes, syscall.EAGAIN
+		return nil, responseBytes, errDirectoryViewChanged
 	}
 	defer fs.mountViewMu.RUnlock()
 
