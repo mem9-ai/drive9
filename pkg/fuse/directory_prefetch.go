@@ -285,7 +285,7 @@ func (fs *Dat9FS) loadRemoteDirectory(ctx context.Context, dirPath string, mount
 		return nil, responseBytes, err
 	}
 	if !fs.lockMountViewRead(mountGeneration) {
-		return nil, responseBytes, errDirectoryViewChanged
+		return nil, responseBytes, errMountViewChanged
 	}
 	defer fs.mountViewMu.RUnlock()
 
