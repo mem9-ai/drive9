@@ -457,6 +457,8 @@ func usage(code int) {
 			"                         mount drive9 or an object prefix (background FUSE by default)\n"+
 			"  mount drain [--timeout duration] [--json] <mountpoint>\n"+
 			"                         drain pending writes for a live FUSE mount\n"+
+			"  mount checkpoint --checkpoint-id ID [--timeout duration] [--json] <mountpoint>\n"+
+			"                         atomically checkpoint a writable LayerFS mount\n"+
 			"  mount status [--json] <mountpoint>\n"+
 			"                         show supervised mount health/status\n"+
 			"  mount health <mountpoint>\n"+

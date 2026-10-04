@@ -456,7 +456,14 @@ Default `restore-safe`:
 - `write(2)`: return after local durable WAL/shadow.
 - `close`, `fsync`, checkpoint, and unmount: must wait until the backend layer is durable.
 - Cross-sandbox restore only guarantees data before a durable checkpoint.
-- The sandbox orchestrator must run `checkpoint --wait` before replacement.
+- A sandbox orchestrator with a live writable FUSE mount must run
+  `drive9 mount checkpoint --checkpoint-id <id> <mountpoint>` before replacement.
+  This command blocks new mutations through that mount, waits for prior mutations,
+  drains pending work, and creates plus independently verifies the checkpoint while
+  the barrier is held.
+- The mount barrier does not fence a second mount or direct SDK writer targeting the
+  same layer. Orchestrators must keep one writer authority per layer unless a future
+  server-enforced writer fence is introduced.
 
 V1 accepts and stores `write-through` / `local-fast` for API/CLI compatibility and future scheduling policy extension. The current FUSE write implementation always uses `restore-safe` behavior and does not change write/flush/checkpoint paths based on those two modes. Any scheduler that depends on more aggressive or more conservative durability must still use explicit checkpoints as cross-sandbox restore boundaries in V1.
 

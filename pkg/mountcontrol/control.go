@@ -14,9 +14,10 @@ import (
 const DefaultDrainTimeout = 30 * time.Second
 
 type DrainRequest struct {
-	// Op is "" or "drain" (default) or "status"/"ping".
-	Op        string `json:"op,omitempty"`
-	TimeoutMS int64  `json:"timeout_ms,omitempty"`
+	// Op is "" or "drain" (default), "checkpoint", or "status"/"ping".
+	Op           string `json:"op,omitempty"`
+	TimeoutMS    int64  `json:"timeout_ms,omitempty"`
+	CheckpointID string `json:"checkpoint_id,omitempty"`
 }
 
 // StatusResponse is a cheap liveness reply from the mount control socket.
@@ -50,6 +51,14 @@ type DrainResponse struct {
 	NativeSyncFSSupported bool         `json:"native_syncfs_supported"`
 	Pending               DrainPending `json:"pending"`
 	Phases                []DrainPhase `json:"phases,omitempty"`
+	Checkpoint            *Checkpoint  `json:"checkpoint,omitempty"`
+}
+
+// Checkpoint identifies the LayerFS restore point verified by a mount barrier.
+type Checkpoint struct {
+	CheckpointID string `json:"checkpoint_id"`
+	LayerID      string `json:"layer_id"`
+	DurableSeq   int64  `json:"durable_seq"`
 }
 
 type DrainPending struct {
@@ -95,11 +104,44 @@ func (r *DrainResponse) Fail(kind, path string, err error) {
 }
 
 func RequestDrain(ctx context.Context, socketPath string, timeout time.Duration) (*DrainResponse, error) {
+	return requestDrainOperation(ctx, socketPath, timeout, DrainRequest{TimeoutMS: timeout.Milliseconds()})
+}
+
+// RequestCheckpoint asks a live mount to fence local mutations, drain prior
+// work, create the named LayerFS checkpoint, and independently verify it.
+func RequestCheckpoint(
+	ctx context.Context,
+	socketPath string,
+	checkpointID string,
+	timeout time.Duration,
+) (*DrainResponse, error) {
+	if checkpointID == "" {
+		return nil, fmt.Errorf("missing checkpoint ID")
+	}
+	return requestDrainOperation(ctx, socketPath, timeout, DrainRequest{
+		Op:           "checkpoint",
+		TimeoutMS:    timeout.Milliseconds(),
+		CheckpointID: checkpointID,
+	})
+}
+
+func requestDrainOperation(
+	ctx context.Context,
+	socketPath string,
+	timeout time.Duration,
+	req DrainRequest,
+) (*DrainResponse, error) {
 	if socketPath == "" {
 		return nil, fmt.Errorf("missing mount control socket")
 	}
 	if timeout <= 0 {
 		timeout = DefaultDrainTimeout
+		req.TimeoutMS = timeout.Milliseconds()
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout+5*time.Second)
+		defer cancel()
 	}
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "unix", socketPath)
@@ -111,13 +153,12 @@ func RequestDrain(ctx context.Context, socketPath string, timeout time.Duration)
 		_ = conn.SetDeadline(deadline)
 	}
 
-	req := DrainRequest{TimeoutMS: timeout.Milliseconds()}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return nil, fmt.Errorf("write drain request: %w", err)
+		return nil, fmt.Errorf("write mount control request: %w", err)
 	}
 	var resp DrainResponse
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
-		return nil, fmt.Errorf("read drain response: %w", err)
+		return nil, fmt.Errorf("read mount control response: %w", err)
 	}
 	return &resp, nil
 }

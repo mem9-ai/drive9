@@ -45,7 +45,7 @@ Related design documents:
 | --- | --- | --- |
 | Native Drive9 behavior without layer | Parity | The current implementation remains opt-in. Existing read/write, mount, local overlay, git workspace, pack/unpack, and related paths are unchanged when `--layer` is not set. |
 | LayerFS core model | Supported | Base root + writable layer, copy-up, whiteout, checkpoint, rollback, commit, and name/tag refs are available. |
-| FUSE layer mount | Partial | Writes, restore, and commit work. POSIX edges, open dirty-handle checkpoint barriers, multi-client consistency, and WebDAV strategy still need work. |
+| FUSE layer mount | Partial | Writes, restore, commit, and a mount-local atomic mutation/drain/checkpoint barrier work. POSIX edges, cross-mount writer fencing, multi-client consistency, and WebDAV strategy still need work. |
 | CLI layer parity | Partial | A batch of key write commands is covered, but direct read/composite commands such as `cat`, `ls`, `stat`, `pack`, `unpack`, and `git` are not layer-aware yet. |
 | Large files | Partial | Local large files and FUSE spill can use object upload. Multipart, resume, range, direct-to-object-store, quota, and GC are still missing. |
 | Search and indexing | Partial | `grep/find --layer` can produce an overlay view. Semantic search, tag search, pre-commit indexing, and checkpoint search are still missing. |
@@ -62,7 +62,7 @@ Related design documents:
 | Modify file | Write directly to base and enter the native commit queue. | Supported: writes go to layer entries/objects and do not mutate base directly. | Write destination switches to the layer table/object store; users must understand base is unchanged before commit. | P1 | FUSE + CLI write e2e and assertions that base stays unchanged. |
 | View overlay result | Native read/list/stat. | Partial: overlay is visible through FUSE; some direct CLI read commands are not layer-aware. | Direct CLI `cat/ls/stat` do not support `--layer`, so experience is inconsistent. | P1 | Direct CLI read commands support `--layer` and have e2e coverage. |
 | Diff/review | Native Drive9 has no session diff. | Partial: `drive9 fs layer diff` returns an entry list. | No git-style patch, content preview, directory aggregation, or conflict markers. | P2 | API/CLI diff schema is stable and covers rename/delete/large object. |
-| Checkpoint | Native Drive9 has no session checkpoint. | Supported: `layer checkpoint` records durable seq. | `--wait` is not yet a true dirty-handle barrier. | P0 | Cross-sandbox restore after checkpoint does not lose confirmed writes. |
+| Checkpoint | Native Drive9 has no session checkpoint. | Supported: `layer checkpoint` records durable seq; `mount checkpoint` provides the strong boundary for one live writable LayerFS FUSE mount. | Direct API/SDK checkpoint calls do not quiesce a mount, and the mount-local barrier does not fence other mounts or SDK writers. | P0 | Cross-sandbox restore after mount checkpoint does not lose confirmed writes; concurrent external writers remain explicitly out of scope. |
 | Rollback | User must manually revert changes. | Supported: rollback to checkpoint. | Rollback must keep events, FUSE cache, and sequence state consistent. | P1 | API + FUSE restore e2e covers multiple op types. |
 | Commit | Writes are already in base. | Partial: commit applies layer entries to base. | No strict global transaction; failure recovery relies on snapshot/best-effort rollback; no exactly-once ledger. | P0 | Conflict, failure recovery, repeated commit, and large-file commit tests. |
 | Abandon/delete layer | Delete an uncommitted workspace manually. | Gap: no delete/archive API. | Layer object and table data are retained; retention/GC are missing. | P0 | Delete/archive/retention/GC semantics and tests. |
@@ -101,6 +101,7 @@ Related design documents:
 | `drive9 fs layer status` | Supported | Can query by id/name/tag; ambiguous errors must remain clear. | P1 | Ambiguous ref tests. |
 | `drive9 fs layer diff` | Partial | Entry list, not a patch; no large-file preview. | P2 | Per-op diff e2e. |
 | `drive9 fs layer checkpoint` | Partial | `--wait` is not yet a full flush barrier. | P0 | Dirty-handle/checkpoint semantics tests. |
+| `drive9 mount checkpoint` | Supported | Atomically gates mutations through one writable active LayerFS FUSE mount, drains pending work, creates a deterministic checkpoint, and independently verifies it. It does not fence other mounts or direct SDK writers. | P0 | Pre-barrier writes are included, post-barrier writes wait, and every failure releases the gate without returning a checkpoint. |
 | `drive9 fs layer rollback` | Supported | No dry-run or conflict explain. | P2 | Rollback multi-op e2e. |
 | `drive9 fs layer commit` | Partial | Text output; `--json`, dry-run, and conflict explain are missing. | P1 | Successful, conflicted, and repeated commit tests. |
 | `drive9 fs layer delete/archive` | Gap | Cannot release uncommitted layer data. | P0 | Delete/archive plus object GC tests. |
@@ -154,7 +155,7 @@ Related design documents:
 | Git workspace coexistence | Partial | Can coexist through mount path; git-workspace-specific behavior is not systematically verified. | Native parity | P1 | git clone/status/commit-like workload e2e. |
 | Shadow store / spill | Supported | Large files can avoid JSON inline. | Native parity | P0 | Spill + object upload tests. |
 | Commit queue to layer | Supported | `--layer` mount writes enter layer entries/objects instead of the base commit queue. | LayerFS core | P1 | After write, base is unchanged and diff is visible. |
-| `flush`/`fsync`/`release` durability | Partial | Close/writeback tests exist; checkpoint wait barrier still needs work. | Ops-prod | P0 | Dirty-handle, crash, and unmount tests. |
+| `flush`/`fsync`/`release` durability | Partial | Close/writeback tests and the mount-local atomic checkpoint barrier exist; crash/power-loss and cross-mount writer fencing still need work. | Ops-prod | P0 | Dirty-handle, crash, cross-mount, and unmount tests. |
 | Multi-client event refresh | Partial | 1s polling; no SSE/watch; payload is simplified. | AgentFS-class | P1 | Two sandboxes sharing one layer sync in e2e. |
 | Rename file | Supported | No-replace semantics. | Native parity | P1 | Rename conflict tests. |
 | Rename directory | Partial | API/FUSE support it; snapshot rollback covers subtree; CLI parity is pending. | Native parity | P1 | Directory rename rollback/commit e2e. |
@@ -192,7 +193,7 @@ Related design documents:
 | Retention/GC | Gap | Lifecycle for uncommitted, committed, and rolled-back layer data is not implemented. | Ops-prod | P0 | GC reachability and safety tests. |
 | Object range read | Gap | Large-file reads lack Range support. | Native parity | P1 | Range/partial download tests. |
 | Direct-to-object-store upload | Gap | Server proxies uploads; cost and throughput are constrained. | Ops-prod | P2 | Presigned/multipart tests. |
-| Cross-sandbox restore | Partial | Checkpoint/event restore works; dirty-handle barrier and crash recovery are insufficient. | Ops-prod | P0 | kill/restart/restore no-data-loss tests. |
+| Cross-sandbox restore | Partial | Checkpoint/event restore and a mount-local dirty-handle barrier work; crash recovery and concurrent external writers remain insufficiently covered. | Ops-prod | P0 | kill/restart/restore no-data-loss tests plus explicit cross-mount behavior. |
 
 ## 8. Search, Discovery, And Indexing Matrix
 

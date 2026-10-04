@@ -86,6 +86,7 @@ var mountProfileAppendLogSupported = probeMountProfileAppendLogSupport
 //
 //   - `drive9 mount vault <path>`       -> read-only vault FUSE filesystem
 //   - `drive9 mount drain <mountpoint>` -> drain pending writes for a live FUSE mount
+//   - `drive9 mount checkpoint ...`     -> atomically quiesce and checkpoint a writable LayerFS mount
 //   - `drive9 mount [flags] <path>`     -> legacy writable fs mount (no
 //     subcommand keyword; first positional is the mount point)
 //
@@ -94,7 +95,7 @@ var mountProfileAppendLogSupported = probeMountProfileAppendLogSupport
 // set would quietly accept write-path flags for a vault mount - that
 // would violate Row C (read-only) in a subtle, mount-time-visible way.
 //
-// Only the CURRENT supported subcommand/backend keywords ("vault", "drain") are
+// Only the CURRENT supported subcommand/backend keywords ("vault", "drain", "checkpoint") are
 // reserved here. Every other first positional falls through to the legacy parser,
 // which enforces "exactly one mountpoint" so `drive9 mount kv /mnt/x` fails as a
 // positional-arity error rather than by pre-reserving backend-shaped words that do
@@ -107,6 +108,8 @@ func MountCmd(args []string) error {
 			return vaultMountCmd(args[1:], true)
 		case "drain":
 			return MountDrainCmd(args[1:])
+		case "checkpoint":
+			return MountCheckpointCmd(args[1:])
 		case "status":
 			return runMountStatus(args[1:])
 		case "health":

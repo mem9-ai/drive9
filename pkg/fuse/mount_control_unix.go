@@ -23,6 +23,8 @@ import (
 
 type mountControlServer struct {
 	fs         *Dat9FS
+	gate       *workspaceMutationGate
+	checkpoint mountCheckpointFunc
 	listener   net.Listener
 	socketPath string
 	startedAt  time.Time
@@ -30,7 +32,12 @@ type mountControlServer struct {
 	drainMu    sync.Mutex
 }
 
-func startMountControlServer(mountPoint string, fs *Dat9FS) (*mountControlServer, error) {
+func startMountControlServer(
+	mountPoint string,
+	fs *Dat9FS,
+	gate *workspaceMutationGate,
+	checkpoint mountCheckpointFunc,
+) (*mountControlServer, error) {
 	socketPath := mountstate.ControlSocketPath(mountPoint)
 	socketDir := filepath.Dir(socketPath)
 	if err := os.MkdirAll(socketDir, 0o700); err != nil {
@@ -45,6 +52,8 @@ func startMountControlServer(mountPoint string, fs *Dat9FS) (*mountControlServer
 	_ = os.Chmod(socketPath, 0o600)
 	s := &mountControlServer{
 		fs:         fs,
+		gate:       gate,
+		checkpoint: checkpoint,
 		listener:   ln,
 		socketPath: socketPath,
 		startedAt:  time.Now().UTC(),
@@ -113,12 +122,24 @@ func (s *mountControlServer) handleConn(conn net.Conn) {
 		})
 		return
 	}
+	if op != "" && op != "drain" && op != "checkpoint" {
+		resp := mountcontrol.NewDrainResponse(s.mountPoint(), time.Now().UTC())
+		resp.Fail("bad_request", "", errors.New("unsupported mount control operation"))
+		resp.Finish(time.Now().UTC())
+		_ = json.NewEncoder(conn).Encode(resp)
+		return
+	}
 	timeout := req.Timeout()
 	_ = conn.SetDeadline(time.Now().Add(timeout + 5*time.Second))
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	s.drainMu.Lock()
-	resp := s.fs.Drain(ctx)
+	var resp mountcontrol.DrainResponse
+	if op == "checkpoint" {
+		resp = runMountCheckpoint(ctx, s.fs, s.gate, req.CheckpointID, s.checkpoint)
+	} else {
+		resp = s.fs.Drain(ctx)
+	}
 	s.drainMu.Unlock()
 	if resp.MountPoint == "" {
 		resp.MountPoint = s.mountPoint()

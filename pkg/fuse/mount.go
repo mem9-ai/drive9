@@ -653,8 +653,17 @@ func Mount(opts *MountOptions) (err error) {
 	// Configure FUSE mount options
 	fuseOpts := newGoFuseMountOptions(opts)
 
+	// Writable LayerFS mounts expose an atomic local mutation barrier through
+	// their control socket. Normal mounts avoid the extra dispatch gate.
+	var mutationGate *workspaceMutationGate
+	var rawFS gofuse.RawFileSystem = dat9fs
+	if mountSupportsCheckpointControl(opts) {
+		mutationGate = newWorkspaceMutationGate()
+		rawFS = newGatedRawFileSystem(dat9fs, mutationGate)
+	}
+
 	// Create FUSE server
-	server, err := gofuse.NewServer(dat9fs, opts.MountPoint, fuseOpts)
+	server, err := gofuse.NewServer(rawFS, opts.MountPoint, fuseOpts)
 	if err != nil {
 		cleanupNewServerFailure(opts.MountPoint, err, layerEventWatcherStop, dat9fs.FlushAll, forceUnmount, nil)
 		return ExitStartupTransientErr("fuse mount", err)
@@ -719,7 +728,12 @@ func Mount(opts *MountOptions) (err error) {
 	if err != nil {
 		return err
 	}
-	controlServer, err := startMountControlServer(opts.MountPoint, dat9fs)
+	controlServer, err := startMountControlServer(
+		opts.MountPoint,
+		dat9fs,
+		mutationGate,
+		layerMountCheckpointFunc(c, opts),
+	)
 	if err != nil {
 		cleanupMountStartFailure(mountStartCleanup{
 			reason:       "mount control socket failure",

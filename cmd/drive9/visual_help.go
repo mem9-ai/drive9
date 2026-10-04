@@ -874,6 +874,19 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			},
 		},
 		{
+			Name:    "mount checkpoint",
+			Args:    "--checkpoint-id ID [--timeout duration] [--json] <mountpoint>",
+			Summary: "atomically quiesce, drain, create, and verify a writable LayerFS checkpoint",
+			Flags: []visualHelpFlag{
+				{Name: "--checkpoint-id ID", Desc: "required stable checkpoint identity"},
+				{Name: "--timeout DURATION", Desc: "maximum time for the full barrier; default 30s"},
+				{Name: "--json", Desc: "print the verified checkpoint identity and durable sequence as JSON"},
+			},
+			Examples: []visualHelpExample{
+				{Command: "drive9 mount checkpoint --checkpoint-id pi-task-42 ./mnt", Desc: "publish one verified checkpoint while local mutations are fenced"},
+			},
+		},
+		{
 			Name:    "mount systemd-unit",
 			Args:    "[--install] [--name name] [mount flags] <mountpoint>",
 			Summary: "print or install a systemd unit for a supervised mount",

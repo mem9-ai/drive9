@@ -1284,8 +1284,11 @@ if require_layer_fuse_prereqs; then
     "${fuse_root}/moved.txt" "upsert" \
     "${fuse_root}/link" "symlink")" "8"
   check_eq "layer diff captures FUSE chmod mode" "$(wait_layer_diff_file_mode "tag:fuse_run=$ts" "${fuse_root}/new.txt" "384")" "384"
-  fuse_checkpoint_json=$(drive9_retry fs layer checkpoint --id "$fuse_ckpt_id" --label fuse-before-after --json "$fuse_layer_name")
-  check_eq "fuse checkpoint resolves layer id" "$(printf '%s' "$fuse_checkpoint_json" | jq -r '.layer_id')" "$fuse_layer_id"
+  fuse_checkpoint_json=$(drive9 mount checkpoint --checkpoint-id "$fuse_ckpt_id" --json "$mount_a")
+  check_eq "mounted checkpoint succeeds" "$(printf '%s' "$fuse_checkpoint_json" | jq -r '.ok')" "true"
+  check_eq "mounted checkpoint resolves checkpoint id" "$(printf '%s' "$fuse_checkpoint_json" | jq -r '.checkpoint.checkpoint_id')" "$fuse_ckpt_id"
+  check_eq "mounted checkpoint resolves layer id" "$(printf '%s' "$fuse_checkpoint_json" | jq -r '.checkpoint.layer_id')" "$fuse_layer_id"
+  check_cmd "mounted checkpoint returns durable sequence" test "$(printf '%s' "$fuse_checkpoint_json" | jq -r '.checkpoint.durable_seq')" -ge 0
   printf 'fuse after checkpoint %s\n' "$ts" >"$mount_a/after.txt"
   check_eq "layer diff receives post-checkpoint FUSE write" "$(wait_layer_diff_entries "tag:fuse_run=$ts" "9" \
     "${fuse_root}/base.txt" "upsert" \

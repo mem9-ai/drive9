@@ -144,8 +144,8 @@ drive9 mount --mode=fuse --layer fix-auth-a :/repo ./attempt-a
 drive9 mount --mode=fuse --layer fix-auth-b :/repo ./attempt-b
 
 # Each agent edits, tests, and checkpoints independently.
-drive9 fs layer checkpoint fix-auth-a --label tests-pass
-drive9 fs layer checkpoint fix-auth-b --label alternative-pass
+drive9 mount checkpoint --checkpoint-id fix-auth-a-tests-pass ./attempt-a
+drive9 mount checkpoint --checkpoint-id fix-auth-b-alternative-pass ./attempt-b
 
 # The first commit updates the base. The second is preserved if it conflicts.
 drive9 fs layer commit fix-auth-a
@@ -154,6 +154,13 @@ drive9 fs layer commit fix-auth-b   # becomes conflicted if the base moved
 
 A conflicted layer is not silently overwritten or discarded. It stays available
 for review, diff, rollback, or manual resolution.
+
+`drive9 mount checkpoint` is the strong checkpoint boundary for a live writable
+LayerFS FUSE mount. It blocks new mutations through that mount, waits for
+mutations already in flight, drains pending work, creates the checkpoint, and
+independently reads it back before returning. The barrier is local to that mount;
+it does not fence another mount or a direct SDK writer targeting the same layer.
+Use one writer authority per layer when relying on this boundary.
 
 ### Vault and Journal Surfaces
 
