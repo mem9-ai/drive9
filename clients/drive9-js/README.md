@@ -54,6 +54,29 @@ Expected config format:
 Environment variables `DRIVE9_SERVER` or `DRIVE9_BASE` and `DRIVE9_API_KEY` take priority over the config file.
 `DRIVE9_CONFIG` can point to an alternate config file.
 
+## Optional Drive9 Runtime
+
+The default-off Runtime API provides durable private workspace executions and
+bounded file operations. See the [Runtime P1 guide](../../docs/guides/runtime.md)
+for the durability, recovery, and external-effect boundaries.
+
+```typescript
+const capabilities = await client.runtimeCapabilities();
+const operation = await client.submitRuntimeExecution("tool-call-42", {
+  workspace: {
+    client_scope_key: "agent-branch-42",
+    source: { root: "/projects/demo" },
+  },
+	profile: "go-build",
+  execution: { argv: ["go", "test", "./..."] },
+});
+```
+
+`capabilities.limits` reports the server-enforced admission, workspace, path,
+output, execution, capture, and checkpoint ceilings. Operations finalized
+through durable publication carry raw `usage` measurements; failures that do
+not publish may report zero. These fields are not a monetary billing contract.
+
 ### Client lifecycle & tuning
 
 | Operation | Method |

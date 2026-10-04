@@ -20,6 +20,10 @@ with server-side conflict detection.
 Local disks run the process. Git stores the final result. **Drive9 keeps the
 working state in between.**
 
+The optional, default-off [Drive9 Runtime P1](docs/guides/runtime.md) adds
+durable command and file operations over private checkpointed workspaces. It
+does not change ordinary filesystem or mount behavior.
+
 ```bash
 # Sandbox A mounts the workspace and starts working.
 drive9 mount --mode=fuse :/repo ./work

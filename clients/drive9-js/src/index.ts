@@ -1,6 +1,7 @@
 export { Client } from "./client.js";
 export { Drive9Error, StatusError, ConflictError, checkError } from "./error.js";
 export { FSLayerCommitConflictError } from "./layer.js";
+export { RuntimeProtocolVersion, RuntimeStatusError, RuntimeUnsupportedError } from "./runtime.js";
 export { StreamWriter } from "./stream.js";
 export { MaxBatchReadSmallPaths, MaxBatchStatPaths } from "./models.js";
 export type {
@@ -75,3 +76,12 @@ export type {
 } from "./models.js";
 export type { ReadPartFn, ProgressFn } from "./patch.js";
 export type { ArchiveOptions } from "./archive.js";
+export type {
+  RuntimeCapabilities,
+  RuntimeEvent,
+  RuntimeExecutionRequest,
+  RuntimeFileOperationRequest,
+  RuntimeOperation,
+  RuntimeRecovery,
+  RuntimeWorkspaceInput,
+} from "./runtime.js";

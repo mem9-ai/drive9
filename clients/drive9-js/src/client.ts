@@ -123,6 +123,25 @@ import {
 } from "./vault.js";
 import { watchEvents, watchEventsWithLifecycle } from "./events.js";
 import { archiveImpl, archiveToFileImpl, type ArchiveOptions } from "./archive.js";
+import {
+  cancelRuntimeOperation,
+  downloadRuntimeArtifact,
+  getRuntimeOperation,
+  getRuntimeRecovery,
+  recoverRuntimeOperation,
+  runtimeCapabilities,
+  submitRuntimeExecution,
+  submitRuntimeFileOperation,
+  watchRuntimeEvents,
+} from "./runtime.js";
+import type {
+  RuntimeCapabilities,
+  RuntimeEvent,
+  RuntimeExecutionRequest,
+  RuntimeFileOperationRequest,
+  RuntimeOperation,
+  RuntimeRecovery,
+} from "./runtime.js";
 
 const DEFAULT_SMALL_FILE_THRESHOLD = 50_000;
 const DEFAULT_SERVER = "https://api.drive9.ai";
@@ -312,6 +331,54 @@ export class Client {
       this.smallFileThreshold = this.statusCache.inline_threshold;
     }
     return this.statusCache;
+  }
+
+  runtimeCapabilities(): Promise<RuntimeCapabilities> {
+    return runtimeCapabilities(this);
+  }
+
+  submitRuntimeExecution(idempotencyKey: string, input: RuntimeExecutionRequest): Promise<RuntimeOperation> {
+    return submitRuntimeExecution(this, idempotencyKey, input);
+  }
+
+  submitRuntimeFileOperation(idempotencyKey: string, input: RuntimeFileOperationRequest): Promise<RuntimeOperation> {
+    return submitRuntimeFileOperation(this, idempotencyKey, input);
+  }
+
+  getRuntimeExecution(id: string): Promise<RuntimeOperation> {
+    return getRuntimeOperation(this, "executions", id);
+  }
+
+  getRuntimeFileOperation(id: string): Promise<RuntimeOperation> {
+    return getRuntimeOperation(this, "file-operations", id);
+  }
+
+  cancelRuntimeExecution(id: string): Promise<RuntimeOperation> {
+    return cancelRuntimeOperation(this, "executions", id);
+  }
+
+  cancelRuntimeFileOperation(id: string): Promise<RuntimeOperation> {
+    return cancelRuntimeOperation(this, "file-operations", id);
+  }
+
+  recoverRuntimeExecution(id: string, idempotencyKey: string, action: RuntimeRecovery["action"]): Promise<RuntimeRecovery> {
+    return recoverRuntimeOperation(this, "executions", id, idempotencyKey, action);
+  }
+
+  recoverRuntimeFileOperation(id: string, idempotencyKey: string, action: RuntimeRecovery["action"]): Promise<RuntimeRecovery> {
+    return recoverRuntimeOperation(this, "file-operations", id, idempotencyKey, action);
+  }
+
+  getRuntimeRecovery(id: string): Promise<RuntimeRecovery> {
+    return getRuntimeRecovery(this, id);
+  }
+
+  watchRuntimeEvents(collection: "executions" | "file-operations", id: string, after: number, onEvent: (event: RuntimeEvent) => void | Promise<void>, signal?: AbortSignal): Promise<void> {
+    return watchRuntimeEvents(this, collection, id, after, onEvent, signal);
+  }
+
+  downloadRuntimeArtifact(id: string): Promise<Uint8Array> {
+    return downloadRuntimeArtifact(this, id);
   }
 
   async maxUploadBytes(): Promise<number> {

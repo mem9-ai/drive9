@@ -21,6 +21,9 @@
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
 //	doctor  diagnose local drive9 runtime prerequisites
+//	runtime discover and use optional durable Runtime operations
+//	exec    submit a durable Runtime command
+//	execution, file-operation, recovery inspect or recover Runtime work
 //	update  update the drive9 CLI binary in place
 package main
 
@@ -61,6 +64,11 @@ var unpackHandler = cli.UnpackCommand
 var profileHandler = cli.Profile
 var umountHandler = cli.UmountCmd
 var updateHandler = cli.Update
+var runtimeHandler = cli.Runtime
+var runtimeExecHandler = cli.RuntimeExec
+var runtimeExecutionHandler = cli.RuntimeExecution
+var runtimeFileOperationHandler = cli.RuntimeFileOperation
+var runtimeRecoveryHandler = cli.RuntimeRecovery
 
 func main() {
 	if logger.CLIEnabled() {
@@ -289,6 +297,26 @@ func dispatch(cmd string, args []string) {
 		if err := updateHandler(args); err != nil {
 			fatal("update", err)
 		}
+	case "runtime":
+		if err := runtimeHandler(args); err != nil {
+			fatal("runtime", err)
+		}
+	case "exec":
+		if err := runtimeExecHandler(args); err != nil {
+			fatal("exec", err)
+		}
+	case "execution":
+		if err := runtimeExecutionHandler(args); err != nil {
+			fatal("execution", err)
+		}
+	case "file-operation":
+		if err := runtimeFileOperationHandler(args); err != nil {
+			fatal("file-operation", err)
+		}
+	case "recovery":
+		if err := runtimeRecoveryHandler(args); err != nil {
+			fatal("recovery", err)
+		}
 	default:
 		if cliLogger != nil {
 			logger.Warn(context.Background(), "cli_unknown_command", zap.String("command", cmd))
@@ -438,6 +466,13 @@ func usage(code int) {
 			"  ctx use <name>         activate context\n"+
 			"  ctx rm <name>          delete context\n"+
 			"  fs <command>           filesystem operations\n"+
+			"  runtime <capabilities|fs>\n"+
+			"                         optional durable Runtime operations\n"+
+			"  exec [flags] [-- argv...]\n"+
+			"                         submit a Runtime execution\n"+
+			"  execution <get|wait|logs|cancel|recover> ID\n"+
+			"  file-operation <get|wait|cancel|recover> ID\n"+
+			"  recovery <get|wait> ID inspect Runtime recovery\n"+
 			"  token <issue|revoke>   issue and revoke workspace-zone scoped tokens\n"+
 			"  vault <set|get|put|with|ls|rm|grant|revoke|audit>\n"+
 			"                         vault operations\n"+

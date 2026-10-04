@@ -922,6 +922,28 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			},
 		},
 		{
+			Name:    "runtime",
+			Args:    "<capabilities|fs> [arguments]",
+			Summary: "discover and use the optional durable Runtime",
+			Details: []string{
+				"drive9 exec submits commands; drive9 execution and drive9 file-operation inspect, cancel, or recover work",
+				"commands wait for durable terminal state by default; use drive9 exec --detach to return after submission",
+			},
+			Flags: []visualHelpFlag{
+				{Name: "--workspace :/PATH", Desc: "create a one-shot private Runtime workspace from the active context"},
+				{Name: "--workspace-ref ID", Desc: "reuse an existing Runtime workspace"},
+				{Name: "--idempotency-key KEY", Desc: "stable submission or recovery key"},
+				{Name: "--discard-uncommitted", Desc: "explicitly recover the last published checkpoint; never reruns shell"},
+			},
+			Examples: []visualHelpExample{
+				{Command: "drive9 runtime capabilities", Desc: "discover Runtime protocol support"},
+				{Command: "drive9 exec --workspace :/projects/demo -- go test ./...", Desc: "run a command and wait for its durable result"},
+				{Command: "drive9 execution logs exe_... --follow", Desc: "replay durable output and follow until terminal state"},
+				{Command: "drive9 runtime fs read --workspace-ref wr_... /result.txt", Desc: "read a file through a durable file operation"},
+				{Command: "drive9 execution recover exe_... --discard-uncommitted --wait", Desc: "explicitly discard unpublished state and restore"},
+			},
+		},
+		{
 			Name:    "doctor",
 			Args:    "fuse",
 			Summary: "diagnose local runtime prerequisites",
