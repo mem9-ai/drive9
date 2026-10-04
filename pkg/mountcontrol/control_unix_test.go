@@ -23,7 +23,7 @@ func TestRequestCheckpointSendsIdentityAndReturnsVerifiedRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() { _ = listener.Close() })
 
 	request := make(chan DrainRequest, 1)
 	serverErr := make(chan error, 1)
@@ -33,7 +33,7 @@ func TestRequestCheckpointSendsIdentityAndReturnsVerifiedRecord(t *testing.T) {
 			serverErr <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		var req DrainRequest
 		if err := json.NewDecoder(conn).Decode(&req); err != nil {
 			serverErr <- err

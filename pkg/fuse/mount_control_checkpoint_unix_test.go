@@ -15,7 +15,7 @@ import (
 
 func TestMountControlServerDispatchesCheckpoint(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
+	t.Cleanup(func() { _ = clientConn.Close() })
 	server := &mountControlServer{
 		fs:   newTestDrainFS(),
 		gate: newWorkspaceMutationGate(),
@@ -47,7 +47,7 @@ func TestMountControlServerDispatchesCheckpoint(t *testing.T) {
 
 func TestMountControlServerRejectsUnknownOperation(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
+	t.Cleanup(func() { _ = clientConn.Close() })
 	server := &mountControlServer{fs: newTestDrainFS()}
 	go server.handleConn(serverConn)
 
