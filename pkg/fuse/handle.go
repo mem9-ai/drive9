@@ -16,18 +16,19 @@ import (
 // FileHandle represents an open file in the FUSE filesystem.
 // WriteBuffer is defined in write.go and supports offset-based writes.
 type FileHandle struct {
-	Ino          uint64
-	Path         string
-	Layer        PathLayer
-	LocalFile    *os.File
-	Flags        uint32       // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
-	OpenPID      uint32       // PID that opened the handle, when supplied by the kernel
-	Dirty        *WriteBuffer // write buffer, nil for read-only opens
-	DirtySeq     uint64       // monotonic sequence for authoritative dirty-size tracking
-	WriteBackSeq uint64       // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
-	OrigSize     int64        // original file size at open time (for patch detection)
-	BaseRev      int64        // server revision at open time (for conflict detection)
-	appendLog    appendLogHandleState
+	Ino             uint64
+	Path            string
+	Layer           PathLayer
+	LocalFile       *os.File
+	Flags           uint32                // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
+	OpenPID         uint32                // PID that opened the handle, when supplied by the kernel
+	Dirty           *WriteBuffer          // write buffer, nil for read-only opens
+	DirtySeq        uint64                // monotonic sequence for authoritative dirty-size tracking
+	ftruncateWrites []ftruncateWriteRange // exact bytes written after a visible fd truncate
+	WriteBackSeq    uint64                // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
+	OrigSize        int64                 // original file size at open time (for patch detection)
+	BaseRev         int64                 // server revision at open time (for conflict detection)
+	appendLog       appendLogHandleState
 	// StorageClass is the cached view of the remote object's storage class
 	// (storageClassDB9 / storageClassS3, empty = unknown). It is seeded from
 	// the server's X-Dat9-Storage-Type stat header when available, updated
@@ -116,6 +117,11 @@ type FileHandle struct {
 	// A zero truncate can reach a sibling while it holds mu waiting for the
 	// path lock. Publish the event without taking that sibling's mu.
 	pendingSQLiteTruncate atomic.Pointer[sqliteHandleTruncate]
+	pendingFtruncate      atomic.Pointer[ftruncateInheritance]
+	ftruncateReadSeq      uint64 // readonly resource invalidation, never write authority
+	ftruncateReadRevision int64
+	ftruncateInherited    string // root truncate retained in the bounded ancestry proof
+	ftruncateFence        bool   // RemoteCommitUnlock is a real, non-fallback path lock
 	mu                    sync.Mutex
 }
 

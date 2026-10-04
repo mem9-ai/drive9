@@ -3,23 +3,26 @@ package fuse
 import (
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // OpenHandleIndex keeps O(1) indexes for currently open file handles.
 // It is intentionally separate from HandleTable so FUSE fh lookup remains a
 // simple id table while hot path lifecycle checks can avoid full-table scans.
 type OpenHandleIndex struct {
-	mu           sync.RWMutex
-	byInode      map[uint64]map[*FileHandle]struct{}
-	byPath       map[string]map[*FileHandle]struct{}
-	pathByHandle map[*FileHandle]string
+	mu               sync.RWMutex
+	byInode          map[uint64]map[*FileHandle]struct{}
+	byPath           map[string]map[*FileHandle]struct{}
+	visibleTruncates map[uint64]map[*FileHandle]uint64
+	pathByHandle     map[*FileHandle]string
 }
 
 func NewOpenHandleIndex() *OpenHandleIndex {
 	return &OpenHandleIndex{
-		byInode:      make(map[uint64]map[*FileHandle]struct{}),
-		byPath:       make(map[string]map[*FileHandle]struct{}),
-		pathByHandle: make(map[*FileHandle]string),
+		byInode:          make(map[uint64]map[*FileHandle]struct{}),
+		byPath:           make(map[string]map[*FileHandle]struct{}),
+		visibleTruncates: make(map[uint64]map[*FileHandle]uint64),
+		pathByHandle:     make(map[*FileHandle]string),
 	}
 }
 
@@ -36,9 +39,58 @@ func (idx *OpenHandleIndex) Add(fh *FileHandle) {
 // exists so a registration can be made atomic with another check (see
 // allocateGitWorkspaceFileHandle).
 func (idx *OpenHandleIndex) addLocked(fh *FileHandle) {
+	if fh.Flags&syscall.O_TRUNC == 0 || fh.ftruncateInherited != "" {
+		for sibling := range idx.byInode[fh.Ino] {
+			if fh.Flags&syscall.O_ACCMODE != syscall.O_RDONLY && sibling.Flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+				continue // Observers never seed writer inheritance.
+			}
+			if event := sibling.pendingFtruncate.Load(); event != nil && event.ino == fh.Ino {
+				if prior := fh.pendingFtruncate.Load(); prior == nil || prior.seq < event.seq {
+					copy := *event
+					copy.path = fh.Path
+					fh.pendingFtruncate.Store(&copy)
+				}
+			}
+		}
+	}
 	addHandleToSet(idx.byInode, fh.Ino, fh)
 	addHandleToSet(idx.byPath, fh.Path, fh)
 	idx.pathByHandle[fh] = fh.Path
+	if fh.Dirty != nil && fh.Dirty.visibleTruncate {
+		if idx.visibleTruncates[fh.Ino] == nil {
+			idx.visibleTruncates[fh.Ino] = make(map[*FileHandle]uint64)
+		}
+		idx.visibleTruncates[fh.Ino][fh] = fh.DirtySeq
+	}
+}
+
+// Publication and registration share idx.mu; reader mutable fields are not
+// accessed while the publisher holds only writable sibling locks.
+func (idx *OpenHandleIndex) notifyFtruncateReaders(event *ftruncateInheritance) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	for fh := range idx.byInode[event.ino] {
+		if fh.Flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+			copy := *event
+			copy.path = idx.pathByHandle[fh]
+			fh.pendingFtruncate.Store(&copy)
+		}
+	}
+}
+
+func (idx *OpenHandleIndex) ftruncateInheritance(ino uint64, path string) *ftruncateInheritance {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	var latest *ftruncateInheritance
+	for fh := range idx.byInode[ino] {
+		if fh.Flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+			continue
+		}
+		if event := fh.pendingFtruncate.Load(); event != nil && event.path == path && (latest == nil || event.seq > latest.seq) {
+			latest = event
+		}
+	}
+	return latest
 }
 
 func (idx *OpenHandleIndex) Remove(fh *FileHandle) {
@@ -48,6 +100,12 @@ func (idx *OpenHandleIndex) Remove(fh *FileHandle) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	removeHandleFromSet(idx.byInode, fh.Ino, fh)
+	if marked := idx.visibleTruncates[fh.Ino]; marked != nil {
+		delete(marked, fh)
+		if len(marked) == 0 {
+			delete(idx.visibleTruncates, fh.Ino)
+		}
+	}
 	if p, ok := idx.pathByHandle[fh]; ok {
 		removeHandleFromSet(idx.byPath, p, fh)
 		delete(idx.pathByHandle, fh)
@@ -56,6 +114,67 @@ func (idx *OpenHandleIndex) Remove(fh *FileHandle) {
 			removeHandleFromSet(idx.byPath, p, fh)
 		}
 	}
+}
+
+func (idx *OpenHandleIndex) MarkVisibleTruncate(fh *FileHandle, seq uint64) {
+	if idx == nil || fh == nil || fh.Ino == 0 {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if _, open := idx.byInode[fh.Ino][fh]; !open {
+		return
+	}
+	marked := idx.visibleTruncates[fh.Ino]
+	if marked == nil {
+		marked = make(map[*FileHandle]uint64)
+		idx.visibleTruncates[fh.Ino] = marked
+	}
+	marked[fh] = seq
+}
+
+func (idx *OpenHandleIndex) UnmarkVisibleTruncate(fh *FileHandle) {
+	if idx == nil || fh == nil {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if marked := idx.visibleTruncates[fh.Ino]; marked != nil {
+		delete(marked, fh)
+		if len(marked) == 0 {
+			delete(idx.visibleTruncates, fh.Ino)
+		}
+	}
+}
+
+// VisibleTruncateSeq returns the newest open fd-truncate sequence that a
+// committed mutation has not superseded. Sequence zero reserves the hint
+// while SetAttr is assigning the truncate's sequence under the handle lock.
+func (idx *OpenHandleIndex) VisibleTruncateSeq(ino, committedSeq uint64) (uint64, bool) {
+	if idx == nil || ino == 0 {
+		return 0, false
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	var latest uint64
+	provisional := false
+	for _, seq := range idx.visibleTruncates[ino] {
+		if seq == 0 {
+			provisional = true
+		} else if seq > committedSeq && seq > latest {
+			latest = seq
+		}
+	}
+	return latest, latest != 0 || provisional
+}
+
+func (idx *OpenHandleIndex) HasVisibleTruncate(ino uint64) bool {
+	if idx == nil || ino == 0 {
+		return false
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return len(idx.visibleTruncates[ino]) != 0
 }
 
 // UnlinkPath detaches currently open handles from a removed directory entry's
@@ -241,4 +360,21 @@ func (fs *Dat9FS) deleteFileHandle(fhID uint64, fh *FileHandle) {
 	}
 	fs.fileHandles.Delete(fhID)
 	fs.openHandles.Remove(fh)
+}
+
+// ftruncatePathsByPrefix snapshots accepted live participants without fh.mu.
+// Release publishes pending ownership before removing a handle from this index.
+func (idx *OpenHandleIndex) ftruncatePathsByPrefix(prefix string) []string {
+	if idx == nil {
+		return nil
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	var paths []string
+	for fh, p := range idx.pathByHandle {
+		if strings.HasPrefix(p, prefix) && fh.pendingFtruncate.Load() != nil {
+			paths = append(paths, p)
+		}
+	}
+	return paths
 }

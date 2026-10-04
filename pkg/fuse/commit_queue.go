@@ -10,7 +10,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/pingcap/failpoint"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
@@ -104,7 +107,10 @@ type CommitEntry struct {
 	cancelUpload                 context.CancelFunc
 	mutationPublished            bool
 	payload                      []byte
-	payloadBound                 bool
+	// Process-local alias fence captured by a live truncate participant.
+	ftruncatePaths []string
+	ftruncateValid func() bool
+	payloadBound   bool
 }
 
 func (entry *CommitEntry) payloadBaseRevision() int64 {
@@ -897,24 +903,7 @@ func (cq *CommitQueue) WaitPrefix(prefix string) {
 	for {
 		cq.mu.Lock()
 		cq.forceDelayedPrefixLocked(prefix)
-		found := false
-		for p := range cq.inFlight {
-			if strings.HasPrefix(p, prefix) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			for _, e := range cq.queue {
-				if strings.HasPrefix(e.Path, prefix) {
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			found = cq.hasImmediatePrefixLocked(prefix)
-		}
+		found := cq.hasPendingPrefixLocked(prefix)
 		cq.mu.Unlock()
 		if !found {
 			return
@@ -932,24 +921,7 @@ func (cq *CommitQueue) WaitPrefixTimeout(prefix string, timeout time.Duration) b
 	for {
 		cq.mu.Lock()
 		cq.forceDelayedPrefixLocked(prefix)
-		found := false
-		for p := range cq.inFlight {
-			if strings.HasPrefix(p, prefix) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			for _, e := range cq.queue {
-				if strings.HasPrefix(e.Path, prefix) {
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			found = cq.hasImmediatePrefixLocked(prefix)
-		}
+		found := cq.hasPendingPrefixLocked(prefix)
 		cq.mu.Unlock()
 		if !found {
 			return true // drained
@@ -1500,7 +1472,13 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		entry.cancelUpload = cancel
 		cq.mu.Unlock()
 
-		unlockPath := cq.lockPath(entry.Path)
+		unlockPath := cq.lockEntryPath(entry)
+		if err := cq.validateRecoveredEntry(entry); err != nil {
+			cancel()
+			cq.onCommitTerminalFailure(entry, err)
+			unlockPath()
+			return
+		}
 		if cq.discardSupersededEntry(entry) || cq.discardLandedAncestor(entryCtx, entry) {
 			unlockPath()
 			return
@@ -1538,6 +1516,11 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			unlockPath()
 			cq.removeFromQueue(entry)
 			safeLogPrintf("commit queue: entry for %s was canceled during upload", entry.Path)
+			return
+		}
+		if errors.Is(err, syscall.ESTALE) {
+			cq.onCommitTerminalFailure(entry, err)
+			unlockPath()
 			return
 		}
 		if errors.Is(err, errCommitPayloadStale) {
@@ -1681,6 +1664,9 @@ func (cq *CommitQueue) canAddToBatch(entry *CommitEntry, seenPaths map[string]st
 }
 
 func (cq *CommitQueue) batchWriteEligible(entry *CommitEntry) bool {
+	if entry != nil && len(entry.ftruncatePaths) > 1 {
+		return false
+	}
 	if cq == nil || entry == nil || entry.canceled || entry.ShadowSpill || cq.shadows == nil || cq.client == nil {
 		return false
 	}
@@ -1732,8 +1718,14 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 	}
 	cq.mu.Unlock()
 	unlockPaths := cq.lockBatchPaths(entries)
+	failpoint.InjectCall("recoveredBatchLocked", cq)
 	active := entries[:0]
 	for _, entry := range entries {
+		if err := cq.validateRecoveredEntry(entry); err != nil {
+			cq.onCommitTerminalFailure(entry, err)
+			cq.endInFlight(entry)
+			continue
+		}
 		if cq.discardSupersededEntry(entry) || cq.discardLandedAncestor(ctx, entry) {
 			cq.endInFlight(entry)
 			continue
@@ -1755,6 +1747,21 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 
 	remoteItems, err := cq.prepareBatchWriteItems(ctx, entries)
 	if err != nil {
+		if errors.Is(err, syscall.ESTALE) {
+			survivors := entries[:0]
+			for _, entry := range entries {
+				if admissionErr := cq.validateRecoveredEntry(entry); admissionErr != nil {
+					cq.onCommitTerminalFailure(entry, admissionErr)
+					cq.endInFlight(entry)
+					continue
+				}
+				survivors = append(survivors, entry)
+			}
+			unlockPaths()
+			cancel()
+			cq.fallbackBatchEntries(survivors)
+			return
+		}
 		unlockPaths()
 		cancel()
 		if errors.Is(err, errCommitPayloadStale) {
@@ -1774,6 +1781,12 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 					// proof and its success bookkeeping must not straddle a
 					// synchronous same-path commit.
 					unlockEntry := cq.lockPath(entry.Path)
+					if admissionErr := cq.validateRecoveredEntry(entry); admissionErr != nil {
+						cq.onCommitTerminalFailure(entry, admissionErr)
+						unlockEntry()
+						cq.endInFlight(entry)
+						continue
+					}
 					resolved, _ := cq.resolveStalePayloadAsIdempotent(entryCtx, entry)
 					unlockEntry()
 					if resolved {
@@ -1868,6 +1881,7 @@ func (cq *CommitQueue) prepareBatchWriteItems(ctx context.Context, entries []*Co
 		if err != nil {
 			return nil, fmt.Errorf("read shadow %s: %w", entry.Path, err)
 		}
+		failpoint.InjectCall("batchPayloadPrepared", cq, entry)
 		item := client.BatchWriteItem{
 			Path:             cq.remotePath(entry.Path),
 			ExpectedRevision: entry.BaseRev,
@@ -1909,6 +1923,7 @@ func (cq *CommitQueue) lockBatchPaths(entries []*CommitEntry) func() {
 
 func (cq *CommitQueue) fallbackBatchEntries(entries []*CommitEntry) {
 	for _, entry := range entries {
+		failpoint.InjectCall("batchFallbackEntry", cq, entry)
 		if cq.isEntryCanceled(entry) {
 			cq.removeFromQueue(entry)
 			cq.endInFlight(entry)
@@ -1945,6 +1960,12 @@ func sleepWithCancel(ctx context.Context, delay time.Duration) bool {
 func (cq *CommitQueue) validateEntryPayloadFreshCtx(ctx context.Context, entry *CommitEntry) error {
 	if entry == nil {
 		return nil
+	}
+	if err := cq.validateRecoveredEntry(entry); err != nil {
+		return err
+	}
+	if entry.ftruncateValid != nil && !entry.ftruncateValid() {
+		return syscall.ESTALE
 	}
 	payloadBaseRev := entry.payloadBaseRevision()
 	watermark := cq.effectiveDurableWatermark(entry)
@@ -2099,7 +2120,7 @@ func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error 
 	if release != nil {
 		defer release()
 	}
-	unlockPath := cq.lockPath(entry.Path)
+	unlockPath := cq.lockEntryPath(entry)
 	defer unlockPath()
 	return cq.commitNowClaimedPathLocked(ctx, entry)
 }
@@ -2133,6 +2154,9 @@ func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEnt
 }
 
 func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *CommitEntry) error {
+	if err := cq.validateRecoveredEntry(entry); err != nil {
+		return err
+	}
 	if cq.isCanceledImmediateEntry(entry) {
 		cq.removeFromQueue(entry)
 		return nil
@@ -2964,6 +2988,13 @@ func (cq *CommitQueue) onCommitPostUploadFailure(entry *CommitEntry, err error) 
 }
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error) {
+	// A rejected legacy recovery without an identity cannot authorize the
+	// unconditional marker or a path-only journal completion for newer data.
+	if entry.recovered && entry.PendingIndexGen == 0 {
+		cq.removeFromQueue(entry)
+		cq.recordCommitTerminalFailure(entry, lastErr)
+		return
+	}
 	// Mark the entry as conflicted in the pending index so that crash
 	// recovery (RecoverPending) skips it instead of retrying forever.
 	// Preserve both the shadow file and the pending metadata so the user
@@ -3030,9 +3061,97 @@ func classifyCommitTerminalReason(lastErr error) string {
 		return "conflict"
 	case errors.Is(lastErr, errLayerRolledBack):
 		return "abandoned"
-	case errors.Is(lastErr, client.ErrConflict), errors.Is(lastErr, errCommitPayloadStale):
+	case errors.Is(lastErr, client.ErrConflict), errors.Is(lastErr, errCommitPayloadStale), errors.Is(lastErr, syscall.ESTALE):
 		return "conflict"
 	default:
 		return "upload_failure"
 	}
+}
+
+// lockEntryPath composes the existing raw path callback for a captured alias
+// set. Such entries are never batched, so overlapping sets are not re-locked.
+func (cq *CommitQueue) lockEntryPath(entry *CommitEntry) func() {
+	if len(entry.ftruncatePaths) == 0 {
+		return cq.lockPath(entry.Path)
+	}
+	unlocks := make([]func(), 0, len(entry.ftruncatePaths))
+	for _, p := range entry.ftruncatePaths {
+		unlocks = append(unlocks, cq.lockPath(p))
+	}
+	return func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}
+}
+
+// hasFtruncateInode includes closed-source jobs and synchronous claims. It
+// consults existing collections; no separate namespace lifetime/index is kept.
+func (cq *CommitQueue) hasFtruncateInode(ino uint64, paths []string) bool {
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	matches := func(e *CommitEntry) bool {
+		return e != nil && !e.canceled && e.Inode == ino && len(e.ftruncatePaths) != 0
+	}
+	for _, path := range paths {
+		if matches(cq.inFlight[path]) {
+			return true
+		}
+		for e := range cq.queuedByPath[path] {
+			if matches(e) {
+				return true
+			}
+		}
+	}
+	if cq.queuedByPath == nil {
+		for _, e := range cq.queue {
+			if matches(e) {
+				return true
+			}
+		}
+	}
+	for e := range cq.immediate {
+		if matches(e) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateRecoveredEntry rechecks a recovery selection under the commit path
+// exclusion before upload or successful cleanup. Selection is not authority
+// after rename quarantine or same-path restaging. Live entries keep their rules.
+func (cq *CommitQueue) validateRecoveredEntry(entry *CommitEntry) error {
+	if entry == nil || !entry.recovered {
+		return nil
+	}
+	if cq.index == nil || entry.PendingIndexGen == 0 {
+		return syscall.ESTALE
+	}
+	meta, ok := cq.index.GetMeta(entry.Path)
+	if ok && meta.Kind == PendingConflict && cq.layerRefSnapshot() != "" {
+		// Recovery now rejects before uploadLayerEntry, so retain its guard
+		// against automatically overwriting an observed Layer conflict.
+		entry.DisableAutoResolveLWW = true
+	}
+	if !ok || meta.Generation != entry.PendingIndexGen || meta.Kind == PendingConflict {
+		return syscall.ESTALE
+	}
+	return nil
+}
+
+// hasPendingPrefixLocked requires cq.mu. Callers decide whether to activate
+// delayed work and whether to wait; rename admission must never wait here.
+func (cq *CommitQueue) hasPendingPrefixLocked(prefix string) bool {
+	for p := range cq.inFlight {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	for _, entry := range cq.queue {
+		if strings.HasPrefix(entry.Path, prefix) {
+			return true
+		}
+	}
+	return cq.hasImmediatePrefixLocked(prefix)
 }

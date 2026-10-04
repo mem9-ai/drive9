@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1939,6 +1940,8 @@ func TestClassifyCommitTerminalReason(t *testing.T) {
 		{fmt.Errorf("%w: 409", errLayerRolledBack), "abandoned"},
 		{client.ErrConflict, "conflict"},
 		{errCommitPayloadStale, "conflict"},
+		{syscall.ESTALE, "conflict"},
+		{fmt.Errorf("alias fence: %w", syscall.ESTALE), "conflict"},
 		{fmt.Errorf("HTTP 503"), "upload_failure"},
 	}
 	for _, tc := range cases {

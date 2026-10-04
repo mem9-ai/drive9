@@ -102,6 +102,12 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
 	}
+	if fs.ftruncateParticipates(fh) {
+		defer fs.releaseHandleRemoteCommitPathLocked(fh)
+	}
+	if handled, err := fs.prepareFtruncateCommitLocked(ctx, fh, fs.syncMode == SyncStrict); handled || err != nil {
+		return httpToFuseStatus(err)
+	}
 	if fs.discardSupersededMutationLocked(fh) {
 		phase = "superseded-mutation"
 		return gofuse.OK
@@ -281,6 +287,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		if err == nil {
 			mutationRevision := fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
 			fs.recordCommittedMutation(handleIno, mutationSeq, mutationRevision, size)
+			fs.captureFtruncateIdentity(ctx, handleIno, handlePath, mutationRevision)
 			if mutationRevision > 0 {
 				fs.refreshCommittedRevisionForOpenHandlesWithSize(handlePath, mutationRevision, fh, size)
 			}
@@ -411,6 +418,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 		mutationRevision := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
 		fs.recordCommittedMutation(fh.Ino, mutationSeq, mutationRevision, size)
+		fs.captureFtruncateIdentity(ctx, fh.Ino, fh.Path, mutationRevision)
 		if mutationRevision > 0 {
 			fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, mutationRevision, fh, size)
 		}
