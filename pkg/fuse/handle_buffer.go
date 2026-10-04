@@ -130,7 +130,7 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 // readHandleBufferLocked serves private writable buffers and shadows before
 // Read falls through to remote I/O. It always releases fh.mu; handled reports
 // whether it produced a response (including an error or EOF).
-func (fs *Dat9FS) readHandleBufferLocked(fh *FileHandle, input *gofuse.ReadIn) (gofuse.ReadResult, gofuse.Status, string, int, bool) {
+func (fs *Dat9FS) readHandleBufferLocked(fh *FileHandle, input *gofuse.ReadIn, usePublishedAppend bool) (gofuse.ReadResult, gofuse.Status, string, int, bool) {
 	var source string
 	var bytesRead int
 	if fh.ShadowSpill && fs.shadowStore != nil && fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.Dirty.Size() == 0 && !fh.Dirty.hasDirtyPartMarks() && !fh.ZeroBase && fh.Flags&syscall.O_TRUNC == 0 {
@@ -152,7 +152,7 @@ func (fs *Dat9FS) readHandleBufferLocked(fh *FileHandle, input *gofuse.ReadIn) (
 
 	// ShadowSpill: read from shadow file (the authoritative data source).
 	// Dirty has evicted parts so ReadAt would return incomplete data.
-	if fh.ShadowSpill && fs.shadowStore != nil {
+	if !usePublishedAppend && fh.ShadowSpill && fs.shadowStore != nil {
 		offset := int64(input.Offset)
 		size := fh.Dirty.Size()
 		// Open-unlinked handle: read from the pinned private backing (a
@@ -287,7 +287,7 @@ func (fs *Dat9FS) readHandleBufferLocked(fh *FileHandle, input *gofuse.ReadIn) (
 		// on the server, so fall through to ReadStreamRange.
 		source = "dirty-evicted-remote"
 		fh.Unlock()
-	} else if fh.Dirty != nil && fh.ShadowReady {
+	} else if !usePublishedAppend && fh.Dirty != nil && fh.ShadowReady {
 		offset := int64(input.Offset)
 		size := fh.Dirty.Size()
 		if offset >= size {
@@ -306,7 +306,7 @@ func (fs *Dat9FS) readHandleBufferLocked(fh *FileHandle, input *gofuse.ReadIn) (
 		source = "dirty-shadow"
 		bytesRead = len(result)
 		return gofuse.ReadResultData(result), gofuse.OK, source, bytesRead, true
-	} else if fh.Dirty != nil && fh.Dirty.Size() > 0 && !fh.Dirty.HasDirtyParts() {
+	} else if !usePublishedAppend && fh.Dirty != nil && fh.Dirty.Size() > 0 && !fh.Dirty.HasDirtyParts() {
 		// Writable handle with lazy-loaded buffer (no dirty parts yet) —
 		// serve already-loaded ranges from memory and fall back to the server
 		// only when the requested range still has unloaded parts.
