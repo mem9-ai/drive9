@@ -5,7 +5,13 @@ import { join } from "node:path";
 import { setupServer } from "msw/node";
 import { http, HttpResponse } from "msw";
 
-import { Client, FSLayerCommitConflictError, MaxBatchReadSmallPaths, MaxBatchStatPaths } from "../src/index.js";
+import {
+  Client,
+  ConflictError,
+  FSLayerCommitConflictError,
+  MaxBatchReadSmallPaths,
+  MaxBatchStatPaths,
+} from "../src/index.js";
 
 const server = setupServer();
 
@@ -396,6 +402,71 @@ describe("TypeScript SDK parity surface", () => {
     expect((await client.replayFSLayer("layer_1")).length).toBe(1);
     expect((await client.upsertFSLayerEntry("layer_1", { path: "/a.txt", content: text.encode("x") })).path).toBe("/a.txt");
     expect((await client.commitFSLayer("layer_1")).applied).toBe(1);
+  });
+
+  it("covers LayerFS fork and delete endpoint shapes", async () => {
+    server.use(
+      http.post("http://localhost:9009/v1/layers/parent-ref/fork", async ({ request }) => {
+        expect(request.headers.get("authorization")).toBe("Bearer key");
+        expect(await request.json()).toEqual({
+          layer_id: "child_1",
+          name: "child",
+          actor_id: "agent-1",
+          checkpoint_id: "checkpoint_1",
+        });
+        return HttpResponse.json(
+          {
+            layer_id: "child_1",
+            base_root_path: "/",
+            name: "child",
+            state: "active",
+            durability_mode: "restore-safe",
+            actor_id: "agent-1",
+            durable_seq: 0,
+            parent_layer_id: "parent_1",
+            origin_seq: 7,
+            origin_checkpoint_id: "checkpoint_1",
+            root_layer_id: "parent_1",
+            depth: 1,
+            origin: "fork",
+            created_at: "now",
+            updated_at: "now",
+          },
+          { status: 201 }
+        );
+      }),
+      http.delete("http://localhost:9009/v1/layers/child_1", ({ request }) => {
+        expect(new URL(request.url).searchParams.get("cascade")).toBe("true");
+        return HttpResponse.json({ status: "abandoned", layer_id: "child_1" });
+      })
+    );
+
+    const client = new Client("http://localhost:9009", "key");
+    const child = await client.forkFSLayer("parent-ref", {
+      layer_id: "child_1",
+      name: "child",
+      actor_id: "agent-1",
+      checkpoint_id: "checkpoint_1",
+    });
+    expect(child.parent_layer_id).toBe("parent_1");
+    expect(child.origin_checkpoint_id).toBe("checkpoint_1");
+    expect(child.depth).toBe(1);
+    await client.deleteFSLayer(child.layer_id, { cascade: true });
+  });
+
+  it("maps LayerFS delete conflicts through the shared error contract", async () => {
+    server.use(
+      http.delete("http://localhost:9009/v1/layers/parent_1", () =>
+        HttpResponse.json({ error: "fs layer has children" }, { status: 409 })
+      )
+    );
+
+    const client = new Client("http://localhost:9009", "key");
+    await expect(client.deleteFSLayer("parent_1")).rejects.toMatchObject({
+      name: "ConflictError",
+      message: "fs layer has children",
+      statusCode: 409,
+    } satisfies Partial<ConflictError>);
   });
 
   it("preserves LayerFS commit conflict details on 409", async () => {

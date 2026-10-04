@@ -8,7 +8,9 @@ import {
   commitFSLayer,
   createFSLayer,
   checkpointFSLayer,
+  deleteFSLayer,
   diffFSLayer,
+  forkFSLayer,
   getFSLayer,
   getFSLayerCheckpoint,
   getFSLayerEntry,
@@ -56,9 +58,11 @@ import type {
   FSLayerCheckpointRequest,
   FSLayerCommit,
   FSLayerCreateRequest,
+  FSLayerDeleteOptions,
   FSLayerEntry,
   FSLayerEntryRequest,
   FSLayerEvent,
+  FSLayerForkRequest,
   GitObjectPack,
   GitObjectPackRequest,
   GitOverlayEntry,
@@ -915,6 +919,14 @@ export class Client {
 
   async getFSLayer(layerId: string): Promise<FSLayer> {
     return getFSLayer(this, layerId);
+  }
+
+  async forkFSLayer(parentRef: string, req: FSLayerForkRequest = {}): Promise<FSLayer> {
+    return forkFSLayer(this, parentRef, req);
+  }
+
+  async deleteFSLayer(layerId: string, options: FSLayerDeleteOptions = {}): Promise<void> {
+    return deleteFSLayer(this, layerId, options);
   }
 
   async diffFSLayer(layerId: string, maxSeq?: number): Promise<FSLayerEntry[]> {

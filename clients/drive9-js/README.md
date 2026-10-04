@@ -209,6 +209,8 @@ provides `onDisconnected(err)` and `onCurrent(seq)` callbacks.
 | Create layer | `await client.createFSLayer(request)` |
 | List layers | `await client.listFSLayers()` |
 | Get layer | `await client.getFSLayer(layerId)` |
+| Fork layer | `await client.forkFSLayer(parentRef, request?)` |
+| Abandon layer (logical delete) | `await client.deleteFSLayer(layerId, { cascade? })` |
 | Diff layer | `await client.diffFSLayer(layerId, maxSeq?)` |
 | Replay layer | `await client.replayFSLayer(layerId, maxSeq?)` |
 | Upsert entry | `await client.upsertFSLayerEntry(layerId, request)` |
