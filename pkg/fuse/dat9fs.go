@@ -4628,6 +4628,11 @@ func httpToFuseStatus(err error) gofuse.Status {
 			return gofuse.EACCES
 		case http.StatusRequestEntityTooLarge:
 			return gofuse.Status(syscall.EFBIG)
+		case http.StatusInsufficientStorage:
+			if status, matched := quotaErrToFuseStatus(err); matched {
+				return status
+			}
+			return gofuse.EIO
 		case http.StatusPreconditionFailed:
 			return gofuse.Status(syscall.ESTALE)
 		case http.StatusBadRequest:
@@ -14818,6 +14823,9 @@ func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr
 	if !ok {
 		return 0, gofuse.ENOENT
 	}
+	if !xattrNamespaceSupported(attr) {
+		return 0, gofuse.Status(syscall.EOPNOTSUPP)
+	}
 	val, found := fs.xattrs.Get(path, attr)
 	if !found {
 		return 0, gofuse.ENOATTR
@@ -14862,6 +14870,9 @@ func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, att
 	if !ok {
 		return gofuse.ENOENT
 	}
+	if !xattrNamespaceSupported(attr) {
+		return gofuse.Status(syscall.EOPNOTSUPP)
+	}
 	if err := fs.xattrs.SetWithFlags(path, attr, data, input.Flags); err != 0 {
 		return gofuse.Status(err)
 	}
@@ -14872,6 +14883,9 @@ func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, a
 	path, ok := fs.inodes.GetPath(header.NodeId)
 	if !ok {
 		return gofuse.ENOENT
+	}
+	if !xattrNamespaceSupported(attr) {
+		return gofuse.Status(syscall.EOPNOTSUPP)
 	}
 	if !fs.xattrs.Remove(path, attr) {
 		return gofuse.ENOATTR
