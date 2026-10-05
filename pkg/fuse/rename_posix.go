@@ -45,7 +45,8 @@ func (i renamePathInfo) modeOrDefault() uint32 {
 }
 
 func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, oldP, newP string) (renamePathInfo, renamePathInfo, gofuse.Status) {
-	oldInfo, err := fs.renamePathInfo(ctx, oldP)
+	request := &initialSyncRequest{}
+	oldInfo, err := fs.renamePathInfo(ctx, oldP, request)
 	if err != nil {
 		return oldInfo, renamePathInfo{}, httpToFuseStatus(err)
 	}
@@ -70,7 +71,7 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 		}
 	}
 
-	oldParentInfo, err := fs.renamePathInfo(ctx, oldParent)
+	oldParentInfo, err := fs.renamePathInfo(ctx, oldParent, request)
 	if err != nil {
 		return oldInfo, renamePathInfo{}, httpToFuseStatus(err)
 	}
@@ -79,7 +80,7 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 	}
 	newParentInfo := oldParentInfo
 	if newParent != oldParent {
-		newParentInfo, err = fs.renamePathInfo(ctx, newParent)
+		newParentInfo, err = fs.renamePathInfo(ctx, newParent, request)
 		if err != nil {
 			return oldInfo, renamePathInfo{}, httpToFuseStatus(err)
 		}
@@ -107,7 +108,7 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 		return oldInfo, renamePathInfo{}, gofuse.Status(syscall.ELOOP)
 	}
 
-	newInfo, err := fs.renamePathInfo(ctx, newP)
+	newInfo, err := fs.renamePathInfo(ctx, newP, request)
 	if err != nil {
 		return oldInfo, newInfo, httpToFuseStatus(err)
 	}
@@ -242,7 +243,7 @@ func (fs *Dat9FS) renameCheckSticky(caller gofuse.Owner, parent, victim renamePa
 	return gofuse.EPERM
 }
 
-func (fs *Dat9FS) renamePathInfo(ctx context.Context, p string) (renamePathInfo, error) {
+func (fs *Dat9FS) renamePathInfo(ctx context.Context, p string, request *initialSyncRequest) (renamePathInfo, error) {
 	info := renamePathInfo{path: p}
 	if entry, ok := fs.specialNodeEntry(p); ok {
 		return renameInfoFromEntry(p, entry, true), nil
@@ -285,7 +286,7 @@ func (fs *Dat9FS) renamePathInfo(ctx context.Context, p string) (renamePathInfo,
 		return renameInfoFromEntry(p, entry, false), nil
 	}
 
-	stat, err := fs.renameStatWithTransientRetry(ctx, p)
+	stat, err := fs.renameStatStage(ctx, p, request)
 	if err != nil {
 		if isNotFoundErr(err) {
 			return info, nil
@@ -310,7 +311,8 @@ func (fs *Dat9FS) renamePathInfo(ctx context.Context, p string) (renamePathInfo,
 	return renameInfoFromEntry(p, entry, false), nil
 }
 
-func (fs *Dat9FS) renameStatWithTransientRetry(ctx context.Context, p string) (*client.StatResult, error) {
+func (fs *Dat9FS) renameStatWithTransientRetry(ctx context.Context, p string, recovery ...time.Time) (*client.StatResult, error) {
+	deadline := recoveryDeadline(recovery)
 	gvisorCompat := fs.gvisorCompatibilityEnabled()
 	generation := fs.mountViewGeneration.Load()
 	statPath := func(statCtx context.Context) (*client.StatResult, error) {
@@ -323,9 +325,15 @@ func (fs *Dat9FS) renameStatWithTransientRetry(ctx context.Context, p string) (*
 		return fs.mountViewGeneration.Load() == generation
 	}
 
-	stat, err := statPath(ctx)
+	probeCtx := ctx
+	probeCancel := func() {}
+	if !deadline.IsZero() {
+		probeCtx, probeCancel = context.WithDeadline(ctx, deadline)
+	}
+	stat, err := statPath(probeCtx)
+	probeCancel()
 	if gvisorCompat && !viewCurrent() {
-		return nil, context.Canceled
+		return nil, fs.renameProbeViewError(ctx, generation, err)
 	}
 	if err == nil || isNotFoundErr(err) || !gvisorCompat || !isTransientLookupErr(err) {
 		return stat, err
@@ -334,13 +342,13 @@ func (fs *Dat9FS) renameStatWithTransientRetry(ctx context.Context, p string) (*
 	lastErr := err
 	for range fs.lookupStatRetryCount() {
 		if !viewCurrent() {
-			return nil, context.Canceled
+			return nil, fs.renameProbeViewError(ctx, generation, err)
 		}
-		retryCtx, retryCancel := context.WithTimeout(context.WithoutCancel(ctx), fs.lookupStatRetryTimeout())
+		retryCtx, retryCancel := capInitialSyncTimeout(context.WithoutCancel(ctx), fs.lookupStatRetryTimeout(), deadline)
 		stat, err = statPath(retryCtx)
 		retryCancel()
 		if !viewCurrent() {
-			return nil, context.Canceled
+			return nil, fs.renameProbeViewError(ctx, generation, err)
 		}
 		if err == nil || isNotFoundErr(err) {
 			return stat, err

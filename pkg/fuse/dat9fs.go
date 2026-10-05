@@ -70,15 +70,22 @@ var testHookBeforeDirectoryOutputCheck func(fs *Dat9FS, path string, generation 
 var errMountViewChanged = fmt.Errorf("mount view changed: %w", syscall.EAGAIN)
 
 type mountViewReadAttempt struct {
-	changed bool
+	cause    error
+	deadline time.Time
 }
 
 func (attempt *mountViewReadAttempt) lock(fs *Dat9FS, generation uint64) bool {
-	if fs.lockMountViewRead(generation) {
-		return true
+	if err := fs.lockMountViewReadCause(generation); err != nil {
+		attempt.record(err)
+		return false
 	}
-	attempt.changed = true
-	return false
+	return true
+}
+
+func (attempt *mountViewReadAttempt) record(err error) {
+	if _, ok := mountViewCause(err); ok {
+		attempt.cause = err
+	}
 }
 
 // errAppendRefreshBusy marks transient sibling-handle lock contention. Write
@@ -771,11 +778,11 @@ func (fs *Dat9FS) syncDataCommitContext(cancel <-chan struct{}, timeout time.Dur
 	return fuseCtxWithTimeout(cancel, timeout)
 }
 
-func detachedSharedReadCtx(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+func detachedSharedReadCtx(parent context.Context, timeout time.Duration, recovery ...time.Time) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
 		timeout = fuseTimeout
 	}
-	return context.WithTimeout(context.WithoutCancel(parent), timeout)
+	return capInitialSyncTimeout(context.WithoutCancel(parent), timeout, recoveryDeadline(recovery))
 }
 
 // namespaceMutationCommitContext returns the context for the remote commit
@@ -4597,20 +4604,26 @@ func httpToFuseStatus(err error) gofuse.Status {
 	if err == nil {
 		return gofuse.OK
 	}
+	if _, view := mountViewCause(err); view {
+		return gofuse.EAGAIN
+	}
 	if errors.Is(err, errLayerRolledBack) {
 		return gofuse.Status(syscall.ESTALE)
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return gofuse.Status(syscall.EAGAIN)
 	}
+	var se *client.StatusError
+	// A mixed view marker's EAGAIN implements net.Error.Timeout. It must not
+	// mask the concrete HTTP status; ordinary network precedence stays intact.
+	mixedViewHTTP := errors.Is(err, errMountViewChanged) && errors.As(err, &se)
 	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
+	if !mixedViewHTTP && errors.As(err, &netErr) && netErr.Timeout() {
 		return gofuse.Status(syscall.EAGAIN)
 	}
 
 	// Prefer typed StatusError so we map by status code even when the
 	// server returns a JSON error body that doesn't contain "HTTP NNN".
-	var se *client.StatusError
 	if errors.As(err, &se) {
 		switch se.StatusCode {
 		case http.StatusNotFound:
@@ -4783,7 +4796,8 @@ func isTransientReadErr(err error) bool {
 // (which honors FUSE interrupt). On transient failure, up to
 // readTransientRetryCount detached retries are attempted with short timeouts.
 // Returns EIO (never EAGAIN) when all retries are exhausted.
-func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string) ([]byte, error) {
+func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string, recovery ...time.Time) ([]byte, error) {
+	deadline := recoveryDeadline(recovery)
 	remotePath := fs.remotePath(path)
 	readStart := fs.perfStart()
 	data, err := fs.client.ReadCtx(ctx, remotePath)
@@ -4797,7 +4811,7 @@ func (fs *Dat9FS) readSmallFileWithRetry(ctx context.Context, path string) ([]by
 	}
 	lastErr := err
 	for range readTransientRetryCount {
-		retryCtx, retryCancel := context.WithTimeout(context.Background(), readTransientRetryTimeout)
+		retryCtx, retryCancel := capInitialSyncTimeout(context.Background(), readTransientRetryTimeout, deadline)
 		readStart = fs.perfStart()
 		data, err = fs.client.ReadCtx(retryCtx, remotePath)
 		retryCancel()
@@ -5185,12 +5199,13 @@ func diskReadCacheReadSize(entry *InodeEntry, offset, requested int64) (int64, b
 // stream is reopened from scratch on retry.
 // Returns (data, nil) on success. On exhausted retries, the returned error
 // is a wrapped sentinel so the caller can map it to EIO.
-func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, fh *FileHandle, offset, size int64) ([]byte, int, error) {
+func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, fh *FileHandle, offset, size int64, recovery ...time.Time) ([]byte, int, error) {
+	deadline := recoveryDeadline(recovery)
 	target := fs.readTargetForHandle(ctx, fh)
 	data, n, err := fs.doRangeRead(ctx, path, target, offset, size)
 	if client.IsPresignExpired(err) {
 		clearReadTargetForHandle(fh)
-		retryCtx, retryCancel := context.WithTimeout(context.Background(), readTransientRetryTimeout)
+		retryCtx, retryCancel := capInitialSyncTimeout(context.Background(), readTransientRetryTimeout, deadline)
 		target = fs.readTargetForHandle(retryCtx, fh)
 		data, n, err = fs.doRangeRead(retryCtx, path, target, offset, size)
 		retryCancel()
@@ -5207,7 +5222,7 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, fh 
 	}
 	lastErr := err
 	for range readTransientRetryCount {
-		retryCtx, retryCancel := context.WithTimeout(context.Background(), readTransientRetryTimeout)
+		retryCtx, retryCancel := capInitialSyncTimeout(context.Background(), readTransientRetryTimeout, deadline)
 		data, n, err = fs.doRangeRead(retryCtx, path, target, offset, size)
 		if client.IsPresignExpired(err) {
 			clearReadTargetForHandle(fh)
@@ -5289,23 +5304,24 @@ func (fs *Dat9FS) readDiskCachedRange(ctx context.Context, path string, fh *File
 	return fs.readDiskCachedRangeForGeneration(ctx, path, fh, key, fs.mountViewGeneration.Load())
 }
 
-func (fs *Dat9FS) readDiskCachedRangeForGeneration(ctx context.Context, path string, fh *FileHandle, key DiskReadCacheKey, generation uint64) ([]byte, int, error) {
-	return fs.readDiskCachedRangeWithContext(ctx, path, fh, key, true, generation)
+func (fs *Dat9FS) readDiskCachedRangeForGeneration(ctx context.Context, path string, fh *FileHandle, key DiskReadCacheKey, generation uint64, recovery ...time.Time) ([]byte, int, error) {
+	return fs.readDiskCachedRangeWithContext(ctx, path, fh, key, true, generation, recovery...)
 }
 
-func (fs *Dat9FS) readDiskCachedRangeCancellable(ctx context.Context, path string, fh *FileHandle, key DiskReadCacheKey, generation uint64) ([]byte, int, error) {
-	return fs.readDiskCachedRangeWithContext(ctx, path, fh, key, false, generation)
+func (fs *Dat9FS) readDiskCachedRangeCancellable(ctx context.Context, path string, fh *FileHandle, key DiskReadCacheKey, generation uint64, recovery ...time.Time) ([]byte, int, error) {
+	return fs.readDiskCachedRangeWithContext(ctx, path, fh, key, false, generation, recovery...)
 }
 
-func (fs *Dat9FS) readDiskCachedRangeWithContext(ctx context.Context, path string, fh *FileHandle, key DiskReadCacheKey, detachFetch bool, generation uint64) ([]byte, int, error) {
-	data, err, _ := fs.readFlight.Do(ctx, key.flightKey(), func() ([]byte, error) {
-		if cached, ok := fs.diskReadCache.Get(key); ok {
+func (fs *Dat9FS) readDiskCachedRangeWithContext(ctx context.Context, path string, fh *FileHandle, key DiskReadCacheKey, detachFetch bool, generation uint64, recovery ...time.Time) ([]byte, int, error) {
+	deadline := recoveryDeadline(recovery)
+	fetch := func() ([]byte, error) {
+		if cached, ok := fs.diskReadCache.Get(key); ok && len(recovery) == 0 {
 			return cached, nil
 		}
 		fetchCtx := ctx
 		fetchCancel := func() {}
 		if detachFetch {
-			fetchCtx, fetchCancel = detachedSharedReadCtx(ctx, fs.remoteReadTimeout)
+			fetchCtx, fetchCancel = detachedSharedReadCtx(ctx, fs.remoteReadTimeout, deadline)
 		}
 		defer fetchCancel()
 		releaseReadSlot, slotErr := fs.acquireRemoteReadSlot(fetchCtx)
@@ -5316,7 +5332,7 @@ func (fs *Dat9FS) readDiskCachedRangeWithContext(ctx context.Context, path strin
 		var fetchData []byte
 		var fetchErr error
 		if detachFetch {
-			fetchData, _, fetchErr = fs.readStreamRangeWithRetry(fetchCtx, path, fh, key.Offset, key.Length)
+			fetchData, _, fetchErr = fs.readStreamRangeWithRetry(fetchCtx, path, fh, key.Offset, key.Length, deadline)
 		} else {
 			fetchData, _, fetchErr = fs.readStreamRangeWithRetryBoundToContext(fetchCtx, path, fh, key.Offset, key.Length)
 		}
@@ -5326,18 +5342,25 @@ func (fs *Dat9FS) readDiskCachedRangeWithContext(ctx context.Context, path strin
 		if int64(len(fetchData)) != key.Length {
 			return nil, io.ErrUnexpectedEOF
 		}
-		if !fs.lockMountViewRead(generation) {
-			return nil, syscall.EAGAIN
+		if err := fs.lockMountViewReadCause(generation); err != nil {
+			return nil, err
 		}
 		fs.diskReadCache.PutAsync(key, fetchData)
 		fs.mountViewMu.RUnlock()
 		return fetchData, nil
-	})
+	}
+	var data []byte
+	var err error
+	if len(recovery) != 0 {
+		data, err = fetch()
+	} else {
+		data, err, _ = fs.readFlight.Do(ctx, fs.initialSyncFlightKey(key.flightKey(), generation), fetch)
+	}
 	if err != nil {
 		return nil, 0, err
 	}
-	if !fs.lockMountViewRead(generation) {
-		return nil, 0, syscall.EAGAIN
+	if err := fs.lockMountViewReadCause(generation); err != nil {
+		return nil, 0, err
 	}
 	defer fs.mountViewMu.RUnlock()
 	return data, len(data), nil
@@ -5401,7 +5424,7 @@ type diskReadBlockResult struct {
 	err   error
 }
 
-func (fs *Dat9FS) readDiskCachedBlocks(ctx context.Context, path string, fh *FileHandle, entry *InodeEntry, offset, size int64, generation uint64) ([]byte, int, error) {
+func (fs *Dat9FS) readDiskCachedBlocks(ctx context.Context, path string, fh *FileHandle, entry *InodeEntry, offset, size int64, generation uint64, recovery ...time.Time) ([]byte, int, error) {
 	blocks := fs.diskReadBlocks(path, entry, offset, size)
 	if len(blocks) == 0 {
 		return nil, 0, nil
@@ -5453,7 +5476,7 @@ func (fs *Dat9FS) readDiskCachedBlocks(ctx context.Context, path string, fh *Fil
 						return
 					}
 					block := blocks[index]
-					data, _, err := fs.readDiskCachedRangeCancellable(readCtx, path, fh, block.key, generation)
+					data, _, err := fs.readDiskCachedRangeCancellable(readCtx, path, fh, block.key, generation, recovery...)
 					if err == nil && int64(len(data)) < block.copyUntil {
 						err = io.ErrUnexpectedEOF
 					}
@@ -5465,9 +5488,13 @@ func (fs *Dat9FS) readDiskCachedBlocks(ctx context.Context, path string, fh *Fil
 						data = chunk
 					} else {
 						data = nil
-						cancel()
 					}
 					results <- diskReadBlockResult{index: index, data: data, err: err}
+					if err != nil {
+						if cause, view := mountViewCause(err); !view || !cause.initial {
+							cancel()
+						}
+					}
 				}
 			}
 		}()
@@ -5477,9 +5504,15 @@ func (fs *Dat9FS) readDiskCachedBlocks(ctx context.Context, path string, fh *Fil
 		close(results)
 	}()
 
-	var firstErr error
+	var firstErr, concreteErr error
+	firstView := false
 	for result := range results {
 		if result.err != nil {
+			if cause, view := mountViewCause(result.err); view && cause.initial {
+				firstView = true
+			} else if concreteErr == nil {
+				concreteErr = result.err
+			}
 			if firstErr == nil {
 				firstErr = result.err
 			}
@@ -5487,6 +5520,14 @@ func (fs *Dat9FS) readDiskCachedBlocks(ctx context.Context, path string, fh *Fil
 		}
 		block := blocks[result.index]
 		copy(out[block.outOffset:], result.data)
+	}
+	if firstView {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		if concreteErr != nil {
+			return nil, 0, concreteErr
+		}
 	}
 	if firstErr != nil {
 		return nil, 0, firstErr
@@ -5578,10 +5619,11 @@ func (fs *Dat9FS) lookupRetryStats() (total, success, exhausted uint64) {
 	return fs.lookupStatRetryTotal.Load(), fs.lookupStatRetrySuccess.Load(), fs.lookupStatRetryExhausted.Load()
 }
 
-func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath string, trackLookupMetrics bool) (*client.StatResult, uint64, error) {
+func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath string, trackLookupMetrics bool, recovery ...time.Time) (*client.StatResult, uint64, error) {
+	deadline := recoveryDeadline(recovery)
 	apiPath := fs.remotePath(localPath)
 	generation := fs.mountViewGeneration.Load()
-	ctx, cf := fuseCtx(cancel)
+	ctx, cf := fuseCtxRecovery(cancel, deadline)
 	statStart := fs.perfStart()
 	stat, err := fs.client.StatCtx(ctx, apiPath)
 	cf()
@@ -5616,7 +5658,7 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 		// Rebinding cancel here would cancel retries immediately and re-expose
 		// transient failures. Keep this detached+bounded behavior unless retry
 		// semantics are redesigned.
-		retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
+		retryCtx, retryCancel := capInitialSyncTimeout(context.Background(), fs.lookupStatRetryTimeout(), deadline)
 		statStart = fs.perfStart()
 		stat, err = fs.client.StatCtx(retryCtx, apiPath)
 		retryCancel()
@@ -5652,14 +5694,14 @@ func (fs *Dat9FS) statWithTransientRetry(cancel <-chan struct{}, localPath strin
 	return nil, 0, lastErr
 }
 
-func (fs *Dat9FS) lookupStatWithRetry(cancel <-chan struct{}, childP string) (*client.StatResult, uint64, error) {
-	return fs.statWithTransientRetry(cancel, childP, true)
+func (fs *Dat9FS) lookupStatWithRetry(cancel <-chan struct{}, childP string, recovery ...time.Time) (*client.StatResult, uint64, error) {
+	return fs.statWithTransientRetry(cancel, childP, true, recovery...)
 }
 
-func (fs *Dat9FS) getAttrStatWithRetry(cancel <-chan struct{}, remotePath string) (*client.StatResult, uint64, error) {
+func (fs *Dat9FS) getAttrStatWithRetry(cancel <-chan struct{}, remotePath string, recovery ...time.Time) (*client.StatResult, uint64, error) {
 	// Keep GetAttr retries out of lookupStatRetry* so that those counters retain
 	// a single meaning: Lookup path retry behavior.
-	stat, generation, err := fs.statWithTransientRetry(cancel, remotePath, false)
+	stat, generation, err := fs.statWithTransientRetry(cancel, remotePath, false, recovery...)
 	return stat, generation, fs.resetMountViewOnUnauthorizedError(err)
 }
 
@@ -5689,10 +5731,11 @@ func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
 	return cached
 }
 
-func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string) ([]client.FileInfo, uint64, error) {
+func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string, recovery ...time.Time) ([]client.FileInfo, uint64, error) {
+	deadline := recoveryDeadline(recovery)
 	// list-fallback retries are intentionally not counted in lookupStatRetry*;
 	// those counters remain scoped to the primary Lookup->Stat path.
-	ctx, cf := fuseCtx(cancel)
+	ctx, cf := fuseCtxRecovery(cancel, deadline)
 	apiPath := fs.remotePath(parentPath)
 	generation := fs.mountViewGeneration.Load()
 	listStart := fs.perfStart()
@@ -5702,8 +5745,8 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 	cf()
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err == nil {
-		if !fs.lockMountViewRead(generation) {
-			return nil, 0, errMountViewChanged
+		if err := fs.lockMountViewReadCause(generation); err != nil {
+			return nil, 0, err
 		}
 		// Serve the merged view, not the raw response: a child whose commit
 		// settled during this LIST's RTT is absent from the response and,
@@ -5733,7 +5776,7 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 			// reason as stat retries above: this path is a compatibility probe
 			// after HEAD said "not found", and cancel-coupled retries would
 			// collapse to the original transient failure immediately.
-			retryCtx, retryCancel := context.WithTimeout(context.Background(), fs.lookupStatRetryTimeout())
+			retryCtx, retryCancel := capInitialSyncTimeout(context.Background(), fs.lookupStatRetryTimeout(), deadline)
 			listStart := fs.perfStart()
 			request := fs.dirCache.BeginRequest(parentPath)
 			defer fs.dirCache.EndRequest(request)
@@ -5741,8 +5784,8 @@ func (fs *Dat9FS) lookupListWithRetry(cancel <-chan struct{}, parentPath string)
 			retryCancel()
 			fs.perfRecordRemote(perfRemoteList, listStart, listErr, 0)
 			if listErr == nil {
-				if !fs.lockMountViewRead(generation) {
-					return nil, 0, errMountViewChanged, true
+				if err := fs.lockMountViewReadCause(generation); err != nil {
+					return nil, 0, err, true
 				}
 				view := reconciledFileInfos(fs.putDirectoryListing(parentPath, cachedFileInfos(listItems), request))
 				fs.mountViewMu.RUnlock()
@@ -5999,17 +6042,17 @@ func (fs *Dat9FS) updateEntryFromStat(entry *InodeEntry, stat *client.StatResult
 	return entry
 }
 
-func (fs *Dat9FS) revalidateReadCacheEntryIfUntrusted(cancel <-chan struct{}, p string, entry *InodeEntry) (*InodeEntry, error) {
-	if fs == nil || entry == nil || entry.IsDir || entry.Revision <= 0 || fs.statCacheTrustedAndVerified() {
+func (fs *Dat9FS) revalidateReadCacheEntryIfUntrusted(cancel <-chan struct{}, p string, entry *InodeEntry, recovery ...time.Time) (*InodeEntry, error) {
+	if fs == nil || entry == nil || entry.IsDir || (len(recovery) == 0 && (entry.Revision <= 0 || fs.statCacheTrustedAndVerified())) {
 		return entry, nil
 	}
 	cachedRevision := entry.Revision
-	stat, generation, err := fs.getAttrStatWithRetry(cancel, p)
+	stat, generation, err := fs.getAttrStatWithRetry(cancel, p, recovery...)
 	if err != nil {
 		return nil, err
 	}
-	if !fs.lockMountViewRead(generation) {
-		return nil, syscall.EAGAIN
+	if err := fs.lockMountViewReadCause(generation); err != nil {
+		return nil, err
 	}
 	defer fs.mountViewMu.RUnlock()
 	entry = fs.updateEntryFromStat(entry, stat)
@@ -6296,8 +6339,8 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 		}
 		liveItems = append(liveItems, item)
 	}
-	if !fs.lockMountViewRead(generation) {
-		return false, 0, syscall.EAGAIN
+	if err := fs.lockMountViewReadCause(generation); err != nil {
+		return false, 0, err
 	}
 	if fs.dirCache != nil {
 		fs.putDirectoryListing(dirPath, cachedFileInfos(liveItems), request)
@@ -6831,45 +6874,39 @@ func (fs *Dat9FS) notifyInodeAtSyncCommit(ino uint64) {
 }
 
 func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
-	// Layer events can reset the view while a remote stat/list is in flight.
-	// The first SSE initial_sync has the same effect. These invalidate our
-	// snapshot, not the application's lookup. Retry only a proven changed view:
-	// once for the tagged initial sync, or boundedly for layer events. Preserve
-	// ordinary remote EAGAIN errors.
-	initialSyncRetried := false
-	layerRetries := 0
-	for {
+	request := &initialSyncRequest{}
+	for layerRetries := 0; ; layerRetries++ {
 		generation := fs.mountViewGeneration.Load()
-		attempt := &mountViewReadAttempt{}
-		status = fs.lookupOnce(cancel, header, name, out, attempt)
-		if status != gofuse.Status(syscall.EAGAIN) || !attempt.changed {
-			return status
+		ctx, cf := fuseCtx(cancel)
+		result, err := executeInitialSync(fs, ctx, request, generation, func(ctx context.Context, fresh bool) (lookupStageResult, error) {
+			var value lookupStageResult
+			attempt := &mountViewReadAttempt{deadline: initialSyncDeadline(ctx, fresh)}
+			value.status = fs.lookupOnce(ctx, cancel, header, name, &value.out, attempt)
+			return value, attempt.cause
+		})
+		cf()
+		if err == nil {
+			*out = result.out
+			return result.status
 		}
-		if !initialSyncRetried && fs.initialSyncViewChangedFrom(generation) {
-			initialSyncRetried = true
-		} else if fs.layerEnabled() && layerRetries < 3 {
-			layerRetries++
-		} else {
-			return status
+		if !errors.Is(err, errMountViewChanged) || !fs.layerEnabled() || layerRetries >= 3 {
+			return initialSyncMetadataStatus(err)
 		}
 		select {
 		case <-cancel:
 			return gofuse.EINTR
 		default:
 		}
-		*out = gofuse.EntryOut{}
 	}
 }
 
-func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut, attempt *mountViewReadAttempt) (status gofuse.Status) {
+func (fs *Dat9FS) lookupOnce(ctx context.Context, cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut, attempt *mountViewReadAttempt) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseLookup, perfStart, status, 0) }()
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
 	}
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
 	if entry, ok := fs.specialNodeEntry(childP); ok {
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
@@ -7002,7 +7039,7 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 	// the mount's lifetime. Observe releases the same token itself, so the
 	// deferred call is a no-op on the installed path.
 	defer fs.dirCache.EndRequest(observation)
-	stat, statGeneration, err := fs.lookupStatWithRetry(cancel, childP)
+	stat, statGeneration, err := fs.lookupStatWithRetry(cancel, childP, attempt.deadline)
 	if err != nil {
 		if fs.metadataPrefetch != nil {
 			fs.metadataPrefetch.discardMiss(childP)
@@ -7012,10 +7049,10 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 			// Compatibility path for list-only scopes and private legacy servers
 			// that do not support stat/HEAD on directories: list the parent and
 			// match by name.
-			items, listGeneration, listErr := fs.lookupListWithRetry(cancel, parentPath)
+			items, listGeneration, listErr := fs.lookupListWithRetry(cancel, parentPath, attempt.deadline)
 			if listErr != nil {
 				if errors.Is(listErr, errMountViewChanged) {
-					attempt.changed = true
+					attempt.record(listErr)
 				}
 				return listDirErrToFuseStatus(listErr)
 			}
@@ -8098,27 +8135,26 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseGetAttr, perfStart, status, 0) }()
 	generation := fs.mountViewGeneration.Load()
-	attempt := &mountViewReadAttempt{}
-	status = fs.getAttrOnce(cancel, input, out, attempt)
-	if status != gofuse.Status(syscall.EAGAIN) || !attempt.changed || !fs.initialSyncViewChangedFrom(generation) {
-		return status
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	result, err := executeInitialSync(fs, ctx, &initialSyncRequest{}, generation, func(ctx context.Context, fresh bool) (attrStageResult, error) {
+		var value attrStageResult
+		attempt := &mountViewReadAttempt{deadline: initialSyncDeadline(ctx, fresh)}
+		value.status = fs.getAttrOnce(ctx, cancel, input, &value.out, attempt)
+		return value, attempt.cause
+	})
+	if err != nil {
+		return initialSyncMetadataStatus(err)
 	}
-	select {
-	case <-cancel:
-		return gofuse.EINTR
-	default:
-	}
-	*out = gofuse.AttrOut{}
-	return fs.getAttrOnce(cancel, input, out, &mountViewReadAttempt{})
+	*out = result.out
+	return result.status
 }
 
-func (fs *Dat9FS) getAttrOnce(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut, attempt *mountViewReadAttempt) gofuse.Status {
+func (fs *Dat9FS) getAttrOnce(ctx context.Context, cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut, attempt *mountViewReadAttempt) gofuse.Status {
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
 	}
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
 	if localOnlySpecialEntry(entry) {
 		fs.fillAttr(entry, &out.Attr)
 		out.SetTimeout(fs.opts.AttrTTL)
@@ -8246,7 +8282,7 @@ func (fs *Dat9FS) getAttrOnce(cancel <-chan struct{}, input *gofuse.GetAttrIn, o
 				}
 			}
 			if !pendingFound && input.NodeId != 1 {
-				stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
+				stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path, attempt.deadline)
 				if err != nil {
 					return listDirErrToFuseStatus(err)
 				}
@@ -8305,7 +8341,7 @@ func (fs *Dat9FS) getAttrOnce(cancel <-chan struct{}, input *gofuse.GetAttrIn, o
 				if cachedEntry, ok := fs.cachedAttrEntry(entry); ok {
 					entry = cachedEntry
 				} else {
-					stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path)
+					stat, statGeneration, err := fs.getAttrStatWithRetry(cancel, entry.Path, attempt.deadline)
 					if err != nil {
 						return listDirErrToFuseStatus(err)
 					}
@@ -10015,6 +10051,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	request := &initialSyncRequest{}
 
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
@@ -10104,22 +10141,11 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		return status
 	}
 	if fs.layerEnabled() {
-		generation := fs.mountViewGeneration.Load()
-		entries, err := fs.listDir(ctx, childP)
+		hasEntries, err := fs.directoryChildrenForMutation(ctx, request, childP, true)
 		if err != nil {
-			if _, ok := fs.layerDirMode(childP); ok && isNotFoundErr(err) {
-				entries = nil
-			} else {
-				status = listDirErrToFuseStatus(err)
-				return status
-			}
+			return listDirErrToFuseStatus(err)
 		}
-		if !fs.lockMountViewRead(generation) {
-			status = gofuse.Status(syscall.EAGAIN)
-			return status
-		}
-		hasEntries := len(entries) > 0
-		fs.mountViewMu.RUnlock()
+
 		if hasEntries {
 			// Remote/overlay listing shows children. If the local inode state
 			// is empty, the listing may be stale (eventual-consistency lag on
@@ -10127,7 +10153,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			// remoteDirectoryHasChildren (which filters locally-unlinked entries)
 			// instead of listDir (which doesn't filter).
 			if !fs.hasKnownLocalDirectoryChildren(childP) {
-				fs.debugf("rmdir path=%s layer listing has %d entries but no local children, polling for up to 2s", childP, len(entries))
+				fs.debugf("rmdir path=%s layer listing has entries but no local children, polling for up to 2s", childP)
 				fs.dirCache.Invalidate(childP)
 				deadline := time.Now().Add(2 * time.Second)
 				for time.Now().Before(deadline) {
@@ -10140,7 +10166,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 						status = gofuse.Status(syscall.EINTR)
 						return status
 					}
-					hasChildren, listGeneration, listErr := fs.remoteDirectoryHasChildren(ctx, childP)
+					hasChildren, listErr := fs.directoryChildrenForMutation(ctx, request, childP, false)
 					if errors.Is(listErr, syscall.EAGAIN) {
 						status = gofuse.Status(syscall.EAGAIN)
 						return status
@@ -10149,21 +10175,14 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 						status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(listErr))
 						return status
 					}
-					if listErr == nil && !fs.lockMountViewRead(listGeneration) {
-						status = gofuse.Status(syscall.EAGAIN)
-						return status
-					}
-					if listErr == nil {
-						fs.mountViewMu.RUnlock()
-					}
 					if listErr != nil || !hasChildren {
-						entries = nil
+						hasEntries = false
 						break
 					}
 					fs.dirCache.Invalidate(childP)
 				}
 			}
-			if len(entries) > 0 {
+			if hasEntries {
 				status = gofuse.Status(syscall.ENOTEMPTY)
 				return status
 			}
@@ -10191,7 +10210,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		// tombstones + the cancel-aware polling loop below to handle any
 		// remaining eventual consistency.
 		// giving the backend time to propagate recent deletes.
-		hasChildren, listGeneration, err := fs.remoteDirectoryHasChildren(ctx, childP)
+		hasChildren, err := fs.directoryChildrenForMutation(ctx, request, childP, false)
 		if errors.Is(err, syscall.EAGAIN) {
 			status = gofuse.Status(syscall.EAGAIN)
 			return status
@@ -10199,13 +10218,6 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		if client.IsUnauthorized(err) {
 			status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
 			return status
-		}
-		if err == nil && !fs.lockMountViewRead(listGeneration) {
-			status = gofuse.Status(syscall.EAGAIN)
-			return status
-		}
-		if err == nil {
-			fs.mountViewMu.RUnlock()
 		}
 		if err == nil && hasChildren {
 			// Invalidate the dirCache entry that was just written from the
@@ -10225,7 +10237,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 						status = gofuse.Status(syscall.EINTR)
 						return status
 					}
-					hasChildren, listGeneration, err = fs.remoteDirectoryHasChildren(ctx, childP)
+					hasChildren, err = fs.directoryChildrenForMutation(ctx, request, childP, false)
 					if errors.Is(err, syscall.EAGAIN) {
 						status = gofuse.Status(syscall.EAGAIN)
 						return status
@@ -10233,13 +10245,6 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 					if client.IsUnauthorized(err) {
 						status = httpToFuseStatus(fs.resetMountViewOnUnauthorizedError(err))
 						return status
-					}
-					if err == nil && !fs.lockMountViewRead(listGeneration) {
-						status = gofuse.Status(syscall.EAGAIN)
-						return status
-					}
-					if err == nil {
-						fs.mountViewMu.RUnlock()
 					}
 					if err != nil || !hasChildren {
 						break
@@ -11016,7 +11021,7 @@ func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle, refre
 	dh.mu.Lock()
 	if fs.mountViewGeneration.Load() != generation {
 		dh.mu.Unlock()
-		return nil, 0, errMountViewChanged
+		return nil, 0, fs.mountViewFailureFrom(generation)
 	}
 	dh.Entries = cloneLoadedDirEntries(entries)
 	dh.entriesGeneration = generation
@@ -11030,31 +11035,21 @@ func (fs *Dat9FS) loadDirHandleEntries(ctx context.Context, dh *DirHandle, refre
 // Only the single tagged startup reset permits a reload, before any output or
 // lookup references. Each attempt retains the normal stale-view fences.
 func (fs *Dat9FS) loadDirHandleEntriesForRead(ctx context.Context, dh *DirHandle, refresh bool) ([]DirEntry, uint64, error) {
-	originalGeneration := fs.mountViewGeneration.Load()
-	for attempt := 0; ; attempt++ {
-		entries, generation, err := fs.loadDirHandleEntries(ctx, dh, refresh)
-		if err == nil {
-			if testHookBeforeDirectoryOutputCheck != nil {
-				testHookBeforeDirectoryOutputCheck(fs, dh.Path, generation)
-			}
-			if fs.lockMountViewRead(generation) {
-				return entries, generation, nil
-			}
-			err = errMountViewChanged
+	generation := fs.mountViewGeneration.Load()
+	result, err := executeInitialSync(fs, ctx, &initialSyncRequest{}, generation, func(ctx context.Context, _ bool) (directoryStageResult, error) {
+		entries, loadedGeneration, err := fs.loadDirHandleEntries(ctx, dh, refresh)
+		if err != nil {
+			return directoryStageResult{}, err
 		}
-		if attempt != 0 || !errors.Is(err, errMountViewChanged) {
-			return nil, 0, err
+		if testHookBeforeDirectoryOutputCheck != nil {
+			testHookBeforeDirectoryOutputCheck(fs, dh.Path, loadedGeneration)
 		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, 0, ctxErr
+		if err := fs.lockMountViewReadCause(loadedGeneration); err != nil {
+			return directoryStageResult{}, err
 		}
-		if !fs.initialSyncViewChangedFrom(originalGeneration) {
-			return nil, 0, err
-		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, 0, ctxErr
-		}
-	}
+		return directoryStageResult{entries: entries, generation: loadedGeneration}, nil
+	})
+	return result.entries, result.generation, err
 }
 
 func cloneLoadedDirEntries(entries []DirEntry) []DirEntry {
@@ -12636,17 +12631,56 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}
 	}
 
+	generation := fs.mountViewGeneration.Load()
+	value, err := executeInitialSync(fs, ctx, &initialSyncRequest{}, generation, func(ctx context.Context, fresh bool) (readStageResult, error) {
+		attempt := &mountViewReadAttempt{deadline: initialSyncDeadline(ctx, fresh)}
+		result, status := fs.readRemoteOnce(ctx, cancel, input, fh, attempt, fresh, &source, &bytesRead)
+		return readStageResult{result: result, status: status}, attempt.cause
+	})
+	if err != nil {
+		return nil, listDirErrToFuseStatus(err)
+	}
+	return value.result, value.status
+}
+
+func (fs *Dat9FS) readRemoteOnce(ctx context.Context, cancel <-chan struct{}, input *gofuse.ReadIn, fh *FileHandle, attempt *mountViewReadAttempt, fresh bool, readSource *string, readBytes *int) (gofuse.ReadResult, gofuse.Status) {
+	source, bytesRead := "unknown", -1
+	defer func() { *readSource, *readBytes = source, bytesRead }()
+	if fresh {
+		if value, st, src, n, handled := fs.readRetainedSource(fh, input); handled {
+			source, bytesRead = src, n
+			return value, st
+		}
+	}
+
 	p := fh.Path
 	mountViewGeneration := fs.mountViewGeneration.Load()
-	bypassStableCaches := fs.bypassStableRemoteReadCaches(p)
+	bypassStableCaches := fresh || fs.bypassStableRemoteReadCaches(p)
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
+	ownedRemote := false
+	if fresh {
+		fh.Lock()
+		ownedRemote = fh.Dirty != nil
+		if ownedRemote {
+			// The unloaded/streamed fallback keeps this writable FD's size
+			// and base. A pathname HEAD must not rebaseline its private state.
+			entry = &InodeEntry{Ino: fh.Ino, Path: p, Size: fh.Dirty.Size(), Revision: fh.BaseRev}
+		} else if entry == nil {
+			entry = &InodeEntry{Ino: fh.Ino, Path: p}
+		}
+		fh.Unlock()
+	}
 	revalidatedForRead := false
-	if entry != nil && !fs.statCacheVerified() {
-		if refreshed, err := fs.revalidateReadCacheEntryIfUntrusted(cancel, p, entry); err != nil {
+	if entry != nil && !ownedRemote && (fresh || !fs.statCacheVerified()) {
+		if refreshed, err := fs.revalidateReadCacheEntryIfUntrusted(cancel, p, entry, readRecoveryDeadline(fresh, attempt.deadline)...); err != nil {
+			attempt.record(err)
 			source = "read-cache-revalidate-error"
 			return nil, listDirErrToFuseStatus(err)
 		} else {
 			entry = refreshed
+			if fresh && fh.Prefetch != nil {
+				fh.Prefetch.invalidateWithSize(entry.Size)
+			}
 			revalidatedForRead = true
 		}
 	}
@@ -12663,7 +12697,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			fh.Prefetch.OnRead(offset, len(data))
 			source = "prefetch-hit"
 			bytesRead = len(data)
-			return fs.mountViewReadResult(mountViewGeneration, data)
+			return fs.mountViewReadResult(mountViewGeneration, data, attempt)
 		}
 		if fs.perf != nil {
 			fs.perf.prefetchMiss.add(1)
@@ -12676,10 +12710,10 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// Try read cache for small files. Use revision-aware cache: if the
 	// InodeEntry has a stored revision from the last Lookup/GetAttr, pass
 	// it to the cache for validation. Cache hit only if revision matches.
-	if entry != nil && entry.Size <= fs.readCache.MaxFileSize() && entry.Size > 0 && !bypassStableCaches {
+	if entry != nil && !ownedRemote && entry.Size <= fs.readCache.MaxFileSize() && entry.Size > 0 && (!bypassStableCaches || fresh) {
 		cacheRev := entry.Revision // use revision from last Stat/Lookup
 		// Fast path: serve from cache without any HTTP call.
-		if data, ok := fs.readCache.Get(p, cacheRev); ok {
+		if data, ok := fs.readCache.Get(p, cacheRev); ok && !fresh {
 			if fs.perf != nil {
 				fs.perf.readCacheHit.add(1)
 			}
@@ -12687,7 +12721,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			if offset >= int64(len(data)) {
 				source = "read-cache-eof"
 				bytesRead = 0
-				return fs.mountViewReadResult(mountViewGeneration, nil)
+				return fs.mountViewReadResult(mountViewGeneration, nil, attempt)
 			}
 			end := offset + int64(input.Size)
 			if end > int64(len(data)) {
@@ -12695,7 +12729,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			}
 			source = "read-cache-hit"
 			bytesRead = int(end - offset)
-			return fs.mountViewReadResult(mountViewGeneration, data[offset:end])
+			return fs.mountViewReadResult(mountViewGeneration, data[offset:end], attempt)
 		}
 		if fs.perf != nil {
 			fs.perf.readCacheMiss.add(1)
@@ -12706,9 +12740,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// miss the cache simultaneously (spec §9.8 T24). The key includes
 		// the observed revision so that concurrent reads after a revision
 		// change do not share stale in-flight results.
-		sfKey := fmt.Sprintf("%s@%d", p, cacheRev)
+		sfKey := fs.initialSyncFlightKey(fmt.Sprintf("%s@%d", p, cacheRev), mountViewGeneration)
 		diskKey, diskKeyOK := fs.diskReadCacheKey(p, entry, 0, entry.Size)
-		data, err, _ := fs.readFlight.Do(ctx, sfKey, func() ([]byte, error) {
+		fetch := func() ([]byte, error) {
 			// Whole-file disk cache tier: survives ReadCache TTL/eviction
 			// so warm reads of small files are served from local disk
 			// instead of re-fetching from the remote.
@@ -12719,10 +12753,10 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			// would match a persisted disk entry and serve outdated bytes
 			// after another client updates the file remotely — the same
 			// guard the range disk-cache path applies below.
-			if diskKeyOK {
+			if diskKeyOK && !fresh {
 				if cached, ok := fs.diskReadCache.Get(diskKey); ok {
 					if !fs.statCacheTrustedAndVerified() && !revalidatedForRead {
-						refreshed, headErr := fs.revalidateReadCacheEntryIfUntrusted(cancel, p, entry)
+						refreshed, headErr := fs.revalidateReadCacheEntryIfUntrusted(cancel, p, entry, readRecoveryDeadline(fresh, attempt.deadline)...)
 						if headErr != nil {
 							return nil, headErr
 						}
@@ -12732,8 +12766,8 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 							goto wholeFileDiskCacheMiss
 						}
 					}
-					if !fs.lockMountViewRead(mountViewGeneration) {
-						return nil, syscall.EAGAIN
+					if err := fs.lockMountViewReadCause(mountViewGeneration); err != nil {
+						return nil, err
 					}
 					fs.readCache.PutOwned(p, cached, cacheRev)
 					fs.mountViewMu.RUnlock()
@@ -12745,19 +12779,19 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			// cancellation of the owner's FUSE request does not fail
 			// piggybacking readers. Apply a fresh bounded timeout so the
 			// shared in-flight key and read slot cannot hang forever.
-			fetchCtx, fetchCancel := detachedSharedReadCtx(ctx, fs.remoteReadTimeout)
+			fetchCtx, fetchCancel := detachedSharedReadCtx(ctx, fs.remoteReadTimeout, attempt.deadline)
 			defer fetchCancel()
 			releaseReadSlot, slotErr := fs.acquireRemoteReadSlot(fetchCtx)
 			if slotErr != nil {
 				return nil, slotErr
 			}
 			defer releaseReadSlot()
-			fetchData, fetchErr := fs.readSmallFileWithRetry(fetchCtx, p)
+			fetchData, fetchErr := fs.readSmallFileWithRetry(fetchCtx, p, attempt.deadline)
 			if fetchErr != nil {
 				return nil, fetchErr
 			}
-			if !fs.lockMountViewRead(mountViewGeneration) {
-				return nil, syscall.EAGAIN
+			if err := fs.lockMountViewReadCause(mountViewGeneration); err != nil {
+				return nil, err
 			}
 			// Populate cache inside the flight callback so the entry
 			// is visible before the flight key is released. This closes
@@ -12771,8 +12805,16 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			fs.readCache.PutOwned(p, fetchData, cacheRev)
 			fs.mountViewMu.RUnlock()
 			return fetchData, nil
-		})
+		}
+		var data []byte
+		var err error
+		if fresh {
+			data, err = fetch()
+		} else {
+			data, err, _ = fs.readFlight.Do(ctx, sfKey, fetch)
+		}
 		if err != nil {
+			attempt.record(err)
 			source = "small-read-error"
 			if errors.Is(err, syscall.EAGAIN) {
 				return nil, gofuse.Status(syscall.EAGAIN)
@@ -12789,7 +12831,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		if offset >= int64(len(data)) {
 			source = "small-read-eof"
 			bytesRead = 0
-			return fs.mountViewReadResult(mountViewGeneration, nil)
+			return fs.mountViewReadResult(mountViewGeneration, nil, attempt)
 		}
 		end := offset + int64(input.Size)
 		if end > int64(len(data)) {
@@ -12797,7 +12839,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}
 		source = "small-read"
 		bytesRead = int(end - offset)
-		return fs.mountViewReadResult(mountViewGeneration, data[offset:end])
+		return fs.mountViewReadResult(mountViewGeneration, data[offset:end], attempt)
 	}
 
 	rangeOffset := int64(input.Offset)
@@ -12806,13 +12848,14 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	if eof {
 		source = "disk-read-cache-eof"
 		bytesRead = 0
-		return fs.mountViewReadResult(mountViewGeneration, nil)
+		return fs.mountViewReadResult(mountViewGeneration, nil, attempt)
 	}
-	if key, ok := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize); ok {
-		if data, ok := fs.diskReadCache.Get(key); ok {
+	if key, ok := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize); ok && !ownedRemote {
+		if data, ok := fs.diskReadCache.Get(key); ok && !fresh {
 			if !fs.statCacheTrustedAndVerified() && !revalidatedForRead {
-				refreshed, err := fs.revalidateReadCacheEntryIfUntrusted(cancel, p, entry)
+				refreshed, err := fs.revalidateReadCacheEntryIfUntrusted(cancel, p, entry, readRecoveryDeadline(fresh, attempt.deadline)...)
 				if err != nil {
+					attempt.record(err)
 					source = "read-cache-revalidate-error"
 					return nil, listDirErrToFuseStatus(err)
 				}
@@ -12821,7 +12864,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 				if refreshedEOF {
 					source = "disk-read-cache-eof"
 					bytesRead = 0
-					return fs.mountViewReadResult(mountViewGeneration, nil)
+					return fs.mountViewReadResult(mountViewGeneration, nil, attempt)
 				}
 				rangeSize = refreshedRangeSize
 				refreshedKey, refreshedOK := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize)
@@ -12843,7 +12886,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			if fh.Prefetch != nil && !bypassStableCaches {
 				fh.Prefetch.OnRead(rangeOffset, len(data))
 			}
-			return fs.mountViewReadResult(mountViewGeneration, data)
+			return fs.mountViewReadResult(mountViewGeneration, data, attempt)
 		}
 	diskReadCacheMiss:
 		if fs.perf != nil {
@@ -12855,12 +12898,13 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		var err error
 		if rangeSize > fs.parallelReadBlockSize() && fs.parallelReadConcurrency() > 1 {
 			source = "disk-read-cache-parallel-miss"
-			data, n, err = fs.readDiskCachedBlocks(ctx, p, fh, entry, rangeOffset, rangeSize, mountViewGeneration)
+			data, n, err = fs.readDiskCachedBlocks(ctx, p, fh, entry, rangeOffset, rangeSize, mountViewGeneration, readRecoveryDeadline(fresh, attempt.deadline)...)
 		} else {
 			source = "disk-read-cache-miss"
-			data, n, err = fs.readDiskCachedRangeForGeneration(ctx, p, fh, key, mountViewGeneration)
+			data, n, err = fs.readDiskCachedRangeForGeneration(ctx, p, fh, key, mountViewGeneration, readRecoveryDeadline(fresh, attempt.deadline)...)
 		}
 		if err != nil {
+			attempt.record(err)
 			fs.debugf("read disk-cache range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
 			if errors.Is(err, errReadRetriesExhausted) {
 				return nil, gofuse.EIO
@@ -12874,7 +12918,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		if fh.Prefetch != nil && !bypassStableCaches {
 			fh.Prefetch.OnRead(rangeOffset, n)
 		}
-		return fs.mountViewReadResult(mountViewGeneration, data)
+		return fs.mountViewReadResult(mountViewGeneration, data, attempt)
 	}
 
 	// Large file or unknown size: range read (avoids O(offset) discard).
@@ -12883,16 +12927,21 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	if source == "unknown" {
 		source = "range-read"
 	}
+	if ownedRemote {
+		requestedRangeSize = rangeSize
+	}
 	rangeStart := time.Now()
 	data, n, err := func() ([]byte, int, error) {
 		releaseReadSlot, err := fs.acquireRemoteReadSlot(ctx)
 		if err != nil {
+			attempt.record(err)
 			return nil, 0, err
 		}
 		defer releaseReadSlot()
-		return fs.readStreamRangeWithRetry(ctx, p, fh, int64(input.Offset), int64(input.Size))
+		return fs.readStreamRangeWithRetry(ctx, p, fh, rangeOffset, requestedRangeSize, attempt.deadline)
 	}()
 	if err != nil {
+		attempt.record(err)
 		fs.debugf("read range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
 		if errors.Is(err, errReadRetriesExhausted) {
 			return nil, gofuse.EIO
@@ -12906,11 +12955,11 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	if fh.Prefetch != nil && !bypassStableCaches {
 		fh.Prefetch.OnRead(int64(input.Offset), n)
 	}
-	return fs.mountViewReadResult(mountViewGeneration, data)
+	return fs.mountViewReadResult(mountViewGeneration, data, attempt)
 }
 
-func (fs *Dat9FS) mountViewReadResult(generation uint64, data []byte) (gofuse.ReadResult, gofuse.Status) {
-	if !fs.lockMountViewRead(generation) {
+func (fs *Dat9FS) mountViewReadResult(generation uint64, data []byte, attempt *mountViewReadAttempt) (gofuse.ReadResult, gofuse.Status) {
+	if !attempt.lock(fs, generation) {
 		return nil, gofuse.Status(syscall.EAGAIN)
 	}
 	defer fs.mountViewMu.RUnlock()

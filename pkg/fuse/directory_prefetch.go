@@ -284,8 +284,8 @@ func (fs *Dat9FS) loadRemoteDirectory(ctx context.Context, dirPath string, mount
 	if err := fs.applyBatchStats(ctx, dirPath, cached); err != nil {
 		return nil, responseBytes, err
 	}
-	if !fs.lockMountViewRead(mountGeneration) {
-		return nil, responseBytes, errMountViewChanged
+	if err := fs.lockMountViewReadCause(mountGeneration); err != nil {
+		return nil, responseBytes, err
 	}
 	defer fs.mountViewMu.RUnlock()
 
