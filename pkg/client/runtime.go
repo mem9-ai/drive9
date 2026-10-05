@@ -553,6 +553,9 @@ func (c *Client) watchRuntimeEventWindow(ctx context.Context, collection, id str
 		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
 			return after, fmt.Errorf("decode Runtime event: %w", err)
 		}
+		if event.OperationID != id {
+			return after, fmt.Errorf("runtime event operation_id %q does not match %q", event.OperationID, id)
+		}
 		if event.Cursor < 1 || event.Cursor > maxRuntimeEventCursor {
 			return after, fmt.Errorf("invalid Runtime event cursor %d", event.Cursor)
 		}

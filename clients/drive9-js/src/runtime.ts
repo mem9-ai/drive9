@@ -332,6 +332,7 @@ function runtimeTerminal(operation: RuntimeOperation): boolean {
 
 async function readEventWindow(
   response: Response,
+  operationId: string,
   cursor: { value: number },
   onEvent: (event: RuntimeEvent) => void | Promise<void>
 ): Promise<void> {
@@ -354,6 +355,9 @@ async function readEventWindow(
       const line = frame.split("\n").find((entry) => entry.startsWith("data: "));
       if (!line) continue;
       const event = JSON.parse(line.slice(6)) as RuntimeEvent;
+      if (event.operation_id !== operationId) {
+        throw new Drive9Error(`Runtime event operation_id ${JSON.stringify(event.operation_id)} does not match ${JSON.stringify(operationId)}`);
+      }
       if (!Number.isSafeInteger(event.cursor) || event.cursor < 1) {
         throw new Drive9Error(`invalid Runtime event cursor ${String(event.cursor)}`);
       }
@@ -396,6 +400,7 @@ export async function watchRuntimeEvents(client: Client, collection: RuntimeColl
       const query = cursor.value > 0 ? `?after=${cursor.value}` : "";
       await readEventWindow(
         await fetch(`${client.baseUrl}/v1/runtime/${collection}/${encodeURIComponent(id)}/events${query}`, { headers: client.authHeaders(), signal }),
+        id,
         cursor,
         onEvent
       );

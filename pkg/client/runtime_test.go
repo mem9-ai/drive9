@@ -301,6 +301,28 @@ func TestWatchRuntimeEventWindowDoesNotAcknowledgeRejectedEvent(t *testing.T) {
 	}
 }
 
+func TestWatchRuntimeEventWindowRejectsForeignOperation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, "data: {\"operation_id\":\"exec_other\",\"cursor\":2,\"kind\":\"running\"}\n\n")
+	}))
+	defer server.Close()
+
+	called := false
+	last, err := New(server.URL, "owner-key").watchRuntimeEventWindow(context.Background(), "executions", "exec_1", 0, func(RuntimeEvent) error {
+		called = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), `operation_id "exec_other" does not match "exec_1"`) {
+		t.Fatalf("watch error = %v", err)
+	}
+	if called {
+		t.Fatal("foreign operation event reached callback")
+	}
+	if last != 0 {
+		t.Fatalf("acknowledged cursor = %d, want 0", last)
+	}
+}
+
 func TestWatchRuntimeEventsRejectsUnsafeCursor(t *testing.T) {
 	err := New("http://unused.invalid", "owner-key").WatchRuntimeEvents(context.Background(), "executions", "exec_1", maxRuntimeEventCursor+1, nil)
 	if err == nil {

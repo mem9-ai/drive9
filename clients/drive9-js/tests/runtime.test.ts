@@ -273,6 +273,26 @@ describe("Runtime SDK", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it("rejects events from another Runtime operation without advancing", async () => {
+    let called = false;
+    server.use(
+      http.get("http://localhost:9009/v1/runtime/executions/exec_1/events", () =>
+        HttpResponse.text('data: {"operation_id":"exec_other","cursor":2,"kind":"running"}\n\n')
+      )
+    );
+    await expect(
+      new Client("http://localhost:9009", "owner-key").watchRuntimeEvents(
+        "executions",
+        "exec_1",
+        0,
+        () => {
+          called = true;
+        }
+      )
+    ).rejects.toThrow('operation_id "exec_other" does not match "exec_1"');
+    expect(called).toBe(false);
+  });
+
   it("reconnects after a mid-stream failure from the last delivered cursor", async () => {
     let window = 0;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
