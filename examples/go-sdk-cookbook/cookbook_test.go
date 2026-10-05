@@ -293,6 +293,53 @@ func ExampleClient_migrationContract() {
 	})
 }
 
+func ExampleClient_runtimeOperations() {
+	ctx := context.Background()
+	c := drive9.New("https://drive9.example.com", "owner-api-key")
+
+	capabilities, err := c.RuntimeCapabilities(ctx)
+	if err != nil || !capabilities.Enabled {
+		return
+	}
+
+	execution, err := c.SubmitRuntimeExecution(ctx, "exec-request-01", drive9.RuntimeExecutionRequest{
+		Workspace: &drive9.RuntimeWorkspaceInput{
+			ClientScopeKey: "project-a",
+			Source:         drive9.RuntimeWorkspaceSource{Root: "/projects/a"},
+		},
+		Profile: capabilities.DefaultProfile,
+		Execution: drive9.RuntimeExecutionSpec{
+			Argv:             []string{"go", "test", "./..."},
+			WorkingDirectory: "/",
+		},
+	})
+	if err == nil {
+		_, _ = c.GetRuntimeExecution(ctx, execution.ID)
+		_ = c.WatchRuntimeEvents(ctx, "executions", execution.ID, 0, func(event drive9.RuntimeEvent) error {
+			_ = event.Kind
+			return nil
+		})
+		_, _ = c.CancelRuntimeExecution(ctx, execution.ID)
+		_, _ = c.RecoverRuntimeExecution(ctx, execution.ID, "exec-recovery-01", "discard_uncommitted")
+	}
+
+	fileOperation, err := c.SubmitRuntimeFileOperation(ctx, "file-request-01", drive9.RuntimeFileOperationRequest{
+		WorkspaceRef: "runtime-workspace-ref",
+		Operation: drive9.RuntimeFileOperationSpec{
+			Action: "read",
+			Path:   "/README.md",
+		},
+	})
+	if err == nil {
+		_, _ = c.GetRuntimeFileOperation(ctx, fileOperation.ID)
+		_, _ = c.CancelRuntimeFileOperation(ctx, fileOperation.ID)
+		_, _ = c.RecoverRuntimeFileOperation(ctx, fileOperation.ID, "file-recovery-01", "discard_uncommitted")
+	}
+
+	_, _ = c.GetRuntimeRecovery(ctx, "runtime-recovery-id")
+	_, _ = c.DownloadRuntimeArtifact(ctx, "runtime-artifact-id")
+}
+
 // ExampleClient_archive demonstrates downloading a remote directory tree as a
 // streaming tar.gz (or zip) archive with profile-based filtering. The archive
 // is streamed directly into the provided io.Writer — pipe it to a file, stdout,
@@ -722,6 +769,8 @@ var coveredClientMethods = map[string]bool{
 	"CachedAppendLogSupported":             true,
 	"CachedBatchWriteModeSupported":        true,
 	"CachedSmallFileThreshold":             true,
+	"CancelRuntimeExecution":               true,
+	"CancelRuntimeFileOperation":           true,
 	"CheckpointFSLayer":                    true,
 	"Chmod":                                true,
 	"ChmodCtx":                             true,
@@ -741,6 +790,7 @@ var coveredClientMethods = map[string]bool{
 	"DeleteGitWorkspace":                   true,
 	"DeleteVaultSecret":                    true,
 	"DiffFSLayer":                          true,
+	"DownloadRuntimeArtifact":              true,
 	"ExtentMeta":                           true,
 	"GetDataCredential":                    true,
 	"ForkFSLayer":                          true,
@@ -762,6 +812,9 @@ var coveredClientMethods = map[string]bool{
 	"GetGitWorkspace":                      true,
 	"GetGitWorkspaceByRoot":                true,
 	"GetQuota":                             true,
+	"GetRuntimeExecution":                  true,
+	"GetRuntimeFileOperation":              true,
+	"GetRuntimeRecovery":                   true,
 	"Grep":                                 true,
 	"GrepWithLayer":                        true,
 	"Hardlink":                             true,
@@ -814,6 +867,8 @@ var coveredClientMethods = map[string]bool{
 	"RemoveAll":                            true,
 	"RemoveAllCtx":                         true,
 	"RemoveGitWorkspaceIndexEntry":         true,
+	"RecoverRuntimeExecution":              true,
+	"RecoverRuntimeFileOperation":          true,
 	"Rename":                               true,
 	"RenameCtx":                            true,
 	"ReplayFSLayer":                        true,
@@ -823,6 +878,7 @@ var coveredClientMethods = map[string]bool{
 	"ResumeUploadWithSummary":              true,
 	"ResumeUploadWithSummaryAndTags":       true,
 	"ResumeUploadWithTags":                 true,
+	"RuntimeCapabilities":                  true,
 	"RevokeScopedToken":                    true,
 	"RevokeScopedTokenByAPIKey":            true,
 	"RevokeVaultGrant":                     true,
@@ -843,6 +899,8 @@ var coveredClientMethods = map[string]bool{
 	"StatMetadataCompat":                   true,
 	"StatMetadataCompatCtx":                true,
 	"StatMetadataCtx":                      true,
+	"SubmitRuntimeExecution":               true,
+	"SubmitRuntimeFileOperation":           true,
 	"Symlink":                              true,
 	"SymlinkCtx":                           true,
 	"UpdateVaultSecret":                    true,
@@ -855,6 +913,7 @@ var coveredClientMethods = map[string]bool{
 	"Warm":                                 true,
 	"WatchEvents":                          true,
 	"WatchEventsWithLifecycle":             true,
+	"WatchRuntimeEvents":                   true,
 	"Write":                                true,
 	"WriteCtx":                             true,
 	"WriteCtxConditional":                  true,
