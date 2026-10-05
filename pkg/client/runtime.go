@@ -315,7 +315,7 @@ func (c *Client) submitRuntimeOperation(ctx context.Context, endpoint, idempoten
 		return nil, fmt.Errorf("%w: file action %q is unavailable", ErrRuntimeUnsupported, requiredFileAction)
 	}
 	if strings.TrimSpace(idempotencyKey) == "" {
-		return nil, fmt.Errorf("Runtime Idempotency-Key is required")
+		return nil, fmt.Errorf("runtime Idempotency-Key is required")
 	}
 	body, err := json.Marshal(input)
 	if err != nil {
@@ -410,7 +410,7 @@ func (c *Client) recoverRuntimeOperation(ctx context.Context, collection, id, id
 		return nil, err
 	}
 	if strings.TrimSpace(idempotencyKey) == "" {
-		return nil, fmt.Errorf("Runtime recovery Idempotency-Key is required")
+		return nil, fmt.Errorf("runtime recovery Idempotency-Key is required")
 	}
 	body, _ := json.Marshal(map[string]string{"action": action})
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/runtime/"+collection+"/"+url.PathEscape(id)+"/recover", bytes.NewReader(body))
@@ -455,7 +455,7 @@ func (c *Client) WatchRuntimeEvents(ctx context.Context, collection, id string, 
 		return fmt.Errorf("unsupported Runtime operation collection %q", collection)
 	}
 	if after < 0 || after > maxRuntimeEventCursor {
-		return fmt.Errorf("Runtime event cursor must be between 0 and %d", maxRuntimeEventCursor)
+		return fmt.Errorf("runtime event cursor must be between 0 and %d", maxRuntimeEventCursor)
 	}
 	for {
 		last, err := c.watchRuntimeEventWindow(ctx, collection, id, after, onEvent)
@@ -586,28 +586,28 @@ func (c *Client) DownloadRuntimeArtifact(ctx context.Context, id string) ([]byte
 		return nil, readRuntimeError(response)
 	}
 	if response.ContentLength < 0 {
-		return nil, fmt.Errorf("Runtime artifact response omitted Content-Length")
+		return nil, fmt.Errorf("runtime artifact response omitted Content-Length")
 	}
 	if response.ContentLength > maxRuntimeArtifactBytes {
-		return nil, fmt.Errorf("Runtime artifact exceeds %d bytes", maxRuntimeArtifactBytes)
+		return nil, fmt.Errorf("runtime artifact exceeds %d bytes", maxRuntimeArtifactBytes)
 	}
 	content, err := io.ReadAll(io.LimitReader(response.Body, maxRuntimeArtifactBytes+1))
 	if err != nil {
 		return nil, err
 	}
 	if len(content) > maxRuntimeArtifactBytes {
-		return nil, fmt.Errorf("Runtime artifact exceeds %d bytes", maxRuntimeArtifactBytes)
+		return nil, fmt.Errorf("runtime artifact exceeds %d bytes", maxRuntimeArtifactBytes)
 	}
 	if int64(len(content)) != response.ContentLength {
-		return nil, fmt.Errorf("Runtime artifact Content-Length mismatch: declared %d, read %d", response.ContentLength, len(content))
+		return nil, fmt.Errorf("runtime artifact Content-Length mismatch: declared %d, read %d", response.ContentLength, len(content))
 	}
 	expected := strings.ToLower(response.Header.Get("X-Content-SHA256"))
 	if expected == "" {
-		return nil, fmt.Errorf("Runtime artifact response omitted X-Content-SHA256")
+		return nil, fmt.Errorf("runtime artifact response omitted X-Content-SHA256")
 	}
 	sum := sha256.Sum256(content)
 	if hex.EncodeToString(sum[:]) != expected {
-		return nil, fmt.Errorf("Runtime artifact checksum mismatch")
+		return nil, fmt.Errorf("runtime artifact checksum mismatch")
 	}
 	return content, nil
 }
