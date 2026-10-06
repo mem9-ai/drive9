@@ -69,6 +69,7 @@ pub struct RunArgs {
     pub durability: String,
     pub overlay: Option<String>,
     pub write_cache_size_mb: Option<u64>,
+    pub allow_other: bool,
     pub tidbcloud_public_key: Option<String>,
     pub tidbcloud_private_key: Option<String>,
     /// External workload file set handed to the case via the PAYLOAD_DIR
@@ -361,6 +362,7 @@ fn run_once(
         live_async: None,
         durability,
         overlay: a.overlay.clone(),
+        allow_other: a.allow_other,
         write_cache_mb: a.write_cache_size_mb,
         sandbox_fc: sb.is_fc(),
         blocked_reason: None,
@@ -1015,6 +1017,9 @@ pub struct Runner {
     /// repeated `--local-only` flags so cases can exercise the overlay
     /// branch (issue #1006 branch coverage: remote vs local-only)
     pub overlay: Option<String>,
+    /// pass --allow-other to the mount; rides along with the kernel-side
+    /// default_permissions permission checks
+    pub allow_other: bool,
     pub write_cache_mb: Option<u64>,
     pub sandbox_fc: bool,
     pub blocked_reason: Option<String>,
@@ -1313,6 +1318,9 @@ impl Runner {
                 args.push("--local-only".into());
                 args.push(g.to_string());
             }
+        }
+        if self.allow_other {
+            args.push("--allow-other".into());
         }
         args.push("--foreground".into());
         args.push(":/".into());

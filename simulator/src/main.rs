@@ -53,6 +53,11 @@ enum Commands {
         overlay: Option<String>,
         #[arg(long)]
         write_cache_size_mb: Option<u64>,
+        /// pass --allow-other to the mount (enables the kernel-side
+        /// default_permissions checks that ride along with it); requires
+        /// user_allow_other in /etc/fuse.conf when mounting as non-root
+        #[arg(long, default_value_t = false)]
+        allow_other: bool,
         /// TiDB Cloud public key for tidb_cloud_native provisioning
         #[arg(long)]
         tidbcloud_public_key: Option<String>,
@@ -115,6 +120,7 @@ fn main() -> Result<()> {
             durability,
             overlay,
             write_cache_size_mb,
+            allow_other,
             tidbcloud_public_key,
             tidbcloud_private_key,
             payload_dir,
@@ -131,6 +137,7 @@ fn main() -> Result<()> {
             durability,
             overlay,
             write_cache_size_mb,
+            allow_other,
             tidbcloud_public_key,
             tidbcloud_private_key,
             payload_dir,

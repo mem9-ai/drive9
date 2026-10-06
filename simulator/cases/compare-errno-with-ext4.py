@@ -616,7 +616,7 @@ def _j3(ws):
 
 
 case("J3-traverse-unsearchable-dir", "J", "parity", simple_op(_j3),
-     note="kernel-side EACCES with default_permissions (parity since the mount option is unconditional)")
+     note="kernel-side EACCES; requires the mount's allow-other/default_permissions combination (run with --allow-other)")
 
 # --- K: xattr ----------------------------------------------------------------
 
