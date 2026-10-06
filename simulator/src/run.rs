@@ -360,6 +360,7 @@ fn run_once(
         check_counter: 0,
         live_async: None,
         durability,
+        overlay: a.overlay.clone(),
         write_cache_mb: a.write_cache_size_mb,
         sandbox_fc: sb.is_fc(),
         blocked_reason: None,
@@ -1010,6 +1011,10 @@ pub struct Runner {
     pub check_counter: u64,
     pub live_async: Option<AsyncInfo>,
     pub durability: String,
+    /// local-only overlay globs (comma separated) forwarded to the mount as
+    /// repeated `--local-only` flags so cases can exercise the overlay
+    /// branch (issue #1006 branch coverage: remote vs local-only)
+    pub overlay: Option<String>,
     pub write_cache_mb: Option<u64>,
     pub sandbox_fc: bool,
     pub blocked_reason: Option<String>,
@@ -1302,6 +1307,12 @@ impl Runner {
         if let Some(mb) = self.write_cache_mb {
             args.push("--write-cache-size-mb".into());
             args.push(mb.to_string());
+        }
+        if let Some(globs) = &self.overlay {
+            for g in globs.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                args.push("--local-only".into());
+                args.push(g.to_string());
+            }
         }
         args.push("--foreground".into());
         args.push(":/".into());

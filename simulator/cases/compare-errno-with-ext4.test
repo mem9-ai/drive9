@@ -1,0 +1,101 @@
+#!/bin/sh
+set -eu
+
+# Issue #1006: run the errno scenario catalog against the drive9 mount (cwd)
+# and a real ext4 directory in parallel, then compare the application-visible
+# errno of every scenario. Two passes over the same catalog:
+#
+#   pass 1 (remote)     cwd root; divergence docs asserted (recorded on the
+#                       remote branch)
+#   pass 2 (local-only) $D9_MOUNT/.errno-local — requires the run to be
+#                       started with --overlay '**/.errno-local/**' so the
+#                       engine forwards it as a --local-only mount rule.
+#                       Divergence docs are remote-branch only, so pass 2
+#                       records them without verdict; parity is still
+#                       asserted. Cross-layer rename/hardlink (EXDEV, family
+#                       X) is pass-2 only.
+#
+# The probe prints the comparison tables and writes per-family verdict marker
+# files (fail-<FAM>[<suffix>] / info-<FAM>[<suffix>]). famcheck turns one
+# family+suffix into a check payload: rc 0 = all asserted rows pass,
+# rc 3 = only record rows, rc 1 = findings (rows printed into evidence).
+#
+# EXT4_BASE may point at a directory on an ext4 filesystem; the probe
+# auto-detects /mnt/ebs or $HOME otherwise and fails loudly if none is ext4.
+
+PROBE=$(dirname "$0")/compare-errno-with-ext4.py
+WORK=$(mktemp -d /tmp/errno-cmp.XXXXXX)
+
+# Optional git-workspace coverage (issue #1006: hardlinks on git-workspace
+# paths return ENOTSUP). GIT_WS_SRC must be a bare git repo URL (e.g.
+# file:///home/ubuntu/errno-probe.git); when set, a git workspace is cloned
+# into the mount and family W asserts the documented ENOTSUP divergence.
+# Paths passed via $WSARGS must not contain spaces.
+WSARGS=""
+if [ -n "${GIT_WS_SRC:-}" ]; then
+    drive9 git clone --fast "$GIT_WS_SRC" "$D9_MOUNT/.errno-gitsrc"
+    printf 'marker\n' > "$D9_MOUNT/.errno-gitsrc/errno-link-marker"
+    WSARGS="--git-ws-root $D9_MOUNT/.errno-gitsrc"
+fi
+
+cat > "$WORK/famcheck.sh" <<'EOF'
+#!/bin/sh
+# usage: famcheck.sh <work> <family> <suffix>
+if [ -s "$1/fail-$2$3" ]; then
+    cat "$1/fail-$2$3"
+    exit 1
+elif [ -s "$1/info-$2$3" ]; then
+    exit 3
+fi
+exit 0
+EOF
+
+if [ -n "${EXT4_BASE:-}" ]; then
+    python3 "$PROBE" --d9-root "$D9_MOUNT" --out "$WORK" --ext4-base "$EXT4_BASE" $WSARGS
+    mkdir -p "$D9_MOUNT/.errno-local"
+    python3 "$PROBE" --d9-root "$D9_MOUNT/.errno-local" --out "$WORK" --suffix -local \
+        --diverge-as-record --alt-root "$D9_MOUNT/.errno-alt" --ext4-base "$EXT4_BASE"
+else
+    python3 "$PROBE" --d9-root "$D9_MOUNT" --out "$WORK" $WSARGS
+    mkdir -p "$D9_MOUNT/.errno-local"
+    python3 "$PROBE" --d9-root "$D9_MOUNT/.errno-local" --out "$WORK" --suffix -local \
+        --diverge-as-record --alt-root "$D9_MOUNT/.errno-alt"
+fi
+rmdir "$D9_MOUNT/.errno-local" "$D9_MOUNT/.errno-alt" 2>/dev/null || true
+
+# keep the tables next to the engine artifacts when the variable is exported
+if [ -n "${D9_RUN_DIR:-}" ] && [ -d "${D9_RUN_DIR:-}" ]; then
+    cp "$WORK/table.txt" "$D9_RUN_DIR/errno-comparison-table.txt"
+    cp "$WORK/table-local.txt" "$D9_RUN_DIR/errno-comparison-table-local.txt"
+fi
+
+drive9-test-check shell --req errno-cmp-A --claim family-A-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' A ''"drive9-test-check shell --req errno-cmp-B --claim family-B-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' B ''"
+drive9-test-check shell --req errno-cmp-C --claim family-C-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' C ''"
+drive9-test-check shell --req errno-cmp-D --claim family-D-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' D ''"
+drive9-test-check shell --req errno-cmp-E --claim family-E-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' E ''"
+drive9-test-check shell --req errno-cmp-F --claim family-F-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' F ''"
+drive9-test-check shell --req errno-cmp-G --claim family-G-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' G ''"
+drive9-test-check shell --req errno-cmp-H --claim family-H-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' H ''"
+drive9-test-check shell --req errno-cmp-I --claim family-I-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' I ''"
+drive9-test-check shell --req errno-cmp-J --claim family-J-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' J ''"
+drive9-test-check shell --req errno-cmp-K --claim family-K-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' K ''"
+drive9-test-check shell --req errno-cmp-L --claim family-L-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' L ''"
+drive9-test-check shell --req errno-cmp-M --claim family-M-remote -- sh -c "sh '$WORK/famcheck.sh' '$WORK' M ''"
+drive9-test-check shell --req errno-cmp-A-local --claim family-A-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' A -local"
+drive9-test-check shell --req errno-cmp-B-local --claim family-B-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' B -local"
+drive9-test-check shell --req errno-cmp-C-local --claim family-C-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' C -local"
+drive9-test-check shell --req errno-cmp-D-local --claim family-D-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' D -local"
+drive9-test-check shell --req errno-cmp-E-local --claim family-E-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' E -local"
+drive9-test-check shell --req errno-cmp-F-local --claim family-F-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' F -local"
+drive9-test-check shell --req errno-cmp-G-local --claim family-G-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' G -local"
+drive9-test-check shell --req errno-cmp-H-local --claim family-H-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' H -local"
+drive9-test-check shell --req errno-cmp-I-local --claim family-I-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' I -local"
+drive9-test-check shell --req errno-cmp-J-local --claim family-J-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' J -local"
+drive9-test-check shell --req errno-cmp-K-local --claim family-K-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' K -local"
+drive9-test-check shell --req errno-cmp-L-local --claim family-L-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' L -local"
+drive9-test-check shell --req errno-cmp-M-local --claim family-M-local -- sh -c "sh '$WORK/famcheck.sh' '$WORK' M -local"
+drive9-test-check shell --req errno-cmp-X --claim cross-layer-exdev -- sh -c "sh '$WORK/famcheck.sh' '$WORK' X -local"
+if [ -n "${GIT_WS_SRC:-}" ]; then
+    drive9-test-check shell --req errno-cmp-W --claim gitws-hardlink-notsup -- sh -c "sh '$WORK/famcheck.sh' '$WORK' W ''"
+fi
+drive9-test-check shell --req errno-cmp-complete --claim tables-produced -- sh -c "test -f '$WORK/table.txt' && test -f '$WORK/table-local.txt' && grep -q 'total=' '$WORK/table-local.txt'"
