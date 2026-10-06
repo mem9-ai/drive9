@@ -32,10 +32,15 @@ type LoadPartFunc func(partNum int) ([]byte, error)
 // server-side via S3 UploadPartCopy).
 // It is NOT thread-safe; callers must hold the FileHandle mutex.
 type WriteBuffer struct {
-	path      string
-	totalSize int64 // current logical file size
-	maxSize   int64
-	partSize  int64
+	// Proven unchanged bytes in [0, prefixEnd) of prefixRevision. Content
+	// versions survive ClearDirty and rollback to fence unlocked readers.
+	prefixRevision int64
+	prefixEnd      int64
+	contentVersion uint64
+	path           string
+	totalSize      int64 // current logical file size
+	maxSize        int64
+	partSize       int64
 	// smallFileMax is the cutoff for the single-buffer fast path; equals the
 	// server-advertised inline_threshold when known, otherwise the local
 	// default. Stored per-buffer so per-mount values (server overrides,
@@ -129,6 +134,8 @@ func (wb *WriteBuffer) restore(snapshot *writeBufferSnapshot) {
 	if wb == nil || snapshot == nil {
 		return
 	}
+	wb.contentVersion++
+	wb.prefixRevision, wb.prefixEnd = 0, 0
 	wb.path = snapshot.path
 	wb.totalSize = snapshot.totalSize
 	wb.maxSize = snapshot.maxSize
@@ -219,6 +226,11 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 	end := offset + int64(len(data))
 	if end > wb.maxSize {
 		return 0, syscall.EFBIG
+	}
+	// Invalidate before a possible partial write followed by a load error.
+	wb.contentVersion++
+	if len(data) > 0 && offset < wb.prefixEnd {
+		wb.prefixRevision, wb.prefixEnd = 0, 0
 	}
 
 	// Small-file fast path: use a single contiguous allocation for files
@@ -574,6 +586,8 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 	if size < 0 {
 		size = 0
 	}
+	wb.contentVersion++
+	wb.prefixRevision, wb.prefixEnd = 0, 0
 	wb.touched = true
 
 	cur := wb.totalSize
@@ -984,6 +998,8 @@ func (wb *WriteBuffer) LoadMissingParts() error {
 
 // Reset clears the buffer, releasing the underlying memory.
 func (wb *WriteBuffer) Reset() {
+	wb.contentVersion++
+	wb.prefixRevision, wb.prefixEnd = 0, 0
 	wb.parts = make(map[int][]byte)
 	wb.dirtyParts = make(map[int]bool)
 	wb.totalSize = 0
@@ -997,6 +1013,16 @@ func (wb *WriteBuffer) ClearDirty() {
 	// Note: we intentionally do NOT clear smallFileData here.
 	// ClearDirty is called after successful flush/upload; the data remains
 	// valid for reads until the handle is released or Reset is called.
+}
+
+// markCommittedPrefix requires bytes established from this exact revision,
+// not merely a clean buffer or an updated handle revision.
+func (wb *WriteBuffer) markCommittedPrefix(revision, size int64) {
+	wb.contentVersion++
+	wb.prefixRevision, wb.prefixEnd = 0, 0
+	if revision > 0 && size == wb.Size() && !wb.HasDirtyParts() {
+		wb.prefixRevision, wb.prefixEnd = revision, size
+	}
 }
 
 // EnsureLoaded loads a part from the server if it's not already in memory.
