@@ -101,6 +101,10 @@ bash e2e/posix-permission-smoke-test.sh
 # Run the default smoke-all sequence once (local-e2e.yml PR set)
 bash e2e/smoke-all.sh
 
+# Cross-repository Runtime visibility proof. Select the client ref with --ref
+# and the exact server ref with the workflow input; neither head is inferred.
+gh workflow run runtime-exec-e2e.yml --ref <client-ref> -f server_ref=<server-ref>
+
 # Skip FUSE-related suites (macOS / no real FUSE)
 RUN_FUSE_SMOKE=0 bash e2e/smoke-all.sh
 
@@ -742,6 +746,21 @@ Opt-in (`RUN_TASKS_SMOKE=1`). Wire contract for `GET /v1/fs/{path}?tasks`
 directory `400`, and unknown-query-key rejection. The handler lives in the
 external server repository, so this is the cross-repo drift check; it needs a
 server build that implements `?tasks`. Not part of the PR or post-merge default.
+
+### `runtime-exec-visibility.sh`
+
+Cross-repository executable proof for the one-shot Runtime workspace boundary.
+It provisions a real local tenant, writes an exact payload through `/v1/fs`,
+runs one Docker process against the fresh Drive9 FUSE mount, compares the
+mounted read byte-for-byte, writes a second exact payload in the process, and
+requires that payload to be immediately readable through `/v1/fs` after the
+terminal frame. It deliberately does not poll or retry the exec or final read.
+
+The script is wired to the manual/reusable `Runtime Exec E2E` workflow rather
+than ordinary PR CI because it must receive an explicit exact `tidbcloud/fs`
+`server_ref`. The checked-out client ref is selected by the workflow caller.
+This keeps cross-repository evidence bound to both exact heads and avoids
+silently testing either PR against a stale peer `main`.
 
 ### `git-feature-smoke-test.sh`
 
