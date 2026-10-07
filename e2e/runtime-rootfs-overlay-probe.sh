@@ -19,6 +19,7 @@ FUSE_ROOT="$WORK_DIR/drive9"
 MERGED="$WORK_DIR/merged"
 MOUNT_LOG="$WORK_DIR/fuse.log"
 FUSE_PID=""
+FIRST_FUSE_PID=""
 OVERLAY_MOUNTED=0
 TMP_MOUNTED=0
 RUN_MOUNTED=0
@@ -52,17 +53,18 @@ unmount_overlay() {
 
 unmount_drive9() {
   if mountpoint -q "$FUSE_ROOT"; then
-    run_cli umount --timeout 30s "$FUSE_ROOT" >/dev/null 2>&1 || true
+    run_cli umount --timeout 30s "$FUSE_ROOT" >/dev/null
   fi
   if [ -n "$FUSE_PID" ]; then
-    wait "$FUSE_PID" >/dev/null 2>&1 || true
+    wait "$FUSE_PID"
     FUSE_PID=""
   fi
+  ! mountpoint -q "$FUSE_ROOT"
 }
 
 cleanup() {
   unmount_overlay
-  unmount_drive9
+  unmount_drive9 >/dev/null 2>&1 || true
   if [ -n "$API_KEY" ]; then
     curl -sS --max-time 20 -X DELETE \
       -H "Authorization: Bearer ${API_KEY}" \
@@ -147,6 +149,7 @@ printf 'rename-me\n' >"$LOWER/etc/lower-rename"
 printf 'hidden-child\n' >"$LOWER/etc/opaque/lower-child"
 
 mount_drive9
+FIRST_FUSE_PID="$FUSE_PID"
 mount_overlay
 
 sudo chroot "$MERGED" /bin/sh -c 'test -x /bin/sh && printf lower-image-ok' \
@@ -177,11 +180,21 @@ sync
 unmount_overlay
 run_cli fs drain-file-system --mount-path "$FUSE_ROOT" --timeout 30s >/dev/null \
   || fail "Drive9 drain failed after rootfs mutation"
-unmount_drive9
+unmount_drive9 || fail "first Drive9 FUSE mount did not stop cleanly"
+if kill -0 "$FIRST_FUSE_PID" 2>/dev/null; then
+  fail "first Drive9 FUSE process is still alive after unmount"
+fi
 
 # Recreate both the FUSE mount and overlay mount. No session-local metadata may
 # be needed to reconstruct the merged root.
 mount_drive9
+[ "$FUSE_PID" != "$FIRST_FUSE_PID" ] || fail "Drive9 remount reused the old FUSE process"
+sudo python3 - "$FUSE_ROOT/upper/etc/drive9.conf" <<'PY' \
+  || fail "xattr was absent on the fresh Drive9 FUSE mount before overlay reconstruction"
+import os
+import sys
+assert os.getxattr(sys.argv[1], b"user.drive9.probe") == b"durable"
+PY
 mount_overlay
 
 sudo chroot "$MERGED" /bin/sh -c 'test -x /bin/sh && printf lower-image-ok' \
