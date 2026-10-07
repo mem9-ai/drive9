@@ -131,7 +131,7 @@ describe("runtime exec", () => {
         execution_class: "linux-full",
         rootfs: {
           driver: "user-union",
-          capability_version: "drive9_rootfs.user_union.extent.v3",
+          capability_version: "drive9_rootfs.user_union.extent.v4",
           config_hash: "a".repeat(64),
           lower_image_digest: `sha256:${"b".repeat(64)}`,
         },
@@ -151,9 +151,15 @@ describe("runtime exec", () => {
       detached: false,
       replay: false,
       providers: [{ provider: "docker", profiles: ["default"], candidates: [{
-        profile: "other",
+        profile: "default",
         execution_class: "linux-full",
-        rootfs: { driver: "user-union", capability_version: "v1", config_hash: "a", lower_image_digest: "sha256:b" },
+        rootfs: {
+          driver: "user-union",
+          capability_version: "drive9_rootfs.user_union.extent.v3",
+          config_hash: "a".repeat(64),
+          lower_image_digest: `sha256:${"b".repeat(64)}`,
+        },
+        capabilities: { "drive9.extent_xattr.v1": true },
         production_eligible: true,
         bounded_selection_eligible: true,
       }] }],

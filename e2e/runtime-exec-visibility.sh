@@ -102,7 +102,7 @@ capabilities="$(curl -fsS --max-time 20 -H "Authorization: Bearer ${API_KEY}" \
 printf '%s' "$capabilities" | jq -e \
   '.streaming == true and .separate_stdout_stderr == true and .cancel == true and .detached == false and .replay == false
    and any(.providers[].candidates[]; .execution_class == "linux-full"
-     and .rootfs.capability_version == "drive9_rootfs.user_union.extent.v3"
+     and .rootfs.capability_version == "drive9_rootfs.user_union.extent.v4"
      and .capabilities["drive9.extent_xattr.v1"] == true
      and .production_eligible == true and .bounded_selection_eligible == true)' \
   >/dev/null || fail "Runtime capabilities do not match the one-shot contract"

@@ -454,7 +454,7 @@ func validateRuntimeCapabilities(capabilities RuntimeCapabilities) error {
 		candidateProfiles := make(map[string]struct{}, len(provider.Candidates))
 		for _, candidate := range provider.Candidates {
 			if strings.TrimSpace(candidate.Profile) == "" || candidate.ExecutionClass != "linux-full" ||
-				candidate.RootFS.Driver != "user-union" || candidate.RootFS.CapabilityVersion != "drive9_rootfs.user_union.extent.v3" ||
+				candidate.RootFS.Driver != "user-union" || candidate.RootFS.CapabilityVersion != "drive9_rootfs.user_union.extent.v4" ||
 				!validRuntimeSHA256Hex(candidate.RootFS.ConfigHash) ||
 				!strings.HasPrefix(candidate.RootFS.LowerImageDigest, "sha256:") || !validRuntimeSHA256Hex(strings.TrimPrefix(candidate.RootFS.LowerImageDigest, "sha256:")) ||
 				!candidate.Capabilities[ExtentXattrProtocolV1] ||

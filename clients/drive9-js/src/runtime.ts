@@ -265,7 +265,7 @@ function validRuntimeCandidateCapability(value: unknown): value is RuntimeCandid
       !isObject(value.rootfs) || !isObject(value.capabilities)) return false;
   const rootfsAllowed = new Set(["driver", "capability_version", "config_hash", "lower_image_digest"]);
   return !Object.keys(value.rootfs).some((key) => !rootfsAllowed.has(key)) && value.execution_class === "linux-full" &&
-    value.rootfs.driver === "user-union" && value.rootfs.capability_version === "drive9_rootfs.user_union.extent.v3" &&
+    value.rootfs.driver === "user-union" && value.rootfs.capability_version === "drive9_rootfs.user_union.extent.v4" &&
     typeof value.rootfs.config_hash === "string" && /^[0-9a-f]{64}$/.test(value.rootfs.config_hash) &&
     typeof value.rootfs.lower_image_digest === "string" && /^sha256:[0-9a-f]{64}$/.test(value.rootfs.lower_image_digest) &&
     value.capabilities["drive9.extent_xattr.v1"] === true &&

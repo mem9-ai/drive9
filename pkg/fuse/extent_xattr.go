@@ -86,7 +86,7 @@ func (fs *Dat9FS) extentRemoveXattr(ctx context.Context, ino uint64, name string
 	return status
 }
 
-// classicFuseOverlayStatXattr returns the stat override fuse-overlayfs 1.10
+// classicFuseOverlayStatXattr returns the stat override fuse-overlayfs 1.14
 // requires when xattr_permissions=2. A file created through the ordinary
 // Drive9 API has classic content and therefore no JuiceFS inode on which the
 // durable extent xattr protocol can store this private attribute. Without a

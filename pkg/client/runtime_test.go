@@ -263,7 +263,7 @@ func TestRuntimeCapabilitiesAcceptsProviderAwareCandidates(t *testing.T) {
 			Candidates: []RuntimeCandidateCapability{{
 				Profile: "default", ExecutionClass: "linux-full",
 				RootFS: RuntimeRootFSIdentity{
-					Driver: "user-union", CapabilityVersion: "drive9_rootfs.user_union.extent.v3",
+					Driver: "user-union", CapabilityVersion: "drive9_rootfs.user_union.extent.v4",
 					ConfigHash: strings.Repeat("a", 64), LowerImageDigest: "sha256:" + strings.Repeat("b", 64),
 				},
 				Capabilities:       map[string]bool{ExtentXattrProtocolV1: true},
@@ -274,6 +274,11 @@ func TestRuntimeCapabilitiesAcceptsProviderAwareCandidates(t *testing.T) {
 	if err := validateRuntimeCapabilities(capabilities); err != nil {
 		t.Fatal(err)
 	}
+	capabilities.Providers[0].Candidates[0].RootFS.CapabilityVersion = "drive9_rootfs.user_union.extent.v3"
+	if err := validateRuntimeCapabilities(capabilities); err == nil {
+		t.Fatal("v3 rootfs candidate error = nil")
+	}
+	capabilities.Providers[0].Candidates[0].RootFS.CapabilityVersion = "drive9_rootfs.user_union.extent.v4"
 	delete(capabilities.Providers[0].Candidates[0].Capabilities, ExtentXattrProtocolV1)
 	if err := validateRuntimeCapabilities(capabilities); err == nil {
 		t.Fatal("candidate without negotiated extent xattr capability error = nil")
