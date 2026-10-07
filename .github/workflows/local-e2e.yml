@@ -298,11 +298,14 @@ jobs:
 
       - name: Probe durable Drive9 overlay rootfs
         id: runtime-rootfs-overlay
-        continue-on-error: true
         run: |
           probe_cli="$(mktemp)"
           trap 'rm -f "$probe_cli"' EXIT
           make build-cli CLI_BIN="$probe_cli"
+          echo "rootfs probe source commit: $GITHUB_SHA"
+          echo "rootfs probe CLI path: $(realpath "$probe_cli")"
+          "$probe_cli" --version
+          sha256sum "$probe_cli"
           DRIVE9_CLI_BIN="$probe_cli" bash e2e/runtime-rootfs-overlay-probe.sh
 
       - name: Run API smoke
