@@ -120,7 +120,7 @@ printf '%s' "$INBOUND_PAYLOAD" | curl -fsS --max-time 20 -X PUT \
 
 if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
   --workspace "$ROOT" --timeout 30s --env "INBOUND_PAYLOAD=${INBOUND_PAYLOAD}" --env "OUTBOUND_PAYLOAD=${OUTBOUND_PAYLOAD}" -- \
-  /bin/sh -c 'set -eu
+  /bin/sh -c 'set -eux
     test "$(stat -c %u:%g /bin/sh)" = 0:0
     test "$(cat /etc/api-inbound.txt)" = "$INBOUND_PAYLOAD"
     test "$(cat /root/persist.txt)" = root-state
