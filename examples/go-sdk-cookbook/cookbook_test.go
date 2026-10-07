@@ -293,6 +293,61 @@ func ExampleClient_migrationContract() {
 	})
 }
 
+func ExampleClient_oneShotRuntimeExec() {
+	ctx := context.Background()
+	c := drive9.New("https://drive9.example.com", "workspace-scoped-api-key")
+
+	capabilities, err := c.GetRuntimeCapabilities(ctx)
+	if err != nil || !capabilities.Streaming {
+		return
+	}
+
+	var stdout, stderr bytes.Buffer
+	var started drive9.ExecStarted
+	result, err := c.Exec(ctx, drive9.ExecRequest{
+		Argv: []string{"go", "test", "./..."},
+		Cwd:  "/workspace",
+		Workspace: drive9.RuntimeWorkspace{
+			Root: "/projects/example",
+		},
+		Resources: drive9.RuntimeResources{
+			CPUMillis: 1000,
+			MemoryMB:  2048,
+			PIDs:      256,
+			Network:   "none",
+		},
+		TimeoutMS: int64((15 * time.Minute) / time.Millisecond),
+	}, drive9.ExecOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+		OnStarted: func(value drive9.ExecStarted) error {
+			started = value
+			return nil
+		},
+	})
+	if err != nil {
+		if drive9.IsRuntimeOutcomeUnknown(err) {
+			// The process may have run. Reconcile instead of resubmitting.
+			return
+		}
+		return
+	}
+	_ = started.ExecutionID
+	_ = result.ExitCode // A nonzero exit code is a normal result.
+	_ = stdout.Bytes()
+	_ = stderr.Bytes()
+}
+
+func ExampleClient_cancelRuntimeExecution() {
+	c := drive9.New("https://drive9.example.com", "workspace-scoped-api-key")
+	cancelCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// Use the ID reported by ExecOptions.OnStarted for an execution that is
+	// still active. A nil error confirms both stop and workspace cleanup.
+	_ = c.CancelRuntimeExecution(cancelCtx, "rex_12345678")
+}
+
 // ExampleClient_archive demonstrates downloading a remote directory tree as a
 // streaming tar.gz (or zip) archive with profile-based filtering. The archive
 // is streamed directly into the provided io.Writer — pipe it to a file, stdout,
@@ -722,6 +777,7 @@ var coveredClientMethods = map[string]bool{
 	"CachedAppendLogSupported":             true,
 	"CachedBatchWriteModeSupported":        true,
 	"CachedSmallFileThreshold":             true,
+	"CancelRuntimeExecution":               true,
 	"CheckpointFSLayer":                    true,
 	"Chmod":                                true,
 	"ChmodCtx":                             true,
@@ -742,6 +798,7 @@ var coveredClientMethods = map[string]bool{
 	"DeleteVaultSecret":                    true,
 	"DiffFSLayer":                          true,
 	"ExtentMeta":                           true,
+	"Exec":                                 true,
 	"GetDataCredential":                    true,
 	"ForkFSLayer":                          true,
 	"DiffFSLayerAtSeq":                     true,
@@ -762,6 +819,7 @@ var coveredClientMethods = map[string]bool{
 	"GetGitWorkspace":                      true,
 	"GetGitWorkspaceByRoot":                true,
 	"GetQuota":                             true,
+	"GetRuntimeCapabilities":               true,
 	"Grep":                                 true,
 	"GrepWithLayer":                        true,
 	"Hardlink":                             true,
