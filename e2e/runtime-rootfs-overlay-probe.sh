@@ -68,7 +68,7 @@ cleanup() {
   if [ -n "$API_KEY" ]; then
     curl -sS --max-time 20 -X DELETE \
       -H "Authorization: Bearer ${API_KEY}" \
-      "${BASE}/v1/fs/${REMOTE_ROOT#/}?recursive" >/dev/null 2>&1 || true
+      "${BASE}/v1/fs/${REMOTE_ROOT#/}?recursive=true" >/dev/null 2>&1 || true
   fi
   sudo rm -rf -- "$WORK_DIR"
 }
@@ -134,6 +134,9 @@ while :; do
   [ "$SECONDS" -lt "$deadline" ] || fail "tenant did not become active"
   sleep 2
 done
+
+run_cli fs mkdir ":$REMOTE_ROOT" >/dev/null \
+  || fail "failed to create the disposable Drive9 root"
 
 mkdir -p "$LOWER" "$FUSE_ROOT" "$MERGED"
 docker pull "$ROOTFS_IMAGE" >/dev/null
