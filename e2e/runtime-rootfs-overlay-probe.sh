@@ -247,6 +247,7 @@ unmount_overlay || fail "$ROOTFS_DRIVER teardown was not idempotent"
 if [ -n "$FIRST_OVERLAY_PID" ] && kill -0 "$FIRST_OVERLAY_PID" 2>/dev/null; then
   fail "first fuse-overlayfs process is still alive after unmount"
 fi
+mountpoint -q "$FUSE_ROOT" || fail "Drive9 mount disappeared before drain"
 run_cli mount drain --timeout 30s "$FUSE_ROOT" >/dev/null \
   || fail "Drive9 drain failed after rootfs mutation"
 unmount_drive9 || fail "first Drive9 FUSE mount did not stop cleanly"
