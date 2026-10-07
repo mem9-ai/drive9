@@ -35,6 +35,11 @@ func ExampleClient_constructionStatusAndRawRequests() {
 	_ = c.MaxUploadBytes(ctx)
 	_ = c.SmallFileThreshold(ctx)
 	_ = c.CachedSmallFileThreshold()
+	// The cached result performs no network I/O and fails closed until Warm has
+	// observed the exact persistent extent-xattr protocol from the server.
+	if c.CachedExtentXattrSupported() {
+		_ = drive9.ExtentXattrProtocolV1
+	}
 	c.SetSmallFileThresholdForTests(50_000)
 
 	resp, err := c.RawPost("/v1/custom/action", strings.NewReader(`{"ok":true}`))
@@ -776,6 +781,7 @@ var coveredClientMethods = map[string]bool{
 	"BatchWriteCtx":                        true,
 	"CachedAppendLogSupported":             true,
 	"CachedBatchWriteModeSupported":        true,
+	"CachedExtentXattrSupported":           true,
 	"CachedSmallFileThreshold":             true,
 	"CancelRuntimeExecution":               true,
 	"CheckpointFSLayer":                    true,
