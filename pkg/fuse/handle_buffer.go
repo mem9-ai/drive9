@@ -56,6 +56,15 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 		}
 		fh.PendingIndexGen = gen
 	}
+	if fs.ftruncateParticipates(fh) {
+		fs.pendingIndex.mu.Lock()
+		if meta := fs.pendingIndex.items[fh.Path]; meta != nil && meta.Generation == fh.PendingIndexGen {
+			meta.ownedStagingKnown = true
+			meta.ownedStagingGens = fs.captureHandleStagingGensLocked(fh)
+			meta.Inode, meta.MutationSeq = fh.Ino, fh.DirtySeq
+		}
+		fs.pendingIndex.mu.Unlock()
+	}
 	publishStagedSnapshotLineageLocked(fh)
 	return nil
 }

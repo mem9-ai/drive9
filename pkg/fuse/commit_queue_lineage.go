@@ -43,6 +43,9 @@ func snapshotAncestors(parent string, inherited []string) []string {
 // discardLandedAncestor acknowledges an exact ancestor already superseded by
 // this process's verified remote image. Byte prefixes alone cannot prove this.
 func (cq *CommitQueue) discardLandedAncestor(ctx context.Context, entry *CommitEntry) bool {
+	if entry != nil && entry.ftruncateValid != nil && !entry.ftruncateValid() {
+		return false
+	}
 	if entry == nil || entry.recovered || !entry.liveLineageProof || entry.SnapshotID == "" ||
 		shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 		return false

@@ -150,6 +150,20 @@ func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) b
 func (fs *Dat9FS) syncPassivePathTruncateLocked(fh *FileHandle, size, revision int64) error {
 	fs.adoptCommittedStorageClassLocked(fh, size)
 	if revision > 0 {
+		// A confirmed pathname mutation supersedes this old fd observation,
+		// without giving an acknowledged close-sync handle another upload.
+		if event := fh.pendingFtruncate.Load(); event != nil {
+			fs.dirtyMu.Lock()
+			state, ok := fs.mutationInodes[fh.Ino]
+			fs.dirtyMu.Unlock()
+			if ok && state.committedSeq > event.seq && state.committedRevision == revision && state.committedSize == size {
+				fh.pendingFtruncate.CompareAndSwap(event, nil)
+				clearStagedSnapshotLineageLocked(fh)
+				fh.ContentSnapshotID, fh.ftruncateInherited, fh.contentAncestors = "", "", nil
+				fh.LineageTrusted, fh.appendSnapshot, fh.Dirty.visibleTruncate = false, false, false
+				fs.openHandles.UnmarkVisibleTruncate(fh)
+			}
+		}
 		fh.ZeroBase = false
 		fs.adoptCleanCommittedRevisionLocked(fh, revision, size)
 		return nil
@@ -188,6 +202,11 @@ func (fs *Dat9FS) syncPassivePathTruncateLocked(fh *FileHandle, size, revision i
 // For grow, the buffer is zero-extended so a later flush uploads the correct
 // size (not stale shorter content that could shrink the file back).
 func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
+	zeroID := ""
+	var zeroEvent *ftruncateInheritance
+	var passive []*FileHandle
+	entry, _ := fs.inodes.GetEntry(ino)
+	samePath := entry != nil && entry.Nlink <= 1
 	for _, fh := range fs.fileHandlesForInode(ino) {
 		fh.Lock()
 		if fh.Dirty == nil {
@@ -195,6 +214,7 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 			continue
 		}
 		if fs.isPassiveCloseSyncHandleLocked(fh) {
+			passive = append(passive, fh)
 			var committedRevision int64
 			if fs.appendLogPathConfigured(fh.Path) {
 				if revision, size, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && size == newSize {
@@ -246,6 +266,28 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 			}
 		}
 		fh.DirtySeq = fs.markDirtySize(ino, newSize)
+		if newSize == 0 && samePath && fs.ftruncateParticipates(fh) {
+			if zeroID == "" {
+				zeroID = generateMountID()
+			}
+			fs.resetFtruncateZeroImageLocked(fh, zeroID)
+			zeroEvent = fh.pendingFtruncate.Load()
+		}
 		fh.Unlock()
 	}
+	if zeroEvent != nil {
+		for _, fh := range passive {
+			fh.Lock()
+			prior := fh.pendingFtruncate.Load()
+			if fs.isPassiveCloseSyncHandleLocked(fh) && !fh.Unlinked && fh.Path == zeroEvent.path && prior != nil && prior.view == zeroEvent.view && prior.seq <= zeroEvent.seq {
+				clearStagedSnapshotLineageLocked(fh)
+				fh.ContentSnapshotID, fh.ftruncateInherited, fh.contentAncestors = "", "", nil
+				fh.LineageTrusted, fh.appendSnapshot, fh.Dirty.visibleTruncate = false, false, false
+				fs.openHandles.UnmarkVisibleTruncate(fh)
+				fh.pendingFtruncate.CompareAndSwap(prior, zeroEvent)
+			}
+			fh.Unlock()
+		}
+	}
+
 }
