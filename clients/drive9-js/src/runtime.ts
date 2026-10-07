@@ -17,6 +17,7 @@ export interface ExecRequest {
   argv: string[];
   cwd?: string;
   env?: Record<string, string>;
+  execution_class?: "linux-full";
   workspace: RuntimeWorkspace;
   resources?: RuntimeResources;
   timeout_ms?: number;
@@ -47,7 +48,28 @@ export interface RuntimeCapabilities {
   cancel_scope: string;
   detached: boolean;
   replay: boolean;
-  providers: Array<{ provider: string; profiles: string[] }>;
+  providers: RuntimeProviderCapability[];
+}
+
+export interface RuntimeProviderCapability {
+  provider: string;
+  profiles: string[];
+  candidates?: RuntimeCandidateCapability[];
+}
+
+export interface RuntimeCandidateCapability {
+  profile: string;
+  execution_class: string;
+  rootfs: RuntimeRootFSIdentity;
+  production_eligible: boolean;
+  bounded_selection_eligible: boolean;
+}
+
+export interface RuntimeRootFSIdentity {
+  driver: string;
+  capability_version: string;
+  config_hash: string;
+  lower_image_digest: string;
 }
 
 export class RuntimeExecutionError extends Error {
@@ -212,9 +234,19 @@ export async function getRuntimeCapabilities(client: RuntimeClient, signal?: Abo
     throw new Error("server advertises an unsupported Runtime cancel scope");
   }
   for (const provider of capabilities.providers) {
-    if (!isObject(provider) || Object.keys(provider).some((key) => key !== "provider" && key !== "profiles") ||
+    if (!isObject(provider) || Object.keys(provider).some((key) => key !== "provider" && key !== "profiles" && key !== "candidates") ||
         !nonemptyString(provider.provider) || !Array.isArray(provider.profiles) || provider.profiles.some((profile) => !nonemptyString(profile))) {
       throw new Error("server returned invalid Runtime provider capabilities");
+    }
+    if (provider.candidates !== undefined) {
+      if (!Array.isArray(provider.candidates)) throw new Error("server returned invalid Runtime candidate capabilities");
+      const candidateProfiles = new Set<string>();
+      for (const candidate of provider.candidates) {
+        if (!validRuntimeCandidateCapability(candidate) || !provider.profiles.includes(candidate.profile) || candidateProfiles.has(candidate.profile)) {
+          throw new Error("server returned invalid Runtime candidate capabilities");
+        }
+        candidateProfiles.add(candidate.profile);
+      }
     }
   }
   const providerNames = capabilities.providers.map((provider) => provider.provider);
@@ -222,6 +254,19 @@ export async function getRuntimeCapabilities(client: RuntimeClient, signal?: Abo
     throw new Error("server returned duplicate Runtime provider capabilities");
   }
   return capabilities;
+}
+
+function validRuntimeCandidateCapability(value: unknown): value is RuntimeCandidateCapability {
+  if (!isObject(value)) return false;
+  const allowed = new Set(["profile", "execution_class", "rootfs", "production_eligible", "bounded_selection_eligible"]);
+  if (Object.keys(value).some((key) => !allowed.has(key)) || !nonemptyString(value.profile) || !nonemptyString(value.execution_class) ||
+      typeof value.production_eligible !== "boolean" || typeof value.bounded_selection_eligible !== "boolean" || !isObject(value.rootfs)) return false;
+  const rootfsAllowed = new Set(["driver", "capability_version", "config_hash", "lower_image_digest"]);
+  return !Object.keys(value.rootfs).some((key) => !rootfsAllowed.has(key)) && value.execution_class === "linux-full" &&
+    value.rootfs.driver === "user-union" && value.rootfs.capability_version === "drive9_rootfs.user_union.extent.v1" &&
+    typeof value.rootfs.config_hash === "string" && /^[0-9a-f]{64}$/.test(value.rootfs.config_hash) &&
+    typeof value.rootfs.lower_image_digest === "string" && /^sha256:[0-9a-f]{64}$/.test(value.rootfs.lower_image_digest) &&
+    !(value.bounded_selection_eligible && !value.production_eligible);
 }
 
 export async function cancelRuntimeExecution(client: RuntimeClient, executionId: string, signal?: AbortSignal): Promise<void> {

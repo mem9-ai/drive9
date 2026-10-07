@@ -5,6 +5,13 @@ against an existing persistent Drive9 workspace. It does not own task state,
 retry, replay, history, artifacts, or recovery. Agent frameworks such as Pi
 remain authoritative for those decisions.
 
+Eligible `linux-full` providers compose the sandbox's literal Linux `/` from
+an immutable provider image/snapshot lower plus a Drive9-backed writable
+upper. Provider binaries remain available while writes under paths such as
+`/root`, `/home`, `/etc`, and `/workspace` survive a fresh sandbox. `/tmp` and
+`/run` are explicitly ephemeral. Runtime reports success only after confirmed
+process exit, Drive9 drain, and provider teardown.
+
 ## CLI
 
 ```bash
@@ -31,8 +38,9 @@ retries.
 
 ```go
 result, err := c.Exec(ctx, client.ExecRequest{
-    Argv: []string{"go", "test", "./..."},
-    Workspace: client.RuntimeWorkspace{Root: "/repo"},
+    Argv:           []string{"go", "test", "./..."},
+    ExecutionClass: "linux-full",
+    Workspace:      client.RuntimeWorkspace{Root: "/repo"},
 }, client.ExecOptions{
     Stdout: os.Stdout,
     Stderr: os.Stderr,
@@ -50,7 +58,11 @@ typed errors.
 
 ```typescript
 const result = await client.exec(
-  { argv: ["npm", "test"], workspace: { root: "/repo" } },
+  {
+    argv: ["npm", "test"],
+    execution_class: "linux-full",
+    workspace: { root: "/repo" },
+  },
   {
     onStdout: chunk => process.stdout.write(chunk),
     onStderr: chunk => process.stderr.write(chunk),
@@ -63,13 +75,18 @@ also expose capabilities and active-execution cancellation. Successful cancel
 means the server confirmed stop and workspace cleanup; an unconfirmed cancel
 is outcome-unknown.
 
+Provider capabilities include each profile's execution class, rootfs identity,
+and `production_eligible` / `bounded_selection_eligible` flags. Treat a
+candidate with either flag false as preview/manual-only for the corresponding
+use.
+
 ## Mount credentials
 
-The server launches a fresh FUSE mount for each execution with
+The server launches a fresh extent-profile FUSE mount for each execution with
 `drive9 mount --no-supervise --no-persist-credentials`. The credential is
-available only to the live mount process and is omitted from mount process
-state. Runtime gives that process isolated HOME/temp/runtime directories,
-removes them after confirmed unmount, and does not pass the credential to
-later drain or unmount commands. It uses profile `none`, write-sync durability,
-a pre-exec drain, and a post-exec drain so no local-only overlay path can
-disappear with the short-lived mount.
+available only to the live mount process, omitted from persistent mount state,
+and never passed to the application. Runtime gives the mount process isolated
+state directories, performs pre/post-exec drains, and removes the provider
+sandbox only after confirmed cleanup. The model process receives only the
+request's explicit environment plus a fixed safe `PATH`; it does not inherit
+server, provider, image, or mount-process environment variables.

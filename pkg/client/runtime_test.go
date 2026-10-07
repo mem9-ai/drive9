@@ -255,6 +255,30 @@ func TestRuntimeCapabilitiesRejectDuplicates(t *testing.T) {
 	}
 }
 
+func TestRuntimeCapabilitiesAcceptsProviderAwareCandidates(t *testing.T) {
+	capabilities := RuntimeCapabilities{
+		Version: 1, Streaming: true, SeparateIO: true,
+		Providers: []RuntimeProviderCapability{{
+			Provider: "docker", Profiles: []string{"default"},
+			Candidates: []RuntimeCandidateCapability{{
+				Profile: "default", ExecutionClass: "linux-full",
+				RootFS: RuntimeRootFSIdentity{
+					Driver: "user-union", CapabilityVersion: "drive9_rootfs.user_union.extent.v1",
+					ConfigHash: strings.Repeat("a", 64), LowerImageDigest: "sha256:" + strings.Repeat("b", 64),
+				},
+				ProductionEligible: true, BoundedSelectionEligible: true,
+			}},
+		}},
+	}
+	if err := validateRuntimeCapabilities(capabilities); err != nil {
+		t.Fatal(err)
+	}
+	capabilities.Providers[0].Candidates[0].Profile = "missing"
+	if err := validateRuntimeCapabilities(capabilities); err == nil {
+		t.Fatal("candidate outside provider profiles error = nil")
+	}
+}
+
 func TestExecDoesNotFollowRedirect(t *testing.T) {
 	var redirected atomic.Int32
 	destination := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {

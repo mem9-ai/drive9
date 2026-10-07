@@ -35,12 +35,13 @@ type RuntimeResources struct {
 // ExecRequest describes one process invocation. Argv is not a shell string.
 // Drive9 never retries the request automatically.
 type ExecRequest struct {
-	Argv      []string          `json:"argv"`
-	Cwd       string            `json:"cwd,omitempty"`
-	Env       map[string]string `json:"env,omitempty"`
-	Workspace RuntimeWorkspace  `json:"workspace"`
-	Resources RuntimeResources  `json:"resources,omitempty"`
-	TimeoutMS int64             `json:"timeout_ms,omitempty"`
+	Argv           []string          `json:"argv"`
+	Cwd            string            `json:"cwd,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+	ExecutionClass string            `json:"execution_class,omitempty"`
+	Workspace      RuntimeWorkspace  `json:"workspace"`
+	Resources      RuntimeResources  `json:"resources,omitempty"`
+	TimeoutMS      int64             `json:"timeout_ms,omitempty"`
 }
 
 type ExecStarted struct {
@@ -71,8 +72,24 @@ type RuntimeCapabilities struct {
 }
 
 type RuntimeProviderCapability struct {
-	Provider string   `json:"provider"`
-	Profiles []string `json:"profiles"`
+	Provider   string                       `json:"provider"`
+	Profiles   []string                     `json:"profiles"`
+	Candidates []RuntimeCandidateCapability `json:"candidates,omitempty"`
+}
+
+type RuntimeCandidateCapability struct {
+	Profile                  string                `json:"profile"`
+	ExecutionClass           string                `json:"execution_class"`
+	RootFS                   RuntimeRootFSIdentity `json:"rootfs"`
+	ProductionEligible       bool                  `json:"production_eligible"`
+	BoundedSelectionEligible bool                  `json:"bounded_selection_eligible"`
+}
+
+type RuntimeRootFSIdentity struct {
+	Driver            string `json:"driver"`
+	CapabilityVersion string `json:"capability_version"`
+	ConfigHash        string `json:"config_hash"`
+	LowerImageDigest  string `json:"lower_image_digest"`
 }
 
 // RuntimeExecutionError is a terminal error frame returned by the server.
@@ -433,8 +450,39 @@ func validateRuntimeCapabilities(capabilities RuntimeCapabilities) error {
 			}
 			profiles[profile] = struct{}{}
 		}
+		candidateProfiles := make(map[string]struct{}, len(provider.Candidates))
+		for _, candidate := range provider.Candidates {
+			if strings.TrimSpace(candidate.Profile) == "" || candidate.ExecutionClass != "linux-full" ||
+				candidate.RootFS.Driver != "user-union" || candidate.RootFS.CapabilityVersion != "drive9_rootfs.user_union.extent.v1" ||
+				!validRuntimeSHA256Hex(candidate.RootFS.ConfigHash) ||
+				!strings.HasPrefix(candidate.RootFS.LowerImageDigest, "sha256:") || !validRuntimeSHA256Hex(strings.TrimPrefix(candidate.RootFS.LowerImageDigest, "sha256:")) ||
+				candidate.BoundedSelectionEligible && !candidate.ProductionEligible {
+				return errors.New("server returned an invalid Runtime candidate capability")
+			}
+			if _, exists := profiles[candidate.Profile]; !exists {
+				return errors.New("server returned a Runtime candidate outside its provider profiles")
+			}
+			if _, exists := candidateProfiles[candidate.Profile]; exists {
+				return errors.New("server returned a duplicate Runtime candidate capability")
+			}
+			candidateProfiles[candidate.Profile] = struct{}{}
+		}
 	}
 	return nil
+}
+
+func validRuntimeSHA256Hex(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			if char < 'a' || char > 'f' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func readRuntimeHTTPError(resp *http.Response) error {

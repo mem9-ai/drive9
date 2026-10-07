@@ -126,9 +126,38 @@ describe("runtime exec", () => {
       cancel_scope: "active_execution",
       detached: false,
       replay: false,
-      providers: [{ provider: "docker", profiles: ["default"] }],
+      providers: [{ provider: "docker", profiles: ["default"], candidates: [{
+        profile: "default",
+        execution_class: "linux-full",
+        rootfs: {
+          driver: "user-union",
+          capability_version: "drive9_rootfs.user_union.extent.v1",
+          config_hash: "a".repeat(64),
+          lower_image_digest: `sha256:${"b".repeat(64)}`,
+        },
+        production_eligible: true,
+        bounded_selection_eligible: true,
+      }] }],
     })));
     await expect(new Client("http://localhost:9009", "test-key").runtimeCapabilities()).resolves.toMatchObject({ version: 1 });
+
+    server.use(http.get("http://localhost:9009/v1/runtime/capabilities", () => HttpResponse.json({
+      version: 1,
+      streaming: true,
+      separate_stdout_stderr: true,
+      cancel: true,
+      cancel_scope: "active_execution",
+      detached: false,
+      replay: false,
+      providers: [{ provider: "docker", profiles: ["default"], candidates: [{
+        profile: "other",
+        execution_class: "linux-full",
+        rootfs: { driver: "user-union", capability_version: "v1", config_hash: "a", lower_image_digest: "sha256:b" },
+        production_eligible: true,
+        bounded_selection_eligible: true,
+      }] }],
+    })));
+    await expect(new Client("http://localhost:9009", "test-key").runtimeCapabilities()).rejects.toThrow("candidate");
 
     server.use(http.get("http://localhost:9009/v1/runtime/capabilities", () => HttpResponse.json({
       version: 1,

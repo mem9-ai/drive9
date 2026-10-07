@@ -85,6 +85,9 @@ export type { ReadPartFn, ProgressFn } from "./patch.js";
 export type { ArchiveOptions } from "./archive.js";
 export type {
   RuntimeCapabilities,
+  RuntimeCandidateCapability,
+  RuntimeProviderCapability,
+  RuntimeRootFSIdentity,
   ExecOptions,
   ExecRequest,
   ExecResult,

@@ -137,7 +137,8 @@ try {
 }
 ```
 
-Use `runtimeCapabilities()` to discover enabled provider profiles and
+Use `runtimeCapabilities()` to discover provider profiles, rootfs identities,
+and their `production_eligible` / `bounded_selection_eligible` status. Use
 `cancelRuntimeExecution(id)` only for an execution whose `started` frame was
 observed. A successful cancel means the provider confirmed the process stopped
 and bounded workspace cleanup completed.
