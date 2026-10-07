@@ -58,11 +58,7 @@ unmount_overlay() {
     TMP_MOUNTED=0
   fi
   if [ "$OVERLAY_MOUNTED" = 1 ]; then
-    if [ "$ROOTFS_DRIVER" = fuse-overlayfs ]; then
-      if ! fusermount3 -u "$MERGED" >/dev/null 2>&1 && [ "$best_effort" != 1 ]; then
-        return 1
-      fi
-    elif ! sudo umount "$MERGED" >/dev/null 2>&1 && [ "$best_effort" != 1 ]; then
+    if ! sudo umount "$MERGED" >/dev/null 2>&1 && [ "$best_effort" != 1 ]; then
       return 1
     fi
     OVERLAY_MOUNTED=0
@@ -140,7 +136,7 @@ mount_overlay() {
       ;;
     fuse-overlayfs)
       : >"$OVERLAY_LOG"
-      FUSE_OVERLAYFS_DISABLE_OVL_WHITEOUT=1 fuse-overlayfs -f \
+      sudo env FUSE_OVERLAYFS_DISABLE_OVL_WHITEOUT=1 fuse-overlayfs -f \
         -o "allow_other,lowerdir=$LOWER,upperdir=$FUSE_ROOT/upper,workdir=$FUSE_ROOT/work" \
         "$MERGED" >>"$OVERLAY_LOG" 2>&1 &
       OVERLAY_PID=$!
@@ -180,7 +176,6 @@ for command in curl docker jq mount mountpoint python3 sudo tar umount; do
 done
 if [ "$ROOTFS_DRIVER" = fuse-overlayfs ]; then
   command -v fuse-overlayfs >/dev/null 2>&1 || fail "required command is missing: fuse-overlayfs"
-  command -v fusermount3 >/dev/null 2>&1 || fail "required command is missing: fusermount3"
 fi
 [ -x "$CLI_BIN" ] || fail "DRIVE9_CLI_BIN is not executable"
 
