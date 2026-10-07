@@ -168,6 +168,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
 	superviseForeground := fs.Bool("supervise-foreground", false, "run as in-process supervisor and block until stop (sandbox/systemd friendly)")
 	noSupervise := fs.Bool("no-supervise", false, "legacy fire-and-forget background mount without supervisor")
+	noPersistCredentials := fs.Bool("no-persist-credentials", false, "do not store mount credentials in process state (FUSE only; requires --foreground or --no-supervise; disables credential-backed unmount helpers)")
 	supervised := fs.Bool("supervised", false, "internal: worker managed by supervisor")
 	maxRestarts := fs.Int("max-restarts", 5, "supervisor max restarts within restart window")
 	restartWindow := fs.Duration("restart-window", 10*time.Minute, "supervisor restart budget window")
@@ -313,6 +314,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	effectiveExtentPatterns := explicitExtentPatterns
 
 	if objectLoc != nil {
+		if *noPersistCredentials {
+			return fmt.Errorf("drive9 mount: --no-persist-credentials is only supported with Drive9 FUSE mounts")
+		}
 		if len(effectiveAppendLogPatterns) > 0 {
 			return fmt.Errorf("drive9 mount: --append-log is only supported with Drive9 FUSE mounts")
 		}
@@ -418,7 +422,6 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
-
 	lookupRetryCountGiven := flagProvided(fs, "lookup-retry-count")
 	lookupRetryTimeoutGiven := flagProvided(fs, "lookup-retry-timeout")
 	readCacheTTLGiven := flagProvided(fs, "read-cache-ttl")
@@ -510,6 +513,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	profileGiven := flagProvided(fs, "profile")
 	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
 	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
+	if *noPersistCredentials && resolved != MountModeFUSE {
+		return fmt.Errorf("drive9 mount: --no-persist-credentials is only supported with Drive9 FUSE mounts")
+	}
 	if len(effectiveAppendLogPatterns) > 0 && resolved != MountModeFUSE {
 		return fmt.Errorf("drive9 mount: --append-log is only supported with Drive9 FUSE mounts")
 	}
@@ -708,6 +714,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			Debug:                        *debug,
 			GVisorCompat:                 *gvisorCompat,
 			LegacyInterruptibleMutations: *legacyInterruptibleMutations,
+			OmitProcessStateCredentials:  *noPersistCredentials,
 		})
 	}
 
@@ -715,6 +722,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	// DRIVE9_MOUNT_SUPERVISE=off forces legacy behavior.
 	envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
 	wantSupervise := !*noSupervise && !envSuperviseOff
+	if *noPersistCredentials && (*superviseForeground || background && !*foreground && wantSupervise) {
+		return fmt.Errorf("drive9 mount: --no-persist-credentials requires --foreground or --no-supervise")
+	}
 	if *superviseForeground {
 		// This process becomes the supervisor (blocks).
 		return runSuperviseForeground(mountSuperviseStartRequest{
@@ -915,6 +925,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		PerfMaxSampleFiles:           *perfMaxSampleFiles,
 		PerfMaxProfileFiles:          *perfMaxProfileFiles,
 		Supervised:                   *supervised,
+		OmitProcessStateCredentials:  *noPersistCredentials,
 	}
 
 	return mountFuse(opts)

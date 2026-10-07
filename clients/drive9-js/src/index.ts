@@ -2,6 +2,14 @@ export { Client } from "./client.js";
 export { Drive9Error, StatusError, ConflictError, checkError } from "./error.js";
 export { FSLayerCommitConflictError } from "./layer.js";
 export { StreamWriter } from "./stream.js";
+export {
+  RuntimeCanceledError,
+  RuntimeExecutionError,
+  RuntimeOutcomeUnknownError,
+  RuntimeStartError,
+  RuntimeTimeoutError,
+  isRuntimeOutcomeUnknown,
+} from "./runtime.js";
 export { MaxBatchReadSmallPaths, MaxBatchStatPaths } from "./models.js";
 export type {
   BatchReadSmallResult,
@@ -75,3 +83,12 @@ export type {
 } from "./models.js";
 export type { ReadPartFn, ProgressFn } from "./patch.js";
 export type { ArchiveOptions } from "./archive.js";
+export type {
+  RuntimeCapabilities,
+  ExecOptions,
+  ExecRequest,
+  ExecResult,
+  ExecStarted,
+  RuntimeResources,
+  RuntimeWorkspace,
+} from "./runtime.js";

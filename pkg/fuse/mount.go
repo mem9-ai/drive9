@@ -117,6 +117,11 @@ type MountOptions struct {
 	// SkipProcessState skips writing the mount pid/process state file. Used when
 	// a supervisor owns the authoritative process state.
 	SkipProcessState bool
+	// OmitProcessStateCredentials keeps API keys and delegated tokens out of
+	// the process-state file while retaining the PID and control socket needed
+	// by drain and unmount. Callers using this mode cannot use credential-backed
+	// post-unmount helpers such as auto-pack.
+	OmitProcessStateCredentials bool
 	// Supervised marks this worker as managed by an external supervisor (logging only).
 	Supervised bool
 }
@@ -754,33 +759,9 @@ func Mount(opts *MountOptions) (err error) {
 		if controlServer != nil {
 			controlSock = controlServer.SocketPath()
 		}
-		pidFile, err = mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
-			PID:                 os.Getpid(),
-			CreationTime:        creationTime,
-			Component:           "drive9-fuse",
-			MountKind:           mountstate.MountKindFUSE,
-			MountPoint:          stateMountPoint,
-			RemoteRoot:          opts.RemoteRoot,
-			Profile:             opts.Profile,
-			LocalRoot:           opts.LocalRoot,
-			Server:              opts.Server,
-			PackPaths:           append([]string(nil), opts.PackPaths...),
-			CredentialKind:      credentialKind,
-			APIKey:              opts.APIKey,
-			Token:               opts.Token,
-			ProfileDir:          opts.Profiling.ProfileDir,
-			PerfSamplesPath:     opts.Profiling.PerfSamplesPath,
-			PerfInterval:        opts.Profiling.PerfSampleInterval.String(),
-			PerfMaxSamples:      opts.Profiling.PerfMaxSamples,
-			PerfMaxSampleFiles:  opts.Profiling.PerfMaxSampleFiles,
-			PerfMaxProfileFiles: opts.Profiling.PerfMaxProfileFiles,
-			PprofAddr:           opts.Profiling.PprofAddr,
-			StartedAt:           time.Now().UTC().Format(time.RFC3339Nano),
-			HeapProfilePath:     opts.Profiling.HeapProfilePath,
-			ControlSocket:       controlSock,
-			Role:                mountstate.RoleWorker,
-			Supervise:           opts.Supervised,
-		})
+		pidFile, err = mountstate.WriteProcessState(opts.MountPoint, newMountProcessState(
+			opts, stateMountPoint, creationTime, credentialKind, controlSock, time.Now().UTC(),
+		))
 		if err != nil {
 			if controlServer != nil {
 				controlServer.Close()
@@ -1023,6 +1004,40 @@ func Mount(opts *MountOptions) (err error) {
 		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=%d reason=%s mountpoint=%s\n",
 			ExitServeAbnormal, reason, opts.MountPoint)
 		return ExitServeAbnormalErr(detail)
+	}
+}
+
+func newMountProcessState(opts *MountOptions, mountPoint string, creationTime uint64, credentialKind, controlSock string, startedAt time.Time) mountstate.ProcessState {
+	apiKey, token := opts.APIKey, opts.Token
+	if opts.OmitProcessStateCredentials {
+		apiKey, token = "", ""
+	}
+	return mountstate.ProcessState{
+		PID:                 os.Getpid(),
+		CreationTime:        creationTime,
+		Component:           "drive9-fuse",
+		MountKind:           mountstate.MountKindFUSE,
+		MountPoint:          mountPoint,
+		RemoteRoot:          opts.RemoteRoot,
+		Profile:             opts.Profile,
+		LocalRoot:           opts.LocalRoot,
+		Server:              opts.Server,
+		PackPaths:           append([]string(nil), opts.PackPaths...),
+		CredentialKind:      credentialKind,
+		APIKey:              apiKey,
+		Token:               token,
+		ProfileDir:          opts.Profiling.ProfileDir,
+		PerfSamplesPath:     opts.Profiling.PerfSamplesPath,
+		PerfInterval:        opts.Profiling.PerfSampleInterval.String(),
+		PerfMaxSamples:      opts.Profiling.PerfMaxSamples,
+		PerfMaxSampleFiles:  opts.Profiling.PerfMaxSampleFiles,
+		PerfMaxProfileFiles: opts.Profiling.PerfMaxProfileFiles,
+		PprofAddr:           opts.Profiling.PprofAddr,
+		StartedAt:           startedAt.Format(time.RFC3339Nano),
+		HeapProfilePath:     opts.Profiling.HeapProfilePath,
+		ControlSocket:       controlSock,
+		Role:                mountstate.RoleWorker,
+		Supervise:           opts.Supervised,
 	}
 }
 

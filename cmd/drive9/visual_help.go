@@ -720,6 +720,25 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			},
 		},
 		{
+			Name:    "exec",
+			Args:    "[flags] -- command [arg...]",
+			Summary: "run one process against a persistent Drive9 workspace",
+			Flags: []visualHelpFlag{
+				{Name: "--workspace PATH", Desc: "canonical Drive9 workspace root; default :/"},
+				{Name: "--cwd PATH", Desc: "working directory relative to the workspace root; default ."},
+				{Name: "--read-only", Desc: "mount the workspace read-only"},
+				{Name: "--timeout DURATION", Desc: "execution timeout; server default when omitted"},
+				{Name: "--cpu-millis N", Desc: "minimum CPU allocation in millicores"},
+				{Name: "--memory-mb N", Desc: "minimum memory allocation in MiB"},
+				{Name: "--pids N", Desc: "minimum PID limit"},
+				{Name: "--network none|bridge", Desc: "required network mode"},
+				{Name: "--env KEY=VALUE", Desc: "environment entry; repeatable"},
+			},
+			Examples: []visualHelpExample{
+				{Command: "drive9 exec --workspace :/repo --timeout 10m -- go test ./...", Desc: "stream one remote command and return its exit status"},
+			},
+		},
+		{
 			Name:    "mount",
 			Args:    "[flags] [:/remote|s3://bucket/prefix/|gs://bucket/prefix/|az://container/prefix/] <mountpoint>",
 			Summary: "mount drive9 or an object prefix (background FUSE supervised by default on Linux/macOS)",
@@ -729,6 +748,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "--api-key KEY", Desc: "owner API key; overrides DRIVE9_API_KEY and config"},
 					{Name: "--mode auto|fuse|webdav", Desc: "mount mode; auto selects the best supported mode"},
 					{Name: "--foreground", Desc: "run in foreground and block until unmounted"},
+					{Name: "--no-persist-credentials", Desc: "omit credentials from FUSE process state; requires --foreground or --no-supervise"},
 					{Name: "--direct-mount-strict", Desc: "Linux only; use mount(2) without fallback to fusermount"},
 					{Name: "--gvisor-compat", Desc: "enable gVisor-specific FUSE compatibility behavior; env DRIVE9_MOUNT_GVISOR_COMPAT"},
 					{Name: "--legacy-interruptible-mutations", Desc: "let FUSE interrupts cancel in-flight remote commits: namespace mutations AND synchronous write/flush/fsync/release data commits (legacy EAGAIN behavior); no effect with --gvisor-compat; env DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS"},
