@@ -80,6 +80,8 @@ if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
   --workspace "$ROOT" --timeout 30s -- \
   /bin/sh -c 'set -eu
     test -x /bin/sh
+    test "$(id -u)" = 65532
+    test "$(awk '\''$1 == "CapEff:" { print $2 }'\'' /proc/self/status)" = 0000000000000002
     printf lower-image-ok
     printf root-state > /root/persist.txt
     printf home-state > /home/agent/persist.txt
