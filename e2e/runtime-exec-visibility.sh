@@ -281,12 +281,22 @@ if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
 fi
 
 # Direction 2: a process write followed by the service's mandatory drain and
-# unmount must be immediately readable through the FS API. Do not poll: a
-# successful terminal frame is itself the durability/visibility boundary.
-actual_outbound="$(curl -fsS --max-time 20 -H "Authorization: Bearer ${API_KEY}" \
-  "${BASE}/v1/fs/${OUTBOUND_PATH}")" \
-  || fail "Runtime write was not readable through the FS API"
+# unmount must be immediately visible to a fresh Drive9 mount. Extent-backed
+# bytes are intentionally not served inline by GET /v1/fs, so HEAD proves the
+# durable metadata projection and the independent mount proves exact bytes.
+# Do not poll: a successful terminal frame is itself the visibility boundary.
+outbound_head="$(curl -fsSI --max-time 20 -H "Authorization: Bearer ${API_KEY}" \
+  "${BASE}/v1/fs/${OUTBOUND_PATH}" | tr -d '\r')" \
+  || fail "Runtime write metadata was not readable through the FS API"
+outbound_layout="$(printf '%s\n' "$outbound_head" | awk -F': ' 'tolower($1)=="x-dat9-content-layout"{print $2}')"
+[ "$outbound_layout" = extent ] \
+  || fail "Runtime write layout expected=extent actual=${outbound_layout:-<missing>}"
+
+mount_raw_workspace
+actual_outbound="$(cat "$RAW_MOUNT/upper/workspace/outbound.txt")" \
+  || fail "Runtime write was not readable through a fresh Drive9 mount"
+unmount_raw_workspace
 [ "$actual_outbound" = "$OUTBOUND_PAYLOAD" ] \
-  || fail "Runtime write did not match through the FS API"
+  || fail "Runtime write did not match through the fresh Drive9 mount"
 
 printf 'PASS runtime exec bidirectional workspace visibility\n'
