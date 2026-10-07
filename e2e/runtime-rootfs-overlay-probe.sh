@@ -12,6 +12,7 @@ API_KEY="${DRIVE9_API_KEY:-}"
 FUSE_READY_TIMEOUT_S="${FUSE_READY_TIMEOUT_S:-30}"
 ROOTFS_IMAGE="${ROOTFS_PROBE_IMAGE:-debian:bookworm-slim}"
 ROOTFS_DRIVER="${ROOTFS_OVERLAY_DRIVER:-fuse-overlayfs}"
+EXPECT_KERNEL_REJECT="${ROOTFS_EXPECT_KERNEL_REJECT:-0}"
 RUN_ID="$(date +%s)-$$"
 REMOTE_ROOT="/runtime-rootfs-probe-${RUN_ID}"
 WORK_DIR="$(mktemp -d)"
@@ -132,7 +133,14 @@ mount_overlay() {
       if ! sudo mount -t overlay overlay \
         -o "lowerdir=$LOWER,upperdir=$FUSE_ROOT/upper,workdir=$FUSE_ROOT/work,userxattr" \
         "$MERGED"; then
+        if [ "$EXPECT_KERNEL_REJECT" = 1 ]; then
+          printf 'PASS Linux kernel rejected Drive9 FUSE as an overlay upper/work filesystem\n'
+          exit 0
+        fi
         fail "kernel rejected Drive9 FUSE as an overlay upper/work filesystem"
+      fi
+      if [ "$EXPECT_KERNEL_REJECT" = 1 ]; then
+        fail "kernel unexpectedly accepted Drive9 FUSE as an overlay upper/work filesystem"
       fi
       ;;
     fuse-overlayfs)
@@ -172,6 +180,14 @@ mount_overlay() {
 if [ "$(uname -s)" != Linux ]; then
   fail "probe requires Linux"
 fi
+case "$EXPECT_KERNEL_REJECT" in
+  0) ;;
+  1)
+    [ "$ROOTFS_DRIVER" = kernel ] \
+      || fail "ROOTFS_EXPECT_KERNEL_REJECT=1 requires ROOTFS_OVERLAY_DRIVER=kernel"
+    ;;
+  *) fail "ROOTFS_EXPECT_KERNEL_REJECT must be 0 or 1" ;;
+esac
 for command in curl docker file jq mount mountpoint python3 sudo tar umount; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
 done
