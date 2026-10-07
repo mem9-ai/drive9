@@ -118,7 +118,8 @@ mount_drive9() {
   : >"$MOUNT_LOG"
   run_cli mount --mode=fuse --foreground --no-supervise \
     --allow-other \
-    --profile=extent --durability=write-sync --flush-debounce=0 \
+    --profile=extent --require-extent-xattr-v1 \
+    --durability=write-sync --flush-debounce=0 \
     ":$REMOTE_ROOT" "$FUSE_ROOT" >>"$MOUNT_LOG" 2>&1 &
   FUSE_PID=$!
   wait_for_mount
@@ -137,7 +138,7 @@ mount_overlay() {
     fuse-overlayfs)
       : >"$OVERLAY_LOG"
       sudo env FUSE_OVERLAYFS_DISABLE_OVL_WHITEOUT=1 fuse-overlayfs -f \
-        -o "allow_other,lowerdir=$LOWER,upperdir=$FUSE_ROOT/upper,workdir=$FUSE_ROOT/work" \
+        -o "allow_other,xattr_permissions=2,lowerdir=$LOWER,upperdir=$FUSE_ROOT/upper,workdir=$FUSE_ROOT/work" \
         "$MERGED" >>"$OVERLAY_LOG" 2>&1 &
       OVERLAY_PID=$!
       local deadline=$((SECONDS + FUSE_READY_TIMEOUT_S))
@@ -215,6 +216,39 @@ printf 'hidden-child\n' >"$LOWER/etc/opaque/lower-child"
 
 mount_drive9
 FIRST_FUSE_PID="$FUSE_PID"
+
+# Directory xattrs must use the same durable inode RPC as file xattrs. Exercise
+# rename and rmdir/recreate directly on the Drive9 mount before fuse-overlayfs
+# adds its own private metadata to upperdir.
+mkdir "$FUSE_ROOT/dir-xattr"
+sudo python3 - "$FUSE_ROOT/dir-xattr" <<'PY'
+import os
+import sys
+os.setxattr(sys.argv[1], b"user.drive9.directory", b"durable-directory")
+assert os.getxattr(sys.argv[1], b"user.drive9.directory") == b"durable-directory"
+assert "user.drive9.directory" in os.listxattr(sys.argv[1])
+PY
+mv "$FUSE_ROOT/dir-xattr" "$FUSE_ROOT/dir-xattr-renamed"
+mkdir "$FUSE_ROOT/dir-xattr-reused"
+sudo python3 - "$FUSE_ROOT/dir-xattr-reused" <<'PY'
+import os
+import sys
+os.setxattr(sys.argv[1], b"user.drive9.stale-directory", b"must-disappear")
+PY
+rmdir "$FUSE_ROOT/dir-xattr-reused"
+mkdir "$FUSE_ROOT/dir-xattr-reused"
+sudo python3 - "$FUSE_ROOT/dir-xattr-reused" <<'PY'
+import errno
+import os
+import sys
+try:
+    os.getxattr(sys.argv[1], b"user.drive9.stale-directory")
+except OSError as exc:
+    assert exc.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA))
+else:
+    raise AssertionError("recreated directory inherited deleted inode xattr")
+PY
+
 mount_overlay
 FIRST_OVERLAY_PID="$OVERLAY_PID"
 
@@ -288,6 +322,30 @@ fi
 # be needed to reconstruct the merged root.
 mount_drive9
 [ "$FUSE_PID" != "$FIRST_FUSE_PID" ] || fail "Drive9 remount reused the old FUSE process"
+sudo python3 - "$FUSE_ROOT/dir-xattr-renamed" "$FUSE_ROOT/dir-xattr-reused" <<'PY' \
+  || fail "directory xattr inode semantics did not survive a fresh Drive9 remount"
+import errno
+import os
+import sys
+assert os.getxattr(sys.argv[1], b"user.drive9.directory") == b"durable-directory"
+assert "user.drive9.directory" in os.listxattr(sys.argv[1])
+try:
+    os.getxattr(sys.argv[2], b"user.drive9.stale-directory")
+except OSError as exc:
+    assert exc.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA))
+else:
+    raise AssertionError("recreated directory inherited deleted inode xattr after remount")
+PY
+if [ "$ROOTFS_DRIVER" = fuse-overlayfs ]; then
+  sudo python3 - "$FUSE_ROOT/upper" <<'PY' \
+    || fail "fuse-overlayfs private upper-directory xattr did not survive a fresh Drive9 remount"
+import os
+import sys
+value = os.getxattr(sys.argv[1], b"user.fuseoverlayfs.override_stat")
+assert value
+assert "user.fuseoverlayfs.override_stat" in os.listxattr(sys.argv[1])
+PY
+fi
 if [ "$ROOTFS_DRIVER" = kernel ]; then
   sudo python3 - "$FUSE_ROOT/upper/etc/drive9.conf" <<'PY' \
     || fail "xattr was absent on the fresh Drive9 FUSE mount before overlay reconstruction"

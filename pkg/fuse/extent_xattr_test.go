@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sort"
 	"sync"
 	"syscall"
@@ -93,6 +94,10 @@ func (s *extentXattrTestServer) serveHTTP(w http.ResponseWriter, r *http.Request
 }
 
 func newExtentXattrTestFS(t *testing.T, handler http.Handler) (*Dat9FS, uint64) {
+	return newExtentXattrTestFSWithKind(t, handler, false)
+}
+
+func newExtentXattrTestFSWithKind(t *testing.T, handler http.Handler, isDir bool) (*Dat9FS, uint64) {
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
@@ -101,9 +106,39 @@ func newExtentXattrTestFS(t *testing.T, handler http.Handler) (*Dat9FS, uint64) 
 		inodes: NewInodeToPath(),
 		xattrs: NewXAttrStore(),
 	}
-	ino := fs.inodes.Lookup("/extent", false, 0, time.Now())
+	ino := fs.inodes.Lookup("/extent", isDir, 0, time.Now())
 	fs.inodes.SetExtentIno(ino, 42)
 	return fs, ino
+}
+
+func TestExtentDirectoryXattrHandlersUseDurableInodeRPC(t *testing.T) {
+	backend := &extentXattrTestServer{attrs: make(map[string][]byte)}
+	fs, ino := newExtentXattrTestFSWithKind(t, http.HandlerFunc(backend.serveHTTP), true)
+	header := gofuse.InHeader{NodeId: ino}
+
+	if status := fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: header}, "user.directory", []byte("durable")); status != gofuse.OK {
+		t.Fatalf("SetXAttr directory status=%v", status)
+	}
+	dest := make([]byte, len("durable"))
+	if size, status := fs.GetXAttr(nil, &header, "user.directory", dest); status != gofuse.OK || size != uint32(len(dest)) || string(dest) != "durable" {
+		t.Fatalf("GetXAttr directory=%d/%v/%q", size, status, dest)
+	}
+	if _, ok := fs.xattrs.Get("/extent", "user.directory"); ok {
+		t.Fatal("directory extent xattr fell back to the session store")
+	}
+
+	backend.mu.Lock()
+	requests := append([]string(nil), backend.requests...)
+	backend.mu.Unlock()
+	want := []string{"set_xattr", "get_xattr"}
+	if len(requests) != len(want) {
+		t.Fatalf("requests=%v, want %v", requests, want)
+	}
+	for i := range want {
+		if requests[i] != want[i] {
+			t.Fatalf("requests=%v, want %v", requests, want)
+		}
+	}
 }
 
 func TestExtentXattrHandlersUseDurableInodeRPC(t *testing.T) {
@@ -128,6 +163,9 @@ func TestExtentXattrHandlersUseDurableInodeRPC(t *testing.T) {
 		t.Fatalf("GetXAttr=%d/%v/%q", size, status, dest)
 	}
 	list := make([]byte, len("user.alpha")+1+len("user.zeta")+1)
+	if size, status := fs.ListXAttr(nil, &header, make([]byte, len(list)-1)); status != gofuse.Status(syscall.ERANGE) || int(size) != len(list) {
+		t.Fatalf("ListXAttr small buffer size/status=%d/%v, want %d/ERANGE", size, status, len(list))
+	}
 	if size, status := fs.ListXAttr(nil, &header, list); status != gofuse.OK || int(size) != len(list) {
 		t.Fatalf("ListXAttr size/status=%d/%v", size, status)
 	}
@@ -148,7 +186,7 @@ func TestExtentXattrHandlersUseDurableInodeRPC(t *testing.T) {
 	if len(flags) != 2 || flags[0] != xattrCreateFlag || flags[1] != 0 {
 		t.Fatalf("set flags=%v, want [%d 0]", flags, xattrCreateFlag)
 	}
-	want := []string{"set_xattr", "set_xattr", "get_xattr", "get_xattr", "list_xattr", "remove_xattr", "get_xattr"}
+	want := []string{"set_xattr", "set_xattr", "get_xattr", "get_xattr", "list_xattr", "list_xattr", "remove_xattr", "get_xattr"}
 	if len(requests) != len(want) {
 		t.Fatalf("requests=%v, want %v", requests, want)
 	}
@@ -160,15 +198,59 @@ func TestExtentXattrHandlersUseDurableInodeRPC(t *testing.T) {
 }
 
 func TestExtentXattrFailureDoesNotFallBackToSessionStore(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.EIO, syscall.ENOSYS, syscall.ENOTSUP} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			fs, ino := newExtentXattrTestFS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"errno": int(errno)})
+			}))
+			header := gofuse.InHeader{NodeId: ino}
+			if status := fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: header}, "user.test", []byte("value")); status != gofuse.Status(errno) {
+				t.Fatalf("SetXAttr status=%v, want %v", status, errno)
+			}
+			if _, ok := fs.xattrs.Get("/extent", "user.test"); ok {
+				t.Fatal("failed extent SetXAttr polluted the session xattr store")
+			}
+		})
+	}
+}
+
+func TestExtentXattrRejectsInvalidNamespaceWithoutRPCOrFallback(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux xattr namespace contract")
+	}
+	var calls int
 	fs, ino := newExtentXattrTestFS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"errno": int(syscall.EIO)})
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	header := gofuse.InHeader{NodeId: ino}
+	if status := fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: header}, "invalid.namespace", []byte("value")); status != gofuse.Status(syscall.EOPNOTSUPP) {
+		t.Fatalf("SetXAttr invalid namespace status=%v, want EOPNOTSUPP", status)
+	}
+	if _, status := fs.GetXAttr(nil, &header, "invalid.namespace", nil); status != gofuse.Status(syscall.EOPNOTSUPP) {
+		t.Fatalf("GetXAttr invalid namespace status=%v, want EOPNOTSUPP", status)
+	}
+	if status := fs.RemoveXAttr(nil, &header, "invalid.namespace"); status != gofuse.Status(syscall.EOPNOTSUPP) {
+		t.Fatalf("RemoveXAttr invalid namespace status=%v, want EOPNOTSUPP", status)
+	}
+	if calls != 0 {
+		t.Fatalf("invalid namespace made %d extent RPCs", calls)
+	}
+	if _, ok := fs.xattrs.Get("/extent", "invalid.namespace"); ok {
+		t.Fatal("invalid namespace polluted the session xattr store")
+	}
+}
+
+func TestExtentDirectoryXattrFailureDoesNotFallBackToSessionStore(t *testing.T) {
+	fs, ino := newExtentXattrTestFSWithKind(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"errno": int(syscall.EIO)})
+	}), true)
+	header := gofuse.InHeader{NodeId: ino}
 	if status := fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: header}, "user.test", []byte("value")); status != gofuse.EIO {
-		t.Fatalf("SetXAttr status=%v, want EIO", status)
+		t.Fatalf("SetXAttr directory status=%v, want EIO", status)
 	}
 	if _, ok := fs.xattrs.Get("/extent", "user.test"); ok {
-		t.Fatal("failed extent SetXAttr polluted the session xattr store")
+		t.Fatal("failed directory extent SetXAttr polluted the session xattr store")
 	}
 }
 

@@ -66,10 +66,15 @@ type tenantStatusResponse struct {
 // A missing object means the server predates the contract.
 type StorageCapabilities struct {
 	AppendLogV1 bool `json:"append_log_v1"`
+	// ExtentXattrV1 is the server-side inode xattr RPC/schema contract used by
+	// extent mounts. Missing and false both mean unavailable.
+	ExtentXattrV1 bool `json:"extent_xattr_v1"`
 	// BatchWriteModeV1 promises atomic content+mode create, owner-only mode
 	// authorization, and the definite-rejection contract on BatchWriteResult.
 	BatchWriteModeV1 bool `json:"batch_write_mode_v1"`
 }
+
+const ExtentXattrProtocolV1 = "drive9.extent_xattr.v1"
 
 // MigrationCapabilities is the bounded Server contract. A missing object
 // means the Server predates Migration V1; individual false fields mean that
@@ -606,6 +611,18 @@ func (c *Client) CachedAppendLogSupported() bool {
 	}
 	body := c.statusBody.Load()
 	return body != nil && body.StorageCapabilities != nil && body.StorageCapabilities.AppendLogV1
+}
+
+// CachedExtentXattrSupported reports the negotiated persistent inode xattr
+// contract without I/O. Missing, failed and older status responses fail
+// closed so callers that require durable xattrs cannot silently use the
+// mount-session xattr store.
+func (c *Client) CachedExtentXattrSupported() bool {
+	if c == nil {
+		return false
+	}
+	body := c.statusBody.Load()
+	return body != nil && body.StorageCapabilities != nil && body.StorageCapabilities.ExtentXattrV1
 }
 
 // CachedBatchWriteModeSupported reports the negotiated batch content+mode

@@ -38,13 +38,64 @@ func runXattrMetaOp(t *testing.T, s *Store, op string, request any) xattrOpRespo
 
 func createXattrTestNode(t *testing.T, s *Store, ino uint64, name string, typ uint8) {
 	t.Helper()
+	mode := uint16(0o644)
+	nlink := uint32(1)
+	if typ == jfsTypeDir {
+		mode = 0o755
+		nlink = 2
+	}
 	response := runXattrMetaOp(t, s, "mknod", map[string]any{
-		"parent": 1, "name": name, "type": typ, "mode": 0o644,
+		"parent": 1, "name": name, "type": typ, "mode": mode,
 		"inode": ino, "proj_path": "/" + name,
-		"attr": ExtentAttr{Typ: typ, Mode: 0o644, Nlink: 1, Parent: 1, Full: true},
+		"attr": ExtentAttr{Typ: typ, Mode: mode, Nlink: nlink, Parent: 1, Full: true},
 	})
 	if response.Errno != 0 {
 		t.Fatalf("mknod %q errno=%d", name, response.Errno)
+	}
+}
+
+func TestExtentDirectoryXattrFollowsRenameAndIsRemovedOnRmdir(t *testing.T) {
+	s := newTestStore(t)
+	createXattrTestNode(t, s, 20, "dir", jfsTypeDir)
+	if got := runXattrMetaOp(t, s, "set_xattr", map[string]any{
+		"inode": 20, "name": "user.directory", "value": []byte("durable"), "flags": 0,
+	}); got.Errno != 0 {
+		t.Fatalf("set directory xattr errno=%d", got.Errno)
+	}
+	if got := runXattrMetaOp(t, s, "rename", map[string]any{
+		"src_parent": 1, "src_name": "dir", "dst_parent": 1, "dst_name": "renamed",
+		"src_path": "/dir", "dst_path": "/renamed",
+	}); got.Errno != 0 || got.Inode != 20 {
+		t.Fatalf("rename directory = errno %d inode %d, want 0/20", got.Errno, got.Inode)
+	}
+	if got := runXattrMetaOp(t, s, "get_xattr", map[string]any{
+		"inode": 20, "name": "user.directory",
+	}); got.Errno != 0 || string(got.Value) != "durable" {
+		t.Fatalf("renamed directory xattr = errno %d value %q", got.Errno, got.Value)
+	}
+	if got := runXattrMetaOp(t, s, "rmdir", map[string]any{
+		"parent": 1, "name": "renamed", "proj_path": "/renamed",
+	}); got.Errno != 0 || got.Inode != 20 {
+		t.Fatalf("rmdir = errno %d inode %d, want 0/20", got.Errno, got.Inode)
+	}
+	if got := runXattrMetaOp(t, s, "get_xattr", map[string]any{
+		"inode": 20, "name": "user.directory",
+	}); got.Errno != int(syscall.ENOENT) {
+		t.Fatalf("removed directory inode errno=%d, want ENOENT", got.Errno)
+	}
+	var rows int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM jfs_xattr WHERE inode = 20`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("xattr rows after rmdir=%d, want 0", rows)
+	}
+
+	createXattrTestNode(t, s, 21, "renamed", jfsTypeDir)
+	if got := runXattrMetaOp(t, s, "get_xattr", map[string]any{
+		"inode": 21, "name": "user.directory",
+	}); got.Errno != int(syscall.ENODATA) {
+		t.Fatalf("recreated directory inherited xattr: errno=%d value=%q", got.Errno, got.Value)
 	}
 }
 
@@ -84,6 +135,17 @@ func TestExtentXattrCRUDAndValidation(t *testing.T) {
 	}
 	if got := runXattrMetaOp(t, s, "list_xattr", map[string]any{"inode": 2}); got.Errno != 0 || len(got.Names) != 2 || got.Names[0] != "user.alpha" || got.Names[1] != "user.empty" {
 		t.Fatalf("list = errno %d names %v", got.Errno, got.Names)
+	}
+	maxValue := make([]byte, jfsXattrMaxValue)
+	if got := runXattrMetaOp(t, s, "set_xattr", map[string]any{
+		"inode": 2, "name": "user.max", "value": maxValue, "flags": 0,
+	}); got.Errno != 0 {
+		t.Fatalf("set maximum xattr value errno=%d", got.Errno)
+	}
+	if got := runXattrMetaOp(t, s, "get_xattr", map[string]any{
+		"inode": 2, "name": "user.max",
+	}); got.Errno != 0 || len(got.Value) != jfsXattrMaxValue {
+		t.Fatalf("get maximum xattr value errno=%d length=%d", got.Errno, len(got.Value))
 	}
 
 	invalid := []struct {

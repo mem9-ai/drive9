@@ -23,6 +23,18 @@ func stubMountProfileAppendLogProbe(t *testing.T) {
 	mountProfileAppendLogSupported = func(context.Context, string, string, string) bool { return true }
 }
 
+func stubMountExtentXattrProbe(t *testing.T, supported bool) *atomic.Int32 {
+	t.Helper()
+	old := mountExtentXattrSupported
+	t.Cleanup(func() { mountExtentXattrSupported = old })
+	var calls atomic.Int32
+	mountExtentXattrSupported = func(context.Context, string, string, string) bool {
+		calls.Add(1)
+		return supported
+	}
+	return &calls
+}
+
 func setupMountProfileAppendLogTest(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -101,6 +113,60 @@ func TestMountProfileAppendLogCapabilities(t *testing.T) {
 				t.Fatalf("status requests = %d, want 1", calls.Load())
 			}
 		})
+	}
+}
+
+func TestMountCapabilitiesAdvertisesExactExtentXattrProtocol(t *testing.T) {
+	out, err := captureStdoutE(t, func() error { return MountCmd([]string{"capabilities"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out) != "drive9.extent_xattr.v1" {
+		t.Fatalf("mount capabilities = %q", out)
+	}
+	if err := MountCmd([]string{"capabilities", "extra"}); err == nil {
+		t.Fatal("mount capabilities accepted trailing arguments")
+	}
+}
+
+func TestMountRequiredExtentXattrCapabilityFailsClosed(t *testing.T) {
+	for _, supported := range []bool{false, true} {
+		t.Run(fmt.Sprintf("supported-%t", supported), func(t *testing.T) {
+			setupMountProfileAppendLogTest(t)
+			calls := stubMountExtentXattrProbe(t, supported)
+			got := captureProfileMountOptions(t)
+			err := MountCmd([]string{
+				"--foreground", "--mode=fuse", "--profile=extent", "--require-extent-xattr-v1",
+				"--server=https://drive9.example", "--api-key=sk-test", t.TempDir(),
+			})
+			if calls.Load() != 1 {
+				t.Fatalf("extent xattr probes = %d, want 1", calls.Load())
+			}
+			if supported {
+				if err != nil || *got == nil {
+					t.Fatalf("supported mount = %v, opts = %#v", err, *got)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "drive9.extent_xattr.v1") || *got != nil {
+				t.Fatalf("unsupported mount = %v, opts = %#v", err, *got)
+			}
+		})
+	}
+}
+
+func TestMountRequiredExtentXattrCapabilityRejectsWrongProfileBeforeProbe(t *testing.T) {
+	setupMountProfileAppendLogTest(t)
+	calls := stubMountExtentXattrProbe(t, true)
+	err := MountCmd([]string{
+		"--foreground", "--mode=fuse", "--profile=none", "--require-extent-xattr-v1",
+		"--server=https://drive9.example", "--api-key=sk-test", t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires --mode=fuse --profile=extent") {
+		t.Fatalf("wrong-profile error = %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("wrong profile made %d capability probes", calls.Load())
 	}
 }
 

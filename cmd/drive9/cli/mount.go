@@ -78,6 +78,7 @@ var startMountBackground = startMountBackgroundImpl
 var startMountSupervisedBackground = startMountSupervisedBackgroundImpl
 var runSuperviseForeground = runSuperviseForegroundImpl
 var mountProfileAppendLogSupported = probeMountProfileAppendLogSupport
+var mountExtentXattrSupported = probeMountExtentXattrSupport
 
 // MountCmd handles the "drive9 mount" command.
 //
@@ -107,6 +108,8 @@ func MountCmd(args []string) error {
 			return vaultMountCmd(args[1:], true)
 		case "drain":
 			return MountDrainCmd(args[1:])
+		case "capabilities":
+			return mountCapabilitiesCmd(args[1:])
 		case "status":
 			return runMountStatus(args[1:])
 		case "health":
@@ -210,6 +213,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	layerRef := fs.String("layer", "", "mount through writable fs layer (layer id, name, or tag ref)")
 	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
 	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
+	requireExtentXattrV1 := fs.Bool("require-extent-xattr-v1", false, "fail closed unless both this client and the server support the exact persistent extent xattr v1 protocol")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
 	var localOnlyPatterns stringListFlag
 	var localGitignoreAwarePatterns stringListFlag
@@ -314,6 +318,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	effectiveExtentPatterns := explicitExtentPatterns
 
 	if objectLoc != nil {
+		if *requireExtentXattrV1 {
+			return fmt.Errorf("drive9 mount: --require-extent-xattr-v1 is only supported with Drive9 FUSE extent mounts")
+		}
 		if *noPersistCredentials {
 			return fmt.Errorf("drive9 mount: --no-persist-credentials is only supported with Drive9 FUSE mounts")
 		}
@@ -681,6 +688,17 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveLocalGitignoreAwarePatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
 		return err
+	}
+	if *requireExtentXattrV1 {
+		if resolved != MountModeFUSE || profileCfg.Name != extentMountProfile {
+			return fmt.Errorf("drive9 mount: --require-extent-xattr-v1 requires --mode=fuse --profile=extent")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		supported := mountExtentXattrSupported(ctx, serverVal, apiKeyVal, tokenVal)
+		cancel()
+		if !supported {
+			return fmt.Errorf("drive9 mount: required server capability %s is unavailable", client.ExtentXattrProtocolV1)
+		}
 	}
 	if resolved == MountModeFUSE && runtime.GOOS != "windows" && len(profileCfg.AppendLogPatterns) > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1107,6 +1125,25 @@ func probeMountProfileAppendLogSupport(ctx context.Context, server, apiKey, toke
 	}
 	c.Warm(ctx)
 	return c.CachedAppendLogSupported()
+}
+
+func probeMountExtentXattrSupport(ctx context.Context, server, apiKey, token string) bool {
+	var c *client.Client
+	if token != "" {
+		c = client.NewWithToken(server, token)
+	} else {
+		c = client.New(server, apiKey)
+	}
+	c.Warm(ctx)
+	return c.CachedExtentXattrSupported()
+}
+
+func mountCapabilitiesCmd(args []string) error {
+	if len(args) != 0 {
+		return fmt.Errorf("usage: drive9 mount capabilities")
+	}
+	_, err := fmt.Fprintln(os.Stdout, client.ExtentXattrProtocolV1)
+	return err
 }
 
 // applyScrubbedMountEnv unsets mount credential env vars then applies scrubbed.

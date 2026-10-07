@@ -51,6 +51,38 @@ func TestCachedAppendLogSupportedWarmFailure(t *testing.T) {
 	}
 }
 
+func TestCachedExtentXattrSupportedFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		body   string
+		status int
+		want   bool
+	}{
+		{name: "supported", body: `{"storage_capabilities":{"extent_xattr_v1":true}}`, status: http.StatusOK, want: true},
+		{name: "false", body: `{"storage_capabilities":{"extent_xattr_v1":false}}`, status: http.StatusOK},
+		{name: "old-server", body: `{"storage_capabilities":{}}`, status: http.StatusOK},
+		{name: "missing", body: `{}`, status: http.StatusOK},
+		{name: "malformed", body: `{"storage_capabilities":{"extent_xattr_v1":"v1"}}`, status: http.StatusOK},
+		{name: "unavailable", body: `{"storage_capabilities":{"extent_xattr_v1":true}}`, status: http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(srv.Close)
+			c := New(srv.URL, "")
+			if c.CachedExtentXattrSupported() {
+				t.Fatal("extent xattr support true before warm")
+			}
+			c.Warm(context.Background())
+			if got := c.CachedExtentXattrSupported(); got != tc.want {
+				t.Fatalf("extent xattr support=%t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestStatCtxParsesContentLayout(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

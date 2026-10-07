@@ -61,6 +61,7 @@ export interface RuntimeCandidateCapability {
   profile: string;
   execution_class: string;
   rootfs: RuntimeRootFSIdentity;
+  capabilities: Record<string, boolean>;
   production_eligible: boolean;
   bounded_selection_eligible: boolean;
 }
@@ -258,14 +259,17 @@ export async function getRuntimeCapabilities(client: RuntimeClient, signal?: Abo
 
 function validRuntimeCandidateCapability(value: unknown): value is RuntimeCandidateCapability {
   if (!isObject(value)) return false;
-  const allowed = new Set(["profile", "execution_class", "rootfs", "production_eligible", "bounded_selection_eligible"]);
+  const allowed = new Set(["profile", "execution_class", "rootfs", "capabilities", "production_eligible", "bounded_selection_eligible"]);
   if (Object.keys(value).some((key) => !allowed.has(key)) || !nonemptyString(value.profile) || !nonemptyString(value.execution_class) ||
-      typeof value.production_eligible !== "boolean" || typeof value.bounded_selection_eligible !== "boolean" || !isObject(value.rootfs)) return false;
+      typeof value.production_eligible !== "boolean" || typeof value.bounded_selection_eligible !== "boolean" ||
+      !isObject(value.rootfs) || !isObject(value.capabilities)) return false;
   const rootfsAllowed = new Set(["driver", "capability_version", "config_hash", "lower_image_digest"]);
   return !Object.keys(value.rootfs).some((key) => !rootfsAllowed.has(key)) && value.execution_class === "linux-full" &&
-    value.rootfs.driver === "user-union" && value.rootfs.capability_version === "drive9_rootfs.user_union.extent.v2" &&
+    value.rootfs.driver === "user-union" && value.rootfs.capability_version === "drive9_rootfs.user_union.extent.v3" &&
     typeof value.rootfs.config_hash === "string" && /^[0-9a-f]{64}$/.test(value.rootfs.config_hash) &&
     typeof value.rootfs.lower_image_digest === "string" && /^sha256:[0-9a-f]{64}$/.test(value.rootfs.lower_image_digest) &&
+    value.capabilities["drive9.extent_xattr.v1"] === true &&
+    Object.values(value.capabilities).every((capability) => typeof capability === "boolean") &&
     !(value.bounded_selection_eligible && !value.production_eligible);
 }
 

@@ -543,6 +543,9 @@ func TestTenantStatusWithValidKey(t *testing.T) {
 	if out.MaxUploadBytes != srv.maxUploadBytes {
 		t.Fatalf("max_upload_bytes = %d, want %d", out.MaxUploadBytes, srv.maxUploadBytes)
 	}
+	if !out.StorageCapabilities.ExtentXattrV1 {
+		t.Fatal("active server omitted extent_xattr_v1")
+	}
 }
 
 func TestTenantStatusReturnsInlineThreshold(t *testing.T) {
@@ -602,6 +605,9 @@ func TestTenantStatusReturnsProvisioningState(t *testing.T) {
 	}
 	if out.Status != string(meta.TenantProvisioning) {
 		t.Fatalf("expected provisioning status, got %+v", out)
+	}
+	if out.StorageCapabilities.ExtentXattrV1 {
+		t.Fatal("provisioning tenant advertised extent_xattr_v1")
 	}
 }
 
