@@ -11,6 +11,7 @@ CLI_BIN="${DRIVE9_CLI_BIN:-./bin/drive9}"
 API_KEY="${DRIVE9_API_KEY:-}"
 FUSE_READY_TIMEOUT_S="${FUSE_READY_TIMEOUT_S:-30}"
 ROOTFS_IMAGE="${ROOTFS_PROBE_IMAGE:-busybox:1.36.1}"
+ROOTFS_DRIVER="${ROOTFS_OVERLAY_DRIVER:-fuse-overlayfs}"
 RUN_ID="$(date +%s)-$$"
 REMOTE_ROOT="/runtime-rootfs-probe-${RUN_ID}"
 WORK_DIR="$(mktemp -d)"
@@ -18,8 +19,11 @@ LOWER="$WORK_DIR/lower"
 FUSE_ROOT="$WORK_DIR/drive9"
 MERGED="$WORK_DIR/merged"
 MOUNT_LOG="$WORK_DIR/fuse.log"
+OVERLAY_LOG="$WORK_DIR/overlay.log"
 FUSE_PID=""
 FIRST_FUSE_PID=""
+OVERLAY_PID=""
+FIRST_OVERLAY_PID=""
 OVERLAY_MOUNTED=0
 TMP_MOUNTED=0
 RUN_MOUNTED=0
@@ -29,6 +33,9 @@ fail() {
   if [ -s "$MOUNT_LOG" ]; then
     sed -n '1,120p' "$MOUNT_LOG" >&2
   fi
+  if [ -s "$OVERLAY_LOG" ]; then
+    sed -n '1,120p' "$OVERLAY_LOG" >&2
+  fi
   exit 1
 }
 
@@ -37,17 +44,40 @@ run_cli() {
 }
 
 unmount_overlay() {
+  local best_effort="${1:-0}"
   if [ "$RUN_MOUNTED" = 1 ]; then
-    sudo umount "$MERGED/run" >/dev/null 2>&1 || true
+    if ! sudo umount "$MERGED/run" >/dev/null 2>&1 && [ "$best_effort" != 1 ]; then
+      return 1
+    fi
     RUN_MOUNTED=0
   fi
   if [ "$TMP_MOUNTED" = 1 ]; then
-    sudo umount "$MERGED/tmp" >/dev/null 2>&1 || true
+    if ! sudo umount "$MERGED/tmp" >/dev/null 2>&1 && [ "$best_effort" != 1 ]; then
+      return 1
+    fi
     TMP_MOUNTED=0
   fi
   if [ "$OVERLAY_MOUNTED" = 1 ]; then
-    sudo umount "$MERGED" >/dev/null 2>&1 || true
+    if [ "$ROOTFS_DRIVER" = fuse-overlayfs ]; then
+      if ! fusermount3 -u "$MERGED" >/dev/null 2>&1 && [ "$best_effort" != 1 ]; then
+        return 1
+      fi
+    elif ! sudo umount "$MERGED" >/dev/null 2>&1 && [ "$best_effort" != 1 ]; then
+      return 1
+    fi
     OVERLAY_MOUNTED=0
+  fi
+  if [ -n "$OVERLAY_PID" ]; then
+    if [ "$best_effort" = 1 ] && kill -0 "$OVERLAY_PID" 2>/dev/null; then
+      kill "$OVERLAY_PID" >/dev/null 2>&1 || true
+    fi
+    if ! wait "$OVERLAY_PID" && [ "$best_effort" != 1 ]; then
+      return 1
+    fi
+    OVERLAY_PID=""
+  fi
+  if mountpoint -q "$MERGED"; then
+    [ "$best_effort" = 1 ] || return 1
   fi
 }
 
@@ -63,7 +93,7 @@ unmount_drive9() {
 }
 
 cleanup() {
-  unmount_overlay
+  unmount_overlay 1
   unmount_drive9 >/dev/null 2>&1 || true
   if [ -n "$API_KEY" ]; then
     curl -sS --max-time 20 -X DELETE \
@@ -99,11 +129,37 @@ mount_drive9() {
 
 mount_overlay() {
   mkdir -p "$FUSE_ROOT/upper" "$FUSE_ROOT/work" "$MERGED"
-  if ! sudo mount -t overlay overlay \
-    -o "lowerdir=$LOWER,upperdir=$FUSE_ROOT/upper,workdir=$FUSE_ROOT/work,userxattr" \
-    "$MERGED"; then
-    fail "kernel rejected Drive9 FUSE as an overlay upper/work filesystem"
-  fi
+  case "$ROOTFS_DRIVER" in
+    kernel)
+      if ! sudo mount -t overlay overlay \
+        -o "lowerdir=$LOWER,upperdir=$FUSE_ROOT/upper,workdir=$FUSE_ROOT/work,userxattr" \
+        "$MERGED"; then
+        fail "kernel rejected Drive9 FUSE as an overlay upper/work filesystem"
+      fi
+      ;;
+    fuse-overlayfs)
+      : >"$OVERLAY_LOG"
+      FUSE_OVERLAYFS_DISABLE_OVL_WHITEOUT=1 fuse-overlayfs -f \
+        -o "lowerdir=$LOWER,upperdir=$FUSE_ROOT/upper,workdir=$FUSE_ROOT/work" \
+        "$MERGED" >>"$OVERLAY_LOG" 2>&1 &
+      OVERLAY_PID=$!
+      local deadline=$((SECONDS + FUSE_READY_TIMEOUT_S))
+      while ! mountpoint -q "$MERGED"; do
+        if ! kill -0 "$OVERLAY_PID" 2>/dev/null; then
+          wait "$OVERLAY_PID" || true
+          OVERLAY_PID=""
+          fail "fuse-overlayfs exited before becoming ready"
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+          fail "fuse-overlayfs did not become ready"
+        fi
+        sleep 0.2
+      done
+      ;;
+    *)
+      fail "unsupported rootfs overlay driver: $ROOTFS_DRIVER"
+      ;;
+  esac
   OVERLAY_MOUNTED=1
   sudo mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs "$MERGED/tmp"
   TMP_MOUNTED=1
@@ -117,6 +173,10 @@ fi
 for command in curl docker jq mount mountpoint python3 sudo tar umount; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
 done
+if [ "$ROOTFS_DRIVER" = fuse-overlayfs ]; then
+  command -v fuse-overlayfs >/dev/null 2>&1 || fail "required command is missing: fuse-overlayfs"
+  command -v fusermount3 >/dev/null 2>&1 || fail "required command is missing: fusermount3"
+fi
 [ -x "$CLI_BIN" ] || fail "DRIVE9_CLI_BIN is not executable"
 
 if [ -z "$API_KEY" ]; then
@@ -154,6 +214,7 @@ printf 'hidden-child\n' >"$LOWER/etc/opaque/lower-child"
 mount_drive9
 FIRST_FUSE_PID="$FUSE_PID"
 mount_overlay
+FIRST_OVERLAY_PID="$OVERLAY_PID"
 
 sudo chroot "$MERGED" /bin/sh -c 'test -x /bin/sh && printf lower-image-ok' \
   | grep -qx 'lower-image-ok' || fail "lower image binary did not execute from merged root"
@@ -180,7 +241,10 @@ sudo sh -c "printf transient-tmp >'$MERGED/tmp/not-persistent'"
 sudo sh -c "printf transient-run >'$MERGED/run/not-persistent'"
 sync
 
-unmount_overlay
+unmount_overlay || fail "$ROOTFS_DRIVER did not stop cleanly"
+if [ -n "$FIRST_OVERLAY_PID" ] && kill -0 "$FIRST_OVERLAY_PID" 2>/dev/null; then
+  fail "first fuse-overlayfs process is still alive after unmount"
+fi
 run_cli fs drain-file-system --mount-path "$FUSE_ROOT" --timeout 30s >/dev/null \
   || fail "Drive9 drain failed after rootfs mutation"
 unmount_drive9 || fail "first Drive9 FUSE mount did not stop cleanly"
@@ -192,13 +256,17 @@ fi
 # be needed to reconstruct the merged root.
 mount_drive9
 [ "$FUSE_PID" != "$FIRST_FUSE_PID" ] || fail "Drive9 remount reused the old FUSE process"
-sudo python3 - "$FUSE_ROOT/upper/etc/drive9.conf" <<'PY' \
-  || fail "xattr was absent on the fresh Drive9 FUSE mount before overlay reconstruction"
+if [ "$ROOTFS_DRIVER" = kernel ]; then
+  sudo python3 - "$FUSE_ROOT/upper/etc/drive9.conf" <<'PY' \
+    || fail "xattr was absent on the fresh Drive9 FUSE mount before overlay reconstruction"
 import os
 import sys
 assert os.getxattr(sys.argv[1], b"user.drive9.probe") == b"durable"
 PY
+fi
 mount_overlay
+[ -z "$FIRST_OVERLAY_PID" ] || [ "$OVERLAY_PID" != "$FIRST_OVERLAY_PID" ] \
+  || fail "rootfs remount reused the old fuse-overlayfs process"
 
 sudo chroot "$MERGED" /bin/sh -c 'test -x /bin/sh && printf lower-image-ok' \
   | grep -qx 'lower-image-ok' || fail "lower image binary failed after Drive9 remount"
@@ -226,4 +294,4 @@ PY
 [ ! -e "$MERGED/tmp/not-persistent" ] || fail "/tmp unexpectedly persisted"
 [ ! -e "$MERGED/run/not-persistent" ] || fail "/run unexpectedly persisted"
 
-printf 'PASS Drive9 FUSE is a durable Linux overlay upper/work filesystem\n'
+printf 'PASS Drive9 FUSE is a durable Linux %s upper/work filesystem\n' "$ROOTFS_DRIVER"

@@ -222,7 +222,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y default-mysql-client fuse3 jq
+          sudo apt-get install -y default-mysql-client fuse3 fuse-overlayfs jq
 
       - name: Cache TiUP artifacts
         uses: actions/cache@v4
