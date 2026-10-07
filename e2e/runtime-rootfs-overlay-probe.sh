@@ -240,6 +240,32 @@ import os
 import sys
 os.setxattr(sys.argv[1], b"user.drive9.probe", b"durable")
 PY
+sudo python3 - "$MERGED/workspace/persist.txt" "$MERGED/workspace/persist-hardlink.txt" <<'PY'
+import os
+import sys
+os.setxattr(sys.argv[1], b"user.drive9.hardlink", b"same-inode")
+assert os.getxattr(sys.argv[2], b"user.drive9.hardlink") == b"same-inode"
+PY
+sudo mv "$MERGED/workspace/persist-hardlink.txt" "$MERGED/workspace/renamed-hardlink.txt"
+sudo sh -c "printf old >'$MERGED/workspace/reused.txt'"
+sudo python3 - "$MERGED/workspace/reused.txt" <<'PY'
+import os
+import sys
+os.setxattr(sys.argv[1], b"user.drive9.stale", b"must-disappear")
+PY
+sudo rm "$MERGED/workspace/reused.txt"
+sudo sh -c "printf new >'$MERGED/workspace/reused.txt'"
+sudo python3 - "$MERGED/workspace/reused.txt" <<'PY'
+import errno
+import os
+import sys
+try:
+    os.getxattr(sys.argv[1], b"user.drive9.stale")
+except OSError as exc:
+    assert exc.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA))
+else:
+    raise AssertionError("recreated path inherited deleted inode xattr")
+PY
 sudo sh -c "printf transient-tmp >'$MERGED/tmp/not-persistent'"
 sudo sh -c "printf transient-run >'$MERGED/run/not-persistent'"
 sync
@@ -287,7 +313,7 @@ sudo chroot "$MERGED" /bin/sh -c 'test -x /bin/sh && printf lower-image-ok' \
 [ "$(stat -c '%a' "$MERGED/etc/drive9.conf")" = 640 ] || fail "chmod did not persist"
 [ "$(stat -c '%u:%g' "$MERGED/workspace/persist.txt")" = 1234:2345 ] || fail "chown uid/gid did not persist"
 [ "$(readlink "$MERGED/root/config-link")" = ../etc/drive9.conf ] || fail "symlink did not persist"
-[ "$(stat -c '%i' "$MERGED/workspace/persist.txt")" = "$(stat -c '%i' "$MERGED/workspace/persist-hardlink.txt")" ] \
+[ "$(stat -c '%i' "$MERGED/workspace/persist.txt")" = "$(stat -c '%i' "$MERGED/workspace/renamed-hardlink.txt")" ] \
   || fail "hardlink identity did not persist"
 [ "$(stat -c '%y' "$MERGED/etc/drive9.conf" | cut -d. -f1)" = '2020-01-02 03:04:05' ] \
   || fail "mtime did not persist"
@@ -297,6 +323,26 @@ sudo python3 - "$MERGED/etc/drive9.conf" <<'PY' \
 import os
 import sys
 assert os.getxattr(sys.argv[1], b"user.drive9.probe") == b"durable"
+PY
+sudo python3 - "$MERGED/workspace/persist.txt" "$MERGED/workspace/renamed-hardlink.txt" <<'PY' \
+  || fail "hardlink/rename inode xattr did not persist"
+import os
+import sys
+assert os.getxattr(sys.argv[1], b"user.drive9.hardlink") == b"same-inode"
+assert os.getxattr(sys.argv[2], b"user.drive9.hardlink") == b"same-inode"
+PY
+[ "$(sudo cat "$MERGED/workspace/reused.txt")" = new ] || fail "recreated file content did not persist"
+sudo python3 - "$MERGED/workspace/reused.txt" <<'PY' \
+  || fail "recreated path inherited deleted inode xattr after remount"
+import errno
+import os
+import sys
+try:
+    os.getxattr(sys.argv[1], b"user.drive9.stale")
+except OSError as exc:
+    assert exc.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA))
+else:
+    raise AssertionError("recreated path inherited deleted inode xattr")
 PY
 [ ! -e "$MERGED/tmp/not-persistent" ] || fail "/tmp unexpectedly persisted"
 [ ! -e "$MERGED/run/not-persistent" ] || fail "/run unexpectedly persisted"
