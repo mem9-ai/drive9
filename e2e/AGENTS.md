@@ -101,9 +101,13 @@ bash e2e/posix-permission-smoke-test.sh
 # Run the default smoke-all sequence once (local-e2e.yml PR set)
 bash e2e/smoke-all.sh
 
-# Cross-repository Runtime visibility proof. It runs automatically for pull
-# requests, post-merge, and nightly; run_all_e2e also includes it on demand.
-gh workflow run local-e2e.yml --ref <client-ref> -f run_all_e2e=1
+# Cross-repository Runtime visibility proof. Hosted CI runs this from the
+# tidbcloud/fs Local E2E workflow so the private server and exact client ref
+# can be paired. For local reproduction, point the graft at both binaries.
+DRIVE9_SERVER_BIN=/path/to/drive9-server \
+  DRIVE9_CLI_BIN=/path/to/drive9 \
+  DRIVE9_LOCAL_E2E_SMOKE_SCRIPT=e2e/runtime-exec-visibility.sh \
+  bash scripts/e2e-local.sh --no-build
 
 # Skip FUSE-related suites (macOS / no real FUSE)
 RUN_FUSE_SMOKE=0 bash e2e/smoke-all.sh
@@ -756,11 +760,10 @@ mounted read byte-for-byte, writes a second exact payload in the process, and
 requires that payload to be immediately readable through `/v1/fs` after the
 terminal frame. It deliberately does not poll or retry the exec or final read.
 
-The script is wired to `Local E2E` for pull requests, post-merge, nightly, and
-manual/reusable `run_all_e2e` runs. The replacement PR is explicitly paired to
-the exact reviewed `tidbcloud/fs` head; normal runs use that repository's
-`main`. This keeps the current cross-repository evidence bound to both exact
-heads without permanently pinning future compatibility checks.
+The script is invoked by the `tidbcloud/fs` `Local E2E` workflow, which checks
+out an exact client ref and grafts the current private server checkout onto it.
+The script stays here because public HTTP / CLI / FUSE smokes are owned by the
+client repository; the server repository contains only the workflow wiring.
 
 ### `git-feature-smoke-test.sh`
 
