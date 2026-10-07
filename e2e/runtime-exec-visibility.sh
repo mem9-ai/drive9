@@ -17,8 +17,16 @@ OUTBOUND_PATH="${ROOT_REL}/upper/workspace/outbound.txt"
 INBOUND_PAYLOAD="api-to-exec-${RUN_ID}"
 OUTBOUND_PAYLOAD="exec-to-api-${RUN_ID}"
 WORK_DIR="$(mktemp -d)"
+RAW_MOUNT="$WORK_DIR/raw-mount"
+RAW_STATE="$WORK_DIR/raw-state"
+RAW_MOUNTED=0
 
 cleanup() {
+  if [ "$RAW_MOUNTED" = 1 ]; then
+    HOME="$RAW_STATE" XDG_RUNTIME_DIR="$RAW_STATE" \
+      "$CLI_BIN" umount --no-auto-pack --timeout 30s "$RAW_MOUNT" \
+      >/dev/null 2>&1 || true
+  fi
   if [ -n "$API_KEY" ]; then
     curl -sS --max-time 20 -X DELETE \
       -H "Authorization: Bearer ${API_KEY}" \
@@ -33,7 +41,36 @@ fail() {
   if [ -s "$WORK_DIR/exec.stderr" ]; then
     sed -n '1,80p' "$WORK_DIR/exec.stderr" >&2
   fi
+  if [ -s "$WORK_DIR/raw-mount.log" ]; then
+    sed -n '1,80p' "$WORK_DIR/raw-mount.log" >&2
+  fi
   exit 1
+}
+
+mount_raw_workspace() {
+  mkdir -p "$RAW_MOUNT" "$RAW_STATE"
+  chmod 0700 "$RAW_STATE"
+  if ! HOME="$RAW_STATE" XDG_RUNTIME_DIR="$RAW_STATE" \
+    DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" \
+    "$CLI_BIN" mount --no-supervise --no-persist-credentials \
+      --mode=fuse --profile=extent --require-extent-xattr-v1 \
+      --durability=write-sync --flush-debounce=0 \
+      ":$ROOT" "$RAW_MOUNT" >"$WORK_DIR/raw-mount.log" 2>&1; then
+    fail "fresh raw-upper diagnostic mount failed"
+  fi
+  RAW_MOUNTED=1
+}
+
+unmount_raw_workspace() {
+  HOME="$RAW_STATE" XDG_RUNTIME_DIR="$RAW_STATE" \
+    "$CLI_BIN" mount drain --timeout 30s "$RAW_MOUNT" \
+    >>"$WORK_DIR/raw-mount.log" 2>&1 \
+    || fail "fresh raw-upper diagnostic drain failed"
+  HOME="$RAW_STATE" XDG_RUNTIME_DIR="$RAW_STATE" \
+    "$CLI_BIN" umount --no-auto-pack --timeout 30s "$RAW_MOUNT" \
+    >>"$WORK_DIR/raw-mount.log" 2>&1 \
+    || fail "fresh raw-upper diagnostic unmount failed"
+  RAW_MOUNTED=0
 }
 
 if [ ! -x "$CLI_BIN" ]; then
@@ -109,6 +146,77 @@ fi
 
 [ "$(cat "$WORK_DIR/exec.stdout")" = lower-image-ok ] \
   || fail "provider lower-image /bin/sh did not execute"
+
+# Before another union mount can mask where the metadata was lost, open the
+# durable workspace with a fresh Drive9 FUSE process and inspect the raw upper
+# inode. The HEAD projection and the private fuse-overlayfs xattr must agree on
+# the same extent-backed fact after the first Runtime drain/unmount.
+RAW_ETC_REL="${ROOT_REL}/upper/etc/drive9.conf"
+RAW_ETC_PATH="$RAW_MOUNT/upper/etc/drive9.conf"
+raw_head="$(curl -fsSI --max-time 20 -H "Authorization: Bearer ${API_KEY}" \
+  "${BASE}/v1/fs/${RAW_ETC_REL}" | tr -d '\r')" \
+  || fail "raw-upper HEAD failed"
+raw_layout="$(printf '%s\n' "$raw_head" | awk -F': ' 'tolower($1)=="x-dat9-content-layout"{print $2}')"
+raw_extent_ino="$(printf '%s\n' "$raw_head" | awk -F': ' 'tolower($1)=="x-dat9-extent-ino"{print $2}')"
+[ "$raw_layout" = extent ] \
+  || fail "raw-upper layout expected=extent actual=${raw_layout:-<missing>}"
+[ -n "$raw_extent_ino" ] \
+  || fail "raw-upper extent inode is missing"
+
+mount_raw_workspace
+raw_metadata="$(python3 - "$RAW_ETC_PATH" "$raw_layout" "$raw_extent_ino" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path, layout, extent_ino = sys.argv[1:]
+try:
+    current = os.lstat(path)
+except OSError as exc:
+    print(json.dumps({"error": f"lstat:{exc.errno}", "path": path}, sort_keys=True))
+    raise SystemExit(2)
+try:
+    names = sorted(os.listxattr(path))
+except OSError as exc:
+    print(json.dumps({"error": f"listxattr:{exc.errno}", "path": path}, sort_keys=True))
+    raise SystemExit(3)
+try:
+    override = os.getxattr(path, b"user.fuseoverlayfs.override_stat").decode("ascii")
+except OSError as exc:
+    override = f"<getxattr-error:{exc.errno}>"
+override_owner = None
+override_mode = None
+parts = override.split(":")
+if len(parts) == 3:
+    try:
+        override_owner = f"{int(parts[0])}:{int(parts[1])}"
+        override_mode = format(int(parts[2], 8) & 0o7777, "o")
+    except ValueError:
+        pass
+print(json.dumps({
+    "path": path,
+    "layout": layout,
+    "extent_ino": extent_ino,
+    "stat_inode": current.st_ino,
+    "stat_owner": f"{current.st_uid}:{current.st_gid}",
+    "stat_mode": format(stat.S_IMODE(current.st_mode), "o"),
+    "xattrs": names,
+    "override_stat": override,
+    "override_owner": override_owner,
+    "override_mode": override_mode,
+}, sort_keys=True))
+PY
+)" || fail "raw-upper metadata inspection failed: ${raw_metadata:-<no-output>}"
+printf 'runtime raw-upper metadata: %s\n' "$raw_metadata" >&2
+raw_override="$(printf '%s' "$raw_metadata" | jq -r '.override_stat // empty')"
+raw_override_owner="$(printf '%s' "$raw_metadata" | jq -r '.override_owner // empty')"
+raw_override_mode="$(printf '%s' "$raw_metadata" | jq -r '.override_mode // empty')"
+[ "$raw_override_owner" = 65532:65532 ] \
+  || fail "raw-upper override_stat owner expected=65532:65532 actual=${raw_override:-<missing>}"
+[ "$raw_override_mode" = 640 ] \
+  || fail "raw-upper override_stat mode expected=640 actual=${raw_override:-<missing>}"
+unmount_raw_workspace
 
 # Direction 1: after rootfs initialization, an acknowledged FS API write into
 # the durable upper must be observed at the corresponding merged-root path by
