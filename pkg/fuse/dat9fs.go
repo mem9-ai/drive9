@@ -9517,6 +9517,14 @@ func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name stri
 	mode := metadataNodeMode(input.Mode)
 	switch mode & fileKindModeMask {
 	case 0, syscall.S_IFREG:
+		// fuse-overlayfs creates regular upper files with MKNOD before it
+		// installs its private override_stat xattr. Keep that file on the
+		// extent data plane when the mount's creation policy selects it;
+		// otherwise SetXAttr would fall back to the mount-session store and
+		// ownership/mode would disappear on a fresh mount.
+		if fs.shouldUseExtentPath(childP) {
+			return fs.extentMknod(cancel, input, name, childP, mode, out)
+		}
 		return fs.mknodRegular(cancel, input, name, childP, mode, out)
 	}
 	if fs.extentEnabled() && metadataOnlySpecialMode(mode) {

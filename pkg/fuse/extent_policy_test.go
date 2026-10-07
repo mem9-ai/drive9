@@ -2,6 +2,9 @@ package fuse
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -10,6 +13,44 @@ import (
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/extent"
 )
+
+func TestRegularMknodUsesExtentCreationPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		file        string
+		wantClassic bool
+	}{
+		{name: "matching extent path", file: "upper.extent"},
+		{name: "ordinary path", file: "ordinary.txt", wantClassic: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				http.Error(w, "classic write must fail", http.StatusInternalServerError)
+			}))
+			defer server.Close()
+
+			fs := NewDat9FS(newTestClient(server.URL), &MountOptions{ExtentPaths: []string{"*.extent"}})
+			fs.extentTornDown = true
+			var out gofuse.EntryOut
+			status := fs.Mknod(nil, &gofuse.MknodIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Mode:     uint32(syscall.S_IFREG) | 0o640,
+			}, test.file, &out)
+			if status == gofuse.OK {
+				t.Fatal("Mknod status=OK, want injected failure")
+			}
+			gotCalls := calls.Load()
+			if test.wantClassic && gotCalls == 0 {
+				t.Fatal("ordinary Mknod made no classic HTTP call")
+			}
+			if !test.wantClassic && gotCalls != 0 {
+				t.Fatalf("extent Mknod made %d classic HTTP calls, want 0", gotCalls)
+			}
+		})
+	}
+}
 
 func TestFindPathInDirIgnoresExtraSlash(t *testing.T) {
 	fs := &Dat9FS{inodes: NewInodeToPath()}

@@ -343,6 +343,7 @@ func (fs *Dat9FS) extentMknod(cancel <-chan struct{}, input *gofuse.MknodIn, nam
 	if entry != nil {
 		fs.inodes.SetExtentIno(driveIno, uint64(entry.Inode))
 	}
+	fs.extentMissForget(childP)
 	fs.inodes.UpdateMode(driveIno, mode)
 	fs.inodes.UpdateRdev(driveIno, input.Rdev)
 	fs.inodes.UpdateOwner(driveIno, input.Uid, input.Gid, true, true)

@@ -18,9 +18,18 @@ import (
 
 type extentXattrTestServer struct {
 	mu       sync.Mutex
-	attrs    map[string][]byte
+	attrs    map[uint64]map[string][]byte
 	requests []string
 	flags    []uint32
+}
+
+func (s *extentXattrTestServer) inodeAttrs(inode uint64) map[string][]byte {
+	attrs := s.attrs[inode]
+	if attrs == nil {
+		attrs = make(map[string][]byte)
+		s.attrs[inode] = attrs
+	}
+	return attrs
 }
 
 func (s *extentXattrTestServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -41,23 +50,23 @@ func (s *extentXattrTestServer) serveHTTP(w http.ResponseWriter, r *http.Request
 			Value []byte `json:"value"`
 			Flags uint32 `json:"flags"`
 		}
-		if json.NewDecoder(r.Body).Decode(&request) != nil || request.Inode != 42 {
+		if json.NewDecoder(r.Body).Decode(&request) != nil || request.Inode == 0 {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		s.flags = append(s.flags, request.Flags)
-		s.attrs[request.Name] = append([]byte(nil), request.Value...)
+		s.inodeAttrs(request.Inode)[request.Name] = append([]byte(nil), request.Value...)
 		_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
 	case "get_xattr":
 		var request struct {
 			Inode uint64 `json:"inode"`
 			Name  string `json:"name"`
 		}
-		if json.NewDecoder(r.Body).Decode(&request) != nil || request.Inode != 42 {
+		if json.NewDecoder(r.Body).Decode(&request) != nil || request.Inode == 0 {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		value, ok := s.attrs[request.Name]
+		value, ok := s.attrs[request.Inode][request.Name]
 		if !ok {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errno": int(syscall.ENODATA)})
 			return
@@ -67,12 +76,13 @@ func (s *extentXattrTestServer) serveHTTP(w http.ResponseWriter, r *http.Request
 		var request struct {
 			Inode uint64 `json:"inode"`
 		}
-		if json.NewDecoder(r.Body).Decode(&request) != nil || request.Inode != 42 {
+		if json.NewDecoder(r.Body).Decode(&request) != nil || request.Inode == 0 {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		names := make([]string, 0, len(s.attrs))
-		for name := range s.attrs {
+		attrs := s.attrs[request.Inode]
+		names := make([]string, 0, len(attrs))
+		for name := range attrs {
 			names = append(names, name)
 		}
 		sort.Sort(sort.Reverse(sort.StringSlice(names)))
@@ -82,11 +92,11 @@ func (s *extentXattrTestServer) serveHTTP(w http.ResponseWriter, r *http.Request
 			Inode uint64 `json:"inode"`
 			Name  string `json:"name"`
 		}
-		if json.NewDecoder(r.Body).Decode(&request) != nil || request.Inode != 42 {
+		if json.NewDecoder(r.Body).Decode(&request) != nil || request.Inode == 0 {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		delete(s.attrs, request.Name)
+		delete(s.attrs[request.Inode], request.Name)
 		_ = json.NewEncoder(w).Encode(map[string]any{"errno": 0})
 	default:
 		w.WriteHeader(http.StatusBadRequest)
@@ -98,6 +108,10 @@ func newExtentXattrTestFS(t *testing.T, handler http.Handler) (*Dat9FS, uint64) 
 }
 
 func newExtentXattrTestFSWithKind(t *testing.T, handler http.Handler, isDir bool) (*Dat9FS, uint64) {
+	return newExtentXattrTestFSWithIdentity(t, handler, "/extent", isDir, 42)
+}
+
+func newExtentXattrTestFSWithIdentity(t *testing.T, handler http.Handler, path string, isDir bool, extentIno uint64) (*Dat9FS, uint64) {
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
@@ -106,13 +120,13 @@ func newExtentXattrTestFSWithKind(t *testing.T, handler http.Handler, isDir bool
 		inodes: NewInodeToPath(),
 		xattrs: NewXAttrStore(),
 	}
-	ino := fs.inodes.Lookup("/extent", isDir, 0, time.Now())
-	fs.inodes.SetExtentIno(ino, 42)
+	ino := fs.inodes.Lookup(path, isDir, 0, time.Now())
+	fs.inodes.SetExtentIno(ino, extentIno)
 	return fs, ino
 }
 
 func TestExtentDirectoryXattrHandlersUseDurableInodeRPC(t *testing.T) {
-	backend := &extentXattrTestServer{attrs: make(map[string][]byte)}
+	backend := &extentXattrTestServer{attrs: make(map[uint64]map[string][]byte)}
 	fs, ino := newExtentXattrTestFSWithKind(t, http.HandlerFunc(backend.serveHTTP), true)
 	header := gofuse.InHeader{NodeId: ino}
 
@@ -142,7 +156,7 @@ func TestExtentDirectoryXattrHandlersUseDurableInodeRPC(t *testing.T) {
 }
 
 func TestExtentXattrHandlersUseDurableInodeRPC(t *testing.T) {
-	backend := &extentXattrTestServer{attrs: make(map[string][]byte)}
+	backend := &extentXattrTestServer{attrs: make(map[uint64]map[string][]byte)}
 	fs, ino := newExtentXattrTestFS(t, http.HandlerFunc(backend.serveHTTP))
 	header := gofuse.InHeader{NodeId: ino}
 
@@ -194,6 +208,46 @@ func TestExtentXattrHandlersUseDurableInodeRPC(t *testing.T) {
 		if requests[i] != want[i] {
 			t.Fatalf("requests=%v, want %v", requests, want)
 		}
+	}
+}
+
+func TestExtentFuseOverlayStatPersistsByInodeAcrossFreshInstances(t *testing.T) {
+	backend := &extentXattrTestServer{attrs: make(map[uint64]map[string][]byte)}
+	handler := http.HandlerFunc(backend.serveHTTP)
+	const (
+		originalPath = "/upper/etc/drive9.conf"
+		renamedPath  = "/upper/etc/drive9-renamed.conf"
+		value        = "65532:65532:100640"
+	)
+
+	first, firstIno := newExtentXattrTestFSWithIdentity(t, handler, originalPath, false, 42)
+	firstHeader := gofuse.InHeader{NodeId: firstIno}
+	if status := first.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: firstHeader}, fuseOverlayOverrideStatXattr, []byte(value)); status != gofuse.OK {
+		t.Fatalf("SetXAttr status=%v, want OK", status)
+	}
+	if _, stored := first.xattrs.Get(originalPath, fuseOverlayOverrideStatXattr); stored {
+		t.Fatal("extent override_stat fell back to the first mount's session store")
+	}
+
+	second, secondIno := newExtentXattrTestFSWithIdentity(t, handler, originalPath, false, 42)
+	secondHeader := gofuse.InHeader{NodeId: secondIno}
+	dest := make([]byte, len(value))
+	if size, status := second.GetXAttr(nil, &secondHeader, fuseOverlayOverrideStatXattr, dest); status != gofuse.OK || size != uint32(len(value)) || string(dest) != value {
+		t.Fatalf("fresh GetXAttr=%d/%v/%q, want %d/OK/%q", size, status, dest, len(value), value)
+	}
+	if _, stored := second.xattrs.Get(originalPath, fuseOverlayOverrideStatXattr); stored {
+		t.Fatal("fresh extent override_stat was copied into the session store")
+	}
+
+	second.inodes.Rename(originalPath, renamedPath)
+	if size, status := second.GetXAttr(nil, &secondHeader, fuseOverlayOverrideStatXattr, dest); status != gofuse.OK || size != uint32(len(value)) || string(dest) != value {
+		t.Fatalf("renamed GetXAttr=%d/%v/%q, want %d/OK/%q", size, status, dest, len(value), value)
+	}
+
+	recreated, recreatedIno := newExtentXattrTestFSWithIdentity(t, handler, originalPath, false, 43)
+	recreatedHeader := gofuse.InHeader{NodeId: recreatedIno}
+	if _, status := recreated.GetXAttr(nil, &recreatedHeader, fuseOverlayOverrideStatXattr, nil); status != gofuse.ENOATTR {
+		t.Fatalf("recreated GetXAttr status=%v, want ENOATTR", status)
 	}
 }
 
