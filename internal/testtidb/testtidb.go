@@ -205,6 +205,7 @@ var resetDeleteQueries = []string{
 	"DELETE FROM jfs_session2",
 	"DELETE FROM jfs_setting",
 	"DELETE FROM jfs_symlink",
+	"DELETE FROM jfs_xattr",
 	"DELETE FROM jfs_counter",
 	"DELETE FROM jfs_node",
 	"DELETE FROM slice_compact_tasks",

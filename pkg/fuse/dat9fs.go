@@ -15377,7 +15377,7 @@ func (fs *Dat9FS) StatFs(cancel <-chan struct{}, header *gofuse.InHeader, out *g
 	return gofuse.OK
 }
 
-// --- Xattr handlers (in-memory, session-scoped) ----------------------------
+// --- Xattr handlers ---------------------------------------------------------
 
 func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string, dest []byte) (uint32, gofuse.Status) {
 	path, ok := fs.inodes.GetPath(header.NodeId)
@@ -15386,6 +15386,22 @@ func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr
 	}
 	if !xattrNamespaceSupported(attr) {
 		return 0, gofuse.Status(syscall.EOPNOTSUPP)
+	}
+	if ino, extent := fs.extentXattrInode(header.NodeId, path); extent {
+		ctx, cancelCtx := fuseCtx(cancel)
+		defer cancelCtx()
+		val, status := fs.extentGetXattr(ctx, ino, attr)
+		if status != gofuse.OK {
+			return 0, status
+		}
+		if len(dest) == 0 {
+			return uint32(len(val)), gofuse.OK
+		}
+		if len(val) > len(dest) {
+			return uint32(len(val)), gofuse.Status(syscall.ERANGE)
+		}
+		copy(dest, val)
+		return uint32(len(val)), gofuse.OK
 	}
 	val, found := fs.xattrs.Get(path, attr)
 	if !found {
@@ -15406,7 +15422,19 @@ func (fs *Dat9FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, des
 	if !ok {
 		return 0, gofuse.ENOENT
 	}
-	names := fs.xattrs.List(path)
+	var names []string
+	if ino, extent := fs.extentXattrInode(header.NodeId, path); extent {
+		ctx, cancelCtx := fuseCtx(cancel)
+		defer cancelCtx()
+		var status gofuse.Status
+		names, status = fs.extentListXattr(ctx, ino)
+		if status != gofuse.OK {
+			return 0, status
+		}
+	} else {
+		names = fs.xattrs.List(path)
+	}
+	sort.Strings(names)
 	var total int
 	for _, name := range names {
 		total += len(name) + 1
@@ -15434,6 +15462,13 @@ func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, att
 	if !xattrNamespaceSupported(attr) {
 		return gofuse.Status(syscall.EOPNOTSUPP)
 	}
+	if ino, extent := fs.extentXattrInode(input.NodeId, path); extent {
+		requestCtx, requestCancel := fuseCtx(cancel)
+		defer requestCancel()
+		commitCtx, commitCancel := fs.namespaceMutationCommitContext(requestCtx)
+		defer commitCancel()
+		return fs.extentSetXattr(commitCtx, ino, attr, data, input.Flags)
+	}
 	if err := fs.xattrs.SetWithFlags(path, attr, data, input.Flags); err != 0 {
 		return gofuse.Status(err)
 	}
@@ -15447,6 +15482,13 @@ func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, a
 	}
 	if !xattrNamespaceSupported(attr) {
 		return gofuse.Status(syscall.EOPNOTSUPP)
+	}
+	if ino, extent := fs.extentXattrInode(header.NodeId, path); extent {
+		requestCtx, requestCancel := fuseCtx(cancel)
+		defer requestCancel()
+		commitCtx, commitCancel := fs.namespaceMutationCommitContext(requestCtx)
+		defer commitCancel()
+		return fs.extentRemoveXattr(commitCtx, ino, attr)
 	}
 	if !fs.xattrs.Remove(path, attr) {
 		return gofuse.ENOATTR

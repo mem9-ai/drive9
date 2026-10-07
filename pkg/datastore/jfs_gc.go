@@ -197,6 +197,9 @@ func (s *Store) jfsReclaimOrphanedInoTx(tx *sql.Tx, ino uint64) error {
 	if err := s.jfsEnqueueFileGCTx(tx, ino, length); err != nil {
 		return err
 	}
+	if err := jfsDeleteXattrsTx(tx, ino); err != nil {
+		return err
+	}
 	_, err = tx.Exec(`DELETE FROM jfs_node WHERE inode = ?`, ino)
 	return err
 }
@@ -380,6 +383,9 @@ func (s *Store) jfsDeleteSustainedTx(tx *sql.Tx, sid, ino uint64) error {
 			if _, err := tx.Exec(`DELETE FROM jfs_symlink WHERE inode = ?`, ino); err != nil {
 				return err
 			}
+		}
+		if err := jfsDeleteXattrsTx(tx, ino); err != nil {
+			return err
 		}
 		if _, err := tx.Exec(`DELETE FROM jfs_node WHERE inode = ?`, ino); err != nil {
 			return err
@@ -586,6 +592,9 @@ func (s *Store) jfsDeleteSubtreeTx(tx *sql.Tx, ino uint64) error {
 			}
 		}
 		if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? OR inode = ?`, node, node); err != nil {
+			return err
+		}
+		if err := jfsDeleteXattrsTx(tx, node); err != nil {
 			return err
 		}
 		for _, q := range []string{

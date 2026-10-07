@@ -92,6 +92,31 @@ func (s *Store) dispatchExtentRead(ctx context.Context, db execer, op string, ra
 			return nil, int(syscall.EIO), err
 		}
 		return map[string]any{"errno": eno, "target": target}, eno, nil
+	case "get_xattr":
+		var in struct {
+			Inode uint64 `json:"inode"`
+			Name  string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return nil, int(syscall.EINVAL), err
+		}
+		value, eno, err := jfsGetXattrTx(db, in.Inode, in.Name)
+		if err != nil {
+			return nil, int(syscall.EIO), err
+		}
+		return map[string]any{"errno": eno, "value": value}, eno, nil
+	case "list_xattr":
+		var in struct {
+			Inode uint64 `json:"inode"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return nil, int(syscall.EINVAL), err
+		}
+		names, eno, err := jfsListXattrTx(db, in.Inode)
+		if err != nil {
+			return nil, int(syscall.EIO), err
+		}
+		return map[string]any{"errno": eno, "names": names}, eno, nil
 	case "readdir":
 		var in struct {
 			Inode uint64 `json:"inode"`
@@ -126,7 +151,7 @@ func (s *Store) dispatchExtentRead(ctx context.Context, db execer, op string, ra
 // extentReadOnlyOp reports whether an op only reads the tenant schema.
 func extentReadOnlyOp(op string) bool {
 	switch op {
-	case "lookup", "getattr", "readlink", "readdir", "read", "get_counter":
+	case "lookup", "getattr", "readlink", "readdir", "read", "get_counter", "get_xattr", "list_xattr":
 		return true
 	}
 	return false
@@ -560,6 +585,34 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 			// the chunks the post-commit enqueue should look at.
 			"compact_chunks": compactChunks,
 		}, eno, nil
+	case "set_xattr":
+		var in struct {
+			Inode uint64 `json:"inode"`
+			Name  string `json:"name"`
+			Value []byte `json:"value"`
+			Flags uint32 `json:"flags"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return nil, int(syscall.EINVAL), err
+		}
+		eno, err := jfsSetXattrTx(tx, in.Inode, in.Name, in.Value, in.Flags)
+		if err != nil {
+			return nil, int(syscall.EIO), err
+		}
+		return map[string]any{"errno": eno}, eno, nil
+	case "remove_xattr":
+		var in struct {
+			Inode uint64 `json:"inode"`
+			Name  string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return nil, int(syscall.EINVAL), err
+		}
+		eno, err := jfsRemoveXattrTx(tx, in.Inode, in.Name)
+		if err != nil {
+			return nil, int(syscall.EIO), err
+		}
+		return map[string]any{"errno": eno}, eno, nil
 	case "mknod":
 		var in struct {
 			Parent   uint64     `json:"parent"`
