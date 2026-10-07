@@ -118,6 +118,7 @@ if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
   --workspace "$ROOT" --timeout 30s -- \
   /bin/sh -c 'set -eu
     test -x /bin/sh
+    test "$(stat -c %u:%g:%a /)" = 0:0:755
     test "$(stat -c %u:%g /bin/sh)" = 0:0
     test "$(id -u)" = 65532
     test "$(awk '\''$1 == "CapEff:" { print $2 }'\'' /proc/self/status)" = 0000000000000002
@@ -244,6 +245,7 @@ if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
     expect_absent() {
       [ ! -e "$2" ] || fail_check "$1:$2" "absent" "present"
     }
+    expect_stat merged-root %u:%g:%a / 0:0:755
     expect_stat lower-owner %u:%g /bin/sh 0:0
     expect_file api-inbound /etc/api-inbound.txt "$INBOUND_PAYLOAD"
     expect_file root-persist /root/persist.txt root-state
