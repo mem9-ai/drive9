@@ -330,6 +330,11 @@ jobs:
           RUN_FUSE_POSIX_FSX: "0"
         run: bash e2e/fuse-release-gate.sh
 
+      - name: Probe durable Drive9 overlay rootfs
+        id: runtime-rootfs-overlay
+        continue-on-error: true
+        run: bash e2e/runtime-rootfs-overlay-probe.sh
+
       - name: Run FUSE patch storage-class e2e
         id: fuse-patch-storage-class
         run: bash e2e/fuse-patch-storage-class.sh

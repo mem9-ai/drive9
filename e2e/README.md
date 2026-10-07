@@ -13,6 +13,7 @@ including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=loca
 
 | Script | What it validates |
 |--------|--------------------|
+| `runtime-rootfs-overlay-probe.sh` | Real Linux capability gate for using Drive9 FUSE as the durable upper/work filesystem of a sandbox overlay root. It executes a lower-image binary, mutates `/root`, `/home`, `/etc`, and `/workspace`, exercises whiteout/opaque-dir/rename/chmod/symlink/hardlink/xattr/large-file semantics, drains and remounts Drive9, then verifies exact persistence while `/tmp` and `/run` remain ephemeral. Wired into the PR Local E2E gate. |
 | `runtime-exec-visibility.sh` | Cross-repository, real-backend Runtime proof: an acknowledged FS API write is read byte-for-byte by a fresh mounted Docker exec, and the exec's write is immediately readable through the FS API after the terminal frame. Hosted CI is wired from `tidbcloud/fs` Local E2E so the private server checkout can be paired to an exact client ref. |
 | `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download; set `DRIVE9_API_KEY` to skip provision and reuse an existing tenant (cleans up its test tree in that mode) |
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, default-slot `pack`/`unpack`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download; honors `DRIVE9_API_KEY` to skip provision and reuse an existing tenant |
@@ -60,7 +61,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 
 | Tier | Trigger | What runs |
 |------|---------|-----------|
-| PR gate | `pull_request` to `main` (local-e2e) | api, cli, object-store, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback + node fs), fuse-patch-storage-class, git-ops, git-workspace-ondemand, portable pack/unpack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget |
+| PR gate | `pull_request` to `main` (local-e2e) | api, cli, object-store, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback + node fs), durable Drive9 overlay-rootfs probe, fuse-patch-storage-class, git-ops, git-workspace-ondemand, portable pack/unpack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget |
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, sqlite 1000-commit WAL FULL sequence, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | Local E2E `workflow_dispatch` with `run_all_e2e=1` | Everything above |
