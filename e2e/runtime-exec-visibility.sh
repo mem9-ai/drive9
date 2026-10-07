@@ -120,32 +120,51 @@ printf '%s' "$INBOUND_PAYLOAD" | curl -fsS --max-time 20 -X PUT \
 
 if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
   --workspace "$ROOT" --timeout 30s --env "INBOUND_PAYLOAD=${INBOUND_PAYLOAD}" --env "OUTBOUND_PAYLOAD=${OUTBOUND_PAYLOAD}" -- \
-  /bin/sh -c 'set -eux
-    test "$(stat -c %u:%g /bin/sh)" = 0:0
-    test "$(cat /etc/api-inbound.txt)" = "$INBOUND_PAYLOAD"
-    test "$(cat /root/persist.txt)" = root-state
-    test "$(cat /home/agent/persist.txt)" = home-state
-    test "$(cat /etc/drive9.conf)" = etc-state
-    test "$(cat /workspace/persist.txt)" = workspace-state
-    test "$(cat /workspace/rename-to.txt)" = rename-state
-    test ! -e /workspace/rename-from.txt
-    test ! -e /workspace/deleted.txt
-    test ! -e /etc/drive9-lower-delete
-    test "$(cat /etc/drive9-lower-renamed)" = rename-lower-state
-    test "$(stat -c %u:%g /etc/drive9-lower-renamed)" = 0:0
-    test "$(stat -c %u:%g /etc/drive9.conf)" = 65532:65532
-    test "$(stat -c %a /etc/drive9.conf)" = 640
-    test "$(readlink /root/config-link)" = ../etc/drive9.conf
-    test "$(stat -c %i /workspace/persist.txt)" = "$(stat -c %i /workspace/persist-hardlink.txt)"
-    test ! -e /tmp/not-persistent
-    test ! -e /run/not-persistent
+  /bin/sh -c 'set -eu
+    fail_check() {
+      printf "rootfs assertion failed: %s expected=%s actual=%s\n" "$1" "$2" "$3" >&2
+      exit 1
+    }
+    expect_file() {
+      actual="$(cat "$2")" || fail_check "$1:$2" "$3" "<read-error>"
+      [ "$actual" = "$3" ] || fail_check "$1:$2" "$3" "$actual"
+    }
+    expect_stat() {
+      actual="$(stat -c "$2" "$3")" || fail_check "$1:$3" "$4" "<stat-error>"
+      [ "$actual" = "$4" ] || fail_check "$1:$3" "$4" "$actual"
+    }
+    expect_absent() {
+      [ ! -e "$2" ] || fail_check "$1:$2" "absent" "present"
+    }
+    expect_stat lower-owner %u:%g /bin/sh 0:0
+    expect_file api-inbound /etc/api-inbound.txt "$INBOUND_PAYLOAD"
+    expect_file root-persist /root/persist.txt root-state
+    expect_file home-persist /home/agent/persist.txt home-state
+    expect_file etc-persist /etc/drive9.conf etc-state
+    expect_file workspace-persist /workspace/persist.txt workspace-state
+    expect_file rename-persist /workspace/rename-to.txt rename-state
+    expect_absent rename-source /workspace/rename-from.txt
+    expect_absent deleted-upper /workspace/deleted.txt
+    expect_absent deleted-lower /etc/drive9-lower-delete
+    expect_file renamed-lower /etc/drive9-lower-renamed rename-lower-state
+    expect_stat renamed-lower-owner %u:%g /etc/drive9-lower-renamed 0:0
+    expect_stat etc-owner %u:%g /etc/drive9.conf 65532:65532
+    expect_stat etc-mode %a /etc/drive9.conf 640
+    actual="$(readlink /root/config-link)" || fail_check "config-link:/root/config-link" "../etc/drive9.conf" "<readlink-error>"
+    [ "$actual" = ../etc/drive9.conf ] || fail_check "config-link:/root/config-link" "../etc/drive9.conf" "$actual"
+    first_inode="$(stat -c %i /workspace/persist.txt)" || fail_check "hardlink-source:/workspace/persist.txt" "readable-inode" "<stat-error>"
+    second_inode="$(stat -c %i /workspace/persist-hardlink.txt)" || fail_check "hardlink-target:/workspace/persist-hardlink.txt" "$first_inode" "<stat-error>"
+    [ "$first_inode" = "$second_inode" ] || fail_check "hardlink-inode" "$first_inode" "$second_inode"
+    expect_absent tmp-ephemeral /tmp/not-persistent
+    expect_absent run-ephemeral /run/not-persistent
     for environment in /proc/[0-9]*/environ; do
       test -r "$environment" || continue
       if tr "\000" "\n" < "$environment" | grep -Eq "^DRIVE9_(API_KEY|SERVER|VAULT_TOKEN)="; then
-        exit 1
+        fail_check "credential-leak:$environment" "no-drive9-credential" "present"
       fi
     done
-    printf "%s" "$OUTBOUND_PAYLOAD" > /workspace/outbound.txt' \
+    printf "%s" "$OUTBOUND_PAYLOAD" > /workspace/outbound.txt \
+      || fail_check "outbound-write:/workspace/outbound.txt" "$OUTBOUND_PAYLOAD" "<write-error>"' \
   >"$WORK_DIR/exec-2.stdout" 2>"$WORK_DIR/exec-2.stderr"; then
   cp "$WORK_DIR/exec-2.stderr" "$WORK_DIR/exec.stderr"
   fail "second rootfs Runtime exec failed"
