@@ -101,9 +101,9 @@ bash e2e/posix-permission-smoke-test.sh
 # Run the default smoke-all sequence once (local-e2e.yml PR set)
 bash e2e/smoke-all.sh
 
-# Cross-repository Runtime visibility proof. Select the client ref with --ref
-# and the exact server ref with the workflow input; neither head is inferred.
-gh workflow run runtime-exec-e2e.yml --ref <client-ref> -f server_ref=<server-ref>
+# Cross-repository Runtime visibility proof. It runs automatically for pull
+# requests, post-merge, and nightly; run_all_e2e also includes it on demand.
+gh workflow run local-e2e.yml --ref <client-ref> -f run_all_e2e=1
 
 # Skip FUSE-related suites (macOS / no real FUSE)
 RUN_FUSE_SMOKE=0 bash e2e/smoke-all.sh
@@ -756,11 +756,11 @@ mounted read byte-for-byte, writes a second exact payload in the process, and
 requires that payload to be immediately readable through `/v1/fs` after the
 terminal frame. It deliberately does not poll or retry the exec or final read.
 
-The script is wired to the manual/reusable `Runtime Exec E2E` workflow rather
-than ordinary PR CI because it must receive an explicit exact `tidbcloud/fs`
-`server_ref`. The checked-out client ref is selected by the workflow caller.
-This keeps cross-repository evidence bound to both exact heads and avoids
-silently testing either PR against a stale peer `main`.
+The script is wired to `Local E2E` for pull requests, post-merge, nightly, and
+manual/reusable `run_all_e2e` runs. The replacement PR is explicitly paired to
+the exact reviewed `tidbcloud/fs` head; normal runs use that repository's
+`main`. This keeps the current cross-repository evidence bound to both exact
+heads without permanently pinning future compatibility checks.
 
 ### `git-feature-smoke-test.sh`
 

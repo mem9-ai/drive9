@@ -1,6 +1,13 @@
 {
   "_comment": "Product metadata for drive9 e2e suites, keyed by the local-e2e.yml step id. Consumed by cmd/e2e-aggregate to turn raw step outcomes into a product-quality report (owner routing, failure signatures, Feishu notifications). Suites that adopt the structured summary contract (e2e/reports/summary/<suite>.json) override these defaults. Keep in sync when adding suites to .github/workflows/local-e2e.yml.",
   "suites": {
+    "runtime-exec-visibility": {
+      "title": "Runtime exec workspace visibility",
+      "product_area": "runtime",
+      "product_promise": "one-shot exec and FS API observe the same durable workspace bytes",
+      "owner_hint": "runtime",
+      "failure_class": "correctness"
+    },
     "api-smoke": {
       "title": "API smoke",
       "product_area": "api",

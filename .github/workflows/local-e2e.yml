@@ -741,3 +741,84 @@ jobs:
             gh issue create --repo "$REPO" --label ci-e2e-failure \
               --title "$title" --body-file "$body_file"
           fi
+
+  runtime-exec-e2e:
+    name: Runtime exec visibility
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
+      ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
+      inputs.run_all_e2e == '1')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout drive9 client
+        uses: actions/checkout@v4
+
+      - name: Checkout drive9 server
+        uses: actions/checkout@v4
+        with:
+          repository: tidbcloud/fs
+          # This replacement PR proves compatibility with its exact paired
+          # server head. Once merged, normal runs follow the server main branch.
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref == 'dat9-dev2/thin-exec-client' && '48ed3f69a2a19b98f40ca0e85655375a35951973' || 'main' }}
+          path: runtime-server
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-mysql-client fuse3 jq
+          grep -qxF user_allow_other /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf
+
+      - name: Build exact client and server heads
+        run: |
+          make build-cli
+          make -C runtime-server build-server
+
+      - name: Resolve the digest-pinned test image
+        run: |
+          set -euo pipefail
+          docker pull busybox:1.36.1
+          image="$(docker image inspect busybox:1.36.1 --format '{{index .RepoDigests 0}}')"
+          case "$image" in
+            *@sha256:????????????????????????????????????????????????????????????????) ;;
+            *) echo "resolved image is not digest-pinned" >&2; exit 1 ;;
+          esac
+          profiles="$(jq -cn --arg image "$image" '[{
+            id:"docker-baseline", profile:"baseline", baseline:true, image:$image,
+            cpu_millis:500, memory_mb:128, pids:64, network:"none",
+            max_timeout_ms:60000, max_output_bytes:1048576
+          }]')"
+          echo "DRIVE9_RUNTIME_DOCKER_PROFILES_JSON=$profiles" >> "$GITHUB_ENV"
+
+      - name: Run bidirectional Runtime workspace visibility proof
+        id: runtime-exec-visibility
+        env:
+          DRIVE9_RUNTIME_ENABLED: "true"
+          DRIVE9_RUNTIME_MOUNT_BINARY: ${{ github.workspace }}/bin/drive9
+          DRIVE9_RUNTIME_MOUNT_BASE_DIR: /tmp/drive9-runtime-mounts
+          DRIVE9_RUNTIME_DRAIN_TIMEOUT: 30s
+          DRIVE9_RUNTIME_JEV_MODE: "off"
+          DRIVE9_S3_BACKEND: mock
+          DRIVE9_SERVER_BIN: ${{ github.workspace }}/runtime-server/bin/drive9-server
+          DRIVE9_CLI_BIN: ${{ github.workspace }}/bin/drive9
+          DRIVE9_LOCAL_E2E_SMOKE_SCRIPT: e2e/runtime-exec-visibility.sh
+        run: bash scripts/e2e-local.sh --no-build
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-exec-e2e-failure
+          path: |
+            /tmp/drive9-e2e-local-*/server.log
+            /tmp/drive9-runtime-mounts
+          if-no-files-found: ignore
+          retention-days: 7
