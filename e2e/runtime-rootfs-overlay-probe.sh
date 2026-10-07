@@ -10,7 +10,7 @@ BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 CLI_BIN="${DRIVE9_CLI_BIN:-./bin/drive9}"
 API_KEY="${DRIVE9_API_KEY:-}"
 FUSE_READY_TIMEOUT_S="${FUSE_READY_TIMEOUT_S:-30}"
-ROOTFS_IMAGE="${ROOTFS_PROBE_IMAGE:-busybox:1.36.1}"
+ROOTFS_IMAGE="${ROOTFS_PROBE_IMAGE:-debian:bookworm-slim}"
 ROOTFS_DRIVER="${ROOTFS_OVERLAY_DRIVER:-fuse-overlayfs}"
 RUN_ID="$(date +%s)-$$"
 REMOTE_ROOT="/runtime-rootfs-probe-${RUN_ID}"
@@ -118,7 +118,7 @@ mount_drive9() {
   : >"$MOUNT_LOG"
   run_cli mount --mode=fuse --foreground --no-supervise \
     --allow-other \
-    --profile=none --durability=write-sync --flush-debounce=0 \
+    --profile=extent --durability=write-sync --flush-debounce=0 \
     ":$REMOTE_ROOT" "$FUSE_ROOT" >>"$MOUNT_LOG" 2>&1 &
   FUSE_PID=$!
   wait_for_mount
@@ -171,7 +171,7 @@ mount_overlay() {
 if [ "$(uname -s)" != Linux ]; then
   fail "probe requires Linux"
 fi
-for command in curl docker jq mount mountpoint python3 sudo tar umount; do
+for command in curl docker file jq mount mountpoint python3 sudo tar umount; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
 done
 if [ "$ROOTFS_DRIVER" = fuse-overlayfs ]; then
@@ -203,6 +203,8 @@ docker pull "$ROOTFS_IMAGE" >/dev/null
 container_id="$(docker create "$ROOTFS_IMAGE")"
 docker export "$container_id" | tar -C "$LOWER" -xf -
 docker rm "$container_id" >/dev/null
+file -Lb "$LOWER/bin/sh" | grep -q 'dynamically linked' \
+  || fail "probe lower /bin/sh is not dynamically linked"
 
 # Deterministic lower-only entries exercise copy-up, whiteout, opaque-dir, and
 # rename behavior independently of the chosen base image contents.
