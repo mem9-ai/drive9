@@ -228,6 +228,7 @@ sudo rm -rf "$MERGED/etc/opaque"
 sudo mkdir "$MERGED/etc/opaque"
 sudo sh -c "printf upper-child >'$MERGED/etc/opaque/upper-child'"
 sudo chmod 0640 "$MERGED/etc/drive9.conf"
+sudo chown 1234:2345 "$MERGED/workspace/persist.txt"
 sudo ln -s ../etc/drive9.conf "$MERGED/root/config-link"
 sudo ln "$MERGED/workspace/persist.txt" "$MERGED/workspace/persist-hardlink.txt"
 sudo touch -t 202001020304.05 "$MERGED/etc/drive9.conf"
@@ -242,12 +243,14 @@ sudo sh -c "printf transient-run >'$MERGED/run/not-persistent'"
 sync
 
 unmount_overlay || fail "$ROOTFS_DRIVER did not stop cleanly"
+unmount_overlay || fail "$ROOTFS_DRIVER teardown was not idempotent"
 if [ -n "$FIRST_OVERLAY_PID" ] && kill -0 "$FIRST_OVERLAY_PID" 2>/dev/null; then
   fail "first fuse-overlayfs process is still alive after unmount"
 fi
-run_cli fs drain-file-system --mount-path "$FUSE_ROOT" --timeout 30s >/dev/null \
+run_cli mount drain --timeout 30s "$FUSE_ROOT" >/dev/null \
   || fail "Drive9 drain failed after rootfs mutation"
 unmount_drive9 || fail "first Drive9 FUSE mount did not stop cleanly"
+unmount_drive9 || fail "Drive9 FUSE teardown was not idempotent"
 if kill -0 "$FIRST_FUSE_PID" 2>/dev/null; then
   fail "first Drive9 FUSE process is still alive after unmount"
 fi
@@ -279,6 +282,7 @@ sudo chroot "$MERGED" /bin/sh -c 'test -x /bin/sh && printf lower-image-ok' \
 [ ! -e "$MERGED/etc/opaque/lower-child" ] || fail "opaque-directory marker did not persist"
 [ "$(sudo cat "$MERGED/etc/opaque/upper-child")" = upper-child ] || fail "opaque-directory upper child did not persist"
 [ "$(stat -c '%a' "$MERGED/etc/drive9.conf")" = 640 ] || fail "chmod did not persist"
+[ "$(stat -c '%u:%g' "$MERGED/workspace/persist.txt")" = 1234:2345 ] || fail "chown uid/gid did not persist"
 [ "$(readlink "$MERGED/root/config-link")" = ../etc/drive9.conf ] || fail "symlink did not persist"
 [ "$(stat -c '%i' "$MERGED/workspace/persist.txt")" = "$(stat -c '%i' "$MERGED/workspace/persist-hardlink.txt")" ] \
   || fail "hardlink identity did not persist"
