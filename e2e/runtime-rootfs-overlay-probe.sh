@@ -121,6 +121,7 @@ wait_for_mount() {
 mount_drive9() {
   : >"$MOUNT_LOG"
   run_cli mount --mode=fuse --foreground --no-supervise \
+    --allow-other \
     --profile=none --durability=write-sync --flush-debounce=0 \
     ":$REMOTE_ROOT" "$FUSE_ROOT" >>"$MOUNT_LOG" 2>&1 &
   FUSE_PID=$!
@@ -140,7 +141,7 @@ mount_overlay() {
     fuse-overlayfs)
       : >"$OVERLAY_LOG"
       FUSE_OVERLAYFS_DISABLE_OVL_WHITEOUT=1 fuse-overlayfs -f \
-        -o "lowerdir=$LOWER,upperdir=$FUSE_ROOT/upper,workdir=$FUSE_ROOT/work" \
+        -o "allow_other,lowerdir=$LOWER,upperdir=$FUSE_ROOT/upper,workdir=$FUSE_ROOT/work" \
         "$MERGED" >>"$OVERLAY_LOG" 2>&1 &
       OVERLAY_PID=$!
       local deadline=$((SECONDS + FUSE_READY_TIMEOUT_S))
@@ -161,9 +162,13 @@ mount_overlay() {
       ;;
   esac
   OVERLAY_MOUNTED=1
-  sudo mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs "$MERGED/tmp"
+  if ! sudo mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs "$MERGED/tmp"; then
+    fail "failed to mount ephemeral /tmp inside the merged root"
+  fi
   TMP_MOUNTED=1
-  sudo mount -t tmpfs -o mode=755,nosuid,nodev tmpfs "$MERGED/run"
+  if ! sudo mount -t tmpfs -o mode=755,nosuid,nodev tmpfs "$MERGED/run"; then
+    fail "failed to mount ephemeral /run inside the merged root"
+  fi
   RUN_MOUNTED=1
 }
 

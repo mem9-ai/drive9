@@ -223,6 +223,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y default-mysql-client fuse3 fuse-overlayfs jq
+          if ! grep -qxF user_allow_other /etc/fuse.conf; then
+            echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null
+          fi
 
       - name: Cache TiUP artifacts
         uses: actions/cache@v4
