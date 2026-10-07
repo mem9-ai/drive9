@@ -124,6 +124,12 @@ func TestReviewFixResetCommittedHandles(t *testing.T) {
 
 func TestReviewFixQueuedTruncateSurvivesAliasUnlink(t *testing.T) {
 	fs, ino, a, b, remote := newHardlinkFS(t)
+	fs.inodes.SetIdentity(ino, "review-inode", 2)
+	fs.inodes.UpdateRevision(ino, 1)
+	entry, _ := fs.inodes.GetEntry(ino)
+	if entry.Nlink != 2 || len(entry.Paths) != 2 {
+		t.Fatal("both hardlinks required")
+	}
 	interceptFtruncateHTTP(t, fs, func(w http.ResponseWriter, r *http.Request) bool {
 		if r.Method == http.MethodDelete {
 			w.WriteHeader(http.StatusNoContent)
@@ -357,4 +363,199 @@ func TestReviewFixCallbackRetiresInactiveStreamer(t *testing.T) {
 	if remote() != "Hello" {
 		t.Fatal(remote())
 	}
+}
+
+func TestRebaseClosedQueuedAliasSafety(t *testing.T) {
+	for _, mode := range []string{"wrong-identity", "late-reader", "failed-delete"} {
+		t.Run(mode, func(t *testing.T) {
+			fs, ino, a, b, remote := newHardlinkFS(t)
+			fs.inodes.SetIdentity(ino, "review-inode", 2)
+			fs.inodes.UpdateRevision(ino, 1)
+			var deletes atomic.Int32
+			var rejectDelete atomic.Bool
+			rejectDelete.Store(mode == "failed-delete")
+			interceptFtruncateHTTP(t, fs, func(w http.ResponseWriter, r *http.Request) bool {
+				if r.Method == http.MethodDelete {
+					deletes.Add(1)
+					if rejectDelete.Load() {
+						w.WriteHeader(http.StatusForbidden)
+						return true
+					}
+					w.WriteHeader(http.StatusNoContent)
+					return true
+				}
+				return false
+			})
+			fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: b})
+			reviewFtruncate(t, fs, ino, a, 5)
+			gate := make(chan struct{})
+			var once sync.Once
+			resume := func() { once.Do(func() { close(gate) }) }
+			defer resume()
+			originalLock := fs.commitQueue.PathLock
+			fs.commitQueue.PathLock = func(p string) func() { <-gate; return originalLock(p) }
+			fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: a})
+			var opened gofuse.OpenOut
+			switch mode {
+			case "wrong-identity":
+				fs.inodes.SetIdentity(ino, "different-resource", 2)
+			case "late-reader":
+				testHookBeforeUnlinkSurvivorBind = func(old string) {
+					if old != "/alias.bin" || opened.Fh != 0 {
+						return
+					}
+					if st := fs.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: ino}, Flags: uint32(syscall.O_RDONLY)}, &opened); st != gofuse.OK {
+						t.Fatalf("late reader Open=%v", st)
+					}
+				}
+				defer func() { testHookBeforeUnlinkSurvivorBind = nil }()
+			}
+			st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "alias.bin")
+			wantStatus, wantDeletes := gofuse.EIO, int32(0)
+			if mode == "failed-delete" {
+				wantStatus, wantDeletes = gofuse.EACCES, 1
+			}
+			if st != wantStatus || deletes.Load() != wantDeletes || !fs.commitQueue.HasPath("/file.bin") {
+				t.Fatalf("unsafe unlink=%v deletes=%d queued=%t", st, deletes.Load(), fs.commitQueue.HasPath("/file.bin"))
+			}
+			if linked, ok := fs.inodes.GetInode("/alias.bin"); !ok || linked != ino {
+				t.Fatal("rejection removed alias")
+			}
+			if linked, ok := fs.inodes.GetInode("/file.bin"); !ok || linked != ino {
+				t.Fatal("rejection removed survivor")
+			}
+			if mode == "late-reader" && opened.Fh == 0 {
+				t.Fatal("late registration boundary not exercised")
+			}
+			fs.inodes.SetIdentity(ino, "review-inode", 2)
+			rejectDelete.Store(false)
+			resume()
+			fs.commitQueue.WaitPath("/file.bin")
+			if remote() != "hello" {
+				t.Fatal("rejection lost accepted truncate")
+			}
+			if retry := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "alias.bin"); retry != gofuse.OK {
+				t.Fatalf("normal commit then retry=%v", retry)
+			}
+			if opened.Fh != 0 {
+				readHardlinkWant(t, fs, ino, opened.Fh, "hello")
+				fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: opened.Fh})
+			}
+		})
+	}
+}
+
+func TestRebaseClosedQueuedAdditionalAlias(t *testing.T) {
+	fs, ino, a, b, remote := newHardlinkFS(t)
+	if !fs.inodes.AddAlias(ino, "/aaa.bin", "review-inode", 3, false, 11, time.Now()) {
+		t.Fatal("third alias")
+	}
+	fs.inodes.UpdateRevision(ino, 1)
+	entry, _ := fs.inodes.GetEntry(ino)
+	if entry.Nlink != 3 || len(entry.Paths) != 3 {
+		t.Fatal("three hardlinks required")
+	}
+	interceptFtruncateHTTP(t, fs, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return true
+		}
+		return false
+	})
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: b})
+	reviewFtruncate(t, fs, ino, a, 5)
+	gate := make(chan struct{})
+	var once sync.Once
+	resume := func() { once.Do(func() { close(gate) }) }
+	defer resume()
+	oldLock := fs.commitQueue.PathLock
+	fs.commitQueue.PathLock = func(p string) func() { <-gate; return oldLock(p) }
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: a})
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "alias.bin"); st != gofuse.OK || !fs.commitQueue.HasPath("/file.bin") {
+		t.Fatalf("three-alias pending unlink=%v queued=%t", st, fs.commitQueue.HasPath("/file.bin"))
+	}
+	if _, linked := fs.inodes.GetInode("/alias.bin"); linked {
+		t.Fatal("successful unlink retained removed name")
+	}
+	for _, path := range []string{"/aaa.bin", "/file.bin"} {
+		if linked, ok := fs.inodes.GetInode(path); !ok || linked != ino {
+			t.Fatalf("successful unlink lost surviving alias %s", path)
+		}
+	}
+	resume()
+	fs.commitQueue.WaitPath("/file.bin")
+	if remote() != "hello" {
+		t.Fatal("three-alias unlink lost queued truncate")
+	}
+}
+
+func TestRebaseClosedQueuedCapturedOpen(t *testing.T) {
+	fs, ino, a, b, remote := newHardlinkFS(t)
+	fs.inodes.SetIdentity(ino, "review-inode", 2)
+	fs.inodes.UpdateRevision(ino, 1)
+	interceptFtruncateHTTP(t, fs, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return true
+		}
+		return false
+	})
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: b})
+	reviewFtruncate(t, fs, ino, a, 5)
+	gate := make(chan struct{})
+	var queueOnce sync.Once
+	resumeQueue := func() { queueOnce.Do(func() { close(gate) }) }
+	defer resumeQueue()
+	oldLock := fs.commitQueue.PathLock
+	fs.commitQueue.PathLock = func(p string) func() { <-gate; return oldLock(p) }
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: a})
+	captured, resume, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var openOnce sync.Once
+	resumeOpen := func() { openOnce.Do(func() { close(resume) }) }
+	defer resumeOpen()
+	testHookBeforeSurvivorOpenRegister = func(fh *FileHandle) {
+		if fh.Path == "/alias.bin" {
+			close(captured)
+			<-resume
+		}
+	}
+	defer func() { testHookBeforeSurvivorOpenRegister = nil }()
+	var opened gofuse.OpenOut
+	var openStatus gofuse.Status
+	go func() {
+		openStatus = fs.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: ino}, Flags: uint32(syscall.O_RDONLY)}, &opened)
+		close(done)
+	}()
+	select {
+	case <-captured:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Open did not capture deleted preferred alias")
+	}
+	if len(fs.openHandles.SnapshotInode(ino)) != 0 {
+		t.Fatal("captured Open must not be registered yet")
+	}
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "alias.bin"); st != gofuse.OK || !fs.commitQueue.HasPath("/file.bin") {
+		t.Fatalf("pending unlink=%v queued=%t", st, fs.commitQueue.HasPath("/file.bin"))
+	}
+	resumeOpen()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("captured Open did not finish")
+	}
+	if openStatus != gofuse.OK {
+		t.Fatalf("captured Open=%v", openStatus)
+	}
+	fh, ok := fs.fileHandles.Get(opened.Fh)
+	if !ok || fh.Path != "/file.bin" || fh.Unlinked {
+		t.Fatal("captured Open did not bind survivor")
+	}
+	readHardlinkWant(t, fs, ino, opened.Fh, "hello")
+	resumeQueue()
+	fs.commitQueue.WaitPath("/file.bin")
+	if remote() != "hello" {
+		t.Fatal("captured Open case lost queued truncate")
+	}
+	readHardlinkWant(t, fs, ino, opened.Fh, "hello")
+	fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: opened.Fh})
 }
