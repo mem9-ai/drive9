@@ -9,6 +9,11 @@ import (
 )
 
 func mountFuseImpl(opts *mountFuseOptions) error {
+	if opts.OmitProcessStateCredentials {
+		if err := hardenMountCredentialProcess(); err != nil {
+			return fmt.Errorf("protect non-persistent mount credential: %w", err)
+		}
+	}
 	mode, err := toDrive9FuseSyncMode(opts.SyncMode)
 	if err != nil {
 		return err

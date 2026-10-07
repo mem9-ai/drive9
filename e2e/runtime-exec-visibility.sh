@@ -12,8 +12,8 @@ POLL_INTERVAL_S="${POLL_INTERVAL_S:-2}"
 RUN_ID="$(date +%s)-$$"
 ROOT_REL="runtime-visibility-${RUN_ID}"
 ROOT="/${ROOT_REL}"
-INBOUND_PATH="${ROOT_REL}/inbound.txt"
-OUTBOUND_PATH="${ROOT_REL}/outbound.txt"
+INBOUND_PATH="${ROOT_REL}/upper/etc/api-inbound.txt"
+OUTBOUND_PATH="${ROOT_REL}/upper/workspace/outbound.txt"
 INBOUND_PAYLOAD="api-to-exec-${RUN_ID}"
 OUTBOUND_PAYLOAD="exec-to-api-${RUN_ID}"
 WORK_DIR="$(mktemp -d)"
@@ -63,30 +63,83 @@ done
 capabilities="$(curl -fsS --max-time 20 -H "Authorization: Bearer ${API_KEY}" \
   "${BASE}/v1/runtime/capabilities")" || fail "Runtime capabilities unavailable"
 printf '%s' "$capabilities" | jq -e \
-  '.streaming == true and .separate_stdout_stderr == true and .cancel == true and .detached == false and .replay == false' \
+  '.streaming == true and .separate_stdout_stderr == true and .cancel == true and .detached == false and .replay == false
+   and any(.providers[].candidates[]; .execution_class == "linux-full"
+     and .rootfs.capability_version == "drive9_rootfs.user_union.extent.v1"
+     and .production_eligible == true and .bounded_selection_eligible == true)' \
   >/dev/null || fail "Runtime capabilities do not match the one-shot contract"
 
 curl -fsS --max-time 20 -X POST -H "Authorization: Bearer ${API_KEY}" \
   "${BASE}/v1/fs/${ROOT_REL}?mkdir" >/dev/null \
   || fail "workspace root creation failed"
 
-# Direction 1: an acknowledged FS API write must be observed byte-for-byte by
-# the subsequently created Runtime mount and process.
+# First sandbox: execute a lower-image binary and persist changes across the
+# literal Linux root. This invocation also initializes the immutable rootfs
+# binding and Drive9 upper/work backing.
+if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
+  --workspace "$ROOT" --timeout 30s -- \
+  /bin/sh -c 'set -eu
+    test -x /bin/sh
+    printf lower-image-ok
+    printf root-state > /root/persist.txt
+    printf home-state > /home/agent/persist.txt
+    printf etc-state > /etc/drive9.conf
+    printf workspace-state > /workspace/persist.txt
+    printf rename-state > /workspace/rename-from.txt
+    mv /workspace/rename-from.txt /workspace/rename-to.txt
+    printf delete-state > /workspace/deleted.txt
+    rm /workspace/deleted.txt
+    rm /etc/drive9-lower-delete
+    mv /etc/drive9-lower-rename /etc/drive9-lower-renamed
+    chmod 0640 /etc/drive9.conf
+    ln -s ../etc/drive9.conf /root/config-link
+    ln /workspace/persist.txt /workspace/persist-hardlink.txt
+    printf transient > /tmp/not-persistent
+    printf transient > /run/not-persistent' \
+  >"$WORK_DIR/exec.stdout" 2>"$WORK_DIR/exec.stderr"; then
+  fail "first rootfs Runtime exec failed"
+fi
+
+[ "$(cat "$WORK_DIR/exec.stdout")" = lower-image-ok ] \
+  || fail "provider lower-image /bin/sh did not execute"
+
+# Direction 1: after rootfs initialization, an acknowledged FS API write into
+# the durable upper must be observed at the corresponding merged-root path by
+# a new sandbox.
 printf '%s' "$INBOUND_PAYLOAD" | curl -fsS --max-time 20 -X PUT \
   -H "Authorization: Bearer ${API_KEY}" --data-binary @- \
   "${BASE}/v1/fs/${INBOUND_PATH}" >/dev/null \
-  || fail "FS API inbound write failed"
+  || fail "FS API inbound upper write failed"
 
 if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
-  --workspace "$ROOT" --timeout 30s --env "OUTBOUND_PAYLOAD=${OUTBOUND_PAYLOAD}" -- \
-  /bin/sh -c 'set -eu; cat inbound.txt; printf "%s" "$OUTBOUND_PAYLOAD" > outbound.txt' \
-  >"$WORK_DIR/exec.stdout" 2>"$WORK_DIR/exec.stderr"; then
-  fail "one-shot Runtime exec failed"
+  --workspace "$ROOT" --timeout 30s --env "INBOUND_PAYLOAD=${INBOUND_PAYLOAD}" --env "OUTBOUND_PAYLOAD=${OUTBOUND_PAYLOAD}" -- \
+  /bin/sh -c 'set -eu
+    test "$(cat /etc/api-inbound.txt)" = "$INBOUND_PAYLOAD"
+    test "$(cat /root/persist.txt)" = root-state
+    test "$(cat /home/agent/persist.txt)" = home-state
+    test "$(cat /etc/drive9.conf)" = etc-state
+    test "$(cat /workspace/persist.txt)" = workspace-state
+    test "$(cat /workspace/rename-to.txt)" = rename-state
+    test ! -e /workspace/rename-from.txt
+    test ! -e /workspace/deleted.txt
+    test ! -e /etc/drive9-lower-delete
+    test "$(cat /etc/drive9-lower-renamed)" = rename-lower-state
+    test "$(stat -c %a /etc/drive9.conf)" = 640
+    test "$(readlink /root/config-link)" = ../etc/drive9.conf
+    test "$(stat -c %i /workspace/persist.txt)" = "$(stat -c %i /workspace/persist-hardlink.txt)"
+    test ! -e /tmp/not-persistent
+    test ! -e /run/not-persistent
+    for environment in /proc/[0-9]*/environ; do
+      test -r "$environment" || continue
+      if tr "\000" "\n" < "$environment" | grep -Eq "^DRIVE9_(API_KEY|SERVER|VAULT_TOKEN)="; then
+        exit 1
+      fi
+    done
+    printf "%s" "$OUTBOUND_PAYLOAD" > /workspace/outbound.txt' \
+  >"$WORK_DIR/exec-2.stdout" 2>"$WORK_DIR/exec-2.stderr"; then
+  cp "$WORK_DIR/exec-2.stderr" "$WORK_DIR/exec.stderr"
+  fail "second rootfs Runtime exec failed"
 fi
-
-actual_inbound="$(cat "$WORK_DIR/exec.stdout")"
-[ "$actual_inbound" = "$INBOUND_PAYLOAD" ] \
-  || fail "FS API write was not visible to the Runtime process"
 
 # Direction 2: a process write followed by the service's mandatory drain and
 # unmount must be immediately readable through the FS API. Do not poll: a
