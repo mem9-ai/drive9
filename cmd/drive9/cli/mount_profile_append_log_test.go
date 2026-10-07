@@ -146,6 +146,9 @@ func TestMountRequiredExtentXattrCapabilityFailsClosed(t *testing.T) {
 				if err != nil || *got == nil {
 					t.Fatalf("supported mount = %v, opts = %#v", err, *got)
 				}
+				if !(*got).RequireExtentXattrV1 {
+					t.Fatal("supported mount did not propagate required extent xattr mode")
+				}
 				return
 			}
 			if err == nil || !strings.Contains(err.Error(), "drive9.extent_xattr.v1") || *got != nil {

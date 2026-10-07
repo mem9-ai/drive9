@@ -733,6 +733,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			GVisorCompat:                 *gvisorCompat,
 			LegacyInterruptibleMutations: *legacyInterruptibleMutations,
 			OmitProcessStateCredentials:  *noPersistCredentials,
+			RequireExtentXattrV1:         *requireExtentXattrV1,
 		})
 	}
 
@@ -870,6 +871,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			Debug:                        *debug,
 			GVisorCompat:                 *gvisorCompat,
 			LegacyInterruptibleMutations: *legacyInterruptibleMutations,
+			RequireExtentXattrV1:         *requireExtentXattrV1,
 		})
 	}
 
@@ -944,6 +946,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		PerfMaxProfileFiles:          *perfMaxProfileFiles,
 		Supervised:                   *supervised,
 		OmitProcessStateCredentials:  *noPersistCredentials,
+		RequireExtentXattrV1:         *requireExtentXattrV1,
 	}
 
 	return mountFuse(opts)

@@ -15405,6 +15405,9 @@ func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr
 	}
 	val, found := fs.xattrs.Get(path, attr)
 	if !found {
+		val, found = fs.classicFuseOverlayStatXattr(header.NodeId, attr)
+	}
+	if !found {
 		return 0, gofuse.ENOATTR
 	}
 	if len(dest) == 0 {
@@ -15433,6 +15436,9 @@ func (fs *Dat9FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, des
 		}
 	} else {
 		names = fs.xattrs.List(path)
+		if _, ok := fs.classicFuseOverlayStatXattr(header.NodeId, fuseOverlayOverrideStatXattr); ok && !slices.Contains(names, fuseOverlayOverrideStatXattr) {
+			names = append(names, fuseOverlayOverrideStatXattr)
+		}
 	}
 	sort.Strings(names)
 	var total int

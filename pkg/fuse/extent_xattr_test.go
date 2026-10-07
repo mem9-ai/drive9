@@ -273,3 +273,137 @@ func TestClassicXattrStillUsesSessionStore(t *testing.T) {
 		t.Fatalf("classic xattr made %d extent RPCs", calls)
 	}
 }
+
+func TestRequiredExtentXattrMountSynthesizesClassicFuseOverlayStat(t *testing.T) {
+	newFS := func() (*Dat9FS, uint64) {
+		fs := &Dat9FS{
+			inodes: NewInodeToPath(),
+			xattrs: NewXAttrStore(),
+			opts:   &MountOptions{RequireExtentXattrV1: true},
+			uid:    1001,
+			gid:    1002,
+		}
+		ino := fs.inodes.Lookup("/api-inbound.txt", false, 17, time.Unix(10, 0))
+		fs.inodes.UpdateMode(ino, 0o640)
+		return fs, ino
+	}
+
+	want := "1001:1002:100640"
+	for attempt := 0; attempt < 2; attempt++ {
+		fs, ino := newFS()
+		header := gofuse.InHeader{NodeId: ino}
+		if size, status := fs.GetXAttr(nil, &header, fuseOverlayOverrideStatXattr, nil); status != gofuse.OK || size != uint32(len(want)) {
+			t.Fatalf("attempt %d size/status=%d/%v, want %d/OK", attempt, size, status, len(want))
+		}
+		if size, status := fs.GetXAttr(nil, &header, fuseOverlayOverrideStatXattr, make([]byte, len(want)-1)); status != gofuse.Status(syscall.ERANGE) || size != uint32(len(want)) {
+			t.Fatalf("attempt %d short buffer=%d/%v, want %d/ERANGE", attempt, size, status, len(want))
+		}
+		dest := make([]byte, len(want))
+		if size, status := fs.GetXAttr(nil, &header, fuseOverlayOverrideStatXattr, dest); status != gofuse.OK || size != uint32(len(want)) || string(dest) != want {
+			t.Fatalf("attempt %d value=%d/%v/%q, want %d/OK/%q", attempt, size, status, dest, len(want), want)
+		}
+		list := make([]byte, len(fuseOverlayOverrideStatXattr)+1)
+		if size, status := fs.ListXAttr(nil, &header, list); status != gofuse.OK || size != uint32(len(list)) || string(list) != fuseOverlayOverrideStatXattr+"\x00" {
+			t.Fatalf("attempt %d list=%d/%v/%q", attempt, size, status, list)
+		}
+		if _, stored := fs.xattrs.Get("/api-inbound.txt", fuseOverlayOverrideStatXattr); stored {
+			t.Fatalf("attempt %d synthesized stat xattr polluted the session store", attempt)
+		}
+	}
+}
+
+func TestRequiredExtentXattrMountReadsClassicFileAcrossFreshInstances(t *testing.T) {
+	const content = "durable-api-bytes"
+	backend, server := newCASFileServer(t, "/api-inbound.txt", 1, []byte(content))
+	defer server.Close()
+
+	for attempt := 0; attempt < 2; attempt++ {
+		fs, ino := pr939HandleFS(t, "/api-inbound.txt", content)
+		fs.client = newTestClient(server.URL)
+		fs.opts.RequireExtentXattrV1 = true
+		header := gofuse.InHeader{NodeId: ino}
+
+		if _, status := fs.GetXAttr(nil, &header, fuseOverlayOverrideStatXattr, nil); status != gofuse.OK {
+			t.Fatalf("attempt %d synthesized xattr status=%v, want OK", attempt, status)
+		}
+		var opened gofuse.OpenOut
+		if status := fs.Open(nil, &gofuse.OpenIn{InHeader: header, Flags: syscall.O_RDONLY}, &opened); status != gofuse.OK {
+			t.Fatalf("attempt %d Open status=%v, want OK", attempt, status)
+		}
+		result, status := fs.Read(nil, &gofuse.ReadIn{InHeader: header, Fh: opened.Fh, Size: uint32(len(content) + 1)}, nil)
+		if status != gofuse.OK {
+			t.Fatalf("attempt %d Read status=%v, want OK", attempt, status)
+		}
+		data, status := result.Bytes(make([]byte, len(content)+1))
+		result.Done()
+		if status != gofuse.OK || string(data) != content {
+			t.Fatalf("attempt %d Read=%q/%v, want %q/OK", attempt, data, status, content)
+		}
+		if handle, ok := fs.fileHandles.Get(opened.Fh); ok {
+			fs.deleteFileHandle(opened.Fh, handle)
+		}
+	}
+
+	if _, gets := backend.proofRequestCounts(); gets != 2 {
+		t.Fatalf("classic data GETs=%d, want 2", gets)
+	}
+}
+
+func TestRequiredExtentXattrMountDoesNotMaskClassicDataFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/fs/missing-data" {
+			http.Error(w, "missing data", http.StatusInternalServerError)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	fs, ino := pr939HandleFS(t, "/missing-data", "expected")
+	fs.client = newTestClient(server.URL)
+	fs.opts.RequireExtentXattrV1 = true
+	header := gofuse.InHeader{NodeId: ino}
+	if _, status := fs.GetXAttr(nil, &header, fuseOverlayOverrideStatXattr, nil); status != gofuse.OK {
+		t.Fatalf("synthesized xattr status=%v, want OK", status)
+	}
+	var opened gofuse.OpenOut
+	if status := fs.Open(nil, &gofuse.OpenIn{InHeader: header, Flags: syscall.O_RDONLY}, &opened); status != gofuse.OK {
+		t.Fatalf("Open status=%v, want OK", status)
+	}
+	if result, status := fs.Read(nil, &gofuse.ReadIn{InHeader: header, Fh: opened.Fh, Size: 8}, nil); status == gofuse.OK || result != nil {
+		t.Fatalf("Read result/status=%v/%v, want nil/failure", result, status)
+	}
+}
+
+func TestClassicFuseOverlayStatSynthesisIsRootfsOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts *MountOptions
+	}{
+		{name: "ordinary mount", opts: &MountOptions{}},
+		{name: "missing options", opts: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &Dat9FS{inodes: NewInodeToPath(), xattrs: NewXAttrStore(), opts: tc.opts, uid: 1001, gid: 1002}
+			ino := fs.inodes.Lookup("/classic", false, 4, time.Now())
+			header := gofuse.InHeader{NodeId: ino}
+			if _, status := fs.GetXAttr(nil, &header, fuseOverlayOverrideStatXattr, nil); status != gofuse.ENOATTR {
+				t.Fatalf("GetXAttr status=%v, want ENOATTR", status)
+			}
+			if size, status := fs.ListXAttr(nil, &header, nil); status != gofuse.OK || size != 0 {
+				t.Fatalf("ListXAttr=%d/%v, want 0/OK", size, status)
+			}
+		})
+	}
+}
+
+func TestClassicFuseOverlayStatDoesNotMaskExtentFailure(t *testing.T) {
+	fs, ino := newExtentXattrTestFS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"errno": int(syscall.EIO)})
+	}))
+	fs.opts = &MountOptions{RequireExtentXattrV1: true}
+	header := gofuse.InHeader{NodeId: ino}
+	if _, status := fs.GetXAttr(nil, &header, fuseOverlayOverrideStatXattr, nil); status != gofuse.EIO {
+		t.Fatalf("GetXAttr extent failure status=%v, want EIO", status)
+	}
+}

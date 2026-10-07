@@ -3,11 +3,14 @@ package fuse
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"runtime"
 	"syscall"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
+
+const fuseOverlayOverrideStatXattr = "user.fuseoverlayfs.override_stat"
 
 type extentXattrResponse struct {
 	Errno int      `json:"errno"`
@@ -81,4 +84,28 @@ func (fs *Dat9FS) extentRemoveXattr(ctx context.Context, ino uint64, name string
 		"name":  name,
 	})
 	return status
+}
+
+// classicFuseOverlayStatXattr returns the stat override fuse-overlayfs 1.10
+// requires when xattr_permissions=2. A file created through the ordinary
+// Drive9 API has classic content and therefore no JuiceFS inode on which the
+// durable extent xattr protocol can store this private attribute. Without a
+// value, fuse-overlayfs rejects stat/open with ENODATA before Drive9 can serve
+// the file bytes.
+//
+// This compatibility value is deliberately limited to mounts that negotiated
+// the exact extent xattr v1 contract, and to regular classic files. It is
+// recomputed from the entry's current FUSE stat on every fresh mount; it does
+// not mask an extent-xattr failure and it never changes file data or size.
+func (fs *Dat9FS) classicFuseOverlayStatXattr(nodeID uint64, name string) ([]byte, bool) {
+	if fs == nil || fs.opts == nil || !fs.opts.RequireExtentXattrV1 || name != fuseOverlayOverrideStatXattr || fs.inodes == nil {
+		return nil, false
+	}
+	entry, ok := fs.inodes.GetEntry(nodeID)
+	if !ok || entry.ExtentIno != 0 || !entryIsRegularFile(entry) {
+		return nil, false
+	}
+	var attr gofuse.Attr
+	fs.fillAttr(entry, &attr)
+	return []byte(fmt.Sprintf("%d:%d:%o", attr.Uid, attr.Gid, attr.Mode)), true
 }

@@ -122,6 +122,12 @@ type MountOptions struct {
 	// by drain and unmount. Callers using this mode cannot use credential-backed
 	// post-unmount helpers such as auto-pack.
 	OmitProcessStateCredentials bool
+	// RequireExtentXattrV1 marks a mount that has negotiated the exact durable
+	// extent xattr v1 protocol. Besides routing extent inode xattrs through that
+	// protocol, it lets the rootfs compatibility path synthesize fuse-overlayfs'
+	// stat override for a pre-existing classic file. The synthesized value is
+	// derived from the file's current FUSE stat and is never persisted.
+	RequireExtentXattrV1 bool
 	// Supervised marks this worker as managed by an external supervisor (logging only).
 	Supervised bool
 }
