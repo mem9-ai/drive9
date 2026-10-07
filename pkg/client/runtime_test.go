@@ -263,7 +263,7 @@ func TestRuntimeCapabilitiesAcceptsProviderAwareCandidates(t *testing.T) {
 			Candidates: []RuntimeCandidateCapability{{
 				Profile: "default", ExecutionClass: "linux-full",
 				RootFS: RuntimeRootFSIdentity{
-					Driver: "user-union", CapabilityVersion: "drive9_rootfs.user_union.extent.v1",
+					Driver: "user-union", CapabilityVersion: "drive9_rootfs.user_union.extent.v2",
 					ConfigHash: strings.Repeat("a", 64), LowerImageDigest: "sha256:" + strings.Repeat("b", 64),
 				},
 				ProductionEligible: true, BoundedSelectionEligible: true,

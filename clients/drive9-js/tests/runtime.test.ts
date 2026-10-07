@@ -131,7 +131,7 @@ describe("runtime exec", () => {
         execution_class: "linux-full",
         rootfs: {
           driver: "user-union",
-          capability_version: "drive9_rootfs.user_union.extent.v1",
+          capability_version: "drive9_rootfs.user_union.extent.v2",
           config_hash: "a".repeat(64),
           lower_image_digest: `sha256:${"b".repeat(64)}`,
         },

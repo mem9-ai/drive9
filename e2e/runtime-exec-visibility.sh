@@ -65,7 +65,7 @@ capabilities="$(curl -fsS --max-time 20 -H "Authorization: Bearer ${API_KEY}" \
 printf '%s' "$capabilities" | jq -e \
   '.streaming == true and .separate_stdout_stderr == true and .cancel == true and .detached == false and .replay == false
    and any(.providers[].candidates[]; .execution_class == "linux-full"
-     and .rootfs.capability_version == "drive9_rootfs.user_union.extent.v1"
+     and .rootfs.capability_version == "drive9_rootfs.user_union.extent.v2"
      and .production_eligible == true and .bounded_selection_eligible == true)' \
   >/dev/null || fail "Runtime capabilities do not match the one-shot contract"
 
@@ -80,6 +80,7 @@ if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
   --workspace "$ROOT" --timeout 30s -- \
   /bin/sh -c 'set -eu
     test -x /bin/sh
+    test "$(stat -c %u:%g /bin/sh)" = 0:0
     test "$(id -u)" = 65532
     test "$(awk '\''$1 == "CapEff:" { print $2 }'\'' /proc/self/status)" = 0000000000000002
     printf lower-image-ok
@@ -92,7 +93,10 @@ if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
     printf delete-state > /workspace/deleted.txt
     rm /workspace/deleted.txt
     rm /etc/drive9-lower-delete
+    if chmod 0600 /etc/drive9-lower-rename 2>/dev/null; then exit 1; fi
     mv /etc/drive9-lower-rename /etc/drive9-lower-renamed
+    test "$(stat -c %u:%g /etc/drive9-lower-renamed)" = 0:0
+    test "$(stat -c %u:%g /etc/drive9.conf)" = 65532:65532
     chmod 0640 /etc/drive9.conf
     ln -s ../etc/drive9.conf /root/config-link
     ln /workspace/persist.txt /workspace/persist-hardlink.txt
@@ -116,6 +120,7 @@ printf '%s' "$INBOUND_PAYLOAD" | curl -fsS --max-time 20 -X PUT \
 if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
   --workspace "$ROOT" --timeout 30s --env "INBOUND_PAYLOAD=${INBOUND_PAYLOAD}" --env "OUTBOUND_PAYLOAD=${OUTBOUND_PAYLOAD}" -- \
   /bin/sh -c 'set -eu
+    test "$(stat -c %u:%g /bin/sh)" = 0:0
     test "$(cat /etc/api-inbound.txt)" = "$INBOUND_PAYLOAD"
     test "$(cat /root/persist.txt)" = root-state
     test "$(cat /home/agent/persist.txt)" = home-state
@@ -126,6 +131,8 @@ if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
     test ! -e /workspace/deleted.txt
     test ! -e /etc/drive9-lower-delete
     test "$(cat /etc/drive9-lower-renamed)" = rename-lower-state
+    test "$(stat -c %u:%g /etc/drive9-lower-renamed)" = 0:0
+    test "$(stat -c %u:%g /etc/drive9.conf)" = 65532:65532
     test "$(stat -c %a /etc/drive9.conf)" = 640
     test "$(readlink /root/config-link)" = ../etc/drive9.conf
     test "$(stat -c %i /workspace/persist.txt)" = "$(stat -c %i /workspace/persist-hardlink.txt)"
