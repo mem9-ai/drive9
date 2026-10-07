@@ -7483,8 +7483,8 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 	if stat.HasMode {
 		fs.inodes.UpdateMode(ino, stat.Mode)
 	}
-	if stat.ContentLayout == client.ContentLayoutExtent && stat.ExtentIno != 0 {
-		fs.inodes.SetExtentIno(ino, stat.ExtentIno)
+	if extentIno, ok := projectedExtentIno(stat); ok {
+		fs.inodes.SetExtentIno(ino, extentIno)
 	}
 	// Refresh from the JuiceFS side only when the projection says this file
 	// lives on the extent data plane. Matching the profile glob is not enough:

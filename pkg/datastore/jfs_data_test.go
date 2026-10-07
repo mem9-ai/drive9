@@ -1386,6 +1386,11 @@ func TestExtentDirRenameSubtreeProjection(t *testing.T) {
 	if _, errno, err := s.RunExtentMetaOp(ctx, "mknod", mkdir, nil); err != nil || errno != 0 {
 		t.Fatalf("mkdir errno=%d err=%v", errno, err)
 	}
+	if got := runXattrMetaOp(t, s, "set_xattr", map[string]any{
+		"inode": 10, "name": "user.directory", "value": []byte("durable"), "flags": 0,
+	}); got.Errno != 0 {
+		t.Fatalf("set directory xattr errno=%d", got.Errno)
+	}
 	create, _ := json.Marshal(map[string]any{
 		"parent": 10, "name": "a.db", "type": 1, "mode": 0644,
 		"inode": 11, "proj_path": "/d/a.db",
@@ -1396,6 +1401,11 @@ func TestExtentDirRenameSubtreeProjection(t *testing.T) {
 	}
 	if _, err := s.RenameDir(ctx, "/d/", "/e/"); err != nil {
 		t.Fatal(err)
+	}
+	if got := runXattrMetaOp(t, s, "get_xattr", map[string]any{
+		"inode": 10, "name": "user.directory",
+	}); got.Errno != 0 || string(got.Value) != "durable" {
+		t.Fatalf("classic directory rename xattr = errno %d value %q", got.Errno, got.Value)
 	}
 	// P0-3: the server-side directory rename moves the jfs edge in the same
 	// transaction, so the old name must be gone before any FUSE-side step.

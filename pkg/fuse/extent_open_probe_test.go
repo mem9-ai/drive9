@@ -2,9 +2,12 @@ package fuse
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // P1-4: the profile glob decides where new files are created, never which data
@@ -43,6 +46,56 @@ func TestExtentOpenInoFollowsLayoutNotGlob(t *testing.T) {
 			ino, ok := fs.extentOpenIno(context.Background(), 7, "/orphan.db")
 			if ok != tc.wantOK || ino != tc.want {
 				t.Fatalf("extentOpenIno = (%d, %v), want (%d, %v)", ino, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestExtentStatInoRestoresMirroredDirectoryWithoutFileLayout(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		isDir  bool
+		wantOK bool
+	}{
+		{name: "mirrored directory", isDir: true, wantOK: true},
+		{name: "ordinary file", isDir: false, wantOK: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("X-Dat9-IsDir", fmt.Sprintf("%t", test.isDir))
+				writer.Header().Set("X-Dat9-Extent-Ino", "42")
+				writer.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+			fs := &Dat9FS{client: newTestClient(server.URL)}
+			ino, ok := fs.extentStatIno(t.Context(), "/directory")
+			wantIno := uint64(0)
+			if test.wantOK {
+				wantIno = 42
+			}
+			if ok != test.wantOK || ino != wantIno {
+				t.Fatalf("extentStatIno = (%d, %t), want (%d, %t)", ino, ok, wantIno, test.wantOK)
+			}
+		})
+	}
+}
+
+func TestProjectedExtentInoSeparatesDirectoriesFromOrdinaryFiles(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		stat   *client.StatResult
+		want   uint64
+		wantOK bool
+	}{
+		{name: "missing"},
+		{name: "directory mirror", stat: &client.StatResult{IsDir: true, ExtentIno: 41}, want: 41, wantOK: true},
+		{name: "extent file", stat: &client.StatResult{ContentLayout: client.ContentLayoutExtent, ExtentIno: 42}, want: 42, wantOK: true},
+		{name: "ordinary file with stale inode", stat: &client.StatResult{ContentLayout: client.ContentLayoutSingle, ExtentIno: 43}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := projectedExtentIno(test.stat)
+			if got != test.want || ok != test.wantOK {
+				t.Fatalf("projectedExtentIno = (%d, %t), want (%d, %t)", got, ok, test.want, test.wantOK)
 			}
 		})
 	}

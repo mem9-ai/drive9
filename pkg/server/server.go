@@ -3460,9 +3460,11 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	// extra query to learn that an ordinary file is not an extent file.
 	if nf.ContentLayout != "" {
 		w.Header().Set("X-Dat9-Content-Layout", string(nf.ContentLayout))
-		if nf.ExtentIno != 0 {
-			w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(nf.ExtentIno, 10))
-		}
+	}
+	// A mirrored directory has no file content layout, but its extent inode is
+	// still the durable identity for namespace operations and inode xattrs.
+	if nf.ExtentIno != 0 {
+		w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(nf.ExtentIno, 10))
 	}
 	if nf.File != nil {
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(nf.File.Revision, 10))
