@@ -135,7 +135,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			// ShadowSpill: stage shadow + journal, no writeBack snapshot.
 			phase = "interactive-shadowspill-stage"
 			stageStart := time.Now()
-			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			err := fs.stageShadowForQueuedCommitLocked(ctx, fh, true)
 			if errors.Is(err, syscall.EAGAIN) {
 				return gofuse.EAGAIN
 			}
@@ -175,7 +175,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		} else {
 			phase = "interactive-stage"
 			stageStart := time.Now()
-			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			err := fs.stageShadowForQueuedCommitLocked(ctx, fh, true)
 			if errors.Is(err, syscall.EAGAIN) {
 				return gofuse.EAGAIN
 			}

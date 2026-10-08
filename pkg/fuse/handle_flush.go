@@ -154,7 +154,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					phase = "small-stage-shadow"
 					stageStart := time.Now()
 					fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
-					err := fs.stageShadowForQueuedCommitLocked(fh, fs.stageDurableAtClose())
+					err := fs.stageShadowForQueuedCommitLocked(ctx, fh, fs.stageDurableAtClose())
 					if errors.Is(err, syscall.EAGAIN) {
 						return gofuse.EAGAIN
 					}
@@ -238,7 +238,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			size := fh.Dirty.Size()
 			stageStart := time.Now()
 			fs.debugf("flush shadowspill stage start path=%s size=%d durable=true", fh.Path, size)
-			err := fs.stageShadowForQueuedCommitLocked(fh, fs.stageDurableAtClose())
+			err := fs.stageShadowForQueuedCommitLocked(ctx, fh, fs.stageDurableAtClose())
 			if errors.Is(err, syscall.EAGAIN) {
 				return gofuse.EAGAIN
 			}
@@ -407,7 +407,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				size := fh.Dirty.Size()
 				stageStart := time.Now()
 				fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
-				err := fs.stageShadowForQueuedCommitLocked(fh, fs.stageDurableAtClose())
+				err := fs.stageShadowForQueuedCommitLocked(ctx, fh, fs.stageDurableAtClose())
 				if errors.Is(err, syscall.EAGAIN) {
 					return gofuse.EAGAIN
 				}

@@ -253,7 +253,7 @@ func TestGVisorCompatStageAfterCommitFenceDiscardsSupersededHandle(t *testing.T)
 	go func() {
 		stale.Lock()
 		close(staleLocked)
-		err := fs.stageShadowForQueuedCommitLocked(stale, true)
+		err := fs.stageShadowForQueuedCommitLocked(context.Background(), stale, true)
 		stale.Unlock()
 		stageDone <- err
 	}()

@@ -3529,7 +3529,7 @@ func clearStagedSnapshotLineageLocked(fh *FileHandle) {
 	fh.StagedLineageTrusted = false
 }
 
-func (fs *Dat9FS) stageShadowForQueuedCommitLocked(fh *FileHandle, durable bool) error {
+func (fs *Dat9FS) stageShadowForQueuedCommitLocked(ctx context.Context, fh *FileHandle, durable bool) error {
 	acquired := fh != nil && fh.RemoteCommitUnlock == nil
 	if fh != nil {
 		_ = fs.lockHandleRemoteCommitPathLocked(fh)
@@ -3541,6 +3541,22 @@ func (fs *Dat9FS) stageShadowForQueuedCommitLocked(fh *FileHandle, durable bool)
 			fs.removeHandleOwnedStagingLocked(fh)
 			fs.releaseHandleRemoteCommitPathLocked(fh)
 			return nil
+		}
+		// An older append fsync must not publish its ancestor over the
+		// verified descendant. Pending mode changes still need staging.
+		if !fh.Unlinked && !fh.HasPendingMode && (fh.appendSnapshot || fh.Flags&uint32(syscall.O_APPEND) != 0) {
+			before := fh.Dirty
+			if err := fs.adoptLandedAppendSnapshotLocked(ctx, fh); err != nil {
+				if acquired {
+					fs.releaseHandleRemoteCommitPathLocked(fh)
+				}
+				// Callers must not fall back to publishing the old image.
+				return errors.Join(syscall.EAGAIN, err)
+			}
+			if fh.Dirty != before {
+				fs.releaseHandleRemoteCommitPathLocked(fh)
+				return nil
+			}
 		}
 	}
 	err := fs.stageShadowLocked(fh, durable)
@@ -3860,6 +3876,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 		zeroBase          bool
 		storageClass      client.StorageType
 		shadowSource      bool
+		shadowSpill       bool
 		canMemory         bool
 		writeBackGen      uint64
 		pendingIndexGen   uint64
@@ -3911,6 +3928,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 			zeroBase:          src.ZeroBase,
 			storageClass:      src.StorageClass,
 			shadowSource:      fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill),
+			shadowSpill:       src.ShadowSpill,
 			canMemory:         src.Dirty.CanMaterializeFull(),
 			writeBackGen:      src.WriteBackGen,
 			pendingIndexGen:   src.PendingIndexGen,
@@ -3943,7 +3961,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 
 		// Shadow-backed handles are authoritative in the shadow store. Their
 		// dirty buffer may have evicted parts and would materialize zeros.
-		if !haveData && c.shadowSource && (!tryLock || !c.canMemory) {
+		if !haveData && c.shadowSource && (!tryLock || !c.canMemory) && (!tryLock || !c.shadowSpill) {
 			var err error
 			if c.shadowStageGen != 0 {
 				data, err = fs.shadowStore.ReadAllIfGeneration(fh.Path, c.shadowStageGen)
@@ -3959,7 +3977,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 			}
 		}
 
-		if !haveData && c.canMemory {
+		if !haveData && (c.canMemory || (tryLock && c.shadowSpill)) {
 			if !lockSrc(c.src) {
 				return false, errAppendRefreshBusy
 			}
@@ -3973,6 +3991,23 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 				c.contentSnapshotID = c.src.ContentSnapshotID
 				c.lineageTrusted = c.src.LineageTrusted
 				c.ancestors = c.src.contentAncestors
+				// A new spill buffer can claim CanMaterializeFull even after
+				// eviction. Bind its authoritative bytes and dirty identity
+				// under the same source lock, using the exact shadow generation.
+				if tryLock && c.src.ShadowSpill {
+					if fs.shadowStore == nil || size > maxLandedPayloadBytes || c.src.ShadowStageGen == 0 {
+						c.src.Unlock()
+						return false, syscall.EAGAIN
+					}
+					var err error
+					data, err = fs.shadowStore.ReadAllIfGeneration(fh.Path, c.src.ShadowStageGen)
+					if err != nil || int64(len(data)) != size {
+						c.src.Unlock()
+						return false, syscall.EAGAIN
+					}
+					c.shadowStageGen = c.src.ShadowStageGen
+					haveData = true
+				}
 				if tryLock && c.src.DirtySeq != 0 {
 					c.contentSnapshotID, _ = ensureStagedSnapshotLineageLocked(c.src)
 					c.ancestors = c.src.stagedAncestors
@@ -3981,7 +4016,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 				}
 				if size == 0 {
 					haveData = true
-				} else if c.src.Dirty.CanMaterializeFull() {
+				} else if !haveData && c.src.Dirty.CanMaterializeFull() {
 					data = c.src.Dirty.Bytes()
 					haveData = true
 				}
@@ -3999,15 +4034,28 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 				return false, syscall.EAGAIN
 			}
 		}
+		// A spill target's eviction callbacks belong to its old shadow
+		// image. Prepare the complete descendant buffer before replacing it.
+		buffer := fh.Dirty
+		if tryLock && fh.ShadowSpill {
+			if size > maxLandedPayloadBytes {
+				return false, syscall.EAGAIN
+			}
+			buffer = fs.newWriteBuffer(fh.Path, max(fh.Dirty.maxSize, size), fh.Dirty.PartSize())
+		}
 		if len(data) > 0 {
-			if _, err := fh.Dirty.Write(0, data); err != nil {
+			if _, err := buffer.Write(0, data); err != nil {
 				safeLogPrintf("open-handle preload failed for %s: %v", fh.Path, err)
 				continue
 			}
 		}
-		if err := fh.Dirty.Truncate(size); err != nil {
+		if err := buffer.Truncate(size); err != nil {
 			safeLogPrintf("open-handle preload truncate failed for %s: %v", fh.Path, err)
 			continue
+		}
+		if buffer != fh.Dirty {
+			fh.Dirty = buffer
+			fh.ShadowSpill = false
 		}
 		fh.Dirty.ClearDirty()
 		fh.WriteBackGen = c.writeBackGen
@@ -4050,7 +4098,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 // sibling handles. A busy sibling requests a retry after releasing locks;
 // dirty targets adopt only a proven descendant of their own snapshot.
 func (fs *Dat9FS) refreshAppendBufferLocked(ctx context.Context, fh *FileHandle) error {
-	if fs == nil || fh == nil || fh.Dirty == nil || fh.Unlinked || fh.ShadowSpill {
+	if fs == nil || fh == nil || fh.Dirty == nil || fh.Unlinked {
 		return nil
 	}
 	if isSQLitePersistentJournalPath(fh.Path) {
@@ -4058,6 +4106,9 @@ func (fs *Dat9FS) refreshAppendBufferLocked(ctx context.Context, fh *FileHandle)
 	}
 	if err := fs.adoptLandedAppendSnapshotLocked(ctx, fh); err != nil {
 		return err
+	}
+	if fh.ShadowSpill && fh.Dirty.Size() > maxLandedPayloadBytes {
+		return nil
 	}
 	if loaded, err := fs.loadWritableHandleFromOpenHandles(fh, true); loaded || err != nil {
 		return err

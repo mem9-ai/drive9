@@ -16359,7 +16359,7 @@ func TestStageShadowReadyNonSpillRewritesShadowWithDirtyBuffer(t *testing.T) {
 		WritePolicy: WritePolicyWriteBack,
 	}
 
-	if err := fs.stageShadowForQueuedCommitLocked(fh, true); err != nil {
+	if err := fs.stageShadowForQueuedCommitLocked(context.Background(), fh, true); err != nil {
 		t.Fatal(err)
 	}
 	if fh.ShadowStageGen == 0 {
@@ -16438,7 +16438,7 @@ func TestOpenTruncateResetShadowStagesDirtyBuffer(t *testing.T) {
 	}, finalData); st != gofuse.OK {
 		t.Fatalf("Write status = %v, want OK", st)
 	}
-	if err := fs.stageShadowForQueuedCommitLocked(fh, true); err != nil {
+	if err := fs.stageShadowForQueuedCommitLocked(context.Background(), fh, true); err != nil {
 		t.Fatal(err)
 	}
 	if fh.ShadowStageGen == 0 {
