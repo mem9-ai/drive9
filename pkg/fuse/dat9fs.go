@@ -3882,6 +3882,16 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 			src.Unlock()
 			continue
 		}
+		// A sibling's old dirty flag may outlive the commit of a snapshot
+		// that already contains it. Never copy that ancestor over our newer
+		// image, even when our DirtySeq was cleared by fsync.
+		if tryLock && src.DirtySeq != 0 && src.LineageTrusted && fh.LineageTrusted {
+			snapshotID, _ := ensureStagedSnapshotLineageLocked(src)
+			if snapshotID == fh.ContentSnapshotID || slices.Contains(fh.contentAncestors, snapshotID) {
+				src.Unlock()
+				continue
+			}
+		}
 		if tryLock && fh.DirtySeq != 0 && src.DirtySeq <= fh.DirtySeq {
 			src.Unlock()
 			continue
@@ -4039,12 +4049,15 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 // absent on the lock-timeout fallback path. The refresh only uses TryLock on
 // sibling handles. A busy sibling requests a retry after releasing locks;
 // dirty targets adopt only a proven descendant of their own snapshot.
-func (fs *Dat9FS) refreshAppendBufferLocked(fh *FileHandle) error {
+func (fs *Dat9FS) refreshAppendBufferLocked(ctx context.Context, fh *FileHandle) error {
 	if fs == nil || fh == nil || fh.Dirty == nil || fh.Unlinked || fh.ShadowSpill {
 		return nil
 	}
 	if isSQLitePersistentJournalPath(fh.Path) {
 		return nil
+	}
+	if err := fs.adoptLandedAppendSnapshotLocked(ctx, fh); err != nil {
+		return err
 	}
 	if loaded, err := fs.loadWritableHandleFromOpenHandles(fh, true); loaded || err != nil {
 		return err
@@ -13590,20 +13603,39 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		return 0, st
 	}
 
-	unlockRemoteCommit := fs.lockHandleRemoteCommitPathLocked(fh)
+	lockCommitPath := func() (func(), bool) {
+		if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+			return fs.tryLockAppendRemoteCommitPathLocked(fh)
+		}
+		return fs.lockHandleRemoteCommitPathLocked(fh), true
+	}
+	unlockRemoteCommit := func() {}
 	defer func() { unlockRemoteCommit() }()
-	deadline := time.Now().Add(fs.opts.RemoteCommitWaitTimeout)
+	var deadline time.Time
+	if fs.opts.RemoteCommitWaitTimeout > 0 {
+		deadline = time.Now().Add(fs.opts.RemoteCommitWaitTimeout)
+	}
 	for {
-		fs.discardSupersededMutationLocked(fh)
-		fs.adoptCommittedRevisionLocked(fh)
-		if fh.Dirty == nil {
-			source = "new-dirty-buffer"
-			fh.Dirty = fs.newWriteBuffer(fh.Path, 0, 0)
+		var acquired bool
+		unlockRemoteCommit, acquired = lockCommitPath()
+		refreshErr := errAppendRefreshBusy
+		if acquired {
+			// Replay or another operation may change the handle's path state
+			// while an append yields its locks. Recheck before any mutation.
+			if st := fs.layerHandleMutationStatusLocked(fh); st != gofuse.OK {
+				return 0, st
+			}
+			fs.discardSupersededMutationLocked(fh)
+			fs.adoptCommittedRevisionLocked(fh)
+			if fh.Dirty == nil {
+				source = "new-dirty-buffer"
+				fh.Dirty = fs.newWriteBuffer(fh.Path, 0, 0)
+			}
+			if fh.Flags&uint32(syscall.O_APPEND) == 0 {
+				break
+			}
+			refreshErr = fs.refreshAppendBufferLocked(ctx, fh)
 		}
-		if fh.Flags&uint32(syscall.O_APPEND) == 0 {
-			break
-		}
-		refreshErr := fs.refreshAppendBufferLocked(fh)
 		if refreshErr == nil {
 			break
 		}
@@ -13613,7 +13645,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			}
 			return 0, httpToFuseStatus(refreshErr)
 		}
-		if time.Now().After(deadline) {
+		if !deadline.IsZero() && time.Now().After(deadline) {
 			return 0, gofuse.Status(syscall.EAGAIN)
 		}
 		fs.releaseHandleRemoteCommitPathLocked(fh)
@@ -13626,7 +13658,6 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		case <-time.After(time.Millisecond):
 		}
 		fh.Lock()
-		unlockRemoteCommit = fs.lockHandleRemoteCommitPathLocked(fh)
 	}
 	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
 	writeSyncAppendLogState := appendLogHandleState{}

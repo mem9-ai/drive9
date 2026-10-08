@@ -15995,81 +15995,86 @@ func TestOpenWritableCancelsQueuedPathTruncateWithoutOTruncFlag(t *testing.T) {
 }
 
 func TestWriteCancelsDelayedQueuedPathTruncateBeforeRemoteWait(t *testing.T) {
-	var uploads atomic.Int32
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		uploads.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
-	}))
-	defer ts.Close()
+	for _, flags := range []uint32{0, uint32(syscall.O_WRONLY | syscall.O_APPEND)} {
+		t.Run(fmt.Sprintf("flags=%d", flags), func(t *testing.T) {
+			var uploads atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				uploads.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+			}))
+			defer ts.Close()
 
-	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
-	fs.syncMode = SyncInteractive
-	shadow, err := NewShadowStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shadow.Close()
-	pending, err := NewPendingIndex(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := "/file.bin"
-	if err := shadow.WriteFull(path, nil, 7); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pending.PutWithBaseRev(path, 0, PendingOverwrite, 7); err != nil {
-		t.Fatal(err)
-	}
-	fs.shadowStore = shadow
-	fs.pendingIndex = pending
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
-	cq.zeroTruncateDelay = time.Hour
-	fs.commitQueue = cq
-	defer cq.DrainAll()
-	queued := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
-	if err := cq.Enqueue(queued); err != nil {
-		t.Fatal(err)
-	}
-	if !cq.HasPath(path) {
-		t.Fatal("delayed zero truncate should be visible before Write")
-	}
+			opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			fs.syncMode = SyncInteractive
+			shadow, err := NewShadowStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer shadow.Close()
+			pending, err := NewPendingIndex(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := "/file.bin"
+			if err := shadow.WriteFull(path, nil, 7); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pending.PutWithBaseRev(path, 0, PendingOverwrite, 7); err != nil {
+				t.Fatal(err)
+			}
+			fs.shadowStore = shadow
+			fs.pendingIndex = pending
+			cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+			cq.zeroTruncateDelay = time.Hour
+			fs.commitQueue = cq
+			defer cq.DrainAll()
+			queued := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+			if err := cq.Enqueue(queued); err != nil {
+				t.Fatal(err)
+			}
+			if !cq.HasPath(path) {
+				t.Fatal("delayed zero truncate should be visible before Write")
+			}
 
-	ino := fs.inodes.Lookup(path, false, 0, time.Now())
-	fs.inodes.UpdateRevision(ino, 7)
-	fh := &FileHandle{
-		Ino:         ino,
-		Path:        path,
-		BaseRev:     7,
-		Dirty:       fs.newWriteBuffer(path, 0, 0),
-		ZeroBase:    true,
-		WritePolicy: WritePolicyWriteBack,
-	}
-	fhID := fs.allocateFileHandle(fh)
-	written, st := fs.Write(nil, &gofuse.WriteIn{
-		InHeader: gofuse.InHeader{NodeId: ino},
-		Fh:       fhID,
-		Offset:   0,
-	}, []byte("new"))
-	if st != gofuse.OK {
-		t.Fatalf("Write status = %v, want OK", st)
-	}
-	if written != 3 {
-		t.Fatalf("Write bytes = %d, want 3", written)
-	}
-	if !queued.canceled {
-		t.Fatal("Write did not cancel delayed zero truncate")
-	}
-	if cq.HasPath(path) {
-		t.Fatal("delayed zero truncate still blocks path after Write")
-	}
-	if got := uploads.Load(); got != 0 {
-		t.Fatalf("uploads before drain = %d, want 0", got)
-	}
-	if !pending.HasPending(path) || !shadow.Has(path) {
-		t.Fatal("Write supersede should preserve local pending/shadow state")
+			ino := fs.inodes.Lookup(path, false, 0, time.Now())
+			fs.inodes.UpdateRevision(ino, 7)
+			fh := &FileHandle{
+				Ino:         ino,
+				Path:        path,
+				BaseRev:     7,
+				Dirty:       fs.newWriteBuffer(path, 0, 0),
+				ZeroBase:    true,
+				WritePolicy: WritePolicyWriteBack,
+				Flags:       flags,
+			}
+			fhID := fs.allocateFileHandle(fh)
+			written, st := fs.Write(nil, &gofuse.WriteIn{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Fh:       fhID,
+				Offset:   0,
+			}, []byte("new"))
+			if st != gofuse.OK {
+				t.Fatalf("Write status = %v, want OK", st)
+			}
+			if written != 3 {
+				t.Fatalf("Write bytes = %d, want 3", written)
+			}
+			if !queued.canceled {
+				t.Fatal("Write did not cancel delayed zero truncate")
+			}
+			if cq.HasPath(path) {
+				t.Fatal("delayed zero truncate still blocks path after Write")
+			}
+			if got := uploads.Load(); got != 0 {
+				t.Fatalf("uploads before drain = %d, want 0", got)
+			}
+			if !pending.HasPending(path) || !shadow.Has(path) {
+				t.Fatal("Write supersede should preserve local pending/shadow state")
+			}
+		})
 	}
 }
 

@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"slices"
 	"syscall"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
@@ -70,4 +71,90 @@ func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle
 		return true, httpToFuseStatus(err)
 	}
 	return true, gofuse.OK
+}
+
+// adoptLandedAppendSnapshotLocked binds the complete landed image and its
+// identity together before selecting an append source. A clean handle may have
+// adopted the revision without the snapshot identity; a dirty handle needs
+// proof that the landed snapshot includes its exact image. Caller holds fh.mu
+// and the path commit lock. Failed remote checks leave the local state intact.
+func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileHandle) error {
+	if fs.commitQueue == nil || fs.layerEnabled() || !fh.LineageTrusted ||
+		fh.Dirty == nil || fh.Dirty.Size() > maxLandedPayloadBytes ||
+		(fh.Streamer != nil && fh.Streamer.Started()) {
+		return nil
+	}
+	proof := fs.commitQueue.landedCommit(fh.Path)
+	if proof.snapshotID == "" || proof.rev < fh.BaseRev {
+		return nil
+	}
+	if fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
+		// Only a clean remote baseline can take the landed identity without
+		// ancestry. Pending local snapshots must retain their own contents.
+		if fh.IsNew || fh.ZeroBase || !fs.handleCanAdoptCommittedRevisionLocked(fh) ||
+			proof.rev != fh.BaseRev || fh.ContentSnapshotID == proof.snapshotID {
+			return nil
+		}
+	} else {
+		if proof.rev <= fh.BaseRev {
+			return nil
+		}
+		snapshotID, _ := ensureStagedSnapshotLineageLocked(fh)
+		if snapshotID != proof.snapshotID && !slices.Contains(proof.ancestors, snapshotID) {
+			return nil
+		}
+	}
+	revision, size, data, err := fs.commitQueue.readRemoteSnapshot(ctx, fh.Path)
+	if err != nil {
+		return err
+	}
+	if !landedIdentityMatches(proof, revision, size, data) {
+		return syscall.EAGAIN
+	}
+	next := fs.newWriteBuffer(fh.Path, max(fh.Dirty.maxSize, size), fh.Dirty.PartSize())
+	if _, err := next.Write(0, data); err != nil {
+		return err
+	}
+	next.ClearDirty()
+	next.markCommittedPrefix(revision, size)
+	fs.removeHandleOwnedStagingLocked(fh)
+	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+	fh.Dirty = next
+	fh.DirtySeq, fh.WriteBackSeq = 0, 0
+	clearHandleShadowClaimLocked(fh)
+	clearStagedSnapshotLineageLocked(fh)
+	clearReadTargetForLockedHandle(fh)
+	fh.IsNew, fh.ZeroBase, fh.appendSnapshot = false, false, false
+	fh.BaseRev, fh.OrigSize = revision, size
+	fh.ContentSnapshotID, fh.contentAncestors = proof.snapshotID, proof.ancestors
+	fs.inodes.UpdateRevision(fh.Ino, revision)
+	fs.inodes.UpdateSize(fh.Ino, size)
+	fs.adoptCommittedStorageClassLocked(fh, size)
+	return nil
+}
+
+// tryLockAppendRemoteCommitPathLocked uses the existing append retry loop
+// instead of waiting for a path fence while pinning a sibling's handle. Each
+// retry also observes reservations acquired by a concurrent same-handle Flush.
+// Caller holds fh.mu; on contention it must release fh.mu before retrying.
+func (fs *Dat9FS) tryLockAppendRemoteCommitPathLocked(fh *FileHandle) (func(), bool) {
+	if fh.RemoteCommitUnlock != nil || fh.Path == "" {
+		return func() {}, true
+	}
+	if !fh.Unlinked && fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() == 0 {
+		_ = fs.canSupersedeQueuedPathTruncate(fh.Path)
+	}
+	if fs.commitQueue != nil && fs.commitQueue.HasPath(fh.Path) {
+		return func() {}, false
+	}
+	unlock, ok := fs.tryLockRemoteCommitPath(fh.Path)
+	if !ok {
+		return func() {}, false
+	}
+	if fs.commitQueue != nil && fs.commitQueue.HasPath(fh.Path) {
+		unlock()
+		return func() {}, false
+	}
+	fh.RemoteCommitUnlock = unlock
+	return func() { fs.releaseHandleRemoteCommitPathLocked(fh) }, true
 }
