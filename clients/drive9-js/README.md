@@ -122,7 +122,7 @@ import { Client, isRuntimeOutcomeUnknown } from "drive9";
 const client = Client.defaultClient();
 try {
   const result = await client.exec(
-    { argv: ["npm", "test"], workspace: { root: "/repo" } },
+    { argv: ["npm", "test"], workspace: { root: "/repo", persistence: "workspace" } },
     {
       onStdout: chunk => process.stdout.write(chunk),
       onStderr: chunk => process.stderr.write(chunk),
@@ -137,11 +137,13 @@ try {
 }
 ```
 
-Use `runtimeCapabilities()` to discover provider profiles, rootfs identities,
-and their `production_eligible` / `bounded_selection_eligible` status. Use
-`cancelRuntimeExecution(id)` only for an execution whose `started` frame was
-observed. A successful cancel means the provider confirmed the process stopped
-and bounded workspace cleanup completed.
+Use `runtimeCapabilities()` to discover provider profiles, machine-readable
+`persistence`, rootfs/workspace identities, and their `production_eligible` /
+`bounded_selection_eligible` status. Omitted request persistence defaults to
+`full_root`; opt in to `workspace` only when files outside the provider's coding
+workspace may be discarded. Use `cancelRuntimeExecution(id)` only for an
+execution whose `started` frame was observed. A successful cancel means the
+provider confirmed the process stopped and bounded workspace cleanup completed.
 
 ### Streaming & multipart
 

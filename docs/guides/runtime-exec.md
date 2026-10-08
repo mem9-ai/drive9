@@ -5,18 +5,25 @@ against an existing persistent Drive9 workspace. It does not own task state,
 retry, replay, history, artifacts, or recovery. Agent frameworks such as Pi
 remain authoritative for those decisions.
 
-Eligible `linux-full` providers compose the sandbox's literal Linux `/` from
-an immutable provider image/snapshot lower plus a Drive9-backed writable
-upper. Provider binaries remain available while writes under paths such as
-`/root`, `/home`, `/etc`, and `/workspace` survive a fresh sandbox. `/tmp` and
-`/run` are explicitly ephemeral. Runtime reports success only after confirmed
-process exit, Drive9 drain, and provider teardown.
+Runtime has two explicit persistence scopes. `full_root` providers compose the
+sandbox's literal Linux `/` from an immutable provider image lower plus a
+Drive9-backed writable upper; writes under `/root`, `/home`, `/etc`, and
+`/workspace` survive a fresh sandbox while `/tmp` and `/run` remain ephemeral.
+`workspace` providers persist only the provider's official coding workspace.
+Their root filesystem, `/tmp`, `/run`, `/etc`, other home content, and system
+package installs are disposable. Runtime never silently downgrades a
+`full_root` request to `workspace`.
+
+Docker supplies `full_root`. Daytona preview profiles use the workspace path
+resolved by Daytona's API and supply `workspace` only. Runtime reports success
+only after confirmed process exit, Drive9 drain, and provider teardown.
 
 ## CLI
 
 ```bash
 drive9 exec \
   --workspace :/repo \
+  --persistence workspace \
   --cwd . \
   --timeout 10m \
   --memory-mb 2048 \
@@ -25,9 +32,11 @@ drive9 exec \
 ```
 
 The command writes remote stdout and stderr to the matching local streams and
-returns the process exit status. `--workspace` defaults to `:/`. Resource flags
-are minimum requirements used by the server's hard candidate filter; they do
-not let a caller name an operator profile.
+returns the process exit status. `--workspace` defaults to `:/`.
+`--persistence` defaults to `full_root` for compatibility and safety; pass
+`workspace` only when persistence outside the coding workspace is unnecessary.
+Resource flags are minimum requirements used by the server's hard candidate
+filter; they do not let a caller name an operator profile.
 
 Interrupting the client requests remote cancellation. The CLI reports canceled
 only after the server confirms that the process stopped and bounded workspace
@@ -40,7 +49,10 @@ retries.
 result, err := c.Exec(ctx, client.ExecRequest{
     Argv:           []string{"go", "test", "./..."},
     ExecutionClass: "linux-full",
-    Workspace:      client.RuntimeWorkspace{Root: "/repo"},
+    Workspace: client.RuntimeWorkspace{
+        Root:        "/repo",
+        Persistence: client.RuntimePersistenceWorkspace,
+    },
 }, client.ExecOptions{
     Stdout: os.Stdout,
     Stderr: os.Stderr,
@@ -61,7 +73,7 @@ const result = await client.exec(
   {
     argv: ["npm", "test"],
     execution_class: "linux-full",
-    workspace: { root: "/repo" },
+    workspace: { root: "/repo", persistence: "workspace" },
   },
   {
     onStdout: chunk => process.stdout.write(chunk),
@@ -75,10 +87,11 @@ also expose capabilities and active-execution cancellation. Successful cancel
 means the server confirmed stop and workspace cleanup; an unconfirmed cancel
 is outcome-unknown.
 
-Provider capabilities include each profile's execution class, rootfs identity,
-and `production_eligible` / `bounded_selection_eligible` flags. Treat a
-candidate with either flag false as preview/manual-only for the corresponding
-use.
+Provider capabilities include each profile's execution class, machine-readable
+`persistence`, rootfs/workspace identity, `workspace_persistence` and
+`full_root_persistence` flags, plus `production_eligible` /
+`bounded_selection_eligible`. Treat a candidate with either eligibility flag
+false as preview/manual-only for the corresponding use.
 
 ## Mount credentials
 

@@ -15,7 +15,18 @@ import (
 )
 
 func TestExecStreamsOutputAndReturnsRemoteStatus(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var persistence string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Workspace struct {
+				Persistence string `json:"persistence"`
+			} `json:"workspace"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		persistence = request.Workspace.Persistence
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		_, _ = fmt.Fprintln(w, `{"type":"started","execution_id":"rex_12345678"}`)
 		_, _ = fmt.Fprintln(w, `{"type":"stdout","execution_id":"rex_12345678","data_base64":"b3V0"}`)
@@ -38,6 +49,9 @@ func TestExecStreamsOutputAndReturnsRemoteStatus(t *testing.T) {
 	var status *runtimeExitError
 	if !errors.As(resultErr, &status) || status.ExitCode() != 9 {
 		t.Fatalf("error = %#v", resultErr)
+	}
+	if persistence != "full_root" {
+		t.Fatalf("persistence = %q, want full_root", persistence)
 	}
 }
 
@@ -154,5 +168,43 @@ func TestRuntimeWorkspaceRoot(t *testing.T) {
 		if _, err := runtimeWorkspaceRoot(valid); err != nil {
 			t.Fatalf("workspace %q: %v", valid, err)
 		}
+	}
+}
+
+func TestExecRejectsInvalidPersistence(t *testing.T) {
+	err := execWithContext(t.Context(), []string{"--persistence=project", "--", "true"})
+	if err == nil || !strings.Contains(err.Error(), "--persistence must be full_root or workspace") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestExecSendsWorkspacePersistence(t *testing.T) {
+	var persistence string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Workspace struct {
+				Persistence string `json:"persistence"`
+			} `json:"workspace"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		persistence = request.Workspace.Persistence
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = fmt.Fprintln(w, `{"type":"started","execution_id":"rex_12345678"}`)
+		_, _ = fmt.Fprintln(w, `{"type":"exit","execution_id":"rex_12345678","exit_code":0,"duration_ms":1}`)
+	}))
+	defer server.Close()
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(EnvServer, server.URL)
+	t.Setenv(EnvAPIKey, "secret")
+	if err := execWithContext(t.Context(), []string{"--persistence=workspace", "--", "true"}); err != nil {
+		t.Fatal(err)
+	}
+	if persistence != "workspace" {
+		t.Fatalf("persistence = %q, want workspace", persistence)
 	}
 }

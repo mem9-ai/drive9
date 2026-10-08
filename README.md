@@ -178,10 +178,13 @@ an existing persistent workspace without introducing a second durable job
 system:
 
 ```bash
-drive9 exec --workspace :/repo --timeout 10m -- go test ./...
+drive9 exec --workspace :/repo --persistence workspace --timeout 10m -- go test ./...
 ```
 
 Stdout and stderr stream separately and the CLI returns the remote exit code.
+Persistence is explicit: `full_root` is the safe default, while `workspace`
+allows providers that persist only their official coding workspace and treat
+the rest of the sandbox filesystem as disposable.
 The server reports an exit only after the workspace mount drains. If the stream
 ends before a terminal frame, the result is `outcome_unknown`; the client never
 automatically retries because the process may already have run. Pi or another

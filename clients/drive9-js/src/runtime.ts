@@ -1,9 +1,12 @@
 const MAX_RUNTIME_FRAME_BYTES = 1 << 20;
 const RUNTIME_CANCEL_TIMEOUT_MS = 20_000;
 
+export type RuntimePersistence = "full_root" | "workspace";
+
 export interface RuntimeWorkspace {
   root: string;
   read_only?: boolean;
+  persistence?: RuntimePersistence;
 }
 
 export interface RuntimeResources {
@@ -60,6 +63,7 @@ export interface RuntimeProviderCapability {
 export interface RuntimeCandidateCapability {
   profile: string;
   execution_class: string;
+  persistence: RuntimePersistence;
   rootfs: RuntimeRootFSIdentity;
   capabilities: Record<string, boolean>;
   production_eligible: boolean;
@@ -259,18 +263,28 @@ export async function getRuntimeCapabilities(client: RuntimeClient, signal?: Abo
 
 function validRuntimeCandidateCapability(value: unknown): value is RuntimeCandidateCapability {
   if (!isObject(value)) return false;
-  const allowed = new Set(["profile", "execution_class", "rootfs", "capabilities", "production_eligible", "bounded_selection_eligible"]);
+  const allowed = new Set(["profile", "execution_class", "persistence", "rootfs", "capabilities", "production_eligible", "bounded_selection_eligible"]);
   if (Object.keys(value).some((key) => !allowed.has(key)) || !nonemptyString(value.profile) || !nonemptyString(value.execution_class) ||
       typeof value.production_eligible !== "boolean" || typeof value.bounded_selection_eligible !== "boolean" ||
       !isObject(value.rootfs) || !isObject(value.capabilities)) return false;
   const rootfsAllowed = new Set(["driver", "capability_version", "config_hash", "lower_image_digest"]);
-  return !Object.keys(value.rootfs).some((key) => !rootfsAllowed.has(key)) && value.execution_class === "linux-full" &&
-    value.rootfs.driver === "user-union" && value.rootfs.capability_version === "drive9_rootfs.user_union.extent.v4" &&
-    typeof value.rootfs.config_hash === "string" && /^[0-9a-f]{64}$/.test(value.rootfs.config_hash) &&
-    typeof value.rootfs.lower_image_digest === "string" && /^sha256:[0-9a-f]{64}$/.test(value.rootfs.lower_image_digest) &&
-    value.capabilities["drive9.extent_xattr.v1"] === true &&
-    Object.values(value.capabilities).every((capability) => typeof capability === "boolean") &&
-    !(value.bounded_selection_eligible && !value.production_eligible);
+  if (Object.keys(value.rootfs).some((key) => !rootfsAllowed.has(key)) || value.execution_class !== "linux-full" ||
+      typeof value.rootfs.config_hash !== "string" || !/^[0-9a-f]{64}$/.test(value.rootfs.config_hash) ||
+      typeof value.rootfs.lower_image_digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.rootfs.lower_image_digest) ||
+      Object.values(value.capabilities).some((capability) => typeof capability !== "boolean") ||
+      value.bounded_selection_eligible && !value.production_eligible) {
+    return false;
+  }
+  if (value.capabilities["workspace_persistence"] !== true) return false;
+  if (value.persistence === "full_root") {
+    return value.rootfs.driver === "user-union" && value.rootfs.capability_version === "drive9_rootfs.user_union.extent.v4" &&
+      value.capabilities["full_root_persistence"] === true && value.capabilities["drive9.extent_xattr.v1"] === true;
+  }
+  if (value.persistence === "workspace") {
+    return value.rootfs.driver === "workspace-mount" && value.rootfs.capability_version === "drive9_workspace.mount.v1" &&
+      value.capabilities["full_root_persistence"] !== true && value.capabilities["drive9.extent_xattr.v1"] !== true;
+  }
+  return false;
 }
 
 export async function cancelRuntimeExecution(client: RuntimeClient, executionId: string, signal?: AbortSignal): Promise<void> {

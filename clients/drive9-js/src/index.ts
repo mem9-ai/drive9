@@ -86,6 +86,7 @@ export type { ArchiveOptions } from "./archive.js";
 export type {
   RuntimeCapabilities,
   RuntimeCandidateCapability,
+  RuntimePersistence,
   RuntimeProviderCapability,
   RuntimeRootFSIdentity,
   ExecOptions,

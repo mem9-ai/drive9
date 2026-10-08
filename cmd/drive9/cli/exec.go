@@ -37,6 +37,7 @@ func execWithContext(ctx context.Context, args []string) error {
 	workspace := fs.String("workspace", "/", "Drive9 workspace root")
 	cwd := fs.String("cwd", ".", "working directory relative to the workspace root")
 	readOnly := fs.Bool("read-only", false, "mount the workspace read-only")
+	persistence := fs.String("persistence", client.RuntimePersistenceFullRoot, "required persistence scope: full_root or workspace")
 	timeout := fs.Duration("timeout", 0, "execution timeout (server default when omitted)")
 	cpuMillis := fs.Int64("cpu-millis", 0, "minimum CPU allocation in millicores")
 	memoryMB := fs.Int64("memory-mb", 0, "minimum memory allocation in MiB")
@@ -72,10 +73,13 @@ func execWithContext(ctx context.Context, args []string) error {
 	if *network != "" && *network != "none" && *network != "bridge" {
 		return errors.New("--network must be none or bridge")
 	}
+	if *persistence != client.RuntimePersistenceFullRoot && *persistence != client.RuntimePersistenceWorkspace {
+		return errors.New("--persistence must be full_root or workspace")
+	}
 
 	request := client.ExecRequest{
 		Argv: append([]string(nil), fs.Args()...), Cwd: *cwd, Env: env,
-		Workspace: client.RuntimeWorkspace{Root: root, ReadOnly: *readOnly},
+		Workspace: client.RuntimeWorkspace{Root: root, ReadOnly: *readOnly, Persistence: *persistence},
 		Resources: client.RuntimeResources{CPUMillis: *cpuMillis, MemoryMB: *memoryMB, PIDs: *pids, Network: *network},
 	}
 	if *timeout > 0 {

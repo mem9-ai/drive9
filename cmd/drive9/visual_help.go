@@ -727,6 +727,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Name: "--workspace PATH", Desc: "canonical Drive9 workspace root; default :/"},
 				{Name: "--cwd PATH", Desc: "working directory relative to the workspace root; default ."},
 				{Name: "--read-only", Desc: "mount the workspace read-only"},
+				{Name: "--persistence full_root|workspace", Desc: "required persistence scope; default full_root"},
 				{Name: "--timeout DURATION", Desc: "execution timeout; server default when omitted"},
 				{Name: "--cpu-millis N", Desc: "minimum CPU allocation in millicores"},
 				{Name: "--memory-mb N", Desc: "minimum memory allocation in MiB"},

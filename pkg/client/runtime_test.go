@@ -259,26 +259,41 @@ func TestRuntimeCapabilitiesAcceptsProviderAwareCandidates(t *testing.T) {
 	capabilities := RuntimeCapabilities{
 		Version: 1, Streaming: true, SeparateIO: true,
 		Providers: []RuntimeProviderCapability{{
-			Provider: "docker", Profiles: []string{"default"},
+			Provider: "docker", Profiles: []string{"default", "workspace"},
 			Candidates: []RuntimeCandidateCapability{{
-				Profile: "default", ExecutionClass: "linux-full",
+				Profile: "default", ExecutionClass: "linux-full", Persistence: RuntimePersistenceFullRoot,
 				RootFS: RuntimeRootFSIdentity{
-					Driver: "user-union", CapabilityVersion: "drive9_rootfs.user_union.extent.v4",
+					Driver: runtimeRootFSUserUnion, CapabilityVersion: runtimeRootFSCapabilityV4,
 					ConfigHash: strings.Repeat("a", 64), LowerImageDigest: "sha256:" + strings.Repeat("b", 64),
 				},
-				Capabilities:       map[string]bool{ExtentXattrProtocolV1: true},
+				Capabilities: map[string]bool{
+					RuntimeCapabilityWorkspace: true, RuntimeCapabilityFullRoot: true, ExtentXattrProtocolV1: true,
+				},
 				ProductionEligible: true, BoundedSelectionEligible: true,
+			}, {
+				Profile: "workspace", ExecutionClass: "linux-full", Persistence: RuntimePersistenceWorkspace,
+				RootFS: RuntimeRootFSIdentity{
+					Driver: runtimeRootFSWorkspace, CapabilityVersion: runtimeWorkspaceCapability,
+					ConfigHash: strings.Repeat("c", 64), LowerImageDigest: "sha256:" + strings.Repeat("d", 64),
+				},
+				Capabilities:       map[string]bool{RuntimeCapabilityWorkspace: true},
+				ProductionEligible: false, BoundedSelectionEligible: false,
 			}},
 		}},
 	}
 	if err := validateRuntimeCapabilities(capabilities); err != nil {
 		t.Fatal(err)
 	}
+	capabilities.Providers[0].Candidates[0].Persistence = ""
+	if err := validateRuntimeCapabilities(capabilities); err == nil {
+		t.Fatal("candidate without persistence error = nil")
+	}
+	capabilities.Providers[0].Candidates[0].Persistence = RuntimePersistenceFullRoot
 	capabilities.Providers[0].Candidates[0].RootFS.CapabilityVersion = "drive9_rootfs.user_union.extent.v3"
 	if err := validateRuntimeCapabilities(capabilities); err == nil {
 		t.Fatal("v3 rootfs candidate error = nil")
 	}
-	capabilities.Providers[0].Candidates[0].RootFS.CapabilityVersion = "drive9_rootfs.user_union.extent.v4"
+	capabilities.Providers[0].Candidates[0].RootFS.CapabilityVersion = runtimeRootFSCapabilityV4
 	delete(capabilities.Providers[0].Candidates[0].Capabilities, ExtentXattrProtocolV1)
 	if err := validateRuntimeCapabilities(capabilities); err == nil {
 		t.Fatal("candidate without negotiated extent xattr capability error = nil")
@@ -287,6 +302,11 @@ func TestRuntimeCapabilitiesAcceptsProviderAwareCandidates(t *testing.T) {
 	capabilities.Providers[0].Candidates[0].Profile = "missing"
 	if err := validateRuntimeCapabilities(capabilities); err == nil {
 		t.Fatal("candidate outside provider profiles error = nil")
+	}
+	capabilities.Providers[0].Candidates[0].Profile = "default"
+	capabilities.Providers[0].Candidates[1].Capabilities[RuntimeCapabilityFullRoot] = true
+	if err := validateRuntimeCapabilities(capabilities); err == nil {
+		t.Fatal("workspace-only candidate with full-root capability error = nil")
 	}
 }
 

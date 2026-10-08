@@ -129,15 +129,33 @@ describe("runtime exec", () => {
       providers: [{ provider: "docker", profiles: ["default"], candidates: [{
         profile: "default",
         execution_class: "linux-full",
+        persistence: "full_root",
         rootfs: {
           driver: "user-union",
           capability_version: "drive9_rootfs.user_union.extent.v4",
           config_hash: "a".repeat(64),
           lower_image_digest: `sha256:${"b".repeat(64)}`,
         },
-        capabilities: { "drive9.extent_xattr.v1": true },
+        capabilities: {
+          "workspace_persistence": true,
+          "full_root_persistence": true,
+          "drive9.extent_xattr.v1": true,
+        },
         production_eligible: true,
         bounded_selection_eligible: true,
+      }] }, { provider: "daytona", profiles: ["preview"], candidates: [{
+        profile: "preview",
+        execution_class: "linux-full",
+        persistence: "workspace",
+        rootfs: {
+          driver: "workspace-mount",
+          capability_version: "drive9_workspace.mount.v1",
+          config_hash: "c".repeat(64),
+          lower_image_digest: `sha256:${"d".repeat(64)}`,
+        },
+        capabilities: { "workspace_persistence": true },
+        production_eligible: false,
+        bounded_selection_eligible: false,
       }] }],
     })));
     await expect(new Client("http://localhost:9009", "test-key").runtimeCapabilities()).resolves.toMatchObject({ version: 1 });
@@ -153,13 +171,18 @@ describe("runtime exec", () => {
       providers: [{ provider: "docker", profiles: ["default"], candidates: [{
         profile: "default",
         execution_class: "linux-full",
+        persistence: "full_root",
         rootfs: {
           driver: "user-union",
           capability_version: "drive9_rootfs.user_union.extent.v3",
           config_hash: "a".repeat(64),
           lower_image_digest: `sha256:${"b".repeat(64)}`,
         },
-        capabilities: { "drive9.extent_xattr.v1": true },
+        capabilities: {
+          "workspace_persistence": true,
+          "full_root_persistence": true,
+          "drive9.extent_xattr.v1": true,
+        },
         production_eligible: true,
         bounded_selection_eligible: true,
       }] }],

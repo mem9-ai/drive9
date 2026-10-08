@@ -18,11 +18,21 @@ import (
 const (
 	maxRuntimeFrameBytes = 1 << 20
 	runtimeCancelTimeout = 20 * time.Second
+
+	RuntimePersistenceFullRoot  = "full_root"
+	RuntimePersistenceWorkspace = "workspace"
+	RuntimeCapabilityWorkspace  = "workspace_persistence"
+	RuntimeCapabilityFullRoot   = "full_root_persistence"
+	runtimeRootFSUserUnion      = "user-union"
+	runtimeRootFSWorkspace      = "workspace-mount"
+	runtimeRootFSCapabilityV4   = "drive9_rootfs.user_union.extent.v4"
+	runtimeWorkspaceCapability  = "drive9_workspace.mount.v1"
 )
 
 type RuntimeWorkspace struct {
-	Root     string `json:"root"`
-	ReadOnly bool   `json:"read_only,omitempty"`
+	Root        string `json:"root"`
+	ReadOnly    bool   `json:"read_only,omitempty"`
+	Persistence string `json:"persistence,omitempty"`
 }
 
 type RuntimeResources struct {
@@ -80,6 +90,7 @@ type RuntimeProviderCapability struct {
 type RuntimeCandidateCapability struct {
 	Profile                  string                `json:"profile"`
 	ExecutionClass           string                `json:"execution_class"`
+	Persistence              string                `json:"persistence"`
 	RootFS                   RuntimeRootFSIdentity `json:"rootfs"`
 	Capabilities             map[string]bool       `json:"capabilities"`
 	ProductionEligible       bool                  `json:"production_eligible"`
@@ -454,11 +465,10 @@ func validateRuntimeCapabilities(capabilities RuntimeCapabilities) error {
 		candidateProfiles := make(map[string]struct{}, len(provider.Candidates))
 		for _, candidate := range provider.Candidates {
 			if strings.TrimSpace(candidate.Profile) == "" || candidate.ExecutionClass != "linux-full" ||
-				candidate.RootFS.Driver != "user-union" || candidate.RootFS.CapabilityVersion != "drive9_rootfs.user_union.extent.v4" ||
 				!validRuntimeSHA256Hex(candidate.RootFS.ConfigHash) ||
 				!strings.HasPrefix(candidate.RootFS.LowerImageDigest, "sha256:") || !validRuntimeSHA256Hex(strings.TrimPrefix(candidate.RootFS.LowerImageDigest, "sha256:")) ||
-				!candidate.Capabilities[ExtentXattrProtocolV1] ||
-				candidate.BoundedSelectionEligible && !candidate.ProductionEligible {
+				candidate.BoundedSelectionEligible && !candidate.ProductionEligible ||
+				!validRuntimePersistenceCapability(candidate) {
 				return errors.New("server returned an invalid Runtime candidate capability")
 			}
 			if _, exists := profiles[candidate.Profile]; !exists {
@@ -471,6 +481,26 @@ func validateRuntimeCapabilities(capabilities RuntimeCapabilities) error {
 		}
 	}
 	return nil
+}
+
+func validRuntimePersistenceCapability(candidate RuntimeCandidateCapability) bool {
+	if !candidate.Capabilities[RuntimeCapabilityWorkspace] {
+		return false
+	}
+	switch candidate.Persistence {
+	case RuntimePersistenceFullRoot:
+		return candidate.RootFS.Driver == runtimeRootFSUserUnion &&
+			candidate.RootFS.CapabilityVersion == runtimeRootFSCapabilityV4 &&
+			candidate.Capabilities[RuntimeCapabilityFullRoot] &&
+			candidate.Capabilities[ExtentXattrProtocolV1]
+	case RuntimePersistenceWorkspace:
+		return candidate.RootFS.Driver == runtimeRootFSWorkspace &&
+			candidate.RootFS.CapabilityVersion == runtimeWorkspaceCapability &&
+			!candidate.Capabilities[RuntimeCapabilityFullRoot] &&
+			!candidate.Capabilities[ExtentXattrProtocolV1]
+	default:
+		return false
+	}
 }
 
 func validRuntimeSHA256Hex(value string) bool {
