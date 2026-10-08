@@ -8,6 +8,45 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
 
+// sameLinkedInode excludes detached or replaced names from alias handoffs.
+func (fs *Dat9FS) sameLinkedInode(path string, ino uint64) bool {
+	if fs.inodes == nil {
+		return false
+	}
+	current, ok := fs.inodes.GetInode(path)
+	return ok && ino != 0 && current == ino
+}
+
+// publishLinkedAppendCommit shares only the queue's existing committed proof
+// and watermark with names still attached to this file. Path-owned staging
+// and generation cleanup remain separate for each alias.
+func (fs *Dat9FS) publishLinkedAppendCommit(path string, ino uint64, revision, size int64) {
+	if fs.commitQueue == nil || fs.layerEnabled() || revision <= 0 ||
+		!fs.sameLinkedInode(path, ino) {
+		return
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok || entry.ResourceID == "" || len(entry.Paths) < 2 {
+		return
+	}
+	proof := fs.commitQueue.landedCommit(path)
+	if proof.rev != revision {
+		proof = pathCommitLandmark{}
+	}
+	for alias := range entry.Paths {
+		if alias == path || !fs.sameLinkedInode(alias, ino) {
+			continue
+		}
+		fs.recordCommittedRevisionWithSize(alias, revision, size)
+		// Alias lookup/GetAttr must not restore an older cached length
+		// after another name commits the final append image.
+		fs.cacheFileForPath(alias, size, entry.Mtime, revision)
+		fs.commitQueue.rememberLanded(alias, revision, size, proof.checksum, proof.snapshotID, proof.ancestors...)
+		fs.invalidateReadCacheAndTargets(alias)
+		fs.refreshCommittedRevisionForOpenHandlesWithSize(alias, revision, nil, size)
+	}
+}
+
 // commitAppendSnapshotLocked gives small live append snapshots the same causal
 // validation and landed identity on fsync as on queued close. Caller holds
 // fh.mu; queue callbacks use TryLock and cannot consume this handle mid-fsync.
@@ -19,6 +58,11 @@ func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle
 		isSQLitePersistentJournalPath(fh.Path) || fh.Dirty.Size() > maxLandedPayloadBytes ||
 		(fh.Streamer != nil && fh.Streamer.Started()) {
 		return false, gofuse.OK
+	}
+	if fs.inodes != nil {
+		if current, ok := fs.inodes.GetInode(fh.Path); ok && current != fh.Ino {
+			return true, gofuse.EAGAIN
+		}
 	}
 	if !fh.Dirty.HasDirtyParts() {
 		if fh.HasPendingMode {
@@ -84,6 +128,11 @@ func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileH
 		(fh.Streamer != nil && fh.Streamer.Started()) {
 		return nil
 	}
+	if fs.inodes != nil {
+		if current, ok := fs.inodes.GetInode(fh.Path); ok && current != fh.Ino {
+			return syscall.EAGAIN
+		}
+	}
 	proof := fs.commitQueue.landedCommit(fh.Path)
 	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
 		if max(proof.rev, fs.latestCommittedRevision(fh.Path)) > fh.BaseRev {
@@ -118,10 +167,15 @@ func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileH
 			return syscall.EAGAIN
 		}
 	}
-	revision, size, data, err := fs.commitQueue.readRemoteSnapshot(ctx, fh.Path)
+	stat, data, err := fs.commitQueue.readRemoteSnapshotStat(ctx, fh.Path)
 	if err != nil {
 		return err
 	}
+	if entry, ok := fs.inodes.GetEntry(fh.Ino); ok && len(entry.Paths) > 1 &&
+		(entry.ResourceID == "" || stat.ResourceID != entry.ResourceID) {
+		return syscall.EAGAIN
+	}
+	revision, size := stat.Revision, stat.Size
 	if !landedIdentityMatches(proof, revision, size, data) {
 		return syscall.EAGAIN
 	}
@@ -158,17 +212,32 @@ func (fs *Dat9FS) tryLockAppendRemoteCommitPathLocked(fh *FileHandle) (func(), b
 	if !fh.Unlinked && fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() == 0 {
 		_ = fs.canSupersedeQueuedPathTruncate(fh.Path)
 	}
-	if fs.commitQueue != nil && fs.commitQueue.HasPath(fh.Path) {
+	if fs.appendCommitPending(fh) {
 		return func() {}, false
 	}
 	unlock, ok := fs.tryLockRemoteCommitPath(fh.Path)
 	if !ok {
 		return func() {}, false
 	}
-	if fs.commitQueue != nil && fs.commitQueue.HasPath(fh.Path) {
+	if fs.appendCommitPending(fh) {
 		unlock()
 		return func() {}, false
 	}
 	fh.RemoteCommitUnlock = unlock
 	return func() { fs.releaseHandleRemoteCommitPathLocked(fh) }, true
+}
+
+func (fs *Dat9FS) appendCommitPending(fh *FileHandle) bool {
+	if fs.commitQueue == nil {
+		return false
+	}
+	if fs.commitQueue.HasPath(fh.Path) {
+		return true
+	}
+	for _, path := range fs.appendReadPaths(fh.Ino) {
+		if fs.sameLinkedInode(path, fh.Ino) && fs.commitQueue.HasPath(path) {
+			return true
+		}
+	}
+	return false
 }

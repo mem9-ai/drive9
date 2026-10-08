@@ -3874,6 +3874,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 
 	type candidate struct {
 		src               *FileHandle
+		path              string
 		size              int64
 		origSize          int64
 		baseRev           int64
@@ -3893,7 +3894,11 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 	}
 
 	var candidates []candidate
-	for _, src := range fs.openHandles.SnapshotPath(fh.Path) {
+	handles := fs.openHandles.SnapshotPath(fh.Path)
+	if fh.Ino != 0 {
+		handles = fs.openHandles.SnapshotInode(fh.Ino)
+	}
+	for _, src := range handles {
 		if src == nil || src == fh {
 			continue
 		}
@@ -3903,6 +3908,14 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 		}
 		if src.Unlinked || src.Ino != fh.Ino || src.Dirty == nil {
 			src.Unlock()
+			continue
+		}
+		if src.Path != fh.Path && !fs.sameLinkedInode(src.Path, fh.Ino) {
+			pending := src.IsNew || src.ZeroBase || src.DirtySeq != 0 || src.Dirty.HasDirtyParts()
+			src.Unlock()
+			if pending {
+				return false, syscall.EAGAIN
+			}
 			continue
 		}
 		// A sibling's old dirty flag may outlive the commit of a snapshot
@@ -3926,6 +3939,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 		}
 		c := candidate{
 			src:               src,
+			path:              src.Path,
 			size:              src.Dirty.Size(),
 			origSize:          src.OrigSize,
 			baseRev:           src.BaseRev,
@@ -3970,9 +3984,9 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 		if !haveData && c.shadowSource && (!tryLock || !c.canMemory) && (!tryLock || !c.shadowSpill) {
 			var err error
 			if c.shadowStageGen != 0 {
-				data, err = fs.shadowStore.ReadAllIfGeneration(fh.Path, c.shadowStageGen)
+				data, err = fs.shadowStore.ReadAllIfGeneration(c.path, c.shadowStageGen)
 			} else {
-				data, err = fs.shadowStore.ReadAll(fh.Path)
+				data, err = fs.shadowStore.ReadAll(c.path)
 				c.lineageTrusted = false
 			}
 			if err != nil {
@@ -3987,7 +4001,9 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 			if !lockSrc(c.src) {
 				return false, errAppendRefreshBusy
 			}
-			if c.src.Dirty != nil && !c.src.Unlinked && c.src.Ino == fh.Ino {
+			if c.src.Dirty != nil && !c.src.Unlinked && c.src.Ino == fh.Ino &&
+				(c.src.Path == fh.Path || fs.sameLinkedInode(c.src.Path, fh.Ino)) {
+				c.path = c.src.Path
 				size = c.src.Dirty.Size()
 				c.origSize = c.src.OrigSize
 				c.baseRev = c.src.BaseRev
@@ -4006,7 +4022,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 						return false, syscall.EAGAIN
 					}
 					var err error
-					data, err = fs.shadowStore.ReadAllIfGeneration(fh.Path, c.src.ShadowStageGen)
+					data, err = fs.shadowStore.ReadAllIfGeneration(c.path, c.src.ShadowStageGen)
 					if err != nil || int64(len(data)) != size {
 						c.src.Unlock()
 						return false, syscall.EAGAIN
@@ -4031,6 +4047,12 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 		}
 
 		if !haveData {
+			// A source on another name may have committed/retired while
+			// we yielded its handle. Recheck the inode's landed proof.
+			// Same-path sources are already fenced by the caller's lock.
+			if tryLock && c.path != fh.Path {
+				return false, errAppendRefreshBusy
+			}
 			continue
 		}
 
@@ -4043,7 +4065,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 		// A spill target's eviction callbacks belong to its old shadow
 		// image. Prepare the complete descendant buffer before replacing it.
 		buffer := fh.Dirty
-		if tryLock && fh.ShadowSpill {
+		if c.path != fh.Path || tryLock && fh.ShadowSpill {
 			if size > maxLandedPayloadBytes {
 				return false, syscall.EAGAIN
 			}
@@ -4058,6 +4080,15 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 		if err := buffer.Truncate(size); err != nil {
 			safeLogPrintf("open-handle preload truncate failed for %s: %v", fh.Path, err)
 			continue
+		}
+		if c.path != fh.Path {
+			// Only this path's generations belong to the target. A full
+			// alias image must not borrow another path's cleanup tokens.
+			fs.removeHandleOwnedStagingLocked(fh)
+			clearHandleShadowClaimLocked(fh)
+			clearReadTargetForLockedHandle(fh)
+			c.writeBackGen, c.pendingIndexGen, c.shadowStageGen = 0, 0, 0
+			c.shadowSource = false
 		}
 		if buffer != fh.Dirty {
 			fh.Dirty = buffer
@@ -10104,6 +10135,9 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	if !fs.inodes.AddAlias(input.Oldnodeid, dstP, resourceID, nlink, isDir, size, mtime) {
 		return gofuse.EIO
 	}
+	if stat != nil {
+		fs.publishLinkedAppendCommit(srcP, input.Oldnodeid, stat.Revision, stat.Size)
+	}
 	linkTime := time.Now()
 	fs.inodes.UpdateCtime(input.Oldnodeid, linkTime)
 	if stat != nil {
@@ -15593,9 +15627,14 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 			fs.inodes.UpdateMode(entry.Inode, entry.Mode&posixPermissionModeMask)
 		}
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), committedRev)
-		// Local async commit completion — this is not an external change.
-		// Kernel does not need notify; userspace caches and inode state
-		// are updated above. Kernel will see new attrs on next access.
+		if linked, ok := fs.inodes.GetEntry(entry.Inode); ok && len(linked.Paths) > 1 &&
+			linked.ResourceID != "" && fs.sameLinkedInode(entry.Path, entry.Inode) {
+			// A retained fd on another name can leave kernel i_size/pages
+			// behind the composed append offset. Cover readers while the
+			// existing asynchronous notification reaches the kernel.
+			fs.armKernelCacheBypass(entry.Inode, entry.Path, committedRev, entry.Size, "linked-commit")
+			fs.notifyInode(entry.Inode)
+		}
 	} else {
 		fs.invalidateReadCacheAndTargets(entry.Path)
 		settleMtime := time.Now()
@@ -15663,6 +15702,9 @@ func (fs *Dat9FS) captureHandleStagingGensLocked(fh *FileHandle) StagingGens {
 }
 
 func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) {
+	if fs != nil && entry != nil {
+		fs.publishLinkedAppendCommit(entry.Path, entry.Inode, committedRev, entry.Size)
+	}
 	if fs == nil || entry == nil || !fs.gvisorCompatibilityEnabled() {
 		return
 	}

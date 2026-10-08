@@ -388,7 +388,7 @@ func TestGVisorCompatCommitQueueOrdersHardlinkAliasesByInode(t *testing.T) {
 	}
 }
 
-func TestGVisorCompatDisabledCommitQueueDoesNotOrderHardlinkAliases(t *testing.T) {
+func TestGVisorCompatDisabledCommitQueueOrdersLiveHardlinkAliases(t *testing.T) {
 	const ino = uint64(42)
 	older := &CommitEntry{Path: "/alias-b", Inode: ino, MutationSeq: 1}
 	newer := &CommitEntry{Path: "/alias-a", Inode: ino, MutationSeq: 2}
@@ -401,8 +401,8 @@ func TestGVisorCompatDisabledCommitQueueDoesNotOrderHardlinkAliases(t *testing.T
 	if cq.hasNewerMutation(older.Path, ino, older.MutationSeq) {
 		t.Fatal("disabled compatibility mode inspected another hardlink path")
 	}
-	if !cq.tryBeginInFlight(older) {
-		t.Fatal("disabled compatibility mode serialized hardlink aliases")
+	if cq.tryBeginInFlight(older) {
+		t.Fatal("live hardlink publication bypassed an in-flight mutation of the same file")
 	}
 }
 
