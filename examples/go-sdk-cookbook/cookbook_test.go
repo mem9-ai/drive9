@@ -40,6 +40,9 @@ func ExampleClient_constructionStatusAndRawRequests() {
 	if c.CachedExtentXattrSupported() {
 		_ = drive9.ExtentXattrProtocolV1
 	}
+	// Rootfs mounts that require durable overlay metadata must use the live
+	// fail-closed check immediately before mounting, not only the cache hint.
+	_ = c.RequireExtentXattrV1(ctx)
 	c.SetSmallFileThresholdForTests(50_000)
 
 	resp, err := c.RawPost("/v1/custom/action", strings.NewReader(`{"ok":true}`))
@@ -882,6 +885,7 @@ var coveredClientMethods = map[string]bool{
 	"RenameCtx":                            true,
 	"ReplayFSLayer":                        true,
 	"ReplayFSLayerAtSeq":                   true,
+	"RequireExtentXattrV1":                 true,
 	"ResolveReadTarget":                    true,
 	"ResumeUpload":                         true,
 	"ResumeUploadWithSummary":              true,
