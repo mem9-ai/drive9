@@ -95,10 +95,13 @@ func TestRequireExtentXattrV1PreservesFailureCause(t *testing.T) {
 		{name: "supported", body: `{"storage_capabilities":{"extent_xattr_v1":true}}`, status: http.StatusOK},
 		{name: "missing", body: `{"storage_capabilities":{}}`, status: http.StatusOK, wantError: "did not advertise drive9.extent_xattr.v1", unsupported: true},
 		{name: "malformed", body: `{"storage_capabilities":{"extent_xattr_v1":"v1"}}`, status: http.StatusOK, wantError: "decode tenant status"},
+		{name: "bad-request", body: `invalid request`, status: http.StatusBadRequest, wantError: "HTTP 400: invalid request"},
 		{name: "status", body: `upstream unavailable`, status: http.StatusServiceUnavailable, wantError: "HTTP 503: upstream unavailable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
 				if r.URL.Path != "/v1/status" || r.Header.Get("Authorization") != "Bearer sk-test" {
 					t.Fatalf("unexpected status request: %s auth=%q", r.URL.Path, r.Header.Get("Authorization"))
 				}
@@ -111,6 +114,9 @@ func TestRequireExtentXattrV1PreservesFailureCause(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				if calls != 1 {
+					t.Fatalf("status calls = %d, want 1", calls)
+				}
 				return
 			}
 			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
@@ -118,6 +124,9 @@ func TestRequireExtentXattrV1PreservesFailureCause(t *testing.T) {
 			}
 			if got := errors.Is(err, ErrExtentXattrUnsupported); got != tc.unsupported {
 				t.Fatalf("unsupported = %t, want %t (err=%v)", got, tc.unsupported, err)
+			}
+			if calls != 1 {
+				t.Fatalf("status calls = %d, want 1", calls)
 			}
 		})
 	}

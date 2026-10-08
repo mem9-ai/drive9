@@ -166,19 +166,137 @@ func TestMountRequiredExtentXattrCapabilityFailsClosed(t *testing.T) {
 
 func TestMountRequiredExtentXattrCapabilityPreservesHTTPFailure(t *testing.T) {
 	setupMountProfileAppendLogTest(t)
+	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
 		if r.URL.Path != "/v1/status" || r.Header.Get("Authorization") != "Bearer sk-test" {
 			t.Fatalf("unexpected status request: %s auth=%q", r.URL.Path, r.Header.Get("Authorization"))
 		}
 		http.Error(w, "tunnel unavailable", http.StatusServiceUnavailable)
 	}))
 	t.Cleanup(srv.Close)
-	err := MountCmd([]string{
-		"--foreground", "--mode=fuse", "--profile=extent", "--require-extent-xattr-v1",
-		"--server=" + srv.URL, "--api-key=sk-test", t.TempDir(),
+	stderr, err := captureStderrE(t, func() error {
+		return MountCmd([]string{
+			"--foreground", "--mode=fuse", "--profile=extent", "--require-extent-xattr-v1",
+			"--server=" + srv.URL, "--api-key=sk-test", t.TempDir(),
+		})
 	})
-	if err == nil || !strings.Contains(err.Error(), "HTTP 503: tunnel unavailable") {
+	if err == nil || !strings.Contains(err.Error(), "exhausted after 3 attempts") || !strings.Contains(err.Error(), "HTTP 503: tunnel unavailable") {
 		t.Fatalf("required capability error = %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("status calls = %d, want 3", calls)
+	}
+	if strings.Count(stderr, "class=http_5xx") != 2 {
+		t.Fatalf("retry diagnostics = %q, want two http_5xx markers", stderr)
+	}
+}
+
+func TestProbeMountExtentXattrSupportRetriesTransientFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		firstCode  int
+		firstReset bool
+		wantClass  string
+	}{
+		{name: "transport", firstReset: true, wantClass: "transport"},
+		{name: "server-status", firstCode: http.StatusBadGateway, wantClass: "http_5xx"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.URL.Path != "/v1/status" || r.Header.Get("Authorization") != "Bearer sk-test" {
+					t.Fatalf("unexpected status request: %s auth=%q", r.URL.Path, r.Header.Get("Authorization"))
+				}
+				if calls == 1 && tc.firstReset {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Fatalf("hijack status connection: %v", err)
+					}
+					_ = conn.Close()
+					return
+				}
+				if calls == 1 && tc.firstCode != 0 {
+					http.Error(w, "temporary upstream failure", tc.firstCode)
+					return
+				}
+				_, _ = fmt.Fprint(w, `{"storage_capabilities":{"extent_xattr_v1":true}}`)
+			}))
+			t.Cleanup(srv.Close)
+			stderr, err := captureStderrE(t, func() error {
+				return probeMountExtentXattrSupport(t.Context(), srv.URL, "sk-test", "")
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if calls != 2 {
+				t.Fatalf("status calls = %d, want 2", calls)
+			}
+			if !strings.Contains(stderr, "next_attempt=2/3 class="+tc.wantClass) {
+				t.Fatalf("retry diagnostic = %q", stderr)
+			}
+		})
+	}
+}
+
+func TestProbeMountExtentXattrSupportExhaustsTransportRetries(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Fatalf("hijack status connection: %v", err)
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+	stderr, err := captureStderrE(t, func() error {
+		return probeMountExtentXattrSupport(t.Context(), srv.URL, "sk-test", "")
+	})
+	if err == nil || !strings.Contains(err.Error(), "exhausted after 3 attempts") {
+		t.Fatalf("required capability error = %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("status calls = %d, want 3", calls)
+	}
+	if strings.Count(stderr, "class=transport") != 2 {
+		t.Fatalf("retry diagnostics = %q, want two transport markers", stderr)
+	}
+}
+
+func TestProbeMountExtentXattrSupportDoesNotRetryDefinitiveFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{name: "missing-capability", status: http.StatusOK, body: `{"storage_capabilities":{}}`},
+		{name: "false-capability", status: http.StatusOK, body: `{"storage_capabilities":{"extent_xattr_v1":false}}`},
+		{name: "decode", status: http.StatusOK, body: `{"storage_capabilities":{"extent_xattr_v1":"v1"}}`},
+		{name: "client-status", status: http.StatusForbidden, body: `forbidden`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				w.WriteHeader(tc.status)
+				_, _ = fmt.Fprint(w, tc.body)
+			}))
+			t.Cleanup(srv.Close)
+			stderr, err := captureStderrE(t, func() error {
+				return probeMountExtentXattrSupport(t.Context(), srv.URL, "sk-test", "")
+			})
+			if err == nil {
+				t.Fatal("definitive capability failure was accepted")
+			}
+			if calls != 1 {
+				t.Fatalf("status calls = %d, want 1", calls)
+			}
+			if stderr != "" {
+				t.Fatalf("unexpected retry diagnostics: %q", stderr)
+			}
+		})
 	}
 }
 

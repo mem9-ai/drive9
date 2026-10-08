@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,6 +38,8 @@ const (
 	defaultMountPerfCPUDuration          = 30 * time.Second
 	defaultMountPerfCPUInterval          = 10 * time.Minute
 	defaultMountPerfHeapInterval         = 10 * time.Minute
+	requiredExtentXattrProbeAttempts     = 3
+	requiredExtentXattrProbeTimeout      = 5 * time.Second
 	envMountGVisorCompat                 = "DRIVE9_MOUNT_GVISOR_COMPAT"
 	envMountLegacyInterruptibleMutations = "DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS"
 	// legacyInterruptibleMutationsFlagHelp is the user-facing contract for
@@ -693,7 +696,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		if resolved != MountModeFUSE || profileCfg.Name != extentMountProfile {
 			return fmt.Errorf("drive9 mount: --require-extent-xattr-v1 requires --mode=fuse --profile=extent")
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), requiredExtentXattrProbeTimeout)
 		capabilityErr := mountExtentXattrSupported(ctx, serverVal, apiKeyVal, tokenVal)
 		cancel()
 		if capabilityErr != nil {
@@ -1137,7 +1140,57 @@ func probeMountExtentXattrSupport(ctx context.Context, server, apiKey, token str
 	} else {
 		c = client.New(server, apiKey)
 	}
-	return c.RequireExtentXattrV1(ctx)
+	for attempt := 1; attempt <= requiredExtentXattrProbeAttempts; attempt++ {
+		err := c.RequireExtentXattrV1(ctx)
+		if err == nil {
+			return nil
+		}
+		failureClass, retryable := extentXattrProbeFailureClass(ctx, err)
+		if !retryable {
+			return err
+		}
+		if attempt == requiredExtentXattrProbeAttempts {
+			return fmt.Errorf("required capability probe exhausted after %d attempts: %w", attempt, err)
+		}
+		_, _ = fmt.Fprintf(os.Stderr,
+			"drive9: required capability probe retry next_attempt=%d/%d class=%s\n",
+			attempt+1, requiredExtentXattrProbeAttempts, failureClass)
+		timer := time.NewTimer(extentXattrProbeRetryDelay(attempt))
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("required capability probe stopped after %d attempts: %w", attempt, ctx.Err())
+		case <-timer.C:
+		}
+	}
+	return errors.New("required capability probe failed")
+}
+
+func extentXattrProbeRetryDelay(failedAttempt int) time.Duration {
+	if failedAttempt == 1 {
+		return 200 * time.Millisecond
+	}
+	return 500 * time.Millisecond
+}
+
+func extentXattrProbeFailureClass(ctx context.Context, err error) (string, bool) {
+	if ctx.Err() != nil {
+		return "", false
+	}
+	var statusErr *client.StatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.StatusCode >= http.StatusInternalServerError && statusErr.StatusCode <= 599 {
+			return "http_5xx", true
+		}
+		return "", false
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return "transport", true
+	}
+	return "", false
 }
 
 func mountCapabilitiesCmd(args []string) error {
