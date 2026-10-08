@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"syscall"
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
@@ -251,6 +252,21 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			fh.Unlock()
 			return
 		}
+		if fs.commitQueue == nil && !fs.layerEnabled() && !fs.appendLogConfiguredLocked(fh) &&
+			(fh.appendSnapshot || fh.Flags&uint32(syscall.O_APPEND) != 0) {
+			err := fs.waitLinkedLegacyAppendUploadsLocked(ctx, fh)
+			if err == nil {
+				err = fs.refreshUnidentifiedAppendAliasesLocked(ctx, fh)
+			}
+			if err == nil {
+				err = fs.adoptLandedAppendSnapshotLocked(ctx, fh)
+			}
+			if err != nil {
+				flushStatus = httpToFuseStatus(err)
+				fh.Unlock()
+				return
+			}
+		}
 		if fs.appendLogConfiguredLocked(fh) {
 			phase = "append-log-release-sync"
 			releasePath := fh.Path
@@ -457,8 +473,20 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			canUseCache := !streamerActive && fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq
 			fs.debugf("release writeback check path=%s streamer_active=%t writeback_seq=%d dirty_seq=%d can_use_cache=%t", fh.Path, streamerActive, fh.WriteBackSeq, fh.DirtySeq, canUseCache)
 			if canUseCache {
+				liveAppend := fh.appendSnapshot || fh.Flags&uint32(syscall.O_APPEND) != 0
 				phase = "writeback-cache-release"
 				useCommitQueue := fs.commitQueue != nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path)
+				if fs.commitQueue == nil && !fs.layerEnabled() && liveAppend && fh.StagedLineageTrusted &&
+					fh.StagedSnapshotID != "" && fh.Dirty.Size() <= maxLandedPayloadBytes {
+					// Without a causal queue, keep the live append owner through
+					// the existing verified commit path instead of surrendering
+					// its ancestor to the raw legacy uploader.
+					uploadCtx, uploadCancel := fs.syncDataCommitContext(cancel, releaseTimeout(fh.Dirty.Size()))
+					flushStatus = fs.flushHandle(uploadCtx, fh)
+					uploadCancel()
+					fh.Unlock()
+					return
+				}
 				var unlockRemoteCommit func()
 				if useCommitQueue {
 					unlockRemoteCommit = fs.takeHandleRemoteCommitPathLocked(fh)
@@ -469,6 +497,21 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 						phase = "superseded-after-commit-fence"
 						return
 					}
+					if liveAppend {
+						err := fs.refreshUnidentifiedAppendAliasesLocked(ctx, fh)
+						if err == nil {
+							err = fs.adoptLandedAppendSnapshotLocked(ctx, fh)
+						}
+						if err != nil || fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+							if err != nil {
+								flushStatus = httpToFuseStatus(err)
+							}
+							unlockRemoteCommit()
+							fh.Unlock()
+							return
+						}
+					}
+
 				}
 				mode, hasMode := fs.modeForPendingHandle(fh)
 				expectedRevision := fs.expectedRevisionForHandleLocked(fh)
@@ -509,7 +552,8 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 							unlockRemoteCommit()
 							return
 						}
-						if fs.gvisorCompatibilityEnabled() {
+						causalAppend := liveAppend && entry.liveLineageProof && entry.Size <= maxLandedPayloadBytes
+						if fs.gvisorCompatibilityEnabled() || causalAppend {
 							uploadCtx, uploadCancel := context.WithTimeout(context.Background(), releaseTimeout(commitSize))
 							commitErr := fs.commitQueue.commitNowPathLocked(uploadCtx, entry)
 							uploadCancel()
@@ -519,7 +563,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 								unlockRemoteCommit()
 								return
 							}
-							fs.writeBack.Remove(fh.Path)
+							if causalAppend {
+								fs.writeBack.RemoveIfGeneration(entry.Path, entry.WriteBackGen)
+							} else {
+								fs.writeBack.Remove(fh.Path)
+							}
 						} else {
 							// Preserve the legacy non-gVisor backpressure behavior.
 							fs.debugf("release uploader submit fallback path=%s", fh.Path)

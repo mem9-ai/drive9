@@ -164,6 +164,7 @@ type Dat9FS struct {
 	committedMu         sync.Mutex
 	committedRev        map[string]int64
 	committedSize       map[string]int64
+	committedAppend     map[string]pathCommitLandmark
 	remoteCommitMu      sync.Mutex
 	remoteCommitLocks   map[string]*sync.Mutex
 	readCache           *ReadCache
@@ -2392,6 +2393,7 @@ func (fs *Dat9FS) recordCommittedRevision(path string, revision int64) {
 	if revision > fs.committedRev[path] {
 		fs.committedRev[path] = revision
 		delete(fs.committedSize, path)
+		delete(fs.committedAppend, path)
 	}
 	fs.committedMu.Unlock()
 }
@@ -2411,6 +2413,9 @@ func (fs *Dat9FS) recordCommittedRevisionWithSize(path string, revision, size in
 		fs.committedSize = make(map[string]int64)
 	}
 	if revision >= fs.committedRev[path] {
+		if revision > fs.committedRev[path] || fs.committedSize[path] != size {
+			delete(fs.committedAppend, path)
+		}
 		fs.committedRev[path] = revision
 		fs.committedSize[path] = size
 	}
@@ -2422,6 +2427,7 @@ func (fs *Dat9FS) replaceCommittedRevision(path string, revision int64) {
 		return
 	}
 	fs.committedMu.Lock()
+	delete(fs.committedAppend, path)
 	if revision <= 0 {
 		delete(fs.committedRev, path)
 		delete(fs.committedSize, path)
@@ -2440,6 +2446,7 @@ func (fs *Dat9FS) replaceCommittedRevisionWithSize(path string, revision, size i
 		return
 	}
 	fs.committedMu.Lock()
+	delete(fs.committedAppend, path)
 	if fs.committedRev == nil {
 		fs.committedRev = make(map[string]int64)
 	}
@@ -2456,6 +2463,7 @@ func (fs *Dat9FS) forgetCommittedRevision(path string) {
 		return
 	}
 	fs.committedMu.Lock()
+	delete(fs.committedAppend, path)
 	delete(fs.committedRev, path)
 	delete(fs.committedSize, path)
 	fs.committedMu.Unlock()
@@ -2471,6 +2479,7 @@ func (fs *Dat9FS) forgetCommittedRevisionPrefix(path string) {
 		if p == path || strings.HasPrefix(p, prefix) {
 			delete(fs.committedRev, p)
 			delete(fs.committedSize, p)
+			delete(fs.committedAppend, p)
 		}
 	}
 	fs.committedMu.Unlock()
@@ -13790,6 +13799,11 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			}
 			fs.discardSupersededMutationLocked(fh)
 			committedBeforeRefresh := fs.latestCommittedRevision(fh.Path)
+			if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+				if err := fs.refreshUnidentifiedAppendAliasesLocked(ctx, fh); err != nil {
+					return 0, gofuse.EAGAIN
+				}
+			}
 			fs.adoptCommittedRevisionLocked(fh)
 			if fh.Dirty == nil {
 				source = "new-dirty-buffer"
@@ -14695,7 +14709,11 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 // NOTE: This method temporarily releases fh.mu during network calls
 // (FinishStreaming, UploadAll) to avoid deadlock with streaming upload
 // callbacks. The lock is re-acquired before modifying handle state.
-func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofuse.Status) {
+func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
+	return fs.flushHandleWithAppendRetryBudget(ctx, fh, maxLiveSnapshotAncestors)
+}
+
+func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *FileHandle, appendRetries int) (status gofuse.Status) {
 	start := time.Now()
 	phase := "start"
 	defer func() {
@@ -14743,6 +14761,30 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 	if !fh.Dirty.HasDirtyParts() {
 		phase = "no-dirty-parts"
+		return httpToFuseStatus(fs.finishLandedAppendPendingModeLocked(ctx, fh))
+	}
+	if err := fs.waitLinkedLegacyAppendUploadsLocked(ctx, fh); err != nil {
+		return httpToFuseStatus(err)
+	}
+	if fh.Unlinked {
+		fs.cancelUnlinkedRemotePublishLocked(fh)
+		return gofuse.OK
+	}
+	if fs.discardSupersededMutationLocked(fh) {
+		return gofuse.OK
+	}
+	if fs.commitQueue == nil && (fh.appendSnapshot || fh.Flags&uint32(syscall.O_APPEND) != 0) {
+		if err := fs.refreshUnidentifiedAppendAliasesLocked(ctx, fh); err != nil {
+			return httpToFuseStatus(err)
+		}
+		if err := fs.adoptLandedAppendSnapshotLocked(ctx, fh); err != nil {
+			return httpToFuseStatus(err)
+		}
+	}
+	if err := fs.finishLandedAppendPendingModeLocked(ctx, fh); err != nil {
+		return httpToFuseStatus(err)
+	}
+	if !fh.Dirty.HasDirtyParts() {
 		return gofuse.OK
 	}
 	if handled, st := fs.commitAppendSnapshotLocked(ctx, fh); handled {
@@ -14978,6 +15020,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	handleIno := fh.Ino
 	handleDirtySeq := fh.DirtySeq
 	handleOrigSize := fh.OrigSize
+	handleOrigBase := fh.BaseRev
 	handleDirtyPartSize := fh.Dirty.PartSize()
 	handleFullRangeLoaded := writeBufferHasLoadedFullRange(fh.Dirty)
 	commitBuffer, commitVersion := fh.Dirty, fh.Dirty.contentVersion
@@ -15052,6 +15095,22 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 		dataCopy = make([]byte, fh.Dirty.Size())
 		copy(dataCopy, fh.Dirty.bytesView())
+	}
+
+	var capturedAppendProof pathCommitLandmark
+	if fs.commitQueue == nil && !usePatch && (fh.appendSnapshot || fh.Flags&uint32(syscall.O_APPEND) != 0) {
+		capturedAppendProof.size = size
+		if size <= maxLandedPayloadBytes {
+			snapshotID, _ := ensureStagedSnapshotLineageLocked(fh)
+			if fh.StagedLineageTrusted {
+				capturedAppendProof.snapshotID = snapshotID
+				capturedAppendProof.ancestors = append([]string(nil), fh.stagedAncestors...)
+				capturedAppendProof.checksum = payloadChecksum(dataCopy)
+				// Later same-handle writes must inherit the exact image being
+				// uploaded, even while this synchronous request drops fh.mu.
+				publishStagedSnapshotLineageLocked(fh)
+			}
+		}
 	}
 
 	// Lock ordering fix (B3): Release fh.mu but keep remoteCommitLock
@@ -15178,6 +15237,12 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 	if err == nil {
 		fs.removeSupersededZeroTruncateStagingLocked(handlePath, committedBarrierRev, size)
+		if fs.commitQueue == nil && !usePatch && (capturedAppendProof.snapshotID != "" || size > maxLandedPayloadBytes) {
+			capturedAppendProof.rev = committedBarrierRev
+			if fs.recordCommittedAppendSnapshot(handlePath, capturedAppendProof) {
+				fs.publishLinkedAppendCommit(handlePath, handleIno, committedBarrierRev, size)
+			}
+		}
 	}
 	recordMutationBeforeFenceRelease()
 
@@ -15194,6 +15259,24 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 	fh.Lock()
 	fs.debugDurationf(uploadStart, 0, "flushHandle path2 relock after upload path=%s size=%d err=%v", handlePath, size, err)
+
+	if errors.Is(err, client.ErrConflict) && appendRetries > 0 && ctx.Err() == nil &&
+		fs.commitQueue == nil && capturedAppendProof.snapshotID != "" &&
+		fh.Path == handlePath && fh.Ino == handleIno && !fh.Unlinked &&
+		fs.latestCommittedRevision(handlePath) > handleOrigBase {
+		// Two live aliases can both enter conditional PUT before either
+		// publishes. Only this process's verified snapshot relationship can
+		// resolve the loser; a foreign/common-ancestor conflict stays failed.
+		if adoptErr := fs.adoptLandedAppendSnapshotLocked(ctx, fh); adoptErr == nil && fh.BaseRev > handleOrigBase {
+			if !fh.Dirty.HasDirtyParts() {
+				if modeErr := fs.finishLandedAppendPendingModeLocked(ctx, fh); modeErr != nil {
+					return httpToFuseStatus(modeErr)
+				}
+				return httpToFuseStatus(fs.applyPendingModeForHandleLocked(ctx, fh))
+			}
+			return fs.flushHandleWithAppendRetryBudget(ctx, fh, appendRetries-1)
+		}
+	}
 
 	if err != nil {
 		if handled, appendStatus := fs.routeAppendLogGenericUnsupportedLocked(ctx, fh, handlePath, handleDirtySeq, err); handled {
@@ -15272,6 +15355,12 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fh.DirtySeq = 0
 	}
 
+	// This proven creation already reset and published its exact watermark
+	// while holding the path fence. Finalization must not reset it again.
+	if capturedAppendProof.rev > 0 && handleIsNew && !pathRetargeted &&
+		fs.sameLinkedInode(handlePath, handleIno) {
+		fh.IsNew = false
+	}
 	if committedRev > 0 {
 		clearReadTargetForLockedHandle(fh)
 		if pathRetargeted {
@@ -15341,6 +15430,13 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			}
 		}
 	}
+	// Creation finalization may reset the same path watermark. Reattach only
+	// this captured successful upload; a newer watermark rejects it atomically.
+	if !pathRetargeted && !fh.Unlinked && fs.sameLinkedInode(handlePath, handleIno) &&
+		capturedAppendProof.rev > 0 && fs.recordCommittedAppendSnapshot(handlePath, capturedAppendProof) {
+		fs.publishLinkedAppendCommit(handlePath, handleIno, capturedAppendProof.rev, capturedAppendProof.size)
+	}
+
 	// When concurrent writes happened (DirtySeq changed), the buffer may
 	// have a different size than the uploaded snapshot. Use the current
 	// dirty buffer size so inode attrs and dir cache reflect reality.
@@ -15846,15 +15942,34 @@ func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int6
 	if committedRev > 0 {
 		if meta.Kind == PendingNew {
 			fs.replaceCommittedRevision(meta.Path, committedRev)
-		} else {
-			fs.recordCommittedRevision(meta.Path, committedRev)
 		}
-		fs.refreshCommittedRevisionForOpenHandles(meta.Path, committedRev, nil)
+		fs.recordCommittedRevisionWithSize(meta.Path, committedRev, meta.Size)
+		fs.recordCommittedAppendSnapshot(meta.Path, pathCommitLandmark{
+			rev: committedRev, size: meta.Size, checksum: meta.liveChecksum,
+			snapshotID: meta.SnapshotID, ancestors: meta.liveAncestors,
+		})
+		// A later linked producer may already have published its successor.
+		// Retire only our generations below; do not republish older state.
+		if fs.latestCommittedRevision(meta.Path) == committedRev {
+			if fs.commitQueue != nil {
+				// Empty identity invalidates an older proof; actual uploaded
+				// bytes authorize a new proof only through process-local trust.
+				fs.commitQueue.rememberLanded(meta.Path, committedRev, meta.Size, meta.liveChecksum, meta.SnapshotID, meta.liveAncestors...)
+			}
+			fs.refreshCommittedRevisionForOpenHandlesWithSize(meta.Path, committedRev, nil, meta.Size)
+			if ino, present := fs.inodes.GetInode(meta.Path); present {
+				fs.inodes.UpdateRevision(ino, committedRev)
+				fs.inodes.UpdateSize(ino, meta.Size)
+				if fs.publishLinkedAppendCommit(meta.Path, ino, committedRev, meta.Size) {
+					fs.finishSyncCommitKernelCacheBoundary(ino, meta.Path, committedRev, meta.Size)
+				}
+			}
+			fs.cacheFileForPath(meta.Path, meta.Size, time.Now(), committedRev)
+		}
 	} else {
 		fs.forgetCommittedRevision(meta.Path)
+		fs.cacheFileForPath(meta.Path, meta.Size, time.Now(), committedRev)
 	}
-	// cacheFileForPath resolves an armed local time override centrally.
-	fs.cacheFileForPath(meta.Path, meta.Size, time.Now(), committedRev)
 	// Clean up pendingIndex and shadowStore so that Unlink does not see a
 	// stale PendingNew entry and skip the remote DELETE (thinking the file
 	// was never uploaded). This mirrors commitQueue's onCommitSuccessWithOptions

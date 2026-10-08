@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"syscall"
+	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -21,15 +22,18 @@ func (fs *Dat9FS) sameLinkedInode(path string, ino uint64) bool {
 // and watermark with names still attached to this file. Path-owned staging
 // and generation cleanup remain separate for each alias.
 func (fs *Dat9FS) publishLinkedAppendCommit(path string, ino uint64, revision, size int64) bool {
-	if fs.commitQueue == nil || fs.layerEnabled() || revision <= 0 ||
+	if fs.layerEnabled() || revision <= 0 ||
 		!fs.sameLinkedInode(path, ino) {
 		return false
 	}
 	entry, ok := fs.inodes.GetEntry(ino)
-	if !ok || entry.ResourceID == "" || len(entry.Paths) < 2 {
+	if !ok || len(entry.Paths) < 2 {
 		return false
 	}
-	proof := fs.commitQueue.landedCommit(path)
+	proof := pathCommitLandmark{}
+	if entry.ResourceID != "" {
+		proof = fs.landedAppendCommit(path)
+	}
 	if proof.rev != revision {
 		proof = pathCommitLandmark{}
 	}
@@ -41,11 +45,127 @@ func (fs *Dat9FS) publishLinkedAppendCommit(path string, ino uint64, revision, s
 		// Alias lookup/GetAttr must not restore an older cached length
 		// after another name commits the final append image.
 		fs.cacheFileForPath(alias, size, entry.Mtime, revision)
-		fs.commitQueue.rememberLanded(alias, revision, size, proof.checksum, proof.snapshotID, proof.ancestors...)
+		if fs.commitQueue != nil {
+			fs.commitQueue.rememberLanded(alias, revision, size, proof.checksum, proof.snapshotID, proof.ancestors...)
+		} else {
+			aliasProof := proof
+			aliasProof.rev, aliasProof.size = revision, size
+			fs.recordCommittedAppendSnapshot(alias, aliasProof)
+		}
 		fs.invalidateReadCacheAndTargets(alias)
-		fs.refreshCommittedRevisionForOpenHandlesWithSize(alias, revision, nil, size)
+		if entry.ResourceID != "" {
+			fs.refreshCommittedRevisionForOpenHandlesWithSize(alias, revision, nil, size)
+		}
 	}
 	return true
+}
+
+// refreshUnidentifiedAppendAliasesLocked resolves an advisory Link identity
+// only after a locally committed alias fence makes the retained baseline old.
+// All still-linked names must agree before any buffer or CAS base is changed.
+func (fs *Dat9FS) refreshUnidentifiedAppendAliasesLocked(ctx context.Context, fh *FileHandle) error {
+	entry, ok := fs.inodes.GetEntry(fh.Ino)
+	if !ok || entry.ResourceID != "" || len(entry.Paths) < 2 || fs.latestCommittedRevision(fh.Path) <= fh.BaseRev {
+		return nil
+	}
+	paths := fs.appendReadPaths(fh.Ino)
+	resourceID := ""
+	revisions := make(map[string]int64, len(paths))
+	for _, path := range paths {
+		if !fs.sameLinkedInode(path, fh.Ino) {
+			return syscall.EAGAIN
+		}
+		stat, err := fs.client.StatCtx(ctx, fs.remotePath(path))
+		if err != nil || stat == nil || stat.IsDir || stat.ResourceID == "" || stat.Revision < fs.latestCommittedRevision(path) {
+			return syscall.EAGAIN
+		}
+		if resourceID != "" && resourceID != stat.ResourceID {
+			return syscall.EAGAIN
+		}
+		resourceID = stat.ResourceID
+		revisions[path] = stat.Revision
+	}
+	for _, path := range paths {
+		if revisions[path] < fs.latestCommittedRevision(path) {
+			return syscall.EAGAIN
+		}
+	}
+	fs.inodes.mu.Lock()
+	current, present := fs.inodes.byInode[fh.Ino]
+	valid := present && !current.IsDir && len(current.Paths) == len(paths) && (current.ResourceID == "" || current.ResourceID == resourceID)
+	if valid {
+		for _, path := range paths {
+			if _, member := current.Paths[path]; !member || fs.inodes.byPath[path] != fh.Ino {
+				valid = false
+				break
+			}
+		}
+	}
+	if valid {
+		fs.inodes.setIdentityLocked(current, resourceID)
+	}
+	fs.inodes.mu.Unlock()
+	if !valid {
+		return syscall.EAGAIN
+	}
+	for _, path := range paths {
+		proof := fs.landedAppendCommit(path)
+		if proof.snapshotID != "" && proof.checksum != "" {
+			fs.publishLinkedAppendCommit(path, fh.Ino, proof.rev, proof.size)
+		}
+	}
+	return nil
+}
+
+// recordCommittedAppendSnapshot attaches the existing live lineage proof to
+// the committed watermark when no queue owns that proof. The revision, size
+// and immutable identity are published together; nothing survives recovery.
+func (fs *Dat9FS) recordCommittedAppendSnapshot(path string, proof pathCommitLandmark) bool {
+	if fs.commitQueue != nil || path == "" || proof.rev <= 0 || proof.size < 0 {
+		return false
+	}
+	fs.committedMu.Lock()
+	defer fs.committedMu.Unlock()
+	if proof.rev < fs.committedRev[path] {
+		return false
+	}
+	if fs.committedRev == nil {
+		fs.committedRev = make(map[string]int64)
+	}
+	if fs.committedSize == nil {
+		fs.committedSize = make(map[string]int64)
+	}
+	fs.committedRev[path], fs.committedSize[path] = proof.rev, proof.size
+	if proof.snapshotID == "" || proof.checksum == "" || proof.size > maxLandedPayloadBytes {
+		delete(fs.committedAppend, path)
+		return true
+	}
+	if fs.committedAppend == nil {
+		fs.committedAppend = make(map[string]pathCommitLandmark)
+	}
+	if len(fs.committedAppend) >= maxLandedCommitLandmarks {
+		for old := range fs.committedAppend {
+			delete(fs.committedAppend, old)
+			break
+		}
+	}
+	proof.ancestors = append([]string(nil), proof.ancestors[:min(len(proof.ancestors), maxLiveSnapshotAncestors)]...)
+	fs.committedAppend[path] = proof
+	return true
+}
+
+func (fs *Dat9FS) landedAppendCommit(path string) pathCommitLandmark {
+	if fs.commitQueue != nil {
+		return fs.commitQueue.landedCommit(path)
+	}
+	fs.committedMu.Lock()
+	defer fs.committedMu.Unlock()
+	proof := fs.committedAppend[path]
+	if proof.rev != fs.committedRev[path] || proof.size != fs.committedSize[path] {
+		return pathCommitLandmark{}
+	}
+	proof.ancestors = append([]string(nil), proof.ancestors...)
+	return proof
 }
 
 // commitAppendSnapshotLocked gives small live append snapshots the same causal
@@ -124,7 +244,11 @@ func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle
 // proof that the landed snapshot includes its exact image. Caller holds fh.mu
 // and the path commit lock. Failed remote checks leave the local state intact.
 func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileHandle) error {
-	if fs.commitQueue == nil || fs.layerEnabled() || fh.Dirty == nil {
+	return fs.adoptLandedAppendSnapshotWithRetryBudgetLocked(ctx, fh, maxLiveSnapshotAncestors)
+}
+
+func (fs *Dat9FS) adoptLandedAppendSnapshotWithRetryBudgetLocked(ctx context.Context, fh *FileHandle, proofRetries int) error {
+	if fs.layerEnabled() || fh.Dirty == nil {
 		return nil
 	}
 	if fh.Dirty.Size() > maxLandedPayloadBytes {
@@ -143,7 +267,7 @@ func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileH
 			return syscall.EAGAIN
 		}
 	}
-	proof := fs.commitQueue.landedCommit(fh.Path)
+	proof := fs.landedAppendCommit(fh.Path)
 	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
 		if max(proof.rev, fs.latestCommittedRevision(fh.Path)) > fh.BaseRev {
 			// Recovered or unrelated dirty images cannot acknowledge more
@@ -154,7 +278,17 @@ func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileH
 			// The local image can already include the landed parent plus
 			// additional writes which must not be retired by adoption.
 			if proof.snapshotID == fh.ContentSnapshotID || slices.Contains(fh.contentAncestors, proof.snapshotID) {
-				return nil
+				if fs.commitQueue != nil {
+					return nil
+				}
+				// This exact live snapshot may have landed before its sync
+				// caller reacquires fh.mu. A subsequent write can retire it;
+				// a different dirty child must preserve its own records.
+				exact := fh.StagedSnapshotID == proof.snapshotID && fh.StagedSnapshotSeq == fh.DirtySeq &&
+					fh.Dirty.CanMaterializeFull() && landedIdentityMatches(proof, proof.rev, fh.Dirty.Size(), fh.Dirty.Bytes())
+				if !exact {
+					return fs.rebaseLegacyAppendOntoLandedParentWithRetryBudgetLocked(ctx, fh, proof, proofRetries)
+				}
 			}
 		}
 	}
@@ -177,7 +311,7 @@ func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileH
 			return syscall.EAGAIN
 		}
 	}
-	stat, data, err := fs.commitQueue.readRemoteSnapshotStat(ctx, fh.Path)
+	stat, data, err := readBoundedRemoteSnapshotStat(ctx, fs.client, fs.remotePath(fh.Path))
 	if err != nil {
 		return err
 	}
@@ -187,9 +321,12 @@ func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileH
 	}
 	revision, size := stat.Revision, stat.Size
 	if !landedIdentityMatches(proof, revision, size, data) {
-		current := fs.commitQueue.landedCommit(fh.Path)
+		current := fs.landedAppendCommit(fh.Path)
 		if current.rev > proof.rev && current.snapshotID != "" && current.checksum != "" &&
 			slices.Contains(current.ancestors, proof.snapshotID) {
+			if fs.commitQueue == nil {
+				return fs.retryLegacyAppendProofAdvanceLocked(ctx, fh, proof, proofRetries)
+			}
 			return errAppendRefreshBusy
 		}
 		return syscall.EAGAIN
@@ -200,7 +337,14 @@ func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileH
 	}
 	next.ClearDirty()
 	next.markCommittedPrefix(revision, size)
+	modeMeta := fs.claimLandedAppendPendingModeLocked(fh, fh.StagedSnapshotID)
+	if modeMeta != nil {
+		fh.WriteBackGen = 0
+	}
 	fs.removeHandleOwnedStagingLocked(fh)
+	if modeMeta != nil {
+		fh.WriteBackGen = modeMeta.Generation
+	}
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fh.Dirty = next
 	fh.DirtySeq, fh.WriteBackSeq = 0, 0
@@ -243,16 +387,99 @@ func (fs *Dat9FS) tryLockAppendRemoteCommitPathLocked(fh *FileHandle) (func(), b
 }
 
 func (fs *Dat9FS) appendCommitPending(fh *FileHandle) bool {
-	if fs.commitQueue == nil {
-		return false
-	}
-	if fs.commitQueue.HasPath(fh.Path) {
+	if fs.commitQueue != nil && fs.commitQueue.HasPath(fh.Path) || fs.uploader != nil && fs.uploader.hasPath(fh.Path) {
 		return true
 	}
 	for _, path := range fs.appendReadPaths(fh.Ino) {
-		if fs.sameLinkedInode(path, fh.Ino) && fs.commitQueue.HasPath(path) {
+		if fs.sameLinkedInode(path, fh.Ino) &&
+			(fs.commitQueue != nil && fs.commitQueue.HasPath(path) || fs.legacyAppendCommitPendingLocked(fh, path)) {
 			return true
 		}
 	}
 	return false
+}
+
+// Caller owns fh.mu; an unexamined busy producer remains pending.
+func (fs *Dat9FS) legacyAppendCommitPendingLocked(fh *FileHandle, path string) bool {
+	if fs.uploader != nil && fs.uploader.hasPath(path) {
+		return true
+	}
+	if fs.writeBack == nil {
+		return false
+	}
+	meta, exists := fs.writeBack.GetMeta(path)
+	if !exists || meta.Kind == PendingChmod || meta.LayerClean {
+		return false
+	}
+	for _, source := range fs.openHandles.SnapshotPath(path) {
+		if source != fh && !source.TryLock() {
+			return true
+		}
+		access := source.Flags & uint32(syscall.O_ACCMODE)
+		owned := meta.Generation != 0 && !source.Unlinked && source.Path == path &&
+			source.Ino == fh.Ino && (access == syscall.O_WRONLY || access == syscall.O_RDWR) &&
+			source.Dirty != nil && source.DirtySeq != 0 && source.WriteBackSeq != 0 &&
+			source.WriteBackGen == meta.Generation
+		if source != fh {
+			source.Unlock()
+		}
+		if owned {
+			return false
+		}
+	}
+	return true
+}
+
+var testHookBeforeLinkedUploaderWait func(*FileHandle, string)
+
+// Wait for released legacy ancestors before submitting a live descendant.
+// Drop the handle lock while waiting, as callbacks and other producers may
+// need it. The caller's context owns the whole wait, including queued uploads
+// which have not entered the uploader's in-flight map yet.
+func (fs *Dat9FS) waitLinkedLegacyAppendUploadsLocked(ctx context.Context, fh *FileHandle) error {
+	if fs.commitQueue != nil || fs.uploader == nil || fs.layerEnabled() || fh.Dirty == nil ||
+		(!fh.appendSnapshot && fh.Flags&uint32(syscall.O_APPEND) == 0) {
+		return nil
+	}
+	path, ino := fh.Path, fh.Ino
+	for {
+		if fh.Unlinked {
+			return nil
+		}
+		if fh.Path != path || fh.Ino != ino {
+			return syscall.EAGAIN
+		}
+		pending := ""
+		for _, alias := range fs.appendReadPaths(ino) {
+			if fs.sameLinkedInode(alias, ino) && fs.legacyAppendCommitPendingLocked(fh, alias) {
+				pending = alias
+				break
+			}
+		}
+		if pending == "" {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		active := fs.uploader.hasPath(pending)
+		if active && testHookBeforeLinkedUploaderWait != nil {
+			testHookBeforeLinkedUploaderWait(fh, pending)
+		}
+		fh.Unlock()
+		var err error
+		if active {
+			err = fs.uploader.waitPathContext(ctx, pending)
+		} else {
+			select {
+			case <-ctx.Done():
+				err = ctx.Err()
+			case <-time.After(samePathDirtyWaitInterval):
+			}
+		}
+		fh.Lock()
+		if err != nil {
+			return err
+		}
+	}
 }

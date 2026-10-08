@@ -317,7 +317,14 @@ func (cq *CommitQueue) readRemoteSnapshot(parent context.Context, path string) (
 // readRemoteSnapshotStat is readRemoteSnapshot with the stat the body was read
 // from, for callers that need more than the revision (mode, for instance).
 func (cq *CommitQueue) readRemoteSnapshotStat(parent context.Context, path string) (*client.StatResult, []byte, error) {
-	if cq == nil || cq.client == nil || path == "" {
+	if cq == nil {
+		return nil, nil, fmt.Errorf("missing remote snapshot source")
+	}
+	return readBoundedRemoteSnapshotStat(parent, cq.client, cq.remotePath(path))
+}
+
+func readBoundedRemoteSnapshotStat(parent context.Context, remoteClient *client.Client, apiPath string) (*client.StatResult, []byte, error) {
+	if remoteClient == nil || apiPath == "" {
 		return nil, nil, fmt.Errorf("missing remote snapshot source")
 	}
 	if parent == nil {
@@ -325,8 +332,7 @@ func (cq *CommitQueue) readRemoteSnapshotStat(parent context.Context, path strin
 	}
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
-	apiPath := cq.remotePath(path)
-	st, err := cq.client.StatCtx(ctx, apiPath)
+	st, err := remoteClient.StatCtx(ctx, apiPath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -334,7 +340,7 @@ func (cq *CommitQueue) readRemoteSnapshotStat(parent context.Context, path strin
 		return nil, nil, fmt.Errorf("remote snapshot exceeds lineage proof limit")
 	}
 	// Bound the response even if the remote object grows after Stat.
-	reader, err := cq.client.ReadStreamRange(ctx, apiPath, 0, maxLandedPayloadBytes+1)
+	reader, err := remoteClient.ReadStreamRange(ctx, apiPath, 0, maxLandedPayloadBytes+1)
 	if err != nil {
 		return nil, nil, err
 	}
