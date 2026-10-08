@@ -20,14 +20,14 @@ func (fs *Dat9FS) sameLinkedInode(path string, ino uint64) bool {
 // publishLinkedAppendCommit shares only the queue's existing committed proof
 // and watermark with names still attached to this file. Path-owned staging
 // and generation cleanup remain separate for each alias.
-func (fs *Dat9FS) publishLinkedAppendCommit(path string, ino uint64, revision, size int64) {
+func (fs *Dat9FS) publishLinkedAppendCommit(path string, ino uint64, revision, size int64) bool {
 	if fs.commitQueue == nil || fs.layerEnabled() || revision <= 0 ||
 		!fs.sameLinkedInode(path, ino) {
-		return
+		return false
 	}
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok || entry.ResourceID == "" || len(entry.Paths) < 2 {
-		return
+		return false
 	}
 	proof := fs.commitQueue.landedCommit(path)
 	if proof.rev != revision {
@@ -45,6 +45,7 @@ func (fs *Dat9FS) publishLinkedAppendCommit(path string, ino uint64, revision, s
 		fs.invalidateReadCacheAndTargets(alias)
 		fs.refreshCommittedRevisionForOpenHandlesWithSize(alias, revision, nil, size)
 	}
+	return true
 }
 
 // commitAppendSnapshotLocked gives small live append snapshots the same causal
@@ -123,9 +124,18 @@ func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle
 // proof that the landed snapshot includes its exact image. Caller holds fh.mu
 // and the path commit lock. Failed remote checks leave the local state intact.
 func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileHandle) error {
-	if fs.commitQueue == nil || fs.layerEnabled() ||
-		fh.Dirty == nil || fh.Dirty.Size() > maxLandedPayloadBytes ||
-		(fh.Streamer != nil && fh.Streamer.Started()) {
+	if fs.commitQueue == nil || fs.layerEnabled() || fh.Dirty == nil {
+		return nil
+	}
+	if fh.Dirty.Size() > maxLandedPayloadBytes {
+		// A dirty oversized image cannot adopt a newer CAS token alone.
+		// Preserve it and reject more writes until the content can align.
+		if (fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts()) && fs.latestCommittedRevision(fh.Path) > fh.BaseRev {
+			return syscall.EAGAIN
+		}
+		return nil
+	}
+	if fh.Streamer != nil && fh.Streamer.Started() {
 		return nil
 	}
 	if fs.inodes != nil {
@@ -177,6 +187,11 @@ func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileH
 	}
 	revision, size := stat.Revision, stat.Size
 	if !landedIdentityMatches(proof, revision, size, data) {
+		current := fs.commitQueue.landedCommit(fh.Path)
+		if current.rev > proof.rev && current.snapshotID != "" && current.checksum != "" &&
+			slices.Contains(current.ancestors, proof.snapshotID) {
+			return errAppendRefreshBusy
+		}
 		return syscall.EAGAIN
 	}
 	next := fs.newWriteBuffer(fh.Path, max(fh.Dirty.maxSize, size), fh.Dirty.PartSize())

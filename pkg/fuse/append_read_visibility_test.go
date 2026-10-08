@@ -67,13 +67,14 @@ func TestIssue986UnstagedAdoption(t *testing.T) {
 	if !loaded || string(target.Dirty.Bytes()) != "CHANGED!" {
 		t.Fatal("adoption did not occur")
 	}
-	if target.ContentSnapshotID != "" || len(target.contentAncestors) != 0 {
-		t.Fatal("expected the untagged adoption counterexample")
+	if target.ContentSnapshotID == "" || target.ContentSnapshotID != source.StagedSnapshotID ||
+		target.ContentSnapshotID != source.ContentSnapshotID || target.LineageTrusted != source.LineageTrusted {
+		t.Fatal("adopted bytes lost their source snapshot identity")
 	}
 	if target.Dirty.prefixRevision != 0 {
 		t.Fatal("adopted prefix falsely remains proved")
 	}
-	t.Log("inherited changed prefix with empty snapshot ID; buffer proof invalidated")
+	t.Log("inherited source snapshot identity; uncommitted buffer prefix proof remains invalidated")
 }
 
 func TestIssue986PrefixRead(t *testing.T) {
