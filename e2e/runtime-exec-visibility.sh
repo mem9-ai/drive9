@@ -73,6 +73,52 @@ unmount_raw_workspace() {
   RAW_MOUNTED=0
 }
 
+raw_metadata_for() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path, layout, extent_ino = sys.argv[1:]
+try:
+    current = os.lstat(path)
+except OSError as exc:
+    print(json.dumps({"error": f"lstat:{exc.errno}", "path": path}, sort_keys=True))
+    raise SystemExit(2)
+try:
+    names = sorted(os.listxattr(path))
+except OSError as exc:
+    print(json.dumps({"error": f"listxattr:{exc.errno}", "path": path}, sort_keys=True))
+    raise SystemExit(3)
+try:
+    override = os.getxattr(path, b"user.fuseoverlayfs.override_stat").decode("ascii")
+except OSError as exc:
+    override = f"<getxattr-error:{exc.errno}>"
+override_owner = None
+override_mode = None
+parts = override.split(":")
+if len(parts) == 3:
+    try:
+        override_owner = f"{int(parts[0])}:{int(parts[1])}"
+        override_mode = format(int(parts[2], 8) & 0o7777, "o")
+    except ValueError:
+        pass
+print(json.dumps({
+    "path": path,
+    "layout": layout,
+    "extent_ino": extent_ino,
+    "stat_inode": current.st_ino,
+    "stat_owner": f"{current.st_uid}:{current.st_gid}",
+    "stat_mode": format(stat.S_IMODE(current.st_mode), "o"),
+    "xattrs": names,
+    "override_stat": override,
+    "override_owner": override_owner,
+    "override_mode": override_mode,
+}, sort_keys=True))
+PY
+}
+
 if [ ! -x "$CLI_BIN" ]; then
   fail "DRIVE9_CLI_BIN is not executable"
 fi
@@ -165,50 +211,8 @@ raw_extent_ino="$(printf '%s\n' "$raw_head" | awk -F': ' 'tolower($1)=="x-dat9-e
   || fail "raw-upper extent inode is missing"
 
 mount_raw_workspace
-raw_metadata="$(python3 - "$RAW_ETC_PATH" "$raw_layout" "$raw_extent_ino" <<'PY'
-import json
-import os
-import stat
-import sys
-
-path, layout, extent_ino = sys.argv[1:]
-try:
-    current = os.lstat(path)
-except OSError as exc:
-    print(json.dumps({"error": f"lstat:{exc.errno}", "path": path}, sort_keys=True))
-    raise SystemExit(2)
-try:
-    names = sorted(os.listxattr(path))
-except OSError as exc:
-    print(json.dumps({"error": f"listxattr:{exc.errno}", "path": path}, sort_keys=True))
-    raise SystemExit(3)
-try:
-    override = os.getxattr(path, b"user.fuseoverlayfs.override_stat").decode("ascii")
-except OSError as exc:
-    override = f"<getxattr-error:{exc.errno}>"
-override_owner = None
-override_mode = None
-parts = override.split(":")
-if len(parts) == 3:
-    try:
-        override_owner = f"{int(parts[0])}:{int(parts[1])}"
-        override_mode = format(int(parts[2], 8) & 0o7777, "o")
-    except ValueError:
-        pass
-print(json.dumps({
-    "path": path,
-    "layout": layout,
-    "extent_ino": extent_ino,
-    "stat_inode": current.st_ino,
-    "stat_owner": f"{current.st_uid}:{current.st_gid}",
-    "stat_mode": format(stat.S_IMODE(current.st_mode), "o"),
-    "xattrs": names,
-    "override_stat": override,
-    "override_owner": override_owner,
-    "override_mode": override_mode,
-}, sort_keys=True))
-PY
-)" || fail "raw-upper metadata inspection failed: ${raw_metadata:-<no-output>}"
+raw_metadata="$(raw_metadata_for "$RAW_ETC_PATH" "$raw_layout" "$raw_extent_ino")" \
+  || fail "raw-upper metadata inspection failed: ${raw_metadata:-<no-output>}"
 printf 'runtime raw-upper metadata: %s\n' "$raw_metadata" >&2
 raw_override="$(printf '%s' "$raw_metadata" | jq -r '.override_stat // empty')"
 raw_override_owner="$(printf '%s' "$raw_metadata" | jq -r '.override_owner // empty')"
@@ -217,6 +221,36 @@ raw_override_mode="$(printf '%s' "$raw_metadata" | jq -r '.override_mode // empt
   || fail "raw-upper override_stat owner expected=65532:65532 actual=${raw_override:-<missing>}"
 [ "$raw_override_mode" = 640 ] \
   || fail "raw-upper override_stat mode expected=640 actual=${raw_override:-<missing>}"
+
+RAW_ROOT_FILE_REL="${ROOT_REL}/upper/root/persist.txt"
+RAW_ROOT_FILE_PATH="$RAW_MOUNT/upper/root/persist.txt"
+raw_root_head="$(curl -fsSI --max-time 20 -H "Authorization: Bearer ${API_KEY}" \
+  "${BASE}/v1/fs/${RAW_ROOT_FILE_REL}" | tr -d '\r')" \
+  || fail "raw-upper root file HEAD failed"
+raw_root_layout="$(printf '%s\n' "$raw_root_head" | awk -F': ' 'tolower($1)=="x-dat9-content-layout"{print $2}')"
+raw_root_extent_ino="$(printf '%s\n' "$raw_root_head" | awk -F': ' 'tolower($1)=="x-dat9-extent-ino"{print $2}')"
+[ "$raw_root_layout" = extent ] \
+  || fail "raw-upper root file layout expected=extent actual=${raw_root_layout:-<missing>}"
+[ -n "$raw_root_extent_ino" ] \
+  || fail "raw-upper root file extent inode is missing"
+raw_root_directory_metadata="$(raw_metadata_for "$RAW_MOUNT/upper/root" directory "")" \
+  || fail "raw-upper root directory metadata inspection failed: ${raw_root_directory_metadata:-<no-output>}"
+raw_root_file_metadata="$(raw_metadata_for "$RAW_ROOT_FILE_PATH" "$raw_root_layout" "$raw_root_extent_ino")" \
+  || fail "raw-upper root file metadata inspection failed: ${raw_root_file_metadata:-<no-output>}"
+printf 'runtime raw-upper root directory metadata: %s\n' "$raw_root_directory_metadata" >&2
+printf 'runtime raw-upper root file metadata: %s\n' "$raw_root_file_metadata" >&2
+raw_root_directory_override="$(printf '%s' "$raw_root_directory_metadata" | jq -r '.override_stat // empty')"
+raw_root_file_override="$(printf '%s' "$raw_root_file_metadata" | jq -r '.override_stat // empty')"
+[ "$(printf '%s' "$raw_root_directory_metadata" | jq -r '.override_owner // empty')" = 0:0 ] \
+  || fail "raw-upper root directory owner expected=0:0 actual=${raw_root_directory_override:-<missing>}"
+[ "$(printf '%s' "$raw_root_directory_metadata" | jq -r '.override_mode // empty')" = 700 ] \
+  || fail "raw-upper root directory mode expected=700 actual=${raw_root_directory_override:-<missing>}"
+[ "$(printf '%s' "$raw_root_file_metadata" | jq -r '.override_owner // empty')" = 65532:65532 ] \
+  || fail "raw-upper root file owner expected=65532:65532 actual=${raw_root_file_override:-<missing>}"
+[ "$(printf '%s' "$raw_root_file_metadata" | jq -r '.override_mode // empty')" = 644 ] \
+  || fail "raw-upper root file mode expected=644 actual=${raw_root_file_override:-<missing>}"
+[ "$(cat "$RAW_ROOT_FILE_PATH")" = root-state ] \
+  || fail "raw-upper root file bytes are not durable"
 unmount_raw_workspace
 
 # Direction 1: after rootfs initialization, an acknowledged FS API write into
@@ -246,7 +280,16 @@ if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
       [ ! -e "$2" ] || fail_check "$1:$2" "absent" "present"
     }
     expect_stat merged-root %u:%g:%a / 0:0:755
+    expect_stat root-directory %u:%g:%a /root 0:0:700
     expect_stat lower-owner %u:%g /bin/sh 0:0
+    capability="$(awk '\''$1 == "CapEff:" { print $2 }'\'' /proc/self/status)"
+    [ "$capability" = 0000000000000002 ] \
+      || fail_check process-capability 0000000000000002 "$capability"
+    root_mount="$(awk '\''$5 == "/" { print }'\'' /proc/self/mountinfo | tail -1)"
+    printf "runtime fresh-root mount: %s uid=%s cap_eff=%s root_stat=%s\n" \
+      "$root_mount" "$(id -u)" "$capability" "$(stat -c %u:%g:%a /root)" >&2
+    printf "%s" "$root_mount" | grep -q " - fuse.fuse-overlayfs " \
+      || fail_check rootfs-mount-type fuse.fuse-overlayfs "$root_mount"
     expect_file api-inbound /etc/api-inbound.txt "$INBOUND_PAYLOAD"
     expect_file root-persist /root/persist.txt root-state
     expect_file home-persist /home/agent/persist.txt home-state
