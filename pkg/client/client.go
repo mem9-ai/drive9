@@ -124,6 +124,10 @@ var ErrConflict = errors.New("conflict")
 // that does not expose the Migration V1 capability object.
 var ErrMigrationUnsupported = errors.New("migration unsupported")
 
+// ErrExtentXattrUnsupported reports that a successful tenant status response
+// did not advertise the exact extent-xattr protocol required by rootfs mounts.
+var ErrExtentXattrUnsupported = errors.New("extent xattr unsupported")
+
 // StatusError preserves the HTTP status code for API errors.
 type StatusError struct {
 	StatusCode int
@@ -558,6 +562,25 @@ func (c *Client) MaxUploadBytes(ctx context.Context) int64 {
 // back. Idempotent; safe to call once at CLI/FUSE startup.
 func (c *Client) Warm(ctx context.Context) {
 	c.ensureTenantStatus(ctx)
+}
+
+// RequireExtentXattrV1 verifies the server side of the extent-xattr protocol.
+// Unlike Warm and the cached compatibility getters, this required-capability
+// path preserves transport, HTTP status, and JSON errors for fail-closed mount
+// diagnostics.
+func (c *Client) RequireExtentXattrV1(ctx context.Context) error {
+	body, err := c.tenantStatus(ctx)
+	if err != nil {
+		var statusErr *StatusError
+		if errors.As(err, &statusErr) {
+			return fmt.Errorf("query %s returned HTTP %d: %w", ExtentXattrProtocolV1, statusErr.StatusCode, err)
+		}
+		return fmt.Errorf("query %s: %w", ExtentXattrProtocolV1, err)
+	}
+	if body.StorageCapabilities == nil || !body.StorageCapabilities.ExtentXattrV1 {
+		return fmt.Errorf("%w: server status did not advertise %s", ErrExtentXattrUnsupported, ExtentXattrProtocolV1)
+	}
+	return nil
 }
 
 // SetSmallFileThresholdForTests pins the client's small-file cutoff

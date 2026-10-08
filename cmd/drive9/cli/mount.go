@@ -694,10 +694,10 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			return fmt.Errorf("drive9 mount: --require-extent-xattr-v1 requires --mode=fuse --profile=extent")
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		supported := mountExtentXattrSupported(ctx, serverVal, apiKeyVal, tokenVal)
+		capabilityErr := mountExtentXattrSupported(ctx, serverVal, apiKeyVal, tokenVal)
 		cancel()
-		if !supported {
-			return fmt.Errorf("drive9 mount: required server capability %s is unavailable", client.ExtentXattrProtocolV1)
+		if capabilityErr != nil {
+			return fmt.Errorf("drive9 mount: required server capability %s is unavailable: %w", client.ExtentXattrProtocolV1, capabilityErr)
 		}
 	}
 	if resolved == MountModeFUSE && runtime.GOOS != "windows" && len(profileCfg.AppendLogPatterns) > 0 {
@@ -1130,15 +1130,14 @@ func probeMountProfileAppendLogSupport(ctx context.Context, server, apiKey, toke
 	return c.CachedAppendLogSupported()
 }
 
-func probeMountExtentXattrSupport(ctx context.Context, server, apiKey, token string) bool {
+func probeMountExtentXattrSupport(ctx context.Context, server, apiKey, token string) error {
 	var c *client.Client
 	if token != "" {
 		c = client.NewWithToken(server, token)
 	} else {
 		c = client.New(server, apiKey)
 	}
-	c.Warm(ctx)
-	return c.CachedExtentXattrSupported()
+	return c.RequireExtentXattrV1(ctx)
 }
 
 func mountCapabilitiesCmd(args []string) error {

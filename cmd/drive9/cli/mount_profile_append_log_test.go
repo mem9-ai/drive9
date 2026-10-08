@@ -28,9 +28,12 @@ func stubMountExtentXattrProbe(t *testing.T, supported bool) *atomic.Int32 {
 	old := mountExtentXattrSupported
 	t.Cleanup(func() { mountExtentXattrSupported = old })
 	var calls atomic.Int32
-	mountExtentXattrSupported = func(context.Context, string, string, string) bool {
+	mountExtentXattrSupported = func(context.Context, string, string, string) error {
 		calls.Add(1)
-		return supported
+		if !supported {
+			return errors.New("diagnostic capability failure")
+		}
+		return nil
 	}
 	return &calls
 }
@@ -154,7 +157,28 @@ func TestMountRequiredExtentXattrCapabilityFailsClosed(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "drive9.extent_xattr.v1") || *got != nil {
 				t.Fatalf("unsupported mount = %v, opts = %#v", err, *got)
 			}
+			if !strings.Contains(err.Error(), "diagnostic capability failure") {
+				t.Fatalf("unsupported mount omitted probe cause: %v", err)
+			}
 		})
+	}
+}
+
+func TestMountRequiredExtentXattrCapabilityPreservesHTTPFailure(t *testing.T) {
+	setupMountProfileAppendLogTest(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/status" || r.Header.Get("Authorization") != "Bearer sk-test" {
+			t.Fatalf("unexpected status request: %s auth=%q", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		http.Error(w, "tunnel unavailable", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	err := MountCmd([]string{
+		"--foreground", "--mode=fuse", "--profile=extent", "--require-extent-xattr-v1",
+		"--server=" + srv.URL, "--api-key=sk-test", t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "HTTP 503: tunnel unavailable") {
+		t.Fatalf("required capability error = %v", err)
 	}
 }
 
