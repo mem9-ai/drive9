@@ -79,13 +79,27 @@ func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle
 // proof that the landed snapshot includes its exact image. Caller holds fh.mu
 // and the path commit lock. Failed remote checks leave the local state intact.
 func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileHandle) error {
-	if fs.commitQueue == nil || fs.layerEnabled() || !fh.LineageTrusted ||
+	if fs.commitQueue == nil || fs.layerEnabled() ||
 		fh.Dirty == nil || fh.Dirty.Size() > maxLandedPayloadBytes ||
 		(fh.Streamer != nil && fh.Streamer.Started()) {
 		return nil
 	}
 	proof := fs.commitQueue.landedCommit(fh.Path)
-	if proof.snapshotID == "" || proof.rev < fh.BaseRev {
+	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		if max(proof.rev, fs.latestCommittedRevision(fh.Path)) > fh.BaseRev {
+			// Recovered or unrelated dirty images cannot acknowledge more
+			// appends against a superseded base. Keep them for recovery.
+			if !fh.LineageTrusted || proof.snapshotID == "" {
+				return syscall.EAGAIN
+			}
+			// The local image can already include the landed parent plus
+			// additional writes which must not be retired by adoption.
+			if proof.snapshotID == fh.ContentSnapshotID || slices.Contains(fh.contentAncestors, proof.snapshotID) {
+				return nil
+			}
+		}
+	}
+	if !fh.LineageTrusted || proof.snapshotID == "" || proof.rev < fh.BaseRev {
 		return nil
 	}
 	if fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
@@ -101,7 +115,7 @@ func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileH
 		}
 		snapshotID, _ := ensureStagedSnapshotLineageLocked(fh)
 		if snapshotID != proof.snapshotID && !slices.Contains(proof.ancestors, snapshotID) {
-			return nil
+			return syscall.EAGAIN
 		}
 	}
 	revision, size, data, err := fs.commitQueue.readRemoteSnapshot(ctx, fh.Path)

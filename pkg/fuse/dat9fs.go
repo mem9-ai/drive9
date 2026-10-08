@@ -3543,8 +3543,8 @@ func (fs *Dat9FS) stageShadowForQueuedCommitLocked(ctx context.Context, fh *File
 			return nil
 		}
 		// An older append fsync must not publish its ancestor over the
-		// verified descendant. Pending mode changes still need staging.
-		if !fh.Unlinked && !fh.HasPendingMode && (fh.appendSnapshot || fh.Flags&uint32(syscall.O_APPEND) != 0) {
+		// verified descendant. Pending mode changes follow that content.
+		if !fh.Unlinked && (fh.appendSnapshot || fh.Flags&uint32(syscall.O_APPEND) != 0) {
 			before := fh.Dirty
 			if err := fs.adoptLandedAppendSnapshotLocked(ctx, fh); err != nil {
 				if acquired {
@@ -3554,8 +3554,14 @@ func (fs *Dat9FS) stageShadowForQueuedCommitLocked(ctx context.Context, fh *File
 				return errors.Join(syscall.EAGAIN, err)
 			}
 			if fh.Dirty != before {
-				fs.releaseHandleRemoteCommitPathLocked(fh)
-				return nil
+				if !fh.HasPendingMode {
+					fs.releaseHandleRemoteCommitPathLocked(fh)
+					return nil
+				}
+				// Content is already committed, but the mode still needs a
+				// durable queued snapshot with the new content as its parent.
+				fh.Dirty.touched = true
+				fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
 			}
 		}
 	}
