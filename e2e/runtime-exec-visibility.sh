@@ -119,6 +119,22 @@ print(json.dumps({
 PY
 }
 
+report_initial_failure_state() {
+  mount_raw_workspace
+  for relative_path in upper upper/root upper/root/persist.txt; do
+    path="$RAW_MOUNT/$relative_path"
+    if [ ! -e "$path" ]; then
+      printf 'runtime initial-failure raw metadata: {"path":"%s","state":"absent"}\n' \
+        "$relative_path" >&2
+      continue
+    fi
+    metadata="$(raw_metadata_for "$path" diagnostic "")" \
+      || fail "initial-failure raw metadata inspection failed: ${metadata:-<no-output>}"
+    printf 'runtime initial-failure raw metadata: %s\n' "$metadata" >&2
+  done
+  unmount_raw_workspace
+}
+
 if [ ! -x "$CLI_BIN" ]; then
   fail "DRIVE9_CLI_BIN is not executable"
 fi
@@ -163,31 +179,66 @@ curl -fsS --max-time 20 -X POST -H "Authorization: Bearer ${API_KEY}" \
 if ! DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
   --workspace "$ROOT" --timeout 30s -- \
   /bin/sh -c 'set -eu
-    test -x /bin/sh
-    test "$(stat -c %u:%g:%a /)" = 0:0:755
-    test "$(stat -c %u:%g /bin/sh)" = 0:0
-    test "$(id -u)" = 65532
-    test "$(awk '\''$1 == "CapEff:" { print $2 }'\'' /proc/self/status)" = 0000000000000002
+    fail_check() {
+      printf "rootfs initialization failed: %s expected=%s actual=%s\n" "$1" "$2" "$3" >&2
+      exit 1
+    }
+    expect_stat() {
+      actual="$(stat -c "$2" "$3")" || fail_check "$1:$3" "$4" "<stat-error>"
+      [ "$actual" = "$4" ] || fail_check "$1:$3" "$4" "$actual"
+    }
+    [ -x /bin/sh ] || fail_check lower-shell executable not-executable
+    expect_stat merged-root %u:%g:%a / 0:0:755
+    expect_stat root-directory %u:%g:%a /root 0:0:700
+    expect_stat lower-owner %u:%g /bin/sh 0:0
+    uid="$(id -u)"
+    [ "$uid" = 65532 ] || fail_check process-uid 65532 "$uid"
+    capability="$(awk '\''$1 == "CapEff:" { print $2 }'\'' /proc/self/status)"
+    [ "$capability" = 0000000000000002 ] \
+      || fail_check process-capability 0000000000000002 "$capability"
+    root_mount="$(awk '\''$5 == "/" { print }'\'' /proc/self/mountinfo | tail -1)"
+    printf "runtime initial-root mount: %s uid=%s cap_eff=%s root_stat=%s\n" \
+      "$root_mount" "$uid" "$capability" "$(stat -c %u:%g:%a /root)" >&2
+    printf "%s" "$root_mount" | grep -q " - fuse.fuse-overlayfs " \
+      || fail_check rootfs-mount-type fuse.fuse-overlayfs "$root_mount"
     printf lower-image-ok
-    printf root-state > /root/persist.txt
-    printf home-state > /home/agent/persist.txt
-    printf etc-state > /etc/drive9.conf
-    printf workspace-state > /workspace/persist.txt
-    printf rename-state > /workspace/rename-from.txt
-    mv /workspace/rename-from.txt /workspace/rename-to.txt
-    printf delete-state > /workspace/deleted.txt
-    rm /workspace/deleted.txt
-    rm /etc/drive9-lower-delete
-    if chmod 0600 /etc/drive9-lower-rename 2>/dev/null; then exit 1; fi
-    mv /etc/drive9-lower-rename /etc/drive9-lower-renamed
-    test "$(stat -c %u:%g /etc/drive9-lower-renamed)" = 0:0
-    test "$(stat -c %u:%g /etc/drive9.conf)" = 65532:65532
-    chmod 0640 /etc/drive9.conf
-    ln -s ../etc/drive9.conf /root/config-link
-    ln /workspace/persist.txt /workspace/persist-hardlink.txt
-    printf transient > /tmp/not-persistent
-    printf transient > /run/not-persistent' \
+    printf root-state > /root/persist.txt \
+      || fail_check root-write writable failed
+    printf home-state > /home/agent/persist.txt \
+      || fail_check home-write writable failed
+    printf etc-state > /etc/drive9.conf \
+      || fail_check etc-write writable failed
+    printf workspace-state > /workspace/persist.txt \
+      || fail_check workspace-write writable failed
+    printf rename-state > /workspace/rename-from.txt \
+      || fail_check rename-source-write writable failed
+    mv /workspace/rename-from.txt /workspace/rename-to.txt \
+      || fail_check upper-rename success failed
+    printf delete-state > /workspace/deleted.txt \
+      || fail_check delete-source-write writable failed
+    rm /workspace/deleted.txt \
+      || fail_check upper-delete success failed
+    rm /etc/drive9-lower-delete \
+      || fail_check lower-delete success failed
+    if chmod 0600 /etc/drive9-lower-rename 2>/dev/null; then
+      fail_check lower-chmod-rejection rejected succeeded
+    fi
+    mv /etc/drive9-lower-rename /etc/drive9-lower-renamed \
+      || fail_check lower-rename success failed
+    expect_stat renamed-lower-owner %u:%g /etc/drive9-lower-renamed 0:0
+    expect_stat etc-owner %u:%g /etc/drive9.conf 65532:65532
+    chmod 0640 /etc/drive9.conf \
+      || fail_check etc-chmod success failed
+    ln -s ../etc/drive9.conf /root/config-link \
+      || fail_check root-symlink success failed
+    ln /workspace/persist.txt /workspace/persist-hardlink.txt \
+      || fail_check workspace-hardlink success failed
+    printf transient > /tmp/not-persistent \
+      || fail_check tmp-write writable failed
+    printf transient > /run/not-persistent \
+      || fail_check run-write writable failed' \
   >"$WORK_DIR/exec.stdout" 2>"$WORK_DIR/exec.stderr"; then
+  report_initial_failure_state
   fail "first rootfs Runtime exec failed"
 fi
 
