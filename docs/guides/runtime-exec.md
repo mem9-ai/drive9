@@ -23,6 +23,7 @@ only after confirmed process exit, Drive9 drain, and provider teardown.
 ```bash
 drive9 exec \
   --workspace :/repo \
+  --layer pi-fork-42 \
   --persistence workspace \
   --cwd . \
   --timeout 10m \
@@ -33,6 +34,9 @@ drive9 exec \
 
 The command writes remote stdout and stderr to the matching local streams and
 returns the process exit status. `--workspace` defaults to `:/`.
+`--layer` selects one exact writable LayerFS view, such as a Pi conversation
+fork. Omitting it mounts the base workspace view. Base and layer views use
+independent execution mounts and may run concurrently.
 `--persistence` defaults to `full_root` for compatibility and safety; pass
 `workspace` only when persistence outside the coding workspace is unnecessary.
 Resource flags are minimum requirements used by the server's hard candidate
@@ -51,6 +55,7 @@ result, err := c.Exec(ctx, client.ExecRequest{
     ExecutionClass: "linux-full",
     Workspace: client.RuntimeWorkspace{
         Root:        "/repo",
+        LayerID:     "pi-fork-42",
         Persistence: client.RuntimePersistenceWorkspace,
     },
 }, client.ExecOptions{
@@ -73,7 +78,7 @@ const result = await client.exec(
   {
     argv: ["npm", "test"],
     execution_class: "linux-full",
-    workspace: { root: "/repo", persistence: "workspace" },
+    workspace: { root: "/repo", layer_id: "pi-fork-42", persistence: "workspace" },
   },
   {
     onStdout: chunk => process.stdout.write(chunk),

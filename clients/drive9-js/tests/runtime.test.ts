@@ -18,7 +18,10 @@ describe("runtime exec", () => {
   it("streams separate output and returns a nonzero exit", async () => {
     server.use(http.post("http://localhost:9009/v1/runtime/exec", async ({ request }) => {
       expect(request.headers.get("authorization")).toBe("Bearer test-key");
-      expect(await request.json()).toMatchObject({ argv: ["sh", "-c", "exit 7"] });
+      expect(await request.json()).toMatchObject({
+        argv: ["sh", "-c", "exit 7"],
+        workspace: { root: "/project", layer_id: "pi-fork-layer" },
+      });
       const body = [
         `{"type":"started","execution_id":"rex_12345678"}`,
         `{"type":"stdout","execution_id":"rex_12345678","data_base64":"aGVsbG8="}`,
@@ -31,7 +34,7 @@ describe("runtime exec", () => {
     const stdout: string[] = [];
     const stderr: string[] = [];
     const result = await new Client("http://localhost:9009", "test-key").exec({
-      argv: ["sh", "-c", "exit 7"], workspace: { root: "/project" },
+      argv: ["sh", "-c", "exit 7"], workspace: { root: "/project", layer_id: "pi-fork-layer" },
     }, {
       onStdout: (chunk) => { stdout.push(new TextDecoder().decode(chunk)); },
       onStderr: (chunk) => { stderr.push(new TextDecoder().decode(chunk)); },

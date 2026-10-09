@@ -31,6 +31,7 @@ const (
 
 type RuntimeWorkspace struct {
 	Root        string `json:"root"`
+	LayerID     string `json:"layer_id,omitempty"`
 	ReadOnly    bool   `json:"read_only,omitempty"`
 	Persistence string `json:"persistence,omitempty"`
 }

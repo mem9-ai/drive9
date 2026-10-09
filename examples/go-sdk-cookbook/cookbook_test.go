@@ -316,7 +316,8 @@ func ExampleClient_oneShotRuntimeExec() {
 		Argv: []string{"go", "test", "./..."},
 		Cwd:  "/workspace",
 		Workspace: drive9.RuntimeWorkspace{
-			Root: "/projects/example",
+			Root:    "/projects/example",
+			LayerID: "pi-fork-42",
 		},
 		Resources: drive9.RuntimeResources{
 			CPUMillis: 1000,

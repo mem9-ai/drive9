@@ -16,10 +16,12 @@ import (
 
 func TestExecStreamsOutputAndReturnsRemoteStatus(t *testing.T) {
 	var persistence string
+	var layerID string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
 			Workspace struct {
 				Persistence string `json:"persistence"`
+				LayerID     string `json:"layer_id"`
 			} `json:"workspace"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -27,6 +29,7 @@ func TestExecStreamsOutputAndReturnsRemoteStatus(t *testing.T) {
 			return
 		}
 		persistence = request.Workspace.Persistence
+		layerID = request.Workspace.LayerID
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		_, _ = fmt.Fprintln(w, `{"type":"started","execution_id":"rex_12345678"}`)
 		_, _ = fmt.Fprintln(w, `{"type":"stdout","execution_id":"rex_12345678","data_base64":"b3V0"}`)
@@ -41,7 +44,7 @@ func TestExecStreamsOutputAndReturnsRemoteStatus(t *testing.T) {
 	t.Setenv(EnvServer, server.URL)
 	t.Setenv(EnvAPIKey, "secret")
 	stdout, stderr, resultErr := captureExecOutput(t, func() error {
-		return Exec([]string{"--workspace=:/project", "--env", "A=B", "--", "sh", "-c", "exit 9"})
+		return Exec([]string{"--workspace=:/project", "--layer=pi-fork-layer", "--env", "A=B", "--", "sh", "-c", "exit 9"})
 	})
 	if stdout != "out" || stderr != "err" {
 		t.Fatalf("stdout/stderr = %q/%q", stdout, stderr)
@@ -52,6 +55,9 @@ func TestExecStreamsOutputAndReturnsRemoteStatus(t *testing.T) {
 	}
 	if persistence != "full_root" {
 		t.Fatalf("persistence = %q, want full_root", persistence)
+	}
+	if layerID != "pi-fork-layer" {
+		t.Fatalf("layer_id = %q, want pi-fork-layer", layerID)
 	}
 }
 
@@ -175,6 +181,15 @@ func TestExecRejectsInvalidPersistence(t *testing.T) {
 	err := execWithContext(t.Context(), []string{"--persistence=project", "--", "true"})
 	if err == nil || !strings.Contains(err.Error(), "--persistence must be full_root or workspace") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestExecRejectsInvalidLayerID(t *testing.T) {
+	for _, value := range []string{"bad:layer", " bad", strings.Repeat("x", 65), "bad\nlayer"} {
+		err := execWithContext(t.Context(), []string{"--layer=" + value, "--", "true"})
+		if err == nil || !strings.Contains(err.Error(), "--layer") {
+			t.Fatalf("layer %q error = %v", value, err)
+		}
 	}
 }
 

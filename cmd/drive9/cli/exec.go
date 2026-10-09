@@ -35,6 +35,7 @@ func execWithContext(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	workspace := fs.String("workspace", "/", "Drive9 workspace root")
+	layerID := fs.String("layer", "", "exact Drive9 LayerFS layer ID")
 	cwd := fs.String("cwd", ".", "working directory relative to the workspace root")
 	readOnly := fs.Bool("read-only", false, "mount the workspace read-only")
 	persistence := fs.String("persistence", client.RuntimePersistenceFullRoot, "required persistence scope: full_root or workspace")
@@ -60,6 +61,9 @@ func execWithContext(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := validateRuntimeLayerID(*layerID); err != nil {
+		return err
+	}
 	env, err := runtimeEnvironment(environment)
 	if err != nil {
 		return err
@@ -79,7 +83,7 @@ func execWithContext(ctx context.Context, args []string) error {
 
 	request := client.ExecRequest{
 		Argv: append([]string(nil), fs.Args()...), Cwd: *cwd, Env: env,
-		Workspace: client.RuntimeWorkspace{Root: root, ReadOnly: *readOnly, Persistence: *persistence},
+		Workspace: client.RuntimeWorkspace{Root: root, LayerID: *layerID, ReadOnly: *readOnly, Persistence: *persistence},
 		Resources: client.RuntimeResources{CPUMillis: *cpuMillis, MemoryMB: *memoryMB, PIDs: *pids, Network: *network},
 	}
 	if *timeout > 0 {
@@ -94,6 +98,21 @@ func execWithContext(ctx context.Context, args []string) error {
 	}
 	if result.ExitCode != 0 {
 		return &runtimeExitError{code: result.ExitCode}
+	}
+	return nil
+}
+
+func validateRuntimeLayerID(value string) error {
+	if value == "" {
+		return nil
+	}
+	if strings.TrimSpace(value) != value || len(value) > 64 || strings.ContainsAny(value, ":\x00") {
+		return errors.New("--layer must be an exact valid LayerFS layer ID")
+	}
+	for _, char := range value {
+		if char < 0x20 || char == 0x7f {
+			return errors.New("--layer must be an exact valid LayerFS layer ID")
+		}
 	}
 	return nil
 }

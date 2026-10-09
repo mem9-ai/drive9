@@ -5,6 +5,7 @@ export type RuntimePersistence = "full_root" | "workspace";
 
 export interface RuntimeWorkspace {
   root: string;
+  layer_id?: string;
   read_only?: boolean;
   persistence?: RuntimePersistence;
 }
