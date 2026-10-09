@@ -70,6 +70,9 @@ func execWithContext(ctx context.Context, args []string) error {
 	if *persistence != client.RuntimePersistenceFullRoot && *persistence != client.RuntimePersistenceWorkspace {
 		return errors.New("--persistence must be full_root or workspace")
 	}
+	if *layerID != "" && *persistence == client.RuntimePersistenceFullRoot {
+		return errors.New("--layer requires --persistence=workspace; full_root LayerFS views are not supported")
+	}
 
 	request := client.ExecRequest{
 		Argv: append([]string(nil), fs.Args()...), Cwd: *cwd, Env: env,

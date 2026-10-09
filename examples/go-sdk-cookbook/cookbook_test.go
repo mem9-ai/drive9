@@ -316,8 +316,9 @@ func ExampleClient_oneShotRuntimeExec() {
 		Argv: []string{"go", "test", "./..."},
 		Cwd:  "/workspace",
 		Workspace: drive9.RuntimeWorkspace{
-			Root:    "/projects/example",
-			LayerID: "pi-fork-42",
+			Root:        "/projects/example",
+			LayerID:     "pi-fork-42",
+			Persistence: drive9.RuntimePersistenceWorkspace,
 		},
 		TimeoutMS: int64((15 * time.Minute) / time.Millisecond),
 	}, drive9.ExecOptions{

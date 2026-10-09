@@ -5,8 +5,10 @@ export type RuntimePersistence = "full_root" | "workspace";
 
 export interface RuntimeWorkspace {
   root: string;
+  /** Selects one exact LayerFS view. Requires `persistence: "workspace"`. */
   layer_id?: string;
   read_only?: boolean;
+  /** Defaults to `full_root`, which cannot be combined with `layer_id`. */
   persistence?: RuntimePersistence;
 }
 

@@ -35,7 +35,10 @@ The command writes remote stdout and stderr to the matching local streams and
 returns the process exit status. `--workspace` defaults to `:/`.
 `--layer` selects one exact writable LayerFS view, such as a Pi conversation
 fork. Omitting it mounts the base workspace view. Base and layer views use
-independent execution mounts and may run concurrently.
+independent execution mounts and may run concurrently. A layer view requires
+`--persistence workspace`; the server rejects `full_root + layer_id`, including
+the default omitted persistence value, because full-root compatibility is not
+inherited across LayerFS forks.
 `--persistence` defaults to `full_root` for compatibility and safety; pass
 `workspace` only when persistence outside the coding workspace is unnecessary.
 CPU, memory, PID, disk, network, and execution class are backend-owned provider

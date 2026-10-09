@@ -44,7 +44,7 @@ func TestExecStreamsOutputAndReturnsRemoteStatus(t *testing.T) {
 	t.Setenv(EnvServer, server.URL)
 	t.Setenv(EnvAPIKey, "secret")
 	stdout, stderr, resultErr := captureExecOutput(t, func() error {
-		return Exec([]string{"--workspace=:/project", "--layer=pi-fork-layer", "--env", "A=B", "--", "sh", "-c", "exit 9"})
+		return Exec([]string{"--workspace=:/project", "--layer=pi-fork-layer", "--persistence=workspace", "--env", "A=B", "--", "sh", "-c", "exit 9"})
 	})
 	if stdout != "out" || stderr != "err" {
 		t.Fatalf("stdout/stderr = %q/%q", stdout, stderr)
@@ -53,8 +53,8 @@ func TestExecStreamsOutputAndReturnsRemoteStatus(t *testing.T) {
 	if !errors.As(resultErr, &status) || status.ExitCode() != 9 {
 		t.Fatalf("error = %#v", resultErr)
 	}
-	if persistence != "full_root" {
-		t.Fatalf("persistence = %q, want full_root", persistence)
+	if persistence != "workspace" {
+		t.Fatalf("persistence = %q, want workspace", persistence)
 	}
 	if layerID != "pi-fork-layer" {
 		t.Fatalf("layer_id = %q, want pi-fork-layer", layerID)
@@ -181,6 +181,18 @@ func TestExecRejectsInvalidPersistence(t *testing.T) {
 	err := execWithContext(t.Context(), []string{"--persistence=project", "--", "true"})
 	if err == nil || !strings.Contains(err.Error(), "--persistence must be full_root or workspace") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestExecRejectsFullRootLayerView(t *testing.T) {
+	for _, args := range [][]string{
+		{"--layer=child-layer", "--", "true"},
+		{"--layer=child-layer", "--persistence=full_root", "--", "true"},
+	} {
+		err := execWithContext(t.Context(), args)
+		if err == nil || !strings.Contains(err.Error(), "--layer requires --persistence=workspace") {
+			t.Fatalf("args %v error = %v", args, err)
+		}
 	}
 }
 

@@ -21,7 +21,7 @@ describe("runtime exec", () => {
       const payload = await request.json() as Record<string, unknown>;
       expect(payload).toMatchObject({
         argv: ["sh", "-c", "exit 7"],
-        workspace: { root: "/project", layer_id: "pi-fork-layer" },
+        workspace: { root: "/project", layer_id: "pi-fork-layer", persistence: "workspace" },
       });
       expect(payload).not.toHaveProperty("execution_class");
       expect(payload).not.toHaveProperty("resources");
@@ -37,7 +37,7 @@ describe("runtime exec", () => {
     const stdout: string[] = [];
     const stderr: string[] = [];
     const result = await new Client("http://localhost:9009", "test-key").exec({
-      argv: ["sh", "-c", "exit 7"], workspace: { root: "/project", layer_id: "pi-fork-layer" },
+      argv: ["sh", "-c", "exit 7"], workspace: { root: "/project", layer_id: "pi-fork-layer", persistence: "workspace" },
     }, {
       onStdout: (chunk) => { stdout.push(new TextDecoder().decode(chunk)); },
       onStderr: (chunk) => { stderr.push(new TextDecoder().decode(chunk)); },

@@ -30,7 +30,10 @@ const (
 )
 
 type RuntimeWorkspace struct {
-	Root        string `json:"root"`
+	Root string `json:"root"`
+	// LayerID selects one exact LayerFS view and requires workspace persistence.
+	// The server rejects full_root persistence, including its omitted default,
+	// when LayerID is set.
 	LayerID     string `json:"layer_id,omitempty"`
 	ReadOnly    bool   `json:"read_only,omitempty"`
 	Persistence string `json:"persistence,omitempty"`

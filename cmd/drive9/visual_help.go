@@ -725,7 +725,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			Summary: "run one process against a persistent Drive9 workspace",
 			Flags: []visualHelpFlag{
 				{Name: "--workspace PATH", Desc: "canonical Drive9 workspace root; default :/"},
-				{Name: "--layer ID", Desc: "mount one exact LayerFS view of the workspace"},
+				{Name: "--layer ID", Desc: "mount one exact LayerFS view; requires --persistence workspace"},
 				{Name: "--cwd PATH", Desc: "working directory relative to the workspace root; default ."},
 				{Name: "--read-only", Desc: "mount the workspace read-only"},
 				{Name: "--persistence full_root|workspace", Desc: "required persistence scope; default full_root"},
@@ -733,7 +733,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Name: "--env KEY=VALUE", Desc: "environment entry; repeatable"},
 			},
 			Examples: []visualHelpExample{
-				{Command: "drive9 exec --workspace :/repo --layer pi-fork-42 --timeout 10m -- go test ./...", Desc: "stream one command in an exact workspace view"},
+				{Command: "drive9 exec --workspace :/repo --layer pi-fork-42 --persistence workspace --timeout 10m -- go test ./...", Desc: "stream one command in an exact workspace view"},
 			},
 		},
 		{
