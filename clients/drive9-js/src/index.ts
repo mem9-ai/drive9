@@ -93,6 +93,5 @@ export type {
   ExecRequest,
   ExecResult,
   ExecStarted,
-  RuntimeResources,
   RuntimeWorkspace,
 } from "./runtime.js";

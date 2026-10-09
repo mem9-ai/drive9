@@ -319,12 +319,6 @@ func ExampleClient_oneShotRuntimeExec() {
 			Root:    "/projects/example",
 			LayerID: "pi-fork-42",
 		},
-		Resources: drive9.RuntimeResources{
-			CPUMillis: 1000,
-			MemoryMB:  2048,
-			PIDs:      256,
-			Network:   "none",
-		},
 		TimeoutMS: int64((15 * time.Minute) / time.Millisecond),
 	}, drive9.ExecOptions{
 		Stdout: &stdout,

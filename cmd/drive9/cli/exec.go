@@ -40,10 +40,6 @@ func execWithContext(ctx context.Context, args []string) error {
 	readOnly := fs.Bool("read-only", false, "mount the workspace read-only")
 	persistence := fs.String("persistence", client.RuntimePersistenceFullRoot, "required persistence scope: full_root or workspace")
 	timeout := fs.Duration("timeout", 0, "execution timeout (server default when omitted)")
-	cpuMillis := fs.Int64("cpu-millis", 0, "minimum CPU allocation in millicores")
-	memoryMB := fs.Int64("memory-mb", 0, "minimum memory allocation in MiB")
-	pids := fs.Int64("pids", 0, "minimum PID limit")
-	network := fs.String("network", "", "required network mode: none or bridge")
 	var environment stringListFlag
 	fs.Var(&environment, "env", "environment entry KEY=VALUE (repeatable)")
 	fs.Usage = func() {
@@ -71,12 +67,6 @@ func execWithContext(ctx context.Context, args []string) error {
 	if *timeout < 0 || *timeout > time.Hour {
 		return errors.New("--timeout must be between 0 and 1h")
 	}
-	if *cpuMillis < 0 || *memoryMB < 0 || *pids < 0 {
-		return errors.New("runtime resource requirements must be non-negative")
-	}
-	if *network != "" && *network != "none" && *network != "bridge" {
-		return errors.New("--network must be none or bridge")
-	}
 	if *persistence != client.RuntimePersistenceFullRoot && *persistence != client.RuntimePersistenceWorkspace {
 		return errors.New("--persistence must be full_root or workspace")
 	}
@@ -84,7 +74,6 @@ func execWithContext(ctx context.Context, args []string) error {
 	request := client.ExecRequest{
 		Argv: append([]string(nil), fs.Args()...), Cwd: *cwd, Env: env,
 		Workspace: client.RuntimeWorkspace{Root: root, LayerID: *layerID, ReadOnly: *readOnly, Persistence: *persistence},
-		Resources: client.RuntimeResources{CPUMillis: *cpuMillis, MemoryMB: *memoryMB, PIDs: *pids, Network: *network},
 	}
 	if *timeout > 0 {
 		request.TimeoutMS = timeout.Milliseconds()

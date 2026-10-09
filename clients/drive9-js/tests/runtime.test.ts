@@ -18,10 +18,13 @@ describe("runtime exec", () => {
   it("streams separate output and returns a nonzero exit", async () => {
     server.use(http.post("http://localhost:9009/v1/runtime/exec", async ({ request }) => {
       expect(request.headers.get("authorization")).toBe("Bearer test-key");
-      expect(await request.json()).toMatchObject({
+      const payload = await request.json() as Record<string, unknown>;
+      expect(payload).toMatchObject({
         argv: ["sh", "-c", "exit 7"],
         workspace: { root: "/project", layer_id: "pi-fork-layer" },
       });
+      expect(payload).not.toHaveProperty("execution_class");
+      expect(payload).not.toHaveProperty("resources");
       const body = [
         `{"type":"started","execution_id":"rex_12345678"}`,
         `{"type":"stdout","execution_id":"rex_12345678","data_base64":"aGVsbG8="}`,

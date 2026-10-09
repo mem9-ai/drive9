@@ -36,23 +36,14 @@ type RuntimeWorkspace struct {
 	Persistence string `json:"persistence,omitempty"`
 }
 
-type RuntimeResources struct {
-	CPUMillis int64  `json:"cpu_millis,omitempty"`
-	MemoryMB  int64  `json:"memory_mb,omitempty"`
-	PIDs      int64  `json:"pids,omitempty"`
-	Network   string `json:"network,omitempty"`
-}
-
 // ExecRequest describes one process invocation. Argv is not a shell string.
 // Drive9 never retries the request automatically.
 type ExecRequest struct {
-	Argv           []string          `json:"argv"`
-	Cwd            string            `json:"cwd,omitempty"`
-	Env            map[string]string `json:"env,omitempty"`
-	ExecutionClass string            `json:"execution_class,omitempty"`
-	Workspace      RuntimeWorkspace  `json:"workspace"`
-	Resources      RuntimeResources  `json:"resources,omitempty"`
-	TimeoutMS      int64             `json:"timeout_ms,omitempty"`
+	Argv      []string          `json:"argv"`
+	Cwd       string            `json:"cwd,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	Workspace RuntimeWorkspace  `json:"workspace"`
+	TimeoutMS int64             `json:"timeout_ms,omitempty"`
 }
 
 type ExecStarted struct {

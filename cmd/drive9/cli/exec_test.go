@@ -184,6 +184,15 @@ func TestExecRejectsInvalidPersistence(t *testing.T) {
 	}
 }
 
+func TestExecDoesNotExposeBackendProfileFlags(t *testing.T) {
+	for _, flag := range []string{"--cpu-millis=1000", "--memory-mb=2048", "--pids=128", "--network=none"} {
+		err := execWithContext(t.Context(), []string{flag, "--", "true"})
+		if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+			t.Fatalf("flag %q error = %v", flag, err)
+		}
+	}
+}
+
 func TestExecRejectsInvalidLayerID(t *testing.T) {
 	for _, value := range []string{"bad:layer", " bad", strings.Repeat("x", 65), "bad\nlayer"} {
 		err := execWithContext(t.Context(), []string{"--layer=" + value, "--", "true"})

@@ -15,6 +15,24 @@ import (
 	"time"
 )
 
+func TestExecRequestDoesNotExposeBackendProfileControls(t *testing.T) {
+	raw, err := json.Marshal(ExecRequest{
+		Argv: []string{"true"}, Workspace: RuntimeWorkspace{Root: "/project"}, TimeoutMS: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"execution_class", "resources"} {
+		if _, ok := payload[field]; ok {
+			t.Fatalf("request exposes backend-owned field %q: %s", field, raw)
+		}
+	}
+}
+
 func TestExecStreamsAndReturnsNonzeroExit(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/runtime/exec" || r.Header.Get("Authorization") != "Bearer secret" {

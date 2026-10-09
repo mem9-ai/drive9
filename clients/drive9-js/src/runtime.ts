@@ -10,20 +10,11 @@ export interface RuntimeWorkspace {
   persistence?: RuntimePersistence;
 }
 
-export interface RuntimeResources {
-  cpu_millis?: number;
-  memory_mb?: number;
-  pids?: number;
-  network?: "none" | "bridge";
-}
-
 export interface ExecRequest {
   argv: string[];
   cwd?: string;
   env?: Record<string, string>;
-  execution_class?: "linux-full";
   workspace: RuntimeWorkspace;
-  resources?: RuntimeResources;
   timeout_ms?: number;
 }
 

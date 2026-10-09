@@ -14,8 +14,8 @@ Their root filesystem, `/tmp`, `/run`, `/etc`, other home content, and system
 package installs are disposable. Runtime never silently downgrades a
 `full_root` request to `workspace`.
 
-Docker supplies `full_root`. Daytona preview profiles use the workspace path
-resolved by Daytona's API and supply `workspace` only. Runtime reports success
+Docker supplies `full_root`. Daytona profiles use the workspace path resolved
+by Daytona's API and supply `workspace` only. Runtime reports success
 only after confirmed process exit, Drive9 drain, and provider teardown.
 
 ## CLI
@@ -27,7 +27,6 @@ drive9 exec \
   --persistence workspace \
   --cwd . \
   --timeout 10m \
-  --memory-mb 2048 \
   --env NODE_ENV=test \
   -- npm test
 ```
@@ -39,8 +38,9 @@ fork. Omitting it mounts the base workspace view. Base and layer views use
 independent execution mounts and may run concurrently.
 `--persistence` defaults to `full_root` for compatibility and safety; pass
 `workspace` only when persistence outside the coding workspace is unnecessary.
-Resource flags are minimum requirements used by the server's hard candidate
-filter; they do not let a caller name an operator profile.
+CPU, memory, PID, disk, network, and execution class are backend-owned provider
+profile settings and are not client flags. `--timeout` is a caller cancellation
+deadline; the selected backend profile may enforce a shorter maximum.
 
 Interrupting the client requests remote cancellation. The CLI reports canceled
 only after the server confirms that the process stopped and bounded workspace
@@ -51,8 +51,7 @@ retries.
 
 ```go
 result, err := c.Exec(ctx, client.ExecRequest{
-    Argv:           []string{"go", "test", "./..."},
-    ExecutionClass: "linux-full",
+    Argv: []string{"go", "test", "./..."},
     Workspace: client.RuntimeWorkspace{
         Root:        "/repo",
         LayerID:     "pi-fork-42",
@@ -77,7 +76,6 @@ typed errors.
 const result = await client.exec(
   {
     argv: ["npm", "test"],
-    execution_class: "linux-full",
     workspace: { root: "/repo", layer_id: "pi-fork-42", persistence: "workspace" },
   },
   {
