@@ -323,6 +323,9 @@ func (cq *CommitQueue) readRemoteSnapshotStat(parent context.Context, path strin
 	return readBoundedRemoteSnapshotStat(parent, cq.client, cq.remotePath(path))
 }
 
+// readBoundedRemoteSnapshotStat reads HEAD metadata and a bounded body under
+// a ten-second budget within the parent context. Callers must still validate
+// revision, size, checksum and causal identity before adopting that image.
 func readBoundedRemoteSnapshotStat(parent context.Context, remoteClient *client.Client, apiPath string) (*client.StatResult, []byte, error) {
 	if remoteClient == nil || apiPath == "" {
 		return nil, nil, fmt.Errorf("missing remote snapshot source")

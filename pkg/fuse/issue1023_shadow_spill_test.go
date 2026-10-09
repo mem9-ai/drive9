@@ -406,8 +406,16 @@ func TestIssue1023AncestorStagingFailureDoesNotPublishFallback(t *testing.T) {
 				if _, ok := cache.GetMeta(older.Path); ok {
 					t.Fatal("writeback fallback premise requires a retired descendant cache")
 				}
+				wantStatus := gofuse.EAGAIN
 				if unavailable {
 					closeServer()
+					// Establish the transport mapping independently of staging.
+					// A closed listener is an I/O failure, not a lineage rejection.
+					_, readErr := fs.client.StatCtx(context.Background(), fs.remotePath(older.Path))
+					if readErr == nil || httpToFuseStatus(readErr) != gofuse.EIO {
+						t.Fatalf("closed server error=%v, want original EIO mapping", readErr)
+					}
+					wantStatus = gofuse.EIO
 				} else {
 					server.mu.Lock()
 					server.revision++
@@ -420,8 +428,8 @@ func TestIssue1023AncestorStagingFailureDoesNotPublishFallback(t *testing.T) {
 				} else {
 					st = fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: ids[1]})
 				}
-				if st != gofuse.EAGAIN {
-					t.Errorf("failed ancestor proof: status=%v, want EAGAIN", st)
+				if st != wantStatus {
+					t.Errorf("failed ancestor proof: status=%v, want %v", st, wantStatus)
 				}
 				if older.Dirty != buffer || buffer.contentVersion != version || older.DirtySeq != seq || !buffer.HasDirtyParts() || older.StagedSnapshotID != snapshot {
 					t.Error("failed ancestor proof changed dirty snapshot")

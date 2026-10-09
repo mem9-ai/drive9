@@ -540,6 +540,9 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	return revision, err
 }
 
+// uploadSyncWithAppendSnapshot binds proof to one captured cache generation.
+// Only trusted bounded payloads receive content identity. A data commit may
+// return proof with a later mode error; callers must retain that mode obligation.
 func (u *WriteBackUploader) uploadSyncWithAppendSnapshot(ctx context.Context, localPath string) (int64, pathCommitLandmark, error) {
 	proof := pathCommitLandmark{}
 	// Wait for any in-flight background upload to complete first.

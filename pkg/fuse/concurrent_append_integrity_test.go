@@ -62,18 +62,24 @@ func TestIssue1023AppendAfterSiblingFsync(t *testing.T) {
 				if _, body, _ := server.snapshot(); string(body) != "A\nB\n" {
 					t.Fatalf("before third write: %q", body)
 				}
-				if nextWriter == 2 {
+				siblingClosed := nextWriter == 2
+				if siblingClosed {
 					// The committing sibling has closed: the old writer must
 					// still recover the complete committed image.
 					fs.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: ids[1]})
 					nextWriter = 0
+					if _, ok := fs.fileHandles.Get(ids[1]); ok {
+						t.Fatal("committing sibling remained open")
+					}
 				}
 				write(nextWriter, "C\n")
 				if got := pr939HandleBytes(handles[nextWriter]); got != "A\nB\nC\n" {
 					t.Fatalf("acknowledged append image=%q, want all three records", got)
 				}
 				syncHandle(nextWriter)
-				syncHandle(1 - nextWriter)
+				if !siblingClosed {
+					syncHandle(1 - nextWriter)
+				}
 				if _, body, _ := server.snapshot(); string(body) != "A\nB\nC\n" {
 					t.Fatalf("remote=%q, want all three records", body)
 				}
@@ -294,7 +300,7 @@ func issue1023LockWaitingAppender(t *testing.T, fh *FileHandle) {
 		n := runtime.Stack(stack, true)
 		for _, goroutine := range strings.Split(string(stack[:n]), "\n\n") {
 			waiting := strings.Contains(goroutine, "(*Dat9FS).Write(") &&
-				(strings.Contains(goroutine, "(*Dat9FS).lockAppendRemoteCommitPathLocked(") || strings.Contains(goroutine, "[select]"))
+				strings.Contains(goroutine, "[select]")
 			if waiting && fh.TryLock() {
 				return
 			}

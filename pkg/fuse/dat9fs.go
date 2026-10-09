@@ -98,6 +98,11 @@ func (attempt *mountViewReadAttempt) lock(fs *Dat9FS, generation uint64) bool {
 // syscall.EAGAIN directly and returns to the caller without an internal spin.
 var errAppendRefreshBusy = errors.New("append refresh source busy")
 
+// errAppendSnapshotAdoption marks verification failures which must stop staging
+// before any fallback can publish an older append image. Keep the underlying
+// error so callers can return its errno instead of treating every failure as EAGAIN.
+var errAppendSnapshotAdoption = errors.New("append snapshot adoption failed")
+
 // appendRefreshSourceBusy preserves the exact handle which prevented refresh.
 // It is transient contention; lineage rejection remains syscall.EAGAIN.
 type appendRefreshSourceBusy struct {
@@ -3601,6 +3606,9 @@ func clearStagedSnapshotLineageLocked(fh *FileHandle) {
 	fh.StagedLineageTrusted = false
 }
 
+// stageShadowForQueuedCommitLocked distinguishes append verification failure
+// from ordinary staging failure, for which callers may use existing fallbacks.
+// Caller holds fh.mu; errAppendSnapshotAdoption always requires an immediate return.
 func (fs *Dat9FS) stageShadowForQueuedCommitLocked(ctx context.Context, fh *FileHandle, durable bool) error {
 	acquired := fh != nil && fh.RemoteCommitUnlock == nil
 	if fh != nil {
@@ -3622,8 +3630,12 @@ func (fs *Dat9FS) stageShadowForQueuedCommitLocked(ctx context.Context, fh *File
 				if acquired {
 					fs.releaseHandleRemoteCommitPathLocked(fh)
 				}
+				// A local proof advancing during HEAD/GET remains retryable.
+				if errors.Is(err, errAppendRefreshBusy) {
+					err = errors.Join(syscall.EAGAIN, err)
+				}
 				// Callers must not fall back to publishing the old image.
-				return errors.Join(syscall.EAGAIN, err)
+				return errors.Join(errAppendSnapshotAdoption, err)
 			}
 			if fh.Dirty != before {
 				if !fh.HasPendingMode {
@@ -14713,6 +14725,9 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status
 	return fs.flushHandleWithAppendRetryBudget(ctx, fh, maxLiveSnapshotAncestors)
 }
 
+// flushHandleWithAppendRetryBudget shares flushHandle's caller-held fh.mu and
+// temporary network unlock windows. Only proven local append conflicts consume
+// the remaining retry budget; all attempts retain the original context deadline.
 func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *FileHandle, appendRetries int) (status gofuse.Status) {
 	start := time.Now()
 	phase := "start"

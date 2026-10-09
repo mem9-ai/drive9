@@ -158,6 +158,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					if errors.Is(err, syscall.EAGAIN) {
 						return gofuse.EAGAIN
 					}
+					if errors.Is(err, errAppendSnapshotAdoption) {
+						return httpToFuseStatus(err)
+					}
 					stageDur := time.Since(stageStart)
 					fs.debugDurationf(stageStart, 0, "flush stage shadow done path=%s size=%d err=%v", fh.Path, size, err)
 					fs.perf.recordFlushStageShadow(stageDur)
@@ -241,6 +244,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			err := fs.stageShadowForQueuedCommitLocked(ctx, fh, fs.stageDurableAtClose())
 			if errors.Is(err, syscall.EAGAIN) {
 				return gofuse.EAGAIN
+			}
+			if errors.Is(err, errAppendSnapshotAdoption) {
+				return httpToFuseStatus(err)
 			}
 			largeStageDur := time.Since(stageStart)
 			fs.debugDurationf(stageStart, 0, "flush shadowspill stage done path=%s size=%d err=%v", fh.Path, size, err)
@@ -410,6 +416,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				err := fs.stageShadowForQueuedCommitLocked(ctx, fh, fs.stageDurableAtClose())
 				if errors.Is(err, syscall.EAGAIN) {
 					return gofuse.EAGAIN
+				}
+				if errors.Is(err, errAppendSnapshotAdoption) {
+					return httpToFuseStatus(err)
 				}
 				fs.debugDurationf(stageStart, 0, "flush stage shadow done path=%s size=%d err=%v", fh.Path, size, err)
 				if err != nil {

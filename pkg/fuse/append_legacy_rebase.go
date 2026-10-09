@@ -18,6 +18,9 @@ func (fs *Dat9FS) rebaseLegacyAppendOntoLandedParentLocked(ctx context.Context, 
 	return fs.rebaseLegacyAppendOntoLandedParentWithRetryBudgetLocked(ctx, fh, proof, maxLiveSnapshotAncestors)
 }
 
+// rebaseLegacyAppendOntoLandedParentWithRetryBudgetLocked shares its wrapper's
+// caller-held fh.mu and path fence. Proof retries retain the original context;
+// metadata rebasing never rewrites the owned cache data or acknowledged buffer.
 func (fs *Dat9FS) rebaseLegacyAppendOntoLandedParentWithRetryBudgetLocked(ctx context.Context, fh *FileHandle, proof pathCommitLandmark, proofRetries int) error {
 	if fs.commitQueue != nil || fs.layerEnabled() || fh.Unlinked || fh.Dirty == nil ||
 		!fh.LineageTrusted || fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() ||

@@ -154,6 +154,9 @@ func (fs *Dat9FS) recordCommittedAppendSnapshot(path string, proof pathCommitLan
 	return true
 }
 
+// landedAppendCommit uses the queue landmark when available; without a queue,
+// its revision and size must still match the process-local committed watermark.
+// Ancestors are copied. This lookup alone does not verify current remote bytes.
 func (fs *Dat9FS) landedAppendCommit(path string) pathCommitLandmark {
 	if fs.commitQueue != nil {
 		return fs.commitQueue.landedCommit(path)
@@ -247,6 +250,9 @@ func (fs *Dat9FS) adoptLandedAppendSnapshotLocked(ctx context.Context, fh *FileH
 	return fs.adoptLandedAppendSnapshotWithRetryBudgetLocked(ctx, fh, maxLiveSnapshotAncestors)
 }
 
+// adoptLandedAppendSnapshotWithRetryBudgetLocked requires fh.mu and the path
+// fence, like its wrapper. The budget bounds no-CQ proof advancement under the
+// original context; failed verification preserves acknowledged bytes and owned staging.
 func (fs *Dat9FS) adoptLandedAppendSnapshotWithRetryBudgetLocked(ctx context.Context, fh *FileHandle, proofRetries int) error {
 	if fs.layerEnabled() || fh.Dirty == nil {
 		return nil
@@ -386,6 +392,9 @@ func (fs *Dat9FS) tryLockAppendRemoteCommitPathLocked(fh *FileHandle) (func(), b
 	return func() { fs.releaseHandleRemoteCommitPathLocked(fh) }, true
 }
 
+// appendCommitPending observes every still-linked alias while the caller holds
+// fh.mu. Legacy in-flight uploads remain pending through success publication;
+// generation-owned live buffers may instead participate in append composition.
 func (fs *Dat9FS) appendCommitPending(fh *FileHandle) bool {
 	if fs.commitQueue != nil && fs.commitQueue.HasPath(fh.Path) || fs.uploader != nil && fs.uploader.hasPath(fh.Path) {
 		return true

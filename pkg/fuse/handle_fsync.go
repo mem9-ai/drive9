@@ -141,6 +141,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			if errors.Is(err, syscall.EAGAIN) {
 				return gofuse.EAGAIN
 			}
+			if errors.Is(err, errAppendSnapshotAdoption) {
+				return httpToFuseStatus(err)
+			}
 			fs.debugDurationf(stageStart, 0, "fsync shadowspill stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
 				if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
@@ -180,6 +183,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			err := fs.stageShadowForQueuedCommitLocked(ctx, fh, true)
 			if errors.Is(err, syscall.EAGAIN) {
 				return gofuse.EAGAIN
+			}
+			if errors.Is(err, errAppendSnapshotAdoption) {
+				return httpToFuseStatus(err)
 			}
 			fs.debugDurationf(stageStart, 0, "fsync stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
