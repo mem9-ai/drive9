@@ -121,3 +121,56 @@ func TestListDirPublishesMirroredDirectoryExtentInode(t *testing.T) {
 	}
 	t.Fatal("ListDir did not return mirrored /root directory")
 }
+
+func TestBindDirectoryProjectionRepairsExistingNativeEdge(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.EnsureParentDirs(ctx, "/root/file", genID); err != nil {
+		t.Fatal(err)
+	}
+	rt := newExtentRuntime(t, s, 0)
+	t.Cleanup(func() { _ = extent.CloseRuntime(rt) })
+
+	jctx := jfsmeta.NewContext(1, 0, []uint32{0}).WithValue(jfsmeta.Drive9PathKey, "/root/")
+	var ino jfsmeta.Ino
+	var attr jfsmeta.Attr
+	if st := rt.Meta.Mkdir(jctx, jfsmeta.RootInode, "root", 0700, 0, 0, &ino, &attr); st != 0 && st != syscall.EEXIST {
+		t.Fatalf("mkdir native root: %v", st)
+	}
+	if ino == 0 {
+		st := rt.Meta.Lookup(jctx, jfsmeta.RootInode, "root", &ino, &attr, false)
+		if st != 0 {
+			t.Fatalf("lookup native root: %v", st)
+		}
+	}
+	if _, err := s.DB().Exec(`UPDATE file_nodes SET extent_ino = NULL WHERE path = ?`, "/root/"); err != nil {
+		t.Fatal(err)
+	}
+
+	body, errno, err := s.RunExtentMetaOp(ctx, "bind_dir_projection", mustJSON(map[string]any{
+		"path": "/root/", "inode": uint64(ino),
+	}), nil)
+	if err != nil || errno != 0 {
+		t.Fatalf("bind directory projection: body=%s errno=%d err=%v", body, errno, err)
+	}
+	proj, err := s.GetExtentProjection(ctx, "/root/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proj.ExtentIno != uint64(ino) {
+		t.Fatalf("bound extent inode = %d, want %d", proj.ExtentIno, ino)
+	}
+
+	// The same request is idempotent, while a different inode may not steal the
+	// projection from the exact edge resolved above.
+	if _, errno, err := s.RunExtentMetaOp(ctx, "bind_dir_projection", mustJSON(map[string]any{
+		"path": "/root", "inode": uint64(ino),
+	}), nil); err != nil || errno != 0 {
+		t.Fatalf("repeat bind: errno=%d err=%v", errno, err)
+	}
+	if _, errno, err := s.RunExtentMetaOp(ctx, "bind_dir_projection", mustJSON(map[string]any{
+		"path": "/root/", "inode": uint64(ino) + 1,
+	}), nil); err != nil || errno != int(syscall.ESTALE) {
+		t.Fatalf("wrong-inode bind: errno=%d err=%v, want ESTALE", errno, err)
+	}
+}

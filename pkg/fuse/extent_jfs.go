@@ -178,9 +178,10 @@ func (fs *Dat9FS) juiceParentForOp(ctx vfs.LogContext, fuseParent uint64, parent
 // path (Opendir, readdirplus, a by-name extent probe) without creating one.
 //
 // Only a create or another mutation may mirror a directory into JuiceFS: the
-// JuiceFS directory tree exists so name operations have a parent to attach to,
-// and the create path that needs it (extentEnsureParent) also writes extent_ino
-// back onto that directory's projection row. Creating nodes from a readdir
+// JuiceFS directory tree exists so name operations have a parent to attach to.
+// A mutation that adopts an already-existing native directory must explicitly
+// bind its exact inode back onto the projection row; a read may not guess it.
+// Creating nodes from a readdir
 // leaked a JuiceFS directory for every directory a mount ever listed —
 // including local-only ones such as .git, which has no drive9 projection row
 // and therefore no owner to remove it. The leaked subtree then made rmdir of

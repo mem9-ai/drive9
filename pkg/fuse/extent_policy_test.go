@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -15,6 +16,47 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extent"
 )
+
+func TestExtentBindDirectoryProjectionUsesExactRemotePath(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		errno      int
+		wantStatus gofuse.Status
+	}{
+		{name: "success", wantStatus: gofuse.OK},
+		{name: "server rejects stale inode", errno: int(syscall.ESTALE), wantStatus: gofuse.Status(syscall.ESTALE)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/extent/meta" {
+					t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+				}
+				if got := r.Header.Get("X-Drive9-Extent-Op"); got != "bind_dir_projection" {
+					t.Fatalf("extent op = %q", got)
+				}
+				var req struct {
+					Path  string `json:"path"`
+					Inode uint64 `json:"inode"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Fatal(err)
+				}
+				if req.Path != "/upper/home/agent" || req.Inode != 42 {
+					t.Fatalf("bind request = %+v", req)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"errno": test.errno, "inode": req.Inode})
+			}))
+			defer server.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(server.URL), opts)
+			if got := fs.extentBindDirectoryProjection(context.Background(), "/upper/home/agent", 42); got != test.wantStatus {
+				t.Fatalf("bind status = %v, want %v", got, test.wantStatus)
+			}
+		})
+	}
+}
 
 func TestRegularMknodUsesExtentCreationPolicy(t *testing.T) {
 	for _, test := range []struct {
@@ -392,7 +434,18 @@ func TestDirectorySetAttrPersistsNativeOwnerAndMode(t *testing.T) {
 		Valid:    gofuse.FATTR_UID | gofuse.FATTR_GID | gofuse.FATTR_FH,
 		Owner:    gofuse.Owner{Uid: 3456, Gid: 4567},
 	}}
+	bound := false
+	testHookExtentBindDir = func(_ context.Context, path string, ino uint64) gofuse.Status {
+		if path != "/upper/home/agent" || ino != 42 {
+			t.Fatalf("directory projection bind = path=%q ino=%d", path, ino)
+		}
+		bound = true
+		return gofuse.OK
+	}
 	testHookExtentSetAttr = func(gotIno uint64, set int, fh uint64, mode, uid, gid uint32, _ int64, _ int64, _ uint32, _ uint32, size uint64) (*jfsmeta.Entry, syscall.Errno) {
+		if !bound {
+			t.Fatal("native directory SetAttr ran before durable projection binding")
+		}
 		wantSet := int(jfsmeta.SetAttrUID | jfsmeta.SetAttrGID)
 		if gotIno != 42 || set != wantSet || fh != 0 || mode != 0 || uid != 3456 || gid != 4567 || size != 0 {
 			t.Fatalf("native directory SetAttr = ino=%d set=%x fh=%d mode=%o owner=%d:%d size=%d", gotIno, set, fh, mode, uid, gid, size)
@@ -402,7 +455,10 @@ func TestDirectorySetAttrPersistsNativeOwnerAndMode(t *testing.T) {
 			Uid: 3456, Gid: 4567, Length: 4096, Nlink: 99, Mtime: 999,
 		}}, 0
 	}
-	t.Cleanup(func() { testHookExtentSetAttr = nil })
+	t.Cleanup(func() {
+		testHookExtentBindDir = nil
+		testHookExtentSetAttr = nil
+	})
 
 	var out gofuse.AttrOut
 	if st := fs.SetAttr(nil, input, &out); st != gofuse.OK {
@@ -446,6 +502,12 @@ func TestDirectorySetAttrNativeFailureIsVisibleAndRestoresProjection(t *testing.
 		Valid:    gofuse.FATTR_UID | gofuse.FATTR_GID | gofuse.FATTR_FH,
 		Owner:    gofuse.Owner{Uid: 3456, Gid: 4567},
 	}}
+	testHookExtentBindDir = func(_ context.Context, path string, ino uint64) gofuse.Status {
+		if path != "/upper/home/agent" || ino != 42 {
+			t.Fatalf("directory projection bind = path=%q ino=%d", path, ino)
+		}
+		return gofuse.OK
+	}
 	testHookExtentSetAttr = func(gotIno uint64, set int, fh uint64, mode, uid, gid uint32, _ int64, _ int64, _ uint32, _ uint32, size uint64) (*jfsmeta.Entry, syscall.Errno) {
 		wantSet := int(jfsmeta.SetAttrUID | jfsmeta.SetAttrGID)
 		if gotIno != 42 || set != wantSet || fh != 0 || mode != 0 || uid != 3456 || gid != 4567 || size != 0 {
@@ -453,7 +515,10 @@ func TestDirectorySetAttrNativeFailureIsVisibleAndRestoresProjection(t *testing.
 		}
 		return nil, syscall.EIO
 	}
-	t.Cleanup(func() { testHookExtentSetAttr = nil })
+	t.Cleanup(func() {
+		testHookExtentBindDir = nil
+		testHookExtentSetAttr = nil
+	})
 
 	var out gofuse.AttrOut
 	if st := fs.SetAttr(nil, input, &out); st != gofuse.EIO {
@@ -469,6 +534,61 @@ func TestDirectorySetAttrNativeFailureIsVisibleAndRestoresProjection(t *testing.
 	items, ok := fs.dirCache.Get(parent)
 	if !ok || len(items) != 1 || items[0].Uid != 1001 || items[0].Gid != 1001 || items[0].Mode&posixPermissionModeMask != 0750 {
 		t.Fatalf("failed SetAttr cache = %+v ok=%v, want original 0750 1001:1001", items, ok)
+	}
+}
+
+func TestDirectorySetAttrBindingFailurePreventsNativeMutation(t *testing.T) {
+	opts := &MountOptions{ExtentPaths: []string{"*"}}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	parent := "/upper/home"
+	dir := parent + "/agent"
+	ino := fs.inodes.Lookup(dir, true, 17, time.Unix(123, 456))
+	fs.inodes.SetExtentIno(ino, 42)
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFDIR)|0750)
+	fs.inodes.UpdateOwner(ino, 1001, 1001, true, true)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing mirrored directory inode")
+	}
+	fs.dirCache.Put(parent, []CachedFileInfo{cachedInfoFromEntry("agent", entry)})
+
+	input := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Valid:    gofuse.FATTR_UID | gofuse.FATTR_GID,
+		Owner:    gofuse.Owner{Uid: 3456, Gid: 4567},
+	}}
+	testHookExtentBindDir = func(_ context.Context, path string, gotIno uint64) gofuse.Status {
+		if path != "/upper/home/agent" || gotIno != 42 {
+			t.Fatalf("directory projection bind = path=%q ino=%d", path, gotIno)
+		}
+		return gofuse.EIO
+	}
+	nativeCalled := false
+	testHookExtentSetAttr = func(uint64, int, uint64, uint32, uint32, uint32, int64, int64, uint32, uint32, uint64) (*jfsmeta.Entry, syscall.Errno) {
+		nativeCalled = true
+		return nil, 0
+	}
+	t.Cleanup(func() {
+		testHookExtentBindDir = nil
+		testHookExtentSetAttr = nil
+	})
+
+	var out gofuse.AttrOut
+	if st := fs.SetAttr(nil, input, &out); st != gofuse.EIO {
+		t.Fatalf("directory SetAttr status = %v, want EIO", st)
+	}
+	if nativeCalled {
+		t.Fatal("native directory SetAttr ran after projection binding failed")
+	}
+	got, ok := fs.inodes.GetEntry(ino)
+	if !ok || got.Uid != 1001 || got.Gid != 1001 || got.Mode&posixPermissionModeMask != 0750 {
+		t.Fatalf("failed binding projection = %+v ok=%v, want original 0750 1001:1001", got, ok)
+	}
+	items, ok := fs.dirCache.Get(parent)
+	if !ok || len(items) != 1 || items[0].Uid != 1001 || items[0].Gid != 1001 || items[0].Mode&posixPermissionModeMask != 0750 {
+		t.Fatalf("failed binding cache = %+v ok=%v, want original 0750 1001:1001", items, ok)
 	}
 }
 

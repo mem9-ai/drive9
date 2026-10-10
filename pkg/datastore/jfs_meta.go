@@ -539,6 +539,19 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 			return nil, int(syscall.EIO), err
 		}
 		return map[string]any{"errno": eno, "inode": in.Inode, "attr": attr}, eno, nil
+	case "bind_dir_projection":
+		var in struct {
+			Path  string `json:"path"`
+			Inode uint64 `json:"inode"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return nil, int(syscall.EINVAL), err
+		}
+		eno, err := s.jfsBindDirProjectionTx(tx, in.Path, in.Inode)
+		if err != nil {
+			return nil, int(syscall.EIO), err
+		}
+		return map[string]any{"errno": eno, "inode": in.Inode}, eno, nil
 	case "setattr":
 		var in struct {
 			Inode uint64     `json:"inode"`

@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +18,10 @@ import (
 // exercise the file and mirrored-directory SetAttr validation, cache update,
 // and reply paths without constructing a remote JuiceFS runtime.
 var testHookExtentSetAttr func(ino uint64, set int, fh uint64, mode, uid, gid uint32, atime, mtime int64, atimensec, mtimensec uint32, size uint64) (*jfsmeta.Entry, syscall.Errno)
+
+// testHookExtentBindDir substitutes only the durable projection binding that
+// precedes a mirrored-directory SetAttr.
+var testHookExtentBindDir func(ctx context.Context, path string, ino uint64) gofuse.Status
 
 func (fs *Dat9FS) extentStatIno(ctx context.Context, p string) (uint64, bool) {
 	if fs.client == nil {
@@ -380,6 +385,33 @@ func (fs *Dat9FS) extentRefreshFromVFS(nodeID uint64, p string, fuseFh uint64) b
 	return true
 }
 
+func (fs *Dat9FS) extentBindDirectoryProjection(ctx context.Context, p string, ino uint64) gofuse.Status {
+	remote := fs.remotePath(p)
+	if testHookExtentBindDir != nil {
+		return testHookExtentBindDir(ctx, remote, ino)
+	}
+	if fs == nil || fs.client == nil || ino == 0 {
+		return gofuse.EIO
+	}
+	raw, err := fs.client.ExtentMeta(ctx, "bind_dir_projection", struct {
+		Path  string `json:"path"`
+		Inode uint64 `json:"inode"`
+	}{Path: remote, Inode: ino})
+	if err != nil {
+		return gofuse.EIO
+	}
+	var out struct {
+		Errno int `json:"errno"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return gofuse.EIO
+	}
+	if out.Errno != 0 {
+		return gofuse.Status(out.Errno)
+	}
+	return gofuse.OK
+}
+
 func (fs *Dat9FS) extentSetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, entry *InodeEntry, out *gofuse.AttrOut) gofuse.Status {
 	v := fs.extentVFS()
 	if testHookExtentSetAttr == nil {
@@ -517,7 +549,7 @@ func (fs *Dat9FS) applyExtentSetAttrResult(input *gofuse.SetAttrIn, entry *Inode
 	return entry
 }
 
-func (fs *Dat9FS) extentMirrorDirAttr(input *gofuse.SetAttrIn, entry *InodeEntry) gofuse.Status {
+func (fs *Dat9FS) extentMirrorDirAttr(requestCtx context.Context, input *gofuse.SetAttrIn, entry *InodeEntry) gofuse.Status {
 	if fs == nil || input == nil || entry == nil || !entry.IsDir {
 		return gofuse.EIO
 	}
@@ -551,6 +583,13 @@ func (fs *Dat9FS) extentMirrorDirAttr(input *gofuse.SetAttrIn, entry *InodeEntry
 		inoNum = uint64(mirrored)
 		fs.inodes.SetExtentIno(input.NodeId, inoNum)
 		entry.ExtentIno = inoNum
+	}
+	// The mount-local binding is not enough: a fresh mount learns the exact
+	// native directory inode only from file_nodes.extent_ino. Bind it before
+	// mutating jfs_node so a failed bind cannot leave an acknowledged owner or
+	// mode that the next mount has no durable way to find.
+	if st := fs.extentBindDirectoryProjection(requestCtx, entry.Path, inoNum); st != gofuse.OK {
+		return st
 	}
 	set := 0
 	var mode, uid, gid uint32

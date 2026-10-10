@@ -9437,7 +9437,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		fs.cacheEntryForPath(entry.Path, entry)
 	}
 	if entry.IsDir {
-		if st := fs.extentMirrorDirAttr(input, entry); st != gofuse.OK {
+		if st := fs.extentMirrorDirAttr(ctx, input, entry); st != gofuse.OK {
 			fs.restoreJuiceFSDirectoryMetadata(entry, directoryNativeBefore)
 			return st
 		}
