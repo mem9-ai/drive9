@@ -1,0 +1,138 @@
+name: Secret Scan
+
+# Scans the commits a pull request adds for committed credentials.
+#
+# Enforcing it requires the repository ruleset to list the `gitleaks` status
+# check; the workflow alone cannot block a merge, so until the ruleset is
+# updated this scan is advisory.
+#
+# `pull_request_target` loads this definition from the default branch, not from
+# the pull request, so the gate cannot be weakened by the change it is meant to
+# inspect. Nothing from the pull request is ever executed: the scanner is
+# installed from the version pinned below into a per-run directory outside the
+# workspace, the allowlist comes from the merge base, and the PR checkout is read
+# only for its git objects. Allowlist additions therefore take effect only once
+# they are merged, and the scanner ignores any `.gitleaksignore` shipped by the
+# PR.
+#
+# Bootstrap: `pull_request_target` only runs when this file already exists on the
+# default branch, so the PR that introduces it is not itself gated — every later
+# PR is.
+#
+# `make gitleaks` is the equivalent local command; workflow_dispatch audits the
+# full history of the selected ref.
+on:
+  pull_request_target:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: secret-scan-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: v8.30.1
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout the PR head (read only, never executed)
+        uses: actions/checkout@v4
+        with:
+          # refs/pull/<n>/head exists for every PR, including conflicting ones.
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/head', github.event.pull_request.number) || github.ref }}
+          # The PR commit range and its merge-base allowlist are resolved with
+          # git, so the base commit must be present locally.
+          fetch-depth: 0
+          # The scan never pushes; do not leave the token in .git/config.
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install gitleaks
+        # The scanner must not be read from the checkout: a pull request could
+        # commit a binary that reports the same version and have this job run it.
+        # Install into a per-run directory outside the workspace, never reuse a
+        # pre-existing or cached binary, and verify the module path as well as
+        # the version.
+        working-directory: ${{ runner.temp }}
+        env:
+          GOBIN: ${{ runner.temp }}/gitleaks-bin
+        run: |
+          set -euo pipefail
+          go install "github.com/zricethezav/gitleaks/v8@${GITLEAKS_VERSION}"
+          info="$(go version -m "$GOBIN/gitleaks")"
+          module="$(printf '%s\n' "$info" | awk '$1 == "path" { print $2 }')"
+          version="$(printf '%s\n' "$info" | awk '$1 == "mod" { print $3 }')"
+          if [ "$module" != "github.com/zricethezav/gitleaks/v8" ] || [ "$version" != "$GITLEAKS_VERSION" ]; then
+            echo "refusing to run an unexpected scanner build: path=$module version=$version" >&2
+            exit 1
+          fi
+          case "$GOBIN/gitleaks" in
+            "$GITHUB_WORKSPACE"/*)
+              echo "refusing to run a scanner from the checkout" >&2
+              exit 1
+              ;;
+          esac
+          echo "scanner: $GOBIN/gitleaks ($module $version)"
+
+      - name: Scan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          scanner="$RUNNER_TEMP/gitleaks-bin/gitleaks"
+          case "$scanner" in
+            "$GITHUB_WORKSPACE"/*)
+              echo "refusing to run a scanner from the checkout" >&2
+              exit 1
+              ;;
+          esac
+          if [ -n "$BASE_SHA" ]; then
+            log_opts="$BASE_SHA..$HEAD_SHA"
+            config_ref="$BASE_SHA"
+          else
+            log_opts="--all"
+            config_ref="HEAD"
+          fi
+
+          # Trusted allowlist: the merge base for a PR, the checked-out ref for a
+          # manual run. If that revision predates .gitleaks.toml, fall back to the
+          # built-in rules with no allowlist — stricter, never the PR's own copy.
+          if git show "$config_ref:.gitleaks.toml" > "$RUNNER_TEMP/gitleaks.toml" 2>/dev/null; then
+            echo "allowlist source: $config_ref:.gitleaks.toml"
+          else
+            printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/gitleaks.toml"
+            echo "allowlist source: built-in defaults, no allowlist ($config_ref predates .gitleaks.toml)"
+          fi
+
+          # gitleaks exits 0 with "0 commits scanned" when git cannot read the
+          # requested history, so traverse the range first and fail closed.
+          if ! git log -p -U0 "$log_opts" >/dev/null 2>&1; then
+            echo "cannot read the full history of '$log_opts' (missing objects or an unknown revision)" >&2
+            exit 1
+          fi
+
+          # Belt and braces: the allowlist and ignore lookups must never resolve
+          # inside the pull request's checkout.
+          rm -f "$GITHUB_WORKSPACE/.gitleaksignore"
+
+          # --ignore-gitleaks-allow: an inline `gitleaks:allow` comment is a
+          # suppression, and a pull request must not be able to suppress its own
+          # finding. The local `make gitleaks` still honours them.
+          "$scanner" git . --no-banner --redact \
+            --config "$RUNNER_TEMP/gitleaks.toml" \
+            --gitleaks-ignore-path "$RUNNER_TEMP" \
+            --ignore-gitleaks-allow \
+            --log-opts="$log_opts"

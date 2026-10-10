@@ -94,6 +94,38 @@ golangci-lint is auto-installed to `bin/golangci-lint` on first `make lint`. The
 `.golangci.yml`; linter runs with default settings. CI (`code-ci.yml`) enforces lint before
 tests on every PR to `main`.
 
+## Secret scanning
+
+```bash
+make gitleaks                                  # the current branch
+make gitleaks GITLEAKS_LOG_OPTS="--all"        # every ref
+make gitleaks GITLEAKS_LOG_OPTS="main..HEAD"   # a commit range
+```
+
+gitleaks (`v8.30.1`, auto-installed to `bin/gitleaks`) is configured by
+`.gitleaks.toml`. The allowlist there covers only verified non-secrets — the
+loopback-only local-dev placeholder keys, a CLI test JWT fixture, and documentation
+placeholders — and every entry is anchored (`^...$`) so it can only match a complete
+detected secret. Never allowlist a real credential; rotate it and remove it from
+history instead.
+
+CI (`.github/workflows/gitleaks.yml`) scans a pull request's own commits
+(`<base-sha>..<head-sha>`). It is declared with `pull_request_target`, so the workflow
+definition comes from the default branch and cannot be weakened by the pull request it
+inspects; the PR is checked out only for its git objects and nothing from it is ever
+executed. The scanner version is pinned in the workflow and the allowlist is read from
+the merge base, so an allowlist entry only takes effect once it is merged. Bootstrap: the
+PR that first lands this file is not itself gated — every later PR is. Manual
+`workflow_dispatch` runs scan the full history of the selected ref. It runs as its own
+check; the workflow alone cannot block a merge, so add the `gitleaks` context to the
+branch ruleset to turn the scan into a gate.
+
+`make gitleaks` fails closed: it traverses the range with git before scanning, so an
+unknown revision or a partial clone whose promisor remote is unreachable aborts instead of
+reporting "no leaks found". Regression: `make test-gitleaks-fail-closed`, run by
+`code-ci.yml` (it cannot run inside the Secret Scan workflow, which never executes code
+from the pull request).
+
 ---
 
 ## Local dev server
