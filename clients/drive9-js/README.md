@@ -143,8 +143,7 @@ Use `runtimeCapabilities()` to discover provider profiles, machine-readable
 `full_root`; opt in to `workspace` only when files outside the provider's coding
 workspace may be discarded. Set `layer_id` together with
 `persistence: "workspace"` to run against one exact LayerFS view;
-`full_root + layer_id` is
-rejected because full-root compatibility is not inherited across forks. Omit
+`full_root + layer_id` is outside the current one-shot Runtime MVP. Omit
 `layer_id` for the base workspace view. Use `cancelRuntimeExecution(id)` only for an
 execution whose `started` frame was observed. A successful cancel means the
 provider confirmed the process stopped and bounded workspace cleanup completed.

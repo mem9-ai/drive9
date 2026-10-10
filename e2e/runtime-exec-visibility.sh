@@ -165,7 +165,7 @@ printf '%s' "$capabilities" | jq -e \
   '.streaming == true and .separate_stdout_stderr == true and .cancel == true and .detached == false and .replay == false
    and any(.providers[].candidates[]; .execution_class == "linux-full"
      and .persistence == "full_root"
-     and .rootfs.capability_version == "drive9_rootfs.user_union.extent.v4"
+     and .rootfs.capability_version == "drive9_rootfs.user_union.extent.v5"
      and .capabilities["workspace_persistence"] == true
      and .capabilities["full_root_persistence"] == true
      and .capabilities["drive9.extent_xattr.v1"] == true

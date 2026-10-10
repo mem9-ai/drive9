@@ -271,7 +271,7 @@ function validRuntimeCandidateCapability(value: unknown): value is RuntimeCandid
   }
   if (value.capabilities["workspace_persistence"] !== true) return false;
   if (value.persistence === "full_root") {
-    return value.rootfs.driver === "user-union" && value.rootfs.capability_version === "drive9_rootfs.user_union.extent.v4" &&
+    return value.rootfs.driver === "user-union" && value.rootfs.capability_version === "drive9_rootfs.user_union.extent.v5" &&
       value.capabilities["full_root_persistence"] === true && value.capabilities["drive9.extent_xattr.v1"] === true;
   }
   if (value.persistence === "workspace") {

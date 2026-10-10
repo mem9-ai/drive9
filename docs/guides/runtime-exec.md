@@ -18,6 +18,13 @@ Docker supplies `full_root`. Daytona profiles use the workspace path resolved
 by Daytona's API and supply `workspace` only. Runtime reports success
 only after confirmed process exit, Drive9 drain, and provider teardown.
 
+For Docker `full_root`, Drive9 persists the user change layer independently
+from the selected base image. If server policy later selects a different image
+or profile for the same workspace, prior copied-up files, deletion records,
+ownership, and permissions continue to overlay that new image; they are not
+reset or rejected. This is deliberate and may hide or replace same-path files
+from the newer image.
+
 ## CLI
 
 ```bash
@@ -37,8 +44,8 @@ returns the process exit status. `--workspace` defaults to `:/`.
 fork. Omitting it mounts the base workspace view. Base and layer views use
 independent execution mounts and may run concurrently. A layer view requires
 `--persistence workspace`; the server rejects `full_root + layer_id`, including
-the default omitted persistence value, because full-root compatibility is not
-inherited across LayerFS forks.
+the default omitted persistence value, because full-root-on-LayerFS composition
+is outside the current one-shot Runtime MVP.
 `--persistence` defaults to `full_root` for compatibility and safety; pass
 `workspace` only when persistence outside the coding workspace is unnecessary.
 CPU, memory, PID, disk, network, and execution class are backend-owned provider

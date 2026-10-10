@@ -25,7 +25,7 @@ const (
 	RuntimeCapabilityFullRoot   = "full_root_persistence"
 	runtimeRootFSUserUnion      = "user-union"
 	runtimeRootFSWorkspace      = "workspace-mount"
-	runtimeRootFSCapabilityV4   = "drive9_rootfs.user_union.extent.v4"
+	runtimeRootFSCapabilityV5   = "drive9_rootfs.user_union.extent.v5"
 	runtimeWorkspaceCapability  = "drive9_workspace.mount.v1"
 )
 
@@ -485,7 +485,7 @@ func validRuntimePersistenceCapability(candidate RuntimeCandidateCapability) boo
 	switch candidate.Persistence {
 	case RuntimePersistenceFullRoot:
 		return candidate.RootFS.Driver == runtimeRootFSUserUnion &&
-			candidate.RootFS.CapabilityVersion == runtimeRootFSCapabilityV4 &&
+			candidate.RootFS.CapabilityVersion == runtimeRootFSCapabilityV5 &&
 			candidate.Capabilities[RuntimeCapabilityFullRoot] &&
 			candidate.Capabilities[ExtentXattrProtocolV1]
 	case RuntimePersistenceWorkspace:

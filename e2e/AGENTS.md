@@ -109,6 +109,10 @@ DRIVE9_SERVER_BIN=/path/to/drive9-server \
   DRIVE9_LOCAL_E2E_SMOKE_SCRIPT=e2e/runtime-exec-visibility.sh \
   bash scripts/e2e-local.sh --no-build
 
+# Paired server CI also runs runtime-rootfs-rebase.sh twice against the same
+# TiDB/object state: seed with image A, then verify with image B. The script is
+# phase-driven and not a useful standalone one-shot command.
+
 # Skip FUSE-related suites (macOS / no real FUSE)
 RUN_FUSE_SMOKE=0 bash e2e/smoke-all.sh
 
