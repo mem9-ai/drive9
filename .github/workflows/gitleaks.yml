@@ -80,8 +80,11 @@ jobs:
           # Trusted allowlist: the merge base for a PR, the checked-out ref for a
           # manual run. If that revision predates .gitleaks.toml, fall back to the
           # built-in rules with no allowlist — stricter, never the PR's own copy.
-          if ! git show "$config_ref:.gitleaks.toml" > "$RUNNER_TEMP/gitleaks.toml" 2>/dev/null; then
+          if git show "$config_ref:.gitleaks.toml" > "$RUNNER_TEMP/gitleaks.toml" 2>/dev/null; then
+            echo "allowlist source: $config_ref:.gitleaks.toml"
+          else
             printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/gitleaks.toml"
+            echo "allowlist source: built-in defaults, no allowlist ($config_ref predates .gitleaks.toml)"
           fi
 
           bin/gitleaks git . --no-banner --redact \
