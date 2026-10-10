@@ -222,7 +222,10 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y default-mysql-client fuse3 jq
+          sudo apt-get install -y default-mysql-client fuse3 fuse-overlayfs jq
+          if ! grep -qxF user_allow_other /etc/fuse.conf; then
+            echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null
+          fi
 
       - name: Cache TiUP artifacts
         uses: actions/cache@v4
@@ -295,6 +298,22 @@ jobs:
           done
           echo "drive9-server did not become ready in time" >&2
           exit 1
+
+      - name: Probe durable Drive9 overlay rootfs
+        id: runtime-rootfs-overlay
+        run: |
+          probe_cli="$(mktemp)"
+          trap 'rm -f "$probe_cli"' EXIT
+          make build-cli CLI_BIN="$probe_cli"
+          echo "rootfs probe source commit: $GITHUB_SHA"
+          echo "rootfs probe CLI path: $(realpath "$probe_cli")"
+          "$probe_cli" --version
+          sha256sum "$probe_cli"
+          DRIVE9_CLI_BIN="$probe_cli" bash e2e/runtime-rootfs-overlay-probe.sh
+          DRIVE9_CLI_BIN="$probe_cli" \
+            ROOTFS_OVERLAY_DRIVER=kernel \
+            ROOTFS_EXPECT_KERNEL_REJECT=1 \
+            bash e2e/runtime-rootfs-overlay-probe.sh
 
       - name: Run API smoke
         id: api-smoke
@@ -510,6 +529,7 @@ jobs:
             echo
             echo "| Check | Outcome |"
             echo "| --- | --- |"
+            echo "| Drive9 overlay rootfs capability | ${{ steps.runtime-rootfs-overlay.outcome || 'skipped' }} |"
             echo "| API smoke | ${{ steps.api-smoke.outcome || 'skipped' }} |"
             echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
             echo "| Object-store smoke | ${{ steps.object-store-smoke.outcome || 'skipped' }} |"
@@ -557,6 +577,7 @@ jobs:
         run: |
           cat > /tmp/e2e-outcomes.json <<JSON
           {
+            "runtime-rootfs-overlay": "${{ steps.runtime-rootfs-overlay.outcome }}",
             "api-smoke": "${{ steps.api-smoke.outcome }}",
             "cli-smoke": "${{ steps.cli-smoke.outcome }}",
             "object-store-smoke": "${{ steps.object-store-smoke.outcome }}",
@@ -659,6 +680,7 @@ jobs:
             fi
           }
 
+          check_required "Drive9 overlay rootfs capability" "${{ steps.runtime-rootfs-overlay.outcome }}"
           check_required "API smoke" "${{ steps.api-smoke.outcome }}"
           check_required "CLI smoke" "${{ steps.cli-smoke.outcome }}"
           check_required "Object-store smoke" "${{ steps.object-store-smoke.outcome }}"

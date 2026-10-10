@@ -111,6 +111,43 @@ Environment variables `DRIVE9_SERVER` or `DRIVE9_BASE` and `DRIVE9_API_KEY` take
 | Layer grep | `await client.grepWithLayer(query, prefix, limit, layerRef)` |
 | Find | `await client.find(prefix, params?)` |
 
+### One-shot Runtime exec
+
+Runtime is optional on the server and deliberately non-durable. The SDK streams
+one process and never retries a lost stream:
+
+```typescript
+import { Client, isRuntimeOutcomeUnknown } from "drive9";
+
+const client = Client.defaultClient();
+try {
+  const result = await client.exec(
+    { argv: ["npm", "test"], workspace: { root: "/repo", layer_id: "pi-fork-42", persistence: "workspace" } },
+    {
+      onStdout: chunk => process.stdout.write(chunk),
+      onStderr: chunk => process.stderr.write(chunk),
+    },
+  );
+  console.log(`exit=${result.exitCode}`);
+} catch (error) {
+  if (isRuntimeOutcomeUnknown(error)) {
+    // The process may have run. Reconcile; do not automatically resubmit.
+  }
+  throw error;
+}
+```
+
+Use `runtimeCapabilities()` to discover provider profiles, machine-readable
+`persistence`, rootfs/workspace identities, and their `production_eligible` /
+`bounded_selection_eligible` status. Omitted request persistence defaults to
+`full_root`; opt in to `workspace` only when files outside the provider's coding
+workspace may be discarded. Set `layer_id` together with
+`persistence: "workspace"` to run against one exact LayerFS view;
+`full_root + layer_id` is outside the current one-shot Runtime MVP. Omit
+`layer_id` for the base workspace view. Use `cancelRuntimeExecution(id)` only for an
+execution whose `started` frame was observed. A successful cancel means the
+provider confirmed the process stopped and bounded workspace cleanup completed.
+
 ### Streaming & multipart
 
 | Operation | Method |

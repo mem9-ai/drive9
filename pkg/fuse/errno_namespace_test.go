@@ -120,3 +120,34 @@ func TestErrnoAlignmentXAttrNamespaces(test *testing.T) {
 		}
 	}
 }
+
+func TestXAttrNamespaceRejectsPrivateOverlayMetadata(t *testing.T) {
+	for _, attr := range []string{
+		"user.fuseoverlayfs.override_stat",
+		"user.fuseoverlayfs.origin",
+		"security.fuseoverlayfs.override_stat",
+		"user.overlay.opaque",
+		"trusted.overlay.opaque",
+		"trusted.overlay.origin",
+		"user.containers.override_stat",
+	} {
+		t.Run(attr, func(t *testing.T) {
+			if xattrNamespaceSupported(attr) {
+				t.Fatalf("private overlay xattr %q is supported", attr)
+			}
+		})
+	}
+
+	for _, attr := range []string{
+		"user.drive9",
+		"security.selinux",
+		"trusted.drive9",
+		"system.posix_acl_access",
+	} {
+		t.Run(attr, func(t *testing.T) {
+			if !xattrNamespaceSupported(attr) {
+				t.Fatalf("ordinary xattr %q is unsupported", attr)
+			}
+		})
+	}
+}

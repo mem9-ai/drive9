@@ -117,6 +117,12 @@ type MountOptions struct {
 	// SkipProcessState skips writing the mount pid/process state file. Used when
 	// a supervisor owns the authoritative process state.
 	SkipProcessState bool
+	// OmitProcessStateCredentials keeps API keys, delegated tokens, and the
+	// potentially credential-bearing server endpoint out of the process-state
+	// file while retaining the PID and control socket needed by drain and
+	// unmount. Callers using this mode cannot use credential-backed post-unmount
+	// helpers such as auto-pack.
+	OmitProcessStateCredentials bool
 	// Supervised marks this worker as managed by an external supervisor (logging only).
 	Supervised bool
 }
@@ -329,7 +335,8 @@ func Mount(opts *MountOptions) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			stack := string(debug.Stack())
-			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=panic mountpoint=%s detail=%v\n%s\n", mountPointCopy, r, stack)
+			detail := redactMountCredentialText(fmt.Sprintf("%v", r), opts)
+			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=panic mountpoint=%s detail=%s\n%s\n", mountPointCopy, detail, stack)
 			// Prefer live mount check over flag: panic may occur after NewServer
 			// before mountBecameActive is set, or the flag may lag.
 			if mountPointCopy != "" {
@@ -339,7 +346,6 @@ func Mount(opts *MountOptions) (err error) {
 					forceUnmountLazy(mountPointCopy)
 				}
 			}
-			detail := fmt.Sprintf("%v", r)
 			err = ExitPanicErr(detail, fmt.Errorf("panic: %v", r))
 			if mountPointCopy != "" {
 				_ = mountstate.WriteExitReason(mountPointCopy, mountstate.ExitReason{
@@ -350,6 +356,9 @@ func Mount(opts *MountOptions) (err error) {
 					At:     time.Now().UTC(),
 				})
 			}
+		}
+		if opts.OmitProcessStateCredentials {
+			err = redactMountCredentialError(err, opts)
 		}
 	}()
 	if localOverlay := NewLocalOverlay(opts.LocalRoot); localOverlay != nil {
@@ -754,33 +763,9 @@ func Mount(opts *MountOptions) (err error) {
 		if controlServer != nil {
 			controlSock = controlServer.SocketPath()
 		}
-		pidFile, err = mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
-			PID:                 os.Getpid(),
-			CreationTime:        creationTime,
-			Component:           "drive9-fuse",
-			MountKind:           mountstate.MountKindFUSE,
-			MountPoint:          stateMountPoint,
-			RemoteRoot:          opts.RemoteRoot,
-			Profile:             opts.Profile,
-			LocalRoot:           opts.LocalRoot,
-			Server:              opts.Server,
-			PackPaths:           append([]string(nil), opts.PackPaths...),
-			CredentialKind:      credentialKind,
-			APIKey:              opts.APIKey,
-			Token:               opts.Token,
-			ProfileDir:          opts.Profiling.ProfileDir,
-			PerfSamplesPath:     opts.Profiling.PerfSamplesPath,
-			PerfInterval:        opts.Profiling.PerfSampleInterval.String(),
-			PerfMaxSamples:      opts.Profiling.PerfMaxSamples,
-			PerfMaxSampleFiles:  opts.Profiling.PerfMaxSampleFiles,
-			PerfMaxProfileFiles: opts.Profiling.PerfMaxProfileFiles,
-			PprofAddr:           opts.Profiling.PprofAddr,
-			StartedAt:           time.Now().UTC().Format(time.RFC3339Nano),
-			HeapProfilePath:     opts.Profiling.HeapProfilePath,
-			ControlSocket:       controlSock,
-			Role:                mountstate.RoleWorker,
-			Supervise:           opts.Supervised,
-		})
+		pidFile, err = mountstate.WriteProcessState(opts.MountPoint, newMountProcessState(
+			opts, stateMountPoint, creationTime, credentialKind, controlSock, time.Now().UTC(),
+		))
 		if err != nil {
 			if controlServer != nil {
 				controlServer.Close()
@@ -937,8 +922,7 @@ func Mount(opts *MountOptions) (err error) {
 		forceUnmountLazy(opts.MountPoint)
 	}()
 
-	fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
-		opts.MountPoint, opts.Server, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
+	fmt.Fprint(os.Stderr, mountReadyMessage(opts, actorID, cacheBase, shadowDir))
 	server.Wait()
 	// Classify serve-end *before* shutdown drains. Drain can take a long time
 	// for a large commit queue; an external umount completing mid-drain would
@@ -1025,6 +1009,88 @@ func Mount(opts *MountOptions) (err error) {
 		return ExitServeAbnormalErr(detail)
 	}
 }
+
+func newMountProcessState(opts *MountOptions, mountPoint string, creationTime uint64, credentialKind, controlSock string, startedAt time.Time) mountstate.ProcessState {
+	apiKey, token, server := opts.APIKey, opts.Token, opts.Server
+	if opts.OmitProcessStateCredentials {
+		apiKey, token, server = "", "", ""
+	}
+	return mountstate.ProcessState{
+		PID:                 os.Getpid(),
+		CreationTime:        creationTime,
+		Component:           "drive9-fuse",
+		MountKind:           mountstate.MountKindFUSE,
+		MountPoint:          mountPoint,
+		RemoteRoot:          opts.RemoteRoot,
+		Profile:             opts.Profile,
+		LocalRoot:           opts.LocalRoot,
+		Server:              server,
+		PackPaths:           append([]string(nil), opts.PackPaths...),
+		CredentialKind:      credentialKind,
+		APIKey:              apiKey,
+		Token:               token,
+		ProfileDir:          opts.Profiling.ProfileDir,
+		PerfSamplesPath:     opts.Profiling.PerfSamplesPath,
+		PerfInterval:        opts.Profiling.PerfSampleInterval.String(),
+		PerfMaxSamples:      opts.Profiling.PerfMaxSamples,
+		PerfMaxSampleFiles:  opts.Profiling.PerfMaxSampleFiles,
+		PerfMaxProfileFiles: opts.Profiling.PerfMaxProfileFiles,
+		PprofAddr:           opts.Profiling.PprofAddr,
+		StartedAt:           startedAt.Format(time.RFC3339Nano),
+		HeapProfilePath:     opts.Profiling.HeapProfilePath,
+		ControlSocket:       controlSock,
+		Role:                mountstate.RoleWorker,
+		Supervise:           opts.Supervised,
+	}
+}
+
+func mountReadyMessage(opts *MountOptions, actorID, cacheBase, shadowDir string) string {
+	return fmt.Sprintf("drive9: mounted on %s (actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
+		opts.MountPoint, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
+}
+
+func redactMountCredentialError(err error, opts *MountOptions) error {
+	if err == nil {
+		return nil
+	}
+	message := redactMountCredentialText(err.Error(), opts)
+	if message == err.Error() {
+		return err
+	}
+	var exitErr *MountExitError
+	if errors.As(err, &exitErr) {
+		redacted := *exitErr
+		redacted.Detail = redactMountCredentialText(exitErr.Detail, opts)
+		if exitErr.Cause != nil {
+			redacted.Cause = redactedMountCause{
+				message: redactMountCredentialText(exitErr.Cause.Error(), opts),
+				cause:   exitErr.Cause,
+			}
+		}
+		return &redacted
+	}
+	return redactedMountCause{message: message, cause: err}
+}
+
+func redactMountCredentialText(text string, opts *MountOptions) string {
+	if opts == nil {
+		return text
+	}
+	for _, secret := range []string{opts.Server, opts.APIKey, opts.Token} {
+		if secret != "" {
+			text = strings.ReplaceAll(text, secret, "<redacted>")
+		}
+	}
+	return text
+}
+
+type redactedMountCause struct {
+	message string
+	cause   error
+}
+
+func (e redactedMountCause) Error() string { return e.message }
+func (e redactedMountCause) Unwrap() error { return e.cause }
 
 // classifyServeEnd decides why the FUSE serve loop ended.
 func classifyServeEnd(unmountRequested bool, mountPoint string) (MountExitReason, string) {

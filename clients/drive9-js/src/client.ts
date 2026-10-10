@@ -123,6 +123,15 @@ import {
 } from "./vault.js";
 import { watchEvents, watchEventsWithLifecycle } from "./events.js";
 import { archiveImpl, archiveToFileImpl, type ArchiveOptions } from "./archive.js";
+import {
+  cancelRuntimeExecution,
+  exec,
+  getRuntimeCapabilities,
+  type RuntimeCapabilities,
+  type ExecOptions,
+  type ExecRequest,
+  type ExecResult,
+} from "./runtime.js";
 
 const DEFAULT_SMALL_FILE_THRESHOLD = 50_000;
 const DEFAULT_SERVER = "https://api.drive9.ai";
@@ -342,6 +351,18 @@ export class Client {
     const resp = await fetch(`${this.baseUrl}${endpoint}`, { method: "DELETE", headers, body: payload.body });
     await checkError(resp);
     return resp;
+  }
+
+  async exec(input: ExecRequest, options?: ExecOptions): Promise<ExecResult> {
+    return exec(this, input, options);
+  }
+
+  async runtimeCapabilities(signal?: AbortSignal): Promise<RuntimeCapabilities> {
+    return getRuntimeCapabilities(this, signal);
+  }
+
+  async cancelRuntimeExecution(executionId: string, signal?: AbortSignal): Promise<void> {
+    return cancelRuntimeExecution(this, executionId, signal);
   }
 
   async write(path: string, data: Uint8Array, options?: number | WriteOptions): Promise<void> {

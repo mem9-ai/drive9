@@ -83,6 +83,69 @@ func (s *Store) jfsGetAttrWithLockTx(db execer, ino uint64, forUpdate bool) (*Ex
 	attr := jfsAttrFromNode(typ, mode, uid, gid, atime, mtime, ctime, asec, msec, csec, nlink, length, parent, rdev)
 	return &attr, 0, nil
 }
+
+// jfsBindDirProjectionTx records the exact native directory inode on an
+// existing Drive9 directory projection. The path is resolved through the
+// current jfs_edge tree before the projection row is touched, so a caller
+// cannot bind an arbitrary directory inode to an unrelated path.
+func (s *Store) jfsBindDirProjectionTx(tx *sql.Tx, rawPath string, ino uint64) (int, error) {
+	if ino == 0 {
+		return int(syscall.EINVAL), nil
+	}
+	dirPath, err := pathutil.CanonicalizeDir(rawPath)
+	if err != nil || dirPath == "/" {
+		return int(syscall.EINVAL), nil
+	}
+
+	parent := uint64(jfsRootIno)
+	for _, name := range strings.Split(strings.Trim(dirPath, "/"), "/") {
+		var next uint64
+		var typ uint8
+		err := tx.QueryRow(`SELECT inode, type FROM jfs_edge WHERE parent = ? AND name = ? FOR UPDATE`,
+			parent, []byte(name)).Scan(&next, &typ)
+		if errors.Is(err, sql.ErrNoRows) {
+			return int(syscall.ENOENT), nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		if typ != jfsTypeDir {
+			return int(syscall.ENOTDIR), nil
+		}
+		parent = next
+	}
+	if parent != ino {
+		return int(syscall.ESTALE), nil
+	}
+	if eno, err := s.jfsRequireDirTx(tx, ino); err != nil || eno != 0 {
+		return eno, err
+	}
+
+	var isDir bool
+	var current sql.NullInt64
+	err = tx.QueryRow(`SELECT is_directory, extent_ino FROM file_nodes WHERE `+
+		s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+		s.scope.Args(fileNodePathHash(dirPath), dirPath)...).Scan(&isDir, &current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return int(syscall.ENOENT), nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !isDir {
+		return int(syscall.ENOTDIR), nil
+	}
+	if current.Valid && current.Int64 != 0 && uint64(current.Int64) != ino {
+		return int(syscall.ESTALE), nil
+	}
+	if _, err := tx.Exec(`UPDATE file_nodes SET extent_ino = ? WHERE `+
+		s.scope.And(`path_hash = ? AND path = ?`),
+		append([]any{ino}, s.scope.Args(fileNodePathHash(dirPath), dirPath)...)...); err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
+
 func (s *Store) jfsSetAttrTx(tx *sql.Tx, ino uint64, set uint16, patch ExtentAttr, quota *ExtentQuotaLimit, compactOut *[]uint32) (*ExtentAttr, int, error) {
 	// FOR UPDATE for the same reason jfsTruncateTx needs it: the statement
 	// below writes the whole length column from a value read here, so an

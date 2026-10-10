@@ -171,6 +171,25 @@ echo '{"type":"tool.call.completed","summary":{"tool":"pytest"}}' \
 drive9 journal verify run-42
 ```
 
+### Optional One-Shot Execution
+
+When the server enables Runtime, the CLI and SDKs can run one process against
+an existing persistent workspace without introducing a second durable job
+system:
+
+```bash
+drive9 exec --workspace :/repo --persistence workspace --timeout 10m -- go test ./...
+```
+
+Stdout and stderr stream separately and the CLI returns the remote exit code.
+Persistence is explicit: `full_root` is the safe default, while `workspace`
+allows providers that persist only their official coding workspace and treat
+the rest of the sandbox filesystem as disposable.
+The server reports an exit only after the workspace mount drains. If the stream
+ends before a terminal frame, the result is `outcome_unknown`; the client never
+automatically retries because the process may already have run. Pi or another
+caller continues to own task state, retry, replay, and recovery policy.
+
 ## Architecture
 
 ```mermaid
@@ -240,7 +259,8 @@ cat ~/drive9/run-42.txt
 
 ## Boundaries
 
-- Drive9 keeps workspace state; another system still runs the sandbox process.
+- Drive9 keeps workspace state. Its optional Runtime endpoint can run one
+  bounded process, but it is not an agent loop or durable job system.
 - It does not preserve live processes, sockets, terminals, or in-memory model context.
 - It is not a Git replacement; Git remains the final review and history layer.
 - It targets agent workspace workloads, not full general-purpose POSIX compatibility.
@@ -255,6 +275,7 @@ cat ~/drive9/run-42.txt
 - [Go SDK integration guide](docs/guides/go-sdk-integration.md)
 - [Go SDK vs CLI parity notes](docs/guides/go-sdk-cli-parity.md)
 - [Vault quickstart](docs/guides/vault-quickstart.md)
+- [One-shot Runtime exec](docs/guides/runtime-exec.md)
 
 ## Development
 

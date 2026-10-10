@@ -955,6 +955,32 @@ func TestDispatchProfileVerbReachesHandler(t *testing.T) {
 	}
 }
 
+func TestDispatchExecVerbReachesHandler(t *testing.T) {
+	origHandler := execHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		execHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	execHandler = func(args []string) error {
+		gotArgs = append([]string(nil), args...)
+		return nil
+	}
+	want := []string{"--workspace", ":/repo", "--", "go", "test", "./..."}
+	dispatch("exec", want)
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for index := range want {
+		if gotArgs[index] != want[index] {
+			t.Fatalf("args[%d] = %q, want %q", index, gotArgs[index], want[index])
+		}
+	}
+}
+
 // V2b hard-cut (G-V2b-1 / G-V2b-3): `drive9 secret <sub>` MUST NOT reach the
 // vault handler and MUST NOT get a bespoke rename hint — it falls into the
 // generic `unknown command` path shared with any typo. This pins the "no
