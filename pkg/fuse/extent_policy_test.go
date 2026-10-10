@@ -370,6 +370,108 @@ func TestExtentSetAttrResultUpdatesCachedReadDirPlusMetadata(t *testing.T) {
 	}
 }
 
+func TestDirectorySetAttrPersistsNativeOwnerAndMode(t *testing.T) {
+	opts := &MountOptions{ExtentPaths: []string{"*"}}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	parent := "/upper/home"
+	dir := parent + "/agent"
+	ino := fs.inodes.Lookup(dir, true, 17, time.Unix(123, 456))
+	fs.inodes.SetExtentIno(ino, 42)
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFDIR)|0750)
+	fs.inodes.UpdateOwner(ino, 1001, 1001, true, true)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing mirrored directory inode")
+	}
+	fs.dirCache.Put(parent, []CachedFileInfo{cachedInfoFromEntry("agent", entry)})
+
+	input := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Valid:    gofuse.FATTR_UID | gofuse.FATTR_GID | gofuse.FATTR_FH,
+		Owner:    gofuse.Owner{Uid: 3456, Gid: 4567},
+	}}
+	testHookExtentSetAttr = func(gotIno uint64, set int, fh uint64, mode, uid, gid uint32, _ int64, _ int64, _ uint32, _ uint32, size uint64) (*jfsmeta.Entry, syscall.Errno) {
+		wantSet := int(jfsmeta.SetAttrUID | jfsmeta.SetAttrGID)
+		if gotIno != 42 || set != wantSet || fh != 0 || mode != 0 || uid != 3456 || gid != 4567 || size != 0 {
+			t.Fatalf("native directory SetAttr = ino=%d set=%x fh=%d mode=%o owner=%d:%d size=%d", gotIno, set, fh, mode, uid, gid, size)
+		}
+		return &jfsmeta.Entry{Inode: 42, Attr: &jfsmeta.Attr{
+			Full: true, Typ: jfsmeta.TypeDirectory, Mode: 0750,
+			Uid: 3456, Gid: 4567, Length: 4096, Nlink: 99, Mtime: 999,
+		}}, 0
+	}
+	t.Cleanup(func() { testHookExtentSetAttr = nil })
+
+	var out gofuse.AttrOut
+	if st := fs.SetAttr(nil, input, &out); st != gofuse.OK {
+		t.Fatalf("directory SetAttr status = %v, want OK", st)
+	}
+	if out.Mode&posixPermissionModeMask != 0750 || out.Uid != 3456 || out.Gid != 4567 {
+		t.Fatalf("directory SetAttr reply = mode=%o owner=%d:%d, want 0750 3456:4567", out.Mode, out.Uid, out.Gid)
+	}
+	got, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing directory inode after SetAttr")
+	}
+	if got.Size != 17 || got.Nlink == 99 || !got.Mtime.Equal(time.Unix(123, 456)) {
+		t.Fatalf("directory namespace metadata changed: size=%d nlink=%d mtime=%s", got.Size, got.Nlink, got.Mtime)
+	}
+	items, ok := fs.dirCache.Get(parent)
+	if !ok || len(items) != 1 || items[0].Uid != 3456 || items[0].Gid != 4567 || items[0].Mode&posixPermissionModeMask != 0750 {
+		t.Fatalf("cached directory metadata = %+v ok=%v, want 0750 3456:4567", items, ok)
+	}
+}
+
+func TestDirectorySetAttrNativeFailureIsVisibleAndRestoresProjection(t *testing.T) {
+	opts := &MountOptions{ExtentPaths: []string{"*"}}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	parent := "/upper/home"
+	dir := parent + "/agent"
+	ino := fs.inodes.Lookup(dir, true, 17, time.Unix(123, 456))
+	fs.inodes.SetExtentIno(ino, 42)
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFDIR)|0750)
+	fs.inodes.UpdateOwner(ino, 1001, 1001, true, true)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing mirrored directory inode")
+	}
+	fs.dirCache.Put(parent, []CachedFileInfo{cachedInfoFromEntry("agent", entry)})
+
+	input := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Valid:    gofuse.FATTR_UID | gofuse.FATTR_GID | gofuse.FATTR_FH,
+		Owner:    gofuse.Owner{Uid: 3456, Gid: 4567},
+	}}
+	testHookExtentSetAttr = func(gotIno uint64, set int, fh uint64, mode, uid, gid uint32, _ int64, _ int64, _ uint32, _ uint32, size uint64) (*jfsmeta.Entry, syscall.Errno) {
+		wantSet := int(jfsmeta.SetAttrUID | jfsmeta.SetAttrGID)
+		if gotIno != 42 || set != wantSet || fh != 0 || mode != 0 || uid != 3456 || gid != 4567 || size != 0 {
+			t.Fatalf("native directory SetAttr = ino=%d set=%x fh=%d mode=%o owner=%d:%d size=%d", gotIno, set, fh, mode, uid, gid, size)
+		}
+		return nil, syscall.EIO
+	}
+	t.Cleanup(func() { testHookExtentSetAttr = nil })
+
+	var out gofuse.AttrOut
+	if st := fs.SetAttr(nil, input, &out); st != gofuse.EIO {
+		t.Fatalf("directory SetAttr status = %v, want EIO", st)
+	}
+	got, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing directory inode after failed SetAttr")
+	}
+	if !got.HasUID || !got.HasGID || !got.HasMode || got.Uid != 1001 || got.Gid != 1001 || got.Mode&posixPermissionModeMask != 0750 {
+		t.Fatalf("failed SetAttr projection = mode=%o owner=%d:%d, want original 0750 1001:1001", got.Mode, got.Uid, got.Gid)
+	}
+	items, ok := fs.dirCache.Get(parent)
+	if !ok || len(items) != 1 || items[0].Uid != 1001 || items[0].Gid != 1001 || items[0].Mode&posixPermissionModeMask != 0750 {
+		t.Fatalf("failed SetAttr cache = %+v ok=%v, want original 0750 1001:1001", items, ok)
+	}
+}
+
 func TestApplyCachedNativeOwnerModeRejectsMismatchedKinds(t *testing.T) {
 	for _, test := range []struct {
 		name  string

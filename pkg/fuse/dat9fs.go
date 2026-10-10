@@ -9115,6 +9115,11 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	if !ok {
 		return gofuse.ENOENT
 	}
+	var directoryNativeBefore *InodeEntry
+	if entry.IsDir {
+		before := *entry
+		directoryNativeBefore = &before
+	}
 	sizeChanged := false
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -9432,7 +9437,10 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		fs.cacheEntryForPath(entry.Path, entry)
 	}
 	if entry.IsDir {
-		fs.extentMirrorDirAttr(input, entry)
+		if st := fs.extentMirrorDirAttr(input, entry); st != gofuse.OK {
+			fs.restoreJuiceFSDirectoryMetadata(entry, directoryNativeBefore)
+			return st
+		}
 	}
 	fs.fillAttr(entry, &out.Attr)
 	fs.setAttrOutTimeout(out, sizeChanged)
