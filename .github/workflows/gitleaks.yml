@@ -124,7 +124,15 @@ jobs:
             exit 1
           fi
 
+          # Belt and braces: the allowlist and ignore lookups must never resolve
+          # inside the pull request's checkout.
+          rm -f "$GITHUB_WORKSPACE/.gitleaksignore"
+
+          # --ignore-gitleaks-allow: an inline `gitleaks:allow` comment is a
+          # suppression, and a pull request must not be able to suppress its own
+          # finding. The local `make gitleaks` still honours them.
           "$scanner" git . --no-banner --redact \
             --config "$RUNNER_TEMP/gitleaks.toml" \
             --gitleaks-ignore-path "$RUNNER_TEMP" \
+            --ignore-gitleaks-allow \
             --log-opts="$log_opts"

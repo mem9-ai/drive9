@@ -146,6 +146,9 @@ install-lint:
 # Scan git history for committed credentials. The default covers the current
 # branch; pass GITLEAKS_LOG_OPTS for another range or "--all". Known non-secret
 # fixtures are allowlisted in .gitleaks.toml.
+# GITLEAKS_RANGE may hold several git-log arguments (gitleaks splits the value
+# on spaces, so the preflight does the same rather than quoting it as a
+# single revision).
 #
 # Fail closed: gitleaks exits 0 with "0 commits scanned" when git cannot read the
 # requested history (unknown revision, or a partial clone whose promisor remote
@@ -158,7 +161,7 @@ install-lint:
 # cannot excuse the finding it is adding.
 gitleaks: install-gitleaks
 	@set -euo pipefail; \
-	if ! git log -p -U0 "$(GITLEAKS_RANGE)" >/dev/null 2>&1; then \
+	if ! git log -p -U0 $(GITLEAKS_RANGE) >/dev/null 2>&1; then \
 		echo "gitleaks: cannot read the full history of '$(GITLEAKS_RANGE)'" >&2; \
 		echo "gitleaks: unknown revision, or a partial clone whose promisor remote is unreachable" >&2; \
 		exit 1; \
