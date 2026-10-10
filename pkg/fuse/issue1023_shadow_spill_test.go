@@ -270,11 +270,7 @@ func TestIssue1023CreatedAppenderRejectsInvalidShadowSource(t *testing.T) {
 	for _, scenario := range []string{"no-generation", "stale-generation", "wrong-length", "too-large"} {
 		t.Run(scenario, func(t *testing.T) {
 			fs, server, _, ino, ids, creator := issue1023CreateShadowAppenders(t, false)
-			record := "A\n"
-			if scenario == "too-large" {
-				record = strings.Repeat("A", maxLandedPayloadBytes+1)
-			}
-			issue1023ShadowAppend(t, fs, ino, ids[0], record)
+			issue1023ShadowAppend(t, fs, ino, ids[0], "A\n")
 			creator.Lock()
 			switch scenario {
 			case "no-generation":
@@ -283,6 +279,19 @@ func TestIssue1023CreatedAppenderRejectsInvalidShadowSource(t *testing.T) {
 				creator.ShadowStageGen++
 			case "wrong-length":
 				if err := fs.shadowStore.WriteFull(creator.Path, []byte("A"), 0); err != nil {
+					creator.Unlock()
+					t.Fatal(err)
+				}
+				creator.ShadowStageGen = fs.shadowStore.ActiveGeneration(creator.Path)
+			case "too-large":
+				// Admission rejects a live oversized child before ACK. Inject
+				// unsupported source evidence, like the other faults here;
+				// real oversized admission/retirement/retry has separate coverage.
+				if err := creator.Dirty.Truncate(maxLandedPayloadBytes + 1); err != nil {
+					creator.Unlock()
+					t.Fatal(err)
+				}
+				if err := fs.shadowStore.Truncate(creator.Path, creator.Dirty.Size(), creator.BaseRev); err != nil {
 					creator.Unlock()
 					t.Fatal(err)
 				}

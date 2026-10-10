@@ -823,7 +823,7 @@ func TestOpenHandlePathWideShadowPreloadDropsLineageTrust(t *testing.T) {
 					t.Fatal("unknown path-wide shadow was attributed to the source snapshot")
 				}
 				target.Lock()
-				loaded, preloadErr := fs.loadWritableHandleFromOpenHandles(target, true)
+				loaded, preloadErr := fs.loadWritableHandleFromOpenHandles(target, true, 0)
 				target.Unlock()
 				if loaded || !errors.Is(preloadErr, syscall.EAGAIN) || source.ContentSnapshotID != "source-snapshot" || source.StagedSnapshotID != "" || source.BaseRev != 0 || !source.ShadowReady {
 					t.Fatal("append accepted or tagged an unknown shadow generation")

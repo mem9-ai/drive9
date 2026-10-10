@@ -3931,7 +3931,7 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 }
 
 func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
-	loaded, _ := fs.loadWritableHandleFromOpenHandles(fh, false)
+	loaded, _ := fs.loadWritableHandleFromOpenHandles(fh, false, 0)
 	return loaded
 }
 
@@ -3940,8 +3940,10 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 // handles with TryLock instead of blocking: used by the write-path append
 // refresh, where the caller already holds the per-path commit lock and fh.mu,
 // so waiting on a busy sibling's handle lock could stall for the remote
-// commit wait timeout.
-func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool) (bool, error) {
+// commit wait timeout. appendBytes is the proposed Write length (zero for
+// Open). Append admission checks both image sizes under the source lock
+// before copying bytes or changing lineage/staging ownership.
+func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool, appendBytes int64) (bool, error) {
 	if fs.openHandles == nil || fh == nil || fh.Dirty == nil || fh.Unlinked {
 		return false, nil
 	}
@@ -3954,6 +3956,13 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 		}
 		src.Lock()
 		return true
+	}
+	oversizedPendingAppend := func(src *FileHandle) bool {
+		// ZeroBase alone may survive a successful empty-file commit. A
+		// genuine pending truncate still has dirty or staging ownership.
+		unresolved := src.IsNew || src.DirtySeq != 0 || src.WriteBackSeq != 0 || src.ShadowCommitReady || src.Dirty.HasDirtyParts()
+		return tryLock && appendBytes > 0 && unresolved &&
+			(appendBytes > maxLandedPayloadBytes || max(fh.Dirty.Size(), src.Dirty.Size()) > maxLandedPayloadBytes-appendBytes)
 	}
 
 	type candidate struct {
@@ -4009,6 +4018,15 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 		if !pendingLocal {
 			src.Unlock()
 			continue
+		}
+		if oversizedPendingAppend(src) {
+			// A still-owned ancestor needs the bounded landed proof even
+			// when its SID is already in our image or in the remote image.
+			// Do not ACK a larger child until that source owner retires.
+			// Subtraction avoids overflowing the prospective image size;
+			// zero-length dirty/truncate sources still carry ownership.
+			src.Unlock()
+			return false, syscall.EAGAIN
 		}
 		if tryLock && fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) && src.ShadowStageGen == 0 {
 			src.Unlock()
@@ -4081,6 +4099,12 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 				(c.src.Path == fh.Path || fs.sameLinkedInode(c.src.Path, fh.Ino)) {
 				if !fs.hasPendingLocalState(c.src.Path) {
 					fs.adoptCommittedRevisionLocked(c.src)
+				}
+				// A sibling can change while candidate selection drops
+				// its lock. Recheck the bound before binding the current image.
+				if oversizedPendingAppend(c.src) {
+					c.src.Unlock()
+					return false, syscall.EAGAIN
 				}
 				c.path = c.src.Path
 				size = c.src.Dirty.Size()
@@ -4227,7 +4251,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 // absent on the lock-timeout fallback path. The refresh only uses TryLock on
 // sibling handles. A busy sibling requests a retry after releasing locks;
 // dirty targets adopt only a proven descendant of their own snapshot.
-func (fs *Dat9FS) refreshAppendBufferLocked(ctx context.Context, fh *FileHandle) error {
+func (fs *Dat9FS) refreshAppendBufferLocked(ctx context.Context, fh *FileHandle, appendBytes int64) error {
 	if fs == nil || fh == nil || fh.Dirty == nil || fh.Unlinked {
 		return nil
 	}
@@ -4237,11 +4261,11 @@ func (fs *Dat9FS) refreshAppendBufferLocked(ctx context.Context, fh *FileHandle)
 	if err := fs.adoptLandedAppendSnapshotLocked(ctx, fh); err != nil {
 		return err
 	}
+	if loaded, err := fs.loadWritableHandleFromOpenHandles(fh, true, appendBytes); loaded || err != nil {
+		return err
+	}
 	if fh.ShadowSpill && fh.Dirty.Size() > maxLandedPayloadBytes {
 		return nil
-	}
-	if loaded, err := fs.loadWritableHandleFromOpenHandles(fh, true); loaded || err != nil {
-		return err
 	}
 	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
 		return nil
@@ -13827,7 +13851,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			if testHookBeforeAppendSourceRefresh != nil {
 				testHookBeforeAppendSourceRefresh(fh)
 			}
-			refreshErr = fs.refreshAppendBufferLocked(ctx, fh)
+			refreshErr = fs.refreshAppendBufferLocked(ctx, fh, int64(len(data)))
 			// A source may enqueue, commit, and close after admission.
 			// Retry the existing fence/refresh loop before acknowledging bytes.
 			if refreshErr == nil && (fs.appendCommitPending(fh) || fs.latestCommittedRevision(fh.Path) > committedBeforeRefresh) {
