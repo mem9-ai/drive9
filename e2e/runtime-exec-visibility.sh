@@ -58,10 +58,12 @@ run_privileged() {
 mount_raw_workspace() {
   mkdir -p "$RAW_MOUNT" "$RAW_STATE"
   chmod 0700 "$RAW_STATE"
+  # Permit the root-only diagnostic below to cross the FUSE mount boundary;
+  # default_permissions still enforces the restored native uid/gid/mode.
   if ! HOME="$RAW_STATE" XDG_RUNTIME_DIR="$RAW_STATE" \
     DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" \
     "$CLI_BIN" mount --no-supervise --no-persist-credentials \
-      --mode=fuse --profile=extent \
+      --mode=fuse --profile=extent --allow-other \
       --durability=write-sync --flush-debounce=0 \
       ":$ROOT" "$RAW_MOUNT" >"$WORK_DIR/raw-mount.log" 2>&1; then
     fail "fresh raw-upper diagnostic mount failed"
