@@ -38,6 +38,12 @@ GOLANGCI_LINT_VERSION ?= v2.5.0
 GOLANGCI_LINT_BIN ?= $(BIN_DIR)/golangci-lint
 GOLANGCI_LINT_GO_VERSION ?= $(shell $(GO) env GOVERSION)
 
+GITLEAKS_VERSION ?= v8.30.1
+GITLEAKS_BIN ?= $(BIN_DIR)/gitleaks
+# Optional `git log` range (for example `<base-sha>..<head-sha>`) so CI can scan
+# only the commits a PR adds. Empty scans every commit reachable from HEAD.
+GITLEAKS_LOG_OPTS ?=
+
 IMAGE_REPO ?= drive9-server
 IMAGE_TAG ?= latest
 IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
@@ -65,7 +71,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-race test-failpoint test-podman test-minio-bootstrap fmt lint install-lint build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
+.PHONY: mod test test-race test-failpoint test-podman test-minio-bootstrap fmt lint install-lint gitleaks install-gitleaks build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
@@ -133,6 +139,25 @@ install-lint:
 		GOTOOLCHAIN="$(GOLANGCI_LINT_GO_VERSION)" GOBIN="$(BIN_DIR_ABS)" $(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
 	else \
 		echo "golangci-lint already installed at $(GOLANGCI_LINT_BIN)"; \
+	fi
+
+# Scan git history for committed credentials. Local runs cover every commit
+# reachable from HEAD; CI sets GITLEAKS_LOG_OPTS to the PR's commit range so a
+# pull request is judged only on what it adds. Known non-secret fixtures are
+# allowlisted in .gitleaks.toml.
+gitleaks: install-gitleaks
+	$(GITLEAKS_BIN) git . --no-banner --redact -v \
+		$(if $(GITLEAKS_LOG_OPTS),--log-opts="$(GITLEAKS_LOG_OPTS)")
+
+install-gitleaks:
+	@echo "Checking for gitleaks..."
+	@current="$$($(GO) version -m "$(GITLEAKS_BIN)" 2>/dev/null | awk '$$1 == "mod" { print $$3 }')"; \
+	if [ ! -x "$(GITLEAKS_BIN)" ] || [ "$$current" != "$(GITLEAKS_VERSION)" ]; then \
+		echo "Installing gitleaks $(GITLEAKS_VERSION) to $(BIN_DIR)..."; \
+		mkdir -p "$(BIN_DIR)"; \
+		GOBIN="$(BIN_DIR_ABS)" $(GO) install github.com/zricethezav/gitleaks/v8@$(GITLEAKS_VERSION); \
+	else \
+		echo "gitleaks already installed at $(GITLEAKS_BIN)"; \
 	fi
 
 build: build-server build-cli

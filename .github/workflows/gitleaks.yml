@@ -1,0 +1,55 @@
+name: Secret Scan
+
+# Scans a pull request's own commits for committed credentials. The scan is
+# incremental on purpose: documented placeholders and test fixtures are
+# allowlisted in .gitleaks.toml, so a PR is judged only on what it adds. Manual
+# runs audit the full history of the selected ref, and the same full-history scan
+# is available locally via `make gitleaks`.
+on:
+  pull_request:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: secret-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The PR commit range is resolved with git, so the base commit must be
+          # present locally.
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cache gitleaks binary
+        uses: actions/cache@v4
+        with:
+          path: bin/gitleaks
+          key: ${{ runner.os }}-gitleaks-bin-${{ hashFiles('Makefile', 'go.mod') }}
+
+      - name: Resolve scan range
+        id: range
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "log_opts=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "log_opts=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run gitleaks
+        run: make gitleaks GITLEAKS_LOG_OPTS="${{ steps.range.outputs.log_opts }}"
