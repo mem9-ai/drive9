@@ -40,8 +40,8 @@ GOLANGCI_LINT_GO_VERSION ?= $(shell $(GO) env GOVERSION)
 
 GITLEAKS_VERSION ?= v8.30.1
 GITLEAKS_BIN ?= $(BIN_DIR)/gitleaks
-# Optional `git log` range (for example `<base-sha>..<head-sha>`) so CI can scan
-# only the commits a PR adds. Empty scans every commit reachable from HEAD.
+# Optional `git log` range for the local `gitleaks` target (`main..HEAD`,
+# `--all`, ...). Empty scans the current branch.
 GITLEAKS_LOG_OPTS ?=
 
 IMAGE_REPO ?= drive9-server
@@ -141,13 +141,14 @@ install-lint:
 		echo "golangci-lint already installed at $(GOLANGCI_LINT_BIN)"; \
 	fi
 
-# Scan git history for committed credentials. Local runs cover every commit
-# reachable from HEAD; CI sets GITLEAKS_LOG_OPTS to the PR's commit range so a
-# pull request is judged only on what it adds. Known non-secret fixtures are
-# allowlisted in .gitleaks.toml.
+# Scan git history for committed credentials. The default covers the current
+# branch; pass GITLEAKS_LOG_OPTS for another range or "--all". Known non-secret
+# fixtures are allowlisted in .gitleaks.toml. CI does not run this target: the
+# workflow installs its own pinned scanner and reads the allowlist from the pull
+# request's merge base, so a PR cannot excuse the finding it is adding.
 gitleaks: install-gitleaks
 	$(GITLEAKS_BIN) git . --no-banner --redact -v \
-		$(if $(GITLEAKS_LOG_OPTS),--log-opts="$(GITLEAKS_LOG_OPTS)")
+		--log-opts="$(if $(GITLEAKS_LOG_OPTS),$(GITLEAKS_LOG_OPTS),HEAD)"
 
 install-gitleaks:
 	@echo "Checking for gitleaks..."

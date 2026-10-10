@@ -4,10 +4,12 @@
 # that are demonstrably not credentials: the loopback-only local-dev placeholder
 # keys, a CLI test JWT fixture, and documentation placeholders.
 #
-# Verified against the full git history:
+# Every expression is anchored with ^...$ so it matches a complete detected
+# secret; a longer credential that merely contains a fixture value is never
+# excused. Verified against the full history:
 #
-#   make gitleaks                 # all commits reachable from HEAD
-#   make gitleaks GITLEAKS_LOG_OPTS="--all"   # every ref
+#   make gitleaks                              # current branch
+#   make gitleaks GITLEAKS_LOG_OPTS="--all"    # every ref
 #
 # Do not add real credentials here — rotate and remove them instead.
 
@@ -23,11 +25,12 @@ description = "Non-secret placeholders and test fixtures"
 regexes = [
     # pkg/tenant/local: fixed placeholder keys of the loopback-only local dev
     # provider (DRIVE9_TENANT_PROVIDER=local); overridable by env, not credentials.
-    '''0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef''',
-    '''fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210''',
+    "^0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef$",
+    "^fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210$",
     # cmd/drive9/cli/ctx_test.go: fake JWT used to assert masking/reveal.
-    '''eyJhbGciOiJIUzI1NiJ9\.eyJncmFudF9pZCI6ImdydF8xIn0\.signature''',
+    "^eyJhbGciOiJIUzI1NiJ9\\.eyJncmFudF9pZCI6ImdydF8xIn0\\.signature$",
     # docs/tidbcloud-native-provider-design.md: digest-auth placeholder pairs.
-    '''YOUR_PUBLIC_KEY:YOUR_PRIVATE_KEY''',
-    '''PUBLIC:PRIVATE''',
+    # The scanner's match keeps the surrounding quotes, so they are optional here.
+    "^['\"]?YOUR_PUBLIC_KEY:YOUR_PRIVATE_KEY['\"]?$",
+    "^['\"]?PUBLIC:PRIVATE['\"]?$",
 ]

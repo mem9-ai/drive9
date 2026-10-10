@@ -97,7 +97,7 @@ tests on every PR to `main`.
 ## Secret scanning
 
 ```bash
-make gitleaks                                  # full history
+make gitleaks                                  # the current branch
 make gitleaks GITLEAKS_LOG_OPTS="--all"        # every ref
 make gitleaks GITLEAKS_LOG_OPTS="main..HEAD"   # a commit range
 ```
@@ -105,13 +105,16 @@ make gitleaks GITLEAKS_LOG_OPTS="main..HEAD"   # a commit range
 gitleaks (`v8.30.1`, auto-installed to `bin/gitleaks`) is configured by
 `.gitleaks.toml`. The allowlist there covers only verified non-secrets — the
 loopback-only local-dev placeholder keys, a CLI test JWT fixture, and documentation
-placeholders. Never allowlist a real credential; rotate it and remove it from history
-instead.
+placeholders — and every entry is anchored (`^...$`) so it can only match a complete
+detected secret. Never allowlist a real credential; rotate it and remove it from
+history instead.
 
 CI (`.github/workflows/gitleaks.yml`) scans a pull request's own commits
-(`<base-sha>..<head-sha>`) and fails the check on any finding. Manual
-`workflow_dispatch` runs scan the full history of the selected ref. It runs as its own
-check; add the `gitleaks` context to the branch ruleset if it should block merges.
+(`<base-sha>..<head-sha>`). It pins its own scanner version and reads the allowlist
+from the pull request's merge base, so an allowlist entry only takes effect once it is
+merged — a PR cannot excuse the finding it is adding. Manual `workflow_dispatch` runs
+scan the full history of the selected ref. It runs as its own check; add the `gitleaks`
+context to the branch ruleset if it should block merges.
 
 ---
 

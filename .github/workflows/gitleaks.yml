@@ -1,10 +1,13 @@
 name: Secret Scan
 
-# Scans a pull request's own commits for committed credentials. The scan is
-# incremental on purpose: documented placeholders and test fixtures are
-# allowlisted in .gitleaks.toml, so a PR is judged only on what it adds. Manual
-# runs audit the full history of the selected ref, and the same full-history scan
-# is available locally via `make gitleaks`.
+# Gates a pull request on the commits it adds. The gate is deliberately
+# self-contained: the scanner version is pinned here and the allowlist is read
+# from the pull request's merge base, so a PR cannot excuse the credential it is
+# adding by editing .gitleaks.toml (or the Make target) in the same change.
+# Allowlist additions only take effect once they are merged.
+#
+# `make gitleaks` is the equivalent local command; workflow_dispatch audits the
+# full history of the selected ref.
 on:
   pull_request:
     branches:
@@ -18,6 +21,9 @@ concurrency:
   group: secret-scan-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GITLEAKS_VERSION: v8.30.1
+
 jobs:
   gitleaks:
     runs-on: ubuntu-latest
@@ -26,9 +32,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # The PR commit range is resolved with git, so the base commit must be
-          # present locally.
+          # The PR commit range and its merge-base allowlist are resolved with
+          # git, so the base commit must be present locally.
           fetch-depth: 0
+          # The scan never pushes; do not leave the token in .git/config.
+          persist-credentials: false
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -40,16 +48,42 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bin/gitleaks
-          key: ${{ runner.os }}-gitleaks-bin-${{ hashFiles('Makefile', 'go.mod') }}
+          # The install step below verifies the binary against
+          # GITLEAKS_VERSION, so this key does not need to carry the version.
+          key: ${{ runner.os }}-gitleaks-bin
 
-      - name: Resolve scan range
-        id: range
+      - name: Install gitleaks
+        env:
+          GOBIN: ${{ github.workspace }}/bin
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "log_opts=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          installed="$(go version -m bin/gitleaks 2>/dev/null | awk '$1 == "mod" { print $3 }' || true)"
+          if [ "$installed" != "${GITLEAKS_VERSION}" ]; then
+            go install github.com/zricethezav/gitleaks/v8@${GITLEAKS_VERSION}
+          fi
+          bin/gitleaks version
+
+      - name: Scan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BASE_SHA" ]; then
+            log_opts="$BASE_SHA..$HEAD_SHA"
+            config_ref="$BASE_SHA"
           else
-            echo "log_opts=" >> "$GITHUB_OUTPUT"
+            log_opts="--all"
+            config_ref="HEAD"
           fi
 
-      - name: Run gitleaks
-        run: make gitleaks GITLEAKS_LOG_OPTS="${{ steps.range.outputs.log_opts }}"
+          # Trusted allowlist: the merge base for a PR, the checked-out ref for a
+          # manual run. If that revision predates .gitleaks.toml, fall back to the
+          # built-in rules with no allowlist — stricter, never the PR's own copy.
+          if ! git show "$config_ref:.gitleaks.toml" > "$RUNNER_TEMP/gitleaks.toml" 2>/dev/null; then
+            printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/gitleaks.toml"
+          fi
+
+          bin/gitleaks git . --no-banner --redact \
+            --config "$RUNNER_TEMP/gitleaks.toml" \
+            --log-opts="$log_opts"
