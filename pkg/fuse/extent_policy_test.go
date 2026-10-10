@@ -254,6 +254,87 @@ func TestApplyCachedNativeOwnerModeUsesFileMetadataOnly(t *testing.T) {
 	}
 }
 
+func TestExtentSetAttrResultUpdatesCachedReadDirPlusMetadata(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	parent := "/upper/etc"
+	file := parent + "/drive9.conf"
+	dirIno := fs.inodes.Lookup(parent, true, 0, time.Now())
+	ino := fs.inodes.Lookup(file, false, 7, time.Now())
+	fs.inodes.SetExtentIno(ino, 42)
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|0644)
+	fs.inodes.UpdateOwner(ino, 1001, 1001, true, true)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing extent inode")
+	}
+	fs.dirCache.Put(parent, []CachedFileInfo{cachedInfoFromEntry("drive9.conf", entry)})
+
+	input := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Valid:    gofuse.FATTR_MODE | gofuse.FATTR_UID | gofuse.FATTR_GID,
+		Mode:     0640,
+		Owner:    gofuse.Owner{Uid: 1234, Gid: 2345},
+	}}
+	entry = fs.applyExtentSetAttrResult(input, entry, &jfsmeta.Entry{
+		Inode: 42,
+		Attr: &jfsmeta.Attr{
+			Full:   true,
+			Typ:    jfsmeta.TypeFile,
+			Mode:   0640,
+			Uid:    1234,
+			Gid:    2345,
+			Length: 7,
+			Nlink:  1,
+		},
+	}, 0640)
+	if entry == nil {
+		t.Fatal("missing updated extent inode")
+	}
+
+	items, ok := fs.dirCache.Get(parent)
+	if !ok || len(items) != 1 {
+		t.Fatalf("cached listing = %+v ok=%v, want one item", items, ok)
+	}
+	item := items[0]
+	if item.Mode&posixPermissionModeMask != 0640 || item.Uid != 1234 || item.Gid != 2345 {
+		t.Fatalf("cached listing metadata = mode=%o owner=%d:%d, want 0640 1234:2345", item.Mode, item.Uid, item.Gid)
+	}
+	if item.ExtentIno != 42 {
+		t.Fatalf("cached listing extent inode = %d, want 42", item.ExtentIno)
+	}
+
+	entries := fs.cachedToDirEntries(parent, items)
+	if len(entries) != 1 {
+		t.Fatalf("directory entries = %+v, want one entry", entries)
+	}
+	if entries[0].AttrMode&posixPermissionModeMask != 0640 || entries[0].Uid != 1234 || entries[0].Gid != 2345 {
+		t.Fatalf("directory entry metadata = mode=%o owner=%d:%d, want 0640 1234:2345", entries[0].AttrMode, entries[0].Uid, entries[0].Gid)
+	}
+
+	dh := &DirHandle{
+		Ino:               dirIno,
+		Path:              parent,
+		Entries:           entries,
+		entriesGeneration: fs.mountViewGeneration.Load(),
+	}
+	fh := fs.dirHandles.Allocate(dh)
+	out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Size:     4096,
+	}, out); st != gofuse.OK {
+		t.Fatalf("ReadDirPlus status = %v, want OK", st)
+	}
+	entry, ok = fs.inodes.GetEntry(ino)
+	if !ok || entry.Mode&posixPermissionModeMask != 0640 || entry.Uid != 1234 || entry.Gid != 2345 {
+		t.Fatalf("ReadDirPlus inode metadata = %+v ok=%v, want 0640 1234:2345", entry, ok)
+	}
+}
+
 func TestApplyCachedNativeOwnerModeRejectsMismatchedKinds(t *testing.T) {
 	for _, test := range []struct {
 		name  string

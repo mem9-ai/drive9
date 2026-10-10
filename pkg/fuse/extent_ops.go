@@ -432,6 +432,22 @@ func (fs *Dat9FS) extentSetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn,
 	}
 	if jentry != nil && jentry.Attr != nil {
 		v.UpdateLength(jfsmeta.Ino(inoNum), jentry.Attr)
+	}
+	entry = fs.applyExtentSetAttrResult(input, entry, jentry, mode)
+	fs.fillAttr(entry, &out.Attr)
+	out.SetTimeout(fs.extentAttrTimeoutFor(entry))
+	return gofuse.OK
+}
+
+// applyExtentSetAttrResult installs the acknowledged native inode metadata in
+// both caches that can answer the next path lookup. Updating only the inode
+// cache leaves the parent directory cache able to publish the pre-chmod mode
+// through Lookup/ReaddirPlus on the same mount.
+func (fs *Dat9FS) applyExtentSetAttrResult(input *gofuse.SetAttrIn, entry *InodeEntry, jentry *jfsmeta.Entry, mode uint32) *InodeEntry {
+	if fs == nil || input == nil || entry == nil {
+		return entry
+	}
+	if jentry != nil && jentry.Attr != nil {
 		if e, ok := fs.inodes.GetEntry(input.NodeId); ok {
 			fs.applyJuiceFSAttr(e, jentry.Attr)
 			entry = e
@@ -461,9 +477,8 @@ func (fs *Dat9FS) extentSetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn,
 		// the file does not have.
 		fs.extentKeepOpenWALIndexSize(entry)
 	}
-	fs.fillAttr(entry, &out.Attr)
-	out.SetTimeout(fs.extentAttrTimeoutFor(entry))
-	return gofuse.OK
+	fs.cacheEntryForPath(entry.Path, entry)
+	return entry
 }
 
 func (fs *Dat9FS) extentMirrorDirAttr(input *gofuse.SetAttrIn, entry *InodeEntry) {
