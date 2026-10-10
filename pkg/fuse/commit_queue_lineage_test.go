@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -763,52 +764,75 @@ func TestCommitQueueCancelDuringConflictLineageProofDoesNotMarkConflict(t *testi
 }
 
 func TestOpenHandlePathWideShadowPreloadDropsLineageTrust(t *testing.T) {
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://localhost"), opts)
-	shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shadow.Close()
-	fs.shadowStore = shadow
+	for _, cleanAdvanced := range []bool{false, true} {
+		for _, memoryPayload := range []string{"source handle bytes", ""} {
+			t.Run(fmt.Sprintf("cleanAdvanced=%t/memoryBytes=%d", cleanAdvanced, len(memoryPayload)), func(t *testing.T) {
+				opts := &MountOptions{}
+				opts.setDefaults()
+				fs := NewDat9FS(newTestClient("http://localhost"), opts)
+				shadow, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer shadow.Close()
+				fs.shadowStore = shadow
 
-	const path = "/generation-race.db"
-	activePayload := []byte("another handle's active generation")
-	if err := shadow.WriteFull(path, activePayload, 0); err != nil {
-		t.Fatal(err)
-	}
+				const path = "/generation-race.db"
+				activePayload := []byte("another handle's active generation")
+				if err := shadow.WriteFull(path, activePayload, 0); err != nil {
+					t.Fatal(err)
+				}
 
-	ino := fs.inodes.Lookup(path, false, int64(len(activePayload)), time.Now())
-	source := &FileHandle{
-		Ino:               ino,
-		Path:              path,
-		Dirty:             fs.newWriteBuffer(path, maxPreloadSize, 0),
-		IsNew:             true,
-		ShadowReady:       true,
-		ShadowStageGen:    0,
-		ContentSnapshotID: "source-snapshot",
-		LineageTrusted:    true,
-	}
-	if _, err := source.Dirty.Write(0, []byte("source handle bytes")); err != nil {
-		t.Fatal(err)
-	}
-	source.DirtySeq = fs.markDirtySize(ino, source.Dirty.Size())
-	fs.openHandles.Add(source)
+				ino := fs.inodes.Lookup(path, false, int64(len(activePayload)), time.Now())
+				source := &FileHandle{
+					Ino:               ino,
+					Path:              path,
+					Dirty:             fs.newWriteBuffer(path, maxPreloadSize, 0),
+					IsNew:             true,
+					ShadowReady:       true,
+					ShadowStageGen:    0,
+					ContentSnapshotID: "source-snapshot",
+					LineageTrusted:    true,
+				}
+				if _, err := source.Dirty.Write(0, []byte(memoryPayload)); err != nil {
+					t.Fatal(err)
+				}
+				source.DirtySeq = fs.markDirtySize(ino, source.Dirty.Size())
+				if cleanAdvanced {
+					source.Dirty.ClearDirty()
+					source.DirtySeq = 0
+					fs.recordCommittedRevisionWithSize(path, 2, int64(len(activePayload)))
+				}
+				fs.openHandles.Add(source)
 
-	target := &FileHandle{
-		Ino:   ino,
-		Path:  path,
-		Dirty: fs.newWriteBuffer(path, maxPreloadSize, 0),
-	}
-	if !fs.loadWritableHandleFromOpenHandleLocked(target) {
-		t.Fatal("loadWritableHandleFromOpenHandleLocked returned false")
-	}
-	if got := target.Dirty.Bytes(); !bytes.Equal(got, activePayload) {
-		t.Fatalf("preloaded bytes = %q, want path-wide active shadow %q", got, activePayload)
-	}
-	if target.LineageTrusted {
-		t.Fatal("path-wide shadow preload retained another handle's lineage trust")
+				target := &FileHandle{
+					Ino:   ino,
+					Path:  path,
+					Dirty: fs.newWriteBuffer(path, maxPreloadSize, 0),
+				}
+				if !fs.loadWritableHandleFromOpenHandleLocked(target) {
+					t.Fatal("loadWritableHandleFromOpenHandleLocked returned false")
+				}
+				if got := target.Dirty.Bytes(); !bytes.Equal(got, activePayload) {
+					t.Fatalf("preloaded bytes = %q, want path-wide active shadow %q", got, activePayload)
+				}
+				if target.LineageTrusted {
+					t.Fatal("path-wide shadow preload retained another handle's lineage trust")
+				}
+				if target.ContentSnapshotID != "" || len(target.contentAncestors) != 0 || source.ContentSnapshotID != "source-snapshot" || source.StagedSnapshotID != "" || source.BaseRev != 0 || !source.ShadowReady {
+					t.Fatal("unknown path-wide shadow was attributed to the source snapshot")
+				}
+				target.Lock()
+				loaded, preloadErr := fs.loadWritableHandleFromOpenHandles(target, true, 0)
+				target.Unlock()
+				if loaded || !errors.Is(preloadErr, syscall.EAGAIN) || source.ContentSnapshotID != "source-snapshot" || source.StagedSnapshotID != "" || source.BaseRev != 0 || !source.ShadowReady {
+					t.Fatal("append accepted or tagged an unknown shadow generation")
+				}
+				if got := target.Dirty.Bytes(); !bytes.Equal(got, activePayload) || target.LineageTrusted {
+					t.Fatal("rejected append changed the untrusted path-wide image")
+				}
+			})
+		}
 	}
 }
 

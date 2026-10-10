@@ -148,7 +148,7 @@ type CommitQueue struct {
 	queue        []*CommitEntry
 	queuedByPath map[string]map[*CommitEntry]struct{}
 	inFlight     map[string]*CommitEntry   // paths currently being processed by workers
-	immediate    map[*CommitEntry]struct{} // synchronous gVisor commits participating in inode ordering
+	immediate    map[*CommitEntry]struct{} // synchronous live commits participating in inode ordering
 	delayed      map[*CommitEntry]*time.Timer
 	// landed is an intentionally process-local map of exact snapshots this
 	// queue has committed. Shadow bytes and JSON metadata are not atomically
@@ -189,8 +189,8 @@ type CommitQueue struct {
 	// recovery entries remain unfiltered by the Dat9FS implementation.
 	IsSuperseded CommitSupersededFunc
 
-	// serializeMutationInodes extends queue dispatch ordering across hardlink
-	// aliases for live-handle mutations. It is enabled only for gVisor mounts.
+	// serializeMutationInodes enables gVisor's newer-mutation supersession.
+	// Live content commits always order by inode, including hardlink aliases.
 	serializeMutationInodes bool
 
 	// PathLock serializes upload and cleanup against Dat9FS same-path shadow
@@ -1273,7 +1273,7 @@ func (cq *CommitQueue) isEntryCanceled(entry *CommitEntry) bool {
 }
 
 func (cq *CommitQueue) isCanceledImmediateEntry(entry *CommitEntry) bool {
-	if cq == nil || entry == nil || !cq.serializeMutationInodes {
+	if cq == nil || entry == nil {
 		return false
 	}
 	cq.mu.Lock()
@@ -1388,7 +1388,7 @@ func (cq *CommitQueue) canBeginInFlightLocked(entry *CommitEntry) bool {
 	if oldest := cq.oldestQueuedForPathLocked(entry.Path); oldest != nil && oldest != entry {
 		return false
 	}
-	if !cq.serializeMutationInodes || entry.Inode == 0 || entry.MutationSeq == 0 {
+	if entry.Inode == 0 || entry.MutationSeq == 0 {
 		return true
 	}
 	for _, active := range cq.inFlight {
@@ -2170,7 +2170,7 @@ func (cq *CommitQueue) commitNowClaimedPathLocked(ctx context.Context, entry *Co
 }
 
 func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *CommitEntry, pathLocked bool) (func(), bool, error) {
-	if cq == nil || entry == nil || !cq.serializeMutationInodes || entry.Inode == 0 || entry.MutationSeq == 0 {
+	if cq == nil || entry == nil || entry.Inode == 0 || entry.MutationSeq == 0 {
 		return nil, false, nil
 	}
 	for {
@@ -2184,7 +2184,7 @@ func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *
 			}
 			if active.MutationSeq > entry.MutationSeq {
 				newer = true
-			} else if active.MutationSeq < entry.MutationSeq {
+			} else if active.MutationSeq <= entry.MutationSeq {
 				older = true
 			}
 		}
@@ -2194,7 +2194,7 @@ func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *
 			}
 			if active.MutationSeq > entry.MutationSeq {
 				newer = true
-			} else if active.MutationSeq < entry.MutationSeq {
+			} else if active.MutationSeq <= entry.MutationSeq {
 				older = true
 			}
 		}
@@ -2207,15 +2207,15 @@ func (cq *CommitQueue) beginImmediateMutationCommit(ctx context.Context, entry *
 			}
 			if queued.MutationSeq > entry.MutationSeq {
 				newer = true
-			} else if queued.MutationSeq < entry.MutationSeq {
+			} else if queued.MutationSeq <= entry.MutationSeq {
 				older = true
 			}
 		}
-		if newer {
+		if newer && cq.serializeMutationInodes {
 			cq.mu.Unlock()
 			return nil, true, nil
 		}
-		if !older && (pathLocked || cq.inFlight[entry.Path] == nil) {
+		if !older && !newer && (pathLocked || cq.inFlight[entry.Path] == nil) {
 			if cq.immediate == nil {
 				cq.immediate = make(map[*CommitEntry]struct{})
 			}

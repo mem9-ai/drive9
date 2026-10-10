@@ -453,6 +453,12 @@ func TestIssue986AliasDelayedStatAfterCommit(t *testing.T) {
 	if _, st := pr939Append(fs, ino, wid, " gopher"); st != gofuse.OK {
 		t.Fatal(st)
 	}
+	// Keep this reader busy across commit publication and the delayed Stat.
+	// Commit-side TryLock refresh legitimately skips it; the next Read must
+	// recover using the published fence even after inode metadata regresses.
+	r.Lock()
+	unlockReader := sync.OnceFunc(r.Unlock)
+	t.Cleanup(unlockReader)
 	if st := fs.Fsync(nil, &gofuse.FsyncIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: wid}); st != gofuse.OK {
 		t.Fatal(st)
 	}
@@ -464,5 +470,6 @@ func TestIssue986AliasDelayedStatAfterCommit(t *testing.T) {
 	if fs.inodes.GetRevision(ino) != 1 || r.BaseRev != 1 {
 		t.Fatal("late stat precondition")
 	}
+	unlockReader()
 	assertAliasAppendRead(t, fs, ino, rid, "hello gopher")
 }

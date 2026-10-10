@@ -7,6 +7,8 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status gofuse.Status) {
@@ -135,9 +137,12 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			// ShadowSpill: stage shadow + journal, no writeBack snapshot.
 			phase = "interactive-shadowspill-stage"
 			stageStart := time.Now()
-			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			err := fs.stageShadowForQueuedCommitLocked(ctx, fh, true)
 			if errors.Is(err, syscall.EAGAIN) {
 				return gofuse.EAGAIN
+			}
+			if errors.Is(err, errAppendSnapshotAdoption) {
+				return httpToFuseStatus(err)
 			}
 			fs.debugDurationf(stageStart, 0, "fsync shadowspill stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
@@ -175,9 +180,12 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		} else {
 			phase = "interactive-stage"
 			stageStart := time.Now()
-			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			err := fs.stageShadowForQueuedCommitLocked(ctx, fh, true)
 			if errors.Is(err, syscall.EAGAIN) {
 				return gofuse.EAGAIN
+			}
+			if errors.Is(err, errAppendSnapshotAdoption) {
+				return httpToFuseStatus(err)
 			}
 			fs.debugDurationf(stageStart, 0, "fsync stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
@@ -220,6 +228,27 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 	}
 
+	if err := fs.waitLinkedLegacyAppendUploadsLocked(ctx, fh); err != nil {
+		return httpToFuseStatus(err)
+	}
+	if fh.Unlinked {
+		fs.cancelUnlinkedRemotePublishLocked(fh)
+		return gofuse.OK
+	}
+	if fs.discardSupersededMutationLocked(fh) {
+		return gofuse.OK
+	}
+	if fs.commitQueue == nil && (fh.appendSnapshot || fh.Flags&uint32(syscall.O_APPEND) != 0) {
+		if err := fs.refreshUnidentifiedAppendAliasesLocked(ctx, fh); err != nil {
+			return httpToFuseStatus(err)
+		}
+		if err := fs.adoptLandedAppendSnapshotLocked(ctx, fh); err != nil {
+			return httpToFuseStatus(err)
+		}
+	}
+	if err := fs.finishLandedAppendPendingModeLocked(ctx, fh); err != nil {
+		return httpToFuseStatus(err)
+	}
 	if handled, st := fs.commitAppendSnapshotLocked(ctx, fh); handled {
 		return st
 	}
@@ -406,9 +435,23 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		mutationSeq := fh.DirtySeq
 		uploadStart := time.Now()
 		fs.debugf("fsync writeback upload start path=%s", fh.Path)
-		committedRev, err := fs.uploader.UploadSyncWithRevision(ctx, fh.Path)
+		committedRev, uploadedProof, err := fs.uploader.uploadSyncWithAppendSnapshot(ctx, fh.Path)
+		if uploadedProof.rev > 0 && fs.recordCommittedAppendSnapshot(fh.Path, uploadedProof) {
+			fs.publishLinkedAppendCommit(fh.Path, fh.Ino, uploadedProof.rev, uploadedProof.size)
+		}
 		fs.debugDurationf(uploadStart, 0, "fsync writeback upload done path=%s err=%v", fh.Path, err)
 		if err != nil {
+			if errors.Is(err, client.ErrConflict) && fs.commitQueue == nil && uploadedProof.snapshotID != "" &&
+				fs.latestCommittedRevision(fh.Path) > expectedRevision {
+				if adoptErr := fs.adoptLandedAppendSnapshotLocked(ctx, fh); adoptErr == nil && fh.BaseRev > expectedRevision {
+					// A cache-backed loser has the same verified relationship as
+					// a generic PUT loser. Finish through the existing bounded path.
+					return fs.flushHandle(ctx, fh)
+				}
+			}
+			if uploadedProof.rev > 0 {
+				fs.claimLandedAppendPendingModeLocked(fh, uploadedProof.snapshotID)
+			}
 			safeLogPrintf("fsync writeback upload failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
@@ -444,6 +487,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		}
 		fs.inodes.UpdateSize(fh.Ino, size)
+		if uploadedProof.rev > 0 && fs.recordCommittedAppendSnapshot(fh.Path, uploadedProof) {
+			fs.publishLinkedAppendCommit(fh.Path, fh.Ino, uploadedProof.rev, uploadedProof.size)
+		}
 		fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
 	} else if fs.writeBack != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq != fh.DirtySeq {
 		// Snapshot is stale — discard it so we don't upload old data.

@@ -154,9 +154,12 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					phase = "small-stage-shadow"
 					stageStart := time.Now()
 					fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
-					err := fs.stageShadowForQueuedCommitLocked(fh, fs.stageDurableAtClose())
+					err := fs.stageShadowForQueuedCommitLocked(ctx, fh, fs.stageDurableAtClose())
 					if errors.Is(err, syscall.EAGAIN) {
 						return gofuse.EAGAIN
+					}
+					if errors.Is(err, errAppendSnapshotAdoption) {
+						return httpToFuseStatus(err)
 					}
 					stageDur := time.Since(stageStart)
 					fs.debugDurationf(stageStart, 0, "flush stage shadow done path=%s size=%d err=%v", fh.Path, size, err)
@@ -238,9 +241,12 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			size := fh.Dirty.Size()
 			stageStart := time.Now()
 			fs.debugf("flush shadowspill stage start path=%s size=%d durable=true", fh.Path, size)
-			err := fs.stageShadowForQueuedCommitLocked(fh, fs.stageDurableAtClose())
+			err := fs.stageShadowForQueuedCommitLocked(ctx, fh, fs.stageDurableAtClose())
 			if errors.Is(err, syscall.EAGAIN) {
 				return gofuse.EAGAIN
+			}
+			if errors.Is(err, errAppendSnapshotAdoption) {
+				return httpToFuseStatus(err)
 			}
 			largeStageDur := time.Since(stageStart)
 			fs.debugDurationf(stageStart, 0, "flush shadowspill stage done path=%s size=%d err=%v", fh.Path, size, err)
@@ -407,9 +413,12 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				size := fh.Dirty.Size()
 				stageStart := time.Now()
 				fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
-				err := fs.stageShadowForQueuedCommitLocked(fh, fs.stageDurableAtClose())
+				err := fs.stageShadowForQueuedCommitLocked(ctx, fh, fs.stageDurableAtClose())
 				if errors.Is(err, syscall.EAGAIN) {
 					return gofuse.EAGAIN
+				}
+				if errors.Is(err, errAppendSnapshotAdoption) {
+					return httpToFuseStatus(err)
 				}
 				fs.debugDurationf(stageStart, 0, "flush stage shadow done path=%s size=%d err=%v", fh.Path, size, err)
 				if err != nil {
