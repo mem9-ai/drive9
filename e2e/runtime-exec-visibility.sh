@@ -47,6 +47,14 @@ fail() {
   exit 1
 }
 
+run_privileged() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+    return
+  fi
+  sudo -n "$@"
+}
+
 mount_raw_workspace() {
   mkdir -p "$RAW_MOUNT" "$RAW_STATE"
   chmod 0700 "$RAW_STATE"
@@ -275,13 +283,16 @@ printf 'runtime raw-upper root file metadata: %s\n' "$raw_root_file_metadata" >&
   || fail "raw-upper root file native owner is not 65532:65532"
 [ "$(printf '%s' "$raw_root_file_metadata" | jq -r '.stat_mode')" = 644 ] \
   || fail "raw-upper root file native mode is not 644"
-[ "$(cat "$RAW_ROOT_FILE_PATH")" = root-state ] \
+[ "$(run_privileged cat "$RAW_ROOT_FILE_PATH")" = root-state ] \
   || fail "raw-upper root file bytes are not durable"
 [ -f "$RAW_MOUNT/upper/etc/.wh.drive9-lower-delete" ] \
   || fail "lower-file deletion is not a regular .wh file"
 [ -f "$RAW_MOUNT/upper/etc/.wh.drive9-lower-rename" ] \
   || fail "lower-file rename source is not a regular .wh file"
-python3 - "$RAW_MOUNT/upper" "$RAW_ETC_PATH" "$RAW_ROOT_FILE_PATH" <<'PY' \
+# The persisted /root mode is intentionally 0700/root:root. Inspect bytes and
+# xattrs as root so this diagnostic proves durability without weakening the
+# permission contract it just verified.
+run_privileged python3 - "$RAW_MOUNT/upper" "$RAW_ETC_PATH" "$RAW_ROOT_FILE_PATH" <<'PY' \
   || fail "raw upper unexpectedly depends on overlay private xattrs"
 import os
 import sys
