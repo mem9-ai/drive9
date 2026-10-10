@@ -77,12 +77,16 @@ type ExtentSlice struct {
 	Len  uint32 `json:"Len"`
 }
 
+// ExtentProjection is the file_nodes projection of an extent file or a
+// directory mirrored into the extent namespace.
 type ExtentProjection struct {
 	Path          string
 	ContentLayout ContentLayout
 	ExtentIno     uint64
 }
 
+// GetExtentProjection reads the layout/inode projection of a canonical path.
+// ErrNotFound is returned when the path has no file_nodes row.
 func (s *Store) GetExtentProjection(ctx context.Context, path string) (*ExtentProjection, error) {
 	var layout sql.NullString
 	var ino sql.NullInt64
@@ -181,16 +185,15 @@ func jfsTypeToStatMode(typ uint8, perm uint32, permStored bool) uint32 {
 	return kind | (perm & 0o7777)
 }
 
-// overlayExtentStatDir is overlayExtentStat for a directory listing. The
-// per-node query would cost one round trip per entry, and a listing is exactly
-// where the missing size does the most damage: readdirplus hands the kernel
-// size 0 for every extent file, the kernel caches i_size = 0, and every later
-// read of those files returns nothing until the attributes expire.
+// overlayExtentStatDir binds every mirrored listing entry to its exact
+// jfs_node. Extent files additionally take native size and mode. Mirrored
+// directories keep their namespace facts; the client uses their inode identity
+// to refresh only owner/mode before returning ReaddirPlus EntryOut.
 //
-// The overlay also records the JuiceFS inode on the entry. It comes from the
-// same row as the length, and it is the only layout signal a listing carries:
-// without it a FUSE readdirplus cannot tell an extent child from a single-layout
-// one, and every first open has to spend a HEAD probe to find out.
+// The grouped query avoids one round trip per entry. For files the inode is
+// also the only layout signal a listing carries: without it a FUSE readdirplus
+// cannot tell an extent child from a single-layout one, and every first open
+// has to spend a HEAD probe to find out.
 func (s *Store) overlayExtentStatDir(ctx context.Context, db execer, parentPath string, entries []*NodeWithFile) error {
 	if parentPath == "" || len(entries) == 0 {
 		return nil
@@ -230,17 +233,22 @@ func (s *Store) overlayExtentStatDir(ctx context.Context, db execer, parentPath 
 		return err
 	}
 	for _, nf := range entries {
-		// Directories keep the projection's values: overlayExtentStat skips them
-		// on the single-node path, and readdirplus must not disagree with it.
-		if nf == nil || nf.File == nil || nf.Node.IsDirectory {
+		if nf == nil {
 			continue
 		}
 		stat, ok := stats[nf.Node.Path]
 		if !ok {
 			continue
 		}
-		nf.ContentLayout = ContentLayoutExtent
+		// Every mirrored entry publishes its exact native identity. Directories
+		// deliberately keep their namespace size/link/time and projection mode:
+		// the mount uses this inode only to refresh native owner/mode from the
+		// same jfs_node before emitting ReaddirPlus EntryOut.
 		nf.ExtentIno = stat.ino
+		if nf.Node.IsDirectory || nf.File == nil {
+			continue
+		}
+		nf.ContentLayout = ContentLayoutExtent
 		nf.File.SizeBytes = stat.length
 		nf.Mode = stat.mode
 		nf.HasMode = true

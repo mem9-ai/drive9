@@ -84,7 +84,7 @@ unmount_raw_workspace() {
 }
 
 raw_metadata_for() {
-  python3 - "$1" "$2" "$3" <<'PY'
+  run_privileged python3 - "$1" "$2" "$3" <<'PY'
 import json
 import os
 import stat

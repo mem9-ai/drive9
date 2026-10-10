@@ -11732,11 +11732,12 @@ func dirEntryFromCachedInfo(item CachedFileInfo, ino uint64) DirEntry {
 	}
 }
 
-// applyCachedDirectoryMetadata updates the readdir result with the native
-// owner and mode loaded from its exact mirrored jfs_node. Size, links, and
-// times remain the ordinary Drive9 directory namespace's facts.
-func applyCachedDirectoryMetadata(item *CachedFileInfo, entry *InodeEntry) {
-	if item == nil || entry == nil || !item.IsDir || !entry.IsDir {
+// applyCachedNativeOwnerMode updates the readdir result with the native owner
+// and mode loaded from its exact jfs_node. Other listing facts stay unchanged:
+// directories keep their namespace size/link/time, while the existing extent
+// size carry-over below retains the file path's established ordering.
+func applyCachedNativeOwnerMode(item *CachedFileInfo, entry *InodeEntry) {
+	if item == nil || entry == nil || item.IsDir != entry.IsDir {
 		return
 	}
 	if entry.HasMode {
@@ -11751,6 +11752,27 @@ func applyCachedDirectoryMetadata(item *CachedFileInfo, entry *InodeEntry) {
 		item.Gid = entry.Gid
 		item.HasGID = true
 	}
+}
+
+// cachedNativeOwnerModeDiffers reports whether a same-object listing and the
+// mount's inode cache disagree on native metadata. The disagreement is only a
+// trigger for an authoritative jfs_node refresh; neither side wins by itself.
+func cachedNativeOwnerModeDiffers(item CachedFileInfo, entry *InodeEntry) bool {
+	if entry == nil || item.IsDir != entry.IsDir {
+		return false
+	}
+	return (entry.HasMode && (!item.HasMode ||
+		entry.Mode&posixPermissionModeMask != item.Mode&posixPermissionModeMask)) ||
+		(entry.HasUID && (!item.HasUID || entry.Uid != item.Uid)) ||
+		(entry.HasGID && (!item.HasGID || entry.Gid != item.Gid))
+}
+
+func shouldRefreshCachedNativeMetadata(item CachedFileInfo, entry *InodeEntry, sameResource bool) bool {
+	if item.ExtentIno == 0 || entry == nil || item.IsDir != entry.IsDir {
+		return false
+	}
+	sameExtent := entry.ExtentIno != 0 && entry.ExtentIno == item.ExtentIno
+	return (sameResource || sameExtent) && cachedNativeOwnerModeDiffers(item, entry)
 }
 
 func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
@@ -12213,6 +12235,7 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 			mtime = time.Now()
 		}
 		prevSize := int64(0)
+		refreshNativeMetadata := item.IsDir && item.ExtentIno != 0
 		if existing, ok := fs.inodes.GetInode(childP); ok {
 			if e, ok := fs.inodes.GetEntry(existing); ok {
 				// Two carry-overs with different evidence requirements.
@@ -12248,6 +12271,9 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 				if item.ExtentIno == 0 && provesSame {
 					item.ExtentIno = e.ExtentIno
 				}
+				if shouldRefreshCachedNativeMetadata(item, e, provesSame) {
+					refreshNativeMetadata = true
+				}
 				if !provesSame && e.ExtentIno != 0 {
 					fs.inodes.ClearExtentIno(existing)
 				}
@@ -12267,12 +12293,13 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 			fs.inodes.SetExtentIno(ino, item.ExtentIno)
 		}
 		// ReaddirPlus can satisfy the kernel's following stat directly from its
-		// EntryOut, without a later Lookup/GetAttr. Refresh a mirrored directory
-		// before building that reply or a fresh mount would expose the projection
-		// user's owner even though jfs_node already holds the durable native one.
-		if item.IsDir && item.ExtentIno != 0 && fs.extentRefreshFromVFS(ino, childP, 0) {
+		// EntryOut, without a later Lookup/GetAttr. A mirrored directory always
+		// needs native mode/owner. An extent file needs the same refresh only
+		// when a same-object listing disagrees with the live inode cache, which
+		// avoids an extra meta lookup per unchanged directory entry.
+		if refreshNativeMetadata && fs.extentRefreshFromVFS(ino, childP, 0) {
 			if refreshed, ok := fs.inodes.GetEntry(ino); ok {
-				applyCachedDirectoryMetadata(&item, refreshed)
+				applyCachedNativeOwnerMode(&item, refreshed)
 			}
 		}
 		if !item.IsDir && prevSize > item.Size {

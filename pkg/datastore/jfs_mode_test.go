@@ -87,3 +87,37 @@ func TestExtentChmodZeroStatAndListDirAgree(t *testing.T) {
 		t.Fatalf("stored chmod 000 mode = %o, want 100000", got)
 	}
 }
+
+func TestListDirPublishesMirroredDirectoryExtentInode(t *testing.T) {
+	s := newTestStore(t)
+	rt := newExtentRuntime(t, s, 0)
+	t.Cleanup(func() { _ = extent.CloseRuntime(rt) })
+
+	ctx := jfsmeta.NewContext(1, 0, []uint32{0}).WithValue(jfsmeta.Drive9PathKey, "/root/")
+	var ino jfsmeta.Ino
+	var attr jfsmeta.Attr
+	if st := rt.Meta.Mkdir(ctx, jfsmeta.RootInode, "root", 0700, 0, 0, &ino, &attr); st != 0 {
+		t.Fatalf("mkdir: %v", st)
+	}
+
+	entries, err := s.ListDir(context.Background(), "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, nf := range entries {
+		if nf.Node.Path != "/root/" {
+			continue
+		}
+		if !nf.Node.IsDirectory || nf.File != nil {
+			t.Fatalf("mirrored directory projection = %+v", nf)
+		}
+		if nf.ExtentIno != uint64(ino) {
+			t.Fatalf("mirrored directory extent inode = %d, want %d", nf.ExtentIno, ino)
+		}
+		if nf.ContentLayout != "" {
+			t.Fatalf("mirrored directory content layout = %q, want empty", nf.ContentLayout)
+		}
+		return
+	}
+	t.Fatal("ListDir did not return mirrored /root directory")
+}

@@ -3444,6 +3444,15 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	if nlink > 0 {
 		w.Header().Set("X-Dat9-Nlink", strconv.FormatUint(uint64(nlink), 10))
 	}
+	if nf.Node.IsDirectory {
+		// Directory requests may omit the trailing slash while the projection
+		// row always stores the canonical directory path. Publish the exact
+		// mirrored inode from that row so a fresh mount can restore native
+		// owner/mode without guessing by name.
+		if proj, perr := b.Store().GetExtentProjection(r.Context(), nf.Node.Path); perr == nil && proj != nil && proj.ExtentIno != 0 {
+			w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(proj.ExtentIno, 10))
+		}
+	}
 	// The layout rides along on the stat row itself (file_nodes.content_layout
 	// + extent_ino are selected by the stat query), so a normal mount pays no
 	// extra query to learn that an ordinary file is not an extent file.

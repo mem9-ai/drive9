@@ -214,7 +214,7 @@ func TestApplyJuiceFSDirectoryMetadataRejectsNonDirectoryAttr(t *testing.T) {
 	}
 }
 
-func TestApplyCachedDirectoryMetadataUsesNativeOwnerModeOnly(t *testing.T) {
+func TestApplyCachedNativeOwnerModeUsesDirectoryMetadataOnly(t *testing.T) {
 	mtime := time.Unix(123, 456)
 	item := CachedFileInfo{
 		Name: "root", Size: 7, IsDir: true, Mtime: mtime,
@@ -225,7 +225,7 @@ func TestApplyCachedDirectoryMetadataUsesNativeOwnerModeOnly(t *testing.T) {
 		IsDir: true, Size: 4096, Mtime: time.Unix(999, 0),
 		Mode: 0700, HasMode: true, Uid: 0, Gid: 0, HasUID: true, HasGID: true,
 	}
-	applyCachedDirectoryMetadata(&item, entry)
+	applyCachedNativeOwnerMode(&item, entry)
 	if item.Mode != 0700 || !item.HasMode || item.Uid != 0 || item.Gid != 0 || !item.HasUID || !item.HasGID {
 		t.Fatalf("cached native metadata = mode=%o owner=%d:%d flags=%v/%v/%v", item.Mode, item.Uid, item.Gid, item.HasMode, item.HasUID, item.HasGID)
 	}
@@ -234,7 +234,27 @@ func TestApplyCachedDirectoryMetadataUsesNativeOwnerModeOnly(t *testing.T) {
 	}
 }
 
-func TestApplyCachedDirectoryMetadataRejectsMismatchedKinds(t *testing.T) {
+func TestApplyCachedNativeOwnerModeUsesFileMetadataOnly(t *testing.T) {
+	mtime := time.Unix(123, 456)
+	item := CachedFileInfo{
+		Name: "drive9.conf", Size: 7, Mtime: mtime,
+		Mode: 0644, HasMode: true, Uid: 1001, Gid: 1001, HasUID: true, HasGID: true,
+		ExtentIno: 42,
+	}
+	entry := &InodeEntry{
+		Size: 99, Mtime: time.Unix(999, 0),
+		Mode: 0640, HasMode: true, Uid: 1234, Gid: 2345, HasUID: true, HasGID: true,
+	}
+	applyCachedNativeOwnerMode(&item, entry)
+	if item.Mode != 0640 || !item.HasMode || item.Uid != 1234 || item.Gid != 2345 || !item.HasUID || !item.HasGID {
+		t.Fatalf("cached native metadata = mode=%o owner=%d:%d flags=%v/%v/%v", item.Mode, item.Uid, item.Gid, item.HasMode, item.HasUID, item.HasGID)
+	}
+	if item.Size != 7 || !item.Mtime.Equal(mtime) || item.ExtentIno != 42 {
+		t.Fatalf("file listing metadata changed: size=%d mtime=%s extent_ino=%d", item.Size, item.Mtime, item.ExtentIno)
+	}
+}
+
+func TestApplyCachedNativeOwnerModeRejectsMismatchedKinds(t *testing.T) {
 	for _, test := range []struct {
 		name  string
 		item  CachedFileInfo
@@ -245,11 +265,49 @@ func TestApplyCachedDirectoryMetadataRejectsMismatchedKinds(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			before := test.item
-			applyCachedDirectoryMetadata(&test.item, &test.entry)
+			applyCachedNativeOwnerMode(&test.item, &test.entry)
 			if test.item != before {
 				t.Fatalf("mismatched kinds changed cached metadata: got %+v want %+v", test.item, before)
 			}
 		})
+	}
+}
+
+func TestCachedNativeOwnerModeDiffersOnlyForMatchingKinds(t *testing.T) {
+	tests := []struct {
+		name  string
+		item  CachedFileInfo
+		entry *InodeEntry
+		want  bool
+	}{
+		{name: "nil entry", item: CachedFileInfo{Mode: 0644}},
+		{name: "kind mismatch", item: CachedFileInfo{IsDir: true, Mode: 0755, HasMode: true}, entry: &InodeEntry{Mode: 0644, HasMode: true}},
+		{name: "same metadata", item: CachedFileInfo{Mode: 0640, HasMode: true, Uid: 1, Gid: 2, HasUID: true, HasGID: true}, entry: &InodeEntry{Mode: syscall.S_IFREG | 0640, HasMode: true, Uid: 1, Gid: 2, HasUID: true, HasGID: true}},
+		{name: "mode differs", item: CachedFileInfo{Mode: 0644, HasMode: true}, entry: &InodeEntry{Mode: syscall.S_IFREG | 0640, HasMode: true}, want: true},
+		{name: "owner differs", item: CachedFileInfo{Uid: 1001, Gid: 1001, HasUID: true, HasGID: true}, entry: &InodeEntry{Uid: 1234, Gid: 2345, HasUID: true, HasGID: true}, want: true},
+		{name: "listing omits native mode", item: CachedFileInfo{}, entry: &InodeEntry{Mode: syscall.S_IFREG | 0600, HasMode: true}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := cachedNativeOwnerModeDiffers(test.item, test.entry); got != test.want {
+				t.Fatalf("cachedNativeOwnerModeDiffers = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestShouldRefreshCachedNativeMetadataAcceptsExactExtentIdentity(t *testing.T) {
+	item := CachedFileInfo{Mode: 0644, HasMode: true, ExtentIno: 42}
+	entry := &InodeEntry{Mode: syscall.S_IFREG | 0640, HasMode: true, ExtentIno: 42}
+	if !shouldRefreshCachedNativeMetadata(item, entry, false) {
+		t.Fatal("matching extent inode with changed native mode must refresh without a resource id")
+	}
+	entry.ExtentIno = 43
+	if shouldRefreshCachedNativeMetadata(item, entry, false) {
+		t.Fatal("different extent identity must not refresh without matching resource evidence")
+	}
+	if !shouldRefreshCachedNativeMetadata(item, entry, true) {
+		t.Fatal("matching resource evidence with changed native mode must refresh")
 	}
 }
 
