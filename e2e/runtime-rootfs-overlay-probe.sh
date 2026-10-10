@@ -456,6 +456,8 @@ sudo chroot "$MERGED" /bin/sh -c 'test -x /bin/sh && printf lower-image-ok' \
 [ "$(sudo readlink "$MERGED/root/config-link")" = ../etc/drive9.conf ] || fail "symlink did not persist"
 [ "$(stat -c '%i' "$MERGED/workspace/persist.txt")" = "$(stat -c '%i' "$MERGED/workspace/renamed-hardlink.txt")" ] \
   || fail "hardlink identity did not persist"
+[ "$(stat -c '%h' "$MERGED/workspace/persist.txt")" = 2 ] \
+  || fail "hardlink count did not persist"
 [ "$(stat -c '%y' "$MERGED/etc/drive9.conf" | cut -d. -f1)" = '2020-01-02 03:04:05' ] \
   || fail "mtime did not persist"
 [ "$(stat -c '%s' "$MERGED/workspace/large.bin")" = 4194304 ] || fail "large file did not persist"
