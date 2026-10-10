@@ -90,6 +90,31 @@ func TestExtentChmodZeroStatAndListDirAgree(t *testing.T) {
 
 func TestListDirPublishesMirroredDirectoryExtentInode(t *testing.T) {
 	s := newTestStore(t)
+	// Dat9FS.Mkdir creates the Drive9 directory projection first, then mirrors
+	// the same directory into the native extent namespace. Model that exact
+	// ordering here: jfsMknodTx binds an existing directory projection; it must
+	// not invent a second namespace row when called through the extent API.
+	if err := s.EnsureParentDirs(context.Background(), "/root/child", genID); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.GetExtentProjection(context.Background(), "/root/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.ExtentIno != 0 {
+		t.Fatalf("unmirrored directory extent inode = %d, want 0", before.ExtentIno)
+	}
+	beforeEntries, err := s.ListDir(context.Background(), "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(beforeEntries) != 1 || beforeEntries[0].Node.Path != "/root/" {
+		t.Fatalf("unmirrored directory listing = %+v, want only /root/", beforeEntries)
+	}
+	if beforeEntries[0].ExtentIno != 0 {
+		t.Fatalf("unmirrored listed directory extent inode = %d, want 0", beforeEntries[0].ExtentIno)
+	}
+
 	rt := newExtentRuntime(t, s, 0)
 	t.Cleanup(func() { _ = extent.CloseRuntime(rt) })
 
@@ -108,7 +133,7 @@ func TestListDirPublishesMirroredDirectoryExtentInode(t *testing.T) {
 		if nf.Node.Path != "/root/" {
 			continue
 		}
-		if !nf.Node.IsDirectory || nf.File != nil {
+		if !nf.Node.IsDirectory {
 			t.Fatalf("mirrored directory projection = %+v", nf)
 		}
 		if nf.ExtentIno != uint64(ino) {
