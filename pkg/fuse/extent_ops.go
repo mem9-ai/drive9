@@ -21,7 +21,18 @@ func (fs *Dat9FS) extentStatIno(ctx context.Context, p string) (uint64, bool) {
 	if err != nil || stat == nil {
 		return 0, false
 	}
-	if stat.ContentLayout == client.ContentLayoutExtent && stat.ExtentIno != 0 {
+	return projectedExtentIno(stat)
+}
+
+func projectedExtentIno(stat *client.StatResult) (uint64, bool) {
+	if stat == nil || stat.ExtentIno == 0 {
+		return 0, false
+	}
+	// Files must explicitly report the extent content layout. Directories have
+	// no content layout, but a non-zero extent inode is still authoritative:
+	// Mkdir and extentEnsureParent mirror the directory into jfs_node so native
+	// mode/owner can survive a fresh mount.
+	if stat.IsDir || stat.ContentLayout == client.ContentLayoutExtent {
 		return stat.ExtentIno, true
 	}
 	return 0, false
@@ -249,18 +260,52 @@ func (fs *Dat9FS) applyJuiceFSAttr(entry *InodeEntry, attr *jfsmeta.Attr) {
 	}
 }
 
-// extentRefreshFromVFS copies JuiceFS GetAttr (length, uid/gid, mode, nlink)
-// onto the Dat9FS inode. file_nodes size is often 0 after a remount.
-// Directories stay on the Dat9FS mkdir path: juicefs parents are created
-// lazily as 0755 and must not overwrite sticky/owner from FUSE Mkdir.
+// applyJuiceFSDirectoryMetadata copies only the native inode metadata that
+// Drive9 mirrors for a directory. Directory size/link/time remain owned by the
+// ordinary Dat9FS namespace path; replacing them with lazily-created JuiceFS
+// parent values would change unrelated directory semantics.
+func (fs *Dat9FS) applyJuiceFSDirectoryMetadata(entry *InodeEntry, attr *jfsmeta.Attr) {
+	if fs == nil || entry == nil || attr == nil || !entry.IsDir || attr.Typ != jfsmeta.TypeDirectory {
+		return
+	}
+	entry.Uid = attr.Uid
+	entry.Gid = attr.Gid
+	entry.HasUID = true
+	entry.HasGID = true
+	entry.Mode = juiceTypeToStatMode(attr.Typ, attr.Mode)
+	entry.HasMode = true
+	if fs.inodes != nil && entry.Ino != 0 {
+		fs.inodes.UpdateOwner(entry.Ino, attr.Uid, attr.Gid, true, true)
+		fs.inodes.UpdateMode(entry.Ino, entry.Mode)
+	}
+}
+
+// extentRefreshFromVFS copies native JuiceFS inode metadata onto the Dat9FS
+// inode. Files also take length/link/time because file_nodes size is often 0
+// after a remount. Directories take only mode/owner, and only when lookup bound
+// the exact mirrored jfs_node identity.
 func (fs *Dat9FS) extentRefreshFromVFS(nodeID uint64, p string, fuseFh uint64) bool {
 	if fs == nil {
 		return false
 	}
-	if entry, ok := fs.inodes.GetEntry(nodeID); ok && entry.IsDir {
+	entry, ok := fs.inodes.GetEntry(nodeID)
+	if !ok {
 		return false
 	}
-	inoNum, ok := fs.cachedExtentIno(nodeID)
+	var inoNum uint64
+	if entry.IsDir {
+		inoNum = entry.ExtentIno
+		ok = inoNum != 0
+		if !ok {
+			// Never discover a directory by name here. A directory may be a
+			// lazily-created projection parent; only extent_ino from the same
+			// stat/list row proves its durable identity.
+			return false
+		}
+	} else {
+		// Preserve the file path's existing handle-first resolution order.
+		inoNum, ok = fs.cachedExtentIno(nodeID)
+	}
 	if !ok {
 		if !fs.extentDiscoveryEnabled() {
 			return false
@@ -295,12 +340,18 @@ func (fs *Dat9FS) extentRefreshFromVFS(nodeID uint64, p string, fuseFh uint64) b
 	if errn != 0 || jentry == nil || jentry.Attr == nil {
 		return false
 	}
-	v.UpdateLength(jfsmeta.Ino(inoNum), jentry.Attr)
-	entry, ok := fs.inodes.GetEntry(nodeID)
+	if !entry.IsDir {
+		v.UpdateLength(jfsmeta.Ino(inoNum), jentry.Attr)
+	}
+	entry, ok = fs.inodes.GetEntry(nodeID)
 	if !ok {
 		return false
 	}
-	fs.applyJuiceFSAttr(entry, jentry.Attr)
+	if entry.IsDir {
+		fs.applyJuiceFSDirectoryMetadata(entry, jentry.Attr)
+	} else {
+		fs.applyJuiceFSAttr(entry, jentry.Attr)
+	}
 	return true
 }
 

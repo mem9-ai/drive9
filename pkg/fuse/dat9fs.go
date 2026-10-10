@@ -7483,14 +7483,14 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 	if stat.HasMode {
 		fs.inodes.UpdateMode(ino, stat.Mode)
 	}
-	if stat.ContentLayout == client.ContentLayoutExtent && stat.ExtentIno != 0 {
-		fs.inodes.SetExtentIno(ino, stat.ExtentIno)
+	if extentIno, ok := projectedExtentIno(stat); ok {
+		fs.inodes.SetExtentIno(ino, extentIno)
 	}
-	// Refresh from the JuiceFS side only when the projection says this file
-	// lives on the extent data plane. Matching the profile glob is not enough:
-	// extentRefreshFromVFS resolves the inode by name, so an orphan jfs edge
-	// would capture a single-layout file that happens to match the glob (P1-4).
-	if !stat.IsDir && stat.ContentLayout == client.ContentLayoutExtent {
+	// Refresh only when the same projection row proves the exact jfs_node:
+	// content layout for files, or an extent inode for mirrored directories.
+	// A matching creation glob alone is not identity evidence (P1-4).
+	if (!stat.IsDir && stat.ContentLayout == client.ContentLayoutExtent) ||
+		(stat.IsDir && stat.ExtentIno != 0) {
 		fs.extentRefreshFromVFS(ino, childP, 0)
 	}
 	// This is a plain remote read, not a mutation: record it as an observation
@@ -8577,10 +8577,11 @@ func (fs *Dat9FS) getAttrOnce(cancel <-chan struct{}, input *gofuse.GetAttrIn, o
 		return gofuse.OK
 	}
 
-	// Extent files: size/owner/mode come from JuiceFS VFS GetAttr, not
-	// file_nodes. Directories keep Dat9FS mkdir mode (sticky/owner).
-	// Kernel i_size (and therefore O_APPEND) follows VFS.
-	if !entry.IsDir && fs.extentRefreshFromVFS(input.NodeId, entry.Path, input.Fh()) {
+	// Extent files take size/owner/mode from JuiceFS VFS GetAttr, not
+	// file_nodes. A directory with an exact mirrored jfs_node identity takes
+	// native mode/owner from it while retaining Dat9FS directory size/times.
+	// Kernel file i_size (and therefore O_APPEND) follows VFS.
+	if fs.extentRefreshFromVFS(input.NodeId, entry.Path, input.Fh()) {
 		if refreshed, ok := fs.inodes.GetEntry(input.NodeId); ok {
 			entry = refreshed
 		}

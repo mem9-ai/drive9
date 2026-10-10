@@ -30,19 +30,20 @@ TMP_MOUNTED=0
 RUN_MOUNTED=0
 
 assert_native_upper_metadata() {
+  local stage="${1:-unknown-stage}"
   local file_mode file_owner dir_mode dir_owner
   file_mode="$(sudo stat -c '%a' "$FUSE_ROOT/upper/etc/drive9.conf")"
   file_owner="$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/workspace/persist.txt")"
   dir_mode="$(sudo stat -c '%a' "$FUSE_ROOT/upper/home/agent")"
   dir_owner="$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/home/agent")"
   [ "$file_mode" = 640 ] \
-    || fail "raw upper file mode is ${file_mode}, want 640"
+    || fail "${stage} raw upper existing-file mode is ${file_mode}, want 640"
   [ "$file_owner" = 1234:2345 ] \
-    || fail "raw upper file ownership is ${file_owner}, want 1234:2345"
+    || fail "${stage} raw upper file ownership is ${file_owner}, want 1234:2345"
   [ "$dir_mode" = 750 ] \
-    || fail "raw upper directory mode is ${dir_mode}, want 750"
+    || fail "${stage} raw upper directory mode is ${dir_mode}, want 750"
   [ "$dir_owner" = 3456:4567 ] \
-    || fail "raw upper directory ownership is ${dir_owner}, want 3456:4567"
+    || fail "${stage} raw upper directory ownership is ${dir_owner}, want 3456:4567"
 }
 
 assert_merged_metadata() {
@@ -344,7 +345,7 @@ if [ -n "$FIRST_OVERLAY_PID" ] && kill -0 "$FIRST_OVERLAY_PID" 2>/dev/null; then
   fail "first fuse-overlayfs process is still alive after unmount"
 fi
 mountpoint -q "$FUSE_ROOT" || fail "Drive9 mount disappeared before drain"
-assert_native_upper_metadata
+assert_native_upper_metadata same-mount
 assert_regular_overlay_markers
 assert_no_private_overlay_xattrs \
   || fail "raw upper depends on private overlay xattrs"
@@ -360,7 +361,7 @@ fi
 # be needed to reconstruct the merged root.
 mount_drive9
 [ "$FUSE_PID" != "$FIRST_FUSE_PID" ] || fail "Drive9 remount reused the old FUSE process"
-assert_native_upper_metadata
+assert_native_upper_metadata fresh-remount
 assert_regular_overlay_markers
 assert_no_private_overlay_xattrs \
   || fail "remounted raw upper depends on private overlay xattrs"

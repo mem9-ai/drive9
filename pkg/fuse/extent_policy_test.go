@@ -11,6 +11,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extent"
 )
 
@@ -153,24 +154,84 @@ func TestSetAttrModeAllowsNonOwnerClearSetid(t *testing.T) {
 	}
 }
 
-func TestExtentRefreshFromVFSSkipsDirectories(t *testing.T) {
+func TestApplyJuiceFSDirectoryMetadataUsesNativeOwnerModeOnly(t *testing.T) {
 	fs := &Dat9FS{inodes: NewInodeToPath()}
-	ino := fs.inodes.Lookup("/sticky/", true, 0, time.Now())
+	mtime := time.Unix(123, 456)
+	ino := fs.inodes.Lookup("/sticky/", true, 7, mtime)
 	fs.inodes.UpdateMode(ino, 01777)
 	fs.inodes.UpdateOwner(ino, 0, 0, true, true)
 	fs.inodes.SetExtentIno(ino, 99)
-	if fs.extentRefreshFromVFS(ino, "/sticky/", 0) {
-		t.Fatal("directory getattr must not refresh from JuiceFS")
-	}
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		t.Fatal("missing dir inode")
 	}
-	if !entry.HasMode || entry.Mode&posixPermissionModeMask != 01777 {
-		t.Fatalf("sticky mode = %o, want 01777", entry.Mode)
+	fs.applyJuiceFSDirectoryMetadata(entry, &jfsmeta.Attr{
+		Typ:    jfsmeta.TypeDirectory,
+		Mode:   0750,
+		Uid:    3456,
+		Gid:    4567,
+		Length: 4096,
+		Nlink:  99,
+		Mtime:  999,
+	})
+	entry, ok = fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing refreshed dir inode")
 	}
-	if !entry.HasUID || entry.Uid != 0 {
-		t.Fatalf("dir uid = %d, want 0", entry.Uid)
+	if !entry.HasMode || entry.Mode&posixPermissionModeMask != 0750 {
+		t.Fatalf("mode = %o, want 0750", entry.Mode)
+	}
+	if !entry.HasUID || !entry.HasGID || entry.Uid != 3456 || entry.Gid != 4567 {
+		t.Fatalf("owner = %d:%d, want 3456:4567", entry.Uid, entry.Gid)
+	}
+	if entry.Size != 7 || entry.Nlink == 99 || !entry.Mtime.Equal(mtime) {
+		t.Fatalf("directory namespace metadata changed: size=%d nlink=%d mtime=%s", entry.Size, entry.Nlink, entry.Mtime)
+	}
+}
+
+func TestApplyJuiceFSDirectoryMetadataRejectsNonDirectoryAttr(t *testing.T) {
+	fs := &Dat9FS{inodes: NewInodeToPath()}
+	ino := fs.inodes.Lookup("/dir/", true, 0, time.Now())
+	fs.inodes.UpdateMode(ino, 0755)
+	fs.inodes.UpdateOwner(ino, 1001, 1002, true, true)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing dir inode")
+	}
+
+	fs.applyJuiceFSDirectoryMetadata(entry, &jfsmeta.Attr{
+		Typ:  jfsmeta.TypeFile,
+		Mode: 0600,
+		Uid:  3456,
+		Gid:  4567,
+	})
+	entry, ok = fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing dir inode after rejected attr")
+	}
+	if entry.Mode&posixPermissionModeMask != 0755 || entry.Uid != 1001 || entry.Gid != 1002 {
+		t.Fatalf("non-directory attr changed directory metadata: mode=%o owner=%d:%d", entry.Mode, entry.Uid, entry.Gid)
+	}
+}
+
+func TestProjectedExtentInoAcceptsMirroredDirectoryOnly(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		stat *client.StatResult
+		want uint64
+	}{
+		{name: "nil stat"},
+		{name: "mirrored directory", stat: &client.StatResult{IsDir: true, ExtentIno: 41}, want: 41},
+		{name: "extent file", stat: &client.StatResult{ContentLayout: client.ContentLayoutExtent, ExtentIno: 42}, want: 42},
+		{name: "classic file with stale inode", stat: &client.StatResult{ExtentIno: 43}},
+		{name: "directory without mirror", stat: &client.StatResult{IsDir: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := projectedExtentIno(test.stat)
+			if got != test.want || ok != (test.want != 0) {
+				t.Fatalf("projectedExtentIno = %d/%v, want %d/%v", got, ok, test.want, test.want != 0)
+			}
+		})
 	}
 }
 
