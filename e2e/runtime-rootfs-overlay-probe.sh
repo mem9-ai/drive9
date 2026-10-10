@@ -31,11 +31,24 @@ RUN_MOUNTED=0
 
 assert_native_upper_metadata() {
   local stage="${1:-unknown-stage}"
-  local file_mode file_owner dir_mode dir_owner
+  local file_mode file_owner dir_mode dir_owner root_mode root_owner
+  # Force the directory-entry path before the explicit stats. ReaddirPlus may
+  # satisfy a later stat from its EntryOut without issuing Lookup/GetAttr, so
+  # it must carry the same native metadata as those paths.
+  sudo python3 - "$FUSE_ROOT/upper" <<'PY'
+import os
+import sys
+for root, dirs, files in os.walk(sys.argv[1]):
+    with os.scandir(root) as entries:
+        for entry in entries:
+            entry.stat(follow_symlinks=False)
+PY
   file_mode="$(sudo stat -c '%a' "$FUSE_ROOT/upper/etc/drive9.conf")"
   file_owner="$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/workspace/persist.txt")"
   dir_mode="$(sudo stat -c '%a' "$FUSE_ROOT/upper/home/agent")"
   dir_owner="$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/home/agent")"
+  root_mode="$(sudo stat -c '%a' "$FUSE_ROOT/upper/root")"
+  root_owner="$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/root")"
   [ "$file_mode" = 640 ] \
     || fail "${stage} raw upper existing-file mode is ${file_mode}, want 640"
   [ "$file_owner" = 1234:2345 ] \
@@ -44,6 +57,10 @@ assert_native_upper_metadata() {
     || fail "${stage} raw upper directory mode is ${dir_mode}, want 750"
   [ "$dir_owner" = 3456:4567 ] \
     || fail "${stage} raw upper directory ownership is ${dir_owner}, want 3456:4567"
+  [ "$root_mode" = 700 ] \
+    || fail "${stage} raw upper /root directory mode is ${root_mode}, want 700"
+  [ "$root_owner" = 0:0 ] \
+    || fail "${stage} raw upper /root directory ownership is ${root_owner}, want 0:0"
 }
 
 assert_merged_metadata() {
@@ -304,6 +321,8 @@ file -Lb "$LOWER/bin/sh" | grep -q 'dynamically linked' \
 # Deterministic lower-only entries exercise copy-up, whiteout, opaque-dir, and
 # rename behavior independently of the chosen base image contents.
 mkdir -p "$LOWER/etc/opaque" "$LOWER/workspace" "$LOWER/home/agent" "$LOWER/root" "$LOWER/tmp" "$LOWER/run"
+sudo chown 0:0 "$LOWER/root"
+sudo chmod 0700 "$LOWER/root"
 printf 'delete-me\n' >"$LOWER/etc/lower-delete"
 printf 'rename-me\n' >"$LOWER/etc/lower-rename"
 printf 'hidden-child\n' >"$LOWER/etc/opaque/lower-child"

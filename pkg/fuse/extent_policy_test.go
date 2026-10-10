@@ -214,6 +214,45 @@ func TestApplyJuiceFSDirectoryMetadataRejectsNonDirectoryAttr(t *testing.T) {
 	}
 }
 
+func TestApplyCachedDirectoryMetadataUsesNativeOwnerModeOnly(t *testing.T) {
+	mtime := time.Unix(123, 456)
+	item := CachedFileInfo{
+		Name: "root", Size: 7, IsDir: true, Mtime: mtime,
+		Mode: 0755, HasMode: true, Uid: 1001, Gid: 1001, HasUID: true, HasGID: true,
+		ExtentIno: 42,
+	}
+	entry := &InodeEntry{
+		IsDir: true, Size: 4096, Mtime: time.Unix(999, 0),
+		Mode: 0700, HasMode: true, Uid: 0, Gid: 0, HasUID: true, HasGID: true,
+	}
+	applyCachedDirectoryMetadata(&item, entry)
+	if item.Mode != 0700 || !item.HasMode || item.Uid != 0 || item.Gid != 0 || !item.HasUID || !item.HasGID {
+		t.Fatalf("cached native metadata = mode=%o owner=%d:%d flags=%v/%v/%v", item.Mode, item.Uid, item.Gid, item.HasMode, item.HasUID, item.HasGID)
+	}
+	if item.Size != 7 || !item.Mtime.Equal(mtime) || item.ExtentIno != 42 {
+		t.Fatalf("directory namespace metadata changed: size=%d mtime=%s extent_ino=%d", item.Size, item.Mtime, item.ExtentIno)
+	}
+}
+
+func TestApplyCachedDirectoryMetadataRejectsMismatchedKinds(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		item  CachedFileInfo
+		entry InodeEntry
+	}{
+		{name: "listing file", item: CachedFileInfo{IsDir: false, Mode: 0644, Uid: 1001, Gid: 1002}, entry: InodeEntry{IsDir: true, Mode: 0700, Uid: 0, Gid: 0}},
+		{name: "native file", item: CachedFileInfo{IsDir: true, Mode: 0755, Uid: 1001, Gid: 1002}, entry: InodeEntry{IsDir: false, Mode: 0600, Uid: 0, Gid: 0}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := test.item
+			applyCachedDirectoryMetadata(&test.item, &test.entry)
+			if test.item != before {
+				t.Fatalf("mismatched kinds changed cached metadata: got %+v want %+v", test.item, before)
+			}
+		})
+	}
+}
+
 func TestProjectedExtentInoAcceptsMirroredDirectoryOnly(t *testing.T) {
 	for _, test := range []struct {
 		name string

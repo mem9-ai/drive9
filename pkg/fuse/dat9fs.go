@@ -11732,6 +11732,27 @@ func dirEntryFromCachedInfo(item CachedFileInfo, ino uint64) DirEntry {
 	}
 }
 
+// applyCachedDirectoryMetadata updates the readdir result with the native
+// owner and mode loaded from its exact mirrored jfs_node. Size, links, and
+// times remain the ordinary Drive9 directory namespace's facts.
+func applyCachedDirectoryMetadata(item *CachedFileInfo, entry *InodeEntry) {
+	if item == nil || entry == nil || !item.IsDir || !entry.IsDir {
+		return
+	}
+	if entry.HasMode {
+		item.Mode = entry.Mode
+		item.HasMode = true
+	}
+	if entry.HasUID {
+		item.Uid = entry.Uid
+		item.HasUID = true
+	}
+	if entry.HasGID {
+		item.Gid = entry.Gid
+		item.HasGID = true
+	}
+}
+
 func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
 	if dh, ok := fs.dirHandles.Get(input.Fh); ok {
 		fs.extentReleaseDir(dh)
@@ -12244,6 +12265,15 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		}
 		if item.ExtentIno != 0 {
 			fs.inodes.SetExtentIno(ino, item.ExtentIno)
+		}
+		// ReaddirPlus can satisfy the kernel's following stat directly from its
+		// EntryOut, without a later Lookup/GetAttr. Refresh a mirrored directory
+		// before building that reply or a fresh mount would expose the projection
+		// user's owner even though jfs_node already holds the durable native one.
+		if item.IsDir && item.ExtentIno != 0 && fs.extentRefreshFromVFS(ino, childP, 0) {
+			if refreshed, ok := fs.inodes.GetEntry(ino); ok {
+				applyCachedDirectoryMetadata(&item, refreshed)
+			}
 		}
 		if !item.IsDir && prevSize > item.Size {
 			fs.inodes.UpdateSize(ino, prevSize)

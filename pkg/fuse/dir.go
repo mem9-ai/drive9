@@ -36,7 +36,7 @@ type CachedFileInfo struct {
 	HasGID     bool
 	ResourceID string
 	Nlink      uint32
-	ExtentIno  uint64 // JuiceFS inode for content_layout=extent files
+	ExtentIno  uint64 // JuiceFS inode for an extent file or mirrored directory
 
 	// freshUntil is the deadline of the evidence holding this value up, and is
 	// what makes the cache's validity per name instead of per directory:
