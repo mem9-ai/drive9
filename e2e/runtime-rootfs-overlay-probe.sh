@@ -63,6 +63,15 @@ PY
     || fail "${stage} raw upper /root directory ownership is ${root_owner}, want 0:0"
 }
 
+assert_native_upper_symlink() {
+  local stage="${1:-unknown-stage}"
+  local link="$FUSE_ROOT/upper/root/config-link"
+  sudo test -L "$link" \
+    || fail "${stage} raw upper symlink is missing"
+  [ "$(sudo readlink "$link")" = ../etc/drive9.conf ] \
+    || fail "${stage} raw upper symlink target did not persist"
+}
+
 report_native_directory_metadata() {
   local stage="${1:-unknown-stage}"
   local head_headers head_extent_ino list_json extent_ino attr_json
@@ -403,6 +412,7 @@ if [ -n "$FIRST_OVERLAY_PID" ] && kill -0 "$FIRST_OVERLAY_PID" 2>/dev/null; then
 fi
 mountpoint -q "$FUSE_ROOT" || fail "Drive9 mount disappeared before drain"
 assert_native_upper_metadata same-mount
+assert_native_upper_symlink same-mount
 report_native_directory_metadata after-overlay-unmount
 assert_regular_overlay_markers
 assert_no_private_overlay_xattrs \
@@ -421,6 +431,7 @@ mount_drive9
 [ "$FUSE_PID" != "$FIRST_FUSE_PID" ] || fail "Drive9 remount reused the old FUSE process"
 report_native_directory_metadata fresh-remount
 assert_native_upper_metadata fresh-remount
+assert_native_upper_symlink fresh-remount
 assert_regular_overlay_markers
 assert_no_private_overlay_xattrs \
   || fail "remounted raw upper depends on private overlay xattrs"
@@ -442,7 +453,7 @@ sudo chroot "$MERGED" /bin/sh -c 'test -x /bin/sh && printf lower-image-ok' \
 [ "$(stat -c '%u:%g' "$MERGED/workspace/persist.txt")" = 1234:2345 ] || fail "chown uid/gid did not persist"
 [ "$(stat -c '%a' "$MERGED/home/agent")" = 750 ] || fail "directory chmod did not persist"
 [ "$(stat -c '%u:%g' "$MERGED/home/agent")" = 3456:4567 ] || fail "directory chown did not persist"
-[ "$(readlink "$MERGED/root/config-link")" = ../etc/drive9.conf ] || fail "symlink did not persist"
+[ "$(sudo readlink "$MERGED/root/config-link")" = ../etc/drive9.conf ] || fail "symlink did not persist"
 [ "$(stat -c '%i' "$MERGED/workspace/persist.txt")" = "$(stat -c '%i' "$MERGED/workspace/renamed-hardlink.txt")" ] \
   || fail "hardlink identity did not persist"
 [ "$(stat -c '%y' "$MERGED/etc/drive9.conf" | cut -d. -f1)" = '2020-01-02 03:04:05' ] \
