@@ -13,6 +13,11 @@ import (
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
+// testHookExtentSetAttr substitutes only the native VFS mutation so tests can
+// exercise extentSetAttr's real validation, cache update, and reply path
+// without constructing a remote JuiceFS runtime.
+var testHookExtentSetAttr func(ino uint64, set int, fh uint64, mode, uid, gid uint32, atime, mtime int64, atimensec, mtimensec uint32, size uint64) (*jfsmeta.Entry, syscall.Errno)
+
 func (fs *Dat9FS) extentStatIno(ctx context.Context, p string) (uint64, bool) {
 	if fs.client == nil {
 		return 0, false
@@ -356,11 +361,14 @@ func (fs *Dat9FS) extentRefreshFromVFS(nodeID uint64, p string, fuseFh uint64) b
 }
 
 func (fs *Dat9FS) extentSetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, entry *InodeEntry, out *gofuse.AttrOut) gofuse.Status {
-	if err := fs.ensureExtentRuntime(); err != nil {
-		return gofuse.EIO
-	}
 	v := fs.extentVFS()
-	if v == nil || entry == nil {
+	if testHookExtentSetAttr == nil {
+		if err := fs.ensureExtentRuntime(); err != nil {
+			return gofuse.EIO
+		}
+		v = fs.extentVFS()
+	}
+	if (v == nil && testHookExtentSetAttr == nil) || entry == nil {
 		return gofuse.EIO
 	}
 	inoNum, ok := fs.resolveJuiceIno(input.NodeId, entry.Path)
@@ -425,12 +433,19 @@ func (fs *Dat9FS) extentSetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn,
 		out.SetTimeout(fs.extentAttrTimeoutFor(entry))
 		return gofuse.OK
 	}
-	ctx := fs.jfsCtx(input.Pid, input.Uid, input.Gid)
-	jentry, errn := v.SetAttr(ctx, jfsmeta.Ino(inoNum), set, fs.extentVFSFh(input.Fh), mode, uid, gid, atime, mtime, atimensec, mtimensec, size)
+	fh := fs.extentVFSFh(input.Fh)
+	var jentry *jfsmeta.Entry
+	var errn syscall.Errno
+	if testHookExtentSetAttr != nil {
+		jentry, errn = testHookExtentSetAttr(inoNum, set, fh, mode, uid, gid, atime, mtime, atimensec, mtimensec, size)
+	} else {
+		ctx := fs.jfsCtx(input.Pid, input.Uid, input.Gid)
+		jentry, errn = v.SetAttr(ctx, jfsmeta.Ino(inoNum), set, fh, mode, uid, gid, atime, mtime, atimensec, mtimensec, size)
+	}
 	if errn != 0 {
 		return gofuse.Status(errn)
 	}
-	if jentry != nil && jentry.Attr != nil {
+	if v != nil && jentry != nil && jentry.Attr != nil {
 		v.UpdateLength(jfsmeta.Ino(inoNum), jentry.Attr)
 	}
 	entry = fs.applyExtentSetAttrResult(input, entry, jentry, mode)

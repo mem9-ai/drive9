@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
@@ -278,20 +279,31 @@ func TestExtentSetAttrResultUpdatesCachedReadDirPlusMetadata(t *testing.T) {
 		Mode:     0640,
 		Owner:    gofuse.Owner{Uid: 1234, Gid: 2345},
 	}}
-	entry = fs.applyExtentSetAttrResult(input, entry, &jfsmeta.Entry{
-		Inode: 42,
-		Attr: &jfsmeta.Attr{
-			Full:   true,
-			Typ:    jfsmeta.TypeFile,
-			Mode:   0640,
-			Uid:    1234,
-			Gid:    2345,
-			Length: 7,
-			Nlink:  1,
-		},
-	}, 0640)
-	if entry == nil {
-		t.Fatal("missing updated extent inode")
+	testHookExtentSetAttr = func(gotIno uint64, set int, fh uint64, mode, uid, gid uint32, _ int64, _ int64, _ uint32, _ uint32, _ uint64) (*jfsmeta.Entry, syscall.Errno) {
+		wantSet := int(jfsmeta.SetAttrMode | jfsmeta.SetAttrUID | jfsmeta.SetAttrGID)
+		if gotIno != 42 || set != wantSet || fh != 0 || mode != 0640 || uid != 1234 || gid != 2345 {
+			t.Fatalf("native SetAttr = ino=%d set=%x fh=%d mode=%o owner=%d:%d", gotIno, set, fh, mode, uid, gid)
+		}
+		return &jfsmeta.Entry{
+			Inode: 42,
+			Attr: &jfsmeta.Attr{
+				Full:   true,
+				Typ:    jfsmeta.TypeFile,
+				Mode:   0640,
+				Uid:    1234,
+				Gid:    2345,
+				Length: 7,
+				Nlink:  1,
+			},
+		}, 0
+	}
+	t.Cleanup(func() { testHookExtentSetAttr = nil })
+	var attrOut gofuse.AttrOut
+	if st := fs.extentSetAttr(nil, input, entry, &attrOut); st != gofuse.OK {
+		t.Fatalf("extentSetAttr status = %v, want OK", st)
+	}
+	if attrOut.Mode&posixPermissionModeMask != 0640 || attrOut.Uid != 1234 || attrOut.Gid != 2345 {
+		t.Fatalf("extentSetAttr reply = mode=%o owner=%d:%d, want 0640 1234:2345", attrOut.Mode, attrOut.Uid, attrOut.Gid)
 	}
 
 	items, ok := fs.dirCache.Get(parent)
@@ -328,6 +340,29 @@ func TestExtentSetAttrResultUpdatesCachedReadDirPlusMetadata(t *testing.T) {
 		Size:     4096,
 	}, out); st != gofuse.OK {
 		t.Fatalf("ReadDirPlus status = %v, want OK", st)
+	}
+	buf := dirEntryListBuf(t, out)
+	entryOutSize := int(unsafe.Sizeof(gofuse.EntryOut{}))
+	found := false
+	for len(buf) >= entryOutSize+24 {
+		entryOut := (*gofuse.EntryOut)(unsafe.Pointer(&buf[0]))
+		dirent := buf[entryOutSize:]
+		nameLen := int(nativeEndian.Uint32(dirent[16:20]))
+		recordLen := entryOutSize + ((24 + nameLen + 7) &^ 7)
+		if recordLen > len(buf) {
+			t.Fatalf("ReadDirPlus record length %d exceeds buffer %d", recordLen, len(buf))
+		}
+		name := string(dirent[24 : 24+nameLen])
+		if name == "drive9.conf" {
+			found = true
+			if entryOut.Mode&posixPermissionModeMask != 0640 || entryOut.Uid != 1234 || entryOut.Gid != 2345 {
+				t.Fatalf("ReadDirPlus EntryOut = mode=%o owner=%d:%d, want 0640 1234:2345", entryOut.Mode, entryOut.Uid, entryOut.Gid)
+			}
+		}
+		buf = buf[recordLen:]
+	}
+	if !found {
+		t.Fatal("ReadDirPlus did not emit drive9.conf")
 	}
 	entry, ok = fs.inodes.GetEntry(ino)
 	if !ok || entry.Mode&posixPermissionModeMask != 0640 || entry.Uid != 1234 || entry.Gid != 2345 {
