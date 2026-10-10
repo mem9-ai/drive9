@@ -63,6 +63,33 @@ PY
     || fail "${stage} raw upper /root directory ownership is ${root_owner}, want 0:0"
 }
 
+report_native_directory_metadata() {
+  local stage="${1:-unknown-stage}"
+  local list_json extent_ino attr_json
+  list_json="$(curl -fsS --max-time 20 \
+    -H "Authorization: Bearer ${API_KEY}" \
+    "${BASE}/v1/fs${REMOTE_ROOT}/upper/home?list=1")" \
+    || fail "${stage} could not list native directory projection"
+  extent_ino="$(printf '%s' "$list_json" | jq -r \
+    '.entries[] | select(.name == "agent" and .isDir == true) | .extent_ino // empty')"
+  [ -n "$extent_ino" ] && [ "$extent_ino" != 0 ] \
+    || fail "${stage} native directory projection has no extent inode"
+  attr_json="$(curl -fsS --max-time 20 -X POST \
+    -H "Authorization: Bearer ${API_KEY}" \
+    -H 'Content-Type: application/json' \
+    -H 'X-Drive9-Extent-Op: getattr' \
+    --data "{\"inode\":${extent_ino}}" \
+    "${BASE}/v1/extent/meta")" \
+    || fail "${stage} could not read native directory inode"
+  printf 'rootfs probe native directory %s: inode=%s owner=%s:%s mode=%s type=%s\n' \
+    "$stage" \
+    "$extent_ino" \
+    "$(printf '%s' "$attr_json" | jq -r '.attr.Uid // "missing"')" \
+    "$(printf '%s' "$attr_json" | jq -r '.attr.Gid // "missing"')" \
+    "$(printf '%s' "$attr_json" | jq -r '.attr.Mode // "missing"')" \
+    "$(printf '%s' "$attr_json" | jq -r '.attr.Typ // "missing"')"
+}
+
 assert_merged_metadata() {
   local file_mode file_owner dir_mode dir_owner
   file_mode="$(sudo stat -c '%a' "$MERGED/etc/drive9.conf")"
@@ -357,6 +384,7 @@ sudo sh -c "printf transient-tmp >'$MERGED/tmp/not-persistent'"
 sudo sh -c "printf transient-run >'$MERGED/run/not-persistent'"
 sync
 assert_merged_metadata
+report_native_directory_metadata after-chown
 
 unmount_overlay || fail "$ROOTFS_DRIVER did not stop cleanly"
 unmount_overlay || fail "$ROOTFS_DRIVER teardown was not idempotent"
@@ -365,6 +393,7 @@ if [ -n "$FIRST_OVERLAY_PID" ] && kill -0 "$FIRST_OVERLAY_PID" 2>/dev/null; then
 fi
 mountpoint -q "$FUSE_ROOT" || fail "Drive9 mount disappeared before drain"
 assert_native_upper_metadata same-mount
+report_native_directory_metadata after-overlay-unmount
 assert_regular_overlay_markers
 assert_no_private_overlay_xattrs \
   || fail "raw upper depends on private overlay xattrs"
@@ -380,6 +409,7 @@ fi
 # be needed to reconstruct the merged root.
 mount_drive9
 [ "$FUSE_PID" != "$FIRST_FUSE_PID" ] || fail "Drive9 remount reused the old FUSE process"
+report_native_directory_metadata fresh-remount
 assert_native_upper_metadata fresh-remount
 assert_regular_overlay_markers
 assert_no_private_overlay_xattrs \
