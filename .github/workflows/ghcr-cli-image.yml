@@ -1,0 +1,147 @@
+name: Publish CLI image to GHCR
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cmd/**'
+      - 'pkg/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile.cli'
+      - 'Makefile'
+      - '.github/workflows/ghcr-cli-image.yml'
+  workflow_dispatch:
+    inputs:
+      publish_ref:
+        description: "Branch, tag, or SHA to publish"
+        required: true
+        default: "main"
+      image_tag:
+        description: "Optional image tag override"
+        required: false
+        type: string
+
+env:
+  IMAGE_NAME: ghcr.io/mem9-ai/drive9
+  PACKAGE_SETTINGS_URL: https://github.com/orgs/mem9-ai/packages/container/package/drive9/settings
+
+jobs:
+  publish:
+    name: Build and publish CLI image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_ref || github.ref }}
+
+      - name: Checkout agfs dependency
+        run: |
+          git clone --depth 1 https://github.com/c4pt0r/agfs ../agfs
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve image tags
+        run: |
+          set -euo pipefail
+
+          FULL_SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+          OVERRIDE_TAG="${{ github.event_name == 'workflow_dispatch' && inputs.image_tag || '' }}"
+
+          if [ -n "$OVERRIDE_TAG" ]; then
+            case "$OVERRIDE_TAG" in
+              *[![:alnum:]_.-]*)
+                echo "Invalid image tag override" >&2
+                exit 1
+                ;;
+            esac
+            IMAGE_TAG="$OVERRIDE_TAG"
+            PUSH_LATEST=false
+          else
+            REF_NAME="${{ github.event_name == 'workflow_dispatch' && inputs.publish_ref || github.ref_name }}"
+            REF_NAME=${REF_NAME#refs/heads/}
+            REF_NAME=${REF_NAME#refs/tags/}
+            REF_NAME=${REF_NAME//\//-}
+            REF_NAME=$(printf '%s' "$REF_NAME" | tr -c '[:alnum:]_.-' '-')
+            REF_NAME=${REF_NAME:0:80}
+            IMAGE_TAG="${REF_NAME}-${SHORT_SHA}"
+            case "$IMAGE_TAG" in
+              [[:alnum:]_]*)
+                ;;
+              *)
+                IMAGE_TAG="sha-${SHORT_SHA}"
+                ;;
+            esac
+
+            if [ "$REF_NAME" = "main" ]; then
+              PUSH_LATEST=true
+            else
+              PUSH_LATEST=false
+            fi
+          fi
+
+          {
+            echo "FULL_SHA=$FULL_SHA"
+            echo "SHORT_SHA=$SHORT_SHA"
+            echo "IMAGE_TAG=$IMAGE_TAG"
+            echo "SHA_TAG=sha-$SHORT_SHA"
+            echo "PUSH_LATEST=$PUSH_LATEST"
+          } >> "$GITHUB_ENV"
+
+      - name: Build CLI
+        run: |
+          make build-cli GOOS=linux GOARCH=amd64 VERSION="$SHORT_SHA"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        run: |
+          docker build \
+            -f Dockerfile.cli \
+            --label "org.opencontainers.image.revision=$FULL_SHA" \
+            --label "org.opencontainers.image.version=$IMAGE_TAG" \
+            -t "$IMAGE_NAME:$IMAGE_TAG" \
+            -t "$IMAGE_NAME:$SHA_TAG" \
+            .
+          if [ "$PUSH_LATEST" = "true" ]; then
+            docker tag "$IMAGE_NAME:$IMAGE_TAG" "$IMAGE_NAME:latest"
+          fi
+
+      - name: Push image
+        run: |
+          docker push "$IMAGE_NAME:$IMAGE_TAG"
+          docker push "$IMAGE_NAME:$SHA_TAG"
+          if [ "$PUSH_LATEST" = "true" ]; then
+            docker push "$IMAGE_NAME:latest"
+          fi
+
+      - name: Publish summary
+        run: |
+          {
+            echo "## GHCR CLI image"
+            echo ""
+            echo "Published \`$IMAGE_NAME:$IMAGE_TAG\`"
+            echo "Published \`$IMAGE_NAME:$SHA_TAG\`"
+            if [ "$PUSH_LATEST" = "true" ]; then
+              echo "Published \`$IMAGE_NAME:latest\`"
+            fi
+            echo ""
+            echo "After the first publish, set the package visibility to Public:"
+            echo "$PACKAGE_SETTINGS_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
