@@ -30,14 +30,35 @@ TMP_MOUNTED=0
 RUN_MOUNTED=0
 
 assert_native_upper_metadata() {
-  [ "$(sudo stat -c '%a' "$FUSE_ROOT/upper/etc/drive9.conf")" = 640 ] \
-    || fail "raw upper file mode was not stored in the Drive9 inode"
-  [ "$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/workspace/persist.txt")" = 1234:2345 ] \
-    || fail "raw upper file ownership was not stored in the Drive9 inode"
-  [ "$(sudo stat -c '%a' "$FUSE_ROOT/upper/home/agent")" = 750 ] \
-    || fail "raw upper directory mode was not stored in the Drive9 inode"
-  [ "$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/home/agent")" = 3456:4567 ] \
-    || fail "raw upper directory ownership was not stored in the Drive9 inode"
+  local file_mode file_owner dir_mode dir_owner
+  file_mode="$(sudo stat -c '%a' "$FUSE_ROOT/upper/etc/drive9.conf")"
+  file_owner="$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/workspace/persist.txt")"
+  dir_mode="$(sudo stat -c '%a' "$FUSE_ROOT/upper/home/agent")"
+  dir_owner="$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/home/agent")"
+  [ "$file_mode" = 640 ] \
+    || fail "raw upper file mode is ${file_mode}, want 640"
+  [ "$file_owner" = 1234:2345 ] \
+    || fail "raw upper file ownership is ${file_owner}, want 1234:2345"
+  [ "$dir_mode" = 750 ] \
+    || fail "raw upper directory mode is ${dir_mode}, want 750"
+  [ "$dir_owner" = 3456:4567 ] \
+    || fail "raw upper directory ownership is ${dir_owner}, want 3456:4567"
+}
+
+assert_merged_metadata() {
+  local file_mode file_owner dir_mode dir_owner
+  file_mode="$(sudo stat -c '%a' "$MERGED/etc/drive9.conf")"
+  file_owner="$(sudo stat -c '%u:%g' "$MERGED/workspace/persist.txt")"
+  dir_mode="$(sudo stat -c '%a' "$MERGED/home/agent")"
+  dir_owner="$(sudo stat -c '%u:%g' "$MERGED/home/agent")"
+  [ "$file_mode" = 640 ] \
+    || fail "merged file mode is ${file_mode}, want 640"
+  [ "$file_owner" = 1234:2345 ] \
+    || fail "merged file ownership is ${file_owner}, want 1234:2345"
+  [ "$dir_mode" = 750 ] \
+    || fail "merged directory mode is ${dir_mode}, want 750"
+  [ "$dir_owner" = 3456:4567 ] \
+    || fail "merged directory ownership is ${dir_owner}, want 3456:4567"
 }
 
 assert_regular_overlay_markers() {
@@ -315,6 +336,7 @@ sudo mv "$MERGED/workspace/persist-hardlink.txt" "$MERGED/workspace/renamed-hard
 sudo sh -c "printf transient-tmp >'$MERGED/tmp/not-persistent'"
 sudo sh -c "printf transient-run >'$MERGED/run/not-persistent'"
 sync
+assert_merged_metadata
 
 unmount_overlay || fail "$ROOTFS_DRIVER did not stop cleanly"
 unmount_overlay || fail "$ROOTFS_DRIVER teardown was not idempotent"
