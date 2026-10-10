@@ -43,6 +43,8 @@ GITLEAKS_BIN ?= $(BIN_DIR)/gitleaks
 # Optional `git log` range for the local `gitleaks` target (`main..HEAD`,
 # `--all`, ...). Empty scans the current branch.
 GITLEAKS_LOG_OPTS ?=
+# Range actually traversed, shared by the pre-flight check and the scan.
+GITLEAKS_RANGE = $(if $(GITLEAKS_LOG_OPTS),$(GITLEAKS_LOG_OPTS),HEAD)
 
 IMAGE_REPO ?= drive9-server
 IMAGE_TAG ?= latest
@@ -71,7 +73,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-race test-failpoint test-podman test-minio-bootstrap fmt lint install-lint gitleaks install-gitleaks build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
+.PHONY: mod test test-race test-failpoint test-podman test-minio-bootstrap fmt lint install-lint gitleaks install-gitleaks test-gitleaks-fail-closed build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
@@ -143,12 +145,29 @@ install-lint:
 
 # Scan git history for committed credentials. The default covers the current
 # branch; pass GITLEAKS_LOG_OPTS for another range or "--all". Known non-secret
-# fixtures are allowlisted in .gitleaks.toml. CI does not run this target: the
-# workflow installs its own pinned scanner and reads the allowlist from the pull
-# request's merge base, so a PR cannot excuse the finding it is adding.
+# fixtures are allowlisted in .gitleaks.toml.
+#
+# Fail closed: gitleaks exits 0 with "0 commits scanned" when git cannot read the
+# requested history (unknown revision, or a partial clone whose promisor remote
+# is unreachable), which would be a silent pass. The range is traversed with git
+# first, and any failure aborts the target. Regression:
+# `make test-gitleaks-fail-closed`.
+#
+# CI does not run this target: the workflow installs its own pinned scanner and
+# reads the allowlist from the pull request's merge base, so a pull request
+# cannot excuse the finding it is adding.
 gitleaks: install-gitleaks
-	$(GITLEAKS_BIN) git . --no-banner --redact -v \
-		--log-opts="$(if $(GITLEAKS_LOG_OPTS),$(GITLEAKS_LOG_OPTS),HEAD)"
+	@set -euo pipefail; \
+	if ! git log -p -U0 "$(GITLEAKS_RANGE)" >/dev/null 2>&1; then \
+		echo "gitleaks: cannot read the full history of '$(GITLEAKS_RANGE)'" >&2; \
+		echo "gitleaks: unknown revision, or a partial clone whose promisor remote is unreachable" >&2; \
+		exit 1; \
+	fi; \
+	$(GITLEAKS_BIN) git . --no-banner --redact -v --log-opts="$(GITLEAKS_RANGE)"
+
+# Regression for the fail-closed behaviour of the target above.
+test-gitleaks-fail-closed:
+	./scripts/test-gitleaks-fail-closed.sh
 
 install-gitleaks:
 	@echo "Checking for gitleaks..."

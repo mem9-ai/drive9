@@ -1,15 +1,23 @@
 name: Secret Scan
 
-# Gates a pull request on the commits it adds. The gate is deliberately
-# self-contained: the scanner version is pinned here and the allowlist is read
-# from the pull request's merge base, so a PR cannot excuse the credential it is
-# adding by editing .gitleaks.toml (or the Make target) in the same change.
-# Allowlist additions only take effect once they are merged.
+# Gates a pull request on the commits it adds.
+#
+# `pull_request_target` loads this definition from the default branch, not from
+# the pull request, so the gate cannot be weakened by the change it is meant to
+# inspect. Nothing from the pull request is ever executed: the job checks out the
+# PR head only to read git objects, installs the scanner itself from the version
+# pinned below, and takes its allowlist from the merge base. Allowlist additions
+# therefore take effect only once they are merged, and the scanner ignores any
+# `.gitleaksignore` shipped by the PR.
+#
+# Bootstrap: `pull_request_target` only runs when this file already exists on the
+# default branch, so the PR that introduces it is not itself gated — every later
+# PR is.
 #
 # `make gitleaks` is the equivalent local command; workflow_dispatch audits the
 # full history of the selected ref.
 on:
-  pull_request:
+  pull_request_target:
     branches:
       - '**'
   workflow_dispatch:
@@ -18,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: secret-scan-${{ github.ref }}
+  group: secret-scan-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -29,9 +37,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Checkout
+      - name: Checkout the PR head (read only, never executed)
         uses: actions/checkout@v4
         with:
+          # refs/pull/<n>/head exists for every PR, including conflicting ones.
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/head', github.event.pull_request.number) || github.ref }}
           # The PR commit range and its merge-base allowlist are resolved with
           # git, so the base commit must be present locally.
           fetch-depth: 0
@@ -53,15 +63,17 @@ jobs:
           key: ${{ runner.os }}-gitleaks-bin
 
       - name: Install gitleaks
+        # Run outside the checkout: nothing from the pull request participates.
+        working-directory: ${{ runner.temp }}
         env:
           GOBIN: ${{ github.workspace }}/bin
         run: |
           set -euo pipefail
-          installed="$(go version -m bin/gitleaks 2>/dev/null | awk '$1 == "mod" { print $3 }' || true)"
+          installed="$(go version -m "$GITHUB_WORKSPACE/bin/gitleaks" 2>/dev/null | awk '$1 == "mod" { print $3 }' || true)"
           if [ "$installed" != "${GITLEAKS_VERSION}" ]; then
-            go install github.com/zricethezav/gitleaks/v8@${GITLEAKS_VERSION}
+            go install "github.com/zricethezav/gitleaks/v8@${GITLEAKS_VERSION}"
           fi
-          bin/gitleaks version
+          "$GITHUB_WORKSPACE/bin/gitleaks" version
 
       - name: Scan
         env:
@@ -87,6 +99,14 @@ jobs:
             echo "allowlist source: built-in defaults, no allowlist ($config_ref predates .gitleaks.toml)"
           fi
 
+          # gitleaks exits 0 with "0 commits scanned" when git cannot read the
+          # requested history, so traverse the range first and fail closed.
+          if ! git log -p -U0 "$log_opts" >/dev/null 2>&1; then
+            echo "cannot read the full history of '$log_opts' (missing objects or an unknown revision)" >&2
+            exit 1
+          fi
+
           bin/gitleaks git . --no-banner --redact \
             --config "$RUNNER_TEMP/gitleaks.toml" \
+            --gitleaks-ignore-path "$RUNNER_TEMP" \
             --log-opts="$log_opts"

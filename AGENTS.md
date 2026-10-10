@@ -110,11 +110,18 @@ detected secret. Never allowlist a real credential; rotate it and remove it from
 history instead.
 
 CI (`.github/workflows/gitleaks.yml`) scans a pull request's own commits
-(`<base-sha>..<head-sha>`). It pins its own scanner version and reads the allowlist
-from the pull request's merge base, so an allowlist entry only takes effect once it is
-merged — a PR cannot excuse the finding it is adding. Manual `workflow_dispatch` runs
-scan the full history of the selected ref. It runs as its own check; add the `gitleaks`
-context to the branch ruleset if it should block merges.
+(`<base-sha>..<head-sha>`). It is declared with `pull_request_target`, so the workflow
+definition comes from the default branch and cannot be weakened by the pull request it
+inspects; the PR is checked out only for its git objects and nothing from it is ever
+executed. The scanner version is pinned in the workflow and the allowlist is read from
+the merge base, so an allowlist entry only takes effect once it is merged. Bootstrap: the
+PR that first lands this file is not itself gated — every later PR is. Manual
+`workflow_dispatch` runs scan the full history of the selected ref. It runs as its own
+check; add the `gitleaks` context to the branch ruleset if it should block merges.
+
+`make gitleaks` fails closed: it traverses the range with git before scanning, so an
+unknown revision or a partial clone whose promisor remote is unreachable aborts instead of
+reporting "no leaks found". Regression: `make test-gitleaks-fail-closed`.
 
 ---
 
