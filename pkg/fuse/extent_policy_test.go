@@ -13,9 +13,26 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
+	jfsvfs "github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extent"
 )
+
+type fixedGetAttrMeta struct {
+	jfsmeta.Meta
+	wantIno jfsmeta.Ino
+	attr    jfsmeta.Attr
+	calls   atomic.Int32
+}
+
+func (m *fixedGetAttrMeta) GetAttr(_ jfsmeta.Context, ino jfsmeta.Ino, attr *jfsmeta.Attr) syscall.Errno {
+	if ino != m.wantIno {
+		return syscall.ENOENT
+	}
+	m.calls.Add(1)
+	*attr = m.attr
+	return 0
+}
 
 func TestExtentBindDirectoryProjectionUsesExactRemotePath(t *testing.T) {
 	for _, test := range []struct {
@@ -257,7 +274,7 @@ func TestApplyJuiceFSDirectoryMetadataRejectsNonDirectoryAttr(t *testing.T) {
 	}
 }
 
-func TestApplyCachedNativeOwnerModeUsesDirectoryMetadataOnly(t *testing.T) {
+func TestApplyCachedNativeMetadataUsesDirectoryMetadataOnly(t *testing.T) {
 	mtime := time.Unix(123, 456)
 	item := CachedFileInfo{
 		Name: "root", Size: 7, IsDir: true, Mtime: mtime,
@@ -268,7 +285,7 @@ func TestApplyCachedNativeOwnerModeUsesDirectoryMetadataOnly(t *testing.T) {
 		IsDir: true, Size: 4096, Mtime: time.Unix(999, 0),
 		Mode: 0700, HasMode: true, Uid: 0, Gid: 0, HasUID: true, HasGID: true,
 	}
-	applyCachedNativeOwnerMode(&item, entry)
+	applyCachedNativeMetadata(&item, entry)
 	if item.Mode != 0700 || !item.HasMode || item.Uid != 0 || item.Gid != 0 || !item.HasUID || !item.HasGID {
 		t.Fatalf("cached native metadata = mode=%o owner=%d:%d flags=%v/%v/%v", item.Mode, item.Uid, item.Gid, item.HasMode, item.HasUID, item.HasGID)
 	}
@@ -277,7 +294,7 @@ func TestApplyCachedNativeOwnerModeUsesDirectoryMetadataOnly(t *testing.T) {
 	}
 }
 
-func TestApplyCachedNativeOwnerModeUsesFileMetadataOnly(t *testing.T) {
+func TestApplyCachedNativeMetadataUsesFileMetadata(t *testing.T) {
 	mtime := time.Unix(123, 456)
 	item := CachedFileInfo{
 		Name: "drive9.conf", Size: 7, Mtime: mtime,
@@ -288,12 +305,78 @@ func TestApplyCachedNativeOwnerModeUsesFileMetadataOnly(t *testing.T) {
 		Size: 99, Mtime: time.Unix(999, 0),
 		Mode: 0640, HasMode: true, Uid: 1234, Gid: 2345, HasUID: true, HasGID: true,
 	}
-	applyCachedNativeOwnerMode(&item, entry)
+	applyCachedNativeMetadata(&item, entry)
 	if item.Mode != 0640 || !item.HasMode || item.Uid != 1234 || item.Gid != 2345 || !item.HasUID || !item.HasGID {
 		t.Fatalf("cached native metadata = mode=%o owner=%d:%d flags=%v/%v/%v", item.Mode, item.Uid, item.Gid, item.HasMode, item.HasUID, item.HasGID)
 	}
-	if item.Size != 7 || !item.Mtime.Equal(mtime) || item.ExtentIno != 42 {
-		t.Fatalf("file listing metadata changed: size=%d mtime=%s extent_ino=%d", item.Size, item.Mtime, item.ExtentIno)
+	if item.Size != 99 || !item.Mtime.Equal(entry.Mtime) || item.ExtentIno != 42 {
+		t.Fatalf("file native metadata = size=%d mtime=%s extent_ino=%d", item.Size, item.Mtime, item.ExtentIno)
+	}
+}
+
+func TestCachedToDirEntriesRefreshesColdExtentFileTimes(t *testing.T) {
+	listingMtime := time.Unix(1_700_000_000, 0)
+	nativeMtime := time.Unix(1_577_934_245, 123_456_789)
+	nativeAtime := time.Unix(1_577_934_200, 987_654_321)
+	nativeCtime := time.Unix(1_577_934_299, 456_789_123)
+	meta := &fixedGetAttrMeta{
+		wantIno: 42,
+		attr: jfsmeta.Attr{
+			Typ:       jfsmeta.TypeFile,
+			Mode:      0o640,
+			Uid:       1234,
+			Gid:       2345,
+			Length:    99,
+			Atime:     nativeAtime.Unix(),
+			Atimensec: uint32(nativeAtime.Nanosecond()),
+			Mtime:     nativeMtime.Unix(),
+			Mtimensec: uint32(nativeMtime.Nanosecond()),
+			Ctime:     nativeCtime.Unix(),
+			Ctimensec: uint32(nativeCtime.Nanosecond()),
+		},
+	}
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.extentRT.Store(&extentRuntime{rt: &extent.Runtime{VFS: &jfsvfs.VFS{Meta: meta}}})
+
+	entries := fs.cachedToDirEntries("/upper/etc", []CachedFileInfo{{
+		Name:       "drive9.conf",
+		Size:       7,
+		Mtime:      listingMtime,
+		Mode:       0o644,
+		HasMode:    true,
+		ResourceID: "resource-1",
+		Nlink:      1,
+		ExtentIno:  42,
+	}})
+	if len(entries) != 1 {
+		t.Fatalf("entries = %+v, want one extent file", entries)
+	}
+	if got := meta.calls.Load(); got != 1 {
+		t.Fatalf("native GetAttr calls = %d, want 1 before cold ReaddirPlus", got)
+	}
+	entry, ok := fs.inodes.GetEntry(entries[0].Ino)
+	if !ok {
+		t.Fatal("missing cold extent inode")
+	}
+	if entry.Size != 99 || entry.Mode&posixPermissionModeMask != 0o640 || entry.Uid != 1234 || entry.Gid != 2345 {
+		t.Fatalf("cold native metadata = size=%d mode=%o owner=%d:%d", entry.Size, entry.Mode, entry.Uid, entry.Gid)
+	}
+	if !entry.Mtime.Equal(nativeMtime) || !entry.Atime.Equal(nativeAtime) || !entry.Ctime.Equal(nativeCtime) {
+		t.Fatalf("cold native times = mtime=%s atime=%s ctime=%s", entry.Mtime, entry.Atime, entry.Ctime)
+	}
+	if !entries[0].Mtime.Equal(nativeMtime) || entries[0].Size != 99 {
+		t.Fatalf("directory snapshot = size=%d mtime=%s, want native size/time", entries[0].Size, entries[0].Mtime)
+	}
+
+	var out gofuse.EntryOut
+	fs.fillAttr(entry, &out.Attr)
+	if got := time.Unix(int64(out.Mtime), int64(out.Mtimensec)); !got.Equal(nativeMtime) {
+		t.Fatalf("ReaddirPlus mtime = %s, want %s", got, nativeMtime)
+	}
+	if got := time.Unix(int64(out.Atime), int64(out.Atimensec)); !got.Equal(nativeAtime) {
+		t.Fatalf("ReaddirPlus atime = %s, want %s", got, nativeAtime)
 	}
 }
 
@@ -592,7 +675,7 @@ func TestDirectorySetAttrBindingFailurePreventsNativeMutation(t *testing.T) {
 	}
 }
 
-func TestApplyCachedNativeOwnerModeRejectsMismatchedKinds(t *testing.T) {
+func TestApplyCachedNativeMetadataRejectsMismatchedKinds(t *testing.T) {
 	for _, test := range []struct {
 		name  string
 		item  CachedFileInfo
@@ -603,7 +686,7 @@ func TestApplyCachedNativeOwnerModeRejectsMismatchedKinds(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			before := test.item
-			applyCachedNativeOwnerMode(&test.item, &test.entry)
+			applyCachedNativeMetadata(&test.item, &test.entry)
 			if test.item != before {
 				t.Fatalf("mismatched kinds changed cached metadata: got %+v want %+v", test.item, before)
 			}

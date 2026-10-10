@@ -31,7 +31,7 @@ RUN_MOUNTED=0
 
 assert_native_upper_metadata() {
   local stage="${1:-unknown-stage}"
-  local file_mode file_owner dir_mode dir_owner root_mode root_owner
+  local file_mode file_owner file_atime file_mtime dir_mode dir_owner root_mode root_owner
   # Force the directory-entry path before the explicit stats. ReaddirPlus may
   # satisfy a later stat from its EntryOut without issuing Lookup/GetAttr, so
   # it must carry the same native metadata as those paths.
@@ -45,6 +45,8 @@ for root, dirs, files in os.walk(sys.argv[1]):
 PY
   file_mode="$(sudo stat -c '%a' "$FUSE_ROOT/upper/etc/drive9.conf")"
   file_owner="$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/workspace/persist.txt")"
+  file_atime="$(sudo stat -c '%X' "$FUSE_ROOT/upper/etc/drive9.conf")"
+  file_mtime="$(sudo stat -c '%Y' "$FUSE_ROOT/upper/etc/drive9.conf")"
   dir_mode="$(sudo stat -c '%a' "$FUSE_ROOT/upper/home/agent")"
   dir_owner="$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/home/agent")"
   root_mode="$(sudo stat -c '%a' "$FUSE_ROOT/upper/root")"
@@ -53,6 +55,10 @@ PY
     || fail "${stage} raw upper existing-file mode is ${file_mode}, want 640"
   [ "$file_owner" = 1234:2345 ] \
     || fail "${stage} raw upper file ownership is ${file_owner}, want 1234:2345"
+  [ "$file_atime" = 1577836798 ] \
+    || fail "${stage} raw upper file atime is ${file_atime}, want 1577836798"
+  [ "$file_mtime" = 1577934245 ] \
+    || fail "${stage} raw upper file mtime is ${file_mtime}, want 1577934245"
   [ "$dir_mode" = 750 ] \
     || fail "${stage} raw upper directory mode is ${dir_mode}, want 750"
   [ "$dir_owner" = 3456:4567 ] \
@@ -396,7 +402,14 @@ sudo chmod 0750 "$MERGED/home/agent"
 sudo chown 3456:4567 "$MERGED/home/agent"
 sudo ln -s ../etc/drive9.conf "$MERGED/root/config-link"
 sudo ln "$MERGED/workspace/persist.txt" "$MERGED/workspace/persist-hardlink.txt"
-sudo touch -t 202001020304.05 "$MERGED/etc/drive9.conf"
+# Use distinct, timezone-independent atime/mtime values. Both must survive the
+# Drive9 remount before content is read; later reads may legitimately advance
+# atime under the mount's access-time policy, while mtime must remain stable.
+sudo python3 - "$MERGED/etc/drive9.conf" <<'PY'
+import os
+import sys
+os.utime(sys.argv[1], ns=(1577836798123456789, 1577934245987654321))
+PY
 sudo dd if=/dev/zero of="$MERGED/workspace/large.bin" bs=1M count=4 status=none
 sudo mv "$MERGED/workspace/persist-hardlink.txt" "$MERGED/workspace/renamed-hardlink.txt"
 sudo sh -c "printf transient-tmp >'$MERGED/tmp/not-persistent'"
@@ -458,7 +471,7 @@ sudo chroot "$MERGED" /bin/sh -c 'test -x /bin/sh && printf lower-image-ok' \
   || fail "hardlink identity did not persist"
 [ "$(stat -c '%h' "$MERGED/workspace/persist.txt")" = 2 ] \
   || fail "hardlink count did not persist"
-[ "$(stat -c '%y' "$MERGED/etc/drive9.conf" | cut -d. -f1)" = '2020-01-02 03:04:05' ] \
+[ "$(stat -c '%Y' "$MERGED/etc/drive9.conf")" = 1577934245 ] \
   || fail "mtime did not persist"
 [ "$(stat -c '%s' "$MERGED/workspace/large.bin")" = 4194304 ] || fail "large file did not persist"
 [ ! -e "$MERGED/tmp/not-persistent" ] || fail "/tmp unexpectedly persisted"

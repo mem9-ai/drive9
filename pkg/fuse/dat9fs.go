@@ -11740,11 +11740,11 @@ func dirEntryFromCachedInfo(item CachedFileInfo, ino uint64) DirEntry {
 	}
 }
 
-// applyCachedNativeOwnerMode updates the readdir result with the native owner
-// and mode loaded from its exact jfs_node. Other listing facts stay unchanged:
-// directories keep their namespace size/link/time, while the existing extent
-// size carry-over below retains the file path's established ordering.
-func applyCachedNativeOwnerMode(item *CachedFileInfo, entry *InodeEntry) {
+// applyCachedNativeMetadata updates the readdir result with metadata loaded
+// from its exact jfs_node. Directories mirror only owner/mode; extent files
+// also take native size/mtime because their projection row is not authoritative
+// for content metadata.
+func applyCachedNativeMetadata(item *CachedFileInfo, entry *InodeEntry) {
 	if item == nil || entry == nil || item.IsDir != entry.IsDir {
 		return
 	}
@@ -11759,6 +11759,12 @@ func applyCachedNativeOwnerMode(item *CachedFileInfo, entry *InodeEntry) {
 	if entry.HasGID {
 		item.Gid = entry.Gid
 		item.HasGID = true
+	}
+	if !item.IsDir {
+		item.Size = entry.Size
+		if !entry.Mtime.IsZero() {
+			item.Mtime = entry.Mtime
+		}
 	}
 }
 
@@ -12243,8 +12249,13 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 			mtime = time.Now()
 		}
 		prevSize := int64(0)
-		refreshNativeMetadata := item.IsDir && item.ExtentIno != 0
-		if existing, ok := fs.inodes.GetInode(childP); ok {
+		existing, hadInode := fs.inodes.GetInode(childP)
+		// A fresh mount has no live inode metadata to compare against the
+		// projection listing. Refresh an extent file once before ReaddirPlus can
+		// seed the kernel with projection mtime/atime. Later listings keep the
+		// existing disagreement-triggered path and avoid an RPC per entry.
+		refreshNativeMetadata := item.ExtentIno != 0 && (item.IsDir || !hadInode)
+		if hadInode {
 			if e, ok := fs.inodes.GetEntry(existing); ok {
 				// Two carry-overs with different evidence requirements.
 				//
@@ -12302,12 +12313,12 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		}
 		// ReaddirPlus can satisfy the kernel's following stat directly from its
 		// EntryOut, without a later Lookup/GetAttr. A mirrored directory always
-		// needs native mode/owner. An extent file needs the same refresh only
-		// when a same-object listing disagrees with the live inode cache, which
-		// avoids an extra meta lookup per unchanged directory entry.
+		// needs native mode/owner. A cold extent file must load all native attrs;
+		// an existing one refreshes only when the same-object listing disagrees
+		// with its live metadata.
 		if refreshNativeMetadata && fs.extentRefreshFromVFS(ino, childP, 0) {
 			if refreshed, ok := fs.inodes.GetEntry(ino); ok {
-				applyCachedNativeOwnerMode(&item, refreshed)
+				applyCachedNativeMetadata(&item, refreshed)
 			}
 		}
 		if !item.IsDir && prevSize > item.Size {
