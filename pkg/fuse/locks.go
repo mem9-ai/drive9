@@ -28,41 +28,6 @@ func newFuseLockTable() *fuseLockTable {
 	}
 }
 
-func (fs *Dat9FS) GetLk(cancel <-chan struct{}, input *gofuse.LkIn, out *gofuse.LkOut) (code gofuse.Status) {
-	if fh, ok := fs.fileHandles.Get(input.Fh); ok && fh.isExtent() {
-		return fs.extentGetLk(cancel, input, out)
-	}
-	owner := fuseLockOwner(input.Owner, input.Pid, input.Fh)
-	if lock, ok := fs.locks.conflict(input.NodeId, owner, input.Lk); ok {
-		out.Lk = gofuse.FileLock{
-			Start: lock.start,
-			End:   lock.end,
-			Typ:   lock.typ,
-			Pid:   lock.pid,
-		}
-		return gofuse.OK
-	}
-	out.Lk = input.Lk
-	out.Lk.Typ = uint32(syscall.F_UNLCK)
-	return gofuse.OK
-}
-
-func (fs *Dat9FS) SetLk(cancel <-chan struct{}, input *gofuse.LkIn) (code gofuse.Status) {
-	if fh, ok := fs.fileHandles.Get(input.Fh); ok && fh.isExtent() {
-		return fs.extentSetLk(cancel, input, false)
-	}
-	owner := fuseLockOwner(input.Owner, input.Pid, input.Fh)
-	return fs.locks.set(cancel, input.NodeId, owner, input.Pid, input.Lk, false)
-}
-
-func (fs *Dat9FS) SetLkw(cancel <-chan struct{}, input *gofuse.LkIn) (code gofuse.Status) {
-	if fh, ok := fs.fileHandles.Get(input.Fh); ok && fh.isExtent() {
-		return fs.extentSetLk(cancel, input, true)
-	}
-	owner := fuseLockOwner(input.Owner, input.Pid, input.Fh)
-	return fs.locks.set(cancel, input.NodeId, owner, input.Pid, input.Lk, true)
-}
-
 func fuseLockOwner(owner uint64, pid uint32, fh uint64) uint64 {
 	if owner != 0 {
 		return owner
@@ -185,4 +150,15 @@ func (t *fuseLockTable) notifyLocked() {
 
 func rangesOverlap(aStart uint64, aEnd uint64, bStart uint64, bEnd uint64) bool {
 	return aStart <= bEnd && bStart <= aEnd
+}
+
+// count reports the number of held locks across all inodes.
+func (t *fuseLockTable) count() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := 0
+	for _, locks := range t.locks {
+		n += len(locks)
+	}
+	return n
 }

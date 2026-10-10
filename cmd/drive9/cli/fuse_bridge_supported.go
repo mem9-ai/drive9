@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	drive9fuse "github.com/mem9-ai/drive9/pkg/fuse"
+	"github.com/mem9-ai/drive9/pkg/vaultfs"
 )
 
 func mountFuseImpl(opts *mountFuseOptions) error {
@@ -80,6 +81,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		Debug:                         opts.Debug,
 		PerfCounters:                  opts.PerfCounters,
 		EnableGitWorkspaces:           opts.LocalRoot != "",
+		Extensions:                    opts.Extensions,
 		Profiling: drive9fuse.ProfilingOptions{
 			CPUProfileDuration:  opts.ProfileCPUDuration,
 			CPUProfileInterval:  opts.ProfileCPUInterval,
@@ -100,7 +102,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 }
 
 func mountVaultImpl(opts *vaultMountOptions) error {
-	return drive9fuse.MountVault(&drive9fuse.VaultMountOptions{
+	return vaultfs.MountVault(&vaultfs.VaultMountOptions{
 		Server:     opts.Server,
 		APIKey:     opts.APIKey,
 		Token:      opts.Token,

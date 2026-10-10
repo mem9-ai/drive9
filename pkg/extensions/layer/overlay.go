@@ -1,0 +1,135 @@
+// The in-memory overlay: whiteouts, file modes, dirs, and symlinks, plus
+// the lookup that resolves a path against it.
+package layer
+
+import (
+	"strings"
+	"syscall"
+)
+
+// markLayerWhiteout / markLayerFileMode / markLayerDir / markLayerSymlink
+// mutate the overlay, including the abandoned guard: a racing write that
+// completed on the server just before a rollback cleared the overlay must
+// not re-populate it.
+func (l *Layer) markLayerWhiteout(p string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.abandoned {
+		return
+	}
+	l.whiteouts[p] = struct{}{}
+	delete(l.files, p)
+	delete(l.dirs, p)
+	delete(l.symlinks, p)
+	delete(l.contents, p)
+}
+
+func (l *Layer) markLayerFileMode(p string, mode uint32) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.abandoned {
+		return
+	}
+	l.files[p] = mode & 0o777
+	delete(l.whiteouts, p)
+	delete(l.dirs, p)
+	delete(l.symlinks, p)
+}
+
+func (l *Layer) markLayerDir(p string, mode uint32) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.abandoned {
+		return
+	}
+	l.dirs[p] = mode & 0o777
+	delete(l.whiteouts, p)
+	delete(l.files, p)
+	delete(l.symlinks, p)
+	delete(l.contents, p)
+}
+
+func (l *Layer) markLayerSymlink(p, target string, mode uint32) {
+	if mode == 0 {
+		mode = uint32(syscall.S_IFLNK) | 0o777
+	} else if mode&uint32(syscall.S_IFMT) == 0 {
+		mode = uint32(syscall.S_IFLNK) | (mode & 0o777)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.abandoned {
+		return
+	}
+	l.symlinks[p] = symlinkState{Target: target, Mode: mode}
+	delete(l.whiteouts, p)
+	delete(l.files, p)
+	delete(l.dirs, p)
+	delete(l.contents, p)
+}
+
+// lookup resolves a path against the overlay; ok reports an overlay hit.
+func (l *Layer) lookup(p string) (kind string, mode uint32, target string, content []byte, ok bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if _, hit := l.whiteouts[p]; hit {
+		return "whiteout", 0, "", nil, true
+	}
+	if m, hit := l.dirs[p]; hit {
+		return "dir", m, "", nil, true
+	}
+	if st, hit := l.symlinks[p]; hit {
+		return "symlink", st.Mode, st.Target, nil, true
+	}
+	if m, hit := l.files[p]; hit {
+		c := l.contents[p]
+		return "file", m, "", append([]byte(nil), c...), true
+	}
+	return "", 0, "", nil, false
+}
+
+// impliedDir reports whether any overlay entry lives strictly below p:
+// namespace-only directories exist because a deeper entry exists.
+func (l *Layer) impliedDir(p string) bool {
+	prefix := strings.TrimRight(p, "/") + "/"
+	if prefix == "" {
+		return false
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	under := func(m map[string]struct{}) bool {
+		for path := range m {
+			if strings.HasPrefix(path, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	if under(l.whiteouts) {
+		return true
+	}
+	for path := range l.dirs {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	for path := range l.symlinks {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	for path := range l.files {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// LookupContentForTest returns the live overlay content of a path.
+func (l *Layer) LookupContentForTest(p string) ([]byte, bool) {
+	kind, _, _, content, ok := l.lookup(p)
+	if !ok || kind != "file" {
+		return nil, false
+	}
+	return content, true
+}
