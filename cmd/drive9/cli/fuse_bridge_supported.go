@@ -102,7 +102,6 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		// Supervised workers do not own the global pidfile; the supervisor does.
 		SkipProcessState:            opts.Supervised,
 		OmitProcessStateCredentials: opts.OmitProcessStateCredentials,
-		RequireExtentXattrV1:        opts.RequireExtentXattrV1,
 	})
 }
 

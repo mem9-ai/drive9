@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,8 +37,6 @@ const (
 	defaultMountPerfCPUDuration          = 30 * time.Second
 	defaultMountPerfCPUInterval          = 10 * time.Minute
 	defaultMountPerfHeapInterval         = 10 * time.Minute
-	requiredExtentXattrProbeAttempts     = 3
-	requiredExtentXattrProbeTimeout      = 5 * time.Second
 	envMountGVisorCompat                 = "DRIVE9_MOUNT_GVISOR_COMPAT"
 	envMountLegacyInterruptibleMutations = "DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS"
 	// legacyInterruptibleMutationsFlagHelp is the user-facing contract for
@@ -81,7 +78,6 @@ var startMountBackground = startMountBackgroundImpl
 var startMountSupervisedBackground = startMountSupervisedBackgroundImpl
 var runSuperviseForeground = runSuperviseForegroundImpl
 var mountProfileAppendLogSupported = probeMountProfileAppendLogSupport
-var mountExtentXattrSupported = probeMountExtentXattrSupport
 
 // MountCmd handles the "drive9 mount" command.
 //
@@ -111,8 +107,6 @@ func MountCmd(args []string) error {
 			return vaultMountCmd(args[1:], true)
 		case "drain":
 			return MountDrainCmd(args[1:])
-		case "capabilities":
-			return mountCapabilitiesCmd(args[1:])
 		case "status":
 			return runMountStatus(args[1:])
 		case "health":
@@ -216,7 +210,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	layerRef := fs.String("layer", "", "mount through writable fs layer (layer id, name, or tag ref)")
 	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
 	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
-	requireExtentXattrV1 := fs.Bool("require-extent-xattr-v1", false, "fail closed unless both this client and the server support the exact persistent extent xattr v1 protocol")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
 	var localOnlyPatterns stringListFlag
 	var localGitignoreAwarePatterns stringListFlag
@@ -327,9 +320,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	effectiveExtentPatterns := explicitExtentPatterns
 
 	if objectLoc != nil {
-		if *requireExtentXattrV1 {
-			return fmt.Errorf("drive9 mount: --require-extent-xattr-v1 is only supported with Drive9 FUSE extent mounts")
-		}
 		if *noPersistCredentials {
 			return fmt.Errorf("drive9 mount: --no-persist-credentials is only supported with Drive9 FUSE mounts")
 		}
@@ -702,17 +692,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveLocalGitignoreAwarePatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
 		return err
 	}
-	if *requireExtentXattrV1 {
-		if resolved != MountModeFUSE || profileCfg.Name != extentMountProfile {
-			return fmt.Errorf("drive9 mount: --require-extent-xattr-v1 requires --mode=fuse --profile=extent")
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), requiredExtentXattrProbeTimeout)
-		capabilityErr := mountExtentXattrSupported(ctx, serverVal, apiKeyVal, tokenVal)
-		cancel()
-		if capabilityErr != nil {
-			return fmt.Errorf("drive9 mount: required server capability %s is unavailable: %w", client.ExtentXattrProtocolV1, capabilityErr)
-		}
-	}
 	if resolved == MountModeFUSE && runtime.GOOS != "windows" && len(profileCfg.AppendLogPatterns) > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		supported := mountProfileAppendLogSupported(ctx, serverVal, apiKeyVal, tokenVal)
@@ -746,7 +725,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			GVisorCompat:                 *gvisorCompat,
 			LegacyInterruptibleMutations: *legacyInterruptibleMutations,
 			OmitProcessStateCredentials:  *noPersistCredentials,
-			RequireExtentXattrV1:         *requireExtentXattrV1,
 		})
 	}
 
@@ -884,7 +862,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			Debug:                        *debug,
 			GVisorCompat:                 *gvisorCompat,
 			LegacyInterruptibleMutations: *legacyInterruptibleMutations,
-			RequireExtentXattrV1:         *requireExtentXattrV1,
 		})
 	}
 
@@ -959,7 +936,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		PerfMaxProfileFiles:          *perfMaxProfileFiles,
 		Supervised:                   *supervised,
 		OmitProcessStateCredentials:  *noPersistCredentials,
-		RequireExtentXattrV1:         *requireExtentXattrV1,
 	}
 
 	return mountFuse(opts)
@@ -1174,74 +1150,6 @@ func probeMountProfileAppendLogSupport(ctx context.Context, server, apiKey, toke
 	}
 	c.Warm(ctx)
 	return c.CachedAppendLogSupported()
-}
-
-func probeMountExtentXattrSupport(ctx context.Context, server, apiKey, token string) error {
-	var c *client.Client
-	if token != "" {
-		c = client.NewWithToken(server, token)
-	} else {
-		c = client.New(server, apiKey)
-	}
-	for attempt := 1; attempt <= requiredExtentXattrProbeAttempts; attempt++ {
-		err := c.RequireExtentXattrV1(ctx)
-		if err == nil {
-			return nil
-		}
-		failureClass, retryable := extentXattrProbeFailureClass(ctx, err)
-		if !retryable {
-			return err
-		}
-		if attempt == requiredExtentXattrProbeAttempts {
-			return fmt.Errorf("required capability probe exhausted after %d attempts: %w", attempt, err)
-		}
-		_, _ = fmt.Fprintf(os.Stderr,
-			"drive9: required capability probe retry next_attempt=%d/%d class=%s\n",
-			attempt+1, requiredExtentXattrProbeAttempts, failureClass)
-		timer := time.NewTimer(extentXattrProbeRetryDelay(attempt))
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return fmt.Errorf("required capability probe stopped after %d attempts: %w", attempt, ctx.Err())
-		case <-timer.C:
-		}
-	}
-	return errors.New("required capability probe failed")
-}
-
-func extentXattrProbeRetryDelay(failedAttempt int) time.Duration {
-	if failedAttempt == 1 {
-		return 200 * time.Millisecond
-	}
-	return 500 * time.Millisecond
-}
-
-func extentXattrProbeFailureClass(ctx context.Context, err error) (string, bool) {
-	if ctx.Err() != nil {
-		return "", false
-	}
-	var statusErr *client.StatusError
-	if errors.As(err, &statusErr) {
-		if statusErr.StatusCode >= http.StatusInternalServerError && statusErr.StatusCode <= 599 {
-			return "http_5xx", true
-		}
-		return "", false
-	}
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		return "transport", true
-	}
-	return "", false
-}
-
-func mountCapabilitiesCmd(args []string) error {
-	if len(args) != 0 {
-		return fmt.Errorf("usage: drive9 mount capabilities")
-	}
-	_, err := fmt.Fprintln(os.Stdout, client.ExtentXattrProtocolV1)
-	return err
 }
 
 // applyScrubbedMountEnv unsets mount credential env vars then applies scrubbed.

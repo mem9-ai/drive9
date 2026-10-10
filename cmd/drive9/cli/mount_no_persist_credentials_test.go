@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -49,32 +48,6 @@ func TestMountNoPersistCredentialsRejectsSupervisor(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "requires --foreground or --no-supervise") {
 		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestMountNoPersistCredentialsRedactsCapabilityPreflightError(t *testing.T) {
-	resetCredentialCacheForTest()
-	t.Cleanup(resetCredentialCacheForTest)
-	server := "https://preview.example.test/?token=preview-secret"
-	apiKey := "drive9-owner-secret"
-	oldProbe := mountExtentXattrSupported
-	t.Cleanup(func() { mountExtentXattrSupported = oldProbe })
-	mountExtentXattrSupported = func(context.Context, string, string, string) error {
-		return fmt.Errorf("GET %s failed with %s", server, apiKey)
-	}
-
-	err := fsMountCmd([]string{
-		"--mode=fuse", "--server=" + server, "--api-key=" + apiKey,
-		"--profile=extent", "--require-extent-xattr-v1", "--no-persist-credentials", t.TempDir(),
-	})
-	if err == nil {
-		t.Fatal("expected capability preflight error")
-	}
-	if strings.Contains(err.Error(), server) || strings.Contains(err.Error(), apiKey) {
-		t.Fatalf("capability preflight error leaked credentials: %q", err)
-	}
-	if !strings.Contains(err.Error(), "GET <redacted> failed with <redacted>") {
-		t.Fatalf("capability preflight error = %q", err)
 	}
 }
 

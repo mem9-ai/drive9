@@ -21,18 +21,7 @@ func (fs *Dat9FS) extentStatIno(ctx context.Context, p string) (uint64, bool) {
 	if err != nil || stat == nil {
 		return 0, false
 	}
-	return projectedExtentIno(stat)
-}
-
-func projectedExtentIno(stat *client.StatResult) (uint64, bool) {
-	if stat == nil || stat.ExtentIno == 0 {
-		return 0, false
-	}
-	// Extent files are identified by their content layout. Directories have
-	// no content layout, but a non-zero extent inode is still authoritative:
-	// it is the durable JuiceFS directory mirror used for namespace mutations
-	// and inode-scoped xattrs after a fresh mount.
-	if stat.IsDir || stat.ContentLayout == client.ContentLayoutExtent {
+	if stat.ContentLayout == client.ContentLayoutExtent && stat.ExtentIno != 0 {
 		return stat.ExtentIno, true
 	}
 	return 0, false

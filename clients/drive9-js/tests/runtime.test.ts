@@ -138,14 +138,13 @@ describe("runtime exec", () => {
         persistence: "full_root",
         rootfs: {
           driver: "user-union",
-          capability_version: "drive9_rootfs.user_union.extent.v5",
+          capability_version: "drive9_rootfs.user_union.extent.v6",
           config_hash: "a".repeat(64),
           lower_image_digest: `sha256:${"b".repeat(64)}`,
         },
         capabilities: {
           "workspace_persistence": true,
           "full_root_persistence": true,
-          "drive9.extent_xattr.v1": true,
         },
         production_eligible: true,
         bounded_selection_eligible: true,
@@ -187,7 +186,6 @@ describe("runtime exec", () => {
         capabilities: {
           "workspace_persistence": true,
           "full_root_persistence": true,
-          "drive9.extent_xattr.v1": true,
         },
         production_eligible: true,
         bounded_selection_eligible: true,

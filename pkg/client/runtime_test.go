@@ -281,11 +281,11 @@ func TestRuntimeCapabilitiesAcceptsProviderAwareCandidates(t *testing.T) {
 			Candidates: []RuntimeCandidateCapability{{
 				Profile: "default", ExecutionClass: "linux-full", Persistence: RuntimePersistenceFullRoot,
 				RootFS: RuntimeRootFSIdentity{
-					Driver: runtimeRootFSUserUnion, CapabilityVersion: runtimeRootFSCapabilityV5,
+					Driver: runtimeRootFSUserUnion, CapabilityVersion: runtimeRootFSCapabilityV6,
 					ConfigHash: strings.Repeat("a", 64), LowerImageDigest: "sha256:" + strings.Repeat("b", 64),
 				},
 				Capabilities: map[string]bool{
-					RuntimeCapabilityWorkspace: true, RuntimeCapabilityFullRoot: true, ExtentXattrProtocolV1: true,
+					RuntimeCapabilityWorkspace: true, RuntimeCapabilityFullRoot: true,
 				},
 				ProductionEligible: true, BoundedSelectionEligible: true,
 			}, {
@@ -311,12 +311,7 @@ func TestRuntimeCapabilitiesAcceptsProviderAwareCandidates(t *testing.T) {
 	if err := validateRuntimeCapabilities(capabilities); err == nil {
 		t.Fatal("v3 rootfs candidate error = nil")
 	}
-	capabilities.Providers[0].Candidates[0].RootFS.CapabilityVersion = runtimeRootFSCapabilityV5
-	delete(capabilities.Providers[0].Candidates[0].Capabilities, ExtentXattrProtocolV1)
-	if err := validateRuntimeCapabilities(capabilities); err == nil {
-		t.Fatal("candidate without negotiated extent xattr capability error = nil")
-	}
-	capabilities.Providers[0].Candidates[0].Capabilities[ExtentXattrProtocolV1] = true
+	capabilities.Providers[0].Candidates[0].RootFS.CapabilityVersion = runtimeRootFSCapabilityV6
 	capabilities.Providers[0].Candidates[0].Profile = "missing"
 	if err := validateRuntimeCapabilities(capabilities); err == nil {
 		t.Fatal("candidate outside provider profiles error = nil")

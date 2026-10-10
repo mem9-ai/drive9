@@ -351,12 +351,7 @@ type TenantStatusResponse struct {
 	// use it to choose simple PUT vs V2 multipart upload so they stay
 	// consistent with server-side IsLargeFile gating. Omitted (zero) by old
 	// servers; clients fall back to their compiled-in default.
-	InlineThreshold     int64               `json:"inline_threshold,omitempty"`
-	StorageCapabilities StorageCapabilities `json:"storage_capabilities,omitempty"`
-}
-
-type StorageCapabilities struct {
-	ExtentXattrV1 bool `json:"extent_xattr_v1,omitempty"`
+	InlineThreshold int64 `json:"inline_threshold,omitempty"`
 }
 
 const (
@@ -2028,9 +2023,6 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		Message:         s.tenantStatusMessage(&resolved.Tenant),
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
-		StorageCapabilities: StorageCapabilities{
-			ExtentXattrV1: resolved.Tenant.Status == meta.TenantActive,
-		},
 	})
 }
 
@@ -2097,9 +2089,6 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 		Kind:            "live",
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
-		StorageCapabilities: StorageCapabilities{
-			ExtentXattrV1: true,
-		},
 	})
 }
 
@@ -3461,8 +3450,6 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	if nf.ContentLayout != "" {
 		w.Header().Set("X-Dat9-Content-Layout", string(nf.ContentLayout))
 	}
-	// A mirrored directory has no file content layout, but its extent inode is
-	// still the durable identity for namespace operations and inode xattrs.
 	if nf.ExtentIno != 0 {
 		w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(nf.ExtentIno, 10))
 	}

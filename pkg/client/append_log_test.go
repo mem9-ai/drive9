@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
@@ -49,86 +48,6 @@ func TestCachedAppendLogSupportedWarmFailure(t *testing.T) {
 	c.Warm(context.Background())
 	if c.CachedAppendLogSupported() {
 		t.Fatal("append-log support true after failed warm")
-	}
-}
-
-func TestCachedExtentXattrSupportedFailsClosed(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		body   string
-		status int
-		want   bool
-	}{
-		{name: "supported", body: `{"storage_capabilities":{"extent_xattr_v1":true}}`, status: http.StatusOK, want: true},
-		{name: "false", body: `{"storage_capabilities":{"extent_xattr_v1":false}}`, status: http.StatusOK},
-		{name: "old-server", body: `{"storage_capabilities":{}}`, status: http.StatusOK},
-		{name: "missing", body: `{}`, status: http.StatusOK},
-		{name: "malformed", body: `{"storage_capabilities":{"extent_xattr_v1":"v1"}}`, status: http.StatusOK},
-		{name: "unavailable", body: `{"storage_capabilities":{"extent_xattr_v1":true}}`, status: http.StatusServiceUnavailable},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(tc.status)
-				_, _ = io.WriteString(w, tc.body)
-			}))
-			t.Cleanup(srv.Close)
-			c := New(srv.URL, "")
-			if c.CachedExtentXattrSupported() {
-				t.Fatal("extent xattr support true before warm")
-			}
-			c.Warm(context.Background())
-			if got := c.CachedExtentXattrSupported(); got != tc.want {
-				t.Fatalf("extent xattr support=%t, want %t", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestRequireExtentXattrV1PreservesFailureCause(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		body        string
-		status      int
-		wantError   string
-		unsupported bool
-	}{
-		{name: "supported", body: `{"storage_capabilities":{"extent_xattr_v1":true}}`, status: http.StatusOK},
-		{name: "missing", body: `{"storage_capabilities":{}}`, status: http.StatusOK, wantError: "did not advertise drive9.extent_xattr.v1", unsupported: true},
-		{name: "malformed", body: `{"storage_capabilities":{"extent_xattr_v1":"v1"}}`, status: http.StatusOK, wantError: "decode tenant status"},
-		{name: "bad-request", body: `invalid request`, status: http.StatusBadRequest, wantError: "HTTP 400: invalid request"},
-		{name: "status", body: `upstream unavailable`, status: http.StatusServiceUnavailable, wantError: "HTTP 503: upstream unavailable"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			calls := 0
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				calls++
-				if r.URL.Path != "/v1/status" || r.Header.Get("Authorization") != "Bearer sk-test" {
-					t.Fatalf("unexpected status request: %s auth=%q", r.URL.Path, r.Header.Get("Authorization"))
-				}
-				w.WriteHeader(tc.status)
-				_, _ = io.WriteString(w, tc.body)
-			}))
-			t.Cleanup(srv.Close)
-			err := New(srv.URL, "sk-test").RequireExtentXattrV1(t.Context())
-			if tc.wantError == "" {
-				if err != nil {
-					t.Fatal(err)
-				}
-				if calls != 1 {
-					t.Fatalf("status calls = %d, want 1", calls)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
-				t.Fatalf("error = %v, want %q", err, tc.wantError)
-			}
-			if got := errors.Is(err, ErrExtentXattrUnsupported); got != tc.unsupported {
-				t.Fatalf("unsupported = %t, want %t (err=%v)", got, tc.unsupported, err)
-			}
-			if calls != 1 {
-				t.Fatalf("status calls = %d, want 1", calls)
-			}
-		})
 	}
 }
 

@@ -43,13 +43,13 @@ wait_for_tenant() {
   done
 }
 
-require_v5() {
+require_v6() {
   curl -fsS --max-time 20 -H "Authorization: Bearer ${API_KEY}" \
     "${BASE}/v1/runtime/capabilities" | jq -e \
       'any(.providers[].candidates[];
         .persistence == "full_root"
-        and .rootfs.capability_version == "drive9_rootfs.user_union.extent.v5")' \
-      >/dev/null || fail "Runtime does not advertise full-root capability v5"
+        and .rootfs.capability_version == "drive9_rootfs.user_union.extent.v6")' \
+      >/dev/null || fail "Runtime does not advertise full-root capability v6"
 }
 
 [ -x "$CLI_BIN" ] || fail "DRIVE9_CLI_BIN is not executable"
@@ -65,7 +65,7 @@ if [ "$PHASE" = seed ]; then
   printf '%s' "$API_KEY" >"$STATE_FILE"
   chmod 0600 "$STATE_FILE"
   wait_for_tenant
-  require_v5
+  require_v6
   curl -fsS --max-time 20 -X POST -H "Authorization: Bearer ${API_KEY}" \
     "${BASE}/v1/fs/${ROOT#/}?mkdir" >/dev/null || fail "workspace root creation failed"
 
@@ -87,7 +87,7 @@ fi
 API_KEY="$(cat "$STATE_FILE")"
 [ -n "$API_KEY" ] || fail "seed state file is empty"
 wait_for_tenant
-require_v5
+require_v6
 
 DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" exec \
   --workspace "$ROOT" --timeout 30s -- \

@@ -60,12 +60,6 @@ func ExtentTiDBSchemaStatements() []string {
 			inode  BIGINT UNSIGNED NOT NULL PRIMARY KEY,
 			target VARBINARY(4096) NOT NULL
 		)`,
-		`CREATE TABLE IF NOT EXISTS jfs_xattr (
-			inode BIGINT UNSIGNED NOT NULL,
-			name  VARBINARY(255) NOT NULL,
-			value MEDIUMBLOB NOT NULL,
-			PRIMARY KEY (inode, name)
-		)`,
 		`CREATE TABLE IF NOT EXISTS jfs_chunk (
 			id     BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			inode  BIGINT UNSIGNED NOT NULL,
@@ -212,12 +206,6 @@ func ExtentDB9SchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS jfs_symlink (
 			inode  BIGINT NOT NULL PRIMARY KEY,
 			target BYTEA NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS jfs_xattr (
-			inode BIGINT NOT NULL,
-			name  VARCHAR(255) NOT NULL,
-			value BYTEA NOT NULL,
-			PRIMARY KEY (inode, name)
 		)`,
 		`CREATE TABLE IF NOT EXISTS jfs_chunk (
 			id     BIGSERIAL PRIMARY KEY,

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Prove whether a real Drive9 FUSE mount can serve as the durable upper/work
 # filesystem for a Linux overlay root. This is deliberately a remount test:
-# an overlay that works only while FUSE keeps whiteout/opaque xattrs in memory
-# is not a durable sandbox rootfs.
+# owner/mode plus ordinary whiteout/opaque sentinel files must reconstruct the
+# same merged root from Drive9's native inode and namespace state.
 
 set -euo pipefail
 
@@ -28,6 +28,56 @@ FIRST_OVERLAY_PID=""
 OVERLAY_MOUNTED=0
 TMP_MOUNTED=0
 RUN_MOUNTED=0
+
+assert_native_upper_metadata() {
+  [ "$(sudo stat -c '%a' "$FUSE_ROOT/upper/etc/drive9.conf")" = 640 ] \
+    || fail "raw upper file mode was not stored in the Drive9 inode"
+  [ "$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/workspace/persist.txt")" = 1234:2345 ] \
+    || fail "raw upper file ownership was not stored in the Drive9 inode"
+  [ "$(sudo stat -c '%a' "$FUSE_ROOT/upper/home/agent")" = 750 ] \
+    || fail "raw upper directory mode was not stored in the Drive9 inode"
+  [ "$(sudo stat -c '%u:%g' "$FUSE_ROOT/upper/home/agent")" = 3456:4567 ] \
+    || fail "raw upper directory ownership was not stored in the Drive9 inode"
+}
+
+assert_regular_overlay_markers() {
+  [ -f "$FUSE_ROOT/upper/etc/.wh.lower-delete" ] \
+    || fail "lower-file whiteout is not a regular .wh.<name> file"
+  [ -f "$FUSE_ROOT/upper/etc/.wh.lower-rename" ] \
+    || fail "renamed lower-file whiteout is not a regular .wh.<name> file"
+  [ -f "$FUSE_ROOT/upper/etc/opaque/.wh..wh..opq" ] \
+    || fail "opaque-directory marker is not a regular .wh..wh..opq file"
+}
+
+assert_no_private_overlay_xattrs() {
+  sudo python3 - \
+    "$FUSE_ROOT/upper" \
+    "$FUSE_ROOT/upper/etc/drive9.conf" \
+    "$FUSE_ROOT/upper/etc/.wh.lower-delete" \
+    "$FUSE_ROOT/upper/etc/opaque/.wh..wh..opq" <<'PY'
+import errno
+import os
+import sys
+
+for path in sys.argv[1:]:
+    try:
+        names = os.listxattr(path)
+    except OSError as exc:
+        if exc.errno in (errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)):
+            continue
+        raise
+    forbidden = [
+        name for name in names
+        if name.startswith("user.fuseoverlayfs.")
+        or name.startswith("security.fuseoverlayfs.")
+        or name.startswith("trusted.overlay.")
+        or name.startswith("user.overlay.")
+        or name == "user.containers.override_stat"
+    ]
+    if forbidden:
+        raise AssertionError(f"private overlay xattr on {path}: {forbidden}")
+PY
+}
 
 fail() {
   printf 'FAIL runtime rootfs overlay probe: %s\n' "$1" >&2
@@ -119,7 +169,7 @@ mount_drive9() {
   : >"$MOUNT_LOG"
   run_cli mount --mode=fuse --foreground --no-supervise \
     --allow-other \
-    --profile=extent --require-extent-xattr-v1 \
+    --profile=extent \
     --durability=write-sync --flush-debounce=0 \
     ":$REMOTE_ROOT" "$FUSE_ROOT" >>"$MOUNT_LOG" 2>&1 &
   FUSE_PID=$!
@@ -145,8 +195,14 @@ mount_overlay() {
       ;;
     fuse-overlayfs)
       : >"$OVERLAY_LOG"
+      local overlay_options="allow_other,lowerdir=$LOWER,upperdir=$FUSE_ROOT/upper,workdir=$FUSE_ROOT/work"
+      case ",$overlay_options," in
+        *,xattr_permissions,*|*,xattr_permissions=*)
+          fail "fuse-overlayfs options must use native inode permissions"
+          ;;
+      esac
       sudo env FUSE_OVERLAYFS_DISABLE_OVL_WHITEOUT=1 fuse-overlayfs -f \
-        -o "allow_other,xattr_permissions=2,lowerdir=$LOWER,upperdir=$FUSE_ROOT/upper,workdir=$FUSE_ROOT/work" \
+        -o "$overlay_options" \
         "$MERGED" >>"$OVERLAY_LOG" 2>&1 &
       OVERLAY_PID=$!
       local deadline=$((SECONDS + FUSE_READY_TIMEOUT_S))
@@ -233,38 +289,6 @@ printf 'hidden-child\n' >"$LOWER/etc/opaque/lower-child"
 mount_drive9
 FIRST_FUSE_PID="$FUSE_PID"
 
-# Directory xattrs must use the same durable inode RPC as file xattrs. Exercise
-# rename and rmdir/recreate directly on the Drive9 mount before fuse-overlayfs
-# adds its own private metadata to upperdir.
-mkdir "$FUSE_ROOT/dir-xattr"
-sudo python3 - "$FUSE_ROOT/dir-xattr" <<'PY'
-import os
-import sys
-os.setxattr(sys.argv[1], b"user.drive9.directory", b"durable-directory")
-assert os.getxattr(sys.argv[1], b"user.drive9.directory") == b"durable-directory"
-assert "user.drive9.directory" in os.listxattr(sys.argv[1])
-PY
-mv "$FUSE_ROOT/dir-xattr" "$FUSE_ROOT/dir-xattr-renamed"
-mkdir "$FUSE_ROOT/dir-xattr-reused"
-sudo python3 - "$FUSE_ROOT/dir-xattr-reused" <<'PY'
-import os
-import sys
-os.setxattr(sys.argv[1], b"user.drive9.stale-directory", b"must-disappear")
-PY
-rmdir "$FUSE_ROOT/dir-xattr-reused"
-mkdir "$FUSE_ROOT/dir-xattr-reused"
-sudo python3 - "$FUSE_ROOT/dir-xattr-reused" <<'PY'
-import errno
-import os
-import sys
-try:
-    os.getxattr(sys.argv[1], b"user.drive9.stale-directory")
-except OSError as exc:
-    assert exc.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA))
-else:
-    raise AssertionError("recreated directory inherited deleted inode xattr")
-PY
-
 mount_overlay
 FIRST_OVERLAY_PID="$OVERLAY_PID"
 
@@ -281,41 +305,13 @@ sudo mkdir "$MERGED/etc/opaque"
 sudo sh -c "printf upper-child >'$MERGED/etc/opaque/upper-child'"
 sudo chmod 0640 "$MERGED/etc/drive9.conf"
 sudo chown 1234:2345 "$MERGED/workspace/persist.txt"
+sudo chmod 0750 "$MERGED/home/agent"
+sudo chown 3456:4567 "$MERGED/home/agent"
 sudo ln -s ../etc/drive9.conf "$MERGED/root/config-link"
 sudo ln "$MERGED/workspace/persist.txt" "$MERGED/workspace/persist-hardlink.txt"
 sudo touch -t 202001020304.05 "$MERGED/etc/drive9.conf"
 sudo dd if=/dev/zero of="$MERGED/workspace/large.bin" bs=1M count=4 status=none
-sudo python3 - "$MERGED/etc/drive9.conf" <<'PY'
-import os
-import sys
-os.setxattr(sys.argv[1], b"user.drive9.probe", b"durable")
-PY
-sudo python3 - "$MERGED/workspace/persist.txt" "$MERGED/workspace/persist-hardlink.txt" <<'PY'
-import os
-import sys
-os.setxattr(sys.argv[1], b"user.drive9.hardlink", b"same-inode")
-assert os.getxattr(sys.argv[2], b"user.drive9.hardlink") == b"same-inode"
-PY
 sudo mv "$MERGED/workspace/persist-hardlink.txt" "$MERGED/workspace/renamed-hardlink.txt"
-sudo sh -c "printf old >'$MERGED/workspace/reused.txt'"
-sudo python3 - "$MERGED/workspace/reused.txt" <<'PY'
-import os
-import sys
-os.setxattr(sys.argv[1], b"user.drive9.stale", b"must-disappear")
-PY
-sudo rm "$MERGED/workspace/reused.txt"
-sudo sh -c "printf new >'$MERGED/workspace/reused.txt'"
-sudo python3 - "$MERGED/workspace/reused.txt" <<'PY'
-import errno
-import os
-import sys
-try:
-    os.getxattr(sys.argv[1], b"user.drive9.stale")
-except OSError as exc:
-    assert exc.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA))
-else:
-    raise AssertionError("recreated path inherited deleted inode xattr")
-PY
 sudo sh -c "printf transient-tmp >'$MERGED/tmp/not-persistent'"
 sudo sh -c "printf transient-run >'$MERGED/run/not-persistent'"
 sync
@@ -326,6 +322,10 @@ if [ -n "$FIRST_OVERLAY_PID" ] && kill -0 "$FIRST_OVERLAY_PID" 2>/dev/null; then
   fail "first fuse-overlayfs process is still alive after unmount"
 fi
 mountpoint -q "$FUSE_ROOT" || fail "Drive9 mount disappeared before drain"
+assert_native_upper_metadata
+assert_regular_overlay_markers
+assert_no_private_overlay_xattrs \
+  || fail "raw upper depends on private overlay xattrs"
 run_cli mount drain --timeout 30s "$FUSE_ROOT" >/dev/null \
   || fail "Drive9 drain failed after rootfs mutation"
 unmount_drive9 || fail "first Drive9 FUSE mount did not stop cleanly"
@@ -338,38 +338,10 @@ fi
 # be needed to reconstruct the merged root.
 mount_drive9
 [ "$FUSE_PID" != "$FIRST_FUSE_PID" ] || fail "Drive9 remount reused the old FUSE process"
-sudo python3 - "$FUSE_ROOT/dir-xattr-renamed" "$FUSE_ROOT/dir-xattr-reused" <<'PY' \
-  || fail "directory xattr inode semantics did not survive a fresh Drive9 remount"
-import errno
-import os
-import sys
-assert os.getxattr(sys.argv[1], b"user.drive9.directory") == b"durable-directory"
-assert "user.drive9.directory" in os.listxattr(sys.argv[1])
-try:
-    os.getxattr(sys.argv[2], b"user.drive9.stale-directory")
-except OSError as exc:
-    assert exc.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA))
-else:
-    raise AssertionError("recreated directory inherited deleted inode xattr after remount")
-PY
-if [ "$ROOTFS_DRIVER" = fuse-overlayfs ]; then
-  sudo python3 - "$FUSE_ROOT/upper" <<'PY' \
-    || fail "fuse-overlayfs private upper-directory xattr did not survive a fresh Drive9 remount"
-import os
-import sys
-value = os.getxattr(sys.argv[1], b"user.fuseoverlayfs.override_stat")
-assert value
-assert "user.fuseoverlayfs.override_stat" in os.listxattr(sys.argv[1])
-PY
-fi
-if [ "$ROOTFS_DRIVER" = kernel ]; then
-  sudo python3 - "$FUSE_ROOT/upper/etc/drive9.conf" <<'PY' \
-    || fail "xattr was absent on the fresh Drive9 FUSE mount before overlay reconstruction"
-import os
-import sys
-assert os.getxattr(sys.argv[1], b"user.drive9.probe") == b"durable"
-PY
-fi
+assert_native_upper_metadata
+assert_regular_overlay_markers
+assert_no_private_overlay_xattrs \
+  || fail "remounted raw upper depends on private overlay xattrs"
 mount_overlay
 [ -z "$FIRST_OVERLAY_PID" ] || [ "$OVERLAY_PID" != "$FIRST_OVERLAY_PID" ] \
   || fail "rootfs remount reused the old fuse-overlayfs process"
@@ -386,38 +358,14 @@ sudo chroot "$MERGED" /bin/sh -c 'test -x /bin/sh && printf lower-image-ok' \
 [ "$(sudo cat "$MERGED/etc/opaque/upper-child")" = upper-child ] || fail "opaque-directory upper child did not persist"
 [ "$(stat -c '%a' "$MERGED/etc/drive9.conf")" = 640 ] || fail "chmod did not persist"
 [ "$(stat -c '%u:%g' "$MERGED/workspace/persist.txt")" = 1234:2345 ] || fail "chown uid/gid did not persist"
+[ "$(stat -c '%a' "$MERGED/home/agent")" = 750 ] || fail "directory chmod did not persist"
+[ "$(stat -c '%u:%g' "$MERGED/home/agent")" = 3456:4567 ] || fail "directory chown did not persist"
 [ "$(readlink "$MERGED/root/config-link")" = ../etc/drive9.conf ] || fail "symlink did not persist"
 [ "$(stat -c '%i' "$MERGED/workspace/persist.txt")" = "$(stat -c '%i' "$MERGED/workspace/renamed-hardlink.txt")" ] \
   || fail "hardlink identity did not persist"
 [ "$(stat -c '%y' "$MERGED/etc/drive9.conf" | cut -d. -f1)" = '2020-01-02 03:04:05' ] \
   || fail "mtime did not persist"
 [ "$(stat -c '%s' "$MERGED/workspace/large.bin")" = 4194304 ] || fail "large file did not persist"
-sudo python3 - "$MERGED/etc/drive9.conf" <<'PY' \
-  || fail "xattr did not persist"
-import os
-import sys
-assert os.getxattr(sys.argv[1], b"user.drive9.probe") == b"durable"
-PY
-sudo python3 - "$MERGED/workspace/persist.txt" "$MERGED/workspace/renamed-hardlink.txt" <<'PY' \
-  || fail "hardlink/rename inode xattr did not persist"
-import os
-import sys
-assert os.getxattr(sys.argv[1], b"user.drive9.hardlink") == b"same-inode"
-assert os.getxattr(sys.argv[2], b"user.drive9.hardlink") == b"same-inode"
-PY
-[ "$(sudo cat "$MERGED/workspace/reused.txt")" = new ] || fail "recreated file content did not persist"
-sudo python3 - "$MERGED/workspace/reused.txt" <<'PY' \
-  || fail "recreated path inherited deleted inode xattr after remount"
-import errno
-import os
-import sys
-try:
-    os.getxattr(sys.argv[1], b"user.drive9.stale")
-except OSError as exc:
-    assert exc.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA))
-else:
-    raise AssertionError("recreated path inherited deleted inode xattr")
-PY
 [ ! -e "$MERGED/tmp/not-persistent" ] || fail "/tmp unexpectedly persisted"
 [ ! -e "$MERGED/run/not-persistent" ] || fail "/run unexpectedly persisted"
 

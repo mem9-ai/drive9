@@ -7483,8 +7483,8 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 	if stat.HasMode {
 		fs.inodes.UpdateMode(ino, stat.Mode)
 	}
-	if extentIno, ok := projectedExtentIno(stat); ok {
-		fs.inodes.SetExtentIno(ino, extentIno)
+	if stat.ContentLayout == client.ContentLayoutExtent && stat.ExtentIno != 0 {
+		fs.inodes.SetExtentIno(ino, stat.ExtentIno)
 	}
 	// Refresh from the JuiceFS side only when the projection says this file
 	// lives on the extent data plane. Matching the profile glob is not enough:
@@ -9517,11 +9517,9 @@ func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name stri
 	mode := metadataNodeMode(input.Mode)
 	switch mode & fileKindModeMask {
 	case 0, syscall.S_IFREG:
-		// fuse-overlayfs creates regular upper files with MKNOD before it
-		// installs its private override_stat xattr. Keep that file on the
-		// extent data plane when the mount's creation policy selects it;
-		// otherwise SetXAttr would fall back to the mount-session store and
-		// ownership/mode would disappear on a fresh mount.
+		// fuse-overlayfs creates regular upper files with MKNOD. Keep matching
+		// files on the extent data plane so their native inode mode and owner
+		// remain durable across fresh mounts.
 		if fs.shouldUseExtentPath(childP) {
 			return fs.extentMknod(cancel, input, name, childP, mode, out)
 		}
@@ -15385,7 +15383,7 @@ func (fs *Dat9FS) StatFs(cancel <-chan struct{}, header *gofuse.InHeader, out *g
 	return gofuse.OK
 }
 
-// --- Xattr handlers ---------------------------------------------------------
+// --- Xattr handlers (in-memory, session-scoped) ----------------------------
 
 func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string, dest []byte) (uint32, gofuse.Status) {
 	path, ok := fs.inodes.GetPath(header.NodeId)
@@ -15395,26 +15393,7 @@ func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr
 	if !xattrNamespaceSupported(attr) {
 		return 0, gofuse.Status(syscall.EOPNOTSUPP)
 	}
-	if ino, extent := fs.extentXattrInode(header.NodeId, path); extent {
-		ctx, cancelCtx := fuseCtx(cancel)
-		defer cancelCtx()
-		val, status := fs.extentGetXattr(ctx, ino, attr)
-		if status != gofuse.OK {
-			return 0, status
-		}
-		if len(dest) == 0 {
-			return uint32(len(val)), gofuse.OK
-		}
-		if len(val) > len(dest) {
-			return uint32(len(val)), gofuse.Status(syscall.ERANGE)
-		}
-		copy(dest, val)
-		return uint32(len(val)), gofuse.OK
-	}
 	val, found := fs.xattrs.Get(path, attr)
-	if !found {
-		val, found = fs.classicFuseOverlayStatXattr(header.NodeId, attr)
-	}
 	if !found {
 		return 0, gofuse.ENOATTR
 	}
@@ -15433,22 +15412,7 @@ func (fs *Dat9FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, des
 	if !ok {
 		return 0, gofuse.ENOENT
 	}
-	var names []string
-	if ino, extent := fs.extentXattrInode(header.NodeId, path); extent {
-		ctx, cancelCtx := fuseCtx(cancel)
-		defer cancelCtx()
-		var status gofuse.Status
-		names, status = fs.extentListXattr(ctx, ino)
-		if status != gofuse.OK {
-			return 0, status
-		}
-	} else {
-		names = fs.xattrs.List(path)
-		if _, ok := fs.classicFuseOverlayStatXattr(header.NodeId, fuseOverlayOverrideStatXattr); ok && !slices.Contains(names, fuseOverlayOverrideStatXattr) {
-			names = append(names, fuseOverlayOverrideStatXattr)
-		}
-	}
-	sort.Strings(names)
+	names := fs.xattrs.List(path)
 	var total int
 	for _, name := range names {
 		total += len(name) + 1
@@ -15476,13 +15440,6 @@ func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, att
 	if !xattrNamespaceSupported(attr) {
 		return gofuse.Status(syscall.EOPNOTSUPP)
 	}
-	if ino, extent := fs.extentXattrInode(input.NodeId, path); extent {
-		requestCtx, requestCancel := fuseCtx(cancel)
-		defer requestCancel()
-		commitCtx, commitCancel := fs.namespaceMutationCommitContext(requestCtx)
-		defer commitCancel()
-		return fs.extentSetXattr(commitCtx, ino, attr, data, input.Flags)
-	}
 	if err := fs.xattrs.SetWithFlags(path, attr, data, input.Flags); err != 0 {
 		return gofuse.Status(err)
 	}
@@ -15496,13 +15453,6 @@ func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, a
 	}
 	if !xattrNamespaceSupported(attr) {
 		return gofuse.Status(syscall.EOPNOTSUPP)
-	}
-	if ino, extent := fs.extentXattrInode(header.NodeId, path); extent {
-		requestCtx, requestCancel := fuseCtx(cancel)
-		defer requestCancel()
-		commitCtx, commitCancel := fs.namespaceMutationCommitContext(requestCtx)
-		defer commitCancel()
-		return fs.extentRemoveXattr(commitCtx, ino, attr)
 	}
 	if !fs.xattrs.Remove(path, attr) {
 		return gofuse.ENOATTR

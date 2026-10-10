@@ -66,15 +66,10 @@ type tenantStatusResponse struct {
 // A missing object means the server predates the contract.
 type StorageCapabilities struct {
 	AppendLogV1 bool `json:"append_log_v1"`
-	// ExtentXattrV1 is the server-side inode xattr RPC/schema contract used by
-	// extent mounts. Missing and false both mean unavailable.
-	ExtentXattrV1 bool `json:"extent_xattr_v1"`
 	// BatchWriteModeV1 promises atomic content+mode create, owner-only mode
 	// authorization, and the definite-rejection contract on BatchWriteResult.
 	BatchWriteModeV1 bool `json:"batch_write_mode_v1"`
 }
-
-const ExtentXattrProtocolV1 = "drive9.extent_xattr.v1"
 
 // MigrationCapabilities is the bounded Server contract. A missing object
 // means the Server predates Migration V1; individual false fields mean that
@@ -123,10 +118,6 @@ var ErrConflict = errors.New("conflict")
 // ErrMigrationUnsupported reports a successful status response from a Server
 // that does not expose the Migration V1 capability object.
 var ErrMigrationUnsupported = errors.New("migration unsupported")
-
-// ErrExtentXattrUnsupported reports that a successful tenant status response
-// did not advertise the exact extent-xattr protocol required by rootfs mounts.
-var ErrExtentXattrUnsupported = errors.New("extent xattr unsupported")
 
 // StatusError preserves the HTTP status code for API errors.
 type StatusError struct {
@@ -564,25 +555,6 @@ func (c *Client) Warm(ctx context.Context) {
 	c.ensureTenantStatus(ctx)
 }
 
-// RequireExtentXattrV1 verifies the server side of the extent-xattr protocol.
-// Unlike Warm and the cached compatibility getters, this required-capability
-// path preserves transport, HTTP status, and JSON errors for fail-closed mount
-// diagnostics.
-func (c *Client) RequireExtentXattrV1(ctx context.Context) error {
-	body, err := c.tenantStatus(ctx)
-	if err != nil {
-		var statusErr *StatusError
-		if errors.As(err, &statusErr) {
-			return fmt.Errorf("query %s returned HTTP %d: %w", ExtentXattrProtocolV1, statusErr.StatusCode, err)
-		}
-		return fmt.Errorf("query %s: %w", ExtentXattrProtocolV1, err)
-	}
-	if body.StorageCapabilities == nil || !body.StorageCapabilities.ExtentXattrV1 {
-		return fmt.Errorf("%w: server status did not advertise %s", ErrExtentXattrUnsupported, ExtentXattrProtocolV1)
-	}
-	return nil
-}
-
 // SetSmallFileThresholdForTests pins the client's small-file cutoff
 // without consulting the server. Hot paths (uploadThreshold,
 // CachedSmallFileThreshold) treat this override as authoritative and
@@ -634,18 +606,6 @@ func (c *Client) CachedAppendLogSupported() bool {
 	}
 	body := c.statusBody.Load()
 	return body != nil && body.StorageCapabilities != nil && body.StorageCapabilities.AppendLogV1
-}
-
-// CachedExtentXattrSupported reports the negotiated persistent inode xattr
-// contract without I/O. Missing, failed and older status responses fail
-// closed so callers that require durable xattrs cannot silently use the
-// mount-session xattr store.
-func (c *Client) CachedExtentXattrSupported() bool {
-	if c == nil {
-		return false
-	}
-	body := c.statusBody.Load()
-	return body != nil && body.StorageCapabilities != nil && body.StorageCapabilities.ExtentXattrV1
 }
 
 // CachedBatchWriteModeSupported reports the negotiated batch content+mode

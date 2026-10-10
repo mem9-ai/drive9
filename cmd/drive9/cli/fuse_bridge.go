@@ -97,7 +97,6 @@ type mountFuseOptions struct {
 	PerfMaxProfileFiles          int
 	Supervised                   bool
 	OmitProcessStateCredentials  bool
-	RequireExtentXattrV1         bool
 }
 
 type vaultMountOptions struct {

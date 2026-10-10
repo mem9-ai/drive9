@@ -53,7 +53,7 @@ mount_raw_workspace() {
   if ! HOME="$RAW_STATE" XDG_RUNTIME_DIR="$RAW_STATE" \
     DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" \
     "$CLI_BIN" mount --no-supervise --no-persist-credentials \
-      --mode=fuse --profile=extent --require-extent-xattr-v1 \
+      --mode=fuse --profile=extent \
       --durability=write-sync --flush-debounce=0 \
       ":$ROOT" "$RAW_MOUNT" >"$WORK_DIR/raw-mount.log" 2>&1; then
     fail "fresh raw-upper diagnostic mount failed"
@@ -86,24 +86,6 @@ try:
 except OSError as exc:
     print(json.dumps({"error": f"lstat:{exc.errno}", "path": path}, sort_keys=True))
     raise SystemExit(2)
-try:
-    names = sorted(os.listxattr(path))
-except OSError as exc:
-    print(json.dumps({"error": f"listxattr:{exc.errno}", "path": path}, sort_keys=True))
-    raise SystemExit(3)
-try:
-    override = os.getxattr(path, b"user.fuseoverlayfs.override_stat").decode("ascii")
-except OSError as exc:
-    override = f"<getxattr-error:{exc.errno}>"
-override_owner = None
-override_mode = None
-parts = override.split(":")
-if len(parts) == 3:
-    try:
-        override_owner = f"{int(parts[0])}:{int(parts[1])}"
-        override_mode = format(int(parts[2], 8) & 0o7777, "o")
-    except ValueError:
-        pass
 print(json.dumps({
     "path": path,
     "layout": layout,
@@ -111,10 +93,6 @@ print(json.dumps({
     "stat_inode": current.st_ino,
     "stat_owner": f"{current.st_uid}:{current.st_gid}",
     "stat_mode": format(stat.S_IMODE(current.st_mode), "o"),
-    "xattrs": names,
-    "override_stat": override,
-    "override_owner": override_owner,
-    "override_mode": override_mode,
 }, sort_keys=True))
 PY
 }
@@ -165,10 +143,9 @@ printf '%s' "$capabilities" | jq -e \
   '.streaming == true and .separate_stdout_stderr == true and .cancel == true and .detached == false and .replay == false
    and any(.providers[].candidates[]; .execution_class == "linux-full"
      and .persistence == "full_root"
-     and .rootfs.capability_version == "drive9_rootfs.user_union.extent.v5"
+     and .rootfs.capability_version == "drive9_rootfs.user_union.extent.v6"
      and .capabilities["workspace_persistence"] == true
      and .capabilities["full_root_persistence"] == true
-     and .capabilities["drive9.extent_xattr.v1"] == true
      and .production_eligible == true and .bounded_selection_eligible == true)' \
   >/dev/null || fail "Runtime capabilities do not match the one-shot contract"
 
@@ -250,8 +227,8 @@ fi
 
 # Before another union mount can mask where the metadata was lost, open the
 # durable workspace with a fresh Drive9 FUSE process and inspect the raw upper
-# inode. The HEAD projection and the private fuse-overlayfs xattr must agree on
-# the same extent-backed fact after the first Runtime drain/unmount.
+# inode. The HEAD projection and native uid/gid/mode must agree on the same
+# extent-backed fact after the first Runtime drain/unmount.
 RAW_ETC_REL="${ROOT_REL}/upper/etc/drive9.conf"
 RAW_ETC_PATH="$RAW_MOUNT/upper/etc/drive9.conf"
 raw_head="$(curl -fsSI --max-time 20 -H "Authorization: Bearer ${API_KEY}" \
@@ -268,13 +245,10 @@ mount_raw_workspace
 raw_metadata="$(raw_metadata_for "$RAW_ETC_PATH" "$raw_layout" "$raw_extent_ino")" \
   || fail "raw-upper metadata inspection failed: ${raw_metadata:-<no-output>}"
 printf 'runtime raw-upper metadata: %s\n' "$raw_metadata" >&2
-raw_override="$(printf '%s' "$raw_metadata" | jq -r '.override_stat // empty')"
-raw_override_owner="$(printf '%s' "$raw_metadata" | jq -r '.override_owner // empty')"
-raw_override_mode="$(printf '%s' "$raw_metadata" | jq -r '.override_mode // empty')"
-[ "$raw_override_owner" = 65532:65532 ] \
-  || fail "raw-upper override_stat owner expected=65532:65532 actual=${raw_override:-<missing>}"
-[ "$raw_override_mode" = 640 ] \
-  || fail "raw-upper override_stat mode expected=640 actual=${raw_override:-<missing>}"
+[ "$(printf '%s' "$raw_metadata" | jq -r '.stat_owner')" = 65532:65532 ] \
+  || fail "raw-upper native owner is not 65532:65532"
+[ "$(printf '%s' "$raw_metadata" | jq -r '.stat_mode')" = 640 ] \
+  || fail "raw-upper native mode is not 640"
 
 RAW_ROOT_FILE_REL="${ROOT_REL}/upper/root/persist.txt"
 RAW_ROOT_FILE_PATH="$RAW_MOUNT/upper/root/persist.txt"
@@ -293,18 +267,33 @@ raw_root_file_metadata="$(raw_metadata_for "$RAW_ROOT_FILE_PATH" "$raw_root_layo
   || fail "raw-upper root file metadata inspection failed: ${raw_root_file_metadata:-<no-output>}"
 printf 'runtime raw-upper root directory metadata: %s\n' "$raw_root_directory_metadata" >&2
 printf 'runtime raw-upper root file metadata: %s\n' "$raw_root_file_metadata" >&2
-raw_root_directory_override="$(printf '%s' "$raw_root_directory_metadata" | jq -r '.override_stat // empty')"
-raw_root_file_override="$(printf '%s' "$raw_root_file_metadata" | jq -r '.override_stat // empty')"
-[ "$(printf '%s' "$raw_root_directory_metadata" | jq -r '.override_owner // empty')" = 0:0 ] \
-  || fail "raw-upper root directory owner expected=0:0 actual=${raw_root_directory_override:-<missing>}"
-[ "$(printf '%s' "$raw_root_directory_metadata" | jq -r '.override_mode // empty')" = 700 ] \
-  || fail "raw-upper root directory mode expected=700 actual=${raw_root_directory_override:-<missing>}"
-[ "$(printf '%s' "$raw_root_file_metadata" | jq -r '.override_owner // empty')" = 65532:65532 ] \
-  || fail "raw-upper root file owner expected=65532:65532 actual=${raw_root_file_override:-<missing>}"
-[ "$(printf '%s' "$raw_root_file_metadata" | jq -r '.override_mode // empty')" = 644 ] \
-  || fail "raw-upper root file mode expected=644 actual=${raw_root_file_override:-<missing>}"
+[ "$(printf '%s' "$raw_root_directory_metadata" | jq -r '.stat_owner')" = 0:0 ] \
+  || fail "raw-upper root directory native owner is not 0:0"
+[ "$(printf '%s' "$raw_root_directory_metadata" | jq -r '.stat_mode')" = 700 ] \
+  || fail "raw-upper root directory native mode is not 700"
+[ "$(printf '%s' "$raw_root_file_metadata" | jq -r '.stat_owner')" = 65532:65532 ] \
+  || fail "raw-upper root file native owner is not 65532:65532"
+[ "$(printf '%s' "$raw_root_file_metadata" | jq -r '.stat_mode')" = 644 ] \
+  || fail "raw-upper root file native mode is not 644"
 [ "$(cat "$RAW_ROOT_FILE_PATH")" = root-state ] \
   || fail "raw-upper root file bytes are not durable"
+[ -f "$RAW_MOUNT/upper/etc/.wh.drive9-lower-delete" ] \
+  || fail "lower-file deletion is not a regular .wh file"
+[ -f "$RAW_MOUNT/upper/etc/.wh.drive9-lower-rename" ] \
+  || fail "lower-file rename source is not a regular .wh file"
+python3 - "$RAW_MOUNT/upper" "$RAW_ETC_PATH" "$RAW_ROOT_FILE_PATH" <<'PY' \
+  || fail "raw upper unexpectedly depends on overlay private xattrs"
+import os
+import sys
+for path in sys.argv[1:]:
+    forbidden = [name for name in os.listxattr(path)
+                 if name.startswith("user.fuseoverlayfs.")
+                 or name.startswith("security.fuseoverlayfs.")
+                 or name.startswith("trusted.overlay.")
+                 or name.startswith("user.overlay.")
+                 or name == "user.containers.override_stat"]
+    assert not forbidden, (path, forbidden)
+PY
 unmount_raw_workspace
 
 # Direction 1: after rootfs initialization, an acknowledged FS API write into

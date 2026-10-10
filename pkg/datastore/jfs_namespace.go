@@ -686,9 +686,6 @@ func (s *Store) jfsUnlinkTx(ctx context.Context, tx *sql.Tx, parent uint64, name
 			return nil, 0, err
 		}
 	}
-	if err := jfsDeleteXattrsTx(tx, ino); err != nil {
-		return nil, 0, err
-	}
 	if _, err := tx.Exec(`DELETE FROM jfs_node WHERE inode = ?`, ino); err != nil {
 		return nil, 0, err
 	}
@@ -753,9 +750,6 @@ func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (ui
 		return 0, nil, 0, err
 	}
 	if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? AND name = ?`, parent, []byte(name)); err != nil {
-		return 0, nil, 0, err
-	}
-	if err := jfsDeleteXattrsTx(tx, ino); err != nil {
 		return 0, nil, 0, err
 	}
 	if _, err := tx.Exec(`DELETE FROM jfs_node WHERE inode = ?`, ino); err != nil {
