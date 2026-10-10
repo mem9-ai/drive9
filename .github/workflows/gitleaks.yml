@@ -8,11 +8,12 @@ name: Secret Scan
 #
 # `pull_request_target` loads this definition from the default branch, not from
 # the pull request, so the gate cannot be weakened by the change it is meant to
-# inspect. Nothing from the pull request is ever executed: the job checks out the
-# PR head only to read git objects, installs the scanner itself from the version
-# pinned below, and takes its allowlist from the merge base. Allowlist additions
-# therefore take effect only once they are merged, and the scanner ignores any
-# `.gitleaksignore` shipped by the PR.
+# inspect. Nothing from the pull request is ever executed: the scanner is
+# installed from the version pinned below into a per-run directory outside the
+# workspace, the allowlist comes from the merge base, and the PR checkout is read
+# only for its git objects. Allowlist additions therefore take effect only once
+# they are merged, and the scanner ignores any `.gitleaksignore` shipped by the
+# PR.
 #
 # Bootstrap: `pull_request_target` only runs when this file already exists on the
 # default branch, so the PR that introduces it is not itself gated — every later
@@ -58,26 +59,32 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Cache gitleaks binary
-        uses: actions/cache@v4
-        with:
-          path: bin/gitleaks
-          # The install step below verifies the binary against
-          # GITLEAKS_VERSION, so this key does not need to carry the version.
-          key: ${{ runner.os }}-gitleaks-bin
-
       - name: Install gitleaks
-        # Run outside the checkout: nothing from the pull request participates.
+        # The scanner must not be read from the checkout: a pull request could
+        # commit a binary that reports the same version and have this job run it.
+        # Install into a per-run directory outside the workspace, never reuse a
+        # pre-existing or cached binary, and verify the module path as well as
+        # the version.
         working-directory: ${{ runner.temp }}
         env:
-          GOBIN: ${{ github.workspace }}/bin
+          GOBIN: ${{ runner.temp }}/gitleaks-bin
         run: |
           set -euo pipefail
-          installed="$(go version -m "$GITHUB_WORKSPACE/bin/gitleaks" 2>/dev/null | awk '$1 == "mod" { print $3 }' || true)"
-          if [ "$installed" != "${GITLEAKS_VERSION}" ]; then
-            go install "github.com/zricethezav/gitleaks/v8@${GITLEAKS_VERSION}"
+          go install "github.com/zricethezav/gitleaks/v8@${GITLEAKS_VERSION}"
+          info="$(go version -m "$GOBIN/gitleaks")"
+          module="$(printf '%s\n' "$info" | awk '$1 == "path" { print $2 }')"
+          version="$(printf '%s\n' "$info" | awk '$1 == "mod" { print $3 }')"
+          if [ "$module" != "github.com/zricethezav/gitleaks/v8" ] || [ "$version" != "$GITLEAKS_VERSION" ]; then
+            echo "refusing to run an unexpected scanner build: path=$module version=$version" >&2
+            exit 1
           fi
-          "$GITHUB_WORKSPACE/bin/gitleaks" version
+          case "$GOBIN/gitleaks" in
+            "$GITHUB_WORKSPACE"/*)
+              echo "refusing to run a scanner from the checkout" >&2
+              exit 1
+              ;;
+          esac
+          echo "scanner: $GOBIN/gitleaks ($module $version)"
 
       - name: Scan
         env:
@@ -85,6 +92,13 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          scanner="$RUNNER_TEMP/gitleaks-bin/gitleaks"
+          case "$scanner" in
+            "$GITHUB_WORKSPACE"/*)
+              echo "refusing to run a scanner from the checkout" >&2
+              exit 1
+              ;;
+          esac
           if [ -n "$BASE_SHA" ]; then
             log_opts="$BASE_SHA..$HEAD_SHA"
             config_ref="$BASE_SHA"
@@ -110,7 +124,7 @@ jobs:
             exit 1
           fi
 
-          bin/gitleaks git . --no-banner --redact \
+          "$scanner" git . --no-banner --redact \
             --config "$RUNNER_TEMP/gitleaks.toml" \
             --gitleaks-ignore-path "$RUNNER_TEMP" \
             --log-opts="$log_opts"

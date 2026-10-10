@@ -165,8 +165,10 @@ gitleaks: install-gitleaks
 	fi; \
 	$(GITLEAKS_BIN) git . --no-banner --redact -v --log-opts="$(GITLEAKS_RANGE)"
 
-# Regression for the fail-closed behaviour of the target above.
-test-gitleaks-fail-closed:
+# Regression for the fail-closed behaviour of the target above. Runs in
+# code-ci.yml; it must not run inside the trusted Secret Scan workflow, which
+# never executes code from the pull request.
+test-gitleaks-fail-closed: install-gitleaks
 	./scripts/test-gitleaks-fail-closed.sh
 
 install-gitleaks:

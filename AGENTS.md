@@ -122,7 +122,9 @@ branch ruleset to turn the scan into a gate.
 
 `make gitleaks` fails closed: it traverses the range with git before scanning, so an
 unknown revision or a partial clone whose promisor remote is unreachable aborts instead of
-reporting "no leaks found". Regression: `make test-gitleaks-fail-closed`.
+reporting "no leaks found". Regression: `make test-gitleaks-fail-closed`, run by
+`code-ci.yml` (it cannot run inside the Secret Scan workflow, which never executes code
+from the pull request).
 
 ---
 
