@@ -65,7 +65,15 @@ PY
 
 report_native_directory_metadata() {
   local stage="${1:-unknown-stage}"
-  local list_json extent_ino attr_json
+  local head_headers head_extent_ino list_json extent_ino attr_json
+  head_headers="$(curl -fsSI --max-time 20 \
+    -H "Authorization: Bearer ${API_KEY}" \
+    "${BASE}/v1/fs${REMOTE_ROOT}/upper/home/agent")" \
+    || fail "${stage} could not stat native directory projection"
+  head_extent_ino="$(printf '%s\n' "$head_headers" | awk -F': ' \
+    'tolower($1) == "x-dat9-extent-ino" {gsub("\r", "", $2); print $2; exit}')"
+  [ -n "$head_extent_ino" ] && [ "$head_extent_ino" != 0 ] \
+    || fail "${stage} native directory stat has no extent inode"
   list_json="$(curl -fsS --max-time 20 \
     -H "Authorization: Bearer ${API_KEY}" \
     "${BASE}/v1/fs${REMOTE_ROOT}/upper/home?list=1")" \
@@ -74,6 +82,8 @@ report_native_directory_metadata() {
     '.entries[] | select(.name == "agent" and .isDir == true) | .extent_ino // empty')"
   [ -n "$extent_ino" ] && [ "$extent_ino" != 0 ] \
     || fail "${stage} native directory projection has no extent inode"
+  [ "$extent_ino" = "$head_extent_ino" ] \
+    || fail "${stage} native directory stat/list inode mismatch: ${head_extent_ino} != ${extent_ino}"
   attr_json="$(curl -fsS --max-time 20 -X POST \
     -H "Authorization: Bearer ${API_KEY}" \
     -H 'Content-Type: application/json' \
