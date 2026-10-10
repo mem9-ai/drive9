@@ -117,7 +117,8 @@ executed. The scanner version is pinned in the workflow and the allowlist is rea
 the merge base, so an allowlist entry only takes effect once it is merged. Bootstrap: the
 PR that first lands this file is not itself gated — every later PR is. Manual
 `workflow_dispatch` runs scan the full history of the selected ref. It runs as its own
-check; add the `gitleaks` context to the branch ruleset if it should block merges.
+check; the workflow alone cannot block a merge, so add the `gitleaks` context to the
+branch ruleset to turn the scan into a gate.
 
 `make gitleaks` fails closed: it traverses the range with git before scanning, so an
 unknown revision or a partial clone whose promisor remote is unreachable aborts instead of

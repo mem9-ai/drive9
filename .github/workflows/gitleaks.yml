@@ -1,6 +1,10 @@
 name: Secret Scan
 
-# Gates a pull request on the commits it adds.
+# Scans the commits a pull request adds for committed credentials.
+#
+# Enforcing it requires the repository ruleset to list the `gitleaks` status
+# check; the workflow alone cannot block a merge, so until the ruleset is
+# updated this scan is advisory.
 #
 # `pull_request_target` loads this definition from the default branch, not from
 # the pull request, so the gate cannot be weakened by the change it is meant to
