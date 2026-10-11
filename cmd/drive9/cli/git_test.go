@@ -264,26 +264,6 @@ func TestPublishGitWorkspaceIndexRetryable(t *testing.T) {
 	}
 }
 
-func TestMarkLocalGitWorkspaceRegisteredRetryable(t *testing.T) {
-	ctx := context.Background()
-	wsID := "ws-mark"
-	notDir := filepath.Join(t.TempDir(), "not-a-dir")
-	if err := os.WriteFile(notDir, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	bad := mountedGitTarget{LocalRoot: notDir}
-	if err := markLocalGitWorkspaceRegistered(ctx, bad, wsID); err == nil {
-		t.Fatal("mark with file LocalRoot succeeded, want error")
-	}
-	good := mountedGitTarget{LocalRoot: t.TempDir()}
-	if err := markLocalGitWorkspaceRegistered(ctx, good, wsID); err != nil {
-		t.Fatalf("mark after previous failure: %v", err)
-	}
-	if err := markLocalGitWorkspaceRegistered(ctx, good, wsID); err != nil {
-		t.Fatalf("idempotent remake: %v", err)
-	}
-}
-
 func TestLinkedWorktreeGitDirMetadataRejectsForeignGitDir(t *testing.T) {
 	root := t.TempDir()
 	baseGit := filepath.Join(root, "base", ".git")

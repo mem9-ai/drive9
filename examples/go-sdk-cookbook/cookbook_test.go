@@ -554,61 +554,41 @@ func ExampleClient_eventsLayersGitAndJournal() {
 		_, _ = c.CommitFSLayer(ctx, layer.LayerID)
 	}
 
-	ws, err := c.UpsertGitWorkspace(ctx, drive9.GitWorkspaceRequest{
+	// Git workspaces are FS-native: every record lives under
+	// /.drive9/git-workspaces/ as plain drive9 files.
+	ws, err := c.GitWorkspaceFSUpsert(ctx, drive9.GitWorkspaceRequest{
 		RootPath:   "/repo/",
 		RepoURL:    "https://github.com/mem9-ai/drive9.git",
 		RemoteName: "origin",
 		BranchName: "main",
+		Mode:       "fast",
 	})
 	if err == nil {
-		_, _ = c.GetGitWorkspaceByRoot(ctx, "/repo/")
-		_, _ = c.GetGitWorkspace(ctx, ws.WorkspaceID)
-		_, _ = c.ListGitWorkspaces(ctx)
-		// Existence-only index used by FUSE on-demand arming (not runtime content).
-		_ = c.UpsertGitWorkspaceIndexEntry(ctx, drive9.GitWorkspaceIndexEntry{
-			WorkspaceID:   ws.WorkspaceID,
-			RootPath:      "/repo/",
-			WorkspaceKind: "main",
-		})
-		_, _, _, _ = c.StatGitWorkspaceIndex(ctx)
+		_, _ = c.GitWorkspaceFSGetByRoot(ctx, "/repo/")
+		_, _ = c.GitWorkspaceFSGet(ctx, ws.WorkspaceID)
+		_, _ = c.GitWorkspaceFSList(ctx)
+		// The existence index the mount discovers workspaces through.
 		_, _, _ = c.ReadGitWorkspaceIndex(ctx)
-		_ = c.ReplaceGitTree(ctx, ws.WorkspaceID, drive9.GitTreeReplaceRequest{
-			CommitSHA: "abc123",
-			Nodes: []drive9.GitTreeNode{{
-				Path:      "README.md",
-				Name:      "README.md",
-				Kind:      "blob",
-				Mode:      "100644",
-				ObjectSHA: "blob-sha",
-				SizeBytes: 9,
-			}},
-		})
-		_, _ = c.ListGitTree(ctx, ws.WorkspaceID, "abc123")
-		_, _ = c.UpsertGitState(ctx, ws.WorkspaceID, drive9.GitStateRequest{
-			CheckpointCommit: "abc123",
-			Content:          []byte("git state"),
-		})
-		_, _ = c.GetGitState(ctx, ws.WorkspaceID)
-		pack, err := c.PutGitObjectPack(ctx, ws.WorkspaceID, drive9.GitObjectPackRequest{Content: []byte("pack")})
-		if err == nil {
-			_, _ = c.GetGitObjectPack(ctx, ws.WorkspaceID, pack.PackID)
+		// The tracked-path oracle (write-side routing + view attributes).
+		_ = c.GitWorkspaceFSPutTreeIndex(ctx, ws.WorkspaceID, "abc123", []drive9.GitTreeNode{{
+			Path:      "README.md",
+			Kind:      "file",
+			Mode:      "100644",
+			ObjectSHA: "blob-sha",
+			SizeBytes: 9,
+		}})
+		_, _ = c.GitWorkspaceFSGetTreeIndex(ctx, ws.WorkspaceID)
+		// .git state and incremental object packs.
+		_ = c.GitWorkspaceFSPutGitState(ctx, ws.WorkspaceID, "abc123", []byte("git state"))
+		_, _ = c.GitWorkspaceFSGetGitState(ctx, ws.WorkspaceID)
+		if _, err := c.GitWorkspaceFSPutObjectPack(ctx, ws.WorkspaceID, []byte("pack")); err == nil {
+			packs, _ := c.GitWorkspaceFSListObjectPacks(ctx, ws.WorkspaceID)
+			for _, pack := range packs {
+				_, _ = c.GitWorkspaceFSGetObjectPack(ctx, ws.WorkspaceID, pack.PackID)
+			}
 		}
-		_, _ = c.ListGitObjectPacks(ctx, ws.WorkspaceID)
-		_, _ = c.PutGitOverlayEntry(ctx, ws.WorkspaceID, drive9.GitOverlayEntryRequest{
-			Path:          "README.md",
-			Op:            "upsert",
-			Kind:          "blob",
-			Content:       []byte("overlay"),
-			SizeBytes:     7,
-			BaseObjectSHA: "blob-sha",
-		})
-		_, _ = c.GetGitOverlayEntry(ctx, ws.WorkspaceID, "README.md")
-		_, _ = c.ListGitOverlayEntries(ctx, ws.WorkspaceID)
-		// Prefer index removal before workspace delete so FUSE does not arm on a
-		// stale existence signal. Examples intentionally ignore network errors.
-		if err := c.RemoveGitWorkspaceIndexEntry(ctx, ws.WorkspaceID); err == nil {
-			_ = c.DeleteGitWorkspace(ctx, ws.WorkspaceID)
-		}
+		// Deregistration: the index entry is the visibility kill-switch.
+		_ = c.GitWorkspaceFSDelete(ctx, ws.WorkspaceID)
 	}
 
 	j, err := c.CreateJournal(ctx, journal.CreateRequest{

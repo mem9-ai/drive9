@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# e2e: on-demand git-workspace discovery (DORMANT → ARMED).
+# e2e: FS-native git-workspace discovery (dormant → live).
 #
-# Covers docs/design/git-workspace-fuse-poll-optimization.md:
-#   G0  no workspace under this RemoteRoot → zero ListGitWorkspaces (refresh=0)
-#       incl. FS activity on paths with ".git" segments
-#   G1  live --fast arms; next FS op uses git layer; refresh in [1,max]
-#   G2  fresh LocalRoot remount discovers via remote index; refresh in [1,max]
-#   G3  armed: second --fast forces list (forced_refresh>=2); wall-clock armed
-#       idle (no .git) stays within refresh max (catches 1s-TTL poll regression)
-#   G4  error-path hardening is unit-tested; e2e bounds refresh via caps
-#   AC5 delete suite workspaces + filter index for root → remount refresh=0
+# The git workspace store is /.drive9/git-workspaces/ (no dedicated API):
+#   G0  no workspace under this RemoteRoot → the mount serves the classic
+#       view only (dormant), incl. under FS noise with ".git" segments
+#   G1  a live `git clone --fast --hydrate=sync` on a running mount
+#       registers the workspace and the clean tree becomes visible without
+#       remounting (SSE event → discovery reload)
+#   G2  a fresh LocalRoot remount discovers via the remote index and
+#       serves the clean tree + restored .git without re-cloning
+#   G3  a second --fast on the same mount registers another workspace;
+#       both stay visible and the index grows
+#   AC5 dropping the index entries for the root → a remount is dormant
+#       again for this RemoteRoot (the index is the visibility kill-switch)
 #
-# Not covered here (no client-visible counter yet): AC1 "index Stat ≤1".
-# Tenant isolation: all index/list asserts filter by suite RemoteRoot (a
-# reused tenant may already have other roots' entries; never require global 404).
+# Tenant isolation: all index asserts filter by suite RemoteRoot (a reused
+# tenant may already have other roots' entries; never require global 404).
 #
 # Usage:
 #   DRIVE9_BASE=http://127.0.0.1:9009 DRIVE9_API_KEY=<provisioned-jwt> \
@@ -38,18 +40,7 @@ GIT_ONDEMAND_CLONE_TIMEOUT_S="${GIT_ONDEMAND_CLONE_TIMEOUT_S:-180}"
 GIT_ONDEMAND_GIT_TIMEOUT_S="${GIT_ONDEMAND_GIT_TIMEOUT_S:-120}"
 GIT_ONDEMAND_KEEP_ARTIFACTS="${GIT_ONDEMAND_KEEP_ARTIFACTS:-0}"
 GIT_ONDEMAND_DORMANT_ACTIVITY_LOOPS="${GIT_ONDEMAND_DORMANT_ACTIVITY_LOOPS:-30}"
-# Armed idle: wall-clock seconds of ordinary FS activity (no .git segments).
-# Must be long enough that a 1s-TTL poll regression would exceed refresh max.
-GIT_ONDEMAND_ARMED_IDLE_S="${GIT_ONDEMAND_ARMED_IDLE_S:-8}"
 GIT_ONDEMAND_FIXTURE_TREE_FILES="${GIT_ONDEMAND_FIXTURE_TREE_FILES:-8}"
-# Upper bound on ListGitWorkspaces-driven refresh counters after normal scenarios.
-# Single --fast + armed idle: event-driven ≈ 1–3 lists; 1s poll over ARMED_IDLE_S
-# would be ~ARMED_IDLE_S+1. Cap sits between those (catches poll, absorbs SSE/force).
-GIT_ONDEMAND_REFRESH_MAX_SINGLE="${GIT_ONDEMAND_REFRESH_MAX_SINGLE:-6}"
-# Two --fast on one mount: arm + second force + optional SSE/index-change extras.
-# Observed ~11 forced lists on fast hosts (SSE index notifications); leave headroom
-# for CI latency without opening a 1s-poll hole (poll needs wall-clock activity).
-GIT_ONDEMAND_REFRESH_MAX_DUAL="${GIT_ONDEMAND_REFRESH_MAX_DUAL:-16}"
 GIT_ONDEMAND_LOG_AUDIT_PATTERN="${GIT_ONDEMAND_LOG_AUDIT_PATTERN:-panic|fatal error|short read|input/output error}"
 export GIT_ALLOW_PROTOCOL="${GIT_ALLOW_PROTOCOL:-file:https:http:ssh}"
 
@@ -330,20 +321,10 @@ start_mount() {
     echo "local_root=$local_root"
   } >>"$MOUNT_LOG"
 
-  local perf_dir="${mount_log%.log}.perf"
-  # --perf-dir enables fusePerfCounters (via PerfSamplesPath), which emits
-  # git_workspace refresh= / forced_refresh= on shutdown.
   drive9 mount --foreground --mode=fuse --profile "${FUSE_PROFILE:-coding-agent}" \
     --local-root "$local_root" \
     --durability=interactive \
     --no-auto-unpack \
-    --perf-dir "$perf_dir" \
-    --perf-interval 1h \
-    --perf-cpu-duration 1ms \
-    --perf-cpu-interval 1h \
-    --perf-heap-interval 1h \
-    --perf-max-sample-files 1 \
-    --perf-max-profile-files 1 \
     ":$remote_root" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
   # Propagate readiness failures even when called under check_cmd (set -e suppressed).
@@ -355,7 +336,7 @@ start_mount() {
     echo "mount log never showed ready: $MOUNT_LOG" >&2
     return 1
   fi
-  # Give async index probe a moment to settle (404 → dormantConfirmed).
+  # Give the async store discovery a moment to settle before assertions.
   sleep 1
 }
 
@@ -370,12 +351,9 @@ stop_mount() {
     fi
   fi
   if [ -n "${MOUNT_PID:-}" ] && kill -0 "$MOUNT_PID" >/dev/null 2>&1; then
-    # Wait for perf summary (printed late in OnUnmount after drain/checkpoint).
+    # Give the unmount checkpoint drain a short window before killing.
     local i
-    for i in $(seq 1 40); do
-      if [ -n "${MOUNT_LOG:-}" ] && [ -f "$MOUNT_LOG" ] && grep -q "drive9: perf git_workspace refresh=" "$MOUNT_LOG"; then
-        break
-      fi
+    for i in $(seq 1 20); do
       if ! kill -0 "$MOUNT_PID" >/dev/null 2>&1; then
         break
       fi
@@ -383,16 +361,6 @@ stop_mount() {
     done
     kill "$MOUNT_PID" >/dev/null 2>&1 || true
     wait "$MOUNT_PID" >/dev/null 2>&1 || true
-  fi
-  # Extra log-flush window if the process already exited without a visible line yet.
-  if [ -n "${MOUNT_LOG:-}" ] && [ -f "$MOUNT_LOG" ] && ! grep -q "drive9: perf git_workspace refresh=" "$MOUNT_LOG"; then
-    local j
-    for j in 1 2 3 4 5 6; do
-      if grep -q "drive9: perf git_workspace refresh=" "$MOUNT_LOG"; then
-        break
-      fi
-      sleep 0.5
-    done
   fi
   MOUNT_PID=""
   MOUNT_POINT=""
@@ -418,112 +386,6 @@ audit_mount_log() {
     return 1
   fi
   return 0
-}
-
-# Parse last git_workspace refresh/forced_refresh counters from mount log.
-parse_git_workspace_refresh() {
-  local log_file="$1"
-  python3 - "$log_file" <<'PY'
-import re, sys
-log_path = sys.argv[1]
-refresh = forced = None
-with open(log_path, "r", errors="replace") as handle:
-    for line in handle:
-        m = re.search(r"drive9: perf git_workspace refresh=(\d+) forced_refresh=(\d+)", line)
-        if m:
-            refresh, forced = int(m.group(1)), int(m.group(2))
-if refresh is None:
-    print("MISSING")
-    raise SystemExit(2)
-print(f"{refresh} {forced}")
-PY
-}
-
-check_refresh_eq() {
-  local desc="$1" log_file="$2" want_refresh="$3"
-  TOTAL=$((TOTAL + 1))
-  local out
-  if ! out=$(parse_git_workspace_refresh "$log_file"); then
-    echo "FAIL $desc (perf git_workspace line missing in $log_file)" >&2
-    FAIL=$((FAIL + 1))
-    return
-  fi
-  local got_refresh got_forced
-  got_refresh=$(echo "$out" | awk '{print $1}')
-  got_forced=$(echo "$out" | awk '{print $2}')
-  if [ "$got_refresh" = "$want_refresh" ]; then
-    echo "PASS $desc (refresh=$got_refresh forced=$got_forced)"
-    PASS=$((PASS + 1))
-  else
-    echo "FAIL $desc (refresh=$got_refresh want=$want_refresh forced=$got_forced)" >&2
-    FAIL=$((FAIL + 1))
-  fi
-}
-
-check_refresh_ge() {
-  local desc="$1" log_file="$2" min_refresh="$3"
-  TOTAL=$((TOTAL + 1))
-  local out
-  if ! out=$(parse_git_workspace_refresh "$log_file"); then
-    echo "FAIL $desc (perf git_workspace line missing in $log_file)" >&2
-    FAIL=$((FAIL + 1))
-    return
-  fi
-  local got_refresh got_forced
-  got_refresh=$(echo "$out" | awk '{print $1}')
-  got_forced=$(echo "$out" | awk '{print $2}')
-  if [ "$got_refresh" -ge "$min_refresh" ] 2>/dev/null; then
-    echo "PASS $desc (refresh=$got_refresh forced=$got_forced >= $min_refresh)"
-    PASS=$((PASS + 1))
-  else
-    echo "FAIL $desc (refresh=$got_refresh forced=$got_forced want>=$min_refresh)" >&2
-    FAIL=$((FAIL + 1))
-  fi
-}
-
-check_refresh_between() {
-  local desc="$1" log_file="$2" min_refresh="$3" max_refresh="$4"
-  TOTAL=$((TOTAL + 1))
-  local out
-  if ! out=$(parse_git_workspace_refresh "$log_file"); then
-    echo "FAIL $desc (perf git_workspace line missing in $log_file)" >&2
-    if [ -f "$log_file" ]; then
-      echo "--- mount log tail ($log_file) ---" >&2
-      tail -n 40 "$log_file" >&2 || true
-    fi
-    FAIL=$((FAIL + 1))
-    return
-  fi
-  local got_refresh got_forced
-  got_refresh=$(echo "$out" | awk '{print $1}')
-  got_forced=$(echo "$out" | awk '{print $2}')
-  if [ "$got_refresh" -ge "$min_refresh" ] 2>/dev/null && [ "$got_refresh" -le "$max_refresh" ] 2>/dev/null; then
-    echo "PASS $desc (refresh=$got_refresh forced=$got_forced in [$min_refresh,$max_refresh])"
-    PASS=$((PASS + 1))
-  else
-    echo "FAIL $desc (refresh=$got_refresh forced=$got_forced want in [$min_refresh,$max_refresh])" >&2
-    FAIL=$((FAIL + 1))
-  fi
-}
-
-check_forced_ge() {
-  local desc="$1" log_file="$2" min_forced="$3"
-  TOTAL=$((TOTAL + 1))
-  local out
-  if ! out=$(parse_git_workspace_refresh "$log_file"); then
-    echo "FAIL $desc (perf git_workspace line missing in $log_file)" >&2
-    FAIL=$((FAIL + 1))
-    return
-  fi
-  local got_forced
-  got_forced=$(echo "$out" | awk '{print $2}')
-  if [ "$got_forced" -ge "$min_forced" ] 2>/dev/null; then
-    echo "PASS $desc (forced_refresh=$got_forced >= $min_forced)"
-    PASS=$((PASS + 1))
-  else
-    echo "FAIL $desc (forced_refresh=$got_forced want>=$min_forced)" >&2
-    FAIL=$((FAIL + 1))
-  fi
 }
 
 # Count index entries whose root_path is under remote_root (tenant-absolute prefix).
@@ -564,29 +426,6 @@ index_has_no_entries_for_root() {
   local n
   n=$(index_count_for_root "$remote_root") || return 1
   [ "$n" = "0" ]
-}
-
-# Count live ListGitWorkspaces entries under remote_root.
-# Non-200 is an error (not "0") so zero-asserts cannot false-green on outage.
-list_count_for_root() {
-  local remote_root="$1"
-  local resp code body
-  resp=$(curl_body_code GET "$BASE/v1/git-workspaces" "$API_KEY")
-  code=$(http_code "$resp")
-  if [ "$code" != "200" ]; then
-    echo "ListGitWorkspaces unexpected status $code" >&2
-    return 1
-  fi
-  body=$(json_body "$resp")
-  printf '%s' "$body" | jq -r --arg root "$remote_root" '
-    [.workspaces // []
-     | .[]
-     | select(
-         ((.root_path // "") == $root)
-         or ((.root_path // "") | startswith($root + "/"))
-       )
-    ] | length
-  '
 }
 
 # Stat index revision via ?stat=1 (prefer over HEAD; some .drive9 paths hang).
@@ -692,51 +531,30 @@ rewrite_index_without_root() {
   return 1
 }
 
-# Poll until index+list report zero under remote_root (or timeout).
+# Poll until the index reports zero under remote_root (or timeout).
 wait_root_cleared() {
   local remote_root="$1"
   local timeout_s="${2:-20}"
-  local deadline i_n l_n
+  local deadline i_n
   deadline=$(( $(date +%s) + timeout_s ))
   while :; do
     i_n=$(index_count_for_root "$remote_root" 2>/dev/null || echo "?")
-    l_n=$(list_count_for_root "$remote_root" 2>/dev/null || echo "?")
-    if [ "$i_n" = "0" ] && [ "$l_n" = "0" ]; then
+    if [ "$i_n" = "0" ]; then
       return 0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      echo "wait_root_cleared: timeout index=$i_n list=$l_n root=$remote_root" >&2
+      echo "wait_root_cleared: timeout index=$i_n root=$remote_root" >&2
       return 1
     fi
     sleep 1
   done
 }
 
-# Delete all git workspaces whose root_path is under remote_root, and filter index.
+# Deregister every workspace under remote_root: rewrite the index without
+# the root. The store subtrees stay (crash-safe by design; a later sweep
+# collects orphans) — with no index entry no mount consumes them.
 cleanup_suite_workspaces() {
   local remote_root="$1"
-  local resp code body
-  resp=$(curl_body_code GET "$BASE/v1/git-workspaces" "$API_KEY")
-  code=$(http_code "$resp")
-  if [ "$code" = "200" ]; then
-    body=$(json_body "$resp")
-    printf '%s' "$body" | jq -r --arg root "$remote_root" '
-      (.workspaces // [])[]
-      | select(
-          ((.root_path // "") == $root)
-          or ((.root_path // "") | startswith($root + "/"))
-        )
-      | .workspace_id
-    ' | while read -r ws_id; do
-      [ -n "$ws_id" ] || continue
-      curl -sS --max-time 30 -o /dev/null -X DELETE \
-        -H "Authorization: Bearer $API_KEY" \
-        "$BASE/v1/git-workspaces/$ws_id" || true
-    done
-  elif [ "$code" != "000" ]; then
-    # Non-200 list is non-fatal for pre-suite cleanup of a brand-new root.
-    :
-  fi
   rewrite_index_without_root "$remote_root"
 }
 
@@ -747,7 +565,7 @@ wait_path_has_fixture_readme() {
     if [ -f "$path" ] && grep -q "Drive9 fixture" "$path" 2>/dev/null; then
       return 0
     fi
-    # Poke the directory so on-demand git layer can arm/list if index is present.
+    # Discovery is event-driven; the ls is only a benign poll tick.
     ls "$(dirname "$path")" >/dev/null 2>&1 || true
     sleep 1
   done
@@ -795,8 +613,8 @@ assert_fixture_readme() {
   grep -q "Drive9 fixture" "$repo/README.md"
 }
 
-# Generate FS activity that would previously have driven ~1 ListGitWorkspaces/s.
-# Includes paths containing a ".git" segment so dormant must not force-list on them.
+# Generate ordinary FS noise, including paths with a ".git" segment: a
+# dormant mount (no workspaces) must serve it as plain classic paths.
 dormant_fs_activity() {
   local root="$1"
   local loops="${2:-$GIT_ONDEMAND_DORMANT_ACTIVITY_LOOPS}"
@@ -813,29 +631,6 @@ dormant_fs_activity() {
     touch "$root/activity/proj/.git/config" 2>/dev/null || true
     ls "$root/activity/proj/.git" >/dev/null 2>&1 || true
     cat "$root/activity/proj/.git/config" >/dev/null 2>&1 || true
-  done
-}
-
-# Ordinary FS noise while ARMED. Intentionally avoids ".git" path segments so
-# shouldForceRefreshGitWorkspacesForGitStatePath cannot inflate refresh and
-# muddy G3/G4 "no idle list storm" claims. Wall-clock duration is long enough
-# that a restored 1s TTL poll would exceed GIT_ONDEMAND_REFRESH_MAX_SINGLE.
-armed_idle_fs_activity() {
-  local root="$1"
-  local seconds="${2:-$GIT_ONDEMAND_ARMED_IDLE_S}"
-  local deadline i
-  mkdir -p "$root/activity/a" "$root/activity/b"
-  deadline=$(( $(date +%s) + seconds ))
-  i=0
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    i=$((i + 1))
-    echo "armed idle $i" >"$root/activity/a/idle-$i.txt"
-    echo "other $i" >"$root/activity/b/idle-$i.txt"
-    ls -la "$root/activity" >/dev/null
-    ls -la "$root/activity/a" >/dev/null
-    cat "$root/activity/a/idle-$i.txt" >/dev/null
-    find "$root/activity" -type f >/dev/null 2>&1 || true
-    sleep 0.25
   done
 }
 
@@ -903,8 +698,6 @@ echo "=== drive9 git-workspace on-demand discovery e2e ==="
 echo "BASE=$BASE"
 echo "CLI_SOURCE=$CLI_SOURCE"
 echo "DORMANT_ACTIVITY_LOOPS=$GIT_ONDEMAND_DORMANT_ACTIVITY_LOOPS"
-echo "ARMED_IDLE_S=$GIT_ONDEMAND_ARMED_IDLE_S"
-echo "REFRESH_MAX_SINGLE=$GIT_ONDEMAND_REFRESH_MAX_SINGLE REFRESH_MAX_DUAL=$GIT_ONDEMAND_REFRESH_MAX_DUAL"
 
 check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
 check_cmd "git is available" bash -c 'command -v git >/dev/null'
@@ -955,15 +748,13 @@ mount_a="$RUN_ROOT/mnt-a"
 local_a="$RUN_ROOT/local-a"
 log_a="$RUN_ROOT/mount-a.log"
 check_cmd "A mount starts" start_mount "$mount_a" "$local_a" "$log_a" "$REMOTE_ROOT"
-# Probe may take a moment; activity that would have listed every second historically.
 check_cmd "A dormant FS activity (incl .git segments)" dormant_fs_activity "$mount_a"
 check_cmd "A index has no entries for suite RemoteRoot" index_has_no_entries_for_root "$REMOTE_ROOT"
 check_cmd "A mount log audit" audit_mount_log "$log_a"
 stop_mount
-check_refresh_eq "A G0 zero git_workspace refresh after dormant activity" "$log_a" "0"
 
 # ---------------------------------------------------------------------------
-# Scenario B — G1: same LocalRoot live --fast arms and lists
+# Scenario B — G1: same LocalRoot live --fast registers and serves
 # ---------------------------------------------------------------------------
 echo "[B] G1 live --fast on same LocalRoot"
 mount_b="$RUN_ROOT/mnt-b"
@@ -972,7 +763,7 @@ log_b="$RUN_ROOT/mount-b.log"
 check_cmd "B mount starts" start_mount "$mount_b" "$local_b" "$log_b" "$REMOTE_ROOT"
 repo_b="$mount_b/repo-main"
 check_cmd "B clone --fast" \
-  drive9_with_timeout "$GIT_ONDEMAND_CLONE_TIMEOUT_S" git clone --fast --hydrate=off "$FIXTURE_URL" "$repo_b"
+  drive9_with_timeout "$GIT_ONDEMAND_CLONE_TIMEOUT_S" git clone --fast --blobless --hydrate=sync "$FIXTURE_URL" "$repo_b"
 check_cmd "B repo ready after --fast" wait_repo_git_ready "$repo_b"
 check_cmd "B fixture README readable via git layer" wait_path_has_fixture_readme "$repo_b/README.md"
 # Next FS ops should keep using git layer without errors.
@@ -989,20 +780,8 @@ idx_code=$(stat_remote_index)
 check_eq "B remote index GET is 200 after --fast" "$idx_code" "200"
 idx_n=$(index_count_for_root "$REMOTE_ROOT") || idx_n="err"
 check_ge "B remote index lists >=1 workspace under suite RemoteRoot" "$idx_n" "1"
-ws_count=$(list_count_for_root "$REMOTE_ROOT") || ws_count="err"
-check_ge "B ListGitWorkspaces returns >=1 under suite RemoteRoot" "$ws_count" "1"
-# Local arm markers should exist under local_root.
-check_cmd "B local armed marker exists" \
-  bash -c "test -f '$local_b/git-workspaces/armed' || ls '$local_b/git-workspaces/refresh' 2>/dev/null | grep -q ."
-# Armed idle: wall-clock ordinary FS noise (no .git segments). A restored 1s poll
-# over GIT_ONDEMAND_ARMED_IDLE_S would exceed REFRESH_MAX_SINGLE.
-check_cmd "B armed idle FS activity (${GIT_ONDEMAND_ARMED_IDLE_S}s, no .git)" \
-  armed_idle_fs_activity "$mount_b" "$GIT_ONDEMAND_ARMED_IDLE_S"
 check_cmd "B mount log audit" audit_mount_log "$log_b"
 stop_mount
-check_refresh_between "B G1 git_workspace refresh in [1,max] after live --fast+idle" \
-  "$log_b" "1" "$GIT_ONDEMAND_REFRESH_MAX_SINGLE"
-check_forced_ge "B G1 forced_refresh >= 1 (arm path)" "$log_b" "1"
 
 # ---------------------------------------------------------------------------
 # Scenario C — G2: fresh LocalRoot remount discovers via remote index
@@ -1020,13 +799,11 @@ check_cmd "C remounted repo becomes git-ready" wait_repo_git_ready "$repo_c"
 check_cmd "C remounted git log works" bash -c "git -C '$repo_c' log --oneline -1 >/dev/null"
 check_cmd "C mount log audit" audit_mount_log "$log_c"
 stop_mount
-check_refresh_between "C G2 remount armed via index (refresh in [1,max])" \
-  "$log_c" "1" "$GIT_ONDEMAND_REFRESH_MAX_SINGLE"
 
 # ---------------------------------------------------------------------------
-# Scenario D — G3: second --fast on armed mount forces additional list
+# Scenario D — G3: second --fast on a live mount registers another workspace
 # ---------------------------------------------------------------------------
-echo "[D] G3 second --fast on armed mount increases refresh"
+echo "[D] G3 second --fast on the same mount"
 mount_d="$RUN_ROOT/mnt-d"
 local_d="$RUN_ROOT/local-d"
 log_d="$RUN_ROOT/mount-d.log"
@@ -1034,44 +811,32 @@ check_cmd "D mount starts" start_mount "$mount_d" "$local_d" "$log_d" "$REMOTE_R
 repo_d1="$mount_d/repo-d1"
 repo_d2="$mount_d/repo-d2"
 check_cmd "D first clone --fast" \
-  drive9_with_timeout "$GIT_ONDEMAND_CLONE_TIMEOUT_S" git clone --fast --hydrate=off "$FIXTURE_URL" "$repo_d1"
+  drive9_with_timeout "$GIT_ONDEMAND_CLONE_TIMEOUT_S" git clone --fast --blobless --hydrate=sync "$FIXTURE_URL" "$repo_d1"
 check_cmd "D first repo ready" wait_repo_git_ready "$repo_d1"
-# Touch FS so first arm list is definitely done; then short ordinary idle (no .git).
-ls -la "$repo_d1" >/dev/null
-sleep 0.5
 # Baseline after first --fast: at least one workspace under this root.
 # Do not default a transport failure to "0" — that softens the growth check.
 ws_after_first=""
-if ws_after_first=$(list_count_for_root "$REMOTE_ROOT"); then
+if ws_after_first=$(index_count_for_root "$REMOTE_ROOT"); then
   :
 else
   ws_after_first="err"
 fi
-check_ge "D ListGitWorkspaces >=1 after first --fast" "$ws_after_first" "1"
+check_ge "D remote index >=1 workspace after first --fast" "$ws_after_first" "1"
 check_cmd "D second clone --fast (new root)" \
-  drive9_with_timeout "$GIT_ONDEMAND_CLONE_TIMEOUT_S" git clone --fast --hydrate=off "$FIXTURE_URL" "$repo_d2"
+  drive9_with_timeout "$GIT_ONDEMAND_CLONE_TIMEOUT_S" git clone --fast --blobless --hydrate=sync "$FIXTURE_URL" "$repo_d2"
 check_cmd "D second repo ready" wait_repo_git_ready "$repo_d2"
-# Force path resolution after second arm marker so pendingForce actually fires.
-ls -la "$repo_d2" >/dev/null
-find "$mount_d" -maxdepth 2 >/dev/null 2>&1 || true
+check_cmd "D first repo README still visible" wait_path_has_fixture_readme "$repo_d1/README.md"
+check_cmd "D second repo README visible" wait_path_has_fixture_readme "$repo_d2/README.md"
 check_cmd "D mount log audit" audit_mount_log "$log_d"
 stop_mount
-# At least two list cycles: initial arm + second workspace registration force.
-# forced_refresh >= 2 tightens G3 (second --fast force path) beyond aggregate refresh.
-# Upper bound catches silent regression to 1s idle poll during the scenario.
-check_refresh_between "D G3 refresh in [2,max] after two --fast on same mount" \
-  "$log_d" "2" "$GIT_ONDEMAND_REFRESH_MAX_DUAL"
-check_forced_ge "D G3 forced_refresh >= 2 (arm + second --fast force)" "$log_d" "2"
-ws_count=$(list_count_for_root "$REMOTE_ROOT") || ws_count="err"
-check_ge "D ListGitWorkspaces returns >=2 under suite RemoteRoot" "$ws_count" "2"
-# Growth after second clone proves the second registration landed (complements force counter).
+ws_count=$(index_count_for_root "$REMOTE_ROOT") || ws_count="err"
+check_ge "D remote index returns >=2 workspace entries under suite RemoteRoot" "$ws_count" "2"
+# Growth after second clone proves the second registration landed.
 if [ "$ws_after_first" != "err" ] && [ -n "$ws_after_first" ]; then
-  check_ge "D ListGitWorkspaces grew after second --fast" "$ws_count" "$((ws_after_first + 1))"
+  check_ge "D remote index grew after second --fast" "$ws_count" "$((ws_after_first + 1))"
 else
-  check_cmd "D ListGitWorkspaces grew after second --fast (baseline unreadable)" false
+  check_cmd "D remote index grew after second --fast (baseline unreadable)" false
 fi
-idx_n=$(index_count_for_root "$REMOTE_ROOT") || idx_n="err"
-check_ge "D remote index has >=2 workspace entries under suite RemoteRoot" "$idx_n" "2"
 fetch_remote_index_body >"$RUN_ROOT/index-d.json"
 
 # ---------------------------------------------------------------------------
@@ -1100,29 +865,26 @@ check_cmd "E final remount sees repo-d1 README" wait_path_has_fixture_readme "$m
 check_cmd "E final remount sees repo-d2 README" wait_path_has_fixture_readme "$mount_e/repo-d2/README.md"
 check_cmd "E mount log audit" audit_mount_log "$log_e"
 stop_mount
-check_refresh_between "E final remount refresh in [1,max]" \
-  "$log_e" "1" "$GIT_ONDEMAND_REFRESH_MAX_SINGLE"
 
 # ---------------------------------------------------------------------------
-# Scenario F — AC5: delete suite workspaces + empty index for root → remount
-# refresh=0 (back to DORMANT for this RemoteRoot).
+# Scenario F — AC5: drop the index entries for the root → a remount is
+# dormant again for this RemoteRoot (the index is the kill-switch).
 # ---------------------------------------------------------------------------
-echo "[F] AC5 cleanup suite workspaces then remount stays dormant (refresh=0)"
+echo "[F] AC5 deregister suite workspaces then remount stays dormant"
 check_cmd "F cleanup suite workspaces + rewrite index" cleanup_suite_workspaces "$REMOTE_ROOT"
-check_cmd "F wait root cleared (index+list)" wait_root_cleared "$REMOTE_ROOT" 20
+check_cmd "F wait root cleared (index)" wait_root_cleared "$REMOTE_ROOT" 20
 check_cmd "F index has no entries for suite RemoteRoot after cleanup" \
   index_has_no_entries_for_root "$REMOTE_ROOT"
-list_after_cleanup=$(list_count_for_root "$REMOTE_ROOT") || list_after_cleanup="err"
-check_eq "F ListGitWorkspaces under suite RemoteRoot is 0 after cleanup" \
-  "$list_after_cleanup" "0"
 mount_f="$RUN_ROOT/mnt-f"
 local_f="$RUN_ROOT/local-f"
 log_f="$RUN_ROOT/mount-f.log"
 check_cmd "F remount starts after cleanup" start_mount "$mount_f" "$local_f" "$log_f" "$REMOTE_ROOT"
 check_cmd "F dormant FS activity after cleanup" dormant_fs_activity "$mount_f" 15
+# Dormant is observable: with no index entry the workspace view is gone.
+check_cmd "F deregistered repo paths stay absent from the dormant view" \
+  bash -c '! test -e "$mount_f/repo-main" && ! test -e "$mount_f/repo-d1"'
 check_cmd "F mount log audit" audit_mount_log "$log_f"
 stop_mount
-check_refresh_eq "F AC5 zero git_workspace refresh after cleanup remount" "$log_f" "0"
 
 echo
 echo "=== drive9 git-workspace on-demand e2e result ==="

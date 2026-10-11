@@ -504,8 +504,6 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/journals", business)
 	mux.Handle("/v1/journals/", business)
 	mux.Handle("/v1/journal-entries", business)
-	mux.Handle("/v1/git-workspaces", business)
-	mux.Handle("/v1/git-workspaces/", business)
 	mux.Handle("/v1/layers", business)
 	mux.Handle("/v1/layers/", business)
 	mux.Handle("/v1/layer-checkpoints/", business)
@@ -1574,8 +1572,6 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleEvents(w, r)
 	case r.URL.Path == "/v1/journals" || strings.HasPrefix(r.URL.Path, "/v1/journals/") || r.URL.Path == "/v1/journal-entries":
 		s.handleJournal(w, r)
-	case r.URL.Path == "/v1/git-workspaces" || strings.HasPrefix(r.URL.Path, "/v1/git-workspaces/"):
-		s.handleGitWorkspaces(w, r)
 	case r.URL.Path == "/v1/layers" || strings.HasPrefix(r.URL.Path, "/v1/layers/") || strings.HasPrefix(r.URL.Path, "/v1/layer-checkpoints/"):
 		s.handleFSLayers(w, r)
 	case r.URL.Path == "/v1/object-credentials":

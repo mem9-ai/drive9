@@ -1,10 +1,13 @@
+// Shared wire types for the FS-native git workspace store: the CLI
+// reads and writes these records as /.drive9/git-workspaces/ files
+// (pkg/gitws layout); there is no dedicated server API anymore.
+
 // FS-native git workspace store: the client-side writer/reader of
 // /.drive9/git-workspaces/**. Every record the git feature persists —
 // the workspace manifest, the lifecycle state, the tracked-path index,
 // the dirty mirror, the git object packs, and the .git state archive —
-// lives here as plain drive9 files written through the regular fs API.
-// The server's /v1/git-workspaces* endpoints are legacy (pre-FS-native
-// workspaces) and are no longer consulted by the CLI or the mount.
+// lives here as plain drive9 files written through the regular fs API;
+// there is no dedicated server API.
 package client
 
 import (
@@ -22,6 +25,72 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/gitws"
 )
+
+type GitWorkspaceRequest struct {
+	// WorkspaceID pins the record id (FS-native store); empty lets the
+	// server (legacy API) or the client (FS-native store) allocate one.
+	WorkspaceID       string `json:"workspace_id,omitempty"`
+	RootPath          string `json:"root_path"`
+	RepoURL           string `json:"repo_url"`
+	RemoteName        string `json:"remote_name,omitempty"`
+	BranchName        string `json:"branch_name,omitempty"`
+	BaseCommit        string `json:"base_commit,omitempty"`
+	HeadCommit        string `json:"head_commit,omitempty"`
+	Mode              string `json:"mode,omitempty"`
+	WorkspaceKind     string `json:"workspace_kind,omitempty"`
+	CommonWorkspaceID string `json:"common_workspace_id,omitempty"`
+	WorktreeName      string `json:"worktree_name,omitempty"`
+	GitDirRel         string `json:"gitdir_rel,omitempty"`
+}
+type GitWorkspace struct {
+	WorkspaceID       string    `json:"workspace_id"`
+	RootPath          string    `json:"root_path"`
+	RepoURL           string    `json:"repo_url"`
+	RemoteName        string    `json:"remote_name"`
+	BranchName        string    `json:"branch_name"`
+	BaseCommit        string    `json:"base_commit"`
+	HeadCommit        string    `json:"head_commit"`
+	Mode              string    `json:"mode"`
+	WorkspaceKind     string    `json:"workspace_kind"`
+	CommonWorkspaceID string    `json:"common_workspace_id"`
+	WorktreeName      string    `json:"worktree_name"`
+	GitDirRel         string    `json:"gitdir_rel"`
+	Status            string    `json:"status"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+type GitTreeNode struct {
+	WorkspaceID string    `json:"workspace_id,omitempty"`
+	CommitSHA   string    `json:"commit_sha,omitempty"`
+	Path        string    `json:"path"`
+	ParentPath  string    `json:"parent_path"`
+	Name        string    `json:"name"`
+	Kind        string    `json:"kind"`
+	Mode        string    `json:"mode"`
+	ObjectSHA   string    `json:"object_sha"`
+	SizeBytes   int64     `json:"size_bytes"`
+	CreatedAt   time.Time `json:"created_at,omitempty"`
+}
+type GitState struct {
+	WorkspaceID      string    `json:"workspace_id"`
+	CheckpointCommit string    `json:"checkpoint_commit"`
+	StorageType      string    `json:"storage_type"`
+	StorageRef       string    `json:"storage_ref"`
+	StorageRefHash   string    `json:"storage_ref_hash"`
+	ChecksumSHA256   string    `json:"checksum_sha256"`
+	SizeBytes        int64     `json:"size_bytes"`
+	Content          []byte    `json:"content,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+type GitObjectPack struct {
+	WorkspaceID    string    `json:"workspace_id"`
+	PackID         string    `json:"pack_id"`
+	ChecksumSHA256 string    `json:"checksum_sha256"`
+	SizeBytes      int64     `json:"size_bytes"`
+	Content        []byte    `json:"content,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+}
 
 // GitWorkspaceFSRoot is the FS-native git workspace store root.
 const GitWorkspaceFSRoot = gitws.Root

@@ -1019,13 +1019,19 @@ main() {
   run_git_ops_suite "$ops_repo" "$bare_repo" "$TS"
   run_git_flow_suite "$git_mount" "$file_url"
 
-  local ws_json ws_id
-  ws_json="$(curl -sS -H "Authorization: Bearer $API_KEY" "$BASE/v1/git-workspaces?root_path=/$git_root_rel/ops/" || true)"
-  ws_id="$(printf '%s' "$ws_json" | jq -r '.workspace_id // empty' 2>/dev/null || true)"
+  # Registration is FS-native: the workspace record exists when the
+  # /.drive9/git-workspaces/ index carries an entry for the ops root.
+  local idx_body idx_n ws_id
+  idx_body="$(curl -sS -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/.drive9/git-workspaces/index.json" || true)"
+  ws_id="$(printf '%s' "$idx_body" | jq -r --arg root "/$git_root_rel/ops" '
+    [.workspaces // []
+     | .[]
+     | select((.root_path // "") == $root or (.root_path // "") == ($root + "/"))
+    ][0].workspace_id // empty' 2>/dev/null || true)"
   if [ -n "$ws_id" ]; then
-    record "PASS" "Drive9 Git Workspace Behavior" "tree manifest registered" "workspace_id=$ws_id"
+    record "PASS" "Drive9 Git Workspace Behavior" "workspace record registered" "workspace_id=$ws_id"
   else
-    record "FAIL" "Drive9 Git Workspace Behavior" "tree manifest registered" "$ws_json"
+    record "FAIL" "Drive9 Git Workspace Behavior" "workspace record registered" "$idx_body"
   fi
 
   run_restore_suite "$git_root_rel" "$file_url" "$git_mount" "$git_local" "$RUN_ROOT/git-mount-a.log"

@@ -109,11 +109,11 @@ func gitClone(args []string) error {
 	}
 
 	// Mark the root as a workspace-in-progress BEFORE git writes `.git`. The
-	// workspace row is only registered after the clone, so without this marker a
-	// live mount would classify `.git` as remote during the clone and upload the
-	// object database. The marker is cleared on failure; on success it is left in
-	// place (the registered workspace takes over, and ClearLocalArmSignals drops
-	// it when the last workspace is deleted).
+	// workspace record is only registered after the clone, so without this
+	// marker a live mount would classify `.git` as remote during the clone and
+	// upload the object database. The marker is cleared on failure; on success
+	// it is left in place (the registered workspace takes over, and
+	// `git worktree remove` drops it when the workspace goes away).
 	workspaceRoot := mountLocalRootForTarget(resolved)
 	if err := gitcache.MarkWorkspacePending(cmdCtx, resolved.LocalRoot, workspaceRoot); err != nil {
 		return fmt.Errorf("mark git workspace pending: %w", err)
@@ -203,9 +203,6 @@ func gitClone(args []string) error {
 	// Index + local arm before success/hydrate so live mounts and remounts discover us.
 	if err := publishGitWorkspaceIndexEntry(cmdCtx, c, ws); err != nil {
 		return fmt.Errorf("registered git workspace %s, but publishing discovery index failed: %w", ws.WorkspaceID, err)
-	}
-	if err := markLocalGitWorkspaceRegistered(cmdCtx, resolved, ws.WorkspaceID); err != nil {
-		return fmt.Errorf("registered git workspace %s, but writing local discovery marker failed: %w", ws.WorkspaceID, err)
 	}
 	registered = true
 
@@ -432,9 +429,6 @@ func gitWorktreeAdd(args []string) error {
 	if err := publishGitWorkspaceIndexEntry(cmdCtx, c, ws); err != nil {
 		return fmt.Errorf("registered linked git workspace %s, but publishing discovery index failed: %w", ws.WorkspaceID, err)
 	}
-	if err := markLocalGitWorkspaceRegistered(cmdCtx, worktreeResolved, ws.WorkspaceID); err != nil {
-		return fmt.Errorf("registered linked git workspace %s, but writing local discovery marker failed: %w", ws.WorkspaceID, err)
-	}
 	worktreeRegistered = true
 
 	fmt.Fprintf(os.Stderr, "drive9: registered linked git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, worktreeResolved.RemotePath, len(nodes))
@@ -562,9 +556,6 @@ func gitWorktreeRemove(args []string) error {
 	// Local cleanup is independent of remote index success after the
 	// deletion returns. Collect errors so partial local failure is visible.
 	var cleanupErrs []error
-	if err := markLocalGitWorkspaceDeleted(cmdCtx, resolved, ws.WorkspaceID); err != nil {
-		cleanupErrs = append(cleanupErrs, fmt.Errorf("mark linked git workspace deleted locally: %w", err))
-	}
 	// The `git worktree add --fast` pending marker lives for the workspace's
 	// lifetime; drop it now so a later ordinary clone at this root is
 	// remote-backed again. Other roots' markers are preserved.
@@ -936,28 +927,6 @@ func localOverlayRootForMountedTarget(resolved mountedGitTarget) (string, error)
 		localPath = filepath.Join(localPath, resolved.MountRel)
 	}
 	return localPath, nil
-}
-
-func markLocalGitWorkspaceDeleted(ctx context.Context, resolved mountedGitTarget, workspaceID string) error {
-	localRoot := strings.TrimSpace(resolved.LocalRoot)
-	if localRoot == "" || strings.TrimSpace(workspaceID) == "" {
-		return nil
-	}
-	if !filepath.IsAbs(localRoot) {
-		return fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
-	}
-	return gitcache.MarkWorkspaceDeleted(ctx, localRoot, workspaceID)
-}
-
-func markLocalGitWorkspaceRegistered(ctx context.Context, resolved mountedGitTarget, workspaceID string) error {
-	localRoot := strings.TrimSpace(resolved.LocalRoot)
-	if localRoot == "" || strings.TrimSpace(workspaceID) == "" {
-		return nil
-	}
-	if !filepath.IsAbs(localRoot) {
-		return fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
-	}
-	return gitcache.MarkWorkspaceRegistered(ctx, localRoot, workspaceID)
 }
 
 func publishGitWorkspaceIndexEntry(ctx context.Context, c *client.Client, ws *client.GitWorkspace) error {

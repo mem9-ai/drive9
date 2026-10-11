@@ -217,7 +217,6 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 		)`,
 		`CREATE INDEX idx_fs_events_created ON fs_events(created_at)`,
 	}
-	stmts = append(stmts, GitWorkspaceTiDBSchemaStatements()...)
 	stmts = append(stmts, FSLayerTiDBSchemaStatements()...)
 	stmts = append(stmts, JournalTiDBSchemaStatements()...)
 	stmts = append(stmts, VaultTiDBSchemaStatements()...)
