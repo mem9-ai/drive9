@@ -36,7 +36,7 @@ func phantomMountChain(t *testing.T) *FS {
 	}
 	bus := fs.NewEventBus()
 	rg, _ := renameguard.New(renameguard.Options{})
-	ge, err := git.New(git.Options{Client: cl, Events: bus})
+	ge, err := git.New(git.Options{Events: bus})
 	if err != nil {
 		t.Fatal(err)
 	}

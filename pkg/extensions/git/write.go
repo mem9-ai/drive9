@@ -1,25 +1,25 @@
 // The workspace write plane: claimed files buffer locally and land as one
-// overlay entry per durability boundary instead of one HTTP round trip
-// per write.
+// whole-image mirror write per durability boundary instead of one store
+// round trip per write chunk. The buffer seeds lazily from the resolved
+// layer (mirror image or clean tree content) through the store view.
 package git
 
 import (
 	"context"
-	"fmt"
-	"io"
 	"sync"
 	"syscall"
 
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
+	"github.com/mem9-ai/drive9/pkg/gitws"
 )
 
 // bufferedMaxTotal caps a claimed file's local buffer.
 const bufferedMaxTotal = 10 << 30
 
 // gitHandle is the claimed data-plane handle of a workspace file: writes
-// buffer over the current image (overlay content or the base object) and
-// land as one overlay entry at the next durability boundary.
+// buffer over the current image (mirror content or clean tree content)
+// and land as one mirror write at the next durability boundary.
 type gitHandle struct {
 	g     *Git
 	w     *workspace
@@ -27,9 +27,6 @@ type gitHandle struct {
 	rel   string
 	flags uint32
 	mode  uint32
-	// treeSHA set on a clean-tree read handle: reads materialize the
-	// blob instead of falling to the (absent) base-plane entry.
-	treeSHA string
 
 	mu       sync.Mutex
 	buf      *writebuffer.WriteBuffer
@@ -39,35 +36,25 @@ type gitHandle struct {
 
 // claimWorkspaceOpen wraps a write-intent open of a workspace file.
 func (g *Git) claimWorkspaceOpen(w *workspace, path, rel string, flags uint32, mode uint32) (*gitHandle, error) {
-	e, hit := w.lookup(rel)
-	// A whiteouted name still answers ENOENT to plain opens; a create
-	// (O_CREAT) instead claims the name fresh — the whiteout is replaced
-	// by the new upsert at the next commit boundary.
-	if hit && e.Op == "whiteout" && flags&uint32(syscall.O_CREAT) == 0 {
+	res := g.resolveIn(w, rel)
+	if res.layer == layerHidden && !res.tracked() {
 		return nil, fs.ErrNotFound
 	}
-	if hit && e.Op != "whiteout" && e.Kind != "file" {
+	if res.layer == layerOverlay && res.node.kind != fs.KindFile {
 		return nil, syscall.EISDIR
 	}
-	if hit && e.Op == "whiteout" {
-		hit = false // fresh create over the whiteout
+	if res.layer == layerTree && kindOfEntry(res.ent.Kind) != fs.KindFile {
+		return nil, syscall.EISDIR
 	}
 	h := &gitHandle{g: g, w: w, path: path, rel: rel, flags: flags}
-	if hit {
-		h.mode = parseMode(e.Mode)
+	if res.layer == layerOverlay {
+		h.mode = res.node.mode
 	}
 	if h.mode == 0 {
 		h.mode = mode & 0o777
 	}
 	if h.mode == 0 {
-		// An in-place modify of a clean tree file carries no create mode
-		// (append opens, O_TRUNC rewrites of existing names): the file
-		// keeps the tree node's mode — a stash/checkout restore that
-		// rewrites content in place must not regress an 0755 fixture
-		// file to 0644 in the published overlay entry.
-		if n, tok := w.treeLookup(rel); tok {
-			h.mode = parseMode(n.Mode)
-		}
+		h.mode = parseMode(res.ent.Mode)
 	}
 	if h.mode == 0 {
 		h.mode = 0o644
@@ -79,65 +66,35 @@ func (h *gitHandle) Attr() fs.Attr {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	size := int64(0)
-	mtime := h.w.cleanTreeMtime()
-	if e, hit := h.w.lookup(h.rel); hit && e.Op == "upsert" {
-		size = int64(len(e.Content))
-		if !e.mtime.IsZero() {
-			mtime = e.mtime
-		}
+	if node, hit := h.w.lookup(h.rel); hit && !node.blackout {
+		size = node.size
+	} else if ent, ok := h.w.isTracked(h.rel); ok {
+		size = ent.Size
 	}
 	if h.buf != nil {
 		size = h.buf.Size()
 	}
-	if size == 0 && h.treeSHA != "" {
-		if n, tok := h.w.treeLookup(h.rel); tok {
-			size = n.SizeBytes
-			if size < 0 {
-				size = h.g.blobSize(h.w, h.treeSHA)
-				h.w.noteTreeSize(h.rel, size)
-			}
-		}
-	}
-	return fs.Attr{Kind: fs.KindFile, Mode: h.mode, Size: size, Mtime: mtime}
+	return fs.Attr{Kind: fs.KindFile, Mode: h.mode, Size: size}
 }
 
 func (h *gitHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.buf == nil && h.treeSHA != "" {
-		if _, hit := h.w.lookup(h.rel); !hit {
-			data, err := h.g.materializeBlob(h.w, h.treeSHA)
-			if err != nil {
-				// The blob's local .git may simply not be here yet: the
-				// discovery-time restore ran before the CLI uploaded its
-				// checkpoint. Pull the state once, then retry.
-				if rerr := h.g.ensureWorkspaceState(ctx, h.w); rerr == nil {
-					data, err = h.g.materializeBlob(h.w, h.treeSHA)
-				}
-			}
+	if h.buf == nil {
+		store := h.g.storeView()
+		if store == nil {
+			return 0, fs.ErrUnsupported
+		}
+		res := h.g.resolveIn(h.w, h.rel)
+		switch res.layer {
+		case layerOverlay, layerTree:
+			data, err := store.Read(ctx, res.storePath, off, int64(len(dest)))
 			if err != nil {
 				return 0, err
 			}
-			h.w.noteTreeSize(h.rel, int64(len(data)))
-			if off >= int64(len(data)) {
-				return 0, nil
-			}
-			return copy(dest, data[off:]), nil
+			return copy(dest, data), nil
 		}
-	}
-	if h.buf == nil {
-		if e, hit := h.w.lookup(h.rel); hit && e.Op == "upsert" {
-			if off >= int64(len(e.Content)) {
-				return 0, nil
-			}
-			return copy(dest, e.Content[off:]), nil
-		}
-		rc, err := h.g.cl.ReadStreamRange(ctx, h.path, off, int64(len(dest)))
-		if err != nil {
-			return 0, err
-		}
-		defer func() { _ = rc.Close() }()
-		return io.ReadFull(rc, dest)
+		return 0, fs.ErrNotFound
 	}
 	if err := h.buf.EnsurePartsForWrite(off, int64(len(dest))); err != nil {
 		return 0, err
@@ -206,7 +163,7 @@ func (h *gitHandle) SetMode(mode uint32) {
 }
 
 // markUnlinked stops the handle from ever publishing; the unlink op has
-// already written the overlay delete.
+// already written the blackout.
 func (h *gitHandle) markUnlinked() {
 	h.mu.Lock()
 	h.unlinked = true
@@ -224,7 +181,7 @@ func (h *gitHandle) retarget(path, rel string) {
 	}
 }
 
-// commit lands the dirty image as one overlay entry.
+// commit lands the dirty image as one mirror write.
 func (h *gitHandle) commit(ctx context.Context) error {
 	h.mu.Lock()
 	if h.unlinked || !h.dirty || h.buf == nil {
@@ -236,11 +193,9 @@ func (h *gitHandle) commit(ctx context.Context) error {
 		return err
 	}
 	image := append([]byte(nil), h.buf.Bytes()...)
-	// Regular-file tree modes are 6-digit octal (100644): a stray 0o100
-	// OR planted a phantom owner-exec bit (0744) on every published entry.
-	mode := fmt.Sprintf("%o", 0o100000|h.mode)
+	mode := h.mode
 	h.mu.Unlock()
-	if err := h.g.putOverlay(ctx, h.w, h.rel, overlayEntry{Op: "upsert", Kind: "file", Content: image, Mode: mode}); err != nil {
+	if err := h.g.landOverlayFile(ctx, h.w, h.rel, image, mode); err != nil {
 		return err
 	}
 	h.mu.Lock()
@@ -252,47 +207,37 @@ func (h *gitHandle) commit(ctx context.Context) error {
 }
 
 // ensureBufferLocked creates the write buffer over the current image:
-// overlay content preloads first, then the clean-tree blob (an in-place
-// modify of a tree file buffers the tree object — v1 readGitCleanFile),
-// and only then a lazy remote base. The lazy loader must NOT capture the
-// opening op's context: parts materialize at commit time (Flush/Release),
-// long after that context was canceled, and a canceled-context read turns
-// the seeded image into zero-filled garbage.
+// mirror content preloads, clean tree content stays lazy part-loading.
 func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
 	if h.buf != nil {
 		return nil
 	}
 	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
-	if e, hit := h.w.lookup(h.rel); hit && e.Op == "upsert" && len(e.Content) > 0 {
-		if _, err := h.buf.Write(0, e.Content); err != nil {
-			return err
-		}
-		h.buf.ClearDirty()
-		return nil
+	store := h.g.storeView()
+	if store == nil {
+		return fs.ErrUnsupported
 	}
-	if n, ok := h.w.treeLookup(h.rel); ok && n.Kind == "file" && n.ObjectSHA != "" {
-		data, err := h.g.materializeBlob(h.w, n.ObjectSHA)
-		if err != nil {
-			if rerr := h.g.ensureWorkspaceState(ctx, h.w); rerr == nil {
-				data, err = h.g.materializeBlob(h.w, n.ObjectSHA)
-			}
-		}
-		if err == nil {
-			if _, werr := h.buf.Write(0, data); werr != nil {
-				return werr
+	res := h.g.resolveIn(h.w, h.rel)
+	switch res.layer {
+	case layerOverlay:
+		content, err := store.Read(ctx, res.storePath, 0, 0)
+		if err == nil && len(content) > 0 {
+			if _, err := h.buf.Write(0, content); err != nil {
+				return err
 			}
 			h.buf.ClearDirty()
-			return nil
 		}
-		// Fall through to the remote base: the blob may be materializable
-		// there even though the local git dir cannot serve it.
-	}
-	if st, err := h.g.cl.StatCtx(ctx, h.path); err == nil && st != nil && st.Size > 0 {
+		return nil
+	case layerTree:
+		attr, err := store.GetAttr(ctx, res.storePath)
+		if err != nil || attr.Size <= 0 {
+			return nil // not hydrated yet: the buffer starts empty
+		}
 		partSize := h.buf.PartSize()
-		remoteSize := st.Size
+		remoteSize := attr.Size
 		g := h.g
-		path := h.path
-		loadCtx := context.Background()
+		w := h.w
+		rel := h.rel
 		h.buf.LoadPart = func(partNum int) ([]byte, error) {
 			start := int64(partNum-1) * partSize
 			end := start + partSize
@@ -302,17 +247,19 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
 			if end <= start {
 				return nil, nil
 			}
-			part := make([]byte, end-start)
-			rc, err := g.cl.ReadStreamRange(loadCtx, path, start, end-start)
+			// The commit may have moved under us; resolve fresh each load.
+			rr := g.resolveIn(w, rel)
+			if rr.layer != layerTree {
+				return nil, nil
+			}
+			part, err := g.storeView().Read(ctx, gitws.TreePath(w.id, w.head(), rel), start, end-start)
 			if err != nil {
 				return nil, err
 			}
-			defer func() { _ = rc.Close() }()
-			_, err = io.ReadFull(rc, part)
-			if err == io.ErrUnexpectedEOF {
-				err = nil
+			if len(part) < int(end-start) {
+				part = append(part, make([]byte, int(end-start)-len(part))...)
 			}
-			return part, err
+			return part, nil
 		}
 		h.buf.SeedRemote(remoteSize)
 	}

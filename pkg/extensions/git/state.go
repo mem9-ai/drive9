@@ -2,9 +2,11 @@
 // workspace's .git directory — object packing with escalating fallbacks,
 // the object-without-state archive, and the atomic restore (remote clone,
 // stored packs, archive, then the HEAD-tree hydration for blobless
-// workspaces). The per-node overlay pruning of the workspace view is
-// approximated by the workspace HeadCommit cutoff, which bounds the object
-// walk the same way for a restored workspace.
+// workspaces). All persistence goes through the /.drive9/git-workspaces
+// store view (packs/<id> + git-state.tar.gz); the per-node overlay
+// pruning of the workspace view is approximated by the workspace
+// HeadCommit cutoff, which bounds the object walk the same way for a
+// restored workspace.
 package git
 
 import (
@@ -14,7 +16,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -25,13 +26,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/gitcache"
+	"github.com/mem9-ai/drive9/pkg/gitws"
 )
 
 const (
 	gitLocalObjectMaxPackByte = 256 << 20
 
-	gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
+	gitStateStorageTarGzNoObjects = gitws.GitStateStorageTarGzNoObjects
 )
 
 func gitCommandOutput(ctx context.Context, args ...string) ([]byte, error) {
@@ -488,14 +490,23 @@ func archiveLocalGitStateDir(gitDir string) ([]byte, error) {
 			return err
 		}
 		hdr.Name = name
+		var data []byte
+		if info.Mode().IsRegular() {
+			var rerr error
+			if data, rerr = os.ReadFile(p); rerr != nil {
+				return rerr
+			}
+			// A checkpoint archive lands in the shared /.drive9 store:
+			// git config credentials must never ride along.
+			if isGitConfigStatePath(name) {
+				data = gitcache.SanitizeGitConfigCredentials(data)
+				hdr.Size = int64(len(data))
+			}
+		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
-		if info.Mode().IsRegular() {
-			data, err := os.ReadFile(p)
-			if err != nil {
-				return err
-			}
+		if len(data) > 0 {
 			if _, err := tw.Write(data); err != nil {
 				return err
 			}
@@ -597,11 +608,10 @@ func gitDirLooksUsable(ctx context.Context, gitDir string) bool {
 	return cmd.Run() == nil
 }
 
-// gitDirFor maps a workspace root onto the local overlay's .git directory.
-// The overlay roots view paths under <localRoot>/overlay (localize's
-// NewOverlay), so the restored state and git's own file traffic must land
-// there — the CLI's LocalGitDir derivation expects the same layout.
-func (g *Git) gitDirFor(root string) string {
+// localOverlayGitDir maps a view root onto the localize overlay backing
+// path of its .git directory: <LocalRoot>/overlay/<rel>/.git (the same
+// mapping the CLI derives, localGitDirForMountedTarget).
+func (g *Git) localOverlayGitDir(root string) string {
 	local := strings.TrimSuffix(strings.TrimSpace(root), "/")
 	if local == "" {
 		local = "/"
@@ -609,10 +619,44 @@ func (g *Git) gitDirFor(root string) string {
 	if !strings.HasPrefix(local, "/") {
 		local = "/" + local
 	}
-	if local == "/" {
-		return filepath.Join(g.localRoot, "overlay", ".git")
+	rel := strings.TrimPrefix(local, "/")
+	parts := []string{strings.TrimSpace(g.localRoot), "overlay"}
+	if rel != "" {
+		parts = append(parts, filepath.FromSlash(rel))
 	}
-	return filepath.Join(g.localRoot, "overlay", local[1:], ".git")
+	return filepath.Join(append(parts, ".git")...)
+}
+
+// commonGitDirFor resolves the common (main) workspace's git dir that a
+// linked worktree anchors against.
+func (g *Git) commonGitDirFor(w *workspace) (string, error) {
+	commonID := w.commonWorkspaceID()
+	if commonID == "" {
+		return "", fmt.Errorf("git workspace %s (linked) has no common_workspace_id", w.id)
+	}
+	common := g.workspaceByID(commonID)
+	if common == nil {
+		return "", fmt.Errorf("git workspace %s: common workspace %s not loaded", w.id, commonID)
+	}
+	return g.localOverlayGitDir(common.rootPath()), nil
+}
+
+// gitDirForWorkspace maps a workspace onto the local .git path its state
+// machine checkpoints and restores: a main workspace owns the overlay
+// .git directory; a linked worktree owns the common gitdir's
+// worktrees/<name> subdirectory (its work-tree .git is a pointer file).
+func (g *Git) gitDirForWorkspace(w *workspace) string {
+	if !w.linked() {
+		return g.localOverlayGitDir(w.rootPath())
+	}
+	if w.worktree() == "" {
+		return g.localOverlayGitDir(w.rootPath())
+	}
+	common, err := g.commonGitDirFor(w)
+	if err != nil {
+		return g.localOverlayGitDir(w.rootPath())
+	}
+	return filepath.Join(common, "worktrees", w.worktree())
 }
 
 // scheduleGitStateCheckpoint debounces a checkpoint for the workspace
@@ -625,7 +669,7 @@ func (g *Git) scheduleGitStateCheckpoint(path string) {
 	if !ok {
 		return
 	}
-	gitDir := g.gitDirFor(w.rootPath())
+	gitDir := g.gitDirForWorkspace(w)
 	relSlash := filepath.ToSlash(rel)
 	if relSlash != ".git" && !strings.HasPrefix(relSlash, ".git/") {
 		return
@@ -639,10 +683,10 @@ func (g *Git) scheduleGitStateCheckpoint(path string) {
 	})
 }
 
-// checkpointWorkspace packs local objects, uploads the pack, then
-// archives+uploads the state without objects.
+// checkpointWorkspace packs local objects, stores the pack, then
+// archives+stores the state without objects.
 func (g *Git) checkpointWorkspace(ctx context.Context, w *workspace, gitDir string) error {
-	if g.cl == nil {
+	if g.storeView() == nil {
 		return nil
 	}
 	if _, err := os.Stat(gitDir); err != nil {
@@ -659,7 +703,7 @@ func (g *Git) checkpointWorkspace(ctx context.Context, w *workspace, gitDir stri
 		return err
 	}
 	if len(pack) > 0 {
-		if _, err := g.cl.PutGitObjectPack(ctx, w.id, client.GitObjectPackRequest{Content: pack}); err != nil {
+		if _, err := g.putObjectPack(ctx, w.id, pack); err != nil {
 			return err
 		}
 	}
@@ -667,15 +711,7 @@ func (g *Git) checkpointWorkspace(ctx context.Context, w *workspace, gitDir stri
 	if err != nil {
 		return err
 	}
-	sum := sha256.Sum256(content)
-	_, err = g.cl.UpsertGitState(ctx, w.id, client.GitStateRequest{
-		CheckpointCommit: w.head(),
-		StorageType:      gitStateStorageTarGzNoObjects,
-		ChecksumSHA256:   hex.EncodeToString(sum[:]),
-		SizeBytes:        int64(len(content)),
-		Content:          content,
-	})
-	return err
+	return g.putGitState(ctx, w.id, w.head(), content)
 }
 
 // checkpointAllGitWorkspaces flushes every workspace's state (the shutdown
@@ -691,43 +727,28 @@ func (g *Git) checkpointAllGitWorkspaces() {
 	ctx, cancel := context.WithTimeout(context.Background(), gitCheckpointTimeout)
 	defer cancel()
 	for _, w := range workspaces {
-		if err := g.checkpointWorkspace(ctx, w, g.gitDirFor(w.rootPath())); err != nil {
+		if err := g.checkpointWorkspace(ctx, w, g.gitDirForWorkspace(w)); err != nil {
 			fmt.Fprintf(os.Stderr, "drive9: git state final checkpoint failed for workspace %s: %v\n", w.id, err)
 		}
 	}
 }
 
 // restoreWorkspaceState restores objects from the remote clone, then the
-// stored packs, then the state archive, swapped in atomically.
-// errGitStateNotReady reports that no server-side checkpoint exists yet —
-// the discovery-time restore racing the CLI's upload. Callers retry later
-// instead of consuming their restore attempt.
-var errGitStateNotReady = errors.New("git state checkpoint not available yet")
-
+// stored packs, then the state archive, swapped in atomically. Linked
+// worktrees restore into the common gitdir's worktrees/<name> and rewrite
+// their .git pointer file.
 func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
-	if g.cl == nil {
+	if g.storeView() == nil {
 		return nil
 	}
-	gitDir := g.gitDirFor(w.rootPath())
-	// v1 ensureGitStateRestored: a usable local .git owns the truth — a
-	// live `drive9 git clone --fast` on THIS mount built it, and the
-	// server's checkpoint lags the live writes. Swapping here would wipe
-	// post-clone .git changes (the identity config, exercise commits)
-	// back to the clone-time archive. Only a missing or unusable .git
-	// (a fresh-LocalRoot remount) downloads and swaps the state.
-	if gitDirLooksUsable(ctx, gitDir) {
-		return nil
-	}
-	state, err := g.cl.GetGitState(ctx, w.id)
-	if err != nil {
-		if client.IsNotFound(err) {
-			return errGitStateNotReady
-		}
+	state, ok, err := g.getGitState(ctx, w.id)
+	if err != nil || !ok {
 		return err
 	}
-	if state == nil {
-		return errGitStateNotReady
+	if w.linked() && w.worktree() != "" {
+		return g.restoreLinkedWorktreeState(ctx, w, state)
 	}
+	gitDir := g.localOverlayGitDir(w.rootPath())
 	parent := filepath.Dir(gitDir)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
@@ -738,15 +759,15 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	}
 	defer func() { _ = os.RemoveAll(tmpRoot) }()
 	tmpGitDir := filepath.Join(tmpRoot, ".git")
-	if state.StorageType == gitStateStorageTarGzNoObjects {
+	if state.storageType == gitStateStorageTarGzNoObjects {
 		if err := g.restoreGitObjectsFromRemote(ctx, w, tmpGitDir); err != nil {
 			return err
 		}
-		if err := g.restoreGitObjectPacks(ctx, w, tmpGitDir); err != nil {
+		if err := g.restoreGitObjectPacks(ctx, w.id, tmpGitDir); err != nil {
 			return err
 		}
 	}
-	if err := extractGitArchive(state.Content, tmpGitDir); err != nil {
+	if err := extractGitArchive(state.content, tmpGitDir); err != nil {
 		return err
 	}
 	if !gitDirLooksUsable(ctx, tmpGitDir) {
@@ -756,6 +777,48 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 		return err
 	}
 	return os.Rename(tmpGitDir, gitDir)
+}
+
+// restoreLinkedWorktreeState re-materializes one linked worktree: the
+// stored archive lands under the common gitdir's worktrees/<name>, and
+// the work-tree .git pointer file is rewritten to it.
+func (g *Git) restoreLinkedWorktreeState(ctx context.Context, w *workspace, state storedGitState) error {
+	common, err := g.commonGitDirFor(w)
+	if err != nil {
+		return err
+	}
+	target := filepath.Join(common, "worktrees", w.worktree())
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.MkdirTemp(filepath.Dir(target), ".drive9-git-wt-restore-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+	if state.storageType == gitStateStorageTarGzNoObjects {
+		if err := g.restoreGitObjectPacks(ctx, w.id, tmp); err != nil {
+			return err
+		}
+	}
+	if err := extractGitArchive(state.content, tmp); err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "HEAD")); err != nil {
+		return fmt.Errorf("restored linked worktree state is missing HEAD")
+	}
+	if err := os.RemoveAll(target); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		return err
+	}
+	pointer := g.localOverlayGitDir(w.rootPath())
+	if err := os.MkdirAll(filepath.Dir(pointer), 0o755); err != nil {
+		return err
+	}
+	_ = os.Remove(pointer)
+	return os.WriteFile(pointer, []byte("gitdir: "+target+"\n"), 0o644)
 }
 
 // restoreGitObjectsFromRemote clones --no-checkout from the workspace's
@@ -802,40 +865,33 @@ func (g *Git) restoreGitObjectsFromRemote(ctx context.Context, w *workspace, git
 
 // restoreGitObjectPacks fetches and unpacks every stored object pack
 // (checksum + size verified).
-func (g *Git) restoreGitObjectPacks(ctx context.Context, w *workspace, gitDir string) error {
-	packs, err := g.cl.ListGitObjectPacks(ctx, w.id)
+func (g *Git) restoreGitObjectPacks(ctx context.Context, id, gitDir string) error {
+	packs, err := g.listObjectPacks(ctx, id)
 	if err != nil {
-		if client.IsNotFound(err) {
-			return nil
-		}
 		return err
 	}
-	for _, meta := range packs {
-		pack, err := g.cl.GetGitObjectPack(ctx, w.id, meta.PackID)
-		if err != nil {
-			return err
-		}
-		if len(pack.Content) == 0 {
+	for _, pack := range packs {
+		if len(pack.content) == 0 {
 			continue
 		}
-		if pack.SizeBytes != 0 && pack.SizeBytes != int64(len(pack.Content)) {
-			return fmt.Errorf("git object pack %s size mismatch", pack.PackID)
+		if pack.sizeBytes != 0 && pack.sizeBytes != int64(len(pack.content)) {
+			return fmt.Errorf("git object pack %s size mismatch", pack.packID)
 		}
-		sum := sha256.Sum256(pack.Content)
+		sum := sha256.Sum256(pack.content)
 		checksum := hex.EncodeToString(sum[:])
-		if pack.ChecksumSHA256 != "" && !strings.EqualFold(pack.ChecksumSHA256, checksum) {
-			return fmt.Errorf("git object pack %s checksum mismatch", pack.PackID)
+		if pack.checksumSHA256 != "" && !strings.EqualFold(pack.checksumSHA256, checksum) {
+			return fmt.Errorf("git object pack %s checksum mismatch", pack.packID)
 		}
 		cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "unpack-objects", "-q")
-		cmd.Stdin = bytes.NewReader(pack.Content)
+		cmd.Stdin = bytes.NewReader(pack.content)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
 			msg := strings.TrimSpace(stderr.String())
 			if msg != "" {
-				return fmt.Errorf("unpack git object pack %s: %w: %s", pack.PackID, err, msg)
+				return fmt.Errorf("unpack git object pack %s: %w: %s", pack.packID, err, msg)
 			}
-			return fmt.Errorf("unpack git object pack %s: %w", pack.PackID, err)
+			return fmt.Errorf("unpack git object pack %s: %w", pack.packID, err)
 		}
 	}
 	return nil
@@ -846,9 +902,6 @@ func (g *Git) restoreGitObjectPacks(ctx context.Context, w *workspace, gitDir st
 // remote; checkout and indexing need them local, so walk the tree and
 // hydrate every blob before the mount serves.
 func (g *Git) MaterializeHeadTree(ctx context.Context, gitDir string) error {
-	if g.cl == nil {
-		return nil
-	}
 	tree, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "rev-parse", "--verify", "HEAD^{tree}")
 	if err != nil {
 		if isMissingGitObjectError(err) {
@@ -896,4 +949,10 @@ func (g *Git) MaterializeHeadTree(ctx context.Context, gitDir string) error {
 		return fmt.Errorf("materialize head tree: %w", err)
 	}
 	return nil
+}
+
+// isGitConfigStatePath reports a git config file inside a state archive.
+func isGitConfigStatePath(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	return rel == "config" || strings.HasSuffix(rel, "/config")
 }

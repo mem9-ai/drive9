@@ -170,13 +170,14 @@ func (cfg MountConfig) toProfilingOptions() perf.ProfilingOptions {
 }
 
 // defaultExtensionOrder is the default --extensions value, in build-up
-// order: core first, each subsequent entry wrapping the ones before it, so
-// the chain assembly order (outermost first) is the reverse of this list.
-// It is the exact reverse of the historical wired chain, so the default
-// wires byte-identically to the pre-flag code.
+// order: core first, each subsequent entry wrapping the ones before it,
+// so the chain assembly order (outermost first) is the reverse of this
+// list. git wraps everything — it must see a complete filesystem (the
+// read caches included) below itself to transform workspace paths
+// efficiently, so it sits outside cache, the v1 outermost.
 var defaultExtensionOrder = []string{
 	"core", "sse", "writeback", "xattr", "specials", "bulkfile",
-	"appendlog", "extent", "git", "layer", "localize", "renameguard", "cache",
+	"appendlog", "extent", "layer", "localize", "renameguard", "cache", "git",
 }
 
 // knownExtensionNames guards --extensions against typos (an unknown name
@@ -710,8 +711,7 @@ func MountWithConfig(cfg MountConfig) error {
 	var gitExt *git.Git
 	if wantExt["git"] && cfg.EnableGitWorkspaces {
 		var gerr error
-		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot,
-			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh})
+		gitExt, gerr = git.New(git.Options{Events: bus, LocalRoot: cfg.LocalRoot})
 		if gerr != nil {
 			return fmt.Errorf("fuse: git extension: %w", gerr)
 		}
@@ -720,6 +720,7 @@ func MountWithConfig(cfg MountConfig) error {
 
 	// localize routes declared local-only paths to the local overlay
 	// (v1 local_overlay/local_policy semantics).
+	var localizeExt *localize.Localize
 	if wantExt["localize"] && cfg.LocalRoot != "" {
 		localizeOpts := localize.Options{
 			LocalRoot:                   cfg.LocalRoot,
@@ -730,10 +731,7 @@ func MountWithConfig(cfg MountConfig) error {
 			ApplyBuiltinDefaults:        !cfg.DisableBuiltinOverlayDefaults,
 		}
 		if gitExt != nil {
-			// v1 gitDirShouldBeLocalOverlay: a discovered workspace's .git
-			// routes to the local overlay (the restored .git state backs
-			// git's own file traffic, not the remote).
-			localizeOpts.DeclarativeLocal = gitExt.RoutesLocal
+			localizeOpts.DeclarativeLocal = gitExt.IsDeclaredLocalPath
 		}
 		if cacheBase != "" && !cfg.ReadOnly {
 			// SQLite WAL-index sidecars (-shm) are mount-local scratch:
@@ -748,14 +746,16 @@ func MountWithConfig(cfg MountConfig) error {
 				localizeOpts.TransientRoot = transientRoot
 			}
 		}
-		localizeExt, lerr := localize.New(localizeOpts)
+		var lerr error
+		localizeExt, lerr = localize.New(localizeOpts)
 		if lerr != nil {
 			return fmt.Errorf("fuse: localize extension: %w", lerr)
 		}
 		built["localize"] = localizeExt
 	}
 
-	// The layer view sits outermost (v1: layer over base), git next.
+	// The layer view sits over the base (v1: layer over base); git sits
+	// outside everything below (see defaultExtensionOrder).
 	var layerExt *layer.Layer
 	if wantExt["layer"] && strings.TrimSpace(cfg.LayerRef) != "" {
 		layerExt, err = layer.New(layer.Options{
@@ -771,7 +771,6 @@ func MountWithConfig(cfg MountConfig) error {
 		}
 		built["layer"] = layerExt
 	}
-
 	// The extent plane claims ahead of the classic data path (cache and
 	// writeback never see extent files). Gated on the --extent paths /
 	// profile [extent] section only: the cache dir falls back to the
@@ -921,6 +920,25 @@ func MountWithConfig(cfg MountConfig) error {
 			chainHandlers = append(chainHandlers, h)
 		}
 	}
+	// The git extension's store view is the chain below itself: the full
+	// handler list minus the git handler, dispatched as a Filesystem. It
+	// must be wired before the facade starts serving (git's discovery,
+	// view rewrites, and checkpoints all read/write through it — with the
+	// read caches below, which is the point of placing git outermost).
+	if gitExt != nil {
+		tail := make([]fs.Handler, 0, len(chainHandlers))
+		for _, h := range chainHandlers {
+			if h == fs.Handler(gitExt) {
+				continue
+			}
+			tail = append(tail, h)
+		}
+		tailChain, terr := fs.NewChain(tail...)
+		if terr != nil {
+			return fmt.Errorf("fuse: git store chain: %w", terr)
+		}
+		gitExt.AttachStore(fs.HandlerFilesystem(tailChain.Dispatch))
+	}
 	f, err := New(Options{
 		Extensions:         chainHandlers,
 		Events:             bus,
@@ -987,6 +1005,12 @@ func MountWithConfig(cfg MountConfig) error {
 	defer perfRecorder.Stop()
 	if sseExt != nil {
 		sseExt.Attach(f.Ctx.Inodes, f.Ctx.Notify)
+	}
+	if gitExt != nil {
+		// Remote store changes (overlay writes from other mounts, CLI
+		// registration) knock the kernel's view of the mapped workspace
+		// paths.
+		gitExt.Attach(f.Ctx.Inodes, f.Ctx.Notify)
 	}
 	if layerExt != nil {
 		// The layer event watcher resets the kernel view after a remote

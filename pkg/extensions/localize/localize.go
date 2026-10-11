@@ -426,6 +426,14 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 	return next(ctx, op)
 }
 
+// AttachDeclarativeLocal wires a structural local-routing declaration
+// (assembly time, before the first dispatch): the git extension declares
+// the .git of registered or pending workspaces local so clone and
+// checkpoint traffic never round-trips the classic namespace.
+func (f *Localize) AttachDeclarativeLocal(declared func(viewPath string) bool) {
+	f.opts.DeclarativeLocal = declared
+}
+
 // StatLocal stats a local-classified path from the overlay. A path that
 // routes local is claimed even when nothing exists in the overlay yet —
 // the error (typically ENOENT) is the reply, and a remote copy at the same
