@@ -12,6 +12,9 @@ import (
 )
 
 type GitWorkspaceRequest struct {
+	// WorkspaceID pins the record id (FS-native store); empty lets the
+	// server (legacy API) or the client (FS-native store) allocate one.
+	WorkspaceID       string `json:"workspace_id,omitempty"`
 	RootPath          string `json:"root_path"`
 	RepoURL           string `json:"repo_url"`
 	RemoteName        string `json:"remote_name,omitempty"`
