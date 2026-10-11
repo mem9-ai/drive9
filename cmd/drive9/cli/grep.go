@@ -37,6 +37,11 @@ func Grep(c *client.Client, args []string) error {
 	}
 	c, path = h.Client, h.Path
 
+	if layerRef != "" {
+		// FS-native layers fold their view at mount time; search over a
+		// layer = mount it and search the mount.
+		return fmt.Errorf("--layer search is not supported on FS-native layers; mount the layer (drive9 mount --layer %s) and search the mount instead", layerRef)
+	}
 	results, err := c.GrepWithLayer(query, path, 20, layerRef)
 	if err != nil {
 		return err

@@ -2,9 +2,11 @@
 
 package fuse
 
+import "github.com/mem9-ai/drive9/pkg/extensions/layer"
+
 type mountControlServer struct{}
 
-func startMountControlServer(mountPoint string, fs *FS) (*mountControlServer, error) {
+func startMountControlServer(mountPoint string, fs *FS, layerCtl *layer.Layer) (*mountControlServer, error) {
 	return nil, nil
 }
 

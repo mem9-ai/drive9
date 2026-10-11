@@ -1,21 +1,20 @@
-// The handler: op routing against the overlay and the merged directory
-// listing.
+// The handler: routes every namespace op against the shadow view —
+// blackout hides, tree rewrites, attrs patches, everything else passes
+// through to the classic view. Mutations are copy-on-write.
 package layer
 
 import (
 	"context"
 	"errors"
-	"io"
 	"strings"
 	"syscall"
-	"time"
 
-	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
 // Do routes through do and maps the rollback error to ESTALE: after a
-// rollback event the mount must fail writes with ESTALE until remount.
+// rollback event the mount must fail writes with ESTALE until remount or
+// checkout.
 func (l *Layer) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
 	res, err := l.do(ctx, op, next)
 	if err != nil && errors.Is(err, errLayerRolledBack) {
@@ -24,418 +23,219 @@ func (l *Layer) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 	return res, err
 }
 
+// resKind classifies how a view path resolves.
+type resKind uint8
+
+const (
+	resClassic resKind = iota
+	resTree
+	resAttrs
+	resBlackout
+)
+
+func (l *Layer) resolve(v *view, p string) (resKind, *indexEntry) {
+	if v.idx.isBlackedOut(p) {
+		return resBlackout, nil
+	}
+	if e, ok := v.idx.get(p); ok {
+		switch e.kind {
+		case ekBlackout:
+			return resBlackout, e
+		case ekTree:
+			return resTree, e
+		case ekAttrs:
+			return resAttrs, e
+		}
+	}
+	return resClassic, nil
+}
+
+// isReservedPath reports the /.drive9 namespace, which never participates
+// in the shadow (it is reserved, and the layer roots live inside it).
+func isReservedPath(p string) bool {
+	return p == "/.drive9" || strings.HasPrefix(p, "/.drive9/")
+}
+
 func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+	if isReservedPath(op.Path) || (op.Path2 != "" && isReservedPath(op.Path2)) {
+		return next(ctx, op)
+	}
+	l.mu.RLock()
+	v := l.cur
+	l.mu.RUnlock()
+	if v.mode == viewLive {
+		return next(ctx, op)
+	}
+
 	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
-		kind, mode, _, content, ok := l.lookup(op.Path)
-		if !ok {
-			// Namespace-only directories exist while any overlay entry
-			// lives below them.
-			if l.impliedDir(op.Path) {
-				return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755, Mtime: time.Now()}}, nil
-			}
-			return next(ctx, op)
-		}
-		switch kind {
-		case "whiteout":
-			return fs.Result{}, fs.ErrNotFound
-		case "dir":
-			return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: mode, Mtime: time.Now()}}, nil
-		case "symlink":
-			return fs.Result{Attr: &fs.Attr{Kind: fs.KindSymlink, Mode: mode & 0o777}}, nil
-		default:
-			return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: int64(len(content))}}, nil
-		}
+		return l.attrOp(ctx, v, op, next)
 
 	case fs.OpReadlink:
-		if kind, _, t, _, ok := l.lookup(op.Path); ok && kind == "symlink" {
-			return fs.Result{Data: []byte(t)}, nil
+		switch res, _ := l.resolve(v, op.Path); res {
+		case resBlackout:
+			return fs.Result{}, fs.ErrNotFound
+		case resTree:
+			rop := *op
+			rop.Path = v.treePathOf(l.serverAbs(op.Path))
+			return next(ctx, &rop)
 		}
 		return next(ctx, op)
 
 	case fs.OpList:
-		return l.listMerged(ctx, op.Path, next)
+		return l.listMerged(ctx, v, op.Path, next)
 
 	case fs.OpRead:
 		if op.Handle != nil || op.Fh != 0 {
 			return next(ctx, op)
 		}
-		kind, _, _, content, ok := l.lookup(op.Path)
-		if ok && kind == "file" {
-			data := content
-			if op.Offset > 0 || op.Limit > 0 {
-				off := op.Offset
-				if off < 0 {
-					off = 0
-				}
-				if off >= int64(len(data)) {
-					return fs.Result{}, nil
-				}
-				end := int64(len(data))
-				if op.Limit > 0 && off+op.Limit < end {
-					end = off + op.Limit
-				}
-				data = data[off:end]
-			}
-			return fs.Result{Data: data}, nil
-		}
-		if ok && kind == "whiteout" {
+		switch res, _ := l.resolve(v, op.Path); res {
+		case resBlackout:
 			return fs.Result{}, fs.ErrNotFound
+		case resTree:
+			rop := *op
+			rop.Path = v.treePathOf(l.serverAbs(op.Path))
+			return next(ctx, &rop)
+		case resAttrs:
+			return next(ctx, op)
 		}
 		return next(ctx, op)
 
 	case fs.OpCreate:
-		// Checkpoint mounts are read-only for WRITES only: plain read opens
-		// must serve the restored overlay (v1). The blanket gate rejected
-		// even O_RDONLY opens with EROFS, so every checkpoint-restore read
-		// failed while the listing (OpList) worked.
-		if l.readOnly && (hasWriteIntent(op.Flags) || op.Flags&uint32(syscall.O_CREAT) != 0 || op.Flags&uint32(syscall.O_TRUNC) != 0) {
-			return fs.Result{}, syscall.EROFS
-		}
-		if hasWriteIntent(op.Flags) {
-			// Claim the data plane: writes buffer locally and land as one
-			// layer entry per durability boundary. A create materializes
-			// at the boundary, not at open.
-			h, err := l.claim(op.Path, op.Flags, op.Mode&0o777)
-			if err != nil {
-				return fs.Result{}, err
-			}
-			if op.Flags&uint32(syscall.O_CREAT) != 0 && h.isNew {
-				h.mu.Lock()
-				h.dirty = true
-				h.mu.Unlock()
-			}
-			l.liveStore(op.Path, h)
-			attr := h.Attr()
-			return fs.Result{Handle: h, Attr: &attr}, nil
-		}
-		if op.Flags&uint32(syscall.O_CREAT) == 0 {
-			// plain read-only open: overlay files report their overlay attr
-			if kind, mode, _, content, ok := l.lookup(op.Path); ok {
-				switch kind {
-				case "whiteout":
-					return fs.Result{}, fs.ErrNotFound
-				case "file":
-					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: int64(len(content))}}, nil
-				}
-			}
-			return next(ctx, op)
-		}
-		if err := l.upsertFile(ctx, op.Path, nil, 0, op.Mode); err != nil {
+		if err := v.mutationGate(op.Flags&uint32(syscall.O_CREAT) != 0 || hasWriteIntent(op.Flags)); err != nil {
 			return fs.Result{}, err
 		}
-		return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o777}}, nil
+		return l.createOp(ctx, v, op, next)
 
 	case fs.OpWrite:
-		if l.readOnly {
-			return fs.Result{}, syscall.EROFS
+		if op.Handle != nil || op.Fh != 0 {
+			return next(ctx, op)
 		}
-		baseRev := int64(0)
-		data := op.Data
-		// merge with the overlay's current image
-		if kind, _, _, content, ok := l.lookup(op.Path); ok && kind == "file" {
-			merged := append([]byte(nil), content...)
-			end := op.Offset + int64(len(op.Data))
-			if end > int64(len(merged)) {
-				grown := make([]byte, end)
-				copy(grown, merged)
-				merged = grown
-			}
-			copy(merged[op.Offset:], op.Data)
-			data = merged
-		} else if _, serr := l.cl.StatCtx(ctx, l.remotePath(op.Path)); serr == nil {
-			if base, rerr := l.cl.ReadCtx(ctx, l.remotePath(op.Path)); rerr == nil {
-				merged := append([]byte(nil), base...)
-				end := op.Offset + int64(len(op.Data))
-				if end > int64(len(merged)) {
-					grown := make([]byte, end)
-					copy(grown, merged)
-					merged = grown
-				}
-				copy(merged[op.Offset:], op.Data)
-				data = merged
-			}
-		}
-		mode := op.Mode
-		if mode == 0 {
-			mode = 0o644
-		}
-		if err := l.upsertFile(ctx, op.Path, data, baseRev, mode); err != nil {
+		if err := v.mutationGate(true); err != nil {
 			return fs.Result{}, err
 		}
-		return fs.Result{Written: uint32(len(op.Data))}, nil
+		return l.writeOp(ctx, v, op, next)
 
 	case fs.OpMkdir:
-		if l.readOnly {
-			return fs.Result{}, syscall.EROFS
-		}
-		mode := op.Mode & 0o777
-		if mode == 0 {
-			mode = 0o755
-		}
-		if err := l.upsertEntry(ctx, client.FSLayerEntryRequest{Path: l.remotePath(op.Path), Op: "mkdir", Kind: "dir", Mode: mode}); err != nil {
+		if err := v.mutationGate(true); err != nil {
 			return fs.Result{}, err
 		}
-		l.markLayerDir(op.Path, mode)
-		l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
-		return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: mode}}, nil
+		return l.mkdirOp(ctx, v, op, next)
 
 	case fs.OpSymlink:
-		if l.readOnly {
-			return fs.Result{}, syscall.EROFS
-		}
-		if err := l.upsertEntry(ctx, client.FSLayerEntryRequest{
-			Path: l.remotePath(op.Path), Op: "symlink", Kind: "symlink",
-			ContentText: op.Target, SizeBytes: int64(len(op.Target)),
-			Mode: uint32(syscall.S_IFLNK) | 0o777,
-		}); err != nil {
+		if err := v.mutationGate(true); err != nil {
 			return fs.Result{}, err
 		}
-		l.markLayerSymlink(op.Path, op.Target, 0)
-		l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
-		return fs.Result{}, nil
+		return l.symlinkOp(ctx, v, op, next)
+
+	case fs.OpMknod:
+		if err := v.mutationGate(true); err != nil {
+			return fs.Result{}, err
+		}
+		return l.mknodOp(ctx, v, op, next)
+
+	case fs.OpUnlink:
+		if err := v.mutationGate(true); err != nil {
+			return fs.Result{}, err
+		}
+		return l.unlinkOp(ctx, v, op.Path, false, next)
+
+	case fs.OpRmdir:
+		if err := v.mutationGate(true); err != nil {
+			return fs.Result{}, err
+		}
+		return l.unlinkOp(ctx, v, op.Path, true, next)
+
+	case fs.OpRename:
+		if err := v.mutationGate(true); err != nil {
+			return fs.Result{}, err
+		}
+		return l.renameOp(ctx, v, op, next)
 
 	case fs.OpLink:
-		if l.readOnly {
-			return fs.Result{}, syscall.EROFS
+		if err := v.mutationGate(true); err != nil {
+			return fs.Result{}, err
 		}
-		// v1 upsertLayerHardlink: a hardlink whose source lives in the
-		// overlay copies the image to the target as a layer upsert — the
-		// base plane cannot hardlink overlay content. Base-plane sources
-		// fall through to the base plane's hardlink.
-		if kind, mode, _, content, ok := l.lookup(op.Path); ok && kind == "file" {
-			data := append([]byte(nil), content...)
-			m := mode
-			if m == 0 {
-				m = 0o644
-			}
-			if err := l.upsertFile(ctx, op.Path2, data, 0, m); err != nil {
-				return fs.Result{}, err
-			}
-			return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: m, Size: int64(len(data))}}, nil
+		return l.linkOp(ctx, v, op, next)
+
+	case fs.OpSetAttr:
+		if err := v.mutationGate(op.Mode != 0 || op.Size >= 0 || !op.Mtime.IsZero()); err != nil {
+			return fs.Result{}, err
+		}
+		return l.setAttrOp(ctx, v, op, next)
+
+	case fs.OpAccess:
+		switch res, _ := l.resolve(v, op.Path); res {
+		case resBlackout:
+			return fs.Result{}, fs.ErrNotFound
+		case resTree:
+			rop := *op
+			rop.Path = v.treePathOf(l.serverAbs(op.Path))
+			return next(ctx, &rop)
 		}
 		return next(ctx, op)
 
-	case fs.OpUnlink, fs.OpRmdir:
-		if l.readOnly {
-			return fs.Result{}, syscall.EROFS
+	case fs.OpGetXattr, fs.OpListXattr:
+		switch res, _ := l.resolve(v, op.Path); res {
+		case resBlackout:
+			return fs.Result{}, fs.ErrNotFound
+		case resTree:
+			rop := *op
+			rop.Path = v.treePathOf(l.serverAbs(op.Path))
+			return next(ctx, &rop)
 		}
-		// v1 layerDirHasOverlayChildren: a non-empty layer directory must
-		// refuse rmdir with ENOTEMPTY before the whiteout lands — the
-		// overlay entries would otherwise live on under a hidden name.
-		if op.Kind == fs.OpRmdir && l.dirHasOverlayChildren(op.Path) {
-			return fs.Result{}, syscall.ENOTEMPTY
-		}
-		unlock := l.mutLocks.lock(op.Path)
-		defer unlock()
-		// POSIX unlink-while-open: the whiteout hides the name now, the
-		// open handle keeps serving its buffered image and never publishes.
-		if h := l.handleFor(op.Path); h != nil && op.Kind == fs.OpUnlink {
-			h.markUnlinked()
-		}
-		kind := "file"
-		if op.Kind == fs.OpRmdir {
-			kind = "dir"
-		}
-		if err := l.upsertEntry(ctx, client.FSLayerEntryRequest{Path: l.remotePath(op.Path), Op: "whiteout", Kind: kind}); err != nil {
-			return fs.Result{}, err
-		}
-		l.markLayerWhiteout(op.Path)
-		l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
-		return fs.Result{}, nil
-
-	case fs.OpRename:
-		if l.readOnly {
-			return fs.Result{}, syscall.EROFS
-		}
-		unlockOld := l.mutLocks.lock(op.Path)
-		unlockNew := l.mutLocks.lock(op.Path2)
-		defer unlockNew()
-		defer unlockOld()
-		if err := l.renameLayer(ctx, op.Path, op.Path2); err != nil {
-			return fs.Result{}, err
-		}
-		if h := l.handleFor(op.Path); h != nil {
-			h.retarget(op.Path2)
-		}
-		l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
-		l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path2})
-		return fs.Result{}, nil
-
-	case fs.OpSetAttr:
-		if l.readOnly {
-			return fs.Result{}, syscall.EROFS
-		}
-		if h := l.handleFor(op.Path); h != nil {
-			if op.HasMode {
-				h.SetMode(op.Mode)
-			}
-			if op.Size >= 0 {
-				if err := h.Truncate(op.Size); err != nil {
-					return fs.Result{}, err
-				}
-			}
-			attr := h.Attr()
-			return fs.Result{Attr: &attr}, nil
-		}
-		if op.HasMode {
-			kind, _, _, _, ok := l.lookup(op.Path)
-			if ok && kind == "file" {
-				// v1: a chmod of a path this layer already upserted
-				// merges into that upsert's mode — a standalone chmod
-				// entry has no base to describe, and the diff/restore
-				// lose the content (the smoke's umask-then-chmod create).
-				unlock := l.mutLocks.lock(op.Path)
-				_, _, _, content, _ := l.lookup(op.Path)
-				err := l.upsertFileLocked(ctx, op.Path, content, 0, op.Mode&0o777)
-				unlock()
-				if err != nil {
-					return fs.Result{}, err
-				}
-				l.markLayerFileMode(op.Path, op.Mode)
-				l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
-				return l.Do(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path}, next)
-			}
-			if !ok {
-				// Base-only file: record a mode-only override — the base
-				// object stays the content source (registering an empty
-				// overlay image would make every read return zero bytes).
-				if st, serr := l.cl.StatCtx(ctx, l.remotePath(op.Path)); serr == nil && st != nil && !st.IsDir {
-					if err := l.upsertEntry(ctx, client.FSLayerEntryRequest{Path: l.remotePath(op.Path), Op: "chmod", Kind: "file", Mode: op.Mode & 0o777}); err != nil {
-						return fs.Result{}, err
-					}
-					l.markLayerBaseFileMode(op.Path, op.Mode)
-					l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
-					return l.Do(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path}, next)
-				}
-			}
-			entryKind := "file"
-			if !ok {
-				if st, err := l.cl.StatCtx(ctx, l.remotePath(op.Path)); err == nil && st != nil && st.IsDir {
-					entryKind = "dir"
-				}
-			} else if kind == "dir" {
-				entryKind = "dir"
-			} else if kind == "symlink" {
-				entryKind = "symlink"
-			}
-			if err := l.upsertEntry(ctx, client.FSLayerEntryRequest{Path: l.remotePath(op.Path), Op: "chmod", Kind: entryKind, Mode: op.Mode & 0o777}); err != nil {
-				return fs.Result{}, err
-			}
-			switch {
-			case ok && kind == "dir":
-				l.markLayerDir(op.Path, op.Mode)
-			case ok && kind == "symlink":
-				_, _, tgt, _, _ := l.lookup(op.Path)
-				l.markLayerSymlink(op.Path, tgt, op.Mode)
-			default:
-				l.markLayerFileMode(op.Path, op.Mode)
-			}
-			l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
-		}
-		if op.Size >= 0 {
-			if kind, mode, _, content, ok := l.lookup(op.Path); ok && kind == "file" {
-				if err := l.truncateFile(ctx, op.Path, content, op.Size, mode); err != nil {
-					return fs.Result{}, err
-				}
-			} else if st, serr := l.cl.StatCtx(ctx, l.remotePath(op.Path)); serr == nil && st != nil && !st.IsDir {
-				// Base-only file (v1 applyRemoteTruncate): a truncation
-				// still records a layer image at the requested size —
-				// returning the unchanged attrs silently dropped it.
-				mode := uint32(0o644)
-				if m, ok := l.baseFileMode(op.Path); ok {
-					mode = m
-				}
-				kept := int64(0)
-				if st.Size < op.Size {
-					kept = st.Size
-				} else {
-					kept = op.Size
-				}
-				content := []byte(nil)
-				var lazyBase baseRangeReader
-				if kept > 0 {
-					if kept <= l.inlineMax() {
-						if data, rerr := l.fetchBaseRange(ctx, op.Path, 0, kept); rerr == nil {
-							content = data
-						}
-					} else {
-						// Above the inline limit the retained prefix
-						// streams from the base object — a nil content
-						// here zero-filled the first kept bytes (review).
-						rp := l.remotePath(op.Path)
-						lazyBase = func(bctx context.Context, off, length int64) (io.Reader, error) {
-							return l.cl.ReadStreamRange(bctx, rp, off, length)
-						}
-					}
-				}
-				if err := l.truncateFileWithBase(ctx, op.Path, content, op.Size, mode, lazyBase); err != nil {
-					return fs.Result{}, err
-				}
-			}
-		}
-		return l.Do(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path}, next)
+		return next(ctx, op)
 	}
 	return next(ctx, op)
 }
 
-// dirHasOverlayChildren ports v1 layerDirHasOverlayChildren: any overlay
-// entry (file, dir, symlink, whiteout, or live handle) directly under dir
-// makes the directory non-empty for rmdir.
-func (l *Layer) dirHasOverlayChildren(dir string) bool {
-	prefix := strings.TrimRight(dir, "/") + "/"
-	has := func(path string) bool {
-		if !strings.HasPrefix(path, prefix) {
-			return false
-		}
-		name := strings.TrimPrefix(path, prefix)
-		return name != "" && !strings.Contains(name, "/")
+// mutationGate rejects mutations on read-only (checkpoint) and rolled-back
+// views. wants reports whether the op mutates (plain read opens pass).
+func (v *view) mutationGate(wants bool) error {
+	if !wants {
+		return nil
 	}
-	l.mu.RLock()
-	for p := range l.whiteouts {
-		if has(p) {
-			l.mu.RUnlock()
-			return true
-		}
+	if v.abandoned {
+		return errLayerRolledBack
 	}
-	for p := range l.files {
-		if has(p) {
-			l.mu.RUnlock()
-			return true
-		}
+	if v.readOnly {
+		return syscall.EROFS
 	}
-	for p := range l.dirs {
-		if has(p) {
-			l.mu.RUnlock()
-			return true
-		}
-	}
-	for p := range l.symlinks {
-		if has(p) {
-			l.mu.RUnlock()
-			return true
-		}
-	}
-	for p := range l.contents {
-		if has(p) {
-			l.mu.RUnlock()
-			return true
-		}
-	}
-	l.mu.RUnlock()
-	found := false
-	l.live.Range(func(key, _ any) bool {
-		if path, ok := key.(string); ok && has(path) {
-			found = true
-			return false
-		}
-		return true
-	})
-	return found
+	return nil
 }
 
-// listMerged overlays this layer's children on the base listing.
-func (l *Layer) listMerged(ctx context.Context, dir string, next fs.Next) (fs.Result, error) {
+func (l *Layer) attrOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) (fs.Result, error) {
+	switch res, e := l.resolve(v, op.Path); res {
+	case resBlackout:
+		return fs.Result{}, fs.ErrNotFound
+	case resTree:
+		rop := *op
+		rop.Path = v.treePathOf(l.serverAbs(op.Path))
+		return next(ctx, &rop)
+	case resAttrs:
+		res, err := next(ctx, op)
+		if err != nil || res.Attr == nil {
+			return res, err
+		}
+		patched := *res.Attr
+		if e.patch.Mode != 0 {
+			patched.Mode = e.patch.Mode
+		}
+		if e.patch.Mtime != 0 {
+			patched.Mtime = unixToTime(e.patch.Mtime)
+		}
+		res.Attr = &patched
+		return res, nil
+	}
+	return next(ctx, op)
+}
+
+// listMerged merges the classic listing with the layer's tree children,
+// hiding blacked-out names and patching attrs-only entries.
+func (l *Layer) listMerged(ctx context.Context, v *view, dir string, next fs.Next) (fs.Result, error) {
+	if v.idx.isBlackedOut(dir) {
+		return fs.Result{}, fs.ErrNotFound
+	}
 	res, err := next(ctx, &fs.Op{Kind: fs.OpList, Path: dir})
 	if err != nil && !fs.IsNotFound(err) {
 		return res, err
@@ -444,36 +244,43 @@ func (l *Layer) listMerged(ctx context.Context, dir string, next fs.Next) (fs.Re
 	for _, e := range res.Entries {
 		out[e.Name] = e
 	}
-	prefix := strings.TrimRight(dir, "/") + "/"
-	l.mu.RLock()
-	add := func(path string, mode uint32, kind fs.Kind, size int64) {
-		if !strings.HasPrefix(path, prefix) {
-			return
+	// Tree children shadow classic names.
+	if v.treeRoot != "" {
+		tres, terr := next(ctx, &fs.Op{Kind: fs.OpList, Path: v.treePathOf(l.serverAbs(dir))})
+		if terr == nil {
+			for _, e := range tres.Entries {
+				out[e.Name] = e
+			}
+		} else if !fs.IsNotFound(terr) {
+			return fs.Result{}, terr
 		}
-		name := strings.TrimPrefix(path, prefix)
-		if name == "" || strings.Contains(name, "/") {
-			return
-		}
-		out[name] = fs.Entry{Name: name, Attr: fs.Attr{Kind: kind, Mode: mode, Size: size}}
 	}
-	for p := range l.whiteouts {
-		if strings.HasPrefix(p, prefix) {
-			name := strings.TrimPrefix(p, prefix)
-			if name != "" && !strings.Contains(name, "/") {
-				delete(out, name)
+	for name, e := range v.idx.childrenOf(dir) {
+		switch e.kind {
+		case ekBlackout:
+			delete(out, name)
+		case ekTree:
+			if _, seen := out[name]; !seen {
+				kind := fs.KindFile
+				switch {
+				case e.isDir:
+					kind = fs.KindDir
+				case e.isSymlink:
+					kind = fs.KindSymlink
+				}
+				out[name] = fs.Entry{Name: name, Attr: fs.Attr{Kind: kind, Mode: e.mode}}
+			}
+		case ekAttrs:
+			if cur, seen := out[name]; seen {
+				patched := cur.Attr
+				if e.patch.Mode != 0 {
+					patched.Mode = e.patch.Mode
+				}
+				cur.Attr = patched
+				out[name] = cur
 			}
 		}
 	}
-	for p, m := range l.dirs {
-		add(p, m, fs.KindDir, 0)
-	}
-	for p, st := range l.symlinks {
-		add(p, st.Mode&0o777, fs.KindSymlink, int64(len(st.Target)))
-	}
-	for p, m := range l.files {
-		add(p, m, fs.KindFile, int64(len(l.contents[p])))
-	}
-	l.mu.RUnlock()
 	entries := make([]fs.Entry, 0, len(out))
 	for _, e := range out {
 		entries = append(entries, e)
@@ -481,13 +288,325 @@ func (l *Layer) listMerged(ctx context.Context, dir string, next fs.Next) (fs.Re
 	return fs.Result{Entries: entries}, nil
 }
 
-// fetchBaseRange reads a byte range of the base object (small images only;
-// larger truncations stream through truncateFile's reader path).
-func (l *Layer) fetchBaseRange(ctx context.Context, path string, off, length int64) ([]byte, error) {
-	rc, err := l.cl.ReadStreamRange(ctx, l.remotePath(path), off, length)
-	if err != nil {
-		return nil, err
+// createOp opens (or creates) a view path with write intent: tree-backed
+// paths open their tree file directly, classic-backed paths materialize a
+// copy first (content copied unless O_TRUNC discards it), fresh paths are
+// created in the tree.
+func (l *Layer) createOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) (fs.Result, error) {
+	p := op.Path
+	res, e := l.resolve(v, p)
+	write := hasWriteIntent(op.Flags) || op.Flags&uint32(syscall.O_CREAT) != 0
+	if !write {
+		// Plain read opens never materialize anything.
+		switch res {
+		case resBlackout:
+			return fs.Result{}, fs.ErrNotFound
+		case resTree:
+			rop := *op
+			rop.Path = v.treePathOf(l.serverAbs(p))
+			return next(ctx, &rop)
+		}
+		return next(ctx, op)
 	}
-	defer func() { _ = rc.Close() }()
-	return io.ReadAll(rc)
+
+	switch res {
+	case resBlackout:
+		if op.Flags&uint32(syscall.O_CREAT) == 0 {
+			return fs.Result{}, fs.ErrNotFound
+		}
+		// Recreate over a blackout: restamp the CAS base (the classic file
+		// may still exist under the shadow), drop the marker, then create.
+		unlock := l.mutLocks.lock(p)
+		defer unlock()
+		baseRev, hasBase, err := l.classicBase(ctx, v, next, p)
+		if err != nil {
+			return fs.Result{}, err
+		}
+		if err := l.writeCasMarker(ctx, v, p, baseRev, hasBase); err != nil {
+			return fs.Result{}, err
+		}
+		if err := l.removeBlackoutMarker(ctx, v, p); err != nil {
+			return fs.Result{}, err
+		}
+		rop := *op
+		rop.Path = v.treePathOf(l.serverAbs(p))
+		rop.Flags = op.Flags | uint32(syscall.O_CREAT|syscall.O_TRUNC)
+		rres, rerr := next(ctx, &rop)
+		if rerr != nil {
+			return rres, rerr
+		}
+		v.idx.put(p, &indexEntry{kind: ekTree, mode: op.Mode & 0o777})
+		return rres, nil
+
+	case resTree:
+		if e.isDir {
+			return fs.Result{}, syscall.EISDIR
+		}
+		if op.Flags&uint32(syscall.O_EXCL) != 0 && op.Flags&uint32(syscall.O_CREAT) != 0 {
+			return fs.Result{}, syscall.EEXIST
+		}
+		rop := *op
+		rop.Path = v.treePathOf(l.serverAbs(p))
+		rres, rerr := next(ctx, &rop)
+		if rerr != nil {
+			return rres, rerr
+		}
+		return rres, nil
+
+	case resAttrs:
+		// A metadata-only shadow still needs the content underneath.
+		unlock := l.mutLocks.lock(p)
+		defer unlock()
+		attr, aerr := l.statClassic(ctx, next, p)
+		if aerr != nil {
+			return fs.Result{}, aerr
+		}
+		if err := l.materializeClassic(ctx, v, next, p, attr, op.Flags&uint32(syscall.O_TRUNC) != 0); err != nil {
+			return fs.Result{}, err
+		}
+		if err := l.removeAttrsMarker(ctx, v, p); err != nil {
+			return fs.Result{}, err
+		}
+		v.idx.put(p, &indexEntry{kind: ekTree, mode: op.Mode & 0o777})
+		rop := *op
+		rop.Path = v.treePathOf(l.serverAbs(p))
+		rop.Flags = op.Flags &^ uint32(syscall.O_CREAT|syscall.O_EXCL)
+		rres, rerr := next(ctx, &rop)
+		if rerr != nil {
+			return rres, rerr
+		}
+		return rres, nil
+	}
+
+	// Classic or fresh: O_EXCL against a classic file must fail without
+	// materializing anything.
+	attr, statErr := l.statClassic(ctx, next, p)
+	if statErr != nil {
+		return fs.Result{}, statErr
+	}
+	if attr != nil {
+		if op.Flags&uint32(syscall.O_EXCL) != 0 && op.Flags&uint32(syscall.O_CREAT) != 0 {
+			return fs.Result{}, syscall.EEXIST
+		}
+		if attr.IsDir() {
+			return fs.Result{}, syscall.EISDIR
+		}
+	} else if op.Flags&uint32(syscall.O_CREAT) == 0 {
+		return fs.Result{}, fs.ErrNotFound
+	}
+	unlock := l.mutLocks.lock(p)
+	defer unlock()
+	if attr != nil {
+		if err := l.materializeClassic(ctx, v, next, p, attr, op.Flags&uint32(syscall.O_TRUNC) != 0); err != nil {
+			return fs.Result{}, err
+		}
+	} else if err := l.writeCasMarker(ctx, v, p, 0, false); err != nil {
+		return fs.Result{}, err
+	}
+	v.idx.put(p, &indexEntry{kind: ekTree, mode: op.Mode & 0o777})
+	rop := *op
+	rop.Path = v.treePathOf(l.serverAbs(p))
+	rop.Flags = op.Flags &^ uint32(syscall.O_EXCL)
+	rres, rerr := next(ctx, &rop)
+	if rerr != nil {
+		return rres, rerr
+	}
+	return rres, nil
+}
+
+// writeOp is the handleless write path: routes to the tree, materializing
+// a classic base first when needed.
+func (l *Layer) writeOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) (fs.Result, error) {
+	res, _ := l.resolve(v, op.Path)
+	switch res {
+	case resBlackout:
+		return fs.Result{}, fs.ErrNotFound
+	case resTree, resAttrs:
+		unlock := l.mutLocks.lock(op.Path)
+		defer unlock()
+		if res == resAttrs {
+			attr, aerr := l.statClassic(ctx, next, op.Path)
+			if aerr != nil {
+				return fs.Result{}, aerr
+			}
+			if err := l.materializeClassic(ctx, v, next, op.Path, attr, false); err != nil {
+				return fs.Result{}, err
+			}
+			if err := l.removeAttrsMarker(ctx, v, op.Path); err != nil {
+				return fs.Result{}, err
+			}
+			v.idx.put(op.Path, &indexEntry{kind: ekTree})
+		}
+		rop := *op
+		rop.Path = v.treePathOf(l.serverAbs(op.Path))
+		return next(ctx, &rop)
+	}
+	// Classic base (or fresh): materialize then write.
+	unlock := l.mutLocks.lock(op.Path)
+	defer unlock()
+	attr, aerr := l.statClassic(ctx, next, op.Path)
+	if aerr != nil {
+		return fs.Result{}, aerr
+	}
+	if attr != nil {
+		if err := l.materializeClassic(ctx, v, next, op.Path, attr, false); err != nil {
+			return fs.Result{}, err
+		}
+	} else if err := l.writeCasMarker(ctx, v, op.Path, 0, false); err != nil {
+		return fs.Result{}, err
+	}
+	v.idx.put(op.Path, &indexEntry{kind: ekTree})
+	rop := *op
+	rop.Path = v.treePathOf(l.serverAbs(op.Path))
+	return next(ctx, &rop)
+}
+
+func (l *Layer) mkdirOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) (fs.Result, error) {
+	p := op.Path
+	res, _ := l.resolve(v, p)
+	if res == resBlackout {
+		// mkdir over a blackout recreates the directory in the layer.
+		unlock := l.mutLocks.lock(p)
+		defer unlock()
+		baseRev, hasBase, err := l.classicBase(ctx, v, next, p)
+		if err != nil {
+			return fs.Result{}, err
+		}
+		if err := l.writeCasMarker(ctx, v, p, baseRev, hasBase); err != nil {
+			return fs.Result{}, err
+		}
+		if err := l.removeBlackoutMarker(ctx, v, p); err != nil {
+			return fs.Result{}, err
+		}
+		if err := l.io.EnsureParent(ctx, parentTreeDir(v, l.serverAbs(p))); err != nil {
+			return fs.Result{}, err
+		}
+		rop := *op
+		rop.Path = v.treePathOf(l.serverAbs(p))
+		rres, rerr := next(ctx, &rop)
+		if rerr != nil {
+			return rres, rerr
+		}
+		mode := op.Mode & 0o777
+		if mode == 0 {
+			mode = 0o755
+		}
+		v.idx.put(p, &indexEntry{kind: ekTree, isDir: true, mode: mode})
+		return rres, nil
+	}
+	if res == resTree || res == resAttrs {
+		return fs.Result{}, syscall.EEXIST
+	}
+	// Reject creation over an existing classic entry (the classic mkdir
+	// path would mutate the base view).
+	if attr, err := l.statClassic(ctx, next, p); err == nil && attr != nil {
+		return fs.Result{}, syscall.EEXIST
+	}
+	unlock := l.mutLocks.lock(p)
+	defer unlock()
+	if err := l.writeCasMarker(ctx, v, p, 0, false); err != nil {
+		return fs.Result{}, err
+	}
+	if err := l.io.EnsureParent(ctx, parentTreeDir(v, l.serverAbs(p))); err != nil {
+		return fs.Result{}, err
+	}
+	rop := *op
+	rop.Path = v.treePathOf(l.serverAbs(p))
+	rres, rerr := next(ctx, &rop)
+	if rerr != nil {
+		return rres, rerr
+	}
+	mode := op.Mode & 0o777
+	if mode == 0 {
+		mode = 0o755
+	}
+	v.idx.put(p, &indexEntry{kind: ekTree, isDir: true, mode: mode})
+	return rres, nil
+}
+
+func (l *Layer) symlinkOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) (fs.Result, error) {
+	p := op.Path
+	res, _ := l.resolve(v, p)
+	if res == resTree || res == resAttrs {
+		return fs.Result{}, syscall.EEXIST
+	}
+	if res == resBlackout {
+		unlock := l.mutLocks.lock(p)
+		defer unlock()
+		baseRev, hasBase, err := l.classicBase(ctx, v, next, p)
+		if err != nil {
+			return fs.Result{}, err
+		}
+		if err := l.writeCasMarker(ctx, v, p, baseRev, hasBase); err != nil {
+			return fs.Result{}, err
+		}
+		if err := l.removeBlackoutMarker(ctx, v, p); err != nil {
+			return fs.Result{}, err
+		}
+	} else if attr, err := l.statClassic(ctx, next, p); err == nil && attr != nil {
+		return fs.Result{}, syscall.EEXIST
+	} else {
+		unlock := l.mutLocks.lock(p)
+		defer unlock()
+		if err := l.writeCasMarker(ctx, v, p, 0, false); err != nil {
+			return fs.Result{}, err
+		}
+	}
+	if err := l.io.EnsureParent(ctx, parentTreeDir(v, l.serverAbs(p))); err != nil {
+		return fs.Result{}, err
+	}
+	rop := *op
+	rop.Path = v.treePathOf(l.serverAbs(p))
+	rres, rerr := next(ctx, &rop)
+	if rerr != nil {
+		return rres, rerr
+	}
+	v.idx.put(p, &indexEntry{kind: ekTree, isSymlink: true, mode: 0o777})
+	return rres, nil
+}
+
+func (l *Layer) mknodOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) (fs.Result, error) {
+	p := op.Path
+	res, _ := l.resolve(v, p)
+	if res == resTree || res == resAttrs {
+		return fs.Result{}, syscall.EEXIST
+	}
+	if res == resBlackout {
+		unlock := l.mutLocks.lock(p)
+		defer unlock()
+		baseRev, hasBase, err := l.classicBase(ctx, v, next, p)
+		if err != nil {
+			return fs.Result{}, err
+		}
+		if err := l.writeCasMarker(ctx, v, p, baseRev, hasBase); err != nil {
+			return fs.Result{}, err
+		}
+		if err := l.removeBlackoutMarker(ctx, v, p); err != nil {
+			return fs.Result{}, err
+		}
+	} else if attr, err := l.statClassic(ctx, next, p); err == nil && attr != nil {
+		return fs.Result{}, syscall.EEXIST
+	} else {
+		unlock := l.mutLocks.lock(p)
+		defer unlock()
+		if err := l.writeCasMarker(ctx, v, p, 0, false); err != nil {
+			return fs.Result{}, err
+		}
+	}
+	if err := l.io.EnsureParent(ctx, parentTreeDir(v, l.serverAbs(p))); err != nil {
+		return fs.Result{}, err
+	}
+	rop := *op
+	rop.Path = v.treePathOf(l.serverAbs(p))
+	rres, rerr := next(ctx, &rop)
+	if rerr != nil {
+		return rres, rerr
+	}
+	v.idx.put(p, &indexEntry{kind: ekTree, mode: op.Mode & 0o777})
+	return rres, nil
+}
+
+// hasWriteIntent reports an open that can produce writes.
+func hasWriteIntent(flags uint32) bool {
+	return flags&uint32(syscall.O_WRONLY|syscall.O_RDWR|syscall.O_APPEND|syscall.O_CREAT) != 0
 }

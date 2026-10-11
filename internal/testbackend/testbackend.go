@@ -77,6 +77,8 @@ type Backend struct {
 	layerEvents map[string][]LayerEntry
 	// checkpoints maps checkpoint ID → durable seq bound.
 	checkpoints map[string]int64
+	// layerStates maps layer ID → state for the bare layer GET.
+	layerStates map[string]string
 	// gitWorkspaces seeds GET /v1/git-workspaces; gitOverlay is the overlay
 	// log per workspace (path → entry).
 	gitWorkspaces []map[string]any
@@ -119,6 +121,7 @@ func NewBackend() *Backend {
 		layerLog:      map[string][]LayerEntry{},
 		layerEvents:   map[string][]LayerEntry{},
 		uploads:       map[string]*uploadState{},
+		layerStates:   map[string]string{},
 		checkpoints:   map[string]int64{},
 		requests:      map[string]int{},
 		gitStates:     map[string][]byte{},
@@ -231,6 +234,21 @@ func (b *Backend) GitOverlay(id string) map[string]map[string]any {
 }
 
 // SetCheckpoint pins a checkpoint's durable seq bound.
+// LayerStateForTest reports the tracked state of a layer.
+func (b *Backend) LayerStateForTest(id string) (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	st, ok := b.layerStates[id]
+	return st, ok
+}
+
+// SetLayerState overrides the state a bare layer GET reports.
+func (b *Backend) SetLayerState(id, state string) {
+	b.mu.Lock()
+	b.layerStates[id] = state
+	b.mu.Unlock()
+}
+
 func (b *Backend) SetCheckpoint(id string, seq int64) {
 	b.mu.Lock()
 	b.checkpoints[id] = seq
@@ -610,6 +628,24 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/v1/layers/") {
 		rest := strings.TrimPrefix(r.URL.Path, "/v1/layers/")
 		id := rest
+		if i := strings.IndexByte(rest, '/'); i < 0 && r.Method == http.MethodDelete {
+			b.mu.Lock()
+			b.layerStates[id] = "abandoned"
+			b.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"status":"ok"}`)
+			return
+		}
+		if i := strings.IndexByte(rest, '/'); i < 0 && r.Method == http.MethodGet {
+			b.mu.Lock()
+			state := b.layerStates[id]
+			b.mu.Unlock()
+			if state == "" {
+				state = "active"
+			}
+			b.writeJSON(w, map[string]any{"layer_id": id, "base_root_path": "/", "state": state, "name": ""})
+			return
+		}
 		if i := strings.IndexByte(rest, '/'); i >= 0 {
 			id = rest[:i]
 			tail := rest[i+1:]
@@ -634,6 +670,51 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					time.Sleep(delay)
 				}
 				b.writeJSON(w, map[string]any{"layer_id": id, "path": req.Path, "op": req.Op, "seq": e.Seq})
+				return
+			case tail == "commit" && r.Method == http.MethodPost:
+				b.mu.Lock()
+				b.layerStates[id] = "committed"
+				b.mu.Unlock()
+				b.writeJSON(w, map[string]any{"status": "committed", "layer_id": id, "applied": 0})
+				return
+			case tail == "fork" && r.Method == http.MethodPost:
+				var req struct {
+					LayerID      string `json:"layer_id"`
+					Name         string `json:"name"`
+					CheckpointID string `json:"checkpoint_id"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				child := req.LayerID
+				if child == "" {
+					child = "layer-forked"
+				}
+				b.mu.Lock()
+				parent := b.layerStates[id]
+				b.mu.Unlock()
+				if parent == "committed" || parent == "abandoned" || parent == "conflicted" {
+					b.writeErr(w, http.StatusConflict, "parent layer is "+parent)
+					return
+				}
+				b.mu.Lock()
+				b.layerStates[child] = "active"
+				b.mu.Unlock()
+				b.writeJSON(w, map[string]any{"layer_id": child, "base_root_path": "/", "state": "active", "parent_layer_id": id, "depth": 1})
+				return
+			case tail == "checkpoints" && r.Method == http.MethodPost:
+				var req struct {
+					CheckpointID string `json:"checkpoint_id"`
+					Label        string `json:"label"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				cp := req.CheckpointID
+				if cp == "" {
+					cp = "ckpt-auto"
+				}
+				b.mu.Lock()
+				b.layerSeq++
+				b.checkpoints[cp] = b.layerSeq
+				b.mu.Unlock()
+				b.writeJSON(w, map[string]any{"checkpoint_id": cp, "layer_id": id, "durable_seq": 0, "label": req.Label})
 				return
 			case tail == "events" && r.Method == http.MethodGet:
 				since := int64(0)
@@ -1131,6 +1212,17 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		n := b.files[p]
 		delete(b.files, p)
+		if q.Get("recursive") == "1" || q.Get("recursive") == "true" {
+			prefix := p + "/"
+			for cp := range b.files {
+				if strings.HasPrefix(cp, prefix) {
+					delete(b.files, cp)
+				}
+			}
+			b.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		b.mu.Unlock()
 		if n == nil {
 			b.writeErr(w, http.StatusNotFound, "not found")

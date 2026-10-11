@@ -176,7 +176,7 @@ func (cfg MountConfig) toProfilingOptions() perf.ProfilingOptions {
 // wires byte-identically to the pre-flag code.
 var defaultExtensionOrder = []string{
 	"core", "sse", "writeback", "xattr", "specials", "bulkfile",
-	"appendlog", "extent", "git", "layer", "localize", "renameguard", "cache",
+	"appendlog", "extent", "git", "localize", "renameguard", "cache", "layer",
 }
 
 // knownExtensionNames guards --extensions against typos (an unknown name
@@ -755,15 +755,20 @@ func MountWithConfig(cfg MountConfig) error {
 		built["localize"] = localizeExt
 	}
 
-	// The layer view sits outermost (v1: layer over base), git next.
+	// The layer view wraps the cached filesystem (outermost handler): it
+	// rewrites shadow paths through the full chain so layer data enjoys
+	// the same write pipeline and read cache as classic data. Constructed
+	// even without --layer so `drive9 fs layer checkout` can hot-switch a
+	// classic mount; without a ref it stays a pure pass-through.
 	var layerExt *layer.Layer
-	if wantExt["layer"] && strings.TrimSpace(cfg.LayerRef) != "" {
+	if wantExt["layer"] {
+		deps := layer.NewClientDeps(cl)
 		layerExt, err = layer.New(layer.Options{
-			Policy:        cfg.WritePolicy,
 			LayerRef:      cfg.LayerRef,
 			CheckpointRef: cfg.CheckpointRef,
 			RemoteRoot:    remoteRoot,
-			Client:        cl,
+			IO:            deps,
+			Registry:      deps,
 			Events:        bus,
 		})
 		if err != nil {
@@ -800,7 +805,10 @@ func MountWithConfig(cfg MountConfig) error {
 	}
 
 	var appendExt *appendlog.AppendLog
-	if wantExt["appendlog"] && len(cfg.AppendLogPatterns) > 0 && strings.TrimSpace(cfg.LayerRef) == "" {
+	// Layer mounts no longer disable the append-log plane: layer writes
+	// are ordinary writes on tree paths (v1 disabled it because the layer
+	// owned a private write plane).
+	if wantExt["appendlog"] && len(cfg.AppendLogPatterns) > 0 {
 		appendExt, err = appendlog.New(appendlog.Options{Patterns: cfg.AppendLogPatterns, Client: cl, RemoteRoot: remoteRoot, Events: bus, TempDir: appendLogSnapshotDir(cacheBase, mountHash)})
 		if err != nil {
 			return fmt.Errorf("fuse: appendlog extension: %w", err)
@@ -990,8 +998,9 @@ func MountWithConfig(cfg MountConfig) error {
 	}
 	if layerExt != nil {
 		// The layer event watcher resets the kernel view after a remote
-		// refresh (v1 resetMountView on fs_layer_events).
-		layerExt.Attach(f.Ctx.Notify)
+		// refresh (v1 resetMountView on fs_layer_events); the inode table
+		// maps marker-tree paths back to the user-visible entries.
+		layerExt.Attach(f.Ctx.Notify, f.Ctx.Inodes)
 		// A layer rollback fences the write plane: the commit queue halts
 		// and later inline commits fail with the rolled-back error.
 		if wb != nil {
@@ -1006,7 +1015,7 @@ func MountWithConfig(cfg MountConfig) error {
 	// `drive9 mount drain/umount/status` find this worker and its control
 	// socket; a supervised worker skips it — the supervisor owns the state
 	// file (v1 SkipProcessState: opts.Supervised).
-	ctrl, cerr := startMountControlServer(cfg.MountPoint, f)
+	ctrl, cerr := startMountControlServer(cfg.MountPoint, f, layerExt)
 	if cerr != nil {
 		fmt.Fprintf(os.Stderr, "drive9: mount control server failed: %v (continuing)\n", cerr)
 	} else {

@@ -14,9 +14,31 @@ import (
 const DefaultDrainTimeout = 30 * time.Second
 
 type DrainRequest struct {
-	// Op is "" or "drain" (default) or "status"/"ping".
+	// Op is "" or "drain" (default) or "status"/"ping" or
+	// "layer_checkout".
 	Op        string `json:"op,omitempty"`
 	TimeoutMS int64  `json:"timeout_ms,omitempty"`
+	// LayerCheckout fields select the layer view to hot-switch the mount
+	// to (op "layer_checkout" only): LayerRef resolves a layer (id, name,
+	// or tag ref), CheckpointRef pins a checkpoint of that layer, and Live
+	// returns the mount to the classic view.
+	LayerRef      string `json:"layer_ref,omitempty"`
+	CheckpointRef string `json:"checkpoint_ref,omitempty"`
+	Live          bool   `json:"live,omitempty"`
+}
+
+// LayerCheckoutResponse reports the view a mount holds after a
+// layer_checkout control op.
+type LayerCheckoutResponse struct {
+	OK           bool      `json:"ok"`
+	MountPoint   string    `json:"mount_point,omitempty"`
+	Op           string    `json:"op,omitempty"`
+	View         string    `json:"view"` // live | layer | checkpoint
+	LayerID      string    `json:"layer_id,omitempty"`
+	CheckpointID string    `json:"checkpoint_id,omitempty"`
+	ReadOnly     bool      `json:"read_only"`
+	Error        string    `json:"error,omitempty"`
+	CompletedAt  time.Time `json:"completed_at"`
 }
 
 // StatusResponse is a cheap liveness reply from the mount control socket.
@@ -118,6 +140,43 @@ func RequestDrain(ctx context.Context, socketPath string, timeout time.Duration)
 	var resp DrainResponse
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
 		return nil, fmt.Errorf("read drain response: %w", err)
+	}
+	return &resp, nil
+}
+
+// RequestLayerCheckout hot-switches a live mount's layer view over the
+// mount control socket: layer ref, layer+checkpoint pin, or live (classic).
+func RequestLayerCheckout(ctx context.Context, socketPath string, timeout time.Duration, layerRef, checkpointRef string, live bool) (*LayerCheckoutResponse, error) {
+	if socketPath == "" {
+		return nil, fmt.Errorf("missing mount control socket")
+	}
+	if timeout <= 0 {
+		timeout = DefaultDrainTimeout
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("dial mount control socket %s: %w", socketPath, err)
+	}
+	defer func() { _ = conn.Close() }()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	req := DrainRequest{Op: "layer_checkout", TimeoutMS: timeout.Milliseconds(), LayerRef: layerRef, CheckpointRef: checkpointRef, Live: live}
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return nil, fmt.Errorf("write layer checkout request: %w", err)
+	}
+	var resp LayerCheckoutResponse
+	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
+		return nil, fmt.Errorf("read layer checkout response: %w", err)
+	}
+	if !resp.OK && resp.Error != "" {
+		return &resp, fmt.Errorf("%s", resp.Error)
 	}
 	return &resp, nil
 }

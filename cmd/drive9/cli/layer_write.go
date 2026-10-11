@@ -3,31 +3,60 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/layerfs"
 )
 
-// Inline layer entries are JSON/base64 encoded and the server caps that
-// request body at 128 MiB. Leave room for the JSON envelope below the 96 MiB
-// raw-content boundary implied by base64 expansion.
-const cliLayerInlineLimit = client.DefaultFSLayerInlineEntryBytes
+// cliLayerInlineMax bounds the whole-image upload path; larger files
+// stream as multipart uploads.
+const cliLayerInlineMax = 8 << 20
 
-func layerBaseRevision(ctx context.Context, c *client.Client, remotePath string) (int64, error) {
+// resolveLayerRoots resolves a layer ref to its marker roots.
+func resolveLayerRoots(ctx context.Context, c *client.Client, layerRef string) (layerfs.Roots, error) {
+	layer, err := c.GetFSLayer(ctx, layerRef)
+	if err != nil {
+		return layerfs.Roots{}, err
+	}
+	return layerfs.RootsOf(layerfs.LayerRoot(layer.LayerID)), nil
+}
+
+// layerBaseAnchor stats the classic target of a layer write: the revision
+// the content is derived from, or absent.
+func layerBaseAnchor(ctx context.Context, c *client.Client, remotePath string) (int64, bool, error) {
 	stat, err := c.StatCtx(ctx, remotePath)
 	if client.IsNotFound(err) {
-		return 0, nil
+		return 0, false, nil
 	}
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if stat.IsDir {
-		return 0, fmt.Errorf("layer target %s is a directory", remotePath)
+		return 0, false, fmt.Errorf("layer target %s is a directory", remotePath)
 	}
-	return stat.Revision, nil
+	return stat.Revision, true, nil
+}
+
+// stampCas writes the commit-CAS marker before content materializes.
+func stampCas(ctx context.Context, c *client.Client, roots layerfs.Roots, remotePath string, baseRev int64, hasBase bool) error {
+	return c.WriteCtx(ctx, layerfs.MarkerPath(roots.Cas, remotePath), layerfs.EncodeCas(baseRev, hasBase))
+}
+
+// clearBlackout removes a stale blackout marker of either flavor (a
+// recreate does not care which root held it).
+func clearBlackout(ctx context.Context, c *client.Client, roots layerfs.Roots, remotePath string) error {
+	for _, root := range []string{roots.Blackouts, roots.BlackoutDirs} {
+		if err := c.DeleteFileCtx(ctx, layerfs.MarkerPath(root, remotePath)); err != nil && !client.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func uploadLocalFileToLayer(ctx context.Context, c *client.Client, layerRef, localPath, remotePath string) error {
@@ -47,133 +76,266 @@ func uploadBytesToLayer(ctx context.Context, c *client.Client, layerRef, remoteP
 	return uploadReaderToLayer(ctx, c, layerRef, remotePath, bytes.NewReader(data), int64(len(data)), mode, hasMode)
 }
 
+// uploadReaderToLayer lands file content in the layer's tree through the
+// ordinary write pipeline: CAS marker first, content second, stale
+// blackouts cleared last.
 func uploadReaderToLayer(ctx context.Context, c *client.Client, layerRef, remotePath string, r io.Reader, size int64, mode uint32, hasMode bool) error {
-	baseRev, err := layerBaseRevision(ctx, c, remotePath)
+	roots, err := resolveLayerRoots(ctx, c, layerRef)
 	if err != nil {
 		return err
 	}
-	inlineLimit := c.CachedSmallFileThreshold()
-	if inlineLimit <= 0 {
-		inlineLimit = client.DefaultSmallFileThreshold
-	}
-	inlineLimit = min(inlineLimit, cliLayerInlineLimit)
-	if size <= inlineLimit {
-		data, err := io.ReadAll(r)
-		if err != nil {
-			return fmt.Errorf("read layer upload: %w", err)
-		}
-		if int64(len(data)) != size {
-			return fmt.Errorf("layer upload size mismatch: metadata=%d actual=%d", size, len(data))
-		}
-		req := client.FSLayerEntryRequest{
-			Path:         remotePath,
-			Op:           "upsert",
-			Kind:         "file",
-			BaseRevision: baseRev,
-			Content:      data,
-			SizeBytes:    size,
-		}
-		if hasMode {
-			req.Mode = mode & 0o777
-		}
-		_, err = c.UpsertFSLayerEntry(ctx, layerRef, req)
+	baseRev, hasBase, err := layerBaseAnchor(ctx, c, remotePath)
+	if err != nil {
 		return err
 	}
-	_, err = c.UploadFSLayerFile(ctx, layerRef, remotePath, r, size, baseRev, mode, hasMode)
-	return err
+	if err := stampCas(ctx, c, roots, remotePath, baseRev, hasBase); err != nil {
+		return err
+	}
+	dst := layerfs.MarkerPath(roots.Tree, remotePath)
+	if size <= cliLayerInlineMax {
+		data, rerr := io.ReadAll(r)
+		if rerr != nil {
+			return fmt.Errorf("read layer upload: %w", rerr)
+		}
+		if werr := c.WriteCtx(ctx, dst, data); werr != nil {
+			return werr
+		}
+	} else if werr := streamToRemote(ctx, c, dst, r, size); werr != nil {
+		return werr
+	}
+	if hasMode && mode&0o777 != 0 && mode&0o777 != 0o644 {
+		if cerr := c.ChmodCtx(ctx, dst, mode&0o777); cerr != nil && !client.IsNotFound(cerr) {
+			return cerr
+		}
+	}
+	return clearBlackout(ctx, c, roots, remotePath)
+}
+
+// streamToRemote pumps a reader into a remote path as a multipart upload.
+func streamToRemote(ctx context.Context, c *client.Client, dst string, r io.Reader, size int64) error {
+	sw := c.NewStreamWriter(ctx, dst, size)
+	part := 0
+	var last []byte
+	buf := make([]byte, 4<<20)
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			part++
+			chunk := make([]byte, n)
+			copy(chunk, buf[:n])
+			if last != nil {
+				if werr := sw.WritePart(ctx, part-1, last); werr != nil {
+					abortStream(sw)
+					return werr
+				}
+			}
+			last = chunk
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			abortStream(sw)
+			return rerr
+		}
+	}
+	if part == 0 {
+		abortStream(sw)
+		return fmt.Errorf("layer upload %s: stream ended with no parts", dst)
+	}
+	return sw.Complete(ctx, part, last)
+}
+
+func abortStream(sw *client.StreamWriter) {
+	abortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_ = sw.Abort(abortCtx)
+	cancel()
 }
 
 func mkdirLayerPath(ctx context.Context, c *client.Client, layerRef, remotePath string, mode uint32) error {
-	_, err := c.UpsertFSLayerEntry(ctx, layerRef, client.FSLayerEntryRequest{
-		Path: remotePath,
-		Op:   "mkdir",
-		Kind: "dir",
-		Mode: mode & 0o777,
-	})
-	return err
-}
-
-func whiteoutLayerPath(ctx context.Context, c *client.Client, layerRef, remotePath string, recursive bool) error {
-	kind := "file"
-	stat, err := c.StatCtx(ctx, remotePath)
-	if err == nil && stat.IsDir {
-		if !recursive {
-			return fmt.Errorf("%s is a directory (use -r/--recursive)", remotePath)
-		}
-		entries, err := c.ListCtx(ctx, remotePath)
-		if err != nil {
-			return err
-		}
-		if len(entries) > 0 {
-			return fmt.Errorf("layer directory whiteout requires empty directory: %s", remotePath)
-		}
-		kind = "dir"
-	} else if err != nil && !client.IsNotFound(err) {
-		return err
-	}
-	if recursive {
-		kind = "dir"
-	}
-	_, err = c.UpsertFSLayerEntry(ctx, layerRef, client.FSLayerEntryRequest{
-		Path: remotePath,
-		Op:   "whiteout",
-		Kind: kind,
-	})
-	return err
-}
-
-func chmodLayerPath(ctx context.Context, c *client.Client, layerRef, remotePath string, mode uint32) error {
-	kind := "file"
-	if stat, err := c.StatCtx(ctx, remotePath); err == nil && stat.IsDir {
-		kind = "dir"
-	} else if err != nil && !client.IsNotFound(err) {
-		return err
-	} else if strings.HasSuffix(remotePath, "/") {
-		kind = "dir"
-	}
-	_, err := c.UpsertFSLayerEntry(ctx, layerRef, client.FSLayerEntryRequest{
-		Path: remotePath,
-		Op:   "chmod",
-		Kind: kind,
-		Mode: mode & 0o777,
-	})
-	return err
-}
-
-func symlinkLayerPath(ctx context.Context, c *client.Client, layerRef, target, linkPath string) error {
-	_, err := c.UpsertFSLayerEntry(ctx, layerRef, client.FSLayerEntryRequest{
-		Path:        linkPath,
-		Op:          "symlink",
-		Kind:        "symlink",
-		ContentText: target,
-		SizeBytes:   int64(len(target)),
-		Mode:        0o120777,
-	})
-	return err
-}
-
-func renameLayerPath(ctx context.Context, c *client.Client, layerRef, oldPath, newPath string) error {
-	_, err := c.UpsertFSLayerEntry(ctx, layerRef, client.FSLayerEntryRequest{
-		Path:        oldPath,
-		Op:          "rename",
-		Kind:        "file",
-		ContentText: newPath,
-	})
-	return err
-}
-
-func hardlinkLayerPath(ctx context.Context, c *client.Client, layerRef, srcPath, dstPath string) error {
-	data, err := c.ReadCtx(ctx, srcPath)
+	roots, err := resolveLayerRoots(ctx, c, layerRef)
 	if err != nil {
 		return err
 	}
-	mode := uint32(0)
-	hasMode := false
-	if stat, err := c.StatCtx(ctx, srcPath); err == nil && stat.HasMode {
-		mode = stat.Mode & 0o777
-		hasMode = true
+	baseRev, hasBase, err := layerBaseAnchor(ctx, c, remotePath)
+	if err != nil {
+		return err
 	}
-	return uploadBytesToLayer(ctx, c, layerRef, dstPath, data, mode, hasMode)
+	if err := stampCas(ctx, c, roots, remotePath, baseRev, hasBase); err != nil {
+		return err
+	}
+	if err := c.MkdirCtx(ctx, layerfs.MarkerPath(roots.Tree, remotePath), mode&0o777); err != nil {
+		return err
+	}
+	return clearBlackout(ctx, c, roots, remotePath)
+}
+
+func whiteoutLayerPath(ctx context.Context, c *client.Client, layerRef, remotePath string, recursive bool) error {
+	roots, err := resolveLayerRoots(ctx, c, layerRef)
+	if err != nil {
+		return err
+	}
+	classic, statErr := c.StatCtx(ctx, remotePath)
+	if statErr != nil && !client.IsNotFound(statErr) {
+		return statErr
+	}
+	treePath := layerfs.MarkerPath(roots.Tree, remotePath)
+	treeStat, treeErr := c.StatCtx(ctx, treePath)
+	if treeErr != nil && !client.IsNotFound(treeErr) {
+		return treeErr
+	}
+	isDir := (classic != nil && classic.IsDir) || (treeStat != nil && treeStat.IsDir)
+	if isDir && !recursive {
+		return fmt.Errorf("%s is a directory (use -r/--recursive)", remotePath)
+	}
+	if classic != nil && classic.IsDir {
+		entries, lerr := c.ListCtx(ctx, remotePath)
+		if lerr == nil && len(entries) > 0 {
+			return fmt.Errorf("layer directory whiteout requires empty directory: %s", remotePath)
+		}
+	}
+	if treeStat != nil {
+		if treeStat.IsDir {
+			if derr := c.DeleteDirCtx(ctx, treePath); derr != nil && !client.IsNotFound(derr) {
+				return derr
+			}
+		} else if derr := c.DeleteFileCtx(ctx, treePath); derr != nil && !client.IsNotFound(derr) {
+			return derr
+		}
+	}
+	if classic == nil && treeStat == nil {
+		return nil // nothing to hide
+	}
+	info := layerfs.Blackout{IsDir: isDir}
+	if classic != nil && !classic.IsDir {
+		info.BaseRev, info.HasBase = classic.Revision, true
+	}
+	root := roots.Blackouts
+	if isDir {
+		root = roots.BlackoutDirs
+	}
+	return c.WriteCtx(ctx, layerfs.MarkerPath(root, remotePath), info.Encode())
+}
+
+func chmodLayerPath(ctx context.Context, c *client.Client, layerRef, remotePath string, mode uint32) error {
+	roots, err := resolveLayerRoots(ctx, c, layerRef)
+	if err != nil {
+		return err
+	}
+	treePath := layerfs.MarkerPath(roots.Tree, remotePath)
+	if stat, serr := c.StatCtx(ctx, treePath); serr == nil && stat != nil {
+		return c.ChmodCtx(ctx, treePath, mode&0o777)
+	} else if !client.IsNotFound(serr) {
+		return serr
+	}
+	if stat, serr := c.StatCtx(ctx, remotePath); serr == nil && stat != nil {
+		patch := layerfs.AttrsPatch{Mode: mode & 0o7777}
+		content, merr := json.Marshal(patch)
+		if merr != nil {
+			return merr
+		}
+		return c.WriteCtx(ctx, layerfs.MarkerPath(roots.Attrs, remotePath), content)
+	} else if !client.IsNotFound(serr) {
+		return serr
+	}
+	return fmt.Errorf("%s: not found", remotePath)
+}
+
+func symlinkLayerPath(ctx context.Context, c *client.Client, layerRef, target, linkPath string) error {
+	roots, err := resolveLayerRoots(ctx, c, layerRef)
+	if err != nil {
+		return err
+	}
+	baseRev, hasBase, err := layerBaseAnchor(ctx, c, linkPath)
+	if err != nil {
+		return err
+	}
+	if err := stampCas(ctx, c, roots, linkPath, baseRev, hasBase); err != nil {
+		return err
+	}
+	if err := c.SymlinkCtx(ctx, target, layerfs.MarkerPath(roots.Tree, linkPath)); err != nil {
+		return err
+	}
+	return clearBlackout(ctx, c, roots, linkPath)
+}
+
+func renameLayerPath(ctx context.Context, c *client.Client, layerRef, oldPath, newPath string) error {
+	roots, err := resolveLayerRoots(ctx, c, layerRef)
+	if err != nil {
+		return err
+	}
+	treeSrc := layerfs.MarkerPath(roots.Tree, oldPath)
+	treeDst := layerfs.MarkerPath(roots.Tree, newPath)
+	if _, serr := c.StatCtx(ctx, treeSrc); serr == nil {
+		if rerr := c.RenameCtx(ctx, treeSrc, treeDst); rerr != nil {
+			return rerr
+		}
+	} else if !client.IsNotFound(serr) {
+		return serr
+	} else {
+		// Classic source: copy the content into the tree, then hide the
+		// origin.
+		data, rerr := c.ReadCtx(ctx, oldPath)
+		if rerr != nil {
+			return rerr
+		}
+		mode := uint32(0o644)
+		if st, serr := c.StatCtx(ctx, oldPath); serr == nil && st.HasMode {
+			mode = st.Mode & 0o777
+		}
+		if uerr := uploadBytesToLayer(ctx, c, layerRef, newPath, data, mode, true); uerr != nil {
+			return uerr
+		}
+	}
+	// Hide the classic origin, clear the destination blackout, and move
+	// the CAS anchor.
+	if st, serr := c.StatCtx(ctx, oldPath); serr == nil && st != nil {
+		info := layerfs.Blackout{IsDir: st.IsDir, BaseRev: st.Revision, HasBase: true}
+		root := roots.Blackouts
+		if info.IsDir {
+			root = roots.BlackoutDirs
+		}
+		if werr := c.WriteCtx(ctx, layerfs.MarkerPath(root, oldPath), info.Encode()); werr != nil {
+			return werr
+		}
+	} else if !client.IsNotFound(serr) {
+		return serr
+	}
+	if err := clearBlackout(ctx, c, roots, newPath); err != nil {
+		return err
+	}
+	if content, rerr := c.ReadCtx(ctx, layerfs.MarkerPath(roots.Cas, oldPath)); rerr == nil {
+		if werr := c.WriteCtx(ctx, layerfs.MarkerPath(roots.Cas, newPath), content); werr != nil {
+			return werr
+		}
+		_ = c.DeleteFileCtx(ctx, layerfs.MarkerPath(roots.Cas, oldPath))
+	}
+	return nil
+}
+
+func hardlinkLayerPath(ctx context.Context, c *client.Client, layerRef, srcPath, dstPath string) error {
+	roots, err := resolveLayerRoots(ctx, c, layerRef)
+	if err != nil {
+		return err
+	}
+	// A layer cannot hardlink into the classic namespace: the link
+	// materializes as a content copy in the tree.
+	src := layerfs.MarkerPath(roots.Tree, srcPath)
+	if _, serr := c.StatCtx(ctx, src); serr != nil {
+		if !client.IsNotFound(serr) {
+			return serr
+		}
+		src = srcPath
+	}
+	data, rerr := c.ReadCtx(ctx, src)
+	if rerr != nil {
+		return rerr
+	}
+	mode := uint32(0o644)
+	if st, serr := c.StatCtx(ctx, src); serr == nil && st.HasMode {
+		mode = st.Mode & 0o777
+	}
+	return uploadBytesToLayer(ctx, c, layerRef, dstPath, data, mode, true)
 }
 
 func requireNoLayerWithRemoteContext(layerRef string, rp RemotePath, raw string) error {

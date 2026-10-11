@@ -11,8 +11,13 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/journal"
+	"github.com/mem9-ai/drive9/pkg/layerfs"
+	"github.com/mem9-ai/drive9/pkg/mountcontrol"
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
 func Layer(c *client.Client, args []string) error {
@@ -44,13 +49,15 @@ func Layer(c *client.Client, args []string) error {
 		return LayerChain(c, args[1:])
 	case "delete", "rm":
 		return LayerDelete(c, args[1:])
+	case "checkout":
+		return LayerCheckout(c, args[1:])
 	default:
 		return fmt.Errorf("unknown fs layer command %q", args[0])
 	}
 }
 
 func layerUsage() string {
-	return "usage: drive9 fs layer <create|list|status|diff|checkpoint|rollback|commit|fork|chain|delete>"
+	return "usage: drive9 fs layer <create|list|status|diff|checkpoint|rollback|commit|fork|chain|delete|checkout>"
 }
 
 func LayerCreate(c *client.Client, args []string) error {
@@ -191,17 +198,80 @@ func LayerDiff(c *client.Client, args []string) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: drive9 fs layer diff [flags] <layer>")
 	}
-	entries, err := c.DiffFSLayer(context.Background(), fs.Arg(0))
+	layer, err := c.GetFSLayer(context.Background(), fs.Arg(0))
 	if err != nil {
 		return err
 	}
+	snap, err := layerfs.LoadSnapshot(context.Background(), c, layerfs.LayerRoot(layer.LayerID))
+	if err != nil {
+		return err
+	}
+	type diffRow struct {
+		Seq     int    `json:"seq"`
+		Op      string `json:"op"`
+		Kind    string `json:"kind"`
+		Mode    uint32 `json:"mode"`
+		Size    int64  `json:"size,omitempty"`
+		Path    string `json:"path"`
+		BaseRev int64  `json:"base_revision,omitempty"`
+	}
+	rows := make([]diffRow, 0, len(snap.Tree)+len(snap.Blackouts)+len(snap.Attrs))
+	seq := 0
+	addRow := func(op, kind string, mode uint32, size, baseRev int64, path string) {
+		seq++
+		rows = append(rows, diffRow{Seq: seq, Op: op, Kind: kind, Mode: mode, Size: size, BaseRev: baseRev, Path: path})
+	}
+	paths := make([]string, 0, len(snap.Tree))
+	for p := range snap.Tree {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		e := snap.Tree[p]
+		kind := "file"
+		if e.IsDir {
+			kind = "dir"
+		} else if e.IsSymlink {
+			kind = "symlink"
+		}
+		baseRev := int64(0)
+		if a, ok := snap.Cas[p]; ok && a.HasBase {
+			baseRev = a.BaseRev
+		}
+		addRow("upsert", kind, e.Mode, e.Size, baseRev, p)
+	}
+	attrPaths := make([]string, 0, len(snap.Attrs))
+	for p := range snap.Attrs {
+		attrPaths = append(attrPaths, p)
+	}
+	sort.Strings(attrPaths)
+	for _, p := range attrPaths {
+		addRow("chmod", "file", snap.Attrs[p].Mode, 0, 0, p)
+	}
+	blackPaths := make([]string, 0, len(snap.Blackouts))
+	for p := range snap.Blackouts {
+		blackPaths = append(blackPaths, p)
+	}
+	sort.Strings(blackPaths)
+	for _, p := range blackPaths {
+		b := snap.Blackouts[p]
+		kind := "file"
+		if b.IsDir {
+			kind = "dir"
+		}
+		baseRev := int64(0)
+		if b.HasBase {
+			baseRev = b.BaseRev
+		}
+		addRow("whiteout", kind, 0, 0, baseRev, p)
+	}
 	if *asJSON {
 		enc := json.NewEncoder(os.Stdout)
-		return enc.Encode(map[string]any{"entries": entries})
+		return enc.Encode(map[string]any{"entries": rows})
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	for _, entry := range entries {
-		_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%04o\t%s\n", entry.EntrySeq, entry.Op, entry.Kind, entry.Mode, entry.Path)
+	for _, row := range rows {
+		_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%04o\t%s\n", row.Seq, row.Op, row.Kind, row.Mode, row.Path)
 	}
 	return tw.Flush()
 }
@@ -222,8 +292,21 @@ func LayerCheckpoint(c *client.Client, args []string) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: drive9 fs layer checkpoint [flags] <layer>")
 	}
-	checkpoint, err := c.CheckpointFSLayer(context.Background(), fs.Arg(0), client.FSLayerCheckpointRequest{
-		CheckpointID: *checkpointID,
+	layer, err := c.GetFSLayer(context.Background(), fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	cpID := strings.TrimSpace(*checkpointID)
+	if cpID == "" {
+		cpID = journal.NewID("ckpt")
+	}
+	// Snapshot first, pin second: a crash leaves an invisible orphan
+	// directory, never a checkpoint row without content.
+	if err := layerfs.CopySnapshot(context.Background(), c, layerfs.LayerRoot(layer.LayerID), layerfs.CheckpointRoot(layer.LayerID, cpID)); err != nil {
+		return fmt.Errorf("snapshot layer tree: %w", err)
+	}
+	checkpoint, err := c.CheckpointFSLayer(context.Background(), layer.LayerID, client.FSLayerCheckpointRequest{
+		CheckpointID: cpID,
 		Label:        *label,
 	})
 	if err != nil {
@@ -268,11 +351,22 @@ func LayerCommit(c *client.Client, args []string) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: drive9 fs layer commit <layer>")
 	}
-	result, err := c.CommitFSLayer(context.Background(), fs.Arg(0))
+	layer, err := c.GetFSLayer(context.Background(), fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(os.Stdout, "%s layer=%s applied=%d\n", result.Status, result.LayerID, result.Applied)
+	result, err := layerfs.Commit(context.Background(), c, layer)
+	if err != nil {
+		return err
+	}
+	if len(result.Conflicts) > 0 {
+		for _, conflict := range result.Conflicts {
+			_, _ = fmt.Fprintf(os.Stderr, "conflict %s: %s (base rev %d, want %d)\n", conflict.Path, conflict.Reason, conflict.BaseRevision, conflict.WantRevision)
+		}
+		_, _ = fmt.Fprintln(os.Stdout, "conflicted")
+		return fmt.Errorf("fs layer commit: %d conflict(s)", len(result.Conflicts))
+	}
+	_, _ = fmt.Fprintf(os.Stdout, "committed layer=%s applied=%d\n", layer.LayerID, result.Applied)
 	return nil
 }
 
@@ -293,8 +387,32 @@ func LayerFork(c *client.Client, args []string) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: drive9 fs layer fork [flags] <parent-layer>")
 	}
+	parent, err := c.GetFSLayer(context.Background(), fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	childID := strings.TrimSpace(*layerID)
+	if childID == "" {
+		childID = journal.NewID("layer")
+	}
+	srcBase := layerfs.LayerRoot(parent.LayerID)
+	if cp := strings.TrimSpace(*checkpoint); cp != "" {
+		pin, err := c.GetFSLayerCheckpoint(context.Background(), cp)
+		if err != nil {
+			return err
+		}
+		if pin.LayerID != parent.LayerID {
+			return fmt.Errorf("checkpoint %s belongs to layer %s, not %s", pin.CheckpointID, pin.LayerID, parent.LayerID)
+		}
+		srcBase = layerfs.CheckpointRoot(parent.LayerID, pin.CheckpointID)
+	}
+	// Copy first, registry row second: a crash leaves an orphan namespace
+	// directory (invisible), never a half-forked layer.
+	if err := layerfs.CopySnapshot(context.Background(), c, srcBase, layerfs.LayerRoot(childID)); err != nil {
+		return fmt.Errorf("fork layer tree: %w", err)
+	}
 	child, err := c.ForkFSLayer(context.Background(), fs.Arg(0), client.FSLayerForkRequest{
-		LayerID:      *layerID,
+		LayerID:      childID,
 		Name:         *name,
 		ActorID:      *actor,
 		CheckpointID: *checkpoint,
@@ -352,8 +470,17 @@ func LayerDelete(c *client.Client, args []string) error {
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: drive9 fs layer delete [flags] <layer>")
 	}
+	layer, err := c.GetFSLayer(context.Background(), fs.Arg(0))
+	if err != nil {
+		return err
+	}
 	if err := c.DeleteFSLayer(context.Background(), fs.Arg(0), *cascade); err != nil {
 		return err
+	}
+	// The registry row is gone; sweep the namespace tree best-effort (a
+	// failure leaves an invisible orphan, nothing consumes it).
+	if rerr := c.RemoveAllCtx(context.Background(), layerfs.LayerRoot(layer.LayerID)); rerr != nil && !client.IsNotFound(rerr) {
+		_, _ = fmt.Fprintf(os.Stderr, "warning: layer tree cleanup failed: %v\n", rerr)
 	}
 	_, _ = fmt.Fprintln(os.Stdout, "ok")
 	return nil
@@ -405,4 +532,68 @@ func formatLayerTags(tags map[string]string) string {
 		parts = append(parts, key+"="+tags[key])
 	}
 	return strings.Join(parts, ",")
+}
+
+// LayerCheckout hot-switches a live mount's shadow view through its mount
+// control socket — no umount required.
+func LayerCheckout(c *client.Client, args []string) error {
+	fs := flag.NewFlagSet("fs layer checkout", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	checkpoint := fs.String("checkpoint", "", "checkout a checkpoint of the layer (read-only view)")
+	live := fs.Bool("live", false, "return the mount to the classic view")
+	mountPoint := fs.String("mount", "", "mount point of the live mount to switch (required)")
+	timeout := fs.Duration("timeout", mountcontrol.DefaultDrainTimeout, "maximum time to wait for the switch")
+	asJSON := fs.Bool("json", false, "print JSON")
+	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return printLayerHelp(fs, "usage: drive9 fs layer checkout [flags] <layer>")
+		}
+		return err
+	}
+	layerRef := ""
+	if fs.NArg() == 1 {
+		layerRef = strings.TrimSpace(fs.Arg(0))
+	} else if fs.NArg() != 0 {
+		return fmt.Errorf("usage: drive9 fs layer checkout [flags] <layer>")
+	}
+	if strings.TrimSpace(*mountPoint) == "" {
+		return fmt.Errorf("fs layer checkout: --mount is required (the live mount to switch)")
+	}
+	if !*live && layerRef == "" {
+		return fmt.Errorf("fs layer checkout: provide a layer ref or --live")
+	}
+	if *live && (layerRef != "" || strings.TrimSpace(*checkpoint) != "") {
+		return fmt.Errorf("fs layer checkout: --live cannot be combined with a layer or checkpoint ref")
+	}
+	stateMountPoint := backgroundMountStatePoint(strings.TrimSpace(*mountPoint))
+	state, _, err := mountstate.ReadProcessState(stateMountPoint)
+	if err != nil {
+		return fmt.Errorf("fs layer checkout: read mount state for %s: %w", *mountPoint, err)
+	}
+	socketPath := strings.TrimSpace(state.ControlSocket)
+	if socketPath == "" {
+		return fmt.Errorf("fs layer checkout: mount %s does not expose a control socket", *mountPoint)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout+5*time.Second)
+	defer cancel()
+	resp, err := mountcontrol.RequestLayerCheckout(ctx, socketPath, *timeout, layerRef, strings.TrimSpace(*checkpoint), *live)
+	if err != nil {
+		return fmt.Errorf("fs layer checkout: %w", err)
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		return enc.Encode(resp)
+	}
+	_, _ = fmt.Fprintf(os.Stdout, "checkout %s view=%s", resp.MountPoint, resp.View)
+	if resp.LayerID != "" {
+		_, _ = fmt.Fprintf(os.Stdout, " layer=%s", resp.LayerID)
+	}
+	if resp.CheckpointID != "" {
+		_, _ = fmt.Fprintf(os.Stdout, " checkpoint=%s", resp.CheckpointID)
+	}
+	if resp.ReadOnly {
+		_, _ = fmt.Fprint(os.Stdout, " read-only")
+	}
+	_, _ = fmt.Fprintln(os.Stdout)
+	return nil
 }
