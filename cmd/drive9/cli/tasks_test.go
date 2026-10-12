@@ -28,8 +28,8 @@ func newTasksTestServer(t *testing.T, responseBody string) *httptest.Server {
 
 func TestTasksTextOutput(t *testing.T) {
 	srv := newTasksTestServer(t, `{"path":"/doc.txt","tasks":[`+
-		`{"task_type":"embed","status":"succeeded","usage":{"input_tokens":109,"output_tokens":51,"total_tokens":160,"llm_calls":2}},`+
-		`{"task_type":"img_extract_text","status":"failed","last_error":"image_extract_provider_auth_rejected: authentication rejected (HTTP 401)","usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10,"llm_calls":1}},`+
+		`{"task_type":"embed","status":"succeeded","usage":{"input_tokens":109,"output_tokens":51,"total_tokens":160,"llm_calls":2,"audio_duration_seconds":0}},`+
+		`{"task_type":"img_extract_text","status":"failed","last_error":"image_extract_provider_auth_rejected: authentication rejected (HTTP 401)","usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10,"llm_calls":1,"audio_duration_seconds":0}},`+
 		`{"task_type":"audio_extract_text","status":"pending","pending_reason":"quota_exceeded","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"llm_calls":0,"audio_duration_seconds":12.5}}]}`)
 	defer srv.Close()
 
@@ -94,7 +94,7 @@ func TestTaskUsageCell(t *testing.T) {
 
 func TestTasksJSONOutput(t *testing.T) {
 	srv := newTasksTestServer(t, `{"path":"/doc.txt","tasks":[`+
-		`{"task_type":"embed","status":"queued","usage":{"input_tokens":109,"output_tokens":51,"total_tokens":160,"llm_calls":2}},`+
+		`{"task_type":"embed","status":"queued","usage":{"input_tokens":109,"output_tokens":51,"total_tokens":160,"llm_calls":2,"audio_duration_seconds":0}},`+
 		`{"task_type":"img_extract_text","status":"failed","last_error":"image_extract_provider_rate_limited: provider rate limited the request (HTTP 429)"}]}`)
 	defer srv.Close()
 

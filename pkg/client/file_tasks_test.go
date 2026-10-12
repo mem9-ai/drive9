@@ -44,7 +44,7 @@ func TestFileTasksCtxDecodesUsageAndPendingReason(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(fileTasksMarkerHeader, "1")
 		_, _ = w.Write([]byte(`{"path":"/doc.txt","tasks":[` +
-			`{"task_type":"embed","status":"failed","usage":{"input_tokens":109,"output_tokens":51,"total_tokens":160,"llm_calls":2}},` +
+			`{"task_type":"embed","status":"failed","usage":{"input_tokens":109,"output_tokens":51,"total_tokens":160,"llm_calls":2,"audio_duration_seconds":0}},` +
 			`{"task_type":"audio_extract_text","status":"pending","pending_reason":"quota_exceeded","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"llm_calls":0,"audio_duration_seconds":12.5}}]}`))
 	}))
 	defer srv.Close()
