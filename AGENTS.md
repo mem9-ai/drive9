@@ -12,6 +12,36 @@ Go version: 1.25.1 (see `go.mod`)
 
 ---
 
+## Development and test task descriptions
+
+Use the following details when describing Drive9 development and test scenarios:
+
+| Scenario | Required description |
+| --- | --- |
+| Failpoint / fault injection | Injection point, simulated error or pause condition, affected test objects, and cleanup method. |
+| Cache bypass | Cache layer being skipped, triggering condition, and subsequent read source. |
+| Cache poisoning / data corruption | Concrete incorrect state, such as reuse of an old revision or reading stale bytes after truncation. |
+| Process termination / crash recovery | Specific test process, termination point, and data acceptance criteria after restart. |
+| Network fault | Affected test connection, simulated disconnection or timeout, and restoration method. |
+| Persistence / durability | Whether data reaches the local shadow, journal, or remote store, and completion boundaries for write, close, and fsync. |
+| Authentication / tenant isolation | Test-created identities and resources, allowed and rejected operations, actual authorized scope, and expected status codes. |
+
+1. Structure task descriptions, plans, command explanations, and test comments as
+   `goal -> environment and objects -> operation mechanism -> acceptance criteria`.
+2. Preserve accurate terminology and existing code identifiers. Clarify ambiguous
+   descriptions with concrete objects and mechanisms. For actual security tests,
+   accurately state the purpose and authorized scope.
+
+For example:
+
+> Simulate a connection timeout before the test client's remote commit completes.
+> Verify that fsync returns an error, pending data is retained, and the data is
+> successfully committed after the connection is restored.
+
+These conventions clarify task intent; they do not exempt requests from platform safety checks.
+
+---
+
 ## Build commands
 
 ```bash
