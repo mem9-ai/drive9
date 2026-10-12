@@ -105,12 +105,13 @@ jobs:
           # conflict is seen, while content merely inherited from the base
           # branch is not re-reported (which plain `-m` would do).
           if [ -n "$BASE_SHA" ]; then
-            log_opts="$BASE_SHA..$HEAD_SHA --text --diff-merges=remerge"
+            range="$BASE_SHA..$HEAD_SHA"
             config_ref="$BASE_SHA"
           else
-            log_opts="--all --text --diff-merges=remerge"
+            range="--all"
             config_ref="HEAD"
           fi
+          log_opts="$range --text --diff-merges=remerge"
 
           # Trusted allowlist: the merge base for a PR, the checked-out ref for a
           # manual run. If that revision predates .gitleaks.toml, fall back to the
@@ -126,6 +127,17 @@ jobs:
           # requested history, so traverse the range first and fail closed.
           if ! git log -p -U0 $log_opts >/dev/null 2>&1; then
             echo "cannot read the full history of '$log_opts' (missing objects or an unknown revision)" >&2
+            exit 1
+          fi
+
+          # `--diff-merges=remerge` emits no patch for merges with three or more
+          # parents, so such a commit could hide a credential; refuse to report a
+          # pass instead of scanning nothing for it.
+          octopus="$(git rev-list --merges --min-parents=3 $range)"
+          if [ -n "$octopus" ]; then
+            echo "octopus merge(s) in '$range' cannot be remerge-diffed:" >&2
+            echo "$octopus" >&2
+            echo "re-create the merge with two parents, or review its result manually" >&2
             exit 1
           fi
 

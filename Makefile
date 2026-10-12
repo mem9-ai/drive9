@@ -53,6 +53,9 @@ GITLEAKS_RANGE = $(if $(GITLEAKS_LOG_OPTS),$(GITLEAKS_LOG_OPTS),HEAD)
 #                               re-reporting content inherited from the base branch,
 #                               which plain `-m` does. Needs git >= 2.36; an older
 #                               git fails the preflight below rather than passing.
+#                               `--diff-merges=remerge` emits no patch at all for merges
+#                               with three or more parents, so the preflight refuses to
+#                               scan a range containing one instead of reporting a pass.
 GITLEAKS_DIFF_OPTS ?= --text --diff-merges=remerge
 
 IMAGE_REPO ?= drive9-server
@@ -173,6 +176,13 @@ gitleaks: install-gitleaks
 	if ! git log -p -U0 $(GITLEAKS_RANGE) $(GITLEAKS_DIFF_OPTS) >/dev/null 2>&1; then \
 		echo "gitleaks: cannot read the full history of '$(GITLEAKS_RANGE)'" >&2; \
 		echo "gitleaks: unknown revision, or a partial clone whose promisor remote is unreachable" >&2; \
+		exit 1; \
+	fi; \
+	octopus="$$(git rev-list --merges --min-parents=3 $(GITLEAKS_RANGE) 2>/dev/null || true)"; \
+	if [ -n "$$octopus" ]; then \
+		echo "gitleaks: octopus merge(s) in '$(GITLEAKS_RANGE)' cannot be remerge-diffed:" >&2; \
+		echo "$$octopus" >&2; \
+		echo "gitleaks: re-create the merge with two parents, or review its result manually" >&2; \
 		exit 1; \
 	fi; \
 	$(GITLEAKS_BIN) git . --no-banner --redact -v --log-opts="$(GITLEAKS_RANGE) $(GITLEAKS_DIFF_OPTS)"

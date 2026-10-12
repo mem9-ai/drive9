@@ -172,4 +172,51 @@ if [[ "$status" -ne 0 ]]; then
 fi
 echo "   ok: make gitleaks stays clean for the inherited case (exit $status)"
 
-echo "PASS: scan coverage guards hold for hidden diffs, merge resolutions and inherited base content"
+echo "== 4. octopus merges must fail closed (remerge emits no patch for 3+ parents)"
+init_repo "$WORK/octopus"
+printf 'base\n' > "$WORK/octopus/base.txt"
+git -C "$WORK/octopus" add -A
+git -C "$WORK/octopus" commit -qm base
+OCTO_DEFAULT="$(git -C "$WORK/octopus" symbolic-ref --short HEAD)"
+for branch in b1 b2 b3; do
+  git -C "$WORK/octopus" checkout -q -b "$branch" "$OCTO_DEFAULT"
+  printf '%s\n' "$branch" > "$WORK/octopus/$branch.txt"
+  git -C "$WORK/octopus" add -A
+  git -C "$WORK/octopus" commit -qm "$branch"
+done
+git -C "$WORK/octopus" checkout -q "$OCTO_DEFAULT"
+git -C "$WORK/octopus" merge -q --no-commit b1 b2 b3 >/dev/null 2>&1
+printf 'aws_key = "%s"\n' "$FAKE_AWS_KEY" > "$WORK/octopus/creds.txt"
+git -C "$WORK/octopus" add -A
+git -C "$WORK/octopus" commit -qm "octopus merge with a resolution-only credential"
+OCTO_MERGE="$(git -C "$WORK/octopus" rev-parse HEAD)"
+if [[ "$(git -C "$WORK/octopus" rev-list --parents -n1 "$OCTO_MERGE" | wc -w)" -lt 4 ]]; then
+  echo "setup error: $OCTO_MERGE is not an octopus merge" >&2
+  exit 1
+fi
+stage_repo "$WORK/octopus"
+
+# A remerge-only traversal sees nothing for that commit...
+status="$(raw_scan "$WORK/octopus" "$OCTO_MERGE --diff-merges=remerge")"
+if [[ "$status" -ne 0 ]]; then
+  echo "setup error: remerge unexpectedly found the octopus credential (exit $status)" >&2
+  cat "$WORK/raw.log" >&2
+  exit 1
+fi
+echo "   ok: a remerge-only traversal is blind to it (exit $status)"
+
+# ...so the target has to refuse rather than report a pass.
+status="$(target_scan "$WORK/octopus" "$OCTO_MERGE")"
+if [[ "$status" -eq 0 ]]; then
+  echo "FAIL: make gitleaks passed over an octopus merge without scanning its result" >&2
+  cat "$WORK/target.log" >&2
+  exit 1
+fi
+grep -q "octopus merge" "$WORK/target.log" || {
+  echo "FAIL: make gitleaks failed without the octopus diagnostic:" >&2
+  cat "$WORK/target.log" >&2
+  exit 1
+}
+echo "   ok: make gitleaks fails closed with the octopus diagnostic (exit $status)"
+
+echo "PASS: scan coverage guards hold (hidden diffs, merge resolutions, inherited base, octopus merges)"

@@ -125,7 +125,9 @@ unknown revision or a partial clone whose promisor remote is unreachable aborts 
 reporting "no leaks found". The traversal also forces `--text` (a pull request must not
 be able to hide a file behind a `.gitattributes` `-diff`/`binary` entry) and
 `--diff-merges=remerge` (a credential introduced while resolving a conflict is scanned,
-without re-reporting content merely inherited from the base branch). Regressions:
+without re-reporting content merely inherited from the base branch; a range containing an
+octopus merge, which remerge cannot diff, fails closed instead of reporting a pass).
+Regressions:
 `make test-gitleaks-fail-closed` and `make test-gitleaks-scan-coverage`, both run by
 `code-ci.yml` — they cannot run inside the Secret Scan workflow, which never executes
 code from the pull request.
