@@ -54,8 +54,8 @@ jobs:
       # Exercises the fail-closed guard of the local `make gitleaks` target. It
       # cannot run inside the Secret Scan workflow, which never executes code
       # from the pull request.
-      - name: Gitleaks fail-closed regression
-        run: make test-gitleaks-fail-closed
+      - name: Gitleaks regressions
+        run: make test-gitleaks-fail-closed test-gitleaks-scan-coverage
 
       - name: Test
         run: make test TEST_TIMEOUT=25m

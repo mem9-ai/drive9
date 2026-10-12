@@ -99,11 +99,15 @@ jobs:
               exit 1
               ;;
           esac
+          # `--text` keeps a PR-controlled `.gitattributes` (`-diff`/`binary`)
+          # from hiding a file from `git log -p`; `-m` emits merge-commit
+          # patches so a credential introduced while resolving a conflict is
+          # scanned too.
           if [ -n "$BASE_SHA" ]; then
-            log_opts="$BASE_SHA..$HEAD_SHA"
+            log_opts="$BASE_SHA..$HEAD_SHA --text -m"
             config_ref="$BASE_SHA"
           else
-            log_opts="--all"
+            log_opts="--all --text -m"
             config_ref="HEAD"
           fi
 
@@ -119,7 +123,7 @@ jobs:
 
           # gitleaks exits 0 with "0 commits scanned" when git cannot read the
           # requested history, so traverse the range first and fail closed.
-          if ! git log -p -U0 "$log_opts" >/dev/null 2>&1; then
+          if ! git log -p -U0 $log_opts >/dev/null 2>&1; then
             echo "cannot read the full history of '$log_opts' (missing objects or an unknown revision)" >&2
             exit 1
           fi

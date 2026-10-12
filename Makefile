@@ -45,6 +45,11 @@ GITLEAKS_BIN ?= $(BIN_DIR)/gitleaks
 GITLEAKS_LOG_OPTS ?=
 # Range actually traversed, shared by the pre-flight check and the scan.
 GITLEAKS_RANGE = $(if $(GITLEAKS_LOG_OPTS),$(GITLEAKS_LOG_OPTS),HEAD)
+# Diff options forced on every traversal. `--text` stops a PR-controlled
+# `.gitattributes` (`-diff`/`binary`) from hiding a file's content from
+# `git log -p`, and `-m` emits merge-commit diffs so a credential introduced
+# while resolving a conflict is still scanned.
+GITLEAKS_DIFF_OPTS ?= --text -m
 
 IMAGE_REPO ?= drive9-server
 IMAGE_TAG ?= latest
@@ -73,7 +78,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-race test-failpoint test-podman test-minio-bootstrap fmt lint install-lint gitleaks install-gitleaks test-gitleaks-fail-closed build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
+.PHONY: mod test test-race test-failpoint test-podman test-minio-bootstrap fmt lint install-lint gitleaks install-gitleaks test-gitleaks-fail-closed test-gitleaks-scan-coverage build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
@@ -161,18 +166,22 @@ install-lint:
 # cannot excuse the finding it is adding.
 gitleaks: install-gitleaks
 	@set -euo pipefail; \
-	if ! git log -p -U0 $(GITLEAKS_RANGE) >/dev/null 2>&1; then \
+	if ! git log -p -U0 $(GITLEAKS_RANGE) $(GITLEAKS_DIFF_OPTS) >/dev/null 2>&1; then \
 		echo "gitleaks: cannot read the full history of '$(GITLEAKS_RANGE)'" >&2; \
 		echo "gitleaks: unknown revision, or a partial clone whose promisor remote is unreachable" >&2; \
 		exit 1; \
 	fi; \
-	$(GITLEAKS_BIN) git . --no-banner --redact -v --log-opts="$(GITLEAKS_RANGE)"
+	$(GITLEAKS_BIN) git . --no-banner --redact -v --log-opts="$(GITLEAKS_RANGE) $(GITLEAKS_DIFF_OPTS)"
 
 # Regression for the fail-closed behaviour of the target above. Runs in
 # code-ci.yml; it must not run inside the trusted Secret Scan workflow, which
 # never executes code from the pull request.
 test-gitleaks-fail-closed: install-gitleaks
 	./scripts/test-gitleaks-fail-closed.sh
+
+# Regression for the scan-coverage guards (`--text`, `-m`).
+test-gitleaks-scan-coverage: install-gitleaks
+	./scripts/test-gitleaks-scan-coverage.sh
 
 install-gitleaks:
 	@echo "Checking for gitleaks..."
