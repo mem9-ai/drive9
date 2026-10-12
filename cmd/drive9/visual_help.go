@@ -582,7 +582,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			Examples: []visualHelpExample{
 				{Command: "drive9 fs ls -l :/", Desc: "list root"},
 				{Command: "drive9 fs cp ./notes.md :/team/notes.md", Desc: "upload a file"},
-				{Command: "drive9 fs tasks :/team/report.pdf", Desc: "check extract/embed status"},
+				{Command: "drive9 fs tasks :/team/report.pdf", Desc: "check extract/embed status and token usage"},
 				{Command: "drive9 fs find :/team -tag owner=agent", Desc: "find by exact tag"},
 				{Command: "drive9 fs archive :/proj ./proj.tar.gz --profile coding-agent", Desc: "download tree, skip node_modules/target"},
 				{Command: "drive9 fs archive :/proj --stdout | tar -tzf -", Desc: "list archive contents via pipe"},

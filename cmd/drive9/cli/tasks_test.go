@@ -28,8 +28,9 @@ func newTasksTestServer(t *testing.T, responseBody string) *httptest.Server {
 
 func TestTasksTextOutput(t *testing.T) {
 	srv := newTasksTestServer(t, `{"path":"/doc.txt","tasks":[`+
-		`{"task_type":"embed","status":"succeeded"},`+
-		`{"task_type":"img_extract_text","status":"failed","last_error":"image_extract_provider_auth_rejected: authentication rejected (HTTP 401)"}]}`)
+		`{"task_type":"embed","status":"succeeded","usage":{"input_tokens":109,"output_tokens":51,"total_tokens":160,"llm_calls":2}},`+
+		`{"task_type":"img_extract_text","status":"failed","last_error":"image_extract_provider_auth_rejected: authentication rejected (HTTP 401)","usage":{"input_tokens":9,"output_tokens":1,"total_tokens":10,"llm_calls":1}},`+
+		`{"task_type":"audio_extract_text","status":"pending","pending_reason":"quota_exceeded","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"llm_calls":0,"audio_duration_seconds":12.5}}]}`)
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
@@ -37,16 +38,63 @@ func TestTasksTextOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tasks: %v", err)
 	}
-	for _, want := range []string{"TASK_TYPE", "STATUS", "LAST_ERROR", "embed", "succeeded", "img_extract_text", "failed", "image_extract_provider_auth_rejected: authentication rejected (HTTP 401)"} {
+	for _, want := range []string{
+		"TASK_TYPE", "STATUS", "USAGE", "PENDING_REASON", "LAST_ERROR",
+		"embed", "succeeded", "2 calls, 109/51 tok",
+		"img_extract_text", "failed", "1 call, 9/1 tok",
+		"image_extract_provider_auth_rejected: authentication rejected (HTTP 401)",
+		"audio_extract_text", "pending", "quota_exceeded", "0 calls, 0/0 tok, 12.5s audio",
+	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q: %q", want, out)
 		}
 	}
 }
 
+// A server that predates the usage projection reports no usage; the table must
+// say so instead of claiming the task consumed nothing.
+func TestTasksTextOutputMarksUnreportedUsage(t *testing.T) {
+	srv := newTasksTestServer(t, `{"path":"/doc.txt","tasks":[{"task_type":"embed","status":"succeeded"}]}`)
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	out, err := captureStdoutE(t, func() error { return Tasks(c, []string{":/doc.txt"}) })
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected header + 1 row, got %d lines: %q", len(lines), out)
+	}
+	if got := strings.Fields(lines[1]); len(got) < 3 || got[2] != "-" {
+		t.Fatalf("usage cell = %v, want \"-\" in %q", got, lines[1])
+	}
+}
+
+func TestTaskUsageCell(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   *client.FileTaskUsage
+		want string
+	}{
+		{name: "unreported", in: nil, want: "-"},
+		{name: "empty", in: &client.FileTaskUsage{}, want: "0 calls, 0/0 tok"},
+		{name: "single call", in: &client.FileTaskUsage{InputTokens: 9, OutputTokens: 1, LLMCalls: 1}, want: "1 call, 9/1 tok"},
+		{name: "multiple calls", in: &client.FileTaskUsage{InputTokens: 109, OutputTokens: 51, LLMCalls: 2}, want: "2 calls, 109/51 tok"},
+		{name: "audio only", in: &client.FileTaskUsage{AudioDurationSeconds: 12.5}, want: "0 calls, 0/0 tok, 12.5s audio"},
+		{name: "tokens and audio", in: &client.FileTaskUsage{InputTokens: 9, OutputTokens: 1, LLMCalls: 1, AudioDurationSeconds: 0.5}, want: "1 call, 9/1 tok, 0.5s audio"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := taskUsageCell(tc.in); got != tc.want {
+				t.Fatalf("taskUsageCell(%+v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestTasksJSONOutput(t *testing.T) {
 	srv := newTasksTestServer(t, `{"path":"/doc.txt","tasks":[`+
-		`{"task_type":"embed","status":"queued"},`+
+		`{"task_type":"embed","status":"queued","usage":{"input_tokens":109,"output_tokens":51,"total_tokens":160,"llm_calls":2}},`+
 		`{"task_type":"img_extract_text","status":"failed","last_error":"image_extract_provider_rate_limited: provider rate limited the request (HTTP 429)"}]}`)
 	defer srv.Close()
 
@@ -68,6 +116,12 @@ func TestTasksJSONOutput(t *testing.T) {
 	if got.Tasks[0].TaskType != "embed" || got.Tasks[0].Status != "queued" {
 		t.Fatalf("task[0] = %+v", got.Tasks[0])
 	}
+	if usage := got.Tasks[0].Usage; usage == nil || usage.InputTokens != 109 || usage.OutputTokens != 51 || usage.TotalTokens != 160 || usage.LLMCalls != 2 {
+		t.Fatalf("task[0].Usage = %+v", got.Tasks[0].Usage)
+	}
+	if got.Tasks[1].Usage != nil {
+		t.Fatalf("task[1].Usage = %+v, want absent usage preserved as null", got.Tasks[1].Usage)
+	}
 	if got.Tasks[1].LastError != "image_extract_provider_rate_limited: provider rate limited the request (HTTP 429)" {
 		t.Fatalf("task[1].LastError = %q", got.Tasks[1].LastError)
 	}
@@ -87,7 +141,9 @@ func TestTasksEmptyTextPrintsHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tasks: %v", err)
 	}
-	if !strings.Contains(out, "TASK_TYPE") || !strings.Contains(out, "STATUS") || !strings.Contains(out, "LAST_ERROR") {
+	if !strings.Contains(out, "TASK_TYPE") || !strings.Contains(out, "STATUS") ||
+		!strings.Contains(out, "USAGE") || !strings.Contains(out, "PENDING_REASON") ||
+		!strings.Contains(out, "LAST_ERROR") {
 		t.Fatalf("empty output should still print the header, got %q", out)
 	}
 }

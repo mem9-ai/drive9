@@ -42,6 +42,27 @@ type FileTask struct {
 	TaskType  string `json:"task_type"`
 	Status    string `json:"status"`
 	LastError string `json:"last_error,omitempty"`
+	// PendingReason names the admission condition a pending task waits on, so a
+	// caller can tell "not yet" (raise the quota) from "never" (skipped) and
+	// from "broke" (failed). Empty unless the task is pending.
+	PendingReason string `json:"pending_reason,omitempty"`
+	// Usage is nil when the server does not report it. Servers that project
+	// usage always send the object, so a nil here keeps `-o json` a faithful
+	// passthrough for older servers instead of inventing zeroes.
+	Usage *FileTaskUsage `json:"usage,omitempty"`
+}
+
+// FileTaskUsage is the LLM consumption of one task, accumulated across every
+// attempt and retry. It covers failed and still-running tasks because usage is
+// persisted at provider-call time, so it is not proof of success.
+// AudioDurationSeconds is independent of the token counts: audio providers may
+// report a duration alongside or instead of tokens.
+type FileTaskUsage struct {
+	InputTokens          int64   `json:"input_tokens"`
+	OutputTokens         int64   `json:"output_tokens"`
+	TotalTokens          int64   `json:"total_tokens"`
+	LLMCalls             int     `json:"llm_calls"`
+	AudioDurationSeconds float64 `json:"audio_duration_seconds"`
 }
 
 // FileTasksResult is the response of GET /v1/fs/{path}?tasks.

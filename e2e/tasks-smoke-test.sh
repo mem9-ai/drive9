@@ -4,6 +4,9 @@
 # Covers the data-plane wire contract behind `drive9 fs tasks`:
 #   - a successful response carries the X-Dat9-Tasks: 1 marker
 #   - the body is {path, tasks[]} with task_type/status and optional last_error
+#   - an optional pending_reason is a string, and an optional usage object
+#     carries numeric input_tokens/output_tokens/total_tokens/llm_calls/
+#     audio_duration_seconds (the fields `drive9 fs tasks` renders)
 #   - tasks is always an array, never null (including an empty result)
 #   - a directory is rejected with 400
 #   - unknown query keys are not silently accepted on the tasks arm
@@ -232,6 +235,8 @@ check_cmd "body.path is the requested file" bash -c '[ "$(printf "%s" "$1" | jq 
 check_cmd "tasks is an array (never null)" bash -c 'printf "%s" "$1" | jq -e "(.tasks|type)==\"array\"" >/dev/null' _ "$body"
 check_cmd "task rows carry string task_type/status" bash -c 'printf "%s" "$1" | jq -e "[.tasks[]? | select((.task_type|type)!=\"string\" or (.status|type)!=\"string\")] | length == 0" >/dev/null' _ "$body"
 check_cmd "task status is a known value" bash -c 'printf "%s" "$1" | jq -e "[.tasks[]? | select(.status | IN(\"queued\",\"processing\",\"succeeded\",\"failed\") | not)] | length == 0" >/dev/null' _ "$body"
+check_cmd "optional pending_reason is a string" bash -c 'printf "%s" "$1" | jq -e "[.tasks[]? | select(has(\"pending_reason\")) | select((.pending_reason|type)!=\"string\")] | length == 0" >/dev/null' _ "$body"
+check_cmd "optional usage fields are numbers" bash -c 'printf "%s" "$1" | jq -e "[.tasks[]? | select(has(\"usage\")) | select(((.usage.input_tokens|type)!=\"number\") or ((.usage.output_tokens|type)!=\"number\") or ((.usage.total_tokens|type)!=\"number\") or ((.usage.llm_calls|type)!=\"number\") or ((.usage.audio_duration_seconds|type)!=\"number\"))] | length == 0" >/dev/null' _ "$body"
 
 step "5" "?tasks rejects a directory"
 resp=$(http GET "$BASE/v1/fs/$DIR?tasks=1")

@@ -40,6 +40,59 @@ func TestFileTasksCtxDecodesResponse(t *testing.T) {
 	}
 }
 
+func TestFileTasksCtxDecodesUsageAndPendingReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(fileTasksMarkerHeader, "1")
+		_, _ = w.Write([]byte(`{"path":"/doc.txt","tasks":[` +
+			`{"task_type":"embed","status":"failed","usage":{"input_tokens":109,"output_tokens":51,"total_tokens":160,"llm_calls":2}},` +
+			`{"task_type":"audio_extract_text","status":"pending","pending_reason":"quota_exceeded","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"llm_calls":0,"audio_duration_seconds":12.5}}]}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	got, err := c.FileTasksCtx(context.Background(), "/doc.txt")
+	if err != nil {
+		t.Fatalf("FileTasksCtx: %v", err)
+	}
+	if len(got.Tasks) != 2 {
+		t.Fatalf("got %d tasks, want 2", len(got.Tasks))
+	}
+	embed := got.Tasks[0].Usage
+	if embed == nil || embed.InputTokens != 109 || embed.OutputTokens != 51 ||
+		embed.TotalTokens != 160 || embed.LLMCalls != 2 || embed.AudioDurationSeconds != 0 {
+		t.Fatalf("embed usage = %+v", got.Tasks[0].Usage)
+	}
+	if got.Tasks[1].PendingReason != "quota_exceeded" {
+		t.Fatalf("pending_reason = %q", got.Tasks[1].PendingReason)
+	}
+	if audio := got.Tasks[1].Usage; audio == nil || audio.AudioDurationSeconds != 12.5 {
+		t.Fatalf("audio usage = %+v", audio)
+	}
+}
+
+// A server that does not project usage omits the object; the client must keep
+// it absent so `-o json` stays a faithful passthrough instead of inventing
+// zeroes that a caller would read as "consumed nothing".
+func TestFileTasksCtxLeavesAbsentUsageNil(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(fileTasksMarkerHeader, "1")
+		_, _ = w.Write([]byte(`{"path":"/doc.txt","tasks":[{"task_type":"embed","status":"succeeded"}]}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	got, err := c.FileTasksCtx(context.Background(), "/doc.txt")
+	if err != nil {
+		t.Fatalf("FileTasksCtx: %v", err)
+	}
+	if len(got.Tasks) != 1 {
+		t.Fatalf("got %d tasks, want 1", len(got.Tasks))
+	}
+	if got.Tasks[0].Usage != nil || got.Tasks[0].PendingReason != "" {
+		t.Fatalf("task = %+v, want nil usage and empty pending_reason", got.Tasks[0])
+	}
+}
+
 func TestFileTasksCtxEmptyTasksIsEmptySlice(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(fileTasksMarkerHeader, "1")
