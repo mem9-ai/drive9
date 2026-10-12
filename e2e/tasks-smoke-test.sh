@@ -4,10 +4,11 @@
 # Covers the data-plane wire contract behind `drive9 fs tasks`:
 #   - a successful response carries the X-Dat9-Tasks: 1 marker
 #   - the body is {path, tasks[]} with task_type/status and optional last_error
-#   - an optional pending_reason is a string, and a present usage object carries
-#     the full numeric input_tokens/output_tokens/total_tokens/llm_calls/
-#     audio_duration_seconds the server always sends (the fields `drive9 fs
-#     tasks` renders)
+#   - every returned task row carries the numeric usage projection
+#     (input_tokens/output_tokens/total_tokens/llm_calls/audio_duration_seconds)
+#   - every pending task row carries a string pending_reason
+#   - the two projection checks SKIP when this run returns no row able to
+#     exercise them, so a missing key can never pass vacuously
 #   - tasks is always an array, never null (including an empty result)
 #   - a directory is rejected with 400
 #   - unknown query keys are not silently accepted on the tasks arm
@@ -236,8 +237,22 @@ check_cmd "body.path is the requested file" bash -c '[ "$(printf "%s" "$1" | jq 
 check_cmd "tasks is an array (never null)" bash -c 'printf "%s" "$1" | jq -e "(.tasks|type)==\"array\"" >/dev/null' _ "$body"
 check_cmd "task rows carry string task_type/status" bash -c 'printf "%s" "$1" | jq -e "[.tasks[]? | select((.task_type|type)!=\"string\" or (.status|type)!=\"string\")] | length == 0" >/dev/null' _ "$body"
 check_cmd "task status is a known value" bash -c 'printf "%s" "$1" | jq -e "[.tasks[]? | select(.status | IN(\"queued\",\"processing\",\"succeeded\",\"failed\",\"pending\") | not)] | length == 0" >/dev/null' _ "$body"
-check_cmd "optional pending_reason is a string" bash -c 'printf "%s" "$1" | jq -e "[.tasks[]? | select(has(\"pending_reason\")) | select((.pending_reason|type)!=\"string\")] | length == 0" >/dev/null' _ "$body"
-check_cmd "optional usage fields are numbers" bash -c 'printf "%s" "$1" | jq -e "[.tasks[]? | select(has(\"usage\")) | select(((.usage.input_tokens|type)!=\"number\") or ((.usage.output_tokens|type)!=\"number\") or ((.usage.total_tokens|type)!=\"number\") or ((.usage.llm_calls|type)!=\"number\") or ((.usage.audio_duration_seconds|type)!=\"number\"))] | length == 0" >/dev/null' _ "$body"
+# The projection checks below must not pass vacuously: a renamed or dropped key
+# would filter every row out of a `select(has(...))` and still report success.
+# Assert presence on the rows that must carry each projection, and SKIP (rather
+# than pass) when this run produced no row able to exercise it.
+task_rows=$(printf "%s" "$body" | jq -r "[.tasks[]?] | length")
+if [ "$task_rows" -eq 0 ]; then
+  skip_check "every task row carries the numeric usage projection (no task row returned)"
+else
+  check_cmd "every task row carries the numeric usage projection" bash -c 'printf "%s" "$1" | jq -e "[.tasks[]? | select((has(\"usage\")|not) or ((.usage.input_tokens|type)!=\"number\") or ((.usage.output_tokens|type)!=\"number\") or ((.usage.total_tokens|type)!=\"number\") or ((.usage.llm_calls|type)!=\"number\") or ((.usage.audio_duration_seconds|type)!=\"number\"))] | length == 0" >/dev/null' _ "$body"
+fi
+pending_rows=$(printf "%s" "$body" | jq -r "[.tasks[]? | select(.status==\"pending\")] | length")
+if [ "$pending_rows" -eq 0 ]; then
+  skip_check "pending rows carry a string pending_reason (no pending row returned)"
+else
+  check_cmd "pending rows carry a string pending_reason" bash -c 'printf "%s" "$1" | jq -e "[.tasks[]? | select(.status==\"pending\") | select((has(\"pending_reason\")|not) or ((.pending_reason|type)!=\"string\"))] | length == 0" >/dev/null' _ "$body"
+fi
 
 step "5" "?tasks rejects a directory"
 resp=$(http GET "$BASE/v1/fs/$DIR?tasks=1")

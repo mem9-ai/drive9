@@ -44,8 +44,10 @@ type FileTask struct {
 	LastError string `json:"last_error,omitempty"`
 	// PendingReason names the admission condition a pending task waits on, so a
 	// caller can tell "not yet" (raise the quota) from "never" (skipped) and
-	// from "broke" (failed). Empty unless the task is pending.
-	PendingReason string `json:"pending_reason,omitempty"`
+	// from "broke" (failed). It is nil unless the server reported one, which
+	// keeps `-o json` a faithful passthrough: a field the server omitted stays
+	// omitted instead of being reported as an empty reason.
+	PendingReason *string `json:"pending_reason,omitempty"`
 	// Usage is nil when the server does not report it. Servers that project
 	// usage always send the object, so a nil here keeps `-o json` a faithful
 	// passthrough for older servers instead of inventing zeroes.

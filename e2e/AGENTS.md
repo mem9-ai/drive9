@@ -739,13 +739,15 @@ the PR or post-merge default.
 Opt-in (`RUN_TASKS_SMOKE=1`). Wire contract for `GET /v1/fs/{path}?tasks`
 (the surface behind `drive9 fs tasks`): the `X-Dat9-Tasks: 1` marker, the
 `{path, tasks[]}` field names, `tasks` always an array (never `null`), a
-directory `400`, and unknown-query-key rejection. When a task carries the
-optional `pending_reason` or `usage` projection, the smoke also pins their
-types (`usage`: numeric `input_tokens`, `output_tokens`, `total_tokens`,
-`llm_calls`, `audio_duration_seconds`), so a rename or type drift fails there
-instead of silently blanking the CLI table. The handler lives in the
+directory `400`, and unknown-query-key rejection. Every returned task row must
+carry the numeric `usage` projection (`input_tokens`, `output_tokens`,
+`total_tokens`, `llm_calls`, `audio_duration_seconds`), and every `pending` row
+a string `pending_reason`. Both projection checks SKIP when the run returns no
+row able to exercise them, so a renamed or dropped key fails instead of passing
+vacuously. The handler lives in the
 external server repository, so this is the cross-repo drift check; it needs a
-server build that implements `?tasks`. Not part of the PR or post-merge default.
+server build that implements `?tasks` and its usage projection. Not part of the
+PR or post-merge default.
 
 ### `git-feature-smoke-test.sh`
 

@@ -69,6 +69,31 @@ func TestTasksTextOutputMarksUnreportedUsage(t *testing.T) {
 	if got := strings.Fields(lines[1]); len(got) < 3 || got[2] != "-" {
 		t.Fatalf("usage cell = %v, want \"-\" in %q", got, lines[1])
 	}
+	if strings.Contains(out, "<nil>") {
+		t.Fatalf("an absent optional field must render as an empty cell, got %q", out)
+	}
+}
+
+func TestOptionalTaskCell(t *testing.T) {
+	present := "quota_exceeded"
+	empty := ""
+	withControls := "quota\texceeded\nreason"
+	for _, tc := range []struct {
+		name string
+		in   *string
+		want string
+	}{
+		{name: "absent", in: nil, want: ""},
+		{name: "present", in: &present, want: "quota_exceeded"},
+		{name: "present but empty", in: &empty, want: ""},
+		{name: "control characters", in: &withControls, want: "quota exceeded reason"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := optionalTaskCell(tc.in); got != tc.want {
+				t.Fatalf("optionalTaskCell(%v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestTaskUsageCell(t *testing.T) {

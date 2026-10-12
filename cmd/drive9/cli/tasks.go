@@ -57,9 +57,18 @@ func Tasks(c *client.Client, args []string) error {
 	for _, task := range resp.Tasks {
 		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
 			taskCell(task.TaskType), taskCell(task.Status), taskUsageCell(task.Usage),
-			taskCell(task.PendingReason), taskCell(task.LastError))
+			optionalTaskCell(task.PendingReason), taskCell(task.LastError))
 	}
 	return w.Flush()
+}
+
+// optionalTaskCell renders an optional server field: a field the server did not
+// report is an empty cell, not the literal "<nil>".
+func optionalTaskCell(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return taskCell(*s)
 }
 
 // taskUsageCell renders one task's LLM consumption. A reported-but-empty usage
