@@ -36,6 +36,13 @@
       "owner_hint": "fs",
       "failure_class": "correctness"
     },
+    "runtime-rootfs-overlay": {
+      "title": "Drive9 overlay rootfs capability",
+      "product_area": "runtime",
+      "product_promise": "Drive9 durably backs the writable sandbox root across remount",
+      "owner_hint": "runtime",
+      "failure_class": "correctness"
+    },
     "fuse-patch-storage-class": {
       "title": "FUSE patch storage-class e2e",
       "product_area": "fuse",

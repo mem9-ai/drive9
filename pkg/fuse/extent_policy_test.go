@@ -2,14 +2,116 @@ package fuse
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
+	jfsvfs "github.com/juicedata/juicefs/pkg/vfs"
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extent"
 )
+
+type fixedGetAttrMeta struct {
+	jfsmeta.Meta
+	wantIno jfsmeta.Ino
+	attr    jfsmeta.Attr
+	calls   atomic.Int32
+}
+
+func (m *fixedGetAttrMeta) GetAttr(_ jfsmeta.Context, ino jfsmeta.Ino, attr *jfsmeta.Attr) syscall.Errno {
+	if ino != m.wantIno {
+		return syscall.ENOENT
+	}
+	m.calls.Add(1)
+	*attr = m.attr
+	return 0
+}
+
+func TestExtentBindDirectoryProjectionUsesExactRemotePath(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		errno      int
+		wantStatus gofuse.Status
+	}{
+		{name: "success", wantStatus: gofuse.OK},
+		{name: "server rejects stale inode", errno: int(syscall.ESTALE), wantStatus: gofuse.Status(syscall.ESTALE)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/extent/meta" {
+					t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+				}
+				if got := r.Header.Get("X-Drive9-Extent-Op"); got != "bind_dir_projection" {
+					t.Fatalf("extent op = %q", got)
+				}
+				var req struct {
+					Path  string `json:"path"`
+					Inode uint64 `json:"inode"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Fatal(err)
+				}
+				if req.Path != "/upper/home/agent" || req.Inode != 42 {
+					t.Fatalf("bind request = %+v", req)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"errno": test.errno, "inode": req.Inode})
+			}))
+			defer server.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(server.URL), opts)
+			if got := fs.extentBindDirectoryProjection(context.Background(), "/upper/home/agent", 42); got != test.wantStatus {
+				t.Fatalf("bind status = %v, want %v", got, test.wantStatus)
+			}
+		})
+	}
+}
+
+func TestRegularMknodUsesExtentCreationPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		file        string
+		wantClassic bool
+	}{
+		{name: "matching extent path", file: "upper.extent"},
+		{name: "ordinary path", file: "ordinary.txt", wantClassic: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				http.Error(w, "classic write must fail", http.StatusInternalServerError)
+			}))
+			defer server.Close()
+
+			fs := NewDat9FS(newTestClient(server.URL), &MountOptions{ExtentPaths: []string{"*.extent"}})
+			fs.extentTornDown = true
+			var out gofuse.EntryOut
+			status := fs.Mknod(nil, &gofuse.MknodIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Mode:     uint32(syscall.S_IFREG) | 0o640,
+			}, test.file, &out)
+			if status == gofuse.OK {
+				t.Fatal("Mknod status=OK, want injected failure")
+			}
+			gotCalls := calls.Load()
+			if test.wantClassic && gotCalls == 0 {
+				t.Fatal("ordinary Mknod made no classic HTTP call")
+			}
+			if !test.wantClassic && gotCalls != 0 {
+				t.Fatalf("extent Mknod made %d classic HTTP calls, want 0", gotCalls)
+			}
+		})
+	}
+}
 
 func TestFindPathInDirIgnoresExtraSlash(t *testing.T) {
 	fs := &Dat9FS{inodes: NewInodeToPath()}
@@ -112,24 +214,542 @@ func TestSetAttrModeAllowsNonOwnerClearSetid(t *testing.T) {
 	}
 }
 
-func TestExtentRefreshFromVFSSkipsDirectories(t *testing.T) {
+func TestApplyJuiceFSDirectoryMetadataUsesNativeOwnerModeOnly(t *testing.T) {
 	fs := &Dat9FS{inodes: NewInodeToPath()}
-	ino := fs.inodes.Lookup("/sticky/", true, 0, time.Now())
+	mtime := time.Unix(123, 456)
+	ino := fs.inodes.Lookup("/sticky/", true, 7, mtime)
 	fs.inodes.UpdateMode(ino, 01777)
 	fs.inodes.UpdateOwner(ino, 0, 0, true, true)
 	fs.inodes.SetExtentIno(ino, 99)
-	if fs.extentRefreshFromVFS(ino, "/sticky/", 0) {
-		t.Fatal("directory getattr must not refresh from JuiceFS")
-	}
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		t.Fatal("missing dir inode")
 	}
-	if !entry.HasMode || entry.Mode&posixPermissionModeMask != 01777 {
-		t.Fatalf("sticky mode = %o, want 01777", entry.Mode)
+	fs.applyJuiceFSDirectoryMetadata(entry, &jfsmeta.Attr{
+		Typ:    jfsmeta.TypeDirectory,
+		Mode:   0750,
+		Uid:    3456,
+		Gid:    4567,
+		Length: 4096,
+		Nlink:  99,
+		Mtime:  999,
+	})
+	entry, ok = fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing refreshed dir inode")
 	}
-	if !entry.HasUID || entry.Uid != 0 {
-		t.Fatalf("dir uid = %d, want 0", entry.Uid)
+	if !entry.HasMode || entry.Mode&posixPermissionModeMask != 0750 {
+		t.Fatalf("mode = %o, want 0750", entry.Mode)
+	}
+	if !entry.HasUID || !entry.HasGID || entry.Uid != 3456 || entry.Gid != 4567 {
+		t.Fatalf("owner = %d:%d, want 3456:4567", entry.Uid, entry.Gid)
+	}
+	if entry.Size != 7 || entry.Nlink == 99 || !entry.Mtime.Equal(mtime) {
+		t.Fatalf("directory namespace metadata changed: size=%d nlink=%d mtime=%s", entry.Size, entry.Nlink, entry.Mtime)
+	}
+}
+
+func TestApplyJuiceFSDirectoryMetadataRejectsNonDirectoryAttr(t *testing.T) {
+	fs := &Dat9FS{inodes: NewInodeToPath()}
+	ino := fs.inodes.Lookup("/dir/", true, 0, time.Now())
+	fs.inodes.UpdateMode(ino, 0755)
+	fs.inodes.UpdateOwner(ino, 1001, 1002, true, true)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing dir inode")
+	}
+
+	fs.applyJuiceFSDirectoryMetadata(entry, &jfsmeta.Attr{
+		Typ:  jfsmeta.TypeFile,
+		Mode: 0600,
+		Uid:  3456,
+		Gid:  4567,
+	})
+	entry, ok = fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing dir inode after rejected attr")
+	}
+	if entry.Mode&posixPermissionModeMask != 0755 || entry.Uid != 1001 || entry.Gid != 1002 {
+		t.Fatalf("non-directory attr changed directory metadata: mode=%o owner=%d:%d", entry.Mode, entry.Uid, entry.Gid)
+	}
+}
+
+func TestApplyCachedNativeMetadataUsesDirectoryMetadataOnly(t *testing.T) {
+	mtime := time.Unix(123, 456)
+	item := CachedFileInfo{
+		Name: "root", Size: 7, IsDir: true, Mtime: mtime,
+		Mode: 0755, HasMode: true, Uid: 1001, Gid: 1001, HasUID: true, HasGID: true,
+		ExtentIno: 42,
+	}
+	entry := &InodeEntry{
+		IsDir: true, Size: 4096, Mtime: time.Unix(999, 0),
+		Mode: 0700, HasMode: true, Uid: 0, Gid: 0, HasUID: true, HasGID: true,
+	}
+	applyCachedNativeMetadata(&item, entry)
+	if item.Mode != 0700 || !item.HasMode || item.Uid != 0 || item.Gid != 0 || !item.HasUID || !item.HasGID {
+		t.Fatalf("cached native metadata = mode=%o owner=%d:%d flags=%v/%v/%v", item.Mode, item.Uid, item.Gid, item.HasMode, item.HasUID, item.HasGID)
+	}
+	if item.Size != 7 || !item.Mtime.Equal(mtime) || item.ExtentIno != 42 {
+		t.Fatalf("directory namespace metadata changed: size=%d mtime=%s extent_ino=%d", item.Size, item.Mtime, item.ExtentIno)
+	}
+}
+
+func TestApplyCachedNativeMetadataUsesFileMetadata(t *testing.T) {
+	mtime := time.Unix(123, 456)
+	item := CachedFileInfo{
+		Name: "drive9.conf", Size: 7, Mtime: mtime,
+		Mode: 0644, HasMode: true, Uid: 1001, Gid: 1001, HasUID: true, HasGID: true,
+		ExtentIno: 42,
+	}
+	entry := &InodeEntry{
+		Size: 99, Mtime: time.Unix(999, 0),
+		Mode: 0640, HasMode: true, Uid: 1234, Gid: 2345, HasUID: true, HasGID: true,
+	}
+	applyCachedNativeMetadata(&item, entry)
+	if item.Mode != 0640 || !item.HasMode || item.Uid != 1234 || item.Gid != 2345 || !item.HasUID || !item.HasGID {
+		t.Fatalf("cached native metadata = mode=%o owner=%d:%d flags=%v/%v/%v", item.Mode, item.Uid, item.Gid, item.HasMode, item.HasUID, item.HasGID)
+	}
+	if item.Size != 99 || !item.Mtime.Equal(entry.Mtime) || item.ExtentIno != 42 {
+		t.Fatalf("file native metadata = size=%d mtime=%s extent_ino=%d", item.Size, item.Mtime, item.ExtentIno)
+	}
+}
+
+func TestCachedToDirEntriesRefreshesColdExtentFileTimes(t *testing.T) {
+	listingMtime := time.Unix(1_700_000_000, 0)
+	nativeMtime := time.Unix(1_577_934_245, 123_456_789)
+	nativeAtime := time.Unix(1_577_934_200, 987_654_321)
+	nativeCtime := time.Unix(1_577_934_299, 456_789_123)
+	meta := &fixedGetAttrMeta{
+		wantIno: 42,
+		attr: jfsmeta.Attr{
+			Typ:       jfsmeta.TypeFile,
+			Mode:      0o640,
+			Uid:       1234,
+			Gid:       2345,
+			Length:    99,
+			Atime:     nativeAtime.Unix(),
+			Atimensec: uint32(nativeAtime.Nanosecond()),
+			Mtime:     nativeMtime.Unix(),
+			Mtimensec: uint32(nativeMtime.Nanosecond()),
+			Ctime:     nativeCtime.Unix(),
+			Ctimensec: uint32(nativeCtime.Nanosecond()),
+		},
+	}
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.extentRT.Store(&extentRuntime{rt: &extent.Runtime{VFS: &jfsvfs.VFS{Meta: meta}}})
+
+	entries := fs.cachedToDirEntries("/upper/etc", []CachedFileInfo{{
+		Name:       "drive9.conf",
+		Size:       7,
+		Mtime:      listingMtime,
+		Mode:       0o644,
+		HasMode:    true,
+		ResourceID: "resource-1",
+		Nlink:      1,
+		ExtentIno:  42,
+	}})
+	if len(entries) != 1 {
+		t.Fatalf("entries = %+v, want one extent file", entries)
+	}
+	if got := meta.calls.Load(); got != 1 {
+		t.Fatalf("native GetAttr calls = %d, want 1 before cold ReaddirPlus", got)
+	}
+	entry, ok := fs.inodes.GetEntry(entries[0].Ino)
+	if !ok {
+		t.Fatal("missing cold extent inode")
+	}
+	if entry.Size != 99 || entry.Mode&posixPermissionModeMask != 0o640 || entry.Uid != 1234 || entry.Gid != 2345 {
+		t.Fatalf("cold native metadata = size=%d mode=%o owner=%d:%d", entry.Size, entry.Mode, entry.Uid, entry.Gid)
+	}
+	if !entry.Mtime.Equal(nativeMtime) || !entry.Atime.Equal(nativeAtime) || !entry.Ctime.Equal(nativeCtime) {
+		t.Fatalf("cold native times = mtime=%s atime=%s ctime=%s", entry.Mtime, entry.Atime, entry.Ctime)
+	}
+	if !entries[0].Mtime.Equal(nativeMtime) || entries[0].Size != 99 {
+		t.Fatalf("directory snapshot = size=%d mtime=%s, want native size/time", entries[0].Size, entries[0].Mtime)
+	}
+
+	var out gofuse.EntryOut
+	fs.fillAttr(entry, &out.Attr)
+	if got := time.Unix(int64(out.Mtime), int64(out.Mtimensec)); !got.Equal(nativeMtime) {
+		t.Fatalf("ReaddirPlus mtime = %s, want %s", got, nativeMtime)
+	}
+	if got := time.Unix(int64(out.Atime), int64(out.Atimensec)); !got.Equal(nativeAtime) {
+		t.Fatalf("ReaddirPlus atime = %s, want %s", got, nativeAtime)
+	}
+}
+
+func TestExtentSetAttrResultUpdatesCachedReadDirPlusMetadata(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	parent := "/upper/etc"
+	file := parent + "/drive9.conf"
+	dirIno := fs.inodes.Lookup(parent, true, 0, time.Now())
+	ino := fs.inodes.Lookup(file, false, 7, time.Now())
+	fs.inodes.SetExtentIno(ino, 42)
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|0644)
+	fs.inodes.UpdateOwner(ino, 1001, 1001, true, true)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing extent inode")
+	}
+	fs.dirCache.Put(parent, []CachedFileInfo{cachedInfoFromEntry("drive9.conf", entry)})
+
+	input := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Valid:    gofuse.FATTR_MODE | gofuse.FATTR_UID | gofuse.FATTR_GID,
+		Mode:     0640,
+		Owner:    gofuse.Owner{Uid: 1234, Gid: 2345},
+	}}
+	testHookExtentSetAttr = func(gotIno uint64, set int, fh uint64, mode, uid, gid uint32, _ int64, _ int64, _ uint32, _ uint32, _ uint64) (*jfsmeta.Entry, syscall.Errno) {
+		wantSet := int(jfsmeta.SetAttrMode | jfsmeta.SetAttrUID | jfsmeta.SetAttrGID)
+		if gotIno != 42 || set != wantSet || fh != 0 || mode != 0640 || uid != 1234 || gid != 2345 {
+			t.Fatalf("native SetAttr = ino=%d set=%x fh=%d mode=%o owner=%d:%d", gotIno, set, fh, mode, uid, gid)
+		}
+		return &jfsmeta.Entry{
+			Inode: 42,
+			Attr: &jfsmeta.Attr{
+				Full:   true,
+				Typ:    jfsmeta.TypeFile,
+				Mode:   0640,
+				Uid:    1234,
+				Gid:    2345,
+				Length: 7,
+				Nlink:  1,
+			},
+		}, 0
+	}
+	t.Cleanup(func() { testHookExtentSetAttr = nil })
+	var attrOut gofuse.AttrOut
+	if st := fs.extentSetAttr(nil, input, entry, &attrOut); st != gofuse.OK {
+		t.Fatalf("extentSetAttr status = %v, want OK", st)
+	}
+	if attrOut.Mode&posixPermissionModeMask != 0640 || attrOut.Uid != 1234 || attrOut.Gid != 2345 {
+		t.Fatalf("extentSetAttr reply = mode=%o owner=%d:%d, want 0640 1234:2345", attrOut.Mode, attrOut.Uid, attrOut.Gid)
+	}
+
+	items, ok := fs.dirCache.Get(parent)
+	if !ok || len(items) != 1 {
+		t.Fatalf("cached listing = %+v ok=%v, want one item", items, ok)
+	}
+	item := items[0]
+	if item.Mode&posixPermissionModeMask != 0640 || item.Uid != 1234 || item.Gid != 2345 {
+		t.Fatalf("cached listing metadata = mode=%o owner=%d:%d, want 0640 1234:2345", item.Mode, item.Uid, item.Gid)
+	}
+	if item.ExtentIno != 42 {
+		t.Fatalf("cached listing extent inode = %d, want 42", item.ExtentIno)
+	}
+
+	entries := fs.cachedToDirEntries(parent, items)
+	if len(entries) != 1 {
+		t.Fatalf("directory entries = %+v, want one entry", entries)
+	}
+	if entries[0].AttrMode&posixPermissionModeMask != 0640 || entries[0].Uid != 1234 || entries[0].Gid != 2345 {
+		t.Fatalf("directory entry metadata = mode=%o owner=%d:%d, want 0640 1234:2345", entries[0].AttrMode, entries[0].Uid, entries[0].Gid)
+	}
+
+	dh := &DirHandle{
+		Ino:               dirIno,
+		Path:              parent,
+		Entries:           entries,
+		entriesGeneration: fs.mountViewGeneration.Load(),
+	}
+	fh := fs.dirHandles.Allocate(dh)
+	out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := fs.ReadDirPlus(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dirIno},
+		Fh:       fh,
+		Size:     4096,
+	}, out); st != gofuse.OK {
+		t.Fatalf("ReadDirPlus status = %v, want OK", st)
+	}
+	buf := dirEntryListBuf(t, out)
+	entryOutSize := int(unsafe.Sizeof(gofuse.EntryOut{}))
+	found := false
+	for len(buf) >= entryOutSize+24 {
+		entryOut := (*gofuse.EntryOut)(unsafe.Pointer(&buf[0]))
+		dirent := buf[entryOutSize:]
+		nameLen := int(nativeEndian.Uint32(dirent[16:20]))
+		recordLen := entryOutSize + ((24 + nameLen + 7) &^ 7)
+		if recordLen > len(buf) {
+			t.Fatalf("ReadDirPlus record length %d exceeds buffer %d", recordLen, len(buf))
+		}
+		name := string(dirent[24 : 24+nameLen])
+		if name == "drive9.conf" {
+			found = true
+			if entryOut.Mode&posixPermissionModeMask != 0640 || entryOut.Uid != 1234 || entryOut.Gid != 2345 {
+				t.Fatalf("ReadDirPlus EntryOut = mode=%o owner=%d:%d, want 0640 1234:2345", entryOut.Mode, entryOut.Uid, entryOut.Gid)
+			}
+		}
+		buf = buf[recordLen:]
+	}
+	if !found {
+		t.Fatal("ReadDirPlus did not emit drive9.conf")
+	}
+	entry, ok = fs.inodes.GetEntry(ino)
+	if !ok || entry.Mode&posixPermissionModeMask != 0640 || entry.Uid != 1234 || entry.Gid != 2345 {
+		t.Fatalf("ReadDirPlus inode metadata = %+v ok=%v, want 0640 1234:2345", entry, ok)
+	}
+}
+
+func TestDirectorySetAttrPersistsNativeOwnerAndMode(t *testing.T) {
+	opts := &MountOptions{ExtentPaths: []string{"*"}}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	parent := "/upper/home"
+	dir := parent + "/agent"
+	ino := fs.inodes.Lookup(dir, true, 17, time.Unix(123, 456))
+	fs.inodes.SetExtentIno(ino, 42)
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFDIR)|0750)
+	fs.inodes.UpdateOwner(ino, 1001, 1001, true, true)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing mirrored directory inode")
+	}
+	fs.dirCache.Put(parent, []CachedFileInfo{cachedInfoFromEntry("agent", entry)})
+
+	input := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Valid:    gofuse.FATTR_UID | gofuse.FATTR_GID | gofuse.FATTR_FH,
+		Owner:    gofuse.Owner{Uid: 3456, Gid: 4567},
+	}}
+	bound := false
+	testHookExtentBindDir = func(_ context.Context, path string, ino uint64) gofuse.Status {
+		if path != "/upper/home/agent" || ino != 42 {
+			t.Fatalf("directory projection bind = path=%q ino=%d", path, ino)
+		}
+		bound = true
+		return gofuse.OK
+	}
+	testHookExtentSetAttr = func(gotIno uint64, set int, fh uint64, mode, uid, gid uint32, _ int64, _ int64, _ uint32, _ uint32, size uint64) (*jfsmeta.Entry, syscall.Errno) {
+		if !bound {
+			t.Fatal("native directory SetAttr ran before durable projection binding")
+		}
+		wantSet := int(jfsmeta.SetAttrUID | jfsmeta.SetAttrGID)
+		if gotIno != 42 || set != wantSet || fh != 0 || mode != 0 || uid != 3456 || gid != 4567 || size != 0 {
+			t.Fatalf("native directory SetAttr = ino=%d set=%x fh=%d mode=%o owner=%d:%d size=%d", gotIno, set, fh, mode, uid, gid, size)
+		}
+		return &jfsmeta.Entry{Inode: 42, Attr: &jfsmeta.Attr{
+			Full: true, Typ: jfsmeta.TypeDirectory, Mode: 0750,
+			Uid: 3456, Gid: 4567, Length: 4096, Nlink: 99, Mtime: 999,
+		}}, 0
+	}
+	t.Cleanup(func() {
+		testHookExtentBindDir = nil
+		testHookExtentSetAttr = nil
+	})
+
+	var out gofuse.AttrOut
+	if st := fs.SetAttr(nil, input, &out); st != gofuse.OK {
+		t.Fatalf("directory SetAttr status = %v, want OK", st)
+	}
+	if out.Mode&posixPermissionModeMask != 0750 || out.Uid != 3456 || out.Gid != 4567 {
+		t.Fatalf("directory SetAttr reply = mode=%o owner=%d:%d, want 0750 3456:4567", out.Mode, out.Uid, out.Gid)
+	}
+	got, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing directory inode after SetAttr")
+	}
+	if got.Size != 17 || got.Nlink == 99 || !got.Mtime.Equal(time.Unix(123, 456)) {
+		t.Fatalf("directory namespace metadata changed: size=%d nlink=%d mtime=%s", got.Size, got.Nlink, got.Mtime)
+	}
+	items, ok := fs.dirCache.Get(parent)
+	if !ok || len(items) != 1 || items[0].Uid != 3456 || items[0].Gid != 4567 || items[0].Mode&posixPermissionModeMask != 0750 {
+		t.Fatalf("cached directory metadata = %+v ok=%v, want 0750 3456:4567", items, ok)
+	}
+}
+
+func TestDirectorySetAttrNativeFailureIsVisibleAndRestoresProjection(t *testing.T) {
+	opts := &MountOptions{ExtentPaths: []string{"*"}}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	parent := "/upper/home"
+	dir := parent + "/agent"
+	ino := fs.inodes.Lookup(dir, true, 17, time.Unix(123, 456))
+	fs.inodes.SetExtentIno(ino, 42)
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFDIR)|0750)
+	fs.inodes.UpdateOwner(ino, 1001, 1001, true, true)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing mirrored directory inode")
+	}
+	fs.dirCache.Put(parent, []CachedFileInfo{cachedInfoFromEntry("agent", entry)})
+
+	input := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Valid:    gofuse.FATTR_UID | gofuse.FATTR_GID | gofuse.FATTR_FH,
+		Owner:    gofuse.Owner{Uid: 3456, Gid: 4567},
+	}}
+	testHookExtentBindDir = func(_ context.Context, path string, ino uint64) gofuse.Status {
+		if path != "/upper/home/agent" || ino != 42 {
+			t.Fatalf("directory projection bind = path=%q ino=%d", path, ino)
+		}
+		return gofuse.OK
+	}
+	testHookExtentSetAttr = func(gotIno uint64, set int, fh uint64, mode, uid, gid uint32, _ int64, _ int64, _ uint32, _ uint32, size uint64) (*jfsmeta.Entry, syscall.Errno) {
+		wantSet := int(jfsmeta.SetAttrUID | jfsmeta.SetAttrGID)
+		if gotIno != 42 || set != wantSet || fh != 0 || mode != 0 || uid != 3456 || gid != 4567 || size != 0 {
+			t.Fatalf("native directory SetAttr = ino=%d set=%x fh=%d mode=%o owner=%d:%d size=%d", gotIno, set, fh, mode, uid, gid, size)
+		}
+		return nil, syscall.EIO
+	}
+	t.Cleanup(func() {
+		testHookExtentBindDir = nil
+		testHookExtentSetAttr = nil
+	})
+
+	var out gofuse.AttrOut
+	if st := fs.SetAttr(nil, input, &out); st != gofuse.EIO {
+		t.Fatalf("directory SetAttr status = %v, want EIO", st)
+	}
+	got, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing directory inode after failed SetAttr")
+	}
+	if !got.HasUID || !got.HasGID || !got.HasMode || got.Uid != 1001 || got.Gid != 1001 || got.Mode&posixPermissionModeMask != 0750 {
+		t.Fatalf("failed SetAttr projection = mode=%o owner=%d:%d, want original 0750 1001:1001", got.Mode, got.Uid, got.Gid)
+	}
+	items, ok := fs.dirCache.Get(parent)
+	if !ok || len(items) != 1 || items[0].Uid != 1001 || items[0].Gid != 1001 || items[0].Mode&posixPermissionModeMask != 0750 {
+		t.Fatalf("failed SetAttr cache = %+v ok=%v, want original 0750 1001:1001", items, ok)
+	}
+}
+
+func TestDirectorySetAttrBindingFailurePreventsNativeMutation(t *testing.T) {
+	opts := &MountOptions{ExtentPaths: []string{"*"}}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	parent := "/upper/home"
+	dir := parent + "/agent"
+	ino := fs.inodes.Lookup(dir, true, 17, time.Unix(123, 456))
+	fs.inodes.SetExtentIno(ino, 42)
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFDIR)|0750)
+	fs.inodes.UpdateOwner(ino, 1001, 1001, true, true)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("missing mirrored directory inode")
+	}
+	fs.dirCache.Put(parent, []CachedFileInfo{cachedInfoFromEntry("agent", entry)})
+
+	input := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Valid:    gofuse.FATTR_UID | gofuse.FATTR_GID,
+		Owner:    gofuse.Owner{Uid: 3456, Gid: 4567},
+	}}
+	testHookExtentBindDir = func(_ context.Context, path string, gotIno uint64) gofuse.Status {
+		if path != "/upper/home/agent" || gotIno != 42 {
+			t.Fatalf("directory projection bind = path=%q ino=%d", path, gotIno)
+		}
+		return gofuse.EIO
+	}
+	nativeCalled := false
+	testHookExtentSetAttr = func(uint64, int, uint64, uint32, uint32, uint32, int64, int64, uint32, uint32, uint64) (*jfsmeta.Entry, syscall.Errno) {
+		nativeCalled = true
+		return nil, 0
+	}
+	t.Cleanup(func() {
+		testHookExtentBindDir = nil
+		testHookExtentSetAttr = nil
+	})
+
+	var out gofuse.AttrOut
+	if st := fs.SetAttr(nil, input, &out); st != gofuse.EIO {
+		t.Fatalf("directory SetAttr status = %v, want EIO", st)
+	}
+	if nativeCalled {
+		t.Fatal("native directory SetAttr ran after projection binding failed")
+	}
+	got, ok := fs.inodes.GetEntry(ino)
+	if !ok || got.Uid != 1001 || got.Gid != 1001 || got.Mode&posixPermissionModeMask != 0750 {
+		t.Fatalf("failed binding projection = %+v ok=%v, want original 0750 1001:1001", got, ok)
+	}
+	items, ok := fs.dirCache.Get(parent)
+	if !ok || len(items) != 1 || items[0].Uid != 1001 || items[0].Gid != 1001 || items[0].Mode&posixPermissionModeMask != 0750 {
+		t.Fatalf("failed binding cache = %+v ok=%v, want original 0750 1001:1001", items, ok)
+	}
+}
+
+func TestApplyCachedNativeMetadataRejectsMismatchedKinds(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		item  CachedFileInfo
+		entry InodeEntry
+	}{
+		{name: "listing file", item: CachedFileInfo{IsDir: false, Mode: 0644, Uid: 1001, Gid: 1002}, entry: InodeEntry{IsDir: true, Mode: 0700, Uid: 0, Gid: 0}},
+		{name: "native file", item: CachedFileInfo{IsDir: true, Mode: 0755, Uid: 1001, Gid: 1002}, entry: InodeEntry{IsDir: false, Mode: 0600, Uid: 0, Gid: 0}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := test.item
+			applyCachedNativeMetadata(&test.item, &test.entry)
+			if test.item != before {
+				t.Fatalf("mismatched kinds changed cached metadata: got %+v want %+v", test.item, before)
+			}
+		})
+	}
+}
+
+func TestCachedNativeOwnerModeDiffersOnlyForMatchingKinds(t *testing.T) {
+	tests := []struct {
+		name  string
+		item  CachedFileInfo
+		entry *InodeEntry
+		want  bool
+	}{
+		{name: "nil entry", item: CachedFileInfo{Mode: 0644}},
+		{name: "kind mismatch", item: CachedFileInfo{IsDir: true, Mode: 0755, HasMode: true}, entry: &InodeEntry{Mode: 0644, HasMode: true}},
+		{name: "same metadata", item: CachedFileInfo{Mode: 0640, HasMode: true, Uid: 1, Gid: 2, HasUID: true, HasGID: true}, entry: &InodeEntry{Mode: syscall.S_IFREG | 0640, HasMode: true, Uid: 1, Gid: 2, HasUID: true, HasGID: true}},
+		{name: "mode differs", item: CachedFileInfo{Mode: 0644, HasMode: true}, entry: &InodeEntry{Mode: syscall.S_IFREG | 0640, HasMode: true}, want: true},
+		{name: "owner differs", item: CachedFileInfo{Uid: 1001, Gid: 1001, HasUID: true, HasGID: true}, entry: &InodeEntry{Uid: 1234, Gid: 2345, HasUID: true, HasGID: true}, want: true},
+		{name: "listing omits native mode", item: CachedFileInfo{}, entry: &InodeEntry{Mode: syscall.S_IFREG | 0600, HasMode: true}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := cachedNativeOwnerModeDiffers(test.item, test.entry); got != test.want {
+				t.Fatalf("cachedNativeOwnerModeDiffers = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestShouldRefreshCachedNativeMetadataAcceptsExactExtentIdentity(t *testing.T) {
+	item := CachedFileInfo{Mode: 0644, HasMode: true, ExtentIno: 42}
+	entry := &InodeEntry{Mode: syscall.S_IFREG | 0640, HasMode: true, ExtentIno: 42}
+	if !shouldRefreshCachedNativeMetadata(item, entry, false) {
+		t.Fatal("matching extent inode with changed native mode must refresh without a resource id")
+	}
+	entry.ExtentIno = 43
+	if shouldRefreshCachedNativeMetadata(item, entry, false) {
+		t.Fatal("different extent identity must not refresh without matching resource evidence")
+	}
+	if !shouldRefreshCachedNativeMetadata(item, entry, true) {
+		t.Fatal("matching resource evidence with changed native mode must refresh")
+	}
+}
+
+func TestProjectedExtentInoAcceptsMirroredDirectoryOnly(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		stat *client.StatResult
+		want uint64
+	}{
+		{name: "nil stat"},
+		{name: "mirrored directory", stat: &client.StatResult{IsDir: true, ExtentIno: 41}, want: 41},
+		{name: "extent file", stat: &client.StatResult{ContentLayout: client.ContentLayoutExtent, ExtentIno: 42}, want: 42},
+		{name: "classic file with stale inode", stat: &client.StatResult{ExtentIno: 43}},
+		{name: "directory without mirror", stat: &client.StatResult{IsDir: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := projectedExtentIno(test.stat)
+			if got != test.want || ok != (test.want != 0) {
+				t.Fatalf("projectedExtentIno = %d/%v, want %d/%v", got, ok, test.want, test.want != 0)
+			}
+		})
 	}
 }
 

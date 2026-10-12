@@ -271,9 +271,10 @@ type FileInfo struct {
 	HasMode    bool   `json:"hasMode"`
 	ResourceID string `json:"resource_id,omitempty"`
 	Nlink      uint32 `json:"nlink,omitempty"`
-	// ExtentIno is the JuiceFS inode for content_layout=extent entries,
-	// discovered from the listing itself. 0 means single-layout, or a server
-	// that predates the field; callers must fall back to a stat probe.
+	// ExtentIno is the JuiceFS inode for content_layout=extent files or a
+	// mirrored directory, discovered from the listing itself. 0 means a
+	// single-layout file, an unmirrored directory, or a server that predates
+	// the field; callers must fall back to a stat probe where appropriate.
 	ExtentIno uint64 `json:"extent_ino,omitempty"`
 }
 

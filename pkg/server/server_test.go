@@ -1170,6 +1170,69 @@ func TestStatDirectoryWithoutTrailingSlash(t *testing.T) {
 	}
 }
 
+func TestStatMirroredDirectoryReturnsExtentInodeWithoutFileLayout(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/dir?mkdir", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir: %d", resp.StatusCode)
+	}
+
+	raw, err := json.Marshal(map[string]any{
+		"parent": 1, "name": "dir", "type": 2, "mode": 0o755,
+		"inode": 42, "proj_path": "/dir/",
+		"attr": datastore.ExtentAttr{Typ: 2, Mode: 0o755, Nlink: 2, Parent: 1, Full: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, errno, err := s.fallback.Store().RunExtentMetaOp(t.Context(), "mknod", raw, nil); err != nil || errno != 0 {
+		t.Fatalf("mirror directory: errno=%d err=%v", errno, err)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/dir", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Dat9-IsDir") != "true" {
+		t.Fatalf("stat mirrored directory: status=%d isdir=%q", resp.StatusCode, resp.Header.Get("X-Dat9-IsDir"))
+	}
+	if got := resp.Header.Get("X-Dat9-Extent-Ino"); got != "42" {
+		t.Fatalf("X-Dat9-Extent-Ino=%q, want 42", got)
+	}
+
+	resp, err = http.Get(ts.URL + "/v1/fs/?list=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list mirrored directory: status=%d", resp.StatusCode)
+	}
+	var listed struct {
+		Entries []struct {
+			Name      string `json:"name"`
+			IsDir     bool   `json:"isDir"`
+			ExtentIno uint64 `json:"extent_ino"`
+		} `json:"entries"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Entries) != 1 || listed.Entries[0].Name != "dir" || !listed.Entries[0].IsDir || listed.Entries[0].ExtentIno != 42 {
+		t.Fatalf("listed mirrored directory = %+v, want dir/ extent_ino=42", listed.Entries)
+	}
+}
+
 func TestStatDirectoryReturnsMode(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

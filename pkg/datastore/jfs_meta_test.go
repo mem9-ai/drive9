@@ -37,6 +37,7 @@ func TestExtentMetaAnswersEveryClientOp(t *testing.T) {
 		"refresh_session":     `{"sid":1,"expire":0}`,
 		"lookup":              `{"parent":1,"name":"nope"}`,
 		"getattr":             `{"inode":1}`,
+		"bind_dir_projection": `{"path":"/nope/","inode":1}`,
 		"setattr":             `{"inode":1,"set":0}`,
 		"mknod":               `{"parent":1,"name":"x","type":1,"mode":420,"proj_path":"/x"}`,
 		"readlink":            `{"inode":1}`,

@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"syscall"
 	"time"
@@ -13,6 +14,15 @@ import (
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
+// testHookExtentSetAttr substitutes only the native VFS mutation so tests can
+// exercise the file and mirrored-directory SetAttr validation, cache update,
+// and reply paths without constructing a remote JuiceFS runtime.
+var testHookExtentSetAttr func(ino uint64, set int, fh uint64, mode, uid, gid uint32, atime, mtime int64, atimensec, mtimensec uint32, size uint64) (*jfsmeta.Entry, syscall.Errno)
+
+// testHookExtentBindDir substitutes only the durable projection binding that
+// precedes a mirrored-directory SetAttr.
+var testHookExtentBindDir func(ctx context.Context, path string, ino uint64) gofuse.Status
+
 func (fs *Dat9FS) extentStatIno(ctx context.Context, p string) (uint64, bool) {
 	if fs.client == nil {
 		return 0, false
@@ -21,7 +31,18 @@ func (fs *Dat9FS) extentStatIno(ctx context.Context, p string) (uint64, bool) {
 	if err != nil || stat == nil {
 		return 0, false
 	}
-	if stat.ContentLayout == client.ContentLayoutExtent && stat.ExtentIno != 0 {
+	return projectedExtentIno(stat)
+}
+
+func projectedExtentIno(stat *client.StatResult) (uint64, bool) {
+	if stat == nil || stat.ExtentIno == 0 {
+		return 0, false
+	}
+	// Files must explicitly report the extent content layout. Directories have
+	// no content layout, but a non-zero extent inode is still authoritative:
+	// Mkdir and extentEnsureParent mirror the directory into jfs_node so native
+	// mode/owner can survive a fresh mount.
+	if stat.IsDir || stat.ContentLayout == client.ContentLayoutExtent {
 		return stat.ExtentIno, true
 	}
 	return 0, false
@@ -249,18 +270,72 @@ func (fs *Dat9FS) applyJuiceFSAttr(entry *InodeEntry, attr *jfsmeta.Attr) {
 	}
 }
 
-// extentRefreshFromVFS copies JuiceFS GetAttr (length, uid/gid, mode, nlink)
-// onto the Dat9FS inode. file_nodes size is often 0 after a remount.
-// Directories stay on the Dat9FS mkdir path: juicefs parents are created
-// lazily as 0755 and must not overwrite sticky/owner from FUSE Mkdir.
+// applyJuiceFSDirectoryMetadata copies only the native inode metadata that
+// Drive9 mirrors for a directory. Directory size/link/time remain owned by the
+// ordinary Dat9FS namespace path; replacing them with lazily-created JuiceFS
+// parent values would change unrelated directory semantics.
+func (fs *Dat9FS) applyJuiceFSDirectoryMetadata(entry *InodeEntry, attr *jfsmeta.Attr) {
+	if fs == nil || entry == nil || attr == nil || !entry.IsDir || attr.Typ != jfsmeta.TypeDirectory {
+		return
+	}
+	entry.Uid = attr.Uid
+	entry.Gid = attr.Gid
+	entry.HasUID = true
+	entry.HasGID = true
+	entry.Mode = juiceTypeToStatMode(attr.Typ, attr.Mode)
+	entry.HasMode = true
+	if fs.inodes != nil && entry.Ino != 0 {
+		fs.inodes.UpdateOwner(entry.Ino, attr.Uid, attr.Gid, true, true)
+		fs.inodes.UpdateMode(entry.Ino, entry.Mode)
+	}
+}
+
+// restoreJuiceFSDirectoryMetadata rolls back only the owner/mode projection
+// backed by the native inode. Directory size/link/time remain namespace facts
+// and are deliberately outside this mirror contract.
+func (fs *Dat9FS) restoreJuiceFSDirectoryMetadata(entry, before *InodeEntry) {
+	if fs == nil || entry == nil || before == nil || !entry.IsDir || !before.IsDir {
+		return
+	}
+	entry.Uid = before.Uid
+	entry.Gid = before.Gid
+	entry.HasUID = before.HasUID
+	entry.HasGID = before.HasGID
+	entry.Mode = before.Mode
+	entry.HasMode = before.HasMode
+	if fs.inodes != nil && entry.Ino != 0 {
+		fs.inodes.SetOwnerState(entry.Ino, before.Uid, before.Gid, before.HasUID, before.HasGID)
+		fs.inodes.SetModeState(entry.Ino, before.Mode, before.HasMode)
+	}
+	fs.cacheEntryForPath(entry.Path, entry)
+}
+
+// extentRefreshFromVFS copies native JuiceFS inode metadata onto the Dat9FS
+// inode. Files also take length/link/time because file_nodes size is often 0
+// after a remount. Directories take only mode/owner, and only when lookup bound
+// the exact mirrored jfs_node identity.
 func (fs *Dat9FS) extentRefreshFromVFS(nodeID uint64, p string, fuseFh uint64) bool {
 	if fs == nil {
 		return false
 	}
-	if entry, ok := fs.inodes.GetEntry(nodeID); ok && entry.IsDir {
+	entry, ok := fs.inodes.GetEntry(nodeID)
+	if !ok {
 		return false
 	}
-	inoNum, ok := fs.cachedExtentIno(nodeID)
+	var inoNum uint64
+	if entry.IsDir {
+		inoNum = entry.ExtentIno
+		ok = inoNum != 0
+		if !ok {
+			// Never discover a directory by name here. A directory may be a
+			// lazily-created projection parent; only extent_ino from the same
+			// stat/list row proves its durable identity.
+			return false
+		}
+	} else {
+		// Preserve the file path's existing handle-first resolution order.
+		inoNum, ok = fs.cachedExtentIno(nodeID)
+	}
 	if !ok {
 		if !fs.extentDiscoveryEnabled() {
 			return false
@@ -295,21 +370,57 @@ func (fs *Dat9FS) extentRefreshFromVFS(nodeID uint64, p string, fuseFh uint64) b
 	if errn != 0 || jentry == nil || jentry.Attr == nil {
 		return false
 	}
-	v.UpdateLength(jfsmeta.Ino(inoNum), jentry.Attr)
-	entry, ok := fs.inodes.GetEntry(nodeID)
+	if !entry.IsDir {
+		v.UpdateLength(jfsmeta.Ino(inoNum), jentry.Attr)
+	}
+	entry, ok = fs.inodes.GetEntry(nodeID)
 	if !ok {
 		return false
 	}
-	fs.applyJuiceFSAttr(entry, jentry.Attr)
+	if entry.IsDir {
+		fs.applyJuiceFSDirectoryMetadata(entry, jentry.Attr)
+	} else {
+		fs.applyJuiceFSAttr(entry, jentry.Attr)
+	}
 	return true
 }
 
-func (fs *Dat9FS) extentSetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, entry *InodeEntry, out *gofuse.AttrOut) gofuse.Status {
-	if err := fs.ensureExtentRuntime(); err != nil {
+func (fs *Dat9FS) extentBindDirectoryProjection(ctx context.Context, p string, ino uint64) gofuse.Status {
+	remote := fs.remotePath(p)
+	if testHookExtentBindDir != nil {
+		return testHookExtentBindDir(ctx, remote, ino)
+	}
+	if fs == nil || fs.client == nil || ino == 0 {
 		return gofuse.EIO
 	}
+	raw, err := fs.client.ExtentMeta(ctx, "bind_dir_projection", struct {
+		Path  string `json:"path"`
+		Inode uint64 `json:"inode"`
+	}{Path: remote, Inode: ino})
+	if err != nil {
+		return gofuse.EIO
+	}
+	var out struct {
+		Errno int `json:"errno"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return gofuse.EIO
+	}
+	if out.Errno != 0 {
+		return gofuse.Status(out.Errno)
+	}
+	return gofuse.OK
+}
+
+func (fs *Dat9FS) extentSetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, entry *InodeEntry, out *gofuse.AttrOut) gofuse.Status {
 	v := fs.extentVFS()
-	if v == nil || entry == nil {
+	if testHookExtentSetAttr == nil {
+		if err := fs.ensureExtentRuntime(); err != nil {
+			return gofuse.EIO
+		}
+		v = fs.extentVFS()
+	}
+	if (v == nil && testHookExtentSetAttr == nil) || entry == nil {
 		return gofuse.EIO
 	}
 	inoNum, ok := fs.resolveJuiceIno(input.NodeId, entry.Path)
@@ -374,13 +485,37 @@ func (fs *Dat9FS) extentSetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn,
 		out.SetTimeout(fs.extentAttrTimeoutFor(entry))
 		return gofuse.OK
 	}
-	ctx := fs.jfsCtx(input.Pid, input.Uid, input.Gid)
-	jentry, errn := v.SetAttr(ctx, jfsmeta.Ino(inoNum), set, fs.extentVFSFh(input.Fh), mode, uid, gid, atime, mtime, atimensec, mtimensec, size)
+	fh := fs.extentVFSFh(input.Fh)
+	var jentry *jfsmeta.Entry
+	var errn syscall.Errno
+	if testHookExtentSetAttr != nil {
+		jentry, errn = testHookExtentSetAttr(inoNum, set, fh, mode, uid, gid, atime, mtime, atimensec, mtimensec, size)
+	} else {
+		caller := setAttrCallerOwner(input)
+		ctx := fs.jfsCtx(input.Pid, caller.Uid, caller.Gid)
+		jentry, errn = v.SetAttr(ctx, jfsmeta.Ino(inoNum), set, fh, mode, uid, gid, atime, mtime, atimensec, mtimensec, size)
+	}
 	if errn != 0 {
 		return gofuse.Status(errn)
 	}
-	if jentry != nil && jentry.Attr != nil {
+	if v != nil && jentry != nil && jentry.Attr != nil {
 		v.UpdateLength(jfsmeta.Ino(inoNum), jentry.Attr)
+	}
+	entry = fs.applyExtentSetAttrResult(input, entry, jentry, mode)
+	fs.fillAttr(entry, &out.Attr)
+	out.SetTimeout(fs.extentAttrTimeoutFor(entry))
+	return gofuse.OK
+}
+
+// applyExtentSetAttrResult installs the acknowledged native inode metadata in
+// both caches that can answer the next path lookup. Updating only the inode
+// cache leaves the parent directory cache able to publish the pre-chmod mode
+// through Lookup/ReaddirPlus on the same mount.
+func (fs *Dat9FS) applyExtentSetAttrResult(input *gofuse.SetAttrIn, entry *InodeEntry, jentry *jfsmeta.Entry, mode uint32) *InodeEntry {
+	if fs == nil || input == nil || entry == nil {
+		return entry
+	}
+	if jentry != nil && jentry.Attr != nil {
 		if e, ok := fs.inodes.GetEntry(input.NodeId); ok {
 			fs.applyJuiceFSAttr(e, jentry.Attr)
 			entry = e
@@ -410,28 +545,51 @@ func (fs *Dat9FS) extentSetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn,
 		// the file does not have.
 		fs.extentKeepOpenWALIndexSize(entry)
 	}
-	fs.fillAttr(entry, &out.Attr)
-	out.SetTimeout(fs.extentAttrTimeoutFor(entry))
-	return gofuse.OK
+	fs.cacheEntryForPath(entry.Path, entry)
+	return entry
 }
 
-func (fs *Dat9FS) extentMirrorDirAttr(input *gofuse.SetAttrIn, entry *InodeEntry) {
+func (fs *Dat9FS) extentMirrorDirAttr(requestCtx context.Context, input *gofuse.SetAttrIn, entry *InodeEntry) gofuse.Status {
 	if fs == nil || input == nil || entry == nil || !entry.IsDir {
-		return
+		return gofuse.EIO
 	}
 	if fs.extentRT.Load() == nil && !fs.extentEnabled() {
-		return
+		return gofuse.OK
 	}
-	if err := fs.ensureExtentRuntime(); err != nil {
-		return
+	if testHookExtentSetAttr == nil {
+		if err := fs.ensureExtentRuntime(); err != nil {
+			return gofuse.EIO
+		}
 	}
 	v := fs.extentVFS()
-	if v == nil {
-		return
+	if v == nil && testHookExtentSetAttr == nil {
+		return gofuse.EIO
 	}
+	caller := setAttrCallerOwner(input)
+	ctx := fs.jfsCtx(input.Pid, caller.Uid, caller.Gid)
 	inoNum, ok := fs.resolveJuiceIno(input.NodeId, entry.Path)
 	if !ok {
-		return
+		// Directory metadata is part of the durable native inode contract for
+		// an extent mount. A prior listing may have dropped the mount-local
+		// binding, so a mutation is allowed to repair/mirror the path instead
+		// of silently acknowledging an owner that will disappear on remount.
+		if testHookExtentSetAttr != nil {
+			return gofuse.ENOENT
+		}
+		mirrored, errn := fs.extentEnsureParent(ctx, entry.Path)
+		if errn != 0 {
+			return gofuse.Status(errn)
+		}
+		inoNum = uint64(mirrored)
+		fs.inodes.SetExtentIno(input.NodeId, inoNum)
+		entry.ExtentIno = inoNum
+	}
+	// The mount-local binding is not enough: a fresh mount learns the exact
+	// native directory inode only from file_nodes.extent_ino. Bind it before
+	// mutating jfs_node so a failed bind cannot leave an acknowledged owner or
+	// mode that the next mount has no durable way to find.
+	if st := fs.extentBindDirectoryProjection(requestCtx, entry.Path, inoNum); st != gofuse.OK {
+		return st
 	}
 	set := 0
 	var mode, uid, gid uint32
@@ -465,10 +623,23 @@ func (fs *Dat9FS) extentMirrorDirAttr(input *gofuse.SetAttrIn, entry *InodeEntry
 		mtimensec = uint32(t.Nanosecond())
 	}
 	if set == 0 {
-		return
+		return gofuse.OK
 	}
-	ctx := fs.jfsCtx(input.Pid, input.Uid, input.Gid)
-	_, _ = v.SetAttr(ctx, jfsmeta.Ino(inoNum), set, 0, mode, uid, gid, atime, mtime, atimensec, mtimensec, 0)
+	var jentry *jfsmeta.Entry
+	var errn syscall.Errno
+	if testHookExtentSetAttr != nil {
+		jentry, errn = testHookExtentSetAttr(inoNum, set, 0, mode, uid, gid, atime, mtime, atimensec, mtimensec, 0)
+	} else {
+		jentry, errn = v.SetAttr(ctx, jfsmeta.Ino(inoNum), set, 0, mode, uid, gid, atime, mtime, atimensec, mtimensec, 0)
+	}
+	if errn != 0 {
+		return gofuse.Status(errn)
+	}
+	if jentry != nil && jentry.Attr != nil {
+		fs.applyJuiceFSDirectoryMetadata(entry, jentry.Attr)
+		fs.cacheEntryForPath(entry.Path, entry)
+	}
+	return gofuse.OK
 }
 
 // resolveExtentIno finds the JuiceFS inode without depending on a FUSE

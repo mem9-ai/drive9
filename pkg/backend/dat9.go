@@ -1470,8 +1470,9 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 		}
 		// A listing is the only place the extent data plane can be announced
 		// for free: the inode rides on the row the size overlay already reads.
-		// Clients that miss it fall back to a HEAD probe on first open.
-		if e.ContentLayout == datastore.ContentLayoutExtent && e.ExtentIno != 0 {
+		// Mirrored directories have no file content layout, but still need their
+		// exact native inode so a fresh mount can restore owner/mode.
+		if e.ExtentIno != 0 && (e.Node.IsDirectory || e.ContentLayout == datastore.ContentLayoutExtent) {
 			meta["extent_ino"] = strconv.FormatUint(e.ExtentIno, 10)
 		}
 		if e.File != nil {

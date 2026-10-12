@@ -18,6 +18,7 @@
 //	git     git-aware drive9 workflows
 //	region list provisioning regions
 //	profile show mount profile configuration
+//	exec    run one remote process against a Drive9 workspace
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
 //	doctor  diagnose local drive9 runtime prerequisites
@@ -61,6 +62,7 @@ var unpackHandler = cli.UnpackCommand
 var profileHandler = cli.Profile
 var umountHandler = cli.UmountCmd
 var updateHandler = cli.Update
+var execHandler = cli.Exec
 
 func main() {
 	if logger.CLIEnabled() {
@@ -256,6 +258,13 @@ func dispatch(cmd string, args []string) {
 		}
 		if err := profileHandler(args); err != nil {
 			fatal("profile", err)
+		}
+	case "exec":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "exec"))
+		}
+		if err := execHandler(args); err != nil {
+			fatal("exec", err)
 		}
 	case "mount":
 		if cliLogger != nil {
@@ -453,6 +462,8 @@ func usage(code int) {
 			"                         restore a drive9 pack archive to a local overlay\n"+
 			"  profile show [profile]\n"+
 			"                         print mount profile configuration\n"+
+			"  exec [flags] -- command [arg...]\n"+
+			"                         run one process against a Drive9 workspace\n"+
 			"  mount [flags] [:/remote|s3://bucket/prefix/|gs://bucket/prefix/|az://container/prefix/] <mountpoint>\n"+
 			"                         mount drive9 or an object prefix (background FUSE by default)\n"+
 			"  mount drain [--timeout duration] [--json] <mountpoint>\n"+

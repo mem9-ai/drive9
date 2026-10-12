@@ -7483,14 +7483,14 @@ func (fs *Dat9FS) lookupOnce(cancel <-chan struct{}, header *gofuse.InHeader, na
 	if stat.HasMode {
 		fs.inodes.UpdateMode(ino, stat.Mode)
 	}
-	if stat.ContentLayout == client.ContentLayoutExtent && stat.ExtentIno != 0 {
-		fs.inodes.SetExtentIno(ino, stat.ExtentIno)
+	if extentIno, ok := projectedExtentIno(stat); ok {
+		fs.inodes.SetExtentIno(ino, extentIno)
 	}
-	// Refresh from the JuiceFS side only when the projection says this file
-	// lives on the extent data plane. Matching the profile glob is not enough:
-	// extentRefreshFromVFS resolves the inode by name, so an orphan jfs edge
-	// would capture a single-layout file that happens to match the glob (P1-4).
-	if !stat.IsDir && stat.ContentLayout == client.ContentLayoutExtent {
+	// Refresh only when the same projection row proves the exact jfs_node:
+	// content layout for files, or an extent inode for mirrored directories.
+	// A matching creation glob alone is not identity evidence (P1-4).
+	if (!stat.IsDir && stat.ContentLayout == client.ContentLayoutExtent) ||
+		(stat.IsDir && stat.ExtentIno != 0) {
 		fs.extentRefreshFromVFS(ino, childP, 0)
 	}
 	// This is a plain remote read, not a mutation: record it as an observation
@@ -8577,10 +8577,11 @@ func (fs *Dat9FS) getAttrOnce(cancel <-chan struct{}, input *gofuse.GetAttrIn, o
 		return gofuse.OK
 	}
 
-	// Extent files: size/owner/mode come from JuiceFS VFS GetAttr, not
-	// file_nodes. Directories keep Dat9FS mkdir mode (sticky/owner).
-	// Kernel i_size (and therefore O_APPEND) follows VFS.
-	if !entry.IsDir && fs.extentRefreshFromVFS(input.NodeId, entry.Path, input.Fh()) {
+	// Extent files take size/owner/mode from JuiceFS VFS GetAttr, not
+	// file_nodes. A directory with an exact mirrored jfs_node identity takes
+	// native mode/owner from it while retaining Dat9FS directory size/times.
+	// Kernel file i_size (and therefore O_APPEND) follows VFS.
+	if fs.extentRefreshFromVFS(input.NodeId, entry.Path, input.Fh()) {
 		if refreshed, ok := fs.inodes.GetEntry(input.NodeId); ok {
 			entry = refreshed
 		}
@@ -9114,6 +9115,11 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	if !ok {
 		return gofuse.ENOENT
 	}
+	var directoryNativeBefore *InodeEntry
+	if entry.IsDir {
+		before := *entry
+		directoryNativeBefore = &before
+	}
 	sizeChanged := false
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -9431,7 +9437,10 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		fs.cacheEntryForPath(entry.Path, entry)
 	}
 	if entry.IsDir {
-		fs.extentMirrorDirAttr(input, entry)
+		if st := fs.extentMirrorDirAttr(ctx, input, entry); st != gofuse.OK {
+			fs.restoreJuiceFSDirectoryMetadata(entry, directoryNativeBefore)
+			return st
+		}
 	}
 	fs.fillAttr(entry, &out.Attr)
 	fs.setAttrOutTimeout(out, sizeChanged)
@@ -9517,6 +9526,12 @@ func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name stri
 	mode := metadataNodeMode(input.Mode)
 	switch mode & fileKindModeMask {
 	case 0, syscall.S_IFREG:
+		// fuse-overlayfs creates regular upper files with MKNOD. Keep matching
+		// files on the extent data plane so their native inode mode and owner
+		// remain durable across fresh mounts.
+		if fs.shouldUseExtentPath(childP) {
+			return fs.extentMknod(cancel, input, name, childP, mode, out)
+		}
 		return fs.mknodRegular(cancel, input, name, childP, mode, out)
 	}
 	if fs.extentEnabled() && metadataOnlySpecialMode(mode) {
@@ -11725,6 +11740,55 @@ func dirEntryFromCachedInfo(item CachedFileInfo, ino uint64) DirEntry {
 	}
 }
 
+// applyCachedNativeMetadata updates the readdir result with metadata loaded
+// from its exact jfs_node. Directories mirror only owner/mode; extent files
+// also take native size/mtime because their projection row is not authoritative
+// for content metadata.
+func applyCachedNativeMetadata(item *CachedFileInfo, entry *InodeEntry) {
+	if item == nil || entry == nil || item.IsDir != entry.IsDir {
+		return
+	}
+	if entry.HasMode {
+		item.Mode = entry.Mode
+		item.HasMode = true
+	}
+	if entry.HasUID {
+		item.Uid = entry.Uid
+		item.HasUID = true
+	}
+	if entry.HasGID {
+		item.Gid = entry.Gid
+		item.HasGID = true
+	}
+	if !item.IsDir {
+		item.Size = entry.Size
+		if !entry.Mtime.IsZero() {
+			item.Mtime = entry.Mtime
+		}
+	}
+}
+
+// cachedNativeOwnerModeDiffers reports whether a same-object listing and the
+// mount's inode cache disagree on native metadata. The disagreement is only a
+// trigger for an authoritative jfs_node refresh; neither side wins by itself.
+func cachedNativeOwnerModeDiffers(item CachedFileInfo, entry *InodeEntry) bool {
+	if entry == nil || item.IsDir != entry.IsDir {
+		return false
+	}
+	return (entry.HasMode && (!item.HasMode ||
+		entry.Mode&posixPermissionModeMask != item.Mode&posixPermissionModeMask)) ||
+		(entry.HasUID && (!item.HasUID || entry.Uid != item.Uid)) ||
+		(entry.HasGID && (!item.HasGID || entry.Gid != item.Gid))
+}
+
+func shouldRefreshCachedNativeMetadata(item CachedFileInfo, entry *InodeEntry, sameResource bool) bool {
+	if item.ExtentIno == 0 || entry == nil || item.IsDir != entry.IsDir {
+		return false
+	}
+	sameExtent := entry.ExtentIno != 0 && entry.ExtentIno == item.ExtentIno
+	return (sameResource || sameExtent) && cachedNativeOwnerModeDiffers(item, entry)
+}
+
 func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
 	if dh, ok := fs.dirHandles.Get(input.Fh); ok {
 		fs.extentReleaseDir(dh)
@@ -12185,7 +12249,13 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 			mtime = time.Now()
 		}
 		prevSize := int64(0)
-		if existing, ok := fs.inodes.GetInode(childP); ok {
+		existing, hadInode := fs.inodes.GetInode(childP)
+		// A fresh mount has no live inode metadata to compare against the
+		// projection listing. Refresh an extent file once before ReaddirPlus can
+		// seed the kernel with projection mtime/atime. Later listings keep the
+		// existing disagreement-triggered path and avoid an RPC per entry.
+		refreshNativeMetadata := item.ExtentIno != 0 && (item.IsDir || !hadInode)
+		if hadInode {
 			if e, ok := fs.inodes.GetEntry(existing); ok {
 				// Two carry-overs with different evidence requirements.
 				//
@@ -12220,6 +12290,9 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 				if item.ExtentIno == 0 && provesSame {
 					item.ExtentIno = e.ExtentIno
 				}
+				if shouldRefreshCachedNativeMetadata(item, e, provesSame) {
+					refreshNativeMetadata = true
+				}
 				if !provesSame && e.ExtentIno != 0 {
 					fs.inodes.ClearExtentIno(existing)
 				}
@@ -12237,6 +12310,16 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		}
 		if item.ExtentIno != 0 {
 			fs.inodes.SetExtentIno(ino, item.ExtentIno)
+		}
+		// ReaddirPlus can satisfy the kernel's following stat directly from its
+		// EntryOut, without a later Lookup/GetAttr. A mirrored directory always
+		// needs native mode/owner. A cold extent file must load all native attrs;
+		// an existing one refreshes only when the same-object listing disagrees
+		// with its live metadata.
+		if refreshNativeMetadata && fs.extentRefreshFromVFS(ino, childP, 0) {
+			if refreshed, ok := fs.inodes.GetEntry(ino); ok {
+				applyCachedNativeMetadata(&item, refreshed)
+			}
 		}
 		if !item.IsDir && prevSize > item.Size {
 			fs.inodes.UpdateSize(ino, prevSize)

@@ -8,9 +8,24 @@ import (
 )
 
 func xattrNamespaceSupported(attr string) bool {
+	if privateOverlayXAttr(attr) {
+		return false
+	}
 	return runtime.GOOS != "linux" || strings.HasPrefix(attr, "user.") ||
 		strings.HasPrefix(attr, "security.") || strings.HasPrefix(attr, "trusted.") ||
 		strings.HasPrefix(attr, "system.")
+}
+
+func privateOverlayXAttr(attr string) bool {
+	// The generic store is mount-local. Returning success for overlay-private
+	// metadata would make fuse-overlayfs depend on state that vanishes on the
+	// next Drive9 mount; EOPNOTSUPP makes it use ordinary whiteout files and
+	// native inode ownership/mode instead.
+	return strings.HasPrefix(attr, "user.fuseoverlayfs.") ||
+		strings.HasPrefix(attr, "security.fuseoverlayfs.") ||
+		strings.HasPrefix(attr, "user.overlay.") ||
+		strings.HasPrefix(attr, "trusted.overlay.") ||
+		attr == "user.containers.override_stat"
 }
 
 // XATTR_CREATE and XATTR_REPLACE flag values from Linux's setxattr(2).

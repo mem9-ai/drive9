@@ -786,6 +786,21 @@ func (m *InodeToPath) UpdateOwner(ino uint64, uid, gid uint32, hasUID, hasGID bo
 	}
 }
 
+// SetOwnerState replaces both owner values and their authoritative flags.
+// Unlike UpdateOwner, it can restore an earlier unknown-owner state after a
+// multi-store metadata mutation fails.
+func (m *InodeToPath) SetOwnerState(ino uint64, uid, gid uint32, hasUID, hasGID bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Uid = uid
+		entry.Gid = gid
+		entry.HasUID = hasUID
+		entry.HasGID = hasGID
+	}
+}
+
 // UpdateRevision updates the server revision of the entry identified by ino.
 func (m *InodeToPath) UpdateRevision(ino uint64, revision int64) {
 	m.mu.Lock()

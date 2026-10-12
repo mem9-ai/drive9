@@ -1,8 +1,8 @@
 package cli
 
 import (
-	"strings"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -96,6 +96,7 @@ type mountFuseOptions struct {
 	PerfMaxSampleFiles           int
 	PerfMaxProfileFiles          int
 	Supervised                   bool
+	OmitProcessStateCredentials  bool
 }
 
 type vaultMountOptions struct {

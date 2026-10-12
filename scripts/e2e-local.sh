@@ -285,6 +285,7 @@ start_server() {
 
   "$SERVER_BIN" >"$WORK_DIR/server.log" 2>&1 &
   SERVER_PID=$!
+  export DRIVE9_E2E_SERVER_LOG="$WORK_DIR/server.log"
   echo "server pid: $SERVER_PID  (logs: $WORK_DIR/server.log)"
 
   if ! wait_http "http://$LISTEN_ADDR/healthz" 60; then
