@@ -100,14 +100,15 @@ jobs:
               ;;
           esac
           # `--text` keeps a PR-controlled `.gitattributes` (`-diff`/`binary`)
-          # from hiding a file from `git log -p`; `-m` emits merge-commit
-          # patches so a credential introduced while resolving a conflict is
-          # scanned too.
+          # from hiding a file from `git log -p`. `--diff-merges=remerge` scans
+          # the merge result, so a credential introduced while resolving a
+          # conflict is seen, while content merely inherited from the base
+          # branch is not re-reported (which plain `-m` would do).
           if [ -n "$BASE_SHA" ]; then
-            log_opts="$BASE_SHA..$HEAD_SHA --text -m"
+            log_opts="$BASE_SHA..$HEAD_SHA --text --diff-merges=remerge"
             config_ref="$BASE_SHA"
           else
-            log_opts="--all --text -m"
+            log_opts="--all --text --diff-merges=remerge"
             config_ref="HEAD"
           fi
 

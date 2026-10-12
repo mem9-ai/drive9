@@ -45,11 +45,15 @@ GITLEAKS_BIN ?= $(BIN_DIR)/gitleaks
 GITLEAKS_LOG_OPTS ?=
 # Range actually traversed, shared by the pre-flight check and the scan.
 GITLEAKS_RANGE = $(if $(GITLEAKS_LOG_OPTS),$(GITLEAKS_LOG_OPTS),HEAD)
-# Diff options forced on every traversal. `--text` stops a PR-controlled
-# `.gitattributes` (`-diff`/`binary`) from hiding a file's content from
-# `git log -p`, and `-m` emits merge-commit diffs so a credential introduced
-# while resolving a conflict is still scanned.
-GITLEAKS_DIFF_OPTS ?= --text -m
+# Diff options forced on every traversal:
+#   --text                      a PR-controlled `.gitattributes` (`-diff`/`binary`)
+#                               must not hide a file's content from `git log -p`.
+#   --diff-merges=remerge       scan the merge result (so a credential introduced
+#                               while resolving a conflict is seen) without
+#                               re-reporting content inherited from the base branch,
+#                               which plain `-m` does. Needs git >= 2.36; an older
+#                               git fails the preflight below rather than passing.
+GITLEAKS_DIFF_OPTS ?= --text --diff-merges=remerge
 
 IMAGE_REPO ?= drive9-server
 IMAGE_TAG ?= latest

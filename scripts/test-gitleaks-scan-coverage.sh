@@ -128,4 +128,48 @@ if [[ "$status" -eq 0 ]]; then
 fi
 echo "   ok: make gitleaks finds it (exit $status)"
 
-echo "PASS: scan coverage guards hold for hidden diffs and merge resolutions"
+echo "== 3. content inherited from the base branch must not be reported"
+init_repo "$WORK/inherited"
+printf 'docs\n' > "$WORK/inherited/docs.txt"
+git -C "$WORK/inherited" add -A
+git -C "$WORK/inherited" commit -qm docs
+INHERIT_DEFAULT="$(git -C "$WORK/inherited" symbolic-ref --short HEAD)"
+git -C "$WORK/inherited" branch -q feature
+printf 'aws_key = "%s"\n' "$FAKE_AWS_KEY" > "$WORK/inherited/creds.txt"
+git -C "$WORK/inherited" add -A
+git -C "$WORK/inherited" commit -qm "base branch gains a credential"
+INHERIT_BASE="$(git -C "$WORK/inherited" rev-parse HEAD)"
+git -C "$WORK/inherited" checkout -q feature
+printf 'readme\n' > "$WORK/inherited/readme.txt"
+git -C "$WORK/inherited" add -A
+git -C "$WORK/inherited" commit -qm readme
+git -C "$WORK/inherited" merge -q --no-edit "$INHERIT_DEFAULT"
+INHERIT_HEAD="$(git -C "$WORK/inherited" rev-parse HEAD)"
+stage_repo "$WORK/inherited"
+
+changed="$(git -C "$WORK/inherited" diff --name-only "$INHERIT_BASE" "$INHERIT_HEAD" | tr '\n' ' ')"
+if [[ "$changed" != "readme.txt " ]]; then
+  echo "setup error: the PR should only change readme.txt, got: $changed" >&2
+  exit 1
+fi
+status="$(raw_scan "$WORK/inherited" "$INHERIT_BASE")"
+if [[ "$status" -eq 0 ]]; then
+  echo "setup error: the credential in the base branch is not detectable" >&2
+  exit 1
+fi
+status="$(raw_scan "$WORK/inherited" "$INHERIT_BASE..$INHERIT_HEAD -m")"
+if [[ "$status" -eq 0 ]]; then
+  echo "setup error: plain -m no longer reports inherited base content; adjust this guard" >&2
+  exit 1
+fi
+echo "   ok: plain -m reports the inherited credential (the false positive being guarded)"
+
+status="$(target_scan "$WORK/inherited" "$INHERIT_BASE..$INHERIT_HEAD")"
+if [[ "$status" -ne 0 ]]; then
+  echo "FAIL: make gitleaks reported content inherited from the base branch:" >&2
+  cat "$WORK/target.log" >&2
+  exit 1
+fi
+echo "   ok: make gitleaks stays clean for the inherited case (exit $status)"
+
+echo "PASS: scan coverage guards hold for hidden diffs, merge resolutions and inherited base content"
