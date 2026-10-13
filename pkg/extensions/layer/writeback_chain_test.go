@@ -12,6 +12,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/extensions/writeback"
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 // TestChainTruncatingOpenOverWriteback reproduces the e2e shape: an
@@ -91,4 +92,25 @@ func TestChainTruncatingOpenOverWriteback(t *testing.T) {
 	// The landed tree file must keep a sane mode: a second open runs the
 	// facade's permission gate against the tree attrs.
 	writeAndClose("second")
+}
+
+// TestRemoteRootKeepsLayerNamespaceGlobal pins the path rule the async
+// planes rely on: tree/marker paths stay server-absolute under a non-root
+// remote root, so mount uploads and CLI/marker I/O address the same
+// namespace.
+func TestRemoteRootKeepsLayerNamespaceGlobal(t *testing.T) {
+	cases := []struct{ root, in, want string }{
+		{"/", "/x", "/x"},
+		{"/repo", "/x", "/repo/x"},
+		{"/repo", "/", "/repo"},
+		{"/repo", "/.drive9/layers/L1/tree/x", "/.drive9/layers/L1/tree/x"},
+		{"/repo", "/.drive9/layers", "/.drive9/layers"},
+		{"/repo", "/.drive9/other", "/repo/.drive9/other"},
+		{"", "/x", "/x"},
+	}
+	for _, c := range cases {
+		if got := pathutil.WithRemoteRoot(c.root, c.in); got != c.want {
+			t.Fatalf("WithRemoteRoot(%q, %q) = %q, want %q", c.root, c.in, got, c.want)
+		}
+	}
 }
