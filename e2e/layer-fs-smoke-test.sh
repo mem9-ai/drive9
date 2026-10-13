@@ -787,7 +787,7 @@ run_fuse_section() {
   local mp="$FUSE_MOUNT_ROOT/drive9-layer-$ts"
   local lroot="$FUSE_MOUNT_ROOT/drive9-layer-$ts-local"
   local log="$FUSE_MOUNT_ROOT/drive9-layer-$ts.log"
-  trap 'stop_mount' EXIT
+  trap 'stop_mount; dump_mount_log' EXIT
 
   start_layer_mount "$fuse_layer" "" "$root" "$mp" "$lroot" "$log"
 
@@ -795,6 +795,7 @@ run_fuse_section() {
   check_eq "layer mount reads classic content" "$(cat "$mp/base.txt")" "live moved on"
 
   # CoW: editing a classic file leaves the classic bytes alone
+  ls -la "$mp" || true
   printf 'replaced in layer' >"$mp/base.txt"
   sync; sleep 1
   check_eq "classic file untouched by the shadow write" "$(drive9_retry fs cat ":$base_file")" "live moved on"
