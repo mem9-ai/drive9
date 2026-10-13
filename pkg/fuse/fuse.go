@@ -114,7 +114,10 @@ type FS struct {
 	mu       sync.Mutex
 	server   *gofuse.Server
 	startErr error
-	started  bool
+	// unmounted records that go-fuse completed a clean unmount handshake
+	// (OnUnmount): a serve-loop exit without it is an abnormal disconnect.
+	unmounted atomic.Bool
+	started   bool
 
 	uid uint32
 	gid uint32
@@ -897,6 +900,7 @@ func (f *FS) Init2(ctx context.Context) {
 }
 
 func (f *FS) OnUnmount() {
+	f.unmounted.Store(true)
 	// v1 printed the perf summary at unmount (printSummary on stderr):
 	// "drive9: FUSE perf summary uptime=..." plus the counter blocks the
 	// git-ops budget guard greps (workspace refresh accounting).
@@ -1548,12 +1552,12 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 			case mode == cur&^0o6000 && cur&0o6000 != 0 && caller.Uid == 0:
 				// Privileged chown: the kernel's kill-priv merge is not the
 				// caller's chmod — keep the privilege bits.
-				op.Mode = 0
+				op.HasMode = false
 			default:
-				op.Mode = mode
+				op.Mode, op.HasMode = mode, true
 			}
 		} else {
-			op.Mode = mode
+			op.Mode, op.HasMode = mode, true
 		}
 	}
 	if input.Valid&gofuse.FATTR_SIZE != 0 {
@@ -2007,6 +2011,12 @@ func (f *FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr stri
 	if err != nil {
 		return 0, fs.StatusOf(err)
 	}
+	// A zero-length destination is the standard size probe: it must
+	// succeed with the byte count so callers can allocate the follow-up
+	// buffer (returning ERANGE there left every probe failing).
+	if len(dest) == 0 {
+		return uint32(len(res.Data)), gofuse.OK
+	}
 	if len(dest) < len(res.Data) {
 		return uint32(len(res.Data)), gofuse.Status(syscall.ERANGE)
 	}
@@ -2024,6 +2034,10 @@ func (f *FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, dest []b
 	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpListXattr, Path: path, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)})
 	if err != nil {
 		return 0, fs.StatusOf(err)
+	}
+	// Size probe: same as GetXAttr — success with the required size.
+	if len(dest) == 0 {
+		return uint32(len(res.Data)), gofuse.OK
 	}
 	if len(dest) < len(res.Data) {
 		return uint32(len(res.Data)), gofuse.Status(syscall.ERANGE)

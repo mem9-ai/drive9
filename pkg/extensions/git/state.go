@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -698,6 +699,11 @@ func (g *Git) checkpointAllGitWorkspaces() {
 
 // restoreWorkspaceState restores objects from the remote clone, then the
 // stored packs, then the state archive, swapped in atomically.
+// errGitStateNotReady reports that no server-side checkpoint exists yet —
+// the discovery-time restore racing the CLI's upload. Callers retry later
+// instead of consuming their restore attempt.
+var errGitStateNotReady = errors.New("git state checkpoint not available yet")
+
 func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	if g.cl == nil {
 		return nil
@@ -715,12 +721,12 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	state, err := g.cl.GetGitState(ctx, w.id)
 	if err != nil {
 		if client.IsNotFound(err) {
-			return nil
+			return errGitStateNotReady
 		}
 		return err
 	}
 	if state == nil {
-		return nil
+		return errGitStateNotReady
 	}
 	parent := filepath.Dir(gitDir)
 	if err := os.MkdirAll(parent, 0o755); err != nil {

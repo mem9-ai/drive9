@@ -10,6 +10,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -74,6 +76,10 @@ type Cache struct {
 	dirs *dirPrefetcher
 	// hitRecorder feeds the read-tier hit/miss counters (facade-attached).
 	hitRecorder func(kind string, hit bool)
+	// open tracks live caching handles by pointer so a rename can
+	// retarget them (and their prefetchers) onto the new path — the
+	// handle keeps serving, but its block requests must follow the name.
+	open sync.Map // *cachingHandle → struct{}
 	// sidecars tracks open -wal/-journal handles (v1 sqlite routing).
 	sidecars sidecarTracker
 }
@@ -305,6 +311,7 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			size = res.Attr.Size
 		}
 		h := &cachingHandle{cache: c, inner: res.Handle, path: op.Path, rev: rev, size: size}
+		c.open.Store(h, struct{}{})
 		if sqliteJournalPath(op.Path) {
 			c.trackSidecarOpen(op.Path)
 			h.isSidecar = true
@@ -319,6 +326,29 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			h.prefetchArmed = true
 		}
 		res.Handle = h
+		return res, nil
+
+	case fs.OpRename:
+		res, err := next(ctx, op)
+		if err != nil {
+			return res, err
+		}
+		// Retarget open handles and their prefetchers: the inner writeback
+		// plane already moved its writers, and a caching handle still
+		// keyed on the old path would fetch blocks for whatever replaces
+		// the old name after a re-create. Cached whole-file images move
+		// with the name (same content, same revision).
+		c.open.Range(func(k, _ any) bool {
+			if h, ok := k.(*cachingHandle); ok {
+				if h.path == op.Path {
+					h.SetPath(op.Path2)
+				} else if strings.HasPrefix(h.path, strings.TrimSuffix(op.Path, "/")+"/") {
+					h.SetPath(op.Path2 + strings.TrimPrefix(h.path, op.Path))
+				}
+			}
+			return true
+		})
+		c.mem.Rename(op.Path, op.Path2)
 		return res, nil
 
 	case fs.OpRead:
@@ -512,10 +542,19 @@ func (h *cachingHandle) Flush(ctx context.Context) error { return h.inner.Flush(
 
 // Release implements fs.Handle.
 func (h *cachingHandle) Release(ctx context.Context) error {
+	h.cache.open.Delete(h)
 	if h.isSidecar {
 		h.cache.sidecars.remove(h.path)
 	}
 	return h.inner.Release(ctx)
+}
+
+// SetPath retargets the handle (and its prefetcher) onto the renamed path.
+func (h *cachingHandle) SetPath(p string) {
+	h.path = p
+	if h.prefetch != nil {
+		h.prefetch.SetPath(p)
+	}
 }
 
 func (c *Cache) admits(data []byte) bool {

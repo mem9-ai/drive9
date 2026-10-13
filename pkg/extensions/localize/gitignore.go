@@ -41,16 +41,16 @@ type ignoreRuleset struct {
 // deeper files taking precedence, and the repository's info/exclude
 // underneath them all. A path with no rule chain (no repository above it,
 // or the repository root itself) is unverified.
-func (f *Localize) gitIgnoreCheck(inner fs.Filesystem, viewPath string, dirHint bool) (confirmed, verified bool) {
+func (f *Localize) gitIgnoreCheck(ctx context.Context, inner fs.Filesystem, viewPath string, dirHint bool) (confirmed, verified bool) {
 	dir := viewPath
 	if !dirHint && !strings.HasSuffix(viewPath, "/") {
 		dir = pathutil.DirOf(viewPath)
 	}
-	root, ok := f.repoRoot(inner, dir)
+	root, ok := f.repoRoot(ctx, inner, dir)
 	if !ok {
 		return false, false
 	}
-	set := f.loadIgnoreRules(inner, root, dir)
+	set := f.loadIgnoreRules(ctx, inner, root, dir)
 	if set == nil {
 		return false, false
 	}
@@ -87,7 +87,7 @@ func (f *Localize) gitIgnoreCheck(inner fs.Filesystem, viewPath string, dirHint 
 // loadIgnoreRules builds (and caches by source fingerprint) the rule chain
 // for dir: the repository's info/exclude plus every directory's ignore file
 // from the repository root down to dir.
-func (f *Localize) loadIgnoreRules(inner fs.Filesystem, root, dir string) *ignoreRuleset {
+func (f *Localize) loadIgnoreRules(ctx context.Context, inner fs.Filesystem, root, dir string) *ignoreRuleset {
 	var dirs []string
 	for cur := dir; ; cur = pathutil.DirOf(cur) {
 		dirs = append(dirs, cur)
@@ -100,14 +100,14 @@ func (f *Localize) loadIgnoreRules(inner fs.Filesystem, root, dir string) *ignor
 	}
 	var sources []string
 	bodies := make([]string, 0, len(dirs)+1)
-	if body, ok := f.readInnerFile(inner, joinDir(joinDir(root, ".git"), "info/exclude")); ok {
+	if body, ok := f.readInnerFile(ctx, inner, joinDir(joinDir(root, ".git"), "info/exclude")); ok {
 		sources = append(sources, "exclude:"+body)
 		bodies = append(bodies, body)
 	} else {
 		bodies = append(bodies, "")
 	}
 	for _, d := range dirs {
-		body, ok := f.readInnerFile(inner, joinDir(d, ".gitignore"))
+		body, ok := f.readInnerFile(ctx, inner, joinDir(d, ".gitignore"))
 		if !ok {
 			body = ""
 		}
@@ -136,11 +136,11 @@ func (f *Localize) loadIgnoreRules(inner fs.Filesystem, root, dir string) *ignor
 
 // readInnerFile reads a whole file through the inner view. Missing or
 // unreadable files report ok=false.
-func (f *Localize) readInnerFile(inner fs.Filesystem, tenantPath string) (string, bool) {
+func (f *Localize) readInnerFile(ctx context.Context, inner fs.Filesystem, tenantPath string) (string, bool) {
 	if inner == nil {
 		return "", false
 	}
-	data, err := inner.Read(context.Background(), tenantPath, 0, 0)
+	data, err := inner.Read(ctx, tenantPath, 0, 0)
 	if err != nil {
 		return "", false
 	}
@@ -149,7 +149,7 @@ func (f *Localize) readInnerFile(inner fs.Filesystem, tenantPath string) (string
 
 // repoRoot finds the nearest ancestor of dir that contains a .git entry,
 // cached per queried directory (negative answers cache too).
-func (f *Localize) repoRoot(inner fs.Filesystem, dir string) (string, bool) {
+func (f *Localize) repoRoot(ctx context.Context, inner fs.Filesystem, dir string) (string, bool) {
 	f.innerMu.Lock()
 	root, ok := f.repoRoots[dir]
 	f.innerMu.Unlock()
@@ -161,7 +161,7 @@ func (f *Localize) repoRoot(inner fs.Filesystem, dir string) (string, bool) {
 	}
 	cur := dir
 	for {
-		if _, err := inner.GetAttr(context.Background(), joinDir(cur, ".git")); err == nil {
+		if _, err := inner.GetAttr(ctx, joinDir(cur, ".git")); err == nil {
 			f.innerMu.Lock()
 			f.repoRoots[dir] = cur
 			f.innerMu.Unlock()

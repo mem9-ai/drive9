@@ -121,7 +121,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		// overlay. FLUSH keeps passing through (its errors surface on
 		// close).
 		if op.Kind == fs.OpFlush || op.Path == "" ||
-			f.overlayFor(fs.HandlerFilesystem(next), op.Path, false) == nil {
+			f.overlayFor(ctx, fs.HandlerFilesystem(next), op.Path, false) == nil {
 			return next(ctx, op)
 		}
 	}
@@ -132,7 +132,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		// serves LOOKUP of a LocalOnly path from the overlay): without
 		// the claim a re-lookup of an overlay-only file leaks to the
 		// remote and returns ENOENT after the entry TTL.
-		st, claimed, err := f.StatLocal(inner, op.Path)
+		st, claimed, err := f.StatLocal(ctx, inner, op.Path)
 		if err != nil {
 			return fs.Result{}, err
 		}
@@ -141,7 +141,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 
 	case fs.OpReadlink:
-		if o := f.overlayFor(inner, op.Path, false); o != nil {
+		if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {
 			target, err := o.Readlink(op.Path)
 			if err != nil {
 				return fs.Result{}, err
@@ -150,7 +150,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 
 	case fs.OpList:
-		if o := f.overlayFor(inner, op.Path, false); o != nil {
+		if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {
 			entries, err := o.ReadDir(op.Path)
 			if err != nil {
 				return fs.Result{}, err
@@ -164,7 +164,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				childPath := joinDir(op.Path, e.Name())
 				// A child that does not itself route local belongs to the
 				// remote view at its own path and must not be listed here.
-				if !f.classifiesLocal(inner, childPath, info.IsDir()) && f.transientFor(childPath, info.IsDir()) == nil {
+				if !f.classifiesLocal(ctx, inner, childPath, info.IsDir()) && f.transientFor(childPath, info.IsDir()) == nil {
 					continue
 				}
 				out = append(out, fs.Entry{Name: e.Name(), Attr: attrOfLocalInfo(info)})
@@ -173,7 +173,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 
 	case fs.OpCreate:
-		if o := f.overlayFor(inner, op.Path, false); o != nil {
+		if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {
 			// Flags pass through untouched so the caller's access mode and
 			// O_EXCL/O_TRUNC semantics hold on the backing file: a plain
 			// read-only open of a missing file reports ENOENT, it does not
@@ -213,7 +213,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			return fs.Result{Data: buf[:n]}, nil
 		}
 		if op.Handle == nil {
-			if o := f.overlayFor(inner, op.Path, false); o != nil {
+			if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {
 				fh, err := o.OpenFile(op.Path, syscall.O_RDONLY, 0)
 				if err != nil {
 					return fs.Result{}, err
@@ -252,7 +252,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			return fs.Result{}, nil
 		}
 		if op.Handle == nil {
-			if o := f.overlayFor(inner, op.Path, false); o != nil {
+			if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {
 				mode := op.Mode
 				if mode == 0 {
 					// A path-addressed write creates the file when it does
@@ -283,7 +283,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			return fs.Result{}, nil
 		}
 		if op.Handle == nil {
-			if o := f.overlayFor(inner, op.Path, true); o != nil {
+			if o := f.overlayFor(ctx, inner, op.Path, true); o != nil {
 				if err := o.SyncDir(op.Path); err != nil {
 					return fs.Result{}, err
 				}
@@ -299,7 +299,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 
 	case fs.OpMkdir:
-		if o := f.overlayFor(inner, op.Path, true); o != nil {
+		if o := f.overlayFor(ctx, inner, op.Path, true); o != nil {
 			mode := op.Mode & 0o7777
 			if err := o.Mkdir(op.Path, mode); err != nil {
 				return fs.Result{}, err
@@ -308,7 +308,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 
 	case fs.OpSymlink:
-		if o := f.overlayFor(inner, op.Path, false); o != nil {
+		if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {
 			if err := o.Symlink(op.Target, op.Path); err != nil {
 				return fs.Result{}, err
 			}
@@ -316,7 +316,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 
 	case fs.OpUnlink:
-		if o := f.overlayFor(inner, op.Path, false); o != nil {
+		if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {
 			info, err := o.Lstat(op.Path)
 			if err != nil {
 				return fs.Result{}, err
@@ -332,7 +332,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 
 	case fs.OpRmdir:
-		if o := f.overlayFor(inner, op.Path, true); o != nil {
+		if o := f.overlayFor(ctx, inner, op.Path, true); o != nil {
 			info, err := o.Lstat(op.Path)
 			if err != nil {
 				return fs.Result{}, err
@@ -347,14 +347,14 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 
 	case fs.OpSetAttr:
-		if o := f.overlayFor(inner, op.Path, false); o != nil {
+		if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {
 			if !op.Mtime.IsZero() {
 				if err := f.chtimes(o, op.Path, op.Mtime); err != nil {
 					return fs.Result{}, err
 				}
 			}
-			if op.Mode != 0 {
-				if err := o.Chmod(op.Path, op.Mode); err != nil {
+			if op.HasMode {
+				if err := o.Chmod(op.Path, op.Mode&0o7777); err != nil {
 					return fs.Result{}, err
 				}
 			}
@@ -378,8 +378,8 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				dirHint = true
 			}
 		}
-		oldLocal := f.classifiesLocal(inner, op.Path, dirHint)
-		newLocal := f.classifiesLocal(inner, op.Path2, dirHint)
+		oldLocal := f.classifiesLocal(ctx, inner, op.Path, dirHint)
+		newLocal := f.classifiesLocal(ctx, inner, op.Path2, dirHint)
 		if oldLocal || newLocal {
 			if oldLocal != newLocal {
 				return fs.Result{}, syscall.EXDEV
@@ -411,8 +411,8 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		return res, nil
 
 	case fs.OpLink:
-		srcLocal := f.classifiesLocal(inner, op.Path, false)
-		dstLocal := f.classifiesLocal(inner, op.Path2, false)
+		srcLocal := f.classifiesLocal(ctx, inner, op.Path, false)
+		dstLocal := f.classifiesLocal(ctx, inner, op.Path2, false)
 		if srcLocal || dstLocal {
 			if srcLocal != dstLocal {
 				return fs.Result{}, syscall.EXDEV
@@ -430,8 +430,8 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 // routes local is claimed even when nothing exists in the overlay yet —
 // the error (typically ENOENT) is the reply, and a remote copy at the same
 // path stays invisible while the overlay owns it.
-func (f *Localize) StatLocal(inner fs.Filesystem, viewPath string) (st fs.Attr, claimed bool, err error) {
-	o := f.overlayFor(inner, viewPath, false)
+func (f *Localize) StatLocal(ctx context.Context, inner fs.Filesystem, viewPath string) (st fs.Attr, claimed bool, err error) {
+	o := f.overlayFor(ctx, inner, viewPath, false)
 	if o == nil {
 		return fs.Attr{}, false, nil
 	}
@@ -464,12 +464,12 @@ func (f *Localize) ReexecRefusal() (string, int) {
 // classifiesLocal reports whether policy routes viewPath to the overlay.
 // The claim is classification-only (no backing-existence probe). dirHint
 // feeds ignore-rule evaluation only.
-func (f *Localize) classifiesLocal(inner fs.Filesystem, viewPath string, dirHint bool) bool {
+func (f *Localize) classifiesLocal(ctx context.Context, inner fs.Filesystem, viewPath string, dirHint bool) bool {
 	if f.overlay == nil || reservedViewPath(viewPath) || !f.policy.Enabled() {
 		return false
 	}
 	oracle := func(viewPath string, dirHint bool) (bool, bool) {
-		return f.gitIgnoreCheck(inner, viewPath, dirHint)
+		return f.gitIgnoreCheck(ctx, inner, viewPath, dirHint)
 	}
 	if f.policy.Classify(viewPath, oracle, dirHint) == LayerLocalOnly {
 		return true
@@ -495,11 +495,11 @@ func (f *Localize) chtimes(o *Overlay, viewPath string, mtime time.Time) error {
 
 // overlayFor returns the overlay that should serve viewPath: the transient
 // sidecar plane first, then the policy-classified local plane.
-func (f *Localize) overlayFor(inner fs.Filesystem, viewPath string, dirHint bool) *Overlay {
+func (f *Localize) overlayFor(ctx context.Context, inner fs.Filesystem, viewPath string, dirHint bool) *Overlay {
 	if o := f.transientFor(viewPath, dirHint); o != nil {
 		return o
 	}
-	if f.classifiesLocal(inner, viewPath, dirHint) {
+	if f.classifiesLocal(ctx, inner, viewPath, dirHint) {
 		return f.overlay
 	}
 	return nil

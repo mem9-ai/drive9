@@ -60,6 +60,13 @@ func (c *Chain) Handlers() []Handler {
 
 // Dispatch runs op through the chain starting at the outermost handler.
 func (c *Chain) Dispatch(ctx context.Context, op *Op) (Result, error) {
+	// SetAttr mode presence compat: direct chain dispatchers that predate
+	// HasMode set Mode without the flag. A non-zero Mode implies presence;
+	// the facade always sets HasMode explicitly so chmod(000) (Mode == 0)
+	// still distinguishes present-vs-absent.
+	if op.Kind == OpSetAttr && !op.HasMode && op.Mode != 0 {
+		op.HasMode = true
+	}
 	if c == nil {
 		return Result{}, fmt.Errorf("fs: nil chain")
 	}

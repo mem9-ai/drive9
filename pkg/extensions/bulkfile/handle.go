@@ -41,7 +41,7 @@ const bulkfileMaxBufferedBytes = 8 << 20
 func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if op.Mode != 0 {
+	if op.HasMode {
 		mode := op.Mode & 0o777
 		h.mode = mode
 		h.mu.Unlock()

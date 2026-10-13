@@ -653,7 +653,7 @@ func (c *Core) setAttrOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 	}
 	attr := *probe.Attr
 	rp := c.remotePath(op.Path)
-	if op.Mode != 0 {
+	if op.HasMode {
 		mode := op.Mode & 0o7777
 		target := rp
 		if attr.IsDir() {

@@ -167,5 +167,5 @@ func newTestClientFor(t *testing.T, ts *httptest.Server) *client.Client {
 
 // opSetAttr builds a mode-only setattr op.
 func opSetAttr(path string, mode uint32) *fs.Op {
-	return &fs.Op{Kind: fs.OpSetAttr, Path: path, Mode: mode, Size: -1}
+	return &fs.Op{Kind: fs.OpSetAttr, Path: path, Mode: mode, HasMode: true, Size: -1}
 }

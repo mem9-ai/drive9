@@ -165,6 +165,18 @@ func (rc *ReadCache) PutPendingOwned(path string, data []byte) {
 	rc.putUncapped(path, data, 0, false)
 }
 
+// Rename moves a cached image to the new path (a rename does not change
+// content or revision); the old name's entry dies with the name.
+func (rc *ReadCache) Rename(oldPath, newPath string) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if entry, ok := rc.items[oldPath]; ok {
+		delete(rc.items, oldPath)
+		entry.path = newPath
+		rc.items[newPath] = entry
+	}
+}
+
 // Invalidate removes a specific path from the cache.
 func (rc *ReadCache) Invalidate(path string) {
 	rc.mu.Lock()

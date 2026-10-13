@@ -145,7 +145,7 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 
 	case fs.OpSetAttr:
 		h := a.handleFor(op.Path)
-		if op.Mode != 0 {
+		if op.HasMode {
 			// A chmod on a live handle defers to the next successful
 			// commit; handle-less paths pass the mode through the chain.
 			if h != nil {

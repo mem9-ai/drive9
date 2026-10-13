@@ -39,7 +39,7 @@ func TestReservedNamespaceNeverRoutesLocal(t *testing.T) {
 		"/.drive9/git-workspaces/ws-1/overlay/repo/node_modules/x.js",
 		"/.drive9/layers/layer_1/tree/repo/node_modules/y.js",
 	} {
-		if _, claimed, err := f.StatLocal(fs.NewEmptyFilesystem(), p); claimed || err != nil {
+		if _, claimed, err := f.StatLocal(context.Background(), fs.NewEmptyFilesystem(), p); claimed || err != nil {
 			t.Fatalf("StatLocal(%q) = claimed=%v err=%v, want reserved namespace to stay remote", p, claimed, err)
 		}
 	}
@@ -57,14 +57,14 @@ func TestStatLocalPlane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, claimed, err := f.StatLocal(fs.NewEmptyFilesystem(), "/repo/node_modules/x.js")
+	st, claimed, err := f.StatLocal(context.Background(), fs.NewEmptyFilesystem(), "/repo/node_modules/x.js")
 	if err != nil || !claimed {
 		t.Fatalf("StatLocal = (%v, %v, %v)", st, claimed, err)
 	}
 	if st.Size != 7 {
 		t.Fatalf("size = %d", st.Size)
 	}
-	_, claimed, _ = f.StatLocal(fs.NewEmptyFilesystem(), "/repo/plain.go")
+	_, claimed, _ = f.StatLocal(context.Background(), fs.NewEmptyFilesystem(), "/repo/plain.go")
 	if claimed {
 		t.Fatal("unclaimed path must pass")
 	}

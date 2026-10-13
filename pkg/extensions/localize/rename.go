@@ -18,7 +18,7 @@ import (
 // following symlinks so nothing outside the backing tree can redirect the
 // cleanup, and directory-relative removal refuses a directory that acquired
 // a concurrent child.
-func (f *Localize) pruneBackingDirs(inner fs.Filesystem, viewPath string) error {
+func (f *Localize) pruneBackingDirs(ctx context.Context, inner fs.Filesystem, viewPath string) error {
 	abs, err := f.overlay.abs(viewPath)
 	if err != nil {
 		return err
@@ -58,7 +58,7 @@ func (f *Localize) pruneBackingDirs(inner fs.Filesystem, viewPath string) error 
 			childPath := joinDir(parentPath, name)
 			// Real local-classified content (or a live sidecar) refuses the
 			// replacement; only remote-classified scaffolding is removable.
-			if f.classifiesLocal(inner, childPath, true) || f.transientFor(childPath, true) != nil {
+			if f.classifiesLocal(ctx, inner, childPath, true) || f.transientFor(childPath, true) != nil {
 				return syscall.ENOTEMPTY
 			}
 			childFD, err := unix.Openat(int(parent.Fd()), name, flags, 0)
@@ -110,7 +110,7 @@ func (f *Localize) pruneRenameDestParents(ctx context.Context, inner fs.Filesyst
 	if st, err := inner.GetAttr(ctx, newP); err == nil && st.Kind != fs.KindDir {
 		return nil
 	}
-	if err := f.pruneBackingDirs(inner, newP); err != nil {
+	if err := f.pruneBackingDirs(ctx, inner, newP); err != nil {
 		if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
 			return syscall.ENOTEMPTY
 		}

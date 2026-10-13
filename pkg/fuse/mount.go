@@ -215,8 +215,12 @@ func parseExtensionOrder(list []string) ([]string, error) {
 	if len(out) == 0 {
 		return defaultExtensionOrder, nil
 	}
-	if !seen["core"] {
-		return nil, fmt.Errorf("fuse: --extensions must include core (the chain terminal)")
+	// Reverse assembly requires core as the FIRST build-up entry so it
+	// becomes the terminal handler; a list like "cache,core" assembles
+	// [core, cache] and core never calls next — the cache is silently
+	// unreachable.
+	if out[0] != "core" {
+		return nil, fmt.Errorf("fuse: --extensions must start with core (the chain terminal), got %q first", out[0])
 	}
 	return out, nil
 }
@@ -518,6 +522,13 @@ func MountWithConfig(cfg MountConfig) error {
 	// supervisor's retry ladder.
 	if err := validateRemoteRoot(context.Background(), cl, remoteRoot); err != nil {
 		return err
+	}
+	// A checkpoint without a layer is meaningless (the layer plane carries
+	// the checkpoint view) and previously passed silently: the layer
+	// extension was skipped, the checkpoint ignored, and an ordinary
+	// writable filesystem mounted instead.
+	if strings.TrimSpace(cfg.CheckpointRef) != "" && strings.TrimSpace(cfg.LayerRef) == "" {
+		return fmt.Errorf("fuse: checkpoint %q requires --layer (the layer plane owns the checkpoint view)", cfg.CheckpointRef)
 	}
 
 	extOrder, err := parseExtensionOrder(cfg.Extensions)
@@ -1147,11 +1158,8 @@ func MountWithConfig(cfg MountConfig) error {
 		}()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		fmt.Fprintf(os.Stderr, "DBG-CKPT sig-flush-begin\n")
 		_ = f.flushOpenHandles(shutdownCtx)
-		fmt.Fprintf(os.Stderr, "DBG-CKPT sig-flush-end\n")
 		_ = f.chain.Drain(shutdownCtx)
-		fmt.Fprintf(os.Stderr, "DBG-CKPT sig-drain-end\n")
 		for attempt := 0; attempt < 5; attempt++ {
 			if err := server.Unmount(); err == nil {
 				return
@@ -1161,7 +1169,30 @@ func MountWithConfig(cfg MountConfig) error {
 		ForceUnmount(cfg.MountPoint)
 	}()
 	<-serveDone
+	// Classify the serve end: a clean unmount completed the OnUnmount
+	// handshake (or our signal handler already detached the kernel mount);
+	// anything else is an abnormal /dev/fuse disconnect that the
+	// supervisor's ExitServeAbnormal recovery exists for. Reporting it as
+	// success suppressed restarts.
+	if !f.unmounted.Load() && !unmountedKernel(cfg.MountPoint) {
+		return ExitServeAbnormalErr(fmt.Sprintf("serve loop ended at %s without a clean unmount", cfg.MountPoint))
+	}
 	return nil
+}
+
+// unmountedKernel reports whether the mountpoint is no longer a FUSE mount.
+func unmountedKernel(mountPoint string) bool {
+	mnts, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		// Non-Linux or unreadable: fall back to the handshake flag only.
+		return true
+	}
+	for _, line := range strings.Split(string(mnts), "\n") {
+		if strings.Contains(line, " "+mountPoint+" ") && strings.Contains(line, "fuse") {
+			return false
+		}
+	}
+	return true
 }
 
 // validateRemoteRoot ports v1's startup preflight: the remote source must

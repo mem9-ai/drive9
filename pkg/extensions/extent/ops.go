@@ -345,7 +345,7 @@ func (e *Extent) setAttrViaVFS(ctx context.Context, op *fs.Op, ino uint64) (fs.R
 	mode, uid, gid := uint32(0), uint32(0), uint32(0)
 	atime, mtime := int64(0), int64(0)
 	atimens, mtimens := uint32(0), uint32(0)
-	if op.Mode != 0 {
+	if op.HasMode {
 		set |= int(gofuse.FATTR_MODE)
 		mode = op.Mode & 0o7777
 	}

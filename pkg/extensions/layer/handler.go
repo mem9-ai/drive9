@@ -267,7 +267,7 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			return fs.Result{}, syscall.EROFS
 		}
 		if h := l.handleFor(op.Path); h != nil {
-			if op.Mode != 0 {
+			if op.HasMode {
 				h.SetMode(op.Mode)
 			}
 			if op.Size >= 0 {
@@ -278,7 +278,7 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			attr := h.Attr()
 			return fs.Result{Attr: &attr}, nil
 		}
-		if op.Mode != 0 {
+		if op.HasMode {
 			kind, _, _, _, ok := l.lookup(op.Path)
 			if ok && kind == "file" {
 				// v1: a chmod of a path this layer already upserted
@@ -353,12 +353,23 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 					kept = op.Size
 				}
 				content := []byte(nil)
-				if kept > 0 && kept <= l.inlineMax() {
-					if data, rerr := l.fetchBaseRange(ctx, op.Path, 0, kept); rerr == nil {
-						content = data
+				var lazyBase baseRangeReader
+				if kept > 0 {
+					if kept <= l.inlineMax() {
+						if data, rerr := l.fetchBaseRange(ctx, op.Path, 0, kept); rerr == nil {
+							content = data
+						}
+					} else {
+						// Above the inline limit the retained prefix
+						// streams from the base object — a nil content
+						// here zero-filled the first kept bytes (review).
+						rp := l.remotePath(op.Path)
+						lazyBase = func(bctx context.Context, off, length int64) (io.Reader, error) {
+							return l.cl.ReadStreamRange(bctx, rp, off, length)
+						}
 					}
 				}
-				if err := l.truncateFile(ctx, op.Path, content, op.Size, mode); err != nil {
+				if err := l.truncateFileWithBase(ctx, op.Path, content, op.Size, mode, lazyBase); err != nil {
 					return fs.Result{}, err
 				}
 			}

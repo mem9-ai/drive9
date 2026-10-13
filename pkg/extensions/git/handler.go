@@ -315,7 +315,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 
 	case fs.OpSetAttr:
 		if h := g.handleFor(op.Path); h != nil {
-			if op.Mode != 0 {
+			if op.HasMode {
 				h.SetMode(op.Mode)
 			}
 			if op.Size >= 0 {
@@ -326,7 +326,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 			attr := h.Attr()
 			return fs.Result{Attr: &attr}, nil
 		}
-		if op.Mode != 0 {
+		if op.HasMode {
 			if e, hit := w.lookup(rel); hit && e.Op == "upsert" {
 				e.Mode = fmt.Sprintf("%o", 0o100000|op.Mode&0o777)
 				if err := g.putOverlay(ctx, w, rel, e); err != nil {

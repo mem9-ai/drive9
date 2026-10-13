@@ -241,16 +241,20 @@ type Op struct {
 	Rev    int64  // compare-and-set base revision for writes; -1 = unconditional
 
 	// Kind-dependent payloads: which fields apply depends on OpKind.
-	Offset int64     // read/write/fallocate start offset
-	Limit  int64     // read length limit
-	Size   int64     // setattr size or allocation size
-	Mode   uint32    // create/setattr mode
-	Flags  uint32    // OpenFlags for OpCreate
-	Target string    // symlink target
-	Rdev   uint32    // mknod device number (specials carry it in their records)
-	Path2  string    // destination path (rename/link/copy_file_range)
-	Data   []byte    // write payload or xattr value
-	Mtime  time.Time // setattr modification time
+	Offset int64  // read/write/fallocate start offset
+	Limit  int64  // read length limit
+	Size   int64  // setattr size or allocation size
+	Mode   uint32 // create/setattr mode
+	// HasMode distinguishes a chmod(000) — Mode == 0 with HasMode true —
+	// from an absent mode on OpSetAttr. Create paths always set it. Zero
+	// as a sentinel silently skipped the permission revocation.
+	HasMode bool
+	Flags   uint32    // OpenFlags for OpCreate
+	Target  string    // symlink target
+	Rdev    uint32    // mknod device number (specials carry it in their records)
+	Path2   string    // destination path (rename/link/copy_file_range)
+	Data    []byte    // write payload or xattr value
+	Mtime   time.Time // setattr modification time
 	// Setattr owner change (v1 chown): pointer semantics — nil/absent
 	// means "do not change"; &^uint32(0) is the kernel's preserve sentinel,
 	// normalized away by the facade before dispatch.

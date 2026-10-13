@@ -150,7 +150,19 @@ func (l *Layer) whiteoutPath(ctx context.Context, path, kind string) error {
 // applyLayerLargeTruncate + remote_upload.truncateReaderAt): only the kept
 // prefix is read, and the zero extension is synthesized by the reader — a
 // multi-gigabyte truncate never materializes in memory.
+// baseRangeReader lazily serves the retained base prefix of a large
+// truncation: the kept bytes stream from the base object instead of being
+// zero-filled (a nil kept-prefix above the inline limit corrupted the
+// visible prefix with zeros — review).
+type baseRangeReader func(ctx context.Context, off, length int64) (io.Reader, error)
+
 func (l *Layer) truncateFile(ctx context.Context, path string, content []byte, newSize int64, mode uint32) error {
+	return l.truncateFileWithBase(ctx, path, content, newSize, mode, nil)
+}
+
+// truncateFileWithBase is truncateFile with a lazy reader for the retained
+// base prefix, used when the kept range exceeds the inline limit.
+func (l *Layer) truncateFileWithBase(ctx context.Context, path string, content []byte, newSize int64, mode uint32, base baseRangeReader) error {
 	unlock := l.mutLocks.lock(path)
 	defer unlock()
 	kept := content
@@ -166,7 +178,13 @@ func (l *Layer) truncateFile(ctx context.Context, path string, content []byte, n
 		copy(img, kept)
 		return l.upsertFileLocked(ctx, path, img, 0, m)
 	}
-	if _, err := l.cl.UploadFSLayerFile(ctx, l.layerRef, l.remotePath(path), &truncateReaderAt{kept: kept, size: newSize}, newSize, 0, m, true); err != nil {
+	// Above the inline limit the retained prefix must stream: inline bytes
+	// first, then the base object's range, zeros only for the extension.
+	keptLen := int64(len(kept))
+	if base != nil && kept == nil {
+		keptLen = newSize // retain the whole requested size from the base
+	}
+	if _, err := l.cl.UploadFSLayerFile(ctx, l.layerRef, l.remotePath(path), &truncateReaderAt{kept: kept, keptLen: keptLen, size: newSize, base: base, ctx: ctx}, newSize, 0, m, true); err != nil {
 		return err
 	}
 	l.mu.Lock()
@@ -183,9 +201,12 @@ func (l *Layer) truncateFile(ctx context.Context, path string, content []byte, n
 // truncateReaderAt serves a truncated image without materializing the
 // zero extension (ports v1 remoteTruncateReaderAt).
 type truncateReaderAt struct {
-	kept []byte
-	size int64
-	pos  int64
+	kept    []byte
+	keptLen int64 // logical length of the retained prefix (kept bytes + streamed base)
+	size    int64
+	pos     int64
+	base    baseRangeReader
+	ctx     context.Context
 }
 
 func (r *truncateReaderAt) Read(p []byte) (int, error) {
@@ -196,12 +217,33 @@ func (r *truncateReaderAt) Read(p []byte) (int, error) {
 	if r.pos+int64(n) > r.size {
 		n = int(r.size - r.pos)
 	}
-	fromCopy := int64(0)
+	kept := int64(0)
 	if r.pos < int64(len(r.kept)) {
-		fromCopy = int64(copy(p[:n], r.kept[r.pos:]))
+		kept = int64(copy(p[:n], r.kept[r.pos:]))
 	}
-	// bytes beyond the kept prefix read as zeros
-	for i := int(fromCopy); i < n; i++ {
+	// The remainder of the retained prefix streams from the base object;
+	// only bytes beyond the prefix read as zeros (the extension).
+	if kept < int64(n) && r.base != nil && r.pos+kept < r.keptLen {
+		want := int64(n) - kept
+		if end := r.keptLen - (r.pos + kept); want > end {
+			want = end
+		}
+		if want > 0 {
+			rc, err := r.base(r.ctx, r.pos+kept, want)
+			if err != nil {
+				return int(kept), err
+			}
+			m, rerr := io.ReadFull(rc, p[kept:kept+want])
+			if c, ok := rc.(io.Closer); ok {
+				_ = c.Close()
+			}
+			if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+				return int(kept) + m, rerr
+			}
+			kept += int64(m)
+		}
+	}
+	for i := kept; i < int64(n); i++ {
 		p[i] = 0
 	}
 	r.pos += int64(n)

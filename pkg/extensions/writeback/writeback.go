@@ -278,6 +278,21 @@ func New(opts Options) (*Writeback, error) {
 	w := &Writeback{opts: opts, root: root, preload: preload, interactive: opts.SyncMode == "interactive",
 		perfShim: &fusePerfCounters{}}
 	w.perfShim.enabled.Store(true)
+	// A view checkout (layer restore/switch, SSE reset) retargets the base:
+	// open handles with CLEAN buffers would keep serving the abandoned
+	// view's bytes forever. Drop clean buffers so the next read reloads
+	// from the new base; DIRTY buffers keep their local writes (they are
+	// this mount's own acknowledged data and still commit) — review.
+	if opts.Events != nil {
+		opts.Events.On(fs.EventCheckout, func(e fs.Event) {
+			w.liveSet.Range(func(_, v any) bool {
+				if h, ok := v.(*bufferingHandle); ok {
+					h.checkoutDropCleanBuffer()
+				}
+				return true
+			})
+		})
+	}
 	// FlushDebounce semantics: 0 disables, negative means unset (2s
 	// default — the CLI's default -1 must land on the default, not on 0).
 	debounce := opts.FlushDebounce
@@ -1144,7 +1159,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		return res, nil
 
 	case fs.OpSetAttr:
-		if op.Mode != 0 {
+		if op.HasMode {
 			// A chmod on a dirty path is deferred to the handle's commit
 			// boundary (pendingMode); clean paths apply immediately. The
 			// deferral must answer with the REQUESTED mode (v1 settles
@@ -1835,6 +1850,20 @@ func readShadowGenerationFenced(shadows *staging.ShadowStore, path string, size 
 // revision as their CAS base (v1 cleared fh.IsNew at every commit settle
 // — a stale isNew staged a create-CAS against the just-landed name and
 // the rewrite conflicted forever).
+// checkoutDropCleanBuffer retires a CLEAN buffered image at a view
+// checkout: the buffer was only a read cache of the abandoned base, and
+// serving it forever would hide the new view's bytes. A dirty buffer (or a
+// pending local truncation) is this mount's own data and survives; the
+// next read reloads from the new base through the terminal.
+func (h *bufferingHandle) checkoutDropCleanBuffer() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.unlinked || h.dirty || h.pendingImage != nil {
+		return
+	}
+	h.buf = nil
+}
+
 func (h *bufferingHandle) markLanded(rev int64) {
 	h.mu.Lock()
 	h.landed = true

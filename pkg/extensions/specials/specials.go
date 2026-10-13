@@ -127,7 +127,7 @@ func (s *Specials) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			return fs.Result{}, syscall.EINVAL
 		}
 		s.mu.Lock()
-		if op.Mode != 0 {
+		if op.HasMode {
 			// Keep the full 0o7777 range: sticky/setgid survive chmods on
 			// special nodes (chmod/11 expects 01621 on a fifo).
 			node.mode = node.mode&syscall.S_IFMT | op.Mode&0o7777
@@ -181,11 +181,21 @@ func (s *Specials) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			// squatting on the TARGET must still die: POSIX rename replaces
 			// the target, and next() here skips this handler, reaching the
 			// terminal's delete directly.
+			// Preflight and remote-delete the TARGET before committing the
+			// local move: a remote directory at the destination cannot be
+			// replaced by a special (EISDIR per POSIX), and a failed
+			// remote deletion must abort the rename instead of leaving
+			// the old target hidden underneath the moved special record.
+			if st, serr := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path2}); serr == nil && st.Attr != nil && st.Attr.IsDir() {
+				return fs.Result{}, syscall.EISDIR
+			}
+			if _, derr := next(ctx, &fs.Op{Kind: fs.OpUnlink, Path: op.Path2}); derr != nil && !fs.IsNotFound(derr) {
+				return fs.Result{}, derr
+			}
 			if _, ok := s.get(op.Path2); ok {
 				s.drop(op.Path2)
 			}
 			s.renameSubtree(op.Path, op.Path2)
-			_, _ = next(ctx, &fs.Op{Kind: fs.OpUnlink, Path: op.Path2})
 			return s.attrResult(op.Path2)
 		}
 		// The rename replaces whatever the target was: a special record

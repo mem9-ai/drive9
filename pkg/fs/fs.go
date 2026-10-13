@@ -79,7 +79,7 @@ func (f HandlerFilesystem) GetAttr(ctx context.Context, path string) (Attr, erro
 func (f HandlerFilesystem) SetAttr(ctx context.Context, path string, p AttrPatch) error {
 	op := &Op{Kind: OpSetAttr, Path: path, Size: -1}
 	if p.Mode != nil {
-		op.Mode = *p.Mode
+		op.Mode, op.HasMode = *p.Mode, true
 	}
 	if p.Size != nil {
 		op.Size = *p.Size

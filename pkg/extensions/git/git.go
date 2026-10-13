@@ -8,6 +8,7 @@ package git
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -65,8 +66,12 @@ type workspace struct {
 	overlay    map[string]overlayEntry // rel path (no leading slash) → entry
 	tree       map[string]client.GitTreeNode
 	treeLoaded string // head commit the tree was loaded for
-	// stateRestore gates the lazy local .git restore to one attempt.
-	stateRestore sync.Once
+	// stateRestore gates the lazy local .git restore: an attempt that
+	// actually restored (or found a usable .git) latches; a checkpoint
+	// that is simply not uploaded yet (discovery racing the CLI) or a
+	// transient failure retries on the next entry point (review).
+	stateRestore   sync.Once
+	restoreLatched bool
 }
 
 // noteTreeSize records a blob size learned by materializing it (v1
@@ -81,7 +86,11 @@ func (w *workspace) noteTreeSize(rel string, size int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if n, ok := w.tree[rel]; ok && n.SizeBytes < 0 {
+		// map values are copies: write the updated node back or every
+		// lookup re-resolves via cat-file and a later failure re-exposes
+		// the placeholder (review).
 		n.SizeBytes = size
+		w.tree[rel] = n
 	}
 }
 
@@ -374,11 +383,23 @@ func (g *Git) ensureWorkspaceState(ctx context.Context, w *workspace) error {
 	if g.localRoot == "" {
 		return nil
 	}
+	w.mu.Lock()
+	latched := w.restoreLatched
+	w.mu.Unlock()
+	if latched {
+		return nil
+	}
 	w.stateRestore.Do(func() {
 		rctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceHydrateTimeout)
 		defer cancel()
 		if err := g.restoreWorkspaceState(rctx, w); err != nil {
-			fmt.Fprintf(os.Stderr, "drive9: git state restore failed for workspace %s: %v\n", w.id, err)
+			// Not latched: a transient failure (or a checkpoint the CLI
+			// has not uploaded yet — discovery races the upload) retries
+			// at the next entry point (review). A not-yet-uploaded
+			// checkpoint is quiet; real failures surface for diagnosis.
+			if !errors.Is(err, errGitStateNotReady) {
+				fmt.Fprintf(os.Stderr, "drive9: git state restore failed for workspace %s: %v\n", w.id, err)
+			}
 			return
 		}
 		if w.blobless() {
@@ -388,6 +409,9 @@ func (g *Git) ensureWorkspaceState(ctx context.Context, w *workspace) error {
 				fmt.Fprintf(os.Stderr, "drive9: git head tree materialize failed for workspace %s: %v\n", w.id, err)
 			}
 		}
+		w.mu.Lock()
+		w.restoreLatched = true
+		w.mu.Unlock()
 	})
 	return nil
 }
