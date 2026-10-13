@@ -8,15 +8,10 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/layerfs"
 )
-
-// cliLayerInlineMax bounds the whole-image upload path; larger files
-// stream as multipart uploads.
-const cliLayerInlineMax = 8 << 20
 
 // resolveLayerRoots resolves a layer ref to its marker roots.
 func resolveLayerRoots(ctx context.Context, c *client.Client, layerRef string) (layerfs.Roots, error) {
@@ -43,8 +38,23 @@ func layerBaseAnchor(ctx context.Context, c *client.Client, remotePath string) (
 	return stat.Revision, true, nil
 }
 
-// stampCas writes the commit-CAS marker before content materializes.
+// stampCas writes the commit-CAS marker before content materializes —
+// but only when none exists: the anchor records the base revision the
+// layer's content was FIRST derived from, and re-stamping on later
+// rewrites would bless base revisions the layer never saw.
 func stampCas(ctx context.Context, c *client.Client, roots layerfs.Roots, remotePath string, baseRev int64, hasBase bool) error {
+	marker := layerfs.MarkerPath(roots.Cas, remotePath)
+	if _, err := c.StatCtx(ctx, marker); err == nil {
+		return nil // keep the original derivation anchor
+	} else if !client.IsNotFound(err) {
+		return err
+	}
+	return c.WriteCtx(ctx, marker, layerfs.EncodeCas(baseRev, hasBase))
+}
+
+// restampCas overwrites the anchor for a rename destination: the moved
+// content's derivation base is the destination's base, not the source's.
+func restampCas(ctx context.Context, c *client.Client, roots layerfs.Roots, remotePath string, baseRev int64, hasBase bool) error {
 	return c.WriteCtx(ctx, layerfs.MarkerPath(roots.Cas, remotePath), layerfs.EncodeCas(baseRev, hasBase))
 }
 
@@ -76,10 +86,20 @@ func uploadBytesToLayer(ctx context.Context, c *client.Client, layerRef, remoteP
 	return uploadReaderToLayer(ctx, c, layerRef, remotePath, bytes.NewReader(data), int64(len(data)), mode, hasMode)
 }
 
+// seekableReader is both a sequential reader and a random-access source:
+// the small-file path streams via Read, the multipart path slices via
+// ReadAt.
+type seekableReader interface {
+	io.Reader
+	io.ReaderAt
+}
+
 // uploadReaderToLayer lands file content in the layer's tree through the
-// ordinary write pipeline: CAS marker first, content second, stale
-// blackouts cleared last.
-func uploadReaderToLayer(ctx context.Context, c *client.Client, layerRef, remotePath string, r io.Reader, size int64, mode uint32, hasMode bool) error {
+// client's negotiated upload path (simple PUT below the server threshold,
+// V2 multipart with adaptive part sizes and checksums above it): CAS
+// marker first, content second, stale blackouts cleared last. The source
+// must be seekable for the multipart path.
+func uploadReaderToLayer(ctx context.Context, c *client.Client, layerRef, remotePath string, r seekableReader, size int64, mode uint32, hasMode bool) error {
 	roots, err := resolveLayerRoots(ctx, c, layerRef)
 	if err != nil {
 		return err
@@ -92,15 +112,7 @@ func uploadReaderToLayer(ctx context.Context, c *client.Client, layerRef, remote
 		return err
 	}
 	dst := layerfs.MarkerPath(roots.Tree, remotePath)
-	if size <= cliLayerInlineMax {
-		data, rerr := io.ReadAll(r)
-		if rerr != nil {
-			return fmt.Errorf("read layer upload: %w", rerr)
-		}
-		if werr := c.WriteCtx(ctx, dst, data); werr != nil {
-			return werr
-		}
-	} else if werr := streamToRemote(ctx, c, dst, r, size); werr != nil {
+	if werr := c.WriteStream(ctx, dst, io.NewSectionReader(r, 0, size), size, nil); werr != nil {
 		return werr
 	}
 	if hasMode && mode&0o777 != 0 && mode&0o777 != 0o644 {
@@ -109,47 +121,6 @@ func uploadReaderToLayer(ctx context.Context, c *client.Client, layerRef, remote
 		}
 	}
 	return clearBlackout(ctx, c, roots, remotePath)
-}
-
-// streamToRemote pumps a reader into a remote path as a multipart upload.
-func streamToRemote(ctx context.Context, c *client.Client, dst string, r io.Reader, size int64) error {
-	sw := c.NewStreamWriter(ctx, dst, size)
-	part := 0
-	var last []byte
-	buf := make([]byte, 4<<20)
-	for {
-		n, rerr := r.Read(buf)
-		if n > 0 {
-			part++
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			if last != nil {
-				if werr := sw.WritePart(ctx, part-1, last); werr != nil {
-					abortStream(sw)
-					return werr
-				}
-			}
-			last = chunk
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			abortStream(sw)
-			return rerr
-		}
-	}
-	if part == 0 {
-		abortStream(sw)
-		return fmt.Errorf("layer upload %s: stream ended with no parts", dst)
-	}
-	return sw.Complete(ctx, part, last)
-}
-
-func abortStream(sw *client.StreamWriter) {
-	abortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	_ = sw.Abort(abortCtx)
-	cancel()
 }
 
 func mkdirLayerPath(ctx context.Context, c *client.Client, layerRef, remotePath string, mode uint32) error {
@@ -304,12 +275,17 @@ func renameLayerPath(ctx context.Context, c *client.Client, layerRef, oldPath, n
 	if err := clearBlackout(ctx, c, roots, newPath); err != nil {
 		return err
 	}
-	if content, rerr := c.ReadCtx(ctx, layerfs.MarkerPath(roots.Cas, oldPath)); rerr == nil {
-		if werr := c.WriteCtx(ctx, layerfs.MarkerPath(roots.Cas, newPath), content); werr != nil {
-			return werr
-		}
-		_ = c.DeleteFileCtx(ctx, layerfs.MarkerPath(roots.Cas, oldPath))
+	// The moved content derives from the destination's base: restamp a
+	// destination-specific anchor (the source's anchor described the
+	// source lineage and must not leak onto the destination).
+	baseQ, hasQ, err := layerBaseAnchor(ctx, c, newPath)
+	if err != nil {
+		return err
 	}
+	if err := restampCas(ctx, c, roots, newPath, baseQ, hasQ); err != nil {
+		return err
+	}
+	_ = c.DeleteFileCtx(ctx, layerfs.MarkerPath(roots.Cas, oldPath))
 	return nil
 }
 

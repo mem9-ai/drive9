@@ -179,7 +179,13 @@ func (l *Layer) copyClassicDir(ctx context.Context, v *view, next fs.Next, srcP,
 		if res, err := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: treeDir}); err == nil && res.Attr != nil && res.Attr.IsDir() {
 			return nil
 		}
+		if err := l.io.EnsureParent(ctx, pathutil.ParentPath(treeDir)); err != nil {
+			return err
+		}
 		_, err := next(ctx, &fs.Op{Kind: fs.OpMkdir, Path: treeDir, Mode: mode})
+		if err != nil && fs.IsNotFound(err) {
+			err = nil
+		}
 		return err
 	}
 	var copy func(dir string) error
@@ -207,7 +213,8 @@ func (l *Layer) copyClassicDir(ctx context.Context, v *view, next fs.Next, srcP,
 				}
 				continue
 			}
-			if err := l.pumpClassic(ctx, v, next, child, child, &e.Attr); err != nil {
+			dstChild := dstP + child[len(srcP):]
+			if err := l.pumpClassic(ctx, v, next, child, dstChild, &e.Attr); err != nil {
 				return err
 			}
 			v.idx.put(child, &indexEntry{kind: ekTree, mode: e.Attr.Mode & 0o777})
@@ -250,6 +257,11 @@ func (l *Layer) unlinkOp(ctx context.Context, v *view, p string, isDir bool, nex
 	attr, err := l.statClassic(ctx, next, p)
 	if err != nil {
 		return fs.Result{}, err
+	}
+	if attr == nil && res == resClassic {
+		// Nothing in the view: unlink/rmdir of a missing path is ENOENT,
+		// not a fresh blackout.
+		return fs.Result{}, fs.ErrNotFound
 	}
 	info := blackoutInfo{isDir: isDir}
 	if attr != nil {
@@ -321,10 +333,8 @@ func (l *Layer) renameOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) 
 	}
 	// File or symlink: the destination's classic anchor is stamped fresh
 	// (an existing view entry at q is simply shadowed over).
-	unlockOld := l.mutLocks.lock(p)
-	unlockNew := l.mutLocks.lock(q)
-	defer unlockNew()
-	defer unlockOld()
+	unlockPair := l.mutLocks.lockPair(p, q)
+	defer unlockPair()
 	baseQ, hasQ, err := l.classicBase(ctx, v, next, q)
 	if err != nil {
 		return fs.Result{}, err
@@ -360,10 +370,8 @@ func (l *Layer) renameOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) 
 // the tree path, plus bookkeeping).
 func (l *Layer) renameTreeEntry(ctx context.Context, v *view, op *fs.Op, next fs.Next, isDir bool) (fs.Result, error) {
 	p, q := op.Path, op.Path2
-	unlockOld := l.mutLocks.lock(p)
-	unlockNew := l.mutLocks.lock(q)
-	defer unlockNew()
-	defer unlockOld()
+	unlockPair := l.mutLocks.lockPair(p, q)
+	defer unlockPair()
 	baseQ, hasQ, err := l.classicBase(ctx, v, next, q)
 	if err != nil {
 		return fs.Result{}, err
@@ -432,14 +440,14 @@ func (l *Layer) finishRename(ctx context.Context, v *view, next fs.Next, p, q st
 // blackouts the origin.
 func (l *Layer) renameClassicDir(ctx context.Context, v *view, op *fs.Op, next fs.Next, st *fs.Attr) (fs.Result, error) {
 	p, q := op.Path, op.Path2
-	unlockOld := l.mutLocks.lock(p)
-	unlockNew := l.mutLocks.lock(q)
-	defer unlockNew()
-	defer unlockOld()
+	unlockPair := l.mutLocks.lockPair(p, q)
+	defer unlockPair()
 	if err := l.copyClassicDir(ctx, v, next, p, q); err != nil {
 		return fs.Result{}, err
 	}
-	v.idx.removePrefix(p)
+	// copyClassicDir indexed the copied children under their source paths;
+	// remap them below the destination before the blackout lands.
+	v.idx.remapPrefix(p, q)
 	v.idx.put(q, &indexEntry{kind: ekTree, isDir: true, mode: st.Mode & 0o777})
 	if err := l.finishRename(ctx, v, next, p, q, 0, false, true); err != nil {
 		return fs.Result{}, err
@@ -454,10 +462,8 @@ func (l *Layer) linkOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) (f
 	if resP == resBlackout {
 		return fs.Result{}, fs.ErrNotFound
 	}
-	unlockOld := l.mutLocks.lock(p)
-	unlockNew := l.mutLocks.lock(q)
-	defer unlockNew()
-	defer unlockOld()
+	unlockPair := l.mutLocks.lockPair(p, q)
+	defer unlockPair()
 	if resP != resTree {
 		attr, err := l.statClassic(ctx, next, p)
 		if err != nil {
@@ -509,18 +515,16 @@ func (l *Layer) setAttrOp(ctx context.Context, v *view, op *fs.Op, next fs.Next)
 		rop := *op
 		rop.Path = v.treePathOf(l.serverAbs(p))
 		rres, rerr := next(ctx, &rop)
-		if rerr == nil && op.Mode != 0 {
-			v.idx.put(p, &indexEntry{kind: ekTree, isDir: e.isDir, mode: op.Mode & 0o777})
+		if rerr == nil && (op.HasMode || op.Mode != 0) {
+			v.idx.put(p, &indexEntry{kind: ekTree, isDir: e.isDir, isSymlink: e.isSymlink, mode: op.Mode & 0o777})
 		}
 		return rres, rerr
 	case resAttrs:
 		if op.Size < 0 {
 			patch := e.patch
-			if op.Mode != 0 {
+			if op.HasMode || op.Mode != 0 {
 				patch.Mode = op.Mode & 0o7777
-			}
-			if !op.Mtime.IsZero() {
-				patch.Mtime = op.Mtime.Unix()
+				patch.ModeSet = true
 			}
 			if err := writeAttrsMarker(ctx, l.io, v, l.serverAbs(p), patch); err != nil {
 				return fs.Result{}, err
@@ -538,6 +542,11 @@ func (l *Layer) setAttrOp(ctx context.Context, v *view, op *fs.Op, next fs.Next)
 		if err := l.materializeClassic(ctx, v, next, p, attr, op.Size == 0); err != nil {
 			return fs.Result{}, err
 		}
+		if op.Size == 0 {
+			if err := l.ensureTreeFile(ctx, v, next, p, attr); err != nil {
+				return fs.Result{}, err
+			}
+		}
 		if err := l.removeAttrsMarker(ctx, v, p); err != nil {
 			return fs.Result{}, err
 		}
@@ -547,10 +556,11 @@ func (l *Layer) setAttrOp(ctx context.Context, v *view, op *fs.Op, next fs.Next)
 		return next(ctx, &rop)
 	}
 	// Classic base.
-	if op.Size < 0 && (op.Mode != 0 || !op.Mtime.IsZero()) {
+	if op.Size < 0 && (op.HasMode || op.Mode != 0 || !op.Mtime.IsZero() || op.HasSetUID || op.HasSetGID) {
 		patch := attrsPatch{}
-		if op.Mode != 0 {
+		if op.HasMode || op.Mode != 0 {
 			patch.Mode = op.Mode & 0o7777
+			patch.ModeSet = true
 		}
 		if !op.Mtime.IsZero() {
 			patch.Mtime = op.Mtime.Unix()
@@ -576,12 +586,49 @@ func (l *Layer) setAttrOp(ctx context.Context, v *view, op *fs.Op, next fs.Next)
 		if err := l.materializeClassic(ctx, v, next, p, attr, op.Size == 0); err != nil {
 			return fs.Result{}, err
 		}
+		if op.Size == 0 {
+			if err := l.ensureTreeFile(ctx, v, next, p, attr); err != nil {
+				return fs.Result{}, err
+			}
+		}
 		v.idx.put(p, &indexEntry{kind: ekTree, mode: attr.Mode & 0o777})
 		rop := *op
 		rop.Path = v.treePathOf(l.serverAbs(p))
 		return next(ctx, &rop)
 	}
-	return next(ctx, op)
+	// Owner-only changes are mount-local at the facade; nothing lands here.
+	return fs.Result{}, fs.ErrUnsupported
+}
+
+// ensureTreeFile materializes an empty tree shadow for a zero-length
+// truncate: materializeClassic skips the pump when the content is
+// discarded, but a SetAttr still needs a tree file to truncate.
+func (l *Layer) ensureTreeFile(ctx context.Context, v *view, next fs.Next, p string, attr *fs.Attr) error {
+	treePath := v.treePathOf(l.serverAbs(p))
+	if res, err := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: treePath}); err == nil && res.Attr != nil {
+		return nil
+	} else if !fs.IsNotFound(err) {
+		return err
+	}
+	mode := uint32(0o644)
+	if attr != nil && attr.Mode&0o777 != 0 {
+		mode = attr.Mode & 0o777
+	}
+	if err := l.io.EnsureParent(ctx, parentTreeDir(v, l.serverAbs(p))); err != nil {
+		return err
+	}
+	res, err := next(ctx, &fs.Op{Kind: fs.OpCreate, Path: treePath, Flags: uint32(syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC), Mode: mode})
+	if err != nil {
+		return err
+	}
+	if h := res.Handle; h != nil {
+		if err := h.Flush(ctx); err != nil {
+			_ = h.Release(ctx)
+			return err
+		}
+		return h.Release(ctx)
+	}
+	return nil
 }
 
 // writeAttrsMarker stores a metadata-only patch marker.

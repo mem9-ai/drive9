@@ -28,17 +28,19 @@ func (l *Layer) Attach(notify fs.Notifier, inodes fs.InodeTable) {
 }
 
 // startWatcher runs the rollback poll loop and the bus subscription until
-// Stop. Safe to call once per mount.
+// Stop. Safe to call once per mount. The event-log cursor is seeded
+// synchronously BEFORE the loop starts: a rollback landing between Start
+// and a lazily seeded cursor would be swallowed by the since-filter.
 func (l *Layer) startWatcher() {
 	if l.events != nil {
 		l.events.On(fs.EventInvalidated, l.onRemoteChange)
 		l.events.On(fs.EventDelete, l.onRemoteChange)
 	}
+	l.subscribeInitialCursor(context.Background())
 	ctx, cancel := context.WithCancel(context.Background())
 	l.watcherCancel = cancel
 	go func() {
 		defer close(l.watcherDone)
-		l.subscribeInitialCursor(ctx)
 		ticker := time.NewTicker(pollInterval)
 		defer ticker.Stop()
 		for {
@@ -55,6 +57,7 @@ func (l *Layer) startWatcher() {
 // subscribeInitialCursor seeds the event-log cursor so the first poll does
 // not replay history as a fresh rollback.
 func (l *Layer) subscribeInitialCursor(ctx context.Context) {
+	_ = ctx
 	l.mu.RLock()
 	v := l.cur
 	l.mu.RUnlock()
@@ -99,19 +102,19 @@ func (l *Layer) pollRollback(ctx context.Context) {
 		return
 	}
 	l.mu.Lock()
-	if l.cur == v && !v.abandoned {
-		v.abandoned = true
+	if l.cur == v && !v.abandoned.Load() {
+		v.abandoned.Store(true)
 		hooks := append([]func(){}, l.onRollback...)
 		// The overlay clears (v1): reads fall through to the classic view
 		// — blackouts stop hiding — while the abandoned latch fails every
 		// later mutation with ESTALE until remount or checkout.
 		cleared := &view{
-			mode:      viewLayer,
-			layerID:   v.layerID,
-			abandoned: true,
-			lastSeq:   v.lastSeq,
-			idx:       newViewIndex(),
+			mode:    viewLayer,
+			layerID: v.layerID,
+			lastSeq: v.lastSeq,
+			idx:     newViewIndex(),
 		}
+		cleared.abandoned.Store(true)
 		l.cur = cleared
 		l.mu.Unlock()
 		for _, hook := range hooks {

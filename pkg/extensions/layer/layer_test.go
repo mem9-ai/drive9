@@ -437,3 +437,91 @@ func TestCheckoutRejectsTerminalLayers(t *testing.T) {
 		t.Fatal("checkout of a committed layer should fail")
 	}
 }
+
+func TestUnlinkMissingPathIsNotFound(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	if err := s.fsys.Unlink(context.Background(), "/missing.txt"); !errors.Is(err, fs.ErrNotFound) {
+		t.Fatalf("unlink of a missing path = %v", err)
+	}
+	if err := s.fsys.Rmdir(context.Background(), "/missing-dir"); !errors.Is(err, fs.ErrNotFound) {
+		t.Fatalf("rmdir of a missing dir = %v", err)
+	}
+	if s.diskExists(t, "/.drive9/layers/L1/blackouts/missing.txt") {
+		t.Fatal("ENOENT unlink left a blackout marker behind")
+	}
+}
+
+func TestChmodZeroOnClassicStaysInLayer(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/locked.txt", []byte("secret"))
+
+	// chmod 000: Mode == 0 with HasMode true must still be a mutation.
+	zero := uint32(0)
+	res, err := s.ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/locked.txt", Mode: zero, HasMode: true, Size: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Attr == nil || res.Attr.Mode != 0 {
+		t.Fatalf("chmod 000 attr = %+v", res.Attr)
+	}
+	if info, serr := os.Lstat(s.core.sysPath("/locked.txt")); serr != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("chmod 000 leaked into the classic file: %v %v", info, serr)
+	}
+	if got, ok := s.disk(t, "/.drive9/layers/L1/attrs/locked.txt"); !ok || !strings.Contains(got, `"mode_set":true`) {
+		t.Fatalf("attrs marker = %q ok=%v", got, ok)
+	}
+
+	// A read-only checkpoint view refuses it outright.
+	s2 := newLocalStack(t, "L1", "cp2")
+	s2.reg.addCheckpoint("cp2", "L1")
+	if _, err := s2.ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/any.txt", Mode: zero, HasMode: true, Size: -1}); !errors.Is(err, syscall.EROFS) {
+		t.Fatalf("checkpoint chmod 000 error = %v", err)
+	}
+}
+
+func TestTruncateToZeroClassic(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/big.txt", []byte("0123456789"))
+
+	zero := int64(0)
+	if err := s.fsys.SetAttr(ctx, "/big.txt", fs.AttrPatch{Size: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRead(t, s, "/big.txt"); got != "" {
+		t.Fatalf("zero-truncated read = %q", got)
+	}
+	if got, ok := s.disk(t, treePath("/big.txt")); !ok || got != "" {
+		t.Fatalf("tree copy = %q ok=%v (want empty file)", got, ok)
+	}
+	if got, _ := s.disk(t, "/big.txt"); got != "0123456789" {
+		t.Fatalf("classic mutated by zero-truncate: %q", got)
+	}
+}
+
+func TestRenameClassicDirectoryRemapsChildren(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/src/a.txt", []byte("a"))
+	s.seed(t, "/src/sub/b.txt", []byte("b"))
+
+	if err := s.fsys.Rename(ctx, "/src", "/dst", fs.RenameOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRead(t, s, "/dst/a.txt"); got != "a" {
+		t.Fatalf("renamed dir child a = %q", got)
+	}
+	if got := mustRead(t, s, "/dst/sub/b.txt"); got != "b" {
+		t.Fatalf("renamed dir nested child b = %q", got)
+	}
+	if got, ok := s.disk(t, treePath("/dst/sub/b.txt")); !ok || got != "b" {
+		t.Fatalf("tree copy of nested child = %q ok=%v", got, ok)
+	}
+	if got, _ := s.disk(t, "/src/a.txt"); got != "a" {
+		t.Fatal("dir rename deleted the classic source")
+	}
+	if _, err := s.fsys.GetAttr(ctx, "/src/a.txt"); err == nil {
+		t.Fatal("dir blackout did not hide the source subtree")
+	}
+}

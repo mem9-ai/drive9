@@ -79,6 +79,8 @@ type Backend struct {
 	checkpoints map[string]int64
 	// layerStates maps layer ID → state for the bare layer GET.
 	layerStates map[string]string
+	// layerParents maps child layer ID → parent for the registry list.
+	layerParents map[string]string
 	// gitWorkspaces seeds GET /v1/git-workspaces; gitOverlay is the overlay
 	// log per workspace (path → entry).
 	gitWorkspaces []map[string]any
@@ -122,6 +124,7 @@ func NewBackend() *Backend {
 		layerEvents:   map[string][]LayerEntry{},
 		uploads:       map[string]*uploadState{},
 		layerStates:   map[string]string{},
+		layerParents:  map[string]string{},
 		checkpoints:   map[string]int64{},
 		requests:      map[string]int{},
 		gitStates:     map[string][]byte{},
@@ -365,6 +368,20 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				ExpectedRevision *int64 `json:"expected_revision"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
+			// The real server enforces the CAS anchor at initiate time.
+			if req.ExpectedRevision != nil {
+				b.mu.Lock()
+				n := b.files[req.Path]
+				b.mu.Unlock()
+				if *req.ExpectedRevision == 0 && n != nil {
+					b.writeErr(w, http.StatusConflict, "already exists")
+					return
+				}
+				if *req.ExpectedRevision > 0 && (n == nil || n.Rev != *req.ExpectedRevision) {
+					b.writeErr(w, http.StatusConflict, "revision mismatch")
+					return
+				}
+			}
 			b.mu.Lock()
 			b.uploadSeq++
 			id := fmt.Sprintf("up-%d", b.uploadSeq)
@@ -616,12 +633,29 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/v1/layer-checkpoints/") && r.Method == http.MethodGet {
 		id := strings.TrimPrefix(r.URL.Path, "/v1/layer-checkpoints/")
 		b.mu.Lock()
-		seq := b.layerSeq
-		if cp, ok := b.checkpoints[id]; ok {
-			seq = cp
+		seq, ok := b.checkpoints[id]
+		b.mu.Unlock()
+		if !ok {
+			b.writeErr(w, http.StatusNotFound, "not found")
+			return
+		}
+		b.writeJSON(w, map[string]any{"checkpoint_id": id, "layer_id": "L1", "durable_seq": seq})
+		return
+	}
+	// Layer registry: GET /v1/layers lists rows (parent linkage for
+	// cascade-sweep consumers).
+	if r.URL.Path == "/v1/layers" && r.Method == http.MethodGet {
+		b.mu.Lock()
+		out := make([]map[string]any, 0, len(b.layerStates))
+		for id, state := range b.layerStates {
+			row := map[string]any{"layer_id": id, "state": state, "base_root_path": "/"}
+			if parent, ok := b.layerParents[id]; ok {
+				row["parent_layer_id"] = parent
+			}
+			out = append(out, row)
 		}
 		b.mu.Unlock()
-		b.writeJSON(w, map[string]any{"checkpoint_id": id, "layer_id": "L1", "durable_seq": seq})
+		b.writeJSON(w, map[string]any{"layers": out})
 		return
 	}
 	// fs-layer subtree: POST /v1/layers/{id}/entries, GET /v1/layers/{id}/diff
@@ -638,8 +672,13 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if i := strings.IndexByte(rest, '/'); i < 0 && r.Method == http.MethodGet {
 			b.mu.Lock()
+			_, known := b.layerStates[id]
 			state := b.layerStates[id]
 			b.mu.Unlock()
+			if !known {
+				b.writeErr(w, http.StatusNotFound, "not found")
+				return
+			}
 			if state == "" {
 				state = "active"
 			}
@@ -651,6 +690,11 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			tail := rest[i+1:]
 			switch {
 			case tail == "entries" && r.Method == http.MethodPost:
+				b.mu.Lock()
+				if _, ok := b.layerStates[id]; !ok {
+					b.layerStates[id] = "active"
+				}
+				b.mu.Unlock()
 				var req struct {
 					Path        string `json:"path"`
 					Op          string `json:"op"`
@@ -697,6 +741,7 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				b.mu.Lock()
 				b.layerStates[child] = "active"
+				b.layerParents[child] = id
 				b.mu.Unlock()
 				b.writeJSON(w, map[string]any{"layer_id": child, "base_root_path": "/", "state": "active", "parent_layer_id": id, "depth": 1})
 				return
@@ -1061,12 +1106,27 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodHead:
 		b.mu.Lock()
 		n := b.files[p]
+		syntheticDir := false
+		if n == nil && p != "/" {
+			prefix := p + "/"
+			for cp := range b.files {
+				if strings.HasPrefix(cp, prefix) {
+					syntheticDir = true
+					break
+				}
+			}
+		}
 		b.mu.Unlock()
-		if n == nil {
+		if n == nil && !syntheticDir {
 			b.writeErr(w, http.StatusNotFound, "not found")
 			return
 		}
-		w.Header().Set("X-Dat9-IsDir", strconv.FormatBool(n.IsDir))
+		isDir := syntheticDir || n.IsDir
+		w.Header().Set("X-Dat9-IsDir", strconv.FormatBool(isDir))
+		if n == nil {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		w.Header().Set("Content-Length", strconv.Itoa(len(n.Data)))
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(n.Rev, 10))
 		w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(n.Mode), 10))

@@ -23,8 +23,12 @@ type CheckoutTarget struct {
 
 // Checkout hot-switches the mount's shadow view. It resolves the refs
 // through the metadata API, walks the new view's marker roots into a fresh
-// index, swaps the view, and flushes the kernel caches.
+// index, swaps the view, and flushes the kernel caches. Concurrent
+// checkouts serialize so each request installs and reports its own target,
+// not whichever view build finishes last.
 func (l *Layer) Checkout(ctx context.Context, target CheckoutTarget) error {
+	l.checkoutMu.Lock()
+	defer l.checkoutMu.Unlock()
 	if target.Live {
 		l.swapView(newLiveView())
 		return nil
@@ -36,15 +40,11 @@ func (l *Layer) Checkout(ctx context.Context, target CheckoutTarget) error {
 	if err != nil {
 		return fmt.Errorf("resolve layer %s: %w", target.LayerRef, err)
 	}
-	// Refuse to shadow terminal layers: their trees are settled.
-	switch layer.State {
-	case "", "active", "sealed", "committing":
-	default:
-		return fmt.Errorf("layer %s is %s; fork or create a new layer instead", layer.LayerID, layer.State)
-	}
 	nv := &view{mode: viewLayer, layerID: layer.LayerID}
 	nv.applyRoots(layerRootPath(layer.LayerID))
 	if target.CheckpointRef != "" {
+		// A checkpoint view is read-only and immutable by construction, so
+		// even terminal layer states remain valid shadow sources.
 		cp, cerr := l.reg.GetCheckpoint(ctx, target.CheckpointRef)
 		if cerr != nil {
 			return fmt.Errorf("resolve checkpoint %s: %w", target.CheckpointRef, cerr)
@@ -56,6 +56,14 @@ func (l *Layer) Checkout(ctx context.Context, target CheckoutTarget) error {
 		nv.checkpoint = cp.CheckpointID
 		nv.readOnly = true
 		nv.applyRoots(layerRootPath(layer.LayerID) + "/checkpoints/" + cp.CheckpointID)
+	} else {
+		// Writable shadow views require an active layer: sealed layers
+		// must not gain writes and a committing tree must stay still.
+		switch layer.State {
+		case "", "active":
+		default:
+			return fmt.Errorf("layer %s is %s; fork or create a new layer instead", layer.LayerID, layer.State)
+		}
 	}
 	idx, err := buildViewIndex(ctx, l.io, nv, pathMapper{
 		serverToView: l.viewPathOf,

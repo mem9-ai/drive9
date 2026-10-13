@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
@@ -47,8 +48,10 @@ type view struct {
 	blackDirRoot string
 	casRoot      string
 	attrsRoot    string
-	// abandoned fails later mutations after a rollback event.
-	abandoned bool
+	// abandoned fails later mutations after a rollback event. Atomic:
+	// the rollback poll sets it while request goroutines gate on it
+	// through unsynchronized view references.
+	abandoned atomic.Bool
 	// lastSeq is the event-log cursor for the rollback poll loop.
 	lastSeq int64
 
@@ -83,7 +86,11 @@ const (
 	ekAttrs
 )
 
-// blackoutInfo decodes a blackouts/<path> marker ("<kind>:<baseRev>").
+// blackoutInfo decodes a blackout marker. File and directory whiteouts
+// live in separate roots (blackouts/ and blackout-dirs/ — one path cannot
+// be both a marker file and a marker directory), so the marker body
+// carries only the deleted base's revision; this codec matches
+// pkg/layerfs exactly.
 type blackoutInfo struct {
 	isDir   bool
 	baseRev int64
@@ -91,21 +98,17 @@ type blackoutInfo struct {
 }
 
 func encodeBlackout(info blackoutInfo) []byte {
-	rev := "-"
 	if info.hasBase {
-		rev = strconv.FormatInt(info.baseRev, 10)
+		return []byte(strconv.FormatInt(info.baseRev, 10))
 	}
-	if info.isDir {
-		return []byte("dir:" + rev)
-	}
-	return []byte("file:" + rev)
+	return []byte("-")
 }
 
 func decodeBlackout(content []byte) blackoutInfo {
-	kind, rev, _ := strings.Cut(strings.TrimSpace(string(content)), ":")
-	info := blackoutInfo{isDir: kind == "dir"}
-	if rev != "" && rev != "-" {
-		if n, err := strconv.ParseInt(rev, 10, 64); err == nil {
+	text := strings.TrimSpace(string(content))
+	info := blackoutInfo{}
+	if text != "" && text != "-" {
+		if n, err := strconv.ParseInt(text, 10, 64); err == nil {
 			info.baseRev = n
 			info.hasBase = true
 		}
@@ -113,10 +116,12 @@ func decodeBlackout(content []byte) blackoutInfo {
 	return info
 }
 
-// attrsPatch decodes an attrs/<path> marker.
+// attrsPatch decodes an attrs/<path> marker. ModeSet distinguishes
+// chmod(000) — mode zero with ModeSet true — from an absent mode field.
 type attrsPatch struct {
-	Mode  uint32 `json:"mode"`
-	Mtime int64  `json:"mtime,omitempty"` // unix seconds; 0 = unchanged
+	Mode    uint32 `json:"mode"`
+	ModeSet bool   `json:"mode_set,omitempty"`
+	Mtime   int64  `json:"mtime,omitempty"` // unix seconds; 0 = unchanged
 }
 
 func decodeAttrs(content []byte, out *attrsPatch) error {
@@ -170,17 +175,6 @@ func (ix *viewIndex) removeIfKind(p string, kind entryKind) {
 	defer ix.mu.Unlock()
 	if e, ok := ix.entries[p]; ok && e.kind == kind {
 		delete(ix.entries, p)
-	}
-}
-
-// removePrefix drops every entry at or below prefix (dir rename).
-func (ix *viewIndex) removePrefix(prefix string) {
-	ix.mu.Lock()
-	defer ix.mu.Unlock()
-	for p := range ix.entries {
-		if p == prefix || strings.HasPrefix(p, prefix+"/") {
-			delete(ix.entries, p)
-		}
 	}
 }
 
@@ -240,8 +234,8 @@ func (ix *viewIndex) blackedOutLocked(p string) bool {
 		return true
 	}
 	for {
-		parent := pathutil.ParentPath(p)
-		if parent == p {
+		parent := strings.TrimSuffix(pathutil.ParentPath(p), "/")
+		if parent == "" || parent == p {
 			return false
 		}
 		if e, ok := ix.entries[parent]; ok && e.kind == ekBlackout && e.blackout.isDir {
@@ -284,19 +278,30 @@ func buildViewIndex(ctx context.Context, dio layerIO, v *view, pm pathMapper) (*
 	}); err != nil {
 		return nil, err
 	}
+	// A listed marker whose read fails must fail the walk closed:
+	// treating it as absent would misroute the view (and mis-anchor
+	// commits). A vanished marker (lost delete race) is benign.
+	var readErr error
+	readMarker := func(root, vp string) ([]byte, bool) {
+		content, err := dio.Read(ctx, root+pm.viewToServer(vp))
+		if err != nil {
+			if !fs.IsNotFound(err) {
+				readErr = err
+			}
+			return nil, false
+		}
+		return content, true
+	}
 	if err := walkRoot(v.attrsRoot, func(vp string, info ioEntry) {
 		if info.IsDir {
 			return
 		}
-		content, err := dio.Read(ctx, v.attrsRoot+pm.viewToServer(vp))
-		if err != nil {
-			return
+		if content, ok := readMarker(v.attrsRoot, vp); ok {
+			var patch attrsPatch
+			if err := decodeAttrs(content, &patch); err == nil {
+				ix.put(vp, &indexEntry{kind: ekAttrs, patch: patch})
+			}
 		}
-		var patch attrsPatch
-		if err := json.Unmarshal(content, &patch); err != nil {
-			return
-		}
-		ix.put(vp, &indexEntry{kind: ekAttrs, patch: patch})
 	}); err != nil {
 		return nil, err
 	}
@@ -307,11 +312,9 @@ func buildViewIndex(ctx context.Context, dio layerIO, v *view, pm pathMapper) (*
 		if info.IsDir {
 			return
 		}
-		content, err := dio.Read(ctx, v.blackRoot+pm.viewToServer(vp))
-		if err != nil {
-			return
+		if content, ok := readMarker(v.blackRoot, vp); ok {
+			ix.put(vp, seed(decodeBlackout(content)))
 		}
-		ix.put(vp, seed(decodeBlackout(content)))
 	}); err != nil {
 		return nil, err
 	}
@@ -319,15 +322,16 @@ func buildViewIndex(ctx context.Context, dio layerIO, v *view, pm pathMapper) (*
 		if info.IsDir {
 			return
 		}
-		content, err := dio.Read(ctx, v.blackDirRoot+pm.viewToServer(vp))
-		if err != nil {
-			return
+		if content, ok := readMarker(v.blackDirRoot, vp); ok {
+			bl := decodeBlackout(content)
+			bl.isDir = true
+			ix.put(vp, seed(bl))
 		}
-		bl := decodeBlackout(content)
-		bl.isDir = true
-		ix.put(vp, seed(bl))
 	}); err != nil {
 		return nil, err
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("read layer marker: %w", readErr)
 	}
 	return ix, nil
 }

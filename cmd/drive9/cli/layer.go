@@ -300,6 +300,14 @@ func LayerCheckpoint(c *client.Client, args []string) error {
 	if cpID == "" {
 		cpID = journal.NewID("ckpt")
 	}
+	// Reserve the caller-supplied id BEFORE touching its namespace: a
+	// duplicate would otherwise overwrite a pinned snapshot's directory
+	// before the registry rejects it.
+	if _, err := c.GetFSLayerCheckpoint(context.Background(), cpID); err == nil {
+		return fmt.Errorf("fs layer checkpoint: checkpoint %s already exists", cpID)
+	} else if !client.IsNotFound(err) {
+		return err
+	}
 	// Snapshot first, pin second: a crash leaves an invisible orphan
 	// directory, never a checkpoint row without content.
 	if err := layerfs.CopySnapshot(context.Background(), c, layerfs.LayerRoot(layer.LayerID), layerfs.CheckpointRoot(layer.LayerID, cpID)); err != nil {
@@ -395,6 +403,14 @@ func LayerFork(c *client.Client, args []string) error {
 	if childID == "" {
 		childID = journal.NewID("layer")
 	}
+	// Reserve the caller-supplied id BEFORE copying: a duplicate would
+	// otherwise overwrite another layer's tree before the registry
+	// rejects it.
+	if _, err := c.GetFSLayer(context.Background(), childID); err == nil {
+		return fmt.Errorf("fs layer fork: layer %s already exists", childID)
+	} else if !client.IsNotFound(err) {
+		return err
+	}
 	srcBase := layerfs.LayerRoot(parent.LayerID)
 	if cp := strings.TrimSpace(*checkpoint); cp != "" {
 		pin, err := c.GetFSLayerCheckpoint(context.Background(), cp)
@@ -478,9 +494,30 @@ func LayerDelete(c *client.Client, args []string) error {
 		return err
 	}
 	// The registry row is gone; sweep the namespace tree best-effort (a
-	// failure leaves an invisible orphan, nothing consumes it).
-	if rerr := c.RemoveAllCtx(context.Background(), layerfs.LayerRoot(layer.LayerID)); rerr != nil && !client.IsNotFound(rerr) {
-		_, _ = fmt.Fprintf(os.Stderr, "warning: layer tree cleanup failed: %v\n", rerr)
+	// failure leaves an invisible orphan, nothing consumes it). Cascade
+	// abandons descendants server-side, so their namespaces sweep too.
+	sweep := []string{layer.LayerID}
+	if *cascade {
+		all, lerr := c.ListFSLayers(context.Background())
+		if lerr == nil {
+			children := map[string][]string{}
+			for _, l := range all {
+				children[l.ParentLayerID] = append(children[l.ParentLayerID], l.LayerID)
+			}
+			var walk func(id string)
+			walk = func(id string) {
+				for _, ch := range children[id] {
+					sweep = append(sweep, ch)
+					walk(ch)
+				}
+			}
+			walk(layer.LayerID)
+		}
+	}
+	for _, id := range sweep {
+		if rerr := c.RemoveAllCtx(context.Background(), layerfs.LayerRoot(id)); rerr != nil && !client.IsNotFound(rerr) {
+			_, _ = fmt.Fprintf(os.Stderr, "warning: layer %s tree cleanup failed: %v\n", id, rerr)
+		}
 	}
 	_, _ = fmt.Fprintln(os.Stdout, "ok")
 	return nil

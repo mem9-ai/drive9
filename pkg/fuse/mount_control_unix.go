@@ -176,12 +176,22 @@ func (s *mountControlServer) handleLayerCheckout(conn net.Conn, ctx context.Cont
 		resp.Error = "layer checkout: provide a layer ref or --live"
 		return
 	}
+	if target.Live && (target.LayerRef != "" || target.CheckpointRef != "") {
+		resp.OK = false
+		resp.Error = "layer checkout: --live cannot be combined with a layer or checkpoint ref"
+		return
+	}
 	if err := s.layerCtl.Checkout(ctx, target); err != nil {
 		resp.OK = false
 		resp.Error = err.Error()
 		return
 	}
 	mode, layerID, checkpointID, readOnly := s.layerCtl.CurrentView()
+	// An active shadow view must route directory attrs through the chain;
+	// returning to live restores the mount-time default.
+	if s.fs != nil {
+		s.fs.SetDirAttrsFromInode(mode == "live")
+	}
 	resp.View = mode
 	resp.LayerID = layerID
 	resp.CheckpointID = checkpointID

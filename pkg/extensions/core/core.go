@@ -1265,9 +1265,12 @@ func normalizeRoot(root string) string {
 	return strings.TrimSuffix(root, "/")
 }
 
-// remotePath prefixes a mount path with the remote root.
+// remotePath prefixes a mount path with the remote root. The global
+// /.drive9/layers namespace stays server-absolute: the layer extension
+// rewrites shadow paths into it, and those marker trees live outside every
+// remote root.
 func (c *Core) remotePath(p string) string {
-	if c.root == "/" {
+	if c.root == "/" || p == layersGlobalRoot || strings.HasPrefix(p, layersGlobalRoot+"/") {
 		return p
 	}
 	if p == "/" {
@@ -1275,6 +1278,10 @@ func (c *Core) remotePath(p string) string {
 	}
 	return c.root + p
 }
+
+// layersGlobalRoot is the server-absolute layer namespace (see
+// pkg/layerfs.Root).
+const layersGlobalRoot = "/.drive9/layers"
 
 // splitDirBase splits an absolute path into its parent directory and base
 // name; the root parent keeps its slash.

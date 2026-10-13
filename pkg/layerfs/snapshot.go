@@ -93,18 +93,29 @@ func LoadSnapshot(ctx context.Context, cl *client.Client, base string) (*Snapsho
 }
 
 // readMarkers walks a marker tree and hands each marker file's content to
-// fn (server-absolute shadowed path, marker body).
+// fn (server-absolute shadowed path, marker body). A listed marker whose
+// read fails aborts the snapshot: treating it as absent would mis-anchor
+// commits and mis-copy forks; a vanished marker (lost delete race) is
+// benign.
 func readMarkers(ctx context.Context, cl *client.Client, root string, fn func(serverPath, content string)) error {
-	return walkRemote(ctx, cl, root, func(serverPath string, info client.FileInfo) {
+	var readErr error
+	err := walkRemote(ctx, cl, root, func(serverPath string, info client.FileInfo) {
 		if info.IsDir {
 			return
 		}
-		content, err := cl.ReadCtx(ctx, MarkerPath(root, serverPath))
-		if err != nil {
-			return // an unreadable marker applies as absent
+		content, rerr := cl.ReadCtx(ctx, MarkerPath(root, serverPath))
+		if rerr != nil {
+			if !client.IsNotFound(rerr) {
+				readErr = fmt.Errorf("read marker %s: %w", serverPath, rerr)
+			}
+			return
 		}
 		fn(serverPath, string(content))
 	})
+	if err != nil {
+		return err
+	}
+	return readErr
 }
 
 // walkRemote lists a server directory tree recursively, invoking fn for

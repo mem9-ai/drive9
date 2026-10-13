@@ -2,7 +2,9 @@ package layerfs
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
@@ -119,5 +121,100 @@ func TestCommitEmptyLayerFlipsState(t *testing.T) {
 	}
 	if st, _ := b.LayerStateForTest("L1"); st != "committed" {
 		t.Fatalf("layer state = %q", st)
+	}
+}
+
+func TestCommitRefusesTerminalStates(t *testing.T) {
+	_, c := newBackend(t)
+	layer := &client.FSLayer{LayerID: "L1", BaseRootPath: "/", State: "abandoned"}
+	if _, err := Commit(context.Background(), c, layer); err == nil || !strings.Contains(err.Error(), "abandoned") {
+		t.Fatalf("terminal-state commit err = %v", err)
+	}
+}
+
+func TestCommitRefusesLegacyEntryLog(t *testing.T) {
+	_, c := newBackend(t)
+	// A legacy entry planted in the server-side log must block the state
+	// flip (the server commit would replay it).
+	if _, err := c.UpsertFSLayerEntry(context.Background(), "L1", client.FSLayerEntryRequest{Path: "/a", Op: "upsert", Kind: "file", Content: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	layer := &client.FSLayer{LayerID: "L1", BaseRootPath: "/", State: "active"}
+	if _, err := Commit(context.Background(), c, layer); err == nil || !strings.Contains(err.Error(), "legacy") {
+		t.Fatalf("legacy-log commit err = %v", err)
+	}
+}
+
+func TestCommitWhiteoutRevisionConflict(t *testing.T) {
+	b, c := newBackend(t)
+	b.Seed("/repo/gone.txt", []byte("v1"))
+	roots := "/.drive9/layers/layer-1"
+	// The blackout anchored the deletion at revision 1; the base moved on.
+	b.Seed(roots+"/blackouts/repo/gone.txt", []byte("1"))
+	if err := c.WriteCtx(context.Background(), "/repo/gone.txt", []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Commit(context.Background(), c, &client.FSLayer{LayerID: "layer-1", BaseRootPath: "/", State: "active"})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if len(res.Conflicts) == 0 || res.Conflicts[0].Reason != "base revision changed" {
+		t.Fatalf("conflicts = %+v", res.Conflicts)
+	}
+	if n, _ := b.Node("/repo/gone.txt"); string(n.Data) != "v2" {
+		t.Fatalf("stale whiteout deleted the newer base: %q", n.Data)
+	}
+}
+
+func TestCommitDirWhiteoutRemovesSubtree(t *testing.T) {
+	b, c := newBackend(t)
+	b.Seed("/repo/olddir/a.txt", []byte("a"))
+	b.Seed("/repo/olddir/sub/b.txt", []byte("b"))
+	roots := "/.drive9/layers/layer-1"
+	b.Seed(roots+"/blackout-dirs/repo/olddir", []byte("-"))
+	res, err := Commit(context.Background(), c, &client.FSLayer{LayerID: "layer-1", BaseRootPath: "/", State: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Conflicts) != 0 {
+		t.Fatalf("conflicts = %+v", res.Conflicts)
+	}
+	if _, ok := b.Node("/repo/olddir/a.txt"); ok {
+		t.Fatal("dir whiteout left base children behind")
+	}
+}
+
+func TestCommitResumeAfterConflictDoesNotStall(t *testing.T) {
+	b, c := newBackend(t)
+	b.Seed("/repo/keep.txt", []byte("keep"))
+	roots := "/.drive9/layers/layer-1"
+	b.Seed(roots+"/tree/repo/keep.txt", []byte("layered"))
+	b.Seed(roots+"/cas/repo/keep.txt", []byte("1"))
+	// Base moved past the anchor: the first commit conflicts and must
+	// abort its journal; after aligning the anchor, a fresh commit
+	// succeeds (the frozen plan does not block forever).
+	if err := c.WriteCtx(context.Background(), "/repo/keep.txt", []byte("base moved")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Commit(context.Background(), c, &client.FSLayer{LayerID: "layer-1", BaseRootPath: "/", State: "active"})
+	if err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	if len(res.Conflicts) == 0 {
+		t.Fatal("expected conflict")
+	}
+	st, err := c.StatCtx(context.Background(), "/repo/keep.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if werr := c.WriteCtx(context.Background(), roots+"/cas/repo/keep.txt", []byte(fmt.Sprintf("%d", st.Revision))); werr != nil {
+		t.Fatal(werr)
+	}
+	res2, err := Commit(context.Background(), c, &client.FSLayer{LayerID: "layer-1", BaseRootPath: "/", State: "active"})
+	if err != nil || len(res2.Conflicts) != 0 {
+		t.Fatalf("second commit = %+v %v", res2, err)
+	}
+	if n, _ := b.Node("/repo/keep.txt"); string(n.Data) != "layered" {
+		t.Fatalf("base = %q", n.Data)
 	}
 }

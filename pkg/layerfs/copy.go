@@ -8,14 +8,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"time"
+	"sort"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
-
-// copyChunkBytes bounds the copy buffer.
-const copyChunkBytes = 4 << 20
 
 // CopySnapshot deep-copies the marker trees of srcBase into dstBase. It
 // writes the destination BEFORE any registry row references it, so a crash
@@ -39,16 +35,34 @@ func CopySnapshot(ctx context.Context, cl *client.Client, srcBase, dstBase strin
 		}
 		return cl.MkdirCtx(ctx, MarkerPath(dst.Tree, serverPath), mode)
 	}
-	for _, entry := range snap.Tree {
-		if !entry.IsDir {
-			continue
+	// Deterministic parent-first directory creation: map ranging order
+	// would let a child's implicit parent race the explicit mkdir.
+	dirs := make([]string, 0, len(snap.Tree))
+	for serverPath, entry := range snap.Tree {
+		if entry.IsDir {
+			dirs = append(dirs, serverPath)
 		}
-		if err := ensureTreeDir(entry.ServerPath, entry.Mode); err != nil {
-			return fmt.Errorf("mkdir %s: %w", entry.ServerPath, err)
+	}
+	sort.Strings(dirs)
+	for _, serverPath := range dirs {
+		if err := ensureTreeDir(serverPath, snap.Tree[serverPath].Mode); err != nil {
+			return fmt.Errorf("mkdir %s: %w", serverPath, err)
 		}
 	}
 	for _, entry := range snap.Tree {
 		if entry.IsDir {
+			continue
+		}
+		if entry.IsSymlink {
+			// A copied snapshot must keep links as links: writing the
+			// payload with WriteCtx would materialize a regular file.
+			target, terr := cl.ReadCtx(ctx, MarkerPath(src.Tree, entry.ServerPath))
+			if terr != nil {
+				return fmt.Errorf("read symlink %s: %w", entry.ServerPath, terr)
+			}
+			if serr := cl.SymlinkCtx(ctx, string(target), MarkerPath(dst.Tree, entry.ServerPath)); serr != nil {
+				return fmt.Errorf("symlink %s: %w", entry.ServerPath, serr)
+			}
 			continue
 		}
 		if err := copyFileServer(ctx, cl, MarkerPath(src.Tree, entry.ServerPath), MarkerPath(dst.Tree, entry.ServerPath), entry.Size); err != nil {
@@ -86,60 +100,13 @@ func CopySnapshot(ctx context.Context, cl *client.Client, srcBase, dstBase strin
 	return nil
 }
 
-// copyInlineMax bounds the whole-image copy path; larger files stream as
-// multipart uploads.
-const copyInlineMax = 8 << 20
-
-// copyFileServer streams one file from src to dst (symlinks ride the same
-// content pipeline — drive9 stores a link's target as its content).
+// copyFileServer streams one file from src to dst through the client's
+// negotiated upload path: simple PUT below the server threshold, V2
+// multipart (adaptive part sizes, part checksums) above it.
 func copyFileServer(ctx context.Context, cl *client.Client, src, dst string, size int64) error {
-	if size <= copyInlineMax {
-		data, err := cl.ReadCtx(ctx, src)
-		if err != nil {
-			return err
-		}
-		return cl.WriteCtx(ctx, dst, data)
-	}
-	rc, err := cl.ReadStream(ctx, src)
+	ra, err := newRangedReaderAt(ctx, cl, src, size)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = rc.Close() }()
-	sw := cl.NewStreamWriter(ctx, dst, size)
-	part := 0
-	var last []byte
-	abort := func() {
-		abortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		_ = sw.Abort(abortCtx)
-		cancel()
-	}
-	buf := make([]byte, copyChunkBytes)
-	for {
-		n, rerr := rc.Read(buf)
-		if n > 0 {
-			part++
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			if last != nil {
-				if werr := sw.WritePart(ctx, part-1, last); werr != nil {
-					abort()
-					return werr
-				}
-			}
-			last = chunk
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			abort()
-			return rerr
-		}
-	}
-	if part == 0 {
-		abort()
-		return fmt.Errorf("copy %s: stream ended with no parts", src)
-	}
-	// The final part rides Complete's synchronous upload.
-	return sw.Complete(ctx, part, last)
+	return cl.WriteStream(ctx, dst, ra, size, nil)
 }

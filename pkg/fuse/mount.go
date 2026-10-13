@@ -1001,11 +1001,11 @@ func MountWithConfig(cfg MountConfig) error {
 		// refresh (v1 resetMountView on fs_layer_events); the inode table
 		// maps marker-tree paths back to the user-visible entries.
 		layerExt.Attach(f.Ctx.Notify, f.Ctx.Inodes)
-		// A layer rollback fences the write plane: the commit queue halts
-		// and later inline commits fail with the rolled-back error.
-		if wb != nil {
-			layerExt.OnRollback(wb.AbandonLayerForRollback)
-		}
+		// No writeback fence on rollback: FS-native layer writes land on
+		// tree paths only, so a late in-flight commit cannot publish into
+		// the base — it becomes invisible garbage in an abandoned layer.
+		// The view-level ESTALE gate rejects new writes; a checkout to
+		// another layer works without re-arming any plane.
 	}
 
 	// Control server + mount process state (v1 mount.go) run BEFORE the

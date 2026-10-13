@@ -175,8 +175,11 @@ func RequestLayerCheckout(ctx context.Context, socketPath string, timeout time.D
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
 		return nil, fmt.Errorf("read layer checkout response: %w", err)
 	}
-	if !resp.OK && resp.Error != "" {
-		return &resp, fmt.Errorf("%s", resp.Error)
+	if !resp.OK {
+		if resp.Error != "" {
+			return &resp, fmt.Errorf("%s", resp.Error)
+		}
+		return &resp, fmt.Errorf("layer checkout: not ok")
 	}
 	return &resp, nil
 }

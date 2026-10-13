@@ -649,8 +649,9 @@ main() {
   tree_small=$(drive9_retry fs cat ":/.drive9/layers/$cli_layer_id/tree$root/small.txt" 2>/dev/null || true)
   check_eq "cp --layer lands in the layer tree" "$tree_small" "layered small"
 
-  # a big file rides the streaming upload path
-  local big_mb=8
+  # a big file rides the multipart upload path (well past the server's
+  # negotiated large-file threshold)
+  local big_mb=12
   dd if=/dev/urandom of="$CLI_HOME/big.bin" bs=1m count="$big_mb" >/dev/null 2>&1 || dd if=/dev/urandom of="$CLI_HOME/big.bin" bs=1M count="$big_mb" >/dev/null 2>&1
   local big_sha
   big_sha=$(sha256_file "$CLI_HOME/big.bin")
@@ -786,12 +787,12 @@ run_fuse_section() {
   start_layer_mount "name:$fuse_layer" "" "$root" "$mp" "$lroot" "$log"
 
   # the classic view is visible through the shadow
-  check_eq "layer mount reads classic content" "$(cat "$mp/base.txt")" "replaced"
+  check_eq "layer mount reads classic content" "$(cat "$mp/base.txt")" "live moved on"
 
   # CoW: editing a classic file leaves the classic bytes alone
   printf 'replaced in layer' >"$mp/base.txt"
   sync; sleep 1
-  check_eq "classic file untouched by the shadow write" "$(drive9_retry fs cat ":$base_file")" "replaced"
+  check_eq "classic file untouched by the shadow write" "$(drive9_retry fs cat ":$base_file")" "live moved on"
 
   # new files land in the tree
   printf 'fresh' >"$mp/fresh.txt"
@@ -823,7 +824,7 @@ run_fuse_section() {
     break
   done
   check_eq "rollback fails later writes (ESTALE)" "$rb_seen" "1"
-  check_eq "classic view survives rollback" "$(cat "$mp/base.txt" 2>/dev/null || echo missing)" "replaced"
+  check_eq "classic view survives rollback" "$(cat "$mp/base.txt" 2>/dev/null || echo missing)" "live moved on"
 
   unmount_layer_mount || { dump_mount_log; exit 1; }
   audit_mount_log "$log"

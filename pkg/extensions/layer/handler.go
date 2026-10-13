@@ -57,7 +57,11 @@ func isReservedPath(p string) bool {
 }
 
 func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
-	if isReservedPath(op.Path) || (op.Path2 != "" && isReservedPath(op.Path2)) {
+	// Reserved-namespace classification happens on the SERVER-absolute
+	// path: a mount-local /.drive9 under a non-root remote root is an
+	// ordinary subtree name and participates in the shadow like any other
+	// path.
+	if isReservedPath(l.serverAbs(op.Path)) || (op.Path2 != "" && isReservedPath(l.serverAbs(op.Path2))) {
 		return next(ctx, op)
 	}
 	l.mu.RLock()
@@ -159,7 +163,9 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		return l.linkOp(ctx, v, op, next)
 
 	case fs.OpSetAttr:
-		if err := v.mutationGate(op.Mode != 0 || op.Size >= 0 || !op.Mtime.IsZero()); err != nil {
+		// HasMode keeps chmod(000) mutating (Mode == 0 is a valid mode, not
+		// an absent one); owner flags take the same gate.
+		if err := v.mutationGate(op.HasMode || op.Mode != 0 || op.Size >= 0 || !op.Mtime.IsZero() || op.HasSetUID || op.HasSetGID); err != nil {
 			return fs.Result{}, err
 		}
 		return l.setAttrOp(ctx, v, op, next)
@@ -195,7 +201,7 @@ func (v *view) mutationGate(wants bool) error {
 	if !wants {
 		return nil
 	}
-	if v.abandoned {
+	if v.abandoned.Load() {
 		return errLayerRolledBack
 	}
 	if v.readOnly {
@@ -218,7 +224,7 @@ func (l *Layer) attrOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) (f
 			return res, err
 		}
 		patched := *res.Attr
-		if e.patch.Mode != 0 {
+		if e.patch.ModeSet || e.patch.Mode != 0 {
 			patched.Mode = e.patch.Mode
 		}
 		if e.patch.Mtime != 0 {
@@ -273,7 +279,7 @@ func (l *Layer) listMerged(ctx context.Context, v *view, dir string, next fs.Nex
 		case ekAttrs:
 			if cur, seen := out[name]; seen {
 				patched := cur.Attr
-				if e.patch.Mode != 0 {
+				if e.patch.ModeSet || e.patch.Mode != 0 {
 					patched.Mode = e.patch.Mode
 				}
 				cur.Attr = patched

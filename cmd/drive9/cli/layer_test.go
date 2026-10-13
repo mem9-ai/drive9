@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -26,6 +27,7 @@ func newLayerBackend(t *testing.T) (*testbackend.Backend, *client.Client) {
 
 func TestUploadReaderToLayerLandsInTreeWithCasMarker(t *testing.T) {
 	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
 	b.Seed("/repo/base.bin", []byte("base"))
 
 	ctx := context.Background()
@@ -55,6 +57,7 @@ func TestUploadReaderToLayerLandsInTreeWithCasMarker(t *testing.T) {
 
 func TestCpLayerLocalUploadUsesTreePath(t *testing.T) {
 	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
 	localPath := filepath.Join(t.TempDir(), "layer.txt")
 	if err := os.WriteFile(localPath, []byte("layer upload"), 0o640); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -79,6 +82,7 @@ func TestSearchCommandsRejectLayer(t *testing.T) {
 
 func TestLayerCommitAppliesTreeOntoBase(t *testing.T) {
 	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
 	b.Seed("/repo/keep.txt", []byte("keep"))
 	b.Seed("/repo/gone.txt", []byte("gone"))
 	b.Seed("/repo/replaced.txt", []byte("classic v1"))
@@ -121,6 +125,7 @@ func TestLayerCommitAppliesTreeOntoBase(t *testing.T) {
 
 func TestLayerCommitReportsCasConflict(t *testing.T) {
 	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
 	b.Seed("/repo/stale.txt", []byte("live-now"))
 	roots := "/.drive9/layers/layer-1"
 	b.Seed(roots+"/tree/repo/stale.txt", []byte("layered-old"))
@@ -143,6 +148,7 @@ func TestLayerCommitReportsCasConflict(t *testing.T) {
 
 func TestLayerDiffWalksTheTree(t *testing.T) {
 	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
 	roots := "/.drive9/layers/layer-1"
 	b.Seed(roots+"/tree/repo/a.txt", []byte("a"))
 	b.Seed(roots+"/blackouts/repo/b.txt", []byte("-"))
@@ -161,6 +167,7 @@ func TestLayerDiffWalksTheTree(t *testing.T) {
 
 func TestLayerForkCopiesSnapshotBeforeRegistryRow(t *testing.T) {
 	b, c := newLayerBackend(t)
+	b.SetLayerState("parent", "active")
 	b.Seed("/.drive9/layers/parent/tree/repo/a.txt", []byte("from parent"))
 	b.Seed("/.drive9/layers/parent/blackouts/repo/b.txt", []byte("-"))
 	b.Seed("/.drive9/layers/parent/cas/repo/a.txt", []byte("0"))
@@ -185,6 +192,7 @@ func TestLayerForkCopiesSnapshotBeforeRegistryRow(t *testing.T) {
 
 func TestLayerCheckpointSnapshotsTheTree(t *testing.T) {
 	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
 	b.Seed("/.drive9/layers/layer-1/tree/repo/a.txt", []byte("v1"))
 
 	out, err := captureStdoutE(t, func() error { return Layer(c, []string{"checkpoint", "--id", "cp9", "layer-1"}) })
@@ -206,6 +214,7 @@ func TestLayerCheckpointSnapshotsTheTree(t *testing.T) {
 
 func TestLayerDeleteSweepsTheTree(t *testing.T) {
 	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
 	b.Seed("/.drive9/layers/layer-1/tree/repo/a.txt", []byte("a"))
 
 	out, err := captureStdoutE(t, func() error { return Layer(c, []string{"delete", "layer-1"}) })
@@ -265,5 +274,67 @@ func TestLayerCreateRejectsDuplicateTag(t *testing.T) {
 	c := client.New(srv.URL, "")
 	if err := Layer(c, []string{"create", "--tag", "a=1", "--tag", "a=2", ":/repo"}); err == nil || !strings.Contains(err.Error(), "duplicate layer tag") {
 		t.Fatalf("duplicate tag error = %v", err)
+	}
+}
+
+func TestStampCasKeepsFirstAnchor(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
+	b.Seed("/repo/x.bin", []byte("v1"))
+
+	ctx := context.Background()
+	if err := uploadReaderToLayer(ctx, c, "layer-1", "/repo/x.bin", bytes.NewReader([]byte("layer v1")), 8, 0o644, true); err != nil {
+		t.Fatal(err)
+	}
+	first, ok := b.Node("/.drive9/layers/layer-1/cas/repo/x.bin")
+	if !ok {
+		t.Fatal("no anchor after first write")
+	}
+	// Another writer moves the base; the layer writes again — the anchor
+	// must keep pinning the revision the layer was first derived from.
+	if err := c.WriteCtx(ctx, "/repo/x.bin", []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := uploadReaderToLayer(ctx, c, "layer-1", "/repo/x.bin", bytes.NewReader([]byte("layer v2")), 8, 0o644, true); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := b.Node("/.drive9/layers/layer-1/cas/repo/x.bin")
+	if string(got.Data) != string(first.Data) {
+		t.Fatalf("anchor drifted: first=%q now=%q", first.Data, got.Data)
+	}
+}
+
+func TestLayerForkRefusesExistingChildID(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("parent", "active")
+	b.SetLayerState("taken", "active")
+	b.Seed("/.drive9/layers/parent/tree/repo/a.txt", []byte("from parent"))
+
+	err := Layer(c, []string{"fork", "--id", "taken", "parent"})
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("fork onto existing id err = %v", err)
+	}
+	if n, ok := b.Node("/.drive9/layers/taken/tree/repo/a.txt"); ok {
+		t.Fatalf("refused fork overwrote the existing tree: %+v", n)
+	}
+}
+
+func TestLayerDeleteCascadeSweepsDescendants(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("parent", "active")
+	if err := Layer(c, []string{"fork", "--id", "child-1", "parent"}); err != nil {
+		t.Fatalf("fork: %v", err)
+	}
+	b.Seed("/.drive9/layers/parent/tree/repo/p.txt", []byte("p"))
+	b.Seed("/.drive9/layers/child-1/tree/repo/c.txt", []byte("c"))
+
+	if _, err := captureStdoutE(t, func() error { return Layer(c, []string{"delete", "--cascade", "parent"}) }); err != nil {
+		t.Fatalf("cascade delete: %v", err)
+	}
+	if n, ok := b.Node("/.drive9/layers/parent/tree/repo/p.txt"); ok {
+		t.Fatalf("parent tree survived: %+v", n)
+	}
+	if n, ok := b.Node("/.drive9/layers/child-1/tree/repo/c.txt"); ok {
+		t.Fatalf("descendant tree survived: %+v", n)
 	}
 }

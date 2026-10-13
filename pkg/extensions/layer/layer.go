@@ -72,6 +72,9 @@ type Layer struct {
 
 	// gen fences lookups issued against a view being switched away from.
 	gen atomic.Uint64
+	// checkoutMu serializes hot checkouts: view construction, installation,
+	// and the reported outcome belong to one request.
+	checkoutMu sync.Mutex
 
 	// notify invalidates kernel caches and inodes maps kernel paths; the
 	// facade attaches both after assembly.
@@ -88,6 +91,25 @@ type Layer struct {
 	// path: a CoW materialization and a same-path rename never interleave
 	// their ordering.
 	mutLocks mutLockTable
+}
+
+// lockPair acquires the mutation locks of two paths in a stable order
+// (deadlock-free under opposing renames) and collapses the same-path case
+// (the striped locks are not reentrant).
+func (t *mutLockTable) lockPair(a, b string) (unlock func()) {
+	if a == b {
+		return t.lock(a)
+	}
+	first, second := a, b
+	if second < first {
+		first, second = second, first
+	}
+	u1 := t.lock(first)
+	u2 := t.lock(second)
+	return func() {
+		u2()
+		u1()
+	}
 }
 
 // mutLockTable is a striped per-path mutex table.
