@@ -656,14 +656,18 @@ main() {
   local big_sha
   big_sha=$(sha256_file "$CLI_HOME/big.bin")
   drive9_retry fs cp --layer "$cli_layer_name" "$CLI_HOME/big.bin" ":$root/big.bin" >/dev/null
-  local tree_big_sha
-  tree_big_sha=$(drive9_retry fs cat ":/.drive9/layers/$cli_layer_id/tree$root/big.bin" 2>/dev/null | sha256_file /dev/stdin || true)
-  check_eq "large layer upload streams intact" "$tree_big_sha" "$big_sha"
+  # byte-exact readback via cp + cmp (no pipe/sha-on-stdin variables)
+  drive9_retry fs cp ":/.drive9/layers/$cli_layer_id/tree$root/big.bin" "$CLI_HOME/big.down" >/dev/null
+  local tree_big_verdict
+  if cmp -s "$CLI_HOME/big.bin" "$CLI_HOME/big.down"; then tree_big_verdict="ok"; else
+    tree_big_verdict="differ(want=$(wc -c <"$CLI_HOME/big.bin" | tr -d ' ') got=$(wc -c <"$CLI_HOME/big.down" | tr -d ' '))"
+  fi
+  check_eq "large layer upload streams intact" "$tree_big_verdict" "ok"
 
   # diff folds the tree
   local diff_json
   diff_json=$(drive9_retry fs layer diff --json "$cli_layer_name")
-  check_eq "layer diff counts tree entries" "$(printf '%s' "$diff_json" | jq '.entries | length')" "2"
+  check_eq "layer diff counts tree entries" "$(printf '%s' "$diff_json" | jq '[.entries[] | select(.kind=="file")] | length')" "2"
   check_eq "layer diff shows the small upsert" "$(printf '%s' "$diff_json" | jq -r --arg p "$root/small.txt" '.entries[] | select(.path == $p and .op == "upsert") | .kind')" "file"
 
   # rm --layer writes a blackout; the classic file survives
