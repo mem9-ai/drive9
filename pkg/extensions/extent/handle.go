@@ -1,12 +1,10 @@
+// The VFS data-plane handle: extent files serve every data operation
+// through the pinned (ino, fh) pair of their JuiceFS VFS session. This file
+// also owns the jfs contexts (including the FUSE interrupt-cancel
+// semantics) and the caller plumbing that feeds them.
 package extent
 
-// VFS operation core: jfs contexts (including the FUSE
-// interrupt-cancel semantics), the open/read/write/flush bodies, and the
-// supplementary-group resolution that feeds jfsMetaCtx.
-
 import (
-	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-
 	"context"
 	"fmt"
 	"os"
@@ -67,10 +65,10 @@ func (e *Extent) jfsCtx(caller fs.Caller) vfs.LogContext {
 }
 
 // jfsCtxWithKeyedPath builds a LogContext whose meta context carries the
-// drive9 projection path (jfsmeta.Drive9PathKey): the engine's mknod/mkdir
-// transactions publish the file_nodes projection row server-side (without
-// it, newly created extent files are invisible to listings, other mounts,
-// and re-mounts).
+// drive9 projection path (jfsmeta.Drive9PathKey): the engine's
+// mknod/mkdir transactions publish the file_nodes projection row
+// server-side (without it, newly created extent files are invisible to
+// listings, other mounts, and re-mounts).
 func (e *Extent) jfsCtxWithKeyedPath(caller fs.Caller, remotePath string) vfs.LogContext {
 	return vfs.NewLogContext(e.jfsMetaCtx(caller).WithValue(jfsmeta.Drive9PathKey, remotePath))
 }
@@ -123,34 +121,6 @@ func (c *jfsFuseContext) Canceled() bool {
 	default:
 		return false
 	}
-}
-
-// extentOpenFlags maps JuiceFS close-to-open invalidation: the inode keeps
-// its cache only when the server said so.
-func extentOpenFlags(keepCache bool) uint32 {
-	if keepCache {
-		// The protocol constant is FOPEN_KEEP_CACHE (1<<1): 0x20 is
-		// FOPEN_NOFLUSH, which made the kernel skip close-time FLUSH and
-		// defer upload errors to a Release that discards them.
-		return gofuse.FOPEN_KEEP_CACHE
-	}
-	// JuiceFS says the page cache must NOT survive the close: carry the
-	// facade-reserved marker so it stops ORing FOPEN_KEEP_CACHE back on
-	// (a plain 0 was indistinguishable from "plane had no opinion" and
-	// cancelled the close-to-open invalidation between mounts).
-	return fs.OpenFlagDropKernelCache
-}
-
-// juiceWriteOffset bumps O_APPEND kernel writes (which can arrive with
-// off=0) to the VFS length.
-func juiceWriteOffset(off, length uint64, appendMode bool) uint64 {
-	if !appendMode || off != 0 {
-		return off
-	}
-	if length > off {
-		return length
-	}
-	return off
 }
 
 // extentHandle is the terminal data-plane handle: Read/Write/Flush go to the
@@ -215,7 +185,7 @@ func (h *extentHandle) Write(ctx context.Context, off int64, data []byte) error 
 	}
 	// v1: write-sync mounts pay remote durability per Write — flush through
 	// the VFS so write(2) returning means the data is on the server.
-	if h.e.policy == "write-sync" {
+	if h.e.opts.Policy == "write-sync" {
 		if ferrn := v.Flush(jctx, h.ino, h.fh, 0); ferrn != 0 {
 			return errno(ferrn)
 		}
@@ -277,9 +247,6 @@ func (h *extentHandle) SetLk(ctx context.Context, lk fs.FileLock, blocking bool)
 	if v == nil {
 		return syscall.EIO
 	}
-	// cancel wires the kernel-request context: a blocking lock becomes
-	// interruptible (EINTR), and lockBlock surfaces the transport's
-	// block:true hint so the server loops instead of 10ms EAGAIN polls.
 	jctx := &jfsFuseContext{LogContext: h.e.jfsCtx(h.callerOf(ctx)), cancel: ctx.Done(), lockBlock: true, started: time.Now()}
 	if lk.Flock {
 		return errno(v.Flock(jctx, vfs.Ino(h.ino), h.fh, lk.Owner, lk.Type, blocking))
@@ -295,7 +262,7 @@ func (h *extentHandle) Release(ctx context.Context) error {
 	}
 	h.closed = true
 	h.mu.Unlock()
-	h.e.untrackLiveHandle(h)
+	h.e.paths.untrackLiveHandle(h)
 	v := h.e.vfs()
 	if v == nil {
 		return nil
@@ -314,71 +281,10 @@ func callerFrom(ctx context.Context) fs.Caller {
 type callerKey struct{}
 
 // contextWithCaller plants the request's credentials where callerFrom
-// finds them: the namespace mutation paths (unlink/rmdir/truncate/rename)
-// construct JuiceFS contexts as the requester, not as root (main passed
-// the request's credentials into these VFS operations).
+// finds them: the namespace mutation paths (unlink/rmdir/rename) construct
+// JuiceFS contexts as the requester, not as root.
 func contextWithCaller(ctx context.Context, caller fs.Caller) context.Context {
 	return context.WithValue(ctx, callerKey{}, caller)
-}
-
-// openExtent ensures the runtime, VFS.Opens the pinned inode, updates the
-// length cache, and returns the terminal handle.
-func (e *Extent) openExtent(ctx context.Context, path string, ino uint64, flags uint32, caller fs.Caller) (fs.Handle, uint32, *fs.Attr, error) {
-	if err := e.ensureRuntime(); err != nil {
-		return nil, 0, nil, syscall.EIO
-	}
-	v := e.vfs()
-	if v == nil {
-		return nil, 0, nil, syscall.EIO
-	}
-	jctx := e.jfsCtx(caller)
-	jino := jfsmeta.Ino(ino)
-	entry, vfsFh, errn := v.Open(jctx, jino, flags)
-	if errn != 0 {
-		return nil, 0, nil, errno(errn)
-	}
-	length := uint64(0)
-	keepCache := false
-	if entry != nil && entry.Attr != nil {
-		v.UpdateLength(jino, entry.Attr)
-		length = entry.Attr.Length
-		keepCache = entry.Attr.KeepCache
-	}
-	e.rememberExtentIno(path, ino)
-	attr := &fs.Attr{Kind: fs.KindFile, Size: int64(length)}
-	if entry != nil && entry.Attr != nil {
-		attr.Mode = juiceTypeToStatMode(entry.Attr.Typ, entry.Attr.Mode)
-		attr.Rdev = entry.Attr.Rdev
-		attr.Mtime = time.Unix(int64(entry.Attr.Atime), int64(entry.Attr.Atimensec))
-		attr.Nlink = entry.Attr.Nlink
-		attr.Uid = entry.Attr.Uid
-		attr.Gid = entry.Attr.Gid
-		attr.HasOwner = true
-	}
-	h := &extentHandle{e: e, path: path, ino: jino, fh: vfsFh, flags: flags, openFlag: extentOpenFlags(keepCache), caller: caller}
-	e.trackLiveHandle(h)
-	return h, extentOpenFlags(keepCache), attr, nil
-}
-
-// adoptCreatedHandle builds a handle around the fh VFS.Create already
-// allocated (re-opening through Open would leak that reference).
-func (e *Extent) adoptCreatedHandle(path string, ino uint64, fh uint64, a *jfsmeta.Attr, flags uint32, caller fs.Caller) (fs.Handle, uint32, *fs.Attr, error) {
-	jino := jfsmeta.Ino(ino)
-	attr := &fs.Attr{Kind: fs.KindFile, Mode: 0o644}
-	keepCache := false
-	if a != nil {
-		e.vfs().UpdateLength(jino, a)
-		attr.Mode = juiceTypeToStatMode(a.Typ, a.Mode)
-		attr.Rdev = a.Rdev
-		attr.Size = int64(a.Length)
-		attr.Mtime = time.Unix(int64(a.Mtime), int64(a.Mtimensec))
-		attr.Nlink = a.Nlink
-		attr.Uid, attr.Gid, attr.HasOwner = a.Uid, a.Gid, true
-		keepCache = a.KeepCache
-	}
-	h := &extentHandle{e: e, path: path, ino: jino, fh: fh, flags: flags, openFlag: extentOpenFlags(keepCache), caller: caller}
-	e.trackLiveHandle(h)
-	return h, extentOpenFlags(keepCache), attr, nil
 }
 
 // extentHandleOf walks decorator wrappers to the extent's own handle

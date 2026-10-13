@@ -15,14 +15,14 @@ import (
 // with a cached extent routing.
 func TestPortCachedExtentInoScoping(t *testing.T) {
 	e := newTestExtent(t)
-	e.rememberExtentIno("/marked.txt", 5)
-	e.rememberExtentIno("/adir", 6)
-	if ino, ok := e.cachedIno("/unmarked.txt"); ok || ino != 0 {
+	e.paths.rememberIno("/marked.txt", 5)
+	e.paths.rememberIno("/adir", 6)
+	if ino, ok := e.paths.cachedIno("/unmarked.txt"); ok || ino != 0 {
 		t.Fatal("unmarked file must not resolve")
 	}
 	// Directories can carry routing (mirrored subtrees) — the file-only
 	// exclusion lived in the facade's stat path, not the cache.
-	if ino, ok := e.cachedIno("/adir"); !ok || ino != 6 {
+	if ino, ok := e.paths.cachedIno("/adir"); !ok || ino != 6 {
 		t.Fatalf("mirrored dir routing lost: %d/%v", ino, ok)
 	}
 }
@@ -31,12 +31,12 @@ func TestPortCachedExtentInoScoping(t *testing.T) {
 // and the negative hint together.
 func TestPortForgetInoDropsBookkeeping(t *testing.T) {
 	e := newTestExtent(t)
-	e.missRemember("/probe.txt")
-	if !e.missCached("/probe.txt") {
+	e.paths.missRemember("/probe.txt")
+	if !e.paths.missCached("/probe.txt") {
 		t.Fatal("miss not recorded")
 	}
-	e.forgetIno("/probe.txt")
-	if e.missCached("/probe.txt") {
+	e.paths.forgetIno("/probe.txt")
+	if e.paths.missCached("/probe.txt") {
 		t.Fatal("miss survived forgetIno")
 	}
 }

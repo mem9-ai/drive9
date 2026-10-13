@@ -60,6 +60,9 @@ const (
 	EnvMountAppendLogPatterns = "DRIVE9_MOUNT_APPEND_LOG_PATTERNS"
 	// EnvMountExtentPatterns adds newline-delimited extent mount rules.
 	EnvMountExtentPatterns = "DRIVE9_MOUNT_EXTENT_PATTERNS"
+	// EnvMountExtentLargeFileThresholdMB overrides the extent large-file
+	// takeover threshold (MiB; "0"/"off" disables it).
+	EnvMountExtentLargeFileThresholdMB = "DRIVE9_MOUNT_EXTENT_LARGE_FILE_THRESHOLD_MB"
 )
 
 var (
@@ -226,6 +229,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	fs.Var(&remoteOnlyPatterns, "remote-only", "force matching paths to remote-persistent storage; overrides local-only routing; repeatable; env $DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS uses one pattern per line")
 	fs.Var(&appendLogPatterns, "append-log", "use append-log sync optimization for matching remote-persistent files; repeatable; env $DRIVE9_MOUNT_APPEND_LOG_PATTERNS uses one pattern per line")
 	fs.Var(&extentPatterns, "extent", "create matching files with content_layout=extent (JuiceFS data plane); repeatable; env $DRIVE9_MOUNT_EXTENT_PATTERNS uses one pattern per line")
+	extentLargeFileThresholdMB := fs.Int64("extent-large-file-threshold-mb", 10, "claim fresh truncate-writers for the extent (JuiceFS) plane once their buffered size reaches this many MiB, replacing the presign/multipart direct-upload link; 0 disables; env $DRIVE9_MOUNT_EXTENT_LARGE_FILE_THRESHOLD_MB")
 	fs.Var(&unpackArchives, "unpack", "restore a drive9 pack archive into --local-root before mounting (repeatable)")
 	uploadConcurrency := fs.Int("upload-concurrency", 16, "maximum concurrent background uploads issued by FUSE")
 	dirCacheMaxEntries := fs.Int("dir-cache-max-entries", 200000, "maximum entries per directory in namespace cache before complete marking is disabled")
@@ -321,6 +325,11 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	}
 	explicitExtentPatterns := mergeProfileValues(envExtentPatterns, extentPatterns)
 	effectiveExtentPatterns := explicitExtentPatterns
+
+	effectiveExtentLargeFileThresholdMB, err := consumeMountExtentLargeFileThreshold(*extentLargeFileThresholdMB)
+	if err != nil {
+		return err
+	}
 
 	if objectLoc != nil {
 		if *noPersistCredentials {
@@ -723,6 +732,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),
 			PackPaths:                    append([]string(nil), effectivePackPaths...),
 			ExtentPaths:                  append([]string(nil), effectiveExtentPatterns...),
+			ExtentLargeFileThresholdMB:   effectiveExtentLargeFileThresholdMB,
 			ReadOnly:                     *readOnly,
 			Debug:                        *debug,
 			GVisorCompat:                 *gvisorCompat,
@@ -861,6 +871,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),
 			PackPaths:                    append([]string(nil), effectivePackPaths...),
 			ExtentPaths:                  append([]string(nil), effectiveExtentPatterns...),
+			ExtentLargeFileThresholdMB:   effectiveExtentLargeFileThresholdMB,
 			ReadOnly:                     *readOnly,
 			Debug:                        *debug,
 			GVisorCompat:                 *gvisorCompat,
@@ -909,6 +920,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		AppendLogPatterns:            append([]string(nil), effectiveAppendLogPatterns...),
 		PackPaths:                    append([]string(nil), effectivePackPaths...),
 		ExtentPaths:                  append([]string(nil), effectiveExtentPatterns...),
+		ExtentLargeFileThresholdMB:   effectiveExtentLargeFileThresholdMB,
 		UploadConcurrency:            *uploadConcurrency,
 		DirCacheMaxEntries:           *dirCacheMaxEntries,
 		CommitQueueMaxPending:        *commitQueueMaxPending,
