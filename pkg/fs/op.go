@@ -89,6 +89,13 @@ func (a Attr) IsSymlink() bool { return a.Kind == KindSymlink }
 type Entry struct {
 	Name string
 	Attr Attr
+	// Ino pins the FUSE inode a directory snapshot resolved the entry to.
+	// Zero = unresolved; the consumer resolves it (the facade fills it in
+	// when a listing snapshot is taken). A pinned inode keeps every
+	// READDIRPLUS page of one enumeration on the identity the first page
+	// saw, so a mid-enumeration replacement cannot serve mixed rows (the
+	// #918 snapshot fence).
+	Ino uint64
 }
 
 // Caller identifies the originating process of a kernel request.

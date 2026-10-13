@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fusecomp/httperr"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 const (
@@ -165,6 +167,11 @@ type Writeback struct {
 	// snapshotUnlinkedRemoteToShadow).
 	unlinkedMu     sync.Mutex
 	unlinkedShadow map[string]struct{}
+	// unlinkedShadowGen fences each snapshot's drop by the shadow
+	// generation it captured: a re-created path stages new bytes at a new
+	// generation, and the old object's last-fd cleanup must not remove
+	// them (#918's replacement-detach, ported).
+	unlinkedShadowGen map[string]uint64
 	// lazy mirrors Options.LazyStaging; syncerCancel stops the background
 	// WAL syncer that bounds the lazy staging power-loss window.
 	lazy         bool
@@ -532,12 +539,7 @@ func (w *Writeback) MarkPathUnlinked(p string) {
 		if meta, ok := w.pendingMeta(p); ok && meta != nil {
 			if data, kok := readShadowGenerationFenced(w.opts.Staging.Shadow, p, meta.Size); kok {
 				if err := w.opts.Staging.Shadow.WriteFull(p, data, 0); err == nil {
-					w.unlinkedMu.Lock()
-					if w.unlinkedShadow == nil {
-						w.unlinkedShadow = map[string]struct{}{}
-					}
-					w.unlinkedShadow[p] = struct{}{}
-					w.unlinkedMu.Unlock()
+					w.recordUnlinkedSnapshot(p, w.opts.Staging.Shadow.ActiveGeneration(p))
 				}
 			}
 		}
@@ -768,6 +770,20 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return fs.Result{Attr: &attr}, nil
 		}
 		return res, err
+	case fs.OpList:
+		res, err := next(ctx, op)
+		if err != nil {
+			return res, err
+		}
+		// v1/#918 resolve-dirty-and-pending-before-publication: a listing
+		// row describes the remote image, but a file whose newest image is
+		// still staged or live in a writer's buffer must not publish that
+		// stale size/mode through READDIRPLUS — the stat path answers from
+		// pendingAttr, and a listing that races a cache invalidation would
+		// otherwise serve the pre-write image while the commit is in
+		// flight.
+		res.Entries = w.overlayPendingListAttrs(op.Path, res.Entries)
+		return res, nil
 	case fs.OpCreate:
 		flags := op.Flags
 		if flags&uint32(syscall.O_CREAT) == 0 {
@@ -1934,6 +1950,110 @@ func attrFromPendingMeta(meta *staging.WriteBackMeta) (fs.Attr, bool) {
 	return fs.Attr{Kind: fs.KindFile, Mode: mode, Size: meta.Size}, true
 }
 
+// overlayPendingListAttrs rewrites and completes listing rows with this
+// mount's pending write state before the caller publishes them (the OpList
+// half of the LOOKUP/GetAttr pending overlay above). Size is authoritative
+// from the pending image — a staged image is newer than anything the remote
+// can serve, including a smaller one — while mode follows attrFromPendingMeta's
+// rule: only a PendingNew (server default 0644) or an explicit pending
+// mode answers, so a mode-less overwrite keeps the row's remote mode.
+//
+// Names are completed too: a fresh listing after a cache invalidation
+// cannot carry a file whose commit has not landed, and readdir must not
+// hide it for the landing's duration (the v1/#918 resolve-before-directory-
+// conversion contract) — staged tracks and live writers both contribute.
+func (w *Writeback) overlayPendingListAttrs(dir string, entries []fs.Entry) []fs.Entry {
+	seen := make(map[string]struct{}, len(entries))
+	for i := range entries {
+		e := &entries[i]
+		seen[e.Name] = struct{}{}
+		if e.Attr.IsDir() {
+			continue
+		}
+		if size, mode, hasMode, ok := w.pendingListAttr(pathutil.JoinPath(dir, e.Name)); ok {
+			e.Attr.Size = size
+			if hasMode {
+				e.Attr.Mode = mode
+			}
+		}
+	}
+	for _, name := range w.pendingNamesUnder(dir, seen) {
+		size, mode, _, ok := w.pendingListAttr(pathutil.JoinPath(dir, name))
+		if !ok {
+			continue
+		}
+		entries = append(entries, fs.Entry{Name: name, Attr: fs.Attr{Kind: fs.KindFile, Mode: mode, Size: size}})
+	}
+	return entries
+}
+
+// pendingListAttr resolves the newest write-plane state for one path: a
+// staged image's metadata, overridden by a live writer's buffer (its bytes
+// may not have reached staging yet — v1 snapshotted published write-back
+// metadata per listing).
+func (w *Writeback) pendingListAttr(p string) (size int64, mode uint32, hasMode, ok bool) {
+	size = -1
+	if meta, mok := w.pendingMeta(p); mok && meta != nil {
+		size = meta.Size
+		if meta.HasMode {
+			mode, hasMode = meta.Mode&0o7777, true
+		} else if meta.Kind == staging.PendingNew {
+			mode, hasMode = 0o644, true
+		}
+	}
+	if h := w.handleFor(p); h != nil && !h.unlinked {
+		h.mu.Lock()
+		if h.buf != nil {
+			size = h.buf.Size()
+		}
+		if h.hasPendingMode {
+			mode, hasMode = h.pendingMode&0o7777, true
+		} else if h.isNew && !hasMode {
+			mode, hasMode = 0o644, true
+		}
+		h.mu.Unlock()
+	}
+	if size < 0 {
+		return 0, 0, false, false
+	}
+	return size, mode, hasMode, true
+}
+
+// pendingNamesUnder collects the direct children of dir the write plane
+// still owns that the listing did not carry, in deterministic order.
+func (w *Writeback) pendingNamesUnder(dir string, seen map[string]struct{}) []string {
+	var names []string
+	add := func(p string) {
+		if pathutil.ParentPath(p) != dir {
+			return
+		}
+		name := pathutil.BaseName(p)
+		if _, dup := seen[name]; dup {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	if w.wbCache != nil {
+		for p := range w.wbCache.ListPendingPaths() {
+			add(p)
+		}
+	}
+	if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+		for p := range w.opts.Staging.Pending.ListPendingPaths() {
+			add(p)
+		}
+	}
+	w.live.Range(func(key, _ any) bool {
+		if p, ok := key.(string); ok {
+			add(p)
+		}
+		return true
+	})
+	sort.Strings(names)
+	return names
+}
+
 func attrRev(res fs.Result) int64 {
 	if res.Attr != nil {
 		return res.Attr.Rev
@@ -2077,12 +2197,25 @@ func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) {
 	if err := st.Shadow.WriteFull(h.path, buf, h.baseRev); err != nil {
 		return
 	}
+	w.recordUnlinkedSnapshot(h.path, st.Shadow.ActiveGeneration(h.path))
+}
+
+// recordUnlinkedSnapshot installs the unlink-snapshot marker with the
+// shadow generation the snapshot captured, so a later drop only removes
+// bytes that are still the snapshot's own.
+func (w *Writeback) recordUnlinkedSnapshot(path string, gen uint64) {
 	w.unlinkedMu.Lock()
+	defer w.unlinkedMu.Unlock()
 	if w.unlinkedShadow == nil {
 		w.unlinkedShadow = map[string]struct{}{}
 	}
-	w.unlinkedShadow[h.path] = struct{}{}
-	w.unlinkedMu.Unlock()
+	w.unlinkedShadow[path] = struct{}{}
+	if gen != 0 {
+		if w.unlinkedShadowGen == nil {
+			w.unlinkedShadowGen = map[string]uint64{}
+		}
+		w.unlinkedShadowGen[path] = gen
+	}
 }
 
 // unlinkedShadowServed reports whether a path has an unlink snapshot in
@@ -2099,10 +2232,26 @@ func (w *Writeback) unlinkedShadowServed(path string) bool {
 func (w *Writeback) dropUnlinkedShadow(path string) {
 	w.unlinkedMu.Lock()
 	delete(w.unlinkedShadow, path)
+	gen := w.unlinkedShadowGen[path]
+	delete(w.unlinkedShadowGen, path)
 	w.unlinkedMu.Unlock()
-	if w.opts.Staging != nil {
-		w.opts.Staging.Shadow.Remove(path)
+	if w.opts.Staging == nil {
+		return
 	}
+	// Generation-fenced removal: when the path was re-created after the
+	// unlink, its new staging replaced the snapshot's generation, and the
+	// old object's cleanup must leave the new bytes for their own commit
+	// (a plain Remove here rejected the replacement's upload as a stale
+	// payload and terminally conflicted it).
+	if gen != 0 {
+		if w.opts.Staging.Shadow.RemoveIfGeneration(path, gen) {
+			return
+		}
+		// A newer generation owns the shadow now; the snapshot's bytes are
+		// gone with the overwrite — nothing of the old object remains.
+		return
+	}
+	w.opts.Staging.Shadow.Remove(path)
 }
 
 // DrainPending reports undrained write-side work after a drain (v1

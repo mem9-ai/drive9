@@ -1876,6 +1876,7 @@ func (f *FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, filename string,
 	// leaving the alias on its own inode (stale reads through the source).
 	if entry, ok := f.inodes.GetEntry(input.Oldnodeid); ok {
 		f.inodes.AddAliasIfAbsent(input.Oldnodeid, newPath, entry.ResourceID, entry.Nlink, entry.IsDir, entry.Size, entry.Mtime)
+	} else {
 	}
 	// v1 Link advances the source inode's ctime: unlink/00's hard-link rows
 	// compare the survivor's ctime across link+unlink cycles.
@@ -2583,14 +2584,20 @@ func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.D
 		realStart = 0
 	}
 	for i := realStart; i < len(dh.entries); i++ {
-		e := dh.entries[i]
+		e := &dh.entries[i]
 		if !validDirEntryName(e.Name) {
 			continue
 		}
 		// Plain READDIR does not pin kernel lookups: observe-only inodes.
-		ino := f.inodes.EnsureInode(childPathOf(dh.path, e.Name), e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
-		f.syncExtentRouting(ino, &e)
-		if !out.AddDirEntry(gofuse.DirEntry{Name: e.Name, Ino: ino, Mode: modeBitsOf(e.Attr), Off: uint64(i + len(dots) + 1)}) {
+		// First touch resolves and pins into the snapshot: later pages of
+		// the same enumeration replay the first page's identity instead of
+		// re-resolving against a table a mid-stream replacement may have
+		// already rewired (#918's per-listing fence).
+		if e.Ino == 0 {
+			e.Ino = f.inodes.EnsureInode(childPathOf(dh.path, e.Name), e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
+			f.syncExtentRouting(e.Ino, e)
+		}
+		if !out.AddDirEntry(gofuse.DirEntry{Name: e.Name, Ino: e.Ino, Mode: modeBitsOf(e.Attr), Off: uint64(i + len(dots) + 1)}) {
 			break
 		}
 	}
@@ -2657,22 +2664,28 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		realStart = 0
 	}
 	for i := realStart; i < len(dh.entries); i++ {
-		e := dh.entries[i]
+		e := &dh.entries[i]
 		if !validDirEntryName(e.Name) {
 			continue
 		}
 		// READDIRPLUS responses pin kernel lookups, like LOOKUP. The
 		// identity-aware lookup hardlink aliases across directories onto
 		// one FUSE inode (v1): a plain Lookup would pre-map the path and
-		// the identity merge in fillEntryOut could never fire.
+		// the identity merge in fillEntryOut could never fire. First touch
+		// resolves once and pins into the snapshot; resumed pages replay
+		// the pinned identity, so a replacement that lands between two
+		// pages of one enumeration cannot mix the old and new objects in
+		// a single kernel reply set (#918's per-listing fence).
 		childP := childPathOf(dh.path, e.Name)
-		var ino uint64
-		if e.Attr.ResourceID != "" {
-			ino = f.inodes.LookupWithIdentity(childP, e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
-		} else {
-			ino = f.inodes.Lookup(childP, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
+		if e.Ino == 0 {
+			if e.Attr.ResourceID != "" {
+				e.Ino = f.inodes.LookupWithIdentity(childP, e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
+			} else {
+				e.Ino = f.inodes.Lookup(childP, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
+			}
+			f.syncExtentRouting(e.Ino, e)
 		}
-		f.syncExtentRouting(ino, &e)
+		ino := e.Ino
 		eo := out.AddDirLookupEntry(gofuse.DirEntry{Name: e.Name, Ino: ino, Mode: modeBitsOf(e.Attr), Off: uint64(i + len(dots) + 1)})
 		if eo == nil {
 			break
