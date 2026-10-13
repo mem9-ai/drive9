@@ -685,7 +685,11 @@ func TestCachedToDirEntriesRestoresLiveSize(t *testing.T) {
 	fs := &Dat9FS{inodes: NewInodeToPath()}
 	ino := fs.inodes.Lookup("/final/w0/file-000.txt", false, 32820, time.Now())
 	fs.inodes.SetExtentIno(ino, 9)
-	entries := fs.cachedToDirEntries("/final/w0", []CachedFileInfo{{Name: "file-000.txt", Size: 0}})
+	// This ID-less row was observed after the inode was created. Its routing
+	// must be cleared, while the larger live size remains authoritative.
+	entries := fs.cachedToDirEntries("/final/w0", []CachedFileInfo{{
+		Name: "file-000.txt", Size: 0, observedVersion: fs.inodes.AttrVersion(),
+	}})
 	if len(entries) != 1 {
 		t.Fatalf("entries=%d", len(entries))
 	}
@@ -703,6 +707,43 @@ func TestCachedToDirEntriesRestoresLiveSize(t *testing.T) {
 	}
 	if got, ok := fs.cachedExtentIno(ino); ok {
 		t.Fatalf("cachedExtentIno = %d, want cleared", got)
+	}
+}
+
+// A directory observation captured before a local mutation must not change
+// routing when the inode mutation fence rejects that observation.
+func TestStaleIDLessDirectoryObservationPreservesExtentRouting(t *testing.T) {
+	fs := &Dat9FS{inodes: NewInodeToPath()}
+	ino := fs.inodes.LookupWithIdentity("/dir/file", "resource-1", 1, false, 4096, time.Now())
+	fs.inodes.SetExtentIno(ino, 41)
+	observed := fs.inodes.AttrVersion()
+	fs.inodes.UpdateSize(ino, 8192)
+
+	stale := fs.cachedToDirEntries("/dir", []CachedFileInfo{{
+		Name: "file", Size: 0, observedVersion: observed,
+	}})
+	live, ok := fs.inodes.GetEntry(ino)
+	if !ok || len(stale) != 1 || stale[0].Ino != ino || stale[0].Size != 8192 || stale[0].ExtentIno != 41 || live.Size != 8192 || live.ExtentIno != 41 {
+		t.Fatalf("stale observation changed live extent routing: entries=%+v inode=%+v", stale, live)
+	}
+
+	// A fresh ID-less observation is accepted and may clear unproven routing.
+	fresh := fs.cachedToDirEntries("/dir", []CachedFileInfo{{
+		Name: "file", Size: 0, observedVersion: fs.inodes.AttrVersion(),
+	}})
+	live, _ = fs.inodes.GetEntry(ino)
+	if len(fresh) != 1 || fresh[0].ExtentIno != 0 || live.ExtentIno != 0 {
+		t.Fatalf("fresh ID-less observation kept unproven routing: entries=%+v inode=%+v", fresh, live)
+	}
+
+	// The same known resource may carry its live extent route forward.
+	fs.inodes.SetExtentIno(ino, 41)
+	same := fs.cachedToDirEntries("/dir", []CachedFileInfo{{
+		Name: "file", ResourceID: "resource-1", Size: 8192, observedVersion: fs.inodes.AttrVersion(),
+	}})
+	live, _ = fs.inodes.GetEntry(ino)
+	if len(same) != 1 || same[0].ExtentIno != 41 || live.ExtentIno != 41 {
+		t.Fatalf("same-resource observation lost extent routing: entries=%+v inode=%+v", same, live)
 	}
 }
 
@@ -829,8 +870,10 @@ func TestCachedToDirEntriesClearsRoutingFromIdLessPredecessor(t *testing.T) {
 	dir := fs.inodes.Lookup("/final/p", true, 0, time.Now())
 	fs.inodes.SetExtentIno(dir, 5)
 
+	// This fresh listing starts after the directory was created. A zero
+	// observation version would instead model an older, in-flight listing.
 	got := fs.cachedToDirEntries("/final", []CachedFileInfo{
-		{Name: "p", Size: 12, ResourceID: "file-2"},
+		{Name: "p", Size: 12, ResourceID: "file-2", observedVersion: fs.inodes.AttrVersion()},
 	})
 	if len(got) != 1 {
 		t.Fatalf("listing = %+v", got)
