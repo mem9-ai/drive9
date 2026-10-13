@@ -39,17 +39,12 @@ func TestReadDirPlusReplacedInodeKernel(t *testing.T) {
 		}
 		t.Skipf("Linux FUSE unavailable: %v", err)
 	}
-	// Strict sync only: the replacement lands synchronously, keeping the
-	// row about identity (snapshot pinning, alias retention, replacement
-	// detach). The interactive variant additionally holds the replacement
-	// in the write plane's pending window, whose unlink-survivor and
-	// queue-wait interactions are durability-plane races tracked separately
-	// (the pending READDIRPLUS contract itself is
-	// TestReadDirPlusPendingKernel's).
-	for _, sizes := range [][2]int{{4096, 8192}, {8192, 512}} {
-		t.Run(fmt.Sprintf("%d-to-%d", sizes[0], sizes[1]), func(t *testing.T) {
-			testReadDirPlusReplacedInodeKernel(t, "strict", sizes[0], sizes[1])
-		})
+	for _, mode := range []string{"interactive", "strict"} {
+		for _, sizes := range [][2]int{{4096, 8192}, {8192, 512}} {
+			t.Run(fmt.Sprintf("%s/%d-to-%d", mode, sizes[0], sizes[1]), func(t *testing.T) {
+				testReadDirPlusReplacedInodeKernel(t, mode, sizes[0], sizes[1])
+			})
+		}
 	}
 }
 
@@ -301,21 +296,12 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, mode string, oldSize, newS
 	if !aliasEqual {
 		t.Fatalf("alias remote payload replaced: head=%q", string(remote["/0-alias.dat"][:min(len(remote["/0-alias.dat"]), 8)]))
 	}
-	probe, perr := os.Open(alias)
-	if perr != nil {
-		t.Fatalf("reopen alias: %v", perr)
-	}
-	probeGot := make([]byte, oldSize)
-	if _, err := probe.ReadAt(probeGot, 0); err != nil && err != io.EOF {
-		t.Fatalf("reopen read: %v", err)
-	}
-	_ = probe.Close()
 	got := make([]byte, oldSize+1)
 	n, err := oldFD.ReadAt(got, 0)
 	if err != nil && err != io.EOF {
 		t.Fatal(err)
 	}
 	if n != oldSize || !bytes.Equal(got[:n], oldData) {
-		t.Errorf("old FD read %d bytes (fresh-fd head=%q), want intact %d-byte payload", n, string(probeGot[:min(len(probeGot), 8)]), oldSize)
+		t.Errorf("old FD read %d bytes, want intact %d-byte payload", n, oldSize)
 	}
 }

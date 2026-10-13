@@ -490,6 +490,13 @@ func (f *FS) maybeRunDeferredUnlink(ino uint64) {
 	}
 	delete(f.deferredUnlinks, ino)
 	f.mu.Unlock()
+	// The deferred delete belongs to the object captured at unlink time. A
+	// path that has since been rebound to a NEWER object (unlink + recreate
+	// before the last handle closed) must not be deleted on the old
+	// object's behalf — the replacement's own landing owns the name now.
+	if cur, ok := f.inodes.GetInode(path); ok && cur != ino {
+		return
+	}
 	// Synchronous with a detached budget (v1: release completes the
 	// survivor deletion before replying, so the storage is gone at close).
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
@@ -509,15 +516,22 @@ func (f *FS) maybeRunDeferredUnlink(ino uint64) {
 func (f *FS) flushDeferredUnlink(path string) {
 	f.mu.Lock()
 	found := false
+	var deferredIno uint64
 	for i, p := range f.deferredUnlinks {
 		if p == path {
 			found = true
+			deferredIno = i
 			delete(f.deferredUnlinks, i)
 			break
 		}
 	}
 	f.mu.Unlock()
 	if !found {
+		return
+	}
+	// Same identity fence as maybeRunDeferredUnlink: a name rebound to a
+	// newer object is not this deferred delete's to remove.
+	if cur, ok := f.inodes.GetInode(path); ok && cur != deferredIno {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
@@ -1698,13 +1712,32 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		// the last close — deferring the delete keeps fd reads working in a
 		// sync core with no local data plane.
 		f.openIdx.UnlinkPath(child)
+		// Capture the ino and a surviving alias before the preserve drops
+		// the byPath mapping: handles of a hardlinked inode may have been
+		// keyed at EITHER name at open (FUSE OPEN carries only the nodeid,
+		// so GetPath picks the inode's primary path), and a handle left
+		// keyed at the doomed name would serve the REPLACEMENT object's
+		// write state through the write plane's read-your-writers overlay
+		// once the name is recycled (#1029). Rebind them onto the survivor
+		// BEFORE the unlink marking: a survivor-keyed handle is an ordinary
+		// reader of a live name and needs no unlink snapshot at all.
+		ino, iok := f.inodes.GetInode(child)
+		if iok {
+			if survivor, sok := f.inodes.SurvivorOfInode(ino, child); sok {
+				for _, h := range f.chain.Handlers() {
+					if rt, ok := h.(interface {
+						RetargetPath(oldPath, newPath string)
+					}); ok {
+						rt.RetargetPath(child, survivor)
+					}
+				}
+			}
+		}
 		for _, h := range f.chain.Handlers() {
 			if mu, ok := h.(interface{ MarkPathUnlinked(string) }); ok {
 				mu.MarkPathUnlinked(child)
 			}
 		}
-		// Capture the ino before the preserve drops the byPath mapping.
-		ino, iok := f.inodes.GetInode(child)
 		f.inodes.RemoveLinkPreserve(child)
 		if iok {
 			f.mu.Lock()

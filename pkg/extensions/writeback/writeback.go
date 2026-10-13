@@ -2299,24 +2299,43 @@ func (w *Writeback) retarget(oldPath, newPath string) {
 	w.liveSet.Range(func(key, _ any) bool {
 		h := key.(*bufferingHandle)
 		h.mu.Lock()
+		next := ""
 		switch {
 		case h.path == oldPath:
 			if cur, ok := w.live.Load(oldPath); ok && cur == h {
 				w.live.Delete(oldPath)
 				w.live.Store(newPath, h)
 			}
-			h.path = newPath
+			next = newPath
 		case strings.HasPrefix(h.path, prefix):
-			next := newPath + strings.TrimPrefix(h.path, oldPath)
+			next = newPath + strings.TrimPrefix(h.path, oldPath)
 			if cur, ok := w.live.Load(h.path); ok && cur == h {
 				w.live.Delete(h.path)
 				w.live.Store(next, h)
 			}
+		}
+		if next != "" {
 			h.path = next
+			// The wrapped read handle is path-bound too (core's SyncHandle
+			// fetches by its own path): rebind it or the fd keeps reading
+			// the doomed name — which a later replacement owns (#1029).
+			if rt, ok := h.inner.(interface{ RetargetTo(newPath string) }); ok {
+				rt.RetargetTo(next)
+			}
 		}
 		h.mu.Unlock()
 		return true
 	})
+}
+
+// RetargetPath rebinds open write-plane handles keyed at oldPath onto
+// newPath — the facade's deferred-unlink survivor hook. FUSE OPEN carries
+// only the nodeid, so a hardlinked inode's open may have keyed the handle
+// at any of its names; a handle left on a name that is later unlinked and
+// recreated would read the replacement object's write state through the
+// read-your-writers overlay (#1029).
+func (w *Writeback) RetargetPath(oldPath, newPath string) {
+	w.retarget(oldPath, newPath)
 }
 
 // probeExisting resolves a path's existence through the chain — the

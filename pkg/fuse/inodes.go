@@ -912,6 +912,26 @@ func (m *InodeToPath) Remove(path string) {
 	m.removePathLocked(path, false, false)
 }
 
+// SurvivorOfInode returns a remaining path of ino other than doomed: the
+// unlink-survivor target for handles keyed at the doomed name. byPath may
+// already have dropped doomed; the inode's path set still knows its
+// aliases, so the deferred-delete bookkeeping can rebind handles even
+// after the mapping is gone.
+func (m *InodeToPath) SurvivorOfInode(ino uint64, doomed string) (string, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return "", false
+	}
+	for p := range entry.Paths {
+		if p != doomed {
+			return p, true
+		}
+	}
+	return "", false
+}
+
 // RemoveLink removes one path mapping for a successful unlink-like operation.
 func (m *InodeToPath) RemoveLink(path string) {
 	m.mu.Lock()

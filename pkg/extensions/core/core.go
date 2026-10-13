@@ -340,6 +340,14 @@ type SyncHandle struct {
 	path string
 }
 
+// RetargetTo rebinds the handle onto another name of the same object (the
+// write plane's deferred-unlink survivor hook, #1029): the handle reads by
+// path, and a name that is unlinked and later recreated belongs to a
+// different object by then.
+func (h *SyncHandle) RetargetTo(newPath string) {
+	h.path = newPath
+}
+
 // Read fills dest with content at off.
 func (h *SyncHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	data, err := h.core.fetchRemote(ctx, h.core.remotePath(h.path), off, int64(len(dest)))
