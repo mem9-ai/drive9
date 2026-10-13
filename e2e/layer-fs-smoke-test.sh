@@ -706,11 +706,12 @@ main() {
   # --- fork: client-side deep copy; the child pins the parent tip ----------
   local fork_parent="forkp-$ts"
   local fork_child="forkc-$ts"
-  drive9_retry fs layer create --name "$fork_parent" ":$root" >/dev/null
+  local fork_parent_id
+  fork_parent_id=$(drive9_retry fs layer create --name "$fork_parent" ":$root")
   printf 'parent a' >"$CLI_HOME/a.txt"
   drive9_retry fs cp --layer "$fork_parent" "$CLI_HOME/a.txt" ":$root/a.txt" >/dev/null
   local child_id
-  child_id=$(drive9_retry fs layer fork --name "$fork_child" "name:$fork_parent")
+  child_id=$(drive9_retry fs layer fork --name "$fork_child" "$fork_parent")
   check_cmd "fs layer fork prints the child id" test -n "$child_id"
   # post-fork parent writes stay invisible to the child
   printf 'parent b' >"$CLI_HOME/b.txt"
@@ -788,7 +789,7 @@ run_fuse_section() {
   local log="$FUSE_MOUNT_ROOT/drive9-layer-$ts.log"
   trap 'stop_mount' EXIT
 
-  start_layer_mount "name:$fuse_layer" "" "$root" "$mp" "$lroot" "$log"
+  start_layer_mount "$fuse_layer" "" "$root" "$mp" "$lroot" "$log"
 
   # the classic view is visible through the shadow
   check_eq "layer mount reads classic content" "$(cat "$mp/base.txt")" "live moved on"
@@ -835,9 +836,8 @@ run_fuse_section() {
 
   # --- hot checkout: live mount switches views without umount -------------
   local co_layer="co-$ts"
-  drive9_retry fs layer create --name "$co_layer" ":$root" >/dev/null
   local co_id
-  co_id=$(drive9_retry fs layer status --json "$co_layer" | jq -r '.layer_id')
+  co_id=$(drive9_retry fs layer create --name "$co_layer" ":$root")
   printf 'from co layer' >"$CLI_HOME/co.txt"
   drive9_retry fs cp --layer "$co_layer" "$CLI_HOME/co.txt" ":$root/co.txt" >/dev/null
 
@@ -852,7 +852,7 @@ run_fuse_section() {
 
   check_eq "live mount cannot see the layer file" "$(test -e "$mp2/co.txt" && echo present || echo absent)" "absent"
 
-  drive9 fs layer checkout --mount "$mp2" "name:$co_layer" >/dev/null
+  drive9 fs layer checkout --mount "$mp2" "$co_layer" >/dev/null
   check_eq "hot checkout exposes the layer tree" "$(wait_mounted_layer_file "$mp2/co.txt" "from co layer" >/dev/null && echo ok || echo fail)" "ok"
   printf 'via checkout' >"$mp2/co2.txt"
   sync; sleep 1
