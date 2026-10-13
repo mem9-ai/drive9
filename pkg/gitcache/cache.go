@@ -939,31 +939,6 @@ func SliceRead(data []byte, offset, size int64) []byte {
 	return out
 }
 
-func readFileRange(f *os.File, fileSize, offset, size int64) ([]byte, bool, error) {
-	if offset < 0 {
-		return nil, true, nil
-	}
-	if offset >= fileSize {
-		return nil, true, nil
-	}
-	end := fileSize
-	if size >= 0 {
-		end = offset + size
-	}
-	if end > fileSize {
-		end = fileSize
-	}
-	if end < offset {
-		return nil, true, nil
-	}
-	buf := make([]byte, end-offset)
-	n, err := f.ReadAt(buf, offset)
-	if err != nil && err != io.EOF {
-		return nil, true, err
-	}
-	return buf[:n], true, nil
-}
-
 func treeFilePath(localRoot, workspaceID, commit, rel string) (string, error) {
 	clean, err := CleanRelative(rel)
 	if err != nil {

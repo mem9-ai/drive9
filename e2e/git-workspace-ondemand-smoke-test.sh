@@ -560,14 +560,36 @@ cleanup_suite_workspaces() {
 
 wait_path_has_fixture_readme() {
   local path="$1"
-  local i
+  local i last_obs
   for i in $(seq 1 40); do
     if [ -f "$path" ] && grep -q "Drive9 fixture" "$path" 2>/dev/null; then
       return 0
     fi
+    last_obs="$(ls -la "$path" 2>&1 | head -2; head -c 64 "$path" 2>&1 | head -1)"
     # Discovery is event-driven; the ls is only a benign poll tick.
     ls "$(dirname "$path")" >/dev/null 2>&1 || true
     sleep 1
+  done
+  echo "wait_path_has_fixture_readme: $path never satisfied; last observation:" >&2
+  printf '%s\n' "$last_obs" >&2
+  # Store forensics: does the fs-native tree content actually exist where
+  # the mount resolves it? Dump index, manifests, and tree listings.
+  local idx_dump id head_commit rel_repo rel_base
+  rel_repo="$(basename "$(dirname "$path")")"
+  rel_base="$(basename "$path")"
+  idx_dump="$(curl -sS -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/.drive9/git-workspaces/index.json" || true)"
+  echo "index: $(printf '%s' "$idx_dump" | head -c 600)" >&2
+  for id in $(printf '%s' "$idx_dump" | jq -r --arg root "$REMOTE_ROOT/$rel_repo" '.workspaces[]? | select((.root_path|sub("/$";""))==$root) | .workspace_id' 2>/dev/null); do
+    echo "manifest $id: $(curl -sS -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/.drive9/git-workspaces/$id/manifest.json" || true | head -c 400)" >&2
+    head_commit="$(curl -sS -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/.drive9/git-workspaces/$id/manifest.json" 2>/dev/null | jq -r '.head_commit // empty')"
+    if [ -n "$head_commit" ]; then
+      echo "tree $id/$head_commit listing:" >&2
+      curl -sS -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/.drive9/git-workspaces/$id/tree/$head_commit/?list=1" 2>&1 | head -c 500 >&2
+      echo >&2
+      echo "direct read of $rel_base:" >&2
+      curl -sS -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/.drive9/git-workspaces/$id/tree/$head_commit/$rel_base" 2>&1 | head -c 200 >&2
+      echo >&2
+    fi
   done
   return 1
 }

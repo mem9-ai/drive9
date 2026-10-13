@@ -89,6 +89,54 @@ func StatePath(id string) string { return WorkspaceDir(id) + "/state" }
 // TreeIndexPath is the tracked-path oracle written by the git tooling.
 func TreeIndexPath(id string) string { return WorkspaceDir(id) + "/tree-index.json" }
 
+// ValidateCommit rejects commit names that could escape tree/ before they
+// are concatenated into store paths (a manifest-supplied head such as
+// "../../manifest.json" must never redirect tree reads or writes). Git
+// object ids are 40/64-char hex; anything with separators or traversal is
+// refused outright.
+func ValidateCommit(commit string) error {
+	commit = strings.TrimSpace(commit)
+	if commit == "" {
+		return fmt.Errorf("gitws: commit is empty")
+	}
+	if isHexOID(commit) {
+		return nil
+	}
+	return fmt.Errorf("gitws: invalid commit name %q", commit)
+}
+
+func isHexOID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateChecksumName rejects checksums used as store file names that
+// could carry path structure (the pointer document is store-writable, so
+// its body reference must stay a flat hex name).
+func ValidateChecksumName(checksum string) error {
+	checksum = strings.TrimSpace(checksum)
+	if checksum == "" || len(checksum) > 128 || !isHexOIDLower(checksum) {
+		return fmt.Errorf("gitws: invalid checksum name %q", checksum)
+	}
+	return nil
+}
+
+func isHexOIDLower(s string) bool {
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // TreeDir is the clean-tree content root for one commit.
 func TreeDir(id, commit string) string {
 	return WorkspaceDir(id) + "/tree/" + strings.TrimSpace(commit)
@@ -138,11 +186,20 @@ func PackPath(id, packID string) string {
 // PackMetaPath is the pack's sidecar metadata document.
 func PackMetaPath(id, packID string) string { return PackPath(id, packID) + ".json" }
 
-// GitStatePath is the .git state archive (tar.gz, objects excluded).
-func GitStatePath(id string) string { return WorkspaceDir(id) + "/git-state.tar.gz" }
-
-// GitStateMetaPath is the archive's sidecar metadata document.
+// GitStateMetaPath is the current state pointer document: it names the
+// content-addressed archive body that belongs with it, so concurrent
+// checkpoints can never pair one archive with another's metadata.
 func GitStateMetaPath(id string) string { return WorkspaceDir(id) + "/git-state.json" }
+
+// GitStateDir holds the content-addressed .git state archive versions
+// (tar.gz, objects excluded).
+func GitStateDir(id string) string { return WorkspaceDir(id) + "/git-state" }
+
+// GitStateBodyPath is one immutable archive version, named by its own
+// checksum; the pointer selects the current one.
+func GitStateBodyPath(id, checksum string) string {
+	return GitStateDir(id) + "/" + strings.TrimSpace(checksum) + ".tar.gz"
+}
 
 // PackIDFor derives the content-addressed pack id (retried checkpoints
 // dedupe to the same id).

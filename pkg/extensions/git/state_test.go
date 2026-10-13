@@ -127,7 +127,7 @@ func TestPortGitStateCheckpointUploadsPackAndArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, ok := b.Node(gitws.GitStatePath("ws1")); !ok {
+	if _, ok := b.Node(gitws.GitStateMetaPath("ws1")); !ok {
 		t.Fatal("checkpoint did not store the git state archive")
 	}
 	packs, err := g.listObjectPacks(ctx, "ws1")

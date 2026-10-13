@@ -578,6 +578,9 @@ func ExampleClient_eventsLayersGitAndJournal() {
 			SizeBytes: 9,
 		}})
 		_, _ = c.GitWorkspaceFSGetTreeIndex(ctx, ws.WorkspaceID)
+		// Clean-tree content upload (hydrate publish).
+		_ = c.GitWorkspaceFSPutTreeFile(ctx, ws.WorkspaceID, "abc123", "README.md", strings.NewReader("README"), 6)
+		_ = c.GitWorkspaceFSPutTreeSymlink(ctx, ws.WorkspaceID, "abc123", "link", "README.md")
 		// .git state and incremental object packs.
 		_ = c.GitWorkspaceFSPutGitState(ctx, ws.WorkspaceID, "abc123", []byte("git state"))
 		_, _ = c.GitWorkspaceFSGetGitState(ctx, ws.WorkspaceID)
@@ -695,6 +698,20 @@ var coveredClientMethods = map[string]bool{
 	"AppendLog":                            true,
 	"APIKey":                               true,
 	"ArchiveDir":                           true,
+	"GitWorkspaceFSDelete":                 true,
+	"GitWorkspaceFSGet":                    true,
+	"GitWorkspaceFSGetByRoot":              true,
+	"GitWorkspaceFSGetGitState":            true,
+	"GitWorkspaceFSGetObjectPack":          true,
+	"GitWorkspaceFSGetTreeIndex":           true,
+	"GitWorkspaceFSList":                   true,
+	"GitWorkspaceFSListObjectPacks":        true,
+	"GitWorkspaceFSPutGitState":            true,
+	"GitWorkspaceFSPutObjectPack":          true,
+	"GitWorkspaceFSPutTreeFile":            true,
+	"GitWorkspaceFSPutTreeIndex":           true,
+	"GitWorkspaceFSPutTreeSymlink":         true,
+	"GitWorkspaceFSUpsert":                 true,
 	"BaseURL":                              true,
 	"BatchReadSmallCtx":                    true,
 	"BatchStatCtx":                         true,

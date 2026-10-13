@@ -7,6 +7,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -506,4 +507,198 @@ func TestRemoteRootRerootingAndStableTreeMtime(t *testing.T) {
 	if g.RoutesLocal("/other/.git/config") {
 		t.Fatal("unregistered root declared local")
 	}
+}
+
+// Blacked-out tracked paths answer ENOENT for plain write opens; only
+// O_CREAT may revive them (POSIX).
+func TestBlackoutWriteOpenRequiresOCreat(t *testing.T) {
+	b := testbackend.NewBackend()
+	seedGitWorkspaceFS(t, b, "ws-1", "/repo", map[string]string{"a": "x"})
+	ch, _ := newStack(t, b)
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/repo/a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/repo/a", Flags: uint32(syscall.O_WRONLY)}); err == nil {
+		t.Fatal("write open of blacked-out path without O_CREAT succeeded")
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/repo/a", Flags: uint32(syscall.O_WRONLY | syscall.O_CREAT), Mode: 0o644})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("O_CREAT revival open = %+v %v", res, err)
+	}
+	if err := res.Handle.Write(ctx, 0, []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	data, err := read(t, ch, "/repo/a")
+	if err != nil || string(data) != "new" {
+		t.Fatalf("revived content = %q %v", data, err)
+	}
+}
+
+// Path-based setattr on a clean tracked path mirrors the tree image once
+// and applies on top (first-modification copy semantics).
+func TestSetAttrMirrorsCleanTreePath(t *testing.T) {
+	b := testbackend.NewBackend()
+	seedGitWorkspaceFS(t, b, "ws-1", "/repo", map[string]string{"a.txt": "hello"})
+	ch, _ := newStack(t, b)
+	ctx := context.Background()
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/repo/a.txt", Size: 2, HasMode: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Attr == nil || res.Attr.Size != 2 {
+		t.Fatalf("truncate attr = %+v", res.Attr)
+	}
+	if n, _ := b.Node(gitws.OverlayPath("ws-1", "a.txt")); string(n.Data) != "he" {
+		t.Fatalf("mirror after truncate = %q", n.Data)
+	}
+	// chmod(000): Mode==0 with HasMode set must still apply.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/repo/a.txt", Mode: 0, HasMode: true}); err != nil {
+		t.Fatal(err)
+	}
+	attr, err := get(t, ch, "/repo/a.txt")
+	if err != nil || attr.Mode != 0 {
+		t.Fatalf("chmod 000 attr = %+v %v", attr, err)
+	}
+}
+
+// Discovery loading a workspace flushes the cached view of its root: a
+// listing taken before discovery (classic-only) must not keep answering
+// lookups with ENOENT after the workspace view appears.
+func TestDiscoveryInvalidatesRootView(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeChain, err := fs.NewChain(terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := fs.NewEventBus()
+	g, err := New(Options{Store: fs.HandlerFilesystem(storeChain.Dispatch), Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// First discovery: empty index, nothing loaded, no invalidations.
+	invalidated := make(chan string, 4)
+	bus.On(fs.EventInvalidated, func(e fs.Event) { invalidated <- e.Path })
+	g.Reload(ctx)
+	select {
+	case p := <-invalidated:
+		t.Fatalf("empty discovery invalidated %q", p)
+	default:
+	}
+
+	// Register a workspace behind the extension's back, then reload.
+	seedGitWorkspaceFS(t, b, "ws-1", "/repo", map[string]string{"a": "x"})
+	g.Reload(ctx)
+	select {
+	case p := <-invalidated:
+		if p != "/repo" {
+			t.Fatalf("invalidated %q, want /repo", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("discovery did not invalidate the new workspace root")
+	}
+}
+
+// Store rewrites must never flow through the main chain: its terminal
+// prefixes the mount's RemoteRoot, so on a subtree mount (:/sub) a store
+// path would stat <root>/.drive9/... and 404 — the exact failure the
+// local-e2e git suites caught (stat served from the in-memory index, open
+// ENOENT). This stack reproduces that shape: a MAIN chain whose terminal
+// carries a RemoteRoot, git outside it, and the store tail absolute.
+func TestSubtreeMountServesCleanTreeThroughStoreView(t *testing.T) {
+	b := testbackend.NewBackend()
+	seedGitWorkspaceFS(t, b, "ws-1", "/sub/repo", map[string]string{"a.txt": "hello"})
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+
+	// The main chain's terminal carries the subtree root, like the real
+	// mount's coreExt. The store tail's terminal is tenant-absolute.
+	mainCore, err := core.New(cl, core.Options{RemoteRoot: "/sub"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeCore, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tailChain, err := fs.NewChain(storeCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := New(Options{Store: fs.HandlerFilesystem(tailChain.Dispatch), RemoteRoot: "/sub"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(g, mainCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	g.Reload(ctx)
+
+	// Attr serves from the in-memory index; the content must come from
+	// the store view (tenant-absolute), not the prefixed main chain.
+	if _, err := get(t, ch, "/repo/a.txt"); err != nil {
+		t.Fatalf("clean attr: %v", err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/a.txt"})
+	if err != nil || string(res.Data) != "hello" {
+		t.Fatalf("clean read = %q %v (store path leaked into the RemoteRoot-prefixed main chain?)", res.Data, err)
+	}
+	openRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/repo/a.txt", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil || openRes.Handle == nil {
+		t.Fatalf("plain open = %+v %v", openRes, err)
+	}
+	buf := make([]byte, 8)
+	n, rerr := openRes.Handle.Read(ctx, 0, buf)
+	if rerr != nil || string(buf[:n]) != "hello" {
+		t.Fatalf("handle read = %q %v", buf[:n], rerr)
+	}
+}
+
+// Directory listings carry the tree index's attrs (exec bits especially),
+// not the store file's own 0644: a 755 script listing as 644 makes git
+// status report the file modified forever.
+func TestTreeListingServesIndexMode(t *testing.T) {
+	b := testbackend.NewBackend()
+	seedGitWorkspaceFS(t, b, "ws-1", "/repo", map[string]string{"run.sh": "run"})
+	// Overwrite the tree index with a 755 entry.
+	ti, err := gitws.EncodeTreeIndex(&gitws.TreeIndex{Commit: testCommit, Entries: []gitws.TreeEntry{
+		{Path: "run.sh", Kind: "file", Mode: "100755", Size: 3},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Seed(gitws.TreeIndexPath("ws-1"), ti)
+	ch, _ := newStack(t, b)
+	ctx := context.Background()
+
+	list, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpList, Path: "/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range list.Entries {
+		if e.Name == "run.sh" {
+			if e.Attr.Mode != 0o755 {
+				t.Fatalf("listing mode = %o, want 755 from the tree index", e.Attr.Mode)
+			}
+			return
+		}
+	}
+	t.Fatal("run.sh missing from listing")
 }

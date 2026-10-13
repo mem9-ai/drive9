@@ -49,7 +49,7 @@ func (g *Git) landOverlayFile(ctx context.Context, w *workspace, rel string, ima
 	if err := g.clearBlackout(ctx, w, rel); err != nil {
 		return err
 	}
-	if err := store.Write(ctx, p, image, fs.WriteOptions{Mode: mode}); err != nil {
+	if err := store.Write(ctx, p, image, fs.WriteOptions{Mode: mode, Truncate: true}); err != nil {
 		return fmt.Errorf("git: overlay write %s: %w", rel, err)
 	}
 	w.set(rel, overlayNode{kind: fs.KindFile, mode: mode, size: int64(len(image)), mtime: time.Now()})
@@ -126,7 +126,7 @@ func (g *Git) setBlackout(ctx context.Context, w *workspace, rel string) error {
 	if err := store.EnsureParent(ctx, storeDirOf(p)); err != nil {
 		return fmt.Errorf("git: blackout parent %s: %w", rel, err)
 	}
-	if err := store.Write(ctx, p, []byte(gitws.StateDeleted+"\n"), fs.WriteOptions{Mode: 0o644}); err != nil {
+	if err := store.Write(ctx, p, []byte(gitws.StateDeleted+"\n"), fs.WriteOptions{Mode: 0o644, Truncate: true}); err != nil {
 		return fmt.Errorf("git: blackout write %s: %w", rel, err)
 	}
 	w.set(rel, overlayNode{blackout: true})
@@ -156,7 +156,7 @@ func (g *Git) putObjectPack(ctx context.Context, id string, content []byte) (str
 	if err := store.EnsureParent(ctx, gitws.PacksDir(id)); err != nil {
 		return "", err
 	}
-	if err := store.Write(ctx, gitws.PackPath(id, packID), content, fs.WriteOptions{Mode: 0o644}); err != nil {
+	if err := store.Write(ctx, gitws.PackPath(id, packID), content, fs.WriteOptions{Mode: 0o644, Truncate: true}); err != nil {
 		return "", fmt.Errorf("git: pack write %s: %w", packID, err)
 	}
 	meta, err := json.Marshal(gitws.PackMeta{
@@ -167,32 +167,40 @@ func (g *Git) putObjectPack(ctx context.Context, id string, content []byte) (str
 	if err != nil {
 		return "", err
 	}
-	if err := store.Write(ctx, gitws.PackMetaPath(id, packID), meta, fs.WriteOptions{Mode: 0o644}); err != nil {
+	if err := store.Write(ctx, gitws.PackMetaPath(id, packID), meta, fs.WriteOptions{Mode: 0o644, Truncate: true}); err != nil {
 		return "", fmt.Errorf("git: pack meta write %s: %w", packID, err)
 	}
 	return packID, nil
 }
 
-// putGitState stores the .git state archive plus its sidecar metadata.
+// putGitState stores the .git state archive as one atomic version: the
+// body lands content-addressed (concurrent checkpoints from the CLI and
+// other mounts write distinct immutable files), and the pointer document
+// switches to it last, so a reader can never pair one archive with
+// another's metadata.
 func (g *Git) putGitState(ctx context.Context, id, checkpointCommit string, content []byte) error {
 	store := g.storeView()
 	if store == nil {
 		return errStoreMissing
 	}
+	checksum := gitws.ChecksumHex(content)
+	if err := store.EnsureParent(ctx, gitws.GitStateDir(id)); err != nil {
+		return fmt.Errorf("git: state dir: %w", err)
+	}
+	if err := store.Write(ctx, gitws.GitStateBodyPath(id, checksum), content, fs.WriteOptions{Mode: 0o644, Truncate: true}); err != nil {
+		return fmt.Errorf("git: state write: %w", err)
+	}
 	meta, err := json.Marshal(gitws.GitStateMeta{
 		CheckpointCommit: checkpointCommit,
 		StorageType:      gitStateStorageTarGzNoObjects,
-		ChecksumSHA256:   gitws.ChecksumHex(content),
+		ChecksumSHA256:   checksum,
 		SizeBytes:        int64(len(content)),
 		CreatedAt:        gitws.NowUTC(),
 	})
 	if err != nil {
 		return err
 	}
-	if err := store.Write(ctx, gitws.GitStatePath(id), content, fs.WriteOptions{Mode: 0o644}); err != nil {
-		return fmt.Errorf("git: state write: %w", err)
-	}
-	if err := store.Write(ctx, gitws.GitStateMetaPath(id), meta, fs.WriteOptions{Mode: 0o644}); err != nil {
+	if err := store.Write(ctx, gitws.GitStateMetaPath(id), meta, fs.WriteOptions{Mode: 0o644, Truncate: true}); err != nil {
 		return fmt.Errorf("git: state meta write: %w", err)
 	}
 	return nil
@@ -222,7 +230,10 @@ func (g *Git) getGitState(ctx context.Context, id string) (storedGitState, bool,
 	if err := json.Unmarshal(metaBody, &meta); err != nil {
 		return storedGitState{}, false, fmt.Errorf("git: state meta parse: %w", err)
 	}
-	content, err := store.Read(ctx, gitws.GitStatePath(id), 0, 0)
+	if err := gitws.ValidateChecksumName(meta.ChecksumSHA256); err != nil {
+		return storedGitState{}, false, err
+	}
+	content, err := store.Read(ctx, gitws.GitStateBodyPath(id, meta.ChecksumSHA256), 0, 0)
 	if err != nil {
 		if fs.IsNotFound(err) {
 			return storedGitState{}, false, nil
@@ -242,15 +253,49 @@ func (g *Git) getGitState(ctx context.Context, id string) (storedGitState, bool,
 	}, true, nil
 }
 
-// storedObjectPack is the restore-side view of one stored pack.
+// storedObjectPack is the restore-side view of one stored pack (metadata
+// only; the body is fetched per pack so a multi-pack workspace never
+// holds every 256 MiB body at once).
 type storedObjectPack struct {
 	packID         string
 	checksumSHA256 string
 	sizeBytes      int64
-	content        []byte
 }
 
-// listObjectPacks enumerates the stored packs (metadata + bodies).
+// fetchObjectPack loads one pack body (checksum verified).
+func (g *Git) fetchObjectPack(ctx context.Context, id, packID, checksumSHA256 string, sizeBytes int64) ([]byte, error) {
+	store := g.storeView()
+	if store == nil {
+		return nil, errStoreMissing
+	}
+	metaBody, err := store.Read(ctx, gitws.PackMetaPath(id, packID), 0, 0)
+	if err != nil {
+		if fs.IsNotFound(err) {
+			return nil, fs.ErrNotFound
+		}
+		return nil, err
+	}
+	var meta gitws.PackMeta
+	if err := json.Unmarshal(metaBody, &meta); err != nil {
+		return nil, fmt.Errorf("git: pack meta parse %s: %w", packID, err)
+	}
+	content, err := store.Read(ctx, gitws.PackPath(id, packID), 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	if (sizeBytes != 0 || meta.SizeBytes != 0) && meta.SizeBytes != int64(len(content)) && sizeBytes != int64(len(content)) {
+		return nil, fmt.Errorf("git object pack %s size mismatch", packID)
+	}
+	if checksumSHA256 == "" {
+		checksumSHA256 = meta.ChecksumSHA256
+	}
+	if checksumSHA256 != "" && !strings.EqualFold(checksumSHA256, gitws.ChecksumHex(content)) {
+		return nil, fmt.Errorf("git object pack %s checksum mismatch", packID)
+	}
+	return content, nil
+}
+
+// listObjectPacks enumerates the stored packs (metadata only).
 func (g *Git) listObjectPacks(ctx context.Context, id string) ([]storedObjectPack, error) {
 	store := g.storeView()
 	if store == nil {
@@ -280,18 +325,10 @@ func (g *Git) listObjectPacks(ctx context.Context, id string) ([]storedObjectPac
 		if err := json.Unmarshal(metaBody, &meta); err != nil {
 			return nil, fmt.Errorf("git: pack meta parse %s: %w", packID, err)
 		}
-		content, err := store.Read(ctx, gitws.PackPath(id, packID), 0, 0)
-		if err != nil {
-			if fs.IsNotFound(err) {
-				continue
-			}
-			return nil, err
-		}
 		packs = append(packs, storedObjectPack{
 			packID:         packID,
 			checksumSHA256: meta.ChecksumSHA256,
 			sizeBytes:      meta.SizeBytes,
-			content:        content,
 		})
 	}
 	return packs, nil

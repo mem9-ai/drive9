@@ -80,9 +80,9 @@ func gitClone(args []string) error {
 	fs := flag.NewFlagSet("git clone", flag.ContinueOnError)
 	fast := fs.Bool("fast", false, "use drive9 git fast clone")
 	blobless := fs.Bool("blobless", false, "use a blobless partial local .git; clean blobs lazy-fetch from the remote")
-	hydrate := fs.String("hydrate", "auto", "blobless clean tree hydrate strategy: auto, background, sync, or off")
+	hydrate := fs.String("hydrate", "auto", "clean tree publish strategy: auto, background, sync, or off (off = blobless metadata-only; full clones always publish)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: drive9 git clone --fast [--blobless] [--hydrate=background|sync|off] <repo-url> <mounted-path>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: drive9 git clone --fast [--blobless] [--hydrate=auto|background|sync|off] <repo-url> <mounted-path>\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -207,7 +207,15 @@ func gitClone(args []string) error {
 	registered = true
 
 	fmt.Fprintf(os.Stderr, "drive9: registered git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, resolved.RemotePath, len(nodes))
-	if *blobless {
+	{
+		if !*blobless {
+			// A full clone holds the entire tree locally; publishing it to
+			// the store is one upload pass and is not optional — the
+			// FS-native extension serves clean reads only from
+			// tree/<commit>/, so an unpublished tree would stat but never
+			// read. The hydrate flag governs the blobless prefetch only.
+			hydrateMode = gitHydrateModeSync
+		}
 		switch hydrateMode {
 		case gitHydrateModeSync:
 			ctx, cancel := context.WithTimeout(context.Background(), gitHydrateTimeout)
@@ -261,7 +269,7 @@ func gitWorktreeAdd(args []string) error {
 	branch := fs.String("b", "", "create a new branch for the worktree")
 	detach := fs.Bool("detach", false, "detach HEAD in the new worktree")
 	blobless := fs.Bool("blobless", false, "require a blobless base workspace")
-	hydrate := fs.String("hydrate", "auto", "blobless clean tree hydrate strategy: auto, background, sync, or off")
+	hydrate := fs.String("hydrate", "auto", "clean tree publish strategy: auto, background, sync, or off (off = blobless metadata-only; full clones always publish)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: drive9 git worktree add --fast [-b <branch>] [--detach] [--blobless] [--hydrate=auto|background|sync|off] <base-repo-path> <worktree-path> [<commit-ish>]\n\nflags:\n")
 		fs.PrintDefaults()
@@ -432,7 +440,7 @@ func gitWorktreeAdd(args []string) error {
 	worktreeRegistered = true
 
 	fmt.Fprintf(os.Stderr, "drive9: registered linked git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, worktreeResolved.RemotePath, len(nodes))
-	if linkedBlobless {
+	{
 		switch hydrateMode {
 		case gitHydrateModeSync:
 			ctx, cancel := context.WithTimeout(context.Background(), gitHydrateTimeout)
@@ -596,21 +604,18 @@ const (
 	gitHydrateModeSync       gitHydrateMode = "sync"
 )
 
-func resolveGitHydrateMode(raw string, blobless bool) (gitHydrateMode, error) {
+func resolveGitHydrateMode(raw string, _ bool) (gitHydrateMode, error) {
+	// The FS-native store is the only source of clean-tree content: even a
+	// full (non-blobless) clone must publish tree/<commit>/ or the
+	// rewritten extension serves attrs whose reads 404. auto therefore
+	// resolves to a synchronous publish — callers expect the tree to be
+	// readable as soon as the clone returns; background stays opt-in.
 	raw = strings.TrimSpace(raw)
 	if raw == "" || raw == "auto" {
-		if blobless {
-			return gitHydrateModeBackground, nil
-		}
-		return gitHydrateModeOff, nil
+		return gitHydrateModeSync, nil
 	}
 	switch gitHydrateMode(raw) {
-	case gitHydrateModeOff:
-		return gitHydrateModeOff, nil
-	case gitHydrateModeBackground, gitHydrateModeSync:
-		if !blobless {
-			return "", fmt.Errorf("--hydrate=%s requires --blobless", raw)
-		}
+	case gitHydrateModeOff, gitHydrateModeBackground, gitHydrateModeSync:
 		return gitHydrateMode(raw), nil
 	default:
 		return "", fmt.Errorf("invalid --hydrate %q (valid: auto, background, sync, off)", raw)

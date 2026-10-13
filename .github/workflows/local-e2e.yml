@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - main
+      - extensions
       - 'perf/**'
     paths:
       - ".github/workflows/local-e2e.yml"

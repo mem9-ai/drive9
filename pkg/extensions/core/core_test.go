@@ -556,3 +556,20 @@ func allZero(b []byte) bool {
 	}
 	return true
 }
+
+// Truncating path writes replace the whole image: a document writer whose
+// new body is shorter must not leave the previous longer body's tail
+// behind (the git workspace store's pointer documents parse as JSON).
+func TestWriteSyncTruncateReplacesWholeFile(t *testing.T) {
+	c, b := newTestCore(t, "/")
+	b.mu.Lock()
+	b.files["/doc.json"] = &fakeNode{data: []byte(`{"version":1,"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-01-01T00:00:00Z"}`), mode: 0o644, rev: 1}
+	b.mu.Unlock()
+
+	if _, err := dispatch(t, c, &fs.Op{Kind: fs.OpWrite, Path: "/doc.json", Offset: 0, Data: []byte(`{"version":1}`), Flags: uint32(fs.FlagTruncate)}); err != nil {
+		t.Fatal(err)
+	}
+	if n := b.node("/doc.json"); string(n.data) != `{"version":1}` {
+		t.Fatalf("backend after truncate write = %q, want the exact shorter document", n.data)
+	}
+}

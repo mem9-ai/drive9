@@ -226,8 +226,14 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
 	res := h.g.resolveIn(h.w, h.rel)
 	switch res.layer {
 	case layerOverlay:
+		// The routing index says the mirror exists: a read failure must
+		// fail the open, or a partial write would publish over the
+		// previously stored content with only its own bytes.
 		content, err := store.Read(ctx, res.storePath, 0, 0)
-		if err == nil && len(content) > 0 {
+		if err != nil {
+			return err
+		}
+		if len(content) > 0 {
 			if _, err := h.buf.Write(0, content); err != nil {
 				return err
 			}
@@ -253,12 +259,16 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
 			if end <= start {
 				return nil, nil
 			}
-			// The commit may have moved under us; resolve fresh each load.
+			// Lazy loads run at Flush/Release time, long after the write
+			// request that created the buffer was canceled: use a fresh
+			// bounded context, never the captured request's.
+			lctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
 			rr := g.resolveIn(w, rel)
 			if rr.layer != layerTree {
 				return nil, nil
 			}
-			part, err := g.storeView().Read(ctx, gitws.TreePath(w.id, w.head(), rel), start, end-start)
+			part, err := g.storeView().Read(lctx, gitws.TreePath(w.id, w.head(), rel), start, end-start)
 			if err != nil {
 				return nil, err
 			}

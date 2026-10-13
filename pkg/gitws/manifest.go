@@ -249,18 +249,110 @@ func ParseState(data []byte) string {
 // objects ride the content-addressed packs instead).
 const GitStateStorageTarGzNoObjects = "tar.gz-no-objects"
 
-// PackMeta is the sidecar document of one stored object pack.
+// PackMeta is the sidecar document of one stored object pack. Unknown
+// keys survive a rewrite (the FS-native document discipline).
 type PackMeta struct {
-	ChecksumSHA256 string    `json:"checksum_sha256"`
-	SizeBytes      int64     `json:"size_bytes"`
-	CreatedAt      time.Time `json:"created_at"`
+	ChecksumSHA256 string
+	SizeBytes      int64
+	CreatedAt      time.Time
+
+	extra map[string]json.RawMessage
 }
 
-// GitStateMeta is the sidecar document of the .git state archive.
+var packMetaKeys = []string{"checksum_sha256", "size_bytes", "created_at"}
+
+// UnmarshalJSON decodes pack metadata, preserving unknown keys.
+func (m *PackMeta) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("gitws: pack meta: %w", err)
+	}
+	m.extra = extraKeys(raw, packMetaKeys...)
+	if v, ok := raw["checksum_sha256"]; ok {
+		if err := json.Unmarshal(v, &m.ChecksumSHA256); err != nil {
+			return fmt.Errorf("gitws: pack meta checksum: %w", err)
+		}
+	}
+	if v, ok := raw["size_bytes"]; ok {
+		if err := json.Unmarshal(v, &m.SizeBytes); err != nil {
+			return fmt.Errorf("gitws: pack meta size: %w", err)
+		}
+	}
+	if v, ok := raw["created_at"]; ok {
+		if err := json.Unmarshal(v, &m.CreatedAt); err != nil {
+			return fmt.Errorf("gitws: pack meta created_at: %w", err)
+		}
+	}
+	return nil
+}
+
+// MarshalJSON encodes pack metadata, preserving unknown keys.
+func (m PackMeta) MarshalJSON() ([]byte, error) {
+	return mergeExtra(map[string]any{
+		"checksum_sha256": m.ChecksumSHA256,
+		"size_bytes":      m.SizeBytes,
+		"created_at":      m.CreatedAt,
+	}, m.extra)
+}
+
+// GitStateMeta is the .git state pointer document: it names the
+// content-addressed archive body that belongs with it. Unknown keys
+// survive a rewrite (the FS-native document discipline).
 type GitStateMeta struct {
-	CheckpointCommit string    `json:"checkpoint_commit"`
-	StorageType      string    `json:"storage_type"`
-	ChecksumSHA256   string    `json:"checksum_sha256"`
-	SizeBytes        int64     `json:"size_bytes"`
-	CreatedAt        time.Time `json:"created_at"`
+	CheckpointCommit string
+	StorageType      string
+	ChecksumSHA256   string
+	SizeBytes        int64
+	CreatedAt        time.Time
+
+	extra map[string]json.RawMessage
+}
+
+var gitStateMetaKeys = []string{"checkpoint_commit", "storage_type", "checksum_sha256", "size_bytes", "created_at"}
+
+// UnmarshalJSON decodes the state pointer, preserving unknown keys.
+func (m *GitStateMeta) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("gitws: git state meta: %w", err)
+	}
+	m.extra = extraKeys(raw, gitStateMetaKeys...)
+	for _, f := range []struct {
+		key string
+		dst *string
+	}{
+		{"checkpoint_commit", &m.CheckpointCommit},
+		{"storage_type", &m.StorageType},
+		{"checksum_sha256", &m.ChecksumSHA256},
+	} {
+		v, ok := raw[f.key]
+		if !ok {
+			continue
+		}
+		if err := json.Unmarshal(v, f.dst); err != nil {
+			return fmt.Errorf("gitws: git state meta %s: %w", f.key, err)
+		}
+	}
+	if v, ok := raw["size_bytes"]; ok {
+		if err := json.Unmarshal(v, &m.SizeBytes); err != nil {
+			return fmt.Errorf("gitws: git state meta size: %w", err)
+		}
+	}
+	if v, ok := raw["created_at"]; ok {
+		if err := json.Unmarshal(v, &m.CreatedAt); err != nil {
+			return fmt.Errorf("gitws: git state meta created_at: %w", err)
+		}
+	}
+	return nil
+}
+
+// MarshalJSON encodes the state pointer, preserving unknown keys.
+func (m GitStateMeta) MarshalJSON() ([]byte, error) {
+	return mergeExtra(map[string]any{
+		"checkpoint_commit": m.CheckpointCommit,
+		"storage_type":      m.StorageType,
+		"checksum_sha256":   m.ChecksumSHA256,
+		"size_bytes":        m.SizeBytes,
+		"created_at":        m.CreatedAt,
+	}, m.extra)
 }

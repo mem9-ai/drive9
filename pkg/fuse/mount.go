@@ -35,6 +35,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/perf"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
@@ -714,7 +715,7 @@ func MountWithConfig(cfg MountConfig) error {
 		// FS-native: the extension carries no client; its store view is
 		// the chain below itself, attached after assembly.
 		gitExt, gerr = git.New(git.Options{Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot,
-			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh})
+			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh, Logger: logger.L()})
 		if gerr != nil {
 			return fmt.Errorf("fuse: git extension: %w", gerr)
 		}
@@ -932,13 +933,22 @@ func MountWithConfig(cfg MountConfig) error {
 	// view rewrites, and checkpoints all read/write through it — with the
 	// read caches below, which is the point of placing git outermost).
 	if gitExt != nil {
+		// The store view's terminal must speak tenant-absolute paths: the
+		// ordinary core prefixes RemoteRoot, so on a subtree mount (:/sub)
+		// the store would read/write /sub/.drive9/... while the CLI
+		// registers at the tenant root and discovery would never match.
+		storeCore, serr := core.New(cl, core.Options{})
+		if serr != nil {
+			return fmt.Errorf("fuse: git store terminal: %w", serr)
+		}
 		tail := make([]fs.Handler, 0, len(chainHandlers))
 		for _, h := range chainHandlers {
-			if h == fs.Handler(gitExt) {
+			if h == fs.Handler(gitExt) || h == fs.Handler(coreExt) {
 				continue
 			}
 			tail = append(tail, h)
 		}
+		tail = append(tail, storeCore)
 		tailChain, terr := fs.NewChain(tail...)
 		if terr != nil {
 			return fmt.Errorf("fuse: git store chain: %w", terr)

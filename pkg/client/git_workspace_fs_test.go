@@ -11,6 +11,8 @@ import (
 	"github.com/mem9-ai/drive9/pkg/gitws"
 )
 
+const fsTestCommit = "00000000000000000000000000000000000000c1"
+
 func newFSClient(t *testing.T) (*Client, *testbackend.Backend) {
 	t.Helper()
 	b := testbackend.NewBackend()
@@ -92,7 +94,7 @@ func TestGitWorkspaceFSUpsertListGetDelete(t *testing.T) {
 func TestGitWorkspaceFSTreeIndexRoundtrip(t *testing.T) {
 	c, _ := newFSClient(t)
 	ctx := context.Background()
-	ws, err := c.GitWorkspaceFSUpsert(ctx, GitWorkspaceRequest{RootPath: "/repo", HeadCommit: "c1"})
+	ws, err := c.GitWorkspaceFSUpsert(ctx, GitWorkspaceRequest{RootPath: "/repo", HeadCommit: fsTestCommit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +102,7 @@ func TestGitWorkspaceFSTreeIndexRoundtrip(t *testing.T) {
 		{Path: "src", Kind: "dir", Mode: "040755"},
 		{Path: "src/main.go", Kind: "file", Mode: "100644", ObjectSHA: "aa", SizeBytes: 7},
 	}
-	if err := c.GitWorkspaceFSPutTreeIndex(ctx, ws.WorkspaceID, "c1", nodes); err != nil {
+	if err := c.GitWorkspaceFSPutTreeIndex(ctx, ws.WorkspaceID, fsTestCommit, nodes); err != nil {
 		t.Fatal(err)
 	}
 	back, err := c.GitWorkspaceFSGetTreeIndex(ctx, ws.WorkspaceID)
@@ -115,7 +117,7 @@ func TestGitWorkspaceFSTreeIndexRoundtrip(t *testing.T) {
 func TestGitWorkspaceFSPacksAndGitStateRoundtrip(t *testing.T) {
 	c, _ := newFSClient(t)
 	ctx := context.Background()
-	ws, err := c.GitWorkspaceFSUpsert(ctx, GitWorkspaceRequest{RootPath: "/repo", HeadCommit: "c1"})
+	ws, err := c.GitWorkspaceFSUpsert(ctx, GitWorkspaceRequest{RootPath: "/repo", HeadCommit: fsTestCommit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,40 +142,43 @@ func TestGitWorkspaceFSPacksAndGitStateRoundtrip(t *testing.T) {
 		t.Fatalf("deduped packs = %d", len(packs))
 	}
 
-	if err := c.GitWorkspaceFSPutGitState(ctx, ws.WorkspaceID, "c1", []byte("ARCHIVE")); err != nil {
+	if err := c.GitWorkspaceFSPutGitState(ctx, ws.WorkspaceID, fsTestCommit, []byte("ARCHIVE")); err != nil {
 		t.Fatal(err)
 	}
 	state, err := c.GitWorkspaceFSGetGitState(ctx, ws.WorkspaceID)
 	if err != nil || state == nil || string(state.Content) != "ARCHIVE" || state.StorageType != "tar.gz-no-objects" {
 		t.Fatalf("git state = %+v %v", state, err)
 	}
-	// A tampered archive fails the checksum.
-	bad := gitws.GitStateMeta{CheckpointCommit: "c1", StorageType: "tar.gz-no-objects", ChecksumSHA256: "deadbeef", SizeBytes: 7}
-	if err := writeRawJSON(t, c, gitws.GitStateMetaPath(ws.WorkspaceID), bad); err != nil {
+	// A tampered body fails the checksum: plant different bytes at the
+	// name the pointer selects.
+	if err := writeGitStateBody(t, c, ws.WorkspaceID, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", []byte("TAMPERED")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.GitWorkspaceFSGetGitState(ctx, ws.WorkspaceID); err == nil {
-		t.Fatal("checksum mismatch not detected")
+	good := state.ChecksumSHA256
+	state2, err := c.GitWorkspaceFSGetGitState(ctx, ws.WorkspaceID)
+	if err == nil || state2 != nil {
+		t.Fatalf("pointing at tampered body not detected: %v", err)
 	}
+	_ = good
 }
 
 func TestGitWorkspaceFSTreeFileUpload(t *testing.T) {
 	c, b := newFSClient(t)
 	ctx := context.Background()
-	ws, err := c.GitWorkspaceFSUpsert(ctx, GitWorkspaceRequest{RootPath: "/repo", HeadCommit: "c1"})
+	ws, err := c.GitWorkspaceFSUpsert(ctx, GitWorkspaceRequest{RootPath: "/repo", HeadCommit: fsTestCommit})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.GitWorkspaceFSPutTreeFile(ctx, ws.WorkspaceID, "c1", "src/main.go", strings.NewReader("package main"), 12); err != nil {
+	if err := c.GitWorkspaceFSPutTreeFile(ctx, ws.WorkspaceID, fsTestCommit, "src/main.go", strings.NewReader("package main"), 12); err != nil {
 		t.Fatal(err)
 	}
-	if n, ok := b.Node(gitws.TreePath(ws.WorkspaceID, "c1", "src/main.go")); !ok || string(n.Data) != "package main" {
+	if n, ok := b.Node(gitws.TreePath(ws.WorkspaceID, fsTestCommit, "src/main.go")); !ok || string(n.Data) != "package main" {
 		t.Fatalf("tree file = %q %v", n.Data, ok)
 	}
-	if err := c.GitWorkspaceFSPutTreeSymlink(ctx, ws.WorkspaceID, "c1", "link", "/target"); err != nil {
+	if err := c.GitWorkspaceFSPutTreeSymlink(ctx, ws.WorkspaceID, fsTestCommit, "link", "/target"); err != nil {
 		t.Fatal(err)
 	}
-	if n, ok := b.Node(gitws.TreePath(ws.WorkspaceID, "c1", "link")); !ok || n.Mode&0o170000 == 0 {
+	if n, ok := b.Node(gitws.TreePath(ws.WorkspaceID, fsTestCommit, "link")); !ok || n.Mode&0o170000 == 0 {
 		t.Fatalf("tree symlink missing or not a symlink: %+v", n)
 	}
 }
@@ -185,4 +190,23 @@ func writeRawJSON(t *testing.T, c *Client, path string, v any) error {
 		t.Fatal(err)
 	}
 	return c.WriteCtx(context.Background(), path, body)
+}
+
+// writeGitStateBody plants one archive body under the store directly.
+func writeGitStateBody(t *testing.T, c *Client, id, checksum string, content []byte) error {
+	t.Helper()
+	body, err := json.Marshal(gitws.GitStateMeta{
+		CheckpointCommit: fsTestCommit,
+		StorageType:      gitws.GitStateStorageTarGzNoObjects,
+		ChecksumSHA256:   checksum,
+		SizeBytes:        int64(len(content)),
+		CreatedAt:        gitws.NowUTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRawJSON(t, c, gitws.GitStateMetaPath(id), body); err != nil {
+		return err
+	}
+	return c.WriteCtx(context.Background(), gitws.GitStateBodyPath(id, checksum), content)
 }

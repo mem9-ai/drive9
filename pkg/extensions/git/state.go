@@ -14,8 +14,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -26,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	fsgit "github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/gitcache"
 	"github.com/mem9-ai/drive9/pkg/gitws"
 )
@@ -749,6 +748,12 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 		return g.restoreLinkedWorktreeState(ctx, w, state)
 	}
 	gitDir := g.localOverlayGitDir(w.rootPath())
+	if gitDirLooksUsable(ctx, gitDir) {
+		// The local .git is usable: it may hold changes newer than the
+		// last debounced checkpoint (a crash inside the checkpoint
+		// window). Keep it — restore is only for a missing or broken .git.
+		return nil
+	}
 	parent := filepath.Dir(gitDir)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
@@ -783,11 +788,23 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 // stored archive lands under the common gitdir's worktrees/<name>, and
 // the work-tree .git pointer file is rewritten to it.
 func (g *Git) restoreLinkedWorktreeState(ctx context.Context, w *workspace, state storedGitState) error {
+	name := w.worktree()
+	if err := validateFlatName(name); err != nil {
+		// A corrupted or hostile manifest must never reach a local
+		// filepath join (RemoveAll below would follow it).
+		return fmt.Errorf("git: workspace %s: %w", w.id, err)
+	}
 	common, err := g.commonGitDirFor(w)
 	if err != nil {
 		return err
 	}
-	target := filepath.Join(common, "worktrees", w.worktree())
+	pointer := g.localOverlayGitDir(w.rootPath())
+	if _, perr := os.Stat(pointer); perr == nil {
+		// The worktree's .git pointer already exists: the worktree is
+		// present locally, keep its (possibly newer) state.
+		return nil
+	}
+	target := filepath.Join(common, "worktrees", name)
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return err
 	}
@@ -813,7 +830,6 @@ func (g *Git) restoreLinkedWorktreeState(ctx context.Context, w *workspace, stat
 	if err := os.Rename(tmp, target); err != nil {
 		return err
 	}
-	pointer := g.localOverlayGitDir(w.rootPath())
 	if err := os.MkdirAll(filepath.Dir(pointer), 0o755); err != nil {
 		return err
 	}
@@ -871,19 +887,21 @@ func (g *Git) restoreGitObjectPacks(ctx context.Context, id, gitDir string) erro
 		return err
 	}
 	for _, pack := range packs {
-		if len(pack.content) == 0 {
+		// Fetch and verify one pack at a time: each body may approach the
+		// 256 MiB budget, so holding every pack in memory at once could
+		// OOM the mount on a multi-checkpoint workspace.
+		content, cerr := g.fetchObjectPack(ctx, id, pack.packID, pack.checksumSHA256, pack.sizeBytes)
+		if cerr != nil {
+			if fsgit.IsNotFound(cerr) {
+				continue // metadata outlived its body: skip the orphan
+			}
+			return cerr
+		}
+		if len(content) == 0 {
 			continue
 		}
-		if pack.sizeBytes != 0 && pack.sizeBytes != int64(len(pack.content)) {
-			return fmt.Errorf("git object pack %s size mismatch", pack.packID)
-		}
-		sum := sha256.Sum256(pack.content)
-		checksum := hex.EncodeToString(sum[:])
-		if pack.checksumSHA256 != "" && !strings.EqualFold(pack.checksumSHA256, checksum) {
-			return fmt.Errorf("git object pack %s checksum mismatch", pack.packID)
-		}
 		cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "unpack-objects", "-q")
-		cmd.Stdin = bytes.NewReader(pack.content)
+		cmd.Stdin = bytes.NewReader(content)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
@@ -955,6 +973,16 @@ func (g *Git) MaterializeHeadTree(ctx context.Context, gitDir string) error {
 func isGitConfigStatePath(rel string) bool {
 	rel = filepath.ToSlash(rel)
 	return rel == "config" || strings.HasSuffix(rel, "/config")
+}
+
+// validateFlatName rejects anything that is not a single path component
+// (manifest-derived values joined into local paths must stay flat).
+func validateFlatName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." || name != filepath.Base(name) || strings.ContainsAny(name, "/\\\x00") {
+		return fmt.Errorf("invalid name %q", name)
+	}
+	return nil
 }
 
 // scheduleMissingRestore retries a workspace's .git restore when its

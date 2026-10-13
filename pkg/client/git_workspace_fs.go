@@ -172,9 +172,10 @@ func (c *Client) ensureGitWorkspaceDir(ctx context.Context, dir string) error {
 			return err
 		}
 		if err := c.MkdirCtx(ctx, cur, 0o755); err != nil {
-			// Tolerate a lost create race.
+			// Tolerate a lost create race: the confirming stat means the
+			// component exists — keep creating the deeper ones.
 			if st, serr := c.StatCtx(ctx, cur); serr == nil && st != nil && st.IsDir {
-				return nil
+				continue
 			}
 			return fmt.Errorf("mkdir %s: %w", cur, err)
 		}
@@ -412,6 +413,9 @@ func (c *Client) GitWorkspaceFSPutTreeIndex(ctx context.Context, id, commit stri
 	if err := gitws.ValidateID(id); err != nil {
 		return err
 	}
+	if err := gitws.ValidateCommit(commit); err != nil {
+		return err
+	}
 	entries := make([]gitws.TreeEntry, 0, len(nodes))
 	for _, n := range nodes {
 		rel, err := gitws.CleanRel(n.Path)
@@ -478,18 +482,22 @@ func (c *Client) GitWorkspaceFSPutGitState(ctx context.Context, id, checkpointCo
 	if err := gitws.ValidateID(id); err != nil {
 		return err
 	}
-	sum := sha256.Sum256(content)
+	// One atomic version: the body lands content-addressed (immutable, so
+	// retried or concurrent checkpoints dedupe) and only then does the
+	// pointer switch to it — a reader can never pair one archive with
+	// another's metadata.
+	checksum := gitws.ChecksumHex(content)
+	if err := c.writeGitWorkspaceFile(ctx, gitws.GitStateBodyPath(id, checksum), content, 0o644); err != nil {
+		return err
+	}
 	meta, err := json.Marshal(gitws.GitStateMeta{
 		CheckpointCommit: checkpointCommit,
 		StorageType:      gitws.GitStateStorageTarGzNoObjects,
-		ChecksumSHA256:   hex.EncodeToString(sum[:]),
+		ChecksumSHA256:   checksum,
 		SizeBytes:        int64(len(content)),
-		CreatedAt:        time.Now().UTC(),
+		CreatedAt:        gitws.NowUTC(),
 	})
 	if err != nil {
-		return err
-	}
-	if err := c.writeGitWorkspaceFile(ctx, gitws.GitStatePath(id), content, 0o644); err != nil {
 		return err
 	}
 	return c.writeGitWorkspaceFile(ctx, gitws.GitStateMetaPath(id), meta, 0o644)
@@ -512,7 +520,10 @@ func (c *Client) GitWorkspaceFSGetGitState(ctx context.Context, id string) (*Git
 	if err := json.Unmarshal(metaBody, &meta); err != nil {
 		return nil, fmt.Errorf("parse git state meta: %w", err)
 	}
-	rc, err := c.ReadStream(ctx, gitws.GitStatePath(id))
+	if err := gitws.ValidateChecksumName(meta.ChecksumSHA256); err != nil {
+		return nil, err
+	}
+	rc, err := c.ReadStream(ctx, gitws.GitStateBodyPath(id, meta.ChecksumSHA256))
 	if IsNotFound(err) {
 		return nil, nil
 	}
@@ -537,7 +548,7 @@ func (c *Client) GitWorkspaceFSGetGitState(ctx context.Context, id string) (*Git
 		WorkspaceID:      id,
 		CheckpointCommit: meta.CheckpointCommit,
 		StorageType:      meta.StorageType,
-		StorageRef:       gitws.GitStatePath(id),
+		StorageRef:       gitws.GitStateBodyPath(id, meta.ChecksumSHA256),
 		ChecksumSHA256:   meta.ChecksumSHA256,
 		SizeBytes:        int64(len(content)),
 		Content:          content,
@@ -679,6 +690,9 @@ func (c *Client) GitWorkspaceFSPutTreeFile(ctx context.Context, id, commit, rel 
 	if err := gitws.ValidateID(id); err != nil {
 		return err
 	}
+	if err := gitws.ValidateCommit(commit); err != nil {
+		return err
+	}
 	rel, err := gitws.CleanRel(rel)
 	if err != nil || rel == "." {
 		return fmt.Errorf("invalid git workspace tree path %q", rel)
@@ -697,6 +711,9 @@ func (c *Client) GitWorkspaceFSPutTreeFile(ctx context.Context, id, commit, rel 
 // store (idempotent).
 func (c *Client) GitWorkspaceFSPutTreeSymlink(ctx context.Context, id, commit, rel, target string) error {
 	if err := gitws.ValidateID(id); err != nil {
+		return err
+	}
+	if err := gitws.ValidateCommit(commit); err != nil {
 		return err
 	}
 	rel, err := gitws.CleanRel(rel)
