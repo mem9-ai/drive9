@@ -813,7 +813,10 @@ run_fuse_section() {
   # chmod of a classic-backed file is metadata-only (attrs marker)
   chmod 0700 "$mp/base.txt"
   local attr_mode
-  attr_mode=$(stat -f '%Lp' "$mp/base.txt" 2>/dev/null || stat -c '%a' "$mp/base.txt")
+  case "$(uname -s)" in
+    Darwin) attr_mode=$(stat -f '%Lp' "$mp/base.txt") ;;
+    *) attr_mode=$(stat -c '%a' "$mp/base.txt") ;;
+  esac
   check_eq "chmod shows through the view" "$attr_mode" "700"
 
   # rollback hot-refresh: overlay clears, writes fail, classic stays visible
