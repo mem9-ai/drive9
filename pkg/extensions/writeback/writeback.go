@@ -820,7 +820,13 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// concurrent fd just wrote). Flush the writer first so the
 			// pending serve below owns the path.
 			if h := w.handleFor(op.Path); h != nil && op.Flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) {
-				_ = h.Flush(ctx)
+				if ferr := h.Flush(ctx); ferr != nil {
+					// The flush is what makes the writer's newest bytes
+					// visible to this read; continuing would serve the
+					// stale remote image as success (ENOSPC staging, a
+					// failed journal append, an upload error).
+					return fs.Result{}, ferr
+				}
 			}
 			// pending-cache visibility (plain opens too): a path flushed
 			// into the async queue but not yet landed waits for its own

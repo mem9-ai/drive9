@@ -645,7 +645,12 @@ func MountWithConfig(cfg MountConfig) error {
 	// needs none of it. The cache plugin stays regardless — its READ caches
 	// serve every policy; only its staging role is policy-bound.
 	var stagingLedger *staging.Staging
-	if (policy == writeback.PolicyWriteBack || policy == writeback.PolicyCloseSync) && cacheBase != "" {
+	if (policy == writeback.PolicyWriteBack || policy == writeback.PolicyCloseSync) && cacheBase != "" && wantExt["writeback"] {
+		// wantExt gate: a core-only stack (--extensions core) keeps the
+		// default writeback policy but builds no writeback handler; the
+		// ledger would still be created, recovered, and compacted — a
+		// corrupt or unwritable cache dir failing a mount that never
+		// uses it.
 		// v1 write-cache quota (defaults freeRatio 0.10, 1024 MiB): the
 		// shadow store refuses writes past the budget with ENOSPC.
 		// v1 knobs: zero uses the default, negative disables the check.
@@ -773,7 +778,12 @@ func MountWithConfig(cfg MountConfig) error {
 	// per-user default like every other cache-backed component, so it is
 	// never the enabling condition.
 	var extentExt *extent.Extent
-	if wantExt["extent"] && len(cfg.ExtentPaths) > 0 {
+	// Build the extent reader whenever the stack requests it, even with
+	// no local ExtentPaths: files created by another extent-enabled mount
+	// still carry ExtentIno in listings/stats, and the server answers
+	// their reads with 422 unless the JuiceFS-backed reader routes them.
+	// An empty ExtentPaths only skips the JuiceFS runtime discovery.
+	if wantExt["extent"] {
 		extentExt, err = extent.New(extent.Options{
 			ExtentPaths: cfg.ExtentPaths,
 			Client:      cl,
@@ -896,6 +906,9 @@ func MountWithConfig(cfg MountConfig) error {
 	// view) must see dir GetAttrs go through the chain; every other stack
 	// serves root/dir attrs from the inode table (v1).
 	localDirAttrs := cfg.LocalRoot == "" && strings.TrimSpace(cfg.LayerRef) == ""
+	// The kernel enforces permissions when default_permissions is on;
+	// otherwise the daemon's open gate carries the mode contract.
+	defaultPermissions := cfg.AllowOther
 	// Assemble the chain as the REVERSE of the flag order: the flag lists
 	// extensions in build-up order (core first, each subsequent entry
 	// wrapping the previous ones), so the last flag entry is the outermost
@@ -917,6 +930,7 @@ func MountWithConfig(cfg MountConfig) error {
 		DirTTL:             dirTTL,
 		DirCacheMaxEntries: cfg.DirCacheMaxEntries,
 		LocalDirAttrs:      localDirAttrs,
+		DefaultPermissions: defaultPermissions,
 		Perf:               cfg.PerfCounters || cfg.PerfSamplesPath != "",
 		PerfCounters:       sharedCounters,
 		Debug:              cfg.Debug,

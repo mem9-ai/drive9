@@ -76,6 +76,9 @@ type Options struct {
 	// snapshot reuse would hide concurrent changes from it (v1).
 	GVisorCompat bool
 
+	// DefaultPermissions reports the kernel default_permissions mount
+	// option (the daemon's open gate is redundant when set).
+	DefaultPermissions bool
 	// LocalDirAttrs answers GetAttr for the root and directories from the
 	// inode table without a remote stat (v1: dirs never revalidate). View
 	// extensions that own directories (localize, layer) need their overlay
@@ -137,8 +140,11 @@ type FS struct {
 	dirKeepCacheOff []interface{ DirKeepCacheOff(path string) bool }
 
 	localDirAttrs bool
-	gvisorCompat  bool
-	debug         bool
+	// defaultPermissions mirrors the kernel mount option: when the kernel
+	// enforces permission checks, the daemon's open gate is redundant.
+	defaultPermissions bool
+	gvisorCompat       bool
+	debug              bool
 
 	// nativeSyncFSSeen records that the kernel actually dispatched a
 	// SyncFs request (v1: protocol support alone must not advertise it).
@@ -210,6 +216,7 @@ func New(opts Options) (*FS, error) {
 		dirTTL = defaultDirTTL
 	}
 	f.localDirAttrs = opts.LocalDirAttrs
+	f.defaultPermissions = opts.DefaultPermissions
 	f.gvisorCompat = opts.GVisorCompat
 	f.debug = opts.Debug
 	f.perf = opts.PerfCounters
@@ -1957,7 +1964,10 @@ func hasPOSIXAccess(caller fs.Caller, ownerUid, ownerGid uint32, mode uint32, ma
 	switch {
 	case caller.Uid == ownerUid:
 		shift = 6
-	case caller.Gid == ownerGid:
+	case caller.Gid == ownerGid, containsUint32(processSupplementaryGroups(caller.Pid), ownerGid):
+		// The file's group may arrive only as a supplementary group of
+		// the caller (v1 consulted /proc/<pid>/status too); testing the
+		// other bits there returned EACCES for granted access.
 		shift = 3
 	}
 	return mode>>shift&mask == mask
@@ -2129,7 +2139,28 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpCreate, Path: path, Flags: input.Flags, Ino: input.NodeId, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+	caller := fs.CallerFrom(input.InHeader)
+	// Userspace permission gate for mounts without default_permissions:
+	// the chain's OpCreate carries no mode context of its own, so a chmod
+	// 000 file or a write open of a read-only mode would sail through.
+	if !f.defaultPermissions {
+		if entry, eok := f.inodes.GetEntry(input.NodeId); eok && entry.HasMode {
+			mode := entry.Mode & 0o777
+			ownerUid, ownerGid := f.uid, f.gid
+			if entry.HasUID {
+				ownerUid = entry.Uid
+			}
+			if entry.HasGID {
+				ownerGid = entry.Gid
+			}
+			if acc := input.Flags & uint32(syscall.O_ACCMODE); acc != uint32(syscall.O_RDONLY) {
+				if !hasPOSIXAccess(caller, ownerUid, ownerGid, mode, 0b010) {
+					return gofuse.EACCES
+				}
+			}
+		}
+	}
+	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpCreate, Path: path, Flags: input.Flags, Ino: input.NodeId, Kernel: input, Caller: caller})
 	if err != nil {
 		return fs.StatusOf(err)
 	}

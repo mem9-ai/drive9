@@ -39,18 +39,40 @@ const bulkfileMaxBufferedBytes = 8 << 20
 // image in place (the truncation stays local until the boundary pushes
 // it), a mode change is forwarded to the write plane's pending handle.
 func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	if op.HasMode {
 		mode := op.Mode & 0o777
+		h.mu.Lock()
 		h.mode = mode
 		h.mu.Unlock()
-		err := h.below.SetAttr(ctx, h.path, fs.AttrPatch{Mode: &mode})
-		h.mu.Lock()
-		if err != nil {
+		if err := h.below.SetAttr(ctx, h.path, fs.AttrPatch{Mode: &mode}); err != nil {
 			return fs.Attr{}, err
 		}
 	}
+	h.mu.Lock()
+	passthrough := h.passthrough
+	h.mu.Unlock()
+	if passthrough {
+		// The stream lives in the plane below now; the emptied image is
+		// not the file. Delegate size changes there (a truncate against
+		// len(nil) would compare equal to 0 and skip the shrink).
+		if op.Size >= 0 {
+			size := op.Size
+			if err := h.below.SetAttr(ctx, h.path, fs.AttrPatch{Size: &size}); err != nil {
+				return fs.Attr{}, err
+			}
+			h.mu.Lock()
+			h.pushed = size
+			a := h.attrLocked()
+			h.mu.Unlock()
+			return a, nil
+		}
+		h.mu.Lock()
+		a := h.attrLocked()
+		h.mu.Unlock()
+		return a, nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if op.Size >= 0 && op.Size != int64(len(h.image)) {
 		size := op.Size
 		if size < int64(len(h.image)) {
@@ -323,7 +345,14 @@ type claimReadHandle struct {
 func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	c.claim.mu.Lock()
 	image := c.claim.image
+	passthrough := c.claim.passthrough
 	c.claim.mu.Unlock()
+	if passthrough {
+		// The claim handed its stream to the plane below (the bounded
+		// forward); the pending bytes now live there, and the emptied
+		// image would answer (0, nil) forever.
+		return c.claim.Read(ctx, off, dest)
+	}
 	if off < 0 || off >= int64(len(image)) {
 		return 0, nil
 	}

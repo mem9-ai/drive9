@@ -12,6 +12,21 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
+func chOf(t *testing.T, b *testbackend.Backend) *fs.Chain {
+	t.Helper()
+	g, cl, _ := newGitExt(t, b, "")
+	g.armed = true
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(g, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ch
+}
+
 // TestOverlayMirrorSurvivesDiscoveryFetch: a first-discovery overlay
 // fetch is in flight while the workspace is already published and serving;
 // a write landing in the mirror during the fetch must survive the
@@ -69,5 +84,35 @@ func TestOverlayMirrorSurvivesDiscoveryFetch(t *testing.T) {
 			}
 		}
 		ts.Close()
+	}
+}
+
+// TestReloadSeesRemoteOverlayChange: a known workspace's overlay mirror
+// follows the server log — a writer's later commit becomes visible after
+// Reload (qiffang: first-discovery-only made the mirror permanent).
+func TestReloadSeesRemoteOverlayChange(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspace("ws-1", "/repo")
+	ctx := context.Background()
+	w := func(data string) {
+		if _, err := chOf(t, b).Dispatch(ctx, &fs.Op{Kind: fs.OpWrite, Path: "/repo/f.txt", Offset: 0, Data: []byte(data), Mode: 0o644}); err != nil {
+			t.Fatalf("write %q: %v", data, err)
+		}
+	}
+	r := func() string {
+		res, err := chOf(t, b).Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/f.txt", Offset: 0, Limit: 0})
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return string(res.Data)
+	}
+	gR, _, _ := newGitExt(t, b, "")
+	gR.armed = true
+	gR.ensure(ctx)
+	w("old")
+	w("new")
+	gR.Reload(ctx)
+	if got := r(); got != "new" {
+		t.Fatalf("overlay after Reload = %q, want new", got)
 	}
 }

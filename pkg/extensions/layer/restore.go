@@ -113,14 +113,25 @@ func (l *Layer) getLayerEntryForRestore(ctx context.Context, path string, maxSeq
 	return l.cl.GetFSLayerEntry(ctx, l.layerRef, path)
 }
 
-func (l *Layer) applyReplayEntry(ctx context.Context, e client.FSLayerEntry, hasCheckpoint bool, checkpointSeq int64) error {
-	local := e.Path
-	if l.root != "/" {
-		local = strings.TrimPrefix(e.Path, l.root)
-		if local == "" {
-			local = "/"
-		}
+// layerPathInsideRoot reports whether the layer-wide absolute path lies
+// inside the mount root with a segment boundary (/team matches /team/x but
+// not /team2/x).
+func layerPathInsideRoot(p, root string) bool {
+	if root == "/" || p == root {
+		return true
 	}
+	return strings.HasPrefix(p, strings.TrimSuffix(root, "/")+"/")
+}
+
+func (l *Layer) applyReplayEntry(ctx context.Context, e client.FSLayerEntry, hasCheckpoint bool, checkpointSeq int64) error {
+	// Replay entries carry layer-wide absolute paths; a subtree mount
+	// (/team) must convert with a boundary check and SKIP everything
+	// outside its root — TrimPrefix alone left /secret intact (visible
+	// inside the /team mount) and mishandled /team2-style collisions.
+	if !layerPathInsideRoot(e.Path, l.root) {
+		return nil
+	}
+	local := l.localPathOf(e.Path)
 	maxSeq := layerEntryFetchMaxSeq(&e, hasCheckpoint, checkpointSeq)
 	switch e.Op {
 	case "whiteout":
@@ -160,8 +171,15 @@ func (l *Layer) applyReplayEntry(ctx context.Context, e client.FSLayerEntry, has
 				nextMode := (st.Mode &^ uint32(0o777)) | (e.Mode & 0o777)
 				l.markLayerSymlink(local, st.Target, nextMode)
 			}
-		default:
+		case func() bool { _, ok := l.contents[local]; return ok }():
+			// A content image exists in the overlay: the chmod re-marks it.
 			l.markLayerFileMode(local, e.Mode)
+		default:
+			// Base-backed file (content still from the base): a
+			// markLayerFileMode here would put the path in l.files with
+			// no content, and lookups would report an empty file — the
+			// mode-only override keeps the base as the content source.
+			l.markLayerBaseFileMode(local, e.Mode)
 		}
 		return nil
 	case "upsert":

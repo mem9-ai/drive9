@@ -640,17 +640,13 @@ func (g *Git) ensure(ctx context.Context) {
 	g.mu.Unlock()
 	// Fetch each workspace's remote overlay and HEAD tree OFF the list
 	// lock (v1 rt.overlay + rt.nodes): other clients' modifications and
-	// the fast-clone clean-file view become visible. The overlay fetch is
-	// FIRST-DISCOVERY ONLY (v1 arms rt.overlay once): a re-list racing a
-	// local write would otherwise replace the mirror with a stale log
-	// snapshot and drop the write from the local view — our writes
-	// round-trip through PutGitOverlayEntry, so the mirror stays the
-	// authority after the first fetch. The HEAD tree is commit-keyed and
-	// refreshes cheaply.
+	// the fast-clone clean-file view become visible. The overlay mirror
+	// follows the server log on every list (our writes round-trip through
+	// PutGitOverlayEntry); entries added to the mirror while the fetch was
+	// in flight are re-applied after the replacement so a local write never
+	// disappears under a stale snapshot.
 	for _, w := range ws {
-		if !existingIDs[w.id] {
-			g.loadRemoteOverlay(ctx, w)
-		}
+		g.loadRemoteOverlay(ctx, w)
 		g.refreshTree(ctx, w)
 		// A workspace discovered after mount start (git clone --fast
 		// registers it server-side) still needs its local .git restored

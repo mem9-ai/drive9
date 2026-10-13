@@ -184,7 +184,15 @@ func (f HandlerFilesystem) Open(ctx context.Context, path string, flags OpenFlag
 	if err != nil {
 		return nil, err
 	}
-	return handle{fs: f, path: path, token: res.Handle}, nil
+	// Return the claimed handle directly: wrapping it in the path-addressed
+	// `handle` adapter turns its Write/Flush/Release back into namespace
+	// ops the write plane does not consume, bypassing writeback durability
+	// and leaking the reopened buffering handle (the create-write-rename
+	// -close atomic-save sequence reopens through here).
+	if res.Handle != nil {
+		return res.Handle, nil
+	}
+	return handle{fs: f, path: path, token: nil}, nil
 }
 
 // handle adapts a handle token claimed at OpCreate into the Handle
