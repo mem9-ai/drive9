@@ -1,4 +1,4 @@
-package extent
+package server
 
 import (
 	"bytes"
@@ -13,8 +13,8 @@ import (
 	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
-// WrapS3 exposes a tenant-prefixed JuiceFS ObjectStorage over drive9's S3 client.
-func WrapS3(s3 s3client.S3Client, prefix string) (object.ObjectStorage, error) {
+// wrapS3 exposes a tenant-prefixed JuiceFS ObjectStorage over drive9's S3 client.
+func wrapS3(s3 s3client.S3Client, prefix string) (object.ObjectStorage, error) {
 	if s3 == nil {
 		return nil, fmt.Errorf("nil s3 client")
 	}

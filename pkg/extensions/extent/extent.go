@@ -4,6 +4,15 @@
 // JuiceFS VFS inodes and their data flows through the extent runtime's
 // session instead of the classic whole-file plane. Discovery is
 // layout-based, never name-based.
+//
+// Large-file takeover: with a non-zero LargeFileThreshold (the default
+// mount configuration), fresh truncate-writers are claimed before the
+// classic buffered-write plane, buffered in memory, and promoted to the
+// extent plane once their image crosses the threshold — replacing the
+// presign/multipart direct-upload link for large files. Claims that stay
+// below the threshold (and claims whose promotion cannot build a runtime)
+// fall back to the classic plane below at their durability boundaries,
+// exactly like the bulk data plane they subsume.
 package extent
 
 import (
@@ -16,18 +25,34 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
+// policyWriteSync names the mount policy whose writes commit inline at
+// every Write below; the buffered claim defers to that track there.
+const policyWriteSync = "write-sync"
+
 // Options configures the extension.
 type Options struct {
 	// ExtentPaths are creation declarations (glob semantics in policy.go);
-	// new matching files are created on the extent plane.
+	// new matching files are created on the extent plane from byte zero.
 	ExtentPaths []string
 	Client      *client.Client
 	// RemoteRoot prefixes engine paths for stat discovery.
 	RemoteRoot string
 	// CacheDir is the JuiceFS block-cache root (mount cache subtree).
 	CacheDir string
-	// Policy is the mount's write policy: write-sync pays a VFS flush per
-	// Write so write(2) returning means server-side durability (v1).
+
+	// LargeFileThreshold is the buffered size at which a fresh
+	// truncate-writer is promoted to the extent plane. Zero disables the
+	// takeover (extent files still route here through discovery and the
+	// declarations above).
+	LargeFileThreshold int64
+	// LargeFileExempt names paths the default large-file claim must leave
+	// to the planes inside this one (the append-log declarations); nil
+	// exempts nothing. Explicit ExtentPaths declarations still win.
+	LargeFileExempt func(path string) bool
+	// Policy is the mount write policy ("writeback", "close-sync",
+	// "write-sync"); blank behaves as writeback. Under write-sync the
+	// buffered claim stays out — durability belongs to every Write, not to
+	// a boundary.
 	Policy string
 }
 
@@ -37,52 +62,21 @@ type Options struct {
 type Extent struct {
 	opts Options
 	root string
-	// policy mirrors Options.Policy (write-sync pays per-Write flushes).
-	policy string
 
 	extentMu       sync.Mutex
 	extentBuild    extentBuildState
 	extentTornDown bool
+	// promoHoldUntil parks the large-file promotion after a failed runtime
+	// build, so a server without the extent plane costs one probe per
+	// window instead of one per claimed writer.
+	promoHoldUntil time.Time
 
 	// rt holds the *extentRuntime (typed pointer, swapped on build/teardown).
-	rt        atomicPointer[extentRuntime]
-	inoMu     sync.Mutex
-	inoByPath map[string]uint64
-	// missTTL bounds how long "not an extent file" is trusted.
-	missTTL time.Duration
-	misses  map[string]time.Time
-
-	// livePaths tracks open extent handles by path: the SQLite -shm
-	// index of an open database reports its mapped size even at 0.
-	live sync.Map
+	rt    atomicPointer[extentRuntime]
+	paths pathRouter
 }
 
-// extentMissCap bounds the negative cache. It is a 2s hint, so throwing it
-// away wholesale once the cap is crossed costs at most one re-probe per
-// path; the alternative (pruning only expired entries) leaves the map
-// unbounded while a workload walks a tree of glob-matching classic files,
-// and every insert then rescans the whole map under a mutex the extent
-// Open/Unlink/Rename/SetAttr paths share.
-const extentMissCap = 4096
-
-// atomicPointer is a minimal generic atomic pointer.
-type atomicPointer[T any] struct {
-	mu sync.Mutex
-	p  *T
-}
-
-func (a *atomicPointer[T]) Load() *T {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.p
-}
-
-func (a *atomicPointer[T]) Store(p *T) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.p = p
-}
-
+// New builds the extension.
 func New(opts Options) (*Extent, error) {
 	root := strings.TrimSpace(opts.RemoteRoot)
 	if root == "" || root == "/" {
@@ -91,12 +85,14 @@ func New(opts Options) (*Extent, error) {
 		root = "/" + strings.Trim(root, "/")
 	}
 	return &Extent{
-		opts:      opts,
-		root:      root,
-		policy:    opts.Policy,
-		inoByPath: map[string]uint64{},
-		missTTL:   2 * time.Second,
-		misses:    map[string]time.Time{},
+		opts: opts,
+		root: root,
+		paths: pathRouter{
+			inoByPath: map[string]uint64{},
+			missTTL:   missTTLDefault,
+			misses:    map[string]time.Time{},
+			staging:   map[string][]*stagingHandle{},
+		},
 	}, nil
 }
 
@@ -117,7 +113,7 @@ func (e *Extent) EntryTTLHint(path string) (time.Duration, bool) {
 	if !e.enabled() {
 		return 0, false
 	}
-	if _, ok := e.cachedIno(path); ok {
+	if _, ok := e.paths.cachedIno(path); ok {
 		return juiceFSAttrTimeout, true
 	}
 	if ShouldUseExtentPath(e.opts.ExtentPaths, path) {
@@ -133,13 +129,17 @@ func (e *Extent) DirKeepCacheOff(path string) bool {
 	if !e.enabled() {
 		return false
 	}
-	_, ok := e.cachedIno(path)
+	_, ok := e.paths.cachedIno(path)
 	return ok
 }
 
-// enabled reports whether this mount opted into the extent plane at all.
+// enabled reports whether this mount opted into extent-plane discovery:
+// declarations, the large-file takeover (a promoted file must be found
+// again after a remount even with no declarations and no runtime yet —
+// the probe cost is bounded by the negative cache), or an already-built
+// runtime.
 func (e *Extent) enabled() bool {
-	return len(e.opts.ExtentPaths) > 0 || e.rt.Load() != nil
+	return len(e.opts.ExtentPaths) > 0 || e.largeFileEnabled() || e.rt.Load() != nil
 }
 
 // discoveryEnabled mirrors enabled: only opted-in mounts pay for probes; a
@@ -149,126 +149,9 @@ func (e *Extent) discoveryEnabled() bool {
 	return e.enabled() || e.vfs() != nil
 }
 
-func (e *Extent) rememberExtentIno(path string, ino uint64) {
-	e.inoMu.Lock()
-	e.inoByPath[path] = ino
-	delete(e.misses, path)
-	e.inoMu.Unlock()
-}
-
-// trackLive/untrackLive maintain the open-handle registry.
-func (e *Extent) trackLive(path string)   { e.live.Store(path, struct{}{}) }
-func (e *Extent) untrackLive(path string) { e.live.Delete(path) }
-
-// forgetIno drops a path's inode mapping and negative-cache entry: both
-// names around a mutation stop carrying evidence about the path.
-func (e *Extent) forgetIno(path string) {
-	e.inoMu.Lock()
-	delete(e.inoByPath, path)
-	e.inoMu.Unlock()
-	e.missForget(path)
-}
-
-// retargetLive moves the open-handle registry with a renamed path.
-func (e *Extent) retargetLive(oldPath, newPath string) {
-	if _, ok := e.live.Load(oldPath); ok {
-		e.live.Delete(oldPath)
-		e.live.Store(newPath, struct{}{})
-	}
-}
-
-func (e *Extent) hasLive(path string) bool {
-	_, ok := e.live.Load(path)
-	return ok
-}
-
-func (e *Extent) cachedIno(path string) (uint64, bool) {
-	e.inoMu.Lock()
-	defer e.inoMu.Unlock()
-	ino, ok := e.inoByPath[path]
-	return ino, ok
-}
-
-// missCached / missRemember maintain the negative-probe cache.
-func (e *Extent) missCached(path string) bool {
-	e.inoMu.Lock()
-	defer e.inoMu.Unlock()
-	t, ok := e.misses[path]
-	if !ok {
-		return false
-	}
-	if time.Since(t) > e.missTTL {
-		delete(e.misses, path)
-		return false
-	}
-	return true
-}
-
-func (e *Extent) missRemember(path string) {
-	e.inoMu.Lock()
-	if e.misses == nil {
-		e.misses = map[string]time.Time{}
-	}
-	if len(e.misses) >= extentMissCap {
-		now := time.Now()
-		for k, at := range e.misses {
-			if now.Sub(at) > e.missTTL {
-				delete(e.misses, k)
-			}
-		}
-		if len(e.misses) >= extentMissCap {
-			// Still over: drop the hint rather than grow without limit.
-			e.misses = make(map[string]time.Time, extentMissCap/2)
-		}
-	}
-	e.misses[path] = time.Now()
-	e.inoMu.Unlock()
-}
-
-// missForget drops the cached miss for a path this mount just changed.
-func (e *Extent) missForget(path string) {
-	if path == "" {
-		return
-	}
-	e.inoMu.Lock()
-	delete(e.misses, path)
-	e.inoMu.Unlock()
-}
-
-// statIno is layout-based discovery through the server stat
-// (ContentLayout=extent + ExtentIno).
-func (e *Extent) statIno(ctx context.Context, path string) (uint64, bool) {
-	if e.opts.Client == nil {
-		return 0, false
-	}
-	stat, err := e.opts.Client.StatCtx(ctx, e.remotePath(path))
-	if err != nil || stat == nil {
-		return 0, false
-	}
-	if stat.ContentLayout == client.ContentLayoutExtent && stat.ExtentIno != 0 {
-		return stat.ExtentIno, true
-	}
-	return 0, false
-}
-
-// resolveIno answers the extent inode of a path: cache first, then one
-// bounded stat probe.
-func (e *Extent) resolveIno(ctx context.Context, path string) (uint64, bool) {
-	if ino, ok := e.cachedIno(path); ok {
-		return ino, true
-	}
-	if !e.discoveryEnabled() || e.missCached(path) {
-		return 0, false
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	ino, ok := e.statIno(probeCtx, path)
-	if ok {
-		e.rememberExtentIno(path, ino)
-	} else {
-		e.missRemember(path)
-	}
-	return ino, ok
+// largeFileEnabled reports whether the default large-file takeover is on.
+func (e *Extent) largeFileEnabled() bool {
+	return e.opts.LargeFileThreshold > 0 && e.opts.Policy != policyWriteSync
 }
 
 func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
@@ -277,45 +160,41 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 	}
 	switch op.Kind {
 	case fs.OpGetAttr, fs.OpLookup:
-		ino, ok := e.resolveIno(ctx, op.Path)
-		if !ok {
-			return next(ctx, op)
+		// A live staging claim answers from its image until it promotes or
+		// releases; the extent plane below that answers by inode.
+		if attr, ok := e.paths.stagingOverlay(op.Path); ok {
+			return fs.Result{Attr: &attr}, nil
 		}
-		if e.rt.Load() == nil {
-			// Server says extent but the runtime is not built yet; build it
-			// lazily on first use.
-			if err := e.ensureRuntime(); err != nil {
+		if ino, ok := e.resolveIno(ctx, op.Path); ok {
+			res, err := e.statViaVFS(ctx, op.Path, ino)
+			if err != nil {
 				return next(ctx, op)
 			}
+			return res, nil
 		}
-		res, err := e.statViaVFS(ctx, op.Path, ino)
-		if err != nil {
-			return next(ctx, op)
-		}
-		return res, nil
+		return next(ctx, op)
 
 	case fs.OpCreate:
-		claimNew := ShouldUseExtentPath(e.opts.ExtentPaths, op.Path)
-		var ino uint64
-		var ok bool
-		if claimNew {
-			if err := e.ensureRuntime(); err != nil {
-				return fs.Result{}, err
-			}
-			ino, ok = e.createInVFS(ctx, op)
-		} else {
-			ino, ok = e.resolveIno(ctx, op.Path)
-		}
-		if !ok {
-			return next(ctx, op)
-		}
-		handle, openFlags, attr, err := e.openExtent(ctx, op.Path, ino, op.Flags, op.Caller)
-		if err != nil {
-			return fs.Result{}, err
-		}
-		return fs.Result{Handle: handle, OpenFlags: openFlags, Attr: attr}, nil
+		return e.createOp(ctx, op, next)
 
 	case fs.OpSetAttr:
+		// A staging claim folds the change into its pending image (or its
+		// promoted VFS inode); an extent inode truncates or applies its
+		// attributes through the VFS; classic files fall through.
+		if h, ok := op.Handle.(*stagingHandle); ok {
+			attr, err := h.applyAttr(ctx, op)
+			if err != nil {
+				return fs.Result{}, err
+			}
+			return fs.Result{Attr: &attr}, nil
+		}
+		if h := e.paths.stagingAt(op.Path); h != nil {
+			attr, err := h.applyAttr(ctx, op)
+			if err != nil {
+				return fs.Result{}, err
+			}
+			return fs.Result{Attr: &attr}, nil
+		}
 		ino, ok := e.resolveIno(ctx, op.Path)
 		if !ok {
 			return next(ctx, op)
@@ -363,6 +242,7 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 				return fs.Result{Data: []byte(target)}, nil
 			}
 		}
+
 	case fs.OpUnlink, fs.OpRmdir:
 		if ino, ok := e.resolveIno(ctx, op.Path); ok {
 			if op.Kind == fs.OpRmdir {
@@ -370,6 +250,7 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			}
 			return fs.Result{}, e.unlinkIno(ctx, op.Path, ino)
 		}
+		return e.mutateStaging(ctx, op, next)
 
 	case fs.OpRename:
 		if ino, ok := e.resolveIno(ctx, op.Path); ok {
@@ -378,20 +259,25 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			}
 			return fs.Result{}, nil
 		}
+		return e.mutateStaging(ctx, op, next)
 
 	case fs.OpRead:
 		if op.Handle != nil || op.Fh != 0 {
 			break
 		}
-		if ino, ok := e.resolveIno(ctx, op.Path); ok {
-			if h, _, _, err := e.openExtent(ctx, op.Path, ino, 0, op.Caller); err == nil {
-				n, rerr := h.Read(ctx, op.Offset, make([]byte, op.Limit))
-				if rerr != nil {
-					return fs.Result{}, rerr
-				}
-				_ = h.Release(ctx)
-				return fs.Result{Written: uint32(n)}, nil
+		if h := e.paths.stagingAt(op.Path); h != nil {
+			data, err := h.readAll(ctx, op.Offset, op.Limit)
+			if err != nil {
+				return fs.Result{}, err
 			}
+			return fs.Result{Data: data}, nil
+		}
+		if ino, ok := e.resolveIno(ctx, op.Path); ok {
+			if data, err := e.readViaVFS(ctx, op.Path, ino, op.Offset, op.Limit); err == nil {
+				return fs.Result{Data: data}, nil
+			}
+			// A transient VFS failure serves the read through the classic
+			// plane below instead of failing it.
 		}
 	}
 	return next(ctx, op)

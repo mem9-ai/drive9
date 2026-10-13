@@ -66,6 +66,7 @@ type mountFuseOptions struct {
 	AppendLogPatterns            []string
 	PackPaths                    []string
 	ExtentPaths                  []string
+	ExtentLargeFileThresholdMB   int64
 	UploadConcurrency            int
 	DirCacheMaxEntries           int
 	CommitQueueMaxPending        int

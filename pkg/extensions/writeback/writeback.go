@@ -1130,13 +1130,36 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					// the rename move the stale remote image would drop
 					// the write with no retry source. Fail the rename —
 					// the staging stays for the retry.
-					return fs.Result{}, fmt.Errorf("land staged image before rename %s: %w", op.Path, err)
+					//
+					// One conflict shape is exempt: Release submits the
+					// staged image asynchronously, so a rename that follows
+					// close(2) immediately can race the queued background
+					// upload of the SAME staging — the winner lands the
+					// acknowledged bytes, the loser CASes a stale revision
+					// (git's lock→config rename hit this deterministically:
+					// both uploads read the staging before either retired
+					// it). When the staged entry has since been retired (or
+					// replaced by a fresher generation, which keeps the
+					// conservative failure below), the old name holds the
+					// acknowledged content and the rename proceeds.
+					tolerated := errors.Is(err, client.ErrConflict)
+					if tolerated {
+						if cur, still := w.wbCache.GetMeta(op.Path); still && cur.Generation == meta.Generation {
+							tolerated = false
+						} else {
+							w.uploader.WaitPath(op.Path)
+						}
+					}
+					if !tolerated {
+						return fs.Result{}, fmt.Errorf("land staged image before rename %s: %w", op.Path, err)
+					}
+				} else {
+					w.uploader.WaitPath(op.Path)
+					// Retire only the generation that uploaded: a fresher
+					// staging published during the upload still needs its own
+					// landing (or the retargeted writer's flush).
+					w.wbCache.RemoveIfGeneration(op.Path, meta.Generation)
 				}
-				w.uploader.WaitPath(op.Path)
-				// Retire only the generation that uploaded: a fresher
-				// staging published during the upload still needs its own
-				// landing (or the retargeted writer's flush).
-				w.wbCache.RemoveIfGeneration(op.Path, meta.Generation)
 			}
 		}
 		// renames only after the old path's pending data landed:
