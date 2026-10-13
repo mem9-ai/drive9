@@ -380,6 +380,7 @@ func (l *Layer) createOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) 
 		// async commit plane; the rewritten open must tolerate a not-yet-
 		// visible tree file (O_CREAT on an existing path is a plain open).
 		rop.Flags = (op.Flags &^ uint32(syscall.O_EXCL)) | uint32(syscall.O_CREAT)
+		rop.Mode = openCreateMode(op.Mode, attr)
 		rres, rerr := next(ctx, &rop)
 		if rerr != nil {
 			return rres, rerr
@@ -412,16 +413,31 @@ func (l *Layer) createOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) 
 	} else if err := l.writeCasMarker(ctx, v, p, 0, false); err != nil {
 		return fs.Result{}, err
 	}
-	v.idx.put(p, &indexEntry{kind: ekTree, mode: op.Mode & 0o777})
+	v.idx.put(p, &indexEntry{kind: ekTree, mode: openCreateMode(op.Mode, attr)})
 	rop := *op
 	rop.Path = v.treePathOf(l.serverAbs(p))
 	// See the resAttrs branch: the tree file may still be landing.
 	rop.Flags = (op.Flags &^ uint32(syscall.O_EXCL)) | uint32(syscall.O_CREAT)
+	rop.Mode = openCreateMode(op.Mode, attr)
 	rres, rerr := next(ctx, &rop)
 	if rerr != nil {
 		return rres, rerr
 	}
 	return rres, nil
+}
+
+// openCreateMode defaults a rewritten open's create mode: an OPEN carries
+// no mode, and a modeless lazy create would land the tree file as chmod
+// 000 (the next open then trips the facade's permission gate). The
+// classic base's mode is the CoW-correct default.
+func openCreateMode(opMode uint32, attr *fs.Attr) uint32 {
+	if opMode&0o777 != 0 {
+		return opMode & 0o777
+	}
+	if attr != nil && attr.Mode&0o777 != 0 {
+		return attr.Mode & 0o777
+	}
+	return 0o644
 }
 
 // writeOp is the handleless write path: routes to the tree, materializing

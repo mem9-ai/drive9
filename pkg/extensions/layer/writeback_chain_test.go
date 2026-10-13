@@ -69,19 +69,26 @@ func TestChainTruncatingOpenOverWriteback(t *testing.T) {
 		t.Fatalf("getattr: %v", err)
 	}
 	// shell `>` on the resolved name: O_TRUNC, no O_CREAT.
-	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/base.txt", Flags: uint32(syscall.O_WRONLY | syscall.O_TRUNC)})
-	if err != nil {
-		t.Fatalf("truncating open: %v", err)
+	writeAndClose := func(label string) {
+		t.Helper()
+		res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/base.txt", Flags: uint32(syscall.O_WRONLY | syscall.O_TRUNC)})
+		if err != nil {
+			t.Fatalf("%s open: %v", label, err)
+		}
+		if h := res.Handle; h != nil {
+			if err := h.Write(ctx, 0, []byte("replaced in layer")); err != nil {
+				t.Fatalf("%s write: %v", label, err)
+			}
+			if err := h.Flush(ctx); err != nil {
+				t.Fatalf("%s flush: %v", label, err)
+			}
+			if err := h.Release(ctx); err != nil {
+				t.Fatalf("%s release: %v", label, err)
+			}
+		}
 	}
-	if h := res.Handle; h != nil {
-		if err := h.Write(ctx, 0, []byte("replaced in layer")); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		if err := h.Flush(ctx); err != nil {
-			t.Fatalf("flush: %v", err)
-		}
-		if err := h.Release(ctx); err != nil {
-			t.Fatalf("release: %v", err)
-		}
-	}
+	writeAndClose("first")
+	// The landed tree file must keep a sane mode: a second open runs the
+	// facade's permission gate against the tree attrs.
+	writeAndClose("second")
 }
