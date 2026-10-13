@@ -114,7 +114,11 @@ func (l *Layer) materializeClassic(ctx context.Context, v *view, next fs.Next, p
 		return err
 	}
 	if truncate {
-		return nil
+		// The discarded content still needs an empty tree file: an
+		// O_TRUNC open that arrives without O_CREAT (the kernel already
+		// resolved the name) would otherwise hit the terminal's
+		// not-exists branch on the missing tree path.
+		return l.ensureTreeFile(ctx, v, next, p, attr)
 	}
 	return l.pumpClassic(ctx, v, next, p, p, attr)
 }

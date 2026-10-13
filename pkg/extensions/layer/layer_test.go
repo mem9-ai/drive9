@@ -525,3 +525,31 @@ func TestRenameClassicDirectoryRemapsChildren(t *testing.T) {
 		t.Fatal("dir blackout did not hide the source subtree")
 	}
 }
+
+func TestTruncatingOpenWithoutCreateMaterializesEmptyTree(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/doc.txt", []byte("original"))
+
+	// shell `>` semantics: O_TRUNC open of an existing name, no O_CREAT
+	// (the kernel already resolved the dentry).
+	res, err := s.ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/doc.txt", Flags: uint32(syscall.O_WRONLY | syscall.O_TRUNC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := res.Handle; h != nil {
+		if err := h.Write(ctx, 0, []byte("new")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		_ = h.Release(ctx)
+	}
+	if got := mustRead(t, s, "/doc.txt"); got != "new" {
+		t.Fatalf("post-truncate read = %q", got)
+	}
+	if got, _ := s.disk(t, "/doc.txt"); got != "original" {
+		t.Fatalf("classic mutated: %q", got)
+	}
+}
