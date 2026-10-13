@@ -77,6 +77,10 @@ type Backend struct {
 	layerEvents map[string][]LayerEntry
 	// checkpoints maps checkpoint ID → durable seq bound.
 	checkpoints map[string]int64
+	// layerStates maps layer ID → state for the bare layer GET.
+	layerStates map[string]string
+	// layerParents maps child layer ID → parent for the registry list.
+	layerParents map[string]string
 	// gitWorkspaces seeds GET /v1/git-workspaces; gitOverlay is the overlay
 	// log per workspace (path → entry).
 	gitWorkspaces []map[string]any
@@ -119,6 +123,8 @@ func NewBackend() *Backend {
 		layerLog:      map[string][]LayerEntry{},
 		layerEvents:   map[string][]LayerEntry{},
 		uploads:       map[string]*uploadState{},
+		layerStates:   map[string]string{},
+		layerParents:  map[string]string{},
 		checkpoints:   map[string]int64{},
 		requests:      map[string]int{},
 		gitStates:     map[string][]byte{},
@@ -231,6 +237,21 @@ func (b *Backend) GitOverlay(id string) map[string]map[string]any {
 }
 
 // SetCheckpoint pins a checkpoint's durable seq bound.
+// LayerStateForTest reports the tracked state of a layer.
+func (b *Backend) LayerStateForTest(id string) (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	st, ok := b.layerStates[id]
+	return st, ok
+}
+
+// SetLayerState overrides the state a bare layer GET reports.
+func (b *Backend) SetLayerState(id, state string) {
+	b.mu.Lock()
+	b.layerStates[id] = state
+	b.mu.Unlock()
+}
+
 func (b *Backend) SetCheckpoint(id string, seq int64) {
 	b.mu.Lock()
 	b.checkpoints[id] = seq
@@ -347,6 +368,20 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				ExpectedRevision *int64 `json:"expected_revision"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
+			// The real server enforces the CAS anchor at initiate time.
+			if req.ExpectedRevision != nil {
+				b.mu.Lock()
+				n := b.files[req.Path]
+				b.mu.Unlock()
+				if *req.ExpectedRevision == 0 && n != nil {
+					b.writeErr(w, http.StatusConflict, "already exists")
+					return
+				}
+				if *req.ExpectedRevision > 0 && (n == nil || n.Rev != *req.ExpectedRevision) {
+					b.writeErr(w, http.StatusConflict, "revision mismatch")
+					return
+				}
+			}
 			b.mu.Lock()
 			b.uploadSeq++
 			id := fmt.Sprintf("up-%d", b.uploadSeq)
@@ -598,23 +633,68 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/v1/layer-checkpoints/") && r.Method == http.MethodGet {
 		id := strings.TrimPrefix(r.URL.Path, "/v1/layer-checkpoints/")
 		b.mu.Lock()
-		seq := b.layerSeq
-		if cp, ok := b.checkpoints[id]; ok {
-			seq = cp
+		seq, ok := b.checkpoints[id]
+		b.mu.Unlock()
+		if !ok {
+			b.writeErr(w, http.StatusNotFound, "not found")
+			return
+		}
+		b.writeJSON(w, map[string]any{"checkpoint_id": id, "layer_id": "L1", "durable_seq": seq})
+		return
+	}
+	// Layer registry: GET /v1/layers lists rows (parent linkage for
+	// cascade-sweep consumers).
+	if r.URL.Path == "/v1/layers" && r.Method == http.MethodGet {
+		b.mu.Lock()
+		out := make([]map[string]any, 0, len(b.layerStates))
+		for id, state := range b.layerStates {
+			row := map[string]any{"layer_id": id, "state": state, "base_root_path": "/"}
+			if parent, ok := b.layerParents[id]; ok {
+				row["parent_layer_id"] = parent
+			}
+			out = append(out, row)
 		}
 		b.mu.Unlock()
-		b.writeJSON(w, map[string]any{"checkpoint_id": id, "layer_id": "L1", "durable_seq": seq})
+		b.writeJSON(w, map[string]any{"layers": out})
 		return
 	}
 	// fs-layer subtree: POST /v1/layers/{id}/entries, GET /v1/layers/{id}/diff
 	if strings.HasPrefix(r.URL.Path, "/v1/layers/") {
 		rest := strings.TrimPrefix(r.URL.Path, "/v1/layers/")
 		id := rest
+		if i := strings.IndexByte(rest, '/'); i < 0 && r.Method == http.MethodDelete {
+			b.mu.Lock()
+			b.layerStates[id] = "abandoned"
+			b.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"status":"ok"}`)
+			return
+		}
+		if i := strings.IndexByte(rest, '/'); i < 0 && r.Method == http.MethodGet {
+			b.mu.Lock()
+			_, known := b.layerStates[id]
+			state := b.layerStates[id]
+			b.mu.Unlock()
+			if !known {
+				b.writeErr(w, http.StatusNotFound, "not found")
+				return
+			}
+			if state == "" {
+				state = "active"
+			}
+			b.writeJSON(w, map[string]any{"layer_id": id, "base_root_path": "/", "state": state, "name": ""})
+			return
+		}
 		if i := strings.IndexByte(rest, '/'); i >= 0 {
 			id = rest[:i]
 			tail := rest[i+1:]
 			switch {
 			case tail == "entries" && r.Method == http.MethodPost:
+				b.mu.Lock()
+				if _, ok := b.layerStates[id]; !ok {
+					b.layerStates[id] = "active"
+				}
+				b.mu.Unlock()
 				var req struct {
 					Path        string `json:"path"`
 					Op          string `json:"op"`
@@ -634,6 +714,52 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					time.Sleep(delay)
 				}
 				b.writeJSON(w, map[string]any{"layer_id": id, "path": req.Path, "op": req.Op, "seq": e.Seq})
+				return
+			case tail == "commit" && r.Method == http.MethodPost:
+				b.mu.Lock()
+				b.layerStates[id] = "committed"
+				b.mu.Unlock()
+				b.writeJSON(w, map[string]any{"status": "committed", "layer_id": id, "applied": 0})
+				return
+			case tail == "fork" && r.Method == http.MethodPost:
+				var req struct {
+					LayerID      string `json:"layer_id"`
+					Name         string `json:"name"`
+					CheckpointID string `json:"checkpoint_id"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				child := req.LayerID
+				if child == "" {
+					child = "layer-forked"
+				}
+				b.mu.Lock()
+				parent := b.layerStates[id]
+				b.mu.Unlock()
+				if parent == "committed" || parent == "abandoned" || parent == "conflicted" {
+					b.writeErr(w, http.StatusConflict, "parent layer is "+parent)
+					return
+				}
+				b.mu.Lock()
+				b.layerStates[child] = "active"
+				b.layerParents[child] = id
+				b.mu.Unlock()
+				b.writeJSON(w, map[string]any{"layer_id": child, "base_root_path": "/", "state": "active", "parent_layer_id": id, "depth": 1})
+				return
+			case tail == "checkpoints" && r.Method == http.MethodPost:
+				var req struct {
+					CheckpointID string `json:"checkpoint_id"`
+					Label        string `json:"label"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				cp := req.CheckpointID
+				if cp == "" {
+					cp = "ckpt-auto"
+				}
+				b.mu.Lock()
+				b.layerSeq++
+				b.checkpoints[cp] = b.layerSeq
+				b.mu.Unlock()
+				b.writeJSON(w, map[string]any{"checkpoint_id": cp, "layer_id": id, "durable_seq": 0, "label": req.Label})
 				return
 			case tail == "events" && r.Method == http.MethodGet:
 				since := int64(0)
@@ -980,12 +1106,27 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodHead:
 		b.mu.Lock()
 		n := b.files[p]
+		syntheticDir := false
+		if n == nil && p != "/" {
+			prefix := p + "/"
+			for cp := range b.files {
+				if strings.HasPrefix(cp, prefix) {
+					syntheticDir = true
+					break
+				}
+			}
+		}
 		b.mu.Unlock()
-		if n == nil {
+		if n == nil && !syntheticDir {
 			b.writeErr(w, http.StatusNotFound, "not found")
 			return
 		}
-		w.Header().Set("X-Dat9-IsDir", strconv.FormatBool(n.IsDir))
+		isDir := syntheticDir || n.IsDir
+		w.Header().Set("X-Dat9-IsDir", strconv.FormatBool(isDir))
+		if n == nil {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		w.Header().Set("Content-Length", strconv.Itoa(len(n.Data)))
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(n.Rev, 10))
 		w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(n.Mode), 10))
@@ -1131,6 +1272,17 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		n := b.files[p]
 		delete(b.files, p)
+		if q.Get("recursive") == "1" || q.Get("recursive") == "true" {
+			prefix := p + "/"
+			for cp := range b.files {
+				if strings.HasPrefix(cp, prefix) {
+					delete(b.files, cp)
+				}
+			}
+			b.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		b.mu.Unlock()
 		if n == nil {
 			b.writeErr(w, http.StatusNotFound, "not found")

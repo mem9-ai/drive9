@@ -1,9 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"io"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,154 +12,217 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
-func TestUploadReaderToLayerUsesServerInlineThreshold(t *testing.T) {
-	var statusCalls, entryCalls, initiateCalls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method + " " + r.URL.Path {
-		case "GET /v1/status":
-			statusCalls++
-			_, _ = io.WriteString(w, `{"inline_threshold":4}`)
-		case "HEAD /v1/fs/repo/a.bin":
-			http.NotFound(w, r)
-		case "POST /v1/layers/layer-1/entries":
-			entryCalls++
-			var req client.FSLayerEntryRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				t.Errorf("decode layer entry: %v", err)
-			}
-			if string(req.Content) != "data" {
-				t.Errorf("inline content = %q, want data", req.Content)
-			}
-			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{Path: req.Path})
-		case "POST /v1/layers/layer-1/uploads/initiate":
-			initiateCalls++
-			http.Error(w, "unexpected direct upload", http.StatusInternalServerError)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
+// newLayerBackend wires a CLI client over one fake backend.
+func newLayerBackend(t *testing.T) (*testbackend.Backend, *client.Client) {
+	t.Helper()
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	return b, client.New(ts.URL, "")
+}
 
-	c := client.New(srv.URL, "")
-	c.Warm(context.Background())
-	err := uploadReaderToLayer(context.Background(), c, "layer-1", "/repo/a.bin", strings.NewReader("data"), 4, 0o644, true)
+func TestUploadReaderToLayerLandsInTreeWithCasMarker(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
+	b.Seed("/repo/base.bin", []byte("base"))
+
+	ctx := context.Background()
+	// fresh path: absent base anchor (cas "0")
+	if err := uploadReaderToLayer(ctx, c, "layer-1", "/repo/a.bin", strings.NewReader("data"), 4, 0o644, true); err != nil {
+		t.Fatalf("uploadReaderToLayer: %v", err)
+	}
+	if n, ok := b.Node("/.drive9/layers/layer-1/tree/repo/a.bin"); !ok || string(n.Data) != "data" {
+		t.Fatalf("tree content = %+v", n)
+	}
+	if n, ok := b.Node("/.drive9/layers/layer-1/cas/repo/a.bin"); !ok || string(n.Data) != "0" {
+		t.Fatalf("cas marker = %+v", n)
+	}
+
+	// classic-backed path: the anchor pins the base revision
+	if err := uploadReaderToLayer(ctx, c, "layer-1", "/repo/base.bin", strings.NewReader("over"), 4, 0o644, true); err != nil {
+		t.Fatalf("uploadReaderToLayer (base): %v", err)
+	}
+	base, _ := b.Node("/repo/base.bin")
+	if n, ok := b.Node("/.drive9/layers/layer-1/cas/repo/base.bin"); !ok || string(n.Data) == "0" {
+		t.Fatalf("cas marker for classic base = %+v (base rev %d)", n, base.Rev)
+	}
+	if string(base.Data) != "base" {
+		t.Fatalf("classic base mutated: %q", base.Data)
+	}
+}
+
+func TestCpLayerLocalUploadUsesTreePath(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
+	localPath := filepath.Join(t.TempDir(), "layer.txt")
+	if err := os.WriteFile(localPath, []byte("layer upload"), 0o640); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := uploadLocalFileToLayer(context.Background(), c, "layer-1", localPath, "/dst/layer.txt"); err != nil {
+		t.Fatalf("uploadLocalFileToLayer: %v", err)
+	}
+	if n, ok := b.Node("/.drive9/layers/layer-1/tree/dst/layer.txt"); !ok || string(n.Data) != "layer upload" {
+		t.Fatalf("tree upload = %+v", n)
+	}
+	if _, ok := b.Node("/dst/layer.txt"); ok {
+		t.Fatal("layer upload leaked into the classic namespace")
+	}
+}
+
+func TestSearchCommandsRejectLayer(t *testing.T) {
+	_, c := newLayerBackend(t)
+	if gerr := Grep(c, []string{"--layer", "layer-1", "pattern"}); gerr == nil || !strings.Contains(gerr.Error(), "mount the layer") {
+		t.Fatalf("grep --layer error = %v", gerr)
+	}
+}
+
+func TestLayerCommitAppliesTreeOntoBase(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
+	b.Seed("/repo/keep.txt", []byte("keep"))
+	b.Seed("/repo/gone.txt", []byte("gone"))
+	b.Seed("/repo/replaced.txt", []byte("classic v1"))
+	roots := "/.drive9/layers/layer-1"
+	// A replacement pins the live base revision as its CAS anchor.
+	replacedStat, err := c.StatCtx(context.Background(), "/repo/replaced.txt")
 	if err != nil {
-		t.Fatalf("uploadReaderToLayer: %v", err)
+		t.Fatal(err)
 	}
-	if statusCalls != 1 || entryCalls != 1 || initiateCalls != 0 {
-		t.Fatalf("statusCalls=%d entryCalls=%d initiateCalls=%d, want 1, 1, 0", statusCalls, entryCalls, initiateCalls)
+	if err := c.WriteCtx(context.Background(), roots+"/cas/repo/replaced.txt", []byte(fmt.Sprintf("%d", replacedStat.Revision))); err != nil {
+		t.Fatal(err)
 	}
-}
+	// tree additions + blackout + attrs, laid out directly on the backend
+	b.Seed(roots+"/tree/repo/added.txt", []byte("added"))
+	b.Seed(roots+"/tree/repo/replaced.txt", []byte("replaced"))
+	b.Seed(roots+"/cas/repo/added.txt", []byte("0"))
+	b.Seed(roots+"/blackouts/repo/gone.txt", []byte("-"))
+	b.Seed(roots+"/attrs/repo/keep.txt", []byte(`{"mode":493}`))
 
-func TestUploadReaderToLayerUsesDirectUploadAboveServerThreshold(t *testing.T) {
-	var uploaded string
-	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		data, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read S3 body: %v", err)
-		}
-		uploaded = string(data)
-		w.Header().Set("ETag", `"etag-1"`)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer s3.Close()
-
-	var entryCalls, initiateCalls int
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method + " " + r.URL.Path {
-		case "GET /v1/status":
-			_, _ = io.WriteString(w, `{"inline_threshold":3}`)
-		case "HEAD /v1/fs/repo/a.bin":
-			http.NotFound(w, r)
-		case "POST /v1/layers/layer-1/entries":
-			entryCalls++
-			http.Error(w, "unexpected inline upload", http.StatusInternalServerError)
-		case "POST /v1/layers/layer-1/uploads/initiate":
-			initiateCalls++
-			w.WriteHeader(http.StatusAccepted)
-			_, _ = io.WriteString(w, `{"upload_id":"upload-1","part_size":4,"total_parts":1}`)
-		case "POST /v1/layers/layer-1/uploads/upload-1/presign-batch":
-			_ = json.NewEncoder(w).Encode(map[string]any{"parts": []map[string]any{{
-				"number": 1,
-				"url":    s3.URL,
-				"size":   4,
-			}}})
-		case "POST /v1/layers/layer-1/uploads/upload-1/complete":
-			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{Path: "/repo/a.bin", StorageType: "s3"})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer api.Close()
-
-	c := client.New(api.URL, "")
-	c.Warm(context.Background())
-	err := uploadReaderToLayer(context.Background(), c, "layer-1", "/repo/a.bin", strings.NewReader("data"), 4, 0o644, true)
+	out, err := captureStdoutE(t, func() error { return Layer(c, []string{"commit", "layer-1"}) })
 	if err != nil {
-		t.Fatalf("uploadReaderToLayer: %v", err)
+		t.Fatalf("Layer commit: %v (out %q)", err, out)
 	}
-	if uploaded != "data" || initiateCalls != 1 || entryCalls != 0 {
-		t.Fatalf("uploaded=%q initiateCalls=%d entryCalls=%d, want data, 1, 0", uploaded, initiateCalls, entryCalls)
+	if !strings.Contains(out, "committed") || !strings.Contains(out, "layer=layer-1") {
+		t.Fatalf("stdout = %q", out)
 	}
-}
-
-func TestUploadReaderToLayerDoesNotFetchStatusOnHotPath(t *testing.T) {
-	var statusCalls, entryCalls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method + " " + r.URL.Path {
-		case "GET /v1/status":
-			statusCalls++
-			_, _ = io.WriteString(w, `{"inline_threshold":1}`)
-		case "HEAD /v1/fs/repo/a.bin":
-			http.NotFound(w, r)
-		case "POST /v1/layers/layer-1/entries":
-			entryCalls++
-			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{Path: "/repo/a.bin"})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	c := client.New(srv.URL, "")
-	if err := uploadReaderToLayer(context.Background(), c, "layer-1", "/repo/a.bin", strings.NewReader("data"), 4, 0, false); err != nil {
-		t.Fatalf("uploadReaderToLayer: %v", err)
+	if n, ok := b.Node("/repo/added.txt"); !ok || string(n.Data) != "added" {
+		t.Fatalf("committed addition = %+v", n)
 	}
-	if statusCalls != 0 || entryCalls != 1 {
-		t.Fatalf("statusCalls=%d entryCalls=%d, want 0 and 1", statusCalls, entryCalls)
+	if n, ok := b.Node("/repo/replaced.txt"); !ok || string(n.Data) != "replaced" {
+		t.Fatalf("committed replacement = %+v", n)
+	}
+	if _, ok := b.Node("/repo/gone.txt"); ok {
+		t.Fatal("committed whiteout left the base file behind")
+	}
+	if n, ok := b.Node("/repo/keep.txt"); !ok || n.Mode&0o755 != 0o755 {
+		t.Fatalf("committed chmod = %+v", n)
 	}
 }
 
-func TestUploadReaderToLayerCapsInlineEntrySize(t *testing.T) {
-	const size = int64(100 << 20)
-	var entryCalls, initiateCalls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method + " " + r.URL.Path {
-		case "HEAD /v1/fs/repo/large.bin":
-			http.NotFound(w, r)
-		case "POST /v1/layers/layer-1/entries":
-			entryCalls++
-			http.Error(w, "unexpected inline upload", http.StatusInternalServerError)
-		case "POST /v1/layers/layer-1/uploads/initiate":
-			initiateCalls++
-			http.Error(w, "direct upload selected", http.StatusInternalServerError)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	c := client.New(srv.URL, "")
-	c.SetSmallFileThresholdForTests(128 << 20)
-	err := uploadReaderToLayer(context.Background(), c, "layer-1", "/repo/large.bin", strings.NewReader("not consumed"), size, 0, false)
-	if err == nil || !strings.Contains(err.Error(), "direct upload selected") {
-		t.Fatalf("uploadReaderToLayer error = %v, want direct upload marker", err)
+func TestLayerCommitReportsCasConflict(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
+	b.Seed("/repo/stale.txt", []byte("live-now"))
+	roots := "/.drive9/layers/layer-1"
+	b.Seed(roots+"/tree/repo/stale.txt", []byte("layered-old"))
+	// the base moves past the anchor before the commit applies
+	if err := c.WriteCtx(context.Background(), "/repo/stale.txt", []byte("live-now-2")); err != nil {
+		t.Fatal(err)
 	}
-	if entryCalls != 0 || initiateCalls != 1 {
-		t.Fatalf("entryCalls=%d initiateCalls=%d, want 0 and 1", entryCalls, initiateCalls)
+	if err := c.WriteCtx(context.Background(), roots+"/cas/repo/stale.txt", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Layer(c, []string{"commit", "layer-1"})
+	if err == nil {
+		t.Fatal("stale CAS anchor committed")
+	}
+	if n, _ := b.Node("/repo/stale.txt"); string(n.Data) != "live-now-2" {
+		t.Fatalf("conflicted commit mutated the base: %q", n.Data)
+	}
+}
+
+func TestLayerDiffWalksTheTree(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
+	roots := "/.drive9/layers/layer-1"
+	b.Seed(roots+"/tree/repo/a.txt", []byte("a"))
+	b.Seed(roots+"/blackouts/repo/b.txt", []byte("-"))
+	b.Seed(roots+"/attrs/repo/c.txt", []byte(`{"mode":493}`))
+
+	out, err := captureStdoutE(t, func() error { return Layer(c, []string{"diff", "layer-1"}) })
+	if err != nil {
+		t.Fatalf("Layer diff: %v", err)
+	}
+	for _, want := range []string{"upsert", "/repo/a.txt", "whiteout", "/repo/b.txt", "chmod", "/repo/c.txt"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("diff output %q missing %q", out, want)
+		}
+	}
+}
+
+func TestLayerForkCopiesSnapshotBeforeRegistryRow(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("parent", "active")
+	b.Seed("/.drive9/layers/parent/tree/repo/a.txt", []byte("from parent"))
+	b.Seed("/.drive9/layers/parent/blackouts/repo/b.txt", []byte("-"))
+	b.Seed("/.drive9/layers/parent/cas/repo/a.txt", []byte("0"))
+
+	out, err := captureStdoutE(t, func() error { return Layer(c, []string{"fork", "--id", "child-1", "parent"}) })
+	if err != nil {
+		t.Fatalf("Layer fork: %v (out %q)", err, out)
+	}
+	if !strings.Contains(out, "child-1") {
+		t.Fatalf("stdout = %q", out)
+	}
+	if n, ok := b.Node("/.drive9/layers/child-1/tree/repo/a.txt"); !ok || string(n.Data) != "from parent" {
+		t.Fatalf("forked tree = %+v", n)
+	}
+	if _, ok := b.Node("/.drive9/layers/child-1/blackouts/repo/b.txt"); !ok {
+		t.Fatal("fork lost the blackout marker")
+	}
+	if _, ok := b.Node("/.drive9/layers/child-1/cas/repo/a.txt"); !ok {
+		t.Fatal("fork lost the cas marker")
+	}
+}
+
+func TestLayerCheckpointSnapshotsTheTree(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
+	b.Seed("/.drive9/layers/layer-1/tree/repo/a.txt", []byte("v1"))
+
+	out, err := captureStdoutE(t, func() error { return Layer(c, []string{"checkpoint", "--id", "cp9", "layer-1"}) })
+	if err != nil {
+		t.Fatalf("Layer checkpoint: %v (out %q)", err, out)
+	}
+	if !strings.Contains(out, "cp9") {
+		t.Fatalf("stdout = %q", out)
+	}
+	if n, ok := b.Node("/.drive9/layers/layer-1/checkpoints/cp9/tree/repo/a.txt"); !ok || string(n.Data) != "v1" {
+		t.Fatalf("checkpoint snapshot = %+v", n)
+	}
+	// post-checkpoint writes do not disturb the snapshot
+	b.Seed("/.drive9/layers/layer-1/tree/repo/a.txt", []byte("v2"))
+	if n, _ := b.Node("/.drive9/layers/layer-1/checkpoints/cp9/tree/repo/a.txt"); string(n.Data) != "v1" {
+		t.Fatalf("snapshot mutated: %q", n.Data)
+	}
+}
+
+func TestLayerDeleteSweepsTheTree(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
+	b.Seed("/.drive9/layers/layer-1/tree/repo/a.txt", []byte("a"))
+
+	out, err := captureStdoutE(t, func() error { return Layer(c, []string{"delete", "layer-1"}) })
+	if err != nil {
+		t.Fatalf("Layer delete: %v (out %q)", err, out)
+	}
+	if n, ok := b.Node("/.drive9/layers/layer-1/tree/repo/a.txt"); ok {
+		t.Fatalf("delete left the tree behind: %+v", n)
 	}
 }
 
@@ -202,132 +266,75 @@ func TestLayerCreatePrintsLayerID(t *testing.T) {
 	}
 }
 
-func TestCpLayerLocalUploadUsesFSLayerEntry(t *testing.T) {
-	localPath := filepath.Join(t.TempDir(), "layer.txt")
-	if err := os.WriteFile(localPath, []byte("layer upload"), 0o640); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	var got client.FSLayerEntryRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method + " " + r.URL.Path {
-		case "HEAD /v1/fs/repo/layer.txt":
-			http.NotFound(w, r)
-		case "POST /v1/layers/layer-1/entries":
-			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
-				t.Fatalf("decode entry request: %v", err)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
-				LayerID:   "layer-1",
-				Path:      got.Path,
-				Op:        got.Op,
-				Kind:      got.Kind,
-				SizeBytes: got.SizeBytes,
-				Mode:      got.Mode,
-			})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	c := client.New(srv.URL, "")
-	if err := Cp(c, []string{"--layer", "layer-1", localPath, ":/repo/layer.txt"}); err != nil {
-		t.Fatalf("Cp --layer: %v", err)
-	}
-	if got.Path != "/repo/layer.txt" || got.Op != "upsert" || got.Kind != "file" || string(got.Content) != "layer upload" || got.Mode != 0o640 {
-		t.Fatalf("entry request = %+v", got)
-	}
-}
-
-func TestSearchCommandsPassLayerParam(t *testing.T) {
-	var grepLayer, findLayer string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/" && r.URL.Query().Has("grep"):
-			grepLayer = r.URL.Query().Get("layer")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `[]`)
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/" && r.URL.Query().Has("find"):
-			findLayer = r.URL.Query().Get("layer")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `[]`)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	c := client.New(srv.URL, "")
-	if err := Grep(c, []string{"--layer", "task=search", "needle", ":/repo/"}); err != nil {
-		t.Fatalf("Grep --layer: %v", err)
-	}
-	if err := Find(c, []string{"--layer", "task=search", ":/repo/"}); err != nil {
-		t.Fatalf("Find --layer: %v", err)
-	}
-	if grepLayer != "task=search" || findLayer != "task=search" {
-		t.Fatalf("grepLayer=%q findLayer=%q, want task=search", grepLayer, findLayer)
-	}
-}
-
 func TestLayerCreateRejectsDuplicateTag(t *testing.T) {
-	c := client.New("http://127.0.0.1", "")
-	err := Layer(c, []string{"create", "--tag", "task=auth", "--tag", "task=review", ":/repo"})
-	if err == nil || !strings.Contains(err.Error(), `duplicate layer tag "task"`) {
-		t.Fatalf("Layer create duplicate tag err=%v, want duplicate tag error", err)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(client.FSLayer{LayerID: "layer-1"})
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, "")
+	if err := Layer(c, []string{"create", "--tag", "a=1", "--tag", "a=2", ":/repo"}); err == nil || !strings.Contains(err.Error(), "duplicate layer tag") {
+		t.Fatalf("duplicate tag error = %v", err)
 	}
 }
 
-func TestLayerCommitPrintsResult(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/task=auth/commit" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(client.FSLayerCommit{
-			Status:  "committed",
-			LayerID: "layer-1",
-			Applied: 3,
-		})
-	}))
-	defer srv.Close()
+func TestStampCasKeepsFirstAnchor(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("layer-1", "active")
+	b.Seed("/repo/x.bin", []byte("v1"))
 
-	c := client.New(srv.URL, "")
-	out, err := captureStdoutE(t, func() error { return Layer(c, []string{"commit", "task=auth"}) })
-	if err != nil {
-		t.Fatalf("Layer commit: %v", err)
+	ctx := context.Background()
+	if err := uploadReaderToLayer(ctx, c, "layer-1", "/repo/x.bin", bytes.NewReader([]byte("layer v1")), 8, 0o644, true); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(out, "committed") || !strings.Contains(out, "layer=layer-1") || !strings.Contains(out, "applied=3") {
-		t.Fatalf("stdout = %q, want commit result", out)
+	first, ok := b.Node("/.drive9/layers/layer-1/cas/repo/x.bin")
+	if !ok {
+		t.Fatal("no anchor after first write")
+	}
+	// Another writer moves the base; the layer writes again — the anchor
+	// must keep pinning the revision the layer was first derived from.
+	if err := c.WriteCtx(ctx, "/repo/x.bin", []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := uploadReaderToLayer(ctx, c, "layer-1", "/repo/x.bin", bytes.NewReader([]byte("layer v2")), 8, 0o644, true); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := b.Node("/.drive9/layers/layer-1/cas/repo/x.bin")
+	if string(got.Data) != string(first.Data) {
+		t.Fatalf("anchor drifted: first=%q now=%q", first.Data, got.Data)
 	}
 }
 
-func TestLayerDiffTextOutput(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/v1/layers/layer-1/diff" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"entries": []client.FSLayerEntry{{
-				EntrySeq: 1,
-				Op:       "upsert",
-				Kind:     "file",
-				Mode:     0o644,
-				Path:     "/repo/a.txt",
-			}},
-		})
-	}))
-	defer srv.Close()
+func TestLayerForkRefusesExistingChildID(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("parent", "active")
+	b.SetLayerState("taken", "active")
+	b.Seed("/.drive9/layers/parent/tree/repo/a.txt", []byte("from parent"))
 
-	c := client.New(srv.URL, "")
-	out, err := captureStdoutE(t, func() error { return Layer(c, []string{"diff", "layer-1"}) })
-	if err != nil {
-		t.Fatalf("Layer diff: %v", err)
+	err := Layer(c, []string{"fork", "--id", "taken", "parent"})
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("fork onto existing id err = %v", err)
 	}
-	if !strings.Contains(out, "1") || !strings.Contains(out, "upsert") || !strings.Contains(out, "/repo/a.txt") {
-		t.Fatalf("stdout = %q, want diff entry", out)
+	if n, ok := b.Node("/.drive9/layers/taken/tree/repo/a.txt"); ok {
+		t.Fatalf("refused fork overwrote the existing tree: %+v", n)
+	}
+}
+
+func TestLayerDeleteCascadeSweepsDescendants(t *testing.T) {
+	b, c := newLayerBackend(t)
+	b.SetLayerState("parent", "active")
+	if err := Layer(c, []string{"fork", "--id", "child-1", "parent"}); err != nil {
+		t.Fatalf("fork: %v", err)
+	}
+	b.Seed("/.drive9/layers/parent/tree/repo/p.txt", []byte("p"))
+	b.Seed("/.drive9/layers/child-1/tree/repo/c.txt", []byte("c"))
+
+	if _, err := captureStdoutE(t, func() error { return Layer(c, []string{"delete", "--cascade", "parent"}) }); err != nil {
+		t.Fatalf("cascade delete: %v", err)
+	}
+	if n, ok := b.Node("/.drive9/layers/parent/tree/repo/p.txt"); ok {
+		t.Fatalf("parent tree survived: %+v", n)
+	}
+	if n, ok := b.Node("/.drive9/layers/child-1/tree/repo/c.txt"); ok {
+		t.Fatalf("descendant tree survived: %+v", n)
 	}
 }

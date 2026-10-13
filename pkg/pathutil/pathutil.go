@@ -139,3 +139,23 @@ func SplitParent(p string) (parent, base string) {
 	}
 	return parent, base
 }
+
+// GlobalLayersRoot is the server-absolute layer namespace: marker trees
+// live outside every mount's remote root, so path joins must never prefix
+// it (see pkg/layerfs.Root).
+const GlobalLayersRoot = "/.drive9/layers"
+
+// WithRemoteRoot prefixes a mount path with the remote root, keeping the
+// global layer namespace server-absolute.
+func WithRemoteRoot(root, p string) string {
+	if root == "" || root == "/" {
+		return p
+	}
+	if p == GlobalLayersRoot || strings.HasPrefix(p, GlobalLayersRoot+"/") {
+		return p
+	}
+	if p == "/" {
+		return root
+	}
+	return root + p
+}

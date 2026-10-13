@@ -14,6 +14,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 // Options configures the extension.
@@ -104,10 +105,7 @@ func (e *Extent) remotePath(p string) string {
 	if e.root == "/" {
 		return p
 	}
-	if p == "/" {
-		return e.root
-	}
-	return e.root + p
+	return pathutil.WithRemoteRoot(e.root, p)
 }
 
 // EntryTTLHint implements the facade's TTL clamp (v1 extentAttrTimeoutFor

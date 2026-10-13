@@ -91,22 +91,14 @@ func TestGrepTextOutputWithoutJSON(t *testing.T) {
 }
 
 func TestGrepJSONWithLayer(t *testing.T) {
-	var capturedLayer string
-	srv := newGrepTestServer(t, `[]`, &capturedLayer)
+	srv := newGrepTestServer(t, `[]`, nil)
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
-	out, err := captureStdoutE(t, func() error {
-		return Grep(c, []string{"--json", "--layer", "task=search", "needle", ":/repo/"})
-	})
-	if err != nil {
-		t.Fatalf("Grep --json --layer: %v", err)
-	}
-
-	if capturedLayer != "task=search" {
-		t.Fatalf("layer param = %q, want task=search", capturedLayer)
-	}
-	if got := strings.TrimSpace(out); got != "[]" {
-		t.Fatalf("got %q, want []", got)
+	// FS-native layers fold their view at mount time: search over a layer
+	// means mounting it, so the CLI refuses --layer up front.
+	err := Grep(c, []string{"--json", "--layer", "task=search", "needle", ":/repo/"})
+	if err == nil || !strings.Contains(err.Error(), "mount the layer") {
+		t.Fatalf("Grep --layer error = %v", err)
 	}
 }

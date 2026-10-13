@@ -2095,13 +2095,7 @@ func (w *Writeback) armBypass(path string, rev, size int64, reason string) {
 }
 
 func (w *Writeback) remotePath(p string) string {
-	if w.root == "/" {
-		return p
-	}
-	if p == "/" {
-		return w.root
-	}
-	return w.root + p
+	return pathutil.WithRemoteRoot(w.root, p)
 }
 
 // localPathOf maps a remote (uploader/cache) path back onto the view.

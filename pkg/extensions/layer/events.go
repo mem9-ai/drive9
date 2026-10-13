@@ -1,156 +1,207 @@
-// Lifecycle and the layer-event watcher: live layer mounts poll
-// fs_layer_events so other clients' writes — and rollbacks — propagate.
+// Event plumbing: the rollback poll loop (metadata API) and the bus
+// subscription translating remote marker-tree changes into user-view
+// invalidations.
 package layer
 
 import (
 	"context"
-	"fmt"
-	"os"
+	"strings"
 	"time"
 
-	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
-// EmitCheckoutForTest emits a coarse checkout event (test hook for the
-// view-fence row).
-func (l *Layer) EmitCheckoutForTest() {
-	l.emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+// rollbackEventOp mirrors the registry's rollback event marker (the
+// client's FSLayerEventOpRollback value).
+const rollbackEventOp = "rollback"
+
+// pollInterval mirrors v1's layer-event poll cadence.
+const pollInterval = time.Second
+
+// Attach wires the facade-owned kernel notifier and inode table (mount
+// calls it after assembly); remote marker-tree changes need both to
+// invalidate the user-visible paths the kernel actually holds.
+func (l *Layer) Attach(notify fs.Notifier, inodes fs.InodeTable) {
+	l.notify = notify
+	l.inodes = inodes
 }
 
-// Attach wires the facade-owned kernel notifier (mount calls it after the
-// facade exists).
-func (l *Layer) Attach(notify fs.Notifier) { l.notify = notify }
-
-func (l *Layer) Start(ctx context.Context) error {
-	if err := l.Restore(ctx); err != nil {
-		return err
+// startWatcher runs the rollback poll loop and the bus subscription until
+// Stop. Safe to call once per mount. The event-log cursor is seeded
+// synchronously BEFORE the loop starts: a rollback landing between Start
+// and a lazily seeded cursor would be swallowed by the since-filter.
+func (l *Layer) startWatcher() {
+	if l.events != nil {
+		l.events.On(fs.EventInvalidated, l.onRemoteChange)
+		l.events.On(fs.EventDelete, l.onRemoteChange)
 	}
-	// Checkpoint mounts are static: no watcher.
-	if l.checkpoint == "" {
-		l.startEventWatcher()
-	}
-	return nil
-}
-
-func (l *Layer) Drain(ctx context.Context) error { return nil }
-
-func (l *Layer) Stop(ctx context.Context) error {
-	if l.watcherCancel != nil {
-		l.watcherCancel()
-		<-l.watcherDone
-	}
-	return nil
-}
-
-// startEventWatcher polls fs_layer_events at 1s. Refresh failures surface
-// on stderr (v1 layer_events.go): a silently-dead watcher looks exactly
-// like a layer that never changes.
-func (l *Layer) startEventWatcher() {
+	l.subscribeInitialCursor(context.Background())
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
 	l.watcherCancel = cancel
-	l.watcherDone = done
 	go func() {
-		defer close(done)
-		ticker := time.NewTicker(time.Second)
+		defer close(l.watcherDone)
+		ticker := time.NewTicker(pollInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := l.refreshEvents(ctx); err != nil {
-					fmt.Fprintf(os.Stderr, "drive9: layer event refresh failed for %s: %v\n", l.layerRef, err)
-				}
+				l.pollRollback(ctx)
 			}
 		}
 	}()
 }
 
-// refreshEvents consumes new layer events: a rollback clears the overlay
-// and abandons the write path (never re-replaying the abandoned layer);
-// anything else replays the log and resets the mount view so existing
-// handles and kernel pages stop serving the old payload.
-func (l *Layer) refreshEvents(ctx context.Context) error {
+// subscribeInitialCursor seeds the event-log cursor so the first poll does
+// not replay history as a fresh rollback.
+func (l *Layer) subscribeInitialCursor(ctx context.Context) {
+	_ = ctx
 	l.mu.RLock()
-	since := l.lastSeq
+	v := l.cur
 	l.mu.RUnlock()
-	events, err := l.cl.ListFSLayerEvents(ctx, l.layerRef, since)
+	if v.mode == viewLive || v.layerID == "" {
+		return
+	}
+	events, err := l.reg.ListEvents(ctx, v.layerID, 0)
+	if err != nil {
+		return
+	}
+	for _, e := range events {
+		if e.Seq > v.lastSeq {
+			v.lastSeq = e.Seq
+		}
+	}
+}
+
+// pollRollback watches the layer event log for a rollback of the current
+// layer: the overlay clears, writes fail ESTALE, and the classic view
+// reappears without a remount.
+func (l *Layer) pollRollback(ctx context.Context) {
+	l.mu.RLock()
+	v := l.cur
+	l.mu.RUnlock()
+	if v.mode == viewLive || v.layerID == "" {
+		return
+	}
+	events, err := l.reg.ListEvents(ctx, v.layerID, v.lastSeq)
 	if err != nil || len(events) == 0 {
-		return err
+		return
 	}
-	max := since
-	rolledBack := false
-	for i := range events {
-		if events[i].Seq > max {
-			max = events[i].Seq
+	rolled := false
+	for _, e := range events {
+		if e.Seq > v.lastSeq {
+			v.lastSeq = e.Seq
 		}
-		if events[i].Op == client.FSLayerEventOpRollback {
-			rolledBack = true
+		if e.Op == rollbackEventOp {
+			rolled = true
 		}
 	}
-	if rolledBack {
-		l.Rollback()
-		l.mu.Lock()
-		l.lastSeq = max
-		l.mu.Unlock()
-		return nil
-	}
-	if err := l.Restore(ctx); err != nil {
-		return err
+	if !rolled {
+		return
 	}
 	l.mu.Lock()
-	l.lastSeq = max
+	if l.cur == v && !v.abandoned.Load() {
+		v.abandoned.Store(true)
+		hooks := append([]func(){}, l.onRollback...)
+		// The overlay clears (v1): reads fall through to the classic view
+		// — blackouts stop hiding — while the abandoned latch fails every
+		// later mutation with ESTALE until remount or checkout.
+		cleared := &view{
+			mode:    viewLayer,
+			layerID: v.layerID,
+			lastSeq: v.lastSeq,
+			idx:     newViewIndex(),
+		}
+		cleared.abandoned.Store(true)
+		l.cur = cleared
+		l.mu.Unlock()
+		for _, hook := range hooks {
+			hook()
+		}
+		if l.notify != nil {
+			l.notify.InvalidateAll()
+		}
+		l.emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+		return
+	}
 	l.mu.Unlock()
-	// Open handles follow external layer changes (v1 open-handle refresh):
-	// a path whose overlay entry changed re-resolves from the new overlay
-	// (drop the stale buffer when it holds no uncommitted writes); a path
-	// now whiteouted serves ENOENT even on an open fd.
-	changed := make(map[string]bool)
-	for i := range events {
-		if events[i].Path != "" {
-			// Event paths are remote (root-prefixed); the live handle
-			// index and the overlay are keyed by the mount-local path.
-			changed[l.localPathOf(events[i].Path)] = true
+}
+
+// onRemoteChange translates a remote change under the active marker roots
+// into the user view: the index entry refreshes and the kernel entry and
+// cached listings for the user-visible path drop. Events for everything
+// else (including our own mount's echoes below the roots) pass through.
+func (l *Layer) onRemoteChange(e fs.Event) {
+	if e.Path == "" {
+		return
+	}
+	l.mu.RLock()
+	v := l.cur
+	l.mu.RUnlock()
+	if v.mode == viewLive {
+		return
+	}
+	var rel string
+	switch {
+	case v.treeRoot != "" && strings.HasPrefix(e.Path, v.treeRoot+"/"):
+		rel = e.Path[len(v.treeRoot):]
+	case v.blackRoot != "" && strings.HasPrefix(e.Path, v.blackRoot+"/"):
+		rel = e.Path[len(v.blackRoot):]
+	case v.blackDirRoot != "" && strings.HasPrefix(e.Path, v.blackDirRoot+"/"):
+		rel = e.Path[len(v.blackDirRoot):]
+	case v.casRoot != "" && strings.HasPrefix(e.Path, v.casRoot+"/"):
+		rel = e.Path[len(v.casRoot):]
+	case v.attrsRoot != "" && strings.HasPrefix(e.Path, v.attrsRoot+"/"):
+		rel = e.Path[len(v.attrsRoot):]
+	default:
+		return
+	}
+	vp, ok := l.viewPathOf(rel)
+	if !ok {
+		return
+	}
+	l.refreshIndexEntry(context.Background(), v, vp)
+	l.invalidateUserPath(vp)
+}
+
+// refreshIndexEntry re-reads the marker state of one view path from the
+// server (targeted; no full re-walk).
+func (l *Layer) refreshIndexEntry(ctx context.Context, v *view, vp string) {
+	serverP := l.serverAbs(vp)
+	if st, err := l.io.Stat(ctx, v.treeRoot+serverP); err == nil && st != nil {
+		v.idx.put(vp, &indexEntry{kind: ekTree, isDir: st.IsDir, isSymlink: st.IsSymlink, mode: st.Mode & 0o777})
+	} else {
+		v.idx.remove(vp)
+	}
+	if content, err := l.io.Read(ctx, v.blackRoot+serverP); err == nil {
+		v.idx.put(vp, &indexEntry{kind: ekBlackout, blackout: decodeBlackout(content)})
+	}
+	if content, err := l.io.Read(ctx, v.blackDirRoot+serverP); err == nil {
+		bl := decodeBlackout(content)
+		bl.isDir = true
+		v.idx.put(vp, &indexEntry{kind: ekBlackout, blackout: bl})
+	}
+	if content, err := l.io.Read(ctx, v.attrsRoot+serverP); err == nil {
+		var patch attrsPatch
+		if err := decodeAttrs(content, &patch); err == nil {
+			v.idx.put(vp, &indexEntry{kind: ekAttrs, patch: patch})
 		}
 	}
-	l.live.Range(func(key, _ any) bool {
-		path, _ := key.(string)
-		if !changed[path] {
-			return true
-		}
-		if h := l.handleFor(path); h != nil {
-			h.mu.Lock()
-			if h.dirty {
-				// v1 preserveLayerReplayConflict: an external change under
-				// uncommitted writes fences the handle — publishing its
-				// buffer onto the new tip would splice stale bytes. The
-				// buffer is kept; writes and commits answer EAGAIN.
-				h.conflicted = true
-			}
-			if _, _, _, _, ok := l.lookup(path); ok {
-				kind, _, _, content, _ := l.lookup(path)
-				if kind == "file" && !h.dirty {
-					h.buf = nil
-					h.origSize = int64(len(content))
-					h.baseRev = 0
-				}
-			} else if !h.dirty {
-				h.buf = nil
-				h.origSize = 0
-			}
-			kind, _, _, _, look := l.lookup(path)
-			if look && kind == "whiteout" {
-				h.unlinked = true
-			}
-			h.mu.Unlock()
-		}
-		return true
-	})
-	l.emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
-	if l.notify != nil {
-		l.notify.InvalidateAll()
+}
+
+// invalidateUserPath drops the kernel entry and the cached listings of the
+// user-visible path the marker tree shadows.
+func (l *Layer) invalidateUserPath(vp string) {
+	l.emit(fs.Event{Kind: fs.EventInvalidated, Path: vp})
+	if l.notify == nil || l.inodes == nil {
+		return
 	}
-	return nil
+	if ino, ok := l.inodes.Ino(vp); ok {
+		l.notify.InvalidateContent(ino, 0)
+	}
+	if parentIno, ok := l.inodes.Ino(pathutil.ParentPath(vp)); ok {
+		l.notify.InvalidateEntry(parentIno, pathutil.BaseName(vp))
+	}
 }

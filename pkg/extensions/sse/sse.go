@@ -143,6 +143,14 @@ func (w *SSE) handleChange(ce *client.ChangeEvent) {
 	if ce.Path == "" {
 		return
 	}
+	// The global layer namespace is server-absolute and lives outside the
+	// mount's remote root; forward those events with their absolute path so
+	// layer mounts on subtree roots still see marker-tree changes (the
+	// layer extension maps them to user-visible paths itself).
+	if ce.Path == "/.drive9/layers" || strings.HasPrefix(ce.Path, "/.drive9/layers/") {
+		w.emit(fs.Event{Kind: fs.EventInvalidated, Path: ce.Path})
+		return
+	}
 	p, ok := w.localPath(ce.Path)
 	if !ok {
 		return

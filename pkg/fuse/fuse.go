@@ -140,6 +140,10 @@ type FS struct {
 	dirKeepCacheOff []interface{ DirKeepCacheOff(path string) bool }
 
 	localDirAttrs bool
+	// dirAttrsLocalDefault records the mount-time choice; hot checkout
+	// forces chain-routed directory attrs while a layer view is active and
+	// restores the default when the mount returns to live.
+	dirAttrsLocalDefault bool
 	// defaultPermissions mirrors the kernel mount option: when the kernel
 	// enforces permission checks, the daemon's open gate is redundant.
 	defaultPermissions bool
@@ -216,6 +220,7 @@ func New(opts Options) (*FS, error) {
 		dirTTL = defaultDirTTL
 	}
 	f.localDirAttrs = opts.LocalDirAttrs
+	f.dirAttrsLocalDefault = opts.LocalDirAttrs
 	f.defaultPermissions = opts.DefaultPermissions
 	f.gvisorCompat = opts.GVisorCompat
 	f.debug = opts.Debug
@@ -357,6 +362,18 @@ func (f *FS) onLocalMutation(e fs.Event) {
 		}
 		f.Ctx.DirCache.Upsert(parentDirOf(e.Path), item)
 	}
+}
+
+// SetDirAttrsFromInode routes (or stops routing) root and directory
+// GetAttrs from the inode table while a hot layer checkout is active: an
+// active shadow view must answer directory attrs through the chain, and a
+// return to live restores the mount-time default.
+func (f *FS) SetDirAttrsFromInode(enabled bool) {
+	if !f.dirAttrsLocalDefault {
+		// The mount never allowed inode-table dir attrs; keep it that way.
+		return
+	}
+	f.localDirAttrs = enabled
 }
 
 // onRemovedPath drops the cached listings of a path that no longer

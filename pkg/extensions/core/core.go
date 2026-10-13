@@ -26,6 +26,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/singleflight"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 const (
@@ -1273,15 +1274,12 @@ func normalizeRoot(root string) string {
 	return strings.TrimSuffix(root, "/")
 }
 
-// remotePath prefixes a mount path with the remote root.
+// remotePath prefixes a mount path with the remote root, keeping the
+// global layer namespace server-absolute (the layer extension rewrites
+// shadow paths into it; those marker trees live outside every remote
+// root).
 func (c *Core) remotePath(p string) string {
-	if c.root == "/" {
-		return p
-	}
-	if p == "/" {
-		return c.root
-	}
-	return c.root + p
+	return pathutil.WithRemoteRoot(c.root, p)
 }
 
 // splitDirBase splits an absolute path into its parent directory and base

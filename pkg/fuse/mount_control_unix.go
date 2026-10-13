@@ -16,6 +16,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/mem9-ai/drive9/pkg/extensions/layer"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
@@ -23,6 +24,7 @@ import (
 
 type mountControlServer struct {
 	fs         *FS
+	layerCtl   *layer.Layer
 	listener   net.Listener
 	socketPath string
 	startedAt  time.Time
@@ -30,7 +32,7 @@ type mountControlServer struct {
 	drainMu    sync.Mutex
 }
 
-func startMountControlServer(mountPoint string, fs *FS) (*mountControlServer, error) {
+func startMountControlServer(mountPoint string, fs *FS, layerCtl *layer.Layer) (*mountControlServer, error) {
 	socketPath := mountstate.ControlSocketPath(mountPoint)
 	socketDir := filepath.Dir(socketPath)
 	if err := os.MkdirAll(socketDir, 0o700); err != nil {
@@ -45,6 +47,7 @@ func startMountControlServer(mountPoint string, fs *FS) (*mountControlServer, er
 	_ = os.Chmod(socketPath, 0o600)
 	s := &mountControlServer{
 		fs:         fs,
+		layerCtl:   layerCtl,
 		listener:   ln,
 		socketPath: socketPath,
 		startedAt:  time.Now().UTC(),
@@ -98,6 +101,7 @@ func (s *mountControlServer) handleConn(conn net.Conn) {
 		_ = json.NewEncoder(conn).Encode(resp)
 		return
 	}
+	ctx0 := context.Background()
 	op := strings.ToLower(strings.TrimSpace(req.Op))
 	if op == "status" || op == "ping" {
 		started := s.startedAt
@@ -111,6 +115,10 @@ func (s *mountControlServer) handleConn(conn net.Conn) {
 			PID:        os.Getpid(),
 			StartedAt:  started,
 		})
+		return
+	}
+	if op == "layer_checkout" {
+		s.handleLayerCheckout(conn, ctx0, &req)
 		return
 	}
 	timeout := req.Timeout()
@@ -132,4 +140,60 @@ func (s *mountControlServer) mountPoint() string {
 		return ""
 	}
 	return s.fs.mountPoint()
+}
+
+// handleLayerCheckout hot-switches the mounted shadow (layer, checkpoint,
+// or live) through the layer extension.
+func (s *mountControlServer) handleLayerCheckout(conn net.Conn, ctx context.Context, req *mountcontrol.DrainRequest) {
+	resp := mountcontrol.LayerCheckoutResponse{
+		OK:         true,
+		MountPoint: s.mountPoint(),
+		Op:         "layer_checkout",
+	}
+	defer func() {
+		resp.CompletedAt = time.Now().UTC()
+		_ = json.NewEncoder(conn).Encode(resp)
+	}()
+	if s.layerCtl == nil {
+		resp.OK = false
+		resp.Error = "layer extension not wired on this mount"
+		return
+	}
+	timeout := req.Timeout()
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > timeout+5*time.Second {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout+5*time.Second)
+		defer cancel()
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout + 5*time.Second))
+	target := layer.CheckoutTarget{
+		LayerRef:      strings.TrimSpace(req.LayerRef),
+		CheckpointRef: strings.TrimSpace(req.CheckpointRef),
+		Live:          req.Live,
+	}
+	if !target.Live && target.LayerRef == "" {
+		resp.OK = false
+		resp.Error = "layer checkout: provide a layer ref or --live"
+		return
+	}
+	if target.Live && (target.LayerRef != "" || target.CheckpointRef != "") {
+		resp.OK = false
+		resp.Error = "layer checkout: --live cannot be combined with a layer or checkpoint ref"
+		return
+	}
+	if err := s.layerCtl.Checkout(ctx, target); err != nil {
+		resp.OK = false
+		resp.Error = err.Error()
+		return
+	}
+	mode, layerID, checkpointID, readOnly := s.layerCtl.CurrentView()
+	// An active shadow view must route directory attrs through the chain;
+	// returning to live restores the mount-time default.
+	if s.fs != nil {
+		s.fs.SetDirAttrsFromInode(mode == "live")
+	}
+	resp.View = mode
+	resp.LayerID = layerID
+	resp.CheckpointID = checkpointID
+	resp.ReadOnly = readOnly
 }

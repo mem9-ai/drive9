@@ -28,6 +28,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/httperr"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 // bufferedMaxTotal caps the local write buffer of a protocol handle.
@@ -657,10 +658,7 @@ func (a *AppendLog) remotePath(p string) string {
 	if a.root == "/" {
 		return p
 	}
-	if p == "/" {
-		return a.root
-	}
-	return a.root + p
+	return pathutil.WithRemoteRoot(a.root, p)
 }
 
 func (a *AppendLog) emit(e fs.Event) {

@@ -1,509 +1,555 @@
 package layer
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"net/http"
-	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/drive9/internal/testbackend"
-	"github.com/mem9-ai/drive9/pkg/client"
-	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
-// newStack builds [layer → core] over one fake backend with the layer
-// mounted on "L1".
-func newStack(t *testing.T, b *testbackend.Backend, checkpoint string) (*fs.Chain, *Layer) {
+// The suite drives the shadow view through the path-addressed
+// fs.Filesystem API over [layer → local-fs core] and asserts both the
+// view and the on-disk truth (the tree/blackout/cas/attrs markers are
+// plain files in the core's directory).
+
+func mustRead(t *testing.T, s *stack, path string) string {
 	t.Helper()
-	ts := httptest.NewServer(b)
-	t.Cleanup(ts.Close)
-	cl := client.New(ts.URL, "")
-	l, err := New(Options{LayerRef: "L1", CheckpointRef: checkpoint, Client: cl})
+	data, err := s.fsys.Read(context.Background(), path, 0, 0)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read %s: %v", path, err)
 	}
-	if err := l.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	terminal, err := core.New(cl, core.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ch, err := fs.NewChain(l, terminal)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return ch, l
+	return string(data)
 }
 
-func get(t *testing.T, ch *fs.Chain, path string) (fs.Attr, error) {
+func mustAttr(t *testing.T, s *stack, path string) fs.Attr {
 	t.Helper()
-	res, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: path})
+	attr, err := s.fsys.GetAttr(context.Background(), path)
 	if err != nil {
-		return fs.Attr{}, err
+		t.Fatalf("getattr %s: %v", path, err)
 	}
-	if res.Attr == nil {
-		t.Fatal("no attr")
-	}
-	return *res.Attr, nil
+	return attr
 }
 
-func TestOverlayMasksAndAddsOverBase(t *testing.T) {
-	b := testbackend.NewBackend()
-	b.Seed("/base.txt", []byte("base"))
-	ch, _ := newStack(t, b, "")
+// disk reads a file under the stack's root directly (the on-disk truth).
+func (s *stack) disk(t *testing.T, path string) (string, bool) {
+	t.Helper()
+	data, err := os.ReadFile(s.core.sysPath(path))
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+func (s *stack) diskExists(t *testing.T, path string) bool {
+	t.Helper()
+	_, err := os.Lstat(s.core.sysPath(path))
+	return err == nil
+}
+
+func TestShadowAddsOverClassicView(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
 	ctx := context.Background()
+	s.seed(t, "/base.txt", []byte("base"))
 
-	// mkdir in the layer: visible through the overlay, base untouched
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/newdir", Mode: 0o755}); err != nil {
+	if err := s.fsys.Mkdir(ctx, "/newdir", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if attr, err := get(t, ch, "/newdir"); err != nil || !attr.IsDir() {
-		t.Fatalf("overlay dir = %+v %v", attr, err)
+	if attr := mustAttr(t, s, "/newdir"); !attr.IsDir() {
+		t.Fatalf("shadow dir = %+v", attr)
 	}
-	if _, err := get(t, ch, "/base.txt"); err != nil {
-		t.Fatalf("base file hidden by layer: %v", err)
+	if !s.diskExists(t, treePath("/newdir")) {
+		t.Fatal("mkdir did not land in the layer tree")
 	}
-	if n, _ := b.Node("/newdir"); n.IsDir {
-		t.Fatal("mkdir leaked to the base namespace")
+	if s.diskExists(t, "/newdir") {
+		t.Fatal("mkdir leaked into the classic namespace")
 	}
-
-	// whiteout hides the base file and records a layer entry
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/base.txt"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := get(t, ch, "/base.txt"); err == nil {
-		t.Fatal("whiteout did not hide the base file")
-	}
-	if n, _ := b.Node("/base.txt"); n.Data == nil {
-		t.Fatal("whiteout deleted the base file")
-	}
-	log := b.LayerLog("L1")
-	if len(log) != 2 || log[0].Op != "mkdir" || log[1].Op != "whiteout" {
-		t.Fatalf("layer log = %+v", log)
+	if got := mustRead(t, s, "/base.txt"); got != "base" {
+		t.Fatalf("classic read = %q", got)
 	}
 }
 
-func TestOverlayFileWriteReadAndChmod(t *testing.T) {
-	b := testbackend.NewBackend()
-	ch, _ := newStack(t, b, "")
+func TestCoWEditLeavesClassicUntouched(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
 	ctx := context.Background()
+	s.seed(t, "/classic.txt", []byte("classic body"))
 
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpWrite, Path: "/ov.txt", Offset: 0, Data: []byte("hello "), Mode: 0o644}); err != nil {
+	if err := s.fsys.Write(ctx, "/classic.txt", []byte("edited body"), fs.WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpWrite, Path: "/ov.txt", Offset: 6, Data: []byte("layer")}); err != nil {
-		t.Fatal(err)
+	if got := mustRead(t, s, "/classic.txt"); got != "edited body" {
+		t.Fatalf("shadow read = %q", got)
 	}
-	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/ov.txt"})
-	if err != nil || string(res.Data) != "hello layer" {
-		t.Fatalf("overlay read = %q %v", res.Data, err)
+	if got, ok := s.disk(t, "/classic.txt"); !ok || got != "classic body" {
+		t.Fatalf("classic mutated on disk: %q", got)
 	}
-	if n, ok := b.Node("/ov.txt"); ok && n.Data != nil {
-		t.Fatal("overlay write leaked into the base namespace")
+	if got, ok := s.disk(t, treePath("/classic.txt")); !ok || got != "edited body" {
+		t.Fatalf("tree copy = %q ok=%v", got, ok)
 	}
-
-	// chmod publishes through the layer log and updates the overlay view
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/ov.txt", Mode: 0o600, Size: -1}); err != nil {
-		t.Fatal(err)
-	}
-	if attr, err := get(t, ch, "/ov.txt"); err != nil || attr.Mode != 0o600 {
-		t.Fatalf("chmod attr = %+v %v", attr, err)
-	}
-	// v1: a chmod of an in-layer upsert merges into that upsert's mode —
-	// the log carries the re-upsert with the final mode, never a
-	// standalone chmod entry that has no base to describe.
-	found := false
-	for _, e := range b.LayerLog("L1") {
-		if e.Op == "upsert" && e.Path == "/ov.txt" && e.Mode == 0o600 {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("chmod not merged into the layer's upsert entry")
+	if got, ok := s.disk(t, "/.drive9/layers/L1/cas/classic.txt"); !ok || got == "0" {
+		t.Fatalf("cas anchor = %q ok=%v (want a positive base rev)", got, ok)
 	}
 }
 
-func TestReplayRestoresOverlayAcrossRemount(t *testing.T) {
-	b := testbackend.NewBackend()
-	ts := httptest.NewServer(b)
-	defer ts.Close()
-	cl := client.New(ts.URL, "")
-
-	l1, err := New(Options{LayerRef: "L1", Client: cl})
-	if err != nil {
-		t.Fatal(err)
-	}
-	terminal, _ := core.New(cl, core.Options{})
-	ch1, _ := fs.NewChain(l1, terminal)
+func TestOpenHandleCoWAndAppend(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
 	ctx := context.Background()
-	if _, err := ch1.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ch1.Dispatch(ctx, &fs.Op{Kind: fs.OpWrite, Path: "/d/f", Offset: 0, Data: []byte("persisted"), Mode: 0o644}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ch1.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/gone"}); err != nil {
-		t.Fatal(err)
-	}
+	s.seed(t, "/doc.txt", []byte("doc body"))
 
-	// A fresh layer instance (remount) replays the same log.
-	l2, err := New(Options{LayerRef: "L1", Client: cl})
+	res, err := s.ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/doc.txt", Flags: uint32(syscall.O_RDWR)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := l2.Start(ctx); err != nil {
-		t.Fatal(err)
+	h := res.Handle
+	if h == nil {
+		t.Fatal("no handle")
 	}
-	ch2, _ := fs.NewChain(l2, terminal)
-	if attr, err := get(t, ch2, "/d"); err != nil || !attr.IsDir() {
-		t.Fatalf("replayed dir = %+v %v", attr, err)
+	head := make([]byte, 3)
+	if _, err := h.Read(ctx, 0, head); err != nil || string(head) != "doc" {
+		t.Fatalf("handle read = %q %v", head, err)
 	}
-	res, err := ch2.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/d/f"})
-	if err != nil || string(res.Data) != "persisted" {
-		t.Fatalf("replayed content = %q %v", res.Data, err)
-	}
-	b.Seed("/gone", []byte("back"))
-	if _, err := get(t, ch2, "/gone"); err == nil {
-		t.Fatal("replayed whiteout did not hide the base file")
-	}
-}
-
-func TestRollbackClearsOverlayAndFailsWrites(t *testing.T) {
-	b := testbackend.NewBackend()
-	b.Seed("/base.txt", []byte("base"))
-	ch, l := newStack(t, b, "")
-	ctx := context.Background()
-
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpWrite, Path: "/ov.txt", Offset: 0, Data: []byte("x"), Mode: 0o644}); err != nil {
-		t.Fatal(err)
-	}
-	l.Rollback()
-
-	// The overlay disappears: the base view returns, writes go ESTALE.
-	if attr, err := get(t, ch, "/base.txt"); err != nil || attr.Size != 4 {
-		t.Fatalf("base after rollback = %+v %v", attr, err)
-	}
-	if _, err := get(t, ch, "/ov.txt"); err == nil {
-		t.Fatal("overlay survived rollback")
-	}
-	_, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpWrite, Path: "/ov.txt", Offset: 0, Data: []byte("y"), Mode: 0o644})
-	if err == nil {
-		t.Fatal("write on abandoned layer succeeded")
-	}
-}
-
-func TestCheckpointMountIsReadOnly(t *testing.T) {
-	b := testbackend.NewBackend()
-	b.SetCheckpoint("cp-1", 0)
-	ch, _ := newStack(t, b, "cp-1")
-	_, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755})
-	if err != syscall.EROFS {
-		t.Fatalf("checkpoint write = %v, want EROFS", err)
-	}
-}
-
-func TestRenameMovesOverlayContent(t *testing.T) {
-	b := testbackend.NewBackend()
-	ch, _ := newStack(t, b, "")
-	ctx := context.Background()
-
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpWrite, Path: "/a", Offset: 0, Data: []byte("moves"), Mode: 0o644}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/b"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := get(t, ch, "/a"); err == nil {
-		t.Fatal("old overlay path still visible after rename")
-	}
-	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/b"})
-	if err != nil || string(res.Data) != "moves" {
-		t.Fatalf("renamed content = %q %v", res.Data, err)
-	}
-	ops := map[string]int{}
-	for _, e := range b.LayerLog("L1") {
-		ops[e.Op]++
-	}
-	if ops["whiteout"] != 1 {
-		t.Fatalf("rename whiteouts = %d, want 1", ops["whiteout"])
-	}
-}
-
-// v1 StartLayerEventWatcher rows: another client's layer write propagates
-// within a poll interval (overlay replays), and a rollback event clears the
-// overlay and abandons the write path.
-func TestLayerEventWatcherPropagatesWritesAndRollback(t *testing.T) {
-	b := testbackend.NewBackend()
-	ts := httptest.NewServer(b)
-	defer ts.Close()
-	cl := client.New(ts.URL, "")
-	l, err := New(Options{LayerRef: "ly", RemoteRoot: "/", Client: cl})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = l.Stop(context.Background()) })
-	terminal, err := core.New(cl, core.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ch, err := fs.NewChain(l, terminal)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// A remote client upserts an overlay entry through the layer log.
-	entry := map[string]any{"path": "/remote.txt", "op": "upsert", "kind": "file", "mode": 0o644, "content_text": "from-remote"}
-	body, _ := json.Marshal(entry)
-	resp, err := http.Post(ts.URL+"/v1/layers/ly/entries", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := get(t, ch, "/remote.txt"); err == nil {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if _, err := get(t, ch, "/remote.txt"); err != nil {
-		t.Fatalf("remote layer write did not propagate: %v", err)
-	}
-
-	// A rollback event clears the overlay and fails later writes (ESTALE).
-	b.AppendLayerEvent("ly", "rollback")
-	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := get(t, ch, "/remote.txt"); err != nil {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if _, err := get(t, ch, "/remote.txt"); err == nil {
-		t.Fatal("rollback did not clear the overlay")
-	}
-}
-
-// v1 TestLayerRefreshReadsExternalMutation (update row), adapted: the event
-// watcher's refresh replays the layer log so a remote client's newer upsert
-// supersedes the locally served overlay content.
-func TestLayerRefreshReadsExternalMutation(t *testing.T) {
-	b := testbackend.NewBackend()
-	ts := httptest.NewServer(b)
-	defer ts.Close()
-	cl := client.New(ts.URL, "")
-	l, err := New(Options{LayerRef: "L1", RemoteRoot: "/", Client: cl})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = l.Stop(context.Background()) })
-	terminal, err := core.New(cl, core.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ch, err := fs.NewChain(l, terminal)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Remote client upserts v1, then supersedes it with v2.
-	for _, content := range []string{"old", "new"} {
-		entry := map[string]any{"path": "/a", "op": "upsert", "kind": "file", "mode": 0o644, "content_text": content}
-		body, _ := json.Marshal(entry)
-		resp, err := http.Post(ts.URL+"/v1/layers/L1/entries", "application/json", bytes.NewReader(body))
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = resp.Body.Close()
-	}
-
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		res, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpRead, Path: "/a"})
-		if err == nil && string(res.Data) == "new" {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	res, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpRead, Path: "/a"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(res.Data) != "new" {
-		t.Fatalf("refresh served %q, want new (superseded replay)", res.Data)
-	}
-}
-
-// Writes on a claimed layer file buffer locally: nothing reaches the layer
-// log until a durability boundary, and the boundary lands ONE entry with
-// the merged image.
-func TestLayerBufferedWriteCommitsOnceAtFlush(t *testing.T) {
-	b := testbackend.NewBackend()
-	ch, _ := newStack(t, b, "")
-	ctx := context.Background()
-
-	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/buf.txt", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h, ok := res.Handle.(*layerHandle)
-	if !ok {
-		t.Fatalf("open not claimed by the layer write plane: %T", res.Handle)
-	}
-	for i, chunk := range []string{"one ", "two ", "three"} {
-		if err := h.Write(ctx, int64(i*4), []byte(chunk)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if log := b.LayerLog("L1"); len(log) != 0 {
-		t.Fatalf("writes reached the layer log before the boundary: %d entries", len(log))
-	}
-	if err := h.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	log := b.LayerLog("L1")
-	if len(log) != 1 || log[0].Op != "upsert" {
-		t.Fatalf("layer log after flush = %+v, want one upsert", log)
-	}
-	if string(log[0].Content) != "one two three" {
-		t.Fatalf("entry content = %q, want the merged image", log[0].Content)
-	}
-	if n, _ := b.Node("/buf.txt"); n.Data != nil {
-		t.Fatal("layer write leaked into the base namespace")
-	}
-}
-
-// A write-sync mount commits every write as its own layer entry.
-func TestLayerWriteSyncCommitsPerWrite(t *testing.T) {
-	b := testbackend.NewBackend()
-	ts := httptest.NewServer(b)
-	t.Cleanup(ts.Close)
-	cl := client.New(ts.URL, "")
-	l, err := New(Options{LayerRef: "L1", Client: cl, Policy: "write-sync"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	terminal, _ := core.New(cl, core.Options{})
-	ch, _ := fs.NewChain(l, terminal)
-	ctx := context.Background()
-
-	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/s.txt", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := res.Handle.(*layerHandle)
-	if err := h.Write(ctx, 0, []byte("a")); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.Write(ctx, 1, []byte("b")); err != nil {
-		t.Fatal(err)
-	}
-	log := b.LayerLog("L1")
-	if len(log) != 2 {
-		t.Fatalf("write-sync entries = %d, want 2 (one per write)", len(log))
-	}
-}
-
-// An image beyond the inline threshold streams as an object upload; a
-// fresh mount restores it through the object stream (the S3-stored entry
-// path of the replay).
-func TestLayerLargeImageStreamsAndRestores(t *testing.T) {
-	b := testbackend.NewBackend()
-	ts := httptest.NewServer(b)
-	t.Cleanup(ts.Close)
-	cl := client.New(ts.URL, "")
-	l, err := New(Options{LayerRef: "L1", Client: cl, InlineMax: 16})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	terminal, _ := core.New(cl, core.Options{})
-	ch, _ := fs.NewChain(l, terminal)
-	ctx := context.Background()
-
-	image := bytes.Repeat([]byte("z"), 64)
-	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/big.bin", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := res.Handle.(*layerHandle)
-	if err := h.Write(ctx, 0, image); err != nil {
+	if err := h.Write(ctx, 8, []byte("edited")); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.Flush(ctx); err != nil {
 		t.Fatal(err)
-	}
-	log := b.LayerLog("L1")
-	if len(log) != 1 || log[0].StorageType != "s3" {
-		t.Fatalf("large commit did not stream as an object: %+v", log[0])
-	}
-
-	// A fresh mount replays the S3-stored entry through the object stream.
-	l2, err := New(Options{LayerRef: "L1", Client: cl})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := l2.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	terminal2, _ := core.New(cl, core.Options{})
-	ch2, _ := fs.NewChain(l2, terminal2)
-	rres, rerr := ch2.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/big.bin"})
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
-	if !bytes.Equal(rres.Data, image) {
-		t.Fatalf("restored image = %d bytes, want %d", len(rres.Data), len(image))
-	}
-}
-
-// Unlink of an open claimed file whiteouts the name immediately; the open
-// handle keeps serving its image and never publishes.
-func TestLayerUnlinkWhileOpenKeepsHandleImage(t *testing.T) {
-	b := testbackend.NewBackend()
-	ch, _ := newStack(t, b, "")
-	ctx := context.Background()
-
-	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/u.txt", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := res.Handle.(*layerHandle)
-	if err := h.Write(ctx, 0, []byte("image")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/u.txt"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/u.txt"}); !errors.Is(err, fs.ErrNotFound) {
-		t.Fatalf("unlinked layer file still visible: %v", err)
-	}
-	if log := b.LayerLog("L1"); len(log) != 1 || log[0].Op != "whiteout" {
-		t.Fatalf("layer log = %+v, want the unlink whiteout only", log)
 	}
 	if err := h.Release(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if log := b.LayerLog("L1"); len(log) != 1 {
-		t.Fatalf("close published after unlink: %+v", log)
+	if got, ok := s.disk(t, treePath("/doc.txt")); !ok || got != "doc bodyedited" {
+		t.Fatalf("tree copy after handle write = %q ok=%v", got, ok)
+	}
+	if got, _ := s.disk(t, "/doc.txt"); got != "doc body" {
+		t.Fatalf("classic mutated: %q", got)
+	}
+}
+
+func TestUnlinkBlackoutAndRecreate(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/gone.txt", []byte("gone"))
+	s.seed(t, "/keep.txt", []byte("keep"))
+
+	if err := s.fsys.Unlink(ctx, "/gone.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.fsys.GetAttr(ctx, "/gone.txt"); err == nil {
+		t.Fatal("blackout did not hide the classic file")
+	}
+	if got, ok := s.disk(t, "/gone.txt"); !ok || got != "gone" {
+		t.Fatalf("classic file did not survive the unlink: %q ok=%v", got, ok)
+	}
+	if got, ok := s.disk(t, "/.drive9/layers/L1/blackouts/gone.txt"); !ok {
+		t.Fatalf("blackout marker missing (content %q ok=%v)", got, ok)
+	}
+
+	// listing merges: hidden name gone, kept name present
+	entries, err := s.fsys.List(ctx, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, e := range entries {
+		names[e.Name] = true
+	}
+	if names["gone.txt"] || !names["keep.txt"] {
+		t.Fatalf("merged listing = %v", names)
+	}
+
+	// recreate over the blackout (shell `>` = O_CREAT semantics): the
+	// name returns with fresh content and the classic file stays
+	// untouched underneath
+	res, err := s.ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/gone.txt", Flags: uint32(syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC), Mode: 0o644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := res.Handle; h != nil {
+		if err := h.Write(ctx, 0, []byte("reborn")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		_ = h.Release(ctx)
+	}
+	if got := mustRead(t, s, "/gone.txt"); got != "reborn" {
+		t.Fatalf("recreated read = %q", got)
+	}
+	if got, _ := s.disk(t, "/gone.txt"); got != "gone" {
+		t.Fatalf("classic mutated by recreate: %q", got)
+	}
+}
+
+func TestDirBlackoutHidesSubtree(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	if err := s.fsys.Mkdir(ctx, "/d", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.seed(t, "/d/x.txt", []byte("x"))
+	s.seed(t, "/d/y.txt", []byte("y"))
+
+	if err := s.fsys.Rmdir(ctx, "/d"); err == nil {
+		t.Fatal("rmdir of a non-empty merged dir should fail")
+	}
+	if err := s.fsys.Unlink(ctx, "/d/x.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fsys.Unlink(ctx, "/d/y.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fsys.Rmdir(ctx, "/d"); err != nil {
+		t.Fatalf("rmdir of emptied dir: %v", err)
+	}
+	if _, err := s.fsys.GetAttr(ctx, "/d/x.txt"); err == nil {
+		t.Fatal("dir blackout did not hide the subtree")
+	}
+	if got, ok := s.disk(t, "/.drive9/layers/L1/blackout-dirs/d"); !ok {
+		t.Fatalf("dir blackout marker missing (content %q ok=%v)", got, ok)
+	}
+	if _, ok := s.disk(t, "/d/x.txt"); !ok {
+		t.Fatal("dir blackout deleted classic content")
+	}
+}
+
+func TestAttrsMarkerChmodsClassicFile(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/script.sh", []byte("#!/bin/sh\n"))
+
+	mode := uint32(0o755)
+	if err := s.fsys.SetAttr(ctx, "/script.sh", fs.AttrPatch{Mode: &mode}); err != nil {
+		t.Fatal(err)
+	}
+	if attr := mustAttr(t, s, "/script.sh"); attr.Mode&0o755 != 0o755 {
+		t.Fatalf("patched attr = %+v", attr)
+	}
+	if info, err := os.Lstat(s.core.sysPath("/script.sh")); err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("chmod leaked to the classic file: %v %v", info, err)
+	}
+	if got, ok := s.disk(t, "/.drive9/layers/L1/attrs/script.sh"); !ok || !strings.Contains(got, "493") {
+		t.Fatalf("attrs marker = %q ok=%v", got, ok)
+	}
+}
+
+func TestSetAttrTruncatePumpsClassicContent(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/big.txt", []byte("0123456789"))
+
+	size := int64(4)
+	if err := s.fsys.SetAttr(ctx, "/big.txt", fs.AttrPatch{Size: &size}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRead(t, s, "/big.txt"); got != "0123" {
+		t.Fatalf("truncated read = %q", got)
+	}
+	if got, ok := s.disk(t, treePath("/big.txt")); !ok || got != "0123" {
+		t.Fatalf("tree copy = %q ok=%v", got, ok)
+	}
+	if got, _ := s.disk(t, "/big.txt"); got != "0123456789" {
+		t.Fatalf("classic mutated by truncate: %q", got)
+	}
+}
+
+func TestRenameClassicIntoTreeAndWithinTree(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/src.txt", []byte("content"))
+
+	if err := s.fsys.Rename(ctx, "/src.txt", "/dst.txt", fs.RenameOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRead(t, s, "/dst.txt"); got != "content" {
+		t.Fatalf("renamed read = %q", got)
+	}
+	if got, ok := s.disk(t, treePath("/dst.txt")); !ok || got != "content" {
+		t.Fatalf("tree copy = %q ok=%v", got, ok)
+	}
+	if got, _ := s.disk(t, "/src.txt"); got != "content" {
+		t.Fatal("rename deleted the classic source")
+	}
+	if _, err := s.fsys.GetAttr(ctx, "/src.txt"); err == nil {
+		t.Fatal("rename did not blackout the source name")
+	}
+
+	// second rename moves within the tree (server-side atomic)
+	if err := s.fsys.Rename(ctx, "/dst.txt", "/final.txt", fs.RenameOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRead(t, s, "/final.txt"); got != "content" {
+		t.Fatalf("tree rename read = %q", got)
+	}
+	if !s.diskExists(t, treePath("/final.txt")) || s.diskExists(t, treePath("/dst.txt")) {
+		t.Fatal("tree rename did not move the tree file")
+	}
+}
+
+func TestSymlinkShadowAndReadlink(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+
+	if err := s.fsys.Symlink(ctx, "/classic.txt", "/link"); err != nil {
+		t.Fatal(err)
+	}
+	target, err := s.fsys.Readlink(ctx, "/link")
+	if err != nil || target != "/classic.txt" {
+		t.Fatalf("readlink = %q %v", target, err)
+	}
+	if !s.diskExists(t, treePath("/link")) {
+		t.Fatal("symlink did not land in the tree")
+	}
+	// the view classifies it as a symlink
+	if attr := mustAttr(t, s, "/link"); !attr.IsSymlink() {
+		t.Fatalf("link attr = %+v", attr)
+	}
+}
+
+func TestCheckpointMountIsReadOnlyAndPinned(t *testing.T) {
+	ctx := context.Background()
+	// the checkpoint snapshot must exist before Start walks it into the
+	// view index
+	core := newLocalCore(t)
+	reg := newFakeRegistry()
+	reg.addLayer("L1")
+	reg.addCheckpoint("cp1", "L1")
+	snapTree := "/.drive9/layers/L1/checkpoints/cp1/tree/v.txt"
+	if err := os.MkdirAll(filepath.Dir(core.sysPath(snapTree)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(core.sysPath(snapTree), []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := newLocalStackOver(t, core, reg, "L1", "cp1")
+
+	if got := mustRead(t, s, "/v.txt"); got != "v1" {
+		t.Fatalf("checkpoint read = %q", got)
+	}
+	if err := s.fsys.Write(ctx, "/w.txt", []byte("x"), fs.WriteOptions{}); !errors.Is(err, syscall.EROFS) {
+		t.Fatalf("checkpoint write error = %v", err)
+	}
+	if err := s.fsys.Mkdir(ctx, "/d", 0o755); !errors.Is(err, syscall.EROFS) {
+		t.Fatalf("checkpoint mkdir error = %v", err)
+	}
+	// plain read opens still work
+	res, err := s.ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/v.txt", Flags: 0})
+	if err != nil {
+		t.Fatalf("checkpoint read open = %v", err)
+	}
+	if h := res.Handle; h != nil {
+		_ = h.Release(ctx)
+	}
+}
+
+func TestRollbackClearsShadowAndFailsWrites(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/base.txt", []byte("base"))
+
+	if err := s.fsys.Write(ctx, "/ov.txt", []byte("x"), fs.WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	s.reg.rollback("L1")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		err := s.fsys.Write(ctx, "/probe.txt", []byte("x"), fs.WriteOptions{})
+		if errors.Is(err, syscall.ESTALE) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("post-rollback probe error = %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := s.fsys.Write(ctx, "/probe2.txt", []byte("x"), fs.WriteOptions{}); !errors.Is(err, syscall.ESTALE) {
+		t.Fatalf("post-rollback write error = %v", err)
+	}
+	// the classic view reappears; the overlay content is gone
+	if got := mustRead(t, s, "/base.txt"); got != "base" {
+		t.Fatalf("classic view lost after rollback: %q", got)
+	}
+	if _, err := s.fsys.GetAttr(ctx, "/ov.txt"); err == nil {
+		t.Fatal("overlay content survived the rollback")
+	}
+}
+
+func TestCheckoutHotSwitchesView(t *testing.T) {
+	s := newLocalStack(t, "", "")
+	ctx := context.Background()
+	s.reg.addLayer("L2")
+	s.seed(t, "/classic.txt", []byte("classic"))
+	// another layer's tree already on disk
+	if err := os.MkdirAll(filepath.Dir(s.core.sysPath("/.drive9/layers/L2/tree/layered.txt")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.core.sysPath("/.drive9/layers/L2/tree/layered.txt"), []byte("from L2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// live mode: writes land in the classic namespace
+	if err := s.fsys.Write(ctx, "/live.txt", []byte("live"), fs.WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := s.disk(t, "/live.txt"); !ok || got != "live" {
+		t.Fatalf("live write = %q ok=%v", got, ok)
+	}
+
+	// hot-switch to L2: its tree shadows the view without remount
+	if err := s.l.Checkout(ctx, CheckoutTarget{LayerRef: "L2"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRead(t, s, "/layered.txt"); got != "from L2" {
+		t.Fatalf("layered read after checkout = %q", got)
+	}
+	if err := s.fsys.Write(ctx, "/w.txt", []byte("x"), fs.WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := s.disk(t, "/.drive9/layers/L2/tree/w.txt"); !ok || got != "x" {
+		t.Fatalf("post-checkout write missed the tree: %q ok=%v", got, ok)
+	}
+	if s.diskExists(t, "/w.txt") {
+		t.Fatal("post-checkout write leaked to the classic namespace")
+	}
+
+	// back to live: the classic view returns
+	if err := s.l.Checkout(ctx, CheckoutTarget{Live: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.fsys.GetAttr(ctx, "/layered.txt"); err == nil {
+		t.Fatal("live view still shows the layer tree")
+	}
+	if got := mustRead(t, s, "/classic.txt"); got != "classic" {
+		t.Fatalf("live read after checkout back = %q", got)
+	}
+}
+
+func TestCheckoutRejectsTerminalLayers(t *testing.T) {
+	s := newLocalStack(t, "", "")
+	s.reg.addLayer("L9")
+	s.reg.setState("L9", "committed")
+	if err := s.l.Checkout(context.Background(), CheckoutTarget{LayerRef: "L9"}); err == nil {
+		t.Fatal("checkout of a committed layer should fail")
+	}
+}
+
+func TestUnlinkMissingPathIsNotFound(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	if err := s.fsys.Unlink(context.Background(), "/missing.txt"); !errors.Is(err, fs.ErrNotFound) {
+		t.Fatalf("unlink of a missing path = %v", err)
+	}
+	if err := s.fsys.Rmdir(context.Background(), "/missing-dir"); !errors.Is(err, fs.ErrNotFound) {
+		t.Fatalf("rmdir of a missing dir = %v", err)
+	}
+	if s.diskExists(t, "/.drive9/layers/L1/blackouts/missing.txt") {
+		t.Fatal("ENOENT unlink left a blackout marker behind")
+	}
+}
+
+func TestChmodZeroOnClassicStaysInLayer(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/locked.txt", []byte("secret"))
+
+	// chmod 000: Mode == 0 with HasMode true must still be a mutation.
+	zero := uint32(0)
+	res, err := s.ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/locked.txt", Mode: zero, HasMode: true, Size: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Attr == nil || res.Attr.Mode != 0 {
+		t.Fatalf("chmod 000 attr = %+v", res.Attr)
+	}
+	if info, serr := os.Lstat(s.core.sysPath("/locked.txt")); serr != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("chmod 000 leaked into the classic file: %v %v", info, serr)
+	}
+	if got, ok := s.disk(t, "/.drive9/layers/L1/attrs/locked.txt"); !ok || !strings.Contains(got, `"mode_set":true`) {
+		t.Fatalf("attrs marker = %q ok=%v", got, ok)
+	}
+
+	// A read-only checkpoint view refuses it outright.
+	s2 := newLocalStack(t, "L1", "cp2")
+	s2.reg.addCheckpoint("cp2", "L1")
+	if _, err := s2.ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/any.txt", Mode: zero, HasMode: true, Size: -1}); !errors.Is(err, syscall.EROFS) {
+		t.Fatalf("checkpoint chmod 000 error = %v", err)
+	}
+}
+
+func TestTruncateToZeroClassic(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/big.txt", []byte("0123456789"))
+
+	zero := int64(0)
+	if err := s.fsys.SetAttr(ctx, "/big.txt", fs.AttrPatch{Size: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRead(t, s, "/big.txt"); got != "" {
+		t.Fatalf("zero-truncated read = %q", got)
+	}
+	if got, ok := s.disk(t, treePath("/big.txt")); !ok || got != "" {
+		t.Fatalf("tree copy = %q ok=%v (want empty file)", got, ok)
+	}
+	if got, _ := s.disk(t, "/big.txt"); got != "0123456789" {
+		t.Fatalf("classic mutated by zero-truncate: %q", got)
+	}
+}
+
+func TestRenameClassicDirectoryRemapsChildren(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/src/a.txt", []byte("a"))
+	s.seed(t, "/src/sub/b.txt", []byte("b"))
+
+	if err := s.fsys.Rename(ctx, "/src", "/dst", fs.RenameOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRead(t, s, "/dst/a.txt"); got != "a" {
+		t.Fatalf("renamed dir child a = %q", got)
+	}
+	if got := mustRead(t, s, "/dst/sub/b.txt"); got != "b" {
+		t.Fatalf("renamed dir nested child b = %q", got)
+	}
+	if got, ok := s.disk(t, treePath("/dst/sub/b.txt")); !ok || got != "b" {
+		t.Fatalf("tree copy of nested child = %q ok=%v", got, ok)
+	}
+	if got, _ := s.disk(t, "/src/a.txt"); got != "a" {
+		t.Fatal("dir rename deleted the classic source")
+	}
+	if _, err := s.fsys.GetAttr(ctx, "/src/a.txt"); err == nil {
+		t.Fatal("dir blackout did not hide the source subtree")
+	}
+}
+
+func TestTruncatingOpenWithoutCreateMaterializesEmptyTree(t *testing.T) {
+	s := newLocalStack(t, "L1", "")
+	ctx := context.Background()
+	s.seed(t, "/doc.txt", []byte("original"))
+
+	// shell `>` semantics: O_TRUNC open of an existing name, no O_CREAT
+	// (the kernel already resolved the dentry).
+	res, err := s.ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/doc.txt", Flags: uint32(syscall.O_WRONLY | syscall.O_TRUNC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := res.Handle; h != nil {
+		if err := h.Write(ctx, 0, []byte("new")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		_ = h.Release(ctx)
+	}
+	if got := mustRead(t, s, "/doc.txt"); got != "new" {
+		t.Fatalf("post-truncate read = %q", got)
+	}
+	if got, _ := s.disk(t, "/doc.txt"); got != "original" {
+		t.Fatalf("classic mutated: %q", got)
 	}
 }
