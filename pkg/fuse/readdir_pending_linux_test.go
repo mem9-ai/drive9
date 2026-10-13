@@ -105,6 +105,26 @@ func testReadDirPlusPendingKernel(t *testing.T, profile string, mode SyncMode) {
 			}
 			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 			w.Header().Set("X-Dat9-Revision", "1")
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			var request struct {
+				Paths []string `json:"paths"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("decode batch stat: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			results := make([]map[string]any, 0, len(request.Paths))
+			mu.Lock()
+			for _, path := range request.Paths {
+				if data, ok := remote[path]; ok {
+					results = append(results, map[string]any{"path": path, "status": http.StatusOK, "size": len(data), "revision": 1})
+				} else {
+					results = append(results, map[string]any{"path": path, "status": http.StatusNotFound})
+				}
+			}
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
 		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
 			w.WriteHeader(http.StatusOK)
 		default:

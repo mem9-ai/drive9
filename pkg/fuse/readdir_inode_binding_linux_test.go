@@ -51,6 +51,8 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 	}
 	var mu sync.Mutex
 	remote := make(map[string][]byte)
+	resourceIDs := make(map[string]string)
+	nextResourceID := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		p := strings.TrimPrefix(req.URL.Path, "/v1/fs")
 		switch {
@@ -60,7 +62,14 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 			mu.Lock()
 			entries := make([]map[string]any, 0, len(remote))
 			for name, data := range remote {
-				entries = append(entries, map[string]any{"name": strings.TrimPrefix(name, "/"), "size": len(data), "revision": 1})
+				id := resourceIDs[name]
+				nlink := 0
+				for _, other := range resourceIDs {
+					if other == id {
+						nlink++
+					}
+				}
+				entries = append(entries, map[string]any{"name": strings.TrimPrefix(name, "/"), "size": len(data), "revision": 1, "resource_id": id, "nlink": nlink})
 			}
 			mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries})
@@ -84,11 +93,22 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 			}
 			mu.Lock()
 			remote[p] = data
+			if resourceIDs[p] == "" {
+				nextResourceID++
+				resourceIDs[p] = fmt.Sprintf("resource-%d", nextResourceID)
+			}
 			mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 1})
 		case req.Method == http.MethodHead || req.Method == http.MethodGet:
 			mu.Lock()
 			data, found := remote[p]
+			id := resourceIDs[p]
+			nlink := 0
+			for _, other := range resourceIDs {
+				if other == id {
+					nlink++
+				}
+			}
 			mu.Unlock()
 			if p == "/" {
 				w.Header().Set("X-Dat9-IsDir", "true")
@@ -98,19 +118,26 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 			}
 			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 			w.Header().Set("X-Dat9-Revision", "1")
+			if id != "" {
+				w.Header().Set("X-Dat9-Resource-ID", id)
+				w.Header().Set("X-Dat9-Nlink", strconv.Itoa(nlink))
+			}
 			if req.Method == http.MethodGet {
 				_, _ = w.Write(data)
 			}
 		case req.Method == http.MethodDelete:
 			mu.Lock()
 			delete(remote, p)
+			delete(resourceIDs, p)
 			mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 		case req.Method == http.MethodPost && req.URL.Query().Has("hardlink"):
 			mu.Lock()
-			data, ok := remote[req.Header.Get("X-Dat9-Hardlink-Source")]
+			source := req.Header.Get("X-Dat9-Hardlink-Source")
+			data, ok := remote[source]
 			if ok {
 				remote[p] = data
+				resourceIDs[p] = resourceIDs[source]
 			}
 			mu.Unlock()
 			if !ok {
