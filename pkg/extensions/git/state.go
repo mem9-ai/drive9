@@ -597,6 +597,9 @@ func gitDirLooksUsable(ctx context.Context, gitDir string) bool {
 }
 
 // gitDirFor maps a workspace root onto the local overlay's .git directory.
+// The overlay roots view paths under <localRoot>/overlay (localize's
+// NewOverlay), so the restored state and git's own file traffic must land
+// there — the CLI's LocalGitDir derivation expects the same layout.
 func (g *Git) gitDirFor(root string) string {
 	local := strings.TrimSuffix(strings.TrimSpace(root), "/")
 	if local == "" {
@@ -606,9 +609,9 @@ func (g *Git) gitDirFor(root string) string {
 		local = "/" + local
 	}
 	if local == "/" {
-		return filepath.Join(g.localRoot, ".git")
+		return filepath.Join(g.localRoot, "overlay", ".git")
 	}
-	return filepath.Join(g.localRoot, local[1:], ".git")
+	return filepath.Join(g.localRoot, "overlay", local[1:], ".git")
 }
 
 // scheduleGitStateCheckpoint debounces a checkpoint for the workspace
@@ -621,7 +624,7 @@ func (g *Git) scheduleGitStateCheckpoint(path string) {
 	if !ok {
 		return
 	}
-	gitDir := g.gitDirFor(w.root)
+	gitDir := g.gitDirFor(w.rootPath())
 	relSlash := filepath.ToSlash(rel)
 	if relSlash != ".git" && !strings.HasPrefix(relSlash, ".git/") {
 		return
@@ -649,7 +652,7 @@ func (g *Git) checkpointWorkspace(ctx context.Context, w *workspace, gitDir stri
 	}
 	g.ckptMu.Lock()
 	defer g.ckptMu.Unlock()
-	baseCommit := strings.ToLower(strings.TrimSpace(w.headCommit))
+	baseCommit := strings.ToLower(strings.TrimSpace(w.head()))
 	pack, err := g.buildLocalGitObjectPack(ctx, gitDir, baseCommit)
 	if err != nil {
 		return err
@@ -665,7 +668,7 @@ func (g *Git) checkpointWorkspace(ctx context.Context, w *workspace, gitDir stri
 	}
 	sum := sha256.Sum256(content)
 	_, err = g.cl.UpsertGitState(ctx, w.id, client.GitStateRequest{
-		CheckpointCommit: w.headCommit,
+		CheckpointCommit: w.head(),
 		StorageType:      gitStateStorageTarGzNoObjects,
 		ChecksumSHA256:   hex.EncodeToString(sum[:]),
 		SizeBytes:        int64(len(content)),
@@ -687,7 +690,7 @@ func (g *Git) checkpointAllGitWorkspaces() {
 	ctx, cancel := context.WithTimeout(context.Background(), gitCheckpointTimeout)
 	defer cancel()
 	for _, w := range workspaces {
-		if err := g.checkpointWorkspace(ctx, w, g.gitDirFor(w.root)); err != nil {
+		if err := g.checkpointWorkspace(ctx, w, g.gitDirFor(w.rootPath())); err != nil {
 			fmt.Fprintf(os.Stderr, "drive9: git state final checkpoint failed for workspace %s: %v\n", w.id, err)
 		}
 	}
@@ -697,6 +700,16 @@ func (g *Git) checkpointAllGitWorkspaces() {
 // stored packs, then the state archive, swapped in atomically.
 func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	if g.cl == nil {
+		return nil
+	}
+	gitDir := g.gitDirFor(w.rootPath())
+	// v1 ensureGitStateRestored: a usable local .git owns the truth — a
+	// live `drive9 git clone --fast` on THIS mount built it, and the
+	// server's checkpoint lags the live writes. Swapping here would wipe
+	// post-clone .git changes (the identity config, exercise commits)
+	// back to the clone-time archive. Only a missing or unusable .git
+	// (a fresh-LocalRoot remount) downloads and swaps the state.
+	if gitDirLooksUsable(ctx, gitDir) {
 		return nil
 	}
 	state, err := g.cl.GetGitState(ctx, w.id)
@@ -709,7 +722,6 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	if state == nil {
 		return nil
 	}
-	gitDir := g.gitDirFor(w.root)
 	parent := filepath.Dir(gitDir)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
@@ -743,7 +755,7 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 // restoreGitObjectsFromRemote clones --no-checkout from the workspace's
 // repo URL into the temp gitdir.
 func (g *Git) restoreGitObjectsFromRemote(ctx context.Context, w *workspace, gitDir string) error {
-	repoURL := strings.TrimSpace(w.repoURL)
+	repoURL := strings.TrimSpace(w.repo())
 	if repoURL == "" {
 		return fmt.Errorf("git workspace %s has no repo URL for object restore", w.id)
 	}
@@ -758,7 +770,7 @@ func (g *Git) restoreGitObjectsFromRemote(ctx context.Context, w *workspace, git
 	}
 	defer func() { _ = os.RemoveAll(tmpWorktree) }()
 	args := []string{"clone", "--no-checkout"}
-	if w.fastBlobless {
+	if w.blobless() {
 		args = append(args, "--filter=blob:none")
 	}
 	args = append(args, repoURL, tmpWorktree)

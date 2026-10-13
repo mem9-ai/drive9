@@ -4,6 +4,7 @@ package layer
 import (
 	"context"
 	"fmt"
+	"io"
 	"syscall"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -143,4 +144,66 @@ func (l *Layer) whiteoutPath(ctx context.Context, path, kind string) error {
 	}
 	l.markLayerWhiteout(path)
 	return nil
+}
+
+// truncateFile streams a truncate of an overlay file (v1
+// applyLayerLargeTruncate + remote_upload.truncateReaderAt): only the kept
+// prefix is read, and the zero extension is synthesized by the reader — a
+// multi-gigabyte truncate never materializes in memory.
+func (l *Layer) truncateFile(ctx context.Context, path string, content []byte, newSize int64, mode uint32) error {
+	unlock := l.mutLocks.lock(path)
+	defer unlock()
+	kept := content
+	if int64(len(kept)) > newSize {
+		kept = kept[:newSize]
+	}
+	m := mode
+	if m == 0 {
+		m = 0o644
+	}
+	if newSize <= l.inlineMax() {
+		img := make([]byte, newSize)
+		copy(img, kept)
+		return l.upsertFileLocked(ctx, path, img, 0, m)
+	}
+	if _, err := l.cl.UploadFSLayerFile(ctx, l.layerRef, l.remotePath(path), &truncateReaderAt{kept: kept, size: newSize}, newSize, 0, m, true); err != nil {
+		return err
+	}
+	l.mu.Lock()
+	if !l.abandoned {
+		l.files[path] = m & 0o777
+		l.contents[path] = append([]byte(nil), kept...)
+		delete(l.whiteouts, path)
+	}
+	l.mu.Unlock()
+	l.emit(fs.Event{Kind: fs.EventInvalidated, Path: path})
+	return nil
+}
+
+// truncateReaderAt serves a truncated image without materializing the
+// zero extension (ports v1 remoteTruncateReaderAt).
+type truncateReaderAt struct {
+	kept []byte
+	size int64
+	pos  int64
+}
+
+func (r *truncateReaderAt) Read(p []byte) (int, error) {
+	if r.pos >= r.size {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if r.pos+int64(n) > r.size {
+		n = int(r.size - r.pos)
+	}
+	fromCopy := int64(0)
+	if r.pos < int64(len(r.kept)) {
+		fromCopy = int64(copy(p[:n], r.kept[r.pos:]))
+	}
+	// bytes beyond the kept prefix read as zeros
+	for i := int(fromCopy); i < n; i++ {
+		p[i] = 0
+	}
+	r.pos += int64(n)
+	return n, nil
 }

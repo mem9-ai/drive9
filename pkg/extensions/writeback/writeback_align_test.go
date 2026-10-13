@@ -70,6 +70,106 @@ func TestOpenTruncateNoWritePublishesEmptyAtFlush(t *testing.T) {
 	}
 }
 
+// v1 createEmptyHandleRemote: an O_CREAT claim that never wrote still
+// materializes at the Flush (close(2)) boundary under the sync policies —
+// close returns with the name existing remotely. Deferring to Release lets
+// the next syscall (chmod/link/unlink/rmdir preflight) answer from a remote
+// that has not seen the file (pjdfstest rename/00, link/00, rmdir/01 rows).
+func TestCreateNoWritePublishesEmptyAtFlush(t *testing.T) {
+	for _, policy := range []Policy{PolicyCloseSync, PolicyWriteSync} {
+		for _, track := range []string{"inline", "uploader"} {
+			t.Run(policy.String()+"-"+track, func(t *testing.T) {
+				b := testbackend.NewBackend()
+				ts := httptest.NewServer(b)
+				t.Cleanup(ts.Close)
+				cl := client.New(ts.URL, "")
+				opts := Options{Policy: policy, Client: cl}
+				if track == "uploader" {
+					cache, err := staging.NewWriteBackCache(t.TempDir())
+					if err != nil {
+						t.Fatal(err)
+					}
+					opts.WriteCache = cache
+				}
+				wb, err := New(opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				terminal, _ := core.New(cl, core.Options{})
+				ch, _ := fs.NewChain(wb, terminal)
+				ctx := context.Background()
+
+				res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/new.txt", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := res.Handle.Flush(ctx); err != nil {
+					t.Fatal(err)
+				}
+				n, ok := b.Node("/new.txt")
+				if !ok {
+					t.Fatal("remote after flush: /new.txt missing")
+				}
+				if len(n.Data) != 0 {
+					t.Fatalf("remote after flush = %d bytes, want 0", len(n.Data))
+				}
+				if err := res.Handle.Release(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if n, ok := b.Node("/new.txt"); !ok || len(n.Data) != 0 {
+					t.Fatalf("remote after release = %v, want one empty file", n)
+				}
+			})
+		}
+	}
+}
+
+// rmdir/01 regression (close-sync, uploader track — the mount config): an
+// empty create+close, then unlink, then rmdir of the parent must see a
+// consistent remote. When the empty create landed only at Release, the
+// unlink's DELETE raced the late upload: the name resurrected inside the
+// parent and rmdir returned ENOTEMPTY.
+func TestRmdirSeesEmptyDirAfterEmptyCreateUnlink(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	cache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyCloseSync, Client: cl, WriteCache: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, _ := core.New(cl, core.Options{})
+	ch, _ := fs.NewChain(wb, terminal)
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/d/f", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/d/f"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRmdir, Path: "/d"}); err != nil {
+		t.Fatalf("rmdir after empty create+unlink: %v", err)
+	}
+	if _, ok := b.Node("/d"); ok {
+		t.Fatal("remote directory survived rmdir")
+	}
+}
+
 func TestUnlinkFailureRollsBackAnonymousMarking(t *testing.T) {
 	b := testbackend.NewBackend()
 	b.Seed("/f", []byte("base"))

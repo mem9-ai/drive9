@@ -7,6 +7,7 @@ package sse
 
 import (
 	"context"
+	"path"
 	"strings"
 	"time"
 
@@ -61,10 +62,20 @@ func (w *SSE) Start(ctx context.Context) error {
 	go func() {
 		defer close(w.doneCh)
 		w.opts.Client.WatchEventsWithLifecycle(ctx, w.opts.Actor, w.handleEvent, client.EventLifecycle{
-			OnCurrent: func(uint64) { w.current = true },
+			OnCurrent:      func(uint64) { w.current = true },
+			OnDisconnected: func(error) { w.handleDisconnect() },
 		})
 	}()
 	return nil
+}
+
+// handleDisconnect ports v1 OnDisconnected -> markStatCacheUnverified:
+// while the stream is down, remote changes arrive unobserved, so the local
+// caches that would mask them drop (the kernel-side caches stay — v1 never
+// kernel-invalidated on disconnect).
+func (w *SSE) handleDisconnect() {
+	w.current = false
+	w.emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
 }
 
 // Drain is a no-op: the stream carries no durable work.
@@ -94,8 +105,12 @@ func (w *SSE) emit(e fs.Event) {
 }
 
 // localPath maps a tenant-absolute remote path into this mount's view;
-// false means the change is outside our root.
+// false means the change is outside our root. v1 mountpath.ToLocal ran
+// path.Clean first: server directory paths carry a trailing slash, and
+// every downstream consumer (inode table keys, parent resolution, prefix
+// invalidation) works on the cleaned form.
 func (w *SSE) localPath(remote string) (string, bool) {
+	remote = path.Clean("/" + remote)
 	if w.root == "/" {
 		return remote, true
 	}

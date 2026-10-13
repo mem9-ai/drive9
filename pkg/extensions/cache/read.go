@@ -124,6 +124,24 @@ func (rc *ReadCache) Get(path string, currentRevision int64) ([]byte, bool) {
 	return entry.data, true
 }
 
+// GetPending returns the path's unversioned pending seed (revision 0):
+// this mount's newest staged image, planted at the write plane's flush
+// boundary. It outranks any revision a handle pinned.
+func (rc *ReadCache) GetPending(path string) ([]byte, bool) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	entry, ok := rc.items[path]
+	if !ok || entry.revision != 0 {
+		return nil, false
+	}
+	if rc.ttl > 0 && time.Now().After(entry.expires) {
+		rc.evict(entry)
+		return nil, false
+	}
+	rc.order.MoveToFront(entry.elem)
+	return entry.data, true
+}
+
 // Put stores data in the cache for the given path and revision. Only files
 // whose size does not exceed the cache's per-file limit are cached. The cache
 // limit is intentionally a static memory-pressure cap rather than a mirror
@@ -139,6 +157,12 @@ func (rc *ReadCache) Put(path string, data []byte, revision int64) {
 // Callers must pass a fresh slice that will not be mutated after this call.
 func (rc *ReadCache) PutOwned(path string, data []byte, revision int64) {
 	rc.put(path, data, revision, false)
+}
+
+// PutPendingOwned stores the path's unversioned pending seed, bypassing
+// the whole-file admission cap.
+func (rc *ReadCache) PutPendingOwned(path string, data []byte) {
+	rc.putUncapped(path, data, 0, false)
 }
 
 // Invalidate removes a specific path from the cache.
@@ -179,7 +203,13 @@ func (rc *ReadCache) put(path string, data []byte, revision int64, clone bool) {
 	if int64(len(data)) > rc.MaxFileSize() {
 		return
 	}
+	rc.putUncapped(path, data, revision, clone)
+}
 
+// putUncapped stores without the whole-file admission cap: the write
+// plane's pending seed is authoritative bytes, not a heuristic admission
+// (its memory bound is the staging's, which already caps the image).
+func (rc *ReadCache) putUncapped(path string, data []byte, revision int64, clone bool) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 

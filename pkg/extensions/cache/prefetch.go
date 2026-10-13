@@ -19,7 +19,7 @@ const (
 
 const (
 	defaultParallelReadConcurrency = 4
-	defaultParallelReadBlockSize   = 8 << 20
+	defaultParallelReadBlockSize   = 1 << 20
 )
 
 // Prefetcher detects sequential read patterns and prefetches upcoming data

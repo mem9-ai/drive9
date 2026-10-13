@@ -26,6 +26,9 @@ type Options struct {
 	RemoteRoot string
 	// CacheDir is the JuiceFS block-cache root (mount cache subtree).
 	CacheDir string
+	// Policy is the mount's write policy: write-sync pays a VFS flush per
+	// Write so write(2) returning means server-side durability (v1).
+	Policy string
 }
 
 // Extent is the fs.Handler middleware claiming extent-plane paths. It
@@ -34,6 +37,8 @@ type Options struct {
 type Extent struct {
 	opts Options
 	root string
+	// policy mirrors Options.Policy (write-sync pays per-Write flushes).
+	policy string
 
 	extentMu       sync.Mutex
 	extentBuild    extentBuildState
@@ -88,6 +93,7 @@ func New(opts Options) (*Extent, error) {
 	return &Extent{
 		opts:      opts,
 		root:      root,
+		policy:    opts.Policy,
 		inoByPath: map[string]uint64{},
 		missTTL:   2 * time.Second,
 		misses:    map[string]time.Time{},
@@ -102,6 +108,33 @@ func (e *Extent) remotePath(p string) string {
 		return e.root
 	}
 	return e.root + p
+}
+
+// EntryTTLHint implements the facade's TTL clamp (v1 extentAttrTimeoutFor
+// + clampExtentTTL): extent-plane paths revalidate at the JuiceFS ~1s
+// cadence, bounded by the mount's configured TTL.
+func (e *Extent) EntryTTLHint(path string) (time.Duration, bool) {
+	if !e.enabled() {
+		return 0, false
+	}
+	if _, ok := e.cachedIno(path); ok {
+		return juiceFSAttrTimeout, true
+	}
+	if ShouldUseExtentPath(e.opts.ExtentPaths, path) {
+		return juiceFSAttrTimeout, true
+	}
+	return 0, false
+}
+
+// DirKeepCacheOff implements the facade's opendir rule (v1: directories
+// with an extent-attached handle must re-list on every open — the jfs side
+// can gain children the kernel's cached listing does not know).
+func (e *Extent) DirKeepCacheOff(path string) bool {
+	if !e.enabled() {
+		return false
+	}
+	_, ok := e.cachedIno(path)
+	return ok
 }
 
 // enabled reports whether this mount opted into the extent plane at all.
@@ -283,14 +316,53 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 		return fs.Result{Handle: handle, OpenFlags: openFlags, Attr: attr}, nil
 
 	case fs.OpSetAttr:
-		// An extent inode truncates through the VFS; classic files fall
-		// through to the classic plane.
+		ino, ok := e.resolveIno(ctx, op.Path)
+		if !ok {
+			return next(ctx, op)
+		}
 		if op.Size >= 0 {
-			if ino, ok := e.resolveIno(ctx, op.Path); ok {
-				return fs.Result{}, e.truncateIno(ctx, op.Path, ino, op.Size)
+			return fs.Result{}, e.truncateIno(ctx, op.Path, ino, op.Size)
+		}
+		// v1 extentSetAttr: mode/owner/times apply through the VFS in one
+		// call — falling through to the classic plane would chmod the
+		// file_nodes row while the jfs inode keeps its old mode, and every
+		// later stat (served from jfs) would report the chmod as a no-op.
+		return e.setAttrViaVFS(ctx, op, ino)
+
+	case fs.OpMkdir:
+		// v1 extentMkdir: a directory created inside an already-mirrored
+		// subtree lands in the JuiceFS namespace too (with its projection
+		// row), then the classic plane creates the drive9 side.
+		if e.enabled() {
+			if err := e.mirrorMkdir(ctx, op); err != nil {
+				return fs.Result{}, err
 			}
 		}
+		return next(ctx, op)
 
+	case fs.OpMknod:
+		// v1: metadata-only specials (FIFO/CHR/BLK/SOCK) become persistent
+		// JuiceFS nodes on extent mounts — cross-mount visible, surviving
+		// restarts — instead of session-local records.
+		if e.enabled() && metadataOnlySpecialMode(op.Mode) {
+			return e.mknodSpecialInVFS(ctx, op)
+		}
+		return next(ctx, op)
+
+	case fs.OpSymlink:
+		if e.enabled() {
+			if err := e.mirrorSymlink(ctx, op); err != nil {
+				return fs.Result{}, err
+			}
+		}
+		return next(ctx, op)
+
+	case fs.OpReadlink:
+		if ino, ok := e.resolveIno(ctx, op.Path); ok {
+			if target, err := e.readlinkIno(ctx, op.Path, ino, op.Caller); err == nil {
+				return fs.Result{Data: []byte(target)}, nil
+			}
+		}
 	case fs.OpUnlink, fs.OpRmdir:
 		if ino, ok := e.resolveIno(ctx, op.Path); ok {
 			if op.Kind == fs.OpRmdir {

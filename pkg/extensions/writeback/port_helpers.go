@@ -22,7 +22,7 @@ const uploadTimeout = 60 * time.Second
 // Mode helpers (the staging package keeps its own unexported copies).
 const (
 	defaultRegularFileMode   uint32 = 0o644
-	posixPermissionModeMask  uint32 = 0o777
+	posixPermissionModeMask  uint32 = 0o7777
 	remotePermissionModeMask uint32 = 0o777
 )
 
@@ -51,6 +51,7 @@ type perfRemoteOp int
 
 type fusePerfCounters struct {
 	enabled               atomic.Bool
+	forward               func(name string, err error, dur time.Duration, bytes uint64)
 	commitRetry           atomicUint64
 	commitFailure         atomicUint64
 	commitSuccess         atomicUint64
@@ -196,5 +197,34 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshotShim {
 }
 
 func (p *fusePerfCounters) recordRemoteOp(op perfRemoteOp, err error, dur time.Duration, bytes uint64) {
-	// trimmed: histograms live with the kernel-side perf integration
+	if p == nil {
+		return
+	}
+	// Forward to the facade-owned remote-op feed when attached (v1
+	// perfRecordRemote); the histogram internals live there.
+	if p.forward != nil {
+		p.forward(remoteOpName(op), err, dur, bytes)
+	}
+}
+
+// remoteOpName maps the writeback remote families onto the perf counter
+// names.
+func remoteOpName(op perfRemoteOp) string {
+	switch op {
+	case perfRemoteStat:
+		return "stat"
+	case perfRemoteRead:
+		return "read"
+	case perfRemoteWrite:
+		return "write"
+	default:
+		return "mutation"
+	}
+}
+
+// setForward attaches the facade-owned remote-op recorder.
+func (p *fusePerfCounters) setForward(fn func(name string, err error, dur time.Duration, bytes uint64)) {
+	if p != nil {
+		p.forward = fn
+	}
 }

@@ -7,6 +7,9 @@ package perf
 
 import (
 	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -327,6 +330,58 @@ func (p *Counters) RecordFuseOpByName(name string, status gofuse.Status, dur tim
 	}
 }
 
+// RecordRemoteOpByName records one remote (HTTP) operation observation by
+// counter name (stat/read/write/mutation); unknown names are dropped.
+// Nil-safe. Also feeds the Prometheus remote-operation series (v1
+// perfRecordRemote).
+func (p *Counters) RecordRemoteOpByName(name string, err error, dur time.Duration, bytes uint64) {
+	if !p.isEnabled() {
+		return
+	}
+	for i, n := range perfRemoteOpNames {
+		if n == name {
+			p.remoteOps[i].record(err != nil, dur, bytes)
+			metrics.RecordFuseRemoteOperation(name, remoteOpResult(err), dur, bytes)
+			return
+		}
+	}
+}
+
+// RecordCacheHit counts one read-tier observation ("read", "dir", or
+// "prefetch"). Nil-safe.
+func (p *Counters) RecordCacheHit(kind string, hit bool) {
+	if !p.isEnabled() {
+		return
+	}
+	switch kind {
+	case "read":
+		if hit {
+			p.readCacheHit.add(1)
+		} else {
+			p.readCacheMiss.add(1)
+		}
+	case "dir":
+		if hit {
+			p.dirCacheHit.add(1)
+		} else {
+			p.dirCacheMiss.add(1)
+		}
+	case "prefetch":
+		if hit {
+			p.prefetchHit.add(1)
+		} else {
+			p.prefetchMiss.add(1)
+		}
+	}
+}
+
+func remoteOpResult(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return "error"
+}
+
 // SnapshotJSON renders the counter snapshot (ok=false when disabled).
 func (p *Counters) SnapshotJSON() ([]byte, bool) {
 	if !p.isEnabled() {
@@ -337,6 +392,111 @@ func (p *Counters) SnapshotJSON() ([]byte, bool) {
 		return nil, false
 	}
 	return b, true
+}
+
+// UptimeString reports the uptime the summary headline carries.
+func (p *Counters) UptimeString() string {
+	snap := p.snapshot()
+	return snap.Uptime.Truncate(time.Millisecond).String()
+}
+
+// GitWorkspaceLine renders v1's workspace refresh accounting line (the
+// git-ops refresh budget guard greps exactly this format).
+func (p *Counters) GitWorkspaceLine() string {
+	if !p.isEnabled() {
+		return ""
+	}
+	snap := p.snapshot()
+	return fmt.Sprintf("drive9: perf git_workspace refresh=%d forced_refresh=%d",
+		snap.Counters["git_workspace_refresh"], snap.Counters["git_workspace_forced_refresh"])
+}
+
+// RecordGitWorkspaceRefresh counts one workspace list (forced marks a
+// reload the arm/notify path asked for, not a lazy miss).
+func (p *Counters) RecordGitWorkspaceRefresh(forced bool) {
+	if p == nil || !p.isEnabled() {
+		return
+	}
+	p.gitWorkspaceRefresh.add(1)
+	if forced {
+		p.gitWorkspaceForcedRefresh.add(1)
+	}
+}
+
+// PerfLines renders v1's machine-readable per-op accounting lines (the
+// write-path budget smoke greps exactly this format):
+//
+//	drive9: perf remote <op> count=N errors=N bytes=N avg=<dur>
+//	drive9: perf fuse <op> count=N errors=N bytes=N avg=<dur>
+func (p *Counters) PerfLines() []string {
+	if !p.isEnabled() {
+		return nil
+	}
+	snap := p.snapshot()
+	var lines []string
+	emit := func(group string, ops map[string]perfOpStats) {
+		names := make([]string, 0, len(ops))
+		for n := range ops {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			st := ops[n]
+			if st.count == 0 {
+				continue
+			}
+			avg := time.Duration(0)
+			if st.count > 0 {
+				avg = time.Duration(st.totalNS / st.count)
+			}
+			lines = append(lines, fmt.Sprintf("drive9: perf %s %s count=%d errors=%d bytes=%d avg=%s",
+				group, n, st.count, st.errors, st.bytes, avg))
+		}
+	}
+	emit("remote", snap.RemoteOps)
+	emit("fuse", snap.FuseOps)
+	return lines
+}
+
+// CommitLine renders v1's commit-queue accounting line: "drive9: perf
+// commit enqueue=N enqueue_errors=N retries=N success=N failure=N".
+func (p *Counters) CommitLine() string {
+	if !p.isEnabled() {
+		return ""
+	}
+	return fmt.Sprintf("drive9: perf commit enqueue=%d enqueue_errors=%d retries=%d success=%d failure=%d",
+		p.commitEnqueue.load(), p.commitEnqueueError.load(), p.commitRetry.load(),
+		p.commitSuccess.load(), p.commitFailure.load())
+}
+
+// SummaryString renders the unmount summary (v1 printSummary): one line
+// per op with observations — totals, errors, and p95/p99 latencies. Empty
+// when disabled.
+func (p *Counters) SummaryString() string {
+	if !p.isEnabled() {
+		return ""
+	}
+	snap := p.snapshot()
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("fuse perf summary (uptime %s):\n", snap.Uptime.Truncate(time.Second)))
+	writeOps := func(title string, ops map[string]perfOpStats) {
+		names := make([]string, 0, len(ops))
+		for n := range ops {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			st := ops[n]
+			if st.count == 0 {
+				continue
+			}
+			b.WriteString(fmt.Sprintf("  %s %-14s n=%-8d err=%-6d p95=%-12s p99=%s\n",
+				title, n, st.count, st.errors, time.Duration(st.p95NS), time.Duration(st.p99NS)))
+		}
+	}
+	writeOps("fuse", snap.FuseOps)
+	writeOps("remote", snap.RemoteOps)
+	return b.String()
 }
 
 func perfLatencyBucketIndex(durNS uint64) int {
@@ -375,6 +535,16 @@ func (p *Counters) recordFuseOp(op perfFuseOp, status gofuse.Status, dur time.Du
 		return
 	}
 	p.fuseOps[op].record(status != gofuse.OK, dur, bytes)
+	// Prometheus series (v1 perfRecordFuse): operation totals and
+	// interrupt accounting live alongside the JSONL counters.
+	result := "ok"
+	if status != gofuse.OK {
+		result = "error"
+		if status == gofuse.EINTR {
+			metrics.RecordFuseInterrupt()
+		}
+	}
+	metrics.RecordFuseOperation(perfFuseOpNames[op], result, dur, bytes)
 }
 
 func (p *Counters) snapshot() fusePerfSnapshot {

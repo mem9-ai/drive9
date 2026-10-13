@@ -1,6 +1,10 @@
 package fs
 
 import (
+	"context"
+	"io"
+	"net"
+
 	"errors"
 	"fmt"
 	"os"
@@ -69,6 +73,10 @@ type Attr struct {
 	// inode the facade stamps it; when it does not, nothing may be invented
 	// and stale routing must be cleared.
 	ExtentIno uint64
+	// ResourceID is the server's object identity for the path: two paths
+	// sharing one are hardlinks of the same object and share a FUSE inode
+	// (v1 LookupWithIdentity). Empty = unknown.
+	ResourceID string
 }
 
 // IsDir reports whether the attribute describes a directory.
@@ -376,9 +384,22 @@ func IsNotFound(err error) bool {
 // os errors map to their canonical errnos, StatusError and syscall.Errno
 // unwrap directly, and everything else is EIO.
 func StatusOf(err error) gofuse.Status {
-	switch {
-	case err == nil:
+	if err == nil {
 		return gofuse.OK
+	}
+	// Exact errno unwrap first (v1 localErrToFuseStatus order): the os
+	// sentinels are broad — os.ErrExist also matches ENOTEMPTY/ENOTDIR and
+	// os.ErrPermission matches EPERM — so sentinel checks must not collapse
+	// a precise errno carried in the chain.
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Status
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return gofuse.Status(errno)
+	}
+	switch {
 	case IsNotFound(err):
 		return gofuse.ENOENT
 	case errors.Is(err, os.ErrPermission):
@@ -387,14 +408,19 @@ func StatusOf(err error) gofuse.Status {
 		return gofuse.Status(syscall.EEXIST)
 	case errors.Is(err, ErrUnsupported):
 		return gofuse.Status(syscall.ENOSYS)
+	case errors.Is(err, io.EOF):
+		// v1 localErrToFuseStatus: a short read is success, not an error.
+		return gofuse.OK
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// v1 httpToFuseStatus: cancellation is retryable (EINTR/EAGAIN
+		// class), never EIO — raw cancel errors reach the facade from the
+		// legacy-interruptible commit paths.
+		return gofuse.Status(syscall.EAGAIN)
 	}
-	var se *StatusError
-	if errors.As(err, &se) {
-		return se.Status
-	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
-		return gofuse.Status(errno)
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		// v1: network timeouts are retryable.
+		return gofuse.Status(syscall.EAGAIN)
 	}
 	return gofuse.EIO
 }

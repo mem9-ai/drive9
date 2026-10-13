@@ -752,6 +752,18 @@ func (dc *DirCache) Upsert(parentPath string, item fs.DirEntryInfo) {
 	dc.upsertInternal(parentPath, item)
 }
 
+// ObserveRemote records one remote observation with TTL semantics and
+// request fencing, for callers outside a listing flow (the background
+// sibling-stat prefetch). Equivalent to BeginRequest+Observe: the row
+// serves until its TTL expires, never as mount-authoritative state.
+func (dc *DirCache) ObserveRemote(parentPath string, item fs.DirEntryInfo) {
+	if dc == nil {
+		return
+	}
+	token := dc.BeginRequest(parentPath)
+	dc.Observe(parentPath, item, token)
+}
+
 // upsertInternal stores a child entry and advances the fencing generation.
 func (dc *DirCache) upsertInternal(parentPath string, item fs.DirEntryInfo) {
 	if item.Name == "" {
@@ -859,6 +871,19 @@ func (dc *DirCache) MarkSessionCreatedDir(dirPath string) {
 	entry.sessionExpires = now.Add(dc.ttl)
 	entry.negatives = make(map[string]time.Time)
 	dc.bumpMutationGenerationLocked(dirPath)
+}
+
+// RecordRemoteNotFound records one remote-observed miss for parent/name
+// (v1 cacheRemoteNotFoundPath): the name seeds a short-lived negative row
+// the next lookup consumes locally, and the miss counts toward the
+// storm-escalation window (RecordRemoteNegative). Lock files never seed —
+// an O_CREAT|O_EXCL probe must always revalidate.
+func (dc *DirCache) RecordRemoteNotFound(parentPath, name string) bool {
+	if name == "" || strings.HasSuffix(name, ".lock") {
+		return false
+	}
+	dc.MarkNegative(parentPath, name)
+	return dc.RecordRemoteNegative(parentPath)
 }
 
 // RecordRemoteNegative notes that a remote stat for a child of dirPath

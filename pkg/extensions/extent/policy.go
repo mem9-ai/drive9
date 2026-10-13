@@ -31,7 +31,7 @@ func clampExtentTTL(ttl, configured time.Duration) time.Duration {
 	return ttl
 }
 
-const posixPermissionModeMask uint32 = 0o777
+const posixPermissionModeMask uint32 = 0o7777
 
 func juiceTypeToStatMode(typ uint8, perm uint16) uint32 {
 	kind := uint32(syscall.S_IFREG)

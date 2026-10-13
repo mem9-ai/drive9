@@ -2,6 +2,7 @@ package sse
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -9,20 +10,37 @@ import (
 )
 
 type recordingNotifier struct {
+	mu      sync.Mutex
 	content []uint64
 	entries [][2]any // parentIno, name
 	all     int
 }
 
 func (n *recordingNotifier) InvalidateEntry(parentIno uint64, name string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.entries = append(n.entries, [2]any{parentIno, name})
 }
 
 func (n *recordingNotifier) InvalidateContent(ino uint64, size uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.content = append(n.content, ino)
 }
 
-func (n *recordingNotifier) InvalidateAll() { n.all++ }
+func (n *recordingNotifier) InvalidateAll() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.all++
+}
+
+// snapshot copies the recorded invalidations; the stream-driven tests read
+// them from the test goroutine while the watcher goroutine records.
+func (n *recordingNotifier) snapshot() (content []uint64, entries int, all int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]uint64(nil), n.content...), len(n.entries), n.all
+}
 
 type fakeInodes struct{}
 

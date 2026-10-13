@@ -5,6 +5,7 @@
 package layer
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"sync"
@@ -34,6 +35,15 @@ type layerHandle struct {
 	buf      *writebuffer.WriteBuffer
 	dirty    bool
 	unlinked bool
+	// wgen fences commit completion against writes that arrive while an
+	// older snapshot uploads: only the generation that landed may clear
+	// the dirty state.
+	wgen uint64
+	// conflicted marks a handle whose path changed underneath it in an
+	// external layer refresh while it held uncommitted writes (v1 replay
+	// conflict): writes and commits answer EAGAIN — the buffer is kept, and
+	// publishing it onto the new tip would splice stale bytes.
+	conflicted bool
 	// unlinkAtRelease publishes the layer whiteout of an unlinked-but-open
 	// path at the last close.
 	unlinkAtRelease func(ctx context.Context) error
@@ -91,6 +101,11 @@ func (h *layerHandle) Attr() fs.Attr {
 func (h *layerHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.unlinked {
+		// An externally whiteouted path serves ENOENT even on an open fd
+		// (v1 survivor semantics: the fd must not resurrect deleted content).
+		return 0, fs.ErrNotFound
+	}
 	if h.buf == nil {
 		// Overlay files serve their committed image; base files stream the
 		// remote object.
@@ -128,6 +143,10 @@ func (h *layerHandle) Read(ctx context.Context, off int64, dest []byte) (int, er
 
 func (h *layerHandle) Write(ctx context.Context, off int64, data []byte) error {
 	h.mu.Lock()
+	if h.conflicted {
+		h.mu.Unlock()
+		return syscall.EAGAIN
+	}
 	if err := h.ensureBufferLocked(ctx); err != nil {
 		h.mu.Unlock()
 		return err
@@ -142,6 +161,7 @@ func (h *layerHandle) Write(ctx context.Context, off int64, data []byte) error {
 		return err
 	}
 	h.dirty = true
+	h.wgen++
 	policy := h.l.policy
 	h.mu.Unlock()
 	if policy == policyWriteSync {
@@ -219,9 +239,22 @@ func (h *layerHandle) retarget(newPath string) {
 // base revision.
 func (h *layerHandle) commit(ctx context.Context) error {
 	h.mu.Lock()
-	if h.unlinked || !h.dirty || h.buf == nil {
+	if h.unlinked || !h.dirty {
 		h.mu.Unlock()
 		return nil
+	}
+	if h.conflicted {
+		h.mu.Unlock()
+		return syscall.EAGAIN
+	}
+	// A create that never wrote has no buffer yet: the empty image must
+	// still land (lock files, markers — an O_CREAT close with zero bytes
+	// published nothing and the next stat ENOENT'd).
+	if h.buf == nil {
+		if err := h.ensureBufferLocked(ctx); err != nil {
+			h.mu.Unlock()
+			return err
+		}
 	}
 	if err := h.buf.LoadMissingParts(); err != nil {
 		h.mu.Unlock()
@@ -229,6 +262,8 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	}
 	size := h.buf.Size()
 	mode, baseRev, path := h.mode, h.baseRev, h.path
+	wgen := h.wgen
+	image := append([]byte(nil), h.buf.Bytes()...)
 	l := h.l
 	h.mu.Unlock()
 
@@ -243,14 +278,8 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	var entry *client.FSLayerEntry
 	var err error
 	if size > l.inlineMax() {
-		h.mu.Lock()
-		reader := &bufferReader{h: h, size: size}
-		h.mu.Unlock()
-		entry, err = l.cl.UploadFSLayerFile(ctx, l.layerRef, l.remotePath(path), reader, size, baseRev, mode, true)
+		entry, err = l.cl.UploadFSLayerFile(ctx, l.layerRef, l.remotePath(path), bytes.NewReader(image), size, baseRev, mode, true)
 	} else {
-		h.mu.Lock()
-		image := append([]byte(nil), h.buf.Bytes()...)
-		h.mu.Unlock()
 		entry, err = l.cl.UpsertFSLayerEntry(ctx, l.layerRef, client.FSLayerEntryRequest{
 			Path:         l.remotePath(path),
 			Op:           "upsert",
@@ -267,16 +296,21 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	h.l.mu.Lock()
 	if !h.l.abandoned {
 		h.l.files[path] = mode & 0o777
-		h.l.contents[path] = append([]byte(nil), h.buf.Bytes()...)
+		h.l.contents[path] = image
 		delete(h.l.whiteouts, path)
 		delete(h.l.dirs, path)
 		delete(h.l.symlinks, path)
 	}
 	h.l.mu.Unlock()
 	h.mu.Lock()
-	h.dirty = false
-	h.isNew = false
-	h.buf.ClearDirty()
+	if h.wgen == wgen {
+		// No write arrived while the snapshot uploaded: this commit is
+		// the newest state and may retire the dirty flag. A newer wgen
+		// keeps the handle dirty — its bytes are still unacknowledged.
+		h.dirty = false
+		h.isNew = false
+		h.buf.ClearDirty()
+	}
 	h.mu.Unlock()
 	_ = entry
 	h.l.emit(fs.Event{Kind: fs.EventLanded, Path: path, Size: size})
@@ -329,51 +363,6 @@ func (h *layerHandle) ensureBufferLocked(ctx context.Context) error {
 		return nil
 	}
 	return nil
-}
-
-// bufferReader streams a claimed file's image chunk-by-chunk: each Read
-// loads only the parts it touches, so committing a sparse multi-GiB image
-// never materializes the whole image in memory.
-type bufferReader struct {
-	h    *layerHandle
-	off  int64
-	size int64
-}
-
-func (r *bufferReader) Read(p []byte) (int, error) {
-	n, err := r.ReadAt(p, r.off)
-	if n > 0 {
-		r.off += int64(n)
-	}
-	return n, err
-}
-
-// ReadAt satisfies the large-upload contract: multipart uploads
-// type-assert io.ReaderAt and seek per part.
-func (r *bufferReader) ReadAt(p []byte, off int64) (int, error) {
-	if off < 0 || off >= r.size {
-		return 0, io.EOF
-	}
-	n := int64(len(p))
-	if off+n > r.size {
-		n = r.size - off
-	}
-	if n <= 0 {
-		return 0, io.EOF
-	}
-	r.h.mu.Lock()
-	defer r.h.mu.Unlock()
-	if r.h.buf == nil {
-		return 0, fs.ErrUnsupported
-	}
-	if err := r.h.buf.EnsurePartsForWrite(off, n); err != nil {
-		return 0, err
-	}
-	got := r.h.buf.ReadAt(off, p[:n])
-	if got <= 0 {
-		return 0, io.EOF
-	}
-	return got, nil
 }
 
 // hasWriteIntent reports an open that can produce writes.

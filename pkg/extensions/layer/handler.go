@@ -5,6 +5,7 @@ package layer
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"syscall"
 	"time"
@@ -84,7 +85,11 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		return next(ctx, op)
 
 	case fs.OpCreate:
-		if l.readOnly {
+		// Checkpoint mounts are read-only for WRITES only: plain read opens
+		// must serve the restored overlay (v1). The blanket gate rejected
+		// even O_RDONLY opens with EROFS, so every checkpoint-restore read
+		// failed while the listing (OpList) worked.
+		if l.readOnly && (hasWriteIntent(op.Flags) || op.Flags&uint32(syscall.O_CREAT) != 0 || op.Flags&uint32(syscall.O_TRUNC) != 0) {
 			return fs.Result{}, syscall.EROFS
 		}
 		if hasWriteIntent(op.Flags) {
@@ -190,9 +195,36 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
 		return fs.Result{}, nil
 
+	case fs.OpLink:
+		if l.readOnly {
+			return fs.Result{}, syscall.EROFS
+		}
+		// v1 upsertLayerHardlink: a hardlink whose source lives in the
+		// overlay copies the image to the target as a layer upsert — the
+		// base plane cannot hardlink overlay content. Base-plane sources
+		// fall through to the base plane's hardlink.
+		if kind, mode, _, content, ok := l.lookup(op.Path); ok && kind == "file" {
+			data := append([]byte(nil), content...)
+			m := mode
+			if m == 0 {
+				m = 0o644
+			}
+			if err := l.upsertFile(ctx, op.Path2, data, 0, m); err != nil {
+				return fs.Result{}, err
+			}
+			return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: m, Size: int64(len(data))}}, nil
+		}
+		return next(ctx, op)
+
 	case fs.OpUnlink, fs.OpRmdir:
 		if l.readOnly {
 			return fs.Result{}, syscall.EROFS
+		}
+		// v1 layerDirHasOverlayChildren: a non-empty layer directory must
+		// refuse rmdir with ENOTEMPTY before the whiteout lands — the
+		// overlay entries would otherwise live on under a hidden name.
+		if op.Kind == fs.OpRmdir && l.dirHasOverlayChildren(op.Path) {
+			return fs.Result{}, syscall.ENOTEMPTY
 		}
 		unlock := l.mutLocks.lock(op.Path)
 		defer unlock()
@@ -248,6 +280,35 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		}
 		if op.Mode != 0 {
 			kind, _, _, _, ok := l.lookup(op.Path)
+			if ok && kind == "file" {
+				// v1: a chmod of a path this layer already upserted
+				// merges into that upsert's mode — a standalone chmod
+				// entry has no base to describe, and the diff/restore
+				// lose the content (the smoke's umask-then-chmod create).
+				unlock := l.mutLocks.lock(op.Path)
+				_, _, _, content, _ := l.lookup(op.Path)
+				err := l.upsertFileLocked(ctx, op.Path, content, 0, op.Mode&0o777)
+				unlock()
+				if err != nil {
+					return fs.Result{}, err
+				}
+				l.markLayerFileMode(op.Path, op.Mode)
+				l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
+				return l.Do(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path}, next)
+			}
+			if !ok {
+				// Base-only file: record a mode-only override — the base
+				// object stays the content source (registering an empty
+				// overlay image would make every read return zero bytes).
+				if st, serr := l.cl.StatCtx(ctx, l.remotePath(op.Path)); serr == nil && st != nil && !st.IsDir {
+					if err := l.upsertEntry(ctx, client.FSLayerEntryRequest{Path: l.remotePath(op.Path), Op: "chmod", Kind: "file", Mode: op.Mode & 0o777}); err != nil {
+						return fs.Result{}, err
+					}
+					l.markLayerBaseFileMode(op.Path, op.Mode)
+					l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
+					return l.Do(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path}, next)
+				}
+			}
 			entryKind := "file"
 			if !ok {
 				if st, err := l.cl.StatCtx(ctx, l.remotePath(op.Path)); err == nil && st != nil && st.IsDir {
@@ -274,9 +335,30 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		}
 		if op.Size >= 0 {
 			if kind, mode, _, content, ok := l.lookup(op.Path); ok && kind == "file" {
-				nextImg := make([]byte, op.Size)
-				copy(nextImg, content)
-				if err := l.upsertFile(ctx, op.Path, nextImg, 0, mode); err != nil {
+				if err := l.truncateFile(ctx, op.Path, content, op.Size, mode); err != nil {
+					return fs.Result{}, err
+				}
+			} else if st, serr := l.cl.StatCtx(ctx, l.remotePath(op.Path)); serr == nil && st != nil && !st.IsDir {
+				// Base-only file (v1 applyRemoteTruncate): a truncation
+				// still records a layer image at the requested size —
+				// returning the unchanged attrs silently dropped it.
+				mode := uint32(0o644)
+				if m, ok := l.baseFileMode(op.Path); ok {
+					mode = m
+				}
+				kept := int64(0)
+				if st.Size < op.Size {
+					kept = st.Size
+				} else {
+					kept = op.Size
+				}
+				content := []byte(nil)
+				if kept > 0 && kept <= l.inlineMax() {
+					if data, rerr := l.fetchBaseRange(ctx, op.Path, 0, kept); rerr == nil {
+						content = data
+					}
+				}
+				if err := l.truncateFile(ctx, op.Path, content, op.Size, mode); err != nil {
 					return fs.Result{}, err
 				}
 			}
@@ -284,6 +366,61 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		return l.Do(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path}, next)
 	}
 	return next(ctx, op)
+}
+
+// dirHasOverlayChildren ports v1 layerDirHasOverlayChildren: any overlay
+// entry (file, dir, symlink, whiteout, or live handle) directly under dir
+// makes the directory non-empty for rmdir.
+func (l *Layer) dirHasOverlayChildren(dir string) bool {
+	prefix := strings.TrimRight(dir, "/") + "/"
+	has := func(path string) bool {
+		if !strings.HasPrefix(path, prefix) {
+			return false
+		}
+		name := strings.TrimPrefix(path, prefix)
+		return name != "" && !strings.Contains(name, "/")
+	}
+	l.mu.RLock()
+	for p := range l.whiteouts {
+		if has(p) {
+			l.mu.RUnlock()
+			return true
+		}
+	}
+	for p := range l.files {
+		if has(p) {
+			l.mu.RUnlock()
+			return true
+		}
+	}
+	for p := range l.dirs {
+		if has(p) {
+			l.mu.RUnlock()
+			return true
+		}
+	}
+	for p := range l.symlinks {
+		if has(p) {
+			l.mu.RUnlock()
+			return true
+		}
+	}
+	for p := range l.contents {
+		if has(p) {
+			l.mu.RUnlock()
+			return true
+		}
+	}
+	l.mu.RUnlock()
+	found := false
+	l.live.Range(func(key, _ any) bool {
+		if path, ok := key.(string); ok && has(path) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // listMerged overlays this layer's children on the base listing.
@@ -331,4 +468,15 @@ func (l *Layer) listMerged(ctx context.Context, dir string, next fs.Next) (fs.Re
 		entries = append(entries, e)
 	}
 	return fs.Result{Entries: entries}, nil
+}
+
+// fetchBaseRange reads a byte range of the base object (small images only;
+// larger truncations stream through truncateFile's reader path).
+func (l *Layer) fetchBaseRange(ctx context.Context, path string, off, length int64) ([]byte, error) {
+	rc, err := l.cl.ReadStreamRange(ctx, l.remotePath(path), off, length)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+	return io.ReadAll(rc)
 }

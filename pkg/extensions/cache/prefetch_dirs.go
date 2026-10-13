@@ -19,6 +19,7 @@ const (
 	metaPrefetchCooldown         = time.Second
 	metaPrefetchMissesToActivate = 2
 	metaPrefetchMaxHotPaths      = client.MaxBatchStatPaths
+	metaPrefetchMaxTrackedDirs   = 1024
 
 	contentPrefetchMaxFilesDefault = 32
 	contentPrefetchMaxBytesDefault = 1 << 20
@@ -213,16 +214,51 @@ func (p *dirPrefetcher) hasLocalWriteState(path string) bool {
 	return true
 }
 
+// answeredFromNamespace reports whether the namespace cache already knows
+// the name absent (a fresh negative row or a complete listing without it).
+func (p *dirPrefetcher) answeredFromNamespace(path string) bool {
+	looker, ok := p.namespace.(interface {
+		LookupNamespace(parent, name string) (fs.DirEntryInfo, fs.LookupKind)
+	})
+	if !ok {
+		return false
+	}
+	dir := parentDirOf(path)
+	name := path[strings.LastIndexByte(path, '/')+1:]
+	if name == "" {
+		return false
+	}
+	_, kind := looker.LookupNamespace(dir, name)
+	return kind == fs.LookupNegative || kind == fs.LookupCompleteMiss || kind == fs.LookupSessionMiss
+}
+
 // noteMiss tracks lookup misses per directory and activates sibling
-// metadata prefetch when the window trips (2 misses within 1s).
+// metadata prefetch when the window trips (2 misses within 1s). Misses the
+// namespace cache already answered (a negative or complete-miss row) do
+// not count — v1 counted only cache-unanswered misses, and re-counting the
+// answered ones would re-fire a redundant batch-stat on every cooldown.
 func (p *dirPrefetcher) noteMiss(ctx context.Context, path string) {
 	if p == nil || p.namespace == nil || p.client == nil {
+		return
+	}
+	if p.answeredFromNamespace(path) {
 		return
 	}
 	dir := parentDirOf(path)
 	p.mu.Lock()
 	st := p.metaDirs[dir]
 	if st == nil {
+		// Bounded tracked-directory set (v1 metadataPrefetchMaxTrackedDirs).
+		if len(p.metaDirs) >= metaPrefetchMaxTrackedDirs {
+			var oldest string
+			var oldestAt time.Time
+			for d, s := range p.metaDirs {
+				if oldest == "" || s.windowFrom.Before(oldestAt) {
+					oldest, oldestAt = d, s.windowFrom
+				}
+			}
+			delete(p.metaDirs, oldest)
+		}
 		st = &metaDirState{misses: map[string]struct{}{}, windowFrom: time.Now()}
 		p.metaDirs[dir] = st
 	}
@@ -243,8 +279,10 @@ func (p *dirPrefetcher) noteMiss(ctx context.Context, path string) {
 }
 
 // refreshSiblingMetadata ports the refreshSiblingMetadata: batch-stat the
-// directory's children (up to MaxBatchStatPaths) and upsert every hit into
-// the namespace cache.
+// directory's children (up to MaxBatchStatPaths) and record every hit into
+// the namespace cache as a REMOTE OBSERVATION — a TTL-bound row, not
+// mount-authoritative state (a plain Upsert would live until an explicit
+// invalidation and mask remote deletes the SSE stream missed).
 func (p *dirPrefetcher) refreshSiblingMetadata(ctx context.Context, dir string) {
 	siblings, ok := p.namespace.Get(dir)
 	if !ok || len(siblings) == 0 {
@@ -267,8 +305,11 @@ func (p *dirPrefetcher) refreshSiblingMetadata(ctx context.Context, dir string) 
 	if err != nil {
 		return
 	}
+	observer, canObserve := p.namespace.(interface {
+		ObserveRemote(parent string, entry fs.DirEntryInfo)
+	})
 	for i, r := range results {
-		if !r.OK() || i >= len(siblings) {
+		if !r.OK() || i >= len(names) {
 			continue
 		}
 		item := siblings[i]
@@ -278,6 +319,10 @@ func (p *dirPrefetcher) refreshSiblingMetadata(ctx context.Context, dir string) 
 		if r.HasMode {
 			item.Mode = r.Mode
 			item.HasMode = true
+		}
+		if canObserve {
+			observer.ObserveRemote(dir, item)
+			continue
 		}
 		p.namespace.Upsert(dir, item)
 	}
@@ -357,7 +402,7 @@ func (p *dirPrefetcher) loadSiblingDirectory(load func(ctx context.Context, op *
 	}
 	items := make([]fs.DirEntryInfo, 0, len(res.Entries))
 	for _, e := range res.Entries {
-		items = append(items, fs.DirEntryInfo{Name: e.Name, IsDir: e.Attr.IsDir(), Size: e.Attr.Size, Mode: e.Attr.Mode, HasMode: true, Rev: e.Attr.Rev})
+		items = append(items, fs.DirEntryInfo{Name: e.Name, IsDir: e.Attr.IsDir(), Size: e.Attr.Size, Mode: e.Attr.Mode, HasMode: true, Rev: e.Attr.Rev, Mtime: e.Attr.Mtime, Nlink: e.Attr.Nlink, ResourceID: e.Attr.ResourceID})
 	}
 	p.namespace.Put(dir, items)
 }

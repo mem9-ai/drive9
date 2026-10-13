@@ -63,7 +63,12 @@ type WriteBackUploader struct {
 	stopOnce   sync.Once
 	stopped    atomic.Bool
 	active     atomic.Int64
-	stopCh     chan struct{}
+	// handed counts paths handed to a worker but not yet finished: it is
+	// incremented BEFORE the channel send and decremented after uploadOne
+	// completes, closing the receive→active window where WaitIdle would
+	// otherwise observe 0/0 with work still in a worker's hands.
+	handed atomic.Int64
+	stopCh chan struct{}
 
 	// Per-path in-flight tracking.
 	inflightMu sync.Mutex
@@ -175,7 +180,10 @@ func (u *WriteBackUploader) WaitIdle(ctx context.Context) error {
 	defer ticker.Stop()
 	for {
 		snap := u.Snapshot()
-		if snap.Queued == 0 && snap.InFlight == 0 {
+		// `handed` covers the receive→active window: a path a worker has
+		// taken but not yet registered shows in neither Queued nor
+		// InFlight, and idle would be reported with the upload pending.
+		if snap.Queued == 0 && snap.InFlight == 0 && u.handed.Load() == 0 {
 			return nil
 		}
 		select {
@@ -209,6 +217,11 @@ func (u *WriteBackUploader) Submit(localPath string) {
 		u.uploadOne(localPath)
 		return
 	}
+	// Account the handoff before the send: between a worker receiving the
+	// path and bumping `active`, neither the channel nor the counters show
+	// it — WaitIdle would report idle with the upload still pending (v1's
+	// depth probe never had this hole).
+	u.handed.Add(1)
 	select {
 	case u.uploadCh <- localPath:
 		u.submitMu.Unlock()
@@ -233,6 +246,7 @@ func (u *WriteBackUploader) Submit(localPath string) {
 		if u.perf != nil {
 			u.perf.uploaderSyncFallback.add(1)
 		}
+		u.handed.Add(-1)
 		u.uploadOne(localPath)
 	}
 }
@@ -433,6 +447,7 @@ func (u *WriteBackUploader) worker() {
 		u.active.Add(1)
 		func() {
 			defer u.active.Add(-1)
+			defer u.handed.Add(-1)
 			u.uploadOne(localPath)
 		}()
 	}
@@ -553,7 +568,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		if errors.Is(lastErr, client.ErrConflict) {
 			// TODO: persist a conflict marker or resolution flow so these
 			// entries do not remain pending forever across mounts.
-			safeLogPrintf("writeback upload conflict for %s at base revision %d (will keep local pending data)", localPath, meta.BaseRev)
+			safeLogPrintf("writeback upload conflict for %s at base revision %d (will keep local pending data): %v", localPath, meta.BaseRev, lastErr)
 			return
 		}
 		safeLogPrintf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", localPath, uploadMaxRetries+1, lastErr)

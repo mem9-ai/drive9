@@ -8,9 +8,11 @@
 package layer
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -48,6 +50,9 @@ type Layer struct {
 	mu        sync.RWMutex
 	whiteouts map[string]struct{}
 	files     map[string]uint32 // overlay file modes
+	// baseModes are mode-only overrides for files whose content still
+	// comes from the base object (a chmod of a base file).
+	baseModes map[string]uint32
 	dirs      map[string]uint32 // overlay dir modes
 	symlinks  map[string]symlinkState
 	// contents holds overlay file bodies inline, seeded from replay and
@@ -88,6 +93,22 @@ type Layer struct {
 func (l *Layer) liveStore(path string, h *layerHandle) { l.live.Store(path, h) }
 func (l *Layer) untrack(path string)                   { l.live.Delete(path) }
 
+// ReexecRefusal ports the v1 hasLayerOverlayState gate: a layer mount with
+// any overlay state (whiteouts, entries, symlinks, or inline contents)
+// refuses re-exec — the in-memory overlay does not survive the handoff.
+func (l *Layer) ReexecRefusal() (string, int) {
+	if l == nil {
+		return "", 0
+	}
+	l.mu.RLock()
+	n := len(l.whiteouts) + len(l.files) + len(l.dirs) + len(l.symlinks) + len(l.contents)
+	l.mu.RUnlock()
+	if n > 0 {
+		return "layer_overlay", n
+	}
+	return "", 0
+}
+
 func (l *Layer) handleFor(path string) *layerHandle {
 	if v, ok := l.live.Load(path); ok {
 		return v.(*layerHandle)
@@ -95,13 +116,19 @@ func (l *Layer) handleFor(path string) *layerHandle {
 	return nil
 }
 
+// serverLayerEntryMaxBytes is the server's per-entry transaction cap: an
+// inline upsert larger than this fails the store transaction outright
+// ("entry too large"). Larger images must take the object-upload path.
+const serverLayerEntryMaxBytes int64 = 6 << 20
+
 // inlineMax is the inline-entry threshold: larger images stream as object
-// uploads.
+// uploads (v1 routed its shadow-spilled layer commits the same way — the
+// 95MiB client envelope limit never applied to the store's entry cap).
 func (l *Layer) inlineMax() int64 {
 	if l.inlineMaxOverride > 0 {
 		return l.inlineMaxOverride
 	}
-	return client.DefaultFSLayerInlineEntryBytes
+	return serverLayerEntryMaxBytes
 }
 
 // OnRollback registers a hook that runs exactly once, when a rollback
@@ -146,6 +173,35 @@ func New(opts Options) (*Layer, error) {
 	} else {
 		root = "/" + strings.Trim(root, "/")
 	}
+	// v1 mount state gate: non-checkpoint mounts only accept active layers;
+	// checkpoint mounts also accept sealed/committed ones. Mounting a
+	// rolled-back or otherwise unusable layer fails fast instead of serving
+	// a stale view.
+	if opts.Client != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		lr, lerr := opts.Client.GetFSLayer(ctx, strings.TrimSpace(opts.LayerRef))
+		cancel()
+		if lerr != nil {
+			return nil, fmt.Errorf("layer: resolve %s: %w", opts.LayerRef, lerr)
+		}
+		state := ""
+		if lr != nil {
+			state = lr.State
+		}
+		allowed := state == "active"
+		if opts.CheckpointRef != "" {
+			allowed = allowed || state == "sealed" || state == "committed"
+		}
+		if !allowed {
+			return nil, fmt.Errorf("layer: %s is in state %q (want active%s); remount requires a usable layer",
+				opts.LayerRef, state, func() string {
+					if opts.CheckpointRef != "" {
+						return "/sealed/committed"
+					}
+					return ""
+				}())
+		}
+	}
 	return &Layer{
 		cl:                opts.Client,
 		layerRef:          strings.TrimSpace(opts.LayerRef),
@@ -156,6 +212,7 @@ func New(opts Options) (*Layer, error) {
 		inlineMaxOverride: opts.InlineMax,
 		whiteouts:         map[string]struct{}{},
 		files:             map[string]uint32{},
+		baseModes:         map[string]uint32{},
 		dirs:              map[string]uint32{},
 		symlinks:          map[string]symlinkState{},
 		contents:          map[string][]byte{},
@@ -183,3 +240,15 @@ var (
 	_ fs.Handler   = (*Layer)(nil)
 	_ fs.Lifecycle = (*Layer)(nil)
 )
+
+// localPathOf maps a remote (root-prefixed) event path back onto the
+// mount-local vocabulary the overlay and live handle index use.
+func (l *Layer) localPathOf(rp string) string {
+	if l.root == "/" || rp == "/" {
+		return rp
+	}
+	if rp == l.root {
+		return "/"
+	}
+	return strings.TrimPrefix(rp, l.root)
+}

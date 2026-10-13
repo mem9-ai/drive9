@@ -33,7 +33,13 @@ func NewStaging(dir string) (*Staging, error) {
 // freeRatio/sizeMB carry the write-cache quota (defaults 0.10 / 1024 when
 // zero): the shadow store refuses new writes with ENOSPC past the budget.
 func NewStagingWithQuota(dir string, freeRatio float64, sizeMB int64) (*Staging, error) {
-	shadow, err := NewShadowStoreWithQuota(filepath.Join(dir, "shadow"), freeRatio, sizeMB)
+	// sizeMB is a MiB count; the shadow store's quota is bytes (v1 mount.go
+	// passed WriteCacheSizeMB << 20). Zero or negative disables the quota.
+	maxBytes := int64(0)
+	if sizeMB > 0 {
+		maxBytes = sizeMB << 20
+	}
+	shadow, err := NewShadowStoreWithQuota(filepath.Join(dir, "shadow"), freeRatio, maxBytes)
 	if err != nil {
 		return nil, fmt.Errorf("staging shadow: %w", err)
 	}

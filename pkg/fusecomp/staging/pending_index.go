@@ -728,13 +728,6 @@ func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (ui
 	gen := idx.nextGen.Add(1)
 	meta.Generation = gen
 
-	idx.mu.RLock()
-	shadows := idx.shadows
-	idx.mu.RUnlock()
-	if shadows != nil && meta.Kind != PendingChmod {
-
-	}
-
 	// Durable publication first, then the in-memory publish.
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {

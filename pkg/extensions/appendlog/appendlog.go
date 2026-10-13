@@ -26,6 +26,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/httperr"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
 
@@ -462,6 +463,7 @@ func (a *AppendLog) fullRewrite(ctx context.Context, h *Handle) error {
 		return nil
 	}
 	expectedRevision, expectedSize := h.committedBaselineLocked()
+	isNew := h.isNew
 	if !h.isNew && (expectedRevision <= 0 || expectedSize < 0) {
 		h.mu.Unlock()
 		return syscall.EIO
@@ -471,17 +473,26 @@ func (a *AppendLog) fullRewrite(ctx context.Context, h *Handle) error {
 
 	if layout == "" {
 		stat, err := a.cl.StatCtx(ctx, a.remotePath(h.path))
-		if err != nil {
+		switch {
+		case err != nil && client.IsNotFound(err) && isNew:
+			// v1: a never-landed create has no remote image to reconcile —
+			// the generic commit creates it (expected revision 0), instead
+			// of failing the flush with ENOENT on servers without
+			// append-log support.
+			layout = client.ContentLayoutSingle
+			expectedRevision = 0
+		case err != nil:
 			return mapErr(err)
-		}
-		h.mu.Lock()
-		if stat == nil || stat.Revision != expectedRevision || stat.Size != expectedSize {
+		default:
+			h.mu.Lock()
+			if stat == nil || stat.Revision != expectedRevision || stat.Size != expectedSize {
+				h.mu.Unlock()
+				return syscall.EEXIST
+			}
+			h.observeLayoutLocked(stat.ContentLayout, stat.Revision, stat.Size)
+			layout = h.layoutAtLocked(expectedRevision, expectedSize)
 			h.mu.Unlock()
-			return syscall.EEXIST
 		}
-		h.observeLayoutLocked(stat.ContentLayout, stat.Revision, stat.Size)
-		layout = h.layoutAtLocked(expectedRevision, expectedSize)
-		h.mu.Unlock()
 	}
 	if layout != "" && layout != client.ContentLayoutAppendLog && layout != client.ContentLayoutSingle {
 		return syscall.EIO
@@ -617,23 +628,18 @@ func (a *AppendLog) commitWholeSnapshot(ctx context.Context, path string, snapsh
 }
 
 // commitWhole conditionally PUTs an in-memory image, retrying on revision
-// conflicts.
+// conflicts. A path that vanished remotely (concurrent delete) is NOT
+// recreated — v1's CAS rejected there, and resurrecting a deleted name from
+// a stale writer's buffer loses the delete.
 func (a *AppendLog) commitWhole(ctx context.Context, path string, image []byte) (int64, error) {
 	rp := a.remotePath(path)
 	for attempt := 0; attempt <= 3; attempt++ {
 		st, err := a.cl.StatCtx(ctx, rp)
 		if err != nil {
-			if !client.IsNotFound(err) {
-				return 0, mapErr(err)
+			if client.IsNotFound(err) {
+				return 0, fs.ErrNotFound
 			}
-			rev, werr := a.cl.WriteCtxConditionalWithRevision(ctx, rp, image, 0)
-			if werr != nil {
-				if errors.Is(werr, client.ErrConflict) {
-					continue
-				}
-				return 0, mapErr(werr)
-			}
-			return rev, nil
+			return 0, mapErr(err)
 		}
 		rev, werr := a.cl.WriteCtxConditionalWithRevision(ctx, rp, image, st.Revision)
 		if werr != nil {
@@ -664,12 +670,73 @@ func (a *AppendLog) emit(e fs.Event) {
 }
 
 // track/untrack maintain the live-handle index.
-func (a *AppendLog) track(h *Handle)   { a.live.Store(h.path, h) }
-func (a *AppendLog) untrack(h *Handle) { a.live.Delete(h.path) }
+// liveHandleSet is one path's open protocol handles. The table supports
+// MULTIPLE concurrent handles of one path (v1 openHandles): the current
+// head serves SetAttr interception, and every dirty member is a
+// read-your-writes / append-baseline source for the others.
+type liveHandleSet struct {
+	mu  sync.Mutex
+	cur *Handle
+	set map[*Handle]struct{}
+}
+
+func (s *liveHandleSet) add(h *Handle) {
+	s.mu.Lock()
+	if s.set == nil {
+		s.set = map[*Handle]struct{}{}
+	}
+	s.set[h] = struct{}{}
+	s.cur = h
+	s.mu.Unlock()
+}
+
+func (s *liveHandleSet) remove(h *Handle) {
+	s.mu.Lock()
+	delete(s.set, h)
+	if s.cur == h {
+		s.cur = nil
+		for other := range s.set {
+			s.cur = other
+			break
+		}
+	}
+	s.mu.Unlock()
+}
+
+// head returns the most recently tracked handle (SetAttr interception).
+func (s *liveHandleSet) head() *Handle {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cur
+}
+
+// forEach visits every live handle of the path.
+func (s *liveHandleSet) forEach(fn func(*Handle) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for h := range s.set {
+		if !fn(h) {
+			return
+		}
+	}
+}
+
+func (a *AppendLog) liveSet(path string) *liveHandleSet {
+	v, _ := a.live.LoadOrStore(path, &liveHandleSet{})
+	return v.(*liveHandleSet)
+}
+
+func (a *AppendLog) track(h *Handle) { a.liveSet(h.path).add(h) }
+
+func (a *AppendLog) untrack(h *Handle) {
+	if v, ok := a.live.Load(h.path); ok {
+		v.(*liveHandleSet).remove(h)
+	}
+}
 
 func (a *AppendLog) handleFor(path string) *Handle {
 	if v, ok := a.live.Load(path); ok {
-		return v.(*Handle)
+		return v.(*liveHandleSet).head()
 	}
 	return nil
 }
@@ -788,6 +855,12 @@ func (h *Handle) Read(ctx context.Context, off int64, dest []byte) (int, error) 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.buf == nil {
+		// Read-your-writes across fds (v1 readActiveAppendVisibleRange /
+		// readSamePathDirtyHandle): another live handle's unflushed buffer
+		// is visible to this fd — serve it instead of the stale remote.
+		if n, ok := h.a.readLiveAppendBuffer(ctx, h, off, dest); ok {
+			return n, nil
+		}
 		if h.inner != nil {
 			return h.inner.Read(ctx, off, dest)
 		}
@@ -818,8 +891,15 @@ func (h *Handle) Write(ctx context.Context, off int64, data []byte) error {
 		return err
 	}
 	// O_APPEND: the kernel may deliver off=0; the write lands at the
-	// buffer tail.
+	// buffer tail. First re-derive that tail from the newest same-path
+	// content (v1 refreshAppendBufferLocked, issue #935): a concurrent
+	// appender's unflushed bytes must not be overwritten — the flush-time
+	// rebase check would reject the whole image instead.
 	if h.flags&uint32(syscall.O_APPEND) != 0 && off == 0 {
+		if err := h.refreshAppendBaselineLocked(ctx); err != nil {
+			h.mu.Unlock()
+			return err
+		}
 		off = h.buf.Size()
 	}
 	// Capture the committed WAL header before a write can overwrite it;
@@ -859,6 +939,97 @@ func (h *Handle) Flush(ctx context.Context) error {
 	}
 	if h.inner != nil {
 		return h.inner.Flush(ctx)
+	}
+	return nil
+}
+
+// readLiveAppendBuffer serves one read from any OTHER live handle's dirty
+// buffer of the same path (v1 read-your-writes across fds). ok=false lets
+// the caller fall through to the inner (remote) tier.
+func (a *AppendLog) readLiveAppendBuffer(ctx context.Context, reader *Handle, off int64, dest []byte) (int, bool) {
+	v, ok := a.live.Load(reader.path)
+	if !ok {
+		return 0, false
+	}
+	set := v.(*liveHandleSet)
+	var served *Handle
+	set.forEach(func(h *Handle) bool {
+		if h != reader && h.dirty && h.buf != nil {
+			served = h
+			return false
+		}
+		return true
+	})
+	if served == nil {
+		return 0, false
+	}
+	served.mu.Lock()
+	defer served.mu.Unlock()
+	if !served.dirty || served.buf == nil {
+		return 0, false
+	}
+	if err := served.buf.EnsurePartsForWrite(off, int64(len(dest))); err != nil {
+		return 0, false
+	}
+	n := served.buf.ReadAt(off, dest)
+	if end := served.buf.Size() - off; end < int64(len(dest)) {
+		if end < 0 {
+			end = 0
+		}
+		n = int(end)
+	}
+	return n, true
+}
+
+// refreshAppendBaselineLocked extends this handle's buffer tail with
+// another live handle's unflushed appends (v1 refreshAppendBufferLocked's
+// local source). Only extension is safe: the caller's own unflushed bytes
+// stay authoritative for the range they cover. Caller holds h.mu.
+func (h *Handle) refreshAppendBaselineLocked(ctx context.Context) error {
+	if h.buf == nil || h.isNew {
+		return nil
+	}
+	v, ok := h.a.live.Load(h.path)
+	if !ok {
+		return nil
+	}
+	set := v.(*liveHandleSet)
+	var newest *Handle
+	newestSize := h.buf.Size()
+	set.forEach(func(other *Handle) bool {
+		if other == h || !other.dirty || other.buf == nil {
+			return true
+		}
+		other.mu.Lock()
+		size := int64(-1)
+		if other.buf != nil {
+			size = other.buf.Size()
+		}
+		other.mu.Unlock()
+		if size > newestSize {
+			newest, newestSize = other, size
+		}
+		return true
+	})
+	if newest == nil {
+		return nil
+	}
+	ourSize := h.buf.Size()
+	tail := make([]byte, newestSize-ourSize)
+	newest.mu.Lock()
+	defer newest.mu.Unlock()
+	if !newest.dirty || newest.buf == nil || newest.buf.Size() < newestSize {
+		return nil // raced with a flush; the rebase retry at flush covers it
+	}
+	if err := newest.buf.EnsurePartsForWrite(ourSize, int64(len(tail))); err != nil {
+		return err
+	}
+	n := newest.buf.ReadAt(ourSize, tail)
+	if n <= 0 {
+		return nil
+	}
+	if _, err := h.buf.Write(ourSize, tail[:n]); err != nil {
+		return err
 	}
 	return nil
 }
@@ -967,8 +1138,8 @@ func (h *Handle) retarget(newPath string) {
 	if old == newPath {
 		return
 	}
-	h.a.live.Delete(old)
-	h.a.live.Store(newPath, h)
+	h.a.untrack(h)
+	h.a.track(h)
 }
 
 // recordUserWrite updates tail-safety and the WAL header coverage mask
@@ -1156,5 +1327,8 @@ func mapErr(err error) error {
 	if errno, ok := err.(syscall.Errno); ok {
 		return errno
 	}
-	return err
+	// Everything else keeps the frozen v1 errno table (401/403 EACCES,
+	// 5xx/timeouts EAGAIN, quota EDQUOT/EFBIG, ...) instead of collapsing
+	// to EIO at the facade.
+	return &fs.StatusError{Status: httperr.HTTPStatusOf(err)}
 }

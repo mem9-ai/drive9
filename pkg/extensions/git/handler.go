@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -45,16 +46,57 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 	g.ensure(ctx)
 	w, rel, ok := g.workspaceFor(op.Path)
 	if !ok {
-		return next(ctx, op)
+		// A workspace registered after this mount started (git clone
+		// --fast runs the CLI registration server-side) is invisible to
+		// the start-time list; re-list on the miss, throttled. Dormant
+		// mounts arm on .git-segment ops only (v1): ordinary FS traffic
+		// on a workspace-free root never lists.
+		g.mu.RLock()
+		armed := g.armed
+		g.mu.RUnlock()
+		if pathHasGitDirSegment(op.Path) && !armed {
+			// A .git-segment op may arm the dormant plane (v1 G2), but
+			// only when an arm source actually suggests workspaces exist:
+			// local markers, or root-relevant index entries. G0's dormant
+			// .git activity on a workspace-free root stays at zero lists.
+			g.tryArmFromLocalSignals()
+			g.maybeArmFromIndex(ctx)
+			g.mu.RLock()
+			armed = g.armed
+			g.mu.RUnlock()
+		}
+		if armed {
+			g.reloadIfStale(ctx)
+		}
+		w, rel, ok = g.workspaceFor(op.Path)
+		if !ok {
+			return next(ctx, op)
+		}
 	}
 
 	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
 		e, hit := w.lookup(rel)
 		if !hit {
+			// Fast-clone view (v1 gitEntry): clean files resolve from the
+			// HEAD tree before the base view.
+			if n, tok := w.treeLookup(rel); tok {
+				if n.Kind == "dir" || n.Kind == "symlink" || n.ObjectSHA != "" {
+					attr := treeAttr(n, w.cleanTreeMtime())
+					// An unknown size resolves once via cat-file and is
+					// remembered on the node: re-resolving per stat let a
+					// single failed exec flap the served size and pin git
+					// status entries as modified.
+					if n.SizeBytes < 0 && (n.Kind == "file" || n.Kind == "symlink") && n.ObjectSHA != "" {
+						attr.Size = g.blobSize(w, n.ObjectSHA)
+						w.noteTreeSize(rel, attr.Size)
+					}
+					return fs.Result{Attr: &attr}, nil
+				}
+			}
 			return next(ctx, op)
 		}
-		if e.Op == "delete" {
+		if e.Op == "whiteout" {
 			return fs.Result{}, fs.ErrNotFound
 		}
 		kind := kindOf(e)
@@ -68,15 +110,23 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 				mode = 0o777
 			}
 		}
-		return fs.Result{Attr: &fs.Attr{Kind: kind, Mode: mode, Size: int64(len(e.Content))}}, nil
+		size := int64(len(e.Content))
+		if e.remote {
+			size = e.size
+		}
+		return fs.Result{Attr: &fs.Attr{Kind: kind, Mode: mode, Size: size}}, nil
 
 	case fs.OpReadlink:
 		if e, hit := w.lookup(rel); hit {
-			if e.Op == "delete" {
+			if e.Op == "whiteout" {
 				return fs.Result{}, fs.ErrNotFound
 			}
 			if e.Kind == "symlink" {
 				return fs.Result{Data: e.Content}, nil
+			}
+		} else if n, tok := w.treeLookup(rel); tok && n.Kind == "symlink" {
+			if data, err := g.materializeBlob(w, n.ObjectSHA); err == nil {
+				return fs.Result{Data: data}, nil
 			}
 		}
 		return next(ctx, op)
@@ -86,8 +136,13 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 			return next(ctx, op)
 		}
 		if e, hit := w.lookup(rel); hit {
-			if e.Op == "delete" {
+			if e.Op == "whiteout" {
 				return fs.Result{}, fs.ErrNotFound
+			}
+			if e.remote {
+				// Storage-backed overlay payload: the base view serves it
+				// until a local write mirrors inline content.
+				return next(ctx, op)
 			}
 			data := e.Content
 			if op.Offset > 0 || op.Limit > 0 {
@@ -105,6 +160,27 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 				data = data[off:end]
 			}
 			return fs.Result{Data: data}, nil
+		}
+		// Fast-clone view: materialize the blob from the restored local
+		// .git (v1 materializeGitBlob).
+		if n, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
+			if data, err := g.materializeBlob(w, n.ObjectSHA); err == nil {
+				if op.Offset > 0 || op.Limit > 0 {
+					off := op.Offset
+					if off < 0 {
+						off = 0
+					}
+					if off >= int64(len(data)) {
+						return fs.Result{}, nil
+					}
+					end := int64(len(data))
+					if op.Limit > 0 && off+op.Limit < end {
+						end = off + op.Limit
+					}
+					data = data[off:end]
+				}
+				return fs.Result{Data: data}, nil
+			}
 		}
 		return next(ctx, op)
 
@@ -139,12 +215,18 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 
 	case fs.OpCreate:
 		if hasWriteIntent(op.Flags) {
-			if e, hit := w.lookup(rel); !hit || (e.Op == "upsert" && e.Kind == "file") {
+			e, hit := w.lookup(rel)
+			// A whiteout is a miss for a create: unlink+recreate (git's
+			// checkout_entry) must land the new file in the overlay —
+			// falling through to the base plane would create it remotely
+			// with a default 0644 mode under a still-active whiteout.
+			whiteoutCreate := hit && e.Op == "whiteout" && op.Flags&uint32(syscall.O_CREAT) != 0
+			if !hit || (e.Op == "upsert" && e.Kind == "file") || whiteoutCreate {
 				h, cerr := g.claimWorkspaceOpen(w, op.Path, rel, op.Flags, op.Mode)
 				if cerr != nil {
 					return fs.Result{}, cerr
 				}
-				if op.Flags&uint32(syscall.O_CREAT) != 0 && !hit {
+				if op.Flags&uint32(syscall.O_CREAT) != 0 && (!hit || whiteoutCreate) {
 					h.mu.Lock()
 					h.dirty = true
 					h.mu.Unlock()
@@ -157,14 +239,31 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		if op.Flags&uint32(syscall.O_CREAT) == 0 {
 			// plain open: overlay files report their overlay attr
 			if e, hit := w.lookup(rel); hit {
-				if e.Op == "delete" {
+				if e.Op == "whiteout" {
 					return fs.Result{}, fs.ErrNotFound
 				}
 				mode := parseMode(e.Mode)
 				if mode == 0 {
 					mode = 0o644
 				}
-				return fs.Result{Attr: &fs.Attr{Kind: kindOf(e), Mode: mode, Size: int64(len(e.Content))}}, nil
+				mtime := e.mtime
+				if mtime.IsZero() {
+					mtime = w.cleanTreeMtime()
+				}
+				return fs.Result{Attr: &fs.Attr{Kind: kindOf(e), Mode: mode, Size: int64(len(e.Content)), Mtime: mtime}}, nil
+			}
+			// A clean tree file has no base-plane entry: a read-only
+			// open that fell through would wrap a 404 remote handle and
+			// every read EIOs. Claim it and serve the materialized blob.
+			if n, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
+				h := &gitHandle{g: g, w: w, path: op.Path, rel: rel, flags: op.Flags,
+					treeSHA: n.ObjectSHA, mode: parseMode(n.Mode)}
+				if h.mode == 0 {
+					h.mode = 0o644
+				}
+				g.trackWorkspace(op.Path, h)
+				attr := h.Attr()
+				return fs.Result{Handle: h, Attr: &attr}, nil
 			}
 			return next(ctx, op)
 		}
@@ -195,7 +294,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		if h := g.handleFor(op.Path); h != nil && op.Kind == fs.OpUnlink {
 			h.markUnlinked()
 		}
-		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "delete", Kind: "file"}); err != nil {
+		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "whiteout", Kind: "file"}); err != nil {
 			return fs.Result{}, err
 		}
 		g.emit(op.Path)
@@ -229,7 +328,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		}
 		if op.Mode != 0 {
 			if e, hit := w.lookup(rel); hit && e.Op == "upsert" {
-				e.Mode = fmt.Sprintf("100%04o", op.Mode&0o777)
+				e.Mode = fmt.Sprintf("%o", 0o100000|op.Mode&0o777)
 				if err := g.putOverlay(ctx, w, rel, e); err != nil {
 					return fs.Result{}, err
 				}
@@ -254,6 +353,13 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 // putOverlay persists one overlay entry server-side then mirrors it
 // locally.
 func (g *Git) putOverlay(ctx context.Context, w *workspace, rel string, e overlayEntry) error {
+	// Path-addressed writes hand us op.Data — a slice of go-fuse's POOLED
+	// request buffer, recycled for the next request (a READDIR's dirent
+	// bytes) the moment this one completes. The entry (and the local
+	// mirror) must own a copy or the stored image mutates in place.
+	if len(e.Content) > 0 {
+		e.Content = append([]byte(nil), e.Content...)
+	}
 	_, err := g.cl.PutGitOverlayEntry(ctx, w.id, client.GitOverlayEntryRequest{
 		Path:    rel,
 		Op:      e.Op,
@@ -264,6 +370,10 @@ func (g *Git) putOverlay(ctx context.Context, w *workspace, rel string, e overla
 	if err != nil {
 		return err
 	}
+	// Our own write stamps a fresh landed time: the rewrite's served stat
+	// must advance past whatever the index last recorded (a rewrite with
+	// an unchanged mtime stays racily clean and git re-hashes forever).
+	e.mtime = time.Now()
 	w.set(rel, e)
 	return nil
 }
@@ -281,13 +391,13 @@ func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error 
 		return fmt.Errorf("git: rename crosses workspace roots")
 	}
 	if e, hit := wOld.lookup(relOld); hit {
-		if e.Op == "delete" {
+		if e.Op == "whiteout" {
 			return fs.ErrNotFound
 		}
 		if err := g.putOverlay(ctx, wNew, relNew, e); err != nil {
 			return err
 		}
-		return g.putOverlay(ctx, wOld, relOld, overlayEntry{Op: "delete", Kind: e.Kind})
+		return g.putOverlay(ctx, wOld, relOld, overlayEntry{Op: "whiteout", Kind: e.Kind})
 	}
 	// base content moves through one fetch + upsert
 	st, err := g.cl.StatCtx(ctx, oldPath)
@@ -303,12 +413,12 @@ func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error 
 	}
 	mode := "100644"
 	if st.HasMode {
-		mode = fmt.Sprintf("100%04o", st.Mode&0o777)
+		mode = fmt.Sprintf("%o", 0o100000|st.Mode&0o777)
 	}
 	if err := g.putOverlay(ctx, wNew, relNew, overlayEntry{Op: "upsert", Kind: "file", Content: data, Mode: mode}); err != nil {
 		return err
 	}
-	return g.putOverlay(ctx, wOld, relOld, overlayEntry{Op: "delete", Kind: "file"})
+	return g.putOverlay(ctx, wOld, relOld, overlayEntry{Op: "whiteout", Kind: "file"})
 }
 
 // listMerged overlays the workspace's children on the base listing.
@@ -321,7 +431,11 @@ func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.
 	for _, e := range res.Entries {
 		out[e.Name] = e
 	}
-	prefixRel := strings.Trim(strings.TrimPrefix(strings.TrimPrefix(dir, w.root), "/"), "/")
+	prefixRel := strings.Trim(strings.TrimPrefix(strings.TrimPrefix(dir, w.rootPath()), "/"), "/")
+	// Compute the stable clean-tree time BEFORE taking the workspace read
+	// lock: cleanTreeMtime re-acquires it, and Go's RWMutex deadlocks a
+	// recursive reader as soon as one writer queues behind the outer hold.
+	cleanMtime := w.cleanTreeMtime()
 	w.mu.RLock()
 	for rel, e := range w.overlay {
 		if prefixRel != "" && !strings.HasPrefix(rel, prefixRel+"/") {
@@ -331,7 +445,7 @@ func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.
 		if name == "" || strings.Contains(name, "/") {
 			continue
 		}
-		if e.Op == "delete" {
+		if e.Op == "whiteout" {
 			delete(out, name)
 			continue
 		}
@@ -344,9 +458,55 @@ func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.
 				mode = 0o644
 			}
 		}
-		out[name] = fs.Entry{Name: name, Attr: fs.Attr{Kind: kind, Mode: mode, Size: int64(len(e.Content))}}
+		size := int64(len(e.Content))
+		if e.remote {
+			size = e.size
+		}
+		mtime := e.mtime
+		if mtime.IsZero() {
+			mtime = cleanMtime
+		}
+		out[name] = fs.Entry{Name: name, Attr: fs.Attr{Kind: kind, Mode: mode, Size: size, Mtime: mtime}}
+	}
+	// Fast-clone view (v1 listGitDir): tree children the base and overlay
+	// do not already cover appear from the HEAD tree.
+	type unresolved struct {
+		rel  string
+		sha  string
+		name string
+	}
+	var pending []unresolved
+	for rel, n := range w.tree {
+		if prefixRel != "" && !strings.HasPrefix(rel, prefixRel+"/") {
+			continue
+		}
+		name := strings.TrimPrefix(rel, prefixRel+"/")
+		if name == "" || strings.Contains(name, "/") {
+			continue
+		}
+		if _, covered := out[name]; covered {
+			continue
+		}
+		attr := treeAttr(n, cleanMtime)
+		// Listing rows feed READDIRPLUS, whose attrs the kernel applies
+		// directly to the inode: an unresolved blobless size (placeholder
+		// 0) retires a known-good i_size and every later read returns
+		// empty. Resolve unknown file/symlink sizes once via cat-file —
+		// OUTSIDE the workspace read lock: noteTreeSize writes.
+		if n.SizeBytes < 0 && (n.Kind == "file" || n.Kind == "symlink") && n.ObjectSHA != "" {
+			pending = append(pending, unresolved{rel: rel, sha: n.ObjectSHA, name: name})
+		}
+		out[name] = fs.Entry{Name: name, Attr: attr}
 	}
 	w.mu.RUnlock()
+	for _, u := range pending {
+		size := g.blobSize(w, u.sha)
+		w.noteTreeSize(u.rel, size)
+		if e, ok := out[u.name]; ok && size > 0 {
+			e.Attr.Size = size
+			out[u.name] = e
+		}
+	}
 	entries := make([]fs.Entry, 0, len(out))
 	for _, e := range out {
 		entries = append(entries, e)

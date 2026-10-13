@@ -443,6 +443,47 @@ func Mount(opts *MountOptions) error {
 	})
 }
 
+// resolveKernelTTLDefaults ports v1 setDefaults' profile-dependent kernel
+// cache TTLs (kept as a named function so white-box tests pin the profile
+// rows): 60s attr/entry, 30s attr on coding-agent, interactive drops
+// attr/entry to 1s and listings to 2s; explicit (positive) values win.
+func resolveKernelTTLDefaults(profile string, attrTTL, entryTTL, dirTTL time.Duration) (time.Duration, time.Duration, time.Duration) {
+	if attrTTL <= 0 {
+		attrTTL = 60 * time.Second
+		if profile == "coding-agent" {
+			attrTTL = 30 * time.Second
+		}
+		if profile == "interactive" {
+			attrTTL = 1 * time.Second
+		}
+	}
+	if entryTTL <= 0 {
+		entryTTL = 60 * time.Second
+		if profile == "interactive" {
+			entryTTL = 1 * time.Second
+		}
+	}
+	if dirTTL <= 0 {
+		dirTTL = 10 * time.Second
+		if profile == "interactive" {
+			dirTTL = 2 * time.Second
+		}
+	}
+	return attrTTL, entryTTL, dirTTL
+}
+
+// resolveWriteCacheSizeMB ports the v1 write-cache quota knob semantics:
+// zero uses the 1024 MiB default, negative disables the byte quota (0).
+func resolveWriteCacheSizeMB(sizeMB int64) int64 {
+	if sizeMB == 0 {
+		return 1024
+	}
+	if sizeMB < 0 {
+		return 0
+	}
+	return sizeMB
+}
+
 // MountWithConfig assembles the fuse stack from the raw internal config and
 // serves until unmounted. Mount(MountOptions) is the stable entry; this form
 // exists for the CLI bridge and white-box tests that already hold a config.
@@ -483,6 +524,10 @@ func MountWithConfig(cfg MountConfig) error {
 	if err != nil {
 		return err
 	}
+	// sharedCounters exists before the extension chain: the git
+	// extension's refresh accounting needs the same instance the FS
+	// summary prints.
+	sharedCounters := perf.NewCounters(cfg.PerfCounters || cfg.PerfSamplesPath != "")
 	wantExt := make(map[string]bool, len(extOrder))
 	for _, name := range extOrder {
 		wantExt[name] = true
@@ -545,12 +590,15 @@ func MountWithConfig(cfg MountConfig) error {
 			Events:             bus,
 			MaxSize:            cfg.CacheSize,
 			TTL:                cfg.ReadCacheTTL,
-			SequentialPrefetch: cfg.ReadDirPrefetch || cfg.PrefetchMaxFiles > 0,
+			SequentialPrefetch: true,
 			PrefetchClient:     cl,
 			RemoteRoot:         remoteRoot,
-			// v1 readdir content prefetch (sibling metadata/directory
-			// prefetch are always-on machinery inside the extension).
-			DirContentPrefetch:   cfg.ReadDirPrefetch || cfg.PrefetchMaxFiles > 0,
+			// v1 --parallel-read-concurrency/block-size (defaults 4 x 1MiB).
+			ParallelReadConcurrency: cfg.ParallelReadConcurrency,
+			ParallelReadBlockSize:   cfg.ParallelReadBlockSize,
+			// v1 readdir content prefetch: --readdir-prefetch only (default
+			// off — the max-files knob alone does not enable it).
+			DirContentPrefetch:   cfg.ReadDirPrefetch,
 			PrefetchMaxFiles:     cfg.PrefetchMaxFiles,
 			PrefetchMaxFileBytes: cfg.PrefetchMaxFileBytes,
 			PrefetchMaxBytes:     cfg.PrefetchMaxBytes,
@@ -579,23 +627,24 @@ func MountWithConfig(cfg MountConfig) error {
 	// The v1 small-file writeback track (.dat/.meta + 16-worker uploader)
 	// rides the mount-scoped cache namespace under its own name.
 	writeCacheDir := cacheScopedDir(cacheBase, mountHash, "writecache")
-	// The staging ledger + commit queue exist only for the async writeback
-	// policy: write-sync commits inline per Write and close-sync at Release,
-	// so neither needs shadow/pending/journal machinery. The cache plugin
-	// stays regardless — its READ caches serve every policy; only its
-	// staging role is policy-bound.
+	// The staging ledger + commit queue serve the async writeback policy
+	// (shadow/pending/journal machinery); close-sync ALSO gets the ledger
+	// for its v1 shadow-backed large-file close uploads (bounded-memory
+	// staging + streamed landing). Write-sync commits inline per Write and
+	// needs none of it. The cache plugin stays regardless — its READ caches
+	// serve every policy; only its staging role is policy-bound.
 	var stagingLedger *staging.Staging
-	if policy == writeback.PolicyWriteBack && cacheBase != "" {
+	if (policy == writeback.PolicyWriteBack || policy == writeback.PolicyCloseSync) && cacheBase != "" {
 		// v1 write-cache quota (defaults freeRatio 0.10, 1024 MiB): the
 		// shadow store refuses writes past the budget with ENOSPC.
+		// v1 knobs: zero uses the default, negative disables the check.
 		freeRatio := cfg.WriteCacheFreeRatio
-		if freeRatio <= 0 {
+		if freeRatio == 0 {
 			freeRatio = 0.10
+		} else if freeRatio < 0 {
+			freeRatio = 0
 		}
-		cacheSizeMB := cfg.WriteCacheSizeMB
-		if cacheSizeMB <= 0 {
-			cacheSizeMB = 1024
-		}
+		cacheSizeMB := resolveWriteCacheSizeMB(cfg.WriteCacheSizeMB)
 		// The ledger's internal layout (shadow/, pending/, journal.wal) is
 		// the v1 mount-scoped one: root it at the mount hash directly.
 		stagingLedger, err = staging.NewStagingWithQuota(filepath.Join(cacheBase, mountHash), freeRatio, cacheSizeMB)
@@ -637,6 +686,22 @@ func MountWithConfig(cfg MountConfig) error {
 		built["renameguard"] = renameGuard
 	}
 
+	// v1 EnableGitWorkspaces (default off): the git extension's workspace
+	// discovery is opt-in — overlay mounts (LocalRoot) arm it via the CLI.
+	// Constructed before localize so its declarative routing (a workspace's
+	// .git stays local, v1 gitDirShouldBeLocalOverlay) wires into the
+	// overlay router.
+	var gitExt *git.Git
+	if wantExt["git"] && cfg.EnableGitWorkspaces {
+		var gerr error
+		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot,
+			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh})
+		if gerr != nil {
+			return fmt.Errorf("fuse: git extension: %w", gerr)
+		}
+		built["git"] = gitExt
+	}
+
 	// localize routes declared local-only paths to the local overlay
 	// (v1 local_overlay/local_policy semantics).
 	if wantExt["localize"] && cfg.LocalRoot != "" {
@@ -647,6 +712,12 @@ func MountWithConfig(cfg MountConfig) error {
 			RemoteOnlyPatterns:          cfg.RemoteOnlyPatterns,
 			Profile:                     cfg.Profile,
 			ApplyBuiltinDefaults:        !cfg.DisableBuiltinOverlayDefaults,
+		}
+		if gitExt != nil {
+			// v1 gitDirShouldBeLocalOverlay: a discovered workspace's .git
+			// routes to the local overlay (the restored .git state backs
+			// git's own file traffic, not the remote).
+			localizeOpts.DeclarativeLocal = gitExt.RoutesLocal
 		}
 		if cacheBase != "" && !cfg.ReadOnly {
 			// SQLite WAL-index sidecars (-shm) are mount-local scratch:
@@ -684,15 +755,6 @@ func MountWithConfig(cfg MountConfig) error {
 		}
 		built["layer"] = layerExt
 	}
-	// v1 EnableGitWorkspaces (default off): the git extension's workspace
-	// discovery is opt-in — overlay mounts (LocalRoot) arm it via the CLI.
-	if wantExt["git"] && cfg.EnableGitWorkspaces {
-		gitExt, gerr := git.New(git.Options{Client: cl, Events: bus, LocalRoot: cfg.LocalRoot})
-		if gerr != nil {
-			return fmt.Errorf("fuse: git extension: %w", gerr)
-		}
-		built["git"] = gitExt
-	}
 
 	// The extent plane claims ahead of the classic data path (cache and
 	// writeback never see extent files). Gated on the --extent paths /
@@ -706,6 +768,9 @@ func MountWithConfig(cfg MountConfig) error {
 			Client:      cl,
 			RemoteRoot:  remoteRoot,
 			CacheDir:    cacheScopedDir(cacheBase, mountHash, "jfs"),
+			// v1: write-sync mounts pay a per-Write VFS flush on the extent
+			// plane too.
+			Policy: cfg.WritePolicy,
 		})
 		if err != nil {
 			return fmt.Errorf("fuse: extent extension: %w", err)
@@ -752,6 +817,12 @@ func MountWithConfig(cfg MountConfig) error {
 
 	var wb *writeback.Writeback
 	if wantExt["writeback"] {
+		flushDebounce := cfg.FlushDebounce
+		if cfg.Profile == "interactive" {
+			// v1 ApplyInteractiveProfile disables the debouncer outright
+			// ("replaced by shadow writes").
+			flushDebounce = 0
+		}
 		var werr error
 		wb, werr = writeback.New(writeback.Options{
 			Policy:                policy,
@@ -761,7 +832,7 @@ func MountWithConfig(cfg MountConfig) error {
 			RemoteRoot:            remoteRoot,
 			Events:                bus,
 			Staging:               stagingLedger,
-			FlushDebounce:         cfg.FlushDebounce,
+			FlushDebounce:         flushDebounce,
 			UploadConcurrency:     cfg.UploadConcurrency,
 			CommitQueueMaxPending: cfg.CommitQueueMaxPending,
 			BatchWindow:           cfg.WriteBackBatchWindow,
@@ -771,6 +842,9 @@ func MountWithConfig(cfg MountConfig) error {
 			// detached (v1).
 			InterruptibleCommits:    cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,
 			RemoteCommitWaitTimeout: cfg.RemoteCommitWaitTimeout,
+			// v1 --writeback-lazy-staging / --writeback-sync-window.
+			LazyStaging: cfg.WritebackLazyStaging,
+			SyncWindow:  cfg.WritebackSyncWindow,
 		})
 		if werr != nil {
 			return fmt.Errorf("fuse: writeback extension: %w", werr)
@@ -785,6 +859,7 @@ func MountWithConfig(cfg MountConfig) error {
 		// this mount's own writes (read-your-writes), and preloads cannot
 		// 404 inside the lag window.
 		wb.SetCommitSeeder(readCache.SeedCommit)
+		wb.SetPendingSeeder(readCache.SeedPending)
 		wb.SetBaseReader(func(path string) ([]byte, bool) {
 			return readCache.ReadCached(path, 0)
 		})
@@ -801,14 +876,11 @@ func MountWithConfig(cfg MountConfig) error {
 	}
 
 	// v1 setDefaults: kernel attr/entry caches default to 60s (30s attr on
-	// the coding-agent profile), negative entries 1s, listings 10s.
-	attrTTL := cfg.AttrTTL
-	if attrTTL <= 0 {
-		attrTTL = 60 * time.Second
-		if cfg.Profile == "coding-agent" {
-			attrTTL = 30 * time.Second
-		}
-	}
+	// the coding-agent profile), negative entries 1s, listings 10s. The
+	// interactive profile (v1 ApplyInteractiveProfile) drops attr/entry to
+	// 1s, listings to 2s, and disables the flush debounce — zero values
+	// only, so explicit flags still win.
+	attrTTL, entryTTL, dirTTL := resolveKernelTTLDefaults(cfg.Profile, cfg.AttrTTL, cfg.EntryTTL, cfg.DirTTL)
 	// View extensions that own directories (localize overlays, layer
 	// view) must see dir GetAttrs go through the chain; every other stack
 	// serves root/dir attrs from the inode table (v1).
@@ -829,12 +901,14 @@ func MountWithConfig(cfg MountConfig) error {
 		Extensions:         chainHandlers,
 		Events:             bus,
 		AttrTTL:            attrTTL,
-		EntryTTL:           cfg.EntryTTL,
+		EntryTTL:           entryTTL,
 		NegEntryTTL:        cfg.NegativeEntryTTL,
-		DirTTL:             cfg.DirTTL,
+		DirTTL:             dirTTL,
 		DirCacheMaxEntries: cfg.DirCacheMaxEntries,
 		LocalDirAttrs:      localDirAttrs,
 		Perf:               cfg.PerfCounters || cfg.PerfSamplesPath != "",
+		PerfCounters:       sharedCounters,
+		Debug:              cfg.Debug,
 		GVisorCompat:       cfg.GVisorCompat,
 	})
 	if err != nil {
@@ -867,6 +941,7 @@ func MountWithConfig(cfg MountConfig) error {
 	}
 	perfRecorder.SetEnv(&perf.ContinuousPerfEnv{
 		MountPoint: f.mountPoint(), RemoteRoot: f.remoteRootTag(), Server: f.serverTag(),
+		SyncMode: syncMode, WritePolicy: cfg.WritePolicy, Profile: cfg.Profile,
 	})
 	perfRecorder.SetPerf(f.perf)
 	if wb != nil {
@@ -879,6 +954,8 @@ func MountWithConfig(cfg MountConfig) error {
 				stats.CommitPending = q.Pending()
 				_, stats.CommitPendingBytes = q.PendingStats()
 			}
+			stats.UploaderQueued, stats.UploaderInFlight = wb.UploaderSnapshot()
+			stats.DirtyInodes = wb.DirtyHandleCount()
 			return stats
 		})
 	}
@@ -967,31 +1044,7 @@ func MountWithConfig(cfg MountConfig) error {
 		}()
 	}
 
-	fuseOpts := &gofuse.MountOptions{
-		FsName:             "drive9",
-		Name:               "drive9",
-		MaxReadAhead:       8 * 1024 * 1024,
-		MaxWrite:           128 * 1024,
-		MaxBackground:      32,
-		EnableLocks:        true,
-		Debug:              cfg.Debug,
-		AllowOther:         cfg.AllowOther,
-		EnableDirectIoMmap: true,
-		SyncRead:           cfg.SyncRead,
-		DirectMountStrict:  cfg.DirectMountStrict,
-	}
-	if runtime.GOOS == "linux" {
-		fuseOpts.MaxWrite = 1024 * 1024
-		if cfg.AllowOther {
-			fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
-		}
-	}
-	if runtime.GOOS == "darwin" {
-		fuseOpts.Options = append(fuseOpts.Options, "defer_permissions", "local")
-	}
-	if cfg.ReadOnly {
-		fuseOpts.Options = append(fuseOpts.Options, "ro")
-	}
+	fuseOpts := newGoFuseMountOptions(cfg)
 
 	server, err := gofuse.NewServer(f, cfg.MountPoint, fuseOpts)
 	if err != nil {
@@ -1019,6 +1072,22 @@ func MountWithConfig(cfg MountConfig) error {
 		defer close(serveDone)
 		server.Serve()
 	}()
+	// A plugin that failed its Start leaves the stack degraded (a layer
+	// checkpoint that could not restore serves an empty/read-only view):
+	// the mount must fail instead of reporting success (review: Init2's
+	// startErr was saved but never checked).
+	if err := f.StartErr(); err != nil {
+		fmt.Fprintf(os.Stderr, "drive9: mount startup failed during extension start at %s: %v\n", cfg.MountPoint, err)
+		if uerr := server.Unmount(); uerr != nil {
+			fmt.Fprintf(os.Stderr, "drive9: cleanup after extension start failure: unmount failed: %v\n", uerr)
+			forceUnmount(cfg.MountPoint)
+		}
+		select {
+		case <-serveDone:
+		case <-time.After(10 * time.Second):
+		}
+		return ExitStartupTransientErr("extension start", err)
+	}
 	if err := server.WaitMount(); err != nil {
 		// v1 shouldContinueAfterWaitMountPermissionError: Linux pollHack can
 		// surface EACCES/EPERM for a mount that is actually serving; the
@@ -1078,8 +1147,11 @@ func MountWithConfig(cfg MountConfig) error {
 		}()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		fmt.Fprintf(os.Stderr, "DBG-CKPT sig-flush-begin\n")
 		_ = f.flushOpenHandles(shutdownCtx)
+		fmt.Fprintf(os.Stderr, "DBG-CKPT sig-flush-end\n")
 		_ = f.chain.Drain(shutdownCtx)
+		fmt.Fprintf(os.Stderr, "DBG-CKPT sig-drain-end\n")
 		for attempt := 0; attempt < 5; attempt++ {
 			if err := server.Unmount(); err == nil {
 				return
@@ -1360,4 +1432,36 @@ func forceUnmount(mountpoint string) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "drive9: force unmount: no fusermount/umount available\n")
+}
+
+// newGoFuseMountOptions renders the kernel mount options from the config
+// (v1 newGoFuseMountOptions). Linux allow-other mounts bind
+// default_permissions — the ext4-parity EACCES contract from #1006.
+func newGoFuseMountOptions(cfg MountConfig) *gofuse.MountOptions {
+	opts := &gofuse.MountOptions{
+		FsName:             "drive9",
+		Name:               "drive9",
+		MaxReadAhead:       8 * 1024 * 1024,
+		MaxWrite:           128 * 1024,
+		MaxBackground:      32,
+		EnableLocks:        true,
+		Debug:              cfg.Debug,
+		AllowOther:         cfg.AllowOther,
+		EnableDirectIoMmap: true,
+		SyncRead:           cfg.SyncRead,
+		DirectMountStrict:  cfg.DirectMountStrict,
+	}
+	if runtime.GOOS == "linux" {
+		opts.MaxWrite = 1024 * 1024
+		if cfg.AllowOther {
+			opts.Options = append(opts.Options, "default_permissions")
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		opts.Options = append(opts.Options, "defer_permissions", "local")
+	}
+	if cfg.ReadOnly {
+		opts.Options = append(opts.Options, "ro")
+	}
+	return opts
 }

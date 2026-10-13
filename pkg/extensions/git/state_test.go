@@ -51,6 +51,9 @@ func newGitExt(t *testing.T, b *testbackend.Backend, localRoot string) (*Git, *c
 	if err != nil {
 		t.Fatal(err)
 	}
+	// These suites exercise the armed serving plane directly; the on-demand
+	// dormant gate is covered by the discovery e2e.
+	g.armed = true
 	return g, cl, bus
 }
 
@@ -68,7 +71,7 @@ func TestPortGitStateCheckpointUploadsPackAndArchive(t *testing.T) {
 	// A real repository in the local overlay under the workspace root,
 	// with a bare remote the restore clones its base objects from (v1
 	// restoreGitObjectsFromRemote).
-	repo := filepath.Join(localRoot, "repo")
+	repo := filepath.Join(localRoot, "overlay", "repo")
 	if err := os.MkdirAll(repo, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +107,8 @@ func TestPortGitStateRestoreOnStart(t *testing.T) {
 	gitBin(t)
 	b := testbackend.NewBackend()
 	localRoot := t.TempDir()
-	repo := filepath.Join(localRoot, "repo")
+	// gitDirFor roots the workspace .git under <localRoot>/overlay.
+	repo := filepath.Join(localRoot, "overlay", "repo")
 	bare := filepath.Join(t.TempDir(), "base.git")
 	if err := os.MkdirAll(repo, 0o755); err != nil {
 		t.Fatal(err)
@@ -127,7 +131,11 @@ func TestPortGitStateRestoreOnStart(t *testing.T) {
 	}
 
 	// Crash: wipe the local overlay (keeping the server's checkpoint).
-	if err := os.RemoveAll(repo); err != nil {
+	// The overlay roots view paths under <localRoot>/overlay (localize's
+	// NewOverlay), and the restored .git lands at the same layout the
+	// CLI's LocalGitDir expects.
+	overlayRepo := filepath.Join(localRoot, "overlay", "repo")
+	if err := os.RemoveAll(overlayRepo); err != nil {
 		t.Fatal(err)
 	}
 
@@ -138,19 +146,19 @@ func TestPortGitStateRestoreOnStart(t *testing.T) {
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(filepath.Join(repo, ".git", "HEAD")); err == nil {
+		if _, err := os.Stat(filepath.Join(overlayRepo, ".git", "HEAD")); err == nil {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if _, err := os.Stat(filepath.Join(repo, ".git", "HEAD")); err != nil {
+	if _, err := os.Stat(filepath.Join(overlayRepo, ".git", "HEAD")); err != nil {
 		t.Fatal("restore did not recreate the local .git directory")
 	}
-	restored := run(t, repo, "rev-parse", "HEAD")
+	restored := run(t, overlayRepo, "rev-parse", "HEAD")
 	if restored != head {
 		t.Fatalf("restored HEAD = %s, want %s", restored, head)
 	}
-	if out := run(t, repo, "cat-file", "-p", "HEAD^{commit}"); !strings.Contains(out, "one") {
+	if out := run(t, overlayRepo, "cat-file", "-p", "HEAD^{commit}"); !strings.Contains(out, "one") {
 		t.Fatalf("restored commit content missing: %q", out)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strings"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -71,4 +72,21 @@ func isConflictErr(err error) bool {
 	}
 	var se *client.StatusError
 	return errors.As(err, &se) && se.StatusCode == http.StatusConflict
+}
+
+// isCreateActionUnsupportedErr ports v1: backends that reject the create
+// POST action outright (404, or 400/405 carrying the action markers).
+func isCreateActionUnsupportedErr(err error) bool {
+	var se *client.StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	if se.StatusCode == http.StatusNotFound {
+		return true
+	}
+	if se.StatusCode != http.StatusBadRequest && se.StatusCode != http.StatusMethodNotAllowed {
+		return false
+	}
+	msg := strings.ToLower(se.Message)
+	return strings.Contains(msg, "unknown post action") || strings.Contains(msg, "method not allowed")
 }

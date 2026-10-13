@@ -17,14 +17,23 @@ type streamHandle struct {
 	below     fs.Filesystem
 	openFlags uint32 // claim flags for re-opening the session below after a rename
 
-	mu       sync.Mutex
-	image    []byte
-	mode     uint32
-	pushed   int64 // image size already expressed below; a shorter image needs a truncation
-	dirty    bool  // image differs from the state expressed below
-	unlinked bool  // directory entry gone; boundary pushes are discarded
-	released bool
+	mu          sync.Mutex
+	image       []byte
+	mode        uint32
+	pushed      int64 // image size already expressed below; a shorter image needs a truncation
+	dirty       bool  // image differs from the state expressed below
+	unlinked    bool  // directory entry gone; boundary pushes are discarded
+	released    bool
+	passthrough bool // image overflowed the bound; the stream forwards to the plane below
 }
+
+// bulkfileMaxBufferedBytes bounds the claimed image retained in memory
+// before the claim hands the stream to the write plane below (whose own
+// buffering spills to parts/shadow files). A write ending beyond the bound
+// — a sparse hole or a sequential stream growing past it — forwards
+// instead of allocating the full logical image (one byte at 64 MiB must
+// not allocate 64 MiB).
+const bulkfileMaxBufferedBytes = 8 << 20
 
 // applyAttr folds a setattr into the pending image: a size change edits the
 // image in place (the truncation stays local until the boundary pushes
@@ -46,17 +55,48 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 		size := op.Size
 		if size < int64(len(h.image)) {
 			h.image = h.image[:size]
+			h.dirty = true
+		} else if size > bulkfileMaxBufferedBytes {
+			// A zero-fill grow past the bound must not allocate the hole:
+			// land the buffered prefix and express the truncation in the
+			// plane below (its SetAttr holds the size without the bytes).
+			h.mu.Unlock()
+			if err := h.push(ctx); err != nil {
+				h.mu.Lock()
+				return fs.Attr{}, err
+			}
+			if err := h.below.SetAttr(ctx, h.path, fs.AttrPatch{Size: &size}); err != nil {
+				h.mu.Lock()
+				return fs.Attr{}, err
+			}
+			h.mu.Lock()
+			h.passthrough = true
+			h.image = nil
+			h.pushed = size
+			h.dirty = false
+			h.b.untrack(h)
+			return h.attrLocked(), nil
 		} else {
 			grown := make([]byte, size)
 			copy(grown, h.image)
 			h.image = grown
+			h.dirty = true
 		}
-		h.dirty = true
 	}
 	return h.attrLocked(), nil
 }
 
 func (h *streamHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	h.mu.Lock()
+	passthrough := h.passthrough
+	h.mu.Unlock()
+	if passthrough {
+		inner, err := h.session(ctx)
+		if err != nil {
+			return 0, err
+		}
+		return inner.Read(ctx, off, dest)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if off >= int64(len(h.image)) {
@@ -68,34 +108,69 @@ func (h *streamHandle) Read(ctx context.Context, off int64, dest []byte) (int, e
 
 func (h *streamHandle) Write(ctx context.Context, off int64, data []byte) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.released {
 		// Unreachable per the kernel contract (RELEASE is the last op on
 		// an fh); refuse rather than drop bytes.
+		h.mu.Unlock()
 		return syscall.EBADF
 	}
 	if len(data) == 0 {
+		h.mu.Unlock()
 		return nil
 	}
 	end := off + int64(len(data))
-	switch {
-	case off == int64(len(h.image)):
-		h.image = append(h.image, data...)
-	case off > int64(len(h.image)):
-		grown := make([]byte, end)
-		copy(grown, h.image)
-		copy(grown[off:], data)
-		h.image = grown
-	default:
-		if int64(len(h.image)) < end {
+	if h.passthrough {
+		h.mu.Unlock()
+		inner, err := h.session(ctx)
+		if err != nil {
+			return err
+		}
+		return inner.Write(ctx, off, data)
+	}
+	// An unlinked claim has nowhere to forward: the below plane holds no
+	// entry, so the stream stays buffered regardless of the bound.
+	if h.unlinked || end <= bulkfileMaxBufferedBytes {
+		switch {
+		case off == int64(len(h.image)):
+			h.image = append(h.image, data...)
+		case off > int64(len(h.image)):
 			grown := make([]byte, end)
 			copy(grown, h.image)
+			copy(grown[off:], data)
 			h.image = grown
+		default:
+			if int64(len(h.image)) < end {
+				grown := make([]byte, end)
+				copy(grown, h.image)
+				h.image = grown
+			}
+			copy(h.image[off:], data)
 		}
-		copy(h.image[off:], data)
+		h.dirty = true
+		h.mu.Unlock()
+		return nil
 	}
-	h.dirty = true
-	return nil
+	h.mu.Unlock()
+	// The image would exceed the memory bound: land what is buffered and
+	// hand the stream to the write plane below — its buffering spills to
+	// parts/shadow files instead of one slice. Failures keep the claim
+	// dirty so the next boundary retries the landing.
+	if err := h.push(ctx); err != nil {
+		return err
+	}
+	h.mu.Lock()
+	h.passthrough = true
+	h.image = nil // the bytes now live in the plane below
+	h.mu.Unlock()
+	// The claim no longer owns the freshest bytes: stop serving the
+	// path's lookups from this handle so new opens read the plane's
+	// pending state instead of a stale image.
+	h.b.untrack(h)
+	inner, err := h.session(ctx)
+	if err != nil {
+		return err
+	}
+	return inner.Write(ctx, off, data)
 }
 
 func (h *streamHandle) Sync(ctx context.Context) error {
@@ -190,14 +265,19 @@ func (h *streamHandle) Release(ctx context.Context) error {
 	release := !h.released
 	h.released = true
 	h.mu.Unlock()
-	if release {
-		h.b.untrack(h)
-	}
 	// The boundary push happens before the inner release so a fresh create
 	// materializes the image (never an empty file) and a detached session
 	// is re-opened first; failures are reported after the release so no
 	// descriptor is leaked either way.
+	//
+	// The claim stays tracked until the push below has staged the image:
+	// untracking first would leave a window where a re-open reads the
+	// stale remote rows while the freshest bytes exist only on this
+	// handle (read-your-writes across close).
 	pushErr := h.push(ctx)
+	if release {
+		h.b.untrack(h)
+	}
 	inner, serr := h.session(ctx)
 	if serr != nil && pushErr == nil {
 		pushErr = serr
@@ -233,3 +313,27 @@ func (h *streamHandle) overlayAttr() (fs.Attr, bool) {
 	}
 	return h.attrLocked(), true
 }
+
+// claimReadHandle serves reads of a live claim's pending image (a
+// read-only re-open before the boundary push).
+type claimReadHandle struct {
+	claim *streamHandle
+}
+
+func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	c.claim.mu.Lock()
+	image := c.claim.image
+	c.claim.mu.Unlock()
+	if off < 0 || off >= int64(len(image)) {
+		return 0, nil
+	}
+	return copy(dest, image[off:]), nil
+}
+
+func (c *claimReadHandle) Write(ctx context.Context, off int64, data []byte) error {
+	return syscall.EROFS
+}
+
+func (c *claimReadHandle) Sync(ctx context.Context) error    { return nil }
+func (c *claimReadHandle) Flush(ctx context.Context) error   { return nil }
+func (c *claimReadHandle) Release(ctx context.Context) error { return nil }

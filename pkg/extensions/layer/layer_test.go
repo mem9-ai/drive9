@@ -116,14 +116,17 @@ func TestOverlayFileWriteReadAndChmod(t *testing.T) {
 	if attr, err := get(t, ch, "/ov.txt"); err != nil || attr.Mode != 0o600 {
 		t.Fatalf("chmod attr = %+v %v", attr, err)
 	}
+	// v1: a chmod of an in-layer upsert merges into that upsert's mode —
+	// the log carries the re-upsert with the final mode, never a
+	// standalone chmod entry that has no base to describe.
 	found := false
 	for _, e := range b.LayerLog("L1") {
-		if e.Op == "chmod" && e.Path == "/ov.txt" && e.Mode == 0o600 {
+		if e.Op == "upsert" && e.Path == "/ov.txt" && e.Mode == 0o600 {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatal("chmod not recorded in the layer log")
+		t.Fatal("chmod not merged into the layer's upsert entry")
 	}
 }
 

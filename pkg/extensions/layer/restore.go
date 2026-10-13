@@ -26,8 +26,16 @@ func (l *Layer) Restore(ctx context.Context) error {
 		if cerr != nil {
 			return fmt.Errorf("layer: read checkpoint %s: %w", l.checkpoint, cerr)
 		}
-		if cp.LayerID != l.layerRef {
-			return fmt.Errorf("layer: checkpoint %s belongs to layer %s, want %s", l.checkpoint, cp.LayerID, l.layerRef)
+		// The mount's layer ref may be a name/tag; the checkpoint carries
+		// the layer ID. Resolve the ref once (v1 layer status) so the
+		// ownership check compares IDs, not name-vs-id (which rejected every
+		// mount, or with a foreign checkpoint slipped past unresolved).
+		wantLayer := l.layerRef
+		if st, serr := l.cl.GetFSLayer(ctx, l.layerRef); serr == nil && st != nil && st.LayerID != "" {
+			wantLayer = st.LayerID
+		}
+		if cp.LayerID != wantLayer {
+			return fmt.Errorf("layer: checkpoint %s belongs to layer %s, want %s", l.checkpoint, cp.LayerID, wantLayer)
 		}
 		checkpointSeq = cp.DurableSeq
 		hasCheckpoint = true

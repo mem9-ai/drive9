@@ -122,6 +122,20 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		res.Handle = h
 		return res, nil
 	}
+	// A live claim owns the file's current image: a read-only re-open
+	// serves those bytes — falling through to the plane below would read
+	// the not-yet-pushed remote state (a checksum spanning the landing
+	// mixes the old and new images). A writer first lands the claim.
+	if op.Kind == fs.OpCreate && op.Flags&uint32(syscall.O_CREAT) == 0 {
+		if hit := b.liveHandleAt(op.Path); hit != nil {
+			if attr, ok := hit.overlayAttr(); ok {
+				if !writeIntent(op.Flags) {
+					return fs.Result{Attr: &attr, Handle: &claimReadHandle{claim: hit}}, nil
+				}
+				_ = hit.Flush(ctx)
+			}
+		}
+	}
 	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
 		// Same overlay role as a lazy create below: a live claimed file

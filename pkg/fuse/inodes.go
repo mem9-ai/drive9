@@ -920,6 +920,27 @@ func (m *InodeToPath) RemoveLink(path string) {
 	m.removePathLocked(path, true, false)
 }
 
+// SurvivingAliases lists the entry's remaining paths after a link-count
+// change (caller refreshes their cached rows so a stale link count never
+// answers a later stat).
+func (m *InodeToPath) SurvivingAliases(path string) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ino, ok := m.byPath[path]
+	if !ok {
+		return nil
+	}
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(entry.Paths))
+	for p := range entry.Paths {
+		out = append(out, p)
+	}
+	return out
+}
+
 // RemoveLinkPreserve removes one visible path mapping while preserving the
 // inode entry if this was the last link and an open file handle still needs it.
 func (m *InodeToPath) RemoveLinkPreserve(path string) {
@@ -976,14 +997,27 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 	// Clear the previous object's time overrides BEFORE the mtime line
 	// below: an identity replacement (different drive9 file at this path)
 	// adopts the incoming listing metadata instead.
-	if identityReplacedLocked(entry, inodeResourceKey(resourceID, isDir)) {
+	replaced := identityReplacedLocked(entry, inodeResourceKey(resourceID, isDir))
+	if replaced {
 		clearTimeOverridesLocked(entry)
 	}
 	// A listing reseed is a derived refresh: keep an explicitly SetAttr'd
 	// time (still pending or diverged from the server view) instead of the
 	// listing mtime, which for a just-committed file is the commit time.
+	// Same identity never rewinds (a stale row must not clobber a locally
+	// advanced clock); an identity replacement adopts the row time
+	// unconditionally — the local time belongs to the previous object and
+	// the replacement's mtime is authoritative even when older (v1).
 	if entry.MtimeOverride == nil {
-		entry.Mtime = mtime
+		switch {
+		case mtime.IsZero():
+			// A no-mtime row (a listing or layer reply that carries no
+			// timestamp) must not wipe the clock: fillAttr then serves
+			// now() and the stat flaps on every such reseed — git flags
+			// the file modified once per cycle.
+		case replaced, mtime.After(entry.Mtime), entry.Mtime.IsZero():
+			entry.Mtime = mtime
+		}
 	}
 	m.setIdentityLocked(entry, resourceID)
 	if nlink > 0 {
@@ -1115,6 +1149,20 @@ type epochTable struct {
 
 func (e *epochTable) Ino(path string) (uint64, bool) { return e.m.GetInode(path) }
 func (e *epochTable) Path(ino uint64) (string, bool) { return e.m.GetPath(ino) }
+
+// Aliases returns every path currently bound to ino (the hardlink view) —
+// writeback's alias-truncate sync walks it (v1 fileHandlesForInode).
+func (e *epochTable) Aliases(ino uint64) []string {
+	entry, ok := e.m.GetEntry(ino)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(entry.Paths))
+	for p := range entry.Paths {
+		out = append(out, p)
+	}
+	return out
+}
 
 func (e *epochTable) Epoch(path string) uint64 {
 	e.mu.Lock()

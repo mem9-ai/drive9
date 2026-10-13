@@ -17,6 +17,7 @@ import (
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/vfs"
 
+	drive9extent "github.com/mem9-ai/drive9/pkg/extent"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
@@ -63,14 +64,36 @@ func (e *Extent) jfsCtx(caller fs.Caller) vfs.LogContext {
 	return vfs.NewLogContext(e.jfsMetaCtx(caller))
 }
 
+// jfsCtxWithKeyedPath builds a LogContext whose meta context carries the
+// drive9 projection path (jfsmeta.Drive9PathKey): the engine's mknod/mkdir
+// transactions publish the file_nodes projection row server-side (without
+// it, newly created extent files are invisible to listings, other mounts,
+// and re-mounts).
+func (e *Extent) jfsCtxWithKeyedPath(caller fs.Caller, remotePath string) vfs.LogContext {
+	return vfs.NewLogContext(e.jfsMetaCtx(caller).WithValue(jfsmeta.Drive9PathKey, remotePath))
+}
+
 // jfsFuseContext carries the FUSE-interrupt semantics: Canceled() ignores
 // the FUSE interrupt channel for the first second, then polls it — JuiceFS
-// only returns EINTR between lock retries, never mid-txn.
+// only returns EINTR between lock retries, never mid-txn. cancel is the
+// kernel-request context's Done channel; lockBlock marks blocking lock
+// requests, which poll immediately AND surface the block hint to the
+// transport so the server loops like sql_lock instead of one EAGAIN RPC
+// every 10ms.
 type jfsFuseContext struct {
 	vfs.LogContext
 	cancel    <-chan struct{}
 	lockBlock bool
 	started   time.Time
+}
+
+// Value surfaces the block hint for the extent transport (v1: the context
+// answered LockBlockCtxKey=true, injecting "block":true server-side).
+func (c *jfsFuseContext) Value(key any) any {
+	if key == drive9extent.LockBlockCtxKey && c.lockBlock {
+		return true
+	}
+	return c.LogContext.Value(key)
 }
 
 func (c *jfsFuseContext) Canceled() bool {
@@ -167,6 +190,13 @@ func (h *extentHandle) Write(ctx context.Context, off int64, data []byte) error 
 		}
 		return errno(errn)
 	}
+	// v1: write-sync mounts pay remote durability per Write — flush through
+	// the VFS so write(2) returning means the data is on the server.
+	if h.e.policy == "write-sync" {
+		if ferrn := v.Flush(jctx, h.ino, h.fh, 0); ferrn != 0 {
+			return errno(ferrn)
+		}
+	}
 	// A write by a non-root caller drops set-user-ID/set-group-ID.
 	if uid := callerFrom(ctx).Uid; uid != 0 {
 		h.e.clearSetidAfterWrite(ctx, h.ino)
@@ -204,7 +234,7 @@ func (h *extentHandle) GetLk(ctx context.Context, lk fs.FileLock) (fs.FileLock, 
 		return fs.FileLock{}, syscall.EIO
 	}
 	start, end, ltype, pid := uint64(lk.Start), uint64(lk.End), lk.Type, lk.Pid
-	jctx := &jfsFuseContext{LogContext: h.e.jfsCtx(callerFrom(ctx)), started: time.Now()}
+	jctx := &jfsFuseContext{LogContext: h.e.jfsCtx(callerFrom(ctx)), cancel: ctx.Done(), started: time.Now()}
 	if errn := v.Getlk(jctx, vfs.Ino(h.ino), h.fh, lk.Owner, &start, &end, &ltype, &pid); errn != 0 {
 		return fs.FileLock{}, errno(errn)
 	}
@@ -219,7 +249,10 @@ func (h *extentHandle) SetLk(ctx context.Context, lk fs.FileLock, blocking bool)
 	if v == nil {
 		return syscall.EIO
 	}
-	jctx := &jfsFuseContext{LogContext: h.e.jfsCtx(callerFrom(ctx)), lockBlock: true, started: time.Now()}
+	// cancel wires the kernel-request context: a blocking lock becomes
+	// interruptible (EINTR), and lockBlock surfaces the transport's
+	// block:true hint so the server loops instead of 10ms EAGAIN polls.
+	jctx := &jfsFuseContext{LogContext: h.e.jfsCtx(callerFrom(ctx)), cancel: ctx.Done(), lockBlock: true, started: time.Now()}
 	if lk.Flock {
 		return errno(v.Flock(jctx, vfs.Ino(h.ino), h.fh, lk.Owner, lk.Type, blocking))
 	}

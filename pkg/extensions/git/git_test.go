@@ -21,6 +21,9 @@ func newStack(t *testing.T, b *testbackend.Backend) *fs.Chain {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// These suites exercise the armed serving plane directly (the
+	// dormant→armed on-demand gate is covered by the discovery e2e).
+	g.armed = true
 	if err := g.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +145,7 @@ func TestRenameMovesOverlayEntry(t *testing.T) {
 		t.Fatalf("renamed overlay content = %q %v", res.Data, err)
 	}
 	ov := b.GitOverlay("ws-1")
-	if ov["a"]["op"] != "delete" || ov["b"]["op"] != "upsert" {
+	if ov["a"]["op"] != "whiteout" || ov["b"]["op"] != "upsert" {
 		t.Fatalf("overlay after rename = %+v", ov)
 	}
 }
@@ -162,6 +165,40 @@ func TestSymlinkThroughOverlay(t *testing.T) {
 	}
 	if attr, err := get(t, ch, "/repo/ln"); err != nil || !attr.IsSymlink() {
 		t.Fatalf("symlink attr = %+v %v", attr, err)
+	}
+}
+
+// A reload (the mount-start Reload racing the first ops, or the coarse "/"
+// invalidation event) must reuse the loaded workspace objects: a wholesale
+// swap would drop overlay state mirrored locally and hide writes the
+// server already accepted.
+func TestReloadPreservesOverlayMirror(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspace("ws-1", "/repo")
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	g, err := New(Options{Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(g, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSymlink, Path: "/repo/ln", Target: "/repo/target"}); err != nil {
+		t.Fatal(err)
+	}
+	g.Reload(ctx)
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpReadlink, Path: "/repo/ln"})
+	if err != nil || string(res.Data) != "/repo/target" {
+		t.Fatalf("readlink after reload = %q %v", res.Data, err)
 	}
 }
 

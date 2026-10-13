@@ -112,11 +112,26 @@ func New(opts Options) (*Localize, error) {
 // data-plane handle, and the backing directory still needs its flush.
 func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
 	if op.Handle == nil && op.Fh != 0 && op.Kind != fs.OpFsync {
-		return next(ctx, op)
+		// A handle-bound op normally belongs to the layer that opened the
+		// handle — but only for paths this overlay does not claim: the
+		// kernel re-asks fh-addressed GETATTR/SETATTR once the attr TTL
+		// expires (fstat on a still-open fd), and the inner chain would
+		// stat a remote that never saw the file (ENOENT). Claimed paths
+		// fall through to the switch, which serves them by path from the
+		// overlay. FLUSH keeps passing through (its errors surface on
+		// close).
+		if op.Kind == fs.OpFlush || op.Path == "" ||
+			f.overlayFor(fs.HandlerFilesystem(next), op.Path, false) == nil {
+			return next(ctx, op)
+		}
 	}
 	inner := fs.HandlerFilesystem(next)
 	switch op.Kind {
-	case fs.OpGetAttr:
+	case fs.OpLookup, fs.OpGetAttr:
+		// LOOKUP claims with the same StatLocal shadow as GETATTR (v1
+		// serves LOOKUP of a LocalOnly path from the overlay): without
+		// the claim a re-lookup of an overlay-only file leaks to the
+		// remote and returns ENOENT after the entry TTL.
 		st, claimed, err := f.StatLocal(inner, op.Path)
 		if err != nil {
 			return fs.Result{}, err
@@ -162,8 +177,13 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			// Flags pass through untouched so the caller's access mode and
 			// O_EXCL/O_TRUNC semantics hold on the backing file: a plain
 			// read-only open of a missing file reports ENOENT, it does not
-			// materialize an empty file.
-			file, err := o.OpenFile(op.Path, op.Flags, op.Mode&0o7777)
+			// materialize an empty file. O_APPEND is the exception: the
+			// kernel already resolves an append write's offset (EOF at
+			// submission) before the WRITE arrives, and Go's os.File
+			// forbids WriteAt on O_APPEND descriptors — open the backing
+			// file without it and keep writing at the kernel offsets.
+			flags := op.Flags &^ uint32(syscall.O_APPEND)
+			file, err := o.OpenFile(op.Path, flags, op.Mode&0o7777)
 			if err != nil {
 				return fs.Result{}, err
 			}

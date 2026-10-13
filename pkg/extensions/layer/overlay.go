@@ -36,6 +36,29 @@ func (l *Layer) markLayerFileMode(p string, mode uint32) {
 	delete(l.symlinks, p)
 }
 
+// markLayerBaseFileMode records a mode-only override for a file the layer
+// has no content image of: the base object stays the content source, so
+// the overlay must not answer reads with an empty image.
+func (l *Layer) markLayerBaseFileMode(p string, mode uint32) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.abandoned {
+		return
+	}
+	l.baseModes[p] = mode & 0o777
+	delete(l.whiteouts, p)
+	delete(l.dirs, p)
+	delete(l.symlinks, p)
+}
+
+// baseFileMode reports a recorded mode-only override.
+func (l *Layer) baseFileMode(p string) (uint32, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	m, ok := l.baseModes[p]
+	return m, ok
+}
+
 func (l *Layer) markLayerDir(p string, mode uint32) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

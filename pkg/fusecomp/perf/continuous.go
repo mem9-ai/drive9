@@ -53,6 +53,9 @@ type ContinuousPerfEnv struct {
 	RemoteRoot string
 	Server     string
 	SyncMode   string
+	// WritePolicy/Profile ride every sample (v1 continuous_perf context).
+	WritePolicy string
+	Profile     string
 }
 
 type continuousPerfSample struct {
@@ -389,6 +392,8 @@ func (r *ContinuousPerfRecorder) context() continuousPerfContext {
 	ctx.RemoteRootHash = shortHash(r.env.RemoteRoot)
 	ctx.ServerHash = shortHash(r.env.Server)
 	ctx.SyncMode = r.env.SyncMode
+	ctx.WritePolicy = r.env.WritePolicy
+	ctx.Profile = r.env.Profile
 	return ctx
 }
 

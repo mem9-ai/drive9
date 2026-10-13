@@ -11,7 +11,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net"
 	"os"
 	pathpkg "path"
 	"strconv"
@@ -61,6 +63,13 @@ type Options struct {
 	// samples path); the continuous recorder and Prometheus metrics read
 	// them.
 	Perf bool
+	// PerfCounters injects a pre-built counter set (the chain's
+	// extensions reference it before the FS exists); nil builds fresh.
+	PerfCounters *perf.Counters
+
+	// Debug arms the application-level trace (v1 --debug): mutation
+	// boundaries and slow operations log to stderr.
+	Debug bool
 
 	// GVisorCompat refreshes listing snapshots on offset-0 restarts: gVisor
 	// directfs rewinds and reuses one host directory FD, and the kernel
@@ -114,9 +123,19 @@ type FS struct {
 	entryTTL    time.Duration
 	negEntryTTL time.Duration
 	epoch       *epochTable
+	// ttlHinters clamp the kernel attr TTL for paths claimed by data planes
+	// with their own revalidation cadence (v1 extentAttrTimeoutFor).
+	ttlHinters []interface {
+		EntryTTLHint(path string) (time.Duration, bool)
+	}
+	// dirKeepCacheOff marks directories whose listings must not be cached
+	// across opens (v1: extent-attached dirs can gain jfs-side children the
+	// kernel's cached listing does not know).
+	dirKeepCacheOff []interface{ DirKeepCacheOff(path string) bool }
 
 	localDirAttrs bool
 	gvisorCompat  bool
+	debug         bool
 
 	// nativeSyncFSSeen records that the kernel actually dispatched a
 	// SyncFs request (v1: protocol support alone must not advertise it).
@@ -124,6 +143,9 @@ type FS struct {
 	// notifyWg tracks in-flight kernel notifications so drain can wait
 	// them out (v1 notifications phase).
 	notifyWg sync.WaitGroup
+	// drainMu serializes concurrent drains (v1): syncfs(2) and the mount
+	// control socket must not interleave quiesce phases.
+	drainMu sync.Mutex
 }
 
 // New assembles the facade: chain, Context, and identity tables. Register
@@ -186,7 +208,11 @@ func New(opts Options) (*FS, error) {
 	}
 	f.localDirAttrs = opts.LocalDirAttrs
 	f.gvisorCompat = opts.GVisorCompat
-	f.perf = perf.NewCounters(opts.Perf)
+	f.debug = opts.Debug
+	f.perf = opts.PerfCounters
+	if f.perf == nil {
+		f.perf = perf.NewCounters(opts.Perf)
+	}
 	f.epoch = &epochTable{m: f.inodes, epoch: map[string]uint64{}}
 	f.Ctx = &fs.Context{
 		Inodes:  f.epoch,
@@ -217,6 +243,33 @@ func New(opts Options) (*FS, error) {
 		}); ok {
 			sl.SetSurvivorLookup(f.SurvivorAlias)
 		}
+		if it, ok := h.(interface{ SetInodeTable(fs.InodeTable) }); ok {
+			// Alias-truncate sync walks the inode's hardlink paths.
+			it.SetInodeTable(f.Ctx.Inodes)
+		}
+		if th, ok := h.(interface {
+			EntryTTLHint(path string) (time.Duration, bool)
+		}); ok {
+			// Data planes with their own revalidation cadence (extent files
+			// revalidate at the JuiceFS ~1s rate) clamp the kernel TTLs.
+			f.ttlHinters = append(f.ttlHinters, th)
+		}
+		if dc, ok := h.(interface{ DirKeepCacheOff(path string) bool }); ok {
+			f.dirKeepCacheOff = append(f.dirKeepCacheOff, dc)
+		}
+		if rp, ok := h.(interface {
+			SetRemoteOpRecorder(func(name string, err error, dur time.Duration, bytes uint64))
+		}); ok {
+			// Remote-op perf feed (v1 perfRecordRemote): the terminal and
+			// the write plane report their HTTP families.
+			rp.SetRemoteOpRecorder(f.recordRemoteOp)
+		}
+		if ch, ok := h.(interface {
+			SetCacheHitRecorder(func(kind string, hit bool))
+		}); ok {
+			// Read-tier hit/miss feed (v1 readCacheHit/DirCache counters).
+			ch.SetCacheHitRecorder(f.recordCacheHit)
+		}
 	}
 	// v1 refreshes cached views after every mutation: directory listings
 	// for local namespace ops and data-plane commits, kernel entry drops
@@ -227,6 +280,15 @@ func New(opts Options) (*FS, error) {
 	f.events.On(fs.EventLanded, f.onLocalMutation)
 	f.events.On(fs.EventDelete, f.onRemovedPath)
 	f.events.On(fs.EventInvalidated, f.onRemovedPath)
+	// A checkout/reset (SSE stream reset or disconnect) drops the local
+	// namespace view too (v1 resetMountViewWithInitialSync /
+	// markStatCacheUnverified cleared the dir cache): stale listings must
+	// not answer lookups after the view restarted.
+	f.events.On(fs.EventCheckout, func(fs.Event) {
+		if f.Ctx.DirCache != nil {
+			f.Ctx.DirCache.InvalidateAll()
+		}
+	})
 	return f, nil
 }
 
@@ -272,6 +334,15 @@ func (f *FS) onLocalMutation(e fs.Event) {
 			if entry.HasGID {
 				item.Gid = entry.Gid
 				item.HasGID = true
+			}
+			if entry.Nlink > item.Nlink {
+				// The settle row keeps the tracked link count — a
+				// listing rebuilt from it must not flatten hardlinks
+				// to nlink 1.
+				item.Nlink = entry.Nlink
+			}
+			if entry.ResourceID != "" {
+				item.ResourceID = entry.ResourceID
 			}
 		}
 		f.Ctx.DirCache.Upsert(parentDirOf(e.Path), item)
@@ -337,13 +408,15 @@ func (f *FS) dirCacheUpsert(child string, attr *fs.Attr) {
 			mode = uint32(syscall.S_IFLNK) | mode&0o777
 		}
 		f.Ctx.DirCache.Upsert(parent, fs.DirEntryInfo{
-			Name:    name,
-			Size:    attr.Size,
-			IsDir:   attr.IsDir(),
-			Mtime:   attr.Mtime,
-			Rev:     attr.Rev,
-			Mode:    mode,
-			HasMode: true,
+			Name:       name,
+			Size:       attr.Size,
+			IsDir:      attr.IsDir(),
+			Mtime:      attr.Mtime,
+			Rev:        attr.Rev,
+			Mode:       mode,
+			HasMode:    true,
+			Nlink:      attr.Nlink,
+			ResourceID: attr.ResourceID,
 		})
 	}
 }
@@ -411,7 +484,12 @@ func (f *FS) maybeRunDeferredUnlink(ino uint64) {
 	// survivor deletion before replying, so the storage is gone at close).
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
 	defer cancel()
-	_, _ = f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path})
+	if _, err := f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path}); err != nil {
+		// The unlink syscall already returned OK; nothing can surface this
+		// to its caller — but a silently-lost deletion must at least be
+		// visible to the operator (v1 surfaced it inline).
+		fmt.Fprintf(os.Stderr, "drive9: deferred unlink of %s failed: %v\n", path, err)
+	}
 	f.markNameNegative(path)
 }
 
@@ -465,7 +543,11 @@ func (f *FS) touchParentMtime(parentIno uint64) {
 	if parentIno == 0 || parentIno == 1 {
 		return
 	}
-	f.inodes.UpdateMtime(parentIno, time.Now())
+	// Locally generated mtimes are second-granular (v1): the wire's stat
+	// mtime is Unix seconds, and a sub-second local clock that later
+	// falls back to the server's row flips the served stat — git flags
+	// the file modified once per landing.
+	f.inodes.UpdateMtime(parentIno, time.Now().Truncate(time.Second))
 	// The kernel caches directory attrs for the attr TTL; rmdir/mkdir rows
 	// compare parent mtimes immediately after the child change, so the
 	// cached view must be dropped (v1 notifyInode on the parent).
@@ -551,12 +633,36 @@ func (f *FS) StartErr() error {
 	return f.startErr
 }
 
+// classifyDrainErr sorts a phase failure into v1's drain error kinds —
+// timeout, remote_timeout_or_retryable, canceled — which the syncfs errno
+// mapping (ETIMEDOUT/EAGAIN/EINTR) reads.
+func classifyDrainErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "remote_timeout_or_retryable"
+	}
+	return "drain"
+}
+
 // Drain quiesces the mount for `drive9 mount drain` (v1 phase shape): open
 // handles flush first (an fd held open across drain must have its buffered
 // image committed), the plugin chain drains its queues (debounced uploads +
 // commit queue inside writeback), and kernel notifications are waited out.
 // The pending snapshot and syncfs support fields mirror v1's response.
 func (f *FS) Drain(ctx context.Context) mountcontrol.DrainResponse {
+	// v1 drainMu: a syncfs(2) and a `drive9 mount drain` racing the same
+	// quiesce must serialize, not interleave phases.
+	f.drainMu.Lock()
+	defer f.drainMu.Unlock()
 	startedAt := time.Now().UTC()
 	resp := mountcontrol.NewDrainResponse(f.mountPt, startedAt)
 	f.populateNativeSyncFSSupport(&resp)
@@ -571,7 +677,7 @@ func (f *FS) Drain(ctx context.Context) mountcontrol.DrainResponse {
 		if err == nil {
 			return true
 		}
-		resp.Fail("drain", f.mountPt, err)
+		resp.Fail(classifyDrainErr(err), f.mountPt, err)
 		return false
 	}
 	if !runPhase("flush_open_handles", func() error { return f.flushOpenHandles(ctx) }) {
@@ -611,6 +717,18 @@ func (f *FS) Drain(ctx context.Context) mountcontrol.DrainResponse {
 	}) {
 		resp.Finish(time.Now().UTC())
 		return resp
+	}
+	// v1 drainPendingWorkError: a drain that leaves write-side work behind
+	// (conflicted commits, uploader-cached snapshots, dirty handles) fails
+	// — syncfs(2) and `drive9 mount drain` must not report success over
+	// abandoned data.
+	for _, h := range f.chain.Handlers() {
+		if p, is := h.(interface{ DrainPending() (string, int) }); is {
+			if reason, n := p.DrainPending(); n > 0 {
+				resp.Fail("pending_work_remaining", f.mountPt, fmt.Errorf("%s: %d entries remain", reason, n))
+			}
+			break
+		}
 	}
 	f.snapshotDrainPending(&resp)
 	resp.Finish(time.Now().UTC())
@@ -718,6 +836,15 @@ func (f *FS) String() string { return "fuse" }
 
 func (f *FS) SetDebug(debug bool) {}
 
+// debugf logs the application-level trace (v1 --debug): mounted behind
+// Options.Debug; zero cost when off.
+func (f *FS) debugf(format string, args ...any) {
+	if !f.debug {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "dat9 debug: "+format+"\n", args...)
+}
+
 func (f *FS) Init(s *gofuse.Server) {
 	f.mu.Lock()
 	f.server = s
@@ -770,6 +897,22 @@ func (f *FS) Init2(ctx context.Context) {
 }
 
 func (f *FS) OnUnmount() {
+	// v1 printed the perf summary at unmount (printSummary on stderr):
+	// "drive9: FUSE perf summary uptime=..." plus the counter blocks the
+	// git-ops budget guard greps (workspace refresh accounting).
+	if summary := f.perf.SummaryString(); summary != "" {
+		fmt.Fprintf(os.Stderr, "drive9: FUSE perf summary uptime=%s\n%s",
+			f.perf.UptimeString(), summary)
+	}
+	if line := f.perf.GitWorkspaceLine(); line != "" {
+		fmt.Fprintln(os.Stderr, line)
+	}
+	for _, line := range f.perf.PerfLines() {
+		fmt.Fprintln(os.Stderr, line)
+	}
+	if line := f.perf.CommitLine(); line != "" {
+		fmt.Fprintln(os.Stderr, line)
+	}
 	_ = f.chain.Stop(context.Background())
 }
 
@@ -1001,7 +1144,7 @@ func (f *FS) fillAttr(a fs.Attr, ino uint64, out *gofuse.Attr) {
 		mtime = entry.Mtime
 	}
 	if mtime.IsZero() {
-		mtime = time.Now()
+		mtime = time.Now().Truncate(time.Second)
 	}
 	atime := a.Atime
 	if entry != nil && entry.AtimeOverride != nil {
@@ -1023,8 +1166,15 @@ func (f *FS) fillAttr(a fs.Attr, ino uint64, out *gofuse.Attr) {
 	}
 	nlink := a.Nlink
 	if entry != nil {
-		nlink = entry.Nlink
-		if n := uint32(len(entry.Paths)); n > 0 && !entry.IsDir {
+		// The tracked path count and the recorded count both describe the
+		// same server object; the larger one is the fresher view (a
+		// listing row pre-dating an in-mount unlink says 2 while Paths
+		// already dropped to 1 — and a freshly listed alias row says 2
+		// before this mount has walked the sibling directory).
+		if entry.Nlink > nlink {
+			nlink = entry.Nlink
+		}
+		if n := uint32(len(entry.Paths)); n > nlink && !entry.IsDir {
 			nlink = n
 		}
 	}
@@ -1038,16 +1188,43 @@ func (f *FS) fillAttr(a fs.Attr, ino uint64, out *gofuse.Attr) {
 	out.Nlink = nlink
 }
 
+// attrTTLFor clamps the mount TTL for paths a data plane revalidates on
+// its own cadence (v1 extentAttrTimeoutFor + clampExtentTTL: a JuiceFS
+// ~1s hint must not lengthen what the user configured, and the mount TTL
+// stays the upper bound).
+func (f *FS) attrTTLFor(path string) time.Duration {
+	for _, h := range f.ttlHinters {
+		if ttl, ok := h.EntryTTLHint(path); ok {
+			if ttl > 0 && ttl < f.attrTTL {
+				return ttl
+			}
+			return f.attrTTL
+		}
+	}
+	return f.attrTTL
+}
+
 func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.EntryOut) {
 	var size int64
 	if a != nil {
 		size = a.Size
 	}
-	// v1 passes `now` here (not the chain/listing mtime): a lookup must
-	// never reseed the entry's clock backwards — a chmod/chown's locally
-	// advanced mtime would be clobbered by the next lookup serving a stale
-	// namespace-row mtime, freezing the ctime the next stat reports.
-	ino := f.inodes.Lookup(path, isDir, size, time.Now())
+	// v1 passes `now` when the chain carries no timestamp; a chain mtime
+	// (git clean-tree files serve a stable per-commit time) seeds the
+	// entry so repeated stats answer the same instant — git's index trust
+	// depends on it. The table never rewinds a locally advanced clock.
+	seed := time.Now().Truncate(time.Second)
+	if a != nil && !a.Mtime.IsZero() {
+		seed = a.Mtime
+	}
+	var ino uint64
+	if a != nil && a.ResourceID != "" {
+		// v1 LookupWithIdentity: hardlink paths sharing one server object
+		// share one FUSE inode (stable st_ino, shared page cache).
+		ino = f.inodes.LookupWithIdentity(path, a.ResourceID, a.Nlink, isDir, size, seed)
+	} else {
+		ino = f.inodes.Lookup(path, isDir, size, seed)
+	}
 	out.NodeId = ino
 	if a != nil {
 		f.fillAttr(*a, ino, &out.Attr)
@@ -1080,7 +1257,11 @@ func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.Entry
 		// revalidate immediately instead of trusting a cached ENOENT.
 		entryTTL = 0
 	}
-	out.SetAttrTimeout(f.attrTTL)
+	attrTTL := f.attrTTLFor(path)
+	if attrTTL < entryTTL {
+		entryTTL = attrTTL
+	}
+	out.SetAttrTimeout(attrTTL)
 	out.SetEntryTimeout(entryTTL)
 }
 
@@ -1132,7 +1313,11 @@ func (f *FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	defer cf()
 	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpLookup, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)})
 	if err != nil {
-		out.SetEntryTimeout(f.negEntryTTL) // negative entry
+		// v1 cached the negative entry only for genuine misses; other
+		// failures must not poison the name for the negative TTL.
+		if fs.IsNotFound(err) {
+			out.SetEntryTimeout(f.negEntryTTL)
+		}
 		return fs.StatusOf(err)
 	}
 	isDir := res.Attr != nil && res.Attr.IsDir()
@@ -1172,8 +1357,21 @@ func (f *FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofus
 	if res.Attr == nil {
 		return gofuse.EIO
 	}
+	// v1 getAttrOnce wrote the fresh stat back into the inode entry: size,
+	// revision, mode, and identity update so later listing-driven views
+	// (readdir's live-size rule, CAS bases) do not serve stale entry state.
+	f.inodes.UpdateSize(input.NodeId, res.Attr.Size)
+	if res.Attr.Rev > 0 {
+		f.inodes.UpdateRevision(input.NodeId, res.Attr.Rev)
+	}
+	if res.Attr.Mode != 0 && res.Attr.Mode&syscall.S_IFMT != 0 {
+		f.inodes.UpdateMode(input.NodeId, res.Attr.Mode)
+	}
+	if res.Attr.ResourceID != "" || res.Attr.Nlink > 0 {
+		f.inodes.SetIdentityWithKind(input.NodeId, res.Attr.ResourceID, res.Attr.Nlink, res.Attr.IsDir())
+	}
 	f.fillAttr(*res.Attr, input.NodeId, &out.Attr)
-	out.SetTimeout(f.attrTTL)
+	out.SetTimeout(f.attrTTLFor(path))
 	return gofuse.OK
 }
 
@@ -1247,6 +1445,43 @@ func (f *FS) checkSetAttrOwnerForCaller(caller fs.Caller, entry *InodeEntry, uid
 	return nil
 }
 
+// checkSetAttrModeForCaller ports v1 setAttrModeForCaller: a non-root,
+// non-owner caller may only change the mode in the kernel's kill-priv form
+// (SUID/SGID cleared alongside a write); anything else is EPERM. A non-root
+// owner requesting SGID on a regular file keeps it only when their primary
+// or supplementary groups include the file's group.
+func (f *FS) checkSetAttrModeForCaller(caller fs.Caller, entry *InodeEntry, input *gofuse.SetAttrIn) (uint32, error) {
+	mode := input.Mode & 0o7777
+	ownerUid, ownerGid := f.uid, f.gid
+	isRegular := true
+	var oldMode uint32
+	if entry != nil {
+		if entry.HasUID {
+			ownerUid = entry.Uid
+		}
+		if entry.HasGID {
+			ownerGid = entry.Gid
+		}
+		if entry.HasMode {
+			oldMode = entry.Mode & 0o7777
+		}
+		isRegular = !entry.IsDir && (entry.Mode&syscall.S_IFMT == syscall.S_IFREG || entry.Mode&syscall.S_IFMT == 0)
+	}
+	if caller.Uid != 0 && caller.Uid != ownerUid {
+		cleared := mode &^ 0o6000
+		oldCleared := oldMode &^ 0o6000
+		if cleared == oldCleared && mode&0o6000 == 0 {
+			return mode, nil
+		}
+		return 0, syscall.EPERM
+	}
+	if caller.Uid != 0 && isRegular && mode&0o2000 != 0 &&
+		caller.Gid != ownerGid && !containsUint32(processSupplementaryGroups(caller.Pid), ownerGid) {
+		mode &^= 0o2000
+	}
+	return mode, nil
+}
+
 func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) gofuse.Status {
 	path, ok := f.inodes.GetPath(input.NodeId)
 	if !ok {
@@ -1283,29 +1518,42 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	op := &fs.Op{Kind: fs.OpSetAttr, Path: path, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader), Size: -1}
+	if owner := f.openHandle(input.Fh); owner != nil {
+		// The owning plane's guards key on op.Handle; leaving it unset
+		// classified the local plane's own open files as foreign and
+		// forwarded ftruncate to the remote chain (ENOENT on
+		// local-only files).
+		op.Handle = owner
+	}
+
 	if uid, hasUID, gid, hasGID := resolveSetAttrOwner(input); hasUID || hasGID {
 		op.SetUID, op.SetGID, op.HasSetUID, op.HasSetGID = uid, gid, hasUID, hasGID
 	}
 	if input.Valid&gofuse.FATTR_MODE != 0 {
-		// v1 setAttrModeForCaller's kernel file_remove_privs note: when a
-		// chown arrives with a mode that only differs from the current one
-		// by cleared SUID/SGID, the kernel merged its kill-priv into the
-		// SETATTR — that is not a chmod by the caller. Apply the ownership
-		// change but keep the file's privilege bits (a privileged chown
-		// preserves them).
+		// v1 setAttrModeForCaller: enforce the owner/EPERM rules first (a
+		// non-owner may only clear SUID/SGID; a non-root owner outside the
+		// file's group loses a requested SGID bit), then the kernel
+		// file_remove_privs note: when a chown arrives with a mode that only
+		// differs from the current one by cleared SUID/SGID, the kernel
+		// merged its kill-priv into the SETATTR — that is not a chmod by the
+		// caller. Apply the ownership change but keep the file's privilege
+		// bits (a privileged chown preserves them).
+		mode, merr := f.checkSetAttrModeForCaller(caller, entry, input)
+		if merr != nil {
+			return gofuse.Status(merr.(syscall.Errno))
+		}
 		if input.Valid&(gofuse.FATTR_UID|gofuse.FATTR_GID) != 0 && entry != nil && entry.HasMode {
 			cur := entry.Mode & 0o7777
-			inc := input.Mode & 0o7777
 			switch {
-			case inc == cur&^0o6000 && cur&0o6000 != 0 && caller.Uid == 0:
+			case mode == cur&^0o6000 && cur&0o6000 != 0 && caller.Uid == 0:
 				// Privileged chown: the kernel's kill-priv merge is not the
 				// caller's chmod — keep the privilege bits.
 				op.Mode = 0
 			default:
-				op.Mode = input.Mode
+				op.Mode = mode
 			}
 		} else {
-			op.Mode = input.Mode
+			op.Mode = mode
 		}
 	}
 	if input.Valid&gofuse.FATTR_SIZE != 0 {
@@ -1355,14 +1603,14 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 	if input.Valid&gofuse.FATTR_MODE != 0 {
 		// A successful chmod updates ctime (v1): fillAttr derives ctime
 		// from mtime, so advance the entry clock with the applied mode.
-		f.inodes.UpdateMtime(input.NodeId, time.Now())
+		f.inodes.UpdateMtime(input.NodeId, time.Now().Truncate(time.Second))
 	}
 	if input.Valid&gofuse.FATTR_SIZE != 0 {
 		f.inodes.UpdateSize(input.NodeId, res.Attr.Size)
 		// A truncation is a metadata change: bump the entry mtime so the
 		// ctime/mtime comparisons around truncate(2)/ftruncate(2) see it
 		// (v1 updates ctime on truncate).
-		f.inodes.UpdateMtime(input.NodeId, time.Now())
+		f.inodes.UpdateMtime(input.NodeId, time.Now().Truncate(time.Second))
 	}
 	f.dirCacheUpsert(path, res.Attr)
 	f.fillAttr(*res.Attr, input.NodeId, &out.Attr)
@@ -1430,6 +1678,7 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	if st != gofuse.OK {
 		return st
 	}
+	f.debugf("unlink start path=%s parent_ino=%d name=%s", child, header.NodeId, name)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if f.openIdx.HasOpenPath(child) {
@@ -1460,11 +1709,32 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		return st
 	}
 	f.openIdx.UnlinkPath(child)
+	// Capture the surviving aliases BEFORE the removal drops the path
+	// mapping (their cached rows hold the pre-unlink link count).
+	siblings := f.inodes.SurvivingAliases(child)
 	f.inodes.RemoveLink(child)
+	f.dropSiblingRows(child, siblings)
 	f.touchParentMtime(header.NodeId)
 	f.mutated(fs.EventDelete, child)
 	f.markNameNegative(child)
 	return gofuse.OK
+}
+
+// dropSiblingRows invalidates the cached listing rows of a hardlink's
+// surviving aliases after one alias is removed: their recorded link count
+// is stale until the next listing (the stat answered the pre-unlink count).
+func (f *FS) dropSiblingRows(removed string, siblings []string) {
+	if f.Ctx.DirCache == nil {
+		return
+	}
+	for _, p := range siblings {
+		if p == removed {
+			continue
+		}
+		if dc, ok := f.Ctx.DirCache.(*dircache.DirCache); ok {
+			dc.Remove(parentDirOf(p), pathpkg.Base(p))
+		}
+	}
 }
 
 func (f *FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string) gofuse.Status {
@@ -1504,6 +1774,12 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	if st != gofuse.OK {
 		return st
 	}
+	// v1: rename onto the same path is an immediate success — no remote
+	// round trip, no cache churn.
+	if oldPath == newPath {
+		return gofuse.OK
+	}
+	f.debugf("rename start old=%s new=%s", oldPath, newPath)
 	f.flushDeferredUnlink(newPath)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -1539,7 +1815,13 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	// one in the cached listings — the next stat then answers locally
 	// instead of racing backend replica lag (create-after-rename EEXIST).
 	if dc, ok := f.Ctx.DirCache.(*dircache.DirCache); ok {
-		dc.Remove(parentDirOf(oldPath), pathpkg.Base(oldPath))
+		// v1 finishLocalRename: the old name is removed AND marked negative —
+		// a plain remove leaves the next stat to race backend replica lag,
+		// and a lagging replica still showing the moved entry resurrects the
+		// old name (rename/09-10: re-create EEXIST, 258 rows in close-sync).
+		oldParent, oldName := parentDirOf(oldPath), pathpkg.Base(oldPath)
+		dc.Remove(oldParent, oldName)
+		dc.MarkNegative(oldParent, oldName)
 		if ino, iok := f.inodes.GetInode(newPath); iok {
 			if e, eok := f.inodes.GetEntry(ino); eok {
 				dc.Upsert(parentDirOf(newPath), fs.DirEntryInfo{
@@ -1878,6 +2160,12 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 	defer cf()
 	if h := f.openHandle(input.Fh); h != nil {
 		n, err := h.Read(ctx, int64(input.Offset), buf)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, fs.StatusOf(err)
+		}
+		if n > 0 {
+			return gofuse.ReadResultData(buf[:n]), gofuse.OK
+		}
 		if err != nil {
 			return nil, fs.StatusOf(err)
 		}
@@ -1909,9 +2197,10 @@ func (f *FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []byte) (
 		// pre-write size for the attr TTL. Shrinks publish at their own
 		// truncate/commit boundaries; a same-size overwrite changes nothing.
 		f.publishWriteLength(input.NodeId, int64(input.Offset)+int64(len(data)))
-		// v1: a committed write bumps mtime/ctime (open O_TRUNC+write rows
-		// compare mtimes; plain opens must not).
-		f.inodes.UpdateMtime(input.NodeId, time.Now())
+		// v1's Write never stamps a local mtime: the clock advances only
+		// through the server's post-landing stat (ConfirmedAt). A local
+		// now() outruns the row and every later cache-expiry stat flips
+		// the served mtime back — git flags the file modified per landing.
 		// POSIX SUID/SGID clearing on non-owner writes (chmod/12): the
 		// privilege bits die with the first write by a non-owner.
 		if e, ok := f.inodes.GetEntry(input.NodeId); ok && e.Mode&0o6000 != 0 {
@@ -2020,8 +2309,22 @@ func lockPayloadOf(input *gofuse.LkIn) fs.FileLock {
 // (v1 routed extent handles to the JuiceFS VFS before the local table).
 func (f *FS) handleLockOps(fh uint64) fs.HandleLockOps {
 	if h, ok := f.handles.get(fh); ok && h.h != nil {
-		if lo, is := h.h.(fs.HandleLockOps); is {
-			return lo
+		// Wrapper planes (the read cache) expose their terminal; probing
+		// the wrapper itself would find no capability and silently drop
+		// the terminal plane's distributed locks.
+		cur := h.h
+		for i := 0; i < 8; i++ {
+			if lo, is := cur.(fs.HandleLockOps); is {
+				return lo
+			}
+			u, is := cur.(interface{ UnwrapHandle() fs.Handle })
+			if !is || u == nil {
+				return nil
+			}
+			cur = u.UnwrapHandle()
+			if cur == nil {
+				return nil
+			}
 		}
 	}
 	return nil
@@ -2128,12 +2431,23 @@ func (f *FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.O
 		return gofuse.ENOENT
 	}
 	// v1 OpenDir is purely local: no getattr, and the kernel keeps its
-	// cached listing across opens (FOPEN_KEEP_CACHE).
+	// cached listing across opens (FOPEN_KEEP_CACHE) — except directories a
+	// foreign data plane mirrors (v1 extent dir handles): those can gain
+	// children the kernel's cached listing does not know, so they re-list.
+	keepCache := true
+	for _, dc := range f.dirKeepCacheOff {
+		if dc.DirKeepCacheOff(path) {
+			keepCache = false
+			break
+		}
+	}
 	dh := &dirHandle{path: path, ino: input.NodeId, attr: fs.Attr{Kind: fs.KindDir, Mode: 0o755}}
 	fh := f.nextFh.Add(1)
 	f.dirs.put(fh, dh)
 	out.Fh = fh
-	out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+	if keepCache {
+		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+	}
 	f.recordFuseOp("opendir", gofuse.OK, 0, 0)
 	return gofuse.OK
 }
@@ -2302,8 +2616,17 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		if !validDirEntryName(e.Name) {
 			continue
 		}
-		// READDIRPLUS responses pin kernel lookups, like LOOKUP.
-		ino := f.inodes.Lookup(childPathOf(dh.path, e.Name), e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
+		// READDIRPLUS responses pin kernel lookups, like LOOKUP. The
+		// identity-aware lookup hardlink aliases across directories onto
+		// one FUSE inode (v1): a plain Lookup would pre-map the path and
+		// the identity merge in fillEntryOut could never fire.
+		childP := childPathOf(dh.path, e.Name)
+		var ino uint64
+		if e.Attr.ResourceID != "" {
+			ino = f.inodes.LookupWithIdentity(childP, e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
+		} else {
+			ino = f.inodes.Lookup(childP, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
+		}
 		f.syncExtentRouting(ino, &e)
 		eo := out.AddDirLookupEntry(gofuse.DirEntry{Name: e.Name, Ino: ino, Mode: modeBitsOf(e.Attr), Off: uint64(i + len(dots) + 1)})
 		if eo == nil {
@@ -2311,7 +2634,7 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		}
 		eo.NodeId = ino
 		f.fillAttr(e.Attr, ino, &eo.Attr)
-		eo.SetAttrTimeout(f.attrTTL)
+		eo.SetAttrTimeout(f.attrTTLFor(childPathOf(dh.path, e.Name)))
 		eo.SetEntryTimeout(f.entryTTLFor(e.Name))
 	}
 	return gofuse.OK
@@ -2508,6 +2831,22 @@ func (f *FS) dispatch(ctx context.Context, op *fs.Op) (fs.Result, gofuse.Status)
 func (f *FS) recordFuseOp(name string, st gofuse.Status, dur time.Duration, bytes uint64) {
 	if f.perf != nil {
 		f.perf.RecordFuseOpByName(name, st, dur, bytes)
+	}
+}
+
+// recordRemoteOp feeds the remote-op perf counters (v1 perfRecordRemote):
+// extensions report their HTTP families through the recorder hook.
+func (f *FS) recordRemoteOp(name string, err error, dur time.Duration, bytes uint64) {
+	if f.perf != nil {
+		f.perf.RecordRemoteOpByName(name, err, dur, bytes)
+	}
+}
+
+// recordCacheHit feeds the read-tier hit/miss counters (v1
+// readCacheHit/DirCache).
+func (f *FS) recordCacheHit(kind string, hit bool) {
+	if f.perf != nil {
+		f.perf.RecordCacheHit(kind, hit)
 	}
 }
 
