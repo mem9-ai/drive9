@@ -1876,7 +1876,6 @@ func (f *FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, filename string,
 	// leaving the alias on its own inode (stale reads through the source).
 	if entry, ok := f.inodes.GetEntry(input.Oldnodeid); ok {
 		f.inodes.AddAliasIfAbsent(input.Oldnodeid, newPath, entry.ResourceID, entry.Nlink, entry.IsDir, entry.Size, entry.Mtime)
-	} else {
 	}
 	// v1 Link advances the source inode's ctime: unlink/00's hard-link rows
 	// compare the survivor's ctime across link+unlink cycles.
