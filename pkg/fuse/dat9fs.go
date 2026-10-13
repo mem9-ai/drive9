@@ -12054,6 +12054,37 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 			e.Ino = fs.recreateDirEntryInode(dh.Path, e)
 			dh.updateEntryIno(generation, i, e.Ino)
 		}
+		// The pending snapshot predates this atomic inode/binding read. An
+		// old directory handle may still name A after the pathname names B;
+		// never publish B's path-keyed metadata on A's NodeId.
+		childP := dirEntryChildPath(dh.Path, e.Name)
+		inoEntry, bound := fs.inodes.dirEntryWithBinding(e.Ino, childP)
+		var busy bool
+		if inoEntry != nil {
+			if bound {
+				var item CachedFileInfo
+				item, _, busy = fs.localDirEntryInfo(childP, cachedInfoFromEntry(e.Name, inoEntry), inoEntry, local)
+				inoEntry.Size = item.Size
+				inoEntry.Mtime = item.Mtime
+				inoEntry.Mode = item.Mode
+				inoEntry.HasMode = item.HasMode
+			} else {
+				size, dirty, blocked := fs.dirtyHandleSize(e.Ino)
+				busy = blocked
+				if dirty {
+					// A can still be written through its old FD or another alias.
+					inoEntry.Size = size
+				}
+			}
+		}
+		if busy {
+			// Preserve a completed prefix and retry this child at the same cookie.
+			// No attributes or lookup reference for this child have been published.
+			if out.Offset != input.Offset {
+				return gofuse.OK
+			}
+			return gofuse.EAGAIN
+		}
 		entryOut := out.AddDirLookupEntry(gofuse.DirEntry{
 			Name: e.Name,
 			Ino:  e.Ino,
@@ -12066,23 +12097,7 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 		if !fs.inodes.IncrementLookup(e.Ino) {
 			return gofuse.EIO
 		}
-
-		// The pending snapshot predates this atomic inode/binding read. An
-		// old directory handle may still name A after the pathname names B;
-		// never publish B's path-keyed metadata on A's NodeId.
-		childP := dirEntryChildPath(dh.Path, e.Name)
-		inoEntry, bound := fs.inodes.dirEntryWithBinding(e.Ino, childP)
 		if inoEntry != nil {
-			if bound {
-				item, _ := fs.localDirEntryInfo(childP, cachedInfoFromEntry(e.Name, inoEntry), inoEntry, local)
-				inoEntry.Size = item.Size
-				inoEntry.Mtime = item.Mtime
-				inoEntry.Mode = item.Mode
-				inoEntry.HasMode = item.HasMode
-			} else if size, dirty := fs.dirtyHandleSize(e.Ino); dirty {
-				// A can still be written through its old FD or another alias.
-				inoEntry.Size = size
-			}
 			fs.fillEntryOut(inoEntry, entryOut)
 		}
 	}
@@ -12588,10 +12603,10 @@ func (fs *Dat9FS) cachedToDirEntriesWithLocal(dirPath string, items []CachedFile
 			live, _ = fs.inodes.GetEntry(ino)
 		}
 		observedVersion := item.observedVersion
-		item, preserve := fs.localDirEntryInfo(childP, item, live, local)
+		item, preserve, _ := fs.localDirEntryInfo(childP, item, live, local)
 		openReference := live != nil && fs.openHandles.Has(live.Ino, "")
 		entry := fs.inodes.ensureDirEntry(childP, item, preserve, openReference)
-		item, _ = fs.localDirEntryInfo(childP, cachedInfoFromEntry(item.Name, entry), entry, local)
+		item, _, _ = fs.localDirEntryInfo(childP, cachedInfoFromEntry(item.Name, entry), entry, local)
 		// Cache provenance belongs to the observation, while attrVersion on
 		// the inode records mutations. Do not lose the original read fence.
 		item.observedVersion = max(item.observedVersion, observedVersion)

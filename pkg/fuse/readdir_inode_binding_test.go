@@ -115,7 +115,10 @@ func TestReadDirPlusBindingSnapshotReplacementOrder(t *testing.T) {
 				replace()
 			}
 			if bound {
-				item, _ := fs.localDirEntryInfo("/file", cachedInfoFromEntry("file", entry), entry, local)
+				item, _, busy := fs.localDirEntryInfo("/file", cachedInfoFromEntry("file", entry), entry, local)
+				if busy {
+					t.Fatal("unexpected busy inode")
+				}
 				entry.Size = item.Size
 			}
 			if entry.Ino != old || entry.Size != 8192 {
