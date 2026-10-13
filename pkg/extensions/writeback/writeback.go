@@ -1266,7 +1266,29 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			rev, err := w.uploader.UploadSyncWithRevision(ctx, p)
 			if err != nil {
-				return err
+				// One conflict shape is exempt: Release submits the staged
+				// image asynchronously, so a rename that follows close(2)
+				// immediately can race the queued background upload of the
+				// SAME staging — the winner lands the acknowledged bytes,
+				// the loser CASes a stale revision (git's lock→config
+				// rename hit this deterministically: both uploads read the
+				// staging before either retired it). When the staged entry
+				// has since been retired (or replaced by a fresher
+				// generation, which keeps the conservative failure below),
+				// the old name holds the acknowledged content and the
+				// rename proceeds.
+				tolerated := errors.Is(err, client.ErrConflict)
+				if tolerated {
+					if cur, still := w.wbCache.GetMeta(p); still && cur.Generation == meta.Generation {
+						tolerated = false
+					} else {
+						w.uploader.WaitPath(p)
+					}
+				}
+				if !tolerated {
+					return err
+				}
+				return nil
 			}
 			w.uploader.WaitPath(p)
 			w.wbCache.RemoveIfGeneration(p, meta.Generation)

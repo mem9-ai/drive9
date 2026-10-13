@@ -82,6 +82,8 @@ Layout is chosen by the FUSE client at **create** time, by matching the new file
 
 Directories are never extent objects. Patterns are matched against the **basename only**: a directory component is not used, so `sub/*.db` behaves like `*.db` and `sub/x.db` matches nothing. The server never infers a layout from the path; the client decides and the server records the decision in the same transaction that creates the inode (§6.2).
 
+Besides the declarations, the extent plane **claims large files by default**: a fresh truncate-writer whose buffered image crosses the takeover threshold is promoted to the extent plane (§2.5), replacing the presign/multipart direct-upload link the classic plane used for large files.
+
 ## 2.2 Built-in profiles
 
 `drive9 mount --profile <name>` selects a built-in profile or a profile file (§2.3).
@@ -137,14 +139,51 @@ DRIVE9_MOUNT_EXTENT_PATTERNS=$'*.db\n*.db-wal' drive9 mount :/workspace ./mnt
 
 `--extent` is the direct analogue of `--append-log`; the difference is that extent needs no server capability probe, because the extent data plane is available on every deployment, while append-log depends on an object store that supports append.
 
-## 2.5 Observability
+## 2.5 Large-file takeover (the default for big files)
+
+With a non-zero takeover threshold — the default mount configuration — the
+extent extension also claims **fresh truncate-writers** (`O_CREAT|O_TRUNC`
+with write intent, no `O_APPEND`, no `O_SYNC`/`O_DSYNC`, and not a
+write-sync mount) that the declarations do not already cover:
+
+- The claim buffers the image in memory with no network traffic during
+  writes and answers lookups from the buffer, exactly like the bulk
+  buffering plane it subsumed (the `bulkfile` extension is gone).
+- When the image crosses the threshold, the claim **promotes** onto the
+  extent plane: the buffered plane's pending create is discarded, the file
+  is created through the JuiceFS VFS (with the classic projection written
+  in the same server transaction), the buffered image is written through
+  the VFS, and every later operation serves through the extent handle.
+- A claim that stays below the threshold — or whose promotion cannot build
+  a runtime (a server without the extent plane; one probe per minute parks
+  the takeover) — **falls back to the classic plane** at its durability
+  boundaries, so behavior degrades to the previous presign/multipart path
+  instead of failing.
+- An existing classic file is never converted: `> existing-classic-file`
+  keeps the classic layout and commits the truncated image below. Legacy
+  large files (created through the presign/multipart direct-upload plane
+  before the takeover) keep reading and writing through the classic paths
+  — reads and edit opens never touch the takeover, and a `>` rewrite
+  travels the classic multipart protocol with the layout unchanged
+  (`TestLegacyLargeFileStaysClassicReadWrite` locks the contract).
+
+```bash
+drive9 mount --extent-large-file-threshold-mb 10 :/workspace ./mnt  # default
+drive9 mount --extent-large-file-threshold-mb 0  :/workspace ./mnt  # off
+DRIVE9_MOUNT_EXTENT_LARGE_FILE_THRESHOLD_MB=off drive9 mount ...
+```
+
+Paths claimed by the append-log plane (its declarations) are exempt from
+the takeover; explicit `--extent` declarations still win over everything.
+
+## 2.6 Observability
 
 - `drive9 fs stat`, `ls -l`, and any in-mount `stat` behave normally. Inside the mount, extent files are ordinary files: `cat`, `dd`, `sqlite3`, `mmap` all work.
 - The stat contract exposes the layout to clients and operators: `X-Dat9-Content-Layout: extent` and `X-Dat9-Extent-Ino: <juicefs inode>` are returned for extent files; the FUSE client uses them to route reads/writes and to detect layout changes.
 - `curl -sI -H "Authorization: Bearer $DRIVE9_API_KEY" "$DRIVE9_BASE/v1/fs/path/to/app.db"` is the quickest operator check of a file's layout.
 - Server-side, `file_nodes.content_layout` / `file_nodes.extent_ino` are the projection columns (§6.2); the JuiceFS tables carry the authoritative inode, edge, and chunk rows (§6.1).
 
-## 2.6 Lifecycle rules
+## 2.7 Lifecycle rules
 
 | Operation | Result for an extent file |
 |---|---|
@@ -159,7 +198,7 @@ DRIVE9_MOUNT_EXTENT_PATTERNS=$'*.db\n*.db-wal' drive9 mount :/workspace ./mnt
 | directory containing extent children | `ls` lists it through the projection; rename/rmdir/`rm -r` handle the JuiceFS subtree in the same transaction (§6.5-§6.7) |
 | remount | nothing to replay: layout, inode, and slice list are all in TiDB |
 
-## 2.7 CLI cheat sheet
+## 2.8 CLI cheat sheet
 
 ```bash
 # mount an all-extent volume
@@ -170,6 +209,9 @@ drive9 mount --extent '*.db' --extent '*.db-*' :/workspace ./mnt
 
 # inspect the resolved profile
 drive9 profile show coding-agent-extent
+
+# big fresh writers go to the extent plane by default (10 MiB threshold)
+# --extent-large-file-threshold-mb 0 disables that takeover
 
 # operate on files exactly as before
 drive9 fs ls /workspace
