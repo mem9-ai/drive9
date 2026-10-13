@@ -284,7 +284,7 @@ func New(opts Options) (*FS, error) {
 	// v1 refreshes cached views after every mutation: directory listings
 	// for local namespace ops and data-plane commits, kernel entry drops
 	// only for removals and remote-origin changes. The facade subscribes
-	// once; every emitter (facade.mutated, writeback commits, bulkfile
+	// once; every emitter (facade.mutated, writeback commits, extent staging
 	// commits, the async queue, SSE) flows through here.
 	f.events.On(fs.EventWrite, f.onLocalMutation)
 	f.events.On(fs.EventLanded, f.onLocalMutation)

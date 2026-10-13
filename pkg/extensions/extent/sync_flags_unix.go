@@ -1,6 +1,6 @@
 //go:build !windows
 
-package bulkfile
+package extent
 
 import "syscall"
 

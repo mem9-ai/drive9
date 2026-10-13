@@ -147,7 +147,7 @@ func (p *extentRuntimePool) runtimeLocked(tenantID string, e *extentRuntimeEntry
 		if e.rt != nil {
 			p.closeEntry(tenantID, e)
 		}
-		st, err := extent.WrapS3(s3, "t/"+tenantID+"/")
+		st, err := wrapS3(s3, "t/"+tenantID+"/")
 		if err != nil {
 			return nil, fmt.Errorf("extent runtime storage for %s: %w", tenantID, err)
 		}

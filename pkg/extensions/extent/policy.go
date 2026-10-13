@@ -1,5 +1,5 @@
-// Policy core of the extent plane: creation-declaration matching, TTL
-// clamping, and the JuiceFS mode mapping.
+// Policy core of the extent plane: creation-declaration matching, the
+// large-file claim decision, and the JuiceFS mode mapping.
 package extent
 
 import (
@@ -9,6 +9,8 @@ import (
 	"time"
 
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
+
+	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
 // juiceFSAttrTimeout is the JuiceFS mount --attr-cache / --entry-cache
@@ -83,4 +85,59 @@ func matchExtentPattern(pattern, filePath string) bool {
 		return ok
 	}
 	return strings.EqualFold(name, pattern)
+}
+
+// writeIntent reports whether the open flags carry write access.
+func writeIntent(flags uint32) bool {
+	return flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) != 0
+}
+
+// claimFreshWriter reports whether the create flags describe the fresh
+// truncate-writer the large-file takeover claims: a create with truncation
+// and write intent, no append (an appender's offset discipline belongs to
+// the plane that owns the existing bytes) and no per-write sync demand.
+func claimFreshWriter(flags uint32) bool {
+	return writeIntent(flags) &&
+		flags&uint32(syscall.O_CREAT) != 0 &&
+		flags&uint32(syscall.O_TRUNC) != 0 &&
+		flags&uint32(syscall.O_APPEND) == 0 &&
+		!hasSyncOpenFlag(flags)
+}
+
+// claimsLargeFile reports whether the default takeover claims this create:
+// enabled, a fresh truncate-writer, not already declared for the extent
+// plane (the declaration claims from byte zero), and not exempted to a
+// plane inside this one (the append-log declarations).
+func (e *Extent) claimsLargeFile(op *fs.Op) bool {
+	if !e.largeFileEnabled() || !claimFreshWriter(op.Flags) {
+		return false
+	}
+	if ShouldUseExtentPath(e.opts.ExtentPaths, op.Path) {
+		return false
+	}
+	if e.opts.LargeFileExempt != nil && e.opts.LargeFileExempt(op.Path) {
+		return false
+	}
+	return true
+}
+
+// extentOpenFlags maps JuiceFS close-to-open invalidation: the inode keeps
+// its cache only when the server said so.
+func extentOpenFlags(keepCache bool) uint32 {
+	if keepCache {
+		return 0x20 // gofuse.FOPEN_KEEP_CACHE
+	}
+	return 0
+}
+
+// juiceWriteOffset bumps O_APPEND kernel writes (which can arrive with
+// off=0) to the VFS length.
+func juiceWriteOffset(off, length uint64, appendMode bool) uint64 {
+	if !appendMode || off != 0 {
+		return off
+	}
+	if length > off {
+		return length
+	}
+	return off
 }

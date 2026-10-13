@@ -3,9 +3,11 @@ package cli
 import (
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -197,6 +199,30 @@ func builtinCodingAgentExtentProfile() profileConfig {
 	cfg.Source = "builtin:coding-agent-extent"
 	cfg.ExtentPatterns = []string{"*"}
 	return cfg
+}
+
+// consumeMountExtentLargeFileThreshold resolves the effective large-file
+// takeover threshold: the flag default unless the env names another value
+// ("0"/"off" disables the takeover).
+func consumeMountExtentLargeFileThreshold(flagValue int64) (int64, error) {
+	// The value reaches FUSE as MiB shifted into bytes: anything outside
+	// [0, maxMiB] would wrap negative or overflow and silently disable the
+	// takeover instead of failing the mount.
+	const maxMiB = int64(math.MaxInt64 >> 20)
+	if raw := strings.TrimSpace(os.Getenv(EnvMountExtentLargeFileThresholdMB)); raw != "" {
+		if strings.EqualFold(raw, "off") {
+			return 0, nil
+		}
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 || v > maxMiB {
+			return 0, fmt.Errorf("drive9 mount: %s must be a MiB value in [0, %d], \"0\" or \"off\": %q", EnvMountExtentLargeFileThresholdMB, maxMiB, raw)
+		}
+		return v, nil
+	}
+	if flagValue < 0 || flagValue > maxMiB {
+		return 0, fmt.Errorf("drive9 mount: --extent-large-file-threshold-mb must be a MiB value in [0, %d], got %d", maxMiB, flagValue)
+	}
+	return flagValue, nil
 }
 
 func mergeProfileValues(groups ...[]string) []string {

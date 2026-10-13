@@ -56,7 +56,7 @@ func TestClaimRoutesExtentLayoutStat(t *testing.T) {
 	if res.Attr == nil || res.Attr.Size != 1 {
 		t.Fatalf("attr = %+v", res.Attr)
 	}
-	if ino, ok := ext.cachedIno("/big.bin"); !ok || ino != 77 {
+	if ino, ok := ext.paths.cachedIno("/big.bin"); !ok || ino != 77 {
 		t.Fatalf("discovered extent ino = %d %v, want 77", ino, ok)
 	}
 
@@ -110,11 +110,11 @@ func TestNegativeProbeCacheBoundsMisses(t *testing.T) {
 	if got := b.Requests()["HEAD /v1/fs/maybe.bin"]; got != 4 {
 		t.Fatalf("probe count = %d, want 4", got)
 	}
-	if !ext.missCached("/maybe.bin") {
+	if !ext.paths.missCached("/maybe.bin") {
 		t.Fatal("negative probe not cached")
 	}
-	time.Sleep(ext.missTTL + 50*time.Millisecond)
-	if ext.missCached("/maybe.bin") {
+	time.Sleep(ext.paths.missTTL + 50*time.Millisecond)
+	if ext.paths.missCached("/maybe.bin") {
 		t.Fatal("miss outlived its TTL")
 	}
 }
