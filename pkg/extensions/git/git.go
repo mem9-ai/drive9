@@ -13,6 +13,7 @@ package git
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"strings"
@@ -45,7 +46,8 @@ type overlayNode struct {
 	kind     fs.Kind // valid when !blackout
 	mode     uint32
 	size     int64
-	target   string // symlink target (overlay layer only)
+	target   string    // symlink target (overlay layer only)
+	mtime    time.Time // landing/observed time, for stable stat replies
 }
 
 // workspace is one loaded git workspace: its view root, its tracked-path
@@ -61,9 +63,50 @@ type workspace struct {
 	kind         string // "main" | "linked"
 	commonID     string
 	worktreeName string
+	// createdAt anchors the clean-tree mtime (v1 gitCleanTreeMtime): a
+	// stable timestamp per commit lets git's stat comparison trust clean
+	// tree files instead of content-checking every one on every status.
+	createdAt time.Time
 
 	tracked map[string]gitws.TreeEntry // rel → clean-tree entry
 	overlay map[string]overlayNode     // rel → mirror/blackout state
+}
+
+// cleanTreeMtime returns the stable stat time for clean tree files: the
+// workspace's creation time with a sub-second component derived from the
+// head commit, so every stat of an unchanged tree file answers the same
+// timestamp and git's index trust survives status passes.
+func (w *workspace) cleanTreeMtime() time.Time {
+	w.mu.RLock()
+	base, commit := w.createdAt, w.headCommit
+	w.mu.RUnlock()
+	if base.IsZero() {
+		base = time.Unix(1, 0).UTC()
+	}
+	commit = strings.TrimSpace(commit)
+	if commit == "" {
+		return base
+	}
+	sum := sha256.Sum256([]byte(strings.ToLower(commit)))
+	raw := uint32(sum[0])<<24 | uint32(sum[1])<<16 | uint32(sum[2])<<8 | uint32(sum[3])
+	return time.Unix(base.Unix(), int64(raw%uint32(time.Second))).UTC()
+}
+
+// noteTreeSize records a blob size learned by serving the file (v1
+// updateGitKnownSize): blobless manifests carry unknown sizes (Size < 0),
+// and until the first read resolves one, getattr answers a placeholder
+// that git status flags as phantom-modified. Recording the size lets the
+// next stat pass the index comparison.
+func (w *workspace) noteTreeSize(rel string, size int64) {
+	if size < 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if e, ok := w.tracked[rel]; ok && e.Size < 0 {
+		e.Size = size
+		w.tracked[rel] = e
+	}
 }
 
 func (w *workspace) lookup(rel string) (overlayNode, bool) {
@@ -155,12 +198,20 @@ func (w *workspace) worktree() string {
 }
 
 // setMeta refreshes the record fields a reload re-derived from the store.
-func (w *workspace) setMeta(root, head, repo string, blobless bool, kind, commonID, worktree string, tracked map[string]gitws.TreeEntry, overlay map[string]overlayNode) {
+func (w *workspace) setMeta(root, head, repo string, blobless bool, kind, commonID, worktree string, createdAt time.Time, tracked map[string]gitws.TreeEntry, overlay map[string]overlayNode) {
 	w.mu.Lock()
 	w.root, w.headCommit, w.repoURL, w.fastBlobless = root, head, repo, blobless
 	w.kind, w.commonID, w.worktreeName = kind, commonID, worktree
+	if !createdAt.IsZero() {
+		w.createdAt = createdAt
+	}
 	w.tracked, w.overlay = tracked, overlay
 	w.mu.Unlock()
+}
+
+// headTreeMtime snapshots the clean-tree stat time for attr assembly.
+func (w *workspace) treeMtime() time.Time {
+	return w.cleanTreeMtime()
 }
 
 // Options configures the extension.
@@ -175,6 +226,14 @@ type Options struct {
 	// carry a real .git directory whose state is checkpointed to the
 	// store and restored on mount.
 	LocalRoot string
+	// RemoteRoot is the mount's remote subtree root (":"-mount). Store
+	// records carry tenant-absolute roots; they are matched and re-rooted
+	// onto the mount-local vocabulary (v1 fs.localPath) at discovery.
+	RemoteRoot string
+	// OnWorkspaceRefresh reports one store discovery pass; forced marks a
+	// reload an explicit event or Reload asked for, as opposed to the
+	// lazy first-op load (v1's forced_refresh counter).
+	OnWorkspaceRefresh func(forced bool)
 }
 
 // Git is the fs.Handler overlaying git workspaces on the base view.
@@ -182,6 +241,10 @@ type Git struct {
 	store     fs.Filesystem
 	bus       *fs.EventBus
 	localRoot string
+	// remoteRoot re-roots tenant-absolute workspace roots onto this
+	// mount's path vocabulary.
+	remoteRoot string
+	onRefresh  func(forced bool)
 	// checkpoints debounces .git state uploads per git dir.
 	checkpoints *debounce.FlushDebouncer
 	// ckptMu serializes checkpoint uploads per extension.
@@ -247,45 +310,97 @@ func (g *Git) storeView() fs.Filesystem {
 // do not survive the handoff.
 func (g *Git) ReexecRefusal() (string, int) { return "git_workspace", 1 }
 
-// IsDeclaredLocalPath feeds the localize wiring for `.git` routing: the
-// .git of a registered workspace (or of a pending clone root — the marker
-// a `git clone --fast` writes before registration) is mount-local; an
-// unregistered clone's .git keeps syncing the classic namespace (v1 rule).
-func (g *Git) IsDeclaredLocalPath(viewPath string) bool {
-	if g == nil || strings.TrimSpace(g.localRoot) == "" {
+// localPathOf maps a tenant-absolute workspace root onto this mount's
+// path vocabulary; a root outside the subtree (ok=false) is not this
+// mount's workspace (v1 fs.localPath).
+func (g *Git) localPathOf(remote string) (string, bool) {
+	p := strings.TrimSuffix(strings.TrimSpace(remote), "/")
+	if p == "" {
+		p = "/"
+	}
+	root := g.remoteRoot
+	if root == "" {
+		return p, true
+	}
+	if p == root {
+		return "/", true
+	}
+	if strings.HasPrefix(p, root+"/") {
+		return p[len(root):], true
+	}
+	return "", false
+}
+
+// RoutesLocal reports view paths the git plane declares local (v1
+// gitDirShouldBeLocalOverlay): a discovered workspace's .git directory
+// routes to the local overlay, so the restored .git state backs git's own
+// file traffic instead of the remote. A pending marker widens the claim
+// to a workspace still being created — `drive9 git clone --fast` writes
+// the marker before git runs and only registers the record after the
+// clone; without it a live mount classifies .git as remote during the
+// clone and uploads the object database.
+func (g *Git) RoutesLocal(viewPath string) bool {
+	if g == nil {
 		return false
 	}
-	root, ok := gitMetaRootOf(viewPath)
+	// Cheap necessary condition: only a path with a `.git` segment can
+	// match (segment-exact — `.gitignore` must not).
+	if !pathHasGitDirSegment(viewPath) {
+		return false
+	}
+	root, ok := mountRootForGitDirPath(viewPath)
 	if !ok {
 		return false
 	}
-	if _, _, hit := g.workspaceFor(root + "/.git"); hit {
+	if g.localRoot != "" && gitcache.WorkspacePending(context.Background(), g.localRoot, root) {
 		return true
 	}
-	return gitcache.WorkspacePending(context.Background(), g.localRoot, root)
+	// In-memory workspace list only — this must not trigger discovery.
+	w, rel, hit := g.workspaceFor(viewPath)
+	if !hit || w == nil {
+		return false
+	}
+	return rel == ".git" || strings.HasPrefix(rel, ".git/")
 }
 
-// gitMetaRootOf splits "<root>/.git[...]" into its workspace root; false
-// for paths that are not git metadata (".gitignore" and friends).
-func gitMetaRootOf(p string) (string, bool) {
-	if !strings.HasPrefix(p, "/") {
-		return "", false
+// pathHasGitDirSegment reports whether viewPath contains a path segment
+// named exactly ".git".
+func pathHasGitDirSegment(viewPath string) bool {
+	for _, part := range strings.Split(viewPath, "/") {
+		if part == ".git" {
+			return true
+		}
 	}
-	if strings.HasSuffix(p, "/.git") {
-		root := strings.TrimSuffix(p, "/.git")
+	return false
+}
+
+// mountRootForGitDirPath returns the mount-local root that owns the
+// nearest `.git` segment of viewPath (for example "/repo" for
+// "/repo/.git/config").
+func mountRootForGitDirPath(viewPath string) (string, bool) {
+	parts := strings.Split(viewPath, "/")
+	for i, part := range parts {
+		if part != ".git" {
+			continue
+		}
+		root := strings.Join(parts[:i], "/")
 		if root == "" {
 			return "/", true
 		}
 		return root, true
 	}
-	if i := strings.Index(p, "/.git/"); i > 0 {
-		return p[:i], true
-	}
 	return "", false
 }
 
 func New(opts Options) (*Git, error) {
-	g := &Git{store: opts.Store, bus: opts.Events, localRoot: opts.LocalRoot}
+	root := strings.TrimSuffix(strings.TrimSpace(opts.RemoteRoot), "/")
+	if root != "" && !strings.HasPrefix(root, "/") {
+		root = "/" + root
+	}
+	if root == "/" {
+		root = ""
+	}
+	g := &Git{store: opts.Store, bus: opts.Events, localRoot: opts.LocalRoot, remoteRoot: root, onRefresh: opts.OnWorkspaceRefresh}
 	if g.localRoot != "" {
 		g.checkpoints = debounce.NewFlushDebouncer(gitCheckpointDebounce)
 	}
@@ -327,6 +442,12 @@ func (g *Git) onStoreEvent(path string) {
 			defer cancel()
 			g.Reload(ctx)
 		}()
+		// A checkpoint landing for a workspace whose local .git is still
+		// missing (this mount discovered the record before the CLI
+		// uploaded its state) gets its restore retried.
+		if strings.HasSuffix(path, "/git-state.json") {
+			g.scheduleMissingRestore(path)
+		}
 		return
 	}
 	if id, rel, ok := splitOverlayStorePath(path); ok {
@@ -436,6 +557,9 @@ func (g *Git) Reload(ctx context.Context) {
 	g.reloadMu.Lock()
 	defer g.reloadMu.Unlock()
 	g.discover(ctx)
+	if g.onRefresh != nil {
+		g.onRefresh(true)
+	}
 }
 
 // discover loads the workspace set once; a failed load retries on the
@@ -482,6 +606,9 @@ func (g *Git) discover(ctx context.Context) {
 	g.workspaces = next
 	g.loaded = true
 	g.mu.Unlock()
+	if g.onRefresh != nil {
+		g.onRefresh(false)
+	}
 }
 
 // loadWorkspace reads one workspace record (manifest, state, tree index)
@@ -505,12 +632,15 @@ func (g *Git) loadWorkspace(ctx context.Context, store fs.Filesystem, entry gitw
 		return nil, false
 	}
 
-	root := strings.TrimSuffix(strings.TrimSpace(m.RootPath), "/")
-	if root == "" {
-		root = "/"
+	root, ok := g.localPathOf(m.RootPath)
+	if !ok {
+		return nil, false // registered outside this mount's subtree
 	}
-	if !strings.HasPrefix(root, "/") {
-		root = "/" + root
+	var createdAt time.Time
+	if m.CreatedAt != "" {
+		if t, terr := time.Parse(time.RFC3339, m.CreatedAt); terr == nil {
+			createdAt = t
+		}
 	}
 	tracked := map[string]gitws.TreeEntry{}
 	if body, err := readStoreDoc(ctx, store, gitws.TreeIndexPath(entry.WorkspaceID)); err == nil {
@@ -529,7 +659,7 @@ func (g *Git) loadWorkspace(ctx context.Context, store fs.Filesystem, entry gitw
 		w = &workspace{id: entry.WorkspaceID}
 	}
 	w.setMeta(root, m.HeadCommit, m.RepoURL, m.Mode == "fast-blobless",
-		m.WorkspaceKind, m.CommonWorkspaceID, m.WorktreeName, tracked, overlay)
+		m.WorkspaceKind, m.CommonWorkspaceID, m.WorktreeName, createdAt, tracked, overlay)
 	return w, true
 }
 
@@ -664,7 +794,7 @@ func walkOverlayIndex(ctx context.Context, store fs.Filesystem, id string) map[s
 }
 
 func overlayNodeFromAttr(attr fs.Attr) overlayNode {
-	node := overlayNode{kind: attr.Kind, mode: attr.Mode, size: attr.Size}
+	node := overlayNode{kind: attr.Kind, mode: attr.Mode, size: attr.Size, mtime: attr.Mtime}
 	if node.mode == 0 {
 		switch node.kind {
 		case fs.KindDir:

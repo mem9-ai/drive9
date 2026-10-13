@@ -8,6 +8,7 @@ import (
 	"context"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
@@ -66,15 +67,20 @@ func (h *gitHandle) Attr() fs.Attr {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	size := int64(0)
+	mtime := h.w.cleanTreeMtime()
 	if node, hit := h.w.lookup(h.rel); hit && !node.blackout {
 		size = node.size
+		if !node.mtime.IsZero() {
+			mtime = node.mtime
+		}
 	} else if ent, ok := h.w.isTracked(h.rel); ok {
 		size = ent.Size
 	}
 	if h.buf != nil {
 		size = h.buf.Size()
+		mtime = time.Now()
 	}
-	return fs.Attr{Kind: fs.KindFile, Mode: h.mode, Size: size}
+	return fs.Attr{Kind: fs.KindFile, Mode: h.mode, Size: size, Mtime: mtime}
 }
 
 func (h *gitHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {

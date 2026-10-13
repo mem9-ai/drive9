@@ -711,7 +711,10 @@ func MountWithConfig(cfg MountConfig) error {
 	var gitExt *git.Git
 	if wantExt["git"] && cfg.EnableGitWorkspaces {
 		var gerr error
-		gitExt, gerr = git.New(git.Options{Events: bus, LocalRoot: cfg.LocalRoot})
+		// FS-native: the extension carries no client; its store view is
+		// the chain below itself, attached after assembly.
+		gitExt, gerr = git.New(git.Options{Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot,
+			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh})
 		if gerr != nil {
 			return fmt.Errorf("fuse: git extension: %w", gerr)
 		}
@@ -731,7 +734,10 @@ func MountWithConfig(cfg MountConfig) error {
 			ApplyBuiltinDefaults:        !cfg.DisableBuiltinOverlayDefaults,
 		}
 		if gitExt != nil {
-			localizeOpts.DeclarativeLocal = gitExt.IsDeclaredLocalPath
+			// v1 gitDirShouldBeLocalOverlay: a discovered workspace's .git
+			// routes to the local overlay (the restored .git state backs
+			// git's own file traffic, not the remote).
+			localizeOpts.DeclarativeLocal = gitExt.RoutesLocal
 		}
 		if cacheBase != "" && !cfg.ReadOnly {
 			// SQLite WAL-index sidecars (-shm) are mount-local scratch:

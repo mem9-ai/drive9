@@ -956,3 +956,33 @@ func isGitConfigStatePath(rel string) bool {
 	rel = filepath.ToSlash(rel)
 	return rel == "config" || strings.HasSuffix(rel, "/config")
 }
+
+// scheduleMissingRestore retries a workspace's .git restore when its
+// checkpoint lands after this mount already discovered the record (the
+// discovery raced the CLI's upload): without the retry the workspace
+// serves its view but git operations fail until the next remount.
+func (g *Git) scheduleMissingRestore(storePath string) {
+	if g == nil || g.localRoot == "" {
+		return
+	}
+	rest := strings.TrimPrefix(storePath, gitws.Root+"/")
+	id, tail, ok := strings.Cut(rest, "/")
+	if !ok || id == "" || tail != "git-state.json" {
+		return
+	}
+	w := g.workspaceByID(id)
+	if w == nil {
+		return // not loaded here (yet): the reload above may pick it up
+	}
+	gitDir := g.gitDirForWorkspace(w)
+	if _, err := os.Stat(gitDir); err == nil {
+		return // local .git already present (this machine cloned it)
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), gitCheckpointTimeout)
+		defer cancel()
+		if err := g.restoreWorkspaceState(ctx, w); err != nil {
+			fmt.Fprintf(os.Stderr, "drive9: git state restore retry failed for workspace %s: %v\n", w.id, err)
+		}
+	}()
+}

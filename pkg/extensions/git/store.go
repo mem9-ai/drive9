@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/gitws"
@@ -51,7 +52,7 @@ func (g *Git) landOverlayFile(ctx context.Context, w *workspace, rel string, ima
 	if err := store.Write(ctx, p, image, fs.WriteOptions{Mode: mode}); err != nil {
 		return fmt.Errorf("git: overlay write %s: %w", rel, err)
 	}
-	w.set(rel, overlayNode{kind: fs.KindFile, mode: mode, size: int64(len(image))})
+	w.set(rel, overlayNode{kind: fs.KindFile, mode: mode, size: int64(len(image)), mtime: time.Now()})
 	return nil
 }
 
@@ -71,7 +72,7 @@ func (g *Git) landOverlaySymlink(ctx context.Context, w *workspace, rel, target 
 	if err := store.Symlink(ctx, target, p); err != nil && !isStoreExistErr(err) {
 		return fmt.Errorf("git: overlay symlink %s: %w", rel, err)
 	}
-	w.set(rel, overlayNode{kind: fs.KindSymlink, mode: 0o777, size: int64(len(target)), target: target})
+	w.set(rel, overlayNode{kind: fs.KindSymlink, mode: 0o777, size: int64(len(target)), target: target, mtime: time.Now()})
 	return nil
 }
 
@@ -91,7 +92,7 @@ func (g *Git) landOverlayDir(ctx context.Context, w *workspace, rel string, mode
 	if err := store.Mkdir(ctx, p, mode); err != nil && !isStoreExistErr(err) {
 		return fmt.Errorf("git: overlay mkdir %s: %w", rel, err)
 	}
-	w.set(rel, overlayNode{kind: fs.KindDir, mode: mode})
+	w.set(rel, overlayNode{kind: fs.KindDir, mode: mode, mtime: time.Now()})
 	return nil
 }
 

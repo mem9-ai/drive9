@@ -452,3 +452,58 @@ func TestDeletedWorkspaceDropsFromView(t *testing.T) {
 		t.Fatal("store subtree must survive deregistration (crash safety)")
 	}
 }
+
+// The extensions-branch review round taught three semantics the FS-native
+// stack must keep: tenant-absolute roots re-root onto a subtree mount
+// (v1 fs.localPath), clean-tree stats carry a stable mtime so git's index
+// trust survives status passes, and the .git routing predicate answers
+// from the workspace table plus the pending markers.
+func TestRemoteRootRerootingAndStableTreeMtime(t *testing.T) {
+	b := testbackend.NewBackend()
+	seedGitWorkspaceFS(t, b, "ws-1", "/sub/repo", map[string]string{"a.go": "package a\n"})
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeChain, err := fs.NewChain(terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := New(Options{Store: fs.HandlerFilesystem(storeChain.Dispatch), RemoteRoot: "/sub"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(g, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The tenant-absolute root /sub/repo serves at the mount-local /repo.
+	first, err := get(t, ch, "/repo/a.go")
+	if err != nil || first.Size != int64(len("package a\n")) {
+		t.Fatalf("re-rooted clean attr = %+v %v", first, err)
+	}
+	second, err := get(t, ch, "/repo/a.go")
+	if err != nil || !first.Mtime.Equal(second.Mtime) {
+		t.Fatalf("clean-tree mtime not stable: %v vs %v (%v)", first.Mtime, second.Mtime, err)
+	}
+	if first.Mtime.IsZero() {
+		t.Fatal("clean-tree mtime is zero (git would re-hash on every status)")
+	}
+
+	// .git of the discovered workspace routes local; anything else does not.
+	if !g.RoutesLocal("/repo/.git/config") {
+		t.Fatal("workspace .git not declared local")
+	}
+	if !g.RoutesLocal("/repo/.git") {
+		t.Fatal("workspace .git dir not declared local")
+	}
+	if g.RoutesLocal("/repo/.gitignore") {
+		t.Fatal(".gitignore declared local")
+	}
+	if g.RoutesLocal("/other/.git/config") {
+		t.Fatal("unregistered root declared local")
+	}
+}

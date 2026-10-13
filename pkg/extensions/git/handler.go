@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/gitws"
@@ -30,6 +31,7 @@ type resolution struct {
 	node      overlayNode
 	ent       gitws.TreeEntry
 	hasEnt    bool
+	w         *workspace
 }
 
 func (r resolution) tracked() bool { return r.hasEnt }
@@ -59,6 +61,10 @@ func parseMode(m string) uint32 {
 }
 
 // attr assembles the view attribute for a resolved overlay or tree node.
+// Tree files stat with the stable clean-tree mtime (git index trust);
+// mirror files stat with their landing time (a rewrite must advance the
+// served stat past what the index last recorded, or git treats the file
+// as racily clean).
 func (r resolution) attr() fs.Attr {
 	if r.layer == layerOverlay {
 		mode := r.node.mode
@@ -71,7 +77,7 @@ func (r resolution) attr() fs.Attr {
 				mode = 0o777
 			}
 		}
-		return fs.Attr{Kind: r.node.kind, Mode: mode, Size: r.node.size}
+		return fs.Attr{Kind: r.node.kind, Mode: mode, Size: r.node.size, Mtime: r.node.mtime}
 	}
 	kind := kindOfEntry(r.ent.Kind)
 	mode := parseMode(r.ent.Mode)
@@ -84,7 +90,11 @@ func (r resolution) attr() fs.Attr {
 			mode = 0o777
 		}
 	}
-	return fs.Attr{Kind: kind, Mode: mode, Size: r.ent.Size}
+	var mtime time.Time
+	if r.w != nil {
+		mtime = r.w.cleanTreeMtime()
+	}
+	return fs.Attr{Kind: kind, Mode: mode, Size: r.ent.Size, Mtime: mtime}
 }
 
 // resolveIn routes one workspace-relative path through the mirror, the
@@ -99,12 +109,12 @@ func (g *Git) resolveIn(w *workspace, rel string) resolution {
 	}
 	if node, hit := w.lookup(rel); hit {
 		if node.blackout {
-			return resolution{layer: layerHidden, ent: ent, hasEnt: hasEnt}
+			return resolution{layer: layerHidden, ent: ent, hasEnt: hasEnt, w: w}
 		}
-		return resolution{layer: layerOverlay, storePath: gitws.OverlayPath(w.id, rel), node: node, ent: ent, hasEnt: hasEnt}
+		return resolution{layer: layerOverlay, storePath: gitws.OverlayPath(w.id, rel), node: node, ent: ent, hasEnt: hasEnt, w: w}
 	}
 	if hasEnt {
-		return resolution{layer: layerTree, storePath: gitws.TreePath(w.id, w.head(), rel), ent: ent, hasEnt: true}
+		return resolution{layer: layerTree, storePath: gitws.TreePath(w.id, w.head(), rel), ent: ent, hasEnt: true, w: w}
 	}
 	return resolution{layer: layerClassic}
 }
@@ -160,6 +170,18 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 			return fs.Result{}, fs.ErrNotFound
 		case layerOverlay, layerTree:
 			attr := res.attr()
+			if res.layer == layerTree && attr.Size < 0 {
+				// Unknown blob size (blobless manifest without size
+				// enrichment): a negative placeholder would read as a
+				// phantom modification in every git status. Resolve it
+				// from the store once and remember it.
+				if store := g.storeView(); store != nil {
+					if st, serr := store.GetAttr(ctx, res.storePath); serr == nil {
+						attr.Size = st.Size
+						w.noteTreeSize(rel, st.Size)
+					}
+				}
+			}
 			return fs.Result{Attr: &attr}, nil
 		}
 		return next(ctx, op)
@@ -210,7 +232,11 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		case layerHidden:
 			return fs.Result{}, fs.ErrNotFound
 		case layerOverlay, layerTree:
-			return next(ctx, &fs.Op{Kind: fs.OpRead, Path: res.storePath, Offset: op.Offset, Limit: op.Limit})
+			out, rerr := next(ctx, &fs.Op{Kind: fs.OpRead, Path: res.storePath, Offset: op.Offset, Limit: op.Limit})
+			if rerr == nil && res.layer == layerTree && op.Offset <= 0 && (op.Limit <= 0 || int64(len(out.Data)) < op.Limit) {
+				w.noteTreeSize(rel, int64(len(out.Data)))
+			}
+			return out, rerr
 		}
 		return next(ctx, op)
 
@@ -558,7 +584,7 @@ func (g *Git) listMerged(ctx context.Context, w *workspace, dir, rel string, nex
 				mode = 0o755
 			}
 		}
-		out[name] = fs.Entry{Name: name, Attr: fs.Attr{Kind: node.kind, Mode: mode, Size: node.size}}
+		out[name] = fs.Entry{Name: name, Attr: fs.Attr{Kind: node.kind, Mode: mode, Size: node.size, Mtime: node.mtime}}
 	}
 	entries := make([]fs.Entry, 0, len(out))
 	for _, e := range out {
