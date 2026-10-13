@@ -376,7 +376,10 @@ func (l *Layer) createOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) 
 		v.idx.put(p, &indexEntry{kind: ekTree, mode: op.Mode & 0o777})
 		rop := *op
 		rop.Path = v.treePathOf(l.serverAbs(p))
-		rop.Flags = op.Flags &^ uint32(syscall.O_CREAT|syscall.O_EXCL)
+		// The materialization above may still be landing through the
+		// async commit plane; the rewritten open must tolerate a not-yet-
+		// visible tree file (O_CREAT on an existing path is a plain open).
+		rop.Flags = (op.Flags &^ uint32(syscall.O_EXCL)) | uint32(syscall.O_CREAT)
 		rres, rerr := next(ctx, &rop)
 		if rerr != nil {
 			return rres, rerr
@@ -412,7 +415,8 @@ func (l *Layer) createOp(ctx context.Context, v *view, op *fs.Op, next fs.Next) 
 	v.idx.put(p, &indexEntry{kind: ekTree, mode: op.Mode & 0o777})
 	rop := *op
 	rop.Path = v.treePathOf(l.serverAbs(p))
-	rop.Flags = op.Flags &^ uint32(syscall.O_EXCL)
+	// See the resAttrs branch: the tree file may still be landing.
+	rop.Flags = (op.Flags &^ uint32(syscall.O_EXCL)) | uint32(syscall.O_CREAT)
 	rres, rerr := next(ctx, &rop)
 	if rerr != nil {
 		return rres, rerr

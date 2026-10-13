@@ -796,6 +796,13 @@ run_fuse_section() {
 
   # CoW: editing a classic file leaves the classic bytes alone
   ls -la "$mp" || true
+  if command -v strace >/dev/null 2>&1; then
+    strace -f -e trace=openat -o "$CLI_HOME/open-trace.txt" sh -c "printf 'replaced in layer' >'$mp/base.txt'" || true
+    grep -E "base.txt" "$CLI_HOME/open-trace.txt" | tail -3 >&2 || true
+  else
+    printf 'replaced in layer' >"$mp/base.txt" || true
+  fi
+  ls -la "$mp" >&2 || true
   printf 'replaced in layer' >"$mp/base.txt"
   sync; sleep 1
   check_eq "classic file untouched by the shadow write" "$(drive9_retry fs cat ":$base_file")" "live moved on"
