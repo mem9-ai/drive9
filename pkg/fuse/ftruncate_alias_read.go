@@ -162,6 +162,7 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 		other.Unlock()
 	}
 	var staged []aliasStageProof
+	var stagedRange *aliasStageProof
 	for p := range entry.Paths {
 		if fs.pendingIndex == nil {
 			break
@@ -194,14 +195,21 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 				return nil, true, syscall.EAGAIN
 			}
 			chosenAncestors = processLocalMetaAncestors(meta)
-			if fs.shadowStore == nil || meta.Size > maxLandedPayloadBytes || meta.ownedStagingGens.ShadowGen == 0 {
+			if fs.shadowStore == nil || meta.ownedStagingGens.ShadowGen == 0 {
 				return nil, true, syscall.EAGAIN
 			}
-			next, err := fs.shadowStore.ReadAllIfGeneration(p, meta.ownedStagingGens.ShadowGen)
-			if err != nil || int64(len(next)) != meta.Size {
-				return nil, true, syscall.EAGAIN
+			if meta.Size > maxLandedPayloadBytes {
+				// Select the final image before acquiring its shadow path lock.
+				ref := staged[len(staged)-1]
+				stagedRange, data = &ref, nil
+			} else {
+				next, err := fs.shadowStore.ReadAllIfGeneration(p, meta.ownedStagingGens.ShadowGen)
+				if err != nil || int64(len(next)) != meta.Size {
+					return nil, true, syscall.EAGAIN
+				}
+				stagedRange, data = nil, next
 			}
-			chosenSeq, chosenID, data, origin = meta.MutationSeq, meta.SnapshotID, next, "staged"
+			chosenSeq, chosenID, origin = meta.MutationSeq, meta.SnapshotID, "staged"
 		}
 	}
 	var rangeSource *FileHandle
@@ -226,6 +234,13 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 		rangeBase, rangeShadow = rangeSource.BaseRev, rangeSource.ShadowStageGen
 		var err error
 		data, loaded, err = fs.readFtruncateLiveRangeLocked(ctx, rangeSource, offset, size)
+		if err != nil {
+			return nil, true, err
+		}
+	}
+	if stagedRange != nil {
+		var err error
+		data, err = fs.readFtruncateStagedRange(stagedRange, offset, size)
 		if err != nil {
 			return nil, true, err
 		}
@@ -257,7 +272,7 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 			}
 		}
 	}
-	ranged := rangeSource != nil
+	ranged := rangeSource != nil || stagedRange != nil
 	readCommitted := readonly || len(entry.Paths) == 1
 	if origin == "committed" && readCommitted {
 		var err error
@@ -403,6 +418,31 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 		return nil, true, syscall.EINVAL
 	}
 	return append([]byte(nil), data[offset:end]...), true, nil
+}
+
+// The content-generation lock covers only the local read. Release it before
+// the caller revalidates metadata, aliases and view, or releases reader pins.
+func (fs *Dat9FS) readFtruncateStagedRange(ref *aliasStageProof, offset int64, size uint32) ([]byte, error) {
+	fd, actualSize, release, err := fs.shadowStore.OpenIfGeneration(ref.path, ref.shadowGen)
+	if err != nil {
+		return nil, syscall.EAGAIN
+	}
+	defer release()
+	defer func() { _ = fd.Close() }()
+	info, err := fd.Stat()
+	if err != nil || actualSize != ref.meta.Size || info.Size() != ref.meta.Size {
+		return nil, syscall.EAGAIN
+	}
+	if offset >= actualSize || size == 0 {
+		return nil, nil
+	}
+	// The selector already rejected negative offsets and addition overflow.
+	end := min(offset+int64(size), actualSize)
+	data := make([]byte, end-offset)
+	if n, err := fd.ReadAt(data, offset); err != nil || n != len(data) {
+		return nil, syscall.EAGAIN
+	}
+	return data, nil
 }
 
 // Readers need a verified committed content view, not a writable ancestry
