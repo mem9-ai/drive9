@@ -1589,6 +1589,7 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 			return gofuse.Status(syscall.EFBIG)
 		}
 		op.Size = int64(input.Size)
+		op.HasSize = true
 	}
 	if input.Valid&(gofuse.FATTR_MTIME|gofuse.FATTR_MTIME_NOW) != 0 {
 		if input.Valid&gofuse.FATTR_MTIME_NOW != 0 {

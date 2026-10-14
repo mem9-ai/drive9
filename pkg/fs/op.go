@@ -256,6 +256,9 @@ type Op struct {
 	// from an absent mode on OpSetAttr. Create paths always set it. Zero
 	// as a sentinel silently skipped the permission revocation.
 	HasMode bool
+	// HasSize marks an explicitly requested truncation in a combined
+	// SETATTR (Size's zero value is ambiguous otherwise).
+	HasSize bool
 	Flags   uint32    // OpenFlags for OpCreate
 	Target  string    // symlink target
 	Rdev    uint32    // mknod device number (specials carry it in their records)

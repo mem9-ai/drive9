@@ -83,6 +83,7 @@ func (f HandlerFilesystem) SetAttr(ctx context.Context, path string, p AttrPatch
 	}
 	if p.Size != nil {
 		op.Size = *p.Size
+		op.HasSize = true
 	}
 	if p.Mtime != nil {
 		op.Mtime = *p.Mtime

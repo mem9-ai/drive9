@@ -190,9 +190,16 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 		// accepts the reply either way. OpRead stays interruptible —
 		// streaming reads of uncached data must not outlive their caller
 		// by a full detached budget.
-		mctx, mcancel := context.WithTimeout(context.WithoutCancel(ctx), detachedNamespaceDeadline)
-		defer mcancel()
-		ctx = mctx
+		//
+		// The detach keeps the caller's explicit budget and honors the
+		// legacy interruptible mount option: a caller deadline earlier
+		// than the detached budget still bounds the op, and
+		// LegacyInterruptibleMutations keeps cancellation live.
+		if !c.legacyInterruptibleMutations {
+			mctx, mcancel := detachedNamespaceContext(ctx)
+			defer mcancel()
+			ctx = mctx
+		}
 	}
 	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
@@ -360,6 +367,21 @@ type SyncHandle struct {
 // bounded reads) once they leave the FUSE cancel channel (v1's
 // interrupt-safe mutations carried their own deadline).
 const detachedNamespaceDeadline = 30 * time.Second
+
+// detachedNamespaceContext detaches ctx from its cancellation while
+// preserving an explicit caller deadline: the op finishes unless the
+// caller's own budget expires (a raw WithoutCancel let a 100 ms GetAttr
+// outlive its deadline by the full detached window).
+func detachedNamespaceContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	base := context.WithoutCancel(ctx)
+	if dl, ok := ctx.Deadline(); ok {
+		lim := time.Now().Add(detachedNamespaceDeadline)
+		if dl.Before(lim) {
+			return context.WithDeadline(base, dl)
+		}
+	}
+	return context.WithTimeout(base, detachedNamespaceDeadline)
+}
 
 // RetargetTo rebinds the handle onto another name of the same object (the
 // write plane's deferred-unlink survivor hook, #1029): the handle reads by

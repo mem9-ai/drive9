@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -88,14 +89,15 @@ func TestPortLargeBaseTruncatePublishesSizeAndReads(t *testing.T) {
 func TestPortTruncateRacesDrainUpload(t *testing.T) {
 	b := testbackend.NewBackend()
 	release := make(chan struct{})
-	var once sync.Once
+	var gateHit atomic.Bool
+	var releaseOnce sync.Once
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/v1/layers/") {
-			once.Do(func() { <-release })
+		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/v1/layers/") && gateHit.CompareAndSwap(false, true) {
+			<-release
 		}
 		b.ServeHTTP(w, r)
 	}))
-	t.Cleanup(func() { once.Do(func() { close(release) }); ts.Close() })
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); ts.Close() })
 	_, ch := layerStack(t, ts, 0)
 	ctx := context.Background()
 
@@ -119,7 +121,7 @@ func TestPortTruncateRacesDrainUpload(t *testing.T) {
 	if err := h.Truncate(2); err != nil {
 		t.Fatal(err)
 	}
-	once.Do(func() { close(release) })
+	releaseOnce.Do(func() { close(release) })
 	if err := <-flushed; err != nil {
 		t.Fatal(err)
 	}

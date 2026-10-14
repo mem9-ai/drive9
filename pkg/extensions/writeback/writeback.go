@@ -199,6 +199,11 @@ type stripedLocks struct {
 type bufferingHandle struct {
 	w    *Writeback
 	path string
+	// wgen fences flush completion against mutations acknowledged while
+	// an upload was in flight (Drain flushes without the per-FH write
+	// lock): a completion from an older buffer must not clear the newer
+	// write's dirty flag.
+	wgen uint64
 	// isNew marks O_CREAT claims that have not reached the remote yet.
 	isNew bool
 	// pendingImage is an immutable captured pending image: reads of a
@@ -1181,6 +1186,31 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		return res, nil
 
 	case fs.OpSetAttr:
+		if op.HasMode && op.HasSize {
+			// A combined request (FATTR_FH | FATTR_MODE | FATTR_SIZE)
+			// carries both fields: the mode branch's early returns dropped
+			// the truncation half. Apply each field through its own path
+			// (one recursion level — the split ops carry a single field)
+			// and answer with the size path's attrs, which read the
+			// just-journaled mode.
+			modeOp := *op
+			modeOp.Size = -1
+			modeOp.HasSize = false
+			mres, merr := w.Do(ctx, &modeOp, next)
+			if merr != nil {
+				return mres, merr
+			}
+			sizeOp := *op
+			sizeOp.HasMode = false
+			sres, serr := w.Do(ctx, &sizeOp, next)
+			if serr != nil {
+				return sres, serr
+			}
+			if sres.Attr != nil && mres.Attr != nil && sres.Attr.Mode == 0 {
+				sres.Attr.Mode = mres.Attr.Mode
+			}
+			return sres, nil
+		}
 		if op.HasMode {
 			// A chmod on a dirty path is deferred to the handle's commit
 			// boundary (pendingMode); clean paths apply immediately. The
@@ -1250,12 +1280,32 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// rebase to the new size and the commit publishes it. Sending
 			// it to the remote now would leave the handle preloading the
 			// pre-truncation base and republish it at close.
-			if h := w.handleFor(op.Path); h != nil {
+			h := w.handleFor(op.Path)
+			namedHandle := false
+			if op.Handle != nil {
+				// FATTR_FH: the kernel named ITS handle. After an
+				// unlink+recreate the path's newest handle belongs to a
+				// different object — resolving by pathname truncated the
+				// replacement through the old descriptor.
+				if own, ok := op.Handle.(fs.Handle); ok {
+					if bh := writebackHandleOf(own); bh != nil {
+						h, namedHandle = bh, true
+					}
+				}
+			}
+			if h != nil {
 				h.mu.Lock()
 				unlinked := h.unlinked
 				mode, hasMode := h.pendingMode, h.hasPendingMode
 				h.mu.Unlock()
-				if !unlinked {
+				if unlinked && namedHandle {
+					// The named handle is anonymous (its name was
+					// unlinked): truncate only this descriptor's buffer —
+					// the recycled path belongs to another object now.
+					if err := h.truncateLocal(ctx, op.Size); err == nil {
+						return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: modeOr644(mode, hasMode), Size: op.Size}}, nil
+					}
+				} else if !unlinked {
 					if err := h.truncateLocal(ctx, op.Size); err == nil {
 						// Every hardlink alias's open handle rebases with
 						// this truncate (v1
@@ -1473,6 +1523,7 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 		h.mu.Unlock()
 		return err
 	}
+	h.wgen++
 	h.dirty = true
 	policy := h.w.opts.Policy
 	forceSync := h.forceSync
@@ -1624,6 +1675,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			}
 			h.mu.Lock()
 			h.stagedToCache = true
+			stagedGen := h.wgen
 			h.mu.Unlock()
 			rev, err := h.w.uploader.UploadSyncWithRevision(ctx, h.path)
 			if err != nil {
@@ -1635,7 +1687,13 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// only the empty one: Release's materialize path keys on
 			// landed, and re-materializing a published image would PUT a
 			// second copy at the open-time base (close-sync double-upload).
-			h.dirty = false
+			// Only the staged generation may retire dirty: a write
+			// acknowledged while the upload was in flight (Drain flushes
+			// without the per-FH write lock) keeps its own dirty flag and
+			// the next durability barrier commits it.
+			if h.wgen == stagedGen {
+				h.dirty = false
+			}
 			h.mu.Unlock()
 			// The landed revision also retires isNew: a later write on
 			// this handle must stage as an overwrite of that revision.
@@ -2332,6 +2390,31 @@ func (w *Writeback) retarget(oldPath, newPath string) {
 	})
 }
 
+// writebackHandleOf resolves the write plane's own handle from a chain
+// handle, unwrapping decorators (the read cache wraps handles; bulkfile
+// may sit between) — FD-named mutations must reach the descriptor's own
+// buffer, not the newest handle at a possibly recycled path.
+func writebackHandleOf(h fs.Handle) *bufferingHandle {
+	for range 8 {
+		if bh, ok := h.(*bufferingHandle); ok {
+			return bh
+		}
+		u, ok := h.(interface{ UnwrapHandle() fs.Handle })
+		if !ok {
+			return nil
+		}
+		h = u.UnwrapHandle()
+	}
+	return nil
+}
+
+func modeOr644(mode uint32, hasMode bool) uint32 {
+	if !hasMode {
+		return 0o644
+	}
+	return mode
+}
+
 // RetargetPath rebinds open write-plane handles keyed at oldPath onto
 // newPath — the facade's deferred-unlink survivor hook. FUSE OPEN carries
 // only the nodeid, so a hardlinked inode's open may have keyed the handle
@@ -2352,7 +2435,11 @@ func (w *Writeback) probeExisting(ctx context.Context, next fs.Next, path string
 	// channel (bounded by its own deadline). A kernel-interrupted create
 	// must finish resolving the base it wraps — an aborted probe surfaces
 	// EAGAIN to open(2), which nothing retries (#1034).
-	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), probeDeadline)
+	base := context.WithoutCancel(ctx)
+	probeCtx, cancel := context.WithTimeout(base, probeDeadline)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(time.Now().Add(probeDeadline)) {
+		probeCtx, cancel = context.WithDeadline(base, dl)
+	}
 	defer cancel()
 	res, err := next(probeCtx, &fs.Op{Kind: fs.OpGetAttr, Path: path})
 	if err != nil {
@@ -2664,6 +2751,7 @@ func (h *bufferingHandle) truncateLocal(ctx context.Context, size int64) error {
 	if err := h.buf.Truncate(size); err != nil {
 		return err
 	}
+	h.wgen++
 	h.dirty = true
 	h.w.armBypass(h.path, h.baseRev, size, "setattr-size")
 	return nil
