@@ -2003,7 +2003,11 @@ func (w *Writeback) pendingListAttr(p string) (size int64, mode uint32, hasMode,
 	}
 	if h := w.handleFor(p); h != nil && !h.unlinked {
 		h.mu.Lock()
-		if h.buf != nil {
+		// Only genuinely pending state may answer: a successful Sync
+		// leaves a clean buffer allocated, and that stale size must not
+		// overwrite a fresher remote listing (an external replace then
+		// hides its suffix from READDIRPLUS until the handle closes).
+		if h.buf != nil && h.dirty {
 			size = h.buf.Size()
 		}
 		if h.hasPendingMode {

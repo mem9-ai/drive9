@@ -557,6 +557,28 @@ func (h *cachingHandle) SetPath(p string) {
 	}
 }
 
+// RetargetPath rebinds open read-plane handles keyed at oldPath onto
+// newPath — the facade's deferred-unlink survivor hook (#1029). The write
+// plane already moved its writers; a caching handle still keyed at the
+// doomed name would seed pending reads and prefetch blocks for whatever
+// replaces the name after the re-create. Cached whole-file images move
+// with the name (same content, same revision), so the recycled name
+// starts without a cached image of the old object.
+func (c *Cache) RetargetPath(oldPath, newPath string) {
+	prefix := strings.TrimSuffix(oldPath, "/") + "/"
+	c.open.Range(func(k, _ any) bool {
+		if h, ok := k.(*cachingHandle); ok {
+			if h.path == oldPath {
+				h.SetPath(newPath)
+			} else if strings.HasPrefix(h.path, prefix) {
+				h.SetPath(newPath + strings.TrimPrefix(h.path, oldPath))
+			}
+		}
+		return true
+	})
+	c.mem.Rename(oldPath, newPath)
+}
+
 func (c *Cache) admits(data []byte) bool {
 	return int64(len(data)) <= c.mem.MaxFileSize()
 }

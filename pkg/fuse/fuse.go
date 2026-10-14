@@ -2186,10 +2186,21 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 			if entry.HasGID {
 				ownerGid = entry.Gid
 			}
-			if acc := input.Flags & uint32(syscall.O_ACCMODE); acc != uint32(syscall.O_RDONLY) {
-				if !hasPOSIXAccess(caller, ownerUid, ownerGid, mode, 0b010) {
-					return gofuse.EACCES
-				}
+			// The requested access class comes from O_ACCMODE: O_RDONLY
+			// needs the read bit, O_WRONLY the write bit, O_RDWR both. A
+			// write-only test let a chmod 000 O_RDONLY open and an O_RDWR
+			// open of a 0200 mode through (v1 checked the full mask).
+			mask := uint32(0)
+			switch input.Flags & uint32(syscall.O_ACCMODE) {
+			case uint32(syscall.O_RDONLY):
+				mask = 0b100
+			case uint32(syscall.O_WRONLY):
+				mask = 0b010
+			default: // O_RDWR (and O_ACCMODE's spare value)
+				mask = 0b110
+			}
+			if !hasPOSIXAccess(caller, ownerUid, ownerGid, mode, mask) {
+				return gofuse.EACCES
 			}
 		}
 	}
@@ -2709,12 +2720,21 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		// pages of one enumeration cannot mix the old and new objects in
 		// a single kernel reply set (#918's per-listing fence).
 		childP := childPathOf(dh.path, e.Name)
+		// Identity pinning and per-reply reference accounting are separate
+		// concerns: the snapshot's inode is resolved WITHOUT a lookup
+		// reference, and one Nlookup reference is granted per successful
+		// emit — a re-read or seek of the same handle emits the pinned
+		// inode again and must account for it, or the kernel's FORGET
+		// removes a mapping another reply still references (main
+		// incremented after every successful AddDirLookupEntry). The
+		// identity-aware ensure keeps hardlink aliases on one inode.
 		if e.Ino == 0 {
-			if e.Attr.ResourceID != "" {
-				e.Ino = f.inodes.LookupWithIdentity(childP, e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
-			} else {
-				e.Ino = f.inodes.Lookup(childP, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
-			}
+			e.Ino = f.inodes.EnsureInodeWithIdentity(childP, e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
+			f.syncExtentRouting(e.Ino, e)
+		} else if _, live := f.inodes.GetEntry(e.Ino); !live {
+			// The pinned mapping was forgotten mid-enumeration: re-resolve
+			// so this and later pages hand the kernel a live nodeid.
+			e.Ino = f.inodes.EnsureInodeWithIdentity(childP, e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
 			f.syncExtentRouting(e.Ino, e)
 		}
 		ino := e.Ino
@@ -2722,6 +2742,7 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		if eo == nil {
 			break
 		}
+		f.inodes.IncrementLookup(ino)
 		eo.NodeId = ino
 		f.fillAttr(e.Attr, ino, &eo.Attr)
 		eo.SetAttrTimeout(f.attrTTLFor(childPathOf(dh.path, e.Name)))

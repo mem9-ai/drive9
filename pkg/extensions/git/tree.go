@@ -30,13 +30,16 @@ const gitBlobCacheSize = 64
 // visible. Entries whose payload lives server-side (storage-backed) keep
 // their metadata; their reads fall through to the base plane.
 func (g *Git) loadRemoteOverlay(ctx context.Context, w *workspace) {
-	// Snapshot the mirror before the fetch: a write landing while the
-	// list is in flight (the workspace is already published and serving)
-	// must survive the replacement — the fetched log predates it.
+	// Snapshot the mirror's VALUES before the fetch: a mutation landing
+	// while the list is in flight (the workspace is already published and
+	// serving) must survive the replacement — the fetched log predates it.
+	// Key membership alone fences only additions; an OVERWRITE of an
+	// existing key would let the older response replace the acknowledged
+	// newer bytes, and a local deletion would resurrect the deleted row.
 	w.mu.RLock()
-	before := make(map[string]struct{}, len(w.overlay))
-	for rel := range w.overlay {
-		before[rel] = struct{}{}
+	before := make(map[string]overlayEntry, len(w.overlay))
+	for rel, e := range w.overlay {
+		before[rel] = e
 	}
 	w.mu.RUnlock()
 	entries, err := g.cl.ListGitOverlayEntries(ctx, w.id)
@@ -67,12 +70,31 @@ func (g *Git) loadRemoteOverlay(ctx context.Context, w *workspace) {
 	// log is the server truth (our writes round-tripped through
 	// PutGitOverlayEntry).
 	for rel, e := range w.overlay {
-		if _, existed := before[rel]; !existed {
+		old, existed := before[rel]
+		if !existed || !sameOverlayEntry(old, e) {
+			// New, or locally mutated while the fetch was in flight: the
+			// response's row predates the acknowledged change.
 			overlay[rel] = e
+		}
+	}
+	for rel := range before {
+		if _, still := w.overlay[rel]; !still {
+			// Deleted locally during the fetch: the response's row is
+			// pre-deletion truth and must not resurrect the name.
+			delete(overlay, rel)
 		}
 	}
 	w.overlay = overlay
 	w.mu.Unlock()
+}
+
+// sameOverlayEntry reports whether two mirror entries carry identical
+// state — the fetch fence replays a local entry only when it differs from
+// the fetch-start snapshot.
+func sameOverlayEntry(a, b overlayEntry) bool {
+	return a.Op == b.Op && a.Kind == b.Kind && a.Mode == b.Mode &&
+		a.remote == b.remote && a.size == b.size &&
+		a.mtime.Equal(b.mtime) && bytes.Equal(a.Content, b.Content)
 }
 
 // loadTree fetches the workspace's HEAD tree (v1 ListGitTree → rt.nodes):
