@@ -19,6 +19,11 @@ const maxCommitQueuePending = 500
 // uploadTimeout bounds one queued upload.
 const uploadTimeout = 60 * time.Second
 
+// probeDeadline bounds the detached existence probe at open (v1's
+// interrupt-safe mutations carried their own deadline once detached from
+// the FUSE cancel channel).
+const probeDeadline = 30 * time.Second
+
 // Mode helpers (the staging package keeps its own unexported copies).
 const (
 	defaultRegularFileMode   uint32 = 0o644

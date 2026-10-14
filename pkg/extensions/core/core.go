@@ -179,6 +179,22 @@ func (c *Core) Attach(dirCache NamespaceCache) {
 // tail it never calls next.
 func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
 	switch op.Kind {
+	case fs.OpCreate, fs.OpMkdir, fs.OpSymlink, fs.OpLink, fs.OpRename,
+		fs.OpUnlink, fs.OpRmdir, fs.OpSetAttr, fs.OpWrite,
+		fs.OpLookup, fs.OpGetAttr, fs.OpList:
+		// v1 interrupt-safe mutations, extended to the bounded namespace
+		// reads: kernel-interrupted requests detach from the FUSE cancel
+		// channel and finish under their own deadline. An abort mid-flight
+		// surfaces EAGAIN to the app, which nothing retries (#1034);
+		// completing the op converges the name and the kernel discards or
+		// accepts the reply either way. OpRead stays interruptible —
+		// streaming reads of uncached data must not outlive their caller
+		// by a full detached budget.
+		mctx, mcancel := context.WithTimeout(context.WithoutCancel(ctx), detachedNamespaceDeadline)
+		defer mcancel()
+		ctx = mctx
+	}
+	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
 		return c.statOp(ctx, op.Path)
 	case fs.OpList:
@@ -339,6 +355,11 @@ type SyncHandle struct {
 	core *Core
 	path string
 }
+
+// detachedNamespaceDeadline bounds detached namespace ops (mutations and
+// bounded reads) once they leave the FUSE cancel channel (v1's
+// interrupt-safe mutations carried their own deadline).
+const detachedNamespaceDeadline = 30 * time.Second
 
 // RetargetTo rebinds the handle onto another name of the same object (the
 // write plane's deferred-unlink survivor hook, #1029): the handle reads by

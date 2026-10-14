@@ -93,6 +93,12 @@ func mountPendingKernelStack(t *testing.T, tsURL, syncMode string) *pendingKerne
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Production wiring (mount.go): the terminal resolves fresh lookups
+	// from the facade's namespace cache, so this mount's own creates answer
+	// locally instead of racing a remote stat on every LOOKUP.
+	if dc, ok := f.Ctx.DirCache.(core.NamespaceCache); ok {
+		terminal.Attach(dc)
+	}
 	cf := &countingFS{FS: f}
 	mp := t.TempDir()
 	server, err := gofuse.NewServer(cf, mp, &gofuse.MountOptions{

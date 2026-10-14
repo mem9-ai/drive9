@@ -2344,7 +2344,13 @@ func (w *Writeback) RetargetPath(oldPath, newPath string) {
 // (unlink/14's re-create after a just-committed DELETE sees the stale
 // replica and answers EEXIST).
 func (w *Writeback) probeExisting(ctx context.Context, next fs.Next, path string) (fs.Attr, error) {
-	res, err := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path})
+	// v1 interrupt-safe mutations: the probe detaches from the FUSE cancel
+	// channel (bounded by its own deadline). A kernel-interrupted create
+	// must finish resolving the base it wraps — an aborted probe surfaces
+	// EAGAIN to open(2), which nothing retries (#1034).
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), probeDeadline)
+	defer cancel()
+	res, err := next(probeCtx, &fs.Op{Kind: fs.OpGetAttr, Path: path})
 	if err != nil {
 		return fs.Attr{}, err
 	}
