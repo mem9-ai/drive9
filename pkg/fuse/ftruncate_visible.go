@@ -295,7 +295,9 @@ func (fs *Dat9FS) readSupersededFtruncateOwnRange(reader *FileHandle, readerPath
 	if end < offset {
 		return nil, 0, false, gofuse.EINVAL
 	}
-	if end > reader.Dirty.Size() || !reader.coversFtruncateWrites(offset, end, committedSeq) {
+	// Only bytes before EOF need coverage; the range reader handles short reads.
+	end = min(end, reader.Dirty.Size())
+	if !reader.coversFtruncateWrites(offset, end, committedSeq) {
 		return nil, 0, false, failClosed
 	}
 	stillCurrent := func() bool {

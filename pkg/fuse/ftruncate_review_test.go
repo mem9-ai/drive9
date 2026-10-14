@@ -180,6 +180,9 @@ func TestReadWriteBackFtruncateOwnRangeAfterCommit(t *testing.T) {
 	if _, st, err := readDat9FSTestRange(fs, ino, b, 0, 2); err != nil || st != gofuse.Status(syscall.EAGAIN) {
 		t.Fatalf("B own uncovered read = %v/%v, want EAGAIN", st, err)
 	}
+	if _, st, err := readDat9FSTestRange(fs, ino, b, 0, 4096); err != nil || st != gofuse.Status(syscall.EAGAIN) {
+		t.Fatalf("B own uncovered read across EOF = %v/%v, want EAGAIN", st, err)
+	}
 	if got, st, err := readDat9FSTestRange(fs, ino, c, 0, 1); err != nil || st != gofuse.OK || string(got) != "X" {
 		t.Fatalf("C proven successor read = %q/%v/%v, want X/OK", got, st, err)
 	}
@@ -190,6 +193,23 @@ func TestReadWriteBackFtruncateOwnRangeAfterCommit(t *testing.T) {
 	got, st, err = readDat9FSTestRange(fs, ino, b, 0, len(want))
 	if err != nil || st != gofuse.OK || !bytes.Equal(got, want) {
 		t.Fatalf("B own full read = %q/%v/%v, want %q/OK", got, st, err, want)
+	}
+	for _, tc := range []struct {
+		name   string
+		offset int64
+		want   string
+	}{
+		{"across-eof", 0, "HELLO WORLD"},
+		{"suffix-across-eof", 6, "WORLD"},
+		{"at-eof", 11, ""},
+		{"past-eof", 12, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, st, err := readDat9FSTestRange(fs, ino, b, tc.offset, 4096)
+			if err != nil || st != gofuse.OK || string(got) != tc.want {
+				t.Fatalf("B own read at %d = %q/%v/%v, want %q/OK", tc.offset, got, st, err, tc.want)
+			}
+		})
 	}
 }
 
