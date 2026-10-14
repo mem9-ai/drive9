@@ -35,6 +35,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/perf"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
@@ -170,13 +171,14 @@ func (cfg MountConfig) toProfilingOptions() perf.ProfilingOptions {
 }
 
 // defaultExtensionOrder is the default --extensions value, in build-up
-// order: core first, each subsequent entry wrapping the ones before it, so
-// the chain assembly order (outermost first) is the reverse of this list.
-// It is the exact reverse of the historical wired chain, so the default
-// wires byte-identically to the pre-flag code.
+// order: core first, each subsequent entry wrapping the ones before it,
+// so the chain assembly order (outermost first) is the reverse of this
+// list. git wraps everything — it must see a complete filesystem (the
+// read caches included) below itself to transform workspace paths
+// efficiently, so it sits outside cache, the v1 outermost.
 var defaultExtensionOrder = []string{
 	"core", "sse", "writeback", "xattr", "specials", "bulkfile",
-	"appendlog", "extent", "git", "layer", "localize", "renameguard", "cache",
+	"appendlog", "extent", "layer", "localize", "renameguard", "cache", "git",
 }
 
 // knownExtensionNames guards --extensions against typos (an unknown name
@@ -710,8 +712,10 @@ func MountWithConfig(cfg MountConfig) error {
 	var gitExt *git.Git
 	if wantExt["git"] && cfg.EnableGitWorkspaces {
 		var gerr error
-		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot,
-			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh})
+		// FS-native: the extension carries no client; its store view is
+		// the chain below itself, attached after assembly.
+		gitExt, gerr = git.New(git.Options{Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot,
+			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh, Logger: logger.L()})
 		if gerr != nil {
 			return fmt.Errorf("fuse: git extension: %w", gerr)
 		}
@@ -720,6 +724,7 @@ func MountWithConfig(cfg MountConfig) error {
 
 	// localize routes declared local-only paths to the local overlay
 	// (v1 local_overlay/local_policy semantics).
+	var localizeExt *localize.Localize
 	if wantExt["localize"] && cfg.LocalRoot != "" {
 		localizeOpts := localize.Options{
 			LocalRoot:                   cfg.LocalRoot,
@@ -748,14 +753,16 @@ func MountWithConfig(cfg MountConfig) error {
 				localizeOpts.TransientRoot = transientRoot
 			}
 		}
-		localizeExt, lerr := localize.New(localizeOpts)
+		var lerr error
+		localizeExt, lerr = localize.New(localizeOpts)
 		if lerr != nil {
 			return fmt.Errorf("fuse: localize extension: %w", lerr)
 		}
 		built["localize"] = localizeExt
 	}
 
-	// The layer view sits outermost (v1: layer over base), git next.
+	// The layer view sits over the base (v1: layer over base); git sits
+	// outside everything below (see defaultExtensionOrder).
 	var layerExt *layer.Layer
 	if wantExt["layer"] && strings.TrimSpace(cfg.LayerRef) != "" {
 		layerExt, err = layer.New(layer.Options{
@@ -771,7 +778,6 @@ func MountWithConfig(cfg MountConfig) error {
 		}
 		built["layer"] = layerExt
 	}
-
 	// The extent plane claims ahead of the classic data path (cache and
 	// writeback never see extent files). Gated on the --extent paths /
 	// profile [extent] section only: the cache dir falls back to the
@@ -921,6 +927,34 @@ func MountWithConfig(cfg MountConfig) error {
 			chainHandlers = append(chainHandlers, h)
 		}
 	}
+	// The git extension's store view is the chain below itself: the full
+	// handler list minus the git handler, dispatched as a Filesystem. It
+	// must be wired before the facade starts serving (git's discovery,
+	// view rewrites, and checkpoints all read/write through it — with the
+	// read caches below, which is the point of placing git outermost).
+	if gitExt != nil {
+		// The store view's terminal must speak tenant-absolute paths: the
+		// ordinary core prefixes RemoteRoot, so on a subtree mount (:/sub)
+		// the store would read/write /sub/.drive9/... while the CLI
+		// registers at the tenant root and discovery would never match.
+		storeCore, serr := core.New(cl, core.Options{})
+		if serr != nil {
+			return fmt.Errorf("fuse: git store terminal: %w", serr)
+		}
+		tail := make([]fs.Handler, 0, len(chainHandlers))
+		for _, h := range chainHandlers {
+			if h == fs.Handler(gitExt) || h == fs.Handler(coreExt) {
+				continue
+			}
+			tail = append(tail, h)
+		}
+		tail = append(tail, storeCore)
+		tailChain, terr := fs.NewChain(tail...)
+		if terr != nil {
+			return fmt.Errorf("fuse: git store chain: %w", terr)
+		}
+		gitExt.AttachStore(fs.HandlerFilesystem(tailChain.Dispatch))
+	}
 	f, err := New(Options{
 		Extensions:         chainHandlers,
 		Events:             bus,
@@ -987,6 +1021,12 @@ func MountWithConfig(cfg MountConfig) error {
 	defer perfRecorder.Stop()
 	if sseExt != nil {
 		sseExt.Attach(f.Ctx.Inodes, f.Ctx.Notify)
+	}
+	if gitExt != nil {
+		// Remote store changes (overlay writes from other mounts, CLI
+		// registration) knock the kernel's view of the mapped workspace
+		// paths.
+		gitExt.Attach(f.Ctx.Inodes, f.Ctx.Notify)
 	}
 	if layerExt != nil {
 		// The layer event watcher resets the kernel view after a remote

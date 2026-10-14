@@ -1,24 +1,31 @@
-// Package git is the git-workspace extension: workspaces are discovered
-// through the client's GitWorkspace API (ListGitWorkspaces) and their
-// writes go to the server-side overlay log (PutGitOverlayEntry) — never
-// through fs-path rewriting. Reads merge the base view with each
-// workspace's overlay (upsert entries add/replace, delete entries hide).
+// Package git is the git-workspace extension, re-implemented FS-native:
+// workspaces live under /.drive9/git-workspaces/ as plain drive9 files
+// (pkg/gitws layout) and the extension is a pure view transformation over
+// the rest of the chain. Reads of a workspace path resolve through three
+// layers — the dirty mirror (overlay/), the clean tree (tree/<commit>/),
+// then the classic namespace — by rewriting the op's path and dispatching
+// into next, so every store access rides the same cached, commit-pipelined
+// filesystem the mount already provides. The extension holds no client
+// and no backend-specific interface: its store view is the chain below
+// itself (Options.Store / AttachStore), which is why the default wiring
+// places git outside the cache extension.
 package git
 
 import (
 	"context"
 	"crypto/sha256"
-	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/mem9-ai/drive9/pkg/client"
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/debounce"
 	"github.com/mem9-ai/drive9/pkg/gitcache"
+	"github.com/mem9-ai/drive9/pkg/gitws"
+	"github.com/mem9-ai/drive9/pkg/gitwsindex"
 )
 
 // gitCheckpointTimeout bounds one state checkpoint or restore.
@@ -32,89 +39,135 @@ const gitCheckpointDebounce = 2 * time.Second
 // clones need far more than a checkpoint's budget.
 const gitWorkspaceHydrateTimeout = 30 * time.Minute
 
-type overlayEntry struct {
-	Op   string // "upsert" | "whiteout"
-	Kind string // "file" | "dir" | "symlink"
-	Mode string
-	// remote marks a storage-backed overlay payload this mirror cannot
-	// serve: attrs carry size, reads fall through to the base view.
-	remote bool
-	size   int64
-	// Content carries inline payloads.
-	Content []byte
-	// mtime is the entry's landed time (server UpdatedAt, or now for our
-	// own writes): a rewrite must advance the served stat past whatever
-	// the index last recorded, or git treats the file as racily clean.
-	mtime time.Time
+// overlayNode is one dirty-mirror routing record. The fs is the index:
+// nodes derive from walking overlay/ and overlay-blackouts/ (and from
+// this mount's own landings); no sidecar manifest exists.
+type overlayNode struct {
+	blackout bool    // overlay-blackouts/<rel> marker present
+	kind     fs.Kind // valid when !blackout
+	mode     uint32
+	size     int64
+	target   string    // symlink target (overlay layer only)
+	mtime    time.Time // landing/observed time, for stable stat replies
 }
 
-// workspace is one loaded git workspace: its root, overlay log, and HEAD
-// tree (the fast-clone view).
+// workspace is one loaded git workspace: its view root, its tracked-path
+// oracle, and its dirty-mirror index.
 type workspace struct {
-	id   string
-	root string // canonical view root, "/"-prefixed, no trailing slash
-	// headCommit/repoURL/fastBlobless feed the checkpoint machine.
+	id string
+
+	mu           sync.RWMutex
+	root         string // canonical view root, "/"-prefixed, no trailing slash
 	headCommit   string
 	repoURL      string
 	fastBlobless bool
+	kind         string // "main" | "linked"
+	commonID     string
+	worktreeName string
 	// createdAt anchors the clean-tree mtime (v1 gitCleanTreeMtime): a
 	// stable timestamp per commit lets git's stat comparison trust clean
 	// tree files instead of content-checking every one on every status.
 	createdAt time.Time
 
-	mu         sync.RWMutex
-	overlay    map[string]overlayEntry // rel path (no leading slash) → entry
-	tree       map[string]client.GitTreeNode
-	treeLoaded string // head commit the tree was loaded for
-	// stateRestoreMu serializes the lazy local .git restore. An attempt
-	// that fails (or finds the checkpoint not uploaded yet) leaves the
-	// gate open — the next entry point retries — while restoreLatched
-	// makes every later call a no-op once a restore has succeeded. A
-	// sync.Once here consumed the attempt on failure and never retried
-	// (review).
-	stateRestoreMu sync.Mutex
-	restoreLatched bool
+	tracked map[string]gitws.TreeEntry // rel → clean-tree entry
+	overlay map[string]overlayNode     // rel → mirror/blackout state
 }
 
-// noteTreeSize records a blob size learned by materializing it (v1
-// updateGitKnownSize): blobless manifests carry unknown sizes, and until
-// the first read resolves one, getattr answers a placeholder that git
-// status flags as phantom-modified. Recording the size lets the next
-// stat pass the index comparison and the status converge.
+// cleanTreeMtime returns the stable stat time for clean tree files: the
+// workspace's creation time with a sub-second component derived from the
+// head commit, so every stat of an unchanged tree file answers the same
+// timestamp and git's index trust survives status passes.
+func (w *workspace) cleanTreeMtime() time.Time {
+	w.mu.RLock()
+	base, commit := w.createdAt, w.headCommit
+	w.mu.RUnlock()
+	if base.IsZero() {
+		base = time.Unix(1, 0).UTC()
+	}
+	commit = strings.TrimSpace(commit)
+	if commit == "" {
+		return base
+	}
+	sum := sha256.Sum256([]byte(strings.ToLower(commit)))
+	raw := uint32(sum[0])<<24 | uint32(sum[1])<<16 | uint32(sum[2])<<8 | uint32(sum[3])
+	return time.Unix(base.Unix(), int64(raw%uint32(time.Second))).UTC()
+}
+
+// noteTreeSize records a blob size learned by serving the file (v1
+// updateGitKnownSize): blobless manifests carry unknown sizes (Size < 0),
+// and until the first read resolves one, getattr answers a placeholder
+// that git status flags as phantom-modified. Recording the size lets the
+// next stat pass the index comparison.
 func (w *workspace) noteTreeSize(rel string, size int64) {
 	if size < 0 {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if n, ok := w.tree[rel]; ok && n.SizeBytes < 0 {
-		// map values are copies: write the updated node back or every
-		// lookup re-resolves via cat-file and a later failure re-exposes
-		// the placeholder (review).
-		n.SizeBytes = size
-		w.tree[rel] = n
+	if e, ok := w.tracked[rel]; ok && e.Size < 0 {
+		e.Size = size
+		w.tracked[rel] = e
 	}
 }
 
-func (w *workspace) lookup(rel string) (overlayEntry, bool) {
+func (w *workspace) lookup(rel string) (overlayNode, bool) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
+	if w.overlay == nil {
+		return overlayNode{}, false
+	}
 	e, ok := w.overlay[rel]
 	return e, ok
 }
 
-func (w *workspace) set(rel string, e overlayEntry) {
+func (w *workspace) set(rel string, e overlayNode) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.overlay == nil {
-		w.overlay = map[string]overlayEntry{}
+		w.overlay = map[string]overlayNode{}
 	}
 	w.overlay[rel] = e
 }
 
-// root/head/repo/blobless are refreshed when a reload re-lists
-// workspaces; readers outside g.mu must snapshot through these
-// accessors instead of touching the fields directly.
+// attr assembles the view attribute for a mirror node.
+func (n overlayNode) attr() fs.Attr {
+	mode := n.mode
+	if mode == 0 {
+		mode = 0o644
+		if n.kind == fs.KindDir {
+			mode = 0o755
+		}
+	}
+	return fs.Attr{Kind: n.kind, Mode: mode, Size: n.size, Mtime: n.mtime}
+}
+
+func (w *workspace) drop(rel string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.overlay, rel)
+}
+
+// snapshotOverlay copies the routing index for listing merges.
+func (w *workspace) snapshotOverlay() map[string]overlayNode {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	out := make(map[string]overlayNode, len(w.overlay))
+	for k, v := range w.overlay {
+		out[k] = v
+	}
+	return out
+}
+
+func (w *workspace) isTracked(rel string) (gitws.TreeEntry, bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	e, ok := w.tracked[rel]
+	return e, ok
+}
+
+// root/head/repo/blobless are refreshed when a reload re-reads the
+// manifests; readers outside g.mu must snapshot through these accessors
+// instead of touching the fields directly.
 func (w *workspace) rootPath() string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -139,127 +192,93 @@ func (w *workspace) blobless() bool {
 	return w.fastBlobless
 }
 
-func (w *workspace) setMeta(root, head, repo string, blobless bool, createdAt time.Time) {
+func (w *workspace) linked() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.kind == "linked"
+}
+
+func (w *workspace) commonWorkspaceID() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.commonID
+}
+
+func (w *workspace) worktree() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.worktreeName
+}
+
+// setMeta refreshes the record fields a reload re-derived from the store.
+func (w *workspace) setMeta(root, head, repo string, blobless bool, kind, commonID, worktree string, createdAt time.Time, tracked map[string]gitws.TreeEntry, overlay map[string]overlayNode) {
 	w.mu.Lock()
 	w.root, w.headCommit, w.repoURL, w.fastBlobless = root, head, repo, blobless
+	w.kind, w.commonID, w.worktreeName = kind, commonID, worktree
 	if !createdAt.IsZero() {
 		w.createdAt = createdAt
 	}
+	w.tracked, w.overlay = tracked, overlay
 	w.mu.Unlock()
 }
 
-// cleanTreeMtime returns the stable stat time for clean tree files (v1
-// gitCleanTreeMtime): the workspace's creation time with a sub-second
-// component derived from the head commit, so every stat of an unchanged
-// tree file answers the same timestamp and git's index trust survives
-// status/checkout passes without re-hashing or rewriting each file.
-var gitCleanTreeDefaultMtime = time.Unix(1, 0).UTC()
-
-func (w *workspace) cleanTreeMtime() time.Time {
-	w.mu.RLock()
-	base, commit := w.createdAt, w.headCommit
-	w.mu.RUnlock()
-	if base.IsZero() {
-		base = gitCleanTreeDefaultMtime
-	}
-	commit = strings.TrimSpace(commit)
-	if commit == "" {
-		return base
-	}
-	sum := sha256.Sum256([]byte(strings.ToLower(commit)))
-	raw := uint32(sum[0])<<24 | uint32(sum[1])<<16 | uint32(sum[2])<<8 | uint32(sum[3])
-	nsec := int64(raw % uint32(time.Second))
-	return time.Unix(base.Unix(), nsec).UTC()
-}
-
 // Options configures the extension.
-// localPathOf maps a server-absolute workspace root onto this mount's
-// path vocabulary; a root outside the subtree (ok=false) is not this
-// mount's workspace (v1 fs.localPath).
-func (g *Git) localPathOf(remote string) (string, bool) {
-	p := strings.TrimSuffix(strings.TrimSpace(remote), "/")
-	if p == "" {
-		p = "/"
-	}
-	root := g.remoteRoot
-	if root == "" || root == "/" {
-		return p, true
-	}
-	if p == root {
-		return "/", true
-	}
-	if strings.HasPrefix(p, root+"/") {
-		return p[len(root):], true
-	}
-	return "", false
-}
-
 type Options struct {
-	Client *client.Client
+	// Store is the extension's view of the filesystem below itself (the
+	// chain tail with the cache included). Assembly attaches it after
+	// construction when nil (AttachStore); a nil store keeps the
+	// extension dormant and fully pass-through.
+	Store  fs.Filesystem
 	Events *fs.EventBus
-	// OnWorkspaceRefresh reports one workspace list; forced marks a
-	// reload an explicit invalidation or arm signal asked for (v1's
-	// forced_refresh counter) as opposed to a lazy miss.
-	OnWorkspaceRefresh func(forced bool)
-
 	// LocalRoot is the mount's local overlay root. Workspaces under it
 	// carry a real .git directory whose state is checkpointed to the
-	// server and restored on mount.
+	// store and restored on mount.
 	LocalRoot string
-	// RemoteRoot is the mount's remote subtree root (":"-mount). Server
-	// paths under it are matched and re-rooted onto the mount-local
-	// vocabulary (v1 fs.localPath): a workspace registered server-side
-	// with the absolute path must resolve for the mount's local lookups.
+	// RemoteRoot is the mount's remote subtree root (":"-mount). Store
+	// records carry tenant-absolute roots; they are matched and re-rooted
+	// onto the mount-local vocabulary (v1 fs.localPath) at discovery.
 	RemoteRoot string
+	// OnWorkspaceRefresh reports one store discovery pass; forced marks a
+	// reload an explicit event or Reload asked for, as opposed to the
+	// lazy first-op load (v1's forced_refresh counter).
+	OnWorkspaceRefresh func(forced bool)
+	// Logger receives the extension's background diagnostics (restore and
+	// checkpoint failures); nil disables them.
+	Logger *zap.Logger
 }
 
 // Git is the fs.Handler overlaying git workspaces on the base view.
 type Git struct {
-	onRefresh func(forced bool)
-	// forceNext marks the next list as explicitly forced (v1 pendingForce).
-	forceNext bool
-	// ensureMu serializes workspace lists (v1 ensureInflight/ensureWait):
-	// a mount-start Reload racing the first op's lazy load issues two
-	// concurrent lists, and the stale completion's loadRemoteOverlay
-	// replaces the mirror after a write already landed in it — dropping
-	// the write from the local view until the next reload.
-	ensureMu sync.Mutex
-	// On-demand discovery state (v1 dormant → armed): a mount with no
-	// workspace under its root stays dormant — zero ListGitWorkspaces —
-	// until a local arm signal (the CLI's markers under LocalRoot) or a
-	// non-empty remote index arms it.
-	armed            bool
-	localArmGen      string
-	localArmScanAt   time.Time
-	dormantConfirmed bool // index confirmed empty for this root; skip probes until local arm
-	indexRevision    int64
-	indexMtime       time.Time
-	indexScanAt      time.Time
-	cl               *client.Client
-	bus              *fs.EventBus
-	// localRoot is the mount's overlay root; non-empty arms the local
-	// .git checkpoint machinery (state.go).
+	store     fs.Filesystem
+	bus       *fs.EventBus
 	localRoot string
-	// remoteRoot is the mount's subtree root; server workspace paths are
-	// re-rooted through localPathOf.
-	remoteRoot  string
+	// remoteRoot re-roots tenant-absolute workspace roots onto this
+	// mount's path vocabulary.
+	remoteRoot string
+	onRefresh  func(forced bool)
+	log        *zap.Logger
+	// checkpoints debounces .git state uploads per git dir.
 	checkpoints *debounce.FlushDebouncer
 	// ckptMu serializes checkpoint uploads per extension.
 	ckptMu sync.Mutex
+	// reloadMu single-flights discovery reloads.
+	reloadMu sync.Mutex
 
 	mu         sync.RWMutex
 	workspaces []*workspace
 	loaded     bool
-	// lastListAt throttles miss-driven re-lists: a workspace registered
-	// server-side after this mount started (git clone --fast) is
-	// discovered on the next overlay miss, not only at mount start.
-	lastListAt time.Time
-	// rescanCancel stops the periodic workspace rescan (Start arms it).
-	rescanCancel context.CancelFunc
+
+	// inodes/notify translate store events back onto the kernel's view
+	// of the workspace paths (attached by assembly with the facade's).
+	inodes fs.InodeTable
+	notify fs.Notifier
 
 	// live indexes claimed workspace handles by path (SetAttr
 	// interception, unlink/rename retargeting).
 	live sync.Map
+	// missLogged bounds the classic-fallthrough diagnostics to one line
+	// per path (e2e triage).
+	missLogged sync.Map
 }
 
 // trackWorkspace/untrackWorkspace maintain the claimed-handle index.
@@ -278,21 +297,67 @@ func (g *Git) retargetWorkspace(oldPath, newPath string, h *gitHandle) {
 	g.live.Store(newPath, h)
 }
 
-// ReexecRefusal ports the v1 git gate: the git workspace layer refuses
-// re-exec outright — its in-memory workspace runtimes and overlay mirrors
+// AttachStore wires the chain-tail filesystem view (called by assembly
+// once the handler list exists; before the first dispatch).
+func (g *Git) AttachStore(store fs.Filesystem) {
+	g.mu.Lock()
+	g.store = store
+	g.mu.Unlock()
+}
+
+// Attach wires the facade-owned identity and notifier services so remote
+// store changes invalidate the kernel's view of the mapped workspace
+// paths.
+func (g *Git) Attach(inodes fs.InodeTable, notify fs.Notifier) {
+	g.mu.Lock()
+	g.inodes, g.notify = inodes, notify
+	g.mu.Unlock()
+}
+
+func (g *Git) storeView() fs.Filesystem {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.store
+}
+
+// ReexecRefusal keeps the v1 git gate: the git workspace layer refuses
+// re-exec outright — its in-memory workspace runtimes and mirror indexes
 // do not survive the handoff.
 func (g *Git) ReexecRefusal() (string, int) { return "git_workspace", 1 }
+
+// localPathOf maps a tenant-absolute workspace root onto this mount's
+// path vocabulary; a root outside the subtree (ok=false) is not this
+// mount's workspace (v1 fs.localPath).
+func (g *Git) localPathOf(remote string) (string, bool) {
+	p := strings.TrimSuffix(strings.TrimSpace(remote), "/")
+	if p == "" {
+		p = "/"
+	}
+	root := g.remoteRoot
+	if root == "" {
+		return p, true
+	}
+	if p == root {
+		return "/", true
+	}
+	if strings.HasPrefix(p, root+"/") {
+		return p[len(root):], true
+	}
+	return "", false
+}
 
 // RoutesLocal reports view paths the git plane declares local (v1
 // gitDirShouldBeLocalOverlay): a discovered workspace's .git directory
 // routes to the local overlay, so the restored .git state backs git's own
-// file traffic instead of the remote. A pending marker widens the claim to
-// a workspace still being created — `drive9 git clone --fast` writes the
-// marker before git runs and only registers the workspace row after the
-// clone; without the marker a live mount classifies .git as remote during
-// the clone (uploading the object database) and flips to an EMPTY overlay
-// on discovery, shadowing the .git the checkpoint is about to read.
+// file traffic instead of the remote. A pending marker widens the claim
+// to a workspace still being created — `drive9 git clone --fast` writes
+// the marker before git runs and only registers the record after the
+// clone; without it a live mount classifies .git as remote during the
+// clone and uploads the object database.
 func (g *Git) RoutesLocal(viewPath string) bool {
+	if g == nil {
+		return false
+	}
 	// Cheap necessary condition: only a path with a `.git` segment can
 	// match (segment-exact — `.gitignore` must not).
 	if !pathHasGitDirSegment(viewPath) {
@@ -305,11 +370,9 @@ func (g *Git) RoutesLocal(viewPath string) bool {
 	if g.localRoot != "" && gitcache.WorkspacePending(context.Background(), g.localRoot, root) {
 		return true
 	}
-	// In-memory workspace list only — this must not trigger workspace
-	// routing (a throttled refresh from every `.git` access during a
-	// clone).
-	w, rel, ok := g.workspaceFor(viewPath)
-	if !ok || w == nil {
+	// In-memory workspace list only — this must not trigger discovery.
+	w, rel, hit := g.workspaceFor(viewPath)
+	if !hit || w == nil {
 		return false
 	}
 	return rel == ".git" || strings.HasPrefix(rel, ".git/")
@@ -345,27 +408,26 @@ func mountRootForGitDirPath(viewPath string) (string, bool) {
 }
 
 func New(opts Options) (*Git, error) {
-	if opts.Client == nil {
-		return nil, fmt.Errorf("git: client is required")
+	root := strings.TrimSuffix(strings.TrimSpace(opts.RemoteRoot), "/")
+	if root != "" && !strings.HasPrefix(root, "/") {
+		root = "/" + root
 	}
-	g := &Git{cl: opts.Client, bus: opts.Events, localRoot: opts.LocalRoot,
-		remoteRoot: strings.TrimSuffix(strings.TrimSpace(opts.RemoteRoot), "/"),
-		onRefresh:  opts.OnWorkspaceRefresh}
+	if root == "/" {
+		root = ""
+	}
+	log := opts.Logger
+	if log == nil {
+		log = zap.NewNop()
+	}
+	g := &Git{store: opts.Store, bus: opts.Events, localRoot: opts.LocalRoot, remoteRoot: root, onRefresh: opts.OnWorkspaceRefresh, log: log}
 	if g.localRoot != "" {
 		g.checkpoints = debounce.NewFlushDebouncer(gitCheckpointDebounce)
 	}
 	if g.bus != nil {
-		g.bus.On(fs.EventInvalidated, func(e fs.Event) {
-			if e.Path != "/" {
-				return
-			}
-			// coarse reset signal: force a workspace reload (the forced
-			// counter distinguishes it from lazy miss-driven lists)
-			g.mu.Lock()
-			g.loaded = false
-			g.forceNext = true
-			g.mu.Unlock()
-		})
+		for _, kind := range []fs.EventKind{fs.EventInvalidated, fs.EventDelete} {
+			g.bus.On(kind, func(e fs.Event) { g.onStoreEvent(e.Path) })
+		}
+		g.bus.On(fs.EventCheckout, func(e fs.Event) { g.onStoreEvent(e.Path) })
 		g.bus.On(fs.EventWrite, func(e fs.Event) {
 			// Writes under a workspace's .git (namespace mutations —
 			// git's own file traffic) debounce a state checkpoint.
@@ -377,305 +439,361 @@ func New(opts Options) (*Git, error) {
 	return g, nil
 }
 
-// ensureWorkspaceState lazily restores a workspace's local .git once its
-// server-side state exists: the discovery-time restore races the CLI's
-// checkpoint upload (git clone --fast registers the workspace BEFORE the
-// state lands). Sync per workspace, bounded by the hydrate budget.
-func (g *Git) ensureWorkspaceState(ctx context.Context, w *workspace) error {
-	if g.localRoot == "" {
-		return nil
-	}
-	w.stateRestoreMu.Lock()
-	defer w.stateRestoreMu.Unlock()
-	if w.restoreLatched {
-		return nil
-	}
-	rctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceHydrateTimeout)
-	defer cancel()
-	if err := g.restoreWorkspaceState(rctx, w); err != nil {
-		// Not latched: a transient failure (or a checkpoint the CLI
-		// has not uploaded yet — discovery races the upload) retries
-		// at the next entry point. A not-yet-uploaded checkpoint is
-		// quiet; real failures surface for diagnosis.
-		if !errors.Is(err, errGitStateNotReady) {
-			fmt.Fprintf(os.Stderr, "drive9: git state restore failed for workspace %s: %v\n", w.id, err)
-		}
-		return nil
-	}
-	if w.blobless() {
-		// A blobless restore prefetches the HEAD tree's blobs
-		// before serving.
-		if err := g.MaterializeHeadTree(rctx, g.gitDirFor(w.rootPath())); err != nil {
-			fmt.Fprintf(os.Stderr, "drive9: git head tree materialize failed for workspace %s: %v\n", w.id, err)
-		}
-	}
-	w.restoreLatched = true
-	return nil
-}
-
-// gitWorkspaceDiscoveryWindow bounds how often a miss re-lists workspaces.
-const gitWorkspaceDiscoveryWindow = 2 * time.Second
-
-// reloadIfStale re-lists workspaces when a path fell outside every known
-// workspace and the last list is older than the discovery window — the
-// miss-driven half of v1's index rescan (git clone --fast registers the
-// workspace server-side mid-mount; lookups must then discover it).
-func (g *Git) reloadIfStale(ctx context.Context) {
-	g.mu.RLock()
-	stale := time.Since(g.lastListAt) >= gitWorkspaceDiscoveryWindow
-	g.mu.RUnlock()
-	if !stale {
+// onStoreEvent reacts to coherence events: the store documents reload
+// discovery, overlay mutations revalidate one routing entry and knock
+// the kernel's cached user path, and coarse resets drop the loaded flag.
+func (g *Git) onStoreEvent(path string) {
+	if path == "" {
 		return
 	}
-	g.Reload(ctx)
+	if path == "/" {
+		g.mu.Lock()
+		g.loaded = false
+		g.mu.Unlock()
+		return
+	}
+	if !strings.HasPrefix(path, gitws.Root+"/") {
+		return
+	}
+	if isStoreDocPath(path) {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			g.Reload(ctx)
+			// A checkpoint landing for a workspace whose local .git is
+			// still missing (this mount discovered the record before the
+			// CLI uploaded its state) gets its restore retried — after
+			// the reload, so a record the reload itself discovers is
+			// covered too.
+			if strings.HasSuffix(path, "/git-state.json") {
+				g.scheduleMissingRestore(path)
+			}
+		}()
+		return
+	}
+	if id, rel, ok := splitOverlayStorePath(path); ok {
+		g.revalidateOverlayRel(id, rel)
+	}
 }
 
-// Reload forces a fresh workspace list.
+// isStoreDocPath reports a registry/record document whose change reloads
+// discovery (the index, and each workspace's manifest, state, tree index,
+// and binary-sidecar metadata all reshape the workspace set or inputs).
+func isStoreDocPath(p string) bool {
+	rest := strings.TrimPrefix(p, gitws.Root+"/")
+	id, tail, ok := strings.Cut(rest, "/")
+	if !ok || id == "" {
+		return true // the index document or the root itself
+	}
+	switch tail {
+	case "manifest.json", "state", "tree-index.json", "git-state.json", "git-state.tar.gz":
+		return true
+	}
+	return strings.HasPrefix(tail, "packs/")
+}
+
+// splitOverlayStorePath maps a store event path onto (workspace, rel)
+// for overlay and blackout mutations.
+func splitOverlayStorePath(p string) (string, string, bool) {
+	rest := strings.TrimPrefix(p, gitws.Root+"/")
+	id, tail, ok := strings.Cut(rest, "/")
+	if !ok || id == "" {
+		return "", "", false
+	}
+	for _, plane := range []string{"overlay/", "overlay-blackouts/"} {
+		if rel, ok := strings.CutPrefix(tail, plane); ok && rel != "" {
+			return id, rel, true
+		}
+	}
+	return "", "", false
+}
+
+// revalidateOverlayRel re-derives one routing entry from the store and
+// invalidates the kernel's view of the mapped user path.
+func (g *Git) revalidateOverlayRel(id, rel string) {
+	store := g.storeView()
+	if store == nil {
+		return
+	}
+	w := g.workspaceByID(id)
+	if w == nil {
+		return
+	}
+	rel, err := gitws.CleanRel(rel)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var next overlayNode
+	if attr, err := store.GetAttr(ctx, gitws.OverlayPath(id, rel)); err == nil {
+		next = overlayNodeFromAttr(attr)
+	} else if _, err := store.GetAttr(ctx, gitws.BlackoutPath(id, rel)); err == nil {
+		next = overlayNode{blackout: true}
+	} else {
+		// Both records are gone: fall the path back to the clean tree or
+		// the classic namespace instead of pinning a phantom overlay.
+		w.drop(rel)
+		g.notifyUserPath(w.rootPath(), rel)
+		return
+	}
+	w.set(rel, next)
+	g.notifyUserPath(w.rootPath(), rel)
+}
+
+// notifyUserPath knocks the kernel's caches for <root>/<rel> after a
+// remote store change (the SSE layer already invalidated the store path;
+// only this extension knows the mapping back onto the view).
+func (g *Git) notifyUserPath(root, rel string) {
+	if g.notify == nil || g.inodes == nil {
+		return
+	}
+	user := strings.TrimSuffix(root, "/") + "/" + rel
+	if root == "/" {
+		user = "/" + rel
+	}
+	g.mu.RLock()
+	inodes, notify := g.inodes, g.notify
+	g.mu.RUnlock()
+	if ino, ok := inodes.Ino(user); ok {
+		notify.InvalidateContent(ino, 0)
+	}
+	if dir, base := splitDirBase(user); dir != "" {
+		if parentIno, ok := inodes.Ino(dir); ok {
+			notify.InvalidateEntry(parentIno, base)
+		}
+	}
+}
+
+func splitDirBase(p string) (string, string) {
+	i := strings.LastIndexByte(p, '/')
+	if i < 0 {
+		return "", p
+	}
+	if i == 0 {
+		return "/", p[1:]
+	}
+	return p[:i], p[i+1:]
+}
+
+// Reload forces a fresh workspace discovery from the store.
 func (g *Git) Reload(ctx context.Context) {
 	g.mu.Lock()
 	g.loaded = false
 	g.mu.Unlock()
-	g.ensure(ctx)
+	g.reloadMu.Lock()
+	defer g.reloadMu.Unlock()
+	g.discover(ctx, true)
 }
 
-// ensure loads the workspace list once; a failed load retries on the next
-// op. Reloading merges by workspace ID and reuses the loaded objects: the
-// mount-start Reload races the first ops' lazy load, and a wholesale swap
-// would drop overlay state already mirrored locally (writes the server
-// accepted but nothing re-fetches).
-// tryArmFromLocalSignals scans the CLI's local arm markers, throttled on
-// the hot path (v1 tryArmFromLocalSignals): a new marker generation arms
-// the dormant state and forces one list. Generation fingerprinting (not
-// mtime) makes a second same-second --fast still count.
-func (g *Git) tryArmFromLocalSignals() {
-	if g.localRoot == "" {
-		return
-	}
-	now := time.Now()
-	g.mu.RLock()
-	lastScan := g.localArmScanAt
-	g.mu.RUnlock()
-	if !lastScan.IsZero() && now.Sub(lastScan) < gitWorkspaceDiscoveryWindow {
-		return
-	}
-	signal, gen := gitcache.LocalArmSignal(context.Background(), g.localRoot)
-	g.mu.Lock()
-	g.localArmScanAt = now
-	if signal {
-		genAdvanced := gen != "" && gen != g.localArmGen
-		if gen != "" {
-			g.localArmGen = gen
-		}
-		if !g.armed || genAdvanced {
-			g.armed = true
-			g.dormantConfirmed = false
-			g.forceNext = true
-			g.loaded = false
-		}
-	}
-	g.mu.Unlock()
-}
-
-// maybeArmFromIndex probes the remote index once while dormant: an entry
-// rooted under this mount arms and forces one list; an absent or
-// root-empty index confirms dormancy (v1 dormantConfirmed) so ordinary
-// traffic never lists again until a local arm signal appears.
-func (g *Git) maybeArmFromIndex(ctx context.Context) {
-	g.mu.RLock()
-	confirmed := g.dormantConfirmed
-	armed := g.armed
-	g.mu.RUnlock()
-	if confirmed || armed {
-		return
-	}
-	idx, _, err := g.cl.ReadGitWorkspaceIndex(ctx)
-	if err != nil {
-		return
-	}
-	relevant := false
-	if idx != nil {
-		root := strings.TrimSuffix(g.remoteRoot, "/")
-		for _, e := range idx.Workspaces {
-			p := strings.TrimSuffix(strings.TrimSpace(e.RootPath), "/")
-			if root == "" || root == "/" || p == root || strings.HasPrefix(p, root+"/") {
-				relevant = true
-				break
-			}
-		}
-	}
-	g.mu.Lock()
-	if relevant {
-		g.armed = true
-		g.forceNext = true
-		g.loaded = false
-	} else {
-		g.dormantConfirmed = true
-	}
-	g.mu.Unlock()
-}
-
-// maybeRescanRemoteIndex probes the remote workspace index (v1
-// maybeRescanRemoteIndex): a revision advance on an armed mount forces one
-// list; a dormant mount arms when a probe first finds the index (a fresh
-// LocalRoot remount discovers via the index, G2).
-func (g *Git) maybeRescanRemoteIndex(ctx context.Context) {
-	g.mu.RLock()
-	armed := g.armed
-	lastScan := g.indexScanAt
-	prevRev := g.indexRevision
-	prevMT := g.indexMtime
-	g.mu.RUnlock()
-	// The index never arms a dormant mount (v1 AC5): ordinary traffic on
-	// a workspace-free root lists zero times. An armed mount re-lists
-	// when the index revision advances (cross-host discovery).
-	if !armed {
-		return
-	}
-	if !lastScan.IsZero() && time.Since(lastScan) < gitWorkspaceRescanInterval {
-		return
-	}
-	exists, rev, mtime, err := g.cl.StatGitWorkspaceIndex(ctx)
-	g.mu.Lock()
-	g.indexScanAt = time.Now()
-	if err != nil {
-		g.mu.Unlock()
-		return
-	}
-	if !exists {
-		g.mu.Unlock()
-		return
-	}
-	advanced := rev != prevRev || (!mtime.IsZero() && mtime.After(prevMT))
-	g.indexRevision = rev
-	g.indexMtime = mtime
-	if advanced {
-		g.forceNext = true
-		g.loaded = false
-	}
-	g.mu.Unlock()
-}
-
-func (g *Git) ensure(ctx context.Context) {
-	g.tryArmFromLocalSignals()
+// discover loads the workspace set once; a failed load retries on the
+// next op. Both the lazy op path and forced reloads go through reloadMu
+// (single-flight): a stale lazy pass must not flip loaded under a forced
+// caller that has newer state. Loaded workspace objects are reused by id
+// so in-flight claimed handles keep a stable identity across reloads.
+func (g *Git) discover(ctx context.Context, forced bool) {
 	g.mu.RLock()
 	loaded := g.loaded
 	g.mu.RUnlock()
 	if loaded {
 		return
 	}
-	// Single-flight (v1 ensureInflight): wait for any in-flight list and
-	// re-check — the leader's completion satisfies this caller too, and a
-	// stale second loadRemoteOverlay must not race the leader's mirror
-	// publication.
-	g.ensureMu.Lock()
-	defer g.ensureMu.Unlock()
-	g.mu.RLock()
-	loaded = g.loaded
-	forced := g.forceNext
-	armed := g.armed
-	g.mu.RUnlock()
-	if loaded || !armed {
-		if !armed {
-			// Dormant: no ListGitWorkspaces (v1 G0/AC5). One index probe
-			// decides: entries under this mount's root arm the plane (a
-			// fresh-LocalRoot remount still discovers, G2); an empty or
-			// absent index confirms dormant until a local arm signal.
-			g.maybeArmFromIndex(ctx)
-		}
+	store := g.storeView()
+	if store == nil {
 		return
 	}
-	if g.onRefresh != nil {
-		g.onRefresh(forced)
-	}
-	g.mu.Lock()
-	g.forceNext = false
-	g.mu.Unlock()
-	list, err := g.cl.ListGitWorkspaces(ctx)
+	idx, err := readStoreIndex(ctx, store)
 	if err != nil {
 		return
 	}
 	g.mu.Lock()
 	prev := make(map[string]*workspace, len(g.workspaces))
-	existingIDs := make(map[string]bool, len(g.workspaces))
 	for _, w := range g.workspaces {
 		prev[w.id] = w
-		existingIDs[w.id] = true
 	}
-	var ws []*workspace
-	for _, gw := range list {
-		if gw.WorkspaceID == "" || strings.TrimSpace(gw.RootPath) == "" {
-			continue
-		}
-		root, local := g.localPathOf(gw.RootPath)
-		if !local {
-			// outside this mount's subtree
-			continue
-		}
-		if gw.Status == "deleted" {
-			continue
-		}
-		var w *workspace
-		if existing, ok := prev[gw.WorkspaceID]; ok {
-			w = existing
-			w.setMeta(root, gw.HeadCommit, gw.RepoURL, gw.Mode == "fast-blobless", gw.CreatedAt)
-			delete(prev, gw.WorkspaceID)
-		} else {
-			w = &workspace{
-				id:           gw.WorkspaceID,
-				root:         root,
-				headCommit:   gw.HeadCommit,
-				repoURL:      gw.RepoURL,
-				fastBlobless: gw.Mode == "fast-blobless",
-				createdAt:    gw.CreatedAt,
-			}
-		}
-		ws = append(ws, w)
-	}
-	g.workspaces = ws
-	g.loaded = true
-	g.lastListAt = time.Now()
 	g.mu.Unlock()
-	// Fetch each workspace's remote overlay and HEAD tree OFF the list
-	// lock (v1 rt.overlay + rt.nodes): other clients' modifications and
-	// the fast-clone clean-file view become visible. The overlay mirror
-	// follows the server log on every list (our writes round-trip through
-	// PutGitOverlayEntry); entries added to the mirror while the fetch was
-	// in flight are re-applied after the replacement so a local write never
-	// disappears under a stale snapshot.
-	for _, w := range ws {
-		g.loadRemoteOverlay(ctx, w)
-		g.refreshTree(ctx, w)
-		// Every workspace gets a restore attempt on every load: one
-		// discovered after mount start (git clone --fast registers it
-		// server-side) needs its .git before clean-file reads can
-		// materialize blobs, and one whose earlier attempt failed (the
-		// checkpoint raced the discovery) retries on the next reload —
-		// the success latch makes repeat attempts a no-op.
-		if g.localRoot != "" {
-			go func(w *workspace) {
-				_ = g.ensureWorkspaceState(ctx, w)
-			}(w)
+
+	var next []*workspace
+	for _, entry := range idx.Workspaces {
+		if err := gitws.ValidateID(entry.WorkspaceID); err != nil {
+			continue
+		}
+		if strings.TrimSpace(entry.RootPath) == "" {
+			continue
+		}
+		w, ok := g.loadWorkspace(ctx, store, entry, prev[entry.WorkspaceID])
+		if !ok {
+			continue
+		}
+		delete(prev, entry.WorkspaceID)
+		next = append(next, w)
+	}
+	changed := len(prev) > 0 // roots that dropped out of the index
+	for _, w := range next {
+		if p, ok := prev[w.id]; !ok || p.rootPath() != w.rootPath() || p.head() != w.head() {
+			changed = true
+		}
+	}
+	g.mu.Lock()
+	firstLoad := g.workspaces == nil && !g.loaded
+	g.workspaces = next
+	g.loaded = true
+	g.mu.Unlock()
+	if firstLoad || changed {
+		roots := make([]string, 0, len(next))
+		for _, w := range next {
+			roots = append(roots, w.rootPath())
+		}
+		g.log.Info("git workspaces discovered", zap.Int("count", len(roots)), zap.Strings("roots", roots))
+	}
+	if changed {
+		// The view under these roots changed (workspaces appeared, moved,
+		// or vanished): the facade's namespace cache and the kernel's
+		// dentries may still hold the pre-discovery (classic-only) image —
+		// a lookup served from that cache would keep answering ENOENT for
+		// every tracked path until its TTL expires.
+		for _, w := range next {
+			g.invalidateRoot(w)
+		}
+		for _, w := range prev {
+			// Roots that dropped out of the index: flush their view too.
+			g.invalidateRoot(w)
+		}
+	}
+	if g.onRefresh != nil {
+		g.onRefresh(forced)
+	}
+}
+
+// invalidateRoot flushes the cached view under one workspace root: the
+// bus event drops the facade's namespace-cache listing and the read
+// caches' entries, and the notification drops the kernel's dentries.
+func (g *Git) invalidateRoot(w *workspace) {
+	root := w.rootPath()
+	if g.bus != nil {
+		g.bus.Emit(fs.Event{Kind: fs.EventInvalidated, Path: root})
+	}
+	g.mu.RLock()
+	inodes, notify := g.inodes, g.notify
+	g.mu.RUnlock()
+	if inodes == nil || notify == nil {
+		return
+	}
+	if ino, ok := inodes.Ino(root); ok {
+		notify.InvalidateContent(ino, 0)
+	}
+	if dir, base := splitDirBase(root); dir != "" {
+		if parentIno, ok := inodes.Ino(dir); ok {
+			notify.InvalidateEntry(parentIno, base)
 		}
 	}
 }
 
-// refreshTree loads the HEAD tree when its commit changed since the last
-// load (v1 armed-runtime tree load; the periodic rescan re-checks cheaply).
-func (g *Git) refreshTree(ctx context.Context, w *workspace) {
-	head := w.head()
-	if head == "" {
+// ensureLoaded is the op path into discovery: serialize with forced
+// reloads through the same single-flight lock.
+func (g *Git) ensureLoaded(ctx context.Context) {
+	g.mu.RLock()
+	loaded := g.loaded
+	g.mu.RUnlock()
+	if loaded {
 		return
 	}
-	w.mu.RLock()
-	loadedFor := w.treeLoaded
-	w.mu.RUnlock()
-	if loadedFor == head {
-		return
+	g.reloadMu.Lock()
+	defer g.reloadMu.Unlock()
+	g.discover(ctx, false)
+}
+
+// loadWorkspace reads one workspace record (manifest, state, tree index)
+// and rebuilds its dirty-mirror routing index from the store, reusing w
+// when the record already exists.
+func (g *Git) loadWorkspace(ctx context.Context, store fs.Filesystem, entry gitwsindex.Entry, prev *workspace) (*workspace, bool) {
+	manifestBody, err := readStoreDoc(ctx, store, gitws.ManifestPath(entry.WorkspaceID))
+	if err != nil {
+		return nil, false // not registered in the store (or unreadable): skip
 	}
-	g.loadTree(ctx, w)
-	w.mu.Lock()
-	w.treeLoaded = head
-	w.mu.Unlock()
+	m, err := gitws.ParseManifest(manifestBody)
+	if err != nil {
+		g.log.Warn("git workspace manifest unreadable", zap.String("workspace", entry.WorkspaceID), zap.Error(err))
+		return nil, false
+	}
+	if body, err := readStoreDoc(ctx, store, gitws.StatePath(entry.WorkspaceID)); err == nil {
+		if gitws.ParseState(body) == gitws.StateDeleted {
+			return nil, false
+		}
+	} else if !fs.IsNotFound(err) {
+		return nil, false
+	}
+
+	if err := gitws.ValidateCommit(m.HeadCommit); err != nil {
+		g.log.Warn("git workspace manifest has invalid head commit", zap.String("workspace", entry.WorkspaceID), zap.Error(err))
+		return nil, false
+	}
+	root, ok := g.localPathOf(m.RootPath)
+	if !ok {
+		return nil, false // registered outside this mount's subtree
+	}
+	var createdAt time.Time
+	if m.CreatedAt != "" {
+		if t, terr := time.Parse(time.RFC3339, m.CreatedAt); terr == nil {
+			createdAt = t
+		}
+	}
+	tracked := map[string]gitws.TreeEntry{}
+	if body, err := readStoreDoc(ctx, store, gitws.TreeIndexPath(entry.WorkspaceID)); err == nil {
+		if idx, perr := gitws.ParseTreeIndex(body); perr == nil {
+			for _, e := range idx.Entries {
+				if rel, cerr := gitws.CleanRel(e.Path); cerr == nil {
+					tracked[rel] = e
+				}
+			}
+		}
+	}
+	walkStart := time.Now()
+	overlay, walkErr := walkOverlayIndex(ctx, store, entry.WorkspaceID)
+
+	w := prev
+	if w == nil {
+		if walkErr != nil {
+			// First load with an unreadable mirror: nothing trusted to
+			// serve the workspace view from.
+			return nil, false
+		}
+		w = &workspace{id: entry.WorkspaceID}
+	} else if walkErr != nil {
+		// Reload with a transient mirror failure: keep the previously
+		// derived routing instead of replacing it with a partial walk.
+		w.mu.RLock()
+		overlay = w.overlay
+		w.mu.RUnlock()
+	} else if prev != nil {
+		// Overlay refresh fence (#1029 review round, FS-native port): a
+		// local mirror write that lands while the walk was in flight is
+		// newer than the snapshot and must win over it — the walk's image
+		// predates the landing, and nothing re-delivers the write later.
+		w.mu.RLock()
+		for rel, node := range w.overlay {
+			if node.mtime.After(walkStart) {
+				if cur, ok := overlay[rel]; !ok || !cur.mtime.After(node.mtime) {
+					overlay[rel] = node
+				}
+			}
+		}
+		w.mu.RUnlock()
+	}
+	w.setMeta(root, m.HeadCommit, m.RepoURL, m.Mode == "fast-blobless",
+		m.WorkspaceKind, m.CommonWorkspaceID, m.WorktreeName, createdAt, tracked, overlay)
+	return w, true
+}
+
+func (g *Git) workspaceByID(id string) *workspace {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	for _, w := range g.workspaces {
+		if w.id == id {
+			return w
+		}
+	}
+	return nil
 }
 
 // workspaceFor returns the workspace whose root is the longest prefix of
@@ -703,76 +821,67 @@ func (g *Git) workspaceFor(path string) (*workspace, string, bool) {
 	return best, rel, true
 }
 
-// Start reloads workspaces at mount start. The reload is async and retries
-// lazily on the next op — a slow or absent /v1/git-workspaces endpoint must
-// never block Init (go-fuse calls Init inside the serve loop). With a local
+// Start reloads workspaces at mount start. The reload is async and
+// retries lazily on the next op — a slow or absent store must never
+// block Init (go-fuse calls Init inside the serve loop). With a local
 // root, each workspace's checkpointed .git state comes back before the
-// mount serves (objects from the remote clone, then stored packs, then the
-// state archive — swapped atomically). A periodic rescan (v1
-// gitWorkspaceIndexRescanInterval) arms workspaces registered after the
-// mount without a remount.
+// mount serves (objects from the remote clone, then stored packs, then
+// the state archive — swapped atomically), and the record's state file
+// flips from dormant to armed.
 func (g *Git) Start(ctx context.Context) error {
 	go func() {
-		// v1 starts DORMANT: no initial ListGitWorkspaces. Local arm
-		// signals or a non-empty remote index arm the first list; an
-		// armed mount's checkpointed workspaces then restore.
-		g.tryArmFromLocalSignals()
+		reloadCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		g.Reload(reloadCtx)
+		cancel()
+		if g.localRoot == "" {
+			return
+		}
 		g.mu.RLock()
-		armed := g.armed
+		workspaces := make([]*workspace, len(g.workspaces))
+		copy(workspaces, g.workspaces)
 		g.mu.RUnlock()
-		if !armed {
-			probeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			g.maybeArmFromIndex(probeCtx)
-			cancel()
-			g.mu.RLock()
-			armed = g.armed
-			g.mu.RUnlock()
-		}
-		if armed {
-			reloadCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			g.Reload(reloadCtx)
-			cancel()
-		}
-		if g.localRoot != "" {
-			g.mu.RLock()
-			workspaces := make([]*workspace, len(g.workspaces))
-			copy(workspaces, g.workspaces)
-			g.mu.RUnlock()
-			restoreCtx, restoreCancel := context.WithTimeout(context.Background(), gitWorkspaceHydrateTimeout)
-			defer restoreCancel()
+		restoreCtx, restoreCancel := context.WithTimeout(context.Background(), gitWorkspaceHydrateTimeout)
+		defer restoreCancel()
+		// Main workspaces restore first so linked worktrees can anchor
+		// their gitdir against the common .git.
+		for pass := 0; pass < 2; pass++ {
 			for _, w := range workspaces {
-				// All restore entry points (mount start, discovery, lazy
-				// blob reads) serialize on the workspace's restore gate:
-				// two concurrent restores race their RemoveAll+Rename
-				// swap and can leave a half-deleted .git behind.
-				_ = g.ensureWorkspaceState(restoreCtx, w)
-			}
-		}
-	}()
-	rescanCtx, rescanCancel := context.WithCancel(context.Background())
-	g.rescanCancel = rescanCancel
-	go func() {
-		ticker := time.NewTicker(gitWorkspaceRescanInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-rescanCtx.Done():
-				return
-			case <-ticker.C:
-				rescanCtx2, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-				g.tryArmFromLocalSignals()
-				g.maybeRescanRemoteIndex(rescanCtx2)
-				g.mu.RLock()
-				armed := g.armed
-				g.mu.RUnlock()
-				if armed {
-					g.Reload(rescanCtx2)
+				if (pass == 0) == w.linked() {
+					continue
 				}
-				cancel()
+				g.armWorkspace(restoreCtx, w)
+				if err := g.restoreWorkspaceState(restoreCtx, w); err != nil {
+					g.log.Warn("git state restore failed", zap.String("workspace", w.id), zap.Error(err))
+					continue
+				}
+				if w.blobless() && !w.linked() {
+					// A blobless restore prefetches the HEAD tree's
+					// blobs before serving.
+					if err := g.MaterializeHeadTree(restoreCtx, g.gitDirForWorkspace(w)); err != nil {
+						g.log.Warn("git head tree materialize failed", zap.String("workspace", w.id), zap.Error(err))
+					}
+				}
 			}
 		}
 	}()
 	return nil
+}
+
+// armWorkspace flips the record's state file from dormant to armed
+// (advisory; best-effort).
+func (g *Git) armWorkspace(ctx context.Context, w *workspace) {
+	store := g.storeView()
+	if store == nil {
+		return
+	}
+	body, err := readStoreDoc(ctx, store, gitws.StatePath(w.id))
+	if err != nil {
+		return
+	}
+	if gitws.ParseState(body) != gitws.StateDormant {
+		return
+	}
+	_ = store.Write(ctx, gitws.StatePath(w.id), []byte(gitws.StateArmed+"\n"), fs.WriteOptions{Mode: 0o644, Truncate: true})
 }
 
 // Drain flushes pending debounced checkpoints.
@@ -785,9 +894,105 @@ func (g *Git) Drain(ctx context.Context) error {
 
 // Stop checkpoints every workspace's state at shutdown.
 func (g *Git) Stop(ctx context.Context) error {
-	if g.rescanCancel != nil {
-		g.rescanCancel()
-	}
 	g.checkpointAllGitWorkspaces()
 	return nil
+}
+
+// walkOverlayIndex rebuilds the dirty-mirror routing index by walking
+// overlay/ and overlay-blackouts/ (the fs is the index). A missing root
+// is an empty mirror; any other listing error is returned so the caller
+// can keep the previously derived routing instead of a partial walk. A
+// torn writer that left both an upsert and a blackout for one path
+// resolves with the upsert opinion for routing (the marker is dropped at
+// the next landing).
+func walkOverlayIndex(ctx context.Context, store fs.Filesystem, id string) (map[string]overlayNode, error) {
+	out := map[string]overlayNode{}
+	if err := walkStore(ctx, store, gitws.OverlayDir(id), "", func(rel string, attr fs.Attr) {
+		out[rel] = overlayNodeFromAttr(attr)
+	}); err != nil {
+		return nil, err
+	}
+	if err := walkStore(ctx, store, gitws.BlackoutDir(id), "", func(rel string, attr fs.Attr) {
+		if _, upserted := out[rel]; !upserted {
+			out[rel] = overlayNode{blackout: true}
+		}
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func overlayNodeFromAttr(attr fs.Attr) overlayNode {
+	node := overlayNode{kind: attr.Kind, mode: attr.Mode, size: attr.Size, mtime: attr.Mtime}
+	if node.mode == 0 {
+		switch node.kind {
+		case fs.KindDir:
+			node.mode = 0o755
+		case fs.KindSymlink:
+			node.mode = 0o777
+		default:
+			node.mode = 0o644
+		}
+	}
+	return node
+}
+
+// walkStore recursively lists a store subtree, reporting file and symlink
+// leaves (directories are implied by their children). A missing root is
+// success (empty subtree); any other listing error propagates.
+func walkStore(ctx context.Context, store fs.Filesystem, dir, prefix string, fn func(rel string, attr fs.Attr)) error {
+	entries, err := store.List(ctx, dir)
+	if err != nil {
+		if fs.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		rel := e.Name
+		if prefix != "" {
+			rel = prefix + "/" + e.Name
+		}
+		if e.Attr.IsDir() {
+			if err := walkStore(ctx, store, dir+"/"+e.Name, rel, fn); err != nil {
+				return err
+			}
+			continue
+		}
+		fn(rel, e.Attr)
+	}
+	return nil
+}
+
+// readStoreDoc reads one bounded whole store document. Workspace
+// metadata is store-writable: the read limit keeps a hostile or broken
+// document (multi-gigabyte manifest, index, or tree index) from being
+// fully materialized before the parsers' own caps apply.
+func readStoreDoc(ctx context.Context, store fs.Filesystem, p string) ([]byte, error) {
+	return readStoreDocMax(ctx, store, p, gitws.MaxDocBytes)
+}
+
+// readStoreDocMax reads at most max+1 bytes and rejects anything longer.
+func readStoreDocMax(ctx context.Context, store fs.Filesystem, p string, max int64) ([]byte, error) {
+	data, err := store.Read(ctx, p, 0, max+1)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("git workspace document %s exceeds %d bytes", p, max)
+	}
+	return data, nil
+}
+
+// readStoreIndex loads and parses the registry document (empty when the
+// store has no workspaces yet).
+func readStoreIndex(ctx context.Context, store fs.Filesystem) (*gitwsindex.Index, error) {
+	body, err := readStoreDocMax(ctx, store, gitwsindex.Path, gitwsindex.MaxBytes)
+	if err != nil {
+		if fs.IsNotFound(err) {
+			return &gitwsindex.Index{}, nil
+		}
+		return nil, err
+	}
+	return gitwsindex.Parse(body)
 }

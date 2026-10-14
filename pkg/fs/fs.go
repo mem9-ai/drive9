@@ -59,7 +59,11 @@ func (f HandlerFilesystem) Write(ctx context.Context, path string, data []byte, 
 	if rev == 0 {
 		rev = -1
 	}
-	_, err := f(ctx, &Op{Kind: OpWrite, Path: path, Data: data, Mode: o.Mode, Rev: rev})
+	var flags uint32
+	if o.Truncate {
+		flags |= uint32(FlagTruncate)
+	}
+	_, err := f(ctx, &Op{Kind: OpWrite, Path: path, Data: data, Mode: o.Mode, Rev: rev, Flags: flags})
 	return err
 }
 

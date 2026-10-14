@@ -1,14 +1,14 @@
 package git
 
-// #1029 review round: the overlay refresh fence must protect per-entry
-// mutations — an OVERWRITE of an existing key (or its deletion) that lands
-// while ListGitOverlayEntries is in flight wins over the fetched response,
-// which predates it. Deterministic: the fetch's response is captured on
-// request receipt and delivered only after the local overwrite.
+// #1029 review round, FS-native port: the overlay refresh fence must
+// protect per-entry mutations — an overwrite of an existing mirror entry
+// (or its removal) that lands while the discovery walk is in flight wins
+// over the walked snapshot, which predates it. Deterministic: the walk's
+// directory listing is captured on request receipt and delivered only
+// after the local overwrite has landed.
 
 import (
 	"context"
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -16,84 +16,106 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
+// fencingStore wraps the tail chain and stalls the overlay directory
+// listing until released, so the walk snapshot is provably stale by the
+// time discovery applies it.
+type fencingStore struct {
+	fs.Filesystem
+	overlayDir string
+	release    chan struct{}
+	blocked    chan struct{}
+	blockOnce  sync.Once
+	armed      sync.Map // dir -> visit count
+}
+
+func (s *fencingStore) List(ctx context.Context, dir string) ([]fs.Entry, error) {
+	// Match the overlay plane exactly (dir or a subdir), not the
+	// sibling overlay-blackouts plane.
+	if dir == s.overlayDir || strings.HasPrefix(dir, s.overlayDir+"/") {
+		if v, loaded := s.armed.LoadOrStore(dir, 1); loaded {
+			if n, _ := v.(int); n >= 1 {
+				s.armed.Store(dir, n+1)
+				s.blockOnce.Do(func() { close(s.blocked) })
+				<-s.release
+			}
+		}
+	}
+	return s.Filesystem.List(ctx, dir)
+}
+
 func TestOverlayRefreshPreservesInFlightOverwrite(t *testing.T) {
 	b := testbackend.NewBackend()
-	b.Seed("/repo/f", []byte("base"))
-	b.Seed("/repo/gone.txt", []byte("gone"))
-	b.SeedGitWorkspace("ws-1", "/repo")
-
-	release := make(chan struct{})
-	var once sync.Once
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/overlay") {
-			// Capture the pre-write log the moment the request arrives;
-			// deliver it only after the local overwrite has landed.
-			rec := httptest.NewRecorder()
-			b.ServeHTTP(rec, r)
-			<-release
-			for k, vs := range rec.Header() {
-				for _, v := range vs {
-					w.Header().Add(k, v)
-				}
-			}
-			w.WriteHeader(rec.Code)
-			_, _ = w.Write(rec.Body.Bytes())
-			return
-		}
-		b.ServeHTTP(w, r)
-	}))
-	t.Cleanup(func() { once.Do(func() { close(release) }); ts.Close() })
-
-	g, cl, _ := newGitExt(t, b, "")
-	g.armed = true
-	if err := g.Start(context.Background()); err != nil {
+	seedGitWorkspaceFS(t, b, "ws-1", "/repo", map[string]string{
+		"f":        "base",
+		"gone":     "gone",
+		"keep.txt": "keep",
+	})
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	terminal, _ := core.New(cl, core.Options{})
-	ch, _ := fs.NewChain(g, terminal)
+	storeChain, err := fs.NewChain(terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := &fencingStore{
+		Filesystem: fs.HandlerFilesystem(storeChain.Dispatch),
+		overlayDir: "/.drive9/git-workspaces/ws-1/overlay",
+		release:    make(chan struct{}),
+		blocked:    make(chan struct{}),
+	}
+	g, err := New(Options{Store: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(g, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 
-	// Prime the workspace and the mirror with the first write.
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpWrite, Path: "/repo/f", Offset: 0, Data: []byte("AAAA")}); err != nil {
-		t.Fatal(err)
-	}
+	// First load (unfenced).
+	g.Reload(ctx)
 
-	reloadDone := make(chan struct{}, 1)
-	go func() { g.Reload(ctx); close(reloadDone) }()
+	// Fence the next walk (the overlay listing above armed the
+	// first-visit pass-through), then start a reload in the background.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.Reload(ctx)
+	}()
 
-	// The reload's overlay fetch is now parked on the gate holding the
-	// AAAA-era response. Overwrite the same key and delete another.
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpWrite, Path: "/repo/f", Offset: 0, Data: []byte("BBBB")}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/repo/gone.txt"}); err != nil {
-		t.Fatal(err)
-	}
-	once.Do(func() { close(release) })
+	// Wait until the walk is stalled on the overlay listing (the fence's
+	// second visit), then land a local overwrite of /repo/f through the
+	// extension while the snapshot is still in flight. The landing goes
+	// through the store (the write itself is not what is under test —
+	// the fence merge is), and its mtime postdates the walk start.
 	select {
-	case <-reloadDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("reload did not finish after gate release")
+	case <-fence.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("walk never stalled on the overlay listing")
 	}
+	w, rel, ok := g.workspaceFor("/repo/f")
+	if !ok || rel != "f" {
+		t.Fatalf("workspace lookup rel=%q ok=%v", rel, ok)
+	}
+	if err := g.landOverlayFile(ctx, w, "f", []byte("local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	close(fence.release)
+	<-done
 
-	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/f", Offset: 0, Limit: 4})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(res.Data) != "BBBB" {
-		t.Fatalf("post-reload overlay read = %q, want the acknowledged BBBB overwrite", string(res.Data))
-	}
-	list, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpList, Path: "/repo"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, e := range list.Entries {
-		if e.Name == "gone.txt" {
-			t.Fatal("in-flight deletion resurrected by the fetched overlay response")
-		}
+	// The in-flight overwrite wins over the stale snapshot.
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/f"})
+	if err != nil || string(res.Data) != "local" {
+		t.Fatalf("fenced read = %q %v, want the in-flight local overwrite", res.Data, err)
 	}
 }

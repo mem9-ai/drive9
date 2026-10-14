@@ -551,8 +551,6 @@ func classifyTenantRequest(r *http.Request) tenantRequestClass {
 		return tenantRequestClass{surface: "tokens", action: classifyTokenAction(r)}
 	case path == "/v1/journals" || strings.HasPrefix(path, "/v1/journals/") || path == "/v1/journal-entries":
 		return tenantRequestClass{surface: "journal", action: strings.ToLower(r.Method)}
-	case path == "/v1/git-workspaces" || strings.HasPrefix(path, "/v1/git-workspaces/"):
-		return tenantRequestClass{surface: "git_workspace", action: strings.ToLower(r.Method)}
 	case strings.HasPrefix(path, "/v1/vault/"):
 		return tenantRequestClass{surface: "vault", action: classifyVaultAction(r)}
 	case strings.HasPrefix(path, "/s3/"):

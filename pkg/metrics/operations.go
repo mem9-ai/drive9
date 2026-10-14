@@ -332,7 +332,7 @@ func isOperationFailureResult(result string) bool {
 
 func tenantAttributedSurface(surface, statusClass string) bool {
 	switch surface {
-	case "fs", "upload", "object_store", "sql", "events", "journal", "git_workspace":
+	case "fs", "upload", "object_store", "sql", "events", "journal":
 		return true
 	default:
 		return statusClass == "4xx" || statusClass == "5xx"

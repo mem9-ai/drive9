@@ -264,26 +264,6 @@ func TestPublishGitWorkspaceIndexRetryable(t *testing.T) {
 	}
 }
 
-func TestMarkLocalGitWorkspaceRegisteredRetryable(t *testing.T) {
-	ctx := context.Background()
-	wsID := "ws-mark"
-	notDir := filepath.Join(t.TempDir(), "not-a-dir")
-	if err := os.WriteFile(notDir, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	bad := mountedGitTarget{LocalRoot: notDir}
-	if err := markLocalGitWorkspaceRegistered(ctx, bad, wsID); err == nil {
-		t.Fatal("mark with file LocalRoot succeeded, want error")
-	}
-	good := mountedGitTarget{LocalRoot: t.TempDir()}
-	if err := markLocalGitWorkspaceRegistered(ctx, good, wsID); err != nil {
-		t.Fatalf("mark after previous failure: %v", err)
-	}
-	if err := markLocalGitWorkspaceRegistered(ctx, good, wsID); err != nil {
-		t.Fatalf("idempotent remake: %v", err)
-	}
-}
-
 func TestLinkedWorktreeGitDirMetadataRejectsForeignGitDir(t *testing.T) {
 	root := t.TempDir()
 	baseGit := filepath.Join(root, "base", ".git")
@@ -460,12 +440,16 @@ func TestResolveGitHydrateMode(t *testing.T) {
 		want     gitHydrateMode
 		wantErr  bool
 	}{
-		{name: "auto blobless", raw: "auto", blobless: true, want: gitHydrateModeBackground},
-		{name: "auto full", raw: "auto", blobless: false, want: gitHydrateModeOff},
-		{name: "empty blobless", raw: "", blobless: true, want: gitHydrateModeBackground},
+		// Every fast clone publishes its clean tree to the store now, so
+		// auto resolves to sync; off keeps blobless-only metadata semantics
+		// (gitClone forces the publish for full clones).
+		{name: "auto blobless", raw: "auto", blobless: true, want: gitHydrateModeSync},
+		{name: "auto full", raw: "auto", blobless: false, want: gitHydrateModeSync},
+		{name: "empty blobless", raw: "", blobless: true, want: gitHydrateModeSync},
+		{name: "off blobless", raw: "off", blobless: true, want: gitHydrateModeOff},
 		{name: "off full", raw: "off", blobless: false, want: gitHydrateModeOff},
 		{name: "sync blobless", raw: "sync", blobless: true, want: gitHydrateModeSync},
-		{name: "background full", raw: "background", blobless: false, wantErr: true},
+		{name: "background full", raw: "background", blobless: false, want: gitHydrateModeBackground},
 		{name: "invalid", raw: "now", blobless: true, wantErr: true},
 	}
 	for _, tt := range tests {

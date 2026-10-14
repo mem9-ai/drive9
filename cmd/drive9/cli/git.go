@@ -5,8 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,17 +23,17 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/gitcache"
+	"github.com/mem9-ai/drive9/pkg/gitws"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 const (
-	gitWorkspaceAPITimeout        = 2 * time.Minute
-	githubTreeAPITimeout          = 30 * time.Second
-	gitHydrateTimeout             = 30 * time.Minute
-	githubAPIBaseURL              = "https://api.github.com"
-	gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
+	gitWorkspaceAPITimeout = 2 * time.Minute
+	githubTreeAPITimeout   = 30 * time.Second
+	gitHydrateTimeout      = 30 * time.Minute
+	githubAPIBaseURL       = "https://api.github.com"
 )
 
 // Git handles git-aware drive9 workflows.
@@ -82,9 +80,9 @@ func gitClone(args []string) error {
 	fs := flag.NewFlagSet("git clone", flag.ContinueOnError)
 	fast := fs.Bool("fast", false, "use drive9 git fast clone")
 	blobless := fs.Bool("blobless", false, "use a blobless partial local .git; clean blobs lazy-fetch from the remote")
-	hydrate := fs.String("hydrate", "auto", "blobless clean tree hydrate strategy: auto, background, sync, or off")
+	hydrate := fs.String("hydrate", "auto", "clean tree publish strategy: auto, background, sync, or off (off = blobless metadata-only; full clones always publish)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: drive9 git clone --fast [--blobless] [--hydrate=background|sync|off] <repo-url> <mounted-path>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: drive9 git clone --fast [--blobless] [--hydrate=auto|background|sync|off] <repo-url> <mounted-path>\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -111,11 +109,11 @@ func gitClone(args []string) error {
 	}
 
 	// Mark the root as a workspace-in-progress BEFORE git writes `.git`. The
-	// workspace row is only registered after the clone, so without this marker a
-	// live mount would classify `.git` as remote during the clone and upload the
-	// object database. The marker is cleared on failure; on success it is left in
-	// place (the registered workspace takes over, and ClearLocalArmSignals drops
-	// it when the last workspace is deleted).
+	// workspace record is only registered after the clone, so without this
+	// marker a live mount would classify `.git` as remote during the clone and
+	// upload the object database. The marker is cleared on failure; on success
+	// it is left in place (the registered workspace takes over, and
+	// `git worktree remove` drops it when the workspace goes away).
 	workspaceRoot := mountLocalRootForTarget(resolved)
 	if err := gitcache.MarkWorkspacePending(cmdCtx, resolved.LocalRoot, workspaceRoot); err != nil {
 		return fmt.Errorf("mark git workspace pending: %w", err)
@@ -175,7 +173,7 @@ func gitClone(args []string) error {
 	}
 	c := NewFromEnv()
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
-	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+	ws, err := c.GitWorkspaceFSUpsert(ctx, client.GitWorkspaceRequest{
 		RootPath:   resolved.RemotePath,
 		RepoURL:    gitcache.SanitizeRepoURL(repoURL),
 		RemoteName: "origin",
@@ -189,10 +187,7 @@ func gitClone(args []string) error {
 		return fmt.Errorf("register git workspace: %w", err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
-	if err := c.ReplaceGitTree(ctx, ws.WorkspaceID, client.GitTreeReplaceRequest{
-		CommitSHA: head,
-		Nodes:     nodes,
-	}); err != nil {
+	if err := c.GitWorkspaceFSPutTreeIndex(ctx, ws.WorkspaceID, head, nodes); err != nil {
 		cancel()
 		return fmt.Errorf("register git tree manifest: %w", err)
 	}
@@ -209,17 +204,22 @@ func gitClone(args []string) error {
 	if err := publishGitWorkspaceIndexEntry(cmdCtx, c, ws); err != nil {
 		return fmt.Errorf("registered git workspace %s, but publishing discovery index failed: %w", ws.WorkspaceID, err)
 	}
-	if err := markLocalGitWorkspaceRegistered(cmdCtx, resolved, ws.WorkspaceID); err != nil {
-		return fmt.Errorf("registered git workspace %s, but writing local discovery marker failed: %w", ws.WorkspaceID, err)
-	}
 	registered = true
 
 	fmt.Fprintf(os.Stderr, "drive9: registered git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, resolved.RemotePath, len(nodes))
-	if *blobless {
+	{
+		if !*blobless {
+			// A full clone holds the entire tree locally; publishing it to
+			// the store is one upload pass and is not optional — the
+			// FS-native extension serves clean reads only from
+			// tree/<commit>/, so an unpublished tree would stat but never
+			// read. The hydrate flag governs the blobless prefetch only.
+			hydrateMode = gitHydrateModeSync
+		}
 		switch hydrateMode {
 		case gitHydrateModeSync:
 			ctx, cancel := context.WithTimeout(context.Background(), gitHydrateTimeout)
-			result, err := hydrateMountedGitTarget(ctx, repoURL, resolved, ws, nodes)
+			result, err := hydrateMountedGitTarget(ctx, c, repoURL, resolved, ws, nodes)
 			cancel()
 			if err != nil {
 				return fmt.Errorf("hydrate clean tree: %w", err)
@@ -269,7 +269,7 @@ func gitWorktreeAdd(args []string) error {
 	branch := fs.String("b", "", "create a new branch for the worktree")
 	detach := fs.Bool("detach", false, "detach HEAD in the new worktree")
 	blobless := fs.Bool("blobless", false, "require a blobless base workspace")
-	hydrate := fs.String("hydrate", "auto", "blobless clean tree hydrate strategy: auto, background, sync, or off")
+	hydrate := fs.String("hydrate", "auto", "clean tree publish strategy: auto, background, sync, or off (off = blobless metadata-only; full clones always publish)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: drive9 git worktree add --fast [-b <branch>] [--detach] [--blobless] [--hydrate=auto|background|sync|off] <base-repo-path> <worktree-path> [<commit-ish>]\n\nflags:\n")
 		fs.PrintDefaults()
@@ -323,7 +323,7 @@ func gitWorktreeAdd(args []string) error {
 
 	c := NewFromEnv()
 	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
-	baseWS, err := c.GetGitWorkspaceByRoot(ctx, baseResolved.RemotePath)
+	baseWS, err := c.GitWorkspaceFSGetByRoot(ctx, baseResolved.RemotePath)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("lookup base git workspace :%s: %w", baseResolved.RemotePath, err)
@@ -400,7 +400,7 @@ func gitWorktreeAdd(args []string) error {
 		mode = "fast-blobless"
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
-	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+	ws, err := c.GitWorkspaceFSUpsert(ctx, client.GitWorkspaceRequest{
 		RootPath:          worktreeResolved.RemotePath,
 		RepoURL:           baseWS.RepoURL,
 		RemoteName:        baseWS.RemoteName,
@@ -418,10 +418,7 @@ func gitWorktreeAdd(args []string) error {
 		return fmt.Errorf("register linked git workspace: %w", err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
-	if err := c.ReplaceGitTree(ctx, ws.WorkspaceID, client.GitTreeReplaceRequest{
-		CommitSHA: head,
-		Nodes:     nodes,
-	}); err != nil {
+	if err := c.GitWorkspaceFSPutTreeIndex(ctx, ws.WorkspaceID, head, nodes); err != nil {
 		cancel()
 		return fmt.Errorf("register linked git tree manifest: %w", err)
 	}
@@ -440,17 +437,14 @@ func gitWorktreeAdd(args []string) error {
 	if err := publishGitWorkspaceIndexEntry(cmdCtx, c, ws); err != nil {
 		return fmt.Errorf("registered linked git workspace %s, but publishing discovery index failed: %w", ws.WorkspaceID, err)
 	}
-	if err := markLocalGitWorkspaceRegistered(cmdCtx, worktreeResolved, ws.WorkspaceID); err != nil {
-		return fmt.Errorf("registered linked git workspace %s, but writing local discovery marker failed: %w", ws.WorkspaceID, err)
-	}
 	worktreeRegistered = true
 
 	fmt.Fprintf(os.Stderr, "drive9: registered linked git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, worktreeResolved.RemotePath, len(nodes))
-	if linkedBlobless {
+	{
 		switch hydrateMode {
 		case gitHydrateModeSync:
 			ctx, cancel := context.WithTimeout(context.Background(), gitHydrateTimeout)
-			result, err := hydrateMountedGitTarget(ctx, baseWS.RepoURL, worktreeResolved, ws, nodes)
+			result, err := hydrateMountedGitTarget(ctx, c, baseWS.RepoURL, worktreeResolved, ws, nodes)
 			cancel()
 			if err != nil {
 				return fmt.Errorf("hydrate linked clean tree: %w", err)
@@ -516,7 +510,7 @@ func gitWorktreeRemove(args []string) error {
 	}
 	c := NewFromEnv()
 	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
-	ws, err := c.GetGitWorkspaceByRoot(ctx, resolved.RemotePath)
+	ws, err := c.GitWorkspaceFSGetByRoot(ctx, resolved.RemotePath)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("lookup linked git workspace :%s: %w", resolved.RemotePath, err)
@@ -528,7 +522,7 @@ func gitWorktreeRemove(args []string) error {
 		return fmt.Errorf("linked git workspace %s has no common_workspace_id", ws.WorkspaceID)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
-	commonWS, err := c.GetGitWorkspace(ctx, ws.CommonWorkspaceID)
+	commonWS, err := c.GitWorkspaceFSGet(ctx, ws.CommonWorkspaceID)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("lookup common git workspace %s: %w", ws.CommonWorkspaceID, err)
@@ -559,29 +553,17 @@ func gitWorktreeRemove(args []string) error {
 			return fmt.Errorf("checkpoint common .git after worktree remove: %w", err)
 		}
 	}
-	// Version skew:
-	// - New server: DELETE soft-deletes + best-effort index cleanup (still 200 on
-	//   index failure); client Remove below is dual-write / immediate convergence.
-	// - Old server: DELETE only soft-deletes; client Remove below still required.
+	// Deregistration is FS-native: the index entry drops first (the
+	// visibility kill-switch), then the store subtree best-effort.
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
-	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
+	if err := c.GitWorkspaceFSDelete(ctx, ws.WorkspaceID); err != nil {
 		cancel()
 		return fmt.Errorf("delete linked git workspace: %w", err)
 	}
 	cancel()
-	// Local cleanup is independent of remote index success after DELETE returns.
-	// Collect errors so partial local failure is visible.
+	// Local cleanup is independent of remote index success after the
+	// deletion returns. Collect errors so partial local failure is visible.
 	var cleanupErrs []error
-	// Always attempt client index remove: required on old servers; no-op/idempotent
-	// when a new server already cleaned the entry.
-	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
-	if err := c.RemoveGitWorkspaceIndexEntry(ctx, ws.WorkspaceID); err != nil {
-		cleanupErrs = append(cleanupErrs, fmt.Errorf("remove linked git workspace from index: %w", err))
-	}
-	cancel()
-	if err := markLocalGitWorkspaceDeleted(cmdCtx, resolved, ws.WorkspaceID); err != nil {
-		cleanupErrs = append(cleanupErrs, fmt.Errorf("mark linked git workspace deleted locally: %w", err))
-	}
 	// The `git worktree add --fast` pending marker lives for the workspace's
 	// lifetime; drop it now so a later ordinary clone at this root is
 	// remote-backed again. Other roots' markers are preserved.
@@ -622,21 +604,18 @@ const (
 	gitHydrateModeSync       gitHydrateMode = "sync"
 )
 
-func resolveGitHydrateMode(raw string, blobless bool) (gitHydrateMode, error) {
+func resolveGitHydrateMode(raw string, _ bool) (gitHydrateMode, error) {
+	// The FS-native store is the only source of clean-tree content: even a
+	// full (non-blobless) clone must publish tree/<commit>/ or the
+	// rewritten extension serves attrs whose reads 404. auto therefore
+	// resolves to a synchronous publish — callers expect the tree to be
+	// readable as soon as the clone returns; background stays opt-in.
 	raw = strings.TrimSpace(raw)
 	if raw == "" || raw == "auto" {
-		if blobless {
-			return gitHydrateModeBackground, nil
-		}
-		return gitHydrateModeOff, nil
+		return gitHydrateModeSync, nil
 	}
 	switch gitHydrateMode(raw) {
-	case gitHydrateModeOff:
-		return gitHydrateModeOff, nil
-	case gitHydrateModeBackground, gitHydrateModeSync:
-		if !blobless {
-			return "", fmt.Errorf("--hydrate=%s requires --blobless", raw)
-		}
+	case gitHydrateModeOff, gitHydrateModeBackground, gitHydrateModeSync:
 		return gitHydrateMode(raw), nil
 	default:
 		return "", fmt.Errorf("invalid --hydrate %q (valid: auto, background, sync, off)", raw)
@@ -664,18 +643,18 @@ func gitHydrate(args []string) error {
 	}
 	c := NewFromEnv()
 	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
-	ws, err := c.GetGitWorkspaceByRoot(ctx, resolved.RemotePath)
+	ws, err := c.GitWorkspaceFSGetByRoot(ctx, resolved.RemotePath)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("lookup git workspace :%s: %w", resolved.RemotePath, err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), *timeout)
-	nodes, nodeErr := c.ListGitTree(ctx, ws.WorkspaceID, ws.HeadCommit)
+	nodes, nodeErr := c.GitWorkspaceFSGetTreeIndex(ctx, ws.WorkspaceID)
 	if nodeErr != nil {
 		cancel()
-		return fmt.Errorf("lookup git tree workspace=%s commit=%s: %w", ws.WorkspaceID, ws.HeadCommit, nodeErr)
+		return fmt.Errorf("lookup git tree workspace=%s: %w", ws.WorkspaceID, nodeErr)
 	}
-	result, err := hydrateMountedGitTarget(ctx, ws.RepoURL, resolved, ws, nodes)
+	result, err := hydrateMountedGitTarget(ctx, c, ws.RepoURL, resolved, ws, nodes)
 	cancel()
 	if err != nil {
 		return err
@@ -685,7 +664,7 @@ func gitHydrate(args []string) error {
 	return nil
 }
 
-func hydrateMountedGitTarget(ctx context.Context, repoURL string, resolved mountedGitTarget, ws *client.GitWorkspace, nodes []client.GitTreeNode) (gitcache.HydrateResult, error) {
+func hydrateMountedGitTarget(ctx context.Context, c *client.Client, repoURL string, resolved mountedGitTarget, ws *client.GitWorkspace, nodes []client.GitTreeNode) (gitcache.HydrateResult, error) {
 	if ws == nil {
 		return gitcache.HydrateResult{}, fmt.Errorf("workspace is required")
 	}
@@ -697,7 +676,7 @@ func hydrateMountedGitTarget(ctx context.Context, repoURL string, resolved mount
 	if parsed, err := gitDirFromMountedGitPath(resolved.LocalGitDir); err == nil && parsed != "" {
 		gitDir = parsed
 	}
-	return gitcache.Hydrate(ctx, gitcache.HydrateOptions{
+	result, err := gitcache.Hydrate(ctx, gitcache.HydrateOptions{
 		LocalRoot:   resolved.LocalRoot,
 		WorkspaceID: ws.WorkspaceID,
 		Commit:      ws.HeadCommit,
@@ -705,6 +684,73 @@ func hydrateMountedGitTarget(ctx context.Context, repoURL string, resolved mount
 		GitDir:      gitDir,
 		Token:       githubTokenForRepoURL(repoURL),
 		TreeEntries: gitcacheEntriesFromClient(nodes),
+	})
+	if err != nil {
+		return result, err
+	}
+	// The materialized clean tree is the workspace's cross-mount record:
+	// publish it under /.drive9/git-workspaces/<id>/tree/<commit>/ so
+	// other mounts serve clean reads without refetching from the origin.
+	if cerr := uploadGitWorkspaceTreeContent(ctx, c, ws, resolved.LocalRoot); cerr != nil {
+		fmt.Fprintf(os.Stderr, "drive9: warning: clean tree publish incomplete: %v\n", cerr)
+	}
+	return result, nil
+}
+
+// uploadGitWorkspaceTreeContent walks the locally materialized clean tree
+// and streams every file (and symlink) into the store, skipping files
+// that are already there with the same size (resumable).
+func uploadGitWorkspaceTreeContent(ctx context.Context, c *client.Client, ws *client.GitWorkspace, localRoot string) error {
+	if c == nil || ws == nil || strings.TrimSpace(localRoot) == "" {
+		return nil
+	}
+	treeRoot := gitcache.TreeRoot(localRoot, ws.WorkspaceID, ws.HeadCommit)
+	info, err := os.Stat(treeRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	return filepath.WalkDir(treeRoot, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if p == treeRoot || d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(treeRoot, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if d.Type()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			return c.GitWorkspaceFSPutTreeSymlink(ctx, ws.WorkspaceID, ws.HeadCommit, rel, target)
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		st, err := d.Info()
+		if err != nil {
+			return err
+		}
+		target := gitws.TreePath(ws.WorkspaceID, ws.HeadCommit, rel)
+		if remote, serr := c.StatCtx(ctx, target); serr == nil && remote != nil && remote.Size == st.Size() {
+			return nil
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = f.Close() }()
+		return c.GitWorkspaceFSPutTreeFile(ctx, ws.WorkspaceID, ws.HeadCommit, rel, f, st.Size())
 	})
 }
 
@@ -888,28 +934,6 @@ func localOverlayRootForMountedTarget(resolved mountedGitTarget) (string, error)
 	return localPath, nil
 }
 
-func markLocalGitWorkspaceDeleted(ctx context.Context, resolved mountedGitTarget, workspaceID string) error {
-	localRoot := strings.TrimSpace(resolved.LocalRoot)
-	if localRoot == "" || strings.TrimSpace(workspaceID) == "" {
-		return nil
-	}
-	if !filepath.IsAbs(localRoot) {
-		return fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
-	}
-	return gitcache.MarkWorkspaceDeleted(ctx, localRoot, workspaceID)
-}
-
-func markLocalGitWorkspaceRegistered(ctx context.Context, resolved mountedGitTarget, workspaceID string) error {
-	localRoot := strings.TrimSpace(resolved.LocalRoot)
-	if localRoot == "" || strings.TrimSpace(workspaceID) == "" {
-		return nil
-	}
-	if !filepath.IsAbs(localRoot) {
-		return fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
-	}
-	return gitcache.MarkWorkspaceRegistered(ctx, localRoot, workspaceID)
-}
-
 func publishGitWorkspaceIndexEntry(ctx context.Context, c *client.Client, ws *client.GitWorkspace) error {
 	if c == nil || ws == nil {
 		return fmt.Errorf("publish git workspace index: nil client or workspace")
@@ -984,16 +1008,9 @@ func uploadGitStateCheckpoint(ctx context.Context, c *client.Client, workspaceID
 	if err != nil {
 		return fmt.Errorf("checkpoint .git: %w", err)
 	}
-	sum := sha256.Sum256(gitState)
 	apiCtx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	defer cancel()
-	if _, err := c.UpsertGitState(apiCtx, workspaceID, client.GitStateRequest{
-		CheckpointCommit: checkpointCommit,
-		StorageType:      gitStateStorageTarGzNoObjects,
-		ChecksumSHA256:   hex.EncodeToString(sum[:]),
-		SizeBytes:        int64(len(gitState)),
-		Content:          gitState,
-	}); err != nil {
+	if err := c.GitWorkspaceFSPutGitState(apiCtx, workspaceID, checkpointCommit, gitState); err != nil {
 		return fmt.Errorf("upload .git checkpoint: %w", err)
 	}
 	return nil

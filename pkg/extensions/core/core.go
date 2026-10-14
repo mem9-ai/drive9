@@ -211,7 +211,8 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 	case fs.OpCreate:
 		return c.createOp(ctx, op)
 	case fs.OpWrite:
-		if err := c.WriteSync(ctx, op.Path, op.Offset, op.Data, op.Mode); err != nil {
+		truncate := op.Flags&uint32(fs.FlagTruncate) != 0
+		if err := c.WriteSync(ctx, op.Path, op.Offset, op.Data, op.Mode, truncate); err != nil {
 			return fs.Result{}, err
 		}
 		return fs.Result{Written: uint32(len(op.Data))}, nil
@@ -293,8 +294,10 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 }
 
 // WriteSync durably writes data at off: it returns only after the server
-// has committed the whole file image (write-sync durability).
-func (c *Core) WriteSync(ctx context.Context, path string, off int64, data []byte, mode uint32) error {
+// has committed the whole file image (write-sync durability). truncate
+// replaces the image instead of merging over the existing content, for
+// writers whose payload is a whole document.
+func (c *Core) WriteSync(ctx context.Context, path string, off int64, data []byte, mode uint32, truncate bool) error {
 	rp := c.remotePath(path)
 	for attempt := 0; attempt <= c.retries; attempt++ {
 		st, err := c.cl.StatCtx(ctx, rp)
@@ -325,9 +328,13 @@ func (c *Core) WriteSync(ctx context.Context, path string, off int64, data []byt
 			}
 			return nil
 		}
-		content, merr := c.mergeAt(ctx, rp, st, off, data)
-		if merr != nil {
-			return merr
+		content := data
+		if !truncate {
+			var merr error
+			content, merr = c.mergeAt(ctx, rp, st, off, data)
+			if merr != nil {
+				return merr
+			}
 		}
 		start := time.Now()
 		if werr := c.cl.WriteStreamConditional(ctx, rp, bytes.NewReader(content), int64(len(content)), nil, st.Revision); werr != nil {
@@ -402,7 +409,7 @@ func (h *SyncHandle) Read(ctx context.Context, off int64, dest []byte) (int, err
 
 // Write durably commits data at off.
 func (h *SyncHandle) Write(ctx context.Context, off int64, data []byte) error {
-	return h.core.WriteSync(ctx, h.path, off, data, 0)
+	return h.core.WriteSync(ctx, h.path, off, data, 0, false)
 }
 
 // Sync implements fs.Handle.

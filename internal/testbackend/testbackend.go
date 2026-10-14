@@ -1,7 +1,6 @@
 // Package testbackend provides a shared in-memory fake drive9 backend
 // speaking the fs HTTP wire-contract subset used by client-side tests:
 // HEAD stat headers, ?list=1, Range GETs, conditional PUTs, multipart
-// sessions, namespace-mutation POSTs, DELETE, plus git-workspace,
 // fs-layer, and fault-injection endpoints. Each test wires its own
 // instance behind an httptest.Server.
 package testbackend
@@ -77,13 +76,6 @@ type Backend struct {
 	layerEvents map[string][]LayerEntry
 	// checkpoints maps checkpoint ID → durable seq bound.
 	checkpoints map[string]int64
-	// gitWorkspaces seeds GET /v1/git-workspaces; gitOverlay is the overlay
-	// log per workspace (path → entry).
-	gitWorkspaces []map[string]any
-	gitOverlay    map[string]map[string]map[string]any
-	// gitStates/gitPacks back the git-state checkpoint endpoints.
-	gitStates map[string][]byte
-	gitPacks  map[string][][]byte
 	// layerEntryDelay slows layer-entry POSTs (test knob).
 	layerEntryDelay time.Duration
 	// uploads tracks v2 multipart sessions (initiate → parts → complete).
@@ -121,8 +113,6 @@ func NewBackend() *Backend {
 		uploads:       map[string]*uploadState{},
 		checkpoints:   map[string]int64{},
 		requests:      map[string]int{},
-		gitStates:     map[string][]byte{},
-		gitPacks:      map[string][][]byte{},
 	}
 }
 
@@ -184,48 +174,6 @@ func (b *Backend) Snapshot() map[string]Node {
 	out := make(map[string]Node, len(b.files))
 	for p, n := range b.files {
 		out[p] = Node{Data: append([]byte(nil), n.Data...), IsDir: n.IsDir, Mode: n.Mode, Rev: n.Rev, Mtime: n.Mtime}
-	}
-	return out
-}
-
-// SeedGitWorkspace installs one workspace for GET /v1/git-workspaces.
-func (b *Backend) SeedGitWorkspace(id, root string) {
-	b.SeedGitWorkspaceFull(id, root, "", "")
-}
-
-// SeedGitWorkspaceFull seeds a workspace with repo URL and head commit
-// (git-state restore needs the object source).
-func (b *Backend) SeedGitWorkspaceFull(id, root, repoURL, headCommit string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.gitWorkspaces = append(b.gitWorkspaces, map[string]any{
-		"workspace_id": id, "root_path": root, "status": "active", "workspace_kind": "standard",
-		"repo_url": repoURL, "head_commit": headCommit,
-	})
-}
-
-// GitState returns the stored checkpoint content for one workspace.
-func (b *Backend) GitState(id string) ([]byte, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	c, ok := b.gitStates[id]
-	return c, ok
-}
-
-// GitPacks returns the stored object packs for one workspace.
-func (b *Backend) GitPacks(id string) [][]byte {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return append([][]byte(nil), b.gitPacks[id]...)
-}
-
-// GitOverlay returns the recorded overlay entries for one workspace.
-func (b *Backend) GitOverlay(id string) map[string]map[string]any {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	out := map[string]map[string]any{}
-	for k, v := range b.gitOverlay[id] {
-		out[k] = v
 	}
 	return out
 }
@@ -479,120 +427,6 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		b.writeErr(w, http.StatusNotFound, "upload endpoint not found")
 		return
-	}
-	// git workspaces: list + overlay log
-	if strings.HasPrefix(r.URL.Path, "/v1/git-workspaces/") && strings.HasSuffix(r.URL.Path, "/git-state") && r.Method == http.MethodPost {
-		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/git-workspaces/"), "/git-state")
-		var req struct {
-			StorageType    string `json:"storage_type"`
-			ChecksumSHA256 string `json:"checksum_sha256"`
-			SizeBytes      int64  `json:"size_bytes"`
-			Content        []byte `json:"content"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		b.mu.Lock()
-		b.gitStates[id] = req.Content
-		b.mu.Unlock()
-		b.writeJSON(w, map[string]any{"workspace_id": id, "storage_type": req.StorageType})
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/v1/git-workspaces/") && strings.HasSuffix(r.URL.Path, "/git-state") && r.Method == http.MethodGet {
-		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/git-workspaces/"), "/git-state")
-		b.mu.Lock()
-		content, ok := b.gitStates[id]
-		b.mu.Unlock()
-		if !ok {
-			b.writeErr(w, http.StatusNotFound, "git state not found")
-			return
-		}
-		b.writeJSON(w, map[string]any{"workspace_id": id, "storage_type": "tar.gz-no-objects", "content": content})
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/v1/git-workspaces/") && strings.HasSuffix(r.URL.Path, "/object-packs") && r.Method == http.MethodPost {
-		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/git-workspaces/"), "/object-packs")
-		var req struct {
-			Content []byte `json:"content"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		b.mu.Lock()
-		b.gitPacks[id] = append(b.gitPacks[id], req.Content)
-		b.mu.Unlock()
-		b.writeJSON(w, map[string]any{"pack_id": fmt.Sprintf("p%d", len(b.gitPacks[id]))})
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/v1/git-workspaces/") && strings.HasSuffix(r.URL.Path, "/object-packs") && r.Method == http.MethodGet {
-		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/git-workspaces/"), "/object-packs")
-		b.mu.Lock()
-		packs := b.gitPacks[id]
-		b.mu.Unlock()
-		out := make([]map[string]any, 0, len(packs))
-		for i, p := range packs {
-			out = append(out, map[string]any{"pack_id": fmt.Sprintf("p%d", i+1), "size_bytes": int64(len(p))})
-		}
-		b.writeJSON(w, map[string]any{"packs": out})
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/v1/git-workspaces/") && strings.Contains(r.URL.Path, "/object-packs/") && r.Method == http.MethodGet {
-		rest := strings.TrimPrefix(r.URL.Path, "/v1/git-workspaces/")
-		id := rest[:strings.IndexByte(rest, '/')]
-		packID := strings.TrimPrefix(rest[strings.IndexByte(rest, '/'):], "/object-packs/")
-		b.mu.Lock()
-		packs := b.gitPacks[id]
-		b.mu.Unlock()
-		idx := 0
-		_, _ = fmt.Sscanf(strings.TrimPrefix(packID, "p"), "%d", &idx)
-		if idx < 1 || idx > len(packs) {
-			b.writeErr(w, http.StatusNotFound, "pack not found")
-			return
-		}
-		b.writeJSON(w, map[string]any{"pack_id": packID, "content": packs[idx-1], "size_bytes": int64(len(packs[idx-1]))})
-		return
-	}
-	if r.URL.Path == "/v1/git-workspaces" && r.Method == http.MethodGet {
-		b.mu.Lock()
-		out := make([]map[string]any, 0, len(b.gitWorkspaces))
-		out = append(out, b.gitWorkspaces...)
-		b.mu.Unlock()
-		b.writeJSON(w, map[string]any{"workspaces": out})
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/v1/git-workspaces/") {
-		rest := strings.TrimPrefix(r.URL.Path, "/v1/git-workspaces/")
-		if i := strings.IndexByte(rest, '/'); i >= 0 && rest[i+1:] == "overlay" {
-			id := rest[:i]
-			switch r.Method {
-			case http.MethodPost:
-				var req struct {
-					Path    string `json:"path"`
-					Op      string `json:"op"`
-					Kind    string `json:"kind"`
-					Mode    string `json:"mode"`
-					Content []byte `json:"content"`
-				}
-				_ = json.NewDecoder(r.Body).Decode(&req)
-				b.mu.Lock()
-				if b.gitOverlay == nil {
-					b.gitOverlay = map[string]map[string]map[string]any{}
-				}
-				if b.gitOverlay[id] == nil {
-					b.gitOverlay[id] = map[string]map[string]any{}
-				}
-				entry := map[string]any{"workspace_id": id, "path": req.Path, "op": req.Op, "kind": req.Kind, "mode": req.Mode, "content": req.Content}
-				b.gitOverlay[id][req.Path] = entry
-				b.mu.Unlock()
-				b.writeJSON(w, entry)
-				return
-			case http.MethodGet:
-				b.mu.Lock()
-				var entries []map[string]any
-				for _, e := range b.gitOverlay[id] {
-					entries = append(entries, e)
-				}
-				b.mu.Unlock()
-				b.writeJSON(w, map[string]any{"entries": entries})
-				return
-			}
-		}
 	}
 	// checkpoints: GET /v1/layer-checkpoints/{id} (durable_seq bounds replay)
 	if strings.HasPrefix(r.URL.Path, "/v1/layer-checkpoints/") && r.Method == http.MethodGet {

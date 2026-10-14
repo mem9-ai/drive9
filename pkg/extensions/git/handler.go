@@ -1,5 +1,8 @@
-// The handler: op routing against each workspace's overlay, overlay
-// persistence, rename, and the merged directory listing.
+// The handler: view transformation for workspace paths. Every op inside
+// a registered workspace root resolves through three layers — the dirty
+// mirror, the clean tree, then the classic namespace — by rewriting the
+// op's path into the store and dispatching next, or by landing mirror
+// mutations as plain store writes.
 package git
 
 import (
@@ -9,12 +12,35 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mem9-ai/drive9/pkg/client"
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/gitws"
 )
 
-func kindOf(e overlayEntry) fs.Kind {
-	switch e.Kind {
+// Resolution layers, strongest opinion first.
+const (
+	layerClassic = iota // untracked path: the classic namespace via next
+	layerTree           // tracked clean path: tree/<commit>/<rel> via next
+	layerOverlay        // mirrored path: overlay/<rel> via next
+	layerHidden         // blackout: the path is deleted in this view
+)
+
+// resolution is the routing decision for one workspace-relative path.
+type resolution struct {
+	layer     int
+	storePath string // valid for layerTree and layerOverlay
+	node      overlayNode
+	ent       gitws.TreeEntry
+	hasEnt    bool
+	w         *workspace
+}
+
+func (r resolution) tracked() bool { return r.hasEnt }
+
+// kindOfEntry maps a tree-index kind string onto the fs vocabulary.
+func kindOfEntry(kind string) fs.Kind {
+	switch kind {
 	case "dir":
 		return fs.KindDir
 	case "symlink":
@@ -36,97 +62,164 @@ func parseMode(m string) uint32 {
 	return mode & 0o777
 }
 
+// attr assembles the view attribute for a resolved overlay or tree node.
+// Tree files stat with the stable clean-tree mtime (git index trust);
+// mirror files stat with their landing time (a rewrite must advance the
+// served stat past what the index last recorded, or git treats the file
+// as racily clean).
+func (r resolution) attr() fs.Attr {
+	if r.layer == layerOverlay {
+		// node.mode carries 0 only as a legitimate chmod(000) — the walk
+		// and the landers default unknown modes to 0644/0755/0777 already.
+		return fs.Attr{Kind: r.node.kind, Mode: r.node.mode, Size: r.node.size, Mtime: r.node.mtime}
+	}
+	kind := kindOfEntry(r.ent.Kind)
+	mode := parseMode(r.ent.Mode)
+	if mode == 0 {
+		mode = 0o644
+		switch kind {
+		case fs.KindDir:
+			mode = 0o755
+		case fs.KindSymlink:
+			mode = 0o777
+		}
+	}
+	var mtime time.Time
+	if r.w != nil {
+		mtime = r.w.cleanTreeMtime()
+	}
+	return fs.Attr{Kind: kind, Mode: mode, Size: r.ent.Size, Mtime: mtime}
+}
+
+// resolveIn routes one workspace-relative path through the mirror, the
+// tracked index, and finally the classic namespace. The tracked entry
+// rides along on every layer: a mirrored or blacked-out path still needs
+// its tracked-ness to decide blackout placement and O_CREAT revival.
+func (g *Git) resolveIn(w *workspace, rel string) resolution {
+	var ent gitws.TreeEntry
+	hasEnt := false
+	if e, ok := w.isTracked(rel); ok {
+		ent, hasEnt = e, true
+	}
+	if node, hit := w.lookup(rel); hit {
+		if node.blackout {
+			return resolution{layer: layerHidden, ent: ent, hasEnt: hasEnt, w: w}
+		}
+		return resolution{layer: layerOverlay, storePath: gitws.OverlayPath(w.id, rel), node: node, ent: ent, hasEnt: hasEnt, w: w}
+	}
+	if hasEnt {
+		return resolution{layer: layerTree, storePath: gitws.TreePath(w.id, w.head(), rel), ent: ent, hasEnt: true, w: w}
+	}
+	return resolution{layer: layerClassic}
+}
+
 func (g *Git) emit(path string) {
 	if g.bus != nil {
 		g.bus.Emit(fs.Event{Kind: fs.EventInvalidated, Path: path})
 	}
 }
 
+// isStoreNamespace keeps the /.drive9/git-workspaces store itself a
+// pass-through: control-plane writes (CLI registration, hydrate uploads)
+// must never be re-routed by the view they feed.
+func isStoreNamespace(path string) bool {
+	return path == gitws.Root || strings.HasPrefix(path, gitws.Root+"/")
+}
+
+// observeGitMetaMutation debounces a .git state checkpoint when git's own
+// file traffic flows through (git sits outside localize, so it observes
+// the mutations before the local overlay absorbs them).
+func (g *Git) observeGitMetaMutation(op *fs.Op) {
+	switch op.Kind {
+	case fs.OpWrite, fs.OpCreate, fs.OpUnlink, fs.OpRmdir, fs.OpRename, fs.OpSetAttr, fs.OpMkdir, fs.OpSymlink:
+		g.scheduleGitStateCheckpoint(op.Path)
+	}
+}
+
 func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
-	g.ensure(ctx)
+	if isStoreNamespace(op.Path) {
+		return next(ctx, op)
+	}
+	g.ensureLoaded(ctx)
 	w, rel, ok := g.workspaceFor(op.Path)
 	if !ok {
-		// A workspace registered after this mount started (git clone
-		// --fast runs the CLI registration server-side) is invisible to
-		// the start-time list; re-list on the miss, throttled. Dormant
-		// mounts arm on .git-segment ops only (v1): ordinary FS traffic
-		// on a workspace-free root never lists.
-		g.mu.RLock()
-		armed := g.armed
-		g.mu.RUnlock()
-		if pathHasGitDirSegment(op.Path) && !armed {
-			// A .git-segment op may arm the dormant plane (v1 G2), but
-			// only when an arm source actually suggests workspaces exist:
-			// local markers, or root-relevant index entries. G0's dormant
-			// .git activity on a workspace-free root stays at zero lists.
-			g.tryArmFromLocalSignals()
-			g.maybeArmFromIndex(ctx)
-			g.mu.RLock()
-			armed = g.armed
-			g.mu.RUnlock()
+		return next(ctx, op)
+	}
+	if (op.Kind == fs.OpLookup || op.Kind == fs.OpGetAttr) && rel != ".git" && !strings.HasPrefix(rel, ".git/") {
+		if res := g.resolveIn(w, rel); res.layer == layerClassic {
+			if _, dup := g.missLogged.LoadOrStore(op.Path, struct{}{}); !dup && g.log != nil {
+				g.log.Info("git view miss: path under loaded workspace root resolves to classic", zap.String("path", op.Path), zap.String("workspace", w.id))
+			}
 		}
-		if armed {
-			g.reloadIfStale(ctx)
-		}
-		w, rel, ok = g.workspaceFor(op.Path)
-		if !ok {
-			return next(ctx, op)
-		}
+	}
+	if rel == ".git" || strings.HasPrefix(rel, ".git/") {
+		// .git of a registered workspace is routing-local (localize via
+		// IsDeclaredLocalPath); its mutations only feed the checkpoint
+		// machine.
+		g.observeGitMetaMutation(op)
+		return next(ctx, op)
+	}
+	if rel == "" {
+		return g.doWorkspaceRoot(ctx, op, w, next)
 	}
 
 	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
-		e, hit := w.lookup(rel)
-		if !hit {
-			// Fast-clone view (v1 gitEntry): clean files resolve from the
-			// HEAD tree before the base view.
-			if n, tok := w.treeLookup(rel); tok {
-				if n.Kind == "dir" || n.Kind == "symlink" || n.ObjectSHA != "" {
-					attr := treeAttr(n, w.cleanTreeMtime())
-					// An unknown size resolves once via cat-file and is
-					// remembered on the node: re-resolving per stat let a
-					// single failed exec flap the served size and pin git
-					// status entries as modified.
-					if n.SizeBytes < 0 && (n.Kind == "file" || n.Kind == "symlink") && n.ObjectSHA != "" {
-						attr.Size = g.blobSize(w, n.ObjectSHA)
-						w.noteTreeSize(rel, attr.Size)
+		res := g.resolveIn(w, rel)
+		switch res.layer {
+		case layerHidden:
+			return fs.Result{}, fs.ErrNotFound
+		case layerOverlay, layerTree:
+			attr := res.attr()
+			if res.layer == layerTree && attr.Size < 0 {
+				// Unknown blob size (blobless manifest without size
+				// enrichment): a negative placeholder would read as a
+				// phantom modification in every git status. Resolve it
+				// from the store once and remember it.
+				if store := g.storeView(); store != nil {
+					if st, serr := store.GetAttr(ctx, res.storePath); serr == nil {
+						attr.Size = st.Size
+						w.noteTreeSize(rel, st.Size)
 					}
-					return fs.Result{Attr: &attr}, nil
 				}
 			}
-			return next(ctx, op)
+			return fs.Result{Attr: &attr}, nil
 		}
-		if e.Op == "whiteout" {
-			return fs.Result{}, fs.ErrNotFound
-		}
-		kind := kindOf(e)
-		mode := parseMode(e.Mode)
-		if mode == 0 {
-			mode = 0o644
-			switch kind {
-			case fs.KindDir:
-				mode = 0o755
-			case fs.KindSymlink:
-				mode = 0o777
-			}
-		}
-		size := int64(len(e.Content))
-		if e.remote {
-			size = e.size
-		}
-		return fs.Result{Attr: &fs.Attr{Kind: kind, Mode: mode, Size: size}}, nil
+		return next(ctx, op)
 
 	case fs.OpReadlink:
-		if e, hit := w.lookup(rel); hit {
-			if e.Op == "whiteout" {
-				return fs.Result{}, fs.ErrNotFound
+		res := g.resolveIn(w, rel)
+		switch res.layer {
+		case layerHidden:
+			return fs.Result{}, fs.ErrNotFound
+		case layerOverlay:
+			if res.node.kind == fs.KindSymlink {
+				if res.node.target != "" {
+					return fs.Result{Data: []byte(res.node.target)}, nil
+				}
+				store := g.storeView()
+				if store == nil {
+					return fs.Result{}, fs.ErrUnsupported
+				}
+				target, err := store.Readlink(ctx, res.storePath)
+				if err != nil {
+					return fs.Result{}, err
+				}
+				res.node.target = target
+				w.set(rel, res.node)
+				return fs.Result{Data: []byte(target)}, nil
 			}
-			if e.Kind == "symlink" {
-				return fs.Result{Data: e.Content}, nil
-			}
-		} else if n, tok := w.treeLookup(rel); tok && n.Kind == "symlink" {
-			if data, err := g.materializeBlob(w, n.ObjectSHA); err == nil {
-				return fs.Result{Data: data}, nil
+		case layerTree:
+			if kindOfEntry(res.ent.Kind) == fs.KindSymlink {
+				store := g.storeView()
+				if store == nil {
+					return fs.Result{}, fs.ErrUnsupported
+				}
+				target, err := store.Readlink(ctx, res.storePath)
+				if err != nil {
+					return fs.Result{}, err
+				}
+				return fs.Result{Data: []byte(target)}, nil
 			}
 		}
 		return next(ctx, op)
@@ -135,98 +228,74 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		if op.Handle != nil || op.Fh != 0 {
 			return next(ctx, op)
 		}
-		if e, hit := w.lookup(rel); hit {
-			if e.Op == "whiteout" {
-				return fs.Result{}, fs.ErrNotFound
+		res := g.resolveIn(w, rel)
+		switch res.layer {
+		case layerHidden:
+			return fs.Result{}, fs.ErrNotFound
+		case layerOverlay, layerTree:
+			// Store reads go through the store view: the main chain's
+			// terminal prefixes the mount's RemoteRoot, so a subtree
+			// mount would stat <root>/.drive9/... and 404.
+			store := g.storeView()
+			if store == nil {
+				return fs.Result{}, fs.ErrUnsupported
 			}
-			if e.remote {
-				// Storage-backed overlay payload: the base view serves it
-				// until a local write mirrors inline content.
-				return next(ctx, op)
+			data, rerr := store.Read(ctx, res.storePath, op.Offset, op.Limit)
+			if rerr != nil {
+				return fs.Result{}, rerr
 			}
-			data := e.Content
-			if op.Offset > 0 || op.Limit > 0 {
-				off := op.Offset
-				if off < 0 {
-					off = 0
-				}
-				if off >= int64(len(data)) {
-					return fs.Result{}, nil
-				}
-				end := int64(len(data))
-				if op.Limit > 0 && off+op.Limit < end {
-					end = off + op.Limit
-				}
-				data = data[off:end]
+			if res.layer == layerTree && op.Offset <= 0 && (op.Limit <= 0 || int64(len(data)) < op.Limit) {
+				w.noteTreeSize(rel, int64(len(data)))
 			}
 			return fs.Result{Data: data}, nil
-		}
-		// Fast-clone view: materialize the blob from the restored local
-		// .git (v1 materializeGitBlob).
-		if n, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
-			if data, err := g.materializeBlob(w, n.ObjectSHA); err == nil {
-				if op.Offset > 0 || op.Limit > 0 {
-					off := op.Offset
-					if off < 0 {
-						off = 0
-					}
-					if off >= int64(len(data)) {
-						return fs.Result{}, nil
-					}
-					end := int64(len(data))
-					if op.Limit > 0 && off+op.Limit < end {
-						end = off + op.Limit
-					}
-					data = data[off:end]
-				}
-				return fs.Result{Data: data}, nil
-			}
 		}
 		return next(ctx, op)
 
 	case fs.OpList:
-		return g.listMerged(ctx, w, op.Path, next)
+		return g.listMerged(ctx, w, op.Path, rel, next)
 
 	case fs.OpWrite:
-		// Merge at op.Offset over the current image: the kernel delivers
-		// large writes as many 128KB chunks — publishing each chunk as the
-		// whole overlay content would keep only the last one.
-		img := op.Data
+		if op.Handle != nil || op.Fh != 0 {
+			return next(ctx, op)
+		}
+		res := g.resolveIn(w, rel)
+		if res.layer == layerClassic {
+			return next(ctx, op)
+		}
+		// Mirror write: merge at op.Offset over the current image — the
+		// kernel delivers large writes as many 128KB chunks, and each
+		// chunk must land over the full image, not replace it.
 		off := op.Offset
 		if off < 0 {
 			off = 0
 		}
-		if off != 0 || op.Handle != nil || op.Fh != 0 {
-			if e, hit := w.lookup(rel); hit && e.Op == "upsert" && e.Kind == "file" {
-				img = mergeAt(e.Content, off, op.Data)
-			} else if off > 0 {
-				img = mergeAt(nil, off, op.Data)
-			}
+		img := mergeAt(g.currentImage(ctx, w, rel, res), off, op.Data)
+		mode := res.attr().Mode
+		if mode == 0 {
+			mode = 0o644
 		}
-		mode := "100644"
-		if e, hit := w.lookup(rel); hit && e.Op == "upsert" && e.Mode != "" {
-			mode = e.Mode
-		}
-		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "upsert", Kind: "file", Content: img, Mode: mode}); err != nil {
+		if err := g.landOverlayFile(ctx, w, rel, img, mode); err != nil {
 			return fs.Result{}, err
 		}
 		g.emit(op.Path)
 		return fs.Result{Written: uint32(len(op.Data))}, nil
 
 	case fs.OpCreate:
+		res := g.resolveIn(w, rel)
 		if hasWriteIntent(op.Flags) {
-			e, hit := w.lookup(rel)
-			// A whiteout is a miss for a create: unlink+recreate (git's
-			// checkout_entry) must land the new file in the overlay —
-			// falling through to the base plane would create it remotely
-			// with a default 0644 mode under a still-active whiteout.
-			whiteoutCreate := hit && e.Op == "whiteout" && op.Flags&uint32(syscall.O_CREAT) != 0
-			if !hit || (e.Op == "upsert" && e.Kind == "file") || whiteoutCreate {
+			switch {
+			case res.layer == layerOverlay && res.node.kind == fs.KindDir,
+				res.layer == layerTree && kindOfEntry(res.ent.Kind) == fs.KindDir:
+				return fs.Result{}, syscall.EISDIR
+			case res.layer == layerOverlay || res.layer == layerTree,
+				// O_CREAT on a deleted tracked path recreates it; without
+				// the flag POSIX requires ENOENT.
+				res.layer == layerHidden && res.tracked() && op.Flags&uint32(syscall.O_CREAT) != 0:
 				h, cerr := g.claimWorkspaceOpen(w, op.Path, rel, op.Flags, op.Mode)
 				if cerr != nil {
 					return fs.Result{}, cerr
 				}
-				if op.Flags&uint32(syscall.O_CREAT) != 0 && (!hit || whiteoutCreate) {
+				if op.Flags&uint32(syscall.O_CREAT) != 0 && res.layer != layerOverlay {
 					h.mu.Lock()
 					h.dirty = true
 					h.mu.Unlock()
@@ -234,59 +303,65 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 				g.trackWorkspace(op.Path, h)
 				attr := h.Attr()
 				return fs.Result{Handle: h, Attr: &attr}, nil
-			}
-		}
-		if op.Flags&uint32(syscall.O_CREAT) == 0 {
-			// plain open: overlay files report their overlay attr
-			if e, hit := w.lookup(rel); hit {
-				if e.Op == "whiteout" {
-					return fs.Result{}, fs.ErrNotFound
-				}
-				mode := parseMode(e.Mode)
-				if mode == 0 {
-					mode = 0o644
-				}
-				mtime := e.mtime
-				if mtime.IsZero() {
-					mtime = w.cleanTreeMtime()
-				}
-				return fs.Result{Attr: &fs.Attr{Kind: kindOf(e), Mode: mode, Size: int64(len(e.Content)), Mtime: mtime}}, nil
-			}
-			// A clean tree file has no base-plane entry: a read-only
-			// open that fell through would wrap a 404 remote handle and
-			// every read EIOs. Claim it and serve the materialized blob.
-			if n, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
-				h := &gitHandle{g: g, w: w, path: op.Path, rel: rel, flags: op.Flags,
-					treeSHA: n.ObjectSHA, mode: parseMode(n.Mode)}
-				if h.mode == 0 {
-					h.mode = 0o644
-				}
-				g.trackWorkspace(op.Path, h)
-				attr := h.Attr()
-				return fs.Result{Handle: h, Attr: &attr}, nil
+			case res.layer == layerHidden:
+				return fs.Result{}, fs.ErrNotFound
 			}
 			return next(ctx, op)
 		}
-		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "upsert", Kind: "file", Content: nil, Mode: "100644"}); err != nil {
-			return fs.Result{}, err
+		switch res.layer {
+		case layerHidden:
+			return fs.Result{}, fs.ErrNotFound
+		case layerOverlay, layerTree:
+			// Plain open: serve the mirrored/tree content from the store
+			// view. The store view (not next) is load-bearing here — the
+			// main chain's terminal prefixes the mount's RemoteRoot, so a
+			// subtree mount would stat <root>/.drive9/... and 404.
+			store := g.storeView()
+			if store == nil {
+				return fs.Result{}, fs.ErrUnsupported
+			}
+			h, oerr := store.Open(ctx, res.storePath, fs.OpenFlags(op.Flags))
+			if oerr != nil {
+				return fs.Result{}, oerr
+			}
+			attr := res.attr()
+			return fs.Result{Handle: h, Attr: &attr}, nil
 		}
-		g.emit(op.Path)
-		return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o777}}, nil
+		return next(ctx, op)
 
 	case fs.OpMkdir:
-		mode := "40755"
-		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "upsert", Kind: "dir", Mode: mode}); err != nil {
-			return fs.Result{}, err
+		res := g.resolveIn(w, rel)
+		switch res.layer {
+		case layerOverlay, layerTree:
+			return fs.Result{}, syscall.EEXIST
+		case layerHidden:
+			if res.tracked() {
+				mode := op.Mode & 0o777
+				if mode == 0 {
+					mode = 0o755
+				}
+				if err := g.landOverlayDir(ctx, w, rel, mode); err != nil {
+					return fs.Result{}, err
+				}
+				g.emit(op.Path)
+				return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: mode}}, nil
+			}
 		}
-		g.emit(op.Path)
-		return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755}}, nil
+		return next(ctx, op)
 
 	case fs.OpSymlink:
-		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "upsert", Kind: "symlink", Content: []byte(op.Target), Mode: "120777"}); err != nil {
-			return fs.Result{}, err
+		res := g.resolveIn(w, rel)
+		switch {
+		case res.layer == layerOverlay || res.layer == layerTree:
+			return fs.Result{}, syscall.EEXIST
+		case res.layer == layerHidden && res.tracked():
+			if err := g.landOverlaySymlink(ctx, w, rel, op.Target); err != nil {
+				return fs.Result{}, err
+			}
+			g.emit(op.Path)
+			return fs.Result{}, nil
 		}
-		g.emit(op.Path)
-		return fs.Result{}, nil
+		return next(ctx, op)
 
 	case fs.OpUnlink, fs.OpRmdir:
 		// POSIX unlink-while-open: the delete hides the name now; an open
@@ -294,14 +369,34 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		if h := g.handleFor(op.Path); h != nil && op.Kind == fs.OpUnlink {
 			h.markUnlinked()
 		}
-		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "whiteout", Kind: "file"}); err != nil {
-			return fs.Result{}, err
+		res := g.resolveIn(w, rel)
+		switch res.layer {
+		case layerHidden:
+			return fs.Result{}, nil
+		case layerOverlay:
+			if err := g.removeOverlayNode(ctx, w, rel, res.node); err != nil {
+				return fs.Result{}, err
+			}
+			if res.tracked() {
+				if err := g.setBlackout(ctx, w, rel); err != nil {
+					return fs.Result{}, err
+				}
+			} else {
+				w.drop(rel)
+			}
+			g.emit(op.Path)
+			return fs.Result{}, nil
+		case layerTree:
+			if err := g.setBlackout(ctx, w, rel); err != nil {
+				return fs.Result{}, err
+			}
+			g.emit(op.Path)
+			return fs.Result{}, nil
 		}
-		g.emit(op.Path)
-		return fs.Result{}, nil
+		return next(ctx, op)
 
 	case fs.OpRename:
-		if err := g.renameOverlay(ctx, op.Path, op.Path2); err != nil {
+		if err := g.renameView(ctx, op, w, rel, next); err != nil {
 			return fs.Result{}, err
 		}
 		if h := g.handleFor(op.Path); h != nil {
@@ -326,103 +421,211 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 			attr := h.Attr()
 			return fs.Result{Attr: &attr}, nil
 		}
-		if op.HasMode {
-			if e, hit := w.lookup(rel); hit && e.Op == "upsert" {
-				e.Mode = fmt.Sprintf("%o", 0o100000|op.Mode&0o777)
-				if err := g.putOverlay(ctx, w, rel, e); err != nil {
-					return fs.Result{}, err
-				}
-				g.emit(op.Path)
+		res := g.resolveIn(w, rel)
+		if res.layer == layerOverlay {
+			// Mirror-path setattr lands through the store view — the
+			// main chain's terminal prefixes RemoteRoot (see plain-open).
+			store := g.storeView()
+			if store == nil {
+				return fs.Result{}, fs.ErrUnsupported
 			}
-		}
-		if op.Size >= 0 {
-			if e, hit := w.lookup(rel); hit && e.Op == "upsert" && e.Kind == "file" {
-				nextImg := make([]byte, op.Size)
-				copy(nextImg, e.Content)
-				e.Content = nextImg
-				if err := g.putOverlay(ctx, w, rel, e); err != nil {
-					return fs.Result{}, err
-				}
-				g.emit(op.Path)
+			var patch fs.AttrPatch
+			if op.HasMode {
+				mode := op.Mode & 0o777
+				patch.Mode = &mode
 			}
+			if op.Size >= 0 {
+				size := op.Size
+				patch.Size = &size
+			}
+			if !op.Mtime.IsZero() {
+				mtime := op.Mtime
+				patch.Mtime = &mtime
+			}
+			if err := store.SetAttr(ctx, res.storePath, patch); err != nil {
+				return fs.Result{}, err
+			}
+			node := res.node
+			if op.HasMode {
+				node.mode = op.Mode & 0o777
+			}
+			if op.Size >= 0 {
+				node.size = op.Size
+			}
+			w.set(rel, node)
+			g.emit(op.Path)
+			attr := node.attr()
+			return fs.Result{Attr: &attr}, nil
 		}
+		if res.layer == layerTree {
+			// First-modification mirror for path-based setattr on clean
+			// tracked paths (chmod/truncate/touch): the classic target
+			// of a fast clone does not exist, so falling through would
+			// only fail. Mirror the tree image once and apply on top.
+			return g.mirrorTreeSetAttr(ctx, op, w, rel, res)
+		}
+		return next(ctx, op)
 	}
 	return next(ctx, op)
 }
 
-// putOverlay persists one overlay entry server-side then mirrors it
-// locally.
-func (g *Git) putOverlay(ctx context.Context, w *workspace, rel string, e overlayEntry) error {
-	// Path-addressed writes hand us op.Data — a slice of go-fuse's POOLED
-	// request buffer, recycled for the next request (a READDIR's dirent
-	// bytes) the moment this one completes. The entry (and the local
-	// mirror) must own a copy or the stored image mutates in place.
-	if len(e.Content) > 0 {
-		e.Content = append([]byte(nil), e.Content...)
+// mirrorTreeSetAttr lands one setattr on a clean tracked path by copying
+// the tree image into the dirty mirror and applying mode/size there.
+func (g *Git) mirrorTreeSetAttr(ctx context.Context, op *fs.Op, w *workspace, rel string, res resolution) (fs.Result, error) {
+	if !op.HasMode && op.Size < 0 {
+		attr := res.attr()
+		return fs.Result{Attr: &attr}, nil
 	}
-	_, err := g.cl.PutGitOverlayEntry(ctx, w.id, client.GitOverlayEntryRequest{
-		Path:    rel,
-		Op:      e.Op,
-		Kind:    e.Kind,
-		Mode:    e.Mode,
-		Content: e.Content,
-	})
+	store := g.storeView()
+	if store == nil {
+		return fs.Result{}, fs.ErrUnsupported
+	}
+	image, err := store.Read(ctx, res.storePath, 0, 0)
 	if err != nil {
-		return err
+		if fs.IsNotFound(err) {
+			return fs.Result{}, fs.ErrNotFound // tree body not hydrated: cannot mirror safely
+		}
+		return fs.Result{}, err
 	}
-	// Our own write stamps a fresh landed time: the rewrite's served stat
-	// must advance past whatever the index last recorded (a rewrite with
-	// an unchanged mtime stays racily clean and git re-hashes forever).
-	e.mtime = time.Now()
-	w.set(rel, e)
+	mode := res.attr().Mode
+	if op.HasMode {
+		mode = op.Mode & 0o777
+	}
+	if op.Size >= 0 && op.Size < int64(len(image)) {
+		image = image[:op.Size]
+	} else if op.Size > int64(len(image)) {
+		grown := make([]byte, op.Size)
+		copy(grown, image)
+		image = grown
+	}
+	if err := g.landOverlayFile(ctx, w, rel, image, mode); err != nil {
+		return fs.Result{}, err
+	}
+	g.emit(op.Path)
+	attr := fs.Attr{Kind: fs.KindFile, Mode: mode, Size: int64(len(image)), Mtime: time.Now()}
+	return fs.Result{Attr: &attr}, nil
+}
+
+// doWorkspaceRoot serves ops on the workspace root itself: the root is
+// always a directory while the record exists; its listing is the merged
+// view; everything else falls through to the classic namespace.
+func (g *Git) doWorkspaceRoot(ctx context.Context, op *fs.Op, w *workspace, next fs.Next) (fs.Result, error) {
+	switch op.Kind {
+	case fs.OpLookup, fs.OpGetAttr:
+		attr := fs.Attr{Kind: fs.KindDir, Mode: 0o755}
+		return fs.Result{Attr: &attr}, nil
+	case fs.OpList:
+		return g.listMerged(ctx, w, op.Path, "", next)
+	}
+	return next(ctx, op)
+}
+
+// currentImage reads the effective content a mirror write merges over.
+func (g *Git) currentImage(ctx context.Context, w *workspace, rel string, res resolution) []byte {
+	store := g.storeView()
+	if store == nil {
+		return nil
+	}
+	switch res.layer {
+	case layerOverlay, layerTree:
+		data, err := store.Read(ctx, res.storePath, 0, 0)
+		if err != nil {
+			return nil // not hydrated yet: nothing below the write
+		}
+		return data
+	}
 	return nil
 }
 
-// renameOverlay moves overlay content: the source overlay entry is
-// re-upserted at the destination and deleted at the source; base content
-// is fetched once and re-upserted.
-func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error {
-	wOld, relOld, ok := g.workspaceFor(oldPath)
-	if !ok {
-		return nil
-	}
-	wNew, relNew, ok := g.workspaceFor(newPath)
-	if !ok || wNew != wOld {
-		return fmt.Errorf("git: rename crosses workspace roots")
-	}
-	if e, hit := wOld.lookup(relOld); hit {
-		if e.Op == "whiteout" {
-			return fs.ErrNotFound
-		}
-		if err := g.putOverlay(ctx, wNew, relNew, e); err != nil {
+// renameView moves content within one workspace. Mirrored sources move
+// through the store (a server-side rename for mirror-to-mirror); tracked
+// clean sources copy once into the mirror and black out the origin;
+// untracked sources stay in the classic namespace unless the destination
+// is shadowed, in which case they copy into the mirror.
+func (g *Git) renameView(ctx context.Context, op *fs.Op, w *workspace, rel string, next fs.Next) error {
+	w2, rel2, ok := g.workspaceFor(op.Path2)
+	if !ok || w2 != w {
+		res := g.resolveIn(w, rel)
+		if res.layer == layerClassic || res.layer == layerHidden && !res.tracked() {
+			_, err := next(ctx, op)
 			return err
 		}
-		return g.putOverlay(ctx, wOld, relOld, overlayEntry{Op: "whiteout", Kind: e.Kind})
+		return fmt.Errorf("git: rename crosses workspace roots")
 	}
-	// base content moves through one fetch + upsert
-	st, err := g.cl.StatCtx(ctx, oldPath)
-	if err != nil {
-		return err
+	resOld := g.resolveIn(w, rel)
+	resNew := g.resolveIn(w, rel2)
+	store := g.storeView()
+	if store == nil {
+		return fs.ErrUnsupported
 	}
-	if st.IsDir {
-		return fmt.Errorf("git: directory rename of base content is not supported")
+
+	switch resOld.layer {
+	case layerHidden:
+		return fs.ErrNotFound
+
+	case layerOverlay:
+		if err := store.EnsureParent(ctx, storeDirOf(gitws.OverlayPath(w.id, rel2))); err != nil {
+			return err
+		}
+		if err := store.Rename(ctx, gitws.OverlayPath(w.id, rel), gitws.OverlayPath(w.id, rel2), fs.RenameOptions{}); err != nil {
+			return err
+		}
+		if err := g.clearBlackout(ctx, w, rel2); err != nil {
+			return err
+		}
+		node := resOld.node
+		w.drop(rel)
+		w.set(rel2, node)
+		if resOld.tracked() {
+			return g.setBlackout(ctx, w, rel)
+		}
+		return nil
+
+	case layerTree:
+		if kindOfEntry(resOld.ent.Kind) == fs.KindDir {
+			return fmt.Errorf("git: directory rename of clean tree content is not supported")
+		}
+		data, err := store.Read(ctx, resOld.storePath, 0, 0)
+		if err != nil {
+			// An unhydrated tree body means the rename cannot preserve
+			// the source bytes: fail rather than replacing the content
+			// with an empty mirror.
+			return err
+		}
+		mode := resOld.attr().Mode
+		if err := g.landOverlayFile(ctx, w, rel2, data, mode); err != nil {
+			return err
+		}
+		return g.setBlackout(ctx, w, rel)
+
+	default: // classic source
+		if resNew.layer == layerClassic || resNew.layer == layerHidden && !resNew.tracked() {
+			_, err := next(ctx, op)
+			return err
+		}
+		// Destination is shadowed by the mirror/tree view: copy the
+		// classic content in, then remove the classic source.
+		readRes, err := next(ctx, &fs.Op{Kind: fs.OpRead, Path: op.Path})
+		if err != nil {
+			return err
+		}
+		var mode uint32 = 0o644
+		if resNew.layer == layerOverlay || resNew.layer == layerTree {
+			mode = resNew.attr().Mode
+		}
+		if err := g.landOverlayFile(ctx, w, rel2, readRes.Data, mode); err != nil {
+			return err
+		}
+		if _, err := next(ctx, &fs.Op{Kind: fs.OpUnlink, Path: op.Path}); err != nil && !fs.IsNotFound(err) {
+			return err
+		}
+		return nil
 	}
-	data, err := g.cl.ReadCtx(ctx, oldPath)
-	if err != nil {
-		return err
-	}
-	mode := "100644"
-	if st.HasMode {
-		mode = fmt.Sprintf("%o", 0o100000|st.Mode&0o777)
-	}
-	if err := g.putOverlay(ctx, wNew, relNew, overlayEntry{Op: "upsert", Kind: "file", Content: data, Mode: mode}); err != nil {
-		return err
-	}
-	return g.putOverlay(ctx, wOld, relOld, overlayEntry{Op: "whiteout", Kind: "file"})
 }
 
-// listMerged overlays the workspace's children on the base listing.
-func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.Next) (fs.Result, error) {
+// listMerged merges the classic listing, the clean tree listing, and the
+// dirty mirror (upserts add/replace, blackouts hide).
+func (g *Git) listMerged(ctx context.Context, w *workspace, dir, rel string, next fs.Next) (fs.Result, error) {
 	res, err := next(ctx, &fs.Op{Kind: fs.OpList, Path: dir})
 	if err != nil && !fs.IsNotFound(err) {
 		return res, err
@@ -431,87 +634,75 @@ func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.
 	for _, e := range res.Entries {
 		out[e.Name] = e
 	}
-	prefixRel := strings.Trim(strings.TrimPrefix(strings.TrimPrefix(dir, w.rootPath()), "/"), "/")
-	// Compute the stable clean-tree time BEFORE taking the workspace read
-	// lock: cleanTreeMtime re-acquires it, and Go's RWMutex deadlocks a
-	// recursive reader as soon as one writer queues behind the outer hold.
-	cleanMtime := w.cleanTreeMtime()
-	w.mu.RLock()
-	for rel, e := range w.overlay {
-		if prefixRel != "" && !strings.HasPrefix(rel, prefixRel+"/") {
+	store := g.storeView()
+	if store != nil {
+		trackedDir := rel == ""
+		if rel != "" {
+			_, trackedDir = w.isTracked(rel)
+		}
+		if trackedDir {
+			treeEntries, terr := store.List(ctx, gitws.TreePath(w.id, w.head(), rel))
+			if terr != nil && !fs.IsNotFound(terr) {
+				return fs.Result{}, terr
+			}
+			for _, e := range treeEntries {
+				// The tree index is the attr authority: the store listing
+				// carries the store file's own mode (0644 — the upload
+				// path never chmods), which would flip git's exec bits
+				// (script.sh 755 in the index, 644 in the listing → M).
+				if ent, ok := w.isTracked(joinRel(rel, e.Name)); ok {
+					e.Attr = resolution{layer: layerTree, ent: ent, w: w}.attr()
+				}
+				out[e.Name] = e
+			}
+		}
+	}
+	prefix := ""
+	if rel != "" {
+		prefix = rel + "/"
+	}
+	for rel2, node := range w.snapshotOverlay() {
+		if prefix != "" && !strings.HasPrefix(rel2, prefix) {
 			continue
 		}
-		name := strings.TrimPrefix(rel, prefixRel+"/")
+		name := strings.TrimPrefix(rel2, prefix)
 		if name == "" || strings.Contains(name, "/") {
 			continue
 		}
-		if e.Op == "whiteout" {
+		if node.blackout {
 			delete(out, name)
 			continue
 		}
-		kind := kindOf(e)
-		mode := parseMode(e.Mode)
+		mode := node.mode
 		if mode == 0 {
-			if kind == fs.KindDir {
+			mode = 0o644
+			if node.kind == fs.KindDir {
 				mode = 0o755
-			} else {
-				mode = 0o644
 			}
 		}
-		size := int64(len(e.Content))
-		if e.remote {
-			size = e.size
-		}
-		mtime := e.mtime
-		if mtime.IsZero() {
-			mtime = cleanMtime
-		}
-		out[name] = fs.Entry{Name: name, Attr: fs.Attr{Kind: kind, Mode: mode, Size: size, Mtime: mtime}}
-	}
-	// Fast-clone view (v1 listGitDir): tree children the base and overlay
-	// do not already cover appear from the HEAD tree.
-	type unresolved struct {
-		rel  string
-		sha  string
-		name string
-	}
-	var pending []unresolved
-	for rel, n := range w.tree {
-		if prefixRel != "" && !strings.HasPrefix(rel, prefixRel+"/") {
-			continue
-		}
-		name := strings.TrimPrefix(rel, prefixRel+"/")
-		if name == "" || strings.Contains(name, "/") {
-			continue
-		}
-		if _, covered := out[name]; covered {
-			continue
-		}
-		attr := treeAttr(n, cleanMtime)
-		// Listing rows feed READDIRPLUS, whose attrs the kernel applies
-		// directly to the inode: an unresolved blobless size (placeholder
-		// 0) retires a known-good i_size and every later read returns
-		// empty. Resolve unknown file/symlink sizes once via cat-file —
-		// OUTSIDE the workspace read lock: noteTreeSize writes.
-		if n.SizeBytes < 0 && (n.Kind == "file" || n.Kind == "symlink") && n.ObjectSHA != "" {
-			pending = append(pending, unresolved{rel: rel, sha: n.ObjectSHA, name: name})
-		}
-		out[name] = fs.Entry{Name: name, Attr: attr}
-	}
-	w.mu.RUnlock()
-	for _, u := range pending {
-		size := g.blobSize(w, u.sha)
-		w.noteTreeSize(u.rel, size)
-		if e, ok := out[u.name]; ok && size > 0 {
-			e.Attr.Size = size
-			out[u.name] = e
-		}
+		out[name] = fs.Entry{Name: name, Attr: fs.Attr{Kind: node.kind, Mode: mode, Size: node.size, Mtime: node.mtime}}
 	}
 	entries := make([]fs.Entry, 0, len(out))
 	for _, e := range out {
 		entries = append(entries, e)
 	}
 	return fs.Result{Entries: entries}, nil
+}
+
+// joinRel joins a dir rel prefix and a name into a workspace rel path.
+func joinRel(dir, name string) string {
+	if dir == "" {
+		return name
+	}
+	return dir + "/" + name
+}
+
+// storeDirOf returns the slash-parent of a store path.
+func storeDirOf(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i > 0 {
+		return p[:i]
+	}
+	return "/"
 }
 
 // mergeAt overlays data at off over old, zero-filling any gap (the buffer

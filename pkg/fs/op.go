@@ -302,6 +302,10 @@ type Result struct {
 type WriteOptions struct {
 	ExpectedRev int64  // compare-and-set base revision; 0 = unconditional
 	Mode        uint32 // mode applied when the write creates the file
+	// Truncate makes the write replace the whole file instead of merging
+	// at the offset over the existing content — document/pointer writes
+	// must not leave the previous longer body's tail behind.
+	Truncate bool
 }
 
 // AttrPatch is the partial-attribute update payload for setattr; nil

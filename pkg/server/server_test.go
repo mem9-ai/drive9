@@ -3,9 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -19,7 +17,6 @@ import (
 
 	"github.com/mem9-ai/drive9/internal/testtidb"
 	"github.com/mem9-ai/drive9/pkg/backend"
-	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
@@ -317,62 +314,6 @@ func TestReadInlineNoRedirect(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "tiny" {
 		t.Errorf("body=%q, want 'tiny'", body)
-	}
-}
-
-func TestGitObjectPackAPIRoundTrip(t *testing.T) {
-	s := newTestServer(t)
-	ensureGitWorkspaceSchema(t, s)
-	ts := httptest.NewServer(s)
-	defer ts.Close()
-
-	c := client.New(ts.URL, "")
-	ctx := context.Background()
-	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
-		RootPath:   "/repo-pack/",
-		RepoURL:    "https://example.test/repo-pack.git",
-		RemoteName: "origin",
-		HeadCommit: "1111111111111111111111111111111111111111",
-	})
-	if err != nil {
-		t.Fatalf("UpsertGitWorkspace: %v", err)
-	}
-	workspaceID := ws.WorkspaceID
-
-	content := []byte("small inline pack")
-	sum := sha256.Sum256(content)
-	wantPackID := hex.EncodeToString(sum[:])
-	pack, err := c.PutGitObjectPack(ctx, workspaceID, client.GitObjectPackRequest{Content: content})
-	if err != nil {
-		t.Fatalf("PutGitObjectPack: %v", err)
-	}
-	if pack.PackID != wantPackID || pack.ChecksumSHA256 != wantPackID {
-		t.Fatalf("pack ids = %q/%q, want %q", pack.PackID, pack.ChecksumSHA256, wantPackID)
-	}
-	if pack.SizeBytes != int64(len(content)) {
-		t.Fatalf("pack size = %d, want %d", pack.SizeBytes, len(content))
-	}
-	if len(pack.Content) != 0 {
-		t.Fatalf("upsert response included content, want metadata only")
-	}
-
-	packs, err := c.ListGitObjectPacks(ctx, workspaceID)
-	if err != nil {
-		t.Fatalf("ListGitObjectPacks: %v", err)
-	}
-	if len(packs) != 1 || packs[0].PackID != wantPackID {
-		t.Fatalf("packs = %+v, want one pack %s", packs, wantPackID)
-	}
-	if len(packs[0].Content) != 0 {
-		t.Fatalf("list response included content, want metadata only")
-	}
-
-	downloaded, err := c.GetGitObjectPack(ctx, workspaceID, wantPackID)
-	if err != nil {
-		t.Fatalf("GetGitObjectPack: %v", err)
-	}
-	if string(downloaded.Content) != string(content) {
-		t.Fatalf("downloaded content = %q, want %q", downloaded.Content, content)
 	}
 }
 

@@ -1251,96 +1251,82 @@ func TestIntegrationGitWorkspaces(t *testing.T) {
 	ctx := context.Background()
 
 	root := "/it-go-git-" + fmt.Sprintf("%d", time.Now().UnixNano()) + "/"
-	wsReq := GitWorkspaceRequest{
+	ws, err := c.GitWorkspaceFSUpsert(ctx, GitWorkspaceRequest{
 		RootPath:   root,
 		RepoURL:    "https://example.com/repo.git",
 		BranchName: "main",
 		BaseCommit: "0000000000000000000000000000000000000001",
 		HeadCommit: "0000000000000000000000000000000000000002",
-	}
-	ws, err := c.UpsertGitWorkspace(ctx, wsReq)
+		Mode:       "fast",
+	})
 	if err != nil {
-		t.Fatalf("UpsertGitWorkspace: %v", err)
+		t.Fatalf("GitWorkspaceFSUpsert: %v", err)
 	}
 	if ws.WorkspaceID == "" {
 		t.Fatal("WorkspaceID empty")
 	}
-	t.Cleanup(func() { _ = c.DeleteGitWorkspace(context.Background(), ws.WorkspaceID) })
+	t.Cleanup(func() { _ = c.GitWorkspaceFSDelete(context.Background(), ws.WorkspaceID) })
 
-	// GetGitWorkspaceByRoot / GetGitWorkspace
-	if _, err := c.GetGitWorkspaceByRoot(ctx, root); err != nil {
-		t.Fatalf("GetGitWorkspaceByRoot: %v", err)
-	}
-	if _, err := c.GetGitWorkspace(ctx, ws.WorkspaceID); err != nil {
-		t.Fatalf("GetGitWorkspace: %v", err)
-	}
-
-	// ListGitWorkspaces
-	if _, err := c.ListGitWorkspaces(ctx); err != nil {
-		t.Fatalf("ListGitWorkspaces: %v", err)
-	}
-
-	// ReplaceGitTree / ListGitTree — node paths are relative to the workspace root;
-	// object_sha must be a 40- or 64-character git object id.
-	sha1 := "00000000000000000000000000000000000000a1"
-	sha2 := "00000000000000000000000000000000000000a2"
-	nodes := []GitTreeNode{
-		{Path: "a.txt", ParentPath: "", Name: "a.txt", Kind: "file", Mode: "100644", ObjectSHA: sha1, SizeBytes: 1},
-		{Path: "sub/b.txt", ParentPath: "sub", Name: "b.txt", Kind: "file", Mode: "100644", ObjectSHA: sha2, SizeBytes: 2},
-	}
-	if err := c.ReplaceGitTree(ctx, ws.WorkspaceID, GitTreeReplaceRequest{CommitSHA: wsReq.HeadCommit, Nodes: nodes}); err != nil {
-		t.Fatalf("ReplaceGitTree: %v", err)
-	}
-	tn, err := c.ListGitTree(ctx, ws.WorkspaceID, wsReq.HeadCommit)
+	// The registry index carries the existence record; the manifest the rest.
+	idx, _, err := c.ReadGitWorkspaceIndex(ctx)
 	if err != nil {
-		t.Fatalf("ListGitTree: %v", err)
+		t.Fatalf("ReadGitWorkspaceIndex: %v", err)
 	}
-	if len(tn) != 2 {
-		t.Fatalf("ListGitTree len = %d, want 2", len(tn))
-	}
-
-	// UpsertGitState / GetGitState
-	if _, err := c.UpsertGitState(ctx, ws.WorkspaceID, GitStateRequest{
-		CheckpointCommit: wsReq.HeadCommit,
-		Content:          []byte("git-state-content"),
-	}); err != nil {
-		t.Fatalf("UpsertGitState: %v", err)
-	}
-	if _, err := c.GetGitState(ctx, ws.WorkspaceID); err != nil {
-		t.Fatalf("GetGitState: %v", err)
-	}
-
-	// PutGitObjectPack / ListGitObjectPacks / GetGitObjectPack
-	pack, err := c.PutGitObjectPack(ctx, ws.WorkspaceID, GitObjectPackRequest{Content: []byte("pack-content")})
-	if err != nil {
-		t.Fatalf("PutGitObjectPack: %v", err)
-	}
-	if _, err := c.ListGitObjectPacks(ctx, ws.WorkspaceID); err != nil {
-		t.Fatalf("ListGitObjectPacks: %v", err)
-	}
-	if pack != nil && pack.PackID != "" {
-		if _, err := c.GetGitObjectPack(ctx, ws.WorkspaceID, pack.PackID); err != nil {
-			t.Fatalf("GetGitObjectPack: %v", err)
+	found := false
+	for _, e := range idx.Workspaces {
+		if e.WorkspaceID == ws.WorkspaceID && strings.TrimSuffix(e.RootPath, "/") == strings.TrimSuffix(root, "/") {
+			found = true
 		}
 	}
+	if !found {
+		t.Fatalf("index entry missing for %s: %+v", ws.WorkspaceID, idx.Workspaces)
+	}
+	if got, err := c.GitWorkspaceFSGetByRoot(ctx, root); err != nil || got.WorkspaceID != ws.WorkspaceID {
+		t.Fatalf("GitWorkspaceFSGetByRoot = %+v, %v", got, err)
+	}
+	if got, err := c.GitWorkspaceFSGet(ctx, ws.WorkspaceID); err != nil || got.HeadCommit != ws.HeadCommit {
+		t.Fatalf("GitWorkspaceFSGet = %+v, %v", got, err)
+	}
+	if list, err := c.GitWorkspaceFSList(ctx); err != nil || len(list) == 0 {
+		t.Fatalf("GitWorkspaceFSList = %d entries, %v", len(list), err)
+	}
 
-	// PutGitOverlayEntry / GetGitOverlayEntry / ListGitOverlayEntries —
-	// overlay entry paths are relative to the workspace root.
-	ovPath := "overlay.txt"
-	if _, err := c.PutGitOverlayEntry(ctx, ws.WorkspaceID, GitOverlayEntryRequest{
-		Path:    ovPath,
-		Op:      "upsert",
-		Kind:    "file",
-		Mode:    "100644",
-		Content: []byte("overlay-content"),
-	}); err != nil {
-		t.Fatalf("PutGitOverlayEntry: %v", err)
+	// Tree index roundtrip through the real /.drive9 store.
+	sha1 := "00000000000000000000000000000000000000a1"
+	nodes := []GitTreeNode{
+		{Path: "a.txt", Kind: "file", Mode: "100644", ObjectSHA: sha1, SizeBytes: 1},
+		{Path: "sub/b.txt", Kind: "file", Mode: "100644", ObjectSHA: sha1, SizeBytes: 2},
 	}
-	if _, err := c.GetGitOverlayEntry(ctx, ws.WorkspaceID, ovPath); err != nil {
-		t.Fatalf("GetGitOverlayEntry: %v", err)
+	if err := c.GitWorkspaceFSPutTreeIndex(ctx, ws.WorkspaceID, ws.HeadCommit, nodes); err != nil {
+		t.Fatalf("GitWorkspaceFSPutTreeIndex: %v", err)
 	}
-	if _, err := c.ListGitOverlayEntries(ctx, ws.WorkspaceID); err != nil {
-		t.Fatalf("ListGitOverlayEntries: %v", err)
+	tn, err := c.GitWorkspaceFSGetTreeIndex(ctx, ws.WorkspaceID)
+	if err != nil || len(tn) != 2 {
+		t.Fatalf("GitWorkspaceFSGetTreeIndex = %d entries, %v", len(tn), err)
+	}
+
+	// .git state + object packs roundtrip.
+	if err := c.GitWorkspaceFSPutGitState(ctx, ws.WorkspaceID, ws.HeadCommit, []byte("git-state-content")); err != nil {
+		t.Fatalf("GitWorkspaceFSPutGitState: %v", err)
+	}
+	if st, err := c.GitWorkspaceFSGetGitState(ctx, ws.WorkspaceID); err != nil || string(st.Content) != "git-state-content" {
+		t.Fatalf("GitWorkspaceFSGetGitState = %q, %v", st, err)
+	}
+	if _, err := c.GitWorkspaceFSPutObjectPack(ctx, ws.WorkspaceID, []byte("pack-content")); err != nil {
+		t.Fatalf("GitWorkspaceFSPutObjectPack: %v", err)
+	}
+	if packs, err := c.GitWorkspaceFSListObjectPacks(ctx, ws.WorkspaceID); err != nil || len(packs) != 1 {
+		t.Fatalf("GitWorkspaceFSListObjectPacks = %d, %v", len(packs), err)
+	} else if _, err := c.GitWorkspaceFSGetObjectPack(ctx, ws.WorkspaceID, packs[0].PackID); err != nil {
+		t.Fatalf("GitWorkspaceFSGetObjectPack: %v", err)
+	}
+
+	// Deletion deregisters first, then sweeps the store subtree.
+	if err := c.GitWorkspaceFSDelete(ctx, ws.WorkspaceID); err != nil {
+		t.Fatalf("GitWorkspaceFSDelete: %v", err)
+	}
+	if _, err := c.GitWorkspaceFSGet(ctx, ws.WorkspaceID); err == nil {
+		t.Fatal("workspace still readable after delete")
 	}
 }
 

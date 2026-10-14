@@ -28,8 +28,9 @@ var ErrGitWorkspaceIndexTooLarge = errors.New("git workspace index exceeds size 
 const GitWorkspaceIndexPath = gitwsindex.Path
 
 // GitWorkspaceIndex is the remote FS document that signals whether any
-// drive9 git --fast workspaces exist. FUSE uses it only as an arming signal;
-// runtime content always comes from ListGitWorkspaces.
+// drive9 git --fast workspaces exist. The mount discovers workspaces
+// through it; the workspace records themselves live beside it under
+// /.drive9/git-workspaces/ (GitWorkspaceFS*).
 type GitWorkspaceIndex = gitwsindex.Index
 
 // GitWorkspaceIndexEntry is a minimal existence record (tenant-absolute root_path).
