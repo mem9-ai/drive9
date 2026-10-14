@@ -98,8 +98,8 @@ func TestPortOpenAccessMaskCoversReadClass(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f.inodes.UpdateMode(ino, tc.mode)
 			hdr := gofuse.InHeader{NodeId: ino}
-			hdr.Owner.Uid = 1000
-			hdr.Owner.Gid = 1000
+			hdr.Uid = 1000
+			hdr.Gid = 1000
 			out := gofuse.OpenOut{}
 			st := f.Open(nil, &gofuse.OpenIn{InHeader: hdr, Flags: tc.flags}, &out)
 			if st != tc.want {
