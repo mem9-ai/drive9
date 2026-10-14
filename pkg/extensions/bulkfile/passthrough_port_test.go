@@ -53,3 +53,30 @@ func TestPassthroughSetAttrTruncatesBelow(t *testing.T) {
 		t.Fatalf("below size after truncate = %d, want 0", st.Size)
 	}
 }
+
+// A handle-based SetAttr after the passthrough handoff answers with the
+// requested logical size (the emptied image must not report 0), and the
+// plane below holds the persisted size.
+func TestPortPassthroughSetAttrReplyKeepsLogicalSize(t *testing.T) {
+	h := newClaimHandle(t)
+	if err := h.Write(context.Background(), 0, []byte("head")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Write(context.Background(), bulkfileMaxBufferedBytes+1, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	a, err := h.applyAttr(context.Background(), &fs.Op{Kind: fs.OpSetAttr, Size: 4, HasSize: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Size != 4 {
+		t.Fatalf("setattr reply size = %d, want 4 (the emptied image answered 0)", a.Size)
+	}
+	st, err := h.below.GetAttr(context.Background(), h.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size != 4 {
+		t.Fatalf("below-plane size = %d, want the persisted 4", st.Size)
+	}
+}

@@ -51,6 +51,12 @@ type layerHandle struct {
 
 // claim wraps an open of a layer-view file with write intent.
 func (l *Layer) claim(path string, flags uint32, mode uint32) (*layerHandle, error) {
+	// An uploaded-but-unmaterialized image is the authoritative content:
+	// hydrate it so the handle reopens the real image (a missing entry
+	// answered attrs 0/EOF and a pwrite-then-flush dropped the rest).
+	if err := l.hydrateRemote(context.Background(), path); err != nil {
+		return nil, err
+	}
 	kind, overlayMode, _, content, ok := l.lookup(path)
 	h := &layerHandle{l: l, path: path, flags: flags, mode: mode, isNew: false}
 	switch {

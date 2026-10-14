@@ -870,8 +870,12 @@ func (g *Git) MaterializeHeadTree(ctx context.Context, gitDir string) error {
 			continue
 		}
 		meta := strings.Fields(string(rec[:tab]))
-		if len(meta) >= 2 && meta[0] == "blob" {
-			blobs = append(blobs, strings.ToLower(meta[1]))
+		// ls-tree records are `<mode> <type> <oid>`: the type is the
+		// second field and the object id the third — testing meta[0]
+		// (the mode, always 100644/100755/120000 here) matched nothing
+		// and hydration silently skipped every blob.
+		if len(meta) >= 3 && meta[1] == "blob" {
+			blobs = append(blobs, strings.ToLower(meta[2]))
 		}
 	}
 	if len(blobs) == 0 {

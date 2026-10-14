@@ -13,7 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"net/http/httptest"
+
 	"github.com/mem9-ai/drive9/internal/testbackend"
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
@@ -77,4 +80,39 @@ func TestPortGitStateRestoreRetriesAfterNotReady(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("ensure after checkpoint upload did not restore .git/HEAD (retry gate consumed by the earlier miss)")
+}
+
+// MaterializeHeadTree must actually hydrate the HEAD tree's blobs on a
+// partial clone: ls-tree records are `<mode> <type> <oid>`, and parsing
+// the type from meta[0] (the mode) matched nothing — hydration succeeded
+// without fetching a single blob.
+func TestPortMaterializeHeadTreeHydratesPartialClone(t *testing.T) {
+	gitBin(t)
+	src := t.TempDir()
+	run(t, src, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(src, "f.txt"), []byte("blob-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, src, "add", "f.txt")
+	run(t, src, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "one")
+	run(t, src, "config", "uploadpack.allowFilter", "true")
+
+	// A real partial clone: no blobs locally.
+	partial := t.TempDir()
+	run(t, partial, "clone", "-q", "--filter=blob:none", "--no-checkout", "file://"+src, partial)
+	if out := run(t, partial, "rev-list", "--objects", "--missing=print", "HEAD"); !strings.Contains(out, "?") {
+		t.Fatalf("precondition: partial clone reports no missing blobs (%q)", out)
+	}
+
+	gitDir := filepath.Join(partial, ".git")
+	b2 := testbackend.NewBackend()
+	ts := httptest.NewServer(b2)
+	t.Cleanup(ts.Close)
+	g, _ := New(Options{Client: client.New(ts.URL, "")})
+	if err := g.MaterializeHeadTree(context.Background(), gitDir); err != nil {
+		t.Fatal(err)
+	}
+	if out := run(t, partial, "rev-list", "--objects", "--missing=print", "HEAD"); strings.Contains(out, "?") {
+		t.Fatalf("HEAD blob still missing after materialization: %q", out)
+	}
 }

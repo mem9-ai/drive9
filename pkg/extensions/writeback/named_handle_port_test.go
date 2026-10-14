@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -158,5 +159,220 @@ func TestPortCombinedSetAttrAppliesModeAndSize(t *testing.T) {
 	}
 	if n.Mode&0o777 != 0o600 {
 		t.Fatalf("persisted mode = %o, want 0600", n.Mode&0o777)
+	}
+}
+
+// FD-named chmod resolves by its own handle: after unlink+recreate, the
+// old descriptor must not chmod the replacement.
+func TestPortNamedHandleChmodTargetsOwnObject(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	wb, _ := New(Options{Policy: PolicyCloseSync, Client: cl, Staging: mustStaging(t)})
+	terminal, _ := core.New(cl, core.Options{})
+	ch, _ := fs.NewChain(wb, terminal)
+	ctx := context.Background()
+
+	oldH := open(t, ch, "/f").(*bufferingHandle)
+	if err := oldH.Write(ctx, 0, []byte("OLD")); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldH.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/f"}); err != nil {
+		t.Fatal(err)
+	}
+	newH := open(t, ch, "/f").(*bufferingHandle)
+	if err := newH.Write(ctx, 0, []byte("NEW")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/f", Mode: 0o600, HasMode: true, Handle: oldH}); err != nil {
+		t.Fatal(err)
+	}
+	if err := newH.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	n, _ := b.Node("/f")
+	if n.Mode&0o777 == 0o600 {
+		t.Fatal("the old descriptor's chmod reached the replacement object")
+	}
+}
+
+// Releasing an older descriptor after a recreate must not hide the newer
+// writer from the path index.
+func TestPortReleaseKeepsSurvivingWriterIndexed(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	wb, _ := New(Options{Policy: PolicyCloseSync, Client: cl, Staging: mustStaging(t)})
+	terminal, _ := core.New(cl, core.Options{})
+	ch, _ := fs.NewChain(wb, terminal)
+	ctx := context.Background()
+
+	oldH := open(t, ch, "/f").(*bufferingHandle)
+	if err := oldH.Write(ctx, 0, []byte("OLD")); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldH.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/f"}); err != nil {
+		t.Fatal(err)
+	}
+	newH := open(t, ch, "/f").(*bufferingHandle)
+	if err := newH.Write(ctx, 0, []byte("NEW")); err != nil {
+		t.Fatal(err)
+	}
+	// The old descriptor goes away; the newer writer must stay reachable.
+	if err := oldH.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 3)
+	if _, err := res.Handle.Read(ctx, 0, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "NEW" {
+		t.Fatalf("read after old release = %q, want NEW (the surviving writer was unindexed)", got)
+	}
+}
+
+// An explicit chmod(000) on a dirty open handle survives the persistence
+// boundary (the presence bit alone gates publication).
+func TestPortZeroModeChmodPublishes(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	wb, _ := New(Options{Policy: PolicyCloseSync, Client: cl, Staging: mustStaging(t)})
+	terminal, _ := core.New(cl, core.Options{})
+	ch, _ := fs.NewChain(wb, terminal)
+	ctx := context.Background()
+
+	h := open(t, ch, "/f").(*bufferingHandle)
+	if err := h.Write(ctx, 0, []byte("secret")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/f", Mode: 0, HasMode: true, Handle: h}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	n, _ := b.Node("/f")
+	if n.Mode&0o777 != 0 {
+		t.Fatalf("remote mode = %o, want 0 (chmod 000 dropped at the persistence boundary)", n.Mode&0o777)
+	}
+}
+
+// The three remaining unfenced completions (review): staging that clears
+// dirty before the flush captures its generation, the write-back
+// DrainFlush upload, and the inline commit without a write cache — each
+// must keep a write acknowledged during its upload.
+func TestPortStagingRaceKeepsInFlightWrite(t *testing.T) {
+	// Variant 3 first (deterministic, no write cache): the inline
+	// commit's PUT parks after capturing its body.
+	b := testbackend.NewBackend()
+	release := make(chan struct{})
+	var gateHit atomic.Bool
+	var releaseOnce sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/fs/") && gateHit.CompareAndSwap(false, true) {
+			<-release
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); ts.Close() })
+	cl := client.New(ts.URL, "")
+	wb, _ := New(Options{Policy: PolicyCloseSync, Client: cl})
+	terminal, _ := core.New(cl, core.Options{})
+	ch, _ := fs.NewChain(wb, terminal)
+	ctx := context.Background()
+
+	h := open(t, ch, "/f").(*bufferingHandle)
+	if err := h.Write(ctx, 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	flushed := make(chan error, 1)
+	go func() { flushed <- h.Flush(ctx) }()
+	time.Sleep(150 * time.Millisecond)
+	if err := h.Write(ctx, 4, []byte("BBBB")); err != nil {
+		t.Fatal(err)
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-flushed; err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	n, _ := b.Node("/f")
+	if string(n.Data) != "AAAABBBB" {
+		t.Fatalf("inline-commit variant persisted %q, want AAAABBBB", string(n.Data))
+	}
+}
+
+// Variant 2: the write-back DrainFlush upload parks; the acknowledged
+// write survives it.
+func TestPortDrainFlushRaceKeepsInFlightWrite(t *testing.T) {
+	b := testbackend.NewBackend()
+	release := make(chan struct{})
+	var gateHit atomic.Bool
+	var releaseOnce sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/fs/") && gateHit.CompareAndSwap(false, true) {
+			<-release
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); ts.Close() })
+	cl := client.New(ts.URL, "")
+	wbcache, _ := staging.NewWriteBackCache(t.TempDir())
+	wb, _ := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+	terminal, _ := core.New(cl, core.Options{})
+	ch, _ := fs.NewChain(wb, terminal)
+	ctx := context.Background()
+
+	h := open(t, ch, "/f").(*bufferingHandle)
+	if err := h.Write(ctx, 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	// Stage the snapshot locally (write-back small-file contract), then
+	// let the drain walk upload it while the new write is acknowledged.
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	drained := make(chan error, 1)
+	go func() { drained <- h.DrainFlush(ctx) }()
+	time.Sleep(150 * time.Millisecond)
+	if err := h.Write(ctx, 4, []byte("BBBB")); err != nil {
+		t.Fatal(err)
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-drained; err != nil {
+		t.Fatal(err)
+	}
+	// The boundary commits the surviving write.
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	n, _ := b.Node("/f")
+	if string(n.Data) != "AAAABBBB" {
+		t.Fatalf("drain-flush variant persisted %q, want AAAABBBB", string(n.Data))
 	}
 }

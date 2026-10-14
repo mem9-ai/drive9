@@ -3,6 +3,8 @@
 package layer
 
 import (
+	"context"
+	"io"
 	"strings"
 	"syscall"
 )
@@ -70,6 +72,42 @@ func (l *Layer) remoteSize(p string) (int64, bool) {
 	defer l.mu.RUnlock()
 	s, ok := l.remoteSizes[p]
 	return s, ok
+}
+
+// hydrateRemote materializes an uploaded-but-unmaterialized layer image
+// into the overlay mirror, once. Every mutation path (reopen, chmod,
+// rename, a second truncate) treats contents as the authoritative image;
+// serving those an absent entry corrupted or resurrected content, and
+// per-read streaming re-downloaded the whole object for every FUSE read.
+// The image already lives server-side; this streams it back once and
+// retires the remote marker.
+func (l *Layer) hydrateRemote(ctx context.Context, path string) error {
+	l.mu.RLock()
+	_, hasContent := l.contents[path]
+	_, remote := l.remoteSizes[path]
+	l.mu.RUnlock()
+	if !remote || hasContent {
+		return nil
+	}
+	rc, err := l.cl.ReadFSLayerFileStream(ctx, l.layerRef, l.remotePath(path), nil)
+	if err != nil {
+		return err
+	}
+	data, rerr := io.ReadAll(rc)
+	cerr := rc.Close()
+	if rerr != nil {
+		return rerr
+	}
+	if cerr != nil {
+		return cerr
+	}
+	l.mu.Lock()
+	if !l.abandoned {
+		l.contents[path] = data
+		delete(l.remoteSizes, path)
+	}
+	l.mu.Unlock()
+	return nil
 }
 
 func (l *Layer) markLayerDir(p string, mode uint32) {

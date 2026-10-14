@@ -44,6 +44,7 @@ func (l *Layer) upsertFileLocked(ctx context.Context, path string, data []byte, 
 	}
 	l.mu.Lock()
 	if !l.abandoned {
+		delete(l.remoteSizes, path)
 		l.files[path] = mode & 0o777
 		l.contents[path] = append([]byte(nil), data...)
 		delete(l.whiteouts, path)
@@ -106,6 +107,15 @@ func (l *Layer) renameLayer(ctx context.Context, oldPath, newPath string) error 
 		return nil
 	}
 
+	// The uploaded layer image outranks the base object: hydrate it
+	// first, or the rename copies the pre-truncation base and
+	// resurrects the tail.
+	if err := l.hydrateRemote(ctx, oldPath); err != nil {
+		return err
+	}
+	if _, _, _, hydrated, hok := l.lookup(oldPath); hok {
+		content, ok = hydrated, true
+	}
 	data, baseMode := content, mode
 	if !ok || len(content) == 0 {
 		st, err := l.cl.StatCtx(ctx, oldRemote)

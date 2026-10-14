@@ -76,40 +76,14 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		}
 		kind, _, _, content, ok := l.lookup(op.Path)
 		if ok && kind == "file" {
-			if content == nil {
-				// An uploaded-but-unmaterialized layer image (large
-				// truncate): stream the stored object — the mirror has no
-				// bytes for it, and an empty reply here hid the image
-				// (review).
-				if rs, rok := l.remoteSize(op.Path); rok {
-					if op.Offset >= rs {
-						return fs.Result{}, nil
-					}
-					rc, rerr := l.cl.ReadFSLayerFileStream(ctx, l.layerRef, l.remotePath(op.Path), nil)
-					if rerr != nil {
-						return fs.Result{}, rerr
-					}
-					full, rerr2 := io.ReadAll(rc)
-					cerr := rc.Close()
-					if rerr2 != nil {
-						return fs.Result{}, rerr2
-					}
-					if cerr != nil {
-						return fs.Result{}, cerr
-					}
-					off := op.Offset
-					if off < 0 {
-						off = 0
-					}
-					end := int64(len(full))
-					if end > rs {
-						end = rs
-					}
-					if op.Limit > 0 && off+op.Limit < end {
-						end = off + op.Limit
-					}
-					return fs.Result{Data: full[off:end]}, nil
+			if content == nil && func() bool { _, rok := l.remoteSize(op.Path); return rok }() {
+				// An uploaded-but-unmaterialized layer image: hydrate it
+				// once — per-read streaming re-downloaded the whole object
+				// for every FUSE read (and an empty reply hid it).
+				if err := l.hydrateRemote(ctx, op.Path); err != nil {
+					return fs.Result{}, err
 				}
+				_, _, _, content, _ = l.lookup(op.Path)
 			}
 			data := content
 			if op.Offset > 0 || op.Limit > 0 {
@@ -314,6 +288,13 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 	case fs.OpSetAttr:
 		if l.readOnly {
 			return fs.Result{}, syscall.EROFS
+		}
+		// Both SETATTR halves must see the authoritative image: an
+		// uploaded-but-unmaterialized entry answered as an empty file
+		// (chmod published a zero-byte image; a second truncate zeroed
+		// the prefix).
+		if err := l.hydrateRemote(ctx, op.Path); err != nil {
+			return fs.Result{}, err
 		}
 		if h := l.handleFor(op.Path); h != nil {
 			if op.HasMode {

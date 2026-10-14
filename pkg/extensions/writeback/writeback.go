@@ -986,11 +986,15 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// (0644) rides as a pending chmod from birth, so the commit boundary
 		// publishes it. The full 0o7777 range keeps SUID/SGID at create
 		// (chmod/12: 04777); the kernel's killpriv clears them on write.
-		// Mode 0 is a legitimate create (open/26) — never coerce it.
+		// Mode 0 is a legitimate create (open/26) — never coerce it locally,
+		// and unlike an EXPLICIT chmod(000) it means "no create-mode
+		// override": the remote keeps its server default (v1), while an
+		// explicit zero-mode SetAttr still publishes (applyPendingMode keys
+		// on the presence bit alone).
 		mode := op.Mode & 0o7777
 		h := &bufferingHandle{w: w, path: op.Path, flags: op.Flags, isNew: true, baseRev: 0,
 			forceSync: hasSyncOpenFlag(op.Flags)}
-		if mode != 0o644 {
+		if mode != 0o644 && mode != 0 {
 			h.pendingMode = mode
 			h.hasPendingMode = true
 		}
@@ -1219,7 +1223,19 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// the chain, which reads the not-yet-published remote mode and
 			// settles the stale value into the kernel's 30s attr cache
 			// (killpriv SETATTR 0777 replying 04777 — chmod/12).
-			if h := w.handleFor(op.Path); h != nil {
+			h := w.handleFor(op.Path)
+			if op.Handle != nil {
+				// FATTR_FH: apply the mode to the naming descriptor's own
+				// handle — after an unlink+recreate the path's newest
+				// handle is a different object, and journaling onto it
+				// chmod'd the replacement through the old descriptor.
+				if own, ok := op.Handle.(fs.Handle); ok {
+					if bh := writebackHandleOf(own); bh != nil {
+						h = bh
+					}
+				}
+			}
+			if h != nil {
 				h.mu.Lock()
 				h.pendingMode = op.Mode & 0o7777
 				h.hasPendingMode = true
@@ -1227,13 +1243,14 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				if h.buf != nil {
 					size = h.buf.Size()
 				}
+				anonymous := h.unlinked
 				h.mu.Unlock()
 				// v1 setPendingMetadataMode: journal the mode onto the staged
 				// ledger meta too — the queue entry snapshotted its mode at
 				// enqueue, and a chmod newer than that snapshot (killpriv on
 				// an open handle) must win the post-landing application
 				// (chmod/12: 0777 vs the create-mode 04777).
-				if w.opts.Staging != nil {
+				if w.opts.Staging != nil && !anonymous {
 					_ = w.opts.Staging.Pending.UpdateMode(op.Path, op.Mode&0o7777)
 				}
 				return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o7777, Size: size}}, nil
@@ -1551,14 +1568,14 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) error {
 			// owns the upload — land it synchronously, exactly once. A
 			// commitLocked here would publish a second image that races
 			// the uploader's CAS on the same base.
+			h.mu.Lock()
+			uploadGen := h.wgen
+			h.mu.Unlock()
 			if err := h.w.uploader.UploadSync(ctx, h.path); err != nil {
 				return err
 			}
 			h.mu.Lock()
-			h.dirty = false
-			if h.buf != nil {
-				h.buf.ClearDirty()
-			}
+			h.retireDirtyLocked(uploadGen)
 			h.landed = true
 			h.mu.Unlock()
 			return nil
@@ -2182,8 +2199,48 @@ func (w *Writeback) track(h *bufferingHandle) {
 }
 
 func (w *Writeback) untrack(h *bufferingHandle) {
-	w.live.Delete(h.path)
+	// The path index maps the path to its newest tracked handle — which
+	// need not be THIS one (a recreate tracked a newer writer over it).
+	// Dropping the entry unconditionally hid the surviving writer from
+	// handleFor: its bytes could no longer be flushed or served. Remove
+	// the mapping only while it still belongs to the released handle, and
+	// re-select a surviving same-path writer otherwise.
+	if cur, ok := w.live.Load(h.path); ok && cur == h {
+		w.live.Delete(h.path)
+		w.liveSet.Range(func(key, _ any) bool {
+			if other, ok := key.(*bufferingHandle); ok && other != h && !other.unlinked {
+				other.mu.Lock()
+				samePath := other.path == h.path
+				other.mu.Unlock()
+				if samePath {
+					w.live.Store(h.path, other)
+					return false
+				}
+			}
+			return true
+		})
+	}
 	w.liveSet.Delete(h)
+}
+
+// retireDirty clears the handle's dirty state only when the write
+// generation still matches the image the completion carried: a mutation
+// acknowledged after that snapshot keeps its own dirty flag for the next
+// durability barrier (Drain flushes without the per-FH write lock).
+func (h *bufferingHandle) retireDirty(stagedGen uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.retireDirtyLocked(stagedGen)
+}
+
+// retireDirtyLocked is retireDirty with h.mu already held.
+func (h *bufferingHandle) retireDirtyLocked(stagedGen uint64) {
+	if h.wgen == stagedGen {
+		h.dirty = false
+		if h.buf != nil {
+			h.buf.ClearDirty()
+		}
+	}
 }
 
 // liveHandles tracks open buffering handles so SetAttr/unlink can find the
@@ -2625,6 +2682,7 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		size = h.buf.Size()
 	}
 	isNew := h.isNew
+	commitGen := h.wgen
 	var newReader func() io.Reader
 	var image []byte
 	if size >= commitInlineStreamThreshold {
@@ -2645,10 +2703,7 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 			h.w.commitSeeder(h.path, image, committedRev)
 		}
 		h.mu.Lock()
-		h.dirty = false
-		if h.buf != nil {
-			h.buf.ClearDirty()
-		}
+		h.retireDirtyLocked(commitGen)
 		h.landed = true
 		h.isNew = false
 		if committedRev > 0 {
@@ -3354,6 +3409,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 		return err
 	}
 	image := h.buf.Bytes()
+	stagedGen := h.wgen
 	baseRev := h.baseRev
 	mode, hasMode := h.pendingMode, h.hasPendingMode
 	h.mu.Unlock()
@@ -3393,10 +3449,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	if h.w.pendingSeeder != nil {
 		h.w.pendingSeeder(h.path, image)
 	}
-	h.mu.Lock()
-	h.dirty = false
-	h.buf.ClearDirty()
-	h.mu.Unlock()
+	h.retireDirty(stagedGen)
 	return nil
 }
 
@@ -3408,7 +3461,10 @@ func (h *bufferingHandle) applyPendingMode(ctx context.Context) error {
 	mode, has := h.pendingMode, h.hasPendingMode
 	h.pendingMode, h.hasPendingMode = 0, false
 	h.mu.Unlock()
-	if !has || mode == 0 {
+	// The presence bit alone gates publication: mode == 0 is a genuine
+	// chmod(000), not "no pending mode" (chmod 000 on a dirty open handle
+	// was silently dropped at this boundary).
+	if !has {
 		return nil
 	}
 	err := retryPostUploadMode(ctx, func() error {

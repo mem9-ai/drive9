@@ -321,7 +321,14 @@ func (h *streamHandle) attrLocked() fs.Attr {
 	if mode == 0 {
 		mode = 0o644
 	}
-	return fs.Attr{Kind: fs.KindFile, Mode: mode, Size: int64(len(h.image))}
+	size := int64(len(h.image))
+	if h.passthrough && h.image == nil {
+		// The stream lives in the plane below now: the authoritative size
+		// is the pushed one (the emptied image would answer 0, and the
+		// facade copies that into the inode and the SETATTR reply).
+		size = h.pushed
+	}
+	return fs.Attr{Kind: fs.KindFile, Mode: mode, Size: size}
 }
 
 // overlayAttr renders the lookup reply for a live claim: the buffered image

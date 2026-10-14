@@ -191,3 +191,72 @@ func TestPortBaseOnlyChmodVisibleAndReplayable(t *testing.T) {
 		t.Fatalf("replayed attr = %+v, want the chmod'd 0600", st2.Attr)
 	}
 }
+
+// The uploaded-but-unmaterialized image participates in the FULL mutation
+// lifecycle (review follow-up): reopen, chmod, rename, and a second
+// truncate see the authoritative image, and reads hydrate once instead of
+// re-downloading per request.
+func TestPortUploadedImageMutationLifecycle(t *testing.T) {
+	const oldSize = 8 << 20
+	const newSize = 7 << 20
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte(strings.Repeat("A", oldSize)))
+	var objectFetches atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/objects") {
+			objectFetches.Add(1)
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	_, ch := layerStack(t, ts, 64)
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/f", Size: newSize}); err != nil {
+		t.Fatal(err)
+	}
+	objectFetches.Store(0) // the truncate's own upload is not a read fetch
+	// Reads hydrate once: two 16-byte reads transfer the object once.
+	for range 2 {
+		rd, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/f", Offset: 0, Limit: 16})
+		if err != nil || string(rd.Data) != strings.Repeat("A", 16) {
+			t.Fatalf("read after upload = %q err=%v", string(rd.Data), err)
+		}
+	}
+	if n := objectFetches.Load(); n != 1 {
+		t.Fatalf("object transfers for 2 reads = %d, want 1 (hydrate once)", n)
+	}
+
+	// A fresh stack exercises each subsequent mutation on the uploaded
+	// state: reopen+attrs, chmod keeps the image, rename moves it without
+	// resurrecting the base tail, and a second truncate composes from it.
+	_, ch2 := layerStack(t, ts, 64)
+	st, err := ch2.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/f"})
+	if err != nil || st.Attr == nil || st.Attr.Size != newSize {
+		t.Fatalf("fresh-stack attr = %+v err=%v, want size %d", st.Attr, err, newSize)
+	}
+	// chmod publishes mode only — the image keeps its size.
+	if _, err := ch2.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/f", Mode: 0o600, HasMode: true}); err != nil {
+		t.Fatal(err)
+	}
+	rd, err := ch2.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/f", Offset: 0, Limit: 4})
+	if err != nil || string(rd.Data) != "AAAA" {
+		t.Fatalf("post-chmod read = %q err=%v, want retained bytes", string(rd.Data), err)
+	}
+	// Rename carries the truncated image, not the base tail.
+	if _, err := ch2.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/f", Path2: "/g"}); err != nil {
+		t.Fatal(err)
+	}
+	stg, err := ch2.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/g"})
+	if err != nil || stg.Attr == nil || stg.Attr.Size != newSize {
+		t.Fatalf("renamed attr = %+v err=%v, want size %d (base tail resurrected)", stg.Attr, err, newSize)
+	}
+	// A second truncate composes from the authoritative image.
+	if _, err := ch2.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/g", Size: 4}); err != nil {
+		t.Fatal(err)
+	}
+	rd, err = ch2.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/g", Offset: 0, Limit: 8})
+	if err != nil || string(rd.Data) != "AAAA" {
+		t.Fatalf("second-truncate read = %q err=%v, want AAAA (zeroed prefix)", string(rd.Data), err)
+	}
+}
