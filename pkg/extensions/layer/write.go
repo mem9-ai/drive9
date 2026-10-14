@@ -201,6 +201,11 @@ func (h *layerHandle) Truncate(size int64) error {
 	if err := h.buf.Truncate(size); err != nil {
 		return err
 	}
+	// An acknowledged truncation is a write-generation boundary: without
+	// bumping wgen, a drain upload that started before the truncate could
+	// complete afterwards and retire the dirty flag, persisting only the
+	// pre-truncate image.
+	h.wgen++
 	h.dirty = true
 	return nil
 }
@@ -297,6 +302,7 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	if !h.l.abandoned {
 		h.l.files[path] = mode & 0o777
 		h.l.contents[path] = image
+		delete(h.l.remoteSizes, path)
 		delete(h.l.whiteouts, path)
 		delete(h.l.dirs, path)
 		delete(h.l.symlinks, path)

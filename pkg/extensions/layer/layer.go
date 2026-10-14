@@ -50,6 +50,11 @@ type Layer struct {
 	mu        sync.RWMutex
 	whiteouts map[string]struct{}
 	files     map[string]uint32 // overlay file modes
+	// remoteSizes are uploaded-but-unmaterialized layer images (large
+	// truncates): the authoritative body is the layer's stored object and
+	// reads stream it back; contents must not claim a partial or empty
+	// image for these paths.
+	remoteSizes map[string]int64
 	// baseModes are mode-only overrides for files whose content still
 	// comes from the base object (a chmod of a base file).
 	baseModes map[string]uint32
@@ -213,6 +218,7 @@ func New(opts Options) (*Layer, error) {
 		whiteouts:         map[string]struct{}{},
 		files:             map[string]uint32{},
 		baseModes:         map[string]uint32{},
+		remoteSizes:       map[string]int64{},
 		dirs:              map[string]uint32{},
 		symlinks:          map[string]symlinkState{},
 		contents:          map[string][]byte{},

@@ -190,7 +190,12 @@ func (l *Layer) truncateFileWithBase(ctx context.Context, path string, content [
 	l.mu.Lock()
 	if !l.abandoned {
 		l.files[path] = m & 0o777
-		l.contents[path] = append([]byte(nil), kept...)
+		// The uploaded image is the layer's stored object; a materialized
+		// prefix here (or nil) would publish a partial/empty file as the
+		// complete overlay image — GetAttr served 0 and reads returned
+		// empty. Record the logical size and stream the object on read.
+		l.remoteSizes[path] = newSize
+		delete(l.contents, path)
 		delete(l.whiteouts, path)
 	}
 	l.mu.Unlock()

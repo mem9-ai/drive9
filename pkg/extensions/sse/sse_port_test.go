@@ -303,7 +303,11 @@ func TestPortStreamSelfFiltersOwnActor(t *testing.T) {
 	_, log, _ := startStreamSSE(t, "me", "/", func(hw http.ResponseWriter, hr *http.Request, flush func()) {
 		writeSSE(t, hw, flush, "file_changed", map[string]any{"seq": 1, "path": "/sub/f", "op": "write", "actor": "me"})
 		writeSSE(t, hw, flush, "file_changed", map[string]any{"seq": 2, "path": "/sub/f", "op": "delete", "actor": "me"})
-		time.Sleep(250 * time.Millisecond)
+		// Hold the stream open until the test closes: ending it here would
+		// disconnect and emit the lifecycle checkout, racing the count
+		// below (this row is about the actor filter, not disconnect
+		// semantics — the previous test pins those).
+		<-hr.Context().Done()
 	})
 	time.Sleep(250 * time.Millisecond)
 	if got := log.count(); got != 0 {

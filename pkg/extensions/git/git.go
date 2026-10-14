@@ -66,11 +66,13 @@ type workspace struct {
 	overlay    map[string]overlayEntry // rel path (no leading slash) → entry
 	tree       map[string]client.GitTreeNode
 	treeLoaded string // head commit the tree was loaded for
-	// stateRestore gates the lazy local .git restore: an attempt that
-	// actually restored (or found a usable .git) latches; a checkpoint
-	// that is simply not uploaded yet (discovery racing the CLI) or a
-	// transient failure retries on the next entry point (review).
-	stateRestore   sync.Once
+	// stateRestoreMu serializes the lazy local .git restore. An attempt
+	// that fails (or finds the checkpoint not uploaded yet) leaves the
+	// gate open — the next entry point retries — while restoreLatched
+	// makes every later call a no-op once a restore has succeeded. A
+	// sync.Once here consumed the attempt on failure and never retried
+	// (review).
+	stateRestoreMu sync.Mutex
 	restoreLatched bool
 }
 
@@ -383,36 +385,31 @@ func (g *Git) ensureWorkspaceState(ctx context.Context, w *workspace) error {
 	if g.localRoot == "" {
 		return nil
 	}
-	w.mu.Lock()
-	latched := w.restoreLatched
-	w.mu.Unlock()
-	if latched {
+	w.stateRestoreMu.Lock()
+	defer w.stateRestoreMu.Unlock()
+	if w.restoreLatched {
 		return nil
 	}
-	w.stateRestore.Do(func() {
-		rctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceHydrateTimeout)
-		defer cancel()
-		if err := g.restoreWorkspaceState(rctx, w); err != nil {
-			// Not latched: a transient failure (or a checkpoint the CLI
-			// has not uploaded yet — discovery races the upload) retries
-			// at the next entry point (review). A not-yet-uploaded
-			// checkpoint is quiet; real failures surface for diagnosis.
-			if !errors.Is(err, errGitStateNotReady) {
-				fmt.Fprintf(os.Stderr, "drive9: git state restore failed for workspace %s: %v\n", w.id, err)
-			}
-			return
+	rctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceHydrateTimeout)
+	defer cancel()
+	if err := g.restoreWorkspaceState(rctx, w); err != nil {
+		// Not latched: a transient failure (or a checkpoint the CLI
+		// has not uploaded yet — discovery races the upload) retries
+		// at the next entry point. A not-yet-uploaded checkpoint is
+		// quiet; real failures surface for diagnosis.
+		if !errors.Is(err, errGitStateNotReady) {
+			fmt.Fprintf(os.Stderr, "drive9: git state restore failed for workspace %s: %v\n", w.id, err)
 		}
-		if w.blobless() {
-			// A blobless restore prefetches the HEAD tree's blobs
-			// before serving.
-			if err := g.MaterializeHeadTree(rctx, g.gitDirFor(w.rootPath())); err != nil {
-				fmt.Fprintf(os.Stderr, "drive9: git head tree materialize failed for workspace %s: %v\n", w.id, err)
-			}
+		return nil
+	}
+	if w.blobless() {
+		// A blobless restore prefetches the HEAD tree's blobs
+		// before serving.
+		if err := g.MaterializeHeadTree(rctx, g.gitDirFor(w.rootPath())); err != nil {
+			fmt.Fprintf(os.Stderr, "drive9: git head tree materialize failed for workspace %s: %v\n", w.id, err)
 		}
-		w.mu.Lock()
-		w.restoreLatched = true
-		w.mu.Unlock()
-	})
+	}
+	w.restoreLatched = true
 	return nil
 }
 
@@ -648,12 +645,13 @@ func (g *Git) ensure(ctx context.Context) {
 	for _, w := range ws {
 		g.loadRemoteOverlay(ctx, w)
 		g.refreshTree(ctx, w)
-		// A workspace discovered after mount start (git clone --fast
-		// registers it server-side) still needs its local .git restored
-		// before clean-file reads can materialize blobs (v1 restores on
-		// discovery via the index notify; this is the miss-driven
-		// equivalent).
-		if g.localRoot != "" && !existingIDs[w.id] {
+		// Every workspace gets a restore attempt on every load: one
+		// discovered after mount start (git clone --fast registers it
+		// server-side) needs its .git before clean-file reads can
+		// materialize blobs, and one whose earlier attempt failed (the
+		// checkpoint raced the discovery) retries on the next reload —
+		// the success latch makes repeat attempts a no-op.
+		if g.localRoot != "" {
 			go func(w *workspace) {
 				_ = g.ensureWorkspaceState(ctx, w)
 			}(w)
@@ -744,9 +742,9 @@ func (g *Git) Start(ctx context.Context) error {
 			defer restoreCancel()
 			for _, w := range workspaces {
 				// All restore entry points (mount start, discovery, lazy
-				// blob reads) share the workspace's once: two concurrent
-				// restores race their RemoveAll+Rename swap and can leave
-				// a half-deleted .git behind.
+				// blob reads) serialize on the workspace's restore gate:
+				// two concurrent restores race their RemoveAll+Rename
+				// swap and can leave a half-deleted .git behind.
 				_ = g.ensureWorkspaceState(restoreCtx, w)
 			}
 		}

@@ -34,7 +34,17 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			if l.impliedDir(op.Path) {
 				return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755, Mtime: time.Now()}}, nil
 			}
-			return next(ctx, op)
+			res, err := next(ctx, op)
+			if err != nil {
+				return res, err
+			}
+			// A mode-only override on a base-backed file must stay
+			// visible: the base's stat still reports its own mode, and a
+			// chmod(0600) then answered 0644 (review).
+			if m, hit := l.baseFileMode(op.Path); hit && res.Attr != nil && res.Attr.Kind == fs.KindFile {
+				res.Attr.Mode = m
+			}
+			return res, err
 		}
 		switch kind {
 		case "whiteout":
@@ -44,7 +54,11 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		case "symlink":
 			return fs.Result{Attr: &fs.Attr{Kind: fs.KindSymlink, Mode: mode & 0o777}}, nil
 		default:
-			return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: int64(len(content))}}, nil
+			size := int64(len(content))
+			if rs, ok := l.remoteSize(op.Path); ok {
+				size = rs
+			}
+			return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: size}}, nil
 		}
 
 	case fs.OpReadlink:
@@ -62,6 +76,41 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		}
 		kind, _, _, content, ok := l.lookup(op.Path)
 		if ok && kind == "file" {
+			if content == nil {
+				// An uploaded-but-unmaterialized layer image (large
+				// truncate): stream the stored object — the mirror has no
+				// bytes for it, and an empty reply here hid the image
+				// (review).
+				if rs, rok := l.remoteSize(op.Path); rok {
+					if op.Offset >= rs {
+						return fs.Result{}, nil
+					}
+					rc, rerr := l.cl.ReadFSLayerFileStream(ctx, l.layerRef, l.remotePath(op.Path), nil)
+					if rerr != nil {
+						return fs.Result{}, rerr
+					}
+					full, rerr2 := io.ReadAll(rc)
+					cerr := rc.Close()
+					if rerr2 != nil {
+						return fs.Result{}, rerr2
+					}
+					if cerr != nil {
+						return fs.Result{}, cerr
+					}
+					off := op.Offset
+					if off < 0 {
+						off = 0
+					}
+					end := int64(len(full))
+					if end > rs {
+						end = rs
+					}
+					if op.Limit > 0 && off+op.Limit < end {
+						end = off + op.Limit
+					}
+					return fs.Result{Data: full[off:end]}, nil
+				}
+			}
 			data := content
 			if op.Offset > 0 || op.Limit > 0 {
 				off := op.Offset
@@ -471,7 +520,11 @@ func (l *Layer) listMerged(ctx context.Context, dir string, next fs.Next) (fs.Re
 		add(p, st.Mode&0o777, fs.KindSymlink, int64(len(st.Target)))
 	}
 	for p, m := range l.files {
-		add(p, m, fs.KindFile, int64(len(l.contents[p])))
+		sz := int64(len(l.contents[p]))
+		if rs, ok := l.remoteSizes[p]; ok {
+			sz = rs
+		}
+		add(p, m, fs.KindFile, sz)
 	}
 	l.mu.RUnlock()
 	entries := make([]fs.Entry, 0, len(out))

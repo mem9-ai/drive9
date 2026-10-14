@@ -22,6 +22,7 @@ func (l *Layer) markLayerWhiteout(p string) {
 	delete(l.dirs, p)
 	delete(l.symlinks, p)
 	delete(l.contents, p)
+	delete(l.remoteSizes, p)
 }
 
 func (l *Layer) markLayerFileMode(p string, mode uint32) {
@@ -49,6 +50,9 @@ func (l *Layer) markLayerBaseFileMode(p string, mode uint32) {
 	delete(l.whiteouts, p)
 	delete(l.dirs, p)
 	delete(l.symlinks, p)
+	delete(l.files, p)
+	delete(l.remoteSizes, p)
+	delete(l.contents, p)
 }
 
 // baseFileMode reports a recorded mode-only override.
@@ -57,6 +61,15 @@ func (l *Layer) baseFileMode(p string) (uint32, bool) {
 	defer l.mu.RUnlock()
 	m, ok := l.baseModes[p]
 	return m, ok
+}
+
+// remoteSize reports the logical size of an uploaded-but-unmaterialized
+// layer image (large truncates): reads stream the stored object.
+func (l *Layer) remoteSize(p string) (int64, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	s, ok := l.remoteSizes[p]
+	return s, ok
 }
 
 func (l *Layer) markLayerDir(p string, mode uint32) {
@@ -70,6 +83,7 @@ func (l *Layer) markLayerDir(p string, mode uint32) {
 	delete(l.files, p)
 	delete(l.symlinks, p)
 	delete(l.contents, p)
+	delete(l.remoteSizes, p)
 }
 
 func (l *Layer) markLayerSymlink(p, target string, mode uint32) {
@@ -88,6 +102,7 @@ func (l *Layer) markLayerSymlink(p, target string, mode uint32) {
 	delete(l.files, p)
 	delete(l.dirs, p)
 	delete(l.contents, p)
+	delete(l.remoteSizes, p)
 }
 
 // lookup resolves a path against the overlay; ok reports an overlay hit.
