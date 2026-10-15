@@ -600,6 +600,12 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		u.perf.uploaderSuccess.add(1)
 	}
 	if u.OnSuccess != nil {
+		if meta.LineageTrusted() && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= 1<<20 {
+			// Bind the actual uploaded payload to this live snapshot id
+			// (main's liveChecksum): success callbacks can carry the
+			// content identity for append-proof publication.
+			meta.LiveChecksum = payloadChecksum(data)
+		}
 		u.OnSuccess(*meta, committedRev, stagingGens)
 	}
 }
