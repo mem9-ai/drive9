@@ -246,6 +246,66 @@ cat ~/drive9/run-42.txt
 - It targets agent workspace workloads, not full general-purpose POSIX compatibility.
 - Search and semantic metadata exist, but Drive9 is not a vector-memory product.
 
+## Telemetry
+
+Drive9 CLI telemetry is opt-in and disabled by default: nothing is collected or
+sent unless you enable it explicitly.
+
+Enable it for one machine by adding a `telemetry` section to your existing
+`~/.drive9/config` (keep the fields already in that file):
+
+```json
+{
+  "telemetry": { "enabled": true }
+}
+```
+
+Or for a single process:
+
+```bash
+DRIVE9_TELEMETRY=on drive9 ...
+```
+
+When enabled, the CLI sends one anonymous `drive9.command.finished` event per
+finished command through the same product-owned ingestion service used by ti-cli.
+
+Collected:
+
+- command and flag names, never flag values
+- exit codes and duration
+- Drive9 version, OS, architecture, and how the CLI was installed
+- the active context's cloud provider and region, from a fixed allowlist
+  (unrecognised values are dropped, and commands addressing another context
+  report neither)
+- whether the credentials came from the config file, the environment, or an
+  explicit flag
+
+Never collected:
+
+- credentials or tokens
+- SQL text
+- file paths or contents
+- command output or API response payloads
+- tenant IDs or other cloud resource IDs
+
+While enabled, the CLI keeps one anonymous, machine-local installation ID in
+`~/.drive9/.telemetry-installation-id` (`0600`); delete that file to start over
+with a new ID. Telemetry is skipped for help, version, commandless usage,
+unknown commands, `drive9 update`, and the background mount workers Drive9
+starts on your behalf.
+
+To disable it again, set `"telemetry": { "enabled": false }` or:
+
+```bash
+DRIVE9_TELEMETRY=off drive9 ...
+```
+
+Set `DRIVE9_TELEMETRY_DEBUG=1` to see why an event was skipped or dropped on
+stderr. Released binaries already contain the ingestion endpoint: the on/off
+switch above is the only setting. Only source builds have no endpoint baked in,
+so local testing of the delivery path also needs
+`DRIVE9_ALLOW_TEST_ENDPOINTS=1` plus `DRIVE9_TEST_TELEMETRY_ENDPOINT`.
+
 ## Documentation
 
 - [LayerFS V1 design](docs/design/layered-filesystem-v1-design.md)

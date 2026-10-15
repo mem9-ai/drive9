@@ -55,10 +55,20 @@ type Context struct {
 	LabelHint     string        `json:"label_hint,omitempty"`
 }
 
+// TelemetryConfig is the persisted CLI telemetry opt-in stored in
+// ~/.drive9/config. A nil Enabled means the user never expressed a preference.
+type TelemetryConfig struct {
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
 type Config struct {
 	Server         string              `json:"server"`
 	CurrentContext string              `json:"current_context,omitempty"`
 	Contexts       map[string]*Context `json:"contexts"`
+	// Telemetry must stay part of this struct: loadConfig/saveConfig round-trip
+	// the whole document, so an unlisted field would be dropped on the next
+	// `ctx` mutation and silently reset the user's choice.
+	Telemetry *TelemetryConfig `json:"telemetry,omitempty"`
 }
 
 func configDir() string {

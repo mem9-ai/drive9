@@ -82,7 +82,7 @@ func webdavMount(c *client.Client, mountPoint string, remoteRoot string) error {
 		signals:    signalChannel(),
 		runMount:   runWebDAVMountCmd,
 		unmount:    webdavUnmount,
-		exit:       os.Exit,
+		exit:       exitProcess,
 		newPrefix:  newWebDAVNoncePrefix,
 		remoteRoot: remoteRoot,
 	})
@@ -112,7 +112,7 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 		deps.unmount = webdavUnmount
 	}
 	if deps.exit == nil {
-		deps.exit = os.Exit
+		deps.exit = exitProcess
 	}
 	if deps.newPrefix == nil {
 		deps.newPrefix = newWebDAVNoncePrefix
