@@ -736,7 +736,7 @@ func TestAppendLogPathTruncateGrowthRebasesCleanSibling(t *testing.T) {
 	if !handled || status != gofuse.OK || putCalls != 1 {
 		t.Fatalf("handled/status/puts = %t/%d/%d, want true/OK/1", handled, status, putCalls)
 	}
-	fs.syncOpenHandlesAfterPathTruncate(ino, 5)
+	fs.syncOpenHandlesAfterPathTruncate(ino, 5, 0)
 	if fh.BaseRev != 6 || fh.OrigSize != 5 || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || fh.Dirty.Size() != 5 {
 		t.Fatalf("clean sibling after path truncate = rev=%d size=%d seq=%d dirty=%t buffer=%d, want 6/5/0/false/5", fh.BaseRev, fh.OrigSize, fh.DirtySeq, fh.Dirty.HasDirtyParts(), fh.Dirty.Size())
 	}

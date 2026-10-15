@@ -74,7 +74,7 @@ func (fs *Dat9FS) checkFtruncatePathZero(ino uint64, path string) error {
 	if event == nil {
 		return nil
 	}
-	for _, fh := range fs.openHandles.SnapshotPath(path) {
+	for _, fh := range fs.openHandles.SnapshotInode(ino) {
 		if fh.Ino != ino || fh.Flags&syscall.O_ACCMODE == syscall.O_RDONLY {
 			continue
 		}

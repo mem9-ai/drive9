@@ -204,12 +204,12 @@ func (fs *Dat9FS) syncPassivePathTruncateLocked(fh *FileHandle, size, revision i
 // Both shrink and grow are handled. For shrink, the buffer is truncated.
 // For grow, the buffer is zero-extended so a later flush uploads the correct
 // size (not stale shorter content that could shrink the file back).
-func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
+func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize, committedRevision int64) {
 	zeroID := ""
 	var zeroEvent *ftruncateInheritance
 	var passive []*FileHandle
 	entry, _ := fs.inodes.GetEntry(ino)
-	samePath := entry != nil && entry.Nlink <= 1
+	sharedZero := entry != nil && (entry.Nlink <= 1 || fs.openHandles.ftruncateInheritance(ino, entry.Path) != nil)
 	for _, fh := range fs.fileHandlesForInode(ino) {
 		fh.Lock()
 		if fh.Dirty == nil {
@@ -269,12 +269,19 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize int64) {
 			}
 		}
 		fh.DirtySeq = fs.markDirtySize(ino, newSize)
-		if newSize == 0 && samePath && fs.ftruncateParticipates(fh) {
+		if newSize == 0 && sharedZero && fs.ftruncateParticipates(fh) {
 			if zeroID == "" {
 				zeroID = generateMountID()
 			}
 			fs.resetFtruncateZeroImageLocked(fh, zeroID)
 			zeroEvent = fh.pendingFtruncate.Load()
+			if committedRevision > 0 {
+				fs.clearDirtySize(ino, fh.DirtySeq)
+				fh.Dirty.ClearDirty()
+				fh.DirtySeq, fh.WriteBackSeq = 0, 0
+				fh.BaseRev = committedRevision
+				fs.openHandles.UnmarkVisibleTruncate(fh)
+			}
 		}
 		fh.Unlock()
 	}

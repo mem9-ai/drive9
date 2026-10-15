@@ -86,11 +86,16 @@ func (idx *OpenHandleIndex) ftruncateInheritance(ino uint64, path string) *ftrun
 		if fh.Flags&syscall.O_ACCMODE == syscall.O_RDONLY {
 			continue
 		}
-		if event := fh.pendingFtruncate.Load(); event != nil && event.path == path && (latest == nil || event.seq > latest.seq) {
+		if event := fh.pendingFtruncate.Load(); event != nil && event.ino == ino && (latest == nil || event.seq > latest.seq) {
 			latest = event
 		}
 	}
-	return latest
+	if latest == nil {
+		return nil
+	}
+	copy := *latest
+	copy.path = path
+	return &copy
 }
 
 func (idx *OpenHandleIndex) Remove(fh *FileHandle) {

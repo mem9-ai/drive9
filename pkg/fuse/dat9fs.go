@@ -3230,6 +3230,7 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 	if handled, status := fs.tryAppendLogPathTruncate(ctx, entry, ino, pid, newSize, data); handled {
 		return status
 	}
+	inheritedZero := newSize == 0 && entry.Revision > 0 && fs.openHandles.ftruncateInheritance(ino, entry.Path) != nil
 	if newSize == 0 {
 		if entry.Revision <= 0 && fs.adoptSingleCallerPathTruncate(entry.Path, pid) {
 			// A newly-created, uncommitted file has no remote base revision for
@@ -3239,7 +3240,7 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 			fs.cacheFileForPath(entry.Path, 0, entry.Mtime, 0)
 			return gofuse.OK
 		}
-		if fs.canStagePathTruncateToZero(entry) {
+		if !inheritedZero && fs.canStagePathTruncateToZero(entry) {
 			st := fs.stagePathTruncateToZeroLocked(ctx, entry, ino)
 			if st != gofuse.OK {
 				return st
@@ -3251,7 +3252,10 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 
 	writeStart := fs.perfStart()
 	var err error
-	if newSize > maxPathTruncateInMemoryBytes {
+	var committedRevision int64
+	if inheritedZero {
+		committedRevision, err = fs.client.WriteCtxConditionalWithRevision(ctx, apiPath, nil, entry.Revision)
+	} else if newSize > maxPathTruncateInMemoryBytes {
 		err = uploadRemoteTruncateFile(ctx, fs.client, apiPath, entry.Size, newSize, -1)
 	} else {
 		err = uploadBufferedRemoteFile(ctx, fs.client, apiPath, data, -1)
@@ -3266,6 +3270,29 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 			}
 		}
 		return httpToFuseStatus(err)
+	}
+
+	if inheritedZero {
+		if committedRevision == 0 {
+			committedRevision, _ = committedRevisionFromExpectedRevision(entry.Revision)
+		}
+		if committedRevision <= entry.Revision {
+			return gofuse.EIO
+		}
+		entry.Revision = committedRevision
+		fs.inodes.UpdateRevision(ino, committedRevision)
+		fs.dirtyMu.Lock()
+		fs.dirtySeq++
+		seq := fs.dirtySeq
+		fs.dirtyMu.Unlock()
+		fs.recordCommittedMutation(ino, seq, committedRevision, 0)
+		for path := range entry.Paths {
+			fs.recordCommittedRevisionWithSize(path, committedRevision, 0)
+		}
+		fs.updateOpenHandleBaseRevision(entry.Path, committedRevision, pid, 0)
+		fs.invalidateReadCacheAndTargets(entry.Path)
+		fs.cacheFileForPath(entry.Path, 0, entry.Mtime, committedRevision)
+		return gofuse.OK
 	}
 
 	var refreshedRevision int64
@@ -9532,7 +9559,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	// settle (~150ms in #954). All other flag combinations keep the fence.
 	fdTruncate := input.Valid&(gofuse.FATTR_FH|gofuse.FATTR_SIZE) == gofuse.FATTR_FH|gofuse.FATTR_SIZE && !fs.layerEnabled() && !isSQLiteDirectIOPath(entry.Path)
 	if !isTimeOnlySetAttr(input) && !fdTruncate {
-		if input.Valid&gofuse.FATTR_SIZE != 0 && input.Size == 0 && entry.Nlink <= 1 && fs.openHandles.ftruncateInheritance(input.NodeId, entry.Path) != nil {
+		if input.Valid&gofuse.FATTR_SIZE != 0 && input.Size == 0 && fs.openHandles.ftruncateInheritance(input.NodeId, entry.Path) != nil {
 			unlock, _, err := fs.lockFtruncateWritableOpen(input.NodeId, entry.Path)
 			if err != nil {
 				return httpToFuseStatus(err)
@@ -9698,7 +9725,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					}
 				}
 				for _, other := range siblings {
-					if other.Path != fh.Path && !other.Unlinked && fs.ftruncateAliasLinked(other) && other.DirtySeq != 0 && other.pendingFtruncate.Load() == nil {
+					if !other.Unlinked && fs.ftruncateAliasLinked(other) && other.DirtySeq != 0 && other.pendingFtruncate.Load() == nil {
 						unlockFileHandles(siblings)
 						fs.releaseHandleRemoteCommitPathLocked(fh)
 						fh.Unlock()
@@ -9761,17 +9788,22 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			// keep the remote path. Clean close-sync handles cannot own new
 			// path mutations because they may already be awaiting Release.
 			if fs.adoptCallerOwnedInodeTruncate(input.NodeId, input.Pid, newSize) {
-				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
+				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize, 0)
 			} else {
+				previousRevision := entry.Revision
 				if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
 					return st
+				}
+				var committedRevision int64
+				if newSize == 0 && entry.Revision > previousRevision {
+					committedRevision = entry.Revision
 				}
 				// Path-based truncate(path, size) truncates the remote file but
 				// does not update open dirty handles' WriteBuffers. Without this
 				// sync, a subsequent fstat(fd) on an open dirty handle returns the
 				// stale (pre-truncate) size via dirtyHandleSize(), causing
 				// fstat() mismatch failures (LTP ftest01 m_fstat case).
-				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize)
+				fs.syncOpenHandlesAfterPathTruncate(input.NodeId, newSize, committedRevision)
 			}
 		}
 		entry.Size = newSize
