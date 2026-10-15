@@ -269,6 +269,31 @@ func (u *WriteBackUploader) directPutThreshold() int64 {
 	return 0
 }
 
+// hasPath observes the existing in-flight lifetime, including success
+// publication after the write-back generation has been removed.
+func (u *WriteBackUploader) hasPath(localPath string) bool {
+	u.inflightMu.Lock()
+	_, pending := u.inflight[localPath]
+	u.inflightMu.Unlock()
+	return pending
+}
+
+// waitPathContext observes the same completion boundary as WaitPath.
+func (u *WriteBackUploader) waitPathContext(ctx context.Context, localPath string) error {
+	u.inflightMu.Lock()
+	ps := u.inflight[localPath]
+	u.inflightMu.Unlock()
+	if ps == nil {
+		return nil
+	}
+	select {
+	case <-ps.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // WaitPath blocks until any in-flight upload for localPath completes.
 // Returns immediately if no upload is in progress for this path.
 // This must be called by Rename/Unlink before operating on the local path
@@ -494,6 +519,9 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		u.perf.uploaderSuccess.add(1)
 	}
 	if u.OnSuccess != nil {
+		if meta.lineageTrusted && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= maxLandedPayloadBytes {
+			meta.liveChecksum = payloadChecksum(data)
+		}
 		u.OnSuccess(*meta, committedRev, stagingGens)
 	}
 }
@@ -508,6 +536,15 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 }
 
 func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPath string) (int64, error) {
+	revision, _, err := u.uploadSyncWithAppendSnapshot(ctx, localPath)
+	return revision, err
+}
+
+// uploadSyncWithAppendSnapshot binds proof to one captured cache generation.
+// Only trusted bounded payloads receive content identity. A data commit may
+// return proof with a later mode error; callers must retain that mode obligation.
+func (u *WriteBackUploader) uploadSyncWithAppendSnapshot(ctx context.Context, localPath string) (int64, pathCommitLandmark, error) {
+	proof := pathCommitLandmark{}
 	// Wait for any in-flight background upload to complete first.
 	u.WaitPath(localPath)
 
@@ -516,19 +553,24 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	// data — GetMetaAndView would prune the entry when the .dat is missing.
 	chmodMeta, chmodOK := u.cache.GetMeta(localPath)
 	if !chmodOK {
-		return 0, nil // not in cache (may have been uploaded by the background worker we just waited for)
+		return 0, proof, nil // not in cache (may have been uploaded by the background worker we just waited for)
 	}
 	if chmodMeta.Kind == PendingChmod {
-		return 0, u.applyPendingChmod(ctx, localPath, chmodMeta, chmodMeta.Generation, true)
+		return 0, proof, u.applyPendingChmod(ctx, localPath, chmodMeta, chmodMeta.Generation, true)
 	}
 
 	// Atomically read meta + data under one path lock so they are guaranteed
 	// to be from the same generation.
 	meta, data, ok := u.cache.GetMetaAndView(localPath)
 	if !ok {
-		return 0, nil // not in cache (removed between GetMeta and GetMetaAndView)
+		return 0, proof, nil // not in cache (removed between GetMeta and GetMetaAndView)
 	}
 	gen := meta.Generation
+	proof.size = meta.Size
+	if meta.lineageTrusted && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= maxLandedPayloadBytes {
+		proof.snapshotID, proof.checksum = meta.SnapshotID, payloadChecksum(data)
+		proof.ancestors = append([]string(nil), meta.liveAncestors...)
+	}
 
 	expectedRevision, err := expectedRevisionForWriteBack(meta)
 	if err != nil {
@@ -539,7 +581,7 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 			safeLogPrintf("writeback uploadsync: legacy overwrite without base revision for %s, falling back to unconditional write", localPath)
 			expectedRevision = -1
 		} else {
-			return 0, fmt.Errorf("resolve expected revision for %s: %w", localPath, err)
+			return 0, proof, fmt.Errorf("resolve expected revision for %s: %w", localPath, err)
 		}
 	}
 
@@ -559,9 +601,10 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 		if u.perf != nil {
 			u.perf.uploaderFailure.add(1)
 		}
-		return 0, err
+		return 0, proof, err
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+	proof.rev = committedRev
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
 	err = u.applyMode(chmodCtx, meta)
 	chmodCancel()
@@ -570,9 +613,9 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 			u.perf.uploaderFailure.add(1)
 		}
 		if _, markErr := u.cache.MarkChmodPending(localPath, gen); markErr != nil {
-			return 0, fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
+			return 0, proof, fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
 		}
-		return 0, err
+		return 0, proof, err
 	}
 
 	// Atomically remove only if generation matches — a concurrent Put() may
@@ -581,7 +624,7 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	if u.perf != nil {
 		u.perf.uploaderSuccess.add(1)
 	}
-	return committedRev, nil
+	return committedRev, proof, nil
 }
 
 func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath string, meta *WriteBackMeta, gen uint64, sync bool) error {

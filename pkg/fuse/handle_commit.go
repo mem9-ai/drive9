@@ -136,11 +136,14 @@ func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) b
 	if fs == nil || fh == nil || fh.Dirty == nil || !fs.handleCanAdoptCommittedRevisionLocked(fh) {
 		return false
 	}
-	revision := fs.latestCommittedRevision(fh.Path)
+	revision, size, hasSize := fs.latestCommittedRevisionWithSize(fh.Path)
 	if revision <= 0 || revision <= fh.BaseRev {
 		return false
 	}
-	fs.adoptCleanCommittedRevisionLocked(fh, revision, fs.committedHandleSizeLocked(fh))
+	if !hasSize {
+		size = fs.committedHandleSizeLocked(fh)
+	}
+	fs.adoptCleanCommittedRevisionLocked(fh, revision, size)
 	return true
 }
 
