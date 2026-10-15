@@ -131,6 +131,8 @@ type WriteBackMeta struct {
 	// copied with in-memory re-home/rename metadata but deliberately omitted
 	// from JSON, so recovery remains fail-closed.
 	liveAncestors []string
+	// liveChecksum binds only the actual uploader payload to this live SID.
+	liveChecksum string
 }
 
 // LineageTrusted reports whether the meta's snapshot lineage is

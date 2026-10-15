@@ -199,6 +199,11 @@ type stripedLocks struct {
 type bufferingHandle struct {
 	w    *Writeback
 	path string
+	// appendSnapshot marks a handle participating in append composition
+	// (v1 fh.appendSnapshot): its buffer adopted a sibling's records, so
+	// later writes and staging boundaries must keep composing onto the
+	// file's newest image (#1023).
+	appendSnapshot bool
 	// wgen fences flush completion against mutations acknowledged while
 	// an upload was in flight (Drain flushes without the per-FH write
 	// lock): a completion from an older buffer must not clear the newer
@@ -1527,6 +1532,31 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 		h.mu.Unlock()
 		return err
 	}
+	// #1023: an append composes onto the file's CURRENT image — a
+	// sibling writer's buffer or a sibling's landed commit may hold
+	// records this handle's buffer has never seen (including everything
+	// this handle's empty buffer has yet to write). Refresh before the
+	// write lands; a diverged composition retains data and rejects the
+	// write.
+	if h.appendParticipant() {
+		h.mu.Unlock()
+		image, landedRev, err := h.w.refreshAppendBase(ctx, h)
+		if err != nil {
+			return err
+		}
+		if image != nil {
+			h.mu.Lock()
+			cur := append([]byte(nil), h.buf.Bytes()...)
+			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
+				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
+					h.mu.Unlock()
+					return err
+				}
+			}
+			h.mu.Unlock()
+		}
+		h.mu.Lock()
+	}
 	// O_APPEND: the kernel may deliver off=0; the write lands at the
 	// buffer tail (append semantics for buffered handles).
 	if h.flags&uint32(syscall.O_APPEND) != 0 && off == 0 {
@@ -1625,9 +1655,11 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 			return err
 		}
 		h.mu.Lock()
+		size := h.buf.Size()
 		h.stagedToCache = false
 		h.mu.Unlock()
 		h.markLanded(rev)
+		h.w.landedAt(h.path, rev, size)
 	}
 	return nil
 }
@@ -1693,11 +1725,17 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			h.mu.Lock()
 			h.stagedToCache = true
 			stagedGen := h.wgen
+			stagedSize := h.buf.Size()
 			h.mu.Unlock()
 			rev, err := h.w.uploader.UploadSyncWithRevision(ctx, h.path)
 			if err != nil {
 				return err
 			}
+			// The synchronous upload bypasses the background worker whose
+			// OnSuccess feeds the landed table — record the watermark here
+			// so append siblings see the advance without a remote stat
+			// (v1 recordCommittedRevisionWithSize at this boundary).
+			h.w.landedAt(h.path, rev, stagedSize)
 			h.mu.Lock()
 			h.stagedToCache = false
 			// The image is on the remote now — for every create shape, not
@@ -2714,6 +2752,7 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 
 	committedRev, err := h.w.commitReaderOpt(ctx, h.path, newReader, size, isNew && size == 0)
 	if err == nil {
+		h.w.landedAt(h.path, committedRev, size)
 		if h.w.commitSeeder != nil && image != nil {
 			h.w.commitSeeder(h.path, image, committedRev)
 		}
@@ -2952,6 +2991,27 @@ func (h *bufferingHandle) stageAndEnqueue(ctx context.Context) error {
 // JournalCommit marker lands at a higher Seq — replay then cannot
 // resurrect a path the commit settled (v1 interactive fsync ordering).
 func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journalFsync bool) error {
+	// #1023 staging fence: an append handle must not publish an image a
+	// sibling's landed commit already superseded — compose (or reject)
+	// before this staging owns the path (v1 adoptLandedAppendSnapshot at
+	// the stageShadow fence).
+	if h.appendParticipant() {
+		image, landedRev, err := h.w.fenceRefreshAppendBase(ctx, h)
+		if err != nil {
+			return err
+		}
+		if image != nil {
+			h.mu.Lock()
+			cur := append([]byte(nil), h.buf.Bytes()...)
+			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
+				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
+					h.mu.Unlock()
+					return err
+				}
+			}
+			h.mu.Unlock()
+		}
+	}
 	h.mu.Lock()
 	if !h.dirty || h.buf == nil {
 		h.mu.Unlock()
@@ -3191,6 +3251,27 @@ func restoreShadowPart(store *staging.ShadowStore, path string, wb *writebuffer.
 // and revision-conflict retries. An unlinked handle never commits — the
 // anonymous fd's data dies at Release (semantics).
 func (h *bufferingHandle) commitLocked(ctx context.Context) error {
+	// The #1023 fence for the inline-commit track (no write cache): the
+	// commit's CAS base is the CURRENT remote revision — composing with
+	// the file's newest state first is what keeps a foreign append from
+	// being silently overwritten by an older local image.
+	if h.appendParticipant() {
+		image, landedRev, err := h.w.fenceRefreshAppendBase(ctx, h)
+		if err != nil {
+			return err
+		}
+		if image != nil {
+			h.mu.Lock()
+			cur := append([]byte(nil), h.buf.Bytes()...)
+			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
+				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
+					h.mu.Unlock()
+					return err
+				}
+			}
+			h.mu.Unlock()
+		}
+	}
 	if h.w.rolledBack.Load() {
 		return errLayerRolledBack
 	}
@@ -3401,6 +3482,28 @@ func (h *bufferingHandle) finishStreaming(ctx context.Context) error {
 // stageToWriteCache writes the buffered image into the .dat/.meta cache
 // (small-stage) and clears the in-memory buffer's dirty state.
 func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) error {
+	// The #1023 fence for the writeback-cache track (close-sync and the
+	// small-file write-back flush both stage here): compose with the
+	// file's newest state before this staging refreshes the CAS base —
+	// adopting a foreign revision without its bytes would let the
+	// conditional PUT overwrite a concurrent append.
+	if h.appendParticipant() {
+		image, landedRev, err := h.w.fenceRefreshAppendBase(ctx, h)
+		if err != nil {
+			return err
+		}
+		if image != nil {
+			h.mu.Lock()
+			cur := append([]byte(nil), h.buf.Bytes()...)
+			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
+				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
+					h.mu.Unlock()
+					return err
+				}
+			}
+			h.mu.Unlock()
+		}
+	}
 	h.mu.Lock()
 	if h.buf == nil {
 		h.mu.Unlock()
