@@ -37,7 +37,6 @@ func (e *Extent) truncateIno(ctx context.Context, path string, ino uint64, size 
 // unlinkIno removes the meta edge through the VFS, carrying the
 // still-open flag so the server keeps the projection for live handles.
 func (e *Extent) unlinkIno(ctx context.Context, path string, ino uint64, caller fs.Caller) error {
-	ctx = contextWithCaller(ctx, caller)
 	if err := e.ensureRuntime(); err != nil {
 		return syscall.EIO
 	}
@@ -61,7 +60,6 @@ func (e *Extent) unlinkIno(ctx context.Context, path string, ino uint64, caller 
 
 // removeDirIno removes an empty extent directory.
 func (e *Extent) removeDirIno(ctx context.Context, path string, ino uint64, caller fs.Caller) error {
-	ctx = contextWithCaller(ctx, caller)
 	if err := e.ensureRuntime(); err != nil {
 		return syscall.EIO
 	}
