@@ -127,7 +127,15 @@ func (h *layerHandle) Read(ctx context.Context, off int64, dest []byte) (int, er
 			return 0, err
 		}
 		defer func() { _ = rc.Close() }()
-		return io.ReadFull(rc, dest)
+		// A read extending past EOF returns a short body with
+		// ErrUnexpectedEOF — those bytes are the file's real tail, not an
+		// error (the facade only tolerates io.EOF and turned them into
+		// EIO).
+		n, rerr := io.ReadFull(rc, dest)
+		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+			rerr = nil
+		}
+		return n, rerr
 	}
 	// Load every part the read touches before serving: ReadAt zero-fills
 	// unloaded parts, which is only correct beyond the remote base.

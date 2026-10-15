@@ -321,7 +321,7 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			return next(ctx, op)
 		}
 		if op.Size >= 0 {
-			return fs.Result{}, e.truncateIno(ctx, op.Path, ino, op.Size)
+			return fs.Result{}, e.truncateIno(ctx, op.Path, ino, op.Size, op.Caller)
 		}
 		// v1 extentSetAttr: mode/owner/times apply through the VFS in one
 		// call — falling through to the classic plane would chmod the
@@ -366,9 +366,9 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 	case fs.OpUnlink, fs.OpRmdir:
 		if ino, ok := e.resolveIno(ctx, op.Path); ok {
 			if op.Kind == fs.OpRmdir {
-				return fs.Result{}, e.removeDirIno(ctx, op.Path, ino)
+				return fs.Result{}, e.removeDirIno(ctx, op.Path, ino, op.Caller)
 			}
-			return fs.Result{}, e.unlinkIno(ctx, op.Path, ino)
+			return fs.Result{}, e.unlinkIno(ctx, op.Path, ino, op.Caller)
 		}
 
 	case fs.OpRename:

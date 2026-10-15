@@ -5,6 +5,8 @@ package extent
 // interrupt semantics.
 
 import (
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -35,7 +37,7 @@ func TestPortJuiceWriteOffset(t *testing.T) {
 
 // v1 TestExtentOpenFlags.
 func TestPortExtentOpenFlags(t *testing.T) {
-	if got := extentOpenFlags(true); got != 0x20 {
+	if got := extentOpenFlags(true); got != gofuse.FOPEN_KEEP_CACHE {
 		t.Fatalf("keepCache open flags = %#x, want FOPEN_KEEP_CACHE", got)
 	}
 	if got := extentOpenFlags(false); got != 0 {
@@ -422,5 +424,24 @@ func TestPortOpenInoFollowsLayoutNotGlob(t *testing.T) {
 				t.Fatalf("stat probes = %d, want 1", got)
 			}
 		})
+	}
+}
+
+// mashenjun's row: credentials resolve through the handle when the
+// context carries none — JuiceFS VFS operations run as the requester.
+func TestPortExtentHandleCallerFallback(t *testing.T) {
+	h := &extentHandle{caller: fs.Caller{Uid: 1001, Gid: 1001, Pid: 42}}
+	if c := h.callerOf(context.Background()); c.Uid != 1001 || c.Pid != 42 {
+		t.Fatalf("handle caller fallback = %+v, want the opener's credentials", c)
+	}
+	// A context-carried caller (namespace ops) wins.
+	ctx := contextWithCaller(context.Background(), fs.Caller{Uid: 1002})
+	if c := h.callerOf(ctx); c.Uid != 1002 {
+		t.Fatalf("context caller = %+v, want 1002", c)
+	}
+	// The zero context-carried caller falls back to the opener's.
+	zero := contextWithCaller(context.Background(), fs.Caller{})
+	if c := h.callerOf(zero); c.Uid != 1001 {
+		t.Fatalf("zero context caller fell through to %+v, want the opener's 1001", c)
 	}
 }

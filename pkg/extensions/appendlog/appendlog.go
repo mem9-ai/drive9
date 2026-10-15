@@ -45,6 +45,10 @@ type Options struct {
 	// TempDir spills append-log snapshots larger than the 1MiB memory
 	// limit; empty uses os.CreateTemp's default.
 	TempDir string
+	// SyncPolicy mirrors the mount's write policy (v1 write-sync): a
+	// synchronous policy must complete the protocol commit before the
+	// Write returns, not only touch RAM.
+	SyncPolicy string
 }
 
 // landedGeneration records the remote landing of one dirty generation so a
@@ -62,11 +66,12 @@ const pathTruncateSeq = math.MinInt64
 // AppendLog is the fs.Handler middleware installing protocol handles on
 // matching paths.
 type AppendLog struct {
-	matcher *AppendLogMatcher
-	cl      *client.Client
-	root    string
-	events  *fs.EventBus
-	tempDir string
+	matcher    *AppendLogMatcher
+	cl         *client.Client
+	root       string
+	events     *fs.EventBus
+	tempDir    string
+	syncPolicy string
 	// live indexes open protocol handles by path (SetAttr interception,
 	// unlink/rename retargeting).
 	live sync.Map
@@ -85,11 +90,12 @@ func New(opts Options) (*AppendLog, error) {
 		root = "/" + strings.Trim(root, "/")
 	}
 	return &AppendLog{
-		matcher: NewAppendLogMatcher(opts.Patterns),
-		cl:      opts.Client,
-		root:    root,
-		events:  opts.Events,
-		tempDir: opts.TempDir,
+		matcher:    NewAppendLogMatcher(opts.Patterns),
+		cl:         opts.Client,
+		root:       root,
+		events:     opts.Events,
+		tempDir:    opts.TempDir,
+		syncPolicy: opts.SyncPolicy,
 	}, nil
 }
 
@@ -919,7 +925,19 @@ func (h *Handle) Write(ctx context.Context, off int64, data []byte) error {
 	h.recordUserWrite(pre, off, int64(len(data)))
 	h.seq++
 	h.dirty = true
+	syncIntent := h.flags&uint32(syscall.O_SYNC) != 0 ||
+		h.flags&uint32(syscall.O_DSYNC) != 0 ||
+		h.a.syncPolicy == "write-sync" ||
+		h.a.syncPolicy == "strict"
 	h.mu.Unlock()
+	if syncIntent {
+		// A synchronous write acknowledges only after the protocol commit
+		// (generation/tail/rewrite upload) completes — RAM-only
+		// acknowledgment violated --durability=write-sync and O_SYNC.
+		if err := h.a.routeFlush(ctx, h); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -938,6 +956,13 @@ func (h *Handle) Flush(ctx context.Context) error {
 		return err
 	}
 	if h.inner != nil {
+		// The append plane owns this path's publication once its protocol
+		// commit uploaded the payload: retire the lower plane's pending
+		// creation first, or the forwarded Flush/Sync/Release
+		// materializes the lower handle's empty image over the upload.
+		if mp, ok := h.inner.(interface{ MarkPublished() }); ok {
+			mp.MarkPublished()
+		}
 		return h.inner.Flush(ctx)
 	}
 	return nil
@@ -1133,12 +1158,17 @@ func (h *Handle) markUnlinked(ctx context.Context, next fs.Next) error {
 func (h *Handle) retarget(newPath string) {
 	h.mu.Lock()
 	old := h.path
-	h.path = newPath
-	h.mu.Unlock()
 	if old == newPath {
+		h.mu.Unlock()
 		return
 	}
+	// Untrack while h.path still names the old path: the live set is
+	// path-keyed, and re-keying first left the released handle indexed
+	// under the old name forever — a later recreate+unlink then deferred
+	// the deletion to a Release that never came.
 	h.a.untrack(h)
+	h.path = newPath
+	h.mu.Unlock()
 	h.a.track(h)
 }
 

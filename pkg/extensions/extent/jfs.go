@@ -5,6 +5,8 @@ package extent
 // supplementary-group resolution that feeds jfsMetaCtx.
 
 import (
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
 	"context"
 	"fmt"
 	"os"
@@ -127,7 +129,10 @@ func (c *jfsFuseContext) Canceled() bool {
 // its cache only when the server said so.
 func extentOpenFlags(keepCache bool) uint32 {
 	if keepCache {
-		return 0x20 // gofuse.FOPEN_KEEP_CACHE
+		// The protocol constant is FOPEN_KEEP_CACHE (1<<1): 0x20 is
+		// FOPEN_NOFLUSH, which made the kernel skip close-time FLUSH and
+		// defer upload errors to a Release that discards them.
+		return gofuse.FOPEN_KEEP_CACHE
 	}
 	return 0
 }
@@ -155,6 +160,20 @@ type extentHandle struct {
 	mu       sync.Mutex
 	closed   bool
 	openFlag uint32
+	// caller is the opener's credentials: JuiceFS VFS operations must run
+	// as the requester, not as root (the private context key is never
+	// populated by the facade's plain fuseCtx contexts).
+	caller fs.Caller
+}
+
+// callerOf resolves the request's caller: a context-carried caller when
+// present (namespace ops), else the handle's opener (handle I/O arrives
+// with a bare fuseCtx context).
+func (h *extentHandle) callerOf(ctx context.Context) fs.Caller {
+	if c, ok := ctx.Value(callerKey{}).(fs.Caller); ok && (c.Uid != 0 || c.Gid != 0 || c.Pid != 0) {
+		return c
+	}
+	return h.caller
 }
 
 func (h *extentHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
@@ -162,7 +181,7 @@ func (h *extentHandle) Read(ctx context.Context, off int64, dest []byte) (int, e
 	if v == nil {
 		return 0, syscall.EIO
 	}
-	n, errn := v.Read(h.e.jfsCtx(callerFrom(ctx)), h.ino, dest, uint64(off), h.fh)
+	n, errn := v.Read(h.e.jfsCtx(h.callerOf(ctx)), h.ino, dest, uint64(off), h.fh)
 	if errn != 0 {
 		return n, errno(errn)
 	}
@@ -174,7 +193,7 @@ func (h *extentHandle) Write(ctx context.Context, off int64, data []byte) error 
 	if v == nil {
 		return syscall.EIO
 	}
-	jctx := h.e.jfsCtx(callerFrom(ctx))
+	jctx := h.e.jfsCtx(h.callerOf(ctx))
 	if h.flags&uint32(syscall.O_APPEND) != 0 {
 		if entry, errn := v.GetAttr(jctx, h.ino, 1); errn == 0 && entry != nil && entry.Attr != nil {
 			v.UpdateLength(h.ino, entry.Attr)
@@ -198,7 +217,7 @@ func (h *extentHandle) Write(ctx context.Context, off int64, data []byte) error 
 		}
 	}
 	// A write by a non-root caller drops set-user-ID/set-group-ID.
-	if uid := callerFrom(ctx).Uid; uid != 0 {
+	if uid := h.callerOf(ctx).Uid; uid != 0 {
 		h.e.clearSetidAfterWrite(ctx, h.ino)
 	}
 	return nil
@@ -209,7 +228,7 @@ func (h *extentHandle) Sync(ctx context.Context) error {
 	if v == nil {
 		return syscall.EIO
 	}
-	if errn := v.Flush(h.e.jfsCtx(callerFrom(ctx)), h.ino, h.fh, 0); errn != 0 {
+	if errn := v.Flush(h.e.jfsCtx(h.callerOf(ctx)), h.ino, h.fh, 0); errn != 0 {
 		return errno(errn)
 	}
 	return nil
@@ -221,7 +240,7 @@ func (h *extentHandle) Flush(ctx context.Context) error {
 	if v == nil {
 		return nil
 	}
-	if errn := v.Flush(h.e.jfsCtx(callerFrom(ctx)), h.ino, h.fh, 0); errn != 0 {
+	if errn := v.Flush(h.e.jfsCtx(h.callerOf(ctx)), h.ino, h.fh, 0); errn != 0 {
 		return errno(errn)
 	}
 	return nil
@@ -234,7 +253,7 @@ func (h *extentHandle) GetLk(ctx context.Context, lk fs.FileLock) (fs.FileLock, 
 		return fs.FileLock{}, syscall.EIO
 	}
 	start, end, ltype, pid := uint64(lk.Start), uint64(lk.End), lk.Type, lk.Pid
-	jctx := &jfsFuseContext{LogContext: h.e.jfsCtx(callerFrom(ctx)), cancel: ctx.Done(), started: time.Now()}
+	jctx := &jfsFuseContext{LogContext: h.e.jfsCtx(h.callerOf(ctx)), cancel: ctx.Done(), started: time.Now()}
 	if errn := v.Getlk(jctx, vfs.Ino(h.ino), h.fh, lk.Owner, &start, &end, &ltype, &pid); errn != 0 {
 		return fs.FileLock{}, errno(errn)
 	}
@@ -252,7 +271,7 @@ func (h *extentHandle) SetLk(ctx context.Context, lk fs.FileLock, blocking bool)
 	// cancel wires the kernel-request context: a blocking lock becomes
 	// interruptible (EINTR), and lockBlock surfaces the transport's
 	// block:true hint so the server loops instead of 10ms EAGAIN polls.
-	jctx := &jfsFuseContext{LogContext: h.e.jfsCtx(callerFrom(ctx)), cancel: ctx.Done(), lockBlock: true, started: time.Now()}
+	jctx := &jfsFuseContext{LogContext: h.e.jfsCtx(h.callerOf(ctx)), cancel: ctx.Done(), lockBlock: true, started: time.Now()}
 	if lk.Flock {
 		return errno(v.Flock(jctx, vfs.Ino(h.ino), h.fh, lk.Owner, lk.Type, blocking))
 	}
@@ -272,7 +291,7 @@ func (h *extentHandle) Release(ctx context.Context) error {
 	if v == nil {
 		return nil
 	}
-	v.Release(h.e.jfsCtx(callerFrom(ctx)), vfs.Ino(h.ino), h.fh)
+	v.Release(h.e.jfsCtx(h.callerOf(ctx)), vfs.Ino(h.ino), h.fh)
 	return nil
 }
 
@@ -284,6 +303,14 @@ func callerFrom(ctx context.Context) fs.Caller {
 }
 
 type callerKey struct{}
+
+// contextWithCaller plants the request's credentials where callerFrom
+// finds them: the namespace mutation paths (unlink/rmdir/truncate/rename)
+// construct JuiceFS contexts as the requester, not as root (main passed
+// the request's credentials into these VFS operations).
+func contextWithCaller(ctx context.Context, caller fs.Caller) context.Context {
+	return context.WithValue(ctx, callerKey{}, caller)
+}
 
 // openExtent ensures the runtime, VFS.Opens the pinned inode, updates the
 // length cache, and returns the terminal handle.
@@ -318,7 +345,7 @@ func (e *Extent) openExtent(ctx context.Context, path string, ino uint64, flags 
 		attr.Gid = entry.Attr.Gid
 		attr.HasOwner = true
 	}
-	h := &extentHandle{e: e, path: path, ino: jino, fh: vfsFh, flags: flags, openFlag: extentOpenFlags(keepCache)}
+	h := &extentHandle{e: e, path: path, ino: jino, fh: vfsFh, flags: flags, openFlag: extentOpenFlags(keepCache), caller: caller}
 	e.trackLive(path)
 	return h, extentOpenFlags(keepCache), attr, nil
 }

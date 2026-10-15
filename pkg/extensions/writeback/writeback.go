@@ -2472,6 +2472,21 @@ func modeOr644(mode uint32, hasMode bool) uint32 {
 	return mode
 }
 
+// MarkPublished retires a pending creation whose publication another
+// plane owns (the append-log plane uploading the payload itself):
+// forwarding later Flush/Sync/Release to this handle must not
+// materialize its empty image over the committed upload.
+func (h *bufferingHandle) MarkPublished() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.buf == nil || h.buf.Size() == 0 {
+		h.dirty = false
+		h.stagedToCache = false
+		h.landed = true
+		h.isNew = false
+	}
+}
+
 // RetargetPath rebinds open write-plane handles keyed at oldPath onto
 // newPath — the facade's deferred-unlink survivor hook. FUSE OPEN carries
 // only the nodeid, so a hardlinked inode's open may have keyed the handle

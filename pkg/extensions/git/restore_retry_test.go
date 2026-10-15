@@ -8,6 +8,7 @@ package git
 import (
 	"context"
 	"strings"
+	"syscall"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,8 +17,9 @@ import (
 	"net/http/httptest"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
-	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 func TestPortGitStateRestoreRetriesAfterNotReady(t *testing.T) {
@@ -114,5 +116,35 @@ func TestPortMaterializeHeadTreeHydratesPartialClone(t *testing.T) {
 	}
 	if out := run(t, partial, "rev-list", "--objects", "--missing=print", "HEAD"); strings.Contains(out, "?") {
 		t.Fatalf("HEAD blob still missing after materialization: %q", out)
+	}
+}
+
+// mashenjun's row: a created-but-never-written file in a Git workspace
+// publishes its empty image at the durability boundary — Sync and Release
+// both owe the name's existence.
+func TestPortGitEmptyCreatePersists(t *testing.T) {
+	gitBin(t)
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspace("ws-1", "/repo")
+	localRoot := t.TempDir()
+	g, cl, _ := newGitExt(t, b, localRoot)
+	g.armed = true
+	ctx := context.Background()
+	g.ensure(ctx)
+	terminal, _ := core.New(cl, core.Options{})
+	ch, _ := fs.NewChain(g, terminal)
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/repo/empty", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/repo/empty"}); err != nil {
+		t.Fatalf("empty create did not survive its durability boundary: %v", err)
 	}
 }

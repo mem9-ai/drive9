@@ -15,7 +15,8 @@ import (
 )
 
 // truncateIno applies a size change through the VFS.
-func (e *Extent) truncateIno(ctx context.Context, path string, ino uint64, size int64) error {
+func (e *Extent) truncateIno(ctx context.Context, path string, ino uint64, size int64, caller fs.Caller) error {
+	ctx = contextWithCaller(ctx, caller)
 	if err := e.ensureRuntime(); err != nil {
 		return syscall.EIO
 	}
@@ -35,7 +36,8 @@ func (e *Extent) truncateIno(ctx context.Context, path string, ino uint64, size 
 
 // unlinkIno removes the meta edge through the VFS, carrying the
 // still-open flag so the server keeps the projection for live handles.
-func (e *Extent) unlinkIno(ctx context.Context, path string, ino uint64) error {
+func (e *Extent) unlinkIno(ctx context.Context, path string, ino uint64, caller fs.Caller) error {
+	ctx = contextWithCaller(ctx, caller)
 	if err := e.ensureRuntime(); err != nil {
 		return syscall.EIO
 	}
@@ -43,7 +45,6 @@ func (e *Extent) unlinkIno(ctx context.Context, path string, ino uint64) error {
 	if v == nil {
 		return syscall.EIO
 	}
-	caller := callerFrom(ctx)
 	metaCtx := e.jfsMetaCtx(caller).
 		WithValue(jfsmeta.Drive9OpenedKey, e.hasLive(path)).
 		WithValue(jfsmeta.Drive9PathKey, e.remotePath(path))
@@ -59,7 +60,8 @@ func (e *Extent) unlinkIno(ctx context.Context, path string, ino uint64) error {
 }
 
 // removeDirIno removes an empty extent directory.
-func (e *Extent) removeDirIno(ctx context.Context, path string, ino uint64) error {
+func (e *Extent) removeDirIno(ctx context.Context, path string, ino uint64, caller fs.Caller) error {
+	ctx = contextWithCaller(ctx, caller)
 	if err := e.ensureRuntime(); err != nil {
 		return syscall.EIO
 	}
@@ -67,7 +69,6 @@ func (e *Extent) removeDirIno(ctx context.Context, path string, ino uint64) erro
 	if v == nil {
 		return syscall.EIO
 	}
-	caller := callerFrom(ctx)
 	parent, errn := e.ensureParent(e.jfsCtx(caller), pathutil.DirOf(path))
 	if errn != 0 {
 		return errno(errn)

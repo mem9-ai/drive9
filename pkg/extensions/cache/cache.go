@@ -105,6 +105,11 @@ type cachingHandle struct {
 	prefetchArmed bool
 	// isSidecar marks an open -wal/-journal handle (tracker cleanup).
 	isSidecar bool
+	// grown marks a handle whose file changed through this descriptor:
+	// its open-time size/rev are stale and whole-file cache admission
+	// under that identity would serve the old image.
+	grown bool
+	mu    sync.Mutex
 }
 
 // New constructs the read-plane cache.
@@ -407,7 +412,10 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	// the inner plane serve its own staged bytes. The same applies while
 	// the path has local write state — its authoritative image is staging,
 	// not the remote revision this handle pinned.
-	if h.rev > 0 && h.size > 0 && h.size <= h.cache.mem.MaxFileSize() && !h.cache.dirs.hasLocalWriteState(h.path) && !h.cache.sqliteBypassStableCaches(h.path) {
+	h.mu.Lock()
+	grown := h.grown
+	h.mu.Unlock()
+	if h.rev > 0 && h.size > 0 && h.size <= h.cache.mem.MaxFileSize() && !grown && !h.cache.dirs.hasLocalWriteState(h.path) && !h.cache.sqliteBypassStableCaches(h.path) {
 		// v1 small-file tier: any offset slices one whole-file image; a
 		// miss fetches the WHOLE file so a short final read (the kernel's
 		// last block smaller than the request buffer) cannot lock the file
@@ -437,7 +445,7 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		// Fetch error or short image: fall through to the direct read.
 		return h.inner.Read(ctx, off, dest)
 	}
-	if off == 0 && h.rev > 0 && h.cache.admits(dest) && !h.cache.sqliteBypassStableCaches(h.path) {
+	if off == 0 && h.rev > 0 && !grown && h.cache.admits(dest) && !h.cache.sqliteBypassStableCaches(h.path) {
 		if data, ok := h.cache.mem.Get(h.path, h.rev); ok && int64(len(data)) <= int64(len(dest)) {
 			n := copy(dest, data)
 			return n, nil
@@ -530,6 +538,13 @@ func (h *cachingHandle) Write(ctx context.Context, off int64, data []byte) error
 		if h.prefetch != nil {
 			h.prefetch.Invalidate()
 		}
+		// The open-time size/rev no longer describe this file: the image
+		// grew (or changed) through this descriptor. Later reads must not
+		// admit whole-file cache entries under the stale identity — a
+		// 4096-byte read then returned only the open-time prefix forever.
+		h.mu.Lock()
+		h.grown = true
+		h.mu.Unlock()
 	}
 	return err
 }

@@ -227,9 +227,23 @@ func (h *gitHandle) retarget(path, rel string) {
 // commit lands the dirty image as one overlay entry.
 func (h *gitHandle) commit(ctx context.Context) error {
 	h.mu.Lock()
-	if h.unlinked || !h.dirty || h.buf == nil {
+	if h.unlinked || !h.dirty {
 		h.mu.Unlock()
 		return nil
+	}
+	if h.buf == nil {
+		// A created-but-never-written file still owes its existence: an
+		// empty image must publish at the durability boundary (Sync,
+		// Flush, and Release all skipped it and the name vanished with
+		// the close).
+		if err := h.ensureBufferLocked(ctx); err != nil {
+			h.mu.Unlock()
+			return err
+		}
+		if h.buf == nil {
+			h.mu.Unlock()
+			return nil
+		}
 	}
 	if err := h.buf.LoadMissingParts(); err != nil {
 		h.mu.Unlock()

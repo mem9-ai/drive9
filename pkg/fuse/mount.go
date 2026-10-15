@@ -801,7 +801,7 @@ func MountWithConfig(cfg MountConfig) error {
 
 	var appendExt *appendlog.AppendLog
 	if wantExt["appendlog"] && len(cfg.AppendLogPatterns) > 0 && strings.TrimSpace(cfg.LayerRef) == "" {
-		appendExt, err = appendlog.New(appendlog.Options{Patterns: cfg.AppendLogPatterns, Client: cl, RemoteRoot: remoteRoot, Events: bus, TempDir: appendLogSnapshotDir(cacheBase, mountHash)})
+		appendExt, err = appendlog.New(appendlog.Options{Patterns: cfg.AppendLogPatterns, Client: cl, RemoteRoot: remoteRoot, Events: bus, TempDir: appendLogSnapshotDir(cacheBase, mountHash), SyncPolicy: string(cfg.WritePolicy)})
 		if err != nil {
 			return fmt.Errorf("fuse: appendlog extension: %w", err)
 		}
