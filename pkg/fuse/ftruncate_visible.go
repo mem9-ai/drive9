@@ -174,7 +174,7 @@ func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, reader *File
 		return nil, 0, true, gofuse.OK
 	}
 	if dirty.seq > committedSeq {
-		return fs.readSupersededFtruncateOwnRange(reader, readerPath, readerSeq, dirty.seq, committedSeq, offset, reqSize)
+		return fs.readSupersededFtruncateOwnRange(ctx, reader, readerPath, readerSeq, dirty.seq, committedSeq, offset, reqSize)
 	}
 	var chmodOnlyGens map[string]uint64
 	for path := range entry.Paths {
@@ -272,9 +272,9 @@ func (fs *Dat9FS) readSupersededFtruncateRange(ctx context.Context, reader *File
 	return data, len(data), true, gofuse.OK
 }
 
-// A newer dirty reader can use only bytes it wrote after the committed
-// mutation. Uncovered bytes may still belong to the superseded truncate.
-func (fs *Dat9FS) readSupersededFtruncateOwnRange(reader *FileHandle, readerPath string, readerSeq, dirtySeq, committedSeq uint64, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+// A newer dirty reader can use its later writes, or a verified inherited
+// image whose base is compatible with the current committed mutation.
+func (fs *Dat9FS) readSupersededFtruncateOwnRange(ctx context.Context, reader *FileHandle, readerPath string, readerSeq, dirtySeq, committedSeq uint64, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
 	failClosed := gofuse.Status(syscall.EAGAIN)
 	if readerSeq == 0 || readerSeq != dirtySeq || readerSeq <= committedSeq || !reader.TryLock() {
 		return nil, 0, false, failClosed
@@ -298,7 +298,8 @@ func (fs *Dat9FS) readSupersededFtruncateOwnRange(reader *FileHandle, readerPath
 	// Only bytes before EOF need coverage; the range reader handles short reads.
 	end = min(end, reader.Dirty.Size())
 	if !reader.coversFtruncateWrites(offset, end, committedSeq) {
-		return nil, 0, false, failClosed
+		data, status := fs.readInheritedFtruncateOwnRangeLocked(ctx, reader, offset, reqSize)
+		return data, len(data), true, status
 	}
 	stillCurrent := func() bool {
 		fs.dirtyMu.Lock()
@@ -314,6 +315,98 @@ func (fs *Dat9FS) readSupersededFtruncateOwnRange(reader *FileHandle, readerPath
 		return nil, 0, false, failClosed
 	}
 	return data, n, true, status
+}
+
+// readInheritedFtruncateOwnRangeLocked borrows this handle's current image
+// when write-only coverage omits its validated base. The caller holds reader.mu
+// and has checked the request range. No proof survives this call.
+func (fs *Dat9FS) readInheritedFtruncateOwnRangeLocked(ctx context.Context, reader *FileHandle, offset int64, size uint32) ([]byte, gofuse.Status) {
+	fail := gofuse.Status(syscall.EAGAIN)
+	event := reader.pendingFtruncate.Load()
+	if reader.Dirty == nil || !fs.ftruncateParticipates(reader) || event == nil || event.id == "" ||
+		event.ino != reader.Ino || event.path != reader.Path || event.view != fs.mountViewGeneration.Load() ||
+		!fs.ftruncateAliasLinked(reader) || !reader.LineageTrusted || reader.ftruncateInherited != event.id || !ftruncateDescends(reader, event.id) ||
+		ftruncateSnapshotID(reader) == "" || reader.DirtySeq <= event.seq {
+		return nil, fail
+	}
+	fs.dirtyMu.Lock()
+	dirty, committed := fs.dirtyInodes[reader.Ino], fs.mutationInodes[reader.Ino]
+	fs.dirtyMu.Unlock()
+	if dirty.seq != reader.DirtySeq || reader.DirtySeq <= committed.committedSeq {
+		return nil, fail
+	}
+	entry, exists := fs.inodes.GetEntry(reader.Ino)
+	if !exists || entry.Unlinked {
+		return nil, fail
+	}
+	revision := max(entry.Revision, fs.ftruncateAliasRevision(reader))
+	// Pending root: a later unrelated known revision cannot supply this base.
+	if committed.committedSeq < event.seq {
+		if reader.BaseRev != event.revision || revision > event.revision {
+			return nil, fail
+		}
+	} else {
+		if committed.committedRevision <= 0 || revision != committed.committedRevision || reader.BaseRev > revision {
+			return nil, fail
+		}
+		// A successful mutation on the currently bound revision preserves its
+		// loaded base. A root committing later is identified by its exact sequence.
+		related := reader.BaseRev == revision || committed.committedSeq == event.seq
+		if !related {
+			p := fs.ftruncateAliasProof(reader)
+			related = p.rev == committed.committedRevision && p.size == committed.committedSize && ftruncateDescends(reader, p.snapshotID)
+		}
+		if !related {
+			return nil, fail
+		}
+	}
+	buffer, version, seq, path, base, id := reader.Dirty, reader.Dirty.contentVersion, reader.DirtySeq, reader.Path, reader.BaseRev, ftruncateSnapshotID(reader)
+	shadow := reader.ShadowStageGen
+	var data []byte
+	var loaded []int
+	valid := false
+	defer func() {
+		if !valid {
+			discardFtruncateLoadedParts(buffer, loaded)
+		}
+	}()
+	if shadow != 0 && (reader.ShadowReady || reader.ShadowSpill) {
+		// Borrow the existing generation-locked local range reader. This
+		// stack-only size descriptor is not published and owns no staging.
+		var err error
+		data, err = fs.readFtruncateStagedRange(&aliasStageProof{path: path, shadowGen: shadow, meta: &WriteBackMeta{Size: buffer.Size()}}, offset, size)
+		if err != nil {
+			return nil, fail
+		}
+	} else {
+		var err error
+		data, loaded, err = fs.readFtruncateLiveRangeLocked(ctx, reader, offset, size)
+		if err != nil {
+			if code, ok := err.(syscall.Errno); ok {
+				return nil, gofuse.Status(code)
+			}
+			return nil, gofuse.EIO
+		}
+	}
+
+	failpoint.InjectCall("ftruncateSelfReadBeforeValidate", fs, reader)
+	if !fs.lockMountViewRead(event.view) {
+		return nil, fail
+	}
+	defer fs.mountViewMu.RUnlock()
+	nowEntry, exists := fs.inodes.GetEntry(reader.Ino)
+	fs.dirtyMu.Lock()
+	nowDirty, nowCommit := fs.dirtyInodes[reader.Ino], fs.mutationInodes[reader.Ino]
+	fs.dirtyMu.Unlock()
+	if !exists || !fs.ftruncateAliasLinked(reader) || nowEntry.ResourceID != entry.ResourceID || nowEntry.Revision != entry.Revision ||
+		reader.pendingFtruncate.Load() != event || reader.Dirty != buffer || buffer.contentVersion != version || reader.DirtySeq != seq || reader.Path != path ||
+		reader.BaseRev != base || ftruncateSnapshotID(reader) != id || nowDirty != dirty || nowCommit.committedSeq != committed.committedSeq || nowCommit.committedRevision != committed.committedRevision || nowCommit.committedSize != committed.committedSize ||
+		max(nowEntry.Revision, fs.ftruncateAliasRevision(reader)) != revision || reader.ShadowStageGen != shadow ||
+		(shadow != 0 && (fs.shadowStore == nil || fs.shadowStore.ActiveGeneration(path) != shadow)) {
+		return nil, fail
+	}
+	valid = true
+	return data, gofuse.OK
 }
 
 func (fs *Dat9FS) readPendingFtruncateVisibleRangeOnce(ctx context.Context, reader *FileHandle, entry *InodeEntry, readerSeq uint64, readerMarked bool, latestSeq uint64, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, bool) {
@@ -378,7 +471,8 @@ func (fs *Dat9FS) readPendingFtruncateVisibleRangeOnce(ctx context.Context, read
 		}
 		end = min(end, reader.Dirty.Size())
 		if offset < end && !reader.coversFtruncateWrites(offset, end, markedSeq) {
-			return nil, 0, false, gofuse.Status(syscall.EAGAIN), false
+			data, status := fs.readInheritedFtruncateOwnRangeLocked(ctx, reader, offset, reqSize)
+			return data, len(data), true, status, false
 		}
 		return fs.readPendingFtruncateHandleLocked(reader, offset, reqSize, false)
 	}

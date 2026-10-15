@@ -117,8 +117,8 @@ func TestReadWriteBackFtruncateNewerWriterOwnRange(t *testing.T) {
 				t.Fatalf("other reader = %q/%v/%v, want proven %q", got, st, err, wantSibling)
 			}
 			if tc.name == "partial" {
-				if _, st, err := readDat9FSTestRange(fs, ino, b, 0, len(remote)); err != nil || st != gofuse.Status(syscall.EAGAIN) {
-					t.Fatalf("own unproven tail = %v/%v, want EAGAIN", st, err)
+				if got, st, err := readDat9FSTestRange(fs, ino, b, 0, len(remote)); err != nil || st != gofuse.OK || string(got) != "Xello" {
+					t.Fatalf("own inherited tail = %q/%v/%v, want Xello/OK", got, st, err)
 				}
 			}
 			if remoteReads.Load() != 0 {
@@ -177,11 +177,11 @@ func TestReadWriteBackFtruncateOwnRangeAfterCommit(t *testing.T) {
 	if err != nil || st != gofuse.OK || string(got) != "X" {
 		t.Fatalf("B own covered read = %q/%v/%v, want X/OK", got, st, err)
 	}
-	if _, st, err := readDat9FSTestRange(fs, ino, b, 0, 2); err != nil || st != gofuse.Status(syscall.EAGAIN) {
-		t.Fatalf("B own uncovered read = %v/%v, want EAGAIN", st, err)
+	if got, st, err := readDat9FSTestRange(fs, ino, b, 0, 2); err != nil || st != gofuse.OK || string(got) != "Xe" {
+		t.Fatalf("B inherited read = %q/%v/%v, want Xe/OK", got, st, err)
 	}
-	if _, st, err := readDat9FSTestRange(fs, ino, b, 0, 4096); err != nil || st != gofuse.Status(syscall.EAGAIN) {
-		t.Fatalf("B own uncovered read across EOF = %v/%v, want EAGAIN", st, err)
+	if got, st, err := readDat9FSTestRange(fs, ino, b, 0, 4096); err != nil || st != gofuse.OK || string(got) != "Xello" {
+		t.Fatalf("B inherited read across EOF = %q/%v/%v, want Xello/OK", got, st, err)
 	}
 	if got, st, err := readDat9FSTestRange(fs, ino, c, 0, 1); err != nil || st != gofuse.OK || string(got) != "X" {
 		t.Fatalf("C proven successor read = %q/%v/%v, want X/OK", got, st, err)

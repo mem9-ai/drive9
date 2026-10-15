@@ -153,7 +153,7 @@ func TestRegularFileRenameRejectsStaleEmptyFallback(t *testing.T) {
 				reviewFtruncate(t, fs, ino, opened.Fh, 0)
 			}
 			wrote, released, drained := false, false, false
-			flushFenceHeld, flushCacheOwned := false, false
+			flushFenceReleased, flushCacheOwned := false, false
 			write := func() {
 				if wrote {
 					t.Fatal("duplicate child write")
@@ -172,13 +172,13 @@ func TestRegularFileRenameRejectsStaleEmptyFallback(t *testing.T) {
 					t.Fatal("Flush removed fd")
 				}
 				fh.Lock()
-				flushFenceHeld = fh.ftruncateFence && fh.RemoteCommitUnlock != nil
+				flushFenceReleased = !fh.ftruncateFence && fh.RemoteCommitUnlock == nil
 				fh.Unlock()
 				if m, ok := fs.writeBack.GetMeta(oldP); ok {
 					flushCacheOwned = m.ownedStagingKnown
 				}
-				if !flushFenceHeld || !flushCacheOwned {
-					t.Fatal("healthy Flush did not publish fenced owned cache")
+				if !flushFenceReleased || !flushCacheOwned {
+					t.Fatal("healthy Flush did not publish owned cache and release its idle fence")
 				}
 			}
 			release := func() {
@@ -233,7 +233,7 @@ func TestRegularFileRenameRejectsStaleEmptyFallback(t *testing.T) {
 					write()
 					flush()
 					if scenario == "flush_after_capture_landed_open" {
-						// Run the real uploader while the healthy fd retains its fence;
+						// Run the real uploader while the healthy fd remains open;
 						// callbacks and Rename perform any retirement themselves.
 						if err := fs.uploader.UploadSync(context.Background(), oldP); err != nil {
 							t.Fatal(err)
@@ -272,20 +272,23 @@ func TestRegularFileRenameRejectsStaleEmptyFallback(t *testing.T) {
 			mu.Unlock()
 			preserved := scenario == "plain_empty" || bytes == "hello"
 			if scenario == "flush_after_capture_uncommitted" {
-				if st != gofuse.EAGAIN || decisionSeen || createCount != 0 || deleteCount != 0 || renameCount != 0 {
-					t.Fatalf("uncommitted image bypassed healthy fence: %v/%t/%d/%d/%d", st, decisionSeen, createCount, deleteCount, renameCount)
+				if st != gofuse.ENOENT || !fired || !decisionSeen || where != oldP || remoteBefore != "hello world" || createCount != 0 || deleteCount != 0 || renameCount != 1 {
+					t.Fatalf("late Flush did not preserve namespace before mock ENOENT: %v/%t/%d/%d/%d", st, decisionSeen, createCount, deleteCount, renameCount)
 				}
 				fh, ok := fs.fileHandles.Get(opened.Fh)
 				if !ok {
 					t.Fatal("Rename abort removed fd")
 				}
 				fh.Lock()
-				retained := fh.DirtySeq != 0 && string(fh.Dirty.Bytes()) == "hello" && fh.RemoteCommitUnlock != nil
+				cached, cachedOK := fs.writeBack.GetMeta(oldP)
+				pendingGen := fs.pendingIndex.Generation(oldP)
+				retained := fh.DirtySeq != 0 && fh.BaseRev == preflightRev && string(fh.Dirty.Bytes()) == "hello" && fh.RemoteCommitUnlock == nil &&
+					cachedOK && cached.ownedStagingKnown && cached.Generation != 0 && cached.Generation == fh.WriteBackGen &&
+					pendingGen != 0 && pendingGen == fh.PendingIndexGen && pendingGen == cached.ownedStagingGens.PendingIndexGen
 				fh.Unlock()
 				if !retained {
-					t.Fatal("Rename abort did not preserve healthy owner/image")
+					t.Fatal("Rename abort did not preserve exact staged live image")
 				}
-				preserved = true
 			}
 			if scenario == "plain_empty" && (st != gofuse.OK || where != newP || createCount != 1 || deleteCount != 1) {
 				t.Fatal("ordinary empty fallback compatibility failed")

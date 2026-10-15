@@ -11,6 +11,36 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
 
+func TestFtruncateCreatedSiblingAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		written bool
+		size    uint64
+		want    gofuse.Status
+	}{{"empty_noop", false, 0, gofuse.OK}, {"empty_grow", false, 2, gofuse.EAGAIN}, {"written_zero", true, 0, gofuse.EAGAIN}, {"written_same_size", true, 1, gofuse.EAGAIN}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, _, _, _, _ := newFtruncateCommitFS(t)
+			var a gofuse.CreateOut
+			if st := fs.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: 1}, Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: defaultRegularFileMode}, "empty.txt", &a); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			if tc.written {
+				hardlinkWrite(t, fs, a.NodeId, a.Fh, "H")
+			}
+			var b gofuse.OpenOut
+			if st := fs.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: a.NodeId}, Flags: uint32(syscall.O_RDWR)}, &b); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			parent, _ := fs.fileHandles.Get(a.Fh)
+			before, seq := string(parent.Dirty.Bytes()), parent.DirtySeq
+			st := fs.SetAttr(nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{InHeader: gofuse.InHeader{NodeId: a.NodeId}, Valid: gofuse.FATTR_FH | gofuse.FATTR_SIZE, Fh: b.Fh, Size: tc.size}}, &gofuse.AttrOut{})
+			if st != tc.want || string(parent.Dirty.Bytes()) != before || parent.DirtySeq != seq {
+				t.Fatalf("created sibling admission=%v want=%v accepted=%q seq=%d", st, tc.want, parent.Dirty.Bytes(), parent.DirtySeq)
+			}
+		})
+	}
+}
+
 func TestFtruncateRejectsIndependentDirtySibling(t *testing.T) {
 	for _, callerDirty := range []bool{false, true} {
 		for _, tc := range []struct {

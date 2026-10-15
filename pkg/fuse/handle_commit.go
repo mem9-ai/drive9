@@ -1,5 +1,7 @@
 package fuse
 
+import "slices"
+
 func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision int64, skip *FileHandle) {
 	if fs == nil || fs.openHandles == nil || path == "" || revision <= 0 {
 		return
@@ -124,6 +126,16 @@ func (fs *Dat9FS) adoptCleanCommittedRevisionLocked(fh *FileHandle, revision, si
 	}
 	fh.IsNew = false
 	fh.BaseRev = revision
+	// A clean alias adopts the complete committed image, so carry its proven
+	// lineage too; a newer CAS base alone would strand the next local child.
+	if fs.ftruncateParticipates(fh) && fh.LineageTrusted {
+		proof, id := fs.ftruncateAliasProof(fh), ftruncateSnapshotID(fh)
+		if id != "" && proof.snapshotID != "" && proof.checksum != "" && proof.rev == revision && proof.size == size &&
+			(proof.snapshotID == id || slices.Contains(proof.ancestors, id)) {
+			clearStagedSnapshotLineageLocked(fh)
+			fh.ContentSnapshotID, fh.contentAncestors = proof.snapshotID, append([]string(nil), proof.ancestors...)
+		}
+	}
 	clearHandleShadowClaimLocked(fh)
 	fs.rebindCleanWriteBufferToRemoteLocked(fh, size)
 	fh.appendLogAdoptCommittedBaseline(revision, size)

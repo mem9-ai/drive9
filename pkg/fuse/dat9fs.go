@@ -1766,6 +1766,14 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fs.removeHandleOwnedStagingLocked(fh)
+	if fs.ftruncateParticipates(fh) && fh.LineageTrusted {
+		proof, id := fs.ftruncateAliasProof(fh), ftruncateSnapshotID(fh)
+		if id != "" && proof.snapshotID != "" && proof.checksum != "" && proof.rev == state.committedRevision && proof.size == state.committedSize &&
+			(proof.snapshotID == id || slices.Contains(proof.ancestors, id)) {
+			clearStagedSnapshotLineageLocked(fh)
+			fh.ContentSnapshotID, fh.contentAncestors, fh.LineageTrusted = proof.snapshotID, append([]string(nil), proof.ancestors...), true
+		}
+	}
 	if fh.Dirty != nil {
 		fh.Dirty.ClearDirty()
 	}
@@ -4063,11 +4071,7 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 		return true
 	}
 	oversizedPendingAppend := func(src *FileHandle) bool {
-		// ZeroBase alone may survive a successful empty-file commit. A
-		// genuine pending truncate still has dirty or staging ownership.
-		unresolved := src.IsNew || src.DirtySeq != 0 || src.WriteBackSeq != 0 || src.ShadowCommitReady || src.Dirty.HasDirtyParts()
-		return tryLock && appendBytes > 0 && unresolved &&
-			(appendBytes > maxLandedPayloadBytes || max(fh.Dirty.Size(), src.Dirty.Size()) > maxLandedPayloadBytes-appendBytes)
+		return tryLock && appendExceedsPendingSourceBound(fh, src, appendBytes)
 	}
 
 	type candidate struct {
@@ -4343,6 +4347,39 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandles(fh *FileHandle, tryLock bool
 		return true, nil
 	}
 	return false, nil
+}
+
+// appendExceedsPendingSourceBound requires both handle locks and src.Dirty.
+func appendExceedsPendingSourceBound(fh, src *FileHandle, appendBytes int64) bool {
+	// ZeroBase alone may survive a successful empty-file commit. A genuine
+	// pending truncate still has dirty or staging ownership.
+	unresolved := src.IsNew || src.DirtySeq != 0 || src.WriteBackSeq != 0 || src.ShadowCommitReady || src.Dirty.HasDirtyParts()
+	targetSize := int64(0)
+	if fh.Dirty != nil {
+		targetSize = fh.Dirty.Size()
+	}
+	return appendBytes > 0 && unresolved &&
+		(appendBytes > maxLandedPayloadBytes || max(targetSize, src.Dirty.Size()) > maxLandedPayloadBytes-appendBytes)
+}
+
+// checkAppendSourceBoundsLocked rejects before truncate inheritance can replace
+// the target image. The caller holds fh.mu and the existing alias fence.
+func (fs *Dat9FS) checkAppendSourceBoundsLocked(fh *FileHandle, appendBytes int64) error {
+	for _, src := range fs.openHandles.SnapshotInode(fh.Ino) {
+		if src == nil || src == fh || src.Flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+			continue
+		}
+		if !src.TryLock() {
+			return syscall.EAGAIN
+		}
+		oversized := !src.Unlinked && src.Ino == fh.Ino && src.Dirty != nil &&
+			(src.Path == fh.Path || fs.sameLinkedInode(src.Path, fh.Ino)) && appendExceedsPendingSourceBound(fh, src, appendBytes)
+		src.Unlock()
+		if oversized {
+			return syscall.EAGAIN
+		}
+	}
+	return nil
 }
 
 // refreshAppendBufferLocked reloads a writable handle's buffer from
@@ -9726,6 +9763,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				}
 				for _, other := range siblings {
 					if !other.Unlinked && fs.ftruncateAliasLinked(other) && other.DirtySeq != 0 && other.pendingFtruncate.Load() == nil {
+						if newSize == 0 && fh.Dirty.Size() == 0 && other.IsNew && other.Dirty != nil && other.Dirty.Size() == 0 {
+							continue // A newly created empty sibling has no pre-truncate bytes.
+						}
 						unlockFileHandles(siblings)
 						fs.releaseHandleRemoteCommitPathLocked(fh)
 						fh.Unlock()
@@ -11767,7 +11807,6 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		for _, meta := range metas {
 			newChild := newP + meta.Path[len(oldP):]
 			if meta.ownedStagingKnown {
-				ownedMigrations[meta.Path] = true
 				var moved bool
 				var err error
 				if _, covered := ownedRenamePaths[meta.Path]; covered {
@@ -11776,6 +11815,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 					// A late publication cannot borrow another path's exclusions.
 					moved, err = fs.renameOwnedWriteBack(meta.Path, newChild)
 				}
+				ownedMigrations[meta.Path] = moved || err != nil
 				if err != nil {
 					migrationErr = errors.Join(migrationErr, err)
 				} else if moved && fs.uploader != nil {
@@ -11795,6 +11835,15 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	// Also migrate pendingIndex and shadowStore entries for descendants.
 	// Meta-first order so a crash mid-migration cannot orphan a child's data.
 	if fs.pendingIndex != nil {
+		quarantineUnmovedPending := func(meta *WriteBackMeta, cause error) {
+			if handled, owned := ownedMigrations[meta.Path]; !owned || handled {
+				return
+			}
+			lock := fs.pendingIndex.acquirePathLock(meta.Path)
+			markErr := fs.pendingIndex.markRenameConflictLocked(meta.Path, meta.Generation)
+			fs.pendingIndex.releasePathLock(meta.Path, lock)
+			migrationErr = errors.Join(migrationErr, cause, markErr)
+		}
 		metas := fs.pendingIndex.ListByPrefix(prefix)
 		if !oldInfo.isDir {
 			if _, covered := ownedRenamePaths[oldP]; covered {
@@ -11813,6 +11862,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 				// Leave the entry at the stale path rather than losing it;
 				// the upload will fail visibly instead of silently dropping.
 				safeLogPrintf("rename: prepare pending child meta %s -> %s failed: %v", meta.Path, newChild, err)
+				quarantineUnmovedPending(meta, err)
 				continue
 			}
 			if preparedMeta == nil {
@@ -11829,6 +11879,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 			if fs.shadowStore != nil && !fs.shadowStore.Rename(meta.Path, newChild) {
 				fs.pendingIndex.AbortRename(newChild)
 				safeLogPrintf("rename: migrate pending child shadow %s -> %s failed", meta.Path, newChild)
+				quarantineUnmovedPending(meta, fmt.Errorf("rename pending child shadow %s to %s: %w", meta.Path, newChild, syscall.EIO))
 				continue
 			}
 			fs.pendingIndex.CommitRename(meta.Path, preparedMeta)
@@ -14085,6 +14136,11 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 					return 0, httpToFuseStatus(err)
 				}
 				unlockRemoteCommit = func() { fs.releaseHandleRemoteCommitPathLocked(fh) }
+				if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+					if err := fs.checkAppendSourceBoundsLocked(fh, int64(len(data))); err != nil {
+						return 0, httpToFuseStatus(err)
+					}
+				}
 				if err := fs.prepareFtruncateMutationLocked(ctx, fh); err != nil {
 					return 0, httpToFuseStatus(err)
 				}
@@ -15151,12 +15207,25 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 	mutationExpectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	mutationRecorded := false
 	mutationUploadCommitted := false
+	var mutationCommittedRevision int64
+	var mutationProof pathCommitLandmark
+	if fs.ftruncateParticipates(fh) && fh.LineageTrusted && mutationSize <= maxLandedPayloadBytes && writeBufferHasLoadedFullRange(fh.Dirty) {
+		mutationProof.snapshotID, _ = ensureStagedSnapshotLineageLocked(fh)
+		mutationProof.ancestors = append([]string(nil), fh.stagedAncestors...)
+		mutationProof.checksum = payloadChecksum(fh.Dirty.bytesView())
+	}
 	recordMutationBeforeFenceRelease := func() {
 		if mutationRecorded || !mutationUploadCommitted || mutationSeq == 0 ||
 			(!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(mutationIno) && !fs.hasFtruncateInheritance(mutationIno)) {
 			return
 		}
-		revision := fs.resolveCommittedMutationRevision(mutationPath, fs.latestCommittedRevision(mutationPath), mutationExpectedRevision)
+		// The cached path revision may precede this upload. Use its actual
+		// result when available, otherwise resolve from the captured CAS base.
+		revision := fs.resolveCommittedMutationRevision(mutationPath, mutationCommittedRevision, mutationExpectedRevision)
+		if fs.commitQueue != nil {
+			fs.commitQueue.rememberLanded(mutationPath, revision, mutationSize, mutationProof.checksum, mutationProof.snapshotID, mutationProof.ancestors...)
+		}
+		fs.recordCommittedRevisionWithSize(mutationPath, revision, mutationSize)
 		fs.recordCommittedMutation(mutationIno, mutationSeq, revision, mutationSize)
 		fs.captureFtruncateIdentity(ctx, mutationIno, mutationPath, revision)
 		if fs.gvisorCompatibilityEnabled() && revision > 0 {
@@ -15210,6 +15279,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		recordMutationBeforeFenceRelease()
 		unlockRemoteCommit()
 		remoteCommitReleased = true
+		failpoint.InjectCall("ftruncateStreamCommitBeforeRelock", fs, fh)
 		fh.Lock()
 		var perfUploadBytes uint64
 		if size > 0 {
@@ -15269,6 +15339,9 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 	// (non-sequential writes) — upload all parts in parallel at flush time.
 	if fh.Streamer != nil && size >= fs.inlineThreshold() {
 		phase = "upload-all"
+		if !fs.materializeFullForUploadLocked(fh) {
+			return gofuse.EIO
+		}
 		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		numParts := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
 		partSnapshots := make(map[int][]byte, numParts)
@@ -15295,6 +15368,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		recordMutationBeforeFenceRelease()
 		unlockRemoteCommit()
 		remoteCommitReleased = true
+		failpoint.InjectCall("ftruncateStreamCommitBeforeRelock", fs, fh)
 		fh.Lock()
 		var perfUploadBytes uint64
 		if size > 0 {
@@ -15582,6 +15656,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 			}
 		}
 	}
+	mutationCommittedRevision = committedRev
 	mutationUploadCommitted = err == nil
 	recordMutationBeforeFenceRelease()
 

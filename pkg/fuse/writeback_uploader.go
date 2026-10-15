@@ -556,7 +556,6 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 // Only trusted bounded payloads receive content identity. A data commit may
 // return proof with a later mode error; callers must retain that mode obligation.
 func (u *WriteBackUploader) uploadSyncWithAppendSnapshot(ctx context.Context, localPath string) (int64, pathCommitLandmark, error) {
-	proof := pathCommitLandmark{}
 	// Share exclusion with background uploads and owned staging migration.
 	release := u.acquirePath(localPath)
 	defer release()
@@ -576,7 +575,7 @@ func (u *WriteBackUploader) uploadSyncForRename(ctx context.Context, localPath s
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			_, err := u.uploadSyncWithRevisionLocked(ctx, localPath)
+			_, _, err := u.uploadSyncWithRevisionLocked(ctx, localPath)
 			return err
 		}
 		failpoint.InjectCall("renameUploadSyncBusy", u, localPath)
@@ -591,8 +590,8 @@ func (u *WriteBackUploader) uploadSyncForRename(ctx context.Context, localPath s
 }
 
 // uploadSyncWithRevisionLocked requires uploader ownership of localPath.
-func (u *WriteBackUploader) uploadSyncWithRevisionLocked(ctx context.Context, localPath string) (int64, error) {
-
+func (u *WriteBackUploader) uploadSyncWithRevisionLocked(ctx context.Context, localPath string) (int64, pathCommitLandmark, error) {
+	proof := pathCommitLandmark{}
 	// PendingChmod entries have no .dat file (data already uploaded, only
 	// chmod remains). Read meta first so we can handle chmod without loading
 	// data — GetMetaAndView would prune the entry when the .dat is missing.

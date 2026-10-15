@@ -99,6 +99,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
 	}
+	if fs.ftruncateParticipates(fh) {
+		defer fs.releaseHandleRemoteCommitPathLocked(fh)
+	}
 	if handled, err := fs.prepareFtruncateFlushLocked(ctx, fh); handled || err != nil {
 		return httpToFuseStatus(err)
 	}

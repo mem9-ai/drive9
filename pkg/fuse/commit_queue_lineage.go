@@ -13,7 +13,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
-// pathCommitLandmark is the last exact snapshot this queue itself landed for
+// pathCommitLandmark is the last exact snapshot this mount itself landed for
 // a path. It is never persisted: after restart there is no safe causal proof
 // between mutable shadow bytes and recovered metadata.
 type pathCommitLandmark struct {

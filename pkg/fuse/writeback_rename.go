@@ -16,6 +16,7 @@ import (
 // uploaders until its new ownership is published. No handle locks or Submit
 // calls are allowed in this window. Store methods below require held path locks.
 func (fs *Dat9FS) renameOwnedWriteBack(oldPath, newPath string) (moved bool, err error) {
+	failpoint.InjectCall("ownedWriteBackRenameBeforeAcquire", fs, oldPath, newPath)
 	first, second := oldPath, newPath
 	if second < first {
 		first, second = second, first
@@ -403,20 +404,27 @@ func (fs *Dat9FS) settleCommittedFileRenameFence(ctx context.Context, p string) 
 		if !fh.TryLock() {
 			return syscall.EAGAIN
 		}
-		if fs.ftruncateParticipates(fh) && fh.ftruncateFence && fh.RemoteCommitUnlock != nil {
+		if fs.ftruncateParticipates(fh) {
 			event := fh.pendingFtruncate.Load()
 			if event.ino != fh.Ino || event.path != fh.Path || event.view != fs.mountViewGeneration.Load() || !fs.ftruncateAliasLinked(fh) {
 				fh.Unlock()
 				return syscall.EAGAIN
 			}
 
+			temporaryFence := !fh.ftruncateFence || fh.RemoteCommitUnlock == nil
+			if temporaryFence {
+				if err := fs.fenceFtruncateLocked(fh); err != nil {
+					fh.Unlock()
+					return syscall.EAGAIN
+				}
+			}
 			adopted, err := fs.adoptLandedFtruncateImageLocked(ctx, fh, true)
+			if temporaryFence || adopted {
+				fs.releaseHandleRemoteCommitPathLocked(fh)
+			}
 			if err != nil {
 				fh.Unlock()
 				return err
-			}
-			if adopted {
-				fs.releaseHandleRemoteCommitPathLocked(fh)
 			}
 		}
 		fh.Unlock()
