@@ -171,6 +171,44 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			}
 			return fs.Result{Entries: out}, nil
 		}
+		// A remotely routed directory may still hold LOCAL children (a
+		// *.tmp file under a remote-routed parent): merge every overlay
+		// child that itself routes local into the lower listing (v1
+		// mergeLocalDirEntries merged eligible children regardless of the
+		// parent's route — skipping them hid readable files from
+		// readdir).
+		if res, err := next(ctx, op); err == nil {
+			seen := make(map[string]struct{}, len(res.Entries))
+			for _, e := range res.Entries {
+				seen[e.Name] = struct{}{}
+			}
+			merged := res.Entries
+			// The parent itself routes remote, but its LOCAL children ride
+			// the shared overlay: list the overlay's view of this directory
+			// and merge every child that itself routes local (v1's
+			// mergeLocalDirEntries ran regardless of the parent's route).
+			if o := f.overlay; o != nil {
+				if extras, err := o.ReadDir(op.Path); err == nil {
+					for _, e := range extras {
+						info, ierr := e.Info()
+						if ierr != nil {
+							continue
+						}
+						childPath := joinDir(op.Path, e.Name())
+						if _, dup := seen[e.Name()]; dup {
+							continue
+						}
+						if !f.classifiesLocal(ctx, inner, childPath, info.IsDir()) && f.transientFor(childPath, info.IsDir()) == nil {
+							continue
+						}
+						seen[e.Name()] = struct{}{}
+						merged = append(merged, fs.Entry{Name: e.Name(), Attr: attrOfLocalInfo(info)})
+					}
+				}
+			}
+			res.Entries = merged
+			return res, nil
+		}
 
 	case fs.OpCreate:
 		if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {

@@ -169,7 +169,16 @@ func (h *gitHandle) Write(ctx context.Context, off int64, data []byte) error {
 		return err
 	}
 	h.dirty = true
+	syncIntent := h.flags&uint32(syscall.O_SYNC) != 0 || h.flags&uint32(syscall.O_DSYNC) != 0 ||
+		h.g.syncPolicy == "write-sync" || h.g.syncPolicy == "strict"
 	h.mu.Unlock()
+	if syncIntent {
+		// The effective synchronous policy (mount write-sync or the
+		// descriptor's O_SYNC/O_DSYNC) acknowledges only after the overlay
+		// commit — the RAM-only return left the server's overlay without
+		// the entry until a later Flush (main committed before acking).
+		return h.commit(ctx)
+	}
 	return nil
 }
 

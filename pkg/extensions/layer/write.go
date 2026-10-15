@@ -10,6 +10,7 @@ import (
 	"io"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -177,8 +178,12 @@ func (h *layerHandle) Write(ctx context.Context, off int64, data []byte) error {
 	h.dirty = true
 	h.wgen++
 	policy := h.l.policy
+	syncIntent := h.flags&uint32(syscall.O_SYNC) != 0 || h.flags&uint32(syscall.O_DSYNC) != 0
 	h.mu.Unlock()
-	if policy == policyWriteSync {
+	if policy == policyWriteSync || syncIntent {
+		// A synchronous descriptor (or write-sync mount) acknowledges only
+		// after the layer commit lands — the deferred path returned with
+		// the entry absent from the layer log.
 		return h.commit(ctx)
 	}
 	return nil
@@ -368,7 +373,15 @@ func (h *layerHandle) ensureBufferLocked(ctx context.Context) error {
 				return nil, nil
 			}
 			part := make([]byte, end-start)
-			rc, err := l.cl.ReadStreamRange(ctx, remote, start, end-start)
+			// The opening request's context is canceled when Write
+			// returns, but parts materialize at flush/commit time long
+			// after — a fresh bounded context per load keeps an
+			// acknowledged edit committable (a captured request context
+			// failed every later LoadMissingParts with "context
+			// canceled").
+			loadCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			rc, err := l.cl.ReadStreamRange(loadCtx, remote, start, end-start)
 			if err != nil {
 				return nil, err
 			}

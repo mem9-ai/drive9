@@ -33,6 +33,15 @@ type Xattr struct {
 func New(opts Options) (*Xattr, error) {
 	x := &Xattr{store: NewXAttrStore()}
 	if opts.Events != nil {
+		// Rename bookkeeping is event-driven: outer extensions (localize,
+		// layer, Git, specials) complete renames without dispatching
+		// through this plane, so the store moves on the same successful-
+		// rename signal the rest of the mount consumes.
+		opts.Events.On(fs.EventWrite, func(e fs.Event) {
+			if e.RenamedTo != "" {
+				x.store.Rename(e.Path, e.RenamedTo)
+			}
+		})
 		opts.Events.On(fs.EventDelete, func(e fs.Event) { x.store.RemoveAll(e.Path) })
 	}
 	return x, nil
@@ -84,6 +93,10 @@ func (x *Xattr) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		if err != nil {
 			return res, err
 		}
+		// The rename may have been claimed by an outer extension
+		// (localize/layer/git/specials complete renames without next) —
+		// the event-driven migration below covers those paths; this
+		// in-line move only covers the xattr-plane's own dispatch.
 		x.store.Rename(op.Path, op.Path2)
 		return res, nil
 	case fs.OpUnlink, fs.OpRmdir:

@@ -710,7 +710,7 @@ func MountWithConfig(cfg MountConfig) error {
 	var gitExt *git.Git
 	if wantExt["git"] && cfg.EnableGitWorkspaces {
 		var gerr error
-		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot,
+		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot, SyncPolicy: string(cfg.WritePolicy),
 			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh})
 		if gerr != nil {
 			return fmt.Errorf("fuse: git extension: %w", gerr)

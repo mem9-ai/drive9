@@ -45,7 +45,11 @@ func (k EventKind) String() string {
 
 // Event is the typed notification delivered over the EventBus.
 type Event struct {
-	Kind  EventKind // event discriminator
+	Kind      EventKind // event discriminator
+	// RenamedTo carries the destination of a successful rename (the
+	// rename's EventWrite emission): lets plane-local stores follow the
+	// move without intercepting the dispatch.
+	RenamedTo string
 	Path  string    // canonical absolute path the event concerns
 	Rev   int64     // EventLanded: the revision the remote acknowledged
 	Size  int64     // EventLanded: the landed size

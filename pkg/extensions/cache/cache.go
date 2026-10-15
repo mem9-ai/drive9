@@ -321,14 +321,23 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			c.trackSidecarOpen(op.Path)
 			h.isSidecar = true
 		}
-		if c.opts.SequentialPrefetch && c.opts.PrefetchClient != nil && size > c.mem.MaxFileSize() {
-			// v1 armed the prefetcher only for handles whose size exceeds
-			// the whole-file cache admission limit: smaller files are served
-			// by the mem cache itself and need no block read-ahead.
-			p := NewPrefetcher(c.opts.PrefetchClient, op.Path, size)
-			p.SetParallelRead(c.opts.ParallelReadConcurrency, c.opts.ParallelReadBlockSize)
-			h.prefetch = p
-			h.prefetchArmed = true
+		// The prefetcher reads the ORDINARY remote namespace: it may only
+		// arm behind a plain terminal (core) claim. Localize/layer/Git
+		// planes own their files' bytes (a local-only overlay file mixed
+		// its first local block with prefetched remote blocks of a same-
+		// named object) — those handles read through their inner plane.
+		if plainInner, ok := res.Handle.(interface{ UnwrapHandle() fs.Handle }); !ok {
+			_ = plainInner
+			if c.opts.SequentialPrefetch && c.opts.PrefetchClient != nil && size > c.mem.MaxFileSize() {
+				// v1 armed the prefetcher only for handles whose size
+				// exceeds the whole-file cache admission limit: smaller
+				// files are served by the mem cache itself and need no
+				// block read-ahead.
+				p := NewPrefetcher(c.opts.PrefetchClient, op.Path, size)
+				p.SetParallelRead(c.opts.ParallelReadConcurrency, c.opts.ParallelReadBlockSize)
+				h.prefetch = p
+				h.prefetchArmed = true
+			}
 		}
 		res.Handle = h
 		return res, nil
@@ -464,7 +473,9 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	// v1 range disk tier for large files: the request's own (offset,
 	// size-clipped) range is fetched once and served from local disk on
 	// repeat — including across mounts (the key carries the revision).
-	if h.cache.dsk != nil && h.rev > 0 && !h.cache.dirs.hasLocalWriteState(h.path) && !h.cache.sqliteBypassStableCaches(h.path) {
+	if h.cache.dsk != nil && h.rev > 0 && !grown && !h.cache.dirs.hasLocalWriteState(h.path) && !h.cache.sqliteBypassStableCaches(h.path) {
+		// grown handles share the whole-file tiers' bypass: the disk
+		// range key and clip encode the stale open-time size/revision.
 		if n, ok := h.cache.readDiskCachedRange(ctx, h, off, dest); ok {
 			return n, nil
 		}

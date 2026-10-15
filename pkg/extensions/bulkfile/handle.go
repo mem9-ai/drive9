@@ -217,6 +217,18 @@ func (h *streamHandle) Flush(ctx context.Context) error {
 	return inner.Flush(ctx)
 }
 
+// surrenderToBelow retires a flushed claim whose file another writer
+// now owns through the lower plane: the claim stops answering lookups
+// and overlays (its image is published), so every later open reads the
+// shared lower state.
+func (h *streamHandle) surrenderToBelow() {
+	h.mu.Lock()
+	h.image = nil
+	h.dirty = false
+	h.mu.Unlock()
+	h.b.untrack(h)
+}
+
 // session returns the below handle, opening it at the current path when a
 // rename detached the previous one; an unlinked claim needs no session.
 func (h *streamHandle) session(ctx context.Context) (fs.Handle, error) {

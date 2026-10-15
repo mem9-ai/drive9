@@ -206,6 +206,9 @@ type Options struct {
 	// carry a real .git directory whose state is checkpointed to the
 	// server and restored on mount.
 	LocalRoot string
+	// SyncPolicy mirrors the mount's write policy: write-sync/strict
+	// commits Git workspace writes before acknowledging them (v1).
+	SyncPolicy string
 	// RemoteRoot is the mount's remote subtree root (":"-mount). Server
 	// paths under it are matched and re-rooted onto the mount-local
 	// vocabulary (v1 fs.localPath): a workspace registered server-side
@@ -240,6 +243,9 @@ type Git struct {
 	// localRoot is the mount's overlay root; non-empty arms the local
 	// .git checkpoint machinery (state.go).
 	localRoot string
+	// syncPolicy mirrors the mount's write policy: write-sync/strict
+	// commits workspace writes before acknowledging them (v1).
+	syncPolicy string
 	// remoteRoot is the mount's subtree root; server workspace paths are
 	// re-rooted through localPathOf.
 	remoteRoot  string
@@ -348,7 +354,7 @@ func New(opts Options) (*Git, error) {
 	if opts.Client == nil {
 		return nil, fmt.Errorf("git: client is required")
 	}
-	g := &Git{cl: opts.Client, bus: opts.Events, localRoot: opts.LocalRoot,
+	g := &Git{cl: opts.Client, bus: opts.Events, localRoot: opts.LocalRoot, syncPolicy: opts.SyncPolicy,
 		remoteRoot: strings.TrimSuffix(strings.TrimSpace(opts.RemoteRoot), "/"),
 		onRefresh:  opts.OnWorkspaceRefresh}
 	if g.localRoot != "" {

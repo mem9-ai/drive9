@@ -1309,6 +1309,16 @@ func (f *FS) entryTTLFor(name string) time.Duration {
 // the event — bumping their epoch would re-materialize inode state for a
 // path that no longer exists. (v1 equivalents: dirCache.Remove/Upsert,
 // cacheNegativePath, invalidateReadCacheAndTargets — all event-driven here.)
+// mutatedRename emits the successful-rename signal: a plain EventWrite on
+// the destination carrying RenamedTo, so plane-local stores (xattrs)
+// follow the move even when an outer extension claimed the dispatch —
+// the same bookkeeping v1 did in shared rename handling.
+func (f *FS) mutatedRename(oldPath, newPath string) {
+	f.epoch.NextEpoch(newPath)
+	f.epoch.NextEpoch(oldPath)
+	f.events.Emit(fs.Event{Kind: fs.EventWrite, Path: oldPath, RenamedTo: newPath})
+}
+
 func (f *FS) mutated(kind fs.EventKind, paths ...string) {
 	for _, p := range paths {
 		if p == "" {
@@ -1845,7 +1855,7 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	f.touchParentMtime(input.NodeId)
 	f.touchParentMtimeByName(newPath)
 	f.mutated(fs.EventDelete, oldPath)
-	f.mutated(fs.EventWrite, newPath)
+	f.mutatedRename(oldPath, newPath)
 	// v1 notifyRenameTarget: invalidate ONLY the rename TARGET — the kernel
 	// moves the old name's dentry natively, and dropping it from userspace
 	// disturbs the bookkeeping for the next create of the same name in

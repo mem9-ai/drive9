@@ -133,6 +133,13 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 					return fs.Result{Attr: &attr, Handle: &claimReadHandle{claim: hit}}, nil
 				}
 				_ = hit.Flush(ctx)
+				// A second writer now owns the file through the plane
+				// below: retire the flushed claim entirely — leaving it
+				// tracked kept its stale image answering lookups and
+				// read-only re-opens over the second writer's landed
+				// state (a new reader saw the old `hello` while the
+				// backend already held `Yello`).
+				hit.surrenderToBelow()
 			}
 		}
 	}

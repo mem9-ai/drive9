@@ -199,6 +199,11 @@ type stripedLocks struct {
 type bufferingHandle struct {
 	w    *Writeback
 	path string
+	// baseLoaded marks a buffer that published a real base (or the lazy
+	// seed): a provisional buffer whose preload failed is discarded so a
+	// retried write re-initializes instead of committing a replacement
+	// with only the retry's bytes.
+	baseLoaded bool
 	// appendSnapshot marks a handle participating in append composition
 	// (v1 fh.appendSnapshot): its buffer adopted a sibling's records, so
 	// later writes and staging boundaries must keep composing onto the
@@ -2140,8 +2145,12 @@ func (w *Writeback) pendingListAttr(p string) (size int64, mode uint32, hasMode,
 // still owns that the listing did not carry, in deterministic order.
 func (w *Writeback) pendingNamesUnder(dir string, seen map[string]struct{}) []string {
 	var names []string
+	// The facade dispatches directory paths WITHOUT a trailing slash
+	// (`/d`), while ParentPath answers WITH one (`/d/`) — normalize both
+	// sides or every pending child of a non-root directory is dropped.
+	dirNorm := strings.TrimSuffix(dir, "/") + "/"
 	add := func(p string) {
-		if pathutil.ParentPath(p) != dir {
+		if parent := pathutil.ParentPath(p); parent != dir && parent != dirNorm {
 			return
 		}
 		name := pathutil.BaseName(p)
@@ -2877,6 +2886,16 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		return nil
 	}
 	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	// A failed base preload must not leave this provisional buffer
+	// behind: the next Write on the same descriptor would skip
+	// initialization entirely and commit a replacement containing only
+	// the retry's bytes (review) — the buffer publishes only after it
+	// holds the real base.
+	defer func() {
+		if h.buf != nil && !h.isNew && h.buf.Size() == 0 && !h.buf.HasDirtyParts() && !h.baseLoaded {
+			h.buf = nil
+		}
+	}()
 	if h.unlinked && h.w.opts.Staging != nil && h.w.unlinkedShadowServed(h.path) {
 		// v1 survivor: an anonymous fd's base is its unlink snapshot, not
 		// the deleted remote — post-unlink writes keep building on the
@@ -2887,6 +2906,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 				return err
 			}
 			h.buf.ClearDirty()
+			h.baseLoaded = true
 			return nil
 		}
 	}
@@ -2900,6 +2920,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 				return err
 			}
 			h.buf.ClearDirty()
+			h.baseLoaded = true
 			return nil
 		}
 	}
@@ -2907,6 +2928,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		// O_TRUNC: empty base, marked dirty so a write-less close still
 		// commits the truncation (ZeroBase + commit at boundary).
 		h.dirty = true
+		h.baseLoaded = true
 		return nil
 	}
 	if (h.isNew || h.inner == nil) && h.w.opts.Staging != nil {
@@ -2918,12 +2940,16 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 			if data, err := h.w.opts.Staging.Shadow.ReadAll(h.path); err == nil && int64(len(data)) == meta.Size {
 				if _, werr := h.buf.Write(0, data); werr == nil {
 					h.buf.ClearDirty()
+					h.baseLoaded = true
 					return nil
 				}
 			}
 		}
 	}
 	if h.isNew || h.inner == nil || h.baseSize <= 0 {
+		// Nothing to preload (fresh claim or empty base): the empty buffer
+		// is the initialized base, not a failed one.
+		h.baseLoaded = true
 		return nil
 	}
 	if h.baseSize <= h.w.preload {
@@ -2937,6 +2963,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 					return err
 				}
 				h.buf.ClearDirty()
+				h.baseLoaded = true
 				return nil
 			}
 		}
@@ -2949,6 +2976,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 			return err
 		}
 		h.buf.ClearDirty()
+		h.baseLoaded = true
 		return nil
 	}
 	// Large bases stay lazy (preloadWritableHandle): parts load from the
@@ -2975,6 +3003,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 	// Seed the base extent: Size() answers the base size (reads and
 	// O_APPEND tails see the full file) while parts stay unloaded.
 	h.buf.SeedRemote(remoteSize)
+	h.baseLoaded = true
 	return nil
 }
 
