@@ -129,7 +129,7 @@ func (e *OpenAIAudioTextExtractor) ExtractAudioText(ctx context.Context, req Aud
 		Text     string  `json:"text"`
 		Duration float64 `json:"duration"` // whisper-1 verbose_json
 		Usage    *struct {
-			InputTokens  int `json:"input_tokens"`  // gpt-4o-transcribe
+			InputTokens  int `json:"input_tokens"` // gpt-4o-transcribe
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
 		Error *struct {

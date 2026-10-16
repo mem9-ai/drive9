@@ -26,8 +26,8 @@ MIGRATION_BIN ?= $(BIN_DIR)/$(MIGRATION_NAME)
 KUBE_PLUGIN_BIN ?= $(BIN_DIR)/$(KUBE_PLUGIN_NAME)
 
 VERSION ?=
-GIT_HASH ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
-GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+GIT_HASH ?= $(shell git rev-parse --verify HEAD 2>/dev/null || echo unknown)
+GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref --verify HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64

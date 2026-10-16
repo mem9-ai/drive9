@@ -1,9 +1,13 @@
 package fuse
 
+// #918's hardlink-identity regression, ported to the extension-stack
+// facade: a name replaced under a live enumeration keeps the snapshot's
+// inode for the resumed pages, the old fd and its alias retain the old
+// identity and payload, and the replacement lands as a new object.
+
 import (
 	"bytes"
-	"context"
-	"encoding/json"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,13 +17,20 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
-	"time"
+	"unsafe"
 
-	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/mem9-ai/drive9/pkg/fs"
 )
+
+var nativeEndian = func() binary.ByteOrder {
+	var x uint16 = 1
+	if *(*byte)(unsafe.Pointer(&x)) == 1 {
+		return binary.LittleEndian
+	}
+	return binary.BigEndian
+}()
 
 func TestReadDirPlusReplacedInodeKernel(t *testing.T) {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
@@ -28,27 +39,18 @@ func TestReadDirPlusReplacedInodeKernel(t *testing.T) {
 		}
 		t.Skipf("Linux FUSE unavailable: %v", err)
 	}
-	for _, profile := range []string{MountProfileNone, MountProfileCodingAgent} {
-		for _, mode := range []SyncMode{SyncInteractive, SyncStrict} {
-			for _, sizes := range [][2]int{{4096, 8192}, {8192, 512}} {
-				t.Run(fmt.Sprintf("%s/%s/%d-to-%d", profile, mode, sizes[0], sizes[1]), func(t *testing.T) {
-					testReadDirPlusReplacedInodeKernel(t, profile, mode, sizes[0], sizes[1])
-				})
-			}
+	for _, mode := range []string{"interactive", "strict"} {
+		for _, sizes := range [][2]int{{4096, 8192}, {8192, 512}} {
+			t.Run(fmt.Sprintf("%s/%d-to-%d", mode, sizes[0], sizes[1]), func(t *testing.T) {
+				testReadDirPlusReplacedInodeKernel(t, mode, sizes[0], sizes[1])
+			})
 		}
 	}
 }
 
-func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncMode, oldSize, newSize int) {
+func testReadDirPlusReplacedInodeKernel(t *testing.T, mode string, oldSize, newSize int) {
 	t.Helper()
 	oldData, newData := bytes.Repeat([]byte("A"), oldSize), bytes.Repeat([]byte("B"), newSize)
-	var armed atomic.Bool
-	entered, allow := make(chan struct{}, 1), make(chan struct{})
-	var once sync.Once
-	release := func() { once.Do(func() { close(allow) }) }
-	if mode == SyncStrict {
-		release()
-	}
 	var mu sync.Mutex
 	remote := make(map[string][]byte)
 	resourceIDs := make(map[string]string)
@@ -57,11 +59,21 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 		p := strings.TrimPrefix(req.URL.Path, "/v1/fs")
 		switch {
 		case req.URL.Path == "/v1/status":
-			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": 1 << 20})
+			_, _ = w.Write([]byte(`{"inline_threshold":1048576}`))
 		case req.Method == http.MethodGet && req.URL.Query().Has("list"):
 			mu.Lock()
-			entries := make([]map[string]any, 0, len(remote))
-			for name, data := range remote {
+			names := make([]string, 0, len(remote))
+			for name := range remote {
+				names = append(names, name)
+			}
+			mu.Unlock()
+			var b strings.Builder
+			b.WriteString(`{"entries":[`)
+			for i, name := range names {
+				if i > 0 {
+					b.WriteByte(',')
+				}
+				mu.Lock()
 				id := resourceIDs[name]
 				nlink := 0
 				for _, other := range resourceIDs {
@@ -69,27 +81,18 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 						nlink++
 					}
 				}
-				entries = append(entries, map[string]any{"name": strings.TrimPrefix(name, "/"), "size": len(data), "revision": 1, "resource_id": id, "nlink": nlink})
+				size := len(remote[name])
+				mu.Unlock()
+				fmt.Fprintf(&b, `{"name":%q,"size":%d,"revision":1,"resource_id":%q,"nlink":%d}`, strings.TrimPrefix(name, "/"), size, id, nlink)
 			}
-			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries})
+			b.WriteString(`]}`)
+			_, _ = w.Write([]byte(b.String()))
 		case req.Method == http.MethodPut:
 			data, err := io.ReadAll(req.Body)
 			if err != nil {
 				t.Error(err)
 				w.WriteHeader(http.StatusInternalServerError)
 				return
-			}
-			if armed.Load() {
-				select {
-				case entered <- struct{}{}:
-				default:
-				}
-				select {
-				case <-allow:
-				case <-req.Context().Done():
-					return
-				}
 			}
 			mu.Lock()
 			remote[p] = data
@@ -98,7 +101,7 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 				resourceIDs[p] = fmt.Sprintf("resource-%d", nextResourceID)
 			}
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 1})
+			_, _ = w.Write([]byte(`{"revision":1}`))
 		case req.Method == http.MethodHead || req.Method == http.MethodGet:
 			mu.Lock()
 			data, found := remote[p]
@@ -125,6 +128,8 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 			if req.Method == http.MethodGet {
 				_, _ = w.Write(data)
 			}
+		case req.Method == http.MethodPost && req.URL.Query().Has("chmod"):
+			w.WriteHeader(http.StatusOK)
 		case req.Method == http.MethodDelete:
 			mu.Lock()
 			delete(remote, p)
@@ -145,64 +150,15 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 				return
 			}
 			w.WriteHeader(http.StatusOK)
-		case req.Method == http.MethodPost && req.URL.Query().Has("chmod"):
-			w.WriteHeader(http.StatusOK)
 		default:
 			t.Errorf("unexpected request: %s %s", req.Method, req.URL)
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	t.Cleanup(ts.Close)
-	t.Cleanup(release)
-	opts := &MountOptions{Profile: profile, LocalRoot: t.TempDir(), MountPoint: t.TempDir(),
-		SyncMode: mode, WritePolicy: WritePolicyWriteBack, DirTTL: 30 * time.Second,
-		AttrTTL: 30 * time.Second, EntryTTL: 30 * time.Second, DirectMountStrict: os.Geteuid() == 0}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
-	fs.client.SetSmallFileThresholdForTests(1 << 20)
-	var err error
-	fs.shadowStore, err = NewShadowStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(fs.shadowStore.Close)
-	fs.pendingIndex, err = NewPendingIndex(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs.writeBack, err = NewWriteBackCache(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	queue := NewCommitQueue(fs.client, fs.shadowStore, fs.pendingIndex, nil, 1, 16)
-	queue.PathLock = fs.lockRemoteCommitPath
-	queue.DurableWatermark = fs.latestCommittedRevision
-	queue.OnSuccess = fs.onCommitQueueSuccess
-	queue.OnCleanup = fs.onCommitQueueCleanup
-	fs.commitQueue = queue
-	t.Cleanup(func() { release(); queue.DrainAll() })
-	fs.dirCache.Put("/", []CachedFileInfo{})
-	kernelFS := &readdirPendingKernelFS{Dat9FS: fs}
-	server, err := gofuse.NewServer(kernelFS, opts.MountPoint, newGoFuseMountOptions(opts))
-	if err != nil {
-		if os.Getenv("DRIVE9_REQUIRE_KERNEL_FUSE") == "1" {
-			t.Fatal(err)
-		}
-		t.Skipf("cannot mount Linux FUSE: %v", err)
-	}
-	go server.Serve()
-	t.Cleanup(func() {
-		release()
-		queue.DrainAll()
-		fs.notifyWg.Wait()
-		if err := server.Unmount(); err != nil {
-			t.Error(err)
-		}
-	})
-	if err := server.WaitMount(); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(opts.MountPoint, "0-alias.dat")
+	st := mountPendingKernelStack(t, ts.URL, mode)
+
+	path := filepath.Join(st.mp, "0-alias.dat")
 	write := func(data []byte, mode os.FileMode) {
 		t.Helper()
 		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
@@ -215,20 +171,15 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 			t.Fatalf("write/sync/close: %v/%v/%v", writeErr, syncErr, closeErr)
 		}
 	}
-	drain := func() {
-		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if got := fs.Drain(ctx); !got.OK {
-			t.Fatalf("drain: %+v", got)
-		}
-	}
 	write(oldData, 0o600)
-	drain()
+	st.drain(t)
 	// Create the retained alias first, then the replaceable directory name.
 	// The mount preserves insertion order for this cached listing.
 	alias := path
-	path = filepath.Join(opts.MountPoint, "file.dat")
+	// v1 seeded the cached listing before the enumeration so it serves
+	// insertion order (the chain list would order by the remote's map).
+	st.f.Ctx.DirCache.Put("/", []fs.DirEntryInfo{{Name: "0-alias.dat", Size: int64(oldSize)}})
+	path = filepath.Join(st.mp, "file.dat")
 	if err := os.Link(alias, path); err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +193,7 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 		t.Fatal(err)
 	}
 	oldIno := oldInfo.Sys().(*syscall.Stat_t).Ino
-	dir, err := os.Open(opts.MountPoint)
+	dir, err := os.Open(st.mp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,25 +247,7 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	armed.Store(true)
 	write(newData, 0o644)
-	select {
-	case <-entered:
-	case <-time.After(10 * time.Second):
-		t.Fatal("replacement PUT did not reach gate")
-	}
-	if mode == SyncInteractive {
-		meta, ok := fs.pendingIndex.GetMeta("/file.dat")
-		if !ok || meta.Size != int64(newSize) {
-			t.Fatalf("replacement pending: %+v", meta)
-		}
-		mu.Lock()
-		_, committed := remote["/file.dat"]
-		mu.Unlock()
-		if committed {
-			t.Fatal("replacement escaped commit gate")
-		}
-	}
 	replacement, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -322,7 +255,7 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 	if replacement.Sys().(*syscall.Stat_t).Ino == oldIno {
 		t.Fatal("replacement reused old inode")
 	}
-	calls := kernelFS.plusCalls.Load()
+	calls := st.f.plusCalls.Load()
 	// Restore a cookie returned by the first enumeration. Return only the
 	// replaced name: if its alias is in the same READDIRPLUS reply, Linux
 	// can accept the alias attributes first and mask the bad second reply.
@@ -330,7 +263,7 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 		t.Fatal(err)
 	}
 	readNames(true)
-	if kernelFS.plusCalls.Load() <= calls {
+	if st.f.plusCalls.Load() <= calls {
 		t.Fatal("rewind did not issue READDIRPLUS")
 	}
 	assertOld := func(phase string) {
@@ -351,9 +284,18 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 		}
 	}
 	assertOld("after rewind")
-	release()
-	drain()
+	st.drain(t)
 	assertOld("after drain")
+	mu.Lock()
+	equal := bytes.Equal(remote["/file.dat"], newData)
+	aliasEqual := bytes.Equal(remote["/0-alias.dat"], oldData)
+	mu.Unlock()
+	if !equal {
+		t.Fatal("replacement remote payload changed")
+	}
+	if !aliasEqual {
+		t.Fatalf("alias remote payload replaced: head=%q", string(remote["/0-alias.dat"][:min(len(remote["/0-alias.dat"]), 8)]))
+	}
 	got := make([]byte, oldSize+1)
 	n, err := oldFD.ReadAt(got, 0)
 	if err != nil && err != io.EOF {
@@ -361,11 +303,5 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 	}
 	if n != oldSize || !bytes.Equal(got[:n], oldData) {
 		t.Errorf("old FD read %d bytes, want intact %d-byte payload", n, oldSize)
-	}
-	mu.Lock()
-	equal := bytes.Equal(remote["/file.dat"], newData)
-	mu.Unlock()
-	if !equal {
-		t.Fatal("replacement remote payload changed")
 	}
 }

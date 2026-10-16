@@ -1,11 +1,21 @@
 package fuse
 
+// Ports of v1 pkg/fuse/inode_test.go for the chain facade's InodeToPath
+// table: extent-ino bindings survive Forget and never shrink on reseeds,
+// hardlink aliases share one FUSE inode, rename consumes the replaced
+// target's link, and fillAttr serves the entry's mode/nlink rows. The v1
+// fillAttr rows moved to the new (fs.Attr, ino) signature; the zero-mode
+// default (0644 file / 0755 dir) now lives in entryToAttr and is pinned
+// here alongside.
+
 import (
 	"syscall"
 	"testing"
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
 func TestEnsureInodeDoesNotShrinkExtentSize(t *testing.T) {
@@ -198,25 +208,28 @@ func TestInodeSetIdentityLetsLaterLookupJoinExistingInode(t *testing.T) {
 	}
 }
 
+// newAttrTestFS builds the bare facade fillAttr needs (uid/gid + inode
+// table); the chain is irrelevant for these rows.
+func newAttrTestFS() *FS {
+	return &FS{uid: 1000, gid: 1000, inodes: NewInodeToPath()}
+}
+
 func TestFillAttrFileMode(t *testing.T) {
-	fs := &Dat9FS{uid: 1000, gid: 1000}
+	f := newAttrTestFS()
 
 	tests := []struct {
 		name     string
 		mode     uint32
 		wantMode uint32
-		hasMode  bool
 	}{
-		{"default zero", 0, syscall.S_IFREG | 0o644, false},
-		{"explicit 755", 0o755, syscall.S_IFREG | 0o755, true},
-		{"explicit 600", 0o600, syscall.S_IFREG | 0o600, true},
+		{"explicit 755", 0o755, syscall.S_IFREG | 0o755},
+		{"explicit 600", 0o600, syscall.S_IFREG | 0o600},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			entry := &InodeEntry{Ino: 2, Path: "/a.txt", IsDir: false, Size: 42, Mode: tt.mode, HasMode: tt.hasMode}
 			var out gofuse.Attr
-			fs.fillAttr(entry, &out)
+			f.fillAttr(fs.Attr{Kind: fs.KindFile, Mode: tt.mode, Size: 42}, 0, &out)
 			if out.Mode != tt.wantMode {
 				t.Errorf("mode=%o, want %o", out.Mode, tt.wantMode)
 			}
@@ -224,48 +237,85 @@ func TestFillAttrFileMode(t *testing.T) {
 	}
 }
 
-func TestFillAttrFileNlink(t *testing.T) {
-	fs := &Dat9FS{uid: 1000, gid: 1000}
-	entry := &InodeEntry{Ino: 2, Path: "/a.txt", IsDir: false, Size: 42, Nlink: 3}
+func TestFillAttrDirMode(t *testing.T) {
+	f := newAttrTestFS()
+
+	tests := []struct {
+		name     string
+		mode     uint32
+		wantMode uint32
+	}{
+		{"explicit 700", 0o700, syscall.S_IFDIR | 0o700},
+		{"explicit 777", 0o777, syscall.S_IFDIR | 0o777},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out gofuse.Attr
+			f.fillAttr(fs.Attr{Kind: fs.KindDir, Mode: tt.mode}, 0, &out)
+			if out.Mode != tt.wantMode {
+				t.Errorf("mode=%o, want %o", out.Mode, tt.wantMode)
+			}
+		})
+	}
+}
+
+// v1's "default zero" mode rows: entries without authoritative mode bits
+// fall back to 0644 (file) / 0755 (dir) in entryToAttr, and fillAttr serves
+// that projection.
+func TestEntryToAttrDefaultModes(t *testing.T) {
+	f := newAttrTestFS()
+	fileIno := f.inodes.Lookup("/a.txt", false, 42, time.Now())
+	dirIno := f.inodes.Lookup("/dir", true, 0, time.Now())
+
 	var out gofuse.Attr
-	fs.fillAttr(entry, &out)
+	entry, ok := f.inodes.GetEntry(fileIno)
+	if !ok {
+		t.Fatal("missing file entry")
+	}
+	f.fillAttr(entryToAttr(entry), fileIno, &out)
+	if out.Mode != syscall.S_IFREG|0o644 {
+		t.Errorf("default file mode = %o, want %o", out.Mode, syscall.S_IFREG|0o644)
+	}
+	entry, ok = f.inodes.GetEntry(dirIno)
+	if !ok {
+		t.Fatal("missing dir entry")
+	}
+	f.fillAttr(entryToAttr(entry), dirIno, &out)
+	if out.Mode != syscall.S_IFDIR|0o755 {
+		t.Errorf("default dir mode = %o, want %o", out.Mode, syscall.S_IFDIR|0o755)
+	}
+}
+
+func TestFillAttrFileNlink(t *testing.T) {
+	f := newAttrTestFS()
+	var out gofuse.Attr
+	f.fillAttr(fs.Attr{Kind: fs.KindFile, Size: 42, Nlink: 3}, 0, &out)
 	if out.Nlink != 3 {
 		t.Fatalf("nlink = %d, want 3", out.Nlink)
 	}
 }
 
 func TestFillAttrDirNlink(t *testing.T) {
-	fs := &Dat9FS{uid: 1000, gid: 1000}
-	entry := &InodeEntry{Ino: 2, Path: "/dir", IsDir: true, Nlink: 4}
+	f := newAttrTestFS()
 	var out gofuse.Attr
-	fs.fillAttr(entry, &out)
+	f.fillAttr(fs.Attr{Kind: fs.KindDir, Nlink: 4}, 0, &out)
 	if out.Nlink != 4 {
 		t.Fatalf("dir nlink = %d, want 4", out.Nlink)
 	}
 }
 
-func TestFillAttrDirMode(t *testing.T) {
-	fs := &Dat9FS{uid: 1000, gid: 1000}
-
-	tests := []struct {
-		name     string
-		mode     uint32
-		wantMode uint32
-		hasMode  bool
-	}{
-		{"default zero", 0, syscall.S_IFDIR | 0o755, false},
-		{"explicit 700", 0o700, syscall.S_IFDIR | 0o700, true},
-		{"explicit 777", 0o777, syscall.S_IFDIR | 0o777, true},
+// v1 TestFindByExtentInoReusesFuseInode: the extent-ino reverse index
+// resolves back to the FUSE inode (hardlink aliasing across paths).
+func TestPortFindByExtentInoReusesFuseInode(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/a.txt", false, 1, time.Now())
+	m.SetExtentIno(ino, 77)
+	got, ok := m.FindByExtentIno(77)
+	if !ok || got != ino {
+		t.Fatalf("FindByExtentIno = %d/%v, want %d", got, ok, ino)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			entry := &InodeEntry{Ino: 2, Path: "/dir", IsDir: true, Size: 0, Mode: tt.mode, HasMode: tt.hasMode}
-			var out gofuse.Attr
-			fs.fillAttr(entry, &out)
-			if out.Mode != tt.wantMode {
-				t.Errorf("mode=%o, want %o", out.Mode, tt.wantMode)
-			}
-		})
+	if _, ok := m.FindByExtentIno(78); ok {
+		t.Fatal("missing juicefs ino must not match")
 	}
 }
