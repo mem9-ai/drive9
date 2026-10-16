@@ -40,6 +40,9 @@ type layerHandle struct {
 	// older snapshot uploads: only the generation that landed may clear
 	// the dirty state.
 	wgen uint64
+	// released marks a descriptor whose Release already published: the
+	// registry must never re-select it as the path's surviving claim.
+	released bool
 	// conflicted marks a handle whose path changed underneath it in an
 	// external layer refresh while it held uncommitted writes (v1 replay
 	// conflict): writes and commits answer EAGAIN — the buffer is kept, and
@@ -233,10 +236,16 @@ func (h *layerHandle) Truncate(size int64) error {
 	return nil
 }
 
-// SetMode records a chmod into the next commit.
+// SetMode records a chmod into the next commit. A metadata-only change on
+// an otherwise clean handle still owes a commit: without marking dirty, a
+// synced chmod reported success while a fresh replay kept the old mode.
 func (h *layerHandle) SetMode(mode uint32) {
 	h.mu.Lock()
 	h.mode = mode & 0o777
+	if !h.dirty {
+		h.wgen++
+		h.dirty = true
+	}
 	h.mu.Unlock()
 }
 

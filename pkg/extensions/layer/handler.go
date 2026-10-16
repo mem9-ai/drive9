@@ -386,9 +386,16 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 				var lazyBase baseRangeReader
 				if kept > 0 {
 					if kept <= l.inlineMax() {
-						if data, rerr := l.fetchBaseRange(ctx, op.Path, 0, kept); rerr == nil {
-							content = data
+						data, rerr := l.fetchBaseRange(ctx, op.Path, 0, kept)
+						if rerr != nil {
+							// The retained prefix IS the new entry's content:
+							// a failed read must abort the truncation —
+							// publishing the nil content would persist zero-
+							// filled bytes over the real prefix (main's
+							// applyRemoteTruncate rejected the failure).
+							return fs.Result{}, rerr
 						}
+						content = data
 					} else {
 						// Above the inline limit the retained prefix
 						// streams from the base object — a nil content

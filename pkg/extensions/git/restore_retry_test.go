@@ -148,3 +148,46 @@ func TestPortGitEmptyCreatePersists(t *testing.T) {
 		t.Fatalf("empty create did not survive its durability boundary: %v", err)
 	}
 }
+
+// qiffang M5: a SETATTR against an overlay-only closed file completes in
+// the overlay and returns its attrs — the follow-up dispatch to the
+// ordinary filesystem returned ENOENT for an already-successful
+// mutation. M4-adjacent: a workspace-file chmod replays.
+func TestPortGitOverlaySetAttrCompletesInOverlay(t *testing.T) {
+	gitBin(t)
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspace("ws-1", "/repo")
+	localRoot := t.TempDir()
+	g, cl, _ := newGitExt(t, b, localRoot)
+	g.armed = true
+	ctx := context.Background()
+	g.ensure(ctx)
+	terminal, _ := core.New(cl, core.Options{})
+	ch, _ := fs.NewChain(g, terminal)
+
+	res, err := ch.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/repo/f", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Write(ctx, 0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Truncate through the overlay (closed file): must succeed and reply
+	// the overlay's attrs, not ENOENT.
+	set, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/repo/f", Size: 2, HasSize: true})
+	if err != nil {
+		t.Fatalf("overlay truncate: %v", err)
+	}
+	if set.Attr == nil || set.Attr.Size != 2 {
+		t.Fatalf("overlay truncate reply = %+v, want size 2", set.Attr)
+	}
+	rd, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/f", Offset: 0, Limit: 5})
+	if err != nil || string(rd.Data) != "he" {
+		t.Fatalf("overlay read after truncate = %q err=%v, want he", string(rd.Data), err)
+	}
+}

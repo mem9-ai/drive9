@@ -5,6 +5,7 @@ package git
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -326,6 +327,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 			attr := h.Attr()
 			return fs.Result{Attr: &attr}, nil
 		}
+		handled := false
 		if op.HasMode {
 			if e, hit := w.lookup(rel); hit && e.Op == "upsert" {
 				e.Mode = fmt.Sprintf("%o", 0o100000|op.Mode&0o777)
@@ -333,6 +335,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 					return fs.Result{}, err
 				}
 				g.emit(op.Path)
+				handled = true
 			}
 		}
 		if op.Size >= 0 {
@@ -344,7 +347,22 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 					return fs.Result{}, err
 				}
 				g.emit(op.Path)
+				handled = true
 			}
+		}
+		if handled {
+			// The mutation completed against the overlay and the file lives
+			// ONLY there: forwarding to next replays it against the ordinary
+			// filesystem, whose ENOENT then failed an operation that had
+			// already succeeded.
+			if e, hit := w.lookup(rel); hit && e.Kind == "file" {
+				mode := uint32(0o644)
+				if m, err := strconv.ParseUint(strings.TrimPrefix(e.Mode, "100000"), 8, 32); err == nil {
+					mode = uint32(m)
+				}
+				return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: int64(len(e.Content))}}, nil
+			}
+			return fs.Result{}, nil
 		}
 	}
 	return next(ctx, op)

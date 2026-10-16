@@ -110,11 +110,16 @@ func (l *Layer) liveStore(path string, h *layerHandle) {
 func (l *Layer) untrackHandle(h *layerHandle) {
 	h.mu.Lock()
 	path := h.path
+	h.released = true
 	h.mu.Unlock()
+	// The handle leaves the index entirely: a retired descriptor must not
+	// be re-selected as the path's surviving claim (its Release already
+	// published; dirtying it again stranded the change with no committer).
+	l.handles.Delete(h)
 	if cur, ok := l.live.Load(path); ok && cur == h {
 		l.live.Delete(path)
 		l.handles.Range(func(key, _ any) bool {
-			if other, ok := key.(*layerHandle); ok && other != h && !other.unlinked {
+			if other, ok := key.(*layerHandle); ok && other != h && !other.unlinked && !other.released {
 				other.mu.Lock()
 				same := other.path == path
 				other.mu.Unlock()

@@ -211,6 +211,9 @@ func (h *gitHandle) Truncate(size int64) error {
 func (h *gitHandle) SetMode(mode uint32) {
 	h.mu.Lock()
 	h.mode = mode & 0o777
+	if !h.dirty {
+		h.dirty = true
+	}
 	h.mu.Unlock()
 }
 

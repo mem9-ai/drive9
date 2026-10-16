@@ -72,8 +72,8 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 		return a, nil
 	}
 	if op.Size >= 0 && op.Size != int64(len(h.image)) {
-		h.mu.Lock()
 		size := op.Size
+		h.mu.Lock()
 		if size < int64(len(h.image)) {
 			h.image = h.image[:size]
 			h.dirty = true
@@ -84,11 +84,9 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 			// plane below (its SetAttr holds the size without the bytes).
 			h.mu.Unlock()
 			if err := h.push(ctx); err != nil {
-				h.mu.Lock()
 				return fs.Attr{}, err
 			}
 			if err := h.below.SetAttr(ctx, h.path, fs.AttrPatch{Size: &size}); err != nil {
-				h.mu.Lock()
 				return fs.Attr{}, err
 			}
 			h.mu.Lock()
@@ -104,7 +102,6 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 			h.b.untrack(h)
 			return attr, nil
 		} else {
-			h.mu.Lock()
 			grown := make([]byte, size)
 			copy(grown, h.image)
 			h.image = grown

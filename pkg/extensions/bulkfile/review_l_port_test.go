@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
+	"time"
 	"syscall"
 	"testing"
 
@@ -142,5 +143,34 @@ func TestPortSurrenderAbortsOnFlushFailure(t *testing.T) {
 	n, _ := b.Node("/f")
 	if string(n.Data) != "new" {
 		t.Fatalf("final image = %q, want new (the acknowledged bytes were lost)", string(n.Data))
+	}
+}
+
+// qiffang M1: a buffered claim's small growth truncation no longer
+// deadlocks (the recursive lock is gone) — create, write one byte, then
+// set size 2 completes.
+func TestPortBulkSmallGrowTruncateCompletes(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	_, ch, _ := lStack(t, ts)
+	ctx := context.Background()
+
+	h := openRW(t, ch, "/f")
+	if err := h.Write(ctx, 0, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/f", Size: 2, HasSize: true, Handle: h})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("small-grow truncate: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("small-grow truncate deadlocked")
 	}
 }
