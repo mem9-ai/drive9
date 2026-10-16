@@ -13,9 +13,18 @@ import (
 // holds fh.mu; resetMountView never waits for that mutex or performs this IO.
 func (fs *Dat9FS) recoverFtruncateViewLocked(ctx context.Context, fh *FileHandle) error {
 	event := fh.pendingFtruncate.Load()
-	view := fs.mountViewGeneration.Load()
-	if event == nil || event.view == view {
+	if event == nil || event.view == fs.mountViewGeneration.Load() {
 		return nil
+	}
+	return fs.retireCommittedFtruncateLocked(ctx, fh, event)
+}
+
+// A settled observation can also retire in its original view after another
+// client advances the same resource. The caller must release alias fences first.
+func (fs *Dat9FS) retireCommittedFtruncateLocked(ctx context.Context, fh *FileHandle, event *ftruncateInheritance) error {
+	view := fs.mountViewGeneration.Load()
+	if event == nil || fh.pendingFtruncate.Load() != event {
+		return syscall.EAGAIN
 	}
 	if !fs.ftruncateAliasLinked(fh) || !fs.handleCanAdoptCommittedRevisionLocked(fh) || (fh.Streamer != nil && fh.Streamer.Started()) {
 		return syscall.EAGAIN

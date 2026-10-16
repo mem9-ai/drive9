@@ -24,11 +24,10 @@ type aliasStageProof struct {
 	shadowGen uint64
 }
 
+var errFtruncateRemoteAdvanced = errors.New("truncate observer remote revision advanced")
+
 func (fs *Dat9FS) readFtruncateAliasLocked(ctx context.Context, fh *FileHandle, offset int64, size uint32) ([]byte, bool, error) {
 	data, handled, err := fs.readFtruncateAliasOnceLocked(ctx, fh, offset, size)
-	if !errors.Is(err, errFtruncateBusy) {
-		return data, handled, err
-	}
 	event := fh.pendingFtruncate.Load()
 	deadline := time.Now().Add(samePathDirtyWaitTimeout)
 	for errors.Is(err, errFtruncateBusy) && time.Now().Before(deadline) && ctx.Err() == nil {
@@ -39,6 +38,9 @@ func (fs *Dat9FS) readFtruncateAliasLocked(ctx context.Context, fh *FileHandle, 
 		if !handled && fh.pendingFtruncate.Load() != event {
 			return nil, true, syscall.EAGAIN
 		}
+	}
+	if errors.Is(err, errFtruncateRemoteAdvanced) {
+		return nil, false, nil // The observation was verified and retired.
 	}
 	return data, handled, err
 }
@@ -67,7 +69,11 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 	if !ok {
 		return nil, true, errFtruncateBusy
 	}
-	defer unlock()
+	defer func() {
+		if unlock != nil {
+			unlock()
+		}
+	}()
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
 	fs.dirtyMu.Lock()
 	committed := fs.mutationInodes[fh.Ino]
@@ -100,15 +106,21 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 	origin := "committed"
 	if event.seq > chosenSeq {
 		if !event.complete {
-			// Preserve the existing live-source range path for large truncates.
+			// The live reader can reselect a concurrent committed image. When
+			// the source is gone, continue below to the exact staged generation.
 			path := fh.Path
 			fh.Unlock()
 			data, _, handled, status := fs.readPendingFtruncateVisibleRange(ctx, fh, path, 0, false, offset, size)
 			fh.Lock()
-			if handled && status == 0 && fh.pendingFtruncate.Load() == event && fs.ftruncateAliasLinked(fh) && event.view == fs.mountViewGeneration.Load() {
-				return data, true, nil
+			if fh.pendingFtruncate.Load() != event || !fs.ftruncateAliasLinked(fh) || event.view != fs.mountViewGeneration.Load() {
+				return nil, true, syscall.EAGAIN
 			}
-			return nil, true, syscall.EAGAIN
+			if handled || status != 0 {
+				if handled && status == 0 {
+					return data, true, nil
+				}
+				return nil, true, syscall.EAGAIN
+			}
 		}
 		chosenSeq, chosenID, data, origin = event.seq, event.id, append([]byte(nil), event.data...), "event"
 		chosenAncestors = event.ancestors
@@ -144,7 +156,7 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 				chosenAncestors = ancestors
 			}
 			live = append(live, aliasLiveProof{other, other.DirtySeq, id, other.Path})
-			if other.DirtySeq > chosenSeq {
+			if other.DirtySeq > chosenSeq || (origin == "event" && !event.complete && other.DirtySeq == chosenSeq) {
 				if chosenID != "" && id != chosenID && !slices.Contains(other.contentAncestors, chosenID) && !slices.Contains(other.stagedAncestors, chosenID) {
 					other.Unlock()
 					return nil, true, syscall.EAGAIN
@@ -190,7 +202,7 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 		if meta.MutationSeq == chosenSeq && chosenID != "" && meta.SnapshotID != chosenID {
 			return nil, true, syscall.EAGAIN
 		}
-		if meta.MutationSeq > chosenSeq {
+		if meta.MutationSeq > chosenSeq || (origin == "event" && !event.complete && meta.MutationSeq == chosenSeq) {
 			if chosenID != "" && meta.SnapshotID != chosenID && !slices.Contains(processLocalMetaAncestors(meta), chosenID) {
 				return nil, true, syscall.EAGAIN
 			}
@@ -211,6 +223,9 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 			}
 			chosenSeq, chosenID, origin = meta.MutationSeq, meta.SnapshotID, "staged"
 		}
+	}
+	if origin == "event" && !event.complete {
+		return nil, true, syscall.EAGAIN // No live or staged payload for this root.
 	}
 	var rangeSource *FileHandle
 	var loaded []int
@@ -277,6 +292,14 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 	if origin == "committed" && readCommitted {
 		var err error
 		data, ranged, err = fs.readFtruncateObserverCommitted(ctx, fh, committed, offset, size)
+		if errors.Is(err, errFtruncateRemoteAdvanced) {
+			unlock()
+			unlock = nil
+			if err := fs.retireCommittedFtruncateLocked(ctx, fh, event); err != nil {
+				return nil, true, err
+			}
+			return nil, true, errFtruncateRemoteAdvanced
+		}
 		if err != nil {
 			return nil, true, err
 		}
@@ -469,6 +492,9 @@ func (fs *Dat9FS) readFtruncateObserverCommitted(ctx context.Context, fh *FileHa
 	}
 	path := fs.remotePath(fh.Path)
 	before, err := fs.client.StatCtx(ctx, path)
+	if err == nil && before != nil && committed.committedRevision > 0 && before.Revision > committed.committedRevision {
+		return nil, false, errFtruncateRemoteAdvanced
+	}
 	if err != nil || before == nil || (committed.committedRevision > 0 && before.Revision != committed.committedRevision) || before.Size != committed.committedSize {
 		return nil, false, syscall.EAGAIN
 	}
