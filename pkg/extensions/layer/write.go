@@ -267,7 +267,10 @@ func (h *layerHandle) retarget(newPath string) {
 	if old == newPath {
 		return
 	}
-	h.l.untrackHandle(h)
+	// A registry MOVE, not a retirement: the open fd keeps its lifetime —
+	// retiring here marked still-open descriptors released and later
+	// renames/writes lost them.
+	h.l.detachFromRegistry(h)
 	h.l.liveStore(newPath, h)
 }
 

@@ -14,6 +14,12 @@ import (
 
 // EmitCheckoutForTest emits a coarse checkout event (test hook for the
 // view-fence row).
+// refreshEventsForTest drives one event refresh synchronously (tests
+// need the checkout sweep without waiting for the poller).
+func (l *Layer) refreshEventsForTest(ctx context.Context) {
+	_ = l.refreshEvents(ctx)
+}
+
 func (l *Layer) EmitCheckoutForTest() {
 	l.emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
 }
@@ -115,37 +121,46 @@ func (l *Layer) refreshEvents(ctx context.Context) error {
 			changed[l.localPathOf(events[i].Path)] = true
 		}
 	}
-	l.live.Range(func(key, _ any) bool {
-		path, _ := key.(string)
-		if !changed[path] {
+	// EVERY descriptor of a changed path follows the checkout, not just
+	// the per-path newest slot (l.live keeps one handle per path; the
+	// handles set has them all — an older sibling fd kept serving its
+	// stale buffer through a refresh that updated only the newest).
+	l.handles.Range(func(key, _ any) bool {
+		h, ok := key.(*layerHandle)
+		if !ok {
 			return true
 		}
-		if h := l.handleFor(path); h != nil {
-			h.mu.Lock()
-			if h.dirty {
-				// v1 preserveLayerReplayConflict: an external change under
-				// uncommitted writes fences the handle — publishing its
-				// buffer onto the new tip would splice stale bytes. The
-				// buffer is kept; writes and commits answer EAGAIN.
-				h.conflicted = true
-			}
-			if _, _, _, _, ok := l.lookup(path); ok {
-				kind, _, _, content, _ := l.lookup(path)
-				if kind == "file" && !h.dirty {
-					h.buf = nil
-					h.origSize = int64(len(content))
-					h.baseRev = 0
-				}
-			} else if !h.dirty {
-				h.buf = nil
-				h.origSize = 0
-			}
-			kind, _, _, _, look := l.lookup(path)
-			if look && kind == "whiteout" {
-				h.unlinked = true
-			}
-			h.mu.Unlock()
+		h.mu.Lock()
+		path := h.path
+		released := h.released
+		h.mu.Unlock()
+		if released || !changed[path] {
+			return true
 		}
+		h.mu.Lock()
+		if h.dirty {
+			// v1 preserveLayerReplayConflict: an external change under
+			// uncommitted writes fences the handle — publishing its
+			// buffer onto the new tip would splice stale bytes. The
+			// buffer is kept; writes and commits answer EAGAIN.
+			h.conflicted = true
+		}
+		if _, _, _, _, ok := l.lookup(path); ok {
+			kind, _, _, content, _ := l.lookup(path)
+			if kind == "file" && !h.dirty {
+				h.buf = nil
+				h.origSize = int64(len(content))
+				h.baseRev = 0
+			}
+		} else if !h.dirty {
+			h.buf = nil
+			h.origSize = 0
+		}
+		kind, _, _, _, look := l.lookup(path)
+		if look && kind == "whiteout" {
+			h.unlinked = true
+		}
+		h.mu.Unlock()
 		return true
 	})
 	l.emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})

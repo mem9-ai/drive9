@@ -107,30 +107,42 @@ func (l *Layer) liveStore(path string, h *layerHandle) {
 // pending edit then landed under the old name instead of following the
 // rename. The path slot is cleared only while it still maps to this
 // handle; a surviving older claim is re-selected.
+// untrackHandle RETIRES a descriptor: its Release published and it must
+// never be re-selected or retargeted again. The handle leaves the index
+// entirely (a retired descriptor dirty again would strand the change with
+// no committer).
 func (l *Layer) untrackHandle(h *layerHandle) {
 	h.mu.Lock()
-	path := h.path
 	h.released = true
 	h.mu.Unlock()
-	// The handle leaves the index entirely: a retired descriptor must not
-	// be re-selected as the path's surviving claim (its Release already
-	// published; dirtying it again stranded the change with no committer).
 	l.handles.Delete(h)
-	if cur, ok := l.live.Load(path); ok && cur == h {
-		l.live.Delete(path)
-		l.handles.Range(func(key, _ any) bool {
-			if other, ok := key.(*layerHandle); ok && other != h && !other.unlinked && !other.released {
-				other.mu.Lock()
-				same := other.path == path
-				other.mu.Unlock()
-				if same {
-					l.live.Store(path, other)
-					return false
-				}
-			}
-			return true
-		})
+	l.detachFromRegistry(h)
+}
+
+// detachFromRegistry removes one handle's claim on ITS CURRENT path slot
+// without touching the descriptor's lifetime (renames move open fds):
+// the slot is cleared only while it still maps to this handle, and a
+// surviving same-path claim is re-selected into it.
+func (l *Layer) detachFromRegistry(h *layerHandle) {
+	h.mu.Lock()
+	path := h.path
+	h.mu.Unlock()
+	if cur, ok := l.live.Load(path); ok && cur != h {
+		return
 	}
+	l.live.Delete(path)
+	l.handles.Range(func(key, _ any) bool {
+		if other, ok := key.(*layerHandle); ok && other != h && !other.unlinked && !other.released {
+			other.mu.Lock()
+			same := other.path == path
+			other.mu.Unlock()
+			if same {
+				l.live.Store(path, other)
+				return false
+			}
+		}
+		return true
+	})
 }
 
 // ReexecRefusal ports the v1 hasLayerOverlayState gate: a layer mount with

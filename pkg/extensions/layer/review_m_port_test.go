@@ -146,3 +146,95 @@ func TestPortLayerTruncateAbortsOnBaseReadFailure(t *testing.T) {
 		t.Fatalf("post-abort read = %q err=%v, want untouched hello", string(rd.Data), err)
 	}
 }
+
+// qiffang N1: EVERY descriptor of a changed path follows the checkout —
+// an older sibling fd must not keep serving its stale buffer after the
+// newest one refreshed.
+func TestPortSiblingHandlesFollowCheckout(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("Aello"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	l, ch := mStack(t, ts)
+	ctx := context.Background()
+
+	open := func() fs.Handle {
+		res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDWR)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Handle
+	}
+	h1, h2 := open(), open()
+	// An external upsert replaces the entry; the layer's periodic event
+	// refresh picks it up and the checkout sweeps every open descriptor.
+	postLayerEntry(t, ts, "L1", "/f", "upsert", "world")
+	l.refreshEventsForTest(ctx)
+	deadline := attempts(t, func() bool {
+		got := make([]byte, 5)
+		if _, err := h2.Read(ctx, 0, got); err != nil || string(got) != "world" {
+			return false
+		}
+		if _, err := h1.Read(ctx, 0, got); err != nil || string(got) != "world" {
+			return false
+		}
+		return true
+	})
+	if !deadline {
+		got := make([]byte, 5)
+		_, e1 := h1.Read(ctx, 0, got)
+		t.Fatalf("sibling checkout: h1 = %q err=%v (older fd kept its stale buffer)", string(got), e1)
+	}
+}
+
+// qiffang N2: a rename MOVES the registry slot without retiring the open
+// descriptor — a sibling open/close between two renames must not strand
+// the first fd.
+func TestPortRenameAcrossSiblingOpenCloseKeepsHandle(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/file", []byte("hello"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	_, ch := mStack(t, ts)
+	ctx := context.Background()
+
+	h1 := func() fs.Handle {
+		res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/file", Flags: uint32(syscall.O_RDWR)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Handle
+	}()
+	if err := h1.Write(ctx, 0, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/file", Path2: "/moved"}); err != nil {
+		t.Fatal(err)
+	}
+	// A sibling opens and releases the renamed path.
+	res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/moved", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := res2.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Rename again: h1 must still be selected and retargeted.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/moved", Path2: "/again"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h1.Write(ctx, 4, []byte("!")); err != nil {
+		t.Fatalf("write through the renamed fd: %v", err)
+	}
+	if err := h1.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	st, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/again"})
+	if err != nil || st.Attr == nil || st.Attr.Size != 5 {
+		t.Fatalf("/again attr = %+v err=%v, want size 5 (the fd was stranded by the sibling release)", st.Attr, err)
+	}
+	rd, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/again", Offset: 0, Limit: 5})
+	if err != nil || string(rd.Data) != "Xell!" && string(rd.Data) != "Xello" {
+		t.Fatalf("/again read = %q err=%v", string(rd.Data), err)
+	}
+}
