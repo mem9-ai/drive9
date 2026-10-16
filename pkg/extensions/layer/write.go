@@ -51,10 +51,6 @@ type layerHandle struct {
 }
 
 // claim wraps an open of a layer-view file with write intent.
-func (l *Layer) claim(path string, flags uint32, mode uint32) (*layerHandle, error) {
-	return l.claimWithMode(path, flags, mode, false)
-}
-
 // claimWithMode distinguishes an explicit create mode (including the
 // valid zero mask) from an absent one: only the absent mode takes the
 // 0644 default.

@@ -388,8 +388,6 @@ func detachedNamespaceContext(ctx context.Context) (context.Context, context.Can
 // the cache's block prefetcher may fetch through the remote namespace ONLY
 // behind such a claim — localize/layer/Git planes own different bytes for
 // the same name, and mixing them corrupted reads.
-type remoteNamespaceReadable struct{}
-
 // IsRemoteNamespaceReadable reports whether reads through this handle
 // equal the ordinary remote namespace (safe for remote prefetch).
 func (h *SyncHandle) IsRemoteNamespaceReadable() bool { return true }
