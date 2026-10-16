@@ -74,6 +74,11 @@ type Localize struct {
 type token struct {
 	file *os.File
 	path string
+	// onRelease runs the owning router's open-reference accounting exactly
+	// once from Release — the facade releases claimed files by calling
+	// Handle.Release directly, so the OpRelease handler never runs and
+	// the router's openDBs accounting leaked every opened pathname.
+	onRelease func(path string)
 }
 
 // New builds the overlay router. The persistent backing root is created
@@ -178,11 +183,12 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		// parent's route — skipping them hid readable files from
 		// readdir).
 		if res, err := next(ctx, op); err == nil {
+			// The local overlay owns any name it holds (v1's
+			// mergeOverlayDirEntries REPLACED matching rows): keeping the
+			// remote row listed a stale size/type through READDIRPLUS
+			// while lookup answered the local file.
 			seen := make(map[string]struct{}, len(res.Entries))
-			for _, e := range res.Entries {
-				seen[e.Name] = struct{}{}
-			}
-			merged := res.Entries
+			merged := make([]fs.Entry, 0, len(res.Entries))
 			// The parent itself routes remote, but its LOCAL children ride
 			// the shared overlay: list the overlay's view of this directory
 			// and merge every child that itself routes local (v1's
@@ -195,16 +201,21 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 							continue
 						}
 						childPath := joinDir(op.Path, e.Name())
-						if _, dup := seen[e.Name()]; dup {
-							continue
-						}
 						if !f.classifiesLocal(ctx, inner, childPath, info.IsDir()) && f.transientFor(childPath, info.IsDir()) == nil {
 							continue
 						}
-						seen[e.Name()] = struct{}{}
+						// Replace a remote row with the local plane's
+						// attributes (the overlay owns this name).
+						delete(seen, e.Name())
 						merged = append(merged, fs.Entry{Name: e.Name(), Attr: attrOfLocalInfo(info)})
 					}
 				}
+			}
+			for _, e := range res.Entries {
+				if _, shadowed := seen[e.Name]; shadowed {
+					continue
+				}
+				merged = append(merged, e)
 			}
 			res.Entries = merged
 			return res, nil
@@ -231,9 +242,25 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				attr := attrOfLocalInfo(info)
 				st = &attr
 			}
-			return fs.Result{Handle: &token{file: file, path: op.Path}, Attr: st}, nil
+			return fs.Result{Handle: &token{file: file, path: op.Path, onRelease: f.noteDBClose}, Attr: st}, nil
 		}
 
+		// A database opened through the REMOTE route still needs its open
+		// reference held for the HANDLE's lifetime (this fall-through runs
+		// only after the local-claim and transient branches declined):
+		// the transient -shm routing consults the mount-wide registry (v1
+		// consulted it too) — an unregistered remote /db.sqlite left the
+		// WAL index persisting to the remote backend.
+		if op.Flags&(uint32(syscall.O_CREAT)|uint32(syscall.O_RDWR)|uint32(syscall.O_WRONLY)) != 0 {
+			f.noteDBOpen(op.Path)
+			res, err := next(ctx, op)
+			if err != nil || res.Handle == nil {
+				f.noteDBClose(op.Path)
+				return res, err
+			}
+			res.Handle = &dbAccountingHandle{inner: res.Handle, path: op.Path, close: f.noteDBClose}
+			return res, nil
+		}
 	case fs.OpRead:
 		if h, ok := op.Handle.(*token); ok {
 			if op.Limit <= 0 {
@@ -561,7 +588,38 @@ func (t *token) Flush(ctx context.Context) error {
 }
 
 func (t *token) Release(ctx context.Context) error {
-	return t.file.Close()
+	err := t.file.Close()
+	if t.onRelease != nil {
+		t.onRelease(t.path)
+	}
+	return err
+}
+
+// dbAccountingHandle holds the router's open reference for the lifetime
+// of a REMOTELY routed database descriptor: its Release retires the
+// reference the transient -shm routing consults.
+type dbAccountingHandle struct {
+	inner fs.Handle
+	path  string
+	close func(path string)
+}
+
+func (h *dbAccountingHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	return h.inner.Read(ctx, off, dest)
+}
+
+func (h *dbAccountingHandle) Write(ctx context.Context, off int64, data []byte) error {
+	return h.inner.Write(ctx, off, data)
+}
+
+func (h *dbAccountingHandle) Sync(ctx context.Context) error { return h.inner.Sync(ctx) }
+
+func (h *dbAccountingHandle) Flush(ctx context.Context) error { return h.inner.Flush(ctx) }
+
+func (h *dbAccountingHandle) Release(ctx context.Context) error {
+	err := h.inner.Release(ctx)
+	h.close(h.path)
+	return err
 }
 
 // attrOfLocalInfo converts backing-file metadata into reply attributes;

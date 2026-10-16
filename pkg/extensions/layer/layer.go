@@ -86,7 +86,8 @@ type Layer struct {
 
 	// live indexes claimed layer handles by path (SetAttr interception,
 	// unlink/rename retargeting).
-	live sync.Map
+	live    sync.Map // path -> newest live handle
+	handles sync.Map // every live handle (survivor re-selection)
 	// policy is the mount's write policy: write-sync commits per write.
 	policy string
 	// inlineMaxOverride bounds inline entry bodies in tests (0 = client
@@ -95,8 +96,37 @@ type Layer struct {
 }
 
 // track/untrack maintain the claimed-handle index.
-func (l *Layer) liveStore(path string, h *layerHandle) { l.live.Store(path, h) }
-func (l *Layer) untrack(path string)                   { l.live.Delete(path) }
+func (l *Layer) liveStore(path string, h *layerHandle) {
+	l.handles.Store(h, struct{}{})
+	l.live.Store(path, h)
+}
+
+// untrackHandle removes exactly one handle's registration: the path slot
+// may hold a NEWER claim (a second open overwrote it), and deleting the
+// slot outright hid the surviving writer from rename retargeting — its
+// pending edit then landed under the old name instead of following the
+// rename. The path slot is cleared only while it still maps to this
+// handle; a surviving older claim is re-selected.
+func (l *Layer) untrackHandle(h *layerHandle) {
+	h.mu.Lock()
+	path := h.path
+	h.mu.Unlock()
+	if cur, ok := l.live.Load(path); ok && cur == h {
+		l.live.Delete(path)
+		l.handles.Range(func(key, _ any) bool {
+			if other, ok := key.(*layerHandle); ok && other != h && !other.unlinked {
+				other.mu.Lock()
+				same := other.path == path
+				other.mu.Unlock()
+				if same {
+					l.live.Store(path, other)
+					return false
+				}
+			}
+			return true
+		})
+	}
+}
 
 // ReexecRefusal ports the v1 hasLayerOverlayState gate: a layer mount with
 // any overlay state (whiteouts, entries, symlinks, or inline contents)

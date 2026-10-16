@@ -52,6 +52,13 @@ type layerHandle struct {
 
 // claim wraps an open of a layer-view file with write intent.
 func (l *Layer) claim(path string, flags uint32, mode uint32) (*layerHandle, error) {
+	return l.claimWithMode(path, flags, mode, false)
+}
+
+// claimWithMode distinguishes an explicit create mode (including the
+// valid zero mask) from an absent one: only the absent mode takes the
+// 0644 default.
+func (l *Layer) claimWithMode(path string, flags uint32, mode uint32, hasMode bool) (*layerHandle, error) {
 	// An uploaded-but-unmaterialized image is the authoritative content:
 	// hydrate it so the handle reopens the real image (a missing entry
 	// answered attrs 0/EOF and a pwrite-then-flush dropped the rest).
@@ -72,8 +79,10 @@ func (l *Layer) claim(path string, flags uint32, mode uint32) (*layerHandle, err
 		return h, nil
 	}
 	// base object (or a fresh create): stat resolves the CAS base and the
-	// lazy-load extent.
-	if mode == 0 {
+	// lazy-load extent. An explicitly requested zero create mode is a
+	// valid permission mask (create(0000) must not widen to 0644); the
+	// 0644 default applies only when the caller sent no mode at all.
+	if mode == 0 && !hasMode {
 		h.mode = 0o644
 	}
 	st, err := l.cl.StatCtx(context.Background(), l.remotePath(path))
@@ -197,15 +206,14 @@ func (h *layerHandle) Release(ctx context.Context) error {
 	h.mu.Lock()
 	unlinked := h.unlinked
 	unlink := h.unlinkAtRelease
-	path := h.path
 	h.mu.Unlock()
 	if unlinked {
 		_ = unlink // the unlink op already published the whiteout
-		h.l.untrack(path)
+		h.l.untrackHandle(h)
 		return nil
 	}
 	err := h.commit(ctx)
-	h.l.untrack(path)
+	h.l.untrackHandle(h)
 	return err
 }
 
@@ -254,7 +262,7 @@ func (h *layerHandle) retarget(newPath string) {
 	if old == newPath {
 		return
 	}
-	h.l.untrack(old)
+	h.l.untrackHandle(h)
 	h.l.liveStore(newPath, h)
 }
 

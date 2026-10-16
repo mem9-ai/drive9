@@ -89,16 +89,12 @@ func (x *Xattr) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		}
 		return fs.Result{}, fs.StatusErrorOf(gofuse.ENOATTR)
 	case fs.OpRename:
-		res, err := next(ctx, op)
-		if err != nil {
-			return res, err
-		}
-		// The rename may have been claimed by an outer extension
-		// (localize/layer/git/specials complete renames without next) —
-		// the event-driven migration below covers those paths; this
-		// in-line move only covers the xattr-plane's own dispatch.
-		x.store.Rename(op.Path, op.Path2)
-		return res, nil
+		// The migration is event-driven ONLY (one ordered path): this
+		// plane's own dispatch AND renames claimed by outer extensions
+		// (localize/layer/git/specials complete without next) move the
+		// store on the facade's successful-rename emission. Moving here
+		// as well re-renamed an already-moved source and deleted the
+		// destination's fresh attributes.
 	case fs.OpUnlink, fs.OpRmdir:
 		res, err := next(ctx, op)
 		if err != nil {

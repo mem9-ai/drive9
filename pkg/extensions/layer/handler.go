@@ -119,7 +119,7 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			// Claim the data plane: writes buffer locally and land as one
 			// layer entry per durability boundary. A create materializes
 			// at the boundary, not at open.
-			h, err := l.claim(op.Path, op.Flags, op.Mode&0o777)
+			h, err := l.claimWithMode(op.Path, op.Flags, op.Mode&0o777, op.HasMode)
 			if err != nil {
 				return fs.Result{}, err
 			}

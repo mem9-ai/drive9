@@ -71,13 +71,13 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 		h.mu.Unlock()
 		return a, nil
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	if op.Size >= 0 && op.Size != int64(len(h.image)) {
+		h.mu.Lock()
 		size := op.Size
 		if size < int64(len(h.image)) {
 			h.image = h.image[:size]
 			h.dirty = true
+			h.mu.Unlock()
 		} else if size > bulkfileMaxBufferedBytes {
 			// A zero-fill grow past the bound must not allocate the hole:
 			// land the buffered prefix and express the truncation in the
@@ -96,16 +96,26 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 			h.image = nil
 			h.pushed = size
 			h.dirty = false
+			attr := h.attrLocked()
+			h.mu.Unlock()
+			// Registry removal takes b.mu while every lookup takes
+			// (b.mu, h.mu) in that order — dropping h.mu first keeps one
+			// lock order (deadlock: a lookup racing this transition).
 			h.b.untrack(h)
-			return h.attrLocked(), nil
+			return attr, nil
 		} else {
+			h.mu.Lock()
 			grown := make([]byte, size)
 			copy(grown, h.image)
 			h.image = grown
 			h.dirty = true
+			h.mu.Unlock()
 		}
 	}
-	return h.attrLocked(), nil
+	h.mu.Lock()
+	attr := h.attrLocked()
+	h.mu.Unlock()
+	return attr, nil
 }
 
 func (h *streamHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
@@ -220,12 +230,22 @@ func (h *streamHandle) Flush(ctx context.Context) error {
 // surrenderToBelow retires a flushed claim whose file another writer
 // now owns through the lower plane: the claim stops answering lookups
 // and overlays (its image is published), so every later open reads the
-// shared lower state.
+// shared lower state. Live descriptors on this claim switch to
+// passthrough — the flushed image lives below now, so their reads and
+// appends address the shared lower state instead of an erased buffer.
 func (h *streamHandle) surrenderToBelow() {
 	h.mu.Lock()
+	h.passthrough = true
 	h.image = nil
 	h.dirty = false
+	h.inner = nil // re-opened lazily at the CURRENT shared state
+	h.pushed = 0
 	h.mu.Unlock()
+	// The flushed write-plane handle below keeps serving its own landed
+	// buffer (read-your-writes prefers it), which would answer the
+	// original descriptor's reads with the pre-handoff image forever.
+	// Dropping the session makes every later read/write open a fresh
+	// handle against the shared state the second writer now owns.
 	h.b.untrack(h)
 }
 

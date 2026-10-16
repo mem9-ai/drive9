@@ -78,6 +78,19 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		op.Flags&uint32(syscall.O_CREAT) != 0 && op.Flags&uint32(syscall.O_TRUNC) != 0 &&
 		op.Flags&uint32(syscall.O_APPEND) == 0 && !hasSyncOpenFlag(op.Flags) &&
 		b.policy != policyWriteSync {
+		// A prior claim on this path must hand off BEFORE the new claim
+		// takes the name: its buffered bytes are the acknowledged state
+		// (the same flush-or-abort contract as the non-truncate writer
+		// below) — without this, a truncate-open over a live claim
+		// stranded the old descriptor reading its stale image forever.
+		if prior := b.liveHandleAt(op.Path); prior != nil {
+			if _, ok := prior.overlayAttr(); ok {
+				if ferr := prior.Flush(ctx); ferr != nil {
+					return fs.Result{}, ferr
+				}
+				prior.surrenderToBelow()
+			}
+		}
 		// Resolve existence BEFORE claiming, so the claim knows whether the
 		// first boundary must express a truncation (an existing file) or
 		// nothing at all (a fresh create that materializes at the boundary).
@@ -132,7 +145,13 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				if !writeIntent(op.Flags) {
 					return fs.Result{Attr: &attr, Handle: &claimReadHandle{claim: hit}}, nil
 				}
-				_ = hit.Flush(ctx)
+				if ferr := hit.Flush(ctx); ferr != nil {
+					// The handoff is aborted: the claim keeps its buffered
+					// image (the acknowledged bytes' only copy) — erasing
+					// it on a failed flush lost the write and left the
+					// remote at its pre-claim content.
+					return fs.Result{}, ferr
+				}
 				// A second writer now owns the file through the plane
 				// below: retire the flushed claim entirely — leaving it
 				// tracked kept its stale image answering lookups and

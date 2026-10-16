@@ -322,12 +322,13 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			h.isSidecar = true
 		}
 		// The prefetcher reads the ORDINARY remote namespace: it may only
-		// arm behind a plain terminal (core) claim. Localize/layer/Git
-		// planes own their files' bytes (a local-only overlay file mixed
-		// its first local block with prefetched remote blocks of a same-
-		// named object) — those handles read through their inner plane.
-		if plainInner, ok := res.Handle.(interface{ UnwrapHandle() fs.Handle }); !ok {
-			_ = plainInner
+		// arm behind a claim whose bytes EQUAL that namespace — an
+		// explicit capability on the terminal (core's SyncHandle), not a
+		// decorator-shape inference (localize's token has no UnwrapHandle
+		// and passed the old check, mixing local and remote images).
+		if plainInner, ok := res.Handle.(interface {
+			IsRemoteNamespaceReadable() bool
+		}); ok && plainInner.IsRemoteNamespaceReadable() {
 			if c.opts.SequentialPrefetch && c.opts.PrefetchClient != nil && size > c.mem.MaxFileSize() {
 				// v1 armed the prefetcher only for handles whose size
 				// exceeds the whole-file cache admission limit: smaller

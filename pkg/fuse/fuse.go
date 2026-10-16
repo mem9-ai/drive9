@@ -1854,8 +1854,11 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	}
 	f.touchParentMtime(input.NodeId)
 	f.touchParentMtimeByName(newPath)
-	f.mutated(fs.EventDelete, oldPath)
+	// The rename migration precedes the old-name delete: a delete-first
+	// order removes the source attributes before any mover observes them
+	// (xattr subscribers), losing the attributes entirely.
 	f.mutatedRename(oldPath, newPath)
+	f.mutated(fs.EventDelete, oldPath)
 	// v1 notifyRenameTarget: invalidate ONLY the rename TARGET — the kernel
 	// moves the old name's dentry natively, and dropping it from userspace
 	// disturbs the bookkeeping for the next create of the same name in
@@ -2140,7 +2143,7 @@ func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string,
 	f.flushDeferredUnlink(child)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpCreate, Path: child, Flags: input.Flags, Mode: input.Mode & 0o7777, Ino: input.NodeId, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpCreate, Path: child, Flags: input.Flags, Mode: input.Mode & 0o7777, HasMode: true, Ino: input.NodeId, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
 	if err != nil {
 		return fs.StatusOf(err)
 	}

@@ -383,6 +383,17 @@ func detachedNamespaceContext(ctx context.Context) (context.Context, context.Can
 	return context.WithTimeout(base, detachedNamespaceDeadline)
 }
 
+// RemoteNamespaceReadable marks handles whose bytes equal the ordinary
+// remote namespace object at the path (core's terminal handles): the read
+// the cache's block prefetcher may fetch through the remote namespace ONLY
+// behind such a claim — localize/layer/Git planes own different bytes for
+// the same name, and mixing them corrupted reads.
+type remoteNamespaceReadable struct{}
+
+// IsRemoteNamespaceReadable reports whether reads through this handle
+// equal the ordinary remote namespace (safe for remote prefetch).
+func (h *SyncHandle) IsRemoteNamespaceReadable() bool { return true }
+
 // RetargetTo rebinds the handle onto another name of the same object (the
 // write plane's deferred-unlink survivor hook, #1029): the handle reads by
 // path, and a name that is unlinked and later recreated belongs to a
