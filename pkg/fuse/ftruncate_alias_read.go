@@ -273,7 +273,7 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 		}
 	}
 	ranged := rangeSource != nil || stagedRange != nil
-	readCommitted := readonly || len(entry.Paths) == 1
+	readCommitted := readonly || len(entry.Paths) == 1 || committed.committedSize > maxLandedPayloadBytes
 	if origin == "committed" && readCommitted {
 		var err error
 		data, ranged, err = fs.readFtruncateObserverCommitted(ctx, fh, committed, offset, size)

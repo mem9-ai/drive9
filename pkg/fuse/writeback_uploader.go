@@ -503,6 +503,9 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		return
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+	if meta.lineageTrusted && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= maxLandedPayloadBytes {
+		meta.liveChecksum = payloadChecksum(data)
+	}
 	if u.OnDataCommitted != nil {
 		u.OnDataCommitted(*meta, committedRev, stagingGens)
 	}
@@ -531,9 +534,6 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		u.perf.uploaderSuccess.add(1)
 	}
 	if u.OnSuccess != nil {
-		if meta.lineageTrusted && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= maxLandedPayloadBytes {
-			meta.liveChecksum = payloadChecksum(data)
-		}
 		u.OnSuccess(*meta, committedRev, stagingGens)
 	}
 }
@@ -664,6 +664,7 @@ func (u *WriteBackUploader) uploadSyncWithRevisionLocked(ctx context.Context, lo
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	proof.rev = committedRev
+	meta.liveChecksum = proof.checksum
 	if u.OnDataCommitted != nil {
 		u.OnDataCommitted(*meta, committedRev, stagingGens)
 	}

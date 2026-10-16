@@ -101,11 +101,9 @@ func (fs *Dat9FS) ftruncateAliasRevision(fh *FileHandle) int64 {
 
 func (fs *Dat9FS) ftruncateAliasProof(fh *FileHandle) pathCommitLandmark {
 	proof := pathCommitLandmark{}
-	if fs.commitQueue != nil {
-		for _, p := range fs.ftruncateAliasPaths(fh.Ino) {
-			if other := fs.commitQueue.landedCommit(p); other.rev > proof.rev {
-				proof = other
-			}
+	for _, p := range fs.ftruncateAliasPaths(fh.Ino) {
+		if other := fs.landedAppendCommit(p); other.rev > proof.rev {
+			proof = other
 		}
 	}
 	return proof

@@ -4370,7 +4370,7 @@ func (fs *Dat9FS) checkAppendSourceBoundsLocked(fh *FileHandle, appendBytes int6
 			continue
 		}
 		if !src.TryLock() {
-			return syscall.EAGAIN
+			return &appendRefreshSourceBusy{source: src}
 		}
 		oversized := !src.Unlinked && src.Ino == fh.Ino && src.Dirty != nil &&
 			(src.Path == fh.Path || fs.sameLinkedInode(src.Path, fh.Ino)) && appendExceedsPendingSourceBound(fh, src, appendBytes)
@@ -14138,10 +14138,18 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 				unlockRemoteCommit = func() { fs.releaseHandleRemoteCommitPathLocked(fh) }
 				if fh.Flags&uint32(syscall.O_APPEND) != 0 {
 					if err := fs.checkAppendSourceBoundsLocked(fh, int64(len(data))); err != nil {
+						if errors.Is(err, errAppendRefreshBusy) {
+							refreshErr = err
+							goto appendRefreshRetry
+						}
 						return 0, httpToFuseStatus(err)
 					}
 				}
 				if err := fs.prepareFtruncateMutationLocked(ctx, fh); err != nil {
+					if fh.Flags&uint32(syscall.O_APPEND) != 0 && errors.Is(err, errAppendRefreshBusy) {
+						refreshErr = err
+						goto appendRefreshRetry
+					}
 					return 0, httpToFuseStatus(err)
 				}
 			}
@@ -14178,6 +14186,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 				refreshErr = errAppendRefreshBusy
 			}
 		}
+	appendRefreshRetry:
 		if refreshErr == nil {
 			break
 		}
@@ -16367,6 +16376,22 @@ func (fs *Dat9FS) onWriteBackDataCommitted(meta WriteBackMeta, committedRev int6
 	if fs == nil {
 		return
 	}
+	// Publish content identity before its watermark can retire the live/staged
+	// read source. Rejected proof authority still settles its own generations.
+	if committedRev > 0 && fs.latestCommittedRevision(meta.Path) <= committedRev {
+		ino, linked := fs.inodes.GetInode(meta.Path)
+		if entry, ok := fs.inodes.GetEntry(ino); linked && ok &&
+			(meta.Inode == 0 || ino == meta.Inode) && entry.Revision <= committedRev {
+			fs.recordCommittedAppendSnapshot(meta.Path, pathCommitLandmark{
+				rev: committedRev, size: meta.Size, checksum: meta.liveChecksum,
+				snapshotID: meta.SnapshotID, ancestors: meta.liveAncestors,
+			})
+			if fs.commitQueue != nil {
+				fs.commitQueue.rememberLanded(meta.Path, committedRev, meta.Size, meta.liveChecksum, meta.SnapshotID, meta.liveAncestors...)
+			}
+		}
+	}
+	failpoint.InjectCall("writeBackDataCommittedProofReady", fs, meta, committedRev)
 	if meta.Inode != 0 && meta.MutationSeq != 0 {
 		fs.recordCommittedMutation(meta.Inode, meta.MutationSeq, committedRev, meta.Size)
 		fs.captureFtruncateIdentity(context.Background(), meta.Inode, meta.Path, committedRev)
@@ -16395,6 +16420,7 @@ func (fs *Dat9FS) onWriteBackDataCommitted(meta WriteBackMeta, committedRev int6
 		fs.recordCommittedRevisionWithSize(path, committedRev, meta.Size)
 	}
 	fs.inodes.advanceRevision(ino, committedRev)
+	fs.publishLinkedAppendCommit(meta.Path, ino, committedRev, meta.Size)
 	// Do not settle dirty handles here or overwrite the inode's effective
 	// dirty size. Only clean buffers may adopt this exact committed image.
 	for _, fh := range fs.openHandles.SnapshotInode(ino) {

@@ -153,7 +153,7 @@ func (fs *Dat9FS) ftruncateChildLocked(fh *FileHandle) (*FileHandle, error) {
 			continue
 		}
 		if !other.TryLock() {
-			return nil, errFtruncateBusy
+			return nil, fmt.Errorf("%w: %w", errFtruncateBusy, &appendRefreshSourceBusy{source: other})
 		}
 		if other.Dirty != nil && !other.Unlinked && other.DirtySeq > fh.DirtySeq &&
 			ftruncateSnapshotID(other) != id && ftruncateDescends(other, id) {
@@ -221,10 +221,7 @@ func (fs *Dat9FS) adoptLandedFtruncateImageLocked(ctx context.Context, fh *FileH
 		fs.installFtruncateImageLocked(fh, data, rev, id, append([]string(nil), ancestors...))
 		return true, nil
 	}
-	proof := pathCommitLandmark{}
-	if fs.commitQueue != nil {
-		proof = fs.ftruncateAliasProof(fh)
-	}
+	proof := fs.ftruncateAliasProof(fh)
 	// The exact parent may land before its live child. Rebase only after
 	// proving that the remote is that parent's complete immutable image.
 	parentMatches := landedIdentityMatches(proof, rev, size, data) && ftruncateDescends(fh, proof.snapshotID)
