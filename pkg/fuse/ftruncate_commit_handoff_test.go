@@ -89,6 +89,7 @@ func TestFtruncateAppendWaitsForBusyWritableSibling(t *testing.T) {
 
 func TestFtruncateLargeCommittedWritableAliasRead(t *testing.T) {
 	fs, ino, a, b, remote := newHardlinkFS(t)
+	fs.inodes.SetIdentity(ino, "review-inode", 2) // Match interceptFtruncateHTTP below.
 	fs.client.SetSmallFileThresholdForTests(8 << 20)
 	var observer gofuse.OpenOut
 	if st := fs.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: ino}, Flags: uint32(syscall.O_RDWR)}, &observer); st != gofuse.OK {

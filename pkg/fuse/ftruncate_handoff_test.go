@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,11 +19,17 @@ import (
 )
 
 type truncateHandoffRemote struct {
-	mu       sync.Mutex
-	data     []byte
-	revision int64
-	puts     int
-	resource string
+	mu              sync.Mutex
+	data            []byte
+	revision        int64
+	puts            int
+	resource        string
+	nlink           int
+	inlineThreshold int64
+	patchParts      []int
+	omitPatchRead   bool
+	shortPatchRead  bool
+	rejectPatchDone bool
 }
 
 func (s *truncateHandoffRemote) snapshot() ([]byte, int64, int) {
@@ -32,9 +39,121 @@ func (s *truncateHandoffRemote) snapshot() ([]byte, int64, int) {
 }
 func truncateHandoffFS(t *testing.T, initial []byte) (*Dat9FS, uint64, *truncateHandoffRemote) {
 	t.Helper()
-	remote := &truncateHandoffRemote{data: bytes.Clone(initial), revision: 1, resource: "handoff-resource"}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/fs/file.bin" {
+	remote := &truncateHandoffRemote{data: bytes.Clone(initial), revision: 1, resource: "handoff-resource", nlink: 1, inlineThreshold: 32 << 20}
+	var uploaded []byte
+	var uploadSize, uploadRevision int64
+	var patchOriginal []byte
+	var patchPart, patchPartSize int64
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/status" {
+			remote.mu.Lock()
+			threshold := remote.inlineThreshold
+			remote.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": threshold})
+			return
+		}
+		if r.URL.Path == "/handoff-original-part" {
+			remote.mu.Lock()
+			defer remote.mu.Unlock()
+			data := patchOriginal
+			if remote.shortPatchRead && len(data) > 0 {
+				data = data[:len(data)-1]
+			}
+			http.ServeContent(w, r, "original.bin", time.Unix(1000, 0), bytes.NewReader(data))
+			return
+		}
+		if r.URL.Path == "/v1/uploads/handoff-patch/complete" {
+			remote.mu.Lock()
+			defer remote.mu.Unlock()
+			partStart := (patchPart - 1) * patchPartSize
+			partSize := min(patchPartSize, uploadSize-partStart)
+			if remote.rejectPatchDone || remote.revision != uploadRevision || int64(len(uploaded)) != partSize {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			data := bytes.Clone(patchOriginal[:uploadSize])
+			copy(data[partStart:], uploaded)
+			remote.data, remote.revision, remote.puts = data, remote.revision+1, remote.puts+1
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(remote.revision, 10))
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": remote.revision})
+			return
+		}
+		if r.URL.Path == "/v2/uploads/initiate" {
+			var request struct {
+				TotalSize int64 `json:"total_size"`
+				Expected  int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			remote.mu.Lock()
+			defer remote.mu.Unlock()
+			if request.Expected != remote.revision {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			uploadSize, uploadRevision, uploaded = request.TotalSize, request.Expected, nil
+			if uploadSize <= 0 || uploadSize > DefaultPartSize {
+				t.Errorf("fixture only accepts one bounded part: %d", uploadSize)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id": "handoff", "key": "handoff", "part_size": DefaultPartSize, "total_parts": 1,
+			})
+			return
+		}
+		if r.URL.Path == "/v2/uploads/handoff/presign-batch" || r.URL.Path == "/v2/uploads/handoff/presign" {
+			remote.mu.Lock()
+			defer remote.mu.Unlock()
+			part := map[string]any{"number": 1, "url": server.URL + "/handoff-part", "size": uploadSize}
+			if r.URL.Path == "/v2/uploads/handoff/presign-batch" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"parts": []map[string]any{part}})
+			} else {
+				_ = json.NewEncoder(w).Encode(part)
+			}
+			return
+		}
+		if r.URL.Path == "/handoff-part" {
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			remote.mu.Lock()
+			uploaded = data
+			remote.mu.Unlock()
+			w.Header().Set("ETag", "handoff-part")
+			return
+		}
+		if r.URL.Path == "/v2/uploads/handoff/complete" {
+			remote.mu.Lock()
+			defer remote.mu.Unlock()
+			if remote.revision != uploadRevision || int64(len(uploaded)) != uploadSize {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			remote.data, remote.revision, remote.puts = bytes.Clone(uploaded), remote.revision+1, remote.puts+1
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(remote.revision, 10))
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": remote.revision})
+			return
+		}
+		if r.URL.Path == "/v2/uploads/handoff/abort" {
+			return
+		}
+		if r.URL.Path == "/v1/fs/" && r.Method == http.MethodHead {
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.Header().Set("X-Dat9-Resource-ID", "handoff-root")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.Header().Set("Content-Length", "0")
+			return
+		}
+		if r.URL.Path != "/v1/fs/file.bin" && r.URL.Path != "/v1/fs/alias.bin" {
 			http.NotFound(w, r)
 			return
 		}
@@ -42,8 +161,13 @@ func truncateHandoffFS(t *testing.T, initial []byte) (*Dat9FS, uint64, *truncate
 		defer remote.mu.Unlock()
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(remote.revision, 10))
 		w.Header().Set("X-Dat9-Resource-ID", remote.resource)
-		w.Header().Set("X-Dat9-Nlink", "1")
+		w.Header().Set("X-Dat9-Nlink", strconv.Itoa(remote.nlink))
 		w.Header().Set("X-Dat9-IsDir", "false")
+		if int64(len(remote.data)) >= remote.inlineThreshold {
+			w.Header().Set("X-Dat9-Storage-Type", "s3")
+		} else {
+			w.Header().Set("X-Dat9-Storage-Type", "db9")
+		}
 		switch r.Method {
 		case http.MethodHead:
 			w.Header().Set("Content-Length", strconv.Itoa(len(remote.data)))
@@ -65,6 +189,45 @@ func truncateHandoffFS(t *testing.T, initial []byte) (*Dat9FS, uint64, *truncate
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(remote.revision, 10))
 			_, _ = fmt.Fprintf(w, `{"status":"ok","revision":%d}`, remote.revision)
+		case http.MethodPatch:
+			var request struct {
+				NewSize  int64 `json:"new_size"`
+				Expected int64 `json:"expected_revision"`
+				PartSize int64 `json:"part_size"`
+				Parts    []int `json:"dirty_parts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || len(request.Parts) != 1 || request.PartSize <= 0 || request.NewSize <= 0 || request.NewSize > int64(len(remote.data)) {
+				t.Errorf("fixture requires one retained PATCH part: %+v, err=%v", request, err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if request.Expected != remote.revision {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			patchPart, patchPartSize = int64(request.Parts[0]), request.PartSize
+			partStart := (patchPart - 1) * patchPartSize
+			if partStart < 0 || partStart >= request.NewSize {
+				t.Errorf("invalid retained PATCH part: %+v", request)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			uploadSize, uploadRevision, uploaded = request.NewSize, request.Expected, nil
+			patchOriginal = bytes.Clone(remote.data)
+			remote.patchParts = append(remote.patchParts, request.Parts[0])
+			part := map[string]any{"number": patchPart, "url": server.URL + "/handoff-part", "size": min(patchPartSize, uploadSize-partStart)}
+			if !remote.omitPatchRead {
+				part["read_url"] = server.URL + "/handoff-original-part"
+				part["read_headers"] = map[string]string{"Range": fmt.Sprintf("bytes=%d-%d", partStart, min(partStart+patchPartSize, uploadSize)-1)}
+			}
+			var copied []int
+			for pn := 1; int64(pn-1)*patchPartSize < uploadSize; pn++ {
+				if int64(pn) != patchPart {
+					copied = append(copied, pn)
+				}
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"upload_id": "handoff-patch", "part_size": patchPartSize, "upload_parts": []map[string]any{part}, "copied_parts": copied})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}

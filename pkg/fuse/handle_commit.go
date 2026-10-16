@@ -1,6 +1,10 @@
 package fuse
 
-import "slices"
+import (
+	"slices"
+
+	"github.com/pingcap/failpoint"
+)
 
 func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision int64, skip *FileHandle) {
 	if fs == nil || fs.openHandles == nil || path == "" || revision <= 0 {
@@ -159,7 +163,7 @@ func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) b
 	return true
 }
 
-// syncPassivePathTruncateLocked sizes a clean close-sync handle without
+// syncPassivePathTruncateLocked updates a clean handle's view without
 // making it a second publisher. A positive revision acknowledges a remote
 // commit; zero is only a local view change while another handle owns the write.
 func (fs *Dat9FS) syncPassivePathTruncateLocked(fh *FileHandle, size, revision int64) error {
@@ -172,11 +176,26 @@ func (fs *Dat9FS) syncPassivePathTruncateLocked(fh *FileHandle, size, revision i
 			state, ok := fs.mutationInodes[fh.Ino]
 			fs.dirtyMu.Unlock()
 			if ok && state.committedSeq > event.seq && state.committedRevision == revision && state.committedSize == size {
-				fh.pendingFtruncate.CompareAndSwap(event, nil)
-				clearStagedSnapshotLineageLocked(fh)
-				fh.ContentSnapshotID, fh.ftruncateInherited, fh.contentAncestors = "", "", nil
-				fh.LineageTrusted, fh.appendSnapshot, fh.Dirty.visibleTruncate = false, false, false
-				fs.openHandles.UnmarkVisibleTruncate(fh)
+				failpoint.InjectCall("pathTruncateObservationBeforeRetire", fs, fh)
+				if fs.lockMountViewRead(event.view) {
+					fs.dirtyMu.Lock()
+					unchanged := fs.mutationInodes[fh.Ino] == state
+					fs.dirtyMu.Unlock()
+					if unchanged && fh.pendingFtruncate.CompareAndSwap(event, nil) {
+						clearStagedSnapshotLineageLocked(fh)
+						fh.ContentSnapshotID, fh.ftruncateInherited, fh.contentAncestors = "", "", nil
+						fh.LineageTrusted, fh.appendSnapshot = false, false
+						if fh.Dirty != nil {
+							fh.Dirty.visibleTruncate = false
+						}
+						if fh.ShadowPinned && fs.shadowStore != nil {
+							fs.shadowStore.Unpin(fh.ShadowGen)
+							fh.ShadowPinned, fh.ShadowGen = false, 0
+						}
+						fs.openHandles.UnmarkVisibleTruncate(fh)
+					}
+					fs.mountViewMu.RUnlock()
+				}
 			}
 		}
 		fh.ZeroBase = false
@@ -218,25 +237,41 @@ func (fs *Dat9FS) syncPassivePathTruncateLocked(fh *FileHandle, size, revision i
 // size (not stale shorter content that could shrink the file back).
 func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize, committedRevision int64) {
 	zeroID := ""
+	var zeroSeq uint64
+	if newSize == 0 && committedRevision > 0 {
+		fs.dirtyMu.Lock()
+		state := fs.mutationInodes[ino]
+		if state.committedRevision == committedRevision && state.committedSize == 0 {
+			zeroSeq = state.committedSeq
+		}
+		fs.dirtyMu.Unlock()
+	}
 	var zeroEvent *ftruncateInheritance
 	var passive []*FileHandle
 	entry, _ := fs.inodes.GetEntry(ino)
 	sharedZero := entry != nil && (entry.Nlink <= 1 || fs.openHandles.ftruncateInheritance(ino, entry.Path) != nil)
 	for _, fh := range fs.fileHandlesForInode(ino) {
 		fh.Lock()
+		if (newSize > 0 || fh.Dirty == nil) && committedRevision > 0 && fh.pendingFtruncate.Load() != nil && fs.handleCanAdoptCommittedRevisionLocked(fh) {
+			if err := fs.syncPassivePathTruncateLocked(fh, newSize, committedRevision); err != nil {
+				safeLogPrintf("acknowledged path-truncate sync failed for %s: %v", fh.Path, err)
+			}
+			fh.Unlock()
+			continue
+		}
 		if fh.Dirty == nil {
 			fh.Unlock()
 			continue
 		}
 		if fs.isPassiveCloseSyncHandleLocked(fh) {
 			passive = append(passive, fh)
-			var committedRevision int64
-			if fs.appendLogPathConfigured(fh.Path) {
+			passiveRevision := committedRevision
+			if passiveRevision == 0 && fs.appendLogPathConfigured(fh.Path) {
 				if revision, size, ok := fs.latestCommittedRevisionWithSize(fh.Path); ok && size == newSize {
-					committedRevision = revision
+					passiveRevision = revision
 				}
 			}
-			if err := fs.syncPassivePathTruncateLocked(fh, newSize, committedRevision); err != nil {
+			if err := fs.syncPassivePathTruncateLocked(fh, newSize, passiveRevision); err != nil {
 				safeLogPrintf("passive path-truncate sync failed for %s: %v", fh.Path, err)
 			}
 			fh.Unlock()
@@ -280,14 +315,19 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize, committe
 				fh.OrigSize = newSize
 			}
 		}
-		fh.DirtySeq = fs.markDirtySize(ino, newSize)
+		if zeroSeq > 0 && sharedZero && fs.ftruncateParticipates(fh) {
+			fs.clearDirtySize(ino, fh.DirtySeq)
+			fh.DirtySeq = zeroSeq
+		} else {
+			fh.DirtySeq = fs.markDirtySize(ino, newSize)
+		}
 		if newSize == 0 && sharedZero && fs.ftruncateParticipates(fh) {
 			if zeroID == "" {
 				zeroID = generateMountID()
 			}
 			fs.resetFtruncateZeroImageLocked(fh, zeroID)
 			zeroEvent = fh.pendingFtruncate.Load()
-			if committedRevision > 0 {
+			if zeroSeq > 0 {
 				fs.clearDirtySize(ino, fh.DirtySeq)
 				fh.Dirty.ClearDirty()
 				fh.DirtySeq, fh.WriteBackSeq = 0, 0

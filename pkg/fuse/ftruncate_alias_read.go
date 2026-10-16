@@ -289,7 +289,7 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 	}
 	ranged := rangeSource != nil || stagedRange != nil
 	readCommitted := readonly || len(entry.Paths) == 1 || committed.committedSize > maxLandedPayloadBytes
-	if origin == "committed" && readCommitted {
+	if origin == "committed" {
 		var err error
 		data, ranged, err = fs.readFtruncateObserverCommitted(ctx, fh, committed, offset, size)
 		if errors.Is(err, errFtruncateRemoteAdvanced) {
@@ -374,7 +374,7 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 			}
 		}
 	}
-	if readCommitted {
+	if readCommitted || origin == "committed" {
 		if !fs.lockMountViewRead(event.view) {
 			return nil, true, syscall.EAGAIN
 		}
@@ -422,7 +422,7 @@ func (fs *Dat9FS) readFtruncateAliasOnceLocked(ctx context.Context, fh *FileHand
 			fh.BaseRev, fh.OrigSize = committed.committedRevision, committed.committedSize
 		}
 	}
-	if origin == "committed" && readCommitted && !ranged && fs.readCache != nil && committed.committedRevision > 0 {
+	if origin == "committed" && !ranged && fs.readCache != nil && committed.committedRevision > 0 {
 		if cached, ok := fs.readCache.Get(fh.Path, committed.committedRevision); !ok || len(cached) != len(data) {
 			fs.readCache.Put(fh.Path, data, committed.committedRevision)
 		}
@@ -492,6 +492,9 @@ func (fs *Dat9FS) readFtruncateObserverCommitted(ctx context.Context, fh *FileHa
 	}
 	path := fs.remotePath(fh.Path)
 	before, err := fs.client.StatCtx(ctx, path)
+	if err == nil && before != nil && linked && entry.ResourceID != "" && before.ResourceID != "" && before.ResourceID != entry.ResourceID {
+		return nil, false, syscall.EAGAIN
+	}
 	if err == nil && before != nil && committed.committedRevision > 0 && before.Revision > committed.committedRevision {
 		return nil, false, errFtruncateRemoteAdvanced
 	}
@@ -511,7 +514,8 @@ func (fs *Dat9FS) readFtruncateObserverCommitted(ctx context.Context, fh *FileHa
 		return nil, ranged, syscall.EAGAIN
 	}
 	after, err := fs.client.StatCtx(ctx, path)
-	if err != nil || after == nil || after.Revision != before.Revision || after.Size != before.Size {
+	if err != nil || after == nil || after.Revision != before.Revision || after.Size != before.Size ||
+		(before.ResourceID != "" && after.ResourceID != before.ResourceID) {
 		return nil, ranged, syscall.EAGAIN
 	}
 	return data, ranged, nil

@@ -284,6 +284,15 @@ func (fs *Dat9FS) prepareFtruncateMutationLocked(ctx context.Context, fh *FileHa
 	if event.ino != fh.Ino || event.path != fh.Path || event.view != fs.mountViewGeneration.Load() || !fs.ftruncateAliasLinked(fh) {
 		return syscall.EAGAIN
 	}
+	// A settled large image needs no bounded writable ancestry. Rebind a clean
+	// alias only after the existing retirement checks verify its remote baseline.
+	fs.dirtyMu.Lock()
+	committed := fs.mutationInodes[fh.Ino]
+	fs.dirtyMu.Unlock()
+	if committed.committedSeq >= event.seq && committed.committedSize > maxLandedPayloadBytes && fs.handleCanAdoptCommittedRevisionLocked(fh) &&
+		(!ftruncateDescends(fh, event.id) || fh.BaseRev < committed.committedRevision) {
+		return fs.retireCommittedFtruncateLocked(ctx, fh, event)
+	}
 	if _, err := fs.adoptLandedFtruncateLocked(ctx, fh); err != nil {
 		return err
 	}

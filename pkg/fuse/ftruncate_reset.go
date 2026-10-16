@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"fmt"
 	"syscall"
 	"time"
 
@@ -47,6 +48,7 @@ func (fs *Dat9FS) retireCommittedFtruncateLocked(ctx context.Context, fh *FileHa
 	if committed.committedSeq < event.seq || committed.committedRevision <= 0 {
 		return syscall.EAGAIN
 	}
+	var busySource *FileHandle
 	settled := func() bool {
 		current, exists := fs.inodes.GetEntry(fh.Ino)
 		if !exists || current.ResourceID != entry.ResourceID {
@@ -78,6 +80,7 @@ func (fs *Dat9FS) retireCommittedFtruncateLocked(ctx context.Context, fh *FileHa
 				continue
 			}
 			if !other.TryLock() {
+				busySource = other
 				return false
 			}
 			pending := other.DirtySeq > committed.committedSeq || (other.DirtySeq == 0 && other.Dirty != nil && other.Dirty.HasDirtyParts())
@@ -89,13 +92,17 @@ func (fs *Dat9FS) retireCommittedFtruncateLocked(ctx context.Context, fh *FileHa
 		return true
 	}
 	if !settled() {
+		if busySource != nil {
+			return fmt.Errorf("%w: %w", errFtruncateBusy, &appendRefreshSourceBusy{source: busySource})
+		}
 		return errFtruncateBusy
 	}
 	stat, err := fs.client.StatCtx(ctx, fs.remotePath(fh.Path))
 	if err != nil {
 		return err
 	}
-	if stat == nil || stat.ResourceID != entry.ResourceID || stat.Revision < committed.committedRevision || stat.Size < 0 {
+	if stat == nil || stat.ResourceID != entry.ResourceID || stat.Revision < committed.committedRevision || stat.Size < 0 ||
+		(stat.Revision == committed.committedRevision && stat.Size != committed.committedSize) {
 		return syscall.EAGAIN
 	}
 	failpoint.InjectCall("ftruncateResetVerified", fs, fh)
@@ -104,6 +111,9 @@ func (fs *Dat9FS) retireCommittedFtruncateLocked(ctx context.Context, fh *FileHa
 	}
 	defer fs.mountViewMu.RUnlock()
 	if !settled() {
+		if busySource != nil {
+			return fmt.Errorf("%w: %w", errFtruncateBusy, &appendRefreshSourceBusy{source: busySource})
+		}
 		return syscall.EAGAIN
 	}
 	if !fh.pendingFtruncate.CompareAndSwap(event, nil) {

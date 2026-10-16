@@ -9835,7 +9835,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					return st
 				}
 				var committedRevision int64
-				if newSize == 0 && entry.Revision > previousRevision {
+				if entry.Revision > previousRevision {
 					committedRevision = entry.Revision
 				}
 				// Path-based truncate(path, size) truncates the remote file but
@@ -15192,6 +15192,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 	mutationIno := fh.Ino
 	mutationSeq := fh.DirtySeq
 	mutationSize := fh.Dirty.Size()
+	mutationTruncate := fs.ftruncateParticipates(fh)
 
 	size := fh.Dirty.Size()
 	if fs.layerEnabled() {
@@ -15218,10 +15219,17 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 	mutationUploadCommitted := false
 	var mutationCommittedRevision int64
 	var mutationProof pathCommitLandmark
-	if fs.ftruncateParticipates(fh) && fh.LineageTrusted && mutationSize <= maxLandedPayloadBytes && writeBufferHasLoadedFullRange(fh.Dirty) {
+	captureMutationProof := func(data []byte) {
+		if !mutationTruncate || !fh.LineageTrusted || mutationSize > maxLandedPayloadBytes ||
+			fh.Path != mutationPath || fh.DirtySeq != mutationSeq || int64(len(data)) != mutationSize {
+			return
+		}
 		mutationProof.snapshotID, _ = ensureStagedSnapshotLineageLocked(fh)
 		mutationProof.ancestors = append([]string(nil), fh.stagedAncestors...)
-		mutationProof.checksum = payloadChecksum(fh.Dirty.bytesView())
+		mutationProof.checksum = payloadChecksum(data)
+	}
+	if mutationSize <= maxLandedPayloadBytes && writeBufferHasLoadedFullRange(fh.Dirty) {
+		captureMutationProof(fh.Dirty.bytesView())
 	}
 	recordMutationBeforeFenceRelease := func() {
 		if mutationRecorded || !mutationUploadCommitted || mutationSeq == 0 ||
@@ -15231,6 +15239,11 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		// The cached path revision may precede this upload. Use its actual
 		// result when available, otherwise resolve from the captured CAS base.
 		revision := fs.resolveCommittedMutationRevision(mutationPath, mutationCommittedRevision, mutationExpectedRevision)
+		if mutationTruncate && fs.commitQueue == nil {
+			proof := mutationProof
+			proof.rev, proof.size = revision, mutationSize
+			fs.recordCommittedAppendSnapshot(mutationPath, proof)
+		}
 		if fs.commitQueue != nil {
 			fs.commitQueue.rememberLanded(mutationPath, revision, mutationSize, mutationProof.checksum, mutationProof.snapshotID, mutationProof.ancestors...)
 		}
@@ -15350,6 +15363,9 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		phase = "upload-all"
 		if !fs.materializeFullForUploadLocked(fh) {
 			return gofuse.EIO
+		}
+		if mutationSize <= maxLandedPayloadBytes {
+			captureMutationProof(fh.Dirty.bytesView())
 		}
 		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		numParts := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
@@ -15472,15 +15488,30 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		// direct-PUT / B11 growth guards already exclude PATCH.
 		usePatch = false
 	}
+	// A bounded truncate needs an immutable full image for its proof.
+	// A size-only patch may have no dirty parts and perform no upload.
+	if mutationTruncate && mutationSize <= maxLandedPayloadBytes {
+		usePatch = false
+	}
 
 	// Prepare patch snapshots while we still hold the lock.
 	var dirtyParts []int
 	var partSnapshots map[int][]byte
+	var unchangedTruncatePart int
 	if usePatch {
 		dirtyParts = fh.Dirty.DirtyPartNumbers()
+		if mutationTruncate && len(dirtyParts) == 0 {
+			// PATCH needs a part even for a size-only mutation. Its actual
+			// completion must precede publication of the new truncate revision.
+			unchangedTruncatePart = int((size-1)/handleDirtyPartSize) + 1
+			dirtyParts = []int{unchangedTruncatePart}
+		}
 		if len(dirtyParts) > 0 {
 			partSnapshots = make(map[int][]byte, len(dirtyParts))
 			for _, pn := range dirtyParts {
+				if pn == unchangedTruncatePart && !fh.Dirty.IsPartLoaded(pn-1) {
+					continue // PartData would invent zeroes; use the PATCH read URL.
+				}
 				src := fh.Dirty.PartData(pn)
 				if src != nil {
 					cp := make([]byte, len(src))
@@ -15518,6 +15549,9 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		copy(dataCopy, fh.Dirty.bytesView())
 	}
 
+	if !usePatch {
+		captureMutationProof(dataCopy)
+	}
 	var capturedAppendProof pathCommitLandmark
 	if fs.commitQueue == nil && !usePatch && (fh.appendSnapshot || fh.Flags&uint32(syscall.O_APPEND) != 0) {
 		capturedAppendProof.size = size
@@ -15599,6 +15633,9 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 				func(partNumber int, partSize int64, origData []byte) ([]byte, error) {
 					if d, ok := partSnapshots[partNumber]; ok {
 						return d, nil
+					}
+					if partNumber == unchangedTruncatePart && int64(len(origData)) != partSize {
+						return nil, fmt.Errorf("missing retained truncate part %d", partNumber)
 					}
 					return origData, nil
 				},
