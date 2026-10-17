@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"syscall"
 	"testing"
 	"time"
 
@@ -8,6 +9,39 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
+
+func TestOpenHandleIndexFtruncateInheritanceByInode(t *testing.T) {
+	idx := NewOpenHandleIndex()
+	add := func(ino uint64, flags uint32, event *ftruncateInheritance) {
+		fh := &FileHandle{Ino: ino, Path: "/old", Flags: flags}
+		idx.Add(fh)
+		fh.pendingFtruncate.Store(event)
+	}
+	older := &ftruncateInheritance{ino: 7, path: "/old", view: 3, seq: 1, revision: 4, id: "older", data: []byte("old"), complete: true}
+	latest := &ftruncateInheritance{ino: 7, path: "/old", view: 3, seq: 2, revision: 4, id: "newest", data: []byte("hello"), complete: true, ancestors: []string{"older"}}
+	add(7, syscall.O_RDWR, older)
+	add(7, syscall.O_RDWR, latest)
+	add(8, syscall.O_RDWR, &ftruncateInheritance{ino: 8, path: "/new", seq: 100, id: "different-inode"})
+	add(7, syscall.O_RDONLY, &ftruncateInheritance{ino: 7, path: "/new", seq: 99, id: "readonly"})
+	got := idx.ftruncateInheritance(7, "/new")
+	if got == nil || got.id != latest.id || got.path != "/new" || got.ino != 7 || got.view != 3 || got.seq != 2 || got.revision != 4 || string(got.data) != "hello" || !got.complete || len(got.ancestors) != 1 {
+		t.Fatalf("bad rebound event: %+v", got)
+	}
+	if got == latest || latest.path != "/old" {
+		t.Fatal("lookup reused or modified published event")
+	}
+	got.path = "/caller-mutated"
+	if latest.path != "/old" {
+		t.Fatal("copy aliases mutable path field")
+	}
+	add(7, syscall.O_RDWR, &ftruncateInheritance{ino: 99, path: "/new", seq: 101, id: "invalid-event-inode"})
+	if event := idx.ftruncateInheritance(7, "/new"); event == nil || event.id != latest.id {
+		t.Fatalf("accepted wrong-inode event: %+v", event)
+	}
+	if event := idx.ftruncateInheritance(1234, "/new"); event != nil {
+		t.Fatalf("missing inode acquired event: %+v", event)
+	}
+}
 
 func TestOpenHandleIndexTracksByInodeAndPath(t *testing.T) {
 	idx := NewOpenHandleIndex()

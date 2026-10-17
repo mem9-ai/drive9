@@ -13,16 +13,18 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
-// pathCommitLandmark is the last exact snapshot this queue itself landed for
+// pathCommitLandmark is the last exact snapshot this mount itself landed for
 // a path. It is never persisted: after restart there is no safe causal proof
 // between mutable shadow bytes and recovered metadata.
 type pathCommitLandmark struct {
-	rev        int64
-	size       int64
-	checksum   string
-	snapshotID string
-	ancestors  []string
-	lastUsed   uint64
+	rev           int64
+	size          int64
+	checksum      string
+	snapshotID    string
+	ancestors     []string
+	lastUsed      uint64
+	retiredRead   *retiredReadPublication // selected upload source, never writable lineage
+	readActualRev int64
 }
 
 const (
@@ -43,6 +45,9 @@ func snapshotAncestors(parent string, inherited []string) []string {
 // discardLandedAncestor acknowledges an exact ancestor already superseded by
 // this process's verified remote image. Byte prefixes alone cannot prove this.
 func (cq *CommitQueue) discardLandedAncestor(ctx context.Context, entry *CommitEntry) bool {
+	if entry != nil && entry.ftruncateValid != nil && !entry.ftruncateValid() {
+		return false
+	}
 	if entry == nil || entry.recovered || !entry.liveLineageProof || entry.SnapshotID == "" ||
 		shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 		return false

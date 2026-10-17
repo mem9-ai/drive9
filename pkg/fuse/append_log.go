@@ -301,7 +301,7 @@ func appendLogSnapshotSQLiteWALHeader(snapshot *appendLogSnapshot) (sqliteWALHea
 	return parseSQLiteWALHeader(raw[:])
 }
 
-func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) appendLogAttemptResult {
+func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle, lockState ...*handleLockState) appendLogAttemptResult {
 	if !fs.appendLogEligibleLocked(fh) {
 		return appendLogAttemptResult{route: appendLogRouteNotApplicable, status: gofuse.OK}
 	}
@@ -332,7 +332,7 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 			// No committed object exists for a remote chmod yet.
 			return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 		}
-		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+		if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
 			safeLogPrintf("append-log pending chmod failed for %s: %v", snapshotPath, err)
 			return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 		}
@@ -367,7 +367,8 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 
 	result := client.AppendLogResult{Revision: committedRevision, Size: committedSize}
 	if !alreadyCommitted {
-		fh.Unlock()
+		closeReceipt := fs.captureReleaseCommitLocked(fh, expectedRevision, lockState)
+		unlockHandleForIO(fh, lockState)
 		result, err = appendOnce(expectedRevision)
 		if appendLogErrorCode(err) == client.AppendLogCodeRebased {
 			stat, statErr := fs.client.StatCtx(ctx, fs.remotePath(snapshotPath))
@@ -382,7 +383,10 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 				// not publish it into fh.appendLog until fh.mu is reacquired:
 				// a concurrent Write may have advanced the dirty generation while
 				// StatCtx ran, including through the bounded path-lock fallback.
-				fh.Lock()
+				if lockErr := relockHandleAfterIO(ctx, fh, lockState); lockErr != nil {
+					unlockRemoteCommit()
+					return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(lockErr)}
+				}
 				if fh.Unlinked || fh.Path != snapshotPath || fh.DirtySeq != snapshotDirtySeq ||
 					fh.IsNew != snapshotIsNew || fh.BaseRev != expectedRevision || fh.OrigSize != expectedSize {
 					unlockRemoteCommit()
@@ -393,11 +397,14 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 				fh.appendLog.rewriteBaseSize = stat.Size
 				fh.appendLog.hasRewriteBase = true
 				fs.recordAppendLogRebaseRetry()
-				fh.Unlock()
+				unlockHandleForIO(fh, lockState)
 				result, err = appendOnce(stat.Revision)
 			}
 		}
 		if err == nil {
+			if result.Size == snapshotSize {
+				closeReceipt.complete(result.Revision)
+			}
 			if snapshotIsNew {
 				fs.replaceCommittedRevisionWithSize(snapshotPath, result.Revision, result.Size)
 			} else {
@@ -410,7 +417,9 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 			fs.recordAppendLogCommittedGeneration(snapshotIno, snapshotDirtySeq, result.Revision, result.Size)
 		}
 		unlockRemoteCommit()
-		fh.Lock()
+		if lockErr := relockHandleAfterIO(ctx, fh, lockState); lockErr != nil {
+			return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(lockErr)}
+		}
 	} else {
 		unlockRemoteCommit()
 	}
@@ -484,7 +493,7 @@ func (fs *Dat9FS) tryAppendLogLocked(ctx context.Context, fh *FileHandle) append
 			_ = reader.Close()
 		}
 	}
-	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+	if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
 		safeLogPrintf("append-log pending chmod failed for %s: %v", snapshotPath, err)
 		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 	}
@@ -690,7 +699,7 @@ func (fs *Dat9FS) rotateAppendLogGenerationShadowLocked(fh *FileHandle, path str
 
 // tryAppendLogGenerationResetLocked turns a proven SQLite WAL header-only
 // recycle into a new 32-byte append-log generation. Callers hold fh.Lock().
-func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *FileHandle) appendLogAttemptResult {
+func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *FileHandle, lockState ...*handleLockState) appendLogAttemptResult {
 	if fs == nil || fs.client == nil || fh == nil || fh.Dirty == nil || fh.IsNew || !fs.appendLogConfiguredLocked(fh) {
 		return appendLogAttemptResult{route: appendLogRouteNotApplicable, status: gofuse.OK}
 	}
@@ -716,7 +725,7 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 	remoteCommitLockWait := time.Since(remoteCommitLockStarted)
 	if fs.applySQLiteZeroTruncateLocked(fh) {
 		unlockRemoteCommit()
-		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+		if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
 			safeLogPrintf("append-log generation-reset pending chmod failed for %s: %v", snapshotPath, err)
 			return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 		}
@@ -831,14 +840,14 @@ func (fs *Dat9FS) tryAppendLogGenerationResetLocked(ctx context.Context, fh *Fil
 		// by the FSYNC request itself.
 		fs.notifyInode(fh.Ino)
 	}
-	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+	if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
 		safeLogPrintf("append-log generation-reset pending chmod failed for %s: %v", snapshotPath, err)
 		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 	}
 	return appendLogAttemptResult{route: appendLogRouteCommitted, status: gofuse.OK}
 }
 
-func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHandle) appendLogAttemptResult {
+func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHandle, lockState ...*handleLockState) appendLogAttemptResult {
 	if fs == nil || fs.client == nil || fh == nil || fh.Dirty == nil || fh.IsNew {
 		return appendLogAttemptResult{route: appendLogRouteNotApplicable, status: gofuse.OK}
 	}
@@ -856,7 +865,7 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 	remoteCommitLockWait := time.Since(remoteCommitLockStarted)
 	if fs.applySQLiteZeroTruncateLocked(fh) {
 		unlockRemoteCommit()
-		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+		if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
 			safeLogPrintf("append-log full-rewrite pending chmod failed for %s: %v", snapshotPath, err)
 			return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 		}
@@ -909,13 +918,15 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 			unlockRemoteCommit()
 			return appendLogAttemptResult{route: appendLogRouteFailed, status: gofuse.EIO}
 		}
-		fh.Unlock()
+		closeReceipt := fs.captureReleaseCommitLocked(fh, expectedRevision, lockState)
+		unlockHandleForIO(fh, lockState)
 		writeStart := fs.perfStart()
 		revision, err = fs.client.WriteServerStreamConditional(ctx, fs.remotePath(snapshotPath), reader, snapshot.Size(), expectedRevision)
 		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(snapshot.Size()))
 		fs.recordAppendLogFullRewrite(uint64(snapshot.Size()))
 		_ = reader.Close()
 		if err == nil {
+			closeReceipt.complete(revision)
 			fs.recordCommittedRevisionWithSize(snapshotPath, revision, snapshot.Size())
 			if !snapshotOwnsShadow && fs.shadowStore != nil {
 				fs.shadowStore.Remove(snapshotPath)
@@ -924,7 +935,9 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 			fs.recordAppendLogCommittedGeneration(snapshotIno, snapshotDirtySeq, revision, snapshot.Size())
 		}
 		unlockRemoteCommit()
-		fh.Lock()
+		if lockErr := relockHandleAfterIO(ctx, fh, lockState); lockErr != nil {
+			return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(lockErr)}
+		}
 	} else {
 		unlockRemoteCommit()
 	}
@@ -984,7 +997,7 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 			_ = reader.Close()
 		}
 	}
-	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+	if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
 		safeLogPrintf("append-log full-rewrite pending chmod failed for %s: %v", snapshotPath, err)
 		return appendLogAttemptResult{route: appendLogRouteFailed, status: httpToFuseStatus(err)}
 	}
@@ -994,6 +1007,7 @@ func (fs *Dat9FS) tryAppendLogFullRewriteLocked(ctx context.Context, fh *FileHan
 // invalidateAppendLogReadTargets drops prefetched bytes independently of the
 // sibling handle lock, as resetMountView does. A busy reader must not retain
 // cached bytes just because the best-effort ReadTarget clear skips its lock.
+
 func (fs *Dat9FS) invalidateAppendLogReadTargets(path string, skip *FileHandle, size int64) {
 	for _, fh := range fs.openHandles.SnapshotPath(path) {
 		if fh != nil && fh != skip && fh.Prefetch != nil {
@@ -1007,27 +1021,27 @@ func (fs *Dat9FS) invalidateAppendLogReadTargets(path string, skip *FileHandle, 
 // generic upload selection. A false handled result leaves legacy routing in
 // control only when append-log has no applicable transport (for example an
 // existing single-layout file).
-func (fs *Dat9FS) routeAppendLogLocked(ctx context.Context, fh *FileHandle) (handled bool, status gofuse.Status, fullRewrite bool) {
+func (fs *Dat9FS) routeAppendLogLocked(ctx context.Context, fh *FileHandle, lockState ...*handleLockState) (handled bool, status gofuse.Status, fullRewrite bool) {
 	if !fs.appendLogConfiguredLocked(fh) {
 		return false, gofuse.OK, false
 	}
 	if fh.Dirty == nil || (!fh.IsNew && !fh.Dirty.HasDirtyParts()) {
 		if fh.HasPendingMode {
-			if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-				safeLogPrintf("append-log pending chmod retry failed for %s: %v", fh.Path, err)
+			if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
+				safeLogPrintf("append-log pending chmod retry failed: %v", err)
 				return true, httpToFuseStatus(err), false
 			}
 			return true, gofuse.OK, false
 		}
 		return false, gofuse.OK, false
 	}
-	reset := fs.tryAppendLogGenerationResetLocked(ctx, fh)
+	reset := fs.tryAppendLogGenerationResetLocked(ctx, fh, lockState...)
 	if reset.route != appendLogRouteNotApplicable {
 		return true, reset.status, true
 	}
 	capabilityEnabled := fs.client != nil && fs.client.CachedAppendLogSupported()
 	if capabilityEnabled && fh.appendLogCanUseTail() {
-		result := fs.tryAppendLogLocked(ctx, fh)
+		result := fs.tryAppendLogLocked(ctx, fh, lockState...)
 		switch result.route {
 		case appendLogRouteCommitted, appendLogRouteFailed:
 			return true, result.status, false
@@ -1036,7 +1050,7 @@ func (fs *Dat9FS) routeAppendLogLocked(ctx context.Context, fh *FileHandle) (han
 		}
 	}
 	if !fh.IsNew && (!capabilityEnabled || !fh.appendLogCanUseTail()) {
-		result := fs.tryAppendLogFullRewriteLocked(ctx, fh)
+		result := fs.tryAppendLogFullRewriteLocked(ctx, fh, lockState...)
 		if result.route != appendLogRouteNotApplicable {
 			return true, result.status, true
 		}
@@ -1048,14 +1062,15 @@ func (fs *Dat9FS) routeAppendLogLocked(ctx context.Context, fh *FileHandle) (han
 // append_log_unsupported response from a generic PATCH/V2/direct-upload plan.
 // That response proves the target layout and permits one full-PUT reroute; it
 // must never retry the rejected generic plan.
-func (fs *Dat9FS) routeAppendLogGenericUnsupportedLocked(ctx context.Context, fh *FileHandle, snapshotPath string, snapshotDirtySeq uint64, err error) (handled bool, status gofuse.Status) {
+
+func (fs *Dat9FS) routeAppendLogGenericUnsupportedLocked(ctx context.Context, fh *FileHandle, snapshotPath string, snapshotDirtySeq uint64, err error, lockState ...*handleLockState) (handled bool, status gofuse.Status) {
 	if appendLogErrorCode(err) != client.AppendLogCodeUnsupported || fh == nil || fh.Layer == PathLayerLocalOnly || fh.Layer == PathLayerGitWorkspace ||
 		fh.Unlinked || fh.Path != snapshotPath || fh.DirtySeq != snapshotDirtySeq {
 		return false, gofuse.OK
 	}
 	baselineRevision, baselineSize := fh.appendLogCommittedBaseline()
 	fh.appendLogObserveLayout(client.ContentLayoutAppendLog, baselineRevision, baselineSize)
-	result := fs.tryAppendLogFullRewriteLocked(ctx, fh)
+	result := fs.tryAppendLogFullRewriteLocked(ctx, fh, lockState...)
 	if result.route == appendLogRouteNotApplicable {
 		return true, gofuse.EIO
 	}

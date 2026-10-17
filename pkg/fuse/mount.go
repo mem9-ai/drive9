@@ -614,6 +614,7 @@ func Mount(opts *MountOptions) (err error) {
 				uploader := NewWriteBackUploader(c, wbCache, opts.UploadConcurrency, opts.RemoteRoot)
 				uploader.SetPerfCounters(dat9fs.perf)
 				uploader.OnSuccess = dat9fs.onWriteBackUploadSuccess
+				uploader.OnDataCommitted = dat9fs.onWriteBackDataCommitted
 				uploader.SnapshotStagingGens = dat9fs.snapshotStagingGens
 				dat9fs.SetWriteBack(wbCache, uploader)
 				// Recover pending uploads only when the newer commit queue is
@@ -989,7 +990,7 @@ func Mount(opts *MountOptions) (err error) {
 		exitRec.Code = ExitForceQuit
 		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
 		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=%d reason=drain_failed mountpoint=%s\n", ExitForceQuit, opts.MountPoint)
-		return newMountExit(ExitForceQuit, MountExitReason("drain_failed"), "shutdown incomplete; local recovery state preserved", shutdownErr)
+		return newMountExit(ExitForceQuit, MountExitReason("drain_failed"), "shutdown incomplete; uncommitted handle data may remain only in memory", shutdownErr)
 	}
 
 	switch reason {

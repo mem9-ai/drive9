@@ -177,10 +177,10 @@ func (fs *Dat9FS) uploadCloseSyncCreateWithMode(ctx context.Context, localPath s
 // finishPendingModeForHandleLocked, so this second ownership check is required.
 // The confirmed revision must survive a later chmod failure so retry uses CAS
 // against this commit rather than attempting another create-only upload.
-func (fs *Dat9FS) adoptCombinedCommitLocked(fh *FileHandle, path string, mutationSeq uint64, size int64, result closeSyncUploadResult) bool {
+func (fs *Dat9FS) adoptCombinedCommitLocked(ctx context.Context, fh *FileHandle, path string, mutationSeq uint64, size int64, result closeSyncUploadResult, lockState ...*handleLockState) (bool, error) {
 	if result.outcome != closeSyncUploadContentAndModeCommitted {
 		// Ordinary and fallback uploads acknowledge content only.
-		return true
+		return true, nil
 	}
 	fh.IsNew = false
 	fh.BaseRev = result.revision
@@ -192,6 +192,8 @@ func (fs *Dat9FS) adoptCombinedCommitLocked(fh *FileHandle, path string, mutatio
 		fh.HasPreviousMode = true
 		fh.PreviousModeKnown = true
 	}
-	fs.finishPendingModeForHandleLocked(fh, mode.mode, mode.generation)
-	return !fh.Unlinked && fh.Path == path && fh.DirtySeq == mutationSeq
+	if err := fs.finishPendingModeForHandleLocked(ctx, fh, mode.mode, mode.generation, lockState...); err != nil {
+		return false, err
+	}
+	return !fh.Unlinked && fh.Path == path && fh.DirtySeq == mutationSeq, nil
 }
