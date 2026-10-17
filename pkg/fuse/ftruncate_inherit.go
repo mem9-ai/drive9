@@ -265,6 +265,9 @@ func (fs *Dat9FS) installFtruncateImageLocked(fh *FileHandle, data []byte, revis
 }
 
 func (fs *Dat9FS) prepareFtruncateMutationLocked(ctx context.Context, fh *FileHandle) error {
+	if _, err := fs.consumeReleaseCommitLocked(fh); err != nil {
+		return err
+	}
 	if fh != nil {
 		if err := fs.recoverFtruncateViewLocked(ctx, fh); err != nil {
 			return err
@@ -443,7 +446,17 @@ func (cq *CommitQueue) ownsFtruncateSnapshot(meta *WriteBackMeta) bool {
 	return false
 }
 
-func (fs *Dat9FS) prepareFtruncateCommitLocked(ctx context.Context, fh *FileHandle, strict bool) (bool, error) {
+func (fs *Dat9FS) prepareFtruncateCommitLocked(ctx context.Context, fh *FileHandle, strict bool, lockState ...*handleLockState) (bool, error) {
+	if handled, err := fs.consumeReleaseCommitLocked(fh); handled || err != nil {
+		if err != nil || !fh.HasPendingMode {
+			return handled, err
+		}
+		if err := fs.applyPendingModeForHandleLocked(ctx, fh, lockState...); err != nil {
+			return true, err
+		}
+		_, err = fs.consumeReleaseCommitLocked(fh)
+		return true, err
+	}
 	if !fs.ftruncateParticipates(fh) {
 		return false, nil
 	}
@@ -515,16 +528,24 @@ func (fs *Dat9FS) lockFtruncateWritableOpen(ino uint64, path string) (func(), bo
 // Release cannot return EAGAIN to the kernel or abandon its only dirty image.
 // Yield the handle while a participating operation owns a lock; no queued work
 // is canceled and callbacks are free to finish before we retry the handoff.
-func (fs *Dat9FS) prepareFtruncateReleaseLocked(ctx context.Context, fh *FileHandle) (bool, error) {
+func (fs *Dat9FS) prepareFtruncateReleaseLocked(ctx context.Context, fh *FileHandle, state *handleLockState) (bool, error) {
 	for {
-		handled, err := fs.prepareFtruncateCommitLocked(ctx, fh, false)
+		if err := ctx.Err(); err != nil {
+			return true, err
+		}
+		handled, err := fs.prepareFtruncateCommitLocked(ctx, fh, false, state)
+		if !state.held {
+			return true, err
+		}
+		if handled && err != nil && fh.HasPendingMode && fh.releaseCommit != nil && fh.releaseCommit.revision.Load() > 0 {
+			// The payload is already acknowledged. Keep the permission owner;
+			// do not replace its staging merely because the chmod retry failed.
+			return true, err
+		}
 		if !errors.Is(err, errFtruncateBusy) {
 			if err != nil && fh.Dirty != nil && fh.Dirty.HasDirtyParts() && fs.shadowStore != nil && fs.pendingIndex != nil {
 				if fenceErr := fs.fenceFtruncateLocked(fh); errors.Is(fenceErr, errFtruncateBusy) {
-					fh.Unlock()
-					time.Sleep(samePathDirtyWaitInterval)
-					fh.Lock()
-					continue
+					goto waitForOwner
 				} else if fenceErr != nil {
 					return true, fenceErr
 				}
@@ -543,10 +564,17 @@ func (fs *Dat9FS) prepareFtruncateReleaseLocked(ctx context.Context, fh *FileHan
 			}
 			return handled, err
 		}
+	waitForOwner:
 		failpoint.InjectCall("ftruncateReleaseWait", fs, fh)
+		fs.releaseHandleRemoteCommitPathLocked(fh)
+		state.held = false
 		fh.Unlock()
-		time.Sleep(samePathDirtyWaitInterval)
-		fh.Lock()
+		if err := waitHandleRetry(ctx, state.deadline); err != nil {
+			return true, err
+		}
+		if err := state.lock(ctx, fh); err != nil {
+			return true, err
+		}
 	}
 }
 
@@ -683,17 +711,24 @@ func (fs *Dat9FS) readReleasedFtruncateOnceLocked(fh *FileHandle, offset int64, 
 // A final close can race the alias child's Release between durable staging
 // and queue ownership. Yield the parent handle through that short handoff;
 // do not return a transient lock collision as a failed close to the kernel.
-func (fs *Dat9FS) prepareFtruncateFlushLocked(ctx context.Context, fh *FileHandle) (bool, error) {
+func (fs *Dat9FS) prepareFtruncateFlushLocked(ctx context.Context, fh *FileHandle, locked *bool) (bool, error) {
 	handled, err := fs.prepareFtruncateCommitLocked(ctx, fh, false)
-	if !errors.Is(err, errFtruncateBusy) || len(fs.ftruncateAliasPaths(fh.Ino)) <= 1 {
+	if !errors.Is(err, errFtruncateBusy) {
 		return handled, err
 	}
 	deadline := time.Now().Add(samePathDirtyWaitTimeout)
 	for errors.Is(err, errFtruncateBusy) && time.Now().Before(deadline) && ctx.Err() == nil {
 		failpoint.InjectCall("ftruncateAliasFlushWait", fs, fh)
+		fs.releaseHandleRemoteCommitPathLocked(fh)
+		*locked = false
 		fh.Unlock()
-		time.Sleep(samePathDirtyWaitInterval)
-		fh.Lock()
+		if waitErr := waitHandleRetry(ctx, deadline); waitErr != nil {
+			return true, waitErr
+		}
+		if lockErr := lockHandleWithContext(ctx, fh, deadline); lockErr != nil {
+			return true, lockErr
+		}
+		*locked = true
 		handled, err = fs.prepareFtruncateCommitLocked(ctx, fh, false)
 	}
 	return handled, err

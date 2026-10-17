@@ -99,10 +99,10 @@ func TestReadDirPlusBusyTruncatePagination(t *testing.T) {
 					t.Fatal("fixture did not reach busy size selection")
 				}
 				attrs, offset, status := readBusyDirPlusPage(t, fs, handle, 0)
-				wantOffset := uint64(2)
-				wantCount := 2
+				wantOffset := uint64(3)
+				wantCount := 3
 				if prefix {
-					wantOffset, wantCount = 3, 3
+					wantOffset, wantCount = 4, 4
 					if attrs["a-ready"].NodeId != ready || attrs["a-ready"].Size != 7 {
 						t.Fatal("valid prefix changed")
 					}
@@ -110,14 +110,14 @@ func TestReadDirPlusBusyTruncatePagination(t *testing.T) {
 				if status != gofuse.OK || offset != wantOffset || len(attrs) != wantCount {
 					t.Fatalf("partial page status=%v offset=%d entries=%v", status, offset, attrs)
 				}
-				if _, emitted := attrs["file.bin"]; emitted {
-					t.Fatal("busy child published attributes")
+				if attr, emitted := attrs["file.bin"]; !emitted || attr != (gofuse.EntryOut{}) {
+					t.Fatal("busy child must publish only its name, without attributes or identity")
 				}
 				if attrs["."].NodeId != gofuse.FUSE_UNKNOWN_INO || attrs[".."].NodeId != gofuse.FUSE_UNKNOWN_INO {
 					t.Fatal("dots acquired inode identity")
 				}
 				attrs, next, status := readBusyDirPlusPage(t, fs, handle, offset)
-				if status != gofuse.EAGAIN || next != offset || len(attrs) != 0 {
+				if status != gofuse.OK || next != offset || len(attrs) != 0 {
 					t.Fatalf("empty busy page=%v offset=%d entries=%v", status, next, attrs)
 				}
 				after, _ := fs.inodes.GetEntry(ino)
@@ -127,8 +127,8 @@ func TestReadDirPlusBusyTruncatePagination(t *testing.T) {
 				}
 				writer.Unlock()
 				locked = false
-				attrs, next, status = readBusyDirPlusPage(t, fs, handle, offset)
-				if status != gofuse.OK || next != offset+1 || len(attrs) != 1 || attrs["file.bin"].NodeId != ino || attrs["file.bin"].Size != 5 {
+				attrs, next, status = readBusyDirPlusPage(t, fs, handle, offset-1)
+				if status != gofuse.OK || next != offset || len(attrs) != 1 || attrs["file.bin"].NodeId != ino || attrs["file.bin"].Size != 5 {
 					t.Fatalf("retry=%v offset=%d attributes=%v", status, next, attrs)
 				}
 				after, _ = fs.inodes.GetEntry(ino)

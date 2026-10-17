@@ -37,9 +37,14 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	if lockWait := time.Since(lockStart); fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 		fs.debugf("flush lock wait path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, lockWait)
 	}
-	defer fh.Unlock()
+	handleLocked := true
 	defer func() {
-		if !fs.debugEnabled() {
+		if handleLocked {
+			fh.Unlock()
+		}
+	}()
+	defer func() {
+		if !handleLocked || !fs.debugEnabled() {
 			return
 		}
 		var size int64
@@ -100,9 +105,13 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		return gofuse.OK
 	}
 	if fs.ftruncateParticipates(fh) {
-		defer fs.releaseHandleRemoteCommitPathLocked(fh)
+		defer func() {
+			if handleLocked {
+				fs.releaseHandleRemoteCommitPathLocked(fh)
+			}
+		}()
 	}
-	if handled, err := fs.prepareFtruncateFlushLocked(ctx, fh); handled || err != nil {
+	if handled, err := fs.prepareFtruncateFlushLocked(ctx, fh, &handleLocked); handled || err != nil {
 		return httpToFuseStatus(err)
 	}
 	if fs.discardSupersededMutationLocked(fh) {

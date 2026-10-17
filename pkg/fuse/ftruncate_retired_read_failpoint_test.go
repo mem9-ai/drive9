@@ -14,10 +14,12 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/pingcap/failpoint"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 func TestRetiredFtruncateReadRevalidates(t *testing.T) {
-	for _, mode := range []string{"view", "event", "identity", "path", "buffer", "version", "commit", "shadow", "pending"} {
+	for _, mode := range []string{"view", "event", "identity", "path", "buffer", "version", "commit", "shadow", "pending", "sse"} {
 		t.Run(mode, func(t *testing.T) {
 			target := 9 << 20
 			if mode == "shadow" || mode == "pending" {
@@ -50,6 +52,8 @@ func TestRetiredFtruncateReadRevalidates(t *testing.T) {
 				// Synthetic invalidations exercise the actual return boundary;
 				// ordinary same-handle changes are serialized by fh.mu.
 				switch mode {
+				case "sse":
+					(&SSEWatcher{fs: fs, actor: "local"}).handleEvent(&client.ChangeEvent{Path: h.Path, Op: "write", Actor: "external"}, nil)
 				case "view":
 					fs.mountViewGeneration.Add(1)
 				case "event":

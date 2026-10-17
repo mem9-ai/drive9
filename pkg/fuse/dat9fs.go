@@ -3363,7 +3363,10 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 // applyPendingModeForHandleLocked applies a deferred chmod after the data
 // upload has succeeded. Caller must hold fh.mu; this method drops it around
 // the network request and re-acquires it before returning.
-func (fs *Dat9FS) applyPendingModeForHandleLocked(ctx context.Context, fh *FileHandle) error {
+func (fs *Dat9FS) applyPendingModeForHandleLocked(ctx context.Context, fh *FileHandle, lockState ...*handleLockState) error {
+	if len(lockState) != 0 {
+		return fs.applyPendingModeBudgetedLocked(ctx, fh, lockState[0])
+	}
 	mode, hasMode := fs.modeForPendingHandle(fh)
 	if !hasMode {
 		return nil
@@ -3398,23 +3401,41 @@ func (fs *Dat9FS) applyPendingModeForHandleLocked(ctx context.Context, fh *FileH
 		}
 		return err
 	}
-	fs.finishPendingModeForHandleLocked(fh, mode, modeGen)
-	return nil
+	return fs.finishPendingModeForHandleLocked(ctx, fh, mode, modeGen)
 }
 
 // finishPendingModeForHandleLocked acknowledges only the mode generation that
 // actually committed. Like applyPendingModeForHandleLocked it may drop fh.mu
 // while clearing sibling handles, so callers must recheck content/path state.
-func (fs *Dat9FS) finishPendingModeForHandleLocked(fh *FileHandle, mode uint32, modeGen uint64) {
+func (fs *Dat9FS) finishPendingModeForHandleLocked(ctx context.Context, fh *FileHandle, mode uint32, modeGen uint64, lockState ...*handleLockState) error {
 	if !pendingModeMatchesLocked(fh, mode, modeGen) {
-		return
+		return nil
 	}
-	ino := fh.Ino
-	fs.inodes.UpdateMode(ino, mode)
-	clearPendingModeLocked(fh)
-	fh.Unlock()
-	fs.clearPendingModeForInodeGeneration(ino, fh, mode, modeGen)
-	fh.Lock()
+	ino, path := fh.Ino, fh.Path
+	if len(lockState) == 0 {
+		fs.inodes.UpdateMode(ino, mode)
+		clearPendingModeLocked(fh)
+		fh.Unlock()
+		fs.clearPendingModeForInodeGeneration(ino, fh, mode, modeGen)
+		fh.Lock()
+		return nil
+	}
+	unlockHandleForIO(fh, lockState)
+	err := fs.clearPendingModeGenerationWithContext(ctx, ino, fh, mode, modeGen, lockState[0].deadline)
+	if lockErr := relockHandleAfterIO(ctx, fh, lockState); lockErr != nil {
+		return lockErr
+	}
+	if err != nil {
+		return err
+	}
+	if fh.Ino != ino || fh.Path != path || fh.Unlinked {
+		return syscall.EAGAIN
+	}
+	if pendingModeMatchesLocked(fh, mode, modeGen) {
+		fs.inodes.UpdateMode(ino, mode)
+		clearPendingModeLocked(fh)
+	}
+	return nil
 }
 
 func (fs *Dat9FS) applyPendingModeWithTimeoutLocked(fh *FileHandle) error {
@@ -11521,6 +11542,7 @@ func (fs *Dat9FS) finishLocalRenameWithRelease(input *gofuse.RenameIn, oldP, new
 			newParent = parentDir(newP)
 		}
 	}
+	fs.openHandles.invalidateRenameReads(oldP)
 	fs.inodes.Rename(oldP, newP)
 	if release != nil {
 		release()
@@ -12195,12 +12217,15 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 			}
 		}
 		if busy {
-			// Preserve a completed prefix and retry this child at the same cookie.
-			// No attributes or lookup reference for this child have been published.
-			if out.Offset != input.Offset {
-				return gofuse.OK
+			// A zero EntryOut.NodeId emits the name without linking attributes
+			// or acquiring a lookup reference (unlike a zero-nodeid LOOKUP).
+			if out.AddDirLookupEntry(gofuse.DirEntry{Name: e.Name, Off: uint64(i + len(dots) + 1)}) == nil {
+				if out.Offset == input.Offset {
+					return gofuse.EINVAL // An empty success would falsely signal EOF.
+				}
+				break
 			}
-			return gofuse.EAGAIN
+			continue
 		}
 		entryOut := out.AddDirLookupEntry(gofuse.DirEntry{
 			Name: e.Name,
@@ -14082,7 +14107,12 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	if lockWait := time.Since(lockStart); fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 		fs.debugf("write lock wait path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, lockWait)
 	}
-	defer fh.Unlock()
+	handleLocked := true
+	defer func() {
+		if handleLocked {
+			fh.Unlock()
+		}
+	}()
 	if fs.debugEnabled() && strings.HasSuffix(fh.Path, ".db") {
 		mainDBPath := fh.Path
 		mainDBLockWait := time.Since(lockStart)
@@ -14154,6 +14184,19 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		if fh.Flags&uint32(syscall.O_APPEND) != 0 {
 			return fs.tryLockAppendRemoteCommitPathLocked(fh)
 		}
+		// A retired writer can race a still-participating sibling's enqueue.
+		// Do not enter the legacy cancel-and-proceed lock for this inode.
+		if hasRetiredRead(fh) || fs.hasFtruncateInheritance(fh.Ino) {
+			if fh.RemoteCommitUnlock != nil {
+				return func() {}, true
+			}
+			unlock, ok := fs.tryLockRemoteCommitPath(fh.Path)
+			if !ok {
+				return func() {}, false
+			}
+			fh.RemoteCommitUnlock = unlock
+			return func() { fs.releaseHandleRemoteCommitPathLocked(fh) }, true
+		}
 		return fs.lockHandleRemoteCommitPathLocked(fh), true
 	}
 	unlockRemoteCommit := func() {}
@@ -14163,18 +14206,28 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		deadline = time.Now().Add(fs.opts.RemoteCommitWaitTimeout)
 	}
 	for {
-		if fs.commitQueue != nil && fs.commitQueue.hasFtruncateInode(fh.Ino, fs.ftruncateAliasPaths(fh.Ino)) {
-			return 0, gofuse.EAGAIN
+		if fh.Unlinked {
+			if fh.Dirty == nil {
+				return 0, gofuse.EAGAIN
+			}
+			break
 		}
+		refreshErr := errAppendRefreshBusy
 		acquired := true
+		if fs.commitQueue != nil && fs.commitQueue.hasFtruncateInode(fh.Ino, fs.ftruncateAliasPaths(fh.Ino)) {
+			goto appendRefreshRetry
+		}
+		failpoint.InjectCall("ftruncateWriteAdmission", fs, fh)
 		if !fs.ftruncateParticipates(fh) {
 			unlockRemoteCommit, acquired = lockCommitPath()
 		}
-		refreshErr := errAppendRefreshBusy
 		if acquired {
 			// A legacy wait may have admitted a truncate while the lock yielded.
 			if fs.ftruncateParticipates(fh) {
 				if err := fs.fenceFtruncateLocked(fh); err != nil {
+					if errors.Is(err, errFtruncateBusy) {
+						goto appendRefreshRetry
+					}
 					return 0, httpToFuseStatus(err)
 				}
 				unlockRemoteCommit = func() { fs.releaseHandleRemoteCommitPathLocked(fh) }
@@ -14188,8 +14241,8 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 					}
 				}
 				if err := fs.prepareFtruncateMutationLocked(ctx, fh); err != nil {
-					if fh.Flags&uint32(syscall.O_APPEND) != 0 && errors.Is(err, errAppendRefreshBusy) {
-						refreshErr = err
+					if errors.Is(err, errAppendRefreshBusy) || errors.Is(err, errFtruncateBusy) {
+						refreshErr = fmt.Errorf("%w: %w", errAppendRefreshBusy, err)
 						goto appendRefreshRetry
 					}
 					return 0, httpToFuseStatus(err)
@@ -14201,7 +14254,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 				return 0, st
 			}
 			if fs.commitQueue != nil && fs.commitQueue.hasFtruncateInode(fh.Ino, fs.ftruncateAliasPaths(fh.Ino)) {
-				return 0, gofuse.EAGAIN
+				goto appendRefreshRetry
 			}
 			fs.discardSupersededMutationLocked(fh)
 			committedBeforeRefresh := fs.latestCommittedRevision(fh.Path)
@@ -14242,8 +14295,9 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			return 0, gofuse.Status(syscall.EAGAIN)
 		}
 		fs.releaseHandleRemoteCommitPathLocked(fh)
-		fh.Unlock()
 		unlockRemoteCommit = func() {}
+		handleLocked = false
+		fh.Unlock()
 		var sourceBusy *appendRefreshSourceBusy
 		var waitErr error
 		if errors.As(refreshErr, &sourceBusy) {
@@ -14257,7 +14311,10 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			case <-time.After(time.Millisecond):
 			}
 		}
-		fh.Lock()
+		if waitErr == nil {
+			waitErr = lockHandleWithContext(ctx, fh, deadline)
+			handleLocked = waitErr == nil
+		}
 		if waitErr != nil {
 			if errors.Is(waitErr, syscall.EAGAIN) {
 				return 0, gofuse.EAGAIN
@@ -14703,24 +14760,24 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 // Caller must hold fh.mu. The method may temporarily release fh.mu around
 // network I/O, matching flushHandle's locking contract. Only Flush/Release
 // request remote-only shadow durability; the upload gate may narrow it further.
-func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle, durability shadowUploadDurability) gofuse.Status {
+func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle, durability shadowUploadDurability, lockState ...*handleLockState) gofuse.Status {
 	if fh != nil && !fh.Unlinked && fs.appendLogConfiguredLocked(fh) {
-		status, _ := fs.syncAppendLogHandleToRemoteLocked(ctx, fh, durability)
+		status, _ := fs.syncAppendLogHandleToRemoteLocked(ctx, fh, durability, lockState...)
 		return status
 	}
-	return fs.syncHandleToRemoteWithoutAppendLogLocked(ctx, fh, durability)
+	return fs.syncHandleToRemoteWithoutAppendLogLocked(ctx, fh, durability, lockState...)
 }
 
 // syncAppendLogHandleToRemoteLocked returns whether the synchronous route used
 // a full rewrite. Caller must hold fh.mu.
-func (fs *Dat9FS) syncAppendLogHandleToRemoteLocked(ctx context.Context, fh *FileHandle, durability shadowUploadDurability) (gofuse.Status, bool) {
-	if handled, status, fullRewrite := fs.routeAppendLogLocked(ctx, fh); handled {
+func (fs *Dat9FS) syncAppendLogHandleToRemoteLocked(ctx context.Context, fh *FileHandle, durability shadowUploadDurability, lockState ...*handleLockState) (gofuse.Status, bool) {
+	if handled, status, fullRewrite := fs.routeAppendLogLocked(ctx, fh, lockState...); handled {
 		return status, fullRewrite
 	}
-	return fs.syncHandleToRemoteWithoutAppendLogLocked(ctx, fh, durability), true
+	return fs.syncHandleToRemoteWithoutAppendLogLocked(ctx, fh, durability, lockState...), true
 }
 
-func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, fh *FileHandle, durability shadowUploadDurability) gofuse.Status {
+func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, fh *FileHandle, durability shadowUploadDurability, lockState ...*handleLockState) gofuse.Status {
 	if fh == nil || fh.Dirty == nil {
 		return gofuse.OK
 	}
@@ -14735,12 +14792,12 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 	}
 	if !fh.Dirty.HasDirtyParts() {
 		if fh.IsNew && fh.Dirty.Size() == 0 {
-			return fs.createEmptyHandleRemoteLocked(ctx, fh)
+			return fs.createEmptyHandleRemoteLocked(ctx, fh, lockState...)
 		}
 		return gofuse.OK
 	}
 	if fs.layerEnabled() {
-		return fs.flushHandle(ctx, fh)
+		return fs.flushHandle(ctx, fh, lockState...)
 	}
 
 	size := fh.Dirty.Size()
@@ -14767,11 +14824,13 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 			durability = fs.foregroundShadowUploadDurabilityLocked(fh, stagingGens)
 		}
 		modeCommit := fs.closeSyncCreateModeLocked(fh, size, expectedRevision, durability)
-		fh.Unlock()
+		closeReceipt := fs.captureReleaseCommitLocked(fh, expectedRevision, lockState)
+		unlockHandleForIO(fh, lockState)
 		uploadResult, err := fs.uploadCloseSyncShadow(ctx, handlePath, size, expectedRevision, stagingGens.ShadowGen, durability, modeCommit)
 		committedRev := uploadResult.revision
 		var committedMutationRev int64
 		if err == nil {
+			closeReceipt.complete(committedRev)
 			committedMutationRev = fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
 			fs.recordCommittedMutation(handleIno, mutationSeq, committedMutationRev, size)
 			fs.captureFtruncateIdentity(ctx, handleIno, handlePath, committedMutationRev)
@@ -14781,7 +14840,10 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 		}
 		unlockRemoteCommit()
 		remoteCommitReleased = true
-		fh.Lock()
+		failpoint.InjectCall("ftruncateStreamCommitBeforeRelock", fs, fh)
+		if err := relockHandleAfterIO(ctx, fh, lockState); err != nil {
+			return httpToFuseStatus(err)
+		}
 		var uploadBytes uint64
 		if size > 0 {
 			uploadBytes = uint64(size)
@@ -14789,7 +14851,7 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 		fs.perfRecordRemote(perfRemoteWrite, uploadStart, err, uploadBytes)
 		fs.debugDurationf(uploadStart, 0, "sync handle shadowspill upload done path=%s size=%d err=%v", handlePath, size, err)
 		if err != nil {
-			if handled, status := fs.routeAppendLogGenericUnsupportedLocked(ctx, fh, handlePath, mutationSeq, err); handled {
+			if handled, status := fs.routeAppendLogGenericUnsupportedLocked(ctx, fh, handlePath, mutationSeq, err, lockState...); handled {
 				return status
 			}
 			safeLogPrintf("sync handle shadowspill upload failed for %s: %v", handlePath, err)
@@ -14805,11 +14867,11 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 		if fh.Path != handlePath || fh.DirtySeq != mutationSeq {
 			return gofuse.OK
 		}
-		if !fs.adoptCombinedCommitLocked(fh, handlePath, mutationSeq, size, uploadResult) {
-			return gofuse.OK
+		if adopted, err := fs.adoptCombinedCommitLocked(ctx, fh, handlePath, mutationSeq, size, uploadResult, lockState...); err != nil || !adopted {
+			return httpToFuseStatus(err)
 		}
-		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-			safeLogPrintf("sync handle shadowspill pending chmod failed for %s: %v", fh.Path, err)
+		if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
+			safeLogPrintf("sync handle shadowspill pending chmod failed for %s: %v", handlePath, err)
 			return httpToFuseStatus(err)
 		}
 		if fh.Path != handlePath || fh.DirtySeq != mutationSeq {
@@ -14842,10 +14904,10 @@ func (fs *Dat9FS) syncHandleToRemoteWithoutAppendLogLocked(ctx context.Context, 
 		return gofuse.OK
 	}
 
-	return fs.flushHandle(ctx, fh)
+	return fs.flushHandle(ctx, fh, lockState...)
 }
 
-func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
+func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHandle, lockState ...*handleLockState) gofuse.Status {
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	stagingGens := fs.captureHandleStagingGensLocked(fh)
 	if fs.layerEnabled() {
@@ -14854,8 +14916,8 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 			safeLogPrintf("sync empty layer create failed for %s: %v", fh.Path, err)
 			return httpToFuseStatus(err)
 		}
-		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-			safeLogPrintf("sync empty layer create pending chmod failed for %s: %v", fh.Path, err)
+		if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
+			safeLogPrintf("sync empty layer create pending chmod failed: %v", err)
 			return httpToFuseStatus(err)
 		}
 		if fh.DirtySeq != 0 {
@@ -14899,8 +14961,8 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 	if committedMutationRev > 0 {
 		fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, committedMutationRev, fh, 0)
 	}
-	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-		safeLogPrintf("sync empty create pending chmod failed for %s: %v", fh.Path, err)
+	if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
+		safeLogPrintf("sync empty create pending chmod failed: %v", err)
 		return httpToFuseStatus(err)
 	}
 	if fh.DirtySeq != 0 {
@@ -15165,18 +15227,18 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 // NOTE: This method temporarily releases fh.mu during network calls
 // (FinishStreaming, UploadAll) to avoid deadlock with streaming upload
 // callbacks. The lock is re-acquired before modifying handle state.
-func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
-	return fs.flushHandleWithAppendRetryBudget(ctx, fh, maxLiveSnapshotAncestors)
+func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle, lockState ...*handleLockState) gofuse.Status {
+	return fs.flushHandleWithAppendRetryBudget(ctx, fh, maxLiveSnapshotAncestors, lockState...)
 }
 
 // flushHandleWithAppendRetryBudget shares flushHandle's caller-held fh.mu and
 // temporary network unlock windows. Only proven local append conflicts consume
 // the remaining retry budget; all attempts retain the original context deadline.
-func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *FileHandle, appendRetries int) (status gofuse.Status) {
+func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *FileHandle, appendRetries int, lockState ...*handleLockState) (status gofuse.Status) {
 	start := time.Now()
 	phase := "start"
 	defer func() {
-		if !fs.debugEnabled() {
+		if (len(lockState) != 0 && !lockState[0].held) || !fs.debugEnabled() {
 			return
 		}
 		var size int64
@@ -15206,14 +15268,14 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
 	}
-	if handled, err := fs.prepareFtruncateCommitLocked(ctx, fh, true); handled || err != nil {
+	if handled, err := fs.prepareFtruncateCommitLocked(ctx, fh, true, lockState...); handled || err != nil {
 		return httpToFuseStatus(err)
 	}
 	if fs.discardSupersededMutationLocked(fh) {
 		phase = "superseded-mutation"
 		return gofuse.OK
 	}
-	if handled, appendStatus, _ := fs.routeAppendLogLocked(ctx, fh); handled {
+	if handled, appendStatus, _ := fs.routeAppendLogLocked(ctx, fh, lockState...); handled {
 		phase = "append-log"
 		return appendStatus
 	}
@@ -15223,9 +15285,9 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 	}
 	if !fh.Dirty.HasDirtyParts() {
 		phase = "no-dirty-parts"
-		return httpToFuseStatus(fs.finishLandedAppendPendingModeLocked(ctx, fh))
+		return httpToFuseStatus(fs.finishLandedAppendPendingModeLocked(ctx, fh, lockState...))
 	}
-	if err := fs.waitLinkedLegacyAppendUploadsLocked(ctx, fh); err != nil {
+	if err := fs.waitLinkedLegacyAppendUploadsLocked(ctx, fh, lockState...); err != nil {
 		return httpToFuseStatus(err)
 	}
 	if fh.Unlinked {
@@ -15243,13 +15305,13 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 			return httpToFuseStatus(err)
 		}
 	}
-	if err := fs.finishLandedAppendPendingModeLocked(ctx, fh); err != nil {
+	if err := fs.finishLandedAppendPendingModeLocked(ctx, fh, lockState...); err != nil {
 		return httpToFuseStatus(err)
 	}
 	if !fh.Dirty.HasDirtyParts() {
 		return gofuse.OK
 	}
-	if handled, st := fs.commitAppendSnapshotLocked(ctx, fh); handled {
+	if handled, st := fs.commitAppendSnapshotLocked(ctx, fh, lockState...); handled {
 		return st
 	}
 	mutationPath := fh.Path
@@ -15358,16 +15420,22 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		// synchronous uploads that may take minutes.
 		uploadStart := time.Now()
 		fs.debugf("flushHandle finish streaming start path=%s size=%d part_size=%d parts=%d dirty_parts=%d expected_rev=%d", fh.Path, size, partSize, numParts, len(dirtyParts), expectedRevision)
-		fh.Unlock()
+		closeReceipt := fs.captureReleaseCommitLocked(fh, expectedRevision, lockState)
+		unlockHandleForIO(fh, lockState)
 		perfUploadStart := fs.perfStart()
 		err = streamer.FinishStreaming(ctx, size,
 			lastPartNum, lastCp, dirtyParts)
 		mutationUploadCommitted = err == nil
+		if err == nil {
+			closeReceipt.complete(0)
+		}
 		recordMutationBeforeFenceRelease()
 		unlockRemoteCommit()
 		remoteCommitReleased = true
 		failpoint.InjectCall("ftruncateStreamCommitBeforeRelock", fs, fh)
-		fh.Lock()
+		if err := relockHandleAfterIO(ctx, fh, lockState); err != nil {
+			return httpToFuseStatus(err)
+		}
 		var perfUploadBytes uint64
 		if size > 0 {
 			perfUploadBytes = uint64(size)
@@ -15387,8 +15455,8 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		if fh.Path != mutationPath || fh.DirtySeq != mutationSeq {
 			return gofuse.OK
 		}
-		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-			safeLogPrintf("finish streaming pending chmod failed for %s: %v", fh.Path, err)
+		if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
+			safeLogPrintf("finish streaming pending chmod failed for %s: %v", mutationPath, err)
 			return httpToFuseStatus(err)
 		}
 		if fh.Path != mutationPath || fh.DirtySeq != mutationSeq {
@@ -15451,15 +15519,21 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		// Release fh.mu during network call (same deadlock avoidance as Path 1a).
 		uploadStart := time.Now()
 		fs.debugf("flushHandle upload all start path=%s size=%d parts=%d expected_rev=%d", fh.Path, size, len(partSnapshots), expectedRevision)
-		fh.Unlock()
+		closeReceipt := fs.captureReleaseCommitLocked(fh, expectedRevision, lockState)
+		unlockHandleForIO(fh, lockState)
 		perfUploadStart := fs.perfStart()
 		err = streamer.UploadAll(ctx, size, partSnapshots)
 		mutationUploadCommitted = err == nil
+		if err == nil {
+			closeReceipt.complete(0)
+		}
 		recordMutationBeforeFenceRelease()
 		unlockRemoteCommit()
 		remoteCommitReleased = true
 		failpoint.InjectCall("ftruncateStreamCommitBeforeRelock", fs, fh)
-		fh.Lock()
+		if err := relockHandleAfterIO(ctx, fh, lockState); err != nil {
+			return httpToFuseStatus(err)
+		}
 		var perfUploadBytes uint64
 		if size > 0 {
 			perfUploadBytes = uint64(size)
@@ -15479,8 +15553,8 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		if fh.Path != mutationPath || fh.DirtySeq != mutationSeq {
 			return gofuse.OK
 		}
-		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-			safeLogPrintf("upload all pending chmod failed for %s: %v", fh.Path, err)
+		if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
+			safeLogPrintf("upload all pending chmod failed for %s: %v", mutationPath, err)
 			return httpToFuseStatus(err)
 		}
 		if fh.Path != mutationPath || fh.DirtySeq != mutationSeq {
@@ -15663,7 +15737,8 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 
 	uploadStart := time.Now()
 	fs.debugf("flushHandle path2 unlock before upload path=%s size=%d phase_hint=%s expected_rev=%d", handlePath, size, phase, expectedRevision)
-	fh.Unlock()
+	closeReceipt := fs.captureReleaseCommitLocked(fh, expectedRevision, lockState)
+	unlockHandleForIO(fh, lockState)
 
 	if useDirectPUT {
 		if size == 0 && handleIsNew {
@@ -15769,6 +15844,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		}
 	}
 	if err == nil {
+		closeReceipt.complete(committedRev)
 		fs.recordRetiredReadAck(readPublication, committedRevisionForExpectedRevision(expectedRevision, committedRev), committedRev > 0)
 	}
 	mutationCommittedRevision = committedRev
@@ -15787,7 +15863,9 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		testHookBeforeFlushRelock(handlePath)
 	}
 	failpoint.InjectCall("retiredFtruncateUploadBeforeRelock", fs, fh)
-	fh.Lock()
+	if err := relockHandleAfterIO(ctx, fh, lockState); err != nil {
+		return httpToFuseStatus(err)
+	}
 	fs.debugDurationf(uploadStart, 0, "flushHandle path2 relock after upload path=%s size=%d err=%v", handlePath, size, err)
 
 	if errors.Is(err, client.ErrConflict) && appendRetries > 0 && ctx.Err() == nil &&
@@ -15799,17 +15877,17 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		// resolve the loser; a foreign/common-ancestor conflict stays failed.
 		if adoptErr := fs.adoptLandedAppendSnapshotLocked(ctx, fh); adoptErr == nil && fh.BaseRev > handleOrigBase {
 			if !fh.Dirty.HasDirtyParts() {
-				if modeErr := fs.finishLandedAppendPendingModeLocked(ctx, fh); modeErr != nil {
+				if modeErr := fs.finishLandedAppendPendingModeLocked(ctx, fh, lockState...); modeErr != nil {
 					return httpToFuseStatus(modeErr)
 				}
-				return httpToFuseStatus(fs.applyPendingModeForHandleLocked(ctx, fh))
+				return httpToFuseStatus(fs.applyPendingModeForHandleLocked(ctx, fh, lockState...))
 			}
-			return fs.flushHandleWithAppendRetryBudget(ctx, fh, appendRetries-1)
+			return fs.flushHandleWithAppendRetryBudget(ctx, fh, appendRetries-1, lockState...)
 		}
 	}
 
 	if err != nil {
-		if handled, appendStatus := fs.routeAppendLogGenericUnsupportedLocked(ctx, fh, handlePath, handleDirtySeq, err); handled {
+		if handled, appendStatus := fs.routeAppendLogGenericUnsupportedLocked(ctx, fh, handlePath, handleDirtySeq, err, lockState...); handled {
 			return appendStatus
 		}
 		if usePatch && client.IsUnsupportedStorageTargetErr(err) {
@@ -15822,7 +15900,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 			fh.StorageClass = storageClassDB9
 			if fh.Path == handlePath && fh.DirtySeq == handleDirtySeq {
 				fs.debugf("flushHandle patch unsupported target, retry as full upload path=%s size=%d", handlePath, size)
-				return fs.flushHandle(ctx, fh)
+				return fs.flushHandle(ctx, fh, lockState...)
 			}
 			safeLogPrintf("flush patch unsupported for %s; will full-upload on next flush (dirty state advanced during upload)", handlePath)
 		}
@@ -15847,7 +15925,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 	if err := fs.reconcileRetiredReadLocked(ctx, fh, false); err != nil {
 		return httpToFuseStatus(err)
 	}
-	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+	if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
 		safeLogPrintf("flush pending chmod failed for %s: %v", handlePath, err)
 		return httpToFuseStatus(err)
 	}
@@ -16114,23 +16192,12 @@ func (fs *Dat9FS) flushAll() error {
 		if e.fh.isExtent() {
 			continue
 		}
-		// Per-handle timeout scaled by file size so large uploads complete.
-		e.fh.Lock()
-		var sz int64
-		if e.fh.Dirty != nil {
-			sz = e.fh.Dirty.Size()
+		started := time.Now()
+		ctx, cf := context.WithTimeout(context.Background(), fuseTimeout)
+		if st := fs.drainFileHandle(ctx, e.id, e.fh, started); st != gofuse.OK {
+			path, _ := fs.openHandles.Path(e.fh)
+			shutdownErr = errors.Join(shutdownErr, newDrainStatusError(path, st))
 		}
-		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(sz))
-		if e.fh.Layer == PathLayerGitWorkspace {
-			if st := fs.flushGitHandleLocked(ctx, e.fh); st != gofuse.OK {
-				shutdownErr = errors.Join(shutdownErr, newDrainStatusError(e.fh.Path, st))
-			}
-		} else {
-			if st := fs.flushHandle(ctx, e.fh); st != gofuse.OK {
-				shutdownErr = errors.Join(shutdownErr, newDrainStatusError(e.fh.Path, st))
-			}
-		}
-		e.fh.Unlock()
 		cf()
 	}
 

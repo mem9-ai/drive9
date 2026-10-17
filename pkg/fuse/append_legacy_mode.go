@@ -27,7 +27,7 @@ func (fs *Dat9FS) claimLandedAppendPendingModeLocked(fh *FileHandle, snapshotID 
 // finishLandedAppendPendingModeLocked completes only the mode obligation of a
 // clean no-CQ append image, retaining newer mode/cache generations. The
 // existing mode helper owns its generation recheck and handle unlock window.
-func (fs *Dat9FS) finishLandedAppendPendingModeLocked(ctx context.Context, fh *FileHandle) error {
+func (fs *Dat9FS) finishLandedAppendPendingModeLocked(ctx context.Context, fh *FileHandle, lockState ...*handleLockState) error {
 	if fs.commitQueue != nil || fs.layerEnabled() || fh.Dirty == nil || fh.Dirty.HasDirtyParts() ||
 		!fh.LineageTrusted || fh.ContentSnapshotID == "" || !fh.HasPendingMode {
 		return nil
@@ -39,10 +39,10 @@ func (fs *Dat9FS) finishLandedAppendPendingModeLocked(ctx context.Context, fh *F
 				return syscall.EAGAIN
 			}
 		}
-		return fs.applyPendingModeForHandleLocked(ctx, fh)
+		return fs.applyPendingModeForHandleLocked(ctx, fh, lockState...)
 	}
 	path, ino, generation := fh.Path, fh.Ino, meta.Generation
-	if err := fs.applyPendingModeForHandleLocked(ctx, fh); err != nil {
+	if err := fs.applyPendingModeForHandleLocked(ctx, fh, lockState...); err != nil {
 		return err
 	}
 	// A concurrent SetAttr keeps HasPendingMode with a newer mode generation;

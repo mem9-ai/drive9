@@ -176,7 +176,7 @@ func (fs *Dat9FS) landedAppendCommit(path string) pathCommitLandmark {
 // fh.mu; queue callbacks use TryLock and cannot consume this handle mid-fsync.
 // As on the existing synchronous write-back path, metadata finalization follows
 // the content commit while the handle remains locked.
-func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle) (bool, gofuse.Status) {
+func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle, lockState ...*handleLockState) (bool, gofuse.Status) {
 	// Every participating alias commit needs a landed identity, including
 	// subsequent writes after the first inherited snapshot was committed.
 	aliasSnapshot := fs.ftruncateParticipates(fh) && len(fs.ftruncateAliasPaths(fh.Ino)) > 1
@@ -193,7 +193,7 @@ func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle
 	}
 	if !fh.Dirty.HasDirtyParts() {
 		if fh.HasPendingMode {
-			return true, httpToFuseStatus(fs.applyPendingModeWithTimeoutLocked(fh))
+			return true, httpToFuseStatus(fs.applyPendingModeForCommitLocked(ctx, fh, lockState...))
 		}
 		return false, gofuse.OK
 	}
@@ -239,7 +239,7 @@ func (fs *Dat9FS) commitAppendSnapshotLocked(ctx context.Context, fh *FileHandle
 	if proof.rev == fh.BaseRev && fh.Dirty.CanMaterializeFull() && landedIdentityMatches(proof, fh.BaseRev, fh.Dirty.Size(), fh.Dirty.Bytes()) {
 		fh.ContentSnapshotID, fh.contentAncestors = proof.snapshotID, proof.ancestors
 	}
-	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+	if err := fs.applyPendingModeForCommitLocked(ctx, fh, lockState...); err != nil {
 		return true, httpToFuseStatus(err)
 	}
 	return true, gofuse.OK
@@ -449,7 +449,7 @@ var testHookBeforeLinkedUploaderWait func(*FileHandle, string)
 // Drop the handle lock while waiting, as callbacks and other producers may
 // need it. The caller's context owns the whole wait, including queued uploads
 // which have not entered the uploader's in-flight map yet.
-func (fs *Dat9FS) waitLinkedLegacyAppendUploadsLocked(ctx context.Context, fh *FileHandle) error {
+func (fs *Dat9FS) waitLinkedLegacyAppendUploadsLocked(ctx context.Context, fh *FileHandle, lockState ...*handleLockState) error {
 	if fs.commitQueue != nil || fs.uploader == nil || fs.layerEnabled() || fh.Dirty == nil ||
 		(!fh.appendSnapshot && fh.Flags&uint32(syscall.O_APPEND) == 0) {
 		return nil
@@ -479,7 +479,7 @@ func (fs *Dat9FS) waitLinkedLegacyAppendUploadsLocked(ctx context.Context, fh *F
 		if active && testHookBeforeLinkedUploaderWait != nil {
 			testHookBeforeLinkedUploaderWait(fh, pending)
 		}
-		fh.Unlock()
+		unlockHandleForIO(fh, lockState)
 		var err error
 		if active {
 			err = fs.uploader.waitPathContext(ctx, pending)
@@ -490,7 +490,9 @@ func (fs *Dat9FS) waitLinkedLegacyAppendUploadsLocked(ctx context.Context, fh *F
 			case <-time.After(samePathDirtyWaitInterval):
 			}
 		}
-		fh.Lock()
+		if lockErr := relockHandleAfterIO(ctx, fh, lockState); lockErr != nil {
+			return lockErr
+		}
 		if err != nil {
 			return err
 		}

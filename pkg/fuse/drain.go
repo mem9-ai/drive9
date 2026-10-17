@@ -179,7 +179,19 @@ func (fs *Dat9FS) Drain(ctx context.Context) mountcontrol.DrainResponse {
 		return resp
 	}
 
-	resp.Pending = fs.snapshotDrainPending()
+	// Status/error reporting is nonblocking. At the successful Drain boundary,
+	// however, an ordinary close still finishing cleanup is not dirty work:
+	// wait within the original context until those uncertain snapshots settle.
+	var uncertain int
+	resp.Pending, uncertain = fs.snapshotDrainPendingState()
+	for uncertain != 0 && resp.Pending.DirtyHandles == uncertain {
+		if err := waitHandleRetry(ctx, time.Time{}); err != nil {
+			resp.Fail(drainContextKind(err), "", err)
+			resp.Finish(time.Now().UTC())
+			return resp
+		}
+		resp.Pending, uncertain = fs.snapshotDrainPendingState()
+	}
 	if err := drainPendingWorkError(resp.Pending); err != nil {
 		resp.Fail(drainPendingWorkKind, "", err)
 	}
@@ -229,23 +241,89 @@ func (fs *Dat9FS) drainOpenHandles(ctx context.Context) error {
 	if fs == nil || fs.fileHandles == nil {
 		return nil
 	}
-	handles := fs.fileHandles.Snapshot()
-	for _, fh := range handles {
+	handles := make(map[uint64]*FileHandle)
+	fs.fileHandles.ForEach(func(id uint64, fh *FileHandle) { handles[id] = fh })
+	for id, fh := range handles {
 		if err := ctx.Err(); err != nil {
 			return newDrainContextError(err)
 		}
-		fh.Lock()
-		path := fh.Path
-		status := fs.drainHandleLocked(ctx, fh)
-		fh.Unlock()
-		if status != gofuse.OK {
-			return newDrainStatusError(path, status)
+		if st := fs.drainFileHandle(ctx, id, fh, time.Time{}); st != gofuse.OK {
+			path, _ := fs.openHandles.Path(fh)
+			return newDrainStatusError(path, st)
 		}
 	}
 	return nil
 }
 
-func (fs *Dat9FS) drainHandleLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
+// Claim before mu for both live and deferred handles. Release may publish a
+// deferred ID during an upload; recheck it after the helper gives back control.
+func (fs *Dat9FS) drainFileHandle(ctx context.Context, id uint64, fh *FileHandle, shutdownStart time.Time) gofuse.Status {
+	if current, ok := fs.fileHandles.Get(id); !ok || current != fh {
+		return gofuse.OK
+	}
+	for !fh.releaseClaim.CompareAndSwap(false, true) {
+		if current, ok := fs.fileHandles.Get(id); !ok || current != fh {
+			return gofuse.OK
+		}
+		if err := waitHandleRetry(ctx, time.Time{}); err != nil {
+			return httpToFuseStatus(err)
+		}
+	}
+	claimed := true
+	defer func() {
+		if claimed {
+			fh.releaseClaim.Store(false)
+		}
+	}()
+	if current, ok := fs.fileHandles.Get(id); !ok || current != fh {
+		return gofuse.OK
+	}
+	deadline, _ := ctx.Deadline()
+	state := &handleLockState{deadline: deadline}
+	if err := state.lock(ctx, fh); err != nil {
+		return httpToFuseStatus(err)
+	}
+	defer func() {
+		if state.held {
+			fh.Unlock()
+		}
+	}()
+	if current, ok := fs.fileHandles.Get(id); !ok || current != fh {
+		return gofuse.OK
+	}
+	if !shutdownStart.IsZero() {
+		var size int64
+		if fh.Dirty != nil {
+			size = fh.Dirty.Size()
+		}
+		state.deadline = shutdownStart.Add(releaseTimeout(size))
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(context.Background(), state.deadline)
+		defer cancel()
+	}
+	status := gofuse.OK
+	if fh.deferredRelease.Load() == 0 {
+		// Entry is bounded for every handle, including a closing transition.
+		// Keep legacy upload finalization for unrelated files; only truncate
+		// participants have the exact receipt needed for an unlocked return.
+		state.truncateOnly = true
+		status = fs.drainHandleLocked(ctx, fh, state)
+	}
+	if state.held {
+		unlockHandleForIO(fh, []*handleLockState{state})
+	}
+	if fh.deferredRelease.Load() != 0 {
+		claimed = false
+		fh.releaseClaim.Store(false)
+		status = fs.releaseFileHandle(ctx, nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: fh.Ino}, Fh: id}, true)
+		if current, ok := fs.fileHandles.Get(id); ok && current == fh && status == gofuse.OK {
+			return gofuse.EAGAIN
+		}
+	}
+	return status
+}
+
+func (fs *Dat9FS) drainHandleLocked(ctx context.Context, fh *FileHandle, lockState ...*handleLockState) gofuse.Status {
 	if isLocalFileHandle(fh) {
 		if localFileHandleOpenedWritable(fh) {
 			if err := syncOpenLocalFile(fh.LocalFile); err != nil {
@@ -273,7 +351,7 @@ func (fs *Dat9FS) drainHandleLocked(ctx context.Context, fh *FileHandle) gofuse.
 		}
 		return fs.extentFsync(jctx, fh, 0)
 	}
-	return fs.flushHandle(ctx, fh)
+	return fs.flushHandle(ctx, fh, lockState...)
 }
 
 func (fs *Dat9FS) waitGitOverlayWrites(ctx context.Context) error {
@@ -306,16 +384,32 @@ func waitGroupWithContext(ctx context.Context, wg *sync.WaitGroup) error {
 }
 
 func (fs *Dat9FS) snapshotDrainPending() mountcontrol.DrainPending {
-	var pending mountcontrol.DrainPending
+	pending, _ := fs.snapshotDrainPendingState()
+	return pending
+}
+
+func (fs *Dat9FS) snapshotDrainPendingState() (pending mountcontrol.DrainPending, uncertain int) {
 	if fs == nil {
-		return pending
+		return
 	}
 	if fs.fileHandles != nil {
-		handles := fs.fileHandles.Snapshot()
-		pending.OpenHandles = len(handles)
-		for _, fh := range handles {
-			fh.Lock()
-			if drainHandleHasDirtyStateLocked(fh) {
+		handles := make(map[uint64]*FileHandle)
+		fs.fileHandles.ForEach(func(id uint64, fh *FileHandle) { handles[id] = fh })
+		for id, fh := range handles {
+			if current, ok := fs.fileHandles.Get(id); !ok || current != fh {
+				continue
+			}
+			pending.OpenHandles++
+			if fh.deferredRelease.Load() != 0 {
+				pending.DirtyHandles++
+				continue
+			}
+			if fh.releaseClaim.Load() || !fh.TryLock() {
+				pending.DirtyHandles++
+				uncertain++
+				continue
+			}
+			if drainHandleHasDirtyStateLocked(fh) || fh.deferredRelease.Load() != 0 || fh.releaseClaim.Load() {
 				pending.DirtyHandles++
 			}
 			fh.Unlock()
@@ -336,7 +430,7 @@ func (fs *Dat9FS) snapshotDrainPending() mountcontrol.DrainPending {
 		pending.UploaderCached = snap.Cached
 		pending.UploaderCachedBytes = snap.CachedBytes
 	}
-	return pending
+	return
 }
 
 func drainPendingWorkError(p mountcontrol.DrainPending) error {

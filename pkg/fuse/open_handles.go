@@ -277,6 +277,39 @@ func (idx *OpenHandleIndex) SnapshotInode(ino uint64) []*FileHandle {
 	return out
 }
 
+// Notify without fh.mu: a busy reader must not miss external invalidation.
+// Registration shares idx.mu, and a newly registered retired reader must first
+// validate its own remote baseline; another handle's epoch is not transferable.
+func (idx *OpenHandleIndex) invalidateInodeReads(ino uint64) {
+	if idx == nil {
+		return
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	for fh := range idx.byInode[ino] {
+		fh.readInvalidationEpoch.Add(1)
+	}
+}
+
+func (idx *OpenHandleIndex) invalidateRenameReads(oldPath string) {
+	if idx == nil {
+		return
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	seen := make(map[uint64]bool)
+	for fh, path := range idx.pathByHandle {
+		if (path == oldPath || strings.HasPrefix(path, oldPath+"/")) && !seen[fh.Ino] {
+			seen[fh.Ino] = true
+			// Include hardlinks outside the moved subtree. A delayed SSE event
+			// for the old pathname will no longer find this inode after rename.
+			for alias := range idx.byInode[fh.Ino] {
+				alias.readInvalidationEpoch.Add(1)
+			}
+		}
+	}
+}
+
 func (idx *OpenHandleIndex) RenamePathPrefix(oldPath, newPath string) map[*FileHandle]string {
 	if idx == nil || oldPath == "" || newPath == "" {
 		return nil

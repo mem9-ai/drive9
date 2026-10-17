@@ -97,6 +97,7 @@ func (fs *Dat9FS) retireCommittedFtruncateLocked(ctx context.Context, fh *FileHa
 		}
 		return errFtruncateBusy
 	}
+	epoch := fh.readInvalidationEpoch.Load()
 	stat, err := fs.client.StatCtx(ctx, fs.remotePath(fh.Path))
 	if err != nil {
 		return err
@@ -116,7 +117,7 @@ func (fs *Dat9FS) retireCommittedFtruncateLocked(ctx context.Context, fh *FileHa
 		}
 		return syscall.EAGAIN
 	}
-	if !fh.pendingFtruncate.CompareAndSwap(event, nil) {
+	if epoch != fh.readInvalidationEpoch.Load() || !fh.pendingFtruncate.CompareAndSwap(event, nil) {
 		return syscall.EAGAIN
 	}
 	if fh.ShadowPinned && fs.shadowStore != nil {
@@ -136,7 +137,7 @@ func (fs *Dat9FS) retireCommittedFtruncateLocked(ctx context.Context, fh *FileHa
 		fh.Streamer = nil
 	}
 	fs.rebindCleanWriteBufferToRemoteLocked(fh, stat.Size)
-	fs.bindRetiredReadLocked(fh, entry.ResourceID, view, stat.Revision, stat.Size)
+	fs.bindRetiredReadLocked(fh, entry.ResourceID, view, stat.Revision, stat.Size, epoch)
 	clearStagedSnapshotLineageLocked(fh)
 	fh.ContentSnapshotID, fh.ftruncateInherited = "", ""
 	fh.contentAncestors = nil

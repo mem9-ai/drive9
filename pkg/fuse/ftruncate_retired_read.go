@@ -20,7 +20,10 @@ type retiredReadImage struct {
 	publications []*retiredReadPublication
 }
 
-type retiredReadBaseline struct{ revision, size int64 }
+type retiredReadBaseline struct {
+	revision, size int64
+	epoch          uint64
+}
 
 // Source fields are frozen before queue/cache publication. Only ack is mutable;
 // fs.dirtyMu protects it, so a worker never needs the owner's handle mutex.
@@ -30,6 +33,7 @@ type retiredReadPublication struct {
 	size, base               int64
 	gens                     StagingGens
 	ack                      *retiredReadAck
+	readEpoch                *uint64 // nil means the source had no verified baseline
 }
 
 type retiredReadAck struct {
@@ -120,6 +124,9 @@ func (fs *Dat9FS) captureRetiredReadLocked(fh *FileHandle) *retiredReadPublicati
 	p := &retiredReadPublication{path: fh.Path, ino: fh.Ino, resource: i.resource, view: i.view,
 		seq: fh.DirtySeq, version: fh.Dirty.contentVersion, size: fh.Dirty.Size(), base: fh.BaseRev,
 		snapshot: fh.StagedSnapshotID, gens: fs.captureHandleStagingGensLocked(fh)}
+	if i.baseline != nil {
+		p.readEpoch = &i.baseline.epoch // baseline is immutable, including epoch zero
+	}
 	i.publications = append(i.publications, p)
 	failpoint.InjectCall("retiredFtruncatePublicationCaptured", fs, fh, p)
 	return p
@@ -210,13 +217,18 @@ func (fs *Dat9FS) reconcileRetiredReadLocked(ctx context.Context, fh *FileHandle
 	if i.baseline != nil && i.baseline.revision >= ack.revision {
 		return nil
 	}
-	if !ack.actual {
+	epoch := p.readEpoch
+	if !ack.actual || epoch == nil {
 		if !remote {
 			return nil // The local image remains readable without a remote fetch.
 		}
+		observed := fh.readInvalidationEpoch.Load()
 		stat, err := fs.client.StatCtx(ctx, fs.remotePath(fh.Path))
 		if err != nil {
 			return err
+		}
+		if observed != fh.readInvalidationEpoch.Load() {
+			return syscall.EAGAIN
 		}
 		if stat == nil || stat.ResourceID != i.resource || stat.Revision != ack.revision || stat.Size != p.size {
 			if stat != nil && stat.ResourceID == i.resource && stat.Revision > ack.revision &&
@@ -226,8 +238,9 @@ func (fs *Dat9FS) reconcileRetiredReadLocked(ctx context.Context, fh *FileHandle
 			}
 			return syscall.EAGAIN
 		}
+		epoch = &observed
 	}
-	i.baseline = &retiredReadBaseline{revision: ack.revision, size: p.size}
+	i.baseline = &retiredReadBaseline{revision: ack.revision, size: p.size, epoch: *epoch}
 	if fh.BaseRev <= ack.revision {
 		fs.updateHandleRevisionMetadataLocked(fh, ack.revision, p.size)
 		fs.recordCommittedRevisionWithSize(fh.Path, ack.revision, p.size)
@@ -249,10 +262,12 @@ func (fs *Dat9FS) prepareRetiredReadLocked(ctx context.Context, fh *FileHandle) 
 		return syscall.EAGAIN
 	}
 	known := max(entry.Revision, fs.ftruncateAliasRevision(fh))
-	if i.baseline != nil && i.view == fs.mountViewGeneration.Load() && i.baseline.revision >= known && fh.BaseRev == i.baseline.revision {
+	epoch := fh.readInvalidationEpoch.Load()
+	own := fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || fs.retiredReadPending(fh)
+	if i.baseline != nil && (own || i.baseline.epoch == epoch) && i.view == fs.mountViewGeneration.Load() && i.baseline.revision >= known && fh.BaseRev == i.baseline.revision {
 		return nil
 	}
-	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() || fs.retiredReadPending(fh) {
+	if own {
 		return syscall.EAGAIN
 	}
 	view, paths := fs.mountViewGeneration.Load(), fs.ftruncateAliasPaths(fh.Ino)
@@ -286,13 +301,13 @@ func (fs *Dat9FS) prepareRetiredReadLocked(ctx context.Context, fh *FileHandle) 
 	stable := fs.dirtyInodes[fh.Ino] == dirty && fs.mutationInodes[fh.Ino] == committed
 	fs.dirtyMu.Unlock()
 	current, present := fs.inodes.GetEntry(fh.Ino)
-	if !stable || !present || current.ResourceID != i.resource || !fs.ftruncateAliasesValid(fh.Ino, paths, view) || fs.retiredReadOtherPending(fh, committed.committedSeq) {
+	if epoch != fh.readInvalidationEpoch.Load() || !stable || !present || current.ResourceID != i.resource || !fs.ftruncateAliasesValid(fh.Ino, paths, view) || fs.retiredReadOtherPending(fh, committed.committedSeq) {
 		return syscall.EAGAIN
 	}
 	fh.BaseRev, fh.OrigSize = stat.Revision, stat.Size
 	i.publications = nil // All own obligations are complete; this HEAD authorizes replacement.
 	fs.rebindCleanWriteBufferToRemoteLocked(fh, stat.Size)
-	fs.bindRetiredReadLocked(fh, i.resource, view, stat.Revision, stat.Size)
+	fs.bindRetiredReadLocked(fh, i.resource, view, stat.Revision, stat.Size, epoch)
 	fs.recordCommittedRevisionWithSize(fh.Path, stat.Revision, stat.Size)
 	fs.inodes.advanceRevision(fh.Ino, stat.Revision)
 	fs.inodes.UpdateSize(fh.Ino, stat.Size)
@@ -340,7 +355,7 @@ func (fs *Dat9FS) retiredReadPendingSnapshot(fh *FileHandle, seq uint64) ([]reti
 	return snapshot, false
 }
 
-func (fs *Dat9FS) bindRetiredReadLocked(fh *FileHandle, resource string, view uint64, revision, size int64) {
+func (fs *Dat9FS) bindRetiredReadLocked(fh *FileHandle, resource string, view uint64, revision, size int64, epoch uint64) {
 	if fh.Dirty == nil {
 		return
 	}
@@ -349,7 +364,7 @@ func (fs *Dat9FS) bindRetiredReadLocked(fh *FileHandle, resource string, view ui
 		loader = old.loader
 	}
 	fh.Dirty.retiredRead = &retiredReadImage{ino: fh.Ino, resource: resource, view: view,
-		baseline: &retiredReadBaseline{revision: revision, size: size}, loader: loader}
+		baseline: &retiredReadBaseline{revision: revision, size: size, epoch: epoch}, loader: loader}
 	fs.bindRetiredReadLoaderLocked(fh)
 }
 
@@ -414,6 +429,7 @@ func (fs *Dat9FS) readRetiredFtruncateLocked(ctx context.Context, fh *FileHandle
 	if offset < 0 || offset > int64(^uint64(0)>>1)-int64(size) {
 		return nil, true, syscall.EINVAL
 	}
+	epoch := fh.readInvalidationEpoch.Load()
 	hadFence := fh.ftruncateFence
 	defer func() {
 		if !hadFence && fh.ftruncateFence {
@@ -424,6 +440,13 @@ func (fs *Dat9FS) readRetiredFtruncateLocked(ctx context.Context, fh *FileHandle
 		return nil, true, err
 	}
 	wb, i := fh.Dirty, fh.Dirty.retiredRead
+	if fh.DirtySeq == 0 && !wb.HasDirtyParts() && !fs.retiredReadPending(fh) &&
+		(i.baseline == nil || i.baseline.epoch != epoch) {
+		if err := fs.prepareRetiredReadLocked(ctx, fh); err != nil {
+			return nil, true, err
+		}
+		wb, i = fh.Dirty, fh.Dirty.retiredRead
+	}
 	end := min(offset+int64(size), wb.Size())
 	if end > offset && (!fh.ShadowReady || fh.ShadowStageGen == 0) {
 		for part := int(offset / wb.PartSize()); part <= int((end-1)/wb.PartSize()); part++ {
@@ -505,7 +528,9 @@ func (fs *Dat9FS) readRetiredFtruncateLocked(ctx context.Context, fh *FileHandle
 	stable := fs.dirtyInodes[fh.Ino] == dirty && fs.mutationInodes[fh.Ino] == committed
 	fs.dirtyMu.Unlock()
 	nowPending, busy := fs.retiredReadPendingSnapshot(fh, seq)
-	if !stable || !exists || current.ResourceID != i.resource || current.ResourceID != entry.ResourceID || current.Revision != entry.Revision ||
+	if epoch != fh.readInvalidationEpoch.Load() ||
+		(fh.DirtySeq == 0 && !wb.HasDirtyParts() && !fs.retiredReadPending(fh) && (base == nil || base.epoch != epoch)) ||
+		!stable || !exists || current.ResourceID != i.resource || current.ResourceID != entry.ResourceID || current.Revision != entry.Revision ||
 		fh.Dirty != wb || wb.retiredRead != i || wb.contentVersion != version || i.baseline != base || fh.Path != path ||
 		fh.DirtySeq != readerSeq || fh.BaseRev != baseRev || fh.OrigSize != originalSize ||
 		fh.pendingFtruncate.Load() != nil || !fs.ftruncateAliasLinked(fh) || fh.ShadowStageGen != shadow || busy || !slices.Equal(pending, nowPending) ||
