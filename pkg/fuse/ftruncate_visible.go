@@ -610,6 +610,9 @@ func (fs *Dat9FS) readPendingFtruncateHandleLocked(src *FileHandle, offset int64
 			return nil, 0, false, gofuse.Status(syscall.EAGAIN), false
 		}
 		if err := src.Dirty.EnsureLoaded(part); err != nil {
+			if hasRetiredRead(src) && errors.Is(err, syscall.EAGAIN) {
+				return nil, 0, false, gofuse.EAGAIN, false
+			}
 			return nil, 0, false, gofuse.EIO, false
 		}
 	}

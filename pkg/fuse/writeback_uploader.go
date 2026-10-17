@@ -502,6 +502,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		safeLogPrintf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", localPath, uploadMaxRetries+1, lastErr)
 		return
 	}
+	meta.readActualRev = committedRev
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	if meta.lineageTrusted && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= maxLandedPayloadBytes {
 		meta.liveChecksum = payloadChecksum(data)
@@ -662,8 +663,12 @@ func (u *WriteBackUploader) uploadSyncWithRevisionLocked(ctx context.Context, lo
 		}
 		return 0, proof, err
 	}
+	meta.readActualRev = committedRev
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	proof.rev = committedRev
+	if meta.retiredRead.matches(meta.Path, meta.Inode, meta.MutationSeq, meta.Size, meta.SnapshotID, stagingGens) {
+		proof.retiredRead, proof.readActualRev = meta.retiredRead, meta.readActualRev
+	}
 	meta.liveChecksum = proof.checksum
 	if u.OnDataCommitted != nil {
 		u.OnDataCommitted(*meta, committedRev, stagingGens)

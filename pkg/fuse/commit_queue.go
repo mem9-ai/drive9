@@ -111,6 +111,8 @@ type CommitEntry struct {
 	ftruncatePaths []string
 	ftruncateValid func() bool
 	payloadBound   bool
+	retiredRead    *retiredReadPublication
+	readActualRev  int64 // raw response, before expected-revision normalization
 }
 
 func (entry *CommitEntry) payloadBaseRevision() int64 {
@@ -2484,6 +2486,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, expectedRevision, com
 }
 
 func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRevision, committedRev int64, remoteModeAlreadyApplied bool) error {
+	entry.readActualRev = committedRev
 	layerRef := cq.layerRefSnapshot()
 	if layerRef == "" {
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)

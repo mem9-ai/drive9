@@ -81,8 +81,8 @@ func truncateHandoffFS(t *testing.T, initial []byte) (*Dat9FS, uint64, *truncate
 		}
 		if r.URL.Path == "/v2/uploads/initiate" {
 			var request struct {
-				TotalSize int64 `json:"total_size"`
-				Expected  int64 `json:"expected_revision"`
+				TotalSize int64  `json:"total_size"`
+				Expected  *int64 `json:"expected_revision"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Error(err)
@@ -91,11 +91,11 @@ func truncateHandoffFS(t *testing.T, initial []byte) (*Dat9FS, uint64, *truncate
 			}
 			remote.mu.Lock()
 			defer remote.mu.Unlock()
-			if request.Expected != remote.revision {
+			if request.Expected != nil && *request.Expected >= 0 && *request.Expected != remote.revision {
 				w.WriteHeader(http.StatusConflict)
 				return
 			}
-			uploadSize, uploadRevision, uploaded = request.TotalSize, request.Expected, nil
+			uploadSize, uploadRevision, uploaded = request.TotalSize, remote.revision, nil
 			if uploadSize <= 0 || uploadSize > DefaultPartSize {
 				t.Errorf("fixture only accepts one bounded part: %d", uploadSize)
 				w.WriteHeader(http.StatusBadRequest)

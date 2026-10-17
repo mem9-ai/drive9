@@ -107,6 +107,15 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if fs.ftruncateParticipates(fh) {
 		defer fs.releaseHandleRemoteCommitPathLocked(fh)
 	}
+	retiredOwner, hadRetiredFence := hasRetiredRead(fh), fh.ftruncateFence
+	defer func() {
+		if retiredOwner && !hadRetiredFence && fh.ftruncateFence {
+			fs.releaseHandleRemoteCommitPathLocked(fh)
+		}
+	}()
+	if err := fs.prepareRetiredReadLocked(ctx, fh); err != nil {
+		return httpToFuseStatus(err)
+	}
 	if handled, err := fs.prepareFtruncateCommitLocked(ctx, fh, fs.syncMode == SyncStrict); handled || err != nil {
 		return httpToFuseStatus(err)
 	}
@@ -442,7 +451,32 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		mutationSeq := fh.DirtySeq
 		uploadStart := time.Now()
 		fs.debugf("fsync writeback upload start path=%s", fh.Path)
+		var retiredBuffer *WriteBuffer
+		var retiredVersion uint64
+		if hasRetiredRead(fh) {
+			retiredBuffer, retiredVersion = fh.Dirty, fh.Dirty.contentVersion
+		}
 		committedRev, uploadedProof, err := fs.uploader.uploadSyncWithAppendSnapshot(ctx, fh.Path)
+		if retiredBuffer != nil {
+			if uploadedProof.retiredRead != nil {
+				if !ownsRetiredReadPublication(fh, uploadedProof.retiredRead) {
+					return gofuse.EAGAIN
+				}
+				fs.recordRetiredReadAck(uploadedProof.retiredRead, uploadedProof.rev, uploadedProof.readActualRev > 0)
+			}
+			if readErr := fs.reconcileRetiredReadLocked(ctx, fh, true); readErr != nil {
+				return httpToFuseStatus(readErr)
+			}
+			if err == nil {
+				if fs.retiredReadPending(fh) {
+					return gofuse.EAGAIN
+				}
+				// A chmod-only retry is not another data commit.
+				if uploadedProof.retiredRead == nil {
+					committedRev = fh.BaseRev
+				}
+			}
+		}
 		if uploadedProof.rev > 0 && fs.recordCommittedAppendSnapshot(fh.Path, uploadedProof) {
 			fs.publishLinkedAppendCommit(fh.Path, fh.Ino, uploadedProof.rev, uploadedProof.size)
 		}
@@ -476,6 +510,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			fh.Unlock()
 			fs.clearPendingModeForInodeGeneration(ino, fh, mode, modeGen)
 			fh.Lock()
+		}
+		if retiredBuffer != nil && (fh.Dirty != retiredBuffer || fh.Dirty.contentVersion != retiredVersion || fh.DirtySeq != mutationSeq) {
+			return gofuse.OK // Keep writes accepted while metadata finalization yielded.
 		}
 		// UploadSync already persisted the data to the server. Clear
 		// the dirty state so the subsequent flushHandleDebounced sees

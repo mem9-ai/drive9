@@ -71,6 +71,9 @@ func (fs *Dat9FS) handleCanAdoptCommittedRevisionLocked(fh *FileHandle) bool {
 	if fh == nil {
 		return false
 	}
+	if fs != nil && fs.retiredReadNeedsOwner(fh) {
+		return false
+	}
 	if fh.WriteBackSeq != 0 || fh.ShadowCommitReady || fh.ShadowCommitSeq != 0 {
 		return false
 	}
@@ -118,6 +121,9 @@ func clearHandleShadowClaimLocked(fh *FileHandle) {
 func (fs *Dat9FS) adoptCleanCommittedRevisionLocked(fh *FileHandle, revision, size int64) {
 	if fs == nil || fh == nil {
 		return
+	}
+	if fs.retiredReadOwnCommit(fh, revision, size) {
+		return // The owner consumes its receipt without throwing away loaded bytes.
 	}
 	// Read pins validate freshness independently. Leave shared staging bytes
 	// to their generation-scoped owner/lifecycle rather than guessing ownership
@@ -252,6 +258,15 @@ func (fs *Dat9FS) syncOpenHandlesAfterPathTruncate(ino uint64, newSize, committe
 	sharedZero := entry != nil && (entry.Nlink <= 1 || fs.openHandles.ftruncateInheritance(ino, entry.Path) != nil)
 	for _, fh := range fs.fileHandlesForInode(ino) {
 		fh.Lock()
+		if committedRevision > 0 && hasRetiredRead(fh) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() &&
+			!fs.retiredReadPending(fh) && fs.ftruncateAliasLinked(fh) {
+			invalidateRetiredReadImage(fh.Dirty)
+			if err := fs.syncPassivePathTruncateLocked(fh, newSize, committedRevision); err != nil {
+				safeLogPrintf("acknowledged retired-buffer truncate failed for %s: %v", fh.Path, err)
+			}
+			fh.Unlock()
+			continue
+		}
 		if (newSize > 0 || fh.Dirty == nil) && committedRevision > 0 && fh.pendingFtruncate.Load() != nil && fs.handleCanAdoptCommittedRevisionLocked(fh) {
 			if err := fs.syncPassivePathTruncateLocked(fh, newSize, committedRevision); err != nil {
 				safeLogPrintf("acknowledged path-truncate sync failed for %s: %v", fh.Path, err)

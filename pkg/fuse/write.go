@@ -37,6 +37,7 @@ type WriteBuffer struct {
 	prefixRevision int64
 	prefixEnd      int64
 	contentVersion uint64
+	retiredRead    *retiredReadImage
 	path           string
 	totalSize      int64 // current logical file size
 	maxSize        int64
@@ -89,6 +90,7 @@ type WriteBuffer struct {
 }
 
 type writeBufferSnapshot struct {
+	retiredRead     *retiredReadImage
 	path            string
 	totalSize       int64
 	maxSize         int64
@@ -114,6 +116,7 @@ func (wb *WriteBuffer) snapshot() *writeBufferSnapshot {
 		return nil
 	}
 	return &writeBufferSnapshot{
+		retiredRead:     cloneRetiredReadImage(wb.retiredRead),
 		path:            wb.path,
 		totalSize:       wb.totalSize,
 		maxSize:         wb.maxSize,
@@ -141,6 +144,7 @@ func (wb *WriteBuffer) restore(snapshot *writeBufferSnapshot) {
 	}
 	wb.contentVersion++
 	wb.prefixRevision, wb.prefixEnd = 0, 0
+	wb.retiredRead = cloneRetiredReadImage(snapshot.retiredRead)
 	wb.path = snapshot.path
 	wb.totalSize = snapshot.totalSize
 	wb.maxSize = snapshot.maxSize
@@ -1012,6 +1016,7 @@ func (wb *WriteBuffer) LoadMissingParts() error {
 func (wb *WriteBuffer) Reset() {
 	wb.contentVersion++
 	wb.prefixRevision, wb.prefixEnd = 0, 0
+	wb.retiredRead = nil
 	wb.parts = make(map[int][]byte)
 	wb.dirtyParts = make(map[int]bool)
 	wb.visibleTruncate = false

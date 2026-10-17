@@ -1635,7 +1635,11 @@ func (fs *Dat9FS) interruptSafeMutationsEnabled() bool {
 }
 
 func (fs *Dat9FS) recordCommittedMutation(ino uint64, seq uint64, revision int64, size int64) {
-	if ino == 0 || seq == 0 || (!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(ino) && !fs.hasFtruncateInheritance(ino)) {
+	fs.recordCommittedMutationQualified(ino, seq, revision, size, false)
+}
+
+func (fs *Dat9FS) recordCommittedMutationQualified(ino uint64, seq uint64, revision int64, size int64, retired bool) {
+	if ino == 0 || seq == 0 || (!retired && !fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(ino) && !fs.hasFtruncateInheritance(ino)) {
 		return
 	}
 
@@ -1775,6 +1779,7 @@ func (fs *Dat9FS) discardSupersededMutationLocked(fh *FileHandle) bool {
 		}
 	}
 	if fh.Dirty != nil {
+		invalidateRetiredReadImage(fh.Dirty)
 		fh.Dirty.ClearDirty()
 	}
 	fh.DirtySeq = 0
@@ -2309,7 +2314,7 @@ func (fs *Dat9FS) clearRemovedCommittedShadowForOpenHandles(path string, committ
 }
 
 func (fs *Dat9FS) clearRemovedCommittedShadowLocked(fh *FileHandle, committedRev, committedSize int64, releaseRemoteCommitLock bool) bool {
-	if fs == nil || fh == nil || fs.shadowStore == nil || !fh.ShadowReady || fs.shadowStore.Has(fh.Path) {
+	if fs == nil || fh == nil || fs.shadowStore == nil || !fh.ShadowReady || fs.shadowStore.Has(fh.Path) || fs.retiredReadNeedsOwner(fh) {
 		return false
 	}
 	if fh.Dirty != nil && (fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts()) {
@@ -2349,7 +2354,7 @@ func (fs *Dat9FS) committedHandleSizeLocked(fh *FileHandle) int64 {
 }
 
 func (fs *Dat9FS) rebindCleanWriteBufferToRemoteLocked(fh *FileHandle, committedSize int64) {
-	if fs == nil || fh == nil || fh.Dirty == nil || fh.Dirty.HasDirtyParts() {
+	if fs == nil || fh == nil || fh.Dirty == nil || fh.Dirty.HasDirtyParts() || fs.retiredReadNeedsOwner(fh) {
 		return
 	}
 	if committedSize < 0 {
@@ -2367,6 +2372,9 @@ func (fs *Dat9FS) rebindCleanWriteBufferToRemoteLocked(fh *FileHandle, committed
 	next := fs.newWriteBuffer(fh.Path, maxSize, partSize)
 	next.totalSize = committedSize
 	next.remoteSize = committedSize
+	if origin := old.retiredRead; origin != nil {
+		next.retiredRead = &retiredReadImage{ino: origin.ino, resource: origin.resource, view: origin.view}
+	}
 	// Some callers only have a locally enlarged inode size. Such a rebind
 	// must not certify that the enlarged range exists in the remote baseline.
 	if rev, size, known := fs.latestCommittedRevisionWithSize(fh.Path); known && rev == fh.BaseRev && size == committedSize {
@@ -2422,6 +2430,9 @@ func (fs *Dat9FS) rebindCleanWriteBufferToRemoteLocked(fh *FileHandle, committed
 		}
 		fs.debugDurationf(loadStart, 0, "committed dirty load part done path=%s part=%d off=%d len=%d got=%d err=<nil>", filePath, partNum, offset, length, len(data))
 		return data, nil
+	}
+	if next.retiredRead != nil {
+		fs.bindRetiredReadLoaderLocked(fh)
 	}
 }
 
@@ -2682,6 +2693,20 @@ func (fs *Dat9FS) markHandleRevisionOnlyLocked(fh *FileHandle, revision int64, s
 	} else {
 		fs.recordCommittedRevision(fh.Path, revision)
 	}
+	fs.updateHandleRevisionMetadataLocked(fh, revision, snapshotSize)
+	fs.inodes.UpdateRevision(fh.Ino, revision)
+	fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, revision, fh, snapshotSize)
+	if fs.publishLinkedAppendCommit(fh.Path, fh.Ino, revision, snapshotSize) {
+		fs.finishSyncCommitKernelCacheBoundary(fh.Ino, fh.Path, revision, snapshotSize)
+	}
+	if !hasRetiredRead(fh) {
+		fs.removeHandleStagingLocked(fh)
+		clearHandleShadowClaimLocked(fh)
+	}
+}
+
+// Update only this owner's acknowledged baseline, without removing successor staging.
+func (fs *Dat9FS) updateHandleRevisionMetadataLocked(fh *FileHandle, revision, snapshotSize int64) {
 	fh.IsNew = false
 	fh.BaseRev = revision
 	fh.OrigSize = snapshotSize
@@ -2691,13 +2716,6 @@ func (fs *Dat9FS) markHandleRevisionOnlyLocked(fh *FileHandle, revision int64, s
 		fh.appendLogRebindLayout(revision, snapshotSize)
 	}
 	fs.adoptCommittedStorageClassLocked(fh, snapshotSize)
-	fs.inodes.UpdateRevision(fh.Ino, revision)
-	fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, revision, fh, snapshotSize)
-	if fs.publishLinkedAppendCommit(fh.Path, fh.Ino, revision, snapshotSize) {
-		fs.finishSyncCommitKernelCacheBoundary(fh.Ino, fh.Path, revision, snapshotSize)
-	}
-	fs.removeHandleStagingLocked(fh)
-	clearHandleShadowClaimLocked(fh)
 }
 
 func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64) {
@@ -2727,9 +2745,11 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 		fh.ZeroBase = false
 	}
 	fs.rebaselineCommittedDirtyBufferLocked(fh)
-	fs.removeHandleStagingLocked(fh)
+	if !hasRetiredRead(fh) {
+		fs.removeHandleStagingLocked(fh)
+		clearHandleShadowClaimLocked(fh)
+	}
 	clearPreinstalledUnlinkSnapshotLocked(fh)
-	clearHandleShadowClaimLocked(fh)
 	fh.appendSnapshot = false
 }
 
@@ -3769,6 +3789,7 @@ func (fs *Dat9FS) bindCommitEntryToHandleLocked(entry *CommitEntry, fh *FileHand
 		entry.DurableWatermarkRev = watermark
 		entry.DisableAutoResolveLWW = true
 	}
+	entry.retiredRead = fs.captureRetiredReadLocked(fh)
 }
 
 func (fs *Dat9FS) bindCommitEntryToPath(entry *CommitEntry, remotePath string, payloadBaseRev int64) {
@@ -3839,6 +3860,7 @@ func (fs *Dat9FS) enqueueStagedShadowCommitLocked(fh *FileHandle) error {
 	}
 	fs.bindCommitEntryToHandleLocked(entry, fh, payloadBaseRev)
 	if err := fs.commitQueue.Enqueue(entry); err != nil {
+		fs.forgetRetiredReadCapture(fh, entry.retiredRead)
 		return err
 	}
 	fh.Dirty.ClearDirty()
@@ -3955,9 +3977,17 @@ func (fs *Dat9FS) snapshotWriteBackWithPendingLocked(fh *FileHandle, durable, pu
 				return 0
 			}
 			fh.PendingIndexGen = gen
+			if hasRetiredRead(fh) {
+				fs.pendingIndex.mu.Lock()
+				if meta := fs.pendingIndex.items[fh.Path]; meta != nil && meta.Generation == gen {
+					meta.Inode, meta.MutationSeq = fh.Ino, fh.DirtySeq
+				}
+				fs.pendingIndex.mu.Unlock()
+			}
 			return gen
 		}
 	}
+	readPublication := fs.captureRetiredReadLocked(fh)
 	gen, timings, err := fs.writeBack.putHandleSnapshot(
 		fh.Path,
 		data,
@@ -3975,7 +4005,11 @@ func (fs *Dat9FS) snapshotWriteBackWithPendingLocked(fh *FileHandle, durable, pu
 		fh.DirtySeq,
 		ownedStaging,
 		publishPending,
+		readPublication,
 	)
+	if err != nil {
+		fs.forgetRetiredReadCapture(fh, readPublication)
+	}
 	if err == nil {
 		// Record the staged generation so unlink-discard can remove only this
 		// handle's entry, never a fresher replacement at the same path.
@@ -4626,7 +4660,7 @@ func (fs *Dat9FS) readSQLitePersistentJournalVisibleRange(path string, skip *Fil
 // but unsafe to rebind so the caller can skip it and fall back to
 // shadowStore/remote.
 func (fs *Dat9FS) rebindStaleCleanSamePathReadCandidateLocked(fh *FileHandle) bool {
-	if fs == nil || fh == nil || fh.Dirty == nil || fh.Dirty.HasDirtyParts() {
+	if fs == nil || fh == nil || fh.Dirty == nil || fh.Dirty.HasDirtyParts() || fs.retiredReadNeedsOwner(fh) {
 		return false
 	}
 	revision, committedSize, hasSize := fs.latestCommittedRevisionWithSize(fh.Path)
@@ -13362,6 +13396,14 @@ readHandleState:
 		}
 		return gofuse.ReadResultData(data), gofuse.OK
 	}
+	if data, handled, err := fs.readRetiredFtruncateLocked(ctx, fh, int64(input.Offset), input.Size); handled {
+		fh.Unlock()
+		source, bytesRead = "retired-ftruncate", len(data)
+		if err != nil {
+			return nil, httpToFuseStatus(err)
+		}
+		return gofuse.ReadResultData(data), gofuse.OK
+	}
 	if !fh.Unlinked && !fh.UnlinkedSnapshot && fh.UnlinkedData == nil && !isSQLiteDirectIOPath(fh.Path) {
 		readerPath := fh.Path
 		readerSeq := fh.DirtySeq
@@ -14223,6 +14265,13 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			return 0, httpToFuseStatus(waitErr)
 		}
 	}
+	readErr := fs.prepareRetiredReadLocked(ctx, fh)
+	if fh.ftruncateFence {
+		unlockRemoteCommit = func() { fs.releaseHandleRemoteCommitPathLocked(fh) }
+	}
+	if readErr != nil {
+		return 0, httpToFuseStatus(readErr)
+	}
 	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
 	writeSyncAppendLogState := appendLogHandleState{}
 	writeSyncBeforeDirtySeq := fh.DirtySeq
@@ -14382,6 +14431,9 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 			fh.Dirty = fs.newWriteBuffer(fh.Path, snapshot.maxSize, snapshot.partSize)
 		}
 		fh.Dirty.restore(snapshot)
+		if fh.Dirty.retiredRead != nil {
+			fs.bindRetiredReadLoaderLocked(fh)
+		}
 		if fh.Dirty.HasDirtyParts() {
 			if restoreDirtySeq != 0 {
 				fh.DirtySeq = restoreDirtySeq
@@ -14452,6 +14504,7 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 		}
 	}()
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
+	readPublication := fs.captureRetiredReadLocked(fh)
 	var (
 		data         []byte
 		committedRev int64
@@ -14601,10 +14654,14 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 	// The commit is authoritative for the storage class: direct PUT lands
 	// inline, PATCH keeps S3, and a full upload re-splits by size.
 	fs.adoptCommittedStorageClassLocked(fh, size)
+	readQualified := fs.recordRetiredReadAck(readPublication, committedRevisionForExpectedRevision(expectedRevision, committedRev), committedRev > 0)
 	sidecarRevision := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
-	fs.recordCommittedMutation(fh.Ino, mutationSeq, sidecarRevision, size)
+	fs.recordCommittedMutationQualified(fh.Ino, mutationSeq, sidecarRevision, size, readQualified)
 	if sidecarRevision > 0 {
 		fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, sidecarRevision, fh, size)
+	}
+	if err := fs.reconcileRetiredReadLocked(ctx, fh, false); err != nil {
+		return httpToFuseStatus(err)
 	}
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 		safeLogPrintf("write-sync pending chmod failed for %s: %v", fh.Path, err)
@@ -14921,6 +14978,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	ino := fh.Ino
 	handle := fh               // capture for goroutine
 	snapshotSeq := fh.DirtySeq // capture current dirty sequence
+	readPublication := fs.captureRetiredReadLocked(fh)
 	// Snapshot the staging-store generations so the post-upload cleanup can be
 	// generation-guarded. A concurrent same-path write while the debounce is
 	// pending/in-flight would bump these generations, and removing the fresher
@@ -15005,11 +15063,17 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 			safeLogPrintf("debounced flush failed for %s: %v", filePath, err)
 			return
 		}
+		readQualified := fs.recordRetiredReadAck(readPublication, committedRevisionForExpectedRevision(expectedRevision, committedRev), committedRev > 0)
 		mutationRevision := fs.resolveCommittedMutationRevision(filePath, committedRev, expectedRevision)
-		fs.recordCommittedMutation(ino, snapshotSeq, mutationRevision, int64(len(data)))
+		fs.recordCommittedMutationQualified(ino, snapshotSeq, mutationRevision, int64(len(data)), readQualified)
 		fs.captureFtruncateIdentity(ctx, ino, filePath, mutationRevision)
 		if mutationRevision > 0 {
 			fs.refreshCommittedRevisionForOpenHandlesWithSize(filePath, mutationRevision, handle, int64(len(data)))
+		}
+		if err := fs.reconcileRetiredReadLocked(context.Background(), handle, false); err != nil {
+			unlockRemoteCommit()
+			handle.Unlock()
+			return
 		}
 		modeCtx, modeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		modeErr := fs.applyPendingModeForHandleLocked(modeCtx, handle)
@@ -15219,6 +15283,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 	mutationUploadCommitted := false
 	var mutationCommittedRevision int64
 	var mutationProof pathCommitLandmark
+	var readPublication *retiredReadPublication
 	captureMutationProof := func(data []byte) {
 		if !mutationTruncate || !fh.LineageTrusted || mutationSize > maxLandedPayloadBytes ||
 			fh.Path != mutationPath || fh.DirtySeq != mutationSeq || int64(len(data)) != mutationSize {
@@ -15233,7 +15298,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 	}
 	recordMutationBeforeFenceRelease := func() {
 		if mutationRecorded || !mutationUploadCommitted || mutationSeq == 0 ||
-			(!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(mutationIno) && !fs.hasFtruncateInheritance(mutationIno)) {
+			(readPublication == nil && !fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(mutationIno) && !fs.hasFtruncateInheritance(mutationIno)) {
 			return
 		}
 		// The cached path revision may precede this upload. Use its actual
@@ -15248,7 +15313,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 			fs.commitQueue.rememberLanded(mutationPath, revision, mutationSize, mutationProof.checksum, mutationProof.snapshotID, mutationProof.ancestors...)
 		}
 		fs.recordCommittedRevisionWithSize(mutationPath, revision, mutationSize)
-		fs.recordCommittedMutation(mutationIno, mutationSeq, revision, mutationSize)
+		fs.recordCommittedMutationQualified(mutationIno, mutationSeq, revision, mutationSize, readPublication != nil)
 		fs.captureFtruncateIdentity(ctx, mutationIno, mutationPath, revision)
 		if fs.gvisorCompatibilityEnabled() && revision > 0 {
 			fs.refreshCommittedRevisionForOpenHandlesWithSize(mutationPath, revision, fh, mutationSize)
@@ -15461,6 +15526,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 	handleDirtyPartSize := fh.Dirty.PartSize()
 	handleFullRangeLoaded := writeBufferHasLoadedFullRange(fh.Dirty)
 	commitBuffer, commitVersion := fh.Dirty, fh.Dirty.contentVersion
+	readPublication = fs.captureRetiredReadLocked(fh)
 	stagingGens := fs.captureHandleStagingGensLocked(fh)
 	var committedRev int64
 
@@ -15702,6 +15768,9 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 			}
 		}
 	}
+	if err == nil {
+		fs.recordRetiredReadAck(readPublication, committedRevisionForExpectedRevision(expectedRevision, committedRev), committedRev > 0)
+	}
 	mutationCommittedRevision = committedRev
 	mutationUploadCommitted = err == nil
 	recordMutationBeforeFenceRelease()
@@ -15717,6 +15786,7 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 	if testHookBeforeFlushRelock != nil {
 		testHookBeforeFlushRelock(handlePath)
 	}
+	failpoint.InjectCall("retiredFtruncateUploadBeforeRelock", fs, fh)
 	fh.Lock()
 	fs.debugDurationf(uploadStart, 0, "flushHandle path2 relock after upload path=%s size=%d err=%v", handlePath, size, err)
 
@@ -15770,6 +15840,12 @@ func (fs *Dat9FS) flushHandleWithAppendRetryBudget(ctx context.Context, fh *File
 		phase = "unlinked-after-upload"
 		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
+	}
+	if readPublication != nil && !ownsRetiredReadPublication(fh, readPublication) {
+		return gofuse.OK // The captured upload cannot finalize a replaced/restored image.
+	}
+	if err := fs.reconcileRetiredReadLocked(ctx, fh, false); err != nil {
+		return httpToFuseStatus(err)
 	}
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 		safeLogPrintf("flush pending chmod failed for %s: %v", handlePath, err)
@@ -16355,7 +16431,12 @@ func (fs *Dat9FS) captureHandleStagingGensLocked(fh *FileHandle) StagingGens {
 }
 
 func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) {
+	readQualified := false
 	if fs != nil && entry != nil {
+		gens := StagingGens{WriteBackGen: entry.WriteBackGen, PendingIndexGen: entry.PendingIndexGen, ShadowGen: entry.ShadowGen}
+		if entry.retiredRead.matches(entry.Path, entry.Inode, entry.MutationSeq, entry.Size, entry.SnapshotID, gens) {
+			readQualified = fs.recordRetiredReadAck(entry.retiredRead, committedRev, entry.readActualRev > 0)
+		}
 		fs.publishLinkedAppendCommit(entry.Path, entry.Inode, committedRev, entry.Size)
 	}
 	// A source may already be closed and a renamed alias may have no live
@@ -16368,7 +16449,7 @@ func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) 
 			fs.inodes.advanceRevision(ino, committedRev)
 		}
 	}
-	if fs == nil || entry == nil || (!fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(entry.Inode) && !fs.hasFtruncateInheritance(entry.Inode)) {
+	if fs == nil || entry == nil || (!readQualified && !fs.gvisorCompatibilityEnabled() && !fs.openHandles.HasVisibleTruncate(entry.Inode) && !fs.hasFtruncateInheritance(entry.Inode)) {
 		return
 	}
 	if entry.mutationPublished {
@@ -16386,7 +16467,7 @@ func (fs *Dat9FS) onCommitQueueUploaded(entry *CommitEntry, committedRev int64) 
 		}
 	}
 	entry.mutationPublished = true
-	fs.recordCommittedMutation(entry.Inode, entry.MutationSeq, committedRev, entry.Size)
+	fs.recordCommittedMutationQualified(entry.Inode, entry.MutationSeq, committedRev, entry.Size, readQualified)
 	fs.captureFtruncateIdentity(context.Background(), entry.Inode, entry.Path, committedRev)
 	if fs.gvisorCompatibilityEnabled() && committedRev > 0 {
 		fs.refreshCommittedRevisionForOpenHandlesWithSize(entry.Path, committedRev, nil, entry.Size)
@@ -16413,6 +16494,10 @@ func (fs *Dat9FS) onWriteBackDataCommitted(meta WriteBackMeta, committedRev int6
 	if fs == nil {
 		return
 	}
+	readQualified := false
+	if meta.retiredRead.matches(meta.Path, meta.Inode, meta.MutationSeq, meta.Size, meta.SnapshotID, gens) {
+		readQualified = fs.recordRetiredReadAck(meta.retiredRead, committedRev, meta.readActualRev > 0)
+	}
 	// Publish content identity before its watermark can retire the live/staged
 	// read source. Rejected proof authority still settles its own generations.
 	if committedRev > 0 && fs.latestCommittedRevision(meta.Path) <= committedRev {
@@ -16430,7 +16515,7 @@ func (fs *Dat9FS) onWriteBackDataCommitted(meta WriteBackMeta, committedRev int6
 	}
 	failpoint.InjectCall("writeBackDataCommittedProofReady", fs, meta, committedRev)
 	if meta.Inode != 0 && meta.MutationSeq != 0 {
-		fs.recordCommittedMutation(meta.Inode, meta.MutationSeq, committedRev, meta.Size)
+		fs.recordCommittedMutationQualified(meta.Inode, meta.MutationSeq, committedRev, meta.Size, readQualified)
 		fs.captureFtruncateIdentity(context.Background(), meta.Inode, meta.Path, committedRev)
 	}
 	if meta.ownedStagingKnown {

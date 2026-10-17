@@ -56,7 +56,7 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 		}
 		fh.PendingIndexGen = gen
 	}
-	if fs.ftruncateParticipates(fh) {
+	if fs.ftruncateParticipates(fh) || hasRetiredRead(fh) {
 		fs.pendingIndex.mu.Lock()
 		if meta := fs.pendingIndex.items[fh.Path]; meta != nil && meta.Generation == fh.PendingIndexGen {
 			meta.ownedStagingKnown = true

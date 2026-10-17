@@ -17,12 +17,14 @@ import (
 // a path. It is never persisted: after restart there is no safe causal proof
 // between mutable shadow bytes and recovered metadata.
 type pathCommitLandmark struct {
-	rev        int64
-	size       int64
-	checksum   string
-	snapshotID string
-	ancestors  []string
-	lastUsed   uint64
+	rev           int64
+	size          int64
+	checksum      string
+	snapshotID    string
+	ancestors     []string
+	lastUsed      uint64
+	retiredRead   *retiredReadPublication // selected upload source, never writable lineage
+	readActualRev int64
 }
 
 const (

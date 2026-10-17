@@ -95,7 +95,9 @@ type WriteBackMeta struct {
 	liveChecksum string
 	// shadowSource binds only PendingIndex publication to its exact payload.
 	// WriteBackCache owns .dat bytes; its metadata never authorizes .shadow.
-	shadowSource shadowReadSource
+	shadowSource  shadowReadSource
+	retiredRead   *retiredReadPublication
+	readActualRev int64
 }
 
 func cloneWriteBackMeta(meta *WriteBackMeta) WriteBackMeta {
@@ -307,11 +309,11 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsNoSync(remotePath
 	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, false, liveAncestors, 0, 0, nil, nil)
 }
 
-func (c *WriteBackCache) putHandleSnapshot(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted, durable bool, liveAncestors []string, ino, seq uint64, ownedStaging StagingGens, publishPending func() uint64) (uint64, WriteBackPutTimings, error) {
-	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, durable, liveAncestors, ino, seq, &ownedStaging, publishPending)
+func (c *WriteBackCache) putHandleSnapshot(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted, durable bool, liveAncestors []string, ino, seq uint64, ownedStaging StagingGens, publishPending func() uint64, retired ...*retiredReadPublication) (uint64, WriteBackPutTimings, error) {
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, durable, liveAncestors, ino, seq, &ownedStaging, publishPending, retired...)
 }
 
-func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, durable bool, liveAncestors []string, ino, seq uint64, ownedStaging *StagingGens, publishPending func() uint64) (uint64, WriteBackPutTimings, error) {
+func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, durable bool, liveAncestors []string, ino, seq uint64, ownedStaging *StagingGens, publishPending func() uint64, retired ...*retiredReadPublication) (uint64, WriteBackPutTimings, error) {
 	var t WriteBackPutTimings
 
 	// Phase 1: acquire per-path lock (serializes same-path Put/Remove/etc.)
@@ -380,6 +382,11 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 		if pendingGen := publishPending(); pendingGen != 0 {
 			meta.ownedStagingGens.PendingIndexGen = pendingGen
 		}
+	}
+
+	if len(retired) != 0 && retired[0] != nil {
+		meta.retiredRead = retired[0]
+		meta.retiredRead.gens = meta.ownedStagingGens
 	}
 
 	// Phase 3: publish in-memory state under global lock (fast, no I/O).

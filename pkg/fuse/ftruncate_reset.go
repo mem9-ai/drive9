@@ -136,6 +136,7 @@ func (fs *Dat9FS) retireCommittedFtruncateLocked(ctx context.Context, fh *FileHa
 		fh.Streamer = nil
 	}
 	fs.rebindCleanWriteBufferToRemoteLocked(fh, stat.Size)
+	fs.bindRetiredReadLocked(fh, entry.ResourceID, view, stat.Revision, stat.Size)
 	clearStagedSnapshotLineageLocked(fh)
 	fh.ContentSnapshotID, fh.ftruncateInherited = "", ""
 	fh.contentAncestors = nil

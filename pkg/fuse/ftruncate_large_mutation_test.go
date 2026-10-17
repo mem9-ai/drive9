@@ -126,13 +126,20 @@ func TestFtruncateLargeSettledAliasMutation(t *testing.T) {
 						if reader.pendingFtruncate.Load() != nil || reader.LineageTrusted || reader.ftruncateInherited != "" {
 							t.Fatal("settled large baseline retained writable truncate ancestry")
 						}
-						hardlinkSync(t, fs, ino, b)
 						want := bytes.Clone(initial[:target])
 						if appendMode {
 							want = append(want, 'H')
 						} else {
 							want[0] = 'H'
 						}
+						for _, offset := range []int{0, target - 4, target} {
+							got, st := truncateHandoffRead(fs, ino, b, int64(offset), 16)
+							expected := want[min(offset, len(want)):min(offset+16, len(want))]
+							if st != gofuse.OK || !bytes.Equal(got, expected) {
+								t.Fatalf("self-read before Fsync at%d=%x/%v want=%x", offset, got, st, expected)
+							}
+						}
+						hardlinkSync(t, fs, ino, b)
 						if data, rev, _ := remote.snapshot(); rev != 3 || !bytes.Equal(data, want) {
 							t.Fatalf("next actual remote size=%d rev=%d want size=%d rev3", len(data), rev, len(want))
 						}
