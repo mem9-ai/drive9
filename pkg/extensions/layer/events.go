@@ -4,6 +4,7 @@ package layer
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"time"
@@ -140,15 +141,22 @@ func (l *Layer) refreshEvents(ctx context.Context) error {
 			h.mu.Unlock()
 			return true
 		}
-		if h.dirty {
+		kind, _, _, content, look := l.lookup(path)
+		// The handle's OWN last landing is not an external change: write →
+		// fsync → write before this poll put the previous commit into
+		// `changed`, and comparing the observed entry against the landing
+		// identity keeps the newer dirty buffer unfenced (main's replay
+		// compared tips the same way).
+		selfLanded := look && kind == "file" && h.landed &&
+			sha256.Sum256(content) == h.landedSum
+		if h.dirty && !selfLanded {
 			// v1 preserveLayerReplayConflict: an external change under
 			// uncommitted writes fences the handle — publishing its
 			// buffer onto the new tip would splice stale bytes. The
 			// buffer is kept; writes and commits answer EAGAIN.
 			h.conflicted = true
 		}
-		if _, _, _, _, ok := l.lookup(path); ok {
-			kind, _, _, content, _ := l.lookup(path)
+		if look {
 			if kind == "file" && !h.dirty {
 				h.buf = nil
 				h.origSize = int64(len(content))
@@ -158,7 +166,6 @@ func (l *Layer) refreshEvents(ctx context.Context) error {
 			h.buf = nil
 			h.origSize = 0
 		}
-		kind, _, _, _, look := l.lookup(path)
 		if look && kind == "whiteout" {
 			h.unlinked = true
 		}

@@ -94,15 +94,20 @@ func (w *Writeback) inodeHandles(ino uint64, path string) []*bufferingHandle {
 	}
 	seen := make(map[*bufferingHandle]struct{})
 	var out []*bufferingHandle
-	// liveSet keys on the handle itself (the value is a set marker).
-	w.liveSet.Range(func(key, _ any) bool {
+	// liveSet keys on the handle; the value is the immutable identity
+	// snapshot, read WITHOUT the handle mutex — a sibling stalled over a
+	// buffer hydration (its mutex held across remote reads) must not hang
+	// an enumeration that only wants to list candidates.
+	w.liveSet.Range(func(key, v any) bool {
 		h, ok := key.(*bufferingHandle)
 		if !ok {
 			return true
 		}
-		h.mu.Lock()
-		hpath, hino := h.path, h.ino
-		h.mu.Unlock()
+		info, iok := v.(*handleInfo)
+		if !iok {
+			info = h.infoSnapshot()
+		}
+		hpath, hino := info.path, info.ino
 		if _, dup := seen[h]; dup {
 			return true
 		}
@@ -256,24 +261,38 @@ func (w *Writeback) readAliasStagedImage(reader *bufferingHandle, off int64, des
 // admissions from interleaving partial sets. Contention retries within
 // the bounded window and fails closed with EAGAIN.
 //
-// The sort keys are snapshotted under each handle's own lock — sorting on
-// a bare h.path read races a concurrent rename/retarget write and could
-// order two admissions by inconsistent keys (review P1) — and every
-// locked handle re-verifies its key before the set is accepted: a rename
-// that moved a sibling mid-sweep restarts the sweep instead of letting an
-// admission proceed over a stale ordering.
+// The sort keys are snapshotted with TryLock-bounded holds — sorting on
+// a bare h.path read races a concurrent rename/retarget write, and a
+// BLOCKING snapshot lock would hang the admission on a sibling whose
+// mutex sits over buffer hydration/remote reads, past every deadline
+// check (review P1) — and every locked handle re-verifies its key before
+// the set is accepted: a rename that moved a sibling mid-sweep restarts
+// the sweep (snapshot included) instead of letting an admission proceed
+// over a stale ordering.
 func (w *Writeback) lockSiblingsOrdered(siblings []*bufferingHandle, owner *bufferingHandle) ([]*bufferingHandle, error) {
 	deadline := time.Now().Add(samePathDirtyWaitTimeout)
 	locked := make([]*bufferingHandle, 0, len(siblings))
+	keys := make([]siblingKey, 0, len(siblings))
 	for {
-		keys := make([]siblingKey, 0, len(siblings))
+		keys = keys[:0]
 		for _, sib := range siblings {
 			if sib == owner {
 				continue
 			}
-			sib.mu.Lock()
+			if !sib.mu.TryLock() {
+				break
+			}
 			keys = append(keys, siblingKey{h: sib, path: sib.path})
 			sib.mu.Unlock()
+		}
+		if len(keys) < countSiblings(siblings, owner) {
+			// A sibling stayed busy through its snapshot attempt — retry
+			// within the budget rather than blocking on it.
+			if time.Now().After(deadline) {
+				return nil, errFtruncateBusy
+			}
+			time.Sleep(samePathDirtyWaitInterval)
+			continue
 		}
 		sort.Slice(keys, func(i, j int) bool { return keys[i].path < keys[j].path })
 
@@ -307,6 +326,18 @@ func (w *Writeback) lockSiblingsOrdered(siblings []*bufferingHandle, owner *buff
 		}
 		time.Sleep(samePathDirtyWaitInterval)
 	}
+}
+
+// countSiblings counts the admission's sibling set (everything but the
+// owner).
+func countSiblings(siblings []*bufferingHandle, owner *bufferingHandle) int {
+	n := 0
+	for _, sib := range siblings {
+		if sib != owner {
+			n++
+		}
+	}
+	return n
 }
 
 // siblingKey is a lock-held snapshot of one sibling's sort key.

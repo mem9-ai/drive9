@@ -645,18 +645,19 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				extra := append([]LayerEntry(nil), b.layerEvents[id]...)
 				b.mu.Unlock()
 				type ev struct {
-					Seq int64  `json:"seq"`
-					Op  string `json:"op"`
+					Seq  int64  `json:"seq"`
+					Op   string `json:"op"`
+					Path string `json:"path"`
 				}
 				out := []ev{}
 				for _, e := range log {
 					if e.Seq > since {
-						out = append(out, ev{Seq: e.Seq, Op: "write"})
+						out = append(out, ev{Seq: e.Seq, Op: "write", Path: e.Path})
 					}
 				}
 				for _, e := range extra {
 					if e.Seq > since {
-						out = append(out, ev{Seq: e.Seq, Op: e.Op})
+						out = append(out, ev{Seq: e.Seq, Op: e.Op, Path: e.Path})
 					}
 				}
 				b.writeJSON(w, map[string]any{"events": out})
@@ -978,31 +979,47 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	case r.Method == http.MethodHead:
+		// Snapshot the node's fields under the lock: a concurrent PUT on
+		// the same path rewrites n.Data after its own lock, and reading
+		// the fields here unlocked is a data race under -race (and served
+		// torn header/body pairs).
 		b.mu.Lock()
 		n := b.files[p]
+		var isDir bool
+		var dataLen int
+		var rev, mtime int64
+		var mode uint32
+		var contentLayout string
+		var extentIno uint64
+		if n != nil {
+			isDir = n.IsDir
+			dataLen = len(n.Data)
+			rev, mtime, mode = n.Rev, n.Mtime, n.Mode
+			contentLayout, extentIno = n.ContentLayout, n.ExtentIno
+		}
 		b.mu.Unlock()
 		if n == nil {
 			b.writeErr(w, http.StatusNotFound, "not found")
 			return
 		}
-		w.Header().Set("X-Dat9-IsDir", strconv.FormatBool(n.IsDir))
-		w.Header().Set("Content-Length", strconv.Itoa(len(n.Data)))
-		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(n.Rev, 10))
-		w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(n.Mode), 10))
-		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(n.Mtime, 10))
+		w.Header().Set("X-Dat9-IsDir", strconv.FormatBool(isDir))
+		w.Header().Set("Content-Length", strconv.Itoa(dataLen))
+		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+		w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(mode), 10))
+		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(mtime, 10))
 		// Mirror the real server's placement decision: objects at or
 		// above the advertised inline threshold live in object storage.
 		storageType := "db9"
-		if int64(len(n.Data)) >= 1<<20 {
+		if int64(dataLen) >= 1<<20 {
 			storageType = "s3"
 		}
 		w.Header().Set("X-Dat9-Storage-Type", storageType)
-		if n.ContentLayout != "" {
-			w.Header().Set("X-Dat9-Content-Layout", n.ContentLayout)
+		if contentLayout != "" {
+			w.Header().Set("X-Dat9-Content-Layout", contentLayout)
 		}
-		if ino := n.ExtentIno; ino != 0 {
+		if extentIno != 0 {
 			w.Header().Set("X-Dat9-Content-Layout", "extent")
-			w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(ino, 10))
+			w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(extentIno, 10))
 		}
 		w.WriteHeader(http.StatusOK)
 
@@ -1056,28 +1073,36 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.writeJSON(w, map[string]any{"entries": out})
 
 	case r.Method == http.MethodGet:
+		// Snapshot the slice header under the lock: PUTs replace the
+		// field (never mutating the old backing array), so serving the
+		// captured bytes after unlocking is race-free while reading the
+		// field unlocked was not.
 		b.mu.Lock()
 		n := b.files[p]
+		var data []byte
+		if n != nil {
+			data = n.Data
+		}
 		b.mu.Unlock()
 		if n == nil || n.IsDir {
 			b.writeErr(w, http.StatusNotFound, "not found")
 			return
 		}
 		if rng := r.Header.Get("Range"); rng != "" {
-			lo, hi, ok := parseRange(rng, int64(len(n.Data)))
+			lo, hi, ok := parseRange(rng, int64(len(data)))
 			if !ok {
 				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 				return
 			}
 			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", lo, hi-1, len(n.Data)))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", lo, hi-1, len(data)))
 			w.WriteHeader(http.StatusPartialContent)
-			_, _ = w.Write(n.Data[lo:hi])
+			_, _ = w.Write(data[lo:hi])
 			return
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(n.Data)
+		_, _ = w.Write(data)
 
 	case r.Method == http.MethodPut:
 		body := make([]byte, r.ContentLength)

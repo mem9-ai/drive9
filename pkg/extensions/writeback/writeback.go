@@ -2310,7 +2310,22 @@ func (w *Writeback) localPathOf(rp string) string {
 // per-path Setattr deferral) and in the walk set for unlink/rename.
 func (w *Writeback) track(h *bufferingHandle) {
 	w.live.Store(h.path, h)
-	w.liveSet.Store(h, struct{}{})
+	w.liveSet.Store(h, h.infoSnapshot())
+}
+
+// handleInfo is the immutable registry snapshot carried in liveSet: the
+// sibling sweeps enumerate the set WITHOUT taking handle mutexes (a
+// stalled holder must not hang an enumeration), so identity fields are
+// read from this atomically-swapped pointer instead of the handle.
+type handleInfo struct {
+	path string
+	ino  uint64
+}
+
+func (h *bufferingHandle) infoSnapshot() *handleInfo {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return &handleInfo{path: h.path, ino: h.ino}
 }
 
 func (w *Writeback) untrack(h *bufferingHandle) {
@@ -2551,6 +2566,9 @@ func (w *Writeback) retarget(oldPath, newPath string) {
 		}
 		if next != "" {
 			h.path = next
+			// Refresh the registry snapshot under the same lock: the
+			// lock-free sibling sweeps read identity from it.
+			w.liveSet.Store(h, &handleInfo{path: next, ino: h.ino})
 			// The wrapped read handle is path-bound too (core's SyncHandle
 			// fetches by its own path): rebind it or the fd keeps reading
 			// the doomed name — which a later replacement owns (#1029).

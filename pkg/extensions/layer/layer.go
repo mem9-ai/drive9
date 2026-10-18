@@ -88,6 +88,9 @@ type Layer struct {
 	// unlink/rename retargeting).
 	live    sync.Map // path -> newest live handle
 	handles sync.Map // every live handle (survivor re-selection)
+	// regMu serializes the registry protocol (retirement vs rename move
+	// vs survivor promotion) for claimed handles.
+	regMu sync.Mutex
 	// policy is the mount's write policy: write-sync commits per write.
 	policy string
 	// inlineMaxOverride bounds inline entry bodies in tests (0 = client
@@ -110,8 +113,13 @@ func (l *Layer) liveStore(path string, h *layerHandle) {
 // untrackHandle RETIRES a descriptor: its Release published and it must
 // never be re-selected or retargeted again. The handle leaves the index
 // entirely (a retired descriptor dirty again would strand the change with
-// no committer).
+// no committer). The whole retirement runs under regMu so a concurrent
+// retarget cannot resurrect the retired fd into either index after this
+// point: the rename side re-checks the lifetime under the same lock
+// before it registers the new-name slot.
 func (l *Layer) untrackHandle(h *layerHandle) {
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
 	h.mu.Lock()
 	h.released = true
 	path := h.path
@@ -120,6 +128,12 @@ func (l *Layer) untrackHandle(h *layerHandle) {
 	l.detachFromRegistry(h, path)
 }
 
+// untrackHandle removes exactly one handle's registration: the path slot
+// may hold a NEWER claim (a second open overwrote it), and deleting the
+// slot outright hid the surviving writer from rename retargeting — its
+// pending edit then landed under the old name instead of following the
+// rename. The path slot is cleared only while it still maps to this
+// handle; a surviving older claim is re-selected.
 // detachFromRegistry removes one handle's claim on the GIVEN path slot
 // without touching the descriptor's lifetime (renames move open fds; the
 // caller names the slot it saw — the handle's current path may already be
@@ -128,19 +142,27 @@ func (l *Layer) untrackHandle(h *layerHandle) {
 // maps to this handle, and a
 // surviving same-path claim is re-selected into it.
 func (l *Layer) detachFromRegistry(h *layerHandle, path string) {
-	if cur, ok := l.live.Load(path); ok && cur != h {
-		return
-	}
-	l.live.Delete(path)
+	// Compare-and-delete: a plain Load→Delete pair dropped a NEWER claim
+	// that a concurrent open stored into the slot between the two calls.
+	// The slot dies only while it still maps to the detaching handle.
+	l.live.CompareAndDelete(path, h)
 	l.handles.Range(func(key, _ any) bool {
-		if other, ok := key.(*layerHandle); ok && other != h && !other.unlinked && !other.released {
-			other.mu.Lock()
-			same := other.path == path
-			other.mu.Unlock()
-			if same {
-				l.live.Store(path, other)
-				return false
-			}
+		other, ok := key.(*layerHandle)
+		if !ok || other == h {
+			return true
+		}
+		// Lifetime AND path are verified under the candidate's own lock —
+		// bare reads raced Release/Unlink writes and could promote a
+		// retired or anonymous descriptor back into the live slot. The
+		// released flag only ever flips under regMu (untrackHandle), and
+		// every caller holds it here, so the check is stable against
+		// retirement racing the promotion.
+		other.mu.Lock()
+		eligible := !other.unlinked && !other.released && other.path == path
+		other.mu.Unlock()
+		if eligible {
+			l.live.Store(path, other)
+			return false
 		}
 		return true
 	})

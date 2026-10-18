@@ -117,7 +117,13 @@ func (l *Layer) renameLayer(ctx context.Context, oldPath, newPath string) error 
 		content, ok = hydrated, true
 	}
 	data, baseMode := content, mode
-	if !ok || len(content) == 0 {
+	// The overlay entry is authoritative at ANY length — including empty:
+	// a zero-byte inline image (a created-then-closed layer-only file, or
+	// a base-backed file truncated to zero) must rename as the empty
+	// image, not fall back to the base namespace and resurrect the
+	// original bytes at the destination (the fallback answers only when
+	// the entry is absent).
+	if !ok {
 		st, err := l.cl.StatCtx(ctx, oldRemote)
 		if err != nil {
 			return err

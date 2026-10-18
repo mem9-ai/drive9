@@ -278,9 +278,22 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		if err := l.renameLayer(ctx, op.Path, op.Path2); err != nil {
 			return fs.Result{}, err
 		}
-		if h := l.handleFor(op.Path); h != nil {
-			h.retarget(op.Path2)
-		}
+		// EVERY open descriptor follows the rename, not just the
+		// per-path newest slot: an older sibling left bound to the old
+		// name recreated it at its next sync (writing `A` through the
+		// first of two descriptors, renaming, then syncing landed
+		// `Aello` back on the old name).
+		l.handles.Range(func(key, _ any) bool {
+			if h, hok := key.(*layerHandle); hok {
+				h.mu.Lock()
+				path, released := h.path, h.released
+				h.mu.Unlock()
+				if !released && path == op.Path {
+					h.retarget(op.Path2)
+				}
+			}
+			return true
+		})
 		l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
 		l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path2})
 		return fs.Result{}, nil

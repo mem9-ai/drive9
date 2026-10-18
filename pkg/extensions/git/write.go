@@ -35,6 +35,10 @@ type gitHandle struct {
 	buf      *writebuffer.WriteBuffer
 	dirty    bool
 	unlinked bool
+	// wgen fences commit completion against mutations acknowledged while
+	// an older snapshot uploads (the mutex is released across
+	// putOverlay): only the generation that landed may clear dirty state.
+	wgen uint64
 }
 
 // claimWorkspaceOpen wraps a write-intent open of a workspace file.
@@ -169,6 +173,7 @@ func (h *gitHandle) Write(ctx context.Context, off int64, data []byte) error {
 		return err
 	}
 	h.dirty = true
+	h.wgen++
 	syncIntent := h.flags&uint32(syscall.O_SYNC) != 0 || h.flags&uint32(syscall.O_DSYNC) != 0 ||
 		h.g.syncPolicy == "write-sync" || h.g.syncPolicy == "strict"
 	h.mu.Unlock()
@@ -204,6 +209,7 @@ func (h *gitHandle) Truncate(size int64) error {
 		return err
 	}
 	h.dirty = true
+	h.wgen++
 	return nil
 }
 
@@ -211,9 +217,10 @@ func (h *gitHandle) Truncate(size int64) error {
 func (h *gitHandle) SetMode(mode uint32) {
 	h.mu.Lock()
 	h.mode = mode & 0o777
-	if !h.dirty {
-		h.dirty = true
-	}
+	// Every acknowledged mutation advances the generation: a chmod racing
+	// an older snapshot's upload must not be retired by its completion.
+	h.wgen++
+	h.dirty = true
 	h.mu.Unlock()
 }
 
@@ -265,13 +272,20 @@ func (h *gitHandle) commit(ctx context.Context) error {
 	// Regular-file tree modes are 6-digit octal (100644): a stray 0o100
 	// OR planted a phantom owner-exec bit (0744) on every published entry.
 	mode := fmt.Sprintf("%o", 0o100000|h.mode)
+	wgen := h.wgen
 	h.mu.Unlock()
 	if err := h.g.putOverlay(ctx, h.w, h.rel, overlayEntry{Op: "upsert", Kind: "file", Content: image, Mode: mode}); err != nil {
 		return err
 	}
 	h.mu.Lock()
-	h.dirty = false
-	h.buf.ClearDirty()
+	// Only the generation that uploaded may retire the dirty state: a
+	// Write/SetMode/Truncate acknowledged while the mutex was released
+	// across putOverlay keeps its own bytes owed to a later boundary
+	// (the stale completion persisted only the older image otherwise).
+	if h.wgen == wgen {
+		h.dirty = false
+		h.buf.ClearDirty()
+	}
 	h.mu.Unlock()
 	h.g.emit(h.path)
 	return nil

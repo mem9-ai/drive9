@@ -7,6 +7,7 @@ package layer
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"io"
 	"sync"
 	"syscall"
@@ -48,6 +49,11 @@ type layerHandle struct {
 	// conflict): writes and commits answer EAGAIN — the buffer is kept, and
 	// publishing it onto the new tip would splice stale bytes.
 	conflicted bool
+	// landed/landedSum identify the image THIS handle last landed: the
+	// checkout sweep compares them against the observed entry so the
+	// handle's own commits never fence its newer dirty buffer.
+	landed    bool
+	landedSum [sha256.Size]byte
 	// unlinkAtRelease publishes the layer whiteout of an unlinked-but-open
 	// path at the last close.
 	unlinkAtRelease func(ctx context.Context) error
@@ -242,10 +248,11 @@ func (h *layerHandle) Truncate(size int64) error {
 func (h *layerHandle) SetMode(mode uint32) {
 	h.mu.Lock()
 	h.mode = mode & 0o777
-	if !h.dirty {
-		h.wgen++
-		h.dirty = true
-	}
+	// Every acknowledged mutation advances the generation: a chmod racing
+	// an older snapshot's upload passed the completion's generation check
+	// otherwise and was silently dropped from the persisted entry.
+	h.wgen++
+	h.dirty = true
 	h.mu.Unlock()
 }
 
@@ -258,23 +265,40 @@ func (h *layerHandle) markUnlinked() {
 	h.mu.Unlock()
 }
 
-// retarget moves the handle to a renamed path.
+// retarget moves the handle to a renamed path. The registry move runs
+// under regMu and re-checks the descriptor's lifetime before registering
+// the new-name slot: a Release that completed in between already removed
+// the fd from both indices (its retirement is serialized on the same
+// lock), and re-registering it would resurrect a descriptor whose commit
+// boundary will never come — later path-keyed SetAttr/rename could then
+// pin acknowledged mutations to a dead handle.
 func (h *layerHandle) retarget(newPath string) {
+	l := h.l
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
+	// Re-read under the registry lock: a concurrent rename may have moved
+	// the fd again before this move acquired it.
 	h.mu.Lock()
 	old := h.path
-	h.path = newPath
-	h.mu.Unlock()
 	if old == newPath {
+		h.mu.Unlock()
 		return
 	}
+	h.path = newPath
+	h.mu.Unlock()
 	// A registry MOVE, not a retirement: the open fd keeps its lifetime —
 	// retiring here marked still-open descriptors released and later
 	// renames/writes lost them. The OLD slot is detached by name: h.path
 	// already reads newPath here, and keying the detach on it removed the
 	// target slot while live[old] kept pointing at this retargeted fd —
 	// a later SetAttr/Unlink on the old name then hit the new name's fd.
-	h.l.detachFromRegistry(h, old)
-	h.l.liveStore(newPath, h)
+	l.detachFromRegistry(h, old)
+	h.mu.Lock()
+	released := h.released
+	h.mu.Unlock()
+	if !released {
+		l.liveStore(newPath, h)
+	}
 }
 
 // commit lands the dirty image as one layer entry: streamed as an object
@@ -347,6 +371,13 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	}
 	h.l.mu.Unlock()
 	h.mu.Lock()
+	// The landing identity lets the checkout sweep tell this handle's OWN
+	// commits from foreign ones: write → fsync → write before the next
+	// event poll puts the previous commit into `changed`, and without the
+	// comparison the sweep fenced the newer dirty buffer although no
+	// other client had touched the path.
+	h.landed = true
+	h.landedSum = sha256.Sum256(image)
 	if h.wgen == wgen {
 		// No write arrived while the snapshot uploaded: this commit is
 		// the newest state and may retire the dirty flag. A newer wgen

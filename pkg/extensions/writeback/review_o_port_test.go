@@ -10,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -166,4 +167,55 @@ func TestPortRenameDuringFtruncateStaysRaceFree(t *testing.T) {
 	if refused == 100 {
 		t.Fatal("every admission was refused — the sweep never completed against quiesced renames")
 	}
+}
+
+// A sibling whose mutex sits over a stalled operation (buffer hydration
+// blocked on a remote read) must not hang an fd-truncate admission: the
+// ordering-key snapshot is TryLock-bounded too, so the admission exhausts
+// its budget and fails closed with EAGAIN instead of blocking on the
+// snapshot before any deadline check (review P1).
+func TestPortTruncateAdmissionBoundedByStalledSibling(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("hello world"))
+	b.Seed("/c", []byte("hello world"))
+	ch, wb := newWritebackStack(t, b)
+	wb.SetInodeTable(&fakeInodeTable{
+		byPath:  map[string]uint64{"/a": 7, "/c": 7},
+		aliases: map[uint64][]string{7: {"/a", "/c"}},
+	})
+	ctx := context.Background()
+
+	resA, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resC, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/c", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := writebackHandleOf(resA.Handle)
+	stalled := writebackHandleOf(resC.Handle)
+
+	// Hold the sibling's mutex as a stalled hydration would.
+	stalled.mu.Lock()
+	defer stalled.mu.Unlock()
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/a", Size: 5, Handle: resA.Handle, Ino: 7})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, syscall.EAGAIN) {
+			t.Fatalf("admission under stalled sibling = %v, want EAGAIN", err)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("admission took %s past its budget before failing closed", elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("admission hung on the stalled sibling's mutex")
+	}
+	_ = owner
 }
