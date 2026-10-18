@@ -72,10 +72,13 @@ type WriteBuffer struct {
 	// remoteSize: the part may exist only in the local shadow.
 	RestorePart LoadPartFunc
 
-	// remoteSize is the original remote file size, set when lazy loading
-	// is configured. ensurePart() only calls LoadPart for parts whose
-	// start offset < remoteSize. Parts beyond this are new (zero-filled).
-	// Zero means "no remote data" (e.g. new file or eager-loaded file).
+	// remoteSize is the retained remote prefix length, set when lazy
+	// loading is configured and reduced on shrink. ensurePart() only calls
+	// LoadPart for parts whose start offset < remoteSize; parts beyond it
+	// are new (zero-filled). Zero means "no remote data" (e.g. new file or
+	// eager-loaded file). A truncate clamps it to the new size so a
+	// shrunk-then-regrown hole zero-fills instead of resurrecting
+	// truncated-away remote bytes (#984).
 	remoteSize int64
 
 	// Memory tracking
@@ -494,6 +497,9 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 			wb.totalSize = size
 			wb.touched = true
 			wb.dirtyParts[0] = true
+			if wb.remoteSize > size {
+				wb.remoteSize = size
+			}
 			return nil
 		}
 
@@ -539,6 +545,12 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 		}
 
 		wb.totalSize = size
+		// The shrink permanently removes the remote prefix beyond the new
+		// EOF: a later grow zero-fills the hole instead of lazily loading
+		// the truncated-away bytes back (#984's shrink-then-regrow).
+		if wb.remoteSize > size {
+			wb.remoteSize = size
+		}
 
 	case size > cur:
 		if wb.smallFileData != nil {

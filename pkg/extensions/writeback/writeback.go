@@ -159,6 +159,10 @@ type Writeback struct {
 	// landedMu/landed is the recently-landed table (landedAt).
 	landedMu sync.Mutex
 	landed   map[string]landedInfo
+	// mutEpoch orders handle mutations mount-wide (v1 fs.dirtySeq): the
+	// sibling-visibility tiers pick an inode's newest uncommitted image by
+	// it, no matter which fd produced the image.
+	mutEpoch atomic.Uint64
 	// perfShim forwards the queue/uploader remote-op observations to the
 	// facade's perf counters (v1 perfRecordRemote).
 	perfShim *fusePerfCounters
@@ -227,6 +231,19 @@ type bufferingHandle struct {
 	hasPendingMode bool
 	// baseRev is the remote revision the buffer was opened against.
 	baseRev int64
+	// ino is the kernel inode of the opened file (0 = unresolved; claimed
+	// lazily from the facade's table). Sibling visibility is keyed by
+	// inode — hardlink aliases share it (#984).
+	ino uint64
+	// mutSeq is the mutation epoch of this handle's newest change (v1
+	// fh.DirtySeq): the sibling-visibility tiers compare epochs across
+	// handles to serve an inode's newest uncommitted image.
+	mutSeq uint64
+	// visTrunc marks a buffer holding a visible uncommitted fd-truncate
+	// (#984 WriteBuffer.visibleTruncate): reads through every other handle
+	// of the inode serve this image before staged or remote bytes, and the
+	// append-composition fence must not adopt older landed images over it.
+	visTrunc bool
 	// inner is nil for isNew handles until commit adopts a terminal.
 	inner    fs.Handle
 	baseSize int64
@@ -644,32 +661,11 @@ func (w *Writeback) openDirectIO(path string, baseSize int64) bool {
 	return baseSize >= smallFileShadowThreshold
 }
 
-// syncAliasHandlesAfterTruncate ports v1 syncOpenHandlesAfterPathTruncate:
-// a truncate through one hardlink alias rebases every OTHER open handle of
-// the same inode — their buffers keep the stale size otherwise and their
-// next flush republishes the pre-truncation tail (LTP ftest01's fstat).
-func (w *Writeback) syncAliasHandlesAfterTruncate(ino uint64, path string, newSize int64) {
-	aliaser, ok := w.inodes.(interface{ Aliases(ino uint64) []string })
-	if !ok || ino == 0 {
-		return
-	}
-	for _, alias := range aliaser.Aliases(ino) {
-		if alias == path {
-			continue
-		}
-		h := w.handleFor(alias)
-		if h == nil {
-			continue
-		}
-		h.mu.Lock()
-		if h.buf != nil && !h.unlinked && h.buf.Size() != newSize {
-			if err := h.buf.Truncate(newSize); err == nil {
-				h.buf.ResetSequentialState(newSize)
-				h.dirty = true
-			}
-		}
-		h.mu.Unlock()
-	}
+// nextMutSeq stamps a handle mutation with the mount-wide ordering epoch
+// (v1 fs.dirtySeq): whichever local image carries the highest epoch is the
+// inode's newest uncommitted truth, regardless of which fd produced it.
+func (w *Writeback) nextMutSeq() uint64 {
+	return w.mutEpoch.Add(1)
 }
 
 // Queue exposes the commit queue for the mount's queue-stats probe.
@@ -772,6 +768,18 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return fs.Result{Attr: &attr}, nil
 		}
 		res, err := next(ctx, op)
+		if err == nil && res.Attr != nil {
+			// #984 stat visibility: a live writer's uncommitted image —
+			// an fd-truncate's new size above all — is the path's newest
+			// truth; the remote row underneath still describes the
+			// pre-mutation image until the commit boundary (v1
+			// dirtyHandleSize). Hardlink aliases resolve the writer
+			// through the inode.
+			if size, ok := w.liveDirtySizeForInode(0, op.Path); ok {
+				res.Attr.Size = size
+			}
+			return res, err
+		}
 		if err == nil || !fs.IsNotFound(err) {
 			return res, err
 		}
@@ -888,6 +896,17 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			res, err := next(ctx, op)
 			if err != nil || res.Handle == nil {
 				return res, err
+			}
+			if res.Attr != nil {
+				// #984: the open-time stat must not pin the pre-truncate
+				// remote row — the inode's live writer (the truncating fd,
+				// possibly on a hardlink alias pathname) owns the newest
+				// size, and the kernel would otherwise cache it for the
+				// attr TTL.
+				if size, ok := w.liveDirtySizeForInode(0, op.Path); ok {
+					res.Attr.Size = size
+					res.Attr.Rev = 0
+				}
 			}
 			// open(O_TRUNC) without O_CREAT truncates locally.
 			trunc := flags&uint32(syscall.O_TRUNC) != 0 &&
@@ -1333,11 +1352,13 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: modeOr644(mode, hasMode), Size: op.Size}}, nil
 					}
 				} else if !unlinked {
-					if err := h.truncateLocal(ctx, op.Size); err == nil {
-						// Every hardlink alias's open handle rebases with
-						// this truncate (v1
-						// syncOpenHandlesAfterPathTruncate).
-						w.syncAliasHandlesAfterTruncate(op.Ino, op.Path, op.Size)
+					// #984 fd-truncate admission: refuse while an
+					// independently dirty sibling holds the inode (two
+					// uncommitted branches cannot merge), then truncate the
+					// owner and rebase every clean sibling handle — the
+					// whole inode, hardlink aliases included, observes the
+					// new image at once instead of at the commit boundary.
+					if aerr := w.admitFtruncate(ctx, h, op.Ino, op.Path, op.Size); aerr == nil {
 						// Publish the new size (UpdateSize +
 						// cacheFileForPath at setattr-on-handle): the FUSE
 						// SETATTR reply reflects it, and the kernel drops
@@ -1351,6 +1372,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						}
 						w.invalidate(op.Path, op.Size)
 						return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: op.Size}}, nil
+					} else {
+						// A refused admission (dirty sibling, busy set, or
+						// a failed base preload) leaves every image
+						// untouched; the caller retries.
+						return fs.Result{}, aerr
 					}
 				}
 			}
@@ -1450,17 +1476,40 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		if n, ok := h.readLiveWriter(ctx, off, dest); ok {
 			return n, nil
 		}
+		// #984 sibling visibility: the inode's newest uncommitted image —
+		// an fd-truncate owner's buffer, or any dirty sibling writer's —
+		// serves readers on ANY pathname of the inode (hardlink aliases
+		// included). Fail-closed EAGAIN after a bounded retry when the
+		// image holder stays busy; never stale bytes.
+		if n, ok, err := h.w.readVisibleSiblingImage(ctx, h, off, dest); err != nil {
+			return 0, err
+		} else if ok {
+			return n, nil
+		}
 		// Read-your-staged-writes (v1 pendingIndex overlay): a released handle's
 		// image lives in the shadow store until the queue lands it — the remote
 		// still 404s inside that window and the .dat/.meta entry is gone (the
-		// queue owns the upload), so serve the staged bytes.
+		// queue owns the upload), so serve the staged bytes. The pending
+		// meta's size is the image's size — the open-time base size is the
+		// pre-mutation remote row and would reject a truncated image.
 		if h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(h.path) {
-			if data, kok := readShadowGenerationFenced(h.w.opts.Staging.Shadow, h.path, h.baseSize); kok && data != nil {
+			size := h.baseSize
+			if meta, mok := h.w.pendingMeta(h.path); mok && meta != nil {
+				size = meta.Size
+			}
+			if data, kok := readShadowGenerationFenced(h.w.opts.Staging.Shadow, h.path, size); kok && data != nil {
 				if off >= int64(len(data)) {
 					return 0, nil
 				}
 				return copy(dest, data[off:]), nil
 			}
+		}
+		// #984 staged alias tier: a truncating sibling flushed on ITS
+		// pathname — while that entry is still pending it is the inode's
+		// newest durable image, and this fd must not fall through to the
+		// stale remote base underneath.
+		if n, ok := h.w.readAliasStagedImage(h, off, dest); ok {
+			return n, nil
 		}
 		// An anonymous clean fd of a deleted name reads its unlink snapshot
 		// (v1 survivor): the remote is about to lose the object at last
@@ -1577,6 +1626,9 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 	}
 	h.wgen++
 	h.dirty = true
+	// Stamp the mutation epoch (#984): sibling readers compare epochs to
+	// serve the inode's newest uncommitted image.
+	h.mutSeq = h.w.nextMutSeq()
 	policy := h.w.opts.Policy
 	forceSync := h.forceSync
 	h.mu.Unlock()
@@ -1753,6 +1805,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// the next durability barrier commits it.
 			if h.wgen == stagedGen {
 				h.dirty = false
+				h.visTrunc = false
 			}
 			h.mu.Unlock()
 			// The landed revision also retires isNew: a later write on
@@ -1905,6 +1958,7 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 			h.w.uploader.Submit(h.path)
 			h.mu.Lock()
 			h.dirty = false
+			h.visTrunc = false
 			if h.buf != nil {
 				h.buf.ClearDirty()
 			}
@@ -2008,6 +2062,10 @@ func (h *bufferingHandle) markLanded(rev int64) {
 	h.mu.Lock()
 	h.landed = true
 	h.isNew = false
+	// #984 supersession: the landed image IS the newest truth now, so the
+	// uncommitted-truncate claim ends (v1 ClearDirty dropping
+	// visibleTruncate). A later write re-dirties and re-stamps on its own.
+	h.visTrunc = false
 	if rev > 0 {
 		h.baseRev = rev
 	}
@@ -2134,6 +2192,16 @@ func (w *Writeback) pendingListAttr(p string) (size int64, mode uint32, hasMode,
 			mode, hasMode = 0o644, true
 		}
 		h.mu.Unlock()
+	} else if w.inodes != nil {
+		// #984 alias projection: the live writer may sit on a hardlink
+		// alias pathname — the truncating fd's new size is the entry's
+		// newest truth here too (v1 readdir's dirtyHandleSize over the
+		// alias set).
+		if ino, iok := w.inodes.Ino(p); iok && ino != 0 {
+			if aliasSize, aok := w.liveDirtySizeForInode(ino, p); aok {
+				size = aliasSize
+			}
+		}
 	}
 	if size < 0 {
 		return 0, 0, false, false
@@ -2284,6 +2352,7 @@ func (h *bufferingHandle) retireDirty(stagedGen uint64) {
 func (h *bufferingHandle) retireDirtyLocked(stagedGen uint64) {
 	if h.wgen == stagedGen {
 		h.dirty = false
+		h.visTrunc = false
 		if h.buf != nil {
 			h.buf.ClearDirty()
 		}
@@ -2528,6 +2597,7 @@ func (h *bufferingHandle) MarkPublished() {
 	defer h.mu.Unlock()
 	if h.buf == nil || h.buf.Size() == 0 {
 		h.dirty = false
+		h.visTrunc = false
 		h.stagedToCache = false
 		h.landed = true
 		h.isNew = false
@@ -2871,6 +2941,8 @@ func (h *bufferingHandle) truncateLocal(ctx context.Context, size int64) error {
 	}
 	h.wgen++
 	h.dirty = true
+	h.visTrunc = true
+	h.mutSeq = h.w.nextMutSeq()
 	h.w.armBypass(h.path, h.baseRev, size, "setattr-size")
 	return nil
 }
@@ -3176,6 +3248,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	}
 	h.mu.Lock()
 	h.dirty = false
+	h.visTrunc = false
 	h.buf.ClearDirty()
 	h.landed = true
 	// v1 publishStagedSnapshotLineageLocked: the staged snapshot becomes
@@ -3310,6 +3383,7 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 	if unlinked {
 		h.mu.Lock()
 		h.dirty = false
+		h.visTrunc = false
 		if h.buf != nil {
 			h.buf.ClearDirty()
 		}
@@ -3351,6 +3425,7 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		}
 		h.mu.Lock()
 		h.dirty = false
+		h.visTrunc = false
 		h.buf.ClearDirty()
 		h.landed = true
 		h.isNew = false

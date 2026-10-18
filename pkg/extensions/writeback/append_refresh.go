@@ -170,17 +170,33 @@ func (w *Writeback) refreshAppendBase(ctx context.Context, h *bufferingHandle) (
 		return nil, 0, nil
 	}
 	baseRev := h.baseRev
+	ownTrunc, ownSeq := h.visTrunc && h.dirty, h.mutSeq
 	h.mu.Unlock()
 
-	// Sibling live images: newest wins under the prefix rule; a diverged
-	// sibling (records mine does not contain, missing mine's records)
-	// must not be silently dropped by either side.
+	// #984 truncate fence: an uncommitted fd-truncate owns the inode's
+	// newest image. A LATER truncate sibling replaces it outright (the
+	// prefix rule would misjudge the shorter newer image); sibling appends
+	// that descend from the truncate still compose below; and the landed
+	// tier is skipped entirely — adopting a landed image that predates the
+	// truncate would resurrect truncated-away bytes ("hello" composing
+	// back to "hello world"). The upload CAS surfaces true foreign races.
+	if ownTrunc {
+		if img, ok := w.newerVisibleTruncateImage(h, ownSeq); ok {
+			return img, 0, nil
+		}
+	}
 	if sib := w.newestLiveAppendImage(h, mine); sib != nil {
+		// Sibling live images: newest wins under the prefix rule; a diverged
+		// sibling (records mine does not contain, missing mine's records)
+		// must not be silently dropped by either side.
 		if len(mine) == 0 || bytes.HasPrefix(sib, mine) {
 			mine = sib
 		} else if !bytes.HasPrefix(mine, sib) {
 			return nil, 0, syscall.EAGAIN
 		}
+	}
+	if ownTrunc {
+		return mine, 0, nil
 	}
 
 	// Landed image: only when the remote advanced past our base. A
@@ -202,6 +218,32 @@ func (w *Writeback) refreshAppendBase(ctx context.Context, h *bufferingHandle) (
 	return mine, newestRev, nil
 }
 
+// newerVisibleTruncateImage returns the image of a sibling handle holding
+// a NEWER visible fd-truncate (#984's newest-truncate-wins): chained
+// truncates shrink images, so the append prefix rule cannot order them —
+// the mutation epoch does.
+func (w *Writeback) newerVisibleTruncateImage(h *bufferingHandle, ownSeq uint64) ([]byte, bool) {
+	for _, cand := range w.inodeHandles(0, h.path) {
+		if cand == h {
+			continue
+		}
+		if !cand.mu.TryLock() {
+			continue
+		}
+		ok := cand.visTrunc && cand.dirty && cand.buf != nil && !cand.unlinked &&
+			cand.mutSeq > ownSeq && cand.buf.CanMaterializeFull()
+		var img []byte
+		if ok {
+			img = append([]byte(nil), cand.buf.Bytes()...)
+		}
+		cand.mu.Unlock()
+		if ok {
+			return img, true
+		}
+	}
+	return nil, false
+}
+
 // fenceRefreshAppendBase is the staging-boundary refresh: unlike the
 // write-time refresh (process-local watermarks only), the fence also
 // checks the remote — stageToWriteCache refreshes the CAS base to the
@@ -217,7 +259,21 @@ func (w *Writeback) fenceRefreshAppendBase(ctx context.Context, h *bufferingHand
 	}
 	mine := append([]byte(nil), h.buf.Bytes()...)
 	baseRev := h.baseRev
+	ownTrunc, ownSeq := h.visTrunc && h.dirty, h.mutSeq
 	h.mu.Unlock()
+
+	// #984 truncate fence (write-time twin): a later truncate sibling
+	// replaces the image; a landed image predating the truncate is never
+	// adopted — the staged image's CAS on the pre-truncate base surfaces
+	// any foreign race instead of composing resurrected bytes.
+	if ownTrunc {
+		if img, ok := w.newerVisibleTruncateImage(h, ownSeq); ok {
+			return img, 0, nil
+		}
+	}
+	if ownTrunc {
+		return mine, 0, nil
+	}
 
 	if sib := w.newestLiveAppendImage(h, mine); sib != nil {
 		if len(mine) == 0 || bytes.HasPrefix(sib, mine) {
