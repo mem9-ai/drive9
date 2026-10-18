@@ -7,6 +7,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/pingcap/failpoint"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
@@ -34,7 +35,12 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 		fs.debugf("fsync lock wait path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, lockWait)
 	}
-	defer fh.Unlock()
+	handleLocked := true
+	defer func() {
+		if handleLocked {
+			fh.Unlock()
+		}
+	}()
 	if fs.debugEnabled() && strings.HasSuffix(fh.Path, ".db") {
 		mainDBPath := fh.Path
 		mainDBFsyncStarted := time.Now()
@@ -49,7 +55,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}()
 	}
 	defer func() {
-		if !fs.debugEnabled() {
+		if !handleLocked || !fs.debugEnabled() {
 			return
 		}
 		var size int64
@@ -91,18 +97,54 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		return fs.flushGitHandleLockedWithPolicy(flushCtx, fh, fs.syncMode == SyncStrict)
 	}
 
-	if st := fs.layerHandleMutationStatusLocked(fh); st != gofuse.OK {
-		return st
+	if fs.ftruncateParticipates(fh) {
+		defer func() {
+			if handleLocked {
+				fs.releaseHandleRemoteCommitPathLocked(fh)
+			}
+		}()
 	}
-
-	// Unlink-while-open: never stage/enqueue/upload. Fsync can otherwise
-	// re-enter commitQueue after Unlink's ordered drain and resurrect the
-	// deleted path (write → unlink → fsync → close → rmdir ENOTEMPTY).
-	// Keep Dirty so a successful write-after-unlink stays readable.
-	if fh.Unlinked {
-		phase = "unlinked-discard"
-		fs.cancelUnlinkedRemotePublishLocked(fh)
-		return gofuse.OK
+	retiredOwner, hadRetiredFence := hasRetiredRead(fh), fh.ftruncateFence
+	defer func() {
+		if handleLocked && retiredOwner && !hadRetiredFence && fh.ftruncateFence {
+			fs.releaseHandleRemoteCommitPathLocked(fh)
+		}
+	}()
+	for {
+		if st := fs.layerHandleMutationStatusLocked(fh); st != gofuse.OK {
+			return st
+		}
+		// Recheck after yielding: an anonymous fd must not republish its path.
+		if fh.Unlinked {
+			phase = "unlinked-discard"
+			fs.cancelUnlinkedRemotePublishLocked(fh)
+			return gofuse.OK
+		}
+		handled := false
+		err := fs.prepareRetiredReadLocked(ctx, fh)
+		if err == nil {
+			handled, err = fs.prepareFtruncateCommitLocked(ctx, fh, fs.syncMode == SyncStrict)
+		}
+		if !errors.Is(err, errFtruncateBusy) {
+			if handled || err != nil {
+				return httpToFuseStatus(err)
+			}
+			break
+		}
+		// A sibling's close or queue handoff can briefly own these locks.
+		// Give it room to finish, then revalidate under the original budget.
+		fs.releaseHandleRemoteCommitPathLocked(fh)
+		handleLocked = false
+		fh.Unlock()
+		failpoint.InjectCall("ftruncateFsyncWait", fs, fh)
+		if err := waitHandleRetry(ctx, time.Time{}); err != nil {
+			return httpToFuseStatus(err)
+		}
+		failpoint.InjectCall("ftruncateFsyncBeforeRelock", fs, fh)
+		if err := lockHandleWithContext(ctx, fh, time.Time{}); err != nil {
+			return httpToFuseStatus(err)
+		}
+		handleLocked = true
 	}
 	if fs.discardSupersededMutationLocked(fh) {
 		phase = "superseded-mutation"
@@ -310,6 +352,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		if err == nil {
 			mutationRevision := fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
 			fs.recordCommittedMutation(handleIno, mutationSeq, mutationRevision, size)
+			fs.captureFtruncateIdentity(ctx, handleIno, handlePath, mutationRevision)
 			if mutationRevision > 0 {
 				fs.refreshCommittedRevisionForOpenHandlesWithSize(handlePath, mutationRevision, fh, size)
 			}
@@ -435,7 +478,32 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		mutationSeq := fh.DirtySeq
 		uploadStart := time.Now()
 		fs.debugf("fsync writeback upload start path=%s", fh.Path)
+		var retiredBuffer *WriteBuffer
+		var retiredVersion uint64
+		if hasRetiredRead(fh) {
+			retiredBuffer, retiredVersion = fh.Dirty, fh.Dirty.contentVersion
+		}
 		committedRev, uploadedProof, err := fs.uploader.uploadSyncWithAppendSnapshot(ctx, fh.Path)
+		if retiredBuffer != nil {
+			if uploadedProof.retiredRead != nil {
+				if !ownsRetiredReadPublication(fh, uploadedProof.retiredRead) {
+					return gofuse.EAGAIN
+				}
+				fs.recordRetiredReadAck(uploadedProof.retiredRead, uploadedProof.rev, uploadedProof.readActualRev > 0)
+			}
+			if readErr := fs.reconcileRetiredReadLocked(ctx, fh, true); readErr != nil {
+				return httpToFuseStatus(readErr)
+			}
+			if err == nil {
+				if fs.retiredReadPending(fh) {
+					return gofuse.EAGAIN
+				}
+				// A chmod-only retry is not another data commit.
+				if uploadedProof.retiredRead == nil {
+					committedRev = fh.BaseRev
+				}
+			}
+		}
 		if uploadedProof.rev > 0 && fs.recordCommittedAppendSnapshot(fh.Path, uploadedProof) {
 			fs.publishLinkedAppendCommit(fh.Path, fh.Ino, uploadedProof.rev, uploadedProof.size)
 		}
@@ -457,6 +525,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 		mutationRevision := fs.resolveCommittedMutationRevision(fh.Path, committedRev, expectedRevision)
 		fs.recordCommittedMutation(fh.Ino, mutationSeq, mutationRevision, size)
+		fs.captureFtruncateIdentity(ctx, fh.Ino, fh.Path, mutationRevision)
 		if mutationRevision > 0 {
 			fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, mutationRevision, fh, size)
 		}
@@ -468,6 +537,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			fh.Unlock()
 			fs.clearPendingModeForInodeGeneration(ino, fh, mode, modeGen)
 			fh.Lock()
+		}
+		if retiredBuffer != nil && (fh.Dirty != retiredBuffer || fh.Dirty.contentVersion != retiredVersion || fh.DirtySeq != mutationSeq) {
+			return gofuse.OK // Keep writes accepted while metadata finalization yielded.
 		}
 		// UploadSync already persisted the data to the server. Clear
 		// the dirty state so the subsequent flushHandleDebounced sees

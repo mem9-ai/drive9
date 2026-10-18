@@ -37,9 +37,14 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	if lockWait := time.Since(lockStart); fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 		fs.debugf("flush lock wait path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, lockWait)
 	}
-	defer fh.Unlock()
+	handleLocked := true
 	defer func() {
-		if !fs.debugEnabled() {
+		if handleLocked {
+			fh.Unlock()
+		}
+	}()
+	defer func() {
+		if !handleLocked || !fs.debugEnabled() {
 			return
 		}
 		var size int64
@@ -98,6 +103,16 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		phase = "unlinked-discard"
 		fs.cancelUnlinkedRemotePublishLocked(fh)
 		return gofuse.OK
+	}
+	if fs.ftruncateParticipates(fh) {
+		defer func() {
+			if handleLocked {
+				fs.releaseHandleRemoteCommitPathLocked(fh)
+			}
+		}()
+	}
+	if handled, err := fs.prepareFtruncateFlushLocked(ctx, fh, &handleLocked); handled || err != nil {
+		return httpToFuseStatus(err)
 	}
 	if fs.discardSupersededMutationLocked(fh) {
 		phase = "superseded-mutation"
@@ -193,16 +208,11 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 
 				phase = "small-snapshot-writeback"
 				snapWBStart2 := time.Now()
-				if err := fs.snapshotWriteBackLocked(fh, true); err != nil {
+				if err := fs.snapshotWriteBackWithPendingLocked(fh, true, true); err != nil {
 					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
 					safeLogPrintf("writeback cache put failed for %s: %v, falling back to sync upload", fh.Path, err)
 				} else {
 					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
-					if fs.pendingIndex != nil {
-						if gen, putErr := fs.pendingIndex.PutWithBaseRev(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev); putErr == nil {
-							fh.PendingIndexGen = gen
-						}
-					}
 					// Snapshot the dirty sequence at cache-write time so
 					// Release can detect whether new writes happened since.
 					fh.WriteBackSeq = fh.DirtySeq
@@ -331,10 +341,11 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				}
 			}
 			var mutationRevision int64
-			if err == nil && gvisorCompat {
+			if err == nil && (gvisorCompat || fs.openHandles.HasVisibleTruncate(handleIno) || fs.hasFtruncateInheritance(handleIno)) {
 				mutationRevision = fs.resolveCommittedMutationRevision(handlePath, committedRev, expectedRevision)
 				fs.recordCommittedMutation(handleIno, mutationSeq, mutationRevision, size)
-				if mutationRevision > 0 {
+				fs.captureFtruncateIdentity(ctx, handleIno, handlePath, mutationRevision)
+				if gvisorCompat && mutationRevision > 0 {
 					fs.refreshCommittedRevisionForOpenHandlesWithSize(handlePath, mutationRevision, fh, size)
 				}
 			}

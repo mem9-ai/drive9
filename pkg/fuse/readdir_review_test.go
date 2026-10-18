@@ -21,8 +21,8 @@ func TestDirectorySnapshotAtomicInstallAfterCommit(t *testing.T) {
 			ino := fs.inodes.Lookup("/file.dat", false, 0, time.Now())
 			local := fs.snapshotDirLocal("/")
 			live, _ := fs.inodes.GetEntry(ino)
-			candidate, preserve := fs.localDirEntryInfo("/file.dat", CachedFileInfo{Name: "file.dat"}, live, local)
-			if preserve {
+			candidate, preserve, busy := fs.localDirEntryInfo("/file.dat", CachedFileInfo{Name: "file.dat"}, live, local)
+			if preserve || busy {
 				t.Fatal("expected a clean remote candidate before commit")
 			}
 			fs.onCommitQueueSuccess(&CommitEntry{Path: "/file.dat", Inode: ino, Size: 4096}, revision)

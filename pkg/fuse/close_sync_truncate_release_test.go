@@ -459,7 +459,7 @@ func TestCloseSyncPathTruncateClearsCleanSiblingRestoreCallbacks(t *testing.T) {
 	fh, _ := test.fs.fileHandles.Get(test.old)
 	fh.Dirty.RestorePart = func(int) ([]byte, error) { t.Error("restored obsolete shadow"); return nil, nil }
 	fh.Dirty.OnPartFull = func(int, []byte) { t.Error("evicted to obsolete shadow") }
-	test.fs.syncOpenHandlesAfterPathTruncate(fh.Ino, 2)
+	test.fs.syncOpenHandlesAfterPathTruncate(fh.Ino, 2, 0)
 	if fh.Dirty.RestorePart != nil || fh.Dirty.OnPartFull != nil || fh.Dirty.HasDirtyParts() || fh.DirtySeq != 0 {
 		t.Fatal("clean sibling retained staging callbacks or became dirty")
 	}
@@ -604,7 +604,7 @@ func TestCloseSyncPathTruncateAdoptsConfirmedAppendLogBaseline(t *testing.T) {
 			fs.inodes.UpdateSize(fh.Ino, size)
 			fs.inodes.UpdateRevision(fh.Ino, 4)
 			fs.recordCommittedRevisionWithSize(fh.Path, 4, size)
-			fs.syncOpenHandlesAfterPathTruncate(fh.Ino, size)
+			fs.syncOpenHandlesAfterPathTruncate(fh.Ino, size, 0)
 			fh.Lock()
 			defer fh.Unlock()
 			if fh.BaseRev != 4 || fh.OrigSize != size || fh.Dirty.Size() != size || fh.ZeroBase || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
@@ -647,7 +647,7 @@ func TestCloseSyncPathTruncateRevisionOnlyRefreshAppendsAtCommittedSize(t *testi
 				test.rebaseOnAppend = rebase
 				test.mu.Unlock()
 				fs.recordCommittedRevision(fh.Path, 2)
-				fs.syncOpenHandlesAfterPathTruncate(fh.Ino, size)
+				fs.syncOpenHandlesAfterPathTruncate(fh.Ino, size, 0)
 				fs.inodes.UpdateRevision(fh.Ino, 2)
 				fs.inodes.UpdateSize(fh.Ino, size)
 				fh.Lock()
@@ -779,7 +779,7 @@ func TestWriteSyncPathTruncateAdoptsConfirmedAppendLogBaseline(t *testing.T) {
 			test.content, test.revision, test.layout = truncated, 2, client.ContentLayoutAppendLog
 			test.mu.Unlock()
 			fs.recordCommittedRevisionWithSize(fh.Path, 2, size)
-			fs.syncOpenHandlesAfterPathTruncate(fh.Ino, size)
+			fs.syncOpenHandlesAfterPathTruncate(fh.Ino, size, 0)
 			if fh.BaseRev != 2 || fh.OrigSize != size || fh.Dirty.Size() != size || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
 				t.Fatalf("confirmed active baseline revision=%d original=%d size=%d seq=%d", fh.BaseRev, fh.OrigSize, fh.Dirty.Size(), fh.DirtySeq)
 			}

@@ -127,6 +127,14 @@ func (w *SSEWatcher) handleChange(ce *client.ChangeEvent) {
 
 	// Notify kernel about the change.
 	if ino, ok := w.fs.inodes.GetInode(p); ok {
+		w.fs.openHandles.invalidateInodeReads(ino)
+		if w.fs.hasFtruncateInheritance(ino) {
+			for _, alias := range w.fs.ftruncateAliasPaths(ino) {
+				if alias != p {
+					w.fs.invalidateReadCacheAndTargets(alias)
+				}
+			}
+		}
 		w.fs.notifyInode(ino)
 	}
 	if parentIno, ok := w.fs.inodes.GetInode(parentDir(p)); ok {

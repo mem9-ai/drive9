@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pingcap/failpoint"
+
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 )
@@ -37,11 +39,9 @@ type pathState struct {
 
 type WriteBackSuccessFunc func(meta WriteBackMeta, committedRev int64, gens StagingGens)
 
-// StagingGens captures the generations of the writeBack, pendingIndex and
-// shadowStore entries associated with a writeBack entry at the moment it is
-// read for upload. This lets the OnSuccess callback perform generation-guarded
-// cleanup so a stale upload does not remove a fresher same-path staging entry
-// that was created by a concurrent write while the upload was in flight.
+// StagingGens identifies content staging associated with a writeBack entry.
+// Handle snapshots bind these generations when published; legacy entries use
+// a path snapshot at upload time. Cleanup removes only matching generations.
 type StagingGens struct {
 	WriteBackGen    uint64
 	PendingIndexGen uint64
@@ -49,9 +49,9 @@ type StagingGens struct {
 }
 
 // SnapshotStagingGensFunc snapshots the pendingIndex and shadowStore generations
-// for a path. If either store is absent or has no entry, the corresponding gen
-// is 0 (which never matches, so the guarded remove is skipped). Optional — if
-// nil, OnSuccess receives zero-value gens.
+// for a legacy entry. If either store is absent or has no entry, the
+// corresponding gen is 0 and guarded removal is skipped. Optional — if nil,
+// uploads without bound handle ownership receive zero-value gens.
 type SnapshotStagingGensFunc func(remotePath string) StagingGens
 
 // WriteBackUploader consumes pending write-back cache entries and uploads
@@ -80,10 +80,11 @@ type WriteBackUploader struct {
 	// stop+close, so a late Submit can never send on a closed channel.
 	submitMu sync.Mutex
 
-	perf      *fusePerfCounters
-	OnSuccess WriteBackSuccessFunc
+	perf            *fusePerfCounters
+	OnSuccess       WriteBackSuccessFunc
+	OnDataCommitted func(meta WriteBackMeta, committedRev int64, gens StagingGens)
 	// SnapshotStagingGens optionally captures the pendingIndex/shadowStore
-	// generations for a path so OnSuccess can do generation-guarded cleanup.
+	// generations for legacy uploads without handle-bound staging ownership.
 	SnapshotStagingGens SnapshotStagingGensFunc
 }
 
@@ -382,6 +383,9 @@ func (u *WriteBackUploader) acquirePath(localPath string) func() {
 		ps, ok := u.inflight[localPath]
 		if !ok {
 			// No in-flight upload — register ours.
+			if u.inflight == nil {
+				u.inflight = make(map[string]*pathState)
+			}
 			ps = &pathState{done: make(chan struct{})}
 			u.inflight[localPath] = ps
 			u.inflightMu.Unlock()
@@ -412,6 +416,9 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	if !chmodOK {
 		return // Already uploaded or removed.
 	}
+	if chmodMeta.Kind == PendingConflict {
+		return
+	}
 	if chmodMeta.Kind == PendingChmod {
 		_ = u.applyPendingChmod(context.Background(), localPath, chmodMeta, chmodMeta.Generation, false)
 		return
@@ -422,9 +429,8 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	// replace the data between GetMeta and getView, causing the uploader to
 	// upload new data with old baseRev/generation. The onLocked callback
 	// captures the staging-store generations under the same path-lock window so
-	// the OnSuccess cleanup is generation-guarded consistently — a concurrent
-	// same-path write cannot race the snapshot and leave a stale upload holding
-	// newer generations it is not responsible for.
+	// handle-bound snapshots override this path-level fallback below, since
+	// newer staging may exist before its cache snapshot is published.
 	var stagingGens StagingGens
 	meta, data, ok := u.cache.GetMetaAndViewWithCallback(localPath, func() {
 		if u.SnapshotStagingGens != nil {
@@ -435,9 +441,12 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		return // Already uploaded or removed.
 	}
 	gen := meta.Generation
-	// Use the writeBack generation we just read (authoritative) rather than
-	// a re-read from the snapshot callback, which could race with a concurrent
-	// Put between GetMetaAndView and the callback.
+	if meta.Kind == PendingConflict {
+		return
+	}
+	if meta.ownedStagingKnown {
+		stagingGens = meta.ownedStagingGens
+	}
 	stagingGens.WriteBackGen = gen
 
 	expectedRevision, err := expectedRevisionForWriteBack(meta)
@@ -493,7 +502,14 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		safeLogPrintf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", localPath, uploadMaxRetries+1, lastErr)
 		return
 	}
+	meta.readActualRev = committedRev
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+	if meta.lineageTrusted && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= maxLandedPayloadBytes {
+		meta.liveChecksum = payloadChecksum(data)
+	}
+	if u.OnDataCommitted != nil {
+		u.OnDataCommitted(*meta, committedRev, stagingGens)
+	}
 	chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	modeErr := u.applyMode(chmodCtx, meta)
 	chmodCancel()
@@ -519,9 +535,6 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		u.perf.uploaderSuccess.add(1)
 	}
 	if u.OnSuccess != nil {
-		if meta.lineageTrusted && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= maxLandedPayloadBytes {
-			meta.liveChecksum = payloadChecksum(data)
-		}
 		u.OnSuccess(*meta, committedRev, stagingGens)
 	}
 }
@@ -544,10 +557,42 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 // Only trusted bounded payloads receive content identity. A data commit may
 // return proof with a later mode error; callers must retain that mode obligation.
 func (u *WriteBackUploader) uploadSyncWithAppendSnapshot(ctx context.Context, localPath string) (int64, pathCommitLandmark, error) {
-	proof := pathCommitLandmark{}
-	// Wait for any in-flight background upload to complete first.
-	u.WaitPath(localPath)
+	// Share exclusion with background uploads and owned staging migration.
+	release := u.acquirePath(localPath)
+	defer release()
+	return u.uploadSyncWithRevisionLocked(ctx, localPath)
+}
 
+// uploadSyncForRename bounds re-acquisition after Rename's initial drain.
+// Other synchronous upload callers retain their existing admission behavior.
+func (u *WriteBackUploader) uploadSyncForRename(ctx context.Context, localPath string) error {
+	failpoint.InjectCall("renameUploadSyncContext", u, ctx, localPath)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if release, ok := u.tryAcquirePath(localPath); ok {
+			defer release()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			_, _, err := u.uploadSyncWithRevisionLocked(ctx, localPath)
+			return err
+		}
+		failpoint.InjectCall("renameUploadSyncBusy", u, localPath)
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// uploadSyncWithRevisionLocked requires uploader ownership of localPath.
+func (u *WriteBackUploader) uploadSyncWithRevisionLocked(ctx context.Context, localPath string) (int64, pathCommitLandmark, error) {
+	proof := pathCommitLandmark{}
 	// PendingChmod entries have no .dat file (data already uploaded, only
 	// chmod remains). Read meta first so we can handle chmod without loading
 	// data — GetMetaAndView would prune the entry when the .dat is missing.
@@ -555,17 +600,32 @@ func (u *WriteBackUploader) uploadSyncWithAppendSnapshot(ctx context.Context, lo
 	if !chmodOK {
 		return 0, proof, nil // not in cache (may have been uploaded by the background worker we just waited for)
 	}
+	if chmodMeta.Kind == PendingConflict {
+		return 0, proof, fmt.Errorf("writeback snapshot %s is conflicted", localPath)
+	}
 	if chmodMeta.Kind == PendingChmod {
 		return 0, proof, u.applyPendingChmod(ctx, localPath, chmodMeta, chmodMeta.Generation, true)
 	}
 
 	// Atomically read meta + data under one path lock so they are guaranteed
 	// to be from the same generation.
-	meta, data, ok := u.cache.GetMetaAndView(localPath)
+	var stagingGens StagingGens
+	meta, data, ok := u.cache.GetMetaAndViewWithCallback(localPath, func() {
+		if u.SnapshotStagingGens != nil {
+			stagingGens = u.SnapshotStagingGens(localPath)
+		}
+	})
 	if !ok {
 		return 0, proof, nil // not in cache (removed between GetMeta and GetMetaAndView)
 	}
 	gen := meta.Generation
+	if meta.Kind == PendingConflict {
+		return 0, proof, fmt.Errorf("writeback snapshot %s is conflicted", localPath)
+	}
+	if meta.ownedStagingKnown {
+		stagingGens = meta.ownedStagingGens
+	}
+	stagingGens.WriteBackGen = gen
 	proof.size = meta.Size
 	if meta.lineageTrusted && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= maxLandedPayloadBytes {
 		proof.snapshotID, proof.checksum = meta.SnapshotID, payloadChecksum(data)
@@ -603,8 +663,16 @@ func (u *WriteBackUploader) uploadSyncWithAppendSnapshot(ctx context.Context, lo
 		}
 		return 0, proof, err
 	}
+	meta.readActualRev = committedRev
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	proof.rev = committedRev
+	if meta.retiredRead.matches(meta.Path, meta.Inode, meta.MutationSeq, meta.Size, meta.SnapshotID, stagingGens) {
+		proof.retiredRead, proof.readActualRev = meta.retiredRead, meta.readActualRev
+	}
+	meta.liveChecksum = proof.checksum
+	if u.OnDataCommitted != nil {
+		u.OnDataCommitted(*meta, committedRev, stagingGens)
+	}
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
 	err = u.applyMode(chmodCtx, meta)
 	chmodCancel()
@@ -647,4 +715,27 @@ func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath str
 		u.perf.uploaderSuccess.add(1)
 	}
 	return nil
+}
+
+// tryAcquirePath uses the same ownership as acquirePath without waiting.
+// Rename uses it so partial lock acquisition cannot outlive its retry budget.
+func (u *WriteBackUploader) tryAcquirePath(p string) (func(), bool) {
+	u.inflightMu.Lock()
+	defer u.inflightMu.Unlock()
+	if u.inflight[p] != nil {
+		return nil, false
+	}
+	if u.inflight == nil {
+		u.inflight = make(map[string]*pathState)
+	}
+	owner := &pathState{done: make(chan struct{})}
+	u.inflight[p] = owner
+	return func() {
+		u.inflightMu.Lock()
+		if u.inflight[p] == owner {
+			delete(u.inflight, p)
+		}
+		u.inflightMu.Unlock()
+		close(owner.done)
+	}, true
 }

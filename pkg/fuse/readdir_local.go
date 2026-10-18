@@ -34,16 +34,19 @@ func (fs *Dat9FS) snapshotDirLocal(dirPath string) dirLocalMetadata {
 
 // localDirEntryInfo projects local attributes without consuming generations or
 // changing an inode. A mutation after the snapshot makes the live inode newer.
-func (fs *Dat9FS) localDirEntryInfo(childP string, item CachedFileInfo, live *InodeEntry, local dirLocalMetadata) (CachedFileInfo, bool) {
+// The final flag reports attributes that READDIRPLUS must retry before publishing.
+func (fs *Dat9FS) localDirEntryInfo(childP string, item CachedFileInfo, live *InodeEntry, local dirLocalMetadata) (CachedFileInfo, bool, bool) {
 	if live != nil && !live.IsDir {
 		// Dirty sizes can advance after the directory snapshot was captured.
-		if size, ok := fs.dirtyHandleSize(live.Ino); ok {
+		if size, ok, busy := fs.dirtyHandleSize(live.Ino); busy {
+			return cachedInfoFromEntry(item.Name, live), true, true
+		} else if ok {
 			item = cachedInfoFromEntry(item.Name, live)
 			item.Size = size
-			return item, true
+			return item, true, false
 		}
 		if live.attrVersion > local.version {
-			return cachedInfoFromEntry(item.Name, live), true
+			return cachedInfoFromEntry(item.Name, live), true, false
 		}
 	}
 	if meta := local.pending[childP]; meta != nil {
@@ -64,12 +67,12 @@ func (fs *Dat9FS) localDirEntryInfo(childP string, item CachedFileInfo, live *In
 		if meta.HasMode {
 			item.Mode, item.HasMode = meta.Mode, true
 		}
-		return item, true
+		return item, true, false
 	}
 	if sameKnownDirEntryResource(live, item) && live.Revision > item.Revision {
-		return cachedInfoFromEntry(item.Name, live), true
+		return cachedInfoFromEntry(item.Name, live), true, false
 	}
-	return item, false
+	return item, false, false
 }
 
 // Revision ordering is meaningful only for the same known resource and type.

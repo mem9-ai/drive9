@@ -22,7 +22,19 @@ import (
 
 type readdirPendingKernelFS struct {
 	*Dat9FS
-	plusCalls atomic.Int32
+	plusCalls     atomic.Int32
+	beforeRelease func(uint64)
+	afterRelease  func(uint64)
+}
+
+func (fs *readdirPendingKernelFS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
+	if fs.beforeRelease != nil {
+		fs.beforeRelease(input.Fh)
+	}
+	fs.Dat9FS.Release(cancel, input)
+	if fs.afterRelease != nil {
+		fs.afterRelease(input.Fh)
+	}
 }
 
 func (fs *readdirPendingKernelFS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) gofuse.Status {

@@ -2,8 +2,10 @@ package fuse
 
 import (
 	"context"
+	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/pingcap/failpoint"
 )
 
 var testHookBeforeSurvivorOpenRegister func(*FileHandle)
@@ -83,12 +85,66 @@ func (fs *Dat9FS) prepareUnlinkSurvivor(ctx context.Context, old string) (string
 	if testHookBeforeUnlinkSurvivorBind != nil {
 		testHookBeforeUnlinkSurvivorBind(old)
 	}
+	// A closed truncate on a surviving alias needs no fd transfer. Keep the
+	// verified preferred-path publication atomic with an empty fd binding set.
+	if fs.commitQueue != nil && fs.commitQueue.hasFtruncateInode(ino, fs.ftruncateAliasPaths(ino)) &&
+		!fs.commitQueue.HasPath(old) && !fs.hasPendingMetadataState(old) {
+		fs.inodes.mu.Lock()
+		fs.openHandles.mu.Lock()
+		current := fs.inodes.byInode[ino]
+		noHandoff := current != nil && current.Nlink > 1 && current.ResourceID == entry.ResourceID &&
+			current.Path == entry.Path && current.Revision <= stat.Revision &&
+			fs.inodes.byPath[old] == ino && fs.inodes.byPath[survivor] == ino &&
+			len(fs.openHandles.byInode[ino]) == 0
+		if noHandoff {
+			current.Path = survivor
+		}
+		fs.openHandles.mu.Unlock()
+		fs.inodes.mu.Unlock()
+		if noHandoff {
+			return survivor, gofuse.OK
+		}
+	}
 	// Final handoff is local-only. A late stage/commit invalidates the sampled
 	// baseline; reject before changing preferred path, handle state or namespace.
-	handles := fs.openHandles.SnapshotInode(ino)
-	ordered, locked := tryLockFileHandlesInOrder(handles)
-	if !locked {
-		return "", gofuse.EIO
+	deadline := time.Now().Add(unlinkHandleSetLockTimeout)
+	var ordered []*FileHandle
+	for {
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			return "", gofuse.EIO
+		}
+		handles := fs.openHandles.SnapshotInode(ino)
+		failpoint.InjectCall("unlinkSurvivorHandlesSnapshot", fs)
+		candidate, locked := tryLockFileHandlesInOrder(handles)
+		if locked {
+			if ctx.Err() != nil || !time.Now().Before(deadline) {
+				unlockFileHandles(candidate)
+				return "", gofuse.EIO
+			}
+			// A clean Release may finish after the snapshot, before its mu
+			// is acquired. Recapture instead of treating its removal as a
+			// changed binding; live handles cannot finish Release under mu.
+			alive := true
+			fs.openHandles.mu.RLock()
+			for _, h := range candidate {
+				if _, ok := fs.openHandles.byInode[ino][h]; !ok {
+					alive = false
+					break
+				}
+			}
+			fs.openHandles.mu.RUnlock()
+			if alive {
+				ordered = candidate
+				break
+			}
+			unlockFileHandles(candidate)
+		}
+		if testHookAfterUnlinkHandleSetLockAttempt != nil {
+			testHookAfterUnlinkHandleSetLockAttempt()
+		}
+		if err := waitHandleRetry(ctx, deadline); err != nil {
+			return "", gofuse.EIO
+		}
 	}
 	defer unlockFileHandles(ordered)
 	paths := fs.appendReadPaths(ino)
@@ -176,6 +232,11 @@ func (fs *Dat9FS) moveSurvivorBindingIndexLocked(fh *FileHandle, target string) 
 		}
 		addHandleToSet(fs.openHandles.byPath, target, fh)
 		fs.openHandles.pathByHandle[fh] = target
+	}
+	if event := fh.pendingFtruncate.Load(); event != nil && event.path == fh.Path && event.ino == fh.Ino {
+		moved := *event
+		moved.path = target
+		fh.pendingFtruncate.Store(&moved)
 	}
 	fh.Path = target
 }
