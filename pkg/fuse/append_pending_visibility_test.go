@@ -120,7 +120,9 @@ func TestIssue986PendingAppendRecovery(t *testing.T) {
 	for _, mode := range []string{"missing-then-restaged", "changed-during-pin"} {
 		t.Run(mode, func(t *testing.T) {
 			fs, ino, r, rid, w, wid, _, stage, _ := newPendingAppendTestFS(t, uint32(syscall.O_RDWR))
-			fs.remoteReadTimeout = 200 * time.Millisecond
+			// Restaging publishes durable metadata within the read budget. Use the
+			// production budget so this success case does not time disk fsyncs.
+			fs.remoteReadTimeout = fuseTimeout
 			if _, st := pr939Append(fs, ino, wid, " gopher"); st != gofuse.OK {
 				t.Fatal(st)
 			}
@@ -167,6 +169,43 @@ func TestIssue986PendingAppendRecovery(t *testing.T) {
 				t.Fatalf("recovery %q/%v/%v calls=%d", data, st, err, calls)
 			}
 		})
+	}
+}
+
+func TestIssue986PendingAppendRecoveryDeadline(t *testing.T) {
+	fs, ino, r, rid, w, wid, _, stage, _ := newPendingAppendTestFS(t, uint32(syscall.O_RDWR))
+	fs.remoteReadTimeout = fuseTimeout
+	if _, st := pr939Append(fs, ino, wid, " gopher"); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	stage()
+	fs.shadowStore.Remove(w.Path)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	calls := 0
+	testHookAfterPendingAppendRead = func(p string, pending bool) {
+		if p != r.Path || !pending || calls > 0 {
+			return
+		}
+		calls++
+		if err := fs.shadowStore.WriteFull(p, []byte("hello gopher"), 1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fs.pendingIndex.PutWithBaseRev(p, 12, PendingOverwrite, 1); err != nil {
+			t.Fatal(err)
+		}
+		// A successful publication must not restart the original read budget.
+		<-ctx.Done()
+	}
+	defer func() { testHookAfterPendingAppendRead = nil }()
+	data, n, ok, st, source, _ := fs.readActiveAppendVisibleRange(ctx, r.Path, ino, r, 0, 64)
+	if len(data) != 0 || n != 0 || ok || st != gofuse.EIO || source != "same-path-dirty-timeout" || calls != 1 {
+		t.Fatalf("expired recovery %q/%d/%t/%v source=%s calls=%d", data, n, ok, st, source, calls)
+	}
+	testHookAfterPendingAppendRead = nil
+	data, st, err := readDat9FSTestRange(fs, ino, rid, 0, 64)
+	if err != nil || st != gofuse.OK || string(data) != "hello gopher" {
+		t.Fatalf("fresh recovery %q/%v/%v", data, st, err)
 	}
 }
 
