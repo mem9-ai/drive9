@@ -265,7 +265,7 @@ func (fs *Dat9FS) installFtruncateImageLocked(fh *FileHandle, data []byte, revis
 }
 
 func (fs *Dat9FS) prepareFtruncateMutationLocked(ctx context.Context, fh *FileHandle) error {
-	if _, err := fs.consumeReleaseCommitLocked(fh); err != nil {
+	if _, err := fs.consumeReleaseCommitLocked(ctx, fh); err != nil {
 		return err
 	}
 	if fh != nil {
@@ -447,14 +447,14 @@ func (cq *CommitQueue) ownsFtruncateSnapshot(meta *WriteBackMeta) bool {
 }
 
 func (fs *Dat9FS) prepareFtruncateCommitLocked(ctx context.Context, fh *FileHandle, strict bool, lockState ...*handleLockState) (bool, error) {
-	if handled, err := fs.consumeReleaseCommitLocked(fh); handled || err != nil {
+	if handled, err := fs.consumeReleaseCommitLocked(ctx, fh); handled || err != nil {
 		if err != nil || !fh.HasPendingMode {
 			return handled, err
 		}
 		if err := fs.applyPendingModeForHandleLocked(ctx, fh, lockState...); err != nil {
 			return true, err
 		}
-		_, err = fs.consumeReleaseCommitLocked(fh)
+		_, err = fs.consumeReleaseCommitLocked(ctx, fh)
 		return true, err
 	}
 	if !fs.ftruncateParticipates(fh) {
@@ -543,6 +543,11 @@ func (fs *Dat9FS) prepareFtruncateReleaseLocked(ctx context.Context, fh *FileHan
 			return true, err
 		}
 		if !errors.Is(err, errFtruncateBusy) {
+			if err != nil && fh.releaseCommit != nil && fh.releaseCommit.revision.Load() > 0 {
+				// Verification may fail after a reset. Keep the completed
+				// image for retry instead of publishing it as a conflict.
+				return true, err
+			}
 			if err != nil && fh.Dirty != nil && fh.Dirty.HasDirtyParts() && fs.shadowStore != nil && fs.pendingIndex != nil {
 				if fenceErr := fs.fenceFtruncateLocked(fh); errors.Is(fenceErr, errFtruncateBusy) {
 					goto waitForOwner

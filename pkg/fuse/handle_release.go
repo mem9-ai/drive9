@@ -114,7 +114,7 @@ func (fs *Dat9FS) releaseFileHandle(parent context.Context, cancel <-chan struct
 				fs.discardUnlinkedHandleStateLocked(fh)
 				clearPendingModeLocked(fh)
 			}
-			if _, err := fs.consumeReleaseCommitLocked(fh); err != nil {
+			if _, err := fs.consumeReleaseCommitLocked(ctx, fh); err != nil {
 				retain()
 				unlock()
 				return
@@ -385,6 +385,9 @@ func (fs *Dat9FS) releaseFileHandle(parent context.Context, cancel <-chan struct
 				flushStatus = httpToFuseStatus(err)
 				releaseStatus = flushStatus
 				safeLogPrintf("release: fd-truncate handoff failed for %s: %v", fh.Path, err)
+				if fh.releaseCommit != nil && fh.releaseCommit.revision.Load() > 0 {
+					retain() // Failed receipt verification must also stop deferred chmod.
+				}
 			}
 			unlock()
 			return

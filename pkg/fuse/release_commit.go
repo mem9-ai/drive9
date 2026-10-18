@@ -1,6 +1,10 @@
 package fuse
 
-import "sync/atomic"
+import (
+	"context"
+	"sync/atomic"
+	"syscall"
+)
 
 // A completion for one selected upload image, published before dropping mu.
 // It finishes only this handle's own recorded commit; never transferable authority
@@ -37,7 +41,7 @@ func (r *releaseCommitReceipt) complete(revision int64) {
 	}
 }
 
-func (fs *Dat9FS) consumeReleaseCommitLocked(fh *FileHandle) (bool, error) {
+func (fs *Dat9FS) consumeReleaseCommitLocked(ctx context.Context, fh *FileHandle) (bool, error) {
 	if fh == nil {
 		return false, nil
 	}
@@ -51,7 +55,7 @@ func (fs *Dat9FS) consumeReleaseCommitLocked(fh *FileHandle) (bool, error) {
 		return false, nil
 	}
 	entry, ok := fs.inodes.GetEntry(fh.Ino)
-	if !ok || fh.Unlinked || fh.Ino != r.ino || r.view != fs.mountViewGeneration.Load() || !fs.ftruncateAliasLinked(fh) ||
+	if !ok || fh.Unlinked || fh.Ino != r.ino || !fs.ftruncateAliasLinked(fh) ||
 		(r.resource != "" && entry.ResourceID != r.resource) || (r.resource == "" && fh.Path != r.path) {
 		return false, nil
 	}
@@ -61,6 +65,36 @@ func (fs *Dat9FS) consumeReleaseCommitLocked(fh *FileHandle) (bool, error) {
 	}
 	if !hadFence {
 		defer fs.releaseHandleRemoteCommitPathLocked(fh)
+	}
+	view, epoch := fs.mountViewGeneration.Load(), fh.readInvalidationEpoch.Load()
+	paths := fs.ftruncateAliasPaths(fh.Ino)
+	changedView := r.view != view
+	if changedView {
+		// Completion survives cache invalidation, but an old view cannot
+		// authorize finalization against a replaced or advanced remote image.
+		if r.resource == "" {
+			return true, syscall.EAGAIN
+		}
+		stat, err := fs.client.StatCtx(ctx, fs.remotePath(fh.Path))
+		if err != nil {
+			return true, err
+		}
+		if err := ctx.Err(); err != nil {
+			return true, err
+		}
+		if stat == nil || stat.IsDir || stat.ResourceID != r.resource || stat.Revision != r.revision.Load() || stat.Size != r.size {
+			return true, syscall.EAGAIN
+		}
+	}
+	if !fs.mountViewMu.TryRLock() {
+		return true, errFtruncateBusy
+	}
+	defer fs.mountViewMu.RUnlock()
+	entry, ok = fs.inodes.GetEntry(fh.Ino)
+	if !ok || !fs.ftruncateAliasesValid(fh.Ino, paths, view) ||
+		(r.resource != "" && entry.ResourceID != r.resource) ||
+		(changedView && epoch != fh.readInvalidationEpoch.Load()) {
+		return true, syscall.EAGAIN
 	}
 	fs.updateHandleRevisionMetadataLocked(fh, r.revision.Load(), r.size)
 	if fs.captureHandleStagingGensLocked(fh) != r.gens {
