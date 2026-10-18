@@ -7,6 +7,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/pingcap/failpoint"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
@@ -34,7 +35,12 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
 		fs.debugf("fsync lock wait path=%s fh=%d ino=%d wait=%s", fh.Path, input.Fh, fh.Ino, lockWait)
 	}
-	defer fh.Unlock()
+	handleLocked := true
+	defer func() {
+		if handleLocked {
+			fh.Unlock()
+		}
+	}()
 	if fs.debugEnabled() && strings.HasSuffix(fh.Path, ".db") {
 		mainDBPath := fh.Path
 		mainDBFsyncStarted := time.Now()
@@ -49,7 +55,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}()
 	}
 	defer func() {
-		if !fs.debugEnabled() {
+		if !handleLocked || !fs.debugEnabled() {
 			return
 		}
 		var size int64
@@ -91,33 +97,54 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		return fs.flushGitHandleLockedWithPolicy(flushCtx, fh, fs.syncMode == SyncStrict)
 	}
 
-	if st := fs.layerHandleMutationStatusLocked(fh); st != gofuse.OK {
-		return st
-	}
-
-	// Unlink-while-open: never stage/enqueue/upload. Fsync can otherwise
-	// re-enter commitQueue after Unlink's ordered drain and resurrect the
-	// deleted path (write → unlink → fsync → close → rmdir ENOTEMPTY).
-	// Keep Dirty so a successful write-after-unlink stays readable.
-	if fh.Unlinked {
-		phase = "unlinked-discard"
-		fs.cancelUnlinkedRemotePublishLocked(fh)
-		return gofuse.OK
-	}
 	if fs.ftruncateParticipates(fh) {
-		defer fs.releaseHandleRemoteCommitPathLocked(fh)
+		defer func() {
+			if handleLocked {
+				fs.releaseHandleRemoteCommitPathLocked(fh)
+			}
+		}()
 	}
 	retiredOwner, hadRetiredFence := hasRetiredRead(fh), fh.ftruncateFence
 	defer func() {
-		if retiredOwner && !hadRetiredFence && fh.ftruncateFence {
+		if handleLocked && retiredOwner && !hadRetiredFence && fh.ftruncateFence {
 			fs.releaseHandleRemoteCommitPathLocked(fh)
 		}
 	}()
-	if err := fs.prepareRetiredReadLocked(ctx, fh); err != nil {
-		return httpToFuseStatus(err)
-	}
-	if handled, err := fs.prepareFtruncateCommitLocked(ctx, fh, fs.syncMode == SyncStrict); handled || err != nil {
-		return httpToFuseStatus(err)
+	for {
+		if st := fs.layerHandleMutationStatusLocked(fh); st != gofuse.OK {
+			return st
+		}
+		// Recheck after yielding: an anonymous fd must not republish its path.
+		if fh.Unlinked {
+			phase = "unlinked-discard"
+			fs.cancelUnlinkedRemotePublishLocked(fh)
+			return gofuse.OK
+		}
+		handled := false
+		err := fs.prepareRetiredReadLocked(ctx, fh)
+		if err == nil {
+			handled, err = fs.prepareFtruncateCommitLocked(ctx, fh, fs.syncMode == SyncStrict)
+		}
+		if !errors.Is(err, errFtruncateBusy) {
+			if handled || err != nil {
+				return httpToFuseStatus(err)
+			}
+			break
+		}
+		// A sibling's close or queue handoff can briefly own these locks.
+		// Give it room to finish, then revalidate under the original budget.
+		fs.releaseHandleRemoteCommitPathLocked(fh)
+		handleLocked = false
+		fh.Unlock()
+		failpoint.InjectCall("ftruncateFsyncWait", fs, fh)
+		if err := waitHandleRetry(ctx, time.Time{}); err != nil {
+			return httpToFuseStatus(err)
+		}
+		failpoint.InjectCall("ftruncateFsyncBeforeRelock", fs, fh)
+		if err := lockHandleWithContext(ctx, fh, time.Time{}); err != nil {
+			return httpToFuseStatus(err)
+		}
+		handleLocked = true
 	}
 	if fs.discardSupersededMutationLocked(fh) {
 		phase = "superseded-mutation"
