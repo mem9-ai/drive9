@@ -233,6 +233,11 @@ func (fs *Dat9FS) moveSurvivorBindingIndexLocked(fh *FileHandle, target string) 
 		addHandleToSet(fs.openHandles.byPath, target, fh)
 		fs.openHandles.pathByHandle[fh] = target
 	}
+	if event := fh.pendingFtruncate.Load(); event != nil && event.path == fh.Path && event.ino == fh.Ino {
+		moved := *event
+		moved.path = target
+		fh.pendingFtruncate.Store(&moved)
+	}
 	fh.Path = target
 }
 
