@@ -34,15 +34,21 @@ func TestPortUntrackKeepsNewerClaimAndPromotesSurvivor(t *testing.T) {
 	}
 	o1, o2, o3 := open(), open(), open()
 
-	o1.Release(ctx)
+	if err := o1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if cur := wb.handleFor("/f"); cur != o3 {
 		t.Fatalf("handleFor(/f) after releasing the oldest = %p, want the newest owner", cur)
 	}
-	o3.Release(ctx)
+	if err := o3.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if cur := wb.handleFor("/f"); cur != o2 {
 		t.Fatalf("handleFor(/f) after releasing the owner = %p, want the surviving claim", cur)
 	}
-	o2.Release(ctx)
+	if err := o2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if cur := wb.handleFor("/f"); cur != nil {
 		t.Fatalf("handleFor(/f) after releasing every claim = %p, want none", cur)
 	}
