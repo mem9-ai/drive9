@@ -39,7 +39,7 @@ func TestReadDirPlusReplacedInodeKernel(t *testing.T) {
 	}
 }
 
-func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncMode, oldSize, newSize int) {
+func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncMode, oldSize, newSize int, configure ...func(*Dat9FS, *readdirPendingKernelFS) func()) {
 	t.Helper()
 	oldData, newData := bytes.Repeat([]byte("A"), oldSize), bytes.Repeat([]byte("B"), newSize)
 	var armed atomic.Bool
@@ -183,6 +183,14 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 	t.Cleanup(func() { release(); queue.DrainAll() })
 	fs.dirCache.Put("/", []CachedFileInfo{})
 	kernelFS := &readdirPendingKernelFS{Dat9FS: fs}
+	var finish func()
+	if len(configure) != 0 {
+		finish = configure[0](fs, kernelFS)
+		if finish != nil {
+			finish = sync.OnceFunc(finish)
+			t.Cleanup(finish) // Also cover mount failure before unmount cleanup exists.
+		}
+	}
 	server, err := gofuse.NewServer(kernelFS, opts.MountPoint, newGoFuseMountOptions(opts))
 	if err != nil {
 		if os.Getenv("DRIVE9_REQUIRE_KERNEL_FUSE") == "1" {
@@ -199,6 +207,9 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, profile string, mode SyncM
 			t.Error(err)
 		}
 	})
+	if finish != nil {
+		t.Cleanup(finish)
+	}
 	if err := server.WaitMount(); err != nil {
 		t.Fatal(err)
 	}
