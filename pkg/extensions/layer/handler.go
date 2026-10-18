@@ -252,15 +252,38 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		unlock := l.mutLocks.lock(op.Path)
 		defer unlock()
 		// POSIX unlink-while-open: the whiteout hides the name now, the
-		// open handle keeps serving its buffered image and never publishes.
-		if h := l.handleFor(op.Path); h != nil && op.Kind == fs.OpUnlink {
-			h.markUnlinked()
+		// open handle keeps serving its buffered image and never
+		// publishes. EVERY matching descriptor goes anonymous — marking
+		// only the per-path newest left an older sibling free to upsert
+		// the whiteouted name back at its next sync.
+		var marked []*layerHandle
+		if op.Kind == fs.OpUnlink {
+			l.handles.Range(func(key, _ any) bool {
+				if h, hok := key.(*layerHandle); hok {
+					h.mu.Lock()
+					path, released := h.path, h.released
+					h.mu.Unlock()
+					if !released && path == op.Path {
+						h.markUnlinked()
+						marked = append(marked, h)
+					}
+				}
+				return true
+			})
 		}
 		kind := "file"
 		if op.Kind == fs.OpRmdir {
 			kind = "dir"
 		}
 		if err := l.upsertEntry(ctx, client.FSLayerEntryRequest{Path: l.remotePath(op.Path), Op: "whiteout", Kind: kind}); err != nil {
+			// The whiteout did NOT land: the name still exists, and a
+			// failed unlink must not silently orphan every marked fd —
+			// their later commits stay bound to the live name.
+			for _, h := range marked {
+				h.mu.Lock()
+				h.unlinked = false
+				h.mu.Unlock()
+			}
 			return fs.Result{}, err
 		}
 		l.markLayerWhiteout(op.Path)

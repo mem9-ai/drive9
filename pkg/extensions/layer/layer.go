@@ -144,8 +144,14 @@ func (l *Layer) untrackHandle(h *layerHandle) {
 func (l *Layer) detachFromRegistry(h *layerHandle, path string) {
 	// Compare-and-delete: a plain Load→Delete pair dropped a NEWER claim
 	// that a concurrent open stored into the slot between the two calls.
-	// The slot dies only while it still maps to the detaching handle.
-	l.live.CompareAndDelete(path, h)
+	// The slot dies only while it still maps to the detaching handle —
+	// and ONLY an actually-removed own slot may re-select a survivor: a
+	// failed CAS means a newer claim owns the path (three fds sharing it,
+	// or a concurrent open), and promoting an older handle here would
+	// overwrite that owner for every later path-keyed operation.
+	if !l.live.CompareAndDelete(path, h) {
+		return
+	}
 	l.handles.Range(func(key, _ any) bool {
 		other, ok := key.(*layerHandle)
 		if !ok || other == h {

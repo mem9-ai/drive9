@@ -163,6 +163,9 @@ type Writeback struct {
 	// sibling-visibility tiers pick an inode's newest uncommitted image by
 	// it, no matter which fd produced the image.
 	mutEpoch atomic.Uint64
+	// regMu serializes the handle-registry protocol (release vs rename
+	// retarget vs survivor promotion), mirroring the layer registry.
+	regMu sync.Mutex
 	// perfShim forwards the queue/uploader remote-op observations to the
 	// facade's perf counters (v1 perfRecordRemote).
 	perfShim *fusePerfCounters
@@ -617,12 +620,19 @@ func (w *Writeback) isSQLiteDirectIOPath(path string) bool {
 	}
 	dir := strings.TrimSuffix(path, base)
 	found := false
-	w.liveSet.Range(func(key, _ any) bool {
+	w.liveSet.Range(func(key, v any) bool {
 		h, ok := key.(*bufferingHandle)
 		if !ok {
 			return true
 		}
-		hp := h.path
+		// Identity comes from the lock-free registry snapshot: a bare
+		// h.path read races a concurrent rename retarget's write under
+		// h.mu (found by -race in the release-registry suite).
+		info, iok := v.(*handleInfo)
+		if !iok {
+			info = h.infoSnapshot()
+		}
+		hp := info.path
 		for _, suffix := range []string{"-wal", "-shm", "-journal"} {
 			if hp == dir+stem+suffix {
 				found = true
@@ -2332,20 +2342,39 @@ func (w *Writeback) untrack(h *bufferingHandle) {
 	// The path index maps the path to its newest tracked handle — which
 	// need not be THIS one (a recreate tracked a newer writer over it).
 	// Dropping the entry unconditionally hid the surviving writer from
-	// handleFor: its bytes could no longer be flushed or served. Remove
-	// the mapping only while it still belongs to the released handle, and
-	// re-select a surviving same-path writer otherwise.
-	if cur, ok := w.live.Load(h.path); ok && cur == h {
-		w.live.Delete(h.path)
-		w.liveSet.Range(func(key, _ any) bool {
-			if other, ok := key.(*bufferingHandle); ok && other != h && !other.unlinked {
-				other.mu.Lock()
-				samePath := other.path == h.path
-				other.mu.Unlock()
-				if samePath {
-					w.live.Store(h.path, other)
-					return false
-				}
+	// handleFor: its bytes could no longer be flushed or served.
+	//
+	// The whole release-side registry update runs under regMu with the
+	// identity snapshotted under the handle's own lock (a bare h.path
+	// read races a concurrent retarget write) and the slot cleared by
+	// compare-and-delete: only an actually-removed OWN slot re-selects a
+	// survivor (a failed CAS means a newer claim — an open that landed
+	// between the check and the delete, or three fds sharing the path —
+	// and promoting an older handle here would overwrite it). Candidate
+	// identity and lifetime are verified under the candidate's lock, read
+	// from the lock-free info snapshot first.
+	path := h.infoSnapshot().path
+	w.regMu.Lock()
+	defer w.regMu.Unlock()
+	if w.live.CompareAndDelete(path, h) {
+		w.liveSet.Range(func(key, v any) bool {
+			other, ok := key.(*bufferingHandle)
+			if !ok || other == h {
+				return true
+			}
+			info, iok := v.(*handleInfo)
+			if !iok {
+				info = other.infoSnapshot()
+			}
+			if info.path != path {
+				return true
+			}
+			other.mu.Lock()
+			eligible := !other.unlinked
+			other.mu.Unlock()
+			if eligible {
+				w.live.Store(path, other)
+				return false
 			}
 			return true
 		})
@@ -2548,21 +2577,22 @@ func (w *Writeback) retarget(oldPath, newPath string) {
 	prefix := strings.TrimSuffix(oldPath, "/") + "/"
 	w.liveSet.Range(func(key, _ any) bool {
 		h := key.(*bufferingHandle)
+		// The descriptor's identity moves under its own lock; the live-slot
+		// move runs under regMu AFTER releasing it (the lock order must
+		// stay handle-mutex-then-regMu everywhere, or a release-side
+		// survivor scan under regMu deadlocks against a retarget holding
+		// this mutex) and by compare-and-delete: a newer claim that took
+		// the slot is never evicted by an older fd's rename.
 		h.mu.Lock()
 		next := ""
+		var slotOld string
 		switch {
 		case h.path == oldPath:
-			if cur, ok := w.live.Load(oldPath); ok && cur == h {
-				w.live.Delete(oldPath)
-				w.live.Store(newPath, h)
-			}
 			next = newPath
+			slotOld = oldPath
 		case strings.HasPrefix(h.path, prefix):
 			next = newPath + strings.TrimPrefix(h.path, oldPath)
-			if cur, ok := w.live.Load(h.path); ok && cur == h {
-				w.live.Delete(h.path)
-				w.live.Store(next, h)
-			}
+			slotOld = h.path
 		}
 		if next != "" {
 			h.path = next
@@ -2577,6 +2607,13 @@ func (w *Writeback) retarget(oldPath, newPath string) {
 			}
 		}
 		h.mu.Unlock()
+		if slotOld != "" {
+			w.regMu.Lock()
+			if w.live.CompareAndDelete(slotOld, h) {
+				w.live.Store(next, h)
+			}
+			w.regMu.Unlock()
+		}
 		return true
 	})
 }

@@ -86,6 +86,8 @@ type Backend struct {
 	gitPacks  map[string][][]byte
 	// layerEntryDelay slows layer-entry POSTs (test knob).
 	layerEntryDelay time.Duration
+	// failLayerEntry injects one failing response per recorded path.
+	failLayerEntry map[string]int
 	// uploads tracks v2 multipart sessions (initiate → parts → complete).
 	uploads   map[string]*uploadState
 	uploadSeq int64
@@ -112,17 +114,18 @@ func (us *uploadState) partSizeFor(num int) int64 {
 
 func NewBackend() *Backend {
 	return &Backend{
-		files:         map[string]*Node{"/": {IsDir: true, Mode: 0o755}},
-		nextRev:       10, // fixtures use revs 1..9
-		forceConflict: map[string]int{},
-		failDelete:    map[string]int{},
-		layerLog:      map[string][]LayerEntry{},
-		layerEvents:   map[string][]LayerEntry{},
-		uploads:       map[string]*uploadState{},
-		checkpoints:   map[string]int64{},
-		requests:      map[string]int{},
-		gitStates:     map[string][]byte{},
-		gitPacks:      map[string][][]byte{},
+		files:          map[string]*Node{"/": {IsDir: true, Mode: 0o755}},
+		nextRev:        10, // fixtures use revs 1..9
+		forceConflict:  map[string]int{},
+		failDelete:     map[string]int{},
+		layerLog:       map[string][]LayerEntry{},
+		layerEvents:    map[string][]LayerEntry{},
+		failLayerEntry: map[string]int{},
+		uploads:        map[string]*uploadState{},
+		checkpoints:    map[string]int64{},
+		requests:       map[string]int{},
+		gitStates:      map[string][]byte{},
+		gitPacks:       map[string][][]byte{},
 	}
 }
 
@@ -267,6 +270,13 @@ func (b *Backend) SeedExtent(path string, data []byte, extentIno uint64) {
 func (b *Backend) DelayLayerEntriesForTest(d time.Duration) {
 	b.mu.Lock()
 	b.layerEntryDelay = d
+	b.mu.Unlock()
+}
+
+// ForceLayerEntryFailure injects n failing layer-entry responses for path.
+func (b *Backend) ForceLayerEntryFailure(path string, n int) {
+	b.mu.Lock()
+	b.failLayerEntry[path] = n
 	b.mu.Unlock()
 }
 
@@ -625,6 +635,12 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				_ = json.NewDecoder(r.Body).Decode(&req)
 				b.mu.Lock()
+				if b.failLayerEntry[req.Path] > 0 {
+					b.failLayerEntry[req.Path]--
+					b.mu.Unlock()
+					b.writeErr(w, http.StatusInternalServerError, "layer entry forced failure")
+					return
+				}
 				delay := b.layerEntryDelay
 				b.layerSeq++
 				e := LayerEntry{Path: req.Path, Op: req.Op, Kind: req.Kind, Mode: req.Mode, Content: req.Content, ContentText: req.ContentText, Seq: b.layerSeq}
@@ -633,7 +649,7 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if delay > 0 {
 					time.Sleep(delay)
 				}
-				b.writeJSON(w, map[string]any{"layer_id": id, "path": req.Path, "op": req.Op, "seq": e.Seq})
+				b.writeJSON(w, map[string]any{"layer_id": id, "path": req.Path, "op": req.Op, "seq": e.Seq, "entry_seq": e.Seq})
 				return
 			case tail == "events" && r.Method == http.MethodGet:
 				since := int64(0)

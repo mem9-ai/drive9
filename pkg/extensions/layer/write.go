@@ -7,7 +7,6 @@ package layer
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"io"
 	"sync"
 	"syscall"
@@ -49,11 +48,13 @@ type layerHandle struct {
 	// conflict): writes and commits answer EAGAIN — the buffer is kept, and
 	// publishing it onto the new tip would splice stale bytes.
 	conflicted bool
-	// landed/landedSum identify the image THIS handle last landed: the
-	// checkout sweep compares them against the observed entry so the
-	// handle's own commits never fence its newer dirty buffer.
+	// landed/landedSeq identify the entry THIS handle last landed (the
+	// server's entry sequence): the checkout sweep compares them against
+	// the observed event sequence so the handle's own commits never fence
+	// its newer dirty buffer — while a foreign entry, even one with
+	// byte-identical content, still does.
 	landed    bool
-	landedSum [sha256.Size]byte
+	landedSeq int64
 	// unlinkAtRelease publishes the layer whiteout of an unlinked-but-open
 	// path at the last close.
 	unlinkAtRelease func(ctx context.Context) error
@@ -341,6 +342,18 @@ func (h *layerHandle) commit(ctx context.Context) error {
 		return syscall.ESTALE
 	}
 	unlock := l.mutLocks.lock(path)
+	// The lock wait outlives the snapshot: a rename holding the path
+	// locks may have completed the move and retargeted this fd while the
+	// commit waited — publishing the captured image under the OLD path
+	// would resurrect the renamed-away name. Fail closed; the retry
+	// captures the new path.
+	h.mu.Lock()
+	moved := h.path != path
+	h.mu.Unlock()
+	if moved {
+		unlock()
+		return syscall.EAGAIN
+	}
 	defer unlock()
 	var entry *client.FSLayerEntry
 	var err error
@@ -375,9 +388,14 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	// commits from foreign ones: write → fsync → write before the next
 	// event poll puts the previous commit into `changed`, and without the
 	// comparison the sweep fenced the newer dirty buffer although no
-	// other client had touched the path.
+	// other client had touched the path. The SERVER's entry sequence is
+	// the identity — a foreign client can write byte-identical content
+	// (a chmod, or a same-content rewrite with a fresh entry), which a
+	// content hash cannot distinguish.
 	h.landed = true
-	h.landedSum = sha256.Sum256(image)
+	if entry != nil && entry.EntrySeq > h.landedSeq {
+		h.landedSeq = entry.EntrySeq
+	}
 	if h.wgen == wgen {
 		// No write arrived while the snapshot uploaded: this commit is
 		// the newest state and may retire the dirty flag. A newer wgen

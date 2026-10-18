@@ -4,7 +4,6 @@ package layer
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"time"
@@ -115,11 +114,16 @@ func (l *Layer) refreshEvents(ctx context.Context) error {
 	// (drop the stale buffer when it holds no uncommitted writes); a path
 	// now whiteouted serves ENOENT even on an open fd.
 	changed := make(map[string]bool)
+	tipSeq := make(map[string]int64)
 	for i := range events {
 		if events[i].Path != "" {
 			// Event paths are remote (root-prefixed); the live handle
 			// index and the overlay are keyed by the mount-local path.
-			changed[l.localPathOf(events[i].Path)] = true
+			local := l.localPathOf(events[i].Path)
+			changed[local] = true
+			if events[i].Seq > tipSeq[local] {
+				tipSeq[local] = events[i].Seq
+			}
 		}
 	}
 	// EVERY descriptor of a changed path follows the checkout, not just
@@ -144,11 +148,12 @@ func (l *Layer) refreshEvents(ctx context.Context) error {
 		kind, _, _, content, look := l.lookup(path)
 		// The handle's OWN last landing is not an external change: write →
 		// fsync → write before this poll put the previous commit into
-		// `changed`, and comparing the observed entry against the landing
-		// identity keeps the newer dirty buffer unfenced (main's replay
-		// compared tips the same way).
-		selfLanded := look && kind == "file" && h.landed &&
-			sha256.Sum256(content) == h.landedSum
+		// `changed`. The landing identity is the SERVER entry sequence —
+		// every observed event for the path is at or below the handle's
+		// last landing exactly when the handle still owns the tip; a
+		// foreign entry (even byte-identical content: a chmod, or a
+		// same-content rewrite) carries a newer sequence and fences.
+		selfLanded := h.landed && tipSeq[path] <= h.landedSeq
 		if h.dirty && !selfLanded {
 			// v1 preserveLayerReplayConflict: an external change under
 			// uncommitted writes fences the handle — publishing its
