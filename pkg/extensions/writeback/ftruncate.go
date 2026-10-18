@@ -32,16 +32,18 @@ const (
 // reconcile with a busy sibling within its budget (v1 errFtruncateBusy).
 var errFtruncateBusy = syscall.EAGAIN
 
-// inoOf resolves a handle's kernel inode, claimed lazily from the
-// facade's table: OPEN and SETATTR carry it on the op, while creates only
-// learn theirs once the kernel assigns the entry.
-func (w *Writeback) inoOf(h *bufferingHandle) uint64 {
+// identityOf snapshots a handle's (inode, path) under its lock and
+// resolves the inode lazily from the facade's table (OPEN and SETATTR
+// carry it on the op; creates only learn theirs once the kernel assigns
+// the entry). Callers must not read h.path bare: rename/retarget writes
+// it under the same lock, and an unlocked read is a data race that can
+// also key a lookup by a path the fd no longer has.
+func (w *Writeback) identityOf(h *bufferingHandle) (uint64, string) {
 	h.mu.Lock()
-	ino := h.ino
-	path := h.path
+	ino, path := h.ino, h.path
 	h.mu.Unlock()
 	if ino != 0 || w.inodes == nil {
-		return ino
+		return ino, path
 	}
 	if resolved, ok := w.inodes.Ino(path); ok {
 		h.mu.Lock()
@@ -49,9 +51,15 @@ func (w *Writeback) inoOf(h *bufferingHandle) uint64 {
 			h.ino = resolved
 		}
 		h.mu.Unlock()
-		return resolved
+		return resolved, path
 	}
-	return 0
+	return 0, path
+}
+
+// inoOf is identityOf's inode half.
+func (w *Writeback) inoOf(h *bufferingHandle) uint64 {
+	ino, _ := w.identityOf(h)
+	return ino
 }
 
 // inodeAliasPaths lists every pathname currently bound to the inode —
@@ -159,7 +167,7 @@ func (w *Writeback) visibleImageOwner(ino uint64, path string, skip *bufferingHa
 // EAGAIN return means the owner stayed busy past the bounded retry, never
 // that an unrelated path is contended.
 func (w *Writeback) readVisibleSiblingImage(ctx context.Context, reader *bufferingHandle, off int64, dest []byte) (int, bool, error) {
-	ino := w.inoOf(reader)
+	ino, path := w.identityOf(reader)
 	if ino == 0 {
 		return 0, false, nil
 	}
@@ -168,7 +176,7 @@ func (w *Writeback) readVisibleSiblingImage(ctx context.Context, reader *bufferi
 		if err := ctx.Err(); err != nil {
 			return 0, false, err
 		}
-		src, _, busy := w.visibleImageOwner(ino, reader.path, reader)
+		src, _, busy := w.visibleImageOwner(ino, path, reader)
 		if busy {
 			if time.Now().After(deadline) {
 				return 0, false, syscall.EAGAIN
@@ -218,12 +226,12 @@ func (w *Writeback) readAliasStagedImage(reader *bufferingHandle, off int64, des
 	if w.opts.Staging == nil {
 		return 0, false
 	}
-	ino := w.inoOf(reader)
+	ino, path := w.identityOf(reader)
 	if ino == 0 {
 		return 0, false
 	}
-	for _, alias := range w.inodeAliasPaths(ino, reader.path) {
-		if alias == reader.path {
+	for _, alias := range w.inodeAliasPaths(ino, path) {
+		if alias == path {
 			continue
 		}
 		if !w.opts.Staging.Pending.HasPending(alias) {
@@ -247,38 +255,64 @@ func (w *Writeback) readAliasStagedImage(reader *bufferingHandle, off int64, des
 // tryLockFileHandlesInOrder): deterministic ordering keeps concurrent
 // admissions from interleaving partial sets. Contention retries within
 // the bounded window and fails closed with EAGAIN.
+//
+// The sort keys are snapshotted under each handle's own lock — sorting on
+// a bare h.path read races a concurrent rename/retarget write and could
+// order two admissions by inconsistent keys (review P1) — and every
+// locked handle re-verifies its key before the set is accepted: a rename
+// that moved a sibling mid-sweep restarts the sweep instead of letting an
+// admission proceed over a stale ordering.
 func (w *Writeback) lockSiblingsOrdered(siblings []*bufferingHandle, owner *bufferingHandle) ([]*bufferingHandle, error) {
-	ordered := make([]*bufferingHandle, 0, len(siblings))
-	for _, sib := range siblings {
-		if sib != owner {
-			ordered = append(ordered, sib)
-		}
-	}
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].path < ordered[j].path })
 	deadline := time.Now().Add(samePathDirtyWaitTimeout)
-	locked := make([]*bufferingHandle, 0, len(ordered))
+	locked := make([]*bufferingHandle, 0, len(siblings))
 	for {
-		locked = locked[:0]
-		ok := true
-		for _, sib := range ordered {
-			if sib.mu.TryLock() {
-				locked = append(locked, sib)
+		keys := make([]siblingKey, 0, len(siblings))
+		for _, sib := range siblings {
+			if sib == owner {
 				continue
 			}
-			for _, l := range locked {
-				l.mu.Unlock()
+			sib.mu.Lock()
+			keys = append(keys, siblingKey{h: sib, path: sib.path})
+			sib.mu.Unlock()
+		}
+		sort.Slice(keys, func(i, j int) bool { return keys[i].path < keys[j].path })
+
+		locked = locked[:0]
+		ok := true
+		for _, k := range keys {
+			if k.h.mu.TryLock() {
+				locked = append(locked, k.h)
+				continue
 			}
 			ok = false
 			break
 		}
-		if ok {
-			return locked, nil
+		if ok && len(locked) == len(keys) {
+			drifted := false
+			for i, h := range locked {
+				if h.path != keys[i].path {
+					drifted = true
+					break
+				}
+			}
+			if !drifted {
+				return locked, nil
+			}
+		}
+		for _, l := range locked {
+			l.mu.Unlock()
 		}
 		if time.Now().After(deadline) {
 			return nil, errFtruncateBusy
 		}
 		time.Sleep(samePathDirtyWaitInterval)
 	}
+}
+
+// siblingKey is a lock-held snapshot of one sibling's sort key.
+type siblingKey struct {
+	h    *bufferingHandle
+	path string
 }
 
 // admitFtruncate is the fd-truncate admission path (#984 SetAttr's
@@ -311,7 +345,9 @@ func (w *Writeback) admitFtruncate(ctx context.Context, owner *bufferingHandle, 
 		owner.mu.Unlock()
 	}
 	for _, sib := range locked {
-		if sib.path == owner.path {
+		// The admission's path (not a bare owner.path read — the owner's
+		// mutex is not held here, and rename writes the field under it).
+		if sib.path == path {
 			// Same-path siblings stay untouched (v1): their reads are
 			// served by the visibility tiers, and a clean sibling's close
 			// must publish nothing — the truncate belongs to the naming
@@ -323,10 +359,15 @@ func (w *Writeback) admitFtruncate(ctx context.Context, owner *bufferingHandle, 
 			// A hardlink alias's buffered handle rebases AND becomes a
 			// publisher of the truncated image (v1
 			// syncOpenHandlesAfterPathTruncate): its flush would otherwise
-			// republish the stale pre-truncation tail at close.
+			// republish the stale pre-truncation tail at close. wgen
+			// advances with the mutation — an upload that captured the
+			// pre-rebase generation (a close-sync Flush or Drain in
+			// flight) must not hit generation equality on completion and
+			// retire this truncate's dirty state (review P1).
 			if terr := sib.buf.Truncate(size); terr == nil {
 				sib.buf.ResetSequentialState(size)
 				sib.dirty = true
+				sib.wgen++
 				sib.mutSeq = w.nextMutSeq()
 			}
 		case sib.buf == nil && sib.pendingImage != nil:

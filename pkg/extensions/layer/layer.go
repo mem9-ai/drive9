@@ -114,19 +114,20 @@ func (l *Layer) liveStore(path string, h *layerHandle) {
 func (l *Layer) untrackHandle(h *layerHandle) {
 	h.mu.Lock()
 	h.released = true
-	h.mu.Unlock()
-	l.handles.Delete(h)
-	l.detachFromRegistry(h)
-}
-
-// detachFromRegistry removes one handle's claim on ITS CURRENT path slot
-// without touching the descriptor's lifetime (renames move open fds):
-// the slot is cleared only while it still maps to this handle, and a
-// surviving same-path claim is re-selected into it.
-func (l *Layer) detachFromRegistry(h *layerHandle) {
-	h.mu.Lock()
 	path := h.path
 	h.mu.Unlock()
+	l.handles.Delete(h)
+	l.detachFromRegistry(h, path)
+}
+
+// detachFromRegistry removes one handle's claim on the GIVEN path slot
+// without touching the descriptor's lifetime (renames move open fds; the
+// caller names the slot it saw — the handle's current path may already be
+// the rename target, and detaching that instead stranded the old slot
+// pointing at a retargeted fd): the slot is cleared only while it still
+// maps to this handle, and a
+// surviving same-path claim is re-selected into it.
+func (l *Layer) detachFromRegistry(h *layerHandle, path string) {
 	if cur, ok := l.live.Load(path); ok && cur != h {
 		return
 	}

@@ -269,8 +269,11 @@ func (h *layerHandle) retarget(newPath string) {
 	}
 	// A registry MOVE, not a retirement: the open fd keeps its lifetime —
 	// retiring here marked still-open descriptors released and later
-	// renames/writes lost them.
-	h.l.detachFromRegistry(h)
+	// renames/writes lost them. The OLD slot is detached by name: h.path
+	// already reads newPath here, and keying the detach on it removed the
+	// target slot while live[old] kept pointing at this retargeted fd —
+	// a later SetAttr/Unlink on the old name then hit the new name's fd.
+	h.l.detachFromRegistry(h, old)
 	h.l.liveStore(newPath, h)
 }
 

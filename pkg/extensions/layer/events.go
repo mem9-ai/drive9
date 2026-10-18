@@ -130,14 +130,16 @@ func (l *Layer) refreshEvents(ctx context.Context) error {
 		if !ok {
 			return true
 		}
+		// Snapshot and apply under ONE lock hold: a gap between them let
+		// a rename retarget the fd (or a Release retire it) while the
+		// sweep still held the old path, writing the old name's
+		// whiteout/content into the moved fd (review P1).
 		h.mu.Lock()
 		path := h.path
-		released := h.released
-		h.mu.Unlock()
-		if released || !changed[path] {
+		if h.released || !changed[path] {
+			h.mu.Unlock()
 			return true
 		}
-		h.mu.Lock()
 		if h.dirty {
 			// v1 preserveLayerReplayConflict: an external change under
 			// uncommitted writes fences the handle — publishing its

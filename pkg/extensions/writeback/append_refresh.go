@@ -223,7 +223,8 @@ func (w *Writeback) refreshAppendBase(ctx context.Context, h *bufferingHandle) (
 // truncates shrink images, so the append prefix rule cannot order them —
 // the mutation epoch does.
 func (w *Writeback) newerVisibleTruncateImage(h *bufferingHandle, ownSeq uint64) ([]byte, bool) {
-	for _, cand := range w.inodeHandles(0, h.path) {
+	_, hpath := w.identityOf(h)
+	for _, cand := range w.inodeHandles(0, hpath) {
 		if cand == h {
 			continue
 		}
