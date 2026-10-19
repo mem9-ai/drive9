@@ -190,7 +190,11 @@ func (t *Transport) Call(ctx jfsmeta.Context, op string, req, resp any) syscall.
 			return syscall.EIO
 		}
 		if *ack.Errno == 0 && in.SID != 0 {
-			t.sessionID.Store(in.SID)
+			// Reusing a transport for another runtime must not relabel an old
+			// runtime's delayed requests with the new session's identity.
+			if !t.sessionID.CompareAndSwap(0, in.SID) && t.sessionID.Load() != in.SID {
+				return syscall.EIO
+			}
 			t.sessionGuard.Store(ack.SessionGuard)
 		}
 	}

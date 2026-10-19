@@ -225,3 +225,31 @@ func TestTransportSessionRegistrationFailureAndLegacyServer(t *testing.T) {
 		})
 	}
 }
+
+func TestTransportCannotRebindAnExistingSession(t *testing.T) {
+	t.Parallel()
+	var caller uint64
+	tr := NewTransport(func(_ context.Context, _ string, raw json.RawMessage) (json.RawMessage, int, error) {
+		var in struct {
+			CallerSID uint64 `json:"caller_sid"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			t.Fatal(err)
+		}
+		caller = in.CallerSID
+		return []byte(`{"errno":0,"session_guard":true}`), 0, nil
+	})
+	ctx := jfsmeta.Background()
+	if st := tr.Call(ctx, "new_session", map[string]any{"sid": 101}, nil); st != 0 {
+		t.Fatal(st)
+	}
+	if st := tr.Call(ctx, "new_session", map[string]any{"sid": 102}, nil); st != syscall.EIO {
+		t.Fatalf("another runtime rebound the transport: %v", st)
+	}
+	if st := tr.Call(ctx, "write", map[string]any{}, nil); st != 0 {
+		t.Fatal(st)
+	}
+	if caller != 101 {
+		t.Fatalf("old request acquired a new identity: %d", caller)
+	}
+}
