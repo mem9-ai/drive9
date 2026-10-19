@@ -276,7 +276,7 @@ type Git struct {
 	openHandles sync.Map
 }
 
-// trackWorkspace/untrackWorkspace maintain the claimed-handle index.
+// trackWorkspace maintains the claimed-handle index.
 func (g *Git) trackWorkspace(path string, h *gitHandle) {
 	g.live.Store(path, h)
 	// The full set keeps every open descriptor discoverable: the per-path
@@ -285,8 +285,6 @@ func (g *Git) trackWorkspace(path string, h *gitHandle) {
 	// the deleted name over a recreated object.
 	g.openHandles.Store(h, path)
 }
-func (g *Git) untrackWorkspace(path string) { g.live.Delete(path) }
-
 // untrackHandle removes a descriptor from both indexes (its path slot
 // may already belong to a newer claim).
 func (g *Git) untrackHandle(h *gitHandle) {
