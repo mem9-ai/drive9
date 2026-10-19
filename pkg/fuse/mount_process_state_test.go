@@ -111,7 +111,6 @@ func TestMountCredentialErrorRedactsFailureAndPreservesExitCode(t *testing.T) {
 	}
 }
 
-
 func TestExitReasonIsRedactedWithoutPersistentCredentials(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	const server = "https://signed-preview-secret.example"

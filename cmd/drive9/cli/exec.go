@@ -79,14 +79,16 @@ type execOptions struct {
 	workspace    string
 	workspaceSet bool
 	layer        string
-	cwd          string
-	cwdSet       bool
-	readOnly     bool
-	fresh        bool
-	timeout      time.Duration
-	verbose      bool
-	env          []string
-	command      []string
+	// layerResolved is set once layer holds a resolved layer ID.
+	layerResolved bool
+	cwd           string
+	cwdSet        bool
+	readOnly      bool
+	fresh         bool
+	timeout       time.Duration
+	verbose       bool
+	env           []string
+	command       []string
 }
 
 // execRuntime is everything `drive9 exec` takes from its surroundings.
@@ -100,6 +102,7 @@ type execRuntime struct {
 	findMount            func(string) (*localMount, error)
 	syncMount            func(context.Context, *localMount) error
 	mountLayer           func(context.Context, *localMount) (string, error)
+	credentialKind       func() CredentialKind
 	client               func() *client.Client
 	execID               *execIDBox
 }
@@ -113,16 +116,14 @@ func defaultExecRuntime(execID *execIDBox) execRuntime {
 		server:     func() string { return ResolveCredentials().Server },
 		credential: currentCredentialFingerprint,
 		findMount:  findLocalMount, syncMount: syncLocalMount, mountLayer: localMountLayer,
-		client: NewFromEnv, execID: execID,
+		credentialKind: func() CredentialKind { return ResolveCredentials().Kind },
+		client:         NewFromEnv, execID: execID,
 	}
 }
 
 // Exec runs one command in a sandbox against a Drive9 workspace. It never
 // retries: a command whose outcome is unknown may already have run.
 func Exec(args []string) error {
-	if err := execCredentialError(ResolveCredentials().Kind); err != nil {
-		return err
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	signals := make(chan os.Signal, 2)
@@ -144,6 +145,20 @@ func Exec(args []string) error {
 		os.Exit(execExitCanceled)
 	}()
 	return runExec(ctx, args, defaultExecRuntime(execID))
+}
+
+// resolveExecLayer turns a layer name or tag ref, from --layer or from the
+// local mount, into the layer ID the runtime takes. It resolves at most once.
+func resolveExecLayer(ctx context.Context, options *execOptions, rt execRuntime) error {
+	if options.layer == "" || options.layerResolved {
+		return nil
+	}
+	layer, err := rt.client().GetFSLayer(ctx, options.layer)
+	if err != nil {
+		return fmt.Errorf("resolve layer %q: %w", options.layer, err)
+	}
+	options.layer, options.layerResolved = layer.LayerID, true
+	return nil
 }
 
 // execCredentialError rejects credentials the runtime endpoint does not
@@ -171,16 +186,15 @@ func runExec(ctx context.Context, args []string, rt execRuntime) error {
 	if err != nil {
 		return err
 	}
-	if options.layer != "" {
-		// Accept a layer name or tag ref like `drive9 mount --layer`; the
-		// runtime takes only the resolved layer ID.
-		layer, err := rt.client().GetFSLayer(ctx, options.layer)
-		if err != nil {
-			return fmt.Errorf("resolve --layer %q: %w", options.layer, err)
+	if rt.credentialKind != nil {
+		if err := execCredentialError(rt.credentialKind()); err != nil {
+			return err
 		}
-		options.layer = layer.LayerID
 	}
 	if err := resolveExecWorkspace(ctx, &options, rt); err != nil {
+		return err
+	}
+	if err := resolveExecLayer(ctx, &options, rt); err != nil {
 		return err
 	}
 	request, err := options.request(rt)
@@ -227,7 +241,7 @@ func resolveExecWorkspace(ctx context.Context, options *execOptions, rt execRunt
 		return nil
 	}
 	if mount.Kind != mountstate.MountKindFUSE {
-		return fmt.Errorf("%s is a drive9 %s mount; drive9 exec follows only FUSE mounts, so pass -w to choose a workspace", mount.MountPoint, mount.Kind)
+		return fmt.Errorf("%s is a drive9 %s mount; drive9 exec follows only FUSE mounts, so pass -w to run against the remote workspace (local changes are not uploaded first)", mount.MountPoint, mount.Kind)
 	}
 	// One server hosts many tenants, so infer only from a mount that uses
 	// the same server and the same credential as this command. Inside a mount
@@ -245,6 +259,13 @@ func resolveExecWorkspace(ctx context.Context, options *execOptions, rt execRunt
 	if err != nil {
 		return fmt.Errorf("cannot tell which layer %s shows: %v (remount it with this drive9 version, or pass -w)", mount.MountPoint, err)
 	}
+	if options.layer == "" {
+		options.layer = layer
+	}
+	// Resolve before the drain, so a bad layer costs no upload.
+	if err := resolveExecLayer(ctx, options, rt); err != nil {
+		return err
+	}
 	if rt.syncMount != nil {
 		progress := newExecProgressMessage(rt.stderr, rt.stderrTTY && !options.verbose, "drive9: uploading local changes…")
 		err := rt.syncMount(ctx, mount)
@@ -254,9 +275,6 @@ func resolveExecWorkspace(ctx context.Context, options *execOptions, rt execRunt
 		}
 	}
 	options.workspace = mount.workspace()
-	if options.layer == "" {
-		options.layer = layer
-	}
 	if !options.cwdSet {
 		options.cwd = mount.remoteCwd()
 	}

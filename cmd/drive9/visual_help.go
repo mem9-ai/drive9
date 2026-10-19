@@ -729,7 +729,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Name: "-e, --env KEY[=VALUE]", Desc: "set a variable; KEY alone copies it from here; repeatable"},
 				{Name: "-t, --timeout DURATION", Desc: "stop the command after DURATION"},
 				{Name: "--fresh", Desc: "start in a new sandbox instead of reusing the warm one"},
-				{Name: "--layer ID", Desc: "use a LayerFS layer view of the workspace"},
+				{Name: "--layer REF", Desc: "use a LayerFS layer view (layer ID, name, or tag:key=value)"},
 				{Name: "--read-only", Desc: "mount the workspace read-only"},
 				{Name: "-v, --verbose", Desc: "show sandbox, working directory, and duration"},
 			},

@@ -20,7 +20,8 @@ The server must have remote exec enabled. Otherwise the command reports
   picks the directory (`repo`, `/repo`, and `:/repo` all work, giving
   `/workspace/repo`; default: the drive root). `-C` picks a subdirectory.
   Only FUSE mounts are followed: inside a WebDAV mount (the default on macOS
-  and Windows), pass `-w`.
+  and Windows), pass `-w`. `-w` does not upload local changes first, so the
+  command sees what the server already has.
 - **Who it runs as.** A normal user, `agent`, with `HOME=/home/agent`, so git,
   pip, npm, and go work as usual. It can edit any workspace file but cannot
   become root.

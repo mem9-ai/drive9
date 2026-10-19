@@ -36,13 +36,18 @@ func execTestServer(t *testing.T, frames ...string) (*execTestRequest, *httptest
 	t.Helper()
 	var request execTestRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Layer refs resolve to "fsl-<ref>" with ':' and '=' as '-'; "missing" is not found.
+		// Names and tag refs resolve to "fsl-<ref>" with ':' and '=' as '-';
+		// "missing" is not found.
 		if ref, ok := strings.CutPrefix(r.URL.Path, "/v1/layers/"); ok && r.Method == http.MethodGet {
 			if ref == "missing" {
 				http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]string{"layer_id": "fsl-" + strings.NewReplacer(":", "-", "=", "-").Replace(ref), "state": "active"})
+			id := ref
+			if !strings.HasPrefix(ref, "fsl") { // a layer ID resolves to itself
+				id = "fsl-" + strings.NewReplacer(":", "-", "=", "-").Replace(ref)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"layer_id": id, "state": "active"})
 			return
 		}
 		request = execTestRequest{}
@@ -305,7 +310,7 @@ func TestExecInsideLocalMountUsesItsWorkspaceAfterUploading(t *testing.T) {
 	if err := runExec(t.Context(), []string{"npm", "test"}, rt); err != nil {
 		t.Fatal(err)
 	}
-	if synced != 1 || request.Workspace.Root != "/repo" || request.Workspace.LayerID != "fork-1" || request.Cwd != "web/src" {
+	if synced != 1 || request.Workspace.Root != "/repo" || request.Workspace.LayerID != "fsl-fork-1" || request.Cwd != "web/src" {
 		t.Fatalf("synced=%d request=%#v", synced, request)
 	}
 
@@ -488,8 +493,34 @@ func TestExecResolvesLayerRefs(t *testing.T) {
 			t.Fatalf("--layer %s sent %q, want %q", ref, request.Workspace.LayerID, want)
 		}
 	}
-	if _, _, err := runExecForTest(t, t.Context(), "-w", "repo", "--layer", "missing", "true"); err == nil || !strings.Contains(err.Error(), `resolve --layer "missing"`) {
+	if _, _, err := runExecForTest(t, t.Context(), "-w", "repo", "--layer", "missing", "true"); err == nil || !strings.Contains(err.Error(), `resolve layer "missing"`) {
 		t.Fatalf("missing layer error = %v", err)
+	}
+}
+
+// A layer ref inferred from the local mount is resolved before the drain.
+func TestExecResolvesInferredLayerRefBeforeUpload(t *testing.T) {
+	request, _ := execTestServer(t, execStarted, execExit0)
+	rt := testExecRuntime(io.Discard, io.Discard)
+	rt.dir = "/mnt/x"
+	rt.server = func() string { return "https://drive9.example" }
+	rt.credential = func() string { return "fp-a" }
+	mount := &localMount{MountPoint: "/mnt/x", Kind: mountstate.MountKindFUSE, RemoteRoot: "/repo", Server: "https://drive9.example", Credential: "fp-a", Rel: "."}
+	rt.findMount = func(string) (*localMount, error) { return mount, nil }
+	ref := "tag:agent=a"
+	rt.mountLayer = func(context.Context, *localMount) (string, error) { return ref, nil }
+	synced := 0
+	rt.syncMount = func(context.Context, *localMount) error { synced++; return nil }
+	if err := runExec(t.Context(), []string{"ls"}, rt); err != nil {
+		t.Fatal(err)
+	}
+	if synced != 1 || request.Workspace.Root != "/repo" || request.Workspace.LayerID != "fsl-tag-agent-a" {
+		t.Fatalf("synced=%d request=%#v", synced, request)
+	}
+	// An unresolvable layer fails before anything is uploaded.
+	ref = "missing"
+	if err := runExec(t.Context(), []string{"ls"}, rt); err == nil || !strings.Contains(err.Error(), `resolve layer "missing"`) || synced != 1 {
+		t.Fatalf("error=%v synced=%d", err, synced)
 	}
 }
 
@@ -511,6 +542,21 @@ func TestExecRefusesNonFUSEMount(t *testing.T) {
 }
 
 func TestExecRejectsDelegatedToken(t *testing.T) {
+	execTestServer(t, execStarted, execExit0)
+	rt := testExecRuntime(io.Discard, io.Discard)
+	rt.credentialKind = func() CredentialKind { return CredentialDelegated }
+	rt.findMount = func(string) (*localMount, error) {
+		t.Fatal("looked for a mount with a delegated token")
+		return nil, nil
+	}
+	rt.dir = "/mnt/x"
+	var help *execExitError
+	if err := runExec(t.Context(), []string{"--help"}, rt); !errors.As(err, &help) || help.ExitCode() != 0 {
+		t.Fatalf("--help with a delegated token = %v", err)
+	}
+	if err := runExec(t.Context(), []string{"true"}, rt); err == nil || !strings.Contains(err.Error(), "API key") {
+		t.Fatalf("delegated token error = %v", err)
+	}
 	if err := execCredentialError(CredentialDelegated); err == nil || !strings.Contains(err.Error(), "API key") {
 		t.Fatalf("delegated error = %v", err)
 	}
