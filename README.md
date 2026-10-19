@@ -178,8 +178,8 @@ workspace mounted at `/workspace`. Output streams live, writes are in Drive9
 when it exits, and the exit status is the command's:
 
 ```bash
-drive9 exec npm test
-drive9 exec -w :/repo 'npm ci && npm test'
+cd ~/drive9/repo && drive9 exec npm test   # inside a mount: your local edits, same directory
+drive9 exec -w repo 'npm ci && npm test'   # from anywhere
 ```
 
 Consecutive commands on the same workspace reuse a warm sandbox, so packages

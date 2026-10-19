@@ -24,6 +24,8 @@ export interface ExecRequest {
   env?: Record<string, string>;
   workspace?: RuntimeWorkspace;
   timeout_ms?: number;
+  /** Start in a new sandbox instead of reusing the warm one. */
+  fresh?: boolean;
 }
 
 export interface ExecStarted {

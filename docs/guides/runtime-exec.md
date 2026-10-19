@@ -4,8 +4,8 @@
 `/workspace`. You do not create, mount, or clean up a sandbox yourself.
 
 ```bash
-drive9 exec npm test
-drive9 exec -w :/repo 'npm ci && npm test'
+cd ~/drive9/repo/web && drive9 exec npm test   # inside a local drive9 mount
+drive9 exec -w repo 'npm ci && npm test'         # anywhere
 drive9 exec -e CI=1 -e GITHUB_TOKEN -t 20m -- make -j8 test
 ```
 
@@ -14,18 +14,25 @@ The server must have remote exec enabled. Otherwise the command reports
 
 ## What to expect
 
-- **Where it runs.** `/workspace` is the Drive9 directory given by `-w`
-  (default `:/`). Relative `-C` paths are inside it.
+- **Where it runs.** Inside a local drive9 mount, `drive9 exec` uses that
+  mount's workspace and runs in the directory you are in, after uploading your
+  pending local changes so the command sees exactly your files. Elsewhere,
+  `/workspace` is the Drive9 directory given by `-w` (`repo`, `/repo`, and
+  `:/repo` all work; default `:/`). Relative `-C` paths are inside it.
 - **Who it runs as.** A normal user, `agent`, with `HOME=/home/agent`, so git,
   pip, npm, and go work as usual. It can edit any workspace file but cannot
   become root.
 - **What persists.** Files under `/workspace` are in Drive9 when the command
   exits. Everything else in the sandbox is disposable.
 - **Warm sandboxes.** Consecutive commands on the same workspace with the same
-  API key reuse the sandbox for a while (10 minutes idle by default). Packages
-  you installed, files in `/tmp`, and background processes are still there for
-  the next command. Use `-v` to see whether a command got a `new` or `warm`
-  sandbox.
+  API key reuse the sandbox for a while (10 minutes idle by default), so
+  packages you installed and files in `/tmp` are still there for the next
+  command. Processes are not: each command starts with nothing left running
+  from the previous one. `--fresh` starts over in a new sandbox; `-v` shows
+  whether a command got a `new` or `warm` one.
+- **Feedback.** While a sandbox is starting, a terminal shows
+  `starting sandbox…`; the line disappears as soon as the command runs.
+  Colors are kept when your output is a terminal (`NO_COLOR` is respected).
 - **Output.** stdout and stderr stream live to your terminal, separately.
 - **Exit status.** `drive9 exec` exits with the command's status and adds no
   message of its own. Other outcomes use shell conventions:
@@ -47,10 +54,11 @@ The server must have remote exec enabled. Otherwise the command reports
 
 | Flag | Meaning |
 | --- | --- |
-| `-w, --workspace :/PATH` | Drive9 directory mounted at `/workspace` (default `:/`) |
+| `-w, --workspace PATH` | Drive9 directory mounted at `/workspace` (default: the mount you are in, else `:/`) |
 | `-C, --cwd DIR` | working directory, relative to `/workspace` |
 | `-e, --env KEY[=VALUE]` | set a variable; `KEY` alone copies it from your environment; repeatable |
 | `-t, --timeout DURATION` | stop the command after this long (the server may cap it) |
+| `--fresh` | start in a new sandbox instead of reusing the warm one |
 | `--layer ID` | use a LayerFS layer view, for example one agent fork |
 | `--read-only` | mount the workspace read-only |
 | `-v, --verbose` | show the sandbox, working directory, and duration |

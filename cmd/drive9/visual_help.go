@@ -724,17 +724,18 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			Args:    "[flags] [--] command [arg...] | 'shell line'",
 			Summary: "run a command in a sandbox with your workspace at /workspace",
 			Flags: []visualHelpFlag{
-				{Name: "-w, --workspace :/PATH", Desc: "Drive9 directory mounted at /workspace; default :/"},
+				{Name: "-w, --workspace PATH", Desc: "Drive9 directory at /workspace; default: the drive9 mount you are in, else :/"},
 				{Name: "-C, --cwd DIR", Desc: "working directory, relative to /workspace"},
 				{Name: "-e, --env KEY[=VALUE]", Desc: "set a variable; KEY alone copies it from here; repeatable"},
 				{Name: "-t, --timeout DURATION", Desc: "stop the command after DURATION"},
+				{Name: "--fresh", Desc: "start in a new sandbox instead of reusing the warm one"},
 				{Name: "--layer ID", Desc: "use a LayerFS layer view of the workspace"},
 				{Name: "--read-only", Desc: "mount the workspace read-only"},
 				{Name: "-v, --verbose", Desc: "show sandbox, working directory, and duration"},
 			},
 			Examples: []visualHelpExample{
-				{Command: "drive9 exec npm test", Desc: "run in the workspace root; exit status is the command's"},
-				{Command: "drive9 exec -w :/repo 'npm ci && npm test'", Desc: "a single quoted argument runs through sh -c"},
+				{Command: "cd ~/drive9/repo && drive9 exec npm test", Desc: "inside a mount: uploads local changes, runs in the same directory"},
+				{Command: "drive9 exec -w repo 'npm ci && npm test'", Desc: "a single quoted argument runs through sh -c"},
 			},
 		},
 		{

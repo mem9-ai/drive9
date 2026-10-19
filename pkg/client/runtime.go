@@ -49,6 +49,8 @@ type ExecRequest struct {
 	Env       map[string]string `json:"env,omitempty"`
 	Workspace RuntimeWorkspace  `json:"workspace"`
 	TimeoutMS int64             `json:"timeout_ms,omitempty"`
+	// Fresh starts in a new sandbox instead of reusing the warm one.
+	Fresh bool `json:"fresh,omitempty"`
 }
 
 // ExecStarted is reported once the command is running.

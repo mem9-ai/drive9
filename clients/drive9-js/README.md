@@ -142,7 +142,8 @@ try {
 - `command` runs through `/bin/sh -c`; use `argv` to skip the shell.
 - `cwd` is relative to `/workspace`. Only `/workspace` persists.
 - Consecutive commands on the same workspace reuse a warm sandbox
-  (`result.sandbox === "warm"`), so installed packages survive between them.
+  (`result.sandbox === "warm"`), so installed packages survive between them;
+  processes do not. Pass `fresh: true` to start over in a new sandbox.
 - Pass `signal` to cancel; a resolved cancel means the server confirmed the
   command stopped and the workspace drained.
 - `runtimeCapabilities()` reports limits such as `max_timeout_ms` and
