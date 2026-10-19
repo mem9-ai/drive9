@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,6 +33,11 @@ type Transport struct {
 	// it must run itself.
 	Enter func(op string) bool
 	Leave func()
+
+	// One transport belongs to one runtime/session. Capture the SID only
+	// after registration succeeds, then carry it on every subsequent RPC.
+	sessionID    atomic.Uint64
+	sessionGuard atomic.Bool
 }
 
 // MetaCallTimeout bounds every non-blocking metadata RPC the extent runtime's
@@ -100,13 +106,22 @@ func (t *Transport) Call(ctx jfsmeta.Context, op string, req, resp any) syscall.
 		return syscall.EINVAL
 	}
 	block := lockBlockFromCtx(ctx) && (op == jfsmeta.Drive9OpSetlk || op == jfsmeta.Drive9OpFlock)
-	if block {
-		var obj map[string]any
-		if json.Unmarshal(raw, &obj) == nil {
-			obj["block"] = true
-			if patched, mErr := json.Marshal(obj); mErr == nil {
-				raw = patched
-			}
+	sid := t.sessionID.Load()
+	if block || sid != 0 {
+		// RawMessage preserves uint64 inode/owner/SID values above 2^53.
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
+			return syscall.EINVAL
+		}
+		if block {
+			obj["block"] = json.RawMessage("true")
+		}
+		if sid != 0 {
+			obj["caller_sid"], _ = json.Marshal(sid)
+		}
+		raw, err = json.Marshal(obj)
+		if err != nil {
+			return syscall.EINVAL
 		}
 	}
 	std := context.Background()
@@ -163,6 +178,26 @@ func (t *Transport) Call(ctx jfsmeta.Context, op string, req, resp any) syscall.
 			return syscall.EIO
 		}
 	}
+	if op == jfsmeta.Drive9OpNewSession {
+		var ack struct {
+			Errno        *int `json:"errno"`
+			SessionGuard bool `json:"session_guard"`
+		}
+		var in struct {
+			SID uint64 `json:"sid"`
+		}
+		if json.Unmarshal(body, &ack) != nil || ack.Errno == nil || json.Unmarshal(raw, &in) != nil {
+			return syscall.EIO
+		}
+		if *ack.Errno == 0 && in.SID != 0 {
+			// Reusing a transport for another runtime must not relabel an old
+			// runtime's delayed requests with the new session's identity.
+			if !t.sessionID.CompareAndSwap(0, in.SID) && t.sessionID.Load() != in.SID {
+				return syscall.EIO
+			}
+			t.sessionGuard.Store(ack.SessionGuard)
+		}
+	}
 	if resp == nil {
 		return 0
 	}
@@ -173,4 +208,11 @@ func (t *Transport) Call(ctx jfsmeta.Context, op string, req, resp any) syscall.
 		return syscall.EIO
 	}
 	return 0
+}
+
+// SessionGuardSupported reports whether the server advertised transactional
+// caller_sid validation when this runtime registered its session. Older
+// servers ignore the field; sending it alone does not provide fencing.
+func (t *Transport) SessionGuardSupported() bool {
+	return t.sessionGuard.Load()
 }

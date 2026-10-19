@@ -383,31 +383,52 @@ func TestWithExternalBindingLockSerializesCallbacks(t *testing.T) {
 
 func TestWithTenantPoolLockSerializesCallbacks(t *testing.T) {
 	s := newControlStore(t)
+	assertRepeatedNamedLockHandoffs(t, func(fn func(context.Context) error) error {
+		return s.WithTenantPoolLock(context.Background(), "pool-lock-test", fn)
+	})
+}
+
+func TestOrgBindingLockSerializesRepeatedCallbacks(t *testing.T) {
+	s := newControlStore(t)
+	assertRepeatedNamedLockHandoffs(t, func(fn func(context.Context) error) error {
+		return s.withTiDBCloudOrgBindingLock(context.Background(), "org", "cluster", "branch", func(ctx context.Context, _ metaQueryExecer) error {
+			return fn(ctx)
+		})
+	})
+}
+
+func assertRepeatedNamedLockHandoffs(t *testing.T, withLock func(func(context.Context) error) error) {
+	t.Helper()
 	var running int32
 	var maxRunning int32
-	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := s.WithTenantPoolLock(context.Background(), "pool-lock-test", func(context.Context) error {
-				n := atomic.AddInt32(&running, 1)
-				for {
-					max := atomic.LoadInt32(&maxRunning)
-					if n <= max || atomic.CompareAndSwapInt32(&maxRunning, max, n) {
-						break
+	// Reuse the pooled connections and query texts across handoffs. A cached
+	// GET_LOCK result must not admit another callback without acquiring a lock,
+	// nor may a cached RELEASE_LOCK operation lose the connection's ownership.
+	for round := 0; round < 3; round++ {
+		var wg sync.WaitGroup
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				err := withLock(func(context.Context) error {
+					n := atomic.AddInt32(&running, 1)
+					for {
+						max := atomic.LoadInt32(&maxRunning)
+						if n <= max || atomic.CompareAndSwapInt32(&maxRunning, max, n) {
+							break
+						}
 					}
+					time.Sleep(20 * time.Millisecond)
+					atomic.AddInt32(&running, -1)
+					return nil
+				})
+				if err != nil {
+					t.Errorf("named lock handoff: %v", err)
 				}
-				time.Sleep(20 * time.Millisecond)
-				atomic.AddInt32(&running, -1)
-				return nil
-			})
-			if err != nil {
-				t.Errorf("WithTenantPoolLock: %v", err)
-			}
-		}()
+			}()
+		}
+		wg.Wait()
 	}
-	wg.Wait()
 	if maxRunning != 1 {
 		t.Fatalf("max concurrent lock holders = %d, want 1", maxRunning)
 	}
