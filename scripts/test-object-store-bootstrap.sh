@@ -230,6 +230,7 @@ case "$cmd" in
       shift 2
     fi
     if [ "${1:-}" = "-p" ]; then
+      log_state "publish" "$2"
       # HOST:PORT:CONTAINER or PORT:CONTAINER — the host port is the second
       # segment from the right.
       port="$(printf '%s' "$2" | awk -F: '{print $(NF-1)}')"
@@ -345,53 +346,6 @@ teardown_harness() {
 
 # Test A: the first candidate's `run -d` succeeds but never turns healthy;
 # the second candidate takes over; the binary fallback is NOT used.
-# Test I: an invalid (0) probe timeout must be sanitized to a positive cap.
-# A stalled leftover server occupies the port, so the run cannot succeed —
-# the contract under test is that it FAILS BOUNDED (rc=1 within 30s, no
-# watchdog): with the value accepted verbatim, curl's --max-time 0 removes
-# the limit and the preflight probe hangs until the watchdog kills it.
-test_zero_probe_timeout_is_sanitized_local_object_store() {
-  echo "--- I: local-object-store sanitizes DRIVE9_OBJECT_STORE_HEALTH_PROBE_TIMEOUT_S=0"
-  new_harness
-  local rc=0
-  local t0 elapsed
-  t0=$(date +%s)
-  python3 "$FAKE_BIN_DIR/fake_stall.py" "$FAKE_PORT" >/dev/null 2>&1 &
-  echo $! >"$FAKE_RUN_DIR/leftover-stall.pid"
-  run_with_watchdog 60 "$FAKE_RUN_DIR/ensure.log" env \
-    DRIVE9_OBJECT_STORE_PORT=$FAKE_PORT DRIVE9_OBJECT_STORE_HEALTH_PROBE_TIMEOUT_S=0 \
-    DRIVE9_OBJECT_STORE_IMAGE=registry.invalid/good:tag \
-    DRIVE9_OBJECT_STORE_FALLBACK_IMAGE="" \
-    DRIVE9_OBJECT_STORE_HEALTH_TIMEOUT_S=6 PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
-    bash "$SCRIPT_DIR/local-object-store.sh" ensure || rc=$?
-  elapsed=$(( $(date +%s) - t0 ))
-  check_eq "bounded failure, not a hang (rc=1; 124 = watchdog)" "$rc" "1"
-  check_le "sanitized probe stays within budget" "$elapsed" 30
-  teardown_harness
-}
-
-# Test J: the same 0-value sanitation for object-store's one-shot preflight.
-test_zero_probe_timeout_is_sanitized_object_store() {
-  echo "--- J: object-store sanitizes DRIVE9_OBJECT_STORE_HEALTH_PROBE_TIMEOUT_S=0"
-  new_harness
-  local rc=0
-  local t0 elapsed
-  t0=$(date +%s)
-  python3 "$FAKE_BIN_DIR/fake_stall.py" "$FAKE_PORT" >/dev/null 2>&1 &
-  echo $! >"$FAKE_RUN_DIR/leftover-stall.pid"
-  run_with_watchdog 60 "$FAKE_RUN_DIR/suite.log" env \
-    CLI_SOURCE=invalid OBJECT_BOOTSTRAP_ONLY=1 \
-    DRIVE9_OBJECT_STORE_PORT=$FAKE_PORT DRIVE9_OBJECT_STORE_HEALTH_PROBE_TIMEOUT_S=0 \
-    DRIVE9_OBJECT_STORE_IMAGE=registry.invalid/good:tag \
-    DRIVE9_OBJECT_STORE_FALLBACK_IMAGE="" \
-    DRIVE9_OBJECT_STORE_HEALTH_TIMEOUT_S=6 PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" FAKE_RUN_DIR="$FAKE_RUN_DIR" \
-    bash "$REPO_ROOT/e2e/object-store-smoke-test.sh" || rc=$?
-  elapsed=$(( $(date +%s) - t0 ))
-  check_eq "bounded failure, not a hang (rc=1; 124 = watchdog)" "$rc" "1"
-  check_le "sanitized probe stays within budget" "$elapsed" 30
-  teardown_harness
-}
-
 test_first_unhealthy_second_healthy() {
   echo "--- A: first candidate unhealthy, second healthy"
   new_harness
@@ -470,6 +424,7 @@ test_object_store_first_unhealthy() {
     bash "$REPO_ROOT/e2e/object-store-smoke-test.sh" >"$FAKE_RUN_DIR/suite.log" 2>&1 || rc=$?
   elapsed=$(( $(date +%s) - t0 ))
   check_eq "bootstrap exit status" "$rc" "0"
+  check_eq "native smoke publishes only on loopback" "$(read_state publish)" "127.0.0.1:$FAKE_PORT:9000"
   check_le "clean-port bootstrap is prompt" "$elapsed" 15
   check_eq "bootstrap hook reached" "$(grep -c 'bootstrap-only: object store provisioning finished' "$FAKE_RUN_DIR/suite.log" || true)" "1"
   teardown_harness

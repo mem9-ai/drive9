@@ -477,7 +477,7 @@ else
         continue
       fi
       if "$RUNTIME" run -d --name "$OBJECT_STORE_CID" \
-        -p "${DRIVE9_OBJECT_STORE_PORT}:9000" \
+        -p "127.0.0.1:${DRIVE9_OBJECT_STORE_PORT}:9000" \
         -e "RUSTFS_ACCESS_KEY=${OBJECT_STORE_ACCESS_KEY}" \
         -e "RUSTFS_SECRET_KEY=${OBJECT_STORE_SECRET_KEY}" \
         -e "MINIO_ROOT_USER=${OBJECT_STORE_ACCESS_KEY}" \
