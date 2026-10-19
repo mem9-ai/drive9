@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
+
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
@@ -103,7 +105,7 @@ func defaultExecRuntime(execID *execIDBox) execRuntime {
 	dir, _ := os.Getwd()
 	return execRuntime{
 		stdout: os.Stdout, stderr: os.Stderr,
-		stdoutTTY: fileIsTerminal(os.Stdout), stderrTTY: fileIsTerminal(os.Stderr),
+		stdoutTTY: term.IsTerminal(int(os.Stdout.Fd())), stderrTTY: term.IsTerminal(int(os.Stderr.Fd())),
 		dir: dir, lookupEnv: os.LookupEnv, server: func() string { return ResolveCredentials().Server },
 		findMount: findLocalMount, syncMount: syncLocalMount,
 		client: NewFromEnv, execID: execID,
