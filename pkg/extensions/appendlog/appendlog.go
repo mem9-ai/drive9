@@ -167,6 +167,15 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 
 	case fs.OpSetAttr:
 		h := a.handleFor(op.Path)
+		if op.Handle != nil {
+			// FATTR_FH names a descriptor: the per-path slot holds only the
+			// newest claim, so a truncate of an older fd hit someone else's
+			// handle (two opens: h1's size=2 truncate mutated h2 and h1's
+			// sync published the untruncated image).
+			if ah := appendLogHandleOf(op.Handle); ah != nil {
+				h = ah
+			}
+		}
 		if op.HasMode {
 			// A chmod on a live handle defers to the next successful
 			// commit; handle-less paths pass the mode through the chain.
@@ -211,14 +220,10 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 	case fs.OpRename:
 		res, err := next(ctx, op)
 		if err == nil {
-			if h := a.handleFor(op.Path); h != nil {
-				h.retarget(op.Path2)
-			}
-			if _, hidden := a.unlinked.Load(op.Path); hidden {
-				// The pending delete follows the file to its new name.
-				a.unlinked.Delete(op.Path)
-				a.unlinked.Store(op.Path2, struct{}{})
-			}
+			a.retargetHandles(op.Path, op.Path2)
+			// The pending delete follows the file (or a renamed
+			// directory's subtree) to its new name.
+			a.moveUnlinkedPrefix(op.Path, op.Path2)
 		}
 		return res, err
 	}
@@ -228,35 +233,38 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 // routeFlush orders the transports: WAL generation reset first, then tail
 // append, then full rewrite. A flush without dirty bytes still applies a
 // deferred chmod.
-func (a *AppendLog) routeFlush(ctx context.Context, h *Handle) error {
+func (a *AppendLog) routeFlush(ctx context.Context, h *Handle) (bool, error) {
 	h.mu.Lock()
 	if h.unlinked {
 		h.mu.Unlock()
-		return nil
+		return false, nil
 	}
 	if !h.dirty || h.buf == nil {
 		hasMode := h.hasPendingMode
 		h.mu.Unlock()
 		if hasMode {
-			return h.applyPendingMode(ctx)
+			return false, h.applyPendingMode(ctx)
 		}
-		return nil
+		return false, nil
 	}
 	h.mu.Unlock()
 
 	if err := a.tryGenerationReset(ctx, h); err != nil {
-		return err
+		return false, err
 	}
 	if a.handleDone(h) {
-		return nil
+		return true, nil
 	}
 	if err := a.tryTailAppend(ctx, h); err != nil {
-		return err
+		return false, err
 	}
 	if a.handleDone(h) {
-		return nil
+		return true, nil
 	}
-	return a.fullRewrite(ctx, h)
+	if err := a.fullRewrite(ctx, h); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // handleDone reports a flush as finished (nothing dirty left or the handle
@@ -948,7 +956,7 @@ func (h *Handle) Write(ctx context.Context, off int64, data []byte) error {
 		// A synchronous write acknowledges only after the protocol commit
 		// (generation/tail/rewrite upload) completes — RAM-only
 		// acknowledgment violated --durability=write-sync and O_SYNC.
-		if err := h.a.routeFlush(ctx, h); err != nil {
+		if _, err := h.a.routeFlush(ctx, h); err != nil {
 			return err
 		}
 	}
@@ -966,16 +974,21 @@ func (h *Handle) Sync(ctx context.Context) error {
 }
 
 func (h *Handle) Flush(ctx context.Context) error {
-	if err := h.a.routeFlush(ctx, h); err != nil {
+	published, err := h.a.routeFlush(ctx, h)
+	if err != nil {
 		return err
 	}
 	if h.inner != nil {
 		// The append plane owns this path's publication once its protocol
 		// commit uploaded the payload: retire the lower plane's pending
-		// creation first, or the forwarded Flush/Sync/Release
-		// materializes the lower handle's empty image over the upload.
-		if mp, ok := h.inner.(interface{ MarkPublished() }); ok {
-			mp.MarkPublished()
+		// creation first, or the forwarded Flush/Sync/Release materializes
+		// the lower handle's empty image over the upload. A no-op flush
+		// (nothing dirty, e.g. a brand-new empty file) published NOTHING:
+		// retiring the lower create there made the empty file vanish.
+		if published {
+			if mp, ok := unwrapMarkPublished(h.inner); ok {
+				mp.MarkPublished()
+			}
 		}
 		return h.inner.Flush(ctx)
 	}
@@ -1156,6 +1169,104 @@ func (h *Handle) applyPendingMode(ctx context.Context) error {
 	h.hasPendingMode = false
 	h.mu.Unlock()
 	return nil
+}
+
+// appendLogHandleOf walks decorator wrappers (UnwrapHandle) to the append
+// plane's own handle; nil when the chain holds none.
+func appendLogHandleOf(h any) *Handle {
+	for range 8 {
+		if ah, ok := h.(*Handle); ok {
+			return ah
+		}
+		u, ok := h.(interface{ UnwrapHandle() fs.Handle })
+		if !ok {
+			return nil
+		}
+		h = u.UnwrapHandle()
+	}
+	return nil
+}
+
+// unwrapMarkPublished finds the lower plane's MarkPublished capability
+// through decorator wrappers.
+func unwrapMarkPublished(h any) (interface{ MarkPublished() }, bool) {
+	for range 8 {
+		if mp, ok := h.(interface{ MarkPublished() }); ok {
+			return mp, true
+		}
+		u, ok := h.(interface{ UnwrapHandle() fs.Handle })
+		if !ok {
+			return nil, false
+		}
+		h = u.UnwrapHandle()
+	}
+	return nil, false
+}
+
+// retargetHandles moves EVERY open descriptor of the renamed object to its
+// new name (and a renamed directory's descendants under the new prefix):
+// the per-path slot only holds the newest claim, so an older dirty fd's
+// commit republished the old name after the rename.
+func (a *AppendLog) retargetHandles(oldPath, newPath string) {
+	var handles []*Handle
+	a.live.Range(func(key, v any) bool {
+		p, ok := key.(string)
+		if !ok {
+			return true
+		}
+		set, ok := v.(*liveHandleSet)
+		if !ok {
+			return true
+		}
+		if p != oldPath && !strings.HasPrefix(p, strings.TrimSuffix(oldPath, "/")+"/") {
+			return true
+		}
+		set.forEach(func(h *Handle) bool {
+			handles = append(handles, h)
+			return true
+		})
+		return true
+	})
+	for _, h := range handles {
+		h.mu.Lock()
+		p := h.path
+		h.mu.Unlock()
+		var target string
+		switch {
+		case p == oldPath:
+			target = newPath
+		case strings.HasPrefix(p, strings.TrimSuffix(oldPath, "/")+"/"):
+			target = strings.TrimSuffix(newPath, "/") + "/" + strings.TrimPrefix(p, strings.TrimSuffix(oldPath, "/")+"/")
+		default:
+			continue
+		}
+		h.retarget(target)
+	}
+}
+
+// moveUnlinkedPrefix moves the pending-delete marks of a renamed path (or
+// directory subtree) to the new name.
+func (a *AppendLog) moveUnlinkedPrefix(oldPath, newPath string) {
+	prefix := strings.TrimSuffix(oldPath, "/") + "/"
+	newPrefix := strings.TrimSuffix(newPath, "/") + "/"
+	var moves [][2]string
+	a.unlinked.Range(func(key, _ any) bool {
+		p, ok := key.(string)
+		if !ok {
+			return true
+		}
+		switch {
+		case p == oldPath:
+			moves = append(moves, [2]string{p, newPath})
+		case strings.HasPrefix(p, prefix):
+			moves = append(moves, [2]string{p, newPrefix + strings.TrimPrefix(p, prefix)})
+		}
+		return true
+	})
+	for _, m := range moves {
+		a.unlinked.Delete(m[0])
+		a.unlinked.Store(m[1], struct{}{})
+	}
 }
 
 // markUnlinked hides the path and keeps the image in the open handle; the

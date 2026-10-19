@@ -224,6 +224,12 @@ func (c *Cache) ReadCached(path string, revision int64) ([]byte, bool) {
 	return c.mem.Get(path, revision)
 }
 
+// MaxFileSize reports the read cache's per-file admission bound (the commit
+// seeder checks it before materializing an image).
+func (c *Cache) MaxFileSize() int64 {
+	return c.mem.MaxFileSize()
+}
+
 // SeedCommit caches the just-committed image (readCache.Put at commit
 // settle) so reads racing backend replica lag see this mount's own writes.
 func (c *Cache) SeedCommit(path string, data []byte, rev int64) {

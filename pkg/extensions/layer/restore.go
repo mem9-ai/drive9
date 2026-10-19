@@ -163,15 +163,23 @@ func (l *Layer) applyReplayEntry(ctx context.Context, e client.FSLayerEntry, has
 	case "rename":
 		return l.replayRename(ctx, e, local, maxSeq)
 	case "chmod":
+		// Restore runs on the background refresh goroutine while live
+		// requests mutate the overlay maps under l.mu: take ONE consistent
+		// snapshot, then call the self-locking mark helpers. Unlocked reads
+		// here raced markLayerDir and could abort the mount with
+		// "concurrent map read and map write".
+		l.mu.RLock()
+		_, isDir := l.dirs[local]
+		sym, isSymlink := l.symlinks[local]
+		_, hasContent := l.contents[local]
+		l.mu.RUnlock()
 		switch {
-		case func() bool { _, ok := l.dirs[local]; return ok }():
+		case isDir:
 			l.markLayerDir(local, e.Mode)
-		case func() bool { _, ok := l.symlinks[local]; return ok }():
-			if st, ok := l.symlinks[local]; ok {
-				nextMode := (st.Mode &^ uint32(0o777)) | (e.Mode & 0o777)
-				l.markLayerSymlink(local, st.Target, nextMode)
-			}
-		case func() bool { _, ok := l.contents[local]; return ok }():
+		case isSymlink:
+			nextMode := (sym.Mode &^ uint32(0o777)) | (e.Mode & 0o777)
+			l.markLayerSymlink(local, sym.Target, nextMode)
+		case hasContent:
 			// A content image exists in the overlay: the chmod re-marks it.
 			l.markLayerFileMode(local, e.Mode)
 		default:
@@ -289,7 +297,10 @@ func (l *Layer) replayRename(ctx context.Context, e client.FSLayerEntry, oldLoca
 	if moved {
 		return nil
 	}
-	if _, exists := l.contents[newLocal]; exists {
+	l.mu.RLock()
+	_, exists := l.contents[newLocal]
+	l.mu.RUnlock()
+	if exists {
 		return nil
 	}
 	if full.Kind == "dir" {

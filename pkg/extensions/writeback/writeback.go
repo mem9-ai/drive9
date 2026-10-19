@@ -188,6 +188,10 @@ type Writeback struct {
 	// own writes; nil disables seeding.
 	commitSeeder  func(path string, data []byte, rev int64)
 	pendingSeeder func(path string, data []byte)
+	// commitSeedMax bounds the image a settle may hand the read cache (its
+	// admission limit): reading a multi-GiB spill into memory only to have
+	// the cache reject it would defeat the bounded-memory commit path.
+	commitSeedMax int64
 	// baseReader serves a write-side base preload from the read cache (
 	// preloaded through the read-cache path): a just-committed image answers
 	// locally instead of racing backend replica lag with a remote GET.
@@ -223,6 +227,11 @@ type bufferingHandle struct {
 	wgen uint64
 	// isNew marks O_CREAT claims that have not reached the remote yet.
 	isNew bool
+	// pendingShadowGen pins the pending shadow generation for a read-only
+	// re-open whose image is too large to capture: commit cleanup retires
+	// (but keeps readable) the pinned generation, so the still-open fd keeps
+	// serving its own image after the upload lands.
+	pendingShadowGen uint64
 	// pendingImage is an immutable captured pending image: reads of a
 	// pending-overlay handle serve exactly these bytes.
 	pendingImage []byte
@@ -372,7 +381,7 @@ func New(opts Options) (*Writeback, error) {
 			if committedRev > 0 {
 				w.landedAt(w.localPathOf(meta.Path), committedRev, meta.Size)
 			}
-			if w.commitSeeder != nil && committedRev > 0 && meta.Size > 0 {
+			if w.commitSeeder != nil && committedRev > 0 && meta.Size > 0 && w.commitSeedAllowed(meta.Size) {
 				if data, derr := w.wbCache.Get(meta.Path); derr && int64(len(data)) == meta.Size {
 					w.commitSeeder(w.localPathOf(meta.Path), data, committedRev)
 				}
@@ -414,7 +423,7 @@ func New(opts Options) (*Writeback, error) {
 			if committedRev > 0 {
 				w.landedAt(entry.Path, committedRev, entry.Size)
 			}
-			if w.commitSeeder != nil && committedRev > 0 && entry.Size > 0 {
+			if w.commitSeeder != nil && committedRev > 0 && entry.Size > 0 && w.commitSeedAllowed(entry.Size) {
 				if data, derr := opts.Staging.Shadow.ReadAll(entry.Path); derr == nil && int64(len(data)) == entry.Size {
 					w.commitSeeder(entry.Path, data, committedRev)
 				}
@@ -472,6 +481,19 @@ func (w *Writeback) AbandonLayerForRollback() {
 
 func (w *Writeback) SetCommitSeeder(fn func(path string, data []byte, rev int64)) {
 	w.commitSeeder = fn
+}
+
+// SetCommitSeedLimit mirrors the read cache's per-file admission bound so a
+// settle never materializes an image the cache would reject (v1 checked the
+// limit before reading the shadow).
+func (w *Writeback) SetCommitSeedLimit(maxBytes int64) {
+	w.commitSeedMax = maxBytes
+}
+
+// commitSeedAllowed reports whether an image of size may be read for the
+// commit seeder.
+func (w *Writeback) commitSeedAllowed(size int64) bool {
+	return w.commitSeedMax <= 0 || size <= w.commitSeedMax
 }
 
 // SetPendingSeeder wires the flush-time pending-seed hook (the cache
@@ -854,7 +876,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				if attr, ok := w.pendingAttr(op.Path); ok {
 					h := &bufferingHandle{w: w, path: op.Path, flags: op.Flags,
 						baseSize: attr.Size, forceSync: hasSyncOpenFlag(op.Flags),
-						pendingImage: w.capturePendingImage(op.Path)}
+						pendingImage:     w.capturePendingImage(op.Path),
+						pendingShadowGen: w.pinPendingShadow(op.Path)}
 					if pb, ok := w.pendingBaseRevOf(op.Path); ok {
 						h.baseRev = pb
 					}
@@ -874,15 +897,20 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					if meta, ok := w.pendingMeta(op.Path); ok && meta != nil {
 						size = meta.Size
 					}
-					if image := w.capturePendingImage(op.Path); image != nil {
+					shadowGen := w.pinPendingShadow(op.Path)
+					image := w.capturePendingImage(op.Path)
+					if image != nil || shadowGen != 0 {
 						h := &bufferingHandle{w: w, path: op.Path, flags: op.Flags,
 							baseSize: size, forceSync: hasSyncOpenFlag(op.Flags),
-							pendingImage: image}
+							pendingImage: image, pendingShadowGen: shadowGen}
 						if pb, ok := w.pendingBaseRevOf(op.Path); ok {
 							h.baseRev = pb
 						}
 						w.track(h)
 						return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: 0o644, Size: size}, Handle: h}, nil
+					}
+					if shadowGen != 0 && w.opts.Staging != nil {
+						w.opts.Staging.Shadow.Unpin(shadowGen)
 					}
 				}
 			}
@@ -1497,6 +1525,10 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 			if h.w.wbCache != nil {
 				if _, ok := h.w.wbCache.GetMeta(h.path); ok {
 					if err := h.ensureBufferLocked(ctx); err == nil && h.buf != nil {
+						if err := h.buf.EnsurePartsForWrite(off, int64(len(dest))); err != nil {
+							h.mu.Unlock()
+							return 0, err
+						}
 						n := h.buf.ReadAt(off, dest)
 						if end := h.buf.Size() - off; end < int64(len(dest)) {
 							if end < 0 {
@@ -1518,7 +1550,9 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		// an unflushed dirty buffer is POSIX-visible to every fd of the
 		// file — the second open reads what the first wrote, not the stale
 		// remote image.
-		if n, ok := h.readLiveWriter(ctx, off, dest); ok {
+		if n, ok, lerr := h.readLiveWriter(ctx, off, dest); lerr != nil {
+			return 0, lerr
+		} else if ok {
 			return n, nil
 		}
 		// #984 sibling visibility: the inode's newest uncommitted image —
@@ -1542,11 +1576,17 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 			if meta, mok := h.w.pendingMeta(h.path); mok && meta != nil {
 				size = meta.Size
 			}
-			if data, kok := readShadowGenerationFenced(h.w.opts.Staging.Shadow, h.path, size); kok && data != nil {
-				if off >= int64(len(data)) {
-					return 0, nil
-				}
-				return copy(dest, data[off:]), nil
+			// The pending image is authoritative for this path: a read AT or
+			// beyond its size is EOF, not a fall-through to the stale
+			// remote/session tiers (a ftruncate to 5 then a read at 5 served
+			// four bytes of the pre-truncate remote).
+			if off >= size {
+				return 0, nil
+			}
+			if n, kok, rerr := readShadowRangeFenced(h.w.opts.Staging.Shadow, h.path, size, off, dest); rerr != nil {
+				return 0, rerr
+			} else if kok {
+				return n, nil
 			}
 		}
 		// #984 staged alias tier: a truncating sibling flushed on ITS
@@ -1568,8 +1608,16 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 			}
 		}
 		// A pending-overlay handle (read-only re-open of a not-yet-landed
-		// image) has no inner terminal; the pending tracks above were its
-		// only sources.
+		// image) has no inner terminal: serve its PINNED shadow generation,
+		// which commit cleanup retires instead of deleting while open (a
+		// 17MiB image read after its upload landed used to ENOENT).
+		if h.pendingShadowGen != 0 && h.w.opts.Staging != nil {
+			gen := h.pendingShadowGen
+			n, rerr := h.w.opts.Staging.Shadow.ReadAtGen(gen, off, dest)
+			if rerr == nil || rerr == io.EOF {
+				return n, nil
+			}
+		}
 		if h.inner == nil {
 			return 0, fs.ErrNotFound
 		}
@@ -1597,22 +1645,28 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 // buffer (v1 readSamePathDirtyHandleVisibleRange): POSIX makes an unflushed
 // write visible to every fd of the file. ok=false when no live writer holds
 // a dirty buffer (fall through to the staged/remote tiers).
-func (h *bufferingHandle) readLiveWriter(ctx context.Context, off int64, dest []byte) (int, bool) {
+func (h *bufferingHandle) readLiveWriter(ctx context.Context, off int64, dest []byte) (int, bool, error) {
 	v, ok := h.w.live.Load(h.path)
 	if !ok {
-		return 0, false
+		return 0, false, nil
 	}
 	writer, ok := v.(*bufferingHandle)
 	if !ok || writer == h {
-		return 0, false
+		return 0, false, nil
 	}
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
 	if !writer.dirty || writer.buf == nil {
-		return 0, false
+		return 0, false, nil
 	}
 	if err := writer.ensureBufferLocked(ctx); err != nil || writer.buf == nil {
-		return 0, false
+		return 0, false, nil
+	}
+	// Lazy base parts must load before the read: ReadAt zero-fills unloaded
+	// parts, which is only correct beyond the retained remote image (a
+	// 12MiB file with a 1MiB preload served four NULs at 8MiB).
+	if err := writer.buf.EnsurePartsForWrite(off, int64(len(dest))); err != nil {
+		return 0, false, err
 	}
 	n := writer.buf.ReadAt(off, dest)
 	if end := writer.buf.Size() - off; end < int64(len(dest)) {
@@ -1621,7 +1675,7 @@ func (h *bufferingHandle) readLiveWriter(ctx context.Context, off int64, dest []
 		}
 		n = int(end)
 	}
-	return n, true
+	return n, true, nil
 }
 
 // Write implements fs.Handle.
@@ -1966,6 +2020,9 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 	// rewrites h.path under h.mu — bare reads were a data race and could
 	// split a single Release's cancel/cleanup/submit across two names).
 	path := h.infoSnapshot().path
+	if h.pendingShadowGen != 0 && h.w.opts.Staging != nil {
+		h.w.opts.Staging.Shadow.Unpin(h.pendingShadowGen)
+	}
 	// The handle stays DISCOVERABLE until its final durability boundary:
 	// unregistering first let a concurrent rename conclude "no live
 	// writer", move the remote name, and then publish this Release's
@@ -2070,6 +2127,48 @@ func (w *Writeback) capturePendingImage(path string) []byte {
 		}
 	}
 	return nil
+}
+
+// pinPendingShadow pins the path's shadow generation for a pending reader;
+// zero when no shadow exists.
+func (w *Writeback) pinPendingShadow(path string) uint64 {
+	if w.opts.Staging == nil || w.opts.Staging.Shadow == nil {
+		return 0
+	}
+	gen, ok := w.opts.Staging.Shadow.PinIfExists(path)
+	if !ok {
+		return 0
+	}
+	return gen
+}
+
+// readShadowRangeFenced serves [off, off+len(dest)) from the active shadow
+// only while its content generation matches, without materializing the file
+// (v1 range-shaped shadow reads). ok=false means no usable pending bytes.
+func readShadowRangeFenced(shadows *staging.ShadowStore, path string, size, off int64, dest []byte) (int, bool, error) {
+	if shadows == nil || len(dest) == 0 || off < 0 || off >= size {
+		return 0, false, nil
+	}
+	want := int64(len(dest))
+	if off+want > size {
+		want = size - off
+	}
+	if want <= 0 {
+		return 0, false, nil
+	}
+	firstErr := error(nil)
+	for attempt := 0; attempt < 2; attempt++ {
+		gen := shadows.ActiveGeneration(path)
+		if gen == 0 {
+			return 0, false, nil
+		}
+		n, err := shadows.ReadAtIfGeneration(path, gen, off, dest[:want])
+		if err == nil {
+			return n, true, nil
+		}
+		firstErr = err
+	}
+	return 0, false, firstErr
 }
 
 // readShadowGenerationFenced reads the shadow only while its content
@@ -2832,6 +2931,58 @@ func (w *Writeback) everLanded(path string) bool {
 }
 
 // landedAttr answers a lookup from the recently-landed table (30s window).
+// landedCoversInode reports whether rev is at or below the newest revision
+// THIS mount landed for the path's inode (hardlink aliases included): the
+// row has not advanced past our own commits, so a whole-image write may
+// compose on it. A FOREIGN write lands above every revision we recorded and
+// is still refused.
+func (w *Writeback) landedCoversInode(path string, rev int64) bool {
+	if rev <= 0 {
+		return false
+	}
+	if w.landedRevisionIs(path, rev) {
+		return true
+	}
+	if w.inodes == nil {
+		return false
+	}
+	ino, ok := w.inodes.Ino(path)
+	if !ok || ino == 0 {
+		return false
+	}
+	newest := int64(0)
+	for _, alias := range w.inodeAliasPaths(ino, path) {
+		if r, ok := w.landedRevision(alias); ok && r > newest {
+			newest = r
+		}
+	}
+	return newest > 0 && newest >= rev
+}
+
+// landedRevision returns this mount's newest recorded landing revision at
+// path.
+func (w *Writeback) landedRevision(path string) (int64, bool) {
+	w.landedMu.Lock()
+	info, ok := w.landed[path]
+	w.landedMu.Unlock()
+	if !ok {
+		return 0, false
+	}
+	return info.rev, true
+}
+
+// landedRevisionIs reports whether rev is a revision THIS mount landed at
+// path (same-origin proof for advancing a stale CAS base).
+func (w *Writeback) landedRevisionIs(path string, rev int64) bool {
+	if rev <= 0 {
+		return false
+	}
+	w.landedMu.Lock()
+	info, ok := w.landed[path]
+	w.landedMu.Unlock()
+	return ok && info.rev == rev
+}
+
 func (w *Writeback) landedAttr(path string) (fs.Attr, bool) {
 	w.landedMu.Lock()
 	info, ok := w.landed[path]
@@ -2959,6 +3110,7 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		size = h.buf.Size()
 	}
 	isNew := h.isNew
+	baseRev := h.baseRev
 	commitGen := h.wgen
 	var newReader func() io.Reader
 	var image []byte
@@ -2974,10 +3126,10 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 	}
 	h.mu.Unlock()
 
-	committedRev, err := h.w.commitReaderOpt(ctx, h.path, newReader, size, isNew && size == 0)
+	committedRev, err := h.w.commitReaderOpt(ctx, h.path, newReader, size, isNew && size == 0, baseRev)
 	if err == nil {
 		h.w.landedAt(h.path, committedRev, size)
-		if h.w.commitSeeder != nil && image != nil {
+		if h.w.commitSeeder != nil && image != nil && h.w.commitSeedAllowed(int64(len(image))) {
 			h.w.commitSeeder(h.path, image, committedRev)
 		}
 		h.mu.Lock()
@@ -3020,7 +3172,7 @@ func (w *Writeback) detachCommitContext(parent context.Context, size int64) (con
 // zero-byte file lands through the create endpoint first (v1 flushHandle's
 // CreateFileCtx), falling back to the conditional write — the two endpoints
 // differ server-side in permissions and event fan-out.
-func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader func() io.Reader, size int64, emptyCreate bool) (int64, error) {
+func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader func() io.Reader, size int64, emptyCreate bool, expectedRev int64) (int64, error) {
 	rp := w.remotePath(path)
 	// syncDataCommitContext + releaseTimeout: commits detach from the
 	// FUSE cancel channel (a kernel interrupt must not fail a server-side
@@ -3044,17 +3196,36 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 	// PUTs below the threshold, multipart above it — the server rejects
 	// large plain PUTs with "missing X-Dat9-Part-Checksums".
 	for attempt := 0; attempt <= commitRetries; attempt++ {
-		expected := int64(0)
-		if st, err := w.opts.Client.StatCtx(ctx, rp); err == nil {
-			expected = st.Revision
-		} else if !client.IsNotFound(err) {
-			return 0, mapErr(err)
+		// The conditional write carries the image's CAPTURED base. Only a
+		// missing lineage discovers the remote revision, and a conflict may
+		// advance the base only on same-origin proof: refreshing it blindly
+		// republished a stale image over a foreign write (the CAS it was
+		// meant to be).
+		expected := expectedRev
+		if expected <= 0 {
+			if st, err := w.opts.Client.StatCtx(ctx, rp); err == nil {
+				expected = st.Revision
+			} else if !client.IsNotFound(err) {
+				return 0, mapErr(err)
+			}
 		}
 		st, werr := w.opts.Client.WriteStreamConditionalWithChecksum(ctx,
 			rp, newReader(), size, nil, expected, "")
 		if werr != nil {
 			if errors.Is(werr, client.ErrConflict) {
-				continue
+				if st, serr := w.opts.Client.StatCtx(ctx, rp); serr == nil && st != nil {
+					// Retry only when the conflict did not advance the row
+					// (a transient reject of the same base) or when the
+					// remote revision is a landing of this mount's own
+					// image: anything else is a foreign write, and
+					// republishing the stale image at its revision is the
+					// CAS bypass this contract exists to prevent.
+					if st.Revision == expected || w.landedCoversInode(path, st.Revision) {
+						expectedRev = st.Revision
+						continue
+					}
+				}
+				return 0, &fs.StatusError{Path: path, Status: gofuse.EAGAIN}
 			}
 			return 0, mapErr(werr)
 		}
@@ -3128,7 +3299,11 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		}
 	}
 	if !h.isNew && h.w.wbCache != nil {
-		if data, ok := h.w.wbCache.Get(h.w.remotePath(h.path)); ok && int64(len(data)) > 0 {
+		// The write cache is LOCAL-path keyed (stageToWriteCache Put uses
+		// h.path): querying the remote name under a RemoteRoot subtree
+		// missed every not-yet-uploaded image and served the stale remote
+		// base as the next overwrite's base.
+		if data, ok := h.w.wbCache.Get(h.path); ok && int64(len(data)) > 0 {
 			// The staged image is newer than the remote (it has not
 			// landed yet): preload from the cache so read-your-writes and
 			// the next commit see the pending bytes (OpenWritable
@@ -3783,20 +3958,20 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	if isNew {
 		baseRev = 0
 	} else {
-		// The CAS base must be the file's real current revision. The
-		// open-time stat can be stale either way — a row whose revision a
-		// streaming landing never reported (committedRev=0), or a row left
-		// at the pre-overwrite revision by the previous handle's async
-		// upload. Refresh from the source of truth before staging.
+		// The CAS base is the revision the BUFFER was built from. Only two
+		// cases may advance it: no lineage at all (a legacy open that never
+		// observed one), or the remote row is THIS mount's own landing
+		// (same-origin proof — its previous async upload advanced the
+		// revision under an unobserved open). A foreign write must stay a
+		// conflict: adopting its revision would let the stale image
+		// overwrite it silently (hello+X vs WORLD landed Xello).
 		if st, serr := h.w.opts.Client.StatCtx(ctx, h.w.remotePath(h.path)); serr == nil && st != nil {
-			h.mu.Lock()
-			h.baseRev = st.Revision
-			h.mu.Unlock()
-			baseRev = st.Revision
-		} else if baseRev <= 0 {
-			// Unreachable remotely (stat failed): keep whatever lineage we
-			// have rather than staging a base-less overwrite.
-			_ = serr
+			if baseRev <= 0 || h.w.landedCoversInode(h.path, st.Revision) {
+				h.mu.Lock()
+				h.baseRev = st.Revision
+				h.mu.Unlock()
+				baseRev = st.Revision
+			}
 		}
 	}
 	kind := staging.PendingOverwrite

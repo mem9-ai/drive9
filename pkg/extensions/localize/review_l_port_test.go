@@ -6,10 +6,16 @@ package localize
 
 import (
 	"context"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
+	"github.com/mem9-ai/drive9/internal/testbackend"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/extensions/core"
+	"github.com/mem9-ai/drive9/pkg/extensions/specials"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
@@ -113,5 +119,56 @@ func TestPortLocalAttrsKeepSpecialModeBits(t *testing.T) {
 	}
 	if res.Attr.Mode != 0o4755 {
 		t.Fatalf("file mode = %#o, want 04755 (setuid lost)", res.Attr.Mode)
+	}
+}
+
+// A metadata-only node created on a local-only path stays visible (and
+// deletable) through the local overlay: the specials plane owns the record,
+// and the overlay must not answer ENOENT for a path it classifies local.
+func TestPortLocalSpecialNodeVisibleAndRemovable(t *testing.T) {
+	ts := httptest.NewServer(testbackend.NewBackend())
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	f, err := New(Options{LocalRoot: t.TempDir(), LocalOnlyPatterns: []string{"**/node_modules/**"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := specials.New(specials.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(f, sp, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	node := "/repo/node_modules/fifo"
+
+	mknod := func() error {
+		_, merr := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: node, Mode: uint32(syscall.S_IFIFO) | 0o644})
+		return merr
+	}
+	if err := mknod(); err != nil {
+		t.Fatalf("mkfifo = %v", err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: node})
+	if err != nil || res.Attr == nil {
+		t.Fatalf("lookup = %v attr=%v", err, res.Attr)
+	}
+	if res.Attr.Mode&syscall.S_IFMT != syscall.S_IFIFO {
+		t.Fatalf("mode = %#o, want a FIFO type", res.Attr.Mode)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: node}); err != nil {
+		t.Fatalf("unlink = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: node}); err == nil {
+		t.Fatal("deleted special still resolves")
+	}
+	if err := mknod(); err != nil {
+		t.Fatalf("re-mkfifo = %v, want success (no stale EEXIST)", err)
 	}
 }

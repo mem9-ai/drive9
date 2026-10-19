@@ -745,6 +745,38 @@ func (s *ShadowStore) ReadAllIfGeneration(remotePath string, expectedGen uint64)
 	return data, nil
 }
 
+// ReadAtIfGeneration reads [offset, offset+len(buf)) from the active shadow
+// only while its content generation still matches expectedGen. Unlike
+// ReadAllIfGeneration it never materializes the whole image: a four-byte READ
+// on a multi-GiB spill must not allocate the file.
+func (s *ShadowStore) ReadAtIfGeneration(remotePath string, expectedGen uint64, offset int64, buf []byte) (int, error) {
+	if expectedGen == 0 {
+		return s.ReadAt(remotePath, offset, buf)
+	}
+	if s == nil {
+		return 0, fmt.Errorf("nil shadow store")
+	}
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	s.mu.RLock()
+	if s.writeGen[remotePath] != expectedGen {
+		s.mu.RUnlock()
+		return 0, fmt.Errorf("%w: shadow %s generation changed", errCommitPayloadStale, remotePath)
+	}
+	sf, ok := s.files[remotePath]
+	if !ok {
+		s.mu.RUnlock()
+		return 0, fmt.Errorf("%w: shadow %s generation not active", errCommitPayloadStale, remotePath)
+	}
+	n, err := sf.fd.ReadAt(buf, offset)
+	s.mu.RUnlock()
+	if err == io.EOF && n > 0 {
+		err = nil
+	}
+	return n, err
+}
+
 // SyncIfGeneration fsyncs the active shadow only if its current content
 // generation still matches expectedGen. Generation 0 preserves the historical
 // path-based fallback for recovered legacy entries.

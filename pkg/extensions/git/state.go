@@ -349,37 +349,56 @@ func gitObjectInfoBatch(ctx context.Context, gitDir string, ids []string) (map[s
 }
 
 // buildLocalGitObjectPack packs ref objects + staged blobs with escalating
-// fallbacks against the pack budget.
-func (g *Git) buildLocalGitObjectPack(ctx context.Context, gitDir, baseCommit string) ([]byte, error) {
-	refObjects, oversize, err := collectLocalRefObjectSet(ctx, gitDir, baseCommit)
+// fallbacks against the pack budget. complete reports whether BOTH sets made
+// it into the returned pack: a checkpoint that archives the index/refs while
+// some of their objects were dropped publishes an unrestorable state (git
+// diff --cached then reports missing objects).
+func (g *Git) buildLocalGitObjectPack(ctx context.Context, gitDir, baseCommit string) (pack []byte, complete bool, err error) {
+	refObjects, refsOversize, err := collectLocalRefObjectSet(ctx, gitDir, baseCommit)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if oversize {
+	if refsOversize {
 		refObjects = nil
 	}
 	stagedObjects, err := collectStagedObjectSet(ctx, gitDir)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	pack, err := packGitObjects(ctx, gitDir, mergeObjectSets(refObjects, stagedObjects))
-	if err != nil {
-		return nil, err
+	fits := func(p []byte) bool { return int64(len(p)) <= gitLocalObjectMaxPackByte }
+	if !refsOversize {
+		if pack, err = packGitObjects(ctx, gitDir, mergeObjectSets(refObjects, stagedObjects)); err != nil {
+			return nil, false, err
+		}
+		if fits(pack) {
+			return pack, true, nil
+		}
 	}
-	if int64(len(pack)) > gitLocalObjectMaxPackByte {
+	refsCovered := false
+	if !refsOversize {
 		if pack, err = packGitObjects(ctx, gitDir, refObjects); err != nil {
-			return nil, err
+			return nil, false, err
 		}
+		refsCovered = fits(pack)
 	}
-	if int64(len(pack)) > gitLocalObjectMaxPackByte {
-		if pack, err = packGitObjects(ctx, gitDir, stagedObjects); err != nil {
-			return nil, err
+	stagedCovered := len(stagedObjects) == 0
+	if !stagedCovered {
+		stagedPack, serr := packGitObjects(ctx, gitDir, stagedObjects)
+		if serr != nil {
+			return nil, false, serr
 		}
-		if int64(len(pack)) > gitLocalObjectMaxPackByte {
-			pack = nil
+		stagedCovered = fits(stagedPack)
+		if refsCovered {
+			// Keep the refs pack; completeness already failed on the
+			// staged set above.
+			return pack, false, nil
 		}
+		pack = stagedPack
 	}
-	return pack, nil
+	if !fits(pack) {
+		pack = nil
+	}
+	return pack, refsCovered && stagedCovered, nil
 }
 
 func collectLocalRefObjectSet(ctx context.Context, gitDir, baseCommit string) (map[string]struct{}, bool, error) {
@@ -654,9 +673,15 @@ func (g *Git) checkpointWorkspace(ctx context.Context, w *workspace, gitDir stri
 	g.ckptMu.Lock()
 	defer g.ckptMu.Unlock()
 	baseCommit := strings.ToLower(strings.TrimSpace(w.head()))
-	pack, err := g.buildLocalGitObjectPack(ctx, gitDir, baseCommit)
+	pack, complete, err := g.buildLocalGitObjectPack(ctx, gitDir, baseCommit)
 	if err != nil {
 		return err
+	}
+	if !complete {
+		// Refuse rather than publish an archive whose index/refs reference
+		// objects outside the pack budget: the previous checkpoint stays
+		// and restoration remains possible.
+		return fmt.Errorf("git: checkpoint %s: local object set exceeds the pack budget; refusing to publish an unrestorable state", w.id)
 	}
 	if len(pack) > 0 {
 		if _, err := g.cl.PutGitObjectPack(ctx, w.id, client.GitObjectPackRequest{Content: pack}); err != nil {
@@ -709,6 +734,28 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 		return nil
 	}
 	gitDir := g.gitDirFor(w.rootPath())
+	// A linked worktree's state is its gitdir under the COMMON repository
+	// plus a .git pointer file at the root. Unpacking the archive as a
+	// standalone .git dropped the commondir relationship (the CLI still
+	// registers linked workspaces and uploads a relative commondir).
+	linkedCommonGitDir := ""
+	if w.linked() {
+		common := g.workspaceByID(w.commonWorkspaceID())
+		if common == nil || common.id == w.id {
+			// The common workspace has not been discovered yet: retry on
+			// the next load instead of restoring a broken standalone repo.
+			return errGitStateNotReady
+		}
+		if err := g.ensureWorkspaceState(ctx, common); err != nil {
+			return err
+		}
+		linkedCommonGitDir = g.gitDirFor(common.rootPath())
+		target, lerr := linkedWorktreeGitDir(linkedCommonGitDir, w.gitDirRelPath())
+		if lerr != nil {
+			return lerr
+		}
+		gitDir = target
+	}
 	// v1 ensureGitStateRestored: a usable local .git owns the truth — a
 	// live `drive9 git clone --fast` on THIS mount built it, and the
 	// server's checkpoint lags the live writes. Swapping here would wipe
@@ -716,6 +763,12 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	// back to the clone-time archive. Only a missing or unusable .git
 	// (a fresh-LocalRoot remount) downloads and swaps the state.
 	if gitDirLooksUsable(ctx, gitDir) {
+		if linkedCommonGitDir != "" {
+			// The common repository's archive also carries the worktree
+			// admin dir, but the LINKED root still needs its .git pointer
+			// file — git only finds the worktree through it.
+			return writeWorktreeGitPointer(g, w.rootPath(), gitDir)
+		}
 		return nil
 	}
 	state, err := g.cl.GetGitState(ctx, w.id)
@@ -738,16 +791,41 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	}
 	defer func() { _ = os.RemoveAll(tmpRoot) }()
 	tmpGitDir := filepath.Join(tmpRoot, ".git")
+	if linkedCommonGitDir != "" {
+		// A linked worktree gitdir sits at <common>/.git/worktrees/<name>
+		// and resolves its shared state through the RELATIVE commondir
+		// "../..": the staging dir must keep the same depth, or the
+		// validation below would follow the pointer into the wrong tree.
+		tmpGitDir = tmpRoot
+	}
 	if state.StorageType == gitStateStorageTarGzNoObjects {
-		if err := g.restoreGitObjectsFromRemote(ctx, w, tmpGitDir); err != nil {
-			return err
+		if linkedCommonGitDir == "" {
+			// Standalone: objects come from the remote clone.
+			if err := g.restoreGitObjectsFromRemote(ctx, w, tmpGitDir); err != nil {
+				return err
+			}
 		}
-		if err := g.restoreGitObjectPacks(ctx, w, tmpGitDir); err != nil {
+		// A linked worktree shares the common repository's object store:
+		// the pack lands THERE, never in the worktree gitdir (which git
+		// resolves through commondir).
+		packDir := tmpGitDir
+		if linkedCommonGitDir != "" {
+			packDir = linkedCommonGitDir
+		}
+		if err := g.restoreGitObjectPacks(ctx, w, packDir); err != nil {
 			return err
 		}
 	}
 	if err := extractGitArchive(state.Content, tmpGitDir); err != nil {
 		return err
+	}
+	if linkedCommonGitDir != "" {
+		// The worktree gitdir must resolve its shared state through the
+		// common .git; an archive that predates commondir gets the
+		// canonical relative pointer for <common>/.git/worktrees/<name>.
+		if err := ensureWorktreeCommondir(tmpGitDir); err != nil {
+			return err
+		}
 	}
 	if !gitDirLooksUsable(ctx, tmpGitDir) {
 		return fmt.Errorf("restored git state is missing a usable HEAD")
@@ -755,7 +833,60 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	if err := os.RemoveAll(gitDir); err != nil {
 		return err
 	}
-	return os.Rename(tmpGitDir, gitDir)
+	if err := os.Rename(tmpGitDir, gitDir); err != nil {
+		return err
+	}
+	if linkedCommonGitDir != "" {
+		return writeWorktreeGitPointer(g, w.rootPath(), gitDir)
+	}
+	return nil
+}
+
+// linkedWorktreeGitDir resolves a linked worktree's gitdir from the common
+// repository's .git and the registered relative gitdir (".git/worktrees/w1").
+func linkedWorktreeGitDir(commonGitDir, gitDirRel string) (string, error) {
+	rel := filepath.Clean(strings.TrimSpace(filepath.FromSlash(gitDirRel)))
+	rel = strings.TrimPrefix(rel, ".git"+string(filepath.Separator))
+	if rel == "" || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("git: linked workspace has no usable gitdir (%q)", gitDirRel)
+	}
+	target := filepath.Join(commonGitDir, rel)
+	// The resolved path must stay inside the common .git.
+	if !strings.HasPrefix(target, filepath.Clean(commonGitDir)+string(filepath.Separator)) {
+		return "", fmt.Errorf("git: linked workspace gitdir %q escapes the common repository", gitDirRel)
+	}
+	return target, nil
+}
+
+// ensureWorktreeCommondir writes the canonical relative commondir for a
+// gitdir that sits at <common>/.git/worktrees/<name>.
+func ensureWorktreeCommondir(gitDir string) error {
+	path := filepath.Join(gitDir, "commondir")
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return os.WriteFile(path, []byte("../..\n"), 0o644)
+}
+
+// writeWorktreeGitPointer turns the linked root's .git into the pointer FILE
+// git expects (a linked worktree never owns a .git directory).
+func writeWorktreeGitPointer(g *Git, root, linkedGitDir string) error {
+	if g.localRoot == "" {
+		return nil
+	}
+	viewRoot := strings.TrimSuffix(root, "/")
+	pointer := filepath.Join(g.localRoot, "overlay", strings.TrimPrefix(viewRoot, "/"), ".git")
+	if err := os.MkdirAll(filepath.Dir(pointer), 0o755); err != nil {
+		return err
+	}
+	if info, err := os.Stat(pointer); err == nil && info.IsDir() {
+		if err := os.RemoveAll(pointer); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(pointer, []byte("gitdir: "+linkedGitDir+"\n"), 0o644)
 }
 
 // restoreGitObjectsFromRemote clones --no-checkout from the workspace's

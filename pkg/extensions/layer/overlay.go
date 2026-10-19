@@ -110,6 +110,49 @@ func (l *Layer) hydrateRemote(ctx context.Context, path string) error {
 	return nil
 }
 
+// migrateOverlaySubtree moves every committed overlay entry of a renamed
+// directory to the new prefix (files/contents/dirs/symlinks/remoteSizes,
+// base-mode overrides, and whiteouts). The rename moved the namespace entry
+// only; without this, a committed /d/f stayed keyed under /d and /e/f read
+// ENOENT (the ancestor whiteout also hid the old name).
+func (l *Layer) migrateOverlaySubtree(oldPath, newPath string) {
+	oldPrefix := strings.TrimSuffix(oldPath, "/") + "/"
+	newPrefix := strings.TrimSuffix(newPath, "/") + "/"
+	if oldPrefix == newPrefix {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.abandoned {
+		return
+	}
+	migratePrefix(l.files, oldPrefix, newPrefix)
+	migratePrefix(l.contents, oldPrefix, newPrefix)
+	migratePrefix(l.dirs, oldPrefix, newPrefix)
+	migratePrefix(l.symlinks, oldPrefix, newPrefix)
+	migratePrefix(l.remoteSizes, oldPrefix, newPrefix)
+	migratePrefix(l.baseModes, oldPrefix, newPrefix)
+	migratePrefix(l.whiteouts, oldPrefix, newPrefix)
+}
+
+// migratePrefix rekeys every entry under oldPrefix to the matching new
+// prefix.
+func migratePrefix[T any](m map[string]T, oldPrefix, newPrefix string) {
+	if len(m) == 0 {
+		return
+	}
+	moves := make(map[string]T)
+	for k, v := range m {
+		if strings.HasPrefix(k, oldPrefix) {
+			moves[newPrefix+strings.TrimPrefix(k, oldPrefix)] = v
+			delete(m, k)
+		}
+	}
+	for k, v := range moves {
+		m[k] = v
+	}
+}
+
 func (l *Layer) markLayerDir(p string, mode uint32) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

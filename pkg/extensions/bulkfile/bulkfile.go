@@ -52,8 +52,16 @@ type Bulkfile struct {
 	policy string
 	events *fs.EventBus
 
-	mu   sync.Mutex
+	mu sync.Mutex
+	// live is the CLAIM registry: handles whose uncommitted image answers
+	// lookups and read-only re-opens. A surrendered claim leaves it.
 	live map[*streamHandle]struct{}
+	// fds is the DESCRIPTOR registry: every open handle, including a
+	// surrendered passthrough descriptor. Rename retargeting walks THIS
+	// set — retiring a claim must not hide a still-open fd from the
+	// namespace tracking (a surrendered fd's later write re-opened /a
+	// after /a had been renamed to /b).
+	fds map[*streamHandle]struct{}
 }
 
 // New builds the data plane. A missing client is a configuration error.
@@ -67,7 +75,11 @@ func New(opts Options) (*Bulkfile, error) {
 	} else {
 		root = "/" + strings.Trim(root, "/")
 	}
-	return &Bulkfile{cl: opts.Client, root: root, policy: opts.Policy, events: opts.Events, live: make(map[*streamHandle]struct{})}, nil
+	return &Bulkfile{
+		cl: opts.Client, root: root, policy: opts.Policy, events: opts.Events,
+		live: make(map[*streamHandle]struct{}),
+		fds:  make(map[*streamHandle]struct{}),
+	}, nil
 }
 
 // Do serves one operation. The claim resolves existence before taking the
@@ -346,7 +358,7 @@ func (b *Bulkfile) retarget(ctx context.Context, oldPath, newPath string) {
 	prefix := strings.TrimSuffix(oldPath, "/") + "/"
 	var detached []fs.Handle
 	b.mu.Lock()
-	for h := range b.live {
+	for h := range b.fds {
 		h.mu.Lock()
 		switch {
 		case h.path == oldPath:
@@ -381,11 +393,27 @@ func (b *Bulkfile) remotePath(p string) string {
 
 func (b *Bulkfile) track(h *streamHandle) {
 	b.mu.Lock()
+	if b.live == nil {
+		b.live = make(map[*streamHandle]struct{})
+	}
+	if b.fds == nil {
+		b.fds = make(map[*streamHandle]struct{})
+	}
 	b.live[h] = struct{}{}
+	b.fds[h] = struct{}{}
 	b.mu.Unlock()
 }
 
 func (b *Bulkfile) untrack(h *streamHandle) {
+	b.mu.Lock()
+	delete(b.live, h)
+	delete(b.fds, h)
+	b.mu.Unlock()
+}
+
+// untrackClaim retires the pathname CLAIM only: the descriptor stays in the
+// namespace-tracking registry so a rename still follows it.
+func (b *Bulkfile) untrackClaim(h *streamHandle) {
 	b.mu.Lock()
 	delete(b.live, h)
 	b.mu.Unlock()

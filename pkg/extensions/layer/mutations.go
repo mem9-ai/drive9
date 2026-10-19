@@ -102,6 +102,10 @@ func (l *Layer) renameLayer(ctx context.Context, oldPath, newPath string) error 
 		}); err != nil {
 			return err
 		}
+		// Move the committed overlay subtree BEFORE the source whiteout:
+		// markLayerWhiteout only drops the exact path, but the descendants
+		// must follow the directory or the new name has no children.
+		l.migrateOverlaySubtree(oldPath, newPath)
 		l.markLayerDir(newPath, dirMode)
 		l.markLayerWhiteout(oldPath)
 		return nil

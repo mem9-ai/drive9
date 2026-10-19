@@ -243,7 +243,11 @@ func (h *streamHandle) surrenderToBelow() {
 	// original descriptor's reads with the pre-handoff image forever.
 	// Dropping the session makes every later read/write open a fresh
 	// handle against the shared state the second writer now owns.
-	h.b.untrack(h)
+	// Retire the pathname CLAIM only: this descriptor is still open, and a
+	// later rename must retarget it (untracking it here left the fd
+	// re-opening the OLD name — a surrendered fd recreated /a with its
+	// O_CREAT flags after /a had moved to /b).
+	h.b.untrackClaim(h)
 }
 
 // session returns the below handle, opening it at the current path when a

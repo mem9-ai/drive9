@@ -379,10 +379,18 @@ func (w *Writeback) admitFtruncate(ctx context.Context, owner *bufferingHandle, 
 		// The admission's path (not a bare owner.path read — the owner's
 		// mutex is not held here, and rename writes the field under it).
 		if sib.path == path {
-			// Same-path siblings stay untouched (v1): their reads are
-			// served by the visibility tiers, and a clean sibling's close
-			// must publish nothing — the truncate belongs to the naming
-			// descriptor that issued it.
+			// Same-path siblings are CLEAN here (the admission above
+			// rejected dirty ones). A clean buffer is only a read cache of
+			// the PRE-truncate image, and Read prefers its own buffer over
+			// the visibility tiers — keeping it served the old tail
+			// (ftruncate(5) on one fd left the other reading "Hello
+			// world"). Drop it so the next read reloads the truncated base.
+			if sib.buf != nil && !sib.dirty && !sib.unlinked {
+				sib.buf = nil
+				sib.baseLoaded = false
+				sib.baseSize = size
+			}
+			sib.pendingImage = nil
 			continue
 		}
 		switch {

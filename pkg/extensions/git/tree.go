@@ -63,6 +63,13 @@ func (g *Git) loadRemoteOverlay(ctx context.Context, w *workspace) {
 			e.remote = true
 			e.size = ge.SizeBytes
 		}
+		// The fetched inline bytes ARE the authoritative image — including
+		// a zero-length one (a synced ftruncate(0)). Without the marker
+		// ensureBufferLocked skipped the overlay and reloaded the stale
+		// HEAD/base under the next write.
+		if !e.remote && (e.Kind == "file" || e.Kind == "symlink") {
+			e.Materialized = true
+		}
 		overlay[strings.TrimPrefix(ge.Path, "/")] = e
 	}
 	w.mu.Lock()
@@ -99,14 +106,14 @@ func sameOverlayEntry(a, b overlayEntry) bool {
 
 // loadTree fetches the workspace's HEAD tree (v1 ListGitTree → rt.nodes):
 // clean files resolve here before the base view.
-func (g *Git) loadTree(ctx context.Context, w *workspace) {
+func (g *Git) loadTree(ctx context.Context, w *workspace) bool {
 	head := w.head()
 	if head == "" {
-		return
+		return false
 	}
 	nodes, err := g.cl.ListGitTree(ctx, w.id, head)
 	if err != nil {
-		return
+		return false
 	}
 	tree := make(map[string]client.GitTreeNode, len(nodes))
 	for _, n := range nodes {
@@ -118,6 +125,7 @@ func (g *Git) loadTree(ctx context.Context, w *workspace) {
 	w.mu.Lock()
 	w.tree = tree
 	w.mu.Unlock()
+	return true
 }
 
 // treeLookup resolves rel against the HEAD tree.

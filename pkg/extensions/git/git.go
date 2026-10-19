@@ -61,6 +61,14 @@ type workspace struct {
 	headCommit   string
 	repoURL      string
 	fastBlobless bool
+	// Linked-worktree identity (v1 GitWorkspace): a linked workspace shares
+	// the common repository's objects, and its own gitdir lives under the
+	// common .git (gitdirRel) with a .git POINTER FILE at the root.
+	// Dropping these made restore unpack a worktree archive as a standalone
+	// .git whose commondir pointed nowhere.
+	workspaceKind string
+	commonID      string
+	gitDirRel     string
 	// createdAt anchors the clean-tree mtime (v1 gitCleanTreeMtime): a
 	// stable timestamp per commit lets git's stat comparison trust clean
 	// tree files instead of content-checking every one on every status.
@@ -155,6 +163,26 @@ func (w *workspace) repo() string {
 	return w.repoURL
 }
 
+// linked reports a linked-worktree workspace (its .git is a pointer file
+// and the gitdir lives under the common repository).
+func (w *workspace) linked() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.workspaceKind == "linked" || (w.commonID != "" && w.gitDirRel != "")
+}
+
+func (w *workspace) gitDirRelPath() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.gitDirRel
+}
+
+func (w *workspace) commonWorkspaceID() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.commonID
+}
+
 func (w *workspace) blobless() bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -168,6 +196,28 @@ func (w *workspace) setMeta(root, head, repo string, blobless bool, createdAt ti
 		w.createdAt = createdAt
 	}
 	w.mu.Unlock()
+}
+
+// setLinkedMeta refreshes the linked-worktree identity fields.
+func (w *workspace) setLinkedMeta(kind, commonID, gitDirRel string) {
+	w.mu.Lock()
+	w.workspaceKind, w.commonID, w.gitDirRel = kind, commonID, gitDirRel
+	w.mu.Unlock()
+}
+
+// workspaceByID resolves another discovered workspace.
+func (g *Git) workspaceByID(id string) *workspace {
+	if id == "" {
+		return nil
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	for _, w := range g.workspaces {
+		if w.id == id {
+			return w
+		}
+	}
+	return nil
 }
 
 // cleanTreeMtime returns the stable stat time for clean tree files (v1
@@ -665,15 +715,19 @@ func (g *Git) ensure(ctx context.Context) {
 		if existing, ok := prev[gw.WorkspaceID]; ok {
 			w = existing
 			w.setMeta(root, gw.HeadCommit, gw.RepoURL, gw.Mode == "fast-blobless", gw.CreatedAt)
+			w.setLinkedMeta(gw.WorkspaceKind, gw.CommonWorkspaceID, gw.GitDirRel)
 			delete(prev, gw.WorkspaceID)
 		} else {
 			w = &workspace{
-				id:           gw.WorkspaceID,
-				root:         root,
-				headCommit:   gw.HeadCommit,
-				repoURL:      gw.RepoURL,
-				fastBlobless: gw.Mode == "fast-blobless",
-				createdAt:    gw.CreatedAt,
+				id:            gw.WorkspaceID,
+				root:          root,
+				headCommit:    gw.HeadCommit,
+				repoURL:       gw.RepoURL,
+				fastBlobless:  gw.Mode == "fast-blobless",
+				createdAt:     gw.CreatedAt,
+				workspaceKind: gw.WorkspaceKind,
+				commonID:      gw.CommonWorkspaceID,
+				gitDirRel:     gw.GitDirRel,
 			}
 		}
 		ws = append(ws, w)
@@ -719,7 +773,12 @@ func (g *Git) refreshTree(ctx context.Context, w *workspace) {
 	if loadedFor == head {
 		return
 	}
-	g.loadTree(ctx, w)
+	// Latch only after a SUCCESSFUL install: a transient 503 used to mark
+	// the commit loaded forever, so every rescan skipped the retry and the
+	// fast-clone view kept missing (or serving the old) tree files.
+	if !g.loadTree(ctx, w) {
+		return
+	}
 	w.mu.Lock()
 	w.treeLoaded = head
 	w.mu.Unlock()

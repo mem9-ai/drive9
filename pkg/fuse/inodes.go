@@ -658,6 +658,28 @@ func (m *InodeToPath) ClearLocalTimes(ino uint64) {
 	}
 }
 
+// MarkDataMutation is the local data-write boundary (v1 markDirtySize): a
+// successful Write (or the chain's fallback write path) drops the explicit
+// times a prior utimens/SetAttr armed and forgets the user-set mtime, so the
+// post-landing server mtime governs again. Without it, a same-length
+// overwrite kept serving the old explicit mtime forever (size+mtime
+// incremental tools saw no change).
+func (m *InodeToPath) MarkDataMutation(ino uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return
+	}
+	if entry.MtimeOverride != nil {
+		// The override WAS the served mtime; drop it so the landed stat
+		// (or fillAttr's now fallback) provides the new one.
+		entry.Mtime = time.Time{}
+	}
+	clearTimeOverridesLocked(entry)
+}
+
 // clearTimeOverridesLocked drops both local time overrides on an entry the
 // caller holds locked. Used at every point where the inode's object or
 // mutation history invalidates explicitly SetAttr'd times: local data

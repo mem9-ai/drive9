@@ -885,6 +885,7 @@ func MountWithConfig(cfg MountConfig) error {
 		// this mount's own writes (read-your-writes), and preloads cannot
 		// 404 inside the lag window.
 		wb.SetCommitSeeder(readCache.SeedCommit)
+		wb.SetCommitSeedLimit(readCache.MaxFileSize())
 		wb.SetPendingSeeder(readCache.SeedPending)
 		wb.SetBaseReader(func(path string) ([]byte, bool) {
 			return readCache.ReadCached(path, 0)

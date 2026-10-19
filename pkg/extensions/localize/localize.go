@@ -66,6 +66,14 @@ type Localize struct {
 	innerMu    sync.Mutex
 	repoRoots  map[string]string
 	ignoreSets map[string]*ignoreRuleset
+
+	// localSpecials records metadata-only nodes (FIFO/CHR/BLK/SOCK) created
+	// through this overlay: the backing store cannot hold them, so lookups
+	// and unlinks answer from the record instead of falling through to a
+	// plane that only knows the remote view (a local-only node_modules
+	// FIFO disappeared from lookups right after mkfifo).
+	specialMu     sync.Mutex
+	localSpecials map[string]fs.Attr
 }
 
 // token is an open overlay file: the terminal data-plane handle for a
@@ -87,14 +95,15 @@ type token struct {
 // route).
 func New(opts Options) (*Localize, error) {
 	f := &Localize{
-		opts:       opts,
-		overlay:    NewOverlay(opts.LocalRoot),
-		policy:     NewPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.LocalGitignoreAwarePatterns, opts.RemoteOnlyPatterns, opts.ApplyBuiltinDefaults),
-		openDBs:    map[string]int{},
-		unlinked:   map[string]bool{},
-		repoRoots:  map[string]string{},
-		ignoreSets: map[string]*ignoreRuleset{},
-		transient:  NewOverlay(opts.TransientRoot),
+		opts:          opts,
+		overlay:       NewOverlay(opts.LocalRoot),
+		policy:        NewPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.LocalGitignoreAwarePatterns, opts.RemoteOnlyPatterns, opts.ApplyBuiltinDefaults),
+		openDBs:       map[string]int{},
+		unlinked:      map[string]bool{},
+		repoRoots:     map[string]string{},
+		ignoreSets:    map[string]*ignoreRuleset{},
+		localSpecials: map[string]fs.Attr{},
+		transient:     NewOverlay(opts.TransientRoot),
 	}
 	if f.overlay != nil && f.policy.Enabled() {
 		if err := f.overlay.EnsureRoot(); err != nil {
@@ -133,6 +142,9 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 	inner := fs.HandlerFilesystem(next)
 	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
+		if attr, ok := f.localSpecial(op.Path); ok {
+			return fs.Result{Attr: &attr}, nil
+		}
 		// LOOKUP claims with the same StatLocal shadow as GETATTR (v1
 		// serves LOOKUP of a LocalOnly path from the overlay): without
 		// the claim a re-lookup of an overlay-only file leaks to the
@@ -386,6 +398,22 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			return fs.Result{}, nil
 		}
 
+	case fs.OpMknod:
+		if f.overlayFor(ctx, inner, op.Path, false) == nil {
+			return next(ctx, op)
+		}
+		if _, exists := f.localSpecial(op.Path); exists {
+			return fs.Result{}, syscall.EEXIST
+		}
+		res, err := next(ctx, op)
+		if err != nil {
+			return res, err
+		}
+		if metadataOnlyLocalMode(op.Mode) {
+			f.recordLocalSpecial(op.Path, fs.Attr{Kind: fs.KindFile, Mode: op.Mode, Rdev: op.Rdev, Nlink: 1})
+		}
+		return res, nil
+
 	case fs.OpMkdir:
 		if o := f.overlayFor(ctx, inner, op.Path, true); o != nil {
 			mode := op.Mode & 0o7777
@@ -404,6 +432,17 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 
 	case fs.OpUnlink:
+		if _, ok := f.localSpecial(op.Path); ok {
+			// A metadata-only local node owns no backing file: let the
+			// specials plane drop its record, then retire ours (a duplicate
+			// mkfifo must not answer EEXIST afterwards).
+			res, err := next(ctx, op)
+			if err != nil && !fs.IsNotFound(err) {
+				return fs.Result{}, err
+			}
+			f.forgetLocalSpecial(op.Path)
+			return res, nil
+		}
 		if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {
 			info, err := o.Lstat(op.Path)
 			if err != nil {
@@ -651,6 +690,39 @@ func (h *dbAccountingHandle) Release(ctx context.Context) error {
 	err := h.inner.Release(ctx)
 	h.close(h.path)
 	return err
+}
+
+// metadataOnlyLocalMode matches the specials plane's node classes (FIFO,
+// character/block device, socket): nodes the local backing store cannot
+// represent.
+func metadataOnlyLocalMode(mode uint32) bool {
+	switch mode & syscall.S_IFMT {
+	case syscall.S_IFIFO, syscall.S_IFCHR, syscall.S_IFBLK, syscall.S_IFSOCK:
+		return true
+	}
+	return false
+}
+
+func (f *Localize) recordLocalSpecial(path string, attr fs.Attr) {
+	f.specialMu.Lock()
+	if f.localSpecials == nil {
+		f.localSpecials = map[string]fs.Attr{}
+	}
+	f.localSpecials[path] = attr
+	f.specialMu.Unlock()
+}
+
+func (f *Localize) localSpecial(path string) (fs.Attr, bool) {
+	f.specialMu.Lock()
+	defer f.specialMu.Unlock()
+	attr, ok := f.localSpecials[path]
+	return attr, ok
+}
+
+func (f *Localize) forgetLocalSpecial(path string) {
+	f.specialMu.Lock()
+	delete(f.localSpecials, path)
+	f.specialMu.Unlock()
 }
 
 // attrOfLocalInfo converts backing-file metadata into reply attributes;

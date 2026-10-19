@@ -196,6 +196,61 @@ func (e *Extent) forgetIno(path string) {
 	e.missForget(path)
 }
 
+// migrateInoPrefix moves the path→inode cache entries of a renamed path
+// (and of a renamed directory's descendants) to the new prefix, and drops
+// the stale negative probes under the old one.
+func (e *Extent) migrateInoPrefix(oldPath, newPath string) {
+	oldPrefix := strings.TrimSuffix(oldPath, "/") + "/"
+	newPrefix := strings.TrimSuffix(newPath, "/") + "/"
+	e.inoMu.Lock()
+	moves := make(map[string]uint64)
+	for p, ino := range e.inoByPath {
+		switch {
+		case p == oldPath:
+			moves[newPath] = ino
+			delete(e.inoByPath, p)
+		case strings.HasPrefix(p, oldPrefix):
+			moves[newPrefix+strings.TrimPrefix(p, oldPrefix)] = ino
+			delete(e.inoByPath, p)
+		}
+	}
+	for p, ino := range moves {
+		e.inoByPath[p] = ino
+	}
+	for p := range e.misses {
+		if p == oldPath || strings.HasPrefix(p, oldPrefix) {
+			delete(e.misses, p)
+		}
+	}
+	e.inoMu.Unlock()
+}
+
+// retargetLivePrefix moves the live-handle registry of a renamed path
+// (directory descendants included).
+func (e *Extent) retargetLivePrefix(oldPath, newPath string) {
+	oldPrefix := strings.TrimSuffix(oldPath, "/") + "/"
+	newPrefix := strings.TrimSuffix(newPath, "/") + "/"
+	e.liveMu.Lock()
+	moves := make(map[string]int)
+	for p, n := range e.live {
+		switch {
+		case p == oldPath:
+			moves[newPath] += n
+			delete(e.live, p)
+		case strings.HasPrefix(p, oldPrefix):
+			moves[newPrefix+strings.TrimPrefix(p, oldPrefix)] += n
+			delete(e.live, p)
+		}
+	}
+	if len(moves) > 0 && e.live == nil {
+		e.live = map[string]int{}
+	}
+	for p, n := range moves {
+		e.live[p] += n
+	}
+	e.liveMu.Unlock()
+}
+
 // retargetLive moves the open-handle registry with a renamed path.
 func (e *Extent) retargetLive(oldPath, newPath string) {
 	e.liveMu.Lock()
@@ -471,8 +526,22 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			if err := e.renameIno(ctx, op, ino); err != nil {
 				return fs.Result{}, err
 			}
+			e.migrateInoPrefix(op.Path, op.Path2)
+			e.retargetLivePrefix(op.Path, op.Path2)
 			return fs.Result{}, nil
 		}
+		// A directory (or an uncached file) moves on the plane below: the
+		// path→inode cache must follow the namespace, or a cached
+		// /d/f.db still resolved through a RECREATED empty /d and
+		// openExtent used the stale inode of an object that now lives at
+		// /moved/f.db.
+		res, err := next(ctx, op)
+		if err != nil {
+			return res, err
+		}
+		e.migrateInoPrefix(op.Path, op.Path2)
+		e.retargetLivePrefix(op.Path, op.Path2)
+		return fs.Result{}, nil
 
 	case fs.OpRead:
 		if op.Handle != nil || op.Fh != 0 {

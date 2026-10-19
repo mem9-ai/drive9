@@ -1367,7 +1367,9 @@ func (f *FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	start := time.Now()
 	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpLookup, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)})
+	f.recordHandleOp(fs.OpLookup, start, err, 0)
 	if err != nil {
 		// v1 cached the negative entry only for genuine misses; other
 		// failures must not poison the name for the negative TTL.
@@ -1659,9 +1661,11 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 	// attr TTL serves the pre-setattr values from the namespace cache.
 	f.inodes.UpdateMode(input.NodeId, res.Attr.Mode)
 	if input.Valid&gofuse.FATTR_MODE != 0 {
-		// A successful chmod updates ctime (v1): fillAttr derives ctime
-		// from mtime, so advance the entry clock with the applied mode.
-		f.inodes.UpdateMtime(input.NodeId, time.Now().Truncate(time.Second))
+		// A successful chmod advances ctime only (v1): bumping the entry
+		// mtime made a pure permission change look like a content change
+		// (backup/build tools re-copy on mtime) and clobbered an mtime the
+		// caller had just set in the same request.
+		f.inodes.UpdateCtime(input.NodeId, time.Now().Truncate(time.Second))
 	}
 	if input.Valid&gofuse.FATTR_SIZE != 0 {
 		f.inodes.UpdateSize(input.NodeId, res.Attr.Size)
@@ -1684,7 +1688,9 @@ func (f *FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, o
 	f.flushDeferredUnlink(child)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	start := time.Now()
 	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpMknod, Path: child, Mode: input.Mode, Rdev: input.Rdev, Ino: input.NodeId, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+	f.recordHandleOp(fs.OpMknod, start, err, 0)
 	if err != nil {
 		return fs.StatusOf(err)
 	}
@@ -1860,8 +1866,11 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	f.flushDeferredUnlink(newPath)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	if _, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpRename, Path: oldPath, Path2: newPath, Ino: input.NodeId, Ino2: input.Newdir, Kernel: input, Caller: fs.CallerFrom(input.InHeader)}); err != nil {
-		return fs.StatusOf(err)
+	start := time.Now()
+	_, rerr := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpRename, Path: oldPath, Path2: newPath, Ino: input.NodeId, Ino2: input.Newdir, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+	f.recordHandleOp(fs.OpRename, start, rerr, 0)
+	if rerr != nil {
+		return fs.StatusOf(rerr)
 	}
 	f.inodes.Rename(oldPath, newPath)
 	f.openIdx.RenamePathPrefix(oldPath, newPath)
@@ -2168,7 +2177,9 @@ func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string,
 	f.flushDeferredUnlink(child)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	start := time.Now()
 	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpCreate, Path: child, Flags: input.Flags, Mode: input.Mode & 0o7777, HasMode: true, Ino: input.NodeId, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+	f.recordHandleOp(fs.OpCreate, start, err, 0)
 	if err != nil {
 		return fs.StatusOf(err)
 	}
@@ -2271,7 +2282,9 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 			}
 		}
 	}
+	start := time.Now()
 	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpCreate, Path: path, Flags: input.Flags, Ino: input.NodeId, Kernel: input, Caller: caller})
+	f.recordHandleOp(fs.OpCreate, start, err, 0)
 	if err != nil {
 		return fs.StatusOf(err)
 	}
@@ -2320,7 +2333,9 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if h := f.openHandle(input.Fh); h != nil {
+		start := time.Now()
 		n, err := h.Read(ctx, int64(input.Offset), buf)
+		f.recordHandleOp(fs.OpRead, start, err, uint64(n))
 		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, fs.StatusOf(err)
 		}
@@ -2347,12 +2362,17 @@ func (f *FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []byte) (
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if h := f.openHandle(input.Fh); h != nil {
+		start := time.Now()
 		unlock := f.pathLocks.HandleLock(input.Fh)
 		err := h.Write(ctx, int64(input.Offset), data)
 		unlock()
+		f.recordHandleOp(fs.OpWrite, start, err, uint64(len(data)))
 		if err != nil {
 			return 0, fs.StatusOf(err)
 		}
+		// A successful data write retires explicit utimens times: the
+		// post-landing server mtime must govern again.
+		f.inodes.MarkDataMutation(input.NodeId)
 		// v1 writer-vs-attr (UpdateLength): publish a grown size at WRITE
 		// time so a GETATTR racing the close-time commit cannot pin the
 		// pre-write size for the attr TTL. Shrinks publish at their own
@@ -2383,6 +2403,7 @@ func (f *FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []byte) (
 	if st != gofuse.OK {
 		return 0, st
 	}
+	f.inodes.MarkDataMutation(input.NodeId)
 	if res.Written != 0 {
 		return res.Written, gofuse.OK
 	}
@@ -2400,8 +2421,10 @@ func (f *FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status 
 		// The kernel's lock owner rides the context: extent close-time
 		// F_UNLCK must target exactly this owner (dup + close of one
 		// descriptor), not whoever opened the handle.
+		start := time.Now()
 		err := h.Flush(fs.WithFlushOwner(ctx, input.LockOwner))
 		unlock()
+		f.recordHandleOp(fs.OpFlush, start, err, 0)
 		return fs.StatusOf(err)
 	}
 	path, _ := f.inodes.GetPath(input.NodeId)
@@ -2413,9 +2436,11 @@ func (f *FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.Status 
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if h := f.openHandle(input.Fh); h != nil {
+		start := time.Now()
 		unlock := f.pathLocks.HandleLock(input.Fh)
 		err := h.Sync(ctx)
 		unlock()
+		f.recordHandleOp(fs.OpFsync, start, err, 0)
 		return fs.StatusOf(err)
 	}
 	path, _ := f.inodes.GetPath(input.NodeId)
@@ -2431,11 +2456,14 @@ func (f *FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	}
 	if h, ok := f.handles.drop(input.Fh); ok {
 		f.openIdx.Remove(h)
+		var rerr error
+		start := time.Now()
 		if h.h != nil {
 			unlock := f.pathLocks.HandleLock(input.Fh)
-			_ = h.h.Release(ctx)
+			rerr = h.h.Release(ctx)
 			unlock()
 		}
+		f.recordHandleOp(fs.OpRelease, start, rerr, 0)
 		f.maybeRunDeferredUnlink(h.ino)
 		return
 	}
@@ -2712,7 +2740,11 @@ func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.D
 		// re-resolving against a table a mid-stream replacement may have
 		// already rewired (#918's per-listing fence).
 		if e.Ino == 0 {
-			e.Ino = f.inodes.EnsureInode(childPathOf(dh.path, e.Name), e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
+			// Identity-aware observe-only allocation: two hardlink rows
+			// sharing a ResourceID must land on one FUSE inode even on the
+			// first plain READDIR, or st_ino disagrees between aliases and
+			// the alias/kernel caches split.
+			e.Ino = f.inodes.EnsureInodeWithIdentity(childPathOf(dh.path, e.Name), e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
 			f.syncExtentRouting(e.Ino, e)
 		}
 		if !out.AddDirEntry(gofuse.DirEntry{Name: e.Name, Ino: e.Ino, Mode: modeBitsOf(e.Attr), Off: uint64(i + len(dots) + 1)}) {
@@ -2863,7 +2895,10 @@ func (f *FS) FsyncDir(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.Stat
 	path, _ := f.inodes.GetPath(input.NodeId)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	if _, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpFsync, Path: path, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader)}); err != nil {
+	start := time.Now()
+	_, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpFsync, Path: path, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+	f.recordHandleOp(fs.OpFsync, start, err, 0)
+	if err != nil {
 		if fs.StatusOf(err) == gofuse.Status(syscall.ENOSYS) {
 			return gofuse.OK // fsync on directories is advisory
 		}
@@ -3018,6 +3053,18 @@ func (f *FS) recordFuseOp(name string, st gofuse.Status, dur time.Duration, byte
 	if f.perf != nil {
 		f.perf.RecordFuseOpByName(name, st, dur, bytes)
 	}
+}
+
+// recordHandleOp times one handle fast-path call with the same counter the
+// chain dispatch of that op kind would feed: the fast path bypasses dispatch,
+// so a mounted buffered read/write/flush/fsync/release used to leave the FUSE
+// counters empty (remote rows only).
+func (f *FS) recordHandleOp(kind fs.OpKind, start time.Time, err error, bytes uint64) {
+	st := gofuse.OK
+	if err != nil {
+		st = fs.StatusOf(err)
+	}
+	f.recordFuseOp(kind.String(), st, time.Since(start), bytes)
 }
 
 // recordRemoteOp feeds the remote-op perf counters (v1 perfRecordRemote):
