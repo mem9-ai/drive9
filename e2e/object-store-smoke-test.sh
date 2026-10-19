@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Object-store CLI + mount smoke against a local MinIO (or an existing S3 URI).
+# Object-store CLI + mount smoke against a local object store (or an existing S3 URI).
 #
-# Does not need drive9-server. Starts MinIO via docker/podman unless
+# Does not need drive9-server. Starts object store via docker/podman unless
 # OBJECT_S3_URI is already set (then uses that URI and the process AWS env).
 #
 #   bash e2e/object-store-smoke-test.sh
@@ -11,6 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$REPO_ROOT/scripts/object-store-config.sh"
 CLI_SOURCE="${CLI_SOURCE:-build}"
 CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
 CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
@@ -19,16 +20,12 @@ OBJECT_STRICT_CROSS="${OBJECT_STRICT_CROSS:-$OBJECT_STRICT_MOUNT}"
 OBJECT_CMD_TIMEOUT_S="${OBJECT_CMD_TIMEOUT_S:-120}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-2}"
-MINIO_IMAGE="${MINIO_IMAGE:-${DRIVE9_MINIO_IMAGE:-minio/minio:RELEASE.2024-12-18T13-15-44Z}}"
-# The minio/minio image no longer exists upstream (the community edition went
-# source-only in 2025/2026 and its Docker Hub repository was removed), so the
-# maintained Chainguard build is the default pull source; set
-# DRIVE9_MINIO_FALLBACK_IMAGE empty to pin the chain to MINIO_IMAGE alone.
-MINIO_FALLBACK_IMAGE="${DRIVE9_MINIO_FALLBACK_IMAGE-cgr.dev/chainguard/minio:latest}"
-MINIO_PORT="${MINIO_PORT:-${DRIVE9_MINIO_PORT:-19000}}"
-MINIO_ROOT_USER="${MINIO_ROOT_USER:-${DRIVE9_MINIO_USER:-drive9minio}}"
-MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-${DRIVE9_MINIO_PASSWORD:-drive9minio}}"
-MINIO_BUCKET="${MINIO_BUCKET:-drive9-e2e}"
+DRIVE9_OBJECT_STORE_IMAGE="${DRIVE9_OBJECT_STORE_IMAGE:-$OBJECT_STORE_DEFAULT_IMAGE}"
+DRIVE9_OBJECT_STORE_FALLBACK_IMAGE="${DRIVE9_OBJECT_STORE_FALLBACK_IMAGE-}"
+DRIVE9_OBJECT_STORE_PORT="${DRIVE9_OBJECT_STORE_PORT:-19000}"
+OBJECT_STORE_ACCESS_KEY="${DRIVE9_OBJECT_STORE_ACCESS_KEY:-drive9local}"
+OBJECT_STORE_SECRET_KEY="${DRIVE9_OBJECT_STORE_SECRET_KEY:-drive9local}"
+DRIVE9_OBJECT_STORE_BUCKET="${DRIVE9_OBJECT_STORE_BUCKET:-drive9-e2e}"
 MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-30}"
 WRITEBACK_TIMEOUT_S="${WRITEBACK_TIMEOUT_S:-30}"
 
@@ -38,29 +35,29 @@ SKIP=0
 TOTAL=0
 CLI_BIN=""
 RUNTIME=""
-MINIO_CID=""
-MINIO_BIN=""
-MINIO_PID=""
+OBJECT_STORE_CID=""
+OBJECT_STORE_BIN=""
+OBJECT_STORE_PID=""
 MOUNT_POINT=""
 CACHE_DIR=""
 WORKDIR=""
 
-MINIO_IMAGE_CANDIDATES="$MINIO_IMAGE"
-if [ -n "$MINIO_FALLBACK_IMAGE" ] && [ "$MINIO_FALLBACK_IMAGE" != "$MINIO_IMAGE" ]; then
-  MINIO_IMAGE_CANDIDATES="$MINIO_IMAGE_CANDIDATES $MINIO_FALLBACK_IMAGE"
+OBJECT_STORE_IMAGE_CANDIDATES="$DRIVE9_OBJECT_STORE_IMAGE"
+if [ -n "$DRIVE9_OBJECT_STORE_FALLBACK_IMAGE" ] && [ "$DRIVE9_OBJECT_STORE_FALLBACK_IMAGE" != "$DRIVE9_OBJECT_STORE_IMAGE" ]; then
+  OBJECT_STORE_IMAGE_CANDIDATES="$OBJECT_STORE_IMAGE_CANDIDATES $DRIVE9_OBJECT_STORE_FALLBACK_IMAGE"
 fi
 # Seconds to wait for one candidate's health endpoint; overridable for
 # hermetic tests (a refused connection fails immediately; the deadline only
 # bounds a slow-answering candidate).
-MINIO_HEALTH_TIMEOUT_S="${MINIO_HEALTH_TIMEOUT_S:-40}"
+DRIVE9_OBJECT_STORE_HEALTH_TIMEOUT_S="${DRIVE9_OBJECT_STORE_HEALTH_TIMEOUT_S:-40}"
 # Per-probe bounds. Without them a server that accepts TCP but never answers
 # the health request would stall `curl` past any deadline: the overall
-# --max-time is what makes MINIO_HEALTH_TIMEOUT_S effective.
-MINIO_HEALTH_CONNECT_TIMEOUT_S="${MINIO_HEALTH_CONNECT_TIMEOUT_S:-2}"
-# One-shot reuse checks answer "is a MinIO already there?" with a single
+# --max-time is what makes DRIVE9_OBJECT_STORE_HEALTH_TIMEOUT_S effective.
+DRIVE9_OBJECT_STORE_HEALTH_CONNECT_TIMEOUT_S="${DRIVE9_OBJECT_STORE_HEALTH_CONNECT_TIMEOUT_S:-2}"
+# One-shot reuse checks answer "is an object store already there?" with a single
 # bounded probe — no retries — so a clean port costs nothing and a stalled
 # leftover server costs at most this many seconds.
-MINIO_HEALTH_PROBE_TIMEOUT_S="${MINIO_HEALTH_PROBE_TIMEOUT_S:-5}"
+DRIVE9_OBJECT_STORE_HEALTH_PROBE_TIMEOUT_S="${DRIVE9_OBJECT_STORE_HEALTH_PROBE_TIMEOUT_S:-5}"
 # curl treats --max-time 0 as "no limit", so every knob must be a positive
 # integer or the bounded-probe contract silently breaks. Invalid values fall
 # back to the defaults instead.
@@ -71,23 +68,23 @@ positive_int() {
   esac
 }
 while :; do
-  if positive_int "$MINIO_HEALTH_TIMEOUT_S"; then
+  if positive_int "$DRIVE9_OBJECT_STORE_HEALTH_TIMEOUT_S"; then
     :
   else
-    echo "warning: MINIO_HEALTH_TIMEOUT_S='$MINIO_HEALTH_TIMEOUT_S' is not a positive integer; using 40" >&2
-    MINIO_HEALTH_TIMEOUT_S=40
+    echo "warning: DRIVE9_OBJECT_STORE_HEALTH_TIMEOUT_S='$DRIVE9_OBJECT_STORE_HEALTH_TIMEOUT_S' is not a positive integer; using 40" >&2
+    DRIVE9_OBJECT_STORE_HEALTH_TIMEOUT_S=40
   fi
-  if positive_int "$MINIO_HEALTH_CONNECT_TIMEOUT_S"; then
+  if positive_int "$DRIVE9_OBJECT_STORE_HEALTH_CONNECT_TIMEOUT_S"; then
     :
   else
-    echo "warning: MINIO_HEALTH_CONNECT_TIMEOUT_S='$MINIO_HEALTH_CONNECT_TIMEOUT_S' is not a positive integer; using 2" >&2
-    MINIO_HEALTH_CONNECT_TIMEOUT_S=2
+    echo "warning: DRIVE9_OBJECT_STORE_HEALTH_CONNECT_TIMEOUT_S='$DRIVE9_OBJECT_STORE_HEALTH_CONNECT_TIMEOUT_S' is not a positive integer; using 2" >&2
+    DRIVE9_OBJECT_STORE_HEALTH_CONNECT_TIMEOUT_S=2
   fi
-  if positive_int "$MINIO_HEALTH_PROBE_TIMEOUT_S"; then
+  if positive_int "$DRIVE9_OBJECT_STORE_HEALTH_PROBE_TIMEOUT_S"; then
     :
   else
-    echo "warning: MINIO_HEALTH_PROBE_TIMEOUT_S='$MINIO_HEALTH_PROBE_TIMEOUT_S' is not a positive integer; using 5" >&2
-    MINIO_HEALTH_PROBE_TIMEOUT_S=5
+    echo "warning: DRIVE9_OBJECT_STORE_HEALTH_PROBE_TIMEOUT_S='$DRIVE9_OBJECT_STORE_HEALTH_PROBE_TIMEOUT_S' is not a positive integer; using 5" >&2
+    DRIVE9_OBJECT_STORE_HEALTH_PROBE_TIMEOUT_S=5
   fi
   break
 done
@@ -192,7 +189,7 @@ prepare_cli_binary() {
 
 drive9() {
   local bin_args=("$@")
-  # Native MinIO uses process AWS env. Server mint is not configured in this
+  # Native object store uses process AWS env. Server mint is not configured in this
   # smoke, so fs/mount object URIs always take --auth=local.
   case "${1:-}" in
     fs)
@@ -228,44 +225,28 @@ pick_runtime() {
   return 1
 }
 
-minio_arch() {
-  case "$(uname -m)" in
-    x86_64 | amd64) echo "linux-amd64" ;;
-    aarch64 | arm64) echo "linux-arm64" ;;
-    *) return 1 ;;
-  esac
-}
-
-ensure_minio_bin() {
-  if command -v minio >/dev/null 2>&1; then
-    MINIO_BIN="$(command -v minio)"
+ensure_object_store_bin() {
+  if command -v "$DRIVE9_OBJECT_STORE_BINARY" >/dev/null 2>&1; then
+    OBJECT_STORE_BIN="$(command -v "$DRIVE9_OBJECT_STORE_BINARY")"
     return 0
   fi
-  local arch
-  arch="$(minio_arch)" || return 1
-  MINIO_BIN="$WORKDIR/minio"
-  if [ -x "$MINIO_BIN" ]; then
-    return 0
-  fi
-  # MinIO discontinued community downloads: dl.min.io binary paths return 410
-  # since the community edition went source-only. Provide the binary via PATH,
-  # WORKDIR, or MINIO_DOWNLOAD_URL.
-  if [ -z "${MINIO_DOWNLOAD_URL:-}" ]; then
-    echo "no minio binary in PATH and upstream community downloads are discontinued; set MINIO_DOWNLOAD_URL or install minio"
+  OBJECT_STORE_BIN="$WORKDIR/object-store"
+  if [ -z "${DRIVE9_OBJECT_STORE_DOWNLOAD_URL:-}" ]; then
+    echo "no object-store binary; set DRIVE9_OBJECT_STORE_BINARY or DRIVE9_OBJECT_STORE_DOWNLOAD_URL"
     return 1
   fi
-  echo "fetching MinIO $arch from $MINIO_DOWNLOAD_URL to $MINIO_BIN"
-  curl -fsSL "$MINIO_DOWNLOAD_URL" -o "$MINIO_BIN"
-  chmod +x "$MINIO_BIN"
+  curl -fsSL "$DRIVE9_OBJECT_STORE_DOWNLOAD_URL" -o "$OBJECT_STORE_BIN" || return 1
+  chmod +x "$OBJECT_STORE_BIN"
 }
 
-start_minio_bin() {
-  ensure_minio_bin || return 1
-  local data="$WORKDIR/minio-data"
+start_object_store_bin() {
+  ensure_object_store_bin || return 1
+  local data="$WORKDIR/object-store-data"
   mkdir -p "$data"
-  MINIO_ROOT_USER="$MINIO_ROOT_USER" MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
-    "$MINIO_BIN" server "$data" --address "127.0.0.1:${MINIO_PORT}" >"$WORKDIR/minio.log" 2>&1 &
-  MINIO_PID=$!
+  RUSTFS_ACCESS_KEY="$OBJECT_STORE_ACCESS_KEY" RUSTFS_SECRET_KEY="$OBJECT_STORE_SECRET_KEY" \
+  MINIO_ROOT_USER="$OBJECT_STORE_ACCESS_KEY" MINIO_ROOT_PASSWORD="$OBJECT_STORE_SECRET_KEY" \
+    "$OBJECT_STORE_BIN" server "$data" --address "127.0.0.1:${DRIVE9_OBJECT_STORE_PORT}" >"$WORKDIR/object-store.log" 2>&1 &
+  OBJECT_STORE_PID=$!
 }
 
 # probe_health is a single bounded probe for reuse detection: it answers
@@ -273,7 +254,7 @@ start_minio_bin() {
 # on a stalled server. Retry-until-deadline semantics belong to wait_health,
 # which is only for a process this script just started.
 probe_health() {
-  curl -sf --connect-timeout "$MINIO_HEALTH_CONNECT_TIMEOUT_S" --max-time "$MINIO_HEALTH_PROBE_TIMEOUT_S" "$1" >/dev/null 2>&1
+  curl -sf --connect-timeout "$DRIVE9_OBJECT_STORE_HEALTH_CONNECT_TIMEOUT_S" --max-time "$DRIVE9_OBJECT_STORE_HEALTH_PROBE_TIMEOUT_S" "$1" >/dev/null 2>&1
 }
 
 wait_health() {
@@ -281,14 +262,14 @@ wait_health() {
   # server that accepts TCP but stalls the HTTP response cannot hang past the
   # deadline (the probe's --max-time is the seconds the wait has left).
   local url="$1"
-  local deadline=$(($(date +%s) + MINIO_HEALTH_TIMEOUT_S))
+  local deadline=$(($(date +%s) + DRIVE9_OBJECT_STORE_HEALTH_TIMEOUT_S))
   local remaining
   while :; do
     remaining=$((deadline - $(date +%s)))
     if [ "$remaining" -le 0 ]; then
       return 1
     fi
-    if curl -sf --connect-timeout "$MINIO_HEALTH_CONNECT_TIMEOUT_S" --max-time "$remaining" "$url" >/dev/null 2>&1; then
+    if curl -sf --connect-timeout "$DRIVE9_OBJECT_STORE_HEALTH_CONNECT_TIMEOUT_S" --max-time "$remaining" "$url" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.4
@@ -411,12 +392,12 @@ cleanup() {
       fusermount -u "$MOUNT_POINT" >/dev/null 2>&1 || true
     fi
   fi
-  if [ -n "${MINIO_CID:-}" ] && [ -n "${RUNTIME:-}" ]; then
-    "$RUNTIME" rm -f "$MINIO_CID" >/dev/null 2>&1 || true
+  if [ -n "${OBJECT_STORE_CID:-}" ] && [ -n "${RUNTIME:-}" ]; then
+    "$RUNTIME" rm -f "$OBJECT_STORE_CID" >/dev/null 2>&1 || true
   fi
-  if [ -n "${MINIO_PID:-}" ]; then
-    kill "$MINIO_PID" >/dev/null 2>&1 || true
-    wait "$MINIO_PID" >/dev/null 2>&1 || true
+  if [ -n "${OBJECT_STORE_PID:-}" ]; then
+    kill "$OBJECT_STORE_PID" >/dev/null 2>&1 || true
+    wait "$OBJECT_STORE_PID" >/dev/null 2>&1 || true
   fi
   if [ -n "${CLI_BIN:-}" ]; then
     rm -f "$CLI_BIN"
@@ -463,16 +444,16 @@ if [ -n "${OBJECT_S3_URI:-}" ]; then
     OBJ_QUERY="?${OBJECT_S3_URI#*\?}"
   fi
 else
-  export AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER"
-  export AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD"
+  export AWS_ACCESS_KEY_ID="$OBJECT_STORE_ACCESS_KEY"
+  export AWS_SECRET_ACCESS_KEY="$OBJECT_STORE_SECRET_KEY"
   export AWS_REGION="${AWS_REGION:-us-east-1}"
   export AWS_DEFAULT_REGION="$AWS_REGION"
 
-  if probe_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"; then
-    echo "reusing MinIO on :$MINIO_PORT"
+  if probe_health "http://127.0.0.1:${DRIVE9_OBJECT_STORE_PORT}${DRIVE9_OBJECT_STORE_HEALTH_PATH}"; then
+    echo "reusing object store on :$DRIVE9_OBJECT_STORE_PORT"
   elif pick_runtime; then
-    echo "starting MinIO with $RUNTIME on :$MINIO_PORT"
-    MINIO_CID="drive9-e2e-minio-$$"
+    echo "starting object store with $RUNTIME on :$DRIVE9_OBJECT_STORE_PORT"
+    OBJECT_STORE_CID="drive9-e2e-object-store-$$"
     # A candidate is accepted only when its container actually turns healthy:
     # `run -d` succeeding says nothing about the server inside (entrypoint or
     # platform mismatches exit right after start). An unhealthy candidate is
@@ -481,60 +462,62 @@ else
     # pre-existing same-name container that is not healthy.
     container_started=""
     image=""
-    for image in $MINIO_IMAGE_CANDIDATES; do
-      if "$RUNTIME" inspect "$MINIO_CID" >/dev/null 2>&1; then
-        if [ "$("$RUNTIME" inspect -f '{{.State.Running}}' "$MINIO_CID" 2>/dev/null)" != "true" ]; then
-          "$RUNTIME" start "$MINIO_CID" >/dev/null 2>&1 || true
+    for image in $OBJECT_STORE_IMAGE_CANDIDATES; do
+      if "$RUNTIME" inspect "$OBJECT_STORE_CID" >/dev/null 2>&1; then
+        if [ "$("$RUNTIME" inspect -f '{{.State.Running}}' "$OBJECT_STORE_CID" 2>/dev/null)" != "true" ]; then
+          "$RUNTIME" start "$OBJECT_STORE_CID" >/dev/null 2>&1 || true
         fi
-        if wait_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"; then
+        if wait_health "http://127.0.0.1:${DRIVE9_OBJECT_STORE_PORT}${DRIVE9_OBJECT_STORE_HEALTH_PATH}"; then
           container_started=1
           break
         fi
-        echo "MinIO container ($image via $RUNTIME) is not healthy; removing and trying the next candidate"
-        "$RUNTIME" logs "$MINIO_CID" 2>&1 | tail -5 || true
-        "$RUNTIME" rm -f "$MINIO_CID" >/dev/null 2>&1 || true
+        echo "object store container ($image via $RUNTIME) is not healthy; removing and trying the next candidate"
+        "$RUNTIME" logs "$OBJECT_STORE_CID" 2>&1 | tail -5 || true
+        "$RUNTIME" rm -f "$OBJECT_STORE_CID" >/dev/null 2>&1 || true
         continue
       fi
-      if "$RUNTIME" run -d --name "$MINIO_CID" \
-        -p "${MINIO_PORT}:9000" \
-        -e "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
-        -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
+      if "$RUNTIME" run -d --name "$OBJECT_STORE_CID" \
+        -p "${DRIVE9_OBJECT_STORE_PORT}:9000" \
+        -e "RUSTFS_ACCESS_KEY=${OBJECT_STORE_ACCESS_KEY}" \
+        -e "RUSTFS_SECRET_KEY=${OBJECT_STORE_SECRET_KEY}" \
+        -e "MINIO_ROOT_USER=${OBJECT_STORE_ACCESS_KEY}" \
+        -e "MINIO_ROOT_PASSWORD=${OBJECT_STORE_SECRET_KEY}" \
         "$image" server /data >/dev/null 2>&1 \
-        && wait_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"; then
+        && wait_health "http://127.0.0.1:${DRIVE9_OBJECT_STORE_PORT}${DRIVE9_OBJECT_STORE_HEALTH_PATH}"; then
         container_started=1
         break
       fi
-      echo "MinIO image $image did not become healthy via $RUNTIME; trying the next candidate"
-      "$RUNTIME" logs "$MINIO_CID" 2>&1 | tail -5 || true
-      "$RUNTIME" rm -f "$MINIO_CID" >/dev/null 2>&1 || true
+      echo "object store image $image did not become healthy via $RUNTIME; trying the next candidate"
+      "$RUNTIME" logs "$OBJECT_STORE_CID" 2>&1 | tail -5 || true
+      "$RUNTIME" rm -f "$OBJECT_STORE_CID" >/dev/null 2>&1 || true
     done
     if [ -z "$container_started" ]; then
-      echo "no MinIO image became healthy; falling back to the MinIO binary"
-      if ! start_minio_bin; then
-        echo "FAIL need docker, podman, or a minio binary (or set OBJECT_S3_URI)"
+      echo "no object store image became healthy; falling back to the object store binary"
+      if ! start_object_store_bin; then
+        echo "FAIL need docker, podman, or an object-store binary (or set OBJECT_S3_URI)"
         exit 1
       fi
     fi
   else
-    echo "no docker/podman; starting MinIO binary on 127.0.0.1:${MINIO_PORT}"
-    if ! start_minio_bin; then
-      echo "FAIL need docker, podman, or a minio binary (or set OBJECT_S3_URI)"
+    echo "no docker/podman; starting object store binary on 127.0.0.1:${DRIVE9_OBJECT_STORE_PORT}"
+    if ! start_object_store_bin; then
+      echo "FAIL need docker, podman, or an object-store binary (or set OBJECT_S3_URI)"
       exit 1
     fi
   fi
-  check_cmd "MinIO health" wait_health "http://127.0.0.1:${MINIO_PORT}/minio/health/live"
-  check_cmd "create MinIO bucket $MINIO_BUCKET" create_bucket "127.0.0.1:${MINIO_PORT}" "$MINIO_BUCKET"
+  check_cmd "object store health" wait_health "http://127.0.0.1:${DRIVE9_OBJECT_STORE_PORT}${DRIVE9_OBJECT_STORE_HEALTH_PATH}"
+  check_cmd "create object store bucket $DRIVE9_OBJECT_STORE_BUCKET" create_bucket "127.0.0.1:${DRIVE9_OBJECT_STORE_PORT}" "$DRIVE9_OBJECT_STORE_BUCKET"
 
   if [ "${OBJECT_BOOTSTRAP_ONLY:-0}" = "1" ]; then
-    # Hermetic hook for scripts/test-minio-bootstrap.sh: with a fake runtime
-    # on PATH, run only the MinIO provisioning above and stop before any CLI
+    # Hermetic hook for scripts/test-object-store-bootstrap.sh: with a fake runtime
+    # on PATH, run only the object store provisioning above and stop before any CLI
     # work.
-    echo "bootstrap-only: MinIO provisioning finished"
+    echo "bootstrap-only: object store provisioning finished"
     exit 0
   fi
 
-  OBJ_BASE="s3://${MINIO_BUCKET}/${PREFIX}"
-  OBJ_QUERY="?region=${AWS_REGION}&endpoint=$(urlencode "http://127.0.0.1:${MINIO_PORT}")&forcePathStyle=true"
+  OBJ_BASE="s3://${DRIVE9_OBJECT_STORE_BUCKET}/${PREFIX}"
+  OBJ_QUERY="?region=${AWS_REGION}&endpoint=$(urlencode "http://127.0.0.1:${DRIVE9_OBJECT_STORE_PORT}")&forcePathStyle=true"
 fi
 
 echo "OBJ_BASE=$OBJ_BASE"
@@ -600,7 +583,7 @@ check_cmd_fail "grep rejected on object URI" drive9 fs grep hello "$(obj "")"
 check_cmd_fail "symlink rejected on object URI" drive9 fs symlink "$(obj hello.txt)" "$(obj link)"
 check_cmd_fail "hardlink rejected on object URI" drive9 fs hardlink "$(obj hello.txt)" "$(obj hard)"
 check_cmd_fail "cross-scheme mv rejected" drive9 fs mv "$(obj hello.txt)" "$WORKDIR/local-mv.txt"
-check_cmd_fail "s3:// never becomes a local file named s3" test -e "s3://${MINIO_BUCKET:-bucket}/${PREFIX}/hello.txt"
+check_cmd_fail "s3:// never becomes a local file named s3" test -e "s3://${DRIVE9_OBJECT_STORE_BUCKET:-bucket}/${PREFIX}/hello.txt"
 
 # --- rm ---
 check_cmd "fs rm file" drive9 fs rm "$(obj hello.moved)"

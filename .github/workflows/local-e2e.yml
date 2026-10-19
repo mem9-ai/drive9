@@ -173,6 +173,7 @@ env:
   DRIVE9_META_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
   DRIVE9_LOCAL_MYSQL_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
   DRIVE9_LOCAL_EMBEDDING_MODE: app
+  DRIVE9_S3_BACKEND: s3
   RUN_SEMANTIC_CHECKS: "0"
   RUN_CLI_SEMANTIC_CHECKS: "0"
   RUN_FUSE_CONCURRENCY_STRESS: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_concurrency_stress) || '0') }}
@@ -266,6 +267,19 @@ jobs:
           echo "TiDB playground did not become ready in time" >&2
           cat /tmp/tidb-sql-ready.log >&2 || true
           exit 1
+
+      - name: Start local object store
+        run: |
+          s3_env=$(bash scripts/local-object-store.sh apply)
+          eval "$s3_env"
+          python3 - <<'PY'
+          import os
+          names = ('DIR', 'BUCKET', 'REGION', 'ENDPOINT', 'FORCE_PATH_STYLE', 'ACCESS_KEY_ID', 'SECRET_ACCESS_KEY')
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              for suffix in names:
+                  name = 'DRIVE9_S3_' + suffix
+                  output.write(name + '=' + os.environ.get(name, '') + '\n')
+          PY
 
       - name: Start drive9-server
         run: |
@@ -653,6 +667,10 @@ jobs:
           if [ -f /tmp/tiup-playground.pid ]; then
             kill "$(cat /tmp/tiup-playground.pid)" || true
           fi
+
+      - name: Stop local object store
+        if: always()
+        run: bash scripts/local-object-store.sh stop
 
       - name: Enforce smoke results
         if: always()

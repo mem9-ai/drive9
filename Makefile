@@ -85,7 +85,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-race test-failpoint test-podman test-minio-bootstrap fmt lint install-lint gitleaks install-gitleaks test-gitleaks-fail-closed test-gitleaks-scan-coverage build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
+.PHONY: mod test test-race test-failpoint test-podman test-object-store-bootstrap test-minio-bootstrap fmt lint install-lint gitleaks install-gitleaks test-gitleaks-fail-closed test-gitleaks-scan-coverage build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
@@ -132,10 +132,13 @@ test-race:
 test-failpoint:
 	./scripts/run_failpoint_tests.py
 
-# Hermetic MinIO bootstrap regression (fake container runtime + real local
+# Hermetic object store bootstrap regression (fake container runtime + real local
 # health probes); no docker/podman required.
-test-minio-bootstrap:
-	bash scripts/test-minio-bootstrap.sh
+test-object-store-bootstrap:
+	bash scripts/test-object-store-bootstrap.sh
+
+# Deprecated compatibility alias.
+test-minio-bootstrap: test-object-store-bootstrap
 
 fmt:
 	$(MAKE) install-lint
@@ -215,15 +218,15 @@ build-server:
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -tags "$(GO_TAGS)" -ldflags "$(BUILDINFO_LDFLAGS)" -o $(SERVER_BIN) ./cmd/drive9-server
 
 # Local server (provider=local). Object store:
-#   DRIVE9_S3_BACKEND=auto (default) — real MinIO via scripts/local-minio.sh, else filesystem mock
-#   DRIVE9_S3_BACKEND=minio|mock     — require MinIO, or force the mock
+#   DRIVE9_S3_BACKEND=auto (default) — real object store via scripts/local-object-store.sh, else filesystem mock
+#   DRIVE9_S3_BACKEND=s3|mock     — require object store, or force the mock
 #   DRIVE9_S3_BUCKET already set     — skip bootstrap (use that bucket)
-#   bash scripts/local-minio.sh stop — tear down the named local MinIO
+#   bash scripts/local-object-store.sh stop — tear down the named local object store
 run-server-local: build-server
 	@set -euo pipefail; \
 	export DRIVE9_TENANT_PROVIDER="$${DRIVE9_TENANT_PROVIDER:-local}"; \
 	export DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS="$${DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS:-1}"; \
-	s3_env="$$(bash scripts/local-minio.sh apply)"; \
+	s3_env="$$(bash scripts/local-object-store.sh apply)"; \
 	eval "$$s3_env"; \
 	exec "./$(SERVER_BIN)"
 
@@ -234,7 +237,7 @@ run-server-local: build-server
 #   RUN_API_ONLY=1 make e2e-local
 #   RUN_FUSE_SMOKE=0 make e2e-local
 #   FUSE_PROFILE=coding-agent-extent make e2e-local
-#   DRIVE9_S3_BACKEND=minio make e2e-local
+#   DRIVE9_S3_BACKEND=s3 make e2e-local
 #   DRIVE9_S3_BACKEND=mock make e2e-local
 e2e-local:
 	bash scripts/e2e-local.sh $(E2E_LOCAL_ARGS)
