@@ -197,13 +197,19 @@ func (e *Extent) trackLiveHandle(h *extentHandle) {
 }
 
 // untrackLiveHandle retires an open descriptor: the caller's CURRENT path
-// (a rename may have moved it) keys the count.
+// (a rename may have moved it) keys the count. The path is read under the
+// handle's own mutex, and the registry mutex is held across it, matching
+// retargetLivePrefix's order (liveMu -> h.mu): a rename and the last
+// Release can no longer split the count from the path.
 func (e *Extent) untrackLiveHandle(h *extentHandle) {
 	e.liveMu.Lock()
-	if e.live[h.path] <= 1 {
-		delete(e.live, h.path)
+	h.mu.Lock()
+	p := h.path
+	h.mu.Unlock()
+	if e.live[p] <= 1 {
+		delete(e.live, p)
 	} else {
-		e.live[h.path]--
+		e.live[p]--
 	}
 	delete(e.liveHandles, h)
 	e.liveMu.Unlock()
@@ -258,11 +264,39 @@ func (e *Extent) migrateInoPrefix(oldPath, newPath string) {
 }
 
 // retargetLivePrefix moves the live-handle registry of a renamed path
-// (directory descendants included).
+// (directory descendants included). The count move and the descriptor's own
+// path update happen in ONE critical section (liveMu, then each h.mu) so a
+// concurrent last Release either untracks the old key before the migration
+// or the new key after it — never the old key in between.
 func (e *Extent) retargetLivePrefix(oldPath, newPath string) {
 	oldPrefix := strings.TrimSuffix(oldPath, "/") + "/"
 	newPrefix := strings.TrimSuffix(newPath, "/") + "/"
 	e.liveMu.Lock()
+	if e.live == nil {
+		e.live = map[string]int{}
+	}
+	for h := range e.liveHandles {
+		h.mu.Lock()
+		p := h.path
+		moved := ""
+		switch {
+		case p == oldPath:
+			moved = newPath
+		case strings.HasPrefix(p, oldPrefix):
+			moved = newPrefix + strings.TrimPrefix(p, oldPrefix)
+		}
+		if moved != "" && moved != p {
+			if e.live[p] <= 1 {
+				delete(e.live, p)
+			} else {
+				e.live[p]--
+			}
+			e.live[moved]++
+			h.path = moved
+		}
+		h.mu.Unlock()
+	}
+	// Path-only counts (handles registered without a descriptor) follow.
 	moves := make(map[string]int)
 	for p, n := range e.live {
 		switch {
@@ -274,41 +308,8 @@ func (e *Extent) retargetLivePrefix(oldPath, newPath string) {
 			delete(e.live, p)
 		}
 	}
-	if len(moves) > 0 && e.live == nil {
-		e.live = map[string]int{}
-	}
 	for p, n := range moves {
 		e.live[p] += n
-	}
-	// Keep every open descriptor's own path in step with the registry: its
-	// Release untracks by h.path under the handle lock.
-	var retargeted []*extentHandle
-	for h := range e.liveHandles {
-		retargeted = append(retargeted, h)
-	}
-	e.liveMu.Unlock()
-	for _, h := range retargeted {
-		h.mu.Lock()
-		p := h.path
-		switch {
-		case p == oldPath:
-			h.path = newPath
-		case strings.HasPrefix(p, oldPrefix):
-			h.path = newPrefix + strings.TrimPrefix(p, oldPrefix)
-		}
-		h.mu.Unlock()
-	}
-}
-
-// retargetLive moves the open-handle registry with a renamed path.
-func (e *Extent) retargetLive(oldPath, newPath string) {
-	e.liveMu.Lock()
-	if n := e.live[oldPath]; n > 0 {
-		delete(e.live, oldPath)
-		if e.live == nil {
-			e.live = map[string]int{}
-		}
-		e.live[newPath] += n
 	}
 	e.liveMu.Unlock()
 }

@@ -373,7 +373,7 @@ func TestPortInoAndMissBookkeeping(t *testing.T) {
 	}
 
 	e.trackLive("/a")
-	e.retargetLive("/a", "/b")
+	e.retargetLivePrefix("/a", "/b")
 	if e.hasLive("/a") || !e.hasLive("/b") {
 		t.Fatal("retargetLive must move the open-handle marker")
 	}

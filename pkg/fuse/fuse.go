@@ -1034,6 +1034,11 @@ type dirHandle struct {
 	ino       uint64
 	attr      fs.Attr
 	entries   []fs.Entry // stable snapshot for one enumeration sequence
+
+	// stale records a reset that could not take the read token: the next
+	// enumeration (which holds it) must drop the snapshot.
+	staleMu sync.Mutex
+	stale   bool
 }
 
 // resetEntries drops the enumeration snapshot. A page in flight keeps its
@@ -1042,10 +1047,26 @@ type dirHandle struct {
 // the next enumeration refetches.
 func (dh *dirHandle) resetEntries() {
 	if !dh.tryLockRead() {
+		// The page in flight will release the token after this reset
+		// passed; without a durable mark the (possibly already installed)
+		// snapshot would survive until closedir.
+		dh.staleMu.Lock()
+		dh.stale = true
+		dh.staleMu.Unlock()
 		return
 	}
 	dh.entries = nil
 	dh.unlockRead()
+}
+
+// takeStale reports and clears a reset that arrived while the handle was
+// busy; callers hold the read token.
+func (dh *dirHandle) takeStale() bool {
+	dh.staleMu.Lock()
+	stale := dh.stale
+	dh.stale = false
+	dh.staleMu.Unlock()
+	return stale
 }
 
 // tryLockRead is lockRead without blocking.
@@ -2157,21 +2178,39 @@ func (f *FS) checkAncestorSearch(ctx context.Context, path string, caller fs.Cal
 	}
 	dir := parentDirOf(path)
 	for {
-		res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: dir, Caller: caller})
-		if err != nil {
-			if fs.IsNotFound(err) {
-				return gofuse.ENOENT
-			}
-			return fs.StatusOf(err)
-		}
-		if res.Attr == nil {
-			return gofuse.EIO
-		}
+		// A mount-local chown/chmod records the new owner on the inode
+		// entry; a remote stat does not carry it (the server still has the
+		// old owner), so the entry is authoritative when it has one.
 		uid, gid := f.uid, f.gid
-		if res.Attr.HasOwner {
-			uid, gid = res.Attr.Uid, res.Attr.Gid
+		mode := uint32(0o755)
+		known := false
+		if ino, iok := f.inodes.GetInode(dir); iok {
+			if entry, eok := f.inodes.GetEntry(ino); eok {
+				if entry.HasUID && entry.HasGID {
+					uid, gid = entry.Uid, entry.Gid
+				}
+				if entry.HasMode {
+					mode, known = entry.Mode&0o777, true
+				}
+			}
 		}
-		if !hasPOSIXAccess(caller, uid, gid, res.Attr.Mode&0o777, 0b001) {
+		if !known {
+			res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: dir, Caller: caller})
+			if err != nil {
+				if fs.IsNotFound(err) {
+					return gofuse.ENOENT
+				}
+				return fs.StatusOf(err)
+			}
+			if res.Attr == nil {
+				return gofuse.EIO
+			}
+			if res.Attr.HasOwner {
+				uid, gid = res.Attr.Uid, res.Attr.Gid
+			}
+			mode = res.Attr.Mode & 0o777
+		}
+		if !hasPOSIXAccess(caller, uid, gid, mode, 0b001) {
 			return gofuse.EACCES
 		}
 		if dir == "/" {
@@ -2768,7 +2807,19 @@ func (f *FS) loadDirEntries(cancel <-chan struct{}, input *gofuse.ReadIn, dh *di
 				if ci.IsDir {
 					kind = fs.KindDir
 				}
-				entries = append(entries, fs.Entry{Name: ci.Name, Attr: fs.Attr{Kind: kind, Mode: ci.Mode, Size: ci.Size, Mtime: ci.Mtime, Nlink: ci.Nlink}})
+				entries = append(entries, fs.Entry{Name: ci.Name, Attr: fs.Attr{
+					Kind: kind, Mode: ci.Mode, Size: ci.Size, Mtime: ci.Mtime, Nlink: ci.Nlink,
+					// The row was written with the server identity; dropping
+					// it here split hardlinked aliases (ResourceID), cleared
+					// extent routing (ExtentIno) and published stale revs
+					// (Rev) on cached READDIRPLUS.
+					Rev:        ci.Rev,
+					ResourceID: ci.ResourceID,
+					ExtentIno:  ci.ExtentIno,
+					Uid:        ci.Uid,
+					Gid:        ci.Gid,
+					HasOwner:   ci.HasUID || ci.HasGID,
+				}})
 			}
 			dh.entries = entries
 			return gofuse.OK
@@ -2825,6 +2876,9 @@ func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.D
 		return gofuse.EINTR
 	}
 	defer dh.unlockRead()
+	if dh.takeStale() {
+		dh.entries = nil
+	}
 	if dh.entries == nil || (f.gvisorCompat && input.Offset == 0) {
 		// gVisor rewinds one host FD: treat offset-zero as a new
 		// enumeration sequence and refetch (v1 loadDirHandleEntriesForRead
@@ -2908,6 +2962,9 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		return gofuse.EINTR
 	}
 	defer dh.unlockRead()
+	if dh.takeStale() {
+		dh.entries = nil
+	}
 	if dh.entries == nil || (f.gvisorCompat && input.Offset == 0) {
 		if f.gvisorCompat && input.Offset == 0 && f.Ctx.DirCache != nil {
 			f.Ctx.DirCache.Invalidate(dh.path)

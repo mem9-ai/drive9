@@ -101,7 +101,7 @@ func (e *Extent) renameIno(ctx context.Context, op *fs.Op, ino uint64) error {
 	e.forgetIno(op.Path)
 	e.forgetIno(op.Path2)
 	e.rememberExtentIno(op.Path2, ino)
-	e.retargetLive(op.Path, op.Path2)
+	e.retargetLivePrefix(op.Path, op.Path2)
 	return nil
 }
 

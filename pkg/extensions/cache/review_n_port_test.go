@@ -104,3 +104,51 @@ type terminalFunc func(context.Context, *fs.Op) (fs.Result, error)
 func (f terminalFunc) Do(ctx context.Context, op *fs.Op, _ fs.Next) (fs.Result, error) {
 	return f(ctx, op)
 }
+
+// gatedHandle blocks its Read until released (a fetch racing a reset).
+type gatedHandle struct {
+	gate    chan struct{}
+	release chan struct{}
+	data    []byte
+	closed  bool
+}
+
+func (g *gatedHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	if !g.closed {
+		g.closed = true
+		close(g.gate)
+	}
+	<-g.release
+	n := copy(dest, g.data[off:])
+	if int64(off)+int64(n) < int64(len(g.data)) {
+		return n, nil
+	}
+	return n, nil
+}
+func (g *gatedHandle) Write(ctx context.Context, off int64, data []byte) error { return nil }
+func (g *gatedHandle) Sync(ctx context.Context) error                          { return nil }
+func (g *gatedHandle) Flush(ctx context.Context) error                         { return nil }
+func (g *gatedHandle) Release(ctx context.Context) error                       { return nil }
+
+// The handle-level whole-file admission carries the same reset fence as the
+// path-addressed branch: a fetch that raced a checkout is not cached.
+func TestPortCheckoutFencesHandleReadAdmission(t *testing.T) {
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gh := &gatedHandle{gate: make(chan struct{}), release: make(chan struct{}), data: []byte("OLDOLD00")}
+	h := &cachingHandle{cache: c, inner: gh, path: "/f", rev: 7, size: 8}
+	done := make(chan struct{})
+	go func() {
+		_, _ = h.Read(context.Background(), 0, make([]byte, 8))
+		close(done)
+	}()
+	<-gh.gate
+	c.invalidateAllTiers()
+	close(gh.release)
+	<-done
+	if _, ok := c.ReadCached("/f", 7); ok {
+		t.Fatal("pre-reset bytes admitted into the read cache from a handle read")
+	}
+}

@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -123,9 +124,11 @@ type Core struct {
 	// readFlight dedups concurrent remote reads of one range:
 	// thundering-herd FUSE reads on an uncached file collapse into a
 	// single HTTP fetch.
-	// bus announces view resets (401) to the facade.
-	bus        *fs.EventBus
-	readFlight *singleflight.SingleFlight
+	// bus announces view resets (401) to the facade; resetPending coalesces
+	// a burst of 401s into one asynchronous reset.
+	bus          *fs.EventBus
+	resetPending atomic.Bool
+	readFlight   *singleflight.SingleFlight
 	// readSlots bounds concurrent remote reads (default 24).
 	readSlots chan struct{}
 
@@ -192,11 +195,20 @@ func (c *Core) AttachEvents(bus *fs.EventBus) {
 
 // mapErr folds backend failures into fs identities, announcing a view
 // reset on 401.
+//
+// The announcement runs on its OWN goroutine: a 401 surfaces inside a data
+// plane that may hold its own handle lock (a buffered overwrite's base
+// preload reaches SyncHandle.Read under the writeback handle mutex), and
+// the checkout subscribers take that same lock — a synchronous broadcast
+// self-deadlocked. Coalesced so a burst of 401s emits one reset.
 func (c *Core) mapErr(err error) error {
 	if err != nil && c.bus != nil {
 		var se *client.StatusError
-		if errors.As(err, &se) && se.StatusCode == http.StatusUnauthorized {
-			c.bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+		if errors.As(err, &se) && se.StatusCode == http.StatusUnauthorized && c.resetPending.CompareAndSwap(false, true) {
+			go func() {
+				defer c.resetPending.Store(false)
+				c.bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+			}()
 		}
 	}
 	return mapErr(err)
@@ -593,7 +605,11 @@ func (c *Core) statFromNamespaceCache(path string) (*fs.Attr, bool) {
 		}
 		return &fs.Attr{Kind: itemKind, Mode: mode, Size: item.Size, Rev: item.Rev, Mtime: item.Mtime,
 			Nlink: item.Nlink, ResourceID: item.ResourceID,
-			Uid: item.Uid, Gid: item.Gid, HasOwner: item.HasUID || item.HasGID}, true
+			// The extent plane routes by the ExtentIno a LOOKUP replies
+			// with; projecting the cached row without it sent an extent
+			// file's open to the ordinary HTTP data plane (422 there).
+			ExtentIno: item.ExtentIno,
+			Uid:       item.Uid, Gid: item.Gid, HasOwner: item.HasUID || item.HasGID}, true
 	case fs.LookupNegative, fs.LookupCompleteMiss, fs.LookupSessionMiss:
 		return nil, true // known absent: ENOENT without a remote stat
 	}

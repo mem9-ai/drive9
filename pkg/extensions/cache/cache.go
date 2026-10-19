@@ -479,10 +479,16 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 			}
 		}
 		whole := make([]byte, h.size)
+		epoch := h.cache.epoch.Load()
 		if n, err := h.inner.Read(ctx, 0, whole); err == nil && int64(n) == h.size {
-			h.cache.mem.PutOwned(path, whole, h.rev)
-			if h.cache.dsk != nil {
-				h.cache.dsk.PutAsync(key, whole)
+			// A checkout may have replaced the view while this fetch was
+			// in flight: its bytes describe the OLD view and must not be
+			// admitted (the OpRead path already carries this fence).
+			if h.cache.epoch.Load() == epoch {
+				h.cache.mem.PutOwned(path, whole, h.rev)
+				if h.cache.dsk != nil {
+					h.cache.dsk.PutAsync(key, whole)
+				}
 			}
 			return copyReadRange(dest, whole, off), nil
 		}
@@ -494,13 +500,14 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 			n := copy(dest, data)
 			return n, nil
 		}
+		epoch := h.cache.epoch.Load()
 		n, err := h.inner.Read(ctx, off, dest)
 		// Admission proves the COMPLETE image was read (n == the file
 		// size), not merely that the request buffer filled: caching a
 		// 4096-byte prefix of an 8MiB file under the whole-file key made
 		// the next larger read serve a premature EOF.
 		if err == nil && int64(n) == int64(len(dest)) && h.size > 0 && int64(n) == h.size &&
-			h.cache.admits(dest[:n]) && h.rev > 0 {
+			h.cache.admits(dest[:n]) && h.rev > 0 && h.cache.epoch.Load() == epoch {
 			h.cache.mem.PutOwned(path, append([]byte(nil), dest[:n]...), h.rev)
 		}
 		return n, err
@@ -551,12 +558,15 @@ func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off i
 	}
 	c.noteHit("read", false)
 	buf := make([]byte, length)
+	epoch := c.epoch.Load()
 	n, err := h.inner.Read(ctx, off, buf)
 	if err != nil {
 		return 0, false
 	}
 	if int64(n) == length {
-		c.dsk.PutOwned(key, buf)
+		if c.epoch.Load() == epoch {
+			c.dsk.PutOwned(key, buf)
+		}
 		return copyReadRange(dest, buf, 0), true
 	}
 	// Short fetch (EOF tail): serve directly; a truncated entry must not

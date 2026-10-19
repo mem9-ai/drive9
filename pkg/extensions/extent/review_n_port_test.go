@@ -39,3 +39,26 @@ func TestPortRenameMigratesDescendantInoCache(t *testing.T) {
 	e.untrackLive("/moved/f.db")
 	e.untrackLive("/moved/f.db")
 }
+
+// Rename and the last Release operate on one registry protocol: whichever
+// wins, the old AND new paths end with no live count.
+func TestPortExtentRenameReleaseRace(t *testing.T) {
+	e, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		h := &extentHandle{e: e, path: "/d/f"}
+		e.trackLiveHandle(h)
+		done := make(chan struct{})
+		go func() {
+			e.retargetLivePrefix("/d", "/m")
+			close(done)
+		}()
+		e.untrackLiveHandle(h)
+		<-done
+		if e.hasLive("/d/f") || e.hasLive("/m/f") {
+			t.Fatalf("iteration %d: live counts survived (old=%v new=%v)", i, e.hasLive("/d/f"), e.hasLive("/m/f"))
+		}
+	}
+}
