@@ -14,6 +14,7 @@
 #      candidate used; no binary fallback
 #   B. every candidate unhealthy -> object store binary fallback is attempted
 #   C. a pre-existing same-name unhealthy container is replaced by the rule
+#      (including the default single-image configuration)
 #   D. object-store: first candidate unhealthy -> second used
 #   E. object-store: every candidate unhealthy -> binary fallback
 #   F. object-store: nothing works -> exit 1
@@ -401,9 +402,39 @@ test_preexisting_unhealthy_container_replaced() {
     bash "$SCRIPT_DIR/local-object-store.sh" ensure >"$FAKE_RUN_DIR/ensure.log" 2>&1 || rc=$?
   check_eq "ensure exit status" "$rc" "0"
   check_eq "pre-existing container removed first" "$(head -1 "$FAKE_STATE")" "removed=drive9-local-object-store"
+  check_eq "primary image retried after removal" "$(grep -c '^run_image=registry.invalid/bad:tag$' "$FAKE_STATE" || true)" "1"
   check_eq "second candidate was run" "$(read_state run_image | tail -1)" "registry.invalid/good:tag"
   check_eq "status healthy afterwards" "$([ -f "$FAKE_RUN_DIR/drive9-local-object-store.pid" ] && echo 0 || echo 1)" "0"
   teardown_harness
+}
+
+# Test C2: with no fallback image or host binary, an unhealthy leftover must
+# not consume the only candidate. Recreate the default image and serve S3.
+test_preexisting_unhealthy_single_image_recreated() {
+	echo "--- C2: pre-existing unhealthy container, default single image"
+	new_harness
+	: >"$FAKE_RUN_DIR/drive9-local-object-store.exists"
+	local image rc=0
+	image=$(
+		source "$SCRIPT_DIR/object-store-config.sh"
+		printf '%s' "$OBJECT_STORE_DEFAULT_IMAGE"
+	)
+	DRIVE9_S3_BACKEND=s3 DRIVE9_OBJECT_STORE_PORT="$FAKE_PORT" \
+		DRIVE9_OBJECT_STORE_FALLBACK_IMAGE= \
+		DRIVE9_OBJECT_STORE_HEALTH_TIMEOUT_S=2 \
+		PATH="$FAKE_BIN_DIR:$PATH" FAKE_STATE="$FAKE_STATE" \
+		FAKE_RUN_DIR="$FAKE_RUN_DIR" FAKE_HEALTHY_IMAGES="$image" \
+		bash "$SCRIPT_DIR/local-object-store.sh" apply \
+		>"$FAKE_RUN_DIR/exports" 2>"$FAKE_RUN_DIR/ensure.log" || rc=$?
+	check_eq "required S3 recovers without a host binary" "$rc" 0
+	check_eq "leftover removed before recreation" \
+		"$(head -1 "$FAKE_STATE")" "removed=drive9-local-object-store"
+	check_eq "default image recreated" "$(read_state run_image)" "$image"
+	check_eq "only one image attempted" \
+		"$(grep -c '^run_image=' "$FAKE_STATE" || true)" 1
+	check_eq "S3 exports emitted after recovery" \
+		"$(grep -c '^export DRIVE9_S3_BUCKET=' "$FAKE_RUN_DIR/exports" || true)" 1
+	teardown_harness
 }
 
 # Test D: with the default health budget, a clean-port bootstrap over the
@@ -620,6 +651,7 @@ test_custom_health_path
 test_first_unhealthy_second_healthy
 test_all_unhealthy_falls_back_to_binary
 test_preexisting_unhealthy_container_replaced
+test_preexisting_unhealthy_single_image_recreated
 test_object_store_first_unhealthy
 test_object_store_binary_fallback
 test_object_store_total_failure

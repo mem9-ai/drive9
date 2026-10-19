@@ -214,8 +214,8 @@ start_container() {
   # `run -d` succeeding says nothing about the server inside (entrypoint or
   # platform mismatches exit right after start). An unhealthy candidate is
   # logged, removed, and replaced by the next one; the caller falls back to
-  # the binary only after every candidate failed this way. This also applies
-  # to a pre-existing same-name container that is not healthy.
+  # the binary only after every candidate failed this way. Remove an unhealthy
+  # pre-existing container before trying the current candidate's fresh container.
   local image
   for image in $OBJECT_STORE_IMAGE_CANDIDATES; do
     if "$runtime" inspect "$CONTAINER" >/dev/null 2>&1; then
@@ -225,10 +225,9 @@ start_container() {
       if wait_healthy "$HEALTH_URL"; then
         return 0
       fi
-      echo "object store container ($image via $runtime) is not healthy; removing and trying the next candidate" >&2
+      echo "object store container is unhealthy; recreating with $image" >&2
       "$runtime" logs "$CONTAINER" 2>&1 | tail -5 >&2 || true
       "$runtime" rm -f "$CONTAINER" >/dev/null 2>&1 || true
-      continue
     fi
     if "$runtime" run -d --name "$CONTAINER" \
       -p "${BIND}:${PORT}:9000" \
