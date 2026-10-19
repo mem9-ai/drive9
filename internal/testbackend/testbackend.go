@@ -142,6 +142,15 @@ func (b *Backend) Seed(path string, data []byte) {
 // SeedDir installs a directory fixture.
 // SeedHardlink plants a second path sharing the node's content, matching
 // the server's hardlink resource-sharing behavior for tests.
+// SetNodeMode applies a remote chmod to a seeded node (test knob).
+func (b *Backend) SetNodeMode(path string, mode uint32) {
+	b.mu.Lock()
+	if n, ok := b.files[path]; ok {
+		n.Mode = mode
+	}
+	b.mu.Unlock()
+}
+
 func (b *Backend) SeedHardlink(src, dst string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

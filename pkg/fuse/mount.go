@@ -1183,15 +1183,35 @@ func MountWithConfig(cfg MountConfig) error {
 		ForceUnmount(cfg.MountPoint)
 	}()
 	<-serveDone
-	// Classify the serve end: a clean unmount completed the OnUnmount
-	// handshake (or our signal handler already detached the kernel mount);
-	// anything else is an abnormal /dev/fuse disconnect that the
-	// supervisor's ExitServeAbnormal recovery exists for. Reporting it as
-	// success suppressed restarts.
-	if !f.unmounted.Load() && !unmountedKernel(cfg.MountPoint) {
-		return ExitServeAbnormalErr(fmt.Sprintf("serve loop ended at %s without a clean unmount", cfg.MountPoint))
+	// Classify the serve end by the KERNEL mount, not by the OnUnmount
+	// callback: the pinned go-fuse fork invokes OnUnmount unconditionally
+	// after the read loop — including error exits — so the callback is a
+	// teardown notification, never proof of a clean umount(2) handshake
+	// (an abnormal /dev/fuse disconnect set it too, and the abnormal-exit
+	// branch below was unreachable). The mountinfo row is independent: a
+	// clean external unmount removes it; a hung mount keeps it after the
+	// serve loop dies. Give the row a short settling window — the loop can
+	// exit marginally before the umount(2) that triggered it completes.
+	return classifyServeExit(cfg.MountPoint, unmountedKernel)
+}
+
+// classifyServeExit classifies a serve-loop exit by the KERNEL mount row
+// alone (mountStillPresent reports whether the mountinfo entry survives).
+// The go-fuse fork's OnUnmount callback fires unconditionally — clean
+// umount(2) and abnormal /dev/fuse disconnect alike — so no callback-side
+// signal participates here. A row that survives the settle window marks
+// a hung mount: the supervisor's ExitServeAbnormal recovery path.
+func classifyServeExit(mountPoint string, mountStillPresent func(string) bool) error {
+	if !mountStillPresent(mountPoint) {
+		return nil
 	}
-	return nil
+	for deadline := time.Now().Add(300 * time.Millisecond); time.Now().Before(deadline); {
+		time.Sleep(100 * time.Millisecond)
+		if !mountStillPresent(mountPoint) {
+			return nil
+		}
+	}
+	return ExitServeAbnormalErr(fmt.Sprintf("serve loop ended at %s with the kernel mount still present", mountPoint))
 }
 
 // unmountedKernel reports whether the mountpoint is no longer a FUSE mount.

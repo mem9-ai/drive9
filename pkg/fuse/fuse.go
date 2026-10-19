@@ -117,8 +117,9 @@ type FS struct {
 	mu       sync.Mutex
 	server   *gofuse.Server
 	startErr error
-	// unmounted records that go-fuse completed a clean unmount handshake
-	// (OnUnmount): a serve-loop exit without it is an abnormal disconnect.
+	// unmounted records that the go-fuse serve loop finished (OnUnmount
+	// fires unconditionally, clean or abnormal — the mount-exit
+	// classification uses the kernel mountinfo instead).
 	unmounted atomic.Bool
 	started   bool
 
@@ -1266,6 +1267,15 @@ func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.Entry
 			// plain regular mode — a retyped reply makes the kernel mark
 			// the live inode bad (the lchown EIO class).
 			f.inodes.UpdateMode(ino, mode)
+		} else if mode&0o777 != 0 {
+			// Regular files record their permission bits too: the open
+			// access gate (no default_permissions) keys on entry.HasMode,
+			// and leaving regular files unrecorded skipped the gate
+			// entirely — a fresh O_RDONLY of a mode-000 file read the
+			// contents. A zero mode is ambiguous at the chain boundary
+			// (chmod 000 vs "unknown"), so those fall to the gate's
+			// fresh-stat path instead of being recorded as 0000.
+			f.inodes.UpdateMode(ino, syscall.S_IFREG|mode&0o777)
 		}
 	} else {
 		out.Ino = ino
@@ -2191,15 +2201,33 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 	// the chain's OpCreate carries no mode context of its own, so a chmod
 	// 000 file or a write open of a read-only mode would sail through.
 	if !f.defaultPermissions {
-		if entry, eok := f.inodes.GetEntry(input.NodeId); eok && entry.HasMode {
-			mode := entry.Mode & 0o777
-			ownerUid, ownerGid := f.uid, f.gid
+		mode, modeKnown := uint32(0), false
+		ownerUid, ownerGid := f.uid, f.gid
+		if entry, eok := f.inodes.GetEntry(input.NodeId); eok {
 			if entry.HasUID {
 				ownerUid = entry.Uid
 			}
 			if entry.HasGID {
 				ownerGid = entry.Gid
 			}
+			if entry.HasMode {
+				mode, modeKnown = entry.Mode&0o777, true
+			}
+		}
+		if !modeKnown {
+			// The inode carries no recorded mode (a chain reply with
+			// mode 0 is ambiguous — a real chmod 000 and "unknown" are
+			// indistinguishable at the boundary): settle it with a fresh
+			// stat instead of skipping the gate — a plain Lookup → Open
+			// of a remote chmod(000) file read the contents otherwise.
+			if st, serr := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path, Ino: input.NodeId, Kernel: input, Caller: caller}); serr == nil && st.Attr != nil {
+				// A successful stat is authoritative — including a real
+				// chmod(000) answer of zero (requiring nonzero would skip
+				// the gate for exactly the mode it exists to enforce).
+				mode, modeKnown = st.Attr.Mode&0o777, true
+			}
+		}
+		if modeKnown {
 			// The requested access class comes from O_ACCMODE: O_RDONLY
 			// needs the read bit, O_WRONLY the write bit, O_RDWR both. A
 			// write-only test let a chmod 000 O_RDONLY open and an O_RDWR
