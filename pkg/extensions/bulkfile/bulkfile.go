@@ -206,6 +206,9 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 		return next(ctx, op)
 	case fs.OpUnlink, fs.OpRmdir:
+		// Surrendered descriptors must bind their anonymous backing BEFORE
+		// the name disappears: session() cannot re-open by path afterwards.
+		b.prepareUnlinkSurvivors(ctx, op.Path, op.Kind == fs.OpRmdir)
 		// A claim that owns its create has nothing remote to delete (the
 		// boundary never ran); the op is forwarded anyway so the write
 		// plane below drops its own pending state for the path, then the
@@ -319,13 +322,64 @@ func (b *Bulkfile) liveHandleAt(p string) *streamHandle {
 	return nil
 }
 
+// prepareUnlinkSurvivors opens a below session for every SURRENDERED
+// (passthrough) descriptor at p (or under it) BEFORE the delete runs: once
+// the name is gone, session() cannot re-open by path, and the fd's
+// anonymous read/write backing must already be bound. The below plane's
+// unlink marks its own open handles anonymous, so this session survives the
+// deletion.
+func (b *Bulkfile) prepareUnlinkSurvivors(ctx context.Context, p string, under bool) {
+	prefix := strings.TrimSuffix(p, "/") + "/"
+	var pending []*streamHandle
+	b.mu.Lock()
+	for h := range b.fds {
+		h.mu.Lock()
+		path := h.path
+		match := !h.released && (path == p || (under && strings.HasPrefix(path, prefix)))
+		passthrough := h.passthrough && h.inner == nil
+		h.mu.Unlock()
+		if match && passthrough {
+			pending = append(pending, h)
+		}
+	}
+	b.mu.Unlock()
+	for _, h := range pending {
+		// Bind the anonymous backing: the below plane's session is opened
+		// while the name still exists, then the handle becomes a local
+		// survivor over a bounded snapshot — an unlinked fd's reads and
+		// writes must neither re-open the deleted name nor hit the below
+		// plane's post-delete path resolution. Files beyond the buffered
+		// bound keep the session (best effort).
+		inner, err := h.session(ctx)
+		if err != nil || inner == nil {
+			continue
+		}
+		st, serr := b.cl.StatCtx(ctx, b.remotePath(h.path))
+		if serr != nil || st == nil || st.Size > bulkfileMaxBufferedBytes {
+			continue
+		}
+		snapshot := make([]byte, st.Size)
+		if n, rerr := inner.Read(ctx, 0, snapshot); rerr != nil || int64(n) != st.Size {
+			continue
+		}
+		_ = inner.Release(ctx)
+		h.mu.Lock()
+		h.image = snapshot
+		h.pushed = int64(len(snapshot))
+		h.dirty = false
+		h.passthrough = false
+		h.inner = nil
+		h.mu.Unlock()
+	}
+}
+
 // markUnlinked flags every live handle at p anonymous: the fd keeps serving
 // reads from the image, but the boundary push must not resurrect the
 // path. Per-handle, so a re-created p stays committable.
 func (b *Bulkfile) markUnlinked(p string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for h := range b.live {
+	for h := range b.fds {
 		h.mu.Lock()
 		if h.path == p && !h.released {
 			h.unlinked = true
@@ -340,7 +394,7 @@ func (b *Bulkfile) markUnlinkedUnder(dir string) {
 	prefix := strings.TrimSuffix(dir, "/") + "/"
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for h := range b.live {
+	for h := range b.fds {
 		h.mu.Lock()
 		if strings.HasPrefix(h.path, prefix) && !h.released {
 			h.unlinked = true

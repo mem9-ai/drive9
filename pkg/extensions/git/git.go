@@ -266,6 +266,21 @@ func (g *Git) localPathOf(remote string) (string, bool) {
 	return "", false
 }
 
+// remotePathOf maps a view path back to the tenant path the client speaks
+// (the inverse of localPathOf): the write plane's direct client fallbacks
+// used the LOCAL view path under a subtree mount and read/wrote the wrong
+// tenant object.
+func (g *Git) remotePathOf(p string) string {
+	root := strings.TrimSuffix(g.remoteRoot, "/")
+	if root == "" || root == "/" {
+		return p
+	}
+	if p == "/" {
+		return root
+	}
+	return root + p
+}
+
 type Options struct {
 	Client *client.Client
 	Events *fs.EventBus

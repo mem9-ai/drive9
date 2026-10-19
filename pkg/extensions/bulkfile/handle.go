@@ -210,6 +210,11 @@ func (h *streamHandle) Sync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if inner == nil {
+		// An anonymous survivor has no below session: its buffered image
+		// is discarded with the name, so sync is local-only.
+		return nil
+	}
 	return inner.Sync(ctx)
 }
 
@@ -220,6 +225,9 @@ func (h *streamHandle) Flush(ctx context.Context) error {
 	inner, err := h.session(ctx)
 	if err != nil {
 		return err
+	}
+	if inner == nil {
+		return nil
 	}
 	return inner.Flush(ctx)
 }

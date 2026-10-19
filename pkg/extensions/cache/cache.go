@@ -183,10 +183,7 @@ func New(opts Options) (*Cache, error) {
 		// sweeps the whole cache.
 		opts.Events.On(fs.EventInvalidated, func(e fs.Event) {
 			if e.Path == "/" {
-				c.mem.InvalidateAll()
-				if c.dsk != nil {
-					c.dsk.InvalidateAll()
-				}
+				c.invalidateAllTiers()
 				return
 			}
 			c.mem.Invalidate(e.Path)
@@ -197,10 +194,7 @@ func New(opts Options) (*Cache, error) {
 			}
 		})
 		opts.Events.On(fs.EventCheckout, func(e fs.Event) {
-			c.mem.InvalidateAll()
-			if c.dsk != nil {
-				c.dsk.InvalidateAll()
-			}
+			c.invalidateAllTiers()
 		})
 		opts.Events.On(fs.EventLanded, func(e fs.Event) {
 			// A local commit settle (onCommitQueueSuccess /
@@ -216,6 +210,28 @@ func New(opts Options) (*Cache, error) {
 		})
 	}
 	return c, nil
+}
+
+// invalidateAllTiers drops the whole-file memory/disk caches AND every open
+// handle's block prefetcher: Read serves prefetched blocks ahead of the
+// invalidated tiers, so a checkout/reset that skipped them kept feeding the
+// pre-reset image to live descriptors (v1 resetMountViewWithInitialSync
+// invalidated each handle's Prefetch, cancelling in-flight fetches).
+func (c *Cache) invalidateAllTiers() {
+	c.mem.InvalidateAll()
+	if c.dsk != nil {
+		c.dsk.InvalidateAll()
+	}
+	c.open.Range(func(key, _ any) bool {
+		if h, ok := key.(*cachingHandle); ok {
+			h.mu.Lock()
+			if h.prefetch != nil {
+				h.prefetch.Invalidate()
+			}
+			h.mu.Unlock()
+		}
+		return true
+	})
 }
 
 // ReadCached returns whole-file cached bytes for path at revision, if

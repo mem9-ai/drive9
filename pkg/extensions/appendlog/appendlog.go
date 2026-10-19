@@ -1004,14 +1004,32 @@ func (a *AppendLog) readLiveAppendBuffer(ctx context.Context, reader *Handle, of
 		return 0, false
 	}
 	set := v.(*liveHandleSet)
-	var served *Handle
-	set.forEach(func(h *Handle) bool {
-		if h != reader && h.dirty && h.buf != nil {
-			served = h
-			return false
+	// Snapshot the candidates under the SET mutex, then inspect each
+	// handle's dirty/buffer state under ITS OWN mutex: the old forEach
+	// body read h.dirty/h.buf while another fd's Write mutated them (a
+	// targeted -race probe flagged it), and locking only after selection
+	// both raced and could miss the newest local image. TryLock keeps the
+	// caller's h.mu from deadlocking against a sibling mid-refresh.
+	var candidates []*Handle
+	set.mu.Lock()
+	for h := range set.set {
+		if h != reader {
+			candidates = append(candidates, h)
 		}
-		return true
-	})
+	}
+	set.mu.Unlock()
+	var served *Handle
+	for _, h := range candidates {
+		if !h.mu.TryLock() {
+			continue
+		}
+		ready := h.dirty && h.buf != nil
+		h.mu.Unlock()
+		if ready {
+			served = h
+			break
+		}
+	}
 	if served == nil {
 		return 0, false
 	}

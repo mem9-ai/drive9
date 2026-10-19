@@ -7,6 +7,8 @@ package git
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -191,5 +193,105 @@ func TestPortOverlayReloadKeepsMaterialized(t *testing.T) {
 	rd, err := ch2.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/f.txt", Offset: 0, Limit: 16})
 	if err != nil || string(rd.Data) != "XDIT" {
 		t.Fatalf("/repo/f.txt = %q err=%v, want XDIT (fetched overlay authoritative)", rd.Data, err)
+	}
+}
+
+// The write plane's direct client fallbacks speak the TENANT path: a
+// subtree mount (RemoteRoot=/team) must read /team/repo/f's bytes as the
+// new image's base, not 404 on the view path and publish a bare write.
+func TestPortWritePlaneUsesRemoteRoot(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/team/repo/f.txt", []byte("hello"))
+	b.SeedGitWorkspace("ws", "/team/repo")
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	g, err := New(Options{Client: cl, RemoteRoot: "/team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.armed = true
+	terminal, _ := core.New(cl, core.Options{RemoteRoot: "/team"})
+	ch, _ := fs.NewChain(g, terminal)
+	ctx := context.Background()
+	g.ensure(ctx)
+
+	h := openLog2(t, ch, "/repo/f.txt")
+	if err := h.Write(ctx, 0, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rd, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/f.txt", Offset: 0, Limit: 16})
+	if err != nil || string(rd.Data) != "Xello" {
+		t.Fatalf("/repo/f.txt = %q err=%v, want Xello (base read through RemoteRoot)", rd.Data, err)
+	}
+}
+
+// An unknown base (503/timeout) must fail the write instead of publishing
+// the write's bytes as the whole image.
+func TestPortWriteRejectsUnknownBase(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/repo/f.txt", []byte("hello"))
+	b.SeedGitWorkspace("ws", "/repo")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/repo/f.txt") {
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	g, err := New(Options{Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.armed = true
+	terminal, _ := core.New(cl, core.Options{})
+	ch, _ := fs.NewChain(g, terminal)
+	ctx := context.Background()
+	g.ensure(ctx)
+
+	h := openLog2(t, ch, "/repo/f.txt")
+	if err := h.Write(ctx, 0, []byte("X")); err == nil {
+		t.Fatal("write over an unknown base succeeded")
+	}
+	if node, ok := b.Node("/repo/f.txt"); !ok || string(node.Data) != "hello" {
+		t.Fatalf("backend = %q ok=%v, want the untouched hello", node.Data, ok)
+	}
+}
+
+// A base read crossing EOF is a normal short read (io.EOF), not
+// io.ErrUnexpectedEOF (which the facade mapped to EIO and dropped).
+func TestPortBaseReadTailIsShortRead(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/repo/f.txt", []byte("hello"))
+	b.SeedGitWorkspace("ws", "/repo")
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	g, err := New(Options{Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.armed = true
+	terminal, _ := core.New(cl, core.Options{})
+	ch, _ := fs.NewChain(g, terminal)
+	ctx := context.Background()
+	g.ensure(ctx)
+
+	h := openLog2(t, ch, "/repo/f.txt")
+	buf := make([]byte, 4096)
+	n, rerr := h.Read(ctx, 0, buf)
+	if n != 5 || (rerr != nil && rerr != io.EOF) {
+		t.Fatalf("read = %d, %v; want 5 bytes and EOF", n, rerr)
+	}
+	if string(buf[:n]) != "hello" {
+		t.Fatalf("read = %q", buf[:n])
 	}
 }

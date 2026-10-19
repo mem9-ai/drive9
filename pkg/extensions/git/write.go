@@ -10,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
@@ -141,12 +142,19 @@ func (h *gitHandle) Read(ctx context.Context, off int64, dest []byte) (int, erro
 			}
 			return copy(dest, e.Content[off:]), nil
 		}
-		rc, err := h.g.cl.ReadStreamRange(ctx, h.path, off, int64(len(dest)))
+		rc, err := h.g.cl.ReadStreamRange(ctx, h.g.remotePathOf(h.path), off, int64(len(dest)))
 		if err != nil {
 			return 0, err
 		}
 		defer func() { _ = rc.Close() }()
-		return io.ReadFull(rc, dest)
+		n, rerr := io.ReadFull(rc, dest)
+		if rerr == io.ErrUnexpectedEOF || (rerr == nil && n < len(dest)) {
+			// A request crossing EOF is a normal SHORT read; the facade
+			// only accepts io.EOF (io.ErrUnexpectedEOF surfaced as EIO and
+			// dropped the valid bytes).
+			return n, io.EOF
+		}
+		return n, rerr
 	}
 	if err := h.buf.EnsurePartsForWrite(off, int64(len(dest))); err != nil {
 		return 0, err
@@ -350,11 +358,20 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
 		// Fall through to the remote base: the blob may be materializable
 		// there even though the local git dir cannot serve it.
 	}
-	if st, err := h.g.cl.StatCtx(ctx, h.path); err == nil && st != nil && st.Size > 0 {
+	st, statErr := h.g.cl.StatCtx(ctx, h.g.remotePathOf(h.path))
+	if statErr != nil && !client.IsNotFound(statErr) {
+		// The base content is UNKNOWN (503/timeout/permission). Publishing
+		// an overlay now would silently replace the file with just this
+		// write's bytes; fail closed and drop the provisional buffer so a
+		// later attempt re-initializes the base.
+		h.buf = nil
+		return statErr
+	}
+	if statErr == nil && st != nil && st.Size > 0 {
 		partSize := h.buf.PartSize()
 		remoteSize := st.Size
 		g := h.g
-		path := h.path
+		path := h.g.remotePathOf(h.path)
 		loadCtx := context.Background()
 		h.buf.LoadPart = func(partNum int) ([]byte, error) {
 			start := int64(partNum-1) * partSize

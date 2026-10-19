@@ -54,3 +54,39 @@ func TestPortSurrenderedDescriptorFollowsRename(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// An unlink retires EVERY descriptor's name binding: a surrendered fd keeps
+// its anonymous backing (bound before the delete) and must not re-open the
+// deleted path with its O_CREAT flags.
+func TestPortSurrenderedDescriptorSurvivesUnlink(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b)
+	ctx := context.Background()
+
+	first := openForWrite(t, ch, "/a")
+	if err := first.Write(ctx, 0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatalf("second open = %v", err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil {
+		t.Fatalf("unlink = %v", err)
+	}
+	if err := first.Write(ctx, 0, []byte("X")); err != nil {
+		t.Fatalf("write after unlink = %v", err)
+	}
+	if err := first.Sync(ctx); err != nil {
+		t.Fatalf("sync after unlink = %v", err)
+	}
+	if _, ok := b.Node("/a"); ok {
+		t.Fatal("surrendered descriptor resurrected the unlinked name")
+	}
+	if err := first.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
