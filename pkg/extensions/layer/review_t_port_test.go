@@ -519,3 +519,69 @@ func TestPortStreamedCommitConcurrentWriteStaysClean(t *testing.T) {
 		t.Fatalf("final image = %d bytes err=%v, want image+writes", len(rd.Data), err)
 	}
 }
+
+// qiffang twenty-first round: base-dir chmod keeps the directory; the
+// restore replay moves content BEFORE the source whiteout.
+func TestPortBaseDirChmodKeepsDirectory(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/d/f", []byte("x"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	l, ch := mStack(t, ts)
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/d", HasMode: true, Mode: 0o700, Size: -1}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/d"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Attr == nil || res.Attr.Kind != fs.KindDir {
+		t.Fatalf("chmod'd base dir = %+v, want a directory", res.Attr)
+	}
+	kind, _, _, _, ok := l.lookup("/d")
+	if !ok || kind != "dir" {
+		t.Fatalf("overlay /d kind = %q ok=%v, want dir", kind, ok)
+	}
+}
+
+// The rename-after-upsert replay order: the replayed image moves to the
+// destination instead of re-reading the stale base.
+func TestPortReplayRenameAfterUpsertUsesMovedContent(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("old"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	l, ch := mStack(t, ts)
+	ctx := context.Background()
+
+	// upsert /a = new, then rename /a -> /b through the live plane.
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Write(ctx, 0, []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/b"}); err != nil {
+		t.Fatal(err)
+	}
+	// A fresh restore replays upsert-then-rename from the log.
+	if err := l.Restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	kind, _, _, content, ok := l.lookup("/b")
+	if !ok || kind != "file" || string(content) != "new" {
+		t.Fatalf("restored /b = kind=%s content=%q ok=%v, want the replayed new image", kind, content, ok)
+	}
+}

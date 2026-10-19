@@ -152,6 +152,11 @@ type DirEntryInfo struct {
 	// ExtentIno is the object-store inode for extent-layout entries;
 	// zero elsewhere.
 	ExtentIno uint64
+	// LocalMutation marks a row this mount itself wrote (create, write,
+	// landed commit, chown). Such a row is this process's own state even
+	// on a multi-server deployment, so a stat may serve it without
+	// revalidation; listing-observed rows leave it false and revalidate.
+	LocalMutation bool
 	// FreshUntil is the listing-cache TTL deadline for this entry. It is
 	// meaningful only inside the listing cache that set it; producers and
 	// consumers outside caching leave it zero.

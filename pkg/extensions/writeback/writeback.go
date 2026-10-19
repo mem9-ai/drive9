@@ -793,6 +793,16 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		}
 		res, err := next(ctx, op)
 		if err == nil && res.Attr != nil {
+			// An overwrite without a pending mode cannot synthesize the
+			// whole attr (the remote owns the mode), but its SIZE is newer
+			// than the remote row until the commit lands. The namespace
+			// cache used to carry that write-time size; with stat
+			// revalidation the close-time commit race would otherwise pin
+			// the pre-write size for the whole attr TTL (append is 20 on
+			// the mount, 22 remotely).
+			if meta, ok := w.pendingMeta(op.Path); ok && res.Attr.Kind != fs.KindDir {
+				res.Attr.Size = meta.Size
+			}
 			// #984 stat visibility: a live writer's uncommitted image —
 			// an fd-truncate's new size above all — is the path's newest
 			// truth; the remote row underneath still describes the
@@ -1098,27 +1108,32 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if w.uploader != nil {
 			w.uploader.WaitPath(op.Path)
 		}
-		// writeBack.Remove() / CancelPrefix: staged entries die with their
-		// path (prefix-wide for directory removal). The queue cancel runs
-		// BEFORE the survivor snapshot: CancelPath also removes the shadow
-		// file, which would wipe the image an anonymous clean fd reads
-		// after the delete.
-		if w.wbCache != nil {
-			if under {
-				for _, entry := range w.wbCache.ListByPrefix(prefix) {
-					w.wbCache.Remove(entry.Path)
+		// Staged entries die with their path — but only AFTER the remote
+		// delete succeeds: wbCache/queue cleanup is irreversible, and a
+		// 503'd DELETE with the staging already removed lost the only
+		// retry source (the closed writer's overwrite vanished with it).
+		// The queue cancel (when it runs) precedes the survivor snapshot:
+		// CancelPath also removes the shadow an anonymous clean fd reads.
+		purgeStaging := func() {
+			if w.wbCache != nil {
+				if under {
+					for _, entry := range w.wbCache.ListByPrefix(prefix) {
+						w.wbCache.Remove(entry.Path)
+					}
 				}
+				w.wbCache.Remove(op.Path)
 			}
-			w.wbCache.Remove(op.Path)
-		}
-		if w.queue != nil {
-			w.queue.CancelPath(op.Path)
-			if under {
-				w.queue.CancelPrefix(prefix)
+			if w.queue != nil {
+				// Preserve-local: the anonymous fd's unlink snapshot lives
+				// in the shadow and must survive the cancel (plain
+				// CancelPath removed it, and post-delete reads ENOENT'd).
+				w.queue.CancelPathPreserveLocal(op.Path)
+				if under {
+					w.queue.CancelPrefix(prefix)
+				}
 			}
 		}
 		w.markUnlinked(op.Path, under)
-		w.forgetLanded(op.Path)
 		rollback := func() {
 			w.markLinked(op.Path, under)
 			w.dropUnlinkedShadow(op.Path)
@@ -1145,6 +1160,10 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					w.queue.CancelPrefix(prefix)
 				}
 			}
+			if w.wbCache != nil {
+				w.wbCache.Remove(op.Path)
+			}
+			w.forgetLanded(op.Path)
 			return fs.Result{}, nil
 		}
 		res, err := next(ctx, op)
@@ -1152,6 +1171,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			rollback()
 			return res, err
 		}
+		purgeStaging()
+		w.forgetLanded(op.Path)
 		return res, nil
 	case fs.OpLink:
 		// v1 Link: the hardlink commit needs the source's pending data landed

@@ -96,15 +96,15 @@ func attrFromJuice(a *jfsmeta.Attr) fs.Attr {
 // drive9 projection path so the engine publishes the file_nodes row (v1:
 // without it, the new extent file is invisible to listings, other mounts,
 // and re-mounts).
-func (e *Extent) createInVFS(ctx context.Context, op *fs.Op) (uint64, uint64, *jfsmeta.Attr, bool) {
+func (e *Extent) createInVFS(ctx context.Context, op *fs.Op) (uint64, uint64, *jfsmeta.Attr, syscall.Errno, bool) {
 	v := e.vfs()
 	if v == nil {
-		return 0, 0, nil, false
+		return 0, 0, nil, syscall.EIO, false
 	}
 	jctx := e.jfsCtxWithKeyedPath(op.Caller, e.remotePath(op.Path))
 	parent, errn := e.ensureParent(jctx, pathutil.DirOf(op.Path))
 	if errn != 0 {
-		return 0, 0, nil, false
+		return 0, 0, nil, errn, false
 	}
 	mode := uint16(op.Mode & 0o777)
 	if mode == 0 {
@@ -115,11 +115,11 @@ func (e *Extent) createInVFS(ctx context.Context, op *fs.Op) (uint64, uint64, *j
 	// forever (Release only closed the second fh).
 	entry, fh, errn := v.Create(jctx, parent, pathutil.BaseName(op.Path), mode, 0, op.Flags)
 	if errn != 0 || entry == nil {
-		return 0, 0, nil, false
+		return 0, 0, nil, errn, false
 	}
 	ino := uint64(entry.Inode)
 	e.rememberExtentIno(op.Path, ino)
-	return ino, fh, entry.Attr, true
+	return ino, fh, entry.Attr, 0, true
 }
 
 // ensureParent walks from the extent mount root, creating missing
@@ -150,7 +150,11 @@ func (e *Extent) ensureParent(jctx vfs.LogContext, dirPath string) (jfsmeta.Ino,
 		acc += "/" + seg
 		entry, errn := v.Lookup(jctx, cur, seg)
 		if errn == syscall.ENOENT {
-			mode := uint16(e.mirroredDirMode(strings.TrimPrefix(acc, e.root)))
+			// acc is already TENANT-absolute (the walk translated through
+			// remotePath above): trimming the mount root here made the
+			// mode lookup view-relative and re-prefixing doubled the
+			// RemoteRoot (the projection missed the real parent row).
+			mode := uint16(e.mirroredDirMode(acc))
 			mkdirCtx := vfs.NewLogContext(e.jfsMetaCtx(caller).WithValue(jfsmeta.Drive9PathKey, e.remotePath(acc)+"/"))
 			newEntry, mkErrn := v.Mkdir(mkdirCtx, cur, seg, mode, 0)
 			if mkErrn != 0 && mkErrn != syscall.EEXIST {
@@ -180,7 +184,10 @@ func (e *Extent) mirroredDirMode(dirPath string) uint32 {
 	if e.opts.Client != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if st, err := e.opts.Client.StatCtx(ctx, e.remotePath(dirPath)); err == nil && st != nil && st.IsDir && st.HasMode {
+		// dirPath arrives TENANT-ABSOLUTE (the parent walk already
+		// translated it): remotePath would double the RemoteRoot prefix
+		// and the projection stat would 404/mis-associate file_nodes.
+		if st, err := e.opts.Client.StatCtx(ctx, dirPath); err == nil && st != nil && st.IsDir && st.HasMode {
 			return st.Mode & 0o7777
 		}
 	}
@@ -351,7 +358,7 @@ func (e *Extent) readlinkIno(ctx context.Context, path string, ino uint64, calle
 // setAttrViaVFS ports v1 extentSetAttr's non-size fields: one VFS SetAttr
 // applies mode/owner/mtime so the jfs inode (the stat authority for extent
 // files) reflects the change.
-func (e *Extent) setAttrViaVFS(ctx context.Context, op *fs.Op, ino uint64) (fs.Result, error) {
+func (e *Extent) setAttrViaVFS(ctx context.Context, op *fs.Op, ino uint64, vfsFh uint64) (fs.Result, error) {
 	v := e.vfs()
 	if v == nil {
 		return fs.Result{}, syscall.EIO
@@ -391,7 +398,7 @@ func (e *Extent) setAttrViaVFS(ctx context.Context, op *fs.Op, ino uint64) (fs.R
 		return e.statViaVFS(ctx, op.Path, ino)
 	}
 	jctx := e.jfsCtx(op.Caller)
-	entry, errn := v.SetAttr(jctx, jfsmeta.Ino(ino), set, 0, mode, uid, gid, atime, mtime, atimens, mtimens, size)
+	entry, errn := v.SetAttr(jctx, jfsmeta.Ino(ino), set, vfsFh, mode, uid, gid, atime, mtime, atimens, mtimens, size)
 	if errn != 0 {
 		return fs.Result{}, errno(errn)
 	}

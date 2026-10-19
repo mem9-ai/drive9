@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
@@ -59,6 +60,14 @@ type landedGeneration struct {
 	seq  int64
 	rev  int64
 	size int64
+	// fileIncarnation distinguishes recreated files: a NEW handle's local
+	// seq restarts at 1, so (path, seq, size) alone matched the deleted
+	// previous file's landed generation and skipped committing the new
+	// content entirely (unlink + recreate + one write = empty remote).
+	// The incarnation counter is per AppendLog instance, minted on every
+	// NEW handle claim; a landed generation only dedups a handle of the
+	// SAME incarnation.
+	fileIncarnation uint64
 }
 
 const pathTruncateSeq = math.MinInt64
@@ -80,6 +89,9 @@ type AppendLog struct {
 	unlinked sync.Map
 	// committed remembers the last landed generation per path.
 	committed sync.Map
+	// incarnation mints a fresh file identity for every NEW handle claim
+	// (dedup must never bridge a deleted file and its recreation).
+	incarnation atomic.Uint64
 }
 
 func New(opts Options) (*AppendLog, error) {
@@ -131,6 +143,10 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			inner: res.Handle,
 			flags: op.Flags,
 			isNew: isNew,
+			// A fresh claim on a MISSING path is a new file incarnation:
+			// mint an identity the landed-generation dedup cannot bridge
+			// across an unlink + recreate of the same name.
+			incarnation: a.incarnation.Add(1),
 		}
 		if !isNew && st != nil {
 			h.baseRev, h.origSize = st.Revision, st.Size
@@ -324,7 +340,7 @@ func (a *AppendLog) tryGenerationReset(ctx context.Context, h *Handle) error {
 		h.observeCommittedWALHeaderLocked(newHeader)
 	}
 	h.mu.Unlock()
-	a.committed.Store(h.path, landedGeneration{seq: snapshotSeq, rev: revision, size: sqliteWALHeaderSize})
+	a.committed.Store(h.path, landedGeneration{seq: snapshotSeq, rev: revision, size: sqliteWALHeaderSize, fileIncarnation: h.incarnation})
 	if err := h.applyPendingMode(ctx); err != nil {
 		return err
 	}
@@ -360,7 +376,7 @@ func (a *AppendLog) tryTailAppend(ctx context.Context, h *Handle) error {
 	// Same-generation finalize dedup: the identical dirty generation
 	// already landed; adopt it instead of uploading a duplicate.
 	if prev, ok := a.committed.Load(h.path); ok {
-		if g := prev.(landedGeneration); g.seq == snapshotSeq && g.rev > 0 && g.size == size {
+		if g := prev.(landedGeneration); g.seq == snapshotSeq && g.rev > 0 && g.size == size && g.fileIncarnation == h.incarnation {
 			h.isNew = false
 			h.baseRev = g.rev
 			h.origSize = g.size
@@ -397,6 +413,11 @@ func (a *AppendLog) tryTailAppend(ctx context.Context, h *Handle) error {
 		case statErr != nil:
 			err = statErr
 		case stat == nil || stat.Revision <= 0 || stat.Revision == expectedRevision || stat.Size != expectedSize:
+			// A rebase only helps a PURE append: when the sibling image
+			// diverged in size the tail contract cannot hold, so the
+			// handle must fail and re-read rather than compose a guess
+			// over someone else's bytes (EEXIST-on-drift is pinned by
+			// engine_port_test.go).
 			err = fmt.Errorf("append-log rebase did not provide the same size with a new positive revision")
 		default:
 			// The rebase observation belongs to the immutable snapshot. A
@@ -433,7 +454,7 @@ func (a *AppendLog) tryTailAppend(ctx context.Context, h *Handle) error {
 		// The remote landing is recorded; local publication belongs to
 		// whichever generation still owns the handle.
 		h.mu.Unlock()
-		a.committed.Store(snapshotPath, landedGeneration{seq: snapshotSeq, rev: result.Revision, size: result.Size})
+		a.committed.Store(snapshotPath, landedGeneration{seq: snapshotSeq, rev: result.Revision, size: result.Size, fileIncarnation: h.incarnation})
 		return nil
 	}
 	h.isNew = false
@@ -490,6 +511,12 @@ func (a *AppendLog) fullRewrite(ctx context.Context, h *Handle) error {
 		case err != nil:
 			return mapErr(err)
 		default:
+			// The remote drifted from this handle's captured baseline: a
+			// sibling landing (or a rename retarget) changed the image
+			// under us, so the buffered image is not a composition over
+			// the current remote. Fail with EEXIST and let the caller
+			// re-read; adopting the sibling revision here would publish
+			// this handle's stale bytes over its tail.
 			h.mu.Lock()
 			if stat == nil || stat.Revision != expectedRevision || stat.Size != expectedSize {
 				h.mu.Unlock()
@@ -530,7 +557,7 @@ func (a *AppendLog) fullRewrite(ctx context.Context, h *Handle) error {
 	if layout == client.ContentLayoutSingle {
 		revision, err = a.commitGeneric(ctx, h.path, snapshot, expectedRevision)
 	} else {
-		revision, err = a.commitWholeSnapshot(ctx, h.path, snapshot)
+		revision, err = a.commitWholeSnapshot(ctx, h.path, snapshot, expectedRevision)
 	}
 	if err != nil {
 		return err
@@ -562,41 +589,37 @@ func (a *AppendLog) fullRewrite(ctx context.Context, h *Handle) error {
 }
 
 // commitGeneric conditionally commits through the size-aware client path
-// (inline PUT below the threshold, multipart above) with
-// revision-conflict retries.
+// (inline PUT below the threshold, multipart above) against the captured
+// base revision.
 func (a *AppendLog) commitGeneric(ctx context.Context, path string, snapshot *appendLogSnapshot, expectedRevision int64) (int64, error) {
 	rp := a.remotePath(path)
-	for attempt := 0; attempt <= 3; attempt++ {
-		expected := expectedRevision
-		if st, err := a.cl.StatCtx(ctx, rp); err == nil {
-			expected = st.Revision
-		} else if !client.IsNotFound(err) {
-			return 0, mapErr(err)
-		}
-		body, oerr := snapshot.Open()
-		if oerr != nil {
-			return 0, oerr
-		}
-		st, werr := a.cl.WriteStreamConditionalWithChecksum(ctx, rp, body, snapshot.Size(), nil, expected, "")
-		_ = body.Close()
-		if werr != nil {
-			if errors.Is(werr, client.ErrConflict) {
-				continue
-			}
-			return 0, mapErr(werr)
-		}
-		rev := int64(0)
-		if st != nil {
-			rev = st.Revision
-		}
-		return rev, nil
+	// The conditional write carries the handle's CAPTURED base revision: a
+	// foreign landing since must CONFLICT here. Refreshing the base from a
+	// stat and retrying the SAME snapshot published a stale image over the
+	// foreign tail (abcdef + local X + foreign TAIL became Xbcdef), so a
+	// conflict is EAGAIN — the caller re-reads and re-materializes.
+	body, oerr := snapshot.Open()
+	if oerr != nil {
+		return 0, oerr
 	}
-	return 0, &fs.StatusError{Path: path, Status: gofuse.EAGAIN}
+	st, werr := a.cl.WriteStreamConditionalWithChecksum(ctx, rp, body, snapshot.Size(), nil, expectedRevision, "")
+	_ = body.Close()
+	if werr != nil {
+		if errors.Is(werr, client.ErrConflict) {
+			return 0, &fs.StatusError{Path: path, Status: gofuse.EAGAIN}
+		}
+		return 0, mapErr(werr)
+	}
+	rev := int64(0)
+	if st != nil {
+		rev = st.Revision
+	}
+	return rev, nil
 }
 
-// commitWholeSnapshot streams the whole image with conditional retries;
-// small snapshots reuse the in-memory commit path unchanged.
-func (a *AppendLog) commitWholeSnapshot(ctx context.Context, path string, snapshot *appendLogSnapshot) (int64, error) {
+// commitWholeSnapshot streams the whole image against the captured base;
+// small snapshots reuse the in-memory commit path.
+func (a *AppendLog) commitWholeSnapshot(ctx context.Context, path string, snapshot *appendLogSnapshot, expectedRevision int64) (int64, error) {
 	if snapshot.Size() <= appendLogSnapshotMemoryLimit {
 		rc, err := snapshot.Open()
 		if err != nil {
@@ -607,56 +630,46 @@ func (a *AppendLog) commitWholeSnapshot(ctx context.Context, path string, snapsh
 		if err != nil {
 			return 0, err
 		}
-		return a.commitWhole(ctx, path, data)
+		return a.commitWhole(ctx, path, data, expectedRevision)
 	}
 	rp := a.remotePath(path)
-	for attempt := 0; attempt <= 3; attempt++ {
-		expected := int64(0)
-		if st, err := a.cl.StatCtx(ctx, rp); err == nil {
-			expected = st.Revision
-		} else if !client.IsNotFound(err) {
-			return 0, mapErr(err)
-		}
-		body, oerr := snapshot.Open()
-		if oerr != nil {
-			return 0, oerr
-		}
-		rev, werr := a.cl.WriteServerStreamConditional(ctx, rp, body, snapshot.Size(), expected)
-		_ = body.Close()
-		if werr == nil {
-			return rev, nil
-		}
-		if !errors.Is(werr, client.ErrConflict) {
-			return 0, mapErr(werr)
-		}
+	// Same contract as commitGeneric: the captured base is the CAS
+	// condition, and a conflict fails with EAGAIN instead of republishing
+	// the stale snapshot at a refreshed revision.
+	body, oerr := snapshot.Open()
+	if oerr != nil {
+		return 0, oerr
 	}
-	return 0, &fs.StatusError{Path: path, Status: gofuse.EAGAIN}
+	rev, werr := a.cl.WriteServerStreamConditional(ctx, rp, body, snapshot.Size(), expectedRevision)
+	_ = body.Close()
+	if werr != nil {
+		if errors.Is(werr, client.ErrConflict) {
+			return 0, &fs.StatusError{Path: path, Status: gofuse.EAGAIN}
+		}
+		return 0, mapErr(werr)
+	}
+	return rev, nil
 }
 
-// commitWhole conditionally PUTs an in-memory image, retrying on revision
-// conflicts. A path that vanished remotely (concurrent delete) is NOT
-// recreated — v1's CAS rejected there, and resurrecting a deleted name from
-// a stale writer's buffer loses the delete.
-func (a *AppendLog) commitWhole(ctx context.Context, path string, image []byte) (int64, error) {
+// commitWhole conditionally PUTs an in-memory image against the captured
+// base revision. A conflict is EAGAIN (a sibling landing changed the
+// image; republishing the stale composition would drop its bytes), and a
+// vanished path is NOT recreated — v1's CAS rejected there, and
+// resurrecting a deleted name from a stale writer's buffer loses the
+// delete.
+func (a *AppendLog) commitWhole(ctx context.Context, path string, image []byte, expectedRevision int64) (int64, error) {
 	rp := a.remotePath(path)
-	for attempt := 0; attempt <= 3; attempt++ {
-		st, err := a.cl.StatCtx(ctx, rp)
-		if err != nil {
-			if client.IsNotFound(err) {
-				return 0, fs.ErrNotFound
-			}
-			return 0, mapErr(err)
+	rev, werr := a.cl.WriteCtxConditionalWithRevision(ctx, rp, image, expectedRevision)
+	if werr != nil {
+		if errors.Is(werr, client.ErrConflict) {
+			return 0, &fs.StatusError{Path: path, Status: gofuse.EAGAIN}
 		}
-		rev, werr := a.cl.WriteCtxConditionalWithRevision(ctx, rp, image, st.Revision)
-		if werr != nil {
-			if errors.Is(werr, client.ErrConflict) {
-				continue
-			}
-			return 0, mapErr(werr)
+		if client.IsNotFound(werr) {
+			return 0, fs.ErrNotFound
 		}
-		return rev, nil
+		return 0, mapErr(werr)
 	}
-	return 0, &fs.StatusError{Path: path, Status: gofuse.EAGAIN}
+	return rev, nil
 }
 
 func (a *AppendLog) remotePath(p string) string {
@@ -849,6 +862,7 @@ type Handle struct {
 	baseRev        int64
 	origSize       int64
 	seq            int64
+	incarnation    uint64
 	unlinked       bool
 	pendingMode    uint32
 	hasPendingMode bool
@@ -1021,27 +1035,43 @@ func (h *Handle) refreshAppendBaselineLocked(ctx context.Context) error {
 	set := v.(*liveHandleSet)
 	var newest *Handle
 	newestSize := h.buf.Size()
-	set.forEach(func(other *Handle) bool {
-		if other == h || !other.dirty || other.buf == nil {
-			return true
+	// NON-BLOCKING sibling admission (v1's shape): the caller holds h.mu,
+	// and every sibling refresh does too — blocking on another handle's
+	// mutex here deadlocks two O_APPEND writers head-on (A holds h.mu and
+	// waits for B.mu inside the set mutex; B holds B.mu and waits for the
+	// set mutex). A busy sibling simply sits this refresh out; the flush
+	// rebase retry covers the missed bytes.
+	set.mu.Lock()
+	candidates := make([]*Handle, 0, len(set.set))
+	for other := range set.set {
+		candidates = append(candidates, other)
+	}
+	set.mu.Unlock()
+	for _, other := range candidates {
+		if other == h {
+			continue
 		}
-		other.mu.Lock()
+		if !other.mu.TryLock() {
+			continue
+		}
 		size := int64(-1)
+		dirty := other.dirty
 		if other.buf != nil {
 			size = other.buf.Size()
 		}
 		other.mu.Unlock()
-		if size > newestSize {
+		if dirty && size > newestSize {
 			newest, newestSize = other, size
 		}
-		return true
-	})
+	}
 	if newest == nil {
 		return nil
 	}
 	ourSize := h.buf.Size()
 	tail := make([]byte, newestSize-ourSize)
-	newest.mu.Lock()
+	if !newest.mu.TryLock() {
+		return nil // raced with the sibling's own refresh; retry at flush
+	}
 	defer newest.mu.Unlock()
 	if !newest.dirty || newest.buf == nil || newest.buf.Size() < newestSize {
 		return nil // raced with a flush; the rebase retry at flush covers it

@@ -215,6 +215,25 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 					}
 				}
 			}
+			// Transient-overlay children join the SAME merge (v1's
+			// mergeLocalDirEntries walked both overlays): a -shm sidecar
+			// created through transient storage was name-addressable but
+			// invisible to fresh listings of its remote-routed parent.
+			if f.transient != nil {
+				if extras, terr := f.transient.ReadDir(op.Path); terr == nil {
+					for _, e := range extras {
+						info, ierr := e.Info()
+						if ierr != nil {
+							continue
+						}
+						if _, dup := seen[e.Name()]; dup {
+							continue
+						}
+						seen[e.Name()] = struct{}{}
+						merged = append(merged, fs.Entry{Name: e.Name(), Attr: attrOfLocalInfo(info)})
+					}
+				}
+			}
 			for _, e := range res.Entries {
 				if _, shadowed := seen[e.Name]; shadowed {
 					continue
@@ -645,7 +664,7 @@ func attrOfLocalInfo(info iofs.FileInfo) fs.Attr {
 	}
 	return fs.Attr{
 		Kind:  kind,
-		Mode:  uint32(info.Mode().Perm()),
+		Mode:  localFileMode(info.Mode()),
 		Size:  info.Size(),
 		Mtime: info.ModTime(),
 	}

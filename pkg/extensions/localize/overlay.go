@@ -229,3 +229,22 @@ func posixFileMode(mode uint32) iofs.FileMode {
 	}
 	return fm
 }
+
+// localFileMode is posixFileMode's inverse for reply attributes:
+// FileMode.Perm() masks the three special bits, so a successful
+// chmod(04755/01777) read back as 0755/0777 and every Lookup/GetAttr/
+// listing dropped the marks the overlay had just stored (renameguard's
+// sticky preflight then saw a non-sticky parent).
+func localFileMode(fm iofs.FileMode) uint32 {
+	mode := uint32(fm.Perm())
+	if fm&iofs.ModeSetuid != 0 {
+		mode |= 0o4000
+	}
+	if fm&iofs.ModeSetgid != 0 {
+		mode |= 0o2000
+	}
+	if fm&iofs.ModeSticky != 0 {
+		mode |= 0o1000
+	}
+	return mode
+}

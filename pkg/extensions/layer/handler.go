@@ -435,10 +435,14 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			if err := l.upsertEntry(ctx, client.FSLayerEntryRequest{Path: l.remotePath(op.Path), Op: "chmod", Kind: entryKind, Mode: op.Mode & 0o777}); err != nil {
 				return fs.Result{}, err
 			}
-			switch {
-			case ok && kind == "dir":
+			// The local overlay follows the RESOLVED kind (a base-only
+			// DIRECTORY resolved entryKind=dir above; keying on the missed
+			// overlay lookup routed it through markLayerFileMode and
+			// retyped the directory as a zero-length file).
+			switch entryKind {
+			case "dir":
 				l.markLayerDir(op.Path, op.Mode)
-			case ok && kind == "symlink":
+			case "symlink":
 				_, _, tgt, _, _ := l.lookup(op.Path)
 				l.markLayerSymlink(op.Path, tgt, op.Mode)
 			default:

@@ -89,7 +89,7 @@ func TestPortSetAttrMergesSizeWithMetadata(t *testing.T) {
 	// size-only return; pin the flag composition here at the unit level
 	// via a nil-VFS error path (the op would reach the VFS call).
 	op := &fs.Op{Kind: fs.OpSetAttr, Path: "/f", Size: 10, HasMode: true, Mode: 0o600}
-	_, err = e.setAttrViaVFS(context.Background(), op, 0)
+	_, err = e.setAttrViaVFS(context.Background(), op, 0, 0)
 	if err == nil {
 		t.Fatal("nil VFS answered a setattr — expected EIO (the op composition itself is exercised in the e2e rows)")
 	}

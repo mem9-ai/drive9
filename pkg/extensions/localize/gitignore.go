@@ -3,6 +3,7 @@ package localize
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -162,6 +163,19 @@ func (f *Localize) repoRoot(ctx context.Context, inner fs.Filesystem, dir string
 	cur := dir
 	for {
 		if _, err := inner.GetAttr(ctx, joinDir(cur, ".git")); err == nil {
+			f.innerMu.Lock()
+			f.repoRoots[dir] = cur
+			f.innerMu.Unlock()
+			return cur, true
+		}
+		// A .git that exists only in the LOCAL overlay (a coding-agent
+		// mount restoring its working copy) is invisible to the inner
+		// chain: probe the overlay directly or the negative answer caches
+		// "no repository" and gitignore-aware rules shadow tracked files
+		// the Git HEAD tree would serve. Both shapes count — a restored
+		// checkout's .git DIRECTORY and a linked worktree/submodule's
+		// .git FILE.
+		if _, lerr := f.overlay.Lstat(filepath.Join(cur, ".git")); lerr == nil {
 			f.innerMu.Lock()
 			f.repoRoots[dir] = cur
 			f.innerMu.Unlock()

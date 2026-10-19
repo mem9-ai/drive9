@@ -335,7 +335,7 @@ func (f *FS) onLocalMutation(e fs.Event) {
 	}
 	f.inodes.UpdateSize(ino, e.Size)
 	if f.Ctx.DirCache != nil {
-		item := fs.DirEntryInfo{Name: pathutil.BaseName(e.Path), Size: e.Size, Rev: e.Rev, Mtime: time.Now()}
+		item := fs.DirEntryInfo{Name: pathutil.BaseName(e.Path), Size: e.Size, Rev: e.Rev, Mtime: time.Now(), LocalMutation: true}
 		if entry, ok := f.inodes.GetEntry(ino); ok {
 			if entry.HasMode {
 				item.Mode = entry.Mode
@@ -426,15 +426,16 @@ func (f *FS) dirCacheUpsert(child string, attr *fs.Attr) {
 			mode = uint32(syscall.S_IFLNK) | mode&0o777
 		}
 		f.Ctx.DirCache.Upsert(parent, fs.DirEntryInfo{
-			Name:       name,
-			Size:       attr.Size,
-			IsDir:      attr.IsDir(),
-			Mtime:      attr.Mtime,
-			Rev:        attr.Rev,
-			Mode:       mode,
-			HasMode:    true,
-			Nlink:      attr.Nlink,
-			ResourceID: attr.ResourceID,
+			LocalMutation: true,
+			Name:          name,
+			Size:          attr.Size,
+			IsDir:         attr.IsDir(),
+			Mtime:         attr.Mtime,
+			Rev:           attr.Rev,
+			Mode:          mode,
+			HasMode:       true,
+			Nlink:         attr.Nlink,
+			ResourceID:    attr.ResourceID,
 		})
 	}
 }
@@ -463,6 +464,7 @@ func (f *FS) stampOwner(ino uint64, caller fs.Caller) {
 			Name: name, IsDir: isDir, Size: size,
 			Mtime: time.Now(), Mode: mode, HasMode: hasMode,
 			Uid: caller.Uid, Gid: caller.Gid, HasUID: true, HasGID: true,
+			LocalMutation: true,
 		})
 	}
 }
@@ -648,12 +650,13 @@ func (f *FS) publishWriteLength(ino uint64, eof int64) {
 	f.inodes.UpdateSize(ino, eof)
 	if f.Ctx.DirCache != nil {
 		f.Ctx.DirCache.Upsert(parentDirOf(entry.Path), fs.DirEntryInfo{
-			Name:    pathpkg.Base(entry.Path),
-			Size:    eof,
-			IsDir:   false,
-			Mtime:   time.Now(),
-			Mode:    entry.Mode,
-			HasMode: entry.HasMode,
+			Name:          pathpkg.Base(entry.Path),
+			Size:          eof,
+			IsDir:         false,
+			Mtime:         time.Now(),
+			Mode:          entry.Mode,
+			HasMode:       entry.HasMode,
+			LocalMutation: true,
 		})
 	}
 }
@@ -1191,7 +1194,11 @@ func (f *FS) fillAttr(a fs.Attr, ino uint64, out *gofuse.Attr) {
 	}
 	out.SetTimes(&atime, &mtime, &ctime)
 	out.Rdev = a.Rdev
-	if entry != nil {
+	if entry != nil && entry.Rdev != 0 {
+		// A tracked Rdev overrides the reply (local mknod state); a zero
+		// entry value is simply "none recorded" and must not erase the
+		// stat's authoritative device number (extent device nodes
+		// answered 0:0 after their first lookup otherwise).
 		out.Rdev = entry.Rdev
 	}
 	nlink := a.Nlink
@@ -1561,6 +1568,7 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 				Name: pathpkg.Base(e.Path), IsDir: e.IsDir, Size: e.Size,
 				Mtime: time.Now(), Mode: e.Mode, HasMode: e.HasMode,
 				Uid: uid, Gid: gid, HasUID: hasUID, HasGID: hasGID,
+				LocalMutation: true,
 			})
 		}
 	}
@@ -2210,6 +2218,7 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 	if !f.defaultPermissions {
 		mode, modeKnown := uint32(0), false
 		ownerUid, ownerGid := f.uid, f.gid
+		ownerKnown := false
 		if entry, eok := f.inodes.GetEntry(input.NodeId); eok {
 			if entry.HasUID {
 				ownerUid = entry.Uid
@@ -2217,21 +2226,30 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 			if entry.HasGID {
 				ownerGid = entry.Gid
 			}
+			ownerKnown = entry.HasUID && entry.HasGID
 			if entry.HasMode {
 				mode, modeKnown = entry.Mode&0o777, true
 			}
 		}
-		if !modeKnown {
+		if !modeKnown || !ownerKnown {
 			// The inode carries no recorded mode (a chain reply with
 			// mode 0 is ambiguous — a real chmod 000 and "unknown" are
-			// indistinguishable at the boundary): settle it with a fresh
-			// stat instead of skipping the gate — a plain Lookup → Open
-			// of a remote chmod(000) file read the contents otherwise.
+			// indistinguishable at the boundary), or no authoritative
+			// owner (without it the gate tested the MOUNT's uid and
+			// picked the wrong permission class for group-readable
+			// files owned by others): settle both with a fresh stat
+			// instead of skipping the gate — a plain Lookup → Open of a
+			// remote chmod(000) file read the contents otherwise.
 			if st, serr := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path, Ino: input.NodeId, Kernel: input, Caller: caller}); serr == nil && st.Attr != nil {
 				// A successful stat is authoritative — including a real
 				// chmod(000) answer of zero (requiring nonzero would skip
 				// the gate for exactly the mode it exists to enforce).
-				mode, modeKnown = st.Attr.Mode&0o777, true
+				if !modeKnown {
+					mode, modeKnown = st.Attr.Mode&0o777, true
+				}
+				if !ownerKnown && st.Attr.HasOwner {
+					ownerUid, ownerGid = st.Attr.Uid, st.Attr.Gid
+				}
 			}
 		}
 		if modeKnown {

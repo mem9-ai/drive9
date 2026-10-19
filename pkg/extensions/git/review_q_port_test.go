@@ -330,3 +330,81 @@ func TestPortGitWhiteoutFailureRollsBackMarks(t *testing.T) {
 		t.Fatalf("/repo/f.txt after failed whiteout + sync = %q err=%v, want NEW", rd.Data, err)
 	}
 }
+
+// qiffang twenty-first round: rename migrates EVERY open descriptor; a
+// synced zero truncate stays authoritative on reopen; deleted tracked
+// files stay out of fresh listings.
+func TestPortGitRenameMovesEveryDescriptor(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/repo/f.txt", []byte("hello"))
+	b.SeedGitWorkspace("ws-1", "/repo")
+	ch := newStack(t, b)
+	ctx := context.Background()
+
+	open := func() fs.Handle { return openLog2(t, ch, "/repo/f.txt") }
+	h1, h2 := open(), open()
+	if err := h1.Write(ctx, 0, []byte("A")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/repo/f.txt", Path2: "/repo/new.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h1.Sync(ctx); err != nil {
+		t.Fatalf("older descriptor sync after rename: %v", err)
+	}
+	if err := h1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rd, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/new.txt", Offset: 0, Limit: 8})
+	if err != nil || string(rd.Data) != "Aello" {
+		t.Fatalf("/repo/new.txt = %q err=%v, want Aello", rd.Data, err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/repo/f.txt"}); err == nil {
+		t.Fatal("old name resurrected by the older descriptor's sync")
+	}
+}
+
+func TestPortGitZeroTruncateStaysAuthoritative(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/repo/z.txt", []byte("hello"))
+	b.SeedGitWorkspace("ws-1", "/repo")
+	ch := newStack(t, b)
+	ctx := context.Background()
+
+	h := openLog2(t, ch, "/repo/z.txt")
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/repo/z.txt", Size: 0, Handle: h}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h2 := openLog2(t, ch, "/repo/z.txt")
+	if err := h2.Write(ctx, 0, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rd, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/z.txt", Offset: 0, Limit: 8})
+	if err != nil || string(rd.Data) != "X" {
+		t.Fatalf("/repo/z.txt = %q err=%v, want X (zero image authoritative)", rd.Data, err)
+	}
+}
+
+func openLog2(t *testing.T, ch *fs.Chain, path string) fs.Handle {
+	t.Helper()
+	res, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpCreate, Path: path, Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res.Handle
+}

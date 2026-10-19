@@ -64,6 +64,12 @@ var errReadRetriesExhausted = errors.New("read retries exhausted")
 
 // Options configures the terminal.
 type Options struct {
+	// TrustLocalEvents lets the namespace cache answer Lookup/GetAttr
+	// without remote revalidation (single-server mounts where every
+	// mutation flows through this process). Default false: process-local
+	// event bookkeeping cannot see other servers' writes, and the cached
+	// row then hides foreign revisions.
+	TrustLocalEvents bool
 	// RemoteRoot prefixes every engine path before it reaches the client.
 	RemoteRoot string
 
@@ -107,6 +113,9 @@ type Core struct {
 	cl      *client.Client
 	root    string
 	retries int
+	// trustLocalEvents mirrors Options.TrustLocalEvents (namespace-cache
+	// stat shortcut).
+	trustLocalEvents bool
 
 	statRetryCount   int
 	statRetryTimeout time.Duration
@@ -149,6 +158,7 @@ func New(cl *client.Client, opts Options) (*Core, error) {
 	if retries <= 0 {
 		retries = defaultWriteRetries
 	}
+	trustLocal := opts.TrustLocalEvents
 	statRetries := opts.StatRetryCount
 	if statRetries < 0 {
 		statRetries = defaultStatRetryCount
@@ -166,7 +176,8 @@ func New(cl *client.Client, opts Options) (*Core, error) {
 		readFlight:                   singleflight.New(),
 		readSlots:                    make(chan struct{}, readConcurrency),
 		legacyDirStatFallback:        opts.LegacyDirStatFallback,
-		legacyInterruptibleMutations: opts.LegacyInterruptibleMutations}, nil
+		legacyInterruptibleMutations: opts.LegacyInterruptibleMutations,
+		trustLocalEvents:             trustLocal}, nil
 }
 
 // Attach wires the facade-owned namespace cache into the terminal so
@@ -529,6 +540,17 @@ func (c *Core) statFromNamespaceCache(path string) (*fs.Attr, bool) {
 	item, kind := c.dirCache.LookupNamespace(parent, name)
 	switch kind {
 	case fs.LookupPositive:
+		if !c.trustLocalEvents && !item.LocalMutation {
+			// Listing-observed rows do not serve stats without
+			// revalidation on multi-server mounts (default): only the
+			// process-local trust flag — or a row this mount itself wrote
+			// (LocalMutation: its own create/write/landing, which no
+			// foreign server can make stale) — authorizes them. Foreign
+			// writes this mount never heard of would otherwise hide
+			// behind a cached size forever. Negative rows stay served:
+			// they are short-TTL hints on every mount (v1).
+			return nil, false
+		}
 		itemKind := fs.KindFile
 		if item.IsDir {
 			itemKind = fs.KindDir
@@ -1364,5 +1386,5 @@ func attrOf(st *client.StatResult) *fs.Attr {
 			mode = 0o755
 		}
 	}
-	return &fs.Attr{Kind: kind, Mode: mode, Size: st.Size, Rev: st.Revision, Mtime: st.Mtime, Nlink: st.Nlink, ResourceID: st.ResourceID}
+	return &fs.Attr{Kind: kind, Mode: mode, Size: st.Size, Rev: st.Revision, Mtime: st.Mtime, Nlink: st.Nlink, ResourceID: st.ResourceID, ExtentIno: st.ExtentIno}
 }

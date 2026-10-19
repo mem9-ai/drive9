@@ -579,6 +579,10 @@ func MountWithConfig(cfg MountConfig) error {
 			StatRetryTimeout:      cfg.LookupRetryTimeout,
 			ReadConcurrency:       cfg.ReadConcurrency,
 			LegacyDirStatFallback: cfg.LegacyDirStatFallback,
+			// Process-local trust only on single-server mounts that asked
+			// for it: default false keeps the remote revalidation that
+			// observes other servers' writes.
+			TrustLocalEvents: cfg.TrustLocalEvents,
 			// gvisor-compat takes precedence and always keeps commits
 			// detached (v1).
 			LegacyInterruptibleMutations: cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,
@@ -601,6 +605,7 @@ func MountWithConfig(cfg MountConfig) error {
 			Events:             bus,
 			MaxSize:            cfg.CacheSize,
 			TTL:                cfg.ReadCacheTTL,
+			MaxFileSize:        cfg.ReadCacheMaxFileBytes,
 			SequentialPrefetch: true,
 			PrefetchClient:     cl,
 			RemoteRoot:         remoteRoot,

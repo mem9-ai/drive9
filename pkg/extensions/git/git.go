@@ -40,8 +40,12 @@ type overlayEntry struct {
 	// serve: attrs carry size, reads fall through to the base view.
 	remote bool
 	size   int64
-	// Content carries inline payloads.
-	Content []byte
+	// Content carries inline payloads; Materialized marks entries whose
+	// Content slice is the AUTHORITATIVE image — including a zero-length
+	// one (a synced ftruncate(0)) — distinguishing them from metadata-only
+	// rows whose bytes must load from elsewhere.
+	Content      []byte
+	Materialized bool
 	// mtime is the entry's landed time (server UpdatedAt, or now for our
 	// own writes): a rewrite must advance the served stat past whatever
 	// the index last recorded, or git treats the file as racily clean.

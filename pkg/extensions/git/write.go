@@ -285,7 +285,7 @@ func (h *gitHandle) commit(ctx context.Context) error {
 	// matching generation left nothing to republish the newer image).
 	ws.uploadMu.Lock()
 	defer ws.uploadMu.Unlock()
-	if err := h.g.putOverlay(ctx, ws, h.rel, overlayEntry{Op: "upsert", Kind: "file", Content: image, Mode: mode}); err != nil {
+	if err := h.g.putOverlay(ctx, ws, h.rel, overlayEntry{Op: "upsert", Kind: "file", Content: image, Mode: mode, Materialized: true}); err != nil {
 		return err
 	}
 	h.mu.Lock()
@@ -321,7 +321,12 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
 		// NEWlo).
 		return nil
 	}
-	if e, hit := h.w.lookup(h.rel); hit && e.Op == "upsert" && len(e.Content) > 0 {
+	if e, hit := h.w.lookup(h.rel); hit && e.Op == "upsert" && e.Materialized {
+		// An EMPTY upsert is the authoritative image (a synced
+		// ftruncate(0)): the len>0 guard skipped it and reloaded the old
+		// HEAD/base bytes, resurrecting the truncated tail (X over a
+		// zeroed hello answered Xello). Materialized distinguishes an
+		// actual image from a metadata-only entry.
 		if _, err := h.buf.Write(0, e.Content); err != nil {
 			return err
 		}

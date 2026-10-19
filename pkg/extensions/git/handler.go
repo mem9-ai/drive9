@@ -208,7 +208,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		if e, hit := w.lookup(rel); hit && e.Op == "upsert" && e.Mode != "" {
 			mode = e.Mode
 		}
-		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "upsert", Kind: "file", Content: img, Mode: mode}); err != nil {
+		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "upsert", Kind: "file", Content: img, Mode: mode, Materialized: true}); err != nil {
 			return fs.Result{}, err
 		}
 		g.emit(op.Path)
@@ -283,7 +283,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755}}, nil
 
 	case fs.OpSymlink:
-		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "upsert", Kind: "symlink", Content: []byte(op.Target), Mode: "120777"}); err != nil {
+		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "upsert", Kind: "symlink", Content: []byte(op.Target), Mode: "120777", Materialized: true}); err != nil {
 			return fs.Result{}, err
 		}
 		g.emit(op.Path)
@@ -328,10 +328,21 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		if err := g.renameOverlay(ctx, op.Path, op.Path2); err != nil {
 			return fs.Result{}, err
 		}
-		if h := g.handleFor(op.Path); h != nil {
-			if w2, rel2, ok := g.workspaceFor(op.Path2); ok && w2 == w {
-				h.retarget(op.Path2, rel2)
-			}
+		// EVERY open descriptor follows the rename (the per-path slot
+		// holds only the newest claim; an older fd's sync republished the
+		// old name over the rename).
+		if w2, rel2, ok := g.workspaceFor(op.Path2); ok && w2 == w {
+			g.openHandles.Range(func(key, _ any) bool {
+				if h, hok := key.(*gitHandle); hok {
+					h.mu.Lock()
+					path := h.path
+					h.mu.Unlock()
+					if path == op.Path {
+						h.retarget(op.Path2, rel2)
+					}
+				}
+				return true
+			})
 		}
 		g.emit(op.Path)
 		g.emit(op.Path2)
@@ -361,6 +372,27 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 			return fs.Result{Attr: &attr}, nil
 		}
 		handled := false
+		// A clean-tree file (no overlay entry, no ordinary remote file)
+		// must be MATERIALIZED before a path-level chmod/truncate can
+		// touch it: v1's setGitAttr handled unmodified tree files, while
+		// forwarding to next answered ENOENT for fast-clone files — the
+		// kernel's O_TRUNC pre-step included.
+		if op.HasMode || op.Size >= 0 {
+			if _, hit := w.lookup(rel); !hit {
+				if n, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
+					if data, merr := g.materializeBlob(w, n.ObjectSHA); merr == nil {
+						mode := strings.TrimSpace(n.Mode)
+						if mode == "" {
+							mode = "100644"
+						}
+						e := overlayEntry{Op: "upsert", Kind: "file", Content: data, Mode: mode, Materialized: true}
+						if err := g.putOverlay(ctx, w, rel, e); err != nil {
+							return fs.Result{}, err
+						}
+					}
+				}
+			}
+		}
 		if op.HasMode {
 			if e, hit := w.lookup(rel); hit && e.Op == "upsert" {
 				e.Mode = fmt.Sprintf("%o", 0o100000|op.Mode&0o777)
@@ -376,6 +408,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 				nextImg := make([]byte, op.Size)
 				copy(nextImg, e.Content)
 				e.Content = nextImg
+				e.Materialized = true
 				if err := g.putOverlay(ctx, w, rel, e); err != nil {
 					return fs.Result{}, err
 				}
@@ -477,6 +510,21 @@ func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error 
 		}
 		return g.putOverlay(ctx, wOld, relOld, overlayEntry{Op: "whiteout", Kind: e.Kind})
 	}
+	// Clean-tree source (no overlay entry, no ordinary remote file):
+	// materialize the blob through the Git content path — a plain
+	// namespace stat/read 404s for fast-clone files (v1 copyGitFileOverlay).
+	if n, tok := wOld.treeLookup(relOld); tok && n.Kind == "file" && n.ObjectSHA != "" {
+		if data, merr := g.materializeBlob(wOld, n.ObjectSHA); merr == nil {
+			mode := strings.TrimSpace(n.Mode)
+			if mode == "" {
+				mode = "100644"
+			}
+			if err := g.putOverlay(ctx, wNew, relNew, overlayEntry{Op: "upsert", Kind: "file", Content: data, Mode: mode, Materialized: true}); err != nil {
+				return err
+			}
+			return g.putOverlay(ctx, wOld, relOld, overlayEntry{Op: "whiteout", Kind: "file"})
+		}
+	}
 	// base content moves through one fetch + upsert
 	st, err := g.cl.StatCtx(ctx, oldPath)
 	if err != nil {
@@ -493,7 +541,7 @@ func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error 
 	if st.HasMode {
 		mode = fmt.Sprintf("%o", 0o100000|st.Mode&0o777)
 	}
-	if err := g.putOverlay(ctx, wNew, relNew, overlayEntry{Op: "upsert", Kind: "file", Content: data, Mode: mode}); err != nil {
+	if err := g.putOverlay(ctx, wNew, relNew, overlayEntry{Op: "upsert", Kind: "file", Content: data, Mode: mode, Materialized: true}); err != nil {
 		return err
 	}
 	return g.putOverlay(ctx, wOld, relOld, overlayEntry{Op: "whiteout", Kind: "file"})
@@ -506,6 +554,8 @@ func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.
 		return res, err
 	}
 	out := map[string]fs.Entry{}
+	// deleted remembers whiteouted names across the later tree pass.
+	var deleted map[string]bool
 	for _, e := range res.Entries {
 		out[e.Name] = e
 	}
@@ -525,6 +575,13 @@ func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.
 		}
 		if e.Op == "whiteout" {
 			delete(out, name)
+			// Track the deletion so the tree pass cannot re-add the name
+			// ("not in out" was indistinguishable from "not yet covered"):
+			// a deleted tracked file reappeared in every fresh listing.
+			if deleted == nil {
+				deleted = map[string]bool{}
+			}
+			deleted[name] = true
 			continue
 		}
 		kind := kindOf(e)
@@ -563,6 +620,9 @@ func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.
 			continue
 		}
 		if _, covered := out[name]; covered {
+			continue
+		}
+		if deleted[name] {
 			continue
 		}
 		attr := treeAttr(n, cleanMtime)

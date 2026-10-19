@@ -260,6 +260,14 @@ func (l *Layer) replayRename(ctx context.Context, e client.FSLayerEntry, oldLoca
 	if targetRemote == "" {
 		return fmt.Errorf("layer: restore rename entry %s: missing target", e.Path)
 	}
+	// Capture the source's replayed state BEFORE the whiteout erases it:
+	// markLayerWhiteout deletes contents/files[oldLocal], so reading them
+	// after the mark never found a just-replayed image and the move fell
+	// back to (stale) base bytes.
+	l.mu.Lock()
+	data, moved := l.contents[oldLocal]
+	mode, hasMode := l.files[oldLocal]
+	l.mu.Unlock()
 	l.markLayerWhiteout(oldLocal)
 	newLocal := targetRemote
 	if l.root != "/" {
@@ -269,8 +277,6 @@ func (l *Layer) replayRename(ctx context.Context, e client.FSLayerEntry, oldLoca
 		newLocal = strings.TrimPrefix(newLocal, l.root)
 	}
 	l.mu.Lock()
-	data, moved := l.contents[oldLocal]
-	mode, hasMode := l.files[oldLocal]
 	if moved {
 		delete(l.contents, oldLocal)
 		delete(l.files, oldLocal)

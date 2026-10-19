@@ -10,6 +10,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
@@ -56,7 +57,11 @@ type Extent struct {
 
 	// livePaths tracks open extent handles by path: the SQLite -shm
 	// index of an open database reports its mapped size even at 0.
-	live sync.Map
+	// liveMu guards the counts: sync.Map Load→Store is not atomic and
+	// concurrent opens/releases dropped references (the count hit zero
+	// while fds were still open).
+	liveMu sync.Mutex
+	live   map[string]int
 }
 
 // extentMissCap bounds the negative cache. It is a 2s hint, so throwing it
@@ -159,32 +164,27 @@ func (e *Extent) rememberExtentIno(path string, ino uint64) {
 }
 
 // trackLive/untrackLive maintain the open-handle registry by REFERENCE
-// COUNT: two handles on one path (two fds on the same -shm index) left a
-// single set entry, and either Release removed it — the survivor's open
-// state (WAL index mmap retention, unlink/rename opened hints) vanished
-// while the file was still in use.
+// COUNT under one mutex: every increment/decrement and the final removal
+// are atomic with respect to each other (two fds on one -shm keep the
+// entry until the last Release; the survivor's WAL-index retention and
+// unlink/rename opened hints survive).
 func (e *Extent) trackLive(path string) {
-	if n, ok := e.live.Load(path); ok {
-		if cnt, cok := n.(int); cok {
-			e.live.Store(path, cnt+1)
-			return
-		}
+	e.liveMu.Lock()
+	if e.live == nil {
+		e.live = map[string]int{}
 	}
-	e.live.Store(path, 1)
+	e.live[path]++
+	e.liveMu.Unlock()
 }
 
 func (e *Extent) untrackLive(path string) {
-	if n, ok := e.live.Load(path); ok {
-		if cnt, cok := n.(int); cok {
-			if cnt <= 1 {
-				e.live.Delete(path)
-			} else {
-				e.live.Store(path, cnt-1)
-			}
-			return
-		}
+	e.liveMu.Lock()
+	if e.live[path] <= 1 {
+		delete(e.live, path)
+	} else {
+		e.live[path]--
 	}
-	e.live.Delete(path)
+	e.liveMu.Unlock()
 }
 
 // forgetIno drops a path's inode mapping and negative-cache entry: both
@@ -198,19 +198,21 @@ func (e *Extent) forgetIno(path string) {
 
 // retargetLive moves the open-handle registry with a renamed path.
 func (e *Extent) retargetLive(oldPath, newPath string) {
-	if _, ok := e.live.Load(oldPath); ok {
-		e.live.Delete(oldPath)
-		e.live.Store(newPath, struct{}{})
+	e.liveMu.Lock()
+	if n := e.live[oldPath]; n > 0 {
+		delete(e.live, oldPath)
+		if e.live == nil {
+			e.live = map[string]int{}
+		}
+		e.live[newPath] += n
 	}
+	e.liveMu.Unlock()
 }
 
 func (e *Extent) hasLive(path string) bool {
-	n, ok := e.live.Load(path)
-	if !ok {
-		return false
-	}
-	cnt, cok := n.(int)
-	return !cok || cnt > 0
+	e.liveMu.Lock()
+	defer e.liveMu.Unlock()
+	return e.live[path] > 0
 }
 
 func (e *Extent) cachedIno(path string) (uint64, bool) {
@@ -336,7 +338,23 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 		return res, nil
 
 	case fs.OpCreate:
-		claimNew := ShouldUseExtentPath(e.opts.ExtentPaths, op.Path)
+		// The facade maps plain Open and Create to the same op kind: the
+		// glob only decides the layout of files this mount CREATES
+		// (O_CREAT on a missing path). An existing file routes by its
+		// published layout/inode — claiming a classic file by name alone
+		// forced the extent runtime (and its data-credential) into plain
+		// O_RDONLY opens that never needed it.
+		claimNew := false
+		if op.Flags&uint32(syscall.O_CREAT) != 0 && ShouldUseExtentPath(e.opts.ExtentPaths, op.Path) {
+			if _, err := e.opts.Client.StatCtx(ctx, e.remotePath(op.Path)); err != nil && client.IsNotFound(err) {
+				claimNew = true
+			} else if err == nil {
+				// exists: fall through to layout routing below
+				claimNew = false
+			} else {
+				return fs.Result{}, err
+			}
+		}
 		var ino uint64
 		var ok bool
 		if claimNew {
@@ -345,8 +363,18 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			}
 			var fh uint64
 			var attr *jfsmeta.Attr
-			ino, fh, attr, ok = e.createInVFS(ctx, op)
-			if ok && fh != 0 {
+			ino, fh, attr, cerr, cok := e.createInVFS(ctx, op)
+			if cerr != 0 {
+				// A SELECTED extent create that failed is a REAL failure
+				// (ENOSPC/EACCES/EIO): converting it to "not claimed" let
+				// the classic plane create the file under a different
+				// layout and hid the error.
+				return fs.Result{}, errno(cerr)
+			}
+			if !cok {
+				return next(ctx, op)
+			}
+			if fh != 0 {
 				// Reuse the fh VFS.Create allocated (a second Open leaked
 				// the first VFS file reference forever).
 				handle, openFlags, a, err := e.adoptCreatedHandle(op.Path, ino, fh, attr, op.Flags, op.Caller)
@@ -372,10 +400,16 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 		// path may have been renamed over (its cache now holds the
 		// replacement's inode), and truncating through the path corrupted
 		// the new object instead of the caller's old fd.
-		ino := uint64(0)
+		ino, vfsFh := uint64(0), uint64(0)
 		if op.Handle != nil {
 			if eh := extentHandleOf(op.Handle); eh != nil {
+				// BOTH the bound inode and the handle's fh ride into the
+				// VFS call: fh=0 makes JuiceFS treat an FD truncate as a
+				// PATH truncate (permission re-check against the CURRENT
+				// mode — a legal ftruncate after a revoking chmod
+				// answered EACCES).
 				ino = uint64(eh.ino)
+				vfsFh = eh.fh
 			}
 		}
 		if ino == 0 {
@@ -388,7 +422,7 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 		// Size and the metadata fields apply TOGETHER: a truncate that
 		// early-returned dropped a same-request chmod/chown/mtime (the
 		// kernel merges kill-priv mode changes into truncates).
-		return e.setAttrViaVFS(ctx, op, ino)
+		return e.setAttrViaVFS(ctx, op, ino, vfsFh)
 
 	case fs.OpMkdir:
 		// v1 extentMkdir: a directory created inside an already-mirrored
