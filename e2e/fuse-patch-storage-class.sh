@@ -250,7 +250,7 @@ if [ -z "${DRIVE9_S3_BUCKET:-}" ]; then
   : "${DRIVE9_S3_DIR:=$TMP_DIR/s3}"
   export DRIVE9_S3_DIR
 fi
-eval "$(bash "$ROOT_DIR/scripts/local-minio.sh" apply)"
+eval "$(bash "$ROOT_DIR/scripts/local-object-store.sh" apply)"
 
 LISTEN_ADDR="127.0.0.1:$(pick_port)"
 PUBLIC_URL="http://${LISTEN_ADDR}"

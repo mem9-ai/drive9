@@ -114,7 +114,7 @@ run_case "cli" "e2e/cli-smoke-test.sh"
 if [ "$RUN_OBJECT_STORE_SMOKE" = "1" ]; then
   run_case "object-store" "e2e/object-store-smoke-test.sh"
 else
-  skip_case "object-store" "e2e/object-store-smoke-test.sh" "set RUN_OBJECT_STORE_SMOKE=1 to run MinIO fs/mount coverage"
+  skip_case "object-store" "e2e/object-store-smoke-test.sh" "set RUN_OBJECT_STORE_SMOKE=1 to run object store fs/mount coverage"
 fi
 
 if [ "$RUN_API_ONLY" = "1" ]; then
