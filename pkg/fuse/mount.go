@@ -1164,6 +1164,7 @@ func MountWithConfig(cfg MountConfig) error {
 	defer signal.Stop(sigCh)
 	go func() {
 		<-sigCh
+		f.shutdownRequested.Store(true)
 		fmt.Fprintf(os.Stderr, "\ndrive9: unmounting %s...\n", cfg.MountPoint)
 		go func() {
 			<-sigCh
@@ -1183,6 +1184,13 @@ func MountWithConfig(cfg MountConfig) error {
 		ForceUnmount(cfg.MountPoint)
 	}()
 	<-serveDone
+	// A shutdown WE initiated (signal handler: flush → drain → Unmount,
+	// with ForceUnmount as the busy fallback) is a clean worker exit —
+	// the lazy fallback can leave the mountinfo row past the serve end,
+	// and classifying that as abnormal failed the CLI's umount.
+	if f.shutdownRequested.Load() {
+		return nil
+	}
 	// Classify the serve end by the KERNEL mount, not by the OnUnmount
 	// callback: the pinned go-fuse fork invokes OnUnmount unconditionally
 	// after the read loop — including error exits — so the callback is a

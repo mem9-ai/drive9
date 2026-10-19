@@ -121,6 +121,13 @@ type FS struct {
 	// fires unconditionally, clean or abnormal — the mount-exit
 	// classification uses the kernel mountinfo instead).
 	unmounted atomic.Bool
+	// shutdownRequested records that OUR signal handler initiated the
+	// shutdown (flush → drain → Unmount/ForceUnmount): a serve end after
+	// a requested shutdown is a clean worker exit even when the lazy
+	// unmount fallback leaves the mountinfo row past the loop's death —
+	// only a SPONTANEOUS serve exit with the row still present is the
+	// abnormal /dev/fuse disconnect the supervisor restarts.
+	shutdownRequested atomic.Bool
 	started   bool
 
 	uid uint32

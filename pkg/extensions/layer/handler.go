@@ -499,9 +499,6 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 	return next(ctx, op)
 }
 
-// dirHasOverlayChildren ports v1 layerDirHasOverlayChildren: any overlay
-// entry (file, dir, symlink, whiteout, or live handle) directly under dir
-// makes the directory non-empty for rmdir.
 // layerHandleOf walks decorator wrappers (UnwrapHandle) to the layer's
 // own handle; nil when the chain holds none.
 func layerHandleOf(h any) *layerHandle {
@@ -643,58 +640,6 @@ func (l *Layer) maskedByWhiteout(p string) bool {
 		}
 		p = p[:slash]
 	}
-}
-
-func (l *Layer) dirHasOverlayChildren(dir string) bool {
-	prefix := strings.TrimRight(dir, "/") + "/"
-	has := func(path string) bool {
-		if !strings.HasPrefix(path, prefix) {
-			return false
-		}
-		name := strings.TrimPrefix(path, prefix)
-		return name != "" && !strings.Contains(name, "/")
-	}
-	l.mu.RLock()
-	for p := range l.whiteouts {
-		if has(p) {
-			l.mu.RUnlock()
-			return true
-		}
-	}
-	for p := range l.files {
-		if has(p) {
-			l.mu.RUnlock()
-			return true
-		}
-	}
-	for p := range l.dirs {
-		if has(p) {
-			l.mu.RUnlock()
-			return true
-		}
-	}
-	for p := range l.symlinks {
-		if has(p) {
-			l.mu.RUnlock()
-			return true
-		}
-	}
-	for p := range l.contents {
-		if has(p) {
-			l.mu.RUnlock()
-			return true
-		}
-	}
-	l.mu.RUnlock()
-	found := false
-	l.live.Range(func(key, _ any) bool {
-		if path, ok := key.(string); ok && has(path) {
-			found = true
-			return false
-		}
-		return true
-	})
-	return found
 }
 
 // listMerged overlays this layer's children on the base listing.
