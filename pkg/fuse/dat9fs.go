@@ -557,6 +557,10 @@ type layerSymlinkState struct {
 
 // NewDat9FS creates a new FUSE filesystem backed by the given dat9 client.
 func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	if opts.DefaultOwner != nil {
+		uid, gid = opts.DefaultOwner.UID, opts.DefaultOwner.GID
+	}
 	fs := &Dat9FS{
 		RawFileSystem:     gofuse.NewDefaultRawFileSystem(),
 		client:            c,
@@ -574,8 +578,8 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		dirtyInodes:       make(map[uint64]dirtyInodeState),
 		kernelCacheBypass: make(map[uint64]kernelCacheBypassMarker),
 		specialByPath:     make(map[string]uint64),
-		uid:               uint32(os.Getuid()),
-		gid:               uint32(os.Getgid()),
+		uid:               uid,
+		gid:               gid,
 		opts:              opts,
 		syncMode:          opts.SyncMode,
 		debouncer:         newFlushDebouncer(opts.FlushDebounce),

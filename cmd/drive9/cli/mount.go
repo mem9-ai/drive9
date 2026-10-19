@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -149,7 +150,7 @@ func fsMountCmd(args []string) error {
 	return fsMountCmdWithBackground(args, false)
 }
 
-func fsMountCmdWithBackground(args []string, background bool) error {
+func fsMountCmdWithBackground(args []string, background bool) (resultErr error) {
 	authLocal, args, err := peelObjectAuth(args)
 	if err != nil {
 		return err
@@ -168,6 +169,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
 	superviseForeground := fs.Bool("supervise-foreground", false, "run as in-process supervisor and block until stop (sandbox/systemd friendly)")
 	noSupervise := fs.Bool("no-supervise", false, "legacy fire-and-forget background mount without supervisor")
+	defaultOwner := fs.String("owner", "", "UID:GID to report for files without a stored owner (FUSE; default: the mounting user)")
+	noPersistCredentials := fs.Bool("no-persist-credentials", false, "do not store mount credentials in process state (FUSE only; requires --foreground or --no-supervise; disables credential-backed unmount helpers)")
 	supervised := fs.Bool("supervised", false, "internal: worker managed by supervisor")
 	maxRestarts := fs.Int("max-restarts", 5, "supervisor max restarts within restart window")
 	restartWindow := fs.Duration("restart-window", 10*time.Minute, "supervisor restart budget window")
@@ -252,6 +255,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	credentialSecrets := []string{*server, *apiKey}
+	defer func() {
+		if *noPersistCredentials {
+			resultErr = redactMountCommandCredentials(resultErr, credentialSecrets...)
+		}
+	}()
 	gvisorCompatGiven := flagProvided(fs, "gvisor-compat")
 	if !gvisorCompatGiven {
 		*gvisorCompat, err = mountGVisorCompatFromEnv()
@@ -313,6 +322,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	effectiveExtentPatterns := explicitExtentPatterns
 
 	if objectLoc != nil {
+		if *noPersistCredentials {
+			return fmt.Errorf("drive9 mount: --no-persist-credentials is only supported with Drive9 FUSE mounts")
+		}
 		if len(effectiveAppendLogPatterns) > 0 {
 			return fmt.Errorf("drive9 mount: --append-log is only supported with Drive9 FUSE mounts")
 		}
@@ -418,7 +430,6 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
-
 	lookupRetryCountGiven := flagProvided(fs, "lookup-retry-count")
 	lookupRetryTimeoutGiven := flagProvided(fs, "lookup-retry-timeout")
 	readCacheTTLGiven := flagProvided(fs, "read-cache-ttl")
@@ -510,6 +521,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	profileGiven := flagProvided(fs, "profile")
 	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
 	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
+	if *noPersistCredentials && resolved != MountModeFUSE {
+		return fmt.Errorf("drive9 mount: --no-persist-credentials is only supported with Drive9 FUSE mounts")
+	}
 	if len(effectiveAppendLogPatterns) > 0 && resolved != MountModeFUSE {
 		return fmt.Errorf("drive9 mount: --append-log is only supported with Drive9 FUSE mounts")
 	}
@@ -652,10 +666,14 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		*readOnly = true
 	}
 
-	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
+	resolvedCredentials := ResolveCredentials()
+	credentialSecrets = append(credentialSecrets,
+		resolvedCredentials.Server, resolvedCredentials.APIKey, resolvedCredentials.Token)
+	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(resolvedCredentials, *server, *apiKey)
 	if err != nil {
 		return err
 	}
+	credentialSecrets = append(credentialSecrets, serverVal, apiKeyVal, tokenVal)
 	*server, *apiKey = serverVal, apiKeyVal
 	token := tokenVal
 
@@ -708,6 +726,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			Debug:                        *debug,
 			GVisorCompat:                 *gvisorCompat,
 			LegacyInterruptibleMutations: *legacyInterruptibleMutations,
+			OmitProcessStateCredentials:  *noPersistCredentials,
 		})
 	}
 
@@ -715,6 +734,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	// DRIVE9_MOUNT_SUPERVISE=off forces legacy behavior.
 	envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
 	wantSupervise := !*noSupervise && !envSuperviseOff
+	if *noPersistCredentials && (*superviseForeground || background && !*foreground && wantSupervise) {
+		return fmt.Errorf("drive9 mount: --no-persist-credentials requires --foreground or --no-supervise")
+	}
 	if *superviseForeground {
 		// This process becomes the supervisor (blocks).
 		return runSuperviseForeground(mountSuperviseStartRequest{
@@ -915,9 +937,44 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		PerfMaxSampleFiles:           *perfMaxSampleFiles,
 		PerfMaxProfileFiles:          *perfMaxProfileFiles,
 		Supervised:                   *supervised,
+		OmitProcessStateCredentials:  *noPersistCredentials,
+		DefaultOwner:                 strings.TrimSpace(*defaultOwner),
 	}
 
 	return mountFuse(opts)
+}
+
+func redactMountCommandCredentials(err error, secrets ...string) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	for _, secret := range secrets {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "<redacted>")
+		}
+	}
+	if message == err.Error() {
+		return err
+	}
+	return mountCommandRedactedError{message: message, cause: err}
+}
+
+type mountCommandRedactedError struct {
+	message string
+	cause   error
+}
+
+func (e mountCommandRedactedError) Error() string { return e.message }
+func (e mountCommandRedactedError) Unwrap() error { return e.cause }
+
+func (e mountCommandRedactedError) ExitCode() int {
+	type exitCoder interface{ ExitCode() int }
+	var code exitCoder
+	if errors.As(e.cause, &code) {
+		return code.ExitCode()
+	}
+	return 1
 }
 
 type mountSuperviseStartRequest struct {
@@ -1337,7 +1394,51 @@ func foregroundMountCommandArgs(args []string) []string {
 		return out
 	}
 	out = append(out, "--foreground")
-	out = append(out, stripBackgroundOnlyCredentialArgs(args)...)
+	cleaned := stripBackgroundOnlyCredentialArgs(args)
+	if argsEnableNoPersistCredentials(cleaned) {
+		// The child gets the resolved server through its environment. Keep a
+		// possibly credential-bearing --server URL out of its argv, which
+		// stays readable through /proc/<pid>/cmdline.
+		cleaned = stripServerArgs(cleaned)
+	}
+	out = append(out, cleaned...)
+	return out
+}
+
+func argsEnableNoPersistCredentials(args []string) bool {
+	enabled := false
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		name, value, hasValue := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		if name != "no-persist-credentials" || !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		enabled = true
+		if hasValue {
+			parsed, err := strconv.ParseBool(value)
+			enabled = err == nil && parsed
+		}
+	}
+	return enabled
+}
+
+func stripServerArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--server" || arg == "-server" {
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--server=") || strings.HasPrefix(arg, "-server=") {
+			continue
+		}
+		out = append(out, arg)
+	}
 	return out
 }
 

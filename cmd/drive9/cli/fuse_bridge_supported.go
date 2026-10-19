@@ -9,6 +9,19 @@ import (
 )
 
 func mountFuseImpl(opts *mountFuseOptions) error {
+	if opts.OmitProcessStateCredentials {
+		if err := hardenMountCredentialProcess(); err != nil {
+			return fmt.Errorf("protect non-persistent mount credential: %w", err)
+		}
+	}
+	var defaultOwner *drive9fuse.Owner
+	if opts.DefaultOwner != "" {
+		owner, err := drive9fuse.ParseOwner(opts.DefaultOwner)
+		if err != nil {
+			return err
+		}
+		defaultOwner = owner
+	}
 	mode, err := toDrive9FuseSyncMode(opts.SyncMode)
 	if err != nil {
 		return err
@@ -95,7 +108,9 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		},
 		Supervised: opts.Supervised,
 		// Supervised workers do not own the global pidfile; the supervisor does.
-		SkipProcessState: opts.Supervised,
+		SkipProcessState:            opts.Supervised,
+		OmitProcessStateCredentials: opts.OmitProcessStateCredentials,
+		DefaultOwner:                defaultOwner,
 	})
 }
 

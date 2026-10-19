@@ -111,6 +111,47 @@ Environment variables `DRIVE9_SERVER` or `DRIVE9_BASE` and `DRIVE9_API_KEY` take
 | Layer grep | `await client.grepWithLayer(query, prefix, limit, layerRef)` |
 | Find | `await client.find(prefix, params?)` |
 
+### Remote exec
+
+When the server enables it, `exec` runs a command in a sandbox with the
+workspace mounted at `/workspace` and streams its output:
+
+```typescript
+import { Client, isRuntimeBusy, isRuntimeOutcomeUnknown } from "drive9";
+
+const client = Client.defaultClient();
+try {
+  const result = await client.exec(
+    { command: "npm ci && npm test", workspace: { root: "/repo" } },
+    {
+      onStdout: chunk => process.stdout.write(chunk),
+      onStderr: chunk => process.stderr.write(chunk),
+    },
+  );
+  process.exitCode = result.exitCode; // nonzero is a normal result
+} catch (error) {
+  if (isRuntimeBusy(error)) {
+    // Nothing started; retry after error.retryAfterMs.
+  } else if (isRuntimeOutcomeUnknown(error)) {
+    // The command may have run. Check the workspace; do not resubmit blindly.
+  }
+  throw error;
+}
+```
+
+- `command` runs through `/bin/sh -c`; use `argv` to skip the shell.
+- The whole drive is at `/workspace`; the command starts in
+  `/workspace/<workspace.root>` and `cwd` is relative to that. Only
+  `/workspace` persists.
+- Consecutive commands on the same workspace reuse a warm sandbox
+  (`result.sandbox === "warm"`), so installed packages survive between them;
+  processes do not. Pass `fresh: true` to start over in a new sandbox.
+- Pass `signal` to cancel; a resolved cancel means the server confirmed the
+  command stopped and the workspace drained.
+- `runtimeCapabilities()` reports limits such as `max_timeout_ms` and
+  `max_active_per_tenant`; it throws `RuntimeNotEnabledError` when the server
+  does not offer remote exec.
+
 ### Streaming & multipart
 
 | Operation | Method |

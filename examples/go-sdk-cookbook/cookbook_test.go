@@ -293,6 +293,42 @@ func ExampleClient_migrationContract() {
 	})
 }
 
+func ExampleClient_exec() {
+	ctx := context.Background()
+	c := drive9.New("https://drive9.example.com", "owner-api-key")
+
+	// Command runs through /bin/sh -c in /workspace, which is the Drive9
+	// directory Workspace.Root. Use Argv instead to skip the shell.
+	var stdout, stderr bytes.Buffer
+	result, err := c.Exec(ctx, drive9.ExecRequest{
+		Command:   "go test ./...",
+		Workspace: drive9.RuntimeWorkspace{Root: "/projects/example"},
+		TimeoutMS: int64((15 * time.Minute) / time.Millisecond),
+	}, drive9.ExecOptions{Stdout: &stdout, Stderr: &stderr})
+	switch {
+	case drive9.IsRuntimeBusy(err):
+		// Too many commands are running; nothing started, retry later.
+		return
+	case drive9.IsRuntimeOutcomeUnknown(err):
+		// The command may have run. Reconcile instead of resubmitting.
+		return
+	case err != nil:
+		return
+	}
+	_ = result.ExitCode // A nonzero exit code is a normal result.
+	_ = result.Sandbox  // "warm" when the previous command's sandbox was reused.
+}
+
+func ExampleClient_cancelRuntimeExecution() {
+	c := drive9.New("https://drive9.example.com", "workspace-scoped-api-key")
+	cancelCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// Use the ID reported by ExecOptions.OnStarted for an execution that is
+	// still active. A nil error confirms both stop and workspace cleanup.
+	_ = c.CancelRuntimeExecution(cancelCtx, "rex_12345678")
+}
+
 // ExampleClient_archive demonstrates downloading a remote directory tree as a
 // streaming tar.gz (or zip) archive with profile-based filtering. The archive
 // is streamed directly into the provided io.Writer — pipe it to a file, stdout,
@@ -722,6 +758,7 @@ var coveredClientMethods = map[string]bool{
 	"CachedAppendLogSupported":             true,
 	"CachedBatchWriteModeSupported":        true,
 	"CachedSmallFileThreshold":             true,
+	"CancelRuntimeExecution":               true,
 	"CheckpointFSLayer":                    true,
 	"Chmod":                                true,
 	"ChmodCtx":                             true,
@@ -742,6 +779,7 @@ var coveredClientMethods = map[string]bool{
 	"DeleteVaultSecret":                    true,
 	"DiffFSLayer":                          true,
 	"ExtentMeta":                           true,
+	"Exec":                                 true,
 	"GetDataCredential":                    true,
 	"ForkFSLayer":                          true,
 	"DiffFSLayerAtSeq":                     true,
@@ -762,6 +800,7 @@ var coveredClientMethods = map[string]bool{
 	"GetGitWorkspace":                      true,
 	"GetGitWorkspaceByRoot":                true,
 	"GetQuota":                             true,
+	"GetRuntimeCapabilities":               true,
 	"Grep":                                 true,
 	"GrepWithLayer":                        true,
 	"Hardlink":                             true,
