@@ -101,3 +101,28 @@ func TestRedactMountCommandCredentialsPreservesWrappedExitCode(t *testing.T) {
 		t.Fatalf("redacted exit code = %v, %v", code, ok)
 	}
 }
+
+func TestBackgroundChildArgvOmitsServerWithoutPersistentCredentials(t *testing.T) {
+	signed := "https://preview.example/?token=secret"
+	for _, args := range [][]string{
+		{"--no-persist-credentials", "--no-supervise", "--server", signed, ":/", "/mnt"},
+		{"--no-persist-credentials=true", "--server=" + signed, ":/", "/mnt"},
+		{"-no-persist-credentials", "-server", signed, ":/", "/mnt"},
+	} {
+		got := strings.Join(foregroundMountCommandArgs(args), " ")
+		if strings.Contains(got, signed) || strings.Contains(got, "server") {
+			t.Fatalf("child argv %q kept the server", got)
+		}
+		if !strings.Contains(got, ":/ /mnt") {
+			t.Fatalf("child argv %q lost positional arguments", got)
+		}
+	}
+	for _, args := range [][]string{
+		{"--server", "https://drive9.example", ":/", "/mnt"},
+		{"--no-persist-credentials=false", "--server", "https://drive9.example", ":/", "/mnt"},
+	} {
+		if got := strings.Join(foregroundMountCommandArgs(args), " "); !strings.Contains(got, "--server https://drive9.example") {
+			t.Fatalf("child argv %q changed without --no-persist-credentials", got)
+		}
+	}
+}

@@ -44,14 +44,51 @@ func credentialFingerprint(secret string) string {
 	return hex.EncodeToString(digest[:])
 }
 
+// execSymlinkResolveTimeout bounds resolving the working directory: a wedged
+// FUSE endpoint must not hang `drive9 exec`.
+const execSymlinkResolveTimeout = time.Second
+
 // findLocalMount walks up from dir to the nearest live drive9 FUSE mount.
-// It returns nil when dir is not inside one.
+// It returns nil when dir is not inside one. A directory reached through a
+// symlink is resolved first, so the walk finds the real mountpoint.
 func findLocalMount(dir string) (*localMount, error) {
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
 	}
-	candidate := filepath.Clean(absDir)
+	paths := []string{filepath.Clean(absDir)}
+	if resolved, ok := resolveSymlinksBounded(paths[0]); ok && resolved != paths[0] {
+		paths = []string{resolved, paths[0]}
+	}
+	for _, path := range paths {
+		mount, err := findLocalMountFrom(path)
+		if mount != nil || err != nil {
+			return mount, err
+		}
+	}
+	return nil, nil
+}
+
+func resolveSymlinksBounded(path string) (string, bool) {
+	type result struct {
+		path string
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resolved, err := filepath.EvalSymlinks(path)
+		done <- result{resolved, err}
+	}()
+	select {
+	case r := <-done:
+		return r.path, r.err == nil
+	case <-time.After(execSymlinkResolveTimeout):
+		return "", false
+	}
+}
+
+func findLocalMountFrom(absDir string) (*localMount, error) {
+	candidate := absDir
 	for {
 		state, _, err := mountstate.ReadProcessState(backgroundMountStatePoint(candidate))
 		if err == nil && mountLooksLive(state) {

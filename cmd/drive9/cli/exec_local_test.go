@@ -95,3 +95,32 @@ func TestFindLocalMountFallsBackToSupervisorArgsForLayer(t *testing.T) {
 		t.Fatalf("mount = %#v, %v", mount, err)
 	}
 }
+
+func TestFindLocalMountThroughSymlinkAlias(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	mountPoint, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(mountPoint, "web"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	creation, err := mountstate.ProcessCreationTime(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
+		PID: os.Getpid(), CreationTime: creation, MountKind: mountstate.MountKindFUSE,
+		MountPoint: mountPoint, RemoteRoot: "/repo",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(mountPoint, alias); err != nil {
+		t.Fatal(err)
+	}
+	mount, err := findLocalMount(filepath.Join(alias, "web"))
+	if err != nil || mount == nil || mount.MountPoint != mountPoint || mount.remoteCwd() != "web" {
+		t.Fatalf("mount through alias = %#v, %v", mount, err)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -1393,7 +1394,51 @@ func foregroundMountCommandArgs(args []string) []string {
 		return out
 	}
 	out = append(out, "--foreground")
-	out = append(out, stripBackgroundOnlyCredentialArgs(args)...)
+	cleaned := stripBackgroundOnlyCredentialArgs(args)
+	if argsEnableNoPersistCredentials(cleaned) {
+		// The child gets the resolved server through its environment. Keep a
+		// possibly credential-bearing --server URL out of its argv, which
+		// stays readable through /proc/<pid>/cmdline.
+		cleaned = stripServerArgs(cleaned)
+	}
+	out = append(out, cleaned...)
+	return out
+}
+
+func argsEnableNoPersistCredentials(args []string) bool {
+	enabled := false
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		name, value, hasValue := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		if name != "no-persist-credentials" || !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		enabled = true
+		if hasValue {
+			parsed, err := strconv.ParseBool(value)
+			enabled = err == nil && parsed
+		}
+	}
+	return enabled
+}
+
+func stripServerArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--server" || arg == "-server" {
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--server=") || strings.HasPrefix(arg, "-server=") {
+			continue
+		}
+		out = append(out, arg)
+	}
 	return out
 }
 

@@ -110,7 +110,7 @@ func defaultExecRuntime(execID *execIDBox) execRuntime {
 		dir: dir, lookupEnv: os.LookupEnv,
 		server:     func() string { return ResolveCredentials().Server },
 		credential: currentCredentialFingerprint,
-		findMount: findLocalMount, syncMount: syncLocalMount,
+		findMount:  findLocalMount, syncMount: syncLocalMount,
 		client: NewFromEnv, execID: execID,
 	}
 }
