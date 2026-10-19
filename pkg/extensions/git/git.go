@@ -62,7 +62,12 @@ type workspace struct {
 	// tree files instead of content-checking every one on every status.
 	createdAt time.Time
 
-	mu         sync.RWMutex
+	mu sync.RWMutex
+	// uploadMu serializes overlay publication: concurrent commits (a
+	// Drain flush racing a Fsync) could land their PUTs out of order and
+	// leave the server holding the OLDER image while the newer upload
+	// already cleared its dirty state — no later boundary republished it.
+	uploadMu   sync.Mutex
 	overlay    map[string]overlayEntry // rel path (no leading slash) → entry
 	tree       map[string]client.GitTreeNode
 	treeLoaded string // head commit the tree was loaded for

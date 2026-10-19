@@ -315,7 +315,14 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		return fs.Result{}, nil
 
 	case fs.OpSetAttr:
-		if h := g.handleFor(op.Path); h != nil {
+		h := g.handleFor(op.Path)
+		// FATTR_FH names a specific descriptor: resolve THAT handle —
+		// the per-path newest claim is a different fd after a second
+		// open, and truncating it acknowledged nothing on the named one.
+		if own, ok := op.Handle.(*gitHandle); ok {
+			h = own
+		}
+		if h != nil {
 			if op.HasMode {
 				h.SetMode(op.Mode)
 			}

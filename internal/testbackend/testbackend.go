@@ -86,6 +86,9 @@ type Backend struct {
 	gitPacks  map[string][][]byte
 	// layerEntryDelay slows layer-entry POSTs (test knob).
 	layerEntryDelay time.Duration
+	// layerEntryResponseHold parks a layer-entry POST's RESPONSE after
+	// the entry is applied and its event published (test knob).
+	layerEntryResponseHold time.Duration
 	// failLayerEntry injects one failing response per recorded path.
 	failLayerEntry map[string]int
 	// uploads tracks v2 multipart sessions (initiate → parts → complete).
@@ -270,6 +273,14 @@ func (b *Backend) SeedExtent(path string, data []byte, extentIno uint64) {
 func (b *Backend) DelayLayerEntriesForTest(d time.Duration) {
 	b.mu.Lock()
 	b.layerEntryDelay = d
+	b.mu.Unlock()
+}
+
+// HoldLayerEntryResponses parks layer-entry POST responses (after the
+// entry is applied) for the given duration.
+func (b *Backend) HoldLayerEntryResponses(d time.Duration) {
+	b.mu.Lock()
+	b.layerEntryResponseHold = d
 	b.mu.Unlock()
 }
 
@@ -642,12 +653,16 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				delay := b.layerEntryDelay
+				hold := b.layerEntryResponseHold
 				b.layerSeq++
 				e := LayerEntry{Path: req.Path, Op: req.Op, Kind: req.Kind, Mode: req.Mode, Content: req.Content, ContentText: req.ContentText, Seq: b.layerSeq}
 				b.layerLog[id] = append(b.layerLog[id], e)
 				b.mu.Unlock()
 				if delay > 0 {
 					time.Sleep(delay)
+				}
+				if hold > 0 {
+					time.Sleep(hold)
 				}
 				b.writeJSON(w, map[string]any{"layer_id": id, "path": req.Path, "op": req.Op, "seq": e.Seq, "entry_seq": e.Seq})
 				return

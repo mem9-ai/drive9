@@ -257,7 +257,9 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		// only the per-path newest left an older sibling free to upsert
 		// the whiteouted name back at its next sync.
 		var marked []*layerHandle
-		if op.Kind == fs.OpUnlink {
+		markPathHandles := func() {
+			l.regMu.Lock()
+			defer l.regMu.Unlock()
 			l.handles.Range(func(key, _ any) bool {
 				if h, hok := key.(*layerHandle); hok {
 					h.mu.Lock()
@@ -270,6 +272,9 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 				}
 				return true
 			})
+		}
+		if op.Kind == fs.OpUnlink {
+			markPathHandles()
 		}
 		kind := "file"
 		if op.Kind == fs.OpRmdir {
@@ -285,6 +290,15 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 				h.mu.Unlock()
 			}
 			return fs.Result{}, err
+		}
+		if op.Kind == fs.OpUnlink {
+			// A writable open can register between the sweep and the
+			// whiteout landing (opens take regMu, but the HTTP window is
+			// outside it): re-sweep so late arrivals are anonymized too —
+			// their next sync would otherwise upsert the deleted name
+			// back. Opens after the whiteout exists are rejected at claim
+			// time by the whiteout lookup.
+			markPathHandles()
 		}
 		l.markLayerWhiteout(op.Path)
 		l.emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
@@ -332,7 +346,14 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		if err := l.hydrateRemote(ctx, op.Path); err != nil {
 			return fs.Result{}, err
 		}
-		if h := l.handleFor(op.Path); h != nil {
+		h := l.handleFor(op.Path)
+		// FATTR_FH names a specific descriptor: resolve THAT handle —
+		// the per-path newest claim is a different fd after a second
+		// open, and truncating it acknowledged nothing on the named one.
+		if own, ok := op.Handle.(*layerHandle); ok {
+			h = own
+		}
+		if h != nil {
 			if op.HasMode {
 				h.SetMode(op.Mode)
 			}

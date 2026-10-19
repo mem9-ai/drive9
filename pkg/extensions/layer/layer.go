@@ -98,8 +98,18 @@ type Layer struct {
 	inlineMaxOverride int64
 }
 
-// track/untrack maintain the claimed-handle index.
+// track/untrack maintain the claimed-handle index. liveStore joins the
+// registry protocol: without regMu, an open racing a rename or a
+// release-side promotion could publish a half-moved handle (handles set
+// updated, live slot stale) or overwrite a just-arrived newer claim.
 func (l *Layer) liveStore(path string, h *layerHandle) {
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
+	l.liveStoreLocked(path, h)
+}
+
+// liveStoreLocked registers a handle under a held regMu.
+func (l *Layer) liveStoreLocked(path string, h *layerHandle) {
 	l.handles.Store(h, struct{}{})
 	l.live.Store(path, h)
 }
@@ -167,7 +177,13 @@ func (l *Layer) detachFromRegistry(h *layerHandle, path string) {
 		eligible := !other.unlinked && !other.released && other.path == path
 		other.mu.Unlock()
 		if eligible {
-			l.live.Store(path, other)
+			// Promote only into an ABSENT slot: an open that arrived after
+			// our successful CAS (opens hold regMu too, but the slot may
+			// have been empty at its turn) is the newer owner — an
+			// unconditional Store would replace it with an older handle.
+			if _, exists := l.live.Load(path); !exists {
+				l.live.Store(path, other)
+			}
 			return false
 		}
 		return true

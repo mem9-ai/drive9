@@ -273,8 +273,14 @@ func (h *gitHandle) commit(ctx context.Context) error {
 	// OR planted a phantom owner-exec bit (0744) on every published entry.
 	mode := fmt.Sprintf("%o", 0o100000|h.mode)
 	wgen := h.wgen
+	ws := h.w
 	h.mu.Unlock()
-	if err := h.g.putOverlay(ctx, h.w, h.rel, overlayEntry{Op: "upsert", Kind: "file", Content: image, Mode: mode}); err != nil {
+	// Publication is serialized per workspace: an older snapshot's PUT
+	// must never overtake a newer one (the newer completion clearing its
+	// matching generation left nothing to republish the newer image).
+	ws.uploadMu.Lock()
+	defer ws.uploadMu.Unlock()
+	if err := h.g.putOverlay(ctx, ws, h.rel, overlayEntry{Op: "upsert", Kind: "file", Content: image, Mode: mode}); err != nil {
 		return err
 	}
 	h.mu.Lock()

@@ -55,6 +55,12 @@ type layerHandle struct {
 	// byte-identical content, still does.
 	landed    bool
 	landedSeq int64
+	// landing marks a commit whose server call is in flight: the server
+	// publishes the entry/event BEFORE the HTTP reply returns, so a
+	// concurrent event poll can observe it while landed/landedSeq still
+	// describe the PREVIOUS landing — the sweep defers such paths instead
+	// of misjudging them foreign (a false conflicted never cleared).
+	landing bool
 	// unlinkAtRelease publishes the layer whiteout of an unlinked-but-open
 	// path at the last close.
 	unlinkAtRelease func(ctx context.Context) error
@@ -298,7 +304,7 @@ func (h *layerHandle) retarget(newPath string) {
 	released := h.released
 	h.mu.Unlock()
 	if !released {
-		l.liveStore(newPath, h)
+		l.liveStoreLocked(newPath, h)
 	}
 }
 
@@ -332,8 +338,20 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	mode, baseRev, path := h.mode, h.baseRev, h.path
 	wgen := h.wgen
 	image := append([]byte(nil), h.buf.Bytes()...)
+	h.landing = true
 	l := h.l
 	h.mu.Unlock()
+	landingDone := func(entrySeq int64) {
+		h.mu.Lock()
+		h.landing = false
+		if entrySeq > 0 {
+			h.landed = true
+			if entrySeq > h.landedSeq {
+				h.landedSeq = entrySeq
+			}
+		}
+		h.mu.Unlock()
+	}
 
 	l.mu.RLock()
 	abandoned := l.abandoned
@@ -371,8 +389,10 @@ func (h *layerHandle) commit(ctx context.Context) error {
 		})
 	}
 	if err != nil {
+		landingDone(0)
 		return err
 	}
+	landingDone(entrySeqOf(entry))
 	h.l.mu.Lock()
 	if !h.l.abandoned {
 		h.l.files[path] = mode & 0o777
@@ -384,18 +404,6 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	}
 	h.l.mu.Unlock()
 	h.mu.Lock()
-	// The landing identity lets the checkout sweep tell this handle's OWN
-	// commits from foreign ones: write → fsync → write before the next
-	// event poll puts the previous commit into `changed`, and without the
-	// comparison the sweep fenced the newer dirty buffer although no
-	// other client had touched the path. The SERVER's entry sequence is
-	// the identity — a foreign client can write byte-identical content
-	// (a chmod, or a same-content rewrite with a fresh entry), which a
-	// content hash cannot distinguish.
-	h.landed = true
-	if entry != nil && entry.EntrySeq > h.landedSeq {
-		h.landedSeq = entry.EntrySeq
-	}
 	if h.wgen == wgen {
 		// No write arrived while the snapshot uploaded: this commit is
 		// the newest state and may retire the dirty flag. A newer wgen
@@ -409,6 +417,15 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	h.l.emit(fs.Event{Kind: fs.EventLanded, Path: path, Size: size})
 	h.l.emit(fs.Event{Kind: fs.EventInvalidated, Path: path})
 	return nil
+}
+
+// entrySeqOf extracts the server entry sequence from a commit reply
+// (0 when the reply carried none).
+func entrySeqOf(e *client.FSLayerEntry) int64 {
+	if e == nil {
+		return 0
+	}
+	return e.EntrySeq
 }
 
 // ensureBufferLocked creates the write buffer over the current image:

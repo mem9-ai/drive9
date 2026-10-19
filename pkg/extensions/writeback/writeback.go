@@ -327,8 +327,12 @@ func New(opts Options) (*Writeback, error) {
 	// this mount's own acknowledged data and still commit) — review.
 	if opts.Events != nil {
 		opts.Events.On(fs.EventCheckout, func(e fs.Event) {
-			w.liveSet.Range(func(_, v any) bool {
-				if h, ok := v.(*bufferingHandle); ok {
+			// liveSet keys on the handle; the value is the identity
+			// snapshot — asserting the value never matched a handle, so
+			// the sweep silently visited nothing and clean buffers kept
+			// serving the abandoned view's bytes.
+			w.liveSet.Range(func(key, _ any) bool {
+				if h, ok := key.(*bufferingHandle); ok {
 					h.checkoutDropCleanBuffer()
 				}
 				return true
@@ -695,8 +699,9 @@ func (w *Writeback) UploaderSnapshot() (queued, inFlight int) {
 // (v1 dirty-inode accounting for the continuous-perf queue sample).
 func (w *Writeback) DirtyHandleCount() int {
 	n := 0
-	w.liveSet.Range(func(_, v any) bool {
-		if h, ok := v.(*bufferingHandle); ok {
+	// liveSet keys on the handle (the value is the identity snapshot).
+	w.liveSet.Range(func(key, _ any) bool {
+		if h, ok := key.(*bufferingHandle); ok {
 			h.mu.Lock()
 			if h.dirty {
 				n++
@@ -1927,14 +1932,22 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 
 // Release implements fs.Handle.
 func (h *bufferingHandle) Release(ctx context.Context) error {
-	h.w.untrack(h)
+	// One identity snapshot for the whole close (a concurrent retarget
+	// rewrites h.path under h.mu — bare reads were a data race and could
+	// split a single Release's cancel/cleanup/submit across two names).
+	path := h.infoSnapshot().path
+	// The handle stays DISCOVERABLE until its final durability boundary:
+	// unregistering first let a concurrent rename conclude "no live
+	// writer", move the remote name, and then publish this Release's
+	// captured image right back under the old name.
+	defer h.w.untrack(h)
 	if h.w.debounce != nil {
-		h.w.debounce.Cancel(h.path)
+		h.w.debounce.Cancel(path)
 	}
 	// The last handle of an unlinked name releases its snapshot (v1
-	// survivor cleanup).
-	if h.w.unlinkedShadowServed(h.path) && h.w.handleFor(h.path) == nil {
-		h.w.dropUnlinkedShadow(h.path)
+	// survivor cleanup): no OTHER tracked handle still holds the name.
+	if h.w.unlinkedShadowServed(path) && !h.w.hasOtherTrackedHandle(path, h) {
+		h.w.dropUnlinkedShadow(path)
 	}
 	// An O_CREAT claim that never landed must still materialize as a remote
 	// file (stages it in pendingIndex at Create): git probes the
@@ -1951,7 +1964,7 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 	h.stagedToCache = false
 	h.mu.Unlock()
 	if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
-		if _, ok := h.w.wbCache.GetMeta(h.path); ok {
+		if _, ok := h.w.wbCache.GetMeta(path); ok {
 			if dirty {
 				// A write landed between Flush and Release: the staged
 				// snapshot is stale — refresh it from the current buffer
@@ -1965,7 +1978,7 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 			// owns the close upload — submit it exactly once instead of
 			// re-committing (commitLocked would publish a second image and
 			// race the uploader's CAS on the same base).
-			h.w.uploader.Submit(h.path)
+			h.w.uploader.Submit(path)
 			h.mu.Lock()
 			h.dirty = false
 			h.visTrunc = false
@@ -2319,8 +2332,40 @@ func (w *Writeback) localPathOf(rp string) string {
 // track registers an open writer by path (newest wins, matching 's
 // per-path Setattr deferral) and in the walk set for unlink/rename.
 func (w *Writeback) track(h *bufferingHandle) {
+	// Opens join the registry protocol: without regMu here, a release-side
+	// survivor promotion or a concurrent rename move could observe a
+	// half-registered handle and overwrite/duplicate its slot.
+	w.regMu.Lock()
+	defer w.regMu.Unlock()
+	w.trackLocked(h)
+}
+
+// trackLocked registers a handle under a held regMu.
+func (w *Writeback) trackLocked(h *bufferingHandle) {
 	w.live.Store(h.path, h)
 	w.liveSet.Store(h, h.infoSnapshot())
+}
+
+// hasOtherTrackedHandle reports whether any handle other than except is
+// currently registered under path (identity from the lock-free snapshot).
+func (w *Writeback) hasOtherTrackedHandle(path string, except *bufferingHandle) bool {
+	found := false
+	w.liveSet.Range(func(key, v any) bool {
+		other, ok := key.(*bufferingHandle)
+		if !ok || other == except {
+			return true
+		}
+		info, iok := v.(*handleInfo)
+		if !iok {
+			info = other.infoSnapshot()
+		}
+		if info.path == path {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // handleInfo is the immutable registry snapshot carried in liveSet: the
@@ -2353,9 +2398,16 @@ func (w *Writeback) untrack(h *bufferingHandle) {
 	// and promoting an older handle here would overwrite it). Candidate
 	// identity and lifetime are verified under the candidate's lock, read
 	// from the lock-free info snapshot first.
-	path := h.infoSnapshot().path
 	w.regMu.Lock()
 	defer w.regMu.Unlock()
+	// Identity is captured INSIDE the registry lock: a retarget that moved
+	// the fd between an outside snapshot and this lock would strand the
+	// slot it actually owns (the snapshot's path no longer maps us, the
+	// CAS misses, and the new-name slot leaks pointing at a releasing
+	// handle). retarget also runs under regMu, so the read is stable.
+	h.mu.Lock()
+	path := h.path
+	h.mu.Unlock()
 	if w.live.CompareAndDelete(path, h) {
 		w.liveSet.Range(func(key, v any) bool {
 			other, ok := key.(*bufferingHandle)
@@ -2372,8 +2424,14 @@ func (w *Writeback) untrack(h *bufferingHandle) {
 			other.mu.Lock()
 			eligible := !other.unlinked
 			other.mu.Unlock()
+			// Promote only into an ABSENT slot: an open that registered
+			// after our CAS (it holds regMu too, but the slot may have
+			// been empty at its turn) is the newer owner — an
+			// unconditional Store would replace it with an older handle.
 			if eligible {
-				w.live.Store(path, other)
+				if _, exists := w.live.Load(path); !exists {
+					w.live.Store(path, other)
+				}
 				return false
 			}
 			return true
@@ -2575,14 +2633,16 @@ func (w *Writeback) markLinked(p string, under bool) {
 // directory, and re-keys the per-path writer index.
 func (w *Writeback) retarget(oldPath, newPath string) {
 	prefix := strings.TrimSuffix(oldPath, "/") + "/"
+	// The WHOLE move — identity rewrite and slot migration — runs under
+	// one regMu section (lock order regMu → handle mutex everywhere, so
+	// the release-side survivor scan cannot invert against it). With the
+	// identity update outside the registry lock, a concurrent untrack
+	// snapshotting between the two steps missed the real slot and left
+	// the new name pointing at a releasing handle.
+	w.regMu.Lock()
+	defer w.regMu.Unlock()
 	w.liveSet.Range(func(key, _ any) bool {
 		h := key.(*bufferingHandle)
-		// The descriptor's identity moves under its own lock; the live-slot
-		// move runs under regMu AFTER releasing it (the lock order must
-		// stay handle-mutex-then-regMu everywhere, or a release-side
-		// survivor scan under regMu deadlocks against a retarget holding
-		// this mutex) and by compare-and-delete: a newer claim that took
-		// the slot is never evicted by an older fd's rename.
 		h.mu.Lock()
 		next := ""
 		var slotOld string
@@ -2608,11 +2668,11 @@ func (w *Writeback) retarget(oldPath, newPath string) {
 		}
 		h.mu.Unlock()
 		if slotOld != "" {
-			w.regMu.Lock()
+			// Compare-and-delete: a newer claim that took the slot is
+			// never evicted by an older fd's rename.
 			if w.live.CompareAndDelete(slotOld, h) {
 				w.live.Store(next, h)
 			}
-			w.regMu.Unlock()
 		}
 		return true
 	})

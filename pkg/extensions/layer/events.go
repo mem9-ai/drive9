@@ -103,10 +103,39 @@ func (l *Layer) refreshEvents(ctx context.Context) error {
 		l.mu.Unlock()
 		return nil
 	}
+	// Paths with a commit IN FLIGHT defer their events: the server
+	// publishes an entry/event before the committing goroutine sees the
+	// HTTP reply, so the landing identity is not yet observable and the
+	// sweep cannot tell those events from foreign ones. The cursor stops
+	// BEFORE the first deferred event — the next refresh re-examines them
+	// once the identity is available (processing is idempotent).
+	deferred := map[string]bool{}
+	l.handles.Range(func(key, _ any) bool {
+		if h, ok := key.(*layerHandle); ok {
+			h.mu.Lock()
+			busy, path := h.landing, h.path
+			h.mu.Unlock()
+			if busy {
+				deferred[l.remotePath(path)] = true
+			}
+		}
+		return true
+	})
+	deferSeq := int64(0)
+	if len(deferred) > 0 {
+		for i := range events {
+			if deferred[events[i].Path] && (deferSeq == 0 || events[i].Seq < deferSeq) {
+				deferSeq = events[i].Seq
+			}
+		}
+	}
 	if err := l.Restore(ctx); err != nil {
 		return err
 	}
 	l.mu.Lock()
+	if deferSeq > 0 && deferSeq <= max {
+		max = deferSeq - 1
+	}
 	l.lastSeq = max
 	l.mu.Unlock()
 	// Open handles follow external layer changes (v1 open-handle refresh):
@@ -141,7 +170,10 @@ func (l *Layer) refreshEvents(ctx context.Context) error {
 		// whiteout/content into the moved fd (review P1).
 		h.mu.Lock()
 		path := h.path
-		if h.released || !changed[path] {
+		// h.landing defers this handle's path wholesale (its events stay
+		// unconsumed above): judging them now would conflict the handle
+		// on its own in-flight publication.
+		if h.released || !changed[path] || h.landing {
 			h.mu.Unlock()
 			return true
 		}
