@@ -2011,11 +2011,14 @@ func (f *FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) ([]byte, 
 // supplementary groups via /proc).
 func hasPOSIXAccess(caller fs.Caller, ownerUid, ownerGid uint32, mode uint32, mask uint32) bool {
 	if caller.Uid == 0 {
-		// v1: root passes read/write regardless; X needs some execute bit.
-		if mask&0b011 == 0 {
+		// POSIX root rule: R_OK/W_OK always granted; X_OK granted when
+		// ANY execute bit is set. (Testing mask&0b011 made a pure
+		// W_OK/R_OK request fall through to the execute-bit check, and
+		// root was denied O_WRONLY/O_RDWR of a 0600 file.)
+		if mask&0b001 == 0 {
 			return true
 		}
-		return mode&0b001 != 0 || mode&0b010 != 0 || mode&0b100 != 0
+		return mode&0o111 != 0
 	}
 	shift := uint32(0)
 	switch {

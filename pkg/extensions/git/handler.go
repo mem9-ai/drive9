@@ -295,6 +295,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		// matching descriptor, not just the per-path newest (an older
 		// fd's later sync would overwrite a recreated object with the
 		// deleted image).
+		var marked []*gitHandle
 		if op.Kind == fs.OpUnlink {
 			g.openHandles.Range(func(key, _ any) bool {
 				if h, hok := key.(*gitHandle); hok {
@@ -303,12 +304,21 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 					h.mu.Unlock()
 					if path == op.Path {
 						h.markUnlinked()
+						marked = append(marked, h)
 					}
 				}
 				return true
 			})
 		}
 		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "whiteout", Kind: "file"}); err != nil {
+			// The whiteout did NOT land — the name still exists, and the
+			// failed unlink must not silently orphan every marked fd (a
+			// later Sync would skip it as anonymous and drop the write).
+			for _, h := range marked {
+				h.mu.Lock()
+				h.unlinked = false
+				h.mu.Unlock()
+			}
 			return fs.Result{}, err
 		}
 		g.emit(op.Path)
@@ -454,6 +464,13 @@ func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error 
 	if e, hit := wOld.lookup(relOld); hit {
 		if e.Op == "whiteout" {
 			return fs.ErrNotFound
+		}
+		if e.Kind == "dir" && wOld.hasEntriesUnder(relOld+"/") {
+			// A NON-EMPTY overlay directory: mv's recursive-copy fallback
+			// owns subtree moves. Copying just the directory entry and
+			// whiteouting the source reported success while dropping
+			// every child from the new name.
+			return syscall.EXDEV
 		}
 		if err := g.putOverlay(ctx, wNew, relNew, e); err != nil {
 			return err

@@ -7,6 +7,7 @@ package layer
 import (
 	"context"
 	"io"
+	"os"
 	"sync"
 	"syscall"
 	"time"
@@ -47,6 +48,11 @@ type layerHandle struct {
 	// conflict): writes and commits answer EAGAIN — the buffer is kept, and
 	// publishing it onto the new tip would splice stale bytes.
 	conflicted bool
+	// unlinkedExternal marks a deletion observed from OUTSIDE (an event
+	// sweep saw the whiteout): the fd serves ENOENT. A LOCAL unlink's
+	// anonymous fd keeps reading its buffered image — only republishing
+	// the old name is forbidden.
+	unlinkedExternal bool
 	// landed/landedSeq identify the entry THIS handle last landed (the
 	// server's entry sequence): the checkout sweep compares them against
 	// the observed event sequence so the handle's own commits never fence
@@ -141,9 +147,11 @@ func (h *layerHandle) Attr() fs.Attr {
 func (h *layerHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.unlinked {
+	if h.unlinkedExternal {
 		// An externally whiteouted path serves ENOENT even on an open fd
-		// (v1 survivor semantics: the fd must not resurrect deleted content).
+		// (v1 survivor semantics: the fd must not resurrect deleted
+		// content). A locally-unlinked anonymous fd is NOT invalidated:
+		// it keeps serving its own image (POSIX unlink semantics).
 		return 0, fs.ErrNotFound
 	}
 	if h.buf == nil {
@@ -395,19 +403,33 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	moved := h.path != path
 	unlinked := h.unlinked
 	h.mu.Unlock()
-	if moved {
+	if moved || unlinked {
 		unlock()
-		return syscall.EAGAIN
-	}
-	if unlinked {
-		unlock()
+		// The aborted attempt still ends its landing window: a marker
+		// left set kept the fd's path permanently deferred in the event
+		// sweep, skipping foreign-change conflict checks forever after.
+		landingDone(0)
+		if moved {
+			return syscall.EAGAIN
+		}
 		return nil
 	}
 	defer unlock()
 	var entry *client.FSLayerEntry
 	var err error
 	if streamed {
-		entry, err = l.cl.UploadFSLayerFile(ctx, l.layerRef, l.remotePath(path), newBoundedImageReader(buf, size), size, baseRev, mode, true)
+		// The spill holds the handle's mutex for the copy: the buffer is
+		// not thread-safe, and a concurrent Write (a Drain flush racing
+		// the same fd) would otherwise splice into the streamed image.
+		h.mu.Lock()
+		spill, serr := spillLayerImage(buf, size)
+		h.mu.Unlock()
+		if serr != nil {
+			landingDone(0)
+			return serr
+		}
+		entry, err = l.cl.UploadFSLayerFile(ctx, l.layerRef, l.remotePath(path), spill.file, size, baseRev, mode, true)
+		spill.close()
 	} else {
 		entry, err = l.cl.UpsertFSLayerEntry(ctx, l.layerRef, client.FSLayerEntryRequest{
 			Path:         l.remotePath(path),
@@ -458,45 +480,78 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	return nil
 }
 
-// newBoundedImageReader streams size bytes of the buffer's image.
-func newBoundedImageReader(buf *writebuffer.WriteBuffer, size int64) *boundedImageReader {
-	return &boundedImageReader{buf: buf, size: size}
+// layerSpill is a stable, bounded-memory snapshot of the handle's image
+// on a local temp file.
+type layerSpill struct {
+	file *os.File
 }
 
-// boundedImageReader streams a write buffer's image in bounded memory:
-// chunks are pulled through ReadAt (lazy part loads, zero-filled holes)
-// instead of materializing the whole image. One chunk is held at a time.
-type boundedImageReader struct {
-	buf   *writebuffer.WriteBuffer
-	off   int64
-	size  int64
-	chunk [1 << 20]byte
-	n     int
-	i     int
-}
-
-func (r *boundedImageReader) Read(p []byte) (int, error) {
-	if r.i >= r.n {
-		if r.off >= r.size {
-			return 0, io.EOF
-		}
-		want := int64(len(r.chunk))
-		if rem := r.size - r.off; rem < want {
-			want = rem
-		}
-		got := r.buf.ReadAt(r.off, r.chunk[:want])
-		if got < 0 {
-			got = 0
-		}
-		r.n, r.i = got, 0
-		if r.n == 0 {
-			return 0, io.EOF
-		}
+func (s *layerSpill) close() {
+	if s.file != nil {
+		name := s.file.Name()
+		_ = s.file.Close()
+		_ = os.Remove(name)
+		s.file = nil
 	}
-	n := copy(p, r.chunk[r.i:r.n])
-	r.i += n
-	r.off += int64(n)
-	return n, nil
+}
+
+// spillLayerImage copies size bytes of the buffer to a temp file under
+// the handle's OWN mutex (WriteBuffer is not thread-safe — a Drain flush
+// racing a Write on the same fd read mixed images through a reader that
+// held no lock), in bounded memory: each chunk loads the retained base
+// parts it spans (ReadAt alone zero-fills unloaded parts — a 16MiB
+// partially-modified file persisted 8MiB of zeros) and releases the
+// clean ones it loaded; dirty parts are the fd's own data and stay.
+func spillLayerImage(buf *writebuffer.WriteBuffer, size int64) (*layerSpill, error) {
+	tmp, err := os.CreateTemp("", "drive9-layer-commit-*")
+	if err != nil {
+		return nil, err
+	}
+	s := &layerSpill{file: tmp}
+	if err := func() error {
+		const chunkSize = 1 << 20
+		chunk := make([]byte, chunkSize)
+		partSize := buf.PartSize()
+		for off := int64(0); off < size; {
+			want := int64(chunkSize)
+			if rem := size - off; rem < want {
+				want = rem
+			}
+			// Load the retained base parts this chunk spans, remembering
+			// which we caused (clean ones are released after the copy).
+			first := int(off / partSize)
+			last := int((off + want - 1) / partSize)
+			var loaded []int
+			for p := first; p <= last; p++ {
+				if !buf.IsPartLoaded(p) {
+					if err := buf.EnsureLoaded(p); err != nil {
+						return err
+					}
+					loaded = append(loaded, p)
+				}
+			}
+			n := buf.ReadAt(off, chunk[:want])
+			if n <= 0 {
+				return io.ErrUnexpectedEOF
+			}
+			if _, werr := tmp.Write(chunk[:n]); werr != nil {
+				return werr
+			}
+			for _, p := range loaded {
+				buf.ReleaseCleanPart(p)
+			}
+			off += int64(n)
+		}
+		return nil
+	}(); err != nil {
+		s.close()
+		return nil, err
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		s.close()
+		return nil, err
+	}
+	return s, nil
 }
 
 // entrySeqOf extracts the server entry sequence from a commit reply

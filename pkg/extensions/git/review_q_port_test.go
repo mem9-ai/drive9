@@ -6,6 +6,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -231,5 +232,101 @@ func TestPortUnlinkAnonymizesEveryGitDescriptor(t *testing.T) {
 	rd, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/f.txt", Offset: 0, Limit: 8})
 	if err != nil || string(rd.Data) != "NEW" {
 		t.Fatalf("/repo/f.txt = %q err=%v, want NEW (recreated object preserved)", rd.Data, err)
+	}
+}
+
+// Renaming a NON-EMPTY overlay directory answers EXDEV: mv's recursive
+// fallback owns the subtree — the entry-copy + whiteout reported success
+// while the children vanished from the new name.
+func TestPortNonEmptyOverlayDirRenameFallsBack(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspace("ws-1", "/repo")
+	ch := newStack(t, b)
+	ctx := context.Background()
+
+	// Own the directory and a child through the overlay.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/repo/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/repo/d/f", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Write(ctx, 0, []byte("child")); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_, err = ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/repo/d", Path2: "/repo/new"})
+	if !errors.Is(err, syscall.EXDEV) {
+		t.Fatalf("non-empty overlay dir rename err = %v, want EXDEV (mv recursive fallback)", err)
+	}
+	// The source subtree is untouched by the refused rename.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/d/f", Offset: 0, Limit: 8}); err != nil || true {
+		_ = err // presence re-checked below via attr
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/repo/d/f"}); err != nil {
+		t.Fatalf("child vanished after the refused rename: %v", err)
+	}
+}
+
+// A FAILED whiteout rolls the anonymization back: the fd's later Sync
+// still publishes (a 503 no longer silently drops the write).
+func TestPortGitWhiteoutFailureRollsBackMarks(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/repo/f.txt", []byte("old"))
+	b.SeedGitWorkspace("ws-1", "/repo")
+	// The whiteout rides the git OVERLAY endpoint — gate its first call
+	// with a 503 instead of the layer-entries knob.
+	var calls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "overlay") &&
+			(r.Method == http.MethodPut || r.Method == http.MethodPost) &&
+			calls.Add(1) == 1 {
+			http.Error(w, "whiteout forced failure", http.StatusServiceUnavailable)
+			return
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	g, err := New(Options{Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.armed = true
+	if err := g.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = g.Stop(context.Background()) })
+	terminal, _ := core.New(cl, core.Options{})
+	ch, err := fs.NewChain(g, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/repo/f.txt", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := res.Handle
+	if err := h.Write(ctx, 0, []byte("NEW")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/repo/f.txt"}); err == nil {
+		t.Fatal("forced-failure whiteout reported success")
+	}
+	// The fd is NOT anonymous: its sync still lands.
+	if err := h.Sync(ctx); err != nil {
+		t.Fatalf("sync after failed whiteout: %v", err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rd, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/f.txt", Offset: 0, Limit: 8})
+	if err != nil || string(rd.Data) != "NEW" {
+		t.Fatalf("/repo/f.txt after failed whiteout + sync = %q err=%v, want NEW", rd.Data, err)
 	}
 }

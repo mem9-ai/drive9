@@ -205,8 +205,12 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 							continue
 						}
 						// Replace a remote row with the local plane's
-						// attributes (the overlay owns this name).
-						delete(seen, e.Name())
+						// attributes (the overlay owns this name): record
+						// the name so the remote pass drops its shadowed
+						// row — the set starts EMPTY (a bare delete never
+						// matched), so same-named remote entries listed
+						// twice and READDIRPLUS exposed the conflict.
+						seen[e.Name()] = struct{}{}
 						merged = append(merged, fs.Entry{Name: e.Name(), Attr: attrOfLocalInfo(info)})
 					}
 				}

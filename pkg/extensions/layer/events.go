@@ -205,6 +205,7 @@ func (l *Layer) refreshEvents(ctx context.Context) error {
 		}
 		if look && kind == "whiteout" {
 			h.unlinked = true
+			h.unlinkedExternal = true
 		}
 		h.mu.Unlock()
 		return true

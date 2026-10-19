@@ -101,6 +101,19 @@ func (w *workspace) noteTreeSize(rel string, size int64) {
 	}
 }
 
+// hasEntriesUnder reports whether any overlay entry lives strictly
+// below the prefix (rel paths carry no leading slash).
+func (w *workspace) hasEntriesUnder(prefix string) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	for rel := range w.overlay {
+		if strings.HasPrefix(rel, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (w *workspace) lookup(rel string) (overlayEntry, bool) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -285,6 +298,7 @@ func (g *Git) trackWorkspace(path string, h *gitHandle) {
 	// the deleted name over a recreated object.
 	g.openHandles.Store(h, path)
 }
+
 // untrackHandle removes a descriptor from both indexes (its path slot
 // may already belong to a newer claim).
 func (g *Git) untrackHandle(h *gitHandle) {

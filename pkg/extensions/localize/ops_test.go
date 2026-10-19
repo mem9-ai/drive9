@@ -20,6 +20,19 @@ func doOp(t *testing.T, f *Localize, op *fs.Op) (fs.Result, error) {
 	return f.Do(context.Background(), op, next)
 }
 
+// remoteListOp runs one op against a next plane whose OpList answers a
+// fixed remote listing (the local/remote merge rows).
+func remoteListOp(t *testing.T, f *Localize, op *fs.Op, entries []fs.Entry) (fs.Result, error) {
+	t.Helper()
+	next := fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		if op.Kind == fs.OpList {
+			return fs.Result{Entries: entries}, nil
+		}
+		return fs.Result{}, fs.ErrUnsupported
+	})
+	return f.Do(context.Background(), op, next)
+}
+
 func TestSetAttrMtimeAppliesChtimes(t *testing.T) {
 	f := newTestRouter(t, []string{"**/node_modules/**"}, nil)
 	writeBacking(t, f, "repo/node_modules/a.js", "a")
@@ -206,5 +219,38 @@ func TestReadWithoutHandleServesOverlay(t *testing.T) {
 	}
 	if string(res.Data) != "payload" {
 		t.Fatalf("read = %q", res.Data)
+	}
+}
+
+// qiffang eighteenth round (I1): a local overlay child with the SAME
+// name as a remote row replaces it — the merged listing carries the
+// local entry once, never both rows.
+func TestListLocalChildReplacesRemoteRow(t *testing.T) {
+	f := newTestRouter(t, []string{"**/node_modules/**"}, nil)
+	root := f.overlay.Root()
+	if err := os.MkdirAll(filepath.Join(root, "repo", "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "repo", "node_modules", "same.tmp"), []byte("local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The remote plane below reports a same-named row with a different
+	// size (999) — the local row must own the name.
+	res, err := remoteListOp(t, f, &fs.Op{Kind: fs.OpList, Path: "/repo/node_modules"}, []fs.Entry{{Name: "same.tmp", Attr: fs.Attr{Kind: fs.KindFile, Size: 999}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, size := 0, int64(0)
+	for _, e := range res.Entries {
+		if e.Name == "same.tmp" {
+			count++
+			size = e.Attr.Size
+		}
+	}
+	if count != 1 {
+		t.Fatalf("same.tmp listed %d times, want exactly 1 (local row owns the name)", count)
+	}
+	if size != int64(len("local")) {
+		t.Fatalf("same.tmp size = %d, want the local size %d", size, len("local"))
 	}
 }

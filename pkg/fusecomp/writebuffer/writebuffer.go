@@ -928,6 +928,16 @@ func (wb *WriteBuffer) EnsureLoaded(partIdx int) error {
 	return wb.ensurePart(partIdx)
 }
 
+// ReleaseCleanPart drops a loaded CLEAN part from memory (a spill that
+// loaded a retained base part only to stream it past frees it again;
+// dirty parts are the handle's own data and stay).
+func (wb *WriteBuffer) ReleaseCleanPart(partIdx int) {
+	if part, ok := wb.parts[partIdx]; ok && !wb.dirtyParts[partIdx] {
+		wb.curMemory -= int64(len(part))
+		delete(wb.parts, partIdx)
+	}
+}
+
 // IsSequential reports whether the buffer is still in sequential append mode.
 func (wb *WriteBuffer) IsSequential() bool {
 	return wb.sequential

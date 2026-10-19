@@ -201,9 +201,13 @@ func (s *Specials) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		// The rename replaces whatever the target was: a special record
 		// squatting on the target dies with it, or it would shadow the
 		// remotely-renamed entry now living at the target (and hijack the
-		// rename-back into the local-only path above).
+		// rename-back into the local-only path above). The drop waits for
+		// the remote rename to SUCCEED — dropping first destroyed the
+		// FIFO when a later 403/5xx failed the rename, and the failed
+		// namespace op had erased the existing target.
+		hadTarget := false
 		if _, ok := s.get(op.Path2); ok {
-			s.drop(op.Path2)
+			hadTarget = true
 		}
 		res, err := next(ctx, op)
 		if err != nil {
@@ -213,6 +217,9 @@ func (s *Specials) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			if !fs.IsNotFound(err) {
 				return res, err
 			}
+		}
+		if hadTarget {
+			s.drop(op.Path2)
 		}
 		s.renameSubtree(op.Path, op.Path2)
 		return res, nil

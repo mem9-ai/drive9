@@ -14,6 +14,7 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
+	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
 // A remote chmod(000) followed by a REAL Lookup (no manual UpdateMode)
@@ -86,5 +87,44 @@ func TestPortServeExitClassificationIgnoresUnmountCallback(t *testing.T) {
 	present = false
 	if err := classifyServeExit("/mnt/x", func(string) bool { return present }); err != nil {
 		t.Fatalf("disappeared mount row classified %v, want clean", err)
+	}
+}
+
+// qiffang nineteenth round: root's access mask follows POSIX — pure
+// R/W requests pass without an execute bit; X needs any execute bit.
+func TestPortRootAccessMaskPOSIXRule(t *testing.T) {
+	root := fs.Caller{Uid: 0, Gid: 0}
+	if !hasPOSIXAccess(root, 1000, 1000, 0o600, 0b010) {
+		t.Fatal("root W_OK on 0600 denied")
+	}
+	if !hasPOSIXAccess(root, 1000, 1000, 0o600, 0b100) {
+		t.Fatal("root R_OK on 0600 denied")
+	}
+	if !hasPOSIXAccess(root, 1000, 1000, 0o600, 0b110) {
+		t.Fatal("root R|W on 0600 denied")
+	}
+	if hasPOSIXAccess(root, 1000, 1000, 0o644, 0b001) {
+		t.Fatal("root X_OK on 0644 granted without any execute bit")
+	}
+	if !hasPOSIXAccess(root, 1000, 1000, 0o644|0o100, 0b001) {
+		t.Fatal("root X_OK on 0744 denied despite owner execute bit")
+	}
+	// End-to-end: a fresh root O_RDWR open of a 0600 file passes the gate.
+	b := testbackend.NewBackend()
+	b.Seed("/rw", []byte("data"))
+	b.SetNodeMode("/rw", 0o600)
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	f, _ := facadeOverCore(t, ts)
+	entryOut := gofuse.EntryOut{}
+	if st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "rw", &entryOut); st != gofuse.OK {
+		t.Fatalf("lookup: %v", st)
+	}
+	hdr := gofuse.InHeader{NodeId: entryOut.NodeId}
+	hdr.Uid = 0
+	hdr.Gid = 0
+	out := gofuse.OpenOut{}
+	if st := f.Open(nil, &gofuse.OpenIn{InHeader: hdr, Flags: uint32(syscall.O_RDWR)}, &out); st != gofuse.OK {
+		t.Fatalf("root O_RDWR of 0600 = %v, want OK", st)
 	}
 }

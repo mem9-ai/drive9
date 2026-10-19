@@ -229,31 +229,37 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		if l.readOnly {
 			return fs.Result{}, syscall.EROFS
 		}
-		// v1 upsertLayerHardlink: a hardlink whose source lives in the
-		// overlay copies the image to the target as a layer upsert — the
-		// base plane cannot hardlink overlay content. Base-plane sources
-		// fall through to the base plane's hardlink.
-		if kind, mode, _, content, ok := l.lookup(op.Path); ok && kind == "file" {
-			data := append([]byte(nil), content...)
-			m := mode
-			if m == 0 {
-				m = 0o644
-			}
-			if err := l.upsertFile(ctx, op.Path2, data, 0, m); err != nil {
-				return fs.Result{}, err
-			}
-			return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: m, Size: int64(len(data))}}, nil
+		// v1 upsertLayerHardlink: the target is ALWAYS a layer entry —
+		// overlay content, an object-backed overlay image (hydrated
+		// first: its lookup content is nil until read, and publishing
+		// that as empty zeroed the link), or the base object read into
+		// the layer. Falling through to the base plane's hardlink for
+		// base sources mutated the shared base namespace from uncommitted
+		// layer state (visible to other mounts, beyond rollback).
+		data, mode, ok := l.linkSourceImage(ctx, op.Path)
+		if !ok {
+			return fs.Result{}, fs.ErrNotFound
 		}
-		return next(ctx, op)
+		m := mode
+		if m == 0 {
+			m = 0o644
+		}
+		if err := l.upsertFile(ctx, op.Path2, data, 0, m); err != nil {
+			return fs.Result{}, err
+		}
+		return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: m, Size: int64(len(data))}}, nil
 
 	case fs.OpUnlink, fs.OpRmdir:
 		if l.readOnly {
 			return fs.Result{}, syscall.EROFS
 		}
-		// v1 layerDirHasOverlayChildren: a non-empty layer directory must
-		// refuse rmdir with ENOTEMPTY before the whiteout lands — the
-		// overlay entries would otherwise live on under a hidden name.
-		if op.Kind == fs.OpRmdir && l.dirHasOverlayChildren(op.Path) {
+		// Emptiness is judged over the MERGED view: overlay children
+		// (minus whiteouted ones) plus real base children. The overlay-only
+		// check both hid base children (rmdir of a dir holding base files
+		// succeeded and whiteouted the whole directory) and counted
+		// whiteouted children as presence (an emptied dir stayed
+		// ENOTEMPTY forever).
+		if op.Kind == fs.OpRmdir && l.mergedDirHasChildren(ctx, op.Path, next) {
 			return fs.Result{}, syscall.ENOTEMPTY
 		}
 		unlock := l.mutLocks.lock(op.Path)
@@ -514,6 +520,111 @@ func layerHandleOf(h any) *layerHandle {
 		h = inner
 	}
 	return nil
+}
+
+// mergedDirHasChildren reports whether the directory has any VISIBLE
+// child in the merged layer+base view: overlay children survive unless
+// whiteouted, and base children count when the overlay does not replace
+// or delete them.
+func (l *Layer) mergedDirHasChildren(ctx context.Context, dir string, next fs.Next) bool {
+	prefix := strings.TrimSuffix(dir, "/") + "/"
+	direct := func(p string) (string, bool) {
+		if !strings.HasPrefix(p, prefix) {
+			return "", false
+		}
+		name := strings.TrimPrefix(p, prefix)
+		return name, name != "" && !strings.Contains(name, "/")
+	}
+	l.mu.RLock()
+	visible := map[string]bool{}
+	for p := range l.files {
+		if n, ok := direct(p); ok {
+			visible[n] = true
+		}
+	}
+	for p := range l.dirs {
+		if n, ok := direct(p); ok {
+			visible[n] = true
+		}
+	}
+	for p := range l.symlinks {
+		if n, ok := direct(p); ok {
+			visible[n] = true
+		}
+	}
+	for p := range l.whiteouts {
+		if n, ok := direct(p); ok {
+			// A whiteout deletes the name outright — it is not presence.
+			delete(visible, n)
+		}
+	}
+	l.mu.RUnlock()
+	if len(visible) > 0 {
+		return true
+	}
+	// Base children that the overlay neither replaced nor deleted.
+	res, err := next(ctx, &fs.Op{Kind: fs.OpList, Path: dir})
+	if err != nil {
+		return false
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	for _, e := range res.Entries {
+		p := prefix + e.Name
+		if _, wh := l.whiteouts[p]; wh {
+			continue
+		}
+		if _, f := l.files[p]; f {
+			continue
+		}
+		if _, d := l.dirs[p]; d {
+			continue
+		}
+		if _, sl := l.symlinks[p]; sl {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// linkSourceImage resolves a hardlink source's full image inside the
+// layer: overlay bytes, a hydrated object-backed overlay entry, or the
+// base object itself.
+func (l *Layer) linkSourceImage(ctx context.Context, path string) ([]byte, uint32, bool) {
+	kind, mode, _, content, ok := l.lookup(path)
+	switch {
+	case ok && kind == "whiteout":
+		return nil, 0, false
+	case ok && kind == "file" && content == nil:
+		// Object-backed entry not yet materialized: hydrate, then read.
+		if _, rok := l.remoteSize(path); rok {
+			if err := l.hydrateRemote(ctx, path); err != nil {
+				return nil, 0, false
+			}
+			_, mode, _, content, ok = l.lookup(path)
+			if !ok {
+				return nil, 0, false
+			}
+		}
+		return append([]byte(nil), content...), mode, true
+	case ok && kind == "file":
+		return append([]byte(nil), content...), mode, true
+	}
+	// Base-plane source: read the object into the layer.
+	st, err := l.cl.StatCtx(ctx, l.remotePath(path))
+	if err != nil || st == nil || st.IsDir {
+		return nil, 0, false
+	}
+	data, err := l.cl.ReadCtx(ctx, l.remotePath(path))
+	if err != nil {
+		return nil, 0, false
+	}
+	m := st.Mode & 0o777
+	if m == 0 {
+		m = 0o644
+	}
+	return data, m, true
 }
 
 // maskedByWhiteout reports whether any ancestor of p (or p itself) is

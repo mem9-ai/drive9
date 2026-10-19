@@ -2,6 +2,7 @@ package specials
 
 import (
 	"context"
+	"errors"
 	"syscall"
 	"testing"
 
@@ -231,5 +232,51 @@ func TestReexecRefusalReportsCount(t *testing.T) {
 	}
 	if reason, n := s.ReexecRefusal(); n != 1 || reason == "" {
 		t.Fatalf("refusal = %q %d", reason, n)
+	}
+}
+
+// nextHandler adapts a Next into a Handler.
+type nextHandler struct{ next fs.Next }
+
+func (n nextHandler) Do(ctx context.Context, op *fs.Op, _ fs.Next) (fs.Result, error) {
+	return n.next(ctx, op)
+}
+
+// qiffang nineteenth round: a FAILED rename does not destroy the target
+// special — the drop waits for the remote rename to succeed.
+func TestPortFailedRenameKeepsTargetSpecial(t *testing.T) {
+	sp, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The terminal answers the source file but fails renames with EACCES
+	// (a non-404 failure — the drop must not have happened yet).
+	srcAttr := fs.Attr{Kind: fs.KindFile, Mode: 0o644, Size: 3}
+	failing := fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		switch op.Kind {
+		case fs.OpGetAttr:
+			if op.Path == "/src" {
+				return fs.Result{Attr: &srcAttr}, nil
+			}
+			return fs.Result{}, fs.ErrNotFound
+		case fs.OpRename:
+			return fs.Result{}, syscall.EACCES
+		}
+		return fs.Result{}, nil
+	})
+	ch, err := fs.NewChain(sp, nextHandler{failing})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := mkfifo(ch, "/fifo"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/src", Path2: "/fifo"}); !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("rename err = %v, want EACCES", err)
+	}
+	// The FIFO survived the failed rename.
+	if mode, err := getMode(ch, "/fifo"); err != nil || mode&syscall.S_IFMT != syscall.S_IFIFO {
+		t.Fatalf("target fifo after failed rename: mode=%o err=%v, want FIFO", mode, err)
 	}
 }
