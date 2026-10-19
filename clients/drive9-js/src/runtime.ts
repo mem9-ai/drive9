@@ -181,9 +181,10 @@ export async function exec(client: RuntimeClient, input: ExecRequest, options: E
   if (response.status === 404) throw new RuntimeNotEnabledError();
   if (!response.ok) {
     const failure = await readRuntimeError(response);
-    // Only a 4xx rejection proves the command never ran; a 5xx (for example
-    // a gateway 502/504 after the server accepted the request) is unknown.
-    if (response.status >= 500 || response.status === 408) {
+    // Only a 4xx rejection proves the command never ran; a 3xx (a proxy may
+    // have redirected an accepted POST) or a 5xx (for example a gateway
+    // 502/504 after the server accepted the request) is unknown.
+    if (response.status < 400 || response.status >= 500 || response.status === 408) {
       throw unknownOutcome(failure.message || `HTTP ${response.status}`);
     }
     if (response.status === 429) {

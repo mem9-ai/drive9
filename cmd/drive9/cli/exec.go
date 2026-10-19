@@ -98,6 +98,7 @@ type execRuntime struct {
 	credential           func() string
 	findMount            func(string) (*localMount, error)
 	syncMount            func(context.Context, *localMount) error
+	mountLayer           func(context.Context, *localMount) (string, error)
 	client               func() *client.Client
 	execID               *execIDBox
 }
@@ -110,7 +111,7 @@ func defaultExecRuntime(execID *execIDBox) execRuntime {
 		dir: dir, lookupEnv: os.LookupEnv,
 		server:     func() string { return ResolveCredentials().Server },
 		credential: currentCredentialFingerprint,
-		findMount:  findLocalMount, syncMount: syncLocalMount,
+		findMount:  findLocalMount, syncMount: syncLocalMount, mountLayer: localMountLayer,
 		client: NewFromEnv, execID: execID,
 	}
 }
@@ -209,6 +210,16 @@ func resolveExecWorkspace(ctx context.Context, options *execOptions, rt execRunt
 	if !mountMatchesCurrentAccount(mount, rt) {
 		return fmt.Errorf("%s is a drive9 mount of a different account, or its account cannot be verified; pass -w to choose a workspace", mount.MountPoint)
 	}
+	// The layer comes from the live mount itself: a supervised mount records
+	// no layer on disk, and guessing would silently run against the base
+	// workspace instead of the layer the user sees.
+	layer, err := "", errors.New("layer lookup unavailable")
+	if rt.mountLayer != nil {
+		layer, err = rt.mountLayer(ctx, mount)
+	}
+	if err != nil {
+		return fmt.Errorf("cannot tell which layer %s shows: %v (remount it with this drive9 version, or pass -w)", mount.MountPoint, err)
+	}
 	if rt.syncMount != nil {
 		progress := newExecProgressMessage(rt.stderr, rt.stderrTTY && !options.verbose, "drive9: uploading local changes…")
 		err := rt.syncMount(ctx, mount)
@@ -219,7 +230,7 @@ func resolveExecWorkspace(ctx context.Context, options *execOptions, rt execRunt
 	}
 	options.workspace = mount.workspace()
 	if options.layer == "" {
-		options.layer = mount.Layer
+		options.layer = layer
 	}
 	if !options.cwdSet {
 		options.cwd = mount.remoteCwd()

@@ -23,7 +23,6 @@ const execLocalSyncTimeout = 2 * time.Minute
 type localMount struct {
 	MountPoint string
 	RemoteRoot string
-	Layer      string
 	Server     string
 	// Rel is the current directory relative to MountPoint ("." at its root).
 	Rel           string
@@ -102,13 +101,8 @@ func findLocalMountFrom(absDir string) (*localMount, error) {
 			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 				return nil, nil
 			}
-			layer := strings.TrimSpace(state.Layer)
-			if layer == "" {
-				// Supervisor state records the original arguments instead.
-				layer = layerFromMountArgs(state.Args)
-			}
 			return &localMount{
-				MountPoint: candidate, RemoteRoot: state.RemoteRoot, Layer: layer,
+				MountPoint: candidate, RemoteRoot: state.RemoteRoot,
 				Server: state.Server, Rel: filepath.ToSlash(rel), ControlSocket: strings.TrimSpace(state.ControlSocket),
 				Credential: credentialFingerprint(firstNonEmpty(state.APIKey, state.Token)),
 			}, nil
@@ -129,16 +123,23 @@ func mountLooksLive(state mountstate.ProcessState) bool {
 		processMatchesIdentity(state.SupervisorPID, state.SupervisorCreationTime)
 }
 
-func layerFromMountArgs(args []string) string {
-	for index, arg := range args {
-		if value, ok := strings.CutPrefix(arg, "--layer="); ok {
-			return value
-		}
-		if arg == "--layer" && index+1 < len(args) {
-			return args[index+1]
-		}
+// execMountStatusTimeout bounds asking a local mount which layer it shows.
+const execMountStatusTimeout = 5 * time.Second
+
+// localMountLayer asks the running mount for the resolved layer ID it serves
+// ("" for the base workspace). A mount too old to report it is an error.
+func localMountLayer(ctx context.Context, mount *localMount) (string, error) {
+	if mount.ControlSocket == "" {
+		return "", errors.New("the mount has no control socket")
 	}
-	return ""
+	status, err := mountcontrol.RequestStatus(ctx, mount.ControlSocket, execMountStatusTimeout)
+	if err != nil {
+		return "", err
+	}
+	if status.Layer == nil {
+		return "", errors.New("the mount does not report its layer")
+	}
+	return *status.Layer, nil
 }
 
 // remoteCwd maps the current directory inside the mount to a sandbox working

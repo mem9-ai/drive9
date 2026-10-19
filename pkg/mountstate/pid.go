@@ -15,14 +15,12 @@ import (
 )
 
 type ProcessState struct {
-	PID          int    `json:"pid"`
-	CreationTime uint64 `json:"creation_time,omitempty"`
-	Component    string `json:"component,omitempty"`
-	MountKind    string `json:"mount_kind,omitempty"`
-	MountPoint   string `json:"mount_point,omitempty"`
-	RemoteRoot   string `json:"remote_root,omitempty"`
-	// Layer is the resolved fs layer ID of a layered mount.
-	Layer                  string   `json:"layer,omitempty"`
+	PID                    int      `json:"pid"`
+	CreationTime           uint64   `json:"creation_time,omitempty"`
+	Component              string   `json:"component,omitempty"`
+	MountKind              string   `json:"mount_kind,omitempty"`
+	MountPoint             string   `json:"mount_point,omitempty"`
+	RemoteRoot             string   `json:"remote_root,omitempty"`
 	Profile                string   `json:"profile,omitempty"`
 	LocalRoot              string   `json:"local_root,omitempty"`
 	Server                 string   `json:"server,omitempty"`

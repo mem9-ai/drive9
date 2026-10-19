@@ -288,8 +288,9 @@ func TestExecInsideLocalMountUsesItsWorkspaceAfterUploading(t *testing.T) {
 	rt.server = func() string { return "https://drive9.example/" }
 	rt.credential = func() string { return "fp-a" }
 	rt.findMount = func(string) (*localMount, error) {
-		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/repo", Layer: "fork-1", Server: "https://drive9.example", Credential: "fp-a", Rel: "web/src"}, nil
+		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/repo", Server: "https://drive9.example", Credential: "fp-a", Rel: "web/src"}, nil
 	}
+	rt.mountLayer = func(context.Context, *localMount) (string, error) { return "fork-1", nil }
 	rt.syncMount = func(context.Context, *localMount) error { synced++; return nil }
 	if err := runExec(t.Context(), []string{"npm", "test"}, rt); err != nil {
 		t.Fatal(err)
@@ -322,6 +323,7 @@ func TestExecReportsLocalUploadFailure(t *testing.T) {
 	rt.findMount = func(string) (*localMount, error) {
 		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/", Server: "https://drive9.example", Credential: "fp-a", Rel: "."}, nil
 	}
+	rt.mountLayer = func(context.Context, *localMount) (string, error) { return "", nil }
 	rt.syncMount = func(context.Context, *localMount) error { return errors.New("upload stalled") }
 	err := runExec(t.Context(), []string{"true"}, rt)
 	if err == nil || !strings.Contains(err.Error(), "could not upload local changes in /home/me/drive9: upload stalled") || !strings.Contains(err.Error(), "pass -w") {
@@ -465,15 +467,3 @@ func (b *syncBuffer) Write(p []byte) (int, error) {
 	return b.b.Write(p)
 }
 func (b *syncBuffer) String() string { b.mu.Lock(); defer b.mu.Unlock(); return b.b.String() }
-
-func TestLayerFromMountArgs(t *testing.T) {
-	for args, want := range map[string]string{
-		"mount --layer fork-1 :/ /mnt": "fork-1",
-		"mount --layer=fork-2 :/ /mnt": "fork-2",
-		"mount :/ /mnt":                "",
-	} {
-		if got := layerFromMountArgs(strings.Fields(args)); got != want {
-			t.Errorf("%q -> %q, want %q", args, got, want)
-		}
-	}
-}

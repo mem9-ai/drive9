@@ -732,7 +732,8 @@ func Mount(opts *MountOptions) (err error) {
 	if err != nil {
 		return err
 	}
-	controlServer, err := startMountControlServer(opts.MountPoint, dat9fs)
+	// opts.LayerRef holds the resolved layer ID by now.
+	controlServer, err := startMountControlServer(opts.MountPoint, opts.LayerRef, dat9fs)
 	if err != nil {
 		cleanupMountStartFailure(mountStartCleanup{
 			reason:       "mount control socket failure",
@@ -1026,7 +1027,6 @@ func newMountProcessState(opts *MountOptions, mountPoint string, creationTime ui
 		MountKind:           mountstate.MountKindFUSE,
 		MountPoint:          mountPoint,
 		RemoteRoot:          opts.RemoteRoot,
-		Layer:               opts.LayerRef,
 		Profile:             opts.Profile,
 		LocalRoot:           opts.LocalRoot,
 		Server:              server,

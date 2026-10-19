@@ -340,7 +340,7 @@ func TestExecDoesNotFollowRedirect(t *testing.T) {
 	defer origin.Close()
 	_, err := New(origin.URL, "secret").Exec(t.Context(), ExecRequest{Argv: []string{"true"}}, ExecOptions{})
 	var start *RuntimeStartError
-	if !errors.As(err, &start) || redirected.Load() != 0 {
+	if !IsRuntimeOutcomeUnknown(err) || errors.As(err, &start) || redirected.Load() != 0 {
 		t.Fatalf("error/redirected = %T %v/%d", err, err, redirected.Load())
 	}
 }
@@ -381,6 +381,8 @@ func TestExecHTTPFailureClassification(t *testing.T) {
 		unknown bool
 	}{
 		{status: http.StatusBadRequest}, {status: http.StatusUnauthorized}, {status: http.StatusForbidden},
+		{status: http.StatusMultipleChoices, unknown: true}, {status: http.StatusFound, unknown: true},
+		{status: http.StatusTemporaryRedirect, unknown: true}, {status: http.StatusNotModified, unknown: true},
 		{status: http.StatusRequestTimeout, unknown: true},
 		{status: http.StatusInternalServerError, unknown: true}, {status: http.StatusBadGateway, unknown: true},
 		{status: http.StatusServiceUnavailable, unknown: true}, {status: http.StatusGatewayTimeout, unknown: true},

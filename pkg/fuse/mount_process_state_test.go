@@ -111,12 +111,6 @@ func TestMountCredentialErrorRedactsFailureAndPreservesExitCode(t *testing.T) {
 	}
 }
 
-func TestMountProcessStateRecordsLayer(t *testing.T) {
-	state := newMountProcessState(&MountOptions{LayerRef: "layer-123"}, "/mnt", 1, "", "", time.Unix(1, 0))
-	if state.Layer != "layer-123" {
-		t.Fatalf("layer = %q", state.Layer)
-	}
-}
 
 func TestExitReasonIsRedactedWithoutPersistentCredentials(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())

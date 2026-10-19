@@ -356,14 +356,15 @@ func (c *Client) CancelRuntimeExecution(ctx context.Context, executionID string)
 }
 
 // runtimeHTTPStartError maps a non-streaming response. Only a 4xx rejection
-// from the server proves the command never ran; a 5xx (including a gateway
-// 502/504 after the server may have accepted the request) is unknown.
+// from the server proves the command never ran; a 3xx (the POST may have been
+// accepted before a proxy redirected it) or a 5xx (including a gateway 502/504
+// after the server may have accepted the request) is unknown.
 func runtimeHTTPStartError(resp *http.Response) error {
 	if resp.StatusCode == http.StatusNotFound {
 		return ErrRuntimeNotEnabled
 	}
 	err := readRuntimeHTTPError(resp)
-	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout {
+	if resp.StatusCode < 400 || resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout {
 		return runtimeUnknown("", err)
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
