@@ -123,6 +123,10 @@ type MountOptions struct {
 	// unmount. Callers using this mode cannot use credential-backed post-unmount
 	// helpers such as auto-pack.
 	OmitProcessStateCredentials bool
+	// DefaultOwner, when set, is the uid/gid reported for files that carry
+	// no stored owner (normally the mounting process). A sandbox uses it to
+	// present the workspace as owned by its unprivileged application user.
+	DefaultOwner *Owner
 	// Supervised marks this worker as managed by an external supervisor (logging only).
 	Supervised bool
 }

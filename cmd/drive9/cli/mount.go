@@ -168,6 +168,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
 	superviseForeground := fs.Bool("supervise-foreground", false, "run as in-process supervisor and block until stop (sandbox/systemd friendly)")
 	noSupervise := fs.Bool("no-supervise", false, "legacy fire-and-forget background mount without supervisor")
+	defaultOwner := fs.String("owner", "", "UID:GID to report for files without a stored owner (FUSE; default: the mounting user)")
 	noPersistCredentials := fs.Bool("no-persist-credentials", false, "do not store mount credentials in process state (FUSE only; requires --foreground or --no-supervise; disables credential-backed unmount helpers)")
 	supervised := fs.Bool("supervised", false, "internal: worker managed by supervisor")
 	maxRestarts := fs.Int("max-restarts", 5, "supervisor max restarts within restart window")
@@ -936,6 +937,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		PerfMaxProfileFiles:          *perfMaxProfileFiles,
 		Supervised:                   *supervised,
 		OmitProcessStateCredentials:  *noPersistCredentials,
+		DefaultOwner:                 strings.TrimSpace(*defaultOwner),
 	}
 
 	return mountFuse(opts)

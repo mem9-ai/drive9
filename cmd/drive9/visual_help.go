@@ -749,6 +749,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "--mode auto|fuse|webdav", Desc: "mount mode; auto selects the best supported mode"},
 					{Name: "--foreground", Desc: "run in foreground and block until unmounted"},
 					{Name: "--no-persist-credentials", Desc: "omit credentials from FUSE process state; requires --foreground or --no-supervise"},
+					{Name: "--owner UID:GID", Desc: "owner to report for files without a stored owner; default: the mounting user"},
 					{Name: "--direct-mount-strict", Desc: "Linux only; use mount(2) without fallback to fusermount"},
 					{Name: "--gvisor-compat", Desc: "enable gVisor-specific FUSE compatibility behavior; env DRIVE9_MOUNT_GVISOR_COMPAT"},
 					{Name: "--legacy-interruptible-mutations", Desc: "let FUSE interrupts cancel in-flight remote commits: namespace mutations AND synchronous write/flush/fsync/release data commits (legacy EAGAIN behavior); no effect with --gvisor-compat; env DRIVE9_MOUNT_LEGACY_INTERRUPTIBLE_MUTATIONS"},
