@@ -35,6 +35,10 @@ type gitHandle struct {
 	buf      *writebuffer.WriteBuffer
 	dirty    bool
 	unlinked bool
+	// fresh marks a create over a whiteout: the name was deleted in the
+	// overlay, and the new object must NOT inherit the hidden base (or
+	// clean-tree) identity — it starts empty.
+	fresh bool
 	// wgen fences commit completion against mutations acknowledged while
 	// an older snapshot uploads (the mutex is released across
 	// putOverlay): only the generation that landed may clear dirty state.
@@ -53,10 +57,11 @@ func (g *Git) claimWorkspaceOpen(w *workspace, path, rel string, flags uint32, m
 	if hit && e.Op != "whiteout" && e.Kind != "file" {
 		return nil, syscall.EISDIR
 	}
-	if hit && e.Op == "whiteout" {
+	fresh := hit && e.Op == "whiteout"
+	if fresh {
 		hit = false // fresh create over the whiteout
 	}
-	h := &gitHandle{g: g, w: w, path: path, rel: rel, flags: flags}
+	h := &gitHandle{g: g, w: w, path: path, rel: rel, flags: flags, fresh: fresh}
 	if hit {
 		h.mode = parseMode(e.Mode)
 	}
@@ -191,7 +196,7 @@ func (h *gitHandle) Sync(ctx context.Context) error  { return h.commit(ctx) }
 func (h *gitHandle) Flush(ctx context.Context) error { return h.commit(ctx) }
 
 func (h *gitHandle) Release(ctx context.Context) error {
-	h.g.untrackWorkspace(h.path)
+	h.g.untrackHandle(h)
 	if h.unlinked {
 		return nil
 	}
@@ -309,6 +314,13 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
 		return nil
 	}
 	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	if h.fresh {
+		// A recreated name owns an empty image: preloading the overlay,
+		// clean-tree blob or remote base would resurrect the deleted
+		// object's bytes under the new create (NEW over hello answered
+		// NEWlo).
+		return nil
+	}
 	if e, hit := h.w.lookup(h.rel); hit && e.Op == "upsert" && len(e.Content) > 0 {
 		if _, err := h.buf.Write(0, e.Content); err != nil {
 			return err

@@ -5,7 +5,6 @@
 package layer
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"sync"
@@ -81,7 +80,20 @@ func (l *Layer) claimWithMode(path string, flags uint32, mode uint32, hasMode bo
 	h := &layerHandle{l: l, path: path, flags: flags, mode: mode, isNew: false}
 	switch {
 	case ok && (kind == "whiteout"):
-		return nil, fs.ErrNotFound
+		if flags&uint32(syscall.O_CREAT) == 0 {
+			return nil, fs.ErrNotFound
+		}
+		// A create over a whiteout owns the name FRESH: the whiteout
+		// hides the deleted base object from plain opens, but a new
+		// create must neither be refused (the name could never be
+		// recreated) nor inherit the hidden base's identity — it starts
+		// as a new empty file.
+		h.mode = mode & 0o777
+		if h.mode == 0 && !hasMode {
+			h.mode = 0o644
+		}
+		h.isNew = true
+		return h, nil
 	case ok && kind == "symlink", ok && kind == "dir":
 		// namespace entries have no data plane here
 		return nil, syscall.EISDIR
@@ -330,16 +342,27 @@ func (h *layerHandle) commit(ctx context.Context) error {
 			return err
 		}
 	}
-	if err := h.buf.LoadMissingParts(); err != nil {
+	l := h.l
+	size := h.buf.Size()
+	streamed := size > l.inlineMax()
+	if streamed {
+		// Bounded memory: the streamed path uploads through a chunked
+		// reader over the buffer (ReadAt lazy-loads parts one at a time
+		// and zero-fills holes) — materializing the whole image with
+		// Bytes() first (plus the slice copy) held multiples of the file
+		// in memory and OOMed large mounts before the upload even began.
+	} else if err := h.buf.LoadMissingParts(); err != nil {
 		h.mu.Unlock()
 		return err
 	}
-	size := h.buf.Size()
 	mode, baseRev, path := h.mode, h.baseRev, h.path
 	wgen := h.wgen
-	image := append([]byte(nil), h.buf.Bytes()...)
+	image := []byte(nil)
+	if !streamed {
+		image = append([]byte(nil), h.buf.Bytes()...)
+	}
 	h.landing = true
-	l := h.l
+	buf := h.buf
 	h.mu.Unlock()
 	landingDone := func(entrySeq int64) {
 		h.mu.Lock()
@@ -364,19 +387,27 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	// locks may have completed the move and retargeted this fd while the
 	// commit waited — publishing the captured image under the OLD path
 	// would resurrect the renamed-away name. Fail closed; the retry
-	// captures the new path.
+	// captures the new path. An unlink that held the lock first may have
+	// anonymized this fd and landed the whiteout — the captured snapshot
+	// is discarded with it (the entry check at function entry ran before
+	// the wait and cannot protect the publish boundary).
 	h.mu.Lock()
 	moved := h.path != path
+	unlinked := h.unlinked
 	h.mu.Unlock()
 	if moved {
 		unlock()
 		return syscall.EAGAIN
 	}
+	if unlinked {
+		unlock()
+		return nil
+	}
 	defer unlock()
 	var entry *client.FSLayerEntry
 	var err error
-	if size > l.inlineMax() {
-		entry, err = l.cl.UploadFSLayerFile(ctx, l.layerRef, l.remotePath(path), bytes.NewReader(image), size, baseRev, mode, true)
+	if streamed {
+		entry, err = l.cl.UploadFSLayerFile(ctx, l.layerRef, l.remotePath(path), newBoundedImageReader(buf, size), size, baseRev, mode, true)
 	} else {
 		entry, err = l.cl.UpsertFSLayerEntry(ctx, l.layerRef, client.FSLayerEntryRequest{
 			Path:         l.remotePath(path),
@@ -396,8 +427,16 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	h.l.mu.Lock()
 	if !h.l.abandoned {
 		h.l.files[path] = mode & 0o777
-		h.l.contents[path] = image
-		delete(h.l.remoteSizes, path)
+		if streamed {
+			// Object-backed entries do NOT mirror their bytes in memory:
+			// lookups re-hydrate from the uploaded object on demand (the
+			// remoteSizes marker drives that lazy hydration).
+			delete(h.l.contents, path)
+			h.l.remoteSizes[path] = size
+		} else {
+			h.l.contents[path] = image
+			delete(h.l.remoteSizes, path)
+		}
 		delete(h.l.whiteouts, path)
 		delete(h.l.dirs, path)
 		delete(h.l.symlinks, path)
@@ -417,6 +456,47 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	h.l.emit(fs.Event{Kind: fs.EventLanded, Path: path, Size: size})
 	h.l.emit(fs.Event{Kind: fs.EventInvalidated, Path: path})
 	return nil
+}
+
+// newBoundedImageReader streams size bytes of the buffer's image.
+func newBoundedImageReader(buf *writebuffer.WriteBuffer, size int64) *boundedImageReader {
+	return &boundedImageReader{buf: buf, size: size}
+}
+
+// boundedImageReader streams a write buffer's image in bounded memory:
+// chunks are pulled through ReadAt (lazy part loads, zero-filled holes)
+// instead of materializing the whole image. One chunk is held at a time.
+type boundedImageReader struct {
+	buf   *writebuffer.WriteBuffer
+	off   int64
+	size  int64
+	chunk [1 << 20]byte
+	n     int
+	i     int
+}
+
+func (r *boundedImageReader) Read(p []byte) (int, error) {
+	if r.i >= r.n {
+		if r.off >= r.size {
+			return 0, io.EOF
+		}
+		want := int64(len(r.chunk))
+		if rem := r.size - r.off; rem < want {
+			want = rem
+		}
+		got := r.buf.ReadAt(r.off, r.chunk[:want])
+		if got < 0 {
+			got = 0
+		}
+		r.n, r.i = got, 0
+		if r.n == 0 {
+			return 0, io.EOF
+		}
+	}
+	n := copy(p, r.chunk[r.i:r.n])
+	r.i += n
+	r.off += int64(n)
+	return n, nil
 }
 
 // entrySeqOf extracts the server entry sequence from a commit reply

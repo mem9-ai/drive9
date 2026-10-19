@@ -271,11 +271,31 @@ type Git struct {
 	// live indexes claimed workspace handles by path (SetAttr
 	// interception, unlink/rename retargeting).
 	live sync.Map
+	// openHandles tracks every claimed descriptor (the live slot keeps
+	// only the newest per path).
+	openHandles sync.Map
 }
 
 // trackWorkspace/untrackWorkspace maintain the claimed-handle index.
-func (g *Git) trackWorkspace(path string, h *gitHandle) { g.live.Store(path, h) }
-func (g *Git) untrackWorkspace(path string)             { g.live.Delete(path) }
+func (g *Git) trackWorkspace(path string, h *gitHandle) {
+	g.live.Store(path, h)
+	// The full set keeps every open descriptor discoverable: the per-path
+	// slot holds only the NEWEST claim, and unlink's anonymization must
+	// reach older fds too — their later sync would otherwise republish
+	// the deleted name over a recreated object.
+	g.openHandles.Store(h, path)
+}
+func (g *Git) untrackWorkspace(path string) { g.live.Delete(path) }
+
+// untrackHandle removes a descriptor from both indexes (its path slot
+// may already belong to a newer claim).
+func (g *Git) untrackHandle(h *gitHandle) {
+	g.openHandles.Delete(h)
+	h.mu.Lock()
+	path := h.path
+	h.mu.Unlock()
+	g.live.Delete(path)
+}
 
 func (g *Git) handleFor(path string) *gitHandle {
 	if v, ok := g.live.Load(path); ok {

@@ -34,6 +34,13 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			if l.impliedDir(op.Path) {
 				return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755, Mtime: time.Now()}}, nil
 			}
+			// A whiteouted ANCESTOR deletes the whole subtree from the
+			// base namespace: falling through would resurrect renamed or
+			// deleted parents' children (a directory rename left /d
+			// whiteouted while the base /d/f still resolved).
+			if l.maskedByWhiteout(op.Path) {
+				return fs.Result{}, fs.ErrNotFound
+			}
 			res, err := next(ctx, op)
 			if err != nil {
 				return res, err
@@ -319,14 +326,23 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		// per-path newest slot: an older sibling left bound to the old
 		// name recreated it at its next sync (writing `A` through the
 		// first of two descriptors, renaming, then syncing landed
-		// `Aello` back on the old name).
+		// `Aello` back on the old name). A DIRECTORY rename also moves
+		// every open CHILD file (their commits would otherwise land
+		// under the dead parent path).
+		prefix := strings.TrimSuffix(op.Path, "/") + "/"
 		l.handles.Range(func(key, _ any) bool {
 			if h, hok := key.(*layerHandle); hok {
 				h.mu.Lock()
 				path, released := h.path, h.released
 				h.mu.Unlock()
-				if !released && path == op.Path {
+				if released {
+					return true
+				}
+				switch {
+				case path == op.Path:
 					h.retarget(op.Path2)
+				case strings.HasPrefix(path, prefix):
+					h.retarget(op.Path2 + strings.TrimPrefix(path, op.Path))
 				}
 			}
 			return true
@@ -350,7 +366,11 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		// FATTR_FH names a specific descriptor: resolve THAT handle —
 		// the per-path newest claim is a different fd after a second
 		// open, and truncating it acknowledged nothing on the named one.
-		if own, ok := op.Handle.(*layerHandle); ok {
+		// The chain is walked through UnwrapHandle decorators (the read
+		// cache wraps handles; localize wraps again) — a bare type
+		// assert missed every wrapped descriptor and fell back to the
+		// newest claim.
+		if own := layerHandleOf(op.Handle); own != nil {
 			h = own
 		}
 		if h != nil {
@@ -476,6 +496,44 @@ func (l *Layer) do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 // dirHasOverlayChildren ports v1 layerDirHasOverlayChildren: any overlay
 // entry (file, dir, symlink, whiteout, or live handle) directly under dir
 // makes the directory non-empty for rmdir.
+// layerHandleOf walks decorator wrappers (UnwrapHandle) to the layer's
+// own handle; nil when the chain holds none.
+func layerHandleOf(h any) *layerHandle {
+	for range 8 {
+		if lh, ok := h.(*layerHandle); ok {
+			return lh
+		}
+		u, ok := h.(interface{ UnwrapHandle() fs.Handle })
+		if !ok {
+			return nil
+		}
+		inner := u.UnwrapHandle()
+		if inner == nil {
+			return nil
+		}
+		h = inner
+	}
+	return nil
+}
+
+// maskedByWhiteout reports whether any ancestor of p (or p itself) is
+// whiteouted in the overlay — the base namespace must not answer through
+// a deleted parent.
+func (l *Layer) maskedByWhiteout(p string) bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	for {
+		if _, hit := l.whiteouts[p]; hit {
+			return true
+		}
+		slash := strings.LastIndexByte(p, '/')
+		if slash <= 0 {
+			return false
+		}
+		p = p[:slash]
+	}
+}
+
 func (l *Layer) dirHasOverlayChildren(dir string) bool {
 	prefix := strings.TrimRight(dir, "/") + "/"
 	has := func(path string) bool {

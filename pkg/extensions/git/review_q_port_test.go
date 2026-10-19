@@ -179,3 +179,57 @@ func TestPortOutOfOrderUploadsKeepNewerImage(t *testing.T) {
 		t.Fatalf("persisted overlay = %q, want BBBBB (newer upload overtook)", rd.Data)
 	}
 }
+
+// Unlink anonymizes EVERY matching workspace descriptor: an older fd's
+// sync cannot overwrite a recreated object with the deleted image.
+func TestPortUnlinkAnonymizesEveryGitDescriptor(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/repo/f.txt", []byte("hello"))
+	b.SeedGitWorkspace("ws-1", "/repo")
+	ch := newStack(t, b)
+	ctx := context.Background()
+
+	open := func() fs.Handle {
+		res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/repo/f.txt", Flags: uint32(syscall.O_RDWR)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Handle
+	}
+	h1, h2 := open(), open()
+	if err := h1.Write(ctx, 0, []byte("A")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/repo/f.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	// Recreate (O_CREAT over the whiteout) and durably write the new object.
+	res3, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/repo/f.txt", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644})
+	if err != nil {
+		t.Fatalf("recreate after unlink: %v", err)
+	}
+	fresh := res3.Handle
+	if err := fresh.Write(ctx, 0, []byte("NEW")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The older anonymous fd's sync must not publish the deleted image.
+	if err := h1.Sync(ctx); err != nil {
+		t.Fatalf("anonymous fd sync: %v", err)
+	}
+	if err := h1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rd, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: "/repo/f.txt", Offset: 0, Limit: 8})
+	if err != nil || string(rd.Data) != "NEW" {
+		t.Fatalf("/repo/f.txt = %q err=%v, want NEW (recreated object preserved)", rd.Data, err)
+	}
+}

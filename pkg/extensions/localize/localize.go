@@ -614,6 +614,14 @@ func (h *dbAccountingHandle) Write(ctx context.Context, off int64, data []byte) 
 
 func (h *dbAccountingHandle) Sync(ctx context.Context) error { return h.inner.Sync(ctx) }
 
+// UnwrapHandle exposes the wrapped handle: FD-named operations
+// (FATTR_FH SetAttr, unlink survivor retargeting) walk the decorator
+// chain to the descriptor's OWN write-plane handle — without this, the
+// resolution fell back to a per-path lookup and mutated whichever
+// object currently owns the NAME (a recreated file truncated through
+// the old descriptor).
+func (h *dbAccountingHandle) UnwrapHandle() fs.Handle { return h.inner }
+
 func (h *dbAccountingHandle) Flush(ctx context.Context) error { return h.inner.Flush(ctx) }
 
 func (h *dbAccountingHandle) Release(ctx context.Context) error {

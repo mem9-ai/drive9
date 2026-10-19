@@ -291,9 +291,22 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 
 	case fs.OpUnlink, fs.OpRmdir:
 		// POSIX unlink-while-open: the delete hides the name now; an open
-		// claimed handle keeps its image and never publishes.
-		if h := g.handleFor(op.Path); h != nil && op.Kind == fs.OpUnlink {
-			h.markUnlinked()
+		// claimed handle keeps its image and never publishes — EVERY
+		// matching descriptor, not just the per-path newest (an older
+		// fd's later sync would overwrite a recreated object with the
+		// deleted image).
+		if op.Kind == fs.OpUnlink {
+			g.openHandles.Range(func(key, _ any) bool {
+				if h, hok := key.(*gitHandle); hok {
+					h.mu.Lock()
+					path := h.path
+					h.mu.Unlock()
+					if path == op.Path {
+						h.markUnlinked()
+					}
+				}
+				return true
+			})
 		}
 		if err := g.putOverlay(ctx, w, rel, overlayEntry{Op: "whiteout", Kind: "file"}); err != nil {
 			return fs.Result{}, err
@@ -319,7 +332,10 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		// FATTR_FH names a specific descriptor: resolve THAT handle —
 		// the per-path newest claim is a different fd after a second
 		// open, and truncating it acknowledged nothing on the named one.
-		if own, ok := op.Handle.(*gitHandle); ok {
+		// The chain is walked through UnwrapHandle decorators (the read
+		// cache wraps handles); a bare type assert missed every wrapped
+		// descriptor.
+		if own := gitHandleOf(op.Handle); own != nil {
 			h = own
 		}
 		if h != nil {
@@ -377,6 +393,26 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 
 // putOverlay persists one overlay entry server-side then mirrors it
 // locally.
+// gitHandleOf walks decorator wrappers (UnwrapHandle) to the git
+// extension's own handle; nil when the chain holds none.
+func gitHandleOf(h any) *gitHandle {
+	for range 8 {
+		if gh, ok := h.(*gitHandle); ok {
+			return gh
+		}
+		u, ok := h.(interface{ UnwrapHandle() fs.Handle })
+		if !ok {
+			return nil
+		}
+		inner := u.UnwrapHandle()
+		if inner == nil {
+			return nil
+		}
+		h = inner
+	}
+	return nil
+}
+
 func (g *Git) putOverlay(ctx context.Context, w *workspace, rel string, e overlayEntry) error {
 	// Path-addressed writes hand us op.Data — a slice of go-fuse's POOLED
 	// request buffer, recycled for the next request (a READDIR's dirent

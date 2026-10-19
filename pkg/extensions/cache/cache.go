@@ -355,10 +355,11 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		// with the name (same content, same revision).
 		c.open.Range(func(k, _ any) bool {
 			if h, ok := k.(*cachingHandle); ok {
-				if h.path == op.Path {
+				p := h.identity()
+				if p == op.Path {
 					h.SetPath(op.Path2)
-				} else if strings.HasPrefix(h.path, strings.TrimSuffix(op.Path, "/")+"/") {
-					h.SetPath(op.Path2 + strings.TrimPrefix(h.path, op.Path))
+				} else if strings.HasPrefix(p, strings.TrimSuffix(op.Path, "/")+"/") {
+					h.SetPath(op.Path2 + strings.TrimPrefix(p, op.Path))
 				}
 			}
 			return true
@@ -405,7 +406,10 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 
 // Read implements fs.Handle.
 func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
-	if data, ok := h.cache.mem.GetPending(h.path); ok {
+	// One stable identity for the whole read (cache keys stay coherent
+	// across a concurrent retarget).
+	path := h.identity()
+	if data, ok := h.cache.mem.GetPending(path); ok {
 		if off < 0 || off >= int64(len(data)) {
 			return 0, nil
 		}
@@ -425,28 +429,28 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	h.mu.Lock()
 	grown := h.grown
 	h.mu.Unlock()
-	if h.rev > 0 && h.size > 0 && h.size <= h.cache.mem.MaxFileSize() && !grown && !h.cache.dirs.hasLocalWriteState(h.path) && !h.cache.sqliteBypassStableCaches(h.path) {
+	if h.rev > 0 && h.size > 0 && h.size <= h.cache.mem.MaxFileSize() && !grown && !h.cache.dirs.hasLocalWriteState(path) && !h.cache.sqliteBypassStableCaches(path) {
 		// v1 small-file tier: any offset slices one whole-file image; a
 		// miss fetches the WHOLE file so a short final read (the kernel's
 		// last block smaller than the request buffer) cannot lock the file
 		// out of the caches. The disk tier below the mem tier survives the
 		// mem TTL/eviction, serving warm re-reads across mounts.
-		if data, ok := h.cache.mem.Get(h.path, h.rev); ok {
+		if data, ok := h.cache.mem.Get(path, h.rev); ok {
 			h.cache.noteHit("read", true)
 			return copyReadRange(dest, data, off), nil
 		}
 		h.cache.noteHit("read", false)
-		key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(h.path), Path: h.path, Revision: h.rev, Offset: 0, Length: h.size}
+		key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: h.rev, Offset: 0, Length: h.size}
 		if h.cache.dsk != nil {
 			if cached, ok := h.cache.dsk.Get(key); ok && int64(len(cached)) == h.size {
 				h.cache.noteHit("read", true)
-				h.cache.mem.PutOwned(h.path, cached, h.rev)
+				h.cache.mem.PutOwned(path, cached, h.rev)
 				return copyReadRange(dest, cached, off), nil
 			}
 		}
 		whole := make([]byte, h.size)
 		if n, err := h.inner.Read(ctx, 0, whole); err == nil && int64(n) == h.size {
-			h.cache.mem.PutOwned(h.path, whole, h.rev)
+			h.cache.mem.PutOwned(path, whole, h.rev)
 			if h.cache.dsk != nil {
 				h.cache.dsk.PutAsync(key, whole)
 			}
@@ -455,8 +459,8 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		// Fetch error or short image: fall through to the direct read.
 		return h.inner.Read(ctx, off, dest)
 	}
-	if off == 0 && h.rev > 0 && !grown && h.cache.admits(dest) && !h.cache.sqliteBypassStableCaches(h.path) {
-		if data, ok := h.cache.mem.Get(h.path, h.rev); ok && int64(len(data)) <= int64(len(dest)) {
+	if off == 0 && h.rev > 0 && !grown && h.cache.admits(dest) && !h.cache.sqliteBypassStableCaches(path) {
+		if data, ok := h.cache.mem.Get(path, h.rev); ok && int64(len(data)) <= int64(len(dest)) {
 			n := copy(dest, data)
 			return n, nil
 		}
@@ -467,14 +471,14 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		// the next larger read serve a premature EOF.
 		if err == nil && int64(n) == int64(len(dest)) && h.size > 0 && int64(n) == h.size &&
 			h.cache.admits(dest[:n]) && h.rev > 0 {
-			h.cache.mem.PutOwned(h.path, append([]byte(nil), dest[:n]...), h.rev)
+			h.cache.mem.PutOwned(path, append([]byte(nil), dest[:n]...), h.rev)
 		}
 		return n, err
 	}
 	// v1 range disk tier for large files: the request's own (offset,
 	// size-clipped) range is fetched once and served from local disk on
 	// repeat — including across mounts (the key carries the revision).
-	if h.cache.dsk != nil && h.rev > 0 && !grown && !h.cache.dirs.hasLocalWriteState(h.path) && !h.cache.sqliteBypassStableCaches(h.path) {
+	if h.cache.dsk != nil && h.rev > 0 && !grown && !h.cache.dirs.hasLocalWriteState(path) && !h.cache.sqliteBypassStableCaches(path) {
 		// grown handles share the whole-file tiers' bypass: the disk
 		// range key and clip encode the stale open-time size/revision.
 		if n, ok := h.cache.readDiskCachedRange(ctx, h, off, dest); ok {
@@ -490,6 +494,7 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 // only when the fetch came back whole. ok=false defers to the caller's
 // direct read.
 func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off int64, dest []byte) (int, bool) {
+	path := h.identity()
 	block := c.opts.ParallelReadBlockSize
 	if block <= 0 {
 		block = defaultParallelReadBlockSize
@@ -509,7 +514,7 @@ func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off i
 	if length <= 0 {
 		return 0, true
 	}
-	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(h.path), Path: h.path, Revision: h.rev, Offset: off, Length: length}
+	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: h.rev, Offset: off, Length: length}
 	if data, ok := c.dsk.Get(key); ok && int64(len(data)) == length {
 		c.noteHit("read", true)
 		return copyReadRange(dest, data, 0), true
@@ -546,7 +551,7 @@ func copyReadRange(dest, data []byte, off int64) int {
 func (h *cachingHandle) Write(ctx context.Context, off int64, data []byte) error {
 	err := h.inner.Write(ctx, off, data)
 	if err == nil {
-		h.cache.mem.Invalidate(h.path)
+		h.cache.mem.Invalidate(h.identity())
 		if h.prefetch != nil {
 			h.prefetch.Invalidate()
 		}
@@ -571,14 +576,25 @@ func (h *cachingHandle) Flush(ctx context.Context) error { return h.inner.Flush(
 func (h *cachingHandle) Release(ctx context.Context) error {
 	h.cache.open.Delete(h)
 	if h.isSidecar {
-		h.cache.sidecars.remove(h.path)
+		h.cache.sidecars.remove(h.identity())
 	}
 	return h.inner.Release(ctx)
 }
 
+// identity snapshots the handle's path under its mutex: rename/survivor
+// retargeting rewrites it concurrently, and a bare read both races and
+// can split one cache operation across two identities.
+func (h *cachingHandle) identity() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.path
+}
+
 // SetPath retargets the handle (and its prefetcher) onto the renamed path.
 func (h *cachingHandle) SetPath(p string) {
+	h.mu.Lock()
 	h.path = p
+	h.mu.Unlock()
 	if h.prefetch != nil {
 		h.prefetch.SetPath(p)
 	}
@@ -595,10 +611,11 @@ func (c *Cache) RetargetPath(oldPath, newPath string) {
 	prefix := strings.TrimSuffix(oldPath, "/") + "/"
 	c.open.Range(func(k, _ any) bool {
 		if h, ok := k.(*cachingHandle); ok {
-			if h.path == oldPath {
+			p := h.identity()
+			if p == oldPath {
 				h.SetPath(newPath)
-			} else if strings.HasPrefix(h.path, prefix) {
-				h.SetPath(newPath + strings.TrimPrefix(h.path, oldPath))
+			} else if strings.HasPrefix(p, prefix) {
+				h.SetPath(newPath + strings.TrimPrefix(p, oldPath))
 			}
 		}
 		return true
