@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
 type execTestRequest struct {
@@ -34,6 +36,15 @@ func execTestServer(t *testing.T, frames ...string) (*execTestRequest, *httptest
 	t.Helper()
 	var request execTestRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Layer refs resolve to "fsl-<ref>" with ':' and '=' as '-'; "missing" is not found.
+		if ref, ok := strings.CutPrefix(r.URL.Path, "/v1/layers/"); ok && r.Method == http.MethodGet {
+			if ref == "missing" {
+				http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"layer_id": "fsl-" + strings.NewReplacer(":", "-", "=", "-").Replace(ref), "state": "active"})
+			return
+		}
 		request = execTestRequest{}
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -93,7 +104,7 @@ func TestExecStreamsOutputAndPassesExitStatusQuietly(t *testing.T) {
 	if !errors.As(err, &status) || status.ExitCode() != 9 || !status.SilentExit() {
 		t.Fatalf("error = %#v", err)
 	}
-	if strings.Join(request.Argv, " ") != "sh -c exit 9" || request.Workspace.Root != "/project" || request.Workspace.LayerID != "fork-1" ||
+	if strings.Join(request.Argv, " ") != "sh -c exit 9" || request.Workspace.Root != "/project" || request.Workspace.LayerID != "fsl-fork-1" ||
 		request.Cwd != "src" || request.Env["A"] != "B" || request.TimeoutMS != 120000 {
 		t.Fatalf("request = %#v", request)
 	}
@@ -272,7 +283,6 @@ func TestExecUsageErrors(t *testing.T) {
 		{"--persistence=full_root", "true"},
 		{"--cpu-millis=1000", "true"},
 		{"-w", "../escape", "true"},
-		{"--layer", "bad:layer", "true"},
 	} {
 		if _, _, err := runExecForTest(t, t.Context(), args...); err == nil {
 			t.Errorf("%q accepted", args)
@@ -288,7 +298,7 @@ func TestExecInsideLocalMountUsesItsWorkspaceAfterUploading(t *testing.T) {
 	rt.server = func() string { return "https://drive9.example/" }
 	rt.credential = func() string { return "fp-a" }
 	rt.findMount = func(string) (*localMount, error) {
-		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/repo", Server: "https://drive9.example", Credential: "fp-a", Rel: "web/src"}, nil
+		return &localMount{MountPoint: "/home/me/drive9", Kind: mountstate.MountKindFUSE, RemoteRoot: "/repo", Server: "https://drive9.example", Credential: "fp-a", Rel: "web/src"}, nil
 	}
 	rt.mountLayer = func(context.Context, *localMount) (string, error) { return "fork-1", nil }
 	rt.syncMount = func(context.Context, *localMount) error { synced++; return nil }
@@ -321,7 +331,7 @@ func TestExecReportsLocalUploadFailure(t *testing.T) {
 	rt.server = func() string { return "https://drive9.example" }
 	rt.credential = func() string { return "fp-a" }
 	rt.findMount = func(string) (*localMount, error) {
-		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/", Server: "https://drive9.example", Credential: "fp-a", Rel: "."}, nil
+		return &localMount{MountPoint: "/home/me/drive9", Kind: mountstate.MountKindFUSE, RemoteRoot: "/", Server: "https://drive9.example", Credential: "fp-a", Rel: "."}, nil
 	}
 	rt.mountLayer = func(context.Context, *localMount) (string, error) { return "", nil }
 	rt.syncMount = func(context.Context, *localMount) error { return errors.New("upload stalled") }
@@ -340,7 +350,7 @@ func TestExecRefusesMountOfAnotherAccount(t *testing.T) {
 		"unrecorded key":     {Server: "https://drive9.example"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			mount.MountPoint, mount.RemoteRoot, mount.Rel = "/mnt/x", "/x", "."
+			mount.MountPoint, mount.Kind, mount.RemoteRoot, mount.Rel = "/mnt/x", mountstate.MountKindFUSE, "/x", "."
 			rt := testExecRuntime(io.Discard, io.Discard)
 			rt.dir = "/mnt/x"
 			rt.server = func() string { return "https://drive9.example" }
@@ -467,3 +477,46 @@ func (b *syncBuffer) Write(p []byte) (int, error) {
 	return b.b.Write(p)
 }
 func (b *syncBuffer) String() string { b.mu.Lock(); defer b.mu.Unlock(); return b.b.String() }
+
+func TestExecResolvesLayerRefs(t *testing.T) {
+	request, _ := execTestServer(t, execStarted, execExit0)
+	for ref, want := range map[string]string{"my-fork": "fsl-my-fork", "tag:agent=a": "fsl-tag-agent-a"} {
+		if _, _, err := runExecForTest(t, t.Context(), "-w", "repo", "--layer", ref, "true"); err != nil {
+			t.Fatalf("--layer %s: %v", ref, err)
+		}
+		if request.Workspace.LayerID != want {
+			t.Fatalf("--layer %s sent %q, want %q", ref, request.Workspace.LayerID, want)
+		}
+	}
+	if _, _, err := runExecForTest(t, t.Context(), "-w", "repo", "--layer", "missing", "true"); err == nil || !strings.Contains(err.Error(), `resolve --layer "missing"`) {
+		t.Fatalf("missing layer error = %v", err)
+	}
+}
+
+func TestExecRefusesNonFUSEMount(t *testing.T) {
+	execTestServer(t, execStarted, execExit0)
+	rt := testExecRuntime(io.Discard, io.Discard)
+	rt.dir = "/Users/me/drive9/repo"
+	rt.findMount = func(string) (*localMount, error) {
+		return &localMount{MountPoint: "/Users/me/drive9", Kind: mountstate.MountKindWebDAV}, nil
+	}
+	rt.syncMount = func(context.Context, *localMount) error { t.Fatal("drained a WebDAV mount"); return nil }
+	err := runExec(t.Context(), []string{"true"}, rt)
+	if err == nil || !strings.Contains(err.Error(), "webdav mount") || !strings.Contains(err.Error(), "pass -w") {
+		t.Fatalf("error = %v", err)
+	}
+	if err := runExec(t.Context(), []string{"-w", "repo", "true"}, rt); err != nil {
+		t.Fatalf("explicit -w: %v", err)
+	}
+}
+
+func TestExecRejectsDelegatedToken(t *testing.T) {
+	if err := execCredentialError(CredentialDelegated); err == nil || !strings.Contains(err.Error(), "API key") {
+		t.Fatalf("delegated error = %v", err)
+	}
+	for _, kind := range []CredentialKind{CredentialOwner, CredentialFSScoped, CredentialNone} {
+		if err := execCredentialError(kind); err != nil {
+			t.Fatalf("kind %d: %v", kind, err)
+		}
+	}
+}

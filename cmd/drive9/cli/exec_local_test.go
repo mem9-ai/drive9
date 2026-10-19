@@ -190,3 +190,21 @@ func TestFindLocalMountThroughSymlinkAlias(t *testing.T) {
 		t.Fatalf("mount through alias = %#v, %v", mount, err)
 	}
 }
+
+func TestFindLocalMountReportsNonFUSEMount(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	mountPoint := t.TempDir()
+	creation, err := mountstate.ProcessCreationTime(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
+		PID: os.Getpid(), CreationTime: creation, MountKind: mountstate.MountKindWebDAV, MountPoint: mountPoint, RemoteRoot: "/repo",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mount, err := findLocalMount(mountPoint)
+	if err != nil || mount == nil || mount.Kind != mountstate.MountKindWebDAV {
+		t.Fatalf("webdav mount = %#v, %v", mount, err)
+	}
+}

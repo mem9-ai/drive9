@@ -22,6 +22,8 @@ const execLocalSyncTimeout = 2 * time.Minute
 // localMount is the drive9 FUSE mount that contains the current directory.
 type localMount struct {
 	MountPoint string
+	// Kind is the mount type (mountstate.MountKindFUSE, ...).
+	Kind       string
 	RemoteRoot string
 	Server     string
 	// Rel is the current directory relative to MountPoint ("." at its root).
@@ -92,7 +94,9 @@ func findLocalMountFrom(absDir string) (*localMount, error) {
 		state, _, err := mountstate.ReadProcessState(backgroundMountStatePoint(candidate))
 		if err == nil && mountLooksLive(state) {
 			if state.MountKind != "" && state.MountKind != mountstate.MountKindFUSE {
-				return nil, nil
+				// Reported, not skipped: exec must not silently fall back
+				// to the drive root from inside another kind of mount.
+				return &localMount{MountPoint: candidate, Kind: state.MountKind}, nil
 			}
 			if strings.TrimSpace(state.RemoteRoot) == "" {
 				return nil, nil
@@ -102,7 +106,7 @@ func findLocalMountFrom(absDir string) (*localMount, error) {
 				return nil, nil
 			}
 			return &localMount{
-				MountPoint: candidate, RemoteRoot: state.RemoteRoot,
+				MountPoint: candidate, Kind: mountstate.MountKindFUSE, RemoteRoot: state.RemoteRoot,
 				Server: state.Server, Rel: filepath.ToSlash(rel), ControlSocket: strings.TrimSpace(state.ControlSocket),
 				Credential: credentialFingerprint(firstNonEmpty(state.APIKey, state.Token)),
 			}, nil

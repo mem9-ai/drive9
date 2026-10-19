@@ -17,6 +17,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
 // Exit statuses for outcomes that are not the remote command's own status.
@@ -47,7 +48,7 @@ flags:
   -e, --env KEY[=VALUE]    set an environment variable; KEY alone copies it from here
   -t, --timeout DURATION   stop the command after DURATION (default: server default)
       --fresh              start in a new sandbox instead of reusing the warm one
-      --layer ID           use a LayerFS layer view of the workspace
+      --layer REF          use a LayerFS layer view (layer ID, name, or tag:key=value)
       --read-only          mount the workspace read-only
   -v, --verbose            show the sandbox, working directory, and duration
 
@@ -119,6 +120,9 @@ func defaultExecRuntime(execID *execIDBox) execRuntime {
 // Exec runs one command in a sandbox against a Drive9 workspace. It never
 // retries: a command whose outcome is unknown may already have run.
 func Exec(args []string) error {
+	if err := execCredentialError(ResolveCredentials().Kind); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	signals := make(chan os.Signal, 2)
@@ -142,6 +146,15 @@ func Exec(args []string) error {
 	return runExec(ctx, args, defaultExecRuntime(execID))
 }
 
+// execCredentialError rejects credentials the runtime endpoint does not
+// accept, before any local mount is drained.
+func execCredentialError(kind CredentialKind) error {
+	if kind == CredentialDelegated {
+		return errors.New("drive9 exec needs a drive9 API key; a delegated token cannot run commands")
+	}
+	return nil
+}
+
 type execIDBox struct {
 	mu sync.Mutex
 	id string
@@ -157,6 +170,15 @@ func runExec(ctx context.Context, args []string, rt execRuntime) error {
 	options, err := parseExecArgs(args)
 	if err != nil {
 		return err
+	}
+	if options.layer != "" {
+		// Accept a layer name or tag ref like `drive9 mount --layer`; the
+		// runtime takes only the resolved layer ID.
+		layer, err := rt.client().GetFSLayer(ctx, options.layer)
+		if err != nil {
+			return fmt.Errorf("resolve --layer %q: %w", options.layer, err)
+		}
+		options.layer = layer.LayerID
 	}
 	if err := resolveExecWorkspace(ctx, &options, rt); err != nil {
 		return err
@@ -203,6 +225,9 @@ func resolveExecWorkspace(ctx context.Context, options *execOptions, rt execRunt
 	mount, err := rt.findMount(rt.dir)
 	if err != nil || mount == nil {
 		return nil
+	}
+	if mount.Kind != mountstate.MountKindFUSE {
+		return fmt.Errorf("%s is a drive9 %s mount; drive9 exec follows only FUSE mounts, so pass -w to choose a workspace", mount.MountPoint, mount.Kind)
 	}
 	// One server hosts many tenants, so infer only from a mount that uses
 	// the same server and the same credential as this command. Inside a mount
@@ -257,7 +282,7 @@ func currentCredentialFingerprint() string {
 	if resolved.Kind == CredentialOwner || resolved.Kind == CredentialFSScoped {
 		return credentialFingerprint(resolved.APIKey)
 	}
-	return credentialFingerprint(resolved.Token)
+	return ""
 }
 
 func sandboxLabel(sandbox string) string {

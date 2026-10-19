@@ -19,6 +19,8 @@ The server must have remote exec enabled. Otherwise the command reports
   local changes are uploaded so it sees exactly your files. Elsewhere, `-w`
   picks the directory (`repo`, `/repo`, and `:/repo` all work, giving
   `/workspace/repo`; default: the drive root). `-C` picks a subdirectory.
+  Only FUSE mounts are followed: inside a WebDAV mount (the default on macOS
+  and Windows), pass `-w`.
 - **Who it runs as.** A normal user, `agent`, with `HOME=/home/agent`, so git,
   pip, npm, and go work as usual. It can edit any workspace file but cannot
   become root.
@@ -60,7 +62,7 @@ The server must have remote exec enabled. Otherwise the command reports
 | `-e, --env KEY[=VALUE]` | set a variable; `KEY` alone copies it from your environment; repeatable |
 | `-t, --timeout DURATION` | stop the command after this long (the server may cap it) |
 | `--fresh` | start in a new sandbox instead of reusing the warm one |
-| `--layer ID` | use a LayerFS layer view, for example one agent fork |
+| `--layer REF` | use a LayerFS layer view (layer ID, name, or `tag:key=value`), for example one agent fork |
 | `--read-only` | mount the workspace read-only |
 | `-v, --verbose` | show the sandbox, working directory, and duration |
 
