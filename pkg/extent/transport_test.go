@@ -144,3 +144,84 @@ func TestTransportCallStillReturnsErrno(t *testing.T) {
 		t.Fatalf("errno=%d, want EAGAIN/11", resp.Errno)
 	}
 }
+
+func TestTransportCarriesSessionIdentityWithoutChangingTarget(t *testing.T) {
+	t.Parallel()
+	const sid = uint64(1<<63 + 123)
+	const owner = uint64(1<<63 + 321)
+	var got map[string]json.RawMessage
+	tr := NewTransport(func(_ context.Context, _ string, raw json.RawMessage) (json.RawMessage, int, error) {
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatal(err)
+		}
+		return []byte(`{"errno":0,"session_guard":true}`), 0, nil
+	})
+	call := func(op string, in any) {
+		t.Helper()
+		got = nil
+		ctx := jfsmeta.NewContext(1, 0, []uint32{0}).WithValue(LockBlockCtxKey, true)
+		var resp struct {
+			Errno int `json:"errno"`
+		}
+		if st := tr.Call(ctx, op, in, &resp); st != 0 {
+			t.Fatal(st)
+		}
+	}
+	call("init", map[string]any{})
+	if _, ok := got["caller_sid"]; ok {
+		t.Fatal("bootstrap has a session")
+	}
+	call("new_session", map[string]any{"sid": sid})
+	if !tr.SessionGuardSupported() {
+		t.Fatal("missing server capability")
+	}
+	for _, op := range []string{"write", "compact", "flock", "clean_stale_session"} {
+		call(op, map[string]any{"sid": 77, "owner": owner})
+		var caller, target, actualOwner uint64
+		if err := json.Unmarshal(got["caller_sid"], &caller); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(got["sid"], &target); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(got["owner"], &actualOwner); err != nil {
+			t.Fatal(err)
+		}
+		if caller != sid || target != 77 || actualOwner != owner {
+			t.Fatalf("%s: caller=%d target=%d owner=%d", op, caller, target, actualOwner)
+		}
+		if op == "flock" && string(got["block"]) != "true" {
+			t.Fatal("missing blocking flag")
+		}
+	}
+}
+
+func TestTransportSessionRegistrationFailureAndLegacyServer(t *testing.T) {
+	t.Parallel()
+	for _, reply := range []string{`{"errno":5}`, `{"errno":0}`, `{}`} {
+		t.Run(reply, func(t *testing.T) {
+			var got map[string]json.RawMessage
+			tr := NewTransport(func(_ context.Context, _ string, raw json.RawMessage) (json.RawMessage, int, error) {
+				got = nil
+				if err := json.Unmarshal(raw, &got); err != nil {
+					t.Fatal(err)
+				}
+				return []byte(reply), 0, nil
+			})
+			st := tr.Call(jfsmeta.Background(), "new_session", map[string]any{"sid": 101}, nil)
+			if (st != 0) != (reply == `{}`) {
+				t.Fatalf("registration status=%v", st)
+			}
+			if tr.SessionGuardSupported() {
+				t.Fatal("claimed unsupported session guard")
+			}
+			if st := tr.Call(jfsmeta.Background(), "write", map[string]any{}, nil); st != 0 {
+				t.Fatal(st)
+			}
+			_, hasSID := got["caller_sid"]
+			if hasSID != (reply == `{"errno":0}`) {
+				t.Fatalf("payload=%v", got)
+			}
+		})
+	}
+}

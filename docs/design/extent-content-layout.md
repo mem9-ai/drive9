@@ -6,6 +6,21 @@ date: 2026-09-09
 
 # 1. Overview
 
+## Session-aware metadata transport
+
+`pkg/extent.Transport` records the existing session ID after `new_session`
+succeeds and adds `caller_sid` to subsequent requests. The operation-specific
+`sid` stays unchanged, including when cleanup targets another session. This
+applies to the common runtime used by FUSE, CLI/SDK and other integrations.
+
+A supporting server advertises `session_guard: true` in the registration reply
+and validates session liveness in the same transaction as each metadata mutation,
+using the existing session row and cleanup lock. `SessionGuardSupported()` reports
+that capability. Older servers ignore `caller_sid`; the field alone does not
+provide fencing. Existing advisory file locks and ordinary file revision CAS
+are separate mechanisms. No new lock service, session table or application-
+specific protocol is introduced.
+
 ## 1.1 Three content layouts
 
 drive9 stores file content under one of three `content_layout` values. The layout is a property of the file's inode, chosen when the file is created, and it determines both where the bytes live and which write path the FUSE client uses.
